@@ -162,7 +162,7 @@ jobs:
           spec.loader.exec_module(packager)
           version = packager.version_text(packager.workspace_version())
           try:
-              packager.verify_bootstrap_binary(pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3], version)
+              packager.check_bootstrap_file(pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3], version)
           except ValueError as error:
               print(f"production packager refused the TEST-root verifier: {error}")
           else:
@@ -248,7 +248,7 @@ jobs:
           spec.loader.exec_module(packager)
           version = packager.version_text(packager.workspace_version())
           try:
-              packager.verify_bootstrap_binary(pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3], version)
+              packager.check_bootstrap_file(pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3], version)
           except ValueError as error:
               print(f"production packager refused the TEST-root verifier: {error}")
           else:

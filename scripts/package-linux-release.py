@@ -11,13 +11,21 @@ explicit production root pin: --bootstrap-root-sha256 <hex>, or
 after the key ceremony; while it is absent there is no production pin, which is
 the documented way to build an archive WITHOUT the verifier: it is then not
 built, not archived, and both a SKIP line and the final summary say so). With a
-pin, a test-root build environment is refused, and this script itself executes
-the exact staged bytes, which must report exactly `PRODUCTION <pin>` and this
-release's version; the bytes archived are checked against the hash taken before
-and after that execution. There is no attestation alternative: a verifier this
-host cannot execute (foreign architecture, exec format error, missing loader) is
-refused with a non-zero exit, never skipped. Package each architecture that ships
-the verifier on a native Linux host of it.
+pin, a test-root build environment is refused, and create_archive() itself runs
+one uninterruptible flow for the verifier: read the staged file ONCE into an
+anonymous memfd, seal it, check the seals, hash it, require an ELF for the
+target, execute that descriptor twice (it must report exactly `PRODUCTION <pin>`
+and this release's version), write the archive member from the same descriptor,
+re-check seals and digest, close it. The archived bytes are the executed bytes
+whatever happens to any pathname. There is no proof, token or descriptor to hand
+around: callers name a path (or a released archive) plus the expected pin,
+version and target, and get a plain report afterwards. The flow is bound to the
+target: it refuses unless this host is Linux of the target's architecture, and
+the archive it writes is named for that target. There is no attestation
+alternative: a verifier this host cannot execute (foreign architecture, exec
+format error, missing loader, no memfd) is refused with a non-zero exit, never
+skipped. Package each architecture that ships the verifier on a native Linux
+host of it.
 
 Cross-architecture release (CI): build with --build-only --defer-bootstrap-probe
 on the build host (the verifier is built with the pin but not executed), then
@@ -25,7 +33,9 @@ on the build host (the verifier is built with the pin but not executed), then
 native packaging host runs --skip-build --binary-dir <dir> --binary-sums-sha256
 <sha256 of SHA256SUMS>, which re-hashes every byte it packages and probes the
 verifier natively. --verify-archive <tarball> re-executes the verifier inside a
-finished archive (or proves its absence when no pin is configured).
+finished archive through the same sealed flow, from the member bytes (never an
+extracted path), or proves its absence when no pin is configured.
+--defer-bootstrap-probe exists only for --build-only, which never packages.
 
 Offline isolation release (scripts/release.sh isolation-sign):
   --extract-bootstrap <tarball>     copy the released verifier out as duduclaw-bootstrap-linux-<arch>
@@ -41,7 +51,10 @@ a build command that names the `test-signer` feature or that binary is refused.
 pin (scripts/isolation-test-keys.sh), never for a production artifact.
 """
 import argparse
+import collections
+import contextlib
 import errno
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -49,6 +62,7 @@ import os
 from pathlib import Path
 import platform
 import re
+import select
 import shutil
 import stat
 import subprocess
@@ -116,6 +130,20 @@ TEST_SIGNER_FEATURE = "test-signer"
 # "Environment variables"); CARGO_TARGET_<TRIPLE>_RUSTFLAGS is checked as well.
 RUSTFLAGS_VARIABLES = (("CARGO_ENCODED_RUSTFLAGS", "\x1f"), ("RUSTFLAGS", None), ("CARGO_BUILD_RUSTFLAGS", None))
 MAX_PROBE_OUTPUT_BYTES = 256
+PROBE_TIMEOUT_SECONDS = 30
+# Linux uapi values (linux/memfd.h, linux/fcntl.h) for Pythons that lack the names.
+MFD_CLOEXEC = getattr(os, "MFD_CLOEXEC", 0x0001)
+MFD_ALLOW_SEALING = getattr(os, "MFD_ALLOW_SEALING", 0x0002)
+MFD_EXEC = getattr(os, "MFD_EXEC", 0x0010)  # Linux 6.3+; older kernels reject it with EINVAL
+F_DUPFD_CLOEXEC = getattr(fcntl, "F_DUPFD_CLOEXEC", 1030)
+F_ADD_SEALS = getattr(fcntl, "F_ADD_SEALS", 1033)
+F_GET_SEALS = getattr(fcntl, "F_GET_SEALS", 1034)
+F_SEAL_SEAL = getattr(fcntl, "F_SEAL_SEAL", 0x0001)
+F_SEAL_SHRINK = getattr(fcntl, "F_SEAL_SHRINK", 0x0002)
+F_SEAL_GROW = getattr(fcntl, "F_SEAL_GROW", 0x0004)
+F_SEAL_WRITE = getattr(fcntl, "F_SEAL_WRITE", 0x0008)
+BOOTSTRAP_SEALS = F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE
+ELF_MACHINES = {"x86_64": 62, "aarch64": 183}  # e_machine: EM_X86_64, EM_AARCH64
 OMITTED_BOOTSTRAP_LINE = ("SKIP duduclaw-bootstrap: no production root pin configured "
                           "(--bootstrap-root-sha256 / release/bootstrap-root.sha256); "
                           "the root bootstrap verifier is not packaged.")
@@ -325,16 +353,235 @@ def host_architecture():
         platform.machine().lower())
 
 
-def probe_bootstrap(path, flag):
-    """Run the staged verifier with one read-only flag; (exit code, stdout bytes)."""
-    result = subprocess.run([str(path), flag], env={}, stdin=subprocess.DEVNULL,
-                            capture_output=True, timeout=30, check=False)
-    return result.returncode, result.stdout
+# ---------------------------------------------------------------- bootstrap verifier: one sealed flow
+# _verified_bootstrap() is the ONLY code that reads, executes or archives the
+# verifier, and it does all of it in one call: seal -> check seals -> hash ->
+# check ELF target -> probe twice -> re-check -> (write member -> re-check) ->
+# close. Nothing it produces (the plain BootstrapReport) is accepted back by any
+# function, and no function takes a descriptor, digest or proof as evidence.
+#
+# Test seam (scripts/tests): where memfd does not exist (macOS) the unit tests
+# replace _new_image, _add_seals and _get_seals TOGETHER with an unlinked-file
+# stand-in. No option, argument or environment variable selects a stand-in, and
+# off Linux every CLI path that would run the flow is refused first by
+# require_native_target() (host_architecture() is None there).
+
+BootstrapReport = collections.namedtuple("BootstrapReport", "target sha256 size pin version")
 
 
-def check_probe(path, flag, expected):
+def _new_image():
+    """An empty anonymous memfd that allows sealing, close-on-exec (Linux only)."""
+    if not sys.platform.startswith("linux") or not hasattr(os, "memfd_create"):
+        raise ValueError(f"{BOOTSTRAP_BINARY} can only be sealed for probing on Linux (memfd); "
+                         "refusing to package it")
+    flags = MFD_CLOEXEC | MFD_ALLOW_SEALING
     try:
-        code, output = probe_bootstrap(path, flag)
+        return os.memfd_create(BOOTSTRAP_BINARY, flags | MFD_EXEC)
+    except OSError as error:
+        if error.errno != errno.EINVAL:
+            raise
+    # Before Linux 6.3 MFD_EXEC is unknown and every memfd is executable.
+    return os.memfd_create(BOOTSTRAP_BINARY, flags)
+
+
+def _add_seals(descriptor):
+    fcntl.fcntl(descriptor, F_ADD_SEALS, BOOTSTRAP_SEALS)
+
+
+def _get_seals(descriptor):
+    """The file's seals; 0 where it has none or the platform has no sealing (fail closed)."""
+    if not sys.platform.startswith("linux"):
+        return 0
+    try:
+        return fcntl.fcntl(descriptor, F_GET_SEALS)
+    except OSError:
+        return 0
+
+
+def require_native_target(target):
+    """The architecture of `target` when this host is Linux of it; refused otherwise.
+
+    Called before anything is read or executed, so a verifier is only ever
+    probed by a host that runs it natively, and for exactly the target whose
+    archive the same call writes.
+    """
+    if target not in TARGETS:
+        raise ValueError(f"unknown release target {target!r}")
+    arch = TARGETS[target][0]
+    if host_architecture() != arch:
+        raise ValueError(f"{BOOTSTRAP_BINARY} for {arch} cannot be executed on this host, so its root pin "
+                         f"cannot be verified; package {arch} on a native {arch} Linux host, or configure "
+                         f"no production root pin to ship this architecture without {BOOTSTRAP_BINARY}")
+    return arch
+
+
+@contextlib.contextmanager
+def _path_source(path):
+    """(read, size) of a nonempty executable regular file, opened O_NOFOLLOW; closed on exit."""
+    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0) | os.O_NONBLOCK
+    try:
+        source = os.open(path, flags)
+    except OSError as error:
+        if error.errno in (errno.ELOOP, errno.EMLINK):
+            raise ValueError(f"{BOOTSTRAP_BINARY} must not be a symbolic link") from error
+        raise
+    try:
+        metadata = os.fstat(source)
+        if (not stat.S_ISREG(metadata.st_mode) or not metadata.st_mode & 0o111
+                or not 0 < metadata.st_size < MAX_BINARY_BYTES):
+            raise ValueError(f"{BOOTSTRAP_BINARY} must be a nonempty executable regular file "
+                             f"smaller than {MAX_BINARY_BYTES} bytes")
+        yield (lambda size: os.read(source, size)), metadata.st_size
+    finally:
+        os.close(source)
+
+
+@contextlib.contextmanager
+def _member_source(bundle, member):
+    """(read, size) of one regular member of an open release archive; never extracted to a path."""
+    stream = bundle.extractfile(member) if member.isfile() else None
+    if stream is None:
+        raise ValueError(f"cannot read {member.name} from the release archive")
+    try:
+        yield stream.read, member.size
+    finally:
+        stream.close()
+
+
+class _SealedImage:
+    """The verifier's bytes in ONE anonymous sealed memfd, owned by one `with` block.
+
+    __enter__ reads the source exactly once (it is closed again before anything
+    is executed), seals the copy against write/shrink/grow/reseal and keeps the
+    descriptor at >= 3 (pass_fds keeps its number in the probe child, whose 0-2
+    are stdio). __exit__ closes it on every path; there is no finalizer.
+    """
+
+    def __init__(self, open_source):
+        self._open_source = open_source
+        self.descriptor = None
+
+    def __enter__(self):
+        image = _new_image()
+        try:
+            with self._open_source() as (read, expected_size):
+                copied = 0
+                while chunk := read(1024 * 1024):
+                    copied += len(chunk)
+                    if copied >= MAX_BINARY_BYTES:
+                        raise ValueError(f"{BOOTSTRAP_BINARY} exceeds {MAX_BINARY_BYTES} bytes")
+                    view = memoryview(chunk)
+                    while view:
+                        view = view[os.write(image, view):]
+            if copied == 0 or copied != expected_size or os.fstat(image).st_size != copied:
+                raise ValueError(f"{BOOTSTRAP_BINARY} changed size while it was read; refusing to package it")
+            _add_seals(image)
+            if image < 3:
+                image, low = fcntl.fcntl(image, F_DUPFD_CLOEXEC, 3), image
+                os.close(low)
+        except BaseException:
+            os.close(image)
+            raise
+        self.descriptor = image
+        return self
+
+    def __exit__(self, *exception):
+        descriptor, self.descriptor = self.descriptor, None
+        if descriptor is not None:
+            os.close(descriptor)
+        return False
+
+
+def _fd_digest(descriptor):
+    """(SHA-256 hex, size) of a descriptor's whole content, read by offset."""
+    size = os.fstat(descriptor).st_size
+    digest = hashlib.sha256()
+    offset = 0
+    while offset < size:
+        chunk = os.pread(descriptor, min(1024 * 1024, size - offset), offset)
+        if not chunk:
+            raise ValueError(f"{BOOTSTRAP_BINARY} image ended early; refusing to package it")
+        digest.update(chunk)
+        offset += len(chunk)
+    return digest.hexdigest(), size
+
+
+def _require_sealed(descriptor):
+    """Exactly the four seals, read back from the kernel (F_GET_SEALS), or refuse."""
+    if _get_seals(descriptor) != BOOTSTRAP_SEALS:
+        raise ValueError(f"{BOOTSTRAP_BINARY} image is not sealed against write/shrink/grow/reseal; "
+                         "refusing to package it")
+
+
+def _require_unchanged(descriptor, digest, size):
+    _require_sealed(descriptor)
+    if _fd_digest(descriptor) != (digest, size):
+        raise ValueError(f"{BOOTSTRAP_BINARY} changed while it was being verified; refusing to package it")
+
+
+def _require_target_elf(descriptor, arch):
+    """A 64-bit little-endian ELF whose e_machine is the target's: with binfmt_misc
+    emulation a host could otherwise execute (and accept) a foreign verifier."""
+    header = os.pread(descriptor, 20, 0)
+    if (len(header) < 20 or header[:4] != b"\x7fELF" or header[4] != 2 or header[5] != 1
+            or int.from_bytes(header[18:20], "little") != ELF_MACHINES[arch]):
+        raise ValueError(f"{BOOTSTRAP_BINARY} is not a 64-bit little-endian ELF for {arch}; refusing to package it")
+
+
+class _PreadReader:
+    """read() over a descriptor by offset: no second descriptor, no shared file position."""
+
+    def __init__(self, descriptor, size):
+        self._descriptor, self._size, self._offset = descriptor, size, 0
+
+    def read(self, size=-1):
+        remaining = self._size - self._offset
+        if size is None or size < 0 or size > remaining:
+            size = remaining
+        chunk = os.pread(self._descriptor, size, self._offset) if size else b""
+        self._offset += len(chunk)
+        return chunk
+
+
+def _probe_image(descriptor, flag):
+    """Execute the sealed image (never a pathname) with one read-only flag; (exit code, stdout).
+
+    The child execs /proc/self/fd/<descriptor>: pass_fds deliberately clears
+    close-on-exec on that one descriptor in the child only (the parent's copy
+    stays CLOEXEC). Empty environment, stdin /dev/null, stderr discarded, a fresh
+    empty working directory, every other descriptor closed, a wall-clock bound
+    and at most MAX_PROBE_OUTPUT_BYTES + 1 bytes of stdout read.
+    """
+    deadline = time.monotonic() + PROBE_TIMEOUT_SECONDS
+    with tempfile.TemporaryDirectory(prefix="bootstrap-probe-") as workdir:
+        process = subprocess.Popen([f"/proc/self/fd/{descriptor}", flag], env={}, cwd=workdir,
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                   close_fds=True, pass_fds=(descriptor,))
+        try:
+            output = bytearray()
+            stream = process.stdout.fileno()
+            while len(output) <= MAX_PROBE_OUTPUT_BYTES:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(BOOTSTRAP_BINARY, PROBE_TIMEOUT_SECONDS)
+                if select.select([stream], [], [], remaining)[0]:
+                    chunk = os.read(stream, MAX_PROBE_OUTPUT_BYTES + 1 - len(output))
+                    if not chunk:
+                        break
+                    output += chunk
+            if len(output) > MAX_PROBE_OUTPUT_BYTES:
+                return -1, bytes(output)  # refused by _check_probe; the child is killed below
+            return process.wait(timeout=max(deadline - time.monotonic(), 0.001)), bytes(output)
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+            process.stdout.close()
+
+
+def _check_probe(descriptor, flag, expected):
+    try:
+        code, output = _probe_image(descriptor, flag)
     except (OSError, subprocess.SubprocessError) as error:
         # Exec format error, missing loader, not executable, timeout: fail closed.
         raise ValueError(f"{BOOTSTRAP_BINARY} {flag} could not be executed on this host; "
@@ -345,26 +592,56 @@ def check_probe(path, flag, expected):
                          f"({expected.strip()}); refusing to package it")
 
 
-def verify_bootstrap_binary(path, target, pin, version):
-    """Execute the exact verifier bytes; require a PRODUCTION build of this pin and version.
+def _verified_bootstrap(open_source, target, pin, version, *, bundle=None, expected_sha256=None):
+    """THE sealed flow; returns a plain BootstrapReport after the descriptor is closed.
 
-    Returns the SHA-256 of the executed bytes, which is the only value the
-    archive writer accepts for the verifier. There is no attestation fallback:
-    a binary this host cannot execute is refused, never packaged unverified.
-    A `cfg(duduclaw_test_root)` build prints `TEST <pin>` and is refused here
-    (test-key leak layer 2).
+    `open_source` opens the verifier's only source ((read, size): a staged path
+    or a member of an open release archive). In one call, which nothing can split:
+    host check for `target` (before anything is read) -> read once into a memfd
+    and seal it -> F_GET_SEALS must equal the four seals -> SHA-256 (and, when
+    given, it must equal `expected_sha256`, which can only narrow what is
+    accepted) -> ELF for the target -> `--print-root-pin` must print exactly
+    `PRODUCTION <pin>` and `--version` this release's version -> seals and digest
+    re-checked -> with `bundle`, the duduclaw-bootstrap member is written from the
+    descriptor and seals and digest are checked once more -> close. A
+    `cfg(duduclaw_test_root)` build prints `TEST <pin>` and is refused here
+    (test-key leak layer 2). There is no attestation fallback.
     """
-    arch = TARGETS[target][0]
-    if host_architecture() != arch:
-        raise ValueError(f"{BOOTSTRAP_BINARY} for {arch} cannot be executed on this host, so its root pin "
-                         f"cannot be verified; package {arch} on a native {arch} Linux host, or omit "
-                         f"--bootstrap-root-sha256 to ship this architecture without {BOOTSTRAP_BINARY}")
-    digest = sha256(path)
-    check_probe(path, "--print-root-pin", f"PRODUCTION {pin}\n")
-    check_probe(path, "--version", f"{BOOTSTRAP_BINARY} {version}\n")
-    if sha256(path) != digest:
-        raise ValueError(f"{BOOTSTRAP_BINARY} changed while it was being probed; refusing to package it")
-    return digest
+    arch = require_native_target(target)
+    pin = parse_bootstrap_pin(pin)
+    if not isinstance(version, str) or re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version) is None:
+        raise ValueError(f"expected {BOOTSTRAP_BINARY} version must be x.y.z")
+    if expected_sha256 is not None:
+        parse_sha256(expected_sha256, f"expected {BOOTSTRAP_BINARY} SHA-256")
+    with _SealedImage(open_source) as image:
+        descriptor = image.descriptor
+        _require_sealed(descriptor)
+        digest, size = _fd_digest(descriptor)
+        if expected_sha256 is not None and digest != expected_sha256:
+            raise ValueError(f"{BOOTSTRAP_BINARY} differs from the handed-off {TRANSFER_SUMS}; refusing to package it")
+        _require_target_elf(descriptor, arch)
+        _check_probe(descriptor, "--print-root-pin", f"PRODUCTION {pin}\n")
+        _check_probe(descriptor, "--version", f"{BOOTSTRAP_BINARY} {version}\n")
+        # Before the member is written: still sealed, still the executed bytes.
+        _require_unchanged(descriptor, digest, size)
+        if bundle is not None:
+            info = tarfile.TarInfo(BOOTSTRAP_BINARY)
+            info.size = size
+            info.mode = 0o755
+            info.mtime = int(os.fstat(descriptor).st_mtime)
+            info.uid, info.gid = os.getuid(), os.getgid()
+            bundle.addfile(info, _PreadReader(descriptor, size))
+            _require_unchanged(descriptor, digest, size)
+    return BootstrapReport(target, digest, size, pin, version)
+
+
+def check_bootstrap_file(path, target, pin, version):
+    """Run the sealed flow on `path` without writing anything (--build-only check).
+
+    Returns a plain BootstrapReport; no function accepts it back, so it cannot
+    stand in for packaging, which runs the whole flow again.
+    """
+    return _verified_bootstrap(lambda: _path_source(path), target, pin, version)
 
 
 def release_binary_dir(target):
@@ -445,21 +722,37 @@ def private_copy(source, destination, limit):
     return sha256(destination)
 
 
-def create_archive(binary_dir, python_dir, target, output_dir, *, binaries, verified=None):
-    """`binaries` comes from archive_binaries(); the verifier only after verify_bootstrap_binary.
+def create_archive(binary_dir, python_dir, target, output_dir, *, binaries, bootstrap_pin=None,
+                   bootstrap_version=None, expected_bootstrap_sha256=None):
+    """Write <output_dir>/duduclaw-linux-<arch>.tar.gz plus .sha256; returns (archive, report).
 
-    `verified` maps a binary name to the SHA-256 of the bytes that were executed
-    and checked; the verifier is archived only with that digest, and both the
-    staged copy and the archived member must still have it.
+    `binaries` is archive_binaries(False): the verifier is never archived by name.
+    Without `bootstrap_pin` the archive has no verifier and `report` is None.
+    With it, binary_dir/duduclaw-bootstrap is the only source of the sealed flow
+    (_verified_bootstrap), which this call runs while writing the archive: the
+    member is written from the executed, sealed descriptor, for this `target`
+    only (the archive is named for the same target). `bootstrap_version` and the
+    optional `expected_bootstrap_sha256` (a hand-off SHA256SUMS entry) only
+    narrow what is accepted; nothing a caller passes stands in for the execution.
+    `report` is a plain BootstrapReport, produced after the descriptor is closed.
+    Nothing is created under `output_dir` until the archive is complete.
     """
-    verified = dict(verified or {})
+    if target not in TARGETS:
+        raise ValueError(f"unknown release target {target!r}")
+    if bootstrap_pin is None:
+        if bootstrap_version is not None or expected_bootstrap_sha256 is not None:
+            raise ValueError(f"{BOOTSTRAP_BINARY} expectations given without a production root pin")
+    else:
+        parse_bootstrap_pin(bootstrap_pin)
+        require_native_target(target)  # refused before anything is read, executed or written
+    if BOOTSTRAP_BINARY in binaries:
+        raise ValueError(f"{BOOTSTRAP_BINARY} is never archived as a plain binary; "
+                         "only the sealed flow (bootstrap_pin) adds it")
     if not set(archive_binaries(False)) <= set(binaries) <= set(BIN_PACKAGES):
         raise ValueError("incomplete or unknown release binary set")
-    if not set(verified) <= set(binaries) or (
-            BOOTSTRAP_BINARY in binaries and not isinstance(verified.get(BOOTSTRAP_BINARY), str)):
-        raise ValueError(f"{BOOTSTRAP_BINARY} is archived only with the digest of the bytes that were probed")
-    # Validate the whole set before creating any release output.
-    for name in binaries:
+    # Validate the whole set before creating any release output (the verifier's
+    # path is only pre-checked here; the sealed flow reads it, once, below).
+    for name in [*binaries, *([BOOTSTRAP_BINARY] if bootstrap_pin is not None else [])]:
         validate_binary(binary_dir / name)
     archive = output_dir / (TARGETS[target][1] + ".tar.gz")
     checksum = Path(str(archive) + ".sha256")
@@ -467,15 +760,13 @@ def create_archive(binary_dir, python_dir, target, output_dir, *, binaries, veri
         raise ValueError("release output already exists")
     if not python_dir.is_dir():
         raise ValueError("Python SDK directory is missing")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="linux-release-", dir=output_dir) as temporary:
+    report = None
+    with tempfile.TemporaryDirectory(prefix="linux-release-") as temporary:
         stage = Path(temporary)
         for name in binaries:
             shutil.copyfile(binary_dir / name, stage / name)
             (stage / name).chmod(0o755)
             validate_binary(stage / name)
-            if name in verified and sha256(stage / name) != verified[name]:
-                raise ValueError(f"{name} changed after it was verified; refusing to package it")
         for name, source in ARCHIVE_ALIASES.items():
             shutil.copyfile(stage / source, stage / name)
             (stage / name).chmod(0o755)
@@ -483,24 +774,34 @@ def create_archive(binary_dir, python_dir, target, output_dir, *, binaries, veri
         with tarfile.open(staged_archive, "w:gz", dereference=False) as bundle:
             for name in [*binaries, *ARCHIVE_ALIASES]:
                 bundle.add(stage / name, arcname=name)
+            if bootstrap_pin is not None:
+                verifier = binary_dir / BOOTSTRAP_BINARY
+                report = _verified_bootstrap(lambda: _path_source(verifier), target, bootstrap_pin,
+                                             bootstrap_version, bundle=bundle,
+                                             expected_sha256=expected_bootstrap_sha256)
             bundle.add(python_dir, arcname="python")
-        # Re-read the written archive: the member must be the verified bytes.
-        with tarfile.open(staged_archive, "r:gz") as bundle:
-            for name, expected in verified.items():
-                member = bundle.getmember(name)
-                content = bundle.extractfile(member) if member.isfile() else None
+        # Re-read the written archive: the member must be the executed bytes.
+        if report is not None:
+            with tarfile.open(staged_archive, "r:gz") as bundle:
+                members = [member for member in bundle.getmembers() if member.name == BOOTSTRAP_BINARY]
+                content = bundle.extractfile(members[0]) if len(members) == 1 and members[0].isfile() else None
                 actual = hashlib.sha256()
                 while content is not None and (chunk := content.read(1024 * 1024)):
                     actual.update(chunk)
-                if content is None or actual.hexdigest() != expected:
-                    raise ValueError(f"archived {name} differs from the verified bytes; refusing to package it")
+                if content is None or (actual.hexdigest(), members[0].size) != (report.sha256, report.size):
+                    raise ValueError(f"archived {BOOTSTRAP_BINARY} differs from the executed bytes; "
+                                     "refusing to package it")
         digest = sha256(staged_archive)
+        output_dir.mkdir(parents=True, exist_ok=True)
         # Exclusive creation avoids silently replacing a previously signed file.
         with archive.open("xb") as destination, staged_archive.open("rb") as source:
             shutil.copyfileobj(source, destination)
+        if sha256(archive) != digest:
+            archive.unlink()
+            raise ValueError(f"{archive.name} changed while it was written")
         with checksum.open("x", encoding="ascii") as destination:
             destination.write(f"{digest}  {archive.name}\n")
-    return archive
+    return archive, report
 
 
 # ---------------------------------------------------------------- native hand-off
@@ -597,7 +898,10 @@ def extract_member(bundle, member, destination):
 def verify_archive(archive, target, pin, version):
     """Check a finished release archive: with a pin its verifier is executed here
     and must report PRODUCTION <pin> and this version; without one it must be absent.
-    Returns one summary line for the CI job summary."""
+
+    The member is executed through the sealed flow from a sealed copy of exactly
+    its archived bytes, never from an extracted path. Returns one summary line
+    for the CI job summary."""
     arch = TARGETS[target][0]
     with tempfile.TemporaryDirectory(prefix="bootstrap-archive-check-") as temporary:
         stage = Path(temporary)
@@ -612,15 +916,16 @@ def verify_archive(archive, target, pin, version):
                                      "root pin is configured; refusing")
                 return (f"{arch}: {BOOTSTRAP_BINARY} NOT shipped (no production root pin configured); "
                         f"archive sha256 {digest}")
-            extract_member(bundle, single_member(members, BOOTSTRAP_BINARY, MAX_BINARY_BYTES), stage / BOOTSTRAP_BINARY)
-        executed = verify_bootstrap_binary(stage / BOOTSTRAP_BINARY, target, pin, version)
-        return (f"{arch}: {BOOTSTRAP_BINARY} shipped, executed on this host: PRODUCTION {pin}, "
-                f"sha256 {executed}; archive sha256 {digest}")
+            member = single_member(members, BOOTSTRAP_BINARY, MAX_BINARY_BYTES)
+            report = _verified_bootstrap(lambda: _member_source(bundle, member), target, pin, version)
+        return (f"{arch}: {BOOTSTRAP_BINARY} shipped, executed on this host: PRODUCTION {report.pin}, "
+                f"sha256 {report.sha256}; archive sha256 {digest}")
 
 
 def extract_bootstrap(archive, target, output_dir):
     """Copy the released verifier out as duduclaw-bootstrap-linux-<arch>. It is not
-    executed here (scripts/release.sh probes it before anything is published)."""
+    executed here (scripts/release.sh probes it before anything is published);
+    executing a verifier taken from an archive is verify_archive()'s sealed flow."""
     output_dir = Path(output_dir)
     destination = output_dir / (BOOTSTRAP_ASSET_PREFIX + TARGETS[target][0])
     if destination.exists():
@@ -711,6 +1016,12 @@ def validate_targets(artifacts):
     identities = set()
     required = set()
     for artifact in artifacts:
+        identifier = artifact.get("id")
+        if isinstance(identifier, str) and (identifier == BOOTSTRAP_BINARY
+                                            or identifier.startswith(BOOTSTRAP_BINARY + "-")):
+            # The verifier ships only in the release tarball, written by the sealed
+            # flow; it is never a signed artifact, an inbox file or a bundle member.
+            raise ValueError(f"{identifier} names the root bootstrap verifier; it is never a signed artifact")
         kind = artifact.get("install_target", {}).get("kind")
         if kind == "runtime_entry":
             identity = (kind, runtime_target(artifact))
@@ -1154,11 +1465,10 @@ def main():
         if pin is not None and args.defer_bootstrap_probe:
             print(DEFERRED_BOOTSTRAP_LINE)
         elif pin is not None:
-            # Check the fresh build at once; packaging re-verifies its own snapshot.
-            with tempfile.TemporaryDirectory(prefix="bootstrap-check-") as temporary:
-                copy = Path(temporary) / BOOTSTRAP_BINARY
-                stage_cargo_binary(release_binary_dir(args.target) / BOOTSTRAP_BINARY, copy)
-                verify_bootstrap_binary(copy, args.target, pin, version)
+            # Check the fresh build at once (sealed and executed, nothing written);
+            # packaging runs the whole sealed flow again on its own snapshot.
+            check_bootstrap_file(release_binary_dir(args.target) / BOOTSTRAP_BINARY, args.target, pin, version)
+        # --build-only never packages, so a deferred verifier never reaches an archive.
         return
     binaries = archive_binaries(pin is not None)
     transfer = None
@@ -1170,7 +1480,6 @@ def main():
         binary_dir = args.binary_dir
     else:
         binary_dir = release_binary_dir(args.target)
-    verified = {}
     # Freeze a single input set for both the tarball and separately signed raw
     # assets; a concurrent build must not make these two outputs disagree.
     with tempfile.TemporaryDirectory(prefix="linux-release-inputs-") as temporary:
@@ -1185,22 +1494,23 @@ def main():
         if args.export_binaries is not None:
             export_binaries(snapshot, binaries, args.export_binaries, pin)
             return
-        if pin is not None:
-            # Execute the exact bytes that go into the archive (also with
-            # --skip-build); create_archive re-checks them against this digest.
-            verified[BOOTSTRAP_BINARY] = verify_bootstrap_binary(snapshot / BOOTSTRAP_BINARY, args.target,
-                                                                 pin, version)
+        # The archive first: create_archive runs the whole sealed flow for the
+        # verifier (also with --skip-build and --binary-dir, where the sealed bytes
+        # must also equal the handed-off SHA256SUMS entry) before any offline key
+        # is touched. The snapshot path is only the flow's source.
+        archive, report = create_archive(
+            snapshot, ROOT / "python", args.target, args.output_dir, binaries=archive_binaries(False),
+            bootstrap_pin=pin, bootstrap_version=version if pin is not None else None,
+            expected_bootstrap_sha256=transfer[BOOTSTRAP_BINARY] if transfer is not None and pin is not None else None)
         signed = sign_release(snapshot, args.target, args.output_dir,
                               args.manifest_template, args.signing_key, args.ssh_keygen, args.runtime_artifacts_dir)
-        archive = create_archive(snapshot, ROOT / "python", args.target, args.output_dir, binaries=binaries,
-                                 verified=verified)
         if args.bootstrap_root:
             create_bootstrap_inbox(args.target, args.output_dir, args.bootstrap_root, args.bootstrap_root_signatures)
-    if pin is None:
+    if report is None:
         bootstrap = f"{BOOTSTRAP_BINARY} NOT included (no production root pin)"
     else:
-        bootstrap = (f"{BOOTSTRAP_BINARY} included (executed here: PRODUCTION {pin}, "
-                     f"sha256 {verified[BOOTSTRAP_BINARY]})")
+        bootstrap = (f"{BOOTSTRAP_BINARY} included (executed here: PRODUCTION {report.pin}, "
+                     f"sha256 {report.sha256})")
     print(f"Packaged {archive}; {bootstrap}; {len(signed)} protected update assets generated.")
 
 

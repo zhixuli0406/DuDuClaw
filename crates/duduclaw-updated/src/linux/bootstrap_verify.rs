@@ -4,7 +4,8 @@
 //! gateway from a sealed memfd. The CLI accepts no path: every location below is
 //! a constant. Every failure is final: no retry, no downgrade, no path fallback.
 use std::{ffi::CString, fs::File, io::{Read, Seek, SeekFrom, Write}, mem::MaybeUninit,
-    os::{fd::{AsRawFd, FromRawFd, RawFd}, unix::fs::{FileExt, PermissionsExt}}, path::{Path, PathBuf}};
+    os::{fd::{AsRawFd, FromRawFd, RawFd}, unix::fs::{FileExt, PermissionsExt}}, path::{Path, PathBuf},
+    time::{Duration, Instant}};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use duduclaw_isolation::{ids::Sha256Digest, update::*};
@@ -30,6 +31,14 @@ pub const VERSION_PENDING: &str = "version-pending";
 /// the newest bundle this host's verifier accepted, persisted before anything runs.
 pub const BOOTSTRAP_HIGH_WATER: &str = "bootstrap-high-water.json";
 const MAX_HIGH_WATER_BYTES: u64 = 4096;
+/// `<PROTECTED_ROOT>/version-lock`: duduclaw-cli `protected_linux_install::version_lock`
+/// holds it (exclusive flock) while it writes version-floor / version-pending.
+pub const VERSION_LOCK: &str = "version-lock";
+/// `files::Directory::lock`'s file, in the state root and in the bootstrap stage directory.
+const UPDATE_LOCK: &str = "update.lock";
+/// Bounded wait for all acceptance locks together (see [`AcceptanceLocks`]).
+const LOCK_WAIT: Duration = Duration::from_secs(60);
+const LOCK_POLL: Duration = Duration::from_millis(50);
 /// Updater state and trust ledger below `linux::STATE_ROOT` (plan §3.1).
 const UPDATER_STATE: &str = "state.json";
 const UPDATER_LEDGER: &str = "trust-ledger.json";
@@ -315,8 +324,9 @@ pub(crate) fn verify_and_stage_with(config: &Config, mode: BootstrapMode, step: 
         return Err(Error::Maintenance);
     }
     // Anti-rollback (part of accepting the manifest), per mode: see check_history.
-    // Refused here before anything is created; `stage` re-checks under its lock and
-    // durably records the high-water mark before staging (and so before step 11).
+    // Refused here before anything is created; `stage` re-checks under the acceptance
+    // locks ([`AcceptanceLocks`]) and durably records the high-water mark before
+    // staging (and so before step 11).
     *step = Step::Manifest;
     check_history(&read_history(&config.paths)?, mode, resume, &verified.manifest,
         &high_water_of(&verified, generation), config.context.now)?;
@@ -537,14 +547,180 @@ pub(crate) fn raised_high_water(recorded: Option<&HighWater>, candidate: &HighWa
     }
 }
 
-/// Under the stage lock: re-read and re-check the history (closing the window
-/// between the unlocked check and this write), then durably raise the high-water
-/// record with `atomic_json` (temp file, fsync, renameat2, directory fsync) and read
-/// it back. Runs before the stage is written or reused, so before step 11.
-fn accept_and_record(paths: &Paths, protected: &Directory, mode: BootstrapMode, resume: Option<Sha256Digest>,
-    manifest: &ReleaseManifest, candidate: &HighWater, now: u64) -> Result<()> {
-    let history = read_history(paths)?;
-    check_history(&history, mode, resume, manifest, candidate, now)?;
+/// Locks held from the final anti-rollback re-read until this bundle is staged
+/// (install/upgrade) or the staged generation is re-verified (rollback).
+///
+/// LOCK ORDER — the only order used in this crate; acquired 1 → 3, released 3 → 1
+/// (fields drop in declaration order, so `state` goes first and `stage` last):
+///   1. `<protected>/bootstrap/update.lock` — the stage lock; taken only by this
+///      verifier (acceptance and rollback) and by the creator of the state root.
+///   2. `<protected>/version-lock` ([`VERSION_LOCK`]) — duduclaw-cli
+///      `protected_linux_install::version_lock` holds it (blocking LOCK_EX) for the whole
+///      of install / uninstall / upgrade, which write version-floor and version-pending
+///      (`prepare_version`, `record_floor`, also from protected_linux_upgrade.rs).
+///   3. `<state_root>/update.lock`, when the state root exists — `files::Directory::lock`
+///      (LOCK_EX|LOCK_NB) held by every updater-state writer (service, launcher,
+///      trust_init, trust_admin, emergency, bootstrap) and by the CLI's
+///      `parse_runtime_tree`.
+/// Creating the state root: when it does not exist there is no lock 3 to hold, so its
+/// creator must be serialised with acceptance by locks that exist beforehand. The one
+/// creator in this crate, `trust_init::publish`, goes through
+/// [`create_state_root_locked`]: lock 1, then lock 2 (bounded, like acceptance), THEN
+/// create the root (0700) and take its lock 3 (LOCK_NB), all held until it returns.
+/// The CLI's install creates it (`protected_linux_layout::DIRECTORIES`) while holding
+/// lock 2, which acceptance holds too. As a second line of defence acceptance still
+/// refuses (`Busy`) when a root that was absent when its locks were taken exists after
+/// the history re-read or after the decision ([`read_unless_state_root_appeared`]).
+/// Deadlock check: lock 1 is only ever taken first, while holding nothing, with a
+/// bounded wait (acceptance, rollback, the state-root creator). No writer takes an
+/// earlier lock while holding a later one: the nested writers take 2 then 3 (CLI
+/// install → parse_runtime_tree) or 1, 2, 3 (acceptance, rollback, the creator). Every
+/// lock-3 holder except acceptance and rollback fails instead of waiting (LOCK_NB), and
+/// those two wait for it only within their deadline. So no cycle can form, and every
+/// wait in this crate ends (`Busy`). flock is per open file description: a caller that
+/// already holds lock 1 or 2 through another description (e.g. the CLI's version_lock)
+/// and then enters acceptance or the creator waits for itself and is refused (`Busy`)
+/// after [`LOCK_WAIT`]; it never proceeds unlocked.
+/// All three are taken with exclusive flock on the writers' own lock files, opened
+/// through the verified dirfds (openat2, O_NOFOLLOW, no symlinks), within one bounded
+/// deadline ([`LOCK_WAIT`]): a lock that cannot be had in time refuses (`Busy`), never
+/// proceeds unlocked.
+struct AcceptanceLocks { state: Option<File>, _version: File, _stage: File }
+impl AcceptanceLocks {
+    fn acquire(paths: &Paths, protected: &Directory, stages: &Directory, wait: Duration) -> Result<Self> {
+        let deadline = Instant::now() + wait;
+        let (stage, version) = outer_locks(protected, stages, deadline)?;
+        let state = match optional(Directory::open(&paths.state_root))? {
+            None => None,
+            Some(dir) => {
+                if mode_of(&dir)? != 0o700 { return Err(Error::Maintenance); }
+                let lock = open_lock(&dir, UPDATE_LOCK, &[UPDATER_STATE, UPDATER_LEDGER])?;
+                flock_until(&lock, deadline)?;
+                Some(lock)
+            }
+        };
+        Ok(Self { state, _version: version, _stage: stage })
+    }
+}
+
+/// Locks 1 → 2 of LOCK ORDER ([`AcceptanceLocks`]), each within `deadline`.
+fn outer_locks(protected: &Directory, stages: &Directory, deadline: Instant) -> Result<(File, File)> {
+    let stage = open_lock(stages, UPDATE_LOCK, &[])?;
+    flock_until(&stage, deadline)?;
+    let version = open_lock(protected, VERSION_LOCK, &[VERSION_FLOOR, VERSION_PENDING])?;
+    flock_until(&version, deadline)?;
+    Ok((stage, version))
+}
+
+/// What the creator of the state root holds (LOCK ORDER, [`AcceptanceLocks`]): the
+/// state root itself and locks 3, 2, 1, released in that order (declaration order).
+pub(crate) struct StateRootLocks { pub state: Directory, _state_lock: File, _version: File, _stage: File }
+
+/// Create (or open) the state root only under the bootstrap acceptance locks: lock 1
+/// (`<protected>/bootstrap/update.lock`), lock 2 (`<protected>/version-lock`), then
+/// the root (root 0700, created if absent, any other mode refused) and its update.lock
+/// (lock 3, `files::Directory::lock`). `protected` must already hold the verified
+/// stage directory: nothing but missing lock files is created there.
+pub(crate) fn create_state_root_locked(protected: &Path, state_root: &Path) -> Result<StateRootLocks> {
+    create_state_root_locked_until(protected, state_root, Instant::now() + LOCK_WAIT)
+}
+
+fn create_state_root_locked_until(protected: &Path, state_root: &Path, deadline: Instant) -> Result<StateRootLocks> {
+    let protected = Directory::open(protected)?;
+    if mode_of(&protected)? != 0o700 { return Err(Error::Maintenance); }
+    let stages = protected.child(STAGE_DIRECTORY)?;
+    if mode_of(&stages)? != 0o700 { return Err(Error::Maintenance); }
+    let (stage, version) = outer_locks(&protected, &stages, deadline)?;
+    let (parent, name) = open_parent(state_root)?;
+    let state = ensure_dir(&parent, &name, 0o700)?;
+    let state_lock = state.lock()?;
+    Ok(StateRootLocks { state, _state_lock: state_lock, _version: version, _stage: stage })
+}
+
+/// Open the lock file `name` in `dir` the way its writers do. Writers create a lock
+/// before the first file it guards and never remove it, so a missing lock beside any
+/// `guarded` file refuses; otherwise a missing lock is created (O_EXCL, 0600; an
+/// existing one is opened instead). Symlinks and other non-regular files refuse
+/// (openat2 O_NOFOLLOW + `files` owner checks), as does anything but root:root, one
+/// link and exactly 0600 (the CLI's `version_lock` rule).
+fn open_lock(dir: &Directory, name: &str, guarded: &[&str]) -> Result<File> {
+    let file = match dir.read(name) {
+        Ok(file) => file,
+        Err(error) if missing(&error) => {
+            for guarded in guarded {
+                if optional(dir.read(guarded))?.is_some() { return Err(Error::Maintenance); }
+            }
+            match dir.create(name) {
+                Ok(file) => file,
+                Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => dir.read(name)?,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(error) => return Err(error),
+    };
+    if file.metadata()?.permissions().mode() & 0o7777 != 0o600 { return Err(Error::Maintenance); }
+    Ok(file)
+}
+
+/// Exclusive flock, polled until `deadline`; `Busy` when it is still held then.
+pub(crate) fn flock_until(file: &File, deadline: Instant) -> Result<()> {
+    loop {
+        // SAFETY: scalar flock on a live descriptor.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 { return Ok(()); }
+        let error = std::io::Error::last_os_error();
+        if !matches!(error.raw_os_error(), Some(libc::EWOULDBLOCK | libc::EINTR)) { return Err(error.into()); }
+        let now = Instant::now();
+        if now >= deadline { return Err(Error::Busy); }
+        std::thread::sleep(LOCK_POLL.min(deadline - now));
+    }
+}
+
+/// Serialised acceptance: take every lock first (`lock`, in LOCK ORDER), then re-read
+/// the history and decide/record (`accept`) — closing the window between the unlocked
+/// check and the high-water write. The guard is returned so the caller holds the
+/// locks until staging is complete. Generic only so the ordering is unit-testable.
+pub(crate) fn accept_locked<G>(lock: impl FnOnce() -> Result<G>, read: impl FnOnce(&G) -> Result<History>,
+    accept: impl FnOnce(&History) -> Result<()>) -> Result<G> {
+    let guard = lock()?;
+    let history = read(&guard)?;
+    accept(&history)?;
+    Ok(guard)
+}
+
+/// Rollback under the same acceptance locks (LOCK ORDER): take them, re-read the
+/// history and re-run the anti-rollback check (`check`; rollback records nothing),
+/// then re-verify the already staged generation (`reverify`) while they are still
+/// held; they are released only after it returns. Generic only so the ordering is
+/// unit-testable.
+pub(crate) fn rollback_locked<G, T>(lock: impl FnOnce() -> Result<G>, read: impl FnOnce(&G) -> Result<History>,
+    check: impl FnOnce(&History) -> Result<()>, reverify: impl FnOnce(&G) -> Result<T>) -> Result<T> {
+    let guard = accept_locked(lock, read, check)?;
+    let result = reverify(&guard);
+    drop(guard);
+    result
+}
+
+/// `read_history` under [`AcceptanceLocks`] ([`read_unless_state_root_appeared`]).
+fn read_history_locked(paths: &Paths, locks: &AcceptanceLocks) -> Result<History> {
+    read_unless_state_root_appeared(locks.state.is_some(), &paths.state_root, || read_history(paths))
+}
+
+/// Second line of defence (LOCK ORDER): `state_locked` says whether the state root
+/// existed, and so had its update.lock taken, when the acceptance locks were taken.
+/// A root that was absent then but exists after `read` has a writer this run did not
+/// serialise with: refuse (`Busy`). Checked after the read, so a root created at any
+/// point up to then is caught; `stage` repeats it after the decision.
+pub(crate) fn read_unless_state_root_appeared<T>(state_locked: bool, state_root: &Path,
+    read: impl FnOnce() -> Result<T>) -> Result<T> {
+    let value = read()?;
+    if !state_locked && present(state_root) { return Err(Error::Busy); }
+    Ok(value)
+}
+
+/// Durably raise the high-water record with `atomic_json` (temp file, fsync,
+/// renameat2, directory fsync) and read it back. Called only from `accept_locked`,
+/// before the stage is written or reused, so before step 11.
+fn record_high_water(protected: &Directory, history: &History, candidate: &HighWater) -> Result<()> {
     if let Some(raised) = raised_high_water(history.high_water.as_ref(), candidate)? {
         protected.atomic_json(BOOTSTRAP_HIGH_WATER, &raised)?;
     }
@@ -772,22 +948,44 @@ fn stage(paths: &Paths, context: &Context, mode: BootstrapMode, resume: Option<S
         bundle_sha256: verified.bundle_sha256, bundle_size: verified.bundle_size,
         authorization_sha256: verified.authorization_sha256, verifier_pin_kind: context.pin_kind,
         verified_at_unix: context.now, artifacts: verified.manifest.artifacts.clone() };
+    let candidate = high_water_of(verified, generation);
+    let final_name = hex::encode(generation.0);
     if mode == BootstrapMode::Rollback {
-        // Rollback never creates or writes a stage: it only re-verifies the
-        // generation the in-progress run already staged (same receipt), or refuses.
-        let (receipt, _) = open_stage_at(&paths.protected, generation, context)?;
-        if !same_verification(&receipt, &expected) { return Err(Error::Maintenance); }
-        return Ok(receipt);
+        // Rollback never creates or writes a stage, a directory or a record: it only
+        // re-verifies the generation the in-progress run already staged (same
+        // receipt), or refuses. It takes the same three acceptance locks (LOCK ORDER),
+        // re-reads the history and re-runs check_history under them, so an updater
+        // that committed a higher floor or state after the unlocked check makes it
+        // refuse; the locks are held until the re-verification is complete.
+        let protected = Directory::open(&paths.protected)?;
+        if mode_of(&protected)? != 0o700 { return Err(Error::Maintenance); }
+        let stages = protected.child(STAGE_DIRECTORY)?;
+        if mode_of(&stages)? != 0o700 { return Err(Error::Maintenance); }
+        return rollback_locked(|| AcceptanceLocks::acquire(paths, &protected, &stages, LOCK_WAIT),
+            |locks| read_history_locked(paths, locks),
+            |history| check_history(history, mode, resume, &verified.manifest, &candidate, context.now),
+            |locks: &AcceptanceLocks| {
+                read_unless_state_root_appeared(locks.state.is_some(), &paths.state_root, || Ok(()))?;
+                let (receipt, _) = check_stage(&stages.child(&final_name)?, generation, context)?;
+                if !same_verification(&receipt, &expected) { return Err(Error::Maintenance); }
+                Ok(receipt)
+            });
     }
     let (parent, name) = open_parent(&paths.protected)?;
     let protected = ensure_dir(&parent, &name, 0o700)?;
     let stages = ensure_dir(&protected, STAGE_DIRECTORY, 0o700)?;
-    let _lock = stages.lock()?;
-    // Accepted: the high-water record is durable before the stage is written or
-    // reused, so before any bundle byte can be executed (step 11).
-    accept_and_record(paths, &protected, mode, resume, &verified.manifest, &high_water_of(verified, generation),
-        context.now)?;
-    let final_name = hex::encode(generation.0);
+    // Accepted under all three acceptance locks (LOCK ORDER, `AcceptanceLocks`), held
+    // until this function returns, i.e. until the stage is published or reused. The
+    // high-water record is durable before the stage is written or reused, so before
+    // any bundle byte can be executed (step 11).
+    let locks = accept_locked(|| AcceptanceLocks::acquire(paths, &protected, &stages, LOCK_WAIT),
+        |locks| read_history_locked(paths, locks),
+        |history| {
+            check_history(history, mode, resume, &verified.manifest, &candidate, context.now)?;
+            record_high_water(&protected, history, &candidate)
+        })?;
+    // Second line of defence, after the decision: no unserialised state root appeared.
+    read_unless_state_root_appeared(locks.state.is_some(), &paths.state_root, || Ok(()))?;
     match stages.child(&final_name) {
         Ok(existing) => {
             // Never overwritten: the whole stage is re-verified and must agree.
@@ -1469,6 +1667,143 @@ pub(crate) mod tests {
         assert_eq!(precondition_rule(Some(&journal(Upgrade, false)), true, Upgrade).unwrap(), Some(generation));
     }
 
+    #[test]
+    fn acceptance_waits_for_the_version_lock_and_rechecks_a_floor_raised_meanwhile() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let lock_path = temp.path().join(VERSION_LOCK);
+        let floor_path = temp.path().join(VERSION_FLOOR);
+        std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&lock_path).unwrap();
+        std::fs::write(&floor_path, crate::version_text(lower())).unwrap();
+        let fixture = build(Architecture::X86_64, None, version());
+        let mine = candidate(&fixture);
+        // The production flock (`flock_until`), each time on a fresh open file description.
+        let lock = |wait: Duration| -> Result<File> {
+            let file = File::open(&lock_path)?;
+            flock_until(&file, Instant::now() + wait)?;
+            Ok(file)
+        };
+        let read = |_: &File| -> Result<History> {
+            Ok(History { floor: Some(parse_version_file(&std::fs::read(&floor_path)?)?), ..no_history() })
+        };
+        let accept = |history: &History| check_history(history, BootstrapMode::Upgrade, None, &fixture.manifest, &mine, NOW);
+        // Nobody holds the lock: a floor below the bundle is accepted at once.
+        drop(accept_locked(|| lock(Duration::from_secs(5)), read, accept).unwrap());
+        // A legacy writer holds the version lock (the CLI's `version_lock`: LOCK_EX) ...
+        let holder = File::open(&lock_path).unwrap();
+        // SAFETY: scalar flock on a live descriptor.
+        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) }, 0);
+        // ... so a bounded acquisition refuses (Busy) instead of proceeding unlocked ...
+        assert!(matches!(accept_locked(|| lock(Duration::from_millis(200)), read, accept), Err(Error::Busy)));
+        // ... and acceptance blocks until the writer, which raises the floor above this
+        // bundle while it holds the lock, releases it; the re-read then refuses.
+        let hold = Duration::from_millis(400);
+        let raised = floor_path.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(hold);
+            std::fs::write(&raised, crate::version_text(next_patch())).unwrap();
+            drop(holder);
+        });
+        let started = Instant::now();
+        let result = accept_locked(|| lock(Duration::from_secs(30)), read, accept);
+        assert!(started.elapsed() >= hold / 2, "acceptance did not wait for the version lock");
+        assert!(matches!(result, Err(Error::Rollback)));
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn state_root_appearing_after_the_locks_were_taken_refuses_acceptance() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("updated-state");
+        let fixture = build(Architecture::X86_64, None, version());
+        let mine = candidate(&fixture);
+        let accepted = std::cell::Cell::new(false);
+        // The guard records what `AcceptanceLocks::acquire` decides: whether the state root
+        // existed (and so had its update.lock taken) when the locks were taken.
+        let lock = || -> Result<bool> { Ok(present(&state_root)) };
+        let accept = |history: &History| -> Result<()> {
+            check_history(history, BootstrapMode::Install, None, &fixture.manifest, &mine, NOW)?;
+            accepted.set(true);
+            Ok(())
+        };
+        // Absent when locked and after the read: a fresh host, accepted.
+        let unchanged = |locked: &bool| read_unless_state_root_appeared(*locked, &state_root, || Ok(no_history()));
+        assert!(!accept_locked(lock, unchanged, accept).unwrap());
+        assert!(accepted.replace(false));
+        // Another process creates the state root after acceptance's lock-time check (here
+        // while the history is re-read) without serialising with it: refused, nothing is
+        // decided or recorded.
+        let appearing = |locked: &bool| read_unless_state_root_appeared(*locked, &state_root, || {
+            std::fs::create_dir(&state_root)?;
+            Ok(no_history())
+        });
+        assert!(matches!(accept_locked(lock, appearing, accept), Err(Error::Busy)));
+        assert!(!accepted.get());
+        // Present when the locks were taken (its update.lock is held then): accepted.
+        assert!(accept_locked(lock, unchanged, accept).unwrap());
+        assert!(accepted.replace(false));
+        // The re-check after the decision (`stage`, before anything is staged) catches a
+        // root that appears after the read.
+        std::fs::remove_dir(&state_root).unwrap();
+        let locked = accept_locked(lock, unchanged, accept).unwrap();
+        std::fs::create_dir(&state_root).unwrap();
+        assert!(matches!(read_unless_state_root_appeared(locked, &state_root, || Ok(())), Err(Error::Busy)));
+    }
+
+    #[test]
+    fn rollback_refuses_a_floor_raised_during_rollback_and_reverifies_under_the_locks() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let lock_path = temp.path().join(VERSION_LOCK);
+        let floor_path = temp.path().join(VERSION_FLOOR);
+        std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&lock_path).unwrap();
+        std::fs::write(&floor_path, crate::version_text(lower())).unwrap();
+        let fixture = build(Architecture::X86_64, None, version());
+        let mine = candidate(&fixture);
+        // The production flock (`flock_until`), each time on a fresh open file description.
+        let lock = |wait: Duration| -> Result<File> {
+            let file = File::open(&lock_path)?;
+            flock_until(&file, Instant::now() + wait)?;
+            Ok(file)
+        };
+        // The in-progress run recorded this generation; the floor is re-read under the lock.
+        let read = |_: &File| -> Result<History> {
+            Ok(History { floor: Some(parse_version_file(&std::fs::read(&floor_path)?)?), high_water: Some(mine),
+                ..no_history() })
+        };
+        let check = |history: &History| check_history(history, BootstrapMode::Rollback, Some(mine.digest),
+            &fixture.manifest, &mine, NOW);
+        // Uncontended: the stage is re-verified while the lock is still held (another open
+        // file description cannot take it then).
+        let held_during_reverify = |_: &File| -> Result<bool> {
+            let probe = File::open(&lock_path)?;
+            // SAFETY: scalar flock on a live descriptor.
+            Ok(unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0)
+        };
+        assert!(rollback_locked(|| lock(Duration::from_secs(5)), read, check, held_during_reverify).unwrap());
+        // A concurrent updater holds the version lock and raises the floor above this
+        // generation: rollback waits, re-reads under the lock and refuses; the old
+        // generation is never re-verified, so never executed.
+        let holder = File::open(&lock_path).unwrap();
+        // SAFETY: scalar flock on a live descriptor.
+        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let hold = Duration::from_millis(400);
+        let raised = floor_path.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(hold);
+            std::fs::write(&raised, crate::version_text(next_patch())).unwrap();
+            drop(holder);
+        });
+        let reverified = std::cell::Cell::new(false);
+        let started = Instant::now();
+        let result = rollback_locked(|| lock(Duration::from_secs(30)), read, check,
+            |_: &File| -> Result<()> { reverified.set(true); Ok(()) });
+        assert!(started.elapsed() >= hold / 2, "rollback did not wait for the version lock");
+        assert!(matches!(result, Err(Error::Rollback)));
+        assert!(!reverified.get());
+        writer.join().unwrap();
+    }
+
     // ------------------------------------------------------------ root (VM) tests
 
     pub(crate) fn host_fixture(updater: Option<Vec<u8>>) -> Fixture {
@@ -1646,6 +1981,8 @@ pub(crate) mod tests {
         };
         std::fs::create_dir(&protected).unwrap();
         std::fs::set_permissions(&protected, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // The floor writer (CLI `version_lock`) creates its lock before any floor file.
+        private_file(&protected.join(VERSION_LOCK), b"", 0o600);
 
         // Rollback with an uncommitted journal of this very generation but nothing
         // staged: refused at step 9 and nothing is created.
@@ -1702,6 +2039,8 @@ pub(crate) mod tests {
         let state_root = config.paths.state_root.clone();
         std::fs::create_dir(&state_root).unwrap();
         std::fs::set_permissions(&state_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // State writers (`files::Directory::lock`) create update.lock before state.json.
+        private_file(&state_root.join(UPDATE_LOCK), b"", 0o600);
         let state_file = state_root.join(UPDATER_STATE);
         let replay = crate::linux::trust_init::initial_state(&fixture.manifest, Sha256Digest([7; 32]));
         private_file(&state_file, &serde_json::to_vec(&replay).unwrap(), 0o600);
@@ -1788,6 +2127,187 @@ pub(crate) mod tests {
         assert_eq!(step, Step::Manifest);
         std::fs::set_permissions(&record_path, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(verify_and_stage_with(&config, BootstrapMode::Install, &mut step).is_ok());
+    }
+
+    #[test]
+    #[ignore = "requires root native Linux openat2/statx/memfd and flock; writes only its own /root fixture tree"]
+    fn iso_root_bootstrap_acceptance_serialises_with_floor_and_state_writers() {
+        use std::os::unix::fs::{symlink, MetadataExt, OpenOptionsExt};
+        let temp = root_temp();
+        let empty = temp.path().join("facts-root");
+        std::fs::create_dir(&empty).unwrap();
+        let fixture = host_fixture(None);
+        let config = root_config(temp.path(), &fixture, empty);
+        let protected = config.paths.protected.clone();
+        let state_root = config.paths.state_root.clone();
+        let generation = manifest_digest(&fixture.manifest_bytes);
+        let staged = protected.join(STAGE_DIRECTORY).join(hex::encode(generation.0));
+        let record = protected.join(BOOTSTRAP_HIGH_WATER);
+        let floor = protected.join(VERSION_FLOOR);
+        let version_lock = protected.join(VERSION_LOCK);
+        let private_file = |path: &Path, bytes: &[u8], mode: u32| {
+            let _ = std::fs::remove_file(path);
+            std::fs::write(path, bytes).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let private_dir = |path: &Path| {
+            std::fs::create_dir(path).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        };
+        let nothing_accepted = || !record.exists() && !staged.exists();
+        private_dir(&protected);
+        private_file(&version_lock, b"", 0o600);
+        private_file(&floor, crate::version_text(lower()).as_bytes(), 0o600);
+        // Long enough that the unlocked step-8 check has surely run before the writer acts.
+        let hold = Duration::from_millis(1500);
+        let mut step = Step::Harden;
+
+        // 1. The single-binary updater (CLI `version_lock`: O_NOFOLLOW open, blocking
+        //    LOCK_EX) holds the version lock and raises the floor above this bundle.
+        let (locked, wait_locked) = std::sync::mpsc::channel();
+        let writer = {
+            let (lock_path, floor) = (version_lock.clone(), floor.clone());
+            std::thread::spawn(move || {
+                let lock = std::fs::OpenOptions::new().read(true).write(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(&lock_path).unwrap();
+                // SAFETY: scalar flock on a live descriptor.
+                assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+                locked.send(()).unwrap();
+                std::thread::sleep(hold);
+                let _ = std::fs::remove_file(&floor);
+                std::fs::write(&floor, crate::version_text(next_patch())).unwrap();
+                std::fs::set_permissions(&floor, std::fs::Permissions::from_mode(0o600)).unwrap();
+                drop(lock);
+            })
+        };
+        wait_locked.recv().unwrap();
+        let started = Instant::now();
+        // The unlocked check saw the lower floor; the re-read under the locks sees the raised one.
+        assert!(matches!(verify_and_stage_with(&config, BootstrapMode::Upgrade, &mut step), Err(Error::Rollback)));
+        assert_eq!(step, Step::Stage);
+        assert!(started.elapsed() >= hold / 2, "acceptance did not wait for the version lock");
+        writer.join().unwrap();
+        assert!(nothing_accepted());
+
+        // 2. An updater-state writer (`files::Directory::lock` on the state root) commits
+        //    another generation at this serial while it holds update.lock.
+        private_file(&floor, crate::version_text(lower()).as_bytes(), 0o600);
+        private_dir(&state_root);
+        let (locked, wait_locked) = std::sync::mpsc::channel();
+        let writer = {
+            let state_root = state_root.clone();
+            let replay = crate::linux::trust_init::initial_state(&fixture.manifest, Sha256Digest([7; 32]));
+            std::thread::spawn(move || {
+                let dir = Directory::open(&state_root).unwrap();
+                let lock = dir.lock().unwrap();
+                locked.send(()).unwrap();
+                std::thread::sleep(hold);
+                dir.atomic_json(UPDATER_STATE, &replay).unwrap();
+                drop(lock);
+            })
+        };
+        wait_locked.recv().unwrap();
+        let started = Instant::now();
+        assert!(matches!(verify_and_stage_with(&config, BootstrapMode::Upgrade, &mut step), Err(Error::Rollback)));
+        assert_eq!(step, Step::Stage);
+        assert!(started.elapsed() >= hold / 2, "acceptance did not wait for the state lock");
+        writer.join().unwrap();
+        assert!(nothing_accepted());
+        std::fs::remove_file(state_root.join(UPDATER_STATE)).unwrap();
+
+        // 3. Lock files unlike the ones their writers create refuse; nothing is accepted.
+        private_file(&protected.join("lock-target"), b"", 0o600);
+        std::fs::remove_file(&version_lock).unwrap();
+        symlink(protected.join("lock-target"), &version_lock).unwrap();
+        assert!(verify_and_stage_with(&config, BootstrapMode::Upgrade, &mut step).is_err());
+        assert_eq!(step, Step::Stage);
+        std::fs::remove_file(&version_lock).unwrap();
+        std::fs::remove_file(protected.join("lock-target")).unwrap();
+        private_file(&version_lock, b"", 0o644);
+        assert!(matches!(verify_and_stage_with(&config, BootstrapMode::Upgrade, &mut step), Err(Error::Maintenance)));
+        assert_eq!(step, Step::Stage);
+        // Missing beside the floor it guards: the floor writer always creates it first.
+        std::fs::remove_file(&version_lock).unwrap();
+        assert!(matches!(verify_and_stage_with(&config, BootstrapMode::Upgrade, &mut step), Err(Error::Maintenance)));
+        assert_eq!(step, Step::Stage);
+        assert!(!version_lock.exists());
+        private_file(&version_lock, b"", 0o600);
+        // The state root's update.lock missing beside the state.json it guards.
+        let same = crate::linux::trust_init::initial_state(&fixture.manifest, generation);
+        private_file(&state_root.join(UPDATER_STATE), &serde_json::to_vec(&same).unwrap(), 0o600);
+        std::fs::remove_file(state_root.join(UPDATE_LOCK)).unwrap();
+        assert!(matches!(verify_and_stage_with(&config, BootstrapMode::Upgrade, &mut step), Err(Error::Maintenance)));
+        assert_eq!(step, Step::Stage);
+        assert!(nothing_accepted());
+        std::fs::remove_file(state_root.join(UPDATER_STATE)).unwrap();
+
+        // 4. Uncontended: accepted and staged; the lock files are the writers' own (root 0600).
+        let receipt = verify_and_stage_with(&config, BootstrapMode::Upgrade, &mut step).unwrap().receipt;
+        assert_eq!(receipt.manifest_digest, generation);
+        assert!(record.exists() && staged.exists());
+        for lock in [version_lock.clone(), state_root.join(UPDATE_LOCK), protected.join(STAGE_DIRECTORY).join(UPDATE_LOCK)] {
+            let metadata = std::fs::symlink_metadata(&lock).unwrap();
+            assert!(metadata.file_type().is_file());
+            assert_eq!((metadata.uid(), metadata.mode() & 0o7777, metadata.nlink()), (0, 0o600, 1));
+        }
+
+        // 5. Rollback takes the same locks: uncontended it re-verifies the staged
+        //    generation; when an updater raises the floor while rollback waits for the
+        //    version lock, the re-read under the locks refuses and nothing is executed.
+        write_journal(&config, "upgrade", &hex::encode(generation.0), false);
+        assert_eq!(verify_and_stage_with(&config, BootstrapMode::Rollback, &mut step).unwrap().receipt, receipt);
+        let (locked, wait_locked) = std::sync::mpsc::channel();
+        let writer = {
+            let (lock_path, floor) = (version_lock.clone(), floor.clone());
+            std::thread::spawn(move || {
+                let lock = std::fs::OpenOptions::new().read(true).write(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(&lock_path).unwrap();
+                // SAFETY: scalar flock on a live descriptor.
+                assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+                locked.send(()).unwrap();
+                std::thread::sleep(hold);
+                let _ = std::fs::remove_file(&floor);
+                std::fs::write(&floor, crate::version_text(next_patch())).unwrap();
+                std::fs::set_permissions(&floor, std::fs::Permissions::from_mode(0o600)).unwrap();
+                drop(lock);
+            })
+        };
+        wait_locked.recv().unwrap();
+        let started = Instant::now();
+        assert!(matches!(verify_and_stage_with(&config, BootstrapMode::Rollback, &mut step), Err(Error::Rollback)));
+        assert_eq!(step, Step::Stage);
+        assert!(started.elapsed() >= hold / 2, "rollback did not wait for the version lock");
+        writer.join().unwrap();
+        std::fs::remove_file(protected.join(BOOTSTRAP_JOURNAL)).unwrap();
+        private_file(&floor, crate::version_text(lower()).as_bytes(), 0o600);
+
+        // 6. The state-root creator (trust_init) is serialised with acceptance by locks that
+        //    exist before the root does: while the CLI holds the version lock it creates
+        //    nothing; free, it creates the root with its update.lock, and an acceptance
+        //    started while it holds its locks waits for it, then takes the new root's lock.
+        std::fs::remove_file(state_root.join(UPDATE_LOCK)).unwrap();
+        std::fs::remove_dir(&state_root).unwrap();
+        let holder = std::fs::OpenOptions::new().read(true).write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(&version_lock).unwrap();
+        // SAFETY: scalar flock on a live descriptor.
+        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) }, 0);
+        assert!(matches!(create_state_root_locked_until(&protected, &state_root,
+            Instant::now() + Duration::from_millis(300)), Err(Error::Busy)));
+        assert!(!state_root.exists());
+        drop(holder);
+        let creator = create_state_root_locked_until(&protected, &state_root,
+            Instant::now() + Duration::from_secs(5)).unwrap();
+        let metadata = std::fs::symlink_metadata(&state_root).unwrap();
+        assert_eq!((metadata.uid(), metadata.mode() & 0o7777), (0, 0o700));
+        assert!(state_root.join(UPDATE_LOCK).exists());
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(hold);
+            drop(creator);
+        });
+        let started = Instant::now();
+        assert_eq!(verify_and_stage_with(&config, BootstrapMode::Upgrade, &mut step).unwrap().receipt, receipt);
+        assert!(started.elapsed() >= hold / 2, "acceptance did not wait for the state-root creator");
+        release.join().unwrap();
     }
 
     /// Fork, put the pty on fd 0/1/2, then exec the sealed memfd through the

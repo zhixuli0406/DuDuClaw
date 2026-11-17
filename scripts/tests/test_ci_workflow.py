@@ -27,10 +27,10 @@ class CiWorkflowTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         # BaseLoader preserves GitHub's `on` key instead of YAML 1.1's boolean.
-        cls.workflow = yaml.load(
+        cls.workflow_data = yaml.load(
             (ROOT / ".github/workflows/ci.yml").read_text(), Loader=yaml.BaseLoader
         )
-        cls.jobs = cls.workflow["jobs"]
+        cls.jobs = cls.workflow_data["jobs"]
 
     def commands(self, job):
         return [
@@ -41,7 +41,7 @@ class CiWorkflowTests(unittest.TestCase):
         ]
 
     def test_ci_permissions_are_read_only(self):
-        self.assertEqual(self.workflow["permissions"], {"contents": "read"})
+        self.assertEqual(self.workflow_data["permissions"], {"contents": "read"})
         for job in self.jobs.values():
             self.assertNotIn("permissions", job)
 
@@ -58,7 +58,7 @@ class CiWorkflowTests(unittest.TestCase):
     }
 
     @staticmethod
-    def workflow(name):
+    def load_workflow(name):
         return yaml.load((ROOT / f".github/workflows/{name}.yml").read_text(), Loader=yaml.BaseLoader)
 
     def linux_steps(self, job):
@@ -130,7 +130,7 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertEqual(len(checks), 2)
         for check in checks:
             self.assertIn('[[ "$actual" == "TEST $SMOKE_TEST_PIN" ]]', check["run"])
-            self.assertIn("packager.verify_bootstrap_binary(", check["run"])
+            self.assertIn("packager.check_bootstrap_file(", check["run"])
             self.assertIn('sys.exit("production packager accepted a TEST-root verifier")', check["run"])
         arm = smoke["jobs"]["package-arm64"]
         self.assertEqual(arm["runs-on"], "ubuntu-24.04-arm")
@@ -140,8 +140,8 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertIn('[[ "${actual%% *}" == "$VERIFIER_SHA256" ]]', handoff["run"])
 
     def test_linux_release_smoke_matches_release_build_steps(self):
-        release = self.workflow("release")
-        smoke = self.workflow("linux-release-smoke")
+        release = self.load_workflow("release")
+        smoke = self.load_workflow("linux-release-smoke")
         # Compare full ordered steps: action pins/options, commands, features,
         # conditions, and environment must all follow the shipping Linux path.
         expected = self.linux_steps(release["jobs"]["build"])
@@ -202,7 +202,7 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertEqual(steps[0], {"uses": checkout})
 
     def test_release_packages_aarch64_natively_from_a_hash_checked_handoff(self):
-        release = self.workflow("release")
+        release = self.load_workflow("release")
         build, arm = release["jobs"]["build"], release["jobs"]["package-linux-arm64"]
         # Both Linux targets are still cross-built on the x86_64 runner (glibc floor unchanged).
         linux = [m for m in build["strategy"]["matrix"]["include"] if "linux" in m["target"]]
@@ -249,7 +249,7 @@ class CiWorkflowTests(unittest.TestCase):
             self.assertIn("set -euo pipefail", step["run"])
 
     def test_latest_runs_do_not_cancel_other_prs_or_main(self):
-        concurrency = self.workflow["concurrency"]
+        concurrency = self.workflow_data["concurrency"]
         group = concurrency["group"]
         for context in ("github.workflow", "github.event_name",
                         "github.event.pull_request.number", "github.ref"):
@@ -258,10 +258,10 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertEqual(concurrency["cancel-in-progress"],
                          "${{ github.event_name == 'pull_request' }}")
         for event in ("push", "pull_request"):
-            trigger = self.workflow["on"][event]
+            trigger = self.workflow_data["on"][event]
             self.assertEqual(trigger["branches"], ["main"])
             self.assertFalse({"paths", "paths-ignore"} & trigger.keys())
-        self.assertIn("workflow_dispatch", self.workflow["on"])
+        self.assertIn("workflow_dispatch", self.workflow_data["on"])
 
     def test_required_jobs_run_even_if_settle_fails(self):
         for job, name in (("rust",
@@ -299,14 +299,14 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertEqual(json.loads(expression[1]), [{"os": "ubuntu-latest", "shard": 1}])
         for event in ("push", "schedule", "workflow_dispatch"):
             with self.subTest(event=event):
-                self.assertIn(event, self.workflow["on"])
+                self.assertIn(event, self.workflow_data["on"])
                 self.assertEqual(json.loads(expression[2]),
                                  [{"os": "ubuntu-latest", "shard": 1}] + [
                                      {"os": os_name, "shard": shard}
                                      for os_name in ("macos-latest", "windows-latest")
                                      for shard in range(1, 4)
                                  ])
-        self.assertEqual(self.workflow["on"]["schedule"], [{"cron": "0 18 * * *"}])
+        self.assertEqual(self.workflow_data["on"]["schedule"], [{"cron": "0 18 * * *"}])
 
     def test_every_native_shard_partitions_both_nextest_suites(self):
         suites = [s for s in self.jobs["rust"]["steps"]
@@ -515,7 +515,7 @@ class CiWorkflowTests(unittest.TestCase):
                 self.assertNotIn("tauri-apps/tauri-action", step.get("uses", ""))
 
     def test_build_profiles_keep_debug_assertions(self):
-        env = self.workflow["env"]
+        env = self.workflow_data["env"]
         for profile in ("DEV", "TEST"):
             self.assertEqual(env[f"CARGO_PROFILE_{profile}_DEBUG"], "0")
         self.assertFalse(any("ASSERTIONS" in key or "OPT_LEVEL" in key

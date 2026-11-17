@@ -1,6 +1,8 @@
 //! R1 trust-root initialisation (plan §4.1 `trust_init::publish`), called by R3
 //! step S4 after the gateway is stopped and its processes are clear. Isolation
-//! facts start here. Everything runs under STATE_ROOT/update.lock. Each step first
+//! facts start here. Everything runs under the bootstrap stage lock, the version
+//! lock and STATE_ROOT/update.lock, taken in that order before STATE_ROOT may be
+//! created (`bootstrap_verify` LOCK ORDER). Each step first
 //! reads back what exists and skips it when already complete; anything present but
 //! different refuses (no repair, no overwrite), so an interrupted run resumes by
 //! calling `publish` again with the same receipt.
@@ -11,7 +13,8 @@ use super::{bootstrap_verify::{self, Context, StageReceipt}, files::{Directory, 
     launcher::SlotReceipt, service::TrustBundle, CONFIG_ROOT, INSTALL_ROOT, STATE_ROOT};
 
 /// Update-service subset of duduclaw-cli `protected_linux_layout::DIRECTORIES`,
-/// parent first, with the same modes. (STATE_ROOT is created before the lock.)
+/// parent first, with the same modes. (STATE_ROOT is created first, under the
+/// acceptance locks: `bootstrap_verify::create_state_root_locked`.)
 pub const UPDATE_DIRECTORIES: &[(&str, u32)] = &[
     ("/etc/duduclaw-updated", 0o700),
     ("/var/lib/duduclaw-updated", 0o700),
@@ -68,10 +71,15 @@ pub(crate) fn publish_at(protected: &Path, stage: &StageReceipt, context: &Conte
     let digest = stage.manifest_digest;
     let root = crate::trust::verify_root(&staged.root_bytes, &staged.root_signatures, context.pin, context.now)?;
 
-    // 1. Update-service directories (STATE_ROOT first: it holds the lock).
-    ensure_path(STATE_ROOT, 0o700)?;
-    let state = Directory::open(Path::new(STATE_ROOT))?;
-    let _lock = state.lock()?;
+    // 1. Update-service directories. STATE_ROOT first, and only under the bootstrap
+    //    acceptance locks (LOCK ORDER in bootstrap_verify: stage lock -> version-lock
+    //    -> create STATE_ROOT -> its update.lock), all held until this function
+    //    returns: a state root can then never appear between a bootstrap acceptance's
+    //    last history re-read and its high-water write / stage publish. A caller must
+    //    not already hold the CLI's version-lock (flock per open file description):
+    //    that is refused as Busy after the bounded wait, never run unlocked.
+    let locks = bootstrap_verify::create_state_root_locked(protected, Path::new(STATE_ROOT))?;
+    let state = &locks.state;
     for (path, mode) in UPDATE_DIRECTORIES { ensure_path(path, *mode)?; }
     checkpoint(1)?;
 
@@ -93,7 +101,7 @@ pub(crate) fn publish_at(protected: &Path, stage: &StageReceipt, context: &Conte
     checkpoint(4)?;
 
     // 5. state.json, read back byte-for-byte and through State::validate.
-    write_state(&state, &install, &staged.manifest, &staged.manifest_bytes, &staged.manifest_signature, digest,
+    write_state(state, &install, &staged.manifest, &staged.manifest_bytes, &staged.manifest_signature, digest,
         context.now)?;
     checkpoint(5)?;
 
@@ -103,7 +111,7 @@ pub(crate) fn publish_at(protected: &Path, stage: &StageReceipt, context: &Conte
     checkpoint(6)?;
 
     // 7. trust-ledger.json, so later verification no longer depends on trust.json.
-    record_ledger(&state, &staged.manifest_bytes, &staged.manifest_signature, context.now)?;
+    record_ledger(state, &staged.manifest_bytes, &staged.manifest_signature, context.now)?;
     checkpoint(7)?;
     Ok(digest)
 }

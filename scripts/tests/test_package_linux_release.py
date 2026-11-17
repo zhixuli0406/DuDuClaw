@@ -1,8 +1,10 @@
 """Exercise release staging, legacy size boundaries and offline signing locally."""
 import contextlib
 import errno
+import fcntl
 import hashlib
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -32,9 +34,81 @@ BOOTSTRAP_ENVIRONMENT = (PACKAGE.BOOTSTRAP_PIN_VARIABLE, PACKAGE.BOOTSTRAP_TEST_
                          "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS")
 
 
+LINUX = sys.platform.startswith("linux")
+
+
 def good_probes(pin=PIN, version=VERSION):
     return {"--print-root-pin": (0, f"PRODUCTION {pin}\n".encode()),
             "--version": (0, f"duduclaw-bootstrap {version}\n".encode())}
+
+
+def elf_image(target, tag=b"verifier"):
+    """A verifier fixture whose ELF header names `target` (the sealed flow checks it)."""
+    machine = PACKAGE.ELF_MACHINES[PACKAGE.TARGETS[target][0]]
+    header = b"\x7fELF" + bytes([2, 1, 1]) + bytes(9) + (2).to_bytes(2, "little") + machine.to_bytes(2, "little")
+    return header + b"\x00GLIBC_2.17\x00" + tag
+
+
+class StandInSeals:
+    """TEST-ONLY stand-in for _new_image/_add_seals/_get_seals where memfd does not
+    exist (macOS): an unlinked private file whose inode is recorded as "sealed".
+    It is installed only by patching (see LinuxReleaseTests.seam); the script has no
+    option that selects it. Linux runs use the real sealed memfd."""
+
+    def __init__(self):
+        self.sealed = set()
+
+    @staticmethod
+    def identity(descriptor):
+        metadata = os.fstat(descriptor)
+        return metadata.st_dev, metadata.st_ino
+
+    def new_image(self):
+        descriptor, name = tempfile.mkstemp()
+        os.unlink(name)
+        return descriptor
+
+    def add_seals(self, descriptor):
+        self.sealed.add(self.identity(descriptor))
+
+    def get_seals(self, descriptor):
+        return PACKAGE.BOOTSTRAP_SEALS if self.identity(descriptor) in self.sealed else 0
+
+    def patches(self):
+        return [patch.object(PACKAGE, "_new_image", self.new_image),
+                patch.object(PACKAGE, "_add_seals", self.add_seals),
+                patch.object(PACKAGE, "_get_seals", self.get_seals)]
+
+
+def unsealed_copy(descriptor):
+    """A new descriptor with the same bytes and NO seals (real memfd on Linux)."""
+    content = image_bytes(descriptor)
+    if LINUX:
+        copy = os.memfd_create("unsealed-substitute", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+    else:
+        copy, name = tempfile.mkstemp()
+        os.unlink(name)
+    os.write(copy, content)
+    return copy
+
+
+def image_bytes(descriptor):
+    return os.pread(descriptor, os.fstat(descriptor).st_size, 0)
+
+
+def answer(probes, descriptor, flag):
+    result = probes[flag]
+    if isinstance(result, BaseException):
+        raise result
+    return result(descriptor) if callable(result) else result
+
+
+def replace_file(path, content):
+    """Atomically swap the pathname to another inode (what a same-uid attacker can do)."""
+    swapped = Path(str(path) + ".swap")
+    swapped.write_bytes(content)
+    swapped.chmod(0o755)
+    os.replace(swapped, path)
 
 
 class LinuxReleaseTests(unittest.TestCase):
@@ -46,20 +120,58 @@ class LinuxReleaseTests(unittest.TestCase):
         self.binaries.mkdir()
         for name in PACKAGE.BIN_PACKAGES:
             binary = self.binaries / name
-            binary.write_bytes(b"\x7fELF\x00GLIBC_2.17\x00" + name.encode())
+            binary.write_bytes(elf_image(TARGET) if name == BOOTSTRAP
+                               else b"\x7fELF\x00GLIBC_2.17\x00" + name.encode())
             binary.chmod(0o755)
         self.python = self.root / "python"
         self.python.mkdir()
         (self.python / "example.py").write_text("print('fixture')\n")
         self.output = self.root / "out"
 
-    def package(self, target=TARGET, include_bootstrap=True):
-        verified = {BOOTSTRAP: PACKAGE.sha256(self.binaries / BOOTSTRAP)} if include_bootstrap else {}
-        return PACKAGE.create_archive(self.binaries, self.python, target, self.output,
-                                      binaries=PACKAGE.archive_binaries(include_bootstrap), verified=verified)
+    @contextlib.contextmanager
+    def seam(self, probes=None, host="x86_64", calls=None):
+        """Run the real sealed flow with only the probe execution (and, off Linux, the
+        memfd primitives) faked. Each source read is recorded as ["read", path]
+        and each probe as ["probe", sha256 of the image it was given, flag]; a
+        probe that is not listed fails the test, so "never executed" is asserted
+        by omission."""
+        probes = good_probes() if probes is None else probes
+        calls = [] if calls is None else calls
+        path_source = PACKAGE._path_source
+
+        def fake_probe(descriptor, flag):
+            calls.append(["probe", hashlib.sha256(image_bytes(descriptor)).hexdigest(), flag])
+            return answer(probes, descriptor, flag)
+
+        def recording_source(path):
+            calls.append(["read", str(path)])
+            return path_source(path)
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(PACKAGE, "host_architecture", return_value=host))
+            stack.enter_context(patch.object(PACKAGE, "_probe_image", fake_probe))
+            stack.enter_context(patch.object(PACKAGE, "_path_source", recording_source))
+            if not LINUX:
+                for stand_in in StandInSeals().patches():
+                    stack.enter_context(stand_in)
+            yield calls
+
+    def create(self, target=TARGET, pin=PIN, output=None, probes=None, host="native", calls=None, **kwargs):
+        """create_archive with the sealed flow (pin) or without the verifier (pin=None);
+        `host` defaults to the target's own architecture."""
+        expectations = {"bootstrap_pin": pin, "bootstrap_version": VERSION} if pin is not None else {}
+        host = PACKAGE.TARGETS[target][0] if host == "native" else host
+        with self.seam(probes, host, calls):
+            return PACKAGE.create_archive(self.binaries, self.python, target, output or self.output,
+                                          binaries=PACKAGE.archive_binaries(False), **expectations, **kwargs)
+
+    def package(self, target=TARGET, include_bootstrap=True, output=None):
+        archive, report = self.create(target, PIN if include_bootstrap else None, output)
+        self.assertEqual(report is None, not include_bootstrap)
+        return archive
 
     def test_both_archives_have_every_binary_regular_executable_and_sdk(self):
         for target in PACKAGE.TARGETS:
+            (self.binaries / BOOTSTRAP).write_bytes(elf_image(target))
             archive = self.package(target)
             with tarfile.open(archive) as bundle:
                 for name in [*PACKAGE.BIN_PACKAGES, *PACKAGE.ARCHIVE_ALIASES]:
@@ -125,7 +237,7 @@ class LinuxReleaseTests(unittest.TestCase):
 
     def run_main(self, release, calls, extra=(), environment=None, probes=None, host="x86_64",
                  skip_build=True, output=None):
-        """Run main() with Cargo, glibc checks and the verifier probe faked.
+        """Run main() with Cargo and glibc checks faked and the sealed flow under self.seam().
 
         `probes` maps a flag to (exit code, stdout); a probe that is not listed
         fails the test, so "never executed" is asserted by omission.
@@ -139,19 +251,11 @@ class LinuxReleaseTests(unittest.TestCase):
             if command[1:2] == ["build"]:
                 self.build_environment = kwargs.get("env")
             return subprocess.CompletedProcess(command, 0)
-
-        def fake_probe(path, flag):
-            calls.append(["probe", str(path), flag])
-            result = probes[flag]
-            if isinstance(result, BaseException):
-                raise result
-            return result(path) if callable(result) else result
         argv = ["package-linux-release.py", "--target", TARGET, "--output-dir", str(self.output),
                 *(["--skip-build"] if skip_build else []), *extra]
         with patch.object(PACKAGE, "release_binary_dir", return_value=release), \
                 patch.object(PACKAGE.subprocess, "run", fake_run), \
-                patch.object(PACKAGE, "probe_bootstrap", fake_probe), \
-                patch.object(PACKAGE, "host_architecture", return_value=host), \
+                self.seam(probes, host, calls), \
                 patch.object(sys, "argv", argv), \
                 patch.dict(os.environ, {"CI": "", "GITHUB_ACTIONS": "", **environment}), \
                 contextlib.redirect_stdout(output if output is not None else io.StringIO()):
@@ -237,10 +341,13 @@ class LinuxReleaseTests(unittest.TestCase):
                       f"sha256 {PACKAGE.sha256(release / BOOTSTRAP)})", output.getvalue().splitlines()[-1])
         probes = [call for call in calls if call[0] == "probe"]
         self.assertEqual([call[2] for call in probes], ["--print-root-pin", "--version"])
-        for call in probes:
-            # The probed file is the private snapshot that is archived, not Cargo's output.
-            self.assertNotEqual(Path(call[1]).parent, release)
-            self.assertEqual(Path(call[1]).name, BOOTSTRAP)
+        # Both probes executed the one sealed image of the built bytes ...
+        self.assertEqual({call[1] for call in probes}, {PACKAGE.sha256(release / BOOTSTRAP)})
+        # ... which was read exactly once, from the private snapshot, not Cargo's output.
+        reads = [call for call in calls if call[0] == "read"]
+        self.assertEqual(len(reads), 1)
+        self.assertNotEqual(Path(reads[0][1]).parent, release)
+        self.assertEqual(Path(reads[0][1]).name, BOOTSTRAP)
         with tarfile.open(self.output / "duduclaw-linux-x64.tar.gz") as bundle:
             self.assertEqual(bundle.extractfile(BOOTSTRAP).read(), (release / BOOTSTRAP).read_bytes())
 
@@ -289,7 +396,8 @@ class LinuxReleaseTests(unittest.TestCase):
                 calls = []
                 with self.assertRaisesRegex(ValueError, "cannot be executed on this host"):
                     self.run_main(release, calls, extra=pinned, probes=good, host=host)
-                self.assertFalse(any(call[0] == "probe" for call in calls))
+                # Refused before the verifier is even read, let alone executed.
+                self.assertFalse(any(call[0] in ("probe", "read") for call in calls))
                 self.assertFalse((self.output / "duduclaw-linux-x64.tar.gz").exists())
         for name, error in [("exec format error", OSError(errno.ENOEXEC, "Exec format error")),
                             ("missing loader", FileNotFoundError(errno.ENOENT, "No such file or directory")),
@@ -313,14 +421,14 @@ class LinuxReleaseTests(unittest.TestCase):
                                    binaries=[*PACKAGE.BIN_PACKAGES, "duduclaw-isolation-test-signer"])
         self.assertFalse(self.output.exists())
 
-    def run_build_only(self, release, extra, probes):
+    def run_build_only(self, release, extra, probes, calls=None):
         def fake_run(command, **kwargs):
             return subprocess.CompletedProcess(command, 0)
-        argv = ["package-linux-release.py", "--target", TARGET, "--build-only", *extra]
+        argv = ["package-linux-release.py", "--target", TARGET, "--build-only", "--output-dir", str(self.output),
+                *extra]
         with patch.object(PACKAGE, "release_binary_dir", return_value=release), \
                 patch.object(PACKAGE.subprocess, "run", fake_run), \
-                patch.object(PACKAGE, "probe_bootstrap", lambda path, flag: probes[flag]), \
-                patch.object(PACKAGE, "host_architecture", return_value="x86_64"), \
+                self.seam(probes, "x86_64", calls), \
                 patch.object(sys, "argv", argv), \
                 patch.dict(os.environ, {"CI": "", "GITHUB_ACTIONS": ""}), \
                 contextlib.redirect_stdout(io.StringIO()):
@@ -330,7 +438,12 @@ class LinuxReleaseTests(unittest.TestCase):
 
     def test_build_only_with_pin_verifies_the_fresh_build(self):
         release = self.cargo_layout()
-        self.run_build_only(release, ["--bootstrap-root-sha256", PIN], good_probes())
+        calls = []
+        self.run_build_only(release, ["--bootstrap-root-sha256", PIN], good_probes(), calls)
+        # Sealed straight from Cargo's output (one read), executed, nothing written.
+        self.assertEqual([call[1] for call in calls if call[0] == "read"], [str(release / BOOTSTRAP)])
+        self.assertEqual([call[2] for call in calls if call[0] == "probe"], ["--print-root-pin", "--version"])
+        self.assertFalse(self.output.exists())
         with self.assertRaises(ValueError):
             self.run_build_only(release, ["--bootstrap-root-sha256", PIN],
                                 {**good_probes(), "--print-root-pin": (0, f"TEST {PIN}\n".encode())})
@@ -373,62 +486,320 @@ class LinuxReleaseTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             PACKAGE.expected_bootstrap_pin(None, {PACKAGE.BOOTSTRAP_PIN_VARIABLE: "not-a-pin"}, True)
 
+    def real_host_target(self):
+        arch = PACKAGE.host_architecture()
+        target = next((name for name, (machine, _) in PACKAGE.TARGETS.items() if machine == arch), None)
+        if target is None:
+            self.skipTest("not a native x86_64/aarch64 Linux host")
+        return target
+
+    @unittest.skipUnless(LINUX, "the real probe executes a sealed memfd (Linux only)")
     def test_wrong_format_binary_is_refused_by_the_real_probe(self):
-        # Unpatched probe: a file the kernel cannot execute is a refusal, not a skip.
+        # Unpatched seal and probe: an image the kernel cannot execute (a header for
+        # this architecture, nothing loadable behind it) is a refusal, not a skip.
+        target = self.real_host_target()
         binary = self.binaries / BOOTSTRAP
-        binary.write_bytes(b"\x7fELF\x00not-a-loadable-image")
+        binary.write_bytes(elf_image(target, b"not-a-loadable-image"))
         binary.chmod(0o755)
         with self.assertRaisesRegex(ValueError, "could not be executed"):
-            PACKAGE.check_probe(binary, "--print-root-pin", f"PRODUCTION {PIN}\n")
+            PACKAGE.check_bootstrap_file(binary, target, PIN, VERSION)
+
+    @unittest.skipIf(LINUX, "covers the non-Linux refusal of the real code path")
+    def test_real_verifier_path_is_refused_off_linux(self):
+        # Unpatched: no native Linux host, and no memfd to seal into either.
+        with self.assertRaisesRegex(ValueError, "cannot be executed on this host"):
+            PACKAGE.check_bootstrap_file(self.binaries / BOOTSTRAP, TARGET, PIN, VERSION)
+        with self.assertRaisesRegex(ValueError, "cannot be executed on this host"):
+            PACKAGE.create_archive(self.binaries, self.python, TARGET, self.output,
+                                   binaries=PACKAGE.archive_binaries(False), bootstrap_pin=PIN,
+                                   bootstrap_version=VERSION)
+        self.assertFalse(self.output.exists())
+        with self.assertRaisesRegex(ValueError, "only be sealed for probing on Linux"):
+            PACKAGE._new_image()
+        # Nothing reads as sealed here, so even a bypassed host check cannot pass the flow.
+        with open(self.binaries / BOOTSTRAP, "rb") as handle:
+            self.assertEqual(PACKAGE._get_seals(handle.fileno()), 0)
         with patch.object(PACKAGE, "host_architecture", return_value="x86_64"):
-            with self.assertRaisesRegex(ValueError, "could not be executed"):
-                PACKAGE.verify_bootstrap_binary(binary, TARGET, PIN, VERSION)
-        binary.chmod(0o644)
-        with self.assertRaisesRegex(ValueError, "could not be executed"):
-            PACKAGE.check_probe(binary, "--print-root-pin", f"PRODUCTION {PIN}\n")
+            with self.assertRaisesRegex(ValueError, "only be sealed for probing on Linux"):
+                PACKAGE.check_bootstrap_file(self.binaries / BOOTSTRAP, TARGET, PIN, VERSION)
+        # The stand-in seam is test-only: the CLI never reaches it. An archive made
+        # with the seam is still refused by the real script on this host.
+        shipped = self.archive_with(True, "seam-made")
+        result = subprocess.run([sys.executable, str(SCRIPT), "--target", TARGET, "--verify-archive", str(shipped),
+                                 "--bootstrap-root-sha256", PIN], capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cannot be executed on this host", result.stderr)
+
+    @unittest.skipUnless(LINUX and os.path.exists("/bin/sh"), "executes a sealed memfd script (Linux only)")
+    def test_real_probe_executes_the_sealed_image_in_a_clean_child(self):
+        # The probe child gets no environment, /dev/null as stdin and an empty working
+        # directory; only builtins are used so no PATH is needed.
+        script = self.binaries / BOOTSTRAP
+
+        def write_script(body):
+            script.write_text("#!/bin/sh\n"
+                              '[ -z "${HOME+x}${PATH_LEAK+x}" ] || exit 3\n'
+                              'for entry in * .[!.]* ..?*; do [ -e "$entry" ] && exit 4; done\n'
+                              "read -r line && exit 5\n" + body)
+            script.chmod(0o755)
+        write_script('case "$1" in\n'
+                     f"--print-root-pin) printf 'PRODUCTION %s\\n' {PIN} ;;\n"
+                     f"--version) printf 'duduclaw-bootstrap %s\\n' {VERSION} ;;\n"
+                     "*) exit 6 ;;\nesac\n")
+        target = self.real_host_target()
+        # A shell script is not an ELF; only the ELF-target check is bypassed here so
+        # the real sealing and the real probe child can be observed.
+        no_elf_check = patch.object(PACKAGE, "_require_target_elf", lambda descriptor, arch: None)
+        with no_elf_check, patch.dict(os.environ, {"PATH_LEAK": "1", "HOME": "/nonexistent"}):
+            archive, report = PACKAGE.create_archive(self.binaries, self.python, target, self.output,
+                                                     binaries=PACKAGE.archive_binaries(False),
+                                                     bootstrap_pin=PIN, bootstrap_version=VERSION)
+        self.assertEqual((report.target, report.sha256, report.pin, report.version),
+                         (target, PACKAGE.sha256(script), PIN, VERSION))
+        self.assertEqual(archive.name, PACKAGE.TARGETS[target][1] + ".tar.gz")
+        with tarfile.open(archive) as bundle:
+            self.assertEqual(bundle.extractfile(BOOTSTRAP).read(), script.read_bytes())
+        # Output beyond the bound is refused, not truncated into a match.
+        write_script(f"printf 'PRODUCTION %s\\n' {PIN}\n" + "printf '%0300d\\n' 0\n")
+        with no_elf_check, self.assertRaisesRegex(ValueError, "did not print exactly"):
+            PACKAGE.check_bootstrap_file(script, target, PIN, VERSION)
+        # Without the bypass the script is refused before it is executed.
+        with self.assertRaisesRegex(ValueError, "not a 64-bit little-endian ELF"):
+            PACKAGE.check_bootstrap_file(script, target, PIN, VERSION)
+
+    @unittest.skipUnless(LINUX, "memfd seals are Linux-only")
+    def test_sealed_image_cannot_be_written_resized_or_resealed(self):
+        source = self.binaries / BOOTSTRAP
+        content = source.read_bytes()
+        with PACKAGE._SealedImage(lambda: PACKAGE._path_source(source)) as image:
+            descriptor = image.descriptor
+            self.assertEqual(image_bytes(descriptor), content)
+            self.assertEqual(PACKAGE._get_seals(descriptor), PACKAGE.BOOTSTRAP_SEALS)
+            self.assertEqual(fcntl.fcntl(descriptor, PACKAGE.F_GET_SEALS), PACKAGE.BOOTSTRAP_SEALS)
+            for attempt in (lambda: os.pwrite(descriptor, b"x", 0), lambda: os.write(descriptor, b"x"),
+                            lambda: os.ftruncate(descriptor, 0),
+                            lambda: os.ftruncate(descriptor, len(content) + 4096),
+                            lambda: fcntl.fcntl(descriptor, PACKAGE.F_ADD_SEALS, PACKAGE.F_SEAL_SEAL)):
+                with self.assertRaises(PermissionError):
+                    attempt()
+            self.assertEqual(image_bytes(descriptor), content)
+            # Close-on-exec in this process; only the probe child gets it (pass_fds), never fd 0-2.
+            self.assertFalse(os.get_inheritable(descriptor))
+            self.assertGreaterEqual(descriptor, 3)
+        # Closed when the block ends; nothing keeps the descriptor.
+        self.assertIsNone(image.descriptor)
+        with self.assertRaises(OSError):
+            os.fstat(descriptor)
+        # An unsealed memfd reads back as such.
+        unsealed = os.memfd_create("unsealed", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+        self.addCleanup(os.close, unsealed)
+        self.assertNotEqual(PACKAGE._get_seals(unsealed), PACKAGE.BOOTSTRAP_SEALS)
+        # The source must be an executable regular file, never followed through a symlink.
+        linked = self.root / "linked-bootstrap"
+        linked.symlink_to(source)
+        with self.assertRaisesRegex(ValueError, "symbolic link"):
+            with PACKAGE._SealedImage(lambda: PACKAGE._path_source(linked)):
+                pass
+        source.chmod(0o644)
+        with self.assertRaisesRegex(ValueError, "executable regular file"):
+            with PACKAGE._SealedImage(lambda: PACKAGE._path_source(source)):
+                pass
 
     def test_nonexecutable_bootstrap_is_refused_when_requested(self):
         release = self.cargo_layout()
         (release / BOOTSTRAP).chmod(0o644)
         self.assert_refused(release, ["--bootstrap-root-sha256", PIN], probes=good_probes())
 
-    def test_bytes_changed_while_probing_are_refused(self):
-        release = self.cargo_layout()
+    def test_path_swapped_after_the_read_is_irrelevant(self):
+        # A same-uid process swaps the pathname during each probe: the archive holds
+        # the bytes that were read once, sealed and executed.
+        path = self.binaries / BOOTSTRAP
+        original = path.read_bytes()
 
-        def rewrite(path):
-            Path(path).write_bytes(b"\x7fELF\x00GLIBC_2.17\x00swapped-after-pin-probe")
+        def swapping(flag):
+            def probe(descriptor):
+                self.assertEqual(image_bytes(descriptor), original)
+                replace_file(path, elf_image(TARGET, b"swapped-in-during" + flag.encode()))
+                return good_probes()[flag]
+            return probe
+        archive, report = self.create(probes={flag: swapping(flag) for flag in good_probes()})
+        self.assertNotEqual(path.read_bytes(), original)
+        self.assertEqual((report.sha256, report.size), (hashlib.sha256(original).hexdigest(), len(original)))
+        with tarfile.open(archive) as bundle:
+            member = bundle.getmember(BOOTSTRAP)
+            self.assertTrue(member.isfile())
+            self.assertEqual(member.mode, 0o755)
+            self.assertEqual(bundle.extractfile(member).read(), original)
+
+    def test_snapshot_swapped_during_the_probe_is_irrelevant_in_main(self):
+        release = self.cargo_layout()
+        original = (release / BOOTSTRAP).read_bytes()
+        calls = []
+
+        def swap(descriptor):
+            # The snapshot copy the flow read, and Cargo's output, both change after the read.
+            snapshot_copy = Path(next(call[1] for call in calls if call[0] == "read"))
+            replace_file(snapshot_copy, elf_image(TARGET, b"test-root-build"))
+            (release / BOOTSTRAP).write_bytes(elf_image(TARGET, b"swapped-after-pin-probe"))
             return good_probes()["--version"]
-        self.assert_refused(release, ["--bootstrap-root-sha256", PIN],
-                            probes={**good_probes(), "--version": rewrite})
+        self.run_main(release, calls, extra=["--bootstrap-root-sha256", PIN],
+                      probes={**good_probes(), "--version": swap})
+        with tarfile.open(self.output / "duduclaw-linux-x64.tar.gz") as bundle:
+            self.assertEqual(bundle.extractfile(BOOTSTRAP).read(), original)
 
-    def test_bytes_changed_between_probe_and_archive_are_refused(self):
-        release = self.cargo_layout()
+    def test_no_function_accepts_a_proof_descriptor_or_digest_as_evidence(self):
+        # The capability design is gone entirely: nothing to forge, pass or reuse.
+        for name in ("BootstrapProof", "_PROOF_ISSUER", "_ISSUED_PROOFS", "verify_bootstrap_binary",
+                     "seal_bootstrap_image", "_add_bootstrap_member", "probe_bootstrap", "check_probe", "weakref"):
+            self.assertFalse(hasattr(PACKAGE, name), name)
+        evidence = {"proof", "bootstrap", "verified", "descriptor", "fd", "fileno", "digest", "sha256",
+                    "image", "report", "evidence", "token", "capability"}
+        public = {name: function for name, function in inspect.getmembers(PACKAGE, inspect.isfunction)
+                  if not name.startswith("_") and function.__module__ == PACKAGE.__name__}
+        self.assertIn("create_archive", public)
+        for name, function in public.items():
+            with self.subTest(function=name):
+                self.assertFalse(set(inspect.signature(function).parameters) & evidence)
+        self.assertEqual(list(inspect.signature(PACKAGE.create_archive).parameters),
+                         ["binary_dir", "python_dir", "target", "output_dir", "binaries", "bootstrap_pin",
+                          "bootstrap_version", "expected_bootstrap_sha256"])
+        production = PACKAGE.archive_binaries(False)
+        path = self.binaries / BOOTSTRAP
+        digest = PACKAGE.sha256(path)
+        archive, report = self.create(output=self.root / "first")
+        # The report is plain data, produced after the flow; nothing takes it back.
+        self.assertEqual(report._fields, ("target", "sha256", "size", "pin", "version"))
+        self.assertTrue(all(isinstance(value, (str, int)) for value in report))
+        for keyword, value in [("verified", {BOOTSTRAP: digest}), ("bootstrap", path), ("proof", report),
+                               ("descriptor", 3), ("report", report), ("bootstrap_sha256", digest)]:
+            with self.subTest(keyword=keyword), self.assertRaises(TypeError):
+                PACKAGE.create_archive(self.binaries, self.python, TARGET, self.output, binaries=production,
+                                       **{keyword: value})
+        # The verifier is never archived by name, with or without a pin.
+        for pin in (None, PIN):
+            with self.subTest(pin=pin), self.seam(), self.assertRaisesRegex(ValueError, "never archived as a plain"):
+                PACKAGE.create_archive(self.binaries, self.python, TARGET, self.output,
+                                       binaries=PACKAGE.archive_binaries(True), bootstrap_pin=pin,
+                                       bootstrap_version=VERSION if pin else None)
+        # Expectations without a pin are refused, never ignored.
+        for keyword, value in [("bootstrap_version", VERSION), ("expected_bootstrap_sha256", digest)]:
+            with self.subTest(expectation=keyword), self.assertRaises(ValueError):
+                PACKAGE.create_archive(self.binaries, self.python, TARGET, self.output, binaries=production,
+                                       **{keyword: value})
+        # An expected digest only narrows: the matching digest of a TEST build is still refused
+        # by the probe, and a different digest is refused before anything is executed.
+        test_probes = {**good_probes(), "--print-root-pin": (0, f"TEST {PIN}\n".encode())}
+        with self.assertRaisesRegex(ValueError, "did not print exactly"):
+            self.create(probes=test_probes, expected_bootstrap_sha256=digest)
+        calls = []
+        with self.assertRaisesRegex(ValueError, "differs from the handed-off"):
+            self.create(calls=calls, expected_bootstrap_sha256=OTHER_PIN)
+        self.assertFalse(any(call[0] == "probe" for call in calls))
+        self.assertFalse(self.output.exists())
 
-        def tamper(binary_dir, *args, **kwargs):
-            (binary_dir / BOOTSTRAP).write_bytes(b"\x7fELF\x00GLIBC_2.17\x00test-root-build")
-            return []
-        with patch.object(PACKAGE, "sign_release", tamper):
-            with self.assertRaisesRegex(ValueError, "changed after it was verified"):
-                self.run_main(release, [], extra=["--bootstrap-root-sha256", PIN], probes=good_probes())
-        self.assertFalse((self.output / "duduclaw-linux-x64.tar.gz").exists())
+    def test_a_verifier_for_another_target_is_refused(self):
+        x64, arm64 = "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"
+        # The host must be Linux of the TARGET's architecture: refused before anything is read.
+        for target, host in [(arm64, "x86_64"), (x64, "aarch64"), (x64, None)]:
+            calls = []
+            with self.subTest(target=target, host=host):
+                with self.assertRaisesRegex(ValueError, "cannot be executed on this host"):
+                    self.create(target, host=host, calls=calls)
+                self.assertEqual(calls, [])
+        # A verifier built for the other architecture is refused before it is executed
+        # (binfmt emulation could otherwise run, and accept, it); so is a non-ELF.
+        for target, content in [(x64, elf_image(arm64)), (arm64, elf_image(x64)), (x64, b"#!/bin/sh\nexit 0\n")]:
+            (self.binaries / BOOTSTRAP).write_bytes(content)
+            with self.subTest(target=target, content=content[:20]):
+                calls = []
+                with self.assertRaisesRegex(ValueError, "not a 64-bit little-endian ELF for"):
+                    self.create(target, calls=calls)
+                self.assertFalse(any(call[0] == "probe" for call in calls))
+                with self.seam(host=PACKAGE.TARGETS[target][0], calls=calls), \
+                        self.assertRaisesRegex(ValueError, "not a 64-bit little-endian ELF for"):
+                    PACKAGE.check_bootstrap_file(self.binaries / BOOTSTRAP, target, PIN, VERSION)
+                self.assertFalse(any(call[0] == "probe" for call in calls))
+        self.assertFalse(self.output.exists())
+        # One run, one target: the archive and the report name the probed target only,
+        # and the finished archive is only accepted as that target's archive.
+        (self.binaries / BOOTSTRAP).write_bytes(elf_image(arm64))
+        archive, report = self.create(arm64)
+        self.assertEqual((archive.name, report.target), ("duduclaw-linux-arm64.tar.gz", arm64))
+        with self.seam(host="x86_64"), self.assertRaisesRegex(ValueError, "is not the x86_64 release archive"):
+            PACKAGE.verify_archive(archive, x64, PIN, VERSION)
 
-    def test_archive_writer_requires_the_probed_digest_for_the_verifier(self):
-        everything = PACKAGE.archive_binaries(True)
-        for name, verified in [("missing", {}), ("not a string", {BOOTSTRAP: None}),
-                               ("other bytes", {BOOTSTRAP: "00" * 32}),
-                               ("unknown name", {BOOTSTRAP: PACKAGE.sha256(self.binaries / BOOTSTRAP),
-                                                 "duduclaw-isolation-test-signer": "00" * 32})]:
+    def test_seals_are_verified_before_probing_and_around_the_member_write(self):
+        production = PACKAGE.archive_binaries(False)
+        archive = self.output / "duduclaw-linux-x64.tar.gz"
+        written = []
+        reader = PACKAGE._PreadReader
+
+        def create(probes=None, calls=None, substitute_while_writing=False):
+            def recording_reader(descriptor, size):
+                written.append(size)
+                if substitute_while_writing:
+                    substitute(descriptor)
+                return reader(descriptor, size)
+            with self.seam(probes, "x86_64", calls), patch.object(PACKAGE, "_PreadReader", recording_reader):
+                return PACKAGE.create_archive(self.binaries, self.python, TARGET, self.output, binaries=production,
+                                              bootstrap_pin=PIN, bootstrap_version=VERSION)
+
+        def substitute(descriptor):
+            # Same descriptor number, same bytes, but a file without seals.
+            copy = unsealed_copy(descriptor)
+            os.dup2(copy, descriptor)
+            os.close(copy)
+        # 1. The image never got its seals: refused before the first probe.
+        calls = []
+        with self.seam(calls=calls), patch.object(PACKAGE, "_add_seals", lambda descriptor: None), \
+                self.assertRaisesRegex(ValueError, "not sealed"):
+            PACKAGE.create_archive(self.binaries, self.python, TARGET, self.output, binaries=production,
+                                   bootstrap_pin=PIN, bootstrap_version=VERSION)
+        self.assertFalse(any(call[0] == "probe" for call in calls))
+        # 2. An unsealed descriptor substituted after the probes: refused before the member is written.
+        def substituting_probe(descriptor):
+            substitute(descriptor)
+            return good_probes()["--version"]
+        with self.assertRaisesRegex(ValueError, "not sealed"):
+            create({**good_probes(), "--version": substituting_probe})
+        self.assertEqual(written, [])
+        # 3. Substituted while the member is written: refused by the check after the write.
+        with self.assertRaisesRegex(ValueError, "not sealed"):
+            create(substitute_while_writing=True)
+        self.assertEqual(len(written), 1)
+        self.assertFalse(archive.exists())
+        # Unchanged, the same flow packages.
+        archive_path, report = create()
+        self.assertEqual(archive_path, archive)
+        self.assertEqual(report.sha256, PACKAGE.sha256(self.binaries / BOOTSTRAP))
+
+    def test_image_descriptor_is_closed_on_every_path(self):
+        seen = []
+
+        def capturing(result):
+            def probe(descriptor):
+                seen.append(descriptor)
+                if isinstance(result, BaseException):
+                    raise result
+                return result
+            return probe
+        good = good_probes()
+        cases = [("refused output", {**good, "--print-root-pin": capturing((0, f"TEST {PIN}\n".encode()))},
+                  ValueError),
+                 ("exec failure", {**good, "--print-root-pin": capturing(OSError(errno.ENOEXEC, "Exec format"))},
+                  ValueError),
+                 ("interrupted", {**good, "--version": capturing(KeyboardInterrupt())}, KeyboardInterrupt)]
+        for name, probes, error in cases:
             with self.subTest(name=name):
-                with self.assertRaises(ValueError):
-                    PACKAGE.create_archive(self.binaries, self.python, TARGET, self.output,
-                                           binaries=everything, verified=verified)
-                self.assertFalse((self.output / "duduclaw-linux-x64.tar.gz").exists())
-        # A digest for a verifier that is not being archived is refused too.
-        with self.assertRaises(ValueError):
-            PACKAGE.create_archive(self.binaries, self.python, TARGET, self.output,
-                                   binaries=PACKAGE.archive_binaries(False),
-                                   verified={BOOTSTRAP: PACKAGE.sha256(self.binaries / BOOTSTRAP)})
-        self.assertFalse((self.output / "duduclaw-linux-x64.tar.gz").exists())
+                with self.assertRaises(error):
+                    self.create(probes=probes)
+                with self.assertRaises(OSError):
+                    os.fstat(seen[-1])
+        with self.seam(probes={**good, "--version": capturing(good["--version"])}):
+            report = PACKAGE.check_bootstrap_file(self.binaries / BOOTSTRAP, TARGET, PIN, VERSION)
+        self.assertEqual(report.pin, PIN)
+        with self.assertRaises(OSError):
+            os.fstat(seen[-1])
 
     def test_staged_copy_is_independent_private_nlink_one(self):
         release = self.cargo_layout()
@@ -795,13 +1166,21 @@ class LinuxReleaseTests(unittest.TestCase):
     def test_deferred_probe_builds_the_pin_but_never_packages_unprobed(self):
         release = self.cargo_layout()
         # No probe is listed: executing the verifier would fail this test.
-        self.run_build_only(release, ["--bootstrap-root-sha256", PIN, "--defer-bootstrap-probe"], {})
-        # Packaging never defers.
-        result = subprocess.run([sys.executable, str(SCRIPT), "--target", TARGET, "--skip-build", "--output-dir",
-                                 str(self.output), "--defer-bootstrap-probe"], capture_output=True, text=True)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("--defer-bootstrap-probe applies only to --build-only", result.stderr)
+        calls = []
+        self.run_build_only(release, ["--bootstrap-root-sha256", PIN, "--defer-bootstrap-probe"], {}, calls)
+        # Deferred = built, neither read nor executed, and no archive anywhere.
+        self.assertEqual(calls, [])
         self.assertFalse(self.output.exists())
+        # Packaging never defers, in any mode that could write an archive.
+        for extra in (["--skip-build"], ["--skip-build", "--bootstrap-root-sha256", PIN],
+                      ["--verify-archive", str(self.root / "duduclaw-linux-x64.tar.gz")]):
+            with self.subTest(extra=extra):
+                result = subprocess.run([sys.executable, str(SCRIPT), "--target", TARGET, "--output-dir",
+                                         str(self.output), "--defer-bootstrap-probe", *extra],
+                                        capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("--defer-bootstrap-probe applies only to --build-only", result.stderr)
+                self.assertFalse(self.output.exists())
 
     def handoff(self, release, include_bootstrap=True):
         handoff = self.root / f"handoff-{os.urandom(6).hex()}"
@@ -827,8 +1206,14 @@ class LinuxReleaseTests(unittest.TestCase):
         with tarfile.open(self.output / "duduclaw-linux-x64.tar.gz") as bundle:
             for name in PACKAGE.archive_binaries(True):
                 self.assertEqual(bundle.extractfile(name).read(), (release / name).read_bytes())
-        probed = [Path(call[1]) for call in calls if call[0] == "probe"]
-        self.assertTrue(probed and all(path.parent != handoff for path in probed))
+        # The verifier was read once, from the re-hashed private snapshot (never the
+        # hand-off directory), and the executed image is the SHA256SUMS entry.
+        reads = [Path(call[1]) for call in calls if call[0] == "read"]
+        self.assertEqual(len(reads), 1)
+        self.assertNotEqual(reads[0].parent, handoff)
+        listed = {name: value for value, name in
+                  (line.split("  ") for line in (handoff / PACKAGE.TRANSFER_SUMS).read_text().splitlines())}
+        self.assertEqual({call[1] for call in calls if call[0] == "probe"}, {listed[BOOTSTRAP]})
         shutil.rmtree(self.output)
         pinned = ["--bootstrap-root-sha256", PIN]
 
@@ -862,32 +1247,32 @@ class LinuxReleaseTests(unittest.TestCase):
             self.assertIn("go together", result.stderr)
 
     def archive_with(self, include_bootstrap, name):
-        output = self.root / name
-        verified = {BOOTSTRAP: PACKAGE.sha256(self.binaries / BOOTSTRAP)} if include_bootstrap else {}
-        return PACKAGE.create_archive(self.binaries, self.python, TARGET, output,
-                                      binaries=PACKAGE.archive_binaries(include_bootstrap), verified=verified)
+        return self.package(include_bootstrap=include_bootstrap, output=self.root / name)
 
     def test_verify_archive_reports_presence_and_absence(self):
         without = self.archive_with(False, "without")
         line = PACKAGE.verify_archive(without, TARGET, None, VERSION)
         self.assertTrue(line.startswith(f"x86_64: {BOOTSTRAP} NOT shipped"), line)
-        with self.assertRaises(ValueError):
+        with self.seam(), self.assertRaises(ValueError):
             PACKAGE.verify_archive(without, TARGET, PIN, VERSION)
         shipped = self.archive_with(True, "with")
         with self.assertRaisesRegex(ValueError, "no production root pin"):
             PACKAGE.verify_archive(shipped, TARGET, None, VERSION)
-        with patch.object(PACKAGE, "probe_bootstrap", lambda path, flag: good_probes()[flag]), \
-                patch.object(PACKAGE, "host_architecture", return_value="x86_64"):
+        executed = PACKAGE.sha256(self.binaries / BOOTSTRAP)
+        calls = []
+        # Executed from a sealed copy of exactly the member bytes: nothing is extracted
+        # to a path and no path is read for the verifier.
+        with self.seam(calls=calls), patch.object(PACKAGE, "extract_member", side_effect=AssertionError):
             line = PACKAGE.verify_archive(shipped, TARGET, PIN, VERSION)
-            self.assertIn(f"PRODUCTION {PIN}, sha256 {PACKAGE.sha256(self.binaries / BOOTSTRAP)}", line)
+        self.assertIn(f"PRODUCTION {PIN}, sha256 {executed}", line)
+        self.assertFalse(any(call[0] == "read" for call in calls))
+        self.assertEqual([(call[1], call[2]) for call in calls if call[0] == "probe"],
+                         [(executed, "--print-root-pin"), (executed, "--version")])
         test_probes = {**good_probes(), "--print-root-pin": (0, f"TEST {PIN}\n".encode())}
-        with patch.object(PACKAGE, "probe_bootstrap", lambda path, flag: test_probes[flag]), \
-                patch.object(PACKAGE, "host_architecture", return_value="x86_64"):
-            with self.assertRaises(ValueError):
-                PACKAGE.verify_archive(shipped, TARGET, PIN, VERSION)
-        with patch.object(PACKAGE, "host_architecture", return_value="aarch64"):
-            with self.assertRaisesRegex(ValueError, "cannot be executed on this host"):
-                PACKAGE.verify_archive(shipped, TARGET, PIN, VERSION)
+        with self.seam(test_probes), self.assertRaisesRegex(ValueError, "did not print exactly"):
+            PACKAGE.verify_archive(shipped, TARGET, PIN, VERSION)
+        with self.seam(host="aarch64"), self.assertRaisesRegex(ValueError, "cannot be executed on this host"):
+            PACKAGE.verify_archive(shipped, TARGET, PIN, VERSION)
         Path(str(shipped) + ".sha256").write_text("00" * 32 + "  duduclaw-linux-x64.tar.gz\n")
         with self.assertRaisesRegex(ValueError, "does not match its .sha256"):
             PACKAGE.verify_archive(shipped, TARGET, None, VERSION)
@@ -1019,6 +1404,26 @@ class LinuxReleaseTests(unittest.TestCase):
                 revert()
         with self.assertRaisesRegex(ValueError, "version and target architecture"):
             PACKAGE.create_migration_bundle("aarch64-unknown-linux-gnu", inbox, other)
+
+    def test_verifier_is_never_a_signed_artifact_inbox_file_or_bundle_member(self):
+        # The only way into any archive is create_archive's sealed flow; the signed
+        # manifest (and so the inbox and the migration bundle) can never carry it.
+        for identifier in (BOOTSTRAP, PACKAGE.BOOTSTRAP_ASSET_PREFIX + "x86_64"):
+            with self.subTest(identifier=identifier):
+                document = self.manifest()
+                document["artifacts"].append({"id": identifier, "mode": 0o755,
+                                              "install_target": {"kind": "runtime_entry", "registry_id": "vendor-x"}})
+                with self.assertRaisesRegex(ValueError, "never a signed artifact"):
+                    PACKAGE.validate_targets(document["artifacts"])
+        root, signatures = self.bootstrap_inputs()
+        inbox = PACKAGE.create_bootstrap_inbox(TARGET, self.output, root, signatures)
+        manifest = json.loads((inbox / "manifest.json").read_bytes())
+        manifest["artifacts"][0]["id"] = BOOTSTRAP
+        (inbox / "manifest.json").write_bytes(json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode())
+        (inbox / "artifacts" / manifest["artifacts"][0]["install_target"]["kind"]).rename(inbox / "artifacts" / BOOTSTRAP)
+        with self.assertRaisesRegex(ValueError, "never a signed artifact"):
+            PACKAGE.create_migration_bundle(TARGET, inbox, self.root / "bundle")
+        self.assertFalse((self.root / "bundle" / PACKAGE.migration_bundle_name("x86_64", PACKAGE.workspace_version())).exists())
 
     def test_release_entrypoint_and_workflow_share_helper(self):
         result = subprocess.run(["bash", str(ROOT / "scripts/release.sh"), "linux-assets", "--help"],
