@@ -631,6 +631,41 @@ unit is unsupported. PID 1 waits at a bounded shared-memory startup barrier unti
 the supervisor has dropped/verified privileges and installed its final filter;
 supervisor initialization failure therefore cannot release a runtime.
 
+Run-unit identity and set-id policy (R7g, measured on Ubuntu 24.04 / systemd
+255): the transient run unit sets neither `User=` nor `Group=` (an explicit
+`User=root` together with `NoNewPrivileges=` and any seccomp-based restriction
+makes systemd 255 remove `CAP_SETUID` from the permitted and effective sets) and
+does not set `RestrictSUIDSGID=` (its filter makes every `openat2` return
+ENOSYS, and the trampoline opens every path with `openat2` and RESOLVE_*).
+After `StartTransientUnit` spawnd requires `User` and `Group` to read back
+empty and `RestrictSUIDSGID` to read back false, and, before it sends the
+bootstrap offer, that `/proc/<MainPID>/status` shows uid/gid 0 (all four),
+`CapPrm` = `CapEff` = `CapBnd` = the seven trampoline capabilities, `CapAmb` 0
+and `NoNewPrivs` 1, with the process in the unit's own cgroup; any mismatch
+stops the unit and refuses the run. Against set-id files: every mount the
+employee can write is `nosuid`, the whole tree runs with no_new_privs, the
+employee holds no capability, and the common seccomp filter refuses set-id
+modes in the chmod and mknod families (below).
+
+The same measurements apply to the static units (R7g). `RestrictSUIDSGID=` is
+not set on any unit whose executed binary reaches `openat2`:
+`duduclaw-spawnd.service` (work broker, storage, cgroup leaves, bootstrap
+mounts, trusted-file reader), `duduclaw-isolation-ready.service`
+(`wait-consistent` reads its status through the trusted-file reader),
+`duduclaw-updated.service` and `duduclaw-auto-upgrade.service` (the updater
+binary's `duduclaw_updated::linux::files`), and the gateway unit text
+(`duduclaw_core::root_key_recovery_unit`; artifact discovery and migration
+readback). Each stays a root or dedicated-account service that creates no
+set-ID files, and `NoNewPrivileges=yes` (the gateway: the launcher's
+no_new_privs) stays. `duduclaw-updated.service` and
+`duduclaw-auto-upgrade.service` also set no `User=`/`Group=` (root by default):
+the updater drops its download child to `duduclaw-dl` and needs `CAP_SETUID`.
+spawnd and the readiness gate keep `User=root`; neither needs `CAP_SETUID`.
+`duduclaw-egress.service`, `duduclaw-dns-broker.service`,
+`duduclaw-parse@.service` and `duduclaw-import@.service` keep
+`RestrictSUIDSGID=yes`: their binaries never call `openat2`, and their
+`SystemCallFilter=` allow-lists do not admit it anyway.
+
 Ancillary slots are fixed in this order:
 
 1. Detached mounts: employee home, workspace, configuration projection, runtime
@@ -707,7 +742,14 @@ u32 count and sorted big-endian u32 syscall numbers. Duplicates are rejected.
 This is a B2 private profile encoding, not a change to shared wire/canonical
 capability contracts. Common restrictions cannot be overridden by a runtime list.
 The common filter additionally refuses ptrace/process_vm operations and limits
-socketpair to AF_UNIX. These are deliberate narrowing defenses.
+socketpair to AF_UNIX. These are deliberate narrowing defenses. Since R7g it
+also refuses `chmod`, `fchmod`, `fchmodat`, `fchmodat2`, `mknod` and `mknodat`
+whose mode argument carries `S_ISUID` or `S_ISGID` (EPERM, a plain masked test
+of the mode register, as systemd's `RestrictSUIDSGID=` does for these calls),
+because the run unit can no longer set `RestrictSUIDSGID=` (run-unit identity
+and set-id policy, above). `open`,
+`openat` and `creat` with `O_CREAT` and a set-id mode are not covered (known
+follow-up); `openat2` is never inspected.
 
 Kernel readiness checks require Linux 5.15+, actual Landlock ABI >=1, seccomp
 KILL_PROCESS, clone3, openat2, statx mount IDs, close_range and detached fs-context

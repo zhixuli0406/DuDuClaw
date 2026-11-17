@@ -135,9 +135,35 @@ impl UnitPolicy {
         }
         let micros = |ms: u64| ms.checked_mul(1000).ok_or_else(invalid);
         let mut properties = BTreeMap::new();
+        // R7g (measured, Ubuntu 24.04 / systemd 255): two directives are NOT
+        // set; `RUN_UNIT_DEFAULTED` reads back their default instead.
+        // - `RestrictSUIDSGID=yes` makes systemd's seccomp filter return ENOSYS
+        //   for every `openat2` (it cannot inspect `open_how`); the trampoline
+        //   opens every path with `openat2` + RESOLVE_* and fails at its probe.
+        //   What still holds against an employee creating set-id files: every
+        //   mount the employee can write is nosuid (duduclaw-run/src/linux/
+        //   mounts.rs: `build_root`'s root tmpfs, home/work attachments and
+        //   /run, /tmp; `build_devices`' /dev tmpfs and devpts;
+        //   `attach_helpers`' /helper-tmp; and the persistent home and work
+        //   clones themselves, bootstrap_mounts.rs `prepare`/`select_workspace`
+        //   with `MOUNT_ATTR_NOSUID`), so a set-id bit is never
+        //   honoured at exec; the whole process tree runs with no_new_privs
+        //   (`NoNewPrivileges` below; the trampoline refuses to install any
+        //   filter without it), which also ignores set-id bits and file
+        //   capabilities; the employee holds no capability at all (the
+        //   trampoline drops and verifies the bounding, permitted, effective,
+        //   inheritable and ambient sets). The employee-side common seccomp
+        //   filter (duduclaw-run/src/seccomp.rs `common_rules`) additionally
+        //   refuses chmod/fchmod/fchmodat/fchmodat2/mknod/mknodat with
+        //   S_ISUID or S_ISGID in the mode argument.
+        // - An explicit `User=root`/`Group=root` combined with NoNewPrivileges
+        //   and any seccomp restriction makes systemd 255 drop CAP_SETUID from
+        //   the permitted and effective sets. Root is a system service's
+        //   default identity, so neither is set; the started process is read
+        //   back as root with exactly `TRAMPOLINE_CAPABILITIES` after start.
         for key in ["PrivateTmp", "PrivateDevices", "PrivateIPC", "ProtectKernelTunables",
             "ProtectKernelModules", "ProtectKernelLogs", "ProtectControlGroups",
-            "RestrictSUIDSGID", "LockPersonality", "NoNewPrivileges", "MemoryAccounting",
+            "LockPersonality", "NoNewPrivileges", "MemoryAccounting",
             "CPUAccounting", "TasksAccounting", "IOAccounting"] {
             properties.insert(key, Property::Bool(true));
         }
@@ -148,7 +174,7 @@ impl UnitPolicy {
         properties.insert("Delegate", Property::Bool(true));
         for (key, value) in [("Type", "exec"), ("ProtectSystem", "strict"), ("OOMPolicy", "continue"),
             ("ProtectHome", "tmpfs"), ("KillMode", "control-group"),
-            ("DevicePolicy", "closed"), ("User", "root"), ("Group", "root"),
+            ("DevicePolicy", "closed"),
             ("StandardInput", "null"), ("StandardOutput", "null"), ("StandardError", "null")] {
             properties.insert(key, Property::Text(value.into()));
         }
@@ -184,13 +210,66 @@ impl UnitPolicy {
             ("IOWriteIOPSMax", limits.io_write_ops_per_sec)] {
             properties.insert(key, Property::DeviceLimits(vec![(device.clone(), ceiling)]));
         }
+        if RUN_UNIT_DEFAULTED.iter().any(|(key, _)| properties.contains_key(key)) { return Err(invalid()); }
         Ok(Self { name: run_unit(run), properties })
     }
     /// Every property `Systemd::start` reads back after StartTransientUnit. No
-    /// property is set without being compared against PID 1's actual value.
+    /// property is set without being compared against PID 1's actual value,
+    /// and every [`RUN_UNIT_DEFAULTED`] property must read back its default.
     pub fn readback(&self) -> impl Iterator<Item = (&'static str, &Property)> {
+        let defaulted: &[(&'static str, Property)] = &RUN_UNIT_DEFAULTED;
         self.properties.iter().map(|(key, value)| (*key, value))
+            .chain(defaulted.iter().map(|(key, value)| (*key, value)))
     }
+}
+
+/// R7g: run-unit properties spawnd deliberately does not set, with the value
+/// PID 1 must report for each. `User`/`Group` empty: a system service with
+/// neither set runs as root:root with the full bounding set it is given (an
+/// explicit `User=root` loses CAP_SETUID on systemd 255). `RestrictSUIDSGID`
+/// false: its seccomp filter makes `openat2` ENOSYS. A mismatch refuses the
+/// start like every other readback failure.
+pub static RUN_UNIT_DEFAULTED: [(&str, Property); 3] = [
+    ("User", Property::Text(String::new())),
+    ("Group", Property::Text(String::new())),
+    ("RestrictSUIDSGID", Property::Bool(false)),
+];
+
+/// R7g: `/proc/<MainPID>/status` of a freshly started run unit, before spawnd
+/// sends the bootstrap offer (the trampoline drops nothing until then). Every
+/// one of `Uid`, `Gid`, `CapPrm`, `CapEff`, `CapBnd`, `CapAmb`, `NoNewPrivs`
+/// must appear exactly once (otherwise `Err`); `Ok(true)` only for real,
+/// effective, saved and filesystem uid and gid 0, permitted = effective =
+/// bounding = [`TRAMPOLINE_CAPABILITIES`], no ambient capability and
+/// no_new_privs set.
+pub fn run_process_status_ok(status: &str) -> io::Result<bool> {
+    let mut fields: BTreeMap<&str, &str> = BTreeMap::new();
+    for line in status.lines() {
+        let Some((key, value)) = line.split_once(':') else { continue };
+        if matches!(key, "Uid" | "Gid" | "CapPrm" | "CapEff" | "CapBnd" | "CapAmb" | "NoNewPrivs")
+            && fields.insert(key, value.trim()).is_some() { return Err(invalid()); }
+    }
+    let field = |key: &str| fields.get(key).copied().ok_or_else(invalid);
+    let root = |text: &str| {
+        let ids: Vec<&str> = text.split_whitespace().collect();
+        ids.len() == 4 && ids.iter().all(|id| *id == "0")
+    };
+    let capabilities = |text: &str| -> io::Result<u64> {
+        if text.len() != 16 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) { return Err(invalid()); }
+        u64::from_str_radix(text, 16).map_err(|_| invalid())
+    };
+    Ok(root(field("Uid")?) && root(field("Gid")?)
+        && capabilities(field("CapPrm")?)? == TRAMPOLINE_CAPABILITIES
+        && capabilities(field("CapEff")?)? == TRAMPOLINE_CAPABILITIES
+        && capabilities(field("CapBnd")?)? == TRAMPOLINE_CAPABILITIES
+        && capabilities(field("CapAmb")?)? == 0
+        && field("NoNewPrivs")? == "1")
+}
+/// R7g: `/proc/<MainPID>/cgroup` names exactly the unit's own cgroup (v2 only;
+/// spawnd moves the trampoline into `rt-init` only after start). Guards the
+/// status readback against a recycled PID.
+pub fn run_process_cgroup_ok(membership: &str, control_group: &str) -> bool {
+    membership.strip_prefix("0::").and_then(|rest| rest.strip_suffix('\n')) == Some(control_group)
 }
 
 /// The DNS second layer must not exempt private resolver IPs (r7 supersedes §4.3).
@@ -540,11 +619,17 @@ pub mod linux {
         /// remains blocked on the bootstrap handshake and B2 status readback.
         pub fn start(&self, policy: &UnitPolicy, bootstrap: BorrowedFd<'_>,
             stdout: BorrowedFd<'_>, stderr: BorrowedFd<'_>) -> io::Result<StartedUnit> {
+            self.start_exec(policy, TRAMPOLINE, vec![TRAMPOLINE], bootstrap, stdout, stderr)
+        }
+        /// [`Self::start`] with its fixed `ExecStart`; root tests alone pass a
+        /// harmless executable to exercise the production policy and readback.
+        fn start_exec(&self, policy: &UnitPolicy, executable: &str, argv: Vec<&str>, bootstrap: BorrowedFd<'_>,
+            stdout: BorrowedFd<'_>, stderr: BorrowedFd<'_>) -> io::Result<StartedUnit> {
             if parse_run_unit(&policy.name).is_none() { return Err(invalid()); }
             self.ensure_employee_slice(policy)?;
             let mut properties: Vec<(&str, Value<'_>)> = policy.properties.iter()
                 .map(|(key, property)| (*key, value(property))).collect();
-            properties.push(("ExecStart", Value::from(vec![(TRAMPOLINE, vec![TRAMPOLINE], false)])));
+            properties.push(("ExecStart", Value::from(vec![(executable, argv, false)])));
             properties.push(("StandardInputFileDescriptor", Value::from(Fd::from(bootstrap))));
             properties.push(("StandardOutputFileDescriptor", Value::from(Fd::from(stdout))));
             properties.push(("StandardErrorFileDescriptor", Value::from(Fd::from(stderr))));
@@ -567,13 +652,14 @@ pub mod linux {
                 // 249 does not expose these received descriptors as properties.
                 // B2 must verify bootstrap/pipe identity before releasing a run.
                 let until = std::time::Instant::now() + Duration::from_secs(5);
-                let cgroup = loop {
+                let (cgroup, control_group) = loop {
                     let path_text: String = service.get_property("ControlGroup").map_err(bus_error)?;
-                    if let Ok(path) = checked_cgroup(&path_text) { break path; }
+                    if let Ok(path) = checked_cgroup(&path_text) { break (path, path_text); }
                     if std::time::Instant::now() >= until { return Err(bus_error("cgroup timeout")); }
                     std::thread::sleep(Duration::from_millis(25));
                 };
                 verify_run_resources(&cgroup, policy)?;
+                verify_main_process(&unit_proxy, &service, &control_group)?;
                 drop(service);
                 drop(unit_proxy);
                 Ok(StartedUnit { name: policy.name.clone(), path, cgroup })
@@ -786,6 +872,34 @@ pub mod linux {
         }
         Ok(())
     }
+    /// R7g: the started process itself, not only PID 1's configuration. Waits
+    /// (bounded) until the `Type=exec` unit is `active` (its process has
+    /// exec'd), then requires `/proc/<MainPID>/status` to show root with
+    /// exactly the trampoline capability set ([`run_process_status_ok`]), the
+    /// process to sit in this unit's own cgroup ([`run_process_cgroup_ok`]) and
+    /// `MainPID` to be unchanged afterwards. This runs before spawnd sends the
+    /// bootstrap offer, so the trampoline has not dropped anything yet; a
+    /// trampoline that already exited (refused) fails the start here.
+    fn verify_main_process(unit: &Proxy<'_>, service: &Proxy<'_>, control_group: &str) -> io::Result<()> {
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            let state: String = unit.get_property("ActiveState").map_err(bus_error)?;
+            if state == "active" { break; }
+            // A just-queued start job may still read `inactive`.
+            if !matches!(state.as_str(), "inactive" | "activating") || Instant::now() >= until { return Err(invalid()); }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let pid: u32 = service.get_property("MainPID").map_err(bus_error)?;
+        if pid == 0 { return Err(invalid()); }
+        let process = PathBuf::from(format!("/proc/{pid}"));
+        let status = std::fs::read_to_string(process.join("status"))?;
+        let membership = std::fs::read_to_string(process.join("cgroup"))?;
+        let after: u32 = service.get_property("MainPID").map_err(bus_error)?;
+        if after != pid || !run_process_status_ok(&status)? || !run_process_cgroup_ok(&membership, control_group) {
+            return Err(invalid());
+        }
+        Ok(())
+    }
     fn property_matches(expected: &Property, actual: OwnedValue) -> io::Result<bool> {
         match expected {
             Property::Strings(wanted) => {
@@ -962,6 +1076,176 @@ pub mod linux {
             let systemd = Systemd::connect().unwrap();
             assert_eq!(systemd.resources_ready().unwrap(), host_pty_budget().unwrap());
         }
+
+        #[test]
+        fn run_unit_readback_refuses_explicit_identity_and_restrict_suid_sgid() {
+            let owned = |value: Value<'_>| value.try_to_owned().unwrap();
+            let policy = UnitPolicy::new(RunId([1; 16]), EmployeeId([2; 16]), &r7g_limits(), &r7g_timeouts(), 8, 1).unwrap();
+            let expected: BTreeMap<&str, &Property> = policy.readback().collect();
+            // A system service with neither User= nor Group= reads back "" (root:root).
+            for key in ["User", "Group"] {
+                assert!(property_matches(expected[key], owned(Value::from(""))).unwrap(), "{key}");
+                for actual in ["root", "0", "duduclaw-runsup", "nobody"] {
+                    assert!(!property_matches(expected[key], owned(Value::from(actual))).unwrap(), "{key}={actual}");
+                }
+            }
+            assert!(property_matches(expected["RestrictSUIDSGID"], owned(Value::from(false))).unwrap());
+            assert!(!property_matches(expected["RestrictSUIDSGID"], owned(Value::from(true))).unwrap());
+            // A wrongly typed reply is not a match either.
+            assert!(!property_matches(expected["User"], owned(Value::from(0u32))).unwrap());
+            assert!(!property_matches(expected["RestrictSUIDSGID"], owned(Value::from(""))).unwrap());
+        }
+
+        fn r7g_limits() -> ResourceLimits {
+            ResourceLimits { memory_bytes: 1024 * 1024 * 1024, cpu_quota_percent: 100,
+                tasks: 128, open_files: 4096, ptys: 16,
+                disk: duduclaw_isolation::execution::DiskQuota::LoopFilesystem { bytes: 1024, inodes: 100 },
+                io_read_bytes_per_sec: 1 << 30, io_write_bytes_per_sec: 1 << 30,
+                io_read_ops_per_sec: 100_000, io_write_ops_per_sec: 100_000,
+                output_buffer_bytes: 65536, output_total_bytes: 1024 * 1024,
+                memfd_total_bytes: 64 * 1024 * 1024 }
+        }
+        fn r7g_timeouts() -> RunTimeouts {
+            RunTimeouts { queue_ms: 30000, startup_ms: 5000, runtime_ms: 30000,
+                pty_idle_ms: Some(30000), termination_grace_ms: 5000 }
+        }
+        /// The whole disk holding `/` (IO ceilings name a whole disk; a
+        /// partition's limit is applied to its disk and would not read back).
+        fn root_whole_disk() -> (u32, u32) {
+            use std::os::unix::fs::MetadataExt;
+            let dev = std::fs::metadata("/").unwrap().dev();
+            let major = (((dev >> 32) & 0xffff_f000) | ((dev >> 8) & 0xfff)) as u32;
+            let minor = (((dev >> 12) & 0xffff_ff00) | (dev & 0xff)) as u32;
+            assert_ne!(major, 0, "/ must be on a block device for the run unit's IO ceilings");
+            let node = std::fs::canonicalize(format!("/sys/dev/block/{major}:{minor}")).unwrap();
+            let disk = if node.join("partition").exists() { node.parent().unwrap().to_path_buf() } else { node };
+            let text = std::fs::read_to_string(disk.join("dev")).unwrap();
+            let (major, minor) = text.trim().split_once(':').unwrap();
+            (major.parse().unwrap(), minor.parse().unwrap())
+        }
+        fn status_field<'a>(status: &'a str, key: &str) -> Vec<&'a str> {
+            status.lines().find_map(|line| line.strip_prefix(key)).unwrap_or_else(|| panic!("{key}"))
+                .split_whitespace().collect()
+        }
+        struct ProbeDirectory(PathBuf);
+        impl Drop for ProbeDirectory {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        const OPENAT2_OK: &[u8] = b"r7g openat2 ok\n";
+        const OPENAT2_FAILED: &[u8] = b"r7g openat2 failed\n";
+
+        /// Child half of `iso_root_run_unit_policy_keeps_setuid_and_openat2`,
+        /// run by a copy of this test binary as the run unit's main process.
+        /// A no-op anywhere else (its parent is not PID 1). Performs the
+        /// trampoline's own `openat2` (`fd::open_beneath`: RESOLVE_BENEATH |
+        /// NO_SYMLINKS | NO_MAGICLINKS | NO_XDEV, O_PATH) and reports on stdout
+        /// (written directly, never captured), then stays alive for the
+        /// parent's readback.
+        #[test]
+        #[ignore = "iso_root_: child half of iso_root_run_unit_policy_keeps_setuid_and_openat2; no-op unless started by PID 1"]
+        fn iso_root_run_unit_openat2_child() {
+            use std::io::Write;
+            if unsafe { libc::getppid() } != 1 { return; }
+            let root = std::fs::File::open("/").unwrap();
+            let opened = duduclaw_run::linux::fd::open_beneath(root.as_raw_fd(), c".", libc::O_PATH);
+            let mut stdout = std::io::stdout();
+            stdout.write_all(if opened.is_ok() { OPENAT2_OK } else { OPENAT2_FAILED }).unwrap();
+            stdout.flush().unwrap();
+            assert!(opened.is_ok(), "openat2 refused inside the run unit");
+            std::thread::sleep(Duration::from_secs(5));
+        }
+
+        /// R7g on a real host: a unit started with the production `UnitPolicy`
+        /// (through `start_exec`, i.e. the production property readback and
+        /// the main-process readback) runs as root with exactly the trampoline
+        /// capability set, CAP_SETUID included, and `openat2` works inside it.
+        #[test]
+        #[ignore = "iso_root_: root disposable systemd Linux VM (DUDUCLAW_ISO_DISPOSABLE=1), / on a block device, no active B1 daemon/runs; --test-threads=1"]
+        fn iso_root_run_unit_policy_keeps_setuid_and_openat2() {
+            assert_eq!(std::env::var("DUDUCLAW_ISO_DISPOSABLE").as_deref(), Ok("1"), "disposable host only");
+            assert_eq!(unsafe { libc::geteuid() }, 0);
+            let systemd = Systemd::connect().unwrap();
+            let run = test_id();
+            let mut employee = [0u8; 16];
+            assert_eq!(duduclaw_run::linux::syscalls::getrandom(&mut employee, 0).unwrap(), employee.len());
+            let employee = EmployeeId(employee);
+            let (major, minor) = root_whole_disk();
+            let mut policy = UnitPolicy::new(run, employee, &r7g_limits(), &r7g_timeouts(), major, minor).unwrap();
+            for key in ["User", "Group", "RestrictSUIDSGID"] { assert!(!policy.properties.contains_key(key), "{key}"); }
+            // BindsTo= would pull in (or, absent, fail on) the daemon unit, which is
+            // not under test; every other production property is kept.
+            if systemd.spawnd_identity().unwrap().is_none() {
+                for key in ["BindsTo", "After"] { assert!(policy.properties.remove(key).is_some(), "{key}"); }
+            }
+            // The unit's ProtectHome=/PrivateTmp= hide a test binary under
+            // /home, /root or /tmp: run a root-only copy from /var/lib.
+            let directory = ProbeDirectory(PathBuf::from("/var/lib").join(format!("{}.r7g-probe", policy.name)));
+            {
+                use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+                std::fs::DirBuilder::new().mode(0o700).create(&directory.0).unwrap();
+                let probe = directory.0.join("probe");
+                std::fs::copy(std::env::current_exe().unwrap(), &probe).unwrap();
+                std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let probe = directory.0.join("probe");
+            let probe = probe.to_str().unwrap();
+            let input = std::fs::File::open("/dev/null").unwrap();
+            let errors = std::fs::OpenOptions::new().write(true).open("/dev/null").unwrap();
+            let (reader, output) = nix::unistd::pipe2(OFlag::O_CLOEXEC | OFlag::O_NONBLOCK).unwrap();
+            let cleanup = TestRunCleanup(&systemd, run);
+            let started = systemd.start_exec(&policy, probe,
+                vec![probe, "iso_root_run_unit_openat2_child", "--ignored", "--test-threads=1"],
+                input.as_fd(), output.as_fd(), errors.as_fd());
+            drop(output);
+            let until = Instant::now() + Duration::from_secs(10);
+            let mut bytes = Vec::new();
+            let mut scratch = [0u8; 4096];
+            let contains = |bytes: &[u8], marker: &[u8]| bytes.windows(marker.len()).any(|window| window == marker);
+            while Instant::now() < until && !contains(&bytes, OPENAT2_OK) && !contains(&bytes, OPENAT2_FAILED) {
+                match nix::unistd::read(reader.as_raw_fd(), &mut scratch) {
+                    Ok(0) => break,
+                    Ok(size) => bytes.extend_from_slice(&scratch[..size]),
+                    Err(nix::errno::Errno::EAGAIN | nix::errno::Errno::EINTR) => std::thread::sleep(Duration::from_millis(25)),
+                    Err(error) => panic!("probe output: {error}"),
+                }
+            }
+            assert!(contains(&bytes, OPENAT2_OK) && !contains(&bytes, OPENAT2_FAILED),
+                "openat2 inside the run unit: {}", String::from_utf8_lossy(&bytes));
+            // The production readback (properties, User/Group empty,
+            // RestrictSUIDSGID false, main process root + full set) accepted it.
+            let started = started.expect("production run-unit readback");
+            let unit = Proxy::new(&systemd.connection, BUS, started.path.as_str(), "org.freedesktop.systemd1.Unit").unwrap();
+            let service = Proxy::new(&systemd.connection, BUS, started.path.as_str(), "org.freedesktop.systemd1.Service").unwrap();
+            for key in ["User", "Group"] { assert_eq!(service.get_property::<String>(key).unwrap(), "", "{key}"); }
+            assert!(!service.get_property::<bool>("RestrictSUIDSGID").unwrap());
+            let pid: u32 = service.get_property("MainPID").unwrap();
+            assert_ne!(pid, 0);
+            let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+            assert_eq!(status_field(&status, "Uid:"), ["0"; 4]);
+            assert_eq!(status_field(&status, "Gid:"), ["0"; 4]);
+            for key in ["CapEff:", "CapPrm:"] {
+                assert_eq!(u64::from_str_radix(status_field(&status, key)[0], 16).unwrap(), TRAMPOLINE_CAPABILITIES, "{key} {status}");
+            }
+            // CAP_SETUID (7), the bit an explicit User=root lost on systemd 255.
+            assert_ne!(TRAMPOLINE_CAPABILITIES & (1 << 7), 0);
+            assert!(run_process_status_ok(&status).unwrap());
+            // The child exits 0 only when its openat2 succeeded.
+            let until = Instant::now() + Duration::from_secs(20);
+            loop {
+                let state: String = unit.get_property("ActiveState").unwrap();
+                if state == "inactive" || state == "failed" { break; }
+                assert!(Instant::now() < until, "probe did not exit");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            assert_eq!(service.get_property::<i32>("ExecMainCode").unwrap(), 1);
+            assert_eq!(service.get_property::<i32>("ExecMainStatus").unwrap(), 0);
+            // The proxies borrow `started.path`: end those borrows first.
+            drop((unit, service));
+            drop(started);
+            drop(cleanup);
+            let _ = systemd.kill_name(&employee_slice(employee));
+            drop(directory);
+        }
     }
 }
 
@@ -1108,7 +1392,90 @@ mod tests {
         for key in ["OOMPolicy", "Delegate", "ProtectControlGroups"] {
             assert_eq!(readback.iter().filter(|(name, _)| *name == key).count(), 1, "{key}");
         }
-        assert_eq!(readback.len(), policy.properties.len());
+        assert_eq!(readback.len(), policy.properties.len() + RUN_UNIT_DEFAULTED.len());
+    }
+    #[test]
+    fn run_unit_policy_sets_no_identity_and_no_restrict_suid_sgid() {
+        let policy = UnitPolicy::new(RunId([1; 16]), EmployeeId([2; 16]), &limits(), &timeouts(), 8, 1).unwrap();
+        for key in ["User", "Group", "RestrictSUIDSGID", "DynamicUser", "SupplementaryGroups"] {
+            assert!(!policy.properties.contains_key(key), "{key}");
+        }
+        // The complete property set PID 1 receives; nothing else was removed or added.
+        let mut expected = vec!["PrivateTmp", "PrivateDevices", "PrivateIPC", "ProtectKernelTunables",
+            "ProtectKernelModules", "ProtectKernelLogs", "ProtectControlGroups", "LockPersonality",
+            "NoNewPrivileges", "MemoryAccounting", "CPUAccounting", "TasksAccounting", "IOAccounting", "Delegate",
+            "Type", "ProtectSystem", "OOMPolicy", "ProtectHome", "KillMode", "DevicePolicy",
+            "StandardInput", "StandardOutput", "StandardError", "Slice", "UMask",
+            "LimitCORE", "LimitCORESoft", "CapabilityBoundingSet", "AmbientCapabilities", "RestrictNamespaces",
+            "LimitNOFILE", "LimitNOFILESoft", "MemoryMax", "MemorySwapMax", "CPUQuotaPerSecUSec", "TasksMax",
+            "RuntimeMaxUSec", "TimeoutStartUSec", "TimeoutStopUSec", "SystemCallArchitectures",
+            "RestrictAddressFamilies", "Environment", "BindsTo", "After", "DeviceAllow",
+            "IOReadBandwidthMax", "IOWriteBandwidthMax", "IOReadIOPSMax", "IOWriteIOPSMax"];
+        expected.sort_unstable();
+        assert_eq!(policy.properties.keys().copied().collect::<Vec<_>>(), expected);
+        for key in ["PrivateTmp", "PrivateDevices", "PrivateIPC", "ProtectKernelTunables", "ProtectKernelModules",
+            "ProtectKernelLogs", "ProtectControlGroups", "LockPersonality", "NoNewPrivileges", "Delegate"] {
+            assert_eq!(policy.properties[key], Property::Bool(true), "{key}");
+        }
+        assert_eq!(policy.properties["RestrictNamespaces"], Property::U64(TRAMPOLINE_NAMESPACES));
+        assert_eq!(policy.properties["AmbientCapabilities"], Property::U64(0));
+        assert_eq!(policy.properties["SystemCallArchitectures"], Property::Strings(vec!["native".into()]));
+        assert_eq!(policy.properties["RestrictAddressFamilies"], Property::AllowStrings(
+            ["AF_UNIX", "AF_INET", "AF_INET6", "AF_NETLINK"].map(String::from).to_vec()));
+        assert_eq!(policy.properties["DevicePolicy"], Property::Text("closed".into()));
+        assert_eq!(policy.properties["ProtectSystem"], Property::Text("strict".into()));
+        assert_eq!(policy.properties["ProtectHome"], Property::Text("tmpfs".into()));
+        // ...and each of the three reads back its default exactly once.
+        let readback: Vec<_> = policy.readback().collect();
+        for (key, value) in [("User", Property::Text(String::new())), ("Group", Property::Text(String::new())),
+            ("RestrictSUIDSGID", Property::Bool(false))] {
+            let found: Vec<_> = readback.iter().filter(|(name, _)| *name == key).collect();
+            assert_eq!(found.len(), 1, "{key}");
+            assert_eq!(*found[0].1, value, "{key}");
+        }
+    }
+    const R7G_STATUS: &str = "Name:\tduduclaw-run\nUmask:\t0077\nState:\tS (sleeping)\nTgid:\t4242\nPid:\t4242\n\
+        PPid:\t1\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t64\nGroups:\t\nNoNewPrivs:\t1\nSeccomp:\t2\n\
+        CapInh:\t0000000000000000\nCapPrm:\t00000000012011c1\nCapEff:\t00000000012011c1\n\
+        CapBnd:\t00000000012011c1\nCapAmb:\t0000000000000000\n";
+    #[test]
+    fn run_process_readback_requires_root_and_the_full_trampoline_set() {
+        assert_eq!(TRAMPOLINE_CAPABILITIES, 0x12011c1);
+        assert!(run_process_status_ok(R7G_STATUS).unwrap());
+        // Measured on systemd 255 with an explicit User=root: CAP_SETUID missing.
+        let lost = R7G_STATUS.replace("CapPrm:\t00000000012011c1", "CapPrm:\t0000000001201141")
+            .replace("CapEff:\t00000000012011c1", "CapEff:\t0000000001201141");
+        assert!(!run_process_status_ok(&lost).unwrap());
+        for (from, to) in [("CapEff:\t00000000012011c1", "CapEff:\t0000000001201141"),
+            ("CapPrm:\t00000000012011c1", "CapPrm:\t0000000001201141"),
+            ("CapEff:\t00000000012011c1", "CapEff:\t00000000012011c9"),
+            ("CapBnd:\t00000000012011c1", "CapBnd:\t000001ffffffffff"),
+            ("CapAmb:\t0000000000000000", "CapAmb:\t0000000000000080"),
+            ("Uid:\t0\t0\t0\t0", "Uid:\t0\t70000\t0\t0"), ("Uid:\t0\t0\t0\t0", "Uid:\t0\t0\t0\t70000"),
+            ("Gid:\t0\t0\t0\t0", "Gid:\t70000\t0\t0\t0"), ("Uid:\t0\t0\t0\t0", "Uid:\t0\t0\t0"),
+            ("NoNewPrivs:\t1", "NoNewPrivs:\t0")] {
+            assert!(!run_process_status_ok(&R7G_STATUS.replace(from, to)).unwrap(), "{to}");
+        }
+        // Missing, duplicated or malformed fields refuse outright.
+        for key in ["Uid:", "Gid:", "CapPrm:", "CapEff:", "CapBnd:", "CapAmb:", "NoNewPrivs:"] {
+            let missing: String = R7G_STATUS.lines().filter(|line| !line.starts_with(key)).map(|line| format!("{line}\n")).collect();
+            assert!(run_process_status_ok(&missing).is_err(), "missing {key}");
+            let line = R7G_STATUS.lines().find(|line| line.starts_with(key)).unwrap();
+            assert!(run_process_status_ok(&format!("{R7G_STATUS}{line}\n")).is_err(), "duplicate {key}");
+        }
+        for (from, to) in [("CapEff:\t00000000012011c1", "CapEff:\t12011c1"), ("CapEff:\t00000000012011c1", "CapEff:\t+0000000012011c1")] {
+            assert!(run_process_status_ok(&R7G_STATUS.replace(from, to)).is_err(), "{to}");
+        }
+        assert!(run_process_status_ok("").is_err());
+    }
+    #[test]
+    fn run_process_cgroup_must_be_the_units_own() {
+        let unit = "/duduclaw.slice/duduclaw-employees.slice/duduclaw-employees-02.slice/duduclaw-run-01.service";
+        assert!(run_process_cgroup_ok(&format!("0::{unit}\n"), unit));
+        for membership in [format!("0::{unit}/rt-init\n"), format!("0::{unit}"), "0::/\n".into(),
+            format!("1:name=systemd:{unit}\n0::{unit}\n"), format!("0::{unit}\n0::{unit}\n"), String::new()] {
+            assert!(!run_process_cgroup_ok(&membership, unit), "{membership:?}");
+        }
     }
     #[test]
     fn invalid_resources_never_become_unlimited() {

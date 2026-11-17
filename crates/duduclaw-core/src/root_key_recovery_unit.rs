@@ -38,8 +38,11 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 # PID 1 owns the unit cgroup; the gateway must not modify its hierarchy.
 ProtectControlGroups=yes
-# The launcher drops IDs directly; it does not need to create set-ID files.
-RestrictSUIDSGID=yes
+# No RestrictSUIDSGID= (R7g): under it systemd's seccomp filter answers ENOSYS
+# for every openat2, and the gateway opens artifacts and migration receipts
+# through openat2 with RESOLVE_* guarantees. Still holds: the root launcher
+# drops IDs directly and creates no set-ID files; the gateway runs with
+# no_new_privs.
 # No execution-domain changes or foreign syscall ABIs are needed.
 LockPersonality=yes
 SystemCallArchitectures=native

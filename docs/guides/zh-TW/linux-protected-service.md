@@ -251,12 +251,11 @@ PrivateDevices=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
-RestrictSUIDSGID=yes
 LockPersonality=yes
 SystemCallArchitectures=native
 ```
 
-依 [systemd.exec](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html) 規則，每個 `-` 前綴會忽略不存在的路徑。這些設定隱藏常見引擎端點、隔離硬體裝置、禁止修改核心／模組／cgroup 與建立 set-ID 檔案，並限制執行模式及 syscall 架構。未設定 `RestrictNamespaces`，因為 gateway 的 Codex／bwrap 工作沙箱需要 user、mount、PID 與 network namespace。
+依 [systemd.exec](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html) 規則，每個 `-` 前綴會忽略不存在的路徑。這些設定隱藏常見引擎端點、隔離硬體裝置、禁止修改核心／模組／cgroup，並限制執行模式及 syscall 架構。刻意不設定 `RestrictSUIDSGID`：在 systemd 255 上它會讓所有 `openat2` 呼叫失敗，而 gateway 以 `openat2` 的路徑解析限制開啟檔案。啟動器不建立 set-ID 檔案，gateway 以 `no_new_privs` 執行。未設定 `RestrictNamespaces`，因為 gateway 的 Codex／bwrap 工作沙箱需要 user、mount、PID 與 network namespace。
 
 Gateway 在啟動時及每 60 秒重新檢查常見引擎 socket 的可達性與附加群組。預設 `revoke` 政策下，定期檢查失敗時會原位清零持有的金鑰、將保護狀態改為拒絕並記錄警告；個人連線暫停，直到重新啟動並通過完整金鑰交接檢查。撤銷後監測仍會繼續；自動恢復方式見下節。也會檢查 `/proc/net/unix` 的監聽中 abstract socket：名稱以 `/` 分段後，任一段完全等於 `docker`、`containerd`、`podman`、`buildkit`、`lxd`，或以這些名稱接 `.`、`-`、`_` 開頭，就會列為候選；不以任意子字串比對。 名稱命中本身不會造成拒絕：Gateway 會以短逾時的非阻塞連線取得 `SO_PEERCRED`，只有連得上且 peer uid 為 0 才視為風險。無法連線的候選會略過。資料表改以原始 bytes 讀取，非 UTF-8 名稱不會阻斷其他 socket 的檢查。每一行都必須完整解析；欄位或 flags 無效、名稱有歧義或換行殘片時，會拒絕接收金鑰，已持有的金鑰則撤銷。任何狀態下讀取資料表失敗都會拒絕通過；撤銷後也會重置連續通過次數。接受安全結果前，還必須透過 `NETLINK_SOCK_DIAG` 檢查附有長度的 `UNIX_DIAG_NAME`，包含非引擎名稱；只要含換行就拒絕，因此換行後即使偽造成合法資料列也不能略過。診斷 dump 無法取得、格式錯誤、中斷、超過 8 MiB 或逾時 250 ms，也會拒絕通過；核心須支援 UNIX socket diagnostics。兩項檢查都是定期觀察，並非所有 socket 的原子快照。
 

@@ -34,6 +34,26 @@ It writes `/run/duduclaw-spawnd/readiness.json` atomically as root:gateway-group
 A running service alone is not a successful readiness check. BindsTo on each run
 unit provides PID 1 shutdown cleanup, followed by startup residue reconciliation.
 
+Run units (transient, `duduclaw-run-<run>.service`) deliberately set neither
+`User=`/`Group=` nor `RestrictSUIDSGID=` (R7g): on systemd 255 an explicit
+`User=root` loses `CAP_SETUID`, and `RestrictSUIDSGID=` makes `openat2` ENOSYS
+for the trampoline. spawnd reads both back as unset and checks the started
+process is root with exactly the trampoline capability set before it sends the
+bootstrap; see `crates/duduclaw-spawnd/src/systemd.rs` (`UnitPolicy::new`) and
+`docs/architecture/native-linux-isolation.md`. No static unit file mirrors the
+run-unit policy, but the same `openat2` conflict applies to the static units:
+`duduclaw-spawnd.service` and `duduclaw-isolation-ready.service` do not set
+`RestrictSUIDSGID=` either, because spawnd (work broker, storage, cgroup
+leaves, bootstrap mounts, trusted-file reader) and its `wait-consistent` waiter
+(status file through the trusted-file reader) open paths with `openat2` and
+RESOLVE_*. Both stay root services that create no set-ID files, with
+`NoNewPrivileges=yes`. They keep `User=root`/`Group=root`: neither needs
+`CAP_SETUID` (spawnd's bounding set excludes it; the waiter has none).
+`duduclaw-updated.service` (scripts/linux-protected/updated) and
+`duduclaw-auto-upgrade.service` follow the same rule and also drop the explicit
+`User=root`, since the updater binary needs `CAP_SETUID` to drop its download
+child to `duduclaw-dl`.
+
 The daemon also binds the root-only update control socket
 `/run/duduclaw-spawnd/update.sock` (root 0600) for `duduclaw-updated`. Its
 `Apply` republishes the verified generation's root components, so the unit adds
