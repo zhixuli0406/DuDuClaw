@@ -242,10 +242,16 @@ fn systemctl_within(args: &[&str], capture: bool, deadline: Instant) -> Result<V
     })
 }
 /// One client against one absolute `deadline` on the clock `now`: when it has
-/// passed nothing is spawned (`Err(Maintenance)`); after the spawn the wait is
-/// computed from the same deadline again ([`wait_within`]), and a client still
-/// running at the deadline is killed (`Err(Maintenance)`). A non-zero exit is
-/// `Err(Maintenance)`; at most 128 bytes of stdout are returned.
+/// passed nothing is spawned (`Err(Maintenance)`); right after the spawn (and
+/// the reader's setup) the same deadline is checked again, and the wait is
+/// computed from it ([`wait_within`]). A client whose exit is not observed
+/// before the deadline (still running, already exited when the spawn ran into
+/// the deadline, or exited between two polls across it) or whose status cannot
+/// be read is never a success: it is killed (a no-op once exited), reaped and
+/// `Err(Maintenance)`. A non-zero exit is `Err(Maintenance)`; at most 128 bytes
+/// of stdout are returned, and only when the reader also finished before the
+/// deadline (it is dropped, never joined, otherwise: a pipe a grandchild holds
+/// open cannot block past the deadline).
 fn client_within(deadline: Instant, mut now: impl FnMut() -> Instant, mut pause: impl FnMut(Duration),
     spawn: impl FnOnce() -> Result<Child>) -> Result<Vec<u8>> {
     if now() >= deadline { return Err(Error::Maintenance); }
@@ -253,22 +259,31 @@ fn client_within(deadline: Instant, mut now: impl FnMut() -> Instant, mut pause:
     let output = child.stdout.take().map(|mut pipe| std::thread::spawn(move || {
         let mut bytes = Vec::new(); pipe.by_ref().take(129).read_to_end(&mut bytes).map(|_| bytes)
     }));
-    let exited = wait_within(|| Ok(child.try_wait()?), deadline, &mut now, &mut pause)?;
-    let Some(status) = exited else { let _ = child.kill(); let _ = child.wait(); return Err(Error::Maintenance) };
+    let exited = if now() >= deadline { Ok(None) } else { wait_within(|| Ok(child.try_wait()?), deadline, &mut now, &mut pause) };
+    let Ok(Some(status)) = exited else { let _ = child.kill(); let _ = child.wait(); return Err(Error::Maintenance) };
     if !status.success() { return Err(Error::Maintenance); }
-    let bytes = match output { Some(handle) => handle.join().map_err(|_| Error::Maintenance)??, None => vec![] };
+    let bytes = match output {
+        Some(handle) => {
+            wait_within(|| Ok(handle.is_finished().then_some(())), deadline, &mut now, &mut pause)?.ok_or(Error::Maintenance)?;
+            handle.join().map_err(|_| Error::Maintenance)??
+        }
+        None => vec![],
+    };
     if bytes.len() > 128 { return Err(Error::Maintenance); }
     Ok(bytes)
 }
-/// Poll `exited` until it yields (`Some`) or the absolute `deadline` is reached
-/// (`None`); every pause is `min(CLIENT_POLL, deadline - now)`, so the wait
-/// never runs past the deadline by more than one poll of `exited`.
+/// Poll `exited` until it yields (`Some`) before the absolute `deadline`, or the
+/// deadline is reached (`None`). The deadline is checked after every poll and
+/// before its value is accepted: a value observed at or after the deadline is
+/// `None`, never a result. Every pause is `min(CLIENT_POLL, deadline - now)`, so
+/// the wait never runs past the deadline by more than one poll of `exited`.
 fn wait_within<T>(mut exited: impl FnMut() -> Result<Option<T>>, deadline: Instant, mut now: impl FnMut() -> Instant,
     mut pause: impl FnMut(Duration)) -> Result<Option<T>> {
     loop {
-        if let Some(value) = exited()? { return Ok(Some(value)); }
+        let observed = exited()?;
         let left = deadline.saturating_duration_since(now());
         if left.is_zero() { return Ok(None); }
+        if let Some(value) = observed { return Ok(Some(value)); }
         pause(CLIENT_POLL.min(left));
     }
 }
@@ -756,6 +771,91 @@ mod tests {
         }
         assert!(matches!(systemctl_within(&["is-active", "--quiet", "duduclaw-spawnd.service"], false, Instant::now()),
             Err(Error::Maintenance)));
+    }
+    /// A real `/bin/sh` client for [`client_within`].
+    fn shell(script: &str, stdin: Stdio, stdout: Stdio) -> Child {
+        Command::new("/bin/sh").args(["-c", script]).stdin(stdin).stdout(stdout).stderr(Stdio::null()).spawn().unwrap()
+    }
+    /// Blocks until child `pid` has exited, without reaping it.
+    fn exited_unreaped(pid: u32) {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT) }, 0);
+    }
+    /// Child `pid` was reaped (no zombie left): `waitpid` knows no such child.
+    fn reaped(pid: u32) -> bool {
+        let mut status = 0;
+        (unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) }) == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
+    }
+    #[test]
+    fn client_result_after_the_deadline_is_never_a_success() {
+        use std::cell::Cell;
+        let base = Instant::now();
+        let clock = Cell::new(Duration::ZERO);
+        let now = || base + clock.get();
+        let deadline = base + Duration::from_millis(100);
+        // The wait itself: a value observed at or after the deadline is not accepted.
+        clock.set(Duration::ZERO);
+        let late = || { clock.set(Duration::from_millis(100)); Ok(Some(7)) };
+        assert!(wait_within(late, deadline, now, |_| panic!("paused past the deadline")).unwrap().is_none());
+        clock.set(Duration::from_millis(150));
+        assert!(wait_within(|| Ok(Some(7)), deadline, now, |_| panic!("paused past the deadline")).unwrap().is_none());
+        clock.set(Duration::ZERO);
+        let mut polls = 0;
+        let across = wait_within(|| { polls += 1; Ok((polls == 2).then_some(7)) }, deadline, now,
+            |_| clock.set(Duration::from_millis(100))).unwrap();
+        assert!(across.is_none() && polls == 2);
+        // The spawn (and the reader's setup) used up the deadline and the client
+        // has already exited successfully: killed (a no-op), reaped, Maintenance.
+        for capture in [false, true] {
+            clock.set(Duration::ZERO);
+            let pid = Cell::new(0);
+            let result = client_within(deadline, now, |_| panic!("waited past the deadline"), || {
+                let child = shell("exit 0", Stdio::null(), if capture { Stdio::piped() } else { Stdio::null() });
+                pid.set(child.id()); exited_unreaped(child.id());
+                clock.set(Duration::from_millis(100)); Ok(child)
+            });
+            assert!(matches!(result, Err(Error::Maintenance)), "{capture}");
+            assert!(reaped(pid.get()), "{capture}");
+        }
+        // Still running at the first poll; between two polls the deadline passes
+        // and the client exits successfully meanwhile: the status the next poll
+        // observes is not accepted.
+        clock.set(Duration::ZERO);
+        let stdin = RefCell::new(None);
+        let pid = Cell::new(0);
+        let mut pauses = 0;
+        let result = client_within(deadline, now, |duration| {
+            pauses += 1;
+            // EOF on its stdin lets the client exit; wait for that without reaping it.
+            drop(stdin.borrow_mut().take());
+            exited_unreaped(pid.get());
+            clock.set(clock.get() + duration.max(Duration::from_millis(100)));
+        }, || {
+            let mut child = shell("read line; exit 0", Stdio::piped(), Stdio::null());
+            *stdin.borrow_mut() = child.stdin.take(); pid.set(child.id()); Ok(child)
+        });
+        assert!(matches!(result, Err(Error::Maintenance)));
+        assert_eq!(pauses, 1);
+        assert!(reaped(pid.get()));
+    }
+    #[test]
+    fn client_finishing_before_the_deadline_succeeds_and_is_reaped() {
+        use std::cell::Cell;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        for (script, capture, expected) in [("echo ok", true, Some(&b"ok\n"[..])), ("exit 0", false, Some(&b""[..])),
+            ("exit 3", false, None)] {
+            let pid = Cell::new(0);
+            let result = client_within(deadline, Instant::now, std::thread::sleep, || {
+                let child = shell(script, Stdio::null(), if capture { Stdio::piped() } else { Stdio::null() });
+                pid.set(child.id()); Ok(child)
+            });
+            match expected {
+                Some(bytes) => assert_eq!(result.ok().as_deref(), Some(bytes), "{script}"),
+                None => assert!(matches!(result, Err(Error::Maintenance)), "{script}"),
+            }
+            assert!(reaped(pid.get()), "{script}");
+        }
     }
     #[test]
     fn restart_timeout_is_one_shared_deadline_and_recoverable() {
