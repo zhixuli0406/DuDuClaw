@@ -95,19 +95,27 @@ impl Reapable for std::process::Child {
 /// `try_wait` (`Err`) proves nothing about the child — it may still run — so
 /// it is handled exactly like `Ok(None)`: SIGKILL, the bounded reap, then the
 /// detached reaper.
+///
+/// Security review: `ECHILD` is the one error that does prove something —
+/// there is no child left to wait for (already reaped elsewhere, `SIGCHLD`
+/// ignored, `SA_NOCLDWAIT`). Its pid may already be reused, so it is treated
+/// as reaped: no signal is sent and nothing is handed to the reaper. SIGKILL
+/// is sent at most once, and never after an outcome saying the child is gone.
 fn kill_and_reap<C: Reapable>(mut child: C, bound: std::time::Duration, step: std::time::Duration) -> bool {
     use std::time::Instant;
-    match child.try_reap() {
-        Ok(Some(_)) => return true,
-        Ok(None) | Err(_) => (),
+    /// `true`: the child is gone (reaped now, or `ECHILD`: nothing left to reap).
+    fn gone<C: Reapable>(child: &mut C) -> bool {
+        match child.try_reap() {
+            Ok(Some(_)) => true,
+            Err(error) if error.raw_os_error() == Some(libc::ECHILD) => true,
+            Ok(None) | Err(_) => false,
+        }
     }
+    if gone(&mut child) { return true; }
     let _ = child.kill();
     let until = Instant::now() + bound;
     loop {
-        match child.try_reap() {
-            Ok(Some(_)) => return true,
-            Ok(None) | Err(_) => (),
-        }
+        if gone(&mut child) { return true; }
         let now = Instant::now();
         if now >= until { break; }
         std::thread::sleep(step.min(until - now));

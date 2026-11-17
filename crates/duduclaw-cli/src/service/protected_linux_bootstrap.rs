@@ -4002,7 +4002,13 @@ gshadow:        files\nhosts:          files mdns4_minimal [NOTFOUND=return] dns
         dies_on_kill: bool,
         /// Review round 6 item 2: `try_wait` fails (`Err`) while it is not reaped.
         try_wait_fails: bool,
+        /// Security review: `try_wait` fails with `ECHILD` (no child left) —
+        /// from the first check, or once killed.
+        echild_first: bool,
+        echild_after_kill: bool,
         killed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        /// How many times `kill` was called.
+        kills: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         reaped: std::sync::Arc<std::sync::atomic::AtomicBool>,
         /// `wait()` blocks until this is signalled (or its sender dropped).
         release: std::sync::mpsc::Receiver<()>,
@@ -4011,12 +4017,17 @@ gshadow:        files\nhosts:          files mdns4_minimal [NOTFOUND=return] dns
     impl super::super::Reapable for FakeChild {
         fn try_reap(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
             use std::os::unix::process::ExitStatusExt;
-            let dead = self.dies_on_kill && self.killed.load(std::sync::atomic::Ordering::SeqCst);
+            let killed = self.killed.load(std::sync::atomic::Ordering::SeqCst);
+            if self.echild_first || (self.echild_after_kill && killed) {
+                return Err(std::io::Error::from_raw_os_error(libc::ECHILD));
+            }
+            let dead = self.dies_on_kill && killed;
             if !dead && self.try_wait_fails { return Err(std::io::Error::other("waitpid failed")); }
             Ok(dead.then(|| std::process::ExitStatus::from_raw(9)))
         }
         fn kill(&mut self) -> std::io::Result<()> {
             self.killed.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.kills.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
         fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
@@ -4034,7 +4045,8 @@ gshadow:        files\nhosts:          files mdns4_minimal [NOTFOUND=return] dns
         let fake = |dies_on_kill: bool| {
             let (killed, reaped) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
             let (release, receiver) = mpsc::channel();
-            (FakeChild { dies_on_kill, try_wait_fails: true, killed: killed.clone(), reaped: reaped.clone(), release: receiver },
+            (FakeChild { dies_on_kill, try_wait_fails: true, echild_first: false, echild_after_kill: false, killed: killed.clone(),
+                kills: Arc::new(std::sync::atomic::AtomicUsize::new(0)), reaped: reaped.clone(), release: receiver },
                 killed, reaped, release)
         };
         // It dies on SIGKILL: the kill was sent and the bounded reap saw it.
@@ -4057,12 +4069,43 @@ gshadow:        files\nhosts:          files mdns4_minimal [NOTFOUND=return] dns
     }
 
     #[test]
+    fn echild_from_try_wait_is_reaped_and_never_signalled() {
+        use std::sync::{atomic::{AtomicBool, AtomicUsize, Ordering}, mpsc, Arc};
+        // Security review: `ECHILD` means no child is left (its pid may be reused).
+        let fake = |echild_first: bool, echild_after_kill: bool| {
+            let (killed, reaped) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+            let kills = Arc::new(AtomicUsize::new(0));
+            let (release, receiver) = mpsc::channel::<()>();
+            // Dropped: a reaper thread, if one were spawned, would return at once and record it.
+            drop(release);
+            (FakeChild { dies_on_kill: false, try_wait_fails: true, echild_first, echild_after_kill, killed: killed.clone(),
+                kills: kills.clone(), reaped: reaped.clone(), release: receiver }, kills, reaped)
+        };
+        // `ECHILD` on the first check: no kill, no hand-off, returned at once.
+        let (child, kills, reaped) = fake(true, false);
+        let started = Instant::now();
+        assert!(super::super::kill_and_reap(child, Duration::from_millis(200), Duration::from_millis(20)));
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert_eq!(kills.load(Ordering::SeqCst), 0, "no signal to a pid that may be reused");
+        // `ECHILD` in the polling loop after the kill: reaped, no second kill.
+        let (child, kills2, reaped2) = fake(false, true);
+        let started = Instant::now();
+        assert!(super::super::kill_and_reap(child, Duration::from_millis(200), Duration::from_millis(20)));
+        assert!(started.elapsed() < Duration::from_millis(200), "the loop ended as reaped");
+        assert_eq!(kills2.load(Ordering::SeqCst), 1, "SIGKILL exactly once");
+        // Neither was handed to the detached reaper.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!reaped.load(Ordering::SeqCst) && !reaped2.load(Ordering::SeqCst), "no reaper hand-off");
+    }
+
+    #[test]
     fn command_reap_and_output_read_never_block_past_their_bounds() {
         use std::sync::{atomic::{AtomicBool, Ordering}, mpsc, Arc};
         let fake = |dies_on_kill: bool| {
             let (killed, reaped) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
             let (release, receiver) = mpsc::channel();
-            (FakeChild { dies_on_kill, try_wait_fails: false, killed: killed.clone(), reaped: reaped.clone(), release: receiver },
+            (FakeChild { dies_on_kill, try_wait_fails: false, echild_first: false, echild_after_kill: false, killed: killed.clone(),
+                kills: Arc::new(std::sync::atomic::AtomicUsize::new(0)), reaped: reaped.clone(), release: receiver },
                 killed, reaped, release)
         };
         // Dies on SIGKILL: reaped within the bound by the caller itself.
