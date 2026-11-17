@@ -76,6 +76,11 @@ impl MemoryStore {
 struct World {
     /// The generation whose bytes each fixed destination holds, in `publication()` order.
     slots: [Option<Sha256Digest>; 8],
+    /// The `<name>.next` temporary next to each fixed destination: the
+    /// generation whose (possibly torn) copy it holds.
+    temporaries: [Option<Sha256Digest>; 8],
+    /// Unlinking a temporary fails (an I/O error, not "absent").
+    temporaries_stuck: bool,
     /// Generation directories that pass full verification.
     staged: Vec<Sha256Digest>,
     /// Generations whose signing key the trust ledger has since revoked.
@@ -92,6 +97,27 @@ type SharedWorld = Arc<Mutex<World>>;
 fn new_world(store: &MemoryStore, installed: Sha256Digest, staged: &[Sha256Digest]) -> SharedWorld {
     Arc::new(Mutex::new(World { slots: [Some(installed); 8], staged: staged.to_vec(), selector: Some(installed),
         disk: Some(store.clone()), ..World::default() }))
+}
+/// One fixed destination of the fake world, driven by the production
+/// [`publish_slot`] / [`settled_slot`] ordering.
+struct WorldSlot<'a> { world: &'a mut World, index: usize, generation: Sha256Digest }
+impl Slot for WorldSlot<'_> {
+    fn remove_temporary(&mut self) -> io::Result<()> {
+        if self.world.temporaries[self.index].is_some() && self.world.temporaries_stuck {
+            return Err(io::Error::other("injected temporary unlink failure"));
+        }
+        self.world.temporaries[self.index] = None;
+        Ok(())
+    }
+    fn holds(&mut self) -> io::Result<bool> { Ok(self.world.slots[self.index] == Some(self.generation)) }
+    fn write_temporary(&mut self) -> io::Result<()> {
+        self.world.temporaries[self.index] = Some(self.generation);
+        Ok(())
+    }
+    fn commit(&mut self) -> io::Result<()> {
+        self.world.slots[self.index] = Some(self.world.temporaries[self.index].take().ok_or_else(invalid)?);
+        Ok(())
+    }
 }
 
 /// Without a world, the selected generation of a verified installed set.
@@ -136,10 +162,12 @@ impl Effects for FakeEffects {
     }
     fn published(&mut self, generation: Sha256Digest) -> io::Result<()> {
         self.calls.push("published");
-        match &self.world {
-            Some(world) if world.lock().unwrap().slots != [Some(generation); 8] => Err(invalid()),
-            _ => Ok(()),
+        let Some(world) = &self.world else { return Ok(()) };
+        let mut world = world.lock().unwrap();
+        for index in 0..8 {
+            if !settled_slot(&mut WorldSlot { world: &mut *world, index, generation })? { return Err(invalid()); }
         }
+        Ok(())
     }
     fn publish(&mut self, generation: Sha256Digest) -> io::Result<()> {
         self.calls.push("publish");
@@ -150,17 +178,23 @@ impl Effects for FakeEffects {
         world.journal_at_publish.push(journal);
         // The copy re-verifies the source: a corrupted generation stops here.
         if !world.staged.contains(&generation) { return Err(invalid()); }
-        for index in 0..8 {
-            if world.slots[index] == Some(generation) { continue; }
-            let pending = world.power_loss_after;
-            match pending {
-                Some(0) => { world.power_loss_after = None; return Err(io::Error::other("simulated power loss")); }
-                Some(remaining) => world.power_loss_after = Some(remaining - 1),
-                None => {}
+        // Power loss after this many renames: the next component's temporary
+        // is fully written, its rename never happens.
+        let mut budget = world.power_loss_after.take();
+        let mut before_rename = || -> io::Result<()> {
+            match budget {
+                Some(0) => { budget = None; Err(io::Error::other("simulated power loss")) }
+                Some(remaining) => { budget = Some(remaining - 1); Ok(()) }
+                None => Ok(()),
             }
-            world.slots[index] = Some(generation);
+        };
+        let mut result = Ok(());
+        for index in 0..8 {
+            result = publish_slot(&mut WorldSlot { world: &mut *world, index, generation }, &mut before_rename);
+            if result.is_err() { break; }
         }
-        Ok(())
+        world.power_loss_after = budget;
+        result
     }
     fn installed(&mut self) -> io::Result<Option<Sha256Digest>> {
         Ok(match &self.world { Some(world) => world.lock().unwrap().selector, None => Some(INSTALLED) })
@@ -469,6 +503,7 @@ fn refused_outcome<S: DrainStore + JournalStore, E: Effects>(control: &mut Updat
     assert!(matches!(outcome(control, command), ControlOutcome::Refused));
 }
 fn slots(world: &SharedWorld) -> [Option<Sha256Digest>; 8] { world.lock().unwrap().slots }
+fn temporaries(world: &SharedWorld) -> [Option<Sha256Digest>; 8] { world.lock().unwrap().temporaries }
 /// A simulated restart: a new barrier and new effects over the same disk and world.
 fn restart(store: &MemoryStore, world: &SharedWorld) -> (DrainBarrier, UpdateControl<MemoryStore, FakeEffects>) {
     let barrier = DrainBarrier::default();
@@ -553,6 +588,111 @@ fn update_corrupt_generation_after_partial_publication_rolls_back() {
     accepted(&mut control, ControlCommand::Resume { generation: digest(1) });
     assert_eq!(store.journal(), None);
     assert!(!barrier.is_closed());
+}
+
+/// The power loss of [`interrupted_apply`] leaves the next component's
+/// temporary: a complete copy of 2 whose rename never happened.
+fn torn_after(renames: usize) -> [Option<Sha256Digest>; 8] {
+    let mut torn = [None; 8];
+    torn[renames] = Some(digest(2));
+    torn
+}
+
+#[test]
+fn update_rollback_removes_the_interrupted_temporary() {
+    for renames in 0..=7 {
+        let (store, shared) = interrupted_apply(renames);
+        assert_eq!(temporaries(&shared), torn_after(renames), "after {renames} renames");
+        // Roll-back: the interrupted component already holds 1 (kept), the
+        // torn copy of 2 next to it must not survive.
+        shared.lock().unwrap().staged.retain(|generation| *generation != digest(2));
+        let (_, control) = restart(&store, &shared);
+        assert_eq!(control.startup().recovery, PublicationRecovery::RolledBack, "after {renames} renames");
+        assert!(control.consistent_at_start());
+        assert_eq!(slots(&shared), [Some(digest(1)); 8], "after {renames} renames");
+        assert_eq!(temporaries(&shared), [None; 8], "after {renames} renames");
+        assert_eq!(store.journal(),
+            Some(PublishJournal::new(digest(1), digest(1), Some(digest(2)), PublishState::Published).unwrap()));
+    }
+}
+
+#[test]
+fn update_roll_forward_removes_the_interrupted_temporary() {
+    for renames in 0..=7 {
+        let (store, shared) = interrupted_apply(renames);
+        assert_eq!(temporaries(&shared), torn_after(renames), "after {renames} renames");
+        let (_, control) = restart(&store, &shared);
+        assert_eq!(control.startup().recovery, PublicationRecovery::RolledForward, "after {renames} renames");
+        assert!(control.consistent_at_start());
+        assert_eq!(slots(&shared), [Some(digest(2)); 8], "after {renames} renames");
+        assert_eq!(temporaries(&shared), [None; 8], "after {renames} renames");
+        assert_eq!(store.journal().map(|journal| journal.state), Some(PublishState::Published));
+    }
+}
+
+#[test]
+fn update_apply_removes_a_stale_temporary_next_to_a_kept_component() {
+    let store = MemoryStore::default();
+    let shared = new_world(&store, digest(1), &[digest(1)]);
+    let barrier = DrainBarrier::default();
+    let _admission = Observer::new(&barrier, 0);
+    let mut control = UpdateControl::new(store.clone(), barrier.clone(), FakeEffects::over(&shared)).unwrap();
+    assert_eq!(control.startup().recovery, PublicationRecovery::NoJournal);
+    // An unrelated stale copy next to a component whose fixed path already
+    // holds the generation applied (every component is kept).
+    shared.lock().unwrap().temporaries[3] = Some(digest(9));
+    accepted(&mut control, ControlCommand::Drain { generation: digest(1) });
+    accepted(&mut control, apply_command(digest(1)));
+    assert_eq!(slots(&shared), [Some(digest(1)); 8]);
+    assert_eq!(temporaries(&shared), [None; 8]);
+    assert_eq!(store.journal(), Some(PublishJournal::new(digest(1), digest(1), None, PublishState::Published).unwrap()));
+    // One that cannot be removed fails the (retried) Apply; never ignored.
+    {
+        let mut world = shared.lock().unwrap();
+        world.temporaries[5] = Some(digest(9));
+        world.temporaries_stuck = true;
+    }
+    refused_outcome(&mut control, apply_command(digest(1)));
+    assert_eq!(temporaries(&shared)[5], Some(digest(9)));
+    assert_eq!(store.journal().map(|journal| journal.state), Some(PublishState::Publishing));
+    drop(control);
+    // Recovery cannot remove it either: not consistent.
+    let (barrier, control) = restart(&store, &shared);
+    assert_eq!(control.startup().recovery, PublicationRecovery::Incomplete);
+    assert!(!control.consistent_at_start());
+    assert_eq!(barrier.closure(), Some(DrainClosure::Recovery));
+    drop(control);
+    // Once it can be removed, the restart completes the publication without it.
+    shared.lock().unwrap().temporaries_stuck = false;
+    let (_, control) = restart(&store, &shared);
+    assert_eq!(control.startup().recovery, PublicationRecovery::RolledForward);
+    assert!(control.consistent_at_start());
+    assert_eq!(temporaries(&shared), [None; 8]);
+}
+
+#[test]
+fn update_start_without_journal_removes_a_stale_temporary_or_is_not_consistent() {
+    let store = MemoryStore::default();
+    let shared = new_world(&store, digest(1), &[digest(1)]);
+    // A copy of a newer generation left beside a kept component (an earlier
+    // roll-back that did not remove it), no journal.
+    shared.lock().unwrap().temporaries[5] = Some(digest(2));
+    shared.lock().unwrap().temporaries_stuck = true;
+    let (barrier, control) = restart(&store, &shared);
+    assert_eq!(control.startup().recovery, PublicationRecovery::SelectedUnverified);
+    assert!(!control.consistent_at_start());
+    assert_eq!(barrier.closure(), Some(DrainClosure::Recovery));
+    assert_eq!(temporaries(&shared)[5], Some(digest(2)));
+    drop(control);
+    // Removable: removed, no destination written, consistent.
+    shared.lock().unwrap().temporaries_stuck = false;
+    let (barrier, control) = restart(&store, &shared);
+    assert_eq!(control.startup().recovery, PublicationRecovery::NoJournal);
+    assert!(control.consistent_at_start());
+    assert_eq!(control.effects.calls, vec!["verify", "published"]);
+    assert_eq!((store.journal(), barrier.closure()), (None, None));
+    assert_eq!(slots(&shared), [Some(digest(1)); 8]);
+    assert_eq!(temporaries(&shared), [None; 8]);
 }
 
 #[test]
