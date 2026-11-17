@@ -302,19 +302,20 @@ pub(super) fn stat_at(dirfd: RawFd, name: &CStr) -> std::io::Result<Stat> {
         nlink: u64::from(stat.stx_nlink), mount_id })
 }
 
-/// Review R4 item 2: a wall-clock instant `(seconds, nanoseconds)` since the epoch.
+/// Review R4 item 2: an instant `(seconds, nanoseconds)` of a clock.
 pub(super) type Timestamp = (i64, u32);
 
-/// Review R4 item 2: what binds an object another component created to this
-/// transaction's window, observed by `statx` of the same inode the identity names.
+/// Review R4 item 2: what `statx` reports of the same inode the identity
+/// names, read after it (the link count, and the birth time when there is one).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Creation {
     pub(super) device: u64,
     pub(super) inode: u64,
     pub(super) nlink: u64,
-    /// Birth time when the filesystem reports one (`STATX_BTIME`), else the
-    /// change time (never earlier than the birth); `None`: neither reported.
-    pub(super) stamp: Option<Timestamp>,
+    /// Review round 5 item 5: the birth time when the filesystem reports one
+    /// (`STATX_BTIME`); `None` otherwise. Never the change time (it moves with
+    /// every metadata update and proves nothing about creation).
+    pub(super) btime: Option<Timestamp>,
 }
 
 /// `statx` of `name` below `dirfd` for [`Creation`] (no link followed, no automount).
@@ -325,11 +326,9 @@ pub(super) fn creation_at(dirfd: RawFd, name: &CStr) -> std::io::Result<Creation
     duduclaw_core::linux_syscalls::statx(dirfd, name, flags, libc::STATX_BASIC_STATS | libc::STATX_BTIME, &mut stat)?;
     let required = libc::STATX_INO | libc::STATX_NLINK;
     if stat.stx_mask & required != required { return Err(std::io::Error::other("incomplete statx answer")); }
-    let time = |time: libc::statx_timestamp| (time.tv_sec, time.tv_nsec);
-    let stamp = if stat.stx_mask & libc::STATX_BTIME != 0 { Some(time(stat.stx_btime)) }
-        else if stat.stx_mask & libc::STATX_CTIME != 0 { Some(time(stat.stx_ctime)) } else { None };
+    let btime = (stat.stx_mask & libc::STATX_BTIME != 0).then_some((stat.stx_btime.tv_sec, stat.stx_btime.tv_nsec));
     Ok(Creation { device: (u64::from(stat.stx_dev_major) << 32) | u64::from(stat.stx_dev_minor), inode: stat.stx_ino,
-        nlink: u64::from(stat.stx_nlink), stamp })
+        nlink: u64::from(stat.stx_nlink), btime })
 }
 
 /// The [`Creation`] of a fixed absolute path (its parent opened no-follow).
@@ -338,24 +337,60 @@ pub(super) fn creation(path: &str) -> Result<Creation> {
     Ok(creation_at(directory.as_raw_fd(), &name)?)
 }
 
-/// Review R4 item 2: the kernel's COARSE wall clock — the clock inode
-/// timestamps are taken from — so an object created after this call never
-/// carries an earlier stamp. `None`: unreadable.
-pub(super) fn window_start() -> Option<Timestamp> {
+/// Review round 5 item 5: the wall clock inode timestamps are taken from
+/// (`CLOCK_REALTIME_COARSE`) read together with `CLOCK_BOOTTIME`, which no
+/// wall-clock step moves. Taken at a window's start and again at its check,
+/// the two readings reveal a step of the wall clock in between ([`stepped`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Clocks {
+    pub(super) realtime: Timestamp,
+    pub(super) boottime: Timestamp,
+}
+
+/// A wall-clock step larger than this between two [`Clocks`] readings is a
+/// step (coarse-clock granularity and NTP slewing stay far below it).
+const STEP_TOLERANCE_NANOS: i128 = 1_000_000_000;
+
+fn clock(id: libc::clockid_t) -> Option<Timestamp> {
     // SAFETY: an all-zero `timespec` is a valid value; clock_gettime writes it on success.
     let mut now: libc::timespec = unsafe { std::mem::zeroed() };
     // SAFETY: valid clock id and a live out-pointer.
-    if unsafe { libc::clock_gettime(libc::CLOCK_REALTIME_COARSE, &mut now) } != 0 { return None; }
+    if unsafe { libc::clock_gettime(id, &mut now) } != 0 { return None; }
     Some((now.tv_sec, u32::try_from(now.tv_nsec).ok()?))
 }
 
-/// Review R4 item 2 (pure): the creation stamp of `creation` does not predate
-/// `window` and belongs to the object `identity` names. Anything unreadable:
-/// not accepted. (A concurrent root actor creating the object inside the
-/// window is outside what the installer can distinguish.)
-pub(super) fn created_in_window(identity: &Identity, creation: &Creation, window: Option<Timestamp>) -> bool {
-    let (Some(stamp), Some(window)) = (creation.stamp, window) else { return false };
-    creation.device == identity.device && creation.inode == identity.inode && stamp >= window
+/// Both clocks now (`None`: either unreadable).
+pub(super) fn clocks() -> Option<Clocks> {
+    Some(Clocks { realtime: clock(libc::CLOCK_REALTIME_COARSE)?, boottime: clock(libc::CLOCK_BOOTTIME)? })
+}
+
+/// Review R4 item 2: read right before the producer is started.
+pub(super) fn window_start() -> Option<Clocks> { clocks() }
+
+fn nanos((seconds, nanoseconds): Timestamp) -> i128 { i128::from(seconds) * 1_000_000_000 + i128::from(nanoseconds) }
+
+/// Review round 5 item 5 (pure): the wall clock advanced by something other
+/// than the boot clock between `start` and `now` (stepped either way).
+pub(super) fn stepped(start: &Clocks, now: &Clocks) -> bool {
+    let wall = nanos(now.realtime) - nanos(start.realtime);
+    let boot = nanos(now.boottime) - nanos(start.boottime);
+    (wall - boot).abs() > STEP_TOLERANCE_NANOS
+}
+
+/// Review round 5 item 5 (pure): the timestamp side of a component proof.
+/// It is NOT the creation proof — that is absence-then-identity: the path was
+/// absent when its intent was made durable right before the producer ran
+/// ([`Recorder::absent_at_intent`]), and the object present now satisfies
+/// the caller's shape, owner, mode and producer checks. This only rejects an
+/// object whose birth time (where the filesystem reports one) predates the
+/// window start. `creation` must be of the inode `identity` names. Skipped —
+/// never a refusal — without a birth time (never substituted by the change
+/// time), when either clock reading is unavailable, or when the wall clock
+/// stepped between the window start and `now`.
+pub(super) fn created_in_window(identity: &Identity, creation: &Creation, window: Option<Clocks>, now: Option<Clocks>) -> bool {
+    if creation.device != identity.device || creation.inode != identity.inode { return false; }
+    let (Some(btime), Some(start), Some(now)) = (creation.btime, window, now) else { return true };
+    stepped(&start, &now) || btime >= start.realtime
 }
 
 pub(super) fn boot_id() -> Result<String> {
@@ -543,7 +578,7 @@ fn collect_proofs<T>(create: impl FnOnce() -> T) -> (T, Vec<(String, Identity)>)
 
 /// Review R4 item 2: an object another component should have created could not be proven this install's.
 fn component_unconfirmed(path: &str) -> DuDuClawError {
-    refused(format!("無法證明 {path} 是這次安裝啟動的元件在這次安裝期間建立的物件（擁有者、權限、掛載點、建立時間或產生它的服務不符，或無法讀取）；已停止，沒有把它記錄為這次安裝建立的物件，這一步也未完成。請確認來源後以同一個命令續接，或執行 duduclaw-bootstrap rollback。"))
+    refused(format!("無法證明 {path} 是這次安裝啟動的元件在這次安裝期間建立的物件（啟動元件前該路徑已有物件，或擁有者、權限、掛載點、建立時間或產生它的服務不符，或無法讀取）；已停止，沒有把它記錄為這次安裝建立的物件，這一步也未完成。請確認來源後以同一個命令續接，或執行 duduclaw-bootstrap rollback。"))
 }
 
 fn changed_after_creation(path: &str) -> DuDuClawError {
@@ -579,7 +614,13 @@ impl LedgerHost for LiveHost {
     }
 }
 
-pub(super) struct Recorder<H: LedgerHost> { host: H, ledger: Ledger }
+pub(super) struct Recorder<H: LedgerHost> {
+    host: H,
+    ledger: Ledger,
+    /// Review round 5 item 5: the paths whose last durable intent (in this
+    /// run) observed nothing at the path.
+    absent: Vec<String>,
+}
 pub(super) type LiveRecorder = Recorder<LiveHost>;
 
 impl Recorder<LiveHost> {
@@ -611,10 +652,17 @@ impl<H: LedgerHost> Recorder<H> {
                 ledger
             }
         };
-        Ok(Self { host, ledger })
+        Ok(Self { host, ledger, absent: Vec::new() })
     }
 
     pub(super) fn ledger(&self) -> &Ledger { &self.ledger }
+
+    /// Review round 5 item 5: the last [`Self::intend`] of `path` in this run
+    /// found nothing there, and that intent is durable — the proof of absence
+    /// taken immediately before the producing action of the same step. False
+    /// when the path held the recorded object (a re-run), was never intended
+    /// in this run, or the intent was not written.
+    pub(super) fn absent_at_intent(&self, path: &str) -> bool { self.absent.iter().any(|absent| absent == path) }
 
     fn save(&mut self, next: Ledger) -> Result<()> {
         if next != self.ledger {
@@ -629,12 +677,14 @@ impl<H: LedgerHost> Recorder<H> {
     /// exactly the recorded object; nothing is written when any item refuses.
     pub(super) fn intend(&mut self, items: &[(&str, Kind)]) -> Result<()> {
         let mut next = self.ledger.clone();
+        let mut absent: Vec<(&str, bool)> = Vec::new();
         for (path, kind) in items {
             if !permitted(*kind, path) { return Err(refused(LEDGER_DAMAGED)); }
             match next.entries.iter_mut().find(|entry| entry.path == *path) {
                 Some(entry) if entry.kind == *kind => {
                     match (entry.identity.is_some(), self.host.classify(entry)?) {
-                        (_, Now::Absent) | (true, Now::Recorded) => (),
+                        (_, Now::Absent) => absent.push((*path, true)),
+                        (true, Now::Recorded) => absent.push((*path, false)),
                         (true, Now::Other) => return Err(changed_since_recorded(path)),
                         (false, _) => return Err(never_adopted(path)),
                     }
@@ -643,14 +693,23 @@ impl<H: LedgerHost> Recorder<H> {
                 Some(_) => return Err(refused(LEDGER_DAMAGED)),
                 None if self.host.present(path)? => match kind {
                     // Not created by this transaction: used as it is, never ledgered.
-                    Kind::Directory => (),
+                    Kind::Directory => absent.push((*path, false)),
                     _ => return Err(refused(format!("{path} 已存在，但不是這次安裝建立的；已停止，未覆蓋或移除它。請確認來源後再續接，或執行 duduclaw-bootstrap rollback。"))),
                 },
-                None => next.entries.push(Entry { path: (*path).to_owned(), kind: *kind, state: State::Intent,
-                    identity: None, keep: Vec::new(), quarantine: None }),
+                None => {
+                    absent.push((*path, true));
+                    next.entries.push(Entry { path: (*path).to_owned(), kind: *kind, state: State::Intent,
+                        identity: None, keep: Vec::new(), quarantine: None });
+                }
             }
         }
-        self.save(next)
+        self.save(next)?;
+        // Review round 5 item 5: only once the intent is durable.
+        for (path, was_absent) in absent {
+            self.absent.retain(|seen| seen != path);
+            if was_absent { self.absent.push(path.to_owned()); }
+        }
+        Ok(())
     }
 
     /// Step 2 of the lifecycle (review R3 item 4), one durable write. A path
@@ -703,8 +762,8 @@ impl<H: LedgerHost> Recorder<H> {
     /// Review R3 item 4: an object another component creates (systemd's
     /// runtime directory, the launcher's root key, R1's state root). Its
     /// present identity is recorded only when `accept` — the caller's proof
-    /// (root-owned, on the expected mount, created inside this transaction's
-    /// window by the producer this install started …) — passes; an object an
+    /// (the path absent at its durable intent right before the producer this
+    /// install started, root-owned, on the expected mount …) — passes; an object an
     /// earlier run recorded and still exactly present stays confirmed.
     ///
     /// Review R4 item 2: anything else is an ERROR naming `path` (the entry,
@@ -1123,19 +1182,33 @@ mod tests {
     #[test]
     fn component_creation_must_not_predate_the_window() {
         let object = identity(Kind::File, 60);
-        let created = |stamp| Creation { device: object.device, inode: object.inode, nlink: 1, stamp };
-        let window = Some((1_000, 500));
-        assert!(created_in_window(&object, &created(Some((1_000, 500))), window));
-        assert!(created_in_window(&object, &created(Some((1_001, 0))), window));
-        // Predates the window (by a nanosecond or more): not accepted.
-        assert!(!created_in_window(&object, &created(Some((1_000, 499))), window));
-        assert!(!created_in_window(&object, &created(Some((999, 999_999_999))), window));
-        // A stamp or a window that cannot be read: not accepted.
-        assert!(!created_in_window(&object, &created(None), window));
-        assert!(!created_in_window(&object, &created(Some((1_001, 0))), None));
-        // The stamp of another inode is not this object's.
-        let other = Creation { inode: 61, ..created(Some((1_001, 0))) };
-        assert!(!created_in_window(&object, &other, window));
+        let created = |btime| Creation { device: object.device, inode: object.inode, nlink: 1, btime };
+        let start = Clocks { realtime: (1_000, 500), boottime: (50, 0) };
+        // Checked 10 s later on both clocks: no step.
+        let now = Clocks { realtime: (1_010, 500), boottime: (60, 0) };
+        let (window, later) = (Some(start), Some(now));
+        assert!(!stepped(&start, &now));
+        assert!(created_in_window(&object, &created(Some((1_000, 500))), window, later));
+        assert!(created_in_window(&object, &created(Some((1_001, 0))), window, later));
+        // Review round 5 item 5: a birth time predating the window (no step): not accepted.
+        assert!(!created_in_window(&object, &created(Some((1_000, 499))), window, later));
+        assert!(!created_in_window(&object, &created(Some((999, 999_999_999))), window, later));
+        // No birth time (never the change time instead), or a clock unreadable: no time comparison.
+        assert!(created_in_window(&object, &created(None), window, later));
+        assert!(created_in_window(&object, &created(Some((1, 0))), None, later));
+        assert!(created_in_window(&object, &created(Some((1, 0))), window, None));
+        // The wall clock stepped back an hour after the window opened: the
+        // object is stamped "before" it, yet the comparison is skipped (no refusal).
+        let back = Clocks { realtime: (1_000 - 3_600 + 10, 500), boottime: (60, 0) };
+        assert!(stepped(&start, &back));
+        assert!(created_in_window(&object, &created(Some((1_000 - 3_600 + 5, 0))), window, Some(back)));
+        // A forward step is a step too; slewing below the tolerance is not.
+        assert!(stepped(&start, &Clocks { realtime: (1_100, 500), boottime: (60, 0) }));
+        assert!(!stepped(&start, &Clocks { realtime: (1_010, 900_000_000), boottime: (60, 0) }));
+        // The facts of another inode are not this object's (whatever the clocks).
+        let other = Creation { inode: 61, ..created(None) };
+        assert!(!created_in_window(&object, &other, window, later));
+        assert!(!created_in_window(&object, &other, None, None));
         // The live readers: a file created now is not before a window taken just before it.
         let directory = tempfile::tempdir().unwrap();
         let start = window_start().unwrap();
@@ -1143,7 +1216,30 @@ mod tests {
         let dir = fs::File::open(directory.path()).unwrap();
         let made = creation_at(dir.as_raw_fd(), c"made").unwrap();
         let on_disk = identity_at(&dir, c"made", Kind::File).unwrap().unwrap();
-        assert!(made.nlink == 1 && created_in_window(&on_disk, &made, Some(start)));
+        assert!(made.nlink == 1 && created_in_window(&on_disk, &made, Some(start), clocks()));
+    }
+
+    #[test]
+    fn absence_is_proven_only_by_a_durable_intent_that_found_nothing() {
+        let world = Rc::new(RefCell::new(World::default()));
+        let mut recorder = open(&world);
+        let runtime = super::super::bootstrap::SPAWND_RUNTIME;
+        assert!(!recorder.absent_at_intent(runtime), "never intended");
+        recorder.intend(&[(runtime, Kind::Tree)]).unwrap();
+        assert!(recorder.absent_at_intent(runtime));
+        // The producer created it; confirmed; a re-run's intent finds the recorded object: not absent.
+        world.borrow_mut().put(runtime, identity(Kind::Tree, 70));
+        recorder.confirm_component(runtime, |_| Ok(true)).unwrap();
+        recorder.intend(&[(runtime, Kind::Tree)]).unwrap();
+        assert!(!recorder.absent_at_intent(runtime));
+        // Gone again before the next intent: absent again.
+        world.borrow_mut().objects.retain(|(path, _)| path != runtime);
+        recorder.intend(&[(runtime, Kind::Tree)]).unwrap();
+        assert!(recorder.absent_at_intent(runtime));
+        // A pre-existing directory used as found: never absent.
+        world.borrow_mut().put("/opt/duduclaw", identity(Kind::Directory, 71));
+        recorder.intend(&[("/opt/duduclaw", Kind::Directory)]).unwrap();
+        assert!(!recorder.absent_at_intent("/opt/duduclaw"));
     }
 
     #[test]

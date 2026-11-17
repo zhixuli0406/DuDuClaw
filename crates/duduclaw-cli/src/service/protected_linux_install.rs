@@ -67,6 +67,67 @@ fn mkdir(path: &str, mode: u32) -> Result<()> {
 
 /// The child deadline of every system command (and the cap of `command_within`).
 const COMMAND_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Review round 5 item 6: after SIGKILL, how long the control path waits for the reap, and in which steps.
+const REAP_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+const REAP_STEP: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// A spawned child as the bounded reaper sees it (test seam).
+trait Reapable: Send + 'static {
+    fn try_reap(&mut self) -> std::io::Result<Option<std::process::ExitStatus>>;
+    /// SIGKILL.
+    fn kill(&mut self) -> std::io::Result<()>;
+    /// Blocks until the child is reaped.
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus>;
+}
+
+impl Reapable for std::process::Child {
+    fn try_reap(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> { self.try_wait() }
+    fn kill(&mut self) -> std::io::Result<()> { std::process::Child::kill(self) }
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> { std::process::Child::wait(self) }
+}
+
+/// Review round 5 item 6: a child not yet reaped is sent SIGKILL and polled
+/// (`try_wait`) for at most `bound` in `step`s. One still not reaped then is
+/// handed to a detached thread that only `wait()`s for it (so no zombie
+/// remains once it exits) and the caller stops blocking. True: reaped here.
+fn kill_and_reap<C: Reapable>(mut child: C, bound: std::time::Duration, step: std::time::Duration) -> bool {
+    use std::time::Instant;
+    // Reaped already, or waitpid fails (nothing left to reap).
+    if !matches!(child.try_reap(), Ok(None)) { return true; }
+    let _ = child.kill();
+    let until = Instant::now() + bound;
+    loop {
+        if !matches!(child.try_reap(), Ok(None)) { return true; }
+        let now = Instant::now();
+        if now >= until { break; }
+        std::thread::sleep(step.min(until - now));
+    }
+    // A thread, not a process: it only reaps the child already spawned. If no
+    // thread can be created, the child is left unreaped rather than blocking.
+    let reaper = std::thread::Builder::new().name("command-reaper".into());
+    let _ = std::thread::Builder::spawn(reaper, move || { let _ = child.wait(); });
+    false
+}
+
+/// Review round 5 item 6: up to `limit + 1` bytes of `reader`, in chunks,
+/// stopping (refused) once `now()` reaches `deadline`.
+fn read_until(mut reader: impl std::io::Read, limit: u64, deadline: std::time::Instant,
+    mut now: impl FnMut() -> std::time::Instant) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        if now() >= deadline { return Err(refused("system command exceeded its time or output limit")); }
+        let room = usize::try_from((limit + 1).saturating_sub(out.len() as u64)).unwrap_or(usize::MAX).min(chunk.len());
+        if room == 0 { return Ok(out); }
+        let count = match reader.read(&mut chunk[..room]) {
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if count == 0 { return Ok(out); }
+        out.extend_from_slice(&chunk[..count]);
+    }
+}
 
 fn command(name: &str, args: &[&str]) -> Result<Output> {
     command_within(name, args, std::time::Instant::now() + COMMAND_LIMIT)
@@ -75,7 +136,11 @@ fn command(name: &str, args: &[&str]) -> Result<Output> {
 /// `command` bounded by the caller's ABSOLUTE `deadline` (R3 review item 6,
 /// R4 item 4): checked on entry, again immediately before the spawn and right
 /// after it; the child is given `min(deadline, spawn + 30 s)`. Nothing is
-/// spawned or read once the deadline has passed (refused).
+/// spawned or read once the deadline has passed (refused). Review round 5
+/// item 6: a child still running then is killed and reaped within
+/// [`REAP_BOUND`] or left to a detached reaper ([`kill_and_reap`]), and the
+/// output is read in chunks that stop at the deadline ([`read_until`]): the
+/// caller never blocks past the deadline plus that bound.
 fn command_within(name: &str, args: &[&str], deadline: std::time::Instant) -> Result<Output> {
     let expired = || refused("system command exceeded its time or output limit");
     if std::time::Instant::now() >= deadline { return Err(expired()); }
@@ -85,13 +150,11 @@ fn command_within(name: &str, args: &[&str], deadline: std::time::Instant) -> Re
     let executable = fs::canonicalize(executable)?;
     parents(&executable)?;
     trusted(&executable, false)?;
-    use std::{io::Read, process::Stdio, time::{Duration, Instant}};
-    struct ReapOnError(std::process::Child);
+    use std::{process::Stdio, time::{Duration, Instant}};
+    struct ReapOnError(Option<std::process::Child>);
     impl Drop for ReapOnError {
         fn drop(&mut self) {
-            if !matches!(self.0.try_wait(), Ok(Some(_))) {
-                let _ = self.0.kill(); let _ = self.0.wait();
-            }
+            if let Some(child) = self.0.take() { kill_and_reap(child, REAP_BOUND, REAP_STEP); }
         }
     }
     trusted(Path::new("/run"), true)?;
@@ -101,11 +164,11 @@ fn command_within(name: &str, args: &[&str], deadline: std::time::Instant) -> Re
     // Preparation may have used up the caller's time: nothing is spawned then.
     if Instant::now() >= deadline { return Err(expired()); }
     // Fixed cwd, PATH and HOME (origin/main) inside the bounded, reaped spawn (isolation).
-    let mut child = ReapOnError(Command::new(executable).args(args).current_dir("/").env_clear()
+    let mut child = ReapOnError(Some(Command::new(executable).args(args).current_dir("/").env_clear()
         .env("PATH", super::runtime::SERVICE_PATH).env("HOME", "/var/lib/duduclaw").env("LC_ALL", "C")
-        .stdin(Stdio::null()).stdout(stdout_handle).stderr(stderr_handle).spawn()?);
+        .stdin(Stdio::null()).stdout(stdout_handle).stderr(stderr_handle).spawn()?));
     let spawned = Instant::now();
-    // Expired during the spawn: the child is killed and reaped (`ReapOnError`), nothing is read.
+    // Expired during the spawn: the child is killed and reaped within the bound (`ReapOnError`), nothing is read.
     if spawned >= deadline { return Err(expired()); }
     let deadline = deadline.min(spawned + COMMAND_LIMIT);
     let limit = 4 * 1024 * 1024;
@@ -114,14 +177,14 @@ fn command_within(name: &str, args: &[&str], deadline: std::time::Instant) -> Re
             || Instant::now() >= deadline {
             return Err(refused("system command exceeded its time or output limit"));
         }
-        if let Some(status) = child.0.try_wait()? { break status; }
+        let Some(running) = child.0.as_mut() else { return Err(expired()) };
+        if let Some(status) = running.try_wait()? { break status; }
         std::thread::sleep(Duration::from_millis(10));
     };
     // An answer that arrives at or after the deadline is not read (fail closed).
     if Instant::now() >= deadline { return Err(expired()); }
-    let mut out = Vec::new(); let mut err = Vec::new();
-    stdout.as_file_mut().take(limit + 1).read_to_end(&mut out)?;
-    stderr.as_file_mut().take(limit + 1).read_to_end(&mut err)?;
+    let out = read_until(stdout.as_file_mut(), limit, deadline, Instant::now)?;
+    let err = read_until(stderr.as_file_mut(), limit, deadline, Instant::now)?;
     if out.len() as u64 > limit || err.len() as u64 > limit { return Err(refused("system command output exceeded limit")); }
     Ok(Output { status, stdout: out, stderr: err })
 }

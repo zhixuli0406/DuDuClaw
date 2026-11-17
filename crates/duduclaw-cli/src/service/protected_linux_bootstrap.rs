@@ -141,6 +141,8 @@ const QUIESCE_POLL: Duration = Duration::from_millis(250);
 const UNIT_PATTERNS: [&str; 2] = ["duduclaw-*", "duduclaw.slice"];
 /// Bound of one enumeration (units or jobs); more lines refuse.
 const MAX_LISTED: usize = 4096;
+/// Review round 5 item 3: stops of one unit within one quiesce; a unit busy again after that many refuses.
+const MAX_STOPS: u32 = 3;
 /// Review round 4 item 1: the template units whose instances may be loaded —
 /// (name prefix, suffix, template unit file).
 const TEMPLATES: [(&str, &str, &str); 4] = [
@@ -198,9 +200,20 @@ fn unit_not_quiet(unit: &str) -> DuDuClawError {
     refused(format!("{QUIESCE_CONTEXT}，無法在時限內確認 {unit} 已停止且沒有待處理的工作；已停止，未重新執行任何步驟，也未移除任何東西。請先手動停止它（sudo systemctl stop {unit}）並確認後再執行同一個命令。"))
 }
 
-/// Review round 4 item 1: a loaded `duduclaw-` unit (or job) of a shape this installation never creates.
+/// Review round 4 item 1 / round 5 item 1: a `duduclaw-` unit of a shape this
+/// installation never creates that is up or has a queued job (never stopped here).
 fn unit_unknown(unit: &str) -> DuDuClawError {
-    refused(format!("{QUIESCE_CONTEXT}，systemd 載入了名稱以 duduclaw- 開頭、但不是這次安裝會建立的單元或工作：{unit}；已停止，沒有停止它或任何其他不明單元。請確認它的來源並自行處理後再執行同一個命令。"))
+    refused(format!("{QUIESCE_CONTEXT}，{unit} 正在執行（或有待處理的工作）。它的名稱以 duduclaw- 開頭，但不是這次安裝的單元，安裝程式不會停止它；已停止，沒有停止它或任何其他不屬於這次安裝的單元，未重新執行任何步驟，也未移除任何東西。請先停止它（sudo systemctl stop {unit}）後再執行同一個命令。"))
+}
+
+/// Review round 5 item 1: `duduclaw-` units of another shape that are down with no job (ignored, never stopped).
+fn units_ignored(units: &[String]) -> String {
+    format!("[資訊] 以下單元的名稱以 duduclaw- 開頭，但不是這次安裝的單元；它們沒有在執行、也沒有待處理的工作，不影響這次停止，也不會被停止：{}", units.join("、"))
+}
+
+/// Review round 5 item 3: a unit of this installation that keeps coming back after [`MAX_STOPS`] stops.
+fn unit_restarting(unit: &str) -> DuDuClawError {
+    refused(format!("{QUIESCE_CONTEXT}，{unit} 已停止 {MAX_STOPS} 次，但每次都又回到執行狀態或又有待處理的工作（可能有其他單元、socket 啟用或管理者一直重新啟動它）；已停止，不再停止它，未重新執行任何步驟，也未移除任何東西。請找出並停止重新啟動它的來源（sudo systemctl status {unit}、sudo systemctl list-dependencies --reverse {unit}）後再執行同一個命令。"))
 }
 
 /// Review round 4 item 1: a product cgroup still holding processes at the deadline.
@@ -893,11 +906,13 @@ pub(super) trait UnitControl {
     fn processes_clear(&mut self, deadline: Instant) -> Result<()>;
     /// Sleep for `pause` (never past the deadline).
     fn pause(&mut self, pause: Duration);
+    /// One informational line for the operator (review round 5 item 1).
+    fn inform(&mut self, line: &str);
 }
 
 /// Review round 4 item 1: the shape of a `duduclaw-` unit this installation
-/// may own. Any other loaded name with the prefix is refused by name and
-/// never stopped.
+/// may own. Any other loaded name with the prefix is never stopped: refused
+/// by name when it is up or has a job, otherwise ignored and reported (round 5 item 1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum UnitShape {
     /// The gateway, a unit it binds to, the nightly requester, a layout unit
@@ -1045,6 +1060,13 @@ fn waiting_refusal(waiting: &Waiting) -> DuDuClawError {
     }
 }
 
+/// Review round 5 item 4 (pure): the `InvocationID=` of a transient unit's
+/// definition text ([`transient_show_is_ours`] admits only 32 lowercase hex or
+/// empty); `None` when empty, missing or of any other form.
+fn invocation_of(definition: &str) -> Option<&str> {
+    definition.lines().find_map(|line| line.strip_prefix("InvocationID=")).filter(|id| lower_hex_id(id))
+}
+
 /// One run of [`quiesce_isolation`].
 struct Quiesce<'a> {
     control: &'a mut dyn UnitControl,
@@ -1052,7 +1074,15 @@ struct Quiesce<'a> {
     last: Option<Waiting>,
     /// Every unit stopped, with the definition read immediately before its stop (review round 4 item 3).
     stopped: Vec<(Busy, String)>,
-    killed: Vec<String>,
+    /// Review round 5 item 3: stop attempts per unit.
+    attempts: Vec<(String, u32)>,
+    /// Review round 5 item 4: a transient unit's InvocationID read (with its
+    /// ownership) immediately before its last stop; `None`: it had none.
+    invocations: Vec<(String, Option<String>)>,
+    /// Transient units killed, with the InvocationID checked immediately before the kill.
+    killed: Vec<(String, String)>,
+    /// Review round 5 item 1: unknown-shape units already reported as ignored.
+    reported: Vec<String>,
 }
 
 impl Quiesce<'_> {
@@ -1064,8 +1094,10 @@ impl Quiesce<'_> {
     }
 
     /// One enumeration from PID 1 (units, then jobs): every unit that is up
-    /// or has a queued job. A `duduclaw-` name of any other shape — up or not
-    /// — refuses by name before anything else happens in this round.
+    /// or has a queued job. Review round 5 item 1: a `duduclaw-` name of any
+    /// other shape that is up or has a job refuses by name before anything
+    /// else happens in this round; one that is inactive or failed with no job
+    /// is ignored (never stopped) and reported once.
     fn observe(&mut self) -> Result<Vec<Busy>> {
         self.budget()?;
         let units = self.control.list_units(self.deadline).map_err(|_| refused(SYSTEMCTL_FAILED))?;
@@ -1073,8 +1105,18 @@ impl Quiesce<'_> {
         self.budget()?;
         let jobs = self.control.list_jobs(self.deadline).map_err(|_| refused(SYSTEMCTL_FAILED))?;
         let jobs = parse_job_list(&jobs)?;
-        for name in units.iter().map(|(name, _)| name).chain(jobs.iter()) {
+        let mut idle_unknown: Vec<String> = Vec::new();
+        for (name, up) in &units {
+            if unit_shape(name).is_some() { continue; }
+            if *up || jobs.contains(name) { return Err(unit_unknown(name)); }
+            if !self.reported.contains(name) { idle_unknown.push(name.clone()); }
+        }
+        for name in &jobs {
             if unit_shape(name).is_none() { return Err(unit_unknown(name)); }
+        }
+        if !idle_unknown.is_empty() {
+            self.control.inform(&units_ignored(&idle_unknown));
+            self.reported.extend(idle_unknown);
         }
         let mut busy: Vec<Busy> = Vec::new();
         for name in units.iter().filter(|(_, up)| *up).map(|(name, _)| name).chain(jobs.iter()) {
@@ -1092,16 +1134,46 @@ impl Quiesce<'_> {
         self.control.definition(&unit.name, unit.shape, self.deadline).ok_or_else(|| unit_not_ours(&unit.name))
     }
 
-    fn was_stopped(&self, name: &str) -> bool { self.stopped.iter().any(|(unit, _)| unit.name == name) }
+    /// Review round 4 items 1, 3 / round 5 items 3, 4: every unit busy in
+    /// this round is (re-)checked for ownership before any of them is acted
+    /// on. A file-backed unit — new, or stopped before and busy again — is
+    /// stopped (again). A transient unit is killed only while it is the very
+    /// invocation stopped earlier (same InvocationID); with any other
+    /// InvocationID (or none) it is a newly appeared unit and is stopped.
+    fn act(&mut self, busy: Vec<Busy>) -> Result<()> {
+        let mut stop: Vec<Busy> = Vec::new();
+        let mut lingering: Vec<(Busy, String)> = Vec::new();
+        for unit in busy {
+            let definition = self.owned(&unit)?;
+            let current = invocation_of(&definition).map(str::to_owned);
+            let stopped = self.invocations.iter().find(|(name, _)| *name == unit.name).map(|(_, id)| id.clone());
+            match (unit.shape.transient(), current, stopped) {
+                (true, Some(current), Some(Some(stopped))) if current == stopped => lingering.push((unit, current)),
+                _ => stop.push(unit),
+            }
+        }
+        self.stop_all(&stop)?;
+        self.kill_lingering(&lingering)
+    }
 
     /// Review round 4 items 1, 3: stop each of `units` (in stop order),
     /// re-reading what PID 1 loads and the unit file identity IMMEDIATELY
     /// before the stop. A failed stop of a transient unit is judged by the
     /// next observation (it may already be gone); of any other unit it refuses.
+    /// Review round 5 item 3: at most [`MAX_STOPS`] stops of one unit.
     fn stop_all(&mut self, units: &[Busy]) -> Result<()> {
         for unit in units {
+            let attempts = self.attempts.iter().find(|(name, _)| *name == unit.name).map_or(0, |(_, count)| *count);
+            if attempts >= MAX_STOPS { return Err(unit_restarting(&unit.name)); }
             let before = self.owned(unit)?;
             self.budget()?;
+            self.attempts.retain(|(name, _)| *name != unit.name);
+            self.attempts.push((unit.name.clone(), attempts + 1));
+            if unit.shape.transient() {
+                let invocation = invocation_of(&before).map(str::to_owned);
+                self.invocations.retain(|(name, _)| *name != unit.name);
+                self.invocations.push((unit.name.clone(), invocation));
+            }
             match self.control.stop(&unit.name, self.deadline) {
                 Ok(()) => (),
                 Err(_) if unit.shape.transient() => (),
@@ -1112,19 +1184,52 @@ impl Quiesce<'_> {
         Ok(())
     }
 
-    /// A transient unit already stopped that is still up: killed once
-    /// (SIGKILL, fixed argv), after the same ownership re-read.
-    fn kill_lingering(&mut self, units: &[Busy]) -> Result<()> {
-        let targets: Vec<Busy> = units.iter()
-            .filter(|unit| unit.shape.transient() && !self.killed.contains(&unit.name)).cloned().collect();
-        for unit in &targets {
-            self.owned(unit)?;
+    /// A transient unit already stopped that is still up as the same
+    /// invocation: killed once per invocation (SIGKILL, fixed argv). Review
+    /// round 5 item 4: its InvocationID is read again (with the ownership
+    /// properties) IMMEDIATELY before the kill; unless it is still the one
+    /// that passed this round's check, nothing is sent — the next observation
+    /// treats it as a newly appeared unit. (`systemctl kill` names the unit,
+    /// not the invocation: a concurrent privileged actor replacing it between
+    /// that read and the kill is otherwise out of scope.)
+    fn kill_lingering(&mut self, units: &[(Busy, String)]) -> Result<()> {
+        for (unit, checked) in units {
+            if self.killed.iter().any(|(name, id)| *name == unit.name && id == checked) { continue; }
+            self.budget()?;
+            let now = self.control.definition(&unit.name, unit.shape, self.deadline);
+            if now.as_deref().and_then(invocation_of) != Some(checked.as_str()) { continue; }
             self.budget()?;
             // Judged by the next observation (it may have exited meanwhile).
             let _ = self.control.kill(&unit.name, self.deadline);
-            self.killed.push(unit.name.clone());
+            self.killed.push((unit.name.clone(), checked.clone()));
         }
         Ok(())
+    }
+
+    /// Units and jobs (acting on every busy unit), then the product cgroups.
+    /// `None`: no unit up, no job queued and every cgroup `populated 0`.
+    fn settle(&mut self) -> Result<Option<Waiting>> {
+        let busy = self.observe()?;
+        if let Some(first) = busy.first().map(|unit| unit.name.clone()) {
+            self.act(busy)?;
+            return Ok(Some(Waiting::Unit(first)));
+        }
+        self.budget()?;
+        Ok(self.control.populated_cgroup(self.deadline)?.map(Waiting::Cgroup))
+    }
+
+    /// Review round 5 item 2: one round — observe (units, jobs, cgroups), the
+    /// gateway account, the full process scan, then the SAME observation
+    /// again. `None` only when both observations and the scan were quiet.
+    fn round(&mut self) -> Result<Option<Waiting>> {
+        if let Some(waiting) = self.settle()? { return Ok(Some(waiting)); }
+        self.budget()?;
+        if self.control.gateway_account_busy(self.deadline).map_err(|_| refused(GATEWAY_PROCESSES))? {
+            return Ok(Some(Waiting::GatewayAccount));
+        }
+        self.budget()?;
+        if self.control.processes_clear(self.deadline).is_err() { return Ok(Some(Waiting::Processes)); }
+        self.settle()
     }
 
     /// Review round 4 item 3: after everything converged, what PID 1 loads
@@ -1157,17 +1262,21 @@ pub(super) fn command_budget(now: Instant, deadline: Instant) -> Option<Duration
 /// S4–S7 step re-runs) and the rollback ([`quiesce_owned`]). Within ONE
 /// absolute deadline of `wait`:
 ///   1. enumerate from PID 1 every loaded `duduclaw-*`/`duduclaw.slice` unit
-///      and every queued job; any such name not of an allowed
-///      [`UnitShape`] refuses by name, and BEFORE ANY EFFECT every unit that
-///      is up or has a job must be provably ours (else a refusal naming it);
+///      and every queued job; any such name not of an allowed [`UnitShape`]
+///      that is up or has a job refuses by name (one that is inactive or
+///      failed with no job is ignored, reported once, never stopped), and
+///      BEFORE ANY EFFECT every unit that is up or has a job must be provably
+///      ours (else a refusal naming it);
 ///   2. stop them in [`stop_rank`] order — the gateway and every activation
 ///      source (timers, sockets) first — re-reading the definition
 ///      immediately before each stop;
 ///   3. loop, re-enumerating every round, until ONE round observes no unit
 ///      up, no job queued, every product cgroup `populated 0` (or absent), no
-///      gateway-account process and a passing full S3 process scan. A unit
-///      that appears in a later round is checked the same way before it is
-///      stopped; a stopped transient unit still up is killed once;
+///      gateway-account process, a passing full S3 process scan, and then
+///      again no unit up, no job queued and every cgroup `populated 0`. A unit
+///      busy in a later round is checked the same way before it is stopped
+///      (again; at most [`MAX_STOPS`] times, then refused by name); a stopped
+///      transient unit still up as the same invocation is killed once;
 ///   4. every stopped file-backed unit must still load the definition (and
 ///      unit file identity) it had immediately before its stop.
 /// At the deadline it refuses naming what was last still up. Concurrent root
@@ -1176,34 +1285,10 @@ pub(super) fn command_budget(now: Instant, deadline: Instant) -> Option<Duration
 /// the narrowing of step 2 and the check of step 4.
 pub(super) fn quiesce_isolation(control: &mut dyn UnitControl, wait: Duration) -> Result<()> {
     let deadline = control.now() + wait;
-    let mut run = Quiesce { control, deadline, last: None, stopped: Vec::new(), killed: Vec::new() };
-    let first = run.observe()?;
-    for unit in &first { run.owned(unit)?; }
-    run.stop_all(&first)?;
+    let mut run = Quiesce { control, deadline, last: None, stopped: Vec::new(), attempts: Vec::new(),
+        invocations: Vec::new(), killed: Vec::new(), reported: Vec::new() };
     loop {
-        let busy = run.observe()?;
-        let first_busy = busy.first().map(|unit| unit.name.clone());
-        let waiting = if let Some(name) = first_busy {
-            let (lingering, fresh): (Vec<Busy>, Vec<Busy>) = busy.into_iter().partition(|unit| run.was_stopped(&unit.name));
-            // Units that appeared since: every one checked before any of them is stopped.
-            for unit in &fresh { run.owned(unit)?; }
-            run.stop_all(&fresh)?;
-            run.kill_lingering(&lingering)?;
-            Waiting::Unit(name)
-        } else {
-            run.budget()?;
-            let populated = run.control.populated_cgroup(deadline)?;
-            if let Some(cgroup) = populated { Waiting::Cgroup(cgroup) } else {
-                run.budget()?;
-                if run.control.gateway_account_busy(deadline).map_err(|_| refused(GATEWAY_PROCESSES))? {
-                    Waiting::GatewayAccount
-                } else {
-                    run.budget()?;
-                    if run.control.processes_clear(deadline).is_ok() { break; }
-                    Waiting::Processes
-                }
-            }
-        };
+        let Some(waiting) = run.round()? else { break };
         run.last = Some(waiting.clone());
         let now = run.control.now();
         let remaining = deadline.saturating_duration_since(now);
@@ -1359,11 +1444,13 @@ fn ledgered_unit_file(ledger: &ledger::Ledger, unit: &str) -> Option<String> {
 }
 
 /// Review round 4 item 1 (pure): PID 1's answer to `systemctl show <unit>
-/// --property=LoadState,Transient,Slice,ControlGroup` for a transient unit of
-/// spawnd: loaded, `Transient=yes`, and placed under the product's employees
-/// slice — a run in a per-employee slice, a per-employee slice directly in
-/// `duduclaw-employees.slice` — with its control group (when it has one)
-/// exactly there. Any other value, a duplicate, missing or extra line: not ours.
+/// --property=LoadState,Transient,Slice,ControlGroup,InvocationID` for a
+/// transient unit of spawnd: loaded, `Transient=yes`, and placed under the
+/// product's employees slice — a run in a per-employee slice, a per-employee
+/// slice directly in `duduclaw-employees.slice` — with its control group
+/// (when it has one) exactly there. Review round 5 item 4: `InvocationID`
+/// is 32 lowercase hex, or empty (not started yet). Any other value, a
+/// duplicate, missing or extra line: not ours.
 pub(super) fn transient_show_is_ours(output: &[u8], unit: &str, shape: UnitShape) -> bool {
     let Ok(text) = std::str::from_utf8(output) else { return false };
     let mut fields: Vec<(&str, &str)> = Vec::new();
@@ -1373,9 +1460,9 @@ pub(super) fn transient_show_is_ours(output: &[u8], unit: &str, shape: UnitShape
         fields.push((key, value));
     }
     let value = |key: &str| fields.iter().find(|(seen, _)| *seen == key).map(|(_, value)| *value);
-    let (Some("loaded"), Some("yes"), Some(slice), Some(cgroup)) =
-        (value("LoadState"), value("Transient"), value("Slice"), value("ControlGroup")) else { return false };
-    if fields.len() != 4 { return false; }
+    let (Some("loaded"), Some("yes"), Some(slice), Some(cgroup), Some(invocation)) =
+        (value("LoadState"), value("Transient"), value("Slice"), value("ControlGroup"), value("InvocationID")) else { return false };
+    if fields.len() != 5 || !(invocation.is_empty() || lower_hex_id(invocation)) { return false; }
     let expected = match shape {
         UnitShape::Run if unit_shape(slice) == Some(UnitShape::EmployeeSlice) =>
             format!("/duduclaw.slice/duduclaw-employees.slice/{slice}/{unit}"),
@@ -1391,7 +1478,8 @@ pub(super) fn transient_show_is_ours(output: &[u8], unit: &str, shape: UnitShape
 /// A fixed unit: its ledgered unit file exactly as recorded AND PID 1 loading
 /// exactly that file ([`unit_show_is_ours`]). A template instance: the same,
 /// with the TEMPLATE's ledgered file as the fragment. A transient run or
-/// employee slice: [`transient_show_is_ours`]. Any failure: `None`.
+/// employee slice: [`transient_show_is_ours`] (the text carries its
+/// InvocationID, [`invocation_of`]). Any failure: `None`.
 fn live_definition(ledger: &ledger::Ledger, unit: &str, shape: UnitShape, deadline: Instant) -> Option<String> {
     let show = |properties: &str| command_until("systemctl", &["show", unit, properties], deadline).ok()
         .filter(|output| output.status.success()).map(|output| output.stdout);
@@ -1403,7 +1491,7 @@ fn live_definition(ledger: &ledger::Ledger, unit: &str, shape: UnitShape, deadli
             unit_show_is_ours(Some(stdout.as_slice()), source).then(|| format!("{file}\n{}", String::from_utf8_lossy(&stdout)))
         }
         UnitShape::Run | UnitShape::EmployeeSlice => {
-            let stdout = show("--property=LoadState,Transient,Slice,ControlGroup")?;
+            let stdout = show("--property=LoadState,Transient,Slice,ControlGroup,InvocationID")?;
             transient_show_is_ours(&stdout, unit, shape).then(|| String::from_utf8_lossy(&stdout).into_owned())
         }
     }
@@ -1478,6 +1566,7 @@ impl UnitControl for LiveUnits<'_> {
         super::removal::processes_clear_until(Some(deadline))
     }
     fn pause(&mut self, pause: Duration) { std::thread::sleep(pause); }
+    fn inform(&mut self, line: &str) { println!("{line}"); }
 }
 
 /// Any live process with a real, effective, saved or filesystem uid `matches`
@@ -2323,15 +2412,17 @@ fn publish_platform(context: &mut Context) -> Result<()> {
     if digest != context.generation { return Err(refused(STAGE_UNVERIFIED)); }
     // Recorded only after publish succeeded for this generation, as the
     // root-owned private directory on its parent's mount publish leaves,
-    // created inside this install's window and holding R1's state file for
-    // this generation. Not proven: the step fails (review round 4 item 2).
+    // absent at the durable intent `record` made right before publish (review
+    // round 5 item 5), and holding R1's state file for this generation with
+    // nothing pending. Not proven: the step fails (review round 4 item 2).
     let generation = context.generation;
     let saved: std::result::Result<duduclaw_updated::state::State, _> =
         Directory::open(Path::new(state_root)).and_then(|root| root.json("state.json"));
     let names_generation = saved.is_ok_and(|state| state.validate().is_ok() && state.pending.is_none()
         && state.effective_digest() == generation);
+    let absent = context.recorder.absent_at_intent(state_root);
     context.recorder.confirm_component(state_root,
-        |identity| Ok(state_root_proven(identity, &component_facts(state_root, window), names_generation)))?;
+        |identity| Ok(state_root_proven(identity, &component_facts(state_root, absent, window), names_generation)))?;
     let manifest = readiness::authenticated_manifest(digest)?;
     let version = duduclaw_updated::version_text(manifest.version);
     if manifest.artifacts != context.stage.artifacts || version != duduclaw_gateway::updater::current_version() {
@@ -2934,23 +3025,29 @@ pub(super) fn listens_in(output: &[u8], directory: &str) -> bool {
         .is_some_and(|(path, _)| Path::new(path).is_absolute() && Path::new(path).parent() == Some(Path::new(directory))))
 }
 
-/// Review R3 item 4 / round 4 item 2: what the installer observes of an
-/// object another component created, read AFTER its identity (the creation
-/// stamp is bound to the same inode by [`ledger::created_in_window`]).
+/// Review R3 item 4 / round 4 item 2 / round 5 item 5: what the installer
+/// observes of an object another component created, read AFTER its identity
+/// (the statx facts are bound to the same inode by [`ledger::created_in_window`]).
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ComponentFacts {
     /// Mount id of the object's parent directory (`None`: unreadable).
     pub(super) parent_mount: Option<u64>,
-    /// `None`: the creation stamp could not be read.
+    /// `None`: the statx facts could not be read.
     pub(super) creation: Option<ledger::Creation>,
-    /// When this install started the producer (`None`: the clock was unreadable).
-    pub(super) window: Option<ledger::Timestamp>,
+    /// Review round 5 item 5: the durable intent made immediately before this
+    /// install started the producer found nothing at the path
+    /// ([`ledger::Recorder::absent_at_intent`]) — the proof of absence.
+    pub(super) absent_at_intent: bool,
+    /// Both clocks when this install started the producer (`None`: unreadable).
+    pub(super) window: Option<ledger::Clocks>,
+    /// Both clocks at this check (`None`: unreadable).
+    pub(super) now: Option<ledger::Clocks>,
 }
 
-fn component_facts(path: &str, window: Option<ledger::Timestamp>) -> ComponentFacts {
+fn component_facts(path: &str, absent_at_intent: bool, window: Option<ledger::Clocks>) -> ComponentFacts {
     let parent_mount = ledger::open_parent(path).ok()
         .and_then(|(directory, _)| ledger::stat_at(directory.as_raw_fd(), c"").ok()).and_then(|stat| stat.mount_id);
-    ComponentFacts { parent_mount, creation: ledger::creation(path).ok(), window }
+    ComponentFacts { parent_mount, creation: ledger::creation(path).ok(), absent_at_intent, window, now: ledger::clocks() }
 }
 
 /// Review R3 item 4 (pure): root:root, of `file_type`, without group/other
@@ -2961,12 +3058,17 @@ fn component_shape(identity: &ledger::Identity, facts: &ComponentFacts, file_typ
         && (!private || identity.mode & 0o077 == 0) && facts.parent_mount == Some(identity.mount_id)
 }
 
-/// Review round 4 item 2 (pure): created no earlier than the window this
-/// install opened right before starting the producer. A stamp or a window
-/// that cannot be read: not proven. A concurrent root actor creating the
-/// object inside that window is outside what the installer can distinguish.
+/// Review round 5 item 5 (pure): absence-then-identity. The path was absent
+/// when its intent was made durable immediately before this install started
+/// the producer, and the statx facts read now are of the object `identity`
+/// names; where the filesystem reports a birth time and the wall clock did
+/// not step, it does not predate the window ([`ledger::created_in_window`]).
+/// The callers add the shape, owner, mode and producer checks. Residual: a
+/// concurrent root actor creating the object at the path between the intent
+/// and the producer is outside what the installer can distinguish.
 fn created_by_this_install(identity: &ledger::Identity, facts: &ComponentFacts) -> bool {
-    facts.creation.as_ref().is_some_and(|creation| ledger::created_in_window(identity, creation, facts.window))
+    facts.absent_at_intent && facts.creation.as_ref()
+        .is_some_and(|creation| ledger::created_in_window(identity, creation, facts.window, facts.now))
 }
 
 /// Review round 4 item 2 (pure): R1's updater state root — a root-only
@@ -3047,15 +3149,17 @@ fn start_services(context: &mut Context, dns: &Dns) -> Result<()> {
     })();
     // Review R3 item 4: systemd created it, not this installer. Recorded (also
     // when a later unit failed) only when it is root-owned, on its parent's
-    // mount, created no earlier than this install started the socket, and PID
+    // mount, absent at the durable intent made right before the socket
+    // started (review round 5 item 5), and PID
     // 1 reports this install's ledgered, unmodified socket unit as listening
     // in it. Review round 4 item 2: otherwise the step fails (never adopted).
     let owner = live_unit_is_ours(context.recorder.ledger(), SPAWND_RUNTIME_OWNER, Instant::now() + QUIESCE_COMMAND_CAP)
         && command("systemctl", &["show", SPAWND_RUNTIME_OWNER, "--property=Listen"]).ok()
             .filter(|output| output.status.success())
             .is_some_and(|output| listens_in(&output.stdout, SPAWND_RUNTIME));
+    let absent = context.recorder.absent_at_intent(SPAWND_RUNTIME);
     let confirmed = context.recorder.confirm_component(SPAWND_RUNTIME,
-        |identity| Ok(runtime_directory_proven(identity, &component_facts(SPAWND_RUNTIME, window), owner)));
+        |identity| Ok(runtime_directory_proven(identity, &component_facts(SPAWND_RUNTIME, absent, window), owner)));
     started?;
     confirmed?;
     // Q11: the nightly update requester is enabled after install.
@@ -3192,13 +3296,15 @@ fn start_gateway(context: &mut Context) -> Result<()> {
         let started = wait_for(Duration::from_secs(60), || readiness::unit_loaded_active(UNIT).is_ok());
         // Review R3 item 4: the gateway's launcher created it, not this
         // installer: recorded only as a root-owned 0600 single-link regular
-        // file on the protected root's mount, created no earlier than this
-        // start, while PID 1 loads this install's ledgered, unmodified gateway
+        // file on the protected root's mount, absent at the durable intent
+        // made before this start (review round 5 item 5), while PID 1 loads
+        // this install's ledgered, unmodified gateway
         // unit. Review round 4 item 2: otherwise the step fails.
         let key = duduclaw_core::root_key::KEY_PATH;
         let owner = live_unit_is_ours(context.recorder.ledger(), UNIT, Instant::now() + QUIESCE_COMMAND_CAP);
+        let absent = context.recorder.absent_at_intent(key);
         let confirmed = context.recorder.confirm_component(key,
-            |identity| Ok(root_key_proven(identity, &component_facts(key, window), owner)));
+            |identity| Ok(root_key_proven(identity, &component_facts(key, absent, window), owner)));
         if !started { return Err(refused("Gateway 未在時限內進入執行狀態。")); }
         confirmed?;
         // The install reports success only when the full check passes.
@@ -3487,6 +3593,20 @@ gshadow:        files\nhosts:          files mdns4_minimal [NOTFOUND=return] dns
         gateway_processes: bool,
         /// The full S3 check finds an isolation-account or root-from-install-path process.
         leftover: bool,
+        /// Review round 5 item 3: units a stop brings down that PID 1 starts
+        /// again before the next listing, and how many more times (`u32::MAX`: always).
+        restarts: Vec<(String, u32)>,
+        /// Review round 5 item 2: units given a start job (seen by one
+        /// `list-jobs`) by the first full process scan.
+        scan_queues: Vec<String>,
+        scans: u32,
+        /// Review round 5 item 4: the current invocation of every transient
+        /// unit (its InvocationID is this number in 32 lowercase hex) …
+        invocation: u32,
+        /// … and the `definition` calls (1-based, counted over all units) before
+        /// whose answer a transient unit is re-invoked (a new InvocationID).
+        reinvoke_at: Vec<u32>,
+        shows: u32,
         stopped: Vec<String>,
         listings: u32,
         start: Instant,
@@ -3504,8 +3624,9 @@ gshadow:        files\nhosts:          files mdns4_minimal [NOTFOUND=return] dns
             let now = Instant::now();
             Self { up: Vec::new(), loaded: Vec::new(), extra: Vec::new(), jobs: Vec::new(), appear: Vec::new(),
                 foreign: Vec::new(), stuck: Vec::new(), redefined: Vec::new(), populated: 0, gateway_processes: false,
-                leftover: false, stopped: Vec::new(), listings: 0, start: now, clock: now, cost: Duration::from_millis(5),
-                late: 0, commands: 0, log: Vec::new() }
+                leftover: false, restarts: Vec::new(), scan_queues: Vec::new(), scans: 0, invocation: 1,
+                reinvoke_at: Vec::new(), shows: 0, stopped: Vec::new(), listings: 0, start: now, clock: now,
+                cost: Duration::from_millis(5), late: 0, commands: 0, log: Vec::new() }
         }
     }
 
@@ -3545,6 +3666,12 @@ gshadow:        files\nhosts:          files mdns4_minimal [NOTFOUND=return] dns
             let (due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.appear).into_iter().partition(|(at, _)| *at <= listings);
             self.appear = later;
             self.up.extend(due.into_iter().map(|(_, unit)| unit));
+            // Started again by PID 1 since its last stop.
+            for (unit, left) in self.restarts.iter_mut() {
+                if *left == 0 || self.up.contains(unit) || !self.stopped.contains(unit) { continue; }
+                if *left != u32::MAX { *left -= 1; }
+                self.up.push(unit.clone());
+            }
             self.log.push("list-units".into());
             let mut text = String::new();
             for unit in self.up.clone() {
@@ -3569,12 +3696,17 @@ gshadow:        files\nhosts:          files mdns4_minimal [NOTFOUND=return] dns
             }
             Ok(text.into_bytes())
         }
-        fn definition(&mut self, unit: &str, _: UnitShape, deadline: Instant) -> Option<String> {
+        fn definition(&mut self, unit: &str, shape: UnitShape, deadline: Instant) -> Option<String> {
             self.command(deadline);
+            self.shows += 1;
+            if self.reinvoke_at.contains(&self.shows) { self.invocation += 1; }
             self.log.push(format!("show {unit}"));
             if self.foreign.iter().any(|foreign| foreign == unit) { return None; }
             let changed = self.redefined.iter().any(|name| name == unit) && self.stopped.iter().any(|name| name == unit);
-            Some(format!("{unit} v{}", if changed { 2 } else { 1 }))
+            let definition = format!("{unit} v{}", if changed { 2 } else { 1 });
+            if !shape.transient() { return Some(definition); }
+            self.log.push(format!("invocation {unit} {}", self.invocation));
+            Some(format!("{definition}\nInvocationID={:032x}", self.invocation))
         }
         fn stop(&mut self, unit: &str, deadline: Instant) -> Result<()> {
             self.command(deadline);
@@ -3612,9 +3744,14 @@ gshadow:        files\nhosts:          files mdns4_minimal [NOTFOUND=return] dns
             // The scan's account lookups are commands bounded by the same deadline.
             self.command(deadline);
             self.log.push("processes_clear".into());
+            self.scans += 1;
+            if self.scans == 1 {
+                for unit in std::mem::take(&mut self.scan_queues) { self.jobs.push((unit, 1)); }
+            }
             if self.leftover { Err(refused("仍有隔離元件正在執行")) } else { Ok(()) }
         }
         fn pause(&mut self, pause: Duration) { self.clock += pause; }
+        fn inform(&mut self, line: &str) { self.log.push(format!("note {line}")); }
     }
 
     /// Stops, kills, the process scan and performed steps, in order (observations dropped).
@@ -3740,10 +3877,11 @@ gshadow:        files\nhosts:          files mdns4_minimal [NOTFOUND=return] dns
         assert_eq!(slow.late, 0);
         assert!(slow.clock.duration_since(slow.start) <= QUIESCE_WAIT);
         assert!(slow.commands <= 5, "{}", slow.commands);
-        // A unit that never goes down: polled until exactly the deadline, then refused by name.
-        let mut stuck = FakeUnits { stuck: names(&["duduclaw-updated.service"]), cost: Duration::ZERO, ..FakeUnits::running() };
+        // A transient run that never goes down (stopped, then killed once):
+        // polled until exactly the deadline, then refused by name.
+        let mut stuck = FakeUnits { up: names(&[RUN]), stuck: names(&[RUN]), cost: Duration::ZERO, ..Default::default() };
         let error = quiesce_isolation(&mut stuck, QUIESCE_WAIT).unwrap_err().to_string();
-        assert!(error.contains("duduclaw-updated.service"), "{error}");
+        assert!(error.contains(RUN), "{error}");
         assert_eq!(stuck.late, 0);
         assert_eq!(stuck.clock.duration_since(stuck.start), QUIESCE_WAIT);
         // Every command is given at most what is left (never the full cap near the end).
@@ -3780,27 +3918,97 @@ gshadow:        files\nhosts:          files mdns4_minimal [NOTFOUND=return] dns
         assert!(uid_processes(|_| false, Some(past)).is_err());
     }
 
+    /// Review round 5 item 6: a child as the bounded reaper sees it.
+    struct FakeChild {
+        /// `try_wait` reports it reaped once killed (else never).
+        dies_on_kill: bool,
+        killed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        reaped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        /// `wait()` blocks until this is signalled (or its sender dropped).
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl super::super::Reapable for FakeChild {
+        fn try_reap(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+            use std::os::unix::process::ExitStatusExt;
+            let dead = self.dies_on_kill && self.killed.load(std::sync::atomic::Ordering::SeqCst);
+            Ok(dead.then(|| std::process::ExitStatus::from_raw(9)))
+        }
+        fn kill(&mut self) -> std::io::Result<()> {
+            self.killed.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+            use std::os::unix::process::ExitStatusExt;
+            let _ = self.release.recv();
+            self.reaped.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(std::process::ExitStatus::from_raw(9))
+        }
+    }
+
+    #[test]
+    fn command_reap_and_output_read_never_block_past_their_bounds() {
+        use std::sync::{atomic::{AtomicBool, Ordering}, mpsc, Arc};
+        let fake = |dies_on_kill: bool| {
+            let (killed, reaped) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+            let (release, receiver) = mpsc::channel();
+            (FakeChild { dies_on_kill, killed: killed.clone(), reaped: reaped.clone(), release: receiver }, killed, reaped, release)
+        };
+        // Dies on SIGKILL: reaped within the bound by the caller itself.
+        let (child, killed, reaped, _release) = fake(true);
+        assert!(super::super::kill_and_reap(child, Duration::from_millis(200), Duration::from_millis(20)));
+        assert!(killed.load(Ordering::SeqCst) && !reaped.load(Ordering::SeqCst));
+        // Cannot be reaped within the bound: the caller returns after about the
+        // bound (never waits for it); a detached thread reaps it once it exits.
+        let (child, killed, reaped, release) = fake(false);
+        let started = Instant::now();
+        assert!(!super::super::kill_and_reap(child, Duration::from_millis(200), Duration::from_millis(20)));
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(200) && took < Duration::from_secs(2), "{took:?}");
+        assert!(killed.load(Ordering::SeqCst));
+        assert!(!reaped.load(Ordering::SeqCst), "the caller did not wait for it");
+        release.send(()).unwrap();
+        let until = Instant::now() + Duration::from_secs(10);
+        while !reaped.load(Ordering::SeqCst) && Instant::now() < until { std::thread::sleep(Duration::from_millis(10)); }
+        assert!(reaped.load(Ordering::SeqCst), "reaped by the detached thread once it exited");
+        // The live bound itself: SIGKILL then at most 2 s of 20 ms polls.
+        assert_eq!((super::super::REAP_BOUND, super::super::REAP_STEP), (Duration::from_secs(2), Duration::from_millis(20)));
+        // Output: an endless stream read on a fake clock stops at the deadline
+        // (refused), whatever is still to come.
+        let start = Instant::now();
+        let mut ticks = 0u32;
+        let clock = || { ticks += 1; start + Duration::from_secs(u64::from(ticks)) };
+        let endless = std::io::repeat(b'x');
+        assert!(super::super::read_until(endless, u64::MAX - 1, start + Duration::from_secs(3), clock).is_err());
+        assert_eq!(ticks, 3, "three clock reads: two chunks, then the deadline");
+        // Nothing is read at or after the deadline; within it, at most limit + 1 bytes.
+        assert!(super::super::read_until(&b"abc"[..], 10, start, || start).is_err());
+        assert_eq!(super::super::read_until(&b"abc"[..], 10, start + Duration::from_secs(1), || start).unwrap(), b"abc");
+        assert_eq!(super::super::read_until(std::io::repeat(b'y'), 10, start + Duration::from_secs(1), || start).unwrap().len(), 11);
+    }
+
     #[test]
     fn queued_instance_job_keeps_the_quiesce_waiting_until_it_clears() {
         // A start job for a parse instance queued before its socket stopped,
-        // and it never clears: waited for (not ignored), refused naming it at the deadline.
+        // and it never clears: waited for (not ignored), the instance stopped
+        // again each round (review round 5 item 3) and refused naming it once
+        // it has been stopped MAX_STOPS times.
         let mut never = FakeUnits { loaded: names(&[PARSE_INSTANCE]), jobs: vec![(PARSE_INSTANCE.into(), u32::MAX)],
             cost: Duration::ZERO, ..FakeUnits::running() };
         let error = quiesce_isolation(&mut never, QUIESCE_WAIT).unwrap_err().to_string();
         assert!(error.contains(PARSE_INSTANCE) && error.contains("待處理的工作"), "{error}");
-        assert_eq!(never.clock.duration_since(never.start), QUIESCE_WAIT);
+        assert!(never.clock.duration_since(never.start) <= QUIESCE_WAIT);
         assert_eq!(never.late, 0);
         assert!(!never.log.iter().any(|line| line == "processes_clear"), "never scanned while a job is queued");
-        // Checked (its TEMPLATE's ownership) before it was stopped, and stopped once.
-        let show = never.log.iter().position(|line| *line == format!("show {PARSE_INSTANCE}")).unwrap();
-        let stop = never.log.iter().position(|line| *line == format!("stop {PARSE_INSTANCE}")).unwrap();
-        assert!(show < stop);
-        assert_eq!(never.log.iter().filter(|line| **line == format!("stop {PARSE_INSTANCE}")).count(), 1);
-        // The job clears after a few rounds: the quiesce completes, and all four
-        // conditions held in ONE round — the final process scan comes after the
-        // last observation of any unit or job, directly after that round's
-        // listing, cgroup read and gateway lookup.
-        let mut clears = FakeUnits { loaded: names(&[PARSE_INSTANCE]), jobs: vec![(PARSE_INSTANCE.into(), 4)],
+        // Checked (its TEMPLATE's ownership) immediately before every stop.
+        let stops: Vec<usize> = never.log.iter().enumerate()
+            .filter(|(_, line)| **line == format!("stop {PARSE_INSTANCE}")).map(|(index, _)| index).collect();
+        assert_eq!(stops.len(), MAX_STOPS as usize);
+        for stop in stops { assert_eq!(never.log[stop - 1], format!("show {PARSE_INSTANCE}")); }
+        // The job clears after a few rounds: the quiesce completes, and every
+        // condition held in ONE round — units, jobs, cgroups, the gateway
+        // account, the full process scan, then units, jobs and cgroups again.
+        let mut clears = FakeUnits { loaded: names(&[PARSE_INSTANCE]), jobs: vec![(PARSE_INSTANCE.into(), 2)],
             populated: 2, ..FakeUnits::running() };
         quiesce_isolation(&mut clears, QUIESCE_WAIT).unwrap();
         let log = &clears.log;
@@ -3808,8 +4016,124 @@ gshadow:        files\nhosts:          files mdns4_minimal [NOTFOUND=return] dns
         let observed = log.iter().rposition(|line| line.starts_with("job ") || line.starts_with("up ")).unwrap();
         assert!(observed < scan, "{log:?}");
         assert_eq!(log[scan - 4..scan], ["list-units", "list-jobs", "cgroup", "gateway"].map(String::from), "{log:?}");
-        assert!(log[scan + 1..].iter().all(|line| line.starts_with("show ")), "only the post-stop re-reads follow: {log:?}");
+        assert_eq!(log[scan + 1..scan + 4], ["list-units", "list-jobs", "cgroup"].map(String::from), "{log:?}");
+        assert!(log[scan + 4..].iter().all(|line| line.starts_with("show ")), "only the post-stop re-reads follow: {log:?}");
         assert_eq!(log.iter().filter(|line| *line == "processes_clear").count(), 1);
+    }
+
+    #[test]
+    fn success_requires_two_quiet_observations_around_the_process_scan() {
+        // Review round 5 item 2: the first scan passes, but a start job for the
+        // egress service is queued meanwhile; the observation after the scan
+        // sees it, so the round does not succeed: the service is checked and
+        // stopped again, and success needs another quiet observation, scan
+        // and quiet observation.
+        let egress = "duduclaw-egress.service";
+        let mut units = FakeUnits { scan_queues: names(&[egress]), ..FakeUnits::running() };
+        quiesce_isolation(&mut units, QUIESCE_WAIT).unwrap();
+        let log = &units.log;
+        let scans: Vec<usize> = log.iter().enumerate().filter(|(_, line)| *line == "processes_clear").map(|(index, _)| index).collect();
+        assert_eq!(scans.len(), 2, "{log:?}");
+        let job = log.iter().position(|line| *line == format!("job {egress}")).unwrap();
+        let restop = log.iter().rposition(|line| *line == format!("stop {egress}")).unwrap();
+        assert!(scans[0] < job && job < restop && restop < scans[1], "{log:?}");
+        assert_eq!(log[scans[0] + 1..scans[0] + 3], ["list-units", "list-jobs"].map(String::from), "{log:?}");
+        assert_eq!(log[restop - 1], format!("show {egress}"));
+        assert_eq!(log.iter().filter(|line| **line == format!("stop {egress}")).count(), 2);
+        assert_eq!(log[scans[1] + 1..scans[1] + 4], ["list-units", "list-jobs", "cgroup"].map(String::from), "{log:?}");
+        assert_eq!(units.late, 0);
+    }
+
+    #[test]
+    fn file_backed_unit_that_restarts_is_stopped_again_then_refused_after_the_cap() {
+        let egress = "duduclaw-egress.service";
+        // Started again once (a dependency, socket activation, an administrator):
+        // re-checked and stopped again, then the quiesce completes.
+        let mut once = FakeUnits { restarts: vec![(egress.into(), 1)], ..FakeUnits::running() };
+        quiesce_isolation(&mut once, QUIESCE_WAIT).unwrap();
+        let stops: Vec<usize> = once.log.iter().enumerate()
+            .filter(|(_, line)| **line == format!("stop {egress}")).map(|(index, _)| index).collect();
+        assert_eq!(stops.len(), 2, "{:?}", once.log);
+        for stop in stops { assert_eq!(once.log[stop - 1], format!("show {egress}"), "ownership re-read right before"); }
+        // Started again every time: refused naming it after MAX_STOPS stops, well before the deadline.
+        let mut always = FakeUnits { restarts: vec![(egress.into(), u32::MAX)], ..FakeUnits::running() };
+        let error = quiesce_isolation(&mut always, QUIESCE_WAIT).unwrap_err().to_string();
+        assert!(error.contains(egress) && error.contains(&format!("已停止 {MAX_STOPS} 次")), "{error}");
+        assert_eq!(always.log.iter().filter(|line| **line == format!("stop {egress}")).count(), MAX_STOPS as usize);
+        assert!(!always.log.iter().any(|line| line == "processes_clear"));
+        assert!(always.clock.duration_since(always.start) < QUIESCE_WAIT);
+    }
+
+    #[test]
+    fn transient_unit_reinvoked_between_check_and_kill_is_not_killed_and_is_rechecked() {
+        // Review round 5 item 4: a stopped run still up is about to be killed,
+        // but the InvocationID read immediately before the kill is a new one:
+        // nothing is sent; the next round treats it as a newly appeared unit
+        // (ownership checked, stopped), and only that invocation is killed later.
+        let mut units = FakeUnits { up: names(&[RUN]), stuck: names(&[RUN]), reinvoke_at: vec![4], cost: Duration::ZERO,
+            ..Default::default() };
+        let error = quiesce_isolation(&mut units, QUIESCE_WAIT).unwrap_err().to_string();
+        assert!(error.contains(RUN), "{error}");
+        let log = &units.log;
+        assert_eq!(effects(log), [format!("stop {RUN}"), format!("stop {RUN}"), format!("kill {RUN}")]);
+        let new = log.iter().position(|line| *line == format!("invocation {RUN} 2")).unwrap();
+        let second_stop = log.iter().rposition(|line| *line == format!("stop {RUN}")).unwrap();
+        let kill = log.iter().position(|line| *line == format!("kill {RUN}")).unwrap();
+        assert!(new < second_stop && second_stop < kill, "{log:?}");
+        // The kill follows the re-read of the same (new) invocation, and the
+        // stop of the new invocation follows its own ownership read.
+        assert_eq!(log[kill - 2..kill], [format!("show {RUN}"), format!("invocation {RUN} 2")], "{log:?}");
+        assert_eq!(log[second_stop - 2..second_stop], [format!("show {RUN}"), format!("invocation {RUN} 2")], "{log:?}");
+        assert!(!log[..second_stop].iter().any(|line| line.starts_with("kill ")), "{log:?}");
+        assert_eq!(units.late, 0);
+    }
+
+    #[test]
+    fn inactive_unknown_unit_is_ignored_and_reported_once_by_resume_and_rollback() {
+        // Review round 5 item 1: an administrator's own unit, merely loaded.
+        let backup = "duduclaw-backup.service";
+        for state in ["inactive dead", "failed failed"] {
+            let line = format!("{backup} loaded {state} Backup job");
+            let mut resume = FakeUnits { extra: vec![line.clone()], ..FakeUnits::running() };
+            quiesce_isolation(&mut resume, QUIESCE_WAIT).unwrap();
+            let mut rollback = FakeUnits { extra: vec![line], ..FakeUnits::everything() };
+            super::super::rollback::quiesce(&mut rollback).unwrap();
+            for units in [&resume, &rollback] {
+                let notes: Vec<&String> = units.log.iter().filter(|line| line.starts_with("note ")).collect();
+                assert_eq!(notes.len(), 1, "reported once: {:?}", units.log);
+                assert!(notes[0].contains(backup) && notes[0].contains("不會被停止"), "{}", notes[0]);
+                assert!(!units.log.iter().any(|line| line.contains(backup) && !line.starts_with("note ")), "never probed or stopped");
+                assert_eq!(units.late, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn busy_unknown_unit_refuses_with_an_actionable_message_and_nothing_stopped() {
+        let backup = "duduclaw-backup.service";
+        let check = |units: &mut FakeUnits, rollback: bool| {
+            let result = if rollback { super::super::rollback::quiesce(units) } else { quiesce_isolation(units, QUIESCE_WAIT) };
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains(&format!("sudo systemctl stop {backup}")) && error.contains("不是這次安裝的單元")
+                && error.contains("不會停止它"), "{error}");
+            assert!(!units.log.iter().any(|line| line.contains(backup) && !line.starts_with("up ") && !line.starts_with("job ")),
+                "never probed, stopped or killed: {:?}", units.log);
+        };
+        for rollback in [false, true] {
+            for state in ["active running", "activating start", "deactivating stop-sigterm", "reloading reload"] {
+                let mut units = FakeUnits { extra: vec![format!("{backup} loaded {state} Backup")], ..FakeUnits::running() };
+                check(&mut units, rollback);
+                assert!(effects(&units.log).is_empty(), "refused before any effect: {:?}", units.log);
+            }
+            // Inactive, but with a queued job: busy.
+            let mut units = FakeUnits { extra: vec![format!("{backup} loaded inactive dead Backup")],
+                jobs: vec![(backup.into(), u32::MAX)], ..FakeUnits::running() };
+            check(&mut units, rollback);
+            assert!(effects(&units.log).is_empty());
+            // Up only in a later round: refused then; it is never stopped.
+            let mut units = FakeUnits { appear: vec![(2, backup.into())], ..FakeUnits::running() };
+            check(&mut units, rollback);
+        }
     }
 
     #[test]
@@ -3837,7 +4161,8 @@ gshadow:        files\nhosts:          files mdns4_minimal [NOTFOUND=return] dns
 
     #[test]
     fn unknown_duduclaw_unit_shape_is_refused_by_name_and_nothing_stopped() {
-        for (line, name) in [("duduclaw-helper.service loaded inactive dead Helper", "duduclaw-helper.service"),
+        // Up (an inactive one is ignored: `inactive_unknown_unit_is_ignored_and_reported_once_by_resume_and_rollback`).
+        for (line, name) in [("duduclaw-helper.service loaded activating start Helper", "duduclaw-helper.service"),
             ("duduclaw-run-XYZ.service loaded active running Run", "duduclaw-run-XYZ.service"),
             ("duduclaw-parse@A_B.service loaded active running Parse", "duduclaw-parse@A_B.service"),
             ("duduclaw-migrate-import.socket loaded active listening Import", "duduclaw-migrate-import.socket")] {
@@ -3896,12 +4221,24 @@ gshadow:        files\nhosts:          files mdns4_minimal [NOTFOUND=return] dns
 
     #[test]
     fn transient_runs_and_slices_must_be_transient_under_the_employees_slice() {
+        let invocation = "00112233445566778899aabbccddeeff";
         let run = format!("LoadState=loaded\nTransient=yes\nSlice={EMPLOYEE_SLICE}\n\
-            ControlGroup=/duduclaw.slice/duduclaw-employees.slice/{EMPLOYEE_SLICE}/{RUN}\n");
+            ControlGroup=/duduclaw.slice/duduclaw-employees.slice/{EMPLOYEE_SLICE}/{RUN}\nInvocationID={invocation}\n");
         assert!(transient_show_is_ours(run.as_bytes(), RUN, UnitShape::Run));
+        assert_eq!(invocation_of(&run), Some(invocation));
         // Not running (no control group yet / any more): placement by Slice alone.
         let idle = run.replace(&format!("/duduclaw.slice/duduclaw-employees.slice/{EMPLOYEE_SLICE}/{RUN}"), "");
         assert!(transient_show_is_ours(idle.as_bytes(), RUN, UnitShape::Run));
+        // Review round 5 item 4: not started yet (a queued job only): no invocation.
+        let unstarted = run.replace(&format!("InvocationID={invocation}"), "InvocationID=");
+        assert!(transient_show_is_ours(unstarted.as_bytes(), RUN, UnitShape::Run));
+        assert_eq!(invocation_of(&unstarted), None);
+        // The InvocationID strict: 32 lowercase hex, present exactly once.
+        for bad in [run.replace(invocation, &invocation.to_uppercase()), run.replace(invocation, &invocation[1..]),
+            run.replace(invocation, &format!("{invocation}0")), run.replace(invocation, "0123456789abcdef-0123456789abcde"),
+            run.replace(&format!("InvocationID={invocation}\n"), ""), format!("{run}InvocationID={invocation}\n")] {
+            assert!(!transient_show_is_ours(bad.as_bytes(), RUN, UnitShape::Run), "{bad}");
+        }
         for bad in [run.replace("Transient=yes", "Transient=no"), run.replace("LoadState=loaded", "LoadState=not-found"),
             run.replace(&format!("Slice={EMPLOYEE_SLICE}"), "Slice=system.slice"),
             run.replace(&format!("Slice={EMPLOYEE_SLICE}"), "Slice=duduclaw-employees.slice"),
@@ -3915,7 +4252,7 @@ gshadow:        files\nhosts:          files mdns4_minimal [NOTFOUND=return] dns
         assert!(!transient_show_is_ours(run.as_bytes(), RUN, UnitShape::EmployeeSlice));
         assert!(!transient_show_is_ours(run.as_bytes(), "duduclaw-run-x.service", UnitShape::Run));
         let slice = format!("LoadState=loaded\nTransient=yes\nSlice=duduclaw-employees.slice\n\
-            ControlGroup=/duduclaw.slice/duduclaw-employees.slice/{EMPLOYEE_SLICE}\n");
+            ControlGroup=/duduclaw.slice/duduclaw-employees.slice/{EMPLOYEE_SLICE}\nInvocationID={invocation}\n");
         assert!(transient_show_is_ours(slice.as_bytes(), EMPLOYEE_SLICE, UnitShape::EmployeeSlice));
         for bad in [slice.replace("Transient=yes", "Transient=no"), slice.replace("Slice=duduclaw-employees.slice", "Slice=duduclaw.slice"),
             slice.replace("ControlGroup=/duduclaw.slice/duduclaw-employees.slice/", "ControlGroup=/duduclaw.slice/")] {
@@ -4006,30 +4343,54 @@ gshadow:        files\nhosts:          files mdns4_minimal [NOTFOUND=return] dns
 
     #[test]
     fn component_proofs_require_this_installs_window() {
-        let window = Some((2_000, 0));
-        let facts = |identity: &ledger::Identity, stamp: Option<ledger::Timestamp>, nlink: u64| ComponentFacts {
-            parent_mount: Some(identity.mount_id), window,
-            creation: Some(ledger::Creation { device: identity.device, inode: identity.inode, nlink, stamp }) };
+        let window = Some(ledger::Clocks { realtime: (2_000, 0), boottime: (100, 0) });
+        // Checked 10 s later on both clocks: no wall-clock step.
+        let now = Some(ledger::Clocks { realtime: (2_010, 0), boottime: (110, 0) });
+        let facts = |identity: &ledger::Identity, btime: Option<ledger::Timestamp>, nlink: u64| ComponentFacts {
+            parent_mount: Some(identity.mount_id), absent_at_intent: true, window, now,
+            creation: Some(ledger::Creation { device: identity.device, inode: identity.inode, nlink, btime }) };
         let boot = "0123abcd-0000-4000-8000-00000000beef".to_owned();
         let directory = |mode: u32| ledger::Identity { device: 1, inode: 2, mount_id: 3, mode: libc::S_IFDIR | mode, uid: 0, gid: 0,
             size: None, sha256: None, boot_id: boot.clone() };
         let key = ledger::Identity { device: 1, inode: 4, mount_id: 3, mode: libc::S_IFREG | 0o600, uid: 0, gid: 0,
             size: Some(32), sha256: Some("ab".repeat(32)), boot_id: boot.clone() };
         let (state, runtime) = (directory(0o700), directory(0o755));
-        // Inside the window: proven.
+        // Absent at intent, born inside the window: proven.
         assert!(state_root_proven(&state, &facts(&state, Some((2_000, 1)), 2), true));
         assert!(runtime_directory_proven(&runtime, &facts(&runtime, Some((2_005, 0)), 2), true));
         assert!(root_key_proven(&key, &facts(&key, Some((2_000, 0)), 1), true));
-        // The stamp predates the window, or cannot be read: each of the three refused.
-        for stamp in [Some((1_999, 999_999_999)), None] {
-            assert!(!state_root_proven(&state, &facts(&state, stamp, 2), true), "{stamp:?}");
-            assert!(!runtime_directory_proven(&runtime, &facts(&runtime, stamp, 2), true), "{stamp:?}");
-            assert!(!root_key_proven(&key, &facts(&key, stamp, 1), true), "{stamp:?}");
+        // Review round 5 item 5: no birth time reported (never the change time instead): proven.
+        assert!(state_root_proven(&state, &facts(&state, None, 2), true));
+        assert!(runtime_directory_proven(&runtime, &facts(&runtime, None, 2), true));
+        assert!(root_key_proven(&key, &facts(&key, None, 1), true));
+        // A birth time predating the window with no step: each of the three refused.
+        let early = Some((1_999, 999_999_999));
+        assert!(!state_root_proven(&state, &facts(&state, early, 2), true));
+        assert!(!runtime_directory_proven(&runtime, &facts(&runtime, early, 2), true));
+        assert!(!root_key_proven(&key, &facts(&key, early, 1), true));
+        // The wall clock stepped back an hour after the window opened: the
+        // object is "born" before it, yet proven (absence-then-identity).
+        let back = Some(ledger::Clocks { realtime: (2_000 - 3_600 + 10, 0), boottime: (110, 0) });
+        let stepped = |identity: &ledger::Identity, nlink: u64|
+            ComponentFacts { now: back, ..facts(identity, Some((2_000 - 3_600 + 5, 0)), nlink) };
+        assert!(state_root_proven(&state, &stepped(&state, 2), true));
+        assert!(runtime_directory_proven(&runtime, &stepped(&runtime, 2), true));
+        assert!(root_key_proven(&key, &stepped(&key, 1), true));
+        // The path was not absent at the intent (present as a recorded object,
+        // or never intended in this run): refused whatever the time facts say.
+        for btime in [Some((2_001, 0)), None] {
+            let present = |identity: &ledger::Identity, nlink: u64|
+                ComponentFacts { absent_at_intent: false, ..facts(identity, btime, nlink) };
+            assert!(!state_root_proven(&state, &present(&state, 2), true), "{btime:?}");
+            assert!(!runtime_directory_proven(&runtime, &present(&runtime, 2), true), "{btime:?}");
+            assert!(!root_key_proven(&key, &present(&key, 1), true), "{btime:?}");
         }
-        // The window itself unreadable, or the stamp of another inode: refused.
-        let unreadable = ComponentFacts { window: None, ..facts(&key, Some((2_001, 0)), 1) };
-        assert!(!root_key_proven(&key, &unreadable, true));
-        let other = ComponentFacts { creation: Some(ledger::Creation { device: 1, inode: 99, nlink: 1, stamp: Some((2_001, 0)) }),
+        // A clock unreadable: no time comparison (absence-then-identity still required).
+        let unreadable = ComponentFacts { window: None, ..facts(&key, early, 1) };
+        assert!(root_key_proven(&key, &unreadable, true));
+        assert!(!root_key_proven(&key, &ComponentFacts { absent_at_intent: false, ..unreadable }, true));
+        // The statx facts of another inode: refused.
+        let other = ComponentFacts { creation: Some(ledger::Creation { device: 1, inode: 99, nlink: 1, btime: Some((2_001, 0)) }),
             ..facts(&key, None, 1) };
         assert!(!root_key_proven(&key, &other, true));
         assert!(!state_root_proven(&state, &ComponentFacts { creation: None, ..facts(&state, Some((2_001, 0)), 2) }, true));
