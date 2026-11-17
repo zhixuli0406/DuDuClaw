@@ -560,6 +560,18 @@ Two stages (what you will see):
   (success, failure, Ctrl-C). --preflight stops after the preconditions:
   nothing is signed and no key location is asked for.
 
+--output-dir is NOT where the ceremony works. Every output is produced, signed,
+verified, hashed and uploaded from a private staging directory inside stage 2's
+work directory (yours, 0700, removed on every exit; a failure deletes only
+there). Only at the very end, after the upload and its read-back (with
+--no-upload: after the final verification), the results and
+SHA256SUMS-isolation.txt are COPIED into --output-dir as a convenience. It must
+not exist yet, and its parent must be an existing directory owned by you that
+is neither a symbolic link nor group/other-writable (checked before any prompt
+and again right before the copy). It is created 0700 (exclusively, never
+through a link), each file 0600, each copy checked against the staged SHA-256.
+A failed copy never affects what was uploaded; it is reported as such.
+
 Key locations are NEVER command-line arguments (any local process can read
 argv) and NEVER environment variables (every child would inherit them): stage 2
 asks for each at an attended prompt on the terminal (echoed; a location is not a
@@ -585,7 +597,8 @@ Steps, in order (any failure stops everything; no output is ever overwritten):
      nothing to sign), HEAD at tag v<version>, every snapshot file
      byte-identical to its blob at the tag; SHA-256 of --root-metadata equal to
      the pin and its signatures meeting its own root threshold, each verified
-     with ssh-keygen -Y verify; --output-dir absent; gh, minisign and docker
+     with ssh-keygen -Y verify; --output-dir absent and its parent a directory
+     of yours, not a link, not group/other-writable; gh, minisign and docker
      resolved.
   For x86_64 and aarch64:
   1. Download duduclaw-linux-<arch>.tar.gz (+ .sha256, .minisig) of the tag; verify
@@ -618,13 +631,19 @@ Steps, in order (any failure stops everything; no output is ever overwritten):
      verifier accepts and verified with ssh-keygen -Y verify over the exact
      bytes; otherwise the authorization is deleted and nothing is added to the
      upload list.
-  Then:
-  5. Write <output-dir>/SHA256SUMS-isolation.txt from the exact bytes to upload,
-     plus "<pin>  root.json" (the root metadata fingerprint).
-  6. After you type UPLOAD: upload the update-service assets isolated-linux-<arch>-*
+  Then (all from the private staging copies):
+  5. After you type UPLOAD (with --no-upload: at once), immediately before the
+     upload, everything is verified again: each manifest's target-key signature
+     and every artifact it binds (exactly the signed SHA-256 and size), each
+     BundleAuthorization's root threshold and its tar (digest, size, version,
+     architecture), each bundle's legacy minisign signature. Then
+     SHA256SUMS-isolation.txt is written from those same bytes, plus
+     "<pin>  root.json" (the root metadata fingerprint).
+  6. Upload exactly those files: the update-service assets isolated-linux-<arch>-*
      (and, for the bundle version, duduclaw-bootstrap-linux-<arch> and the four
      bundle files) to the GitHub release without replacing any asset, then
      download every uploaded asset again and compare its SHA-256.
+  7. Copy the results and SHA256SUMS-isolation.txt into --output-dir (above).
 Publishing SHA256SUMS-isolation.txt on the website and the licensed console is
 the separate [external] gate; this script never publishes it there.
 
@@ -1302,6 +1321,139 @@ isolation_probe_pin() {
     isolation_run "${ISOLATION_DOCKER_ARGV[@]}"
 }
 
+# --output-dir only RECEIVES copies at the very end; the ceremony works in its private staging
+# directory. `check <dir>`: <dir> does not exist and its parent is an existing directory owned by
+# you, not a symbolic link, not group/other-writable (else another user could rename the results).
+# `copy <dir> <staging> <name>=<sha256> ...`: the same check on the opened parent, then <dir>
+# created exclusively (never through a link) with mode 0700, and each <staging>/<name> copied
+# into it with mode 0600; the staged bytes and the copy must both have <sha256>.
+ISOLATION_OUTPUT_PY='import hashlib, os, stat, sys
+mode, output = sys.argv[1], sys.argv[2]
+uid = os.geteuid()
+directory_flag = getattr(os, "O_DIRECTORY", 0)
+def fail(message):
+    sys.exit("Error: --output-dir " + output + ": " + message)
+path = output.rstrip("/")
+if not path or "\n" in path or any(part in (".", "..") for part in path.split("/")):
+    fail("must name a new directory (no . or .. component)")
+if not os.path.isabs(path):
+    path = os.path.join(os.getcwd(), path)
+parent, name = os.path.split(path)
+def digest_of(descriptor):
+    digest = hashlib.sha256()
+    with os.fdopen(descriptor, "rb") as source:
+        for chunk in iter(lambda: source.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+try:
+    try:
+        if stat.S_ISLNK(os.lstat(parent).st_mode):
+            fail("its parent directory is a symbolic link")
+        parent_fd = os.open(parent, os.O_RDONLY | directory_flag | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        fail("its parent directory does not exist")
+    info = os.fstat(parent_fd)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != uid or info.st_mode & 0o022:
+        fail("its parent must be an existing directory owned by you that is not group/other-writable")
+    try:
+        os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    else:
+        fail("must not exist yet (outputs are never overwritten)")
+    if mode == "check":
+        sys.exit(0)
+    if mode != "copy":
+        fail("unknown mode")
+    staging = sys.argv[3]
+    os.mkdir(name, 0o700, dir_fd=parent_fd)
+    out_fd = os.open(name, os.O_RDONLY | directory_flag | os.O_NOFOLLOW, dir_fd=parent_fd)
+    info = os.fstat(out_fd)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != uid:
+        fail("the created directory is not a directory of yours")
+    os.fchmod(out_fd, 0o700)
+    for argument in sys.argv[4:]:
+        file, _, expected = argument.rpartition("=")
+        if not file or "/" in file or file in (".", ".."):
+            fail("unexpected file name " + file)
+        source_fd = os.open(os.path.join(staging, file), os.O_RDONLY | os.O_NOFOLLOW)
+        target_fd = os.open(file, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=out_fd)
+        os.fchmod(target_fd, 0o600)
+        staged = hashlib.sha256()
+        with os.fdopen(source_fd, "rb") as source, os.fdopen(target_fd, "wb") as target:
+            for chunk in iter(lambda: source.read(1 << 20), b""):
+                staged.update(chunk)
+                target.write(chunk)
+            target.flush()
+            os.fsync(target.fileno())
+        if staged.hexdigest() != expected:
+            fail("the staged " + file + " is not the uploaded/verified bytes")
+        copy_fd = os.open(file, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=out_fd)
+        info = os.fstat(copy_fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != uid or stat.S_IMODE(info.st_mode) != 0o600
+                or digest_of(copy_fd) != expected):
+            fail("the copy of " + file + " differs from the staged SHA-256")
+except OSError as error:
+    fail(str(error))'
+
+# Before any prompt (and before --preflight ends): --output-dir is new and its parent qualifies.
+isolation_check_output_dir() {
+    if [[ -e "$1" || -L "$1" ]]; then
+        isolation_fail "--output-dir must not exist yet (outputs are never overwritten)"; return 1
+    fi
+    isolation_run "$ISOLATION_TOOL_PYTHON" -I -B -c "$ISOLATION_OUTPUT_PY" check "$1"
+}
+
+# The convenience copy, LAST: $1 staging, $2 --output-dir, then <name>=<sha256> of each file
+# (the uploaded/verified digests). The parent is checked again on the opened directory.
+isolation_copy_results() {
+    local staging="$1" output_dir="$2"
+    shift 2
+    if ! isolation_run "$ISOLATION_TOOL_PYTHON" -I -B -c "$ISOLATION_OUTPUT_PY" copy "$output_dir" "$staging" "$@"
+    then
+        isolation_fail "the results were NOT copied into --output-dir (above); nothing of the upload or its" \
+            "read-back depends on that copy. Anything partially created there is not verified: remove it."
+        return 1
+    fi
+}
+
+# Immediately before the upload (with --no-upload: before the copy), every check again on the
+# private staging copies that are hashed, uploaded and copied next, through the signer's own
+# verification paths: --check-target --artifacts-dir (target-key signature; every artifact the
+# manifest binds re-bound by the signing-time code: exactly the signed digest and size),
+# --check-threshold --bundle (root threshold; the tar is the authorized one), the legacy minisign
+# signature. $1 staging, $2 pin, $3 legacy minisign public key, $4 migration bundle (0/1).
+isolation_verify_staged() {
+    local staging="$1" pin="$2" legacy_public="$3" migration_bundle="$4" snapshot="$ISOLATION_SNAPSHOT"
+    local root_metadata="$ISOLATION_WORK/root/root.json" arch bundle_name
+    for arch in x86_64 aarch64; do
+        if ! isolation_run "$ISOLATION_TOOL_PYTHON" -I -B "$snapshot/scripts/sign-isolation-manifest.py" \
+                --kind release --check-target "$staging/isolated-linux-$arch-manifest.json" \
+                --artifacts-dir "$staging" --root-metadata "$root_metadata" --root-sha256 "$pin" \
+                --ssh-keygen "$ISOLATION_TOOL_SSH_KEYGEN"; then
+            isolation_fail "re-verification before upload: the staged $arch manifest or an artifact it binds failed"
+            return 1
+        fi
+        if [[ "$migration_bundle" == "1" ]]; then
+            bundle_name="duduclaw-isolated-linux-$arch-$CURRENT_VERSION.tar"
+            if ! isolation_run "$ISOLATION_TOOL_PYTHON" -I -B "$snapshot/scripts/sign-isolation-manifest.py" \
+                    --kind bundle --check-threshold "$staging/$bundle_name.authorization.json" \
+                    --bundle "$staging/$bundle_name" --root-metadata "$root_metadata" --root-sha256 "$pin" \
+                    --ssh-keygen "$ISOLATION_TOOL_SSH_KEYGEN"; then
+                isolation_fail "re-verification before upload: the staged $bundle_name authorization failed"
+                return 1
+            fi
+            if ! isolation_run "$ISOLATION_TOOL_MINISIGN" -V -q -P "$legacy_public" -m "$staging/$bundle_name" \
+                    -x "$staging/$bundle_name.minisig" \
+                    || ! isolation_check_minisig "$staging/$bundle_name.minisig" \
+                        "duduclaw v$CURRENT_VERSION $bundle_name"; then
+                isolation_fail "re-verification before upload: the staged $bundle_name.minisig failed"
+                return 1
+            fi
+        fi
+    done
+}
+
 # STAGE 2 ceremony body (from isolation_stage2: snapshot audited, traps set, work
 # directory created). Every file it reads or executes is "$snapshot/...".
 run_isolation_sign() {
@@ -1375,9 +1527,10 @@ print(pin)' "$pin_file" "$snapshot/scripts/package-linux-release.py")"
     if [[ "$legacy_count" != "1" || ! "$legacy_public" =~ ^RW[A-Za-z0-9+/]{54}$ ]]; then
         isolation_fail "cannot read LEGACY_RELEASE_MINISIGN_KEY from duduclaw-isolation"; return 1
     fi
-    if [[ -e "$output_dir" || -L "$output_dir" ]]; then
-        isolation_fail "--output-dir must not exist yet (outputs are never overwritten)"; return 1
-    fi
+    # --output-dir only receives copies at the very end (step 7); new, and its parent an existing
+    # directory of yours, not a link, not group/other-writable: here, before any prompt, and again
+    # right before the copy.
+    isolation_check_output_dir "$output_dir" || return 1
     isolation_require_tools || return 1
     if [[ "$ISOLATION_PREFLIGHT" == "1" ]]; then
         echo "Preflight passed for $tag: the snapshot is the tag, every tool resolved, --root-metadata matches" \
@@ -1399,7 +1552,11 @@ print(pin)' "$pin_file" "$snapshot/scripts/package-linux-release.py")"
         legacy_minisign_key="$(isolation_key_location "legacy release minisign key" \
             "${HOME:+$HOME/.minisign/duduclaw-release.key}")" || return 1
     fi
-    isolation_run "$ISOLATION_TOOL_MKDIR" -m 0700 -- "$output_dir"
+    # Everything is produced, signed, verified, hashed and uploaded from this private staging
+    # directory (inside the 0700 work directory the EXIT trap removes); deletions on failure
+    # touch only it. Nothing before or during the upload reads --output-dir.
+    local staging="$ISOLATION_WORK/staging"
+    isolation_run "$ISOLATION_TOOL_MKDIR" -m 0700 -- "$staging"
 
     local arch triple archive bundle_name verifier probe_output expires asset now
     local -a uploads=()
@@ -1446,7 +1603,7 @@ print(pin)' "$pin_file" "$snapshot/scripts/package-linux-release.py")"
         local -a package_args=(--target "$triple" --from-release-archive "$ISOLATION_WORK/$arch/$archive"
             --manifest-template "$snapshot/$ISOLATION_TEMPLATE" --manifest-valid-days "$manifest_days"
             --signing-key-stdin "${signing_tools[@]}" --target-root "$root_metadata" --target-root-sha256 "$pin"
-            --output-dir "$output_dir")
+            --output-dir "$staging")
         if [[ "$migration_bundle" == "1" ]]; then
             package_args+=(--bootstrap-root "$root_metadata" --bootstrap-root-signatures "$root_signatures")
         fi
@@ -1457,28 +1614,28 @@ print(pin)' "$pin_file" "$snapshot/scripts/package-linux-release.py")"
             "${package_args[@]}"
         # Again on the written bytes, before anything of this architecture joins the upload list:
         # shape check, then ssh-keygen -Y verify against the pinned target_key only. Otherwise
-        # every output of this architecture is deleted.
+        # every output of this architecture is deleted (in the private staging directory only).
         if ! isolation_run "$python" -I -B "$snapshot/scripts/sign-isolation-manifest.py" --kind release \
-                --check-target "$output_dir/isolated-linux-$arch-manifest.json" --root-metadata "$root_metadata" \
+                --check-target "$staging/isolated-linux-$arch-manifest.json" --root-metadata "$root_metadata" \
                 --root-sha256 "$pin" --ssh-keygen "$ssh_keygen"; then
-            isolation_run "$ISOLATION_TOOL_RM" -rf -- "$output_dir/isolated-linux-$arch-"*
+            isolation_run "$ISOLATION_TOOL_RM" -rf -- "$staging/isolated-linux-$arch-"*
             isolation_fail "the $arch manifest is not signed by the target key of the pinned root; deleted"
             return 1
         fi
-        for asset in "$output_dir/isolated-linux-$arch-"*; do
+        for asset in "$staging/isolated-linux-$arch-"*; do
             if [[ -f "$asset" && ! -L "$asset" ]]; then uploads+=("$asset"); fi
         done
         if [[ "$migration_bundle" == "1" ]]; then
             # 3. Plain-ustar migration bundle (plan §3.2).
             isolation_run "$python" -I -B "$snapshot/scripts/package-linux-release.py" --target "$triple" \
-                --migration-bundle-from "$output_dir/isolated-linux-$arch-bootstrap-inbox" --output-dir "$output_dir"
+                --migration-bundle-from "$staging/isolated-linux-$arch-bootstrap-inbox" --output-dir "$staging"
             bundle_name="duduclaw-isolated-linux-$arch-$CURRENT_VERSION.tar"
-            local authorization="$output_dir/$bundle_name.authorization.json"
+            local authorization="$staging/$bundle_name.authorization.json"
             # 4. Transition dual signature: root threshold + legacy release key. R1 then R2
             # on the signer's stdin (never argv or the environment).
             echo "Root threshold ($arch bundle): R1 touch + PIN, then the R2 passphrase."
             isolation_handoff 2 "${root_keys[0]}" "${root_keys[1]}" "$python" -I -B \
-                "$snapshot/scripts/sign-isolation-manifest.py" --kind bundle --bundle "$output_dir/$bundle_name" \
+                "$snapshot/scripts/sign-isolation-manifest.py" --kind bundle --bundle "$staging/$bundle_name" \
                 --expires-at-unix "$expires" --output "$authorization" --key-count 2 \
                 --root-metadata "$root_metadata" --root-sha256 "$pin" "${signing_tools[@]}"
             # R2-5, before anything of this bundle reaches the upload list: the signers are
@@ -1494,25 +1651,41 @@ print(pin)' "$pin_file" "$snapshot/scripts/package-linux-release.py")"
             fi
             echo "Legacy release key ($arch bundle): minisign asks for its password."
             isolation_handoff 1 "$legacy_minisign_key" "$python" -I -B "$snapshot/scripts/sign-isolation-manifest.py" \
-                --minisign-sign "$output_dir/$bundle_name" --trusted-comment "duduclaw v$CURRENT_VERSION $bundle_name" \
-                --output "$output_dir/$bundle_name.minisig" --minisign "$ISOLATION_TOOL_MINISIGN"
-            isolation_run "$ISOLATION_TOOL_MINISIGN" -V -q -P "$legacy_public" -m "$output_dir/$bundle_name" \
-                -x "$output_dir/$bundle_name.minisig"
-            if ! isolation_check_minisig "$output_dir/$bundle_name.minisig" "duduclaw v$CURRENT_VERSION $bundle_name"; then
+                --minisign-sign "$staging/$bundle_name" --trusted-comment "duduclaw v$CURRENT_VERSION $bundle_name" \
+                --output "$staging/$bundle_name.minisig" --minisign "$ISOLATION_TOOL_MINISIGN"
+            isolation_run "$ISOLATION_TOOL_MINISIGN" -V -q -P "$legacy_public" -m "$staging/$bundle_name" \
+                -x "$staging/$bundle_name.minisig"
+            if ! isolation_check_minisig "$staging/$bundle_name.minisig" "duduclaw v$CURRENT_VERSION $bundle_name"; then
                 isolation_fail "$bundle_name.minisig is not a prehashed signature with the verifier's trusted comment"
                 return 1
             fi
-            isolation_run "$ISOLATION_TOOL_CP" -- "$verifier" "$output_dir/duduclaw-bootstrap-linux-$arch"
-            isolation_run "$ISOLATION_TOOL_CHMOD" 0755 "$output_dir/duduclaw-bootstrap-linux-$arch"
-            uploads+=("$output_dir/duduclaw-bootstrap-linux-$arch" "$output_dir/$bundle_name"
-                "$output_dir/$bundle_name.minisig" "$output_dir/$bundle_name.authorization.json"
-                "$output_dir/$bundle_name.authorization.json.signatures.json")
+            isolation_run "$ISOLATION_TOOL_CP" -- "$verifier" "$staging/duduclaw-bootstrap-linux-$arch"
+            isolation_run "$ISOLATION_TOOL_CHMOD" 0755 "$staging/duduclaw-bootstrap-linux-$arch"
+            uploads+=("$staging/duduclaw-bootstrap-linux-$arch" "$staging/$bundle_name"
+                "$staging/$bundle_name.minisig" "$staging/$bundle_name.authorization.json"
+                "$staging/$bundle_name.authorization.json.signatures.json")
         fi
     done
 
-    # 5. Publication list from the exact bytes to upload (+ root fingerprint).
-    local sums_file="$output_dir/SHA256SUMS-isolation.txt" index name
+    local sums_file="$staging/SHA256SUMS-isolation.txt" index name sums_hash
     local -a hashes=()
+    local -a copies=()
+    echo ""
+    echo "Assets for GitHub release $tag:"
+    for index in "${!uploads[@]}"; do
+        printf '  %s\n' "${uploads[$index]##*/}"
+    done
+    if [[ "$upload" == "1" ]]; then
+        local answer=""
+        read -r -p "Type UPLOAD to publish these ${#uploads[@]} assets to $tag: " answer
+        if [[ "$answer" != "UPLOAD" ]]; then
+            echo "Not uploaded; nothing was copied to --output-dir (the staging copies are removed on exit)."
+            return 1
+        fi
+    fi
+    # 5. Immediately before the upload: every check again on the staging copies, then the
+    # publication list from those same bytes (+ root fingerprint).
+    isolation_verify_staged "$staging" "$pin" "$legacy_public" "$migration_bundle" || return 1
     for index in "${!uploads[@]}"; do
         hashes+=("$(isolation_sha256 "${uploads[$index]}")")
     done
@@ -1522,21 +1695,10 @@ print(pin)' "$pin_file" "$snapshot/scripts/package-linux-release.py")"
         done
         printf '%s  %s\n' "$pin" "root.json"
     } > "$sums_file"
-    echo ""
-    echo "Assets for GitHub release $tag:"
-    for index in "${!uploads[@]}"; do
-        printf '  %s\n' "${uploads[$index]##*/}"
-    done
     if [[ "$upload" == "0" ]]; then
-        echo "--no-upload: nothing uploaded; every output stays in $output_dir."
+        echo "--no-upload: nothing uploaded."
     else
-        # 6. Upload exactly the recorded bytes, never replacing an asset, then read back.
-        local answer=""
-        read -r -p "Type UPLOAD to publish these ${#uploads[@]} assets to $tag: " answer
-        if [[ "$answer" != "UPLOAD" ]]; then
-            echo "Not uploaded; every output stays in $output_dir."
-            return 1
-        fi
+        # 6. Upload exactly the verified, recorded bytes, never replacing an asset, then read back.
         for index in "${!uploads[@]}"; do
             if [[ "$(isolation_sha256 "${uploads[$index]}")" != "${hashes[$index]}" ]]; then
                 isolation_fail "${uploads[$index]##*/} changed after it was recorded"; return 1
@@ -1554,11 +1716,20 @@ print(pin)' "$pin_file" "$snapshot/scripts/package-linux-release.py")"
         done
         echo "Uploaded and read back ${#uploads[@]} assets."
     fi
+    sums_hash="$(isolation_sha256 "$sums_file")"
     echo ""
-    echo "SHA256SUMS-isolation.txt (sha256 $(isolation_sha256 "$sums_file")):"
+    echo "SHA256SUMS-isolation.txt (sha256 $sums_hash):"
     while IFS= read -r line || [[ -n "$line" ]]; do printf '%s\n' "$line"; done < "$sums_file"
     echo "[external gate] Publish this list on the website AND the licensed console only after"
     echo "owner confirmation; both must show identical values (design §8 step 1)."
+    # 7. Only now (after upload + read-back, or the final verification with --no-upload): a
+    # convenience copy into --output-dir, each file checked against the staged/uploaded digest.
+    for index in "${!uploads[@]}"; do
+        copies+=("${uploads[$index]##*/}=${hashes[$index]}")
+    done
+    copies+=("SHA256SUMS-isolation.txt=$sums_hash")
+    isolation_copy_results "$staging" "$output_dir" "${copies[@]}" || return 1
+    echo "Copied ${#copies[@]} files into $output_dir (directory 0700, files 0600, SHA-256 checked)."
 }
 
 # --- Arg parsing / sub-commands ---

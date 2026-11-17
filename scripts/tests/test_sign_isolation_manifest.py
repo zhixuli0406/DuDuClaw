@@ -635,6 +635,35 @@ class ManifestSigningTests(unittest.TestCase):
             self.assertEqual(valid.returncode, 0, valid.stderr)
             self.assertIn("the manifest signature verified", valid.stdout)
             self.assertIn("requires --root-metadata", check().stderr)
+            # --artifacts-dir: every bound artifact, under the packager's published name, must have
+            # exactly the signed digest and size (scripts/release.sh, right before the upload).
+            published = directory / "published"
+            published.mkdir()
+            manifest = published / "isolated-linux-x86_64-manifest.json"
+            shutil.copyfile(output, manifest)
+            shutil.copyfile(str(output) + ".signatures.json", str(manifest) + ".signatures.json")
+            shutil.copyfile(directory / "artifacts/a", published / "isolated-linux-x86_64-a")
+
+            def check_published(path=manifest):
+                return subprocess.run([sys.executable, "-I", str(SCRIPT), "--kind", "release", "--check-target",
+                                       str(path), "--artifacts-dir", str(published), "--ssh-keygen", SSH_KEYGEN,
+                                       *pinned], capture_output=True, text=True)
+            result = check_published()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("every bound artifact has the signed digest and size", result.stdout)
+            (published / "isolated-linux-x86_64-a").write_bytes(b"\x7fELF-placeholdeR")  # same size
+            result = check_published()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("differs from the digest or size the signed manifest states", result.stderr)
+            (published / "isolated-linux-x86_64-a").write_bytes(b"\x7fELF-placeholder!")
+            self.assertNotEqual(check_published().returncode, 0)
+            (published / "isolated-linux-x86_64-a").unlink()
+            (published / "isolated-linux-x86_64-a").symlink_to(directory / "artifacts/a")
+            self.assertNotEqual(check_published().returncode, 0)  # never followed
+            (published / "isolated-linux-x86_64-a").unlink()
+            self.assertNotEqual(check_published().returncode, 0)
+            self.assertIn("named <prefix>manifest.json",
+                          check_published(output).stderr)
             # A valid signature of another key over the very same bytes is refused.
             other, other_output = self.sign_release_manifest(directory, "other", r1)
             self.assertEqual(other.returncode, 0, other.stderr)
@@ -736,6 +765,21 @@ class ManifestSigningTests(unittest.TestCase):
             root, output = self.signed_bundle(directory, keys, [*keys, generate_key(directory, "r3")])
             valid = self.check(output, root, "--ssh-keygen", SSH_KEYGEN)
             self.assertEqual(valid.returncode, 0, valid.stderr)
+            # --bundle: the tar must be exactly the authorized one (scripts/release.sh, before the upload).
+            tar = Path(str(output)[:-len(".authorization.json")])
+            result = self.check(output, root, "--bundle", str(tar), "--ssh-keygen", SSH_KEYGEN)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("the bundle is the authorized one", result.stdout)
+            tar.write_bytes(b"\0" * 2047 + b"\1")
+            result = self.check(output, root, "--bundle", str(tar), "--ssh-keygen", SSH_KEYGEN)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("the bundle differs from the digest, size, version or architecture", result.stderr)
+            tar.write_bytes(b"\0" * 2048)
+            renamed = directory / "duduclaw-isolated-linux-aarch64-1.83.0.tar"
+            shutil.copyfile(tar, renamed)
+            result = self.check(output, root, "--bundle", str(renamed), "--ssh-keygen", SSH_KEYGEN)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("the bundle differs", result.stderr)
             signatures = json.loads(Path(str(output) + ".signatures.json").read_text())
 
             def check_with(armors):

@@ -64,7 +64,8 @@ file listing only the root key with that key id (principal = key id); with
 --test-signer, `<test signer> verify`, which runs the crate's production verifier.
 Otherwise nothing is written. Distinct paths, links or handles to one key are
 therefore one signer. --check-threshold re-runs exactly this check on written
-files (scripts/release.sh does so before uploading).
+files (scripts/release.sh does so before uploading); for --kind bundle, --bundle
+<tar> also requires the tar to be exactly the authorized one (name, digest, size).
 
 Target key (--kind release / runtime with --root-metadata, optionally pinned by
 --root-sha256): after signing and before any output is written, the single
@@ -72,7 +73,10 @@ signature must be made by the root metadata's target_key (key id from the
 embedded public key, not revoked), have the shape the Rust verifier accepts and
 VERIFY with `ssh-keygen -Y verify` against an allowed-signers file listing only
 that key (TEST: `<test signer> verify`). A wrong but valid key therefore writes
-nothing. --check-target <manifest> re-runs this check on written files.
+nothing. --check-target <manifest> re-runs this check on written files; with
+--artifacts-dir <dir> every artifact the manifest binds must be <dir>/<prefix><id>
+(prefix: the manifest file name without "manifest.json") with exactly the signed
+digest and size (the signing-time binding, recomputed).
 """
 import argparse
 import base64
@@ -159,7 +163,9 @@ def canonical_bytes(document):
                       separators=(",", ":"), allow_nan=False).encode("utf-8")
 
 
-def bind_artifacts(document, directory):
+def bind_artifacts(document, directory, prefix=""):
+    """Binds each artifact's SHA-256 and size from <directory>/<prefix><id> (signing: no prefix;
+    check_bound_artifacts: the packager's published names)."""
     artifacts = document.get("artifacts")
     if not isinstance(artifacts, list) or not 1 <= len(artifacts) <= 128:
         raise ValueError("expected 1 to 128 artifacts")
@@ -179,7 +185,7 @@ def bind_artifacts(document, directory):
         mode = artifact["mode"]
         if not isinstance(mode, int) or isinstance(mode, bool) or mode & ~0o755 or not mode & 0o400:
             raise ValueError("invalid artifact mode")
-        fd = os.open(directory / artifact_id, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(directory / (prefix + artifact_id), os.O_RDONLY | os.O_NOFOLLOW)
         with os.fdopen(fd, "rb") as source:
             before = os.fstat(source.fileno())
             if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size == 0:
@@ -820,15 +826,39 @@ def read_root_metadata(path, expected_sha256=None):
     return raw
 
 
+def check_bound_artifacts(manifest_path, document, directory):
+    """--check-target --artifacts-dir: every artifact the signed manifest binds is
+    <directory>/<prefix><id> (prefix: the manifest file name without "manifest.json", the names
+    the packager publishes) with exactly the digest and size the manifest states. The binding is
+    recomputed by bind_artifacts, the signing-time code, and must give the signed bytes."""
+    name = Path(manifest_path).name
+    if not name.endswith("manifest.json"):
+        raise ValueError("--artifacts-dir needs a manifest named <prefix>manifest.json")
+    rebound = json.loads(document, object_pairs_hook=unique_object, parse_float=reject_number,
+                         parse_constant=reject_number)
+    try:
+        if not isinstance(rebound, dict):
+            raise TypeError("not an object")
+        bind_artifacts(rebound, Path(directory), name[:-len("manifest.json")])
+    except (KeyError, TypeError, AttributeError) as error:
+        raise ValueError("malformed artifact list in the manifest") from error
+    if canonical_bytes(rebound) != document:
+        raise ValueError("an artifact differs from the digest or size the signed manifest states")
+
+
 def check_written_threshold(parser, args):
-    """--check-threshold: verify a written document + signatures; never signs or writes."""
+    """--check-threshold: verify a written document + signatures; never signs or writes. With
+    --kind bundle and --bundle, the tar must also be exactly the one authorized (bundle_authorization:
+    name, digest and size)."""
     if args.kind not in THRESHOLD_KINDS:
         parser.error("--check-threshold applies to --kind root or --kind bundle")
     if any(value is not None for value in (args.output, args.key, args.key_count, args.template, args.artifacts_dir,
-                                           args.bundle, args.expires_at_unix, args.minisign_sign,
+                                           args.expires_at_unix, args.minisign_sign,
                                            args.trusted_comment, args.ssh_sk_helper, args.check_target)):
-        parser.error("--check-threshold takes only --kind, --signatures, --root-metadata, --root-sha256 and the "
-                     "verifier (--ssh-keygen, or --test-signer for TEST signatures)")
+        parser.error("--check-threshold takes only --kind, --signatures, --root-metadata, --root-sha256, --bundle "
+                     "(--kind bundle) and the verifier (--ssh-keygen, or --test-signer for TEST signatures)")
+    if args.bundle is not None and args.kind != "bundle":
+        parser.error("--check-threshold --bundle applies to --kind bundle")
     try:
         document = read_bounded(args.check_threshold, MAX_METADATA_BYTES)
         signatures = json.loads(read_bounded(args.signatures or Path(str(args.check_threshold) + ".signatures.json"),
@@ -848,21 +878,29 @@ def check_written_threshold(parser, args):
         verify = (isolation_test_signer_verifier(args.test_signer, root_bytes, args.kind)
                   if args.test_signer is not None else ssh_keygen_verifier(args.ssh_keygen))
         signers = check_root_threshold(signatures, root_bytes, NAMESPACES[args.kind], document, verify)
+        if args.bundle is not None:
+            expires = parsed.get("expires_at_unix") if isinstance(parsed, dict) else None
+            if canonical_bytes(bundle_authorization(args.bundle, expires)) != document:
+                raise ValueError("the bundle differs from the digest, size, version or architecture its "
+                                 "authorization states")
     except (OSError, ValueError) as error:
         parser.error(str(error))
-    print(f"root threshold met by {len(signers)} distinct root keys; every signature verified")
+    print(f"root threshold met by {len(signers)} distinct root keys; every signature verified"
+          + ("; the bundle is the authorized one" if args.bundle is not None else ""))
 
 
 def check_written_target(parser, args):
     """--check-target: verify a written release/runtime manifest and its signature against the
-    target key of --root-metadata (scripts/release.sh, before the upload list); never signs."""
+    target key of --root-metadata (scripts/release.sh, before the upload list and again right
+    before the upload); never signs. With --artifacts-dir, also every bound artifact
+    (check_bound_artifacts)."""
     if args.kind not in TARGET_KINDS:
         parser.error("--check-target applies to --kind release or --kind runtime")
-    if any(value is not None for value in (args.output, args.key, args.key_count, args.template, args.artifacts_dir,
+    if any(value is not None for value in (args.output, args.key, args.key_count, args.template,
                                            args.bundle, args.expires_at_unix, args.minisign_sign,
                                            args.trusted_comment, args.ssh_sk_helper, args.check_threshold)):
-        parser.error("--check-target takes only --kind, --signatures, --root-metadata, --root-sha256 and the "
-                     "verifier (--ssh-keygen, or --test-signer for TEST signatures)")
+        parser.error("--check-target takes only --kind, --signatures, --root-metadata, --root-sha256, "
+                     "--artifacts-dir and the verifier (--ssh-keygen, or --test-signer for TEST signatures)")
     if args.root_metadata is None:
         parser.error("--check-target requires --root-metadata (the pinned root.json naming the target key)")
     try:
@@ -877,9 +915,12 @@ def check_written_target(parser, args):
         verify = (isolation_test_signer_verifier(args.test_signer, root_bytes, args.kind)
                   if args.test_signer is not None else ssh_keygen_verifier(args.ssh_keygen))
         key_id = check_target_signature(signatures, root_bytes, NAMESPACES[args.kind], document, verify)
+        if args.artifacts_dir is not None:
+            check_bound_artifacts(args.check_target, document, args.artifacts_dir)
     except (OSError, ValueError) as error:
         parser.error(str(error))
-    print(f"target key {key_id}: the manifest signature verified")
+    print(f"target key {key_id}: the manifest signature verified"
+          + ("; every bound artifact has the signed digest and size" if args.artifacts_dir is not None else ""))
 
 
 def minisign_sign(parser, args):

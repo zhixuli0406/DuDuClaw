@@ -297,7 +297,10 @@ class IsolationSignTests(unittest.TestCase):
                        "ssh-keygen -Y verify", "NEVER environment variables", "DUDUCLAW_ISOLATION_*KEY*",
                        "Usage: scripts/isolation-sign", LAUNCHER_SHEBANG, "never through sudo",
                        "never as bash scripts/release.sh isolation-sign", "as a CHILD process", "ssh-sk-helper",
-                       "SSH_SK_HELPER", "copied ONCE", "target_key of the pinned root"):
+                       "SSH_SK_HELPER", "copied ONCE", "target_key of the pinned root",
+                       "--output-dir is NOT where the ceremony works", "COPIED into --output-dir",
+                       "private staging directory", "neither a symbolic link nor group/other-writable",
+                       "immediately before the", "A failed copy never affects what was uploaded"):
             self.assertIn(needle, result.stdout)
         usage = subprocess.run([BASH, str(RELEASE)], cwd=ROOT, capture_output=True, text=True)
         self.assertIn("scripts/isolation-sign --help", usage.stdout)
@@ -1177,9 +1180,9 @@ class IsolationSignTests(unittest.TestCase):
         self.assertIn('--signing-key-stdin "${signing_tools[@]}" --target-root "$root_metadata" '
                       '--target-root-sha256 "$pin"', body)
         handoff = body.index('isolation_handoff 1 "$target_key"')
-        check = body.index('--kind release --check-target "$output_dir/isolated-linux-$arch-manifest.json" '
+        check = body.index('--kind release --check-target "$staging/isolated-linux-$arch-manifest.json" '
                            '--root-metadata "$root_metadata" --root-sha256 "$pin" --ssh-keygen "$ssh_keygen"')
-        delete = body.index('isolation_run "$ISOLATION_TOOL_RM" -rf -- "$output_dir/isolated-linux-$arch-"*')
+        delete = body.index('isolation_run "$ISOLATION_TOOL_RM" -rf -- "$staging/isolated-linux-$arch-"*')
         self.assertLess(handoff, check)
         self.assertLess(check, delete)
         self.assertLess(delete, body.index("uploads+="))
@@ -1206,6 +1209,202 @@ class IsolationSignTests(unittest.TestCase):
             self.assertIn(needle, after)
             self.assertNotIn(needle, before)
         self.assertLess(body.index('isolation_check_repository "$tag"'), copy)
+
+    # ---------------------------------------------------------------- --output-dir: private staging, copy last
+
+    def output_section(self, command):
+        return run_section(f'ISOLATION_TOOL_ENV="{system_tool("env")}" ISOLATION_TOOL_PYTHON="{sys.executable}"\n'
+                           + command)
+
+    def refused_output_parents(self, base):
+        """(case, --output-dir, message) for each parent the rule refuses: group/world-writable (also
+        sticky), a symlink, missing, and (unless root) a directory that is not yours."""
+        mine = "owned by you that is not group/other-writable"
+        cases = []
+        for name, mode in (("group-writable", 0o770), ("world-writable", 0o777), ("sticky-world-writable", 0o1777)):
+            directory = base / name
+            directory.mkdir()
+            directory.chmod(mode)
+            cases.append((name, directory / "out", mine))
+        real = base / "real-parent"
+        real.mkdir(mode=0o700)
+        (base / "link-parent").symlink_to(real)
+        cases.append(("symlink", base / "link-parent" / "out", "its parent directory is a symbolic link"))
+        cases.append(("missing", base / "missing-parent" / "out", "its parent directory does not exist"))
+        if os.geteuid() != 0:
+            cases.append(("not yours", Path("/usr") / f"duduclaw-isolation-test-out-{os.getpid()}", mine))
+        return cases
+
+    def test_output_dir_parent_must_be_yours_and_not_writable_by_others(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            for case, output, message in self.refused_output_parents(base):
+                with self.subTest(case=case):
+                    result = self.output_section(f'isolation_check_output_dir "{output}"\n')
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(message, result.stderr)
+                    self.assertFalse(os.path.lexists(output))
+            # An existing --output-dir (also a dangling link) is refused as before.
+            existing = base / "real-parent" / "existing"
+            existing.mkdir()
+            dangling = base / "real-parent" / "dangling"
+            dangling.symlink_to(base / "nowhere")
+            for output in (existing, dangling):
+                result = self.output_section(f'isolation_check_output_dir "{output}"\n')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("--output-dir must not exist yet", result.stderr)
+            result = self.output_section(f'isolation_check_output_dir "{base / "real-parent" / ".." / "x"}"\n')
+            self.assertNotEqual(result.returncode, 0)
+            # A new directory under a parent of yours that only you can write: accepted, not created.
+            result = self.output_section(f'isolation_check_output_dir "{base / "real-parent" / "out"}"\n')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse((base / "real-parent" / "out").exists())
+
+    def test_copy_into_output_dir_is_exclusive_private_and_digest_checked(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            staging = base / "staging"
+            staging.mkdir(mode=0o700)
+            files = {"isolated-linux-x86_64-manifest.json": b"{}", "duduclaw-bootstrap-linux-x86_64": b"\x7fELF",
+                     "SHA256SUMS-isolation.txt": b"sums\n"}
+            for name, data in files.items():
+                (staging / name).write_bytes(data)
+            (staging / "duduclaw-bootstrap-linux-x86_64").chmod(0o755)
+            entries = [f"{name}={hashlib.sha256(data).hexdigest()}" for name, data in files.items()]
+            parent = base / "parent"
+            parent.mkdir(mode=0o700)
+
+            def copy(output, items):
+                return self.output_section(f'isolation_copy_results "{staging}" "{output}" '
+                                           + " ".join(f'"{item}"' for item in items) + "\n")
+            result = copy(parent / "out", entries)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output = parent / "out"
+            self.assertEqual(stat.S_IMODE(output.lstat().st_mode), 0o700)
+            self.assertEqual(sorted(path.name for path in output.iterdir()), sorted(files))
+            for name, data in files.items():
+                self.assertEqual(stat.S_IMODE((output / name).lstat().st_mode), 0o600, name)
+                self.assertEqual((output / name).read_bytes(), data)
+            # Never into an existing directory.
+            result = copy(output, entries)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("must not exist yet", result.stderr)
+            self.assertIn("NOT copied into --output-dir", result.stderr)
+            # Staged bytes that are not the recorded (uploaded) digest are refused and reported.
+            result = copy(parent / "mismatch", [*entries[:-1], "SHA256SUMS-isolation.txt=" + "0" * 64])
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("is not the uploaded/verified bytes", result.stderr)
+            self.assertIn("nothing of the upload or its read-back depends on that copy", result.stderr)
+            # A staged file that became a link is never followed.
+            (staging / "SHA256SUMS-isolation.txt").unlink()
+            (staging / "SHA256SUMS-isolation.txt").symlink_to(base / "elsewhere")
+            (base / "elsewhere").write_bytes(b"sums\n")
+            result = copy(parent / "linked", entries)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("NOT copied into --output-dir", result.stderr)
+            (staging / "SHA256SUMS-isolation.txt").unlink()
+            (staging / "SHA256SUMS-isolation.txt").write_bytes(b"sums\n")
+            # The parent is checked again right before the copy.
+            late = base / "late"
+            late.mkdir(mode=0o700)
+            for case, target, message in self.refused_output_parents(late):
+                with self.subTest(case=case):
+                    result = copy(target, entries)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(message, result.stderr)
+                    self.assertFalse(os.path.lexists(target))
+
+    def test_everything_from_signing_to_upload_uses_only_the_private_staging_directory(self):
+        body = re.sub(r"\\\n\s*", "", isolation_function())
+        verify = re.sub(r"\\\n\s*", "", shell_function("isolation_verify_staged"))
+        self.assertIn('local staging="$ISOLATION_WORK/staging"', body)
+        self.assertIn('isolation_run "$ISOLATION_TOOL_MKDIR" -m 0700 -- "$staging"', body)
+        prompt = body.index('isolation_key_location "target key handle"')
+        copy = body.index('isolation_copy_results "$staging" "$output_dir" "${copies[@]}" || return 1')
+        # --output-dir: the early check (before --preflight ends and before any prompt), then only the copy.
+        early = body.index('isolation_check_output_dir "$output_dir" || return 1')
+        self.assertLess(early, body.index('if [[ "$ISOLATION_PREFLIGHT" == "1" ]]; then'))
+        self.assertLess(early, prompt)
+        uses = [match.start() for match in re.finditer(r"\$\{?output_dir\b", body)]
+        self.assertEqual([use for use in uses if early + 40 < use < copy], [])
+        self.assertNotIn("output_dir", verify)
+        # Every path a helper or tool is given from the first prompt to the copy (and in the
+        # pre-upload re-verification) lies in the private staging or work directory.
+        flags = (r"(--output-dir|--from-release-archive|--extract-bootstrap|--check-target|--artifacts-dir|--bundle"
+                 r"|--migration-bundle-from|--minisign-sign|--output|--dir|-m|-x) \"([^\"]*)\"")
+        paths = re.findall(flags, body[prompt:copy] + "\n" + verify)
+        self.assertGreaterEqual(len(paths), 20)
+        for flag, path in paths:
+            self.assertTrue(path.startswith(("$staging", "$ISOLATION_WORK/", "$authorization")), (flag, path))
+        self.assertIn('local authorization="$staging/$bundle_name.authorization.json"', body)
+        self.assertIn('local sums_file="$staging/SHA256SUMS-isolation.txt"', body)
+        for entry in re.findall(r"uploads\+=\(([^)]*)\)", body):
+            for path in re.findall(r'"([^"]*)"', entry):
+                self.assertTrue(path.startswith(("$staging/", "$asset")), path)
+        self.assertIn('for asset in "$staging/isolated-linux-$arch-"*; do', body)
+        # Deletion on failure touches only the staging directory.
+        deletions = re.findall(r'"\$ISOLATION_TOOL_RM" -r?f -- "([^"]*)"', body)
+        self.assertEqual(len(deletions), 2)
+        for path in deletions:
+            self.assertTrue(path.startswith(("$staging/", "$authorization")), path)
+        # Order: UPLOAD answer, re-verification of the staged bytes, hashes and sums from them,
+        # re-hash, upload, read-back, and only then the copy (also after --no-upload's verification).
+        answer = body.index('if [[ "$answer" != "UPLOAD" ]]; then')
+        reverify = body.index('isolation_verify_staged "$staging" "$pin" "$legacy_public" "$migration_bundle" '
+                              '|| return 1')
+        hashed = body.index('hashes+=("$(isolation_sha256 "${uploads[$index]}")")')
+        sums = body.index('} > "$sums_file"')
+        rehash = body.index("changed after it was recorded")
+        upload = body.index('isolation_run "$ISOLATION_TOOL_GH" release upload "$tag"')
+        readback = body.index("differs from the signed bytes")
+        for earlier, later in ((answer, reverify), (reverify, hashed), (hashed, sums), (sums, rehash),
+                               (rehash, upload), (upload, readback), (readback, copy),
+                               (body.index("--no-upload: nothing uploaded."), copy)):
+            self.assertLess(earlier, later)
+        self.assertEqual(body.count("isolation_verify_staged"), 1)
+        self.assertEqual(body.count("isolation_copy_results"), 1)
+        self.assertIn('copies+=("${uploads[$index]##*/}=${hashes[$index]}")', body)
+        # The re-verification is the signer's own: target key + every bound digest/size, root
+        # threshold + the authorized tar, and the legacy minisign signature, all on staged paths.
+        for needle in ('--kind release --check-target "$staging/isolated-linux-$arch-manifest.json" '
+                       '--artifacts-dir "$staging" --root-metadata "$root_metadata" --root-sha256 "$pin"',
+                       '--kind bundle --check-threshold "$staging/$bundle_name.authorization.json" '
+                       '--bundle "$staging/$bundle_name" --root-metadata "$root_metadata" --root-sha256 "$pin"',
+                       '-m "$staging/$bundle_name" -x "$staging/$bundle_name.minisig"'):
+            self.assertIn(needle, verify)
+        self.assertIn('root_metadata="$ISOLATION_WORK/root/root.json"', verify)
+        signer = SIGNER.read_text()
+        self.assertIn("bind_artifacts(rebound, Path(directory), name[:-len(\"manifest.json\")])", signer)
+        self.assertIn("canonical_bytes(bundle_authorization(args.bundle, expires)) != document", signer)
+        # The copy: exclusive, never through a link, explicit modes, digests checked.
+        program = python_constant("ISOLATION_OUTPUT_PY")
+        for needle in ("os.O_NOFOLLOW", "os.O_EXCL", "os.mkdir(name, 0o700, dir_fd=parent_fd)",
+                       "os.fchmod(out_fd, 0o700)", "os.fchmod(target_fd, 0o600)", "staged.hexdigest() != expected",
+                       "digest_of(copy_fd) != expected", "info.st_uid != uid or info.st_mode & 0o022"):
+            self.assertIn(needle, program)
+        self.assertIn('copy "$output_dir" "$staging" "$@"', shell_function("isolation_copy_results"))
+
+    @unittest.skipUnless(CEREMONY_TOOLS, "needs env, bash, git, python3 (3.9+), ssh-keygen in system/Homebrew dirs")
+    def test_end_to_end_output_parent_is_refused_before_any_prompt(self):
+        # --preflight: should the refusal ever regress, the run still ends before any key prompt.
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            repo, root, signatures, git_marker = self.ceremony_repository(base)
+            for case, output, message in self.refused_output_parents(base):
+                with self.subTest(case=case):
+                    result, marker, leftovers = self.run_ceremony(repo, base, "--root-metadata", str(root),
+                                                                "--root-signatures", str(signatures),
+                                                                "--output-dir", str(output), "--preflight")
+                    report = result.stdout + result.stderr
+                    self.assertNotEqual(result.returncode, 0, report)
+                    self.assertIn("root threshold met by 2 distinct root keys", result.stdout, report)
+                    self.assertIn(message, result.stderr, report)
+                    self.assertNotIn("Preflight passed", result.stdout, report)
+                    self.assertNotIn("no terminal for", result.stderr, report)
+                    self.assertFalse(os.path.lexists(output))
+                    self.assertFalse(marker.exists(), marker.read_text() if marker.exists() else "")
+                    self.assertEqual(leftovers, set())
+            self.assertFalse(git_marker.exists(), git_marker.read_text() if git_marker.exists() else "")
 
     # ---------------------------------------------------------------- R2-2: the docker probe
 

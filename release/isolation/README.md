@@ -47,6 +47,18 @@ variable of the calling shell reaches the ceremony; `scripts/release.sh
 isolation-sign` refuses to run unless that launcher started it. The shell you
 type the command into is still trusted: it chooses which file is started.
 
+`--output-dir` is not where the ceremony works. Every asset is produced, signed,
+verified, hashed and uploaded from a private staging directory inside the
+ceremony's own 0700 work directory (removed on every exit; a failure deletes only
+there), and everything is verified again on those staged bytes immediately before
+the upload. Only at the very end — after the upload and its read-back, or with
+`--no-upload` after that final verification — the results and
+`SHA256SUMS-isolation.txt` are copied into `--output-dir` as a convenience. It must
+not exist yet, and its parent must be an existing directory owned by you that is
+neither a symbolic link nor group/other-writable (checked before any prompt and
+again right before the copy). It is created 0700, each file 0600, and each copy is
+checked against the staged SHA-256. A failed copy never affects what was uploaded.
+
 ## Test keys
 
 Implementation and VM acceptance use the TEST key set of
