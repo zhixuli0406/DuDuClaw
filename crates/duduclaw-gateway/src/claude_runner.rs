@@ -387,6 +387,8 @@ impl Default for DispatchOverrides {
 /// byte-identical to before this type existed.
 #[derive(Debug, Clone, Copy, Default)]
 struct SpawnIdentity<'a> {
+    /// Only positively identified employee work may raise the utility budget.
+    work_turn: bool,
     /// Directory whose `agent.toml` supplies identity-scoped config —
     /// `[model] effort`, `[capabilities] scoped_tools` grants, minimal-context
     /// resolution. Falls back to `work_dir`.
@@ -991,6 +993,9 @@ async fn call_claude_for_agent_impl(
     // overridden cwd never silently swaps the member's `[model] effort`,
     // scoped-tool grants or minimal-context setting for the employee's.
     let spawn_identity = SpawnIdentity {
+        work_turn: matches!(request_type, crate::cost_telemetry::RequestType::Chat
+            | crate::cost_telemetry::RequestType::Cron | crate::cost_telemetry::RequestType::Dispatch)
+            && !crate::runtime_dispatch::in_utility_call(),
         config_dir: work_dir_override.as_ref().map(|_| agent_dir.as_path()),
         mcp_config: overrides.mcp_config_path.as_deref(),
     };
@@ -4552,7 +4557,10 @@ fn prepare_claude_cmd(
     // Identity-scoped config directory. Defaults to the cwd — which IS the
     // agent directory for every caller but a team role member.
     let config_dir = identity.config_dir.or(work_dir);
-    let max_turns = duduclaw_core::turn_limits::max_turns(home_dir, config_dir);
+    let resolved = duduclaw_core::turn_limits::max_turns(home_dir, config_dir);
+    let max_turns = if identity.work_turn { resolved } else {
+        resolved.min(duduclaw_core::turn_limits::DEFAULT_MAX_TURNS)
+    };
     let budget_prompt = duduclaw_core::turn_limits::budget_prompt(system_prompt, max_turns);
     let system_prompt = budget_prompt.as_str();
     let git_env_granted = duduclaw_core::apply_agent_cli_env_allowlist_for(&mut cmd, capabilities);
@@ -4941,6 +4949,7 @@ mod role_cache_ttl_tests {
                 tmp.path(),
                 None,
                 SpawnIdentity {
+                    work_turn: false,
                     config_dir,
                     mcp_config: None,
                 },
@@ -4987,7 +4996,7 @@ mod rm166_identity_env_tests {
             None,
             home,
             None,
-            SpawnIdentity { config_dir, mcp_config: None },
+            SpawnIdentity { work_turn: false, config_dir, mcp_config: None },
         )
         .unwrap()
         .0
@@ -5111,6 +5120,8 @@ async fn call_claude_with_env(
             return Err(protected_claude_options_refusal());
         }
         let agent_dir = identity.config_dir.or(work_dir).ok_or_else(protected_claude_options_refusal)?;
+        // The root-owned plan always enforces `--max-turns 50` (it carries no
+        // range yet): the prompt sentence and the classification must say 50.
         let system_prompt = duduclaw_core::turn_limits::budget_prompt(system_prompt, 50)
             .replace(crate::direct_api::CACHE_SPLIT_MARKER, "");
         let mut marker = tokio::process::Command::new("root-selected-claude");
@@ -6663,6 +6674,21 @@ mod process_tree_cancellation_tests {
 mod turn_budget_tests {
     use super::*;
     #[test]
+    fn utility_budget_caps_raised_limits_and_preserves_lower_limits() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("agents/anna");
+        std::fs::create_dir_all(&dir).unwrap();
+        for (configured, applied) in [(120, 50), (30, 30)] {
+            std::fs::write(dir.join("agent.toml"), format!("[runtime]\nmax_turns={configured}\n")).unwrap();
+            let (cmd, guards) = prepare_claude_cmd("claude", "hi", "m", "stable", None, Some(&dir),
+                home.path(), None, SpawnIdentity::default()).unwrap();
+            let args = duduclaw_core::execution_gate::command_snapshot(&cmd).argv;
+            assert!(args.windows(2).any(|w| w[0] == "--max-turns" && w[1] == applied.to_string().as_str()));
+            let text = std::fs::read_to_string(guards.prompt.as_ref().unwrap()).unwrap();
+            assert!(text.contains(&format!("Step budget for this turn: {applied}")));
+        }
+    }
+    #[test]
     fn dispatch_resolves_steps_and_blocks_questions_for_both_context_modes() {
         let home = tempfile::tempdir().unwrap();
         let dir = home.path().join("agents/anna");
@@ -6670,7 +6696,7 @@ mod turn_budget_tests {
         for minimal in [true, false] {
             std::fs::write(dir.join("agent.toml"), format!("[runtime]\nmax_turns=88\nminimal_context={minimal}\n")).unwrap();
             let (cmd, guards) = prepare_claude_cmd("claude", "hi", "m", "stable", None, None,
-                home.path(), None, SpawnIdentity { config_dir: Some(&dir), mcp_config: None }).unwrap();
+                home.path(), None, SpawnIdentity { work_turn: true, config_dir: Some(&dir), mcp_config: None }).unwrap();
             let args = duduclaw_core::execution_gate::command_snapshot(&cmd).argv;
             assert!(args.windows(2).any(|w| w[0] == "--max-turns" && w[1] == "88"));
             assert!(args.windows(2).any(|w| w[0] == "--disallowedTools" && w[1].to_string_lossy().split(',').any(|t| t == "AskUserQuestion")));

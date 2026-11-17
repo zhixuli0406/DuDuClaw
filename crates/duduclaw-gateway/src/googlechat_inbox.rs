@@ -132,7 +132,7 @@ impl Inbox {
         // HTTP Google Chat is also supported on Windows. Reuse the shared
         // private SQLite opener there (including its documented home-ACL trust).
         #[cfg(not(unix))]
-        let conn = duduclaw_core::private_sqlite::open(home, "googlechat_inbox.db", duduclaw_core::private_sqlite::Access::Create)
+        let mut conn = duduclaw_core::private_sqlite::open(home, "googlechat_inbox.db", duduclaw_core::private_sqlite::Access::Create)
             .map_err(|_| "無法開啟 Google Chat 耐久收件匣")?
             .ok_or("無法開啟 Google Chat 耐久收件匣")?;
         // 64 MiB database ceiling (4 KiB pages); checkpoints bound WAL growth.

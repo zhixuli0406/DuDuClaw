@@ -529,7 +529,7 @@ impl OpenAiCompatRuntime {
             &provider,
             req,
             &guarded,
-            duduclaw_core::turn_limits::tool_loop_max_turns(&context.home_dir, context.agent_dir.as_deref()),
+            duduclaw_core::turn_limits::tool_loop_max_turns(&context.home_dir, context.agent_dir.as_deref()).min(if crate::runtime_dispatch::allows_employee_step_budget() { usize::MAX } else { 50 }),
             duduclaw_llm::ProvenanceConfig::default(),
             interceptor,
             crate::ccr_runtime::for_agent(&context.home_dir, &context.agent_id),

@@ -464,6 +464,19 @@ tokio::task_local! {
     static RUNTIME_USAGE_REQUEST_TYPE: RequestType;
 }
 
+/// Evolution keeps tools where authorized, but never inherits a raised work budget.
+/// Fail closed: without a positively identified work request type, the cap applies.
+pub(crate) fn allows_employee_step_budget() -> bool {
+    !in_utility_call() && RUNTIME_USAGE_REQUEST_TYPE.try_with(|kind| matches!(kind,
+        RequestType::Chat | RequestType::Cron | RequestType::Dispatch)).unwrap_or(false)
+}
+
+/// Classify a work turn that reaches a runtime without [`run_agent_prompt`]
+/// (the direct channel-reply Claude CLI path), so it keeps the employee budget.
+pub(crate) async fn with_work_request_type<F: std::future::Future>(kind: RequestType, future: F) -> F::Output {
+    RUNTIME_USAGE_REQUEST_TYPE.scope(kind, future).await
+}
+
 pub(crate) fn allows_partial_reply() -> bool {
     !in_utility_call() && CHANNEL_REPLY_PARTIAL.try_with(|_| ()).is_ok()
 }

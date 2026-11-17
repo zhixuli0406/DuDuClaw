@@ -98,16 +98,29 @@ fn child(home: std::path::PathBuf) {
             std::fs::write(dir.join("agent.toml"), format!("[runtime]\nminimal_context={minimal}\nmax_turns=73\n")).unwrap();
             let capture = Arc::new(Mutex::new(None));
             let caps = crate::night_llm::night_capabilities();
-            let error = COMMAND_CAPTURE.scope(capture.clone(), spawn_claude_cli_with_env(
+            // The raised budget needs a positively identified work turn (fail closed).
+            let error = COMMAND_CAPTURE.scope(capture.clone(), crate::runtime_dispatch::with_work_request_type(
+                crate::cost_telemetry::RequestType::Chat, spawn_claude_cli_with_env(
                 "hi", "m", "stable", &home, Some(&dir), None, Some(&caps), &Default::default(),
-                None, None, crate::runtime_dispatch::SpawnPurpose::Utility,
-            )).await.unwrap_err();
+                None, None, crate::runtime_dispatch::SpawnPurpose::EmployeeTurn,
+            ))).await.unwrap_err();
             assert!(error.contains("captured"), "{error}");
             let cmd = capture.lock().unwrap().take().unwrap();
             let args = duduclaw_core::execution_gate::command_snapshot(&cmd).argv;
             assert!(args.windows(2).any(|w| w[0] == "--max-turns" && w[1] == "73"));
             assert!(args.windows(2).any(|w| w[0] == "--disallowedTools" && w[1].to_string_lossy().split(',').any(|t| t == "AskUserQuestion")));
         }
+        // No request-type scope ⇒ the raised budget is not granted.
+        let capture = Arc::new(Mutex::new(None));
+        let caps = crate::night_llm::night_capabilities();
+        let dir = home.join("agents/agnes");
+        let _ = COMMAND_CAPTURE.scope(capture.clone(), spawn_claude_cli_with_env(
+            "hi", "m", "stable", &home, Some(&dir), None, Some(&caps), &Default::default(),
+            None, None, crate::runtime_dispatch::SpawnPurpose::EmployeeTurn,
+        )).await.unwrap_err();
+        let cmd = capture.lock().unwrap().take().unwrap();
+        let args = duduclaw_core::execution_gate::command_snapshot(&cmd).argv;
+        assert!(args.windows(2).any(|w| w[0] == "--max-turns" && w[1] == "50"));
         assert_eq!(duduclaw_core::execution_gate::local_command_roundtrip(command).await.unwrap(), before,
             "channel argv, env removals and cwd survive LocalBackend registration unchanged");
 

@@ -98,7 +98,13 @@ pub(super) async fn spawn_claude_cli_with_env(
         None
     };
 
-    let max_turns = if protected { 50 } else { duduclaw_core::turn_limits::max_turns(home_dir, work_dir) };
+    // Protected mode: the root-owned plan always enforces `--max-turns 50`, so
+    // the prompt sentence and the max-turn classification state that value.
+    let max_turns = if protected { 50 } else {
+        let resolved = duduclaw_core::turn_limits::max_turns(home_dir, work_dir);
+        if purpose == crate::runtime_dispatch::SpawnPurpose::EmployeeTurn
+            && crate::runtime_dispatch::allows_employee_step_budget() { resolved } else { resolved.min(50) }
+    };
     let budget_prompt = duduclaw_core::turn_limits::budget_prompt(system_prompt, max_turns);
     let system_prompt = budget_prompt.as_str();
     let mut cmd = duduclaw_core::platform::async_command_for(&claude_path);

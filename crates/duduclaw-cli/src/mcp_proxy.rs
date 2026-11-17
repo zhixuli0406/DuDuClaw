@@ -168,11 +168,23 @@ pub fn tool_call_of(frame: &Value) -> Option<(Value, String, Value)> {
 /// Canonical bookkeeping key for a JSON-RPC id. JSON-RPC allows numbers and
 /// strings; both are kept distinct (`7` vs `"7"`) by prefixing the kind, so a
 /// server that answers string ids cannot collide with a client using numbers.
+/// Numbers are normalised by value: `1`, `1.0` and `-0.0`/`0` share a key, so
+/// a peer cannot dodge bookkeeping by re-spelling an id.
 pub fn id_key(id: &Value) -> Option<String> {
     match id {
-        Value::Number(n) => Some(format!("n:{n}")),
+        Value::Number(n) => Some(format!("n:{}", numeric_id_key(n))),
         Value::String(s) => Some(format!("s:{s}")),
         _ => None,
+    }
+}
+
+fn numeric_id_key(n: &serde_json::Number) -> String {
+    if let Some(i) = n.as_i64() { return i.to_string(); }
+    if let Some(u) = n.as_u64() { return u.to_string(); }
+    // Integral floats within f64's exact-integer range map to the integer key.
+    match n.as_f64() {
+        Some(f) if f.fract() == 0.0 && f.abs() <= 9_007_199_254_740_992.0 => (f as i64).to_string(),
+        _ => n.to_string(),
     }
 }
 
@@ -285,6 +297,67 @@ impl PendingCalls {
 
     pub fn len(&self) -> usize { self.inner.len() }
     pub fn is_empty(&self) -> bool { self.inner.is_empty() }
+}
+
+/// Longest serialized client request id the monitored proxy tracks.
+const MAX_TRACKED_ID_BYTES: usize = 256;
+const TRACK_REFUSED_FULL: &str = "等候中的請求已達上限，請稍後再試。";
+const TRACK_REFUSED_DUPLICATE: &str = "請求識別碼重複，請等候原請求結束後再試。";
+const TRACK_REFUSED_ID: &str = "請求識別碼無效或過長，已拒絕此請求。";
+
+/// Client requests still awaiting an answer, so a lost upstream fails exactly
+/// the unanswered ones. Keys are normalised [`id_key`]s; the stored value is
+/// the client's ORIGINAL id, echoed back verbatim. Bounded by
+/// [`MAX_PENDING_CALLS`]; a refused request is answered locally and never
+/// tears the session down.
+#[derive(Debug, Default)]
+struct RequestTracker {
+    live: HashMap<String, (Value, bool)>,
+    /// Local refusals of a duplicate id still on their way to the client:
+    /// each must not consume the live request's entry when it passes.
+    refusing: HashMap<String, usize>,
+}
+
+impl RequestTracker {
+    fn track(&mut self, id: &Value, initialize: bool) -> std::result::Result<(), &'static str> {
+        let key = id_key(id).ok_or(TRACK_REFUSED_ID)?;
+        if serde_json::to_string(id).map_or(true, |s| s.len() > MAX_TRACKED_ID_BYTES) {
+            return Err(TRACK_REFUSED_ID);
+        }
+        if self.live.contains_key(&key) {
+            if self.refusing.len() < MAX_PENDING_CALLS || self.refusing.contains_key(&key) {
+                *self.refusing.entry(key).or_default() += 1;
+            }
+            return Err(TRACK_REFUSED_DUPLICATE);
+        }
+        if self.live.len() >= MAX_PENDING_CALLS {
+            return Err(TRACK_REFUSED_FULL);
+        }
+        self.live.insert(key, (id.clone(), initialize));
+        Ok(())
+    }
+
+    /// A response passed to the client. `Some(initialize)` when it answered a
+    /// tracked request.
+    fn answered(&mut self, key: &str) -> Option<bool> {
+        if let Some(count) = self.refusing.get_mut(key) {
+            *count -= 1;
+            if *count == 0 { self.refusing.remove(key); }
+            return None;
+        }
+        self.live.remove(key).map(|(_, initialize)| initialize)
+    }
+
+    /// `notifications/cancelled`: the request may never be answered.
+    fn cancel(&mut self, request_id: &Value) {
+        if let Some(key) = id_key(request_id) { self.live.remove(&key); }
+    }
+
+    fn is_empty(&self) -> bool { self.live.is_empty() }
+
+    fn drain(&mut self) -> Vec<Value> {
+        self.live.drain().map(|(_, (id, _))| id).collect()
+    }
 }
 
 /// Owns the slot until the upstream write completes. Every local refusal, cancellation,
@@ -422,12 +495,16 @@ async fn startup_error_frame<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     if let Ok(Ok(_)) = tokio::time::timeout(Duration::from_secs(2), input.read_line(&mut line)).await {
         if let Ok(frame) = serde_json::from_str::<Value>(&line) {
             if let Some(id) = frame.get("id") {
-                let error = serde_json::json!({"jsonrpc":"2.0", "id":id,
-                    "error":{"code":-32001,"message":message,"data":{"reason_code":reason}}});
-                let _ = write_line(output, &error.to_string()).await;
+                let _ = write_line(output, &startup_refusal_frame(id, message, reason)).await;
             }
         }
     }
+}
+
+fn startup_refusal_frame(id: &Value, message: &str,
+    reason: Option<duduclaw_core::mcp_start_status::ReasonCode>) -> String {
+    serde_json::json!({"jsonrpc":"2.0", "id":id,
+        "error":{"code":-32001,"message":message,"data":{"reason_code":reason}}}).to_string()
 }
 
 // ── The proxy loop ──────────────────────────────────────────────────────────
@@ -475,6 +552,21 @@ async fn run_proxy_io_with_identity(
     io: ProxyIo,
     identity_home: Option<std::path::PathBuf>,
 ) -> std::io::Result<()> {
+    run_proxy_io_monitored(server, layer, gate, io, identity_home, None).await
+}
+
+async fn run_proxy_io_monitored(
+    server: &str,
+    layer: Option<Arc<McpRedactionLayer>>,
+    gate: Option<Arc<ThirdPartyGate>>,
+    io: ProxyIo,
+    identity_home: Option<std::path::PathBuf>,
+    child: Option<duduclaw_core::execution_gate::RunControl>,
+) -> std::io::Result<()> {
+    let monitor = child.is_some();
+    // Track every request, including generic requests and approval-held calls.
+    let requests = Arc::new(Mutex::new(RequestTracker::default()));
+    let initialized = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let ProxyIo {
         client_in,
         mut client_out,
@@ -486,8 +578,18 @@ async fn run_proxy_io_with_identity(
     // upstream→client pump, and the answers the client→upstream pump gives
     // itself (redaction denials, refused tools).
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    let writer_requests = requests.clone();
+    let writer_initialized = initialized.clone();
     let writer = tokio::spawn(async move {
         while let Some(mut line) = rx.recv().await {
+            if let Some(frame) = parse_frame(&line).filter(is_response) {
+                if let Some(key) = frame.get("id").and_then(id_key) {
+                    let init = writer_requests.lock().ok().and_then(|mut r| r.answered(&key));
+                    if init == Some(true) && frame.get("result").is_some() && frame.get("error").is_none() {
+                        writer_initialized.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+            }
             line.push('\n');
             if client_out.write_all(line.as_bytes()).await.is_err() {
                 break;
@@ -496,6 +598,8 @@ async fn run_proxy_io_with_identity(
                 break;
             }
         }
+        // Handed back so final error frames use the same client stream.
+        client_out
     });
 
     // One writer owns `upstream_in` too: a call held for approval is
@@ -538,7 +642,7 @@ async fn run_proxy_io_with_identity(
     let list_ids = Arc::new(std::sync::Mutex::new(std::collections::HashSet::<String>::new()));
 
     // ── upstream → client ────────────────────────────────────────────
-    let up_task = {
+    let mut up_task = {
         let pending = pending.clone();
         let layer = layer.clone();
         let gate = gate.clone();
@@ -599,16 +703,35 @@ async fn run_proxy_io_with_identity(
     // ── client → upstream ────────────────────────────────────────────
     let mut held = tokio::task::JoinSet::new();
     let mut lines = BufReader::new(client_in).lines();
+    let mut upstream_lost = false;
+    let mut upstream_joined = false;
     loop {
         let line = tokio::select! {
-            completed = held.join_next(), if !held.is_empty() => {
-                let _ = completed;
-                continue;
-            }
+            biased;
             line = lines.next_line() => match line {
                 Ok(Some(line)) => line,
                 _ => break,
             },
+            _ = &mut up_task, if monitor => {
+                upstream_joined = true;
+                upstream_lost = true;
+                break;
+            }
+            _ = async {
+                match child.as_ref() {
+                    Some(control) => { let _ = control.wait().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            }, if monitor => {
+                // Drain responses already in the pipe before failing requests.
+                upstream_joined = tokio::time::timeout(Duration::from_millis(100), &mut up_task).await.is_ok();
+                upstream_lost = true;
+                break;
+            }
+            completed = held.join_next(), if !held.is_empty() => {
+                let _ = completed;
+                continue;
+            }
         };
         call_capacity(&mut held);
         if line.trim().is_empty() {
@@ -617,11 +740,29 @@ async fn run_proxy_io_with_identity(
         let Some(frame) = parse_frame(&line) else {
             // Opaque line — forward verbatim.
             if up_tx.send(QueuedFrame { line, permit: None, slot: None }).is_err() {
+                upstream_lost = monitor;
                 break;
             }
             continue;
         };
 
+        if monitor && frame.get("method").and_then(Value::as_str) == Some("notifications/cancelled") {
+            // A cancelled request may never be answered: stop tracking it.
+            if let Some(request_id) = frame.pointer("/params/requestId") {
+                requests.lock().map_err(|_| std::io::ErrorKind::Other)?.cancel(request_id);
+            }
+        }
+        if monitor && frame.get("method").is_some() {
+            if let Some(id) = frame.get("id").filter(|id| id_key(id).is_some()) {
+                let tracked = requests.lock().map_err(|_| std::io::ErrorKind::Other)?
+                    .track(id, frame["method"] == "initialize");
+                if let Err(reason) = tracked {
+                    // Refuse only this request; the session and the upstream stay up.
+                    let _ = tx.send(duduclaw_gateway::third_party_tools::refusal_frame(id, reason));
+                    continue;
+                }
+            }
+        }
         if identity_home.as_deref().is_some_and(|home|
             crate::mcp::caller_identity_verdict(home) == duduclaw_core::IdentityVerdict::Rejected)
         {
@@ -691,8 +832,59 @@ async fn run_proxy_io_with_identity(
             continue;
         };
         if up_tx.send(payload.queued(None)).is_err() {
+            upstream_lost = monitor;
             break;
         }
+    }
+
+    if upstream_lost {
+        held.abort_all();
+        while held.join_next().await.is_some() {}
+        up_writer.abort();
+        let _ = up_writer.await;
+        if !upstream_joined { up_task.abort(); let _ = up_task.await; }
+        if let Some(gate) = &gate { gate.close_pending(); }
+        // Flush queued responses first so only unanswered IDs receive errors.
+        drop(tx);
+        let client_out = writer.await.ok();
+        let starting = !initialized.load(std::sync::atomic::Ordering::SeqCst);
+        let reason = duduclaw_core::mcp_start_status::ReasonCode::UpstreamIoUnavailable;
+        if starting { report_startup_diagnostic(reason); }
+        let none_tracked = requests.lock().map_err(|_| std::io::ErrorKind::Other)?.is_empty();
+        if starting && monitor && none_tracked {
+            // The upstream may die before the client's first request was read:
+            // give that request a bounded chance to arrive so it gets the refusal.
+            // One line is capped like `startup_error_frame`; overflow ⇒ no request.
+            let mut reader = lines.into_inner();
+            let _ = tokio::time::timeout(Duration::from_millis(500), async {
+                use tokio::io::AsyncReadExt;
+                const LIMIT: u64 = 65536;
+                loop {
+                    let mut bytes = Vec::new();
+                    match (&mut reader).take(LIMIT).read_until(b'\n', &mut bytes).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                    if bytes.last() != Some(&b'\n') && bytes.len() as u64 >= LIMIT { break; }
+                    let Some(frame) = std::str::from_utf8(&bytes).ok().and_then(parse_frame) else { continue };
+                    if frame.get("method").is_none() { continue; }
+                    let Some(id) = frame.get("id") else { continue };
+                    if id_key(id).is_none() { continue; }
+                    if let Ok(mut tracker) = requests.lock() { let _ = tracker.track(id, false); }
+                    break;
+                }
+            }).await;
+        }
+        let outstanding = requests.lock().map_err(|_| std::io::ErrorKind::Other)?.drain();
+        if let Some(mut output) = client_out {
+            for id in outstanding {
+                // Always carry the closed reason code, also after `initialize`,
+                // so a probe reports the lost upstream rather than a protocol error.
+                let frame = startup_refusal_frame(&id, "MCP upstream unavailable", Some(reason));
+                write_line(&mut output, &frame).await?;
+            }
+        }
+        return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "MCP upstream unavailable"));
     }
 
     // Client hung up (or the pipe broke): let held calls finish (an
@@ -940,10 +1132,14 @@ async fn write_line<W: AsyncWrite + Unpin>(w: &mut W, line: &str) -> std::io::Re
 async fn report_startup_refusal(reason: duduclaw_core::mcp_start_status::ReasonCode) {
     // Only the gateway may attribute and persist a startup result. This process
     // reports solely to its own stdio peer; environment claims are not evidence.
-    eprintln!("mcp-proxy startup_refused reason_code={}",
-        serde_json::to_value(reason).expect("closed reason code").as_str().expect("string reason code"));
+    report_startup_diagnostic(reason);
     startup_error_frame(tokio::io::stdin(), &mut tokio::io::stdout(),
         "MCP server startup refused", Some(reason)).await;
+}
+
+fn report_startup_diagnostic(reason: duduclaw_core::mcp_start_status::ReasonCode) {
+    eprintln!("mcp-proxy startup_refused reason_code={}",
+        serde_json::to_value(reason).expect("closed reason code").as_str().expect("string reason code"));
 }
 
 // ── Subcommand entry point ──────────────────────────────────────────────────
@@ -1121,6 +1317,8 @@ pub async fn run_mcp_proxy_scoped(
     let upstream_in = match child.stdin.take() {
         Some(pipe) => pipe,
         None => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
             report_startup_refusal(ReasonCode::UpstreamIoUnavailable).await;
             return Err(DuDuClawError::Gateway("mcp-proxy: upstream stdin unavailable".into()));
         }
@@ -1128,6 +1326,8 @@ pub async fn run_mcp_proxy_scoped(
     let upstream_out = match child.stdout.take() {
         Some(pipe) => pipe,
         None => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
             report_startup_refusal(ReasonCode::UpstreamIoUnavailable).await;
             return Err(DuDuClawError::Gateway("mcp-proxy: upstream stdout unavailable".into()));
         }
@@ -1140,14 +1340,14 @@ pub async fn run_mcp_proxy_scoped(
         upstream_out: Box::new(upstream_out),
     };
 
-    if let Err(e) = run_proxy_io_with_identity(server, layer, gate, io, Some(home_dir.to_path_buf())).await {
-        tracing::warn!(server = %server, error = %e, "mcp-proxy: stream loop ended with an error");
-    }
+    let failed = run_proxy_io_monitored(server, layer, gate, io,
+        Some(home_dir.to_path_buf()), Some(child.control())).await.is_err();
+    if failed { let _ = child.kill().await; }
 
     let status = child.wait().await.map_err(|e| {
         DuDuClawError::Gateway(format!("mcp-proxy: waiting for upstream failed: {e}"))
     })?;
-    Ok(status.code().unwrap_or(1))
+    Ok(if failed { 1 } else { status.code().unwrap_or(1) })
 }
 
 fn upstream_command(command: &str, args: &[String], env_pairs: Vec<(String, String)>, upstream_is_bridge: bool)
@@ -1262,6 +1462,69 @@ mod tests {
         assert_eq!(id_key(&json!(7)).unwrap(), "n:7");
         assert_eq!(id_key(&json!("7")).unwrap(), "s:7");
         assert!(id_key(&Value::Null).is_none());
+    }
+
+    #[test]
+    fn numeric_ids_normalise_by_value() {
+        assert_eq!(id_key(&json!(1)), id_key(&json!(1.0)));
+        assert_eq!(id_key(&json!(0)), id_key(&json!(-0.0)));
+        assert_eq!(id_key(&json!(u64::MAX)).unwrap(), format!("n:{}", u64::MAX));
+        assert_ne!(id_key(&json!(1)), id_key(&json!(1.5)));
+        assert_ne!(id_key(&json!(1)), id_key(&json!("1")));
+    }
+
+    #[test]
+    fn tracker_matches_respelled_numeric_ids_and_echoes_the_original() {
+        let mut tracker = RequestTracker::default();
+        tracker.track(&json!(1), true).unwrap();
+        tracker.track(&json!(2), false).unwrap();
+        // An upstream answering id `1` as `1.0` still clears the entry, so the
+        // client never gets a second response for it at exit.
+        assert_eq!(tracker.answered(&id_key(&json!(1.0)).unwrap()), Some(true));
+        assert_eq!(tracker.drain(), vec![json!(2)]);
+        // The final error frame echoes the client's original id spelling.
+        tracker.track(&json!(3.0), false).unwrap();
+        assert_eq!(tracker.drain(), vec![json!(3.0)]);
+    }
+
+    #[test]
+    fn tracker_cancel_removes_and_full_map_refuses_one_request_only() {
+        let mut tracker = RequestTracker::default();
+        tracker.track(&json!(7), false).unwrap();
+        tracker.cancel(&json!(7.0));
+        assert!(tracker.is_empty(), "a cancelled request is no longer tracked");
+        for i in 0..MAX_PENDING_CALLS { tracker.track(&json!(i), false).unwrap(); }
+        assert_eq!(tracker.track(&json!("extra"), false), Err(TRACK_REFUSED_FULL));
+        assert_eq!(tracker.live.len(), MAX_PENDING_CALLS, "the live requests stay tracked");
+        // The local refusal passing the writer touches no live entry.
+        assert_eq!(tracker.answered(&id_key(&json!("extra")).unwrap()), None);
+        assert_eq!(tracker.live.len(), MAX_PENDING_CALLS);
+        // Cancellation frees capacity for the next request.
+        tracker.cancel(&json!(0));
+        tracker.track(&json!("next"), false).unwrap();
+    }
+
+    #[test]
+    fn tracker_duplicate_refusal_does_not_consume_the_live_entry() {
+        let mut tracker = RequestTracker::default();
+        tracker.track(&json!(5), false).unwrap();
+        assert_eq!(tracker.track(&json!(5.0), false), Err(TRACK_REFUSED_DUPLICATE));
+        let key = id_key(&json!(5)).unwrap();
+        assert_eq!(tracker.answered(&key), None, "the local refusal");
+        assert!(!tracker.is_empty());
+        assert_eq!(tracker.answered(&key), Some(false), "the real answer");
+        assert!(tracker.is_empty());
+    }
+
+    #[test]
+    fn tracker_refuses_oversized_ids_without_tracking() {
+        let mut tracker = RequestTracker::default();
+        // Serialized with quotes: 258 bytes.
+        let long = json!("x".repeat(MAX_TRACKED_ID_BYTES));
+        assert_eq!(tracker.track(&long, false), Err(TRACK_REFUSED_ID));
+        assert!(tracker.is_empty());
+        tracker.track(&json!("x".repeat(MAX_TRACKED_ID_BYTES - 2)), false).unwrap();
+        assert_eq!(tracker.drain().len(), 1);
     }
 
     #[test]

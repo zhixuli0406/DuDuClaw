@@ -1938,7 +1938,9 @@ async fn build_reply_with_session_inner_impl(
     } else {
         Box::pin(async {
             #[cfg(test)] super::reply_origin::testing::boundary(&ctx.home_dir,false);
-            Box::pin(call_claude_cli_rotated(
+            // A channel reply is chat work: keep its employee step budget.
+            Box::pin(crate::runtime_dispatch::with_work_request_type(
+                crate::cost_telemetry::RequestType::Chat, call_claude_cli_rotated(
             &effective_message,
             &model,
             &full_system_prompt,
@@ -1951,7 +1953,7 @@ async fn build_reply_with_session_inner_impl(
             &account_pool,
             None,
             crate::runtime_dispatch::SpawnPurpose::EmployeeTurn,
-        )).await
+        ))).await
             .map(|text| ReplyAttempt::new(text, ReplyOrigin::Runtime(duduclaw_core::types::RuntimeType::Claude)))
             .map_err(|error| ReplyFailure::simple(ReplyOrigin::Runtime(duduclaw_core::types::RuntimeType::Claude), error))
         })

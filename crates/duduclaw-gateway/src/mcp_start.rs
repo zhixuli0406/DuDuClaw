@@ -212,7 +212,8 @@ async fn read_response<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R, id: u
         let mut bytes = Vec::new();
         let n = (&mut *reader).take(1024 * 1024).read_until(b'\n', &mut bytes).await
             .map_err(|_| ReasonCode::ProtocolError)?;
-        if n == 0 || bytes.last() != Some(&b'\n') { return Err(ReasonCode::ProtocolError); }
+        if n == 0 { return Err(ReasonCode::UpstreamIoUnavailable); }
+        if bytes.last() != Some(&b'\n') { return Err(ReasonCode::ProtocolError); }
         let frame: Value = match serde_json::from_slice(&bytes) { Ok(v) => v, Err(_) => continue };
         if frame["id"] != id { continue; }
         if let Some(error) = frame.get("error") {
@@ -242,16 +243,29 @@ async fn probe_entry(entry: &Value, deadline: std::time::Duration) -> Result<usi
     let result = tokio::time::timeout_at(end, async {
         let mut input = child.child().stdin.take().ok_or(ReasonCode::UpstreamIoUnavailable)?;
         let mut reader = BufReader::new(child.child().stdout.take().ok_or(ReasonCode::UpstreamIoUnavailable)?);
+        let exchange = async {
         input.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"duduclaw-install-probe\",\"version\":\"1\"}}}\n")
-            .await.map_err(|_| ReasonCode::ProtocolError)?;
+            .await.map_err(|_| ReasonCode::UpstreamIoUnavailable)?;
         let init = read_response(&mut reader, 1).await?;
         if !init["protocolVersion"].is_string() || !init["capabilities"].is_object() {
             return Err(ReasonCode::ProtocolError);
         }
         input.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}\n")
-            .await.map_err(|_| ReasonCode::ProtocolError)?;
+            .await.map_err(|_| ReasonCode::UpstreamIoUnavailable)?;
         let result = read_response(&mut reader, 2).await?;
         result["tools"].as_array().map(Vec::len).ok_or(ReasonCode::ProtocolError)
+        };
+        tokio::pin!(exchange);
+        tokio::select! {
+            biased;
+            result = &mut exchange => result,
+            _ = child.child().wait() => {
+                // Preserve a final fixed refusal already written before exit,
+                // even if another process still holds the stdout pipe open.
+                tokio::time::timeout(Duration::from_millis(100), &mut exchange).await
+                    .unwrap_or(Err(ReasonCode::UpstreamIoUnavailable))
+            }
+        }
     }).await.unwrap_or(Err(ReasonCode::Timeout));
     child.kill_and_reap().await;
     result
@@ -450,6 +464,8 @@ mod tests {
             let handler = crate::handlers::MethodHandler::new(home.path().into()).await;
             std::fs::create_dir_all(&dir).unwrap();
             for (mode, expected) in [("success", None), ("failure", Some(ReasonCode::IdentityRejected)),
+                ("upstream_exit", Some(ReasonCode::UpstreamIoUnavailable)),
+                ("upstream_exit_initialized", Some(ReasonCode::UpstreamIoUnavailable)),
                 ("timeout", Some(ReasonCode::Timeout))] {
                 let path = dir.join(".mcp.json");
                 // The persisted file intentionally lacks the built-in slot;
@@ -472,6 +488,7 @@ mod tests {
                     }).collect()
                 };
                 let before_temp = temp_configs();
+                let started = std::time::Instant::now();
                 let frame = Box::pin(handler.handle("mcp.probe", json!({"agent_id":"alice", "server_name":"fixture"}),
                     &duduclaw_auth::UserContext::admin_fallback())).await;
                 let crate::protocol::WsFrame::Response { ok: true, payload: Some(payload), .. } = frame else {
@@ -482,6 +499,7 @@ mod tests {
                 assert!(payload.get("time").is_none());
                 let status: ProbeResult = serde_json::from_value(payload).unwrap();
                 assert_eq!(status.reason_code, expected, "{mode}");
+                if mode == "upstream_exit" { assert!(started.elapsed() < Duration::from_secs(3)); }
                 assert_eq!(status.ok, mode == "success");
                 if status.ok { assert_eq!(status.tool_count, Some(1)); }
                 assert_eq!(std::fs::read(&path).unwrap(), raw, "{mode}");
@@ -517,11 +535,20 @@ mod tests {
             let raw = std::env::var(crate::redaction_proxy::PROXY_UPSTREAM_ENV_VAR).ok()?;
             serde_json::from_str::<Value>(&raw).ok()?["MCP_FIXTURE_MODE"].as_str().map(str::to_owned)
         }).unwrap_or_default();
+        if mode == "upstream_exit" { std::process::exit(1); }
         if mode == "timeout" { std::thread::sleep(std::time::Duration::from_secs(30)); return; }
         for line in std::io::stdin().lock().lines() {
             let Ok(line) = line else { break; };
             let Ok(v) = serde_json::from_str::<Value>(&line) else { continue; };
             if v.get("id").is_none() { continue; }
+            if mode == "upstream_exit_initialized" && v["method"] != "initialize" {
+                // The proxy's frame for a request pending when its upstream
+                // died after `initialize`: the closed reason code is present.
+                println!("{}", json!({"jsonrpc":"2.0","id":v["id"],"error":{"code":-32001,
+                    "message":"MCP upstream unavailable","data":{"reason_code":"upstream_io_unavailable"}}}));
+                std::io::stdout().flush().unwrap();
+                std::process::exit(1);
+            }
             let frame = if mode == "failure" {
                 json!({"jsonrpc":"2.0","id":v["id"],"error":{"code":-32001,
                     "message":"fixed","data":{"reason_code":"identity_rejected"}}})
@@ -540,6 +567,8 @@ mod tests {
     async fn install_probe_success_failure_and_timeout() {
         let home = tempfile::tempdir().unwrap();
         for (mode, expected) in [("success", Ok(1)), ("failure", Err(ReasonCode::IdentityRejected)),
+            ("upstream_exit", Err(ReasonCode::UpstreamIoUnavailable)),
+            ("upstream_exit_initialized", Err(ReasonCode::UpstreamIoUnavailable)),
             ("timeout", Err(ReasonCode::Timeout))] {
             let entry = json!({"command":std::env::current_exe().unwrap(),
                 "args":["--exact","mcp_start::tests::fixture","--ignored","--nocapture"],

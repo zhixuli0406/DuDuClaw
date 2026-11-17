@@ -777,7 +777,7 @@
       "rationale": "Typed ExecutionBackend handoff; original native Command/PTY builder retained by LocalBackend. Protected launch requires trusted immutable policy/input/capability context and uses daemon run handles; missing context is refused without gateway execution."
     },
     {
-      "symbol": "crates/duduclaw-cli/src/mcp_proxy.rs::run_proxy_io_with_identity",
+      "symbol": "crates/duduclaw-cli/src/mcp_proxy.rs::run_proxy_io_monitored",
       "apis": {
         "terminal_spawn": 1
       },

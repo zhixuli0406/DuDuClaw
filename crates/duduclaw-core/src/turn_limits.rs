@@ -1,17 +1,37 @@
 //! Shared bounded per-run step policy for CLI and gateway callers.
-use std::{path::Path, sync::Once};
+use std::{collections::HashSet, path::Path, sync::{Mutex, OnceLock}};
 
 pub const DEFAULT_MAX_TURNS: u64 = 50;
 pub const DEFAULT_MAX_TURNS_LIMIT: u64 = 200;
-static WARNING: Once = Once::new();
+const MAX_WARNINGS: usize = 256;
+#[derive(Default)]
+struct Warnings(HashSet<(String, String, u64, bool)>);
+impl Warnings {
+    fn first(&mut self, agent: &str, configured: &str, applied: u64, unreadable: bool) -> bool {
+        self.0.len() < MAX_WARNINGS && self.0.insert((agent.into(), configured.into(), applied, unreadable))
+    }
+}
+static WARNINGS: OnceLock<Mutex<Warnings>> = OnceLock::new();
+fn warn_limit(dir: Option<&Path>, configured: &str, applied: u64, cap_source: &'static str, unreadable: bool) {
+    let agent = dir.and_then(Path::file_name).and_then(|s| s.to_str()).unwrap_or("system");
+    let first = WARNINGS.get_or_init(|| Mutex::new(Warnings::default())).lock()
+        .map(|mut warnings| warnings.first(agent, configured, applied, unreadable)).unwrap_or(false);
+    if first {
+        if unreadable {
+            tracing::warn!(agent, configured, applied, cap_source, "runtime step config unreadable or invalid; using conservative fallback");
+        } else {
+            tracing::warn!(agent, configured, applied, cap_source, "configured runtime step limit was clamped");
+        }
+    }
+}
 pub fn warn_invalid() {
-    WARNING.call_once(|| tracing::warn!("invalid or unreadable runtime step limit; using conservative step limits (or clamping to ceiling)"));
+    warn_limit(None, "unreadable", DEFAULT_MAX_TURNS, "builtin_fallback", true);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TurnPolicy { pub default: u64, pub limit: u64, degraded: bool }
+pub struct TurnPolicy { pub default: u64, pub limit: u64, degraded: bool, limit_configured: bool, requested_default: u64 }
 impl Default for TurnPolicy {
-    fn default() -> Self { Self { default: DEFAULT_MAX_TURNS, limit: DEFAULT_MAX_TURNS_LIMIT, degraded: false } }
+    fn default() -> Self { Self { default: DEFAULT_MAX_TURNS, limit: DEFAULT_MAX_TURNS_LIMIT, degraded: false, limit_configured: false, requested_default: DEFAULT_MAX_TURNS } }
 }
 impl TurnPolicy {
     /// Strict validation for dashboard writes; execution uses bounded recovery.
@@ -34,7 +54,7 @@ impl TurnPolicy {
                 .ok_or_else(|| format!("runtime.{key} must be an integer between 1 and 10000")))
                 .unwrap_or(Ok(fallback))
         };
-        Ok(Self { default: number("default_max_turns", DEFAULT_MAX_TURNS)?, limit: number("max_turns_limit", DEFAULT_MAX_TURNS_LIMIT)?, degraded: false })
+        Ok(Self { default: number("default_max_turns", DEFAULT_MAX_TURNS)?, limit: number("max_turns_limit", DEFAULT_MAX_TURNS_LIMIT)?, degraded: false, limit_configured: runtime.contains_key("max_turns_limit"), requested_default: number("default_max_turns", DEFAULT_MAX_TURNS)? })
     }
     pub fn from_table(table: &toml::Table) -> Self {
         let runtime = table.get("runtime").and_then(toml::Value::as_table);
@@ -46,10 +66,12 @@ impl TurnPolicy {
                     .filter(|n| (1..=max).contains(n)).unwrap_or_else(|| { invalid.set(true); fallback }),
             }
         };
-        let mut policy = Self { default: number("default_max_turns", DEFAULT_MAX_TURNS, i64::MAX as u64),
-            limit: number("max_turns_limit", DEFAULT_MAX_TURNS_LIMIT, 10000), degraded: invalid.get() };
-        if policy.degraded { warn_invalid(); }
-        if policy.default > policy.limit { warn_invalid(); policy.default = policy.limit; }
+        let default = number("default_max_turns", DEFAULT_MAX_TURNS, i64::MAX as u64);
+        let mut policy = Self { default,
+            limit: number("max_turns_limit", DEFAULT_MAX_TURNS_LIMIT, 10000), degraded: invalid.get(),
+            limit_configured: runtime.and_then(|r| r.get("max_turns_limit")).and_then(toml::Value::as_integer)
+                .is_some_and(|n| (1..=10000).contains(&n)), requested_default: default };
+        if policy.default > policy.limit { policy.default = policy.limit; }
         policy
     }
     /// Authorization cannot recover from an unreadable or invalid policy.
@@ -61,7 +83,6 @@ impl TurnPolicy {
         }
     }
     fn conservative() -> Self {
-        warn_invalid();
         Self { degraded: true, ..Self::default() }
     }
     pub fn load(home: &Path) -> Self {
@@ -73,13 +94,20 @@ impl TurnPolicy {
         }
     }
     pub fn resolve(self, raw: Option<i64>) -> u64 {
+        self.resolve_for(raw, None)
+    }
+    fn resolve_for(self, raw: Option<i64>, dir: Option<&Path>) -> u64 {
         let requested = match raw {
             Some(n) if n > 0 => n as u64,
-            Some(_) => { warn_invalid(); self.default.min(DEFAULT_MAX_TURNS) },
-            None => self.default,
+            Some(_) => self.default.min(DEFAULT_MAX_TURNS),
+            None => self.requested_default,
         };
-        if requested > self.limit { warn_invalid(); }
-        requested.min(self.limit).min(if self.degraded { DEFAULT_MAX_TURNS } else { u64::MAX })
+        let applied = requested.min(self.limit).min(if self.degraded { DEFAULT_MAX_TURNS } else { u64::MAX });
+        let source = if self.limit_configured && applied == self.limit { "max_turns_limit" } else { "builtin_fallback" };
+        if requested > applied || raw.is_some_and(|n| n <= 0) {
+            warn_limit(dir, &raw.map(|n| n.to_string()).unwrap_or_else(|| requested.to_string()), applied, source, false);
+        }
+        applied
     }
 }
 
@@ -98,16 +126,22 @@ fn checked_agent_max_turns(dir: &Path) -> Result<Option<i64>, ()> {
     }
 }
 pub fn raw_agent_max_turns(dir: &Path) -> Option<i64> {
-    checked_agent_max_turns(dir).unwrap_or_else(|_| { warn_invalid(); None })
+    // Only the resolver knows the applied fallback (which may be below 50).
+    checked_agent_max_turns(dir).unwrap_or(None)
 }
 fn resolve_runtime_turns(home: &Path, agent_dir: Option<&Path>, tool_loop: bool) -> u64 {
     let policy = TurnPolicy::load(home);
     let raw = agent_dir.map(checked_agent_max_turns).unwrap_or(Ok(None));
     let degraded = policy.degraded || raw.is_err();
-    if degraded { warn_invalid(); }
     let raw = raw.ok().flatten();
-    let resolved = if tool_loop && raw.is_none() { 10 } else { policy.resolve(raw) };
-    if degraded { resolved.min(policy.limit).min(if tool_loop { 10 } else { DEFAULT_MAX_TURNS }) } else { resolved }
+    let resolved = if tool_loop && raw.is_none() { 10 } else { policy.resolve_for(raw, agent_dir) };
+    let applied = if degraded { resolved.min(policy.limit).min(if tool_loop { 10 } else { DEFAULT_MAX_TURNS }) } else { resolved };
+    if degraded {
+        let configured = raw.map(|n| n.to_string()).unwrap_or_else(|| "unreadable".into());
+        let source = if policy.limit_configured && applied == policy.limit { "max_turns_limit" } else { "builtin_fallback" };
+        warn_limit(agent_dir, &configured, applied, source, true);
+    }
+    applied
 }
 pub fn max_turns(home: &Path, agent_dir: Option<&Path>) -> u64 {
     resolve_runtime_turns(home, agent_dir, false)
@@ -123,6 +157,19 @@ pub fn budget_prompt(prompt: &str, turns: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn warning_keys_distinguish_agents_values_caps_and_bound_memory() {
+        let mut warnings = Warnings::default();
+        assert!(warnings.first("anna", "500", 200, false));
+        assert!(!warnings.first("anna", "500", 200, false));
+        assert!(warnings.first("bob", "500", 200, false));
+        assert!(warnings.first("anna", "501", 200, false));
+        assert!(warnings.first("anna", "500", 100, false));
+        assert!(warnings.first("anna", "500", 200, true));
+        for i in 0..MAX_WARNINGS { warnings.first(&format!("agent-{i}"), "unreadable", 50, true); }
+        assert_eq!(warnings.0.len(), MAX_WARNINGS);
+        assert!(!warnings.first("new", "500", 200, false));
+    }
     #[test]
     fn precedence_defaults_invalid_and_clamping() {
         let p = TurnPolicy::from_table(&"[runtime]\ndefault_max_turns=80\nmax_turns_limit=100".parse().unwrap());
