@@ -883,15 +883,15 @@ fn read_member(dir: &File, name: &str) -> Result<Vec<u8>> {
 fn memfd(name: &std::ffi::CStr, executable: bool) -> Result<File> {
     let base = libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING;
     // SAFETY: name is a valid C string; flags are scalar.
-    let mut fd = if executable { unsafe { libc::memfd_create(name.as_ptr(), base | MFD_EXEC) } } else { -1 };
+    let mut fd = if executable { unsafe { libc::syscall(libc::SYS_memfd_create, name.as_ptr(), (base | MFD_EXEC) as libc::c_uint) } } else { -1 };
     if fd < 0 && (!executable || std::io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL)) {
         // Before Linux 6.3 MFD_EXEC is unknown and every memfd is executable.
         // SAFETY: as above.
-        fd = unsafe { libc::memfd_create(name.as_ptr(), base) };
+        fd = unsafe { libc::syscall(libc::SYS_memfd_create, name.as_ptr(), base as libc::c_uint) };
     }
     if fd < 0 { return Err(std::io::Error::last_os_error().into()); }
     // SAFETY: a fresh, uniquely owned descriptor.
-    Ok(unsafe { File::from_raw_fd(fd) })
+    Ok(unsafe { File::from_raw_fd(fd as RawFd) })
 }
 /// Add SEAL|SHRINK|GROW|WRITE and read them back.
 fn seal(file: &File) -> Result<()> {
