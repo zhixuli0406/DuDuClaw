@@ -2,7 +2,21 @@
 """Build canonical isolation metadata and create detached OpenSSH signatures.
 
 Release/runtime templates name artifacts by id; files in --artifacts-dir have
-exactly those names. No private key is generated, copied, or stored by this tool.
+exactly those names. No private key is generated, copied, or stored by this tool:
+`ssh-keygen -Y sign` reads the operator's key file (or FIDO2 key handle) itself
+and asks for its passphrase / PIN on the terminal.
+
+--kind bundle (plan §3.2, R2 §4.2) authorizes one migration bundle tar: the input
+is the tar itself (--bundle, fixed name duduclaw-isolated-linux-<arch>-<x.y.z>.tar),
+the output is the canonical BundleAuthorization {schema_version, product, version,
+arch, bundle_sha256, bundle_size, expires_at_unix} plus its root-threshold
+signatures (2 or 3 distinct root keys) under duduclaw-migration-bundle-v1@dudustudio.
+Owner decision Q6: only v1.83.0 ships a migration bundle (scripts/release.sh
+isolation-sign gates this).
+
+--test-signer <duduclaw-isolation-test-signer> replaces ssh-keygen for the
+TEST-ONLY key set of scripts/isolation-test-keys.sh; that binary refuses every
+key that is not a TEST-ONLY key file.
 """
 import argparse
 import hashlib
@@ -13,14 +27,22 @@ import re
 import stat
 import subprocess
 import tempfile
+import time
 
 NAMESPACES = {
     "root": "duduclaw-root-metadata-v1@dudustudio",
     "release": "duduclaw-release-manifest-v1@dudustudio",
     "runtime": "duduclaw-runtime-manifest-v1@dudustudio",
     "emergency": "duduclaw-emergency-v1@dudustudio",
+    # Root threshold over a BundleAuthorization (duduclaw-isolation
+    # MIGRATION_BUNDLE_SSHSIG_NAMESPACE); never accepted for any other document.
+    "bundle": "duduclaw-migration-bundle-v1@dudustudio",
 }
 MAX_METADATA_BYTES = 256 * 1024
+# duduclaw-isolation MAX_MIGRATION_BUNDLE_BYTES.
+MAX_BUNDLE_BYTES = 2 * 1024 * 1024 * 1024
+BUNDLE_NAME = re.compile(r"duduclaw-isolated-linux-(x86_64|aarch64)-(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\."
+                         r"(0|[1-9][0-9]{0,8})\.tar")
 
 
 def unique_object(pairs):
@@ -159,31 +181,106 @@ def validate_policy_document(document):
     return document
 
 
+def hash_regular_file(path, limit):
+    """(sha256 bytes, size) of a nonempty, single-link regular file; refuses symlinks and changes."""
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+    with os.fdopen(fd, "rb") as source:
+        before = os.fstat(source.fileno())
+        if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                or not 0 < before.st_size <= limit):
+            raise ValueError("bundle must be a nonempty, unlinked regular file within the size limit")
+        digest = hashlib.sha256()
+        length = 0
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+            length += len(chunk)
+        after = os.fstat(source.fileno())
+        if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+                after.st_size, after.st_mtime_ns, after.st_ctime_ns) or length != before.st_size:
+            raise ValueError("bundle changed during hashing")
+    return digest.digest(), length
+
+
+def bundle_authorization(path, expires_at_unix, now=None):
+    """Canonical BundleAuthorization for the tar at `path` (duduclaw-isolation update.rs).
+
+    Version and architecture come only from the fixed file name the verifier
+    opens (plan §3.2); digest and size from the bytes themselves.
+    """
+    match = BUNDLE_NAME.fullmatch(Path(path).name)
+    if match is None:
+        raise ValueError("bundle file name must be duduclaw-isolated-linux-<x86_64|aarch64>-<x.y.z>.tar")
+    arch, major, minor, patch = match[1], int(match[2]), int(match[3]), int(match[4])
+    if max(major, minor, patch) > 2 ** 32 - 1:
+        raise ValueError("bundle version component out of range")
+    now = int(time.time()) if now is None else now
+    if (not isinstance(expires_at_unix, int) or isinstance(expires_at_unix, bool)
+            or not now < expires_at_unix < 2 ** 63):
+        raise ValueError("bundle authorization must expire in the future")
+    digest, size = hash_regular_file(path, MAX_BUNDLE_BYTES)
+    return {"schema_version": 1, "product": "duduclaw",
+            "version": {"major": major, "minor": minor, "patch": patch}, "arch": arch,
+            "bundle_sha256": list(digest), "bundle_size": size, "expires_at_unix": expires_at_unix}
+
+
+def signer_command(args, key, stage):
+    """ssh-keygen (operator keys, FIDO2 via Homebrew OpenSSH) or the TEST-ONLY signer."""
+    if args.test_signer is not None:
+        return [str(args.test_signer), "sign", str(key), args.kind, str(stage), str(stage) + ".sig"]
+    return [args.ssh_keygen, "-Y", "sign", "-f", str(key), "-n", NAMESPACES[args.kind],
+            "-O", "hashalg=sha512", str(stage)]
+
+
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--kind", choices=NAMESPACES, default="release")
-    parser.add_argument("--template", type=Path, required=True)
+    parser.add_argument("--template", type=Path, help="metadata template (every kind except bundle)")
     parser.add_argument("--artifacts-dir", type=Path)
+    parser.add_argument("--bundle", type=Path, help="--kind bundle: the migration bundle tar to authorize")
+    parser.add_argument("--expires-at-unix", type=int, help="--kind bundle: authorization expiry (Unix seconds)")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--key", type=Path, action="append", required=True,
                         help="offline signing key; repeat for root threshold signatures")
     parser.add_argument("--ssh-keygen", default="ssh-keygen",
                         help="use Homebrew OpenSSH for FIDO2 support on macOS")
+    parser.add_argument("--test-signer", type=Path,
+                        help="TEST-ONLY: duduclaw-isolation-test-signer instead of ssh-keygen (test key set only)")
     args = parser.parse_args()
-    raw = args.template.read_bytes()
-    if len(raw) > MAX_METADATA_BYTES:
-        parser.error("template exceeds metadata limit")
-    document = json.loads(raw, object_pairs_hook=unique_object,
-                          parse_float=reject_number, parse_constant=reject_number)
-    if args.kind in ("release", "runtime"):
-        if args.artifacts_dir is None:
-            parser.error("--artifacts-dir is required for release/runtime metadata")
-        bind_artifacts(document, args.artifacts_dir)
+    if args.test_signer is not None and args.ssh_keygen != "ssh-keygen":
+        parser.error("--test-signer and --ssh-keygen are mutually exclusive")
     if not 1 <= len(args.key) <= 6 or len(set(args.key)) != len(args.key):
         parser.error("use 1 to 6 distinct signing keys")
+    if args.kind == "bundle":
+        if args.template is not None or args.artifacts_dir is not None:
+            parser.error("--kind bundle takes --bundle, never a template or artifacts directory")
+        if args.bundle is None or args.expires_at_unix is None:
+            parser.error("--kind bundle requires --bundle and --expires-at-unix")
+        if not 2 <= len(args.key) <= 3:
+            parser.error("--kind bundle needs a root threshold: 2 or 3 distinct root keys")
+        try:
+            document = bundle_authorization(args.bundle, args.expires_at_unix)
+        except (OSError, ValueError) as error:
+            parser.error(str(error))
+    else:
+        if args.bundle is not None or args.expires_at_unix is not None:
+            parser.error("--bundle/--expires-at-unix belong to --kind bundle")
+        if args.template is None:
+            parser.error("--template is required")
+        raw = args.template.read_bytes()
+        if len(raw) > MAX_METADATA_BYTES:
+            parser.error("template exceeds metadata limit")
+        document = json.loads(raw, object_pairs_hook=unique_object,
+                              parse_float=reject_number, parse_constant=reject_number)
+        if args.kind in ("release", "runtime"):
+            if args.artifacts_dir is None:
+                parser.error("--artifacts-dir is required for release/runtime metadata")
+            bind_artifacts(document, args.artifacts_dir)
     payload = canonical_bytes(document)
     if len(payload) > MAX_METADATA_BYTES:
         parser.error("canonical metadata exceeds limit")
+    signature_output = Path(str(args.output) + ".signatures.json")
+    if args.output.exists() or signature_output.exists():
+        parser.error("output already exists")
     # No output is published until every signer succeeds. Existing outputs are
     # never overwritten; release operators publish the resulting pair together.
     with tempfile.TemporaryDirectory(prefix="duduclaw-sign-") as temporary:
@@ -191,14 +288,16 @@ def main():
         stage.write_bytes(payload)
         signatures = []
         for key in args.key:
-            subprocess.run([args.ssh_keygen, "-Y", "sign", "-f", str(key), "-n",
-                            NAMESPACES[args.kind], "-O", "hashalg=sha512", str(stage)], check=True)
+            subprocess.run(signer_command(args, key, stage), check=True)
             detached = Path(str(stage) + ".sig")
             signatures.append(detached.read_text(encoding="ascii"))
             detached.unlink()
-        signature_output = Path(str(args.output) + ".signatures.json")
-        if args.output.exists() or signature_output.exists():
-            parser.error("output already exists")
+        if args.kind == "bundle":
+            # The authorization binds these exact bytes: the tar must not have
+            # changed while the operator touched the keys.
+            if hash_regular_file(args.bundle, MAX_BUNDLE_BYTES) != (bytes(document["bundle_sha256"]),
+                                                                     document["bundle_size"]):
+                parser.error("bundle changed while it was being authorized; nothing was written")
         with args.output.open("xb") as output:
             output.write(payload)
         with signature_output.open("x", encoding="ascii") as output:

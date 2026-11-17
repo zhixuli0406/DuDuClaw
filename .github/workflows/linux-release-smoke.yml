@@ -15,15 +15,26 @@ on:
       - 'crates/duduclaw-cli/assets/native-protected-launcher.sh'
       - 'crates/duduclaw-cli/src/service/**'
       - 'crates/duduclaw-core/src/root_key*.rs'
+      - 'crates/duduclaw-updated/src/**'
+      - 'release/**'
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# Mirrors the Linux packaging path of release.yml (cross build on x86_64, native
+# arm64 packaging from a hash-checked hand-off) WITHOUT the production pin file:
+# a PR build never produces a production-pinned verifier, so its archives carry
+# no duduclaw-bootstrap. Native execution of a cross-built verifier is exercised
+# with a separate TEST-root build (plan §3.3) that prints `TEST <fixed fake pin>`,
+# is never packaged, and must be refused by the production packager.
 jobs:
   build:
     name: Linux release smoke ${{ matrix.target }}
     runs-on: ubuntu-latest
+    outputs:
+      arm64_inputs_sha256: ${{ steps.arm64_inputs.outputs.sha256 }}
+      arm64_test_verifier_sha256: ${{ steps.test_verifier.outputs.sha256 }}
     strategy:
       fail-fast: false
       matrix:
@@ -43,8 +54,9 @@ jobs:
           sudo chmod 600 /mnt/duduclaw-swap && sudo mkswap /mnt/duduclaw-swap && sudo swapon /mnt/duduclaw-swap
           free -h
 
-      # Keep Linux setup/build steps identical to release.yml; enforced by
-      # scripts/tests/test_ci_workflow.py. This is an advisory PR build only.
+      # Keep Linux setup/build steps identical to release.yml (minus the
+      # production pin file); enforced by scripts/tests/test_ci_workflow.py.
+      # This is an advisory PR build only.
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7
         with:
           node-version: "22"
@@ -71,16 +83,101 @@ jobs:
 
       - name: Build binary (cross-compile — skip desktop feature, Wayland unavailable in cross)
         if: runner.os == 'Linux'
-        run: python3 scripts/package-linux-release.py --target ${{ matrix.target }} --build-only
+        run: python3 scripts/package-linux-release.py --target ${{ matrix.target }} --build-only ${{ matrix.target == 'aarch64-unknown-linux-gnu' && '--defer-bootstrap-probe' || '' }}
         env:
           PKG_CONFIG_ALLOW_CROSS: 1
 
       - name: Package Linux binaries and check glibc baseline
-        if: runner.os == 'Linux'
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
         # Unprivileged: no signing key is passed (the packager refuses one under
         # CI), so F metadata signing is skipped; only the unsigned tarball and
         # the glibc baseline check run.
         run: python3 scripts/package-linux-release.py --target ${{ matrix.target }} --skip-build --output-dir .
+
+      - name: Verify packaged duduclaw-bootstrap against the pin file
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/package-linux-release.py --target ${{ matrix.target }} --verify-archive duduclaw-linux-x64.tar.gz > "$RUNNER_TEMP/bootstrap-summary.txt"
+          { echo "### Linux bootstrap verifier"; cat "$RUNNER_TEMP/bootstrap-summary.txt"; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Export cross-built aarch64 binaries for native arm64 packaging
+        id: arm64_inputs
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/package-linux-release.py --target ${{ matrix.target }} --skip-build --export-binaries "$RUNNER_TEMP/linux-arm64-binaries"
+          sums="$(sha256sum "$RUNNER_TEMP/linux-arm64-binaries/SHA256SUMS")"
+          echo "sha256=${sums%% *}" >> "$GITHUB_OUTPUT"
+
+      - name: Hand aarch64 binaries to the native arm64 packaging job
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
+        with:
+          name: smoke-linux-arm64-binaries
+          path: ${{ runner.temp }}/linux-arm64-binaries/
+          if-no-files-found: error
+          retention-days: 1
+
+      # TEST-root verifier (plan §3.3): own target directory, so it can never be
+      # picked up by the packager; fixed fake pin 7e57… ("TEST"), not a real root.
+      - name: Build TEST-root verifier (smoke only, never packaged)
+        id: test_verifier
+        shell: bash
+        env:
+          SMOKE_TEST_PIN: 7e577e577e577e577e577e577e577e577e577e577e577e577e577e577e577e57
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          CARGO_TARGET_DIR=target/smoke-test-root RUSTFLAGS='--cfg duduclaw_test_root' \
+            DUDUCLAW_BOOTSTRAP_ROOT_SHA256="$SMOKE_TEST_PIN" \
+            CROSS_BUILD_ENV_PASSTHROUGH='RUSTFLAGS DUDUCLAW_BOOTSTRAP_ROOT_SHA256' PKG_CONFIG_ALLOW_CROSS=1 \
+            cross build --locked --release --target "$TARGET" -p duduclaw-updated --bin duduclaw-bootstrap
+          verifier="target/smoke-test-root/$TARGET/release/duduclaw-bootstrap"
+          mkdir -m 0700 "$RUNNER_TEMP/test-verifier"
+          cp -- "$verifier" "$RUNNER_TEMP/test-verifier/duduclaw-bootstrap"
+          # Only the aarch64 leg publishes the digest (matrix legs share job outputs).
+          if [[ "$TARGET" == "aarch64-unknown-linux-gnu" ]]; then
+            sums="$(sha256sum "$RUNNER_TEMP/test-verifier/duduclaw-bootstrap")"
+            echo "sha256=${sums%% *}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Execute TEST-root verifier natively and check the packager refuses it
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        env:
+          SMOKE_TEST_PIN: 7e577e577e577e577e577e577e577e577e577e577e577e577e577e577e577e57
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          verifier="$RUNNER_TEMP/test-verifier/duduclaw-bootstrap"
+          actual="$(env -i "$verifier" --print-root-pin)"
+          [[ "$actual" == "TEST $SMOKE_TEST_PIN" ]] || { echo "::error::TEST-root verifier must print exactly TEST <smoke pin>"; exit 1; }
+          python3 - "$verifier" "$TARGET" "$SMOKE_TEST_PIN" <<'PY'
+          import importlib.util, pathlib, sys
+          spec = importlib.util.spec_from_file_location("packager", "scripts/package-linux-release.py")
+          packager = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(packager)
+          version = packager.version_text(packager.workspace_version())
+          try:
+              packager.verify_bootstrap_binary(pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3], version)
+          except ValueError as error:
+              print(f"production packager refused the TEST-root verifier: {error}")
+          else:
+              sys.exit("production packager accepted a TEST-root verifier")
+          PY
+          echo "TEST-root verifier executed natively on $(uname -m): prints TEST, refused for packaging." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Hand TEST-root verifier to the native arm64 job
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
+        with:
+          name: smoke-TEST-ONLY-verifier-aarch64
+          path: ${{ runner.temp }}/test-verifier/duduclaw-bootstrap
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Start x86_64 binary on Ubuntu 22.04 (glibc 2.35)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
@@ -92,3 +189,69 @@ jobs:
           path: target/${{ matrix.target }}/release/duduclaw
           if-no-files-found: error
           retention-days: 3
+
+  package-arm64:
+    name: Linux release smoke aarch64 native packaging
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8
+        with:
+          name: smoke-linux-arm64-binaries
+          path: ${{ runner.temp }}/linux-arm64-binaries
+
+      - name: Package Linux arm64 binaries natively and check glibc baseline
+        shell: bash
+        env:
+          INPUTS_SHA256: ${{ needs.build.outputs.arm64_inputs_sha256 }}
+        run: |
+          set -euo pipefail
+          python3 scripts/package-linux-release.py --target aarch64-unknown-linux-gnu --skip-build --output-dir . --binary-dir "$RUNNER_TEMP/linux-arm64-binaries" --binary-sums-sha256 "$INPUTS_SHA256"
+
+      - name: Verify packaged duduclaw-bootstrap against the pin file
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/package-linux-release.py --target aarch64-unknown-linux-gnu --verify-archive duduclaw-linux-arm64.tar.gz > "$RUNNER_TEMP/bootstrap-summary.txt"
+          { echo "### Linux bootstrap verifier"; cat "$RUNNER_TEMP/bootstrap-summary.txt"; } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8
+        with:
+          name: smoke-TEST-ONLY-verifier-aarch64
+          path: ${{ runner.temp }}/test-verifier-download
+
+      - name: Execute TEST-root verifier natively and check the packager refuses it
+        shell: bash
+        env:
+          SMOKE_TEST_PIN: 7e577e577e577e577e577e577e577e577e577e577e577e577e577e577e577e57
+          VERIFIER_SHA256: ${{ needs.build.outputs.arm64_test_verifier_sha256 }}
+        run: |
+          set -euo pipefail
+          download="$RUNNER_TEMP/test-verifier-download/duduclaw-bootstrap"
+          [[ "$VERIFIER_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::missing TEST verifier digest"; exit 1; }
+          mkdir -m 0700 "$RUNNER_TEMP/test-verifier"
+          cp -- "$download" "$RUNNER_TEMP/test-verifier/duduclaw-bootstrap"
+          actual="$(sha256sum "$RUNNER_TEMP/test-verifier/duduclaw-bootstrap")"
+          [[ "${actual%% *}" == "$VERIFIER_SHA256" ]] || { echo "::error::TEST verifier hand-off digest mismatch"; exit 1; }
+          chmod 0755 "$RUNNER_TEMP/test-verifier/duduclaw-bootstrap"
+          verifier="$RUNNER_TEMP/test-verifier/duduclaw-bootstrap"
+          actual="$(env -i "$verifier" --print-root-pin)"
+          [[ "$actual" == "TEST $SMOKE_TEST_PIN" ]] || { echo "::error::TEST-root verifier must print exactly TEST <smoke pin>"; exit 1; }
+          python3 - "$verifier" aarch64-unknown-linux-gnu "$SMOKE_TEST_PIN" <<'PY'
+          import importlib.util, pathlib, sys
+          spec = importlib.util.spec_from_file_location("packager", "scripts/package-linux-release.py")
+          packager = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(packager)
+          version = packager.version_text(packager.workspace_version())
+          try:
+              packager.verify_bootstrap_binary(pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3], version)
+          except ValueError as error:
+              print(f"production packager refused the TEST-root verifier: {error}")
+          else:
+              sys.exit("production packager accepted a TEST-root verifier")
+          PY
+          echo "TEST-root verifier executed natively on $(uname -m): prints TEST, refused for packaging." >> "$GITHUB_STEP_SUMMARY"

@@ -8,6 +8,18 @@
 #   ./scripts/release.sh linux-assets --target <triple> [--output-dir <dir>]
 #                         [--manifest-template <json> --signing-key <offline-key>]
 #                                                          # build/package, never publish
+#   ./scripts/release.sh isolation-sign --help             # OFFLINE, owner present: sign the
+#                                                          # native Linux isolation release
+#
+# isolation-sign (plan R2 §4.2) runs after CI has published the tag's Linux
+# archives. It needs release/bootstrap-root.sha256 (added after the key
+# ceremony; without it there is no production pin and nothing to sign). Per
+# release it probes the released duduclaw-bootstrap (PRODUCTION <pin>), signs
+# the isolation manifest with the target key, uploads the update-service assets
+# (isolated-linux-<arch>-*) and writes SHA256SUMS-isolation.txt. Only the
+# versions in ISOLATION_MIGRATION_BUNDLE_VERSIONS (owner decision Q6: v1.83.0)
+# also build the migration bundle tar and need the root threshold
+# (--migration-bundle --root-key R1 --root-key R2) plus the legacy minisign key.
 #
 # --title "<theme>" sets the one-line release theme in the CHANGELOG version
 # header (house style: "## [1.36.0] - 2026-07-15 — <theme>"). On a bump the
@@ -384,6 +396,352 @@ run_verify() {
     return $rc
 }
 
+# --- isolation-sign: offline signing of the native Linux isolation release (plan R2 §4.2) ---
+# Owner decision Q6 (2026-11-17): ONLY v1.83.0 ships a migration bundle signed
+# by the root threshold; later versions reach migrated hosts through the update
+# service. Adding a version here is an owner decision, never a routine edit.
+ISOLATION_MIGRATION_BUNDLE_VERSIONS="1.83.0"
+ISOLATION_PIN_FILE="release/bootstrap-root.sha256"
+ISOLATION_TEMPLATE="release/isolation/manifest-template.json"
+ISOLATION_REPO="zhixuli0406/DuDuClaw"
+ISOLATION_WORK=""
+
+isolation_sign_usage() {
+    cat <<'EOF'
+Usage: scripts/release.sh isolation-sign \
+         --target-key <target key handle> \
+         --root-metadata <root.json> --root-signatures <root.json.signatures.json> \
+         --output-dir <new directory> [--ssh-keygen <Homebrew ssh-keygen>] \
+         [--manifest-valid-days <1-1830, default 365>] \
+         [--migration-bundle --root-key <R1 key handle> --root-key <R2 key> \
+          [--legacy-minisign-key <default ~/.minisign/duduclaw-release.key>] \
+          [--authorization-valid-days <1-1830, default 730>]] \
+         [--no-upload]
+
+OFFLINE signing of the native Linux isolation release (plan R2 §4.2). Run it
+attended, in an interactive terminal, on the release machine with the hardware
+key attached, from a clean checkout of tag v<version>, after CI has published
+that tag's Linux archives. Never in CI; never with stdin/stdout sent to a log.
+
+Steps, in order (any failure stops everything; no output is ever overwritten):
+  0. Preconditions: not CI, interactive terminal, clean tree at tag v<version>,
+     release/bootstrap-root.sha256 present (absent = no production pin = nothing
+     to sign), SHA-256 of --root-metadata equal to that pin, gh/minisign/ssh-keygen.
+  For x86_64 and aarch64:
+  1. Download duduclaw-linux-<arch>.tar.gz (+ .sha256, .minisig) of the tag; verify
+     the CI minisign signature with the official release key and its exact
+     trusted comment; extract duduclaw-bootstrap and execute --print-root-pin
+     (natively on Linux of that arch, otherwise `docker run --network none`
+     ubuntu:22.04): it must print exactly PRODUCTION <pin>.
+  2. The target key signs the isolation manifest: release/isolation/manifest-template.json
+     rendered for this version/arch (serial = major*10^6+minor*10^3+patch) over the
+     binaries of that same released archive; ssh-keygen asks for touch + PIN.
+  Only for ISOLATION_MIGRATION_BUNDLE_VERSIONS (owner decision Q6: ONLY v1.83.0),
+  which also REQUIRE --migration-bundle (every other version refuses it):
+  3. Assemble the bootstrap inbox and the plain-ustar migration bundle
+     duduclaw-isolated-linux-<arch>-<version>.tar.
+  4. The root threshold (R1 touch + PIN, R2 passphrase) signs its
+     BundleAuthorization; the legacy release minisign key signs the tar
+     (minisign asks for its password); both are verified before going on.
+  Then:
+  5. Write <output-dir>/SHA256SUMS-isolation.txt from the exact bytes to upload,
+     plus "<pin>  root.json" (the root metadata fingerprint).
+  6. After you type UPLOAD: upload the update-service assets isolated-linux-<arch>-*
+     (and, for the bundle version, duduclaw-bootstrap-linux-<arch> and the four
+     bundle files) to the GitHub release without replacing any asset, then
+     download every uploaded asset again and compare its SHA-256.
+Publishing SHA256SUMS-isolation.txt on the website and the licensed console is
+the separate [external] gate; this script never publishes it there.
+
+Secrets: key files and key handles are opened only by ssh-keygen / minisign,
+which prompt on the terminal. This script never copies, prints or logs a key,
+passphrase or PIN; its temporary directory holds public release data only and
+is removed on exit.
+EOF
+}
+
+isolation_fail() {
+    echo "Error: $*" >&2
+    return 1
+}
+
+isolation_sha256() {
+    python3 -c 'import hashlib, sys
+digest = hashlib.sha256()
+with open(sys.argv[1], "rb") as source:
+    for chunk in iter(lambda: source.read(1 << 20), b""):
+        digest.update(chunk)
+print(digest.hexdigest())' "$1"
+}
+
+# Exact minisign text: four lines, prehashed (ED) signature, exact trusted comment.
+isolation_check_minisig() {
+    python3 - "$1" "$2" <<'PY'
+import base64, binascii, sys
+try:
+    with open(sys.argv[1], "rb") as source:
+        lines = source.read(4096).decode("utf-8").split("\n")
+    ok = (len(lines) == 5 and lines[4] == "" and lines[0].startswith("untrusted comment: ")
+          and base64.b64decode(lines[1], validate=True)[:2] == b"ED"
+          and lines[2] == "trusted comment: " + sys.argv[2])
+except (OSError, UnicodeDecodeError, binascii.Error):
+    ok = False
+sys.exit(0 if ok else 1)
+PY
+}
+
+# Execute the verifier's read-only --print-root-pin; its stdout is the result.
+# $1 is a private copy named duduclaw-bootstrap in its own directory.
+isolation_probe_pin() {
+    local binary="$1" arch="$2" host_arch platform
+    host_arch="$(uname -m)"
+    if [[ "$host_arch" == "arm64" ]]; then host_arch="aarch64"; fi
+    if [[ "$(uname -s)" == "Linux" && "$host_arch" == "$arch" ]]; then
+        env -i "$binary" --print-root-pin
+        return
+    fi
+    case "$arch" in
+        x86_64) platform="linux/amd64" ;;
+        aarch64) platform="linux/arm64" ;;
+        *) return 1 ;;
+    esac
+    command -v docker >/dev/null 2>&1 \
+        || isolation_fail "executing the $arch verifier here needs docker (or run on Linux $arch)" || return 1
+    docker run --rm --network none --platform "$platform" \
+        -v "$(dirname -- "$binary"):/probe:ro" ubuntu:22.04 /probe/duduclaw-bootstrap --print-root-pin
+}
+
+run_isolation_sign() {
+    local target_key="" root_metadata="" root_signatures="" output_dir="" ssh_keygen="ssh-keygen"
+    local manifest_days=365 authorization_days=730 migration_bundle=0 upload=1
+    local legacy_minisign_key="$HOME/.minisign/duduclaw-release.key"
+    local -a root_keys=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help) isolation_sign_usage; return 0 ;;
+            --target-key) target_key="${2:?--target-key needs a value}"; shift 2 ;;
+            --root-metadata) root_metadata="${2:?--root-metadata needs a value}"; shift 2 ;;
+            --root-signatures) root_signatures="${2:?--root-signatures needs a value}"; shift 2 ;;
+            --output-dir) output_dir="${2:?--output-dir needs a value}"; shift 2 ;;
+            --ssh-keygen) ssh_keygen="${2:?--ssh-keygen needs a value}"; shift 2 ;;
+            --manifest-valid-days) manifest_days="${2:?--manifest-valid-days needs a value}"; shift 2 ;;
+            --authorization-valid-days) authorization_days="${2:?--authorization-valid-days needs a value}"; shift 2 ;;
+            --root-key) root_keys+=("${2:?--root-key needs a value}"); shift 2 ;;
+            --legacy-minisign-key) legacy_minisign_key="${2:?--legacy-minisign-key needs a value}"; shift 2 ;;
+            --migration-bundle) migration_bundle=1; shift ;;
+            --no-upload) upload=0; shift ;;
+            *) isolation_fail "unknown isolation-sign option '$1' (see --help)"; return 1 ;;
+        esac
+    done
+
+    # 0. Preconditions, cheapest and most decisive first.
+    if [[ -n "${CI:-}" || -n "${GITHUB_ACTIONS:-}" ]]; then
+        isolation_fail "isolation-sign uses offline keys and never runs in CI"; return 1
+    fi
+    local bundle_release=0 listed
+    local -a bundle_versions=()
+    read -r -a bundle_versions <<< "$ISOLATION_MIGRATION_BUNDLE_VERSIONS"
+    for listed in "${bundle_versions[@]}"; do
+        if [[ "$listed" == "$CURRENT_VERSION" ]]; then bundle_release=1; fi
+    done
+    if [[ "$migration_bundle" == "1" && "$bundle_release" == "0" ]]; then
+        isolation_fail "owner decision Q6: only v$ISOLATION_MIGRATION_BUNDLE_VERSIONS ships a migration bundle;" \
+            "v$CURRENT_VERSION reaches migrated hosts through the update service. Drop --migration-bundle."
+        return 1
+    fi
+    if [[ "$migration_bundle" == "0" && "$bundle_release" == "1" ]]; then
+        isolation_fail "v$CURRENT_VERSION is the migration-bundle release (owner decision Q6);" \
+            "pass --migration-bundle --root-key <R1> --root-key <R2>."
+        return 1
+    fi
+    if [[ -z "$target_key" || -z "$root_metadata" || -z "$root_signatures" || -z "$output_dir" ]]; then
+        isolation_fail "--target-key, --root-metadata, --root-signatures and --output-dir are required (see --help)"
+        return 1
+    fi
+    if [[ "$migration_bundle" == "1" ]]; then
+        if [[ ${#root_keys[@]} -ne 2 || "${root_keys[0]}" == "${root_keys[1]}" ]]; then
+            isolation_fail "--migration-bundle needs exactly two distinct --root-key (the 2-of-3 threshold)"; return 1
+        fi
+    elif [[ ${#root_keys[@]} -ne 0 ]]; then
+        isolation_fail "--root-key is only used with --migration-bundle"; return 1
+    fi
+    local days
+    for days in "$manifest_days" "$authorization_days"; do
+        if [[ ! "$days" =~ ^[1-9][0-9]{0,3}$ ]] || (( days > 1830 )); then
+            isolation_fail "validity must be 1 to 1830 days"; return 1
+        fi
+    done
+    if [[ ! -t 0 ]]; then
+        isolation_fail "isolation-sign must run attended in an interactive terminal (keys prompt on the tty)"
+        return 1
+    fi
+    if [[ ! -f "$ISOLATION_PIN_FILE" || -L "$ISOLATION_PIN_FILE" ]]; then
+        isolation_fail "$ISOLATION_PIN_FILE is absent: there is no production root pin, so no isolation" \
+            "release can be signed (the key ceremony adds it through a reviewed PR)."
+        return 1
+    fi
+    local pin
+    pin="$(python3 -c 'import importlib.util, sys
+spec = importlib.util.spec_from_file_location("packager", "scripts/package-linux-release.py")
+packager = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(packager)
+pin = packager.read_pin_file(sys.argv[1])
+if pin is None:
+    sys.exit("production pin file is absent")
+print(pin)' "$ISOLATION_PIN_FILE")"
+    local tag="v$CURRENT_VERSION" head tag_commit
+    head="$(git rev-parse HEAD)"
+    tag_commit="$(git rev-parse --verify --quiet "refs/tags/$tag^{commit}" || true)"
+    if [[ -z "$tag_commit" || "$head" != "$tag_commit" ]]; then
+        isolation_fail "check out tag $tag first: the template, pin file and released archives must belong to it"
+        return 1
+    fi
+    if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
+        isolation_fail "the working tree has uncommitted changes"; return 1
+    fi
+    if [[ ! -f "$root_metadata" || -L "$root_metadata" || ! -f "$root_signatures" || -L "$root_signatures" ]]; then
+        isolation_fail "--root-metadata and --root-signatures must be regular files"; return 1
+    fi
+    if [[ "$(isolation_sha256 "$root_metadata")" != "$pin" ]]; then
+        isolation_fail "SHA-256 of --root-metadata differs from $ISOLATION_PIN_FILE"; return 1
+    fi
+    local tool
+    for tool in gh minisign "$ssh_keygen"; do
+        if ! command -v "$tool" >/dev/null 2>&1; then isolation_fail "$tool is not on PATH"; return 1; fi
+    done
+    if [[ "$migration_bundle" == "1" && ! -f "$legacy_minisign_key" ]]; then
+        isolation_fail "legacy release minisign key not found (--legacy-minisign-key)"; return 1
+    fi
+    local legacy_public
+    legacy_public="$(sed -n 's|^pub const LEGACY_RELEASE_MINISIGN_KEY: &str = "\([A-Za-z0-9+/=]*\)";$|\1|p' \
+        crates/duduclaw-isolation/src/update.rs)"
+    if [[ ! "$legacy_public" =~ ^RW[A-Za-z0-9+/]{54}$ ]]; then
+        isolation_fail "cannot read LEGACY_RELEASE_MINISIGN_KEY from duduclaw-isolation"; return 1
+    fi
+    if [[ -e "$output_dir" || -L "$output_dir" ]]; then
+        isolation_fail "--output-dir must not exist yet (outputs are never overwritten)"; return 1
+    fi
+    mkdir -m 0700 -- "$output_dir"
+    ISOLATION_WORK="$(mktemp -d "${TMPDIR:-/tmp}/duduclaw-isolation-sign.XXXXXX")"
+    trap 'rm -rf -- "$ISOLATION_WORK"' EXIT
+
+    local arch triple archive bundle_name verifier probe_output expires asset
+    local -a uploads=()
+    expires=$(( $(date +%s) + authorization_days * 86400 ))
+    for arch in x86_64 aarch64; do
+        if [[ "$arch" == "x86_64" ]]; then
+            triple="x86_64-unknown-linux-gnu"; archive="duduclaw-linux-x64.tar.gz"
+        else
+            triple="aarch64-unknown-linux-gnu"; archive="duduclaw-linux-arm64.tar.gz"
+        fi
+        echo "== $arch: $archive of $tag"
+        mkdir -m 0700 -- "$ISOLATION_WORK/$arch" "$ISOLATION_WORK/$arch/probe"
+        gh release download "$tag" --repo "$ISOLATION_REPO" --dir "$ISOLATION_WORK/$arch" \
+            --pattern "$archive" --pattern "$archive.sha256" --pattern "$archive.minisig"
+        minisign -V -q -P "$legacy_public" -m "$ISOLATION_WORK/$arch/$archive" -x "$ISOLATION_WORK/$arch/$archive.minisig"
+        if ! isolation_check_minisig "$ISOLATION_WORK/$arch/$archive.minisig" "duduclaw $tag $archive"; then
+            isolation_fail "$archive.minisig is not the release job's prehashed signature for $tag"; return 1
+        fi
+        # 1. The released verifier must be a PRODUCTION build of exactly this pin.
+        python3 scripts/package-linux-release.py --target "$triple" \
+            --extract-bootstrap "$ISOLATION_WORK/$arch/$archive" --output-dir "$ISOLATION_WORK/$arch/verifier"
+        verifier="$ISOLATION_WORK/$arch/verifier/duduclaw-bootstrap-linux-$arch"
+        cp -- "$verifier" "$ISOLATION_WORK/$arch/probe/duduclaw-bootstrap"
+        chmod 0755 "$ISOLATION_WORK/$arch/probe/duduclaw-bootstrap"
+        probe_output="$(isolation_probe_pin "$ISOLATION_WORK/$arch/probe/duduclaw-bootstrap" "$arch")"
+        if [[ "$probe_output" != "PRODUCTION $pin" ]]; then
+            # The probe output itself is not echoed; only the expectation is named.
+            isolation_fail "the released $arch duduclaw-bootstrap does not print PRODUCTION <$ISOLATION_PIN_FILE>"
+            return 1
+        fi
+        # 2. Target key: isolation manifest over the binaries of this released archive.
+        local -a package_args=(--target "$triple" --from-release-archive "$ISOLATION_WORK/$arch/$archive"
+            --manifest-template "$ISOLATION_TEMPLATE" --manifest-valid-days "$manifest_days"
+            --signing-key "$target_key" --ssh-keygen "$ssh_keygen" --output-dir "$output_dir")
+        if [[ "$migration_bundle" == "1" ]]; then
+            package_args+=(--bootstrap-root "$root_metadata" --bootstrap-root-signatures "$root_signatures")
+        fi
+        echo "Target key ($arch manifest): touch the key and enter its PIN when ssh-keygen asks."
+        python3 scripts/package-linux-release.py "${package_args[@]}"
+        for asset in "$output_dir/isolated-linux-$arch-"*; do
+            if [[ -f "$asset" && ! -L "$asset" ]]; then uploads+=("$asset"); fi
+        done
+        if [[ "$migration_bundle" == "1" ]]; then
+            # 3. Plain-ustar migration bundle (plan §3.2).
+            python3 scripts/package-linux-release.py --target "$triple" \
+                --migration-bundle-from "$output_dir/isolated-linux-$arch-bootstrap-inbox" --output-dir "$output_dir"
+            bundle_name="duduclaw-isolated-linux-$arch-$CURRENT_VERSION.tar"
+            # 4. Transition dual signature: root threshold + legacy release key.
+            echo "Root threshold ($arch bundle): R1 touch + PIN, then the R2 passphrase."
+            python3 scripts/sign-isolation-manifest.py --kind bundle --bundle "$output_dir/$bundle_name" \
+                --expires-at-unix "$expires" --output "$output_dir/$bundle_name.authorization.json" \
+                --key "${root_keys[0]}" --key "${root_keys[1]}" --ssh-keygen "$ssh_keygen"
+            echo "Legacy release key ($arch bundle): minisign asks for its password."
+            minisign -S -s "$legacy_minisign_key" -m "$output_dir/$bundle_name" \
+                -t "duduclaw v$CURRENT_VERSION $bundle_name" -x "$output_dir/$bundle_name.minisig"
+            minisign -V -q -P "$legacy_public" -m "$output_dir/$bundle_name" -x "$output_dir/$bundle_name.minisig"
+            if ! isolation_check_minisig "$output_dir/$bundle_name.minisig" "duduclaw v$CURRENT_VERSION $bundle_name"; then
+                isolation_fail "$bundle_name.minisig is not a prehashed signature with the verifier's trusted comment"
+                return 1
+            fi
+            cp -- "$verifier" "$output_dir/duduclaw-bootstrap-linux-$arch"
+            chmod 0755 "$output_dir/duduclaw-bootstrap-linux-$arch"
+            uploads+=("$output_dir/duduclaw-bootstrap-linux-$arch" "$output_dir/$bundle_name"
+                "$output_dir/$bundle_name.minisig" "$output_dir/$bundle_name.authorization.json"
+                "$output_dir/$bundle_name.authorization.json.signatures.json")
+        fi
+    done
+
+    # 5. Publication list from the exact bytes to upload (+ root fingerprint).
+    local sums_file="$output_dir/SHA256SUMS-isolation.txt" index name
+    local -a hashes=()
+    for index in "${!uploads[@]}"; do
+        hashes+=("$(isolation_sha256 "${uploads[$index]}")")
+    done
+    {
+        for index in "${!uploads[@]}"; do
+            printf '%s  %s\n' "${hashes[$index]}" "$(basename -- "${uploads[$index]}")"
+        done
+        printf '%s  %s\n' "$pin" "root.json"
+    } > "$sums_file"
+    echo ""
+    echo "Assets for GitHub release $tag:"
+    for index in "${!uploads[@]}"; do
+        printf '  %s\n' "$(basename -- "${uploads[$index]}")"
+    done
+    if [[ "$upload" == "0" ]]; then
+        echo "--no-upload: nothing uploaded; every output stays in $output_dir."
+    else
+        # 6. Upload exactly the recorded bytes, never replacing an asset, then read back.
+        local answer=""
+        read -r -p "Type UPLOAD to publish these ${#uploads[@]} assets to $tag: " answer
+        if [[ "$answer" != "UPLOAD" ]]; then
+            echo "Not uploaded; every output stays in $output_dir."
+            return 1
+        fi
+        for index in "${!uploads[@]}"; do
+            if [[ "$(isolation_sha256 "${uploads[$index]}")" != "${hashes[$index]}" ]]; then
+                isolation_fail "$(basename -- "${uploads[$index]}") changed after it was recorded"; return 1
+            fi
+        done
+        gh release upload "$tag" --repo "$ISOLATION_REPO" "${uploads[@]}"
+        mkdir -m 0700 -- "$ISOLATION_WORK/readback"
+        for index in "${!uploads[@]}"; do
+            name="$(basename -- "${uploads[$index]}")"
+            gh release download "$tag" --repo "$ISOLATION_REPO" --dir "$ISOLATION_WORK/readback" --pattern "$name"
+            if [[ "$(isolation_sha256 "$ISOLATION_WORK/readback/$name")" != "${hashes[$index]}" ]]; then
+                isolation_fail "uploaded $name differs from the signed bytes; investigate before publishing"; return 1
+            fi
+        done
+        echo "Uploaded and read back ${#uploads[@]} assets."
+    fi
+    echo ""
+    echo "SHA256SUMS-isolation.txt (sha256 $(isolation_sha256 "$sums_file")):"
+    cat -- "$sums_file"
+    echo "[external gate] Publish this list on the website AND the licensed console only after"
+    echo "owner confirmation; both must show identical values (design §8 step 1)."
+}
+
 # --- Arg parsing / sub-commands ---
 if [[ $# -lt 1 ]]; then
     echo "Usage:"
@@ -392,6 +750,7 @@ if [[ $# -lt 1 ]]; then
     echo "  $0 audit                             show each platform's version + drift"
     echo "  $0 verify [version]                  confirm PyPI/npm published <version>"
     echo "  $0 linux-assets --target <triple>     build/package all native Linux binaries"
+    echo "  $0 isolation-sign --help              OFFLINE: sign/upload the Linux isolation release"
     exit 1
 fi
 
@@ -406,6 +765,11 @@ case "$1" in
     linux-assets)
         shift
         exec python3 "$(dirname "$0")/package-linux-release.py" "$@"
+        ;;
+    isolation-sign)
+        shift
+        run_isolation_sign "$@"
+        exit $?
         ;;
     audit)
         run_audit "$CURRENT_VERSION" || {
@@ -494,7 +858,9 @@ if $DRY_RUN; then
     echo "[DRY RUN] ALL channels: 5 GitHub targets + minisign/cosign, npm, PyPI, KB, GHCR,"
     echo "          computer-use image, desktop, Pro image/OEM tar/pro-bin/control-plane allowlist,"
     echo "          distributor console manuals (publish-manuals.py, dry run first)."
-    echo "[DRY RUN] Linux archives include native isolation services; F metadata is signed offline only."
+    echo "[DRY RUN] Linux archives include native isolation services; duduclaw-bootstrap only with"
+    echo "          release/bootstrap-root.sha256. Isolation metadata is signed offline afterwards:"
+    echo "          $0 isolation-sign --help (owner present; migration bundle only for: $ISOLATION_MIGRATION_BUNDLE_VERSIONS)."
     echo "[DRY RUN] Pro image CLOUD_BUILD=$CLOUD_BUILD; no signing/build/install/commit/tag/publish performed."
     echo "[DRY RUN] Confirm after publishing: $0 verify $NEW_VERSION"
 fi

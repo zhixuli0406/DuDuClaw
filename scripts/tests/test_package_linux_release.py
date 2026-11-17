@@ -689,6 +689,337 @@ class LinuxReleaseTests(unittest.TestCase):
             self.assertEqual(artifact["sha256"],list(hashlib.sha256(payload).digest()))
             self.assertEqual(artifact["size_bytes"],len(payload))
 
+    # ---------------------------------------------------------------- R2: test-key leak prevention
+
+    def test_test_root_pin_in_the_verifier_refuses_the_production_tarball(self):
+        # Layer 2: a cfg(duduclaw_test_root) verifier prints TEST <pin>; every
+        # packaging path refuses it, with any pin, before an archive exists.
+        release = self.cargo_layout()
+        test_probes = {**good_probes(), "--print-root-pin": (0, f"TEST {PIN}\n".encode())}
+        self.assert_refused(release, ["--bootstrap-root-sha256", PIN], probes=test_probes)
+        pin_file = self.root / "bootstrap-root.sha256"
+        pin_file.write_text(PIN + "\n")
+        self.assert_refused(release, ["--bootstrap-root-pin-file", str(pin_file)], probes=test_probes)
+        with self.assertRaises(ValueError):
+            self.run_build_only(release, ["--bootstrap-root-sha256", PIN], test_probes)
+        # The same refusal on the native host after a hand-off.
+        handoff = self.root / "handoff"
+        self.run_main(release, [], extra=["--bootstrap-root-sha256", PIN, "--export-binaries", str(handoff)])
+        digest = PACKAGE.sha256(handoff / PACKAGE.TRANSFER_SUMS)
+        self.assert_refused(release, ["--bootstrap-root-sha256", PIN, "--binary-dir", str(handoff),
+                                      "--binary-sums-sha256", digest], probes=test_probes)
+
+    def test_test_signer_is_never_built_listed_or_packaged(self):
+        # Layer 1: the TEST-ONLY signer is not a release binary and no release
+        # build may name its feature or binary, or select it implicitly.
+        self.assertNotIn(PACKAGE.TEST_SIGNER_BINARY, PACKAGE.BIN_PACKAGES)
+        PACKAGE.check_release_binary_set()
+        for bad in ({**PACKAGE.BIN_PACKAGES, PACKAGE.TEST_SIGNER_BINARY: "duduclaw-updated"},
+                    {**PACKAGE.BIN_PACKAGES, "x": "duduclaw-updated/test-signer"}):
+            with self.assertRaises(ValueError):
+                PACKAGE.check_release_binary_set(bad)
+        for include in (True, False):
+            command = PACKAGE.build_command(TARGET, "cross", include)
+            self.assertEqual(PACKAGE.refuse_test_signer_build(command), command)
+            for extra in (["--features", "duduclaw-updated/test-signer"], ["--features=test-signer"],
+                          ["--bin", PACKAGE.TEST_SIGNER_BINARY], ["--bins"], ["--all-features"], ["--all-targets"]):
+                with self.subTest(extra=extra), self.assertRaises(ValueError):
+                    PACKAGE.refuse_test_signer_build(command + extra)
+        # Wired into main(): refused before Cargo runs.
+        release = self.cargo_layout()
+        original = PACKAGE.build_command
+        calls = []
+        with patch.object(PACKAGE, "build_command",
+                          lambda *args: original(*args) + ["--features", "duduclaw-updated/test-signer"]):
+            with self.assertRaises(ValueError):
+                self.run_main(release, calls, skip_build=False)
+        self.assertFalse(any(call[1:2] == ["build"] for call in calls))
+        # The Cargo manifest only builds the signer behind its feature.
+        manifest = (ROOT / "crates/duduclaw-updated/Cargo.toml").read_text()
+        block = re.search(r'\[\[bin\]\]\nname = "duduclaw-isolation-test-signer"\n(?:[^\[\n][^\n]*\n)*', manifest)
+        self.assertIsNotNone(block)
+        self.assertIn('required-features = ["test-signer"]', block[0])
+        self.assertIn('test-signer = ["dep:blake2"]', manifest)
+        self.assertNotRegex(manifest, r'(?m)^default\s*=.*test-signer')
+
+    def test_pin_file_absent_means_no_bootstrap_and_present_is_strict(self):
+        missing = self.root / "release" / "bootstrap-root.sha256"
+        self.assertIsNone(PACKAGE.read_pin_file(missing))
+        pin_file = self.root / "pin"
+        pin_file.write_text(PIN + "\n")
+        self.assertEqual(PACKAGE.read_pin_file(pin_file), PIN)
+        for content in [PIN, PIN + "\n\n", PIN.upper() + "\n", PIN + "\r\n", " " + PIN + "\n", "\n",
+                        f"{PIN}  root.json\n", "", "ab" * 31 + "\n"]:
+            with self.subTest(content=content):
+                pin_file.write_text(content)
+                with self.assertRaises(ValueError):
+                    PACKAGE.read_pin_file(pin_file)
+        pin_file.write_text(PIN + "\n")
+        link = self.root / "pin-link"
+        link.symlink_to(pin_file)
+        with self.assertRaises(ValueError):
+            PACKAGE.read_pin_file(link)
+        self.assertEqual(PACKAGE.resolve_pin(None, pin_file, {}, True), PIN)
+        self.assertIsNone(PACKAGE.resolve_pin(None, missing, {}, True))
+        for argument, environment in [(PIN, {}), (None, {PACKAGE.BOOTSTRAP_PIN_VARIABLE: OTHER_PIN})]:
+            with self.assertRaises(ValueError):
+                PACKAGE.resolve_pin(argument, pin_file, environment, True)
+        # An inherited pin with an absent file is a conflict, never a silent pin.
+        with self.assertRaises(ValueError):
+            PACKAGE.resolve_pin(None, missing, {PACKAGE.BOOTSTRAP_PIN_VARIABLE: PIN}, True)
+        self.assertEqual(PACKAGE.resolve_pin(None, pin_file, {PACKAGE.BOOTSTRAP_PIN_VARIABLE: PIN}, True), PIN)
+        # main(): absent file = SKIP line and no verifier; present file = verified verifier.
+        release = self.cargo_layout()
+        output = io.StringIO()
+        self.run_main(release, [], extra=["--bootstrap-root-pin-file", str(missing)], output=output)
+        self.assertIn(PACKAGE.OMITTED_BOOTSTRAP_LINE, output.getvalue().splitlines())
+        self.assertNotIn(BOOTSTRAP, self.archive_names())
+        shutil.rmtree(self.output)
+        calls = []
+        self.run_main(release, calls, extra=["--bootstrap-root-pin-file", str(pin_file)], probes=good_probes())
+        self.assertIn(BOOTSTRAP, self.archive_names())
+        self.assertEqual([call[2] for call in calls if call[0] == "probe"], ["--print-root-pin", "--version"])
+
+    def test_cross_build_forwards_only_the_expected_pin(self):
+        environment = PACKAGE.build_environment({"PATH": "/bin", PACKAGE.BOOTSTRAP_PIN_VARIABLE: OTHER_PIN}, None, "cross")
+        self.assertNotIn(PACKAGE.BOOTSTRAP_PIN_VARIABLE, environment)
+        self.assertNotIn(PACKAGE.CROSS_PASSTHROUGH_VARIABLE, environment)
+        environment = PACKAGE.build_environment({PACKAGE.CROSS_PASSTHROUGH_VARIABLE: "OTHER"}, PIN, "cross")
+        self.assertEqual(environment[PACKAGE.BOOTSTRAP_PIN_VARIABLE], PIN)
+        self.assertEqual(environment[PACKAGE.CROSS_PASSTHROUGH_VARIABLE].split(), ["OTHER", PACKAGE.BOOTSTRAP_PIN_VARIABLE])
+        self.assertNotIn(PACKAGE.CROSS_PASSTHROUGH_VARIABLE, PACKAGE.build_environment({}, PIN, "cargo"))
+        release = self.cargo_layout()
+        self.run_main(release, [], extra=["--bootstrap-root-sha256", PIN], probes=good_probes(), skip_build=False)
+        self.assertIn(PACKAGE.BOOTSTRAP_PIN_VARIABLE, self.build_environment[PACKAGE.CROSS_PASSTHROUGH_VARIABLE].split())
+
+    def test_deferred_probe_builds_the_pin_but_never_packages_unprobed(self):
+        release = self.cargo_layout()
+        # No probe is listed: executing the verifier would fail this test.
+        self.run_build_only(release, ["--bootstrap-root-sha256", PIN, "--defer-bootstrap-probe"], {})
+        # Packaging never defers.
+        result = subprocess.run([sys.executable, str(SCRIPT), "--target", TARGET, "--skip-build", "--output-dir",
+                                 str(self.output), "--defer-bootstrap-probe"], capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--defer-bootstrap-probe applies only to --build-only", result.stderr)
+        self.assertFalse(self.output.exists())
+
+    def handoff(self, release, include_bootstrap=True):
+        handoff = self.root / f"handoff-{os.urandom(6).hex()}"
+        extra = ["--bootstrap-root-sha256", PIN] if include_bootstrap else []
+        calls = []
+        self.run_main(release, calls, extra=[*extra, "--export-binaries", str(handoff)])
+        self.assertFalse(any(call[0] == "probe" for call in calls))
+        self.assertFalse(self.output.exists())
+        # Artifact transit drops the execute bits.
+        for path in handoff.iterdir():
+            path.chmod(0o644)
+        return handoff, PACKAGE.sha256(handoff / PACKAGE.TRANSFER_SUMS)
+
+    def test_native_handoff_rehashes_every_packaged_byte(self):
+        release = self.cargo_layout()
+        handoff, digest = self.handoff(release)
+        self.assertEqual({path.name for path in handoff.iterdir()},
+                         {*PACKAGE.archive_binaries(True), PACKAGE.TRANSFER_SUMS})
+        self.assertEqual(handoff.stat().st_mode & 0o777, 0o700)
+        calls = []
+        self.run_main(release, calls, extra=["--bootstrap-root-sha256", PIN, "--binary-dir", str(handoff),
+                                             "--binary-sums-sha256", digest], probes=good_probes())
+        with tarfile.open(self.output / "duduclaw-linux-x64.tar.gz") as bundle:
+            for name in PACKAGE.archive_binaries(True):
+                self.assertEqual(bundle.extractfile(name).read(), (release / name).read_bytes())
+        probed = [Path(call[1]) for call in calls if call[0] == "probe"]
+        self.assertTrue(probed and all(path.parent != handoff for path in probed))
+        shutil.rmtree(self.output)
+        pinned = ["--bootstrap-root-sha256", PIN]
+
+        def tampered(change):
+            copy, _ = self.handoff(release)
+            change(copy)
+            return copy
+        cases = {
+            "wrong digest": (handoff, OTHER_PIN),
+            "malformed digest": (handoff, digest.upper()),
+            "changed binary": (tampered(lambda d: (d / "duduclaw").write_bytes(b"\x7fELF\x00GLIBC_2.17\x00evil")), digest),
+            "extra file": (tampered(lambda d: (d / "extra").write_bytes(b"x")), digest),
+            "missing binary": (tampered(lambda d: (d / "duduclaw-run").unlink()), digest),
+        }
+        resigned = tampered(lambda d: (d / "duduclaw").write_bytes(b"\x7fELF\x00GLIBC_2.17\x00evil"))
+        lines = (resigned / PACKAGE.TRANSFER_SUMS).read_text().splitlines()
+        lines = [f"{PACKAGE.sha256(resigned / 'duduclaw')}  duduclaw" if line.endswith("  duduclaw") else line
+                 for line in lines]
+        (resigned / PACKAGE.TRANSFER_SUMS).write_text("\n".join(lines) + "\n")
+        cases["rewritten SHA256SUMS"] = (resigned, digest)
+        unpinned, unpinned_digest = self.handoff(release, include_bootstrap=False)
+        cases["set built without the pin"] = (unpinned, unpinned_digest)
+        for name, (directory, value) in cases.items():
+            with self.subTest(name=name):
+                self.assert_refused(release, [*pinned, "--binary-dir", str(directory), "--binary-sums-sha256", value],
+                                    probes=good_probes())
+        for extra in (["--binary-dir", str(handoff)], ["--binary-sums-sha256", digest]):
+            result = subprocess.run([sys.executable, str(SCRIPT), "--target", TARGET, "--skip-build",
+                                     "--output-dir", str(self.output), *extra], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("go together", result.stderr)
+
+    def archive_with(self, include_bootstrap, name):
+        output = self.root / name
+        verified = {BOOTSTRAP: PACKAGE.sha256(self.binaries / BOOTSTRAP)} if include_bootstrap else {}
+        return PACKAGE.create_archive(self.binaries, self.python, TARGET, output,
+                                      binaries=PACKAGE.archive_binaries(include_bootstrap), verified=verified)
+
+    def test_verify_archive_reports_presence_and_absence(self):
+        without = self.archive_with(False, "without")
+        line = PACKAGE.verify_archive(without, TARGET, None, VERSION)
+        self.assertTrue(line.startswith(f"x86_64: {BOOTSTRAP} NOT shipped"), line)
+        with self.assertRaises(ValueError):
+            PACKAGE.verify_archive(without, TARGET, PIN, VERSION)
+        shipped = self.archive_with(True, "with")
+        with self.assertRaisesRegex(ValueError, "no production root pin"):
+            PACKAGE.verify_archive(shipped, TARGET, None, VERSION)
+        with patch.object(PACKAGE, "probe_bootstrap", lambda path, flag: good_probes()[flag]), \
+                patch.object(PACKAGE, "host_architecture", return_value="x86_64"):
+            line = PACKAGE.verify_archive(shipped, TARGET, PIN, VERSION)
+            self.assertIn(f"PRODUCTION {PIN}, sha256 {PACKAGE.sha256(self.binaries / BOOTSTRAP)}", line)
+        test_probes = {**good_probes(), "--print-root-pin": (0, f"TEST {PIN}\n".encode())}
+        with patch.object(PACKAGE, "probe_bootstrap", lambda path, flag: test_probes[flag]), \
+                patch.object(PACKAGE, "host_architecture", return_value="x86_64"):
+            with self.assertRaises(ValueError):
+                PACKAGE.verify_archive(shipped, TARGET, PIN, VERSION)
+        with patch.object(PACKAGE, "host_architecture", return_value="aarch64"):
+            with self.assertRaisesRegex(ValueError, "cannot be executed on this host"):
+                PACKAGE.verify_archive(shipped, TARGET, PIN, VERSION)
+        Path(str(shipped) + ".sha256").write_text("00" * 32 + "  duduclaw-linux-x64.tar.gz\n")
+        with self.assertRaisesRegex(ValueError, "does not match its .sha256"):
+            PACKAGE.verify_archive(shipped, TARGET, None, VERSION)
+        with self.assertRaisesRegex(ValueError, "is not the aarch64 release archive"):
+            PACKAGE.verify_archive(without, "aarch64-unknown-linux-gnu", None, VERSION)
+
+    def test_released_archive_is_read_only_through_its_checksum(self):
+        shipped = self.archive_with(True, "released")
+        snapshot = self.root / "snapshot"
+        snapshot.mkdir(mode=0o700)
+        names, digest = PACKAGE.snapshot_release_archive(shipped, TARGET, snapshot)
+        self.assertEqual(names, PACKAGE.archive_binaries(False))
+        self.assertEqual(digest, PACKAGE.sha256(shipped))
+        self.assertEqual({path.name for path in snapshot.iterdir()}, set(names))
+        for name in names:
+            self.assertEqual((snapshot / name).read_bytes(), (self.binaries / name).read_bytes())
+        asset, asset_digest = PACKAGE.extract_bootstrap(shipped, TARGET, self.output)
+        self.assertEqual(asset.name, "duduclaw-bootstrap-linux-x86_64")
+        self.assertEqual(asset.read_bytes(), (self.binaries / BOOTSTRAP).read_bytes())
+        self.assertEqual(asset_digest, PACKAGE.sha256(asset))
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            PACKAGE.extract_bootstrap(shipped, TARGET, self.output)
+        with self.assertRaises(ValueError):
+            PACKAGE.extract_bootstrap(self.archive_with(False, "unpinned"), TARGET, self.root / "other")
+        for arguments, message in [
+                (["--from-release-archive", str(shipped), "--bootstrap-root-pin-file", str(self.root / "x")],
+                 "never packages the verifier"),
+                (["--test-signer", str(self.root / "signer"), "--skip-build"], "TEST-ONLY"),
+                (["--from-release-archive", str(shipped), "--test-signer", str(self.root / "signer"),
+                  "--bootstrap-root-sha256", PIN], "TEST-ONLY"),
+                (["--from-release-archive", str(shipped), "--skip-build"], "does not build or package"),
+                (["--verify-archive", str(shipped), "--extract-bootstrap", str(shipped)], "mutually exclusive"),
+                (["--manifest-valid-days", "30", "--skip-build"], "belongs to --from-release-archive")]:
+            with self.subTest(arguments=arguments):
+                result = subprocess.run([sys.executable, str(SCRIPT), "--target", TARGET, "--output-dir",
+                                         str(self.root / "cli"), *arguments], capture_output=True, text=True,
+                                        env={**os.environ, "CI": "", "GITHUB_ACTIONS": ""})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+
+    def test_release_template_renders_into_a_signable_manifest(self):
+        raw = (ROOT / "release/isolation/manifest-template.json").read_bytes()
+        base = json.loads(raw)
+        self.assertFalse(set(PACKAGE.PER_RELEASE_FIELDS) & set(base))
+        version = {"major": 1, "minor": 83, "patch": 0}
+        rendered = json.loads(PACKAGE.render_release_template(raw, "aarch64", version, 1_800_000_000, 365))
+        self.assertEqual(rendered["version"], version)
+        self.assertEqual(rendered["arch"], "aarch64")
+        self.assertEqual(rendered["serial"], 1_083_000)
+        self.assertEqual(rendered["created_at_unix"], 1_800_000_000)
+        self.assertEqual(rendered["expires_at_unix"], 1_800_000_000 + 365 * 86400)
+        self.assertEqual((rendered["schema_version"], rendered["product"], rendered["channel"], rendered["os"]),
+                         (1, "duduclaw", "stable", "linux"))
+        PACKAGE.validate_targets(rendered["artifacts"])
+        # Artifact ids are exactly the names the update service downloads (publication.rs).
+        source = (ROOT / "crates/duduclaw-updated/src/publication.rs").read_text()
+        for artifact in rendered["artifacts"]:
+            variant = "".join(part.title() for part in artifact["install_target"]["kind"].split("_"))
+            match = re.search(r'InstallTarget::' + variant + r' => "([^"]+)"', source)
+            self.assertEqual(artifact["id"], match[1])
+        # The workspace version renders too (the template never outruns the tree).
+        PACKAGE.render_release_template(raw, "x86_64", PACKAGE.workspace_version(), 1_800_000_000, 1)
+        serials = [PACKAGE.release_serial({"major": a, "minor": b, "patch": c})
+                   for a, b, c in [(1, 82, 9), (1, 83, 0), (1, 83, 1), (1, 84, 0), (2, 0, 0)]]
+        self.assertEqual(serials, sorted(set(serials)))
+        for bad_version in [{"major": 1, "minor": 1000, "patch": 0}, {"major": 1, "minor": 83, "patch": 1000}]:
+            with self.assertRaises(ValueError):
+                PACKAGE.release_serial(bad_version)
+        for field in PACKAGE.PER_RELEASE_FIELDS:
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                PACKAGE.render_release_template(json.dumps({**base, field: 1}).encode(), "x86_64", version, 1, 1)
+        for days in (0, PACKAGE.MAX_VALID_DAYS + 1, True):
+            with self.assertRaises(ValueError):
+                PACKAGE.render_release_template(raw, "x86_64", version, 1, days)
+        with self.assertRaises(ValueError):
+            PACKAGE.render_release_template(raw, "x86_64", {"major": 1, "minor": 81, "patch": 0}, 1, 1)
+
+    def ustar_members(self, path):
+        """Parse the bundle with the verifier's rules (duduclaw-updated bundle.rs)."""
+        image = path.read_bytes()
+        members, offset = [], 0
+        while image[offset:offset + 512] != bytes(512):
+            header = image[offset:offset + 512]
+            self.assertEqual(header[257:265], b"ustar\x0000")
+            self.assertEqual(header[156:157], b"0")
+            self.assertFalse(any(header[157:257]))
+            checksum = int(header[148:156].rstrip(b"\0 ").decode(), 8)
+            self.assertEqual(checksum, sum(header[:148]) + 256 + sum(header[156:]))
+            name = header[:100].split(b"\0", 1)[0].decode()
+            size = int(header[124:136].rstrip(b"\0 ").decode(), 8)
+            self.assertEqual(int(header[100:108].rstrip(b"\0 ").decode(), 8), 0o600)
+            data = image[offset + 512:offset + 512 + size]
+            members.append((name, data))
+            padded = (size + 511) // 512 * 512
+            self.assertFalse(any(image[offset + 512 + size:offset + 512 + padded]))
+            offset += 512 + padded
+        self.assertGreaterEqual(len(image) - offset, 1024)
+        self.assertFalse(any(image[offset:]))
+        return members
+
+    def test_migration_bundle_is_plain_ustar_in_inbox_order(self):
+        root, signatures = self.bootstrap_inputs()
+        inbox = PACKAGE.create_bootstrap_inbox(TARGET, self.output, root, signatures)
+        bundle = PACKAGE.create_migration_bundle(TARGET, inbox, self.output)
+        self.assertEqual(bundle.name, f"duduclaw-isolated-linux-x86_64-{VERSION}.tar")
+        members = self.ustar_members(bundle)
+        manifest = json.loads((inbox / "manifest.json").read_bytes())
+        expected = [*PACKAGE.BUNDLE_METADATA, *("artifacts/" + artifact["id"] for artifact in manifest["artifacts"])]
+        self.assertEqual([name for name, _ in members], expected)
+        for name, data in members:
+            self.assertEqual(data, (inbox / name).read_bytes())
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            PACKAGE.create_migration_bundle(TARGET, inbox, self.output)
+        other = self.root / "other-output"
+        (inbox / "artifacts" / "gateway").chmod(0o600)
+        original = (inbox / "artifacts" / "gateway").read_bytes()
+        for name, change, revert in [
+                ("changed artifact", lambda: (inbox / "artifacts" / "gateway").write_bytes(b"changed"),
+                 lambda: (inbox / "artifacts" / "gateway").write_bytes(original)),
+                ("extra artifact", lambda: (inbox / "artifacts" / "unsigned").write_bytes(b"x"),
+                 lambda: (inbox / "artifacts" / "unsigned").unlink()),
+                ("extra metadata", lambda: (inbox / "notes.txt").write_bytes(b"x"),
+                 lambda: (inbox / "notes.txt").unlink())]:
+            with self.subTest(name=name):
+                change()
+                with self.assertRaises(ValueError):
+                    PACKAGE.create_migration_bundle(TARGET, inbox, other)
+                self.assertFalse((other / bundle.name).exists())
+                revert()
+        with self.assertRaisesRegex(ValueError, "version and target architecture"):
+            PACKAGE.create_migration_bundle("aarch64-unknown-linux-gnu", inbox, other)
+
     def test_release_entrypoint_and_workflow_share_helper(self):
         result = subprocess.run(["bash", str(ROOT / "scripts/release.sh"), "linux-assets", "--help"],
                                 cwd=ROOT, capture_output=True, text=True)

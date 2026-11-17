@@ -146,55 +146,9 @@ pub fn validate_key(key: &SigningKey) -> Result<VerifyingKey> {
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
-    use ed25519_dalek::{Signer, SigningKey as PrivateKey};
-
-    pub fn key(seed: u8, application: Option<&str>) -> (PrivateKey, SigningKey) {
-        let secret = PrivateKey::from_bytes(&[seed; 32]);
-        let mut blob = Vec::new();
-        ssh_string(&mut blob, if application.is_some() { SK_ED25519 } else { ED25519 });
-        ssh_string(&mut blob, &secret.verifying_key().to_bytes());
-        if let Some(application) = application { ssh_string(&mut blob, application.as_bytes()); }
-        (secret, SigningKey { key_id: Sha256Digest(Sha256::digest(&blob).into()),
-            algorithm: if application.is_some() { SigningAlgorithm::SkEd25519 } else { SigningAlgorithm::Ed25519 },
-            public_blob: blob, application: application.map(str::to_owned) })
-    }
-
-    pub fn armor(bytes: &[u8]) -> String {
-        let encoded = STANDARD.encode(bytes);
-        let lines: Vec<_> = encoded.as_bytes().chunks(70)
-            .map(|line| std::str::from_utf8(line).unwrap()).collect();
-        format!("-----BEGIN SSH SIGNATURE-----\n{}\n-----END SSH SIGNATURE-----\n", lines.join("\n"))
-    }
-
-    pub fn sign(secret: &PrivateKey, key: &SigningKey, namespace: &str, message: &[u8], flags: u8) -> String {
-        let mut signed = b"SSHSIG".to_vec();
-        ssh_string(&mut signed, namespace.as_bytes());
-        ssh_string(&mut signed, b"");
-        ssh_string(&mut signed, b"sha512");
-        ssh_string(&mut signed, &Sha512::digest(message));
-        let mut sigblob = Vec::new();
-        if let Some(application) = key.application.as_deref() {
-            let mut auth = Sha256::digest(application.as_bytes()).to_vec();
-            auth.push(flags);
-            auth.extend_from_slice(&42u32.to_be_bytes());
-            auth.extend_from_slice(&Sha256::digest(signed));
-            ssh_string(&mut sigblob, SK_ED25519);
-            ssh_string(&mut sigblob, &secret.sign(&auth).to_bytes());
-            sigblob.push(flags);
-            sigblob.extend_from_slice(&42u32.to_be_bytes());
-        } else {
-            ssh_string(&mut sigblob, ED25519);
-            ssh_string(&mut sigblob, &secret.sign(&signed).to_bytes());
-        }
-        let mut envelope = b"SSHSIG".to_vec();
-        envelope.extend_from_slice(&1u32.to_be_bytes());
-        ssh_string(&mut envelope, &key.public_blob);
-        ssh_string(&mut envelope, namespace.as_bytes());
-        ssh_string(&mut envelope, b"");
-        ssh_string(&mut envelope, b"sha512");
-        ssh_string(&mut envelope, &sigblob);
-        armor(&envelope)
-    }
+    // The software signer lives in `test_signer` (feature `test-signer`, R2 §4.2);
+    // unit tests keep importing it from here.
+    pub use crate::test_signer::{armor, key, sign};
 
     pub fn fixture_key() -> SigningKey {
         let public = include_str!("../tests/fixtures/ed25519-1.pub");
