@@ -26,6 +26,10 @@ pub const STAGE_RECEIPT: &str = "verified.json";
 pub const VERSION_FLOOR: &str = "version-floor";
 /// Version reserved by an interrupted single-binary upgrade (same writer and rules).
 pub const VERSION_PENDING: &str = "version-pending";
+/// `<PROTECTED_ROOT>/bootstrap-high-water.json` (root 0600, NOT an isolation fact):
+/// the newest bundle this host's verifier accepted, persisted before anything runs.
+pub const BOOTSTRAP_HIGH_WATER: &str = "bootstrap-high-water.json";
+const MAX_HIGH_WATER_BYTES: u64 = 4096;
 /// Updater state and trust ledger below `linux::STATE_ROOT` (plan §3.1).
 const UPDATER_STATE: &str = "state.json";
 const UPDATER_LEDGER: &str = "trust-ledger.json";
@@ -74,6 +78,21 @@ pub struct StageReceipt {
     pub artifacts: Vec<ReleaseArtifact>,
 }
 
+/// `bootstrap-high-water.json`: written atomically (temp + fsync + rename +
+/// directory fsync) after a bundle is accepted and before any of its bytes run.
+/// It only moves forward ([`raised_high_water`]); a failed or aborted run never lowers it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HighWater {
+    pub schema_version: u16,
+    pub version: ReleaseVersion,
+    pub serial: u64,
+    /// Generation (signed manifest) digest.
+    pub digest: Sha256Digest,
+    /// Digest of the root-authorised bundle (`BundleAuthorization::bundle_sha256`).
+    pub bundle_sha256: Sha256Digest,
+}
+
 /// The eleven steps of `verify_and_stage` + exec (plan §4.1), for refusal reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -93,7 +112,7 @@ impl Step {
             Self::LegacySignature => "安裝包的發行金鑰（minisign）簽章驗證未通過。",
             Self::Root => "信任根與內建指紋不符，或信任根的門檻簽章未通過。",
             Self::Authorization => "遷移安裝包授權（信任根門檻簽章）未通過、已過期，或與安裝包、版本、架構不符。",
-            Self::Manifest => "發行清單簽章未通過、其版本或元件與安裝包授權不符，或其版本／序號不新於這台主機已記錄的版本下限或已接受的發行（不能用來降版）。",
+            Self::Manifest => "發行清單簽章未通過、其版本或元件與安裝包授權不符，或其版本／序號不新於這台主機已記錄的版本下限或已接受的發行（不能用來降版；同版本只接受先前已記錄的同一個安裝包）；升級模式另需這台主機的版本下限紀錄。",
             Self::Stage => "暫存區寫入或重新驗證失敗；既有的暫存內容與這次的驗證結果不同時不會覆寫。",
             Self::Announce => "無法輸出驗證結果。",
             Self::Exec => "無法執行已驗證的 gateway。",
@@ -295,12 +314,14 @@ pub(crate) fn verify_and_stage_with(config: &Config, mode: BootstrapMode, step: 
         *step = Step::Preconditions;
         return Err(Error::Maintenance);
     }
-    // Anti-rollback (part of accepting the manifest): the root-owned version floor
-    // and, when present, the updater's accepted serials. Absent files impose nothing.
+    // Anti-rollback (part of accepting the manifest), per mode: see check_history.
+    // Refused here before anything is created; `stage` re-checks under its lock and
+    // durably records the high-water mark before staging (and so before step 11).
     *step = Step::Manifest;
-    check_history(&read_history(&config.paths)?, &verified.manifest, generation, config.context.now)?;
+    check_history(&read_history(&config.paths)?, mode, resume, &verified.manifest,
+        &high_water_of(&verified, generation), config.context.now)?;
     *step = Step::Stage;
-    let receipt = stage(&config.paths, &config.context, mode, image.bytes(), &verified)?;
+    let receipt = stage(&config.paths, &config.context, mode, resume, image.bytes(), &verified)?;
     let gateway = verified.manifest.artifacts.iter().find(|a| a.install_target == InstallTarget::Gateway)
         .cloned().ok_or(Error::Signature)?;
     Ok(Staged { receipt, version: verified.manifest.version, gateway })
@@ -375,6 +396,7 @@ pub(crate) fn precondition_rule(journal: Option<&Journal>, facts: bool, mode: Bo
 pub(crate) struct History {
     pub floor: Option<ReleaseVersion>,
     pub pending: Option<ReleaseVersion>,
+    pub high_water: Option<HighWater>,
     pub state: Option<State>,
     pub ledger: Option<TrustLedger>,
 }
@@ -398,27 +420,43 @@ pub(crate) fn parse_version_file(bytes: &[u8]) -> Result<ReleaseVersion> {
 /// file, no symlink, root:root, exactly 0600, one link, at most 128 bytes), read
 /// through the verified directory fd instead of a pathname.
 fn read_version_file(dir: &Directory, name: &str) -> Result<Option<ReleaseVersion>> {
+    let Some(bytes) = read_private_file(dir, name, MAX_VERSION_FILE_BYTES)? else { return Ok(None) };
+    parse_version_file(&bytes).map(Some)
+}
+/// Regular root-owned file, exactly 0600, one link, at most `limit` bytes, read
+/// through the verified directory fd. NotFound = `None`; anything else refuses.
+fn read_private_file(dir: &Directory, name: &str, limit: u64) -> Result<Option<Vec<u8>>> {
     let Some(file) = optional(dir.read(name))? else { return Ok(None) };
     let metadata = file.metadata()?;
-    if metadata.permissions().mode() & 0o7777 != 0o600 || metadata.len() > MAX_VERSION_FILE_BYTES {
+    if metadata.permissions().mode() & 0o7777 != 0o600 || metadata.len() > limit {
         return Err(Error::Maintenance);
     }
     let mut bytes = Vec::new();
-    Read::take(&file, MAX_VERSION_FILE_BYTES + 1).read_to_end(&mut bytes)?;
+    Read::take(&file, limit + 1).read_to_end(&mut bytes)?;
     if u64::try_from(bytes.len()).map_err(|_| Error::Invalid)? != metadata.len() { return Err(Error::Maintenance); }
-    parse_version_file(&bytes).map(Some)
+    Ok(Some(bytes))
+}
+/// Strict: size-bounded, `deny_unknown_fields`, schema 1. Corrupt = refuse, never absent.
+pub(crate) fn parse_high_water(bytes: &[u8]) -> Result<HighWater> {
+    let record: HighWater = serde_json::from_slice(bytes).map_err(|_| Error::Maintenance)?;
+    if record.schema_version != 1 { return Err(Error::Maintenance); }
+    Ok(record)
+}
+fn read_high_water(dir: &Directory) -> Result<Option<HighWater>> {
+    read_private_file(dir, BOOTSTRAP_HIGH_WATER, MAX_HIGH_WATER_BYTES)?.map(|bytes| parse_high_water(&bytes)).transpose()
 }
 
-/// Read the version floor/pending files (protected root, 0700) and the updater's
-/// state.json/trust-ledger.json (state root, 0700) through the existing dirfd
-/// readers (`files::Directory`, the same `json` reader the launcher and
-/// `trust_admin::ledger` use). Only NotFound means absent; anything else refuses.
+/// Read the version floor/pending files and the bootstrap high-water record
+/// (protected root, 0700) and the updater's state.json/trust-ledger.json (state
+/// root, 0700) through the existing dirfd readers (`files::Directory`, the same
+/// `json` reader the launcher and `trust_admin::ledger` use). Only NotFound means
+/// absent; unreadable or corrupt content refuses.
 pub(crate) fn read_history(paths: &Paths) -> Result<History> {
-    let (floor, pending) = match optional(Directory::open(&paths.protected))? {
-        None => (None, None),
+    let (floor, pending, high_water) = match optional(Directory::open(&paths.protected))? {
+        None => (None, None, None),
         Some(dir) => {
             if mode_of(&dir)? != 0o700 { return Err(Error::Maintenance); }
-            (read_version_file(&dir, VERSION_FLOOR)?, read_version_file(&dir, VERSION_PENDING)?)
+            (read_version_file(&dir, VERSION_FLOOR)?, read_version_file(&dir, VERSION_PENDING)?, read_high_water(&dir)?)
         }
     };
     let (state, ledger) = match optional(Directory::open(&paths.state_root))? {
@@ -428,22 +466,54 @@ pub(crate) fn read_history(paths: &Paths) -> Result<History> {
             (optional(dir.json::<State>(UPDATER_STATE))?, optional(dir.json::<TrustLedger>(UPDATER_LEDGER))?)
         }
     };
-    Ok(History { floor, pending, state, ledger })
+    Ok(History { floor, pending, high_water, state, ledger })
 }
 
-/// Pure anti-rollback rule; reuses the existing rules instead of a second policy:
-/// - floor/pending: the target may not be lower (duduclaw-core
-///   `check_protected_version`: `target < floor` refuses, equal is allowed);
-/// - updater state: `State::check_manifest` (version above the committed floor,
-///   serial above the committed serial and not below the highest accepted serial;
-///   an equal serial only as the exact pending retry). The one exception is the
-///   very generation the state already commits (an interrupted R3 run of this same
-///   bundle, written by `trust_init`): resuming the same digest is not a rollback;
-/// - trust ledger: must validate (`TrustLedger::current`), and cannot exist
-///   without the state it is bound to (`trust_admin::ledger`).
-pub(crate) fn check_history(history: &History, manifest: &ReleaseManifest, digest: Sha256Digest, now: u64) -> Result<()> {
-    if [history.floor, history.pending].into_iter().flatten().any(|floor| manifest.version < floor) {
-        return Err(Error::Rollback);
+/// The high-water record this bundle would set.
+pub(crate) fn high_water_of(verified: &Verified, generation: Sha256Digest) -> HighWater {
+    HighWater { schema_version: 1, version: verified.manifest.version, serial: verified.manifest.serial,
+        digest: generation, bundle_sha256: verified.bundle_sha256 }
+}
+
+/// Pure anti-rollback rule. `candidate` is this bundle's record ([`high_water_of`]);
+/// `resume` is the uncommitted R3 journal's generation, already proven equal to
+/// `candidate.digest` (step 2, deferred half).
+/// - Every recorded version (version-floor, version-pending, the high-water record,
+///   the updater state's committed floor): a lower version refuses, and an EQUAL
+///   version is accepted only as the exact bundle already recorded for it — the
+///   identical high-water record, the generation the updater state commits, or the
+///   journal's generation (resume of the same bundle).
+/// - High-water record: any other bundle needs a strictly higher version AND serial.
+/// - Updater state: `State::check_manifest` (version above the committed floor,
+///   serial above the committed one, never below the highest accepted serial)
+///   unless it already commits this exact generation; a trust ledger must validate
+///   and cannot exist without its state (`trust_admin::ledger`).
+/// - Mode `Upgrade` migrates a single-binary protected host, identified by its
+///   version floor (design §10.0 item 2): a missing floor refuses. On that host the
+///   updater state is absent by definition (§10.0 item 3), so its absence is the
+///   first-migration case; acceptance there rests on the root-threshold
+///   BundleAuthorization of exactly this bundle digest (step 7) and is recorded as
+///   the high-water mark before anything runs. Unreadable or corrupt history never
+///   counts as absent (`read_history`).
+/// - Mode `Install` (fresh host) has no history to compare on first contact; the
+///   same authorization binding and high-water record apply.
+/// - Mode `Rollback` is bound to the journal's generation and records nothing.
+pub(crate) fn check_history(history: &History, mode: BootstrapMode, resume: Option<Sha256Digest>,
+    manifest: &ReleaseManifest, candidate: &HighWater, now: u64) -> Result<()> {
+    let digest = candidate.digest;
+    if candidate.schema_version != 1 || candidate.version != manifest.version || candidate.serial != manifest.serial {
+        return Err(Error::Invalid);
+    }
+    let state_commits = history.state.as_ref().is_some_and(|state| state.committed_digest == digest
+        && state.serial == manifest.serial && state.floor == manifest.version && state.product == manifest.product
+        && state.arch == manifest.arch);
+    let recorded = history.high_water.as_ref() == Some(candidate) || resume == Some(digest) || state_commits;
+    if let Some(high) = &history.high_water {
+        if high.schema_version != 1 { return Err(Error::Maintenance); }
+        if raised_high_water(Some(high), candidate).is_err() { return Err(Error::Rollback); }
+    }
+    for bound in [history.floor, history.pending].into_iter().flatten() {
+        if manifest.version < bound || (manifest.version == bound && !recorded) { return Err(Error::Rollback); }
     }
     if let Some(ledger) = &history.ledger {
         ledger.current(now)?;
@@ -451,10 +521,34 @@ pub(crate) fn check_history(history: &History, manifest: &ReleaseManifest, diges
     }
     if let Some(state) = &history.state {
         state.validate()?;
-        let same_generation = state.committed_digest == digest && state.serial == manifest.serial
-            && state.floor == manifest.version && state.product == manifest.product && state.arch == manifest.arch;
-        if !same_generation { state.check_manifest(manifest, digest, now)?; }
+        if !state_commits { state.check_manifest(manifest, digest, now)?; }
     }
+    if mode == BootstrapMode::Upgrade && history.floor.is_none() { return Err(Error::Maintenance); }
+    Ok(())
+}
+
+/// The high-water record only moves forward: the identical record needs no write
+/// (`None`); any other must be strictly newer in version AND serial, else refused.
+pub(crate) fn raised_high_water(recorded: Option<&HighWater>, candidate: &HighWater) -> Result<Option<HighWater>> {
+    match recorded {
+        Some(old) if old == candidate => Ok(None),
+        Some(old) if candidate.version <= old.version || candidate.serial <= old.serial => Err(Error::Rollback),
+        _ => Ok(Some(*candidate)),
+    }
+}
+
+/// Under the stage lock: re-read and re-check the history (closing the window
+/// between the unlocked check and this write), then durably raise the high-water
+/// record with `atomic_json` (temp file, fsync, renameat2, directory fsync) and read
+/// it back. Runs before the stage is written or reused, so before step 11.
+fn accept_and_record(paths: &Paths, protected: &Directory, mode: BootstrapMode, resume: Option<Sha256Digest>,
+    manifest: &ReleaseManifest, candidate: &HighWater, now: u64) -> Result<()> {
+    let history = read_history(paths)?;
+    check_history(&history, mode, resume, manifest, candidate, now)?;
+    if let Some(raised) = raised_high_water(history.high_water.as_ref(), candidate)? {
+        protected.atomic_json(BOOTSTRAP_HIGH_WATER, &raised)?;
+    }
+    if read_high_water(protected)?.as_ref() != Some(candidate) { return Err(Error::Maintenance); }
     Ok(())
 }
 
@@ -671,7 +765,8 @@ fn remove_partial(stages: &Directory, next: &str) -> Result<()> {
     stages.remove_artifact_directory(next)
 }
 
-fn stage(paths: &Paths, context: &Context, mode: BootstrapMode, image: &[u8], verified: &Verified) -> Result<StageReceipt> {
+fn stage(paths: &Paths, context: &Context, mode: BootstrapMode, resume: Option<Sha256Digest>, image: &[u8],
+    verified: &Verified) -> Result<StageReceipt> {
     let generation = manifest_digest(&verified.manifest_bytes);
     let expected = StageReceipt { schema_version: 1, mode, manifest_digest: generation, root_sha256: context.pin,
         bundle_sha256: verified.bundle_sha256, bundle_size: verified.bundle_size,
@@ -688,6 +783,10 @@ fn stage(paths: &Paths, context: &Context, mode: BootstrapMode, image: &[u8], ve
     let protected = ensure_dir(&parent, &name, 0o700)?;
     let stages = ensure_dir(&protected, STAGE_DIRECTORY, 0o700)?;
     let _lock = stages.lock()?;
+    // Accepted: the high-water record is durable before the stage is written or
+    // reused, so before any bundle byte can be executed (step 11).
+    accept_and_record(paths, &protected, mode, resume, &verified.manifest, &high_water_of(verified, generation),
+        context.now)?;
     let final_name = hex::encode(generation.0);
     match stages.child(&final_name) {
         Ok(existing) => {
@@ -1145,7 +1244,12 @@ pub(crate) mod tests {
         assert_eq!(refused_at(verify(&extended)), Step::Manifest);
     }
 
-    fn no_history() -> History { History { floor: None, pending: None, state: None, ledger: None } }
+    fn no_history() -> History { History { floor: None, pending: None, high_water: None, state: None, ledger: None } }
+    /// The record the fixture bundle sets (`high_water_of` without a sealed image).
+    fn candidate(fixture: &Fixture) -> HighWater {
+        HighWater { schema_version: 1, version: fixture.manifest.version, serial: fixture.manifest.serial,
+            digest: manifest_digest(&fixture.manifest_bytes), bundle_sha256: manifest_digest(&fixture.image) }
+    }
     /// A stable version the fixture's `minimum_version` (1.80.0) allows and below `version()`.
     fn lower() -> ReleaseVersion {
         let lower = ReleaseVersion { major: 1, minor: 80, patch: 0 };
@@ -1168,18 +1272,24 @@ pub(crate) mod tests {
         let fixture = build(Architecture::X86_64, None, version());
         let manifest = &fixture.manifest;
         let digest = manifest_digest(&fixture.manifest_bytes);
-        let check = |history: History| check_history(&history, manifest, digest, NOW);
-        // A host with no floor and no updater state: nothing changes.
+        let mine = candidate(&fixture);
+        let check = |history: History| check_history(&history, BootstrapMode::Install, None, manifest, &mine, NOW);
+        // A fresh host with no floor and no updater state: first contact (bound to step 7).
         check(no_history()).unwrap();
-        // Floor (and the pending reservation, same rule): equal or lower passes, higher refuses.
-        for floor in [lower(), version()] {
-            check(History { floor: Some(floor), ..no_history() }).unwrap();
-            check(History { pending: Some(floor), ..no_history() }).unwrap();
-        }
+        // Floor (and the pending reservation, same rule): lower passes, higher refuses ...
+        check(History { floor: Some(lower()), ..no_history() }).unwrap();
+        check(History { pending: Some(lower()), ..no_history() }).unwrap();
         assert!(matches!(check(History { floor: Some(next_patch()), ..no_history() }), Err(Error::Rollback)));
         assert!(matches!(check(History { pending: Some(next_patch()), ..no_history() }), Err(Error::Rollback)));
         assert!(matches!(check(History { floor: Some(lower()), pending: Some(next_patch()), ..no_history() }),
             Err(Error::Rollback)));
+        // ... and EQUAL refuses unless this exact bundle is already recorded for that version.
+        assert!(matches!(check(History { floor: Some(version()), ..no_history() }), Err(Error::Rollback)));
+        assert!(matches!(check(History { pending: Some(version()), ..no_history() }), Err(Error::Rollback)));
+        check(History { floor: Some(version()), high_water: Some(mine), ..no_history() }).unwrap();
+        check(History { pending: Some(version()), high_water: Some(mine), ..no_history() }).unwrap();
+        check(History { floor: Some(version()), state: Some(crate::linux::trust_init::initial_state(manifest, digest)),
+            ..no_history() }).unwrap();
 
         // Updater state: resuming the generation it already commits is not a rollback.
         let same = crate::linux::trust_init::initial_state(manifest, digest);
@@ -1225,6 +1335,114 @@ pub(crate) mod tests {
         let mut broken = ledger;
         broken.pin = Sha256Digest([0; 32]);
         assert!(check(History { ledger: Some(broken), state: Some(same), ..no_history() }).is_err());
+    }
+
+    #[test]
+    fn upgrade_without_state_is_only_the_first_migration_of_a_floored_host() {
+        use BootstrapMode::{Install, Rollback, Upgrade};
+        let fixture = build(Architecture::X86_64, None, version());
+        let manifest = &fixture.manifest;
+        let mine = candidate(&fixture);
+        let check = |history: History, mode, resume| check_history(&history, mode, resume, manifest, &mine, NOW);
+        let same = || crate::linux::trust_init::initial_state(manifest, mine.digest);
+        // No version floor = not an identified single-binary host: refused, whatever else exists.
+        assert!(matches!(check(no_history(), Upgrade, None), Err(Error::Maintenance)));
+        assert!(matches!(check(History { high_water: Some(mine), ..no_history() }, Upgrade, Some(mine.digest)),
+            Err(Error::Maintenance)));
+        assert!(matches!(check(History { state: Some(same()), ..no_history() }, Upgrade, Some(mine.digest)),
+            Err(Error::Maintenance)));
+        // Exactly the plan's first migration: floor present, no updater state, no journal, no record.
+        check(History { floor: Some(lower()), ..no_history() }, Upgrade, None).unwrap();
+        // ... but not when a different bundle of this version was already accepted on this host.
+        let other = HighWater { digest: Sha256Digest([7; 32]), bundle_sha256: Sha256Digest([8; 32]), ..mine };
+        assert!(matches!(check(History { floor: Some(lower()), high_water: Some(other), ..no_history() }, Upgrade, None),
+            Err(Error::Rollback)));
+        // Install (fresh host) and rollback (bound to the journal) need no floor.
+        check(no_history(), Install, None).unwrap();
+        check(no_history(), Rollback, Some(mine.digest)).unwrap();
+    }
+
+    #[test]
+    fn same_version_needs_the_recorded_digest_and_serial_never_goes_down() {
+        use BootstrapMode::Upgrade;
+        let fixture = build(Architecture::X86_64, None, version());
+        let manifest = &fixture.manifest;
+        let mine = candidate(&fixture);
+        let check = |high_water: HighWater, floor: ReleaseVersion, resume: Option<Sha256Digest>|
+            check_history(&History { floor: Some(floor), high_water: Some(high_water), ..no_history() }, Upgrade,
+                resume, manifest, &mine, NOW);
+        // Same version, different digest (an older root-authorised bundle of this version): refused,
+        // even when its recorded serial is lower, and even as a "resume".
+        for other in [HighWater { digest: Sha256Digest([7; 32]), bundle_sha256: Sha256Digest([8; 32]), ..mine },
+            HighWater { digest: Sha256Digest([7; 32]), serial: mine.serial - 1, ..mine },
+            HighWater { bundle_sha256: Sha256Digest([8; 32]), ..mine }] {
+            assert!(matches!(check(other, lower(), None), Err(Error::Rollback)), "{other:?}");
+            assert!(matches!(check(other, lower(), Some(mine.digest)), Err(Error::Rollback)), "{other:?}");
+        }
+        // A serial below (or equal to) the recorded high-water mark: refused even for a newer version.
+        let earlier = HighWater { schema_version: 1, version: lower(), serial: mine.serial + 1,
+            digest: Sha256Digest([9; 32]), bundle_sha256: Sha256Digest([9; 32]) };
+        assert!(matches!(check(earlier, lower(), None), Err(Error::Rollback)));
+        assert!(matches!(check(HighWater { serial: mine.serial, ..earlier }, lower(), None), Err(Error::Rollback)));
+        // A recorded newer version refuses.
+        assert!(matches!(check(HighWater { version: next_patch(), serial: mine.serial + 1, ..earlier }, lower(), None),
+            Err(Error::Rollback)));
+        // Strictly newer in version AND serial than the record: accepted.
+        check(HighWater { serial: mine.serial - 1, ..earlier }, lower(), None).unwrap();
+        // Same version + same digest: the resume of the same bundle — through the high-water record
+        // (also with an equal floor) or the uncommitted journal entry.
+        check(mine, lower(), None).unwrap();
+        check(mine, version(), None).unwrap();
+        check(mine, version(), Some(mine.digest)).unwrap();
+        let journal = |floor| check_history(&History { floor: Some(floor), ..no_history() }, Upgrade,
+            Some(mine.digest), manifest, &mine, NOW);
+        journal(version()).unwrap();
+        // Without any record of this digest the equal floor refuses.
+        assert!(matches!(check_history(&History { floor: Some(version()), ..no_history() }, Upgrade, None, manifest,
+            &mine, NOW), Err(Error::Rollback)));
+        // Strict parsing of the record: exact fields, schema 1, no unknown or missing field.
+        let bytes = serde_json::to_vec(&mine).unwrap();
+        assert_eq!(parse_high_water(&bytes).unwrap(), mine);
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        value["extra"] = serde_json::json!(1);
+        assert!(parse_high_water(&serde_json::to_vec(&value).unwrap()).is_err());
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        value["schema_version"] = serde_json::json!(2);
+        assert!(parse_high_water(&serde_json::to_vec(&value).unwrap()).is_err());
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        value.as_object_mut().unwrap().remove("bundle_sha256");
+        assert!(parse_high_water(&serde_json::to_vec(&value).unwrap()).is_err());
+        assert!(parse_high_water(bytes.get(..bytes.len() - 1).unwrap()).is_err());
+        assert!(parse_high_water(b"").is_err());
+    }
+
+    #[test]
+    fn high_water_only_moves_forward_and_a_failed_install_never_lowers_it() {
+        let record = HighWater { schema_version: 1, version: version(), serial: 5, digest: Sha256Digest([1; 32]),
+            bundle_sha256: Sha256Digest([2; 32]) };
+        assert_eq!(raised_high_water(None, &record).unwrap(), Some(record));
+        assert_eq!(raised_high_water(Some(&record), &record).unwrap(), None);
+        let newer = HighWater { version: next_patch(), serial: 6, digest: Sha256Digest([3; 32]), ..record };
+        assert_eq!(raised_high_water(Some(&record), &newer).unwrap(), Some(newer));
+        let refused = [HighWater { serial: 4, ..record }, HighWater { version: lower(), serial: 6, ..record },
+            HighWater { digest: Sha256Digest([9; 32]), ..record }, HighWater { serial: 6, digest: Sha256Digest([9; 32]), ..record },
+            HighWater { version: next_patch(), ..record }, HighWater { version: lower(), serial: 1, ..record }];
+        for attempt in refused {
+            assert!(matches!(raised_high_water(Some(&record), &attempt), Err(Error::Rollback)), "{attempt:?}");
+        }
+        // The locked writer only ever stores what raised_high_water returns: a run that is
+        // refused (or fails/aborts later) leaves the stored mark exactly as it was.
+        let mut stored = Some(record);
+        for attempt in refused {
+            if let Ok(Some(next)) = raised_high_water(stored.as_ref(), &attempt) { stored = Some(next); }
+        }
+        assert_eq!(stored, Some(record));
+        // And the version floor bounds are unaffected by any high-water record: a lower
+        // version than the floor refuses even when the record would allow it.
+        let fixture = build(Architecture::X86_64, None, version());
+        let mine = candidate(&fixture);
+        assert!(matches!(check_history(&History { floor: Some(next_patch()), high_water: Some(mine), ..no_history() },
+            BootstrapMode::Upgrade, Some(mine.digest), &fixture.manifest, &mine, NOW), Err(Error::Rollback)));
     }
 
     #[test]
@@ -1463,10 +1681,22 @@ pub(crate) mod tests {
         private_file(&pending, crate::version_text(next_patch()).as_bytes(), 0o600);
         assert!(matches!(verify_and_stage_with(&config, BootstrapMode::Upgrade, &mut step), Err(Error::Rollback)));
         std::fs::remove_file(&pending).unwrap();
-        // An equal floor is not a downgrade.
+        // Upgrade without the single-binary version floor is refused (no updater state either).
+        assert!(matches!(verify_and_stage_with(&config, BootstrapMode::Upgrade, &mut step), Err(Error::Maintenance)));
+        assert_eq!(step, Step::Manifest);
+        // An equal floor with no record of this bundle for that version: a possible replay, refused.
         private_file(&floor, version_string().as_bytes(), 0o600);
+        assert!(matches!(verify_and_stage_with(&config, BootstrapMode::Upgrade, &mut step), Err(Error::Rollback)));
+        assert_eq!(step, Step::Manifest);
+        assert!(!stages.exists() && !protected.join(BOOTSTRAP_HIGH_WATER).exists());
+        // The first migration of a single-binary host (lower floor, no updater state) is accepted
+        // and recorded; afterwards the equal floor resumes exactly this bundle.
+        private_file(&floor, crate::version_text(lower()).as_bytes(), 0o600);
         let staged = verify_and_stage_with(&config, BootstrapMode::Upgrade, &mut step).unwrap();
         assert_eq!(staged.receipt.manifest_digest, generation);
+        assert!(protected.join(BOOTSTRAP_HIGH_WATER).exists());
+        private_file(&floor, version_string().as_bytes(), 0o600);
+        assert!(verify_and_stage_with(&config, BootstrapMode::Upgrade, &mut step).is_ok());
 
         // Updater state committing another generation at the same serial: a replay, refused.
         let state_root = config.paths.state_root.clone();
@@ -1495,6 +1725,69 @@ pub(crate) mod tests {
         std::fs::remove_file(&state_file).unwrap();
         assert!(verify_and_stage_with(&config, BootstrapMode::Upgrade, &mut step).is_err());
         assert_eq!(step, Step::Manifest);
+    }
+
+    #[test]
+    #[ignore = "requires root native Linux openat2/statx/memfd; writes only its own /root fixture tree"]
+    fn iso_root_bootstrap_high_water_recorded_before_exec_and_never_lowered() {
+        use std::os::unix::fs::MetadataExt;
+        let temp = root_temp();
+        let empty = temp.path().join("facts-root");
+        std::fs::create_dir(&empty).unwrap();
+        let fixture = host_fixture(None);
+        let config = root_config(temp.path(), &fixture, empty);
+        let protected = config.paths.protected.clone();
+        let record_path = protected.join(BOOTSTRAP_HIGH_WATER);
+        let generation = manifest_digest(&fixture.manifest_bytes);
+        let expected = HighWater { schema_version: 1, version: fixture.manifest.version, serial: fixture.manifest.serial,
+            digest: generation, bundle_sha256: manifest_digest(&fixture.image) };
+        let private_dir = |path: &Path| {
+            std::fs::create_dir(path).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        };
+        let private_file = |path: &Path, bytes: &[u8]| {
+            let _ = std::fs::remove_file(path);
+            std::fs::write(path, bytes).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        let mut step = Step::Harden;
+        // Abort right after acceptance: a foreign directory under this generation's stage
+        // name makes step 9 refuse. Nothing is staged or executed, yet the acceptance is durable.
+        private_dir(&protected);
+        private_dir(&protected.join(STAGE_DIRECTORY));
+        let foreign = protected.join(STAGE_DIRECTORY).join(hex::encode(generation.0));
+        private_dir(&foreign);
+        assert!(verify_and_stage_with(&config, BootstrapMode::Install, &mut step).is_err());
+        assert_eq!(step, Step::Stage);
+        assert_eq!(parse_high_water(&std::fs::read(&record_path).unwrap()).unwrap(), expected);
+        let metadata = std::fs::symlink_metadata(&record_path).unwrap();
+        assert_eq!((metadata.uid(), metadata.mode() & 0o7777, metadata.nlink()), (0, 0o600, 1));
+        assert!(!protected.join(format!("{BOOTSTRAP_HIGH_WATER}.next")).exists());
+        std::fs::remove_dir(&foreign).unwrap();
+        // verify_and_stage_with is everything that precedes announce and execveat (`run`):
+        // when it returns the record is already on disk, unchanged by the resume.
+        verify_and_stage_with(&config, BootstrapMode::Install, &mut step).unwrap();
+        assert_eq!(parse_high_water(&std::fs::read(&record_path).unwrap()).unwrap(), expected);
+        // A higher recorded mark, another digest of this version, a corrupt or unknown-field
+        // record: refused at step 8 and the stored record is left byte-for-byte untouched.
+        let newer = HighWater { version: next_patch(), serial: expected.serial + 1, ..expected };
+        let other = HighWater { digest: Sha256Digest([7; 32]), ..expected };
+        let mut unknown: serde_json::Value = serde_json::to_value(expected).unwrap();
+        unknown["extra"] = serde_json::json!(true);
+        for bytes in [serde_json::to_vec(&newer).unwrap(), serde_json::to_vec(&other).unwrap(),
+            b"{\"schema_version\":1}".to_vec(), serde_json::to_vec(&unknown).unwrap()] {
+            private_file(&record_path, &bytes);
+            assert!(verify_and_stage_with(&config, BootstrapMode::Install, &mut step).is_err());
+            assert_eq!(step, Step::Manifest);
+            assert_eq!(std::fs::read(&record_path).unwrap(), bytes);
+        }
+        // A record that is not exactly root 0600 refuses as well.
+        private_file(&record_path, &serde_json::to_vec(&expected).unwrap());
+        std::fs::set_permissions(&record_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(verify_and_stage_with(&config, BootstrapMode::Install, &mut step).is_err());
+        assert_eq!(step, Step::Manifest);
+        std::fs::set_permissions(&record_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(verify_and_stage_with(&config, BootstrapMode::Install, &mut step).is_ok());
     }
 
     /// Fork, put the pty on fd 0/1/2, then exec the sealed memfd through the
