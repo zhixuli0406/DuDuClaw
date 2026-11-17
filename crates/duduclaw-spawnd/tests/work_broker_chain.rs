@@ -3,8 +3,12 @@
 //! storage lease, and the drop-before-detach rule, on real loop storage.
 //!
 //! Root disposable Linux VM only: `ISO_STORAGE_TEST_ROOT` on ext4/XFS (loop
-//! devices, private mount tree), `DUDUCLAW_ISO_DISPOSABLE=1`. The test runs in
-//! a private mount namespace of its thread and removes its fixture tree.
+//! devices), `DUDUCLAW_ISO_DISPOSABLE=1`, and the whole test PROCESS in a
+//! private mount tree: run the binary under `unshare --mount --propagation
+//! private`. The storage layer reads `/proc/self/mountinfo`, which is the
+//! process's (thread-group leader's) mount namespace, so a thread-level
+//! `unshare(CLONE_NEWNS)` would mount where the storage layer cannot see. The
+//! test removes its fixture tree.
 #![cfg(target_os = "linux")]
 use std::{ffi::CString, fs, io::Read, os::{fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd}, unix::fs::{DirBuilderExt, MetadataExt}},
     path::PathBuf};
@@ -13,10 +17,18 @@ use duduclaw_spawnd::{bootstrap_mounts::work_broker_root, storage::{LoopStorage,
     work_anchor::{backfill, AnchorOwner, AnchoredStorage, Backfilled, WorkAnchors, ANCHOR_MODE, BASE_MODE},
     work_broker::{copy_snapshot, verify_lease, BrokerRoot, LiveRunView, WorkRefusal}};
 
-fn private_mount_namespace() {
-    assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWNS) }, 0);
-    assert_eq!(unsafe { libc::mount(std::ptr::null(), c"/".as_ptr(), std::ptr::null(),
-        libc::MS_REC | libc::MS_PRIVATE, std::ptr::null()) }, 0);
+/// Refuse to start unless the PROCESS's root mount (the last "/" entry of
+/// `/proc/self/mountinfo`, the one in effect) propagates nowhere: no `shared:`
+/// or `master:` optional field. Nothing is mounted before this holds.
+fn require_private_mount_tree() {
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo").expect("read /proc/self/mountinfo");
+    let root = mountinfo.lines().rev().find(|line| line.split(' ').nth(4) == Some("/"))
+        .expect("no root mount in /proc/self/mountinfo");
+    let (fields, _) = root.split_once(" - ").expect("malformed /proc/self/mountinfo line");
+    let propagates = fields.split(' ').skip(6).any(|field| field.starts_with("shared:") || field.starts_with("master:"));
+    assert!(!propagates, "the process root mount propagates ({root}); run this test binary in a private mount tree: \
+        unshare --mount --propagation private env DUDUCLAW_ISO_DISPOSABLE=1 ISO_STORAGE_TEST_ROOT=... \
+        cargo test -p duduclaw-spawnd --test work_broker_chain -- --ignored --test-threads=1");
 }
 fn hex(employee: EmployeeId) -> String { employee.0.iter().map(|byte| format!("{byte:02x}")).collect() }
 /// Root creates an employee-owned file beneath the attached work mount.
@@ -31,12 +43,12 @@ fn employee_file(work: BorrowedFd<'_>, name: &str, bytes: &[u8], uid: u32) {
 }
 
 #[test]
-#[ignore = "iso_root_: root disposable Linux VM; ISO_STORAGE_TEST_ROOT on ext4/XFS with loop devices; DUDUCLAW_ISO_DISPOSABLE=1"]
+#[ignore = "iso_root_: root disposable Linux VM; whole binary under `unshare --mount --propagation private`; ISO_STORAGE_TEST_ROOT on ext4/XFS with loop devices; DUDUCLAW_ISO_DISPOSABLE=1"]
 fn iso_root_work_broker_chain_backfill_snapshot_and_detach() {
     assert_eq!(unsafe { libc::geteuid() }, 0);
     assert_eq!(std::env::var("DUDUCLAW_ISO_DISPOSABLE").as_deref(), Ok("1"), "disposable VM only");
     let base = PathBuf::from(std::env::var_os("ISO_STORAGE_TEST_ROOT").expect("set isolated ISO_STORAGE_TEST_ROOT"));
-    private_mount_namespace();
+    require_private_mount_tree();
     let root = base.join(format!("h4-broker-chain-{}", std::process::id()));
     let (images, journal, anchors) = (root.join("images"), root.join("journal"), root.join("work-anchors"));
     for path in [&root, &images, &journal, &anchors] { fs::DirBuilder::new().mode(BASE_MODE).create(path).unwrap(); }

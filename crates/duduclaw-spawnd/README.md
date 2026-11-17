@@ -392,7 +392,8 @@ never sends them to an older spawnd (which closes the connection on an unknown
 
 Root acceptance: `tests/work_broker_chain.rs`
 (`iso_root_work_broker_chain_backfill_snapshot_and_detach`, ignored; root VM,
-`ISO_STORAGE_TEST_ROOT`, `DUDUCLAW_ISO_DISPOSABLE=1`). Not run in this worktree.
+`ISO_STORAGE_TEST_ROOT`, `DUDUCLAW_ISO_DISPOSABLE=1`, whole binary under
+`unshare --mount --propagation private`; see `tests/README.md`). Not run in this worktree.
 
 ### Root retire (F6l, F6 design r5 §3.12)
 

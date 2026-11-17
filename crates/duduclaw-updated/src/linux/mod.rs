@@ -34,7 +34,18 @@ pub fn require_root() -> Result<()> {
     if unsafe { libc::getuid() } != 0 || unsafe { libc::geteuid() } != 0 { return Err(Error::Maintenance); }
     Ok(())
 }
+#[cfg(test)]
+thread_local! {
+    /// Test wall clock: `Some((next, step))` makes each `now()` on this thread return
+    /// `next` and then advance it by `step` seconds (a host where time passes between reads).
+    pub(crate) static TEST_CLOCK: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+}
 pub fn now() -> Result<u64> {
+    #[cfg(test)]
+    if let Some((next, step)) = TEST_CLOCK.with(|clock| clock.get()) {
+        TEST_CLOCK.with(|clock| clock.set(Some((next.saturating_add(step), step))));
+        return Ok(next);
+    }
     Ok(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| Error::Maintenance)?.as_secs())
 }
