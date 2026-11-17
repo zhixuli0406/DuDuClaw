@@ -143,6 +143,9 @@ pub async fn serve_control(control: CheckedSocket, config: &Config) -> Result<()
     let mut budget = RunBudget::new(&limits, RunCaps { total_bytes: 1, total_connections: 10000 }, Instant::now())?;
     // Remember run IDs for the control lifetime so re-registration cannot reset budgets.
     let mut seen = std::collections::BTreeSet::new();
+    // R7b: the route runs use (one for every profile) and the probe's rate limit.
+    let route = crate::dns_probe::configured_route(config.profiles.as_slice());
+    let mut probe = crate::dns_probe::DnsProbe::default();
     let result = async { loop {
         let received = tokio::select! {
             received = control.receive(&mut packets) => received.map_err(io_error)?,
@@ -193,6 +196,13 @@ pub async fn serve_control(control: CheckedSocket, config: &Config) -> Result<()
                         .map_err(|_| EgressError::Timeout)?.map_err(io_error)?;
                 }
                 EgressControlResponse::Unregistered
+            }
+            // This loop is serial: the probe is awaited inline and bounded by
+            // `dns_probe::PROBE_DEADLINE` (3 s), so it delays a following
+            // Register/Unregister by at most that long. A lookup failure is a
+            // `DnsProbed { resolved: false }` answer, never a control error.
+            EgressControl::ProbeDns { name } => {
+                probe.answer(&name, route, &*resolver, Instant::now(), &crate::policy::own_addresses).await
             }
         };
         let packet = ipc::encode(&Envelope { version: ipc::PROTOCOL_VERSION, request_id: request.request_id, message: reply }).map_err(io_error)?;

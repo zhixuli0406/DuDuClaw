@@ -590,6 +590,40 @@ installer creates the `duduclaw-selftest` system account and installs the unit
 file (`protected_linux_layout.rs`) before it starts spawnd; without them this
 readiness fails closed.
 
+### R7b: DNS route evidence
+
+`dns_route_verified` no longer comes from an installer receipt (nothing
+produced one, so it could never become true). Signed isolation policy v4
+(domain `duduclaw-isolation-policy-v4`) is v3 plus the required
+`dns_probe_name`: a hostname AI employees need anyway (for example the model
+API host), chosen by the vendor at signing time. The one rule
+(`duduclaw_isolation::egress::validate_dns_probe_name`, mirrored by
+`scripts/sign-isolation-manifest.py`): ASCII lower case, 1–253 bytes, at least
+two labels of 1–63 bytes of `[a-z0-9-]` not starting or ending with `-`, no
+trailing dot, a last label that is not all digits, and neither `localhost` nor
+a name under `.local`, `.internal` or `.localhost`. v1–v3 documents refuse the
+key; `installed::signed_policy_dns_probe_name` reads it next to
+`signed_policy_egress_profiles`.
+
+`dns_evidence` runs a background worker (started, like the self-test, by the
+first readiness refresh after start-up recovery; never a precondition of
+spawnd opening, since the egress unit waits for spawnd's readiness gate). It
+sends `EgressControl::ProbeDns { name }` over the existing, single egress
+control connection (credential-checked like every egress frame; the worker
+never connects, the lifecycle thread does) and passes only on
+`DnsProbed { route, resolved: true, public_addresses >= 1 }` with `route` equal
+to the one route of every profile in the root-owned `/etc/duduclaw/egress.json`
+(read with the installed-document ownership checks; spawnd has no other source
+of the configured route). A pass is fresh for 60 s and re-probed after 45 s; a
+failure is retried after 5 s. No result yet, a stale result, a policy older
+than v4 (nothing is sent), an unreadable configuration, no connection, a
+`Refused` answer or a failed exchange all read as not verified. The refresh
+path only loads an atomic snapshot. A probe holds the control connection for
+one exchange (egress's 3 s deadline), so a run registration waits at most that
+long behind it. `egress_verified` is unchanged; `egress_second_layer` is
+reported `unavailable` until its own readback exists (it came from the
+receipt's DNS part).
+
 ## UserDB account verification
 
 Account checks enumerate Varlink providers directly; `userdbctl` is not required.
@@ -648,7 +682,9 @@ compilation and fixture tests do not establish live-provider acceptance.
 F must have a verified committed generation containing an immutable mode-0444
 `RuntimeEntry { registry_id: "isolation-policy-v1" }` artifact. Its strict JSON
 contains `version: 1`, the bounded runtime table and architecture-specific native
-profiles. The root-only `/var/lib/duduclaw-spawnd/publication.json` contains
+profiles (versions 2–4 add their signed `domain`; v3 adds per-record
+`turn_limit`; v4, domain `duduclaw-isolation-policy-v4`, adds the required
+`dns_probe_name` — see "R7b: DNS route evidence" below). The root-only `/var/lib/duduclaw-spawnd/publication.json` contains
 `version`, the same `generation` digest and administrator-confirmed employee
 entitlements. Paths are fixed, not supplied by a gateway request. This is a new
 internal root publication schema; the shared IPC/capability contract is unchanged.
@@ -665,13 +701,14 @@ state or executable path is disclosed through the projection.
 `/run/duduclaw-isolation-evidence/installation.json` is a root-harness receipt,
 not an operator configuration. It binds the committed generation and current
 boot with at most 60 seconds validity. It records UID inventory and permanent
-external-IAM reservation digests; per-account SSH positive control, denied
-public-key login and forwarding observations; and DNS query/answer digests
-through resolved Varlink or a dedicated broker with no private-IP allow
-exception. Since R7a it carries no trampoline facts (a receipt with a
-`trampoline` member is refused as an unknown field); the trampoline digest,
-self-test and ABI evidence come from spawnd's own self-test (see "R7a:
-trampoline facts from spawnd's own self-test" above). Missing, stale, changed
+external-IAM reservation digests; and per-account SSH positive control, denied
+public-key login and forwarding observations. Since R7a it carries no trampoline
+facts (a receipt with a `trampoline` member is refused as an unknown field); the
+trampoline digest, self-test and ABI evidence come from spawnd's own self-test
+(see "R7a: trampoline facts from spawnd's own self-test" above). Since R7b it
+carries no DNS facts either (a receipt with a `dns` member is refused as an
+unknown field); `dns_route_verified` comes from spawnd's own probe through
+egress (see "R7b: DNS route evidence" above). Missing, stale, changed
 or malformed receipts deny admission. The trusted root harness must renew real
 observations; this change does not implement that harness or claim an installed
 host is ready. Root caches only a fully verified immutable F generation and its
@@ -738,9 +775,12 @@ The VM must have the compiled-version F service running with a committed signed
 generation; B1 must continuously publish current root/gateway reports, with at
 least one confirmed MCP-enabled Claude entitlement. The signed runtime policy
 must contain real exact-runtime MCP inheritance acceptance. The root measurement
-harness must continuously renew the installation/SSH/DNS receipts; the second
+harness must continuously renew the installation/SSH receipts; the second
 test also starts the installed `duduclaw-isolation-selftest.service` through
-PID 1 (R7a), which needs the unit file and the `duduclaw-selftest` account. No test
+PID 1 (R7a), which needs the unit file and the `duduclaw-selftest` account, and
+(R7b) requires a policy v4 `dns_probe_name` and one DNS route in
+`/etc/duduclaw/egress.json` (the probe itself needs spawnd's own control
+connection and is covered by egress's `iso_root_egress_dns_probe_through_control_socket`). No test
 synthesizes those prerequisites. For the third test, an externally started real
 Claude run must remain journaled and its MCP receipt must be less than 60 seconds
 old. Set `ISO_INSTALLED_RUN_ID` to that actual 32-character lowercase hex run ID.

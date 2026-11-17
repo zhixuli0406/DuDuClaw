@@ -188,7 +188,7 @@ sudo journalctl -u duduclaw-gateway.service -u duduclaw-spawnd.service -u duducl
 | 準備情報が欠落、古い、非互換 | 完全な世代、プロトコル、アカウント登録、全サービスを確認。`active` だけでは不十分。 |
 | UID／アカウント／SSH／IAM 失敗 | 予約範囲の衝突、別名、補助グループ、ログイン／cron／at、linger を解決。外部 IAM の予約には管理者の証跡が必要。 |
 | ストレージ／クォータ失敗 | 下位デバイス構成、強制クォータ、空き容量、ホスト予約容量を確認。ディスク使用量ポーリングで代替しない。 |
-| DNS／egress 失敗 | root が選んだ resolved Varlink／DNS broker 経路を確認。egress に私設 resolver IP の例外を追加しない。 |
+| DNS／egress 失敗 | root が選んだ resolved Varlink／DNS broker 経路を確認。egress に私設 resolver IP の例外を追加しない。DNS の準備状態（`host_dns_route_unverified`）はインストーラーのレシートではなく spawnd 自身のライブ検査です。spawnd は約 1 分ごとに、署名済みポリシーの `dns_probe_name` をその経路で解決するよう egress に依頼し、公開アドレスが 1 つ以上得られた場合のみ合格とします。署名済みポリシーが v4 より古い場合、egress が動いていない場合、このホストからその名前を解決できない場合は未検証のままです（外向き DNS と egress ジャーナルの `dns_probe` 行を確認）。 |
 | 解析 root 失敗 | 両 root の所有者、モード、予期しない内容を調査。ホスト `/etc` やデータをコピーしない。 |
 | 移行プラットフォーム／設定リンクなし | 既存環境を保持し、完全な検証済み連携を取得。旧権限データのコピーや移行ゲート迂回をしない。 |
 | 確認／交換待ち | 移行の確認で対応項目の確認、再試行、新しい認証情報設定を完了。承認だけでは移行完了にならない。 |

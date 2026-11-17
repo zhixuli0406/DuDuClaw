@@ -59,6 +59,10 @@ pub mod installed;
 #[cfg(any(target_os = "linux", test))]
 pub mod selftest;
 
+/// R7b: `dns_route_verified` from a live probe through egress.
+#[cfg(any(target_os = "linux", test))]
+pub mod dns_evidence;
+
 #[cfg(target_os = "linux")]
 pub mod gateway_mcp;
 

@@ -216,6 +216,13 @@ def bind_artifacts(document, directory, prefix=""):
 
 POLICY_DOMAIN_V2 = "duduclaw-isolation-policy-v2"
 POLICY_DOMAIN_V3 = "duduclaw-isolation-policy-v3"
+# Policy v4 (R7b) = v3 + `dns_probe_name`: a hostname AI employees need anyway
+# (e.g. the model API host), chosen at signing time; spawnd asks egress to
+# resolve it as its DNS route evidence.
+POLICY_DOMAIN_V4 = "duduclaw-isolation-policy-v4"
+POLICY_KEYS = {"domain", "version", "runtimes", "native"}
+DNS_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+DNS_PROBE_LOCAL_SUFFIXES = (".local", ".internal", ".localhost")
 # Policy v3 step range (spawnd `policy::TurnLimit`): 1 <= min <= default <= max <= 1000.
 TURN_LIMIT_KEYS = {"min", "max", "default"}
 TURN_LIMIT_CEILING = 1000
@@ -302,26 +309,51 @@ def validate_turn_limit(runtime, version):
         validate_claude_arguments(runtime.get("fixed_args"), ranged)
 
 
+def validate_dns_probe_name(name):
+    """Policy v4 `dns_probe_name`, the rule of spawnd/egress
+    (`duduclaw_isolation::egress::validate_dns_probe_name`): ASCII lower case,
+    1-253 bytes, at least two labels of 1-63 bytes of [a-z0-9-] not starting or
+    ending with '-', no trailing dot, a last label that is not all digits, and
+    neither `localhost` nor a name under .local/.internal/.localhost.
+    """
+    if not isinstance(name, str) or not name.isascii() or not 1 <= len(name) <= 253:
+        raise ValueError("dns_probe_name must be an ASCII hostname of 1 to 253 bytes")
+    labels = name.split(".")
+    if len(labels) < 2 or not all(DNS_LABEL.fullmatch(label) for label in labels):
+        raise ValueError("dns_probe_name must be a lower-case hostname with at least two labels")
+    if labels[-1].isdigit():
+        raise ValueError("dns_probe_name must not be an IP address")
+    if name == "localhost" or name.endswith(DNS_PROBE_LOCAL_SUFFIXES):
+        raise ValueError("dns_probe_name must not be a local name")
+
+
 def validate_policy_document(document):
     """Offline shape check of the signed isolation policy artifact.
 
     spawnd re-runs every publication check (HX D8 revision section 2.3) on the
     bytes; this only stops a malformed template before it is bound by the
-    release manifest. v2 and v3 carry their domain and version in the signed
-    bytes; v1 has neither a domain nor a launcher; only v3 has step ranges.
+    release manifest. v2, v3 and v4 carry their domain and version in the
+    signed bytes; v1 has neither a domain nor a launcher; only v3 and v4 have
+    step ranges; only v4 has (and requires) `dns_probe_name`.
     """
     if not isinstance(document, dict):
         raise ValueError("policy must be an object")
     version = document.get("version")
+    if version in (1, 2, 3) and "dns_probe_name" in document:
+        raise ValueError("dns_probe_name requires policy v4")
     if version == 1:
         if set(document) != {"version", "runtimes", "native"}:
             raise ValueError("v1 policy has exactly version/runtimes/native")
     elif version == 2:
-        if set(document) != {"domain", "version", "runtimes", "native"} or document["domain"] != POLICY_DOMAIN_V2:
+        if set(document) != POLICY_KEYS or document["domain"] != POLICY_DOMAIN_V2:
             raise ValueError("v2 policy requires its signed domain")
     elif version == 3:
-        if set(document) != {"domain", "version", "runtimes", "native"} or document["domain"] != POLICY_DOMAIN_V3:
+        if set(document) != POLICY_KEYS or document["domain"] != POLICY_DOMAIN_V3:
             raise ValueError("v3 policy requires its signed domain")
+    elif version == 4:
+        if set(document) != POLICY_KEYS | {"dns_probe_name"} or document["domain"] != POLICY_DOMAIN_V4:
+            raise ValueError("v4 policy requires its signed domain and dns_probe_name")
+        validate_dns_probe_name(document["dns_probe_name"])
     else:
         raise ValueError("unsupported policy version")
     native = document.get("native")

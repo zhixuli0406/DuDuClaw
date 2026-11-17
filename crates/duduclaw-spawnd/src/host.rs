@@ -41,36 +41,66 @@ impl Publication for MissingPublication {
 /// C's DNS/secondary BPF probe is independent of successful control connection.
 pub trait Egress: Send {
     fn readiness(&mut self) -> Result<crate::readiness::EgressSecondLayer>;
+    /// R7b: whether a fresh `ProbeDns` through egress passed. Reads a snapshot
+    /// only; never blocks the readiness refresh.
+    fn dns_route_verified(&mut self) -> bool;
     fn register(&mut self, run: RunId, profile: duduclaw_isolation::egress::ProfileId, fd: OwnedFd) -> Result<()>;
     fn unregister(&mut self, run: RunId) -> Result<()>;
 }
-pub trait DnsEvidence: Send { fn verify(&mut self) -> Result<crate::readiness::EgressSecondLayer>; }
+/// R7b: DNS route evidence (`crate::dns_evidence`). `verified` never blocks:
+/// it reads the probe worker's snapshot; unknown is `false`.
+pub trait DnsEvidence: Send { fn verified(&mut self) -> bool; }
 pub struct MissingDnsEvidence;
-impl DnsEvidence for MissingDnsEvidence { fn verify(&mut self) -> Result<crate::readiness::EgressSecondLayer> { Err(unavailable()) } }
-pub struct LinuxEgress { dns: Box<dyn DnsEvidence>, client: Option<crate::egress::EgressControlClient> }
+impl DnsEvidence for MissingDnsEvidence { fn verified(&mut self) -> bool { false } }
+/// R7b: the one egress control connection, shared by the lifecycle thread
+/// (Register/Unregister, connecting when there is none) and the DNS evidence
+/// worker (`ProbeDns`, never connecting). Egress serves exactly one controller,
+/// so a probe cannot use a second connection. A probe holds the lock for one
+/// exchange, bounded by egress's 3 s probe deadline (and the 5 s control
+/// receive timeout), so a registration waits at most that long behind it.
+pub type SharedEgressClient = Arc<Mutex<Option<crate::egress::EgressControlClient>>>;
+pub struct LinuxEgress { dns: Box<dyn DnsEvidence>, client: SharedEgressClient }
 impl LinuxEgress {
-    pub fn new(dns: Box<dyn DnsEvidence>) -> Self { Self { dns, client: None } }
-    fn client(&mut self) -> Result<&mut crate::egress::EgressControlClient> {
-        if self.client.is_none() {
+    pub fn new(dns: Box<dyn DnsEvidence>) -> Self { Self::with_client(dns, SharedEgressClient::default()) }
+    pub fn with_client(dns: Box<dyn DnsEvidence>, client: SharedEgressClient) -> Self { Self { dns, client } }
+    fn connect(slot: &mut Option<crate::egress::EgressControlClient>) -> Result<()> {
+        if slot.is_none() {
             let (uid, gid) = os(crate::server::named_identity(c"duduclaw-egress"))?;
-            self.client = Some(os(crate::egress::EgressControlClient::connect(uid, gid))?);
+            *slot = Some(os(crate::egress::EgressControlClient::connect(uid, gid))?);
         }
-        self.client.as_mut().ok_or_else(unavailable)
+        Ok(())
+    }
+    /// One exchange on the connection (connecting first); an error drops it.
+    fn exchange(&mut self, f: impl FnOnce(&mut crate::egress::EgressControlClient) -> io::Result<()>) -> Result<()> {
+        let mut slot = self.client.lock().map_err(|_| unavailable())?;
+        Self::connect(&mut slot)?;
+        let result = os(f(slot.as_mut().ok_or_else(unavailable)?));
+        if result.is_err() { *slot = None; }
+        result
     }
 }
 impl Egress for LinuxEgress {
-    fn readiness(&mut self) -> Result<crate::readiness::EgressSecondLayer> { let _ = self.client()?; self.dns.verify() }
+    fn readiness(&mut self) -> Result<crate::readiness::EgressSecondLayer> {
+        // As before: a control connection exists or can be made. While the DNS
+        // worker holds it for a probe it exists; the refresh never waits for it.
+        match self.client.try_lock() {
+            Ok(mut slot) => Self::connect(&mut slot)?,
+            Err(std::sync::TryLockError::WouldBlock) => {}
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(unavailable()),
+        }
+        // R7b: the second layer was read from the installer receipt's DNS part,
+        // which is gone; until its own readback exists it is reported
+        // unavailable (a readiness notice, not a readiness gate).
+        Ok(crate::readiness::EgressSecondLayer::Unavailable)
+    }
+    fn dns_route_verified(&mut self) -> bool { self.dns.verified() }
     fn register(&mut self, run: RunId, profile: duduclaw_isolation::egress::ProfileId, fd: OwnedFd) -> Result<()> {
         let request = RequestId(os(crate::server::random_id())?);
-        let result = os(self.client()?.register_owned(request, run, profile, fd));
-        if result.is_err() { self.client = None; }
-        result
+        self.exchange(|client| client.register_owned(request, run, profile, fd))
     }
     fn unregister(&mut self, run: RunId) -> Result<()> {
         let request = RequestId(os(crate::server::random_id())?);
-        let result = os(self.client()?.unregister(request, run));
-        if result.is_err() { self.client = None; }
-        result
+        self.exchange(|client| client.unregister(request, run))
     }
 }
 pub struct Components {
@@ -289,8 +319,12 @@ impl Core {
             }
         }
         if let Ok(layer) = self.components.egress.readiness() {
-            checks.egress_verified = true; checks.dns_route_verified = true; checks.egress_second_layer = layer;
+            checks.egress_verified = true; checks.egress_second_layer = layer;
         }
+        // R7b: a snapshot of the DNS probe worker (first call starts it, after
+        // start-up recovery); never blocks this refresh.
+        let dns_route = self.components.egress.dns_route_verified();
+        checks.dns_route_verified = checks.egress_verified && dns_route;
         checks.storage_verified = self.components.storage.readiness().is_ok();
         checks.process_scan_verified = self.monitor.state.lock().is_ok_and(|state|
             state.at.elapsed() < Duration::from_secs(1) && state.result.as_ref().is_ok_and(Vec::is_empty));

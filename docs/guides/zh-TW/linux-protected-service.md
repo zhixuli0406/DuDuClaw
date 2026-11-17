@@ -188,7 +188,7 @@ sudo journalctl -u duduclaw-gateway.service -u duduclaw-spawnd.service -u duducl
 | 就緒資料缺失、過期或不相容 | 確認完整世代、協定版本、帳號登錄表與全部服務；只有 `active` 不足以放行。 |
 | UID／帳號／SSH／IAM 失敗 | 處理保留範圍衝突、別名、附加群組、登入／cron／at 或 linger；外部 IAM 保留需管理員證明。 |
 | 儲存／配額失敗 | 確認底層裝置鏈、硬性配額、可用容量與主機保留空間；不能用磁碟用量輪詢代替硬性配額。 |
-| DNS／egress 失敗 | 檢查 root 指定的 resolved Varlink 或 DNS broker 路徑；不要替 egress 服務加入私有 resolver IP 例外。 |
+| DNS／egress 失敗 | 檢查 root 指定的 resolved Varlink 或 DNS broker 路徑；不要替 egress 服務加入私有 resolver IP 例外。DNS 就緒（`host_dns_route_unverified`）是 spawnd 自己的即時檢查，不讀安裝收據：spawnd 約每分鐘請 egress 經由該路徑解析簽章政策中的 `dns_probe_name`，至少要得到一個公開位址才算通過。簽章政策版本低於 v4、egress 沒有執行，或這台主機解析不到該名稱時，都維持未驗證（請檢查對外 DNS 與 egress 日誌中的 `dns_probe` 紀錄）。 |
 | 解析根目錄失敗 | 檢查兩個根目錄的擁有者、權限與非預期內容；不要複製主機 `/etc` 或資料進去。 |
 | 遷移平台或設定連結不可用 | 保留既有環境，取得完整驗證過的整合；不要搬移舊權威或繞過遷移閘。 |
 | 等待確認／輪替 | 在遷移確認頁完成支援的確認、重試與新憑證設定；核准本身不代表遷移完成。 |
