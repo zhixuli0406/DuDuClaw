@@ -1506,7 +1506,7 @@ async fn live_budget_and_provider_refusals_keep_pre_notice_assistant_done_bytes(
         let rows = fixture.state.ctx.session_manager.webchat_history(&format!("{base}#conv:{conv}")).await.unwrap();
         let notices: Vec<_> = rows.iter().filter(|r| r.notice_kind.as_deref() == Some("turn_failure")).collect();
         assert_eq!(notices.len(), 1);
-        assert_eq!(notices[0].message.content, reason.text(None));
+        assert!(notices[0].message.content.starts_with(reason.text(None)));
         fixture.turn_count(0).await;
     }
 }

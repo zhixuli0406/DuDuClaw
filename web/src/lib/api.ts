@@ -143,7 +143,12 @@ export type OrgChartAgent = Pick<AgentInfo, 'name' | 'role'> & Partial<Pick<Agen
 
 export interface AgentDetail extends AgentInfo {
   timeout_authorization_ceiling_secs?: number;
+  effective_max_turns?: number;
+  max_turns_limit?: number;
+  default_max_turns?: number;
   effective_timeout_secs?: number;
+  effective_idle_timeout_secs?: number;
+  default_idle_timeout_secs?: number;
   max_timeout_secs?: number;
   budget: AgentBudget;
   model: AgentModel;
@@ -177,6 +182,8 @@ export interface AgentDetail extends AgentInfo {
     provider?: string;
     fallback?: string;
     timeout_secs?: number | null;
+    idle_timeout_secs?: number | null;
+    max_turns?: number | null;
   };
   /** [research] table — returned by agents.inspect so the automation tab's
    *  self-study toggle can prefill the agent's own value (belief loop ×
@@ -273,6 +280,7 @@ export interface ChannelStatus {
 
 /** W2-2 (E1) — a channel's behavior settings (`channels.config_get/set`). */
 export interface ChannelConfigSettings {
+  dm_reply_placement: 'main' | 'thread';
   mention_only: boolean;
   auto_thread: boolean;
   allowed_channels: string[];
@@ -3109,8 +3117,26 @@ export interface McpServerDef {
   env: Record<string, string>;
 }
 
+export interface McpLastStartResult {
+  ok: boolean;
+  tool_count?: number | null;
+  reason_code?: string | null;
+  time?: string;
+}
+
+export interface McpStartResult {
+  ok: boolean;
+  tool_count?: number | null;
+  reason_code?: string | null;
+  time?: string;
+}
+
 export interface McpServerEntry extends McpServerDef {
   name: string;
+  source?: 'mcp_json' | 'agent_toml';
+  read_only?: boolean;
+  effective_runtimes?: string[];
+  last_start?: McpLastStartResult | null;
 }
 
 export interface McpAgentConfig {
@@ -3583,6 +3609,8 @@ export interface AgentRuntime {
   provider?: RuntimeProvider;
   /** Per-run CLI / per-request OpenAI-compatible API limit for all runtimes including Claude, from 30 seconds to the global ceiling. Null clears it. */
   timeout_secs?: number | null;
+  idle_timeout_secs?: number | null;
+  max_turns?: number | null;
   /** A provider name, or '' to clear. Must be a valid provider when non-empty. */
   fallback?: string;
   /** v1.68 W1 — `[runtime] minimal_context` (精簡啟動內容). Default true. */
@@ -8319,6 +8347,8 @@ export const api = {
           enabled: boolean;
           last_run_at?: string | null;
           last_status?: string | null;
+          last_delivery_status?: string | null;
+          last_delivery_reason?: string | null;
         }>;
       }>,
     add: (params: { name: string; agent_id: string; cron: string; task?: string }) =>
@@ -8831,13 +8861,15 @@ export const api = {
   mcp: {
     list: () =>
       client.call('mcp.list') as Promise<{ agents: McpAgentConfig[]; catalog: McpCatalogItem[] }>,
-    update: (agentId: string, action: 'add' | 'remove', serverName: string, serverDef?: McpServerDef) =>
+    probe: (agentId: string, serverName: string) =>
+      client.call('mcp.probe', { agent_id: agentId, server_name: serverName }) as Promise<McpStartResult>,
+    update: (agentId: string, action: 'add' | 'edit' | 'remove', serverName: string, serverDef?: McpServerDef) =>
       client.call('mcp.update', {
         agent_id: agentId,
         action,
         server_name: serverName,
         ...(serverDef ? { server_def: serverDef } : {}),
-      }).then(notifyDisconnectForget) as Promise<{ success: boolean }>,
+      }).then(notifyDisconnectForget) as Promise<{ success: boolean; probe?: McpStartResult }>,
     oauthProviders: () =>
       client.call('mcp.oauth.providers') as Promise<{ providers: McpOAuthProvider[] }>,
     oauthStart: (providerId: string, clientId?: string, clientSecret?: string, acknowledgeGoogleData?: boolean) =>

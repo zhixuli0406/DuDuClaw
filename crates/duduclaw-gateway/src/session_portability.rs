@@ -423,6 +423,7 @@ impl SessionManager {
         )
         .map_err(|e| DuDuClawError::Gateway(format!("undo token count: {e}")))?;
 
+        Self::reset_rolling_summary(&tx, session_id)?;
         tx.commit()
             .map_err(|e| DuDuClawError::Gateway(format!("commit transaction: {e}")))?;
 
@@ -504,6 +505,7 @@ impl SessionManager {
         )
         .map_err(|e| DuDuClawError::Gateway(format!("rollback token count: {e}")))?;
 
+        Self::reset_rolling_summary(&tx, session_id)?;
         tx.commit()
             .map_err(|e| DuDuClawError::Gateway(format!("commit transaction: {e}")))?;
 
@@ -531,6 +533,44 @@ mod tests {
         let tmp = NamedTempFile::new().unwrap();
         let m = SessionManager::new(tmp.path()).unwrap();
         (tmp, m)
+    }
+
+    #[tokio::test]
+    async fn undo_clears_rolling_summary_and_bookmark() {
+        let (tmp, m) = mgr().await;
+        m.get_or_create("undo-summary", "worker").await.unwrap();
+        for (role, text) in [("user", "q1"), ("assistant", "a1"),
+            ("user", "q2"), ("assistant", "a2")] {
+            m.append_message("undo-summary", role, text, 1).await.unwrap();
+        }
+        m.set_summary("undo-summary", "- includes retracted exchange", 4).await.unwrap();
+        assert!(matches!(m.undo_last_turns("undo-summary", 1).await.unwrap(), UndoDecision::Undone { .. }));
+        let (summary, bookmark) = m.get_summary("undo-summary").await.unwrap();
+        assert!(summary.is_empty());
+        assert_eq!(bookmark, 0);
+        assert!(bookmark as usize <= m.get_messages("undo-summary").await.unwrap().len());
+        let conn = rusqlite::Connection::open(tmp.path()).unwrap();
+        assert!(conn.query_row("SELECT summary_of_prior IS NULL AND last_summarized_at IS NULL
+            FROM sessions WHERE id='undo-summary'", [], |row| row.get::<_, bool>(0)).unwrap());
+    }
+
+    #[tokio::test]
+    async fn rollback_clears_rolling_summary_and_bookmark() {
+        let (tmp, m) = mgr().await;
+        m.get_or_create("rollback-summary", "worker").await.unwrap();
+        for (role, text) in [("user", "q1"), ("assistant", "a1"),
+            ("user", "q2"), ("assistant", "a2")] {
+            m.append_message("rollback-summary", role, text, 1).await.unwrap();
+        }
+        m.set_summary("rollback-summary", "- includes retracted exchange", 4).await.unwrap();
+        assert!(matches!(m.rollback_to_checkpoint("rollback-summary").await.unwrap(), RollbackDecision::RolledBack { .. }));
+        let (summary, bookmark) = m.get_summary("rollback-summary").await.unwrap();
+        assert!(summary.is_empty());
+        assert_eq!(bookmark, 0);
+        assert!(bookmark as usize <= m.get_messages("rollback-summary").await.unwrap().len());
+        let conn = rusqlite::Connection::open(tmp.path()).unwrap();
+        assert!(conn.query_row("SELECT summary_of_prior IS NULL AND last_summarized_at IS NULL
+            FROM sessions WHERE id='rollback-summary'", [], |row| row.get::<_, bool>(0)).unwrap());
     }
 
     #[tokio::test]

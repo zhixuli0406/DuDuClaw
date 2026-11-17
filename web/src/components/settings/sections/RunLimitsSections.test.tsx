@@ -24,6 +24,16 @@ function saveCard(label: string) {
 }
 
 describe('Run limit settings cards', () => {
+  it('saves the step budget through the existing config RPC', async () => {
+    renderWithProviders(<RunLimitsSections />);
+    const field = await screen.findByRole('spinbutton', { name: 'Default step limit' });
+    await waitFor(() => expect(field).toHaveValue(50));
+    expect(screen.getByRole('spinbutton', { name: 'Step limit ceiling' })).toHaveValue(200);
+    fireEvent.change(field, { target: { value: '80' } });
+    saveCard('Default step limit');
+    await waitFor(() => expect(update).toHaveBeenCalledWith({ runtime: { default_max_turns: 80 } }));
+  });
+
   it('gives each new save button a distinct accessible name', () => {
     renderWithProviders(<RunLimitsSections />);
     expect(screen.getByRole('button', { name: 'Save run limits' })).toBeInTheDocument();
@@ -62,4 +72,13 @@ describe('Run limit settings cards', () => {
     saveCard('Pending requests per person');
     await waitFor(() => expect(update).toHaveBeenCalledWith({ agent_files: { max_pending_per_user: 10 } }));
   });
+});
+
+it('saves the global idle timeout beside the total timeout, including disable', async () => {
+  renderWithProviders(<RunLimitsSections />);
+  const input = await screen.findByRole('spinbutton', { name: 'Default no-progress timeout (seconds)' });
+  await waitFor(() => expect(input).toHaveValue(900));
+  fireEvent.change(input, { target: { value: '0' } });
+  saveCard('Default no-progress timeout (seconds)');
+  await waitFor(() => expect(update).toHaveBeenCalledWith({ runtime: { default_idle_timeout_secs: 0 } }));
 });

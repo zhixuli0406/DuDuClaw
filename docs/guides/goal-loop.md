@@ -714,3 +714,13 @@ The task detail page has two controls for a goal task in progress. Full rules ar
 ## Termination guarantee
 
 The driver, not the model, owns the hard boundaries, so a stuck goal can never loop forever: only an acceptance judge's sign-off counts as a completion signal (the AI's own "I'm done" self-report is never trusted); the dispatch cap, wall-clock cap, concurrency cap, progress-oscillation detection, and the feedback-path circuit breaker each apply independently, and hitting any one of them triggers an escalation to a human or a trip of the breaker.
+
+## Event-silence limits and continuation
+
+The global `[runtime] default_idle_timeout_secs` defaults to **900 seconds**. An employee may override it with `[runtime] idle_timeout_secs`; absent means inherit, **0 disables**, and other values must be **60..=max_timeout_secs**. With an omitted global value, a lower global maximum also narrows the default. Read or parse failures use the built-in 900 seconds. Raising or disabling an employee limit, including clearing it to a larger or disabled global default, requires administrator authority; lowering does not. The dashboard places both fields next to the execution time limits, in the employee editor and global run limits.
+
+Claude chat and background runs, Codex JSONL runs, and OpenAI-compatible SSE responses stop when no event arrives within that window. Any parsed event counts, including tool events; the periodic 90-second keep-alive notice does not. The last unfinished tool is named when known. Grok and non-streaming OpenAI-compatible requests/tool loops retain their total timeout because these paths do not expose a live event stream here. Antigravity has been removed.
+
+A step limit (`max_turns`), total timeout (`timeout_total`), or event-silence timeout (`timeout_no_progress`) ends the current turn without marking an account unhealthy, changing accounts, or retrying another model/runtime. A timeout reports that **no final answer was produced before the time limit**, even when tools ran. For signed-in channel users, captured assistant text is delivered before the notice and saved as an assistant turn; reply “continue” to resume with that context. Claude step-limit notices include the applied step count. Public visitors receive only the visitor-safe generic message and reference number, with no partial text, counts, reason code, or operator hints.
+
+Failure notices end with a stable lowercase reason code and the first eight characters of the turn reference. The audit record retains `reason_code` and the full `reference_id`; background results use the dispatch run reference. Goal-loop work limits pause with `max_turns`, `timeout_total`, or `timeout_no_progress`, without accumulating infrastructure dispatch failures.

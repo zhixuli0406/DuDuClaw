@@ -464,6 +464,19 @@ tokio::task_local! {
     static RUNTIME_USAGE_REQUEST_TYPE: RequestType;
 }
 
+/// Evolution keeps tools where authorized, but never inherits a raised work budget.
+/// Fail closed: without a positively identified work request type, the cap applies.
+pub(crate) fn allows_employee_step_budget() -> bool {
+    !in_utility_call() && RUNTIME_USAGE_REQUEST_TYPE.try_with(|kind| matches!(kind,
+        RequestType::Chat | RequestType::Cron | RequestType::Dispatch)).unwrap_or(false)
+}
+
+/// Classify a work turn that reaches a runtime without [`run_agent_prompt`]
+/// (the direct channel-reply Claude CLI path), so it keeps the employee budget.
+pub(crate) async fn with_work_request_type<F: std::future::Future>(kind: RequestType, future: F) -> F::Output {
+    RUNTIME_USAGE_REQUEST_TYPE.scope(kind, future).await
+}
+
 pub(crate) fn allows_partial_reply() -> bool {
     !in_utility_call() && CHANNEL_REPLY_PARTIAL.try_with(|_| ()).is_ok()
 }
@@ -491,9 +504,12 @@ pub(crate) async fn validate_runtime_response(
     response: RuntimeResponse, context: &RuntimeContext,
 ) -> Result<RuntimeResponse, String> {
     if !allows_partial_reply() {
-        if let Err(error) = response.ensure_complete() {
+        if let Some(seconds) = response.partial_timeout_secs {
             record_discarded_runtime_usage(context, &response).await;
-            return Err(error);
+            return Err(crate::work_outcome::WorkOutcome::TimeoutTotal {
+                seconds,
+                partial: String::new(),
+            }.encode());
         }
     }
     Ok(response)
@@ -1553,7 +1569,13 @@ mod utility_policy_tests {
                 "text" => run_agent_prompt_text(partial_request(home.path())).await.unwrap_err(),
                 _ => run_agent_prompt(partial_request(home.path())).await.unwrap_err(),
             };
-            assert!(error.contains("openai_compat CLI hard timeout after 37s (partial output discarded)"), "{lane}: {error}");
+            if lane == "nested-text" {
+                assert!(error.contains("openai_compat CLI hard timeout after 37s (partial output discarded)"), "{lane}: {error}");
+            } else {
+                assert_eq!(crate::work_outcome::WorkOutcome::decode(&error), Some(crate::work_outcome::WorkOutcome::TimeoutTotal {
+                    seconds: 37, partial: String::new(),
+                }), "{lane}: {error}");
+            }
             assert!(!error.contains("PASS"), "partial verdict must not leak into errors");
             let reply = CHANNEL_REPLY_PARTIAL.scope((),
                 run_agent_prompt_detailed(partial_request(home.path()))).await.unwrap();

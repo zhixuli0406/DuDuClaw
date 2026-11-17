@@ -13,7 +13,7 @@ pub(super) fn finished(input: &RunInput, outcome: Value) -> Value {
 }
 pub(super) fn failure(code: &str) -> Value {
     let message = if code == "run_timeout" {
-        "已達網頁對話的 15 分鐘執行上限。較長的工作請改為交辦背景任務。"
+        "已達設定的網頁對話執行時間上限。較長的工作請改為交辦背景任務。"
     } else { "無法繼續這次執行，請確認登入狀態、權限及核准要求。" };
     json!({"type":"RUN_ERROR", "code":code, "message":message})
 }
@@ -127,12 +127,12 @@ async fn interrupts_valid(broker: &ApprovalBroker, sid: &str, turn: &str, cards:
 pub(super) async fn start(
     state: Arc<AgUiState>, broker: ApprovalBroker, _lease: RunLease, user: String,
     agent: String, sid: String, turn: String, principal: String, text: String, connection: Connection,
-    mut incoming: mpsc::Receiver<Connection>, waiting: Arc<AtomicBool>,
+    mut incoming: mpsc::Receiver<Connection>, waiting: Arc<AtomicBool>, lifetime: Duration,
 ) {
-    let work = execute(&state, &broker, &user, &agent, &sid, &turn, &text, connection, &mut incoming, &waiting);
+    let work = execute(&state, &broker, &user, &agent, &sid, &turn, &text, connection, &mut incoming, &waiting, lifetime);
     use futures_util::FutureExt;
     let outcome = std::panic::AssertUnwindSafe(crate::channel_reply::with_delivery_cleanup(
-        tokio::time::timeout(RUN_LIFETIME + SEND_TIMEOUT + SEND_TIMEOUT, Box::pin(work)),
+        tokio::time::timeout(lifetime + SEND_TIMEOUT + SEND_TIMEOUT, Box::pin(work)),
     )).catch_unwind().await;
     let success = matches!(&outcome, Ok((Ok(true), Ok(()))));
     let mut fenced = success;
@@ -151,7 +151,7 @@ pub(super) async fn start(
 pub(super) async fn execute(
     state: &AgUiState, broker: &ApprovalBroker, user: &str, agent: &str, sid: &str,
     turn: &str, text: &str, mut connection: Connection, incoming: &mut mpsc::Receiver<Connection>,
-    waiting: &AtomicBool,
+    waiting: &AtomicBool, lifetime: Duration,
 ) -> bool {
     if send(&connection, started(&connection.input)).await.is_err() { return false; }
     if !authorized(state, user, agent, &connection).await { let _ = send(&connection, failure("authorization_changed")).await; return false; }
@@ -185,7 +185,7 @@ pub(super) async fn execute(
     let mut receipt: Vec<ResumeEntry> = Vec::new();
     let mut tick = tokio::time::interval(Duration::from_millis(500));
     let mut tool_seq = 0u64;
-    let deadline = tokio::time::Instant::now() + RUN_LIFETIME;
+    let deadline = tokio::time::Instant::now() + lifetime;
     loop {
         let mut check_pending = false;
         tokio::select! {
@@ -305,7 +305,7 @@ pub(super) async fn execute(
             if !delivered { guarded.refuse_delivery(); }
             if delivered && !receipt.is_empty() {
                 if let Ok(mut receipts) = state.receipts.lock() {
-                    receipts.retain(|_, (at, _)| at.elapsed() < RUN_LIFETIME);
+                    receipts.retain(|_, (at, _)| at.elapsed() < lifetime);
                     if receipts.len() >= 128 { receipts.clear(); }
                     receipts.insert(sid.to_string(), (std::time::Instant::now(), receipt));
                 }

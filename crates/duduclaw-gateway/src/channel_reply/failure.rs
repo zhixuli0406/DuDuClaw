@@ -16,6 +16,9 @@ pub(crate) enum FailureReason {
     AuthFailed,
     /// The runtime execution time limit was reached.
     Timeout,
+    MaxTurns,
+    TimeoutTotal,
+    TimeoutNoProgress,
     /// Subprocess failed to spawn or exited non-zero without recognizable cause.
     SpawnError,
     /// CLI returned empty output after trimming.
@@ -51,7 +54,10 @@ impl FailureReason {
             Self::RateLimited => "rate_limited",
             Self::Billing => "billing",
             Self::AuthFailed => "auth_failed",
-            Self::Timeout => "timeout",
+            Self::Timeout => "timeout_total",
+            Self::MaxTurns => "max_turns",
+            Self::TimeoutTotal => "timeout_total",
+            Self::TimeoutNoProgress => "timeout_no_progress",
             Self::SpawnError => "spawn_error",
             Self::EmptyResponse => "empty_response",
             Self::NoAccounts => "no_accounts",

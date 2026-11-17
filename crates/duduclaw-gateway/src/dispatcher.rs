@@ -21,6 +21,19 @@ use duduclaw_core::{
     MAX_DELEGATION_DEPTH, is_valid_discord_snowflake, truncate_bytes,
 };
 
+tokio::task_local! {
+    static DISPATCH_FAILURE_REFERENCE: DispatchFailureDelivery;
+}
+
+/// Delivery diagnostics are separate from model-authored history.
+#[derive(Clone)]
+struct DispatchFailureDelivery {
+    reference: String,
+    language: Option<String>,
+    partial: String,
+    reason: crate::channel_reply::TurnFailureReason,
+}
+
 /// Message envelope stored in `bus_queue.jsonl`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BusMessage {
@@ -412,6 +425,7 @@ pub(crate) async fn poll_and_dispatch_sqlite(
     prediction_engine: Option<&Arc<crate::prediction::engine::PredictionEngine>>,
     gvu_ctx: Option<&Arc<crate::prediction::subagent_prediction::GvuTriggerCtx>>,
 ) -> Result<(), String> {
+    Box::pin(async {
     let mut messages = Vec::new();
     let mut cursor: Option<(String, String)> = None;
     let mut eligibility = std::collections::HashMap::new();
@@ -915,13 +929,25 @@ pub(crate) async fn poll_and_dispatch_sqlite(
                 // sub-task died (silent drop). See `dispatch_failure_reply`:
                 // ordinary errors become a classified, non-leaking zh-TW notice;
                 // task-sandbox refusals carry their own operator-safe message.
-                let fallback_text = dispatch_failure_reply(&e);
-                forward_delegation_response(home_dir, &msg.id, &fallback_text, &msg.target).await;
+                let language = crate::prompt_identity::resolve_fixed_message_language_for_id(home_dir, &msg.target).await;
+                let code = match &e { DispatchError::Other(error) => crate::channel_reply::classify_cli_failure(error).as_str(), _ => "unknown" };
+                let reference = crate::work_outcome::WorkOutcome::reference(&host_text).unwrap_or_else(|| msg.id.clone());
+                let fallback_text = format!("{}\n{}", dispatch_failure_reply(&e),
+                    crate::channel_reply::failure_notice::notice_suffix(language.as_deref(), Some(code), &reference));
+                let partial = crate::work_outcome::WorkOutcome::decode(&host_text)
+                    .map(|outcome| outcome.partial().to_owned()).unwrap_or_default();
+                let reason = match &e {
+                    DispatchError::Other(error) => crate::channel_reply::classify_cli_failure(error).into(),
+                    _ => crate::channel_reply::TurnFailureReason::Unknown,
+                };
+                DISPATCH_FAILURE_REFERENCE.scope(DispatchFailureDelivery { reference, language, partial, reason },
+                    forward_delegation_response(home_dir, &msg.id, &fallback_text, &msg.target)).await;
             }
         }
     }
 
     Ok(())
+    }).await
 }
 
 /// Why a dispatch failed, as the two delegation reply paths need it.
@@ -999,6 +1025,10 @@ fn dispatch_failure_reply(error: &DispatchError) -> String {
             format!("⚠️ 子任務失敗（任務沙箱，{}）：{}", failure.code, failure.message)
         }
         DispatchError::Other(e) => {
+            if let Some(outcome) = crate::work_outcome::WorkOutcome::decode(e) {
+                let notice = crate::channel_reply::failure_notice::work_notice(&outcome, None);
+                return if outcome.partial().trim().is_empty() { notice } else { format!("{}\n\n{notice}", outcome.partial()) };
+            }
             let label = short_failure_label(crate::channel_reply::classify_cli_failure(e));
             format!("⚠️ 子任務處理失敗：{label}。請稍後再試或改寫指令。")
         }
@@ -1059,7 +1089,9 @@ fn dispatch_failure_code(error: &DispatchError) -> String {
             FailureReason::AuthFailed => "auth_failed",
             FailureReason::RateLimited => "rate_limited",
             FailureReason::Billing => "billing",
-            FailureReason::Timeout => "timeout",
+            FailureReason::Timeout | FailureReason::TimeoutTotal => "timeout_total",
+            FailureReason::TimeoutNoProgress => "timeout_no_progress",
+            FailureReason::MaxTurns => "max_turns",
             FailureReason::SpawnError => "spawn_error",
             FailureReason::EmptyResponse => "empty_response",
             FailureReason::NoAccounts => "no_accounts",
@@ -1082,7 +1114,9 @@ fn short_failure_label(reason: crate::channel_reply::FailureReason) -> &'static 
         FailureReason::AuthFailed => "帳號未登入或認證失效",
         FailureReason::RateLimited => "API 使用量已達上限",
         FailureReason::Billing => "帳號額度已用完",
-        FailureReason::Timeout => "處理逾時",
+        FailureReason::Timeout | FailureReason::TimeoutTotal => "已達執行時限，尚未產生最終答案",
+        FailureReason::TimeoutNoProgress => "長時間沒有進展，已停止",
+        FailureReason::MaxTurns => "這一輪的步數用完了",
         FailureReason::SpawnError => "子程序啟動失敗",
         FailureReason::EmptyResponse => "未產生回應內容",
         FailureReason::NoAccounts => "沒有可用帳號",
@@ -1131,6 +1165,7 @@ async fn poll_and_dispatch(
     prediction_engine: Option<&Arc<crate::prediction::engine::PredictionEngine>>,
     gvu_ctx: Option<&Arc<crate::prediction::subagent_prediction::GvuTriggerCtx>>,
 ) -> Result<(), String> {
+    Box::pin(async {
     let queue_path = home_dir.join("bus_queue.jsonl");
 
     // Read all lines
@@ -1815,6 +1850,7 @@ async fn poll_and_dispatch(
     }
 
     Ok(())
+    }).await
 }
 
 /// Delegation context injected as environment variables into Claude CLI subprocesses.
@@ -3144,6 +3180,16 @@ pub(crate) async fn forward_delegation_response(
         return;
     };
 
+    // Apply the public-visitor boundary after resolving the actual callback.
+    let visitor_notice = DISPATCH_FAILURE_REFERENCE.try_with(|failure| {
+        let sid = format!("{channel_type}:{channel_id}");
+        (crate::channel_reply::assembly::public_session(&sid)
+            || (channel_type == "webchat" && crate::webchat::is_widget_visitor(&channel_id)))
+            .then(|| format!("{}\n{}", crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE,
+                crate::channel_reply::failure_notice::notice_suffix(failure.language.as_deref(), None, &failure.reference)))
+    }).ok().flatten();
+    let response_text = visitor_notice.as_deref().unwrap_or(response_text);
+
     // v1.8.20: look up the chain root (original origin_agent) so
     // `forward_to_channel` can cascade token resolution from the
     // callback caller → chain root → global config. Without this hop,
@@ -3169,7 +3215,7 @@ pub(crate) async fn forward_delegation_response(
         "Forwarding sub-agent response to originating channel"
     );
 
-    match forward_to_channel_as(
+    let (forwarded, partial) = crate::telegram_send::track_partial(forward_to_channel_as(
         home_dir,
         &channel_type,
         &channel_id,
@@ -3180,8 +3226,8 @@ pub(crate) async fn forward_delegation_response(
         chain_root.as_deref(),
         sender_agent.as_deref(),
     )
-    .await
-    {
+    ).await;
+    match forwarded {
         Ok(()) => {
             // v1.8.17 Fix 2 (Option A): forward succeeded — also persist the
             // sub-agent's reply into the PARENT agent's session history so
@@ -3209,13 +3255,13 @@ pub(crate) async fn forward_delegation_response(
         }
         Err(e) => {
             let next_retry = retry_count + 1;
-            if next_retry >= 5 {
+            if partial || next_retry >= 5 {
                 warn!(
                     channel = %channel_type,
                     chat_id = %channel_id,
                     error = %e,
                     retries = retry_count,
-                    "Delegation callback forwarding permanently failed after 5 retries — dropping"
+                    "Delegation callback forwarding stopped after partial delivery or retry limit — dropping"
                 );
             } else {
                 warn!(
@@ -3432,7 +3478,9 @@ async fn append_subagent_reply_to_parent_session_with(
     // Two variants of the content — direct vs relayed. The reply body is
     // redacted per owning agent inside the closure (the owner is only known
     // once the session row is read), so only the owned strings move in.
-    let response_owned = response_text.to_string();
+    let failure = DISPATCH_FAILURE_REFERENCE.try_with(Clone::clone).ok();
+    let response_owned = failure.as_ref().map(|f| f.partial.clone()).unwrap_or_else(|| response_text.to_string());
+    let failed = failure.is_some();
     let responder_owned = responder_agent.to_string();
 
     let parent = parent_agent_id.to_string();
@@ -3447,6 +3495,11 @@ async fn append_subagent_reply_to_parent_session_with(
         std::iter::once(parent.as_str()).chain(root.as_deref()),
     );
 
+    // Capture task-local widget identity before entering spawn_blocking.
+    let candidates: Vec<_> = candidates.into_iter().map(|sid| {
+        let public = crate::channel_reply::assembly::public_session(&sid);
+        (sid, public)
+    }).collect();
     let ch_type = channel_type.to_string();
     let ch_id = channel_id.to_string();
     let responder_for_log = responder_agent.to_string();
@@ -3460,7 +3513,7 @@ async fn append_subagent_reply_to_parent_session_with(
         // Try each candidate session_id in order. Accept a session whose
         // owner matches either the direct parent OR the chain root.
         // Direct match wins if both are available for the same session.
-        for sid in &candidates {
+        for (sid, public) in &candidates {
             // RM-173: a user clear left at its original id
             // (`STUCK_USER_CLEAR`) is not a live conversation — skip it.
             let existing: Option<String> = conn
@@ -3490,6 +3543,12 @@ async fn append_subagent_reply_to_parent_session_with(
                 );
                 continue;
             };
+
+            // Match direct-channel history: public visitors retain no failed
+            // partials; other sessions retain only nonempty model partials.
+            if failed && (*public || response_owned.trim().is_empty()) {
+                return Ok(Some((sid.clone(), is_relayed)));
+            }
 
             let content = subagent_reply_turn_content(
                 redaction.as_ref(),
@@ -3530,6 +3589,18 @@ async fn append_subagent_reply_to_parent_session_with(
 
     match result {
         Ok(Ok(Some((sid, is_relayed)))) => {
+            if let Some(failure) = failure {
+                match crate::session::SessionManager::new(&home_dir.join("sessions.db")) {
+                    Ok(manager) => {
+                        if let Err(error) = manager.record_turn_failure(&sid, &failure.reference,
+                            failure.reason, failure.language.as_deref(), None).await {
+                            warn!(%error, "Delegation failure notice persistence failed");
+                        }
+                    }
+                    Err(error) => warn!(%error, "Delegation failure session store unavailable"),
+                }
+            }
+
             info!(
                 parent = %parent_agent_id,
                 responder = %responder_for_log,
@@ -3849,7 +3920,7 @@ async fn forward_to_channel_as(
         let report = format!("📨 **{}** 的回報：\n\n{}", safe_agent, safe_text);
         return crate::googlechat::send_text_to_space_as(home_dir, sender, channel_id, &report)
             .await
-            .map_err(|e| e.to_string());
+            .map_err(|e| e.user_message(home_dir));
     }
 
     // Split the body into paragraph/line-aligned chunks instead of truncating.
@@ -3900,60 +3971,13 @@ async fn forward_to_channel_as(
             if token.is_empty() {
                 return Err("telegram_bot_token not configured".into());
             }
-            let url = format!("{}/sendMessage", crate::telegram::telegram_poll_api_base(&token));
-            for (i, body) in chunks.iter().enumerate() {
-                let mut payload = serde_json::json!({
-                    "chat_id": channel_id,
-                    "text": body,
-                    "parse_mode": "Markdown",
-                });
-                if let Some(tid) = thread_id {
-                    if let Ok(tid_num) = tid.parse::<i64>() {
-                        payload["message_thread_id"] = serde_json::json!(tid_num);
-                    }
-                }
-                let resp = http.post(&url).json(&payload).send().await.map_err(|e| {
-                    format!(
-                        "telegram send chunk {}/{}: {}",
-                        i + 1,
-                        total,
-                        crate::secret_redact::redact_secrets(&e.to_string())
-                    )
-                })?;
-                if !resp.status().is_success() {
-                    // Retry without parse_mode in case Markdown causes issues on this chunk.
-                    // A failure here (network error or non-2xx) MUST propagate as Err —
-                    // this used to only `warn!` and fall through to `Ok(())`, which
-                    // silently swallowed the delivery failure and starved the
-                    // `forward_delegation_response` 5-attempt retry (every other
-                    // channel in this match already returns Err on the equivalent
-                    // path). Multi-chunk replies may re-send earlier chunks on the
-                    // outer retry — same accepted tradeoff as LINE/Discord/Slack above.
-                    let fallback_payload = serde_json::json!({
-                        "chat_id": channel_id,
-                        "text": body,
-                    });
-                    let fallback_resp = http
-                        .post(&url)
-                        .json(&fallback_payload)
-                        .send()
-                        .await
-                        .map_err(|e| {
-                            format!("telegram fallback send chunk {}/{}: {e}", i + 1, total)
-                        })?;
-                    if !fallback_resp.status().is_success() {
-                        return Err(format!(
-                            "Telegram API returned {} on chunk {}/{} (markdown and plain-text attempts both failed)",
-                            fallback_resp.status(),
-                            i + 1,
-                            total
-                        ));
-                    }
-                }
-                if i + 1 < total {
-                    tokio::time::sleep(chunk_gap).await;
-                }
-            }
+            let prefix = format!("📨 {} 的回報：\n\n", responder_agent);
+            let mut options = crate::telegram_send::Options::new(home_dir, "delegation", originating_agent);
+            options.thread = thread_id.and_then(|id| id.parse().ok());
+            options.literal_prefix = Some(&prefix);
+            crate::telegram_send::send(http, &crate::telegram::telegram_poll_api_base(&token),
+                channel_id, &safe_text, crate::telegram_send::Format::MarkdownHtml, options)
+                .await.map_err(|error| error.to_string())?;
         }
         "line" => {
             let token = resolve_forward_token(
@@ -5100,6 +5124,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_failure_history_keeps_only_non_public_model_partial() {
+        for (channel, chat) in [("telegram", "42"), ("odoolivechat", "site:42"), ("webchat", "widget-visitor:42")] {
+            for partial in ["", "模型完成的部分"] {
+                let sid = format!("{channel}:{chat}");
+                let (_tmp, home) = setup_parent_session(&sid, "agnes").await;
+                let failure = DispatchFailureDelivery {
+                    reference: "failure-ref".into(), language: Some("zh-TW".into()), partial: partial.into(),
+                    reason: crate::channel_reply::TurnFailureReason::TimeoutNoProgress,
+                };
+                crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.scope(
+                    if channel == "webchat" { "widget-visitor:42" } else { "member" }.into(),
+                    DISPATCH_FAILURE_REFERENCE.scope(failure,
+                        append_subagent_reply_to_parent_session(&home, channel, chat, None, "agnes", None,
+                            "worker", "platform notice and failure-ref")),
+                ).await;
+                let sm = SessionManager::new(&home.join("sessions.db")).unwrap();
+                let messages = sm.get_messages(&sid).await.unwrap();
+                let assistants: Vec<_> = messages.iter().filter(|m| m.role == "assistant").collect();
+                assert_eq!(assistants.len(), usize::from(channel == "telegram" && !partial.is_empty()));
+                if let Some(message) = assistants.first() {
+                    assert!(message.content.contains(partial));
+                    assert!(!message.content.contains("failure-ref"));
+                    assert!(!message.content.contains("platform notice"));
+                }
+                let conn = rusqlite::Connection::open(home.join("sessions.db")).unwrap();
+                let visible_notices: i64 = conn.query_row(
+                    "SELECT count(*) FROM session_messages WHERE role='assistant' AND hidden=0 AND content LIKE '%failure-ref%'",
+                    [], |r| r.get(0)).unwrap();
+                assert_eq!(visible_notices, 0);
+                if channel == "telegram" {
+                    let hidden: i64 = conn.query_row(
+                        "SELECT count(*) FROM session_messages WHERE hidden=1 AND notice_kind='turn_failure'",
+                        [], |r| r.get(0)).unwrap();
+                    assert_eq!(hidden, 1);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn forward_appends_to_parent_session_on_success() {
         let (_tmp, home) = setup_parent_session("telegram:42", "agnes").await;
 
@@ -5885,6 +5949,28 @@ bot_token = "{token}"
     }
 
     #[tokio::test]
+    async fn partial_delegation_is_not_requeued_and_notifies_once() {
+        let provider = crate::test_channel_provider::TestChannelProvider::start().await;
+        provider.enqueue_response("sendMessage", serde_json::json!({"ok":true,"result":{}}));
+        provider.enqueue_response("sendMessage", serde_json::json!({"__status":403,"ok":false,"description":"Forbidden"}));
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"),
+            format!("[channels]\ntelegram_bot_token = {:?}\n", provider.token)).unwrap();
+        setup_done_message(home.path(), "partial-forward", "worker", "responder", "report", None);
+        let conn = rusqlite::Connection::open(home.path().join("message_queue.db")).unwrap();
+        conn.execute("INSERT INTO delegation_callbacks (message_id, agent_id, channel_type, channel_id, retry_count, created_at) VALUES ('partial-forward', 'worker', 'telegram', '12345', 0, '2026-11-17')", []).unwrap();
+        forward_delegation_response(home.path(), "partial-forward", &"a".repeat(6000), "responder").await;
+        let remaining: i64 = conn.query_row("SELECT COUNT(*) FROM delegation_callbacks WHERE message_id = 'partial-forward'", [], |r| r.get(0)).unwrap();
+        assert_eq!(remaining, 0, "partially delivered callback must not be requeued");
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.iter().filter(|r| r.body["text"] == crate::telegram_send::delivery_notice(None, true)).count(), 1);
+        assert!(requests[2].body.get("parse_mode").is_none());
+        let record = std::fs::read_to_string(home.path().join("channel_failures.jsonl")).unwrap();
+        assert_eq!(serde_json::from_str::<serde_json::Value>(record.trim()).unwrap()["delivered_chunks"], 1);
+    }
+
+    #[tokio::test]
     async fn peek_callback_reads_without_consuming() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
@@ -6462,7 +6548,7 @@ bot_token = "{token}"
             assert_eq!(reply, "⚠️ 子任務處理失敗：未知錯誤。請稍後再試或改寫指令。", "{raw}");
         }
         let reply = dispatch_failure_reply(&DispatchError::Other("hard timeout after 300s".into()));
-        assert_eq!(reply, "⚠️ 子任務處理失敗：處理逾時。請稍後再試或改寫指令。");
+        assert_eq!(reply, "⚠️ 子任務處理失敗：已達執行時限，尚未產生最終答案。請稍後再試或改寫指令。");
     }
 
     /// One explore lane, two sources: a responsibility round's contract lane

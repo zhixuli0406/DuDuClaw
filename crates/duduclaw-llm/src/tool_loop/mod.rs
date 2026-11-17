@@ -23,8 +23,7 @@
 //! 3. Any other stop reason returns the response as-is.
 //! 4. **Guard rails.** At most `max_iters` (default via
 //!    [`DEFAULT_MAX_TOOL_ITERS`]) tool-dispatch rounds run; on exhaustion the
-//!    last response is returned with its stop reason rewritten to
-//!    `StopReason::Other("max_tool_iters")`. A per-call executor error is fed
+//!    typed `LlmError::MaxTurns` error is returned. A per-call executor error is fed
 //!    back as a `ToolResult { is_error: true }` so the model can recover — it
 //!    never aborts the whole loop (fail-soft for tools, fail-closed only on
 //!    provider transport errors, which propagate).

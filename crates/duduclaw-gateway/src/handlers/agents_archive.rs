@@ -44,6 +44,7 @@ impl MethodHandler {
         if let Err(e) = self.offboard_agent_toml(&agent_id, "deleted").await {
             return WsFrame::error_response("", &format!("Failed to soft-delete agent: {e}"));
         }
+        crate::mcp_start::clear(&self.home_dir, &agent_id, None);
         // RM-134 fourth review (Medium 1): in the same operation, every MCP
         // key bound to this employee is permanently revoked (tombstoned,
         // audited), so it never works for a later employee with the same id.

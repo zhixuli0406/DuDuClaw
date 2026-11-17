@@ -259,6 +259,10 @@ impl MethodHandler {
                 require_admin!();
                 boxed_frame(|| self.handle_mcp_list()).await
             }
+            "mcp.probe" => {
+                require_admin!();
+                boxed_frame(|| self.handle_mcp_probe(&params)).await
+            }
             "mcp.update" => {
                 require_admin!();
                 boxed_frame(|| self.handle_mcp_update(&params)).await

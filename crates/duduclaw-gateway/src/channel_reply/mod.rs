@@ -282,7 +282,7 @@ mod delivery;
 mod direct_api;
 mod entry;
 mod failure;
-mod failure_notice;
+pub(crate) mod failure_notice;
 mod failure_message;
 mod guarded;
 mod history;

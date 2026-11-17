@@ -821,6 +821,30 @@ async fn raw_editor_cannot_forge_or_change_the_embedding_disclosure_record() {
 #[tokio::test]
 async fn runtime_timeout_rpc_preserves_comments_and_rejects_invalid_values() {
     let (home, handler) = handler_with_agent().await;
+    for value in [json!(0), json!(-1), json!(201), json!(1.5), json!("50")] {
+        let e = err(&handler.handle("agents.update", json!({"agent_id":"a1", "runtime":{"max_turns":value}}), &admin()).await);
+        assert!(e.contains("max_turns"), "{e}");
+    }
+    let e = err(&handler.handle("agents.update", json!({"agent_id":"a1", "runtime":{"max_turns":51}}), &owner_of_a1()).await);
+    assert!(e.contains("runtime.max_turns"), "{e}");
+    assert!(!audit_rows(home.path(), "agent_authority_refused").is_empty());
+    ok(&handler.handle("agents.update", json!({"agent_id":"a1", "runtime":{"max_turns":75}}), &admin()).await);
+    assert!(!audit_rows(home.path(), "agent_authority_changed").is_empty());
+    ok(&handler.handle("agents.update", json!({"agent_id":"a1", "runtime":{"max_turns":30}}), &owner_of_a1()).await);
+    let e = err(&handler.handle("agents.update", json!({"agent_id":"a1", "runtime":{"max_turns":null}}), &owner_of_a1()).await);
+    assert!(e.contains("runtime.max_turns"), "{e}");
+    ok(&handler.handle("agents.update", json!({"agent_id":"a1", "runtime":{"max_turns":null}}), &admin()).await);
+    let e = err(&handler.handle("system.update_config", json!({"runtime":{"default_max_turns":60}}), &owner_of_a1()).await);
+    assert!(!e.is_empty());
+    ok(&handler.handle("system.update_config", json!({"runtime":{"default_max_turns":60,"max_turns_limit":80}}), &admin()).await);
+    for value in [json!(65), json!(100), json!(0), json!("8")] {
+        let e = err(&handler.handle("agents.update", json!({"agent_id":"a1", "proactive":{"max_turns":value}}), &admin()).await);
+        assert!(e.contains("64"), "{e}");
+    }
+    ok(&handler.handle("agents.update", json!({"agent_id":"a1", "proactive":{"max_turns":64}}), &admin()).await);
+    let mut proactive = duduclaw_core::types::ProactiveConfig { max_turns: 65, ..Default::default() };
+    proactive.sanitize();
+    assert_eq!(proactive.max_turns, 64);
     let path = home.path().join("agents/a1/agent.toml");
     let original = std::fs::read_to_string(&path).unwrap();
     std::fs::write(&path, format!("# Keep the operator's comment\n{original}")).unwrap();

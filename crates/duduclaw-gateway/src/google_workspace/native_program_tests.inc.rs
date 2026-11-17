@@ -429,7 +429,7 @@ async fn google_chat_read_rejects_entire_injected_batch() {
     let result = run(&template, &mut io).await;
     assert_eq!(result["isError"],true);
     assert_eq!(result["content"][0]["text"],"not available");
-    assert!(chat_error(GoogleApiError::Forbidden("provider-secret".into())).to_string().contains(chat_read::GUIDANCE));
+    assert!(chat_error(GoogleApiError::Forbidden("provider-secret".into())).to_string().contains("沒有權限"));
     assert!(!chat_error(GoogleApiError::Forbidden("provider-secret".into())).to_string().contains("provider-secret"));
 }
 

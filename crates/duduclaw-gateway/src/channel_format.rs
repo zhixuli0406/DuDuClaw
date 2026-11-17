@@ -11,6 +11,8 @@ pub mod limits {
     pub const DISCORD_EMBED_DESC: usize = 4096;
     pub const SLACK_MESSAGE: usize = 4000;
     pub const TELEGRAM_MESSAGE: usize = 4096;
+    pub const WHATSAPP_MESSAGE: usize = 4000;
+    pub const DELIVERY_CHUNKS: usize = 16;
     pub const LINE_MESSAGE: usize = 5000;
 }
 

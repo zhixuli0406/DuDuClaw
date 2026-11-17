@@ -145,6 +145,7 @@ impl AgentRunner {
                 &model_id,
                 &rotator,
                 &capabilities,
+                &agent.dir,
                 &|| before_spawn(agent),
             )
             .await;
@@ -400,6 +401,7 @@ async fn call_with_streaming<F, Fut>(
     model: &str,
     rotator: &AccountRotator,
     capabilities: &duduclaw_core::types::CapabilitiesConfig,
+    agent_dir: &std::path::Path,
     before_spawn: &F,
 ) -> std::result::Result<String, String>
 where
@@ -435,7 +437,7 @@ where
 
         let is_oauth = selected.auth_method == AuthMethod::OAuth;
 
-        match call_claude_streaming(system_prompt, prompt, model, &selected.env_vars, capabilities)
+        match call_claude_streaming(system_prompt, prompt, model, &selected.env_vars, capabilities, Some(agent_dir))
             .await
         {
             Ok(resp) => {
@@ -467,7 +469,13 @@ fn streaming_command(
     claude: &str, system_prompt: &str, prompt: &str, model: &str,
     env_vars: &std::collections::HashMap<String, String>,
     capabilities: &duduclaw_core::types::CapabilitiesConfig,
+    agent_dir: Option<&std::path::Path>,
 ) -> (tokio::process::Command, Option<tempfile::TempPath>) {
+    let home = agent_dir.and_then(duduclaw_core::preset::agent_home_dir)
+        .unwrap_or_else(duduclaw_core::platform::duduclaw_home);
+    let max_turns = duduclaw_core::turn_limits::max_turns(&home, agent_dir);
+    let budget_prompt = duduclaw_core::turn_limits::budget_prompt(system_prompt, max_turns);
+    let system_prompt = budget_prompt.as_str();
     let mut cmd = duduclaw_core::platform::async_command_for(claude);
     duduclaw_core::ns_guard::guard_command(&mut cmd);
     cmd.args([
@@ -481,7 +489,7 @@ fn streaming_command(
         "--permission-mode",
         "auto",
         "--max-turns",
-        "50",
+        &max_turns.to_string(),
     ]);
 
     // HS12: enforce a per-agent allowlist when configured.
@@ -490,7 +498,8 @@ fn streaming_command(
         cmd.args(["--allowedTools", &allowed.join(",")]);
     }
     // Apply tool restrictions (deny-by-default)
-    let denied = capabilities.disallowed_tools();
+    let mut denied = capabilities.disallowed_tools();
+    denied.push("AskUserQuestion".into());
     if !denied.is_empty() {
         cmd.args(["--disallowedTools", &denied.join(",")]);
     }
@@ -551,6 +560,7 @@ async fn call_claude_streaming(
     model: &str,
     env_vars: &std::collections::HashMap<String, String>,
     capabilities: &duduclaw_core::types::CapabilitiesConfig,
+    agent_dir: Option<&std::path::Path>,
 ) -> std::result::Result<CliResponse, String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -558,7 +568,7 @@ async fn call_claude_streaming(
         .ok_or("Claude CLI not found. Install: npm install -g @anthropic-ai/claude-code")?;
 
     let (mut cmd, _prompt_guard) = streaming_command(&claude, system_prompt, prompt, model,
-        env_vars, capabilities);
+        env_vars, capabilities, agent_dir);
 
     let mut child = duduclaw_core::execution_gate::with_runtime(
             duduclaw_core::execution_gate::RuntimeKind::Claude,
@@ -826,7 +836,7 @@ mod interactive_budget_tests {
     async fn interactive_budget_refusal_never_reaches_account_selection_or_spawn() {
         let rotator = AccountRotator::new(crate::account_rotator::RotationStrategy::RoundRobin, 1);
         let error = call_with_streaming("", "hello", "unused", &rotator,
-            &Default::default(), &|| std::future::ready(Err(DuDuClawError::Agent("budget denied".into()))))
+            &Default::default(), std::path::Path::new("/unused/agents/anna"), &|| std::future::ready(Err(DuDuClawError::Agent("budget denied".into()))))
             .await.unwrap_err();
         assert!(error.contains("budget denied"), "{error}");
         assert!(!error.contains("accounts exhausted"), "gate must run before account selection: {error}");
@@ -896,15 +906,22 @@ mod execution_backend_equivalence_tests {
             ("ANTHROPIC_API_KEY".into(), String::new()),
         ]);
         let capabilities = duduclaw_core::types::CapabilitiesConfig::default();
-        let (command, guard) = streaming_command("claude", "", "prompt $HOME;\n繁體中文", "fixture-model", &env, &capabilities);
-        assert!(guard.is_none());
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("agents/anna");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"), "[runtime]\nmax_turns=72\n").unwrap();
+        let (command, guard) = streaming_command("claude", "", "prompt $HOME;\n繁體中文", "fixture-model", &env, &capabilities, Some(&dir));
+        let guard = guard.expect("budget hint uses a prompt file");
+        assert!(std::fs::read_to_string(&guard).unwrap().contains("Step budget for this turn: 72"));
         let mut legacy = duduclaw_core::platform::async_command_for("claude");
         duduclaw_core::ns_guard::guard_command(&mut legacy);
-        legacy.args(["-p", "prompt $HOME;\n繁體中文", "--model", "fixture-model", "--output-format", "stream-json", "--verbose", "--permission-mode", "auto", "--max-turns", "50"]);
+        legacy.args(["-p", "prompt $HOME;\n繁體中文", "--model", "fixture-model", "--output-format", "stream-json", "--verbose", "--permission-mode", "auto", "--max-turns", "72"]);
         let allowed = capabilities.allowed_tools();
         if !allowed.is_empty() { legacy.args(["--allowedTools", &allowed.join(",")]); }
-        let denied = capabilities.disallowed_tools();
+        let mut denied = capabilities.disallowed_tools();
+        denied.push("AskUserQuestion".into());
         if !denied.is_empty() { legacy.args(["--disallowedTools", &denied.join(",")]); }
+        legacy.args(["--system-prompt-file", &guard.to_string_lossy()]);
         for (key, value) in &env {
             if value.is_empty() { legacy.env_remove(key); } else { legacy.env(key, value); }
         }

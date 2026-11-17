@@ -126,7 +126,8 @@ impl MethodHandler {
             }
         };
         for key in settings_obj.keys() {
-            if !crate::channel_settings::CONFIG_KEYS.contains(&key.as_str()) {
+            if !crate::channel_settings::CONFIG_KEYS.contains(&key.as_str())
+                && !(channel == "googlechat" && scope_id == "global" && key == crate::channel_settings::keys::DM_REPLY_PLACEMENT) {
                 return WsFrame::error_response("", &format!("Unknown setting key: {key}"));
             }
         }

@@ -44,6 +44,20 @@ impl GoalLoopDriver {
         task_id: &str,
         error: &str,
     ) -> Result<bool, String> {
+        if let Some(outcome) = crate::work_outcome::WorkOutcome::decode(error).or_else(|| {
+            crate::work_outcome::is_work_result(error).then_some(crate::work_outcome::WorkOutcome::TimeoutTotal { seconds: 0, partial: String::new() })
+        }) {
+            let pause = match outcome {
+                crate::work_outcome::WorkOutcome::MaxTurns { .. } => crate::pause_reason::PauseReason::MaxTurns,
+                crate::work_outcome::WorkOutcome::TimeoutTotal { .. } => crate::pause_reason::PauseReason::TimeoutTotal,
+                crate::work_outcome::WorkOutcome::TimeoutNoProgress { .. } => crate::pause_reason::PauseReason::TimeoutNoProgress,
+            };
+            if let Some(removed) = inflight.remove(task_id) { self.release_lease(&removed); }
+            self.dispatch_failures.lock().await.remove(task_id);
+            let Some(task) = self.store.get_task(task_id).await? else { return Ok(false); };
+            self.escalate(inflight, &task, &crate::channel_reply::failure_notice::work_notice(&outcome, None), pause).await?;
+            return Ok(true);
+        }
         if let Some(removed) = inflight.remove(task_id) {
             self.release_lease(&removed);
             // E-M2 / H-1: a round that failed before any agent ran it gives

@@ -22,6 +22,8 @@ fn verify_live_io() -> Result<(), String> {
 
 /// Known setting keys (type-safe access).
 pub mod keys {
+    /// Dashboard-only Google Chat DM presentation preference.
+    pub const DM_REPLY_PLACEMENT: &str = "dm_reply_placement";
     /// Admin-only per-group retention policy; not exposed through channel_config.
     pub const GROUP_CONTEXT: &str = "group_context";
     /// Admin-only per-guild choices for Discord /agent. No global inheritance.
@@ -152,6 +154,9 @@ pub fn validate_scope_id(scope_id: &str) -> Result<(), String> {
 /// [`MCP_ACCESS_KEYS`] / [`DASHBOARD_ACCESS_KEYS`] first.
 pub fn validate_setting_value(key: &str, value: &str) -> Result<(), String> {
     match key {
+        keys::DM_REPLY_PLACEMENT => {
+            if !["main", "thread"].contains(&value) { return Err("dm_reply_placement must be main or thread".into()); }
+        }
         keys::DISCORD_AGENT_CHOICES => {
             let ids: Vec<String> = serde_json::from_str(value)
                 .map_err(|_| "discord_agent_choices must be an array of agent ids".to_string())?;

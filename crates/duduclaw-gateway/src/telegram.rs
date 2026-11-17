@@ -864,10 +864,11 @@ async fn poll_loop(
                     }).to_string());
                     let ack_client = client.clone();
                     let ack_api = api_base.clone();
+                    let ack_home = ctx.home_dir.clone();
                     let _ = busy_acks.try_submit("busy-ack".into(), async move {
                         let _ = tokio::time::timeout(
                             std::time::Duration::from_secs(2),
-                            send_reply(
+                            send_reply(&ack_home,
                                 &ack_client,
                                 &ack_api,
                                 ack_chat,
@@ -1035,7 +1036,7 @@ async fn process_telegram_message(
                     Ok(m) => m,
                     Err(e) => format!("⚠ {e}"),
                 };
-                send_reply(&client, &api_base, chat_id, &ack, thread_id, msg_id, None).await;
+                send_reply(&ctx.home_dir, &client, &api_base, chat_id, &ack, thread_id, msg_id, None).await;
                 return;
             }
         }
@@ -1090,7 +1091,7 @@ async fn process_telegram_message(
             }
             Err(e) => {
                 warn!("Voice transcription failed: {e}");
-                send_reply(
+                send_reply(&ctx.home_dir,
                     &client,
                     &api_base,
                     chat_id,
@@ -1109,7 +1110,7 @@ async fn process_telegram_message(
             Ok(text) => text,
             Err(e) => {
                 warn!("Audio transcription failed: {e}");
-                send_reply(
+                send_reply(&ctx.home_dir,
                     &client,
                     &api_base,
                     chat_id,
@@ -1433,7 +1434,7 @@ async fn process_telegram_message(
             crate::channel_reply::gate_direct_reply(&ctx, &session_id, &user_id, &input_text).await
         {
             if !gate.is_empty() {
-                send_reply(&client, &api_base, chat_id, &gate, thread_id, msg_id, None).await;
+                send_reply(&ctx.home_dir, &client, &api_base, chat_id, &gate, thread_id, msg_id, None).await;
             }
             return;
         }
@@ -1460,7 +1461,7 @@ async fn process_telegram_message(
             },
             None => (text.clone(), None),
         };
-        send_reply(&client, &api_base, chat_id, &body, thread_id, msg_id, markup).await;
+        send_reply(&ctx.home_dir, &client, &api_base, chat_id, &body, thread_id, msg_id, markup).await;
         return;
     }
     // The message an armed `/交辦 @name` was waiting for becomes the task.
@@ -1480,7 +1481,7 @@ async fn process_telegram_message(
         let reply =
             Box::pin(crate::trigger_route::assign::run_pending(&ctx, id, &input_text, &caller)).await;
         if !reply.text.trim().is_empty() {
-            send_reply(&client, &api_base, chat_id, &reply.text, thread_id, msg_id, None).await;
+            send_reply(&ctx.home_dir, &client, &api_base, chat_id, &reply.text, thread_id, msg_id, None).await;
         }
         return;
     }
@@ -1578,6 +1579,7 @@ async fn process_telegram_message(
         // state (see `resolve_current_token` above) — no more
         // reverse-parsing it back out of `api_base`.
         let sender = crate::channel_sender::TelegramSender {
+            home_dir: ctx.home_dir.clone(),
             bot_token: token.clone(),
             chat_id: chat_id.to_string(),
             http: client.clone(),
@@ -1658,7 +1660,7 @@ async fn process_telegram_message(
                         if crate::channel_reply::guard_lost(guarded.as_ref()).await {
                             return;
                         }
-                        send_reply_with_guard(
+                        let _ = send_reply_with_guard(&ctx.home_dir,
                             &client,
                             &api_base,
                             chat_id,
@@ -1813,7 +1815,7 @@ async fn telegram_decision_fastlane(
     let ack = outcome.unwrap_or_else(|e| format!("⚠ {e}"));
     let _ = tokio::time::timeout(
         std::time::Duration::from_secs(3),
-        send_reply(
+        send_reply(&ctx.home_dir,
             client,
             api_base,
             msg.chat.id,
@@ -1973,7 +1975,7 @@ async fn handle_callback_query(
             is_private_chat_with(chat_id, &presser),
         )
         .await;
-        send_reply(client, api_base, chat_id, &text, thread_id, None, None).await;
+        send_reply(&ctx.home_dir, client, api_base, chat_id, &text, thread_id, None, None).await;
         return;
     }
 
@@ -2173,7 +2175,7 @@ async fn handle_command(
                 .map(|(_, rest)| rest.trim())
                 .unwrap_or("");
             let reply = handle_start_binding(ctx, payload, from_user_id).await;
-            send_reply(client, api_base, chat_id, &reply, thread_id, None, None).await;
+            send_reply(&ctx.home_dir, client, api_base, chat_id, &reply, thread_id, None, None).await;
             return;
         }
     }
@@ -2190,7 +2192,7 @@ async fn handle_command(
             telegram_command_gate(ctx, chat_id, thread_id, from_user_id, text).await
         {
             if !gate_reply.is_empty() {
-                send_reply(
+                send_reply(&ctx.home_dir,
                     client,
                     api_base,
                     chat_id,
@@ -2218,7 +2220,7 @@ async fn handle_command(
     match cmd {
         "/ask" => {
             if args.is_empty() {
-                send_reply(
+                send_reply(&ctx.home_dir,
                     client,
                     api_base,
                     chat_id,
@@ -2315,11 +2317,11 @@ async fn handle_command(
                 "{agent_info}\n\n僅在被提及時回覆：{}",
                 if mention_only { "✅" } else { "❌" }
             );
-            send_reply(client, api_base, chat_id, &status, thread_id, None, None).await;
+            send_reply(&ctx.home_dir, client, api_base, chat_id, &status, thread_id, None, None).await;
         }
         "/voice" => {
             let msg = toggle_voice(ctx, chat_id).await;
-            send_reply(client, api_base, chat_id, msg, thread_id, None, None).await;
+            send_reply(&ctx.home_dir, client, api_base, chat_id, msg, thread_id, None, None).await;
         }
         "/reset" => {
             let conversation = if let Some(tid) = thread_id {
@@ -2337,7 +2339,7 @@ async fn handle_command(
                 !is_private_chat_with(chat_id, &sender),
             ) {
                 let refusal = crate::chat_commands::GROUP_RESET_REFUSED;
-                send_reply(client, api_base, chat_id, refusal, thread_id, None, None).await;
+                send_reply(&ctx.home_dir, client, api_base, chat_id, refusal, thread_id, None, None).await;
                 return;
             }
             let session_id =
@@ -2349,7 +2351,7 @@ async fn handle_command(
                 }
                 Err(e) => format!("⚠️ 清除工作階段失敗：{e}"),
             };
-            send_reply(client, api_base, chat_id, &msg, thread_id, None, None).await;
+            send_reply(&ctx.home_dir, client, api_base, chat_id, &msg, thread_id, None, None).await;
         }
         "/help" => {
             let help = "\
@@ -2358,7 +2360,7 @@ async fn handle_command(
 /voice — 切換語音回覆模式\n\
 /reset — 清除對話工作階段\n\
 /help — 顯示本說明";
-            send_reply(client, api_base, chat_id, help, thread_id, None, None).await;
+            send_reply(&ctx.home_dir, client, api_base, chat_id, help, thread_id, None, None).await;
         }
         _ => {
             // Not a legacy Telegram command — delegate to the shared
@@ -2390,7 +2392,7 @@ async fn handle_command(
                     build_guarded_reply_with_session(&normalized, ctx, &session_id, &sender, None)
                         .await;
                 if !guarded.text.trim().is_empty() && guarded.still_valid().await {
-                    send_reply_with_guard(
+                    let _ = send_reply_with_guard(&ctx.home_dir,
                         client,
                         api_base,
                         chat_id,
@@ -2431,7 +2433,7 @@ async fn handle_command(
                     !is_private_chat_with(chat_id, own_sender),
                     &parsed,
                 ) {
-                    send_reply(client, api_base, chat_id, refusal, thread_id, None, None).await;
+                    send_reply(&ctx.home_dir, client, api_base, chat_id, refusal, thread_id, None, None).await;
                     return;
                 }
                 let mut identities: Vec<&str> = vec![scope_id, &session_id];
@@ -2473,7 +2475,7 @@ async fn handle_command(
                 )
                 .await;
                 if !reply.trim().is_empty() {
-                    send_reply(client, api_base, chat_id, &reply, thread_id, None, None).await;
+                    send_reply(&ctx.home_dir, client, api_base, chat_id, &reply, thread_id, None, None).await;
                 }
             }
             // Still-unknown slash command — ignore (legacy behavior).
@@ -3795,7 +3797,9 @@ mod reply_context_tests {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_reply(
+    home_dir: &Path,
     client: &reqwest::Client,
     api_base: &str,
     chat_id: i64,
@@ -3804,7 +3808,8 @@ async fn send_reply(
     reply_to_message_id: Option<i64>,
     reply_markup: Option<serde_json::Value>,
 ) {
-    send_reply_with_guard(
+    if let Err(error) = send_reply_with_guard(
+        home_dir,
         client,
         api_base,
         chat_id,
@@ -3814,11 +3819,14 @@ async fn send_reply(
         reply_markup,
         None,
     )
-    .await;
+    .await {
+        error!(%error, "Telegram command reply failed");
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn send_reply_with_guard(
+pub(crate) async fn send_reply_with_guard(
+    home_dir: &Path,
     client: &reqwest::Client,
     api_base: &str,
     chat_id: i64,
@@ -3827,104 +3835,15 @@ async fn send_reply_with_guard(
     reply_to_message_id: Option<i64>,
     reply_markup: Option<serde_json::Value>,
     guarded: Option<&crate::channel_reply::GuardedReply>,
-) {
-    // Split long messages
-    let chunks = channel_format::split_text(text, channel_format::limits::TELEGRAM_MESSAGE);
-
-    for (i, chunk) in chunks.iter().enumerate() {
-        if crate::channel_reply::guard_lost(guarded).await {
-            return;
-        }
-        // Only reply-to the original message on the first chunk
-        let reply_params = if i == 0 {
-            reply_to_message_id.map(|mid| json!({ "message_id": mid }))
-        } else {
-            None
-        };
-        let body = SendMessage {
-            chat_id,
-            text: chunk.to_string(),
-            parse_mode: Some("Markdown".to_string()),
-            message_thread_id,
-            reply_parameters: reply_params.clone(),
-            // Only add buttons to the last chunk
-            reply_markup: if i == chunks.len() - 1 {
-                reply_markup.clone()
-            } else {
-                None
-            },
-        };
-
-        match client
-            .post(format!("{api_base}/sendMessage"))
-            .json(&body)
-            .send()
-            .await
-        {
-            Ok(resp) => {
-                if let Ok(data) = resp.json::<TgResponse<serde_json::Value>>().await {
-                    if data.ok {
-                        let id = data.result.as_ref().and_then(|r| r.get("message_id")).and_then(|id| id.as_i64()).map(|id| id.to_string());
-                        crate::channel_reply::group_buffer::delivered(chunk, id.as_deref()).await;
-                        continue;
-                    }
-                    let desc = data.description.unwrap_or_default();
-                    error!("Telegram send failed: {}", duduclaw_security::credential_detect::mask(&desc));
-
-                    // Retry without reply_parameters if the referenced message
-                    // is invalid (deleted, wrong chat, etc.)
-                    if reply_params.is_some()
-                        && (desc.contains("message not found")
-                            || desc.contains("replied message not found")
-                            || desc.contains("Bad Request"))
-                    {
-                        if crate::channel_reply::guard_lost(guarded).await {
-                            return;
-                        }
-                        warn!("Telegram: retrying without reply_parameters / Markdown");
-                        // HC1: drop parse_mode on retry. A Markdown parse error
-                        // would otherwise re-fail identically and silently drop the
-                        // reply. `parse_mode` is `skip_serializing_if=Option::is_none`,
-                        // so `None` sends plain text. Mirrors dispatcher.rs.
-                        let fallback = SendMessage {
-                            chat_id,
-                            text: chunk.to_string(),
-                            parse_mode: None,
-                            message_thread_id,
-                            reply_parameters: None,
-                            reply_markup: if i == chunks.len() - 1 {
-                                reply_markup.clone()
-                            } else {
-                                None
-                            },
-                        };
-                        match client
-                            .post(format!("{api_base}/sendMessage"))
-                            .json(&fallback)
-                            .send()
-                            .await
-                        {
-                            Ok(r2) => {
-                                if let Ok(d2) = r2.json::<TgResponse<serde_json::Value>>().await {
-                                    if d2.ok {
-                                        let id = d2.result.as_ref().and_then(|r| r.get("message_id")).and_then(|id| id.as_i64()).map(|id| id.to_string());
-                                        crate::channel_reply::group_buffer::delivered(chunk, id.as_deref()).await;
-                                        continue;
-                                    }
-                                    error!(
-                                        "Telegram retry also failed: {}",
-                                        duduclaw_security::credential_detect::mask(&d2.description.unwrap_or_default())
-                                    );
-                                }
-                            }
-                            Err(e2) => error!("Telegram retry error: {e2}"),
-                        }
-                    }
-                }
-            }
-            Err(e) => error!("Telegram send error: {e}"),
-        }
-    }
+) -> Result<(), crate::telegram_send::Failure> {
+    let reference = reply_to_message_id.map(|id| id.to_string()).unwrap_or_else(|| chat_id.to_string());
+    let mut options = crate::telegram_send::Options::new(home_dir, "command", &reference);
+    options.thread = message_thread_id;
+    options.reply_to = reply_to_message_id;
+    options.markup = reply_markup;
+    options.guarded = guarded;
+    crate::telegram_send::send(client, api_base, &chat_id.to_string(), text,
+        crate::telegram_send::Format::LegacyMarkdown, options).await
 }
 
 /// WP12 — startup/poll agreement on what counts as a bad token, and the

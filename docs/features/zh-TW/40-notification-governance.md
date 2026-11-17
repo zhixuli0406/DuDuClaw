@@ -256,3 +256,11 @@ duduclaw dashboard → notify.stats RPC
 - 程式碼：`crates/duduclaw-gateway/src/notify_governance.rs`、`notify_stats.rs`、`notify_digest.rs`
 - 前端：`web/src/pages/agent-form/EditAgentPage.tsx`（自動化分頁）、`web/src/components/settings/sections/ProactiveTab.tsx`、`SystemTab.tsx`、`web/src/pages/ReportPage.tsx`
 - 相關功能：[34-goal-loop.md](34-goal-loop.md)（needs_human 決定卡）、[23-autopilot-engine.md](23-autopilot-engine.md)（規則跳閘通知）
+
+## 排程送達與 Telegram 格式
+
+Telegram 的 cron 結果、提醒回呼與格式化通知會將 Markdown 轉為已逸出的 HTML，依訊息上限切塊並保持標籤及跳脫字元完整。指令回覆保留原有 Markdown 格式。Telegram 若因格式解析錯誤拒收某一塊，會將該塊改用純文字重送。明確指定純文字的通知會原樣保留 `_` 與 `*`。
+
+最終失敗會寫入 `channel_failures.jsonl`，包含操作類型、參考 id、HTTP 狀態及移除敏感內容的 Telegram 錯誤描述，不含訊息本文。cron 若仍因內容問題無法送達，會在同一聊天室傳送一次簡短純文字通知，引導使用者前往儀表板查看；401／403 等認證或封鎖錯誤不發送此通知，公開網站訪客也不會收到。通知依 `[general] default_language` 選用英文或日文，其餘使用繁體中文。
+
+外部通道的 cron 結果會依各通道上限分段傳送，包含 Discord 的 2000 字上限，不再統一截為 3500 字。WebChat 維持原有對話歷史長度限制。儀表板的「例行工作」列表會另外顯示上次送達狀態與簡短失敗原因。

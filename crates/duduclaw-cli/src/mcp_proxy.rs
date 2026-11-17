@@ -168,11 +168,23 @@ pub fn tool_call_of(frame: &Value) -> Option<(Value, String, Value)> {
 /// Canonical bookkeeping key for a JSON-RPC id. JSON-RPC allows numbers and
 /// strings; both are kept distinct (`7` vs `"7"`) by prefixing the kind, so a
 /// server that answers string ids cannot collide with a client using numbers.
+/// Numbers are normalised by value: `1`, `1.0` and `-0.0`/`0` share a key, so
+/// a peer cannot dodge bookkeeping by re-spelling an id.
 pub fn id_key(id: &Value) -> Option<String> {
     match id {
-        Value::Number(n) => Some(format!("n:{n}")),
+        Value::Number(n) => Some(format!("n:{}", numeric_id_key(n))),
         Value::String(s) => Some(format!("s:{s}")),
         _ => None,
+    }
+}
+
+fn numeric_id_key(n: &serde_json::Number) -> String {
+    if let Some(i) = n.as_i64() { return i.to_string(); }
+    if let Some(u) = n.as_u64() { return u.to_string(); }
+    // Integral floats within f64's exact-integer range map to the integer key.
+    match n.as_f64() {
+        Some(f) if f.fract() == 0.0 && f.abs() <= 9_007_199_254_740_992.0 => (f as i64).to_string(),
+        _ => n.to_string(),
     }
 }
 
@@ -285,6 +297,108 @@ impl PendingCalls {
 
     pub fn len(&self) -> usize { self.inner.len() }
     pub fn is_empty(&self) -> bool { self.inner.is_empty() }
+}
+
+/// Longest serialized client request id the monitored proxy tracks.
+const MAX_TRACKED_ID_BYTES: usize = 256;
+const TRACK_REFUSED_FULL: &str = "等候中的請求已達上限，請稍後再試。";
+const TRACK_REFUSED_DUPLICATE: &str = "請求識別碼重複，請等候原請求結束後再試。";
+const TRACK_REFUSED_ID: &str = "請求識別碼無效或過長，已拒絕此請求。";
+
+/// Client requests still awaiting an answer, so a lost upstream fails exactly
+/// the unanswered ones. Keys are normalised [`id_key`]s; the stored value is
+/// the client's ORIGINAL id, echoed back verbatim. Bounded by
+/// [`MAX_PENDING_CALLS`]; a refused request is answered locally and never
+/// tears the session down. A refusal of a request this tracker did NOT
+/// register is queued with `settles: false` and never reaches
+/// [`Self::answered`] (see [`client_frame_written`]), so it cannot settle a
+/// live request that shares its id.
+#[derive(Debug, Default)]
+struct RequestTracker {
+    live: HashMap<String, (Value, bool)>,
+}
+
+impl RequestTracker {
+    fn track(&mut self, id: &Value, initialize: bool) -> std::result::Result<(), &'static str> {
+        let key = id_key(id).ok_or(TRACK_REFUSED_ID)?;
+        if serde_json::to_string(id).map_or(true, |s| s.len() > MAX_TRACKED_ID_BYTES) {
+            return Err(TRACK_REFUSED_ID);
+        }
+        if self.live.contains_key(&key) {
+            return Err(TRACK_REFUSED_DUPLICATE);
+        }
+        if self.live.len() >= MAX_PENDING_CALLS {
+            return Err(TRACK_REFUSED_FULL);
+        }
+        self.live.insert(key, (id.clone(), initialize));
+        Ok(())
+    }
+
+    /// A settling response passed to the client. `Some(initialize)` when it
+    /// answered a tracked request; a second answer for the same id is a no-op.
+    fn answered(&mut self, key: &str) -> Option<bool> {
+        self.live.remove(key).map(|(_, initialize)| initialize)
+    }
+
+    /// `notifications/cancelled`: the request may never be answered.
+    fn cancel(&mut self, request_id: &Value) {
+        if let Some(key) = id_key(request_id) { self.live.remove(&key); }
+    }
+
+    fn is_empty(&self) -> bool { self.live.is_empty() }
+
+    fn drain(&mut self) -> Vec<Value> {
+        self.live.drain().map(|(_, (id, _))| id).collect()
+    }
+}
+
+/// The client writer's bookkeeping for one frame it is about to write.
+/// `settles` is false for a local refusal of a request the tracker did not
+/// register (duplicate id, tracker full, oversized id, or a frame that is not
+/// a tracked request): such a frame answers only itself and never touches the
+/// tracker. Returns true when the frame successfully answered a tracked
+/// `initialize`.
+fn client_frame_written(requests: &Mutex<RequestTracker>, line: &str, settles: bool) -> bool {
+    if !settles { return false; }
+    let Some(frame) = parse_frame(line).filter(is_response) else { return false };
+    let Some(key) = frame.get("id").and_then(id_key) else { return false };
+    let init = requests.lock().ok().and_then(|mut r| r.answered(&key));
+    init == Some(true) && frame.get("result").is_some() && frame.get("error").is_none()
+}
+
+/// One frame for the client. Every producer shares ONE FIFO channel, so two
+/// answers carrying the same wire id reach the client in the order they were
+/// produced. `settles` as for [`client_frame_written`].
+struct ClientFrame {
+    line: String,
+    settles: bool,
+}
+
+type ClientTx = mpsc::UnboundedSender<ClientFrame>;
+
+/// The sole writer of the client stream: frames strictly in arrival order,
+/// each settling the tracker as it is written. Stops when every sender is gone
+/// or a write fails, and hands `out` back so final error frames follow every
+/// queued frame on the same stream.
+async fn write_client_frames<W: AsyncWrite + Unpin>(
+    mut rx: mpsc::UnboundedReceiver<ClientFrame>,
+    mut out: W,
+    requests: &Mutex<RequestTracker>,
+    initialized: &std::sync::atomic::AtomicBool,
+) -> W {
+    while let Some(ClientFrame { mut line, settles }) = rx.recv().await {
+        if client_frame_written(requests, &line, settles) {
+            initialized.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        line.push('\n');
+        if out.write_all(line.as_bytes()).await.is_err() {
+            break;
+        }
+        if out.flush().await.is_err() {
+            break;
+        }
+    }
+    out
 }
 
 /// Owns the slot until the upstream write completes. Every local refusal, cancellation,
@@ -414,6 +528,7 @@ pub fn upstream_env_blob(
 /// The message is constructed from server/env names only, never credential data.
 async fn startup_error_frame<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     input: R, output: &mut W, message: &str,
+    reason: Option<duduclaw_core::mcp_start_status::ReasonCode>,
 ) {
     use tokio::io::AsyncReadExt;
     let mut input = BufReader::new(input.take(65536));
@@ -421,12 +536,16 @@ async fn startup_error_frame<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     if let Ok(Ok(_)) = tokio::time::timeout(Duration::from_secs(2), input.read_line(&mut line)).await {
         if let Ok(frame) = serde_json::from_str::<Value>(&line) {
             if let Some(id) = frame.get("id") {
-                let error = serde_json::json!({"jsonrpc":"2.0", "id":id,
-                    "error":{"code":-32001,"message":message}});
-                let _ = write_line(output, &error.to_string()).await;
+                let _ = write_line(output, &startup_refusal_frame(id, message, reason)).await;
             }
         }
     }
+}
+
+fn startup_refusal_frame(id: &Value, message: &str,
+    reason: Option<duduclaw_core::mcp_start_status::ReasonCode>) -> String {
+    serde_json::json!({"jsonrpc":"2.0", "id":id,
+        "error":{"code":-32001,"message":message,"data":{"reason_code":reason}}}).to_string()
 }
 
 // ── The proxy loop ──────────────────────────────────────────────────────────
@@ -474,27 +593,38 @@ async fn run_proxy_io_with_identity(
     io: ProxyIo,
     identity_home: Option<std::path::PathBuf>,
 ) -> std::io::Result<()> {
+    run_proxy_io_monitored(server, layer, gate, io, identity_home, None).await
+}
+
+async fn run_proxy_io_monitored(
+    server: &str,
+    layer: Option<Arc<McpRedactionLayer>>,
+    gate: Option<Arc<ThirdPartyGate>>,
+    io: ProxyIo,
+    identity_home: Option<std::path::PathBuf>,
+    child: Option<duduclaw_core::execution_gate::RunControl>,
+) -> std::io::Result<()> {
+    let monitor = child.is_some();
+    // Track every request, including generic requests and approval-held calls.
+    let requests = Arc::new(Mutex::new(RequestTracker::default()));
+    let initialized = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let ProxyIo {
         client_in,
-        mut client_out,
+        client_out,
         mut upstream_in,
         upstream_out,
     } = io;
 
     // One writer owns `client_out`, because two producers write to it: the
     // upstream→client pump, and the answers the client→upstream pump gives
-    // itself (redaction denials, refused tools).
-    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    // itself (redaction denials, refused tools). One FIFO channel keeps every
+    // frame in production order; each frame states whether it settles.
+    let (tx, rx) = mpsc::unbounded_channel::<ClientFrame>();
+    let writer_requests = requests.clone();
+    let writer_initialized = initialized.clone();
     let writer = tokio::spawn(async move {
-        while let Some(mut line) = rx.recv().await {
-            line.push('\n');
-            if client_out.write_all(line.as_bytes()).await.is_err() {
-                break;
-            }
-            if client_out.flush().await.is_err() {
-                break;
-            }
-        }
+        // Handed back so final error frames use the same client stream.
+        write_client_frames(rx, client_out, &writer_requests, &writer_initialized).await
     });
 
     // One writer owns `upstream_in` too: a call held for approval is
@@ -515,9 +645,12 @@ async fn run_proxy_io_with_identity(
             {
                 if let Some(id) = parse_frame(&frame.line).and_then(|v| v.get("id").cloned()) {
                     let id = frame.slot.as_ref().map(|slot| slot.id.clone()).unwrap_or(id);
-                    let _ = writer_tx.send(duduclaw_gateway::third_party_tools::refusal_frame(
-                        &id, "MCP caller identity rejected: strict tokens required or identity policy/key unavailable",
-                    ));
+                    let _ = writer_tx.send(ClientFrame {
+                        line: duduclaw_gateway::third_party_tools::refusal_frame(
+                            &id, "MCP caller identity rejected: strict tokens required or identity policy/key unavailable",
+                        ),
+                        settles: true,
+                    });
                 }
                 if let Some(gate) = &writer_gate { gate.close_pending(); }
                 continue;
@@ -537,7 +670,7 @@ async fn run_proxy_io_with_identity(
     let list_ids = Arc::new(std::sync::Mutex::new(std::collections::HashSet::<String>::new()));
 
     // ── upstream → client ────────────────────────────────────────────
-    let up_task = {
+    let mut up_task = {
         let pending = pending.clone();
         let layer = layer.clone();
         let gate = gate.clone();
@@ -564,7 +697,7 @@ async fn run_proxy_io_with_identity(
                             match response_context(&pending, &mut frame) {
                                 Ok(context) => context,
                                 Err(refusal) => {
-                                    if tx.send(refusal).is_err() { break; }
+                                    if tx.send(ClientFrame { line: refusal, settles: true }).is_err() { break; }
                                     continue;
                                 }
                             }
@@ -586,7 +719,7 @@ async fn run_proxy_io_with_identity(
                         rewrite_upstream_frame(layer.as_deref(), &server_label, frame, line, context, tool.as_deref())
                     }
                 };
-                if tx.send(out).is_err() {
+                if tx.send(ClientFrame { line: out, settles: true }).is_err() {
                     break;
                 }
             }
@@ -598,16 +731,35 @@ async fn run_proxy_io_with_identity(
     // ── client → upstream ────────────────────────────────────────────
     let mut held = tokio::task::JoinSet::new();
     let mut lines = BufReader::new(client_in).lines();
+    let mut upstream_lost = false;
+    let mut upstream_joined = false;
     loop {
         let line = tokio::select! {
-            completed = held.join_next(), if !held.is_empty() => {
-                let _ = completed;
-                continue;
-            }
+            biased;
             line = lines.next_line() => match line {
                 Ok(Some(line)) => line,
                 _ => break,
             },
+            _ = &mut up_task, if monitor => {
+                upstream_joined = true;
+                upstream_lost = true;
+                break;
+            }
+            _ = async {
+                match child.as_ref() {
+                    Some(control) => { let _ = control.wait().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            }, if monitor => {
+                // Drain responses already in the pipe before failing requests.
+                upstream_joined = tokio::time::timeout(Duration::from_millis(100), &mut up_task).await.is_ok();
+                upstream_lost = true;
+                break;
+            }
+            completed = held.join_next(), if !held.is_empty() => {
+                let _ = completed;
+                continue;
+            }
         };
         call_capacity(&mut held);
         if line.trim().is_empty() {
@@ -616,18 +768,47 @@ async fn run_proxy_io_with_identity(
         let Some(frame) = parse_frame(&line) else {
             // Opaque line — forward verbatim.
             if up_tx.send(QueuedFrame { line, permit: None, slot: None }).is_err() {
+                upstream_lost = monitor;
                 break;
             }
             continue;
         };
 
+        if monitor && frame.get("method").and_then(Value::as_str) == Some("notifications/cancelled") {
+            // A cancelled request may never be answered: stop tracking it.
+            if let Some(request_id) = frame.pointer("/params/requestId") {
+                requests.lock().map_err(|_| std::io::ErrorKind::Other)?.cancel(request_id);
+            }
+        }
+        let mut registered = false;
+        if monitor && frame.get("method").is_some() {
+            if let Some(id) = frame.get("id").filter(|id| id_key(id).is_some()) {
+                let tracked = requests.lock().map_err(|_| std::io::ErrorKind::Other)?
+                    .track(id, frame["method"] == "initialize");
+                if let Err(reason) = tracked {
+                    // Refuse only this request; the session and the upstream stay up.
+                    // Untracked, so it must not settle a live request with this id.
+                    let _ = tx.send(ClientFrame {
+                        line: duduclaw_gateway::third_party_tools::refusal_frame(id, reason),
+                        settles: false,
+                    });
+                    continue;
+                }
+                registered = true;
+            }
+        }
+        // A local refusal settles the tracker only for a request it registered.
+        let settles = registered;
         if identity_home.as_deref().is_some_and(|home|
             crate::mcp::caller_identity_verdict(home) == duduclaw_core::IdentityVerdict::Rejected)
         {
             if let Some(id) = frame.get("id") {
-                let _ = tx.send(duduclaw_gateway::third_party_tools::refusal_frame(
-                    id, "MCP caller identity rejected: strict tokens required or identity policy/key unavailable",
-                ));
+                let _ = tx.send(ClientFrame {
+                    line: duduclaw_gateway::third_party_tools::refusal_frame(
+                        id, "MCP caller identity rejected: strict tokens required or identity policy/key unavailable",
+                    ),
+                    settles,
+                });
             }
             continue;
         }
@@ -635,10 +816,13 @@ async fn run_proxy_io_with_identity(
             || (frame.get("method").and_then(Value::as_str) == Some("tools/call")
                 && tool_call_of(&frame).is_none())
         {
-            let _ = tx.send(duduclaw_gateway::third_party_tools::refusal_frame(
-                &frame.get("id").cloned().unwrap_or(Value::Null),
-                "Malformed tools/call cannot pass the egress gate.",
-            ));
+            let _ = tx.send(ClientFrame {
+                line: duduclaw_gateway::third_party_tools::refusal_frame(
+                    &frame.get("id").cloned().unwrap_or(Value::Null),
+                    "Malformed tools/call cannot pass the egress gate.",
+                ),
+                settles,
+            });
             continue;
         }
         if let Some(gate) = gate.as_ref() {
@@ -650,14 +834,20 @@ async fn run_proxy_io_with_identity(
             }
             if let Some((id, tool, _)) = tool_call_of(&frame) {
                 if !call_capacity(&mut held) {
-                    let _ = tx.send(duduclaw_gateway::third_party_tools::refusal_frame(
-                        &id, "同時執行的工具呼叫已達上限，請稍後再試。",
-                    ));
+                    let _ = tx.send(ClientFrame {
+                        line: duduclaw_gateway::third_party_tools::refusal_frame(
+                            &id, "同時執行的工具呼叫已達上限，請稍後再試。",
+                        ),
+                        settles,
+                    });
                     continue;
                 }
                 if matches!(gate.decide(&tool).1, duduclaw_core::ThirdPartyDecision::Block(_)) {
                     let msg = gate.check_call(&tool).await.err().unwrap_or_default();
-                    let _ = tx.send(duduclaw_gateway::third_party_tools::refusal_frame(&id, &msg));
+                    let _ = tx.send(ClientFrame {
+                        line: duduclaw_gateway::third_party_tools::refusal_frame(&id, &msg),
+                        settles,
+                    });
                     continue;
                 }
                 // Restore before approval so the card and digest describe the
@@ -677,7 +867,10 @@ async fn run_proxy_io_with_identity(
                             }
                         }
                         Err(msg) => {
-                            let _ = tx.send(duduclaw_gateway::third_party_tools::refusal_frame(&id, &msg));
+                            let _ = tx.send(ClientFrame {
+                                line: duduclaw_gateway::third_party_tools::refusal_frame(&id, &msg),
+                                settles: true,
+                            });
                         }
                     }
                 });
@@ -690,8 +883,59 @@ async fn run_proxy_io_with_identity(
             continue;
         };
         if up_tx.send(payload.queued(None)).is_err() {
+            upstream_lost = monitor;
             break;
         }
+    }
+
+    if upstream_lost {
+        held.abort_all();
+        while held.join_next().await.is_some() {}
+        up_writer.abort();
+        let _ = up_writer.await;
+        if !upstream_joined { up_task.abort(); let _ = up_task.await; }
+        if let Some(gate) = &gate { gate.close_pending(); }
+        // Flush queued responses first so only unanswered IDs receive errors.
+        drop(tx);
+        let client_out = writer.await.ok();
+        let starting = !initialized.load(std::sync::atomic::Ordering::SeqCst);
+        let reason = duduclaw_core::mcp_start_status::ReasonCode::UpstreamIoUnavailable;
+        if starting { report_startup_diagnostic(reason); }
+        let none_tracked = requests.lock().map_err(|_| std::io::ErrorKind::Other)?.is_empty();
+        if starting && monitor && none_tracked {
+            // The upstream may die before the client's first request was read:
+            // give that request a bounded chance to arrive so it gets the refusal.
+            // One line is capped like `startup_error_frame`; overflow ⇒ no request.
+            let mut reader = lines.into_inner();
+            let _ = tokio::time::timeout(Duration::from_millis(500), async {
+                use tokio::io::AsyncReadExt;
+                const LIMIT: u64 = 65536;
+                loop {
+                    let mut bytes = Vec::new();
+                    match (&mut reader).take(LIMIT).read_until(b'\n', &mut bytes).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                    if bytes.last() != Some(&b'\n') && bytes.len() as u64 >= LIMIT { break; }
+                    let Some(frame) = std::str::from_utf8(&bytes).ok().and_then(parse_frame) else { continue };
+                    if frame.get("method").is_none() { continue; }
+                    let Some(id) = frame.get("id") else { continue };
+                    if id_key(id).is_none() { continue; }
+                    if let Ok(mut tracker) = requests.lock() { let _ = tracker.track(id, false); }
+                    break;
+                }
+            }).await;
+        }
+        let outstanding = requests.lock().map_err(|_| std::io::ErrorKind::Other)?.drain();
+        if let Some(mut output) = client_out {
+            for id in outstanding {
+                // Always carry the closed reason code, also after `initialize`,
+                // so a probe reports the lost upstream rather than a protocol error.
+                let frame = startup_refusal_frame(&id, "MCP upstream unavailable", Some(reason));
+                write_line(&mut output, &frame).await?;
+            }
+        }
+        return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "MCP upstream unavailable"));
     }
 
     // Client hung up (or the pipe broke): let held calls finish (an
@@ -712,7 +956,7 @@ async fn prepare_upstream(
     server: &str,
     layer: Option<&McpRedactionLayer>,
     pending: &Arc<Mutex<PendingCalls>>,
-    tx: &mpsc::UnboundedSender<String>,
+    tx: &ClientTx,
     frame: &Value,
     line: &str,
 ) -> Option<PreparedFrame> {
@@ -734,7 +978,10 @@ async fn prepare_upstream(
     let ns = namespaced_tool(server, &tool);
     let restored = match decide_args(layer, &ns, &args) {
         ArgDecision::Deny { reason, tokens_seen } => {
-            let _ = tx.send(egress_deny_response(&id, &ns, &reason, tokens_seen).to_string());
+            let _ = tx.send(ClientFrame {
+                line: egress_deny_response(&id, &ns, &reason, tokens_seen).to_string(),
+                settles: true,
+            });
             return None;
         }
         ArgDecision::Forward(restored) => restored,
@@ -745,7 +992,10 @@ async fn prepare_upstream(
     {
         Ok(generation) => generation,
         Err(reason) => {
-            let _ = tx.send(duduclaw_gateway::third_party_tools::refusal_frame(&id, reason));
+            let _ = tx.send(ClientFrame {
+                line: duduclaw_gateway::third_party_tools::refusal_frame(&id, reason),
+                settles: true,
+            });
             return None;
         }
     };
@@ -934,6 +1184,21 @@ async fn write_line<W: AsyncWrite + Unpin>(w: &mut W, line: &str) -> std::io::Re
     w.flush().await
 }
 
+/// Report only a fixed diagnostic. Identity verification is not repeated here:
+/// its existing verdict deliberately does not expose which credential failed.
+async fn report_startup_refusal(reason: duduclaw_core::mcp_start_status::ReasonCode) {
+    // Only the gateway may attribute and persist a startup result. This process
+    // reports solely to its own stdio peer; environment claims are not evidence.
+    report_startup_diagnostic(reason);
+    startup_error_frame(tokio::io::stdin(), &mut tokio::io::stdout(),
+        "MCP server startup refused", Some(reason)).await;
+}
+
+fn report_startup_diagnostic(reason: duduclaw_core::mcp_start_status::ReasonCode) {
+    eprintln!("mcp-proxy startup_refused reason_code={}",
+        serde_json::to_value(reason).expect("closed reason code").as_str().expect("string reason code"));
+}
+
 // ── Subcommand entry point ──────────────────────────────────────────────────
 
 /// `duduclaw mcp-proxy --server <name> -- <cmd> [args…]`.
@@ -970,6 +1235,7 @@ pub async fn run_mcp_proxy_scoped(
     args: &[String],
     spawn_scoped: bool,
 ) -> Result<i32> {
+    use duduclaw_core::mcp_start_status::ReasonCode;
     // Checked before anything else starts: a refused spawn-scoped proxy
     // launches no upstream and initialises nothing.
     let scoped_blob = if spawn_scoped {
@@ -979,7 +1245,7 @@ pub async fn run_mcp_proxy_scoped(
         ) {
             Ok(blob) => Some(blob),
             Err(why) => {
-                tracing::warn!(server = %server, reason = %why, "mcp-proxy: spawn-scoped entry not registered for this spawn — not starting the upstream");
+                report_startup_refusal(ReasonCode::SpawnScopeUnavailable).await;
                 return Err(DuDuClawError::Gateway(format!(
                     "mcp-proxy: MCP server '{server}' is not available here ({why})"
                 )));
@@ -989,18 +1255,21 @@ pub async fn run_mcp_proxy_scoped(
         None
     };
     if server.trim().is_empty() {
+        report_startup_refusal(ReasonCode::ServerMissing).await;
         return Err(DuDuClawError::Gateway(
             "mcp-proxy: --server must be a non-empty server name".to_string(),
         ));
     }
     if command.trim().is_empty() {
+        report_startup_refusal(ReasonCode::CommandMissing).await;
         return Err(DuDuClawError::Gateway(
             "mcp-proxy: missing upstream command after `--`".to_string(),
         ));
     }
 
-    let default_agent = crate::mcp::get_default_agent(home_dir).await;
+    let default_agent = crate::mcp::get_default_agent_for_proxy(home_dir).await;
     if default_agent == duduclaw_core::UNTRUSTED_AGENT_ID {
+        report_startup_refusal(ReasonCode::IdentityRejected).await;
         return Err(DuDuClawError::Gateway(
             "MCP caller identity rejected: refusing to start the upstream proxy".into(),
         ));
@@ -1041,7 +1310,7 @@ pub async fn run_mcp_proxy_scoped(
     let env_pairs = match resolved {
         Ok(pairs) => pairs,
         Err(message) => {
-            startup_error_frame(tokio::io::stdin(), &mut tokio::io::stdout(), &message).await;
+            report_startup_refusal(ReasonCode::EnvironmentRejected).await;
             return Err(DuDuClawError::Gateway(message));
         }
     };
@@ -1066,6 +1335,7 @@ pub async fn run_mcp_proxy_scoped(
             opt.map(Arc::new)
         }
         Err(e) => {
+            report_startup_refusal(ReasonCode::RedactionUnavailable).await;
             tracing::error!(
                 server = %server,
                 error = %e,
@@ -1089,23 +1359,36 @@ pub async fn run_mcp_proxy_scoped(
 
     let mut cmd = upstream_command(command, args, env_pairs, upstream_is_bridge);
 
-    let mut child = duduclaw_core::execution_gate::with_runtime(
+    let spawned = duduclaw_core::execution_gate::with_runtime(
         duduclaw_core::execution_gate::RuntimeKind::Registered(
             duduclaw_core::execution_gate::Text::new("third-party-mcp".into()).expect("constant runtime id")),
         duduclaw_core::execution_gate::spawn(&mut cmd,
-        duduclaw_core::execution_gate::ExecutionClass::ThirdPartyMcp)).await.map_err(|e| {
-        DuDuClawError::Gateway(format!(
-            "mcp-proxy: failed to spawn upstream '{command}': {e}"
-        ))
-    })?;
-    let upstream_in = child
-        .stdin
-        .take()
-        .ok_or_else(|| DuDuClawError::Gateway("mcp-proxy: upstream stdin unavailable".into()))?;
-    let upstream_out = child
-        .stdout
-        .take()
-        .ok_or_else(|| DuDuClawError::Gateway("mcp-proxy: upstream stdout unavailable".into()))?;
+            duduclaw_core::execution_gate::ExecutionClass::ThirdPartyMcp)).await;
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(e) => {
+            report_startup_refusal(ReasonCode::UpstreamSpawnFailed).await;
+            return Err(DuDuClawError::Gateway(format!("mcp-proxy: failed to spawn upstream '{command}': {e}")));
+        }
+    };
+    let upstream_in = match child.stdin.take() {
+        Some(pipe) => pipe,
+        None => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            report_startup_refusal(ReasonCode::UpstreamIoUnavailable).await;
+            return Err(DuDuClawError::Gateway("mcp-proxy: upstream stdin unavailable".into()));
+        }
+    };
+    let upstream_out = match child.stdout.take() {
+        Some(pipe) => pipe,
+        None => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            report_startup_refusal(ReasonCode::UpstreamIoUnavailable).await;
+            return Err(DuDuClawError::Gateway("mcp-proxy: upstream stdout unavailable".into()));
+        }
+    };
 
     let io = ProxyIo {
         client_in: Box::new(tokio::io::stdin()),
@@ -1114,14 +1397,14 @@ pub async fn run_mcp_proxy_scoped(
         upstream_out: Box::new(upstream_out),
     };
 
-    if let Err(e) = run_proxy_io_with_identity(server, layer, gate, io, Some(home_dir.to_path_buf())).await {
-        tracing::warn!(server = %server, error = %e, "mcp-proxy: stream loop ended with an error");
-    }
+    let failed = run_proxy_io_monitored(server, layer, gate, io,
+        Some(home_dir.to_path_buf()), Some(child.control())).await.is_err();
+    if failed { let _ = child.kill().await; }
 
     let status = child.wait().await.map_err(|e| {
         DuDuClawError::Gateway(format!("mcp-proxy: waiting for upstream failed: {e}"))
     })?;
-    Ok(status.code().unwrap_or(1))
+    Ok(if failed { 1 } else { status.code().unwrap_or(1) })
 }
 
 fn upstream_command(command: &str, args: &[String], env_pairs: Vec<(String, String)>, upstream_is_bridge: bool)
@@ -1239,6 +1522,160 @@ mod tests {
     }
 
     #[test]
+    fn numeric_ids_normalise_by_value() {
+        assert_eq!(id_key(&json!(1)), id_key(&json!(1.0)));
+        assert_eq!(id_key(&json!(0)), id_key(&json!(-0.0)));
+        assert_eq!(id_key(&json!(u64::MAX)).unwrap(), format!("n:{}", u64::MAX));
+        assert_ne!(id_key(&json!(1)), id_key(&json!(1.5)));
+        assert_ne!(id_key(&json!(1)), id_key(&json!("1")));
+    }
+
+    #[test]
+    fn tracker_matches_respelled_numeric_ids_and_echoes_the_original() {
+        let mut tracker = RequestTracker::default();
+        tracker.track(&json!(1), true).unwrap();
+        tracker.track(&json!(2), false).unwrap();
+        // An upstream answering id `1` as `1.0` still clears the entry, so the
+        // client never gets a second response for it at exit.
+        assert_eq!(tracker.answered(&id_key(&json!(1.0)).unwrap()), Some(true));
+        assert_eq!(tracker.drain(), vec![json!(2)]);
+        // The final error frame echoes the client's original id spelling.
+        tracker.track(&json!(3.0), false).unwrap();
+        assert_eq!(tracker.drain(), vec![json!(3.0)]);
+    }
+
+    #[test]
+    fn tracker_cancel_removes_and_full_map_refuses_one_request_only() {
+        let mut tracker = RequestTracker::default();
+        tracker.track(&json!(7), false).unwrap();
+        tracker.cancel(&json!(7.0));
+        assert!(tracker.is_empty(), "a cancelled request is no longer tracked");
+        for i in 0..MAX_PENDING_CALLS { tracker.track(&json!(i), false).unwrap(); }
+        assert_eq!(tracker.track(&json!("extra"), false), Err(TRACK_REFUSED_FULL));
+        assert_eq!(tracker.live.len(), MAX_PENDING_CALLS, "the live requests stay tracked");
+        // An answer for the refused id touches no live entry.
+        assert_eq!(tracker.answered(&id_key(&json!("extra")).unwrap()), None);
+        assert_eq!(tracker.live.len(), MAX_PENDING_CALLS);
+        // Cancellation frees capacity for the next request.
+        tracker.cancel(&json!(0));
+        tracker.track(&json!("next"), false).unwrap();
+    }
+
+    #[test]
+    fn tracker_duplicate_refusal_does_not_consume_the_live_entry() {
+        let requests = Mutex::new(RequestTracker::default());
+        requests.lock().unwrap().track(&json!(5), false).unwrap();
+        let reason = requests.lock().unwrap().track(&json!(5.0), false).unwrap_err();
+        assert_eq!(reason, TRACK_REFUSED_DUPLICATE);
+        let refusal = duduclaw_gateway::third_party_tools::refusal_frame(&json!(5.0), reason);
+        assert!(!client_frame_written(&requests, &refusal, false), "the local refusal");
+        assert!(!requests.lock().unwrap().is_empty());
+        let answer = json!({"jsonrpc": "2.0", "id": 5, "result": {}}).to_string();
+        assert!(!client_frame_written(&requests, &answer, true), "the real answer");
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn orphaned_duplicate_refusals_never_settle_a_later_live_request() {
+        let requests = Mutex::new(RequestTracker::default());
+        for i in 0..MAX_PENDING_CALLS {
+            requests.lock().unwrap().track(&json!(i), false).unwrap();
+        }
+        // The client stalls its stdout while duplicating every live id.
+        let mut refusals = Vec::new();
+        for i in 0..MAX_PENDING_CALLS {
+            let id = json!(i);
+            let reason = requests.lock().unwrap().track(&id, false).unwrap_err();
+            assert_eq!(reason, TRACK_REFUSED_DUPLICATE);
+            refusals.push(duduclaw_gateway::third_party_tools::refusal_frame(&id, reason));
+        }
+        requests.lock().unwrap().cancel(&json!(0));
+        let fresh = json!("fresh");
+        requests.lock().unwrap().track(&fresh, false).unwrap();
+        let reason = requests.lock().unwrap().track(&fresh, false).unwrap_err();
+        assert_eq!(reason, TRACK_REFUSED_DUPLICATE);
+        refusals.push(duduclaw_gateway::third_party_tools::refusal_frame(&fresh, reason));
+        // The client resumes reading: every local refusal passes the writer.
+        for line in &refusals {
+            assert!(!client_frame_written(&requests, line, false));
+        }
+        let outstanding = requests.lock().unwrap().drain();
+        assert_eq!(outstanding.len(), MAX_PENDING_CALLS, "one final error per live id");
+        assert!(outstanding.contains(&fresh), "the new request still gets its final error");
+        assert!(!outstanding.contains(&json!(0)), "the cancelled request gets none");
+    }
+
+    #[test]
+    fn stale_full_tracker_refusal_never_settles_a_resent_id() {
+        let requests = Mutex::new(RequestTracker::default());
+        for i in 0..MAX_PENDING_CALLS {
+            requests.lock().unwrap().track(&json!(i), false).unwrap();
+        }
+        let x = json!("x");
+        let reason = requests.lock().unwrap().track(&x, false).unwrap_err();
+        assert_eq!(reason, TRACK_REFUSED_FULL);
+        let stale = duduclaw_gateway::third_party_tools::refusal_frame(&x, reason);
+        // A slot frees: the upstream answers request 0.
+        let answer = json!({"jsonrpc": "2.0", "id": 0, "result": {}}).to_string();
+        assert!(!client_frame_written(&requests, &answer, true));
+        requests.lock().unwrap().track(&x, false).unwrap();
+        // The stale refusal reaches the writer only now.
+        assert!(!client_frame_written(&requests, &stale, false));
+        let outstanding = requests.lock().unwrap().drain();
+        assert_eq!(outstanding.len(), MAX_PENDING_CALLS);
+        assert!(outstanding.contains(&x), "the re-sent request is still live");
+        assert!(!outstanding.contains(&json!(0)), "an answered request gets no final error");
+    }
+
+    #[test]
+    fn upstream_response_settles_a_live_id_exactly_once() {
+        let requests = Mutex::new(RequestTracker::default());
+        requests.lock().unwrap().track(&json!(1), true).unwrap();
+        requests.lock().unwrap().track(&json!(2), false).unwrap();
+        let answer = json!({"jsonrpc": "2.0", "id": 1.0, "result": {}}).to_string();
+        assert!(client_frame_written(&requests, &answer, true), "the initialize answer");
+        assert!(!client_frame_written(&requests, &answer, true), "a second answer is a no-op");
+        assert_eq!(requests.lock().unwrap().live.len(), 1);
+        // A gate refusal of a registered request settles it like a response.
+        let refusal = duduclaw_gateway::third_party_tools::refusal_frame(&json!(2), "blocked");
+        assert!(!client_frame_written(&requests, &refusal, true));
+        assert!(requests.lock().unwrap().is_empty(), "no final error for answered ids");
+    }
+
+    #[tokio::test]
+    async fn writer_keeps_a_stale_refusal_ahead_of_the_settling_response() {
+        let requests = Mutex::new(RequestTracker::default());
+        let initialized = std::sync::atomic::AtomicBool::new(false);
+        let x = json!("x");
+        // A "tracker full" refusal for X is queued while the client is stalled;
+        // X is then re-sent, registered, and answered by the upstream.
+        let stale = duduclaw_gateway::third_party_tools::refusal_frame(&x, TRACK_REFUSED_FULL);
+        requests.lock().unwrap().track(&x, true).unwrap();
+        let answer = json!({"jsonrpc": "2.0", "id": "x", "result": {}}).to_string();
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(ClientFrame { line: stale.clone(), settles: false }).unwrap();
+        tx.send(ClientFrame { line: answer.clone(), settles: true }).unwrap();
+        drop(tx);
+        let out = write_client_frames(rx, Vec::new(), &requests, &initialized).await;
+        assert_eq!(String::from_utf8(out).unwrap(), format!("{stale}\n{answer}\n"), "production order");
+        assert!(requests.lock().unwrap().is_empty(), "the answer settled X");
+        // Only the success answer can report the tracked `initialize`: the
+        // stale refusal did not consume the live entry first.
+        assert!(initialized.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn tracker_refuses_oversized_ids_without_tracking() {
+        let mut tracker = RequestTracker::default();
+        // Serialized with quotes: 258 bytes.
+        let long = json!("x".repeat(MAX_TRACKED_ID_BYTES));
+        assert_eq!(tracker.track(&long, false), Err(TRACK_REFUSED_ID));
+        assert!(tracker.is_empty());
+        tracker.track(&json!("x".repeat(MAX_TRACKED_ID_BYTES - 2)), false).unwrap();
+        assert_eq!(tracker.drain().len(), 1);
+    }
+
+    #[test]
     fn responses_are_distinguished_from_requests() {
         assert!(is_response(&json!({"id": 1, "result": {}})));
         assert!(is_response(&json!({"id": 1, "error": {"code": -1}})));
@@ -1318,7 +1755,7 @@ mod tests {
         let first = prepare_upstream("fakepg", Some(&layer), &pending, &tx, &original, &original.to_string()).await.unwrap();
         let duplicate = json!({"id":1, "method":"tools/call", "params":{"name":"public", "arguments":{}}});
         assert!(prepare_upstream("fakepg", Some(&layer), &pending, &tx, &duplicate, &duplicate.to_string()).await.is_none());
-        assert!(rx.recv().await.unwrap().contains("重複"));
+        assert!(rx.recv().await.unwrap().line.contains("重複"));
         let sent: Value = serde_json::from_str(&first.line).unwrap();
         let mut response = json!({"id":sent["id"], "result":{"rows":[{"name":"王小明"}]}});
         let context = response_context(&pending, &mut response).unwrap();
@@ -1694,12 +2131,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refusal_error_has_fixed_message_and_closed_reason() {
+        let mut output = Vec::new();
+        startup_error_frame(
+            b"{\"jsonrpc\":\"2.0\",\"id\":\"request-1\",\"method\":\"initialize\"}\n".as_slice(),
+            &mut output, "MCP server startup refused",
+            Some(duduclaw_core::mcp_start_status::ReasonCode::IdentityRejected)).await;
+        let frame: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(frame["jsonrpc"], "2.0");
+        assert_eq!(frame["id"], "request-1");
+        assert_eq!(frame["error"]["code"], -32001);
+        assert_eq!(frame["error"]["message"], "MCP server startup refused");
+        assert_eq!(frame["error"]["data"]["reason_code"], "identity_rejected");
+    }
+
+    #[tokio::test]
     async fn unresolved_startup_answers_with_an_mcp_error() {
         let request = br#"{"jsonrpc":"2.0","id":17,"method":"initialize"}
 "#;
         let mut output = Vec::new();
         startup_error_frame(request.as_slice(), &mut output,
-            "MCP server 'server': unresolved env 'API_KEY'; upstream was not started").await;
+            "MCP server 'server': unresolved env 'API_KEY'; upstream was not started", None).await;
         let frame: Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(frame["id"], 17);
         assert_eq!(frame["error"]["code"], -32001);

@@ -44,6 +44,31 @@ mod rotation_tests {
         }
     }
 
+    #[tokio::test]
+    async fn work_limits_never_rotate_or_penalize_accounts() {
+        use crate::work_outcome::WorkOutcome;
+        for outcome in [WorkOutcome::MaxTurns { limit: 7, partial: "已做一半".into() },
+            WorkOutcome::TimeoutTotal { seconds: 60, partial: String::new() },
+            WorkOutcome::TimeoutNoProgress { seconds: 60, tool: Some("Bash".into()), partial: String::new() }] {
+            let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+            rotator.push_account_for_test(fake_oauth_account("first", 1)).await;
+            rotator.push_account_for_test(fake_oauth_account("second", 2)).await;
+            let calls = Arc::new(AtomicUsize::new(0));
+            // Four turns would previously poison both accounts after three errors.
+            for _ in 0..4 {
+                let expected = outcome.encode();
+                let error = rotate_cli_spawn(&rotator, &[], |_, _| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let error = expected.clone();
+                    async move { Err(error) }
+                }, 1).await.unwrap_err();
+                assert_eq!(error, expected);
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 4);
+            assert!(rotator.status().await.iter().all(|s| s.is_available && s.is_healthy && s.total_requests == 0));
+        }
+    }
+
     /// Scenario: first account rate-limited, second succeeds.
     ///
     /// Verifies:
@@ -162,6 +187,15 @@ mod rotation_tests {
         assert_eq!(seen, vec!["tok_capped", "tok_spare"]);
     }
 
+    #[tokio::test]
+    async fn provider_timeouts_rotate_to_the_spare() {
+        for error in ["connection timed out", "CLI pipe hard timeout", "MCP process wait timed out"] {
+            let (result, seen) = run_equal_priority_pair(error).await;
+            assert_eq!(result.as_deref(), Ok("hello from spare"));
+            assert_eq!(seen, vec!["tok_capped", "tok_spare"]);
+        }
+    }
+
     /// Scenario: summarized-failure retry (arXiv:2605.08563).
     ///
     /// First attempt hits a model-behavior failure (hard timeout); the retry
@@ -277,8 +311,8 @@ mod rotation_tests {
             "expected last error to be propagated, got: {err}"
         );
 
-        // Extracted error must still be classifiable as Timeout (not Unknown).
-        assert_eq!(classify_cli_failure(&err), FailureReason::Timeout);
+        // Extracted work deadline retains the total-timeout classification.
+        assert_eq!(classify_cli_failure(&err), FailureReason::TimeoutTotal);
     }
 
     /// Scenario: billing-exhausted error places the account on a 24h cooldown.

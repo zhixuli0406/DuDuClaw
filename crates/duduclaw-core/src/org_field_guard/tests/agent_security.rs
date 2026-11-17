@@ -25,6 +25,8 @@ fn as_agent(existing: &str, new: &str) -> GuardDecision {
 /// `(section text before, section text after)` for every frozen section;
 /// each pair changes exactly one security-relevant value.
 const SECTION_CASES: &[(&str, &str, &str)] = &[
+    ("runtime", "[runtime]\nmax_turns=50", "[runtime]\nmax_turns=100"),
+    ("runtime", "[runtime]\ntimeout_secs=300\nmax_turns=50", "[runtime]\ntimeout_secs=300\nmax_turns=51"),
     (
         "permissions",
         "[permissions]\ncan_modify_own_soul = false",
@@ -304,8 +306,10 @@ fn agent_status_is_frozen_for_the_agent() {
 
 #[test]
 fn unchanged_security_sections_and_ordinary_sections_pass() {
+    let mut seen = std::collections::HashSet::new();
     let all: String = SECTION_CASES
         .iter()
+        .filter(|(section, _, _)| seen.insert(*section))
         .map(|(_, before, _)| *before)
         .collect::<Vec<_>>()
         .join("\n");

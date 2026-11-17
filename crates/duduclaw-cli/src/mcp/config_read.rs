@@ -269,6 +269,15 @@ mod decrypt_channel_token_tests {
 /// identity can carry one, and it would inherit the system senders'
 /// unconditional delegation reach, so it resolves to the untrusted sentinel.
 pub async fn get_default_agent(home_dir: &Path) -> String {
+    get_default_agent_inner(home_dir, true).await
+}
+
+/// Same identity verdict and order, without shared audit writes from a proxy.
+pub async fn get_default_agent_for_proxy(home_dir: &Path) -> String {
+    get_default_agent_inner(home_dir, false).await
+}
+
+async fn get_default_agent_inner(home_dir: &Path, audit_claim: bool) -> String {
     if let Some(employee) = crate::mcp_isolation_identity::verified_employee(home_dir) {
         return employee.unwrap_or_else(|_| duduclaw_core::UNTRUSTED_AGENT_ID.to_owned());
     }
@@ -278,7 +287,7 @@ pub async fn get_default_agent(home_dir: &Path) -> String {
             if duduclaw_core::is_system_sender(claimed)
                 || duduclaw_core::is_reserved_queue_sender(claimed)
             {
-                audit_system_sender_identity_once(home_dir, claimed, "env");
+                if audit_claim { audit_system_sender_identity_once(home_dir, claimed, "env"); }
             }
         }
         return duduclaw_core::UNTRUSTED_AGENT_ID.to_string();
@@ -302,7 +311,7 @@ pub async fn get_default_agent(home_dir: &Path) -> String {
     if duduclaw_core::is_system_sender(&resolved)
         || duduclaw_core::is_reserved_queue_sender(&resolved)
     {
-        audit_system_sender_identity_once(home_dir, resolved.trim(), source);
+        if audit_claim { audit_system_sender_identity_once(home_dir, resolved.trim(), source); }
         return duduclaw_core::UNTRUSTED_AGENT_ID.to_string();
     }
     resolved

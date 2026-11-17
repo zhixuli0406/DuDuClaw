@@ -1103,8 +1103,12 @@ const MAX_STDOUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_STDOUT_LINE_BYTES: usize = 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 
+tokio::task_local! { static CODEX_IDLE_TIMEOUT: u64; }
+
 #[derive(Default)]
 struct CodexOutput {
+    idle: Option<crate::work_outcome::IdleWatch>,
+    terminal_at: Option<tokio::time::Instant>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     line: Vec<u8>,
@@ -1151,6 +1155,12 @@ impl CodexOutput {
         // retention cap. In particular, final usage must not disappear merely
         // because earlier tool output consumed the raw-log budget.
         if let Ok(event) = serde_json::from_str::<CodexEvent>(&line) {
+            if event.event_type == "turn.completed" && self.terminal_at.is_none() {
+                self.terminal_at = Some(tokio::time::Instant::now());
+            }
+            if let Some(idle) = self.idle.as_mut() {
+                if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&line) { idle.observe_codex(&raw); }
+            }
             let (content, input, output, chunks) = parse_codex_stdout(&line);
             if event.event_type == "turn.completed"
                 && event.extra.get("usage").and_then(|u| serde_json::from_value::<CodexUsage>(u.clone()).ok()).is_some()
@@ -1267,7 +1277,8 @@ async fn collect_codex_output_with_input(
     let mut writer_done = false;
     let mut stdout = managed.child().stdout.take().ok_or("Failed to capture codex stdout")?;
     let mut stderr = managed.child().stderr.take().ok_or("Failed to capture codex stderr")?;
-    let mut output = CodexOutput::default();
+    let mut output = CodexOutput { idle: Some(crate::work_outcome::IdleWatch::new(CODEX_IDLE_TIMEOUT.try_with(|v| *v).unwrap_or(900))), ..Default::default() };
+    let mut idle_stopped = false;
     let mut stdout_buffer = [0u8; 8192];
     let mut stderr_buffer = [0u8; 8192];
     let mut stdout_done = false;
@@ -1275,7 +1286,14 @@ async fn collect_codex_output_with_input(
     let mut status = None;
     let result = tokio::time::timeout(timeout, async {
         while !writer_done || !stdout_done || !stderr_done || status.is_none() {
+            let terminal_at = output.terminal_at;
             tokio::select! {
+                _ = async {
+                    if let Some(at) = terminal_at {
+                        tokio::time::sleep_until(at + std::time::Duration::from_secs(5)).await;
+                    } else { std::future::pending::<()>().await; }
+                } => { break; }
+                _ = output.idle.as_ref().expect("collector idle clock").expired() => { idle_stopped = true; break; }
                 written = &mut writer, if !writer_done => {
                     written?;
                     writer_done = true;
@@ -1298,6 +1316,10 @@ async fn collect_codex_output_with_input(
         }
         Ok::<(), std::io::Error>(())
     }).await;
+    if idle_stopped {
+        managed.kill_and_reap().await;
+        return Err(output.idle.as_ref().expect("collector idle clock").outcome(output.content.clone()).encode());
+    }
     output.finish_line();
     if output.truncated {
         warn!(stdout_limit = MAX_STDOUT_BYTES, line_limit = MAX_STDOUT_LINE_BYTES,
@@ -1311,7 +1333,9 @@ async fn collect_codex_output_with_input(
         }
         Ok(Err(error)) => {
             managed.kill_and_reap().await;
-            return Err(format!("Failed to read codex output: {error}"));
+            if output.terminal_at.is_none() {
+                return Err(format!("Failed to read codex output: {error}"));
+            }
         }
         Err(_) => { managed.kill_and_reap().await; }
     }
@@ -1829,12 +1853,13 @@ async fn execute_codex_command_with_input(
     input: Option<&[u8]>,
 ) -> Result<RuntimeResponse, String> {
     let timeout_secs = crate::runtime_config::call_timeout_secs(context.agent_dir.as_deref());
-    let output = collect_codex_output_with_input(
+    let idle = crate::runtime_config::idle_timeout_secs(&context.home_dir, context.agent_dir.as_deref());
+    let output = CODEX_IDLE_TIMEOUT.scope(idle, collect_codex_output_with_input(
         cmd, std::time::Duration::from_secs(timeout_secs), input,
-    ).await?;
+    )).await?;
 
     if let Some(status) = output.status {
-        if !status.success() {
+        if output.terminal_at.is_none() && !status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(format!(
                 "Codex CLI exited with {}: {}",
@@ -1847,7 +1872,7 @@ async fn execute_codex_command_with_input(
     // Parse JSONL output
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut response = RuntimeResponse {
-        partial_timeout_secs: output.status.is_none().then_some(timeout_secs),
+        partial_timeout_secs: (output.status.is_none() && output.terminal_at.is_none()).then_some(timeout_secs),
         content: output.content.clone(),
         input_tokens: output.input_tokens,
         output_tokens: output.output_tokens,
@@ -1865,15 +1890,10 @@ async fn execute_codex_command_with_input(
 
     // Parse usage, native events and thinking above on both paths, even
     // when the deadline left no completed assistant message.
-    if output.status.is_none() {
-        response = crate::runtime_dispatch::validate_runtime_response(response, context).await?;
-        response.content = match output.timeout_content(timeout_secs) {
-            Ok(content) => content,
-            Err(error) => {
-                crate::runtime_dispatch::record_discarded_runtime_usage(context, &response).await;
-                return Err(error);
-            }
-        };
+    if output.status.is_none() && output.terminal_at.is_none() {
+        crate::runtime_dispatch::record_discarded_runtime_usage(context, &response).await;
+        return Err(crate::work_outcome::WorkOutcome::TimeoutTotal { seconds: timeout_secs,
+            partial: output.completed.last().cloned().unwrap_or_default() }.encode());
     }
 
     // JSONL metadata/reasoning lines are never fallback answers.
@@ -2181,6 +2201,30 @@ mod tests {
         assert_eq!(duduclaw_core::execution_gate::local_command_roundtrip(command).await.unwrap(), before);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_result_survives_hung_codex_cleanup() {
+        let home = tempfile::tempdir().unwrap();
+        let context = utility_context(home.path());
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.args(["-c", r#"printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"完成"}}' '{"type":"turn.completed","usage":{"input_tokens":2,"output_tokens":3}}'; exec /bin/sleep 300"#]);
+        let output = CODEX_IDLE_TIMEOUT.scope(1,
+            tokio::time::timeout(std::time::Duration::from_secs(10),
+                collect_codex_output(&mut cmd, std::time::Duration::from_secs(300))))
+            .await.expect("terminal cleanup must be bounded").expect("completed result");
+        assert!(output.terminal_at.is_some());
+        assert_eq!(output.content, "完成");
+        assert_eq!(output.output_tokens, 3);
+        // The production response path must also accept a completed turn
+        // whose cleanup needed to kill the still-running process.
+        let output = std::sync::Mutex::new(Some(output));
+        let probe: CollectProbe = Box::new(move |_| Ok(output.lock().unwrap().take().unwrap()));
+        let mut cmd = tokio::process::Command::new("fixture-never-spawned");
+        let response = COLLECT_PROBE.scope(probe, execute_codex_command(&mut cmd, &context)).await.unwrap();
+        assert_eq!(response.content, "完成");
+        assert_eq!(response.partial_timeout_secs, None);
+    }
+
     #[tokio::test]
     async fn collected_partial_timeout_is_display_only() {
         let home = tempfile::tempdir().unwrap();
@@ -2194,15 +2238,11 @@ mod tests {
             });
             let mut cmd = tokio::process::Command::new("fixture-never-spawned");
             let call = COLLECT_PROBE.scope(probe, execute_codex_command(&mut cmd, &context));
-            if utility {
-                let error = crate::runtime_dispatch::CHANNEL_REPLY_PARTIAL.scope((),
-                    crate::runtime_dispatch::UTILITY_CALL.scope((), call)).await.unwrap_err();
-                assert_eq!(error, "codex CLI hard timeout after 300s (partial output discarded)");
-            } else {
-                let response = crate::runtime_dispatch::CHANNEL_REPLY_PARTIAL.scope((), call).await.unwrap();
-                assert_eq!(response.content, "PASS");
-                assert_eq!(response.partial_timeout_secs, Some(300));
-            }
+            let error = if utility {
+                crate::runtime_dispatch::CHANNEL_REPLY_PARTIAL.scope((), crate::runtime_dispatch::UTILITY_CALL.scope((), call)).await.unwrap_err()
+            } else { crate::runtime_dispatch::CHANNEL_REPLY_PARTIAL.scope((), call).await.unwrap_err() };
+            assert_eq!(crate::work_outcome::WorkOutcome::decode(&error), Some(crate::work_outcome::WorkOutcome::TimeoutTotal {
+                seconds:300, partial:"PASS".into() }));
         }
     }
 

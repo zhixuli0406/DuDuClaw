@@ -65,6 +65,13 @@ where
     Ok(value.value())
 }
 
+pub(crate) fn deserialize_max_turns<'de, D>(d: D) -> Result<Option<i64>, D::Error>
+where D: serde::Deserializer<'de> {
+    let value: Tri<i64> = crate::lenient::tri(d)?;
+    // The runtime resolver reports the effective fallback with employee context.
+    Ok(value.value())
+}
+
 /// The `[model]` keys the former shadow readers consumed.
 ///
 /// A deliberately narrow projection rather than [`crate::types::ModelConfig`]:

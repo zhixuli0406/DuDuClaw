@@ -2,6 +2,44 @@
 
 DuDuClaw 可以把第三方 [Model Context Protocol](https://modelcontextprotocol.io) 伺服器掛載在自己內建的 MCP server 旁邊，讓 agent 的工具迴圈直接拿到外部伺服器的工具，不必手刻一支 Rust 連接器。Plane、Chatwoot、Invoice Ninja、Gmail/Calendar、WooCommerce，以及其他任何 MCP server，都是這樣接進 agent 的。
 
+## 設定生效範圍與啟動結果
+
+| 設定 | 讀取它的執行環境 | 儀表板 |
+|---|---|---|
+| 員工的 `.mcp.json` | Claude、Codex、Grok，以及內建工具迴圈（OpenAI 相容、Direct API、本機推論） | 管理員可編輯；`source: "mcp_json"` |
+| 員工 `agent.toml` 的 `[[mcp.external]]` | 僅內建工具迴圈 | 唯讀；`source: "agent_toml"` |
+
+Claude、Codex、Grok 不讀取 `[[mcp.external]]`。MCP 頁面會在每筆項目顯示適用環境；
+`mcp.list` 以 `effective_runtimes` 回傳 `claude`、`codex`、`grok`、`in_process`。
+這表示設定的適用範圍，不保證已連線。停用的 TOML 項目仍維持停用；兩種格式之間不會
+自動搬移設定或憑證。同一伺服器出現在兩種格式時，內建工具迴圈優先使用 TOML 項目。
+
+管理員透過 `mcp.update` 新增或編輯 stdio 項目後，系統先儲存、清除前次啟動結果，
+再執行與 MCP 頁面「立即檢查」相同的檢查。該操作呼叫僅限管理員的 `mcp.probe`，
+參數為 `{agent_id, server_name}`，回傳 `{ok, tool_count, reason_code}`；儲存的回應則
+將結果放在 `probe`。檢查在記憶體中驗證並產生有效設定，不修補 `.mcp.json`，也不在
+員工目錄下寫入任何檔案。唯一的設定檔是權限 0600 的暫存 proxy 設定，成功、失敗或
+逾時後都會移除。檢查送出 `initialize` 與 `tools/list`，期限 10 秒，結束後清理程序，
+不呼叫上游工具。失敗仍保留儲存的設定；成功只代表能啟動並取得可見工具，不保證工具
+呼叫權限或遠端服務健康。整個 gateway 同時最多執行 4 個檢查，等候名額最多 2 秒；
+同一員工／伺服器已有檢查，或等候名額逾時，回傳 `busy`，請稍後重試。
+
+proxy 的身分驗證、檢查順序與拒絕優先行為不變。proxy 不將啟動結果寫入共用檔案；
+只對自己的 stdio 對端第一個 JSON-RPC 請求回傳 `-32001`、固定短訊息與
+`error.data.reason_code`，並向自己的 stderr 印出固定格式的原因碼。
+`identity_rejected` 包含既有驗證器拒絕的情況，例如缺少／無效憑證或無法讀取政策／
+金鑰；診斷不會再次驗證來猜測更細的原因。啟動結果僅由 gateway 記錄：檢查從代理的
+錯誤框取得原因碼；gateway 啟動的 Claude `system/init` 事件只提供已連線／未連線
+（`connection_failed`）。觀察器僅接受該次凍結設定中的精確伺服器名稱，限制事件、
+名稱與狀態長度，最多處理 64 筆、去除重複，每個事件最多寫一筆失敗摘要。檢查失敗
+也可由 gateway 透過有鎖且有容量限制的 helper 寫入一筆 `channel_failures.jsonl`
+`mcp_start` 異常紀錄，不含權杖、環境值或上游參數。未連線不會中斷該回合。
+
+`mcp.list` 的 `last_start` 僅讀取 gateway 的有限記憶體 map，滿額時淘汰最舊項目，
+不從 JSONL 取得狀態。頁面顯示翻譯後的原因與時間；執行時顯示「未連線」後，管理員
+可按「立即檢查」取得精確原因。更新／移除伺服器或刪除員工會清除前次結果；gateway
+重啟後不保留狀態。沒有結果時不推測狀態，這不是持續健康監控。
+
 ## 第三方工具檢查（v1.80.0 起）
 
 `[[mcp.external]]` 的 stdio 與 Streamable HTTP 掛載都採用與受管理 MCP 代理相同的 `ThirdPartyGate`，依工具宣告判定影響類別。伺服器的工具允許／拒絕清單仍會限縮工具，員工的名稱限制、動作規則與審批要求也會套用到清單與呼叫。annotations 只能將預設 Modify 提高為 Delete，唯讀宣稱即使搭配舊信任設定也不得降低風險；遭拒的工具不會提供給模型。

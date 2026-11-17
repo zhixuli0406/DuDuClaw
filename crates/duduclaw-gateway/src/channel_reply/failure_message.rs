@@ -29,6 +29,13 @@ pub(super) fn filter_facts_not_in_prompt(facts: &[String], prompt: &str) -> Vec<
 
 /// Classify an error string produced by `call_claude_cli_rotated` or the Direct API fallback.
 pub(crate) fn classify_cli_failure(err: &str) -> FailureReason {
+    if let Some(outcome) = crate::work_outcome::WorkOutcome::decode(err) {
+        return match outcome {
+            crate::work_outcome::WorkOutcome::MaxTurns { .. } => FailureReason::MaxTurns,
+            crate::work_outcome::WorkOutcome::TimeoutTotal { .. } => FailureReason::TimeoutTotal,
+            crate::work_outcome::WorkOutcome::TimeoutNoProgress { .. } => FailureReason::TimeoutNoProgress,
+        };
+    }
     let lower = err.to_lowercase();
 
     if lower.contains("claude cli not found") {
@@ -59,7 +66,7 @@ pub(crate) fn classify_cli_failure(err: &str) -> FailureReason {
         return FailureReason::AuthFailed;
     }
     if lower.contains("hard timeout") || lower.contains("timed out") {
-        return FailureReason::Timeout;
+        return FailureReason::TimeoutTotal;
     }
     if lower.contains("empty response") {
         return FailureReason::EmptyResponse;
@@ -155,8 +162,10 @@ pub(crate) fn auth_failure_kind_for(
 /// is synthesized from the failure class, never from raw stderr (which could
 /// carry prompt-injection payloads).
 pub(crate) fn retry_hint_for(err: &str) -> Option<String> {
+    if crate::work_outcome::is_work_result(err) { return None; }
     match classify_cli_failure(err) {
-        FailureReason::Timeout => Some(
+        FailureReason::MaxTurns | FailureReason::TimeoutNoProgress => None,
+        FailureReason::Timeout | FailureReason::TimeoutTotal => Some(
             "A previous attempt at this exact request timed out before completing. \
              Do not repeat the same approach: answer more directly, keep tool use \
              to a minimum, and prefer a shorter response."
@@ -191,7 +200,7 @@ pub(super) fn failure_console_link_kind(reason: FailureReason) -> crate::deep_li
         | FailureReason::AccountsCoolingDownUnknown => DeepLinkKind::Billing,
         FailureReason::BinaryMissing
         | FailureReason::AuthFailed
-        | FailureReason::Timeout
+        | FailureReason::Timeout | FailureReason::TimeoutTotal | FailureReason::TimeoutNoProgress | FailureReason::MaxTurns
         | FailureReason::SpawnError
         | FailureReason::EmptyResponse
         | FailureReason::Unknown => DeepLinkKind::System,
@@ -230,7 +239,7 @@ pub(super) fn failure_doc_url(reason: FailureReason) -> Option<&'static str> {
         ),
         FailureReason::BinaryMissing
         | FailureReason::AuthFailed
-        | FailureReason::Timeout
+        | FailureReason::Timeout | FailureReason::TimeoutTotal | FailureReason::TimeoutNoProgress | FailureReason::MaxTurns
         | FailureReason::SpawnError
         | FailureReason::EmptyResponse
         | FailureReason::Unknown => None,
@@ -288,6 +297,11 @@ pub(super) fn format_fallback_message_with_timeout(
             "{agent_name} 無法回應：目前帳號額度已用完。\n\
              請於 Anthropic Console 儲值，或在儀表板切換到其他有效帳號。"
         ),
+        FailureReason::TimeoutTotal if timeout_secs > 0 => format!(
+            "已達 {duration} 的時間上限，尚未產生最終答案。已完成的部分已保留，回覆『繼續』可以接著做。\n\
+             需要延長上限時，請洽管理員。"
+        ),
+        FailureReason::MaxTurns | FailureReason::TimeoutTotal | FailureReason::TimeoutNoProgress => super::TurnFailureReason::from(reason).text(None).to_string(),
         FailureReason::Timeout => format!(
             "{agent_name} 這次處理逾時（已達 {duration}安全上限）。\n\
              請重新送出訊息，或將任務拆成較小的步驟。需要延長上限時，請洽管理員。"
@@ -350,7 +364,9 @@ pub(super) fn classify_cli_error_hint(err: &str) -> &'static str {
         FailureReason::RateLimited => "使用量已達上限",
         FailureReason::Billing => "帳號額度用完",
         FailureReason::AuthFailed => "認證失效",
-        FailureReason::Timeout => "處理逾時",
+        FailureReason::Timeout | FailureReason::TimeoutTotal => "已達執行時限，尚未產生最終答案",
+        FailureReason::TimeoutNoProgress => "長時間沒有進展",
+        FailureReason::MaxTurns => "這一輪的步數用完了",
         FailureReason::EmptyResponse => "空回應",
         FailureReason::BinaryMissing => "CLI 未安裝",
         FailureReason::NoAccounts => "無可用帳號",
@@ -414,6 +430,9 @@ pub(super) fn end_user_failure_message(agent: &str, reason: FailureReason, langu
             _ => "目前 AI 服務用量已達上限，暫時無法回應。已通知管理員，請稍後再試。",
         }
         .to_string();
+    }
+    if matches!(reason, FailureReason::MaxTurns | FailureReason::TimeoutTotal | FailureReason::TimeoutNoProgress) {
+        return super::TurnFailureReason::from(reason).text(language).to_string();
     }
     match (language.unwrap_or("zh-TW"), reason) {
         ("zh-CN" | "zh_CN", FailureReason::Timeout) => format!("{agent} 这次处理超时，请稍后重试，或将工作拆成较小的步骤。"),

@@ -29,6 +29,10 @@ pub enum LlmError {
     #[error("request timed out")]
     Timeout,
 
+    /// The bounded tool loop still requested tools after exhausting its budget.
+    #[error("max turns reached ({limit})")]
+    MaxTurns { limit: usize },
+
     /// Prompt exceeds the model's context window.
     #[error("context window exceeded")]
     ContextWindowExceeded,
