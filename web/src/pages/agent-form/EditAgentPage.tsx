@@ -479,9 +479,14 @@ function EditAgentPageContent() {
   const isAdmin = useAuthStore((st) => st.user?.role === 'admin');
   const [savedRuntimeTimeout, setSavedRuntimeTimeout] = useState(300);
   const savedRuntimeTimeoutRef = useRef(300);
+  const savedRuntimeIdleRef = useRef(900);
+  const [runtimeDefaultIdle, setRuntimeDefaultIdle] = useState(900);
   const [runtimeTimeoutError, setRuntimeTimeoutError] = useState(false);
   const [runtimeEffectiveTimeout, setRuntimeEffectiveTimeout] = useState(300);
   const [runtimeMaxTimeout, setRuntimeMaxTimeout] = useState(3600);
+  const [runtimeTurnsLimit, setRuntimeTurnsLimit] = useState(200);
+  const [runtimeDefaultTurns, setRuntimeDefaultTurns] = useState(50);
+  const savedRuntimeTurnsRef = useRef(50);
   const isAdminRef = useRef(isAdmin);
   useEffect(() => { isAdminRef.current = isAdmin; }, [isAdmin]);
   // The gateway's own admin-only path list (`agents.inspect.admin_only_fields`);
@@ -643,15 +648,22 @@ function EditAgentPageContent() {
     setContractHeld(null);
 
     const rt = agent.runtime;
+    setRuntimeTurnsLimit(agent.max_turns_limit ?? 200);
+    setRuntimeDefaultTurns(agent.default_max_turns ?? 50);
+    savedRuntimeTurnsRef.current = rt?.max_turns ?? agent.default_max_turns ?? 50;
     savedRuntimeTimeoutRef.current = agent.timeout_authorization_ceiling_secs
       ?? effectiveRuntimeTimeout(rt?.timeout_secs, 300, agent.max_timeout_secs ?? 3600);
     setRuntimeEffectiveTimeout(agent.effective_timeout_secs
       ?? effectiveRuntimeTimeout(rt?.timeout_secs, rt?.provider === 'claude' || !rt?.provider ? 1800 : 300, agent.max_timeout_secs ?? 3600));
     setRuntimeMaxTimeout(agent.max_timeout_secs ?? 3600);
+    setRuntimeDefaultIdle(agent.default_idle_timeout_secs ?? 900);
+    savedRuntimeIdleRef.current = rt?.idle_timeout_secs ?? agent.default_idle_timeout_secs ?? 900;
     setSavedRuntimeTimeout(savedRuntimeTimeoutRef.current);
     setRuntime({
       provider: (rt?.provider as RuntimeProvider) ?? DEFAULT_RUNTIME.provider,
       fallback: rt?.fallback ?? DEFAULT_RUNTIME.fallback,
+      max_turns: rt?.max_turns ?? null,
+      idle_timeout_secs: rt?.idle_timeout_secs ?? null,
       timeout_secs: effectiveRuntimeTimeout(rt?.timeout_secs, agent.effective_timeout_secs ?? (rt?.provider === 'claude' || !rt?.provider ? 1800 : 300), agent.max_timeout_secs ?? 3600),
     });
 
@@ -803,6 +815,12 @@ function EditAgentPageContent() {
 
   const updateRuntime = useCallback(<K extends keyof typeof DEFAULT_RUNTIME>(key: K, value: (typeof DEFAULT_RUNTIME)[K]) => {
     if (lockedPath(`runtime.${String(key)}`)) return;
+    if (key === 'max_turns' && !isAdminRef.current && (typeof value === 'number' ? value : runtimeDefaultTurns) > savedRuntimeTurnsRef.current) return;
+    if (key === 'idle_timeout_secs' && !isAdminRef.current) {
+      const seconds = typeof value === 'number' ? value : runtimeDefaultIdle;
+      const previous = savedRuntimeIdleRef.current;
+      if (seconds !== previous && (seconds === 0 || (previous !== 0 && seconds > previous))) return;
+    }
     if (key === 'timeout_secs') {
       const exceedsCeiling = !isAdminRef.current && runtimeTimeoutNeedsAdmin(savedRuntimeTimeoutRef.current, value);
       setRuntimeTimeoutError(exceedsCeiling);
@@ -810,7 +828,7 @@ function EditAgentPageContent() {
     }
     markDirty(`runtime.${String(key)}`);
     setRuntime((prev) => ({ ...prev, [key]: value }));
-  }, [markDirty, lockedPath]);
+  }, [markDirty, lockedPath, runtimeDefaultTurns, runtimeDefaultIdle]);
 
   const updateEvoAdv = useCallback(<K extends keyof typeof DEFAULT_EVOLUTION_ADVANCED>(key: K, value: (typeof DEFAULT_EVOLUTION_ADVANCED)[K]) => {
     markDirty(`evo.${String(key)}`);
@@ -916,6 +934,7 @@ function EditAgentPageContent() {
     const dirty = isAdminRef.current
       ? consumed
       : new Set([...consumed].filter((p) => !isAdminOnlyPath(p, agent.admin_only_fields)
+        && !(p === 'runtime.max_turns' && (runtime.max_turns ?? runtimeDefaultTurns) > savedRuntimeTurnsRef.current)
         && !(p === 'runtime.timeout_secs' && runtimeTimeoutNeedsAdmin(savedRuntimeTimeoutRef.current, runtime.timeout_secs))));
     const savedPref = agent.model?.preferred ?? '';
     const savedFb = agent.model?.fallback ?? '';
@@ -954,6 +973,10 @@ function EditAgentPageContent() {
         if (payload.runtime || res?.runtime_provider_aligned) {
           // Preserve the successful write even if the follow-up read fails or
           // an older gateway returns no authorization ceiling.
+          if (payload.runtime && 'idle_timeout_secs' in payload.runtime) savedRuntimeIdleRef.current = payload.runtime.idle_timeout_secs ?? runtimeDefaultIdle;
+          if (payload.runtime && 'max_turns' in payload.runtime) {
+            savedRuntimeTurnsRef.current = payload.runtime.max_turns ?? runtimeDefaultTurns;
+          }
           const sentTimeout = payload.runtime?.timeout_secs;
           if (sentTimeout !== undefined) {
             savedRuntimeTimeoutRef.current = effectiveRuntimeTimeout(sentTimeout, 300, runtimeMaxTimeout);
@@ -962,6 +985,11 @@ function EditAgentPageContent() {
           }
           try {
             const detail = await api.agents.inspect(agent.name);
+            setRuntimeDefaultIdle(detail.default_idle_timeout_secs ?? 900);
+            savedRuntimeIdleRef.current = detail.runtime?.idle_timeout_secs ?? detail.default_idle_timeout_secs ?? 900;
+            setRuntimeTurnsLimit(detail.max_turns_limit ?? 200);
+            setRuntimeDefaultTurns(detail.default_max_turns ?? 50);
+            savedRuntimeTurnsRef.current = detail.runtime?.max_turns ?? detail.default_max_turns ?? 50;
             const max = detail.max_timeout_secs ?? 3600;
             const effective = detail.effective_timeout_secs
               ?? effectiveRuntimeTimeout(sentTimeout ?? detail.runtime?.timeout_secs, detail.runtime?.provider === 'claude' || !detail.runtime?.provider ? 1800 : 300, max);
@@ -1033,7 +1061,7 @@ function EditAgentPageContent() {
     }
   }, [
     agent, form, availableModels, updateAgent, intl, errorText,
-    caps, osWatch, research, runtime, runtimeMaxTimeout, runtimeEffectiveTimeout,
+    caps, osWatch, research, runtime, runtimeDefaultIdle, runtimeDefaultTurns, runtimeMaxTimeout, runtimeEffectiveTimeout,
     evoAdv, odoo, adv, v168, contract, takeContractAnswer,
   ]);
 
@@ -1932,6 +1960,19 @@ function EditAgentPageContent() {
               <RowSelect label={t('agents.runtime.provider')} description={t('agents.runtime.provider.hint')} value={runtime.provider} disabled={locked('runtime.provider')} onChange={(v) => updateRuntime('provider', v as RuntimeProvider)} options={providerPickerOptions} />
               <RowSelect label={t('agents.runtime.fallback')} description={t('agents.runtime.fallback.hint')} value={runtime.fallback} disabled={locked('runtime.fallback')} onChange={(v) => updateRuntime('fallback', v)} options={fallbackProviderOptions} />
               <RowNumber label={t('agents.runtime.timeout')} description={<><span>{t(isAdmin ? 'agents.runtime.timeout.hint' : 'agents.runtime.timeout.lowerOnly')}</span> {intl.formatMessage({ id: isAdmin ? 'agents.runtime.timeout.effective' : 'agents.runtime.timeout.ownerCeiling' }, { value: runtimeEffectiveTimeout, max: runtimeMaxTimeout, ceiling: Math.min(savedRuntimeTimeout, runtimeMaxTimeout) })}</>} value={runtime.timeout_secs} min={30} max={isAdmin ? runtimeMaxTimeout : Math.min(savedRuntimeTimeout, runtimeMaxTimeout)} step={1} onChange={(v) => updateRuntime('timeout_secs', v)} />
+              <SettingsRow label={t('agents.runtime.idleTimeout')} description={t('agents.runtime.idleTimeout.hint')} tier="text">
+                <Input type="number" min={0} max={runtimeMaxTimeout} step={1}
+                  aria-label={t('agents.runtime.idleTimeout')}
+                  value={runtime.idle_timeout_secs ?? ''}
+                  placeholder={String(runtimeDefaultIdle)}
+                  onChange={(e) => updateRuntime('idle_timeout_secs', e.target.value === '' ? null : Number(e.target.value))} />
+              </SettingsRow>
+              <SettingsRow label={t('agents.runtime.maxTurns')} description={t('agents.runtime.maxTurns.hint')} tier="text">
+                <Input type="number" aria-label={t('agents.runtime.maxTurns')} min={1}
+                  max={isAdmin ? runtimeTurnsLimit : Math.min(savedRuntimeTurnsRef.current, runtimeTurnsLimit)}
+                  placeholder={String(runtimeDefaultTurns)} value={runtime.max_turns ?? ''}
+                  onChange={(e) => updateRuntime('max_turns', e.target.value === '' ? null : Number(e.target.value))} />
+              </SettingsRow>
               {runtimeTimeoutError && <p role="alert" className="px-3 py-2 text-xs text-destructive">{intl.formatMessage({ id: 'agents.runtime.timeout.overCeiling' }, { ceiling: Math.min(savedRuntimeTimeout, runtimeMaxTimeout) })}</p>}
               <RowSwitch label={t('agents.v168.minimalContext')} description={t('agents.v168.minimalContext.help')} checked={v168.minimal_context} onChange={(v) => updateV('minimal_context', v)} />
             </SettingsCard>
@@ -2058,7 +2099,7 @@ function EditAgentPageContent() {
                 <Input
                   type="number"
                   min={1}
-                  max={100}
+                  max={64}
                   aria-label={t('agents.adv.proactiveMaxTurns')}
                   placeholder={t('agents.v168.effort.unset')}
                   value={adv.proactive_max_turns ?? ''}

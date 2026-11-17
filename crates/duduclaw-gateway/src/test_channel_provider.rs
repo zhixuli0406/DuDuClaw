@@ -183,5 +183,11 @@ async fn capture(
         .and_then(|v| v.as_u64())
         .map(|s| s as u16)
         .unwrap_or_else(|| state.status.load(Ordering::SeqCst));
-    (StatusCode::from_u16(status).unwrap(), Json(value))
+    let delay = value.as_object_mut().and_then(|o| o.remove("__delay_millis"))
+        .and_then(|v| v.as_u64()).unwrap_or(0);
+    if delay > 0 { tokio::time::sleep(std::time::Duration::from_millis(delay)).await; }
+    if let Some(raw) = value.as_object_mut().and_then(|o| o.remove("__raw")).and_then(|v| v.as_str().map(str::to_owned)) {
+        return (StatusCode::from_u16(status).unwrap(), raw).into_response();
+    }
+    (StatusCode::from_u16(status).unwrap(), Json(value)).into_response()
 }

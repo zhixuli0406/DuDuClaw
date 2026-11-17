@@ -406,3 +406,20 @@ fn import_accepts_v182_cron_without_importing_delivery_authority() {
     assert_eq!(proposals.len(), 1);
     assert!(!serde_json::to_string(&proposals).unwrap().contains("SECRET"));
 }
+
+#[test]
+fn googlechat_recovery_catalogs_match_initializer_and_refuse_unknown_objects() {
+    for sql in [GOOGLECHAT_INBOX_V182, GOOGLECHAT_INBOX_V183_V1, GOOGLECHAT_INBOX_V183] {
+        let conn = catalog_connection(sql, None).unwrap();
+        assert!(detect(&conn, Store::GoogleChatInbox, None).is_ok());
+        conn.execute_batch("CREATE TABLE unknown_state (id TEXT)").unwrap();
+        assert!(detect(&conn, Store::GoogleChatInbox, None).is_err());
+    }
+    let source = include_str!("../../duduclaw-gateway/src/googlechat_inbox.rs").replace("\r\n", "\n");
+    assert!(source.contains(GOOGLECHAT_INBOX_V182));
+    assert!(source.contains(include_str!("googlechat-placeholders-v183.sql")));
+    assert!(source.contains(include_str!("googlechat-placeholder-state-v183.sql").trim()));
+    let legacy = catalog_connection(GOOGLECHAT_INBOX_V183_V1, None).unwrap();
+    legacy.execute_batch(include_str!("googlechat-placeholder-state-v183.sql")).unwrap();
+    assert_eq!(detect(&legacy, Store::GoogleChatInbox, None).unwrap().version, SchemaVersion::V181);
+}

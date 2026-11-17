@@ -254,6 +254,25 @@ fn maybe_proxy_mcp_config_with_agent_dir(
     }
 }
 
+/// Probe an already validated in-memory snapshot. No repair, reread, or audit
+/// side effect; the sole output file is the owner-only temporary config.
+pub(crate) fn proxy_config_for_probe(
+    home: &Path, agent: &str, parsed: &Value,
+) -> Result<tempfile::TempPath, String> {
+    let exe = duduclaw_core::resolve_duduclaw_bin();
+    let own = duduclaw_core::mcp_proxy_rewrite::canonical_duduclaw_server(home, agent, &exe);
+    let purpose = ProxyPurpose {
+        redaction: redaction_active_for_spawn(home),
+        secret_env: duduclaw_core::mcp_proxy_rewrite::has_mcp_secret_refs(parsed),
+        tool_gate: true,
+    };
+    let (guard, _) = write_gated_mcp_config_value(parsed, &exe, purpose, &own, false)?;
+    let guard = guard.ok_or_else(|| "probe config unavailable".to_string())?;
+    duduclaw_core::platform::set_owner_only(&guard)
+        .map_err(|e| format!("probe config permissions failed: {e}"))?;
+    Ok(guard)
+}
+
 /// Audit each direct remote entry the third-party tool gate removed from a
 /// spawn (`third_party_remote_entry_dropped`). Shared by the Claude CLI path
 /// ([`maybe_proxy_mcp_config_in_lane`]) and the Codex path

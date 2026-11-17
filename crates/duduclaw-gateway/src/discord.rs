@@ -43,7 +43,8 @@ mod slash_gate_tests;
 
 #[cfg(test)]
 pub(crate) fn test_sender_url(token: &str, original: &str) -> String {
-    routing_test_transport::sender_url(token, original)
+    let scoped = routing_test_transport::sender_url(token, original);
+    crate::test_channel_provider::url(token, &scoped)
 }
 
 // ── Discord API types ───────────────────────────────────────

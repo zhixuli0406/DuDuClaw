@@ -653,13 +653,46 @@ pub fn append_anomaly(home_dir: &Path, record: &serde_json::Value) -> std::io::R
     let mut masked = record.clone();
     duduclaw_security::credential_detect::mask_json(&mut masked);
     let line = format!("{masked}\n");
+    // Keep both a single record and the retained log bounded under the same
+    // advisory lock. Startup diagnostics never need raw upstream payloads.
+    if line.len() > 64 * 1024 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "anomaly record too large"));
+    }
     duduclaw_core::with_file_lock(&path, || {
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
-        f.write_all(line.as_bytes())
+        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        let metadata = file.metadata()?;
+        if metadata.len().saturating_add(line.len() as u64) > 4 * 1024 * 1024 {
+            // Rotate, never erase: keep one previous generation. The lock is a
+            // sidecar `<path>.lock`, so renaming the data file is safe; the
+            // path is reopened inside the lock so the new line lands in the
+            // fresh file. A failed rename leaves the log untouched and the
+            // record is appended to it anyway (temporarily above 4 MiB), so a
+            // persistent rename failure never silently stops logging.
+            #[cfg(unix)]
+            let mode = { use std::os::unix::fs::PermissionsExt; metadata.permissions().mode() & 0o7777 };
+            let mut rotated = path.as_os_str().to_os_string();
+            rotated.push(".1");
+            drop(file);
+            let mut options = std::fs::OpenOptions::new();
+            options.create(true).append(true);
+            let renamed = std::fs::rename(&path, std::path::PathBuf::from(rotated)).is_ok();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                if renamed { options.mode(mode); }
+            }
+            file = options.open(&path)?;
+            #[cfg(unix)]
+            {
+                // `mode` above is narrowed by the umask; restore the exact bits.
+                use std::os::unix::fs::PermissionsExt;
+                if renamed { let _ = file.set_permissions(std::fs::Permissions::from_mode(mode)); }
+            }
+            #[cfg(not(unix))]
+            let _ = renamed;
+        }
+        file.write_all(line.as_bytes())
     })
 }
 
@@ -1260,6 +1293,87 @@ mod tests {
         let stored = std::fs::read_to_string(dir.path().join("channel_failures.jsonl")).unwrap();
         assert!(!stored.contains("fixture-"));
         assert!(serde_json::from_str::<serde_json::Value>(stored.trim()).is_ok());
+    }
+
+    #[test]
+    fn anomaly_sink_bounds_record_and_retained_file() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("channel_failures.jsonl");
+        std::fs::write(&path, vec![b' '; 4 * 1024 * 1024]).unwrap();
+        append_anomaly(home.path(), &serde_json::json!({"classification":"mcp_start"})).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 1);
+        let before = std::fs::read(&path).unwrap();
+        assert!(append_anomaly(home.path(), &serde_json::json!({"large":"x".repeat(65536)})).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn anomaly_sink_rotates_full_file_into_dot_one() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("channel_failures.jsonl");
+        let rotated = home.path().join("channel_failures.jsonl.1");
+        let old = vec![b'a'; 4 * 1024 * 1024 - 8];
+        std::fs::write(&path, &old).unwrap();
+        let record = serde_json::json!({"classification":"mcp_start"});
+        append_anomaly(home.path(), &record).unwrap();
+        assert_eq!(std::fs::read(&rotated).unwrap(), old);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{record}\n"));
+    }
+
+    #[test]
+    fn anomaly_sink_rotation_replaces_existing_dot_one() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("channel_failures.jsonl");
+        let rotated = home.path().join("channel_failures.jsonl.1");
+        std::fs::write(&rotated, b"older generation\n").unwrap();
+        let current = vec![b'b'; 4 * 1024 * 1024];
+        std::fs::write(&path, &current).unwrap();
+        append_anomaly(home.path(), &serde_json::json!({"classification":"mcp_start"})).unwrap();
+        assert_eq!(std::fs::read(&rotated).unwrap(), current);
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 1);
+    }
+
+    #[test]
+    fn anomaly_sink_failed_rotation_still_appends_without_erasing() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("channel_failures.jsonl");
+        let rotated = home.path().join("channel_failures.jsonl.1");
+        // A non-empty directory as the rename target makes every rotation fail.
+        std::fs::create_dir_all(&rotated).unwrap();
+        std::fs::write(rotated.join("keep"), b"keep\n").unwrap();
+        let current = vec![b'd'; 4 * 1024 * 1024 - 8];
+        std::fs::write(&path, &current).unwrap();
+        let record = serde_json::json!({"classification":"mcp_start"});
+        for _ in 0..2 { append_anomaly(home.path(), &record).unwrap(); }
+        let stored = std::fs::read(&path).unwrap();
+        assert!(stored.starts_with(&current), "a failed rotation must never erase the log");
+        assert!(stored.ends_with(format!("{record}\n{record}\n").as_bytes()));
+        assert_eq!(std::fs::read(rotated.join("keep")).unwrap(), b"keep\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn anomaly_sink_rotation_keeps_permission_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("channel_failures.jsonl");
+        std::fs::write(&path, vec![b'e'; 4 * 1024 * 1024]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        append_anomaly(home.path(), &serde_json::json!({"classification":"mcp_start"})).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777, 0o640);
+    }
+
+    #[test]
+    fn anomaly_sink_oversized_record_changes_neither_file() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("channel_failures.jsonl");
+        let rotated = home.path().join("channel_failures.jsonl.1");
+        let current = vec![b'c'; 4 * 1024 * 1024 - 8];
+        std::fs::write(&path, &current).unwrap();
+        std::fs::write(&rotated, b"keep\n").unwrap();
+        assert!(append_anomaly(home.path(), &serde_json::json!({"large":"x".repeat(65536)})).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), current);
+        assert_eq!(std::fs::read(&rotated).unwrap(), b"keep\n");
     }
 
     #[test]

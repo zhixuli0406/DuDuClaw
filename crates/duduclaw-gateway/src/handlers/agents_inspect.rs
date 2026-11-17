@@ -261,7 +261,12 @@ impl MethodHandler {
                         // file so the dashboard tells "unset" from an explicit false
                         // (drives the PTY-pool OAuth default-enable materialization).
                         "runtime": runtime_json,
+                        "effective_max_turns": duduclaw_core::turn_limits::max_turns(&self.home_dir, Some(&self.home_dir.join("agents").join(&cfg.agent.name))),
+                        "max_turns_limit": duduclaw_core::turn_limits::TurnPolicy::load(&self.home_dir).limit,
+                        "default_max_turns": duduclaw_core::turn_limits::TurnPolicy::load(&self.home_dir).default,
                         "effective_timeout_secs": crate::runtime_config::effective_agent_timeout_secs(&self.home_dir.join("agents").join(&cfg.agent.name)),
+                        "effective_idle_timeout_secs": crate::runtime_config::idle_timeout_secs(&self.home_dir, Some(&self.home_dir.join("agents").join(&cfg.agent.name))),
+                        "default_idle_timeout_secs": crate::runtime_config::idle_policy_checked(&self.home_dir).unwrap_or(900),
                         "max_timeout_secs": crate::runtime_config::TimeoutPolicy::load(&self.home_dir).max_secs,
                         "timeout_authorization_ceiling_secs": crate::runtime_config::agent_timeout_authorization_ceiling(&self.home_dir.join("agents").join(&cfg.agent.name)),
                         // [os_watch] table — raw from agent.toml (typed config doesn't

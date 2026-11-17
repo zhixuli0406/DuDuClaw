@@ -266,7 +266,7 @@ pub fn classify(ev: &FailureEvidence) -> MastLabel {
         if INFRA_REASONS.iter().any(|k| *k == r) {
             return MastLabel::Infra;
         }
-        if r == "Timeout" {
+        if matches!(r, "Timeout" | "MaxTurns" | "TimeoutTotal" | "TimeoutNoProgress") {
             return MastLabel::Mode(MastMode::UnawareOfTerminationConditions);
         }
         if r == "EmptyResponse" {

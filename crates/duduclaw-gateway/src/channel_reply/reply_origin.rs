@@ -81,12 +81,13 @@ impl ReplyFailure {
                 .requested
                 .map(ReplyOrigin::Runtime)
                 .unwrap_or(ReplyOrigin::Unknown),
-            summary: error.to_string(),
+            summary: error.legacy_message(),
             runtime: Some(error),
             secondary: None,
         }
     }
     pub(super) fn stop_fallbacks(&self) -> bool {
+        if crate::work_outcome::is_work_result(&self.summary) { return true; }
         if self.spawn_gate_message().is_some() { return true; }
         if self.runtime.as_ref().is_some_and(|failure| failure.preflight.is_some()) { return true; }
         crate::budget::budget_refusal_message(&self.summary).is_some()
@@ -481,7 +482,7 @@ mod timeout_tests {
     }
 
     #[test]
-    fn configured_claude_timeout_names_the_applied_limit() {
+    fn configured_claude_timeout_and_work_deadline_use_their_respective_notices() {
         let home = tempfile::tempdir().unwrap();
         let dir = home.path().join("agents/worker");
         std::fs::create_dir_all(&dir).unwrap();
@@ -491,15 +492,17 @@ mod timeout_tests {
         assert!(configured.contains("15 分鐘安全上限"), "{configured}");
         assert!(configured.contains("請洽管理員"));
         assert!(!configured.contains("員工設定"));
-        // The employee was changed after this run started. Its failure still
-        // reports the captured 600 s, not today's 900 s setting.
+        // A classified work deadline names the captured limit, not the current setting.
         let failure = ReplyFailure::simple(origin, "claude CLI hard timeout (600s, no output)".into());
         let message = failure.message("worker", home.path());
-        assert!(message.contains("10 分鐘安全上限"), "{message}");
+        assert_eq!(failure.reason(), FailureReason::TimeoutTotal);
+        assert!(message.contains("10 分鐘"), "{message}");
         assert!(!message.contains("15 分鐘"));
-        let message = ReplyFailure::simple(origin, "claude CLI hard timeout (95s, no output)".into())
-            .message("worker", home.path());
-        assert!(message.contains("95 秒安全上限"), "{message}");
+        assert!(message.contains("需要延長上限時，請洽管理員。"));
+        let failure = ReplyFailure::simple(origin, "claude CLI hard timeout (95s, no output)".into());
+        let message = failure.message("worker", home.path());
+        assert_eq!(failure.reason(), FailureReason::TimeoutTotal);
+        assert!(message.contains("95 秒"), "{message}");
     }
 
     /// RM-155: while macOS folder access is pending, a timeout names the

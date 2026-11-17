@@ -21,7 +21,8 @@ async fn assert_notice(ctx: &ReplyContext, sid: &str, reason: TurnFailureReason,
     let rows = ctx.session_manager.webchat_history(sid).await.unwrap();
     let notices: Vec<_> = rows.iter().filter(|r| r.notice_kind.as_deref() == Some("turn_failure")).collect();
     assert_eq!(notices.len(), 1);
-    assert_eq!(notices[0].message.content, reason.text(None));
+    assert!(notices[0].message.content.starts_with(reason.text(None)));
+    assert!(notices[0].message.content.contains("參考編號"));
     assert_eq!(notices[0].message.tokens, 0);
     assert_eq!(ctx.session_manager.get_messages(sid).await.unwrap().len(), users);
 }
@@ -166,7 +167,7 @@ async fn notice_language_follows_the_existing_global_fixed_message_setting() {
         ctx.session_manager.append_message(&sid, "user", "question", 1).await.unwrap();
         bound(&sid, &session.created_at, persist_failure_notice(&ctx, &sid, "worker", "t1", TurnFailureReason::Timeout, Some(&session.created_at))).await;
         let rows = ctx.session_manager.webchat_history(&sid).await.unwrap();
-        assert_eq!(rows[1].message.content, TurnFailureReason::Timeout.text(Some(language)));
+        assert!(rows[1].message.content.starts_with(TurnFailureReason::Timeout.text(Some(language))));
     }
 }
 
@@ -332,4 +333,54 @@ async fn notice_only_webchat_delivery_still_rejects_stale_acl_and_cancellation()
             &crate::webchat::access::TargetPolicy::test_admin(), &cancel).await.is_err());
         assert_notice(&ctx, &sid, TurnFailureReason::Internal, 1).await;
     }
+}
+
+#[test]
+fn notice_suffix_has_stable_code_and_bounded_reference_but_visitors_only_reference() {
+    let id = "12345678-rest-of-full-id";
+    for language in ["zh-TW", "en", "ja-JP", "zh-CN"] {
+        let normal = TurnFailureReason::MaxTurns.render(Some(language), id, false);
+        assert!(normal.ends_with("12345678）"));
+        assert!(normal.contains("max_turns"));
+        let visitor = TurnFailureReason::MaxTurns.render(Some(language), id, true);
+        assert!(!visitor.contains("max_turns"));
+        assert!(!visitor.contains("繼續"));
+        assert!(visitor.ends_with("12345678）"));
+    }
+}
+
+#[test]
+fn fallback_audit_jsonl_preserves_full_reference_and_reason_code() {
+    let home = tempfile::tempdir().unwrap();
+    let reference = "12345678-完整參考編號";
+    let mut audit = serde_json::json!({"event":"channel_reply_fallback"});
+    attach_failure_reference(&mut audit, "max_turns", reference);
+    crate::trajectory_guard::append_anomaly(home.path(), &audit).unwrap();
+    let line = std::fs::read_to_string(home.path().join("channel_failures.jsonl")).unwrap();
+    let stored: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(stored["event"], "channel_reply_fallback");
+    assert_eq!(stored["reason_code"], "max_turns");
+    assert_eq!(stored["reference_id"], reference);
+}
+
+#[tokio::test]
+async fn work_partial_is_assistant_context_and_budget_notice_is_display_only() {
+    let (_home, ctx) = fixture();
+    let sid = "telegram:partial";
+    let session = ctx.session_manager.get_or_create(sid, "worker").await.unwrap();
+    ctx.session_manager.append_message(sid, "user", "做兩份報表", 1).await.unwrap();
+    let outcome = crate::work_outcome::WorkOutcome::MaxTurns { limit:17, partial:"第一份已完成".into() };
+    bound(sid, &session.created_at, FAILURE_DETAILS.scope(("max_turns", Some(outcome.clone())), async {
+        assert!(persist_work_partial(&ctx, sid, "worker", outcome.partial(), Some(&session.created_at)).await);
+        persist_failure_notice(&ctx, sid, "worker", "12345678-full", TurnFailureReason::MaxTurns, Some(&session.created_at)).await;
+        assert!(!persist_work_partial(&ctx, sid, "worker", "stale", Some("wrong-generation")).await);
+    })).await;
+    let context = ctx.session_manager.get_messages(sid).await.unwrap();
+    assert_eq!(context.len(), 2);
+    assert_eq!(context[1].role, "assistant");
+    assert_eq!(context[1].content, "第一份已完成");
+    let display = ctx.session_manager.webchat_history(sid).await.unwrap();
+    let notice = display.iter().find(|r| r.notice_kind.as_deref() == Some("turn_failure")).unwrap();
+    assert!(notice.message.content.contains("17"));
+    assert!(notice.message.content.ends_with("（原因代碼：max_turns｜參考編號：12345678）"));
 }

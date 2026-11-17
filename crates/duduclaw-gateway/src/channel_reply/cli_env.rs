@@ -98,6 +98,15 @@ pub(super) async fn spawn_claude_cli_with_env(
         None
     };
 
+    // Protected mode: the root-owned plan always enforces `--max-turns 50`, so
+    // the prompt sentence and the max-turn classification state that value.
+    let max_turns = if protected { 50 } else {
+        let resolved = duduclaw_core::turn_limits::max_turns(home_dir, work_dir);
+        if purpose == crate::runtime_dispatch::SpawnPurpose::EmployeeTurn
+            && crate::runtime_dispatch::allows_employee_step_budget() { resolved } else { resolved.min(50) }
+    };
+    let budget_prompt = duduclaw_core::turn_limits::budget_prompt(system_prompt, max_turns);
+    let system_prompt = budget_prompt.as_str();
     let mut cmd = duduclaw_core::platform::async_command_for(&claude_path);
     let hook_args = if protected { Vec::new() } else {
         crate::agent_hook_installer::claude_hook_args(home_dir, work_dir, false)?
@@ -162,7 +171,7 @@ pub(super) async fn spawn_claude_cli_with_env(
         "--dangerously-skip-permissions",
         // Allow enough agentic turns for complex tasks.
         "--max-turns",
-        "50",
+        &max_turns.to_string(),
     ]);
     // An unset model (`[model] utility = ""`, a failover with no model) must
     // leave the choice to the CLI. `--model ""` was sent verbatim before
@@ -209,7 +218,8 @@ pub(super) async fn spawn_claude_cli_with_env(
         } else if !allowed.is_empty() {
             cmd.args(["--allowedTools", &allowed.join(",")]);
         }
-        let denied = caps.disallowed_tools();
+        let mut denied = caps.disallowed_tools();
+        denied.push("AskUserQuestion".into());
         if !denied.is_empty() {
             let denied_csv = denied.join(",");
             cmd.args(["--disallowedTools", &denied_csv]);
@@ -304,6 +314,7 @@ pub(super) async fn spawn_claude_cli_with_env(
     } else {
         _mcp_proxy_guard = None;
     }
+    let mcp_names = crate::mcp_start::frozen_names(_mcp_proxy_guard.as_deref());
     cmd.args(&hook_args);
     if let Some(ref key) = api_key {
         cmd.env("ANTHROPIC_API_KEY", key);
@@ -494,6 +505,7 @@ pub(super) async fn spawn_claude_cli_with_env(
         .try_with(|sid| sid.as_deref().is_some_and(super::assembly::public_session))
         .unwrap_or(false);
     let mut assistant_text = String::new();
+    let mut partial_assistant_text = String::new();
     let mut result_text = String::new();
     // RFC-22 P1-7: capture token usage from `result` event so cost_telemetry
     // can be recorded for channel-path replies (previously: 0 entries for
@@ -591,11 +603,14 @@ pub(super) async fn spawn_claude_cli_with_env(
     keepalive.reset(); // don't fire immediately
 
     // Hard max timeout — absolute safety net
+    let mut terminal_received = false;
+    let mut idle = crate::work_outcome::IdleWatch::new(crate::runtime_config::idle_timeout_secs(home_dir, work_dir));
     let hard_max_timeout_secs = crate::runtime_config::claude_timeout_secs(home_dir, work_dir);
     let hard_deadline = tokio::time::sleep(std::time::Duration::from_secs(hard_max_timeout_secs));
     tokio::pin!(hard_deadline);
 
     loop {
+        if terminal_received { break; }
         tokio::select! {
             // Priority 1: read stream-json events from CLI stdout
             line_result = reader.next_line() => {
@@ -618,6 +633,11 @@ pub(super) async fn spawn_claude_cli_with_env(
 
                         lines_seen += 1;
                         let parsed = serde_json::from_str::<serde_json::Value>(&line).ok();
+                        if let Some(event) = parsed.as_ref() {
+                            if line.len() <= crate::mcp_start::MAX_INIT_BYTES {
+                                crate::mcp_start::observe_init(home_dir, &step_agent_id, &mcp_names, event);
+                            }
+                        }
 
                         // Keep only a truncated tail for diagnostics (full line
                         // can contain the user's prompt — we don't want it on disk).
@@ -655,6 +675,7 @@ pub(super) async fn spawn_claude_cli_with_env(
                         }
 
                         if let Some(event) = parsed {
+                            idle.observe(&event);
                             events_parsed += 1;
 
                             // Thinking display: a partial `stream_event` line is
@@ -795,35 +816,14 @@ pub(super) async fn spawn_claude_cli_with_env(
                                         .get("subtype")
                                         .and_then(|s| s.as_str())
                                         .map(String::from);
-                                    let is_error = event
-                                        .get("is_error")
-                                        .and_then(|v| v.as_bool())
-                                        .unwrap_or(false);
-                                    if is_error {
-                                        let err_text = event
-                                            .get("result")
-                                            .and_then(|r| r.as_str())
-                                            .unwrap_or("Unknown stream-json error");
-                                        child.kill_and_reap().await;
-                                        // Include captured stderr tail in the error so we can
-                                        // diagnose cases where Claude CLI sets is_error=true
-                                        // without a meaningful `result` text (e.g. --resume
-                                        // failures, internal CLI errors). Without this the
-                                        // error just says "Unknown stream-json error".
-                                        let stderr_tail = stderr_buf
-                                            .lock()
-                                            .ok()
-                                            .map(|g| g.trim().to_string())
-                                            .filter(|s| !s.is_empty())
-                                            .map(|s| {
-                                                let snippet = duduclaw_core::truncate_bytes(&s, 500);
-                                                format!(" | stderr: {snippet}")
-                                            })
-                                            .unwrap_or_default();
-                                        return Err(format!(
-                                            "claude CLI stream error: {err_text}{stderr_tail}"
-                                        ));
+                                    if let Some(error) = crate::work_outcome::result_error(
+                                        &event, max_turns,
+                                        if result_text.is_empty() { &partial_assistant_text } else { &result_text },
+                                    ) {
+                                        crate::process_group::finish_terminal(&mut child, hard_deadline.deadline(), true).await;
+                                        return Err(error);
                                     }
+                                    terminal_received = true;
                                     if let Some(text) = event.get("result").and_then(|r| r.as_str()) {
                                         // Only overwrite with the result event's text if it's
                                         // non-empty. When Claude uses tools, the final `result`
@@ -940,6 +940,10 @@ pub(super) async fn spawn_claude_cli_with_env(
                                         .and_then(|c| c.as_array())
                                     {
                                         assistant_text = duduclaw_core::think_tags::last_assistant_text(content);
+                                        if !assistant_text.trim().is_empty() {
+                                            if !partial_assistant_text.is_empty() { partial_assistant_text.push_str("\n\n"); }
+                                            partial_assistant_text.push_str(&assistant_text);
+                                        }
                                         for block in content {
                                             let block_type = block.get("type").and_then(|t| t.as_str());
                                             match block_type {
@@ -1043,25 +1047,16 @@ pub(super) async fn spawn_claude_cli_with_env(
             }
 
             // Priority 3: hard max timeout — kill truly hung processes
-            _ = &mut hard_deadline => {
-                warn!(
-                    "claude CLI hard timeout ({hard_max_timeout_secs}s) — killing process"
-                );
+            _ = idle.expired() => {
                 child.kill_and_reap().await;
-                if result_text.is_empty() && !assistant_text.is_empty() && !public_fallback {
-                    // No authoritative result: only the final text segment is eligible.
-                    result_text = std::mem::take(&mut assistant_text);
-                }
-                if result_text.is_empty() {
-                    return Err(format!(
-                        "claude CLI hard timeout ({hard_max_timeout_secs}s, no output)"
-                    ));
-                }
-                warn!(
-                    "claude CLI hard timeout — returning partial result ({} chars)",
-                    result_text.len()
-                );
-                break;
+                return Err(idle.outcome(if result_text.is_empty() { partial_assistant_text.clone() } else { result_text.clone() }).encode());
+            }
+            _ = &mut hard_deadline => {
+                child.kill_and_reap().await;
+                return Err(crate::work_outcome::WorkOutcome::TimeoutTotal {
+                    seconds: hard_max_timeout_secs,
+                    partial: if result_text.is_empty() { partial_assistant_text.clone() } else { result_text.clone() },
+                }.encode());
             }
         }
     }
@@ -1071,9 +1066,15 @@ pub(super) async fn spawn_claude_cli_with_env(
 
     // Wait for process to exit
     #[cfg(target_os = "linux")]
-    if let Some(writer) = prompt_writer.as_mut() { writer.finish().await?; }
-    let status = child.child().wait().await.map_err(|e| format!("wait error: {e}"))?;
-    child.disarm();
+    if !terminal_received {
+        if let Some(writer) = prompt_writer.as_mut() { writer.finish().await?; }
+    }
+    let status = if terminal_received {
+        crate::process_group::finish_terminal(&mut child, hard_deadline.deadline(), false).await
+    } else {
+        Some(child.child().wait().await.map_err(|e| format!("wait error: {e}"))?)
+    };
+    if !terminal_received { child.disarm(); }
 
     // Snapshot stderr tail for error diagnostics.
     let stderr_tail: String = stderr_buf
@@ -1094,7 +1095,7 @@ pub(super) async fn spawn_claude_cli_with_env(
          result_events={result_events} \
          result_subtype={:?} stop_reason={:?} \
          last_line={:?} stderr_tail={:?}",
-        status.code().unwrap_or(-1),
+        status.as_ref().and_then(|s| s.code()).unwrap_or(-1),
         last_result_subtype,
         last_stop_reason,
         last_raw_line,
@@ -1107,10 +1108,10 @@ pub(super) async fn spawn_claude_cli_with_env(
     // a real result event with `is_error: true` and exit code 1. The
     // stream-json error check above should have caught those before we
     // reach here, but the exit-code gate is a defensive backstop.
-    if !status.success() {
+    if !terminal_received && !status.as_ref().is_some_and(|s| s.success()) {
         return Err(format!(
             "claude CLI exit {} ({diag})",
-            status.code().unwrap_or(-1)
+            status.as_ref().and_then(|s| s.code()).unwrap_or(-1)
         ));
     }
 

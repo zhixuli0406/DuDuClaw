@@ -7,6 +7,7 @@ import en from '@/i18n/en.json';
 import { mockWsClient } from '@/test/mocks';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useAuthStore } from '@/stores/auth-store';
+import { useMcpStore } from '@/stores/mcp-store';
 import { useConnectionStore } from '@/stores/connection-store';
 import { McpPage } from './McpPage';
 
@@ -62,6 +63,7 @@ async function pickAgent(dialog: HTMLElement, user: ReturnType<typeof userEvent.
 
 beforeEach(() => {
   vi.clearAllMocks();
+  useMcpStore.setState({ lastProbe: null });
   useConnectionStore.setState({ state: 'authenticated' as never, error: null });
   useAuthStore.setState({ user: { role: 'admin' } } as never);
   useAgentsStore.setState({ fetchAgents: vi.fn() as never, agents: [{ name: 'sam', display_name: 'Sam' }] as never });
@@ -272,4 +274,33 @@ describe('McpPage editing an installed server', () => {
     expect(combos[0]).toHaveAttribute('data-disabled');
     expect(within(dialog).getByDisplayValue('browserbase')).toHaveAttribute('readonly');
   });
+});
+
+it('shows translated startup results, both runtime sources and a read-only TOML entry', async () => {
+  mockList([{ agent_id: 'sam', servers: [
+    { name: 'json-server', command: 'fixture', args: [], env: {}, source: 'mcp_json',
+      effective_runtimes: ['claude', 'codex', 'grok', 'in_process'],
+      last_start: { ok: false, reason_code: 'identity_rejected', time: '2026-11-17T00:00:00Z' } },
+    { name: 'api-only', command: 'fixture', args: [], env: {}, source: 'agent_toml', read_only: true,
+      effective_runtimes: ['in_process'] },
+  ] }]);
+  renderPage('agents');
+  expect(await screen.findByText(/^Caller identity rejected ·$/)).toBeInTheDocument();
+  expect(screen.getByText(/Used by: Claude, Codex, Grok/)).toBeInTheDocument();
+  expect(screen.getByText('Read-only. Claude, Codex and Grok do not use this configuration.')).toBeInTheDocument();
+  expect(screen.getByText('2026-11-17T00:00:00Z')).toBeInTheDocument();
+  expect(screen.queryByText('identity_rejected')).not.toBeInTheDocument();
+});
+
+it('shows the returned install probe inline after saving', async () => {
+  mockWsClient.call.mockImplementation(async (method: string) => {
+    if (method === 'mcp.list') return { agents: [], catalog: [] };
+    if (method === 'mcp.update') return { success: true,
+      probe: { ok: false, reason_code: 'timeout', time: '2026-11-17T01:00:00Z' } };
+    return { providers: [] };
+  });
+  renderPage('agents');
+  await useMcpStore.getState().addServer('sam', 'fixture', { command: 'fixture', args: [], env: {} });
+  expect(await screen.findByText('Saved fixture for sam. Start probe:')).toBeInTheDocument();
+  expect(screen.getByText(/Start probe timed out/)).toBeInTheDocument();
 });

@@ -119,7 +119,7 @@ async fn acl_loss_after_staging_refuses_sse_content_and_retracts_history() {
     let (_incoming_tx, incoming) = mpsc::channel(1);
     let lease = RunLease { state: state.clone(), sid: sid.clone() };
     let worker = tokio::spawn(run::start(state, broker, lease, f.user.clone(), "worker".into(), sid.clone(),
-        "host-turn".into(), format!("user:{}", f.user), "hello".into(), connection, incoming, Arc::new(AtomicBool::new(false))));
+        "host-turn".into(), format!("user:{}", f.user), "hello".into(), connection, incoming, Arc::new(AtomicBool::new(false)), Duration::from_secs(1830)));
     assert_eq!(frame(&mut rx).await["type"], "RUN_STARTED");
     let turn = tokio::time::timeout(Duration::from_secs(30), seam.entered.recv()).await.unwrap().unwrap();
     turn.release.send(()).unwrap();
@@ -273,7 +273,7 @@ async fn approval_resume_case(role: UserRole, kind: &str, external: bool, approv
     let broker_worker = broker.clone();
     let worker = tokio::spawn(async move {
         let (result, cleanup) = crate::channel_reply::with_delivery_cleanup(
-            run::execute(&state, &broker_worker, &user, "worker", &sid_worker, "host-turn", "hello", connection, &mut incoming_rx, &waiting_worker),
+            run::execute(&state, &broker_worker, &user, "worker", &sid_worker, "host-turn", "hello", connection, &mut incoming_rx, &waiting_worker, Duration::from_secs(1830)),
         ).await;
         cleanup.unwrap();
         result
@@ -379,7 +379,7 @@ async fn disconnected_stream_releases_run_slot_and_withdraws_approvals() {
     drop(rx);
     let (_tx, incoming) = mpsc::channel(1);
     let lease = RunLease { state: state.clone(), sid: sid.clone() };
-    run::start(state, broker.clone(), lease, f.user.clone(), "worker".into(), sid, "host-turn".into(), format!("user:{}", f.user), "hello".into(), connection, incoming, Arc::new(AtomicBool::new(false))).await;
+    run::start(state, broker.clone(), lease, f.user.clone(), "worker".into(), sid, "host-turn".into(), format!("user:{}", f.user), "hello".into(), connection, incoming, Arc::new(AtomicBool::new(false)), Duration::from_secs(1830)).await;
     assert_eq!(broker.get(&id).await.unwrap().unwrap().status, crate::approval::ApprovalStatus::Denied);
 }
 
@@ -455,7 +455,7 @@ fn web_lifetime_error_names_the_web_cap_and_suggests_background_work() {
     let event = run::failure("run_timeout");
     assert_eq!(event["code"], "run_timeout");
     let message = event["message"].as_str().unwrap();
-    assert!(message.contains("網頁對話") && message.contains("15 分鐘") && message.contains("背景任務"));
+    assert!(message.contains("網頁對話") && message.contains("設定的網頁對話執行時間上限") && message.contains("背景任務"));
     assert!(!run::failure("runtime_failed")["message"].as_str().unwrap().contains("15 分鐘"));
 }
 
@@ -463,14 +463,14 @@ mod timeout_tests {
     use super::*;
 
     #[tokio::test]
-    async fn employee_hour_limit_does_not_extend_web_chat_past_fifteen_minutes() {
+    async fn employee_five_minute_limit_expires_after_delivery_grace() {
         let f = Fixture::new(UserRole::Admin).await;
         let path = f.home.path().join("agents/worker/agent.toml");
         let mut table: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
         table.insert("runtime".into(), toml::Value::Table(
-            toml::from_str("provider='claude'\ntimeout_secs=3600").unwrap()));
+            toml::from_str("provider='claude'\ntimeout_secs=300").unwrap()));
         std::fs::write(&path, toml::to_string(&table).unwrap()).unwrap();
-        assert_eq!(crate::runtime_config::claude_timeout_secs(f.home.path(), Some(path.parent().unwrap())), 3600);
+        assert_eq!(crate::runtime_config::claude_timeout_secs(f.home.path(), Some(path.parent().unwrap())), 300);
         let state = f.state();
         let broker = state.chat.approvals.clone().unwrap();
         let sid = session_id(&f.user, "worker", "thread");
@@ -480,12 +480,12 @@ mod timeout_tests {
         let user = f.user.clone();
         let worker = tokio::spawn(async move {
             run::execute(&state, &broker, &user, "worker", &sid, "timeout-turn", "hello",
-                connection, &mut incoming, &AtomicBool::new(false)).await
+                connection, &mut incoming, &AtomicBool::new(false), Duration::from_secs(330)).await
         });
         assert_eq!(frame(&mut rx).await["type"], "RUN_STARTED");
         let _blocked_turn = tokio::time::timeout(Duration::from_secs(30), seam.entered.recv()).await.unwrap().unwrap();
         tokio::time::pause();
-        tokio::time::advance(Duration::from_secs(899)).await;
+        tokio::time::advance(Duration::from_secs(329)).await;
         tokio::task::yield_now().await;
         assert!(!worker.is_finished());
         assert!(rx.try_recv().is_err());
@@ -493,5 +493,26 @@ mod timeout_tests {
         let event = frame(&mut rx).await;
         assert_eq!(event["code"], "run_timeout", "{event}");
         assert!(!worker.await.unwrap());
+    }
+}
+
+#[test]
+fn webchat_deadline_covers_resolved_employee_timeout_and_global_ceiling() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().join("agents/anna");
+    std::fs::create_dir_all(&dir).unwrap();
+    for (employee, expected) in [("timeout_secs=300", 330), ("", 1830)] {
+        std::fs::write(dir.join("agent.toml"), format!("[runtime]\nprovider='claude'\n{employee}\n")).unwrap();
+        assert_eq!(run_lifetime(home.path(), "anna").as_secs(), expected);
+        for max in [600, 7200, 14400] {
+            std::fs::write(home.path().join("config.toml"), format!("[runtime]\nmax_timeout_secs={max}\n")).unwrap();
+            assert_eq!(run_lifetime(home.path(), "anna").as_secs(), expected.min(max + 30));
+        }
+        std::fs::remove_file(home.path().join("config.toml")).unwrap();
+    }
+    std::fs::write(dir.join("agent.toml"), "[runtime]\ntimeout_secs=14000\n").unwrap();
+    for max in [600, 7200, 14400] {
+        std::fs::write(home.path().join("config.toml"), format!("[runtime]\nmax_timeout_secs={max}\n")).unwrap();
+        assert!(run_lifetime(home.path(), "anna").as_secs() <= max + 30);
     }
 }

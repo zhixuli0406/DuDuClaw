@@ -499,7 +499,7 @@ pub fn scoped_task_timeout_secs(agent_id: &str) -> Option<u64> {
             scoped
                 .as_ref()
                 .filter(|(id, _)| id == agent_id)
-                .map(|(_, secs)| (*secs).clamp(MIN_TIMEOUT_SECS, MAX_TIMEOUT_SECS))
+                .map(|(_, secs)| (*secs).max(MIN_TIMEOUT_SECS))
         })
         .ok()
         .flatten()
@@ -705,6 +705,12 @@ pub fn read_runtime_json(agent_dir: &Path) -> serde_json::Value {
     }
     if let Some(secs) = raw_agent_timeout_secs(agent_dir) {
         obj.insert("timeout_secs".into(), serde_json::Value::from(secs));
+    }
+    if let Some(secs) = duduclaw_core::agent_toml::load(agent_dir).runtime.idle_timeout_secs {
+        obj.insert("idle_timeout_secs".into(), serde_json::Value::from(secs));
+    }
+    if let Some(turns) = duduclaw_core::turn_limits::raw_agent_max_turns(agent_dir) {
+        obj.insert("max_turns".into(), serde_json::Value::from(turns));
     }
     serde_json::Value::Object(obj)
 }
@@ -2325,6 +2331,11 @@ mod tests {
             claude_timeout_secs(home.path(), Some(&dir))
         }).await;
         assert_eq!(got, 600);
+        std::fs::write(home.path().join("config.toml"), "[runtime]\nmax_timeout_secs=7200\n").unwrap();
+        let got = TASK_TIMEOUT_SECS.scope(Some(("anna".into(), 6000)), async {
+            claude_timeout_secs(home.path(), Some(&dir))
+        }).await;
+        assert_eq!(got, 6000);
     }
 
 }
@@ -2334,3 +2345,70 @@ mod alignment;
 pub(crate) use alignment::{ModelRuntimeAlignment, align_model_runtime, ensure_model_provider};
 #[cfg(test)]
 pub(crate) use alignment::testing;
+
+/// Zero disables the event-silence deadline. Invalid reads restore the built-in window.
+pub(crate) const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 900;
+pub(crate) fn validate_idle_timeout(value: i64, maximum: u64) -> Result<u64, String> {
+    u64::try_from(value).ok().filter(|v| *v == 0 || (60..=maximum).contains(v))
+        .ok_or_else(|| format!("idle timeout must be 0 or 60..={maximum} seconds"))
+}
+pub(crate) fn idle_policy_checked(home: &Path) -> Result<u64, String> {
+    let text = match std::fs::read_to_string(home.join("config.toml")) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(DEFAULT_IDLE_TIMEOUT_SECS),
+        Err(e) => return Err(e.to_string()),
+    };
+    idle_policy_from_table(&text.parse::<toml::Table>().map_err(|e| e.to_string())?)
+}
+pub(crate) fn idle_policy_from_table(table: &toml::Table) -> Result<u64, String> {
+    let maximum = TimeoutPolicy::from_table(table)?.max_secs;
+    let Some(runtime) = table.get("runtime") else { return Ok(DEFAULT_IDLE_TIMEOUT_SECS.min(maximum)); };
+    let runtime = runtime.as_table().ok_or("invalid runtime table")?;
+    match runtime.get("default_idle_timeout_secs") {
+        Some(v) => validate_idle_timeout(v.as_integer().ok_or("idle timeout must be integer seconds")?, maximum),
+        None => Ok(DEFAULT_IDLE_TIMEOUT_SECS.min(maximum)),
+    }
+}
+pub(crate) fn idle_timeout_secs(home: &Path, dir: Option<&Path>) -> u64 {
+    let resolve = || -> Result<u64, String> {
+        let default = idle_policy_checked(home)?;
+        let Some(dir) = dir else { return Ok(default); };
+        let text = match duduclaw_core::agent_toml::read_effective_text(dir) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(default),
+            Err(e) => return Err(e.to_string()),
+        };
+        let table = text.parse::<toml::Table>().map_err(|e| e.to_string())?;
+        let Some(runtime) = table.get("runtime") else { return Ok(default); };
+        let runtime = runtime.as_table().ok_or("invalid runtime table")?;
+        match runtime.get("idle_timeout_secs") {
+            Some(v) => validate_idle_timeout(v.as_integer().ok_or("idle timeout must be integer seconds")?, TimeoutPolicy::load(home).max_secs),
+            None => Ok(default),
+        }
+    };
+    resolve().unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS)
+}
+
+#[cfg(test)]
+mod idle_tests {
+    use super::*;
+    #[test]
+    fn idle_policy_resolution_validation_and_read_errors() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("agents/worker");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(idle_timeout_secs(home.path(), Some(&dir)), 900);
+        std::fs::write(home.path().join("config.toml"), "[runtime]\ndefault_idle_timeout_secs=1200\n").unwrap();
+        assert_eq!(idle_timeout_secs(home.path(), Some(&dir)), 1200);
+        for (raw, expected) in [("60",60), ("0",0), ("'bad'",900), ("59",900), ("3601",900)] {
+            std::fs::write(dir.join("agent.toml"), format!("[runtime]\nidle_timeout_secs={raw}\n")).unwrap();
+            assert_eq!(idle_timeout_secs(home.path(), Some(&dir)), expected);
+        }
+        std::fs::write(home.path().join("config.toml"), "[broken").unwrap();
+        assert!(idle_policy_checked(home.path()).is_err());
+        assert_eq!(idle_timeout_secs(home.path(), Some(&dir)), 900);
+        for raw in ["59", "-1", "3601", "'bad'"] {
+            assert!(idle_policy_from_table(&format!("[runtime]\ndefault_idle_timeout_secs={raw}").parse().unwrap()).is_err());
+        }
+    }
+}

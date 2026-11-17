@@ -44,6 +44,45 @@ fn render_backend_error(required: bool, error: std::io::Error, operation: &str) 
     }
 }
 
+/// A canonical result owns success or failure. The entire cleanup shares one
+/// deadline; dropping the owner on expiry uses the backend's detached cleanup.
+pub(crate) async fn finish_terminal(
+    child: &mut BackendChild, total_deadline: tokio::time::Instant, failed: bool,
+) -> Option<std::process::ExitStatus> {
+    finish_terminal_with(child, total_deadline, failed).await
+}
+
+#[async_trait::async_trait]
+trait TerminalChild: Send {
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus>;
+    async fn kill_and_reap(&mut self);
+    fn disarm(&mut self);
+}
+
+#[async_trait::async_trait]
+impl TerminalChild for BackendChild {
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> { self.child().wait().await }
+    async fn kill_and_reap(&mut self) { BackendChild::kill_and_reap(self).await; }
+    fn disarm(&mut self) { BackendChild::disarm(self); }
+}
+
+async fn finish_terminal_with(
+    child: &mut impl TerminalChild, total_deadline: tokio::time::Instant, failed: bool,
+) -> Option<std::process::ExitStatus> {
+    let deadline = total_deadline.min(tokio::time::Instant::now() + std::time::Duration::from_secs(5));
+    tokio::time::timeout_at(deadline, async {
+        if failed {
+            child.kill_and_reap().await;
+            return None;
+        }
+        match child.wait().await {
+            Ok(status) if status.success() => { child.disarm(); Some(status) }
+            Ok(status) => { child.kill_and_reap().await; Some(status) }
+            Err(_) => { child.kill_and_reap().await; None }
+        }
+    }).await.ok().flatten()
+}
+
 #[derive(Debug)]
 pub enum OutputError {
     Timeout,
@@ -184,6 +223,59 @@ async fn collect_output(
 #[cfg(test)]
 mod bounded_tests {
     use super::*;
+
+    struct HungTerminalChild {
+        kill_started: bool,
+        disarmed: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl TerminalChild for HungTerminalChild {
+        async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+            std::future::pending().await
+        }
+        async fn kill_and_reap(&mut self) {
+            self.kill_started = true;
+            // A protected backend can hang in cancel, before it even reaches wait.
+            std::future::pending().await
+        }
+        fn disarm(&mut self) { self.disarmed = true; }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn max_turns_survives_hung_kill_within_cleanup_and_total_bounds() {
+        for seconds_left in [60, 1, 0] {
+            let mut child = HungTerminalChild { kill_started: false, disarmed: false };
+            let error = crate::work_outcome::result_error(&serde_json::json!({
+                "type":"result", "subtype":"error_max_turns", "is_error":true,
+            }), 17, "partial").unwrap();
+            let started = tokio::time::Instant::now();
+            let deadline = started + std::time::Duration::from_secs(seconds_left);
+            let outcome: Result<(), String> = tokio::time::timeout(
+                std::time::Duration::from_secs(6), async {
+                    finish_terminal_with(&mut child, deadline, true).await;
+                    Err(error)
+                },
+            ).await.expect("terminal error must not wait for a hung backend");
+            assert_eq!(crate::work_outcome::WorkOutcome::decode(&outcome.unwrap_err()),
+                Some(crate::work_outcome::WorkOutcome::MaxTurns { limit:17, partial:"partial".into() }));
+            assert_eq!(tokio::time::Instant::now() - started,
+                std::time::Duration::from_secs(seconds_left.min(5)));
+            assert!(child.kill_started);
+            assert!(!child.disarmed, "the backend owner must retain detached cleanup responsibility");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_success_does_not_disarm_a_child_that_never_exits() {
+        let mut child = HungTerminalChild { kill_started: false, disarmed: false };
+        let started = tokio::time::Instant::now();
+        let status = finish_terminal_with(&mut child,
+            started + std::time::Duration::from_secs(60), false).await;
+        assert!(status.is_none());
+        assert_eq!(tokio::time::Instant::now() - started, std::time::Duration::from_secs(5));
+        assert!(!child.disarmed);
+    }
 
     #[test]
     fn isolation_backend_error_is_terminal_across_runtime_fallbacks() {

@@ -177,15 +177,17 @@ async fn seeds_tools_from_executor_when_request_has_none() {
 }
 
 #[tokio::test]
-async fn max_iters_exhaustion_returns_marker() {
+async fn max_iters_exhaustion_returns_typed_error() {
     // Provider always asks for a tool → loop can never end naturally.
     let provider = ScriptedProvider::new(vec![tool_use_resp("c", "search")]);
     let exec = MockExecutor::new(MockBehavior::Ok("again".into()));
     let req = ChatRequest::new("m");
 
-    let resp = run_tool_loop(&provider, req, &exec, 2).await.unwrap();
+    let error = run_tool_loop(&provider, req, &exec, 2).await.unwrap_err();
 
-    assert_eq!(resp.stop, StopReason::Other(MAX_ITERS_STOP.into()));
+    assert_eq!(error, LlmError::MaxTurns { limit: 2 });
+    assert!(!error.is_retryable());
+    assert!(!error.is_failover());
     // Exactly `max_iters` dispatch rounds executed.
     assert_eq!(exec.call_count(), 2);
     // Provider called 1 (initial) + 2 (per round) = 3 times.

@@ -137,6 +137,7 @@ impl MethodHandler {
                     { "name": "heartbeat.status", "description": "Per-agent heartbeat status" },
                     { "name": "heartbeat.trigger", "description": "Manually trigger heartbeat for an agent" },
                     { "name": "mcp.list", "description": "List MCP servers for all agents + catalog" },
+                    { "name": "mcp.probe", "description": "Check an employee MCP server startup (Admin)" },
                     { "name": "mcp.update", "description": "Add or remove an MCP server for an agent" },
                     { "name": "mcp.import.fetch", "description": "Fetch + security-scan MCP server defs from a GitHub/URL manifest" },
                     { "name": "mcp.import.install", "description": "Install a scanned MCP server def (fail-closed re-scan)" },

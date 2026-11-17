@@ -518,6 +518,9 @@ impl AgentRuntime for GrokRuntime {
         // rather than risking a rejected `xhigh`/`max`. `None` ⇒ flag absent.
         args.extend(effort_args(context.effort));
 
+        let mut denied = caps.map(|c| c.denied_tools.clone()).unwrap_or_default();
+        denied.push("ask_user_question".into());
+        args.extend(["--disallowed-tools".to_string(), denied.join(",")]);
         // Tool confinement — verified `--tools` / `--disallowed-tools` flags. This
         // is an ADDITIVE best-effort layer on top of the hard `native_sandbox`
         // confinement below (which stays fail-closed). RESIDUAL: the LIST
@@ -529,10 +532,7 @@ impl AgentRuntime for GrokRuntime {
                 args.push("--tools".to_string());
                 args.push(c.allowed_tools.join(","));
             }
-            if !c.denied_tools.is_empty() {
-                args.push("--disallowed-tools".to_string());
-                args.push(c.denied_tools.join(","));
-            }
+
             if c.has_tool_restrictions() {
                 info!(
                     runtime = "grok",
@@ -1300,7 +1300,7 @@ mod tests {
             duduclaw_cli_runtime::PtyError::ReadTimeout(std::time::Duration::from_secs(600)), 600,
         );
         assert_eq!(error, "Grok CLI hard timeout after 600s");
-        assert_eq!(crate::channel_reply::classify_cli_failure(&error), crate::channel_reply::FailureReason::Timeout);
+        assert_eq!(crate::channel_reply::classify_cli_failure(&error), crate::channel_reply::FailureReason::TimeoutTotal);
     }
 
     use super::*;

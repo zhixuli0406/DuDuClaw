@@ -4,6 +4,30 @@
   "identity_semantics": "identity records current execution domain; target_identity is a pending migration destination. test/operator/host_service are inventory-only domains outside the native wire contract",
   "entries": [
     {
+      "symbol": "crates/duduclaw-gateway/src/claude_runner/work_outcome_tests.rs::background_idle_stops_pending_tool_and_keepalive_does_not_reset_it",
+      "apis": {
+        "command_constructor": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Fake CLI pending-tool/idle-clock regression using the existing BackendChild termination path."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/claude_runner/work_outcome_tests.rs::background_stream_parser_preserves_partial_and_empty_or_missing_result",
+      "apis": {
+        "command_constructor": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Isolated fake CLI stream fixture for terminal step-budget errors; no provider calls."
+    },
+    {
       "symbol": "crates/duduclaw-agent/src/account_rotator/host_inheritance_tests.rs::run_ambient_child",
       "apis": {
         "command_constructor": 1,
@@ -753,7 +777,7 @@
       "rationale": "Typed ExecutionBackend handoff; original native Command/PTY builder retained by LocalBackend. Protected launch requires trusted immutable policy/input/capability context and uses daemon run handles; missing context is refused without gateway execution."
     },
     {
-      "symbol": "crates/duduclaw-cli/src/mcp_proxy.rs::run_proxy_io_with_identity",
+      "symbol": "crates/duduclaw-cli/src/mcp_proxy.rs::run_proxy_io_monitored",
       "apis": {
         "terminal_spawn": 1
       },
@@ -7328,6 +7352,81 @@
       "identity": "test",
       "migration": "test_only",
       "rationale": "Root acceptance fixture forks the trampoline serve child for in-run helper scenarios; root-test-fixture feature is required and release builds are forbidden. Not a shipped spawn path."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/mcp_start.rs::probe_entry",
+      "apis": {
+        "platform_command_factory": 1,
+        "backend_spawn_class": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "employee",
+      "migration": "backend",
+      "rationale": "Admin install probe uses the real employee spawn gate, rewritten per-spawn identity, ThirdPartyMcp classification and BackendChild cleanup."
+    },
+    {
+      "symbol": "crates/duduclaw-cli/src/third_party_mcp_tests.rs::exchange",
+      "apis": {
+        "platform_command_factory": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Rust-only regression launches the exact Claude-prepared proxy entry with a cleared environment; includes the missing-token negative control."
+    },
+    {
+      "symbol": "crates/duduclaw-cli/src/third_party_mcp_tests.rs::isolated_spawn_regression",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_status": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Runs the real-proxy regression in its own filtered test process so the binary resolver override cannot affect parallel unit tests."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/claude_runner/work_outcome_tests.rs::terminal_result_survives_a_hung_process",
+      "apis": {
+        "command_constructor": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Fake CLI terminal-result regression verifies cleanup of a hung test process."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/mcp_start.rs::tests::rpc_probe_outcomes_leave_employee_bytes_mtime_and_directory_unchanged",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_status": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Isolated subprocess fixture verifies MCP probe outcomes preserve employee configuration."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/runtime/codex.rs::tests::terminal_result_survives_hung_codex_cleanup",
+      "apis": {
+        "command_constructor": 2
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Fake Codex terminal-result regression verifies cleanup of hung test processes."
     }
   ]
 }

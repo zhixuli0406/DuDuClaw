@@ -160,3 +160,27 @@ describe('employee automations', () => {
     expect(screen.queryByText('Admin confidential')).not.toBeInTheDocument();
   });
 });
+
+describe('routine delivery status', () => {
+  it('shows delivered and failed delivery independently of run time', async () => {
+    useConnectionStore.setState({ state: 'authenticated' });
+    mockWsClient.call.mockImplementation((method: string) => Promise.resolve(method === 'cron.list' ? {
+      tasks: [
+        { id: 'failed-delivery', name: 'Failed delivery', agent_id: 'sales', cron: '0 9 * * *', enabled: true,
+          last_status: 'success', last_delivery_status: 'delivery_failed', last_delivery_reason: 'notification_delivery_failed' },
+        { id: 'delivered', name: 'Delivered routine', agent_id: 'sales', cron: '0 9 * * *', enabled: true,
+          last_delivery_status: 'delivered' },
+        { id: 'refused', name: 'Refused routine', agent_id: 'sales', cron: '0 9 * * *', enabled: true,
+          last_delivery_status: 'delivery_refused', last_delivery_reason: 'origin_access_revoked' },
+        { id: 'old', name: 'Older routine', agent_id: 'sales', cron: '0 9 * * *', enabled: true },
+      ],
+    } : {}));
+    renderWithProviders(<RoutinesPage />);
+    expect(await screen.findByText('Delivery failed')).toBeInTheDocument();
+    expect(screen.getByText('Notification could not be delivered. Check the channel settings.')).toBeInTheDocument();
+    expect(screen.getByText('Delivered')).toBeInTheDocument();
+    expect(screen.getByText('No delivery recorded')).toBeInTheDocument();
+    expect(screen.getByText('Delivery refused')).toBeInTheDocument();
+    expect(screen.getByText('Destination access changed. Review the notification destination.')).toBeInTheDocument();
+  });
+});

@@ -180,3 +180,13 @@ fn example_config_covers_the_sections_the_audit_named() {
         );
     }
 }
+
+#[test]
+fn example_documents_bounded_runtime_steps() {
+    let example = example_text();
+    assert!(example.contains("# default_max_turns = 50"));
+    assert!(example.contains("# max_turns_limit = 200"));
+    let policy = duduclaw_core::turn_limits::TurnPolicy::validate(
+        &"[runtime]\ndefault_max_turns=50\nmax_turns_limit=200\n".parse().unwrap()).unwrap();
+    assert_eq!(policy.resolve(None), 50);
+}

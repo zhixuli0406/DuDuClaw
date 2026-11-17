@@ -253,7 +253,10 @@ pub(crate) const CONFIG_KEY_TYPES: &[(&str, &str, Ty)] = &[
     ("api", "anthropic_api_key_enc", Str),
     ("runtime", "utility_provider", Str),
     ("runtime", "default_timeout_secs", UInt),
+    ("runtime", "default_idle_timeout_secs", UInt),
     ("runtime", "max_timeout_secs", UInt),
+    ("runtime", "default_max_turns", UInt),
+    ("runtime", "max_turns_limit", UInt),
     ("goal_defaults", "assign_schedule_max_active", UInt),
     ("goal_defaults", "assign_schedule_min_interval_minutes", UInt),
     ("agent_files", "review_daily_limit", UInt),
@@ -321,6 +324,8 @@ pub(crate) fn check_config_types_with_stored(
     for (section, key, min, max) in [
         ("runtime", "default_timeout_secs", 30, 14400),
         ("runtime", "max_timeout_secs", 60, 14400),
+        ("runtime", "default_max_turns", 1, 10000),
+        ("runtime", "max_turns_limit", 1, 10000),
         ("goal_defaults", "assign_schedule_max_active", 0, 200),
         ("goal_defaults", "assign_schedule_min_interval_minutes", 60, 10080),
         ("agent_files", "review_daily_limit", 0, 100000),
@@ -336,7 +341,9 @@ pub(crate) fn check_config_types_with_stored(
             }
         }
     }
+    crate::runtime_config::idle_policy_from_table(table)?;
     crate::runtime_config::TimeoutPolicy::from_table(table)?;
+    duduclaw_core::turn_limits::TurnPolicy::validate(table)?;
     Ok(())
 }
 
@@ -440,6 +447,8 @@ mod tests {
     fn run_schedule_and_review_limit_ranges_are_checked() {
         for (section, key, min, max) in [
             ("runtime", "max_timeout_secs", 60, 14400),
+        ("runtime", "default_max_turns", 1, 10000),
+        ("runtime", "max_turns_limit", 1, 10000),
             ("goal_defaults", "assign_schedule_max_active", 0, 200),
             ("goal_defaults", "assign_schedule_min_interval_minutes", 60, 10080),
             ("agent_files", "review_daily_limit", 0, 100000),
@@ -448,8 +457,13 @@ mod tests {
             ("agent_files", "checks_per_minute", 1, 1000),
             ("agent_files", "max_pending_per_user", 1, 200),
         ] {
-            for n in [min, max] { check(&format!("[{section}]\n{key}={n}\n")).unwrap(); }
-            for n in [min - 1, max + 1] { assert!(check(&format!("[{section}]\n{key}={n}\n")).is_err()); }
+            let paired = match key {
+                "default_max_turns" => "max_turns_limit=10000\n",
+                "max_turns_limit" => "default_max_turns=1\n",
+                _ => "",
+            };
+            for n in [min, max] { check(&format!("[{section}]\n{key}={n}\n{paired}")).unwrap(); }
+            for n in [min - 1, max + 1] { assert!(check(&format!("[{section}]\n{key}={n}\n{paired}")).is_err()); }
         }
         assert!(check("[runtime]\ndefault_timeout_secs=3601\n").is_err());
         assert!(check("[runtime]\nmax_timeout_secs=600\ndefault_timeout_secs=601\n").is_err());
