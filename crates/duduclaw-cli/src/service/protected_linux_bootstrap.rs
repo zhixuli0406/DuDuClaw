@@ -23,8 +23,10 @@
 //! bound to this generation) and re-runs from the first step whose invariants
 //! do not hold. S9 independently requires the readiness check in the same run.
 //! Every object a step creates is first recorded as an intent and then with
-//! its identity in the creation ledger (review F4, `protected_linux_ledger.rs`);
-//! rollback removes nothing else.
+//! the identity its creation proves in the creation ledger (review F4, R3
+//! item 4, `protected_linux_ledger.rs`); rollback removes nothing else.
+//! Before any S4–S7 step re-runs on resume, every unit this installation owns
+//! is stopped and the full S3 process check passes (review R3 item 1).
 //!
 //! LOCK ORDER (consistent with R1's `bootstrap_verify` LOCK ORDER):
 //!   0. `<protected>/isolation-bootstrap.lock` — this run (and rollback) only;
@@ -124,8 +126,15 @@ pub(super) const JOURNAL_SCHEMA: u16 = 2;
 /// Review H1: bound of spawnd's root host publication as this installer reads it.
 const MAX_PUBLICATION_BYTES: u64 = 64 * 1024;
 const READY_WAIT: Duration = Duration::from_secs(30);
-/// Review H2: polls (250 ms) while waiting for a stopped gateway to be down.
-const QUIESCE_POLLS: u32 = 120;
+/// Review R3 item 6: ONE deadline for the whole resume quiesce (stop, wait,
+/// re-check); every command gets `min(QUIESCE_COMMAND_CAP, what is left)`
+/// and nothing is spawned once it has passed.
+const QUIESCE_WAIT: Duration = Duration::from_secs(30);
+const QUIESCE_COMMAND_CAP: Duration = Duration::from_secs(30);
+const QUIESCE_POLL: Duration = Duration::from_millis(250);
+/// Review R3 item 4: the unit whose socket systemd creates [`SPAWND_RUNTIME`] for
+/// (`ListenSequentialPacket=/run/duduclaw-spawnd/control.sock`).
+const SPAWND_RUNTIME_OWNER: &str = "duduclaw-spawnd.socket";
 
 // ── Administrator text (zh-TW; no internal state, never subprocess output) ──
 
@@ -147,8 +156,18 @@ const POLICY_REFUSED: &str = "安裝包的簽章政策沒有可用的對外連�
 const SYSTEMCTL_FAILED: &str = "systemd 指令失敗或回應無法判讀。";
 const OTHER_HOST: &str = "隔離安裝日誌屬於另一台主機（或這台主機的識別碼已改變），已停止。請勿刪除日誌；請保留現況並聯絡原廠協助人工處理。";
 const HOST_UNKNOWN: &str = "無法讀取這台主機的識別碼：/etc/machine-id 必須是 root 擁有的一般檔案，內容為 32 位小寫十六進位且不能全為 0 或同一個字元；/sys/class/dmi/id/product_uuid 存在時必須是標準 UUID 格式。";
-const GATEWAY_NOT_OURS: &str = "續接需要重新執行平台或政策步驟，但 duduclaw-gateway.service 正在執行（或有待處理的工作），而它的單元檔無法確認是這次安裝發布的原檔案；為避免在 Gateway 運作時變更平台，已停止，未停止任何服務。請先手動停止它（sudo systemctl stop duduclaw-gateway.service）並確認來源後再續接。";
-const GATEWAY_NOT_QUIET: &str = "續接需要重新執行平台或政策步驟，但無法確認 duduclaw-gateway.service 已停止、沒有待處理的工作，且 duduclaw 帳號與員工帳號沒有任何程序；已停止。請先手動停止 Gateway 及其程序後再續接。";
+const GATEWAY_PROCESSES: &str = "續接需要重新執行平台或政策步驟，但 duduclaw-gateway.service 停止後，duduclaw（Gateway）帳號仍有程序；已停止，未重新執行任何步驟。請先結束這些程序後再續接。";
+const ISOLATION_PROCESSES: &str = "續接需要重新執行平台或政策步驟；這次安裝的服務都已停止，但仍有服務帳號（duduclaw、duduclaw-*）或員工帳號（uid 70000–99999）的程序，或有從隔離安裝路徑（/opt/duduclaw-isolated、/opt/duduclaw、/usr/lib/duduclaw、/usr/libexec/duduclaw 等）執行的程序；已停止，未重新執行任何步驟。請先結束這些程序後再續接。";
+
+/// Review H2 / R3 item 1: a unit up (or with a job) whose unit file is not provably this install's.
+fn unit_not_ours(unit: &str) -> DuDuClawError {
+    refused(format!("續接需要重新執行平台或政策步驟，但 {unit} 正在執行（或有待處理的工作），而 systemd 載入它的方式無法確認是這次安裝發布的原單元檔（必須從記錄的原檔案載入、沒有覆寫設定、不需要 daemon-reload、不是暫時單元）；為避免在服務運作時變更平台，已停止，沒有停止它。請先手動停止它（sudo systemctl stop {unit}）並確認來源後再續接。"))
+}
+
+/// Review R3 items 1/6: a unit not confirmed down with no pending job within the deadline.
+fn unit_not_quiet(unit: &str) -> DuDuClawError {
+    refused(format!("續接需要重新執行平台或政策步驟，但無法在時限內確認 {unit} 已停止且沒有待處理的工作；已停止，未重新執行任何步驟。請先手動停止它（sudo systemctl stop {unit}）並確認後再續接。"))
+}
 const PUBLICATION_MISMATCH: &str = "隔離執行服務的發布紀錄 /var/lib/duduclaw-spawnd/publication.json 不是這次安裝寫入的內容（必須是 root 擁有、權限 0600 的一般檔案，只含這個世代且沒有任何授權）；已停止，未覆蓋它。";
 const HOST_DNS_CHANGED: &str = "主機的 DNS 狀態（systemd-resolved 是否可用）與第一次執行時不同。請恢復原狀後續接，或先執行 duduclaw-bootstrap rollback。";
 const PUBLISHED_MISMATCH: &str = "已發布的內容與這次安裝不符。";
@@ -702,6 +721,11 @@ fn continue_with(options: ContinueOptions, verify_self: bool) -> Result<()> {
         (Some(journal), Some(ours)) => ledger::belongs_to(ours, &journal.generation, &journal.nonce)?,
         _ => (),
     }
+    // Review R3 item 5: an interrupted rollback quarantine is finished before anything else.
+    let ours = match ours {
+        Some(recorded) if super::rollback::reconcile_on_resume(&store, &recorded)? => ledger::read(&store)?,
+        ours => ours,
+    };
     // S1 HostPreflight on every invocation (review F6): no side effect; what
     // this transaction already created (per its ledger) is not "residue".
     let (mut journal, fresh) = begin(journal, &options, &host, &nonce, now()?,
@@ -786,45 +810,127 @@ pub(super) trait Steps {
     /// The step's invariants hold on the host now (never the journal's word).
     fn holds(&mut self, step: Step) -> Result<bool>;
     fn perform(&mut self, step: Step) -> Result<()>;
-    /// Review H2: bring the gateway down before platform or policy steps re-run
-    /// ([`quiesce_gateway`]); refuses when that cannot be proven.
-    fn quiesce_gateway(&mut self) -> Result<()>;
-    /// Review H2: S2/S3 as plain checks — no gateway running, no gateway or
-    /// employee process — never accepting a running published gateway.
-    fn quiet(&mut self, step: Step) -> Result<bool>;
+    /// Review H2 / R3 item 1: before any S4–S7 step re-runs, bring down the
+    /// gateway and EVERY isolation unit this installation owns, prove them
+    /// down, then pass the full S3 process check ([`quiesce_isolation`]);
+    /// refuses when that cannot be proven.
+    fn quiesce(&mut self) -> Result<()>;
 }
 
-/// Review H2: what quiescing the gateway needs from the host (test seam).
-pub(super) trait GatewayControl {
-    /// `(down, job_pending)`: down = ActiveState inactive or failed.
-    fn state(&mut self) -> Result<(bool, bool)>;
-    /// The gateway unit is loaded from the unit file this transaction
-    /// published, whose identity equals its ledger entry (no drop-ins).
-    fn unit_is_ours(&mut self) -> Result<bool>;
-    fn stop(&mut self) -> Result<()>;
+/// Review H2 / R3 items 1, 2, 6: what quiescing needs from the host (test
+/// seam). Every call that spawns a command is given the one quiesce
+/// `deadline`; the command gets at most what is left of it.
+pub(super) trait UnitControl {
+    /// Monotonic time (a fake clock in tests).
+    fn now(&mut self) -> Instant;
+    /// `(down, job_pending)` of `unit`: down = ActiveState inactive or failed.
+    fn state(&mut self, unit: &str, deadline: Instant) -> Result<(bool, bool)>;
+    /// `unit`'s unit file is the object this transaction ledgered and PID 1
+    /// loads exactly it ([`unit_show_is_ours`]). Any failure: not ours.
+    fn unit_is_ours(&mut self, unit: &str, deadline: Instant) -> Result<bool>;
+    fn stop(&mut self, unit: &str, deadline: Instant) -> Result<()>;
     /// Any process of the gateway account remains.
-    fn account_has_processes(&mut self) -> Result<bool>;
-    fn pause(&mut self);
+    fn gateway_account_busy(&mut self, deadline: Instant) -> Result<bool>;
+    /// The full S3 check of a fresh install (`removal::processes_clear`):
+    /// no service-account or employee process, nothing executing from the
+    /// isolation install paths.
+    fn processes_clear(&mut self) -> Result<()>;
+    /// Sleep for `pause` (never past the deadline).
+    fn pause(&mut self, pause: Duration);
 }
 
-/// Review H2 (pure over the seam): a gateway that is up or has a pending job
-/// is stopped only when its unit is provably this transaction's; then it
-/// must be down with no job and the gateway account without any process
-/// within `polls` waits. Anything else refuses with a fixed message.
-pub(super) fn quiesce_gateway(control: &mut dyn GatewayControl, polls: u32) -> Result<()> {
-    let (down, pending) = control.state()?;
-    let stopped = !down || pending;
-    if stopped {
-        if !control.unit_is_ours()? { return Err(refused(GATEWAY_NOT_OURS)); }
-        control.stop().map_err(|_| refused(GATEWAY_NOT_QUIET))?;
+/// Review R3 item 6: what is left of `deadline` for one command (at most its
+/// own cap); `None` once it has passed — nothing may be spawned then.
+pub(super) fn command_budget(now: Instant, deadline: Instant) -> Option<Duration> {
+    let remaining = deadline.saturating_duration_since(now);
+    (!remaining.is_zero()).then(|| remaining.min(QUIESCE_COMMAND_CAP))
+}
+
+/// `unit` is up or has a pending job. A read after the deadline or a failed
+/// read is "cannot be confirmed down".
+fn unit_busy(control: &mut dyn UnitControl, unit: &str, deadline: Instant) -> Result<bool> {
+    let now = control.now();
+    if command_budget(now, deadline).is_none() { return Err(unit_not_quiet(unit)); }
+    let (down, pending) = control.state(unit, deadline).map_err(|_| unit_not_quiet(unit))?;
+    Ok(!down || pending)
+}
+
+/// Review R3 item 2: provably ours, or not (a failure is "not ours").
+fn unit_owned(control: &mut dyn UnitControl, unit: &str, deadline: Instant) -> Result<bool> {
+    let now = control.now();
+    if command_budget(now, deadline).is_none() { return Err(unit_not_quiet(unit)); }
+    Ok(control.unit_is_ours(unit, deadline).unwrap_or(false))
+}
+
+/// Review H2 / R3 items 1 and 6 (pure over the seam). `units` in stop order
+/// (the gateway first, then the units it binds to, the nightly requester,
+/// every socket before the services it activates). Within ONE deadline of
+/// `wait`:
+///   1. before any effect, every unit that is up or has a job must be
+///      provably this installation's (else a fixed refusal naming it);
+///   2. each such unit is stopped (re-checked first; one that came up since
+///      is checked again);
+///   3. every unit must be down with no pending job and the gateway account
+///      without a process (polled until the deadline, else a fixed refusal
+///      naming the unit or the gateway account);
+///   4. then the FULL S3 process check — the same as a fresh install's.
+pub(super) fn quiesce_isolation(control: &mut dyn UnitControl, units: &[&str], wait: Duration) -> Result<()> {
+    let deadline = control.now() + wait;
+    for unit in units.iter().copied() {
+        if unit_busy(control, unit, deadline)? && !unit_owned(control, unit, deadline)? { return Err(unit_not_ours(unit)); }
     }
-    let polls = if stopped { polls } else { 0 };
-    for attempt in 0..=polls {
-        let (down, pending) = control.state()?;
-        if down && !pending && !control.account_has_processes()? { return Ok(()); }
-        if attempt < polls { control.pause(); }
+    for unit in units.iter().copied() {
+        if !unit_busy(control, unit, deadline)? { continue; }
+        if !unit_owned(control, unit, deadline)? { return Err(unit_not_ours(unit)); }
+        let now = control.now();
+        if command_budget(now, deadline).is_none() { return Err(unit_not_quiet(unit)); }
+        control.stop(unit, deadline).map_err(|_| unit_not_quiet(unit))?;
     }
-    Err(refused(GATEWAY_NOT_QUIET))
+    // What the last poll was still waiting for: named when the deadline passes.
+    #[derive(Clone, Copy)]
+    enum Waiting<'a> { Unit(&'a str), GatewayAccount }
+    let refusal = |waiting: Waiting| match waiting {
+        Waiting::Unit(unit) => unit_not_quiet(unit),
+        Waiting::GatewayAccount => refused(GATEWAY_PROCESSES),
+    };
+    let mut last: Option<Waiting> = None;
+    loop {
+        let mut waiting = None;
+        for unit in units.iter().copied() {
+            let now = control.now();
+            if command_budget(now, deadline).is_none() { return Err(refusal(last.unwrap_or(Waiting::Unit(unit)))); }
+            let (down, pending) = control.state(unit, deadline).map_err(|_| unit_not_quiet(unit))?;
+            if !down || pending { waiting = Some(Waiting::Unit(unit)); break; }
+        }
+        if waiting.is_none() {
+            let now = control.now();
+            if command_budget(now, deadline).is_none() { return Err(refusal(last.unwrap_or(Waiting::GatewayAccount))); }
+            if control.gateway_account_busy(deadline).map_err(|_| refused(GATEWAY_PROCESSES))? {
+                waiting = Some(Waiting::GatewayAccount);
+            }
+        }
+        let Some(waiting) = waiting else { break };
+        last = Some(waiting);
+        let now = control.now();
+        let remaining = deadline.saturating_duration_since(now);
+        if remaining.is_zero() { return Err(refusal(waiting)); }
+        control.pause(remaining.min(QUIESCE_POLL));
+    }
+    control.processes_clear().map_err(|_| refused(ISOLATION_PROCESSES))
+}
+
+/// Review R3 item 2 (pure): PID 1's answer to `systemctl show <unit>
+/// --property=LoadState,FragmentPath,DropInPaths,NeedDaemonReload,Transient`
+/// (`None`: the read failed) names exactly the ledgered unit file, loaded,
+/// with no drop-in, no pending daemon-reload and not transient. Any other
+/// value, a duplicate or missing line or unparseable output: not ours.
+/// (Never made to pass by a `daemon-reload`.)
+pub(super) fn unit_show_is_ours(output: Option<&[u8]>, unit: &str) -> bool {
+    let Some(text) = output.and_then(|bytes| std::str::from_utf8(bytes).ok()) else { return false };
+    let mut fields: Vec<&str> = text.lines().collect();
+    fields.sort_unstable();
+    let fragment = format!("FragmentPath={}", unit_file(unit));
+    fields == ["DropInPaths=", fragment.as_str(), "LoadState=loaded", "NeedDaemonReload=no", "Transient=no"]
 }
 
 /// The last step after S1 the journal claims complete, if any.
@@ -843,11 +949,15 @@ fn claimed_complete(journal: &Journal) -> Option<Step> {
 /// against a state that no longer holds). S2/S3 are pure checks, so re-running
 /// them refuses rather than changes anything; S4–S8 are idempotent.
 ///
-/// Review H2: S2/S3 hold while the gateway this transaction published at S8
-/// runs. When the first step that does not hold is one of S4–S7, that gateway
-/// is quiesced FIRST (stopped only when its unit is provably ours) and S2/S3
-/// must then hold as plain checks; only then do the steps re-run, S8 among
-/// them when claimed (its completion is no longer trusted), or next in order.
+/// Review H2 / R3 item 1: S2/S3 hold while the gateway this transaction
+/// published at S8 and the isolation services it started at S6 run. When
+/// any step of S4–S7 is about to re-run, the gateway and every isolation unit
+/// this installation owns are quiesced FIRST (each stopped only when its unit
+/// is provably ours) and the full S3 process check must pass; only then do
+/// the steps re-run, S6 starting the services again and S8 among them when
+/// claimed (its completion is no longer trusted), or next in order. A pure
+/// S8 (S9) resume — nothing in S4–S7 re-runs — leaves the isolation services
+/// running (S3 then holds with the narrowed check, `processes_quiet`).
 pub(super) fn reestablish(steps: &mut dyn Steps, journal: &Journal) -> Result<()> {
     let Some(last) = claimed_complete(journal) else { return Ok(()) };
     let claimed: Vec<Step> = Step::ORDER.iter().copied()
@@ -858,14 +968,12 @@ pub(super) fn reestablish(steps: &mut dyn Steps, journal: &Journal) -> Result<()
     }
     let Some(first) = first else { return Ok(()) };
     println!("[重新建立] 日誌記錄 S{} {} 已完成，但主機現況不符；從這一步重新執行。", first.number(), first.label());
-    if (Step::PublishPlatform..=Step::Readiness).contains(&first) {
-        println!("[重新建立] 重新執行平台步驟前，先停止 Gateway。");
-        steps.quiesce_gateway()?;
-        for step in [Step::StopGateway, Step::ProcessesClear] {
-            if !steps.quiet(step)? { return Err(refused(GATEWAY_NOT_QUIET)); }
-        }
+    let rerun: Vec<Step> = claimed.into_iter().filter(|step| *step >= first).collect();
+    if rerun.iter().any(|step| (Step::PublishPlatform..=Step::Readiness).contains(step)) {
+        println!("[重新建立] 重新執行平台步驟前，先停止 Gateway 與這次安裝的所有隔離服務，並確認沒有殘留程序。");
+        steps.quiesce()?;
     }
-    for step in claimed.into_iter().filter(|step| *step >= first) {
+    for step in rerun {
         steps.perform(step)?;
         println!("[完成] S{} {}", step.number(), step.label());
     }
@@ -913,26 +1021,55 @@ impl Steps for Live<'_> {
     fn holds(&mut self, step: Step) -> Result<bool> {
         Ok(invariants(step, &*self.context, self.dns, self.services_started).is_ok())
     }
-    fn perform(&mut self, step: Step) -> Result<()> { perform(step, &mut *self.context, self.dns, self.services_started) }
-    fn quiesce_gateway(&mut self) -> Result<()> {
-        let ledger = self.context.recorder.ledger();
-        with_version_lock(|| quiesce_gateway(&mut LiveGateway { ledger }, QUIESCE_POLLS))
+    fn perform(&mut self, step: Step) -> Result<()> {
+        perform(step, &mut *self.context, self.dns, self.services_started)?;
+        // S6 (re-)started this transaction's isolation services.
+        if step == Step::StartServices { self.services_started = true; }
+        Ok(())
     }
-    fn quiet(&mut self, step: Step) -> Result<bool> {
-        match step {
-            Step::StopGateway => with_version_lock(|| Ok(gateway_not_running().is_ok())),
-            Step::ProcessesClear => with_version_lock(|| Ok(processes_quiet(self.services_started).is_ok())),
-            _ => Err(refused(JOURNAL_DAMAGED)),
-        }
+    fn quiesce(&mut self) -> Result<()> {
+        let ledger = self.context.recorder.ledger();
+        let units = super::rollback::stop_order();
+        with_version_lock(|| quiesce_isolation(&mut LiveUnits { ledger }, &units, QUIESCE_WAIT))?;
+        // Review R3 item 1: none of this transaction's services runs now; until
+        // S6 re-runs, every S3 check on this path is the full one.
+        self.services_started = false;
+        Ok(())
     }
 }
 
-/// Review H2: the live gateway unit and account.
-struct LiveGateway<'a> { ledger: &'a ledger::Ledger }
+/// A system command bounded by what is left of `deadline` (review R3 item 6);
+/// nothing is spawned once it has passed.
+fn command_until(name: &str, args: &[&str], deadline: Instant) -> Result<Output> {
+    let limit = command_budget(Instant::now(), deadline).ok_or_else(|| refused(SYSTEMCTL_FAILED))?;
+    command_within(name, args, limit)
+}
 
-impl GatewayControl for LiveGateway<'_> {
-    fn state(&mut self) -> Result<(bool, bool)> {
-        let output = command("systemctl", &["show", UNIT, "--property=ActiveState"])?;
+/// Review R3 item 2: the unit file of `unit` is the object this transaction
+/// ledgered (identity and content as recorded) AND PID 1 loads exactly it
+/// ([`unit_show_is_ours`]). Any failure: false.
+fn live_unit_is_ours(ledger: &ledger::Ledger, unit: &str, deadline: Instant) -> bool {
+    let path = unit_file(unit);
+    let Some(entry) = ledger.entry(&path) else { return false };
+    let recorded = (|| -> Result<bool> {
+        if !ledger::present(&path)? { return Ok(false); }
+        let (directory, name) = ledger::open_parent(&path)?;
+        Ok(ledger::classify_at(&directory, &name, entry, &ledger::boot_id()?)? == ledger::Now::Recorded)
+    })();
+    if !matches!(recorded, Ok(true)) { return false; }
+    let output = command_until("systemctl", &["show", unit,
+        "--property=LoadState,FragmentPath,DropInPaths,NeedDaemonReload,Transient"], deadline);
+    let stdout = output.ok().filter(|output| output.status.success()).map(|output| output.stdout);
+    unit_show_is_ours(stdout.as_deref(), unit)
+}
+
+/// Review H2 / R3 item 1: the live units and the gateway account.
+struct LiveUnits<'a> { ledger: &'a ledger::Ledger }
+
+impl UnitControl for LiveUnits<'_> {
+    fn now(&mut self) -> Instant { Instant::now() }
+    fn state(&mut self, unit: &str, deadline: Instant) -> Result<(bool, bool)> {
+        let output = command_until("systemctl", &["show", unit, "--property=ActiveState"], deadline)?;
         if !output.status.success() { return Err(refused(SYSTEMCTL_FAILED)); }
         let text = String::from_utf8(output.stdout).map_err(|_| refused(SYSTEMCTL_FAILED))?;
         let down = match text.trim_end_matches('\n').strip_prefix("ActiveState=") {
@@ -941,34 +1078,26 @@ impl GatewayControl for LiveGateway<'_> {
             _ => return Err(refused(SYSTEMCTL_FAILED)),
         };
         // `--no-legend` prints nothing at all when no job matches.
-        let jobs = command("systemctl", &["list-jobs", "--no-legend", "--plain", UNIT])?;
+        let jobs = command_until("systemctl", &["list-jobs", "--no-legend", "--plain", unit], deadline)?;
         if !jobs.status.success() { return Err(refused(SYSTEMCTL_FAILED)); }
         let jobs = String::from_utf8(jobs.stdout).map_err(|_| refused(SYSTEMCTL_FAILED))?;
         Ok((down, !jobs.trim().is_empty()))
     }
-    fn unit_is_ours(&mut self) -> Result<bool> {
-        let Some(entry) = self.ledger.entry(UNIT_PATH) else { return Ok(false) };
-        if !ledger::present(UNIT_PATH)? { return Ok(false); }
-        let (directory, name) = ledger::open_parent(UNIT_PATH)?;
-        if ledger::classify_at(&directory, &name, entry, &ledger::boot_id()?)? != ledger::Now::Recorded { return Ok(false); }
-        let output = command("systemctl", &["show", UNIT, "--property=FragmentPath,DropInPaths"])?;
-        if !output.status.success() { return Ok(false); }
-        let text = String::from_utf8(output.stdout).map_err(|_| refused(SYSTEMCTL_FAILED))?;
-        let mut fields: Vec<&str> = text.lines().collect();
-        fields.sort_unstable();
-        let fragment = format!("FragmentPath={UNIT_PATH}");
-        Ok(fields == ["DropInPaths=", fragment.as_str()])
+    fn unit_is_ours(&mut self, unit: &str, deadline: Instant) -> Result<bool> {
+        Ok(live_unit_is_ours(self.ledger, unit, deadline))
     }
-    fn stop(&mut self) -> Result<()> {
-        let output = command("systemctl", &["stop", UNIT])?;
-        if !output.status.success() { return Err(refused(format!("無法停止 {UNIT}。"))); }
+    fn stop(&mut self, unit: &str, deadline: Instant) -> Result<()> {
+        let output = command_until("systemctl", &["stop", unit], deadline)?;
+        if !output.status.success() { return Err(refused(format!("無法停止 {unit}。"))); }
         Ok(())
     }
-    fn account_has_processes(&mut self) -> Result<bool> {
-        let Some(gateway) = passwd_entry("duduclaw")? else { return Ok(false) };
+    fn gateway_account_busy(&mut self, deadline: Instant) -> Result<bool> {
+        let output = command_until("getent", &["passwd", "duduclaw"], deadline)?;
+        let Some(gateway) = passwd_from("duduclaw", output)? else { return Ok(false) };
         uid_processes(|uid| uid == gateway.uid)
     }
-    fn pause(&mut self) { std::thread::sleep(Duration::from_millis(250)); }
+    fn processes_clear(&mut self) -> Result<()> { super::removal::processes_clear() }
+    fn pause(&mut self, pause: Duration) { std::thread::sleep(pause); }
 }
 
 /// Any live process with a real, effective, saved or filesystem uid `matches` accepts.
@@ -1006,6 +1135,12 @@ fn uid_processes(matches: impl Fn(u32) -> bool) -> Result<bool> {
 /// of DuDuClaw may run (`processes_clear`). From S6 on, those services are
 /// this transaction's own (S6's invariants check them); the gateway account
 /// and the employee range must still have no process.
+///
+/// Review R3 item 1: the narrowed (post-S6) variant is used ONLY while nothing
+/// in S4–S7 re-runs — the S3 invariant of a pure S8/S9 resume. Before any
+/// S4–S7 re-run the services are stopped and the full `processes_clear` runs
+/// (`quiesce_isolation`), and `Live` then passes `services_started: false`
+/// until S6 has started them again.
 fn processes_quiet(services_started: bool) -> Result<()> {
     if !services_started { return super::removal::processes_clear(); }
     let gateway = passwd_entry("duduclaw")?.map(|entry| entry.uid);
@@ -1155,6 +1290,12 @@ pub(super) enum NssProblem {
     Unknown(String),
     /// An unterminated `[ … ]` action item.
     Malformed,
+    /// Review R3 item 3: an account database line (or the `*_compat` line
+    /// `compat` reads) given more than once.
+    Duplicate(String),
+    /// Review R3 item 3: `compat` without its `*_compat` line (glibc's default
+    /// there is NIS) or with one that lists nothing; names that line.
+    CompatUnbounded(String),
 }
 
 /// Account sources the installer classifies as local.
@@ -1185,22 +1326,32 @@ fn nss_line(line: &str) -> std::result::Result<Option<(&str, Vec<&str>)>, NssPro
 /// and `initgroups` databases. `files` and `systemd` are local; the external
 /// sources the code names refuse as before; `compat` is local only when the
 /// corresponding `passwd_compat` / `group_compat` / `shadow_compat` line is
-/// absent or lists only `files`; every other source refuses by name.
+/// PRESENT exactly once and lists only `files` (review R3 item 3: an absent
+/// one means NIS to glibc); every other source refuses by name. A database
+/// line of `passwd`, `group`, `shadow` or `initgroups` given twice refuses.
 pub(super) fn nss_verdict(nsswitch: &str) -> std::result::Result<(), NssProblem> {
     let mut lines = Vec::new();
     for line in nsswitch.lines() {
         if let Some(parsed) = nss_line(line.split('#').next().unwrap_or(""))? { lines.push(parsed); }
     }
+    for database in ["passwd", "group", "shadow", "initgroups"] {
+        if lines.iter().filter(|(line, _)| *line == database).count() > 1 {
+            return Err(NssProblem::Duplicate(database.to_owned()));
+        }
+    }
     // What `compat` reads besides the local file: the `<database>_compat` line.
     let compat_reads = |database: &str| -> std::result::Result<(), NssProblem> {
         let name = format!("{database}_compat");
-        for (_, sources) in lines.iter().filter(|(line, _)| *line == name) {
-            if sources.is_empty() { return Err(NssProblem::Unknown("compat".into())); }
-            for source in sources {
-                if *source == "files" { continue; }
-                if NSS_EXTERNAL.contains(source) { return Err(NssProblem::External); }
-                return Err(NssProblem::Unknown((*source).to_owned()));
-            }
+        let matching: Vec<&Vec<&str>> = lines.iter().filter(|(line, _)| *line == name).map(|(_, sources)| sources).collect();
+        let sources = match matching.as_slice() {
+            [sources] if !sources.is_empty() => *sources,
+            [] | [_] => return Err(NssProblem::CompatUnbounded(name)),
+            _ => return Err(NssProblem::Duplicate(name)),
+        };
+        for source in sources {
+            if *source == "files" { continue; }
+            if NSS_EXTERNAL.contains(source) { return Err(NssProblem::External); }
+            return Err(NssProblem::Unknown((*source).to_owned()));
         }
         Ok(())
     };
@@ -1351,6 +1502,12 @@ fn preflight(upstream: Option<SocketAddr>, hosts: &[IpAddr], stage: &StageReceip
         duduclaw_egress::daemon::BROKER_CONFIG_PATH, NIGHTLY_HELPER].iter().any(|path| foreign(*path)) {
         fail("這台主機有先前安裝留下的設定檔（/etc/duduclaw 或自動更新程式）；請先確認並移除後再安裝。");
     }
+    // Review R3 item 5: a rollback quarantine directory no ledger of this transaction explains.
+    match super::rollback::unexplained_quarantines(ours) {
+        Ok(found) if found.is_empty() => (),
+        Ok(found) => fail(&format!("這台主機有先前回退留下、沒有安裝建立紀錄可說明的隔離目錄（{}）；裡面可能仍有完整的檔案或目錄樹。請先確認內容並處理後再安裝。", found.join("、"))),
+        Err(_) => fail("無法檢查先前回退留下的隔離目錄（.duduclaw-rollback-*）。"),
+    }
     // After S8 the gateway writes its own data; its snapshot is in the ledger.
     let snapshot = ours.is_some_and(|recorded| recorded.entry(ledger::GATEWAY_DATA_PATH).is_some());
     if !snapshot && !gateway_home_clear().unwrap_or(false) {
@@ -1452,8 +1609,12 @@ fn nss_clear() -> std::result::Result<(), String> {
         Err(NssProblem::External) =>
             Err("偵測到外部帳號服務（LDAP／SSSD 等）。本版安裝程式不支援這類主機：外部帳號服務必須先永久保留員工 uid 範圍 70000–99999，並由原廠協助確認。".into()),
         Err(NssProblem::Unknown(source)) => Err(format!(
-            "/etc/nsswitch.conf 的帳號資料庫（passwd、group、shadow、initgroups）使用了安裝程式無法判定的來源「{source}」；只接受 files、systemd，以及對應 *_compat 設定不存在或只有 files 的 compat。請先移除該來源，或聯絡原廠確認。")),
+            "/etc/nsswitch.conf 的帳號資料庫（passwd、group、shadow、initgroups）使用了安裝程式無法判定的來源「{source}」；只接受 files、systemd，以及對應 *_compat 設定剛好一行且只列出 files 的 compat。請先移除該來源，或聯絡原廠確認。")),
         Err(NssProblem::Malformed) => Err("/etc/nsswitch.conf 的動作設定（[ … ]）格式不完整，無法判定帳號資料來源。".into()),
+        Err(NssProblem::Duplicate(line)) => Err(format!(
+            "/etc/nsswitch.conf 的「{line}:」設定出現不只一次，無法判定實際使用的帳號資料來源；請只保留一行。")),
+        Err(NssProblem::CompatUnbounded(line)) => Err(format!(
+            "/etc/nsswitch.conf 的帳號資料庫使用 compat，但沒有剛好一行只列出 files 的「{line}:」設定（未設定時 glibc 會改向 NIS 查詢）。請加上一行「{line}: files」，或改用 files。")),
     }
 }
 
@@ -1762,11 +1923,22 @@ fn publish_platform(context: &mut Context) -> Result<()> {
     // update.lock itself (see LOCK ORDER above). Re-entrant. The trees it
     // creates are ledgered first (review F4).
     let stage = &context.stage;
+    let state_root = duduclaw_updated::linux::STATE_ROOT;
     let digest = context.recorder.record(&TRUST_TREES.map(|tree| (tree, Kind::Tree)), || {
+        // Review R3 item 4: the trees publish uses as it finds them (same
+        // owner and mode) are created here first, so this installer's own
+        // descriptors prove their creation. The state root is created only by
+        // publish, under its locks (R1): recorded below by component proof.
+        for (tree, mode) in duduclaw_updated::linux::trust_init::UPDATE_DIRECTORIES {
+            if TRUST_TREES.contains(tree) && *tree != state_root { ensure_directory(tree, *mode)?; }
+        }
         duduclaw_updated::linux::trust_init::publish(stage)
             .map_err(|error| refused(format!("無法發布更新信任根與世代（{:?}）。", error.code())))
     })?;
     if digest != context.generation { return Err(refused(STAGE_UNVERIFIED)); }
+    // Recorded only after publish succeeded for this generation, as the
+    // root-owned private directory on its parent's mount publish leaves.
+    context.recorder.confirm_component(state_root, |identity| component_object(state_root, identity, libc::S_IFDIR, true))?;
     let manifest = readiness::authenticated_manifest(digest)?;
     let version = duduclaw_updated::version_text(manifest.version);
     if manifest.artifacts != context.stage.artifacts || version != duduclaw_gateway::updater::current_version() {
@@ -1908,7 +2080,11 @@ pub(super) struct PasswdEntry { pub(super) uid: u32, pub(super) gid: u32, home: 
 
 /// `getent passwd <name>`: `Ok(None)` only for "not found" (exit 2).
 pub(super) fn passwd_entry(name: &str) -> Result<Option<PasswdEntry>> {
-    let output = command("getent", &["passwd", name])?;
+    passwd_from(name, command("getent", &["passwd", name])?)
+}
+
+/// The answer of `getent passwd <name>` (`output`), parsed as [`passwd_entry`] does.
+fn passwd_from(name: &str, output: Output) -> Result<Option<PasswdEntry>> {
     match output.status.code() {
         Some(2) => return Ok(None),
         Some(0) => (),
@@ -2357,6 +2533,25 @@ fn require_installation_receipt() -> Result<()> {
     }
 }
 
+/// Review R3 item 4 (pure): `systemctl show <socket> --property=Listen` names a
+/// socket path directly inside `directory`.
+pub(super) fn listens_in(output: &[u8], directory: &str) -> bool {
+    let Ok(text) = std::str::from_utf8(output) else { return false };
+    text.lines().filter_map(|line| line.strip_prefix("Listen=")).any(|value| value.split_once(' ')
+        .is_some_and(|(path, _)| Path::new(path).is_absolute() && Path::new(path).parent() == Some(Path::new(directory))))
+}
+
+/// Review R3 item 4: an object another component created, as far as the
+/// installer can prove it: root:root, of `file_type`, without group/other
+/// bits when `private`, and on its parent directory's mount (not a mount
+/// point of its own).
+fn component_object(path: &str, identity: &ledger::Identity, file_type: u32, private: bool) -> Result<bool> {
+    let (directory, _) = ledger::open_parent(path)?;
+    let parent = ledger::stat_at(directory.as_raw_fd(), c"")?.mount_id;
+    Ok(identity.uid == 0 && identity.gid == 0 && identity.mode & libc::S_IFMT == file_type
+        && (!private || identity.mode & 0o077 == 0) && parent == Some(identity.mount_id))
+}
+
 /// The units S6 starts, in order (the broker socket only on the broker route).
 fn started_units(dns: &Dns) -> Vec<&'static str> {
     SERVICE_ORDER.iter().copied()
@@ -2407,9 +2602,16 @@ fn start_services(context: &mut Context, dns: &Dns) -> Result<()> {
         }
         Ok(())
     })();
-    // Review H3: the identity is recorded even when a later unit failed, so a
-    // resume never finds this transaction's runtime directory without one.
-    context.recorder.confirm(&[SPAWND_RUNTIME])?;
+    // Review R3 item 4: systemd created it, not this installer. Recorded (also
+    // when a later unit failed) only when it is root-owned, on its parent's
+    // mount, and PID 1 reports this install's ledgered, unmodified socket unit
+    // as listening in it; otherwise it stays unconfirmed (never adopted).
+    let owner = live_unit_is_ours(context.recorder.ledger(), SPAWND_RUNTIME_OWNER, Instant::now() + QUIESCE_COMMAND_CAP)
+        && command("systemctl", &["show", SPAWND_RUNTIME_OWNER, "--property=Listen"]).ok()
+            .filter(|output| output.status.success())
+            .is_some_and(|output| listens_in(&output.stdout, SPAWND_RUNTIME));
+    context.recorder.confirm_component(SPAWND_RUNTIME,
+        |identity| Ok(owner && component_object(SPAWND_RUNTIME, identity, libc::S_IFDIR, false)?))?;
     started?;
     // Q11: the nightly update requester is enabled after install.
     enable_now(NIGHTLY_TIMER)
@@ -2518,12 +2720,13 @@ fn gateway_published(context: &Context) -> Result<()> {
 fn start_gateway(context: &mut Context) -> Result<()> {
     let text = duduclaw_core::root_key::recovery::isolated_unit_text();
     let recorder = &mut context.recorder;
-    recorder.intend(&[(UNIT_PATH, Kind::File), (RECOVERY_BOUND, Kind::File), (LAUNCHER, Kind::File)])?;
-    invalidate_recovery_bound()?;
-    update_text_if_different(UNIT_PATH, 0o644, &text)?;
-    update_text_if_different(LAUNCHER, 0o755, LAUNCHER_TEXT)?;
-    reload_and_certify_recovery_text(&text)?;
-    recorder.confirm(&[UNIT_PATH, RECOVERY_BOUND, LAUNCHER])?;
+    // Review R3 item 4: recorded only as the files these writes prove they created.
+    recorder.record(&[(UNIT_PATH, Kind::File), (RECOVERY_BOUND, Kind::File), (LAUNCHER, Kind::File)], || {
+        invalidate_recovery_bound()?;
+        update_text_if_different(UNIT_PATH, 0o644, &text)?;
+        update_text_if_different(LAUNCHER, 0o755, LAUNCHER_TEXT)?;
+        reload_and_certify_recovery_text(&text)
+    })?;
     // Review F4: before the gateway can first start, the names its data
     // directory holds (the license) are recorded; rollback keeps exactly those.
     let gateway = passwd_entry("duduclaw")?.ok_or_else(|| refused("無法查詢服務帳號。"))?;
@@ -2540,7 +2743,13 @@ fn start_gateway(context: &mut Context) -> Result<()> {
         let output = command("systemctl", &["start", UNIT])?;
         if !output.status.success() { return Err(refused(format!("無法啟動 {UNIT}。"))); }
         let started = wait_for(Duration::from_secs(60), || readiness::unit_loaded_active(UNIT).is_ok());
-        context.recorder.confirm(&[duduclaw_core::root_key::KEY_PATH])?;
+        // Review R3 item 4: the gateway's launcher created it, not this
+        // installer: recorded only as a root-owned private regular file on the
+        // protected root's mount while PID 1 loads this install's ledgered,
+        // unmodified gateway unit; otherwise it stays unconfirmed.
+        let key = duduclaw_core::root_key::KEY_PATH;
+        let owner = live_unit_is_ours(context.recorder.ledger(), UNIT, Instant::now() + QUIESCE_COMMAND_CAP);
+        context.recorder.confirm_component(key, |identity| Ok(owner && component_object(key, identity, libc::S_IFREG, true)?))?;
         if !started { return Err(refused("Gateway 未在時限內進入執行狀態。")); }
         // The install reports success only when the full check passes.
         readiness::check(&mut readiness::InstalledComposite)?;
@@ -2763,14 +2972,27 @@ mod tests {
         assert_eq!(nss_verdict("passwd:         files systemd\ngroup:          files systemd\nshadow:         files\n\
 gshadow:        files\nhosts:          files mdns4_minimal [NOTFOUND=return] dns\nnetgroup:       nis\n"), Ok(()));
         // compat reads passwd_compat / group_compat / shadow_compat (e.g. NIS).
-        assert_eq!(nss_verdict("passwd: compat\n"), Ok(()), "no passwd_compat line");
+        // Review R3 item 3: absent means NIS to glibc — refused; exactly one `files` line is required.
+        assert_eq!(nss_verdict("passwd: compat\n"), Err(NssProblem::CompatUnbounded("passwd_compat".into())));
+        assert_eq!(nss_verdict("group: files\ninitgroups: compat\n"), Err(NssProblem::CompatUnbounded("group_compat".into())));
+        assert_eq!(nss_verdict("passwd: compat\npasswd_compat: files\npasswd_compat: files\n"),
+            Err(NssProblem::Duplicate("passwd_compat".into())));
+        assert_eq!(nss_verdict("passwd: compat\npasswd_compat: files\n# passwd_compat: nis\n"), Ok(()));
         assert_eq!(nss_verdict("passwd: compat\npasswd_compat: files\n"), Ok(()));
+        assert_eq!(nss_verdict("passwd: compat\ngroup: compat\nshadow: compat\npasswd_compat: files\ngroup_compat: files\nshadow_compat: files\n"), Ok(()));
         assert_eq!(nss_verdict("passwd: compat\npasswd_compat: nis\n"), Err(NssProblem::External));
         assert_eq!(nss_verdict("passwd: compat\npasswd_compat: files nis\n"), Err(NssProblem::External));
         assert_eq!(nss_verdict("group: files\ninitgroups: compat\ngroup_compat: nis\n"), Err(NssProblem::External));
         assert_eq!(nss_verdict("shadow: compat\nshadow_compat: sss\n"), Err(NssProblem::External));
         assert_eq!(nss_verdict("passwd: compat\npasswd_compat: extrausers\n"), Err(NssProblem::Unknown("extrausers".into())));
-        assert_eq!(nss_verdict("passwd: compat\npasswd_compat:\n"), Err(NssProblem::Unknown("compat".into())));
+        assert_eq!(nss_verdict("passwd: compat\npasswd_compat:\n"), Err(NssProblem::CompatUnbounded("passwd_compat".into())));
+        // Review R3 item 3: an account database given twice refuses (which line wins is not ours to guess).
+        assert_eq!(nss_verdict("passwd: files\npasswd: files ldap\n"), Err(NssProblem::Duplicate("passwd".into())));
+        assert_eq!(nss_verdict("passwd: files\npasswd:   files\n"), Err(NssProblem::Duplicate("passwd".into())));
+        for database in ["group", "shadow", "initgroups"] {
+            assert_eq!(nss_verdict(&format!("{database}: files\n{database}: files\n")), Err(NssProblem::Duplicate(database.into())));
+        }
+        assert_eq!(nss_verdict("hosts: files\nhosts: dns\n"), Ok(()), "not an account database");
         // A *_compat line of a database not using compat changes nothing.
         assert_eq!(nss_verdict("passwd: files\npasswd_compat: nis\n"), Ok(()));
         // Any source the installer does not classify refuses by name (never treated as local).
@@ -2788,25 +3010,84 @@ gshadow:        files\nhosts:          files mdns4_minimal [NOTFOUND=return] dns
         assert_eq!(nss_verdict("hosts: files resolve [!UNAVAIL=return] dns myhostname\n"), Ok(()));
     }
 
-    /// Review H2: a scripted gateway; every effect is appended to the shared log.
-    #[derive(Default)]
-    struct FakeGateway { up: bool, ours: bool, stuck: bool, processes: bool, log: Vec<String> }
+    /// Review H2 / R3 items 1, 2, 6: scripted units on a fake clock; every
+    /// effect is appended to the shared log.
+    struct FakeUnits {
+        /// Units that are up.
+        up: Vec<&'static str>,
+        /// Units whose unit file is not provably this install's.
+        foreign: Vec<&'static str>,
+        /// Units a stop does not bring down.
+        stuck: Vec<&'static str>,
+        /// A process of the gateway account remains (gone when the gateway stops).
+        gateway_processes: bool,
+        /// The full S3 check finds an isolation-account or root-from-install-path process.
+        leftover: bool,
+        start: Instant,
+        clock: Instant,
+        /// What every command costs on the fake clock (bounded by the deadline, as `command_within` is).
+        cost: Duration,
+        /// Commands that were started at or after their deadline (must stay 0).
+        late: u32,
+        commands: u32,
+        log: Vec<String>,
+    }
 
-    impl GatewayControl for FakeGateway {
-        fn state(&mut self) -> Result<(bool, bool)> { Ok((!self.up, false)) }
-        fn unit_is_ours(&mut self) -> Result<bool> { Ok(self.ours) }
-        fn stop(&mut self) -> Result<()> {
-            self.log.push("stop gateway".into());
-            if !self.stuck { self.up = false; self.processes = false; }
+    impl Default for FakeUnits {
+        fn default() -> Self {
+            let now = Instant::now();
+            Self { up: Vec::new(), foreign: Vec::new(), stuck: Vec::new(), gateway_processes: false, leftover: false,
+                start: now, clock: now, cost: Duration::from_millis(5), late: 0, commands: 0, log: Vec::new() }
+        }
+    }
+
+    impl FakeUnits {
+        fn running() -> Self {
+            Self { up: vec![UNIT, NIGHTLY_TIMER, "duduclaw-egress.socket", "duduclaw-spawnd.socket", "duduclaw-spawnd.service",
+                "duduclaw-egress.service", "duduclaw-updated.service"], gateway_processes: true, ..Self::default() }
+        }
+        fn command(&mut self, deadline: Instant) {
+            self.commands += 1;
+            match command_budget(self.clock, deadline) {
+                Some(limit) => self.clock += self.cost.min(limit),
+                None => self.late += 1,
+            }
+        }
+    }
+
+    impl UnitControl for FakeUnits {
+        fn now(&mut self) -> Instant { self.clock }
+        fn state(&mut self, unit: &str, deadline: Instant) -> Result<(bool, bool)> {
+            self.command(deadline);
+            Ok((!self.up.iter().any(|up| *up == unit), false))
+        }
+        fn unit_is_ours(&mut self, unit: &str, deadline: Instant) -> Result<bool> {
+            self.command(deadline);
+            Ok(!self.foreign.iter().any(|foreign| *foreign == unit))
+        }
+        fn stop(&mut self, unit: &str, deadline: Instant) -> Result<()> {
+            self.command(deadline);
+            self.log.push(format!("stop {unit}"));
+            if !self.stuck.iter().any(|stuck| *stuck == unit) {
+                self.up.retain(|up| *up != unit);
+                if unit == UNIT { self.gateway_processes = false; }
+            }
             Ok(())
         }
-        fn account_has_processes(&mut self) -> Result<bool> { Ok(self.processes) }
-        fn pause(&mut self) {}
+        fn gateway_account_busy(&mut self, deadline: Instant) -> Result<bool> {
+            self.command(deadline);
+            Ok(self.gateway_processes)
+        }
+        fn processes_clear(&mut self) -> Result<()> {
+            self.log.push("processes_clear".into());
+            if self.leftover { Err(refused("仍有隔離元件正在執行")) } else { Ok(()) }
+        }
+        fn pause(&mut self, pause: Duration) { self.clock += pause; }
     }
 
     /// A host whose step invariants are scripted (review F1).
     #[derive(Default)]
-    struct ScriptedHost { broken: Vec<Step>, refuse: Vec<Step>, performed: Vec<Step>, gateway: FakeGateway }
+    struct ScriptedHost { broken: Vec<Step>, refuse: Vec<Step>, performed: Vec<Step>, units: FakeUnits }
 
     impl Steps for ScriptedHost {
         fn holds(&mut self, step: Step) -> Result<bool> { Ok(!self.broken.contains(&step)) }
@@ -2814,59 +3095,149 @@ gshadow:        files\nhosts:          files mdns4_minimal [NOTFOUND=return] dns
             if self.refuse.contains(&step) { return Err(refused("refused")); }
             self.broken.retain(|broken| *broken != step);
             self.performed.push(step);
-            self.gateway.log.push(format!("perform {step:?}"));
+            self.units.log.push(format!("perform {step:?}"));
             Ok(())
         }
-        fn quiesce_gateway(&mut self) -> Result<()> { quiesce_gateway(&mut self.gateway, 3) }
-        fn quiet(&mut self, step: Step) -> Result<bool> {
-            Ok(match step {
-                Step::StopGateway => !self.gateway.up,
-                Step::ProcessesClear => !self.gateway.processes,
-                _ => false,
-            })
+        fn quiesce(&mut self) -> Result<()> {
+            quiesce_isolation(&mut self.units, &super::super::rollback::stop_order(), QUIESCE_WAIT)
         }
     }
 
+    /// The stop effects of `units` (those up), in the installation's stop order.
+    fn stops(up: &[&str]) -> Vec<String> {
+        super::super::rollback::stop_order().into_iter().filter(|unit| up.contains(unit)).map(|unit| format!("stop {unit}")).collect()
+    }
+
     #[test]
-    fn resume_quiesces_published_gateway_before_platform_steps() {
+    fn resume_stops_every_owned_unit_before_rerunning_platform_steps() {
         let forged = journal().at(Step::StartGateway, Phase::Completed);
-        // S8's gateway runs as published (S2/S3 hold through it); S5 no longer holds.
-        let running = || FakeGateway { up: true, ours: true, processes: true, ..Default::default() };
-        let mut host = ScriptedHost { broken: vec![Step::DnsPolicy], gateway: running(), ..Default::default() };
+        // S8's gateway and S6's services run as published (S2/S3 hold through them); S5 no longer holds.
+        let mut host = ScriptedHost { broken: vec![Step::DnsPolicy], units: FakeUnits::running(), ..Default::default() };
+        let up = host.units.up.clone();
         let mut position = forged.clone();
         let (result, writes) = drive_scripted(&mut position, &mut host);
         result.unwrap();
-        // The gateway is stopped FIRST; then S5..S8 re-run (S8's completion no longer trusted), then the commit.
-        assert_eq!(host.gateway.log, ["stop gateway", "perform DnsPolicy", "perform StartServices", "perform Readiness",
-            "perform StartGateway", "perform Commit"]);
+        // Every owned unit is stopped FIRST (gateway first, sockets before
+        // services), then the FULL process check, then S5..S8 re-run, then the commit.
+        let mut expected = stops(&up);
+        assert_eq!(expected.first().map(String::as_str), Some("stop duduclaw-gateway.service"));
+        assert_eq!(expected.len(), up.len());
+        expected.extend(["processes_clear", "perform DnsPolicy", "perform StartServices", "perform Readiness",
+            "perform StartGateway", "perform Commit"].map(String::from));
+        assert_eq!(host.units.log, expected);
         assert_eq!(writes, vec![(Step::Commit, Phase::Entered), (Step::Commit, Phase::Completed)]);
-        // The unit is not the ledgered one this install published: refused before any effect.
-        let mut host = ScriptedHost { broken: vec![Step::PublishPlatform],
-            gateway: FakeGateway { ours: false, ..running() }, ..Default::default() };
-        let mut position = forged.clone();
-        let (result, writes) = drive_scripted(&mut position, &mut host);
-        let error = result.unwrap_err().to_string();
-        assert!(error.contains("手動停止"), "{error}");
-        assert!(host.gateway.log.is_empty() && host.performed.is_empty() && writes.is_empty() && position == forged);
-        // Stopped but never confirmed down (or the account keeps a process): refused, nothing re-run.
-        for gateway in [FakeGateway { stuck: true, ..running() }, FakeGateway { up: false, processes: true, ..running() }] {
-            let mut host = ScriptedHost { broken: vec![Step::Readiness], gateway, ..Default::default() };
-            let mut position = forged.clone();
-            let (result, writes) = drive_scripted(&mut position, &mut host);
-            assert!(result.is_err());
-            assert!(host.performed.is_empty() && writes.is_empty() && !position.committed);
-        }
-        // Only S8 fails: no platform step re-runs, so the gateway is not stopped here.
-        let mut host = ScriptedHost { broken: vec![Step::StartGateway], gateway: running(), ..Default::default() };
+        assert_eq!(host.units.late, 0);
+        // A re-run that starts at S2 or S3 but reaches S4–S7 quiesces too.
+        let mut host = ScriptedHost { broken: vec![Step::ProcessesClear], units: FakeUnits::running(), ..Default::default() };
         let mut position = forged.clone();
         drive_scripted(&mut position, &mut host).0.unwrap();
-        assert_eq!(host.gateway.log, ["perform StartGateway", "perform Commit"]);
-        // A gateway already down is not stopped (nothing to prove about its unit).
+        assert_eq!(host.units.log.iter().position(|line| line == "processes_clear"), Some(up.len()));
+        assert_eq!(host.units.log.get(up.len() + 1).map(String::as_str), Some("perform ProcessesClear"));
+        // Units already down are not stopped (nothing to prove about their files).
         let mut host = ScriptedHost { broken: vec![Step::StartServices],
-            gateway: FakeGateway { ours: false, ..Default::default() }, ..Default::default() };
+            units: FakeUnits { foreign: stop_order_all(), ..Default::default() }, ..Default::default() };
         let mut position = forged;
         drive_scripted(&mut position, &mut host).0.unwrap();
-        assert_eq!(host.gateway.log.first().map(String::as_str), Some("perform StartServices"));
+        assert_eq!(host.units.log.first().map(String::as_str), Some("processes_clear"));
+        assert_eq!(host.units.log.get(1).map(String::as_str), Some("perform StartServices"));
+    }
+
+    fn stop_order_all() -> Vec<&'static str> { super::super::rollback::stop_order() }
+
+    #[test]
+    fn resume_refuses_unless_every_owned_unit_is_down_and_no_process_remains() {
+        let forged = journal().at(Step::StartGateway, Phase::Completed);
+        let refused_with = |units: FakeUnits, broken: Step| {
+            let mut host = ScriptedHost { broken: vec![broken], units, ..Default::default() };
+            let mut position = forged.clone();
+            let (result, writes) = drive_scripted(&mut position, &mut host);
+            assert!(host.performed.is_empty() && writes.is_empty() && position == forged && !position.committed);
+            assert_eq!(host.units.late, 0, "nothing spawned after the deadline");
+            (result.unwrap_err().to_string(), host.units)
+        };
+        // A unit that is up but not provably ours (the gateway or an isolation
+        // service): refused by name before any effect.
+        for unit in [UNIT, "duduclaw-egress.service"] {
+            let (error, units) = refused_with(FakeUnits { foreign: vec![unit], ..FakeUnits::running() }, Step::PublishPlatform);
+            assert!(error.contains(unit) && error.contains("手動停止"), "{error}");
+            assert!(units.log.is_empty(), "{:?}", units.log);
+        }
+        // An owned unit that stays active: refused by name after the one deadline; no process check, nothing re-run.
+        let (error, units) = refused_with(FakeUnits { stuck: vec!["duduclaw-spawnd.service"], ..FakeUnits::running() }, Step::Readiness);
+        assert!(error.contains("duduclaw-spawnd.service"), "{error}");
+        assert!(!units.log.iter().any(|line| line == "processes_clear"));
+        assert!(units.clock.duration_since(units.start) <= QUIESCE_WAIT);
+        // The gateway account keeps a process: refused naming the account.
+        let (error, _) = refused_with(FakeUnits { gateway_processes: true, ..Default::default() }, Step::DnsPolicy);
+        assert!(error.contains("duduclaw（Gateway）帳號"), "{error}");
+        // An isolation-account or root-from-install-path process remains: the full check refuses.
+        let (error, units) = refused_with(FakeUnits { leftover: true, ..FakeUnits::running() }, Step::StartServices);
+        assert!(error.contains("服務帳號") && error.contains("隔離安裝路徑"), "{error}");
+        assert_eq!(units.log.last().map(String::as_str), Some("processes_clear"));
+    }
+
+    #[test]
+    fn pure_s8_resume_leaves_isolation_services_running() {
+        let forged = journal().at(Step::StartGateway, Phase::Completed);
+        let mut host = ScriptedHost { broken: vec![Step::StartGateway], units: FakeUnits::running(), ..Default::default() };
+        let mut position = forged;
+        drive_scripted(&mut position, &mut host).0.unwrap();
+        assert_eq!(host.units.log, ["perform StartGateway", "perform Commit"]);
+        assert_eq!(host.units.commands, 0);
+    }
+
+    #[test]
+    fn quiesce_deadline_is_one_strict_instant() {
+        let units = stop_order_all();
+        // Each command takes long on the fake clock: the whole quiesce still
+        // ends by the one deadline and nothing is spawned after it.
+        let mut slow = FakeUnits { cost: Duration::from_secs(7), ..FakeUnits::running() };
+        assert!(quiesce_isolation(&mut slow, &units, QUIESCE_WAIT).is_err());
+        assert_eq!(slow.late, 0);
+        assert!(slow.clock.duration_since(slow.start) <= QUIESCE_WAIT);
+        assert!(slow.commands <= 5, "{}", slow.commands);
+        // A unit that never goes down: polled until exactly the deadline, then refused by name.
+        let mut stuck = FakeUnits { stuck: vec!["duduclaw-updated.service"], cost: Duration::ZERO, ..FakeUnits::running() };
+        let error = quiesce_isolation(&mut stuck, &units, QUIESCE_WAIT).unwrap_err().to_string();
+        assert!(error.contains("duduclaw-updated.service"), "{error}");
+        assert_eq!(stuck.late, 0);
+        assert_eq!(stuck.clock.duration_since(stuck.start), QUIESCE_WAIT);
+        // Every command is given at most what is left (never the full cap near the end).
+        let start = Instant::now();
+        assert_eq!(command_budget(start, start + Duration::from_secs(90)), Some(QUIESCE_COMMAND_CAP));
+        assert_eq!(command_budget(start, start + Duration::from_millis(40)), Some(Duration::from_millis(40)));
+        assert_eq!(command_budget(start + Duration::from_secs(1), start), None);
+        assert_eq!(command_budget(start, start), None);
+    }
+
+    #[test]
+    fn unit_is_ours_only_for_the_ledgered_loaded_unmodified_unit() {
+        let unit = "duduclaw-egress.service";
+        let ours = "LoadState=loaded\nFragmentPath=/etc/systemd/system/duduclaw-egress.service\nDropInPaths=\nNeedDaemonReload=no\nTransient=no\n";
+        assert!(unit_show_is_ours(Some(ours.as_bytes()), unit));
+        for bad in [ours.replace("NeedDaemonReload=no", "NeedDaemonReload=yes"), ours.replace("Transient=no", "Transient=yes"),
+            ours.replace("LoadState=loaded", "LoadState=not-found"), ours.replace("LoadState=loaded", "LoadState=masked"),
+            ours.replace("DropInPaths=", "DropInPaths=/run/systemd/system/duduclaw-egress.service.d/x.conf"),
+            ours.replace("/etc/systemd/system/", "/usr/lib/systemd/system/"), ours.replace("Transient=no\n", ""),
+            format!("{ours}Transient=no\n"), String::new(), "garbage".into()] {
+            assert!(!unit_show_is_ours(Some(bad.as_bytes()), unit), "{bad}");
+        }
+        // Unreadable (a failed `systemctl show`) or not UTF-8: not ours.
+        assert!(!unit_show_is_ours(None, unit));
+        assert!(!unit_show_is_ours(Some(&[0xff_u8, 0xfe][..]), unit));
+        // Another unit's fragment is not this unit's.
+        assert!(!unit_show_is_ours(Some(ours.as_bytes()), "duduclaw-spawnd.service"));
+    }
+
+    #[test]
+    fn runtime_directory_owner_is_the_socket_listening_in_it() {
+        let listen = b"Listen=/run/duduclaw-spawnd/control.sock (SequentialPacket)\n";
+        assert!(listens_in(listen, SPAWND_RUNTIME));
+        assert!(!listens_in(b"Listen=/run/other/control.sock (SequentialPacket)\n", SPAWND_RUNTIME));
+        assert!(!listens_in(b"Listen=/run/duduclaw-spawnd/sub/control.sock (SequentialPacket)\n", SPAWND_RUNTIME));
+        assert!(!listens_in(b"Listen=\n", SPAWND_RUNTIME));
+        assert!(!listens_in(b"", SPAWND_RUNTIME));
+        assert!(!listens_in(&[0xff], SPAWND_RUNTIME));
     }
 
     #[test]

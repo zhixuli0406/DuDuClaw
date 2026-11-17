@@ -33,13 +33,25 @@
 //!
 //! Review M1: a ledgered object is never unlinked where it was checked. It is
 //! first moved (`renameat2(RENAME_NOREPLACE)`) into a fresh root-only (0700)
-//! quarantine directory with a random name in its own parent (same
-//! filesystem; a parent that is not root-owned or is writable by others
-//! refuses), its identity is verified again there by `statx`/fd with the same
-//! rules (mount id included), and only then is it removed inside the
-//! quarantine — a tree root likewise, then walked there with the mount-bounded
-//! logic. Anything that no longer matches is moved back (or, if that fails,
-//! left in the quarantine), kept, listed, and the rollback ends incomplete.
+//! quarantine directory in its own parent (same filesystem; a parent that is
+//! not root-owned or is writable by others refuses), its identity is verified
+//! again there by `statx`/fd with the same rules (mount id included), and only
+//! then is it removed inside the quarantine — a tree root likewise, then
+//! walked there with the mount-bounded logic. Anything that no longer matches
+//! is moved back (or, if that fails, left in the quarantine), kept, listed,
+//! and the rollback ends incomplete.
+//!
+//! Review R3 item 5: the quarantine is durable. Its name is deterministic per
+//! entry (`ledger::quarantine_name`: transaction nonce and entry index; still
+//! created with exclusive `mkdirat` 0700) and is written into the ledger entry
+//! with the phase `quarantining` BEFORE the directory is created and the
+//! object moved, then `removed` once the quarantine holds nothing of it. Every
+//! rollback start and every install resume first reconciles: a recorded
+//! quarantine directory that exists is finished (identity re-verified inside;
+//! removed when it is the recorded object, otherwise moved back without
+//! replacing, or kept and listed). The journal and the ledger are deleted only
+//! when no recorded quarantine directory remains, and S1 refuses a host with a
+//! quarantine directory no ledger explains.
 //!
 //! Review M3: objects under `/run` recorded in an earlier boot are never
 //! deleted (the boot cleared what this transaction created; whatever is there
@@ -51,7 +63,7 @@
 //! stage lock) → 2 (`version_lock`) → 3 (updater state, before its removal).
 use super::*;
 use super::bootstrap::{self as boot, Journal, Phase, Step, Store};
-use super::ledger::{self, Entry, Kind, Ledger, Now};
+use super::ledger::{self, Entry, Kind, Ledger, Now, QuarantinePhase};
 use std::{ffi::{CStr, CString}, os::fd::FromRawFd};
 use duduclaw_updated::linux::{bootstrap_verify, files::Directory};
 
@@ -87,13 +99,15 @@ static RUNTIME_OWNERS: [(&str, [&str; 2]); 1] =
     [(boot::SPAWND_RUNTIME, ["duduclaw-spawnd.socket", "duduclaw-spawnd.service"])];
 /// Owner of every parent a quarantine is created in (production: root).
 const ROOT_OWNER: u32 = 0;
-const QUARANTINE_PREFIX: &str = ".duduclaw-rollback-";
 
 #[cfg(test)]
 thread_local! {
     /// Unit-test seam: runs after the first identity check, before the move
     /// into the quarantine (a concurrent rename). Never set in production.
     static AFTER_FIRST_CHECK: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
+    /// Unit-test seam (review R3 item 5): stop right after the move into the
+    /// quarantine, as a power loss would. Never set in production.
+    static STOP_AFTER_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn unit_path(name: &str) -> String { format!("/etc/systemd/system/{name}") }
@@ -132,22 +146,23 @@ pub(super) fn run(store: &Store, journal: Option<Journal>, generation: Option<&s
     let _version = version_lock()?;
     // Without a ledger nothing was recorded as created, so nothing is removed.
     // A ledger of another transaction (generation or nonce) is refused (review H3).
-    let ledger = ledger::read(store)?.unwrap_or_else(|| Ledger::new(&journal.generation, &journal.nonce));
+    let mut ledger = ledger::read(store)?.unwrap_or_else(|| Ledger::new(&journal.generation, &journal.nonce));
     ledger::belongs_to(&ledger, &journal.generation, &journal.nonce)?;
+    let boot_id = ledger::boot_id()?;
+    // Review R3 item 5: an interrupted quarantine is finished before anything else.
+    let mut kept: Vec<String> = reconcile(store, &mut ledger, &boot_id)?;
     let journal = if journal.step == Step::Rollback { journal } else {
         let marked = journal.at(Step::Rollback, Phase::Entered);
         store.write(Some(&journal), &marked)?;
         marked
     };
     println!("正在回退尚未完成的隔離安裝……");
-    let boot_id = ledger::boot_id()?;
     stop_units(&ledger, &boot_id)?;
     removal::processes_clear()?;
-    let mut kept: Vec<String> = Vec::new();
     // Review M3: runtime directories of an earlier boot, left to the system.
     let mut left: Vec<String> = Vec::new();
-    for entry in ledger.entries.iter().filter(|entry| entry.kind == Kind::File) {
-        if let Removal::Kept(path) = remove_ledgered(entry, &boot_id)? { kept.push(path); }
+    for index in indices(&ledger, Kind::File) {
+        if let Removal::Kept(path) = remove_indexed(store, &mut ledger, index, &boot_id)? { kept.push(path); }
     }
     let reload = command("systemctl", &["daemon-reload"])?;
     if !reload.status.success() { return Err(refused("systemd 指令失敗或回應無法判讀。")); }
@@ -161,8 +176,9 @@ pub(super) fn run(store: &Store, journal: Option<Journal>, generation: Option<&s
             Err(duduclaw_updated::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(_) => return Err(refused("更新服務的狀態目錄不是 root 擁有的安全目錄，已停止回退。")),
         };
-        for entry in ledger.entries.iter().filter(|entry| entry.kind == Kind::Tree) {
-            if from_earlier_boot(entry, &boot_id) {
+        for index in indices(&ledger, Kind::Tree) {
+            let entry = ledger.entries.get(index).cloned().ok_or_else(|| refused(ledger::LEDGER_DAMAGED))?;
+            if from_earlier_boot(&entry, &boot_id) {
                 // Review M3: never deleted; left to the system once its units are gone.
                 let mut owners_removed = runtime_owners(&entry.path).is_some();
                 for unit in runtime_owners(&entry.path).unwrap_or_default() {
@@ -171,19 +187,27 @@ pub(super) fn run(store: &Store, journal: Option<Journal>, generation: Option<&s
                 if owners_removed { left.push(entry.path.clone()); } else { kept.push(entry.path.clone()); }
                 continue;
             }
-            if let Removal::Kept(path) = remove_tree_entry(entry, &boot_id, &kept)? { kept.push(path); }
+            // A kept object lies below it: the tree stays.
+            if kept.iter().any(|path| path.strip_prefix(entry.path.as_str()).is_some_and(|rest| rest.starts_with('/'))) {
+                kept.push(entry.path.clone());
+                continue;
+            }
+            if let Removal::Kept(path) = remove_indexed(store, &mut ledger, index, &boot_id)? { kept.push(path); }
         }
     }
     // Deepest first, so a ledgered parent is empty once its ledgered children are gone.
-    let mut directories: Vec<&Entry> = ledger.entries.iter().filter(|entry| entry.kind == Kind::Directory).collect();
-    directories.sort_by_key(|entry| std::cmp::Reverse(Path::new(&entry.path).components().count()));
-    for entry in directories {
-        if let Removal::Kept(path) = remove_ledgered(entry, &boot_id)? { kept.push(path); }
+    let mut directories = indices(&ledger, Kind::Directory);
+    directories.sort_by_key(|index| std::cmp::Reverse(ledger.entries.get(*index)
+        .map_or(0, |entry| Path::new(&entry.path).components().count())));
+    for index in directories {
+        if let Removal::Kept(path) = remove_indexed(store, &mut ledger, index, &boot_id)? { kept.push(path); }
     }
     let remaining = remaining_facts(|fact| fs::symlink_metadata(fact).map(|_| true)
         .unwrap_or_else(|error| error.kind() != std::io::ErrorKind::NotFound), &left);
     report_left(&left);
     finish(&kept, &remaining)?;
+    // Review R3 item 5: never delete the records while a quarantine directory remains.
+    records_deletable(&outstanding_quarantines(&ledger)?)?;
     remove_stage(&journal.generation)?;
     ledger::remove(store)?;
     store.remove()?;
@@ -258,6 +282,11 @@ fn owned_unit(ledger: &Ledger, unit: &str, boot_id: &str) -> Result<bool> {
     }
 }
 
+/// Review R3 item 1: every unit this installation may own, in stop order
+/// (the gateway, the units it binds to, the nightly requester, every socket
+/// before the services, the employees' slice) — also the bootstrap's resume quiesce.
+pub(super) fn stop_order() -> Vec<&'static str> { with_ready_units(&STOP_ORDER) }
+
 fn with_ready_units(units: &[&'static str]) -> Vec<&'static str> {
     // The units the gateway binds to stop right after it (none in this tree).
     let mut ordered = vec![UNIT];
@@ -306,19 +335,134 @@ pub(super) enum Removal {
     Kept(String),
 }
 
-/// A ledgered file, directory or tree by its fixed path.
-fn remove_ledgered(entry: &Entry, boot_id: &str) -> Result<Removal> {
-    if !ledger::present(&entry.path)? { return Ok(Removal::Absent); }
-    let (parent, name) = ledger::open_parent(&entry.path)?;
-    remove_ledgered_at(&parent, &name, entry, boot_id, ROOT_OWNER)
+/// The indices of the ledger's entries of `kind`, in ledger order.
+fn indices(ledger: &Ledger, kind: Kind) -> Vec<usize> {
+    ledger.entries.iter().enumerate().filter(|(_, entry)| entry.kind == kind).map(|(index, _)| index).collect()
 }
 
-/// A ledgered tree, unless a kept object lies below it.
-fn remove_tree_entry(entry: &Entry, boot_id: &str, kept: &[String]) -> Result<Removal> {
-    if kept.iter().any(|path| path.strip_prefix(entry.path.as_str()).is_some_and(|rest| rest.starts_with('/'))) {
-        return Ok(Removal::Kept(entry.path.clone()));
+/// Review R3 item 5: durably record the quarantine phase of entry `index`
+/// (its deterministic name included) in the ledger, read back.
+fn set_quarantine(store: &Store, ledger: &mut Ledger, index: usize, phase: QuarantinePhase) -> Result<()> {
+    let name = ledger::quarantine_name(&ledger.nonce, index);
+    let entry = ledger.entries.get_mut(index).ok_or_else(|| refused(ledger::LEDGER_DAMAGED))?;
+    entry.quarantine = Some(ledger::QuarantineRecord { name, phase });
+    ledger::write(store, ledger)
+}
+
+/// The deterministic quarantine name of entry `index`, as a C string.
+fn quarantine_c_name(ledger: &Ledger, index: usize) -> Result<CString> {
+    CString::new(ledger::quarantine_name(&ledger.nonce, index)).map_err(|_| refused(ledger::LEDGER_DAMAGED))
+}
+
+/// A ledgered file, directory or tree (entry `index`) by its fixed path,
+/// through its durable quarantine.
+fn remove_indexed(store: &Store, ledger: &mut Ledger, index: usize, boot_id: &str) -> Result<Removal> {
+    let entry = ledger.entries.get(index).cloned().ok_or_else(|| refused(ledger::LEDGER_DAMAGED))?;
+    if !ledger::present(&entry.path)? { return Ok(Removal::Absent); }
+    let (parent, name) = ledger::open_parent(&entry.path)?;
+    let quarantine = quarantine_c_name(ledger, index)?;
+    remove_ledgered_at(&parent, &name, &entry, boot_id, ROOT_OWNER, &quarantine,
+        &mut |phase| set_quarantine(store, ledger, index, phase))
+}
+
+/// The directory below which `entry`'s quarantine lives (its parent).
+fn quarantine_parent(entry: &Entry) -> Option<&str> { Path::new(&entry.path).parent()?.to_str() }
+
+/// Review R3 item 5: finish every recorded quarantine whose directory still
+/// exists (see [`reconcile_at`]). Returns the paths to list as kept.
+pub(super) fn reconcile(store: &Store, ledger: &mut Ledger, boot_id: &str) -> Result<Vec<String>> {
+    let mut kept = Vec::new();
+    for index in 0..ledger.entries.len() {
+        let Some(entry) = ledger.entries.get(index).cloned() else { continue };
+        if entry.quarantine.is_none() { continue; }
+        let parent = quarantine_parent(&entry).ok_or_else(|| refused(ledger::LEDGER_DAMAGED))?;
+        // Without its parent there is no quarantine left either.
+        if !ledger::present(parent)? { continue; }
+        let (parent, name) = ledger::open_parent(&entry.path)?;
+        let quarantine = quarantine_c_name(ledger, index)?;
+        if let Removal::Kept(path) = reconcile_at(&parent, &name, &quarantine, &entry, boot_id, ROOT_OWNER,
+            &mut |phase| set_quarantine(store, ledger, index, phase))? {
+            kept.push(path);
+        }
     }
-    remove_ledgered(entry, boot_id)
+    Ok(kept)
+}
+
+/// Review R3 item 5: on an install resume, a recorded quarantine is finished
+/// first; when anything stays kept or in a quarantine the resume refuses
+/// (only `duduclaw-bootstrap rollback` continues). `Ok(true)`: the ledger was
+/// written (the caller re-reads it).
+pub(super) fn reconcile_on_resume(store: &Store, recorded: &Ledger) -> Result<bool> {
+    if recorded.entries.iter().all(|entry| entry.quarantine.is_none()) { return Ok(false); }
+    let _version = version_lock()?;
+    let mut ledger = recorded.clone();
+    let kept = reconcile(store, &mut ledger, &ledger::boot_id()?)?;
+    let outstanding = outstanding_quarantines(&ledger)?;
+    if kept.is_empty() && outstanding.is_empty() { return Ok(true); }
+    println!("[保留] 先前回退的隔離目錄無法完成處理：");
+    for path in kept.iter().chain(outstanding.iter()) { println!("  - {path}"); }
+    Err(refused("這台主機有尚未完成的回退隔離目錄；請以 duduclaw-bootstrap rollback 完成回退，不能續接安裝。"))
+}
+
+/// Review R3 item 5: every recorded quarantine directory still present.
+pub(super) fn outstanding_quarantines(ledger: &Ledger) -> Result<Vec<String>> {
+    let mut outstanding = Vec::new();
+    for entry in &ledger.entries {
+        let (Some(record), Some(parent)) = (&entry.quarantine, quarantine_parent(entry)) else { continue };
+        let path = format!("{parent}/{}", record.name);
+        if ledger::present(&path)? { outstanding.push(path); }
+    }
+    Ok(outstanding)
+}
+
+/// Review R3 item 5 (pure): the journal and the ledger may be deleted only
+/// when no quarantine directory is outstanding.
+pub(super) fn records_deletable(outstanding: &[String]) -> Result<()> {
+    if outstanding.is_empty() { return Ok(()); }
+    println!("[保留] 以下回退隔離目錄仍然存在，安裝紀錄不會刪除：");
+    for path in outstanding { println!("  - {path}"); }
+    Err(refused("回退尚未完成：仍有回退隔離目錄；請確認上列目錄的內容並處理後，再執行同一個回退命令。"))
+}
+
+/// Every directory a ledgered object (and so its quarantine) can sit in.
+fn quarantine_parents() -> Vec<String> {
+    let files = ledger_files();
+    let mut parents: Vec<String> = files.iter().map(String::as_str).chain(TREES).chain(LEDGER_DIRECTORIES)
+        .filter_map(|path| Path::new(path).parent()?.to_str().map(str::to_owned)).collect();
+    parents.sort();
+    parents.dedup();
+    parents
+}
+
+/// Review R3 item 5 (pure): of the quarantine directories `found` (parent,
+/// name), those no entry of `ours` records (same parent, same name).
+pub(super) fn unexplained(found: &[(String, String)], ours: Option<&Ledger>) -> Vec<String> {
+    found.iter().filter(|(parent, name)| !ours.is_some_and(|ledger| ledger.entries.iter().any(|entry|
+        entry.quarantine.as_ref().is_some_and(|record| record.name == *name)
+            && quarantine_parent(entry) == Some(parent.as_str()))))
+        .map(|(parent, name)| format!("{parent}/{name}")).collect()
+}
+
+/// Review R3 item 5 (S1): quarantine directories (`.duduclaw-rollback-*`) in
+/// any directory a ledgered object can sit in that `ours` does not explain.
+pub(super) fn unexplained_quarantines(ours: Option<&Ledger>) -> Result<Vec<String>> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut found = Vec::new();
+    for parent in quarantine_parents() {
+        let entries = match fs::read_dir(&parent) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        for (count, entry) in entries.enumerate() {
+            if count >= MAX_DIRECTORY_ENTRIES { return Err(refused("目錄項目超過上限。")); }
+            let name = entry?.file_name();
+            if name.as_bytes().starts_with(ledger::QUARANTINE_PREFIX.as_bytes()) {
+                found.push((parent.clone(), name.to_string_lossy().into_owned()));
+            }
+        }
+    }
+    Ok(unexplained(&found, ours))
 }
 
 fn rename_noreplace(from: &fs::File, old: &CStr, to: &fs::File, new: &CStr) -> std::io::Result<()> {
@@ -330,14 +474,16 @@ fn rename_noreplace(from: &fs::File, old: &CStr, to: &fs::File, new: &CStr) -> s
     Ok(())
 }
 
-/// Review M1: a fresh root-only directory with a random name in `parent`.
+/// Review M1: a fresh root-only directory in `parent`, named deterministically
+/// per ledger entry (review R3 item 5).
 struct Quarantine { name: CString, directory: fs::File }
 
 impl Quarantine {
     /// `parent` must be a directory owned by `owner` and not writable by group
-    /// or others; the quarantine is created 0700 there (same filesystem) and
-    /// proven to be a fresh owner-only directory on the parent's mount.
-    fn create(parent: &fs::File, owner: u32, path: &str) -> Result<Self> {
+    /// or others; the quarantine `name` is created 0700 there with exclusive
+    /// `mkdirat` (same filesystem) and proven to be a fresh owner-only
+    /// directory on the parent's mount.
+    fn create(parent: &fs::File, owner: u32, path: &str, name: &CStr) -> Result<Self> {
         let unavailable = || refused(ledger::MOUNT_ID_UNAVAILABLE);
         let unsafe_parent = || refused(format!("{path} 的上層目錄不是 root 擁有的目錄，或可被其他帳號寫入；無法安全地移除它，已停止回退。"));
         let stat = ledger::stat_at(parent.as_raw_fd(), c"")?;
@@ -345,10 +491,15 @@ impl Quarantine {
             return Err(unsafe_parent());
         }
         let parent_mount = stat.mount_id.ok_or_else(unavailable)?;
-        let name = CString::new(format!("{QUARANTINE_PREFIX}{}", boot::random_hex(16)?)).map_err(|_| unsafe_parent())?;
+        let name = name.to_owned();
         // SAFETY: live dirfd and a NUL-terminated single-component name.
         if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EEXIST) {
+                return Err(refused(format!("{path} 的回退隔離目錄 {} 已存在（先前的回退未完成）；請確認其內容並處理後，再執行同一個回退命令。",
+                    name.to_string_lossy())));
+            }
+            return Err(error.into());
         }
         let directory = match open_directory_at(parent, &name) {
             Ok(directory) => directory,
@@ -371,21 +522,33 @@ impl Quarantine {
     }
 
     /// Remove the quarantine directory when it is empty; otherwise it stays.
-    fn discard(&self, parent: &fs::File) -> bool {
-        // SAFETY: live dirfd and a NUL-terminated single-component name.
-        let removed = unsafe { libc::unlinkat(parent.as_raw_fd(), self.name.as_ptr(), libc::AT_REMOVEDIR) } == 0;
-        let _ = parent.sync_all();
-        removed
-    }
+    fn discard(&self, parent: &fs::File) -> bool { discard_at(parent, &self.name) }
+}
+
+/// Remove the quarantine directory `name` below `parent` when it is empty.
+fn discard_at(parent: &fs::File, name: &CStr) -> bool {
+    // SAFETY: live dirfd and a NUL-terminated single-component name.
+    let removed = unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } == 0;
+    let _ = parent.sync_all();
+    removed
+}
+
+/// How a kept object left inside its quarantine is listed.
+fn in_quarantine(entry: &Entry, quarantine: &CStr) -> String {
+    let directory = Path::new(&entry.path).parent().map(|path| path.display().to_string()).unwrap_or_default();
+    format!("{}（已移到隔離目錄 {directory}/{}/ 內）", entry.path, quarantine.to_string_lossy())
 }
 
 /// Review M1: remove the ledgered object `name` below `parent` (whose
 /// owner must be `owner`: root in production) only through a quarantine.
-/// First check → move into the quarantine without replacing → verify the
-/// moved object again there (same rule, mount id included; one link for
-/// files) → remove it inside the quarantine. On any mismatch it is moved back
-/// without replacing (left in the quarantine if that fails) and kept.
-pub(super) fn remove_ledgered_at(parent: &fs::File, name: &CStr, entry: &Entry, boot_id: &str, owner: u32) -> Result<Removal> {
+/// First check → record the quarantine durably (`persist`, review R3 item 5)
+/// → create it (`quarantine`, exclusive) and move the object into it without
+/// replacing → verify the moved object again there (same rule, mount id
+/// included; one link for files) → remove it inside the quarantine → record
+/// `removed` → discard the empty quarantine. On any mismatch it is moved back
+/// without replacing (left in the quarantine, still `quarantining`, if that fails) and kept.
+pub(super) fn remove_ledgered_at(parent: &fs::File, name: &CStr, entry: &Entry, boot_id: &str, owner: u32,
+    quarantine: &CStr, persist: &mut dyn FnMut(QuarantinePhase) -> Result<()>) -> Result<Removal> {
     match ledger::classify_at(parent, name, entry, boot_id)? {
         Now::Absent => return Ok(Removal::Absent),
         Now::Other => return Ok(Removal::Kept(entry.path.clone())),
@@ -394,19 +557,61 @@ pub(super) fn remove_ledgered_at(parent: &fs::File, name: &CStr, entry: &Entry, 
     if entry.kind == Kind::Contents { return Err(refused(ledger::LEDGER_DAMAGED)); }
     #[cfg(test)]
     AFTER_FIRST_CHECK.with(|hook| if let Some(hook) = hook.borrow_mut().as_mut() { hook() });
-    let quarantine = Quarantine::create(parent, owner, &entry.path)?;
+    // Review R3 item 5: durable before the quarantine exists and the object moves.
+    persist(QuarantinePhase::Quarantining)?;
+    let quarantine = Quarantine::create(parent, owner, &entry.path, quarantine)?;
     if let Err(error) = rename_noreplace(parent, name, &quarantine.directory, name) {
         quarantine.discard(parent);
+        persist(QuarantinePhase::Removed)?;
         if error.raw_os_error() == Some(libc::ENOENT) { return Ok(Removal::Absent); }
         return Err(error.into());
     }
-    let inside = &quarantine.directory;
-    // An error here still moves the object back below (then is reported).
+    #[cfg(test)]
+    if STOP_AFTER_RENAME.with(|stop| stop.replace(false)) { return Err(refused("test interruption")); }
+    let removed = remove_inside(&quarantine.directory, name, entry, boot_id);
+    settle(parent, name, entry, &quarantine.name, &quarantine.directory, removed, persist)
+}
+
+/// Review R3 item 5: finish an interrupted quarantine `quarantine` of `entry`
+/// (object `name`) below `parent`. Absent: nothing outstanding. A directory
+/// that is not an owner-only (`owner`) directory on the parent's mount is
+/// never touched (kept, listed). Inside it the object is verified again:
+/// removed when it is the recorded one, otherwise moved back without
+/// replacing (kept), or left there (kept, still outstanding).
+pub(super) fn reconcile_at(parent: &fs::File, name: &CStr, quarantine: &CStr, entry: &Entry, boot_id: &str, owner: u32,
+    persist: &mut dyn FnMut(QuarantinePhase) -> Result<()>) -> Result<Removal> {
+    match ledger::stat_at(parent.as_raw_fd(), quarantine) {
+        Ok(_) => (),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Removal::Absent),
+        Err(error) => return Err(error.into()),
+    }
+    let inside = open_directory_at(parent, quarantine)?;
+    let made = ledger::stat_at(inside.as_raw_fd(), c"")?;
+    let parent_mount = ledger::stat_at(parent.as_raw_fd(), c"")?.mount_id;
+    if made.mode & libc::S_IFMT != libc::S_IFDIR || made.uid != owner || made.mode & 0o7777 != 0o700
+        || made.mount_id.is_none() || made.mount_id != parent_mount {
+        return Ok(Removal::Kept(in_quarantine(entry, quarantine)));
+    }
+    if ledger::classify_at(&inside, name, entry, boot_id)? == Now::Absent {
+        persist(QuarantinePhase::Removed)?;
+        drop(inside);
+        if discard_at(parent, quarantine) { return Ok(Removal::Absent); }
+        return Ok(Removal::Kept(in_quarantine(entry, quarantine)));
+    }
+    let removed = remove_inside(&inside, name, entry, boot_id);
+    settle(parent, name, entry, quarantine, &inside, removed, persist)
+}
+
+/// The moved object `name` inside the quarantine `inside`, verified again and
+/// removed when it is the recorded one. `Ok(false)`: not the recorded object,
+/// or a directory that is not empty.
+fn remove_inside(inside: &fs::File, name: &CStr, entry: &Entry, boot_id: &str) -> Result<bool> {
+    // An error here still moves the object back (then is reported).
     let same = (|| -> Result<bool> {
         Ok(ledger::classify_at(inside, name, entry, boot_id)? == Now::Recorded
             && (entry.kind != Kind::File || ledger::stat_at(inside.as_raw_fd(), name)?.nlink == 1))
     })();
-    let removed: Result<bool> = match (same, entry.kind) {
+    match (same, entry.kind) {
         (Err(error), _) => Err(error),
         (Ok(false), _) => Ok(false),
         // SAFETY: live dirfd and a NUL-terminated single-component name.
@@ -422,21 +627,30 @@ pub(super) fn remove_ledgered_at(parent: &fs::File, name: &CStr, entry: &Entry, 
         },
         (Ok(true), Kind::Tree) => remove_below(inside, name).map(|()| true),
         (Ok(true), Kind::Contents) => Err(refused(ledger::LEDGER_DAMAGED)),
-    };
+    }
+}
+
+/// After [`remove_inside`]: removed → record `removed`, discard the
+/// quarantine; otherwise back where it was, never replacing, then record
+/// `removed` and discard — or, when that fails, left inside (the record stays
+/// `quarantining`: outstanding) and listed.
+fn settle(parent: &fs::File, name: &CStr, entry: &Entry, quarantine: &CStr, inside: &fs::File, removed: Result<bool>,
+    persist: &mut dyn FnMut(QuarantinePhase) -> Result<()>) -> Result<Removal> {
     if matches!(removed, Ok(true)) {
         inside.sync_all()?;
-        quarantine.discard(parent);
+        persist(QuarantinePhase::Removed)?;
+        discard_at(parent, quarantine);
         return Ok(Removal::Removed);
     }
     // Not the recorded object (or not removable): back where it was, never replacing.
     let restored = rename_noreplace(inside, name, parent, name).is_ok();
     let _ = parent.sync_all();
     let kept = if restored {
-        quarantine.discard(parent);
+        persist(QuarantinePhase::Removed)?;
+        discard_at(parent, quarantine);
         entry.path.clone()
     } else {
-        let directory = Path::new(&entry.path).parent().map(|path| path.display().to_string()).unwrap_or_default();
-        format!("{}（已移到隔離目錄 {directory}/{}/ 內）", entry.path, quarantine.name.to_string_lossy())
+        in_quarantine(entry, quarantine)
     };
     removed?;
     Ok(Removal::Kept(kept))
@@ -650,7 +864,104 @@ mod tests {
     fn recorded_entry(dir: &fs::File, name: &CStr, kind: Kind) -> Entry {
         let path = if kind == Kind::File { UNIT_PATH } else { "/opt/duduclaw" };
         Entry { path: path.into(), kind, state: State::Created,
-            identity: ledger::identity_at(dir, name, kind).unwrap(), keep: Vec::new() }
+            identity: ledger::identity_at(dir, name, kind).unwrap(), keep: Vec::new(), quarantine: None }
+    }
+
+    const QUARANTINE: &CStr = c".duduclaw-rollback-test-0";
+
+    /// `remove_ledgered_at` with a fixed quarantine name, persisting nothing.
+    fn remove_quarantined(dir: &fs::File, name: &CStr, entry: &Entry, boot_id: &str, owner: u32) -> Result<Removal> {
+        remove_ledgered_at(dir, name, entry, boot_id, owner, QUARANTINE, &mut |_| Ok(()))
+    }
+
+    #[test]
+    fn crash_after_rename_is_reconciled_before_anything_else() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir_all(directory.path().join("tree/a")).unwrap();
+        fs::write(directory.path().join("tree/a/file"), b"x").unwrap();
+        let dir = fs::File::open(directory.path()).unwrap();
+        let boot_id = ledger::boot_id().unwrap();
+        let tree = Entry { path: "/usr/lib/duduclaw".into(), kind: Kind::Tree, state: State::Created,
+            identity: ledger::identity_at(&dir, c"tree", Kind::Tree).unwrap(), keep: Vec::new(), quarantine: None };
+        // Power loss right after the move: the phase was durable BEFORE it.
+        let mut phases = Vec::new();
+        STOP_AFTER_RENAME.with(|stop| stop.set(true));
+        let crashed = remove_ledgered_at(&dir, c"tree", &tree, &boot_id, me(), QUARANTINE,
+            &mut |phase| { phases.push(phase); Ok(()) });
+        assert!(crashed.is_err());
+        assert_eq!(phases, [QuarantinePhase::Quarantining]);
+        // The original path is absent; the complete tree sits in the recorded quarantine.
+        assert_eq!(names(directory.path()), vec![QUARANTINE.to_str().unwrap().to_owned()]);
+        assert!(directory.path().join(QUARANTINE.to_str().unwrap()).join("tree/a/file").is_file());
+        // While it is outstanding the journal and ledger are never deleted.
+        let outstanding = vec![directory.path().join(QUARANTINE.to_str().unwrap()).display().to_string()];
+        assert!(records_deletable(&outstanding).is_err());
+        // The next rollback reconciles first: identity re-verified inside, removed, `removed` recorded.
+        let mut phases = Vec::new();
+        let result = reconcile_at(&dir, c"tree", QUARANTINE, &tree, &boot_id, me(), &mut |phase| { phases.push(phase); Ok(()) });
+        assert_eq!(result.unwrap(), Removal::Removed);
+        assert_eq!(phases, [QuarantinePhase::Removed]);
+        assert!(names(directory.path()).is_empty(), "tree and quarantine gone");
+        records_deletable(&[]).unwrap();
+        // Reconciling again (or a quarantine never created): nothing outstanding.
+        assert_eq!(reconcile_at(&dir, c"tree", QUARANTINE, &tree, &boot_id, me(), &mut |_| Ok(())).unwrap(), Removal::Absent);
+    }
+
+    #[test]
+    fn reconcile_moves_back_or_keeps_what_is_not_the_recorded_object() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("unit"), b"ours").unwrap();
+        let dir = fs::File::open(directory.path()).unwrap();
+        let boot_id = ledger::boot_id().unwrap();
+        let entry = recorded_entry(&dir, c"unit", Kind::File);
+        STOP_AFTER_RENAME.with(|stop| stop.set(true));
+        assert!(remove_quarantined(&dir, c"unit", &entry, &boot_id, me()).is_err());
+        let quarantine = directory.path().join(QUARANTINE.to_str().unwrap());
+        // Someone replaced the object inside the quarantine meanwhile: moved back, kept, listed.
+        fs::write(quarantine.join("unit.other"), b"theirs").unwrap();
+        fs::rename(quarantine.join("unit.other"), quarantine.join("unit")).unwrap();
+        let result = reconcile_at(&dir, c"unit", QUARANTINE, &entry, &boot_id, me(), &mut |_| Ok(()));
+        assert_eq!(result.unwrap(), Removal::Kept(UNIT_PATH.into()));
+        assert_eq!(fs::read(directory.path().join("unit")).unwrap(), b"theirs");
+        assert_eq!(names(directory.path()), vec!["unit".to_owned()]);
+        // A same-named directory that is not an owner-only quarantine is never touched.
+        use std::os::unix::fs::PermissionsExt;
+        fs::create_dir(&quarantine).unwrap();
+        fs::set_permissions(&quarantine, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(quarantine.join("unit"), b"third").unwrap();
+        let result = reconcile_at(&dir, c"unit", QUARANTINE, &entry, &boot_id, me(), &mut |_| Ok(()));
+        assert!(matches!(result.unwrap(), Removal::Kept(_)));
+        assert!(quarantine.join("unit").is_file());
+        // The original path is occupied as well: it cannot go back, so it stays in the quarantine (outstanding).
+        fs::set_permissions(&quarantine, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut phases = Vec::new();
+        let result = reconcile_at(&dir, c"unit", QUARANTINE, &entry, &boot_id, me(), &mut |phase| { phases.push(phase); Ok(()) });
+        assert!(matches!(result.unwrap(), Removal::Kept(listed) if listed.contains(QUARANTINE.to_str().unwrap())));
+        assert!(phases.is_empty(), "still quarantining");
+        assert!(quarantine.join("unit").is_file());
+        assert!(records_deletable(&[quarantine.display().to_string()]).is_err());
+    }
+
+    #[test]
+    fn unexplained_quarantine_directory_makes_s1_refuse() {
+        let nonce = "5a".repeat(32);
+        let mut ours = Ledger::new(&"cd".repeat(32), &nonce);
+        ours.entries.push(Entry { path: UNIT_PATH.into(), kind: Kind::File, state: State::Created, identity: None,
+            keep: Vec::new(), quarantine: Some(ledger::QuarantineRecord { name: ledger::quarantine_name(&nonce, 0),
+                phase: QuarantinePhase::Removed }) });
+        let explained = ("/etc/systemd/system".to_owned(), ledger::quarantine_name(&nonce, 0));
+        // An old random-named quarantine, another index, another parent: unexplained.
+        let found = vec![explained.clone(), ("/etc/systemd/system".to_owned(), format!("{}{}", ledger::QUARANTINE_PREFIX, "ab".repeat(16))),
+            ("/etc/systemd/system".to_owned(), ledger::quarantine_name(&nonce, 1)), ("/usr/local/sbin".to_owned(), ledger::quarantine_name(&nonce, 0))];
+        assert_eq!(unexplained(&found, Some(&ours)).len(), 3);
+        assert_eq!(unexplained(&[explained.clone()], Some(&ours)), Vec::<String>::new());
+        // Without a ledger nothing explains it (a fresh host).
+        assert_eq!(unexplained(&[explained], None), vec![format!("/etc/systemd/system/{}", ledger::quarantine_name(&nonce, 0))]);
+        // Every directory a ledgered object sits in is scanned.
+        let parents = quarantine_parents();
+        for parent in ["/etc/systemd/system", "/var/lib/duduclaw-protected", "/usr/local/sbin", "/opt", "/run", "/etc/duduclaw"] {
+            assert!(parents.iter().any(|scanned| scanned == parent), "{parent}");
+        }
     }
 
     #[test]
@@ -662,28 +973,28 @@ mod tests {
         let boot_id = ledger::boot_id().unwrap();
         let recorded: Identity = ledger::identity_at(&dir, c"unit", Kind::File).unwrap().unwrap();
         let entry = Entry { path: UNIT_PATH.into(), kind: Kind::File, state: State::Created, identity: Some(recorded),
-            keep: Vec::new() };
+            keep: Vec::new(), quarantine: None };
         // A package or an administrator replaced it after the interruption.
         fs::write(directory.path().join("unit.pkg"), b"theirs").unwrap();
         fs::rename(directory.path().join("unit.pkg"), &path).unwrap();
-        assert_eq!(remove_ledgered_at(&dir, c"unit", &entry, &boot_id, me()).unwrap(), Removal::Kept(UNIT_PATH.into()));
+        assert_eq!(remove_quarantined(&dir,c"unit", &entry, &boot_id, me()).unwrap(), Removal::Kept(UNIT_PATH.into()));
         assert_eq!(fs::read(&path).unwrap(), b"theirs");
         assert!(finish(&[entry.path.clone()], &[]).is_err(), "an incomplete rollback never reports done");
         // An intent without an identity matches nothing either.
         let intent = Entry { identity: None, state: State::Intent, ..entry.clone() };
-        assert!(matches!(remove_ledgered_at(&dir, c"unit", &intent, &boot_id, me()).unwrap(), Removal::Kept(_)));
+        assert!(matches!(remove_quarantined(&dir,c"unit", &intent, &boot_id, me()).unwrap(), Removal::Kept(_)));
         assert!(path.exists());
         // The recorded object itself is removed; then the path is simply absent.
         let ours = Entry { identity: ledger::identity_at(&dir, c"unit", Kind::File).unwrap(), ..entry.clone() };
-        assert_eq!(remove_ledgered_at(&dir, c"unit", &ours, &boot_id, me()).unwrap(), Removal::Removed);
+        assert_eq!(remove_quarantined(&dir,c"unit", &ours, &boot_id, me()).unwrap(), Removal::Removed);
         assert!(!path.exists());
         assert!(names(directory.path()).is_empty(), "no quarantine is left behind");
-        assert_eq!(remove_ledgered_at(&dir, c"unit", &ours, &boot_id, me()).unwrap(), Removal::Absent);
+        assert_eq!(remove_quarantined(&dir,c"unit", &ours, &boot_id, me()).unwrap(), Removal::Absent);
         // A hard-linked object is kept even when it is the recorded inode (moved back from the quarantine).
         fs::write(&path, b"ours").unwrap();
         let linked = Entry { identity: ledger::identity_at(&dir, c"unit", Kind::File).unwrap(), ..entry };
         fs::hard_link(&path, directory.path().join("alias")).unwrap();
-        assert!(matches!(remove_ledgered_at(&dir, c"unit", &linked, &boot_id, me()).unwrap(), Removal::Kept(_)));
+        assert!(matches!(remove_quarantined(&dir,c"unit", &linked, &boot_id, me()).unwrap(), Removal::Kept(_)));
         assert_eq!(names(directory.path()), vec!["alias".to_owned(), "unit".to_owned()]);
         finish(&[], &[]).unwrap();
         assert!(finish(&[], &["/usr/lib/duduclaw"]).is_err());
@@ -703,7 +1014,7 @@ mod tests {
             fs::write(swap.join("unit.other"), b"theirs").unwrap();
             fs::rename(swap.join("unit.other"), swap.join("unit")).unwrap();
         })));
-        let result = remove_ledgered_at(&dir, c"unit", &entry, &boot_id, me());
+        let result = remove_quarantined(&dir,c"unit", &entry, &boot_id, me());
         AFTER_FIRST_CHECK.with(|hook| *hook.borrow_mut() = None);
         assert_eq!(result.unwrap(), Removal::Kept(UNIT_PATH.into()), "detected inside the quarantine");
         // Kept, moved back to its own name, and the empty quarantine is gone.
@@ -722,7 +1033,7 @@ mod tests {
             fs::create_dir(swap.join("dir")).unwrap();
             fs::set_permissions(swap.join("dir"), fs::Permissions::from_mode(0o700)).unwrap();
         })));
-        let result = remove_ledgered_at(&dir, c"dir", &entry, &boot_id, me());
+        let result = remove_quarantined(&dir,c"dir", &entry, &boot_id, me());
         AFTER_FIRST_CHECK.with(|hook| *hook.borrow_mut() = None);
         assert!(matches!(result.unwrap(), Removal::Kept(_)));
         assert!(directory.path().join("dir").is_dir());
@@ -731,8 +1042,8 @@ mod tests {
         fs::create_dir_all(directory.path().join("tree/a")).unwrap();
         fs::write(directory.path().join("tree/a/file"), b"x").unwrap();
         let tree = Entry { path: "/usr/lib/duduclaw".into(), kind: Kind::Tree, state: State::Created,
-            identity: ledger::identity_at(&dir, c"tree", Kind::Tree).unwrap(), keep: Vec::new() };
-        assert_eq!(remove_ledgered_at(&dir, c"tree", &tree, &boot_id, me()).unwrap(), Removal::Removed);
+            identity: ledger::identity_at(&dir, c"tree", Kind::Tree).unwrap(), keep: Vec::new(), quarantine: None };
+        assert_eq!(remove_quarantined(&dir,c"tree", &tree, &boot_id, me()).unwrap(), Removal::Removed);
         assert_eq!(names(directory.path()), vec!["dir".to_owned(), "unit".to_owned()]);
     }
 
@@ -746,15 +1057,15 @@ mod tests {
         let boot_id = ledger::boot_id().unwrap();
         let entry = recorded_entry(&dir, c"unit", Kind::File);
         // The parent is not owned by the required owner (production: root).
-        assert!(remove_ledgered_at(&dir, c"unit", &entry, &boot_id, me().wrapping_add(1)).is_err());
+        assert!(remove_quarantined(&dir,c"unit", &entry, &boot_id, me().wrapping_add(1)).is_err());
         assert_eq!(fs::read(&path).unwrap(), b"ours");
         assert_eq!(names(directory.path()), vec!["unit".to_owned()]);
         // Writable by others.
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o777)).unwrap();
-        assert!(remove_ledgered_at(&dir, c"unit", &entry, &boot_id, me()).is_err());
+        assert!(remove_quarantined(&dir,c"unit", &entry, &boot_id, me()).is_err());
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(names(directory.path()), vec!["unit".to_owned()]);
-        assert_eq!(remove_ledgered_at(&dir, c"unit", &entry, &boot_id, me()).unwrap(), Removal::Removed);
+        assert_eq!(remove_quarantined(&dir,c"unit", &entry, &boot_id, me()).unwrap(), Removal::Removed);
     }
 
     #[test]
@@ -763,7 +1074,7 @@ mod tests {
         let identity = Identity { device: 1, inode: 2, mount_id: 3, mode: libc::S_IFDIR | 0o755, uid: 0, gid: 0,
             size: None, sha256: None, boot_id: "ffffffff-0000-4000-8000-000000000000".into() };
         let runtime = Entry { path: boot::SPAWND_RUNTIME.into(), kind: Kind::Tree, state: State::Created,
-            identity: Some(identity.clone()), keep: Vec::new() };
+            identity: Some(identity.clone()), keep: Vec::new(), quarantine: None };
         // Recorded in another boot: never deleted by rollback.
         assert!(from_earlier_boot(&runtime, boot));
         // Same boot: the ordinary identity rule applies.

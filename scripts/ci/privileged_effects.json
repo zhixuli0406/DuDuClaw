@@ -1052,7 +1052,7 @@
       "rationale": "Operator installation/service-lifecycle helper; runs service-manager commands under the invoking administrator or gateway identity, not employee content."
     },
     {
-      "symbol": "crates/duduclaw-cli/src/service/protected_linux_install.rs::command",
+      "symbol": "crates/duduclaw-cli/src/service/protected_linux_install.rs::command_within",
       "apis": {
         "command_constructor": 1,
         "terminal_spawn": 1
@@ -1062,7 +1062,7 @@
       ],
       "identity": "gateway",
       "migration": "gateway_exception",
-      "rationale": "Operator-only protected Linux installer invokes root-trusted OS utilities with fixed caller-built argv, cleared environment and null stdin. Temporary-file capture is capped at 4 MiB per stream with a 30-second child deadline; no employee prompt, shell text or backend workload runs here. v1.83 R3: the isolation bootstrap, its rollback and its creation ledger (protected_linux_bootstrap.rs, protected_linux_rollback.rs, protected_linux_ledger.rs) run every tool only through this helper (systemctl, useradd, getent including the full `getent passwd` / `getent group` enumeration of the service-identity alias check, id, loginctl, `dmsetup table --major M --minor m` for the read-only storage-chain check and, via parse_runtime_tree, python3 -I; the root-only #[ignore] test iso_root_install_rollback_refuses_bind_mount_inside_tree also runs `mount --bind` / `umount` on fixed test paths of a disposable VM); their output is parsed, never printed, and those files add no other process spawn. Their privileged file effects (unlinkat/rmdir of ledgered objects only, after a statx STATX_MNT_ID identity match) are filesystem operations, not process effects."
+      "rationale": "Operator-only protected Linux installer invokes root-trusted OS utilities with fixed caller-built argv, cleared environment and null stdin. Temporary-file capture is capped at 4 MiB per stream with a child deadline of at most 30 seconds (`command` delegates here with 30 s; the bootstrap's resume quiesce passes the remainder of its single deadline and spawns nothing once it is exhausted); no employee prompt, shell text or backend workload runs here. v1.83 R3: the isolation bootstrap, its rollback and its creation ledger (protected_linux_bootstrap.rs, protected_linux_rollback.rs, protected_linux_ledger.rs) run every tool only through this helper (systemctl, useradd, getent including the full `getent passwd` / `getent group` enumeration of the service-identity alias check, id, loginctl, `dmsetup table --major M --minor m` for the read-only storage-chain check and, via parse_runtime_tree, python3 -I; the root-only #[ignore] test iso_root_install_rollback_refuses_bind_mount_inside_tree also runs `mount --bind` / `umount` on fixed test paths of a disposable VM); their output is parsed, never printed, and those files add no other process spawn. Their privileged file effects (unlinkat/rmdir of ledgered objects only, after a statx STATX_MNT_ID identity match) are filesystem operations, not process effects."
     },
     {
       "symbol": "crates/duduclaw-container/src/apple.rs::AppleContainerRuntime::is_available",

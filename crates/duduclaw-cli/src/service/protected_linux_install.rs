@@ -49,21 +49,31 @@ fn mkdir(path: &str, mode: u32) -> Result<()> {
     let path = Path::new(path);
     parents(path)?;
     // Do not briefly expose a writable directory when the invoking umask is 0.
-    match fs::DirBuilder::new().mode(mode).create(path) {
-        Ok(()) => (),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => trusted(path, true)?,
+    let created = match fs::DirBuilder::new().mode(mode).create(path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => { trusted(path, true)?; false }
         Err(error) => return Err(error.into()),
-    }
+    };
     let directory = fs::OpenOptions::new().read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(path)?;
     if unsafe { libc::fchown(directory.as_raw_fd(), 0, 0) } != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
     directory.set_permissions(fs::Permissions::from_mode(mode))?;
-    Ok(())
+    // R3 review item 4: only a directory this call's mkdir created is proven
+    // (identity from the no-follow descriptor); one it found never is.
+    if created { ledger::prove_created(path, &directory) } else { ledger::reprove(path, &directory) }
 }
 
-fn command(name: &str, args: &[&str]) -> Result<Output> {
+/// The child deadline of every system command (and the cap of `command_within`).
+const COMMAND_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn command(name: &str, args: &[&str]) -> Result<Output> { command_within(name, args, COMMAND_LIMIT) }
+
+/// `command` with a child deadline of `min(limit, 30 s)`, so a caller's own
+/// deadline bounds the whole call (R3 review item 6). A zero limit spawns nothing.
+fn command_within(name: &str, args: &[&str], limit: std::time::Duration) -> Result<Output> {
+    if limit.is_zero() { return Err(refused("system command exceeded its time or output limit")); }
     let executable = ["/usr/sbin", "/usr/bin", "/sbin", "/bin"].iter()
         .map(|dir| Path::new(dir).join(name)).find(|path| path.exists())
         .ok_or_else(|| refused(format!("required command missing: {name}")))?;
@@ -86,7 +96,7 @@ fn command(name: &str, args: &[&str]) -> Result<Output> {
     let mut child = ReapOnError(Command::new(executable).args(args).current_dir("/").env_clear()
         .env("PATH", super::runtime::SERVICE_PATH).env("HOME", "/var/lib/duduclaw").env("LC_ALL", "C")
         .stdin(Stdio::null()).stdout(stdout.reopen()?).stderr(stderr.reopen()?).spawn()?);
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + limit.min(COMMAND_LIMIT);
     let limit = 4 * 1024 * 1024;
     let status = loop {
         if stdout.as_file().metadata()?.len() > limit || stderr.as_file().metadata()?.len() > limit
@@ -166,9 +176,11 @@ fn atomic_install(path: &str, mode: u32, write: impl FnOnce(&mut fs::File) -> Re
     if unsafe { libc::fchown(temp.as_raw_fd(), 0, 0) } != 0 { return Err(std::io::Error::last_os_error().into()); }
     temp.as_file().set_permissions(fs::Permissions::from_mode(mode))?;
     temp.as_file().sync_all()?;
-    temp.persist(path).map_err(|error| error.error)?;
+    let file = temp.persist(path).map_err(|error| error.error)?;
     fs::File::open(parent)?.sync_all()?;
-    Ok(())
+    // R3 review item 4: what this call created (the O_EXCL temporary, now at
+    // `path`), proven by its own descriptor for an active creation ledger record.
+    ledger::prove_created(path, &file)
 }
 
 const PARSE_RUNTIME_TREE: &str = "/usr/lib/duduclaw/parse-root-tree";

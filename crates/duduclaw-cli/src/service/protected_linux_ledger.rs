@@ -14,7 +14,15 @@
 //!      is and never ledgered (rollback never touches it).
 //!   2. AFTER creating it: its identity is made durable (`created`): kind,
 //!      device, inode, mount id, mode, owner, the boot it was observed in, and
-//!      for regular files size and SHA-256.
+//!      for regular files size and SHA-256. Review R3 item 4: only an identity
+//!      the creation PROVES — read from the descriptor of the object the
+//!      creation helper made with exclusive semantics (an `O_EXCL` temporary
+//!      renamed into place, `mkdir` then a no-follow open; [`prove_created`]) —
+//!      and only while the path still resolves to that object. An object a
+//!      step did not provably create (also after a failed creation) is never
+//!      recorded. Objects other components create (systemd's runtime
+//!      directory, the launcher's root key, R1's state root) are recorded only
+//!      through [`Recorder::confirm_component`] with the caller's proof.
 //! Rollback deletes ONLY entries whose current identity equals the recorded
 //! one ([`same_object`]); anything else at a ledgered path is kept and
 //! reported, and the rollback ends incomplete (resumable). An entry still in
@@ -80,6 +88,27 @@ pub(super) struct Identity {
     pub(super) boot_id: String,
 }
 
+/// Review R3 item 5: where rollback stands with an entry's quarantine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum QuarantinePhase {
+    /// Written BEFORE the quarantine is created and the object moved into it:
+    /// the object may be inside the quarantine directory.
+    Quarantining,
+    /// The quarantine holds nothing of this entry any more (removed there or
+    /// moved back); at most the empty directory may remain.
+    Removed,
+}
+
+/// Review R3 item 5: the durable quarantine of one entry, in the entry's parent directory.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct QuarantineRecord {
+    /// Always [`quarantine_name`] of the transaction nonce and the entry index.
+    pub(super) name: String,
+    pub(super) phase: QuarantinePhase,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Entry {
@@ -89,6 +118,18 @@ pub(super) struct Entry {
     /// The last confirmed identity (kept while a re-creation is `intent`).
     pub(super) identity: Option<Identity>,
     pub(super) keep: Vec<String>,
+    /// Review R3 item 5: written by rollback before it moves the object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) quarantine: Option<QuarantineRecord>,
+}
+
+/// Review R3 item 5: the name prefix of every rollback quarantine directory.
+pub(super) const QUARANTINE_PREFIX: &str = ".duduclaw-rollback-";
+
+/// Review R3 item 5 (pure): the deterministic quarantine directory name of
+/// entry `index` of the transaction `nonce` (created with exclusive `mkdirat` 0700).
+pub(super) fn quarantine_name(nonce: &str, index: usize) -> String {
+    format!("{QUARANTINE_PREFIX}{}-{index}", nonce.get(..32).unwrap_or(nonce))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,7 +194,10 @@ impl Ledger {
                 || (entry.state == State::Created && entry.identity.is_none())
                 || entry.identity.as_ref().is_some_and(|identity| !identity.valid_for(entry.kind))
                 || (entry.kind != Kind::Contents && !entry.keep.is_empty()) || entry.keep.len() > MAX_KEEP
-                || !entry.keep.iter().all(|name| single_name(name)) {
+                || !entry.keep.iter().all(|name| single_name(name))
+                // Review R3 item 5: only the deterministic name, never for the gateway data.
+                || entry.quarantine.as_ref().is_some_and(|record| entry.kind == Kind::Contents
+                    || record.name != quarantine_name(&self.nonce, index)) {
                 return Err(damaged());
             }
         }
@@ -356,6 +400,95 @@ pub(super) fn present(path: &str) -> Result<bool> {
     }
 }
 
+// ── Proof of creation (review R3 item 4) ──────────────────────────────────
+
+thread_local! {
+    /// The identities creation helpers proved while a [`Recorder::record`]
+    /// runs on this thread (`None`: no record active, helpers prove nothing).
+    static PROOFS: std::cell::RefCell<Option<Vec<(String, Identity)>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// SHA-256 of a regular file through its own descriptor (positional reads from 0).
+fn hash_fd(file: &fs::File, size: u64) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::FileExt;
+    if size > MAX_HASHED_BYTES { return Err(refused("要記錄的檔案過大，已停止。")); }
+    let mut hash = Sha256::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    let mut offset = 0u64;
+    loop {
+        let count = file.read_at(&mut buffer, offset)?;
+        if count == 0 { break; }
+        offset = offset.saturating_add(count as u64);
+        if offset > size { return Err(refused("要記錄的檔案在檢查期間被修改，已停止。")); }
+        hash.update(buffer.get(..count).ok_or_else(|| refused("讀取失敗。"))?);
+    }
+    if offset != size { return Err(refused("要記錄的檔案在檢查期間被修改，已停止。")); }
+    Ok(hex::encode(hash.finalize()))
+}
+
+/// The identity of the object behind `file` (statx on the descriptor itself).
+fn identity_of_fd(file: &fs::File) -> Result<Identity> {
+    let stat = stat_at(file.as_raw_fd(), c"")?;
+    let mount_id = stat.mount_id.ok_or_else(|| refused(MOUNT_ID_UNAVAILABLE))?;
+    let (size, sha256) = if stat.mode & libc::S_IFMT == libc::S_IFREG {
+        (Some(stat.size), Some(hash_fd(file, stat.size)?))
+    } else if stat.mode & libc::S_IFMT == libc::S_IFDIR {
+        (None, None)
+    } else {
+        return Err(refused("建立的物件型別不符。"));
+    };
+    Ok(Identity { device: stat.device, inode: stat.inode, mount_id, mode: stat.mode, uid: stat.uid, gid: stat.gid,
+        size, sha256, boot_id: boot_id()? })
+}
+
+fn push_proof(path: &str, identity: Identity) {
+    PROOFS.with(|proofs| if let Some(proofs) = proofs.borrow_mut().as_mut() {
+        proofs.retain(|(proven, _)| proven != path);
+        proofs.push((path.to_owned(), identity));
+    });
+}
+
+/// Called by a creation helper with the descriptor of the object it has just
+/// CREATED at `path` with exclusive semantics (the `O_EXCL` temporary it
+/// renamed there, or the directory its `mkdir` made, opened no-follow) and
+/// finished (owner, mode, content). Outside an active record: nothing.
+pub(super) fn prove_created(path: &Path, file: &fs::File) -> Result<()> {
+    let Some(path) = path.to_str() else { return Ok(()) };
+    if !PROOFS.with(|proofs| proofs.borrow().is_some()) { return Ok(()); }
+    let identity = identity_of_fd(file)?;
+    push_proof(path, identity);
+    Ok(())
+}
+
+/// A helper changed the owner or mode of a directory it found at `path`: the
+/// proof is refreshed only when that is the very object proven in this record
+/// (same device and inode); anything else is left for the confirm re-check.
+pub(super) fn reprove(path: &Path, file: &fs::File) -> Result<()> {
+    let Some(path) = path.to_str() else { return Ok(()) };
+    let known = PROOFS.with(|proofs| proofs.borrow().as_ref().and_then(|proofs| proofs.iter()
+        .find(|(proven, _)| proven == path).map(|(_, identity)| (identity.device, identity.inode))));
+    let Some(known) = known else { return Ok(()) };
+    let identity = identity_of_fd(file)?;
+    if (identity.device, identity.inode) == known { push_proof(path, identity); }
+    Ok(())
+}
+
+/// Run `create` with proof collection active on this thread; the proofs it produced.
+fn collect_proofs<T>(create: impl FnOnce() -> T) -> (T, Vec<(String, Identity)>) {
+    struct Stop;
+    impl Drop for Stop { fn drop(&mut self) { PROOFS.with(|proofs| *proofs.borrow_mut() = None); } }
+    PROOFS.with(|proofs| *proofs.borrow_mut() = Some(Vec::new()));
+    let _stop = Stop;
+    let value = create();
+    let proofs = PROOFS.with(|proofs| proofs.borrow_mut().take()).unwrap_or_default();
+    (value, proofs)
+}
+
+fn changed_after_creation(path: &str) -> DuDuClawError {
+    refused(format!("{path} 在這次安裝建立它之後、記錄之前已被更換；已停止，沒有把它記錄為這次安裝建立的物件。請確認來源後再續接，或執行 duduclaw-bootstrap rollback。"))
+}
+
 // ── The install transaction's recorder ────────────────────────────────────
 
 /// Where the recorder persists and observes (test seam).
@@ -453,40 +586,83 @@ impl<H: LedgerHost> Recorder<H> {
                     _ => return Err(refused(format!("{path} 已存在，但不是這次安裝建立的；已停止，未覆蓋或移除它。請確認來源後再續接，或執行 duduclaw-bootstrap rollback。"))),
                 },
                 None => next.entries.push(Entry { path: (*path).to_owned(), kind: *kind, state: State::Intent,
-                    identity: None, keep: Vec::new() }),
+                    identity: None, keep: Vec::new(), quarantine: None }),
             }
         }
         self.save(next)
     }
 
-    /// Step 2 of the lifecycle: the identity of every listed path that has an
-    /// entry and now exists, one durable write. An absent object keeps its intent.
-    pub(super) fn confirm(&mut self, paths: &[&str]) -> Result<()> {
+    /// Step 2 of the lifecycle (review R3 item 4), one durable write. A path
+    /// with a proof is recorded with exactly the proven identity, and only
+    /// when the path still resolves to that object (otherwise it stays
+    /// unconfirmed and the step refuses). A path without a proof is recorded
+    /// only as the object an earlier run proved, when it is still exactly that
+    /// one; anything else keeps its intent.
+    fn confirm_proven(&mut self, paths: &[&str], proofs: &[(String, Identity)]) -> Result<()> {
         let mut next = self.ledger.clone();
+        let mut changed = None;
         for path in paths {
             let Some(entry) = next.entries.iter_mut().find(|entry| entry.path == *path) else { continue };
-            if let Some(identity) = self.host.identity(path, entry.kind)? {
-                if !identity.valid_for(entry.kind) { return Err(refused(format!("建立後讀回的物件型別不符：{path}"))); }
-                entry.identity = Some(identity);
-                entry.state = State::Created;
+            match proofs.iter().find(|(proven, _)| proven == path) {
+                Some((_, proof)) => {
+                    if !proof.valid_for(entry.kind) { return Err(refused(format!("建立後讀回的物件型別不符：{path}"))); }
+                    let proven = Entry { identity: Some(proof.clone()), ..entry.clone() };
+                    if self.host.classify(&proven)? == Now::Recorded {
+                        entry.identity = Some(proof.clone());
+                        entry.state = State::Created;
+                    } else if changed.is_none() {
+                        changed = Some(changed_after_creation(path));
+                    }
+                }
+                None => if entry.identity.is_some() && self.host.classify(entry)? == Now::Recorded {
+                    entry.state = State::Created;
+                },
             }
         }
-        self.save(next)
+        self.save(next)?;
+        match changed { Some(error) => Err(error), None => Ok(()) }
     }
 
-    /// Intent, create, identity. The identities are recorded even when the
-    /// creation failed part-way: the intent proved each path empty (or the
-    /// recorded object) right before, so what exists now is this
-    /// transaction's, and a resume then never meets an identity-less object
-    /// it would have to refuse (review H3).
+    /// Intent, create, confirm (review R3 item 4). Only what `create`'s
+    /// creation helpers PROVE they created ([`prove_created`]) is recorded —
+    /// also after a failure part-way, exactly the proven objects. An object
+    /// `create` did not make (another root actor's, or one a helper merely
+    /// found) is never recorded: its entry stays `intent`, and a resume then
+    /// refuses it by path (review H3, never adopted).
     pub(super) fn record<T>(&mut self, items: &[(&str, Kind)], create: impl FnOnce() -> Result<T>) -> Result<T> {
         self.intend(items)?;
-        let value = create();
+        let (value, proofs) = collect_proofs(create);
         let paths: Vec<&str> = items.iter().map(|(path, _)| *path).collect();
-        let confirmed = self.confirm(&paths);
+        let confirmed = self.confirm_proven(&paths, &proofs);
         let value = value?;
         confirmed?;
         Ok(value)
+    }
+
+    /// Review R3 item 4: an object another component creates (systemd's
+    /// runtime directory, the launcher's root key, R1's state root). Its
+    /// present identity is recorded only when `accept` — the caller's proof
+    /// (root-owned, on the expected mount, made by a unit PID 1 reports as this
+    /// install's …) — passes; otherwise it stays unconfirmed (an object an
+    /// earlier run recorded and still exactly present stays confirmed).
+    pub(super) fn confirm_component(&mut self, path: &str, accept: impl FnOnce(&Identity) -> Result<bool>) -> Result<()> {
+        let Some(entry) = self.ledger.entry(path).cloned() else { return Ok(()) };
+        let mut next = self.ledger.clone();
+        let current = self.host.identity(path, entry.kind)?;
+        let accepted = match &current {
+            Some(identity) => identity.valid_for(entry.kind) && accept(identity)?,
+            None => false,
+        };
+        let unchanged = !accepted && entry.identity.is_some() && self.host.classify(&entry)? == Now::Recorded;
+        for slot in next.entries.iter_mut().filter(|slot| slot.path == path) {
+            if accepted {
+                slot.identity = current.clone();
+                slot.state = State::Created;
+            } else if unchanged {
+                slot.state = State::Created;
+            }
+        }
+        self.save(next)
     }
 
     /// Review L1: the installer re-applied the permission bits `mode` to a
@@ -514,7 +690,7 @@ impl<H: LedgerHost> Recorder<H> {
         let identity = self.host.identity(path, Kind::Contents)?.ok_or_else(|| refused("Gateway 資料目錄不存在。"))?;
         let mut next = self.ledger.clone();
         next.entries.push(Entry { path: path.to_owned(), kind: Kind::Contents, state: State::Created,
-            identity: Some(identity), keep });
+            identity: Some(identity), keep, quarantine: None });
         self.save(next)
     }
 }
@@ -536,12 +712,31 @@ mod tests {
     fn ledger() -> Ledger {
         let mut ledger = Ledger::new(&"cd".repeat(32), &nonce());
         ledger.entries.push(Entry { path: UNIT_PATH.into(), kind: Kind::File, state: State::Created,
-            identity: Some(identity(Kind::File, 7)), keep: Vec::new() });
+            identity: Some(identity(Kind::File, 7)), keep: Vec::new(), quarantine: None });
         ledger.entries.push(Entry { path: "/opt/duduclaw-isolated".into(), kind: Kind::Tree, state: State::Intent,
-            identity: None, keep: Vec::new() });
+            identity: None, keep: Vec::new(), quarantine: None });
         ledger.entries.push(Entry { path: GATEWAY_DATA_PATH.into(), kind: Kind::Contents, state: State::Created,
-            identity: Some(identity(Kind::Contents, 9)), keep: vec!["license.json".into()] });
+            identity: Some(identity(Kind::Contents, 9)), keep: vec!["license.json".into()], quarantine: None });
         ledger
+    }
+
+    #[test]
+    fn quarantine_record_is_bound_to_nonce_and_index() {
+        let mut good = ledger();
+        good.entries[0].quarantine = Some(QuarantineRecord { name: quarantine_name(&nonce(), 0),
+            phase: QuarantinePhase::Quarantining });
+        let bytes = serde_json::to_vec(&good).unwrap();
+        assert_eq!(Ledger::parse(&bytes).unwrap(), good);
+        assert_eq!(quarantine_name(&nonce(), 0), format!("{QUARANTINE_PREFIX}{}-0", "5a".repeat(16)));
+        // A ledger without the field (no rollback yet) still parses.
+        assert!(!String::from_utf8(serde_json::to_vec(&ledger()).unwrap()).unwrap().contains("quarantine"));
+        // Another index, another nonce, a free name, or the gateway data: damaged.
+        for (index, name) in [(0, quarantine_name(&nonce(), 1)), (0, quarantine_name(&"6b".repeat(32), 0)),
+            (0, format!("{QUARANTINE_PREFIX}x")), (0, "../etc".to_owned()), (2, quarantine_name(&nonce(), 2))] {
+            let mut bad = ledger();
+            bad.entries[index].quarantine = Some(QuarantineRecord { name, phase: QuarantinePhase::Removed });
+            assert!(bad.validate().is_err(), "{:?}", bad.entries[index].quarantine);
+        }
     }
 
     #[test]
@@ -580,7 +775,8 @@ mod tests {
         assert!(Ledger::parse(&vec![b' '; MAX_LEDGER_BYTES + 1]).is_err());
         let mut many = Ledger::new(&"cd".repeat(32), &nonce());
         for _ in 0..=MAX_ENTRIES {
-            many.entries.push(Entry { path: UNIT_PATH.into(), kind: Kind::File, state: State::Intent, identity: None, keep: Vec::new() });
+            many.entries.push(Entry { path: UNIT_PATH.into(), kind: Kind::File, state: State::Intent, identity: None,
+                keep: Vec::new(), quarantine: None });
         }
         assert!(many.validate().is_err());
         assert!(good.covers("/opt/duduclaw-isolated/current") && good.covers(UNIT_PATH));
@@ -664,6 +860,8 @@ mod tests {
             let mut world = created.borrow_mut();
             world.events.push("create".into());
             world.objects.push((UNIT_PATH.into(), identity(Kind::File, 7)));
+            // The creation helper's proof (the descriptor of what it created).
+            push_proof(UNIT_PATH, identity(Kind::File, 7));
             Ok(())
         }).unwrap();
         let events = world.borrow().events.clone();
@@ -714,11 +912,14 @@ mod tests {
         let created = world.clone();
         recorder.record(&[(UNIT_PATH, Kind::File)], move || {
             created.borrow_mut().put(UNIT_PATH, identity(Kind::File, 7));
+            push_proof(UNIT_PATH, identity(Kind::File, 7));
             Ok(())
         }).unwrap();
-        // The recorded object is still there: re-intent proceeds (resume of the same step).
-        recorder.intend(&[(UNIT_PATH, Kind::File)]).unwrap();
-        recorder.confirm(&[UNIT_PATH]).unwrap();
+        // The recorded object is still there: re-intent proceeds (resume of the
+        // same step) and, with nothing created now, it stays the confirmed one.
+        recorder.record(&[(UNIT_PATH, Kind::File)], || Ok(())).unwrap();
+        let entry = recorder.ledger().entry(UNIT_PATH).unwrap().clone();
+        assert_eq!((entry.state, entry.identity), (State::Created, Some(identity(Kind::File, 7))));
         let before = recorder.ledger().clone();
         let saves = world.borrow().saved.len();
         // An administrator or a package replaced it after a crash: refused by path, entry untouched.
@@ -751,19 +952,101 @@ mod tests {
     }
 
     #[test]
-    fn ledger_records_identity_even_when_creation_failed_part_way() {
+    fn failed_creation_never_confirms_a_foreign_object_at_the_path() {
+        // Review R3 item 4: the creation failed before its descriptor existed,
+        // and meanwhile another root actor created an object at the path.
         let world = Rc::new(RefCell::new(World::default()));
         let mut recorder = open(&world);
-        let created = world.clone();
+        let foreign = world.clone();
         let failed = recorder.record(&[("/usr/lib/duduclaw", Kind::Tree)], move || -> Result<()> {
-            created.borrow_mut().put("/usr/lib/duduclaw", identity(Kind::Tree, 12));
-            Err(refused("failed after creating the directory"))
+            foreign.borrow_mut().put("/usr/lib/duduclaw", identity(Kind::Tree, 12));
+            Err(refused("failed before creating anything"))
         });
         assert!(failed.is_err());
         let entry = recorder.ledger().entry("/usr/lib/duduclaw").unwrap().clone();
-        assert_eq!((entry.state, entry.identity), (State::Created, Some(identity(Kind::Tree, 12))));
-        // So the re-run re-intends it instead of refusing an identity-less object.
-        recorder.intend(&[("/usr/lib/duduclaw", Kind::Tree)]).unwrap();
+        assert_eq!((entry.state, entry.identity), (State::Intent, None), "not recorded as ours");
+        // Per the existing rule a resume refuses it by path (never adopted).
+        let error = recorder.intend(&[("/usr/lib/duduclaw", Kind::Tree)]).unwrap_err().to_string();
+        assert!(error.contains("/usr/lib/duduclaw"), "{error}");
+        // The same when the step "succeeds" without having created it (a helper merely found it).
+        let foreign = world.clone();
+        recorder.record(&[(BINARY, Kind::File)], move || {
+            foreign.borrow_mut().put(BINARY, identity(Kind::File, 13));
+            Ok(())
+        }).unwrap();
+        assert_eq!(recorder.ledger().entry(BINARY).unwrap().identity, None);
+    }
+
+    #[test]
+    fn part_way_failure_confirms_exactly_the_proven_objects() {
+        let world = Rc::new(RefCell::new(World::default()));
+        let mut recorder = open(&world);
+        let host = world.clone();
+        let items = [(UNIT_PATH, Kind::File), (LAUNCHER, Kind::File), ("/opt/duduclaw", Kind::Directory)];
+        let failed = recorder.record(&items, move || -> Result<()> {
+            // Created and proven by its descriptor.
+            host.borrow_mut().put(UNIT_PATH, identity(Kind::File, 20));
+            push_proof(UNIT_PATH, identity(Kind::File, 20));
+            // Appeared without a proof (another actor's).
+            host.borrow_mut().put(LAUNCHER, identity(Kind::File, 21));
+            Err(refused("failed part-way"))
+        });
+        assert!(failed.is_err());
+        let state = |path: &str| { let entry = recorder.ledger().entry(path).unwrap(); (entry.state, entry.identity.clone()) };
+        assert_eq!(state(UNIT_PATH), (State::Created, Some(identity(Kind::File, 20))));
+        assert_eq!(state(LAUNCHER), (State::Intent, None));
+        assert_eq!(state("/opt/duduclaw"), (State::Intent, None));
+        // A proof whose path no longer resolves to the proven object (swapped
+        // before the confirm): not recorded, and the step refuses.
+        let host = world.clone();
+        let swapped = recorder.record(&[(BINARY, Kind::File)], move || {
+            push_proof(BINARY, identity(Kind::File, 30));
+            host.borrow_mut().put(BINARY, identity(Kind::File, 31));
+            Ok(())
+        });
+        assert!(swapped.unwrap_err().to_string().contains(BINARY));
+        assert_eq!(recorder.ledger().entry(BINARY).unwrap().identity, None);
+        // A proof is only collected inside a record.
+        push_proof(VERSION_PENDING, identity(Kind::File, 40));
+        recorder.record(&[(VERSION_PENDING, Kind::File)], || Ok(())).unwrap();
+        assert_eq!(recorder.ledger().entry(VERSION_PENDING).unwrap().identity, None);
+    }
+
+    #[test]
+    fn component_objects_are_confirmed_only_with_the_callers_proof() {
+        let world = Rc::new(RefCell::new(World::default()));
+        let mut recorder = open(&world);
+        let runtime = super::super::bootstrap::SPAWND_RUNTIME;
+        recorder.intend(&[(runtime, Kind::Tree)]).unwrap();
+        world.borrow_mut().put(runtime, identity(Kind::Tree, 50));
+        // PID 1 does not report this install's unit for it: unconfirmed.
+        recorder.confirm_component(runtime, |_| Ok(false)).unwrap();
+        assert_eq!(recorder.ledger().entry(runtime).unwrap().identity, None);
+        recorder.confirm_component(runtime, |identity| Ok(identity.inode == 50)).unwrap();
+        let entry = recorder.ledger().entry(runtime).unwrap().clone();
+        assert_eq!((entry.state, entry.identity), (State::Created, Some(identity(Kind::Tree, 50))));
+        // Absent, or no entry: nothing recorded.
+        recorder.confirm_component(VERSION_FLOOR, |_| Ok(true)).unwrap();
+        assert!(recorder.ledger().entry(VERSION_FLOOR).is_none());
+    }
+
+    #[test]
+    fn creation_proof_is_the_descriptors_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("unit");
+        let (result, proofs) = collect_proofs(|| -> Result<()> {
+            let mut file = fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path)?;
+            std::io::Write::write_all(&mut file, b"created")?;
+            prove_created(&path, &file)
+        });
+        result.unwrap();
+        let dir = fs::File::open(directory.path()).unwrap();
+        let on_disk = identity_at(&dir, c"unit", Kind::File).unwrap().unwrap();
+        assert_eq!(proofs, vec![(path.to_str().unwrap().to_owned(), on_disk)]);
+        // Outside a record nothing is collected.
+        let file = fs::File::open(&path).unwrap();
+        prove_created(&path, &file).unwrap();
+        assert!(PROOFS.with(|proofs| proofs.borrow().is_none()));
     }
 
     #[test]
@@ -773,6 +1056,7 @@ mod tests {
         let created = world.clone();
         recorder.record(&[("/opt/duduclaw", Kind::Directory)], move || {
             created.borrow_mut().put("/opt/duduclaw", identity(Kind::Directory, 4));
+            push_proof("/opt/duduclaw", identity(Kind::Directory, 4));
             Ok(())
         }).unwrap();
         let with_mode = |mode: u32| Identity { mode: libc::S_IFDIR | mode, ..identity(Kind::Directory, 4) };
@@ -782,8 +1066,8 @@ mod tests {
         recorder.rerecord_mode("/opt/duduclaw", 0o700).unwrap();
         assert_eq!(world.borrow().saved.len(), saves + 1);
         assert_eq!(recorder.ledger().entry("/opt/duduclaw").unwrap().identity, Some(with_mode(0o700)));
-        recorder.intend(&[("/opt/duduclaw", Kind::Directory)]).unwrap();
-        recorder.confirm(&["/opt/duduclaw"]).unwrap();
+        recorder.record(&[("/opt/duduclaw", Kind::Directory)], || Ok(())).unwrap();
+        assert_eq!(recorder.ledger().entry("/opt/duduclaw").unwrap().state, State::Created);
         // Idempotent: nothing to re-record once recorded.
         let saves = world.borrow().saved.len();
         recorder.rerecord_mode("/opt/duduclaw", 0o700).unwrap();
@@ -811,7 +1095,8 @@ mod tests {
         let dir = fs::File::open(directory.path()).unwrap();
         let boot = boot_id().unwrap();
         let Some(recorded) = identity_at(&dir, c"unit", Kind::File).unwrap() else { panic!("present") };
-        let entry = Entry { path: UNIT_PATH.into(), kind: Kind::File, state: State::Created, identity: Some(recorded), keep: Vec::new() };
+        let entry = Entry { path: UNIT_PATH.into(), kind: Kind::File, state: State::Created, identity: Some(recorded),
+            keep: Vec::new(), quarantine: None };
         assert_eq!(classify_at(&dir, c"unit", &entry, &boot).unwrap(), Now::Recorded);
         // Same bytes, replaced by rename (a package or an administrator): another inode.
         fs::write(directory.path().join("unit.new"), b"first").unwrap();
