@@ -501,12 +501,13 @@ pub(super) fn random_hex(bytes: usize) -> Result<String> {
     let mut filled = 0;
     while filled < bytes {
         let rest = buffer.get_mut(filled..).ok_or_else(|| refused("無法取得隨機數。"))?;
-        // SAFETY: writes at most `rest.len()` bytes into the live buffer.
-        let count = unsafe { libc::getrandom(rest.as_mut_ptr().cast(), rest.len(), 0) };
+        // SAFETY: SYS_getrandom writes at most `rest.len()` bytes into the live buffer; flags are zero.
+        let count = unsafe { libc::syscall(libc::SYS_getrandom, rest.as_mut_ptr(), rest.len(), 0 as libc::c_uint) };
         if count < 0 {
             if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) { continue; }
             return Err(refused("無法取得隨機數。"));
         }
+        if count == 0 { return Err(refused("無法取得隨機數。")); }
         filled += count as usize;
     }
     Ok(hex::encode(buffer))
