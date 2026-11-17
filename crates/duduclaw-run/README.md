@@ -26,6 +26,11 @@ newer with Landlock ABI 1 or later, seccomp, and root in a systemd transient ser
 the design's capabilities and private devices. macOS/Windows build only the pure
 policy and validation logic and return an unsupported-platform refusal.
 
+The PID-namespace init and every HX helper are created with legacy
+`clone(CLONE_PIDFD | SIGCHLD)` (`linux::process`), never `clone3`: systemd's
+`RestrictNamespaces=` on the run unit returns ENOSYS for `clone3`. The kernel
+probe checks pidfd support with `pidfd_open` on itself and creates no process.
+
 ```sh
 CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-run --offline
 CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo check -p duduclaw-run --target x86_64-unknown-linux-gnu --offline

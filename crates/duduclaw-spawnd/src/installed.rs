@@ -262,6 +262,26 @@ fn parse_policy(bytes: &[u8]) -> io::Result<SignedPolicy> {
     validate_turn_limits(&policy)?;
     Ok(policy)
 }
+/// The egress profile ids the signed isolation policy names (`network:
+/// {kind: egress, profile}` of each runtime record), in first-seen order and
+/// without duplicates, read through the same strict reader spawnd uses at
+/// start (`parse_policy`: version/domain, step ranges, canonical Claude+MCP
+/// argument shapes) plus the runtime/native pairing `bundle` requires. The
+/// root installer (R3 S5) writes `/etc/duduclaw/egress.json` from exactly
+/// these ids; a policy spawnd would refuse is refused here as well.
+pub fn signed_policy_egress_profiles(bytes: &[u8]) -> io::Result<Vec<ProfileId>> {
+    if bytes.len() > 1024 * 1024 { return Err(denied()); }
+    let policy = parse_policy(bytes)?;
+    if policy.native.len() != policy.runtimes.len() { return Err(denied()); }
+    let mut profiles = Vec::new();
+    for runtime in &policy.runtimes {
+        if !policy.native.iter().any(|native| native.profile == runtime.profile) { return Err(denied()); }
+        if let NetworkPolicy::Egress(profile) = &runtime.network {
+            if !profiles.contains(profile) { profiles.push(*profile); }
+        }
+    }
+    Ok(profiles)
+}
 /// R6 review round, finding 3: decided on the raw document, because the typed
 /// record reads both an absent key and `"turn_limit": null` as `None`. A
 /// v1/v2 runtime record must not carry the key at all; a v3 record either

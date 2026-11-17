@@ -1065,7 +1065,7 @@
       "rationale": "Operator installation/service-lifecycle helper; runs service-manager commands under the invoking administrator or gateway identity, not employee content."
     },
     {
-      "symbol": "crates/duduclaw-cli/src/service/protected_linux_install.rs::command",
+      "symbol": "crates/duduclaw-cli/src/service/protected_linux_install.rs::command_within",
       "apis": {
         "command_constructor": 1,
         "terminal_spawn": 1
@@ -1075,7 +1075,7 @@
       ],
       "identity": "gateway",
       "migration": "gateway_exception",
-      "rationale": "Operator-only protected Linux installer invokes root-trusted OS utilities with fixed caller-built argv, cleared environment and null stdin. Temporary-file capture is capped at 4 MiB per stream with a 30-second child deadline; no employee prompt, shell text or backend workload runs here."
+      "rationale": "Operator-only protected Linux installer invokes root-trusted OS utilities with fixed caller-built argv, cleared environment and null stdin. Temporary-file capture is capped at 4 MiB per stream with a child deadline of at most 30 seconds. The helper takes an ABSOLUTE deadline (`command` passes now + 30 s; the shared resume/rollback quiesce and its full process scan, including every `getent passwd` lookup of protected_linux_uninstall.rs::processes_clear_until, pass their one quiesce deadline): it is checked on entry, immediately before and right after the spawn, the child gets min(deadline, spawn + 30 s), and nothing is spawned or read once it has passed. No employee prompt, shell text or backend workload runs here. v1.83 R3: the isolation bootstrap, its rollback and its creation ledger (protected_linux_bootstrap.rs, protected_linux_rollback.rs, protected_linux_ledger.rs) run every tool only through this helper (systemctl — including the quiesce's fixed `list-units --all --no-legend --plain --no-pager duduclaw-* duduclaw.slice`, `list-jobs --no-legend --plain --no-pager duduclaw-* duduclaw.slice`, `show <unit> --property=…`, `stop <unit>` and, for spawnd's transient run units and employee slices only, `kill --signal=SIGKILL <unit>` on validated unit names — useradd, getent including the full `getent passwd` / `getent group` enumeration of the service-identity alias check, id, loginctl, `dmsetup table --major M --minor m` for the read-only storage-chain check and, via parse_runtime_tree, python3 -I; the root-only #[ignore] test iso_root_install_rollback_refuses_bind_mount_inside_tree also runs `mount --bind` / `umount` on fixed test paths of a disposable VM); their output is parsed, never printed, and those files add no other process spawn. Their privileged file effects (unlinkat/rmdir of ledgered objects only, after a statx STATX_MNT_ID identity match) are filesystem operations, not process effects."
     },
     {
       "symbol": "crates/duduclaw-container/src/apple.rs::AppleContainerRuntime::is_available",
@@ -7256,6 +7256,18 @@
       "rationale": "Ignored root Linux acceptance test forks a child into a private mount namespace to check the /etc protected-mode projection, then _exits; not a production spawn path."
     },
     {
+      "symbol": "crates/duduclaw-spawnd/src/transport.rs::tests::root_tests::iso_root_egress_control_identity_over_socket_activation",
+      "apis": {
+        "raw_fork": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Ignored root Linux test forks a child that drops to a temporary system account and answers one socket frame to verify egress credential checks; not a production spawn path."
+    },
+    {
       "symbol": "crates/duduclaw-spawnd/src/allocation_retire_tests.rs::iso_root_retire_gid_match_counts_as_live",
       "apis": {
         "command_constructor": 1,
@@ -7377,7 +7389,7 @@
       ],
       "identity": "trampoline",
       "migration": "privileged_service",
-      "rationale": "HX in-run helper launcher (D8 revision 2.1/2.4/2.5) inside the duduclaw-run trampoline: raw clone with CLONE_PIDFD, then Child::exec of a root-verified signed helper fd (execveat) after setsid/PDEATHSIG, slot cgroup, exact fds, stacked Landlock, hard=soft rlimits and seccomp. Runs only inside the isolated run, holds no capability, prompt, stdin, MCP channel or egress socket; no gateway invocation or local fallback."
+      "rationale": "HX in-run helper launcher (D8 revision 2.1/2.4/2.5) inside the duduclaw-run trampoline: raw legacy clone(CLONE_PIDFD | SIGCHLD) via linux::process::clone_with_pidfd (shared with namespace-init creation; never clone3), then Child::exec of a root-verified signed helper fd (execveat) after setsid/PDEATHSIG, slot cgroup, exact fds, stacked Landlock, hard=soft rlimits and seccomp. Runs only inside the isolated run, holds no capability, prompt, stdin, MCP channel or egress socket; no gateway invocation or local fallback."
     },
     {
       "symbol": "crates/duduclaw-run/src/linux/runner.rs::tests::launcher_ready_before_all_isolated",
@@ -7402,6 +7414,18 @@
       "identity": "test",
       "migration": "test_only",
       "rationale": "Test-only fork child lowers its own rlimits and _exits; not a production spawn path."
+    },
+    {
+      "symbol": "crates/duduclaw-run/src/linux/mounts.rs::tests::iso_root_attach_input_without_dac_capabilities",
+      "apis": {
+        "raw_fork": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Root-only ignored test (DUDUCLAW_ISO_DISPOSABLE=1): the fork child enters a private mount namespace, reduces its capabilities to the run unit's set and calls attach_input, then _exits; never execs, not a production spawn path."
     },
     {
       "symbol": "crates/duduclaw-run/src/bin/root-fixture/helpers.rs::Session::new",

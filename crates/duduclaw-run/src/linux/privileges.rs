@@ -132,7 +132,7 @@ fn set_oom_score_adj(path: &std::ffi::CStr, value: i32) -> Result<()> {
     Ok(())
 }
 /// HX [F2]: only the supervisor (outside the run's PID namespace) is OOM-protected.
-/// Called by the root trampoline before pivot (host procfs) and before clone3.
+/// Called by the root trampoline before pivot (host procfs) and before the init clone.
 pub fn protect_supervisor_from_oom() -> Result<()> {
     set_oom_score_adj(c"/proc/self/oom_score_adj", SUPERVISOR_OOM_SCORE_ADJ)
 }

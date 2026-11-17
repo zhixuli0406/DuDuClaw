@@ -6,6 +6,29 @@ The per-employee isolation architecture (planned for a later release) separates 
 
 **What you can install today:** `service install --protected-linux` does not install spawnd, egress or the separate updater, and nothing creates the migration plan. Until the isolation fresh bootstrap lands (planned for a later release), the protected service is the v1.80 single-binary gateway service described in [Single-binary protected service (current releases)](#single-binary-protected-service-current-releases). The per-employee Linux isolation described in this guide does not apply to it.
 
+## Fresh isolated install (v1.83.0 and later)
+
+From v1.83.0, a new protected host is installed only through the independently verified `duduclaw-bootstrap install`. On a host that never had DuDuClaw, `sudo duduclaw service install --protected-linux` prints the steps below and changes nothing. `--migrate-from` is refused for every protected install. A host that already runs the v1.80–v1.82 single-binary protected service (or has its leftover files) is refused by this flow; it needs the upgrade path instead. The isolated install requires the TEAM edition.
+
+1. As root, create the download directory: `install -d -m 0700 -o root -g root /root/duduclaw-migrate`.
+2. Save these as files in that directory: `duduclaw-bootstrap`, `duduclaw-isolated-linux-<arch>-<version>.tar` and its `.minisig`, `.authorization.json` and `.authorization.json.signatures.json`, plus your TEAM license `license.json` (owned by root, not writable by group or others).
+3. Compare them with `sha256sum -c` against the values published on the website and in the license console. Both must agree.
+4. Run `sudo /root/duduclaw-migrate/duduclaw-bootstrap install [--dns-upstream <IP:53>] [--host-public-address <IP>]... [--enable-now]`.
+
+| Option | Meaning |
+| --- | --- |
+| `--dns-upstream <IP:53>` | Only on hosts without systemd-resolved: the single upstream of the dedicated DNS broker. Refused when systemd-resolved is available. It is never added to the employees' egress rules. |
+| `--host-public-address <IP>` | A public address of this host that is on no interface (cloud 1:1 NAT); repeatable, at most 64. Employees are denied connections to it. |
+| `--enable-now` | Start the gateway at the end and run the full readiness check. Without it the gateway is enabled but not started. |
+
+The installer checks the host before it changes anything and lists every failed item: Ubuntu 22.04, Ubuntu 24.04 or Debian 12; systemd 249 or later; kernel 5.15 or later; cgroup v2; `/var/lib` on ext4 or XFS; explicit `SYS_UID_MAX`/`SYS_GID_MAX` in `/etc/login.defs`; no account, group or subordinate ID range in 70000–99999; the sshd main configuration includes `/etc/ssh/sshd_config.d/*.conf`; `cron.allow`/`at.allow` do not admit DuDuClaw accounts; enough free space; a valid TEAM license; no earlier DuDuClaw installation. Hosts with an external account service (LDAP, SSSD and similar) are not supported by this installer.
+
+It then confirms that nothing runs as the service account, publishes the verified update trust root, generation and fixed-path programs, creates the service accounts, directories and units, writes the egress and DNS configuration from the signed policy, starts spawnd, egress, the parser socket and the update service, enables the nightly update timer (`duduclaw-auto-upgrade.timer`), runs the composite readiness check and only then installs and enables the gateway unit. The install reports success only after the composite readiness check passes.
+
+**Resume.** Progress is recorded in `/var/lib/duduclaw-protected/isolation-bootstrap.json`. If the install stops (an error, a reboot, a power loss), fix the reported cause and run the same `duduclaw-bootstrap install` command again; it continues at the first unfinished step. You may omit the options on a resume; different values are refused. A different bundle is refused until you roll back. While an install is unfinished, `service install`, `upgrade` and `uninstall --protected-linux` are refused.
+
+**Rollback.** Before the last step (commit), `sudo /root/duduclaw-migrate/duduclaw-bootstrap rollback` (with the same bundle files still in the directory) returns the host to its state before the install. It stops and disables the services, then removes the installed programs and units, the update service's trust, state and generations, spawnd's state, `egress.json`, `dns-broker.json`, the root key and the gateway data the install created. It keeps the system accounts, the empty gateway data directory with your license, the protected-mode marker and the record that prevents installing an older bundle. Removal never follows links or crosses mounts; if anything remains, the paths are listed and the same command can be run again. After the commit, rollback is refused; use `service uninstall --protected-linux`.
+
 ## What changes for customers
 
 The changes below apply once the isolation architecture is available. They do not apply to current installations.

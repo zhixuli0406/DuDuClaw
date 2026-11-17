@@ -83,6 +83,29 @@ They require a disposable root Linux VM and the installation prerequisites named
 in each ignore reason. The account test modifies login ACLs; the systemd resource
 test requires the complete trusted service hierarchy.
 
+Every run unit carries `RestrictNamespaces=mnt ipc uts net pid`
+(`systemd::TRAMPOLINE_NAMESPACES`). Under it systemd's seccomp filter returns
+ENOSYS for `clone3`, so `duduclaw-run` creates its PID-namespace init and HX
+helpers with legacy `clone(CLONE_PIDFD | SIGCHLD)` and never probes `clone3`.
+
+## Egress control client (v1.83 R7e)
+
+spawnd is the only client of `/run/duduclaw-egress/control.sock`, which
+`duduclaw-egress.socket` creates through PID 1 as `root:root 0600` in a
+root-owned 0755 directory. Because PID 1 created and listens on it, neither the
+socket file owner nor `SO_PEERCRED` identifies the service (both are root).
+`Seqpacket::connect_fixed_egress` therefore requires exactly that endpoint shape
+(every ancestor a root-owned directory without group/other write, the socket
+`root:root` mode 0600 and not a symlink), enables `SO_PASSCRED` before
+connecting, and returns an `EgressSeqpacket` whose only receive path requires,
+for every frame, exactly one kernel-attached `SCM_CREDENTIALS` naming the
+`duduclaw-egress` uid/gid with a non-zero pid. A frame without credentials, with
+several, with another account's or with truncated control data is refused, the
+connection is shut down and the cached client dropped; the next call reconnects.
+The egress account is never uid 0. The egress service is unchanged and still
+requires a root peer. The generic `Seqpacket::recv` (gateway, update control)
+keeps refusing any credentials message.
+
 ## Update control endpoint (v1.83 R6)
 
 `update_control.rs` serves `/run/duduclaw-spawnd/update.sock` (root 0600 in the

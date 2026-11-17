@@ -419,6 +419,8 @@ mod tests {
                 assert_eq!(evaluate(&filter,arch.audit(),arch.nr(56,220),[bit,0,0,0,0,0]),DENY);
             }
             assert_eq!(evaluate(&filter,arch.audit(),arch.nr(56,220),[17,0,0,0,0,0]),ALLOW);
+            // linux::process::FLAGS (CLONE_PIDFD | SIGCHLD): the HX helper clone under common.
+            assert_eq!(evaluate(&filter,arch.audit(),arch.nr(56,220),[0x1000|17,0,0x7fff_0000,0,0,0]),ALLOW);
             for ioctl in [0x5412,0x541c,0x100005412] {
                 assert_eq!(evaluate(&filter,arch.audit(),arch.nr(16,29),[0,ioctl,0,0,0,0]),DENY);
             }

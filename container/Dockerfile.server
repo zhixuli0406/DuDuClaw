@@ -49,6 +49,7 @@ COPY docs/README.md docs/README.md
 # `duduclaw channels googlechat bootstrap`, since v1.79.3.
 COPY scripts/googlechat/ scripts/googlechat/
 COPY scripts/linux-protected/ scripts/linux-protected/
+COPY scripts/live-test/linux-protected/install-acceptance.sh scripts/live-test/linux-protected/install-acceptance.sh
 # Keep the agent-authority test include covered by the embedded-path check:
 # crates/duduclaw-gateway/src/handlers/agent_authority.rs includes this fixture
 # inside a test module of a non-test file.
