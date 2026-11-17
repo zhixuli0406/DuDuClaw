@@ -620,9 +620,75 @@ than v4 (nothing is sent), an unreadable configuration, no connection, a
 `Refused` answer or a failed exchange all read as not verified. The refresh
 path only loads an atomic snapshot. A probe holds the control connection for
 one exchange (egress's 3 s deadline), so a run registration waits at most that
-long behind it. `egress_verified` is unchanged; `egress_second_layer` is
-reported `unavailable` until its own readback exists (it came from the
-receipt's DNS part).
+long behind it. `egress_verified` is unchanged; `egress_second_layer` has its
+own readback (next section).
+
+### R7b: egress second layer from PID 1
+
+`egress_second_layer` (display-only: `Readiness::check` does not include it)
+no longer comes from the receipt. `egress_layer` runs a background worker with
+the DNS evidence's snapshot and cadence (fresh for 60 s, re-read after 45 s,
+retried after 5 s; the refresh path only loads the snapshot) and its own D-Bus
+connection to PID 1 (`Systemd::egress_second_layer`, read-only properties):
+
+- `duduclaw-egress.service` must be loaded (`GetUnit`; never loaded by spawnd)
+  from exactly `/etc/systemd/system/duduclaw-egress.service` with no drop-in (a
+  drop-in could add `IPAddressAllow=any`), no pending daemon-reload, not
+  transient (`systemd::fixed_unit_load_mismatch`, the self-test unit's rule
+  generalised to a unit name), and `active`.
+- Its `IPAddressDeny` and `IPAddressAllow` (`a(iayu)`: family 2/10, address
+  bytes, prefix length) must each equal, as an exact multiset (PID 1 reports
+  them in hash order), the sets parsed from the shipped unit text spawnd embeds
+  (`systemd::EGRESS_UNIT_TEXT`, `crates/duduclaw-egress/systemd/duduclaw-egress.service`:
+  22 deny and 9 allow prefixes). The parser (`systemd::unit_ip_rules`) is
+  strict: every assignment in `[Service]`, literal `address/prefix` tokens only
+  (no `any`, no bare address, no host bits beyond the prefix), no duplicates, no
+  empty assignment; a parse failure is `unavailable`.
+- When `/etc/duduclaw/egress.json` selects `dedicated_dns_broker`,
+  `duduclaw-dns-broker.service` must also be loaded from its own file with no
+  drop-in (it may be idle: it is socket-activated), `IPAddressDeny` exactly
+  `::/0` and `0.0.0.0/0` (`any`), and `IPAddressAllow` non-empty with every
+  entry a single unicast, non-loopback host (/32 or /128). Nothing in the
+  protected installer writes that allow line today, so a broker host reads
+  `unavailable`.
+
+Anything else (not loaded, not active, a property unreadable, a mismatch) is
+`unavailable`, never a readiness failure; the reason is logged when it changes,
+not on every read. The egress unit starts only after spawnd's readiness gate,
+so the value is `unavailable` until the first successful readback. This
+verifies what PID 1 has configured for the unit, not that the cgroup BPF
+filter is attached in the kernel (reading the attached programs needs a
+privilege spawnd does not hold).
+
+### R7b: file-owner inventory at UID allocation
+
+The receipt's `unowned_uids`/`owner_inventory_digest` and
+`InstallationEvidence::no_existing_file_owner` are gone. `Registry::reserve`
+asks the account host once per allocation, before trying any candidate, for
+the occupied ids (`AccountHost::occupied_ids` → `owner_inventory::scan_installed`);
+the per-candidate `getent passwd|group` checks are unchanged, and so are the
+tombstone and retire rules. The scan covers only spawnd's own state directories
+that can hold employee-owned files (`owner_inventory::INVENTORY_ROOTS`):
+`/var/lib/duduclaw-spawnd/{work-anchors,images,storage,projections,etc-state}`.
+spawnd cannot see the host's `/home`, `/root` or `/tmp` by design, so files
+there are outside it. Every uid and gid inside the employee range that owns an
+entry (roots included) is collected; a candidate found as either is skipped
+(an employee's gid is its uid). Each root is opened from `/` without symlinks
+through root-owned, not group/other-writable components; entries are read
+through directory descriptors and inspected with `fstatat(AT_SYMLINK_NOFOLLOW)`
+(a symlink is recorded, never followed); subdirectories are entered only with
+`openat2(RESOLVE_BENEATH|NO_SYMLINKS|NO_MAGICLINKS|NO_XDEV)`, so a mounted
+employee image or any other mount is recorded by the owner seen from its
+parent and never entered. Bounds: 200,000 entries in total, 12 levels below a
+root. Exceeding one, or any error other than a root that does not exist yet
+(fresh install: empty), fails the inventory: the allocation is refused (and
+logged) with nothing reserved or tombstoned.
+
+```bash
+# Disposable root VM:
+DUDUCLAW_ISO_DISPOSABLE=1 cargo test -p duduclaw-spawnd --lib systemd::linux::tests::iso_root_egress_second_layer_readback_matches_real_systemd -- --ignored --exact --test-threads=1
+DUDUCLAW_ISO_DISPOSABLE=1 cargo test -p duduclaw-spawnd --lib owner_inventory::tests::iso_root_uid_inventory_finds_foreign_owned_files_and_skips_mounts -- --ignored --exact --test-threads=1
+```
 
 ## UserDB account verification
 
@@ -700,9 +766,11 @@ state or executable path is disclosed through the projection.
 
 `/run/duduclaw-isolation-evidence/installation.json` is a root-harness receipt,
 not an operator configuration. It binds the committed generation and current
-boot with at most 60 seconds validity. It records UID inventory and permanent
-external-IAM reservation digests; and per-account SSH positive control, denied
-public-key login and forwarding observations. Since R7a it carries no trampoline
+boot with at most 60 seconds validity. It records the permanent external-IAM
+reservation digest and per-account SSH positive control, denied public-key
+login and forwarding observations. Since R7b it carries no file-owner
+inventory (`unowned_uids`, `owner_inventory_digest` are refused as unknown
+fields; see "R7b: file-owner inventory at UID allocation"). Since R7a it carries no trampoline
 facts (a receipt with a `trampoline` member is refused as an unknown field); the
 trampoline digest, self-test and ABI evidence come from spawnd's own self-test
 (see "R7a: trampoline facts from spawnd's own self-test" above). Since R7b it

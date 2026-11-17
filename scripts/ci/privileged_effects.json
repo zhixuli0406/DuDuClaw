@@ -7282,6 +7282,19 @@
       "rationale": "Ignored root Linux acceptance test re-executes only itself in a fresh process to verify that a mounted CA chain is refused in a private mount namespace; not a production spawn path."
     },
     {
+      "symbol": "crates/duduclaw-spawnd/src/owner_inventory.rs::tests::iso_root_uid_inventory_finds_foreign_owned_files_and_skips_mounts",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Ignored root Linux acceptance test (DUDUCLAW_ISO_DISPOSABLE=1) re-executes only itself (current test binary, --exact) so its bind mount over a fixture subdirectory lives in a fresh process's private mount namespace while the UID allocation's file-owner inventory is checked not to enter it; not a production spawn path."
+    },
+    {
       "symbol": "crates/duduclaw-spawnd/src/transport.rs::tests::root_tests::iso_root_egress_control_identity_over_socket_activation",
       "apis": {
         "raw_fork": 1

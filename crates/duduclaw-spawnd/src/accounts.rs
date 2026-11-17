@@ -141,9 +141,10 @@ pub fn partial_identity(account: &EmployeeAccount, users: &[PasswdEntry], groups
 
 /// Deployment evidence is supplied by the privileged installer/readiness harness.
 /// It cannot be supplied by SpawnRequest or inferred from a successful `sshd -T`.
+/// R7b: file ownership is not installer evidence; spawnd scans its own state
+/// directories at each allocation (`AccountHost::occupied_ids`).
 pub trait InstallationEvidence: Send + Sync {
     fn external_nss_range_reserved_and_enumerable(&self, range: UidRange) -> io::Result<()>;
-    fn no_existing_file_owner(&self, uid: u32) -> io::Result<()>;
     fn ssh_public_key_and_forwarding_denied(&self, account: &str) -> io::Result<()>;
 }
 
@@ -151,7 +152,6 @@ pub trait InstallationEvidence: Send + Sync {
 pub struct MissingInstallationEvidence;
 impl InstallationEvidence for MissingInstallationEvidence {
     fn external_nss_range_reserved_and_enumerable(&self, _: UidRange) -> io::Result<()> { Err(denied()) }
-    fn no_existing_file_owner(&self, _: u32) -> io::Result<()> { Err(denied()) }
     fn ssh_public_key_and_forwarding_denied(&self, _: &str) -> io::Result<()> { Err(denied()) }
 }
 
@@ -575,8 +575,15 @@ mod linux {
                     }
                 }
             }
-            self.evidence.no_existing_file_owner(uid)?;
+            // File owners are checked once per allocation (`occupied_ids`).
             Ok(true)
+        }
+
+        /// R7b: the employee-range uids and gids owning anything in spawnd's
+        /// own state directories (`crate::owner_inventory`), scanned once per
+        /// allocation; a failed or bounded-out scan refuses the allocation.
+        fn occupied_ids(&mut self, range: UidRange) -> io::Result<std::collections::BTreeSet<u32>> {
+            Ok(crate::owner_inventory::scan_installed(range)?.occupied())
         }
 
         fn create_locked(&mut self, account: &EmployeeAccount) -> io::Result<()> {

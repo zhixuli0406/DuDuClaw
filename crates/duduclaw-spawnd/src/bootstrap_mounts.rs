@@ -69,7 +69,11 @@ impl RootPublicationAnchors {
     }
 }
 fn metadata(fd: &OwnedFd) -> io::Result<fs::Metadata> { File::from(fd.try_clone()?).metadata() }
-fn trusted_directory(path: &Path) -> io::Result<OwnedFd> {
+/// An absolute directory opened component by component from `/` without
+/// following any symlink, every component root-owned and not group/other
+/// writable. A missing component keeps its `NotFound` kind. Also opens the
+/// roots of the UID allocation's file-owner inventory (`crate::owner_inventory`).
+pub(crate) fn trusted_directory(path: &Path) -> io::Result<OwnedFd> {
     if !path.is_absolute() { return Err(invalid()); }
     let mut current = owned(unsafe { libc::open(c"/".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) } as _)?;
     let root = metadata(&current)?;

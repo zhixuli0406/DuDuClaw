@@ -8,6 +8,10 @@ use duduclaw_isolation::{bounded::Text, egress::{DnsRoute, EgressProfile, Profil
 use duduclaw_updated::linux::{files::Directory, service::{artifact_name, verified_committed_generation}, INSTALL_ROOT};
 use crate::{Result, policy::{EmployeeEntitlement, Executable, PublishedRuntime, RootPolicy, TurnLimit}};
 const ROOT: &str = "/var/lib/duduclaw-spawnd";
+/// Per-run /etc projection state (the etc-state parent of `RootPublicationAnchors`).
+pub const ETC_STATE_DIRECTORY: &str = "/var/lib/duduclaw-spawnd/etc-state";
+/// Per-employee MCP projection files (the projection root of `RootPublicationAnchors`).
+pub const PROJECTIONS_DIRECTORY: &str = "/var/lib/duduclaw-spawnd/projections";
 const RECEIPTS: &str = "/run/duduclaw-isolation-evidence";
 pub const GATEWAY_PUBLICATION: &str = "/run/duduclaw-spawnd/publication.json";
 const POLICY_ID: &str = "isolation-policy-v1";
@@ -525,7 +529,7 @@ impl crate::host::Publication for InstalledPublication {
     fn supervisor_identity(&mut self) -> Result<(u32, u32)> { os(crate::server::named_identity(c"duduclaw-runsup")) }
     fn anchors(&mut self) -> Result<crate::bootstrap_mounts::RootPublicationAnchors> {
         let b = self.checked_bundle()?;
-        os(crate::bootstrap_mounts::RootPublicationAnchors::new(b.directory, Path::new(ROOT).join("etc-state"), Path::new(ROOT).join("projections")))
+        os(crate::bootstrap_mounts::RootPublicationAnchors::new(b.directory, Path::new(ETC_STATE_DIRECTORY).into(), Path::new(PROJECTIONS_DIRECTORY).into()))
     }
     fn prepare_mcp_projection(&mut self, plan: &crate::bootstrap::BootstrapPlan, runtime: &PublishedRuntime) -> Result<()> {
         use std::io::Write;
@@ -545,7 +549,7 @@ impl crate::host::Publication for InstalledPublication {
         os(acceptance.validate(&projection))?;
         let native = b.policy.native.iter().find(|n| n.profile == runtime.profile).ok_or(ErrorCode::RuntimeDenied)?;
         os(acceptance.validate_launch(record, native))?;
-        let anchor = Path::new(ROOT).join("projections");
+        let anchor = Path::new(PROJECTIONS_DIRECTORY).to_path_buf();
         os(crate::registry::root_path(&anchor, true))?;
         let hex: String = plan.employee.0.iter().map(|byte| format!("{byte:02x}")).collect();
         let path = anchor.join(hex);
@@ -662,13 +666,16 @@ impl crate::host::Publication for InstalledPublication {
 /// (`crate::selftest`). R7b: the DNS facts are no longer part of it either;
 /// spawnd probes the route through egress (`crate::dns_evidence`). A receipt
 /// that still carries a `dns` member is refused as a whole (unknown field).
-/// Accounts/SSH still read this receipt.
+/// R7b part 2: the file-owner facts (`unowned_uids`, `owner_inventory_digest`)
+/// are gone too; spawnd scans its own state directories at each UID
+/// allocation (`crate::owner_inventory`), and a receipt still carrying them is
+/// refused. External NSS and SSH still read this receipt.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InstallReceipt {
     version: u16, generation: Sha256Digest, boot_id: String, checked_boottime_ms: u64, valid_for_ms: u64,
     external_nss_range: Option<UidRange>, iam_reservation_digest: Option<Sha256Digest>,
-    unowned_uids: Vec<u32>, owner_inventory_digest: Sha256Digest, ssh: Vec<SshReceipt>,
+    ssh: Vec<SshReceipt>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -682,8 +689,7 @@ fn receipt() -> io::Result<InstallReceipt> {
     let now = crate::host_state::boottime_ms()?;
     if receipt.version != 1 || receipt.generation != generation || receipt.boot_id != boot.trim()
         || receipt.valid_for_ms == 0 || receipt.valid_for_ms > 60_000 || now < receipt.checked_boottime_ms
-        || now - receipt.checked_boottime_ms >= receipt.valid_for_ms || receipt.ssh.len() > 30_000
-        || receipt.unowned_uids.len() > 30_000 { return Err(denied()); }
+        || now - receipt.checked_boottime_ms >= receipt.valid_for_ms || receipt.ssh.len() > 30_000 { return Err(denied()); }
     Ok(receipt)
 }
 pub struct InstalledEvidence;
@@ -691,11 +697,6 @@ impl crate::accounts::InstallationEvidence for InstalledEvidence {
     fn external_nss_range_reserved_and_enumerable(&self, range: UidRange) -> io::Result<()> {
         let r = receipt()?;
         if r.external_nss_range != Some(range) || !r.iam_reservation_digest.is_some_and(nonzero) { return Err(denied()); }
-        Ok(())
-    }
-    fn no_existing_file_owner(&self, uid: u32) -> io::Result<()> {
-        let r = receipt()?;
-        if !nonzero(r.owner_inventory_digest) || !r.unowned_uids.contains(&uid) { return Err(denied()); }
         Ok(())
     }
     fn ssh_public_key_and_forwarding_denied(&self, account: &str) -> io::Result<()> {
@@ -712,8 +713,10 @@ pub fn install(components: &mut crate::host::Components) {
     // R7b: DNS route evidence from spawnd's own probe through egress, over the
     // same (single) control connection the run registrations use.
     let client = crate::host::SharedEgressClient::default();
+    // The second layer from PID 1's own view of the egress unit's IP rules.
     components.egress = Box::new(crate::host::LinuxEgress::with_client(
-        Box::new(crate::dns_evidence::installed(client.clone())), client));
+        Box::new(crate::dns_evidence::installed(client.clone())), client)
+        .with_second_layer(Box::new(crate::egress_layer::installed())));
     // R7a: trampoline readiness comes from spawnd's own self-test, not the receipt.
     components.trampoline = Box::new(crate::native_trampoline::NativeTrampoline::new(
         Box::new(crate::selftest::SelfTestInstallation::default())));
@@ -881,12 +884,19 @@ mod tests {
         assert!(serde_json::from_value::<HostPublication>(value).is_err());
         assert!(serde_json::from_str::<InstallReceipt>(r#"{"ready":true}"#).is_err());
         // R7b: the receipt has no DNS part any more; one that still carries it is refused.
-        let mut receipt = serde_json::json!({ "version": 1, "generation": Sha256Digest([1; 32]), "boot_id": "boot",
+        let receipt = serde_json::json!({ "version": 1, "generation": Sha256Digest([1; 32]), "boot_id": "boot",
             "checked_boottime_ms": 1, "valid_for_ms": 1000, "external_nss_range": null, "iam_reservation_digest": null,
-            "unowned_uids": [], "owner_inventory_digest": Sha256Digest([2; 32]), "ssh": [] });
+            "ssh": [] });
         assert!(serde_json::from_value::<InstallReceipt>(receipt.clone()).is_ok());
-        receipt["dns"] = serde_json::json!({ "route": "resolved_varlink" });
-        assert!(serde_json::from_value::<InstallReceipt>(receipt).is_err());
+        let mut with_dns = receipt.clone();
+        with_dns["dns"] = serde_json::json!({ "route": "resolved_varlink" });
+        assert!(serde_json::from_value::<InstallReceipt>(with_dns).is_err());
+        // R7b part 2: nor a file-owner part (spawnd scans its own state directories).
+        for (key, value) in [("unowned_uids", serde_json::json!([])), ("owner_inventory_digest", serde_json::json!(Sha256Digest([2; 32])))] {
+            let mut with_owners = receipt.clone();
+            with_owners[key] = value;
+            assert!(serde_json::from_value::<InstallReceipt>(with_owners).is_err(), "{key}");
+        }
     }
     #[test]
     fn mcp_acceptance_binds_exact_runtime_projection_and_child_exec() {
