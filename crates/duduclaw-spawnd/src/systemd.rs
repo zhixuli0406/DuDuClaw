@@ -679,18 +679,21 @@ pub mod linux {
                 let path: OwnedObjectPath = manager.call("GetUnit", &(policy.name.as_str(),)).map_err(bus_error)?;
                 let service = Proxy::new(&self.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Service").map_err(bus_error)?;
                 let unit_proxy = Proxy::new(&self.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Unit").map_err(bus_error)?;
+                // Every property is compared before refusing, so one refusal
+                // names every mismatch. A property that cannot be read at all
+                // (bus error) still refuses at once: a dead bus would otherwise
+                // cost one method timeout per remaining property.
+                let mut refusals = ReadbackRefusals::default();
                 for (key, expected) in policy.readback() {
-                    let actual: OwnedValue = if matches!(key, "BindsTo" | "After") {
+                    if matches!(key, "BindsTo" | "After") {
                         let actual: Vec<String> = unit_proxy.get_property(key).map_err(bus_error)?;
-                        // systemd adds implicit ordering dependencies as well.
-                        if !actual.iter().any(|name| name == "duduclaw-spawnd.service") {
-                            return Err(invalid_because(format_args!("dependency {key} (actual {})",
-                                bounded_text(&format!("{actual:?}")))));
-                        }
-                        continue;
-                    } else { service.get_property(key).map_err(bus_error)? };
-                    readback_matches(key, expected, actual)?;
+                        refusals.check(dependency_matches(key, expected, &actual));
+                    } else {
+                        let actual: OwnedValue = service.get_property(key).map_err(bus_error)?;
+                        refusals.check(readback_matches(key, expected, actual));
+                    }
                 }
+                refusals.finish()?;
                 // Standard*FileDescriptor overrides the null defaults; systemd
                 // 249 does not expose these received descriptors as properties.
                 // B2 must verify bootstrap/pipe identity before releasing a run.
@@ -976,13 +979,71 @@ pub mod linux {
     /// ([`property_matches`]): a mismatch is `invalid unit policy: readback
     /// <key>: actual signature <sig> value <debug>` ([`readback_refusal`]); a
     /// reply that does not even convert keeps its bus error kind and gains the
-    /// same naming.
+    /// same naming (`… (not convertible: <bus error>)`).
     fn readback_matches(key: &str, expected: &Property, actual: OwnedValue) -> io::Result<()> {
         let refusal = readback_refusal("readback", key, &actual);
         match property_matches(expected, actual) {
             Ok(true) => Ok(()),
             Ok(false) => Err(refusal),
-            Err(error) => Err(io::Error::new(error.kind(), format!("{error}; {refusal}"))),
+            Err(error) => Err(io::Error::new(error.kind(),
+                format!("{refusal} (not convertible: {})", bounded_text(&error.to_string())))),
+        }
+    }
+    /// `BindsTo`/`After`, read from the Unit interface. systemd adds implicit
+    /// dependencies of its own, so the reported list must contain every
+    /// policy entry (exact name, any order) and may contain more. An empty or
+    /// non-list policy entry refuses. A mismatch is `invalid unit policy:
+    /// readback <key>: dependency missing (actual <bounded list>)`.
+    fn dependency_matches(key: &str, expected: &Property, actual: &[String]) -> io::Result<()> {
+        let present = match expected {
+            Property::Strings(wanted) => !wanted.is_empty() && wanted.iter().all(|name| actual.contains(name)),
+            _ => false,
+        };
+        if present { return Ok(()); }
+        Err(invalid_because(format_args!("readback {key}: dependency missing (actual {})",
+            bounded_text(&format!("{actual:?}")))))
+    }
+    /// At most this many readback failures are named in one refusal.
+    const MAX_READBACK_NAMED: usize = 16;
+    /// A combined readback refusal stops adding named failures past this many
+    /// bytes (each failure is itself bounded, see [`readback_refusal`]).
+    const MAX_READBACK_MESSAGE: usize = 2048;
+    /// Every readback failure of one start, in readback order: the first
+    /// [`MAX_READBACK_NAMED`] are kept, the rest only counted.
+    #[derive(Default)]
+    struct ReadbackRefusals { named: Vec<io::Error>, total: usize }
+    impl ReadbackRefusals {
+        fn check(&mut self, result: io::Result<()>) {
+            if let Err(error) = result {
+                self.total += 1;
+                if self.named.len() < MAX_READBACK_NAMED { self.named.push(error); }
+            }
+        }
+        /// `Ok` only when nothing failed. Otherwise one error `invalid unit
+        /// policy: readback <Key1>: …; readback <Key2>: …[; <n> more readback
+        /// mismatches not shown]`, bounded to about [`MAX_READBACK_MESSAGE`]
+        /// bytes; its kind is `InvalidData` unless a failure had another kind
+        /// (a reply that did not convert), in which case the first such kind.
+        fn finish(self) -> io::Result<()> {
+            if self.total == 0 { return Ok(()); }
+            const PREFIX: &str = "invalid unit policy: ";
+            let kind = self.named.iter().map(io::Error::kind)
+                .find(|kind| *kind != io::ErrorKind::InvalidData).unwrap_or(io::ErrorKind::InvalidData);
+            let mut message = String::from(PREFIX);
+            let mut shown = 0;
+            for error in &self.named {
+                let text = error.to_string();
+                let detail = text.strip_prefix(PREFIX).unwrap_or(&text);
+                let separator = if shown == 0 { "" } else { "; " };
+                if shown > 0 && message.len() + separator.len() + detail.len() > MAX_READBACK_MESSAGE { break; }
+                message.push_str(separator);
+                message.push_str(detail);
+                shown += 1;
+            }
+            if shown < self.total {
+                message.push_str(&format!("; {} more readback mismatches not shown", self.total - shown));
+            }
+            Err(io::Error::new(kind, message))
         }
     }
     /// `invalid unit policy: <scope> <key>: actual signature <sig> value
@@ -992,22 +1053,37 @@ pub mod linux {
         invalid_because(format_args!("{scope} {key}: actual signature {} value {}",
             bounded_text(&actual.value_signature().to_string()), bounded_text(&format!("{actual:?}"))))
     }
+    /// List-valued properties are sets to systemd, which need not report them
+    /// in the order they were set (systemd 255 reverses `DeviceAllow`): they
+    /// match as multisets of exact entries ([`same_entries`]), no entry
+    /// normalised. Every other property matches by exact value.
     fn property_matches(expected: &Property, actual: OwnedValue) -> io::Result<bool> {
         match expected {
             Property::Strings(wanted) => {
-                let mut actual: Vec<String> = actual.try_into().map_err(bus_error)?;
-                let mut wanted = wanted.clone();
-                actual.sort(); wanted.sort();
-                Ok(actual == wanted)
+                let actual: Vec<String> = actual.try_into().map_err(bus_error)?;
+                Ok(same_entries(actual, wanted))
             }
             Property::AllowStrings(wanted) => {
-                let (allow, mut actual): (bool, Vec<String>) = actual.try_into().map_err(bus_error)?;
-                let mut wanted = wanted.clone();
-                actual.sort(); wanted.sort();
-                Ok(allow && actual == wanted)
+                let (allow, actual): (bool, Vec<String>) = actual.try_into().map_err(bus_error)?;
+                Ok(allow && same_entries(actual, wanted))
+            }
+            Property::DeviceLimits(wanted) => {
+                let actual: Vec<(String, u64)> = actual.try_into().map_err(bus_error)?;
+                Ok(same_entries(actual, wanted))
+            }
+            Property::DeviceAccess(wanted) => {
+                let actual: Vec<(String, String)> = actual.try_into().map_err(bus_error)?;
+                Ok(same_entries(actual, wanted))
             }
             _ => Ok(actual == value(expected).try_to_owned().map_err(bus_error)?),
         }
+    }
+    /// Exact multiset equality: the same entries, each as often, any order.
+    fn same_entries<T: Ord + Clone>(mut actual: Vec<T>, wanted: &[T]) -> bool {
+        let mut wanted = wanted.to_vec();
+        actual.sort();
+        wanted.sort();
+        actual == wanted
     }
     fn checked_cgroup(text: &str) -> io::Result<PathBuf> {
         checked_cgroup_with_missing(text, false)
@@ -1232,6 +1308,163 @@ pub mod linux {
             let error = readback_refusal("slice readback", "MemoryMax", &owned(Value::from(u64::MAX)));
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
             assert!(error.to_string().starts_with("invalid unit policy: slice readback MemoryMax: actual signature t value "), "{error}");
+        }
+
+        fn device_access(entries: &[(&str, &str)]) -> OwnedValue {
+            Value::from(entries.to_vec()).try_to_owned().unwrap()
+        }
+        fn device_limits(entries: &[(&str, u64)]) -> OwnedValue {
+            Value::from(entries.to_vec()).try_to_owned().unwrap()
+        }
+        fn strings(entries: &[&str]) -> OwnedValue {
+            Value::from(entries.to_vec()).try_to_owned().unwrap()
+        }
+
+        #[test]
+        fn run_unit_device_allow_readback_is_order_insensitive_and_exact() {
+            let policy = UnitPolicy::new(RunId([1; 16]), EmployeeId([2; 16]), &r7g_limits(), &r7g_timeouts(), 8, 1).unwrap();
+            let expected = &policy.properties["DeviceAllow"];
+            // As set, and as systemd 255 reports it (reverse order).
+            readback_matches("DeviceAllow", expected, device_access(&[("char-pts", "rw"), ("/dev/ptmx", "rw")])).unwrap();
+            readback_matches("DeviceAllow", expected, device_access(&[("/dev/ptmx", "rw"), ("char-pts", "rw")])).unwrap();
+            let refused: [&[(&str, &str)]; 9] = [
+                &[("/dev/ptmx", "rw"), ("char-pts", "rw"), ("/dev/null", "rw")], // extra entry
+                &[("/dev/ptmx", "rw")],                                          // missing entry
+                &[],                                                             // nothing
+                &[("/dev/ptmx", "rw"), ("char-pts", "rw"), ("char-pts", "rw")],  // duplicate
+                &[("/dev/ptmx", "rw"), ("/dev/ptmx", "rw")],                     // multiplicity
+                &[("/dev/ptmx", "rwm"), ("char-pts", "rw")],                     // access widened
+                &[("/dev/ptmx", "rw"), ("char-pts", "r")],                       // access changed
+                &[("/dev/pts/ptmx", "rw"), ("char-pts", "rw")],                  // other spelling
+                &[("/dev/ptmx", "rw"), ("char-136", "rw")],                      // other specifier
+            ];
+            for actual in refused {
+                let error = readback_matches("DeviceAllow", expected, device_access(actual)).unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{actual:?}");
+                assert!(error.to_string().starts_with("invalid unit policy: readback DeviceAllow: actual signature a(ss) value "),
+                    "{actual:?}: {error}");
+            }
+        }
+
+        #[test]
+        fn run_unit_list_readbacks_are_order_insensitive_multisets() {
+            let owned = |value: Value<'_>| value.try_to_owned().unwrap();
+            let policy = UnitPolicy::new(RunId([1; 16]), EmployeeId([2; 16]), &r7g_limits(), &r7g_timeouts(), 8, 1).unwrap();
+            let expected: BTreeMap<&str, &Property> = policy.readback().collect();
+            // RestrictAddressFamilies: an allow-list of exactly the four, any order.
+            let families = expected["RestrictAddressFamilies"];
+            assert!(property_matches(families, owned(Value::from((true, vec!["AF_NETLINK", "AF_INET6", "AF_UNIX", "AF_INET"])))).unwrap());
+            for actual in [vec!["AF_UNIX", "AF_INET", "AF_INET6"],
+                vec!["AF_UNIX", "AF_INET", "AF_INET6", "AF_NETLINK", "AF_PACKET"],
+                vec!["AF_UNIX", "AF_UNIX", "AF_INET", "AF_INET6", "AF_NETLINK"],
+                vec!["AF_UNIX", "AF_INET", "AF_INET6", "AF_PACKET"]] {
+                assert!(!property_matches(families, owned(Value::from((true, actual.clone())))).unwrap(), "{actual:?}");
+            }
+            // SystemCallArchitectures and Environment: exact multisets.
+            assert!(property_matches(expected["SystemCallArchitectures"], strings(&["native"])).unwrap());
+            for actual in [&["native", "native"][..], &["x86-64"][..], &["native", "x86"][..], &[][..]] {
+                assert!(!property_matches(expected["SystemCallArchitectures"], strings(actual)).unwrap(), "{actual:?}");
+            }
+            assert!(property_matches(expected["Environment"], strings(&[])).unwrap());
+            assert!(!property_matches(expected["Environment"], strings(&["A=b"])).unwrap());
+            assert!(same_entries(vec!["B=2".to_string(), "A=1".to_string()], &["A=1".to_string(), "B=2".to_string()]));
+            assert!(!same_entries(vec!["A=1".to_string(), "A=1".to_string()], &["A=1".to_string(), "B=2".to_string()]));
+            // IO limits: one device each, exact device text and ceiling.
+            for key in ["IOReadBandwidthMax", "IOWriteBandwidthMax", "IOReadIOPSMax", "IOWriteIOPSMax"] {
+                let Property::DeviceLimits(limits) = expected[key] else { panic!("{key}") };
+                let (device, ceiling) = (limits[0].0.as_str(), limits[0].1);
+                assert_eq!(device, "/dev/block/8:1");
+                assert!(property_matches(expected[key], device_limits(&[(device, ceiling)])).unwrap(), "{key}");
+                for actual in [&[(device, ceiling + 1)][..], &[(device, ceiling - 1)][..], &[][..],
+                    &[(device, ceiling), (device, ceiling)][..], &[(device, ceiling), ("/dev/block/8:2", ceiling)][..],
+                    &[("/dev/sda1", ceiling)][..]] {
+                    assert!(!property_matches(expected[key], device_limits(actual)).unwrap(), "{key} {actual:?}");
+                }
+            }
+            // A multi-device limit list (not built by policy today) matches in any order.
+            let two = Property::DeviceLimits(vec![("/dev/block/8:1".into(), 5), ("/dev/block/8:2".into(), 7)]);
+            assert!(property_matches(&two, device_limits(&[("/dev/block/8:2", 7), ("/dev/block/8:1", 5)])).unwrap());
+            assert!(!property_matches(&two, device_limits(&[("/dev/block/8:2", 5), ("/dev/block/8:1", 7)])).unwrap());
+        }
+
+        #[test]
+        fn run_unit_dependency_readback_requires_every_policy_entry_in_any_order() {
+            fn names(list: &[&str]) -> Vec<String> { list.iter().map(|name| name.to_string()).collect() }
+            let policy = UnitPolicy::new(RunId([1; 16]), EmployeeId([2; 16]), &r7g_limits(), &r7g_timeouts(), 8, 1).unwrap();
+            for key in ["BindsTo", "After"] {
+                let expected = &policy.properties[key];
+                dependency_matches(key, expected, &names(&["duduclaw-spawnd.service"])).unwrap();
+                // systemd's implicit dependencies are extra entries, in any order.
+                dependency_matches(key, expected, &names(&["system.slice", "duduclaw-spawnd.service", "sysinit.target"])).unwrap();
+                for actual in [&[][..], &["system.slice"][..], &["duduclaw-spawnd"][..]] {
+                    let error = dependency_matches(key, expected, &names(actual)).unwrap_err();
+                    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                    assert!(error.to_string().starts_with(&format!("invalid unit policy: readback {key}: dependency missing (actual ")),
+                        "{error}");
+                }
+            }
+            // A policy entry that is not a non-empty name list never matches.
+            let spawnd = names(&["duduclaw-spawnd.service"]);
+            assert!(dependency_matches("After", &Property::Strings(vec![]), &spawnd).is_err());
+            assert!(dependency_matches("After", &Property::Text("duduclaw-spawnd.service".into()), &spawnd).is_err());
+        }
+
+        #[test]
+        fn run_unit_readback_names_every_mismatch_in_one_refusal() {
+            let owned = |value: Value<'_>| value.try_to_owned().unwrap();
+            let policy = UnitPolicy::new(RunId([1; 16]), EmployeeId([2; 16]), &r7g_limits(), &r7g_timeouts(), 8, 1).unwrap();
+            let expected: BTreeMap<&str, &Property> = policy.readback().collect();
+            ReadbackRefusals::default().finish().unwrap();
+            let mut refusals = ReadbackRefusals::default();
+            refusals.check(readback_matches("DeviceAllow", expected["DeviceAllow"], device_access(&[("/dev/ptmx", "rw"), ("char-pts", "rw")])));
+            refusals.finish().unwrap();
+            // Two simultaneous mismatches: both named, in readback order, one prefix.
+            let mut refusals = ReadbackRefusals::default();
+            refusals.check(readback_matches("DeviceAllow", expected["DeviceAllow"],
+                device_access(&[("/dev/ptmx", "rw"), ("char-pts", "rw"), ("/dev/null", "rw")])));
+            refusals.check(readback_matches("StandardInput", expected["StandardInput"], owned(Value::from("null"))));
+            refusals.check(readback_matches("StandardOutput", expected["StandardOutput"], owned(Value::from("journal"))));
+            let error = refusals.finish().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            let message = error.to_string();
+            assert!(message.starts_with("invalid unit policy: readback DeviceAllow: actual signature a(ss) value "), "{message}");
+            assert!(message.contains("/dev/null"), "{message}");
+            assert!(message.contains("; readback StandardOutput: actual signature s value "), "{message}");
+            assert!(message.contains("journal"), "{message}");
+            assert!(!message.contains("StandardInput"), "{message}");
+            assert_eq!(message.matches("invalid unit policy").count(), 1, "{message}");
+            assert!(!message.contains("more readback mismatches"), "{message}");
+            // A dependency mismatch and a non-convertible reply join the same
+            // refusal; the latter's (bus) kind is kept.
+            let mut refusals = ReadbackRefusals::default();
+            refusals.check(dependency_matches("BindsTo", expected["BindsTo"], &[]));
+            refusals.check(readback_matches("SystemCallArchitectures", expected["SystemCallArchitectures"], owned(Value::from(7u32))));
+            let error = refusals.finish().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Other);
+            let message = error.to_string();
+            assert!(message.starts_with("invalid unit policy: readback BindsTo: dependency missing (actual "), "{message}");
+            assert!(message.contains("; readback SystemCallArchitectures: actual signature u value "), "{message}");
+            assert!(message.contains("(not convertible: "), "{message}");
+            // At most MAX_READBACK_NAMED are named; the rest are counted.
+            let mut refusals = ReadbackRefusals::default();
+            for _ in 0..40 {
+                refusals.check(readback_matches("StandardInput", expected["StandardInput"], owned(Value::from("fd"))));
+            }
+            let message = refusals.finish().unwrap_err().to_string();
+            assert_eq!(message.matches("readback StandardInput: ").count(), MAX_READBACK_NAMED, "{message}");
+            assert!(message.ends_with(&format!("; {} more readback mismatches not shown", 40 - MAX_READBACK_NAMED)), "{message}");
+            // The whole message stays bounded even when each failure is long.
+            let long = "x".repeat(1000);
+            let mut refusals = ReadbackRefusals::default();
+            for _ in 0..40 {
+                refusals.check(readback_matches("User", expected["User"], owned(Value::from(long.as_str()))));
+            }
+            let message = refusals.finish().unwrap_err().to_string();
+            let shown = message.matches("readback User: ").count();
+            assert!(shown >= 1 && shown < MAX_READBACK_NAMED, "{shown}");
+            assert!(message.len() <= MAX_READBACK_MESSAGE + 64, "{}", message.len());
+            assert!(message.ends_with(&format!("; {} more readback mismatches not shown", 40 - shown)), "{message}");
+            assert!(!message.chars().any(char::is_control), "{message}");
         }
 
         #[test]
