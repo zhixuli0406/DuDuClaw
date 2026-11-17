@@ -118,6 +118,8 @@ pub async fn host_main() -> Result<(), EgressError> {
     // the configured NAT public addresses.
     crate::policy::configure_host_public_addresses(&config.host_public_addresses)?;
     crate::policy::init_host_addresses()?;
+    // The probe worker must exist before seccomp denies thread creation.
+    let probe = crate::dns_probe::DnsProbe::default();
     crate::seccomp::install()?;
     if let Ok(readback) = readback { crate::update_readback::start(readback, identity); }
     loop {
@@ -126,11 +128,15 @@ pub async fn host_main() -> Result<(), EgressError> {
         // One authenticated spawnd controller owns all registrations. Losing it
         // drops JoinSet, cancelling all runs and their nested tunnel tasks.
         let control = CheckedSocket::new(fd).map_err(io_error)?;
-        return serve_control(control, &config).await;
+        return serve_control_with_probe(control, &config, probe).await;
     }
 }
 
 pub async fn serve_control(control: CheckedSocket, config: &Config) -> Result<(), EgressError> {
+    serve_control_with_probe(control, config, crate::dns_probe::DnsProbe::default()).await
+}
+
+async fn serve_control_with_probe(control: CheckedSocket, config: &Config, mut probe: crate::dns_probe::DnsProbe) -> Result<(), EgressError> {
     control.validate(libc::SOCK_SEQPACKET, true, false).map_err(io_error)?;
     config.validate()?;
     let mut tasks = JoinSet::new();
@@ -145,7 +151,6 @@ pub async fn serve_control(control: CheckedSocket, config: &Config) -> Result<()
     let mut seen = std::collections::BTreeSet::new();
     // R7b: the route runs use (one for every profile) and the probe's rate limit.
     let route = crate::dns_probe::configured_route(config.profiles.as_slice());
-    let mut probe = crate::dns_probe::DnsProbe::default();
     let result = async { loop {
         let received = tokio::select! {
             received = control.receive(&mut packets) => received.map_err(io_error)?,
@@ -159,6 +164,8 @@ pub async fn serve_control(control: CheckedSocket, config: &Config) -> Result<()
                 continue;
             }
         };
+        let taken = Instant::now();
+        let probe_deadline = probe.deadline_at(taken);
         let (size, mut fds) = received;
         if size == 0 { return Err(EgressError::Unavailable); }
         budget.frame(Instant::now())?;
@@ -197,12 +204,20 @@ pub async fn serve_control(control: CheckedSocket, config: &Config) -> Result<()
                 }
                 EgressControlResponse::Unregistered
             }
-            // This loop is serial: the probe is awaited inline and bounded by
-            // `dns_probe::PROBE_DEADLINE` (3 s), so it delays a following
-            // Register/Unregister by at most that long. A lookup failure is a
-            // `DnsProbed { resolved: false }` answer, never a control error.
+            // Serial control is held for at most PROBE_DEADLINE +
+            // PROBE_REPLY_GRACE (3 s + 250 ms), including reply send. Blocking
+            // refresh/count/log work runs on the pre-seccomp worker; late
+            // results are discarded. Register/Unregister keep their own bounds.
             EgressControl::ProbeDns { name } => {
-                probe.answer(&name, route, &*resolver, Instant::now(), &crate::policy::own_addresses).await
+                probe.answer_and_send(&name, route, &*resolver, taken, probe_deadline, crate::policy::own_addresses, |reply| {
+                    let control = &control;
+                    let request_id = request.request_id;
+                    async move {
+                        let packet = ipc::encode(&Envelope { version: ipc::PROTOCOL_VERSION, request_id, message: reply }).map_err(io_error)?;
+                        control.send_packet(&packet).await.map_err(io_error)
+                    }
+                }).await?;
+                continue;
             }
         };
         let packet = ipc::encode(&Envelope { version: ipc::PROTOCOL_VERSION, request_id: request.request_id, message: reply }).map_err(io_error)?;
