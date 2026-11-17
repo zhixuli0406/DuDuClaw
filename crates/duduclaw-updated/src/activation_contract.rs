@@ -138,7 +138,8 @@ pub fn validate_response(request: &ControlRequest, response: &ControlResponse) -
 fn protocol(manifest: &ReleaseManifest, target: &InstallTarget) -> u16 {
     match target {
         InstallTarget::Gateway => manifest.protocols.gateway,
-        InstallTarget::Spawnd | InstallTarget::RuntimeEntry { .. } => manifest.protocols.spawnd,
+        // R7c: the SSH denial probe's result contract is read by spawnd only.
+        InstallTarget::Spawnd | InstallTarget::IsolationProbe | InstallTarget::RuntimeEntry { .. } => manifest.protocols.spawnd,
         InstallTarget::Trampoline | InstallTarget::TrampolineSelftest => manifest.protocols.trampoline,
         InstallTarget::Egress | InstallTarget::EgressForwarder => manifest.protocols.egress,
         InstallTarget::McpBridge => manifest.protocols.mcp_bridge,
@@ -160,7 +161,8 @@ pub fn validate_readbacks(manifest: &ReleaseManifest, readbacks: &[ComponentRead
             || report.version != manifest.version || report.protocol != protocol(manifest, &artifact.install_target)
             || report.build_sha256 != artifact.sha256 || !report.ready { return Err(Error::Maintenance); }
         let root_component = matches!(artifact.install_target,
-            InstallTarget::Spawnd | InstallTarget::Trampoline | InstallTarget::TrampolineSelftest);
+            InstallTarget::Spawnd | InstallTarget::Trampoline | InstallTarget::TrampolineSelftest
+            | InstallTarget::IsolationProbe);
         if (report.effective_uid == 0) != root_component { return Err(Error::Maintenance); }
     }
     Ok(())

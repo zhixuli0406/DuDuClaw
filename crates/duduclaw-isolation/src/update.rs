@@ -30,6 +30,7 @@ pub const ISOLATION_FACTS: &[&str] = &[
     "/etc/systemd/system/duduclaw-spawnd.service",
     "/etc/systemd/system/duduclaw-isolation-ready.service",
     "/etc/systemd/system/duduclaw-isolation-selftest.service",
+    "/etc/systemd/system/duduclaw-isolation-probe@.service",
     "/etc/systemd/system/duduclaw-employees.slice",
     "/etc/systemd/system/duduclaw-egress.socket",
     "/etc/systemd/system/duduclaw-egress.service",
@@ -63,6 +64,7 @@ pub const ISOLATION_FACTS: &[&str] = &[
     "/usr/lib/duduclaw/duduclaw-spawnd",
     "/usr/lib/duduclaw/duduclaw-run",
     "/usr/lib/duduclaw/duduclaw-run-selftest",
+    "/usr/lib/duduclaw/duduclaw-isolation-probe",
     "/opt/duduclaw/bin/duduclaw-egress",
     "/usr/libexec/duduclaw/duduclaw-parse-worker",
     "/usr/lib/duduclaw/current/duduclaw-import",
@@ -129,6 +131,10 @@ pub enum InstallTarget {
     /// R7a: `duduclaw-run-selftest`, the isolation self-test of the trampoline
     /// library, installed next to the trampoline (`/usr/lib/duduclaw`).
     TrampolineSelftest,
+    /// R7c: `duduclaw-isolation-probe`, the one-shot SSH denial probe run as
+    /// root by the template unit `duduclaw-isolation-probe@.service`,
+    /// installed at `/usr/lib/duduclaw/duduclaw-isolation-probe` (root:root 0755).
+    IsolationProbe,
     Egress,
     EgressForwarder,
     McpBridge,

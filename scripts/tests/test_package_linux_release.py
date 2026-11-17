@@ -867,7 +867,8 @@ class LinuxReleaseTests(unittest.TestCase):
     def test_f_publication_names_and_packaged_component_ids_agree(self):
         source = (ROOT / "crates/duduclaw-updated/src/publication.rs").read_text()
         variants = {"gateway": "Gateway", "spawnd": "Spawnd", "trampoline": "Trampoline",
-            "trampoline_selftest": "TrampolineSelftest", "egress": "Egress", "egress_forwarder": "EgressForwarder", "mcp_bridge": "McpBridge",
+            "trampoline_selftest": "TrampolineSelftest", "isolation_probe": "IsolationProbe",
+            "egress": "Egress", "egress_forwarder": "EgressForwarder", "mcp_bridge": "McpBridge",
             "parse_worker": "ParseWorker", "importer": "Importer", "migration": "Migration", "update_slot": "UpdateSlot"}
         for kind, variant in variants.items():
             match = re.search(r'InstallTarget::' + variant + r' => "([^"]+)"', source)
@@ -891,6 +892,24 @@ class LinuxReleaseTests(unittest.TestCase):
                                    "install_target": {"kind": "trampoline_selftest"}}])
         document = self.manifest()
         document["artifacts"] = [a for a in document["artifacts"] if a["install_target"]["kind"] != "trampoline_selftest"]
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            PACKAGE.validate_targets(document["artifacts"])
+
+    def test_isolation_probe_is_built_packaged_and_listed(self):
+        # R7c: a production bin of duduclaw-isolation, a required signed target,
+        # and a root:root 0755 artifact of the release template.
+        self.assertEqual(PACKAGE.BIN_PACKAGES["duduclaw-isolation-probe"], "duduclaw-isolation")
+        self.assertEqual(PACKAGE.INSTALL_BINARIES["isolation_probe"], "duduclaw-isolation-probe")
+        self.assertIn("isolation_probe", PACKAGE.REQUIRED_TARGETS)
+        command = PACKAGE.build_command(TARGET, "cross", False)
+        self.assertIn("duduclaw-isolation-probe", [command[i + 1] for i, part in enumerate(command) if part == "--bin"])
+        self.assertIn("duduclaw-isolation", [command[i + 1] for i, part in enumerate(command) if part == "-p"])
+        template = json.loads((ROOT / "release/isolation/manifest-template.json").read_bytes())
+        listed = [a for a in template["artifacts"] if a["install_target"]["kind"] == "isolation_probe"]
+        self.assertEqual(listed, [{"id": "duduclaw-isolation-probe", "mode": 0o755,
+                                   "install_target": {"kind": "isolation_probe"}}])
+        document = self.manifest()
+        document["artifacts"] = [a for a in document["artifacts"] if a["install_target"]["kind"] != "isolation_probe"]
         with self.assertRaisesRegex(ValueError, "incomplete"):
             PACKAGE.validate_targets(document["artifacts"])
 
@@ -993,11 +1012,11 @@ class LinuxReleaseTests(unittest.TestCase):
             document["artifacts"].append({"id": registry, "mode": mode,
                 "install_target": {"kind": "runtime_entry", "registry_id": registry}})
         PACKAGE.validate_targets(document["artifacts"])
-        self.assertEqual(PACKAGE.runtime_source(document["artifacts"][12], self.binaries, None),
+        self.assertEqual(PACKAGE.runtime_source(document["artifacts"][13], self.binaries, None),
                          self.binaries / "duduclaw-api-worker")
         with self.assertRaises(ValueError):
-            PACKAGE.runtime_source(document["artifacts"][11], self.binaries, None)
-        self.assertEqual(PACKAGE.runtime_source(document["artifacts"][11], self.binaries, self.root),
+            PACKAGE.runtime_source(document["artifacts"][12], self.binaries, None)
+        self.assertEqual(PACKAGE.runtime_source(document["artifacts"][12], self.binaries, self.root),
                          self.root / "runtime-isolation-policy-v1")
         duplicate = document["artifacts"] + [document["artifacts"][-1]]
         with self.assertRaises(ValueError):

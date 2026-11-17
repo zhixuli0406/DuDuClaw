@@ -149,6 +149,49 @@ so no run inventory counts it.
 The protected installer installs this unit at `/etc/systemd/system/` (root:root 0644, exactly these bytes) before spawnd starts, and never enables or starts it.
 The protected installer creates the `duduclaw-selftest` system account (no login, no home, own group, no supplementary groups) before spawnd starts.
 
+`duduclaw-isolation-probe@.service` (R7c; template, oneshot,
+`RemainAfterExit=no`, no `[Install]`) runs
+`/usr/lib/duduclaw/duduclaw-isolation-probe %i` for one employee account
+(`duduclaw-isolation-probe@duduclaw-emp-<uid>.service`) as root in
+`duduclaw-tcb.slice`, with an empty `CapabilityBoundingSet=`,
+`IPAddressDeny=any` + `IPAddressAllow=localhost`, `TimeoutStartSec=30` and
+stdout/stderr to the journal. Like the self-test it sets neither
+`User=`/`Group=` nor `RestrictSUIDSGID=` (measured on systemd 255). It proves
+against the live sshd that a real public-key login and a real `-N -R`
+forwarding session as the account are refused: the ssh client (fresh,
+never-authorised ed25519 key; this binary as `ProxyCommand=… --relay`, so the
+source port is known) must exit 255 with `Permission denied (publickey).`, and
+the journal must hold sshd's (`sshd` or `sshd-session`) root record, from the
+session of that source port, saying the account is listed in `DenyUsers`. Pass:
+exit 0 and one JSON line `{"version":1,"account":"…","port":N,"result":"denied"}`.
+Failure: `{"code":"ssh_probe_failed","stage":"<name>"}` and the stage's exit
+code:
+
+| Code | Stage | Meaning |
+|---|---|---|
+| 2 | `usage` | argv is not `<account>` or `--relay <src> <dst>` |
+| 3 | `identity` | not root, name outside `^duduclaw-emp-[a-z0-9-]{1,48}$`, or no single `/etc/passwd` row in the employee uid range |
+| 4 | `tools` | sshd, ssh, ssh-keygen, journalctl or the probe itself not a root-owned, non group/other-writable file |
+| 5 | `no_sshd` | `/usr/sbin/sshd` absent: SSH checks not applicable on this host |
+| 6 | `workspace` | private 0700 directory under the unit's `/tmp` |
+| 7 | `effective_config` | `sshd -T -C user=…,host=localhost,addr=127.0.0.1` failed or lacks DenyUsers/DisableForwarding/PermitTTY, or no port |
+| 8 | `keygen` | ephemeral key generation |
+| 9 / 12 | `login_inconclusive` / `forward_inconclusive` | neither refused nor accepted (connection refused, timeout, tool error) |
+| 10 / 13 | `login_not_denied` / `forward_not_denied` | the account is reachable (exit 0, or the `-N` session stayed connected) |
+| 11 / 14 | `login_journal` / `forward_journal` | client refused, but no matching sshd DenyUsers journal record |
+| 15 | `deadline` | the probe's 25 s deadline expired |
+| 16 | `output` | the result line could not be written |
+| 17 | `relay` | `--relay` mode only |
+
+Host prerequisites where `/usr/sbin/sshd` exists: `/usr/bin/ssh`,
+`/usr/bin/ssh-keygen`, `/usr/bin/journalctl`, sshd listening on 127.0.0.1 at
+the first `Port` of its effective configuration, and sshd logging to the
+journal. Hosts without sshd skip the probe (exit 5). The protected installer
+installs the template at `/etc/systemd/system/` (root:root 0644, exactly these
+bytes) and never enables or starts it; rollback stops any running instance and
+removes the file. No account is created for it. Spawnd does not start it yet
+(R7c part 2).
+
 The native Linux service lifecycle and D-Bus fd handoff require root VM testing
 on systemd 249, 252 and 255. No installation or activation has been performed by
 this implementation change.

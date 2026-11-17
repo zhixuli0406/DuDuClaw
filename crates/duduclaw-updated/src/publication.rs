@@ -13,6 +13,7 @@ pub fn artifact_name(target: &InstallTarget) -> Result<String> {
         InstallTarget::Spawnd => "duduclaw-spawnd".into(),
         InstallTarget::Trampoline => "duduclaw-run".into(),
         InstallTarget::TrampolineSelftest => "duduclaw-run-selftest".into(),
+        InstallTarget::IsolationProbe => "duduclaw-isolation-probe".into(),
         InstallTarget::Egress => "duduclaw-egress".into(),
         InstallTarget::EgressForwarder => "duduclaw-egress-forwarder".into(),
         InstallTarget::McpBridge => "duduclaw-mcp-bridge".into(),
@@ -36,7 +37,7 @@ pub fn validate_bootstrap_manifest(manifest: &ReleaseManifest, arch: Architectur
     if [p.gateway, p.spawnd, p.trampoline, p.egress, p.updated, p.mcp_bridge, p.parse_worker, p.importer]
         .iter().any(|value| *value != 1) { return Err(Error::Incompatible); }
     let required = [InstallTarget::Gateway, InstallTarget::Spawnd, InstallTarget::Trampoline,
-        InstallTarget::TrampolineSelftest,
+        InstallTarget::TrampolineSelftest, InstallTarget::IsolationProbe,
         InstallTarget::Egress, InstallTarget::EgressForwarder, InstallTarget::McpBridge,
         InstallTarget::ParseWorker, InstallTarget::Importer, InstallTarget::Migration, InstallTarget::UpdateSlot];
     if manifest.artifacts.len() < required.len() || manifest.artifacts.len() > 128 { return Err(Error::Incompatible); }
@@ -78,7 +79,8 @@ pub(crate) mod tests {
 
     pub(crate) fn manifest() -> ReleaseManifest {
         let targets = [InstallTarget::Gateway, InstallTarget::Spawnd, InstallTarget::Trampoline,
-            InstallTarget::TrampolineSelftest, InstallTarget::Egress, InstallTarget::EgressForwarder, InstallTarget::McpBridge,
+            InstallTarget::TrampolineSelftest, InstallTarget::IsolationProbe, InstallTarget::Egress,
+            InstallTarget::EgressForwarder, InstallTarget::McpBridge,
             InstallTarget::ParseWorker, InstallTarget::Importer, InstallTarget::Migration, InstallTarget::UpdateSlot];
         ReleaseManifest { schema_version: 1, product: Product::Duduclaw,
             version: ReleaseVersion { major: 1, minor: 80, patch: 0 },
@@ -117,9 +119,9 @@ pub(crate) mod tests {
                 size_bytes: 7, mode, install_target: InstallTarget::RuntimeEntry { registry_id: id.into() } });
         }
         validate_bootstrap_manifest(&manifest, Architecture::X86_64).unwrap();
-        let mut bad = manifest.clone(); bad.artifacts[11].mode = 0o755;
+        let mut bad = manifest.clone(); bad.artifacts[12].mode = 0o755;
         assert!(validate_bootstrap_manifest(&bad, Architecture::X86_64).is_err());
-        let mut bad = manifest; bad.artifacts[12].mode = 0o444;
+        let mut bad = manifest; bad.artifacts[13].mode = 0o444;
         assert!(validate_bootstrap_manifest(&bad, Architecture::X86_64).is_err());
     }
     #[test]
@@ -144,9 +146,27 @@ pub(crate) mod tests {
         assert_eq!(artifact_name(&InstallTarget::ParseWorker).unwrap(), "duduclaw-parse-worker");
         assert_eq!(artifact_name(&InstallTarget::Migration).unwrap(), "duduclaw-migrate");
         assert_eq!(artifact_name(&InstallTarget::TrampolineSelftest).unwrap(), "duduclaw-run-selftest");
+        assert_eq!(artifact_name(&InstallTarget::IsolationProbe).unwrap(), "duduclaw-isolation-probe");
         let names: std::collections::BTreeSet<_> = manifest().artifacts.into_iter()
             .map(|artifact| artifact_name(&artifact.install_target).unwrap()).collect();
-        assert_eq!(names.len(), 11);
+        assert_eq!(names.len(), 12);
+    }
+    /// R7c: the SSH denial probe is a required 0755 artifact of every complete
+    /// generation, like the self-test.
+    #[test]
+    fn bootstrap_requires_the_isolation_probe_artifact() {
+        let good = manifest();
+        assert!(good.artifacts.iter().any(|a| a.install_target == InstallTarget::IsolationProbe));
+        let mut bad = good.clone();
+        bad.artifacts.retain(|a| a.install_target != InstallTarget::IsolationProbe);
+        assert!(validate_bootstrap_manifest(&bad, Architecture::X86_64).is_err());
+        let mut bad = good;
+        for artifact in &mut bad.artifacts {
+            if artifact.install_target == InstallTarget::IsolationProbe { artifact.mode = 0o4755; }
+        }
+        assert!(validate_bootstrap_manifest(&bad, Architecture::X86_64).is_err());
+        let json = serde_json::to_string(&InstallTarget::IsolationProbe).unwrap();
+        assert_eq!(json, r#"{"kind":"isolation_probe"}"#);
     }
     /// R7a: the self-test binary is a required artifact of every complete
     /// generation, exactly like the trampoline it tests.

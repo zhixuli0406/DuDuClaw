@@ -153,7 +153,7 @@ fields refused, 5 s timeouts. Every refusal is the single `Refused` outcome.
   on disk, and zero admitted runs in a fresh healthy iteration. It verifies the
   whole generation first (manifest digest, signature against the trust ledger,
   every artifact from its descriptor), then writes the publication journal (see
-  below), then copies spawnd, run, run self-test (R7a), parse worker, `/usr/lib/duduclaw/current/*`,
+  below), then copies spawnd, run, run self-test (R7a), SSH denial probe (R7c), parse worker, `/usr/lib/duduclaw/current/*`,
   egress and gateway from the generation directory, hashing each file from its
   descriptor while copying, to `<name>.next`, fsync, rename, directory fsync;
   finally every destination file and directory is synced again and the journal
@@ -161,7 +161,8 @@ fields refused, 5 s timeouts. Every refusal is the single `Refused` outcome.
   `Apply` is refused except for that journal's previous generation (the roll-back).
 - `Readback` reports spawnd itself (`sha256(/proc/self/exe)`, liveness of the
   admission loop), the trampoline it executes and (R7a) the published
-  `duduclaw-run-selftest`, by the trampoline's rule. Other non-daemon components
+  `duduclaw-run-selftest`, by the trampoline's rule, and (R7c) the published
+  `duduclaw-isolation-probe` by the same rule with spawnd's protocol. Other non-daemon components
   (parse worker, MCP bridge, importer, migration, egress forwarder, runtime
   entries) report `ready: false`: no executable readback under a non-root
   identity exists yet, so the updater cannot validate an activation until one does.
@@ -589,6 +590,26 @@ refresh loop (a run in progress reads as "not yet passed"). The protected
 installer creates the `duduclaw-selftest` system account and installs the unit
 file (`protected_linux_layout.rs`) before it starts spawnd; without them this
 readiness fails closed.
+
+### R7c: SSH denial probe (part 1: program and unit only)
+
+`/usr/lib/duduclaw/duduclaw-isolation-probe` (signed target `IsolationProbe`,
+root:root 0755, built from `crates/duduclaw-isolation/src/bin/probe.rs`) and
+the template unit `duduclaw-isolation-probe@.service` (embedded here as
+`systemd::ISOLATION_PROBE_UNIT_TEXT`, executable `systemd::PROBE_EXECUTABLE`,
+names `duduclaw_isolation::ids::ISOLATION_PROBE_UNIT_PREFIX` /
+`ISOLATION_PROBE_UNIT_TEMPLATE`) prove per account against the live sshd that
+a public-key login and a `-N -R` forwarding session are refused (client
+`Permission denied (publickey).` plus sshd's root `DenyUsers` journal record
+for the probe's own source port). Exit 0 with
+`{"version":1,"account":"…","port":N,"result":"denied"}` is the only pass;
+exit 5 means no `/usr/sbin/sshd` (SSH checks not applicable, as in
+`verify_login` today); the full exit-code table is in
+`scripts/linux-protected/spawnd/README.md`. Spawnd does not start the unit
+yet: `verify_login` still asks `InstallationEvidence` (the receipt reader) until
+part 2 replaces it with a cached run of this unit. Host prerequisites where
+sshd exists: ssh client, ssh-keygen, journalctl, sshd listening on loopback and
+logging to the journal.
 
 ### R7b: DNS route evidence
 

@@ -801,6 +801,14 @@ mod tests {
         assert!(!ENABLED.contains(&selftest));
         assert_eq!(position(selftest), position("duduclaw-spawnd.service") + 1);
         assert!(!boot::GATEWAY_READY_UNITS.contains(&selftest));
+        // R7c: the probe template file and binary are removed by the rollback;
+        // the template is never enabled and never a fixed stop entry (its
+        // running instances are enumerated and stopped through `boot::unit_shape`).
+        let probe = duduclaw_isolation::ids::ISOLATION_PROBE_UNIT_TEMPLATE;
+        assert!(files.contains(&unit_path(probe)));
+        assert!(files.iter().any(|file| file == "/usr/lib/duduclaw/duduclaw-isolation-probe"));
+        assert!(!ENABLED.contains(&probe));
+        assert!(!STOP_ORDER.iter().any(|unit| unit.starts_with(duduclaw_isolation::ids::ISOLATION_PROBE_UNIT_PREFIX)));
     }
 
     fn set_mount_ids(rewrite: impl Fn(&[u8]) -> Option<u64> + 'static) {

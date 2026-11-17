@@ -146,11 +146,14 @@ const MAX_LISTED: usize = 4096;
 const MAX_STOPS: u32 = 3;
 /// Review round 4 item 1: the template units whose instances may be loaded —
 /// (name prefix, suffix, template unit file).
-const TEMPLATES: [(&str, &str, &str); 4] = [
+/// R7c: spawnd's one-shot SSH denial probe instances
+/// (`duduclaw-isolation-probe@<account>.service`, in `duduclaw-tcb.slice`).
+const TEMPLATES: [(&str, &str, &str); 5] = [
     ("duduclaw-parse@", ".service", "duduclaw-parse@.service"),
     ("duduclaw-import@", ".service", "duduclaw-import@.service"),
     ("duduclaw-migrate-expire@", ".service", "duduclaw-migrate-expire@.service"),
     ("duduclaw-migrate-expire@", ".timer", "duduclaw-migrate-expire@.timer"),
+    (duduclaw_isolation::ids::ISOLATION_PROBE_UNIT_PREFIX, ".service", duduclaw_isolation::ids::ISOLATION_PROBE_UNIT_TEMPLATE),
 ];
 /// Review round 4 item 1: the product's cgroups below `/sys/fs/cgroup` that
 /// must read `populated 0` (or be absent): the aggregate slice (the TCB, the
@@ -4379,6 +4382,13 @@ gshadow:        files\nhosts:          files mdns4_minimal [NOTFOUND=return] dns
         assert_eq!(unit_shape("duduclaw-import@0a1b2c.service"), Some(UnitShape::Instance("duduclaw-import@.service")));
         assert_eq!(unit_shape("duduclaw-migrate-expire@0a1b.service"), Some(UnitShape::Instance("duduclaw-migrate-expire@.service")));
         assert_eq!(unit_shape("duduclaw-migrate-expire@0a1b.timer"), Some(UnitShape::Instance("duduclaw-migrate-expire@.timer")));
+        // R7c: a probe instance names an employee account.
+        assert_eq!(unit_shape("duduclaw-isolation-probe@duduclaw-emp-70000.service"),
+            Some(UnitShape::Instance("duduclaw-isolation-probe@.service")));
+        for unknown in ["duduclaw-isolation-probe@.service", "duduclaw-isolation-probe@duduclaw-emp-70000.timer",
+            "duduclaw-isolation-probe@Duduclaw.service", "duduclaw-isolation-probe@-x.service"] {
+            assert_eq!(unit_shape(unknown), None, "{unknown}");
+        }
         assert_eq!(unit_shape(RUN), Some(UnitShape::Run));
         assert_eq!(unit_shape(EMPLOYEE_SLICE), Some(UnitShape::EmployeeSlice));
         for template in TEMPLATES.map(|(_, _, template)| template) {
@@ -4449,6 +4459,19 @@ gshadow:        files\nhosts:          files mdns4_minimal [NOTFOUND=return] dns
         assert!(!SERVICE_ORDER.contains(&ISOLATION_SELFTEST_UNIT));
         assert!(!ISOLATION_GATED_UNITS.contains(&ISOLATION_SELFTEST_UNIT));
         assert!(!ISOLATED_GATEWAY_UNIT_DEPENDENCIES.contains(ISOLATION_SELFTEST_UNIT));
+        // (v) R7c: the probe template is a layout unit file whose instances are
+        // owned (stopped with the other services); never enabled or started here.
+        use duduclaw_isolation::ids::ISOLATION_PROBE_UNIT_TEMPLATE;
+        assert!(templates.contains(&ISOLATION_PROBE_UNIT_TEMPLATE));
+        assert!(layout::UNITS.iter().any(|(name, _)| *name == ISOLATION_PROBE_UNIT_TEMPLATE));
+        let instance = "duduclaw-isolation-probe@duduclaw-emp-70000.service";
+        assert!(stop_rank("duduclaw-spawnd.service", UnitShape::Fixed)
+            < stop_rank(instance, UnitShape::Instance(ISOLATION_PROBE_UNIT_TEMPLATE)));
+        for dns in [broker_dns(), Dns { route: DnsRoute::ResolvedVarlink, upstream: None, host_public_addresses: Vec::new() }] {
+            assert!(!started_units(&dns).iter().any(|unit| unit.starts_with("duduclaw-isolation-probe@")));
+        }
+        assert!(!SERVICE_ORDER.iter().any(|unit| unit.starts_with("duduclaw-isolation-probe@")));
+        assert!(!order.iter().any(|unit| unit.starts_with("duduclaw-isolation-probe@")));
     }
 
     #[test]

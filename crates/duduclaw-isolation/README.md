@@ -5,6 +5,12 @@ crate defines messages, bounds and lifecycle transitions; it does not start a
 process, authorize a tool, verify a signature, or provide isolation by itself.
 The existing gateway is not connected to these contracts yet.
 
+Exception, kept out of the library: the separate binary target
+`duduclaw-isolation-probe` (`src/bin/probe.rs`, R7c), the one-shot SSH denial
+probe run as root by `duduclaw-isolation-probe@<account>.service`. It links only
+std, libc (Linux only) and serde_json; the library stays free of OS operations.
+See `scripts/linux-protected/spawnd/README.md` for its exit codes.
+
 The normative design is `DESIGN-native-linux-employee-isolation-2026-11`, revision
 r7; rustdoc references its sections. Section 17.7 supersedes earlier details.
 

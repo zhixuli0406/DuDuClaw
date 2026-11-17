@@ -303,6 +303,7 @@ pub(super) fn component_target(path: &str) -> Option<InstallTarget> {
         "/usr/lib/duduclaw/duduclaw-spawnd" => InstallTarget::Spawnd,
         "/usr/lib/duduclaw/duduclaw-run" => InstallTarget::Trampoline,
         "/usr/lib/duduclaw/duduclaw-run-selftest" => InstallTarget::TrampolineSelftest,
+        "/usr/lib/duduclaw/duduclaw-isolation-probe" => InstallTarget::IsolationProbe,
         "/opt/duduclaw/bin/duduclaw-egress" => InstallTarget::Egress,
         "/usr/libexec/duduclaw/duduclaw-parse-worker" => InstallTarget::ParseWorker,
         "/usr/lib/duduclaw/current/duduclaw-import" => InstallTarget::Importer,

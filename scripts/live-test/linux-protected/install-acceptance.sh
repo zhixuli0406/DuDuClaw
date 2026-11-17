@@ -36,6 +36,7 @@ FACTS='
 /etc/systemd/system/duduclaw-spawnd.service
 /etc/systemd/system/duduclaw-isolation-ready.service
 /etc/systemd/system/duduclaw-isolation-selftest.service
+/etc/systemd/system/duduclaw-isolation-probe@.service
 /etc/systemd/system/duduclaw-employees.slice
 /etc/systemd/system/duduclaw-egress.socket
 /etc/systemd/system/duduclaw-egress.service
@@ -69,6 +70,7 @@ FACTS='
 /usr/lib/duduclaw/duduclaw-spawnd
 /usr/lib/duduclaw/duduclaw-run
 /usr/lib/duduclaw/duduclaw-run-selftest
+/usr/lib/duduclaw/duduclaw-isolation-probe
 /opt/duduclaw/bin/duduclaw-egress
 /usr/libexec/duduclaw/duduclaw-parse-worker
 /usr/lib/duduclaw/current/duduclaw-import

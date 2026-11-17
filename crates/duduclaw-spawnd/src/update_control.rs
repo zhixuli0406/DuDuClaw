@@ -1171,13 +1171,13 @@ pub fn notify(state: &str) -> io::Result<()> {
 }
 
 /// Fixed destinations (relative to the publication root) in the plan's order:
-/// spawnd, run, run self-test (R7a), parse worker, `/usr/lib/duduclaw/current/*`,
-/// egress, gateway. File names are `publication::artifact_name`. The egress
-/// forwarder and runtime entries are used from the generation itself; the
-/// updater slot is F's.
-fn publication() -> [(InstallTarget, &'static str); 9] {
+/// spawnd, run, run self-test (R7a), SSH denial probe (R7c), parse worker,
+/// `/usr/lib/duduclaw/current/*`, egress, gateway. File names are
+/// `publication::artifact_name`. The egress forwarder and runtime entries are
+/// used from the generation itself; the updater slot is F's.
+fn publication() -> [(InstallTarget, &'static str); 10] {
     [(InstallTarget::Spawnd, "usr/lib/duduclaw"), (InstallTarget::Trampoline, "usr/lib/duduclaw"),
-        (InstallTarget::TrampolineSelftest, "usr/lib/duduclaw"),
+        (InstallTarget::TrampolineSelftest, "usr/lib/duduclaw"), (InstallTarget::IsolationProbe, "usr/lib/duduclaw"),
         (InstallTarget::ParseWorker, "usr/libexec/duduclaw"), (InstallTarget::Importer, "usr/lib/duduclaw/current"),
         (InstallTarget::Migration, "usr/lib/duduclaw/current"), (InstallTarget::McpBridge, "usr/lib/duduclaw/current"),
         (InstallTarget::Egress, "opt/duduclaw/bin"), (InstallTarget::Gateway, "opt/duduclaw/bin")]
@@ -1474,10 +1474,11 @@ impl Effects for InstalledEffects {
             .map_err(updated).and_then(|file| digest_file(file, Some(0o755)));
         let trampoline = installed("duduclaw-run");
         let trampoline_selftest = installed("duduclaw-run-selftest");
+        let isolation_probe = installed("duduclaw-isolation-probe");
         // SAFETY: geteuid has no arguments and cannot fail.
         let euid = unsafe { libc::geteuid() };
         Ok(components(&manifest, Observed { own_image: self.own_image, live, euid, trampoline: trampoline.ok(),
-            trampoline_selftest: trampoline_selftest.ok() }))
+            trampoline_selftest: trampoline_selftest.ok(), isolation_probe: isolation_probe.ok() }))
     }
     fn workloads(&mut self) -> io::Result<Workloads> { system_census() }
     fn gated_units_down(&mut self) -> io::Result<bool> { system_gated_units_down() }
@@ -1493,6 +1494,8 @@ pub(crate) struct Observed {
     pub trampoline: Option<Sha256Digest>,
     /// R7a: SHA-256 of the published `/usr/lib/duduclaw/duduclaw-run-selftest`.
     pub trampoline_selftest: Option<Sha256Digest>,
+    /// R7c: SHA-256 of the published `/usr/lib/duduclaw/duduclaw-isolation-probe`.
+    pub isolation_probe: Option<Sha256Digest>,
 }
 
 /// spawnd's readback: itself, the trampoline it executes, and every other
@@ -1528,6 +1531,13 @@ pub(crate) fn components(manifest: &ReleaseManifest, observed: Observed) -> Vec<
                 let matched = observed.trampoline_selftest == Some(artifact.sha256);
                 record(manifest.product, matched.then_some(manifest.version), manifest.protocols.trampoline,
                     observed.trampoline_selftest, Some(observed.euid), matched && observed.euid == 0)
+            }
+            // R7c: the SSH denial probe PID 1 executes as root for this process,
+            // same rule; its result contract is spawnd's (protocol spawnd).
+            InstallTarget::IsolationProbe => {
+                let matched = observed.isolation_probe == Some(artifact.sha256);
+                record(manifest.product, matched.then_some(manifest.version), manifest.protocols.spawnd,
+                    observed.isolation_probe, Some(observed.euid), matched && observed.euid == 0)
             }
             // Non-daemon, non-root components (parse worker, MCP bridge, importer,
             // migration, egress forwarder, runtime entries): no executable

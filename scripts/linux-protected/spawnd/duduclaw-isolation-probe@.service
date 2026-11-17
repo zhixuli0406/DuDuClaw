@@ -1,0 +1,64 @@
+[Unit]
+Description=DuDuClaw SSH denial probe for employee account %i
+# R7c: a template started only by duduclaw-spawnd through PID 1, one instance
+# per employee account (duduclaw-isolation-probe@duduclaw-emp-<uid>.service).
+# It proves against the LIVE sshd that a real public-key login and a real -N
+# port-forward session as %i are refused: ssh exits 255 with "Permission
+# denied (publickey)." AND sshd's own root journal record for that session's
+# source port says the account is listed in DenyUsers. Exit 0 with one JSON
+# line {"version":1,"account":"<name>","port":N,"result":"denied"} is the only pass.
+# Not a run unit (name is not duduclaw-run-<hex>.service). No [Install]:
+# nothing enables it; the installer only places this file.
+# Failure: one JSON line {"code":"ssh_probe_failed","stage":"<name>"} in the
+# journal and the stage's exit code
+# (crates/duduclaw-isolation/src/bin/probe.rs):
+#   2 usage, 3 identity, 4 tools, 5 no_sshd (no /usr/sbin/sshd: SSH checks
+#   not applicable), 6 workspace, 7 effective_config, 8 keygen,
+#   9 login_inconclusive, 10 login_not_denied, 11 login_journal,
+#   12 forward_inconclusive, 13 forward_not_denied, 14 forward_journal,
+#   15 deadline, 16 output, 17 relay.
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+ExecStart=/usr/lib/duduclaw/duduclaw-isolation-probe %i
+# No User=/Group= and no RestrictSUIDSGID= (measured on systemd 255): an
+# explicit User=root together with NoNewPrivileges= and a seccomp-based
+# restriction changes the effective capability set, and RestrictSUIDSGID=yes
+# makes systemd's seccomp filter return ENOSYS for openat2. Root is the
+# default identity.
+Slice=duduclaw-tcb.slice
+TimeoutStartSec=30
+KillMode=control-group
+# Root uid with no capabilities at all: the probe only reads root-owned files
+# (/etc/passwd, the sshd configuration and host keys through sshd -T, the
+# journal), writes a throw-away key to its private /tmp and makes loopback
+# TCP connections.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+# Hides only the kernel ring buffer (/dev/kmsg, /proc/kmsg, syslog(2));
+# journalctl reads journal files and talks to journald, which stays allowed.
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictNamespaces=yes
+# AF_UNIX: journald and NSS; AF_INET/AF_INET6: the loopback SSH attempts.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+UMask=0077
+LimitCORE=0
+TasksMax=32
+MemoryMax=256M
+Environment=
+StandardInput=null
+StandardOutput=journal
+StandardError=journal

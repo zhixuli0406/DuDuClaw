@@ -101,10 +101,14 @@ A complete installation requires these roles and inputs:
 | Services | Gateway, spawnd socket/service, egress socket/service, optional DNS broker, updater, parse socket/template and TCB/employee slices |
 | Self-test account | `duduclaw-selftest`: the isolation self-test drops to it; system ID like the other service accounts, no home, no login shell, own group, no supplementary groups, locked |
 | Self-test unit | `/etc/systemd/system/duduclaw-isolation-selftest.service`, root:root 0644, exactly the shipped text with no drop-in; no `[Install]`: the installer never enables or starts it, spawnd starts it |
+| SSH denial probe | `/usr/lib/duduclaw/duduclaw-isolation-probe`, root:root 0755, signed component; runs as root, no account of its own |
+| SSH denial probe unit | `/etc/systemd/system/duduclaw-isolation-probe@.service` template, root:root 0644, exactly the shipped text; no `[Install]`: the installer never enables or starts it, one instance per employee account (`duduclaw-isolation-probe@duduclaw-emp-<uid>.service`) |
 | Parser roots | `/usr/lib/duduclaw/parse-root` and `/usr/lib/duduclaw/parse-root-tree`, root:root 0755; initially empty, never populated with host data |
 | Signed state | Bootstrap trust, compatible generation, runtime registry, updater slots/state and migration/readiness integration |
 
 The parser may leave the known empty mountpoint directories described in its [installation reference](../../crates/duduclaw-parse-worker/README.md). Unexpected content must be investigated; do not recursively clear either parser root. Spawnd owns employee SSH, cron, at and user-manager lockdown and verifies effective host state. Do not hand-edit those controls to make a failed check pass.
+
+If `/usr/sbin/sshd` is installed, the SSH denial probe attempts a real public-key login and a real port-forward as each employee account against the running sshd and requires both to be refused by the `DenyUsers duduclaw-emp-*` rule. Such hosts also need `/usr/bin/ssh`, `/usr/bin/ssh-keygen` and `/usr/bin/journalctl`, sshd listening on 127.0.0.1 (at the first `Port` of its configuration) and sshd logging to the systemd journal. Hosts without sshd skip the probe.
 
 The installer validates the complete fixed-path component set before preparing accounts, directories and units. Linux archives now include the frozen updater launcher. Offline release tooling can assemble a bootstrap inbox from signed metadata and artifacts. The independently authenticated `duduclaw-updated --bootstrap-stage` verifier checks its compiled root pin, threshold root signatures, target signature and all component hashes before publishing an **inactive generation**. It does not select `current`, create trust/state/slots, verify the legacy transition dual signature or activate services. No complete fresh-install recipe is available yet.
 

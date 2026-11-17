@@ -286,6 +286,14 @@ pub const TCB_SLICE: &str = "duduclaw-tcb.slice";
 /// The shipped self-test unit text; the installed file must be exactly these bytes.
 pub const ISOLATION_SELFTEST_UNIT_TEXT: &str =
     include_str!("../../../scripts/linux-protected/spawnd/duduclaw-isolation-selftest.service");
+/// R7c: the one command the SSH denial probe template unit runs (the installed
+/// path of `InstallTarget::IsolationProbe`), followed by ` %i`.
+pub const PROBE_EXECUTABLE: &str = "/usr/lib/duduclaw/duduclaw-isolation-probe";
+/// R7c: the shipped probe template unit text
+/// ([`duduclaw_isolation::ids::ISOLATION_PROBE_UNIT_TEMPLATE`]); the installed
+/// file must be exactly these bytes. Not started by anything yet.
+pub const ISOLATION_PROBE_UNIT_TEXT: &str =
+    include_str!("../../../scripts/linux-protected/spawnd/duduclaw-isolation-probe@.service");
 /// Read bound for an installed fixed unit file (the shipped one is ~4 KiB).
 pub const MAX_FIXED_UNIT_BYTES: usize = 64 * 1024;
 /// The installed unit file's content, read through the trusted-directory

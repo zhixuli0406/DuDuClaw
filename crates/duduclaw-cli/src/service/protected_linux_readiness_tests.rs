@@ -214,6 +214,12 @@ fn service_protected_readiness_components_match_the_signed_generation() {
     let mut fake = Fake::healthy();
     fake.manifest.as_mut().unwrap().artifacts.retain(|artifact| artifact.install_target != InstallTarget::TrampolineSelftest);
     assert_eq!(failures(&fake.assess()), [(Item::Components, "component_mismatch")]);
+    // R7c: the SSH denial probe binary likewise.
+    let mut fake = Fake::healthy(); fake.broken = vec!["/usr/lib/duduclaw/duduclaw-isolation-probe"];
+    assert_eq!(failures(&fake.assess()), [(Item::Components, "component_mismatch")]);
+    let mut fake = Fake::healthy();
+    fake.manifest.as_mut().unwrap().artifacts.retain(|artifact| artifact.install_target != InstallTarget::IsolationProbe);
+    assert_eq!(failures(&fake.assess()), [(Item::Components, "component_mismatch")]);
     // The gateway executable is compared too.
     let mut fake = Fake::healthy(); fake.broken = vec![BINARY];
     assert_eq!(failures(&fake.assess()), [(Item::Components, "component_mismatch")]);
@@ -262,6 +268,8 @@ fn service_protected_readiness_component_paths_map_to_distinct_signed_targets() 
     assert_eq!(component_target("/usr/lib/duduclaw/current/duduclaw"), Some(InstallTarget::Gateway));
     assert_eq!(component_target("/usr/lib/duduclaw/duduclaw-run-selftest"), Some(InstallTarget::TrampolineSelftest));
     assert_eq!(component_target(duduclaw_spawnd::systemd::SELFTEST_EXECUTABLE), Some(InstallTarget::TrampolineSelftest));
+    assert_eq!(component_target("/usr/lib/duduclaw/duduclaw-isolation-probe"), Some(InstallTarget::IsolationProbe));
+    assert_eq!(component_target(duduclaw_spawnd::systemd::PROBE_EXECUTABLE), Some(InstallTarget::IsolationProbe));
     assert!(layout::BINARIES.contains(&UPDATER_LAUNCHER));
     assert!(!component_paths().any(|path| path == UPDATER_LAUNCHER));
     assert!(component_target(UPDATER_LAUNCHER).is_none());

@@ -5516,6 +5516,19 @@
       "rationale": "R7a shipped isolation self-test (duduclaw-run-selftest), started only by PID 1 through the fixed root unit duduclaw-isolation-selftest.service with the trampoline's capability bounding set. Refuses any argument, reads no environment or stdin, closes every fd above 2. After the trampoline library's namespace entry, build_root/pivot and loopback it unshares a PID namespace and forks exactly one child that becomes that namespace's init, mounts its own /proc, drops to the dedicated non-login duduclaw-selftest account, applies runner::restrict_filesystem and the common seccomp filter, runs fixed filesystem assertions and _exits. No exec, no employee or gateway input; the parent only waits with a deadline."
     },
     {
+      "symbol": "crates/duduclaw-isolation/src/bin/probe.rs::linux::run_tool",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "spawn_daemon",
+      "migration": "privileged_service",
+      "rationale": "R7c shipped SSH denial probe (duduclaw-isolation-probe), started only by PID 1 through the root template unit duduclaw-isolation-probe@<account>.service with an empty capability bounding set and loopback-only IP access. Its only process creation: the fixed absolute host tools /usr/sbin/sshd -T, /usr/bin/ssh-keygen, /usr/bin/ssh and /usr/bin/journalctl (each fstat-verified root-owned, not group/other writable), fixed argv built from the validated employee account name and numeric ports, empty environment plus LC_ALL=C, cwd /, stdin /dev/null, output to 0600 files in a private 0700 directory, own process group, waited with a timer and group-killed on expiry. ssh runs this same binary as its ProxyCommand (--relay, numeric loopback ports only). No employee or gateway input."
+    },
+    {
       "symbol": "crates/duduclaw-run/src/bin/root-fixture/launch.rs::run",
       "apis": {
         "raw_fork": 1

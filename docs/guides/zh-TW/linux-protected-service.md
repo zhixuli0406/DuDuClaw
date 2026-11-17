@@ -101,10 +101,14 @@ sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux [--version X.Y
 | 服務 | Gateway、spawnd socket／service、egress socket／service、選用的 DNS broker、更新服務、parse socket／template、TCB 與員工 slice |
 | 自我檢測帳號 | `duduclaw-selftest`：隔離自我檢測降權後使用的帳號；與其他服務帳號相同的系統 ID，無家目錄、不能登入、自有群組、無額外群組、已鎖定 |
 | 自我檢測單元 | `/etc/systemd/system/duduclaw-isolation-selftest.service`，root:root 0644，內容與隨附版本完全相同且不得有覆寫設定；沒有 `[Install]`：安裝程式不會啟用或啟動它，由 spawnd 啟動 |
+| SSH 拒絕檢測程式 | `/usr/lib/duduclaw/duduclaw-isolation-probe`，root:root 0755，已簽章元件；以 root 執行，沒有專用帳號 |
+| SSH 拒絕檢測單元 | `/etc/systemd/system/duduclaw-isolation-probe@.service` 範本，root:root 0644，內容與隨附版本完全相同；沒有 `[Install]`：安裝程式不會啟用或啟動它，每個員工帳號一個執行個體（`duduclaw-isolation-probe@duduclaw-emp-<uid>.service`） |
 | 解析根目錄 | `/usr/lib/duduclaw/parse-root` 與 `/usr/lib/duduclaw/parse-root-tree`，root:root 0755，初始為空，不能放主機資料 |
 | 簽章狀態 | Bootstrap 信任、相容的元件世代、runtime 登錄表、更新槽與狀態、遷移及就緒檢查接線 |
 
 解析器可能留下[安裝參考](../../../crates/duduclaw-parse-worker/README.md)列出的已知空掛載點目錄。遇到其他內容應先調查，不要遞迴清空解析根目錄。Spawnd 負責員工的 SSH、cron、at 與 user manager 封鎖，並驗證主機上的有效狀態；不要手動放寬這些控制來通過檢查。
+
+若主機安裝了 `/usr/sbin/sshd`，SSH 拒絕檢測會以每個員工帳號對執行中的 sshd 實際嘗試一次公鑰登入與一次連接埠轉送，兩者都必須被 `DenyUsers duduclaw-emp-*` 規則拒絕。這類主機還需要 `/usr/bin/ssh`、`/usr/bin/ssh-keygen` 與 `/usr/bin/journalctl`，sshd 必須在 127.0.0.1（其設定中的第一個 `Port`）上監聽，並把日誌寫入 systemd journal。沒有 sshd 的主機會略過這項檢測。
 
 安裝器先驗證固定路徑的完整元件，再準備帳號、目錄與 unit。Linux 發行包已加入凍結的更新啟動器；離線工具可將已簽署的資料與元件組成 bootstrap inbox。經獨立驗證的 `duduclaw-updated --bootstrap-stage` 會檢查編譯時固定的根指紋、根金鑰門檻簽章、target 簽章與全部元件雜湊，再發布**尚未啟用的世代**；不選擇 `current`、不建立 trust／state／slots、不驗證舊版過渡雙簽，也不啟動服務。尚無可直接照做的完整新安裝步驟。
 

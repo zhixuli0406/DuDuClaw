@@ -101,10 +101,14 @@ sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux [--version X.Y
 | サービス | Gateway、spawnd socket／service、egress socket／service、任意の DNS broker、更新サービス、parse socket／template、TCB／社員 slice |
 | セルフテスト用アカウント | `duduclaw-selftest`：隔離セルフテストが権限を下げて使うアカウント。他のサービスアカウントと同じシステム ID、ホームなし、ログイン不可、専用グループ、追加グループなし、ロック済み |
 | セルフテスト用ユニット | `/etc/systemd/system/duduclaw-isolation-selftest.service`。root:root 0644、同梱版と完全に同一でドロップインなし。`[Install]` がなく、インストーラーは有効化も起動もせず、spawnd が起動する |
+| SSH 拒否検査プログラム | `/usr/lib/duduclaw/duduclaw-isolation-probe`。root:root 0755、署名済みコンポーネント。root で実行し、専用アカウントはない |
+| SSH 拒否検査ユニット | `/etc/systemd/system/duduclaw-isolation-probe@.service` テンプレート。root:root 0644、同梱版と完全に同一。`[Install]` がなく、インストーラーは有効化も起動もしない。社員アカウントごとに 1 インスタンス（`duduclaw-isolation-probe@duduclaw-emp-<uid>.service`） |
 | 解析用 root | `/usr/lib/duduclaw/parse-root` と `/usr/lib/duduclaw/parse-root-tree`。root:root 0755、初期状態は空、ホストデータを置かない |
 | 署名済み状態 | Bootstrap の信頼、互換性のある世代、runtime 登録、更新スロット／状態、移行／準備完了の連携 |
 
 解析器は[インストール参考](../../../crates/duduclaw-parse-worker/README.md)に記載された既知の空マウントポイントを残す場合があります。予期しない内容は調査し、解析用 root を再帰的に削除しないでください。Spawnd が社員の SSH、cron、at、user manager を封鎖し、ホストの実効状態を検証します。検査に通すために制御を緩和しないでください。
+
+`/usr/sbin/sshd` がインストールされているホストでは、SSH 拒否検査が各社員アカウントで稼働中の sshd に対して実際の公開鍵ログインとポート転送を 1 回ずつ試み、どちらも `DenyUsers duduclaw-emp-*` ルールで拒否されることを確認します。このようなホストには `/usr/bin/ssh`、`/usr/bin/ssh-keygen`、`/usr/bin/journalctl` も必要で、sshd は 127.0.0.1（設定の最初の `Port`）で待ち受け、ログを systemd journal に出力している必要があります。sshd のないホストではこの検査を省略します。
 
 インストーラーは固定パスの完全なコンポーネント群を検証してから、アカウント、ディレクトリ、unit を準備します。Linux 配布物には固定更新ランチャーも含まれ、オフラインツールは署名済み情報とファイルから bootstrap inbox を作成できます。独立に認証された `duduclaw-updated --bootstrap-stage` は、コンパイル時の root 指紋、root 閾値署名、target 署名、全ファイルのハッシュを検証し、**未有効化の世代**を配置します。`current` の選択、trust／state／slots の作成、旧版移行の二重署名検証、サービス有効化は行いません。完全な新規導入の手順はまだ提供していません。
 

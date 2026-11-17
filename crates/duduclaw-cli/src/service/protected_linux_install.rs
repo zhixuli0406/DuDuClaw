@@ -967,6 +967,22 @@ mod spawnd_install_tests {
         assert!(staging.contains("atomic_install(&format!(\"/etc/systemd/system/{name}\"), 0o644"));
         for effect in ["\"enable\"", "\"start\"", "\"--now\""] { assert!(!staging.contains(effect), "{effect}"); }
     }
+
+    /// R7c: the SSH denial probe template is written like every layout unit
+    /// (root 0644, exactly spawnd's embedded bytes), runs the published probe
+    /// binary with the instance name, and is never enabled or started here.
+    #[test]
+    fn probe_template_unit_is_installed_as_spawnd_requires_and_never_enabled() {
+        use duduclaw_isolation::ids::ISOLATION_PROBE_UNIT_TEMPLATE;
+        let units: Vec<_> = layout::UNITS.iter().filter(|(unit, _)| *unit == ISOLATION_PROBE_UNIT_TEMPLATE).collect();
+        assert_eq!(units.len(), 1);
+        let text = units[0].1;
+        assert_eq!(text, duduclaw_spawnd::systemd::ISOLATION_PROBE_UNIT_TEXT);
+        let exec = format!("ExecStart={} %i", duduclaw_spawnd::systemd::PROBE_EXECUTABLE);
+        assert!(text.lines().any(|line| line == exec));
+        assert!(layout::BINARIES.contains(&duduclaw_spawnd::systemd::PROBE_EXECUTABLE));
+        assert!(!text.lines().any(|line| line.trim() == "[Install]" || line.starts_with("WantedBy=")));
+    }
 }
 
 #[cfg(test)]
