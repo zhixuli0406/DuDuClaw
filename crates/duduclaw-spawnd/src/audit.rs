@@ -43,6 +43,11 @@ pub enum Event { Refused, Reserved, Queued, Started, Ended, Revoked, Intruder, O
     UpdateBarrierRestored,
     /// R6: spawnd found a publication journal at start (detail: `publication_recovery`).
     PublicationRecovery,
+    /// R6: an update request left the set of a fully open spawnd not consistent
+    /// (failed or partial `Apply`, unreadable journal). Admission is closed and
+    /// spawnd exits for start-up recovery (detail: `publication_recovery`, the
+    /// journal as found; action `incomplete` or `journal_unreadable`).
+    UpdateSetInconsistent,
 }
 /// R6: how spawnd verified the installed set at start (publication journal
 /// `publish.json`, or the `current` selector when there is no journal). Every
@@ -290,23 +295,41 @@ fn first_record_time(reader: impl std::io::Read) -> std::io::Result<Option<u64>>
     Ok(Some(first.at_unix_ms))
 }
 
+/// One queued record; with an acknowledgement, the worker reports whether it
+/// was durably written (file and directory synced).
+#[cfg(any(target_os = "linux", test))]
+type Queued = (u8, Record, Option<std::sync::mpsc::SyncSender<bool>>);
 #[cfg(any(target_os = "linux", test))]
 #[derive(Clone)]
 struct AuditQueue {
-    sender: std::sync::mpsc::SyncSender<(u8, Record)>,
+    sender: std::sync::mpsc::SyncSender<Queued>,
     dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 #[cfg(any(target_os = "linux", test))]
 impl AuditQueue {
     fn emit(&self, source: u8, record: Record) -> bool {
-        if self.sender.try_send((source, record)).is_ok() { return true; }
+        if self.sender.try_send((source, record, None)).is_ok() { return true; }
+        self.count_dropped();
+        false
+    }
+    /// Queue `record` (never blocking on a full queue) and wait at most
+    /// `timeout` for the worker's report. `true` only when the worker wrote it;
+    /// the queue is FIFO, so every record queued earlier was handled first.
+    fn emit_acknowledged(&self, source: u8, record: Record, timeout: std::time::Duration) -> bool {
+        let (acknowledge, acknowledged) = std::sync::mpsc::sync_channel(1);
+        if self.sender.try_send((source, record, Some(acknowledge))).is_err() {
+            self.count_dropped();
+            return false;
+        }
+        acknowledged.recv_timeout(timeout).unwrap_or(false)
+    }
+    fn count_dropped(&self) {
         let _ = self.dropped.fetch_update(std::sync::atomic::Ordering::Relaxed,
             std::sync::atomic::Ordering::Relaxed, |count| Some(count.saturating_add(1)));
-        false
     }
 }
 #[cfg(any(target_os = "linux", test))]
-fn audit_channel() -> (AuditQueue, std::sync::mpsc::Receiver<(u8, Record)>) {
+fn audit_channel() -> (AuditQueue, std::sync::mpsc::Receiver<Queued>) {
     let (sender, receiver) = std::sync::mpsc::sync_channel(QUEUE_LENGTH);
     (AuditQueue { sender, dropped: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)) }, receiver)
 }
@@ -336,9 +359,10 @@ pub mod disk {
                 let _ = log.sweep(now_ms());
                 loop {
                     match receiver.recv_timeout(Duration::from_secs(60)) {
-                        Ok((source, mut record)) => {
+                        Ok((source, mut record, acknowledge)) => {
                             record.suppressed = record.suppressed.saturating_add(dropped.swap(0, Ordering::Relaxed));
-                            let _ = log.write(source, record);
+                            let written = log.write(source, record).is_ok();
+                            if let Some(acknowledge) = acknowledge { let _ = acknowledge.try_send(written); }
                         }
                         Err(RecvTimeoutError::Timeout) => { let _ = log.sweep(now_ms()); }
                         Err(RecvTimeoutError::Disconnected) => {
@@ -353,6 +377,15 @@ pub mod disk {
         /// False means a full/disconnected queue. The next admitted event reports
         /// the dropped count; callers must not retry synchronously or block.
         pub fn emit(&self, source: u8, record: Record) -> bool { self.queue.emit(source, record) }
+        /// For the few security-relevant records whose loss must be visible (R6
+        /// start-up records, the inconsistent-set exit): waits at most `timeout`
+        /// until the worker reports the record written and synced. `false`:
+        /// dropped (full queue), failed to write, or no report in time. Also
+        /// flushes: everything queued earlier was handled first. Never call it
+        /// from the admission loop.
+        pub fn emit_acknowledged(&self, source: u8, record: Record, timeout: Duration) -> bool {
+            self.queue.emit_acknowledged(source, record, timeout)
+        }
     }
 
     fn now_ms() -> u64 {
@@ -520,6 +553,36 @@ mod tests {
         assert!(!queue.emit(1, record()));
     }
     #[test]
+    fn acknowledged_audit_reports_the_write_result_and_is_bounded() {
+        use std::time::{Duration, Instant};
+        fn record() -> Record {
+            Record { at_unix_ms: 0, event: Event::PublicationRecovery, employee: None, run: None, suppressed: 0, detail: None }
+        }
+        // The worker's result reaches the caller: written, then a failed write.
+        let (queue, receiver) = audit_channel();
+        let worker = std::thread::spawn(move || {
+            for (index, (_, _, acknowledge)) in receiver.iter().enumerate() {
+                if let Some(acknowledge) = acknowledge { let _ = acknowledge.try_send(index == 0); }
+            }
+        });
+        assert!(queue.emit_acknowledged(2, record(), Duration::from_secs(5)));
+        assert!(!queue.emit_acknowledged(2, record(), Duration::from_secs(5)));
+        drop(queue);
+        worker.join().unwrap();
+        // No worker answers: `false` after the bound, never an indefinite wait.
+        let (queue, receiver) = audit_channel();
+        let started = Instant::now();
+        assert!(!queue.emit_acknowledged(2, record(), Duration::from_millis(50)));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // A full queue: `false` at once and counted as dropped.
+        for _ in 1..QUEUE_LENGTH { assert!(queue.emit(2, record())); }
+        let started = Instant::now();
+        assert!(!queue.emit_acknowledged(2, record(), Duration::from_secs(30)));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(queue.dropped.load(std::sync::atomic::Ordering::Relaxed), 1);
+        drop(receiver);
+    }
+    #[test]
     fn bounded_output_and_event_rate() {
         let mut output = OutputBudget::new(6, 4).unwrap();
         assert_eq!(output.allowance(5, 1), 3);
@@ -654,7 +717,7 @@ mod tests {
         assert_eq!(queue.dropped.load(std::sync::atomic::Ordering::Relaxed), 1);
         // The worker's admission (the default `AuditLog` budget: 60/min/source).
         let mut budget = AuditBudget::new(60);
-        let admitted = receiver.try_iter().filter(|(source, record)| {
+        let admitted = receiver.try_iter().filter(|(source, record, _)| {
             assert_eq!(*source, 0);
             budget.admit(*source, record.at_unix_ms).is_some()
         }).count();

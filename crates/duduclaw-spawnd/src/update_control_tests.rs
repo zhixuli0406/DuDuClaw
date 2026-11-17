@@ -96,8 +96,13 @@ fn new_world(store: &MemoryStore, installed: Sha256Digest, staged: &[Sha256Diges
 
 /// Without a world, the selected generation of a verified installed set.
 const INSTALLED: Sha256Digest = Sha256Digest([0xee; 32]);
+/// What the fake workload census reports (production: PID 1 and cgroupfs).
+#[derive(Clone, Copy, Default)]
+enum Census { #[default] Idle, Busy(Workloads), Fails }
+const LIVE_RUN: Workloads = Workloads { live_run_units: 1, employees_cgroup_populated: false };
+const POPULATED: Workloads = Workloads { live_run_units: 0, employees_cgroup_populated: true };
 #[derive(Default)]
-struct FakeEffects { calls: Vec<&'static str>, fail: bool, world: Option<SharedWorld> }
+struct FakeEffects { calls: Vec<&'static str>, fail: bool, world: Option<SharedWorld>, census: Census }
 impl FakeEffects {
     fn over(world: &SharedWorld) -> Self { Self { world: Some(world.clone()), ..Self::default() } }
 }
@@ -155,6 +160,13 @@ impl Effects for FakeEffects {
         self.calls.push("readback");
         Ok(vec![])
     }
+    fn workloads(&mut self) -> io::Result<Workloads> {
+        match self.census {
+            Census::Idle => Ok(Workloads::default()),
+            Census::Busy(workloads) => Ok(workloads),
+            Census::Fails => Err(io::Error::other("census incomplete")),
+        }
+    }
 }
 /// A verified installed set and no publication (drain-only root tests).
 struct NoEffects;
@@ -169,6 +181,7 @@ impl Effects for NoEffects {
     }
     fn installed(&mut self) -> io::Result<Option<Sha256Digest>> { Ok(Some(INSTALLED)) }
     fn readback(&mut self, _: Sha256Digest, _: bool) -> io::Result<Vec<ComponentReadback>> { Err(invalid()) }
+    fn workloads(&mut self) -> io::Result<Workloads> { Ok(Workloads::default()) }
 }
 
 /// Stands in for the admission loop: one iteration every 5 ms with a fixed run
@@ -630,7 +643,8 @@ fn update_repairing_apply_replies_then_takes_the_restart_path() {
     shared.lock().unwrap().slots[6] = Some(digest(9));
     let (barrier, mut control) = restart(&store, &shared);
     assert_eq!(control.startup().recovery, PublicationRecovery::SelectedUnverified);
-    // No admission loop exists: Drain answers zero admitted runs without waiting.
+    // No admission loop exists: Drain answers zero admitted runs on an idle
+    // census, without waiting for an iteration.
     let started = Instant::now();
     accepted(&mut control, ControlCommand::Drain { generation: digest(1) });
     assert!(started.elapsed() < OBSERVATION_WAIT);
@@ -714,41 +728,66 @@ fn update_status_line_uses_fixed_vocabulary() {
     }
 }
 
+/// A systemd invocation id (32 lowercase hex digits) for test owners.
+const INVOCATION: &str = "0123456789abcdef0123456789abcdef";
+/// Make `control` the status owner a service start would make it (tests do
+/// not run under systemd, so `$INVOCATION_ID` is not there), and return how
+/// PID 1 would report that process.
+fn own<S: DrainStore + JournalStore, E: Effects>(control: &mut UpdateControl<S, E>) -> LiveSpawnd {
+    control.owner = Some(Owner { boot_id: boot_id().unwrap(), pid: std::process::id(), invocation_id: INVOCATION.into() });
+    LiveSpawnd { pid: std::process::id(), invocation_id: INVOCATION.into() }
+}
+
 #[test]
 fn update_wait_consistent_accepts_only_a_fresh_matching_consistent_status() {
     let boot = "0123abcd-0000-4000-8000-000000000001";
-    let owner = Owner { boot_id: boot.into(), pid: 4242, start_time: 777 };
+    let owner = Owner { boot_id: boot.into(), pid: 4242, invocation_id: INVOCATION.into() };
     let status = |set: &str, owner: Option<&Owner>| serde_json::to_vec(&serde_json::json!({
-        "schema": 2, "set": set, "closed_reason": null, "owner": owner, "admission_closed": false })).unwrap();
-    let live = |pid: u32| (pid == 4242).then_some(777u64);
+        "schema": 3, "set": set, "closed_reason": null, "owner": owner, "admission_closed": false })).unwrap();
+    let live = LiveSpawnd { pid: 4242, invocation_id: INVOCATION.into() };
     let good = status("consistent", Some(&owner));
-    assert!(status_accepted(Some(&good), boot, live));
+    assert!(status_accepted(Some(&good), boot, Some(&live)));
     // Missing, unreadable, malformed.
-    assert!(!status_accepted(None, boot, live));
-    assert!(!status_accepted(Some(b"{"), boot, live));
-    assert!(!status_accepted(Some(&vec![b' '; MAX_STATUS_BYTES + 1]), boot, live));
-    // Stale: another boot, a dead pid, a recycled pid (other start time), a
-    // process outside duduclaw-spawnd.service (the probe returns nothing).
-    assert!(!status_accepted(Some(&good), "0123abcd-0000-4000-8000-000000000002", live));
-    assert!(!status_accepted(Some(&good), boot, |_| None));
-    assert!(!status_accepted(Some(&good), boot, |_| Some(778)));
-    // Not consistent, no owner, an earlier schema, an owner with an unknown field.
-    for set in ["recovering", "inconsistent"] { assert!(!status_accepted(Some(&status(set, Some(&owner))), boot, live)); }
-    assert!(!status_accepted(Some(&status("consistent", None)), boot, live));
+    assert!(!status_accepted(None, boot, Some(&live)));
+    assert!(!status_accepted(Some(b"{"), boot, Some(&live)));
+    assert!(!status_accepted(Some(&vec![b' '; MAX_STATUS_BYTES + 1]), boot, Some(&live)));
+    // Stale: another boot; no active spawnd (or the bus unavailable); the same
+    // pid under a new invocation (a restart, or a recycled pid); another pid.
+    assert!(!status_accepted(Some(&good), "0123abcd-0000-4000-8000-000000000002", Some(&live)));
+    assert!(!status_accepted(Some(&good), boot, None));
+    assert!(!status_accepted(Some(&good), boot, Some(&LiveSpawnd { pid: 4242, invocation_id: "f".repeat(32) })));
+    assert!(!status_accepted(Some(&good), boot, Some(&LiveSpawnd { pid: 4243, invocation_id: INVOCATION.into() })));
+    // Not consistent, no owner, an earlier schema, an owner with an unknown
+    // field (a schema-2 `start_time`), an owner with a malformed invocation id.
+    for set in ["recovering", "inconsistent"] {
+        assert!(!status_accepted(Some(&status(set, Some(&owner))), boot, Some(&live)));
+    }
+    assert!(!status_accepted(Some(&status("consistent", None)), boot, Some(&live)));
     let mut value: serde_json::Value = serde_json::from_slice(&good).unwrap();
-    value["schema"] = 1.into();
-    assert!(!status_accepted(Some(&serde_json::to_vec(&value).unwrap()), boot, live));
+    value["schema"] = 2.into();
+    assert!(!status_accepted(Some(&serde_json::to_vec(&value).unwrap()), boot, Some(&live)));
     let mut value: serde_json::Value = serde_json::from_slice(&good).unwrap();
-    value["owner"]["uid"] = 0.into();
-    assert!(!status_accepted(Some(&serde_json::to_vec(&value).unwrap()), boot, live));
+    value["owner"]["start_time"] = 777.into();
+    assert!(!status_accepted(Some(&serde_json::to_vec(&value).unwrap()), boot, Some(&live)));
+    let malformed = Owner { invocation_id: INVOCATION.to_uppercase(), ..owner.clone() };
+    assert!(!status_accepted(Some(&status("consistent", Some(&malformed))), boot,
+        Some(&LiveSpawnd { pid: 4242, invocation_id: INVOCATION.to_uppercase() })));
+    let (zeros, short): (String, String) = ("0".repeat(32), INVOCATION.chars().take(31).collect());
+    for (id, valid) in [(INVOCATION, true), ("", false), (zeros.as_str(), false), (short.as_str(), false),
+        ("0123456789abcdef0123456789abcdeg", false)] {
+        assert_eq!(invocation_id_valid(id), valid, "{id:?}");
+    }
     // The status this process writes is accepted only once everything is open.
     let current = boot_id().unwrap();
-    let alive = |pid: u32| (pid == std::process::id()).then(|| process_start_time(pid).unwrap());
     let mut control = endpoint();
+    let alive = own(&mut control);
     let written = |control: &mut UpdateControl<MemoryStore, FakeEffects>| serde_json::to_vec(&control.status()).unwrap();
-    assert!(!status_accepted(Some(&written(&mut control)), &current, alive));
+    assert!(!status_accepted(Some(&written(&mut control)), &current, Some(&alive)));
     assert!(control.opened());
-    assert!(status_accepted(Some(&written(&mut control)), &current, alive));
+    assert!(status_accepted(Some(&written(&mut control)), &current, Some(&alive)));
+    // Outside a service start there is no owner: never accepted.
+    control.owner = None;
+    assert!(!status_accepted(Some(&written(&mut control)), &current, Some(&alive)));
     // The waiter keeps waiting (here until its test timeout) and returns as soon as it is accepted.
     assert_eq!(wait_until(|| false, Some(Duration::from_millis(50)), Duration::from_millis(5)).unwrap_err().kind(),
         io::ErrorKind::TimedOut);
@@ -773,10 +812,10 @@ fn update_unit_isolation_ready_waits_for_spawnd_consistency() {
     use duduclaw_isolation::ids::ISOLATION_READY_UNIT;
     assert_eq!(ISOLATION_READY_UNIT, "duduclaw-isolation-ready.service");
     let lines = directives(READY_UNIT);
-    for expected in ["Type=oneshot", "RemainAfterExit=yes", "Requires=duduclaw-spawnd.service", "After=duduclaw-spawnd.service",
-        "ExecStart=/usr/lib/duduclaw/duduclaw-spawnd wait-consistent", "TimeoutStartSec=infinity", "User=root",
-        "NoNewPrivileges=yes", "CapabilityBoundingSet=", "AmbientCapabilities=", "ProtectSystem=strict",
-        "PrivateNetwork=yes", "IPAddressDeny=any", "PrivateDevices=yes", "ProtectHome=yes", "StandardError=journal"] {
+    for expected in ["Type=oneshot", "RemainAfterExit=yes", "ExecStart=/usr/lib/duduclaw/duduclaw-spawnd wait-consistent",
+        "TimeoutStartSec=infinity", "User=root", "NoNewPrivileges=yes", "CapabilityBoundingSet=", "AmbientCapabilities=",
+        "ProtectSystem=strict", "PrivateNetwork=yes", "IPAddressDeny=any", "PrivateDevices=yes", "ProtectHome=yes",
+        "RestrictAddressFamilies=AF_UNIX", "StandardError=journal"] {
         assert!(lines.contains(&expected), "{expected}");
     }
     // Read-only, no network, nothing restarted behind the waiter's back.
@@ -785,13 +824,42 @@ fn update_unit_isolation_ready_waits_for_spawnd_consistency() {
 }
 
 #[test]
+fn update_unit_isolation_ready_lives_exactly_as_long_as_spawnd() {
+    let lines = directives(READY_UNIT);
+    // Stopped whenever spawnd stops or fails, restarted with it, run after its READY=1.
+    for expected in ["BindsTo=duduclaw-spawnd.service", "PartOf=duduclaw-spawnd.service", "After=duduclaw-spawnd.service"] {
+        assert!(lines.contains(&expected), "{expected}");
+    }
+    // BindsTo= replaces Requires= (a Requires= gate stayed up after a crash).
+    assert!(!lines.iter().any(|line| line.starts_with("Requires=")));
+    // Started by spawnd's own start (a [Unit] relation), not by an enable step.
+    assert!(!READY_UNIT.lines().any(|line| line == "[Install]"));
+    assert!(directives(SPAWND_UNIT).contains(&"Wants=duduclaw-isolation-ready.service"));
+}
+
+#[test]
 fn update_unit_spawnd_ready_is_bounded_and_restarts_after_repair() {
+    use duduclaw_updated::linux::activation::{RESTART_DEADLINE, SPAWND_START_TIMEOUT_SECS, SPAWND_STOP_TIMEOUT_SECS};
     let lines = directives(SPAWND_UNIT);
     let exit = RESTART_AFTER_REPAIR_EXIT.to_string();
-    for expected in ["Type=notify".to_owned(), "NotifyAccess=main".to_owned(), "TimeoutStartSec=300".to_owned(),
+    for expected in ["Type=notify".to_owned(), "NotifyAccess=main".to_owned(),
+        format!("TimeoutStartSec={SPAWND_START_TIMEOUT_SECS}"), format!("TimeoutStopSec={SPAWND_STOP_TIMEOUT_SECS}"),
         "Restart=on-failure".to_owned(), format!("RestartForceExitStatus={exit}"), format!("SuccessExitStatus={exit}"),
         "StartLimitIntervalSec=300".to_owned(), "StartLimitBurst=5".to_owned(), "StandardError=journal".to_owned()] {
         assert!(lines.contains(&expected.as_str()), "{expected}");
+    }
+    // The updater's one restart deadline outlasts a whole stop plus start.
+    assert!(RESTART_DEADLINE > Duration::from_secs(SPAWND_START_TIMEOUT_SECS + SPAWND_STOP_TIMEOUT_SECS));
+    // The failure exit of an open process is a failure: restarted by
+    // Restart=on-failure and counted, never "success" and never prevented.
+    let failure = EXIT_SET_INCONSISTENT.to_string();
+    assert_ne!(EXIT_SET_INCONSISTENT, RESTART_AFTER_REPAIR_EXIT);
+    for line in &lines {
+        for key in ["SuccessExitStatus=", "RestartPreventExitStatus=", "RestartForceExitStatus="] {
+            if let Some(statuses) = line.strip_prefix(key) {
+                assert!(!statuses.split_ascii_whitespace().any(|status| status == failure), "{line}");
+            }
+        }
     }
     // Only the waiter unit has no start timeout; stderr is no longer discarded.
     assert!(!lines.contains(&"TimeoutStartSec=infinity"));
@@ -805,6 +873,9 @@ fn update_unit_egress_and_gateway_depend_on_isolation_ready() {
     assert!(EGRESS_UNIT.contains(ISOLATED_GATEWAY_UNIT_DEPENDENCIES));
     let lines = directives(EGRESS_UNIT);
     for expected in ISOLATED_GATEWAY_UNIT_DEPENDENCIES.lines() { assert!(lines.contains(&expected), "{expected}"); }
+    // Stopped when the gate drops: BindsTo=, and no leftover Requires= on the gate.
+    assert!(lines.contains(&"BindsTo=duduclaw-isolation-ready.service"));
+    assert!(!lines.contains(&"Requires=duduclaw-isolation-ready.service"));
     // Not on spawnd directly: its READY=1 means only "update endpoint bound".
     assert!(!lines.iter().any(|line| line.contains("duduclaw-spawnd.service")));
 }
@@ -814,8 +885,10 @@ fn update_unit_updater_depends_only_on_spawnd_start() {
     let lines = directives(UPDATED_UNIT);
     assert!(lines.contains(&"Wants=duduclaw-spawnd.service"));
     assert!(lines.contains(&"After=duduclaw-spawnd.service"));
-    // Requires= would propagate the updater's own `systemctl restart duduclaw-spawnd.service`.
-    assert!(!lines.iter().any(|line| line.starts_with("Requires=")));
+    // Requires= would propagate the updater's own `systemctl restart duduclaw-spawnd.service`;
+    // BindsTo=/PartOf= would stop or restart the updater with every spawnd restart.
+    assert!(!lines.iter().any(|line| line.starts_with("Requires=") || line.starts_with("BindsTo=")
+        || line.starts_with("PartOf=")));
     for unit in ["duduclaw-gateway.service", "duduclaw-egress.service", "duduclaw-isolation-ready.service"] {
         assert!(!lines.iter().any(|line| line.contains(unit)), "{unit}");
     }
@@ -828,22 +901,37 @@ fn update_apply_refused_while_another_generation_is_publishing() {
     let barrier = DrainBarrier::default();
     let _admission = Observer::new(&barrier, 0);
     let mut control = UpdateControl::new(store.clone(), barrier.clone(), FakeEffects::over(&shared)).unwrap();
-    // A late failure in this process leaves `publishing` for 2 (4 of 8 replaced).
+    // A late failure in this process leaves `publishing` for 2 (4 of 8 replaced);
+    // the open process stops serving (see the failure-exit test).
     accepted(&mut control, ControlCommand::Drain { generation: digest(2) });
     shared.lock().unwrap().power_loss_after = Some(4);
     refused_outcome(&mut control, apply_command(digest(2)));
     assert_eq!(store.journal().map(|journal| journal.state), Some(PublishState::Publishing));
+    assert!(control.exit_required());
+    drop(control);
+    // Its restart can neither complete 2 nor roll back to 1 (both unverifiable
+    // for now): only the update endpoint serves, with `publishing` for 2.
+    shared.lock().unwrap().staged.retain(|generation| *generation == digest(3));
+    let (_barrier, mut control) = restart(&store, &shared);
+    assert_eq!(control.startup().recovery, PublicationRecovery::Incomplete);
     control.effects.calls.clear();
     accepted(&mut control, ControlCommand::Drain { generation: digest(3) });
     refused_outcome(&mut control, apply_command(digest(3)));
     assert!(control.effects.calls.is_empty());
     assert_eq!(store.journal().map(|journal| journal.generation), Some(digest(2)));
     // Rolling back to the journal's previous generation is allowed (it finishes the journal).
+    shared.lock().unwrap().staged.push(digest(1));
     accepted(&mut control, ControlCommand::Drain { generation: digest(1) });
     accepted(&mut control, apply_command(digest(1)));
+    assert!(control.restart_required());
     assert_eq!(slots(&shared), [Some(digest(1)); 8]);
     assert_eq!(store.journal(), Some(PublishJournal::new(digest(1), digest(1), Some(digest(2)), PublishState::Published).unwrap()));
-    // Once published, another generation may be applied; its previous is the installed one.
+    drop(control);
+    // Once published (and re-verified by the restart), another generation may
+    // be applied; its previous is the installed one.
+    let (barrier, mut control) = restart(&store, &shared);
+    assert_eq!(control.startup().recovery, PublicationRecovery::Reverified);
+    let _admission = Observer::new(&barrier, 0);
     accepted(&mut control, ControlCommand::Drain { generation: digest(3) });
     accepted(&mut control, apply_command(digest(3)));
     assert_eq!(slots(&shared), [Some(digest(3)); 8]);
@@ -876,6 +964,207 @@ fn update_drain_and_apply_refused_when_admission_is_unhealthy() {
 }
 
 #[test]
+fn update_open_apply_failure_closes_admission_and_takes_the_failure_exit() {
+    let store = MemoryStore::default();
+    let shared = new_world(&store, digest(1), &[digest(1), digest(2), digest(3)]);
+    let barrier = DrainBarrier::default();
+    let _admission = Observer::new(&barrier, 0);
+    let mut control = UpdateControl::new(store.clone(), barrier.clone(), FakeEffects::over(&shared)).unwrap();
+    assert!(control.opened());
+    assert_eq!(control.report(), "consistent");
+    // A refusal before the journal (verification) leaves the set as it was:
+    // the process keeps serving.
+    accepted(&mut control, ControlCommand::Drain { generation: digest(9) });
+    let (client, server) = pair();
+    transport::send(&client, &request(apply_command(digest(9)))).unwrap();
+    assert_eq!(serve_and_settle(server, me(), &mut control), After::Continue);
+    assert!(matches!(transport::receive::<ControlResponse>(&client).unwrap().outcome, ControlOutcome::Refused));
+    assert_eq!(store.journal(), None);
+    assert_eq!(control.report(), "consistent");
+    // A failure after `publishing` landed (3 of 8 replaced): the reply is sent,
+    // then the failure exit is decided; admission was closed before the reply.
+    accepted(&mut control, ControlCommand::Drain { generation: digest(2) });
+    shared.lock().unwrap().power_loss_after = Some(3);
+    let (client, server) = pair();
+    transport::send(&client, &request(apply_command(digest(2)))).unwrap();
+    assert_eq!(serve_and_settle(server, me(), &mut control), After::ExitInconsistent);
+    assert!(matches!(transport::receive::<ControlResponse>(&client).unwrap().outcome, ControlOutcome::Refused));
+    assert!(control.exit_required() && !control.restart_required());
+    assert_eq!(barrier.closure(), Some(DrainClosure::Recovery));
+    assert_eq!(control.report(), "inconsistent: publication_incomplete");
+    let status = serde_json::to_value(control.status()).unwrap();
+    assert_eq!((status["set"].as_str(), status["admission_closed"].as_bool(), status["barrier"].as_str(),
+        status["journal"].as_str()), (Some("inconsistent"), Some(true), Some("recovery_incomplete"), Some("publishing")));
+    // Nothing else is served, and nothing reopens admission, until it exits.
+    for command in [ControlCommand::Resume { generation: digest(2) }, ControlCommand::Drain { generation: digest(2) },
+        apply_command(digest(2)), ControlCommand::Readback { generation: digest(2) }] {
+        let (client, server) = pair();
+        transport::send(&client, &request(command)).unwrap();
+        assert_eq!(serve_and_settle(server, me(), &mut control), After::ExitInconsistent);
+        assert!(matches!(transport::receive::<ControlResponse>(&client).unwrap().outcome, ControlOutcome::Refused));
+    }
+    assert_eq!(barrier.closure(), Some(DrainClosure::Recovery));
+    assert_eq!(slots(&shared).iter().filter(|slot| **slot == Some(digest(2))).count(), 3);
+    // The exit's audit record names the journal as found; a record that did not
+    // land is part of STATUS=.
+    let record = inconsistent_record(&mut store.clone(), 5);
+    assert_eq!((record.event, record.detail.clone()), (crate::audit::Event::UpdateSetInconsistent,
+        Some(Detail::PublicationRecovery { action: PublicationRecovery::Incomplete, generation: Some(digest(2)),
+            previous: Some(digest(1)) })));
+    assert_eq!(report_audited(&mut control, vec![record], |_| false), "inconsistent: publication_incomplete; audit_write_failed");
+    drop(control);
+    // The restart (systemd's, after EXIT_SET_INCONSISTENT) completes the publication.
+    let (barrier, control) = restart(&store, &shared);
+    assert_eq!(control.startup().recovery, PublicationRecovery::RolledForward);
+    assert_eq!(slots(&shared), [Some(digest(2)); 8]);
+    assert_eq!(barrier.closure(), Some(DrainClosure::Generation(digest(2))));
+    // An unreadable journal found by a later request also ends an open process.
+    drop(control);
+    let (barrier, mut control) = restart(&store, &shared);
+    let _admission = Observer::new(&barrier, 0);
+    assert!(control.opened());
+    store.0.lock().unwrap().journal = Some(b"{\"schema\":".to_vec());
+    let (client, server) = pair();
+    transport::send(&client, &request(ControlCommand::Readback { generation: digest(2) })).unwrap();
+    assert_eq!(serve_and_settle(server, me(), &mut control), After::ExitInconsistent);
+    assert_eq!(control.report(), "inconsistent: journal_unreadable");
+    assert_eq!(inconsistent_record(&mut store.clone(), 6).detail,
+        Some(Detail::PublicationRecovery { action: PublicationRecovery::JournalUnreadable, generation: None, previous: None }));
+}
+
+#[test]
+fn update_closed_drain_and_apply_follow_the_workload_census() {
+    let store = MemoryStore::default();
+    let shared = new_world(&store, digest(1), &[digest(1)]);
+    shared.lock().unwrap().slots[6] = Some(digest(9));
+    let (barrier, mut control) = restart(&store, &shared);
+    assert_eq!(control.startup().recovery, PublicationRecovery::SelectedUnverified);
+    // A run unit of an earlier spawnd still live, a populated employees cgroup,
+    // or a census that cannot be completed: Drain is refused (the record and
+    // the closure still land: fail closed).
+    for census in [Census::Busy(LIVE_RUN), Census::Busy(POPULATED), Census::Fails] {
+        control.effects.census = census;
+        refused_outcome(&mut control, ControlCommand::Drain { generation: digest(1) });
+        assert_eq!(barrier.closure(), Some(DrainClosure::Generation(digest(1))));
+        assert_eq!(store.clone().load().unwrap(), Some(digest(1)));
+    }
+    control.effects.census = Census::Idle;
+    match outcome(&mut control, ControlCommand::Drain { generation: digest(1) }) {
+        ControlOutcome::Drained { admission_closed: true, active_runs: 0 } => {}
+        other => panic!("{other:?}"),
+    }
+    // Apply re-takes the census: refused before anything is verified or written.
+    control.effects.calls.clear();
+    for census in [Census::Busy(LIVE_RUN), Census::Busy(POPULATED), Census::Fails] {
+        control.effects.census = census;
+        refused_outcome(&mut control, apply_command(digest(1)));
+    }
+    assert!(control.effects.calls.is_empty());
+    assert_eq!(slots(&shared)[6], Some(digest(9)));
+    assert!(!control.restart_required());
+    control.effects.census = Census::Idle;
+    accepted(&mut control, apply_command(digest(1)));
+    assert!(control.restart_required());
+    assert_eq!(slots(&shared), [Some(digest(1)); 8]);
+}
+
+#[test]
+fn update_open_apply_also_requires_an_idle_census() {
+    let barrier = DrainBarrier::default();
+    let _admission = Observer::new(&barrier, 0);
+    let mut control = UpdateControl::new(MemoryStore::default(), barrier.clone(), FakeEffects::default()).unwrap();
+    accepted(&mut control, ControlCommand::Drain { generation: digest(7) });
+    control.effects.calls.clear();
+    // The admission loop counts zero, but PID 1 or cgroupfs still see a run.
+    for census in [Census::Busy(LIVE_RUN), Census::Busy(POPULATED), Census::Fails] {
+        control.effects.census = census;
+        refused_outcome(&mut control, apply_command(digest(7)));
+    }
+    assert!(control.effects.calls.is_empty());
+    assert!(!control.exit_required());
+    control.effects.census = Census::Idle;
+    accepted(&mut control, apply_command(digest(7)));
+}
+
+#[test]
+fn update_employees_cgroup_census_reads_cgroupfs_fail_closed() {
+    let root = tempfile::tempdir().unwrap();
+    // Not the unified hierarchy (no cgroup.controllers, or not a file): no census.
+    assert!(employees_cgroup_populated(root.path()).is_err());
+    std::fs::create_dir(root.path().join("cgroup.controllers")).unwrap();
+    assert!(employees_cgroup_populated(root.path()).is_err());
+    std::fs::remove_dir(root.path().join("cgroup.controllers")).unwrap();
+    std::fs::write(root.path().join("cgroup.controllers"), "cpu io memory pids\n").unwrap();
+    // No employees slice at all: nothing can run there.
+    assert!(!employees_cgroup_populated(root.path()).unwrap());
+    let slice = root.path().join("duduclaw.slice").join("duduclaw-employees.slice");
+    std::fs::create_dir_all(&slice).unwrap();
+    assert!(!employees_cgroup_populated(root.path()).unwrap());
+    std::fs::write(slice.join("cgroup.events"), "populated 1\nfrozen 0\n").unwrap();
+    assert!(employees_cgroup_populated(root.path()).unwrap());
+    std::fs::write(slice.join("cgroup.events"), "populated 0\nfrozen 0\n").unwrap();
+    assert!(!employees_cgroup_populated(root.path()).unwrap());
+    for malformed in ["", "populated 2\n", "frozen 0\n", "populated 0\npopulated 0\n"] {
+        std::fs::write(slice.join("cgroup.events"), malformed).unwrap();
+        assert!(employees_cgroup_populated(root.path()).is_err(), "{malformed:?}");
+    }
+    assert!(Workloads::default().idle());
+    assert!(!LIVE_RUN.idle() && !POPULATED.idle());
+}
+
+#[test]
+fn update_startup_audit_failure_appears_in_status() {
+    let store = MemoryStore::default();
+    {
+        let mut disk = store.0.lock().unwrap();
+        disk.bytes = Some(encode_record(digest(7)).unwrap());
+        disk.journal = Some(PublishJournal::new(digest(7), digest(7), None, PublishState::Published).unwrap().encode().unwrap());
+    }
+    let mut control = UpdateControl::new(store, DrainBarrier::default(), FakeEffects::default()).unwrap();
+    let records = control.startup().audit_records(1);
+    assert_eq!(records.len(), 2);
+    // Both written (acknowledged): nothing appended.
+    let mut written = 0;
+    assert_eq!(report_audited(&mut control, records, |_| { written += 1; true }), "recovering");
+    assert_eq!(written, 2);
+    // One not acknowledged (write or fsync failed, queue full, no answer in time).
+    let records = control.startup().audit_records(1);
+    let line = report_audited(&mut control, records,
+        |record| record.event != crate::audit::Event::PublicationRecovery);
+    assert_eq!(line, "recovering; audit_write_failed");
+    // It stays part of every later STATUS= line of this process.
+    assert!(control.opened());
+    assert_eq!(control.report(), "consistent; audit_write_failed");
+}
+
+#[test]
+fn update_waiter_refuses_a_non_unified_hierarchy_and_matches_only_the_live_spawnd() {
+    // Not on the unified cgroup v2 hierarchy: an error at once, nothing read.
+    let (mut reads, mut lookups) = (0, 0);
+    let started = Instant::now();
+    let error = wait_for_consistency(false, "boot", || { reads += 1; None }, || { lookups += 1; None }, None,
+        Duration::from_millis(1)).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    assert_eq!(error.to_string(), NOT_UNIFIED_MESSAGE);
+    assert_eq!((reads, lookups), (0, 0));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    // Unified: only the spawnd PID 1 reports now, with the owner's pid and
+    // invocation id, completes the wait.
+    let boot = "0123abcd-0000-4000-8000-000000000001";
+    let owner = Owner { boot_id: boot.into(), pid: 4242, invocation_id: INVOCATION.into() };
+    let bytes = serde_json::to_vec(&serde_json::json!({ "schema": 3, "set": "consistent", "owner": owner })).unwrap();
+    for live in [None, Some(LiveSpawnd { pid: 4242, invocation_id: "e".repeat(32) }),
+        Some(LiveSpawnd { pid: 4241, invocation_id: INVOCATION.into() })] {
+        let error = wait_for_consistency(true, boot, || Some(bytes.clone()), || live.clone(),
+            Some(Duration::from_millis(30)), Duration::from_millis(5)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{live:?}");
+    }
+    let matching = LiveSpawnd { pid: 4242, invocation_id: INVOCATION.into() };
+    wait_for_consistency(true, boot, || Some(bytes.clone()), || Some(matching.clone()), Some(Duration::from_secs(5)),
+        Duration::from_millis(1)).unwrap();
+}
+
+#[test]
 fn update_startup_status_and_audit_records() {
     let store = MemoryStore::default();
     {
@@ -888,11 +1177,12 @@ fn update_startup_status_and_audit_records() {
     let mut control = UpdateControl::new(store.clone(), barrier, FakeEffects::default()).unwrap();
     let hex7 = "07".repeat(32);
     let mut status = serde_json::to_value(control.status()).unwrap();
-    // The owner identifies this process in this boot (staleness for the waiter).
-    let owner: Owner = serde_json::from_value(status.as_object_mut().unwrap().remove("owner").unwrap()).unwrap();
-    assert_eq!(owner, Owner::current().unwrap());
+    // The owner identifies this process's service start in this boot
+    // (staleness for the waiter); without `$INVOCATION_ID` there is none.
+    let owner: Option<Owner> = serde_json::from_value(status.as_object_mut().unwrap().remove("owner").unwrap()).unwrap();
+    assert_eq!(owner, Owner::current().ok());
     assert_eq!(status, serde_json::json!({
-        "schema": 2, "set": "recovering", "closed_reason": null,
+        "schema": 3, "set": "recovering", "closed_reason": null,
         "admission_closed": true, "barrier": "drained", "barrier_generation": hex7,
         "journal": "published", "journal_generation": hex7, "journal_previous": "06".repeat(32),
         "publication_consistent": true, "startup_barrier": "drained", "startup_barrier_generation": hex7,
@@ -1600,6 +1890,7 @@ fn iso_root_update_power_loss_each_phase() {
     tree.corrupt(first);
     let barrier = DrainBarrier::default();
     let mut control = tree.control(&barrier).with_status_root(&tree.state);
+    let alive = own(&mut control);
     assert_eq!(control.startup().recovery, PublicationRecovery::Incomplete);
     assert_eq!(barrier.closure(), Some(DrainClosure::Recovery));
     assert_eq!(tree.count_published(3), 2);
@@ -1611,34 +1902,38 @@ fn iso_root_update_power_loss_each_phase() {
     let bytes = std::fs::read(&path).unwrap();
     let mut status: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     let owner: Owner = serde_json::from_value(status.as_object_mut().unwrap().remove("owner").unwrap()).unwrap();
-    assert_eq!(owner, Owner::current().unwrap());
+    assert_eq!((owner.pid, owner.invocation_id.as_str()), (alive.pid, alive.invocation_id.as_str()));
     assert_eq!(status, serde_json::json!({
-        "schema": 2, "set": "inconsistent", "closed_reason": "publication_incomplete",
+        "schema": 3, "set": "inconsistent", "closed_reason": "publication_incomplete",
         "admission_closed": true, "barrier": "recovery_incomplete", "barrier_generation": null,
         "journal": "publishing", "journal_generation": hex(&third), "journal_previous": hex(&first),
         "publication_consistent": false, "startup_barrier": "drained", "startup_barrier_generation": hex(&third),
         "startup_recovery": "incomplete" }));
     let boot = boot_id().unwrap();
-    let alive = |pid: u32| (pid == std::process::id()).then(|| process_start_time(pid).unwrap());
-    assert!(!status_accepted(Some(&bytes), &boot, alive));
+    assert!(!status_accepted(Some(&bytes), &boot, Some(&alive)));
     // 8. Restart after repair: an operator restages the generation; Drain needs
-    //    no admission loop; the repairing Apply replies, then takes the restart
-    //    path; the restarted process verifies everything, opens, and only then
-    //    writes the `consistent` status the waiter accepts.
+    //    no admission loop (an idle census of this host); the repairing Apply
+    //    replies, then takes the restart path; the restarted process verifies
+    //    everything, opens, and only then writes the `consistent` status the
+    //    waiter accepts.
     tree.restore(third, 3);
     accepted(&mut control, ControlCommand::Drain { generation: third });
     repair_over_socket(&mut control, Preparation::for_manifest(&last, third));
     tree.assert_published(3);
     assert_eq!(control.report(), "recovering");
-    assert!(!status_accepted(Some(&std::fs::read(&path).unwrap()), &boot, alive));
+    assert!(!status_accepted(Some(&std::fs::read(&path).unwrap()), &boot, Some(&alive)));
     drop(control);
     let barrier = DrainBarrier::default();
     let mut control = tree.control(&barrier).with_status_root(&tree.state);
+    // A new service start has a new invocation id: the old status never matches it.
+    assert!(!status_accepted(Some(&std::fs::read(&path).unwrap()), &boot,
+        Some(&LiveSpawnd { pid: alive.pid, invocation_id: "f".repeat(32) })));
+    let alive = own(&mut control);
     assert_eq!(control.startup().recovery, PublicationRecovery::Reverified);
     assert_eq!(control.report(), "recovering");
     assert!(control.opened());
     assert_eq!(control.report(), "consistent");
-    assert!(status_accepted(Some(&std::fs::read(&path).unwrap()), &boot, alive));
+    assert!(status_accepted(Some(&std::fs::read(&path).unwrap()), &boot, Some(&alive)));
     // An unreadable journal is never ignored either.
     drop(control);
     std::fs::write(tree.state.join(JOURNAL_FILE), b"{\"schema\":2}").unwrap();
@@ -1646,4 +1941,140 @@ fn iso_root_update_power_loss_each_phase() {
     let control = tree.control(&barrier);
     assert_eq!(control.startup().recovery, PublicationRecovery::JournalUnreadable);
     assert_eq!(barrier.closure(), Some(DrainClosure::Recovery));
+}
+
+#[test]
+#[ignore = "requires root native Linux with the system bus: open-mode Apply failure in an isolated root-owned /run tree"]
+fn iso_root_update_open_apply_failure_exits_and_restart_completes() {
+    let tree = RootTree::new();
+    let (first, _) = tree.install(1);
+    let (second, next) = tree.stage(2);
+    let barrier = DrainBarrier::default();
+    let _admission = Observer::new(&barrier, 0);
+    let mut effects = tree.effects();
+    effects.power_loss_after = Some(4);
+    let mut control = tree.control_with(&barrier, effects).with_status_root(&tree.state);
+    let alive = own(&mut control);
+    assert!(control.opened());
+    assert_eq!(control.report(), "consistent");
+    let (boot, path) = (boot_id().unwrap(), tree.state.join(STATUS_FILE));
+    assert!(status_accepted(Some(&std::fs::read(&path).unwrap()), &boot, Some(&alive)));
+    // The production census of this host (PID 1, cgroupfs) finds nothing running.
+    accepted(&mut control, ControlCommand::Drain { generation: second });
+    let (client, server) = pair();
+    transport::send(&client, &request(ControlCommand::Apply { preparation: Preparation::for_manifest(&next, second) })).unwrap();
+    assert_eq!(serve_and_settle(server, me(), &mut control), After::ExitInconsistent);
+    assert!(matches!(transport::receive::<ControlResponse>(&client).unwrap().outcome, ControlOutcome::Refused));
+    assert_eq!(barrier.closure(), Some(DrainClosure::Recovery));
+    assert_eq!(control.report(), "inconsistent: publication_incomplete");
+    // The gate's waiter no longer accepts this process's status file.
+    assert!(!status_accepted(Some(&std::fs::read(&path).unwrap()), &boot, Some(&alive)));
+    assert_eq!(tree.count_published(2), 4);
+    drop(control);
+    // The restart after EXIT_SET_INCONSISTENT completes the publication.
+    let barrier = DrainBarrier::default();
+    let control = tree.control(&barrier);
+    assert_eq!(control.startup().recovery, PublicationRecovery::RolledForward);
+    tree.assert_published(2);
+    assert_eq!(tree.journal(), Some(PublishJournal::new(second, second, Some(first), PublishState::Published).unwrap()));
+}
+
+/// Temporary units under `/run/systemd/system` whose relation lines are the
+/// production files' own, renamed: a stand-in spawnd (exits with
+/// [`EXIT_SET_INCONSISTENT`] when its flag file appears, `Restart=` as in
+/// production), the gate, and a dependent carrying the gateway/egress lines.
+/// PID 1 is driven over the system bus (no process is spawned).
+struct GateUnits { prefix: String, connection: zbus::blocking::Connection }
+impl GateUnits {
+    const BUS: &'static str = "org.freedesktop.systemd1";
+    fn name(&self, role: &str) -> String { format!("{}-{role}.service", self.prefix) }
+    fn flag(&self) -> PathBuf { PathBuf::from(format!("/run/{}.fail", self.prefix)) }
+    fn manager(&self) -> zbus::blocking::Proxy<'_> {
+        zbus::blocking::Proxy::new(&self.connection, Self::BUS, "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager")
+            .unwrap()
+    }
+    fn install() -> Self {
+        use duduclaw_isolation::ids::ISOLATED_GATEWAY_UNIT_DEPENDENCIES;
+        assert_eq!(unsafe { libc::geteuid() }, 0, "requires root");
+        let units = Self { prefix: format!("duduclaw-gate-test-{}", std::process::id()),
+            connection: zbus::blocking::Connection::system().unwrap() };
+        let rename = |line: &str| line.replace("duduclaw-spawnd.service", &units.name("spawnd"))
+            .replace("duduclaw-isolation-ready.service", &units.name("ready"));
+        let relations = |unit: &str, keys: &[&str]| directives(unit).into_iter()
+            .filter(|line| keys.iter().any(|key| line.starts_with(key))).map(|line| rename(line)).collect::<Vec<_>>().join("\n");
+        let spawnd = format!("[Unit]\n{}\n[Service]\nType=simple\nExecStart=/bin/sh -c 'while [ ! -e {flag} ]; do sleep 0.2; done; \
+            rm -f {flag}; exit {exit}'\n{}\nRestartSec=1\n",
+            relations(SPAWND_UNIT, &["Wants=", "StartLimitIntervalSec=", "StartLimitBurst="]),
+            relations(SPAWND_UNIT, &["Restart=", "RestartForceExitStatus=", "SuccessExitStatus="]),
+            flag = units.flag().display(), exit = EXIT_SET_INCONSISTENT);
+        let ready = format!("[Unit]\n{}\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/usr/bin/true\n",
+            relations(READY_UNIT, &["BindsTo=", "PartOf=", "After=", "Requires="]));
+        let dependent = format!("[Unit]\n{}[Service]\nExecStart=/usr/bin/sleep infinity\n", rename(ISOLATED_GATEWAY_UNIT_DEPENDENCIES));
+        for (role, content) in [("spawnd", spawnd), ("ready", ready), ("egress", dependent)] {
+            std::fs::write(Path::new("/run/systemd/system").join(units.name(role)), content).unwrap();
+        }
+        let _: () = units.manager().call("Reload", &()).unwrap();
+        units
+    }
+    fn job(&self, method: &str, role: &str) {
+        let _: zbus::zvariant::OwnedObjectPath = self.manager().call(method, &(self.name(role).as_str(), "replace")).unwrap();
+    }
+    /// `(ActiveState, InvocationID)` as PID 1 reports them now.
+    fn state(&self, role: &str) -> (String, Vec<u8>) {
+        let path: zbus::zvariant::OwnedObjectPath = self.manager().call("LoadUnit", &(self.name(role).as_str(),)).unwrap();
+        let unit = zbus::blocking::Proxy::new(&self.connection, Self::BUS, path.as_str(), "org.freedesktop.systemd1.Unit").unwrap();
+        (unit.get_property("ActiveState").unwrap(), unit.get_property("InvocationID").unwrap())
+    }
+    fn until(&self, what: &str, condition: impl Fn(&Self) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !condition(self) {
+            assert!(Instant::now() < deadline, "{what}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    /// Every role active under a new invocation (compared with `before`).
+    fn rearmed(&self, roles: &[&str], before: &[Vec<u8>]) -> bool {
+        roles.iter().zip(before).all(|(role, old)| { let (state, id) = self.state(role); state == "active" && id != *old })
+    }
+}
+impl Drop for GateUnits {
+    fn drop(&mut self) {
+        for role in ["egress", "ready", "spawnd"] {
+            let _: zbus::Result<zbus::zvariant::OwnedObjectPath> = self.manager().call("StopUnit", &(self.name(role).as_str(), "replace"));
+            let _ = std::fs::remove_file(Path::new("/run/systemd/system").join(self.name(role)));
+        }
+        let _ = std::fs::remove_file(self.flag());
+        let _: zbus::Result<()> = self.manager().call("Reload", &());
+    }
+}
+
+#[test]
+#[ignore = "iso_root_: root systemd >= 249 VM; temporary units under /run/systemd/system with the production gate relations"]
+fn iso_root_update_gate_drops_and_rearms_with_spawnd() {
+    let units = GateUnits::install();
+    let all: &[&str] = &["spawnd", "ready", "egress"];
+    let gate: &[&str] = &["spawnd", "ready"];
+    let invocations = |roles: &[&str]| roles.iter().map(|role| units.state(role).1).collect::<Vec<_>>();
+    // Starting a dependent pulls in the gate and spawnd (BindsTo=), in order.
+    units.job("StartUnit", "egress");
+    units.until("everything active", |units| all.iter().all(|role| units.state(role).0 == "active"));
+    // 1. An explicit restart of spawnd restarts the gate (PartOf=/BindsTo=) and,
+    //    through it, the dependent: the gate is re-armed by the new process.
+    let before = invocations(all);
+    units.job("RestartUnit", "spawnd");
+    units.until("gate and dependent restarted with spawnd", |units| units.rearmed(all, &before));
+    // 2. The open-mode failure exit (83): the gate drops and takes the
+    //    dependent down; Restart= starts a new spawnd, which pulls the gate in
+    //    again (Wants=). The dependent stays down until it is started again.
+    let before = invocations(gate);
+    std::fs::write(units.flag(), b"").unwrap();
+    units.until("dependent stopped with the gate", |units| units.state("egress").0 != "active");
+    units.until("gate re-armed by the restarted spawnd", |units| units.rearmed(gate, &before));
+    assert_ne!(units.state("egress").0, "active");
+    units.job("StartUnit", "egress");
+    units.until("dependent back after the gate", |units| units.state("egress").0 == "active");
+    // 3. Stopping spawnd stops the gate and every dependent.
+    units.job("StopUnit", "spawnd");
+    units.until("gate and dependent stopped with spawnd",
+        |units| ["ready", "egress"].iter().all(|role| units.state(role).0 == "inactive"));
 }

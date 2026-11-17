@@ -172,27 +172,53 @@ ALWAYS. `READY=1` means only "the root update endpoint is available".
 - Consistent: the allocation socket (`LinuxHost::open`), the control listener
   and admission are opened; then the status says `consistent` for this process.
 - Not consistent: nothing else is initialised (only audit, the status file and
-  `update.sock`). `Drain` closes and records the barrier and answers zero
-  admitted runs at once (no admission loop exists, so no run can exist in this
-  process); `Resume` is refused. A successful `Apply` repairs the set: spawnd
-  sends the reply, writes the status (`recovering`) and exits with status 82
-  (`RESTART_AFTER_REPAIR_EXIT`); the unit restarts exactly that status
-  (`RestartForceExitStatus=82`, `SuccessExitStatus=82`, start rate limit
-  `StartLimitIntervalSec=300`/`StartLimitBurst=5`), and the new process runs
-  the full verification before opening anything. There is no in-process switch.
+  `update.sock`). `Drain` closes and records the barrier; it answers zero
+  admitted runs only when the workload census is complete and idle (below),
+  otherwise it is refused. `Resume` is refused. A successful `Apply` (same
+  census precondition) repairs the set: spawnd sends the reply, writes the
+  status (`recovering`) and exits with status 82 (`RESTART_AFTER_REPAIR_EXIT`);
+  the unit restarts exactly that status (`RestartForceExitStatus=82`,
+  `SuccessExitStatus=82`), and the new process runs the full verification
+  before opening anything. There is no in-process switch.
+- Opened, then a request leaves the set not consistent (an `Apply` that failed
+  after the journal said `publishing`, or a journal that no longer reads):
+  before the reply, admission is closed (`recovery_incomplete`) and every
+  further request is refused; after the reply the status is written
+  (`inconsistent`), an `update_set_inconsistent` audit record is written
+  synchronously (acknowledged by the audit worker, which also flushes every
+  record queued before it), and spawnd exits with status 83
+  (`EXIT_SET_INCONSISTENT`). `Restart=on-failure` restarts it (counted against
+  the start rate limit), and the start-up recovery completes or rolls back the
+  publication. The consistency gate and its dependents stop with the process.
+
+Workload census (`Effects::workloads`, production `system_census`): PID 1's
+`ListUnits` over the system bus, counting every `duduclaw-run-<id>.service`
+(exact name) in a state other than `inactive`/`failed`, and
+`/sys/fs/cgroup/duduclaw.slice/duduclaw-employees.slice/cgroup.events`, which
+must say `populated 0` or be absent (every run unit lives below it). The cgroup
+root must be the unified hierarchy (`cgroup.controllers`). Nothing comes from
+this process's memory, so runs started by an earlier spawnd process whose
+asynchronous teardown is still in progress are seen. A census that cannot be
+completed refuses `Drain` (without an admission loop) and `Apply` (always, in
+addition to the admission loop's own zero count).
 
 The barrier restored from a record and the start-up verification are audited
 (`update_barrier_restored`, `publication_recovery` with the action and the
 journal's generations, or the selected generation; nothing for a verified
-start without a journal).
+start without a journal). These records are written synchronously: each is
+acknowledged by the audit worker after its file and directory fsync (at most
+5 s) before the start-up status is reported; one that is dropped, fails or is
+not acknowledged in time makes every later `STATUS=` line of the process end
+in `; audit_write_failed`.
 
 Operator status: `/run/duduclaw-spawnd/update-status.json` (root 0600, atomic
 replace, written at start, once everything is open and after every request on
-`update.sock`; the wire contract has no status request). Schema 2. Fields:
+`update.sock`; the wire contract has no status request). Schema 3. Fields:
 `set` (`consistent`, `recovering`, `inconsistent`), `closed_reason` (with
 `inconsistent`: `publication_incomplete`, `journal_unreadable`,
 `selector_absent`, `selector_unreadable`, `selected_unverified`), `owner`
-(`boot_id`, `pid`, `start_time` = field 22 of `/proc/<pid>/stat`),
+(`boot_id`, `pid`, `invocation_id` = the service start's `$INVOCATION_ID`;
+`null` outside a systemd start),
 `admission_closed`, `barrier` (`open`, `drained`, `unreadable_record`,
 `recovery_incomplete`) and `barrier_generation`, `journal` (`absent`,
 `publishing`, `published`, `unreadable`), `journal_generation`,
@@ -204,31 +230,46 @@ replace, written at start, once everything is open and after every request on
 `STATUS=` line (`consistent`, `recovering`, `inconsistent: <closed_reason>`)
 whenever it changes, and logged to stderr (the unit routes stderr to the
 journal); a failed status-file write appends `; status_file_write_failed`, a
-failed audit emission at start `; audit_write_failed`.
+synchronously written audit record that did not land `; audit_write_failed`.
 
 ### Unit ordering (`duduclaw-isolation-ready.service`)
 
 - `duduclaw-spawnd.service`: `Type=notify`, `TimeoutStartSec=300` (bounds the
-  verification before `READY=1`).
+  verification before `READY=1`), `TimeoutStopSec=90`;
+  `Wants=duduclaw-isolation-ready.service`, so every start of spawnd (boot,
+  manual, `Restart=`) starts the gate again (a `[Unit]` dependency; nothing is
+  enabled). Exit 82 (repair) and 83 (inconsistent set) are restarted; see the
+  scripts README for the start rate limit and `systemctl reset-failed`.
 - `duduclaw-isolation-ready.service` (next to the spawnd unit): oneshot,
-  `RemainAfterExit=yes`, `Requires=`/`After=duduclaw-spawnd.service`, runs
+  `RemainAfterExit=yes`, `BindsTo=`/`PartOf=`/`After=duduclaw-spawnd.service`
+  (stopped whenever spawnd stops, fails or restarts; restarted with it), runs
   `duduclaw-spawnd wait-consistent`, `TimeoutStartSec=infinity` (the only
   unit without a start timeout), no network, read-only filesystem, no
   capabilities. The waiter exits 0 only when the status file says
-  `consistent`, its `owner.boot_id` is the current boot, and `owner.pid` is a
-  live process of `duduclaw-spawnd.service` (cgroup) whose start time equals
-  `owner.start_time`; a missing, unreadable, stale (earlier process or boot)
-  or inconsistent status keeps it waiting. It binds and connects to nothing.
-- `duduclaw-egress.service`: `Requires=`/`After=duduclaw-isolation-ready.service`.
+  `consistent`, its `owner.boot_id` is the current boot, and `owner.pid` and
+  `owner.invocation_id` are exactly the `MainPID` and `InvocationID` PID 1
+  reports for the active `duduclaw-spawnd.service` (system bus, read-only
+  properties); a missing, unreadable, stale (earlier process, invocation or
+  boot) or inconsistent status keeps it waiting. It never opens `/proc/<pid>`
+  (so `hidepid=` and spawnd's non-dumpable flag do not matter) and needs no
+  capability; the trade-off is a dependency on the system bus (spawnd is
+  ordered after `dbus.service`; while the bus is down the waiter keeps
+  waiting). On a host whose `/sys/fs/cgroup` is not the unified cgroup v2
+  hierarchy it exits 1 at once with a fixed message (the isolated install
+  requires cgroup v2: plan S1 HostPreflight).
+- `duduclaw-egress.service`: `BindsTo=`/`After=duduclaw-isolation-ready.service`.
 - Isolated-install gateway unit (written by the installer package, R3): must
   contain `duduclaw_isolation::ids::ISOLATED_GATEWAY_UNIT_DEPENDENCIES`
-  (`Requires=duduclaw-isolation-ready.service` and
-  `After=duduclaw-isolation-ready.service`). The single-binary gateway unit is
-  unchanged (no spawnd on those hosts).
+  (`BindsTo=duduclaw-isolation-ready.service` and
+  `After=duduclaw-isolation-ready.service`), so it stops whenever the gate
+  drops. The single-binary gateway unit is unchanged (no spawnd on those hosts).
 - `duduclaw-updated.service`: `Wants=`/`After=duduclaw-spawnd.service` only, so
-  it starts on an inconsistent set and can repair it. Not `Requires=`: the
-  updater itself runs `systemctl restart duduclaw-spawnd.service` during an
-  activation, which `Requires=` would propagate to the updater.
+  it starts on an inconsistent set and can repair it, and spawnd restarts never
+  stop or restart it. Not `Requires=`/`BindsTo=`/`PartOf=`: the updater itself
+  restarts spawnd during an activation (`systemctl reset-failed`, then
+  `systemctl --no-block restart`, then polling every unit for `active` under a
+  new `InvocationID` against one deadline, `RESTART_DEADLINE` = stop 90 s +
+  start 300 s + 60 s), which those would propagate to the updater.
 
 The unit grants spawnd write access to `/usr/lib/duduclaw`, `/usr/libexec/duduclaw`
 and `/opt/duduclaw/bin` for this publication: an atomic replacement creates

@@ -2,7 +2,16 @@
 Description=DuDuClaw root employee launch agent
 Requires=duduclaw-spawnd.socket
 After=duduclaw-spawnd.socket dbus.service
-# Crash loops stay rate-limited, including the restart after a repair (below).
+# R6 consistency gate: every start of this unit (boot, manual, Restart=) also
+# starts the gate, which is BindsTo=/PartOf=/After= this unit, so it drops with
+# every stop or restart and is re-armed only by the new process. A [Unit]
+# dependency, not [Install]: nothing has to be enabled for it.
+Wants=duduclaw-isolation-ready.service
+# Crash loops stay rate-limited: every automatic restart (failure, exit 83,
+# and the exit-82 restart after a repair) counts. Deliberate restarts by
+# duduclaw-updated (it restarts spawnd after every Apply, including every
+# repairing one) run `systemctl reset-failed` first, so legitimate repairs in a
+# row cannot exhaust the budget. Limit hit: see README (`reset-failed`).
 StartLimitIntervalSec=300
 StartLimitBurst=5
 
@@ -17,7 +26,11 @@ StartLimitBurst=5
 Type=notify
 NotifyAccess=main
 # Bounds the verification that precedes READY=1 (hashing two generations).
+# Start and stop budgets are duduclaw-updated's restart deadline inputs
+# (duduclaw_updated::linux::activation::SPAWND_START_TIMEOUT_SECS and
+# SPAWND_STOP_TIMEOUT_SECS; pinned by spawnd's unit-file test).
 TimeoutStartSec=300
+TimeoutStopSec=90
 User=root
 Group=root
 ExecStart=/usr/lib/duduclaw/duduclaw-spawnd
@@ -26,9 +39,14 @@ Restart=on-failure
 RestartSec=3
 # 82: an Apply repaired a set this process found not consistent; it exits so
 # the fresh start verifies everything before opening (update_control.rs
-# RESTART_AFTER_REPAIR_EXIT). Restarted, not counted as a failure.
+# RESTART_AFTER_REPAIR_EXIT). Restarted, result "success".
 RestartForceExitStatus=82
 SuccessExitStatus=82
+# 83 (update_control.rs EXIT_SET_INCONSISTENT): a fully open spawnd whose set
+# became inconsistent (failed or partial Apply) closed admission, replied,
+# wrote its status and audit, and exited. A failure: Restart=on-failure
+# restarts it and the start-up recovery completes or rolls back the
+# publication. Deliberately not in SuccessExitStatus=/RestartPreventExitStatus=.
 KillMode=control-group
 UMask=0077
 LimitCORE=0

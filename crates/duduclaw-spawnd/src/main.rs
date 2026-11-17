@@ -10,7 +10,8 @@ fn main() {
             update_control};
         // duduclaw-isolation-ready.service: exits 0 only once the live spawnd
         // reports the verified, opened, consistent set. Reads the root-only
-        // status file and /proc; binds and connects to nothing.
+        // status file and PID 1's view of duduclaw-spawnd.service (system bus,
+        // read-only); binds nothing. Not on cgroup v2: exits 1 at once.
         if arguments.len() == 1 && arguments[0] == "wait-consistent" {
             if update_control::wait_consistent().is_ok() { return; }
             eprintln!("duduclaw-spawnd: wait-consistent failed");

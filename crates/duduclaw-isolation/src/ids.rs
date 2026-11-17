@@ -43,14 +43,17 @@ pub const EMPLOYEE_SLICE_PATTERN: &str = "duduclaw-employees-<immutable-id>.slic
 pub const UPDATED_UNIT: &str = "duduclaw-updated.service";
 /// R6 (plan addendum "啟動順序與「一致」的判定", points 3 and 6): the oneshot
 /// unit that completes only once spawnd reports the isolated component set
-/// verified and consistent (`duduclaw-spawnd wait-consistent`).
+/// verified and consistent (`duduclaw-spawnd wait-consistent`). It is bound to
+/// spawnd (`BindsTo=`/`PartOf=`/`After=`), so it drops whenever spawnd stops,
+/// crashes or restarts, and spawnd pulls it in again (`Wants=`) on every start.
 pub const ISOLATION_READY_UNIT: &str = "duduclaw-isolation-ready.service";
 /// The two `[Unit]` lines the isolated-install gateway unit (written by the
 /// installer package, R3) must carry, exactly as `duduclaw-egress.service`
-/// does, so the gateway never starts on an unverified or mixed set. The
+/// does, so the gateway never starts on an unverified or mixed set and is
+/// stopped whenever the gate drops (`BindsTo=`, not only `Requires=`). The
 /// single-binary gateway unit (no spawnd on those hosts) must not carry them.
 pub const ISOLATED_GATEWAY_UNIT_DEPENDENCIES: &str =
-    "Requires=duduclaw-isolation-ready.service\nAfter=duduclaw-isolation-ready.service\n";
+    "BindsTo=duduclaw-isolation-ready.service\nAfter=duduclaw-isolation-ready.service\n";
 
 /// Inclusive numeric interval, checked before allocation (§5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,9 +120,11 @@ mod tests {
     fn isolated_gateway_unit_dependencies_are_pinned() {
         assert_eq!(ISOLATION_READY_UNIT, "duduclaw-isolation-ready.service");
         assert_eq!(ISOLATED_GATEWAY_UNIT_DEPENDENCIES,
-            "Requires=duduclaw-isolation-ready.service\nAfter=duduclaw-isolation-ready.service\n");
+            "BindsTo=duduclaw-isolation-ready.service\nAfter=duduclaw-isolation-ready.service\n");
         let lines: Vec<&str> = ISOLATED_GATEWAY_UNIT_DEPENDENCIES.lines().collect();
-        assert_eq!(lines, [format!("Requires={ISOLATION_READY_UNIT}"), format!("After={ISOLATION_READY_UNIT}")]);
+        assert_eq!(lines, [format!("BindsTo={ISOLATION_READY_UNIT}"), format!("After={ISOLATION_READY_UNIT}")]);
+        // Requires= alone would leave the gateway running after the gate drops.
+        assert!(!ISOLATED_GATEWAY_UNIT_DEPENDENCIES.contains("Requires="));
     }
     #[test]
     fn uid_range_checks_fail_closed() {

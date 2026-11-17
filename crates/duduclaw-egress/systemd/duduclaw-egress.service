@@ -5,7 +5,10 @@ After=duduclaw-egress.socket
 # R6: start only once spawnd reports the installed set verified consistent
 # (/opt/duduclaw/bin/duduclaw-egress is one of its eight components). Not on
 # spawnd itself: its READY=1 only means its update endpoint is bound.
-Requires=duduclaw-isolation-ready.service
+# BindsTo=, not Requires=: the gate drops with every spawnd stop, crash or
+# restart and when a fully open spawnd finds its set inconsistent, and egress
+# must stop with it (it comes back through its socket, after the gate).
+BindsTo=duduclaw-isolation-ready.service
 After=duduclaw-isolation-ready.service
 
 [Service]

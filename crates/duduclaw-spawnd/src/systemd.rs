@@ -47,6 +47,13 @@ pub fn parse_run_unit(name: &str) -> Option<RunId> {
     }
     Some(RunId(bytes))
 }
+/// R6 update census: a unit PID 1 lists is a live spawnd run unit when its
+/// name is exactly a run unit's and it is in any state but `inactive` or
+/// `failed` (`active`, `activating`, `deactivating`, `reloading`, or anything
+/// unknown: fail closed). Other names are not spawnd's.
+pub fn run_unit_live(name: &str, active_state: &str) -> bool {
+    parse_run_unit(name).is_some() && !matches!(active_state, "inactive" | "failed")
+}
 pub fn employee_slice(employee: EmployeeId) -> String {
     let hex: String = employee.0.iter().map(|byte| format!("{byte:02x}")).collect();
     format!("duduclaw-employees-{hex}.slice")
@@ -264,6 +271,39 @@ pub mod linux {
             runs.dedup();
             if runs.len() > 1024 { return Err(invalid()); }
             Ok(runs)
+        }
+        /// R6 update census, independent of any spawnd process's memory: how
+        /// many run units PID 1 currently has loaded in a live state
+        /// ([`run_unit_live`]). Every unit that has a process, a job or a
+        /// pending stop is loaded, so a run of an earlier spawnd process whose
+        /// asynchronous teardown is still in progress is counted.
+        pub fn live_run_units(&self) -> io::Result<u32> {
+            type ListedUnit = (String, String, String, String, String, String,
+                OwnedObjectPath, u32, String, OwnedObjectPath);
+            let units: Vec<ListedUnit> = self.manager()?.call("ListUnits", &()).map_err(bus_error)?;
+            let live = units.iter().filter(|unit| run_unit_live(&unit.0, &unit.3)).count();
+            u32::try_from(live).map_err(|_| invalid())
+        }
+        /// `duduclaw-spawnd.service` as PID 1 sees it now: `(MainPID,
+        /// InvocationID)` (lowercase hex, 32 digits) while it is `active` with a
+        /// main process, otherwise `None`. Read-only properties; used by the
+        /// consistency waiter instead of `/proc/<pid>` (no capability needed,
+        /// unaffected by `hidepid=` and spawnd being non-dumpable).
+        pub fn spawnd_identity(&self) -> io::Result<Option<(u32, String)>> {
+            let name = "duduclaw-spawnd.service";
+            let path: OwnedObjectPath = match self.manager()?.call("GetUnit", &(name,)) {
+                Ok(path) => path,
+                Err(error) if missing_unit(&error) => return Ok(None),
+                Err(error) => return Err(bus_error(error)),
+            };
+            let unit = Proxy::new(&self.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Unit").map_err(bus_error)?;
+            let state: String = unit.get_property("ActiveState").map_err(bus_error)?;
+            if state != "active" { return Ok(None); }
+            let invocation: Vec<u8> = unit.get_property("InvocationID").map_err(bus_error)?;
+            let service = Proxy::new(&self.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Service").map_err(bus_error)?;
+            let pid: u32 = service.get_property("MainPID").map_err(bus_error)?;
+            if pid == 0 || invocation.len() != 16 || invocation.iter().all(|byte| *byte == 0) { return Ok(None); }
+            Ok(Some((pid, invocation.iter().map(|byte| format!("{byte:02x}")).collect())))
         }
         /// Recover a receipt after a failed launch or daemon restart. Missing
         /// cgroups are only cleanup proof after an inactive readback.
@@ -808,6 +848,18 @@ mod tests {
             "duduclaw-run-00000000000000000000000000000000.scope",
             "duduclaw-run-00000000000000000000000000000000.service\n"] {
             assert_eq!(parse_run_unit(name), None, "{name:?}");
+        }
+    }
+    #[test]
+    fn update_census_counts_only_live_run_units() {
+        let run = run_unit(RunId([0xab; 16]));
+        for state in ["active", "activating", "deactivating", "reloading", "maintenance", ""] {
+            assert!(run_unit_live(&run, state), "{state:?}");
+        }
+        for state in ["inactive", "failed"] { assert!(!run_unit_live(&run, state), "{state:?}"); }
+        for name in ["duduclaw-spawnd.service", "duduclaw-run-.service", "duduclaw-employees-ab.slice",
+            "duduclaw-run-ABABABABABABABABABABABABABABABAB.service"] {
+            assert!(!run_unit_live(name, "active"), "{name}");
         }
     }
     #[test]

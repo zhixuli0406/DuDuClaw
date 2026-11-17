@@ -16,6 +16,18 @@ const UNITS: [(&str, InstallTarget); 3] = [
     ("duduclaw-spawnd.service", InstallTarget::Spawnd),
     ("duduclaw-gateway.service", InstallTarget::Gateway),
 ];
+const SPAWND_UNIT: &str = "duduclaw-spawnd.service";
+/// `TimeoutStartSec=` of duduclaw-spawnd.service: its start verifies the
+/// installed set (hashing up to two generations) before READY=1. Pinned
+/// against the unit file by spawnd's unit-file test.
+pub const SPAWND_START_TIMEOUT_SECS: u64 = 300;
+/// `TimeoutStopSec=` of duduclaw-spawnd.service (pinned the same way).
+pub const SPAWND_STOP_TIMEOUT_SECS: u64 = 90;
+/// The one deadline of [`LinuxEffects::restart`]: a full stop and start of
+/// spawnd plus a margin for egress and the gateway, which start only after
+/// the consistency gate (itself after spawnd's READY=1) completes.
+pub const RESTART_DEADLINE: Duration = Duration::from_secs(SPAWND_STOP_TIMEOUT_SECS + SPAWND_START_TIMEOUT_SECS + 60);
+const RESTART_POLL: Duration = Duration::from_millis(500);
 
 /// F's concrete client. B1's endpoint accepts only root SO_PEERCRED and persists
 /// admission closure keyed by generation before Drain replies. G is called by
@@ -204,6 +216,8 @@ fn verify_generation(install: &Directory, manifest: &ReleaseManifest, digest: Sh
 
 /// Small fixed-argv systemd adapter. Commands and children have a bounded lifetime,
 /// no inherited environment, no shell, no stdin and bounded diagnostic output.
+/// Every call returns quickly: unit restarts are queued with `--no-block` and
+/// waited for by [`restart_units`], so the 60 s bound never cuts a job short.
 fn systemctl(args: &[&str], capture: bool) -> Result<Vec<u8>> {
     Directory::open(Path::new("/usr/bin"))?.read("systemctl")?;
     let mut child = Command::new("/usr/bin/systemctl").env_clear().env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
@@ -262,6 +276,65 @@ fn live_processes(manifest: &ReleaseManifest) -> Result<Vec<u32>> {
     Ok(pids)
 }
 
+/// What [`restart_units`] needs from PID 1 (production: [`Systemctl`]).
+trait UnitControl {
+    /// `systemctl show --property=InvocationID --value` (empty: never started).
+    fn invocation(&mut self, unit: &str) -> Result<Vec<u8>>;
+    /// `systemctl reset-failed`: flushes the unit's start-rate counter.
+    fn reset_failed(&mut self, unit: &str) -> Result<()>;
+    /// `systemctl --no-block restart`: the job is queued, not waited for.
+    fn restart_queued(&mut self, unit: &str) -> Result<()>;
+    /// `systemctl is-active --quiet`.
+    fn active(&mut self, unit: &str) -> bool;
+}
+struct Systemctl;
+impl UnitControl for Systemctl {
+    fn invocation(&mut self, unit: &str) -> Result<Vec<u8>> {
+        systemctl(&["show", "--property=InvocationID", "--value", unit], true)
+    }
+    fn reset_failed(&mut self, unit: &str) -> Result<()> { systemctl(&["reset-failed", unit], false).map(drop) }
+    fn restart_queued(&mut self, unit: &str) -> Result<()> { systemctl(&["--no-block", "restart", unit], false).map(drop) }
+    fn active(&mut self, unit: &str) -> bool { systemctl(&["is-active", "--quiet", unit], false).is_ok() }
+}
+/// Restart the three units against one deadline that exceeds spawnd's whole
+/// stop and start budget ([`RESTART_DEADLINE`]): the jobs are queued with
+/// `--no-block` (PID 1 owns them; no client is killed half way), then every
+/// unit must be `active` under a new invocation id (a start that began after
+/// this restart was requested). spawnd's start-rate counter is flushed first:
+/// this restart follows every `Apply`, including every repairing one, and must
+/// not consume the crash-loop budget (`StartLimitBurst=`) that automatic
+/// restarts are counted against.
+///
+/// spawnd is queued first: its restart also restarts the consistency gate
+/// (`PartOf=`/`BindsTo=`) and with it egress and the gateway, so their queued
+/// restarts merge behind the new gate instead of starting against the old one.
+///
+/// On timeout `Err(Maintenance)`. Nothing is resumed: spawnd's drain record
+/// still closes admission for the generation, its publication journal says
+/// `published`, `current` already names the generation and the updater's
+/// pending activation stays `Prepared`. The next activation attempt (or the
+/// updater's start-up reconciliation) repeats the idempotent sequence, whose
+/// own restart replaces any job PID 1 still holds; a spawnd that came back
+/// inconsistent meanwhile is repaired by that attempt's `Apply`.
+fn restart_units(control: &mut impl UnitControl, deadline: Duration, poll: Duration) -> Result<()> {
+    let started = Instant::now();
+    let mut before = Vec::with_capacity(UNITS.len());
+    for (unit, _) in &UNITS { before.push(control.invocation(unit)?); }
+    control.reset_failed(SPAWND_UNIT)?;
+    control.restart_queued(SPAWND_UNIT)?;
+    for (unit, _) in UNITS.iter().filter(|(unit, _)| *unit != SPAWND_UNIT) { control.restart_queued(unit)?; }
+    loop {
+        let mut restarted = true;
+        for ((unit, _), old) in UNITS.iter().zip(&before) {
+            let fresh = control.invocation(unit).is_ok_and(|now| now.iter().any(u8::is_ascii_hexdigit) && now != *old);
+            if !fresh || !control.active(unit) { restarted = false; break; }
+        }
+        if restarted { return Ok(()); }
+        if started.elapsed() >= deadline { return Err(Error::Maintenance); }
+        std::thread::sleep(poll);
+    }
+}
+
 pub struct LinuxGenerationActivator<R = SocketRuntime> { committed: Sha256Digest, runtime: R }
 impl LinuxGenerationActivator<SocketRuntime> {
     pub fn new(committed: Sha256Digest) -> Self { Self { committed, runtime: SocketRuntime } }
@@ -293,7 +366,7 @@ impl GenerationEffects for LinuxEffects {
     fn publish(&mut self, digest: Sha256Digest) -> Result<()> { publish_current(&self.install, self.committed, digest) }
     fn restart(&mut self) -> Result<()> {
         verify_unit_identities()?;
-        for (unit, _) in &UNITS { systemctl(&["restart", unit], false)?; } Ok(())
+        restart_units(&mut Systemctl, RESTART_DEADLINE, RESTART_POLL)
     }
     fn processes(&mut self, manifest: &ReleaseManifest) -> Result<Vec<u32>> {
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -341,6 +414,61 @@ mod tests {
             format!("../{valid}"), format!("generations/{}", "ab".repeat(31))] {
             assert!(parse_current(invalid.as_bytes()).is_err());
         }
+    }
+    /// Scripted PID 1: after the restarts are queued, every unit reports a new
+    /// invocation and `active` once `settles_after` invocation reads happened
+    /// (`None`: never, as with a spawnd stuck verifying or failing).
+    #[derive(Default)]
+    struct FakeUnits { calls: Vec<String>, restarted: bool, polls: usize, settles_after: Option<usize>, always_active: bool }
+    impl FakeUnits {
+        fn settled(&self) -> bool { self.restarted && self.settles_after.is_some_and(|after| self.polls >= after) }
+    }
+    impl UnitControl for FakeUnits {
+        fn invocation(&mut self, unit: &str) -> Result<Vec<u8>> {
+            self.calls.push(format!("invocation {unit}"));
+            if self.restarted { self.polls += 1; }
+            let digit = if self.settled() { "b" } else { "a" };
+            Ok(format!("{}\n", digit.repeat(32)).into_bytes())
+        }
+        fn reset_failed(&mut self, unit: &str) -> Result<()> { self.calls.push(format!("reset-failed {unit}")); Ok(()) }
+        fn restart_queued(&mut self, unit: &str) -> Result<()> {
+            self.calls.push(format!("--no-block restart {unit}"));
+            self.restarted = true;
+            Ok(())
+        }
+        fn active(&mut self, _: &str) -> bool { self.always_active || self.settled() }
+    }
+    fn queued(units: &FakeUnits) -> Vec<&str> {
+        units.calls.iter().map(String::as_str).filter(|call| !call.starts_with("invocation ")).collect()
+    }
+    #[test]
+    fn restart_queues_jobs_and_waits_for_new_invocations() {
+        let mut units = FakeUnits { settles_after: Some(7), ..FakeUnits::default() };
+        restart_units(&mut units, Duration::from_secs(5), Duration::from_millis(1)).unwrap();
+        // The invocations before, then the start-rate flush of spawnd, then
+        // non-blocking restarts only: PID 1 owns the jobs, no client is killed.
+        assert_eq!(units.calls.iter().take(3).map(String::as_str).collect::<Vec<_>>(),
+            ["invocation duduclaw-egress.service", "invocation duduclaw-spawnd.service", "invocation duduclaw-gateway.service"]);
+        assert_eq!(queued(&units), ["reset-failed duduclaw-spawnd.service", "--no-block restart duduclaw-spawnd.service",
+            "--no-block restart duduclaw-egress.service", "--no-block restart duduclaw-gateway.service"]);
+    }
+    #[test]
+    fn restart_timeout_is_one_shared_deadline_and_recoverable() {
+        // Active under the old invocation (the restart job has not run yet) is
+        // not a restart; never settling ends at the deadline, not before.
+        for always_active in [false, true] {
+            let mut units = FakeUnits { always_active, ..FakeUnits::default() };
+            let started = Instant::now();
+            let error = restart_units(&mut units, Duration::from_millis(60), Duration::from_millis(5)).unwrap_err();
+            assert!(matches!(error, Error::Maintenance));
+            assert!(started.elapsed() >= Duration::from_millis(60) && started.elapsed() < Duration::from_secs(5));
+            // The jobs were queued once and left to PID 1; the next attempt
+            // repeats the idempotent sequence (nothing is resumed here).
+            assert_eq!(queued(&units).len(), 4);
+        }
+        // The production deadline outlasts spawnd's whole stop and start budget.
+        assert!(RESTART_DEADLINE > Duration::from_secs(SPAWND_STOP_TIMEOUT_SECS + SPAWND_START_TIMEOUT_SECS));
+        assert_eq!((SPAWND_START_TIMEOUT_SECS, SPAWND_STOP_TIMEOUT_SECS), (300, 90));
     }
     #[test]
     #[ignore = "Requires root Linux openat2; isolated /run tree, no production selector is touched"]
