@@ -1076,10 +1076,12 @@ mod tests {
         file.sync_all().unwrap(); directory.sync().unwrap();
         systemctl(&["daemon-reload"], false).unwrap(); systemctl(&["start", &target], false).unwrap();
         let pid = main_pid(&target).unwrap();
+        // The probes mirror duduclaw-updated.service: root by default (no
+        // User=/Group=) and no RestrictSUIDSGID= (R7g).
         for (unit, capabilities) in [(&denied, "CAP_SETUID CAP_SETGID CAP_CHOWN"),
             (&denied_dac, "CAP_SETUID CAP_SETGID CAP_CHOWN CAP_SYS_PTRACE"),
             (&allowed, "CAP_SETUID CAP_SETGID CAP_CHOWN CAP_SYS_PTRACE CAP_DAC_OVERRIDE")] {
-            let content = format!("[Service]\nType=oneshot\nRemainAfterExit=yes\nUser=root\nGroup=root\nNoNewPrivileges=yes\nProtectSystem=strict\nProtectHome=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectKernelLogs=yes\nProtectControlGroups=yes\nRestrictSUIDSGID=yes\nLockPersonality=yes\nCapabilityBoundingSet={capabilities}\nExecStart=/usr/bin/python3 -c \"import os,socket,struct; f=os.open('/proc/{pid}/exe',os.O_RDONLY); assert os.read(f,4)==bytes([127,69,76,70]); s=socket.socket(socket.AF_UNIX,socket.SOCK_SEQPACKET); s.connect('/run/{prefix}/readback.sock'); assert struct.unpack('3i',s.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))[1:]==(65534,65534)\"\n");
+            let content = format!("[Service]\nType=oneshot\nRemainAfterExit=yes\nNoNewPrivileges=yes\nProtectSystem=strict\nProtectHome=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectKernelLogs=yes\nProtectControlGroups=yes\nLockPersonality=yes\nCapabilityBoundingSet={capabilities}\nExecStart=/usr/bin/python3 -c \"import os,socket,struct; f=os.open('/proc/{pid}/exe',os.O_RDONLY); assert os.read(f,4)==bytes([127,69,76,70]); s=socket.socket(socket.AF_UNIX,socket.SOCK_SEQPACKET); s.connect('/run/{prefix}/readback.sock'); assert struct.unpack('3i',s.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))[1:]==(65534,65534)\"\n");
             let mut file = directory.create(unit).unwrap(); cleanup.units.push(unit.clone());
             file.write_all(content.as_bytes()).unwrap(); file.sync_all().unwrap();
         }

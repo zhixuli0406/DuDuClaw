@@ -55,7 +55,11 @@ ProtectClock=yes
 ProtectHostname=yes
 RestrictNamespaces=yes
 RestrictRealtime=yes
-RestrictSUIDSGID=yes
+# No RestrictSUIDSGID= (R7g): under it systemd's seccomp filter answers ENOSYS
+# for every openat2, and the waiter reads the status file through the
+# trusted-file reader, which needs openat2's RESOLVE_* guarantees. Still holds:
+# a root service with no capabilities that creates no set-ID files;
+# NoNewPrivileges=yes stays.
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native

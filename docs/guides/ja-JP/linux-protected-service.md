@@ -249,12 +249,11 @@ PrivateDevices=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
-RestrictSUIDSGID=yes
 LockPersonality=yes
 SystemCallArchitectures=native
 ```
 
-[systemd.exec](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html) の仕様に従い、各 `-` 接頭辞は存在しないパスを無視します。一般的なエンジンの接続先を隠し、ハードウェアを隔離し、カーネル／モジュール／cgroup の変更と set-ID ファイルの作成を禁止して、実行モードと syscall アーキテクチャを制限します。`RestrictNamespaces` は設定しません。gateway の Codex／bwrap タスクサンドボックスは user、mount、PID、network namespace を必要とします。
+[systemd.exec](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html) の仕様に従い、各 `-` 接頭辞は存在しないパスを無視します。一般的なエンジンの接続先を隠し、ハードウェアを隔離し、カーネル／モジュール／cgroup の変更を禁止して、実行モードと syscall アーキテクチャを制限します。`RestrictSUIDSGID` は意図的に設定しません。systemd 255 ではすべての `openat2` 呼び出しが失敗し、gateway は `openat2` のパス解決制限でファイルを開くためです。ランチャーは set-ID ファイルを作成せず、gateway は `no_new_privs` で動作します。`RestrictNamespaces` は設定しません。gateway の Codex／bwrap タスクサンドボックスは user、mount、PID、network namespace を必要とします。
 
 起動時と 60 秒ごとに、一般的なエンジンソケットへの到達性と補助グループを検査します。既定の `revoke` ポリシーで定期検査に失敗すると、保持中の鍵をその場でゼロ化し、保護状態を拒否に変更して警告を記録します。個人接続は、新たな起動時の鍵受け取り検査に成功するまで停止します。失効後も監視を続けます。自動復旧は次の節を参照してください。`/proc/net/unix` の待ち受け中の abstract socket も検査します。`/` で区切られた名前の要素が `docker`、`containerd`、`podman`、`buildkit`、`lxd` と完全一致するか、その名前の直後に `.`、`-`、`_` が続く場合に候補とします。任意の部分文字列では一致させません。 名前の一致だけでは拒否しません。短いタイムアウトの非ブロッキング接続で `SO_PEERCRED` を取得し、接続できた相手の uid が 0 の場合だけリスクと判断します。到達不能な候補は無視します。表は生のバイト列として読み取り、非 UTF-8 名が他のソケットの検査を妨げないようにします。すべての行を完全に解析し、不正なフィールドや flags、曖昧な名前、改行による断片があれば鍵の受け取りを拒否し、保持中の鍵も失効させます。表の読み取り失敗はどの状態でも検査失敗とし、復旧時の連続成功回数もリセットします。安全と判断する前に、必須の `NETLINK_SOCK_DIAG` dump で長さ付きの `UNIX_DIAG_NAME` を調べます。非エンジン名も含めて改行を拒否するため、改行の後が正しい形式の偽造行でも見逃しません。dump が取得不能、不正、中断、8 MiB 超過、250 ms のタイムアウトの場合も拒否し、カーネルには UNIX socket diagnostics の対応が必要です。どちらの検査も定期的な観測であり、全ソケットの原子的なスナップショットではありません。
 

@@ -34,6 +34,26 @@ It writes `/run/duduclaw-spawnd/readiness.json` atomically as root:gateway-group
 A running service alone is not a successful readiness check. BindsTo on each run
 unit provides PID 1 shutdown cleanup, followed by startup residue reconciliation.
 
+Run units (transient, `duduclaw-run-<run>.service`) deliberately set neither
+`User=`/`Group=` nor `RestrictSUIDSGID=` (R7g): on systemd 255 an explicit
+`User=root` loses `CAP_SETUID`, and `RestrictSUIDSGID=` makes `openat2` ENOSYS
+for the trampoline. spawnd reads both back as unset and checks the started
+process is root with exactly the trampoline capability set before it sends the
+bootstrap; see `crates/duduclaw-spawnd/src/systemd.rs` (`UnitPolicy::new`) and
+`docs/architecture/native-linux-isolation.md`. No static unit file mirrors the
+run-unit policy, but the same `openat2` conflict applies to the static units:
+`duduclaw-spawnd.service` and `duduclaw-isolation-ready.service` do not set
+`RestrictSUIDSGID=` either, because spawnd (work broker, storage, cgroup
+leaves, bootstrap mounts, trusted-file reader) and its `wait-consistent` waiter
+(status file through the trusted-file reader) open paths with `openat2` and
+RESOLVE_*. Both stay root services that create no set-ID files, with
+`NoNewPrivileges=yes`. They keep `User=root`/`Group=root`: neither needs
+`CAP_SETUID` (spawnd's bounding set excludes it; the waiter has none).
+`duduclaw-updated.service` (scripts/linux-protected/updated) and
+`duduclaw-auto-upgrade.service` follow the same rule and also drop the explicit
+`User=root`, since the updater binary needs `CAP_SETUID` to drop its download
+child to `duduclaw-dl`.
+
 The daemon also binds the root-only update control socket
 `/run/duduclaw-spawnd/update.sock` (root 0600) for `duduclaw-updated`. Its
 `Apply` republishes the verified generation's root components, so the unit adds
@@ -116,7 +136,13 @@ isolated-install gateway unit (written by the installer package, R3) must carry
 `duduclaw-tcb.slice` with exactly the trampoline's `CapabilityBoundingSet=` and
 `RestrictNamespaces=` (pinned against `TRAMPOLINE_CAPABILITIES` /
 `TRAMPOLINE_NAMESPACES` by spawnd's unit-file test), `TimeoutStartSec=30` and
-stdout/stderr to the journal. Only spawnd starts it (by name, through PID 1),
+stdout/stderr to the journal. Root is the default identity: like run units it
+sets neither `User=`/`Group=` nor `RestrictSUIDSGID=` (R7g; an explicit
+`User=root` loses `CAP_SETUID`, `RestrictSUIDSGID=` makes `openat2` ENOSYS), and
+spawnd reads back `User=""`, `Group=""`, `RestrictSUIDSGID=no` before starting
+it. Every other sandbox directive it shares with run units has
+`UnitPolicy::new`'s value; the deliberate differences are listed in the unit
+file. Only spawnd starts it (by name, through PID 1),
 after its start-up recovery, and only while PID 1 loads it from
 `/etc/systemd/system/` without drop-ins. Its name is not of the run-unit shape,
 so no run inventory counts it. The installer must install it there and create

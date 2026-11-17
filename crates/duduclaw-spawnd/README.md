@@ -22,6 +22,30 @@ employee execution closed. This wiring is not production acceptance.
 See [Package B1](../../docs/architecture/native-linux-isolation.md#package-b1)
 for adapter contracts and remaining cross-package acceptance.
 
+### Run-unit identity and set-id policy (R7g)
+
+`UnitPolicy::new` sets neither `User=`/`Group=` nor `RestrictSUIDSGID=` on the
+transient run unit. Measured on systemd 255: an explicit `User=root` with
+`NoNewPrivileges=` and any seccomp restriction removes `CAP_SETUID` from the
+trampoline's permitted/effective sets, and `RestrictSUIDSGID=` makes every
+`openat2` ENOSYS. `Systemd::start` therefore reads back `User`/`Group` as empty
+and `RestrictSUIDSGID` as false (`RUN_UNIT_DEFAULTED`), then, before the
+bootstrap offer, requires `/proc/<MainPID>/status` to show uid/gid 0 and
+`CapPrm` = `CapEff` = `CapBnd` = `TRAMPOLINE_CAPABILITIES`, no ambient
+capability and no_new_privs, for a process in the unit's own cgroup. Any
+mismatch stops the unit. Set-id files stay inert (nosuid writable mounts,
+no_new_privs, no employee capability) and the trampoline's common seccomp
+filter refuses set-id modes in the chmod/mknod families. Root test:
+`iso_root_run_unit_policy_keeps_setuid_and_openat2`.
+
+The static `duduclaw-spawnd.service` and `duduclaw-isolation-ready.service`
+(`scripts/linux-protected/spawnd`) do not set `RestrictSUIDSGID=` for the same
+`openat2` reason: spawnd's work broker, storage adapter, cgroup leaves,
+bootstrap mounts and the trusted-file reader (`duduclaw_updated::linux::files`,
+also used by `wait-consistent`) all open with `openat2` and RESOLVE_*. They keep
+`User=root` (neither needs `CAP_SETUID`) and `NoNewPrivileges=yes`; pinned by
+`update_units_reaching_openat2_set_no_restrict_suid_sgid`.
+
 ### Native CLI home on older kernels
 
 Codex/Grok homes first try composing the persistent private clone beneath the
@@ -542,7 +566,11 @@ mode, by descriptor; the check moved here from the receipt reader).
 unit `duduclaw-isolation-selftest.service`, which spawnd starts through PID 1
 (`Systemd::run_fixed_unit`: only that name; PID 1 must load it from
 `/etc/systemd/system/duduclaw-isolation-selftest.service` with no drop-in, no
-pending daemon-reload, not transient and not already running; pass only on
+pending daemon-reload, not transient and not already running; PID 1 must
+report the run units' `NoNewPrivileges`, `TRAMPOLINE_CAPABILITIES`, no ambient
+capability and `TRAMPOLINE_NAMESPACES`, and `User`/`Group` empty and
+`RestrictSUIDSGID` false (`RUN_UNIT_DEFAULTED`), every mismatch named as
+`invalid unit policy: fixed unit readback <Key>: …`; pass only on
 `Result=success`, `ExecMainCode=CLD_EXITED`, `ExecMainStatus=0` of a new
 `InvocationID`; the journal is never parsed). The ABI pair is the live probe.
 The outcome is cached under (boot id, committed generation, detected/selected

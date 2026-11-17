@@ -10,14 +10,37 @@ Description=DuDuClaw isolation self-test (namespaces, Landlock, seccomp)
 # journal and a per-stage exit code (crates/duduclaw-run/src/bin/selftest.rs).
 
 [Service]
+# Sandboxing equals the transient run units' (duduclaw-spawnd systemd.rs
+# UnitPolicy::new; pinned directive by directive by spawnd's unit-file test)
+# except, deliberately:
+# - Type=oneshot, RemainAfterExit=no: spawnd waits for this one invocation and
+#   reads its result (run units: Type=exec, supervised while they live).
+# - Slice=duduclaw-tcb.slice: a TCB service, not an employee's slice.
+# - StandardOutput/StandardError=journal: the stage line is the only failure
+#   report (run units: null, overridden by the fds spawnd passes).
+# - PrivateNetwork=yes, RestrictAddressFamilies=AF_UNIX AF_NETLINK: no host
+#   network; netlink only for its own loopback (narrower than run units).
+# - TasksMax, MemoryMax, LimitNOFILE: its own small fixed ceilings, and
+#   TimeoutStartSec=30 bounds the whole run (run units: per-run limits and
+#   timeouts, CPU and IO ceilings).
+# - OOMPolicy=stop: any OOM kill ends the invocation as a failure (run units
+#   continue so one helper's OOM kill does not stop the run).
+# - No Delegate= (it creates no cgroup), no DeviceAllow= (it builds its root
+#   without a pty; DevicePolicy=closed still applies), no BindsTo=/After=
+#   duduclaw-spawnd.service (nothing pulls it in; spawnd starts and waits).
 Type=oneshot
 RemainAfterExit=no
 ExecStart=/usr/lib/duduclaw/duduclaw-run-selftest
-User=root
-Group=root
+# No User=/Group= and no RestrictSUIDSGID= (R7g, measured on systemd 255): an
+# explicit User=root/Group=root with NoNewPrivileges= and a seccomp-based
+# restriction drops CAP_SETUID from the effective set (stage `capabilities`
+# fails), and RestrictSUIDSGID=yes makes systemd's seccomp filter return
+# ENOSYS for openat2 (stage `probe` fails). Root is the default identity;
+# spawnd reads back User="", Group="" and RestrictSUIDSGID=no before starting.
 Slice=duduclaw-tcb.slice
 TimeoutStartSec=30
 KillMode=control-group
+OOMPolicy=stop
 # Exactly the trampoline's bounding set and namespace allowance
 # (duduclaw-spawnd systemd.rs TRAMPOLINE_CAPABILITIES / TRAMPOLINE_NAMESPACES;
 # pinned by spawnd's unit-file test).
@@ -26,9 +49,11 @@ AmbientCapabilities=
 RestrictNamespaces=mnt ipc uts net pid
 NoNewPrivileges=yes
 ProtectSystem=strict
-ProtectHome=yes
+ProtectHome=tmpfs
 PrivateTmp=yes
 PrivateDevices=yes
+PrivateIPC=yes
+DevicePolicy=closed
 # The test unshares its own network namespace and brings up only its loopback;
 # this outer one only guarantees no host network either way.
 PrivateNetwork=yes
@@ -38,13 +63,14 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
 ProtectControlGroups=yes
-RestrictSUIDSGID=yes
 LockPersonality=yes
 SystemCallArchitectures=native
 UMask=0077
 LimitCORE=0
+LimitNOFILE=1024
 TasksMax=16
 MemoryMax=128M
+MemorySwapMax=0
 Environment=
 StandardInput=null
 StandardOutput=journal
