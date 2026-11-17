@@ -25,6 +25,12 @@ pub fn projected_tool_timeout_ms(runtime: &RuntimeKind) -> Option<u64> {
     }
 }
 
+/// Fixed MCP suffix of every Claude runtime record. In a policy v3 ranged
+/// record spawnd inserts `--max-turns <effective>` immediately before it.
+pub fn claude_mcp_arguments() -> Vec<String> {
+    ["--strict-mcp-config", "--mcp-config", "/config/mcp.json"].into_iter().map(str::to_owned).collect()
+}
+
 pub fn api_worker_arguments() -> Vec<String> {
     ["--duduclaw-protocol", "openai-compat-v1", "--mcp-config", "/config/mcp.json"]
         .into_iter().map(str::to_owned).collect()
@@ -231,8 +237,7 @@ pub fn runtime_projection(registration: RuntimeRegistration) -> Result<RuntimePr
             destination: ConfigDestination::RunConfig, relative_target: "mcp.json",
             contents: serde_json::json!({"mcpServers": {"duduclaw": {"command": server["command"],
                 "args": server["args"], "timeout": tool_timeout_ms}}}).to_string(),
-        }], vec!["--strict-mcp-config".into(), "--mcp-config".into(),
-            "/config/mcp.json".into()]),
+        }], claude_mcp_arguments()),
         // Codex default is 60 s (`tool_timeout_sec`).
         RuntimeKind::Codex => (vec![ProjectionFile {
             destination: ConfigDestination::RuntimeHome, relative_target: ".codex/config.toml",

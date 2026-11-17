@@ -80,6 +80,13 @@ def bind_artifacts(document, directory):
 
 
 POLICY_DOMAIN_V2 = "duduclaw-isolation-policy-v2"
+POLICY_DOMAIN_V3 = "duduclaw-isolation-policy-v3"
+# Policy v3 step range (spawnd `policy::TurnLimit`): 1 <= min <= default <= max <= 1000.
+TURN_LIMIT_KEYS = {"min", "max", "default"}
+TURN_LIMIT_CEILING = 1000
+# Working default for a v3 template: PENDING OWNER DECISION Q12 (min 1, default 50, max 200).
+TURN_LIMIT_WORKING_DEFAULT = {"min": 1, "default": 50, "max": 200}
+CLAUDE_MCP_SUFFIX = ["--strict-mcp-config", "--mcp-config", "/config/mcp.json"]
 HELPER_BINDING_KEYS = {"profile", "slot", "seccomp", "seccomp_digest", "self_only", "memory_bytes", "tasks",
                        "cpu_quota_percent", "open_files", "file_size_bytes", "timeout_ms", "filesystem", "egress"}
 HELPER_FS = {"work", "work_recordings", "system_ro"}
@@ -90,13 +97,38 @@ def _integer(value, low, high):
     return isinstance(value, int) and not isinstance(value, bool) and low <= value <= high
 
 
+def validate_turn_limit(runtime, version):
+    """Policy v3 `turn_limit` of one runtime record (spawnd re-checks all of it).
+
+    Absent: the record keeps its signed arguments (v1/v2 Claude: fixed 50).
+    Present (v3 only): a Claude MCP record whose arguments carry no
+    `--max-turns` and end with the fixed MCP suffix; any invalid value makes
+    the whole policy invalid.
+    """
+    if not isinstance(runtime, dict) or "turn_limit" not in runtime:
+        return
+    limit = runtime["turn_limit"]
+    if version < 3:
+        raise ValueError("turn_limit requires policy v3")
+    if not isinstance(limit, dict) or set(limit) != TURN_LIMIT_KEYS \
+            or not all(_integer(limit[key], 1, TURN_LIMIT_CEILING) for key in TURN_LIMIT_KEYS) \
+            or not limit["min"] <= limit["default"] <= limit["max"]:
+        raise ValueError("turn_limit must satisfy 1 <= min <= default <= max <= 1000")
+    arguments = runtime.get("fixed_args")
+    if runtime.get("runtime") != {"kind": "claude"} or runtime.get("mcp") is not True \
+            or not isinstance(arguments, list) or arguments[-len(CLAUDE_MCP_SUFFIX):] != CLAUDE_MCP_SUFFIX \
+            or any(not isinstance(arg, str) or arg == "--max-turns" or arg.startswith("--max-turns=")
+                   for arg in arguments):
+        raise ValueError("turn_limit requires a Claude MCP record without a fixed --max-turns")
+
+
 def validate_policy_document(document):
     """Offline shape check of the signed isolation policy artifact.
 
     spawnd re-runs every publication check (HX D8 revision section 2.3) on the
     bytes; this only stops a malformed template before it is bound by the
-    release manifest. v2 carries its domain and version in the signed bytes;
-    v1 has neither a domain nor a launcher.
+    release manifest. v2 and v3 carry their domain and version in the signed
+    bytes; v1 has neither a domain nor a launcher; only v3 has step ranges.
     """
     if not isinstance(document, dict):
         raise ValueError("policy must be an object")
@@ -107,18 +139,23 @@ def validate_policy_document(document):
     elif version == 2:
         if set(document) != {"domain", "version", "runtimes", "native"} or document["domain"] != POLICY_DOMAIN_V2:
             raise ValueError("v2 policy requires its signed domain")
+    elif version == 3:
+        if set(document) != {"domain", "version", "runtimes", "native"} or document["domain"] != POLICY_DOMAIN_V3:
+            raise ValueError("v3 policy requires its signed domain")
     else:
         raise ValueError("unsupported policy version")
     native = document.get("native")
     if not isinstance(native, list) or not isinstance(document.get("runtimes"), list) \
             or len(native) != len(document["runtimes"]):
         raise ValueError("one native record per runtime")
+    for runtime in document["runtimes"]:
+        validate_turn_limit(runtime, version)
     for record in native:
         launcher = record.get("launcher") if isinstance(record, dict) else None
         if launcher is None:
             continue
-        if version != 2:
-            raise ValueError("launcher requires policy v2")
+        if version < 2:
+            raise ValueError("launcher requires policy v2 or later")
         if not isinstance(launcher, dict) or set(launcher) != {"reserve", "helpers", "helper_tmpfs_bytes"}:
             raise ValueError("invalid launcher record")
         if not _integer(launcher["helper_tmpfs_bytes"], 1, record.get("tmpfs_bytes", 0)):

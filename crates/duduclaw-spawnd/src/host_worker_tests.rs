@@ -136,7 +136,8 @@ fn policy() -> LaunchPolicy {
 }
 fn request() -> SpawnRequest {
     SpawnRequest::StartRun { run: run(1), employee_id: employee(), runtime_request: RuntimeKind::Codex,
-        task_ref: None, workspace: None, prompt_bytes: 1, input_fds: List::new(vec![]).unwrap(), pty: false }
+        task_ref: None, workspace: None, prompt_bytes: 1, input_fds: List::new(vec![]).unwrap(), pty: false,
+        requested_max_turns: None }
 }
 fn proof() -> CleanupReadback {
     CleanupReadback { unit_inactive: true, cgroup_empty: true, employee_uid_absent: true }

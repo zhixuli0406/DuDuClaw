@@ -175,6 +175,7 @@ pub(crate) fn plan(context: &RequestContext, name: &str, run: RunHandle) -> Spaw
         capabilities: CapabilityHandover { mcp_bridge: false, egress_forwarder: false },
         timeouts: RunTimeouts { queue_ms: 1000, startup_ms: 1000, runtime_ms: 1000, pty_idle_ms: None, termination_grace_ms: 100 },
         inputs: RunInputs { prompt: RunInput { reader: Box::new(EmptyInput), max_bytes: 1024 }, attachments: vec![] },
+        requested_max_turns: None,
     }
 }
 

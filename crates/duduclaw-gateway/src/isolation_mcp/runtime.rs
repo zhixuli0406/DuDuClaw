@@ -96,8 +96,28 @@ fn take_authorization(agent_dir: &std::path::Path) -> Result<RuntimeAuthorizatio
     Ok(authorization)
 }
 
-pub(crate) async fn spawn_claude(agent_dir: &std::path::Path, prompt: &str, system_prompt: &str, model: &str)
+/// R6: the step limit root will enforce for this employee's next Claude run.
+/// `desired` is the caller's own wish (work turn: the gateway resolution;
+/// utility call: at most 50); the result can only be lower. It consumes no
+/// authorization. The caller shows exactly this value in the step-budget
+/// sentence, uses it to classify a max-turns outcome, and passes it to
+/// [`spawn_claude`], which refuses the run if root would enforce anything else.
+pub(crate) async fn claude_max_turns(agent_dir: &std::path::Path, desired: u64) -> Result<u16, String> {
+    let agent = agent_dir.file_name().and_then(|name| name.to_str()).ok_or_else(refusal)?;
+    let home = agent_dir.parent().and_then(|path| path.parent()).ok_or_else(refusal)?;
+    match super::boot::claude_max_turns(home.to_path_buf(), agent.to_owned(), desired).await {
+        Ok(value) => Ok(value),
+        Err(_) => {
+            // Agent id and numbers only; no path, policy or entitlement content.
+            tracing::warn!(agent, desired, "protected step limit unavailable or outside the root-signed range; run refused");
+            Err(refusal())
+        }
+    }
+}
+
+pub(crate) async fn spawn_claude(agent_dir: &std::path::Path, prompt: &str, system_prompt: &str, model: &str, max_turns: u64)
     -> Result<(crate::process_group::BackendChild, PromptWriter), String> {
+    let max_turns = u16::try_from(max_turns).map_err(|_| refusal())?;
     let (authorization, principal_context) = if AUTHORIZATION.try_with(|_| ()).is_ok() {
         (take_authorization(agent_dir)?, None)
     } else {
@@ -113,7 +133,7 @@ pub(crate) async fn spawn_claude(agent_dir: &std::path::Path, prompt: &str, syst
     };
     let class = crate::process_group::execution_class(ExecutionClass::EmployeeMain);
     let plan = super::boot::claude_plan(authorization.home.clone(), authorization.agent.clone(), class,
-        prompt.as_bytes().to_vec(), system_prompt.as_bytes().to_vec(), model.into()).await.map_err(|_| refusal())?;
+        prompt.as_bytes().to_vec(), system_prompt.as_bytes().to_vec(), model.into(), max_turns).await.map_err(|_| refusal())?;
     spawn_plan(authorization, plan, class, RuntimeKind::Claude, prompt.as_bytes().to_vec(), principal_context).await
 }
 
@@ -426,7 +446,22 @@ mod tests {
     }
     #[tokio::test]
     async fn missing_runtime_authorization_refuses_before_boot_or_spawn() {
-        assert!(spawn_claude(std::path::Path::new("/not-an-agent"), "input", "system", "model").await.is_err());
+        assert!(spawn_claude(std::path::Path::new("/not-an-agent"), "input", "system", "model", 50).await.is_err());
+        // An out-of-wire-range value refuses before any authority is consumed.
+        with_runtime_authorization(authorization("alice"), async {
+            assert!(spawn_claude(Path::new("/trusted-home/agents/alice"), "input", "system", "model",
+                u64::from(u16::MAX) + 1).await.is_err());
+            assert_eq!(take_authorization(Path::new("/trusted-home/agents/alice")).unwrap().agent, "alice");
+        }).await;
+    }
+    #[tokio::test]
+    async fn step_limit_lookup_refuses_without_boot_owner_and_consumes_no_authority() {
+        with_runtime_authorization(authorization("alice"), async {
+            let error = claude_max_turns(Path::new("/trusted-home/agents/alice"), 50).await.unwrap_err();
+            assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error));
+            assert_eq!(take_authorization(Path::new("/trusted-home/agents/alice")).unwrap().agent, "alice");
+        }).await;
+        assert!(claude_max_turns(Path::new("/"), 50).await.is_err());
     }
     #[tokio::test]
     async fn runtime_authorization_is_single_use_and_does_not_cross_tasks() {

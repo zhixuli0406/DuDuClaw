@@ -550,9 +550,20 @@ impl Host for Core {
         self.monitor.check_run(run)?;
         self.ready(employee)?;
         if !self.cleanup_run(employee, None)?.complete() { return Err(unavailable()); }
-        let SpawnRequest::StartRun { runtime_request, pty, prompt_bytes, input_fds, workspace, .. } = request else { return Err(ErrorCode::InvalidRequest); };
+        let SpawnRequest::StartRun { runtime_request, pty, prompt_bytes, input_fds, workspace, requested_max_turns, .. } = request else { return Err(ErrorCode::InvalidRequest); };
         let account = self.account(employee)?;
-        let (runtime, _) = self.policy.as_ref().ok_or_else(unavailable)?.derive(employee, runtime_request, *pty)?;
+        let root_policy = self.policy.as_ref().ok_or_else(unavailable)?;
+        let (runtime, _) = root_policy.derive(employee, runtime_request, *pty)?;
+        // R6: the one `turn_limit` rule, before any journal entry or resource
+        // exists. Out of range or narrowed below the request: this run is
+        // refused, never clamped (the gateway already shows the request).
+        let max_turns = match root_policy.max_turns(employee, runtime, *requested_max_turns) {
+            Ok(value) => value,
+            Err(code) => {
+                emit_detail(&self.audit, Event::Refused, Some(employee), Some(run.0), Some(Detail::Code { code }));
+                return Err(code);
+            }
+        };
         let runtime = runtime.clone();
         self.components.storage.usage(employee)?.check(employee, &runtime.resources.disk)?;
         // WAL before any external attachment, endpoint or transient unit exists.
@@ -605,7 +616,8 @@ impl Host for Core {
         let (supervisor_uid, supervisor_gid) = self.components.publication.supervisor_identity()?;
         let mut nonce = [0; 32]; nonce[..16].copy_from_slice(&os(crate::server::random_id())?); nonce[16..].copy_from_slice(&os(crate::server::random_id())?);
         let mut plan = BootstrapPlan::from_runtime(run, employee, account.uid, account.gid, supervisor_uid, supervisor_gid,
-            nonce, &runtime, *pty, *prompt_bytes, input_fds.as_slice(), if matches!(runtime.network, NetworkPolicy::Egress(_)) { Some(18080) } else { None })?;
+            nonce, &runtime, *pty, *prompt_bytes, input_fds.as_slice(), if matches!(runtime.network, NetworkPolicy::Egress(_)) { Some(18080) } else { None },
+            max_turns)?;
         plan.pty_size = launch_policy.pty_size;
         plan.validate()?;
         let entry = self.runs.get_mut(&run.0).ok_or(ErrorCode::NotFound)?;

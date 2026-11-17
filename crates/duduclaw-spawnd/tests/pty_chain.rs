@@ -163,7 +163,8 @@ fn installed_pty_gateway_child() {
                 workspace:Text::new("employee-work".into()).unwrap(),relative_cwd:Text::new(String::new()).unwrap()},
             resources:runtime.resources.clone(),network:runtime.network.clone(),pty:true,
             capabilities:CapabilityHandover{mcp_bridge:false,egress_forwarder:false},timeouts:runtime.timeouts.clone(),
-            inputs:RunInputs{prompt:RunInput{max_bytes:32,reader:Box::new(duduclaw_execution::io::Reader(std::io::Cursor::new(setup.nonce.as_bytes().to_vec())))},attachments:vec![]}
+            inputs:RunInputs{prompt:RunInput{max_bytes:32,reader:Box::new(duduclaw_execution::io::Reader(std::io::Cursor::new(setup.nonce.as_bytes().to_vec())))},attachments:vec![]},
+            requested_max_turns:None
         }).await.unwrap();
         let mut io=loop{match backend.take_pty(run).await{Ok(io)=>break io,
             Err(BackendError::Unavailable)=>tokio::time::sleep(Duration::from_millis(20)).await,Err(error)=>panic!("PTY delivery: {error}")}};

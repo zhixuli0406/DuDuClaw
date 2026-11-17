@@ -98,13 +98,20 @@ pub(super) async fn spawn_claude_cli_with_env(
         None
     };
 
-    // Protected mode: the root-owned plan always enforces `--max-turns 50`, so
-    // the prompt sentence and the max-turn classification state that value.
-    let max_turns = if protected { 50 } else {
+    // Same request in both modes: the employee's own work turn gets the
+    // resolved budget, anything else at most 50. Protected mode (R6): root
+    // enforces the step limit from its signed policy (v1/v2 fixed 50; v3 a
+    // range this request can only lower), so the prompt sentence and the
+    // max-turn classification use exactly the value root confirms.
+    let desired = {
         let resolved = duduclaw_core::turn_limits::max_turns(home_dir, work_dir);
         if purpose == crate::runtime_dispatch::SpawnPurpose::EmployeeTurn
             && crate::runtime_dispatch::allows_employee_step_budget() { resolved } else { resolved.min(50) }
     };
+    let max_turns = if protected {
+        crate::claude_runner::protected_max_turns(
+            work_dir.ok_or_else(crate::claude_runner::protected_claude_options_refusal)?, desired).await?
+    } else { desired };
     let budget_prompt = duduclaw_core::turn_limits::budget_prompt(system_prompt, max_turns);
     let system_prompt = budget_prompt.as_str();
     let mut cmd = duduclaw_core::platform::async_command_for(&claude_path);
@@ -437,7 +444,7 @@ pub(super) async fn spawn_claude_cli_with_env(
         {
             let (child, writer) = crate::isolation_mcp::runtime::spawn_claude(
                 work_dir.ok_or_else(crate::claude_runner::protected_claude_options_refusal)?,
-                user_message, system_prompt, model).await?;
+                user_message, system_prompt, model, max_turns).await?;
             prompt_writer = Some(writer);
             child
         }

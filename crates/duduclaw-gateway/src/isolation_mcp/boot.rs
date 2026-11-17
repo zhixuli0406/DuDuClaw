@@ -651,14 +651,28 @@ fn assemble(home: &Path, backend: Arc<duduclaw_execution::SpawndBackend>, mut so
 }
 
 pub(super) async fn claude_plan(home: PathBuf, agent: String, class: duduclaw_isolation::execution::ExecutionClass,
-    prompt: Vec<u8>, system_prompt: Vec<u8>, model: String) -> Result<SpawnPolicy, VerificationError> {
+    prompt: Vec<u8>, system_prompt: Vec<u8>, model: String, max_turns: u16) -> Result<SpawnPolicy, VerificationError> {
     crate::isolation_readiness::check_execution().map_err(|_| VerificationError::Unavailable)?;
     let owner = OWNER.get().cloned().ok_or(VerificationError::Unavailable)?;
     if owner.home != home { return Err(VerificationError::BindingMismatch); }
     duduclaw_mcp_boundary::authority::verify_blocking(move || {
         let employee = crate::handlers::resolve_confirmed_employee(&owner.home, &agent)
             .map_err(|_| VerificationError::Unavailable)?;
-        owner.main_plans.claude(employee.employee, class, prompt, system_prompt, &model)
+        owner.main_plans.claude(employee.employee, class, prompt, system_prompt, &model, max_turns)
+            .map_err(|_| VerificationError::Unavailable)
+    }).await
+}
+
+/// R6: the step limit root will enforce for this employee's Claude run, from
+/// the fresh root publication (same rule spawnd applies at StartRun).
+pub(super) async fn claude_max_turns(home: PathBuf, agent: String, desired: u64) -> Result<u16, VerificationError> {
+    crate::isolation_readiness::check_execution().map_err(|_| VerificationError::Unavailable)?;
+    let owner = OWNER.get().cloned().ok_or(VerificationError::Unavailable)?;
+    if owner.home != home { return Err(VerificationError::BindingMismatch); }
+    duduclaw_mcp_boundary::authority::verify_blocking(move || {
+        let employee = crate::handlers::resolve_confirmed_employee(&owner.home, &agent)
+            .map_err(|_| VerificationError::Unavailable)?;
+        owner.main_plans.claude_max_turns(employee.employee, desired)
             .map_err(|_| VerificationError::Unavailable)
     }).await
 }

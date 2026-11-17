@@ -80,6 +80,45 @@ class ManifestSigningTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 SIGN.validate_policy_document(document)
 
+    def test_policy_v3_turn_limit_shape(self):
+        def claude(limit=None, args=None):
+            record = {"runtime": {"kind": "claude"}, "mcp": True,
+                      "fixed_args": args if args is not None else ["-p"] + SIGN.CLAUDE_MCP_SUFFIX}
+            if limit is not None:
+                record["turn_limit"] = limit
+            return record
+
+        def policy(version=3, domain=SIGN.POLICY_DOMAIN_V3, runtime=None):
+            document = {"version": version, "runtimes": [runtime if runtime is not None else claude(
+                dict(SIGN.TURN_LIMIT_WORKING_DEFAULT))], "native": [{"profile": [1] * 32, "tmpfs_bytes": 4096}]}
+            if domain is not None:
+                document["domain"] = domain
+            return document
+        SIGN.validate_policy_document(policy())
+        SIGN.validate_policy_document(policy(runtime=claude()))
+        SIGN.validate_policy_document(policy(runtime=claude({"min": 1, "default": 1000, "max": 1000})))
+        # v1/v2 without a range are unaffected.
+        SIGN.validate_policy_document(policy(version=2, domain=SIGN.POLICY_DOMAIN_V2, runtime=claude()))
+        SIGN.validate_policy_document(policy(version=1, domain=None, runtime=claude()))
+        bad = [policy(domain=None), policy(domain=SIGN.POLICY_DOMAIN_V2),
+               policy(version=2, domain=SIGN.POLICY_DOMAIN_V3),
+               policy(version=2, domain=SIGN.POLICY_DOMAIN_V2),
+               policy(version=1, domain=None)]
+        for limit in [{"min": 0, "default": 50, "max": 200}, {"min": 60, "default": 50, "max": 200},
+                      {"min": 1, "default": 50, "max": 40}, {"min": 1, "default": 50, "max": 1001},
+                      {"min": 1, "max": 200}, {"min": 1, "default": 50, "max": 200, "step": 1},
+                      {"min": True, "default": 50, "max": 200}, {"min": "1", "default": 50, "max": 200}, [1, 50, 200]]:
+            bad.append(policy(runtime=claude(limit)))
+        wide = dict(SIGN.TURN_LIMIT_WORKING_DEFAULT)
+        bad.append(policy(runtime=claude(wide, ["--max-turns", "500", "-p"] + SIGN.CLAUDE_MCP_SUFFIX)))
+        bad.append(policy(runtime=claude(wide, ["--max-turns=500"] + SIGN.CLAUDE_MCP_SUFFIX)))
+        bad.append(policy(runtime=claude(wide, ["-p"])))
+        bad.append(policy(runtime=dict(claude(wide), runtime={"kind": "codex"})))
+        bad.append(policy(runtime=dict(claude(wide), mcp=False)))
+        for document in bad:
+            with self.assertRaises(ValueError):
+                SIGN.validate_policy_document(document)
+
     @unittest.skipUnless(shutil.which("ssh-keygen"), "requires system OpenSSH")
     def test_real_ssh_keygen_round_trip_and_no_overwrite(self):
         with tempfile.TemporaryDirectory() as temporary:

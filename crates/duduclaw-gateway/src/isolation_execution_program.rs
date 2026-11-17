@@ -279,7 +279,8 @@ impl ExecutionPlanFactory for InstalledProgramPlans {
                 resources: runtime.resources.clone(), network: runtime.network.clone(), pty: false,
                 capabilities: CapabilityHandover { mcp_bridge: false, egress_forwarder: matches!(runtime.network, NetworkPolicy::Egress(_)) },
                 timeouts: runtime.timeouts.clone(), inputs: RunInputs { prompt: RunInput {
-                    max_bytes: request.bytes.len() as u64, reader: Box::new(ProgramInput(std::io::Cursor::new(request.bytes))) }, attachments: vec![] } })
+                    max_bytes: request.bytes.len() as u64, reader: Box::new(ProgramInput(std::io::Cursor::new(request.bytes))) }, attachments: vec![] },
+                requested_max_turns: None })
         })
     }
 }
@@ -469,6 +470,7 @@ mod recording_tests {
                 output_total_bytes: recording_helper::MAX_RESULT as u64, memfd_total_bytes: recording_helper::MAX_REQUEST as u64 },
             timeouts: RunTimeouts { queue_ms: 1000, startup_ms: 1000, runtime_ms: 320_000, pty_idle_ms: None, termination_grace_ms: 1000 },
             network: NetworkPolicy::Egress(ProfileId(Sha256Digest([3; 32]))), mcp: false, pty_allowed: false, queue_class: QueueClass::Background,
+            turn_limit: None,
         };
         assert!(valid_helper(&runtime));
         assert!(timeout_fits(315, runtime.timeouts.runtime_ms));

@@ -300,7 +300,8 @@ impl SpawndBackend {
         }
         let request = SpawnRequest::StartRun { run: policy.run, employee_id: policy.employee,
             runtime_request: policy.runtime, workspace: selection, task_ref: state.task_ref.clone(), prompt_bytes: prepared.prompt_bytes,
-            input_fds: List::new(prepared.attachments).map_err(|_| BackendError::Denied)?, pty: policy.pty };
+            input_fds: List::new(prepared.attachments).map_err(|_| BackendError::Denied)?, pty: policy.pty,
+            requested_max_turns: policy.requested_max_turns };
         request.validate().map_err(|_| BackendError::Denied)?;
         if let Err(error) = self.check_admission() {
             entry.connection.close().await;

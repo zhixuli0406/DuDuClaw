@@ -85,7 +85,8 @@ fn helper(n: u8, emp: u8, slot: HelperSlot, input_bytes: u64) -> SpawnRequest {
 fn queue(c: &mut Coordinator<Fake>, n: u8, emp: u8, now: u64) {
     c.reserve(conn(), employee(emp), run(n), now).unwrap();
     c.start(conn(), SpawnRequest::StartRun { run: run(n), employee_id: employee(emp), runtime_request: RuntimeKind::Codex,
-        task_ref: None, workspace: None, prompt_bytes: 1, input_fds: List::new(vec![]).unwrap(), pty: false }, Rc::new(()), now).unwrap();
+        task_ref: None, workspace: None, prompt_bytes: 1, input_fds: List::new(vec![]).unwrap(), pty: false,
+        requested_max_turns: None }, Rc::new(()), now).unwrap();
 }
 fn running(limits: Limits) -> Coordinator<Fake> {
     let mut c = Coordinator::new(Fake::default(), limits).unwrap();
@@ -222,7 +223,8 @@ fn queued_call_counts_against_input_budgets() {
     // The same budget refuses a StartRun that no longer fits.
     c.reserve(conn(), employee(2), run(2), 102).unwrap();
     let big = SpawnRequest::StartRun { run: run(2), employee_id: employee(2), runtime_request: RuntimeKind::Codex,
-        task_ref: None, workspace: None, prompt_bytes: 6, input_fds: List::new(vec![]).unwrap(), pty: false };
+        task_ref: None, workspace: None, prompt_bytes: 6, input_fds: List::new(vec![]).unwrap(), pty: false,
+        requested_max_turns: None };
     assert_eq!(c.start(conn(), big, Rc::new(()), 102).unwrap_err(), ErrorCode::ResourceLimit);
     // Once the host sent `Start`, the first memfd is no longer held by spawnd.
     c.host.hold = false;

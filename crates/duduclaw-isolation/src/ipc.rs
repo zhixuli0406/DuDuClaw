@@ -377,6 +377,9 @@ pub fn check_work_reply(request: &SpawnRequest, response: &SpawnResponse, receiv
 pub const MAX_FRAME_BYTES: usize = 256 * 1024;
 pub const MAX_INPUT_FDS: usize = 64;
 pub const MAX_PROMPT_BYTES: u64 = 16 * 1024 * 1024;
+/// R6: absolute bound of `StartRun.requested_max_turns`, equal to the bound of
+/// any root-signed step range (policy v3 `turn_limit.max ≤ 1000`).
+pub const MAX_REQUESTED_MAX_TURNS: u16 = 1000;
 pub const MAX_ATTACHMENT_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 pub const DEFAULT_QUEUE_LENGTH: u16 = 32;
 pub const CONTROL_TIMEOUT_MS: u64 = 5_000;
@@ -526,6 +529,13 @@ pub enum SpawnRequest {
         prompt_bytes: u64,
         input_fds: List<InputFd, MAX_INPUT_FDS>,
         pty: bool,
+        /// R6 (additive): the step limit the gateway asks for. Root enforces it
+        /// only inside the root-signed range of the selected runtime and the
+        /// employee's root ceiling; a value outside them refuses the run, it is
+        /// never clamped. Absent means the signed default. A runtime without a
+        /// signed range refuses any value. At most `MAX_REQUESTED_MAX_TURNS`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        requested_max_turns: Option<u16>,
     },
     /// Before StartRun, bind the initial PTY size to this reservation. It does
     /// not start work; a following non-PTY StartRun is refused. During Running,
@@ -629,8 +639,11 @@ impl SpawnRequest {
     }
     pub fn validate(&self) -> Result<(), ContractError> {
         match self {
-            Self::StartRun { prompt_bytes, input_fds, workspace, .. } => {
+            Self::StartRun { prompt_bytes, input_fds, workspace, requested_max_turns, .. } => {
                 if let Some(selection) = workspace { selection.validate()?; }
+                if requested_max_turns.is_some_and(|value| value == 0 || value > MAX_REQUESTED_MAX_TURNS) {
+                    return Err(ContractError::InvalidValue("requested_max_turns"));
+                }
                 if *prompt_bytes > MAX_PROMPT_BYTES { return Err(ContractError::LimitExceeded("prompt")); }
                 let mut total = 0u64;
                 let mut memfd_total = *prompt_bytes;
@@ -808,7 +821,33 @@ mod tests {
     use super::*;
     fn start() -> SpawnRequest {
         SpawnRequest::StartRun { run: RunHandle(crate::ids::RunId([3; 16])), employee_id: EmployeeId([1; 16]), runtime_request: RuntimeKind::Codex,
-            task_ref: None, workspace: None, prompt_bytes: 1, input_fds: List::new(vec![]).unwrap(), pty: false }
+            task_ref: None, workspace: None, prompt_bytes: 1, input_fds: List::new(vec![]).unwrap(), pty: false,
+            requested_max_turns: None }
+    }
+    #[test]
+    fn requested_max_turns_is_additive_bounded_and_carries_no_rights() {
+        // Absent: the exact pre-R6 frame (deployed peers keep decoding it).
+        let legacy = serde_json::to_value(start()).unwrap();
+        assert!(legacy.get("requested_max_turns").is_none());
+        assert!(serde_json::from_value::<SpawnRequest>(legacy).is_ok());
+        let mut request = start();
+        if let SpawnRequest::StartRun { requested_max_turns, .. } = &mut request { *requested_max_turns = Some(120); }
+        let envelope = Envelope { version: 1, request_id: RequestId([2; 16]), message: request.clone() };
+        assert_eq!(decode::<SpawnRequest>(&encode(&envelope).unwrap()).unwrap(), envelope);
+        assert_eq!(request.fd_plan().unwrap(), vec![FdRole::PromptSealed]);
+        for value in [0u16, MAX_REQUESTED_MAX_TURNS + 1, u16::MAX] {
+            if let SpawnRequest::StartRun { requested_max_turns, .. } = &mut request { *requested_max_turns = Some(value); }
+            assert!(request.validate().is_err(), "{value}");
+        }
+        for value in [serde_json::json!(-1), serde_json::json!(70000), serde_json::json!("50"), serde_json::json!(1.5)] {
+            let mut raw = serde_json::to_value(start()).unwrap();
+            raw["requested_max_turns"] = value;
+            assert!(serde_json::from_value::<SpawnRequest>(raw).is_err());
+        }
+        // No other step-limit knob exists on the wire.
+        let mut raw = serde_json::to_value(start()).unwrap();
+        raw["max_turns"] = 500.into();
+        assert!(serde_json::from_value::<SpawnRequest>(raw).is_err());
     }
     #[test]
     fn pty_activity_is_narrow_and_has_no_rights_or_caller_clock() {
