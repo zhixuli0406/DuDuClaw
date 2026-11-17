@@ -24,8 +24,9 @@ pub fn kernel_version(release: &str) -> Result<(u32, u32)> {
     Ok((major, minor))
 }
 
-/// Positive version/ABI checks plus harmless syscall-availability probes.
-/// Actual namespaces, detached mounts, proc flags and enforcement must still
+/// Positive version/ABI checks plus harmless syscall-availability probes; none
+/// creates a process (pidfd support is shown by `pidfd_open` on this process,
+/// not by `clone`/`clone3`). Actual namespaces, detached mounts, proc flags and enforcement must still
 /// succeed in the launch state machine; this is not a systemd readiness receipt.
 pub fn probe() -> Result<Readiness> {
     let mut name: libc::utsname = unsafe { std::mem::zeroed() };
@@ -34,9 +35,13 @@ pub fn probe() -> Result<Readiness> {
     let (kernel_major, kernel_minor) = kernel_version(release.to_str().map_err(|_| Error::UnsupportedKernel)?)?;
     let landlock_abi = crate::landlock::probe_abi().map_err(|_| Error::UnsupportedKernel)?;
     let (landlock_abi, landlock_ruleset_abi) = landlock_evidence(landlock_abi)?;
-    // No actual process creation: size zero must fail EINVAL on a supported API.
-    let clone = unsafe { libc::syscall(libc::SYS_clone3, std::ptr::null::<u8>(), 0usize) };
-    if clone != -1 || super::errno() != libc::EINVAL { return Err(Error::UnsupportedKernel); }
+    // Children are created with legacy clone(CLONE_PIDFD | SIGCHLD) (`process`),
+    // never clone3, which systemd's RestrictNamespaces= answers with ENOSYS.
+    // CLONE_PIDFD for clone needs 5.2, implied by the 5.15 minimum above. No
+    // process is created here: a pidfd for this process proves pidfd support.
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0u32) };
+    if pidfd < 0 { return Err(Error::UnsupportedKernel); }
+    drop(unsafe { OwnedFd::from_raw_fd(pidfd as i32) });
     let root = unsafe { libc::open(c"/".as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
     if root < 0 { return Err(Error::UnsupportedKernel); }
     let root = unsafe { OwnedFd::from_raw_fd(root) };

@@ -83,6 +83,11 @@ They require a disposable root Linux VM and the installation prerequisites named
 in each ignore reason. The account test modifies login ACLs; the systemd resource
 test requires the complete trusted service hierarchy.
 
+Every run unit carries `RestrictNamespaces=mnt ipc uts net pid`
+(`systemd::TRAMPOLINE_NAMESPACES`). Under it systemd's seccomp filter returns
+ENOSYS for `clone3`, so `duduclaw-run` creates its PID-namespace init and HX
+helpers with legacy `clone(CLONE_PIDFD | SIGCHLD)` and never probes `clone3`.
+
 ## Egress control client (v1.83 R7e)
 
 spawnd is the only client of `/run/duduclaw-egress/control.sock`, which

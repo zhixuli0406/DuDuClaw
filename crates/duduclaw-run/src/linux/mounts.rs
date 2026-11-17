@@ -387,7 +387,7 @@ fn native_project(root: RawFd, run: RawFd) -> Result<(), MountError> {
     Ok(())
 }
 
-/// PID 1 calls this after clone3 and before dropping privileges (§4 step 8a).
+/// PID 1 calls this after clone(CLONE_PIDFD) and before dropping privileges (§4 step 8a).
 /// `subset_pid=false` requires an explicit root-published runtime compatibility
 /// exception; this boolean must never come from gateway/employee arguments.
 pub fn mount_proc(subset_pid: bool) -> Result<(), MountError> {

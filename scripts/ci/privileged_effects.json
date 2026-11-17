@@ -7377,7 +7377,7 @@
       ],
       "identity": "trampoline",
       "migration": "privileged_service",
-      "rationale": "HX in-run helper launcher (D8 revision 2.1/2.4/2.5) inside the duduclaw-run trampoline: raw clone with CLONE_PIDFD, then Child::exec of a root-verified signed helper fd (execveat) after setsid/PDEATHSIG, slot cgroup, exact fds, stacked Landlock, hard=soft rlimits and seccomp. Runs only inside the isolated run, holds no capability, prompt, stdin, MCP channel or egress socket; no gateway invocation or local fallback."
+      "rationale": "HX in-run helper launcher (D8 revision 2.1/2.4/2.5) inside the duduclaw-run trampoline: raw legacy clone(CLONE_PIDFD | SIGCHLD) via linux::process::clone_with_pidfd (shared with namespace-init creation; never clone3), then Child::exec of a root-verified signed helper fd (execveat) after setsid/PDEATHSIG, slot cgroup, exact fds, stacked Landlock, hard=soft rlimits and seccomp. Runs only inside the isolated run, holds no capability, prompt, stdin, MCP channel or egress socket; no gateway invocation or local fallback."
     },
     {
       "symbol": "crates/duduclaw-run/src/linux/runner.rs::tests::launcher_ready_before_all_isolated",
