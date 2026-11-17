@@ -4503,10 +4503,11 @@ gshadow:        files\nhosts:          files mdns4_minimal [NOTFOUND=return] dns
         let resume: Vec<String> = effects(&host.units.log).into_iter().filter(|line| !line.starts_with("perform ")).collect();
         assert_eq!(resume, effects(&rollback.log));
         assert_eq!(host.units.log.iter().filter(|line| !line.starts_with("perform ")).cloned().collect::<Vec<_>>(), rollback.log);
-        // The order: the gateway, every activation source (timers, sockets), the
-        // services (fixed, then instances and runs), the employee slice, the aggregate slices.
+        // The order: the gateway, the consistency gate it binds to, every activation
+        // source (timers, sockets), the services (fixed, then instances and runs),
+        // the employee slice, the aggregate slices.
         let order: Vec<&str> = resume.iter().filter_map(|line| line.strip_prefix("stop ")).collect();
-        assert_eq!(order, [UNIT, NIGHTLY_TIMER, "duduclaw-migrate-expire@0a1b.timer", "duduclaw-egress.socket",
+        assert_eq!(order, [UNIT, duduclaw_isolation::ids::ISOLATION_READY_UNIT, NIGHTLY_TIMER, "duduclaw-migrate-expire@0a1b.timer", "duduclaw-egress.socket",
             "duduclaw-spawnd.socket", "duduclaw-updated.service", "duduclaw-egress.service", "duduclaw-spawnd.service",
             PARSE_INSTANCE, RUN, EMPLOYEE_SLICE, "duduclaw-employees.slice", "duduclaw-tcb.slice", "duduclaw.slice"]);
         assert_eq!(resume.last().map(String::as_str), Some("processes_clear"));
