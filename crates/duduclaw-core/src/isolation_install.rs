@@ -74,6 +74,8 @@ pub const FACTS: &[&str] = &[
     "/usr/lib/duduclaw",
     "/usr/lib/duduclaw/parse-root",
     "/usr/lib/duduclaw/parse-root-tree",
+    "/usr/lib/duduclaw/current",
+    "/usr/libexec/duduclaw",
     "/var/lib/duduclaw-spawnd",
     "/var/lib/duduclaw-spawnd/etc",
     "/var/log/duduclaw-spawnd",
@@ -97,6 +99,7 @@ pub const FACTS: &[&str] = &[
     "/usr/lib/duduclaw/current/duduclaw-import",
     "/usr/lib/duduclaw/current/duduclaw-migrate",
     "/usr/lib/duduclaw/current/duduclaw-mcp-bridge",
+    "/usr/lib/duduclaw/current/duduclaw",
     "/usr/libexec/duduclaw-updated-launch",
 ];
 

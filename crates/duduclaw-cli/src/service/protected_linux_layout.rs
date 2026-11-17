@@ -8,6 +8,9 @@ pub(super) const BINARIES: &[&str] = &[
     "/usr/lib/duduclaw/current/duduclaw-import",
     "/usr/lib/duduclaw/current/duduclaw-migrate",
     "/usr/lib/duduclaw/current/duduclaw-mcp-bridge",
+    // The gateway copy G's `installed("duduclaw")` runs (duduclaw-migration
+    // root_pipeline); the same signed artifact as /opt/duduclaw/bin/duduclaw.
+    "/usr/lib/duduclaw/current/duduclaw",
     "/usr/libexec/duduclaw-updated-launch",
 ];
 
@@ -20,6 +23,9 @@ pub(super) const DIRECTORIES: &[(&str, u32)] = &[
     ("/usr/lib/duduclaw", 0o755),
     ("/usr/lib/duduclaw/parse-root", 0o755),
     ("/usr/lib/duduclaw/parse-root-tree", 0o755),
+    // A real directory of file copies, never a symlink (plan §3.1).
+    ("/usr/lib/duduclaw/current", 0o755),
+    ("/usr/libexec/duduclaw", 0o755),
     ("/var/lib/duduclaw-spawnd", 0o700),
     ("/var/lib/duduclaw-spawnd/etc", 0o700),
     ("/var/log/duduclaw-spawnd", 0o700),
@@ -177,7 +183,19 @@ mod tests {
             assert!(DIRECTORIES.contains(&(root, 0o755)));
         }
         assert_eq!(ACCOUNTS.len(), 4);
-        assert_eq!(BINARIES.len(), 8);
+        assert_eq!(BINARIES.len(), 9);
+        // Every binary's parent directory is created by the layout (parent first).
+        for binary in BINARIES {
+            let parent = std::path::Path::new(binary).parent().unwrap().to_str().unwrap();
+            assert!(DIRECTORIES.iter().any(|(path, mode)| *path == parent && *mode == 0o755)
+                || matches!(parent, "/opt/duduclaw/bin" | "/usr/libexec"), "{binary}");
+        }
+        for (index, (path, _)) in DIRECTORIES.iter().enumerate() {
+            let parent = std::path::Path::new(path).parent().unwrap().to_str().unwrap();
+            if let Some(position) = DIRECTORIES.iter().position(|(other, _)| *other == parent) {
+                assert!(position < index, "{path} listed before its parent");
+            }
+        }
     }
     #[cfg(unix)]
     struct Fixture(std::path::PathBuf);

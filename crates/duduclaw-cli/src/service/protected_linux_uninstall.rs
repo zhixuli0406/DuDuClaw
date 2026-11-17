@@ -2,7 +2,7 @@
 use super::*;
 use std::{collections::BTreeSet, io::Read, path::PathBuf};
 
-fn read_bounded(path: &Path, limit: u64) -> Result<String> {
+pub(super) fn read_bounded(path: &Path, limit: u64) -> Result<String> {
     let mut file = fs::File::open(path)?;
     let mut text = String::new();
     Read::by_ref(&mut file).take(limit + 1).read_to_string(&mut text)?;
@@ -90,7 +90,7 @@ fn service_uids() -> Result<BTreeSet<u32>> {
     Ok(uids)
 }
 
-fn processes_clear() -> Result<()> {
+pub(super) fn processes_clear() -> Result<()> {
     let uids = service_uids()?;
     let mut count = 0;
     for entry in fs::read_dir("/proc")? {

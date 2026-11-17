@@ -6,6 +6,29 @@
 
 **現在インストールできる内容：** `service install --protected-linux` は spawnd、egress、独立した更新サービスをインストールせず、移行計画を作成する処理もありません。隔離構成の新規インストール手順が完成するまで（今後のバージョンで提供予定）、保護サービスは下記「単一実行ファイルの保護サービス（現行版）」で説明する v1.80 の単一実行ファイル gateway サービスです。このガイドで説明する社員ごとの隔離は適用されません。
 
+## 新規ホストへの隔離インストール（v1.83.0 以降）
+
+v1.83.0 以降、新しいホストへの保護インストールは、独立して検証した `duduclaw-bootstrap install` でのみ行います。DuDuClaw を一度も導入していないホストで `sudo duduclaw service install --protected-linux` を実行すると、下記の手順を表示するだけで何も変更しません。`--migrate-from` はすべての保護インストールで拒否されます。v1.80〜v1.82 の単一実行ファイル保護サービスが動作している（またはその残りのファイルがある）ホストは、この手順では拒否されるため、アップグレード手順を使ってください。隔離インストールにはチーム版が必要です。
+
+1. root でダウンロード用ディレクトリを作成します：`install -d -m 0700 -o root -g root /root/duduclaw-migrate`。
+2. 次のファイルをファイルとしてこのディレクトリに保存します：`duduclaw-bootstrap`、`duduclaw-isolated-linux-<アーキテクチャ>-<バージョン>.tar` とその `.minisig`、`.authorization.json`、`.authorization.json.signatures.json`、およびチーム版ライセンス `license.json`（root 所有で、グループとその他のユーザーが書き込めないもの）。
+3. 公式サイトとライセンスコンソールで公開されている値と `sha256sum -c` で照合します。両方が一致している必要があります。
+4. `sudo /root/duduclaw-migrate/duduclaw-bootstrap install [--dns-upstream <IP:53>] [--host-public-address <IP>]... [--enable-now]` を実行します。
+
+| オプション | 意味 |
+| --- | --- |
+| `--dns-upstream <IP:53>` | systemd-resolved のないホストでのみ使用：専用 DNS 転送サービスの唯一の上流。systemd-resolved がある場合は拒否されます。このアドレスは社員の外部接続ルールには追加されません。 |
+| `--host-public-address <IP>` | ネットワークインターフェースにないこのホストの公開アドレス（クラウドの 1:1 NAT）。複数指定可、最大 64 個。社員はこのアドレスに接続できません。 |
+| `--enable-now` | 最後に gateway を起動し、完全な準備検査を実行します。指定しない場合、gateway は自動起動の設定だけ行い、すぐには起動しません。 |
+
+インストーラーは何かを変更する前にホストを検査し、不合格の項目をまとめて表示します：Ubuntu 22.04、Ubuntu 24.04 または Debian 12、systemd 249 以上、カーネル 5.15 以上、cgroup v2、`/var/lib` が ext4 または XFS、`/etc/login.defs` に `SYS_UID_MAX`／`SYS_GID_MAX` が明示されていること、70000〜99999 にアカウント・グループ・subordinate ID の範囲がないこと、sshd のメイン設定が `/etc/ssh/sshd_config.d/*.conf` を読み込むこと、`cron.allow`／`at.allow` が DuDuClaw のアカウントを許可していないこと、十分な空き容量、有効なチーム版ライセンス、以前の DuDuClaw のインストールがないこと。外部アカウントサービス（LDAP、SSSD など）を使うホストは、このインストーラーではサポートしていません。
+
+続いて、サービスアカウントのプロセスがないことを確認し、検証済みの更新信頼ルート・世代・固定パスのプログラムを配置し、サービスアカウント・ディレクトリ・サービスユニットを作成し、署名済みポリシーから外部接続と DNS の設定を書き込み、spawnd・egress・文書解析ソケット・更新サービスを起動し、夜間更新タイマー（`duduclaw-auto-upgrade.timer`）を有効にし、総合準備検査を実行して、合格した後にだけ gateway のユニットを導入・有効化します。総合準備検査に合格した場合にのみ、インストールは成功を報告します。
+
+**再開：** 進捗は `/var/lib/duduclaw-protected/isolation-bootstrap.json` に記録されます。インストールが中断した場合（エラー、再起動、停電）は、表示された原因を直してから同じ `duduclaw-bootstrap install` コマンドをもう一度実行すると、最初の未完了の手順から続行します。再開時はオプションを省略できます。異なる値は拒否されます。別のインストールパッケージはロールバックするまで拒否されます。インストールが未完了の間、`service install`、`upgrade`、`uninstall --protected-linux` は拒否されます。
+
+**ロールバック：** 最後の手順（確定）の前であれば、`sudo /root/duduclaw-migrate/duduclaw-bootstrap rollback`（ダウンロード用ディレクトリに同じパッケージが残っている必要があります）でホストをインストール前の状態に戻せます。サービスを停止・無効化した後、導入したプログラムとサービスユニット、更新サービスの信頼ルート・状態・世代、spawnd の状態、`egress.json`、`dns-broker.json`、ルート鍵、今回のインストールで作成された gateway のデータを削除します。システムアカウント、空の gateway データディレクトリとライセンス、保護モードのマーカー、古いパッケージのインストールを防ぐ記録は残します。削除はリンクをたどらず、マウントポイントをまたぎません。何か残った場合はそのパスを表示し、同じコマンドを再実行できます。確定後はロールバックできません。`service uninstall --protected-linux` を使ってください。
+
 ## 利用者にとっての変更
 
 以下の変更は隔離構成が提供されてから適用されます。現在のインストールには適用されません。

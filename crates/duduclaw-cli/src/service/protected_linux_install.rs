@@ -8,6 +8,11 @@ mod removal;
 mod fresh;
 #[path = "protected_linux_upgrade.rs"]
 mod in_place;
+#[path = "protected_linux_bootstrap.rs"]
+mod bootstrap;
+#[path = "protected_linux_rollback.rs"]
+mod rollback;
+pub(super) use bootstrap::ContinueOptions;
 
 fn gate() -> Result<()> {
     if unsafe { libc::getuid() } != 0 || unsafe { libc::geteuid() } != 0 {
@@ -134,7 +139,12 @@ fn account() -> Result<(u32, u32)> {
     let home = Path::new("/var/lib/duduclaw");
     parents(home)?;
     let metadata = fs::symlink_metadata(home)?;
-    if !metadata.is_dir() || metadata.uid() != uid || metadata.gid() != gid || metadata.mode() & 0o022 != 0 {
+    // The single-binary layout (home owned by the account) or the v1.83
+    // isolated layout (root:root 0711 home around a private 0700 data
+    // directory, `layout::migrated_home_is_private`, which R4 requires).
+    let single_binary = metadata.is_dir() && !metadata.file_type().is_symlink() && metadata.uid() == uid
+        && metadata.gid() == gid && metadata.mode() & 0o022 == 0;
+    if !single_binary && !layout::migrated_home_is_private(home, 0, 0, uid, gid)? {
         return Err(refused("service home must be a real directory owned by duduclaw, not group/other writable"));
     }
     Ok((uid, gid))
@@ -260,6 +270,14 @@ fn invalidate_recovery_bound() -> Result<()> {
 }
 
 fn reload_and_certify_recovery() -> Result<()> {
+    reload_and_certify_recovery_text(&unit_text())
+}
+
+/// `text` is the gateway unit just installed: the single-binary
+/// `unit_text()` or, on an isolated host, `isolated_unit_text()`. The
+/// recovery bound must hold the same canonical text
+/// (`duduclaw_core::root_key::recovery` compares both files).
+fn reload_and_certify_recovery_text(text: &str) -> Result<()> {
     checked("systemctl", &["daemon-reload"])?;
     let output = checked("systemctl", &["show", UNIT, "-p", "StartLimitIntervalUSec",
         "-p", "StartLimitBurst", "-p", "RestartForceExitStatus"])?;
@@ -267,7 +285,7 @@ fn reload_and_certify_recovery() -> Result<()> {
     if !duduclaw_core::root_key::recovery::protected_properties_bounded(properties) {
         return Err(refused("effective unit restart bounds differ; remove conflicting systemd overrides before upgrading"));
     }
-    atomic_install(RECOVERY_BOUND, 0o644, |file| { file.write_all(unit_text().as_bytes())?; Ok(()) })
+    atomic_install(RECOVERY_BOUND, 0o644, |file| { file.write_all(text.as_bytes())?; Ok(()) })
 }
 
 const VERSION_FLOOR: &str = "/var/lib/duduclaw-protected/version-floor";
@@ -286,7 +304,16 @@ fn install_isolation_support_if_published() -> Result<()> {
     // Validate explicit host ranges before useradd can allocate anything.
     layout::system_id_limit(&defs, "SYS_UID_MAX").map_err(refused)?;
     layout::system_id_limit(&defs, "SYS_GID_MAX").map_err(refused)?;
-    let (uid, gid) = account()?;
+    let gateway = account()?;
+    install_isolation_support_for(gateway, &defs)
+}
+
+/// The accounts, directories and unit files of the isolation layout, for an
+/// already resolved gateway identity (the v1.83 bootstrap resolves its own:
+/// its service home is the root-owned 0711 parent of a private data
+/// directory, which `account()` does not accept). Never enables anything.
+fn install_isolation_support_for((uid, gid): (u32, u32), defs: &str) -> Result<()> {
+    let defs = defs.to_owned();
     layout::validate_system_ids(uid, gid, &defs).map_err(refused)?;
     let mut identities = vec![(uid, gid)];
     for name in layout::ACCOUNTS {
@@ -539,8 +566,23 @@ fn write_mode_marker() -> Result<()> {
 }
 
 pub(super) fn install(options: InstallOptions) -> Result<()> {
+    // v1.83 (owner decision Q7): `--migrate-from` would carry unreviewed
+    // single-binary data straight into the new trusted computing base, so it
+    // is refused for every protected install, before any lock or side effect.
+    if options.migrate_from.is_some() || options.force_migrate {
+        return Err(refused(bootstrap::MIGRATE_FROM_REFUSED));
+    }
     gate()?;
     let _lock = version_lock()?;
+    // An isolation bootstrap in progress owns this host until it is committed
+    // or rolled back; nothing here may write the floor or the program.
+    bootstrap::refuse_if_in_progress()?;
+    // v1.83 (Q7): a fresh protected install goes only through the independently
+    // verified `duduclaw-bootstrap install`. Decided before the mode marker.
+    if !managed_install()? && fresh::host_is_fresh() {
+        bootstrap::print_fresh_install_instructions();
+        return Err(refused(bootstrap::FRESH_INSTALL_REFUSED));
+    }
     write_mode_marker()?;
     let version = duduclaw_gateway::updater::current_version();
     if managed_install()? {
@@ -551,8 +593,10 @@ pub(super) fn install(options: InstallOptions) -> Result<()> {
     }
     // The single authoritative probe, under the lock so no concurrent install,
     // upgrade or uninstall can change the answer. The lock file and the mode
-    // marker are not residue, so creating them above never changes it. It also
-    // continues an interrupted fresh install from its strictly validated marker.
+    // marker are not residue, so creating them above never changes it. Since
+    // v1.83 (Q7) a fresh host (including an interrupted pre-v1.83 fresh install
+    // with a valid marker) was refused above, so this is false here and only an
+    // existing single-binary host is reinstalled below.
     let fresh_host = fresh::host_is_fresh();
     let floor = read_version_file(VERSION_FLOOR)?;
     // A fresh host has no earlier data, so there is nothing for G to migrate:
@@ -567,13 +611,6 @@ pub(super) fn install(options: InstallOptions) -> Result<()> {
         if !options.i_verified_this_binary {
             return Err(refused("請先驗證執行檔；確認後才可使用 --i-verified-this-binary"));
         }
-    }
-    // The common migration refusals (a source that changes while it is being
-    // read, links, foreign owners, an existing target) happen here, before any
-    // side effect. Preflight does not detect a running source gateway as such.
-    // copy() repeats every check against the live tree.
-    if let Some(source) = options.migrate_from.as_deref() {
-        super::migrate::preflight(source, options.force_migrate)?;
     }
     // From here on a failure leaves the account and data behind. The marker
     // lets a retry continue this fresh install; record_floor removes it.
@@ -590,11 +627,6 @@ pub(super) fn install(options: InstallOptions) -> Result<()> {
         Some(3 | 4) => false,
         _ => return Err(refused("cannot determine system service state")),
     };
-    if options.migrate_from.is_some() && was_active { checked("systemctl", &["stop", UNIT])?; }
-    if let Some(source) = options.migrate_from {
-        super::migrate::copy(&source, uid, gid, options.force_migrate)?;
-        println!("個人連線使用不同的金鑰，搬移後必須重新連結。請先停止來源 Gateway，避免資料在複製時變動。");
-    }
     install_isolation_support_if_published()?;
     invalidate_recovery_bound()?;
     prepare_version(version)?;
@@ -618,6 +650,8 @@ pub(super) fn install(options: InstallOptions) -> Result<()> {
 pub(super) fn uninstall() -> Result<()> {
     gate()?;
     let _lock = version_lock()?;
+    // An uncommitted isolation bootstrap is undone only by its rollback.
+    bootstrap::refuse_if_in_progress()?;
     // The fresh-install marker goes first, on both the coordinated-removal and
     // the plain path: once a floor or key may be removed, a later install must
     // not continue an earlier fresh install over retained data. Removing it
@@ -664,6 +698,20 @@ pub(super) fn uninstall() -> Result<()> {
 pub(super) fn readiness() -> Result<()> {
     gate()?;
     readiness::check(&mut readiness::InstalledComposite)
+}
+
+/// `service bootstrap-continue --protected-linux` (hidden): entered only by
+/// `duduclaw-bootstrap` after it verified and staged the generation.
+pub(super) fn bootstrap_continue(options: ContinueOptions) -> Result<()> {
+    gate()?;
+    bootstrap::continue_run(options)
+}
+
+/// `service bootstrap-rollback --protected-linux` (hidden): the same rollback
+/// without re-verifying the bundle (e.g. when the inbox was already cleared).
+pub(super) fn bootstrap_rollback() -> Result<()> {
+    gate()?;
+    rollback::run_standalone()
 }
 
 // The route is decided from installed state, under the version lock, before
@@ -716,6 +764,7 @@ pub(super) async fn upgrade(version: Option<&str>, allow_missing_runtime: bool) 
     }
     gate()?;
     let _lock = version_lock()?;
+    bootstrap::refuse_if_in_progress()?;
     let managed = managed_install()?;
     let floor = if managed { None } else { read_version_file(VERSION_FLOOR)? };
     let route = upgrade_route(managed, floor.as_deref(), version)?;

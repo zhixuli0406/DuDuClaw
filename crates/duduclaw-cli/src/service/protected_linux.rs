@@ -14,7 +14,11 @@ mod lifecycle;
 #[cfg(target_os = "linux")]
 #[path = "protected_linux_migration.rs"]
 mod native_migration;
+// v1.83 (owner decision Q7): `--migrate-from` is refused for every protected
+// install, so the copier is no longer called. It stays compiled (and tested)
+// until R5 decides whether any of it is reused by the reviewed migration.
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 #[path = "protected_linux_migrate.rs"]
 mod migrate;
 
@@ -77,6 +81,38 @@ pub(crate) fn readiness() -> Result<()> {
     operator_gate()?;
     #[cfg(target_os = "linux")]
     { linux::readiness() }
+    #[cfg(not(target_os = "linux"))]
+    { Err(refused("--protected-linux requires native Linux")) }
+}
+
+/// Typed arguments of the hidden `service bootstrap-continue` command, exactly
+/// as `duduclaw-bootstrap` forwards them (no path is ever accepted).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) struct BootstrapContinueArgs {
+    /// `install`, `upgrade` or `rollback`.
+    pub mode: String,
+    /// The staged generation: 64 lowercase hex digits.
+    pub generation: String,
+    pub dns_upstream: Option<std::net::SocketAddr>,
+    pub host_public_address: Vec<std::net::IpAddr>,
+    pub enable_now: bool,
+}
+
+/// v1.83 isolation bootstrap continuation (plan §4.3), run by the verified
+/// gateway that `duduclaw-bootstrap` executes from a sealed memfd.
+pub(crate) fn bootstrap_continue(args: BootstrapContinueArgs) -> Result<()> {
+    operator_gate()?;
+    #[cfg(target_os = "linux")]
+    { linux::bootstrap_continue(linux::ContinueOptions::from_args(args)?) }
+    #[cfg(not(target_os = "linux"))]
+    { let _ = args; Err(refused("--protected-linux requires native Linux")) }
+}
+
+/// Roll back an uncommitted isolation bootstrap (plan §4.3).
+pub(crate) fn bootstrap_rollback() -> Result<()> {
+    operator_gate()?;
+    #[cfg(target_os = "linux")]
+    { linux::bootstrap_rollback() }
     #[cfg(not(target_os = "linux"))]
     { Err(refused("--protected-linux requires native Linux")) }
 }
