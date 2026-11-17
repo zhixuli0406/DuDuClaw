@@ -68,12 +68,17 @@ fn mkdir(path: &str, mode: u32) -> Result<()> {
 /// The child deadline of every system command (and the cap of `command_within`).
 const COMMAND_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
 
-fn command(name: &str, args: &[&str]) -> Result<Output> { command_within(name, args, COMMAND_LIMIT) }
+fn command(name: &str, args: &[&str]) -> Result<Output> {
+    command_within(name, args, std::time::Instant::now() + COMMAND_LIMIT)
+}
 
-/// `command` with a child deadline of `min(limit, 30 s)`, so a caller's own
-/// deadline bounds the whole call (R3 review item 6). A zero limit spawns nothing.
-fn command_within(name: &str, args: &[&str], limit: std::time::Duration) -> Result<Output> {
-    if limit.is_zero() { return Err(refused("system command exceeded its time or output limit")); }
+/// `command` bounded by the caller's ABSOLUTE `deadline` (R3 review item 6,
+/// R4 item 4): checked on entry, again immediately before the spawn and right
+/// after it; the child is given `min(deadline, spawn + 30 s)`. Nothing is
+/// spawned or read once the deadline has passed (refused).
+fn command_within(name: &str, args: &[&str], deadline: std::time::Instant) -> Result<Output> {
+    let expired = || refused("system command exceeded its time or output limit");
+    if std::time::Instant::now() >= deadline { return Err(expired()); }
     let executable = ["/usr/sbin", "/usr/bin", "/sbin", "/bin"].iter()
         .map(|dir| Path::new(dir).join(name)).find(|path| path.exists())
         .ok_or_else(|| refused(format!("required command missing: {name}")))?;
@@ -92,11 +97,17 @@ fn command_within(name: &str, args: &[&str], limit: std::time::Duration) -> Resu
     trusted(Path::new("/run"), true)?;
     let mut stdout = tempfile::NamedTempFile::new_in("/run")?;
     let mut stderr = tempfile::NamedTempFile::new_in("/run")?;
+    let (stdout_handle, stderr_handle) = (stdout.reopen()?, stderr.reopen()?);
+    // Preparation may have used up the caller's time: nothing is spawned then.
+    if Instant::now() >= deadline { return Err(expired()); }
     // Fixed cwd, PATH and HOME (origin/main) inside the bounded, reaped spawn (isolation).
     let mut child = ReapOnError(Command::new(executable).args(args).current_dir("/").env_clear()
         .env("PATH", super::runtime::SERVICE_PATH).env("HOME", "/var/lib/duduclaw").env("LC_ALL", "C")
-        .stdin(Stdio::null()).stdout(stdout.reopen()?).stderr(stderr.reopen()?).spawn()?);
-    let deadline = Instant::now() + limit.min(COMMAND_LIMIT);
+        .stdin(Stdio::null()).stdout(stdout_handle).stderr(stderr_handle).spawn()?);
+    let spawned = Instant::now();
+    // Expired during the spawn: the child is killed and reaped (`ReapOnError`), nothing is read.
+    if spawned >= deadline { return Err(expired()); }
+    let deadline = deadline.min(spawned + COMMAND_LIMIT);
     let limit = 4 * 1024 * 1024;
     let status = loop {
         if stdout.as_file().metadata()?.len() > limit || stderr.as_file().metadata()?.len() > limit
@@ -106,6 +117,8 @@ fn command_within(name: &str, args: &[&str], limit: std::time::Duration) -> Resu
         if let Some(status) = child.0.try_wait()? { break status; }
         std::thread::sleep(Duration::from_millis(10));
     };
+    // An answer that arrives at or after the deadline is not read (fail closed).
+    if Instant::now() >= deadline { return Err(expired()); }
     let mut out = Vec::new(); let mut err = Vec::new();
     stdout.as_file_mut().take(limit + 1).read_to_end(&mut out)?;
     stderr.as_file_mut().take(limit + 1).read_to_end(&mut err)?;

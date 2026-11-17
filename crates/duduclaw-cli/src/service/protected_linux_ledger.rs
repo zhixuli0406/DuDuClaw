@@ -302,6 +302,62 @@ pub(super) fn stat_at(dirfd: RawFd, name: &CStr) -> std::io::Result<Stat> {
         nlink: u64::from(stat.stx_nlink), mount_id })
 }
 
+/// Review R4 item 2: a wall-clock instant `(seconds, nanoseconds)` since the epoch.
+pub(super) type Timestamp = (i64, u32);
+
+/// Review R4 item 2: what binds an object another component created to this
+/// transaction's window, observed by `statx` of the same inode the identity names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Creation {
+    pub(super) device: u64,
+    pub(super) inode: u64,
+    pub(super) nlink: u64,
+    /// Birth time when the filesystem reports one (`STATX_BTIME`), else the
+    /// change time (never earlier than the birth); `None`: neither reported.
+    pub(super) stamp: Option<Timestamp>,
+}
+
+/// `statx` of `name` below `dirfd` for [`Creation`] (no link followed, no automount).
+pub(super) fn creation_at(dirfd: RawFd, name: &CStr) -> std::io::Result<Creation> {
+    let flags = libc::AT_SYMLINK_NOFOLLOW | libc::AT_NO_AUTOMOUNT | if name.is_empty() { libc::AT_EMPTY_PATH } else { 0 };
+    // SAFETY: an all-zero `statx` (plain integers) is a valid value.
+    let mut stat: libc::statx = unsafe { std::mem::zeroed() };
+    duduclaw_core::linux_syscalls::statx(dirfd, name, flags, libc::STATX_BASIC_STATS | libc::STATX_BTIME, &mut stat)?;
+    let required = libc::STATX_INO | libc::STATX_NLINK;
+    if stat.stx_mask & required != required { return Err(std::io::Error::other("incomplete statx answer")); }
+    let time = |time: libc::statx_timestamp| (time.tv_sec, time.tv_nsec);
+    let stamp = if stat.stx_mask & libc::STATX_BTIME != 0 { Some(time(stat.stx_btime)) }
+        else if stat.stx_mask & libc::STATX_CTIME != 0 { Some(time(stat.stx_ctime)) } else { None };
+    Ok(Creation { device: (u64::from(stat.stx_dev_major) << 32) | u64::from(stat.stx_dev_minor), inode: stat.stx_ino,
+        nlink: u64::from(stat.stx_nlink), stamp })
+}
+
+/// The [`Creation`] of a fixed absolute path (its parent opened no-follow).
+pub(super) fn creation(path: &str) -> Result<Creation> {
+    let (directory, name) = open_parent(path)?;
+    Ok(creation_at(directory.as_raw_fd(), &name)?)
+}
+
+/// Review R4 item 2: the kernel's COARSE wall clock — the clock inode
+/// timestamps are taken from — so an object created after this call never
+/// carries an earlier stamp. `None`: unreadable.
+pub(super) fn window_start() -> Option<Timestamp> {
+    // SAFETY: an all-zero `timespec` is a valid value; clock_gettime writes it on success.
+    let mut now: libc::timespec = unsafe { std::mem::zeroed() };
+    // SAFETY: valid clock id and a live out-pointer.
+    if unsafe { libc::clock_gettime(libc::CLOCK_REALTIME_COARSE, &mut now) } != 0 { return None; }
+    Some((now.tv_sec, u32::try_from(now.tv_nsec).ok()?))
+}
+
+/// Review R4 item 2 (pure): the creation stamp of `creation` does not predate
+/// `window` and belongs to the object `identity` names. Anything unreadable:
+/// not accepted. (A concurrent root actor creating the object inside the
+/// window is outside what the installer can distinguish.)
+pub(super) fn created_in_window(identity: &Identity, creation: &Creation, window: Option<Timestamp>) -> bool {
+    let (Some(stamp), Some(window)) = (creation.stamp, window) else { return false };
+    creation.device == identity.device && creation.inode == identity.inode && stamp >= window
+}
+
 pub(super) fn boot_id() -> Result<String> {
     let text = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
     let text = text.trim();
@@ -485,6 +541,11 @@ fn collect_proofs<T>(create: impl FnOnce() -> T) -> (T, Vec<(String, Identity)>)
     (value, proofs)
 }
 
+/// Review R4 item 2: an object another component should have created could not be proven this install's.
+fn component_unconfirmed(path: &str) -> DuDuClawError {
+    refused(format!("無法證明 {path} 是這次安裝啟動的元件在這次安裝期間建立的物件（擁有者、權限、掛載點、建立時間或產生它的服務不符，或無法讀取）；已停止，沒有把它記錄為這次安裝建立的物件，這一步也未完成。請確認來源後以同一個命令續接，或執行 duduclaw-bootstrap rollback。"))
+}
+
 fn changed_after_creation(path: &str) -> DuDuClawError {
     refused(format!("{path} 在這次安裝建立它之後、記錄之前已被更換；已停止，沒有把它記錄為這次安裝建立的物件。請確認來源後再續接，或執行 duduclaw-bootstrap rollback。"))
 }
@@ -642,15 +703,20 @@ impl<H: LedgerHost> Recorder<H> {
     /// Review R3 item 4: an object another component creates (systemd's
     /// runtime directory, the launcher's root key, R1's state root). Its
     /// present identity is recorded only when `accept` — the caller's proof
-    /// (root-owned, on the expected mount, made by a unit PID 1 reports as this
-    /// install's …) — passes; otherwise it stays unconfirmed (an object an
-    /// earlier run recorded and still exactly present stays confirmed).
+    /// (root-owned, on the expected mount, created inside this transaction's
+    /// window by the producer this install started …) — passes; an object an
+    /// earlier run recorded and still exactly present stays confirmed.
+    ///
+    /// Review R4 item 2: anything else is an ERROR naming `path` (the entry,
+    /// if any, is left as it was — never `created`), so the calling step fails
+    /// and stays resumable instead of completing with an unconfirmed object.
+    /// A failing proof (`accept` erring) is "not accepted".
     pub(super) fn confirm_component(&mut self, path: &str, accept: impl FnOnce(&Identity) -> Result<bool>) -> Result<()> {
-        let Some(entry) = self.ledger.entry(path).cloned() else { return Ok(()) };
+        let Some(entry) = self.ledger.entry(path).cloned() else { return Err(component_unconfirmed(path)) };
         let mut next = self.ledger.clone();
         let current = self.host.identity(path, entry.kind)?;
         let accepted = match &current {
-            Some(identity) => identity.valid_for(entry.kind) && accept(identity)?,
+            Some(identity) => identity.valid_for(entry.kind) && accept(identity).unwrap_or(false),
             None => false,
         };
         let unchanged = !accepted && entry.identity.is_some() && self.host.classify(&entry)? == Now::Recorded;
@@ -660,9 +726,16 @@ impl<H: LedgerHost> Recorder<H> {
                 slot.state = State::Created;
             } else if unchanged {
                 slot.state = State::Created;
+            } else {
+                // Not proven now: never left `created` (the last identity stays for rollback's rule).
+                slot.state = State::Intent;
             }
         }
-        self.save(next)
+        self.save(next)?;
+        match self.ledger.entry(path) {
+            Some(entry) if entry.state == State::Created => Ok(()),
+            _ => Err(component_unconfirmed(path)),
+        }
     }
 
     /// Review L1: the installer re-applied the permission bits `mode` to a
@@ -1019,15 +1092,58 @@ mod tests {
         let runtime = super::super::bootstrap::SPAWND_RUNTIME;
         recorder.intend(&[(runtime, Kind::Tree)]).unwrap();
         world.borrow_mut().put(runtime, identity(Kind::Tree, 50));
-        // PID 1 does not report this install's unit for it: unconfirmed.
-        recorder.confirm_component(runtime, |_| Ok(false)).unwrap();
-        assert_eq!(recorder.ledger().entry(runtime).unwrap().identity, None);
+        // Review R4 item 2: PID 1 does not report this install's unit for it
+        // (or the proof fails): an ERROR naming the object, never `created`.
+        let error = recorder.confirm_component(runtime, |_| Ok(false)).unwrap_err().to_string();
+        assert!(error.contains(runtime), "{error}");
+        let entry = recorder.ledger().entry(runtime).unwrap().clone();
+        assert_eq!((entry.state, entry.identity), (State::Intent, None));
+        assert!(recorder.confirm_component(runtime, |_| Err(refused("stamp unreadable"))).is_err());
+        assert_eq!(recorder.ledger().entry(runtime).unwrap().state, State::Intent);
         recorder.confirm_component(runtime, |identity| Ok(identity.inode == 50)).unwrap();
         let entry = recorder.ledger().entry(runtime).unwrap().clone();
         assert_eq!((entry.state, entry.identity), (State::Created, Some(identity(Kind::Tree, 50))));
-        // Absent, or no entry: nothing recorded.
-        recorder.confirm_component(VERSION_FLOOR, |_| Ok(true)).unwrap();
+        // Recorded earlier and still exactly present: stays confirmed without a new proof.
+        recorder.intend(&[(runtime, Kind::Tree)]).unwrap();
+        recorder.confirm_component(runtime, |_| Ok(false)).unwrap();
+        assert_eq!(recorder.ledger().entry(runtime).unwrap().state, State::Created);
+        // Replaced since: not accepted and not unchanged — an error, back to `intent`.
+        recorder.intend(&[(runtime, Kind::Tree)]).unwrap();
+        world.borrow_mut().put(runtime, identity(Kind::Tree, 51));
+        assert!(recorder.confirm_component(runtime, |_| Ok(false)).is_err());
+        assert_eq!(recorder.ledger().entry(runtime).unwrap().state, State::Intent);
+        // Absent, or no entry: an error, nothing recorded.
+        assert!(recorder.confirm_component(VERSION_FLOOR, |_| Ok(true)).is_err());
         assert!(recorder.ledger().entry(VERSION_FLOOR).is_none());
+        recorder.intend(&[(VERSION_FLOOR, Kind::File)]).unwrap();
+        assert!(recorder.confirm_component(VERSION_FLOOR, |_| Ok(true)).is_err());
+        assert_eq!(recorder.ledger().entry(VERSION_FLOOR).unwrap().state, State::Intent);
+    }
+
+    #[test]
+    fn component_creation_must_not_predate_the_window() {
+        let object = identity(Kind::File, 60);
+        let created = |stamp| Creation { device: object.device, inode: object.inode, nlink: 1, stamp };
+        let window = Some((1_000, 500));
+        assert!(created_in_window(&object, &created(Some((1_000, 500))), window));
+        assert!(created_in_window(&object, &created(Some((1_001, 0))), window));
+        // Predates the window (by a nanosecond or more): not accepted.
+        assert!(!created_in_window(&object, &created(Some((1_000, 499))), window));
+        assert!(!created_in_window(&object, &created(Some((999, 999_999_999))), window));
+        // A stamp or a window that cannot be read: not accepted.
+        assert!(!created_in_window(&object, &created(None), window));
+        assert!(!created_in_window(&object, &created(Some((1_001, 0))), None));
+        // The stamp of another inode is not this object's.
+        let other = Creation { inode: 61, ..created(Some((1_001, 0))) };
+        assert!(!created_in_window(&object, &other, window));
+        // The live readers: a file created now is not before a window taken just before it.
+        let directory = tempfile::tempdir().unwrap();
+        let start = window_start().unwrap();
+        fs::write(directory.path().join("made"), b"x").unwrap();
+        let dir = fs::File::open(directory.path()).unwrap();
+        let made = creation_at(dir.as_raw_fd(), c"made").unwrap();
+        let on_disk = identity_at(&dir, c"made", Kind::File).unwrap().unwrap();
+        assert!(made.nlink == 1 && created_in_window(&on_disk, &made, Some(start)));
     }
 
     #[test]

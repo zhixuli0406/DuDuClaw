@@ -17,8 +17,11 @@
 //! data directory only what appeared after its S8 snapshot. Anything else at a
 //! ledgered path is kept and listed; the rollback then ends incomplete: the
 //! journal stays in the rollback state and the same command finishes it once
-//! the administrator resolved the listed paths. Units are stopped and disabled
-//! only when their ledgered unit file is the recorded one. It keeps the system
+//! the administrator resolved the listed paths. Units are stopped through the
+//! same quiesce as an install resume (review round 4 item 1: everything PID 1
+//! has loaded of this installation, refusing when a unit is up that is not
+//! provably ours) and disabled only when their ledgered unit file is the
+//! recorded one. It keeps the system
 //! accounts, the gateway home (root 0711 with the private `.duduclaw` and the
 //! license), the protected-mode marker (it only narrows), the bootstrap
 //! high-water record (anti-rollback, never lowered) and spawnd's SSH/cron
@@ -67,22 +70,20 @@ use super::ledger::{self, Entry, Kind, Ledger, Now, QuarantinePhase};
 use std::{ffi::{CStr, CString}, os::fd::FromRawFd};
 use duduclaw_updated::linux::{bootstrap_verify, files::Directory};
 
-/// Stop order: the gateway (then the units it binds to), the nightly
-/// requester, every socket (so nothing is re-activated), then the services.
-const STOP_ORDER: [&str; 12] = [UNIT, boot::NIGHTLY_TIMER, "duduclaw-auto-upgrade.service",
+/// The fixed units this installation may own, in stop order: the gateway
+/// (then the units it binds to), every activation source (the nightly timer,
+/// every socket — so nothing is re-activated), the services, then the slices
+/// (employees, TCB, aggregate). Review round 4 item 1: template instances,
+/// spawnd's transient runs and per-employee slices are enumerated from PID 1
+/// by `boot::quiesce_isolation` (`boot::unit_shape`), never by pattern here.
+const STOP_ORDER: [&str; 14] = [UNIT, boot::NIGHTLY_TIMER,
     "duduclaw-egress.socket", "duduclaw-dns-broker.socket", "duduclaw-parse.socket", "duduclaw-spawnd.socket",
-    "duduclaw-updated.service", "duduclaw-egress.service", "duduclaw-dns-broker.service", "duduclaw-spawnd.service",
-    "duduclaw-employees.slice"];
+    "duduclaw-auto-upgrade.service", "duduclaw-updated.service", "duduclaw-egress.service", "duduclaw-dns-broker.service",
+    "duduclaw-spawnd.service", "duduclaw-employees.slice", "duduclaw-tcb.slice", "duduclaw.slice"];
 /// The units a bootstrap run enables (S6, S8); the others have no `[Install]`.
 const ENABLED: [&str; 9] = [UNIT, boot::NIGHTLY_TIMER, "duduclaw-egress.socket", "duduclaw-dns-broker.socket",
     "duduclaw-parse.socket", "duduclaw-spawnd.socket", "duduclaw-spawnd.service", "duduclaw-egress.service",
     "duduclaw-updated.service"];
-/// Instances never have their own unit file; `systemctl stop` with a pattern
-/// (no shell involved) stops the loaded ones and succeeds when none match.
-/// Each is stopped only when the unit owning it is this transaction's.
-const INSTANCE_PATTERNS: [(&str, &str); 4] = [("duduclaw-parse@*.service", "duduclaw-parse@.service"),
-    ("duduclaw-import@*.service", "duduclaw-import@.service"), ("duduclaw-run-*.service", "duduclaw-spawnd.service"),
-    ("duduclaw-migrate-expire@*.timer", "duduclaw-migrate-expire@.timer")];
 /// Root-owned trees an install run creates (all isolation facts or below one).
 pub(super) const TREES: [&str; 9] = ["/opt/duduclaw-isolated", "/etc/duduclaw-updated", "/var/lib/duduclaw-updated",
     "/var/lib/duduclaw-spawnd", "/var/log/duduclaw-spawnd", "/usr/lib/duduclaw", "/usr/libexec/duduclaw",
@@ -157,8 +158,8 @@ pub(super) fn run(store: &Store, journal: Option<Journal>, generation: Option<&s
         marked
     };
     println!("正在回退尚未完成的隔離安裝……");
+    // Review round 4 item 1: the full process scan is part of the shared quiesce.
     stop_units(&ledger, &boot_id)?;
-    removal::processes_clear()?;
     // Review M3: runtime directories of an earlier boot, left to the system.
     let mut left: Vec<String> = Vec::new();
     for index in indices(&ledger, Kind::File) {
@@ -282,10 +283,14 @@ fn owned_unit(ledger: &Ledger, unit: &str, boot_id: &str) -> Result<bool> {
     }
 }
 
-/// Review R3 item 1: every unit this installation may own, in stop order
-/// (the gateway, the units it binds to, the nightly requester, every socket
-/// before the services, the employees' slice) — also the bootstrap's resume quiesce.
+/// Review R3 item 1: every FIXED unit this installation may own, in stop
+/// order (the gateway, the units it binds to, the nightly timer, every socket
+/// before the services, the slices) — `boot::UnitShape::Fixed`.
 pub(super) fn stop_order() -> Vec<&'static str> { with_ready_units(&STOP_ORDER) }
+
+/// Review round 4 item 1: the rollback quiesces through exactly the routine
+/// the install resume uses (`boot::quiesce_owned`), so the two cannot drift.
+pub(super) fn quiesce(control: &mut dyn boot::UnitControl) -> Result<()> { boot::quiesce_owned(control) }
 
 fn with_ready_units(units: &[&'static str]) -> Vec<&'static str> {
     // The units the gateway binds to stop right after it (none in this tree).
@@ -295,33 +300,18 @@ fn with_ready_units(units: &[&'static str]) -> Vec<&'static str> {
     ordered
 }
 
+/// Review round 4 item 1: everything PID 1 has loaded of this installation is
+/// stopped and proven down (units, template instances, transient runs and
+/// employee slices, queued jobs, product cgroups, the full process scan) by
+/// the shared [`quiesce`] — a unit up that is not provably ours refuses —
+/// then the units whose unit file is this transaction's are disabled.
 fn stop_units(ledger: &Ledger, boot_id: &str) -> Result<()> {
-    let mut stopped = Vec::new();
-    for unit in with_ready_units(&STOP_ORDER) {
-        if !owned_unit(ledger, unit, boot_id)? { continue; }
-        let output = command("systemctl", &["stop", unit])?;
-        if !output.status.success() { return Err(refused(format!("無法停止 {unit}。"))); }
-        stopped.push(unit);
-    }
+    quiesce(&mut boot::LiveUnits { ledger })?;
     for unit in with_ready_units(&ENABLED) {
         if !owned_unit(ledger, unit, boot_id)? { continue; }
         // Removes the enablement links before the unit files go.
         let output = command("systemctl", &["disable", unit])?;
         if !output.status.success() { return Err(refused(format!("無法停用 {unit}。"))); }
-    }
-    for (pattern, owner) in INSTANCE_PATTERNS {
-        if !owned_unit(ledger, owner, boot_id)? { continue; }
-        let output = command("systemctl", &["stop", pattern])?;
-        if !output.status.success() { return Err(refused("無法停止隔離服務的執行個體。")); }
-    }
-    // Read back: every unit stopped here is inactive (unknown answers refuse).
-    for unit in stopped {
-        let output = command("systemctl", &["is-active", "--quiet", unit])?;
-        match output.status.code() {
-            Some(3 | 4) => (),
-            Some(0) => return Err(refused(format!("{unit} 仍在執行。"))),
-            _ => return Err(refused("systemd 指令失敗或回應無法判讀。")),
-        }
     }
     Ok(())
 }

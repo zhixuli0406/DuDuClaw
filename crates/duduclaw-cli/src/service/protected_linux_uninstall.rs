@@ -74,10 +74,13 @@ fn mask_unit(unit: &str) -> Result<()> {
     Ok(())
 }
 
-fn service_uids() -> Result<BTreeSet<u32>> {
+fn service_uids(deadline: Option<std::time::Instant>) -> Result<BTreeSet<u32>> {
     let mut uids = BTreeSet::new();
     for name in std::iter::once("duduclaw").chain(layout::ACCOUNTS.iter().copied()) {
-        let output = command("getent", &["passwd", name])?;
+        let output = match deadline {
+            Some(deadline) => command_within("getent", &["passwd", name], deadline)?,
+            None => command("getent", &["passwd", name])?,
+        };
         if output.status.code() == Some(2) { continue; }
         if !output.status.success() { return Err(refused("無法確認服務身分。")); }
         let text = String::from_utf8(output.stdout).map_err(|_| refused("無效的帳號資料。"))?;
@@ -90,10 +93,18 @@ fn service_uids() -> Result<BTreeSet<u32>> {
     Ok(uids)
 }
 
-pub(super) fn processes_clear() -> Result<()> {
-    let uids = service_uids()?;
+pub(super) fn processes_clear() -> Result<()> { processes_clear_until(None) }
+
+/// The same scan bounded by an absolute `deadline` (v1.83 R4 item 4): every
+/// account lookup gets `min(30 s, what is left)` and no command is spawned and
+/// no `/proc` entry read once it has passed (refused).
+pub(super) fn processes_clear_until(deadline: Option<std::time::Instant>) -> Result<()> {
+    let expired = || refused("程序檢查超過時限。");
+    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) { return Err(expired()); }
+    let uids = service_uids(deadline)?;
     let mut count = 0;
     for entry in fs::read_dir("/proc")? {
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) { return Err(expired()); }
         let entry = entry?;
         let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else { continue; };
         if pid == std::process::id() { continue; }
