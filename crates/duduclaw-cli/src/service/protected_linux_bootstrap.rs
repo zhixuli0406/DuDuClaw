@@ -11,8 +11,10 @@
 //! resumes with the same command; every step is idempotent and reads back what
 //! an earlier attempt left.
 //!
-//! The journal is bound to one generation and one host (SHA-256 of
-//! `/etc/machine-id`); another generation's or host's journal is refused.
+//! The journal is bound to one generation, one host (SHA-256 of
+//! `/etc/machine-id` and the DMI product UUID or its absence, review M4) and
+//! one transaction nonce shared with the creation ledger (review H3); another
+//! generation's, host's or transaction's journal or ledger is refused.
 //! Its cursor is only a HINT (review F1): every invocation re-runs S0 and the
 //! complete, side-effect-free S1 preflight (review F6), then re-establishes
 //! every step the journal claims complete against the real host (`Steps::holds`:
@@ -113,7 +115,17 @@ const LAYOUT_TREES: [&str; 3] = ["/var/lib/duduclaw-spawnd", "/var/log/duduclaw-
 /// spawnd's root installation receipt (`duduclaw-spawnd` installed.rs, `RECEIPTS`/`installation.json`).
 const INSTALLATION_RECEIPT: &str = "/run/duduclaw-isolation-evidence/installation.json";
 const MACHINE_ID: &str = "/etc/machine-id";
+/// `/sys/class/dmi/id/product_uuid` (`/sys/class/dmi/id` is a link to this
+/// canonical sysfs directory; links are never followed). Absent without DMI.
+const PRODUCT_UUID: &str = "/sys/devices/virtual/dmi/id/product_uuid";
+const SYSFS_MAGIC: i64 = 0x6265_6572;
+/// Journal schema (review M4: 2 binds the product UUID and the transaction nonce).
+pub(super) const JOURNAL_SCHEMA: u16 = 2;
+/// Review H1: bound of spawnd's root host publication as this installer reads it.
+const MAX_PUBLICATION_BYTES: u64 = 64 * 1024;
 const READY_WAIT: Duration = Duration::from_secs(30);
+/// Review H2: polls (250 ms) while waiting for a stopped gateway to be down.
+const QUIESCE_POLLS: u32 = 120;
 
 // ── Administrator text (zh-TW; no internal state, never subprocess output) ──
 
@@ -134,7 +146,10 @@ const LICENSE_NOT_TEAM: &str = "員工隔離只支援團隊版：提供的授權
 const POLICY_REFUSED: &str = "安裝包的簽章政策沒有可用的對外連線設定，或與已驗證的政策不符。";
 const SYSTEMCTL_FAILED: &str = "systemd 指令失敗或回應無法判讀。";
 const OTHER_HOST: &str = "隔離安裝日誌屬於另一台主機（或這台主機的識別碼已改變），已停止。請勿刪除日誌；請保留現況並聯絡原廠協助人工處理。";
-const HOST_UNKNOWN: &str = "無法讀取這台主機的識別碼 /etc/machine-id（必須是 root 擁有的一般檔案）。";
+const HOST_UNKNOWN: &str = "無法讀取這台主機的識別碼：/etc/machine-id 必須是 root 擁有的一般檔案，內容為 32 位小寫十六進位且不能全為 0 或同一個字元；/sys/class/dmi/id/product_uuid 存在時必須是標準 UUID 格式。";
+const GATEWAY_NOT_OURS: &str = "續接需要重新執行平台或政策步驟，但 duduclaw-gateway.service 正在執行（或有待處理的工作），而它的單元檔無法確認是這次安裝發布的原檔案；為避免在 Gateway 運作時變更平台，已停止，未停止任何服務。請先手動停止它（sudo systemctl stop duduclaw-gateway.service）並確認來源後再續接。";
+const GATEWAY_NOT_QUIET: &str = "續接需要重新執行平台或政策步驟，但無法確認 duduclaw-gateway.service 已停止、沒有待處理的工作，且 duduclaw 帳號與員工帳號沒有任何程序；已停止。請先手動停止 Gateway 及其程序後再續接。";
+const PUBLICATION_MISMATCH: &str = "隔離執行服務的發布紀錄 /var/lib/duduclaw-spawnd/publication.json 不是這次安裝寫入的內容（必須是 root 擁有、權限 0600 的一般檔案，只含這個世代且沒有任何授權）；已停止，未覆蓋它。";
 const HOST_DNS_CHANGED: &str = "主機的 DNS 狀態（systemd-resolved 是否可用）與第一次執行時不同。請恢復原狀後續接，或先執行 duduclaw-bootstrap rollback。";
 const PUBLISHED_MISMATCH: &str = "已發布的內容與這次安裝不符。";
 const LICENSE_MODE: &str = "團隊版授權檔 license.json 的權限必須是 0600 或 0644。";
@@ -224,8 +239,12 @@ pub(super) struct Journal {
     pub(super) mode: JournalMode,
     /// The staged generation, 64 lowercase hex digits.
     pub(super) generation: String,
-    /// [`host_digest`] of the host the journal was created on (review F1).
+    /// [`host_digest`] of the host the journal was created on (review F1, M4).
     pub(super) host: String,
+    /// Review H3: this transaction's random 256-bit nonce (64 lowercase hex
+    /// digits), generated at S0 of the run that created the journal; the
+    /// creation ledger carries the same value and must match on every load.
+    pub(super) nonce: String,
     pub(super) step: Step,
     pub(super) phase: Phase,
     pub(super) started_at_unix: u64,
@@ -242,9 +261,9 @@ pub(super) fn parse_generation(text: &str) -> Option<Sha256Digest> {
 }
 
 impl Journal {
-    pub(super) fn new(generation: &str, host: &str, dns: Dns, now: u64) -> Self {
-        Self { schema_version: 1, mode: JournalMode::Install, generation: generation.to_owned(), host: host.to_owned(),
-            step: Step::HostPreflight, phase: Phase::Completed, started_at_unix: now, prior: Prior::fresh(), dns,
+    pub(super) fn new(generation: &str, host: &str, nonce: &str, dns: Dns, now: u64) -> Self {
+        Self { schema_version: JOURNAL_SCHEMA, mode: JournalMode::Install, generation: generation.to_owned(),
+            host: host.to_owned(), nonce: nonce.to_owned(), step: Step::HostPreflight, phase: Phase::Completed, started_at_unix: now, prior: Prior::fresh(), dns,
             committed: false }
     }
 
@@ -258,8 +277,9 @@ impl Journal {
 
     pub(super) fn validate(&self) -> Result<()> {
         let damaged = || refused(JOURNAL_DAMAGED);
-        if self.schema_version != 1 || parse_generation(&self.generation).is_none() || parse_generation(&self.host).is_none()
-            || self.started_at_unix == 0 {
+        // Review M4: a journal of an older schema (host bound to the machine id alone) is refused.
+        if self.schema_version != JOURNAL_SCHEMA || parse_generation(&self.generation).is_none()
+            || parse_generation(&self.host).is_none() || parse_generation(&self.nonce).is_none() || self.started_at_unix == 0 {
             return Err(damaged());
         }
         // A journal exists only from S1 completed on (it is created then).
@@ -332,22 +352,87 @@ pub(super) fn rollback_permitted(journal: &Journal, generation: Option<&str>) ->
     Ok(())
 }
 
-/// Review F1 (pure): the host binding — SHA-256 over a fixed domain and the
-/// machine id (32 lowercase hex digits, one optional trailing newline).
-pub(super) fn host_digest_of(machine_id: &str) -> Option<String> {
+/// A value made of one repeated character (all-zero included) identifies nothing.
+fn degenerate(text: &str) -> bool {
+    let mut digits = text.bytes().filter(|b| *b != b'-');
+    digits.next().is_none_or(|first| digits.all(|b| b == first))
+}
+
+/// Review M4 (pure): DMI `product_uuid` in strict 8-4-4-4-12 hex form (one
+/// optional trailing newline), lowercased. `Ok(None)`: a degenerate UUID
+/// (one repeated digit, e.g. all zero) adds nothing and is recorded as absent.
+pub(super) fn parse_product_uuid(text: &str) -> std::result::Result<Option<String>, ()> {
+    let uuid = text.strip_suffix('\n').unwrap_or(text);
+    let shape = uuid.len() == 36 && uuid.bytes().enumerate().all(|(index, b)| match index {
+        8 | 13 | 18 | 23 => b == b'-',
+        _ => b.is_ascii_hexdigit(),
+    });
+    if !shape { return Err(()); }
+    if degenerate(uuid) { return Ok(None); }
+    Ok(Some(uuid.to_ascii_lowercase()))
+}
+
+/// Review F1/M4 (pure): the host binding — SHA-256 over a fixed domain, the
+/// machine id (32 lowercase hex digits, one optional trailing newline, never
+/// all-zero or one repeated digit) and the DMI product UUID or the explicit
+/// fact that the platform has none, so a resume where it appears or vanishes
+/// is another host.
+///
+/// Limit: a clone that preserves BOTH identifiers (a copied disk image with
+/// `/etc/machine-id` kept, on a hypervisor that copies or does not provide the
+/// DMI UUID) is indistinguishable from the original; that is outside what the
+/// installer can detect.
+pub(super) fn host_digest_of(machine_id: &str, product_uuid: Option<&str>) -> Option<String> {
     use sha2::{Digest, Sha256};
     let id = machine_id.strip_suffix('\n').unwrap_or(machine_id);
-    if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) { return None; }
+    if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) || degenerate(id) {
+        return None;
+    }
+    let uuid = match product_uuid {
+        Some(text) => parse_product_uuid(text).ok()?,
+        None => None,
+    };
     let mut hash = Sha256::new();
-    hash.update(b"duduclaw-isolation-bootstrap-host-v1\0");
+    hash.update(b"duduclaw-isolation-bootstrap-host-v2\0machine-id\0");
     hash.update(id.as_bytes());
+    match uuid {
+        Some(uuid) => { hash.update(b"\0product-uuid\0"); hash.update(uuid.as_bytes()); }
+        None => hash.update(b"\0product-uuid-absent\0"),
+    }
     Some(hex::encode(hash.finalize()))
 }
 
-/// This host's binding, from the root-owned `/etc/machine-id` (never followed as a link).
+/// The DMI product UUID when the platform has one (read from the kernel's
+/// sysfs only, root-owned, bounded, never through a link). Absent = `None`.
+fn product_uuid() -> Result<Option<String>> {
+    if statfs_type(c"/sys") != Some(SYSFS_MAGIC) { return Err(refused(HOST_UNKNOWN)); }
+    if !exists(PRODUCT_UUID).map_err(|_| refused(HOST_UNKNOWN))? { return Ok(None); }
+    read_root_text(PRODUCT_UUID, 4096).map_err(|_| refused(HOST_UNKNOWN))
+}
+
+/// This host's binding, from the root-owned `/etc/machine-id` and the DMI
+/// product UUID (neither followed as a link).
 pub(super) fn host_digest() -> Result<String> {
     let text = read_root_text(MACHINE_ID, 64).map_err(|_| refused(HOST_UNKNOWN))?.ok_or_else(|| refused(HOST_UNKNOWN))?;
-    host_digest_of(&text).ok_or_else(|| refused(HOST_UNKNOWN))
+    let uuid = product_uuid()?;
+    host_digest_of(&text, uuid.as_deref()).ok_or_else(|| refused(HOST_UNKNOWN))
+}
+
+/// `bytes` bytes from the kernel's CSPRNG (`getrandom(2)`), lowercase hex.
+pub(super) fn random_hex(bytes: usize) -> Result<String> {
+    let mut buffer = vec![0u8; bytes];
+    let mut filled = 0;
+    while filled < bytes {
+        let rest = buffer.get_mut(filled..).ok_or_else(|| refused("無法取得隨機數。"))?;
+        // SAFETY: writes at most `rest.len()` bytes into the live buffer.
+        let count = unsafe { libc::getrandom(rest.as_mut_ptr().cast(), rest.len(), 0) };
+        if count < 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) { continue; }
+            return Err(refused("無法取得隨機數。"));
+        }
+        filled += count as usize;
+    }
+    Ok(hex::encode(buffer))
 }
 
 /// Review F1 (pure): a journal continues only on its own host, for its own
@@ -506,7 +591,8 @@ impl ContinueOptions {
 /// re-checks the host with the journal's DNS choices (omitted options reuse
 /// them, given ones must equal them) and its decision must still be the
 /// recorded one. Returns the journal and whether it is new (to be written).
-pub(super) fn begin(journal: Option<Journal>, options: &ContinueOptions, host: &str, now: u64,
+/// `nonce` (review H3, generated at S0) is used only for a new journal.
+pub(super) fn begin(journal: Option<Journal>, options: &ContinueOptions, host: &str, nonce: &str, now: u64,
     preflight: impl FnOnce(Option<SocketAddr>, &[IpAddr]) -> Result<Dns>) -> Result<(Journal, bool)> {
     match journal {
         Some(journal) => {
@@ -517,7 +603,7 @@ pub(super) fn begin(journal: Option<Journal>, options: &ContinueOptions, host: &
         }
         None => {
             let dns = preflight(options.dns_upstream, &options.host_public_addresses)?;
-            Ok((Journal::new(&options.generation_hex, host, dns, now), true))
+            Ok((Journal::new(&options.generation_hex, host, nonce, dns, now), true))
         }
     }
 }
@@ -603,24 +689,34 @@ fn continue_with(options: ContinueOptions, verify_self: bool) -> Result<()> {
     }
     // S0 Verified: every run re-verifies the stage (R1) and that this program is its gateway.
     let stage = verified_stage(&options, verify_self)?;
+    // Review H3: a new transaction's nonce, generated at S0 (used only when no journal exists).
+    let nonce = random_hex(32)?;
     // Review F1: the journal belongs to this generation and this host.
     let host = host_digest()?;
     if let Some(journal) = &journal { bound_to(journal, &options.generation_hex, &host)?; }
-    // A ledger exists only beside a journal (created after it, removed before it).
+    // A ledger exists only beside a journal (created after it, removed before
+    // it) and only of the same transaction (generation and nonce, review H3).
     let ours = ledger::read(&store)?;
-    if journal.is_none() && ours.is_some() { return Err(refused(ledger::LEDGER_DAMAGED)); }
+    match (&journal, &ours) {
+        (None, Some(_)) => return Err(refused(ledger::LEDGER_DAMAGED)),
+        (Some(journal), Some(ours)) => ledger::belongs_to(ours, &journal.generation, &journal.nonce)?,
+        _ => (),
+    }
     // S1 HostPreflight on every invocation (review F6): no side effect; what
     // this transaction already created (per its ledger) is not "residue".
-    let (mut journal, fresh) = begin(journal, &options, &host, now()?,
+    let (mut journal, fresh) = begin(journal, &options, &host, &nonce, now()?,
         |upstream, hosts| preflight(upstream, hosts, &stage, ours.as_ref()))?;
     if fresh { store.write(None, &journal)?; }
     println!("[完成] S1 {}", Step::HostPreflight.label());
-    let recorder = LiveRecorder::open_live(&options.generation_hex)?;
+    let recorder = LiveRecorder::open_live(&options.generation_hex, &journal.nonce)?;
     let mut context = Context { generation: options.generation, generation_hex: options.generation_hex.clone(),
         stage, enable_now: options.enable_now, recorder };
     let dns = journal.dns.clone();
+    // S3's check after this transaction started its isolation services (S6
+    // entered) admits their own processes (`processes_quiet`).
+    let services_started = journal.step >= Step::StartServices;
     let result = {
-        let mut live = Live { context: &mut context, dns: &dns };
+        let mut live = Live { context: &mut context, dns: &dns, services_started };
         drive(&mut journal, &mut live, &mut |previous: &Journal, next: &Journal| store.write(Some(previous), next), Step::Commit)
     };
     if let Err(error) = result {
@@ -690,6 +786,45 @@ pub(super) trait Steps {
     /// The step's invariants hold on the host now (never the journal's word).
     fn holds(&mut self, step: Step) -> Result<bool>;
     fn perform(&mut self, step: Step) -> Result<()>;
+    /// Review H2: bring the gateway down before platform or policy steps re-run
+    /// ([`quiesce_gateway`]); refuses when that cannot be proven.
+    fn quiesce_gateway(&mut self) -> Result<()>;
+    /// Review H2: S2/S3 as plain checks — no gateway running, no gateway or
+    /// employee process — never accepting a running published gateway.
+    fn quiet(&mut self, step: Step) -> Result<bool>;
+}
+
+/// Review H2: what quiescing the gateway needs from the host (test seam).
+pub(super) trait GatewayControl {
+    /// `(down, job_pending)`: down = ActiveState inactive or failed.
+    fn state(&mut self) -> Result<(bool, bool)>;
+    /// The gateway unit is loaded from the unit file this transaction
+    /// published, whose identity equals its ledger entry (no drop-ins).
+    fn unit_is_ours(&mut self) -> Result<bool>;
+    fn stop(&mut self) -> Result<()>;
+    /// Any process of the gateway account remains.
+    fn account_has_processes(&mut self) -> Result<bool>;
+    fn pause(&mut self);
+}
+
+/// Review H2 (pure over the seam): a gateway that is up or has a pending job
+/// is stopped only when its unit is provably this transaction's; then it
+/// must be down with no job and the gateway account without any process
+/// within `polls` waits. Anything else refuses with a fixed message.
+pub(super) fn quiesce_gateway(control: &mut dyn GatewayControl, polls: u32) -> Result<()> {
+    let (down, pending) = control.state()?;
+    let stopped = !down || pending;
+    if stopped {
+        if !control.unit_is_ours()? { return Err(refused(GATEWAY_NOT_OURS)); }
+        control.stop().map_err(|_| refused(GATEWAY_NOT_QUIET))?;
+    }
+    let polls = if stopped { polls } else { 0 };
+    for attempt in 0..=polls {
+        let (down, pending) = control.state()?;
+        if down && !pending && !control.account_has_processes()? { return Ok(()); }
+        if attempt < polls { control.pause(); }
+    }
+    Err(refused(GATEWAY_NOT_QUIET))
 }
 
 /// The last step after S1 the journal claims complete, if any.
@@ -707,15 +842,30 @@ fn claimed_complete(journal: &Journal) -> Option<Step> {
 /// step and every later claimed step are re-run (their own checks were made
 /// against a state that no longer holds). S2/S3 are pure checks, so re-running
 /// them refuses rather than changes anything; S4–S8 are idempotent.
+///
+/// Review H2: S2/S3 hold while the gateway this transaction published at S8
+/// runs. When the first step that does not hold is one of S4–S7, that gateway
+/// is quiesced FIRST (stopped only when its unit is provably ours) and S2/S3
+/// must then hold as plain checks; only then do the steps re-run, S8 among
+/// them when claimed (its completion is no longer trusted), or next in order.
 pub(super) fn reestablish(steps: &mut dyn Steps, journal: &Journal) -> Result<()> {
     let Some(last) = claimed_complete(journal) else { return Ok(()) };
-    let mut rerun = false;
-    for step in Step::ORDER.iter().copied().filter(|step| *step >= Step::StopGateway && *step <= last && *step != Step::Commit) {
-        if !rerun && steps.holds(step)? { continue; }
-        if !rerun {
-            println!("[重新建立] 日誌記錄 S{} {} 已完成，但主機現況不符；從這一步重新執行。", step.number(), step.label());
+    let claimed: Vec<Step> = Step::ORDER.iter().copied()
+        .filter(|step| *step >= Step::StopGateway && *step <= last && *step != Step::Commit).collect();
+    let mut first = None;
+    for step in claimed.iter().copied() {
+        if !steps.holds(step)? { first = Some(step); break; }
+    }
+    let Some(first) = first else { return Ok(()) };
+    println!("[重新建立] 日誌記錄 S{} {} 已完成，但主機現況不符；從這一步重新執行。", first.number(), first.label());
+    if (Step::PublishPlatform..=Step::Readiness).contains(&first) {
+        println!("[重新建立] 重新執行平台步驟前，先停止 Gateway。");
+        steps.quiesce_gateway()?;
+        for step in [Step::StopGateway, Step::ProcessesClear] {
+            if !steps.quiet(step)? { return Err(refused(GATEWAY_NOT_QUIET)); }
         }
-        rerun = true;
+    }
+    for step in claimed.into_iter().filter(|step| *step >= first) {
         steps.perform(step)?;
         println!("[完成] S{} {}", step.number(), step.label());
     }
@@ -757,18 +907,120 @@ pub(super) fn drive(journal: &mut Journal, steps: &mut dyn Steps, write: &mut dy
     run_steps(journal, steps, write, through)
 }
 
-struct Live<'a> { context: &'a mut Context, dns: &'a Dns }
+struct Live<'a> { context: &'a mut Context, dns: &'a Dns, services_started: bool }
 
 impl Steps for Live<'_> {
-    fn holds(&mut self, step: Step) -> Result<bool> { Ok(invariants(step, &*self.context, self.dns).is_ok()) }
-    fn perform(&mut self, step: Step) -> Result<()> { perform(step, &mut *self.context, self.dns) }
+    fn holds(&mut self, step: Step) -> Result<bool> {
+        Ok(invariants(step, &*self.context, self.dns, self.services_started).is_ok())
+    }
+    fn perform(&mut self, step: Step) -> Result<()> { perform(step, &mut *self.context, self.dns, self.services_started) }
+    fn quiesce_gateway(&mut self) -> Result<()> {
+        let ledger = self.context.recorder.ledger();
+        with_version_lock(|| quiesce_gateway(&mut LiveGateway { ledger }, QUIESCE_POLLS))
+    }
+    fn quiet(&mut self, step: Step) -> Result<bool> {
+        match step {
+            Step::StopGateway => with_version_lock(|| Ok(gateway_not_running().is_ok())),
+            Step::ProcessesClear => with_version_lock(|| Ok(processes_quiet(self.services_started).is_ok())),
+            _ => Err(refused(JOURNAL_DAMAGED)),
+        }
+    }
 }
 
-fn perform(step: Step, context: &mut Context, dns: &Dns) -> Result<()> {
+/// Review H2: the live gateway unit and account.
+struct LiveGateway<'a> { ledger: &'a ledger::Ledger }
+
+impl GatewayControl for LiveGateway<'_> {
+    fn state(&mut self) -> Result<(bool, bool)> {
+        let output = command("systemctl", &["show", UNIT, "--property=ActiveState"])?;
+        if !output.status.success() { return Err(refused(SYSTEMCTL_FAILED)); }
+        let text = String::from_utf8(output.stdout).map_err(|_| refused(SYSTEMCTL_FAILED))?;
+        let down = match text.trim_end_matches('\n').strip_prefix("ActiveState=") {
+            Some("inactive" | "failed") => true,
+            Some(state) if !state.is_empty() && state.bytes().all(|b| b.is_ascii_lowercase() || b == b'-') => false,
+            _ => return Err(refused(SYSTEMCTL_FAILED)),
+        };
+        // `--no-legend` prints nothing at all when no job matches.
+        let jobs = command("systemctl", &["list-jobs", "--no-legend", "--plain", UNIT])?;
+        if !jobs.status.success() { return Err(refused(SYSTEMCTL_FAILED)); }
+        let jobs = String::from_utf8(jobs.stdout).map_err(|_| refused(SYSTEMCTL_FAILED))?;
+        Ok((down, !jobs.trim().is_empty()))
+    }
+    fn unit_is_ours(&mut self) -> Result<bool> {
+        let Some(entry) = self.ledger.entry(UNIT_PATH) else { return Ok(false) };
+        if !ledger::present(UNIT_PATH)? { return Ok(false); }
+        let (directory, name) = ledger::open_parent(UNIT_PATH)?;
+        if ledger::classify_at(&directory, &name, entry, &ledger::boot_id()?)? != ledger::Now::Recorded { return Ok(false); }
+        let output = command("systemctl", &["show", UNIT, "--property=FragmentPath,DropInPaths"])?;
+        if !output.status.success() { return Ok(false); }
+        let text = String::from_utf8(output.stdout).map_err(|_| refused(SYSTEMCTL_FAILED))?;
+        let mut fields: Vec<&str> = text.lines().collect();
+        fields.sort_unstable();
+        let fragment = format!("FragmentPath={UNIT_PATH}");
+        Ok(fields == ["DropInPaths=", fragment.as_str()])
+    }
+    fn stop(&mut self) -> Result<()> {
+        let output = command("systemctl", &["stop", UNIT])?;
+        if !output.status.success() { return Err(refused(format!("無法停止 {UNIT}。"))); }
+        Ok(())
+    }
+    fn account_has_processes(&mut self) -> Result<bool> {
+        let Some(gateway) = passwd_entry("duduclaw")? else { return Ok(false) };
+        uid_processes(|uid| uid == gateway.uid)
+    }
+    fn pause(&mut self) { std::thread::sleep(Duration::from_millis(250)); }
+}
+
+/// Any live process with a real, effective, saved or filesystem uid `matches` accepts.
+fn uid_processes(matches: impl Fn(u32) -> bool) -> Result<bool> {
+    let mut count = 0usize;
+    for entry in fs::read_dir("/proc")? {
+        let entry = entry?;
+        let Some(pid) = entry.file_name().to_str().and_then(|name| name.parse::<u32>().ok()) else { continue };
+        if pid == std::process::id() { continue; }
+        count += 1;
+        if count > 100_000 { return Err(refused("程序檢查超過上限。")); }
+        let mut status = String::new();
+        let read = fs::File::open(entry.path().join("status"))
+            .and_then(|file| file.take(64 * 1024).read_to_string(&mut status));
+        match read {
+            Ok(_) => (),
+            // The process exited meanwhile.
+            Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => continue,
+            Err(error) => return Err(error.into()),
+        }
+        let Some(line) = status.lines().find_map(|line| line.strip_prefix("Uid:")) else {
+            // A process that exited while being read has an empty status.
+            if status.is_empty() { continue; }
+            return Err(refused("無法確認程序身分。"));
+        };
+        let ids = line.split_whitespace().map(str::parse::<u32>).collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| refused("無效的程序身分。"))?;
+        if ids.len() != 4 { return Err(refused("無效的程序身分。")); }
+        if ids.into_iter().any(&matches) { return Ok(true); }
+    }
+    Ok(false)
+}
+
+/// Plan S3. Before this transaction started its isolation services, nothing
+/// of DuDuClaw may run (`processes_clear`). From S6 on, those services are
+/// this transaction's own (S6's invariants check them); the gateway account
+/// and the employee range must still have no process.
+fn processes_quiet(services_started: bool) -> Result<()> {
+    if !services_started { return super::removal::processes_clear(); }
+    let gateway = passwd_entry("duduclaw")?.map(|entry| entry.uid);
+    let employees = duduclaw_isolation::ids::EMPLOYEE_UID_MIN..=duduclaw_isolation::ids::EMPLOYEE_UID_MAX;
+    if uid_processes(|uid| Some(uid) == gateway || employees.contains(&uid))? {
+        return Err(refused("仍有 Gateway 或員工程序在執行。"));
+    }
+    Ok(())
+}
+
+fn perform(step: Step, context: &mut Context, dns: &Dns, services_started: bool) -> Result<()> {
     match step {
         Step::Verified | Step::HostPreflight | Step::Rollback => Err(refused(JOURNAL_DAMAGED)),
         Step::StopGateway => with_version_lock(gateway_not_running),
-        Step::ProcessesClear => with_version_lock(super::removal::processes_clear),
+        Step::ProcessesClear => with_version_lock(|| processes_quiet(services_started)),
         Step::PublishPlatform => publish_platform(context),
         Step::DnsPolicy => with_version_lock(|| dns_policy(context, dns)),
         Step::StartServices => with_version_lock(|| start_services(context, dns)),
@@ -783,12 +1035,13 @@ fn perform(step: Step, context: &mut Context, dns: &Dns) -> Result<()> {
 }
 
 /// Review F1: the read-only invariants of each step on the real host.
-fn invariants(step: Step, context: &Context, dns: &Dns) -> Result<()> {
+fn invariants(step: Step, context: &Context, dns: &Dns, services_started: bool) -> Result<()> {
     match step {
-        // A gateway may run only as the one this transaction published at S8.
+        // A gateway may run only as the one this transaction published at S8
+        // (and is quiesced before any S4–S7 step re-runs, review H2).
         Step::StopGateway => with_version_lock(|| if gateway_not_running().is_ok() { Ok(()) } else { gateway_published(context) }),
         Step::ProcessesClear => with_version_lock(|| {
-            if gateway_active() && gateway_published(context).is_ok() { Ok(()) } else { super::removal::processes_clear() }
+            if gateway_active() && gateway_published(context).is_ok() { Ok(()) } else { processes_quiet(services_started) }
         }),
         Step::PublishPlatform => with_version_lock(|| platform_published(context)),
         Step::DnsPolicy => with_version_lock(|| dns_readback(context, dns)),
@@ -893,13 +1146,77 @@ pub(super) fn enumeration_overlap(text: &str) -> bool {
     text.lines().any(|line| line.split(':').nth(2).is_some_and(|id| id.parse::<u32>().is_ok_and(|id| range.contains(&id))))
 }
 
-/// The passwd/group lines of nsswitch.conf name an external account source.
-pub(super) fn external_nss(nsswitch: &str) -> bool {
-    nsswitch.lines().map(|line| line.split('#').next().unwrap_or("")).any(|line| {
-        let mut words = line.split_whitespace();
-        matches!(words.next(), Some("passwd:" | "group:" | "shadow:"))
-            && words.any(|source| matches!(source, "ldap" | "sss" | "winbind" | "nis" | "nisplus" | "hesiod"))
-    })
+/// Review M2: why nsswitch.conf is not acceptable.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum NssProblem {
+    /// An external account source the code names (LDAP, SSSD, NIS, …).
+    External,
+    /// A source the code does not classify, or `compat` whose `*_compat` line reads more than files.
+    Unknown(String),
+    /// An unterminated `[ … ]` action item.
+    Malformed,
+}
+
+/// Account sources the installer classifies as local.
+const NSS_LOCAL: [&str; 2] = ["files", "systemd"];
+const NSS_EXTERNAL: [&str; 6] = ["ldap", "sss", "winbind", "nis", "nisplus", "hesiod"];
+
+/// One nsswitch.conf line (comment removed) as `(database, sources)`; the
+/// `[STATUS=action …]` items are parsed and dropped, never taken as sources.
+fn nss_line(line: &str) -> std::result::Result<Option<(&str, Vec<&str>)>, NssProblem> {
+    let Some((database, rest)) = line.split_once(':') else { return Ok(None) };
+    let mut sources = Vec::new();
+    let mut rest = rest.trim_start();
+    while !rest.is_empty() {
+        if let Some(action) = rest.strip_prefix('[') {
+            let (_, after) = action.split_once(']').ok_or(NssProblem::Malformed)?;
+            rest = after.trim_start();
+            continue;
+        }
+        let end = rest.find(|c: char| c.is_whitespace() || c == '[').unwrap_or(rest.len());
+        let (source, after) = rest.split_at(end);
+        sources.push(source);
+        rest = after.trim_start();
+    }
+    Ok(Some((database.trim(), sources)))
+}
+
+/// Review M2 (pure): allowlist semantics for the `passwd`, `group`, `shadow`
+/// and `initgroups` databases. `files` and `systemd` are local; the external
+/// sources the code names refuse as before; `compat` is local only when the
+/// corresponding `passwd_compat` / `group_compat` / `shadow_compat` line is
+/// absent or lists only `files`; every other source refuses by name.
+pub(super) fn nss_verdict(nsswitch: &str) -> std::result::Result<(), NssProblem> {
+    let mut lines = Vec::new();
+    for line in nsswitch.lines() {
+        if let Some(parsed) = nss_line(line.split('#').next().unwrap_or(""))? { lines.push(parsed); }
+    }
+    // What `compat` reads besides the local file: the `<database>_compat` line.
+    let compat_reads = |database: &str| -> std::result::Result<(), NssProblem> {
+        let name = format!("{database}_compat");
+        for (_, sources) in lines.iter().filter(|(line, _)| *line == name) {
+            if sources.is_empty() { return Err(NssProblem::Unknown("compat".into())); }
+            for source in sources {
+                if *source == "files" { continue; }
+                if NSS_EXTERNAL.contains(source) { return Err(NssProblem::External); }
+                return Err(NssProblem::Unknown((*source).to_owned()));
+            }
+        }
+        Ok(())
+    };
+    for (database, sources) in &lines {
+        let compat = match *database {
+            "passwd" => "passwd", "shadow" => "shadow", "group" | "initgroups" => "group",
+            _ => continue,
+        };
+        for source in sources {
+            if NSS_LOCAL.contains(source) { continue; }
+            if NSS_EXTERNAL.contains(source) { return Err(NssProblem::External); }
+            if *source == "compat" { compat_reads(compat)?; continue; }
+            return Err(NssProblem::Unknown((*source).to_owned()));
+        }
+    }
+    Ok(())
 }
 
 /// sshd's main configuration includes the drop-in directory spawnd writes.
@@ -1081,7 +1398,7 @@ fn preflight(upstream: Option<SocketAddr>, hosts: &[IpAddr], stage: &StageReceip
             .and_then(|output| String::from_utf8(output.stdout).ok()).map(|text| enumeration_overlap(&text));
         if overlap != Some(false) { fail("已有帳號或群組使用員工專用範圍 70000–99999，或無法列出帳號。"); }
     }
-    if let Err(message) = nss_clear() { fail(message); }
+    if let Err(message) = nss_clear() { fail(&message); }
     if let Err(message) = sshd_clear() { fail(message); }
     for path in ["/etc/cron.allow", "/etc/at.allow"] {
         match read_root_text(path, 1024 * 1024) {
@@ -1124,12 +1441,19 @@ fn resolved_available() -> bool {
             .is_ok_and(|output| output.status.success())
 }
 
-fn nss_clear() -> std::result::Result<(), &'static str> {
-    match read_root_text("/etc/nsswitch.conf", 256 * 1024) {
-        Ok(Some(text)) if external_nss(&text) =>
-            Err("偵測到外部帳號服務（LDAP／SSSD 等）。本版安裝程式不支援這類主機：外部帳號服務必須先永久保留員工 uid 範圍 70000–99999，並由原廠協助確認。"),
-        Ok(_) => Ok(()),
-        Err(_) => Err("無法讀取 /etc/nsswitch.conf。"),
+fn nss_clear() -> std::result::Result<(), String> {
+    let text = match read_root_text("/etc/nsswitch.conf", 256 * 1024) {
+        Ok(Some(text)) => text,
+        Ok(None) => return Ok(()),
+        Err(_) => return Err("無法讀取 /etc/nsswitch.conf。".into()),
+    };
+    match nss_verdict(&text) {
+        Ok(()) => Ok(()),
+        Err(NssProblem::External) =>
+            Err("偵測到外部帳號服務（LDAP／SSSD 等）。本版安裝程式不支援這類主機：外部帳號服務必須先永久保留員工 uid 範圍 70000–99999，並由原廠協助確認。".into()),
+        Err(NssProblem::Unknown(source)) => Err(format!(
+            "/etc/nsswitch.conf 的帳號資料庫（passwd、group、shadow、initgroups）使用了安裝程式無法判定的來源「{source}」；只接受 files、systemd，以及對應 *_compat 設定不存在或只有 files 的 compat。請先移除該來源，或聯絡原廠確認。")),
+        Err(NssProblem::Malformed) => Err("/etc/nsswitch.conf 的動作設定（[ … ]）格式不完整，無法判定帳號資料來源。".into()),
     }
 }
 
@@ -1420,7 +1744,19 @@ fn ensure_directory(path: &str, mode: u32) -> Result<()> {
 
 fn unit_file(name: &str) -> String { format!("/etc/systemd/system/{name}") }
 
+/// Review L1: `install_isolation_support_for` re-applies `layout::DIRECTORIES`
+/// modes, some to directories this transaction created and ledgered (the
+/// trust trees of R1's publish among them). Exactly that transition — the
+/// same object with the layout's permission bits — is re-recorded durably;
+/// any other change stays a different identity. Also run first on a re-run,
+/// for a run interrupted between the chmod and its re-record.
+fn rerecord_layout_modes(recorder: &mut LiveRecorder) -> Result<()> {
+    for (path, mode) in layout::DIRECTORIES { recorder.rerecord_mode(path, *mode)?; }
+    Ok(())
+}
+
 fn publish_platform(context: &mut Context) -> Result<()> {
+    rerecord_layout_modes(&mut context.recorder)?;
     // (a) Trust root, state, slot A, generation and `current` (R1). Called
     // WITHOUT the version lock: publish takes stage lock → version-lock →
     // update.lock itself (see LOCK ORDER above). Re-entrant. The trees it
@@ -1467,6 +1803,7 @@ fn publish_platform(context: &mut Context) -> Result<()> {
             parse_runtime_tree(true)?;
             install_isolation_support_for(gateway, &defs)
         })?;
+        rerecord_layout_modes(recorder)?;
         // Check point 2 for the helper accounts (check point 3: S6, before they run).
         verify_identities(&service_names())?;
         spawnd_anchors(digest)?;
@@ -1782,6 +2119,67 @@ fn install_license((uid, gid): (u32, u32)) -> Result<()> {
     Ok(())
 }
 
+/// Review H1: spawnd's root host publication `publication.json`. Its consumer
+/// type (`duduclaw-spawnd` installed.rs `HostPublication`) is private to
+/// spawnd, so it is mirrored here with the same three fields and
+/// `deny_unknown_fields` (pinned by `spawnd_publication_field_set_is_pinned`).
+/// Entitlements are only ever compared with the empty list this install
+/// writes, so their records stay untyped JSON here.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct HostPublication {
+    pub(super) version: u16,
+    pub(super) generation: Sha256Digest,
+    pub(super) entitlements: Vec<serde_json::Value>,
+}
+
+impl HostPublication {
+    /// Exactly what this install publishes: version 1, this generation, no entitlement.
+    pub(super) fn expected(generation: Sha256Digest) -> Self {
+        Self { version: 1, generation, entitlements: Vec::new() }
+    }
+}
+
+/// Review H1: the publication below `directory`, read strictly: opened
+/// without following a link, a regular file with one link owned by
+/// `owner` (root:root in production), mode exactly 0600, bounded, parsed with
+/// `deny_unknown_fields`. `Ok(None)`: absent; anything else unreadable refuses.
+pub(super) fn read_publication_at(directory: &fs::File, (uid, gid): (u32, u32)) -> Result<Option<HostPublication>> {
+    let mismatch = || refused(PUBLICATION_MISMATCH);
+    // SAFETY: live dirfd and a NUL-terminated single-component name.
+    let fd = unsafe { libc::openat(directory.as_raw_fd(), c"publication.json".as_ptr(),
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC) };
+    if fd < 0 {
+        if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) { return Ok(None); }
+        return Err(mismatch());
+    }
+    // SAFETY: a fresh descriptor owned here.
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.nlink() != 1 || metadata.uid() != uid || metadata.gid() != gid
+        || metadata.mode() & 0o7777 != 0o600 || metadata.len() > MAX_PUBLICATION_BYTES {
+        return Err(mismatch());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_PUBLICATION_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_PUBLICATION_BYTES { return Err(mismatch()); }
+    serde_json::from_slice(&bytes).map(Some).map_err(|_| mismatch())
+}
+
+/// Review H1: S4 holds for the publication only when it is, field for field,
+/// what this install publishes.
+pub(super) fn publication_holds(directory: &fs::File, owner: (u32, u32), generation: Sha256Digest) -> bool {
+    matches!(read_publication_at(directory, owner), Ok(Some(publication)) if publication == HostPublication::expected(generation))
+}
+
+/// `/var/lib/duduclaw-spawnd` as a no-follow dirfd after its ancestors and itself were checked.
+fn spawnd_root_fd() -> Result<fs::File> {
+    let root = Path::new(SPAWND_ROOT);
+    parents(root)?;
+    trusted(root, true)?;
+    Ok(fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(root)?)
+}
+
 /// spawnd's root anchors and its root-only host publication (no entitlement
 /// yet: employees are confirmed later through spawnd's own RPC).
 fn spawnd_anchors(digest: Sha256Digest) -> Result<()> {
@@ -1797,18 +2195,16 @@ fn spawnd_anchors(digest: Sha256Digest) -> Result<()> {
             return Err(refused("隔離執行服務的目錄權限不符。"));
         }
     }
-    let expected = serde_json::json!({ "version": 1, "generation": digest, "entitlements": [] });
-    match root.bytes(SPAWND_PUBLICATION, 1024 * 1024) {
-        Ok(bytes) => {
-            let existing: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| refused("隔離執行服務的發布紀錄不符。"))?;
-            if existing.get("version") != expected.get("version") || existing.get("generation") != expected.get("generation") {
-                return Err(refused("隔離執行服務的發布紀錄屬於其他世代。"));
-            }
-        }
-        Err(error) if update_missing(&error) =>
-            root.atomic_json(SPAWND_PUBLICATION, &expected).map_err(|_| refused("無法寫入隔離執行服務的發布紀錄。"))?,
-        Err(_) => return Err(refused("隔離執行服務的發布紀錄不符。")),
+    // Review H1: an existing publication must be exactly this install's (never
+    // overwritten); an absent one is written (root 0600) and read back.
+    let expected = HostPublication::expected(digest);
+    let directory = spawnd_root_fd()?;
+    match read_publication_at(&directory, (0, 0))? {
+        Some(existing) if existing == expected => (),
+        Some(_) => return Err(refused(PUBLICATION_MISMATCH)),
+        None => root.atomic_json(SPAWND_PUBLICATION, &expected).map_err(|_| refused("無法寫入隔離執行服務的發布紀錄。"))?,
     }
+    if !publication_holds(&directory, (0, 0), digest) { return Err(refused(PUBLICATION_MISMATCH)); }
     Ok(())
 }
 
@@ -1998,16 +2394,23 @@ fn start_services(context: &mut Context, dns: &Dns) -> Result<()> {
     let gateway = passwd_entry("duduclaw")?.ok_or_else(|| refused("無法查詢服務帳號。"))?;
     // systemd creates spawnd's runtime directory: ledgered before it can exist.
     context.recorder.intend(&[(SPAWND_RUNTIME, Kind::Tree)])?;
-    for unit in started_units(dns) {
-        enable_now(unit)?;
-        if unit == "duduclaw-spawnd.service" && !wait_for(READY_WAIT, || spawnd_evidence_valid(gateway.gid)) {
-            return Err(refused("隔離執行服務未在 30 秒內發布有效的主機證據。"));
+    let generation = context.generation;
+    let started = (|| -> Result<()> {
+        for unit in started_units(dns) {
+            enable_now(unit)?;
+            if unit == "duduclaw-spawnd.service" && !wait_for(READY_WAIT, || spawnd_evidence_valid(gateway.gid)) {
+                return Err(refused("隔離執行服務未在 30 秒內發布有效的主機證據。"));
+            }
+            if unit == "duduclaw-updated.service" && !wait_for(READY_WAIT, || updater_reports(generation)) {
+                return Err(refused("更新服務未在 30 秒內回報與安裝相同的世代。"));
+            }
         }
-        if unit == "duduclaw-updated.service" && !wait_for(READY_WAIT, || updater_reports(context.generation)) {
-            return Err(refused("更新服務未在 30 秒內回報與安裝相同的世代。"));
-        }
-    }
+        Ok(())
+    })();
+    // Review H3: the identity is recorded even when a later unit failed, so a
+    // resume never finds this transaction's runtime directory without one.
     context.recorder.confirm(&[SPAWND_RUNTIME])?;
+    started?;
     // Q11: the nightly update requester is enabled after install.
     enable_now(NIGHTLY_TIMER)
 }
@@ -2068,12 +2471,12 @@ fn platform_published(context: &Context) -> Result<()> {
     parse_runtime_tree(false)?;
     let spawnd = Directory::open(Path::new(SPAWND_ROOT)).map_err(|_| mismatch())?;
     for name in SPAWND_ANCHORS { spawnd.child(name).map_err(|_| mismatch())?; }
-    let publication: serde_json::Value = serde_json::from_slice(&spawnd.bytes(SPAWND_PUBLICATION, 1024 * 1024)
-        .map_err(|_| mismatch())?).map_err(|_| mismatch())?;
-    if publication.get("generation") != Some(&serde_json::json!(context.generation)) { return Err(mismatch()); }
+    // Review H1: every field equal to what this install publishes (no entitlement).
+    if !publication_holds(&spawnd_root_fd()?, (0, 0), context.generation) { return Err(mismatch()); }
     text_installed(NIGHTLY_HELPER, 0o755, NIGHTLY_HELPER_TEXT)?;
     for (name, text) in NIGHTLY_UNITS { text_installed(&unit_file(name), 0o644, text)?; }
-    // A creation whose identity was never recorded (interrupted) is re-run so it is.
+    // A creation whose identity was never recorded (interrupted) does not
+    // hold; the re-run's intent then refuses it by path (review H3: never adopted).
     for entry in &context.recorder.ledger().entries {
         if entry.state == ledger::State::Intent && ledger::present(&entry.path)? && entry.path != duduclaw_core::root_key::KEY_PATH {
             return Err(mismatch());
@@ -2172,16 +2575,18 @@ mod tests {
             host_public_addresses: vec!["203.0.113.7".parse().unwrap()] }
     }
     fn host() -> String { "ef".repeat(32) }
-    fn journal() -> Journal { Journal::new(&"ab".repeat(32), &host(), broker_dns(), 100) }
+    fn nonce() -> String { "5a".repeat(32) }
+    fn journal() -> Journal { Journal::new(&"ab".repeat(32), &host(), &nonce(), broker_dns(), 100) }
 
     #[test]
     fn journal_rejects_unknown_fields_and_step_regression() {
         let start = journal();
         let bytes = serde_json::to_vec(&start).unwrap();
         assert_eq!(Journal::parse(&bytes).unwrap(), start);
-        // R1's minimal reader sees the four fields it needs.
+        // R1's minimal reader sees the four fields it needs (schema 2, review M4).
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["schema_version"], 2);
+        assert_eq!(value["nonce"], nonce());
         assert_eq!(value["mode"], "install");
         assert_eq!(value["generation"], "ab".repeat(32));
         assert_eq!(value["host"], host());
@@ -2194,7 +2599,12 @@ mod tests {
             serde_json::to_vec(&value).unwrap()
         };
         for bad in [mutate(|v| v["extra"] = true.into()), mutate(|v| v["prior"]["extra"] = 1.into()),
-            mutate(|v| v["dns"]["extra"] = 1.into()), mutate(|v| v["schema_version"] = 2.into()),
+            mutate(|v| v["dns"]["extra"] = 1.into()), mutate(|v| v["schema_version"] = 3.into()),
+            // An older journal (host bound to the machine id alone, no nonce) is refused.
+            mutate(|v| v["schema_version"] = 1.into()),
+            mutate(|v| { v["schema_version"] = 1.into(); v.as_object_mut().unwrap().remove("nonce"); }),
+            mutate(|v| v["nonce"] = "5A".repeat(32).into()), mutate(|v| v["nonce"] = "5a".into()),
+            mutate(|v| { v.as_object_mut().unwrap().remove("nonce"); }),
             mutate(|v| v["generation"] = "AB".repeat(32).into()), mutate(|v| v["generation"] = "ab".into()),
             mutate(|v| v["host"] = "ef".into()), mutate(|v| { v.as_object_mut().unwrap().remove("host"); }),
             mutate(|v| v["step"] = "unknown".into()), mutate(|v| v["committed"] = true.into()),
@@ -2223,6 +2633,9 @@ mod tests {
         let mut edited = completed.at(Step::ProcessesClear, Phase::Entered);
         edited.host = "cd".repeat(32);
         assert!(completed.check_transition(&edited).is_err(), "host is immutable");
+        let mut edited = completed.at(Step::ProcessesClear, Phase::Entered);
+        edited.nonce = "6b".repeat(32);
+        assert!(completed.check_transition(&edited).is_err(), "nonce is immutable");
         // Rollback can start from any uncommitted position, and nothing follows it.
         let rolling = completed.at(Step::Rollback, Phase::Entered);
         completed.check_transition(&rolling).unwrap();
@@ -2326,9 +2739,9 @@ mod tests {
         assert!(!login_range_clear("UID_MAX many\n", "UID"));
         assert!(enumeration_overlap("emp:x:70001:70001::/:/bin/false\n"));
         assert!(!enumeration_overlap("root:x:0:0:root:/root:/bin/bash\n"));
-        assert!(external_nss("passwd: files sss\ngroup: files\n"));
-        assert!(external_nss("group:  files ldap # remote\n"));
-        assert!(!external_nss("passwd: files systemd\n# passwd: ldap\nhosts: files dns ldap\n"));
+        assert_eq!(nss_verdict("passwd: files sss\ngroup: files\n"), Err(NssProblem::External));
+        assert_eq!(nss_verdict("group:  files ldap # remote\n"), Err(NssProblem::External));
+        assert_eq!(nss_verdict("passwd: files systemd\n# passwd: ldap\nhosts: files dns ldap\n"), Ok(()));
         assert!(sshd_includes_dropins("Include /etc/ssh/sshd_config.d/*.conf\nPort 22\n"));
         assert!(!sshd_includes_dropins("#Include /etc/ssh/sshd_config.d/*.conf\n"));
         assert!(allow_list_clear("alice\nbob\n"));
@@ -2344,9 +2757,56 @@ mod tests {
         assert_eq!(Step::Rollback.next(), None);
     }
 
+    #[test]
+    fn nsswitch_sources_are_an_allowlist() {
+        // Ubuntu / Debian defaults.
+        assert_eq!(nss_verdict("passwd:         files systemd\ngroup:          files systemd\nshadow:         files\n\
+gshadow:        files\nhosts:          files mdns4_minimal [NOTFOUND=return] dns\nnetgroup:       nis\n"), Ok(()));
+        // compat reads passwd_compat / group_compat / shadow_compat (e.g. NIS).
+        assert_eq!(nss_verdict("passwd: compat\n"), Ok(()), "no passwd_compat line");
+        assert_eq!(nss_verdict("passwd: compat\npasswd_compat: files\n"), Ok(()));
+        assert_eq!(nss_verdict("passwd: compat\npasswd_compat: nis\n"), Err(NssProblem::External));
+        assert_eq!(nss_verdict("passwd: compat\npasswd_compat: files nis\n"), Err(NssProblem::External));
+        assert_eq!(nss_verdict("group: files\ninitgroups: compat\ngroup_compat: nis\n"), Err(NssProblem::External));
+        assert_eq!(nss_verdict("shadow: compat\nshadow_compat: sss\n"), Err(NssProblem::External));
+        assert_eq!(nss_verdict("passwd: compat\npasswd_compat: extrausers\n"), Err(NssProblem::Unknown("extrausers".into())));
+        assert_eq!(nss_verdict("passwd: compat\npasswd_compat:\n"), Err(NssProblem::Unknown("compat".into())));
+        // A *_compat line of a database not using compat changes nothing.
+        assert_eq!(nss_verdict("passwd: files\npasswd_compat: nis\n"), Ok(()));
+        // Any source the installer does not classify refuses by name (never treated as local).
+        assert_eq!(nss_verdict("passwd: files extrausers\n"), Err(NssProblem::Unknown("extrausers".into())));
+        assert_eq!(nss_verdict("group: files mymachines\n"), Err(NssProblem::Unknown("mymachines".into())));
+        assert_eq!(nss_verdict("initgroups: files oslogin\n"), Err(NssProblem::Unknown("oslogin".into())));
+        assert_eq!(nss_verdict("shadow: files cache\n"), Err(NssProblem::Unknown("cache".into())));
+        // Bracketed action items are parsed, not sources — with or without inner spaces or separators.
+        assert_eq!(nss_verdict("passwd: files [NOTFOUND=return] systemd\n"), Ok(()));
+        assert_eq!(nss_verdict("passwd: files[!UNAVAIL=return]systemd\n"), Ok(()));
+        assert_eq!(nss_verdict("passwd: files [ NOTFOUND=return SUCCESS=return ] systemd\n"), Ok(()));
+        assert_eq!(nss_verdict("passwd: files [NOTFOUND=return] ldap\n"), Err(NssProblem::External));
+        assert_eq!(nss_verdict("passwd: files [NOTFOUND=return\n"), Err(NssProblem::Malformed));
+        // Other databases are not account sources here.
+        assert_eq!(nss_verdict("hosts: files resolve [!UNAVAIL=return] dns myhostname\n"), Ok(()));
+    }
+
+    /// Review H2: a scripted gateway; every effect is appended to the shared log.
+    #[derive(Default)]
+    struct FakeGateway { up: bool, ours: bool, stuck: bool, processes: bool, log: Vec<String> }
+
+    impl GatewayControl for FakeGateway {
+        fn state(&mut self) -> Result<(bool, bool)> { Ok((!self.up, false)) }
+        fn unit_is_ours(&mut self) -> Result<bool> { Ok(self.ours) }
+        fn stop(&mut self) -> Result<()> {
+            self.log.push("stop gateway".into());
+            if !self.stuck { self.up = false; self.processes = false; }
+            Ok(())
+        }
+        fn account_has_processes(&mut self) -> Result<bool> { Ok(self.processes) }
+        fn pause(&mut self) {}
+    }
+
     /// A host whose step invariants are scripted (review F1).
     #[derive(Default)]
-    struct ScriptedHost { broken: Vec<Step>, refuse: Vec<Step>, performed: Vec<Step> }
+    struct ScriptedHost { broken: Vec<Step>, refuse: Vec<Step>, performed: Vec<Step>, gateway: FakeGateway }
 
     impl Steps for ScriptedHost {
         fn holds(&mut self, step: Step) -> Result<bool> { Ok(!self.broken.contains(&step)) }
@@ -2354,8 +2814,130 @@ mod tests {
             if self.refuse.contains(&step) { return Err(refused("refused")); }
             self.broken.retain(|broken| *broken != step);
             self.performed.push(step);
+            self.gateway.log.push(format!("perform {step:?}"));
             Ok(())
         }
+        fn quiesce_gateway(&mut self) -> Result<()> { quiesce_gateway(&mut self.gateway, 3) }
+        fn quiet(&mut self, step: Step) -> Result<bool> {
+            Ok(match step {
+                Step::StopGateway => !self.gateway.up,
+                Step::ProcessesClear => !self.gateway.processes,
+                _ => false,
+            })
+        }
+    }
+
+    #[test]
+    fn resume_quiesces_published_gateway_before_platform_steps() {
+        let forged = journal().at(Step::StartGateway, Phase::Completed);
+        // S8's gateway runs as published (S2/S3 hold through it); S5 no longer holds.
+        let running = || FakeGateway { up: true, ours: true, processes: true, ..Default::default() };
+        let mut host = ScriptedHost { broken: vec![Step::DnsPolicy], gateway: running(), ..Default::default() };
+        let mut position = forged.clone();
+        let (result, writes) = drive_scripted(&mut position, &mut host);
+        result.unwrap();
+        // The gateway is stopped FIRST; then S5..S8 re-run (S8's completion no longer trusted), then the commit.
+        assert_eq!(host.gateway.log, ["stop gateway", "perform DnsPolicy", "perform StartServices", "perform Readiness",
+            "perform StartGateway", "perform Commit"]);
+        assert_eq!(writes, vec![(Step::Commit, Phase::Entered), (Step::Commit, Phase::Completed)]);
+        // The unit is not the ledgered one this install published: refused before any effect.
+        let mut host = ScriptedHost { broken: vec![Step::PublishPlatform],
+            gateway: FakeGateway { ours: false, ..running() }, ..Default::default() };
+        let mut position = forged.clone();
+        let (result, writes) = drive_scripted(&mut position, &mut host);
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("手動停止"), "{error}");
+        assert!(host.gateway.log.is_empty() && host.performed.is_empty() && writes.is_empty() && position == forged);
+        // Stopped but never confirmed down (or the account keeps a process): refused, nothing re-run.
+        for gateway in [FakeGateway { stuck: true, ..running() }, FakeGateway { up: false, processes: true, ..running() }] {
+            let mut host = ScriptedHost { broken: vec![Step::Readiness], gateway, ..Default::default() };
+            let mut position = forged.clone();
+            let (result, writes) = drive_scripted(&mut position, &mut host);
+            assert!(result.is_err());
+            assert!(host.performed.is_empty() && writes.is_empty() && !position.committed);
+        }
+        // Only S8 fails: no platform step re-runs, so the gateway is not stopped here.
+        let mut host = ScriptedHost { broken: vec![Step::StartGateway], gateway: running(), ..Default::default() };
+        let mut position = forged.clone();
+        drive_scripted(&mut position, &mut host).0.unwrap();
+        assert_eq!(host.gateway.log, ["perform StartGateway", "perform Commit"]);
+        // A gateway already down is not stopped (nothing to prove about its unit).
+        let mut host = ScriptedHost { broken: vec![Step::StartServices],
+            gateway: FakeGateway { ours: false, ..Default::default() }, ..Default::default() };
+        let mut position = forged;
+        drive_scripted(&mut position, &mut host).0.unwrap();
+        assert_eq!(host.gateway.log.first().map(String::as_str), Some("perform StartServices"));
+    }
+
+    #[test]
+    fn spawnd_publication_field_set_is_pinned() {
+        // The producer's serialisation (what S4 writes) has exactly the fields
+        // of spawnd's consumer `HostPublication` (installed.rs), in its shape.
+        let generation = digest(1);
+        let written = serde_json::to_value(HostPublication::expected(generation)).unwrap();
+        let mut fields: Vec<&str> = written.as_object().unwrap().keys().map(String::as_str).collect();
+        fields.sort_unstable();
+        assert_eq!(fields, ["entitlements", "generation", "version"]);
+        assert_eq!(written, serde_json::json!({ "version": 1, "generation": generation, "entitlements": [] }));
+        let parsed: HostPublication = serde_json::from_value(written).unwrap();
+        assert_eq!(parsed, HostPublication::expected(generation));
+    }
+
+    #[test]
+    fn publication_must_equal_this_install_in_every_field() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let dir = fs::File::open(directory.path()).unwrap();
+        let me = unsafe { (libc::geteuid(), libc::getegid()) };
+        let generation = digest(1);
+        let path = directory.path().join("publication.json");
+        let write = |value: &serde_json::Value| {
+            let _ = fs::remove_file(&path);
+            fs::write(&path, serde_json::to_vec(value).unwrap()).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        let good = serde_json::json!({ "version": 1, "generation": generation, "entitlements": [] });
+        write(&good);
+        assert!(publication_holds(&dir, me, generation));
+        // Absent: nothing holds (and the reader says absent, not damaged).
+        fs::remove_file(&path).unwrap();
+        assert!(read_publication_at(&dir, me).unwrap().is_none());
+        assert!(!publication_holds(&dir, me, generation));
+        // Same generation, but forged or left-over content: S4 does not hold.
+        let entitlement = serde_json::json!([{ "employee": "00".repeat(16), "profiles": [digest(2)] }]);
+        for bad in [
+            serde_json::json!({ "version": 1, "generation": generation, "entitlements": [], "extra": true }),
+            serde_json::json!({ "version": 2, "generation": generation, "entitlements": [] }),
+            serde_json::json!({ "version": 1, "generation": generation, "entitlements": entitlement }),
+            serde_json::json!({ "version": 1, "generation": digest(3), "entitlements": [] }),
+            serde_json::json!({ "version": 1, "generation": generation }),
+            serde_json::json!([]),
+        ] {
+            write(&bad);
+            assert!(!publication_holds(&dir, me, generation), "{bad}");
+        }
+        // Wrong mode, another owner, a hard link, oversize: refused before parsing.
+        write(&good);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!publication_holds(&dir, me, generation));
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(!publication_holds(&dir, (me.0.wrapping_add(1), me.1), generation));
+        fs::hard_link(&path, directory.path().join("alias")).unwrap();
+        assert!(!publication_holds(&dir, me, generation));
+        fs::remove_file(directory.path().join("alias")).unwrap();
+        assert!(publication_holds(&dir, me, generation));
+        let mut padded = serde_json::to_vec(&good).unwrap();
+        padded.resize(MAX_PUBLICATION_BYTES as usize + 1, b' ');
+        fs::write(&path, &padded).unwrap();
+        assert!(!publication_holds(&dir, me, generation));
+        // A symlink to a correct publication is never followed.
+        fs::remove_file(&path).unwrap();
+        let target = directory.path().join("real.json");
+        fs::write(&target, serde_json::to_vec(&good).unwrap()).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(read_publication_at(&dir, me).is_err());
+        assert!(!publication_holds(&dir, me, generation));
     }
 
     fn drive_scripted(journal: &mut Journal, host: &mut ScriptedHost) -> (Result<()>, Vec<(Step, Phase)>) {
@@ -2419,14 +3001,61 @@ mod tests {
         assert!(bound_to(&upgrade, &"ab".repeat(32), &host()).is_err());
         // The machine-id binding: strict format, fixed domain, distinct hosts differ.
         let id = "0123456789abcdef0123456789abcdef";
-        let digest = host_digest_of(&format!("{id}\n")).unwrap();
-        assert_eq!(host_digest_of(id), Some(digest.clone()));
+        let digest = host_digest_of(&format!("{id}\n"), None).unwrap();
+        assert_eq!(host_digest_of(id, None), Some(digest.clone()));
         assert!(parse_generation(&digest).is_some());
-        assert_ne!(host_digest_of("fedcba9876543210fedcba9876543210"), Some(digest));
+        assert_ne!(host_digest_of("fedcba9876543210fedcba9876543210", None), Some(digest));
         for bad in ["", "0123456789ABCDEF0123456789abcdef", "0123456789abcdef", "0123456789abcdef0123456789abcdef\n\n",
             "uninitialized\n"] {
-            assert_eq!(host_digest_of(bad), None, "{bad:?}");
+            assert_eq!(host_digest_of(bad, None), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn host_binding_refuses_degenerate_ids_and_binds_product_uuid_presence() {
+        let id = "0123456789abcdef0123456789abcdef";
+        // Review M4: an all-zero or one-digit machine id identifies nothing.
+        for degenerate in ["0".repeat(32), format!("{}\n", "0".repeat(32)), "f".repeat(32), "7".repeat(32)] {
+            assert_eq!(host_digest_of(&degenerate, None), None, "{degenerate:?}");
+            assert_eq!(host_digest_of(&degenerate, Some("4c4c4544-0042-3510-8051-b3c04f4e3132\n")), None);
+        }
+        // The DMI product UUID: strict 8-4-4-4-12 form; case-insensitive; a trailing newline.
+        let uuid = "4c4c4544-0042-3510-8051-b3c04f4e3132";
+        assert_eq!(parse_product_uuid(&format!("{uuid}\n")), Ok(Some(uuid.to_owned())));
+        assert_eq!(parse_product_uuid(&uuid.to_uppercase()), Ok(Some(uuid.to_owned())));
+        for bad in ["", "4c4c4544004235108051b3c04f4e3132", "4c4c4544-0042-3510-8051-b3c04f4e313", "4c4c4544-0042-3510-8051-b3c04f4e3132x",
+            "4c4c4544_0042_3510_8051_b3c04f4e3132", "zc4c4544-0042-3510-8051-b3c04f4e3132", "Not Settable\n"] {
+            assert_eq!(parse_product_uuid(bad), Err(()), "{bad:?}");
+            assert_eq!(host_digest_of(id, Some(bad)), None, "{bad:?}");
+        }
+        // A degenerate UUID (all zero / one digit) adds nothing: recorded as absent.
+        assert_eq!(parse_product_uuid("00000000-0000-0000-0000-000000000000\n"), Ok(None));
+        assert_eq!(host_digest_of(id, Some("ffffffff-ffff-ffff-ffff-ffffffffffff")), host_digest_of(id, None));
+        // Presence is bound: a UUID that appears, vanishes or changes on resume is another host.
+        let absent = host_digest_of(id, None).unwrap();
+        let present = host_digest_of(id, Some(uuid)).unwrap();
+        assert_ne!(absent, present);
+        assert_eq!(host_digest_of(id, Some(&uuid.to_uppercase())), Some(present.clone()));
+        assert_ne!(host_digest_of(id, Some("4c4c4544-0042-3510-8051-b3c04f4e3133")), Some(present.clone()));
+        let recorded = Journal::new(&"ab".repeat(32), &absent, &nonce(), broker_dns(), 100);
+        bound_to(&recorded, &"ab".repeat(32), &absent).unwrap();
+        assert!(bound_to(&recorded, &"ab".repeat(32), &present).unwrap_err().to_string().contains("另一台主機"));
+        let recorded = Journal::new(&"ab".repeat(32), &present, &nonce(), broker_dns(), 100);
+        assert!(bound_to(&recorded, &"ab".repeat(32), &absent).is_err());
+    }
+
+    #[test]
+    fn nonce_mismatch_between_journal_and_ledger_is_refused() {
+        let recorded = journal();
+        let ours = ledger::Ledger::new(&recorded.generation, &recorded.nonce);
+        ledger::belongs_to(&ours, &recorded.generation, &recorded.nonce).unwrap();
+        // A ledger of another transaction of the same generation.
+        let other = ledger::Ledger::new(&recorded.generation, &"6b".repeat(32));
+        assert!(ledger::belongs_to(&other, &recorded.generation, &recorded.nonce).is_err());
+        // Two runs never share a nonce (256 random bits each).
+        let (first, second) = (random_hex(32).unwrap(), random_hex(32).unwrap());
+        assert!(parse_generation(&first).is_some() && parse_generation(&second).is_some());
+        assert_ne!(first, second);
     }
 
     fn unit_options(upstream: Option<SocketAddr>) -> ContinueOptions {
@@ -2440,25 +3069,27 @@ mod tests {
         let options = unit_options(None);
         // A resumed run still runs S1, with the journal's DNS choices, and stops when it fails.
         let mut asked = None;
-        let result = begin(Some(recorded.clone()), &options, &host(), 5, |upstream, hosts| {
+        let fresh_nonce = "6b".repeat(32);
+        let result = begin(Some(recorded.clone()), &options, &host(), &fresh_nonce, 5, |upstream, hosts| {
             asked = Some((upstream, hosts.to_vec()));
             Err(refused("S1 failed"))
         });
         assert!(result.is_err());
         assert_eq!(asked, Some((recorded.dns.upstream, recorded.dns.host_public_addresses.clone())));
-        // Passing S1 with the recorded decision resumes the same journal (not a new one).
-        let (resumed, fresh) = begin(Some(recorded.clone()), &options, &host(), 5, |_, _| Ok(broker_dns())).unwrap();
-        assert!(!fresh && resumed == recorded);
+        // Passing S1 with the recorded decision resumes the same journal (not a new one, its own nonce).
+        let (resumed, fresh) = begin(Some(recorded.clone()), &options, &host(), &fresh_nonce, 5, |_, _| Ok(broker_dns())).unwrap();
+        assert!(!fresh && resumed == recorded && resumed.nonce == nonce());
         // A host whose DNS decision changed since the first run refuses.
         let resolved = Dns { route: DnsRoute::ResolvedVarlink, upstream: None,
             host_public_addresses: broker_dns().host_public_addresses };
-        assert!(begin(Some(recorded.clone()), &options, &host(), 5, |_, _| Ok(resolved)).is_err());
+        assert!(begin(Some(recorded.clone()), &options, &host(), &fresh_nonce, 5, |_, _| Ok(resolved)).is_err());
         // Given options must equal the recorded ones.
         let changed = unit_options(Some("198.51.100.53:53".parse().unwrap()));
-        assert!(begin(Some(recorded), &changed, &host(), 5, |_, _| Ok(broker_dns())).is_err());
-        // A fresh run records S1's decision and this host.
-        let (created, fresh) = begin(None, &options, &host(), 5, |_, _| Ok(broker_dns())).unwrap();
+        assert!(begin(Some(recorded), &changed, &host(), &fresh_nonce, 5, |_, _| Ok(broker_dns())).is_err());
+        // A fresh run records S1's decision, this host and the nonce generated at S0.
+        let (created, fresh) = begin(None, &options, &host(), &fresh_nonce, 5, |_, _| Ok(broker_dns())).unwrap();
         assert!(fresh && created.host == host() && created.step == Step::HostPreflight && created.phase == Phase::Completed);
+        assert_eq!(created.nonce, fresh_nonce);
         created.validate().unwrap();
     }
 

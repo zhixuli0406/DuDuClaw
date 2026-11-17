@@ -20,6 +20,13 @@
 //! reported, and the rollback ends incomplete (resumable). An entry still in
 //! `intent` without an identity matches nothing. Paths are a fixed allowlist
 //! ([`permitted`]), so a damaged or forged ledger cannot aim rollback elsewhere.
+//!
+//! Review H3: re-intending an entry (a resumed or re-run step) requires the
+//! object present now to be exactly the recorded one (same rule as rollback),
+//! or no object at all; an intent without an identity admits only an absent
+//! object (never adopted). Otherwise the step refuses by path and the entry is
+//! left untouched. The ledger carries its transaction's nonce (the journal's)
+//! and is refused for any other transaction, even of the same generation.
 use super::*;
 use super::bootstrap::{self as boot, Store};
 use std::{ffi::{CStr, CString}, io::Read, os::{fd::RawFd, unix::ffi::OsStrExt}};
@@ -89,7 +96,15 @@ pub(super) struct Entry {
 pub(super) struct Ledger {
     pub(super) schema_version: u16,
     pub(super) generation: String,
+    /// The journal's transaction nonce (review H3).
+    pub(super) nonce: String,
     pub(super) entries: Vec<Entry>,
+}
+
+/// Review H3: the ledger belongs to exactly this transaction.
+pub(super) fn belongs_to(ledger: &Ledger, generation: &str, nonce: &str) -> Result<()> {
+    if ledger.generation != generation || ledger.nonce != nonce { return Err(refused(LEDGER_DAMAGED)); }
+    Ok(())
 }
 
 fn boot_id_valid(text: &str) -> bool {
@@ -123,13 +138,14 @@ impl Identity {
 }
 
 impl Ledger {
-    pub(super) fn new(generation: &str) -> Self {
-        Self { schema_version: 1, generation: generation.to_owned(), entries: Vec::new() }
+    pub(super) fn new(generation: &str, nonce: &str) -> Self {
+        Self { schema_version: 2, generation: generation.to_owned(), nonce: nonce.to_owned(), entries: Vec::new() }
     }
 
     pub(super) fn validate(&self) -> Result<()> {
         let damaged = || refused(LEDGER_DAMAGED);
-        if self.schema_version != 1 || boot::parse_generation(&self.generation).is_none() || self.entries.len() > MAX_ENTRIES {
+        if self.schema_version != 2 || boot::parse_generation(&self.generation).is_none()
+            || boot::parse_generation(&self.nonce).is_none() || self.entries.len() > MAX_ENTRIES {
             return Err(damaged());
         }
         for (index, entry) in self.entries.iter().enumerate() {
@@ -306,18 +322,17 @@ pub(super) fn identity_at(directory: &fs::File, name: &CStr, kind: Kind) -> Resu
         size, sha256, boot_id: boot_id()? }))
 }
 
-/// The rollback rule (pure). Same inode, device and owner; for regular files
-/// also the full mode, size and SHA-256 (directories may have had their
-/// permission bits re-applied by this transaction; their type must match).
-/// Mount ids are per boot: in the recording boot they must be equal; after a
-/// reboot the object must sit on its parent directory's mount (it is not a
-/// mount point of its own).
+/// The rollback rule (pure). Same inode, device, owner and full mode (type and
+/// permission bits, directories included: review L1 — the installer's own
+/// later mode re-application is re-recorded through [`Recorder::rerecord_mode`]);
+/// for regular files also size and SHA-256. Mount ids are per boot: in the
+/// recording boot they must be equal; after a reboot the object must sit on
+/// its parent directory's mount (it is not a mount point of its own).
 pub(super) fn same_object(recorded: &Identity, current: &Identity, parent_mount: u64, boot: &str) -> bool {
     let mount = if recorded.boot_id == boot { current.mount_id == recorded.mount_id } else { current.mount_id == parent_mount };
-    let file = recorded.mode & libc::S_IFMT == libc::S_IFREG;
-    let mode = if file { recorded.mode == current.mode } else { recorded.mode & libc::S_IFMT == current.mode & libc::S_IFMT };
-    mount && mode && recorded.device == current.device && recorded.inode == current.inode && recorded.uid == current.uid
-        && recorded.gid == current.gid && recorded.size == current.size && recorded.sha256 == current.sha256
+    mount && recorded.mode == current.mode && recorded.device == current.device && recorded.inode == current.inode
+        && recorded.uid == current.uid && recorded.gid == current.gid && recorded.size == current.size
+        && recorded.sha256 == current.sha256
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -349,6 +364,8 @@ pub(super) trait LedgerHost {
     fn save(&mut self, ledger: &Ledger) -> Result<()>;
     fn present(&mut self, path: &str) -> Result<bool>;
     fn identity(&mut self, path: &str, kind: Kind) -> Result<Option<Identity>>;
+    /// What the entry's path holds now relative to the entry (rollback's rule).
+    fn classify(&mut self, entry: &Entry) -> Result<Now>;
 }
 
 pub(super) struct LiveHost { store: Store }
@@ -361,27 +378,41 @@ impl LedgerHost for LiveHost {
         let (directory, name) = open_parent(path)?;
         identity_at(&directory, &name, kind)
     }
+    fn classify(&mut self, entry: &Entry) -> Result<Now> {
+        if !present(&entry.path)? { return Ok(Now::Absent); }
+        let (directory, name) = open_parent(&entry.path)?;
+        classify_at(&directory, &name, entry, &boot_id()?)
+    }
 }
 
 pub(super) struct Recorder<H: LedgerHost> { host: H, ledger: Ledger }
 pub(super) type LiveRecorder = Recorder<LiveHost>;
 
 impl Recorder<LiveHost> {
-    /// The ledger of `generation` in the protected root; created empty when absent.
-    pub(super) fn open_live(generation: &str) -> Result<Self> {
+    /// The ledger of this transaction (`generation`, `nonce`) in the protected
+    /// root; created empty when absent.
+    pub(super) fn open_live(generation: &str, nonce: &str) -> Result<Self> {
         let store = Store::open()?;
         let existing = read(&store)?;
-        Recorder::open(LiveHost { store }, existing, generation)
+        Recorder::open(LiveHost { store }, existing, generation, nonce)
     }
 }
 
+/// Review H3: an existing object at a ledgered path the step would create again.
+fn changed_since_recorded(path: &str) -> DuDuClawError {
+    refused(format!("{path} 上的物件已不是這次安裝記錄的原物件（已被更換或修改）；已停止，未覆蓋、接管或移除它，建立紀錄也未變更。請確認來源後再續接，或執行 duduclaw-bootstrap rollback。"))
+}
+
+fn never_adopted(path: &str) -> DuDuClawError {
+    refused(format!("{path} 已存在，但這次安裝在建立它之前中斷，沒有記錄它的識別；無法證明它是這次安裝建立的，已停止，未覆蓋或接管它。請確認來源並處理後再續接，或執行 duduclaw-bootstrap rollback。"))
+}
+
 impl<H: LedgerHost> Recorder<H> {
-    pub(super) fn open(mut host: H, existing: Option<Ledger>, generation: &str) -> Result<Self> {
+    pub(super) fn open(mut host: H, existing: Option<Ledger>, generation: &str, nonce: &str) -> Result<Self> {
         let ledger = match existing {
-            Some(ledger) if ledger.generation == generation => ledger,
-            Some(_) => return Err(refused(LEDGER_DAMAGED)),
+            Some(ledger) => { belongs_to(&ledger, generation, nonce)?; ledger }
             None => {
-                let ledger = Ledger::new(generation);
+                let ledger = Ledger::new(generation, nonce);
                 host.save(&ledger)?;
                 ledger
             }
@@ -399,13 +430,22 @@ impl<H: LedgerHost> Recorder<H> {
         Ok(())
     }
 
-    /// Step 1 of the lifecycle, one durable write for all `items`.
+    /// Step 1 of the lifecycle, one durable write for all `items`. Review H3:
+    /// an existing entry is re-intended only when its path holds nothing or
+    /// exactly the recorded object; nothing is written when any item refuses.
     pub(super) fn intend(&mut self, items: &[(&str, Kind)]) -> Result<()> {
         let mut next = self.ledger.clone();
         for (path, kind) in items {
             if !permitted(*kind, path) { return Err(refused(LEDGER_DAMAGED)); }
             match next.entries.iter_mut().find(|entry| entry.path == *path) {
-                Some(entry) if entry.kind == *kind => entry.state = State::Intent,
+                Some(entry) if entry.kind == *kind => {
+                    match (entry.identity.is_some(), self.host.classify(entry)?) {
+                        (_, Now::Absent) | (true, Now::Recorded) => (),
+                        (true, Now::Other) => return Err(changed_since_recorded(path)),
+                        (false, _) => return Err(never_adopted(path)),
+                    }
+                    entry.state = State::Intent;
+                }
                 Some(_) => return Err(refused(LEDGER_DAMAGED)),
                 None if self.host.present(path)? => match kind {
                     // Not created by this transaction: used as it is, never ledgered.
@@ -434,13 +474,37 @@ impl<H: LedgerHost> Recorder<H> {
         self.save(next)
     }
 
-    /// Intent, create, identity.
+    /// Intent, create, identity. The identities are recorded even when the
+    /// creation failed part-way: the intent proved each path empty (or the
+    /// recorded object) right before, so what exists now is this
+    /// transaction's, and a resume then never meets an identity-less object
+    /// it would have to refuse (review H3).
     pub(super) fn record<T>(&mut self, items: &[(&str, Kind)], create: impl FnOnce() -> Result<T>) -> Result<T> {
         self.intend(items)?;
-        let value = create()?;
+        let value = create();
         let paths: Vec<&str> = items.iter().map(|(path, _)| *path).collect();
-        self.confirm(&paths)?;
+        let confirmed = self.confirm(&paths);
+        let value = value?;
+        confirmed?;
         Ok(value)
+    }
+
+    /// Review L1: the installer re-applied the permission bits `mode` to a
+    /// ledgered directory it created. When the object present is exactly the
+    /// recorded one with only those bits changed to `mode`, that identity is
+    /// made durable; any other state is left for the intent and rollback rules.
+    pub(super) fn rerecord_mode(&mut self, path: &str, mode: u32) -> Result<()> {
+        if mode & !0o7777 != 0 { return Err(refused(LEDGER_DAMAGED)); }
+        let Some(entry) = self.ledger.entry(path) else { return Ok(()) };
+        if entry.kind == Kind::File { return Err(refused(LEDGER_DAMAGED)); }
+        let Some(recorded) = &entry.identity else { return Ok(()) };
+        if recorded.mode & 0o7777 == mode { return Ok(()); }
+        let mut transitioned = entry.clone();
+        if let Some(identity) = transitioned.identity.as_mut() { identity.mode = (identity.mode & libc::S_IFMT) | mode; }
+        if self.host.classify(&transitioned)? != Now::Recorded { return Ok(()); }
+        let mut next = self.ledger.clone();
+        for entry in next.entries.iter_mut().filter(|entry| entry.path == path) { *entry = transitioned.clone(); }
+        self.save(next)
     }
 
     /// The gateway data snapshot (S8, before the gateway can first start). The
@@ -467,8 +531,10 @@ mod tests {
             boot_id: "0123abcd-0000-4000-8000-00000000beef".into() }
     }
 
+    fn nonce() -> String { "5a".repeat(32) }
+
     fn ledger() -> Ledger {
-        let mut ledger = Ledger::new(&"cd".repeat(32));
+        let mut ledger = Ledger::new(&"cd".repeat(32), &nonce());
         ledger.entries.push(Entry { path: UNIT_PATH.into(), kind: Kind::File, state: State::Created,
             identity: Some(identity(Kind::File, 7)), keep: Vec::new() });
         ledger.entries.push(Entry { path: "/opt/duduclaw-isolated".into(), kind: Kind::Tree, state: State::Intent,
@@ -489,8 +555,11 @@ mod tests {
             change(&mut value);
             serde_json::to_vec(&value).unwrap()
         };
-        for bad in [mutate(|v| v["extra"] = true.into()), mutate(|v| v["schema_version"] = 2.into()),
+        for bad in [mutate(|v| v["extra"] = true.into()), mutate(|v| v["schema_version"] = 1.into()),
+            mutate(|v| v["schema_version"] = 3.into()),
             mutate(|v| v["generation"] = "CD".repeat(32).into()),
+            mutate(|v| v["nonce"] = "5A".repeat(32).into()), mutate(|v| v["nonce"] = "5a".into()),
+            mutate(|v| { v.as_object_mut().unwrap().remove("nonce"); }),
             mutate(|v| v["entries"][0]["extra"] = 1.into()),
             mutate(|v| v["entries"][0]["identity"]["extra"] = 1.into()),
             // Not an installer path: a forged ledger cannot aim rollback elsewhere.
@@ -509,7 +578,7 @@ mod tests {
             assert!(Ledger::parse(&bad).is_err(), "{}", String::from_utf8_lossy(&bad));
         }
         assert!(Ledger::parse(&vec![b' '; MAX_LEDGER_BYTES + 1]).is_err());
-        let mut many = Ledger::new(&"cd".repeat(32));
+        let mut many = Ledger::new(&"cd".repeat(32), &nonce());
         for _ in 0..=MAX_ENTRIES {
             many.entries.push(Entry { path: UNIT_PATH.into(), kind: Kind::File, state: State::Intent, identity: None, keep: Vec::new() });
         }
@@ -536,13 +605,15 @@ mod tests {
         later.boot_id = "ffffffff-0000-4000-8000-000000000000".into();
         assert!(same_object(&recorded, &later, 77, &later.boot_id));
         assert!(!same_object(&recorded, &later, 78, &later.boot_id));
-        // Directories may have had their permission bits re-applied, never their type.
+        // Review L1: a directory's permission bits are part of its identity too
+        // (the installer's own re-application is re-recorded, see below).
         let directory = identity(Kind::Directory, 5);
         let mut chmod = directory.clone();
         chmod.mode = libc::S_IFDIR | 0o700;
-        assert!(same_object(&directory, &chmod, 31, boot));
+        assert!(!same_object(&directory, &chmod, 31, boot));
         chmod.mode = libc::S_IFREG | 0o755;
         assert!(!same_object(&directory, &chmod, 31, boot));
+        assert!(same_object(&directory, &directory.clone(), 31, boot));
     }
 
     /// In-memory host: objects by path, and every durable ledger write in order.
@@ -563,12 +634,31 @@ mod tests {
         fn identity(&mut self, path: &str, _: Kind) -> Result<Option<Identity>> {
             Ok(self.0.borrow().objects.iter().find(|(p, _)| p == path).map(|(_, identity)| identity.clone()))
         }
+        /// Exact identity equality stands in for `same_object` (tested on its own above).
+        fn classify(&mut self, entry: &Entry) -> Result<Now> {
+            Ok(match self.identity(&entry.path, entry.kind)? {
+                None => Now::Absent,
+                Some(current) if entry.identity.as_ref() == Some(&current) => Now::Recorded,
+                Some(_) => Now::Other,
+            })
+        }
+    }
+
+    impl World {
+        fn put(&mut self, path: &str, identity: Identity) {
+            self.objects.retain(|(p, _)| p != path);
+            self.objects.push((path.into(), identity));
+        }
+    }
+
+    fn open(world: &Rc<RefCell<World>>) -> Recorder<FakeHost> {
+        Recorder::open(FakeHost(world.clone()), None, &"cd".repeat(32), &nonce()).unwrap()
     }
 
     #[test]
     fn ledger_records_intent_before_create_and_identity_after() {
         let world = Rc::new(RefCell::new(World::default()));
-        let mut recorder = Recorder::open(FakeHost(world.clone()), None, &"cd".repeat(32)).unwrap();
+        let mut recorder = open(&world);
         let created = world.clone();
         recorder.record(&[(UNIT_PATH, Kind::File)], move || {
             let mut world = created.borrow_mut();
@@ -597,7 +687,7 @@ mod tests {
         world.borrow_mut().objects.push((LAUNCHER.into(), identity(Kind::File, 3)));
         world.borrow_mut().objects.push(("/opt/duduclaw".into(), identity(Kind::Directory, 4)));
         world.borrow_mut().objects.push(("/usr/lib/duduclaw".into(), identity(Kind::Tree, 5)));
-        let mut recorder = Recorder::open(FakeHost(world.clone()), None, &"cd".repeat(32)).unwrap();
+        let mut recorder = open(&world);
         // A file or tree present without an entry was not created by this transaction.
         assert!(recorder.intend(&[(LAUNCHER, Kind::File)]).is_err());
         assert!(recorder.intend(&[("/usr/lib/duduclaw", Kind::Tree)]).is_err());
@@ -607,7 +697,110 @@ mod tests {
         // A path outside the allowlist is never recorded.
         assert!(recorder.intend(&[("/etc/passwd", Kind::File)]).is_err());
         // Another generation's ledger is refused.
-        assert!(Recorder::open(FakeHost(world), Some(Ledger::new(&"ab".repeat(32))), &"cd".repeat(32)).is_err());
+        assert!(Recorder::open(FakeHost(world.clone()), Some(Ledger::new(&"ab".repeat(32), &nonce())), &"cd".repeat(32), &nonce()).is_err());
+        // Review H3: so is another transaction's ledger of the same generation.
+        let other = Ledger::new(&"cd".repeat(32), &"6b".repeat(32));
+        assert!(Recorder::open(FakeHost(world.clone()), Some(other.clone()), &"cd".repeat(32), &nonce()).is_err());
+        assert!(belongs_to(&other, &"cd".repeat(32), &nonce()).is_err());
+        belongs_to(&other, &"cd".repeat(32), &"6b".repeat(32)).unwrap();
+        assert!(belongs_to(&other, &"ab".repeat(32), &"6b".repeat(32)).is_err());
+        Recorder::open(FakeHost(world), Some(other), &"cd".repeat(32), &"6b".repeat(32)).unwrap();
+    }
+
+    #[test]
+    fn ledger_reintent_refuses_changed_or_unrecorded_objects() {
+        let world = Rc::new(RefCell::new(World::default()));
+        let mut recorder = open(&world);
+        let created = world.clone();
+        recorder.record(&[(UNIT_PATH, Kind::File)], move || {
+            created.borrow_mut().put(UNIT_PATH, identity(Kind::File, 7));
+            Ok(())
+        }).unwrap();
+        // The recorded object is still there: re-intent proceeds (resume of the same step).
+        recorder.intend(&[(UNIT_PATH, Kind::File)]).unwrap();
+        recorder.confirm(&[UNIT_PATH]).unwrap();
+        let before = recorder.ledger().clone();
+        let saves = world.borrow().saved.len();
+        // An administrator or a package replaced it after a crash: refused by path, entry untouched.
+        world.borrow_mut().put(UNIT_PATH, identity(Kind::File, 8));
+        let error = recorder.intend(&[(UNIT_PATH, Kind::File)]).unwrap_err().to_string();
+        assert!(error.contains(UNIT_PATH), "{error}");
+        assert_eq!(recorder.ledger(), &before);
+        assert_eq!(world.borrow().saved.len(), saves, "nothing written");
+        // A refusal of one item writes none of a batch.
+        assert!(recorder.intend(&[(BINARY, Kind::File), (UNIT_PATH, Kind::File)]).is_err());
+        assert!(recorder.ledger().entry(BINARY).is_none());
+        // Missing now: re-creating at an empty path may proceed.
+        world.borrow_mut().objects.retain(|(path, _)| path != UNIT_PATH);
+        recorder.intend(&[(UNIT_PATH, Kind::File)]).unwrap();
+        // ... but reappeared as something else before the re-run: refused again.
+        world.borrow_mut().put(UNIT_PATH, identity(Kind::File, 9));
+        assert!(recorder.intend(&[(UNIT_PATH, Kind::File)]).is_err());
+        // An intent without identity (crash between intent and confirm) never adopts an object.
+        let failed = recorder.record(&[(LAUNCHER, Kind::File)], || -> Result<()> { Err(refused("crash")) });
+        assert!(failed.is_err());
+        assert_eq!(recorder.ledger().entry(LAUNCHER).unwrap().identity, None);
+        world.borrow_mut().put(LAUNCHER, identity(Kind::File, 11));
+        let before = recorder.ledger().clone();
+        let error = recorder.intend(&[(LAUNCHER, Kind::File)]).unwrap_err().to_string();
+        assert!(error.contains(LAUNCHER), "{error}");
+        assert_eq!(recorder.ledger(), &before);
+        // Only an absent object may proceed.
+        world.borrow_mut().objects.retain(|(path, _)| path != LAUNCHER);
+        recorder.intend(&[(LAUNCHER, Kind::File)]).unwrap();
+    }
+
+    #[test]
+    fn ledger_records_identity_even_when_creation_failed_part_way() {
+        let world = Rc::new(RefCell::new(World::default()));
+        let mut recorder = open(&world);
+        let created = world.clone();
+        let failed = recorder.record(&[("/usr/lib/duduclaw", Kind::Tree)], move || -> Result<()> {
+            created.borrow_mut().put("/usr/lib/duduclaw", identity(Kind::Tree, 12));
+            Err(refused("failed after creating the directory"))
+        });
+        assert!(failed.is_err());
+        let entry = recorder.ledger().entry("/usr/lib/duduclaw").unwrap().clone();
+        assert_eq!((entry.state, entry.identity), (State::Created, Some(identity(Kind::Tree, 12))));
+        // So the re-run re-intends it instead of refusing an identity-less object.
+        recorder.intend(&[("/usr/lib/duduclaw", Kind::Tree)]).unwrap();
+    }
+
+    #[test]
+    fn directory_mode_change_differs_unless_it_is_the_installers_own_rerecord() {
+        let world = Rc::new(RefCell::new(World::default()));
+        let mut recorder = open(&world);
+        let created = world.clone();
+        recorder.record(&[("/opt/duduclaw", Kind::Directory)], move || {
+            created.borrow_mut().put("/opt/duduclaw", identity(Kind::Directory, 4));
+            Ok(())
+        }).unwrap();
+        let with_mode = |mode: u32| Identity { mode: libc::S_IFDIR | mode, ..identity(Kind::Directory, 4) };
+        // The installer re-applies 0700: exactly that transition is re-recorded durably.
+        world.borrow_mut().put("/opt/duduclaw", with_mode(0o700));
+        let saves = world.borrow().saved.len();
+        recorder.rerecord_mode("/opt/duduclaw", 0o700).unwrap();
+        assert_eq!(world.borrow().saved.len(), saves + 1);
+        assert_eq!(recorder.ledger().entry("/opt/duduclaw").unwrap().identity, Some(with_mode(0o700)));
+        recorder.intend(&[("/opt/duduclaw", Kind::Directory)]).unwrap();
+        recorder.confirm(&["/opt/duduclaw"]).unwrap();
+        // Idempotent: nothing to re-record once recorded.
+        let saves = world.borrow().saved.len();
+        recorder.rerecord_mode("/opt/duduclaw", 0o700).unwrap();
+        assert_eq!(world.borrow().saved.len(), saves);
+        // Another party widens it: no re-record matches, the identity differs, the re-intent refuses.
+        world.borrow_mut().put("/opt/duduclaw", with_mode(0o777));
+        recorder.rerecord_mode("/opt/duduclaw", 0o755).unwrap();
+        assert_eq!(recorder.ledger().entry("/opt/duduclaw").unwrap().identity, Some(with_mode(0o700)));
+        assert!(recorder.intend(&[("/opt/duduclaw", Kind::Directory)]).is_err());
+        // Another object with the installer's mode is still another object.
+        world.borrow_mut().put("/opt/duduclaw", Identity { inode: 40, ..with_mode(0o755) });
+        recorder.rerecord_mode("/opt/duduclaw", 0o755).unwrap();
+        assert_eq!(recorder.ledger().entry("/opt/duduclaw").unwrap().identity, Some(with_mode(0o700)));
+        // Files never take this path.
+        assert!(recorder.rerecord_mode(UNIT_PATH, 0o644).is_ok(), "no entry: nothing to do");
+        recorder.record(&[(UNIT_PATH, Kind::File)], || Ok(())).unwrap();
+        assert!(recorder.rerecord_mode(UNIT_PATH, 0o644).is_err());
     }
 
     #[test]

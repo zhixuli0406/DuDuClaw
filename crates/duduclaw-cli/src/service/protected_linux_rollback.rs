@@ -31,12 +31,28 @@
 //! kernel that cannot report mount ids (before 5.8) refuses; there is no
 //! `st_dev` fallback. Bounded; no `rm -rf`. Finally no isolation fact may remain.
 //!
+//! Review M1: a ledgered object is never unlinked where it was checked. It is
+//! first moved (`renameat2(RENAME_NOREPLACE)`) into a fresh root-only (0700)
+//! quarantine directory with a random name in its own parent (same
+//! filesystem; a parent that is not root-owned or is writable by others
+//! refuses), its identity is verified again there by `statx`/fd with the same
+//! rules (mount id included), and only then is it removed inside the
+//! quarantine — a tree root likewise, then walked there with the mount-bounded
+//! logic. Anything that no longer matches is moved back (or, if that fails,
+//! left in the quarantine), kept, listed, and the rollback ends incomplete.
+//!
+//! Review M3: objects under `/run` recorded in an earlier boot are never
+//! deleted (the boot cleared what this transaction created; whatever is there
+//! now is someone else's). They are reported as left to the system and do not
+//! make the rollback incomplete once the units owning them were removed by
+//! this rollback; if those units could not be removed it stays incomplete.
+//!
 //! LOCK ORDER (see `protected_linux_bootstrap.rs`): 0 (the caller) → 1 (R1's
 //! stage lock) → 2 (`version_lock`) → 3 (updater state, before its removal).
 use super::*;
 use super::bootstrap::{self as boot, Journal, Phase, Step, Store};
 use super::ledger::{self, Entry, Kind, Ledger, Now};
-use std::{ffi::CStr, os::fd::FromRawFd};
+use std::{ffi::{CStr, CString}, os::fd::FromRawFd};
 use duduclaw_updated::linux::{bootstrap_verify, files::Directory};
 
 /// Stop order: the gateway (then the units it binds to), the nightly
@@ -66,6 +82,19 @@ pub(super) const LEDGER_DIRECTORIES: [&str; 5] = ["/usr/local/libexec/duduclaw",
 const MAX_TREE_ENTRIES: u32 = 200_000;
 const MAX_DIRECTORY_ENTRIES: usize = 100_000;
 const OTHER_MOUNT: &str = "要移除的目錄含有其他掛載點（或在檢查期間被更換），已停止回退；請先卸載後再執行同一個回退命令。";
+/// Review M3: the units whose runtime directory lives under `/run`.
+static RUNTIME_OWNERS: [(&str, [&str; 2]); 1] =
+    [(boot::SPAWND_RUNTIME, ["duduclaw-spawnd.socket", "duduclaw-spawnd.service"])];
+/// Owner of every parent a quarantine is created in (production: root).
+const ROOT_OWNER: u32 = 0;
+const QUARANTINE_PREFIX: &str = ".duduclaw-rollback-";
+
+#[cfg(test)]
+thread_local! {
+    /// Unit-test seam: runs after the first identity check, before the move
+    /// into the quarantine (a concurrent rename). Never set in production.
+    static AFTER_FIRST_CHECK: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
+}
 
 fn unit_path(name: &str) -> String { format!("/etc/systemd/system/{name}") }
 
@@ -102,8 +131,9 @@ pub(super) fn run(store: &Store, journal: Option<Journal>, generation: Option<&s
     let _stage = stage_lock()?;
     let _version = version_lock()?;
     // Without a ledger nothing was recorded as created, so nothing is removed.
-    let ledger = ledger::read(store)?.unwrap_or_else(|| Ledger::new(&journal.generation));
-    if ledger.generation != journal.generation { return Err(refused(ledger::LEDGER_DAMAGED)); }
+    // A ledger of another transaction (generation or nonce) is refused (review H3).
+    let ledger = ledger::read(store)?.unwrap_or_else(|| Ledger::new(&journal.generation, &journal.nonce));
+    ledger::belongs_to(&ledger, &journal.generation, &journal.nonce)?;
     let journal = if journal.step == Step::Rollback { journal } else {
         let marked = journal.at(Step::Rollback, Phase::Entered);
         store.write(Some(&journal), &marked)?;
@@ -111,14 +141,13 @@ pub(super) fn run(store: &Store, journal: Option<Journal>, generation: Option<&s
     };
     println!("正在回退尚未完成的隔離安裝……");
     let boot_id = ledger::boot_id()?;
-    // After a reboot systemd recreated spawnd's runtime directory (tmpfs) from
-    // this transaction's own socket unit: identified by that unit, not by inode.
-    let runtime_by_our_unit = owned_unit(&ledger, "duduclaw-spawnd.socket", &boot_id)?;
     stop_units(&ledger, &boot_id)?;
     removal::processes_clear()?;
     let mut kept: Vec<String> = Vec::new();
+    // Review M3: runtime directories of an earlier boot, left to the system.
+    let mut left: Vec<String> = Vec::new();
     for entry in ledger.entries.iter().filter(|entry| entry.kind == Kind::File) {
-        if remove_file(entry, &boot_id)? { kept.push(entry.path.clone()); }
+        if let Removal::Kept(path) = remove_ledgered(entry, &boot_id)? { kept.push(path); }
     }
     let reload = command("systemctl", &["daemon-reload"])?;
     if !reload.status.success() { return Err(refused("systemd 指令失敗或回應無法判讀。")); }
@@ -133,26 +162,59 @@ pub(super) fn run(store: &Store, journal: Option<Journal>, generation: Option<&s
             Err(_) => return Err(refused("更新服務的狀態目錄不是 root 擁有的安全目錄，已停止回退。")),
         };
         for entry in ledger.entries.iter().filter(|entry| entry.kind == Kind::Tree) {
-            let recreated_at_boot = runtime_by_our_unit && entry.path == boot::SPAWND_RUNTIME
-                && entry.identity.as_ref().is_none_or(|identity| identity.boot_id != boot_id);
-            if remove_tree_entry(entry, &boot_id, &kept, recreated_at_boot)? { kept.push(entry.path.clone()); }
+            if from_earlier_boot(entry, &boot_id) {
+                // Review M3: never deleted; left to the system once its units are gone.
+                let mut owners_removed = runtime_owners(&entry.path).is_some();
+                for unit in runtime_owners(&entry.path).unwrap_or_default() {
+                    if ledger::present(&unit_path(unit))? { owners_removed = false; }
+                }
+                if owners_removed { left.push(entry.path.clone()); } else { kept.push(entry.path.clone()); }
+                continue;
+            }
+            if let Removal::Kept(path) = remove_tree_entry(entry, &boot_id, &kept)? { kept.push(path); }
         }
     }
     // Deepest first, so a ledgered parent is empty once its ledgered children are gone.
     let mut directories: Vec<&Entry> = ledger.entries.iter().filter(|entry| entry.kind == Kind::Directory).collect();
     directories.sort_by_key(|entry| std::cmp::Reverse(Path::new(&entry.path).components().count()));
     for entry in directories {
-        if remove_directory(entry, &boot_id)? { kept.push(entry.path.clone()); }
+        if let Removal::Kept(path) = remove_ledgered(entry, &boot_id)? { kept.push(path); }
     }
-    let remaining: Vec<&str> = duduclaw_core::isolation_install::FACTS.iter().copied()
-        .filter(|fact| fs::symlink_metadata(fact).map(|_| true).unwrap_or_else(|error| error.kind() != std::io::ErrorKind::NotFound))
-        .collect();
+    let remaining = remaining_facts(|fact| fs::symlink_metadata(fact).map(|_| true)
+        .unwrap_or_else(|error| error.kind() != std::io::ErrorKind::NotFound), &left);
+    report_left(&left);
     finish(&kept, &remaining)?;
     remove_stage(&journal.generation)?;
     ledger::remove(store)?;
     store.remove()?;
     println!("已回退到安裝前的狀態。保留：系統帳號、空的 Gateway 資料目錄與團隊版授權、受保護模式標記，以及安裝包的防降版紀錄。");
     Ok(())
+}
+
+/// Review M3 (pure): a ledgered object under `/run` whose recorded identity
+/// was observed in another boot. That boot's tmpfs is gone; what is there now
+/// was not created by this transaction and is never deleted by rollback.
+pub(super) fn from_earlier_boot(entry: &Entry, boot_id: &str) -> bool {
+    entry.path.starts_with("/run/") && entry.identity.as_ref().is_some_and(|identity| identity.boot_id != boot_id)
+}
+
+/// The units owning a ledgered runtime directory (`None`: not a known one).
+pub(super) fn runtime_owners(path: &str) -> Option<&'static [&'static str]> {
+    RUNTIME_OWNERS.iter().find(|(runtime, _)| *runtime == path).map(|(_, units)| units.as_slice())
+}
+
+/// The isolation facts still present, except those below a runtime directory
+/// left to the system (review M3).
+pub(super) fn remaining_facts(present: impl Fn(&str) -> bool, left: &[String]) -> Vec<&'static str> {
+    duduclaw_core::isolation_install::FACTS.iter().copied()
+        .filter(|fact| !left.iter().any(|tree| fact.strip_prefix(tree.as_str()).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))))
+        .filter(|fact| present(*fact)).collect()
+}
+
+fn report_left(left: &[String]) {
+    if left.is_empty() { return; }
+    println!("[交由系統處理] 以下執行期目錄是在先前的開機中建立的，回退不會刪除（開機時或由 systemd 清除）；擁有它們的服務單元已由這次回退移除：");
+    for path in left { println!("  - {path}：runtime directory left to the system (cleared at boot / by systemd)"); }
 }
 
 /// Review F4: a rollback that kept anything, or left a fact, is incomplete and
@@ -235,73 +297,149 @@ fn stop_units(ledger: &Ledger, boot_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// `true` = kept (not the recorded object).
-fn remove_file(entry: &Entry, boot_id: &str) -> Result<bool> {
-    if !ledger::present(&entry.path)? { return Ok(false); }
-    let (directory, name) = ledger::open_parent(&entry.path)?;
-    remove_file_at(&directory, &name, entry, boot_id)
+/// What a ledgered removal did.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Removal {
+    Absent,
+    Removed,
+    /// Kept (not the recorded object, not removable, or left in a quarantine): the path to list.
+    Kept(String),
 }
 
-/// Unlink `name` only when it is exactly the ledgered object with one link.
-/// `true` = kept.
-pub(super) fn remove_file_at(directory: &fs::File, name: &CStr, entry: &Entry, boot_id: &str) -> Result<bool> {
-    match ledger::classify_at(directory, name, entry, boot_id)? {
-        Now::Absent => Ok(false),
-        Now::Other => Ok(true),
-        Now::Recorded => {
-            if ledger::stat_at(directory.as_raw_fd(), name)?.nlink != 1 { return Ok(true); }
-            // SAFETY: live dirfd and a NUL-terminated single-component name.
-            if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            directory.sync_all()?;
-            Ok(false)
-        }
-    }
-}
-
-fn remove_directory(entry: &Entry, boot_id: &str) -> Result<bool> {
-    if !ledger::present(&entry.path)? { return Ok(false); }
+/// A ledgered file, directory or tree by its fixed path.
+fn remove_ledgered(entry: &Entry, boot_id: &str) -> Result<Removal> {
+    if !ledger::present(&entry.path)? { return Ok(Removal::Absent); }
     let (parent, name) = ledger::open_parent(&entry.path)?;
-    match ledger::classify_at(&parent, &name, entry, boot_id)? {
-        Now::Absent => Ok(false),
-        Now::Other => Ok(true),
-        Now::Recorded => {
-            // SAFETY: live dirfd and a NUL-terminated single-component name.
-            if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
-                let error = std::io::Error::last_os_error();
-                // Not empty: something else lives there; keep it and report.
-                if matches!(error.raw_os_error(), Some(libc::ENOTEMPTY | libc::EEXIST)) { return Ok(true); }
-                return Err(error.into());
-            }
-            parent.sync_all()?;
-            Ok(false)
-        }
-    }
+    remove_ledgered_at(&parent, &name, entry, boot_id, ROOT_OWNER)
 }
 
-/// A ledgered tree, unless a kept object lies below it. `recreated_at_boot`:
-/// spawnd's runtime directory recorded in an earlier boot (or never confirmed)
-/// while this transaction's own socket unit recreates it at boot; then a
-/// root-owned directory there is removed (still never crossing a mount).
-fn remove_tree_entry(entry: &Entry, boot_id: &str, kept: &[String], recreated_at_boot: bool) -> Result<bool> {
+/// A ledgered tree, unless a kept object lies below it.
+fn remove_tree_entry(entry: &Entry, boot_id: &str, kept: &[String]) -> Result<Removal> {
     if kept.iter().any(|path| path.strip_prefix(entry.path.as_str()).is_some_and(|rest| rest.starts_with('/'))) {
-        return Ok(true);
+        return Ok(Removal::Kept(entry.path.clone()));
     }
-    if !ledger::present(&entry.path)? { return Ok(false); }
-    let (parent, name) = ledger::open_parent(&entry.path)?;
-    let recorded = match ledger::classify_at(&parent, &name, entry, boot_id)? {
-        Now::Absent => return Ok(false),
-        Now::Recorded => true,
-        Now::Other => {
-            let stat = ledger::stat_at(parent.as_raw_fd(), &name)?;
-            recreated_at_boot && stat.mode & libc::S_IFMT == libc::S_IFDIR && stat.uid == 0 && stat.gid == 0
+    remove_ledgered(entry, boot_id)
+}
+
+fn rename_noreplace(from: &fs::File, old: &CStr, to: &fs::File, new: &CStr) -> std::io::Result<()> {
+    // SAFETY: live dirfds and NUL-terminated single-component names; never replaces.
+    if unsafe { libc::syscall(libc::SYS_renameat2, from.as_raw_fd(), old.as_ptr(), to.as_raw_fd(), new.as_ptr(),
+        libc::RENAME_NOREPLACE) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Review M1: a fresh root-only directory with a random name in `parent`.
+struct Quarantine { name: CString, directory: fs::File }
+
+impl Quarantine {
+    /// `parent` must be a directory owned by `owner` and not writable by group
+    /// or others; the quarantine is created 0700 there (same filesystem) and
+    /// proven to be a fresh owner-only directory on the parent's mount.
+    fn create(parent: &fs::File, owner: u32, path: &str) -> Result<Self> {
+        let unavailable = || refused(ledger::MOUNT_ID_UNAVAILABLE);
+        let unsafe_parent = || refused(format!("{path} 的上層目錄不是 root 擁有的目錄，或可被其他帳號寫入；無法安全地移除它，已停止回退。"));
+        let stat = ledger::stat_at(parent.as_raw_fd(), c"")?;
+        if stat.mode & libc::S_IFMT != libc::S_IFDIR || stat.uid != owner || stat.mode & 0o022 != 0 {
+            return Err(unsafe_parent());
         }
+        let parent_mount = stat.mount_id.ok_or_else(unavailable)?;
+        let name = CString::new(format!("{QUARANTINE_PREFIX}{}", boot::random_hex(16)?)).map_err(|_| unsafe_parent())?;
+        // SAFETY: live dirfd and a NUL-terminated single-component name.
+        if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let directory = match open_directory_at(parent, &name) {
+            Ok(directory) => directory,
+            Err(error) => {
+                // SAFETY: live dirfd and a NUL-terminated single-component name.
+                unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR); }
+                return Err(error);
+            }
+        };
+        let quarantine = Self { name, directory };
+        // SAFETY: scalar arguments on a live descriptor (umask may have narrowed the mode).
+        let chmod = unsafe { libc::fchmod(quarantine.directory.as_raw_fd(), 0o700) } == 0;
+        let created = ledger::stat_at(quarantine.directory.as_raw_fd(), c"")?;
+        if !chmod || created.mode & 0o7777 != 0o700 || created.uid != owner || created.device != stat.device
+            || created.mode & libc::S_IFMT != libc::S_IFDIR || created.mount_id.ok_or_else(unavailable)? != parent_mount {
+            quarantine.discard(parent);
+            return Err(unsafe_parent());
+        }
+        Ok(quarantine)
+    }
+
+    /// Remove the quarantine directory when it is empty; otherwise it stays.
+    fn discard(&self, parent: &fs::File) -> bool {
+        // SAFETY: live dirfd and a NUL-terminated single-component name.
+        let removed = unsafe { libc::unlinkat(parent.as_raw_fd(), self.name.as_ptr(), libc::AT_REMOVEDIR) } == 0;
+        let _ = parent.sync_all();
+        removed
+    }
+}
+
+/// Review M1: remove the ledgered object `name` below `parent` (whose
+/// owner must be `owner`: root in production) only through a quarantine.
+/// First check → move into the quarantine without replacing → verify the
+/// moved object again there (same rule, mount id included; one link for
+/// files) → remove it inside the quarantine. On any mismatch it is moved back
+/// without replacing (left in the quarantine if that fails) and kept.
+pub(super) fn remove_ledgered_at(parent: &fs::File, name: &CStr, entry: &Entry, boot_id: &str, owner: u32) -> Result<Removal> {
+    match ledger::classify_at(parent, name, entry, boot_id)? {
+        Now::Absent => return Ok(Removal::Absent),
+        Now::Other => return Ok(Removal::Kept(entry.path.clone())),
+        Now::Recorded => (),
+    }
+    if entry.kind == Kind::Contents { return Err(refused(ledger::LEDGER_DAMAGED)); }
+    #[cfg(test)]
+    AFTER_FIRST_CHECK.with(|hook| if let Some(hook) = hook.borrow_mut().as_mut() { hook() });
+    let quarantine = Quarantine::create(parent, owner, &entry.path)?;
+    if let Err(error) = rename_noreplace(parent, name, &quarantine.directory, name) {
+        quarantine.discard(parent);
+        if error.raw_os_error() == Some(libc::ENOENT) { return Ok(Removal::Absent); }
+        return Err(error.into());
+    }
+    let inside = &quarantine.directory;
+    // An error here still moves the object back below (then is reported).
+    let same = (|| -> Result<bool> {
+        Ok(ledger::classify_at(inside, name, entry, boot_id)? == Now::Recorded
+            && (entry.kind != Kind::File || ledger::stat_at(inside.as_raw_fd(), name)?.nlink == 1))
+    })();
+    let removed: Result<bool> = match (same, entry.kind) {
+        (Err(error), _) => Err(error),
+        (Ok(false), _) => Ok(false),
+        // SAFETY: live dirfd and a NUL-terminated single-component name.
+        (Ok(true), Kind::File) => if unsafe { libc::unlinkat(inside.as_raw_fd(), name.as_ptr(), 0) } == 0 { Ok(true) }
+            else { Err(std::io::Error::last_os_error().into()) },
+        // SAFETY: live dirfd and a NUL-terminated single-component name.
+        (Ok(true), Kind::Directory) => if unsafe { libc::unlinkat(inside.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } == 0 {
+            Ok(true)
+        } else {
+            let error = std::io::Error::last_os_error();
+            // Not empty: something else lives there; keep it and report.
+            if matches!(error.raw_os_error(), Some(libc::ENOTEMPTY | libc::EEXIST)) { Ok(false) } else { Err(error.into()) }
+        },
+        (Ok(true), Kind::Tree) => remove_below(inside, name).map(|()| true),
+        (Ok(true), Kind::Contents) => Err(refused(ledger::LEDGER_DAMAGED)),
     };
-    if !recorded { return Ok(true); }
-    remove_below(&parent, &name)?;
-    parent.sync_all()?;
-    Ok(false)
+    if matches!(removed, Ok(true)) {
+        inside.sync_all()?;
+        quarantine.discard(parent);
+        return Ok(Removal::Removed);
+    }
+    // Not the recorded object (or not removable): back where it was, never replacing.
+    let restored = rename_noreplace(inside, name, parent, name).is_ok();
+    let _ = parent.sync_all();
+    let kept = if restored {
+        quarantine.discard(parent);
+        entry.path.clone()
+    } else {
+        let directory = Path::new(&entry.path).parent().map(|path| path.display().to_string()).unwrap_or_default();
+        format!("{}（已移到隔離目錄 {directory}/{}/ 內）", entry.path, quarantine.name.to_string_lossy())
+    };
+    removed?;
+    Ok(Removal::Kept(kept))
 }
 
 /// The gateway's data written after its S8 snapshot (the account's own
@@ -498,6 +636,23 @@ mod tests {
         assert!(directory.path().join("tree").is_dir());
     }
 
+    /// The test user owns the temporary parents (production: root).
+    fn me() -> u32 { unsafe { libc::geteuid() } }
+
+    /// Every name in `directory` (a quarantine left behind would show here).
+    fn names(directory: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(directory).unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap()).collect();
+        names.sort();
+        names
+    }
+
+    fn recorded_entry(dir: &fs::File, name: &CStr, kind: Kind) -> Entry {
+        let path = if kind == Kind::File { UNIT_PATH } else { "/opt/duduclaw" };
+        Entry { path: path.into(), kind, state: State::Created,
+            identity: ledger::identity_at(dir, name, kind).unwrap(), keep: Vec::new() }
+    }
+
     #[test]
     fn rollback_keeps_object_whose_identity_differs_and_ends_incomplete() {
         let directory = tempfile::tempdir().unwrap();
@@ -511,24 +666,125 @@ mod tests {
         // A package or an administrator replaced it after the interruption.
         fs::write(directory.path().join("unit.pkg"), b"theirs").unwrap();
         fs::rename(directory.path().join("unit.pkg"), &path).unwrap();
-        assert!(remove_file_at(&dir, c"unit", &entry, &boot_id).unwrap(), "kept");
+        assert_eq!(remove_ledgered_at(&dir, c"unit", &entry, &boot_id, me()).unwrap(), Removal::Kept(UNIT_PATH.into()));
         assert_eq!(fs::read(&path).unwrap(), b"theirs");
         assert!(finish(&[entry.path.clone()], &[]).is_err(), "an incomplete rollback never reports done");
         // An intent without an identity matches nothing either.
         let intent = Entry { identity: None, state: State::Intent, ..entry.clone() };
-        assert!(remove_file_at(&dir, c"unit", &intent, &boot_id).unwrap());
+        assert!(matches!(remove_ledgered_at(&dir, c"unit", &intent, &boot_id, me()).unwrap(), Removal::Kept(_)));
         assert!(path.exists());
         // The recorded object itself is removed; then the path is simply absent.
         let ours = Entry { identity: ledger::identity_at(&dir, c"unit", Kind::File).unwrap(), ..entry.clone() };
-        assert!(!remove_file_at(&dir, c"unit", &ours, &boot_id).unwrap());
+        assert_eq!(remove_ledgered_at(&dir, c"unit", &ours, &boot_id, me()).unwrap(), Removal::Removed);
         assert!(!path.exists());
-        assert!(!remove_file_at(&dir, c"unit", &ours, &boot_id).unwrap());
-        // A hard-linked object is kept even when it is the recorded inode.
+        assert!(names(directory.path()).is_empty(), "no quarantine is left behind");
+        assert_eq!(remove_ledgered_at(&dir, c"unit", &ours, &boot_id, me()).unwrap(), Removal::Absent);
+        // A hard-linked object is kept even when it is the recorded inode (moved back from the quarantine).
         fs::write(&path, b"ours").unwrap();
         let linked = Entry { identity: ledger::identity_at(&dir, c"unit", Kind::File).unwrap(), ..entry };
         fs::hard_link(&path, directory.path().join("alias")).unwrap();
-        assert!(remove_file_at(&dir, c"unit", &linked, &boot_id).unwrap());
+        assert!(matches!(remove_ledgered_at(&dir, c"unit", &linked, &boot_id, me()).unwrap(), Removal::Kept(_)));
+        assert_eq!(names(directory.path()), vec!["alias".to_owned(), "unit".to_owned()]);
         finish(&[], &[]).unwrap();
         assert!(finish(&[], &["/usr/lib/duduclaw"]).is_err());
+    }
+
+    #[test]
+    fn quarantine_detects_swap_after_first_check_and_moves_it_back() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("unit");
+        fs::write(&path, b"ours").unwrap();
+        let dir = fs::File::open(directory.path()).unwrap();
+        let boot_id = ledger::boot_id().unwrap();
+        let entry = recorded_entry(&dir, c"unit", Kind::File);
+        // A concurrent rename swaps another object in right after the first check passed.
+        let swap = directory.path().to_path_buf();
+        AFTER_FIRST_CHECK.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+            fs::write(swap.join("unit.other"), b"theirs").unwrap();
+            fs::rename(swap.join("unit.other"), swap.join("unit")).unwrap();
+        })));
+        let result = remove_ledgered_at(&dir, c"unit", &entry, &boot_id, me());
+        AFTER_FIRST_CHECK.with(|hook| *hook.borrow_mut() = None);
+        assert_eq!(result.unwrap(), Removal::Kept(UNIT_PATH.into()), "detected inside the quarantine");
+        // Kept, moved back to its own name, and the empty quarantine is gone.
+        assert_eq!(fs::read(&path).unwrap(), b"theirs");
+        assert_eq!(names(directory.path()), vec!["unit".to_owned()]);
+        assert!(finish(&[UNIT_PATH.into()], &[]).is_err());
+        // The same for a directory swapped for another directory (a freed
+        // inode number may be reused at once, so the impostor's mode differs too).
+        use std::os::unix::fs::PermissionsExt;
+        fs::create_dir(directory.path().join("dir")).unwrap();
+        fs::set_permissions(directory.path().join("dir"), fs::Permissions::from_mode(0o755)).unwrap();
+        let entry = recorded_entry(&dir, c"dir", Kind::Directory);
+        let swap = directory.path().to_path_buf();
+        AFTER_FIRST_CHECK.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+            fs::remove_dir(swap.join("dir")).unwrap();
+            fs::create_dir(swap.join("dir")).unwrap();
+            fs::set_permissions(swap.join("dir"), fs::Permissions::from_mode(0o700)).unwrap();
+        })));
+        let result = remove_ledgered_at(&dir, c"dir", &entry, &boot_id, me());
+        AFTER_FIRST_CHECK.with(|hook| *hook.borrow_mut() = None);
+        assert!(matches!(result.unwrap(), Removal::Kept(_)));
+        assert!(directory.path().join("dir").is_dir());
+        assert_eq!(names(directory.path()), vec!["dir".to_owned(), "unit".to_owned()]);
+        // Unchanged: a tree root is removed through the quarantine with its contents.
+        fs::create_dir_all(directory.path().join("tree/a")).unwrap();
+        fs::write(directory.path().join("tree/a/file"), b"x").unwrap();
+        let tree = Entry { path: "/usr/lib/duduclaw".into(), kind: Kind::Tree, state: State::Created,
+            identity: ledger::identity_at(&dir, c"tree", Kind::Tree).unwrap(), keep: Vec::new() };
+        assert_eq!(remove_ledgered_at(&dir, c"tree", &tree, &boot_id, me()).unwrap(), Removal::Removed);
+        assert_eq!(names(directory.path()), vec!["dir".to_owned(), "unit".to_owned()]);
+    }
+
+    #[test]
+    fn quarantine_refuses_parent_not_owned_or_writable_by_others() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("unit");
+        fs::write(&path, b"ours").unwrap();
+        let dir = fs::File::open(directory.path()).unwrap();
+        let boot_id = ledger::boot_id().unwrap();
+        let entry = recorded_entry(&dir, c"unit", Kind::File);
+        // The parent is not owned by the required owner (production: root).
+        assert!(remove_ledgered_at(&dir, c"unit", &entry, &boot_id, me().wrapping_add(1)).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"ours");
+        assert_eq!(names(directory.path()), vec!["unit".to_owned()]);
+        // Writable by others.
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(remove_ledgered_at(&dir, c"unit", &entry, &boot_id, me()).is_err());
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(names(directory.path()), vec!["unit".to_owned()]);
+        assert_eq!(remove_ledgered_at(&dir, c"unit", &entry, &boot_id, me()).unwrap(), Removal::Removed);
+    }
+
+    #[test]
+    fn post_reboot_run_entries_are_left_to_the_system_and_reported() {
+        let boot = "0123abcd-0000-4000-8000-00000000beef";
+        let identity = Identity { device: 1, inode: 2, mount_id: 3, mode: libc::S_IFDIR | 0o755, uid: 0, gid: 0,
+            size: None, sha256: None, boot_id: "ffffffff-0000-4000-8000-000000000000".into() };
+        let runtime = Entry { path: boot::SPAWND_RUNTIME.into(), kind: Kind::Tree, state: State::Created,
+            identity: Some(identity.clone()), keep: Vec::new() };
+        // Recorded in another boot: never deleted by rollback.
+        assert!(from_earlier_boot(&runtime, boot));
+        // Same boot: the ordinary identity rule applies.
+        let same_boot = Entry { identity: Some(Identity { boot_id: boot.into(), ..identity.clone() }), ..runtime.clone() };
+        assert!(!from_earlier_boot(&same_boot, boot));
+        // Not under /run, or never confirmed: the ordinary rule (kept unless it matches).
+        let durable = Entry { path: "/var/lib/duduclaw-spawnd".into(), ..runtime.clone() };
+        assert!(!from_earlier_boot(&durable, boot));
+        let unconfirmed = Entry { identity: None, state: State::Intent, ..runtime.clone() };
+        assert!(!from_earlier_boot(&unconfirmed, boot));
+        // Its owning units are known; an unknown runtime path has none (kept).
+        assert_eq!(runtime_owners(boot::SPAWND_RUNTIME), Some(&["duduclaw-spawnd.socket", "duduclaw-spawnd.service"][..]));
+        assert_eq!(runtime_owners("/run/other"), None);
+        // Facts below a left runtime directory do not make the rollback incomplete.
+        let below_runtime: Vec<&str> = duduclaw_core::isolation_install::FACTS.iter().copied()
+            .filter(|fact| fact.starts_with(&format!("{}/", boot::SPAWND_RUNTIME))).collect();
+        let everything = remaining_facts(|_| true, &[]);
+        let left = remaining_facts(|_| true, &[boot::SPAWND_RUNTIME.to_owned()]);
+        for fact in &below_runtime { assert!(everything.contains(fact) && !left.contains(fact), "{fact}"); }
+        assert_eq!(left.len() + below_runtime.len(), everything.len());
+        report_left(&[boot::SPAWND_RUNTIME.to_owned()]);
+        finish(&[], &remaining_facts(|_| false, &[boot::SPAWND_RUNTIME.to_owned()])).unwrap();
     }
 }

@@ -373,7 +373,8 @@ pub(crate) fn facts_present(root: &Path) -> Vec<&'static str> {
 pub(crate) struct Journal { pub mode: BootstrapMode, pub generation: Sha256Digest, pub committed: bool }
 
 /// Minimal strict read of R3's journal: the four fields this decision needs, each
-/// with an exact type. R3 owns the full `deny_unknown_fields` schema. Malformed = refuse.
+/// with an exact type. R3 owns the full `deny_unknown_fields` schema (schema 2
+/// since R3 review M4; an older journal is refused here as well). Malformed = refuse.
 fn read_journal(protected: &Path) -> Result<Option<Journal>> {
     let dir = match Directory::open(protected) {
         Ok(dir) => dir,
@@ -388,7 +389,7 @@ fn read_journal(protected: &Path) -> Result<Option<Journal>> {
     };
     let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| Error::Maintenance)?;
     let object = value.as_object().ok_or(Error::Maintenance)?;
-    if object.get("schema_version").and_then(serde_json::Value::as_u64) != Some(1) { return Err(Error::Maintenance); }
+    if object.get("schema_version").and_then(serde_json::Value::as_u64) != Some(2) { return Err(Error::Maintenance); }
     let mode = match object.get("mode").and_then(serde_json::Value::as_str) {
         Some("install") => BootstrapMode::Install,
         Some("upgrade") => BootstrapMode::Upgrade,
@@ -1985,7 +1986,7 @@ pub(crate) mod tests {
     fn write_journal(config: &Config, mode: &str, generation: &str, committed: bool) {
         let path = config.paths.protected.join(BOOTSTRAP_JOURNAL);
         let _ = std::fs::remove_file(&path);
-        std::fs::write(&path, serde_json::to_vec(&serde_json::json!({"schema_version": 1, "mode": mode,
+        std::fs::write(&path, serde_json::to_vec(&serde_json::json!({"schema_version": 2, "mode": mode,
             "generation": generation, "step": "verified", "committed": committed})).unwrap()).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
