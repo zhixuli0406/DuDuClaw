@@ -55,6 +55,10 @@ mod native_pty;
 #[cfg(target_os = "linux")]
 pub mod installed;
 
+/// R7a: trampoline readiness from spawnd's own isolation self-test.
+#[cfg(any(target_os = "linux", test))]
+pub mod selftest;
+
 #[cfg(target_os = "linux")]
 pub mod gateway_mcp;
 

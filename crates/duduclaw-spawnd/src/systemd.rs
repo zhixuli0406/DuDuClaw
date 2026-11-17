@@ -193,6 +193,39 @@ impl UnitPolicy {
     }
 }
 
+/// R7a: the directory the installer writes every fixed DuDuClaw unit file to
+/// (the same directory as the isolation facts' unit files).
+pub const FIXED_UNIT_DIRECTORY: &str = "/etc/systemd/system";
+/// PID 1's view of a fixed unit, read back before it is started.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixedUnitLoad {
+    pub id: String, pub load_state: String, pub fragment_path: String,
+    pub drop_in_paths: Vec<String>, pub need_daemon_reload: bool, pub transient: bool,
+}
+/// Only the single allow-listed unit, loaded by PID 1 from exactly its own file
+/// in [`FIXED_UNIT_DIRECTORY`], with no drop-in, no pending daemon-reload and
+/// not transient (a transient unit of the same name would carry caller-chosen
+/// properties). Anything else refuses before any start.
+pub fn fixed_unit_load_valid(name: &str, load: &FixedUnitLoad) -> bool {
+    name == duduclaw_isolation::ids::ISOLATION_SELFTEST_UNIT && load.id == name && load.load_state == "loaded"
+        && load.fragment_path == format!("{FIXED_UNIT_DIRECTORY}/{name}")
+        && load.drop_in_paths.is_empty() && !load.need_daemon_reload && !load.transient
+}
+/// The started invocation has finished: PID 1 reports a new, non-zero
+/// InvocationID (not the one read before `StartUnit`) and the unit is back to
+/// `inactive` or `failed`. A start that never acquires an invocation times out.
+pub fn fixed_unit_finished(before: &[u8], invocation: &[u8], active_state: &str) -> bool {
+    invocation.len() == 16 && invocation.iter().any(|byte| *byte != 0) && invocation != before
+        && matches!(active_state, "inactive" | "failed")
+}
+/// How the fixed oneshot unit ended, as PID 1 records it. The journal is never parsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixedUnitOutcome { pub result: String, pub exec_main_code: i32, pub exec_main_status: i32, pub invocation: Vec<u8> }
+impl FixedUnitOutcome {
+    /// `Result=success`, exited normally (CLD_EXITED) with status 0. Anything else fails.
+    pub fn passed(&self) -> bool { self.result == "success" && self.exec_main_code == 1 && self.exec_main_status == 0 }
+}
+
 /// The DNS second layer must not exempt private resolver IPs (r7 supersedes §4.3).
 pub fn egress_second_layer_valid(address_allow: &[String], dns_route: &str) -> bool {
     address_allow.is_empty() && matches!(dns_route, "resolved_varlink" | "dedicated_dns_broker")
@@ -536,6 +569,56 @@ pub mod linux {
             released?;
             Ok(status)
         }
+        /// R7a: start the pre-installed fixed unit `name` through PID 1 and wait,
+        /// at most `deadline`, for that invocation to finish. Only
+        /// [`duduclaw_isolation::ids::ISOLATION_SELFTEST_UNIT`] is accepted, and
+        /// only while PID 1 loads it from its own file with no drop-in, no
+        /// pending reload, not transient ([`fixed_unit_load_valid`]) and not
+        /// already running. Same polling style as [`Self::run_cgroup_probe`].
+        pub fn run_fixed_unit(&self, name: &str, deadline: Duration) -> io::Result<FixedUnitOutcome> {
+            if name != duduclaw_isolation::ids::ISOLATION_SELFTEST_UNIT { return Err(invalid()); }
+            let manager = self.manager()?;
+            let path: OwnedObjectPath = manager.call("LoadUnit", &(name,)).map_err(bus_error)?;
+            let unit = Proxy::new(&self.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Unit").map_err(bus_error)?;
+            let load = FixedUnitLoad {
+                id: unit.get_property("Id").map_err(bus_error)?,
+                load_state: unit.get_property("LoadState").map_err(bus_error)?,
+                fragment_path: unit.get_property("FragmentPath").map_err(bus_error)?,
+                drop_in_paths: unit.get_property("DropInPaths").map_err(bus_error)?,
+                need_daemon_reload: unit.get_property("NeedDaemonReload").map_err(bus_error)?,
+                transient: unit.get_property("Transient").map_err(bus_error)?,
+            };
+            if !fixed_unit_load_valid(name, &load) { return Err(invalid()); }
+            let state: String = unit.get_property("ActiveState").map_err(bus_error)?;
+            match state.as_str() {
+                "inactive" => {}
+                // A previous failed invocation: clear it so this start is fresh.
+                "failed" => manager.call::<_, _, ()>("ResetFailedUnit", &(name,)).map_err(bus_error)?,
+                // Someone else's invocation is in progress: never adopt its result.
+                _ => return Err(invalid()),
+            }
+            let before: Vec<u8> = unit.get_property("InvocationID").map_err(bus_error)?;
+            let _job: OwnedObjectPath = manager.call("StartUnit", &(name, "replace")).map_err(bus_error)?;
+            let service = Proxy::new(&self.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Service").map_err(bus_error)?;
+            let until = Instant::now() + deadline;
+            let outcome = loop {
+                let state: String = unit.get_property("ActiveState").map_err(bus_error)?;
+                let invocation: Vec<u8> = unit.get_property("InvocationID").map_err(bus_error)?;
+                if fixed_unit_finished(&before, &invocation, &state) {
+                    break FixedUnitOutcome { result: service.get_property("Result").map_err(bus_error)?,
+                        exec_main_code: service.get_property("ExecMainCode").map_err(bus_error)?,
+                        exec_main_status: service.get_property("ExecMainStatus").map_err(bus_error)?, invocation };
+                }
+                if Instant::now() >= until {
+                    let _: zbus::Result<OwnedObjectPath> = manager.call("StopUnit", &(name, "replace"));
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            };
+            // The outcome is read; a failed state would otherwise linger in PID 1.
+            if state_failed(&unit) { let _: zbus::Result<()> = manager.call("ResetFailedUnit", &(name,)); }
+            Ok(outcome)
+        }
         /// Descriptors must be validated by B1 before this call. Runtime release
         /// remains blocked on the bootstrap handshake and B2 status readback.
         pub fn start(&self, policy: &UnitPolicy, bootstrap: BorrowedFd<'_>,
@@ -738,6 +821,9 @@ pub mod linux {
             }
             host_pty_budget()
         }
+    }
+    fn state_failed(unit: &Proxy<'_>) -> bool {
+        unit.get_property::<String>("ActiveState").is_ok_and(|state| state == "failed")
     }
     pub fn host_pty_budget() -> io::Result<u32> {
         pty_budget(&std::fs::read_to_string("/proc/sys/kernel/pty/max")?,
@@ -981,6 +1067,61 @@ mod tests {
     fn timeouts() -> RunTimeouts {
         RunTimeouts { queue_ms: 30000, startup_ms: 5000, runtime_ms: 60000,
             pty_idle_ms: Some(30000), termination_grace_ms: 5000 }
+    }
+    fn selftest_load() -> FixedUnitLoad {
+        FixedUnitLoad { id: "duduclaw-isolation-selftest.service".into(), load_state: "loaded".into(),
+            fragment_path: "/etc/systemd/system/duduclaw-isolation-selftest.service".into(),
+            drop_in_paths: vec![], need_daemon_reload: false, transient: false }
+    }
+    /// R7a: the fixed unit is started only when PID 1 loads exactly the
+    /// installed file; every deviation refuses before StartUnit.
+    #[test]
+    fn selftest_fixed_unit_readback_refuses_any_other_source() {
+        use duduclaw_isolation::ids::ISOLATION_SELFTEST_UNIT;
+        let good = selftest_load();
+        assert!(fixed_unit_load_valid(ISOLATION_SELFTEST_UNIT, &good));
+        // Only the allow-listed name, even when everything else matches.
+        let mut other = good.clone(); other.id = "duduclaw-spawnd.service".into();
+        other.fragment_path = "/etc/systemd/system/duduclaw-spawnd.service".into();
+        assert!(!fixed_unit_load_valid("duduclaw-spawnd.service", &other));
+        assert!(parse_run_unit(ISOLATION_SELFTEST_UNIT).is_none());
+        let cases: [fn(&mut FixedUnitLoad); 8] = [
+            |l| l.fragment_path = "/run/systemd/system/duduclaw-isolation-selftest.service".into(),
+            |l| l.fragment_path = "/usr/lib/systemd/system/duduclaw-isolation-selftest.service".into(),
+            |l| l.fragment_path = String::new(),
+            |l| l.drop_in_paths = vec!["/etc/systemd/system/duduclaw-isolation-selftest.service.d/x.conf".into()],
+            |l| l.need_daemon_reload = true,
+            |l| l.transient = true,
+            |l| l.load_state = "not-found".into(),
+            |l| l.id = "duduclaw-isolation-ready.service".into(),
+        ];
+        for (index, change) in cases.iter().enumerate() {
+            let mut load = selftest_load();
+            change(&mut load);
+            assert!(!fixed_unit_load_valid(ISOLATION_SELFTEST_UNIT, &load), "case {index}");
+        }
+    }
+    #[test]
+    fn selftest_fixed_unit_finishes_only_on_a_new_invocation_and_passes_only_on_exit_zero() {
+        let old = [7u8; 16];
+        let new = [9u8; 16];
+        assert!(fixed_unit_finished(&old, &new, "inactive"));
+        assert!(fixed_unit_finished(&[], &new, "failed"));
+        // The previous invocation's result is never adopted.
+        assert!(!fixed_unit_finished(&old, &old, "inactive"));
+        for state in ["active", "activating", "deactivating", "reloading", ""] {
+            assert!(!fixed_unit_finished(&old, &new, state), "{state}");
+        }
+        assert!(!fixed_unit_finished(&old, &[0; 16], "inactive"));
+        assert!(!fixed_unit_finished(&old, &[9; 15], "inactive"));
+        let pass = FixedUnitOutcome { result: "success".into(), exec_main_code: 1, exec_main_status: 0, invocation: new.to_vec() };
+        assert!(pass.passed());
+        for outcome in [FixedUnitOutcome { exec_main_status: 22, ..pass.clone() },
+            FixedUnitOutcome { exec_main_code: 2, ..pass.clone() },
+            FixedUnitOutcome { result: "exit-code".into(), ..pass.clone() },
+            FixedUnitOutcome { result: "timeout".into(), ..pass.clone() }] {
+            assert!(!outcome.passed(), "{outcome:?}");
+        }
     }
     #[test]
     fn run_unit_parser_accepts_only_exact_canonical_names() {

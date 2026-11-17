@@ -1,0 +1,51 @@
+[Unit]
+Description=DuDuClaw isolation self-test (namespaces, Landlock, seccomp)
+# R7a: started only by duduclaw-spawnd through PID 1 (StartUnit, by this exact
+# name) after its start-up recovery; spawnd first reads back that PID 1 loads
+# this file from /etc/systemd/system with no drop-ins, then reads Result,
+# ExecMainCode and ExecMainStatus. Exit 0 + Result=success is the only pass.
+# Not a run unit (name is not duduclaw-run-<hex>.service), so no run inventory,
+# census or reconciliation counts it. No [Install]: nothing enables it.
+# Failure: one JSON line {"code":"selftest_failed","stage":"<name>"} in the
+# journal and a per-stage exit code (crates/duduclaw-run/src/bin/selftest.rs).
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+ExecStart=/usr/lib/duduclaw/duduclaw-run-selftest
+User=root
+Group=root
+Slice=duduclaw-tcb.slice
+TimeoutStartSec=30
+KillMode=control-group
+# Exactly the trampoline's bounding set and namespace allowance
+# (duduclaw-spawnd systemd.rs TRAMPOLINE_CAPABILITIES / TRAMPOLINE_NAMESPACES;
+# pinned by spawnd's unit-file test).
+CapabilityBoundingSet=CAP_CHOWN CAP_SETGID CAP_SETUID CAP_SETPCAP CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_RESOURCE
+AmbientCapabilities=
+RestrictNamespaces=mnt ipc uts net pid
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+# The test unshares its own network namespace and brings up only its loopback;
+# this outer one only guarantees no host network either way.
+PrivateNetwork=yes
+# AF_UNIX: the assertions and NSS; AF_NETLINK: the private loopback.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+UMask=0077
+LimitCORE=0
+TasksMax=16
+MemoryMax=128M
+Environment=
+StandardInput=null
+StandardOutput=journal
+StandardError=journal

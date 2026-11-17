@@ -5492,6 +5492,18 @@
       "rationale": "Root acceptance fixture forks isolated syscall/namespace test children; root-test-fixture feature is required and release builds are forbidden."
     },
     {
+      "symbol": "crates/duduclaw-run/src/bin/selftest.rs::linux::main",
+      "apis": {
+        "raw_fork": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "trampoline",
+      "migration": "privileged_service",
+      "rationale": "R7a shipped isolation self-test (duduclaw-run-selftest), started only by PID 1 through the fixed root unit duduclaw-isolation-selftest.service with the trampoline's capability bounding set. Refuses any argument, reads no environment or stdin, closes every fd above 2. After the trampoline library's namespace entry, build_root/pivot and loopback it unshares a PID namespace and forks exactly one child that becomes that namespace's init, mounts its own /proc, drops to the dedicated non-login duduclaw-selftest account, applies runner::restrict_filesystem and the common seccomp filter, runs fixed filesystem assertions and _exits. No exec, no employee or gateway input; the parent only waits with a deadline."
+    },
+    {
       "symbol": "crates/duduclaw-run/src/bin/root-fixture/launch.rs::run",
       "apis": {
         "raw_fork": 1

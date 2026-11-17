@@ -88,6 +88,8 @@ BIN_PACKAGES = {
     "duduclaw": "duduclaw-cli",
     "duduclaw-spawnd": "duduclaw-spawnd",
     "duduclaw-run": "duduclaw-run",
+    # R7a isolation self-test, same crate and build as the trampoline.
+    "duduclaw-run-selftest": "duduclaw-run",
     "duduclaw-egress": "duduclaw-egress",
     "duduclaw-updated": "duduclaw-updated",
     # Root transition verifier (plan R1); customers compare its published SHA-256.
@@ -101,7 +103,7 @@ BIN_PACKAGES = {
 }
 INSTALL_BINARIES = {
     "gateway": "duduclaw", "spawnd": "duduclaw-spawnd",
-    "trampoline": "duduclaw-run", "egress": "duduclaw-egress",
+    "trampoline": "duduclaw-run", "trampoline_selftest": "duduclaw-run-selftest", "egress": "duduclaw-egress",
     "egress_forwarder": "duduclaw-egress", "mcp_bridge": "duduclaw-mcp-bridge",
     "parse_worker": "duduclaw-parse-worker", "importer": "duduclaw-import",
     "migration": "duduclaw-migrate", "update_slot": "duduclaw-updated",

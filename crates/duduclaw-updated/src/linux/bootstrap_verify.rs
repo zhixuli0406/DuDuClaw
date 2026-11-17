@@ -1306,7 +1306,8 @@ pub(crate) mod tests {
         let roots: Vec<PrivateKey> = pairs.into_iter().map(|(secret, _)| secret).collect();
         let root_bytes = canonical_bytes(&root).unwrap();
         let root_signatures = root_sign(&root, &roots, &root_bytes, ROOT_SSHSIG_NAMESPACE, &[0, 1]);
-        let targets = [InstallTarget::Gateway, InstallTarget::Spawnd, InstallTarget::Trampoline, InstallTarget::Egress,
+        let targets = [InstallTarget::Gateway, InstallTarget::Spawnd, InstallTarget::Trampoline,
+            InstallTarget::TrampolineSelftest, InstallTarget::Egress,
             InstallTarget::EgressForwarder, InstallTarget::McpBridge, InstallTarget::ParseWorker, InstallTarget::Importer,
             InstallTarget::Migration, InstallTarget::UpdateSlot];
         let artifacts: Vec<(ReleaseArtifact, Vec<u8>)> = targets.into_iter().map(|target| {

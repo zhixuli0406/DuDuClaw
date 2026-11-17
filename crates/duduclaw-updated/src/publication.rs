@@ -12,6 +12,7 @@ pub fn artifact_name(target: &InstallTarget) -> Result<String> {
         InstallTarget::Gateway => "duduclaw".into(),
         InstallTarget::Spawnd => "duduclaw-spawnd".into(),
         InstallTarget::Trampoline => "duduclaw-run".into(),
+        InstallTarget::TrampolineSelftest => "duduclaw-run-selftest".into(),
         InstallTarget::Egress => "duduclaw-egress".into(),
         InstallTarget::EgressForwarder => "duduclaw-egress-forwarder".into(),
         InstallTarget::McpBridge => "duduclaw-mcp-bridge".into(),
@@ -35,6 +36,7 @@ pub fn validate_bootstrap_manifest(manifest: &ReleaseManifest, arch: Architectur
     if [p.gateway, p.spawnd, p.trampoline, p.egress, p.updated, p.mcp_bridge, p.parse_worker, p.importer]
         .iter().any(|value| *value != 1) { return Err(Error::Incompatible); }
     let required = [InstallTarget::Gateway, InstallTarget::Spawnd, InstallTarget::Trampoline,
+        InstallTarget::TrampolineSelftest,
         InstallTarget::Egress, InstallTarget::EgressForwarder, InstallTarget::McpBridge,
         InstallTarget::ParseWorker, InstallTarget::Importer, InstallTarget::Migration, InstallTarget::UpdateSlot];
     if manifest.artifacts.len() < required.len() || manifest.artifacts.len() > 128 { return Err(Error::Incompatible); }
@@ -76,7 +78,7 @@ pub(crate) mod tests {
 
     pub(crate) fn manifest() -> ReleaseManifest {
         let targets = [InstallTarget::Gateway, InstallTarget::Spawnd, InstallTarget::Trampoline,
-            InstallTarget::Egress, InstallTarget::EgressForwarder, InstallTarget::McpBridge,
+            InstallTarget::TrampolineSelftest, InstallTarget::Egress, InstallTarget::EgressForwarder, InstallTarget::McpBridge,
             InstallTarget::ParseWorker, InstallTarget::Importer, InstallTarget::Migration, InstallTarget::UpdateSlot];
         ReleaseManifest { schema_version: 1, product: Product::Duduclaw,
             version: ReleaseVersion { major: 1, minor: 80, patch: 0 },
@@ -115,9 +117,9 @@ pub(crate) mod tests {
                 size_bytes: 7, mode, install_target: InstallTarget::RuntimeEntry { registry_id: id.into() } });
         }
         validate_bootstrap_manifest(&manifest, Architecture::X86_64).unwrap();
-        let mut bad = manifest.clone(); bad.artifacts[10].mode = 0o755;
+        let mut bad = manifest.clone(); bad.artifacts[11].mode = 0o755;
         assert!(validate_bootstrap_manifest(&bad, Architecture::X86_64).is_err());
-        let mut bad = manifest; bad.artifacts[11].mode = 0o444;
+        let mut bad = manifest; bad.artifacts[12].mode = 0o444;
         assert!(validate_bootstrap_manifest(&bad, Architecture::X86_64).is_err());
     }
     #[test]
@@ -141,8 +143,26 @@ pub(crate) mod tests {
     fn publication_names_match_shipped_executables() {
         assert_eq!(artifact_name(&InstallTarget::ParseWorker).unwrap(), "duduclaw-parse-worker");
         assert_eq!(artifact_name(&InstallTarget::Migration).unwrap(), "duduclaw-migrate");
+        assert_eq!(artifact_name(&InstallTarget::TrampolineSelftest).unwrap(), "duduclaw-run-selftest");
         let names: std::collections::BTreeSet<_> = manifest().artifacts.into_iter()
             .map(|artifact| artifact_name(&artifact.install_target).unwrap()).collect();
-        assert_eq!(names.len(), 10);
+        assert_eq!(names.len(), 11);
+    }
+    /// R7a: the self-test binary is a required artifact of every complete
+    /// generation, exactly like the trampoline it tests.
+    #[test]
+    fn bootstrap_requires_the_trampoline_selftest_artifact() {
+        let good = manifest();
+        assert!(good.artifacts.iter().any(|a| a.install_target == InstallTarget::TrampolineSelftest));
+        let mut bad = good.clone();
+        bad.artifacts.retain(|a| a.install_target != InstallTarget::TrampolineSelftest);
+        assert!(validate_bootstrap_manifest(&bad, Architecture::X86_64).is_err());
+        let mut bad = good;
+        for artifact in &mut bad.artifacts {
+            if artifact.install_target == InstallTarget::TrampolineSelftest { artifact.mode = 0o644; }
+        }
+        assert!(validate_bootstrap_manifest(&bad, Architecture::X86_64).is_err());
+        let json = serde_json::to_string(&InstallTarget::TrampolineSelftest).unwrap();
+        assert_eq!(json, r#"{"kind":"trampoline_selftest"}"#);
     }
 }

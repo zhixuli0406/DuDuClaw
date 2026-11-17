@@ -64,6 +64,27 @@ pub const ISOLATED_GATEWAY_UNIT: &str = "duduclaw-gateway.service";
 /// exactly these before `Apply`; spawnd refuses `Apply` unless PID 1 reports
 /// each of them inactive with no pending job.
 pub const ISOLATION_GATED_UNITS: [&str; 4] = [ISOLATION_READY_UNIT, EGRESS_SOCKET_UNIT, EGRESS_UNIT, ISOLATED_GATEWAY_UNIT];
+/// R7a: the dedicated, non-login account `duduclaw-run-selftest` drops to. It
+/// owns no data, is never an employee and never a service identity.
+pub const SELFTEST_USER: &str = "duduclaw-selftest";
+/// R7a: the fixed, pre-installed oneshot unit that runs the isolation self-test.
+/// The only unit spawnd starts by name (`Systemd::run_fixed_unit`); its name is
+/// deliberately not of the run-unit shape (`duduclaw-run-<hex>.service`), so no
+/// run inventory, census or reconciliation ever counts it as an employee run.
+pub const ISOLATION_SELFTEST_UNIT: &str = "duduclaw-isolation-selftest.service";
+/// Service accounts the self-test identity must never coincide with.
+pub const SERVICE_USERS: [&str; 6] = [GATEWAY_USER, SUPERVISOR_USER, PARSE_WORKER_USER,
+    IMPORT_WORKER_USER, EGRESS_USER, DOWNLOAD_USER];
+
+/// R7a: the resolved self-test identity is acceptable only if it is neither
+/// root nor in the employee range, and neither its uid nor its gid equals any
+/// resolved service account's (`services`: `(uid, gid)` of each [`SERVICE_USERS`]
+/// entry that exists on the host).
+pub fn selftest_identity_allowed(uid: u32, gid: u32, services: &[(u32, u32)]) -> bool {
+    let employee = |id: u32| (EMPLOYEE_UID_MIN..=EMPLOYEE_UID_MAX).contains(&id);
+    uid != 0 && gid != 0 && uid != u32::MAX && gid != u32::MAX && !employee(uid) && !employee(gid)
+        && !services.iter().any(|(service_uid, service_gid)| *service_uid == uid || *service_gid == gid)
+}
 
 /// Inclusive numeric interval, checked before allocation (§5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,6 +158,20 @@ mod tests {
         assert!(!ISOLATED_GATEWAY_UNIT_DEPENDENCIES.contains("Requires="));
         assert_eq!(ISOLATION_GATED_UNITS, ["duduclaw-isolation-ready.service", "duduclaw-egress.socket",
             "duduclaw-egress.service", "duduclaw-gateway.service"]);
+    }
+    #[test]
+    fn selftest_unit_and_identity_are_pinned_and_refuse_privileged_or_employee_ids() {
+        assert_eq!(SELFTEST_USER, "duduclaw-selftest");
+        assert_eq!(ISOLATION_SELFTEST_UNIT, "duduclaw-isolation-selftest.service");
+        // Never the run-unit shape (duduclaw-run-<32 hex>.service).
+        assert!(!ISOLATION_SELFTEST_UNIT.starts_with("duduclaw-run-"));
+        assert!(!SERVICE_USERS.contains(&SELFTEST_USER));
+        let services = [(990, 990), (991, 989)];
+        assert!(selftest_identity_allowed(995, 995, &services));
+        for (uid, gid) in [(0, 995), (995, 0), (990, 995), (995, 989), (70000, 995), (995, 99999),
+            (u32::MAX, 995), (995, u32::MAX)] {
+            assert!(!selftest_identity_allowed(uid, gid, &services), "{uid}:{gid}");
+        }
     }
     #[test]
     fn uid_range_checks_fail_closed() {

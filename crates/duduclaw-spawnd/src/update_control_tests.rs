@@ -1024,9 +1024,60 @@ const SPAWND_UNIT: &str = include_str!("../../../scripts/linux-protected/spawnd/
 const READY_UNIT: &str = include_str!("../../../scripts/linux-protected/spawnd/duduclaw-isolation-ready.service");
 const EGRESS_UNIT: &str = include_str!("../../duduclaw-egress/systemd/duduclaw-egress.service");
 const UPDATED_UNIT: &str = include_str!("../../../scripts/linux-protected/updated/duduclaw-updated.service");
+const SELFTEST_UNIT: &str = include_str!("../../../scripts/linux-protected/spawnd/duduclaw-isolation-selftest.service");
 /// Directive lines (comments and blank lines dropped).
 fn directives(unit: &str) -> Vec<&str> {
     unit.lines().filter(|line| !line.is_empty() && !line.starts_with('#')).collect()
+}
+
+/// R7a: the fixed self-test unit carries exactly the trampoline's capability
+/// bounding set and namespace allowance, never the run-unit name shape, and
+/// nothing that would let it be enabled or started by anything but spawnd.
+#[test]
+fn update_unit_isolation_selftest_matches_the_trampoline_constants() {
+    use crate::systemd::{parse_run_unit, TRAMPOLINE_CAPABILITIES, TRAMPOLINE_NAMESPACES, FIXED_UNIT_DIRECTORY};
+    use duduclaw_isolation::ids::ISOLATION_SELFTEST_UNIT;
+    assert!(parse_run_unit(ISOLATION_SELFTEST_UNIT).is_none());
+    assert_eq!(FIXED_UNIT_DIRECTORY, "/etc/systemd/system");
+    let lines = directives(SELFTEST_UNIT);
+    for expected in ["Type=oneshot", "RemainAfterExit=no", "ExecStart=/usr/lib/duduclaw/duduclaw-run-selftest",
+        "User=root", "Group=root", "Slice=duduclaw-tcb.slice", "TimeoutStartSec=30", "NoNewPrivileges=yes",
+        "ProtectSystem=strict", "ProtectHome=yes", "PrivateTmp=yes", "PrivateNetwork=yes", "AmbientCapabilities=",
+        "StandardInput=null", "StandardOutput=journal", "StandardError=journal"] {
+        assert!(lines.contains(&expected), "{expected}");
+    }
+    // The ExecStart is the shipped artifact path of InstallTarget::TrampolineSelftest.
+    let artifact = artifact_name(&InstallTarget::TrampolineSelftest).unwrap();
+    assert!(lines.contains(&format!("ExecStart=/usr/lib/duduclaw/{artifact}").as_str()));
+    fn single<'a>(lines: &[&'a str], key: &str) -> &'a str {
+        let found: Vec<&'a str> = lines.iter().filter_map(|line| line.strip_prefix(key)).collect();
+        assert_eq!(found.len(), 1, "exactly one {key}");
+        found[0]
+    }
+    let value = |key: &str| single(&lines, key);
+    let capability = |name: &str| -> u64 {
+        match name {
+            "CAP_CHOWN" => 1 << 0, "CAP_SETGID" => 1 << 6, "CAP_SETUID" => 1 << 7, "CAP_SETPCAP" => 1 << 8,
+            "CAP_NET_ADMIN" => 1 << 12, "CAP_SYS_ADMIN" => 1 << 21, "CAP_SYS_RESOURCE" => 1 << 24,
+            other => panic!("capability outside the trampoline set: {other}"),
+        }
+    };
+    let bounding = value("CapabilityBoundingSet=").split_whitespace().map(capability).fold(0, |set, bit| set | bit);
+    assert_eq!(bounding, TRAMPOLINE_CAPABILITIES);
+    let namespace = |name: &str| -> u64 {
+        match name {
+            "mnt" => 0x0002_0000, "ipc" => 0x0800_0000, "uts" => 0x0400_0000, "net" => 0x4000_0000,
+            "pid" => 0x2000_0000, other => panic!("namespace outside the trampoline set: {other}"),
+        }
+    };
+    let namespaces = value("RestrictNamespaces=").split_whitespace().map(namespace).fold(0, |set, bit| set | bit);
+    assert_eq!(namespaces, TRAMPOLINE_NAMESPACES);
+    // Not enabled by anything, never restarted behind spawnd, never a long-running
+    // or network service; sethostname in its own UTS namespace stays allowed.
+    assert!(!SELFTEST_UNIT.lines().any(|line| line == "[Install]"));
+    assert!(!lines.iter().any(|line| line.starts_with("Restart=") || line.starts_with("ProtectHostname=")
+        || line.starts_with("ReadWritePaths=") || line.contains("AF_INET") || line.starts_with("DynamicUser=")
+        || line.starts_with("Wants=") || line.starts_with("Requires=") || line.starts_with("BindsTo=")));
 }
 
 #[test]
@@ -1757,7 +1808,8 @@ fn manifest_with(artifacts: Vec<ReleaseArtifact>) -> ReleaseManifest {
             parse_worker: 1, importer: 1 }, artifacts, migrations: vec![] }
 }
 fn all_targets() -> Vec<InstallTarget> {
-    vec![InstallTarget::Gateway, InstallTarget::Spawnd, InstallTarget::Trampoline, InstallTarget::Egress,
+    vec![InstallTarget::Gateway, InstallTarget::Spawnd, InstallTarget::Trampoline, InstallTarget::TrampolineSelftest,
+        InstallTarget::Egress,
         InstallTarget::EgressForwarder, InstallTarget::McpBridge, InstallTarget::ParseWorker, InstallTarget::Importer,
         InstallTarget::Migration, InstallTarget::UpdateSlot]
 }
@@ -1773,7 +1825,9 @@ fn fixed_manifest() -> ReleaseManifest {
 fn update_readback_reports_only_spawnd_side_components_and_never_guesses() {
     let manifest = fixed_manifest();
     let trampoline = manifest.artifacts.iter().find(|a| a.install_target == InstallTarget::Trampoline).unwrap().sha256;
-    let observed = |own_image, live, euid, trampoline| Observed { own_image, live, euid, trampoline };
+    let selftest = manifest.artifacts.iter().find(|a| a.install_target == InstallTarget::TrampolineSelftest).unwrap().sha256;
+    let observed = |own_image, live, euid, trampoline| Observed { own_image, live, euid, trampoline,
+        trampoline_selftest: Some(selftest) };
     let reports = components(&manifest, observed(Some(digest(42)), true, 0, Some(trampoline)));
     assert_eq!(reports.len(), manifest.artifacts.len() - 3);
     assert!(!reports.iter().any(|r| matches!(r.target, InstallTarget::Gateway | InstallTarget::Egress | InstallTarget::UpdateSlot)));
@@ -1802,6 +1856,20 @@ fn update_readback_reports_only_spawnd_side_components_and_never_guesses() {
     assert!(!replaced.ready);
     assert_eq!((replaced.build_sha256, replaced.version), (digest(9), ReleaseVersion { major: 0, minor: 0, patch: 0 }));
     assert!(!find(&components(&manifest, observed(Some(digest(42)), true, 0, None)), InstallTarget::Trampoline).ready);
+    // R7a: the self-test binary is read back by the same rule as the trampoline.
+    let check = find(&reports, InstallTarget::TrampolineSelftest);
+    assert!(check.ready);
+    assert_eq!((check.build_sha256, check.version, check.effective_uid, check.protocol),
+        (selftest, manifest.version, 0, manifest.protocols.trampoline));
+    assert_eq!(check.artifact_id, "duduclaw-run-selftest");
+    let with_selftest = |value| Observed { own_image: Some(digest(42)), live: true, euid: 0, trampoline: Some(trampoline),
+        trampoline_selftest: value };
+    for value in [None, Some(digest(9))] {
+        let reports = components(&manifest, with_selftest(value));
+        assert!(!find(&reports, InstallTarget::TrampolineSelftest).ready);
+        assert!(find(&reports, InstallTarget::Trampoline).ready);
+    }
+    assert!(!find(&unprivileged, InstallTarget::TrampolineSelftest).ready);
 }
 
 #[test]
@@ -1809,7 +1877,8 @@ fn update_publication_matches_the_installed_layout() {
     let published: Vec<String> = publication().iter()
         .map(|(target, directory)| format!("/{directory}/{}", artifact_name(target).unwrap())).collect();
     assert_eq!(published, [
-        "/usr/lib/duduclaw/duduclaw-spawnd", "/usr/lib/duduclaw/duduclaw-run", "/usr/libexec/duduclaw/duduclaw-parse-worker",
+        "/usr/lib/duduclaw/duduclaw-spawnd", "/usr/lib/duduclaw/duduclaw-run", "/usr/lib/duduclaw/duduclaw-run-selftest",
+        "/usr/libexec/duduclaw/duduclaw-parse-worker",
         "/usr/lib/duduclaw/current/duduclaw-import", "/usr/lib/duduclaw/current/duduclaw-migrate",
         "/usr/lib/duduclaw/current/duduclaw-mcp-bridge", "/opt/duduclaw/bin/duduclaw-egress", "/opt/duduclaw/bin/duduclaw"]);
 }

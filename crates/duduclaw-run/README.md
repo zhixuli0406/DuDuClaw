@@ -48,14 +48,53 @@ unavailable API still refuses execution; failed rule installation never falls
 back. `linux::probe::Readiness` keeps both the actual `landlock_abi` and selected
 `landlock_ruleset_abi`. The probe does not print those values to employee stderr.
 
-B1's readiness interface carries detected/selected fields. Once a trusted
-installation producer supplies verified evidence, the daemon logs the pair once
-per daemon process and writes `EvidenceReport.landlock` for operator readback.
-The production producer remains `MissingInstallation`; a successful ABI probe
-alone cannot fill this gap. The fixed bootstrap privilege receipt reports only
+B1's readiness interface carries detected/selected fields. Once verified
+evidence exists, the daemon logs the pair once per daemon process and writes
+`EvidenceReport.landlock` for operator readback. A successful ABI probe alone
+is never that evidence: since R7a the producer is spawnd's own self-test
+(below), not an installer receipt. The fixed bootstrap privilege receipt reports only
 the selected ABI (1–7), precedes rule enforcement and does not prove successful
 exec. No protection from unknown future rights is claimed. Native Linux
 re-validation and complete installation acceptance are still required.
+
+## Isolation self-test (`duduclaw-run-selftest`, R7a)
+
+A second shipped binary of this crate (`src/bin/selftest.rs`, built in release
+with the trampoline, signed as `InstallTarget::TrampolineSelftest` and
+installed at `/usr/lib/duduclaw/duduclaw-run-selftest`). It is not a mode of
+`duduclaw-run`, which still refuses any argv but its own name. It accepts no
+argument, reads no environment or stdin and closes every fd above 2. Only PID 1
+runs it, through the fixed unit
+`scripts/linux-protected/spawnd/duduclaw-isolation-selftest.service`, which
+spawnd starts after its start-up recovery.
+
+It runs this crate's own library code in the trampoline's order: `probe`,
+`require_root_capabilities`, `enter_namespaces` (then reads
+`/proc/thread-self/mountinfo` to confirm no mount keeps a shared/slave peer),
+a private tmpfs work area, `build_root` + `pivot` + `bring_loopback_up`, then
+`unshare(CLONE_NEWPID)` and one forked child that is that namespace's init:
+`mount_proc`, `privileges::drop_all` to the dedicated `duduclaw-selftest`
+account (refused if root, an employee uid/gid or any service account's uid/gid),
+`runner::restrict_filesystem` (the `RUNTIME_LANDLOCK` table) and
+`seccomp::common`. It then asserts: ordinary file write/read in `/work` and
+`/home/employee` succeeds (positive control); a pathname socket in `/tmp`
+succeeds; a pathname socket and a FIFO in `/work` and `/home/employee` fail
+with `EACCES`; `/etc/hosts` reads; opening `/` (no rule covers it) fails with
+`EACCES`. Exit 0 prints one stdout line
+`{"version":1,"kernel":[major,minor],"detected_abi":N,"selected_abi":M}`;
+any failure prints one stderr line `{"code":"selftest_failed","stage":"<name>"}`
+and exits with the stage's code (2 descriptors, 3 arguments, 4 capabilities,
+5 probe, 6 account, 7 namespaces, 8 propagation, 9 work_area, 10 root, 11 pivot,
+12 loopback, 13 pid_namespace, 14 supervise, 15 output, 20 child_pid,
+21 privileges, 22 landlock, 23 seccomp, 24 positive_write, 25 socket_allowed,
+26 socket_denied, 27 fifo_denied, 28 read_allowed, 29 read_denied; 125 on
+non-Linux). It does not exercise the bootstrap socket, detached mounts made by
+spawnd, `/proc` `hidepid`/`subset` visibility, the PTY path, the supervisor or
+runtime seccomp filters, or exec.
+
+Root-only tests (`DUDUCLAW_ISO_DISPOSABLE=1`, creates the `duduclaw-selftest`
+system account if missing; no `root-test-fixture` feature needed):
+`cargo test -p duduclaw-run --test selftest_root -- --ignored iso_root_ --test-threads=1`.
 
 ## B1 adapter
 

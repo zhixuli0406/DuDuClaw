@@ -121,6 +121,9 @@ pub enum InstallTarget {
     Gateway,
     Spawnd,
     Trampoline,
+    /// R7a: `duduclaw-run-selftest`, the isolation self-test of the trampoline
+    /// library, installed next to the trampoline (`/usr/lib/duduclaw`).
+    TrampolineSelftest,
     Egress,
     EgressForwarder,
     McpBridge,
