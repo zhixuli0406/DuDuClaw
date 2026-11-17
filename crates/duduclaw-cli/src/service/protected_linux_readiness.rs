@@ -159,13 +159,54 @@ pub(super) struct TrustView { expires_at_unix: u64, frozen: bool }
 /// receipt (never the current generation's `UpdateSlot` artifact: only the
 /// bootstrap/transition program replaces the launcher, so a legitimate update
 /// of `duduclaw-updated` must not change this comparison).
-// Constructed only by tests until R1/R3 define the receipt (see `launcher_receipt`).
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct LauncherReceipt { sha256: Sha256Digest, size_bytes: u64, mode: u32 }
 
 /// The fixed updater launcher path (`layout::BINARIES`).
-const UPDATER_LAUNCHER: &str = "/usr/libexec/duduclaw-updated-launch";
+pub(super) const UPDATER_LAUNCHER: &str = "/usr/libexec/duduclaw-updated-launch";
+
+/// `/etc/duduclaw-updated/launcher-receipt.json`: written once by the v1.83
+/// isolation bootstrap (R3 S4, `protected_linux_bootstrap.rs`) after it
+/// published the frozen launcher from the verified bootstrap generation's
+/// `UpdateSlot` artifact. Root 0600, one link, at most
+/// [`MAX_LAUNCHER_RECEIPT_BYTES`], read through the update-service config
+/// root's verified dirfd (no symlinks in any component). It lives in an
+/// isolation-only root directory the gateway account cannot write, and is
+/// removed with it by the bootstrap rollback.
+pub(super) const LAUNCHER_RECEIPT_FILE: &str = "launcher-receipt.json";
+pub(super) const MAX_LAUNCHER_RECEIPT_BYTES: usize = 4096;
+
+/// On-disk form of [`LauncherReceipt`]. `generation` is the bootstrap
+/// generation the launcher bytes were taken from (provenance only).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+// `installed_at_unix` is provenance for the administrator, not a readiness input.
+#[allow(dead_code)]
+pub(super) struct LauncherReceiptRecord {
+    pub(super) schema_version: u16,
+    pub(super) generation: Sha256Digest,
+    pub(super) sha256: Sha256Digest,
+    pub(super) size_bytes: u64,
+    pub(super) mode: u32,
+    pub(super) installed_at_unix: u64,
+}
+
+impl LauncherReceiptRecord {
+    /// Strict: bounded, `deny_unknown_fields`, schema 1, a non-empty file and
+    /// exactly the 0755 mode every fixed-path binary has (`layout`).
+    pub(super) fn parse(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > MAX_LAUNCHER_RECEIPT_BYTES { return Err(refused("launcher receipt")); }
+        let record: Self = serde_json::from_slice(bytes).map_err(|_| refused("launcher receipt"))?;
+        if record.schema_version != 1 || record.size_bytes == 0 || record.mode != 0o755
+            || record.sha256.0 == [0; 32] || record.generation.0 == [0; 32] {
+            return Err(refused("launcher receipt"));
+        }
+        Ok(record)
+    }
+    pub(super) fn receipt(&self) -> LauncherReceipt {
+        LauncherReceipt { sha256: self.sha256, size_bytes: self.size_bytes, mode: self.mode }
+    }
+}
 
 /// Read-only data sources of the composite check (plan §4.4 data sources).
 /// Production reads root-owned state only; tests inject fakes.
@@ -257,7 +298,7 @@ fn component_paths() -> impl Iterator<Item = &'static str> {
 
 /// The signed artifact of the current generation a fixed-path executable must
 /// equal. Exact paths only; the frozen launcher has none.
-fn component_target(path: &str) -> Option<InstallTarget> {
+pub(super) fn component_target(path: &str) -> Option<InstallTarget> {
     Some(match path {
         "/usr/lib/duduclaw/duduclaw-spawnd" => InstallTarget::Spawnd,
         "/usr/lib/duduclaw/duduclaw-run" => InstallTarget::Trampoline,
@@ -266,6 +307,7 @@ fn component_target(path: &str) -> Option<InstallTarget> {
         "/usr/lib/duduclaw/current/duduclaw-import" => InstallTarget::Importer,
         "/usr/lib/duduclaw/current/duduclaw-migrate" => InstallTarget::Migration,
         "/usr/lib/duduclaw/current/duduclaw-mcp-bridge" => InstallTarget::McpBridge,
+        "/usr/lib/duduclaw/current/duduclaw" => InstallTarget::Gateway,
         BINARY => InstallTarget::Gateway,
         _ => return None,
     })
@@ -592,18 +634,8 @@ impl HostSources for LiveSources {
         duduclaw_updated::linux::activation::read_current().map_err(refused)
     }
 
-    // Same authentication as `parse_runtime_tree`, without the update lock.
     fn generation_manifest(&mut self, generation: Sha256Digest) -> Result<ReleaseManifest> {
-        use duduclaw_updated::linux::{files::Directory, trust_admin, INSTALL_ROOT};
-        let directory = Directory::open(Path::new(INSTALL_ROOT)).map_err(refused)?
-            .child("generations").map_err(refused)?.child(&hex::encode(generation.0)).map_err(refused)?;
-        let bytes = directory.bytes("manifest.json", duduclaw_updated::metadata::MAX_METADATA_BYTES).map_err(refused)?;
-        if duduclaw_updated::publication::manifest_digest(&bytes) != generation {
-            return Err(refused("generation manifest"));
-        }
-        let signature = directory.bytes("manifest.json.sig", 16 * 1024).map_err(refused)?;
-        let signature = std::str::from_utf8(&signature).map_err(refused)?;
-        trust_admin::verify_recorded(&bytes, signature).map_err(refused)
+        authenticated_manifest(generation)
     }
 
     fn component(&mut self, path: &'static str, artifact: &ReleaseArtifact) -> Result<()> {
@@ -619,16 +651,12 @@ impl HostSources for LiveSources {
         Ok(())
     }
 
-    // The plan (PLAN §3.1, §4.1, §4.3) defines no durable root-owned receipt
-    // that records the frozen launcher's digest: R1's `StageReceipt`
-    // (`verified.json`) lists the bootstrap generation's `UpdateSlot` artifact,
-    // but it lives in the staging area that R3 S9 deletes at commit, and
-    // `slot-a.json` (`SlotReceipt`) records the updater slot's manifest, which
-    // changes with every update. Until R1/R3 add one, the frozen launcher
-    // cannot be verified and this item fails closed (`launcher_receipt_missing`).
-    // When the receipt exists, read it here by descriptor (root 0600, nlink 1,
-    // size cap, `deny_unknown_fields`) and return its digest, size and mode.
-    fn launcher_receipt(&mut self) -> Result<Option<LauncherReceipt>> { Ok(None) }
+    // The bootstrap's receipt (R3 S4, see `LauncherReceiptRecord`): neither
+    // R1's `verified.json` (deleted with the staging area at commit) nor
+    // `slot-a.json` (changes with every update) can stand in for it. Only a
+    // missing file or a missing update-service config root is "absent"; any
+    // other error, owner, mode, link count, size or content refuses.
+    fn launcher_receipt(&mut self) -> Result<Option<LauncherReceipt>> { read_launcher_receipt() }
 
     fn launcher(&mut self, receipt: &LauncherReceipt) -> Result<()> {
         let path = Path::new(UPDATER_LAUNCHER);
@@ -719,7 +747,7 @@ impl HostSources for LiveSources {
     // root-owned entitlement receipt written by the installer; no receipt
     // format is invented here and this check otherwise stays as is.
     fn edition_is_team(&mut self) -> Result<bool> {
-        use duduclaw_license::{fingerprint_candidates, storage, FeatureGate, License, EMBEDDED_FEATURES_TOML};
+        use duduclaw_license::storage;
         let home = Path::new(GATEWAY_HOME);
         let parent = home.parent().ok_or_else(|| refused("gateway home"))?;
         parents(parent)?;
@@ -738,14 +766,69 @@ impl HostSources for LiveSources {
             Err(error) => return Err(error.into()),
             Ok(_) => (),
         }
-        let bytes = read_bounded(&license_path, 64 * 1024)?;
-        let Ok(license) = serde_json::from_slice::<License>(&bytes) else { return Ok(false) };
-        let gate = FeatureGate::from_str(EMBEDDED_FEATURES_TOML).map_err(|_| refused("license policy"))?;
-        let valid = duduclaw_gateway::license_runtime::production_registry().verify(&license).is_ok()
-            && license.validate_any(&fingerprint_candidates(), gate.phone_home_interval_days(license.tier),
-                gate.grace_period_days(license.tier)).is_ok();
-        Ok(valid && license_admits_isolation(&license))
+        let bytes = read_bounded(&license_path, MAX_LICENSE_BYTES)?;
+        license_bytes_admit_isolation(&bytes)
     }
+}
+
+/// Size bound of a license file read by the installer and this check.
+pub(super) const MAX_LICENSE_BYTES: u64 = 64 * 1024;
+
+/// The gateway's own license rule over license bytes (signed by a trusted
+/// issuer, bound to this machine, within grace, a tier allowed for a
+/// self-hosted deployment and not Personal). Malformed JSON is "not TEAM".
+/// Shared by item #10 and the bootstrap's preflight (R3 S1, Q9), so both use
+/// one rule.
+pub(super) fn license_bytes_admit_isolation(bytes: &[u8]) -> Result<bool> {
+    use duduclaw_license::{fingerprint_candidates, FeatureGate, License, EMBEDDED_FEATURES_TOML};
+    let Ok(license) = serde_json::from_slice::<License>(bytes) else { return Ok(false) };
+    let gate = FeatureGate::from_str(EMBEDDED_FEATURES_TOML).map_err(|_| refused("license policy"))?;
+    let valid = duduclaw_gateway::license_runtime::production_registry().verify(&license).is_ok()
+        && license.validate_any(&fingerprint_candidates(), gate.phone_home_interval_days(license.tier),
+            gate.grace_period_days(license.tier)).is_ok();
+    Ok(valid && license_admits_isolation(&license))
+}
+
+/// The manifest of `generation`, authenticated through the trust ledger (same
+/// authentication as `parse_runtime_tree`, without the update lock).
+pub(super) fn authenticated_manifest(generation: Sha256Digest) -> Result<ReleaseManifest> {
+    use duduclaw_updated::linux::{files::Directory, trust_admin, INSTALL_ROOT};
+    let directory = Directory::open(Path::new(INSTALL_ROOT)).map_err(refused)?
+        .child("generations").map_err(refused)?.child(&hex::encode(generation.0)).map_err(refused)?;
+    let bytes = directory.bytes("manifest.json", duduclaw_updated::metadata::MAX_METADATA_BYTES).map_err(refused)?;
+    if duduclaw_updated::publication::manifest_digest(&bytes) != generation {
+        return Err(refused("generation manifest"));
+    }
+    let signature = directory.bytes("manifest.json.sig", 16 * 1024).map_err(refused)?;
+    let signature = std::str::from_utf8(&signature).map_err(refused)?;
+    trust_admin::verify_recorded(&bytes, signature).map_err(refused)
+}
+
+/// The frozen launcher's bootstrap receipt ([`LauncherReceiptRecord`]).
+/// `Ok(None)` only when the update-service config root or the receipt file
+/// does not exist.
+pub(super) fn read_launcher_receipt() -> Result<Option<LauncherReceipt>> {
+    use duduclaw_updated::{Error as UpdateError, linux::{files::Directory, CONFIG_ROOT}};
+    let missing = |error: &UpdateError| matches!(error, UpdateError::Io(error) if error.kind() == std::io::ErrorKind::NotFound);
+    let directory = match Directory::open(Path::new(CONFIG_ROOT)) {
+        Ok(directory) => directory,
+        Err(error) if missing(&error) => return Ok(None),
+        Err(error) => return Err(refused(error)),
+    };
+    // `Directory::read`: openat2 without symlinks, root:root, regular, one
+    // link, not group/other writable; the exact mode is checked here.
+    let file = match directory.read(LAUNCHER_RECEIPT_FILE) {
+        Ok(file) => file,
+        Err(error) if missing(&error) => return Ok(None),
+        Err(error) => return Err(refused(error)),
+    };
+    let metadata = file.metadata()?;
+    if metadata.mode() & 0o7777 != 0o600 || metadata.len() > MAX_LAUNCHER_RECEIPT_BYTES as u64 {
+        return Err(refused("launcher receipt"));
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut std::io::Read::take(file, MAX_LAUNCHER_RECEIPT_BYTES as u64 + 1), &mut bytes)?;
+    Ok(Some(LauncherReceiptRecord::parse(&bytes)?.receipt()))
 }
 
 // ── Installer groups (item #1) ────────────────────────────────────────────
@@ -829,7 +912,7 @@ fn accounts() -> Result<()> {
 
 /// Loaded from the installed fragment, active, no drop-in and no pending
 /// daemon-reload. Unknown systemctl output is "not active".
-fn unit_loaded_active(name: &str) -> Result<()> {
+pub(super) fn unit_loaded_active(name: &str) -> Result<()> {
     let output = checked("systemctl", &["show", name,
         "--property=LoadState,ActiveState,FragmentPath,NeedDaemonReload,DropInPaths"])?;
     let text = String::from_utf8(output.stdout).map_err(|_| refused("無法讀取服務狀態。"))?;
@@ -842,6 +925,13 @@ fn unit_loaded_active(name: &str) -> Result<()> {
 }
 
 fn units() -> Result<()> {
+    platform_units()?;
+    unit_loaded_active(UNIT)
+}
+
+/// Every layout unit file as installed, and every isolation service active;
+/// the gateway unit is not part of it (it starts after the platform is ready).
+fn platform_units() -> Result<()> {
     for (name, expected) in layout::UNITS {
         let path = Path::new("/etc/systemd/system").join(name);
         parents(&path)?;
@@ -850,9 +940,30 @@ fn units() -> Result<()> {
             return Err(refused("隔離服務單元與安裝版本不符。"));
         }
     }
-    for name in [UNIT, "duduclaw-spawnd.service", "duduclaw-spawnd.socket", "duduclaw-isolation-ready.service", "duduclaw-egress.service",
+    for name in ["duduclaw-spawnd.service", "duduclaw-spawnd.socket", "duduclaw-isolation-ready.service", "duduclaw-egress.service",
         "duduclaw-egress.socket", "duduclaw-updated.service", "duduclaw-parse.socket"] {
         unit_loaded_active(name)?;
+    }
+    Ok(())
+}
+
+/// The bootstrap's step S7 (plan §4.3): the composite check before the
+/// gateway is started. Identical to [`check`] except that the gateway unit
+/// itself is not yet required to be active; every other group and every
+/// composite item must pass. Prints the same fixed lines.
+pub(super) fn check_platform(composite: &mut impl CompositeReadiness) -> Result<()> {
+    let results = [("執行檔", binaries()), ("服務帳號", accounts()),
+        ("目錄權限", directories()), ("隔離服務單元", platform_units())];
+    let mut failed = 0;
+    for (label, result) in results {
+        if result.is_ok() { println!("[通過] {label}"); }
+        else { failed += 1; println!("[未通過] {label}"); }
+    }
+    let (lines, composite_failed, _) = render(&composite.assess());
+    for line in lines { println!("{line}"); }
+    failed += composite_failed;
+    if failed != 0 {
+        return Err(refused(format!("{failed} 項就緒檢查未通過；尚未啟動 Gateway。修正後請再執行同一個安裝命令續接。")));
     }
     Ok(())
 }

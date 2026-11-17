@@ -295,6 +295,55 @@ class ManifestSigningTests(unittest.TestCase):
         self.assertEqual(derived, SIGN.CLAUDE_VALUE_OPTIONS)
 
     @unittest.skipUnless(SSH_KEYGEN, "requires OpenSSH ssh-keygen")
+    def test_policy_signing_validates_bound_bytes_before_accessing_keys(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            key = generate_key(directory, "target")
+            artifact = directory / "runtime-policy"
+            template = directory / "template.json"
+            template.write_text(json.dumps({"artifacts": [{
+                "id": artifact.name, "mode": 0o444,
+                "install_target": {"kind": "runtime_entry", "registry_id": "isolation-policy-v1"}}]}))
+            runtime = {"runtime": {"kind": "claude"}, "mcp": True,
+                       "fixed_args": list(self.RANGED), "turn_limit": dict(SIGN.TURN_LIMIT_WORKING_DEFAULT)}
+            policy = {"domain": SIGN.POLICY_DOMAIN_V3, "version": 3, "runtimes": [runtime],
+                      "native": [{"profile": [1] * 32, "tmpfs_bytes": 4096}]}
+            for kind in ("release", "runtime"):
+                output = directory / (kind + ".json")
+                command = [sys.executable, "-I", str(SCRIPT), "--kind", kind, "--template", str(template),
+                           "--artifacts-dir", str(directory), "--output", str(output), "--ssh-keygen", SSH_KEYGEN]
+                for version, domain, arguments, limit in (
+                        (3, SIGN.POLICY_DOMAIN_V3, self.LEGACY, dict(SIGN.TURN_LIMIT_WORKING_DEFAULT)),
+                        (3, SIGN.POLICY_DOMAIN_V3, self.RANGED, None),
+                        (2, SIGN.POLICY_DOMAIN_V2, self.RANGED, dict(SIGN.TURN_LIMIT_WORKING_DEFAULT)),
+                        (3, SIGN.POLICY_DOMAIN_V3, self.RANGED, {"min": 1, "default": 50, "max": 1001})):
+                    with self.subTest(kind=kind, version=version, arguments=arguments, limit=limit):
+                        invalid = dict(policy, version=version, domain=domain,
+                                       runtimes=[dict(runtime, fixed_args=arguments, turn_limit=limit)])
+                        artifact.write_bytes(SIGN.canonical_bytes(invalid))
+                        result = run_production(command, [directory / "missing-key"])
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn("turn_limit", result.stderr)
+                        self.assertNotIn("is not a file", result.stderr)
+                        self.assertFalse(output.exists())
+                        self.assertFalse(Path(str(output) + ".signatures.json").exists())
+                artifact.write_bytes(SIGN.canonical_bytes(policy))
+                result = run_production(command, [key])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                payload = output.read_bytes()
+                bound = json.loads(payload)["artifacts"][0]
+                self.assertEqual(bound["sha256"], list(hashlib.sha256(artifact.read_bytes()).digest()))
+                self.assertEqual(bound["size_bytes"], artifact.stat().st_size)
+                signature = directory / "signature"
+                signature.write_text(json.loads(Path(str(output) + ".signatures.json").read_text())[0])
+                allowed = directory / "allowed"
+                allowed.write_text("target " + Path(str(key) + ".pub").read_text())
+                verified = subprocess.run([SSH_KEYGEN, "-Y", "verify", "-f", str(allowed), "-I", "target",
+                                           "-n", SIGN.NAMESPACES[kind], "-s", str(signature)],
+                                          input=payload, capture_output=True)
+                self.assertEqual(verified.returncode, 0, verified.stderr)
+
+    @unittest.skipUnless(SSH_KEYGEN, "requires OpenSSH ssh-keygen")
     def test_real_ssh_keygen_round_trip_and_no_overwrite(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)

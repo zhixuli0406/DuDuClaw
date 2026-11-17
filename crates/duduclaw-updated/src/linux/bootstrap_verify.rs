@@ -280,12 +280,35 @@ pub fn verify_and_stage(mode: BootstrapMode) -> Result<StageReceipt> {
 /// Steps 1–11. Returns only on refusal; success replaces this process with the
 /// staged gateway (`service bootstrap-continue`, implemented by R3).
 pub fn run(mode: BootstrapMode) -> std::result::Result<std::convert::Infallible, Refusal> {
+    run_with(mode, &[])
+}
+
+/// [`run`] with the canonical argv tail of `bootstrap_cli::Forwarded::args`
+/// appended to `service bootstrap-continue` (R3: `--dns-upstream`,
+/// `--host-public-address`, `--enable-now`; install mode only, never a path).
+/// Any other tail, or a tail on another mode, refuses before anything is read.
+pub fn run_with(mode: BootstrapMode, forwarded: &[String]) -> std::result::Result<std::convert::Infallible, Refusal> {
+    if !forwarded_tail_allowed(mode, forwarded) {
+        return Err(Refusal { step: Step::Harden, error: Error::Invalid });
+    }
     let config = harden_and_configure().map_err(|error| Refusal { step: Step::Harden, error })?;
     let mut step = Step::Harden;
     let staged = verify_and_stage_with(&config, mode, &mut step).map_err(move |error| Refusal { step, error })?;
     announce(&config.context, &staged).map_err(|error| Refusal { step: Step::Announce, error })?;
-    let error = match exec_gateway(&config.paths, &staged, mode) { Ok(never) => match never {}, Err(error) => error };
+    let error = match exec_gateway(&config.paths, &staged, mode, forwarded) {
+        Ok(never) => match never {}, Err(error) => error };
     Err(Refusal { step: Step::Exec, error })
+}
+
+/// The tail must be exactly what `bootstrap_cli::parse_invocation` +
+/// `Forwarded::args` can produce, and only for install.
+fn forwarded_tail_allowed(mode: BootstrapMode, forwarded: &[String]) -> bool {
+    if forwarded.is_empty() { return true; }
+    if mode != BootstrapMode::Install { return false; }
+    let mut args = vec!["install".to_owned()];
+    args.extend(forwarded.iter().cloned());
+    let (command, parsed) = crate::bootstrap_cli::parse_invocation(args.into_iter().map(std::ffi::OsString::from));
+    command == crate::bootstrap_cli::Command::Install && parsed.args() == forwarded
 }
 
 /// R3 S0: re-verify a staged generation (root pin, signatures, every artifact hash
@@ -350,7 +373,8 @@ pub(crate) fn facts_present(root: &Path) -> Vec<&'static str> {
 pub(crate) struct Journal { pub mode: BootstrapMode, pub generation: Sha256Digest, pub committed: bool }
 
 /// Minimal strict read of R3's journal: the four fields this decision needs, each
-/// with an exact type. R3 owns the full `deny_unknown_fields` schema. Malformed = refuse.
+/// with an exact type. R3 owns the full `deny_unknown_fields` schema (schema 2
+/// since R3 review M4; an older journal is refused here as well). Malformed = refuse.
 fn read_journal(protected: &Path) -> Result<Option<Journal>> {
     let dir = match Directory::open(protected) {
         Ok(dir) => dir,
@@ -365,7 +389,7 @@ fn read_journal(protected: &Path) -> Result<Option<Journal>> {
     };
     let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| Error::Maintenance)?;
     let object = value.as_object().ok_or(Error::Maintenance)?;
-    if object.get("schema_version").and_then(serde_json::Value::as_u64) != Some(1) { return Err(Error::Maintenance); }
+    if object.get("schema_version").and_then(serde_json::Value::as_u64) != Some(2) { return Err(Error::Maintenance); }
     let mode = match object.get("mode").and_then(serde_json::Value::as_str) {
         Some("install") => BootstrapMode::Install,
         Some("upgrade") => BootstrapMode::Upgrade,
@@ -1214,14 +1238,17 @@ pub(crate) fn exec_sealed(fd: RawFd, argv: &[*const libc::c_char], envp: &[*cons
     std::io::Error::last_os_error()
 }
 
-fn exec_gateway(paths: &Paths, staged: &Staged, mode: BootstrapMode) -> Result<std::convert::Infallible> {
+fn exec_gateway(paths: &Paths, staged: &Staged, mode: BootstrapMode, forwarded: &[String])
+    -> Result<std::convert::Infallible> {
+    if !forwarded_tail_allowed(mode, forwarded) { return Err(Error::Invalid); }
     let gateway = &staged.gateway;
     let generation = hex::encode(staged.receipt.manifest_digest.0);
     let stage = Directory::open(&paths.protected)?.child(STAGE_DIRECTORY)?.child(&generation)?.child(STAGE_ARTIFACTS)?;
     let source = verify_fd(stage.read(&gateway.id)?, gateway.size_bytes, gateway.sha256)?;
     let memfd = sealed_executable(source, gateway)?;
     let args = ["duduclaw", "service", "bootstrap-continue", "--protected-linux", "--mode", mode.as_str(),
-        "--generation", generation.as_str()].into_iter().map(cstring).collect::<Result<Vec<_>>>()?;
+        "--generation", generation.as_str()].into_iter().chain(forwarded.iter().map(String::as_str))
+        .map(cstring).collect::<Result<Vec<_>>>()?;
     let env = ["PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LANG=C"].into_iter().map(cstring).collect::<Result<Vec<_>>>()?;
     let mut argv: Vec<*const libc::c_char> = args.iter().map(|value| value.as_ptr()).collect();
     argv.push(std::ptr::null());
@@ -1959,7 +1986,7 @@ pub(crate) mod tests {
     fn write_journal(config: &Config, mode: &str, generation: &str, committed: bool) {
         let path = config.paths.protected.join(BOOTSTRAP_JOURNAL);
         let _ = std::fs::remove_file(&path);
-        std::fs::write(&path, serde_json::to_vec(&serde_json::json!({"schema_version": 1, "mode": mode,
+        std::fs::write(&path, serde_json::to_vec(&serde_json::json!({"schema_version": 2, "mode": mode,
             "generation": generation, "step": "verified", "committed": committed})).unwrap()).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
@@ -2526,5 +2553,22 @@ pub(crate) mod tests {
         assert!(exec_probe(memfd.as_raw_fd(), args(&["test", "-t", "0", "-a", "-t", "1", "-a", "-t", "2"]), &tty, false));
         // Every other inherited descriptor was closed by exec.
         assert!(!exec_probe(memfd.as_raw_fd(), args(&["test", "-t", "9"]), &tty, true));
+    }
+
+    #[test]
+    fn forwarded_tail_is_canonical_typed_install_options_only() {
+        let tail = |list: &[&str]| list.iter().map(|value| (*value).to_owned()).collect::<Vec<_>>();
+        for mode in [BootstrapMode::Install, BootstrapMode::Upgrade, BootstrapMode::Rollback] {
+            assert!(forwarded_tail_allowed(mode, &[]));
+        }
+        let good = tail(&["--dns-upstream", "192.0.2.53:53", "--host-public-address", "203.0.113.7", "--enable-now"]);
+        assert!(forwarded_tail_allowed(BootstrapMode::Install, &good));
+        assert!(!forwarded_tail_allowed(BootstrapMode::Upgrade, &good));
+        assert!(!forwarded_tail_allowed(BootstrapMode::Rollback, &tail(&["--enable-now"])));
+        for bad in [tail(&["--generation", "00"]), tail(&["--mode", "upgrade"]), tail(&["--dns-upstream", "/etc/x"]),
+            // Valid but not canonical: only the re-rendered form is accepted.
+            tail(&["--host-public-address", "2001:0db8::7"]), tail(&["--enable-now", "--dns-upstream", "192.0.2.53:53"])] {
+            assert!(!forwarded_tail_allowed(BootstrapMode::Install, &bad), "{bad:?}");
+        }
     }
 }

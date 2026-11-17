@@ -3690,10 +3690,11 @@ enum ServiceCommands {
         /// Enable and start the protected system service
         #[arg(long, requires = "protected_linux")]
         enable_now: bool,
-        /// Copy an existing .duduclaw data directory into the service account
+        /// Refused from v1.83.0: protected installs no longer copy an existing
+        /// .duduclaw data directory (use the official migration flow)
         #[arg(long, requires = "protected_linux")]
         migrate_from: Option<std::path::PathBuf>,
-        /// Preserve the existing destination as a backup and replace it
+        /// Refused from v1.83.0 together with --migrate-from
         #[arg(long, requires = "migrate_from")]
         force_migrate: bool,
         /// Keep installation successful even if a configured AI CLI is missing
@@ -3713,6 +3714,36 @@ enum ServiceCommands {
         /// Keep upgrade successful even if a configured AI CLI is missing
         #[arg(long, requires = "protected_linux")]
         allow_missing_runtime: bool,
+    },
+
+    /// Internal: continue a verified isolation install. Run only by
+    /// `duduclaw-bootstrap` (which verified and staged the generation).
+    #[command(hide = true)]
+    BootstrapContinue {
+        #[arg(long, required = true)]
+        protected_linux: bool,
+        /// install | upgrade | rollback
+        #[arg(long, value_parser = ["install", "upgrade", "rollback"])]
+        mode: String,
+        /// Staged generation (64 lowercase hex digits)
+        #[arg(long)]
+        generation: String,
+        /// Single upstream of the dedicated DNS broker (hosts without systemd-resolved)
+        #[arg(long)]
+        dns_upstream: Option<std::net::SocketAddr>,
+        /// Public address of this host that is on no interface (cloud 1:1 NAT); repeatable
+        #[arg(long)]
+        host_public_address: Vec<std::net::IpAddr>,
+        /// Start the gateway after the install
+        #[arg(long)]
+        enable_now: bool,
+    },
+
+    /// Internal: roll back an uncommitted isolation install
+    #[command(hide = true)]
+    BootstrapRollback {
+        #[arg(long, required = true)]
+        protected_linux: bool,
     },
 
     /// Start the background service
@@ -5676,6 +5707,15 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             }
             ServiceCommands::Upgrade { protected_linux: _, version, allow_missing_runtime } => {
                 service::protected_linux::upgrade(version.as_deref(), allow_missing_runtime).await
+            }
+            ServiceCommands::BootstrapContinue { protected_linux: _, mode, generation, dns_upstream,
+                host_public_address, enable_now } => {
+                service::protected_linux::bootstrap_continue(service::protected_linux::BootstrapContinueArgs {
+                    mode, generation, dns_upstream, host_public_address, enable_now,
+                })
+            }
+            ServiceCommands::BootstrapRollback { protected_linux: _ } => {
+                service::protected_linux::bootstrap_rollback()
             }
             ServiceCommands::Start => service::handle_service(service::ServiceAction::Start).await,
             ServiceCommands::Stop => service::handle_service(service::ServiceAction::Stop).await,

@@ -13,15 +13,18 @@ fn protocols(value: u16) -> ProtocolCompatibility {
 }
 
 fn manifest() -> ReleaseManifest {
+    // One artifact per signed target (both gateway copies share the Gateway artifact).
+    let mut artifacts: Vec<ReleaseArtifact> = Vec::new();
+    for path in component_paths() {
+        let target = component_target(path).unwrap();
+        if artifacts.iter().any(|artifact| artifact.install_target == target) { continue; }
+        artifacts.push(ReleaseArtifact { id: duduclaw_updated::publication::artifact_name(&target).unwrap(),
+            sha256: digest(9), size_bytes: 7, mode: 0o755, install_target: target });
+    }
     ReleaseManifest { schema_version: 1, product: Product::Duduclaw, version: version(),
         channel: ReleaseChannel::Stable, os: OperatingSystem::Linux, arch: Architecture::X86_64,
         minimum_version: version(), serial: 1, created_at_unix: 100, expires_at_unix: 5000,
-        artifacts: component_paths().map(|path| {
-            let target = component_target(path).unwrap();
-            ReleaseArtifact { id: duduclaw_updated::publication::artifact_name(&target).unwrap(), sha256: digest(9),
-                size_bytes: 7, mode: 0o755, install_target: target }
-        }).collect(),
-        protocols: protocols(1), migrations: Vec::new() }
+        artifacts, protocols: protocols(1), migrations: Vec::new() }
 }
 
 fn all_checks() -> HostChecks {
@@ -237,7 +240,8 @@ fn service_protected_readiness_component_paths_map_to_distinct_signed_targets() 
     let mut targets = Vec::new();
     for path in component_paths() {
         let target = component_target(path).unwrap_or_else(|| panic!("unmapped published executable {path}"));
-        assert!(!targets.contains(&target), "{path}");
+        // Only the gateway has two fixed-path copies of one signed artifact.
+        assert!(!targets.contains(&target) || target == InstallTarget::Gateway, "{path}");
         let name = duduclaw_updated::publication::artifact_name(&target).unwrap();
         let file = Path::new(path).file_name().unwrap().to_str().unwrap();
         match path {
@@ -248,6 +252,8 @@ fn service_protected_readiness_component_paths_map_to_distinct_signed_targets() 
     }
     // Every published executable except the frozen launcher, plus the gateway.
     assert_eq!(targets.len(), layout::BINARIES.len());
+    assert_eq!(targets.iter().filter(|target| **target == InstallTarget::Gateway).count(), 2);
+    assert_eq!(component_target("/usr/lib/duduclaw/current/duduclaw"), Some(InstallTarget::Gateway));
     assert!(layout::BINARIES.contains(&UPDATER_LAUNCHER));
     assert!(!component_paths().any(|path| path == UPDATER_LAUNCHER));
     assert!(component_target(UPDATER_LAUNCHER).is_none());
@@ -267,7 +273,7 @@ fn service_protected_readiness_frozen_launcher_matches_its_bootstrap_receipt() {
         id: duduclaw_updated::publication::artifact_name(&InstallTarget::UpdateSlot).unwrap(),
         sha256: digest(5), size_bytes: 9, mode: 0o700, install_target: InstallTarget::UpdateSlot });
     assert!(fake.assess().is_empty());
-    // Receipt missing (today's live state until R1/R3 add it), unreadable, mismatched.
+    // Receipt missing (a host the v1.83 bootstrap did not install), unreadable, mismatched.
     let mut fake = Fake::healthy(); fake.receipt = Some(None);
     let findings = fake.assess();
     assert_eq!(failures(&findings), [(Item::Components, "launcher_receipt_missing")]);
@@ -277,8 +283,33 @@ fn service_protected_readiness_frozen_launcher_matches_its_bootstrap_receipt() {
     assert_eq!(failures(&fake.assess()), [(Item::Components, "launcher_receipt_unreadable")]);
     let mut fake = Fake::healthy(); fake.launcher = digest(5);
     assert_eq!(failures(&fake.assess()), [(Item::Components, "launcher_mismatch")]);
-    // The live source has no receipt to read: it reports "missing".
+    // A host without the update-service config root (this test host) reports "missing".
     assert_eq!(LiveSources::default().launcher_receipt().unwrap(), None);
+}
+
+/// The receipt the bootstrap writes (R3 S4) is exactly what this reader accepts.
+#[test]
+fn service_protected_readiness_launcher_receipt_record_is_strict() {
+    let record = LauncherReceiptRecord { schema_version: 1, generation: digest(2), sha256: digest(4),
+        size_bytes: 7, mode: 0o755, installed_at_unix: 10 };
+    let bytes = serde_json::to_vec(&record).unwrap();
+    assert_eq!(LauncherReceiptRecord::parse(&bytes).unwrap(), record);
+    assert_eq!(record.receipt(), launcher_receipt());
+    let mutate = |change: fn(&mut serde_json::Value)| {
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        change(&mut value);
+        serde_json::to_vec(&value).unwrap()
+    };
+    for bad in [mutate(|v| v["extra"] = 1.into()), mutate(|v| v["schema_version"] = 2.into()),
+        mutate(|v| v["size_bytes"] = 0.into()), mutate(|v| v["mode"] = 0o700.into()),
+        mutate(|v| v["sha256"] = serde_json::to_value(digest(0)).unwrap()),
+        mutate(|v| v["generation"] = serde_json::to_value(digest(0)).unwrap()),
+        mutate(|v| { v.as_object_mut().unwrap().remove("generation"); }), b"null".to_vec(), Vec::new()] {
+        assert!(LauncherReceiptRecord::parse(&bad).is_err());
+    }
+    let mut padded = bytes.clone();
+    padded.extend(vec![b' '; MAX_LAUNCHER_RECEIPT_BYTES]);
+    assert!(LauncherReceiptRecord::parse(&padded).is_err());
 }
 
 #[test]

@@ -183,6 +183,7 @@ def bind_artifacts(document, directory, prefix=""):
         if target in targets:
             raise ValueError("duplicate install target")
         targets.add(target)
+        policy = artifact["install_target"] == {"kind": "runtime_entry", "registry_id": "isolation-policy-v1"}
         mode = artifact["mode"]
         if not isinstance(mode, int) or isinstance(mode, bool) or mode & ~0o755 or not mode & 0o400:
             raise ValueError("invalid artifact mode")
@@ -193,13 +194,22 @@ def bind_artifacts(document, directory, prefix=""):
                 raise ValueError("artifact must be a nonempty, unlinked regular file")
             digest = hashlib.sha256()
             length = 0
+            policy_bytes = bytearray()
             while chunk := source.read(1024 * 1024):
                 digest.update(chunk)
                 length += len(chunk)
+                if policy:
+                    # Match the packager's policy limit and validate the exact bytes hashed.
+                    if length > 1024 * 1024:
+                        raise ValueError("signed runtime policy exceeds the size limit")
+                    policy_bytes.extend(chunk)
             after = os.fstat(source.fileno())
             if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
                     after.st_size, after.st_mtime_ns, after.st_ctime_ns) or length != before.st_size:
                 raise ValueError("artifact changed during hashing")
+        if policy:
+            validate_policy_document(json.loads(policy_bytes, object_pairs_hook=unique_object,
+                                                parse_float=reject_number, parse_constant=reject_number))
         artifact["sha256"] = list(digest.digest())
         artifact["size_bytes"] = length
 

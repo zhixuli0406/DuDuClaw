@@ -6,7 +6,7 @@
 //! message or backtrace.
 use duduclaw_updated::bootstrap_cli::{self, Command};
 
-const USAGE: &str = "用法：duduclaw-bootstrap install | upgrade | rollback | --print-root-pin | --version";
+const USAGE: &str = "用法：duduclaw-bootstrap install [--dns-upstream <IP:53>] [--host-public-address <IP>]... [--enable-now] | upgrade | rollback | --print-root-pin | --version";
 
 /// Installed before anything else runs: replaces the default hook, so a panic
 /// prints one fixed line (no message, location or backtrace; RUST_BACKTRACE has
@@ -30,7 +30,9 @@ fn refuse(refusal: duduclaw_updated::linux::bootstrap_verify::Refusal) -> ! {
 fn main() {
     use duduclaw_updated::linux::{self as platform, bootstrap_verify::{self, BootstrapMode, Refusal, Step}};
     quiet_panics();
-    let command = bootstrap_cli::parse(std::env::args_os().skip(1));
+    // Only `install` carries options: three typed values, re-rendered from their
+    // parsed types and forwarded to `service bootstrap-continue` (never a path).
+    let (command, forwarded) = bootstrap_cli::parse_invocation(std::env::args_os().skip(1));
     if command.changes_state() {
         // A state-changing command was selected: harden before any other work.
         if let Err(error) = platform::harden() { refuse(Refusal { step: Step::Harden, error }); }
@@ -58,7 +60,7 @@ fn main() {
             std::process::exit(2);
         }
     };
-    match bootstrap_verify::run(mode) {
+    match bootstrap_verify::run_with(mode, &forwarded.args()) {
         Ok(never) => match never {},
         Err(refusal) => refuse(refusal),
     }
