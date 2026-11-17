@@ -35,15 +35,34 @@
 //! The journal is removed only by the `Resume` of its generation (the updater
 //! resumes after it committed or rolled back), so the previous generation stays
 //! known and retained until then (the updater's pruning keeps both names).
-//! [`recover`] runs at spawnd start before any socket is bound and before
-//! admission: `publishing` is rolled forward after full re-verification, or
-//! rolled back to `previous` with the same procedure; when neither completes,
-//! or the journal cannot be read, admission stays closed
-//! ([`DrainClosure::Recovery`]), `READY=1` is withheld, and the root-only status
-//! file `/run/duduclaw-spawnd/update-status.json` says so.
+//!
+//! Start (plan R6 addendum "啟動順序與「一致」的判定"): [`recover`] runs before
+//! any socket is bound and before admission, and verifies the installed set
+//! EVERY time: whatever the journal says (`publishing` or `published`), its
+//! generation is re-verified against the trust ledger (including revocation),
+//! its manifest digest must be the journal's, and all eight destinations are
+//! republished idempotently; on failure the journal's `previous` is verified
+//! and published with the same procedure. Without a journal, the generation
+//! the `current` selector names is verified the same way and every destination
+//! must already hold its bytes. The set is then consistent or not ([`start`]):
+//! - `READY=1` is always sent once the root-only update endpoint is bound: it
+//!   means only "the update endpoint is available" (the updater depends on it).
+//! - Not consistent: nothing else is opened (no allocation socket, no control
+//!   listener, no admission loop); admission is closed ([`DrainClosure::Recovery`]).
+//!   A successful `Apply` repairs the set; spawnd then replies, flushes its
+//!   status and exits with [`RESTART_AFTER_REPAIR_EXIT`] so systemd restarts it
+//!   and the fresh start verifies everything before opening. It never switches
+//!   to an open state in-process.
+//! - Consistent: everything is opened, then the root-only status file
+//!   `/run/duduclaw-spawnd/update-status.json` says `consistent` for this
+//!   process (boot id, pid, start time): `duduclaw-spawnd wait-consistent`
+//!   ([`wait_consistent`], unit `duduclaw-isolation-ready.service`) completes
+//!   only then, and gateway and egress are ordered after that unit.
+//! Every state change is also one fixed-vocabulary `STATUS=` line to systemd
+//! and stderr (journal): `consistent`, `recovering`, `inconsistent: <reason>`.
 #![allow(unsafe_code)]
 use std::{fs::File, io::{self, Read}, os::{fd::{AsRawFd, FromRawFd, OwnedFd}, unix::fs::{FileTypeExt, MetadataExt, PermissionsExt}},
-    path::{Path, PathBuf}, time::{Duration, Instant}};
+    path::{Path, PathBuf}, sync::{Arc, Mutex}, time::{Duration, Instant}};
 use duduclaw_isolation::{ids::Sha256Digest, update::{InstallTarget, Product, ReleaseArtifact, ReleaseManifest, ReleaseVersion}};
 use duduclaw_updated::{activation_contract::{ComponentReadback, ControlCommand, ControlOutcome, ControlRequest, ControlResponse, Preparation},
     linux::{activation::SPAWND_UPDATE_SOCKET, files::{copy_artifact, verify_fd, Directory}, transport, INSTALL_ROOT},
@@ -59,6 +78,13 @@ pub const DRAIN_RECORD: &str = "drain.json";
 /// Root-only (0600, atomic replace) operator status of the barrier and journal.
 pub const STATUS_ROOT: &str = "/run/duduclaw-spawnd";
 pub const STATUS_FILE: &str = "update-status.json";
+/// Schema of the status file (2: `set`, `closed_reason`, `owner`).
+const STATUS_SCHEMA: u16 = 2;
+const MAX_STATUS_BYTES: usize = 16 * 1024;
+/// spawnd's exit status after an `Apply` repaired a set it started on
+/// inconsistent. The unit restarts exactly this status
+/// (`RestartForceExitStatus=`, `SuccessExitStatus=`); see the unit file.
+pub const RESTART_AFTER_REPAIR_EXIT: i32 = 82;
 /// Audit rate-limit source of this endpoint (0: control socket, 1: host).
 const AUDIT_SOURCE: u8 = 2;
 const SCHEMA: u16 = 1;
@@ -204,6 +230,10 @@ pub trait Effects {
     /// artifact's bytes is kept), then sync every destination file and directory.
     /// Idempotent; the caller journals it.
     fn publish(&mut self, generation: Sha256Digest) -> io::Result<()>;
+    /// Read-only: every fixed destination already holds exactly `generation`'s
+    /// artifact (root-owned single-link regular file, mode 0755, size and
+    /// SHA-256 by descriptor). Call only after [`Self::verify`] of `generation`.
+    fn published(&mut self, generation: Sha256Digest) -> io::Result<()>;
     /// The generation the install selector (`current`) names; `None`: no selector.
     fn installed(&mut self) -> io::Result<Option<Sha256Digest>>;
     /// `live`: this spawnd's admission loop completed a healthy iteration recently.
@@ -218,6 +248,8 @@ pub struct Startup {
     pub recovery: PublicationRecovery,
     /// The journal as found (`None`: absent or unreadable).
     pub journal: Option<PublishJournal>,
+    /// Without a journal: the generation the `current` selector named.
+    pub selected: Option<Sha256Digest>,
 }
 impl Startup {
     /// At most two bounded, content-free records: the barrier restored from a
@@ -235,18 +267,55 @@ impl Startup {
         }
         if self.recovery != PublicationRecovery::NoJournal {
             records.push(record(Event::PublicationRecovery, Detail::PublicationRecovery { action: self.recovery,
-                generation: self.journal.map(|journal| journal.generation),
+                generation: self.journal.map(|journal| journal.generation).or(self.selected),
                 previous: self.journal.and_then(|journal| journal.previous) }));
         }
         records
     }
 }
 
+/// The process a status file belongs to. pid and start time (field 22 of
+/// `/proc/<pid>/stat`, clock ticks after boot) identify one process within one
+/// boot; a status whose owner is not the live spawnd is stale.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Owner { pub boot_id: String, pub pid: u32, pub start_time: u64 }
+impl Owner {
+    pub(crate) fn current() -> io::Result<Self> {
+        let pid = std::process::id();
+        Ok(Self { boot_id: boot_id()?, pid, start_time: process_start_time(pid)? })
+    }
+}
+fn boot_id() -> io::Result<String> {
+    let text = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+    let id = text.trim();
+    if id.len() != 36 || !id.bytes().all(|byte| byte.is_ascii_hexdigit() || byte == b'-') { return Err(invalid()); }
+    Ok(id.to_owned())
+}
+/// Field 22 (`starttime`) of `/proc/<pid>/stat`. The command name (field 2)
+/// may contain spaces and parentheses, so fields are counted after the last `)`.
+fn process_start_time(pid: u32) -> io::Result<u64> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let (_, fields) = text.rsplit_once(')').ok_or_else(invalid)?;
+    // `fields` begins with field 3 (state): starttime is the 20th from there.
+    fields.split_ascii_whitespace().nth(19).ok_or_else(invalid)?.parse().map_err(|_| invalid())
+}
+
 /// Root-only operator status (`/run/duduclaw-spawnd/update-status.json`):
-/// rewritten at start and after every served request. Digests are lowercase hex.
+/// rewritten at start, when everything is opened, and after every served
+/// request. Digests are lowercase hex.
 #[derive(Debug, Serialize)]
 pub(crate) struct UpdateStatus {
     schema: u16,
+    /// `consistent` (verified at this process's start and fully opened, journal
+    /// absent or `published`), `recovering` (verified, not yet opened; or a
+    /// repaired set waiting for the restart) or `inconsistent`.
+    set: &'static str,
+    /// With `inconsistent`: the fixed reason code.
+    closed_reason: Option<&'static str>,
+    /// The process this status belongs to (`None`: could not be read; the
+    /// waiter then never accepts it).
+    owner: Option<Owner>,
     /// New runs are refused (any barrier closure).
     admission_closed: bool,
     /// `open`, `drained` (closed for `barrier_generation`), `unreadable_record`
@@ -276,6 +345,22 @@ fn barrier_words(closure: Option<DrainClosure>) -> (&'static str, Option<String>
 fn write_status(root: &Path, status: &UpdateStatus) -> io::Result<()> {
     Directory::open(root).and_then(|directory| directory.atomic_json(STATUS_FILE, status)).map_err(updated)
 }
+/// The one-line `STATUS=` text (fixed vocabulary): `consistent`, `recovering`
+/// or `inconsistent: <reason>`, with `; status_file_write_failed` appended
+/// when the status file could not be written.
+pub(crate) fn status_line(set: &str, closed_reason: Option<&str>, status_file_written: bool) -> String {
+    let mut line = match closed_reason {
+        Some(reason) => format!("{set}: {reason}"),
+        None => set.to_owned(),
+    };
+    if !status_file_written { line.push_str("; status_file_write_failed"); }
+    line
+}
+/// `STATUS=` to systemd and the same line on stderr (the unit routes it to the journal).
+fn announce(line: &str) {
+    let _ = notify(&format!("STATUS={line}"));
+    eprintln!("duduclaw-spawnd: update status: {line}");
+}
 
 /// Verify `generation` completely, then: journal `publishing` (durable, read
 /// back) → replace the components → journal `published`. Used by `Apply` and
@@ -296,13 +381,19 @@ fn publish_verified<S: JournalStore, E: Effects>(store: &mut S, effects: &mut E,
     store.persist_journal(&journal)
 }
 
-/// Start-up completion of an interrupted publication (plan R6 addendum).
+/// Start-up verification with a journal (plan R6 addenda): whatever its state,
+/// the journal's generation is fully re-verified (trust ledger including
+/// revocation, the journal's manifest digest, every artifact) and all eight
+/// destinations are republished with the idempotent procedure (a destination
+/// already holding the right bytes is kept, an altered one is replaced).
 fn recover_journal<S: JournalStore, E: Effects>(store: &mut S, effects: &mut E, journal: PublishJournal)
     -> PublicationRecovery {
-    if journal.state == PublishState::Published { return PublicationRecovery::AlreadyPublished; }
-    // Roll forward: the same generation, re-verified, with the recorded manifest.
+    // Forward: the same generation, re-verified, with the recorded manifest.
     if publish_verified(store, effects, journal.generation, Some(journal.manifest_sha256), journal.previous, None).is_ok() {
-        return PublicationRecovery::RolledForward;
+        return match journal.state {
+            PublishState::Published => PublicationRecovery::Reverified,
+            PublishState::Publishing => PublicationRecovery::RolledForward,
+        };
     }
     // Roll back with the same procedure. The new journal names the previous
     // generation, and the interrupted one as its own fallback.
@@ -312,14 +403,57 @@ fn recover_journal<S: JournalStore, E: Effects>(store: &mut S, effects: &mut E, 
         _ => PublicationRecovery::Incomplete,
     }
 }
+/// Start-up verification without a journal: the generation the `current`
+/// selector names is verified like a publication's (trust ledger including
+/// revocation, every artifact), and every destination must already hold its
+/// bytes. Nothing is written: without a journal there is no recorded intent to
+/// complete, so a difference is reported (an `Apply` of that generation repairs it).
+/// A host installed by `duduclaw-bootstrap install` has a selector from its
+/// first boot on (`trust_init` publishes the initial `current` and records it
+/// in the ledger), so "no selector" is never a fresh-install state here.
+fn verify_selected<E: Effects>(effects: &mut E) -> (Option<Sha256Digest>, PublicationRecovery) {
+    match effects.installed() {
+        Ok(Some(generation)) => {
+            let verified = effects.verify(generation, None).is_ok() && effects.published(generation).is_ok();
+            (Some(generation), if verified { PublicationRecovery::NoJournal } else { PublicationRecovery::SelectedUnverified })
+        }
+        Ok(None) => (None, PublicationRecovery::SelectorAbsent),
+        Err(_) => (None, PublicationRecovery::SelectorUnreadable),
+    }
+}
+
+/// Where this process is in the start sequence (plan R6 addendum point 4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    /// Verified consistent at start; the allocation socket, control listener and
+    /// admission loop are being opened.
+    Verified,
+    /// Verified and everything opened ([`UpdateControl::opened`]).
+    Open,
+    /// Not consistent at start: only the update endpoint is open, no admission
+    /// loop exists, so no run can be admitted by this process.
+    Closed,
+    /// Started `Closed`, then an `Apply` repaired the set: this process exits
+    /// with [`RESTART_AFTER_REPAIR_EXIT`] once the reply is sent.
+    RestartPending,
+}
+/// What the accept loop does after one served connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum After { Continue, RestartAfterRepair }
 
 /// The protocol state machine. Requests are served one at a time by one thread,
 /// so `Drain`, `Apply` and `Resume` never interleave.
-pub struct UpdateControl<S, E> { store: S, barrier: DrainBarrier, effects: E, startup: Startup }
+pub struct UpdateControl<S, E> { store: S, barrier: DrainBarrier, effects: E, startup: Startup, phase: Phase,
+    owner: Option<Owner>,
+    /// Where [`Self::report`] writes the status file (`None`: not written).
+    status_root: Option<PathBuf>,
+    /// The last `STATUS=` line announced (announced again only when it changes).
+    reported: Option<String> }
 impl<S: DrainStore + JournalStore, E: Effects> UpdateControl<S, E> {
-    /// Restores the barrier from the durable record, then settles the
-    /// publication journal (roll forward, roll back, or not ready). Call before
-    /// any socket is bound and before admission starts.
+    /// Restores the barrier from the durable record, then verifies the
+    /// installed set (journal: re-verify and republish, or roll back; no
+    /// journal: verify the selected generation). Call before any socket is
+    /// bound and before admission starts.
     pub fn new(mut store: S, barrier: DrainBarrier, mut effects: E) -> io::Result<Self> {
         let drain = match store.load() {
             Ok(None) => None,
@@ -327,16 +461,43 @@ impl<S: DrainStore + JournalStore, E: Effects> UpdateControl<S, E> {
             Err(_) => Some(DrainClosure::Unreadable),
         };
         if let Some(closure) = drain { barrier.close(closure).ok_or_else(invalid)?; }
+        let mut selected = None;
         let (journal, recovery) = match store.load_journal() {
-            Ok(None) => (None, PublicationRecovery::NoJournal),
+            Ok(None) => {
+                let (generation, recovery) = verify_selected(&mut effects);
+                selected = generation;
+                (None, recovery)
+            }
             Ok(Some(journal)) => (Some(journal), recover_journal(&mut store, &mut effects, journal)),
             Err(_) => (None, PublicationRecovery::JournalUnreadable),
         };
-        // A possibly mixed set: closed whatever the record said; only a new Drain re-keys it.
-        if !recovery.consistent() { barrier.close(DrainClosure::Recovery).ok_or_else(invalid)?; }
-        Ok(Self { store, barrier, effects, startup: Startup { drain, recovery, journal } })
+        // A possibly mixed or unverified set: closed whatever the record said;
+        // only a new Drain re-keys it, and nothing but the update endpoint opens.
+        let phase = if recovery.consistent() { Phase::Verified } else {
+            barrier.close(DrainClosure::Recovery).ok_or_else(invalid)?;
+            Phase::Closed
+        };
+        Ok(Self { store, barrier, effects, startup: Startup { drain, recovery, journal, selected }, phase,
+            owner: Owner::current().ok(), status_root: None, reported: None })
     }
+    /// Production: the status file lives in `root` (`/run/duduclaw-spawnd`).
+    fn with_status_root(mut self, root: &Path) -> Self { self.status_root = Some(root.to_path_buf()); self }
     pub fn startup(&self) -> Startup { self.startup }
+    /// The set was verified consistent at this process's start: the caller
+    /// opens the allocation socket, control listener and admission loop.
+    pub fn consistent_at_start(&self) -> bool { self.startup.recovery.consistent() }
+    /// Everything is open: from now on the status says `consistent` (while the
+    /// journal stays absent or `published`). `false`: not verified at start.
+    pub fn opened(&mut self) -> bool {
+        if self.phase != Phase::Verified { return false; }
+        self.phase = Phase::Open;
+        true
+    }
+    /// A process that started not consistent and whose set an `Apply` has since
+    /// repaired: it must exit with [`RESTART_AFTER_REPAIR_EXIT`].
+    pub(crate) fn restart_required(&self) -> bool { self.phase == Phase::RestartPending }
+    /// The admission loop of this process runs (or is about to).
+    fn admission_live(&self) -> bool { matches!(self.phase, Phase::Verified | Phase::Open) }
     pub(crate) fn status(&mut self) -> UpdateStatus {
         let (barrier, barrier_generation) = barrier_words(self.barrier.closure());
         let (startup_barrier, startup_barrier_generation) = barrier_words(self.startup.drain);
@@ -346,9 +507,34 @@ impl<S: DrainStore + JournalStore, E: Effects> UpdateControl<S, E> {
                 Some(hex(&found.generation)), found.previous.as_ref().map(hex), found.state == PublishState::Published),
             Err(_) => ("unreadable", None, None, false),
         };
-        UpdateStatus { schema: 1, admission_closed: self.barrier.is_closed(), barrier, barrier_generation, journal,
+        let (set, closed_reason) = match self.phase {
+            Phase::Verified | Phase::RestartPending => ("recovering", None),
+            Phase::Closed => ("inconsistent", Some(self.startup.recovery.closed_reason().unwrap_or("not_verified"))),
+            // A later Apply of this process failed half way: report it (the waiter
+            // has completed already; a restart of the waiter blocks again).
+            Phase::Open if !publication_consistent =>
+                ("inconsistent", Some(if journal == "unreadable" { "journal_unreadable" } else { "publication_incomplete" })),
+            Phase::Open => ("consistent", None),
+        };
+        UpdateStatus { schema: STATUS_SCHEMA, set, closed_reason, owner: self.owner.clone(),
+            admission_closed: self.barrier.is_closed(), barrier, barrier_generation, journal,
             journal_generation, journal_previous, publication_consistent, startup_barrier, startup_barrier_generation,
             startup_recovery: self.startup.recovery }
+    }
+    /// Write the status file (when configured) and announce the `STATUS=` line
+    /// when it changed. A failed write is part of the line. Returns the line.
+    pub(crate) fn report(&mut self) -> String {
+        let status = self.status();
+        let written = match &self.status_root {
+            Some(root) => write_status(root, &status).is_ok(),
+            None => true,
+        };
+        let line = status_line(status.set, status.closed_reason, written);
+        if self.reported.as_deref() != Some(line.as_str()) {
+            announce(&line);
+            self.reported = Some(line.clone());
+        }
+        line
     }
     /// Every refusal, whatever its cause, is the single `Refused` outcome.
     pub fn respond(&mut self, request: &ControlRequest) -> ControlResponse {
@@ -367,6 +553,10 @@ impl<S: DrainStore + JournalStore, E: Effects> UpdateControl<S, E> {
                 let previous = self.previous_for(preparation.generation)?;
                 publish_verified(&mut self.store, &mut self.effects, preparation.generation, None, previous,
                     Some(preparation))?;
+                // A set this process found not consistent is now complete: it
+                // replies, then restarts so the next start verifies everything
+                // before opening anything (never an in-process switch).
+                if self.phase == Phase::Closed { self.phase = Phase::RestartPending; }
                 Ok(ControlOutcome::Applied)
             }
             ControlCommand::Readback { generation } => {
@@ -382,6 +572,9 @@ impl<S: DrainStore + JournalStore, E: Effects> UpdateControl<S, E> {
         self.store.persist(generation)?;
         // 2. Then the in-memory barrier: no new StartRun from here on.
         let epoch = self.barrier.close(DrainClosure::Generation(generation)).ok_or_else(invalid)?;
+        // No admission loop exists in this process (started not consistent):
+        // nothing was or can be admitted, and no iteration will ever report.
+        if !self.admission_live() { return Ok(ControlOutcome::Drained { admission_closed: true, active_runs: 0 }); }
         // 3. Count what an admission iteration that began after the closure kept.
         let observed = self.barrier.wait_observation(epoch, started, OBSERVATION_WAIT).ok_or_else(timed_out)?;
         // An unhealthy iteration's count is not evidence of a drain (the barrier
@@ -396,6 +589,8 @@ impl<S: DrainStore + JournalStore, E: Effects> UpdateControl<S, E> {
         if self.barrier.closure() != Some(DrainClosure::Generation(generation)) || self.store.load()? != Some(generation) {
             return Err(invalid());
         }
+        // Without an admission loop no run exists in this process (see `drain`).
+        if !self.admission_live() { return Ok(()); }
         let observed = self.barrier.wait_observation(self.barrier.epoch(), Instant::now(), OBSERVATION_WAIT)
             .ok_or_else(timed_out)?;
         if !observed.healthy || observed.admitted_runs != 0 { return Err(invalid()); }
@@ -419,6 +614,9 @@ impl<S: DrainStore + JournalStore, E: Effects> UpdateControl<S, E> {
         })
     }
     fn resume(&mut self, generation: Sha256Digest) -> io::Result<ControlOutcome> {
+        // There is no admission to reopen in a process that started not
+        // consistent: only its restart (after a repairing Apply) opens anything.
+        if !self.admission_live() { return Err(invalid()); }
         let matches = match self.barrier.closure() {
             None => true,
             Some(DrainClosure::Generation(closed)) => closed == generation,
@@ -462,10 +660,18 @@ pub(crate) fn serve_one<S: DrainStore + JournalStore, E: Effects>(fd: OwnedFd, p
     let response = control.respond(&request);
     transport::send(&fd, &response).map_err(updated)
 }
+/// [`serve_one`], then the decision: the reply has been sent (and the
+/// connection closed) before a repaired set's restart is requested.
+pub(crate) fn serve_and_settle<S: DrainStore + JournalStore, E: Effects>(fd: OwnedFd, peer: (u32, u32),
+    control: &mut UpdateControl<S, E>) -> After {
+    let _ = serve_one(fd, peer, control);
+    if control.restart_required() { After::RestartAfterRepair } else { After::Continue }
+}
 
 /// Bind `update.sock` (root 0600) in the root-owned `/run/duduclaw-spawnd`.
-/// The caller holds the registry singleton lock, so an existing root socket
-/// is a dead spawnd's endpoint; any other file at the path stops startup.
+/// The caller holds the lifetime update lock (`recover`; every spawnd takes it
+/// before binding anything), so an existing root socket is a dead spawnd's
+/// endpoint; any other file at the path stops startup.
 fn bind_listener() -> io::Result<OwnedFd> {
     let path = Path::new(SPAWND_UPDATE_SOCKET);
     let parent = Directory::open(path.parent().ok_or_else(invalid)?).map_err(updated)?;
@@ -489,23 +695,35 @@ fn bind_listener() -> io::Result<OwnedFd> {
     Ok(fd)
 }
 
-/// `notified`: `READY=1` was already sent (start-up recovery was consistent).
-/// Otherwise it is sent once a served request (an operator's or the updater's
-/// `Drain` + `Apply`) leaves a consistent set and a re-keyed barrier.
-fn accept_loop<S: DrainStore + JournalStore, E: Effects>(listener: OwnedFd, mut control: UpdateControl<S, E>,
-    mut notified: bool) {
+type Shared = Arc<Mutex<UpdateControl<DiskDrainStore, InstalledEffects>>>;
+/// The state is shared with [`Serving::opened`]; a poisoned lock (a panic
+/// while serving) ends the process (fail closed: systemd restarts it, and
+/// the start verifies everything again).
+fn locked<S, E>(control: &Mutex<UpdateControl<S, E>>) -> std::sync::MutexGuard<'_, UpdateControl<S, E>> {
+    match control.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            eprintln!("duduclaw-spawnd: update control state lost");
+            std::process::exit(1)
+        }
+    }
+}
+/// One request at a time. After a request that repaired a set this process
+/// found not consistent: the reply is already sent, the status is flushed
+/// (`recovering`), then the process exits with [`RESTART_AFTER_REPAIR_EXIT`].
+fn accept_loop(listener: OwnedFd, control: Shared) {
     loop {
         match socket::accept4(listener.as_raw_fd(), SockFlag::SOCK_CLOEXEC) {
             Ok(raw) => {
                 // SAFETY: accept4 returned a new descriptor owned only here.
                 let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-                let _ = serve_one(fd, (0, 0), &mut control);
-                let status = control.status();
-                if !notified && status.publication_consistent && status.barrier != "recovery_incomplete" {
-                    notified = notify("READY=1").is_ok();
+                let mut control = locked(&control);
+                let after = serve_and_settle(fd, (0, 0), &mut *control);
+                control.report();
+                if after == After::RestartAfterRepair {
+                    eprintln!("duduclaw-spawnd: set repaired; restarting to verify before opening");
+                    std::process::exit(RESTART_AFTER_REPAIR_EXIT);
                 }
-                // Diagnostic only: a failed status write never changes a decision.
-                let _ = write_status(Path::new(STATUS_ROOT), &status);
             }
             Err(Errno::EAGAIN | Errno::EINTR | Errno::ECONNABORTED) => {}
             Err(_) => std::thread::sleep(Duration::from_millis(100)),
@@ -519,38 +737,130 @@ fn now_ms() -> u64 {
 }
 
 /// spawnd's start-up half of the endpoint: the update lock held, the barrier
-/// restored and the publication journal settled. [`Recovered::serve`] binds.
+/// restored and the installed set verified. [`Recovered::serve`] binds.
 pub struct Recovered { control: UpdateControl<DiskDrainStore, InstalledEffects>, barrier: DrainBarrier, lock: File }
 /// Called before any socket is bound (control, allocation, update) and before
 /// admission. The lifetime flock `/var/lib/duduclaw-spawnd/update.lock` makes
 /// this process the only writer of the fixed destinations even before the
-/// registry singleton lock is taken. Audits the barrier restored from a record
-/// and any journal found, and writes the status file (best effort).
+/// registry singleton lock is taken. Announces `recovering` first, audits the
+/// barrier restored from a record and the start-up verification, then writes
+/// the status file and announces the result (a failed audit emission or status
+/// write is part of the announced `STATUS=` line, never silent).
 pub fn recover(audit: &crate::audit::disk::AuditWorker) -> io::Result<Recovered> {
+    announce(&status_line("recovering", None, true));
     let lock = Directory::open(Path::new(DRAIN_ROOT)).and_then(|directory| directory.lock()).map_err(updated)?;
     let barrier = DrainBarrier::default();
-    let mut control = UpdateControl::new(DiskDrainStore::production(), barrier.clone(), InstalledEffects::production())?;
-    for record in control.startup().audit_records(now_ms()) { let _ = audit.emit(AUDIT_SOURCE, record); }
-    let _ = write_status(Path::new(STATUS_ROOT), &control.status());
+    let mut control = UpdateControl::new(DiskDrainStore::production(), barrier.clone(), InstalledEffects::production())?
+        .with_status_root(Path::new(STATUS_ROOT));
+    let mut audited = true;
+    for record in control.startup().audit_records(now_ms()) { audited &= audit.emit(AUDIT_SOURCE, record); }
+    let line = control.report();
+    if !audited { announce(&format!("{line}; audit_write_failed")); }
     Ok(Recovered { control, barrier, lock })
 }
 impl Recovered {
-    /// Every fixed component holds one generation's bytes. `false`: admission
-    /// stays closed and `READY=1` must be withheld (units ordered after spawnd
-    /// do not start on a mixed set); the update endpoint still answers root.
-    pub fn ready(&self) -> bool { self.control.startup().recovery.consistent() }
+    /// Every fixed component holds one verified generation's bytes. `false`:
+    /// spawnd opens nothing but the update endpoint.
+    pub fn consistent(&self) -> bool { self.control.consistent_at_start() }
     /// Bind `update.sock` and serve it on a dedicated thread (which keeps the
-    /// update lock); the returned barrier is attached to the admission loop.
-    /// The caller sends `READY=1` when [`Self::ready`]; otherwise the thread
-    /// sends it once a consistent set is restored.
-    pub fn serve(self) -> io::Result<DrainBarrier> {
-        let ready = self.ready();
+    /// update lock). The returned handle carries the barrier for the admission
+    /// loop and marks the set open ([`Serving::opened`]).
+    pub fn serve(self) -> io::Result<Serving> {
         let Self { control, barrier, lock } = self;
         let listener = bind_listener()?;
-        std::thread::Builder::new().name("spawnd-update-control".into())
-            .spawn(move || { let _lock = lock; accept_loop(listener, control, ready) })?;
-        Ok(barrier)
+        let control: Shared = Arc::new(Mutex::new(control));
+        let served = control.clone();
+        let thread = std::thread::Builder::new().name("spawnd-update-control".into())
+            .spawn(move || { let _lock = lock; accept_loop(listener, served) })?;
+        Ok(Serving { barrier, control, thread })
     }
+}
+/// The running update endpoint.
+pub struct Serving { barrier: DrainBarrier, control: Shared, thread: std::thread::JoinHandle<()> }
+impl Serving {
+    /// The barrier the admission loop observes.
+    pub fn barrier(&self) -> DrainBarrier { self.barrier.clone() }
+    /// The allocation socket, control listener and admission are open: the
+    /// status file now says `consistent` for this process (the waiter of
+    /// `duduclaw-isolation-ready.service` completes on it).
+    pub fn opened(&self) -> io::Result<()> {
+        let mut control = locked(&self.control);
+        if !control.opened() { return Err(invalid()); }
+        control.report();
+        Ok(())
+    }
+    /// Not consistent: the process serves only the update endpoint until a
+    /// repairing `Apply` exits it. Returns only if the endpoint thread ended.
+    pub fn wait(self) -> io::Result<()> {
+        let _ = self.thread.join();
+        Err(io::Error::other("update control endpoint stopped"))
+    }
+}
+
+/// spawnd's start sequence after [`recover`] (plan R6 addendum points 2 and 4):
+/// 1. bind and serve the root-only update endpoint;
+/// 2. `READY=1`, always: it means only that the update endpoint is available;
+/// 3. only when the set was verified consistent: open the allocation socket,
+///    control listener and admission (`open_admission`). Otherwise nothing
+///    else is initialised and `Ok(None)` is returned.
+pub fn start<T>(consistent: bool, bind_update: impl FnOnce() -> io::Result<()>, mut notify: impl FnMut(&str),
+    open_admission: impl FnOnce() -> io::Result<T>) -> io::Result<Option<T>> {
+    bind_update()?;
+    notify("READY=1");
+    if !consistent { return Ok(None); }
+    open_admission().map(Some)
+}
+
+/// `duduclaw-spawnd wait-consistent` (unit `duduclaw-isolation-ready.service`):
+/// a fresh, matching, consistent status file exists. Fresh and matching: the
+/// `owner` is this boot (`/proc/sys/kernel/random/boot_id`), and `live(pid)`
+/// returns the start time of a live spawnd with that pid equal to the
+/// recorded one (a status of an earlier spawnd process, even with a recycled
+/// pid, never matches). Missing, unreadable, unparsable, ownerless, stale or
+/// not `consistent`: `false`.
+pub(crate) fn status_accepted(bytes: Option<&[u8]>, boot: &str, live: impl Fn(u32) -> Option<u64>) -> bool {
+    #[derive(Deserialize)]
+    struct View { schema: u16, set: String, owner: Option<Owner> }
+    let Some(bytes) = bytes.filter(|bytes| bytes.len() <= MAX_STATUS_BYTES) else { return false };
+    let Ok(view) = serde_json::from_slice::<View>(bytes) else { return false };
+    let Some(owner) = view.owner else { return false };
+    view.schema == STATUS_SCHEMA && view.set == "consistent" && owner.boot_id == boot
+        && live(owner.pid) == Some(owner.start_time)
+}
+/// Poll `accepted` every `interval` until it holds (`Ok`) or `timeout` passes
+/// (`Err`); `None`: no timeout (the unit's own start timeout is infinite).
+pub(crate) fn wait_until(mut accepted: impl FnMut() -> bool, timeout: Option<Duration>, interval: Duration)
+    -> io::Result<()> {
+    let started = Instant::now();
+    loop {
+        if accepted() { return Ok(()); }
+        if timeout.is_some_and(|timeout| started.elapsed() >= timeout) { return Err(timed_out()); }
+        std::thread::sleep(interval);
+    }
+}
+/// The start time of `pid` when it is a process of `duduclaw-spawnd.service`
+/// (its cgroup v2 path ends in that unit), otherwise `None`.
+fn live_spawnd(pid: u32) -> Option<u64> {
+    let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    let in_unit = cgroup.lines().filter_map(|line| line.strip_prefix("0::"))
+        .any(|path| path.rsplit('/').next() == Some("duduclaw-spawnd.service"));
+    if !in_unit { return None; }
+    process_start_time(pid).ok()
+}
+/// The root-only status file, read through `Directory` (root-owned ancestors,
+/// no symlink, root-owned single-link regular file).
+fn read_status() -> Option<Vec<u8>> {
+    Directory::open(Path::new(STATUS_ROOT)).and_then(|directory| directory.bytes(STATUS_FILE, MAX_STATUS_BYTES)).ok()
+}
+/// Returns `Ok` only once spawnd reports the verified, opened, consistent set.
+/// Waits indefinitely otherwise; an unreadable boot id is an error (never `Ok`).
+/// Connects to nothing: it only reads the root-only status file and `/proc`.
+pub fn wait_consistent() -> io::Result<()> {
+    let boot = boot_id()?;
+    eprintln!("duduclaw-spawnd: waiting for a consistent isolated set (see {STATUS_ROOT}/{STATUS_FILE})");
+    wait_until(|| status_accepted(read_status().as_deref(), &boot, live_spawnd), None, Duration::from_millis(500))?;
+    eprintln!("duduclaw-spawnd: isolated set consistent");
+    Ok(())
 }
 
 /// `sd_notify(3)` for the `Type=notify` unit: `state` is e.g. `READY=1`. Without
@@ -598,16 +908,20 @@ pub struct InstalledEffects {
     /// this many renames, before the next one.
     #[cfg(test)]
     power_loss_after: Option<usize>,
+    /// Stands in for the trust ledger's revocation fence (`Trust::Unsigned`):
+    /// these generations fail authentication.
+    #[cfg(test)]
+    revoked: Vec<Sha256Digest>,
 }
 impl InstalledEffects {
     pub fn production() -> Self {
         Self { install_root: PathBuf::from(INSTALL_ROOT), publish_root: PathBuf::from("/"), trust: Trust::Recorded,
-            own_image: running_image().ok(), #[cfg(test)] power_loss_after: None }
+            own_image: running_image().ok(), #[cfg(test)] power_loss_after: None, #[cfg(test)] revoked: Vec::new() }
     }
     #[cfg(test)]
     fn for_test(install_root: &Path, publish_root: &Path) -> Self {
         Self { install_root: install_root.to_path_buf(), publish_root: publish_root.to_path_buf(),
-            trust: Trust::Unsigned, own_image: running_image().ok(), power_loss_after: None }
+            trust: Trust::Unsigned, own_image: running_image().ok(), power_loss_after: None, revoked: Vec::new() }
     }
     /// `Ok(None)` only when the generation directory does not exist (yet).
     fn generation_directory(&self, generation: Sha256Digest) -> io::Result<Option<Directory>> {
@@ -742,7 +1056,11 @@ impl Effects for InstalledEffects {
     fn verify(&mut self, generation: Sha256Digest, preparation: Option<&Preparation>) -> io::Result<Sha256Digest> {
         let directory = self.generation_directory(generation)?.ok_or_else(invalid)?;
         let (bytes, manifest) = self.manifest(&directory, generation)?;
+        // Production: `verify_recorded` = `TrustLedger::verify_installed`, which
+        // refuses a manifest whose signing key the current root revoked.
         self.authenticate(&directory, &bytes, &manifest)?;
+        #[cfg(test)]
+        if self.revoked.contains(&generation) { return Err(invalid()); }
         match preparation {
             Some(preparation) => bound(preparation, &manifest)?,
             // Start-up recovery has no request: the manifest itself must need none.
@@ -779,6 +1097,18 @@ impl Effects for InstalledEffects {
         for (destination, name) in &placed {
             destination.read(name).map_err(updated)?.sync_all()?;
             destination.sync().map_err(updated)?;
+        }
+        Ok(())
+    }
+    fn published(&mut self, generation: Sha256Digest) -> io::Result<()> {
+        let directory = self.generation_directory(generation)?.ok_or_else(invalid)?;
+        let (_, manifest) = self.manifest(&directory, generation)?;
+        for (target, relative) in publication() {
+            let artifact = fixed_artifact(&manifest, &target)?;
+            let destination = Directory::open(&self.publish_root.join(relative)).map_err(updated)?;
+            if artifact.mode != 0o755 || !already_published(&destination, &artifact_name(&target).map_err(updated)?, artifact)? {
+                return Err(invalid());
+            }
         }
         Ok(())
     }

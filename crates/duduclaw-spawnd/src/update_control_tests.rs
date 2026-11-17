@@ -78,6 +78,8 @@ struct World {
     slots: [Option<Sha256Digest>; 8],
     /// Generation directories that pass full verification.
     staged: Vec<Sha256Digest>,
+    /// Generations whose signing key the trust ledger has since revoked.
+    revoked: Vec<Sha256Digest>,
     /// The install selector (`current`).
     selector: Option<Sha256Digest>,
     /// Simulated power loss in the next `publish`, after this many renames.
@@ -92,6 +94,8 @@ fn new_world(store: &MemoryStore, installed: Sha256Digest, staged: &[Sha256Diges
         disk: Some(store.clone()), ..World::default() }))
 }
 
+/// Without a world, the selected generation of a verified installed set.
+const INSTALLED: Sha256Digest = Sha256Digest([0xee; 32]);
 #[derive(Default)]
 struct FakeEffects { calls: Vec<&'static str>, fail: bool, world: Option<SharedWorld> }
 impl FakeEffects {
@@ -106,9 +110,21 @@ impl Effects for FakeEffects {
         self.calls.push("verify");
         if self.fail { return Err(invalid()); }
         match &self.world {
-            Some(world) if !world.lock().unwrap().staged.contains(&generation) => Err(invalid()),
+            Some(world) => {
+                let world = world.lock().unwrap();
+                // Missing/corrupt directory, or a signer the ledger revoked.
+                if !world.staged.contains(&generation) || world.revoked.contains(&generation) { return Err(invalid()); }
+                Ok(generation)
+            }
             // The manifest digest is the generation digest.
-            _ => Ok(generation),
+            None => Ok(generation),
+        }
+    }
+    fn published(&mut self, generation: Sha256Digest) -> io::Result<()> {
+        self.calls.push("published");
+        match &self.world {
+            Some(world) if world.lock().unwrap().slots != [Some(generation); 8] => Err(invalid()),
+            _ => Ok(()),
         }
     }
     fn publish(&mut self, generation: Sha256Digest) -> io::Result<()> {
@@ -133,20 +149,25 @@ impl Effects for FakeEffects {
         Ok(())
     }
     fn installed(&mut self) -> io::Result<Option<Sha256Digest>> {
-        Ok(self.world.as_ref().and_then(|world| world.lock().unwrap().selector))
+        Ok(match &self.world { Some(world) => world.lock().unwrap().selector, None => Some(INSTALLED) })
     }
     fn readback(&mut self, _: Sha256Digest, _: bool) -> io::Result<Vec<ComponentReadback>> {
         self.calls.push("readback");
         Ok(vec![])
     }
 }
-/// No generation effects (drain-only root tests).
+/// A verified installed set and no publication (drain-only root tests).
 struct NoEffects;
 impl Effects for NoEffects {
     fn prepare(&mut self, _: &Preparation) -> io::Result<()> { Err(invalid()) }
-    fn verify(&mut self, _: Sha256Digest, _: Option<&Preparation>) -> io::Result<Sha256Digest> { Err(invalid()) }
+    fn verify(&mut self, generation: Sha256Digest, _: Option<&Preparation>) -> io::Result<Sha256Digest> {
+        if generation == INSTALLED { Ok(generation) } else { Err(invalid()) }
+    }
     fn publish(&mut self, _: Sha256Digest) -> io::Result<()> { Err(invalid()) }
-    fn installed(&mut self) -> io::Result<Option<Sha256Digest>> { Err(invalid()) }
+    fn published(&mut self, generation: Sha256Digest) -> io::Result<()> {
+        if generation == INSTALLED { Ok(()) } else { Err(invalid()) }
+    }
+    fn installed(&mut self) -> io::Result<Option<Sha256Digest>> { Ok(Some(INSTALLED)) }
     fn readback(&mut self, _: Sha256Digest, _: bool) -> io::Result<Vec<ComponentReadback>> { Err(invalid()) }
 }
 
@@ -312,6 +333,9 @@ fn update_apply_requires_closed_recorded_generation_and_no_runs() {
     let store = MemoryStore::default();
     let admission = Observer::new(&barrier, 1);
     let mut control = UpdateControl::new(store.clone(), barrier.clone(), FakeEffects::default()).unwrap();
+    // The start verified the selected generation (and wrote nothing).
+    assert_eq!(control.effects.calls, vec!["verify", "published"]);
+    control.effects.calls.clear();
     let apply = |generation| ControlCommand::Apply { preparation: preparation(generation) };
     // Not drained at all.
     assert!(matches!(outcome(&mut control, apply(digest(7))), ControlOutcome::Refused));
@@ -334,8 +358,10 @@ fn update_apply_requires_closed_recorded_generation_and_no_runs() {
     assert!(control.effects.calls.is_empty());
     accepted(&mut control, apply(digest(7)));
     assert_eq!(control.effects.calls, vec!["verify", "publish"]);
-    // No selector: the journal names no previous generation.
-    assert_eq!(store.journal(), Some(PublishJournal::new(digest(7), digest(7), None, PublishState::Published).unwrap()));
+    // An Apply on a set verified at start never asks for a restart.
+    assert!(!control.restart_required());
+    // The selected generation is the journal's previous.
+    assert_eq!(store.journal(), Some(PublishJournal::new(digest(7), digest(7), Some(INSTALLED), PublishState::Published).unwrap()));
     accepted(&mut control, ControlCommand::Resume { generation: digest(7) });
     assert_eq!(store.journal(), None);
     assert!(matches!(outcome(&mut control, apply(digest(7))), ControlOutcome::Refused));
@@ -402,10 +428,12 @@ fn update_power_loss_after_each_rename_is_completed_on_restart() {
         assert_eq!(slots(&shared), [Some(digest(2)); 8], "after {renames} renames");
         assert_eq!(store.journal().map(|journal| journal.state), Some(PublishState::Published));
         assert_eq!(barrier.closure(), Some(DrainClosure::Generation(digest(2))));
-        // A second restart finds nothing to complete.
+        // A second restart re-verifies the `published` generation and runs the
+        // idempotent publication again (nothing left to replace).
         let (_, again) = restart(&store, &shared);
-        assert_eq!(again.startup().recovery, PublicationRecovery::AlreadyPublished);
-        assert_eq!(again.effects.calls, Vec::<&str>::new());
+        assert_eq!(again.startup().recovery, PublicationRecovery::Reverified);
+        assert_eq!(again.effects.calls, vec!["verify", "publish"]);
+        assert_eq!(slots(&shared), [Some(digest(2)); 8]);
     }
 }
 
@@ -444,6 +472,8 @@ fn update_unrecoverable_publication_stays_not_ready_until_completed() {
     assert_eq!((status["barrier"].as_str(), status["journal"].as_str(), status["publication_consistent"].as_bool(),
         status["startup_recovery"].as_str(), status["admission_closed"].as_bool()),
         (Some("recovery_incomplete"), Some("publishing"), Some(false), Some("incomplete"), Some(true)));
+    assert_eq!((status["set"].as_str(), status["closed_reason"].as_str()), (Some("inconsistent"), Some("publication_incomplete")));
+    assert_eq!(control.report(), "inconsistent: publication_incomplete");
     // The mixed set is left exactly as found (no further renames).
     assert_eq!(slots(&shared).iter().filter(|slot| **slot == Some(digest(2))).count(), 3);
     let _admission = Observer::new(&barrier, 0);
@@ -456,9 +486,22 @@ fn update_unrecoverable_publication_stays_not_ready_until_completed() {
     assert!(barrier.is_closed());
     // An operator restages the generation: the update endpoint completes it.
     shared.lock().unwrap().staged.push(digest(2));
+    assert!(!control.restart_required());
     accepted(&mut control, apply_command(digest(2)));
     assert_eq!(slots(&shared), [Some(digest(2)); 8]);
     assert_eq!(serde_json::to_value(control.status()).unwrap()["publication_consistent"], true);
+    // Never an in-process switch: this process asks for its restart, and
+    // nothing (not even Resume) reopens admission here.
+    assert!(control.restart_required());
+    assert_eq!(control.report(), "recovering");
+    refused_outcome(&mut control, ControlCommand::Resume { generation: digest(2) });
+    assert!(barrier.is_closed());
+    drop(control);
+    // The restart re-verifies everything; only then may Resume reopen admission.
+    let (barrier, mut control) = restart(&store, &shared);
+    assert_eq!(control.startup().recovery, PublicationRecovery::Reverified);
+    assert!(control.consistent_at_start());
+    let _admission = Observer::new(&barrier, 0);
     accepted(&mut control, ControlCommand::Resume { generation: digest(2) });
     assert!(!barrier.is_closed());
 }
@@ -484,6 +527,297 @@ fn update_unreadable_or_unknown_journal_is_not_ready() {
         refused_outcome(&mut control, ControlCommand::Resume { generation: digest(1) });
         assert!(barrier.is_closed());
         assert_eq!(slots(&shared), [Some(digest(1)); 8]);
+    }
+}
+
+/// Generation 1 installed; `Apply(2)` completed (`published`), power lost before `Resume`.
+fn applied_not_resumed() -> (MemoryStore, SharedWorld) {
+    let store = MemoryStore::default();
+    let shared = new_world(&store, digest(1), &[digest(1), digest(2)]);
+    let barrier = DrainBarrier::default();
+    let _admission = Observer::new(&barrier, 0);
+    let mut control = UpdateControl::new(store.clone(), barrier, FakeEffects::over(&shared)).unwrap();
+    accepted(&mut control, ControlCommand::Drain { generation: digest(2) });
+    accepted(&mut control, apply_command(digest(2)));
+    assert_eq!(slots(&shared), [Some(digest(2)); 8]);
+    assert_eq!(store.journal(), Some(PublishJournal::new(digest(2), digest(2), Some(digest(1)), PublishState::Published).unwrap()));
+    (store, shared)
+}
+
+#[test]
+fn update_published_journal_with_revoked_signer_is_not_trusted() {
+    // The signing key of generation 2 is revoked after its Apply, before Resume:
+    // a `published` journal is re-verified and rolled back to the trusted previous.
+    let (store, shared) = applied_not_resumed();
+    shared.lock().unwrap().revoked.push(digest(2));
+    let (barrier, control) = restart(&store, &shared);
+    assert_eq!(control.startup().recovery, PublicationRecovery::RolledBack);
+    assert!(control.consistent_at_start());
+    assert_eq!(slots(&shared), [Some(digest(1)); 8]);
+    assert_eq!(store.journal(), Some(PublishJournal::new(digest(1), digest(1), Some(digest(2)), PublishState::Published).unwrap()));
+    // Admission stays closed by the record of 2 until the updater re-drains and resumes 1.
+    assert_eq!(barrier.closure(), Some(DrainClosure::Generation(digest(2))));
+    drop(control);
+    // Both revoked: not consistent; nothing republished; nothing but the update endpoint.
+    shared.lock().unwrap().revoked.push(digest(1));
+    let (barrier, mut control) = restart(&store, &shared);
+    assert_eq!(control.startup().recovery, PublicationRecovery::Incomplete);
+    assert!(!control.consistent_at_start());
+    assert_eq!(barrier.closure(), Some(DrainClosure::Recovery));
+    assert_eq!(slots(&shared), [Some(digest(1)); 8]);
+    assert!(!control.opened());
+    assert_eq!(control.report(), "inconsistent: publication_incomplete");
+    refused_outcome(&mut control, ControlCommand::Resume { generation: digest(1) });
+}
+
+#[test]
+fn update_published_journal_repairs_an_altered_destination() {
+    let (store, shared) = applied_not_resumed();
+    shared.lock().unwrap().slots[3] = Some(digest(9));
+    let (barrier, mut control) = restart(&store, &shared);
+    assert_eq!(control.startup().recovery, PublicationRecovery::Reverified);
+    assert_eq!(control.effects.calls, vec!["verify", "publish"]);
+    assert_eq!(slots(&shared), [Some(digest(2)); 8]);
+    // Journaled like any publication: `publishing` was durable before the repair.
+    let before = shared.lock().unwrap().journal_at_publish.last().copied().flatten();
+    assert_eq!(before.map(|journal| journal.state), Some(PublishState::Publishing));
+    assert_eq!(store.journal(), Some(PublishJournal::new(digest(2), digest(2), Some(digest(1)), PublishState::Published).unwrap()));
+    let _admission = Observer::new(&barrier, 0);
+    accepted(&mut control, ControlCommand::Resume { generation: digest(2) });
+    assert!(!barrier.is_closed());
+}
+
+#[test]
+fn update_without_journal_verifies_the_selected_generation() {
+    let store = MemoryStore::default();
+    let shared = new_world(&store, digest(1), &[digest(1)]);
+    // Valid: consistent, nothing written.
+    let (barrier, mut control) = restart(&store, &shared);
+    assert_eq!(control.startup().recovery, PublicationRecovery::NoJournal);
+    assert_eq!(control.effects.calls, vec!["verify", "published"]);
+    assert_eq!((store.journal(), barrier.closure()), (None, None));
+    assert_eq!(control.report(), "recovering");
+    assert!(control.opened());
+    assert_eq!(control.report(), "consistent");
+    drop(control);
+    // A tampered destination: not consistent, left as found, audited with the generation.
+    shared.lock().unwrap().slots[7] = Some(digest(9));
+    let (barrier, mut control) = restart(&store, &shared);
+    assert_eq!(control.startup().recovery, PublicationRecovery::SelectedUnverified);
+    assert_eq!(barrier.closure(), Some(DrainClosure::Recovery));
+    assert_eq!(slots(&shared)[7], Some(digest(9)));
+    assert_eq!(store.journal(), None);
+    assert!(!control.opened());
+    assert_eq!(control.report(), "inconsistent: selected_unverified");
+    assert_eq!(control.startup().audit_records(1).last().and_then(|record| record.detail.clone()),
+        Some(Detail::PublicationRecovery { action: PublicationRecovery::SelectedUnverified, generation: Some(digest(1)),
+            previous: None }));
+    drop(control);
+    // A revoked selected generation, and no selector at all: not consistent either.
+    shared.lock().unwrap().slots = [Some(digest(1)); 8];
+    shared.lock().unwrap().revoked.push(digest(1));
+    assert_eq!(restart(&store, &shared).1.startup().recovery, PublicationRecovery::SelectedUnverified);
+    shared.lock().unwrap().selector = None;
+    let (barrier, control) = restart(&store, &shared);
+    assert_eq!(control.startup().recovery, PublicationRecovery::SelectorAbsent);
+    assert_eq!(barrier.closure(), Some(DrainClosure::Recovery));
+}
+
+#[test]
+fn update_repairing_apply_replies_then_takes_the_restart_path() {
+    let store = MemoryStore::default();
+    let shared = new_world(&store, digest(1), &[digest(1)]);
+    shared.lock().unwrap().slots[6] = Some(digest(9));
+    let (barrier, mut control) = restart(&store, &shared);
+    assert_eq!(control.startup().recovery, PublicationRecovery::SelectedUnverified);
+    // No admission loop exists: Drain answers zero admitted runs without waiting.
+    let started = Instant::now();
+    accepted(&mut control, ControlCommand::Drain { generation: digest(1) });
+    assert!(started.elapsed() < OBSERVATION_WAIT);
+    // A refused request takes no restart path.
+    let (client, server) = pair();
+    transport::send(&client, &request(ControlCommand::Resume { generation: digest(1) })).unwrap();
+    assert_eq!(serve_and_settle(server, me(), &mut control), After::Continue);
+    assert!(matches!(transport::receive::<ControlResponse>(&client).unwrap().outcome, ControlOutcome::Refused));
+    // The repairing Apply: its reply is sent before the restart is decided.
+    let (client, server) = pair();
+    let apply = request(apply_command(digest(1)));
+    transport::send(&client, &apply).unwrap();
+    assert_eq!(serve_and_settle(server, me(), &mut control), After::RestartAfterRepair);
+    let response: ControlResponse = transport::receive(&client).unwrap();
+    validate_response(&apply, &response).unwrap();
+    assert_eq!(slots(&shared), [Some(digest(1)); 8]);
+    assert_eq!(store.journal(), Some(PublishJournal::new(digest(1), digest(1), None, PublishState::Published).unwrap()));
+    assert_eq!(control.report(), "recovering");
+    assert!(!control.opened());
+    assert_eq!(barrier.closure(), Some(DrainClosure::Generation(digest(1))));
+    drop(control);
+    // The restarted process verifies everything, then opens.
+    let (barrier, mut control) = restart(&store, &shared);
+    assert_eq!(control.startup().recovery, PublicationRecovery::Reverified);
+    assert!(control.opened());
+    assert_eq!(control.report(), "consistent");
+    let _admission = Observer::new(&barrier, 0);
+    accepted(&mut control, ControlCommand::Resume { generation: digest(1) });
+    assert_eq!(store.journal(), None);
+    assert!(!barrier.is_closed());
+}
+
+#[test]
+fn update_start_binds_only_the_update_endpoint_when_not_consistent() {
+    use std::os::unix::net::UnixListener;
+    for consistent in [false, true] {
+        // The runtime directory seam: every endpoint is bound below it.
+        let runtime = tempfile::tempdir().unwrap();
+        let path = |name: &str| runtime.path().join(name);
+        let mut notified = Vec::new();
+        let mut held = Vec::new();
+        let opened = start(consistent,
+            || { held.push(UnixListener::bind(path("update.sock"))?); Ok(()) },
+            |state| notified.push(state.to_owned()),
+            || Ok((UnixListener::bind(path("allocation.sock"))?, UnixListener::bind(path("control.sock"))?))).unwrap();
+        // READY=1 always, and only after the update endpoint is bound.
+        assert_eq!(notified, ["READY=1"]);
+        assert_eq!(held.len(), 1);
+        assert!(path("update.sock").exists());
+        assert_eq!(opened.is_some(), consistent);
+        assert_eq!(path("allocation.sock").exists(), consistent, "consistent={consistent}");
+        assert_eq!(path("control.sock").exists(), consistent, "consistent={consistent}");
+    }
+    // No update endpoint: no READY=1 and nothing else.
+    let mut notified = Vec::new();
+    let mut admitted = false;
+    assert!(start(true, || Err(io::Error::other("bind failed")), |state| notified.push(state.to_owned()),
+        || { admitted = true; Ok(()) }).is_err());
+    assert!(notified.is_empty() && !admitted);
+}
+
+#[test]
+fn update_status_line_uses_fixed_vocabulary() {
+    assert_eq!(status_line("consistent", None, true), "consistent");
+    assert_eq!(status_line("recovering", None, true), "recovering");
+    assert_eq!(status_line("inconsistent", Some("selector_absent"), true), "inconsistent: selector_absent");
+    // A failed status-file write is reflected in STATUS=.
+    assert_eq!(status_line("inconsistent", Some("journal_unreadable"), false),
+        "inconsistent: journal_unreadable; status_file_write_failed");
+    assert_eq!(status_line("consistent", None, false), "consistent; status_file_write_failed");
+    for recovery in [PublicationRecovery::NoJournal, PublicationRecovery::Reverified, PublicationRecovery::RolledForward,
+        PublicationRecovery::RolledBack] {
+        assert!(recovery.consistent() && recovery.closed_reason().is_none());
+    }
+    for (recovery, reason) in [(PublicationRecovery::Incomplete, "publication_incomplete"),
+        (PublicationRecovery::JournalUnreadable, "journal_unreadable"), (PublicationRecovery::SelectorAbsent, "selector_absent"),
+        (PublicationRecovery::SelectorUnreadable, "selector_unreadable"),
+        (PublicationRecovery::SelectedUnverified, "selected_unverified")] {
+        assert!(!recovery.consistent());
+        assert_eq!(recovery.closed_reason(), Some(reason));
+    }
+}
+
+#[test]
+fn update_wait_consistent_accepts_only_a_fresh_matching_consistent_status() {
+    let boot = "0123abcd-0000-4000-8000-000000000001";
+    let owner = Owner { boot_id: boot.into(), pid: 4242, start_time: 777 };
+    let status = |set: &str, owner: Option<&Owner>| serde_json::to_vec(&serde_json::json!({
+        "schema": 2, "set": set, "closed_reason": null, "owner": owner, "admission_closed": false })).unwrap();
+    let live = |pid: u32| (pid == 4242).then_some(777u64);
+    let good = status("consistent", Some(&owner));
+    assert!(status_accepted(Some(&good), boot, live));
+    // Missing, unreadable, malformed.
+    assert!(!status_accepted(None, boot, live));
+    assert!(!status_accepted(Some(b"{"), boot, live));
+    assert!(!status_accepted(Some(&vec![b' '; MAX_STATUS_BYTES + 1]), boot, live));
+    // Stale: another boot, a dead pid, a recycled pid (other start time), a
+    // process outside duduclaw-spawnd.service (the probe returns nothing).
+    assert!(!status_accepted(Some(&good), "0123abcd-0000-4000-8000-000000000002", live));
+    assert!(!status_accepted(Some(&good), boot, |_| None));
+    assert!(!status_accepted(Some(&good), boot, |_| Some(778)));
+    // Not consistent, no owner, an earlier schema, an owner with an unknown field.
+    for set in ["recovering", "inconsistent"] { assert!(!status_accepted(Some(&status(set, Some(&owner))), boot, live)); }
+    assert!(!status_accepted(Some(&status("consistent", None)), boot, live));
+    let mut value: serde_json::Value = serde_json::from_slice(&good).unwrap();
+    value["schema"] = 1.into();
+    assert!(!status_accepted(Some(&serde_json::to_vec(&value).unwrap()), boot, live));
+    let mut value: serde_json::Value = serde_json::from_slice(&good).unwrap();
+    value["owner"]["uid"] = 0.into();
+    assert!(!status_accepted(Some(&serde_json::to_vec(&value).unwrap()), boot, live));
+    // The status this process writes is accepted only once everything is open.
+    let current = boot_id().unwrap();
+    let alive = |pid: u32| (pid == std::process::id()).then(|| process_start_time(pid).unwrap());
+    let mut control = endpoint();
+    let written = |control: &mut UpdateControl<MemoryStore, FakeEffects>| serde_json::to_vec(&control.status()).unwrap();
+    assert!(!status_accepted(Some(&written(&mut control)), &current, alive));
+    assert!(control.opened());
+    assert!(status_accepted(Some(&written(&mut control)), &current, alive));
+    // The waiter keeps waiting (here until its test timeout) and returns as soon as it is accepted.
+    assert_eq!(wait_until(|| false, Some(Duration::from_millis(50)), Duration::from_millis(5)).unwrap_err().kind(),
+        io::ErrorKind::TimedOut);
+    let mut polls = 0;
+    wait_until(|| { polls += 1; polls == 3 }, Some(Duration::from_secs(5)), Duration::from_millis(1)).unwrap();
+    assert_eq!(polls, 3);
+}
+
+// ---------------------------------------------------------------- unit files
+
+const SPAWND_UNIT: &str = include_str!("../../../scripts/linux-protected/spawnd/duduclaw-spawnd.service");
+const READY_UNIT: &str = include_str!("../../../scripts/linux-protected/spawnd/duduclaw-isolation-ready.service");
+const EGRESS_UNIT: &str = include_str!("../../duduclaw-egress/systemd/duduclaw-egress.service");
+const UPDATED_UNIT: &str = include_str!("../../../scripts/linux-protected/updated/duduclaw-updated.service");
+/// Directive lines (comments and blank lines dropped).
+fn directives(unit: &str) -> Vec<&str> {
+    unit.lines().filter(|line| !line.is_empty() && !line.starts_with('#')).collect()
+}
+
+#[test]
+fn update_unit_isolation_ready_waits_for_spawnd_consistency() {
+    use duduclaw_isolation::ids::ISOLATION_READY_UNIT;
+    assert_eq!(ISOLATION_READY_UNIT, "duduclaw-isolation-ready.service");
+    let lines = directives(READY_UNIT);
+    for expected in ["Type=oneshot", "RemainAfterExit=yes", "Requires=duduclaw-spawnd.service", "After=duduclaw-spawnd.service",
+        "ExecStart=/usr/lib/duduclaw/duduclaw-spawnd wait-consistent", "TimeoutStartSec=infinity", "User=root",
+        "NoNewPrivileges=yes", "CapabilityBoundingSet=", "AmbientCapabilities=", "ProtectSystem=strict",
+        "PrivateNetwork=yes", "IPAddressDeny=any", "PrivateDevices=yes", "ProtectHome=yes", "StandardError=journal"] {
+        assert!(lines.contains(&expected), "{expected}");
+    }
+    // Read-only, no network, nothing restarted behind the waiter's back.
+    assert!(!lines.iter().any(|line| line.starts_with("ReadWritePaths=") || line.starts_with("Restart=")
+        || line.contains("AF_INET")));
+}
+
+#[test]
+fn update_unit_spawnd_ready_is_bounded_and_restarts_after_repair() {
+    let lines = directives(SPAWND_UNIT);
+    let exit = RESTART_AFTER_REPAIR_EXIT.to_string();
+    for expected in ["Type=notify".to_owned(), "NotifyAccess=main".to_owned(), "TimeoutStartSec=300".to_owned(),
+        "Restart=on-failure".to_owned(), format!("RestartForceExitStatus={exit}"), format!("SuccessExitStatus={exit}"),
+        "StartLimitIntervalSec=300".to_owned(), "StartLimitBurst=5".to_owned(), "StandardError=journal".to_owned()] {
+        assert!(lines.contains(&expected.as_str()), "{expected}");
+    }
+    // Only the waiter unit has no start timeout; stderr is no longer discarded.
+    assert!(!lines.contains(&"TimeoutStartSec=infinity"));
+    assert!(!lines.contains(&"StandardError=null"));
+}
+
+#[test]
+fn update_unit_egress_and_gateway_depend_on_isolation_ready() {
+    use duduclaw_isolation::ids::ISOLATED_GATEWAY_UNIT_DEPENDENCIES;
+    // Egress carries exactly the lines the installer package adds to the gateway unit.
+    assert!(EGRESS_UNIT.contains(ISOLATED_GATEWAY_UNIT_DEPENDENCIES));
+    let lines = directives(EGRESS_UNIT);
+    for expected in ISOLATED_GATEWAY_UNIT_DEPENDENCIES.lines() { assert!(lines.contains(&expected), "{expected}"); }
+    // Not on spawnd directly: its READY=1 means only "update endpoint bound".
+    assert!(!lines.iter().any(|line| line.contains("duduclaw-spawnd.service")));
+}
+
+#[test]
+fn update_unit_updater_depends_only_on_spawnd_start() {
+    let lines = directives(UPDATED_UNIT);
+    assert!(lines.contains(&"Wants=duduclaw-spawnd.service"));
+    assert!(lines.contains(&"After=duduclaw-spawnd.service"));
+    // Requires= would propagate the updater's own `systemctl restart duduclaw-spawnd.service`.
+    assert!(!lines.iter().any(|line| line.starts_with("Requires=")));
+    for unit in ["duduclaw-gateway.service", "duduclaw-egress.service", "duduclaw-isolation-ready.service"] {
+        assert!(!lines.iter().any(|line| line.contains(unit)), "{unit}");
     }
 }
 
@@ -523,6 +857,7 @@ fn update_drain_and_apply_refused_when_admission_is_unhealthy() {
     let admission = Observer::new(&barrier, 0);
     admission.healthy.store(false, Ordering::Release);
     let mut control = UpdateControl::new(store.clone(), barrier.clone(), FakeEffects::default()).unwrap();
+    control.effects.calls.clear();
     // Zero runs from an unhealthy iteration is not a drain; the barrier stays closed and recorded.
     refused_outcome(&mut control, ControlCommand::Drain { generation: digest(7) });
     assert_eq!(barrier.closure(), Some(DrainClosure::Generation(digest(7))));
@@ -552,17 +887,27 @@ fn update_startup_status_and_audit_records() {
     let barrier = DrainBarrier::default();
     let mut control = UpdateControl::new(store.clone(), barrier, FakeEffects::default()).unwrap();
     let hex7 = "07".repeat(32);
-    assert_eq!(serde_json::to_value(control.status()).unwrap(), serde_json::json!({
-        "schema": 1, "admission_closed": true, "barrier": "drained", "barrier_generation": hex7,
+    let mut status = serde_json::to_value(control.status()).unwrap();
+    // The owner identifies this process in this boot (staleness for the waiter).
+    let owner: Owner = serde_json::from_value(status.as_object_mut().unwrap().remove("owner").unwrap()).unwrap();
+    assert_eq!(owner, Owner::current().unwrap());
+    assert_eq!(status, serde_json::json!({
+        "schema": 2, "set": "recovering", "closed_reason": null,
+        "admission_closed": true, "barrier": "drained", "barrier_generation": hex7,
         "journal": "published", "journal_generation": hex7, "journal_previous": "06".repeat(32),
         "publication_consistent": true, "startup_barrier": "drained", "startup_barrier_generation": hex7,
-        "startup_recovery": "already_published" }));
+        "startup_recovery": "reverified" }));
+    // Verified, not yet opened: `recovering`; after `opened`: `consistent`.
+    assert_eq!(control.report(), "recovering");
+    assert!(control.opened());
+    assert!(!control.opened());
+    assert_eq!(control.report(), "consistent");
     let records = control.startup().audit_records(42);
     assert_eq!(records.len(), 2);
     assert_eq!((records[0].event, records[0].at_unix_ms, records[0].detail.clone()),
         (crate::audit::Event::UpdateBarrierRestored, 42, Some(Detail::UpdateBarrier { generation: Some(digest(7)) })));
     assert_eq!((records[1].event, records[1].detail.clone()), (crate::audit::Event::PublicationRecovery,
-        Some(Detail::PublicationRecovery { action: PublicationRecovery::AlreadyPublished, generation: Some(digest(7)),
+        Some(Detail::PublicationRecovery { action: PublicationRecovery::Reverified, generation: Some(digest(7)),
             previous: Some(digest(6)) })));
     for record in &records { assert!(serde_json::to_vec(record).unwrap().len() < 1024); }
     // An unreadable record is audited without a generation; no journal, no journal record.
@@ -585,6 +930,7 @@ fn update_startup_status_and_audit_records() {
 fn update_schema_zero_generation_and_effect_errors_are_refused() {
     let barrier = DrainBarrier::default();
     let mut control = UpdateControl::new(MemoryStore::default(), barrier.clone(), FakeEffects::default()).unwrap();
+    control.effects.calls.clear();
     let mut wrong = request(ControlCommand::Prepare { preparation: preparation(digest(1)) });
     wrong.schema_version = 2;
     let response = control.respond(&wrong);
@@ -954,6 +1300,43 @@ impl RootTree {
     fn corrupt(&self, generation: Sha256Digest) {
         std::fs::write(self.install.join("generations").join(hex(&generation)).join("duduclaw-run"), b"#!/bin/false\ntampered\n").unwrap();
     }
+    /// Undo [`Self::corrupt`] (an operator restaging the artifact).
+    fn restore(&self, generation: Sha256Digest, seed: u8) {
+        std::fs::write(self.install.join("generations").join(hex(&generation)).join("duduclaw-run"),
+            Self::content(&InstallTarget::Trampoline, seed)).unwrap();
+    }
+    /// The installer's fresh install (no journal): a staged generation, its
+    /// eight components at the fixed destinations, and `current` selecting it.
+    fn install(&self, seed: u8) -> (Sha256Digest, ReleaseManifest) {
+        let (generation, manifest) = self.stage(seed);
+        for (target, directory) in publication() {
+            let path = self.publish.join(directory).join(artifact_name(&target).unwrap());
+            std::fs::write(&path, Self::content(&target, seed)).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        self.select(generation);
+        (generation, manifest)
+    }
+    /// Alter one fixed destination in place (same owner, mode and link count).
+    fn alter_destination(&self) {
+        std::fs::write(self.publish.join("opt/duduclaw/bin/duduclaw"), b"#!/bin/false\naltered\n").unwrap();
+    }
+    /// A start whose effects see `revoked` as revoked by the trust ledger.
+    fn control_revoking(&self, barrier: &DrainBarrier, revoked: &[Sha256Digest]) -> UpdateControl<DiskDrainStore, InstalledEffects> {
+        let mut effects = self.effects();
+        effects.revoked = revoked.to_vec();
+        self.control_with(barrier, effects)
+    }
+}
+
+/// The repairing `Apply` over a socket pair: replied first, then the restart path.
+fn repair_over_socket(control: &mut UpdateControl<DiskDrainStore, InstalledEffects>, preparation: Preparation) {
+    let (client, server) = pair();
+    let apply = request(ControlCommand::Apply { preparation });
+    transport::send(&client, &apply).unwrap();
+    assert_eq!(serve_and_settle(server, me(), control), After::RestartAfterRepair);
+    let response: ControlResponse = transport::receive(&client).unwrap();
+    validate_response(&apply, &response).unwrap();
 }
 
 fn activate(tree: &RootTree, control: &mut UpdateControl<DiskDrainStore, InstalledEffects>, manifest: &ReleaseManifest,
@@ -993,14 +1376,17 @@ fn activate(tree: &RootTree, control: &mut UpdateControl<DiskDrainStore, Install
 #[ignore = "requires root native Linux: publishes into an isolated root-owned /run tree"]
 fn iso_root_update_apply_end_to_end_two_generations() {
     let tree = RootTree::new();
+    // A fresh install (generation 1 published by the installer, `current`
+    // selecting it, no journal) verifies at start and opens.
+    let (first, manifest) = tree.install(1);
     let barrier = DrainBarrier::default();
-    let _admission = Observer::new(&barrier, 0);
+    let admission = Observer::new(&barrier, 0);
     let mut control = tree.control(&barrier);
+    assert_eq!(control.startup().recovery, PublicationRecovery::NoJournal);
+    assert!(control.opened());
     // The updater's first preflight precedes staging; the directory does not exist yet.
-    let (first, manifest) = tree.stage(1);
     let absent = Sha256Digest([0xab; 32]);
     accepted(&mut control, ControlCommand::Prepare { preparation: preparation(absent) });
-    activate(&tree, &mut control, &manifest, first, 1, None);
     let (second, next) = tree.stage(2);
     activate(&tree, &mut control, &next, second, 2, Some(first));
     // A stale or foreign generation can never be applied once admission reopened.
@@ -1020,6 +1406,58 @@ fn iso_root_update_apply_end_to_end_two_generations() {
     assert_eq!(tree.journal(), None);
     tree.assert_published(2);
     accepted(&mut control, ControlCommand::Resume { generation: third });
+
+    // Published-journal re-verification: Apply(4) completed (`published`),
+    // power lost before Resume, then the signer of 4 is revoked. The next start
+    // re-verifies against the ledger and rolls back to the still-trusted 2.
+    let (fourth, fourth_manifest) = tree.stage(4);
+    accepted(&mut control, ControlCommand::Drain { generation: fourth });
+    accepted(&mut control, ControlCommand::Apply { preparation: Preparation::for_manifest(&fourth_manifest, fourth) });
+    tree.assert_published(4);
+    drop(admission);
+    drop(control);
+    let barrier = DrainBarrier::default();
+    let control = tree.control_revoking(&barrier, &[fourth]);
+    assert_eq!(control.startup().recovery, PublicationRecovery::RolledBack);
+    tree.assert_published(2);
+    assert_eq!(tree.journal(), Some(PublishJournal::new(second, second, Some(fourth), PublishState::Published).unwrap()));
+    drop(control);
+    // A destination altered under the `published` journal is repaired at the next start.
+    tree.alter_destination();
+    let barrier = DrainBarrier::default();
+    let admission = Observer::new(&barrier, 0);
+    let mut control = tree.control_revoking(&barrier, &[fourth]);
+    assert_eq!(control.startup().recovery, PublicationRecovery::Reverified);
+    tree.assert_published(2);
+    accepted(&mut control, ControlCommand::Drain { generation: second });
+    accepted(&mut control, ControlCommand::Resume { generation: second });
+    assert_eq!(tree.journal(), None);
+    drop(admission);
+    drop(control);
+
+    // Restart after repair: no journal, a destination altered. The start finds
+    // the selected generation unverified and opens nothing but this endpoint;
+    // Drain needs no admission loop; the repairing Apply replies, then takes
+    // the restart path; the restarted process verifies and opens.
+    tree.alter_destination();
+    let barrier = DrainBarrier::default();
+    let mut control = tree.control(&barrier);
+    assert_eq!(control.startup().recovery, PublicationRecovery::SelectedUnverified);
+    assert_eq!(barrier.closure(), Some(DrainClosure::Recovery));
+    assert!(!control.opened());
+    accepted(&mut control, ControlCommand::Drain { generation: second });
+    repair_over_socket(&mut control, Preparation::for_manifest(&next, second));
+    tree.assert_published(2);
+    assert_eq!(control.report(), "recovering");
+    drop(control);
+    let barrier = DrainBarrier::default();
+    let _admission = Observer::new(&barrier, 0);
+    let mut control = tree.control(&barrier);
+    assert_eq!(control.startup().recovery, PublicationRecovery::Reverified);
+    assert!(control.opened());
+    accepted(&mut control, ControlCommand::Resume { generation: second });
+    assert_eq!(tree.journal(), None);
+    assert!(!barrier.is_closed());
 }
 
 #[test]
@@ -1066,6 +1504,8 @@ impl RootTree {
 #[ignore = "requires root native Linux: simulated power loss in an isolated root-owned /run tree"]
 fn iso_root_update_power_loss_each_phase() {
     let tree = RootTree::new();
+    // Every start verifies the installed set: begin from a fresh install of 1.
+    let (first, manifest) = tree.install(1);
     let record = tree.state.join(DRAIN_RECORD);
     let restart = || { let barrier = DrainBarrier::default(); let control = tree.control(&barrier); (barrier, control) };
     // 1. Loss before the record's rename: only a stale temporary exists. No
@@ -1102,14 +1542,7 @@ fn iso_root_update_power_loss_each_phase() {
     //    the journal write and the first rename), a torn `.next` left behind.
     //    The restart (before any socket or admission) finds `publishing`,
     //    re-verifies the generation and completes it; the journal says `published`.
-    let (first, manifest) = tree.stage(1);
     let (second, next) = tree.stage(2);
-    {
-        let barrier = DrainBarrier::default();
-        let _admission = Observer::new(&barrier, 0);
-        let mut control = tree.control(&barrier);
-        activate(&tree, &mut control, &manifest, first, 1, None);
-    }
     let publishing = PublishJournal::new(second, second, Some(first), PublishState::Publishing).unwrap();
     for renames in 0..=7 {
         tree.assert_published(1);
@@ -1118,12 +1551,21 @@ fn iso_root_update_power_loss_each_phase() {
         assert_eq!(tree.count_published(2), renames, "after {renames} renames");
         assert_eq!(tree.count_published(1), 8 - renames, "after {renames} renames");
         assert_eq!(tree.journal(), Some(publishing));
-        let barrier = DrainBarrier::default();
-        let mut control = tree.control(&barrier);
+        let (barrier, control) = restart();
         assert_eq!(control.startup().recovery, PublicationRecovery::RolledForward, "after {renames} renames");
         tree.assert_published(2);
         assert_eq!(tree.journal(), Some(PublishJournal { state: PublishState::Published, ..publishing }));
         assert_eq!(barrier.closure(), Some(DrainClosure::Generation(second)));
+        drop(control);
+        // Power lost again (after `published`, before Resume) and one component
+        // torn meanwhile: every start re-verifies the `published` journal and
+        // repairs the destination with the idempotent publication.
+        tree.alter_destination();
+        let (barrier, mut control) = restart();
+        assert_eq!(control.startup().recovery, PublicationRecovery::Reverified, "after {renames} renames");
+        assert!(control.consistent_at_start());
+        tree.assert_published(2);
+        assert_eq!(tree.journal(), Some(PublishJournal { state: PublishState::Published, ..publishing }));
         // Back to generation 1 for the next round: the updater's roll-back path
         // (Apply of the installed-before generation, then its Resume).
         let _admission = Observer::new(&barrier, 0);
@@ -1157,21 +1599,46 @@ fn iso_root_update_power_loss_each_phase() {
     tree.corrupt(third);
     tree.corrupt(first);
     let barrier = DrainBarrier::default();
-    let mut control = tree.control(&barrier);
+    let mut control = tree.control(&barrier).with_status_root(&tree.state);
     assert_eq!(control.startup().recovery, PublicationRecovery::Incomplete);
     assert_eq!(barrier.closure(), Some(DrainClosure::Recovery));
     assert_eq!(tree.count_published(3), 2);
     refused_outcome(&mut control, ControlCommand::Resume { generation: third });
-    write_status(&tree.state, &control.status()).unwrap();
+    assert_eq!(control.report(), "inconsistent: publication_incomplete");
     let path = tree.state.join(STATUS_FILE);
     let metadata = std::fs::symlink_metadata(&path).unwrap();
     assert_eq!((metadata.mode() & 0o7777, metadata.uid(), metadata.nlink()), (0o600, 0, 1));
-    let status: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    let mut status: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let owner: Owner = serde_json::from_value(status.as_object_mut().unwrap().remove("owner").unwrap()).unwrap();
+    assert_eq!(owner, Owner::current().unwrap());
     assert_eq!(status, serde_json::json!({
-        "schema": 1, "admission_closed": true, "barrier": "recovery_incomplete", "barrier_generation": null,
+        "schema": 2, "set": "inconsistent", "closed_reason": "publication_incomplete",
+        "admission_closed": true, "barrier": "recovery_incomplete", "barrier_generation": null,
         "journal": "publishing", "journal_generation": hex(&third), "journal_previous": hex(&first),
         "publication_consistent": false, "startup_barrier": "drained", "startup_barrier_generation": hex(&third),
         "startup_recovery": "incomplete" }));
+    let boot = boot_id().unwrap();
+    let alive = |pid: u32| (pid == std::process::id()).then(|| process_start_time(pid).unwrap());
+    assert!(!status_accepted(Some(&bytes), &boot, alive));
+    // 8. Restart after repair: an operator restages the generation; Drain needs
+    //    no admission loop; the repairing Apply replies, then takes the restart
+    //    path; the restarted process verifies everything, opens, and only then
+    //    writes the `consistent` status the waiter accepts.
+    tree.restore(third, 3);
+    accepted(&mut control, ControlCommand::Drain { generation: third });
+    repair_over_socket(&mut control, Preparation::for_manifest(&last, third));
+    tree.assert_published(3);
+    assert_eq!(control.report(), "recovering");
+    assert!(!status_accepted(Some(&std::fs::read(&path).unwrap()), &boot, alive));
+    drop(control);
+    let barrier = DrainBarrier::default();
+    let mut control = tree.control(&barrier).with_status_root(&tree.state);
+    assert_eq!(control.startup().recovery, PublicationRecovery::Reverified);
+    assert_eq!(control.report(), "recovering");
+    assert!(control.opened());
+    assert_eq!(control.report(), "consistent");
+    assert!(status_accepted(Some(&std::fs::read(&path).unwrap()), &boot, alive));
     // An unreadable journal is never ignored either.
     drop(control);
     std::fs::write(tree.state.join(JOURNAL_FILE), b"{\"schema\":2}").unwrap();

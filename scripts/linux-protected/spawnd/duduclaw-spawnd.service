@@ -2,23 +2,33 @@
 Description=DuDuClaw root employee launch agent
 Requires=duduclaw-spawnd.socket
 After=duduclaw-spawnd.socket dbus.service
+# Crash loops stay rate-limited, including the restart after a repair (below).
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
-# R6: READY=1 only after the update publication journal is settled (rolled
-# forward/back, or nothing to do) and update.sock is bound, so units ordered
-# After=+Requires= this one never run on a mixed set of root components. When
-# recovery cannot complete, READY=1 is withheld (admission stays closed and
-# update.sock keeps answering root) until a consistent set is restored; hence
-# no start timeout. See /run/duduclaw-spawnd/update-status.json.
+# R6: every start re-verifies the installed set (publication journal or the
+# `current` generation) before binding anything. READY=1 then means only that
+# the root update endpoint (update.sock) is bound: it is sent whether or not the
+# set is consistent, so duduclaw-updated can always repair the host. Consistency
+# is duduclaw-isolation-ready.service's job (gateway and egress depend on it).
+# Not consistent: nothing but update.sock opens. See `systemctl status` (STATUS=)
+# and /run/duduclaw-spawnd/update-status.json.
 Type=notify
 NotifyAccess=main
-TimeoutStartSec=infinity
+# Bounds the verification that precedes READY=1 (hashing two generations).
+TimeoutStartSec=300
 User=root
 Group=root
 ExecStart=/usr/lib/duduclaw/duduclaw-spawnd
 Sockets=duduclaw-spawnd.socket
 Restart=on-failure
 RestartSec=3
+# 82: an Apply repaired a set this process found not consistent; it exits so
+# the fresh start verifies everything before opening (update_control.rs
+# RESTART_AFTER_REPAIR_EXIT). Restarted, not counted as a failure.
+RestartForceExitStatus=82
+SuccessExitStatus=82
 KillMode=control-group
 UMask=0077
 LimitCORE=0
@@ -55,4 +65,7 @@ RestrictAddressFamilies=AF_UNIX AF_NETLINK
 RestrictNamespaces=mnt
 CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_KILL CAP_CHOWN CAP_FOWNER CAP_AUDIT_WRITE
 StandardOutput=null
-StandardError=null
+# Fixed-vocabulary diagnostics (update status lines, startup failures) only.
+StandardError=journal
+LogRateLimitIntervalSec=60
+LogRateLimitBurst=100

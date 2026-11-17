@@ -43,16 +43,26 @@ which needs directory write access, broader than the eight fixed files. Narrowin
 it needs a separate narrow publisher helper (known residual, plan R6).
 The drain barrier is kept in `/var/lib/duduclaw-spawnd/drain.json` across restarts.
 
-The unit is `Type=notify` (`NotifyAccess=main`, `TimeoutStartSec=infinity`).
-spawnd sends `READY=1` only after its publication journal
-(`/var/lib/duduclaw-spawnd/publish.json`) is settled and `update.sock` is bound;
-if neither roll-forward nor roll-back completes, it withholds `READY=1`, keeps
-admission closed and keeps answering root on `update.sock` (status in
-`/run/duduclaw-spawnd/update-status.json`). `duduclaw-egress.service` has
-`Requires=` + `After=duduclaw-spawnd.service`. The gateway unit
-(`duduclaw_core::root_key::recovery::protected_unit_text`) must add the same two
-lines in the installer package; until then the gateway can start on a set that
-spawnd is still recovering.
+The unit is `Type=notify` (`NotifyAccess=main`, `TimeoutStartSec=300`). Every
+start re-verifies the installed set (publication journal, or the generation
+`current` names) before binding anything; `READY=1` then only means that
+`update.sock` is bound, and it is sent whether or not the set is consistent, so
+`duduclaw-updated.service` (`Wants=` + `After=duduclaw-spawnd.service` only) can
+always repair the host. On an inconsistent set spawnd opens nothing else; a
+repairing `Apply` makes it exit with status 82, which the unit restarts
+(`RestartForceExitStatus=82`, `SuccessExitStatus=82`; crash loops stay limited
+by `StartLimitIntervalSec=300`/`StartLimitBurst=5`). Its stderr goes to the
+journal (fixed-vocabulary lines), and `systemctl status` shows the `STATUS=` line.
+
+`duduclaw-isolation-ready.service` (oneshot, `RemainAfterExit=yes`,
+`Requires=`/`After=duduclaw-spawnd.service`) runs `duduclaw-spawnd
+wait-consistent` and completes only when the live spawnd reports the verified,
+opened, consistent set in `/run/duduclaw-spawnd/update-status.json`.
+`duduclaw-egress.service` has `Requires=` + `After=` on it. The isolated-install
+gateway unit (written by the installer package, R3) must carry the same two
+lines: `duduclaw_isolation::ids::ISOLATED_GATEWAY_UNIT_DEPENDENCIES`. The
+single-binary gateway unit (`duduclaw_core::root_key_recovery_unit`) does not
+(no spawnd on those hosts).
 
 The native Linux service lifecycle and D-Bus fd handoff require root VM testing
 on systemd 249, 252 and 255. No installation or activation has been performed by

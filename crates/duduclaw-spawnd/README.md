@@ -138,42 +138,97 @@ directory fsync, read back) before the first destination is touched; rewritten
 it, so until then the previous generation stays known, and the updater's
 generation pruning keeps both directories named by the journal.
 
-At start, before any socket is bound (update, control, allocation) and before
-admission (`update_control::recover`, holding the lifetime flock
-`/var/lib/duduclaw-spawnd/update.lock`):
+At EVERY start, before any socket is bound (update, control, allocation) and
+before admission (`update_control::recover`, holding the lifetime flock
+`/var/lib/duduclaw-spawnd/update.lock`), the installed set is verified against
+the trust ledger including its revocation fence (`verify_recorded` =
+`TrustLedger::verify_installed`):
 
-- `published` or no journal: nothing to do.
-- `publishing`: the generation is fully re-verified (manifest digest equal to
-  the journal's, signature against the trust ledger, every artifact by
-  descriptor) and its publication completed (files already holding the right
-  bytes are kept). If that fails, the journal's `previous` generation is
-  published with the same procedure (the new journal names the interrupted
-  generation as its fallback).
-- Neither possible, or the journal is unreadable / of an unknown schema:
-  admission stays closed (`recovery_incomplete`; no `Resume` lifts it, a new
-  `Drain` re-keys it and `Resume` still requires a consistent journal), the
-  update socket still answers root, and `READY=1` is not sent. It is sent later
-  if a served request (an operator's or the updater's `Drain` + `Apply`) leaves a
-  consistent set. An unreadable journal must be inspected and removed by an
-  operator; it is never ignored.
+- A journal, `publishing` or `published`: its generation is fully re-verified
+  (manifest digest equal to the journal's, signature, every artifact by
+  descriptor) and published again with the idempotent procedure (files already
+  holding the right bytes are kept, an altered one is replaced; journaled
+  `publishing` → `published` like any `Apply`). If that fails (directory
+  missing or corrupt, signer revoked), the journal's `previous` generation is
+  verified and published with the same procedure (the new journal names the
+  failed generation as its fallback).
+- No journal: the generation the `current` selector names is verified the same
+  way, and every one of the eight destinations must already hold its bytes
+  (read-only: without a journal there is no recorded intent to complete). An
+  isolated install always has a selector from its first boot on:
+  `duduclaw-bootstrap install` (`trust_init::publish_at`) publishes the initial
+  `current` and records its manifest in the trust ledger, and the installer
+  places the eight components, so a fresh install before its first update is
+  verified exactly like any other host. No selector is not consistent.
+- Otherwise (neither generation verifies, the journal is unreadable or of an
+  unknown schema, the selector is absent or unreadable, the selected generation
+  does not verify or a destination differs) the set is NOT consistent:
+  admission is closed (`recovery_incomplete`; no `Resume` lifts it).
+  An unreadable journal must be inspected and removed by an operator.
 
-The barrier restored from a record and any journal found are audited
+Then (`update_control::start`): `update.sock` is bound and `READY=1` sent,
+ALWAYS. `READY=1` means only "the root update endpoint is available".
+
+- Consistent: the allocation socket (`LinuxHost::open`), the control listener
+  and admission are opened; then the status says `consistent` for this process.
+- Not consistent: nothing else is initialised (only audit, the status file and
+  `update.sock`). `Drain` closes and records the barrier and answers zero
+  admitted runs at once (no admission loop exists, so no run can exist in this
+  process); `Resume` is refused. A successful `Apply` repairs the set: spawnd
+  sends the reply, writes the status (`recovering`) and exits with status 82
+  (`RESTART_AFTER_REPAIR_EXIT`); the unit restarts exactly that status
+  (`RestartForceExitStatus=82`, `SuccessExitStatus=82`, start rate limit
+  `StartLimitIntervalSec=300`/`StartLimitBurst=5`), and the new process runs
+  the full verification before opening anything. There is no in-process switch.
+
+The barrier restored from a record and the start-up verification are audited
 (`update_barrier_restored`, `publication_recovery` with the action and the
-journal's generations; at most two records per start).
+journal's generations, or the selected generation; nothing for a verified
+start without a journal).
 
 Operator status: `/run/duduclaw-spawnd/update-status.json` (root 0600, atomic
-replace, written at start and after every request on `update.sock`; the wire
-contract has no status request). Fields: `admission_closed`, `barrier`
-(`open`, `drained`, `unreadable_record`, `recovery_incomplete`) and
-`barrier_generation`, `journal` (`absent`, `publishing`, `published`,
-`unreadable`), `journal_generation`, `journal_previous`,
-`publication_consistent`, `startup_barrier` / `startup_barrier_generation` and
-`startup_recovery` (`no_journal`, `already_published`, `rolled_forward`,
-`rolled_back`, `incomplete`, `journal_unreadable`). Digests are lowercase hex.
+replace, written at start, once everything is open and after every request on
+`update.sock`; the wire contract has no status request). Schema 2. Fields:
+`set` (`consistent`, `recovering`, `inconsistent`), `closed_reason` (with
+`inconsistent`: `publication_incomplete`, `journal_unreadable`,
+`selector_absent`, `selector_unreadable`, `selected_unverified`), `owner`
+(`boot_id`, `pid`, `start_time` = field 22 of `/proc/<pid>/stat`),
+`admission_closed`, `barrier` (`open`, `drained`, `unreadable_record`,
+`recovery_incomplete`) and `barrier_generation`, `journal` (`absent`,
+`publishing`, `published`, `unreadable`), `journal_generation`,
+`journal_previous`, `publication_consistent`, `startup_barrier` /
+`startup_barrier_generation` and `startup_recovery` (`no_journal`,
+`reverified`, `rolled_forward`, `rolled_back`, `incomplete`,
+`journal_unreadable`, `selector_absent`, `selector_unreadable`,
+`selected_unverified`). Digests are lowercase hex. The same state is sent as one
+`STATUS=` line (`consistent`, `recovering`, `inconsistent: <closed_reason>`)
+whenever it changes, and logged to stderr (the unit routes stderr to the
+journal); a failed status-file write appends `; status_file_write_failed`, a
+failed audit emission at start `; audit_write_failed`.
 
-The unit is `Type=notify` so that units ordered after spawnd (`After=` +
-`Requires=duduclaw-spawnd.service`: egress here; the gateway unit generated by
-the installer must add the same) never start on a mixed set.
+### Unit ordering (`duduclaw-isolation-ready.service`)
+
+- `duduclaw-spawnd.service`: `Type=notify`, `TimeoutStartSec=300` (bounds the
+  verification before `READY=1`).
+- `duduclaw-isolation-ready.service` (next to the spawnd unit): oneshot,
+  `RemainAfterExit=yes`, `Requires=`/`After=duduclaw-spawnd.service`, runs
+  `duduclaw-spawnd wait-consistent`, `TimeoutStartSec=infinity` (the only
+  unit without a start timeout), no network, read-only filesystem, no
+  capabilities. The waiter exits 0 only when the status file says
+  `consistent`, its `owner.boot_id` is the current boot, and `owner.pid` is a
+  live process of `duduclaw-spawnd.service` (cgroup) whose start time equals
+  `owner.start_time`; a missing, unreadable, stale (earlier process or boot)
+  or inconsistent status keeps it waiting. It binds and connects to nothing.
+- `duduclaw-egress.service`: `Requires=`/`After=duduclaw-isolation-ready.service`.
+- Isolated-install gateway unit (written by the installer package, R3): must
+  contain `duduclaw_isolation::ids::ISOLATED_GATEWAY_UNIT_DEPENDENCIES`
+  (`Requires=duduclaw-isolation-ready.service` and
+  `After=duduclaw-isolation-ready.service`). The single-binary gateway unit is
+  unchanged (no spawnd on those hosts).
+- `duduclaw-updated.service`: `Wants=`/`After=duduclaw-spawnd.service` only, so
+  it starts on an inconsistent set and can repair it. Not `Requires=`: the
+  updater itself runs `systemctl restart duduclaw-spawnd.service` during an
+  activation, which `Requires=` would propagate to the updater.
 
 The unit grants spawnd write access to `/usr/lib/duduclaw`, `/usr/libexec/duduclaw`
 and `/opt/duduclaw/bin` for this publication: an atomic replacement creates
@@ -396,9 +451,8 @@ B2's probe returns the detected kernel ABI and the selected ruleset ABI without
 printing them to employee stderr. The B1 readiness interface carries both fields;
 when a trusted installation producer returns verified evidence, the daemon logs
 the pair once per daemon process to stderr and publishes it as `EvidenceReport.landlock`
-(`detected_abi`, `selected_abi`). The supplied service currently discards stderr;
-readiness is the retained operator evidence, and a bounded daemon-log destination
-remains an installer task. The selected ABI cannot exceed 7. The default
+(`detected_abi`, `selected_abi`). The supplied service routes stderr to the
+journal (rate-limited); readiness remains the retained operator evidence. The selected ABI cannot exceed 7. The default
 native adapter still uses `MissingInstallation`, so the production producer is
 absent: neither kernel probing nor an arbitrary configuration flag makes this
 readiness evidence available. The bootstrap receipt's selected ABI alone is not

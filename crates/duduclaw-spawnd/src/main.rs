@@ -6,7 +6,16 @@ fn main() {
     }
     #[cfg(target_os = "linux")]
     {
-        use duduclaw_spawnd::{server, admission::Limits, host::{LinuxHost, Components, EvidenceReport}, audit::disk::AuditWorker};
+        use duduclaw_spawnd::{server, admission::Limits, host::{LinuxHost, Components, EvidenceReport}, audit::disk::AuditWorker,
+            update_control};
+        // duduclaw-isolation-ready.service: exits 0 only once the live spawnd
+        // reports the verified, opened, consistent set. Reads the root-only
+        // status file and /proc; binds and connects to nothing.
+        if arguments.len() == 1 && arguments[0] == "wait-consistent" {
+            if update_control::wait_consistent().is_ok() { return; }
+            eprintln!("duduclaw-spawnd: wait-consistent failed");
+            std::process::exit(1);
+        }
         let result = (|| -> std::io::Result<()> {
             if arguments.len() == 1 && arguments[0] == "--check" {
                 let (_, gid) = server::gateway_identity()?;
@@ -19,25 +28,34 @@ fn main() {
             let gateway = server::gateway_identity()?;
             duduclaw_spawnd::transport::prepare_runtime_directory()?;
             let audit = AuditWorker::start()?;
-            // R6: the drain barrier and the publication journal are settled
-            // (roll forward / roll back / not ready) before any socket is bound
-            // (LinuxHost::open binds the allocation socket) and before admission.
-            let update = duduclaw_spawnd::update_control::recover(&audit)?;
-            let host = LinuxHost::open(gateway, Components::installed(), audit.clone())?;
-            let listener = server::listener(gateway.1)?;
-            let ready = update.ready();
-            let drain = update.serve()?;
-            // Type=notify: units ordered after spawnd start only on a consistent
-            // set. Not ready: no READY=1 (the unit stays activating, admission
-            // closed, update.sock answering root) until an operator acts.
-            if ready {
-                duduclaw_spawnd::update_control::notify("READY=1")?;
-            } else {
-                let _ = duduclaw_spawnd::update_control::notify("STATUS=update publication incomplete; see /run/duduclaw-spawnd/update-status.json");
-            }
+            // R6: the drain barrier is restored and the installed set verified
+            // (journal re-verified and republished / rolled back, or the
+            // selected generation verified) before any socket is bound.
+            let update = update_control::recover(&audit)?;
+            let consistent = update.consistent();
+            let mut serving = None;
+            // READY=1 always follows the update endpoint (the updater depends on
+            // it); the allocation socket (LinuxHost::open), the control listener
+            // and admission open only on a set verified consistent at this start.
+            let opened = update_control::start(consistent,
+                || { serving = Some(update.serve()?); Ok(()) },
+                |state| { let _ = update_control::notify(state); },
+                || {
+                    let host = LinuxHost::open(gateway, Components::installed(), audit.clone())?;
+                    let listener = server::listener(gateway.1)?;
+                    Ok((host, listener))
+                })?;
+            let serving = serving.ok_or_else(|| std::io::Error::other("update endpoint not serving"))?;
+            let Some((host, listener)) = opened else {
+                // Not consistent: only the root update endpoint runs, until a
+                // repairing Apply exits the process for a verified restart.
+                return serving.wait();
+            };
+            // duduclaw-isolation-ready.service completes on this status.
+            serving.opened()?;
             let snapshots = host.snapshots;
             let limits = Limits { host_ptys: host.host_ptys, ..Limits::default() };
-            server::serve_with_drain(listener, gateway, snapshots, host, limits, audit, Some(drain))
+            server::serve_with_drain(listener, gateway, snapshots, host, limits, audit, Some(serving.barrier()))
         })();
         if result.is_ok() { return; }
     }

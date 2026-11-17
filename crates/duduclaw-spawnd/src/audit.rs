@@ -44,27 +44,51 @@ pub enum Event { Refused, Reserved, Queued, Started, Ended, Revoked, Intruder, O
     /// R6: spawnd found a publication journal at start (detail: `publication_recovery`).
     PublicationRecovery,
 }
-/// R6: what spawnd did with its publication journal (`publish.json`) at start.
+/// R6: how spawnd verified the installed set at start (publication journal
+/// `publish.json`, or the `current` selector when there is no journal). Every
+/// start re-verifies against the trust ledger, including its revocations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PublicationRecovery {
-    /// No journal: the last publication was completed and resumed (or none ran).
+    /// No journal: the generation `current` names verified (signature against
+    /// the trust ledger, every artifact) and all eight destinations hold its bytes.
     NoJournal,
-    /// The journal said `published`: every component already in place.
-    AlreadyPublished,
+    /// The journal said `published`: its generation was re-verified and every
+    /// destination re-published idempotently (an altered file is repaired).
+    Reverified,
     /// `publishing`: the generation was re-verified and its publication completed.
     RolledForward,
-    /// `publishing`, generation missing or unverifiable: the previous generation
-    /// was re-verified and published instead.
+    /// The journal's generation is missing or no longer verifies (e.g. its
+    /// signer was revoked): the previous generation was re-verified and published.
     RolledBack,
-    /// Neither could be completed: admission stays closed (not ready).
+    /// Neither could be completed: not consistent (nothing but the update endpoint opens).
     Incomplete,
-    /// The journal is unreadable, has an unknown schema or field: not ready.
+    /// The journal is unreadable, has an unknown schema or field: not consistent.
     JournalUnreadable,
+    /// No journal and no `current` selector: not consistent.
+    SelectorAbsent,
+    /// No journal and the selector cannot be read: not consistent.
+    SelectorUnreadable,
+    /// No journal and the selected generation does not verify, or a destination
+    /// does not hold its bytes: not consistent (an `Apply` repairs it).
+    SelectedUnverified,
 }
 impl PublicationRecovery {
-    /// After this outcome every fixed component holds one generation's bytes.
-    pub fn consistent(self) -> bool { !matches!(self, Self::Incomplete | Self::JournalUnreadable) }
+    /// After this outcome every fixed component holds one verified generation's bytes.
+    pub fn consistent(self) -> bool {
+        matches!(self, Self::NoJournal | Self::Reverified | Self::RolledForward | Self::RolledBack)
+    }
+    /// The fixed closed-reason code of a non-consistent outcome (status file, `STATUS=`).
+    pub fn closed_reason(self) -> Option<&'static str> {
+        match self {
+            Self::NoJournal | Self::Reverified | Self::RolledForward | Self::RolledBack => None,
+            Self::Incomplete => Some("publication_incomplete"),
+            Self::JournalUnreadable => Some("journal_unreadable"),
+            Self::SelectorAbsent => Some("selector_absent"),
+            Self::SelectorUnreadable => Some("selector_unreadable"),
+            Self::SelectedUnverified => Some("selected_unverified"),
+        }
+    }
 }
 /// HX6 round 3: what one probe call decided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]

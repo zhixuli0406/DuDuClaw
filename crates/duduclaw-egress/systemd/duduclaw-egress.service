@@ -2,10 +2,11 @@
 Description=DuDuClaw public IP egress
 Requires=duduclaw-egress.socket
 After=duduclaw-egress.socket
-# R6: start only after spawnd settled its update publication journal (spawnd is
-# Type=notify): /opt/duduclaw/bin/duduclaw-egress is one of its eight components.
-Requires=duduclaw-spawnd.service
-After=duduclaw-spawnd.service
+# R6: start only once spawnd reports the installed set verified consistent
+# (/opt/duduclaw/bin/duduclaw-egress is one of its eight components). Not on
+# spawnd itself: its READY=1 only means its update endpoint is bound.
+Requires=duduclaw-isolation-ready.service
+After=duduclaw-isolation-ready.service
 
 [Service]
 Slice=duduclaw-tcb.slice

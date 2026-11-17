@@ -1,0 +1,52 @@
+[Unit]
+Description=DuDuClaw isolated component set verified consistent
+# R6: spawnd's READY=1 only means its root update endpoint is bound. This unit
+# completes only once the live spawnd reports that the installed set verified
+# consistent at its start and that it opened admission (status file owned by
+# that spawnd process in this boot). duduclaw-gateway.service (isolated
+# install) and duduclaw-egress.service Require=/After= it: on an inconsistent
+# set they do not start, and `systemctl status` shows this unit waiting.
+Requires=duduclaw-spawnd.service
+After=duduclaw-spawnd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Polls /run/duduclaw-spawnd/update-status.json (root 0600) and /proc only;
+# connects to nothing. Never exits 0 on a missing, unreadable, stale or
+# inconsistent status.
+ExecStart=/usr/lib/duduclaw/duduclaw-spawnd wait-consistent
+# The only unit without a start timeout: it waits until the set is repaired.
+TimeoutStartSec=infinity
+User=root
+Group=root
+Slice=duduclaw-tcb.slice
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+IPAddressDeny=any
+RestrictAddressFamilies=AF_UNIX
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+UMask=0077
+LimitCORE=0
+LimitNOFILE=64
+TasksMax=4
+MemoryMax=32M
+StandardOutput=null
+StandardError=journal

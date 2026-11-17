@@ -850,7 +850,7 @@ fn units() -> Result<()> {
             return Err(refused("隔離服務單元與安裝版本不符。"));
         }
     }
-    for name in [UNIT, "duduclaw-spawnd.service", "duduclaw-spawnd.socket", "duduclaw-egress.service",
+    for name in [UNIT, "duduclaw-spawnd.service", "duduclaw-spawnd.socket", "duduclaw-isolation-ready.service", "duduclaw-egress.service",
         "duduclaw-egress.socket", "duduclaw-updated.service", "duduclaw-parse.socket"] {
         unit_loaded_active(name)?;
     }
