@@ -104,21 +104,6 @@ mod filesystem {
         }
     }
     #[test]
-    fn immutable_uri_preserves_special_path_bytes_and_read_only_mode() {
-        use std::os::unix::ffi::OsStrExt;
-        let home = home();
-        let path = home.path().join(std::ffi::OsStr::from_bytes(b"space ?#%&\xE7\xA7\x98.db"));
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch("CREATE TABLE canary(value TEXT);").unwrap();
-        conn.close().unwrap();
-        let mut conn = Connection::open_with_flags(immutable_uri(&path),
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX).unwrap();
-        assert!(conn.execute_batch("CREATE TABLE denied(value TEXT);").is_err());
-        sqlite::harden(&mut conn).unwrap();
-        assert_eq!(sqlite::schema(&conn).unwrap()[0].1, "canary");
-        assert_eq!(fs::read_dir(home.path()).unwrap().count(), 1);
-    }
-    #[test]
     fn capture_refuses_symlink_store_home_and_sidecar() {
         use std::os::unix::fs::symlink;
         let home = home();
@@ -138,8 +123,8 @@ mod filesystem {
         fs::create_dir(&path).unwrap();
         assert_eq!(task(&capture(home.path(), "v1.82.0").unwrap()).status, "refused_file_or_limit");
         fs::remove_dir(&path).unwrap();
-        let file = fs::File::create(&path).unwrap(); file.set_len(crate::MAX_SOURCE_BYTES + 1).unwrap(); drop(file);
-        assert_eq!(task(&capture(home.path(), "v1.82.0").unwrap()).status, "refused_file_or_limit");
+        fs::write(&path, [0; 33]).unwrap();
+        assert_eq!(task(&capture_with_bound(home.path(), "v1.82.0", 32, |_| {}).unwrap()).status, "refused_too_large");
         fs::remove_file(&path).unwrap(); seed(home.path(), catalog::TASKS_V182);
         // The generic SQLite refusal must be caused by corruption, not by a
         // parser limit that would also reject the valid catalog on this OS.
@@ -223,79 +208,54 @@ mod filesystem {
         assert!(source_flags().contains(rustix::fs::OFlags::NOATIME));
     }
     #[test]
-    fn capture_private_copy_ignores_tmpdir_and_cleans_up() {
-        // Run this test in a child so TMPDIR does not race other Rust tests.
-        const CHILD: &str = "DUDUCLAW_CAPTURE_COPY_TEST_HOME";
+    fn capture_creates_no_files_in_home_tmpdir_or_cwd() {
+        // Isolate TMPDIR and cwd in a child; never mutate the test runner's environment.
+        const CHILD: &str = "DUDUCLAW_CAPTURE_MEMORY_TEST_HOME";
         if let Some(path) = std::env::var_os(CHILD) {
-            use std::os::unix::fs::MetadataExt;
             let path = std::path::PathBuf::from(path);
-            assert_eq!(std::env::var_os("TMPDIR").unwrap().as_os_str(), path.as_os_str());
             let listing = |dir: &Path| {
                 let mut names = fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name()).collect::<Vec<_>>();
                 names.sort(); names
             };
+            let temp = std::env::temp_dir();
+            let cwd = std::env::current_dir().unwrap();
             let before = listing(&path);
-            #[cfg(target_os = "linux")]
-            let temp_listings = [std::path::PathBuf::from("/tmp"), std::path::PathBuf::from("/var/tmp")]
-                .into_iter().filter(|p| p.is_dir()).map(|dir| {
-                    // Ignore unrelated concurrent system activity; capture's
-                    // fixed-prefix artifacts must never appear in trusted roots.
-                    let names = listing(&dir).into_iter().filter(|n| n.to_string_lossy().starts_with("duduclaw-capture-")).collect::<Vec<_>>();
-                    (dir, names)
-                }).collect::<Vec<_>>();
-            let file = fs::File::open(path.join("tasks.db")).unwrap();
-            let copy = PrivateCopy::new(&file, &path, file.metadata().unwrap().len()).unwrap();
-            assert_eq!(listing(&path), before);
-            #[cfg(target_os = "linux")]
-            {
-                use rustix::fs::{SealFlags, fcntl_get_seals};
-                assert_eq!(copy.file.metadata().unwrap().nlink(), 0);
-                let required = SealFlags::SHRINK | SealFlags::GROW | SealFlags::WRITE | SealFlags::SEAL;
-                assert!(fcntl_get_seals(&copy.file).unwrap().contains(required));
-                assert!(copy.file.set_len(0).is_err());
-                assert!(std::os::unix::fs::FileExt::write_at(&copy.file, b"x", 0).is_err());
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                let home = fs::canonicalize(&path).unwrap();
-                let dir = copy.directory.path();
-                assert!(!dir.starts_with(&home) && !home.starts_with(dir));
-                assert_eq!(fs::metadata(dir).unwrap().mode() & 0o777, 0o700);
-                assert_eq!(fs::metadata(copy.path()).unwrap().mode() & 0o777, 0o600);
-                assert_eq!(dir.parent().unwrap(), fs::canonicalize("/tmp").unwrap());
-            }
-            let conn = copy.open().unwrap();
-            assert!(inspect(&conn, Store::Tasks).unwrap().exact_catalog);
-            assert!(conn.execute_batch("CREATE TABLE denied(x);").is_err());
-            copy.close(conn).unwrap();
-            #[cfg(target_os = "linux")]
-            {
-                assert_eq!(copy.copied_bytes, file.metadata().unwrap().len());
-                assert!(memfd::verify(&copy.file, copy.copied_bytes + 1).is_err());
-                let unsealed = fs::File::open(path.join("tasks.db")).unwrap();
-                assert!(memfd::verify(&unsealed, copy.copied_bytes).is_err());
-                copy.verify().unwrap();
-            }
-            let copy_path = copy.path();
-            drop(copy);
-            assert!(!copy_path.exists());
-            assert_eq!(listing(&path), before);
-            let report = capture_with_hook(&path, "v1.82.0", |_| {
-                assert_eq!(listing(&path), before, "no copy may appear in TMPDIR/home even during capture");
-                #[cfg(target_os = "linux")]
-                for (dir, names) in &temp_listings {
-                    assert_eq!(&listing(dir).into_iter().filter(|n| n.to_string_lossy().starts_with("duduclaw-capture-")).collect::<Vec<_>>(), names);
-                }
-            }).unwrap();
-            assert_eq!(report.private_copy, COPY_MECHANISM);
-            assert_eq!(listing(&path), before);
+            let check = || {
+                assert_eq!(listing(&path), before);
+                assert!(listing(&temp).is_empty());
+                assert!(listing(&cwd).is_empty());
+            };
+            check();
+            let report = capture_with_hook(&path, "v1.82.0", |_| check()).unwrap();
+            assert_eq!(task(&report).status, "code_candidate");
+            assert_eq!(report.private_copy, "in_memory");
+            check();
+            fs::write(path.join("tasks.db"), b"corrupt").unwrap();
+            assert_eq!(task(&capture(&path, "v1.82.0").unwrap()).status, "refused_sqlite_or_changed");
+            check();
             return;
         }
-        let home = home(); seed(home.path(), catalog::TASKS_V182);
+        let parent = home();
+        let source = parent.path().join("home");
+        let temp = parent.path().join("tmp");
+        let cwd = parent.path().join("cwd");
+        for dir in [&source, &temp, &cwd] { fs::create_dir(dir).unwrap(); }
+        seed(&source, catalog::TASKS_V182);
         let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", &format!("{}::capture_private_copy_ignores_tmpdir_and_cleans_up", module_path!().split_once("::").unwrap().1), "--nocapture"])
-            .env(CHILD, home.path()).env("TMPDIR", home.path()).status().unwrap();
+            .args(["--exact", &format!("{}::capture_creates_no_files_in_home_tmpdir_or_cwd", module_path!().split_once("::").unwrap().1), "--nocapture"])
+            .env(CHILD, &source).env("TMPDIR", &temp).current_dir(&cwd).status().unwrap();
         assert!(status.success());
+    }
+    #[test]
+    fn capture_multi_megabyte_real_pages() {
+        let home = home(); seed(home.path(), catalog::TASKS_V182);
+        let path = home.path().join("tasks.db");
+        let conn = Connection::open(&path).unwrap();
+        // Leave real free pages while restoring the exact reviewed schema.
+        conn.execute_batch("CREATE TABLE padding(x BLOB); INSERT INTO padding VALUES(zeroblob(9 * 1024 * 1024)); DROP TABLE padding; PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        conn.close().unwrap();
+        assert!(fs::metadata(&path).unwrap().len() >= 8 * 1024 * 1024);
+        assert_eq!(task(&capture(home.path(), "v1.82.0").unwrap()).status, "code_candidate");
     }
     #[test]
     fn capture_missing_stores_and_excluded_creating_version() {
@@ -341,4 +301,44 @@ fn capture_unknown_names_are_digest_only_and_deterministic() {
     let changed = serde_json::to_string(&inspect(&conn, Store::Tasks).unwrap()).unwrap();
     assert!(changed.contains("changed table tasks"));
     assert!(!changed.contains("private_definition_984"));
+}
+
+#[test]
+fn capture_image_exact_length_and_bound() {
+    struct MustNotRead;
+    impl std::io::Read for MustNotRead {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> { panic!("oversize input must not be read"); }
+    }
+    assert!(matches!(read_image(MustNotRead, 33, 32, Store::Tasks), Err(Error::Limit)));
+    let mut source = database(catalog::TASKS_V182);
+    let bytes = source.serialize("main").unwrap();
+    let image: &[u8] = &bytes;
+    assert!(read_image(image, image.len() as u64 + 1, crate::MAX_SOURCE_BYTES, Store::Tasks).is_err());
+    assert!(read_image(image, image.len() as u64 - 1, crate::MAX_SOURCE_BYTES, Store::Tasks).is_err());
+    let conn = read_image(image, image.len() as u64, crate::MAX_SOURCE_BYTES, Store::Tasks).unwrap();
+    assert_eq!(inspect(&conn, Store::Tasks).unwrap().status, "code_candidate");
+    assert!(conn.execute_batch("CREATE TABLE denied(x);").is_err());
+    assert!(conn.execute_batch("ATTACH x AS other;").is_err());
+    assert!(conn.query_row("SELECT count(*) FROM tasks", [], |r| r.get::<_, i64>(0)).is_err());
+}
+
+#[test]
+fn capture_deserialized_schema_limits() {
+    for kind in ["rows", "sql", "depth"] {
+        let mut source = Connection::open_in_memory().unwrap();
+        match kind {
+            "rows" => for index in 0..257 {
+                source.execute_batch(&format!("CREATE TABLE t{index}(x TEXT);")).unwrap();
+            },
+            "sql" => source.execute_batch(&format!("CREATE TABLE hostile(x TEXT DEFAULT '{}');", "x".repeat(66000))).unwrap(),
+            "depth" => source.execute_batch(&format!("CREATE TABLE hostile(x CHECK(x{} > 0));", " + 1".repeat(140))).unwrap(),
+            _ => unreachable!(),
+        }
+        let bytes = source.serialize("main").unwrap();
+        let image: &[u8] = &bytes;
+        let conn = read_image(image, image.len() as u64, crate::MAX_SOURCE_BYTES, Store::Tasks).unwrap();
+        assert_eq!(conn.limit(rusqlite::limits::Limit::SQLITE_LIMIT_EXPR_DEPTH).unwrap(), 128);
+        assert_eq!(conn.limit(rusqlite::limits::Limit::SQLITE_LIMIT_SQL_LENGTH).unwrap(), 65536);
+        assert!(inspect(&conn, Store::Tasks).is_err(), "{kind}");
+    }
 }

@@ -37,11 +37,20 @@ pub(crate) fn schema(conn: &Connection) -> Result<Vec<SchemaRow>> {
 }
 
 pub(crate) fn harden(conn: &mut Connection) -> Result<()> {
+    harden_with_heap_limit(conn, 64 * 1024 * 1024)
+}
+
+pub(crate) fn harden_capture(conn: &mut Connection) -> Result<()> {
+    // Capture is a separate operator process: one image plus the existing working margin.
+    harden_with_heap_limit(conn, (MAX_SOURCE_BYTES + 64 * 1024 * 1024) as i64)
+}
+
+fn harden_with_heap_limit(conn: &mut Connection, ceiling: i64) -> Result<()> {
     // SAFETY: importer is a dedicated process; the SQLite process-wide ceiling
     // is only narrowed. -1 queries the current ceiling without changing it.
     unsafe {
         let old = rusqlite::ffi::sqlite3_hard_heap_limit64(-1);
-        let limit = if old > 0 { old.min(64 * 1024 * 1024) } else { 64 * 1024 * 1024 };
+        let limit = if old > 0 { old.min(ceiling) } else { ceiling };
         rusqlite::ffi::sqlite3_hard_heap_limit64(limit);
         let actual = rusqlite::ffi::sqlite3_hard_heap_limit64(-1);
         if actual <= 0 || actual > limit { return Err(Error::Isolation); }
