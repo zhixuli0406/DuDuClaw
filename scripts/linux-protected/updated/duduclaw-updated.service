@@ -1,8 +1,15 @@
 [Unit]
 Description=Verify and activate signed protected DuDuClaw updates
 After=network-online.target
-After=duduclaw-gateway.service duduclaw-spawnd.service duduclaw-egress.service
 Wants=network-online.target
+# R6: only spawnd's start, whose READY=1 means its root update endpoint is
+# bound (also on an inconsistent set, so this service can repair the host).
+# Not ordered after gateway or egress: their readback sockets are read with
+# timeouts and retries during an activation. Wants=, not Requires=: this
+# service restarts spawnd itself during an activation, and Requires= would
+# propagate that restart to this service.
+Wants=duduclaw-spawnd.service
+After=duduclaw-spawnd.service
 StartLimitIntervalSec=60
 StartLimitBurst=3
 

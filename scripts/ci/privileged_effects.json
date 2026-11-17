@@ -4676,6 +4676,18 @@
       "rationale": "Test fixture or test helper; compiled/run only for regression verification, not a production employee execution entry point."
     },
     {
+      "symbol": "crates/duduclaw-gateway/src/update_readback.rs::linux::start",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "thread_spawn"
+      ],
+      "identity": "gateway",
+      "migration": "not_process",
+      "rationale": "R6: std::thread::Builder::spawn starts the one bounded Rust thread serving the root-only update readback socket (one frame per connection, 5 s timeouts); no OS child process is launched."
+    },
+    {
       "symbol": "crates/duduclaw-gateway/src/updater.rs::apply_update_inner",
       "apis": {
         "command_constructor": 1,
@@ -6159,7 +6171,7 @@
       "rationale": "Test fixture or test helper; compiled/run only for regression verification, not a production employee execution entry point."
     },
     {
-      "symbol": "crates/duduclaw-updated/src/linux/activation.rs::systemctl",
+      "symbol": "crates/duduclaw-updated/src/linux/activation.rs::systemctl_within",
       "apis": {
         "command_constructor": 1,
         "terminal_spawn": 1
@@ -6169,7 +6181,7 @@
       ],
       "identity": "updater",
       "migration": "privileged_service",
-      "rationale": "F root updater invokes trusted /usr/bin/systemctl with fixed internal activation/readback argv, cleared environment and bounded output/time. Controlling the signed service generation is root maintenance, not employee code execution."
+      "rationale": "F root updater invokes trusted /usr/bin/systemctl with fixed internal activation/readback argv, cleared environment and bounded output/time. Controlling the signed service generation is root maintenance, not employee code execution. R6: unit restarts use the fixed argv `restart <fixed unit>` (blocking: the client waits for exactly the job it enqueued and exits non-zero unless that job is done) for duduclaw-spawnd.service, then duduclaw-egress.service, then duduclaw-gateway.service, preceded by `reset-failed duduclaw-spawnd.service`, then `show --property=Job --value` / `show --property=InvocationID --value` / `is-active --quiet` polling, all against one absolute deadline (RESTART_DEADLINE). Before Apply: `stop duduclaw-isolation-ready.service`, `stop duduclaw-egress.socket`, `stop duduclaw-egress.service`, `stop duduclaw-gateway.service`, then `show --property=ActiveState --value <unit>` and `show --property=Job --value <unit>` for those four fixed units (one absolute QUIESCE_DEADLINE). Every client is killed at its absolute deadline (a restart: the caller's deadline; every other call: min(60 s from its start, the caller's deadline)) and is not spawned once that deadline has passed; `systemctl` is the 60 s wrapper. Single spawn site (/usr/bin/systemctl, fixed argv)."
     },
     {
       "symbol": "crates/duduclaw-updated/src/linux/download.rs::Downloader::url",
@@ -7181,6 +7193,18 @@
       "identity": "spawn_daemon",
       "migration": "not_process",
       "rationale": "spawnd starts one fresh Rust thread that unshares CLONE_FS|CLONE_NEWNS to compose the native home mount in a disposable namespace and returns a detached clone; no employee process or OS child is started."
+    },
+    {
+      "symbol": "crates/duduclaw-spawnd/src/update_control.rs::Recovered::serve",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "task_or_thread"
+      ],
+      "identity": "spawn_daemon",
+      "migration": "not_process",
+      "rationale": "R6: std::thread::Builder::spawn starts the one root update-control thread serving update.sock (uid 0 peers only); its Apply republishes verified generation files at fixed root paths. On a set not consistent at start it is the only endpoint, and after a repairing Apply it exits the process (status 82) so systemd restarts spawnd for a full re-verification; when a request leaves an opened set inconsistent it closes admission, replies, writes status and an acknowledged audit record, and exits (status 83). No OS child process is launched; the workload census and duduclaw-isolation-ready.service's `duduclaw-spawnd wait-consistent` read cgroupfs/the status file and query PID 1 over the system bus (zbus, read-only), spawning nothing."
     },
     {
       "symbol": "crates/duduclaw-spawnd/src/work_anchor.rs::tests::iso_root_work_anchor_not_writable_by_employee",

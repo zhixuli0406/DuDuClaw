@@ -64,6 +64,8 @@ pub mod isolation_skill_jobs;
 #[cfg(target_os = "linux")]
 pub mod isolation_forks;
 pub mod isolation_readiness;
+/// R6 update readback endpoint (`/run/duduclaw-gateway-update/readback.sock`).
+pub mod update_readback;
 // Read model and handover path; B1–B3 and the A4 admin RPC consume the parts
 // not yet called from production code.
 #[allow(dead_code)]

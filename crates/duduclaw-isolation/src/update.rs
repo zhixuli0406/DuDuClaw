@@ -28,6 +28,7 @@ pub const ISOLATION_FACTS: &[&str] = &[
     crate::ids::SPAWND_SOCKET,
     "/etc/systemd/system/duduclaw-spawnd.socket",
     "/etc/systemd/system/duduclaw-spawnd.service",
+    "/etc/systemd/system/duduclaw-isolation-ready.service",
     "/etc/systemd/system/duduclaw-employees.slice",
     "/etc/systemd/system/duduclaw-egress.socket",
     "/etc/systemd/system/duduclaw-egress.service",

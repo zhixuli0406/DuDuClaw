@@ -754,6 +754,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     ).await;
     info!("edition_profile={}", boot_edition.as_str());
     crate::isolation_readiness::initialize(!boot_edition.is_personal());
+    // R6: the update service's gateway readback endpoint (isolated hosts only).
+    crate::update_readback::start();
     crate::isolation_readiness::connect_backend().await;
     // Allow an old store with no MFA tables; refuse a partial MFA schema or
     // unreadable policy before schema initialization can hide the failure.

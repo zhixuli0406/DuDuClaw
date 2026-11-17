@@ -41,6 +41,29 @@ pub const IMPORT_UNIT_PATTERN: &str = "duduclaw-import-<request-id>.service";
 pub const EMPLOYEES_SLICE: &str = "duduclaw-employees.slice";
 pub const EMPLOYEE_SLICE_PATTERN: &str = "duduclaw-employees-<immutable-id>.slice";
 pub const UPDATED_UNIT: &str = "duduclaw-updated.service";
+/// R6 (plan addendum "啟動順序與「一致」的判定", points 3 and 6): the oneshot
+/// unit that completes only once spawnd reports the isolated component set
+/// verified and consistent (`duduclaw-spawnd wait-consistent`). It is bound to
+/// spawnd (`BindsTo=`/`PartOf=`/`After=`), so it drops whenever spawnd stops,
+/// crashes or restarts, and spawnd pulls it in again (`Wants=`) on every start.
+pub const ISOLATION_READY_UNIT: &str = "duduclaw-isolation-ready.service";
+/// The two `[Unit]` lines the isolated-install gateway unit (written by the
+/// installer package, R3) must carry, exactly as `duduclaw-egress.service`
+/// does, so the gateway never starts on an unverified or mixed set and is
+/// stopped whenever the gate drops (`BindsTo=`, not only `Requires=`). The
+/// single-binary gateway unit (no spawnd on those hosts) must not carry them.
+pub const ISOLATED_GATEWAY_UNIT_DEPENDENCIES: &str =
+    "BindsTo=duduclaw-isolation-ready.service\nAfter=duduclaw-isolation-ready.service\n";
+/// The egress service (bound to [`ISOLATION_READY_UNIT`]) and the socket that
+/// activates it, and the isolated-install gateway unit (bound to it as well).
+pub const EGRESS_UNIT: &str = "duduclaw-egress.service";
+pub const EGRESS_SOCKET_UNIT: &str = "duduclaw-egress.socket";
+pub const ISOLATED_GATEWAY_UNIT: &str = "duduclaw-gateway.service";
+/// R6 `Apply` precondition: the consistency gate, every unit bound to it and
+/// the socket that could start one of them again. The updater stops and checks
+/// exactly these before `Apply`; spawnd refuses `Apply` unless PID 1 reports
+/// each of them inactive with no pending job.
+pub const ISOLATION_GATED_UNITS: [&str; 4] = [ISOLATION_READY_UNIT, EGRESS_SOCKET_UNIT, EGRESS_UNIT, ISOLATED_GATEWAY_UNIT];
 
 /// Inclusive numeric interval, checked before allocation (§5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +126,18 @@ impl UidPolicy<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn isolated_gateway_unit_dependencies_are_pinned() {
+        assert_eq!(ISOLATION_READY_UNIT, "duduclaw-isolation-ready.service");
+        assert_eq!(ISOLATED_GATEWAY_UNIT_DEPENDENCIES,
+            "BindsTo=duduclaw-isolation-ready.service\nAfter=duduclaw-isolation-ready.service\n");
+        let lines: Vec<&str> = ISOLATED_GATEWAY_UNIT_DEPENDENCIES.lines().collect();
+        assert_eq!(lines, [format!("BindsTo={ISOLATION_READY_UNIT}"), format!("After={ISOLATION_READY_UNIT}")]);
+        // Requires= alone would leave the gateway running after the gate drops.
+        assert!(!ISOLATED_GATEWAY_UNIT_DEPENDENCIES.contains("Requires="));
+        assert_eq!(ISOLATION_GATED_UNITS, ["duduclaw-isolation-ready.service", "duduclaw-egress.socket",
+            "duduclaw-egress.service", "duduclaw-gateway.service"]);
+    }
     #[test]
     fn uid_range_checks_fail_closed() {
         let mut policy = UidPolicy {

@@ -73,6 +73,7 @@ struct Subject { op: Opcode, employee: Option<EmployeeId>, run: Option<RunId>,
 impl Subject {
     fn of(message: &SpawnRequest) -> Self {
         let (employee, run, call) = match message {
+            SpawnRequest::StartRun { run, employee_id, .. } => (Some(*employee_id), Some(run.0), None),
             SpawnRequest::OpenWorkFile { run, employee_id, .. } => (Some(*employee_id), Some(run.0), None),
             SpawnRequest::WorkAnchor { employee_id } | SpawnRequest::StopEmployeeRuns { employee_id }
                 | SpawnRequest::EmployeeIdle { employee_id } => (Some(*employee_id), None, None),
@@ -120,6 +121,15 @@ pub(crate) fn coordination_time_ms() -> io::Result<u64> {
 pub fn serve<H: Host<Inputs = Vec<OwnedFd>, Io = Vec<OwnedFd>>>(listener: Listener,
     gateway: (u32, u32), snapshots: SnapshotAuthority, host: H, limits: Limits,
     audit: crate::audit::disk::AuditWorker) -> io::Result<()> {
+    serve_with_drain(listener, gateway, snapshots, host, limits, audit, None)
+}
+
+/// [`serve`] bound to the R6 update drain barrier (`update_control`): admission
+/// refuses new runs while it is closed, and every iteration reports the
+/// admitted run count observed after that iteration's admissions.
+pub fn serve_with_drain<H: Host<Inputs = Vec<OwnedFd>, Io = Vec<OwnedFd>>>(listener: Listener,
+    gateway: (u32, u32), snapshots: SnapshotAuthority, host: H, limits: Limits,
+    audit: crate::audit::disk::AuditWorker, drain: Option<crate::admission::DrainBarrier>) -> io::Result<()> {
     harden_process()?;
     use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
     let handler = SigAction::new(SigHandler::Handler(stop), SaFlags::empty(), SigSet::empty());
@@ -127,9 +137,12 @@ pub fn serve<H: Host<Inputs = Vec<OwnedFd>, Io = Vec<OwnedFd>>>(listener: Listen
     unsafe { sigaction(Signal::SIGTERM, &handler)?; sigaction(Signal::SIGINT, &handler)?; }
     if snapshots.gateway_uid != gateway.0 { return Err(unavailable()); }
     let mut coordinator = Coordinator::new(host, limits).map_err(|_| unavailable())?;
+    if let Some(barrier) = &drain { coordinator.set_drain_barrier(barrier.clone()); }
     coordination_time_ms()?;
     let mut clients: Vec<Client> = Vec::new();
     loop {
+        // Read before any admission of this iteration; reported after them.
+        let epoch = drain.as_ref().map(crate::admission::DrainBarrier::epoch);
         let now = coordination_time_ms()?;
         if STOP.load(Ordering::Relaxed) {
             coordinator.begin_shutdown(now);
@@ -143,7 +156,7 @@ pub fn serve<H: Host<Inputs = Vec<OwnedFd>, Io = Vec<OwnedFd>>>(listener: Listen
         }
         // Host adapters may not block this loop: slow probes/startup belong in
         // adapter-owned jobs with finite deadlines, observed by poll().
-        let _ = coordinator.tick(now);
+        let healthy = coordinator.tick(now).is_ok();
         if clients.len() < MAX_CONNECTIONS {
             match listener.accept_gateway(gateway.0, gateway.1) {
                 Ok(socket) => {
@@ -192,6 +205,9 @@ pub fn serve<H: Host<Inputs = Vec<OwnedFd>, Io = Vec<OwnedFd>>>(listener: Listen
                 clients.swap_remove(index);
             } else { index += 1; }
         }
+        if let (Some(barrier), Some(epoch)) = (&drain, epoch) {
+            barrier.observe(epoch, coordinator.admitted_runs(), healthy);
+        }
         std::thread::sleep(Duration::from_millis(25));
     }
 }
@@ -219,6 +235,8 @@ fn audit_record(now: u64, message: &SpawnResponse, subject: Subject, detail: Opt
         SpawnResponse::WorkFile { run, .. } => record(Event::WorkFileOpened, subject.employee, Some(run.0), detail),
         SpawnResponse::EmployeeRunsStopped { employee_id, runs, confirmed } => record(Event::EmployeeRunsStopped,
             Some(*employee_id), None, Some(Detail::Stopped { runs: runs.as_slice().len() as u16, confirmed: *confirmed })),
+        SpawnResponse::Error { code } if subject.op == Opcode::StartRun =>
+            record(Event::Refused, subject.employee, subject.run, Some(Detail::Code { code: *code })),
         SpawnResponse::Error { code } if subject.op == Opcode::OpenWorkFile =>
             record(Event::WorkFileRefused, subject.employee, subject.run, Some(Detail::Code { code: *code })),
         SpawnResponse::Error { code } if subject.work() =>
@@ -290,6 +308,8 @@ fn dispatch<H: Host<Inputs = Vec<OwnedFd>, Io = Vec<OwnedFd>>>(coordinator: &mut
     let subject = Subject::of(&frame.message);
     let subject = subject.resolve(subject.run.and_then(|run| coordinator.run_employee(RunHandle(run))));
     let result = (|| -> Result<Dispatched> {
+        // Preserve closed validation codes before fd_plan maps them to InvalidFds.
+        frame.message.validation_code()?;
         fds::validate_start(&frame.message, &packet.fds, snapshots).map_err(|_| ErrorCode::InvalidFds)?;
         let response = match frame.message {
             SpawnRequest::ReserveRun { employee_id } => coordinator.reserve(connection, employee_id,
@@ -377,6 +397,39 @@ impl Host for UnavailableHost {
 mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
+    #[test]
+    fn server_start_step_limit_denied_before_fds_and_audited() {
+        use crate::admission::{DrainBarrier, DrainClosure};
+        use duduclaw_isolation::{bounded::List, ipc::MAX_REQUESTED_MAX_TURNS};
+        let (employee, run) = (EmployeeId([2; 16]), RunHandle(RunId([3; 16])));
+        for closed in [false, true] {
+            let mut coordinator = Coordinator::new(UnavailableHost, Limits::default()).unwrap();
+            let barrier = DrainBarrier::default();
+            if closed { assert!(barrier.close(DrainClosure::Unreadable).is_some()); }
+            coordinator.set_drain_barrier(barrier);
+            for value in [0, MAX_REQUESTED_MAX_TURNS + 1] {
+                let request = Envelope { version: ipc::PROTOCOL_VERSION, request_id: RequestId([4; 16]),
+                    message: SpawnRequest::StartRun { run, employee_id: employee, runtime_request: RuntimeKind::Codex,
+                        task_ref: None, workspace: None, prompt_bytes: 1, input_fds: List::new(vec![]).unwrap(),
+                        pty: false, requested_max_turns: Some(value) } };
+                let (gateway, server) = Seqpacket::pair().unwrap();
+                // Deliberately missing the prompt fd: validation must still win.
+                gateway.send(&ipc::encode(&request).unwrap(), &[]).unwrap();
+                let reply = dispatch(&mut coordinator, ControlConnectionId([1; 16]), server.recv().unwrap(),
+                    SnapshotAuthority { gateway_uid: 1000, mount_id: 1 }, 100).unwrap();
+                let Reply::Now(response, descriptors, subject, detail) = reply else { panic!("unexpected deferred reply") };
+                assert_eq!(response.request_id, request.request_id);
+                assert_eq!(response.message, SpawnResponse::Error { code: ErrorCode::StepLimitDenied });
+                assert!(descriptors.is_empty());
+                assert_eq!(serde_json::to_value(&response.message).unwrap()["code"], "step_limit_denied");
+                let record = audit_record(100, &response.message, subject, detail).unwrap();
+                assert_eq!((record.event, record.employee, record.run), (Event::Refused, Some(employee), Some(run.0)));
+                assert_eq!(record.detail, Some(Detail::Code { code: ErrorCode::StepLimitDenied }));
+                assert_eq!(serde_json::to_value(&record).unwrap()["detail"]["code"], "step_limit_denied");
+                assert_eq!(coordinator.admitted_runs(), 0);
+            }
+        }
+    }
     #[test]
     fn missing_adapters_refuse_every_launch_and_readiness() {
         assert_eq!(UnavailableHost.ready(EmployeeId([1; 16])), Err(ErrorCode::IsolationUnavailable));

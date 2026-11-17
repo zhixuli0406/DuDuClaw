@@ -168,7 +168,8 @@ libc = "0.2"
 # disk/network readings (crates/duduclaw-gateway/src/device.rs) — both are
 # available cross-Unix, not Linux-only, per nix's own feature gating.
 # "user" added for N-0's device_ops sysd integration tests (nix::unistd::Uid::current()).
-nix = { version = "0.29", features = ["signal", "process", "fs", "net", "user"] }
+# "socket" added for the R6 update readback endpoint (`update_readback.rs`).
+nix = { version = "0.29", features = ["signal", "process", "fs", "net", "user", "socket"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 duduclaw-spawnd = { path = "../duduclaw-spawnd" }

@@ -21,8 +21,10 @@ fn request_id(text: &str) -> Result<RequestId, &'static str> {
 
 /// Result code (in an `ok` payload, never an error frame) meaning: this host
 /// has no reachable root updater, so NO request was sent. The gateway never
-/// updates itself; the administrator updates from the host instead. Until the
-/// isolation bootstrap is installable (planned v1.82.0) this is every host.
+/// updates itself; the administrator updates from the host instead. This is
+/// every single-binary protected host: only an isolated installation (v1.83.0,
+/// `duduclaw-bootstrap install`) runs the update service and its drain/readback
+/// endpoints (spawnd `update.sock`, gateway and egress `readback.sock`).
 pub(crate) const UPDATER_NOT_INSTALLED: &str = "updater_not_installed";
 const UPDATER_NOT_INSTALLED_MESSAGE: &str = "這台主機沒有可用的獨立更新服務，儀表板無法更新受保護安裝，未送出任何更新要求。請在主機終端機執行 sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux。";
 

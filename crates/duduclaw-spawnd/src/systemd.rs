@@ -47,6 +47,73 @@ pub fn parse_run_unit(name: &str) -> Option<RunId> {
     }
     Some(RunId(bytes))
 }
+/// R6 update census: a unit PID 1 lists is a live spawnd run unit when its
+/// name is exactly a run unit's and it is in any state but `inactive` or
+/// `failed` (`active`, `activating`, `deactivating`, `reloading`, or anything
+/// unknown: fail closed). Other names are not spawnd's.
+pub fn run_unit_live(name: &str, active_state: &str) -> bool {
+    parse_run_unit(name).is_some() && !matches!(active_state, "inactive" | "failed")
+}
+/// The `ListUnitsByPatterns` filter of the R6 census: exactly the run-unit
+/// name pattern, in every `ActiveState` but `inactive` and `failed`. A state a
+/// future systemd adds is not listed here; the census's second half (the
+/// employees cgroup must be empty) still sees any process such a unit holds.
+pub const RUN_UNIT_GLOB: &str = "duduclaw-run-*.service";
+pub const LIVE_UNIT_STATES: [&str; 6] = ["active", "reloading", "activating", "deactivating", "maintenance", "refreshing"];
+/// Hard cap on the entries one census reply may carry (spawnd never keeps more
+/// run units than this); a longer reply refuses the census.
+pub const MAX_CENSUS_UNITS: usize = 1024;
+/// A sequence of at most `N` entries, bounded while it is deserialised: the
+/// visitor fails at entry `N + 1` instead of building the whole list first
+/// (PID 1's census and gate replies; on Linux its D-Bus signature is the
+/// plain array's, `a…`).
+#[derive(Debug)]
+pub struct BoundedList<T, const N: usize>(pub Vec<T>);
+impl<'de, T: serde::Deserialize<'de>, const N: usize> serde::Deserialize<'de> for BoundedList<T, N> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Entries<T, const N: usize>(std::marker::PhantomData<T>);
+        impl<'de, T: serde::Deserialize<'de>, const N: usize> serde::de::Visitor<'de> for Entries<T, N> {
+            type Value = BoundedList<T, N>;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "a sequence of at most {N} entries")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut sequence: A) -> Result<Self::Value, A::Error> {
+                // The length hint comes from the peer: never allocate past N for it.
+                let mut entries = Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(N));
+                while let Some(entry) = sequence.next_element()? {
+                    if entries.len() == N { return Err(serde::de::Error::invalid_length(N + 1, &self)); }
+                    entries.push(entry);
+                }
+                Ok(BoundedList(entries))
+            }
+        }
+        deserializer.deserialize_seq(Entries(std::marker::PhantomData))
+    }
+}
+/// The census over PID 1's filtered list (`(Id, ActiveState)` per entry):
+/// more entries than [`MAX_CENSUS_UNITS`] refuses, otherwise the live run units
+/// ([`run_unit_live`]) are counted.
+pub fn census_live_run_units<'a>(listed: impl ExactSizeIterator<Item = (&'a str, &'a str)>) -> io::Result<u32> {
+    if listed.len() > MAX_CENSUS_UNITS { return Err(invalid()); }
+    let live = listed.filter(|(name, state)| run_unit_live(name, state)).count();
+    u32::try_from(live).map_err(|_| invalid())
+}
+/// R6 `Apply` precondition over PID 1's list of `units` (`(Id, ActiveState,
+/// job id)` per loaded entry; a unit PID 1 has not loaded has no process and no
+/// job). `Ok(true)` only when every listed entry is one of `units`, at most once,
+/// `inactive` or `failed`, with no job. `Err`: an entry PID 1 should not have
+/// returned (another name, a duplicate, too many).
+pub fn units_down<'a>(units: &[&str], listed: impl ExactSizeIterator<Item = (&'a str, &'a str, u32)>) -> io::Result<bool> {
+    if listed.len() > units.len() { return Err(invalid()); }
+    let mut seen = Vec::with_capacity(units.len());
+    let mut down = true;
+    for (name, state, job) in listed {
+        if !units.contains(&name) || seen.contains(&name) { return Err(invalid()); }
+        seen.push(name);
+        down &= matches!(state, "inactive" | "failed") && job == 0;
+    }
+    Ok(down)
+}
 pub fn employee_slice(employee: EmployeeId) -> String {
     let hex: String = employee.0.iter().map(|byte| format!("{byte:02x}")).collect();
     format!("duduclaw-employees-{hex}.slice")
@@ -227,6 +294,26 @@ pub mod linux {
             Property::DeviceAccess(v) => Value::from(v.iter().map(|(path, access)| (path.as_str(), access.as_str())).collect::<Vec<_>>()),
         }
     }
+    /// One `ListUnits*` entry: id, description, load, active and sub state,
+    /// following, unit path, job id, job type, job path.
+    type ListedUnit = (String, String, String, String, String, String,
+        OwnedObjectPath, u32, String, OwnedObjectPath);
+    /// On the bus a [`BoundedList`] is exactly the plain array of its entries.
+    impl<T: zbus::zvariant::Type, const N: usize> zbus::zvariant::Type for BoundedList<T, N> {
+        const SIGNATURE: &'static zbus::zvariant::Signature = <Vec<T> as zbus::zvariant::Type>::SIGNATURE;
+    }
+    /// A `ListUnitsByPatterns` reply (census and gate check), bounded to
+    /// [`MAX_CENSUS_UNITS`] entries while it is deserialised.
+    type BoundedUnits = BoundedList<ListedUnit, MAX_CENSUS_UNITS>;
+    /// The largest `ListUnitsByPatterns` reply body deserialised at all
+    /// ([`MAX_CENSUS_UNITS`] entries of a few hundred bytes each fit well).
+    const MAX_LIST_REPLY_BYTES: usize = 1 << 20;
+    /// A body over [`MAX_LIST_REPLY_BYTES`] is refused before `decode` runs;
+    /// otherwise `decode`'s bounded list, or `Err` (refused).
+    fn bounded_units(body_bytes: usize, decode: impl FnOnce() -> zbus::Result<BoundedUnits>) -> io::Result<Vec<ListedUnit>> {
+        if body_bytes > MAX_LIST_REPLY_BYTES { return Err(invalid()); }
+        Ok(decode().map_err(bus_error)?.0)
+    }
     pub struct Systemd { connection: Connection, references: Mutex<UnitReferences> }
     /// A host-only receipt; no cgroup paths or PIDs go back over gateway IPC.
     pub struct StartedUnit { pub name: String, path: OwnedObjectPath, pub cgroup: PathBuf }
@@ -256,14 +343,58 @@ pub mod linux {
         /// Enumerate only exact daemon-generated names, including inactive units.
         /// Callers must reconcile this inventory before admitting a fresh run.
         pub fn list_runs(&self) -> io::Result<Vec<RunId>> {
-            type ListedUnit = (String, String, String, String, String, String,
-                OwnedObjectPath, u32, String, OwnedObjectPath);
             let units: Vec<ListedUnit> = self.manager()?.call("ListUnits", &()).map_err(bus_error)?;
             let mut runs: Vec<_> = units.into_iter().filter_map(|unit| parse_run_unit(&unit.0)).collect();
             runs.sort();
             runs.dedup();
             if runs.len() > 1024 { return Err(invalid()); }
             Ok(runs)
+        }
+        /// R6 update census, independent of any spawnd process's memory: how
+        /// many run units PID 1 currently has loaded in a live state
+        /// ([`run_unit_live`]). Every unit that has a process, a job or a
+        /// pending stop is loaded, so a run of an earlier spawnd process whose
+        /// asynchronous teardown is still in progress is counted. PID 1 filters
+        /// (exact run-unit pattern, live states); a reply longer than
+        /// [`MAX_CENSUS_UNITS`] refuses the census.
+        pub fn live_run_units(&self) -> io::Result<u32> {
+            let units = self.list_by_patterns(&LIVE_UNIT_STATES, &[RUN_UNIT_GLOB])?;
+            census_live_run_units(units.iter().map(|unit| (unit.0.as_str(), unit.3.as_str())))
+        }
+        /// R6 `Apply` precondition, from the same source as the census: PID 1
+        /// reports each of `units` (exact names) not loaded, or `inactive` /
+        /// `failed` with no job ([`units_down`]). A bus error is `Err`.
+        pub fn units_down(&self, units: &[&str]) -> io::Result<bool> {
+            let listed = self.list_by_patterns(&[], units)?;
+            units_down(units, listed.iter().map(|unit| (unit.0.as_str(), unit.3.as_str(), unit.7)))
+        }
+        /// PID 1's filtered list, bounded before and while it is deserialised
+        /// ([`bounded_units`]): an oversize body or entry 1025 refuses.
+        fn list_by_patterns(&self, states: &[&str], patterns: &[&str]) -> io::Result<Vec<ListedUnit>> {
+            let reply = self.manager()?.call_method("ListUnitsByPatterns", &(states, patterns)).map_err(bus_error)?;
+            let body = reply.body();
+            bounded_units(body.len(), || body.deserialize::<BoundedUnits>())
+        }
+        /// `duduclaw-spawnd.service` as PID 1 sees it now: `(MainPID,
+        /// InvocationID)` (lowercase hex, 32 digits) while it is `active` with a
+        /// main process, otherwise `None`. Read-only properties; used by the
+        /// consistency waiter instead of `/proc/<pid>` (no capability needed,
+        /// unaffected by `hidepid=` and spawnd being non-dumpable).
+        pub fn spawnd_identity(&self) -> io::Result<Option<(u32, String)>> {
+            let name = "duduclaw-spawnd.service";
+            let path: OwnedObjectPath = match self.manager()?.call("GetUnit", &(name,)) {
+                Ok(path) => path,
+                Err(error) if missing_unit(&error) => return Ok(None),
+                Err(error) => return Err(bus_error(error)),
+            };
+            let unit = Proxy::new(&self.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Unit").map_err(bus_error)?;
+            let state: String = unit.get_property("ActiveState").map_err(bus_error)?;
+            if state != "active" { return Ok(None); }
+            let invocation: Vec<u8> = unit.get_property("InvocationID").map_err(bus_error)?;
+            let service = Proxy::new(&self.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Service").map_err(bus_error)?;
+            let pid: u32 = service.get_property("MainPID").map_err(bus_error)?;
+            if pid == 0 || invocation.len() != 16 || invocation.iter().all(|byte| *byte == 0) { return Ok(None); }
+            Ok(Some((pid, invocation.iter().map(|byte| format!("{byte:02x}")).collect())))
         }
         /// Recover a receipt after a failed launch or daemon restart. Missing
         /// cgroups are only cleanup proof after an inactive readback.
@@ -708,6 +839,32 @@ pub mod linux {
             }
         }
         #[test]
+        fn update_census_reply_is_bounded_in_dbus_decoding() {
+            use zbus::zvariant::{serialized::Context, to_bytes, ObjectPath, LE};
+            let path = |text: &'static str| OwnedObjectPath::from(ObjectPath::try_from(text).unwrap());
+            let entry = |n: u32| -> ListedUnit {
+                (format!("duduclaw-run-{n:032x}.service"), String::new(), "loaded".into(), "active".into(),
+                    "running".into(), String::new(), path("/org/freedesktop/systemd1/unit/x"), 0, String::new(), path("/"))
+            };
+            // The reply's own encoding (signature `a(ssssssouso)`, as PID 1 sends it).
+            let encode = |entries: usize| to_bytes(Context::new_dbus(LE, 0),
+                &(0..entries as u32).map(entry).collect::<Vec<ListedUnit>>()).unwrap();
+            assert_eq!(<BoundedUnits as zbus::zvariant::Type>::SIGNATURE, <Vec<ListedUnit> as zbus::zvariant::Type>::SIGNATURE);
+            let at_cap = encode(MAX_CENSUS_UNITS);
+            assert!(at_cap.len() <= MAX_LIST_REPLY_BYTES);
+            let (units, _) = at_cap.deserialize::<BoundedUnits>().unwrap();
+            assert_eq!(units.0.len(), MAX_CENSUS_UNITS);
+            let over = encode(MAX_CENSUS_UNITS + 1);
+            assert!(over.deserialize::<BoundedUnits>().is_err());
+            assert!(bounded_units(over.len(), || over.deserialize::<BoundedUnits>().map(|(units, _)| units)
+                .map_err(zbus::Error::from)).is_err());
+            assert_eq!(bounded_units(at_cap.len(), || at_cap.deserialize::<BoundedUnits>().map(|(units, _)| units)
+                .map_err(zbus::Error::from)).unwrap().len(), MAX_CENSUS_UNITS);
+            // A body over the byte bound is refused before anything is deserialised.
+            assert!(bounded_units(MAX_LIST_REPLY_BYTES + 1, || panic!("deserialised an oversize body")).is_err());
+            assert!(bounded_units(MAX_LIST_REPLY_BYTES, || Ok(BoundedList(vec![]))).unwrap().is_empty());
+        }
+        #[test]
         #[ignore = "iso_root_: root disposable systemd Linux VM, no active B1 daemon/runs; --test-threads=1"]
         fn iso_root_systemd_fd_delivery_and_restart_reconciliation() {
             assert_eq!(unsafe { libc::geteuid() }, 0);
@@ -809,6 +966,85 @@ mod tests {
             "duduclaw-run-00000000000000000000000000000000.service\n"] {
             assert_eq!(parse_run_unit(name), None, "{name:?}");
         }
+    }
+    #[test]
+    fn update_census_counts_only_live_run_units() {
+        let run = run_unit(RunId([0xab; 16]));
+        for state in ["active", "activating", "deactivating", "reloading", "maintenance", ""] {
+            assert!(run_unit_live(&run, state), "{state:?}");
+        }
+        for state in ["inactive", "failed"] { assert!(!run_unit_live(&run, state), "{state:?}"); }
+        for name in ["duduclaw-spawnd.service", "duduclaw-run-.service", "duduclaw-employees-ab.slice",
+            "duduclaw-run-ABABABABABABABABABABABABABABABAB.service"] {
+            assert!(!run_unit_live(name, "active"), "{name}");
+        }
+    }
+    #[test]
+    fn update_census_filtered_list_is_capped() {
+        let names: Vec<String> = (0..=MAX_CENSUS_UNITS as u32).map(|n| {
+            let mut bytes = [0u8; 16]; bytes[..4].copy_from_slice(&n.to_be_bytes()); run_unit(RunId(bytes))
+        }).collect();
+        // The filter PID 1 applies: exactly the run-unit pattern, every live state.
+        assert_eq!(RUN_UNIT_GLOB, "duduclaw-run-*.service");
+        assert!(!LIVE_UNIT_STATES.iter().any(|state| matches!(*state, "inactive" | "failed")));
+        let at_cap = names[..MAX_CENSUS_UNITS].iter().map(|name| (name.as_str(), "active"));
+        assert_eq!(census_live_run_units(at_cap).unwrap(), MAX_CENSUS_UNITS as u32);
+        // One entry over the cap: the census is refused, never a partial count.
+        assert!(census_live_run_units(names.iter().map(|name| (name.as_str(), "active"))).is_err());
+        // Inactive/failed entries and foreign names are not counted.
+        let mixed = [(names[0].as_str(), "failed"), (names[1].as_str(), "deactivating"), ("duduclaw-spawnd.service", "active")];
+        assert_eq!(census_live_run_units(mixed.into_iter()).unwrap(), 1);
+    }
+    #[test]
+    fn update_census_list_is_bounded_while_deserialising() {
+        use std::cell::Cell;
+        thread_local! { static DESERIALISED: Cell<usize> = const { Cell::new(0) }; }
+        // One entry; counts how many entries the visitor deserialised.
+        struct Counted;
+        impl<'de> serde::Deserialize<'de> for Counted {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                <u32 as serde::Deserialize>::deserialize(deserializer)?;
+                DESERIALISED.with(|count| count.set(count.get() + 1));
+                Ok(Counted)
+            }
+        }
+        type Census = BoundedList<Counted, MAX_CENSUS_UNITS>;
+        let array = |entries: usize| format!("[{}]", vec!["7"; entries].join(","));
+        for entries in [0, 1, MAX_CENSUS_UNITS] {
+            assert_eq!(serde_json::from_str::<Census>(&array(entries)).unwrap().0.len(), entries);
+        }
+        // Entry 1025 fails the visitor: the remaining entries of a much longer
+        // array are never deserialised, so the full list is never built.
+        DESERIALISED.with(|count| count.set(0));
+        assert!(serde_json::from_str::<Census>(&array(4 * MAX_CENSUS_UNITS)).is_err());
+        assert_eq!(DESERIALISED.with(Cell::get), MAX_CENSUS_UNITS + 1);
+        DESERIALISED.with(|count| count.set(0));
+        assert!(serde_json::from_str::<Census>(&array(MAX_CENSUS_UNITS + 1)).is_err());
+        assert_eq!(DESERIALISED.with(Cell::get), MAX_CENSUS_UNITS + 1);
+        // Not a sequence at all: refused.
+        assert!(serde_json::from_str::<Census>("{}").is_err());
+    }
+    #[test]
+    fn update_gate_units_down_only_when_every_entry_is_inactive_without_job() {
+        use duduclaw_isolation::ids::ISOLATION_GATED_UNITS as UNITS;
+        // Nothing loaded, or every unit inactive/failed with no job: down.
+        assert!(units_down(&UNITS, std::iter::empty()).unwrap());
+        let all = |state: &'static str, job: u32| UNITS.iter().map(move |name| (*name, state, job)).collect::<Vec<_>>();
+        assert!(units_down(&UNITS, all("inactive", 0).into_iter()).unwrap());
+        assert!(units_down(&UNITS, [(UNITS[0], "failed", 0)].into_iter()).unwrap());
+        // Any of them active, starting, stopping, or with a queued job: not down.
+        for (state, job) in [("active", 0), ("activating", 0), ("deactivating", 0), ("reloading", 0), ("inactive", 7)] {
+            for unit in UNITS {
+                let mut listed = all("inactive", 0);
+                for entry in &mut listed { if entry.0 == unit { *entry = (unit, state, job); } }
+                assert!(!units_down(&UNITS, listed.into_iter()).unwrap(), "{unit} {state} {job}");
+            }
+        }
+        // Uncertain replies refuse: a foreign name, a duplicate, too many entries.
+        assert!(units_down(&UNITS, [("duduclaw-spawnd.service", "inactive", 0)].into_iter()).is_err());
+        assert!(units_down(&UNITS, [(UNITS[1], "inactive", 0), (UNITS[1], "inactive", 0)].into_iter()).is_err());
+        let mut long = all("inactive", 0); long.push((UNITS[0], "inactive", 0));
+        assert!(units_down(&UNITS, long.into_iter()).is_err());
     }
     #[test]
     fn fixed_unit_policy_includes_r7_chown_and_resource_hard_limits() {

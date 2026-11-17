@@ -22,3 +22,6 @@ pub mod seccomp;
 
 #[cfg(target_os = "linux")]
 pub mod controller;
+
+/// R6 update readback endpoint (`/run/duduclaw-egress-update/readback.sock`).
+pub mod update_readback;

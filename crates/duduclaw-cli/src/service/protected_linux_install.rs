@@ -773,7 +773,12 @@ mod spawnd_install_tests {
         let service = lookup("duduclaw-spawnd.service");
         assert!(service.lines().any(|line| line == format!("ExecStart={SPAWND_BINARY}")));
         assert!(service.lines().any(|line| line == "StandardOutput=null"));
-        assert!(service.lines().any(|line| line == "StandardError=null"));
+        // R6: fixed-vocabulary update status lines reach the journal.
+        assert!(service.lines().any(|line| line == "StandardError=journal"));
+        assert!(!service.lines().any(|line| line == "StandardError=null"));
+        let ready = lookup("duduclaw-isolation-ready.service");
+        assert!(ready.lines().any(|line| line == format!("ExecStart={SPAWND_BINARY} wait-consistent")));
+        assert!(lookup("duduclaw-egress.service").contains(duduclaw_isolation::ids::ISOLATED_GATEWAY_UNIT_DEPENDENCIES));
         assert!(service.lines().any(|line| line == "Slice=duduclaw-tcb.slice"));
         assert!(service.lines().any(|line| line == "ReadWritePaths=/var/lib/duduclaw-spawnd /var/log/duduclaw-spawnd /run/duduclaw-spawnd /etc -/var/lib/systemd/linger"));
         // HX: cgroupfs is writable only beneath the employees slice; the rest stays protected.

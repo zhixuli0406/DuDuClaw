@@ -48,6 +48,19 @@ Configuration also rejects `max_runs` times any profile's `max_tunnels` above
 1024, bounding the possible per-run tunnel bookkeeping independently of the
 active global ceiling.
 
+## Update readback endpoint (v1.83 R6)
+
+Before installing seccomp, the host service hashes its running image
+(`/proc/self/exe`) and binds `/run/duduclaw-egress-update/readback.sock` beneath
+verified descriptors (root-owned `/run`; the unit's `RuntimeDirectory=` leaf,
+owned by `duduclaw-egress`, mode 0750, bind-mounted through
+`TemporaryFileSystem=/run:ro`). Only a uid 0 / gid 0 peer is answered: one
+`Readback{generation}` frame in, one `{target: egress, artifact_id, product,
+version, protocol, build_sha256, effective_uid, ready}` record out; no ancillary
+data, unknown fields refused, 5 s per exchange. `ready` is true only after the
+startup checks and seccomp, and only when every field was computed. Without the
+endpoint egress still runs; the updater's readback then fails closed.
+
 ## License
 
 Apache-2.0, as declared by the workspace.

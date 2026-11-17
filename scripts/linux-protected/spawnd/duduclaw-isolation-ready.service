@@ -1,0 +1,69 @@
+[Unit]
+Description=DuDuClaw isolated component set verified consistent
+# R6: spawnd's READY=1 only means its root update endpoint is bound. This unit
+# completes only once the live spawnd reports that the installed set verified
+# consistent at its start and that it opened admission (status file owned by
+# that spawnd process: this boot, its MainPID and its systemd InvocationID).
+# duduclaw-gateway.service (isolated install) and duduclaw-egress.service carry
+# BindsTo=/After= on it: on an inconsistent set they do not start, and
+# `systemctl status` shows this unit waiting.
+# The gate lives exactly as long as one spawnd process (not a one-shot latch):
+# - BindsTo=: stopped whenever spawnd stops or fails (crash, exit 82 after a
+#   repair, exit 83 after a fully open spawnd found its set inconsistent), and
+#   its BindsTo= dependents (egress, gateway) stop with it.
+# - PartOf=: `systemctl restart duduclaw-spawnd.service` (and spawnd's own
+#   Restart= job, which systemd enqueues as a restart) restarts it too.
+# - After=: the waiter runs only after the new spawnd's READY=1.
+# - duduclaw-spawnd.service has Wants= on this unit, so every spawnd start,
+#   manual or automatic, starts it again (a [Unit] dependency: no enable step).
+# Systemd 249 (Ubuntu 22.04) supports all four directives.
+BindsTo=duduclaw-spawnd.service
+PartOf=duduclaw-spawnd.service
+After=duduclaw-spawnd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Reads /run/duduclaw-spawnd/update-status.json (root 0600) and asks PID 1
+# (system bus, read-only properties) for duduclaw-spawnd.service's MainPID and
+# InvocationID; no /proc/<pid> access, no capability. Never exits 0 on a
+# missing, unreadable, stale or inconsistent status. Exits non-zero at once on
+# a host that is not on the unified cgroup v2 hierarchy (S1 HostPreflight
+# requires it).
+ExecStart=/usr/lib/duduclaw/duduclaw-spawnd wait-consistent
+# The only unit without a start timeout: it waits until the set is repaired.
+TimeoutStartSec=infinity
+User=root
+Group=root
+Slice=duduclaw-tcb.slice
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+IPAddressDeny=any
+# AF_UNIX: the system bus socket (a path socket, unaffected by PrivateNetwork=).
+RestrictAddressFamilies=AF_UNIX
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+UMask=0077
+LimitCORE=0
+LimitNOFILE=64
+# The D-Bus client runs its executor and reactor on two extra threads.
+TasksMax=8
+MemoryMax=32M
+StandardOutput=null
+StandardError=journal

@@ -37,6 +37,7 @@ pub(super) const DIRECTORIES: &[(&str, u32)] = &[
 pub(super) const UNITS: &[(&str, &str)] = &[
     ("duduclaw-spawnd.service", include_str!("../../../../scripts/linux-protected/spawnd/duduclaw-spawnd.service")),
     ("duduclaw-spawnd.socket", include_str!("../../../../scripts/linux-protected/spawnd/duduclaw-spawnd.socket")),
+    ("duduclaw-isolation-ready.service", include_str!("../../../../scripts/linux-protected/spawnd/duduclaw-isolation-ready.service")),
     ("duduclaw.slice", include_str!("../../../../scripts/linux-protected/spawnd/duduclaw.slice")),
     ("duduclaw-tcb.slice", include_str!("../../../../scripts/linux-protected/spawnd/duduclaw-tcb.slice")),
     ("duduclaw-employees.slice", include_str!("../../../../scripts/linux-protected/spawnd/duduclaw-employees.slice")),

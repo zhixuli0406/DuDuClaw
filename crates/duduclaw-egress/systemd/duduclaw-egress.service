@@ -2,6 +2,14 @@
 Description=DuDuClaw public IP egress
 Requires=duduclaw-egress.socket
 After=duduclaw-egress.socket
+# R6: start only once spawnd reports the installed set verified consistent
+# (/opt/duduclaw/bin/duduclaw-egress is one of its eight components). Not on
+# spawnd itself: its READY=1 only means its update endpoint is bound.
+# BindsTo=, not Requires=: the gate drops with every spawnd stop, crash or
+# restart and when a fully open spawnd finds its set inconsistent, and egress
+# must stop with it (it comes back through its socket, after the gate).
+BindsTo=duduclaw-isolation-ready.service
+After=duduclaw-isolation-ready.service
 
 [Service]
 Slice=duduclaw-tcb.slice
@@ -50,3 +58,8 @@ IPAddressAllow=192.0.0.9/32 192.0.0.10/32 2001:1::1/128 2001:1::2/128 2001:1::3/
 # root-owned drop-in; never add a resolver IP exception to this service.
 TemporaryFileSystem=/run:ro
 BindReadOnlyPaths=/run/duduclaw-egress /run/systemd/resolve/io.systemd.Resolve
+# R6 update readback endpoint (root peers only): a service-owned 0750 leaf of
+# root-owned /run, as duduclaw-updated's client requires.
+RuntimeDirectory=duduclaw-egress-update
+RuntimeDirectoryMode=0750
+BindPaths=/run/duduclaw-egress-update
