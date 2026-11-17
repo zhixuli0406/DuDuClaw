@@ -674,6 +674,15 @@ impl SpawnRequest {
         }
         Ok(())
     }
+    /// [`Self::validate`] as one closed, auditable caller code: a step limit
+    /// outside `1..=MAX_REQUESTED_MAX_TURNS` is `StepLimitDenied`, any other
+    /// refusal `InvalidRequest`. Never carries the refused value.
+    pub fn validation_code(&self) -> Result<(), ErrorCode> {
+        if let Self::StartRun { requested_max_turns: Some(value), .. } = self {
+            if *value == 0 || *value > MAX_REQUESTED_MAX_TURNS { return Err(ErrorCode::StepLimitDenied); }
+        }
+        self.validate().map_err(|_| ErrorCode::InvalidRequest)
+    }
 }
 
 /// Caller-safe errors; diagnostic detail goes only to bounded root logs (§4.4).
@@ -698,11 +707,17 @@ impl SpawnRequest {
 ///   recording-slot `HelperCall` while this host's recording probe has not
 ///   passed (or the build kill switch is closed). spawnd refuses it itself;
 ///   the gateway's feature check is no longer the only gate.
+///
+/// R6 addition (review round, finding 4):
+/// - `StepLimitDenied`: `StartRun.requested_max_turns` outside
+///   `1..=MAX_REQUESTED_MAX_TURNS` (see [`SpawnRequest::validation_code`]).
+///   Only a gateway that sends the field can receive it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode { UnsupportedVersion, InvalidRequest, Unauthorized, InvalidFds, QueueFull, QueueExpired, NotFound, NotReady, AlreadyTaken, WouldDeadlock, RuntimeDenied, ResourceLimit, IsolationUnavailable, Internal,
     WorkFileNotFound, WorkFileRefused, WorkFileTooLarge, WorkspaceBrokerUnavailable,
-    HelperBusy, HelperUnavailable, RunTimeExhausted, HelperCgroupUnavailable, HelperRecordingUnsupported }
+    HelperBusy, HelperUnavailable, RunTimeExhausted, HelperCgroupUnavailable, HelperRecordingUnsupported,
+    StepLimitDenied }
 
 /// Queue priority is host-derived from verified task context (§4.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -835,9 +850,22 @@ mod tests {
         let envelope = Envelope { version: 1, request_id: RequestId([2; 16]), message: request.clone() };
         assert_eq!(decode::<SpawnRequest>(&encode(&envelope).unwrap()).unwrap(), envelope);
         assert_eq!(request.fd_plan().unwrap(), vec![FdRole::PromptSealed]);
+        assert_eq!(request.validation_code(), Ok(()));
         for value in [0u16, MAX_REQUESTED_MAX_TURNS + 1, u16::MAX] {
             if let SpawnRequest::StartRun { requested_max_turns, .. } = &mut request { *requested_max_turns = Some(value); }
             assert!(request.validate().is_err(), "{value}");
+            // Review round, finding 4: one closed, auditable code for it.
+            assert_eq!(request.validation_code(), Err(ErrorCode::StepLimitDenied), "{value}");
+        }
+        assert_eq!(serde_json::to_value(ErrorCode::StepLimitDenied).unwrap(), "step_limit_denied");
+        assert!(!HX_RESERVED_ERROR_CODES.contains(&"step_limit_denied"));
+        // Any other refusal keeps the generic code.
+        let mut other = start();
+        if let SpawnRequest::StartRun { prompt_bytes, .. } = &mut other { *prompt_bytes = MAX_PROMPT_BYTES + 1; }
+        assert_eq!(other.validation_code(), Err(ErrorCode::InvalidRequest));
+        for value in [1u16, MAX_REQUESTED_MAX_TURNS] {
+            if let SpawnRequest::StartRun { requested_max_turns, .. } = &mut request { *requested_max_turns = Some(value); }
+            assert_eq!(request.validation_code(), Ok(()), "{value}");
         }
         for value in [serde_json::json!(-1), serde_json::json!(70000), serde_json::json!("50"), serde_json::json!(1.5)] {
             let mut raw = serde_json::to_value(start()).unwrap();

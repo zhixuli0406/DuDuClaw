@@ -500,6 +500,32 @@ fn update_drain_barrier_refuses_new_starts_and_keeps_admitted_runs() {
 }
 
 #[test]
+fn update_drain_barrier_validation_wins_before_not_ready() {
+    let barrier = DrainBarrier::default();
+    let mut c = Coordinator::new(FakeHost::default(), Limits::default()).unwrap();
+    c.set_drain_barrier(barrier.clone());
+    c.reserve(conn(), employee(1), run(1), 100).unwrap();
+    assert!(barrier.close(DrainClosure::Unreadable).is_some());
+    let valid = request(1, 1, RuntimeKind::Codex);
+    assert_eq!(c.start(conn(), valid.clone(), (), 100), Err(ErrorCode::NotReady));
+    for value in [0, duduclaw_isolation::ipc::MAX_REQUESTED_MAX_TURNS + 1] {
+        let mut invalid = valid.clone();
+        if let SpawnRequest::StartRun { requested_max_turns, .. } = &mut invalid {
+            *requested_max_turns = Some(value);
+        }
+        assert_eq!(c.start(conn(), invalid, (), 100), Err(ErrorCode::StepLimitDenied));
+    }
+    let mut invalid = valid;
+    if let SpawnRequest::StartRun { prompt_bytes, .. } = &mut invalid {
+        *prompt_bytes = duduclaw_isolation::ipc::MAX_PROMPT_BYTES + 1;
+    }
+    assert_eq!(c.start(conn(), invalid, (), 100), Err(ErrorCode::InvalidRequest));
+    assert!(matches!(c.status(run(1), conn()).unwrap(), RunStatus::Reserved { .. }));
+    assert_eq!(c.admitted_runs(), 0);
+    assert!(c.host.starts.is_empty());
+}
+
+#[test]
 fn update_drain_barrier_unreadable_closure_and_bounded_observation() {
     use duduclaw_isolation::ids::Sha256Digest;
     use std::time::{Duration, Instant};

@@ -567,9 +567,11 @@ impl<H: Host> Coordinator<H> {
     pub fn start(&mut self, connection: ControlConnectionId, request: SpawnRequest, inputs: H::Inputs,
         now: u64) -> Result<SpawnResponse> {
         self.time(now)?;
-        // R6: a closed update barrier refuses every new run; queued ones stay.
+        // R6 review round, finding 4: a step limit outside the wire bound is
+        // the closed `StepLimitDenied`; every other refusal `InvalidRequest`.
+        request.validation_code()?;
+        // R6: validation wins over the closed update barrier; queued runs stay.
         if self.drain.as_ref().is_some_and(DrainBarrier::is_closed) { return Err(ErrorCode::NotReady); }
-        request.validate().map_err(|_| ErrorCode::InvalidRequest)?;
         let SpawnRequest::StartRun { run, employee_id, ref runtime_request, prompt_bytes, ref input_fds, pty, .. } = request
             else { return Err(ErrorCode::InvalidRequest); };
         let entry = self.owned(run, connection)?;

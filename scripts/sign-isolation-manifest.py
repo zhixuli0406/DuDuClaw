@@ -13,6 +13,7 @@ import re
 import stat
 import subprocess
 import tempfile
+import unicodedata
 
 NAMESPACES = {
     "root": "duduclaw-root-metadata-v1@dudustudio",
@@ -87,6 +88,15 @@ TURN_LIMIT_CEILING = 1000
 # Working default for a v3 template: PENDING OWNER DECISION Q12 (min 1, default 50, max 200).
 TURN_LIMIT_WORKING_DEFAULT = {"min": 1, "default": 50, "max": 200}
 CLAUDE_MCP_SUFFIX = ["--strict-mcp-config", "--mcp-config", "/config/mcp.json"]
+# The canonical signed Claude MCP shape (spawnd `policy::validate_claude_arguments`,
+# `gateway_plan::claude_arguments`): this prefix, then `--max-turns 50` only
+# without a range, then optionally `--model <m>`, then the fixed MCP suffix.
+CLAUDE_FIXED_PREFIX = ["-p", "--input-format", "text", "--output-format", "stream-json", "--verbose",
+                       "--system-prompt-file", "/proc/self/fd/5", "--tools", "", "--allowedTools", "mcp__duduclaw__*"]
+# Options of that shape which consume the next element (spawnd `CLAUDE_VALUE_OPTIONS`).
+CLAUDE_VALUE_OPTIONS = {"--input-format", "--output-format", "--system-prompt-file", "--tools",
+                        "--allowedTools", "--max-turns", "--model", "--mcp-config"}
+LEGACY_FIXED_MAX_TURNS = "50"
 HELPER_BINDING_KEYS = {"profile", "slot", "seccomp", "seccomp_digest", "self_only", "memory_bytes", "tasks",
                        "cpu_quota_percent", "open_files", "file_size_bytes", "timeout_ms", "filesystem", "egress"}
 HELPER_FS = {"work", "work_recordings", "system_ro"}
@@ -97,29 +107,65 @@ def _integer(value, low, high):
     return isinstance(value, int) and not isinstance(value, bool) and low <= value <= high
 
 
-def validate_turn_limit(runtime, version):
-    """Policy v3 `turn_limit` of one runtime record (spawnd re-checks all of it).
+def _plain_model(model):
+    return (isinstance(model, str) and model != "" and len(model.encode("utf-8")) <= 256
+            and not model.startswith("-") and model.strip() == model
+            and not any(unicodedata.category(char) == "Cc" for char in model))
 
-    Absent: the record keeps its signed arguments (v1/v2 Claude: fixed 50).
-    Present (v3 only): a Claude MCP record whose arguments carry no
-    `--max-turns` and end with the fixed MCP suffix; any invalid value makes
-    the whole policy invalid.
+
+def validate_claude_arguments(arguments, ranged):
+    """Signed arguments of a Claude MCP record, in every policy version.
+
+    Without a range: exactly prefix + `--max-turns 50` + [`--model m`] + suffix.
+    With a range (v3): prefix + [`--model m`] + suffix and no `--max-turns` in
+    any spelling; spawnd inserts `--max-turns <n>` right before the suffix, so
+    no bare `--` may precede it and it must not follow a value-taking option.
     """
-    if not isinstance(runtime, dict) or "turn_limit" not in runtime:
+    suffix = len(CLAUDE_MCP_SUFFIX)
+    if not isinstance(arguments, list) or not all(isinstance(arg, str) for arg in arguments) \
+            or len(arguments) < suffix or arguments[-suffix:] != CLAUDE_MCP_SUFFIX:
+        raise ValueError("Claude MCP arguments must end with the fixed MCP suffix")
+    head = arguments[:-suffix]
+    if "--" in head or not head or head[-1] in CLAUDE_VALUE_OPTIONS:
+        raise ValueError("the --max-turns insertion point must stay in the CLI option area")
+    if sum(arg.startswith("--max-turns") for arg in arguments) != (0 if ranged else 1):
+        raise ValueError("a Claude MCP record needs exactly one of turn_limit or the fixed --max-turns 50")
+    rest = head[len(CLAUDE_FIXED_PREFIX):]
+    if head[:len(CLAUDE_FIXED_PREFIX)] != CLAUDE_FIXED_PREFIX:
+        raise ValueError("Claude MCP arguments are not the canonical shape")
+    if not ranged:
+        if rest[:2] != ["--max-turns", LEGACY_FIXED_MAX_TURNS]:
+            raise ValueError("the fixed step limit is exactly --max-turns 50 after the input protocol")
+        rest = rest[2:]
+    if rest and not (len(rest) == 2 and rest[0] == "--model" and _plain_model(rest[1])):
+        raise ValueError("Claude MCP arguments are not the canonical shape")
+
+
+def validate_turn_limit(runtime, version):
+    """Step limit of one runtime record (spawnd re-checks all of it).
+
+    Every Claude MCP record, in every version, has exactly one enforceable
+    step limit: absent `turn_limit` with the canonical fixed `--max-turns 50`,
+    or (v3 only) a valid `turn_limit` object with no `--max-turns` at all.
+    The key is refused before v3 and as an explicit null; any invalid value
+    makes the whole policy invalid.
+    """
+    if not isinstance(runtime, dict):
         return
-    limit = runtime["turn_limit"]
-    if version < 3:
-        raise ValueError("turn_limit requires policy v3")
-    if not isinstance(limit, dict) or set(limit) != TURN_LIMIT_KEYS \
-            or not all(_integer(limit[key], 1, TURN_LIMIT_CEILING) for key in TURN_LIMIT_KEYS) \
-            or not limit["min"] <= limit["default"] <= limit["max"]:
-        raise ValueError("turn_limit must satisfy 1 <= min <= default <= max <= 1000")
-    arguments = runtime.get("fixed_args")
-    if runtime.get("runtime") != {"kind": "claude"} or runtime.get("mcp") is not True \
-            or not isinstance(arguments, list) or arguments[-len(CLAUDE_MCP_SUFFIX):] != CLAUDE_MCP_SUFFIX \
-            or any(not isinstance(arg, str) or arg == "--max-turns" or arg.startswith("--max-turns=")
-                   for arg in arguments):
-        raise ValueError("turn_limit requires a Claude MCP record without a fixed --max-turns")
+    claude_mcp = runtime.get("runtime") == {"kind": "claude"} and runtime.get("mcp") is True
+    ranged = "turn_limit" in runtime
+    if ranged:
+        limit = runtime["turn_limit"]
+        if version < 3:
+            raise ValueError("turn_limit requires policy v3")
+        if not isinstance(limit, dict) or set(limit) != TURN_LIMIT_KEYS \
+                or not all(_integer(limit[key], 1, TURN_LIMIT_CEILING) for key in TURN_LIMIT_KEYS) \
+                or not limit["min"] <= limit["default"] <= limit["max"]:
+            raise ValueError("turn_limit must satisfy 1 <= min <= default <= max <= 1000")
+        if not claude_mcp:
+            raise ValueError("turn_limit requires a Claude MCP record")
+    if claude_mcp:
+        validate_claude_arguments(runtime.get("fixed_args"), ranged)
 
 
 def validate_policy_document(document):
