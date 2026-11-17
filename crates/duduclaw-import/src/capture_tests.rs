@@ -244,7 +244,7 @@ mod filesystem {
                     (dir, names)
                 }).collect::<Vec<_>>();
             let file = fs::File::open(path.join("tasks.db")).unwrap();
-            let copy = PrivateCopy::new(&file, &path).unwrap();
+            let copy = PrivateCopy::new(&file, &path, file.metadata().unwrap().len()).unwrap();
             assert_eq!(listing(&path), before);
             #[cfg(target_os = "linux")]
             {

@@ -229,9 +229,10 @@ Run as root or as the home's owner: Linux requires `O_NOATIME` for source and
 sidecar opens; an `EPERM` refusal produces `refused_noatime`, with no retry that
 could update access times. Linux copies bytes only into an anonymous memfd,
 then applies `F_SEAL_SHRINK|F_SEAL_GROW|F_SEAL_WRITE|F_SEAL_SEAL`. SQLite opens
-`/proc/self/fd/<n>` read-only with `mode=ro&immutable=1`; a capture-only VFS
-preserves this generated path instead of resolving the procfs magic link, and
-provides only sealed read-only descriptor I/O (no file creation, WAL or mmap).
+`/proc/self/fd/<n>` through SQLite's default VFS with `mode=ro&immutable=1`.
+The memfd is sealed against writes and size changes; immutable read-only access
+prevents SQLite from creating files or using WAL, and temporary storage is kept
+in memory.
 No named copy is created on Linux, including on failures or process termination.
 The non-Linux Unix development/test fallback ignores `TMPDIR`: it creates a
 0700 directory under the fixed, verified root-owned `/tmp` (canonicalized on

@@ -115,20 +115,21 @@ fn capture_with_hook(home: &Path, creating_version: &str, after_copy: impl Fn(St
         };
         // SQLite never receives a descriptor/path into the customer's home.
         let result = (|| -> Result<StoreReport> {
-            let copy = PrivateCopy::new(&file, home)?;
+            let copy = PrivateCopy::new(&file, home, metadata.len())?;
+            let inspected = (|| -> Result<StoreReport> {
             after_copy(store);
             if snapshot(home, &directory, store).ok().as_ref() != Some(&before)
                 || identity(&file.metadata()?) != before.store { return Err(Error::Io); }
-            let mut conn = copy.open()?;
-            let inspected = (|| -> Result<StoreReport> {
-                conn.execute_batch("PRAGMA temp_store=MEMORY;")?;
-                sqlite::harden(&mut conn)?;
+                let mut conn = copy.open()?;
+                let inspected = (|| -> Result<StoreReport> {
+                    conn.execute_batch("PRAGMA temp_store=MEMORY;")?;
+                    sqlite::harden(&mut conn)?;
                 // Match the existing authority readers: the task authority trigger
                 // covers more than 32 fields; workflow also needs this fixed bound.
-                if matches!(store, Store::Tasks | Store::Workflow) {
-                    conn.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_EXPR_DEPTH, 128)?;
-                }
-                conn.authorizer(Some(|c: AuthContext<'_>| {
+                    if matches!(store, Store::Tasks | Store::Workflow) {
+                        conn.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_EXPR_DEPTH, 128)?;
+                    }
+                    conn.authorizer(Some(|c: AuthContext<'_>| {
                     if c.accessor.is_some() { return Authorization::Deny; }
                     match c.action {
                         AuthAction::Select => Authorization::Allow,
@@ -139,11 +140,15 @@ fn capture_with_hook(home: &Path, creating_version: &str, after_copy: impl Fn(St
                             if ["date", "time", "datetime", "julianday", "unixepoch", "strftime", "timediff"].iter().any(|n| function_name.eq_ignore_ascii_case(n)) => Authorization::Allow,
                         _ => Authorization::Deny,
                     }
-                }))?;
-                inspect(&conn, store)
+                    }))?;
+                    inspect(&conn, store)
+                })();
+                let closed = copy.close(conn);
+                closed?;
+                inspected
             })();
-            // Close and recheck the held descriptor even when inspection failed.
-            copy.close(conn)?;
+            let removed = copy.remove();
+            removed?;
             let found = inspected?;
             if snapshot(home, &directory, store).ok().as_ref() != Some(&before)
                 || identity(&file.metadata()?) != before.store { return Err(Error::Io); }
@@ -235,10 +240,10 @@ struct PrivateCopy {
 }
 #[cfg(unix)]
 impl PrivateCopy {
-    fn new(input: impl std::io::Read, _home: &Path) -> Result<Self> {
+    fn new(input: impl std::io::Read, _home: &Path, expected_bytes: u64) -> Result<Self> {
         #[cfg(target_os = "linux")]
         {
-            let (file, copied_bytes) = memfd::copy(input)?;
+            let (file, copied_bytes) = memfd::copy(input, expected_bytes)?;
             Ok(Self { file, copied_bytes })
         }
         #[cfg(not(target_os = "linux"))]
@@ -253,10 +258,19 @@ impl PrivateCopy {
                 || root.starts_with(&home) { return Err(Error::Isolation); }
             let directory = tempfile::Builder::new().prefix("duduclaw-capture-")
                 .permissions(std::fs::Permissions::from_mode(0o700)).tempdir_in(&root)?;
-            let path = directory.path();
-            if path.starts_with(&home) || home.starts_with(path)
-                || std::fs::metadata(path)?.mode() & 0o777 != 0o700 { return Err(Error::Isolation); }
-            sqlite::copy_bounded(input, &path.join("source.db"))?;
+            let copied = (|| -> Result<()> {
+                let path = directory.path();
+                if path.starts_with(&home) || home.starts_with(path)
+                    || std::fs::metadata(path)?.mode() & 0o777 != 0o700 { return Err(Error::Isolation); }
+                let source = path.join("source.db");
+                sqlite::copy_bounded(input, &source)?;
+                if std::fs::metadata(source)?.len() != expected_bytes { return Err(Error::Io); }
+                Ok(())
+            })();
+            if let Err(error) = copied {
+                directory.close().map_err(|_| Error::Isolation)?;
+                return Err(error);
+            }
             Ok(Self { directory })
         }
     }
@@ -284,6 +298,11 @@ impl PrivateCopy {
         let closed = conn.close().map_err(|(_, error)| error);
         self.verify()?;
         closed?;
+        Ok(())
+    }
+    fn remove(self) -> Result<()> {
+        #[cfg(not(target_os = "linux"))]
+        self.directory.close().map_err(|_| Error::Isolation)?;
         Ok(())
     }
     fn path(&self) -> std::path::PathBuf {
