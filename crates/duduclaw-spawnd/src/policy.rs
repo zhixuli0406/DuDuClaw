@@ -96,19 +96,65 @@ pub fn narrowed_request(limit: TurnLimit, entitlement: Option<u16>, desired: u64
     u16::try_from(desired).unwrap_or(u16::MAX).min(entitlement.unwrap_or(limit.max)).min(limit.max)
 }
 
-/// A ranged record is a Claude MCP runtime whose signed arguments carry no
-/// `--max-turns` and end with the fixed MCP suffix that spawnd inserts before.
-pub fn validate_turn_limit(runtime: &PublishedRuntime) -> Result<()> {
-    let Some(limit) = runtime.turn_limit else { return Ok(()); };
-    limit.validate()?;
-    let tail = duduclaw_mcp_boundary::config::claude_mcp_arguments();
-    let arguments: Vec<&str> = runtime.fixed_args.iter().map(|arg| arg.as_str()).collect();
-    let tail: Vec<&str> = tail.iter().map(String::as_str).collect();
-    if runtime.runtime != RuntimeKind::Claude || !runtime.mcp || !arguments.ends_with(&tail)
-        || arguments.iter().any(|arg| *arg == "--max-turns" || arg.starts_with("--max-turns=")) {
+/// The fixed input-protocol head of every signed Claude MCP record (the
+/// `gateway_plan::claude_arguments` shape). Only `--max-turns 50` (v1/v2, no
+/// range), `--model <m>` (optional) and the fixed MCP suffix may follow it.
+pub const CLAUDE_FIXED_PREFIX: [&str; 12] = ["-p", "--input-format", "text", "--output-format", "stream-json",
+    "--verbose", "--system-prompt-file", "/proc/self/fd/5", "--tools", "", "--allowedTools", "mcp__duduclaw__*"];
+/// Every option of the canonical signed Claude shape that consumes the next
+/// element as its value (derived from that shape; pinned by
+/// `claude_value_options_are_exactly_those_of_the_canonical_shape`). spawnd's
+/// `--max-turns <n>` insertion point must never follow one of them.
+pub const CLAUDE_VALUE_OPTIONS: [&str; 8] = ["--input-format", "--output-format", "--system-prompt-file",
+    "--tools", "--allowedTools", "--max-turns", "--model", "--mcp-config"];
+
+/// R6 review round, findings 1 and 2: the signed arguments of a Claude MCP
+/// record, in every policy version, are exactly one of
+/// - no range: `CLAUDE_FIXED_PREFIX ++ [--max-turns, 50] ++ [--model, m]? ++ MCP suffix`
+///   (the v1/v2 shape; the only `--max-turns`, canonical spelling and position);
+/// - range (v3): `CLAUDE_FIXED_PREFIX ++ [--model, m]? ++ MCP suffix`, with no
+///   `--max-turns` in any spelling; spawnd inserts `--max-turns <n>` right
+///   before the suffix, i.e. after `mcp__duduclaw__*` or the model value.
+///
+/// No bare `--` may precede the suffix, the element before the insertion point
+/// must not be a value-taking option, and `m` must be a plain value (not empty,
+/// no leading `-`). Anything else invalidates the whole policy.
+pub fn validate_claude_arguments(arguments: &[&str], ranged: bool) -> Result<()> {
+    let suffix = duduclaw_mcp_boundary::config::claude_mcp_arguments();
+    let split = arguments.len().checked_sub(suffix.len()).ok_or(ErrorCode::RuntimeDenied)?;
+    let (head, tail) = arguments.split_at(split);
+    if tail.iter().copied().ne(suffix.iter().map(String::as_str))
+        || head.iter().any(|arg| *arg == "--")
+        || head.last().is_none_or(|arg| CLAUDE_VALUE_OPTIONS.contains(arg))
+        || !head.starts_with(&CLAUDE_FIXED_PREFIX)
+        || arguments.iter().filter(|arg| arg.starts_with("--max-turns")).count() != usize::from(!ranged) {
         return Err(ErrorCode::RuntimeDenied);
     }
-    Ok(())
+    let rest = &head[CLAUDE_FIXED_PREFIX.len()..];
+    let rest = if ranged { rest } else {
+        match rest {
+            ["--max-turns", value, rest @ ..] if *value == LEGACY_FIXED_MAX_TURNS.to_string() => rest,
+            _ => return Err(ErrorCode::RuntimeDenied),
+        }
+    };
+    match rest {
+        [] => Ok(()),
+        ["--model", model] if !model.is_empty() && model.len() <= 256 && !model.starts_with('-')
+            && !model.chars().any(char::is_control) && model.trim() == *model => Ok(()),
+        _ => Err(ErrorCode::RuntimeDenied),
+    }
+}
+
+/// The signed step rule of one runtime record. A range needs a Claude MCP
+/// record; every Claude MCP record (any policy version) must have exactly the
+/// argument shape [`validate_claude_arguments`] allows for its range or lack of one.
+pub fn validate_turn_limit(runtime: &PublishedRuntime) -> Result<()> {
+    if let Some(limit) = runtime.turn_limit { limit.validate()?; }
+    if runtime.runtime != RuntimeKind::Claude || !runtime.mcp {
+        return if runtime.turn_limit.is_none() { Ok(()) } else { Err(ErrorCode::RuntimeDenied) };
+    }
+    let arguments: Vec<&str> = runtime.fixed_args.iter().map(|arg| arg.as_str()).collect();
+    validate_claude_arguments(&arguments, runtime.turn_limit.is_some())
 }
 
 /// One row of a run's helper table. `index` is the launcher `Start.helper` byte.
@@ -275,16 +321,132 @@ mod tests {
         assert!(policy.derive(employee, &RuntimeKind::Codex, false).is_err());
     }
 
-    /// A v3-shaped Claude record: signed arguments without `--max-turns`,
-    /// ending with the fixed MCP suffix.
+    /// A v3-shaped Claude record: the canonical signed arguments without
+    /// `--max-turns`, ending with the fixed MCP suffix.
     fn ranged_claude(limit: TurnLimit) -> PublishedRuntime {
         let mut claude = runtime(7);
         claude.runtime = RuntimeKind::Claude;
-        claude.fixed_args = ["-p", "--allowedTools", "mcp__duduclaw__*"].into_iter().map(str::to_owned)
-            .chain(duduclaw_mcp_boundary::config::claude_mcp_arguments())
-            .map(|arg| Text::new(arg).unwrap()).collect();
+        claude.fixed_args = texts(crate::gateway_plan::claude_ranged_arguments("model").unwrap());
         claude.turn_limit = Some(limit);
         claude
+    }
+    fn texts(arguments: Vec<String>) -> Vec<Text<4096>> { arguments.into_iter().map(|arg| Text::new(arg).unwrap()).collect() }
+    /// A v1/v2-shaped Claude record: the canonical fixed `--max-turns 50`, no range.
+    fn legacy_claude() -> PublishedRuntime {
+        let mut claude = ranged_claude(WORKING_DEFAULT_TURN_LIMIT);
+        claude.fixed_args = texts(crate::gateway_plan::claude_arguments("model").unwrap());
+        claude.turn_limit = None;
+        claude
+    }
+    /// The whole publication, with a second valid (Codex) record that cannot rescue it.
+    fn publishes(claude: PublishedRuntime) -> bool {
+        let other = runtime(3);
+        let profiles = vec![claude.profile, other.profile];
+        RootPolicy::from_verified_publication(vec![claude, other], vec![EmployeeEntitlement {
+            employee: EmployeeId([1; 16]), profiles, max_turns: None }]).is_ok()
+    }
+    fn with_args(mut claude: PublishedRuntime, arguments: &[&str]) -> PublishedRuntime {
+        claude.fixed_args = texts(arguments.iter().map(|arg| (*arg).to_owned()).collect());
+        claude
+    }
+    #[test]
+    fn claude_mcp_record_needs_exactly_one_of_range_or_canonical_fixed_fifty() {
+        assert_eq!(LEGACY_FIXED_MAX_TURNS, 50);
+        let legacy: Vec<String> = crate::gateway_plan::claude_arguments("model").unwrap();
+        let legacy: Vec<&str> = legacy.iter().map(String::as_str).collect();
+        let ranged: Vec<String> = crate::gateway_plan::claude_ranged_arguments("model").unwrap();
+        let ranged: Vec<&str> = ranged.iter().map(String::as_str).collect();
+        // The two canonical shapes (with and without `--model`) are accepted.
+        assert!(publishes(legacy_claude()));
+        assert!(publishes(ranged_claude(WORKING_DEFAULT_TURN_LIMIT)));
+        let no_model = crate::gateway_plan::claude_arguments("").unwrap();
+        assert!(publishes(with_args(legacy_claude(), &no_model.iter().map(String::as_str).collect::<Vec<_>>())));
+        let no_model = crate::gateway_plan::claude_ranged_arguments("").unwrap();
+        assert!(publishes(with_args(ranged_claude(WORKING_DEFAULT_TURN_LIMIT), &no_model.iter().map(String::as_str).collect::<Vec<_>>())));
+        // Neither a range nor the fixed flag: root would launch Claude without
+        // any step limit. The whole policy is refused.
+        assert!(!publishes(with_args(legacy_claude(), &ranged)));
+        // Both a range and the fixed flag.
+        assert!(!publishes(with_args(ranged_claude(WORKING_DEFAULT_TURN_LIMIT), &legacy)));
+        // The fixed flag with another value, duplicated, in `=` spelling or
+        // moved from its canonical position.
+        let position = legacy.iter().position(|arg| *arg == "--max-turns").unwrap();
+        assert_eq!(position, CLAUDE_FIXED_PREFIX.len());
+        for value in ["49", "51", "500", "050", "+50", "50 ", "", "0"] {
+            let mut bad = legacy.clone(); bad[position + 1] = value;
+            assert!(!publishes(with_args(legacy_claude(), &bad)), "{value:?}");
+        }
+        let mut bad = legacy.clone(); bad.insert(position, "50"); bad.insert(position, "--max-turns");
+        assert!(!publishes(with_args(legacy_claude(), &bad)), "duplicated");
+        let mut bad = legacy.clone(); bad.insert(position + 2, "--max-turns=50");
+        assert!(!publishes(with_args(legacy_claude(), &bad)), "duplicated in = spelling");
+        let mut bad = legacy.clone(); bad[position] = "--max-turns=50"; bad.remove(position + 1);
+        assert!(!publishes(with_args(legacy_claude(), &bad)), "= spelling");
+        let mut bad = legacy.clone(); bad.remove(position); bad.remove(position);
+        bad.insert(position + 2, "50"); bad.insert(position + 2, "--max-turns");
+        assert_eq!(bad[position..position + 4], ["--model", "model", "--max-turns", "50"]);
+        assert!(!publishes(with_args(legacy_claude(), &bad)), "moved");
+        // A ranged record carries no `--max-turns` in any spelling.
+        for smuggled in ["--max-turns=50", "--max-turns"] {
+            let mut bad = ranged.clone(); bad.insert(CLAUDE_FIXED_PREFIX.len(), smuggled);
+            assert!(!publishes(with_args(ranged_claude(WORKING_DEFAULT_TURN_LIMIT), &bad)), "{smuggled}");
+        }
+        // Any other extra or missing element is not the canonical shape.
+        let mut bad = legacy.clone(); bad.insert(1, "--resume");
+        assert!(!publishes(with_args(legacy_claude(), &bad)));
+        let mut bad = ranged.clone(); bad.remove(0);
+        assert!(!publishes(with_args(ranged_claude(WORKING_DEFAULT_TURN_LIMIT), &bad)));
+        // A non-MCP Claude record (no step limit to enforce) keeps its own rules.
+        let mut offline = legacy_claude(); offline.mcp = false; offline.fixed_args.clear();
+        assert!(publishes(offline));
+    }
+    #[test]
+    fn insertion_point_must_stay_in_the_cli_option_area() {
+        let ranged: Vec<String> = crate::gateway_plan::claude_ranged_arguments("model").unwrap();
+        let ranged: Vec<&str> = ranged.iter().map(String::as_str).collect();
+        let legacy: Vec<String> = crate::gateway_plan::claude_arguments("model").unwrap();
+        let legacy: Vec<&str> = legacy.iter().map(String::as_str).collect();
+        let split = ranged.len() - 3;
+        assert!(validate_claude_arguments(&ranged, true).is_ok());
+        assert!(validate_claude_arguments(&legacy, false).is_ok());
+        // A bare `--` anywhere before the suffix: spawnd's `--max-turns N`
+        // would become a positional argument.
+        for at in [split, split - 2, 1, 0] {
+            let mut bad = ranged.clone(); bad.insert(at, "--");
+            assert!(validate_claude_arguments(&bad, true).is_err(), "ranged at {at}");
+            assert!(!publishes(with_args(ranged_claude(WORKING_DEFAULT_TURN_LIMIT), &bad)));
+            let mut bad = legacy.clone(); bad.insert(at.min(bad.len() - 3), "--");
+            assert!(validate_claude_arguments(&bad, false).is_err(), "legacy at {at}");
+        }
+        // The insertion point right after a value-taking option: the option
+        // would consume `--max-turns` as its value.
+        let mut bad = ranged.clone(); bad.remove(split - 1);
+        assert_eq!(bad[split - 2], "--model");
+        assert!(validate_claude_arguments(&bad, true).is_err());
+        let mut bad = ranged.clone(); for _ in 0..3 { bad.remove(split - 3); }
+        assert_eq!(bad[split - 4], "--allowedTools");
+        assert!(validate_claude_arguments(&bad, true).is_err());
+        for option in CLAUDE_VALUE_OPTIONS {
+            let mut bad = ranged.clone(); bad.insert(split, option);
+            assert!(validate_claude_arguments(&bad, true).is_err(), "{option}");
+        }
+        // A model "value" that is itself an option, `--` or empty.
+        for model in ["--", "--allowedTools", "--max-turns", "-x", "", " model"] {
+            let mut bad = ranged.clone(); bad[split - 1] = model;
+            assert!(validate_claude_arguments(&bad, true).is_err(), "{model:?}");
+            let mut bad = legacy.clone(); let at = bad.len() - 4; bad[at] = model;
+            assert!(validate_claude_arguments(&bad, false).is_err(), "{model:?}");
+        }
+    }
+    #[test]
+    fn claude_value_options_are_exactly_those_of_the_canonical_shape() {
+        // An option of the canonical shape takes a value iff the next element
+        // is not itself an option.
+        let shape = crate::gateway_plan::claude_arguments("model").unwrap();
+        let derived: BTreeSet<&str> = shape.windows(2)
+            .filter(|pair| pair[0].starts_with('-') && !pair[1].starts_with('-')).map(|pair| pair[0].as_str()).collect();
+        assert_eq!(derived, CLAUDE_VALUE_OPTIONS.into_iter().collect::<BTreeSet<_>>());
+        assert_eq!(shape[..CLAUDE_FIXED_PREFIX.len()], CLAUDE_FIXED_PREFIX);
     }
     #[test]
     fn turn_limit_truth_table() {

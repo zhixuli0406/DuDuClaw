@@ -107,9 +107,7 @@ pub fn claude_ranged_arguments(model: &str) -> Result<Vec<String>, BackendError>
     if model.len() > 256 || model.chars().any(char::is_control) || model.trim() != model {
         return Err(BackendError::Denied);
     }
-    let mut args: Vec<String> = ["-p", "--input-format", "text", "--output-format", "stream-json",
-        "--verbose", "--system-prompt-file", "/proc/self/fd/5", "--tools", "", "--allowedTools", "mcp__duduclaw__*"]
-        .into_iter().map(str::to_owned).collect();
+    let mut args: Vec<String> = crate::policy::CLAUDE_FIXED_PREFIX.into_iter().map(str::to_owned).collect();
     if !model.is_empty() { args.extend(["--model".into(), model.into()]); }
     args.extend(duduclaw_mcp_boundary::config::claude_mcp_arguments());
     Ok(args)
@@ -338,10 +336,12 @@ mod tests {
         }
         assert!(claude_plan(&good, employee, ExecutionClass::EmployeeMain,
             vec![1; 2048], vec![2; 2049], "model", 50).is_err());
+        // An unsigned argument shape: root refuses the whole publication now
+        // (R6 review round), so no plan can be derived from it at all.
         let mut changed = runtime;
         changed.fixed_args.push(Text::new("--resume".into()).unwrap());
-        assert!(claude_plan(&policy(employee, changed), employee, ExecutionClass::EmployeeMain,
-            vec![1], vec![], "model", 50).is_err());
+        assert!(RootPolicy::from_verified_publication(vec![changed], vec![EmployeeEntitlement {
+            employee, profiles: vec![ProfileId(Sha256Digest([2; 32]))], max_turns: None }]).is_err());
         assert!(claude_arguments("model\n--flag").is_err());
         assert!(claude_ranged_arguments("model\n--flag").is_err());
         assert!(InstalledMainPlanFactory::new(Sha256Digest([0; 32]), 100).is_err());

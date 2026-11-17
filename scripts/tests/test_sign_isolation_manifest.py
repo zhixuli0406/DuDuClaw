@@ -80,10 +80,14 @@ class ManifestSigningTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 SIGN.validate_policy_document(document)
 
+    LEGACY = SIGN.CLAUDE_FIXED_PREFIX + ["--max-turns", "50", "--model", "model"] + SIGN.CLAUDE_MCP_SUFFIX
+    RANGED = SIGN.CLAUDE_FIXED_PREFIX + ["--model", "model"] + SIGN.CLAUDE_MCP_SUFFIX
+
     def test_policy_v3_turn_limit_shape(self):
         def claude(limit=None, args=None):
+            default = self.RANGED if limit is not None else self.LEGACY
             record = {"runtime": {"kind": "claude"}, "mcp": True,
-                      "fixed_args": args if args is not None else ["-p"] + SIGN.CLAUDE_MCP_SUFFIX}
+                      "fixed_args": list(args if args is not None else default)}
             if limit is not None:
                 record["turn_limit"] = limit
             return record
@@ -118,6 +122,71 @@ class ManifestSigningTests(unittest.TestCase):
         for document in bad:
             with self.assertRaises(ValueError):
                 SIGN.validate_policy_document(document)
+
+    def test_claude_mcp_step_limit_shape_in_every_version(self):
+        """Review round, findings 1-3: the signer refuses what spawnd refuses."""
+        codex = {"runtime": {"kind": "codex"}, "mcp": True, "fixed_args": []}
+
+        def policy(version, args, limit=None, has_limit=False):
+            record = {"runtime": {"kind": "claude"}, "mcp": True, "fixed_args": list(args)}
+            if has_limit or limit is not None:
+                record["turn_limit"] = limit
+            document = {"version": version, "runtimes": [record, dict(codex)],
+                        "native": [{"profile": [1] * 32, "tmpfs_bytes": 4096}, {"profile": [2] * 32, "tmpfs_bytes": 4096}]}
+            if version > 1:
+                document["domain"] = SIGN.POLICY_DOMAIN_V2 if version == 2 else SIGN.POLICY_DOMAIN_V3
+            return document
+
+        def refused(document):
+            with self.assertRaises(ValueError):
+                SIGN.validate_policy_document(document)
+
+        prefix, suffix, limit = SIGN.CLAUDE_FIXED_PREFIX, SIGN.CLAUDE_MCP_SUFFIX, dict(SIGN.TURN_LIMIT_WORKING_DEFAULT)
+        for version in (1, 2, 3):
+            SIGN.validate_policy_document(policy(version, self.LEGACY))
+            SIGN.validate_policy_document(policy(version, prefix + ["--max-turns", "50"] + suffix))
+            # Neither a range nor the fixed flag.
+            refused(policy(version, self.RANGED))
+            refused(policy(version, prefix + suffix))
+            # The fixed flag with another value, duplicated, in `=` spelling or moved.
+            for value in ("49", "500", "050", "+50", "", "0"):
+                refused(policy(version, prefix + ["--max-turns", value, "--model", "model"] + suffix))
+            refused(policy(version, prefix + ["--max-turns", "50", "--max-turns", "50"] + suffix))
+            refused(policy(version, prefix + ["--max-turns", "50", "--max-turns=50"] + suffix))
+            refused(policy(version, prefix + ["--max-turns=50", "--model", "model"] + suffix))
+            refused(policy(version, prefix + ["--model", "model", "--max-turns", "50"] + suffix))
+            refused(policy(version, ["--max-turns", "50"] + prefix + suffix))
+            # A bare `--` before the suffix.
+            refused(policy(version, prefix + ["--max-turns", "50", "--"] + suffix))
+            refused(policy(version, ["-p", "--"] + self.LEGACY[1:]))
+            # `turn_limit: null` is never "no range"; before v3 the key itself is refused.
+            refused(policy(version, self.LEGACY, has_limit=True))
+        for version in (1, 2):
+            refused(policy(version, self.RANGED, limit))
+        SIGN.validate_policy_document(policy(3, self.RANGED, limit))
+        SIGN.validate_policy_document(policy(3, prefix + suffix, limit))
+        # Both a range and the fixed flag.
+        refused(policy(3, self.LEGACY, limit))
+        for smuggled in ("--max-turns", "--max-turns=50"):
+            refused(policy(3, prefix + [smuggled] + suffix, limit))
+        # The insertion point after `--`, after a value-taking option or a
+        # model "value" that is an option.
+        refused(policy(3, prefix + ["--model", "model", "--"] + suffix, limit))
+        refused(policy(3, prefix + ["--model"] + suffix, limit))
+        refused(policy(3, prefix[:-1] + suffix, limit))
+        for option in sorted(SIGN.CLAUDE_VALUE_OPTIONS):
+            refused(policy(3, self.RANGED[:-3] + [option] + suffix, limit))
+        for model in ("--", "--allowedTools", "-x", "", " model", "mo\x07del"):
+            refused(policy(3, prefix + ["--model", model] + suffix, limit))
+            refused(policy(1, prefix + ["--max-turns", "50", "--model", model] + suffix))
+        # A non-MCP Claude record has no step limit to enforce.
+        SIGN.validate_policy_document(dict(policy(1, []), runtimes=[{"runtime": {"kind": "claude"}, "mcp": False,
+                                                                        "fixed_args": []}, dict(codex)]))
+
+    def test_value_options_match_the_canonical_shape(self):
+        derived = {option for option, value in zip(self.LEGACY, self.LEGACY[1:])
+                   if option.startswith("-") and not value.startswith("-")}
+        self.assertEqual(derived, SIGN.CLAUDE_VALUE_OPTIONS)
 
     @unittest.skipUnless(shutil.which("ssh-keygen"), "requires system OpenSSH")
     def test_real_ssh_keygen_round_trip_and_no_overwrite(self):

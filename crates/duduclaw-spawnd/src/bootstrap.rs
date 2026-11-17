@@ -71,6 +71,20 @@ pub struct BootstrapPlan {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_turns: Option<u16>,
 }
+/// R6 final-argv defence for a Claude MCP launch: exactly one element spelled
+/// `--max-turns…`; it is the bare flag, followed by the canonical decimal of
+/// `expected` (`1..=TURN_LIMIT_CEILING`), and no bare `--` precedes it.
+pub fn checked_step_limit(argv: &[String], expected: u16) -> Result<()> {
+    let mut flags = argv.iter().enumerate().filter(|(_, arg)| arg.starts_with("--max-turns"));
+    let (index, flag) = flags.next().ok_or(ErrorCode::RuntimeDenied)?;
+    let value = argv.get(index + 1).ok_or(ErrorCode::RuntimeDenied)?;
+    if flags.next().is_some() || flag.as_str() != "--max-turns" || expected == 0
+        || expected > crate::policy::TURN_LIMIT_CEILING || *value != expected.to_string()
+        || argv[..index].iter().any(|arg| arg.as_str() == "--") {
+        return Err(ErrorCode::RuntimeDenied);
+    }
+    Ok(())
+}
 impl BootstrapPlan {
     /// `max_turns` is the value of `RootPolicy::max_turns` for this run. It must
     /// be `None` for a record without a signed range and inside the range
@@ -87,10 +101,12 @@ impl BootstrapPlan {
                     script: script.as_str().into(), script_digest: *script_digest },
                     vec![format!("/runtime/{}", interpreter.as_str()), format!("/runtime/{}", script.as_str())]),
         };
+        // R6 review round: the signed step rule of the record (a Claude MCP
+        // record has exactly the canonical fixed-50 or ranged shape).
+        crate::policy::validate_turn_limit(runtime)?;
         match (runtime.turn_limit, max_turns) {
             (None, None) => argv.extend(runtime.fixed_args.iter().map(|arg| arg.as_str().to_owned())),
             (Some(limit), Some(value)) if limit.contains(value) => {
-                crate::policy::validate_turn_limit(runtime)?;
                 let tail = duduclaw_mcp_boundary::config::claude_mcp_arguments().len();
                 let split = runtime.fixed_args.len().checked_sub(tail).ok_or(ErrorCode::RuntimeDenied)?;
                 let (head, suffix) = runtime.fixed_args.split_at(split);
@@ -99,6 +115,11 @@ impl BootstrapPlan {
                 argv.extend(suffix.iter().map(|arg| arg.as_str().to_owned()));
             }
             _ => return Err(ErrorCode::RuntimeDenied),
+        }
+        // Defence in depth: whatever the record said, root never launches a
+        // Claude MCP runtime without exactly one bounded `--max-turns`.
+        if runtime.runtime == duduclaw_isolation::execution::RuntimeKind::Claude && runtime.mcp {
+            checked_step_limit(&argv, max_turns.unwrap_or(crate::policy::LEGACY_FIXED_MAX_TURNS))?;
         }
         let egress = matches!(runtime.network, NetworkPolicy::Egress(_));
         let mut plan = Self { domain: BOOTSTRAP_DOMAIN, version: BOOTSTRAP_VERSION, run, employee,
@@ -326,8 +347,7 @@ mod tests {
         let mut claude = runtime();
         claude.runtime = RuntimeKind::Claude;
         claude.pty_allowed = false;
-        claude.fixed_args = ["-p", "--model", "m"].into_iter().map(str::to_owned)
-            .chain(duduclaw_mcp_boundary::config::claude_mcp_arguments())
+        claude.fixed_args = crate::gateway_plan::claude_ranged_arguments("m").unwrap().into_iter()
             .map(|arg| Text::new(arg).unwrap()).collect();
         claude.turn_limit = Some(crate::policy::WORKING_DEFAULT_TURN_LIMIT);
         claude
@@ -338,8 +358,9 @@ mod tests {
             EmployeeId([2; 16]), 70000, 70000, 400, 400, [5; 32], runtime, false, 2, &[], None, max_turns);
         let claude = ranged_claude();
         let ranged_plan = build(&claude, Some(120)).unwrap();
-        assert_eq!(ranged_plan.argv, ["/runtime/codex", "-p", "--model", "m", "--max-turns", "120",
-            "--strict-mcp-config", "--mcp-config", "/config/mcp.json"]);
+        assert_eq!(ranged_plan.argv, ["/runtime/codex", "-p", "--input-format", "text", "--output-format", "stream-json",
+            "--verbose", "--system-prompt-file", "/proc/self/fd/5", "--tools", "", "--allowedTools", "mcp__duduclaw__*",
+            "--model", "m", "--max-turns", "120", "--strict-mcp-config", "--mcp-config", "/config/mcp.json"]);
         assert_eq!(ranged_plan.max_turns, Some(120));
         assert!(serde_json::to_value(&ranged_plan).unwrap()["max_turns"] == 120);
         // Outside the signed range, absent for a ranged record, or present for
@@ -351,6 +372,41 @@ mod tests {
         assert!(serde_json::to_value(&legacy).unwrap().get("max_turns").is_none());
         assert!(!legacy.argv.iter().any(|arg| arg == "--max-turns"));
         let mut bad = build(&claude, Some(120)).unwrap(); bad.max_turns = Some(0); assert!(bad.validate().is_err());
+    }
+    #[test]
+    fn final_argv_defence_requires_exactly_one_bounded_max_turns_for_claude_mcp() {
+        let build = |runtime: &PublishedRuntime, max_turns| BootstrapPlan::from_runtime(RunHandle(RunId([1; 16])),
+            EmployeeId([2; 16]), 70000, 70000, 400, 400, [5; 32], runtime, false, 2, &[], None, max_turns);
+        fn argv(args: &[&str]) -> Vec<String> { args.iter().map(|arg| (*arg).to_owned()).collect() }
+        let suffix = ["--strict-mcp-config", "--mcp-config", "/config/mcp.json"];
+        let good = argv(&[&["/runtime/claude", "-p", "--max-turns", "120"][..], &suffix].concat());
+        assert!(checked_step_limit(&good, 120).is_ok());
+        for (bad, expected) in [
+            (argv(&[&["/runtime/claude", "-p"][..], &suffix].concat()), 50),                       // none at all
+            (argv(&["/runtime/claude", "--max-turns", "50", "--max-turns", "50"]), 50),             // duplicated
+            (argv(&["/runtime/claude", "--max-turns", "50", "--max-turns=50"]), 50),                // second spelling
+            (argv(&["/runtime/claude", "--max-turns=50"]), 50),                                     // `=` spelling
+            (argv(&["/runtime/claude", "--max-turns"]), 50),                                        // no value
+            (argv(&["/runtime/claude", "--max-turns", "050"]), 50),                                 // not canonical
+            (argv(&["/runtime/claude", "--max-turns", "49"]), 50),                                  // not the value enforced
+            (argv(&["/runtime/claude", "--max-turns", "0"]), 0),                                    // unbounded
+            (argv(&["/runtime/claude", "--max-turns", "1001"]), 1001),                              // above the ceiling
+            (argv(&["/runtime/claude", "--", "--max-turns", "50"]), 50),                            // positional
+        ] {
+            assert!(checked_step_limit(&bad, expected).is_err(), "{bad:?}");
+        }
+        // `from_runtime` applies the record rule and then this check to every
+        // Claude MCP launch: a record without any step limit (a ranged shape
+        // with no range) gets no plan; other runtimes are unaffected.
+        let mut unlimited = ranged_claude(); unlimited.turn_limit = None;
+        assert!(build(&unlimited, None).is_err());
+        let mut legacy = ranged_claude(); legacy.turn_limit = None;
+        legacy.fixed_args = crate::gateway_plan::claude_arguments("m").unwrap().into_iter().map(|arg| Text::new(arg).unwrap()).collect();
+        let plan = build(&legacy, None).unwrap();
+        assert!(checked_step_limit(&plan.argv, 50).is_ok());
+        assert!(plan.max_turns.is_none() && serde_json::to_value(&plan).unwrap().get("max_turns").is_none());
+        assert!(build(&legacy, Some(50)).is_err());
+        assert!(build(&runtime(), None).is_ok());
     }
     #[test]
     fn bootstrap_exact_order_nonce_identity_and_fd_limit_are_required() {

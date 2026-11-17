@@ -480,7 +480,9 @@ impl<H: Host> Coordinator<H> {
     pub fn start(&mut self, connection: ControlConnectionId, request: SpawnRequest, inputs: H::Inputs,
         now: u64) -> Result<SpawnResponse> {
         self.time(now)?;
-        request.validate().map_err(|_| ErrorCode::InvalidRequest)?;
+        // R6 review round, finding 4: a step limit outside the wire bound is
+        // the closed `StepLimitDenied`; every other refusal `InvalidRequest`.
+        request.validation_code()?;
         let SpawnRequest::StartRun { run, employee_id, ref runtime_request, prompt_bytes, ref input_fds, pty, .. } = request
             else { return Err(ErrorCode::InvalidRequest); };
         let entry = self.owned(run, connection)?;

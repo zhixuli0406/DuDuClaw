@@ -110,6 +110,8 @@ pub struct RuntimeRecord {
     /// R6 policy v3 only. Omitted when absent, so v1/v2 records (and their
     /// MCP launch-policy digests) are byte-identical to before; a ranged v3
     /// record's digest covers the range, so its acceptance is regenerated.
+    /// In a signed policy the key's presence is checked on the raw bytes
+    /// (`turn_limit_keys`): refused before v3, and `null` refused in v3.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_limit: Option<TurnLimit>,
 }
@@ -255,10 +257,27 @@ fn parse_policy(bytes: &[u8]) -> io::Result<SignedPolicy> {
         }
         _ => return Err(denied()),
     };
+    turn_limit_keys(bytes, policy.version)?;
     validate_turn_limits(&policy)?;
     Ok(policy)
 }
-/// R6: no step range before v3; every v3 range valid, or the policy is refused.
+/// R6 review round, finding 3: decided on the raw document, because the typed
+/// record reads both an absent key and `"turn_limit": null` as `None`. A
+/// v1/v2 runtime record must not carry the key at all; a v3 record either
+/// omits it (no range: the fixed `--max-turns 50` shape) or carries a range
+/// object. An explicit `null` is refused in every version.
+fn turn_limit_keys(bytes: &[u8], version: u16) -> io::Result<()> {
+    let document: serde_json::Value = serde_json::from_slice(bytes).map_err(|_| denied())?;
+    let runtimes = document.get("runtimes").and_then(serde_json::Value::as_array).ok_or_else(denied)?;
+    for record in runtimes {
+        let record = record.as_object().ok_or_else(denied)?;
+        if record.get("turn_limit").is_some_and(|limit| version < 3 || limit.is_null()) { return Err(denied()); }
+    }
+    Ok(())
+}
+/// R6: no step range before v3; every v3 range valid; every Claude MCP record
+/// with exactly the canonical fixed-50 or ranged argument shape. Otherwise
+/// the policy is refused as a whole.
 fn validate_turn_limits(policy: &SignedPolicy) -> io::Result<()> {
     for record in &policy.runtimes {
         if record.turn_limit.is_some() && policy.version < 3 { return Err(denied()); }
@@ -653,7 +672,9 @@ mod tests {
     fn runtime_record() -> RuntimeRecord {
         RuntimeRecord { runtime: RuntimeKind::Claude, profile: ProfileId(Sha256Digest([1; 32])),
             executable: ExecutableRecord::Elf { entry: Text::new("claude".into()).unwrap(), digest: Sha256Digest([2; 32]) },
-            pinned_version: Text::new("2.0.0".into()).unwrap(), fixed_args: vec![],
+            pinned_version: Text::new("2.0.0".into()).unwrap(),
+            // The canonical v1/v2 Claude MCP shape (fixed `--max-turns 50`).
+            fixed_args: crate::gateway_plan::claude_arguments("model").unwrap().into_iter().map(|arg| Text::new(arg).unwrap()).collect(),
             resources: ResourceLimits { memory_bytes: 1024 * 1024, cpu_quota_percent: 100, tasks: 16,
                 open_files: 4096, ptys: 16, disk: DiskQuota::LoopFilesystem { bytes: 1024, inodes: 32 },
                 io_read_bytes_per_sec: 1024, io_write_bytes_per_sec: 1024, io_read_ops_per_sec: 10,
@@ -922,8 +943,7 @@ mod tests {
     /// MCP suffix last, and the Q12 working-default range (pending owner).
     fn ranged_record() -> RuntimeRecord {
         let mut record = runtime_record();
-        record.fixed_args = ["-p", "--allowedTools", "mcp__duduclaw__*"].into_iter().map(str::to_owned)
-            .chain(duduclaw_mcp_boundary::config::claude_mcp_arguments())
+        record.fixed_args = crate::gateway_plan::claude_ranged_arguments("model").unwrap().into_iter()
             .map(|arg| Text::new(arg).unwrap()).collect();
         record.turn_limit = Some(crate::policy::WORKING_DEFAULT_TURN_LIMIT);
         record
@@ -1014,6 +1034,14 @@ mod tests {
         let mut value: serde_json::Value = serde_json::from_slice(&v2_bytes).unwrap();
         value["runtimes"][0]["turn_limit"] = range;
         assert!(parse_policy(&serde_json::to_vec(&value).unwrap()).is_err());
+        // R6 review round, finding 3: the key itself is refused before v3,
+        // also as an explicit `null` (which the typed record reads as absent).
+        let mut value = v1_document(); value["runtimes"][0]["turn_limit"] = serde_json::Value::Null;
+        assert!(serde_json::from_slice::<SignedPolicyV1>(&serde_json::to_vec(&value).unwrap()).unwrap().runtimes[0].turn_limit.is_none());
+        assert!(parse_policy(&serde_json::to_vec(&value).unwrap()).is_err(), "v1 null");
+        let mut value: serde_json::Value = serde_json::from_slice(&v2_bytes).unwrap();
+        value["runtimes"][0]["turn_limit"] = serde_json::Value::Null;
+        assert!(parse_policy(&serde_json::to_vec(&value).unwrap()).is_err(), "v2 null");
         // Host entitlements without `max_turns` keep their exact shape.
         let entitlement: EntitlementRecord = serde_json::from_value(serde_json::json!({
             "employee": EmployeeId([1; 16]), "profiles": [] })).unwrap();
@@ -1021,6 +1049,58 @@ mod tests {
         assert!(serde_json::to_value(&entitlement).unwrap().get("max_turns").is_none());
         assert!(serde_json::from_value::<EntitlementRecord>(serde_json::json!({
             "employee": EmployeeId([1; 16]), "profiles": [], "max_turns": 30, "ready": true })).is_err());
+    }
+
+    /// R6 review round, findings 1–3: every signed Claude MCP record carries
+    /// exactly one enforceable step limit, in every policy version; a v3
+    /// `"turn_limit": null` is refused (absent is the only "no range").
+    #[test]
+    fn policy_claude_mcp_step_limit_shape_is_refused_as_a_whole() {
+        let mut second = runtime_record();
+        second.runtime = RuntimeKind::Codex; second.profile = ProfileId(Sha256Digest([9; 32])); second.fixed_args.clear();
+        let parses = |mut value: serde_json::Value| {
+            value["runtimes"].as_array_mut().unwrap().push(serde_json::to_value(&second).unwrap());
+            value["native"].as_array_mut().unwrap().push(serde_json::to_value(native_record(&second)).unwrap());
+            parse_policy(&serde_json::to_vec(&value).unwrap()).is_ok()
+        };
+        let legacy = serde_json::to_value(crate::gateway_plan::claude_arguments("model").unwrap()).unwrap();
+        let ranged = serde_json::to_value(crate::gateway_plan::claude_ranged_arguments("model").unwrap()).unwrap();
+        let unranged = |mut value: serde_json::Value| {
+            value["runtimes"][0].as_object_mut().unwrap().remove("turn_limit");
+            value
+        };
+        assert!(parses(v3_document()));
+        assert!(parses(v1_document()));
+        // v3 without a range keeps the canonical fixed 50.
+        let mut value = unranged(v3_document()); value["runtimes"][0]["fixed_args"] = legacy.clone();
+        assert!(parses(value));
+        // v3: an explicit null is not "no range".
+        let mut value = v3_document(); value["runtimes"][0]["turn_limit"] = serde_json::Value::Null;
+        assert!(!parses(value), "v3 null");
+        // Neither a range nor the fixed flag (would launch with no step limit).
+        assert!(!parses(unranged(v3_document())), "v3 neither");
+        let mut value = v1_document(); value["runtimes"][0]["fixed_args"] = ranged.clone();
+        assert!(!parses(value), "v1 neither");
+        // Both.
+        let mut value = v3_document(); value["runtimes"][0]["fixed_args"] = legacy.clone();
+        assert!(!parses(value), "v3 both");
+        // The fixed flag with another value, duplicated or in `=` spelling.
+        let position = crate::policy::CLAUDE_FIXED_PREFIX.len();
+        for (index, replacement) in [(position + 1, "500"), (position, "--max-turns=50")] {
+            let mut value = v1_document(); value["runtimes"][0]["fixed_args"][index] = replacement.into();
+            assert!(!parses(value), "{replacement}");
+        }
+        let mut value = v1_document();
+        let arguments = value["runtimes"][0]["fixed_args"].as_array_mut().unwrap();
+        arguments.insert(position, "50".into()); arguments.insert(position, "--max-turns".into());
+        assert!(!parses(value), "duplicated");
+        // A bare `--` before the suffix, or the insertion point after a
+        // value-taking option.
+        for (index, smuggled) in [(14, "--"), (1, "--"), (14, "--model")] {
+            let mut value = v3_document();
+            value["runtimes"][0]["fixed_args"].as_array_mut().unwrap().insert(index, smuggled.into());
+            assert!(!parses(value), "{index} {smuggled}");
+        }
     }
 
     /// R6 on a real installed host: for every employee entitled to a ranged
