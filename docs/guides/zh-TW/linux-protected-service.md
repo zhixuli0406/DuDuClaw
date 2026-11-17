@@ -99,6 +99,8 @@ sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux [--version X.Y
 | 員工身分 | 永久登記，預設 70000–99999；只在員工確認後配置 |
 | 可信程式 | Gateway、spawnd、trampoline、egress／forwarder／DNS broker、更新服務／凍結啟動器、解析器、匯入器、遷移命令與 MCP stdio 橋接；由 root 擁有 |
 | 服務 | Gateway、spawnd socket／service、egress socket／service、選用的 DNS broker、更新服務、parse socket／template、TCB 與員工 slice |
+| 自我檢測帳號 | `duduclaw-selftest`：隔離自我檢測降權後使用的帳號；與其他服務帳號相同的系統 ID，無家目錄、不能登入、自有群組、無額外群組、已鎖定 |
+| 自我檢測單元 | `/etc/systemd/system/duduclaw-isolation-selftest.service`，root:root 0644，內容與隨附版本完全相同且不得有覆寫設定；沒有 `[Install]`：安裝程式不會啟用或啟動它，由 spawnd 啟動 |
 | 解析根目錄 | `/usr/lib/duduclaw/parse-root` 與 `/usr/lib/duduclaw/parse-root-tree`，root:root 0755，初始為空，不能放主機資料 |
 | 簽章狀態 | Bootstrap 信任、相容的元件世代、runtime 登錄表、更新槽與狀態、遷移及就緒檢查接線 |
 

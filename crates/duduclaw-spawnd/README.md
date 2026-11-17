@@ -585,9 +585,10 @@ ABI, both artifact identities): a pass is reused for that key, any key change
 runs the unit again, a fail is reused for 60 s before one retry. The run happens
 on a background thread first requested by the first readiness refresh after
 start-up recovery, so it never delays the sockets, the update endpoint or the
-refresh loop (a run in progress reads as "not yet passed"). The installer still
-has to create the `duduclaw-selftest` system account and install the unit file
-(R7d); until then this readiness fails closed.
+refresh loop (a run in progress reads as "not yet passed"). The protected
+installer creates the `duduclaw-selftest` system account and installs the unit
+file (`protected_linux_layout.rs`) before it starts spawnd; without them this
+readiness fails closed.
 
 ## UserDB account verification
 

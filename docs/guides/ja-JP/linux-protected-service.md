@@ -99,6 +99,8 @@ sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux [--version X.Y
 | 社員 ID | 永続的な登録、通常 70000–99999。社員の確認後にのみ割り当て |
 | 信頼するプログラム | Gateway、spawnd、trampoline、egress／forwarder／DNS broker、更新サービス／固定ランチャー、解析器、インポーター、移行コマンド、MCP stdio ブリッジ。root 所有の実行ファイル |
 | サービス | Gateway、spawnd socket／service、egress socket／service、任意の DNS broker、更新サービス、parse socket／template、TCB／社員 slice |
+| セルフテスト用アカウント | `duduclaw-selftest`：隔離セルフテストが権限を下げて使うアカウント。他のサービスアカウントと同じシステム ID、ホームなし、ログイン不可、専用グループ、追加グループなし、ロック済み |
+| セルフテスト用ユニット | `/etc/systemd/system/duduclaw-isolation-selftest.service`。root:root 0644、同梱版と完全に同一でドロップインなし。`[Install]` がなく、インストーラーは有効化も起動もせず、spawnd が起動する |
 | 解析用 root | `/usr/lib/duduclaw/parse-root` と `/usr/lib/duduclaw/parse-root-tree`。root:root 0755、初期状態は空、ホストデータを置かない |
 | 署名済み状態 | Bootstrap の信頼、互換性のある世代、runtime 登録、更新スロット／状態、移行／準備完了の連携 |
 

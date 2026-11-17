@@ -5592,6 +5592,8 @@ No formatter, release, service operation or production-home access was performed
   accounts have locked/expired passwords, nologin, no home or supplementary
   groups, and disabled linger. Service UID/GID pairs must be distinct. Existing
   incompatible accounts refuse; this hook does not silently repurpose them.
+- R7a account: `duduclaw-selftest` (`duduclaw_isolation::ids::SELFTEST_USER`, which `duduclaw-run-selftest` drops to) is one of the layout's auxiliary accounts, created, checked and kept under the same rules before spawnd starts.
+- R7a unit: `duduclaw-isolation-selftest.service` is installed with the layout units (root:root 0644, byte-equal to spawnd's `ISOLATION_SELFTEST_UNIT_TEXT`, daemon-reloaded before spawnd starts), stopped right after spawnd by the quiesce, removed by rollback/uninstall, and never enabled or started by the installer.
 - The two parser roots start root:root 0755 and empty. Reinstall accepts only the
   bounded empty mountpoint skeleton that systemd can leave; files, symlinks,
   unexpected descendants, writable directories and different devices refuse.

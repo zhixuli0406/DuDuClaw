@@ -302,6 +302,7 @@ pub(super) fn component_target(path: &str) -> Option<InstallTarget> {
     Some(match path {
         "/usr/lib/duduclaw/duduclaw-spawnd" => InstallTarget::Spawnd,
         "/usr/lib/duduclaw/duduclaw-run" => InstallTarget::Trampoline,
+        "/usr/lib/duduclaw/duduclaw-run-selftest" => InstallTarget::TrampolineSelftest,
         "/opt/duduclaw/bin/duduclaw-egress" => InstallTarget::Egress,
         "/usr/libexec/duduclaw/duduclaw-parse-worker" => InstallTarget::ParseWorker,
         "/usr/lib/duduclaw/current/duduclaw-import" => InstallTarget::Importer,
@@ -931,6 +932,8 @@ fn units() -> Result<()> {
 
 /// Every layout unit file as installed, and every isolation service active;
 /// the gateway unit is not part of it (it starts after the platform is ready).
+/// The R7a self-test unit's bytes are checked with the others, but it is never
+/// required active (a `RemainAfterExit=no` oneshot spawnd starts; inactive after its run).
 fn platform_units() -> Result<()> {
     for (name, expected) in layout::UNITS {
         let path = Path::new("/etc/systemd/system").join(name);

@@ -4397,7 +4397,8 @@ gshadow:        files\nhosts:          files mdns4_minimal [NOTFOUND=return] dns
 
     #[test]
     fn layout_and_gated_units_are_in_the_quiesce_stop_order() {
-        use duduclaw_isolation::ids::{ISOLATED_GATEWAY_UNIT, ISOLATION_GATED_UNITS, ISOLATION_READY_UNIT};
+        use duduclaw_isolation::ids::{ISOLATED_GATEWAY_UNIT, ISOLATED_GATEWAY_UNIT_DEPENDENCIES, ISOLATION_GATED_UNITS,
+            ISOLATION_READY_UNIT, ISOLATION_SELFTEST_UNIT};
         let order = stop_order_all();
         let templates = TEMPLATES.map(|(_, _, template)| template);
         // (i) Every layout unit is accepted by the fixed-name shape and stopped
@@ -4434,7 +4435,19 @@ gshadow:        files\nhosts:          files mdns4_minimal [NOTFOUND=return] dns
             assert_eq!(started.iter().filter(|unit| **unit == ISOLATION_READY_UNIT).count(), 1);
             assert_eq!(at(ISOLATION_READY_UNIT), at("duduclaw-spawnd.service") + 1);
             assert!(at(ISOLATION_READY_UNIT) < at("duduclaw-egress.service"));
+            // (iv) R7a: the installer never enables or starts the self-test unit (spawnd does, through PID 1).
+            assert!(!started.contains(&ISOLATION_SELFTEST_UNIT));
         }
+        // (iv) It is a fixed, installed layout unit, stopped right after spawnd (its
+        // only starter), never a gate the gateway binds to and never of the run shape.
+        assert_eq!(unit_shape(ISOLATION_SELFTEST_UNIT), Some(UnitShape::Fixed));
+        assert_eq!(position(ISOLATION_SELFTEST_UNIT), position("duduclaw-spawnd.service") + 1);
+        assert!(stop_rank("duduclaw-spawnd.service", UnitShape::Fixed) < stop_rank(ISOLATION_SELFTEST_UNIT, UnitShape::Fixed));
+        assert!(stop_rank(ISOLATION_SELFTEST_UNIT, UnitShape::Fixed) < stop_rank(RUN, UnitShape::Run));
+        assert!(!GATEWAY_READY_UNITS.contains(&ISOLATION_SELFTEST_UNIT));
+        assert!(!SERVICE_ORDER.contains(&ISOLATION_SELFTEST_UNIT));
+        assert!(!ISOLATION_GATED_UNITS.contains(&ISOLATION_SELFTEST_UNIT));
+        assert!(!ISOLATED_GATEWAY_UNIT_DEPENDENCIES.contains(ISOLATION_SELFTEST_UNIT));
     }
 
     #[test]
@@ -4889,9 +4902,10 @@ duduclaw:x:990:990::/var/lib/duduclaw:/usr/sbin/nologin\n\
 duduclaw-runsup:x:989:989::/nonexistent:/usr/sbin/nologin\n\
 duduclaw-egress:x:988:988::/nonexistent:/usr/sbin/nologin\n\
 duduclaw-dl:x:987:987::/nonexistent:/usr/sbin/nologin\n\
-duduclaw-dns:x:986:986::/nonexistent:/usr/sbin/nologin\n";
+duduclaw-dns:x:986:986::/nonexistent:/usr/sbin/nologin\n\
+duduclaw-selftest:x:985:985::/nonexistent:/usr/sbin/nologin\n";
     const GROUP: &str = "root:x:0:\nduduclaw:x:990:\nduduclaw-runsup:x:989:\nduduclaw-egress:x:988:\n\
-duduclaw-dl:x:987:\nduduclaw-dns:x:986:\nsudo:x:27:alice\n";
+duduclaw-dl:x:987:\nduduclaw-dns:x:986:\nduduclaw-selftest:x:985:\nsudo:x:27:alice\n";
 
     #[test]
     fn service_identity_aliases_refused_at_every_check_point() {
@@ -4910,6 +4924,11 @@ duduclaw-dl:x:987:\nduduclaw-dns:x:986:\nsudo:x:27:alice\n";
             // Members in the gateway's group; a service account in another group.
             (PASSWD.into(), GROUP.replace("duduclaw:x:990:\n", "duduclaw:x:990:alice\n")),
             (PASSWD.into(), GROUP.replace("sudo:x:27:alice", "sudo:x:27:alice,duduclaw-dns")),
+            // R7a: the self-test account under the same rules (no extra group, home, shell, uid alias).
+            (PASSWD.into(), GROUP.replace("sudo:x:27:alice", "sudo:x:27:alice,duduclaw-selftest")),
+            (PASSWD.replace("985::/nonexistent", "985::/home/duduclaw-selftest"), GROUP.into()),
+            (PASSWD.replace("985::/nonexistent:/usr/sbin/nologin", "985::/nonexistent:/bin/bash"), GROUP.into()),
+            (format!("{PASSWD}shadow3:x:985:42::/nonexistent:/usr/sbin/nologin\n"), GROUP.into()),
             // A helper account's uid alias.
             (format!("{PASSWD}shadow2:x:987:42::/nonexistent:/usr/sbin/nologin\n"), GROUP.into()),
             // Duplicate name, wrong home, malformed or non-numeric ids.
@@ -4929,6 +4948,11 @@ duduclaw-dl:x:987:\nduduclaw-dns:x:986:\nsudo:x:27:alice\n";
         identities_unaliased(passwd, group, &[]).unwrap();
         assert!(identities_unaliased(passwd, group, GATEWAY_ONLY).is_err(), "created account missing");
         assert!(identities_unaliased(passwd, "root:x:0:\nduduclaw:x:990:\n", &[]).is_err());
+        // R7a: the self-test account is a required service account once created (S4, S6 check points).
+        assert!(all.contains(&duduclaw_isolation::ids::SELFTEST_USER));
+        let without = PASSWD.replace("duduclaw-selftest:x:985:985::/nonexistent:/usr/sbin/nologin\n", "");
+        let without_group = GROUP.replace("duduclaw-selftest:x:985:\n", "");
+        assert!(identities_unaliased(&without, &without_group, &all).is_err(), "self-test account missing");
     }
 
     #[derive(Default)]

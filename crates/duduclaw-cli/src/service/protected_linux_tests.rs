@@ -74,6 +74,24 @@ fn service_protected_isolation_install_facts_cover_layout() {
     assert!(unit_text().lines().any(|line| line == "Slice=duduclaw-tcb.slice"));
 }
 
+/// R7a: the installer creates the account `duduclaw-run-selftest` looks up
+/// (`identity()`: `duduclaw_isolation::ids::SELFTEST_USER`), as one of the
+/// layout's helper accounts (same creation, lockdown, readiness and removal
+/// rules), installs the unit spawnd starts by name, and publishes its binary.
+#[test]
+fn service_protected_selftest_account_unit_and_binary_are_in_the_layout() {
+    use duduclaw_isolation::ids::{SELFTEST_USER, ISOLATION_SELFTEST_UNIT, SERVICE_USERS};
+    assert_eq!(super::layout::ACCOUNTS.iter().filter(|name| **name == SELFTEST_USER).count(), 1);
+    assert!(!SERVICE_USERS.contains(&SELFTEST_USER), "never a service identity it must differ from");
+    assert!(super::layout::UNITS.iter().any(|(name, _)| *name == ISOLATION_SELFTEST_UNIT));
+    assert!(super::layout::BINARIES.contains(&"/usr/lib/duduclaw/duduclaw-run-selftest"));
+    let facts = duduclaw_core::isolation_install::FACTS;
+    assert!(facts.contains(&"/etc/systemd/system/duduclaw-isolation-selftest.service"));
+    assert!(facts.contains(&"/usr/lib/duduclaw/duduclaw-run-selftest"));
+    // The uninstall inventory owns (fences, stops and removes) the unit.
+    assert!(super::lifecycle::owned_unit(ISOLATION_SELFTEST_UNIT));
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn service_protected_isolation_install_manifest_matches_migration() {

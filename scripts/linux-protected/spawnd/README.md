@@ -145,9 +145,9 @@ it. Every other sandbox directive it shares with run units has
 file. Only spawnd starts it (by name, through PID 1),
 after its start-up recovery, and only while PID 1 loads it from
 `/etc/systemd/system/` without drop-ins. Its name is not of the run-unit shape,
-so no run inventory counts it. The installer must install it there and create
-the `duduclaw-selftest` system account (no login, no home); that is package R7d,
-not this change.
+so no run inventory counts it.
+The protected installer installs this unit at `/etc/systemd/system/` (root:root 0644, exactly these bytes) before spawnd starts, and never enables or starts it.
+The protected installer creates the `duduclaw-selftest` system account (no login, no home, own group, no supplementary groups) before spawnd starts.
 
 The native Linux service lifecycle and D-Bus fd handoff require root VM testing
 on systemd 249, 252 and 255. No installation or activation has been performed by
