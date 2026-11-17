@@ -265,11 +265,15 @@ pub trait Effects {
     /// Replace the eight fixed components with `generation`'s (each hashed from
     /// its descriptor while copied; a destination already holding exactly the
     /// artifact's bytes is kept), then sync every destination file and directory.
-    /// Idempotent; the caller journals it.
+    /// A stale `<name>.next` is removed for every component, kept ones included
+    /// (`publish_slot`). Idempotent; the caller journals it.
     fn publish(&mut self, generation: Sha256Digest) -> io::Result<()>;
-    /// Read-only: every fixed destination already holds exactly `generation`'s
-    /// artifact (root-owned single-link regular file, mode 0755, size and
-    /// SHA-256 by descriptor). Call only after [`Self::verify`] of `generation`.
+    /// Every fixed destination already holds exactly `generation`'s artifact
+    /// (root-owned single-link regular file, mode 0755, size and SHA-256 by
+    /// descriptor) and no stale `<name>.next` remains next to it. No fixed
+    /// destination is written; a stale temporary is removed (`settled_slot`),
+    /// and one that cannot be removed is an error. Call only after
+    /// [`Self::verify`] of `generation`.
     fn published(&mut self, generation: Sha256Digest) -> io::Result<()>;
     /// The generation the install selector (`current`) names; `None`: no selector.
     fn installed(&mut self) -> io::Result<Option<Sha256Digest>>;
@@ -507,8 +511,10 @@ fn recover_journal<S: JournalStore, E: Effects>(store: &mut S, effects: &mut E, 
 /// Start-up verification without a journal: the generation the `current`
 /// selector names is verified like a publication's (trust ledger including
 /// revocation, every artifact), and every destination must already hold its
-/// bytes. Nothing is written: without a journal there is no recorded intent to
-/// complete, so a difference is reported (an `Apply` of that generation repairs it).
+/// bytes. No destination is written: without a journal there is no recorded
+/// intent to complete, so a difference is reported (an `Apply` of that
+/// generation repairs it). Only a stale `<name>.next` (never a destination) is
+/// removed; one that cannot be removed leaves the set not consistent.
 /// A host installed by `duduclaw-bootstrap install` has a selector from its
 /// first boot on (`trust_init` publishes the initial `current` and records it
 /// in the ledger), so "no selector" is never a fresh-install state here.
@@ -1287,37 +1293,92 @@ fn already_published(destination: &Directory, name: &str, artifact: &ReleaseArti
         Err(error) => Err(updated(error)),
     }
 }
+/// One fixed destination as publication sees it: the fixed path and its
+/// `<name>.next` temporary (production: `FixedPath`).
+pub(crate) trait Slot {
+    /// Unlink a stale temporary by its fixed name (never opened, truncated or
+    /// followed), then sync the directory. Absent is fine; any other failure is
+    /// an error.
+    fn remove_temporary(&mut self) -> io::Result<()>;
+    /// The fixed path already holds exactly this artifact.
+    fn holds(&mut self) -> io::Result<bool>;
+    /// Copy the artifact into a fresh temporary (hashed while copied, synced).
+    fn write_temporary(&mut self) -> io::Result<()>;
+    /// Rename the temporary over the fixed path (directory synced), check what landed.
+    fn commit(&mut self) -> io::Result<()>;
+}
+/// Publication of one slot. The stale temporary goes first, on every path: a
+/// roll-back finds the interrupted component still holding the previous
+/// generation (kept) next to the torn copy of the newer one, which must not
+/// survive any completed publication. `before_rename` runs right before the
+/// rename (fault-injection seam).
+pub(crate) fn publish_slot(slot: &mut dyn Slot, before_rename: &mut dyn FnMut() -> io::Result<()>) -> io::Result<()> {
+    slot.remove_temporary()?;
+    if slot.holds()? { return Ok(()); }
+    slot.write_temporary()?;
+    before_rename()?;
+    slot.commit()
+}
+/// Start-up verification of one slot ([`Effects::published`]): a stale
+/// temporary is removed (the fixed path is never written), then the fixed
+/// path must hold the artifact.
+pub(crate) fn settled_slot(slot: &mut dyn Slot) -> io::Result<bool> {
+    slot.remove_temporary()?;
+    slot.holds()
+}
+
+/// A fixed path in its already opened, verified publication directory.
+/// `source`: the generation's descriptor, already checked (`None`: verification only).
+struct FixedPath<'a> { destination: &'a Directory, name: String, artifact: &'a ReleaseArtifact, source: Option<File> }
+impl FixedPath<'_> {
+    fn temporary(&self) -> String { format!("{}.next", self.name) }
+}
+impl Slot for FixedPath<'_> {
+    fn remove_temporary(&mut self) -> io::Result<()> {
+        // `Directory::remove`: unlinkat by a validated plain name (no path
+        // separators, no `..`), no symlink followed, then the directory fsync.
+        match self.destination.remove(&self.temporary()) {
+            Ok(()) => Ok(()),
+            Err(duduclaw_updated::Error::Io(error)) if missing(&error) => Ok(()),
+            Err(error) => Err(updated(error)),
+        }
+    }
+    fn holds(&mut self) -> io::Result<bool> { already_published(self.destination, &self.name, self.artifact) }
+    fn write_temporary(&mut self) -> io::Result<()> {
+        let mut source = self.source.take().ok_or_else(invalid)?;
+        let temporary = self.temporary();
+        let mut output = self.destination.create(&temporary).map_err(updated)?;
+        let copied = output.set_permissions(std::fs::Permissions::from_mode(0o755))
+            .and_then(|()| copy_artifact(&mut source, &mut output, self.artifact).map_err(updated));
+        drop(output);
+        if let Err(error) = copied {
+            // The publication fails either way; a temporary left here is removed
+            // by the next attempt's `remove_temporary`.
+            let _ = self.destination.remove(&temporary);
+            return Err(error);
+        }
+        Ok(())
+    }
+    fn commit(&mut self) -> io::Result<()> {
+        self.destination.rename(&self.temporary(), self.destination, &self.name, true).map_err(updated)?;
+        let landed = self.destination.read(&self.name).map_err(updated)?.metadata()?;
+        if landed.mode() & 0o7777 != 0o755 || landed.len() != self.artifact.size_bytes { return Err(invalid()); }
+        Ok(())
+    }
+}
+
 /// Copy one artifact from its generation descriptor to `<name>.next`, hashing
 /// the bytes as they are copied, fsync, rename over the fixed path, fsync the
 /// directory. The source is re-verified at the moment of use, never earlier.
-/// `before_rename` runs right before the rename (fault-injection seam).
+/// A stale `<name>.next` is removed even when the fixed path is kept.
 fn publish_component(generation: &Directory, artifact: &ReleaseArtifact, destination: &Directory,
     before_rename: &mut dyn FnMut() -> io::Result<()>) -> io::Result<()> {
     if artifact.mode != 0o755 { return Err(invalid()); }
     let name = artifact_name(&artifact.install_target).map_err(updated)?;
-    let mut source = generation.read(&name).map_err(updated)?;
+    let source = generation.read(&name).map_err(updated)?;
     let metadata = source.metadata()?;
     if metadata.mode() & 0o7777 != 0o755 || metadata.len() != artifact.size_bytes { return Err(invalid()); }
-    if already_published(destination, &name, artifact)? { return Ok(()); }
-    let temporary = format!("{name}.next");
-    match destination.remove(&temporary) {
-        Ok(()) => {}
-        Err(duduclaw_updated::Error::Io(error)) if missing(&error) => {}
-        Err(error) => return Err(updated(error)),
-    }
-    let mut output = destination.create(&temporary).map_err(updated)?;
-    let copied = output.set_permissions(std::fs::Permissions::from_mode(0o755))
-        .and_then(|()| copy_artifact(&mut source, &mut output, artifact).map_err(updated));
-    drop(output);
-    if let Err(error) = copied {
-        let _ = destination.remove(&temporary);
-        return Err(error);
-    }
-    before_rename()?;
-    destination.rename(&temporary, destination, &name, true).map_err(updated)?;
-    let landed = destination.read(&name).map_err(updated)?.metadata()?;
-    if landed.mode() & 0o7777 != 0o755 || landed.len() != artifact.size_bytes { return Err(invalid()); }
-    Ok(())
+    publish_slot(&mut FixedPath { destination, name, artifact, source: Some(source) }, before_rename)
 }
 
 impl Effects for InstalledEffects {
@@ -1388,7 +1449,9 @@ impl Effects for InstalledEffects {
         for (target, relative) in publication() {
             let artifact = fixed_artifact(&manifest, &target)?;
             let destination = Directory::open(&self.publish_root.join(relative)).map_err(updated)?;
-            if artifact.mode != 0o755 || !already_published(&destination, &artifact_name(&target).map_err(updated)?, artifact)? {
+            if artifact.mode != 0o755 { return Err(invalid()); }
+            let name = artifact_name(&target).map_err(updated)?;
+            if !settled_slot(&mut FixedPath { destination: &destination, name, artifact, source: None })? {
                 return Err(invalid());
             }
         }
