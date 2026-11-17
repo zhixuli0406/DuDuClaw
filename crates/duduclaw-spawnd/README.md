@@ -100,23 +100,87 @@ fields refused, 5 s timeouts. Every refusal is the single `Refused` outcome.
   fsync, rename, directory fsync) **before** the in-memory barrier closes, then
   replies with the admitted runs counted by an admission iteration that began
   after the closure. New `StartRun`s are refused (`not_ready`); queued and
-  running runs are kept. The updater retries until the count is zero.
+  running runs are kept. The updater retries until the count is zero. An
+  unhealthy admission iteration (its tick failed) is `Refused`, whatever the count.
 - `Apply` requires the barrier closed for exactly that generation in memory and
-  on disk, and zero admitted runs. It re-authenticates the manifest against the
-  trust ledger and copies spawnd, run, parse worker, `/usr/lib/duduclaw/current/*`,
+  on disk, and zero admitted runs in a fresh healthy iteration. It verifies the
+  whole generation first (manifest digest, signature against the trust ledger,
+  every artifact from its descriptor), then writes the publication journal (see
+  below), then copies spawnd, run, parse worker, `/usr/lib/duduclaw/current/*`,
   egress and gateway from the generation directory, hashing each file from its
-  descriptor while copying, to `<name>.next`, fsync, rename, directory fsync.
+  descriptor while copying, to `<name>.next`, fsync, rename, directory fsync;
+  finally every destination file and directory is synced again and the journal
+  says `published`. While a journal of another generation is `publishing`,
+  `Apply` is refused except for that journal's previous generation (the roll-back).
 - `Readback` reports spawnd itself (`sha256(/proc/self/exe)`, liveness of the
   admission loop) and the trampoline it executes. Other non-daemon components
   (parse worker, MCP bridge, importer, migration, egress forwarder, runtime
   entries) report `ready: false`: no executable readback under a non-root
   identity exists yet, so the updater cannot validate an activation until one does.
-- `Resume{g}` removes the record durably, then reopens admission. It is the only
-  way to lift the barrier. At start the record is read strictly before the first
-  admission; an unreadable record keeps admission closed until a new `Drain`.
+- `Resume{g}` requires that no journal exists or that it says `published` for
+  `g`; it removes the journal, then the record, durably, then reopens admission.
+  It is the only way to lift the barrier. At start the record is read strictly
+  before the first admission; an unreadable record keeps admission closed until
+  a new `Drain`.
+
+### Publication journal and start-up recovery
+
+Each file rename is atomic; the set of eight is not. `Apply` therefore keeps
+`/var/lib/duduclaw-spawnd/publish.json` (root 0600; format
+`duduclaw_updated::publish_journal`, schema 1, fixed across versions, strict
+parsing: bounded, unknown field or schema refused, canonical bytes only):
+`{schema, generation, manifest_sha256, previous, state}`. `previous` is the
+generation installed before (`current` when no journal exists; the journal's own
+`previous` on a retried `Apply`). Written `publishing` (temporary, fsync, rename,
+directory fsync, read back) before the first destination is touched; rewritten
+`published` after all eight are in place and synced. Removed only by the
+`Resume` of its generation, i.e. after the updater committed (or rolled back to)
+it, so until then the previous generation stays known, and the updater's
+generation pruning keeps both directories named by the journal.
+
+At start, before any socket is bound (update, control, allocation) and before
+admission (`update_control::recover`, holding the lifetime flock
+`/var/lib/duduclaw-spawnd/update.lock`):
+
+- `published` or no journal: nothing to do.
+- `publishing`: the generation is fully re-verified (manifest digest equal to
+  the journal's, signature against the trust ledger, every artifact by
+  descriptor) and its publication completed (files already holding the right
+  bytes are kept). If that fails, the journal's `previous` generation is
+  published with the same procedure (the new journal names the interrupted
+  generation as its fallback).
+- Neither possible, or the journal is unreadable / of an unknown schema:
+  admission stays closed (`recovery_incomplete`; no `Resume` lifts it, a new
+  `Drain` re-keys it and `Resume` still requires a consistent journal), the
+  update socket still answers root, and `READY=1` is not sent. It is sent later
+  if a served request (an operator's or the updater's `Drain` + `Apply`) leaves a
+  consistent set. An unreadable journal must be inspected and removed by an
+  operator; it is never ignored.
+
+The barrier restored from a record and any journal found are audited
+(`update_barrier_restored`, `publication_recovery` with the action and the
+journal's generations; at most two records per start).
+
+Operator status: `/run/duduclaw-spawnd/update-status.json` (root 0600, atomic
+replace, written at start and after every request on `update.sock`; the wire
+contract has no status request). Fields: `admission_closed`, `barrier`
+(`open`, `drained`, `unreadable_record`, `recovery_incomplete`) and
+`barrier_generation`, `journal` (`absent`, `publishing`, `published`,
+`unreadable`), `journal_generation`, `journal_previous`,
+`publication_consistent`, `startup_barrier` / `startup_barrier_generation` and
+`startup_recovery` (`no_journal`, `already_published`, `rolled_forward`,
+`rolled_back`, `incomplete`, `journal_unreadable`). Digests are lowercase hex.
+
+The unit is `Type=notify` so that units ordered after spawnd (`After=` +
+`Requires=duduclaw-spawnd.service`: egress here; the gateway unit generated by
+the installer must add the same) never start on a mixed set.
 
 The unit grants spawnd write access to `/usr/lib/duduclaw`, `/usr/libexec/duduclaw`
-and `/opt/duduclaw/bin` for this publication.
+and `/opt/duduclaw/bin` for this publication: an atomic replacement creates
+`<name>.next` in the destination directory and renames it over `<name>`, which
+needs write access to the directory, not only to the file. This is broader than
+the eight fixed file names; narrowing it requires moving publication into a
+separate, narrowly privileged publisher helper (known residual, plan R6).
 
 ## Package H adapter
 

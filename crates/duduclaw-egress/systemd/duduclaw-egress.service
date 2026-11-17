@@ -2,6 +2,10 @@
 Description=DuDuClaw public IP egress
 Requires=duduclaw-egress.socket
 After=duduclaw-egress.socket
+# R6: start only after spawnd settled its update publication journal (spawnd is
+# Type=notify): /opt/duduclaw/bin/duduclaw-egress is one of its eight components.
+Requires=duduclaw-spawnd.service
+After=duduclaw-spawnd.service
 
 [Service]
 Slice=duduclaw-tcb.slice

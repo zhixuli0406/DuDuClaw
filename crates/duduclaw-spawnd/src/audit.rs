@@ -38,6 +38,33 @@ pub enum Event { Refused, Reserved, Queued, Started, Ended, Revoked, Intruder, O
     /// F6l (§3.12 step 8): an employee's root allocation was retired
     /// (detail: `retired`).
     Retired,
+    /// R6: spawnd started with its update drain barrier closed from
+    /// `drain.json` (detail: `update_barrier`).
+    UpdateBarrierRestored,
+    /// R6: spawnd found a publication journal at start (detail: `publication_recovery`).
+    PublicationRecovery,
+}
+/// R6: what spawnd did with its publication journal (`publish.json`) at start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationRecovery {
+    /// No journal: the last publication was completed and resumed (or none ran).
+    NoJournal,
+    /// The journal said `published`: every component already in place.
+    AlreadyPublished,
+    /// `publishing`: the generation was re-verified and its publication completed.
+    RolledForward,
+    /// `publishing`, generation missing or unverifiable: the previous generation
+    /// was re-verified and published instead.
+    RolledBack,
+    /// Neither could be completed: admission stays closed (not ready).
+    Incomplete,
+    /// The journal is unreadable, has an unknown schema or field: not ready.
+    JournalUnreadable,
+}
+impl PublicationRecovery {
+    /// After this outcome every fixed component holds one generation's bytes.
+    pub fn consistent(self) -> bool { !matches!(self, Self::Incomplete | Self::JournalUnreadable) }
 }
 /// HX6 round 3: what one probe call decided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -149,6 +176,12 @@ pub enum Detail {
     /// Every text value was validated by `allocation::retire_specification`.
     Retired { uid: u32, label: String, used_bytes: Option<u64>, used_inodes: Option<u64>, quota_bytes: u64, quota_inodes: u64,
         quarantine_digest_prefix: String, requested_by: String, approved_by: String, early: bool },
+    /// R6: the drain record's generation; `None`: the record was unreadable.
+    UpdateBarrier { generation: Option<duduclaw_isolation::ids::Sha256Digest> },
+    /// R6: the start-up journal outcome and the journal's generations (as
+    /// found; `None` when the journal was unreadable).
+    PublicationRecovery { action: PublicationRecovery, generation: Option<duduclaw_isolation::ids::Sha256Digest>,
+        previous: Option<duduclaw_isolation::ids::Sha256Digest> },
 }
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

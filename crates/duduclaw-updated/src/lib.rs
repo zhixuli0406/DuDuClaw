@@ -8,6 +8,8 @@ pub mod trust_store;
 pub mod publication;
 pub mod bundle;
 pub mod bootstrap_cli;
+/// spawnd's publication journal format (shared so the updater's pruning reads it).
+pub mod publish_journal;
 #[cfg(target_os = "linux")]
 pub mod linux;
 #[cfg(target_os = "linux")]

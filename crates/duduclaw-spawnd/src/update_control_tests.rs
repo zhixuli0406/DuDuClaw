@@ -13,7 +13,9 @@ use crate::admission::{Coordinator, Host, HostProgress, LaunchPolicy, Limits};
 #[derive(Debug, PartialEq)]
 enum Event { Persisted { already_closed: bool }, Cleared { already_open: bool } }
 #[derive(Default)]
-struct Disk { bytes: Option<Vec<u8>>, fail: bool, events: Vec<Event>, watch: Option<DrainBarrier> }
+struct Disk { bytes: Option<Vec<u8>>, fail: bool, events: Vec<Event>, watch: Option<DrainBarrier>,
+    /// `publish.json`, stored as the exact bytes a disk would hold.
+    journal: Option<Vec<u8>>, journal_fail: bool }
 /// In-memory "disk" that records, at each durable step, what the barrier
 /// already said: the protocol requires the record before the closure and the
 /// removal before the reopening.
@@ -47,17 +49,91 @@ impl DrainStore for MemoryStore {
         Ok(())
     }
 }
+impl JournalStore for MemoryStore {
+    fn load_journal(&mut self) -> io::Result<Option<PublishJournal>> {
+        self.0.lock().unwrap().journal.as_deref().map(|bytes| PublishJournal::parse(bytes).map_err(|_| invalid())).transpose()
+    }
+    fn persist_journal(&mut self, journal: &PublishJournal) -> io::Result<()> {
+        let mut disk = self.0.lock().unwrap();
+        if disk.journal_fail { return Err(io::Error::other("injected journal write failure")); }
+        disk.journal = Some(journal.encode().map_err(|_| invalid())?);
+        Ok(())
+    }
+    fn clear_journal(&mut self) -> io::Result<()> {
+        let mut disk = self.0.lock().unwrap();
+        if disk.journal_fail { return Err(io::Error::other("injected journal unlink failure")); }
+        disk.journal = None;
+        Ok(())
+    }
+}
+impl MemoryStore {
+    fn journal(&self) -> Option<PublishJournal> { self.clone().load_journal().unwrap() }
+}
+
+/// The eight fixed destinations and the staged generation directories, shared
+/// across simulated restarts (each restart builds new effects over the same world).
+#[derive(Default)]
+struct World {
+    /// The generation whose bytes each fixed destination holds, in `publication()` order.
+    slots: [Option<Sha256Digest>; 8],
+    /// Generation directories that pass full verification.
+    staged: Vec<Sha256Digest>,
+    /// The install selector (`current`).
+    selector: Option<Sha256Digest>,
+    /// Simulated power loss in the next `publish`, after this many renames.
+    power_loss_after: Option<usize>,
+    /// The journal on "disk" when each `publish` began (before its first rename).
+    journal_at_publish: Vec<Option<PublishJournal>>,
+    disk: Option<MemoryStore>,
+}
+type SharedWorld = Arc<Mutex<World>>;
+fn new_world(store: &MemoryStore, installed: Sha256Digest, staged: &[Sha256Digest]) -> SharedWorld {
+    Arc::new(Mutex::new(World { slots: [Some(installed); 8], staged: staged.to_vec(), selector: Some(installed),
+        disk: Some(store.clone()), ..World::default() }))
+}
 
 #[derive(Default)]
-struct FakeEffects { calls: Vec<&'static str>, fail: bool }
+struct FakeEffects { calls: Vec<&'static str>, fail: bool, world: Option<SharedWorld> }
+impl FakeEffects {
+    fn over(world: &SharedWorld) -> Self { Self { world: Some(world.clone()), ..Self::default() } }
+}
 impl Effects for FakeEffects {
     fn prepare(&mut self, _: &Preparation) -> io::Result<()> {
         self.calls.push("prepare");
         if self.fail { Err(invalid()) } else { Ok(()) }
     }
-    fn apply(&mut self, _: &Preparation) -> io::Result<()> {
-        self.calls.push("apply");
-        if self.fail { Err(invalid()) } else { Ok(()) }
+    fn verify(&mut self, generation: Sha256Digest, _: Option<&Preparation>) -> io::Result<Sha256Digest> {
+        self.calls.push("verify");
+        if self.fail { return Err(invalid()); }
+        match &self.world {
+            Some(world) if !world.lock().unwrap().staged.contains(&generation) => Err(invalid()),
+            // The manifest digest is the generation digest.
+            _ => Ok(generation),
+        }
+    }
+    fn publish(&mut self, generation: Sha256Digest) -> io::Result<()> {
+        self.calls.push("publish");
+        if self.fail { return Err(invalid()); }
+        let Some(world) = &self.world else { return Ok(()) };
+        let mut world = world.lock().unwrap();
+        let journal = world.disk.as_ref().and_then(MemoryStore::journal);
+        world.journal_at_publish.push(journal);
+        // The copy re-verifies the source: a corrupted generation stops here.
+        if !world.staged.contains(&generation) { return Err(invalid()); }
+        for index in 0..8 {
+            if world.slots[index] == Some(generation) { continue; }
+            let pending = world.power_loss_after;
+            match pending {
+                Some(0) => { world.power_loss_after = None; return Err(io::Error::other("simulated power loss")); }
+                Some(remaining) => world.power_loss_after = Some(remaining - 1),
+                None => {}
+            }
+            world.slots[index] = Some(generation);
+        }
+        Ok(())
+    }
+    fn installed(&mut self) -> io::Result<Option<Sha256Digest>> {
+        Ok(self.world.as_ref().and_then(|world| world.lock().unwrap().selector))
     }
     fn readback(&mut self, _: Sha256Digest, _: bool) -> io::Result<Vec<ComponentReadback>> {
         self.calls.push("readback");
@@ -68,23 +144,28 @@ impl Effects for FakeEffects {
 struct NoEffects;
 impl Effects for NoEffects {
     fn prepare(&mut self, _: &Preparation) -> io::Result<()> { Err(invalid()) }
-    fn apply(&mut self, _: &Preparation) -> io::Result<()> { Err(invalid()) }
+    fn verify(&mut self, _: Sha256Digest, _: Option<&Preparation>) -> io::Result<Sha256Digest> { Err(invalid()) }
+    fn publish(&mut self, _: Sha256Digest) -> io::Result<()> { Err(invalid()) }
+    fn installed(&mut self) -> io::Result<Option<Sha256Digest>> { Err(invalid()) }
     fn readback(&mut self, _: Sha256Digest, _: bool) -> io::Result<Vec<ComponentReadback>> { Err(invalid()) }
 }
 
-/// Stands in for the admission loop: one iteration every 5 ms with a fixed run count.
-struct Observer { stop: Arc<AtomicBool>, runs: Arc<AtomicUsize>, worker: Option<std::thread::JoinHandle<()>> }
+/// Stands in for the admission loop: one iteration every 5 ms with a fixed run
+/// count and health.
+struct Observer { stop: Arc<AtomicBool>, runs: Arc<AtomicUsize>, healthy: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>> }
 impl Observer {
     fn new(barrier: &DrainBarrier, runs: usize) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let count = Arc::new(AtomicUsize::new(runs));
-        let (barrier, flag, admitted) = (barrier.clone(), stop.clone(), count.clone());
+        let healthy = Arc::new(AtomicBool::new(true));
+        let (barrier, flag, admitted, health) = (barrier.clone(), stop.clone(), count.clone(), healthy.clone());
         let worker = std::thread::spawn(move || while !flag.load(Ordering::Acquire) {
             let epoch = barrier.epoch();
-            barrier.observe(epoch, admitted.load(Ordering::Acquire), true);
+            barrier.observe(epoch, admitted.load(Ordering::Acquire), health.load(Ordering::Acquire));
             std::thread::sleep(Duration::from_millis(5));
         });
-        Self { stop, runs: count, worker: Some(worker) }
+        Self { stop, runs: count, healthy, worker: Some(worker) }
     }
 }
 impl Drop for Observer {
@@ -97,14 +178,14 @@ impl Drop for Observer {
 fn digest(n: u8) -> Sha256Digest { Sha256Digest([n; 32]) }
 fn request(command: ControlCommand) -> ControlRequest { ControlRequest { schema_version: 1, nonce: RequestId([3; 16]), command } }
 fn preparation(generation: Sha256Digest) -> Preparation { Preparation { generation, migrations: vec![], runtime_entries: vec![] } }
-fn outcome<S: DrainStore, E: Effects>(control: &mut UpdateControl<S, E>, command: ControlCommand) -> ControlOutcome {
+fn outcome<S: DrainStore + JournalStore, E: Effects>(control: &mut UpdateControl<S, E>, command: ControlCommand) -> ControlOutcome {
     let request = request(command);
     let response = control.respond(&request);
     assert_eq!(response.nonce, request.nonce);
     assert_eq!(response.generation, request.command.generation());
     response.outcome
 }
-fn accepted<S: DrainStore, E: Effects>(control: &mut UpdateControl<S, E>, command: ControlCommand) {
+fn accepted<S: DrainStore + JournalStore, E: Effects>(control: &mut UpdateControl<S, E>, command: ControlCommand) {
     let request = request(command);
     let response = control.respond(&request);
     validate_response(&request, &response).unwrap_or_else(|_| panic!("refused: {:?}", response.outcome));
@@ -252,9 +333,252 @@ fn update_apply_requires_closed_recorded_generation_and_no_runs() {
     store.0.lock().unwrap().bytes = saved;
     assert!(control.effects.calls.is_empty());
     accepted(&mut control, apply(digest(7)));
-    assert_eq!(control.effects.calls, vec!["apply"]);
+    assert_eq!(control.effects.calls, vec!["verify", "publish"]);
+    // No selector: the journal names no previous generation.
+    assert_eq!(store.journal(), Some(PublishJournal::new(digest(7), digest(7), None, PublishState::Published).unwrap()));
     accepted(&mut control, ControlCommand::Resume { generation: digest(7) });
+    assert_eq!(store.journal(), None);
     assert!(matches!(outcome(&mut control, apply(digest(7))), ControlOutcome::Refused));
+}
+
+// ---------------------------------------------------------------- publication journal
+
+fn apply_command(generation: Sha256Digest) -> ControlCommand { ControlCommand::Apply { preparation: preparation(generation) } }
+fn refused_outcome<S: DrainStore + JournalStore, E: Effects>(control: &mut UpdateControl<S, E>, command: ControlCommand) {
+    assert!(matches!(outcome(control, command), ControlOutcome::Refused));
+}
+fn slots(world: &SharedWorld) -> [Option<Sha256Digest>; 8] { world.lock().unwrap().slots }
+/// A simulated restart: a new barrier and new effects over the same disk and world.
+fn restart(store: &MemoryStore, world: &SharedWorld) -> (DrainBarrier, UpdateControl<MemoryStore, FakeEffects>) {
+    let barrier = DrainBarrier::default();
+    let control = UpdateControl::new(store.clone(), barrier.clone(), FakeEffects::over(world)).unwrap();
+    (barrier, control)
+}
+/// Generation 1 installed and selected; `Apply(2)` loses power after `renames` renames.
+fn interrupted_apply(renames: usize) -> (MemoryStore, SharedWorld) {
+    let store = MemoryStore::default();
+    let shared = new_world(&store, digest(1), &[digest(1), digest(2)]);
+    let barrier = DrainBarrier::default();
+    let _admission = Observer::new(&barrier, 0);
+    let mut control = UpdateControl::new(store.clone(), barrier, FakeEffects::over(&shared)).unwrap();
+    accepted(&mut control, ControlCommand::Drain { generation: digest(2) });
+    shared.lock().unwrap().power_loss_after = Some(renames);
+    refused_outcome(&mut control, apply_command(digest(2)));
+    let mixed = slots(&shared);
+    assert_eq!(mixed.iter().filter(|slot| **slot == Some(digest(2))).count(), renames);
+    assert_eq!(mixed.iter().filter(|slot| **slot == Some(digest(1))).count(), 8 - renames);
+    assert_eq!(store.journal(), Some(PublishJournal::new(digest(2), digest(2), Some(digest(1)), PublishState::Publishing).unwrap()));
+    (store, shared)
+}
+
+#[test]
+fn update_journal_is_durable_before_the_first_rename_and_restart_rolls_forward() {
+    // Fault between the journal write and the first rename: nothing replaced.
+    let (store, shared) = interrupted_apply(0);
+    assert_eq!(slots(&shared), [Some(digest(1)); 8]);
+    // The journal was on disk, read back, before publish touched anything.
+    let publishing = PublishJournal::new(digest(2), digest(2), Some(digest(1)), PublishState::Publishing).unwrap();
+    assert_eq!(shared.lock().unwrap().journal_at_publish, vec![Some(publishing)]);
+    // Restart: `publishing` is rolled forward before admission or any socket.
+    let (barrier, mut control) = restart(&store, &shared);
+    assert_eq!(control.startup().recovery, PublicationRecovery::RolledForward);
+    assert_eq!(control.effects.calls, vec!["verify", "publish"]);
+    assert_eq!(slots(&shared), [Some(digest(2)); 8]);
+    assert_eq!(store.journal(), Some(PublishJournal { state: PublishState::Published, ..publishing }));
+    // The drain record still holds admission closed for the generation.
+    assert_eq!(barrier.closure(), Some(DrainClosure::Generation(digest(2))));
+    // The journal stays until the Resume of its generation (after the commit).
+    accepted(&mut control, ControlCommand::Resume { generation: digest(2) });
+    assert_eq!(store.journal(), None);
+    assert!(!barrier.is_closed());
+}
+
+#[test]
+fn update_power_loss_after_each_rename_is_completed_on_restart() {
+    for renames in 1..=7 {
+        let (store, shared) = interrupted_apply(renames);
+        let (barrier, control) = restart(&store, &shared);
+        assert_eq!(control.startup().recovery, PublicationRecovery::RolledForward, "after {renames} renames");
+        assert_eq!(slots(&shared), [Some(digest(2)); 8], "after {renames} renames");
+        assert_eq!(store.journal().map(|journal| journal.state), Some(PublishState::Published));
+        assert_eq!(barrier.closure(), Some(DrainClosure::Generation(digest(2))));
+        // A second restart finds nothing to complete.
+        let (_, again) = restart(&store, &shared);
+        assert_eq!(again.startup().recovery, PublicationRecovery::AlreadyPublished);
+        assert_eq!(again.effects.calls, Vec::<&str>::new());
+    }
+}
+
+#[test]
+fn update_corrupt_generation_after_partial_publication_rolls_back() {
+    let (store, shared) = interrupted_apply(3);
+    // The new generation's directory no longer verifies.
+    shared.lock().unwrap().staged.retain(|generation| *generation != digest(2));
+    let (barrier, mut control) = restart(&store, &shared);
+    assert_eq!(control.startup().recovery, PublicationRecovery::RolledBack);
+    assert!(control.startup().recovery.consistent());
+    assert_eq!(slots(&shared), [Some(digest(1)); 8]);
+    // The roll-back is journaled like any publication; the interrupted generation is its fallback.
+    assert_eq!(store.journal(), Some(PublishJournal::new(digest(1), digest(1), Some(digest(2)), PublishState::Published).unwrap()));
+    // Admission stays closed: the record names generation 2, which is not installed.
+    assert_eq!(barrier.closure(), Some(DrainClosure::Generation(digest(2))));
+    let _admission = Observer::new(&barrier, 0);
+    refused_outcome(&mut control, ControlCommand::Resume { generation: digest(2) });
+    assert!(barrier.is_closed());
+    // The updater re-drains and resumes the generation actually installed.
+    accepted(&mut control, ControlCommand::Drain { generation: digest(1) });
+    accepted(&mut control, ControlCommand::Resume { generation: digest(1) });
+    assert_eq!(store.journal(), None);
+    assert!(!barrier.is_closed());
+}
+
+#[test]
+fn update_unrecoverable_publication_stays_not_ready_until_completed() {
+    let (store, shared) = interrupted_apply(3);
+    shared.lock().unwrap().staged.clear();
+    let (barrier, mut control) = restart(&store, &shared);
+    assert_eq!(control.startup().recovery, PublicationRecovery::Incomplete);
+    assert!(!control.startup().recovery.consistent());
+    assert_eq!(barrier.closure(), Some(DrainClosure::Recovery));
+    let status = serde_json::to_value(control.status()).unwrap();
+    assert_eq!((status["barrier"].as_str(), status["journal"].as_str(), status["publication_consistent"].as_bool(),
+        status["startup_recovery"].as_str(), status["admission_closed"].as_bool()),
+        (Some("recovery_incomplete"), Some("publishing"), Some(false), Some("incomplete"), Some(true)));
+    // The mixed set is left exactly as found (no further renames).
+    assert_eq!(slots(&shared).iter().filter(|slot| **slot == Some(digest(2))).count(), 3);
+    let _admission = Observer::new(&barrier, 0);
+    // No Resume lifts it, and Apply needs a re-keyed barrier and a verifiable generation.
+    refused_outcome(&mut control, ControlCommand::Resume { generation: digest(2) });
+    refused_outcome(&mut control, apply_command(digest(2)));
+    accepted(&mut control, ControlCommand::Drain { generation: digest(2) });
+    refused_outcome(&mut control, apply_command(digest(2)));
+    refused_outcome(&mut control, ControlCommand::Resume { generation: digest(2) });
+    assert!(barrier.is_closed());
+    // An operator restages the generation: the update endpoint completes it.
+    shared.lock().unwrap().staged.push(digest(2));
+    accepted(&mut control, apply_command(digest(2)));
+    assert_eq!(slots(&shared), [Some(digest(2)); 8]);
+    assert_eq!(serde_json::to_value(control.status()).unwrap()["publication_consistent"], true);
+    accepted(&mut control, ControlCommand::Resume { generation: digest(2) });
+    assert!(!barrier.is_closed());
+}
+
+#[test]
+fn update_unreadable_or_unknown_journal_is_not_ready() {
+    let good = PublishJournal::new(digest(2), digest(2), Some(digest(1)), PublishState::Published).unwrap().encode().unwrap();
+    let text = String::from_utf8(good).unwrap();
+    for bad in [text.replace('{', "{\"extra\":1,"), text.replace("\"schema\":1", "\"schema\":2"),
+        text.replace("published", "committed"), text.get(..text.len() / 2).unwrap().to_owned()] {
+        let store = MemoryStore::default();
+        let shared = new_world(&store, digest(1), &[digest(1), digest(2)]);
+        store.0.lock().unwrap().journal = Some(bad.clone().into_bytes());
+        let (barrier, mut control) = restart(&store, &shared);
+        assert_eq!(control.startup().recovery, PublicationRecovery::JournalUnreadable, "{bad}");
+        assert_eq!(barrier.closure(), Some(DrainClosure::Recovery));
+        // Never ignored: nothing was published or verified, and nothing reopens.
+        assert!(control.effects.calls.is_empty());
+        assert_eq!(serde_json::to_value(control.status()).unwrap()["journal"], "unreadable");
+        let _admission = Observer::new(&barrier, 0);
+        accepted(&mut control, ControlCommand::Drain { generation: digest(1) });
+        refused_outcome(&mut control, apply_command(digest(1)));
+        refused_outcome(&mut control, ControlCommand::Resume { generation: digest(1) });
+        assert!(barrier.is_closed());
+        assert_eq!(slots(&shared), [Some(digest(1)); 8]);
+    }
+}
+
+#[test]
+fn update_apply_refused_while_another_generation_is_publishing() {
+    let store = MemoryStore::default();
+    let shared = new_world(&store, digest(1), &[digest(1), digest(2), digest(3)]);
+    let barrier = DrainBarrier::default();
+    let _admission = Observer::new(&barrier, 0);
+    let mut control = UpdateControl::new(store.clone(), barrier.clone(), FakeEffects::over(&shared)).unwrap();
+    // A late failure in this process leaves `publishing` for 2 (4 of 8 replaced).
+    accepted(&mut control, ControlCommand::Drain { generation: digest(2) });
+    shared.lock().unwrap().power_loss_after = Some(4);
+    refused_outcome(&mut control, apply_command(digest(2)));
+    assert_eq!(store.journal().map(|journal| journal.state), Some(PublishState::Publishing));
+    control.effects.calls.clear();
+    accepted(&mut control, ControlCommand::Drain { generation: digest(3) });
+    refused_outcome(&mut control, apply_command(digest(3)));
+    assert!(control.effects.calls.is_empty());
+    assert_eq!(store.journal().map(|journal| journal.generation), Some(digest(2)));
+    // Rolling back to the journal's previous generation is allowed (it finishes the journal).
+    accepted(&mut control, ControlCommand::Drain { generation: digest(1) });
+    accepted(&mut control, apply_command(digest(1)));
+    assert_eq!(slots(&shared), [Some(digest(1)); 8]);
+    assert_eq!(store.journal(), Some(PublishJournal::new(digest(1), digest(1), Some(digest(2)), PublishState::Published).unwrap()));
+    // Once published, another generation may be applied; its previous is the installed one.
+    accepted(&mut control, ControlCommand::Drain { generation: digest(3) });
+    accepted(&mut control, apply_command(digest(3)));
+    assert_eq!(slots(&shared), [Some(digest(3)); 8]);
+    assert_eq!(store.journal(), Some(PublishJournal::new(digest(3), digest(3), Some(digest(1)), PublishState::Published).unwrap()));
+}
+
+#[test]
+fn update_drain_and_apply_refused_when_admission_is_unhealthy() {
+    let barrier = DrainBarrier::default();
+    let store = MemoryStore::default();
+    let admission = Observer::new(&barrier, 0);
+    admission.healthy.store(false, Ordering::Release);
+    let mut control = UpdateControl::new(store.clone(), barrier.clone(), FakeEffects::default()).unwrap();
+    // Zero runs from an unhealthy iteration is not a drain; the barrier stays closed and recorded.
+    refused_outcome(&mut control, ControlCommand::Drain { generation: digest(7) });
+    assert_eq!(barrier.closure(), Some(DrainClosure::Generation(digest(7))));
+    assert_eq!(store.clone().load().unwrap(), Some(digest(7)));
+    admission.healthy.store(true, Ordering::Release);
+    accepted(&mut control, ControlCommand::Drain { generation: digest(7) });
+    admission.healthy.store(false, Ordering::Release);
+    // Let an unhealthy iteration land before Apply's fresh observation.
+    std::thread::sleep(Duration::from_millis(30));
+    refused_outcome(&mut control, apply_command(digest(7)));
+    assert!(control.effects.calls.is_empty());
+    assert_eq!(store.journal(), None);
+    admission.healthy.store(true, Ordering::Release);
+    std::thread::sleep(Duration::from_millis(30));
+    accepted(&mut control, apply_command(digest(7)));
+}
+
+#[test]
+fn update_startup_status_and_audit_records() {
+    let store = MemoryStore::default();
+    {
+        let mut disk = store.0.lock().unwrap();
+        disk.bytes = Some(encode_record(digest(7)).unwrap());
+        disk.journal = Some(PublishJournal::new(digest(7), digest(7), Some(digest(6)), PublishState::Published)
+            .unwrap().encode().unwrap());
+    }
+    let barrier = DrainBarrier::default();
+    let mut control = UpdateControl::new(store.clone(), barrier, FakeEffects::default()).unwrap();
+    let hex7 = "07".repeat(32);
+    assert_eq!(serde_json::to_value(control.status()).unwrap(), serde_json::json!({
+        "schema": 1, "admission_closed": true, "barrier": "drained", "barrier_generation": hex7,
+        "journal": "published", "journal_generation": hex7, "journal_previous": "06".repeat(32),
+        "publication_consistent": true, "startup_barrier": "drained", "startup_barrier_generation": hex7,
+        "startup_recovery": "already_published" }));
+    let records = control.startup().audit_records(42);
+    assert_eq!(records.len(), 2);
+    assert_eq!((records[0].event, records[0].at_unix_ms, records[0].detail.clone()),
+        (crate::audit::Event::UpdateBarrierRestored, 42, Some(Detail::UpdateBarrier { generation: Some(digest(7)) })));
+    assert_eq!((records[1].event, records[1].detail.clone()), (crate::audit::Event::PublicationRecovery,
+        Some(Detail::PublicationRecovery { action: PublicationRecovery::AlreadyPublished, generation: Some(digest(7)),
+            previous: Some(digest(6)) })));
+    for record in &records { assert!(serde_json::to_vec(record).unwrap().len() < 1024); }
+    // An unreadable record is audited without a generation; no journal, no journal record.
+    let store = MemoryStore::default();
+    store.0.lock().unwrap().bytes = Some(b"{\"version\":1".to_vec());
+    let mut control = UpdateControl::new(store, DrainBarrier::default(), FakeEffects::default()).unwrap();
+    let records = control.startup().audit_records(1);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].detail, Some(Detail::UpdateBarrier { generation: None }));
+    let status = serde_json::to_value(control.status()).unwrap();
+    assert_eq!((status["barrier"].as_str(), status["startup_barrier"].as_str(), status["journal"].as_str(),
+        status["startup_recovery"].as_str()), (Some("unreadable_record"), Some("unreadable_record"), Some("absent"),
+        Some("no_journal")));
+    // Nothing found: nothing audited.
+    let control = UpdateControl::new(MemoryStore::default(), DrainBarrier::default(), FakeEffects::default()).unwrap();
+    assert!(control.startup().audit_records(1).is_empty());
 }
 
 #[test]
@@ -316,7 +640,7 @@ fn reserve(coordinator: &mut Coordinator<OneRunHost>, n: u8, now: u64) {
 }
 /// Answer one request on its own thread (as in production) while this thread
 /// is the admission loop: tick, then report the admitted runs of the iteration.
-fn respond_while_admitting<S: DrainStore + Send + 'static, E: Effects + Send + 'static>(control: UpdateControl<S, E>,
+fn respond_while_admitting<S: DrainStore + JournalStore + Send + 'static, E: Effects + Send + 'static>(control: UpdateControl<S, E>,
     command: ControlCommand, coordinator: &mut Coordinator<OneRunHost>, barrier: &DrainBarrier, now: &mut u64)
     -> (UpdateControl<S, E>, ControlRequest, ControlResponse) {
     let request = request(command);
@@ -336,7 +660,7 @@ fn respond_while_admitting<S: DrainStore + Send + 'static, E: Effects + Send + '
 }
 
 /// Shared by the unit test (memory store) and the root test (disk store).
-fn drain_waits_for_active_run<S: DrainStore + Clone + Send + 'static>(store: S) {
+fn drain_waits_for_active_run<S: DrainStore + JournalStore + Clone + Send + 'static>(store: S) {
     let barrier = DrainBarrier::default();
     let mut coordinator = Coordinator::new(OneRunHost::default(), Limits::default()).unwrap();
     coordinator.set_drain_barrier(barrier.clone());
@@ -611,23 +935,44 @@ impl RootTree {
             assert!(std::fs::symlink_metadata(path.with_file_name(format!("{}.next", artifact_name(&target).unwrap()))).is_err());
         }
     }
+    fn effects(&self) -> InstalledEffects { InstalledEffects::for_test(&self.install, &self.publish) }
     fn control(&self, barrier: &DrainBarrier) -> UpdateControl<DiskDrainStore, InstalledEffects> {
-        UpdateControl::new(DiskDrainStore::at(&self.state), barrier.clone(),
-            InstalledEffects::for_test(&self.install, &self.publish)).unwrap()
+        self.control_with(barrier, self.effects())
+    }
+    /// A (re)start: the barrier is restored and the journal settled in `new`.
+    fn control_with(&self, barrier: &DrainBarrier, effects: InstalledEffects) -> UpdateControl<DiskDrainStore, InstalledEffects> {
+        UpdateControl::new(DiskDrainStore::at(&self.state), barrier.clone(), effects).unwrap()
+    }
+    /// The updater's selector swap (`current` -> `generations/<hex>`), as root.
+    fn select(&self, generation: Sha256Digest) {
+        let current = self.install.join("current");
+        let _ = std::fs::remove_file(&current);
+        std::os::unix::fs::symlink(format!("generations/{}", hex(&generation)), &current).unwrap();
+    }
+    fn journal(&self) -> Option<PublishJournal> { DiskDrainStore::at(&self.state).load_journal().unwrap() }
+    /// Overwrite one staged artifact so the generation no longer verifies.
+    fn corrupt(&self, generation: Sha256Digest) {
+        std::fs::write(self.install.join("generations").join(hex(&generation)).join("duduclaw-run"), b"#!/bin/false\ntampered\n").unwrap();
     }
 }
 
 fn activate(tree: &RootTree, control: &mut UpdateControl<DiskDrainStore, InstalledEffects>, manifest: &ReleaseManifest,
-    generation: Sha256Digest, seed: u8) {
+    generation: Sha256Digest, seed: u8, previous: Option<Sha256Digest>) {
     let preparation = Preparation::for_manifest(manifest, generation);
     accepted(control, ControlCommand::Prepare { preparation: preparation.clone() });
     accepted(control, ControlCommand::Drain { generation });
     assert_eq!(DiskDrainStore::at(&tree.state).load().unwrap(), Some(generation));
     accepted(control, ControlCommand::Apply { preparation: preparation.clone() });
     tree.assert_published(seed);
-    // A retried Apply (lost reply) is idempotent.
+    let published = PublishJournal::new(generation, generation, previous, PublishState::Published).unwrap();
+    assert_eq!(tree.journal(), Some(published));
+    let metadata = std::fs::symlink_metadata(tree.state.join(JOURNAL_FILE)).unwrap();
+    assert_eq!((metadata.mode() & 0o7777, metadata.uid(), metadata.nlink()), (0o600, 0, 1));
+    // A retried Apply (lost reply) is idempotent and keeps the journal's previous.
     accepted(control, ControlCommand::Apply { preparation });
     tree.assert_published(seed);
+    assert_eq!(tree.journal(), Some(published));
+    tree.select(generation);
     let request = request(ControlCommand::Readback { generation });
     let response = control.respond(&request);
     validate_response(&request, &response).unwrap();
@@ -640,6 +985,8 @@ fn activate(tree: &RootTree, control: &mut UpdateControl<DiskDrainStore, Install
     assert!(run.ready && run.build_sha256 == expected.sha256);
     accepted(control, ControlCommand::Resume { generation });
     assert_eq!(DiskDrainStore::at(&tree.state).load().unwrap(), None);
+    // Removed only by the Resume that follows the commit.
+    assert_eq!(tree.journal(), None);
 }
 
 #[test]
@@ -653,9 +1000,9 @@ fn iso_root_update_apply_end_to_end_two_generations() {
     let (first, manifest) = tree.stage(1);
     let absent = Sha256Digest([0xab; 32]);
     accepted(&mut control, ControlCommand::Prepare { preparation: preparation(absent) });
-    activate(&tree, &mut control, &manifest, first, 1);
+    activate(&tree, &mut control, &manifest, first, 1, None);
     let (second, next) = tree.stage(2);
-    activate(&tree, &mut control, &next, second, 2);
+    activate(&tree, &mut control, &next, second, 2, Some(first));
     // A stale or foreign generation can never be applied once admission reopened.
     assert!(matches!(outcome(&mut control, ControlCommand::Apply { preparation: Preparation::for_manifest(&manifest, first) }),
         ControlOutcome::Refused));
@@ -669,6 +1016,9 @@ fn iso_root_update_apply_end_to_end_two_generations() {
     accepted(&mut control, ControlCommand::Drain { generation: third });
     assert!(matches!(outcome(&mut control, ControlCommand::Apply { preparation: Preparation::for_manifest(&last, third) }),
         ControlOutcome::Refused));
+    // Refused during verification, before the journal: nothing to recover.
+    assert_eq!(tree.journal(), None);
+    tree.assert_published(2);
     accepted(&mut control, ControlCommand::Resume { generation: third });
 }
 
@@ -685,6 +1035,31 @@ impl DrainStore for DiskStoreHandle {
     fn load(&mut self) -> io::Result<Option<Sha256Digest>> { DiskDrainStore::at(&self.0).load() }
     fn persist(&mut self, generation: Sha256Digest) -> io::Result<()> { DiskDrainStore::at(&self.0).persist(generation) }
     fn clear(&mut self) -> io::Result<()> { DiskDrainStore::at(&self.0).clear() }
+}
+impl JournalStore for DiskStoreHandle {
+    fn load_journal(&mut self) -> io::Result<Option<PublishJournal>> { DiskDrainStore::at(&self.0).load_journal() }
+    fn persist_journal(&mut self, journal: &PublishJournal) -> io::Result<()> {
+        DiskDrainStore::at(&self.0).persist_journal(journal)
+    }
+    fn clear_journal(&mut self) -> io::Result<()> { DiskDrainStore::at(&self.0).clear_journal() }
+}
+impl RootTree {
+    /// How many fixed destinations hold generation `seed`'s bytes.
+    fn count_published(&self, seed: u8) -> usize {
+        publication().into_iter().filter(|(target, directory)| {
+            std::fs::read(self.publish.join(directory).join(artifact_name(target).unwrap())).unwrap() == Self::content(target, seed)
+        }).count()
+    }
+    /// One `Drain` + `Apply` of `generation` that loses power after `renames` renames.
+    fn interrupted_apply(&self, manifest: &ReleaseManifest, generation: Sha256Digest, renames: usize) {
+        let barrier = DrainBarrier::default();
+        let _admission = Observer::new(&barrier, 0);
+        let mut effects = self.effects();
+        effects.power_loss_after = Some(renames);
+        let mut control = self.control_with(&barrier, effects);
+        accepted(&mut control, ControlCommand::Drain { generation });
+        refused_outcome(&mut control, ControlCommand::Apply { preparation: Preparation::for_manifest(manifest, generation) });
+    }
 }
 
 #[test]
@@ -722,25 +1097,86 @@ fn iso_root_update_power_loss_each_phase() {
     let (barrier, mut control) = restart();
     assert_eq!(barrier.closure(), None);
     accepted(&mut control, ControlCommand::Resume { generation: digest(7) });
-    // 5. Loss in the middle of Apply: two components already renamed, a torn
-    //    temporary for the third. The retried Apply completes every component.
+    drop(_admission);
+    // 5. Loss in the middle of Apply after N of the 8 renames (N = 0: between
+    //    the journal write and the first rename), a torn `.next` left behind.
+    //    The restart (before any socket or admission) finds `publishing`,
+    //    re-verifies the generation and completes it; the journal says `published`.
     let (first, manifest) = tree.stage(1);
-    let barrier = DrainBarrier::default();
-    let _admission = Observer::new(&barrier, 0);
-    let mut control = tree.control(&barrier);
-    activate(&tree, &mut control, &manifest, first, 1);
     let (second, next) = tree.stage(2);
-    for target in [InstallTarget::Spawnd, InstallTarget::Trampoline] {
-        let path = tree.publish.join("usr/lib/duduclaw").join(artifact_name(&target).unwrap());
-        let staged = tree.install.join("generations").join(hex(&second)).join(artifact_name(&target).unwrap());
-        let temporary = path.with_file_name("partial.tmp");
-        std::fs::copy(&staged, &temporary).unwrap();
-        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::rename(&temporary, &path).unwrap();
+    {
+        let barrier = DrainBarrier::default();
+        let _admission = Observer::new(&barrier, 0);
+        let mut control = tree.control(&barrier);
+        activate(&tree, &mut control, &manifest, first, 1, None);
     }
-    std::fs::write(tree.publish.join("usr/libexec/duduclaw/duduclaw-parse-worker.next"), b"torn").unwrap();
-    accepted(&mut control, ControlCommand::Drain { generation: second });
-    accepted(&mut control, ControlCommand::Apply { preparation: Preparation::for_manifest(&next, second) });
-    tree.assert_published(2);
-    accepted(&mut control, ControlCommand::Resume { generation: second });
+    let publishing = PublishJournal::new(second, second, Some(first), PublishState::Publishing).unwrap();
+    for renames in 0..=7 {
+        tree.assert_published(1);
+        assert_eq!(tree.journal(), None);
+        tree.interrupted_apply(&next, second, renames);
+        assert_eq!(tree.count_published(2), renames, "after {renames} renames");
+        assert_eq!(tree.count_published(1), 8 - renames, "after {renames} renames");
+        assert_eq!(tree.journal(), Some(publishing));
+        let barrier = DrainBarrier::default();
+        let mut control = tree.control(&barrier);
+        assert_eq!(control.startup().recovery, PublicationRecovery::RolledForward, "after {renames} renames");
+        tree.assert_published(2);
+        assert_eq!(tree.journal(), Some(PublishJournal { state: PublishState::Published, ..publishing }));
+        assert_eq!(barrier.closure(), Some(DrainClosure::Generation(second)));
+        // Back to generation 1 for the next round: the updater's roll-back path
+        // (Apply of the installed-before generation, then its Resume).
+        let _admission = Observer::new(&barrier, 0);
+        accepted(&mut control, ControlCommand::Drain { generation: first });
+        accepted(&mut control, ControlCommand::Apply { preparation: Preparation::for_manifest(&manifest, first) });
+        assert_eq!(tree.journal(), Some(PublishJournal::new(first, first, Some(second), PublishState::Published).unwrap()));
+        accepted(&mut control, ControlCommand::Resume { generation: first });
+    }
+    // 6. Partial publication, then the new generation's directory is corrupted:
+    //    the restart rolls back to the journal's previous generation with the
+    //    same procedure, and all eight destinations hold its bytes.
+    tree.interrupted_apply(&next, second, 5);
+    assert_eq!(tree.count_published(2), 5);
+    tree.corrupt(second);
+    {
+        let barrier = DrainBarrier::default();
+        let mut control = tree.control(&barrier);
+        assert_eq!(control.startup().recovery, PublicationRecovery::RolledBack);
+        tree.assert_published(1);
+        assert_eq!(tree.journal(), Some(PublishJournal::new(first, first, Some(second), PublishState::Published).unwrap()));
+        let _admission = Observer::new(&barrier, 0);
+        accepted(&mut control, ControlCommand::Drain { generation: first });
+        accepted(&mut control, ControlCommand::Resume { generation: first });
+        assert_eq!(tree.journal(), None);
+    }
+    // 7. Neither the generation nor its previous can be completed: not ready
+    //    (admission closed by `Recovery`), the mixed set is left as found, and
+    //    the root-only status file says so.
+    let (third, last) = tree.stage(3);
+    tree.interrupted_apply(&last, third, 2);
+    tree.corrupt(third);
+    tree.corrupt(first);
+    let barrier = DrainBarrier::default();
+    let mut control = tree.control(&barrier);
+    assert_eq!(control.startup().recovery, PublicationRecovery::Incomplete);
+    assert_eq!(barrier.closure(), Some(DrainClosure::Recovery));
+    assert_eq!(tree.count_published(3), 2);
+    refused_outcome(&mut control, ControlCommand::Resume { generation: third });
+    write_status(&tree.state, &control.status()).unwrap();
+    let path = tree.state.join(STATUS_FILE);
+    let metadata = std::fs::symlink_metadata(&path).unwrap();
+    assert_eq!((metadata.mode() & 0o7777, metadata.uid(), metadata.nlink()), (0o600, 0, 1));
+    let status: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(status, serde_json::json!({
+        "schema": 1, "admission_closed": true, "barrier": "recovery_incomplete", "barrier_generation": null,
+        "journal": "publishing", "journal_generation": hex(&third), "journal_previous": hex(&first),
+        "publication_consistent": false, "startup_barrier": "drained", "startup_barrier_generation": hex(&third),
+        "startup_recovery": "incomplete" }));
+    // An unreadable journal is never ignored either.
+    drop(control);
+    std::fs::write(tree.state.join(JOURNAL_FILE), b"{\"schema\":2}").unwrap();
+    let barrier = DrainBarrier::default();
+    let control = tree.control(&barrier);
+    assert_eq!(control.startup().recovery, PublicationRecovery::JournalUnreadable);
+    assert_eq!(barrier.closure(), Some(DrainClosure::Recovery));
 }

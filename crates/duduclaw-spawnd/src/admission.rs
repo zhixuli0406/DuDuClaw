@@ -79,6 +79,11 @@ pub enum DrainClosure {
     Generation(duduclaw_isolation::ids::Sha256Digest),
     /// A record exists but could not be read or parsed: closed, generation unknown.
     Unreadable,
+    /// The publication journal (`publish.json`) could not be completed or read at
+    /// start: the installed components may be a mixed set. Like `Unreadable`, no
+    /// `Resume` lifts it; a `Drain` re-keys it, and `Resume` then still requires a
+    /// consistent journal.
+    Recovery,
 }
 /// What the admission loop saw in one full iteration that began at `epoch`.
 #[derive(Clone, Copy, Debug)]

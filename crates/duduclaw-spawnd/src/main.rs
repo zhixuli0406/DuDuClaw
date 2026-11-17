@@ -19,10 +19,22 @@ fn main() {
             let gateway = server::gateway_identity()?;
             duduclaw_spawnd::transport::prepare_runtime_directory()?;
             let audit = AuditWorker::start()?;
+            // R6: the drain barrier and the publication journal are settled
+            // (roll forward / roll back / not ready) before any socket is bound
+            // (LinuxHost::open binds the allocation socket) and before admission.
+            let update = duduclaw_spawnd::update_control::recover(&audit)?;
             let host = LinuxHost::open(gateway, Components::installed(), audit.clone())?;
             let listener = server::listener(gateway.1)?;
-            // R6: restore the durable drain barrier before the first admission.
-            let drain = duduclaw_spawnd::update_control::start()?;
+            let ready = update.ready();
+            let drain = update.serve()?;
+            // Type=notify: units ordered after spawnd start only on a consistent
+            // set. Not ready: no READY=1 (the unit stays activating, admission
+            // closed, update.sock answering root) until an operator acts.
+            if ready {
+                duduclaw_spawnd::update_control::notify("READY=1")?;
+            } else {
+                let _ = duduclaw_spawnd::update_control::notify("STATUS=update publication incomplete; see /run/duduclaw-spawnd/update-status.json");
+            }
             let snapshots = host.snapshots;
             let limits = Limits { host_ptys: host.host_ptys, ..Limits::default() };
             server::serve_with_drain(listener, gateway, snapshots, host, limits, audit, Some(drain))

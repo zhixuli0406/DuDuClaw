@@ -7182,7 +7182,7 @@
       "rationale": "spawnd starts one fresh Rust thread that unshares CLONE_FS|CLONE_NEWNS to compose the native home mount in a disposable namespace and returns a detached clone; no employee process or OS child is started."
     },
     {
-      "symbol": "crates/duduclaw-spawnd/src/update_control.rs::start",
+      "symbol": "crates/duduclaw-spawnd/src/update_control.rs::Recovered::serve",
       "apis": {
         "terminal_spawn": 1
       },

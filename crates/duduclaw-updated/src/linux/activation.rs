@@ -130,7 +130,9 @@ fn parse_current(target: &[u8]) -> Result<Sha256Digest> {
     if hex::encode(bytes) != encoded { return Err(Error::Maintenance); }
     Ok(Sha256Digest(bytes))
 }
-pub(crate) fn read_current_at(install: &Directory) -> Result<Sha256Digest> {
+/// The generation `current` names below an install root (also spawnd's
+/// publication journal: the generation installed before an `Apply`).
+pub fn read_current_at(install: &Directory) -> Result<Sha256Digest> {
     let current = literal("current")?;
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     if unsafe { libc::fstatat(install.raw_fd(), current.as_ptr(), stat.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) } != 0 {

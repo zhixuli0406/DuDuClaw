@@ -359,6 +359,10 @@ fn cleanup_generations(shared: &Arc<Mutex<Service>>, root: &Directory, generatio
             Err(e) => return Err(e),
         }
     }
+    // spawnd's publication journal: the generation being published and its
+    // roll-back target stay until spawnd removes the journal (at the Resume that
+    // follows the commit or the roll-back). An unreadable journal stops pruning.
+    keep.extend(publication_journal_generations()?.into_iter().map(|digest| hex::encode(digest.0)));
     let current = hex::encode(super::activation::read_current()?.0);
     if !keep.iter().any(|entry| entry == &current) { return Err(Error::Maintenance); }
     for entry in generations.entries(64)? {
@@ -366,6 +370,21 @@ fn cleanup_generations(shared: &Arc<Mutex<Service>>, root: &Directory, generatio
         if !keep.iter().any(|name| name == &entry) { generations.remove_artifact_directory(&entry)?; }
     }
     Ok(())
+}
+/// Generations named by `/var/lib/duduclaw-spawnd/publish.json` (none when
+/// spawnd's state directory or the journal does not exist).
+fn publication_journal_generations() -> Result<Vec<Sha256Digest>> {
+    use crate::publish_journal::{PublishJournal, JOURNAL_DIRECTORY, JOURNAL_FILE, MAX_JOURNAL_BYTES};
+    let directory = match Directory::open(Path::new(JOURNAL_DIRECTORY)) {
+        Ok(directory) => directory,
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(e),
+    };
+    match directory.bytes(JOURNAL_FILE, MAX_JOURNAL_BYTES) {
+        Ok(bytes) => Ok(PublishJournal::parse(&bytes)?.retained().collect()),
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(vec![]),
+        Err(e) => Err(e),
+    }
 }
 pub fn artifact_name(target: &InstallTarget) -> Result<String> {
     crate::publication::artifact_name(target)

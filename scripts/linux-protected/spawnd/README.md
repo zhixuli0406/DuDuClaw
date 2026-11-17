@@ -37,8 +37,22 @@ unit provides PID 1 shutdown cleanup, followed by startup residue reconciliation
 The daemon also binds the root-only update control socket
 `/run/duduclaw-spawnd/update.sock` (root 0600) for `duduclaw-updated`. Its
 `Apply` republishes the verified generation's root components, so the unit adds
-`ReadWritePaths=-/usr/lib/duduclaw -/usr/libexec/duduclaw -/opt/duduclaw/bin`.
+`ReadWritePaths=-/usr/lib/duduclaw -/usr/libexec/duduclaw -/opt/duduclaw/bin`:
+atomic replacement creates `<name>.next` inside each directory and renames it,
+which needs directory write access, broader than the eight fixed files. Narrowing
+it needs a separate narrow publisher helper (known residual, plan R6).
 The drain barrier is kept in `/var/lib/duduclaw-spawnd/drain.json` across restarts.
+
+The unit is `Type=notify` (`NotifyAccess=main`, `TimeoutStartSec=infinity`).
+spawnd sends `READY=1` only after its publication journal
+(`/var/lib/duduclaw-spawnd/publish.json`) is settled and `update.sock` is bound;
+if neither roll-forward nor roll-back completes, it withholds `READY=1`, keeps
+admission closed and keeps answering root on `update.sock` (status in
+`/run/duduclaw-spawnd/update-status.json`). `duduclaw-egress.service` has
+`Requires=` + `After=duduclaw-spawnd.service`. The gateway unit
+(`duduclaw_core::root_key::recovery::protected_unit_text`) must add the same two
+lines in the installer package; until then the gateway can start on a set that
+spawnd is still recovering.
 
 The native Linux service lifecycle and D-Bus fd handoff require root VM testing
 on systemd 249, 252 and 255. No installation or activation has been performed by

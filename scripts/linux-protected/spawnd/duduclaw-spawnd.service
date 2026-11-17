@@ -4,7 +4,15 @@ Requires=duduclaw-spawnd.socket
 After=duduclaw-spawnd.socket dbus.service
 
 [Service]
-Type=simple
+# R6: READY=1 only after the update publication journal is settled (rolled
+# forward/back, or nothing to do) and update.sock is bound, so units ordered
+# After=+Requires= this one never run on a mixed set of root components. When
+# recovery cannot complete, READY=1 is withheld (admission stays closed and
+# update.sock keeps answering root) until a consistent set is restored; hence
+# no start timeout. See /run/duduclaw-spawnd/update-status.json.
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=infinity
 User=root
 Group=root
 ExecStart=/usr/lib/duduclaw/duduclaw-spawnd
@@ -30,6 +38,9 @@ ReadWritePaths=/var/lib/duduclaw-spawnd /var/log/duduclaw-spawnd /run/duduclaw-s
 ReadWritePaths=-/sys/fs/cgroup/duduclaw.slice/duduclaw-employees.slice
 # R6 update Apply (update.sock, root peers only) republishes the verified
 # generation's root components at these fixed paths: file.next + fsync + rename.
+# Atomic replacement creates file.next in, and renames within, each directory, so
+# the whole directory must be writable (broader than the eight fixed files).
+# Narrowing this needs a separate narrow publisher helper (known residual, R6).
 ReadWritePaths=-/usr/lib/duduclaw -/usr/libexec/duduclaw -/opt/duduclaw/bin
 ProtectHome=yes
 PrivateTmp=yes
