@@ -434,6 +434,8 @@ class ManifestSigningTests(unittest.TestCase):
             directory = Path(temporary).resolve()
             key = directory / "duduclaw-root-r1-handle"
             key.write_text("handle")
+            # A software key (its .pub says so): no ssh-sk-helper is needed for it.
+            Path(str(key) + ".pub").write_text("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA test\n")
             fake, record = recording_tool(directory, "ssh-keygen", 1)
             template = directory / "template.json"
             template.write_text('{"a":1}')
@@ -452,9 +454,12 @@ class ManifestSigningTests(unittest.TestCase):
             self.assertNotIn(key.name, json.dumps(call["argv"]))
             self.assertNotIn(key.name, json.dumps(call["env"]))
             names = set(call["env"]) - {"LC_CTYPE", "__CF_USER_TEXT_ENCODING"}
-            self.assertLessEqual(names, {"PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR"})
-            for name in ("SSH_AUTH_SOCK", "DUDUCLAW_OTHER", "SSH_SK_HELPER", "PYTHONPATH"):
+            self.assertLessEqual(names, {"PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR", "SSH_SK_HELPER"})
+            for name in ("SSH_AUTH_SOCK", "DUDUCLAW_OTHER", "PYTHONPATH"):
                 self.assertNotIn(name, call["env"])
+            # Never the caller's SSH_SK_HELPER: this installation has no helper, so ssh-keygen -Y sign
+            # gets a never-created path inside the private key-link directory (it cannot start any).
+            self.assertEqual(call["env"]["SSH_SK_HELPER"], str(link.parent / SIGN.NO_SK_HELPER_NAME))
             self.assertEqual(call["env"]["PATH"], "/usr/bin:/bin:/usr/sbin:/sbin")
             self.assertFalse(link.parent.exists())  # removed although signing failed
             self.assertFalse((directory / "out.json").exists())
@@ -489,6 +494,173 @@ class ManifestSigningTests(unittest.TestCase):
                                              env=clean_environment())
                     self.assertNotEqual(refused.returncode, 0)
                     self.assertIn(message, refused.stderr)
+
+    # ---------------------------------------------------------------- FIDO2: ssh-sk-helper of the selected ssh-keygen
+
+    def fake_installation(self, directory, with_helper=True):
+        """<prefix>/bin/ssh-keygen (records its environment, writes a placeholder signature) and,
+        optionally, <prefix>/libexec/ssh-sk-helper: an installation like /usr or a Homebrew keg."""
+        prefix = directory / "prefix"
+        for sub in ("bin", "libexec"):
+            (prefix / sub).mkdir(parents=True)
+            (prefix / sub).chmod(0o755)
+        prefix.chmod(0o755)
+        record = directory / "ssh-keygen.json"
+        keygen = prefix / "bin/ssh-keygen"
+        keygen.write_text(f"#!{sys.executable} -I\nimport json, os, sys\n"
+                          f"json.dump({{'argv': sys.argv, 'env': dict(os.environ)}}, open({str(record)!r}, 'w'))\n"
+                          "open(sys.argv[-1] + '.sig', 'w').write('placeholder signature')\n")
+        keygen.chmod(0o755)
+        helper = prefix / "libexec/ssh-sk-helper"
+        if with_helper:
+            helper.write_text("#!/bin/sh\nexit 1\n")
+            helper.chmod(0o755)
+        return keygen, helper, record
+
+    def sign_emergency(self, directory, keygen, key, *extra):
+        template = directory / "template.json"
+        template.write_text('{"a":1}')
+        output = directory / "out.json"
+        result = subprocess.run([sys.executable, "-I", str(SCRIPT), "--kind", "emergency", "--template",
+                                 str(template), "--output", str(output), "--ssh-keygen", str(keygen), *extra],
+                                input=f"{key}\n", capture_output=True, text=True,
+                                env=clean_environment({"SSH_SK_HELPER": "/evil/ssh-sk-helper"}))
+        return result, output
+
+    def test_sk_helper_is_the_selected_installations_and_only_ssh_keygen_sign_gets_it(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary).resolve()
+            keygen, helper, record = self.fake_installation(directory)
+            key = directory / "duduclaw-target-sk-handle"
+            key.write_text("handle")
+            Path(str(key) + ".pub").write_text("sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29t x\n")
+            self.assertEqual(SIGN.sk_helper_candidates(str(keygen))[0], str(helper))
+            result, output = self.sign_emergency(directory, keygen, key)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(output.exists())
+            call = json.loads(record.read_text())
+            self.assertEqual(call["argv"][1:3], ["-Y", "sign"])
+            # Exactly the audited helper next to the selected ssh-keygen, never the caller's value.
+            self.assertEqual(call["env"]["SSH_SK_HELPER"], os.path.realpath(helper))
+            names = set(call["env"]) - {"LC_CTYPE", "__CF_USER_TEXT_ENCODING"}
+            self.assertLessEqual(names, {"PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR", "SSH_SK_HELPER"})
+            # No other child gets it: the shared child environment never carries SSH_SK_HELPER.
+            self.assertNotIn("SSH_SK_HELPER", SIGN.child_environment({"SSH_SK_HELPER": "/evil", "HOME": "/h"}))
+            # An explicitly given helper must be an audited libexec/ssh-sk-helper.
+            output.unlink()
+            Path(str(output) + ".signatures.json").unlink()
+            result, output = self.sign_emergency(directory, keygen, key, "--ssh-sk-helper", str(keygen))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("--ssh-sk-helper must be the absolute path of libexec/ssh-sk-helper", result.stderr)
+            self.assertFalse(output.exists())
+            helper.chmod(0o777)  # group/other-writable: the audit refuses it, nothing is skipped
+            record.unlink()
+            result, output = self.sign_emergency(directory, keygen, key)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("refusing", result.stderr)
+            self.assertFalse(record.exists())
+            self.assertFalse(output.exists())
+
+    def test_security_key_without_a_helper_in_the_selected_installation_is_refused(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary).resolve()
+            keygen, helper, record = self.fake_installation(directory, with_helper=False)
+            for name, public in (("sk-handle", "sk-ssh-ed25519@openssh.com AAAA x\n"), ("no-public", None)):
+                with self.subTest(key=name):
+                    key = directory / name
+                    key.write_text("handle")
+                    if public is not None:
+                        Path(str(key) + ".pub").write_text(public)
+                    result, output = self.sign_emergency(directory, keygen, key)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("has no ssh-sk-helper in its installation", result.stderr)
+                    self.assertIn(str(helper), result.stderr)
+                    self.assertNotIn(name, result.stderr)  # messages never name the key location
+                    self.assertFalse(record.exists())  # ssh-keygen never ran
+                    self.assertFalse(output.exists())
+            self.assertTrue(SIGN.may_be_security_key(directory / "no-public"))
+            software = directory / "software"
+            Path(str(software) + ".pub").write_text("ssh-ed25519 AAAA x\n")
+            self.assertFalse(SIGN.may_be_security_key(software))
+
+    # ---------------------------------------------------------------- target key of the pinned root
+
+    def release_inputs(self, directory):
+        template = directory / "release-template.json"
+        template.write_text(json.dumps({"artifacts": [{"id": "a", "mode": 0o755, "install_target": {"kind": "gateway"}}]}))
+        artifacts = directory / "artifacts"
+        artifacts.mkdir()
+        (artifacts / "a").write_bytes(b"\x7fELF-placeholder")
+        return template, artifacts
+
+    def sign_release_manifest(self, directory, name, key, *extra):
+        template, artifacts = (directory / "release-template.json", directory / "artifacts")
+        output = directory / f"{name}.json"
+        result = run_production([sys.executable, "-I", str(SCRIPT), "--kind", "release", "--template", str(template),
+                                 "--artifacts-dir", str(artifacts), "--output", str(output), "--ssh-keygen", SSH_KEYGEN,
+                                 *extra], [key])
+        return result, output
+
+    @unittest.skipUnless(SSH_KEYGEN, "requires OpenSSH ssh-keygen")
+    def test_release_manifest_must_verify_against_the_target_key_of_the_pinned_root(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary).resolve()
+            r1, r2, r3 = (generate_key(directory, name) for name in ("r1", "r2", "r3"))
+            root = directory / "root.json"
+            root.write_bytes(SIGN.canonical_bytes(root_document([r1, r2, r3])))  # target_key = r3
+            pin = hashlib.sha256(root.read_bytes()).hexdigest()
+            self.release_inputs(directory)
+            pinned = ["--root-metadata", str(root), "--root-sha256", pin]
+            # A wrong but valid key (here a root key) is refused before anything is written.
+            result, output = self.sign_release_manifest(directory, "wrong", r1, *pinned)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("not the target key of the pinned root metadata", result.stderr)
+            self.assertIn("nothing was written", result.stderr)
+            self.assertFalse(output.exists())
+            self.assertFalse(Path(str(output) + ".signatures.json").exists())
+            # The pin binds the root that names the target key.
+            result, output = self.sign_release_manifest(directory, "unpinned", r3, "--root-metadata", str(root),
+                                                        "--root-sha256", "0" * 64)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("does not match --root-sha256", result.stderr)
+            self.assertFalse(output.exists())
+            # The target key: written, and the written files verify again (--check-target).
+            result, output = self.sign_release_manifest(directory, "good", r3, *pinned)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            def check(*extra):
+                return subprocess.run([sys.executable, "-I", str(SCRIPT), "--kind", "release", "--check-target",
+                                       str(output), "--ssh-keygen", SSH_KEYGEN, *extra], capture_output=True, text=True)
+            valid = check(*pinned)
+            self.assertEqual(valid.returncode, 0, valid.stderr)
+            self.assertIn("the manifest signature verified", valid.stdout)
+            self.assertIn("requires --root-metadata", check().stderr)
+            # A valid signature of another key over the very same bytes is refused.
+            other, other_output = self.sign_release_manifest(directory, "other", r1)
+            self.assertEqual(other.returncode, 0, other.stderr)
+            self.assertEqual(other_output.read_bytes(), output.read_bytes())
+            result = check(*pinned, "--signatures", str(other_output) + ".signatures.json")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("not the target key", result.stderr)
+            # A flipped byte of the target signature fails ssh-keygen -Y verify.
+            armors = json.loads(Path(str(output) + ".signatures.json").read_text())
+            blob = unarmor(armors[0])
+            blob[-32] ^= 1
+            tampered = directory / "tampered.json"
+            tampered.write_text(json.dumps([rearmor(blob)]))
+            result = check(*pinned, "--signatures", str(tampered))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("does not verify", result.stderr)
+            # A revoked target key is refused.
+            revoked = directory / "revoked-root.json"
+            revoked.write_bytes(SIGN.canonical_bytes(root_document(
+                [r1, r2, r3], revoked=[hashlib.sha256(bytes(root_document([r3])["root_keys"][0]["public_blob"]))
+                                       .digest()])))
+            self.assertIn("revoked", check("--root-metadata", str(revoked)).stderr)
+            # Verification is mandatory.
+            with self.assertRaises(ValueError):
+                SIGN.check_target_signature(armors, root.read_bytes(), SIGN.NAMESPACES["release"], output.read_bytes(),
+                                            None)
 
     # ---------------------------------------------------------------- R2-5 / finding 3: verified signers
 

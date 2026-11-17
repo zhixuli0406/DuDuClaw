@@ -179,19 +179,30 @@ jobs:
           GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" \
             GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
             git fetch --no-tags --depth=1 origin "$WORKFLOW_SHA"
-          # The token is needed for the fetch only: nothing after it (hooks, filters,
-          # the checkout) can see it.
+          # The token is needed for the fetch only: nothing after it can see it.
           unset FETCH_TOKEN auth
-          # No hook, fsmonitor or system/global config (filter drivers) runs during the
-          # checkout; the written file must be exactly the fetched blob (no smudge).
+          # No working-tree update at all: that could run a .gitattributes or local-config
+          # smudge filter whose side effects no later comparison can undo. The blob is
+          # written by cat-file (never filtered) to a new temporary file next to the
+          # target, checked, made executable and renamed into place atomically. These git
+          # calls still run without hooks, fsmonitor or system/global config.
           script=scripts/macos/verify-gateway-signature.sh
-          GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+          staged="$(mktemp "${script%/*}/.verify-gateway-signature.XXXXXX")"
+          if ! GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
             git -c core.hooksPath=/dev/null -c core.fsmonitor= -c core.attributesFile=/dev/null \
-            checkout FETCH_HEAD -- "$script"
-          if ! git cat-file blob "FETCH_HEAD:$script" | cmp -s - "$script"; then
-            echo "::error::$script differs from its blob at $WORKFLOW_SHA (a checkout filter ran)"
+            cat-file blob "FETCH_HEAD:$script" > "$staged"; then
+            rm -f -- "$staged"
+            echo "::error::$script is not a blob at $WORKFLOW_SHA"
             exit 1
           fi
+          size="$(wc -c < "$staged" | tr -d '[:space:]')"
+          if [[ ! "$size" =~ ^[0-9]+$ ]] || (( size == 0 || size > 1048576 )); then
+            rm -f -- "$staged"
+            echo "::error::$script at $WORKFLOW_SHA is empty or larger than 1 MiB"
+            exit 1
+          fi
+          chmod 0755 "$staged"
+          mv -f -- "$staged" "$script"
           echo "verify-gateway-signature.sh taken from workflow revision $WORKFLOW_SHA (build source commit: $TAG_COMMIT)"
 
       - name: Build, sign and notarize macOS gateway

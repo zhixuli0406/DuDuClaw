@@ -26,8 +26,9 @@ usage:
   duduclaw-isolation-test-signer minisign-public <key-path>
       prints the base64 public key for DUDUCLAW_BOOTSTRAP_TEST_MINISIGN_KEY
   duduclaw-isolation-test-signer verify <root.json> <root|release|runtime|emergency|bundle> <input> <signature> <key-id-hex>
-      exit 0 only if <signature> (SSHSIG) was made by the root key <key-id-hex> of the canonical
-      <root.json> over exactly <input> under that kind's namespace (production sshsig verifier)";
+      exit 0 only if <signature> (SSHSIG) was made by the root key <key-id-hex> (release/runtime:
+      the target key) of the canonical <root.json> over exactly <input> under that kind's
+      namespace (production sshsig verifier)";
 
 const MAX_KEY_FILE_BYTES: u64 = 4096;
 const MAX_SIGNATURE_FILE_BYTES: u64 = 16 * 1024;
@@ -149,8 +150,14 @@ fn verify(root: &Path, kind: &str, input: &Path, signature: &Path, key_id: &str)
     let expected: [u8; 32] = hex::decode(key_id).ok().and_then(|bytes| bytes.try_into().ok())
         .ok_or("key id must be 64 hex digits")?;
     if signature.key_id().0 != expected { return Err("the signature was made by another key"); }
-    let key = root.root_keys.iter().find(|key| key.key_id.0 == expected)
-        .ok_or("not a root key of the root metadata")?;
+    // Release and runtime manifests are signed by the target key of the root metadata
+    // (scripts/sign-isolation-manifest.py checks the target signature before it writes);
+    // every other kind only by a root key.
+    let key = if matches!(kind, "release" | "runtime") {
+        Some(&root.target_key).filter(|key| key.key_id.0 == expected).ok_or("not the target key of the root metadata")?
+    } else {
+        root.root_keys.iter().find(|key| key.key_id.0 == expected).ok_or("not a root key of the root metadata")?
+    };
     signature.verify(key, namespace, &message).map_err(|_| "signature does not verify")?;
     Ok(())
 }

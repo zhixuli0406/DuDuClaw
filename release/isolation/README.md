@@ -8,8 +8,8 @@ added here.
 
 Base template of the signed release manifest (`ReleaseManifest` in
 `crates/duduclaw-isolation/src/update.rs`). It deliberately has no `version`,
-`arch`, `serial`, `created_at_unix` or `expires_at_unix`: `scripts/release.sh
-isolation-sign` renders those per release and architecture through
+`arch`, `serial`, `created_at_unix` or `expires_at_unix`: the signing ceremony
+(`scripts/isolation-sign`, see below) renders those per release and architecture through
 `scripts/package-linux-release.py --from-release-archive --manifest-valid-days N`
 (serial = `major*10^6 + minor*10^3 + patch`, strictly increasing with the
 version). Artifact ids are the fixed names the update service downloads
@@ -26,11 +26,26 @@ ceremony. While it is absent there is no production pin, and therefore:
 
 - `release.yml` builds and ships the Linux archives **without** `duduclaw-bootstrap`
   (the job summary says so for each architecture);
-- `scripts/release.sh isolation-sign` refuses to run.
+- the signing ceremony (`scripts/isolation-sign`) refuses to run.
 
 When it is present, CI builds `duduclaw-bootstrap` with exactly this pin, executes
 it on a host of each target architecture (aarch64 on a native arm64 runner) and
 requires `PRODUCTION <pin>` before packaging it.
+
+## Starting the signing ceremony
+
+The offline ceremony is started ONLY as
+
+    scripts/isolation-sign --root-metadata … --root-signatures … --output-dir …
+
+from the repository top level, in a fresh terminal, as yourself (see
+`scripts/isolation-sign --help`). Never `bash scripts/release.sh isolation-sign`,
+never `bash scripts/isolation-sign`, never through `sudo`. The launcher's first
+line, `#!/usr/bin/env -S -i /bin/bash --noprofile --norc`, makes the kernel start
+it with an empty environment, so no exported shell function, `BASH_ENV` or other
+variable of the calling shell reaches the ceremony; `scripts/release.sh
+isolation-sign` refuses to run unless that launcher started it. The shell you
+type the command into is still trusted: it chooses which file is started.
 
 ## Test keys
 

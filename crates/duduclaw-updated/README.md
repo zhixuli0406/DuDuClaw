@@ -57,9 +57,10 @@ The `bootstrap_staged:<digest>` result must never be reported as readiness.
 
 The production pin is read only from the public file `release/bootstrap-root.sha256`
 (added after the key ceremony; see `release/isolation/README.md`). Without it no
-`duduclaw-bootstrap` is built or shipped. `scripts/release.sh isolation-sign`
-signs the isolation manifest offline and, for v1.83.0 only (owner decision Q6),
-the migration bundle with the root threshold.
+`duduclaw-bootstrap` is built or shipped. The offline ceremony, started only as
+`scripts/isolation-sign` (which runs `scripts/release.sh isolation-sign` with an
+empty environment), signs the isolation manifest and, for v1.83.0 only (owner
+decision Q6), the migration bundle with the root threshold.
 
 `duduclaw-isolation-test-signer` (`--features test-signer`, module `test_signer`)
 is a TEST-ONLY software signer: simulated `sk-ssh-ed25519` root/target keys,

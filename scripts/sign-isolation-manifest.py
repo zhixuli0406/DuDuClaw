@@ -23,16 +23,23 @@ location per line, signing key 1 first (for --kind bundle: R1 then R2), exactly
 --key-count lines. Never on the command line (any local process can read argv)
 and never from the environment: a DUDUCLAW_ISOLATION_*KEY* variable in the
 environment is refused. On a terminal each line is prompted for (echoed: a
-location is not a secret); scripts/release.sh isolation-sign pipes the locations
-it read at its own prompt. --key is refused. ssh-keygen -Y sign needs `-f
+location is not a secret); the ceremony (started as scripts/isolation-sign, which
+runs scripts/release.sh isolation-sign) pipes the locations it read at its own
+prompt. --key is refused. ssh-keygen -Y sign needs `-f
 <path>`; it is given only `<private 0700 temp dir>/signing-key`, a symlink to the
 real key (plus signing-key.pub when the key has one), and the directory is
 removed right after. Every child (ssh-keygen, minisign, the TEST signer) runs with
 an explicit environment: PATH=/usr/bin:/bin:/usr/sbin:/sbin plus HOME, LANG,
 LC_ALL, LC_CTYPE, TERM and TMPDIR when set, nothing else (no key variable, no
-SSH_AUTH_SOCK, SSH_SK_HELPER, SSH_ASKPASS or DISPLAY), with the controlling
-terminal as stdin for its PIN/passphrase prompt. Tools named without a path are
-looked up only in /usr/bin, /bin, /usr/sbin, /sbin, /opt/homebrew/bin and
+SSH_AUTH_SOCK, SSH_ASKPASS or DISPLAY), with the controlling terminal as stdin
+for its PIN/passphrase prompt. The one addition: `ssh-keygen -Y sign` alone gets
+SSH_SK_HELPER, the audited ssh-sk-helper of the SELECTED ssh-keygen's own
+installation (--ssh-sk-helper, else libexec/ssh-sk-helper next to the resolved
+ssh-keygen; FIDO2 keys need it), or, when there is none, a path inside the
+private key-link directory that does not exist, so ssh-keygen can never start
+another helper. A key whose signing-key.pub names a security key (sk-...), or
+that has no .pub at all, is refused without a helper. Tools named without a path
+are looked up only in /usr/bin, /bin, /usr/sbin, /sbin, /opt/homebrew/bin and
 /usr/local/bin, never in PATH. Residual exposure: while a signer runs its argv
 shows the neutral temporary path, and the symlink target is readable by the
 operator's own user (and root).
@@ -58,6 +65,14 @@ file listing only the root key with that key id (principal = key id); with
 Otherwise nothing is written. Distinct paths, links or handles to one key are
 therefore one signer. --check-threshold re-runs exactly this check on written
 files (scripts/release.sh does so before uploading).
+
+Target key (--kind release / runtime with --root-metadata, optionally pinned by
+--root-sha256): after signing and before any output is written, the single
+signature must be made by the root metadata's target_key (key id from the
+embedded public key, not revoked), have the shape the Rust verifier accepts and
+VERIFY with `ssh-keygen -Y verify` against an allowed-signers file listing only
+that key (TEST: `<test signer> verify`). A wrong but valid key therefore writes
+nothing. --check-target <manifest> re-runs this check on written files.
 """
 import argparse
 import base64
@@ -100,10 +115,17 @@ MAX_SIGNERS = 6
 MAX_SIGNATURE_BYTES = 16 * 1024
 MAX_KEY_BLOB_BYTES = 4096
 THRESHOLD_KINDS = ("root", "bundle")
+# Signed by the target key of the root metadata (check_target_signature).
+TARGET_KINDS = ("release", "runtime")
 # Every child gets exactly this environment (child_environment): a fixed PATH plus these
-# variables when set. Never a key location, SSH_AUTH_SOCK, SSH_SK_HELPER, SSH_ASKPASS, DISPLAY.
+# variables when set. Never a key location, SSH_AUTH_SOCK, SSH_ASKPASS, DISPLAY; SSH_SK_HELPER
+# only for ssh-keygen -Y sign (signing_environment), and only the audited helper.
 SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 CHILD_VARIABLES = ("HOME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TMPDIR")
+SK_HELPER_NAME = "ssh-sk-helper"
+# ssh-keygen -Y sign's SSH_SK_HELPER when its installation has no helper: inside the private
+# 0700 key-link directory, never created, so ssh-keygen cannot start any other helper.
+NO_SK_HELPER_NAME = "no-ssh-sk-helper"
 # A tool named without a path is looked up only here (never PATH): system directories first.
 TOOL_DIRECTORIES = ("/usr/bin", "/bin", "/usr/sbin", "/sbin", "/opt/homebrew/bin", "/usr/local/bin")
 # The accept set of duduclaw-updated sshsig.rs (SshSignature::verify, validate_key) and
@@ -336,6 +358,86 @@ def resolve_tool(value, what):
     return candidate
 
 
+def audited_tool(candidate, what):
+    """scripts/release.sh's tool audit (ISOLATION_TOOL_AUDIT_PY): an absolute path to a regular
+    executable (after resolving links) owned by root or you and not group/other-writable, in a
+    directory (as named and resolved) owned by root or you and not group/other-writable.
+    Returns the resolved path."""
+    uid = os.geteuid()
+
+    def directory_ok(path):
+        try:
+            info = os.stat(path)
+        except OSError:
+            return False
+        return stat.S_ISDIR(info.st_mode) and info.st_uid in (0, uid) and not info.st_mode & 0o022
+    candidate = os.fspath(candidate)
+    real = os.path.realpath(candidate)
+    try:
+        info = os.stat(real)
+        ok = (os.path.isabs(candidate) and stat.S_ISREG(info.st_mode) and os.access(real, os.X_OK)
+              and info.st_uid in (0, uid) and not info.st_mode & 0o022 and "\n" not in real
+              and directory_ok(os.path.dirname(candidate)) and directory_ok(os.path.dirname(real)))
+    except OSError:
+        ok = False
+    if not ok:
+        raise ValueError(f"{what}: refusing {candidate}: not a regular executable owned by root or you, or its "
+                         "directory is group/other-writable or owned by someone else")
+    return real
+
+
+def sk_helper_candidates(ssh_keygen):
+    """Where the ssh-sk-helper of THIS ssh-keygen's installation lives: libexec/ next to its
+    resolved path (/usr/bin/ssh-keygen -> /usr/libexec; Homebrew: the Cellar keg's libexec, the
+    compiled-in default of that ssh-keygen), then <prefix>/libexec of the path as given."""
+    paths = (os.path.realpath(ssh_keygen), os.path.abspath(ssh_keygen))
+    candidates = []
+    for path in paths:
+        candidate = os.path.join(os.path.dirname(os.path.dirname(path)), "libexec", SK_HELPER_NAME)
+        if candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
+
+def resolve_sk_helper(ssh_keygen, given=None):
+    """The audited absolute ssh-sk-helper for `ssh_keygen`, or None when its installation has none.
+    `given` (scripts/release.sh resolves it next to the selected ssh-keygen and audits it the same
+    way) must be an absolute libexec/ssh-sk-helper and pass the same audit; a present but
+    unaudited candidate refuses rather than being skipped."""
+    if given is not None:
+        given = os.fspath(given)
+        if (not os.path.isabs(given) or os.path.basename(given) != SK_HELPER_NAME
+                or os.path.basename(os.path.dirname(os.path.realpath(given))) != "libexec"):
+            raise ValueError("--ssh-sk-helper must be the absolute path of libexec/ssh-sk-helper of the "
+                             "selected ssh-keygen's installation")
+        return audited_tool(given, "--ssh-sk-helper")
+    for candidate in sk_helper_candidates(ssh_keygen):
+        if os.path.lexists(candidate):
+            return audited_tool(candidate, "ssh-sk-helper")
+    return None
+
+
+def may_be_security_key(key):
+    """Whether ssh-keygen may start ssh-sk-helper for `key`: its PUBLIC half <key>.pub names a
+    security-key algorithm (sk-...), or there is no readable <key>.pub (unknown: fail closed).
+    The key file itself is only ever opened by ssh-keygen."""
+    try:
+        with open(os.path.abspath(key) + ".pub", "rb") as source:
+            fields = source.read(256).split(None, 1)
+    except OSError:
+        return True
+    return not fields or fields[0].startswith(b"sk-")
+
+
+def signing_environment(link, helper):
+    """child_environment() plus SSH_SK_HELPER, for `ssh-keygen -Y sign` ONLY: the audited helper of
+    the selected installation, or a never-created path inside the private key-link directory, so
+    ssh-keygen can never start a helper outside the audited tool set."""
+    environment = child_environment()
+    environment["SSH_SK_HELPER"] = str(helper) if helper is not None else str(Path(link).parent / NO_SK_HELPER_NAME)
+    return environment
+
+
 def read_key_locations(count, stream=None, interactive=None):
     """Production key locations: exactly `count` lines on stdin, signing key 1 first.
 
@@ -532,7 +634,7 @@ def ssh_keygen_verifier(ssh_keygen):
                                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         if result.returncode != 0:
             detail = result.stderr.decode("utf-8", "replace").strip().splitlines()
-            raise ValueError(f"the signature of root key {principal} does not verify (ssh-keygen -Y verify"
+            raise ValueError(f"the signature of key {principal} does not verify (ssh-keygen -Y verify"
                              + (f": {detail[-1]}" if detail else "") + ")")
     return verify
 
@@ -659,6 +761,45 @@ def check_root_threshold(signatures, root_bytes, namespace, payload, verify):
     return sorted(key_id.hex() for key_id in seen)
 
 
+def target_signer(root_bytes):
+    """(key id, key) of the target_key of canonical root metadata (validated by root_signers):
+    its key id is the SHA-256 of its own blob, it is not revoked, and an sk key is bound to the
+    target application."""
+    _, revoked, _ = root_signers(root_bytes)
+    key = json.loads(root_bytes).get("target_key")
+    if not isinstance(key, dict):
+        raise ValueError("root metadata has no target key")
+    blob, key_id = _byte_array(key.get("public_blob")), _byte_array(key.get("key_id"), 32)
+    if not 0 < len(blob) <= MAX_KEY_BLOB_BYTES or hashlib.sha256(blob).digest() != key_id:
+        raise ValueError("the target key id must be the SHA-256 of its own public key blob")
+    if key_id in revoked:
+        raise ValueError("the target key of the root metadata is revoked")
+    application = key.get("application")
+    if application not in (None, TARGET_SK_APPLICATION):
+        raise ValueError("the target key is not bound to the target application")
+    return key_id, {"blob": blob, "algorithm": key.get("algorithm"), "application": application}
+
+
+def check_target_signature(signatures, root_bytes, namespace, payload, verify):
+    """A release/runtime manifest carries exactly one signature, made by the target_key of the
+    (pinned) root metadata: the key embedded in the signature is that key, the signature has the
+    shape the Rust verifier accepts, and `verify` (ssh_keygen_verifier: an allowed-signers file
+    with only that key; or isolation_test_signer_verifier) accepts it over `payload`, which is
+    mandatory. Returns the target key id (hex)."""
+    key_id, key = target_signer(root_bytes)
+    if not isinstance(payload, bytes) or not callable(verify):
+        raise ValueError("signatures are accepted only after cryptographic verification over the exact bytes")
+    if not isinstance(signatures, list) or len(signatures) != 1:
+        raise ValueError("a release manifest carries exactly one target-key signature")
+    public, inner = parse_signature(signatures[0], namespace)
+    if hashlib.sha256(public).digest() != key_id or public != key["blob"]:
+        raise ValueError("the manifest was signed by a key that is not the target key of the pinned root metadata "
+                         "(was the wrong key selected?)")
+    check_signature_shape(public, inner, key)
+    verify(signatures[0], key_id, public, namespace, payload)
+    return key_id.hex()
+
+
 def read_bounded(path, limit):
     with open(path, "rb") as source:
         raw = source.read(limit + 1)
@@ -685,7 +826,7 @@ def check_written_threshold(parser, args):
         parser.error("--check-threshold applies to --kind root or --kind bundle")
     if any(value is not None for value in (args.output, args.key, args.key_count, args.template, args.artifacts_dir,
                                            args.bundle, args.expires_at_unix, args.minisign_sign,
-                                           args.trusted_comment)):
+                                           args.trusted_comment, args.ssh_sk_helper, args.check_target)):
         parser.error("--check-threshold takes only --kind, --signatures, --root-metadata, --root-sha256 and the "
                      "verifier (--ssh-keygen, or --test-signer for TEST signatures)")
     try:
@@ -712,6 +853,35 @@ def check_written_threshold(parser, args):
     print(f"root threshold met by {len(signers)} distinct root keys; every signature verified")
 
 
+def check_written_target(parser, args):
+    """--check-target: verify a written release/runtime manifest and its signature against the
+    target key of --root-metadata (scripts/release.sh, before the upload list); never signs."""
+    if args.kind not in TARGET_KINDS:
+        parser.error("--check-target applies to --kind release or --kind runtime")
+    if any(value is not None for value in (args.output, args.key, args.key_count, args.template, args.artifacts_dir,
+                                           args.bundle, args.expires_at_unix, args.minisign_sign,
+                                           args.trusted_comment, args.ssh_sk_helper, args.check_threshold)):
+        parser.error("--check-target takes only --kind, --signatures, --root-metadata, --root-sha256 and the "
+                     "verifier (--ssh-keygen, or --test-signer for TEST signatures)")
+    if args.root_metadata is None:
+        parser.error("--check-target requires --root-metadata (the pinned root.json naming the target key)")
+    try:
+        document = read_bounded(args.check_target, MAX_METADATA_BYTES)
+        parsed = json.loads(document, object_pairs_hook=unique_object, parse_float=reject_number,
+                            parse_constant=reject_number)
+        if canonical_bytes(parsed) != document:
+            raise ValueError("the manifest is not canonical")
+        signatures = json.loads(read_bounded(args.signatures or Path(str(args.check_target) + ".signatures.json"),
+                                             MAX_METADATA_BYTES))
+        root_bytes = read_root_metadata(args.root_metadata, args.root_sha256)
+        verify = (isolation_test_signer_verifier(args.test_signer, root_bytes, args.kind)
+                  if args.test_signer is not None else ssh_keygen_verifier(args.ssh_keygen))
+        key_id = check_target_signature(signatures, root_bytes, NAMESPACES[args.kind], document, verify)
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
+    print(f"target key {key_id}: the manifest signature verified")
+
+
 def minisign_sign(parser, args):
     """--minisign-sign: the legacy release key signs one file (scripts/release.sh, migration bundle).
 
@@ -722,7 +892,7 @@ def minisign_sign(parser, args):
     """
     if any(value is not None for value in (args.template, args.artifacts_dir, args.bundle, args.expires_at_unix,
                                            args.key, args.key_count, args.root_metadata, args.root_sha256,
-                                           args.signatures, args.test_signer)):
+                                           args.signatures, args.test_signer, args.ssh_sk_helper, args.check_target)):
         parser.error("--minisign-sign takes only --trusted-comment, --output and --minisign")
     comment = args.trusted_comment
     if args.output is None or comment is None:
@@ -773,16 +943,25 @@ def main():
                         help="production: number of signing keys (default 1; root/bundle: 2 or 3); their "
                              "locations are read from stdin, one per line, key 1 first")
     parser.add_argument("--root-metadata", type=Path,
-                        help="--kind bundle: the pinned canonical root.json whose root keys must sign")
+                        help="--kind bundle: the pinned canonical root.json whose root keys must sign; --kind "
+                             "release/runtime: the pinned root.json whose target_key must have made the signature")
     parser.add_argument("--root-sha256", help="expected SHA-256 (bootstrap pin) of the root metadata")
     parser.add_argument("--check-threshold", type=Path,
                         help="verify an already written root/bundle document and its signatures; signs nothing")
+    parser.add_argument("--check-target", type=Path,
+                        help="verify an already written release/runtime manifest against the target key of "
+                             "--root-metadata; signs nothing")
     parser.add_argument("--signatures", type=Path,
-                        help="with --check-threshold: signatures JSON (default <document>.signatures.json)")
+                        help="with --check-threshold/--check-target: signatures JSON "
+                             "(default <document>.signatures.json)")
     parser.add_argument("--ssh-keygen", default="ssh-keygen",
                         help="absolute path (scripts/release.sh passes one), or a name looked up only in "
                              + ", ".join(TOOL_DIRECTORIES) + "; use Homebrew OpenSSH for FIDO2 on macOS. "
                              "Signs, and verifies every root-threshold signature (-Y verify)")
+    parser.add_argument("--ssh-sk-helper", type=Path,
+                        help="absolute path of the audited libexec/ssh-sk-helper of the selected ssh-keygen's "
+                             "installation (scripts/release.sh passes it); default: found next to --ssh-keygen. "
+                             "Given to ssh-keygen -Y sign only, as SSH_SK_HELPER")
     parser.add_argument("--test-signer", type=Path,
                         help="TEST-ONLY: duduclaw-isolation-test-signer instead of ssh-keygen (test key set only); "
                              "its `verify` command checks root-threshold signatures")
@@ -792,11 +971,11 @@ def main():
     parser.add_argument("--minisign", default="minisign",
                         help="with --minisign-sign: absolute path, or a name looked up like --ssh-keygen")
     args = parser.parse_args()
-    if args.test_signer is not None and args.ssh_keygen != "ssh-keygen":
-        parser.error("--test-signer and --ssh-keygen are mutually exclusive")
+    if args.test_signer is not None and (args.ssh_keygen != "ssh-keygen" or args.ssh_sk_helper is not None):
+        parser.error("--test-signer and --ssh-keygen/--ssh-sk-helper are mutually exclusive")
     if args.minisign_sign is not None:
-        if args.check_threshold is not None:
-            parser.error("--minisign-sign and --check-threshold are mutually exclusive")
+        if args.check_threshold is not None or args.check_target is not None:
+            parser.error("--minisign-sign and --check-threshold/--check-target are mutually exclusive")
         minisign_sign(parser, args)
         return
     if args.trusted_comment is not None or args.minisign != "minisign":
@@ -804,8 +983,11 @@ def main():
     if args.check_threshold is not None:
         check_written_threshold(parser, args)
         return
+    if args.check_target is not None:
+        check_written_target(parser, args)
+        return
     if args.signatures is not None:
-        parser.error("--signatures belongs to --check-threshold")
+        parser.error("--signatures belongs to --check-threshold/--check-target")
     if args.output is None:
         parser.error("--output is required")
     if args.test_signer is None:
@@ -822,8 +1004,11 @@ def main():
         count = len(args.key)
     if not _integer(count, 1, MAX_SIGNERS):
         parser.error("use 1 to 6 distinct signing keys")
-    if args.kind != "bundle" and (args.root_metadata is not None or args.root_sha256 is not None):
-        parser.error("--root-metadata/--root-sha256 belong to --kind bundle (a root is checked against itself)")
+    if args.kind not in ("bundle", *TARGET_KINDS) and (args.root_metadata is not None or args.root_sha256 is not None):
+        parser.error("--root-metadata/--root-sha256 belong to --kind bundle (root threshold) or --kind release/"
+                     "runtime (target key); a root is checked against itself")
+    # --kind release/runtime with --root-metadata: the target key of that root must sign (and verify).
+    target_root = None
     if args.kind == "bundle":
         if args.template is not None or args.artifacts_dir is not None:
             parser.error("--kind bundle takes --bundle, never a template or artifacts directory")
@@ -855,6 +1040,16 @@ def main():
             if args.artifacts_dir is None:
                 parser.error("--artifacts-dir is required for release/runtime metadata")
             bind_artifacts(document, args.artifacts_dir)
+            if args.root_sha256 is not None and args.root_metadata is None:
+                parser.error("--root-sha256 pins --root-metadata; give both")
+            if args.root_metadata is not None:
+                if count != 1:
+                    parser.error("a release manifest is signed by the one target key: --key-count 1")
+                try:
+                    target_root = read_root_metadata(args.root_metadata, args.root_sha256)
+                    target_signer(target_root)
+                except (OSError, ValueError) as error:
+                    parser.error(str(error))
     payload = canonical_bytes(document)
     if len(payload) > MAX_METADATA_BYTES:
         parser.error("canonical metadata exceeds limit")
@@ -876,11 +1071,28 @@ def main():
         if args.test_signer is None:
             refuse_key_variables()
             args.ssh_keygen = resolve_tool(args.ssh_keygen, "--ssh-keygen")
+            if args.ssh_sk_helper is not None:
+                args.ssh_sk_helper = resolve_sk_helper(args.ssh_keygen, args.ssh_sk_helper)
         verify = None
-        if args.kind in THRESHOLD_KINDS:
-            verify = (isolation_test_signer_verifier(args.test_signer, root_bytes, args.kind)
+        if args.kind in THRESHOLD_KINDS or target_root is not None:
+            checked_root = root_bytes if args.kind in THRESHOLD_KINDS else target_root
+            verify = (isolation_test_signer_verifier(args.test_signer, checked_root, args.kind)
                       if args.test_signer is not None else ssh_keygen_verifier(args.ssh_keygen))
         keys = args.key if args.test_signer is not None else read_key_locations(count)
+        # FIDO2: a security key (or a key whose type its .pub does not show) needs the ssh-sk-helper
+        # of the selected ssh-keygen's installation; no other helper is ever used.
+        helpers = []
+        for index, key in enumerate(keys if args.test_signer is None else (), 1):
+            helper = None
+            if may_be_security_key(key):
+                helper = args.ssh_sk_helper or resolve_sk_helper(args.ssh_keygen)
+                if helper is None:
+                    raise ValueError(
+                        f"signing key {index} is a security key (or has no readable .pub showing its type), and the "
+                        f"selected ssh-keygen has no ssh-sk-helper in its installation ("
+                        f"{' or '.join(sk_helper_candidates(args.ssh_keygen))}); select an ssh-keygen whose "
+                        "installation has one (--ssh-keygen). No other helper is ever used.")
+            helpers.append(helper)
     except ValueError as error:
         parser.error(str(error))
     # No output is published until every signer succeeds. Existing outputs are
@@ -889,17 +1101,24 @@ def main():
         stage = Path(temporary) / "metadata.json"
         stage.write_bytes(payload)
         signatures = []
-        for key in keys:
+        for index, key in enumerate(keys):
             if args.test_signer is not None:
                 subprocess.run(signer_command(args, key, stage), check=True, env=child_environment(),
                                stdin=subprocess.DEVNULL)
             else:
                 with neutral_key_link(key) as link, terminal_stdin() as terminal:
-                    subprocess.run(signer_command(args, link, stage), check=True, env=child_environment(),
-                                   stdin=terminal)
+                    subprocess.run(signer_command(args, link, stage), check=True,
+                                   env=signing_environment(link, helpers[index]), stdin=terminal)
             detached = Path(str(stage) + ".sig")
             signatures.append(detached.read_text(encoding="ascii"))
             detached.unlink()
+        if target_root is not None:
+            # A wrong but valid key (e.g. a root key, or another security key) is refused here,
+            # before anything is written: only the pinned root's target_key may sign a manifest.
+            try:
+                check_target_signature(signatures, target_root, NAMESPACES[args.kind], payload, verify)
+            except ValueError as error:
+                parser.error(f"{error}; nothing was written")
         if args.kind in THRESHOLD_KINDS:
             # R2-5: signers are the keys embedded in the signatures, checked against the
             # root metadata and verified cryptographically over `payload` before anything

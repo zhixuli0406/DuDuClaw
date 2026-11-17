@@ -37,13 +37,17 @@ finished archive through the same sealed flow, from the member bytes (never an
 extracted path), or proves its absence when no pin is configured.
 --defer-bootstrap-probe exists only for --build-only, which never packages.
 
-Offline isolation release (scripts/release.sh isolation-sign):
+Offline isolation release (the ceremony, started only as scripts/isolation-sign,
+which runs scripts/release.sh isolation-sign):
   --extract-bootstrap <tarball>     copy the released verifier out as duduclaw-bootstrap-linux-<arch>
   --from-release-archive <tarball>  sign the isolation manifest over the binaries of
                                     the released tarball (no new tarball), optionally
                                     with the bootstrap inbox (--bootstrap-root ...);
                                     --signing-key-stdin reads the target key location
-                                    from stdin (one line), never argv or the environment
+                                    from stdin (one line), never argv or the environment;
+                                    --target-root <root.json> [--target-root-sha256 <pin>]
+                                    (default: --bootstrap-root): nothing is written unless
+                                    the signature verifies against that root's target_key
   --migration-bundle-from <inbox>   write the plain-ustar migration bundle (plan §3.2)
                                     duduclaw-isolated-linux-<arch>-<x.y.z>.tar
 
@@ -181,7 +185,7 @@ def version_text(version):
 
 
 # Production key locations travel only on stdin: --signing-key-stdin reads the target key
-# location as one line (scripts/release.sh isolation-sign pipes it), and sign_release hands
+# location as one line (the scripts/isolation-sign ceremony pipes it), and sign_release hands
 # it to sign-isolation-manifest.py on that child's stdin. Never argv, never the environment.
 
 
@@ -1054,7 +1058,12 @@ def runtime_source(artifact, binary_dir, runtime_dir):
     return runtime_dir / ("runtime-" + registry)
 
 
-def sign_release(binary_dir, target, output_dir, template, key, ssh_keygen, runtime_dir=None, test_signer=None):
+def sign_release(binary_dir, target, output_dir, template, key, ssh_keygen, runtime_dir=None, test_signer=None,
+                 target_root=None, target_root_sha256=None, ssh_sk_helper=None):
+    """Sign the release manifest with the offline target key. With `target_root` (the pinned
+    root.json, optionally checked against `target_root_sha256`) the signer refuses, writing
+    nothing, unless the signature verifies against that root's target_key, so a wrong but valid
+    key never produces outputs. `ssh_sk_helper` is the audited helper of `ssh_keygen` (FIDO2)."""
     if key is None:
         if template is not None:
             raise ValueError("--manifest-template requires an offline --signing-key")
@@ -1127,7 +1136,13 @@ def sign_release(binary_dir, target, output_dir, template, key, ssh_keygen, runt
         else:
             signer.refuse_key_variables()
             signer_arguments = ["--key-count", "1", "--ssh-keygen", ssh_keygen]
+            if ssh_sk_helper is not None:
+                signer_arguments += ["--ssh-sk-helper", str(ssh_sk_helper)]
             handoff = {"input": os.fsencode(str(key.resolve())) + b"\n"}
+        if target_root is not None:
+            signer_arguments += ["--root-metadata", str(Path(target_root).resolve())]
+            if target_root_sha256 is not None:
+                signer_arguments += ["--root-sha256", target_root_sha256]
         subprocess.run([sys.executable, "-I", "-B", str(ROOT / "scripts/sign-isolation-manifest.py"),
                         "--kind", "release", "--template", str(staged_template),
                         "--artifacts-dir", str(raw_artifacts), "--output", str(stage / manifest_name),
@@ -1141,12 +1156,15 @@ def sign_release(binary_dir, target, output_dir, template, key, ssh_keygen, runt
         return [output_dir / name for name in names]
 
 
-def create_bootstrap_inbox(target, output_dir, root_path, root_signatures_path):
+def create_bootstrap_inbox(target, output_dir, root_path, root_signatures_path, expected_root_sha256=None):
     """Assemble only data for the compiled-pin verifier; never install or trust it.
 
     Inputs are externally signed metadata. The Rust --bootstrap-stage entrypoint
     checks the independent compiled pin, root threshold and target signatures.
     This helper deliberately cannot certify the legacy transition dual signature.
+    Each input is read once; with `expected_root_sha256` (the pin) the root bytes
+    read here must hash to it. scripts/release.sh passes only its private,
+    already verified copies of root.json and its signatures.
     """
     prefix = f"isolated-linux-{TARGETS[target][0]}-"
     destination = output_dir / (prefix + "bootstrap-inbox")
@@ -1162,6 +1180,8 @@ def create_bootstrap_inbox(target, output_dir, root_path, root_signatures_path):
                            parse_float=signer.reject_number, parse_constant=signer.reject_number)
         return raw, value
     root_bytes, root = metadata(root_path, signer.MAX_METADATA_BYTES)
+    if expected_root_sha256 is not None and hashlib.sha256(root_bytes).hexdigest() != expected_root_sha256:
+        raise ValueError("bootstrap root metadata does not match the expected root pin")
     root_signatures_bytes, root_signatures = metadata(root_signatures_path, 64 * 1024)
     if (signer.canonical_bytes(root) != root_bytes or not isinstance(root_signatures, list)
             or not 2 <= len(root_signatures) <= 6 or any(not isinstance(value, str) for value in root_signatures)):
@@ -1363,6 +1383,14 @@ def main():
                              "from stdin instead of --signing-key, so it is never in argv or the environment "
                              "(scripts/release.sh isolation-sign)")
     parser.add_argument("--ssh-keygen", default="ssh-keygen")
+    parser.add_argument("--ssh-sk-helper", type=Path,
+                        help="audited ssh-sk-helper of --ssh-keygen's installation, passed on to the signer "
+                             "(scripts/release.sh isolation-sign resolves it)")
+    parser.add_argument("--target-root", type=Path,
+                        help="with --from-release-archive: the pinned root.json whose target_key must have made the "
+                             "manifest signature (verified before anything is written); default: --bootstrap-root")
+    parser.add_argument("--target-root-sha256",
+                        help="expected SHA-256 (root pin) of --target-root and of --bootstrap-root")
     parser.add_argument("--bootstrap-root", type=Path, help="externally signed canonical root metadata for an inactive bootstrap inbox")
     parser.add_argument("--bootstrap-root-signatures", type=Path, help="root threshold signature JSON paired with --bootstrap-root")
     parser.add_argument("--bootstrap-root-sha256",
@@ -1430,6 +1458,12 @@ def main():
         parser.error("--test-signer is TEST-ONLY: accepted only with --from-release-archive and without a root pin")
     if args.manifest_valid_days is not None and args.from_release_archive is None:
         parser.error("--manifest-valid-days belongs to --from-release-archive")
+    if (args.target_root or args.target_root_sha256) and args.from_release_archive is None:
+        parser.error("--target-root/--target-root-sha256 belong to --from-release-archive")
+    if args.target_root_sha256 is not None and re.fullmatch(r"[0-9a-f]{64}", args.target_root_sha256) is None:
+        parser.error("--target-root-sha256 must be 64 lowercase hex digits")
+    if args.ssh_sk_helper is not None and (args.test_signer is not None or not args.signing_key):
+        parser.error("--ssh-sk-helper belongs to production signing with --ssh-keygen")
     if args.defer_bootstrap_probe and not args.build_only:
         parser.error("--defer-bootstrap-probe applies only to --build-only; packaging always executes the verifier")
     if (args.binary_dir is None) != (args.binary_sums_sha256 is None):
@@ -1467,10 +1501,15 @@ def main():
                 template = snapshot / "rendered-release-template.json"
                 template.write_bytes(render_release_template(args.manifest_template.read_bytes(),
                     TARGETS[args.target][0], workspace_version(), int(time.time()), args.manifest_valid_days))
+            # The manifest signature must verify against the target_key of the pinned root (the
+            # bootstrap inbox's root when there is one) before any output is written.
             signed = sign_release(snapshot, args.target, args.output_dir, template, args.signing_key,
-                                  args.ssh_keygen, args.runtime_artifacts_dir, args.test_signer)
+                                  args.ssh_keygen, args.runtime_artifacts_dir, args.test_signer,
+                                  target_root=args.target_root or args.bootstrap_root,
+                                  target_root_sha256=args.target_root_sha256, ssh_sk_helper=args.ssh_sk_helper)
             if args.bootstrap_root:
-                create_bootstrap_inbox(args.target, args.output_dir, args.bootstrap_root, args.bootstrap_root_signatures)
+                create_bootstrap_inbox(args.target, args.output_dir, args.bootstrap_root, args.bootstrap_root_signatures,
+                                       expected_root_sha256=args.target_root_sha256)
         print(f"Signed {len(signed)} isolation assets over {args.from_release_archive.name} (sha256 {digest}).")
         return
 

@@ -1,0 +1,88 @@
+#!/usr/bin/env -S -i /bin/bash --noprofile --norc
+# DuDuClaw isolation-sign launcher (plan R2 §4.2): the ONLY way to start the offline signing
+# ceremony of the native Linux isolation release. Run it attended, from the repository top
+# level, in a fresh terminal:
+#     scripts/isolation-sign --help
+# Never `bash scripts/isolation-sign`, never `bash scripts/release.sh isolation-sign`, never
+# through sudo: each of them bypasses what this file is for.
+#
+# Why a launcher: a script cannot reliably sanitise the bash that is already running it. Bash
+# imports exported functions of any name (even `hash`, `declare` or `/usr/bin/env`) and runs
+# BASH_ENV before a script's first statement. The first line above makes the KERNEL start
+# `env -i /bin/bash --noprofile --norc <this file> <arguments>`, so the bash running this file
+# begins with an EMPTY environment: no exported function, no BASH_ENV, no variable of the
+# caller. Nothing below reads the caller's environment: only fixed absolute paths, the password
+# database and this file's own location. Inherent: the operator's own shell, which starts this
+# file, is trusted (it chooses which file is started).
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+set -euo pipefail
+
+launcher_fail() {
+    printf 'Error: %s\n' "$*" >&2
+    exit 1
+}
+
+# Defence against an accidental start without the first line (`bash scripts/isolation-sign`,
+# sudo): then the environment is not empty. Bash itself adds PWD, OLDPWD, SHLVL and _; macOS
+# may add __CF_USER_TEXT_ENCODING (a text-encoding hint nothing here uses).
+for name in $(compgen -e); do
+    case "$name" in
+        PATH|PWD|OLDPWD|SHLVL|_|__CF_USER_TEXT_ENCODING) ;;
+        *) launcher_fail "start the ceremony as scripts/isolation-sign (its first line empties the environment);" \
+               "it was started with $name set (through bash, sudo or another wrapper?)" ;;
+    esac
+done
+if [[ "$EUID" == "0" || "$UID" == "0" ]]; then
+    launcher_fail "never start the ceremony as root or through sudo; run scripts/isolation-sign as yourself"
+fi
+if [[ -L "$0" ]]; then
+    launcher_fail "refusing a symlinked launcher path; run the repository's own scripts/isolation-sign"
+fi
+
+# HOME from the password database (never inherited): absolute, an existing directory owned by
+# this user. The repository: the parent of this file's (physical) directory; this file itself
+# must not be a symlink and must be <repository>/scripts/isolation-sign next to release.sh.
+locations="$(/usr/bin/python3 -I -S -B -c 'import os, pwd, stat, sys
+uid = os.getuid()
+home = pwd.getpwuid(uid).pw_dir
+try:
+    info = os.stat(home)
+except OSError:
+    sys.exit("Error: the home directory of the password database does not exist")
+if not os.path.isabs(home) or "\n" in home or not stat.S_ISDIR(info.st_mode) or info.st_uid != uid:
+    sys.exit("Error: the home directory of the password database is not an absolute directory owned by you")
+launcher = sys.argv[1]
+if os.path.islink(launcher):
+    sys.exit("Error: refusing a symlinked launcher path")
+real = os.path.realpath(launcher)
+scripts = os.path.dirname(real)
+repository = os.path.dirname(scripts)
+release = os.path.join(scripts, "release.sh")
+if (os.path.basename(real) != "isolation-sign" or os.path.basename(scripts) != "scripts" or "\n" in real
+        or not os.path.isfile(release) or os.path.islink(release)):
+    sys.exit("Error: the launcher is not <repository>/scripts/isolation-sign next to scripts/release.sh")
+print(home)
+print(repository)' "$0")" || launcher_fail "cannot determine HOME and the repository (above)"
+newline=$'\n'
+HOME="${locations%%"$newline"*}"
+repository="${locations#*"$newline"}"
+if [[ "$HOME" != /* || "$repository" != /* || "$repository" == *$'\n'* ]]; then
+    launcher_fail "cannot determine HOME and the repository"
+fi
+if [[ "$(pwd -P)" != "$repository" ]]; then
+    launcher_fail "run scripts/isolation-sign from the repository top level ($repository)"
+fi
+
+# A fixed terminal type (nothing in the ceremony needs to query the terminal; prompts use
+# /dev/tty directly). TMPDIR only on macOS: the per-user private directory from getconf.
+TERM=dumb
+TMPDIR=""
+case "$OSTYPE" in
+    darwin*) TMPDIR="$(/usr/bin/getconf DARWIN_USER_TEMP_DIR 2>/dev/null)" || TMPDIR="" ;;
+esac
+if [[ "$TMPDIR" != /* || "$TMPDIR" == *$'\n'* ]]; then TMPDIR=""; fi
+DUDUCLAW_ISOLATION_LAUNCHER="$repository"
+export HOME TERM DUDUCLAW_ISOLATION_LAUNCHER
+if [[ -n "$TMPDIR" ]]; then export TMPDIR; else unset TMPDIR; fi
+exec /bin/bash --noprofile --norc "$repository/scripts/release.sh" isolation-sign "$@"

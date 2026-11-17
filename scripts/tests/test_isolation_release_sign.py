@@ -1,9 +1,13 @@
-"""release.sh isolation-sign and scripts/isolation-test-keys.sh fail closed (plan R2 §4.2).
+"""release.sh isolation-sign, its launcher scripts/isolation-sign and scripts/isolation-test-keys.sh
+fail closed (plan R2 §4.2).
 
 Nothing here touches a real key, the network or GitHub: every case stops at a
 refusal before the first download or signature (or at --preflight). The
 end-to-end cases run the real two-stage ceremony against a throwaway repository
 whose HEAD is a tag, with fake tools first in PATH that would leave a marker file.
+Normal ceremony starts execute the real launcher. Hostile stage-1 probes deliberately
+start release.sh with the launcher's environment plus the forbidden variables;
+otherwise the launcher would remove the very condition those probes must exercise.
 """
 import base64
 import hashlib
@@ -11,6 +15,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import pwd
 import re
 import shutil
 import stat
@@ -21,6 +26,8 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 RELEASE = ROOT / "scripts/release.sh"
+LAUNCHER = ROOT / "scripts/isolation-sign"
+LAUNCHER_SHEBANG = "#!/usr/bin/env -S -i /bin/bash --noprofile --norc"
 TEST_KEYS = ROOT / "scripts/isolation-test-keys.sh"
 PIN_FILE = ROOT / "release/bootstrap-root.sha256"
 SIGNER = ROOT / "scripts/sign-isolation-manifest.py"
@@ -94,6 +101,79 @@ CEREMONY_TOOLS = ceremony_tools_pass_audit()
 OPTIONAL_TOOLS = all(ceremony_candidates()[name] for name in ("gh", "minisign", "docker"))
 
 
+def launcher_works():
+    """The real launcher can run here: /usr/bin/env -S -i empties the environment, /bin/bash and
+    /usr/bin/python3 work, and this non-root user's home directory exists and is theirs."""
+    if os.geteuid() == 0 or not os.path.isfile("/bin/bash") or not os.access("/usr/bin/python3", os.X_OK):
+        return False
+    try:
+        home = os.stat(pwd.getpwuid(os.getuid()).pw_dir)
+        emptied = subprocess.run(["/usr/bin/env", "-S", "-i /usr/bin/env"], env={"PROBE": "1"},
+                                 capture_output=True, text=True, timeout=30)
+        python = subprocess.run(["/usr/bin/python3", "-I", "-S", "-B", "-c", "import pwd"], env={},
+                                capture_output=True, timeout=60)
+    except (OSError, KeyError, subprocess.SubprocessError):
+        return False
+    return (stat.S_ISDIR(home.st_mode) and home.st_uid == os.getuid() and emptied.returncode == 0
+            and "PROBE" not in emptied.stdout and python.returncode == 0)
+
+
+LAUNCHER_WORKS = launcher_works()
+
+
+def launcher_environment(cwd, **extra):
+    """Exactly what scripts/isolation-sign exports before it starts release.sh (marker = the
+    repository it found, which is the physical working directory)."""
+    environment = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": pwd.getpwuid(os.getuid()).pw_dir,
+                   "TERM": "dumb", "DUDUCLAW_ISOLATION_LAUNCHER": os.path.realpath(cwd)}
+    environment.update(extra)
+    return environment
+
+
+def launcher_layout(base):
+    """<base>/repo with the launcher (0755), release.sh and Cargo.toml: enough for stage 1's
+    tool-free refusals (no production pin in it)."""
+    repo = base / "repo"
+    (repo / "scripts").mkdir(parents=True)
+    shutil.copyfile(LAUNCHER, repo / "scripts/isolation-sign")
+    (repo / "scripts/isolation-sign").chmod(0o755)
+    shutil.copyfile(RELEASE, repo / "scripts/release.sh")
+    shutil.copyfile(ROOT / "Cargo.toml", repo / "Cargo.toml")
+    return repo
+
+
+def hostile_environment(base, **extra):
+    """A polluted caller: exported functions named hash, declare, git, /usr/bin/env, compgen and pwd,
+    a BASH_ENV file and key-location variables. Any of them running leaves a line in the marker."""
+    marker = base / "hostile-marker"
+    bash_env = base / "bash-env.sh"
+    bash_env.write_text(f'echo "BASH_ENV ran" >> "{marker}"\n')
+    environment = clean_environment(BASH_ENV=str(bash_env), DUDUCLAW_ISOLATION_TARGET_KEY="/keys/target",
+                                    DUDUCLAW_ISOLATION_ROOT_KEY_1="/keys/r1", SSH_AUTH_SOCK=str(base / "agent.sock"),
+                                    GIT_DIR=str(base / "nowhere"), PYTHONPATH=str(base / "fakes"), **extra)
+    for name in ("hash", "declare", "git", "/usr/bin/env", "compgen", "pwd"):
+        environment[f"BASH_FUNC_{name}%%"] = f'() {{ echo "function {name} ran" >> "{marker}"; }}'
+    return environment, marker
+
+
+def ceremony_leftovers():
+    """Snapshot / work directories in the places the real launcher's stage 1 may use."""
+    bases = {"/tmp"}
+    if sys.platform == "darwin":
+        result = subprocess.run(["/usr/bin/getconf", "DARWIN_USER_TEMP_DIR"], capture_output=True, text=True)
+        if result.returncode == 0 and result.stdout.strip():
+            bases.add(result.stdout.strip())
+    found = set()
+    for base in bases:
+        try:
+            names = os.listdir(base)
+        except OSError:
+            continue
+        found |= {os.path.join(os.path.realpath(base), name) for name in names
+                  if name.startswith(("duduclaw-isolation-ceremony.", "duduclaw-isolation-sign."))}
+    return found
+
+
 def release_text():
     return RELEASE.read_text()
 
@@ -138,7 +218,7 @@ def run_functions(names, command, cwd=ROOT, env=None):
 
 def run_section(command, cwd=ROOT, env=None):
     """The whole isolation section (assignments and functions only) plus `command`."""
-    script = "set -euo pipefail\nISOLATION_IMPORTED_FUNCTIONS=\"\"\n" + isolation_section() + command
+    script = "set -euo pipefail\n" + isolation_section() + command
     return subprocess.run([BASH, "-c", script], cwd=cwd, env=env, capture_output=True, text=True, timeout=120)
 
 
@@ -186,9 +266,15 @@ DIGEST = "ubuntu@sha256:" + "ab" * 32
 
 class IsolationSignTests(unittest.TestCase):
     def run_sign(self, *args, env=None, stdin=subprocess.DEVNULL):
-        environment = clean_environment(**(env or {}))
-        return subprocess.run([BASH, str(RELEASE), "isolation-sign", *args], cwd=ROOT, env=environment,
-                              stdin=stdin, capture_output=True, text=True, timeout=60)
+        """Use the real launcher; only hostile stage-1 environment probes bypass it deliberately."""
+        if env is None:
+            environment = clean_environment()
+            command = [str(LAUNCHER), *args]
+        else:
+            environment = launcher_environment(ROOT, **env)
+            command = [BASH, "--noprofile", "--norc", str(RELEASE), "isolation-sign", *args]
+        return subprocess.run(command, cwd=ROOT,
+                              env=environment, stdin=stdin, capture_output=True, text=True, timeout=60)
 
     def required(self):
         # Key locations are never arguments nor environment variables (R2-3): only the prompt.
@@ -208,16 +294,24 @@ class IsolationSignTests(unittest.TestCase):
                        "/opt/homebrew/bin and /usr/local/bin", "NOTICE: trusting <directory>",
                        "FROM THE TAG'S BLOB", "Stage 1: snapshot of v<version>", "env -i", "no SSH_AUTH_SOCK",
                        "removed on", "--preflight", "ONLY on the helper's stdin", "R1 then R2",
-                       "ssh-keygen -Y verify", "NEVER environment variables", "DUDUCLAW_ISOLATION_*KEY*"):
+                       "ssh-keygen -Y verify", "NEVER environment variables", "DUDUCLAW_ISOLATION_*KEY*",
+                       "Usage: scripts/isolation-sign", LAUNCHER_SHEBANG, "never through sudo",
+                       "never as bash scripts/release.sh isolation-sign", "as a CHILD process", "ssh-sk-helper",
+                       "SSH_SK_HELPER", "copied ONCE", "target_key of the pinned root"):
             self.assertIn(needle, result.stdout)
         usage = subprocess.run([BASH, str(RELEASE)], cwd=ROOT, capture_output=True, text=True)
-        self.assertIn("isolation-sign --help", usage.stdout)
+        self.assertIn("scripts/isolation-sign --help", usage.stdout)
 
     def test_refused_in_ci_before_anything_else(self):
+        # CI variables never reach a launcher start (the launcher empties the environment); a start
+        # that still carries them is not the launcher's and is refused before anything else.
         for variable in ("CI", "GITHUB_ACTIONS"):
             result = self.run_sign(*self.required(), env={variable: "true"})
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("never runs in CI", result.stderr)
+            self.assertIn("runs only when started as scripts/isolation-sign", result.stderr)
+            self.assertIn(f"unexpected environment variable(s): {variable}", result.stderr)
+        # Stage 2 keeps its own CI refusal.
+        self.assertIn("never runs in CI", shell_function("isolation_refuse_hostile_start"))
 
     def test_migration_bundle_is_an_explicit_q6_gated_step(self):
         self.assertIn('ISOLATION_MIGRATION_BUNDLE_VERSIONS="1.83.0"', release_text())
@@ -337,9 +431,20 @@ class IsolationSignTests(unittest.TestCase):
         guard = text.index('if [[ "${1:-}" == "isolation-sign" ]]; then\n    PATH="/usr/bin:/bin:/usr/sbin:/sbin"')
         self.assertLess(text.index("set -euo pipefail"), guard)
         before = [line for line in text[:guard].splitlines() if line.strip() and not line.lstrip().startswith("#")]
-        self.assertEqual(before, ["set -euo pipefail", 'ISOLATION_IMPORTED_FUNCTIONS=""'])
+        self.assertEqual(before, ["set -euo pipefail"])
         self.assertLess(guard, text.index("\nisolation_fail() {"))
-        self.assertIn('ISOLATION_IMPORTED_FUNCTIONS="$(declare -F)"', text[guard:guard + 300])
+        # No pre-check before the launcher check (a hostile shell could replace `hash` or `declare`):
+        # the top only fixes PATH, and stage 1's first statement is the launcher check.
+        top = text[guard:text.index("\nfi\n", guard)]
+        self.assertEqual([line.strip() for line in top.splitlines()[1:]],
+                         ['PATH="/usr/bin:/bin:/usr/sbin:/sbin"', "export PATH"])
+        self.assertNotIn("ISOLATION_IMPORTED_FUNCTIONS", text)
+        stage1 = shell_function("isolation_stage1").splitlines()
+        self.assertEqual(stage1[1].strip(), "isolation_require_launcher || return 1")
+        self.assertEqual(stage1[2].strip(), "isolation_refuse_hostile_start || return 1")
+        check = shell_function("isolation_require_launcher")
+        self.assertIn("$(compgen -e)", check)
+        self.assertIn("not against a hostile shell", text[text.index("# Stage 1's FIRST check"):])
         dispatch = text.index('if [[ "${1:-}" == "isolation-sign" ]]; then\n    shift')
         self.assertLess(dispatch, text.index('CURRENT_VERSION="$(extract_version'))
         self.assertNotIn("run_isolation_sign \"$@\"", text)
@@ -485,16 +590,24 @@ class IsolationSignTests(unittest.TestCase):
 
     # ---------------------------------------------------------------- stage 1 refusals before any tool
 
-    def refused_before_any_tool(self, extra, message):
+    def refused_before_any_tool(self, extra, message, launched=True):
+        """Stage 1 refuses with `message` before any tool runs. launched: started with the
+        launcher's environment plus `extra`; otherwise started directly from an ordinary shell."""
         with tempfile.TemporaryDirectory() as temporary:
-            base = Path(temporary)
+            base = Path(temporary).resolve()
             marker = base / "marker"
             write_fakes(base / "fakes", marker)
-            environment = clean_environment(PATH=f"{base / 'fakes'}:/usr/bin:/bin", TMPDIR=str(base), **extra)
+            if launched:
+                environment = launcher_environment(ROOT, PATH=f"{base / 'fakes'}:/usr/bin:/bin", TMPDIR=str(base),
+                                                   **extra)
+                command = [BASH, "--noprofile", "--norc", str(RELEASE), "isolation-sign", *self.required()]
+            else:
+                environment = clean_environment(PATH=f"{base / 'fakes'}:/usr/bin:/bin", TMPDIR=str(base), **extra)
+                command = [BASH, str(RELEASE), "isolation-sign", *self.required()]
             controller, terminal = os.openpty()
             try:
-                result = subprocess.run([BASH, str(RELEASE), "isolation-sign", *self.required()], cwd=ROOT,
-                                        env=environment, stdin=terminal, capture_output=True, text=True, timeout=60)
+                result = subprocess.run(command, cwd=ROOT, env=environment, stdin=terminal, capture_output=True,
+                                        text=True, timeout=60)
             finally:
                 os.close(controller)
                 os.close(terminal)
@@ -503,16 +616,118 @@ class IsolationSignTests(unittest.TestCase):
             self.assertNotIn("Stage 1: snapshot", result.stdout)
             self.assertFalse(marker.exists(), marker.read_text() if marker.exists() else "")
             self.assertEqual(sorted(path.name for path in base.iterdir()), ["fakes"])
+            return result
+
+    def test_direct_start_of_release_sh_is_refused_before_any_tool_runs(self):
+        # `bash scripts/release.sh isolation-sign` (and --help) from an ordinary shell: no marker.
+        result = self.refused_before_any_tool({}, "runs only when started as scripts/isolation-sign", launched=False)
+        self.assertIn("never bash scripts/release.sh isolation-sign, never through sudo", result.stderr)
+        direct = subprocess.run([BASH, str(RELEASE), "isolation-sign", "--help"], cwd=ROOT, env=clean_environment(),
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(direct.returncode, 0)
+        self.assertIn("runs only when started as scripts/isolation-sign", direct.stderr)
+        # A forged marker naming another directory is refused as well.
+        self.refused_before_any_tool({"DUDUCLAW_ISOLATION_LAUNCHER": "/elsewhere"},
+                                     "runs only when started as scripts/isolation-sign")
+        # The enterprise build default must not leak into the offline environment;
+        # an externally supplied value is still forbidden, not allow-listed.
+        self.refused_before_any_tool({"CLOUD_BUILD": "1"},
+                                     "unexpected environment variable(s): CLOUD_BUILD")
 
     def test_key_location_variable_in_the_environment_is_refused_in_stage_1(self):
         for variable in ("DUDUCLAW_ISOLATION_TARGET_KEY", "DUDUCLAW_ISOLATION_ROOT_KEY_2",
                          "DUDUCLAW_ISOLATION_LEGACY_MINISIGN_KEY", "DUDUCLAW_ISOLATION_SIGNING_KEY_1"):
             with self.subTest(variable=variable):
                 self.refused_before_any_tool({variable: "/somewhere/key"},
-                                             f"{variable} is set: key locations are entered only at the attended prompt")
+                                             f"unexpected environment variable(s): {variable}")
+        # Stage 2 keeps its own refusal of such variables.
+        self.assertIn("key locations are entered only at the attended prompt",
+                      shell_function("isolation_refuse_hostile_start"))
 
     def test_exported_functions_and_bash_env_are_refused_in_stage_1(self):
-        self.refused_before_any_tool({"BASH_FUNC_isolation_fail%%": "() { :; }"}, "exports shell functions")
+        # Secondary assertion after the launcher check (a launcher start has neither).
+        self.refused_before_any_tool({"BASH_FUNC_duduclaw_planted%%": "() { :; }"}, "exports shell functions")
+        with tempfile.TemporaryDirectory() as temporary:
+            empty = Path(temporary) / "empty.sh"
+            empty.write_text("")
+            self.refused_before_any_tool({"BASH_ENV": str(empty)}, "unexpected environment variable(s): BASH_ENV")
+
+    # ---------------------------------------------------------------- the launcher
+
+    def test_launcher_is_tracked_executable_with_the_exact_shebang_and_no_environment_logic(self):
+        text = LAUNCHER.read_text()
+        lines = text.splitlines()
+        self.assertEqual(lines[0], LAUNCHER_SHEBANG)
+        code = [line.strip() for line in lines[1:] if line.strip() and not line.lstrip().startswith("#")]
+        self.assertEqual(code[0], "PATH=/usr/bin:/bin:/usr/sbin:/sbin")
+        self.assertEqual(code[-1], 'exec /bin/bash --noprofile --norc "$repository/scripts/release.sh" '
+                                   'isolation-sign "$@"')
+        joined = "\n".join(code)
+        self.assertIn("/usr/bin/python3 -I -S -B -c", joined)
+        self.assertIn("pwd.getpwuid(uid).pw_dir", joined)
+        self.assertIn("TERM=dumb", joined)
+        self.assertIn('DUDUCLAW_ISOLATION_LAUNCHER="$repository"', joined)
+        self.assertIn('if [[ -L "$0" ]]; then', joined)
+        self.assertIn('"$EUID" == "0"', joined)
+        # Nothing is read from the caller's environment: every expanded variable is a bash builtin
+        # one, the script's own, or assigned before its first use.
+        names = re.findall(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)", joined)
+        self.assertLessEqual(set(names), {"name", "EUID", "UID", "OSTYPE", "locations", "newline", "HOME",
+                                          "repository", "TMPDIR"})
+        for name in ("HOME", "TMPDIR", "repository", "locations", "newline"):
+            self.assertLess(re.search(rf"(?m)^{name}=", joined).start(),
+                            re.search(r"\$\{?" + name + r"\b", joined).start(), name)
+        self.assertIn("scripts/isolation-sign", ceremony_files())
+        # Tracked as executable (mode 100755) in the git index.
+        listing = subprocess.run([GIT, "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null", "ls-files", "-s",
+                                  "--", "scripts/isolation-sign"], cwd=ROOT, capture_output=True, text=True,
+                                 env=dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1"))
+        self.assertEqual(listing.returncode, 0, listing.stderr)
+        self.assertRegex(listing.stdout, r"^100755 [0-9a-f]{40,64} 0\tscripts/isolation-sign\n$")
+
+    @unittest.skipUnless(LAUNCHER_WORKS, "needs /usr/bin/env -S, /bin/bash, /usr/bin/python3 and a non-root user")
+    def test_launcher_starts_the_ceremony_clean_whatever_the_caller_exports(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            repo = launcher_layout(base)
+            launcher = repo / "scripts/isolation-sign"
+            write_fakes(base / "fakes", base / "marker")
+            environment, marker = hostile_environment(base, PATH=f"{base / 'fakes'}:/usr/bin:/bin")
+
+            def start(*arguments, command=None, cwd=repo, env=environment):
+                controller, terminal = os.openpty()
+                try:
+                    return subprocess.run(command or [str(launcher), *arguments], cwd=cwd, env=env, stdin=terminal,
+                                          capture_output=True, text=True, timeout=60)
+                finally:
+                    os.close(controller)
+                    os.close(terminal)
+            # None of the exported functions, BASH_ENV or variables reaches the ceremony: it gets
+            # to its normal next refusal (this layout has no production pin) and nothing ran.
+            result = start(*self.required())
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("there is no production root pin", result.stderr, result.stderr)
+            self.assertNotIn("unexpected environment variable", result.stderr)
+            self.assertNotIn("is set: key locations", result.stderr)
+            result = start("--help")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("STAGE 1", result.stdout)
+            self.assertFalse(marker.exists(), marker.read_text() if marker.exists() else "")
+            self.assertFalse((base / "marker").exists())
+            # Started without its first line (through bash): refused, nothing else runs.
+            result = start(command=[BASH, str(launcher), "--help"], env=clean_environment())
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("start the ceremony as scripts/isolation-sign", result.stderr)
+            # Only from the repository top level, and never through a symlink.
+            result = start("--help", cwd=base)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("repository top level", result.stderr)
+            link = base / "isolation-sign"
+            link.symlink_to(launcher)
+            result = start(command=[str(link), "--help"])
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("symlinked launcher", result.stderr)
+            self.assertFalse(marker.exists(), marker.read_text() if marker.exists() else "")
 
     # ---------------------------------------------------------------- stage 2 runs only from a valid snapshot
 
@@ -582,21 +797,32 @@ class IsolationSignTests(unittest.TestCase):
                 make_writable(base)
 
     def test_cleanup_removes_snapshot_and_work_on_success_failure_and_signal(self):
-        for ending in ("exit 0", "exit 1", "kill -TERM $$; sleep 5"):
-            with self.subTest(ending=ending), tempfile.TemporaryDirectory() as temporary:
+        # Stage 1 owns (and removes) the snapshot; stage 2 removes only its work directory.
+        for owner, ending in [(owner, ending) for owner in ("1", "0")
+                              for ending in ("exit 0", "exit 1", "kill -TERM $$; sleep 5")]:
+            with self.subTest(owner=owner, ending=ending), tempfile.TemporaryDirectory() as temporary:
                 base = Path(temporary).resolve()
                 (base / "source").mkdir()
                 (base / "source/Cargo.toml").write_text("x")
                 snapshot = make_snapshot(base / "source", base / "snapshot", ["Cargo.toml"])
                 work = base / "work"
                 (work / "tmp").mkdir(parents=True)
+                (work / "root").mkdir()
+                (work / "root/root.json").write_text("{}")
+                os.chmod(work / "root/root.json", 0o400)
+                os.chmod(work / "root", 0o500)
                 result = run_section(
                     f'ISOLATION_TOOL_ENV="{system_tool("env")}" ISOLATION_TOOL_RM="{system_tool("rm")}"\n'
                     f'ISOLATION_TOOL_CHMOD="{system_tool("chmod")}"\n'
-                    f'ISOLATION_SNAPSHOT="{snapshot}" ISOLATION_WORK="{work}"\nisolation_set_traps\n{ending}\n')
-                self.assertFalse(snapshot.exists(), result.stderr)
-                self.assertFalse(work.exists(), result.stderr)
-                self.assertTrue((base / "source").exists())
+                    f'ISOLATION_SNAPSHOT="{snapshot}" ISOLATION_WORK="{work}" ISOLATION_OWNS_SNAPSHOT={owner}\n'
+                    f'isolation_set_traps\n{ending}\n')
+                try:
+                    self.assertEqual(snapshot.exists(), owner == "0", result.stderr)
+                    self.assertFalse(work.exists(), result.stderr)  # also its read-only root copies
+                    self.assertTrue((base / "source").exists())
+                finally:
+                    if snapshot.exists():
+                        make_writable(snapshot)
 
     # ---------------------------------------------------------------- stage 2 gate on the original repository
 
@@ -619,6 +845,8 @@ class IsolationSignTests(unittest.TestCase):
         for path, content in files.items():
             (repo / path).parent.mkdir(parents=True, exist_ok=True)
             (repo / path).write_bytes(content)
+            if path == "scripts/isolation-sign":
+                (repo / path).chmod(0o755)  # committed as 100755, like the real launcher
         (repo / ".gitignore").write_text("__pycache__/\n*.pyc\ntarget/\n")
         git("add", ".")
         git("commit", "-qm", "ceremony fixture")
@@ -715,12 +943,15 @@ class IsolationSignTests(unittest.TestCase):
 
     # ---------------------------------------------------------------- end to end: the real two-stage run
 
-    def ceremony_repository(self, base):
+    def ceremony_repository(self, base, tag_release=None):
         """The real ceremony files at tag v9.9.9 with a production pin of a root signed by two
-        of three fresh ssh-keygen keys, and hostile repository-local git configuration."""
+        of three fresh ssh-keygen keys, and hostile repository-local git configuration.
+        `tag_release` replaces scripts/release.sh AT THE TAG only (the snapshot, i.e. stage 2)."""
         files = ceremony_files()
         contents = {path: (ROOT / path).read_bytes() for path in files
                     if path not in ("Cargo.toml", "release/bootstrap-root.sha256")}
+        if tag_release is not None:
+            contents["scripts/release.sh"] = tag_release
         contents["Cargo.toml"] = b'[workspace]\n\n[workspace.package]\nversion = "9.9.9"\n'
         keys = base / "keys"
         keys.mkdir()
@@ -745,30 +976,31 @@ class IsolationSignTests(unittest.TestCase):
         # After stage 1's snapshot the working tree is irrelevant: tamper with it now. The
         # working-tree release.sh still runs stage 1, but its stage-2 text is never used.
         script = repo / "scripts/release.sh"
-        script.write_text(script.read_text().replace("--output-dir must not exist yet", "TAMPERED-WORKING-TREE"))
+        script.write_text(RELEASE.read_text().replace("--output-dir must not exist yet", "TAMPERED-WORKING-TREE"))
         (repo / "scripts/sign-isolation-manifest.py").write_text(
             f'open("{base / "marker"}", "a").write("working-tree signer ran\\n")\n')
         (repo / "scripts/hashlib.py").write_text(f'open("{base / "marker"}", "a").write("planted\\n")\n')
         return repo, root, Path(str(root) + ".signatures.json"), git_marker
 
-    def run_ceremony(self, repo, base, *arguments):
+    def run_ceremony(self, repo, base, *arguments, launcher_env=None):
+        """The two-stage ceremony through the real launcher, with hostile tools in the caller's PATH.
+        Return the leaked ceremony directories as well, checking the launcher's actual temp locations."""
         marker = base / "marker"
         write_fakes(base / "fakes", marker)
-        private = base / "private-tmp"
-        private.mkdir(mode=0o700)
-        environment = clean_environment(
-            PATH=f"{base / 'fakes'}:/usr/bin:/bin:/usr/sbin:/sbin", TMPDIR=str(private),
-            SSH_AUTH_SOCK=str(base / "agent.sock"), GIT_DIR=str(base / "nowhere"), PYTHONPATH=str(base / "fakes"),
-            GIT_CONFIG_PARAMETERS=f"'core.fsmonitor'='{base / 'hostile.sh'}'")
+        if launcher_env is None:
+            environment = clean_environment(PATH=f"{base / 'fakes'}:/usr/bin:/bin:/usr/sbin:/sbin")
+        else:
+            environment = launcher_env
+        command = [str(repo / "scripts/isolation-sign"), *arguments]
+        before = ceremony_leftovers()
         controller, terminal = os.openpty()
         try:
-            result = subprocess.run([BASH, str(repo / "scripts/release.sh"), "isolation-sign", *arguments],
-                                    cwd=repo, env=environment, stdin=terminal, capture_output=True, text=True,
-                                    timeout=300)
+            result = subprocess.run(command, cwd=repo, env=environment, stdin=terminal, capture_output=True,
+                                    text=True, timeout=300)
         finally:
             os.close(controller)
             os.close(terminal)
-        return result, marker, private
+        return result, marker, ceremony_leftovers() - before
 
     @unittest.skipUnless(CEREMONY_TOOLS, "needs env, bash, git, python3 (3.9+), ssh-keygen in system/Homebrew dirs")
     def test_end_to_end_stage_2_runs_the_snapshot_never_path_or_working_tree_and_cleans_up(self):
@@ -777,7 +1009,7 @@ class IsolationSignTests(unittest.TestCase):
             repo, root, signatures, git_marker = self.ceremony_repository(base)
             output = base / "out"
             output.mkdir()  # stage 2 refuses here, after every gate and the root verification
-            result, marker, private = self.run_ceremony(repo, base, "--root-metadata", str(root),
+            result, marker, leftovers = self.run_ceremony(repo, base, "--root-metadata", str(root),
                                                         "--root-signatures", str(signatures),
                                                         "--output-dir", str(output))
             report = result.stdout + result.stderr
@@ -796,14 +1028,14 @@ class IsolationSignTests(unittest.TestCase):
                 self.assertTrue(tools[name].startswith("/"), tools)
                 self.assertNotIn(str(base), tools[name])
             # The snapshot and the work directory are gone after the failure.
-            self.assertEqual(list(private.iterdir()), [])
+            self.assertEqual(leftovers, set())
 
     @unittest.skipUnless(CEREMONY_TOOLS and OPTIONAL_TOOLS, "needs every ceremony tool incl. gh, minisign, docker")
     def test_end_to_end_preflight_succeeds_and_cleans_up(self):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary).resolve()
             repo, root, signatures, git_marker = self.ceremony_repository(base)
-            result, marker, private = self.run_ceremony(repo, base, "--root-metadata", str(root),
+            result, marker, leftovers = self.run_ceremony(repo, base, "--root-metadata", str(root),
                                                         "--root-signatures", str(signatures),
                                                         "--output-dir", str(base / "out"), "--preflight")
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -811,7 +1043,7 @@ class IsolationSignTests(unittest.TestCase):
             self.assertFalse((base / "out").exists())
             self.assertFalse(marker.exists())
             self.assertFalse(git_marker.exists())
-            self.assertEqual(list(private.iterdir()), [])
+            self.assertEqual(leftovers, set())
 
     @unittest.skipUnless(CEREMONY_TOOLS, "needs env, bash, git, python3 (3.9+), ssh-keygen in system/Homebrew dirs")
     def test_end_to_end_root_signature_with_a_flipped_byte_is_refused(self):
@@ -827,13 +1059,153 @@ class IsolationSignTests(unittest.TestCase):
                          range(0, len(encoded), 70)) + "\n-----END SSH SIGNATURE-----\n")
             tampered = base / "tampered.signatures.json"
             tampered.write_text(json.dumps(armors))
-            result, marker, private = self.run_ceremony(repo, base, "--root-metadata", str(root),
+            result, marker, leftovers = self.run_ceremony(repo, base, "--root-metadata", str(root),
                                                         "--root-signatures", str(tampered),
                                                         "--output-dir", str(base / "out"))
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("does not verify", result.stderr)
             self.assertIn("--root-signatures do not meet the root threshold", result.stderr)
-            self.assertEqual(list(private.iterdir()), [])
+            self.assertEqual(leftovers, set())
+
+    @unittest.skipUnless(CEREMONY_TOOLS and LAUNCHER_WORKS,
+                         "needs every required ceremony tool and a working /usr/bin/env -S launcher")
+    def test_end_to_end_through_the_launcher_nothing_the_caller_exports_runs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            repo, root, signatures, git_marker = self.ceremony_repository(base)
+            output = base / "out"
+            output.mkdir()  # the normal refusal after every gate and the root verification
+            environment, hostile_marker = hostile_environment(
+                base, PATH=f"{base / 'fakes'}:/usr/bin:/bin:/usr/sbin:/sbin",
+                GIT_CONFIG_PARAMETERS=f"'core.fsmonitor'='{base / 'hostile.sh'}'")
+            before = ceremony_leftovers()
+            result, marker, _ = self.run_ceremony(repo, base, "--root-metadata", str(root), "--root-signatures",
+                                                  str(signatures), "--output-dir", str(output),
+                                                  launcher_env=environment)
+            report = result.stdout + result.stderr
+            self.assertNotEqual(result.returncode, 0, report)
+            self.assertIn("Stage 1: snapshot of v9.9.9", result.stdout, report)
+            self.assertIn("Stage 2: running from", result.stdout, report)
+            self.assertIn("root threshold met by 2 distinct root keys", result.stdout, report)
+            self.assertIn("--output-dir must not exist yet", result.stderr, report)
+            for path in (hostile_marker, marker, git_marker):
+                self.assertFalse(path.exists(), path.read_text() if path.exists() else "")
+            self.assertEqual(ceremony_leftovers() - before, set())
+
+    @unittest.skipUnless(CEREMONY_TOOLS, "needs env, bash, git, python3 (3.9+), ssh-keygen in system/Homebrew dirs")
+    def test_stage_1_removes_the_snapshot_when_stage_2_fails_before_its_own_trap(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            text = RELEASE.read_text()
+            # The tag's (snapshot's) stage 2 stops at its very first statement, before any trap.
+            failing = text.replace("isolation_stage2() {\n",
+                                   'isolation_stage2() {\n    echo "stage 2 stopped at once" >&2\n    return 3\n', 1)
+            self.assertNotEqual(failing, text)
+            repo, root, signatures, _ = self.ceremony_repository(base, tag_release=failing.encode())
+            result, marker, leftovers = self.run_ceremony(repo, base, "--root-metadata", str(root),
+                                                        "--root-signatures", str(signatures),
+                                                        "--output-dir", str(base / "out"))
+            report = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 3, report)
+            self.assertIn("Stage 1: snapshot of v9.9.9", result.stdout, report)
+            self.assertIn("stage 2 stopped at once", result.stderr, report)
+            self.assertEqual(leftovers, set())  # stage 1's own trap removed the snapshot
+            self.assertFalse(marker.exists(), marker.read_text() if marker.exists() else "")
+        # Stage 1 waits for stage 2 as a child; it never execs it.
+        stage1 = shell_function("isolation_stage1")
+        self.assertNotIn("exec ", stage1)
+        self.assertIn('"$ISOLATION_SNAPSHOT/scripts/release.sh" isolation-sign "$@" || status=$?', stage1)
+        self.assertLess(stage1.index("ISOLATION_OWNS_SNAPSHOT=1"), stage1.index("isolation_set_traps"))
+        self.assertLess(stage1.index("isolation_set_traps"), stage1.index('ISOLATION_SNAPSHOT="$(isolation_run'))
+        self.assertNotIn("ISOLATION_OWNS_SNAPSHOT", shell_function("isolation_stage2"))
+
+    # ---------------------------------------------------------------- FIDO2 helper, target key, root copies
+
+    def test_sk_helper_is_resolved_only_next_to_the_selected_ssh_keygen(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            # Homebrew-like: <prefix>/bin/ssh-keygen -> <prefix>/Cellar/openssh/9/bin/ssh-keygen.
+            prefix = base / "brew"
+            keg = prefix / "Cellar/openssh/9"
+            for directory in (prefix / "bin", prefix / "libexec", keg / "bin", keg / "libexec"):
+                directory.mkdir(parents=True, exist_ok=True)
+            for directory, _, _ in os.walk(prefix):
+                os.chmod(directory, 0o755)
+            real = keg / "bin/ssh-keygen"
+            real.write_text("#!/bin/sh\nexit 1\n")
+            real.chmod(0o755)
+            named = prefix / "bin/ssh-keygen"
+            named.symlink_to(real)
+
+            def resolve():
+                return run_section(f'ISOLATION_TOOL_ENV="{system_tool("env")}" ISOLATION_TOOL_PYTHON="{sys.executable}"\n'
+                                   f'ISOLATION_TOOL_SSH_KEYGEN="{real}"\nisolation_resolve_sk_helper "{named}"\n'
+                                   'printf "%s\\n" "${ISOLATION_TOOL_SSH_SK_HELPER:-none}"\n')
+
+            def helper(path):
+                path.write_text("#!/bin/sh\nexit 1\n")
+                path.chmod(0o755)
+                return path
+            result = resolve()
+            self.assertEqual((result.returncode, result.stdout), (0, "none\n"), result.stderr)
+            prefix_helper = helper(prefix / "libexec/ssh-sk-helper")
+            result = resolve()
+            self.assertEqual((result.returncode, result.stdout), (0, f"{prefix_helper}\n"), result.stderr)
+            # The keg's own libexec (the compiled-in default of that ssh-keygen) comes first.
+            keg_helper = helper(keg / "libexec/ssh-sk-helper")
+            result = resolve()
+            self.assertEqual((result.returncode, result.stdout), (0, f"{keg_helper}\n"), result.stderr)
+            # A present helper that fails the audit refuses; it is never skipped for another.
+            keg_helper.chmod(0o777)
+            result = resolve()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("failed the location audit", result.stderr)
+        # Stage 2 hands it to the signers only as --ssh-sk-helper (they set SSH_SK_HELPER for
+        # ssh-keygen -Y sign alone); verification calls never get it.
+        body = re.sub(r"\\\n\s*", "", isolation_function())
+        self.assertIn('signing_tools+=(--ssh-sk-helper "$ISOLATION_TOOL_SSH_SK_HELPER")', body)
+        self.assertEqual(body.count('"${signing_tools[@]}"'), 2)
+        for line in body.splitlines():
+            if "--check-threshold" in line or "--check-target" in line:
+                self.assertNotIn("signing_tools", line)
+        # Never in the shared child environment of the ceremony.
+        self.assertNotIn("SSH_SK_HELPER", shell_function("isolation_child_environment"))
+        self.assertNotIn("SSH_SK_HELPER=$ISOLATION_TOOL_SSH_SK_HELPER", section_code())
+
+    def test_target_key_is_verified_before_anything_joins_the_upload_list(self):
+        body = re.sub(r"\\\n\s*", "", isolation_function())
+        self.assertIn('--signing-key-stdin "${signing_tools[@]}" --target-root "$root_metadata" '
+                      '--target-root-sha256 "$pin"', body)
+        handoff = body.index('isolation_handoff 1 "$target_key"')
+        check = body.index('--kind release --check-target "$output_dir/isolated-linux-$arch-manifest.json" '
+                           '--root-metadata "$root_metadata" --root-sha256 "$pin" --ssh-keygen "$ssh_keygen"')
+        delete = body.index('isolation_run "$ISOLATION_TOOL_RM" -rf -- "$output_dir/isolated-linux-$arch-"*')
+        self.assertLess(handoff, check)
+        self.assertLess(check, delete)
+        self.assertLess(delete, body.index("uploads+="))
+        packager = (ROOT / "scripts/package-linux-release.py").read_text()
+        self.assertIn("target_root=args.target_root or args.bootstrap_root", packager)
+        self.assertIn('signer_arguments += ["--root-metadata", str(Path(target_root).resolve())]', packager)
+        self.assertIn("expected_root_sha256=args.target_root_sha256", packager)
+
+    def test_root_metadata_is_copied_once_and_only_the_verified_copies_are_read(self):
+        body = isolation_function()
+        copy = body.index('root_metadata="$ISOLATION_WORK/root/root.json"')
+        self.assertIn('root_signatures="$ISOLATION_WORK/root/root.json.signatures.json"', body[copy:copy + 120])
+        before, after = body[:copy], body[copy:]
+        # Before the switch, the given paths are only checked to be regular files and copied once.
+        for variable in ("root_metadata", "root_signatures"):
+            self.assertEqual(before.count(f'"${variable}"'), 3, variable)
+            self.assertEqual(body.count(f"ISOLATION_{variable.upper()}"), 1, variable)
+        self.assertIn('"$ISOLATION_TOOL_CP" -- "$root_metadata" "$ISOLATION_WORK/root/root.json"', before)
+        self.assertIn('"$ISOLATION_TOOL_CHMOD" -R u=rX,go= -- "$ISOLATION_WORK/root"', before)
+        # Pin, threshold and ssh-keygen -Y verify run on the copies, and so does everything later.
+        for needle in ('isolation_sha256 "$root_metadata"', '--check-threshold "$root_metadata" --signatures '
+                       '"$root_signatures"', '--bootstrap-root "$root_metadata" --bootstrap-root-signatures '
+                       '"$root_signatures"', '--root-metadata "$root_metadata" --root-sha256 "$pin"'):
+            self.assertIn(needle, after)
+            self.assertNotIn(needle, before)
+        self.assertLess(body.index('isolation_check_repository "$tag"'), copy)
 
     # ---------------------------------------------------------------- R2-2: the docker probe
 
