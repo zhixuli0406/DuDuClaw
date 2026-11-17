@@ -1427,12 +1427,19 @@ pub mod linux {
             let error = refusals.finish().unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
             let message = error.to_string();
-            assert!(message.starts_with("invalid unit policy: readback DeviceAllow: actual signature a(ss) value "), "{message}");
-            assert!(message.contains("/dev/null"), "{message}");
-            assert!(message.contains("; readback StandardOutput: actual signature s value "), "{message}");
-            assert!(message.contains("journal"), "{message}");
+            let prefix = "invalid unit policy: ";
+            assert!(message.starts_with(prefix), "{message}");
+            assert_eq!(message.matches(prefix).count(), 1, "{message}");
+            let entries: Vec<&str> = message.strip_prefix(prefix).unwrap().split("; ").collect();
+            assert_eq!(entries.len(), 2, "{message}");
+            // Policy properties use BTreeMap order; Debug values may be cut
+            // before the mismatching entry, so check names and bounds instead.
+            for (entry, (key, signature)) in entries.iter().zip([("DeviceAllow", "a(ss)"), ("StandardOutput", "s")]) {
+                let heading = format!("readback {key}: actual signature {signature} value ");
+                let rendered = entry.strip_prefix(heading.as_str()).expect(&message);
+                assert!(rendered.strip_suffix("...").unwrap_or(rendered).len() <= 200, "{message}");
+            }
             assert!(!message.contains("StandardInput"), "{message}");
-            assert_eq!(message.matches("invalid unit policy").count(), 1, "{message}");
             assert!(!message.contains("more readback mismatches"), "{message}");
             // A dependency mismatch and a non-convertible reply join the same
             // refusal; the latter's (bus) kind is kept.
