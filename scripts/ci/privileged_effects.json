@@ -7256,6 +7256,32 @@
       "rationale": "Ignored root Linux acceptance test forks a child into a private mount namespace to check the /etc protected-mode projection, then _exits; not a production spawn path."
     },
     {
+      "symbol": "crates/duduclaw-spawnd/src/bootstrap_mounts.rs::tests::iso_root_etc_projection_attaches_through_build_root",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Ignored root Linux acceptance test (DUDUCLAW_ISO_DISPOSABLE=1) re-executes only itself (current test binary, --exact) so the production /etc projection is attached by build_root in a fresh process's private namespaces instead of a fork of the harness; not a production spawn path."
+    },
+    {
+      "symbol": "crates/duduclaw-spawnd/src/bootstrap_mounts.rs::tests::iso_root_etc_projection_refuses_mounted_ca_chain",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Ignored root Linux acceptance test re-executes only itself in a fresh process to verify that a mounted CA chain is refused in a private mount namespace; not a production spawn path."
+    },
+    {
       "symbol": "crates/duduclaw-spawnd/src/transport.rs::tests::root_tests::iso_root_egress_control_identity_over_socket_activation",
       "apis": {
         "raw_fork": 1
@@ -7414,18 +7440,6 @@
       "identity": "test",
       "migration": "test_only",
       "rationale": "Test-only fork child lowers its own rlimits and _exits; not a production spawn path."
-    },
-    {
-      "symbol": "crates/duduclaw-run/src/linux/mounts.rs::tests::iso_root_attach_input_without_dac_capabilities",
-      "apis": {
-        "raw_fork": 1
-      },
-      "effects": [
-        "process_spawn"
-      ],
-      "identity": "test",
-      "migration": "test_only",
-      "rationale": "Root-only ignored test (DUDUCLAW_ISO_DISPOSABLE=1): the fork child enters a private mount namespace, reduces its capabilities to the run unit's set and calls attach_input, then _exits; never execs, not a production spawn path."
     },
     {
       "symbol": "crates/duduclaw-run/src/bin/root-fixture/helpers.rs::Session::new",

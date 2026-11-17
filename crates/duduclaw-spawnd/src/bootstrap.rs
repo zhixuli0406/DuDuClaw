@@ -207,9 +207,12 @@ impl BootstrapPlan {
 }
 
 /// Content for B1's minimal read-only /etc projection. The adapter publishes
-/// these exact regular files beneath a root-owned private anchor, fsyncs it,
-/// clones a recursive private read-only/nosuid/nodev/nosymfollow mount and hands
-/// only that detached mount to B2. Never bind the host /etc or shadow database.
+/// these exact regular files beneath a root-owned private anchor, together with
+/// the R3-1 marker directory and the EMPTY root 0755 directories the trampoline
+/// mounts the host CA certificates on ([`duduclaw_run::ETC_PROJECTION_DIRECTORIES`],
+/// `ssl/certs`), fsyncs it, clones a recursive private read-only/nosuid/nodev/
+/// nosymfollow mount and hands only that detached mount to B2. Nothing else is
+/// accepted in it. Never bind the host /etc or shadow database.
 pub fn minimal_etc(uid: u32, gid: u32) -> Result<BTreeMap<&'static str, String>> {
     if !crate::storage::valid_employee_uid(uid) || uid != gid { return Err(ErrorCode::InvalidRequest); }
     let user = format!("duduclaw-emp-{uid}");
@@ -243,7 +246,9 @@ pub const ETC_MARKER_CONTENT: &str = "native-systemd\n";
 
 /// Every regular file of an employee runtime's read-only `/etc`, as
 /// `(path relative to /etc, contents)`: [`minimal_etc`] plus the R3-1
-/// protected-mode marker. The single source for publication and tests.
+/// protected-mode marker. The single source for publication and tests. The
+/// only other entries are directories: `duduclaw/` and the empty CA mount
+/// point chain [`duduclaw_run::ETC_PROJECTION_DIRECTORIES`].
 pub fn etc_projection(uid: u32, gid: u32) -> Result<Vec<(String, String)>> {
     let mut entries: Vec<(String, String)> = minimal_etc(uid, gid)?.into_iter()
         .map(|(name, contents)| (name.to_owned(), contents)).collect();
