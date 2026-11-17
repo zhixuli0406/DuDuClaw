@@ -53,6 +53,23 @@ executables to service paths, start a service, or execute staged content. It is
 activation are still required before an installer may select or run the generation.
 The `bootstrap_staged:<digest>` result must never be reported as readiness.
 
+## Release integration and test keys (plan R2)
+
+The production pin is read only from the public file `release/bootstrap-root.sha256`
+(added after the key ceremony; see `release/isolation/README.md`). Without it no
+`duduclaw-bootstrap` is built or shipped. `scripts/release.sh isolation-sign`
+signs the isolation manifest offline and, for v1.83.0 only (owner decision Q6),
+the migration bundle with the root threshold.
+
+`duduclaw-isolation-test-signer` (`--features test-signer`, module `test_signer`)
+is a TEST-ONLY software signer: simulated `sk-ssh-ed25519` root/target keys,
+plain ed25519 R2/R3 and a test minisign key. It is never a release binary
+(`scripts/package-linux-release.py` refuses any build naming the feature or the
+binary). `scripts/isolation-test-keys.sh keys` creates a test key set and prints
+`TEST <pin>` with the environment of a `--cfg duduclaw_test_root` verifier build;
+`... bundle` turns an unpinned release archive into a TEST migration bundle
+through the production packaging and signing code.
+
 ## Validation
 
 ```sh

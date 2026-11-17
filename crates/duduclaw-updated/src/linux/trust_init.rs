@@ -1,6 +1,8 @@
 //! R1 trust-root initialisation (plan §4.1 `trust_init::publish`), called by R3
 //! step S4 after the gateway is stopped and its processes are clear. Isolation
-//! facts start here. Everything runs under STATE_ROOT/update.lock. Each step first
+//! facts start here. Everything runs under the bootstrap stage lock, the version
+//! lock and STATE_ROOT/update.lock, taken in that order before STATE_ROOT may be
+//! created (`bootstrap_verify` LOCK ORDER). Each step first
 //! reads back what exists and skips it when already complete; anything present but
 //! different refuses (no repair, no overwrite), so an interrupted run resumes by
 //! calling `publish` again with the same receipt.
@@ -11,7 +13,8 @@ use super::{bootstrap_verify::{self, Context, StageReceipt}, files::{Directory, 
     launcher::SlotReceipt, service::TrustBundle, CONFIG_ROOT, INSTALL_ROOT, STATE_ROOT};
 
 /// Update-service subset of duduclaw-cli `protected_linux_layout::DIRECTORIES`,
-/// parent first, with the same modes. (STATE_ROOT is created before the lock.)
+/// parent first, with the same modes. (STATE_ROOT is created first, under the
+/// acceptance locks: `bootstrap_verify::create_state_root_locked`.)
 pub const UPDATE_DIRECTORIES: &[(&str, u32)] = &[
     ("/etc/duduclaw-updated", 0o700),
     ("/var/lib/duduclaw-updated", 0o700),
@@ -63,15 +66,28 @@ pub(crate) fn publish_at(protected: &Path, stage: &StageReceipt, context: &Conte
     if stage.schema_version != 1 || stage.root_sha256 != context.pin || stage.verifier_pin_kind != context.pin_kind {
         return Err(Error::Signature);
     }
-    let (receipt, staged) = bootstrap_verify::open_stage_at(protected, stage.manifest_digest, context)?;
-    if receipt != *stage { return Err(Error::Signature); }
     let digest = stage.manifest_digest;
-    let root = crate::trust::verify_root(&staged.root_bytes, &staged.root_signatures, context.pin, context.now)?;
 
-    // 1. Update-service directories (STATE_ROOT first: it holds the lock).
-    ensure_path(STATE_ROOT, 0o700)?;
-    let state = Directory::open(Path::new(STATE_ROOT))?;
-    let _lock = state.lock()?;
+    // 1. Update-service directories. STATE_ROOT first, and only under the bootstrap
+    //    acceptance locks (LOCK ORDER in bootstrap_verify: stage lock -> version-lock
+    //    -> STATE_ROOT/update.lock if the root exists), all held until this function
+    //    returns: a state root can then never appear between a bootstrap acceptance's
+    //    last history re-read and its high-water write / stage publish. Under those
+    //    locks, BEFORE anything is created, the stage is re-opened and fully
+    //    re-verified from disk (it must equal `stage`), the history is re-read and
+    //    `check_history` re-run, and the high-water record must be exactly this
+    //    candidate (`bootstrap_verify::reverify_for_publish`): a receipt overtaken by a
+    //    newer acceptance is refused and no state root is created. Nothing is read from
+    //    the stage before the locks are held. A caller that already holds the CLI's
+    //    version-lock (e.g. the future CLI installer inside `version_lock`) must NOT
+    //    call `publish` (flock per open file description): it would wait for itself and
+    //    be refused as Busy after the bounded wait, never run unlocked.
+    let (locks, (staged, root)) = bootstrap_verify::create_state_root_locked(protected, Path::new(STATE_ROOT), || {
+        let staged = bootstrap_verify::reverify_for_publish(protected, Path::new(STATE_ROOT), stage, context)?;
+        let root = crate::trust::verify_root(&staged.root_bytes, &staged.root_signatures, context.pin, context.now)?;
+        Ok((staged, root))
+    })?;
+    let state = &locks.state;
     for (path, mode) in UPDATE_DIRECTORIES { ensure_path(path, *mode)?; }
     checkpoint(1)?;
 
@@ -93,7 +109,7 @@ pub(crate) fn publish_at(protected: &Path, stage: &StageReceipt, context: &Conte
     checkpoint(4)?;
 
     // 5. state.json, read back byte-for-byte and through State::validate.
-    write_state(&state, &install, &staged.manifest, &staged.manifest_bytes, &staged.manifest_signature, digest,
+    write_state(state, &install, &staged.manifest, &staged.manifest_bytes, &staged.manifest_signature, digest,
         context.now)?;
     checkpoint(5)?;
 
@@ -103,7 +119,7 @@ pub(crate) fn publish_at(protected: &Path, stage: &StageReceipt, context: &Conte
     checkpoint(6)?;
 
     // 7. trust-ledger.json, so later verification no longer depends on trust.json.
-    record_ledger(&state, &staged.manifest_bytes, &staged.manifest_signature, context.now)?;
+    record_ledger(state, &staged.manifest_bytes, &staged.manifest_signature, context.now)?;
     checkpoint(7)?;
     Ok(digest)
 }

@@ -8,6 +8,18 @@
 #   ./scripts/release.sh linux-assets --target <triple> [--output-dir <dir>]
 #                         [--manifest-template <json> --signing-key <offline-key>]
 #                                                          # build/package, never publish
+#   ./scripts/release.sh isolation-sign --help             # OFFLINE, owner present: sign the
+#                                                          # native Linux isolation release
+#
+# isolation-sign (plan R2 §4.2) runs after CI has published the tag's Linux
+# archives. It needs release/bootstrap-root.sha256 (added after the key
+# ceremony; without it there is no production pin and nothing to sign). Per
+# release it probes the released duduclaw-bootstrap (PRODUCTION <pin>), signs
+# the isolation manifest with the target key, uploads the update-service assets
+# (isolated-linux-<arch>-*) and writes SHA256SUMS-isolation.txt. Only the
+# versions in ISOLATION_MIGRATION_BUNDLE_VERSIONS (owner decision Q6: v1.83.0)
+# also build the migration bundle tar and need the root threshold
+# (--migration-bundle --root-key R1 --root-key R2) plus the legacy minisign key.
 #
 # --title "<theme>" sets the one-line release theme in the CHANGELOG version
 # header (house style: "## [1.36.0] - 2026-07-15 — <theme>"). On a bump the
@@ -384,6 +396,559 @@ run_verify() {
     return $rc
 }
 
+# --- isolation-sign: offline signing of the native Linux isolation release (plan R2 §4.2) ---
+# Owner decision Q6 (2026-11-17): ONLY v1.83.0 ships a migration bundle signed
+# by the root threshold; later versions reach migrated hosts through the update
+# service. Adding a version here is an owner decision, never a routine edit.
+ISOLATION_MIGRATION_BUNDLE_VERSIONS="1.83.0"
+ISOLATION_PIN_FILE="release/bootstrap-root.sha256"
+ISOLATION_TEMPLATE="release/isolation/manifest-template.json"
+ISOLATION_REPO="zhixuli0406/DuDuClaw"
+ISOLATION_WORK=""
+# R2-2: the probe container image, by digest only (see the file's header).
+ISOLATION_PROBE_DIGEST_FILE="release/isolation/probe-image.digest"
+# R2-1: every file the ceremony executes or reads by path. Each must be
+# byte-identical to its blob at the checked-out tag before anything runs.
+ISOLATION_CEREMONY_FILES=(
+    scripts/release.sh
+    scripts/package-linux-release.py
+    scripts/sign-isolation-manifest.py
+    scripts/check_glibc.py
+    release/isolation/manifest-template.json
+    release/isolation/probe-image.digest
+    release/bootstrap-root.sha256
+    crates/duduclaw-isolation/src/update.rs
+    Cargo.toml
+)
+# R2-3: key locations come only from these variables or an attended prompt.
+ISOLATION_TARGET_KEY_VARIABLE="DUDUCLAW_ISOLATION_TARGET_KEY"
+ISOLATION_ROOT_KEY_VARIABLES=(DUDUCLAW_ISOLATION_ROOT_KEY_1 DUDUCLAW_ISOLATION_ROOT_KEY_2)
+ISOLATION_LEGACY_KEY_VARIABLE="DUDUCLAW_ISOLATION_LEGACY_MINISIGN_KEY"
+
+isolation_sign_usage() {
+    cat <<'EOF'
+Usage: scripts/release.sh isolation-sign \
+         --root-metadata <root.json> --root-signatures <root.json.signatures.json> \
+         --output-dir <new directory> [--ssh-keygen <Homebrew ssh-keygen>] \
+         [--manifest-valid-days <1-1830, default 365>] \
+         [--migration-bundle [--authorization-valid-days <1-1830, default 730>]] \
+         [--no-upload]
+
+Key locations are NEVER command-line arguments (any local process can read
+argv): each comes from its environment variable or, when that is unset, from
+an attended prompt on the terminal (echoed; a location is not a secret):
+  DUDUCLAW_ISOLATION_TARGET_KEY            target key handle
+  DUDUCLAW_ISOLATION_ROOT_KEY_1 / _2       --migration-bundle: R1 handle, R2 key
+  DUDUCLAW_ISOLATION_LEGACY_MINISIGN_KEY   --migration-bundle: legacy minisign key
+                                           (empty prompt answer: ~/.minisign/duduclaw-release.key)
+They reach the signers only through the environment. ssh-keygen / minisign are
+given `-f`/`-s <private 0700 temp dir>/signing-key`, a symlink to the real key
+that is removed right after. Residual exposure: while ssh-keygen or minisign
+runs (the signing moment, on this offline ceremony machine) its argv shows that
+neutral temporary name, and only your own user (and root) can read the link or
+the environment.
+
+OFFLINE signing of the native Linux isolation release (plan R2 §4.2). Run it
+attended, in an interactive terminal, on the release machine with the hardware
+key attached, from a clean checkout of tag v<version>, after CI has published
+that tag's Linux archives. Never in CI; never with stdin/stdout sent to a log.
+
+Steps, in order (any failure stops everything; no output is ever overwritten):
+  0. Preconditions: not CI, interactive terminal, release/bootstrap-root.sha256
+     present (absent = no production pin = nothing to sign), HEAD at tag
+     v<version>, no change and NO untracked file anywhere in the checkout, no
+     ignored file (e.g. __pycache__) under scripts/ or release/, no index flag
+     but H in `git ls-files -v` (assume-unchanged / skip-worktree refused), every
+     ceremony file byte-identical to its blob at the tag; SHA-256 of
+     --root-metadata equal to the pin and its signatures meeting its own root
+     threshold; gh/minisign/ssh-keygen. Every Python step runs as python3 -I -B.
+  For x86_64 and aarch64:
+  1. Download duduclaw-linux-<arch>.tar.gz (+ .sha256, .minisig) of the tag; verify
+     the CI minisign signature with the official release key and its exact
+     trusted comment; extract duduclaw-bootstrap and execute --print-root-pin
+     (natively on Linux of that arch; otherwise in docker: the image ONLY by
+     digest from release/isolation/probe-image.digest, pre-pulled by you as a
+     separate step (--pull=never), read-only, non-root, no capabilities,
+     no-new-privileges, pid and memory limits, --network none, only the
+     verifier file mounted read-only, no environment): it must print exactly
+     PRODUCTION <pin>.
+  2. The target key signs the isolation manifest: release/isolation/manifest-template.json
+     rendered for this version/arch (serial = major*10^6+minor*10^3+patch) over the
+     binaries of that same released archive; ssh-keygen asks for touch + PIN.
+  Only for ISOLATION_MIGRATION_BUNDLE_VERSIONS (owner decision Q6: ONLY v1.83.0),
+  which also REQUIRE --migration-bundle (every other version refuses it):
+  3. Assemble the bootstrap inbox and the plain-ustar migration bundle
+     duduclaw-isolated-linux-<arch>-<version>.tar.
+  4. The root threshold (R1 touch + PIN, R2 passphrase) signs its
+     BundleAuthorization; the legacy release minisign key signs the tar
+     (minisign asks for its password); both are verified before going on. The
+     signers are identified by the keys embedded in the signatures (two paths to
+     one key are one signer): distinct, registered in --root-metadata, not
+     revoked, meeting its threshold; otherwise the authorization is deleted and
+     nothing is added to the upload list.
+  Then:
+  5. Write <output-dir>/SHA256SUMS-isolation.txt from the exact bytes to upload,
+     plus "<pin>  root.json" (the root metadata fingerprint).
+  6. After you type UPLOAD: upload the update-service assets isolated-linux-<arch>-*
+     (and, for the bundle version, duduclaw-bootstrap-linux-<arch> and the four
+     bundle files) to the GitHub release without replacing any asset, then
+     download every uploaded asset again and compare its SHA-256.
+Publishing SHA256SUMS-isolation.txt on the website and the licensed console is
+the separate [external] gate; this script never publishes it there.
+
+Secrets: key files and key handles are opened only by ssh-keygen / minisign,
+which prompt on the terminal. This script never copies, prints or logs a key,
+passphrase or PIN; its temporary directory holds public release data and, only
+while a signer runs, the neutral `signing-key` symlink; it is removed on exit.
+Before the docker probe can run, pre-pull the digests of
+release/isolation/probe-image.digest yourself (docker pull --platform ... ubuntu@sha256:...).
+EOF
+}
+
+isolation_fail() {
+    echo "Error: $*" >&2
+    return 1
+}
+
+isolation_sha256() {
+    python3 -I -B -c 'import hashlib, sys
+digest = hashlib.sha256()
+with open(sys.argv[1], "rb") as source:
+    for chunk in iter(lambda: source.read(1 << 20), b""):
+        digest.update(chunk)
+print(digest.hexdigest())' "$1"
+}
+
+# Exact minisign text: four lines, prehashed (ED) signature, exact trusted comment.
+isolation_check_minisig() {
+    python3 -I -B - "$1" "$2" <<'PY'
+import base64, binascii, sys
+try:
+    with open(sys.argv[1], "rb") as source:
+        lines = source.read(4096).decode("utf-8").split("\n")
+    ok = (len(lines) == 5 and lines[4] == "" and lines[0].startswith("untrusted comment: ")
+          and base64.b64decode(lines[1], validate=True)[:2] == b"ED"
+          and lines[2] == "trusted comment: " + sys.argv[2])
+except (OSError, UnicodeDecodeError, binascii.Error):
+    ok = False
+sys.exit(0 if ok else 1)
+PY
+}
+
+# R2-1: the ceremony runs only on a checkout that is exactly tag $1. Rule:
+#  - HEAD is the tag's commit, and the shell runs at the repository top level;
+#  - no tracked change and NO untracked file anywhere (any untracked file refuses);
+#  - no ignored file under scripts/ or release/, the only directories the ceremony
+#    executes or loads code from (this also catches __pycache__, which importlib
+#    would read for scripts loaded by path). Ignored build output elsewhere (e.g.
+#    target/, web/node_modules) is allowed: every Python step runs as
+#    `python3 -I -B`, so neither the working directory nor the script directory is
+#    on sys.path, PYTHON* variables and the user site are ignored, and no
+#    bytecode is written; nothing outside scripts/ and release/ is executed;
+#  - `git ls-files -v` shows only "H" (assume-unchanged / skip-worktree hide edits
+#    from git status);
+#  - every ISOLATION_CEREMONY_FILES entry is a regular file byte-identical to its
+#    blob at the tag (git cat-file + cmp), whatever git status believes.
+# git runs with fsmonitor and the untracked cache disabled, so no hook or cache
+# can shape these answers.
+isolation_check_checkout() {
+    local tag="$1" head tag_commit top listing path blob
+    local -a git_plain=(git -c core.fsmonitor=false -c core.untrackedCache=false)
+    top="$("${git_plain[@]}" rev-parse --show-toplevel)" || { isolation_fail "not a git checkout"; return 1; }
+    if [[ "$top" != "$(pwd -P)" ]]; then
+        isolation_fail "run isolation-sign from the repository top level"; return 1
+    fi
+    head="$("${git_plain[@]}" rev-parse --verify HEAD)" || { isolation_fail "cannot read HEAD"; return 1; }
+    tag_commit="$("${git_plain[@]}" rev-parse --verify --quiet "refs/tags/$tag^{commit}" || true)"
+    if [[ -z "$tag_commit" || "$head" != "$tag_commit" ]]; then
+        isolation_fail "check out tag $tag first: the template, pin file and released archives must belong to it"
+        return 1
+    fi
+    listing="$("${git_plain[@]}" status --porcelain=v1 --untracked-files=all)" \
+        || { isolation_fail "git status failed"; return 1; }
+    if [[ -n "$listing" ]]; then
+        isolation_fail "the working tree has uncommitted changes or untracked files (any untracked file is refused)"
+        return 1
+    fi
+    listing="$("${git_plain[@]}" status --porcelain=v1 --untracked-files=all --ignored=matching -- scripts release)" \
+        || { isolation_fail "git status failed"; return 1; }
+    if [[ -n "$listing" ]]; then
+        isolation_fail "ignored files exist under scripts/ or release/ (e.g. __pycache__); remove them" \
+            "(git clean -ndX -- scripts release lists them)"
+        return 1
+    fi
+    listing="$("${git_plain[@]}" ls-files -v)" || { isolation_fail "git ls-files failed"; return 1; }
+    if [[ -n "$listing" ]] && grep -q -v '^H ' <<< "$listing"; then
+        isolation_fail "tracked files carry index flags (assume-unchanged, skip-worktree, ...):" \
+            "git ls-files -v must show only H"
+        return 1
+    fi
+    for path in "${ISOLATION_CEREMONY_FILES[@]}"; do
+        if [[ ! -f "$path" || -L "$path" ]]; then
+            isolation_fail "$path is missing or not a regular file"; return 1
+        fi
+        blob="$("${git_plain[@]}" rev-parse --verify --quiet "$tag_commit:$path")" \
+            || { isolation_fail "$path is not tracked at $tag"; return 1; }
+        if ! "${git_plain[@]}" cat-file blob "$blob" | cmp -s - "$path"; then
+            isolation_fail "$path differs from its blob at $tag"; return 1
+        fi
+    done
+}
+
+# R2-3: one key location, from the named variable or an attended prompt on the
+# controlling terminal (echo on), never from argv. Prints the absolute location.
+# $3 (optional) is used when the prompt answer is empty. Messages name the
+# variable, never the location.
+isolation_key_location() {
+    local variable="$1" label="$2" fallback="${3:-}" value
+    value="${!variable:-}"
+    if [[ -z "$value" ]]; then
+        if ! { exec 3<>/dev/tty; } 2>/dev/null; then
+            isolation_fail "no terminal for the $label prompt: set $variable"; return 1
+        fi
+        printf 'Location of the %s (a path, not a secret; or set %s): ' "$label" "$variable" >&3
+        IFS= read -r value <&3 || value=""
+        exec 3>&-
+        if [[ -z "$value" ]]; then value="$fallback"; fi
+    fi
+    if [[ -z "$value" || "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+        isolation_fail "the $label location ($variable or the prompt) is empty or malformed"; return 1
+    fi
+    if [[ "$value" != /* ]]; then value="$PWD/$value"; fi
+    if [[ ! -f "$value" ]]; then
+        isolation_fail "the $label location ($variable or the prompt) is not a file"; return 1
+    fi
+    printf '%s\n' "$value"
+}
+
+# minisign -S with only a neutral symlink in its argv (R2-3), created in a private
+# 0700 directory inside ISOLATION_WORK (removed here and by the EXIT trap). The
+# link is made by Python from the environment, so the real location never
+# appears in any argv. $1 key location, $2 file, $3 trusted comment, $4 output.
+isolation_minisign_sign() {
+    local link_dir="$ISOLATION_WORK/minisign-key" rc=0
+    mkdir -m 0700 -- "$link_dir"
+    ISOLATION_LINK_TARGET="$1" python3 -I -B -c 'import os, sys
+os.symlink(os.path.abspath(os.environ["ISOLATION_LINK_TARGET"]), sys.argv[1])' "$link_dir/signing-key" || rc=$?
+    if [[ "$rc" == "0" ]]; then
+        minisign -S -s "$link_dir/signing-key" -m "$2" -t "$3" -x "$4" || rc=$?
+    fi
+    rm -rf -- "$link_dir"
+    return "$rc"
+}
+
+# R2-2: the digest reference for docker platform $1 from ISOLATION_PROBE_DIGEST_FILE:
+# exactly one "<platform> ubuntu@sha256:<64 lowercase hex>" line. A tag, a
+# placeholder, a duplicate or a missing line refuses.
+isolation_probe_image() {
+    local platform="$1" line name reference found="" count=0
+    if [[ ! -f "$ISOLATION_PROBE_DIGEST_FILE" || -L "$ISOLATION_PROBE_DIGEST_FILE" ]]; then
+        isolation_fail "$ISOLATION_PROBE_DIGEST_FILE is missing"; return 1
+    fi
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        case "$line" in ''|'#'*) continue ;; esac
+        name="${line%% *}"
+        reference="${line#* }"
+        if [[ "$name" == "$platform" ]]; then
+            found="$reference"
+            count=$((count + 1))
+        fi
+    done < "$ISOLATION_PROBE_DIGEST_FILE"
+    if [[ "$count" != "1" || ! "$found" =~ ^ubuntu@sha256:[0-9a-f]{64}$ ]]; then
+        isolation_fail "$ISOLATION_PROBE_DIGEST_FILE has no verified digest for $platform (one line" \
+            "'$platform ubuntu@sha256:<64 hex>'; tags and placeholders are refused). Fill in a digest you" \
+            "verified through a reviewed commit, or run isolation-sign on Linux of that architecture."
+        return 1
+    fi
+    printf '%s\n' "$found"
+}
+
+# R2-2: the complete docker argv for the probe, in ISOLATION_DOCKER_ARGV.
+# $1 verifier file (mounted alone, read-only), $2 docker platform, $3 digest reference.
+isolation_probe_docker_argv() {
+    local binary="$1" platform="$2" image="$3"
+    if [[ ! "$image" =~ ^ubuntu@sha256:[0-9a-f]{64}$ ]]; then
+        isolation_fail "the probe image must be an ubuntu@sha256 digest reference"; return 1
+    fi
+    if [[ "$binary" != /* || "$binary" == *,* || "$binary" == *$'\n'* ]]; then
+        isolation_fail "the verifier path cannot be bind-mounted safely"; return 1
+    fi
+    ISOLATION_DOCKER_ARGV=(docker run --rm --pull=never --platform "$platform"
+        --network none --read-only --user 65534:65534 --cap-drop=ALL
+        --security-opt no-new-privileges --pids-limit 32 --memory 256m --memory-swap 256m
+        --entrypoint /probe/duduclaw-bootstrap
+        --mount "type=bind,source=$binary,target=/probe/duduclaw-bootstrap,readonly"
+        "$image" --print-root-pin)
+}
+
+# Execute the verifier's read-only --print-root-pin; its stdout is the result.
+# $1 is a private copy named duduclaw-bootstrap in its own directory.
+isolation_probe_pin() {
+    local binary="$1" arch="$2" host_arch platform image
+    host_arch="$(uname -m)"
+    if [[ "$host_arch" == "arm64" ]]; then host_arch="aarch64"; fi
+    if [[ "$(uname -s)" == "Linux" && "$host_arch" == "$arch" ]]; then
+        env -i "$binary" --print-root-pin
+        return
+    fi
+    case "$arch" in
+        x86_64) platform="linux/amd64" ;;
+        aarch64) platform="linux/arm64" ;;
+        *) return 1 ;;
+    esac
+    command -v docker >/dev/null 2>&1 \
+        || isolation_fail "executing the $arch verifier here needs docker (or run on Linux $arch)" || return 1
+    image="$(isolation_probe_image "$platform")" || return 1
+    local -a ISOLATION_DOCKER_ARGV=()
+    isolation_probe_docker_argv "$binary" "$platform" "$image" || return 1
+    "${ISOLATION_DOCKER_ARGV[@]}"
+}
+
+run_isolation_sign() {
+    local root_metadata="" root_signatures="" output_dir="" ssh_keygen="ssh-keygen"
+    local manifest_days=365 authorization_days=730 migration_bundle=0 upload=1
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help) isolation_sign_usage; return 0 ;;
+            --target-key|--root-key|--legacy-minisign-key)
+                isolation_fail "$1 is refused: key locations are never command-line arguments (other local" \
+                    "processes can read argv); set its DUDUCLAW_ISOLATION_* variable or answer the prompt (see --help)"
+                return 1 ;;
+            --root-metadata) root_metadata="${2:?--root-metadata needs a value}"; shift 2 ;;
+            --root-signatures) root_signatures="${2:?--root-signatures needs a value}"; shift 2 ;;
+            --output-dir) output_dir="${2:?--output-dir needs a value}"; shift 2 ;;
+            --ssh-keygen) ssh_keygen="${2:?--ssh-keygen needs a value}"; shift 2 ;;
+            --manifest-valid-days) manifest_days="${2:?--manifest-valid-days needs a value}"; shift 2 ;;
+            --authorization-valid-days) authorization_days="${2:?--authorization-valid-days needs a value}"; shift 2 ;;
+            --migration-bundle) migration_bundle=1; shift ;;
+            --no-upload) upload=0; shift ;;
+            *) isolation_fail "unknown isolation-sign option '$1' (see --help)"; return 1 ;;
+        esac
+    done
+
+    # 0. Preconditions, cheapest and most decisive first.
+    if [[ -n "${CI:-}" || -n "${GITHUB_ACTIONS:-}" ]]; then
+        isolation_fail "isolation-sign uses offline keys and never runs in CI"; return 1
+    fi
+    local bundle_release=0 listed
+    local -a bundle_versions=()
+    read -r -a bundle_versions <<< "$ISOLATION_MIGRATION_BUNDLE_VERSIONS"
+    for listed in "${bundle_versions[@]}"; do
+        if [[ "$listed" == "$CURRENT_VERSION" ]]; then bundle_release=1; fi
+    done
+    if [[ "$migration_bundle" == "1" && "$bundle_release" == "0" ]]; then
+        isolation_fail "owner decision Q6: only v$ISOLATION_MIGRATION_BUNDLE_VERSIONS ships a migration bundle;" \
+            "v$CURRENT_VERSION reaches migrated hosts through the update service. Drop --migration-bundle."
+        return 1
+    fi
+    if [[ "$migration_bundle" == "0" && "$bundle_release" == "1" ]]; then
+        isolation_fail "v$CURRENT_VERSION is the migration-bundle release (owner decision Q6);" \
+            "pass --migration-bundle (root keys: DUDUCLAW_ISOLATION_ROOT_KEY_1/_2 or the prompt)."
+        return 1
+    fi
+    if [[ -z "$root_metadata" || -z "$root_signatures" || -z "$output_dir" ]]; then
+        isolation_fail "--root-metadata, --root-signatures and --output-dir are required (see --help)"
+        return 1
+    fi
+    local days
+    for days in "$manifest_days" "$authorization_days"; do
+        if [[ ! "$days" =~ ^[1-9][0-9]{0,3}$ ]] || (( days > 1830 )); then
+            isolation_fail "validity must be 1 to 1830 days"; return 1
+        fi
+    done
+    if [[ ! -t 0 ]]; then
+        isolation_fail "isolation-sign must run attended in an interactive terminal (keys prompt on the tty)"
+        return 1
+    fi
+    if [[ ! -f "$ISOLATION_PIN_FILE" || -L "$ISOLATION_PIN_FILE" ]]; then
+        isolation_fail "$ISOLATION_PIN_FILE is absent: there is no production root pin, so no isolation" \
+            "release can be signed (the key ceremony adds it through a reviewed PR)."
+        return 1
+    fi
+    # R2-1: before any Python runs, the checkout must be exactly the tag (rule above
+    # isolation_check_checkout); from here on every Python step runs isolated (-I -B).
+    local tag="v$CURRENT_VERSION"
+    isolation_check_checkout "$tag" || return 1
+    local pin
+    pin="$(python3 -I -B -c 'import importlib.util, sys
+spec = importlib.util.spec_from_file_location("packager", "scripts/package-linux-release.py")
+packager = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(packager)
+pin = packager.read_pin_file(sys.argv[1])
+if pin is None:
+    sys.exit("production pin file is absent")
+print(pin)' "$ISOLATION_PIN_FILE")"
+    if [[ ! -f "$root_metadata" || -L "$root_metadata" || ! -f "$root_signatures" || -L "$root_signatures" ]]; then
+        isolation_fail "--root-metadata and --root-signatures must be regular files"; return 1
+    fi
+    if [[ "$(isolation_sha256 "$root_metadata")" != "$pin" ]]; then
+        isolation_fail "SHA-256 of --root-metadata differs from $ISOLATION_PIN_FILE"; return 1
+    fi
+    # The pinned root's own signatures: distinct registered root keys meeting its threshold.
+    if ! python3 -I -B scripts/sign-isolation-manifest.py --kind root --check-threshold "$root_metadata" \
+            --signatures "$root_signatures" --root-sha256 "$pin"; then
+        isolation_fail "--root-signatures do not meet the root threshold of --root-metadata"; return 1
+    fi
+    local tool
+    for tool in gh minisign "$ssh_keygen"; do
+        if ! command -v "$tool" >/dev/null 2>&1; then isolation_fail "$tool is not on PATH"; return 1; fi
+    done
+    local legacy_public
+    legacy_public="$(sed -n 's|^pub const LEGACY_RELEASE_MINISIGN_KEY: &str = "\([A-Za-z0-9+/=]*\)";$|\1|p' \
+        crates/duduclaw-isolation/src/update.rs)"
+    if [[ ! "$legacy_public" =~ ^RW[A-Za-z0-9+/]{54}$ ]]; then
+        isolation_fail "cannot read LEGACY_RELEASE_MINISIGN_KEY from duduclaw-isolation"; return 1
+    fi
+    # R2-3: key locations from the environment or the attended prompt, never argv.
+    local target_key="" legacy_minisign_key="" location variable
+    local -a root_keys=()
+    target_key="$(isolation_key_location "$ISOLATION_TARGET_KEY_VARIABLE" "target key handle")" || return 1
+    if [[ "$migration_bundle" == "1" ]]; then
+        for variable in "${ISOLATION_ROOT_KEY_VARIABLES[@]}"; do
+            location="$(isolation_key_location "$variable" "root key ${variable##*_} (R${variable##*_})")" || return 1
+            root_keys+=("$location")
+        done
+        if [[ "${root_keys[0]}" == "${root_keys[1]}" ]]; then
+            isolation_fail "--migration-bundle needs two distinct root keys (the 2-of-3 threshold)"; return 1
+        fi
+        legacy_minisign_key="$(isolation_key_location "$ISOLATION_LEGACY_KEY_VARIABLE" \
+            "legacy release minisign key" "$HOME/.minisign/duduclaw-release.key")" || return 1
+    fi
+    if [[ -e "$output_dir" || -L "$output_dir" ]]; then
+        isolation_fail "--output-dir must not exist yet (outputs are never overwritten)"; return 1
+    fi
+    mkdir -m 0700 -- "$output_dir"
+    ISOLATION_WORK="$(mktemp -d "${TMPDIR:-/tmp}/duduclaw-isolation-sign.XXXXXX")"
+    trap 'rm -rf -- "$ISOLATION_WORK"' EXIT
+
+    local arch triple archive bundle_name verifier probe_output expires asset
+    local -a uploads=()
+    expires=$(( $(date +%s) + authorization_days * 86400 ))
+    for arch in x86_64 aarch64; do
+        if [[ "$arch" == "x86_64" ]]; then
+            triple="x86_64-unknown-linux-gnu"; archive="duduclaw-linux-x64.tar.gz"
+        else
+            triple="aarch64-unknown-linux-gnu"; archive="duduclaw-linux-arm64.tar.gz"
+        fi
+        echo "== $arch: $archive of $tag"
+        mkdir -m 0700 -- "$ISOLATION_WORK/$arch" "$ISOLATION_WORK/$arch/probe"
+        gh release download "$tag" --repo "$ISOLATION_REPO" --dir "$ISOLATION_WORK/$arch" \
+            --pattern "$archive" --pattern "$archive.sha256" --pattern "$archive.minisig"
+        minisign -V -q -P "$legacy_public" -m "$ISOLATION_WORK/$arch/$archive" -x "$ISOLATION_WORK/$arch/$archive.minisig"
+        if ! isolation_check_minisig "$ISOLATION_WORK/$arch/$archive.minisig" "duduclaw $tag $archive"; then
+            isolation_fail "$archive.minisig is not the release job's prehashed signature for $tag"; return 1
+        fi
+        # 1. The released verifier must be a PRODUCTION build of exactly this pin.
+        python3 -I -B scripts/package-linux-release.py --target "$triple" \
+            --extract-bootstrap "$ISOLATION_WORK/$arch/$archive" --output-dir "$ISOLATION_WORK/$arch/verifier"
+        verifier="$ISOLATION_WORK/$arch/verifier/duduclaw-bootstrap-linux-$arch"
+        cp -- "$verifier" "$ISOLATION_WORK/$arch/probe/duduclaw-bootstrap"
+        chmod 0755 "$ISOLATION_WORK/$arch/probe/duduclaw-bootstrap"
+        probe_output="$(isolation_probe_pin "$ISOLATION_WORK/$arch/probe/duduclaw-bootstrap" "$arch")"
+        if [[ "$probe_output" != "PRODUCTION $pin" ]]; then
+            # The probe output itself is not echoed; only the expectation is named.
+            isolation_fail "the released $arch duduclaw-bootstrap does not print PRODUCTION <$ISOLATION_PIN_FILE>"
+            return 1
+        fi
+        # 2. Target key: isolation manifest over the binaries of this released archive.
+        local -a package_args=(--target "$triple" --from-release-archive "$ISOLATION_WORK/$arch/$archive"
+            --manifest-template "$ISOLATION_TEMPLATE" --manifest-valid-days "$manifest_days"
+            --signing-key-from-env --ssh-keygen "$ssh_keygen" --output-dir "$output_dir")
+        if [[ "$migration_bundle" == "1" ]]; then
+            package_args+=(--bootstrap-root "$root_metadata" --bootstrap-root-signatures "$root_signatures")
+        fi
+        echo "Target key ($arch manifest): touch the key and enter its PIN when ssh-keygen asks."
+        DUDUCLAW_ISOLATION_TARGET_KEY="$target_key" python3 -I -B scripts/package-linux-release.py "${package_args[@]}"
+        for asset in "$output_dir/isolated-linux-$arch-"*; do
+            if [[ -f "$asset" && ! -L "$asset" ]]; then uploads+=("$asset"); fi
+        done
+        if [[ "$migration_bundle" == "1" ]]; then
+            # 3. Plain-ustar migration bundle (plan §3.2).
+            python3 -I -B scripts/package-linux-release.py --target "$triple" \
+                --migration-bundle-from "$output_dir/isolated-linux-$arch-bootstrap-inbox" --output-dir "$output_dir"
+            bundle_name="duduclaw-isolated-linux-$arch-$CURRENT_VERSION.tar"
+            local authorization="$output_dir/$bundle_name.authorization.json"
+            # 4. Transition dual signature: root threshold + legacy release key.
+            echo "Root threshold ($arch bundle): R1 touch + PIN, then the R2 passphrase."
+            DUDUCLAW_ISOLATION_SIGNING_KEY_1="${root_keys[0]}" DUDUCLAW_ISOLATION_SIGNING_KEY_2="${root_keys[1]}" \
+                python3 -I -B scripts/sign-isolation-manifest.py --kind bundle --bundle "$output_dir/$bundle_name" \
+                --expires-at-unix "$expires" --output "$authorization" --key-count 2 \
+                --root-metadata "$root_metadata" --root-sha256 "$pin" --ssh-keygen "$ssh_keygen"
+            # R2-5, before anything of this bundle reaches the upload list: the signers are
+            # the keys embedded in the signatures, distinct, registered in the pinned root,
+            # not revoked, meeting its threshold. Otherwise the authorization is deleted.
+            if ! python3 -I -B scripts/sign-isolation-manifest.py --kind bundle --check-threshold "$authorization" \
+                    --root-metadata "$root_metadata" --root-sha256 "$pin"; then
+                rm -f -- "$authorization" "$authorization.signatures.json"
+                isolation_fail "the $arch BundleAuthorization signatures do not meet the root threshold; deleted"
+                return 1
+            fi
+            echo "Legacy release key ($arch bundle): minisign asks for its password."
+            isolation_minisign_sign "$legacy_minisign_key" "$output_dir/$bundle_name" \
+                "duduclaw v$CURRENT_VERSION $bundle_name" "$output_dir/$bundle_name.minisig"
+            minisign -V -q -P "$legacy_public" -m "$output_dir/$bundle_name" -x "$output_dir/$bundle_name.minisig"
+            if ! isolation_check_minisig "$output_dir/$bundle_name.minisig" "duduclaw v$CURRENT_VERSION $bundle_name"; then
+                isolation_fail "$bundle_name.minisig is not a prehashed signature with the verifier's trusted comment"
+                return 1
+            fi
+            cp -- "$verifier" "$output_dir/duduclaw-bootstrap-linux-$arch"
+            chmod 0755 "$output_dir/duduclaw-bootstrap-linux-$arch"
+            uploads+=("$output_dir/duduclaw-bootstrap-linux-$arch" "$output_dir/$bundle_name"
+                "$output_dir/$bundle_name.minisig" "$output_dir/$bundle_name.authorization.json"
+                "$output_dir/$bundle_name.authorization.json.signatures.json")
+        fi
+    done
+
+    # 5. Publication list from the exact bytes to upload (+ root fingerprint).
+    local sums_file="$output_dir/SHA256SUMS-isolation.txt" index name
+    local -a hashes=()
+    for index in "${!uploads[@]}"; do
+        hashes+=("$(isolation_sha256 "${uploads[$index]}")")
+    done
+    {
+        for index in "${!uploads[@]}"; do
+            printf '%s  %s\n' "${hashes[$index]}" "$(basename -- "${uploads[$index]}")"
+        done
+        printf '%s  %s\n' "$pin" "root.json"
+    } > "$sums_file"
+    echo ""
+    echo "Assets for GitHub release $tag:"
+    for index in "${!uploads[@]}"; do
+        printf '  %s\n' "$(basename -- "${uploads[$index]}")"
+    done
+    if [[ "$upload" == "0" ]]; then
+        echo "--no-upload: nothing uploaded; every output stays in $output_dir."
+    else
+        # 6. Upload exactly the recorded bytes, never replacing an asset, then read back.
+        local answer=""
+        read -r -p "Type UPLOAD to publish these ${#uploads[@]} assets to $tag: " answer
+        if [[ "$answer" != "UPLOAD" ]]; then
+            echo "Not uploaded; every output stays in $output_dir."
+            return 1
+        fi
+        for index in "${!uploads[@]}"; do
+            if [[ "$(isolation_sha256 "${uploads[$index]}")" != "${hashes[$index]}" ]]; then
+                isolation_fail "$(basename -- "${uploads[$index]}") changed after it was recorded"; return 1
+            fi
+        done
+        gh release upload "$tag" --repo "$ISOLATION_REPO" "${uploads[@]}"
+        mkdir -m 0700 -- "$ISOLATION_WORK/readback"
+        for index in "${!uploads[@]}"; do
+            name="$(basename -- "${uploads[$index]}")"
+            gh release download "$tag" --repo "$ISOLATION_REPO" --dir "$ISOLATION_WORK/readback" --pattern "$name"
+            if [[ "$(isolation_sha256 "$ISOLATION_WORK/readback/$name")" != "${hashes[$index]}" ]]; then
+                isolation_fail "uploaded $name differs from the signed bytes; investigate before publishing"; return 1
+            fi
+        done
+        echo "Uploaded and read back ${#uploads[@]} assets."
+    fi
+    echo ""
+    echo "SHA256SUMS-isolation.txt (sha256 $(isolation_sha256 "$sums_file")):"
+    cat -- "$sums_file"
+    echo "[external gate] Publish this list on the website AND the licensed console only after"
+    echo "owner confirmation; both must show identical values (design §8 step 1)."
+}
+
 # --- Arg parsing / sub-commands ---
 if [[ $# -lt 1 ]]; then
     echo "Usage:"
@@ -392,6 +957,7 @@ if [[ $# -lt 1 ]]; then
     echo "  $0 audit                             show each platform's version + drift"
     echo "  $0 verify [version]                  confirm PyPI/npm published <version>"
     echo "  $0 linux-assets --target <triple>     build/package all native Linux binaries"
+    echo "  $0 isolation-sign --help              OFFLINE: sign/upload the Linux isolation release"
     exit 1
 fi
 
@@ -406,6 +972,11 @@ case "$1" in
     linux-assets)
         shift
         exec python3 "$(dirname "$0")/package-linux-release.py" "$@"
+        ;;
+    isolation-sign)
+        shift
+        run_isolation_sign "$@"
+        exit $?
         ;;
     audit)
         run_audit "$CURRENT_VERSION" || {
@@ -494,7 +1065,9 @@ if $DRY_RUN; then
     echo "[DRY RUN] ALL channels: 5 GitHub targets + minisign/cosign, npm, PyPI, KB, GHCR,"
     echo "          computer-use image, desktop, Pro image/OEM tar/pro-bin/control-plane allowlist,"
     echo "          distributor console manuals (publish-manuals.py, dry run first)."
-    echo "[DRY RUN] Linux archives include native isolation services; F metadata is signed offline only."
+    echo "[DRY RUN] Linux archives include native isolation services; duduclaw-bootstrap only with"
+    echo "          release/bootstrap-root.sha256. Isolation metadata is signed offline afterwards:"
+    echo "          $0 isolation-sign --help (owner present; migration bundle only for: $ISOLATION_MIGRATION_BUNDLE_VERSIONS)."
     echo "[DRY RUN] Pro image CLOUD_BUILD=$CLOUD_BUILD; no signing/build/install/commit/tag/publish performed."
     echo "[DRY RUN] Confirm after publishing: $0 verify $NEW_VERSION"
 fi

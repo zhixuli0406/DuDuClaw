@@ -1,0 +1,14 @@
+# Container image for `scripts/release.sh isolation-sign` step 1 when the
+# release machine is not Linux of the probed architecture: the released
+# duduclaw-bootstrap is executed (--print-root-pin) inside this image only.
+#
+# Format: one line per platform, "<platform> ubuntu@sha256:<64 lowercase hex>",
+# the digest of the platform-specific image manifest. Tags are never accepted.
+# A placeholder line (anything that is not such a digest) makes isolation-sign
+# refuse until an operator replaces it, through a reviewed commit, with a digest
+# they verified themselves. Then, as a separate step before the ceremony,
+# pre-pull exactly that digest (isolation-sign runs docker with --pull=never):
+#   docker pull --platform linux/amd64 ubuntu@sha256:<digest>
+#   docker pull --platform linux/arm64 ubuntu@sha256:<digest>
+linux/amd64 PLACEHOLDER-operator-must-replace-with-a-verified-ubuntu@sha256-digest
+linux/arm64 PLACEHOLDER-operator-must-replace-with-a-verified-ubuntu@sha256-digest
