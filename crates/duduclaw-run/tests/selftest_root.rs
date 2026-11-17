@@ -1,13 +1,30 @@
 //! R7a: the shipped `duduclaw-run-selftest` binary on a disposable Linux VM,
-//! run directly as root and as a transient systemd service with the run units'
-//! capability bounding set (spawnd's fixed-unit path is covered by the spawnd
-//! root tests). Guarded by DUDUCLAW_ISO_DISPOSABLE=1 because it creates the
-//! `duduclaw-selftest` system account when it is missing.
+//! run directly as root and as a transient systemd service under the shipped
+//! fixed unit's `[Service]` settings (spawnd's fixed-unit path is covered by
+//! the spawnd root tests). Guarded by DUDUCLAW_ISO_DISPOSABLE=1 because it
+//! creates the `duduclaw-selftest` system account when it is missing.
 use std::process::{Command, Stdio};
 
 /// The run units' (and the fixed self-test unit's) `CapabilityBoundingSet=`.
 const RUN_UNIT_CAPABILITIES: &str =
     "CapabilityBoundingSet=CAP_CHOWN CAP_SETGID CAP_SETUID CAP_SETPCAP CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_RESOURCE";
+/// The shipped fixed unit (spawnd's `ISOLATION_SELFTEST_UNIT_TEXT`).
+const SELFTEST_UNIT_TEXT: &str =
+    include_str!("../../../scripts/linux-protected/spawnd/duduclaw-isolation-selftest.service");
+/// `[Service]` settings of the unit not passed to `systemd-run`: the copy is
+/// executed instead of the installed path; `--pipe` replaces the journal so the
+/// JSON line comes back; the TCB slice need not be installed for this test; an
+/// empty `Environment=` is the default. Every other setting is applied.
+const NOT_APPLIED: [&str; 6] = ["ExecStart", "StandardInput", "StandardOutput", "StandardError", "Slice", "Environment"];
+
+/// The unit's `[Service]` `Key=Value` lines, minus [`NOT_APPLIED`].
+fn selftest_unit_service_settings() -> Vec<&'static str> {
+    let (_, service) = SELFTEST_UNIT_TEXT.split_once("\n[Service]\n").expect("[Service] section");
+    service.lines().filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .take_while(|line| !line.starts_with('['))
+        .filter(|line| !NOT_APPLIED.contains(&line.split_once('=').expect("Key=Value").0))
+        .collect()
+}
 
 fn require_disposable_root() {
     assert!(cfg!(target_os = "linux"), "iso_root_ tests require native Linux");
@@ -96,21 +113,33 @@ fn iso_root_selftest_passes_under_the_run_unit_capability_set() {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     require_disposable_root();
     ensure_selftest_account();
+    // The shipped unit's sandbox, RestrictNamespaces= included: the trampoline
+    // probes with legacy clone (CLONE_PIDFD) and pidfd_open, not clone3, so it
+    // passes under RestrictNamespaces (measured on systemd 255 with the
+    // installed unit). R7g: the unit sets no User=/Group= and no RestrictSUIDSGID=.
+    let settings = selftest_unit_service_settings();
+    assert!(settings.contains(&RUN_UNIT_CAPABILITIES), "{settings:?}");
+    for key in ["RestrictNamespaces", "NoNewPrivileges", "AmbientCapabilities", "Type"] {
+        assert!(settings.iter().any(|setting| setting.split_once('=').unwrap().0 == key), "{key}: {settings:?}");
+    }
+    for key in ["User", "Group", "RestrictSUIDSGID"] {
+        assert!(!settings.iter().any(|setting| setting.split_once('=').unwrap().0 == key), "{key}: {settings:?}");
+    }
     // Without CAP_DAC_* the service may not reach a build tree below a
     // non-root home: exec a copy from a fresh root-owned 0700 directory, as
-    // production execs a root-owned path under /usr/lib/duduclaw.
+    // production execs a root-owned path under /usr/lib/duduclaw. Not under
+    // /tmp, /home or /root, which PrivateTmp=/ProtectHome= hide from the unit.
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("clock").as_nanos();
-    let directory = std::env::temp_dir().join(format!("duduclaw-selftest-unit-{}-{nanos}", std::process::id()));
+    let directory = std::path::Path::new("/var/lib").join(format!("duduclaw-selftest-unit-{}-{nanos}", std::process::id()));
     std::fs::DirBuilder::new().mode(0o700).create(&directory).expect("fresh private directory");
     let copy = PrivateCopy(directory);
     let binary = copy.0.join("duduclaw-run-selftest");
     std::fs::copy(env!("CARGO_BIN_EXE_duduclaw-run-selftest"), &binary).expect("copy self-test binary");
     std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).expect("binary mode");
     let mut command = Command::new("/usr/bin/systemd-run");
-    // TODO(R7f): add `-p RestrictNamespaces=<the run units' set>` once the
-    // trampoline's probe uses legacy clone instead of clone3 (ENOSYS under it).
-    command.args(["--quiet", "--wait", "--collect", "--pipe", "-p", "NoNewPrivileges=yes",
-        "-p", RUN_UNIT_CAPABILITIES]).arg(&binary);
+    command.args(["--quiet", "--wait", "--collect", "--pipe"]);
+    for setting in settings { command.args(["-p", setting]); }
+    command.arg(&binary);
     assert_passed(bounded(command));
 }
 

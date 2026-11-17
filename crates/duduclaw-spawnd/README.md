@@ -570,9 +570,16 @@ pending daemon-reload, not transient and not already running; PID 1 must
 report the run units' `NoNewPrivileges`, `TRAMPOLINE_CAPABILITIES`, no ambient
 capability and `TRAMPOLINE_NAMESPACES`, and `User`/`Group` empty and
 `RestrictSUIDSGID` false (`RUN_UNIT_DEFAULTED`), every mismatch named as
-`invalid unit policy: fixed unit readback <Key>: …`; pass only on
-`Result=success`, `ExecMainCode=CLD_EXITED`, `ExecMainStatus=0` of a new
-`InvocationID`; the journal is never parsed). The ABI pair is the live probe.
+`invalid unit policy: fixed unit readback <Key>: …`; the journal is never
+parsed). `run_fixed_unit` holds a `Unit.Ref` on the unit from before the
+pre-start readback until it returns, released on every path including errors
+and the deadline, and refuses without starting if the reference cannot be
+taken: unreferenced, PID 1 collects the finished oneshot and every outcome
+field reads 0. A run passes only on a new `InvocationID`, `ActiveState=inactive`,
+`Result=success`, `ExecMainCode=1` (exited), `ExecMainStatus=0`, a non-zero
+`ExecMainPID`, and `ExecStart`'s single pinned record agreeing with that pid
+and exit, started after the record read before the start and exited after it
+started; anything else fails. The ABI pair is the live probe.
 The outcome is cached under (boot id, committed generation, detected/selected
 ABI, both artifact identities): a pass is reused for that key, any key change
 runs the unit again, a fail is reused for 60 s before one retry. The run happens
