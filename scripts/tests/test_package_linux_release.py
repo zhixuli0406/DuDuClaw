@@ -277,7 +277,10 @@ class LinuxReleaseTests(unittest.TestCase):
         self.run_main(release, calls)
         archive = self.output / "duduclaw-linux-x64.tar.gz"
         self.assertTrue(archive.is_file())
-        checked = [Path(call[-1]) for call in calls if call[1:2] and call[1].endswith("check_glibc.py")]
+        glibc = [call for call in calls if any(str(arg).endswith("check_glibc.py") for arg in call[1:4])]
+        # Run in isolated mode without bytecode: no PYTHONPATH, user site or script-directory import.
+        self.assertTrue(glibc and all(call[1:3] == ["-I", "-B"] for call in glibc))
+        checked = [Path(call[-1]) for call in glibc]
         self.assertEqual(len(checked), len(PACKAGE.archive_binaries(False)))
         for path in checked:
             self.assertNotEqual(path.parent, release)

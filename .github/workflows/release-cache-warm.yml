@@ -85,8 +85,9 @@ jobs:
         with:
           node-version: "22"
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca  # stable
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
@@ -155,7 +156,7 @@ jobs:
       # Cargo 1.100's build-directory layout breaks ort-sys 2.0.0-rc.12
       # copy_dylibs on Windows (DirectML.dll); remove when ort is upgraded past rc.12.
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca  # stable
         with:
           toolchain: "1.99.1"
           targets: ${{ matrix.target }}

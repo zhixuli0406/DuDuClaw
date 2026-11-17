@@ -66,19 +66,27 @@ pub(crate) fn publish_at(protected: &Path, stage: &StageReceipt, context: &Conte
     if stage.schema_version != 1 || stage.root_sha256 != context.pin || stage.verifier_pin_kind != context.pin_kind {
         return Err(Error::Signature);
     }
-    let (receipt, staged) = bootstrap_verify::open_stage_at(protected, stage.manifest_digest, context)?;
-    if receipt != *stage { return Err(Error::Signature); }
     let digest = stage.manifest_digest;
-    let root = crate::trust::verify_root(&staged.root_bytes, &staged.root_signatures, context.pin, context.now)?;
 
     // 1. Update-service directories. STATE_ROOT first, and only under the bootstrap
     //    acceptance locks (LOCK ORDER in bootstrap_verify: stage lock -> version-lock
-    //    -> create STATE_ROOT -> its update.lock), all held until this function
+    //    -> STATE_ROOT/update.lock if the root exists), all held until this function
     //    returns: a state root can then never appear between a bootstrap acceptance's
-    //    last history re-read and its high-water write / stage publish. A caller must
-    //    not already hold the CLI's version-lock (flock per open file description):
-    //    that is refused as Busy after the bounded wait, never run unlocked.
-    let locks = bootstrap_verify::create_state_root_locked(protected, Path::new(STATE_ROOT))?;
+    //    last history re-read and its high-water write / stage publish. Under those
+    //    locks, BEFORE anything is created, the stage is re-opened and fully
+    //    re-verified from disk (it must equal `stage`), the history is re-read and
+    //    `check_history` re-run, and the high-water record must be exactly this
+    //    candidate (`bootstrap_verify::reverify_for_publish`): a receipt overtaken by a
+    //    newer acceptance is refused and no state root is created. Nothing is read from
+    //    the stage before the locks are held. A caller that already holds the CLI's
+    //    version-lock (e.g. the future CLI installer inside `version_lock`) must NOT
+    //    call `publish` (flock per open file description): it would wait for itself and
+    //    be refused as Busy after the bounded wait, never run unlocked.
+    let (locks, (staged, root)) = bootstrap_verify::create_state_root_locked(protected, Path::new(STATE_ROOT), || {
+        let staged = bootstrap_verify::reverify_for_publish(protected, Path::new(STATE_ROOT), stage, context)?;
+        let root = crate::trust::verify_root(&staged.root_bytes, &staged.root_signatures, context.pin, context.now)?;
+        Ok((staged, root))
+    })?;
     let state = &locks.state;
     for (path, mode) in UPDATE_DIRECTORIES { ensure_path(path, *mode)?; }
     checkpoint(1)?;

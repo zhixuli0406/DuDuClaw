@@ -178,6 +178,12 @@ def version_text(version):
     return f"{version['major']}.{version['minor']}.{version['patch']}"
 
 
+# sign-isolation-manifest.py reads production key location 1 from here (never argv).
+SIGNING_KEY_ENVIRONMENT = "DUDUCLAW_ISOLATION_SIGNING_KEY_1"
+# --signing-key-from-env: scripts/release.sh isolation-sign passes the target key here.
+TARGET_KEY_ENVIRONMENT = "DUDUCLAW_ISOLATION_TARGET_KEY"
+
+
 def load_signer():
     spec = importlib.util.spec_from_file_location("isolation_signer", ROOT / "scripts/sign-isolation-manifest.py")
     signer = importlib.util.module_from_spec(spec)
@@ -1110,12 +1116,19 @@ def sign_release(binary_dir, target, output_dir, template, key, ssh_keygen, runt
         # template is edited while the operator touches the hardware key.
         staged_template = stage / "release-template.json"
         staged_template.write_bytes(raw)
-        signer_arguments = (["--test-signer", str(Path(test_signer).resolve())] if test_signer is not None
-                            else ["--ssh-keygen", ssh_keygen])
-        subprocess.run([sys.executable, str(ROOT / "scripts/sign-isolation-manifest.py"),
+        # Production: the key location reaches the signer only through its environment
+        # (argv is visible to other local processes); only the TEST signer takes --key.
+        environment = {name: value for name, value in os.environ.items()
+                       if not name.startswith("DUDUCLAW_ISOLATION_SIGNING_KEY_")}
+        if test_signer is not None:
+            signer_arguments = ["--key", str(key.resolve()), "--test-signer", str(Path(test_signer).resolve())]
+        else:
+            signer_arguments = ["--key-count", "1", "--ssh-keygen", ssh_keygen]
+            environment[SIGNING_KEY_ENVIRONMENT] = str(key.resolve())
+        subprocess.run([sys.executable, "-I", "-B", str(ROOT / "scripts/sign-isolation-manifest.py"),
                         "--kind", "release", "--template", str(staged_template),
                         "--artifacts-dir", str(raw_artifacts), "--output", str(stage / manifest_name),
-                        "--key", str(key.resolve()), *signer_arguments], check=True)
+                        *signer_arguments], check=True, env=environment)
         publication = [(manifest_name, stage / manifest_name),
                        (manifest_name + ".signatures.json", stage / (manifest_name + ".signatures.json"))]
         publication.extend((prefix + artifact["id"], raw_artifacts / artifact["id"]) for artifact in artifacts)
@@ -1342,6 +1355,10 @@ def main():
     parser.add_argument("--runtime-artifacts-dir", type=Path,
                         help="reviewed runtime-<registry_id> ELF/policy files; no acceptance is generated")
     parser.add_argument("--signing-key", type=Path)
+    parser.add_argument("--signing-key-from-env", action="store_true",
+                        help="read the offline target key location from " + TARGET_KEY_ENVIRONMENT
+                             + " instead of --signing-key, so it never appears in argv (scripts/release.sh "
+                             "isolation-sign)")
     parser.add_argument("--ssh-keygen", default="ssh-keygen")
     parser.add_argument("--bootstrap-root", type=Path, help="externally signed canonical root metadata for an inactive bootstrap inbox")
     parser.add_argument("--bootstrap-root-signatures", type=Path, help="root threshold signature JSON paired with --bootstrap-root")
@@ -1377,6 +1394,13 @@ def main():
                         help="TEST-ONLY (scripts/isolation-test-keys.sh): sign with duduclaw-isolation-test-signer; "
                              "only with --from-release-archive and never with a production pin")
     args = parser.parse_args()
+    if args.signing_key_from_env:
+        if args.signing_key is not None or args.test_signer is not None:
+            parser.error("--signing-key-from-env excludes --signing-key and --test-signer")
+        location = os.environ.get(TARGET_KEY_ENVIRONMENT, "")
+        if not location or any(character in location for character in "\0\r\n"):
+            parser.error(f"--signing-key-from-env: {TARGET_KEY_ENVIRONMENT} is not set to a key location")
+        args.signing_key = Path(location)
     try:
         check_release_binary_set()
     except ValueError as error:
@@ -1430,7 +1454,8 @@ def main():
             snapshot.chmod(0o700)
             names, digest = snapshot_release_archive(args.from_release_archive, args.target, snapshot)
             for name in names:
-                subprocess.run([sys.executable, str(ROOT / "scripts/check_glibc.py"), str(snapshot / name)], check=True)
+                subprocess.run([sys.executable, "-I", "-B", str(ROOT / "scripts/check_glibc.py"), str(snapshot / name)],
+                               check=True)
             template = args.manifest_template
             if args.manifest_valid_days is not None:
                 template = snapshot / "rendered-release-template.json"
@@ -1489,7 +1514,7 @@ def main():
             stage_cargo_binary(binary_dir / name, snapshot / name, require_executable=transfer is None)
             if transfer is not None and sha256(snapshot / name) != transfer[name]:
                 raise ValueError(f"handed-off {name} does not match {TRANSFER_SUMS}; refusing to package it")
-            subprocess.run([sys.executable, str(ROOT / "scripts/check_glibc.py"),
+            subprocess.run([sys.executable, "-I", "-B", str(ROOT / "scripts/check_glibc.py"),
                             str(snapshot / name)], check=True)
         if args.export_binaries is not None:
             export_binaries(snapshot, binaries, args.export_binaries, pin)

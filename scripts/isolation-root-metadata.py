@@ -16,9 +16,10 @@ root is a security key; the target is an sk-ssh-ed25519@openssh.com key with
 application ssh:duduclaw-target; all four keys are distinct. ECDSA security keys
 are refused until the verifier supports them (plan Q5).
 
-Sign the output afterwards with the root threshold, e.g. R1 (touch + PIN) and R2:
-  scripts/sign-isolation-manifest.py --kind root --template root.unsigned.json \
-      --output root.json --key duduclaw-root-r1 --key duduclaw-root-r2 --ssh-keygen <Homebrew ssh-keygen>
+Sign the output afterwards with the root threshold, e.g. R1 (touch + PIN) and R2
+(key locations from DUDUCLAW_ISOLATION_SIGNING_KEY_1/_2 or the terminal prompt, never argv):
+  python3 -I scripts/sign-isolation-manifest.py --kind root --template root.unsigned.json \
+      --output root.json --key-count 2 --ssh-keygen <Homebrew ssh-keygen>
 The SHA-256 of the signed root.json (printed by that command, identical to the
 one printed here) is the bootstrap root pin, release/bootstrap-root.sha256.
 

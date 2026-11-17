@@ -165,7 +165,7 @@ print(packager.version_text(packager.workspace_version()))' "$ROOT/scripts/packa
     tar_name="duduclaw-isolated-linux-$arch-$version.tar"
     expires=$(( $(date +%s) + 30 * 86400 ))
     python3 "$ROOT/scripts/sign-isolation-manifest.py" --kind bundle --bundle "$out/$tar_name" \
-        --expires-at-unix "$expires" --output "$out/$tar_name.authorization.json" \
+        --expires-at-unix "$expires" --output "$out/$tar_name.authorization.json" --root-metadata "$keys/root.json" \
         --key "$keys/root-r1" --key "$keys/root-r2" --test-signer "$SIGNER" >/dev/null
     "$SIGNER" minisign "$keys/minisign" "$out/$tar_name" "duduclaw v$version $tar_name" "$out/$tar_name.minisig"
     CLEANUP_DIR=""

@@ -434,6 +434,8 @@ class CiWorkflowTests(unittest.TestCase):
                 for step_name in ("Install cross (Linux)", "Build frontend"):
                     self.assertIn(next(s for s in steps if s.get("name") == step_name), warm_steps)
 
+    RUST_TOOLCHAIN_ACTION = "dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca"
+
     def test_release_toolchain_pin_is_desktop_only(self):
         workflows = {
             name: yaml.load((ROOT / f".github/workflows/{name}.yml").read_text(),
@@ -445,7 +447,8 @@ class CiWorkflowTests(unittest.TestCase):
             steps = [s for s in workflows[name]["jobs"][job]["steps"]
                      if s.get("uses", "").startswith("dtolnay/rust-toolchain@")]
             self.assertEqual(len(steps), 1)
-            self.assertEqual(steps[0]["uses"], "dtolnay/rust-toolchain@stable")
+            # The reviewed commit, never the mutable `stable` branch of the action.
+            self.assertEqual(steps[0]["uses"], self.RUST_TOOLCHAIN_ACTION)
             return steps[0]
 
         desktop = toolchain("desktop-release", "build")
@@ -453,10 +456,54 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertEqual(desktop["with"]["toolchain"], "1.99.1")
         self.assertEqual(warmed["with"]["toolchain"], "1.99.1")
         self.assertEqual(desktop, warmed)
+        # A SHA pin of the action no longer encodes the channel: it is an explicit input.
         for name, job in (("release", "build"), ("linux-release-smoke", "build"),
                           ("release-cache-warm", "release")):
             with self.subTest(workflow=name, job=job):
-                self.assertNotIn("toolchain", toolchain(name, job).get("with", {}))
+                self.assertEqual(toolchain(name, job)["with"]["toolchain"], "stable")
+        for name in workflows:
+            text = (ROOT / f".github/workflows/{name}.yml").read_text()
+            self.assertNotIn("dtolnay/rust-toolchain@stable", text)
+            for line in text.splitlines():
+                if "dtolnay/rust-toolchain@" in line:
+                    self.assertTrue(line.endswith(self.RUST_TOOLCHAIN_ACTION + "  # stable"), line)
+
+    def test_release_producer_job_is_read_only_and_every_action_is_commit_pinned(self):
+        text = (ROOT / ".github/workflows/release.yml").read_text()
+        release = yaml.load(text, Loader=yaml.BaseLoader)
+        # Every third-party action is a 40-hex commit, also inside the local reusable
+        # workflows release.yml calls (those are the only non-commit `uses`).
+        steps = []
+        for name, job in release["jobs"].items():
+            if "uses" in job:
+                self.assertTrue(job["uses"].startswith("./.github/workflows/"), name)
+                called = yaml.load((ROOT / job["uses"]).read_text(), Loader=yaml.BaseLoader)
+                steps += [(name, step) for inner in called["jobs"].values() for step in inner.get("steps", [])]
+            steps += [(name, step) for step in job.get("steps", [])]
+        for name, step in steps:
+            if uses := step.get("uses"):
+                with self.subTest(job=name, uses=uses):
+                    self.assertRegex(uses, r"^[\w.-]+/[\w.-]+(/[\w.-]+)*@[0-9a-f]{40}$")
+        # The producer of every archive and of the arm64 hand-off needs no write access:
+        # nothing in it uploads a release asset or pushes (the release job publishes).
+        build, arm = release["jobs"]["build"], release["jobs"]["package-linux-arm64"]
+        self.assertEqual(build["permissions"], {"contents": "read"})
+        self.assertEqual(arm["permissions"], {"contents": "read"})
+        for job in (build, arm):
+            for step in job["steps"]:
+                run = step.get("run", "")
+                for needle in ("gh release", "git push", "--clobber", "contents: write"):
+                    self.assertNotIn(needle, run)
+                self.assertFalse(step.get("uses", "").startswith("softprops/action-gh-release@"))
+            checkouts = [s for s in job["steps"] if s.get("uses", "").startswith("actions/checkout@")]
+            self.assertEqual(len(checkouts), 1)
+            self.assertEqual(checkouts[0]["with"]["persist-credentials"], "false")
+        # The one authenticated git fetch passes its token through env-scoped config, not argv.
+        fetch = next(s for s in build["steps"]
+                     if s.get("name") == "Use workflow revision of the gateway verify script (macOS)")
+        self.assertEqual(fetch["env"]["FETCH_TOKEN"], "${{ github.token }}")
+        self.assertIn('GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth"', fetch["run"])
+        self.assertNotIn("${{", fetch["run"])
 
     def test_release_linux_swap_immediately_follows_checkout_and_precedes_builds(self):
         for name, job in (("release", "build"), ("linux-release-smoke", "build"),
@@ -745,8 +792,7 @@ class CiWorkflowTests(unittest.TestCase):
             for job in workflow["jobs"].values():
                 for step in job.get("steps", []):
                     if uses := step.get("uses"):
-                        if uses != "dtolnay/rust-toolchain@stable":
-                            self.assertRegex(uses, r"^[\w-]+/[\w-]+@[a-f0-9]{40}$")
+                        self.assertRegex(uses, r"^[\w-]+/[\w-]+@[a-f0-9]{40}$")
             if name in {"desktop-release", "release-cache-warm"}:
                 installs = [shlex.split(line) for job in workflow["jobs"].values()
                             for step in job.get("steps", [])

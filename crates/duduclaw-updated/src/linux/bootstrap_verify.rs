@@ -565,8 +565,11 @@ pub(crate) fn raised_high_water(recorded: Option<&HighWater>, candidate: &HighWa
 /// Creating the state root: when it does not exist there is no lock 3 to hold, so its
 /// creator must be serialised with acceptance by locks that exist beforehand. The one
 /// creator in this crate, `trust_init::publish`, goes through
-/// [`create_state_root_locked`]: lock 1, then lock 2 (bounded, like acceptance), THEN
-/// create the root (0700) and take its lock 3 (LOCK_NB), all held until it returns.
+/// [`create_state_root_locked`]: lock 1, then lock 2 (bounded, like acceptance), then
+/// lock 3 if the root already exists, then its acceptance re-check
+/// ([`reverify_for_publish`]: stage, history, exact high-water record), and only if
+/// that passes create the root (0700) and take its lock 3 (LOCK_NB); all held until it
+/// returns. A refused re-check therefore creates no state root.
 /// The CLI's install creates it (`protected_linux_layout::DIRECTORIES`) while holding
 /// lock 2, which acceptance holds too. As a second line of defence acceptance still
 /// refuses (`Busy`) when a root that was absent when its locks were taken exists after
@@ -616,25 +619,96 @@ fn outer_locks(protected: &Directory, stages: &Directory, deadline: Instant) -> 
 /// state root itself and locks 3, 2, 1, released in that order (declaration order).
 pub(crate) struct StateRootLocks { pub state: Directory, _state_lock: File, _version: File, _stage: File }
 
-/// Create (or open) the state root only under the bootstrap acceptance locks: lock 1
-/// (`<protected>/bootstrap/update.lock`), lock 2 (`<protected>/version-lock`), then
-/// the root (root 0700, created if absent, any other mode refused) and its update.lock
-/// (lock 3, `files::Directory::lock`). `protected` must already hold the verified
-/// stage directory: nothing but missing lock files is created there.
-pub(crate) fn create_state_root_locked(protected: &Path, state_root: &Path) -> Result<StateRootLocks> {
-    create_state_root_locked_until(protected, state_root, Instant::now() + LOCK_WAIT)
+/// Create (or open) the state root only under the bootstrap acceptance locks, and only
+/// after `accept` passed under them: lock 1 (`<protected>/bootstrap/update.lock`),
+/// lock 2 (`<protected>/version-lock`), lock 3 (`files::Directory::lock`) when the
+/// root already exists (so `accept` reads its files serialised with their writers),
+/// then `accept`, then — if the root was absent — the root (root 0700, any other mode
+/// refused) and its lock 3. When `accept` refuses, nothing but missing lock files is
+/// created (and no state root). `protected` must already hold the verified stage
+/// directory. flock is per open file description: a caller that already holds lock 1
+/// or 2 (e.g. the CLI installer inside its `version_lock`) waits for itself and is
+/// refused (`Busy`) after [`LOCK_WAIT`] — it must not call this (nor `trust_init::publish`).
+pub(crate) fn create_state_root_locked<T>(protected: &Path, state_root: &Path, accept: impl FnOnce() -> Result<T>)
+    -> Result<(StateRootLocks, T)> {
+    create_state_root_locked_until(protected, state_root, Instant::now() + LOCK_WAIT, accept)
 }
 
-fn create_state_root_locked_until(protected: &Path, state_root: &Path, deadline: Instant) -> Result<StateRootLocks> {
+fn create_state_root_locked_until<T>(protected: &Path, state_root: &Path, deadline: Instant,
+    accept: impl FnOnce() -> Result<T>) -> Result<(StateRootLocks, T)> {
     let protected = Directory::open(protected)?;
     if mode_of(&protected)? != 0o700 { return Err(Error::Maintenance); }
     let stages = protected.child(STAGE_DIRECTORY)?;
     if mode_of(&stages)? != 0o700 { return Err(Error::Maintenance); }
-    let (stage, version) = outer_locks(&protected, &stages, deadline)?;
     let (parent, name) = open_parent(state_root)?;
-    let state = ensure_dir(&parent, &name, 0o700)?;
-    let state_lock = state.lock()?;
-    Ok(StateRootLocks { state, _state_lock: state_lock, _version: version, _stage: stage })
+    accept_then_create(
+        || {
+            let (stage, version) = outer_locks(&protected, &stages, deadline)?;
+            let existing = match optional(parent.child(&name))? {
+                None => None,
+                Some(dir) => {
+                    if mode_of(&dir)? != 0o700 { return Err(Error::Maintenance); }
+                    let lock = dir.lock()?;
+                    Some((dir, lock))
+                }
+            };
+            Ok((stage, version, existing))
+        },
+        |_| accept(),
+        |(stage, version, existing): (File, File, Option<(Directory, File)>)| {
+            let (state, state_lock) = match existing {
+                Some(pair) => pair,
+                None => {
+                    // Absent when the locks were taken and nobody else may create it under
+                    // locks 1+2: a root that appeared anyway was not serialised with us.
+                    if optional(parent.child(&name))?.is_some() { return Err(Error::Busy); }
+                    let state = ensure_dir(&parent, &name, 0o700)?;
+                    let lock = state.lock()?;
+                    (state, lock)
+                }
+            };
+            Ok(StateRootLocks { state, _state_lock: state_lock, _version: version, _stage: stage })
+        })
+}
+
+/// Ordering of [`create_state_root_locked`]: take the locks, run the re-check under
+/// them, and only when it passes create anything (`create` consumes the guard).
+/// Generic only so the ordering is unit-testable.
+pub(crate) fn accept_then_create<G, T, S>(lock: impl FnOnce() -> Result<G>, accept: impl FnOnce(&G) -> Result<T>,
+    create: impl FnOnce(G) -> Result<S>) -> Result<(S, T)> {
+    let guard = lock()?;
+    let value = accept(&guard)?;
+    Ok((create(guard)?, value))
+}
+
+/// The pure publish rule (`trust_init::publish`, R1-1): the staged generation may be
+/// published only while it is still the newest accepted bundle — the high-water record
+/// must be EXACTLY this stage's (version, serial, generation digest, bundle digest) —
+/// and the full anti-rollback rule (`check_history`) still accepts it in the mode it
+/// was staged in. A newer acceptance after the receipt (higher mark), a missing or
+/// different record, or a rollback receipt refuses.
+pub(crate) fn check_publish(history: &History, receipt: &StageReceipt, manifest: &ReleaseManifest, now: u64)
+    -> Result<()> {
+    if receipt.schema_version != 1 || receipt.mode == BootstrapMode::Rollback { return Err(Error::Maintenance); }
+    if receipt.artifacts != manifest.artifacts { return Err(Error::Signature); }
+    let candidate = HighWater { schema_version: 1, version: manifest.version, serial: manifest.serial,
+        digest: receipt.manifest_digest, bundle_sha256: receipt.bundle_sha256 };
+    if history.high_water.as_ref() != Some(&candidate) { return Err(Error::Rollback); }
+    check_history(history, receipt.mode, None, manifest, &candidate, now)
+}
+
+/// `trust_init::publish`'s re-check, run by [`create_state_root_locked`] under locks
+/// 1–3 before anything is created: re-open and fully re-verify the stage from disk
+/// (`check_stage`), require it to equal the caller's receipt, re-read the history and
+/// apply [`check_publish`]. Returns the re-verified staged files.
+pub(crate) fn reverify_for_publish(protected: &Path, state_root: &Path, stage: &StageReceipt, context: &Context)
+    -> Result<StagedFiles> {
+    let (receipt, staged) = open_stage_at(protected, stage.manifest_digest, context)?;
+    if receipt != *stage { return Err(Error::Signature); }
+    let paths = Paths { inbox: String::new(), protected: protected.to_path_buf(), facts_root: PathBuf::from("/"),
+        state_root: state_root.to_path_buf() };
+    check_publish(&read_history(&paths)?, &receipt, &staged.manifest, context.now)?;
+    Ok(staged)
 }
 
 /// Open the lock file `name` in `dir` the way its writers do. Writers create a lock
@@ -1750,6 +1824,60 @@ pub(crate) mod tests {
         assert!(matches!(read_unless_state_root_appeared(locked, &state_root, || Ok(())), Err(Error::Busy)));
     }
 
+    fn publish_receipt(fixture: &Fixture, mode: BootstrapMode) -> StageReceipt {
+        let mine = candidate(fixture);
+        StageReceipt { schema_version: 1, mode, manifest_digest: mine.digest, root_sha256: manifest_digest(&fixture.root_bytes),
+            bundle_sha256: mine.bundle_sha256, bundle_size: fixture.image.len() as u64,
+            authorization_sha256: manifest_digest(&fixture.side.authorization), verifier_pin_kind: PinKind::Test,
+            verified_at_unix: NOW, artifacts: fixture.manifest.artifacts.clone() }
+    }
+
+    #[test]
+    fn newer_bundle_accepted_between_receipt_and_publish_refuses_publish_and_creates_no_state() {
+        let fixture = build(Architecture::X86_64, None, version());
+        let mine = candidate(&fixture);
+        let receipt = publish_receipt(&fixture, BootstrapMode::Install);
+        let with = |high_water: Option<HighWater>| History { high_water, ..no_history() };
+        // Still the newest accepted bundle: publishable.
+        check_publish(&with(Some(mine)), &receipt, &fixture.manifest, NOW).unwrap();
+        // Receipt A; another acceptance then staged a newer bundle and raised the mark.
+        let newer = HighWater { schema_version: 1, version: next_patch(), serial: mine.serial + 1,
+            digest: Sha256Digest([7; 32]), bundle_sha256: Sha256Digest([8; 32]) };
+        assert!(matches!(check_publish(&with(Some(newer)), &receipt, &fixture.manifest, NOW), Err(Error::Rollback)));
+        // The record must be exactly this candidate: missing, or any field different, refuses.
+        for other in [None, Some(HighWater { bundle_sha256: Sha256Digest([8; 32]), ..mine }),
+            Some(HighWater { digest: Sha256Digest([7; 32]), ..mine }), Some(HighWater { serial: mine.serial + 1, ..mine }),
+            Some(HighWater { version: next_patch(), ..mine })] {
+            assert!(check_publish(&with(other), &receipt, &fixture.manifest, NOW).is_err(), "{other:?}");
+        }
+        // check_history still applies (an upgrade receipt needs its version floor; a
+        // floor raised above the bundle refuses), and a rollback receipt never publishes.
+        let upgrade = publish_receipt(&fixture, BootstrapMode::Upgrade);
+        assert!(check_publish(&with(Some(mine)), &upgrade, &fixture.manifest, NOW).is_err());
+        check_publish(&History { floor: Some(lower()), ..with(Some(mine)) }, &upgrade, &fixture.manifest, NOW).unwrap();
+        assert!(matches!(check_publish(&History { floor: Some(next_patch()), ..with(Some(mine)) }, &upgrade,
+            &fixture.manifest, NOW), Err(Error::Rollback)));
+        let rollback = publish_receipt(&fixture, BootstrapMode::Rollback);
+        assert!(check_publish(&with(Some(mine)), &rollback, &fixture.manifest, NOW).is_err());
+
+        // Ordering of create_state_root_locked: the re-check runs under the locks and the
+        // state root is created only after it passed.
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("updated-state");
+        let locked = std::cell::Cell::new(false);
+        let lock = || -> Result<()> { locked.set(true); Ok(()) };
+        let create = |_: ()| -> Result<()> { std::fs::create_dir(&state_root)?; Ok(()) };
+        let refused = accept_then_create(lock, |_: &()| {
+            assert!(locked.get(), "re-check ran before the locks were taken");
+            check_publish(&with(Some(newer)), &receipt, &fixture.manifest, NOW)
+        }, create);
+        assert!(matches!(refused, Err(Error::Rollback)));
+        assert!(!state_root.exists(), "a refused publish created the state root");
+        accept_then_create(lock, |_: &()| check_publish(&with(Some(mine)), &receipt, &fixture.manifest, NOW), create)
+            .unwrap();
+        assert!(state_root.is_dir());
+    }
+
     #[test]
     fn rollback_refuses_a_floor_raised_during_rollback_and_reverifies_under_the_locks() {
         use std::os::unix::fs::OpenOptionsExt;
@@ -2292,11 +2420,11 @@ pub(crate) mod tests {
         // SAFETY: scalar flock on a live descriptor.
         assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) }, 0);
         assert!(matches!(create_state_root_locked_until(&protected, &state_root,
-            Instant::now() + Duration::from_millis(300)), Err(Error::Busy)));
+            Instant::now() + Duration::from_millis(300), || Ok(())), Err(Error::Busy)));
         assert!(!state_root.exists());
         drop(holder);
         let creator = create_state_root_locked_until(&protected, &state_root,
-            Instant::now() + Duration::from_secs(5)).unwrap();
+            Instant::now() + Duration::from_secs(5), || Ok(())).unwrap();
         let metadata = std::fs::symlink_metadata(&state_root).unwrap();
         assert_eq!((metadata.uid(), metadata.mode() & 0o7777), (0, 0o700));
         assert!(state_root.join(UPDATE_LOCK).exists());
@@ -2308,6 +2436,47 @@ pub(crate) mod tests {
         assert_eq!(verify_and_stage_with(&config, BootstrapMode::Upgrade, &mut step).unwrap().receipt, receipt);
         assert!(started.elapsed() >= hold / 2, "acceptance did not wait for the state-root creator");
         release.join().unwrap();
+
+        // 7. Publish (trust_init::publish = create_state_root_locked + reverify_for_publish):
+        //    receipt A is still the newest acceptance, so the gate passes. Then another
+        //    acceptance raises the high-water mark (a newer bundle staged) while publish
+        //    waits for the version lock: the re-check under the locks refuses publishing
+        //    A, and no state root is created; with an existing root nothing is written.
+        std::fs::remove_file(state_root.join(UPDATE_LOCK)).unwrap();
+        std::fs::remove_dir(&state_root).unwrap();
+        let publish_gate = |wait: Duration| create_state_root_locked_until(&protected, &state_root,
+            Instant::now() + wait, || reverify_for_publish(&protected, &state_root, &receipt, &config.context));
+        drop(publish_gate(Duration::from_secs(5)).unwrap());
+        std::fs::remove_file(state_root.join(UPDATE_LOCK)).unwrap();
+        std::fs::remove_dir(&state_root).unwrap();
+        let newer = HighWater { schema_version: 1, version: next_patch(), serial: fixture.manifest.serial + 1,
+            digest: Sha256Digest([7; 32]), bundle_sha256: Sha256Digest([8; 32]) };
+        let (locked, wait_locked) = std::sync::mpsc::channel();
+        let writer = {
+            let (lock_path, record) = (version_lock.clone(), record.clone());
+            std::thread::spawn(move || {
+                let lock = std::fs::OpenOptions::new().read(true).write(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(&lock_path).unwrap();
+                // SAFETY: scalar flock on a live descriptor.
+                assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+                locked.send(()).unwrap();
+                std::thread::sleep(hold);
+                let _ = std::fs::remove_file(&record);
+                std::fs::write(&record, serde_json::to_vec(&newer).unwrap()).unwrap();
+                std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o600)).unwrap();
+                drop(lock);
+            })
+        };
+        wait_locked.recv().unwrap();
+        let started = Instant::now();
+        assert!(matches!(publish_gate(Duration::from_secs(30)), Err(Error::Rollback)));
+        assert!(started.elapsed() >= hold / 2, "publish did not wait for the version lock");
+        writer.join().unwrap();
+        assert!(!state_root.exists(), "a refused publish created the state root");
+        private_dir(&state_root);
+        assert!(matches!(publish_gate(Duration::from_secs(5)), Err(Error::Rollback)));
+        let left: Vec<_> = std::fs::read_dir(&state_root).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+        assert_eq!(left, vec![std::ffi::OsString::from(UPDATE_LOCK)]);
     }
 
     /// Fork, put the pty on fd 0/1/2, then exec the sealed memfd through the
