@@ -131,12 +131,15 @@ root-held RO broker clone is taken, an employee-owned file is read through the
 real `verify_lease` and a sealed snapshot; while a copy still holds the clone H
 cannot finish the detach, and after `BrokerRoot::release` the same detach
 succeeds; the snapshot outlives the detach; retire removes the anchor. Needs a
-root disposable VM with `ISO_STORAGE_TEST_ROOT` on ext4/XFS (loop devices) and
-runs in a private mount namespace of its thread.
+root disposable VM with `ISO_STORAGE_TEST_ROOT` on ext4/XFS (loop devices), and
+the whole test process in a private mount tree: H storage reads
+`/proc/self/mountinfo` (the process's mount namespace, not a thread's), so the
+test does not unshare by itself and refuses to start while the process root
+mount is `shared:`/`master:`. Run it under `unshare --mount --propagation private`.
 
 ```sh
 CARGO_BUILD_JOBS=12 CARGO_INCREMENTAL=0 cargo test -p duduclaw-spawnd --test work_broker_chain --no-run
-DUDUCLAW_ISO_DISPOSABLE=1 ISO_STORAGE_TEST_ROOT=/srv/iso-storage cargo test -p duduclaw-spawnd --test work_broker_chain -- --ignored --test-threads=1 --nocapture
+unshare --mount --propagation private env DUDUCLAW_ISO_DISPOSABLE=1 ISO_STORAGE_TEST_ROOT=/srv/iso-storage cargo test -p duduclaw-spawnd --test work_broker_chain -- --ignored --test-threads=1 --nocapture
 ```
 
 ## I1e installed PTY chain

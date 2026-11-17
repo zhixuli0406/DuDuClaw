@@ -34,12 +34,18 @@ const MAX_STATE_BYTES: usize = 1024 * 1024;
 
 #[cfg(test)]
 thread_local! { static STOP_AFTER: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) }; }
+/// The error a test-injected interruption after `step` returns: distinct from every
+/// production refusal, so a resumability test cannot mistake a real failure for it.
+#[cfg(test)]
+fn interruption(step: u8) -> std::io::Error {
+    std::io::Error::other(format!("test interruption after trust_init step {step}"))
+}
 /// Test-only crash injection after a completed step.
 fn checkpoint(step: u8) -> Result<()> {
     #[cfg(test)]
     if STOP_AFTER.with(|value| value.get() == Some(step)) {
         STOP_AFTER.with(|value| value.set(None));
-        return Err(Error::Maintenance);
+        return Err(Error::Io(interruption(step)));
     }
     let _ = step;
     Ok(())
@@ -188,8 +194,22 @@ fn install_slot_a(install: &Directory, config: &Directory, root: &RootMetadata, 
         Err(error) => return Err(error),
     }
     let receipt: SlotReceipt = config.json("slot-a.json")?;
-    if receipt.manifest != manifest_text || receipt.signature != signature { return Err(Error::Maintenance); }
+    check_slot_receipt(root, &receipt, manifest_bytes, signature, now)
+}
+
+/// Pure check of step 4's receipt at the transaction time `now` (a receipt left by
+/// an interrupted earlier attempt carries that attempt's, earlier, time).
+fn check_slot_receipt(root: &RootMetadata, receipt: &SlotReceipt, manifest_bytes: &[u8], signature: &str, now: u64)
+    -> Result<()> {
+    if receipt.manifest.as_bytes() != manifest_bytes || receipt.signature != signature { return Err(Error::Maintenance); }
     crate::trust::verify_installed_release(root, manifest_bytes, signature, receipt.accepted_at_unix, now)?;
+    Ok(())
+}
+
+/// Pure check of step 7's ledger at the transaction time `now`.
+fn check_ledger(ledger: &TrustLedger, manifest_bytes: &[u8], signature: &str, now: u64) -> Result<()> {
+    ledger.current(now)?;
+    ledger.verify_installed(manifest_bytes, signature, now)?;
     Ok(())
 }
 
@@ -262,11 +282,15 @@ fn later_steps_agree(state: &Directory, install: &Directory, manifest_bytes: &[u
         Err(error) if missing(&error) => return Ok(false),
         Err(error) => return Err(error),
     };
-    ledger.current(now)?;
-    ledger.verify_installed(manifest_bytes, signature, now)?;
+    check_ledger(&ledger, manifest_bytes, signature, now)?;
     Ok(true)
 }
 
+/// Step 7. `now` is the publication's single transaction time (`Context::now`): the
+/// ledger is derived, stamped and verified at it, never at a fresh wall-clock read
+/// (which would put the root entry after `now`, "from the future" -> Signature). A
+/// ledger an interrupted earlier attempt wrote is kept as is (its stamps are that
+/// attempt's earlier time) and only verified.
 fn record_ledger(state: &Directory, manifest_bytes: &[u8], signature: &str, now: u64) -> Result<()> {
     let exists = match state.read(LEDGER_FILE) {
         Ok(_) => true,
@@ -275,19 +299,134 @@ fn record_ledger(state: &Directory, manifest_bytes: &[u8], signature: &str, now:
     };
     if !exists {
         // The ledger must be derivable from trust.json + the slot A receipt + state.
-        super::trust_admin::ledger()?;
-        super::trust_admin::record_release(manifest_bytes, signature)?;
+        super::trust_admin::ledger_at(now)?;
+        super::trust_admin::record_release_at(manifest_bytes, signature, now)?;
     }
     let ledger: TrustLedger = state.json(LEDGER_FILE)?;
-    ledger.current(now)?;
-    ledger.verify_installed(manifest_bytes, signature, now)?;
-    Ok(())
+    check_ledger(&ledger, manifest_bytes, signature, now)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::linux::bootstrap_verify::{BootstrapMode, Step, verify_and_stage_with, tests::{host_fixture, root_config, Fixture}};
+    use crate::linux::bootstrap_verify::{BootstrapMode, Step, verify_and_stage_with,
+        tests::{build, host_fixture, root_config, version as workspace_version, Fixture}};
+    use crate::linux::TEST_CLOCK;
+
+    fn set_clock(clock: Option<(u64, u64)>) { TEST_CLOCK.with(|value| value.set(clock)); }
+    fn wall_clock() -> u64 { crate::linux::now().unwrap() }
+    fn expect_interruption(result: Result<impl std::fmt::Debug>, step: u8) {
+        match result {
+            Err(Error::Io(error)) if error.to_string() == interruption(step).to_string() => (),
+            other => panic!("stop after step {step}: expected the injected interruption, got {other:?}"),
+        }
+    }
+
+    /// What earlier attempts left on disk that carries a time: slot-a.json (step 4)
+    /// and trust-ledger.json (step 7). trust.json and the initial state.json carry none.
+    #[derive(Default)]
+    struct Stamped { slot: Option<SlotReceipt>, ledger: Option<TrustLedger> }
+
+    /// The time-dependent decisions of one `publish_at` attempt, in step order, over
+    /// the same pure functions the root path calls (`Directory` insists on root-owned
+    /// files, so the I/O itself only runs in the iso_root tests below). A stamp found
+    /// in `host` (an interrupted earlier attempt) is kept, never rewritten. The wall
+    /// clock is read after every step only to let time pass, as the step-2 copy does
+    /// on a real host; the attempt itself must depend on `context.now` alone.
+    fn attempt(fixture: &Fixture, context: &Context, host: &mut Stamped, stop: Option<u8>) -> Result<()> {
+        let stop_after = |step: u8| -> Result<()> {
+            crate::linux::now()?;
+            if stop == Some(step) { return Err(Error::Io(interruption(step))); }
+            Ok(())
+        };
+        let digest = Sha256Digest(<sha2::Sha256 as sha2::Digest>::digest(&fixture.manifest_bytes).into());
+        // 1. reverify_for_publish's root check.
+        let root = crate::trust::verify_root(&fixture.root_bytes, &fixture.root_signatures, context.pin, context.now)?;
+        stop_after(1)?;
+        // 2. The generation copy (no time; the slow part on a real host).
+        stop_after(2)?;
+        // 3. write_trust.
+        TrustLedger::bootstrap(&fixture.root_bytes, &fixture.root_signatures, context.pin, context.now)?;
+        stop_after(3)?;
+        // 4. install_slot_a: a missing receipt is stamped with the transaction time.
+        if host.slot.is_none() {
+            host.slot = Some(SlotReceipt { manifest: String::from_utf8(fixture.manifest_bytes.clone()).unwrap(),
+                signature: fixture.manifest_signature.clone(), accepted_at_unix: context.now });
+        }
+        let receipt = host.slot.as_ref().ok_or(Error::Invalid)?;
+        check_slot_receipt(&root, receipt, &fixture.manifest_bytes, &fixture.manifest_signature, context.now)?;
+        stop_after(4)?;
+        // 5. write_state (no time) and 6. current (no time).
+        let state = initial_state(&fixture.manifest, digest);
+        state.validate()?;
+        stop_after(5)?;
+        stop_after(6)?;
+        // 7. record_ledger -> trust_admin::record_release_at(.., context.now) on a missing ledger.
+        if host.ledger.is_none() {
+            let mut ledger = crate::linux::trust_admin::derive_ledger(&fixture.root_bytes, &fixture.root_signatures,
+                context.pin, &state, receipt, context.now)?;
+            ledger.record_release(&fixture.manifest_bytes, &fixture.manifest_signature, context.now)?;
+            host.ledger = Some(serde_json::from_slice(&serde_json::to_vec(&ledger)?)?);
+        }
+        check_ledger(host.ledger.as_ref().ok_or(Error::Invalid)?, &fixture.manifest_bytes, &fixture.manifest_signature,
+            context.now)?;
+        stop_after(7)
+    }
+
+    const T0: u64 = 1_800_000_000;
+
+    #[test]
+    fn publication_stamps_and_verifies_at_one_transaction_time_under_an_advancing_clock() {
+        let fixture = build(Architecture::X86_64, None, workspace_version());
+        // Every wall-clock read is 3 s after the previous one.
+        set_clock(Some((T0, 3)));
+        let context = fixture.context(wall_clock());
+        let mut host = Stamped::default();
+        attempt(&fixture, &context, &mut host, None).unwrap();
+        assert!(wall_clock() >= context.now + 3 * 7, "time passed during the publication");
+        set_clock(None);
+        // Everything the transaction stamped carries its own time, not a later read.
+        assert_eq!(host.slot.as_ref().unwrap().accepted_at_unix, context.now);
+        let ledger = host.ledger.as_ref().unwrap();
+        assert_eq!(ledger.roots.iter().map(|r| r.accepted_at_unix).collect::<Vec<_>>(), vec![context.now]);
+        assert_eq!(ledger.releases.iter().map(|r| r.accepted_at_unix).collect::<Vec<_>>(), vec![context.now]);
+        // The defect this guards: a ledger stamped at a later wall-clock read is
+        // "from the future" at the transaction time and refused (the rule stays strict).
+        let digest = Sha256Digest(<sha2::Sha256 as sha2::Digest>::digest(&fixture.manifest_bytes).into());
+        let late = crate::linux::trust_admin::derive_ledger(&fixture.root_bytes, &fixture.root_signatures, context.pin,
+            &initial_state(&fixture.manifest, digest), host.slot.as_ref().unwrap(), context.now + 2).unwrap();
+        assert!(matches!(check_ledger(&late, &fixture.manifest_bytes, &fixture.manifest_signature, context.now),
+            Err(Error::Signature)));
+    }
+
+    #[test]
+    fn interrupted_publication_resumes_at_a_later_time_without_restamping() {
+        let fixture = build(Architecture::X86_64, None, workspace_version());
+        for stop in 1..=7u8 {
+            set_clock(Some((T0, 4)));
+            let first = fixture.context(wall_clock());
+            let mut host = Stamped::default();
+            expect_interruption(attempt(&fixture, &first, &mut host, Some(stop)), stop);
+            // The rerun is a new process: a new, later transaction time.
+            let second = fixture.context(wall_clock());
+            assert!(second.now > first.now);
+            attempt(&fixture, &second, &mut host, None).unwrap_or_else(|error| panic!("resume after step {stop}: {error:?}"));
+            let slot_time = if stop >= 4 { first.now } else { second.now };
+            let ledger_time = if stop >= 7 { first.now } else { second.now };
+            assert_eq!(host.slot.as_ref().unwrap().accepted_at_unix, slot_time, "stop {stop}");
+            let ledger = host.ledger.as_ref().unwrap();
+            assert_eq!(ledger.roots.iter().map(|r| r.accepted_at_unix).collect::<Vec<_>>(), vec![ledger_time], "stop {stop}");
+            // The release keeps the slot receipt's acceptance time.
+            assert_eq!(ledger.releases.iter().map(|r| r.accepted_at_unix).collect::<Vec<_>>(), vec![slot_time], "stop {stop}");
+            // A further, later rerun verifies the earlier stamps and rewrites nothing.
+            let before = serde_json::to_vec(ledger).unwrap();
+            let third = fixture.context(wall_clock());
+            attempt(&fixture, &third, &mut host, None).unwrap();
+            assert_eq!(serde_json::to_vec(host.ledger.as_ref().unwrap()).unwrap(), before, "stop {stop}");
+            assert_eq!(host.slot.as_ref().unwrap().accepted_at_unix, slot_time, "stop {stop}");
+            set_clock(None);
+        }
+    }
 
     #[test]
     fn existing_state_must_equal_initial_bytes_until_current_and_ledger_agree() {
@@ -407,22 +546,44 @@ mod tests {
         disposable();
         let temp = tempfile::Builder::new().prefix("duduclaw-trust-init-").tempdir_in("/root").unwrap();
         let (fixture, receipt, context, protected) = staged(temp.path());
-        // Interrupt after every step in turn; each rerun skips what is complete.
-        for stop in 1..=7u8 {
-            STOP_AFTER.with(|value| value.set(Some(stop)));
-            assert!(publish_at(&protected, &receipt, &context).is_err(), "stop after step {stop}");
+        // Each attempt is a new run with its own, later, transaction time (never before
+        // the stage's verified_at). A wall clock that is already ahead of every attempt
+        // and keeps moving reproduces the VM failure (ledger root stamped after the
+        // transaction time); the publication must not read it at all.
+        let start = context.now;
+        let clock = Some((context.now + 60, 3));
+        let run = |stop: Option<u8>, now: u64| {
+            STOP_AFTER.with(|value| value.set(stop));
+            set_clock(clock);
+            let result = publish_at(&protected, &receipt, &fixture.context(now));
+            assert_eq!(TEST_CLOCK.with(|value| value.get()), clock, "the publication read the wall clock");
+            set_clock(None);
             STOP_AFTER.with(|value| value.set(None));
+            result
+        };
+        // Interrupt after every step in turn; each rerun skips what is complete and
+        // must reach exactly the next injected interruption (no other failure).
+        for stop in 1..=7u8 {
+            expect_interruption(run(Some(stop), start + 3 * u64::from(stop)), stop);
         }
-        let digest = publish_at(&protected, &receipt, &context).unwrap();
+        let digest = run(None, start + 24).unwrap();
         assert_eq!(digest, receipt.manifest_digest);
-        assert_eq!(publish_at(&protected, &receipt, &context).unwrap(), digest);
+        assert_eq!(run(None, start + 27).unwrap(), digest);
+        // Stamps are the earlier attempts' transaction times, never rewritten.
+        let slot: SlotReceipt = Directory::open(Path::new(CONFIG_ROOT)).unwrap().json("slot-a.json").unwrap();
+        assert_eq!(slot.accepted_at_unix, start + 3 * 4);
+        let ledger: TrustLedger = Directory::open(Path::new(STATE_ROOT)).unwrap().json(LEDGER_FILE).unwrap();
+        assert_eq!(ledger.roots.iter().map(|r| r.accepted_at_unix).collect::<Vec<_>>(), vec![start + 3 * 7]);
         assert_eq!(crate::linux::activation::read_current().unwrap(), digest);
         let state: State = Directory::open(Path::new(STATE_ROOT)).unwrap().json("state.json").unwrap();
         state.validate().unwrap();
         assert_eq!((state.committed_digest, state.floor, state.serial), (digest, fixture.manifest.version, fixture.manifest.serial));
         assert_eq!(state.selector.active, UpdateSlot::A);
+        // The wall-clock readers, at a time after every attempt (the real clock may lag them).
+        set_clock(Some((start + 100, 0)));
         crate::linux::trust_admin::load_current().unwrap();
         crate::linux::trust_admin::verify_recorded(&fixture.manifest_bytes, &fixture.manifest_signature).unwrap();
+        set_clock(None);
         // Any receipt other than the re-verified stage is refused before a write.
         for forged in [StageReceipt { bundle_size: receipt.bundle_size + 1, ..receipt.clone() },
             StageReceipt { verifier_pin_kind: bootstrap_verify::PinKind::Production, ..receipt.clone() },
@@ -438,7 +599,13 @@ mod tests {
         disposable();
         let temp = tempfile::Builder::new().prefix("duduclaw-launcher-").tempdir_in("/root").unwrap();
         let (_, receipt, context, protected) = staged(temp.path());
+        // First bootstrap while the wall clock is already seconds past the transaction
+        // time (the VM failure: Signature at step 7). The publication must not read it.
+        let clock = Some((context.now + 2, 2));
+        set_clock(clock);
         let digest = publish_at(&protected, &receipt, &context).unwrap();
+        assert_eq!(TEST_CLOCK.with(|value| value.get()), clock, "the publication read the wall clock");
+        set_clock(None);
         let state_dir = Directory::open(Path::new(STATE_ROOT)).unwrap();
         match state_dir.remove("self-test.json") {
             Ok(()) => (),

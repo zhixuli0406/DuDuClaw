@@ -19,17 +19,18 @@ fn missing(error: &Error) -> bool {
     matches!(error, Error::Io(error) if error.kind() == std::io::ErrorKind::NotFound)
 }
 /// Caller holds STATE_ROOT's update.lock for all mutations. Reads use atomic snapshots.
-pub(super) fn ledger() -> Result<TrustLedger> {
+pub(super) fn ledger() -> Result<TrustLedger> { ledger_at(super::now()?) }
+/// `ledger` at a caller-supplied time instead of the wall clock: an existing ledger
+/// is checked at `now`, a missing one is derived with its entries stamped `now`.
+/// The bootstrap publication (`trust_init`) passes its single transaction time, so
+/// nothing it writes can be "from the future" relative to what it verifies.
+pub(super) fn ledger_at(now: u64) -> Result<TrustLedger> {
     let state = Directory::open(Path::new(STATE_ROOT))?;
     match state.json::<TrustLedger>("trust-ledger.json") {
-        Ok(ledger) => { ledger.current(super::now()?)?; Ok(ledger) }
+        Ok(ledger) => { ledger.current(now)?; Ok(ledger) }
         Err(error) if missing(&error) => {
             let config = Directory::open(Path::new(CONFIG_ROOT))?;
             let bundle: BootstrapBundle = config.json("trust.json")?;
-            let now = super::now()?;
-            let mut ledger = TrustLedger::bootstrap(bundle.root.as_bytes(), &bundle.signatures, bundle.pin, now)?;
-            // Preserve accepted old targets before rotation. Only state-bound slots
-            // are authoritative; an unselected stale slot cannot invent history.
             let installed: State = state.json("state.json")?;
             installed.validate()?;
             let active_name = match installed.selector.active {
@@ -37,17 +38,27 @@ pub(super) fn ledger() -> Result<TrustLedger> {
                 duduclaw_isolation::update::UpdateSlot::B => "slot-b.json",
             };
             let receipt: super::launcher::SlotReceipt = config.json(active_name)?;
-            let digest = Sha256Digest(Sha256::digest(receipt.manifest.as_bytes()).into());
-            if digest != installed.effective_digest() && digest != installed.committed_digest
-                && !installed.pending.as_ref().is_some_and(|p| p.digest == digest) { return Err(Error::Signature); }
-            ledger.record_provisioned(receipt.manifest.as_bytes(), &receipt.signature, receipt.accepted_at_unix, now)?;
-            // An invalid inactive/trial receipt must not prevent the launcher
-            // from booting its valid active fallback. New trials are recorded in
-            // the ledger before staging; bootstrap only imports the active slot.
-            Ok(ledger)
+            derive_ledger(bundle.root.as_bytes(), &bundle.signatures, bundle.pin, &installed, &receipt, now)
         }
         Err(error) => Err(error),
     }
+}
+/// Pure: the ledger derived from trust.json, state.json and the state's active slot
+/// receipt. The root entry is stamped `now`; the release keeps the receipt's time.
+pub(super) fn derive_ledger(root: &[u8], signatures: &[String], pin: Sha256Digest, installed: &State,
+    receipt: &super::launcher::SlotReceipt, now: u64) -> Result<TrustLedger> {
+    let mut ledger = TrustLedger::bootstrap(root, signatures, pin, now)?;
+    // Preserve accepted old targets before rotation. Only state-bound slots
+    // are authoritative; an unselected stale slot cannot invent history.
+    installed.validate()?;
+    let digest = Sha256Digest(Sha256::digest(receipt.manifest.as_bytes()).into());
+    if digest != installed.effective_digest() && digest != installed.committed_digest
+        && !installed.pending.as_ref().is_some_and(|p| p.digest == digest) { return Err(Error::Signature); }
+    ledger.record_provisioned(receipt.manifest.as_bytes(), &receipt.signature, receipt.accepted_at_unix, now)?;
+    // An invalid inactive/trial receipt must not prevent the launcher
+    // from booting its valid active fallback. New trials are recorded in
+    // the ledger before staging; bootstrap only imports the active slot.
+    Ok(ledger)
 }
 pub fn load_current() -> Result<RootMetadata> { ledger()?.current(super::now()?) }
 /// Persist before staging/activation. Requires the daemon's update.lock.
@@ -55,6 +66,13 @@ pub fn record_release(bytes: &[u8], signature: &str) -> Result<()> {
     let mut ledger = ledger()?;
     let mut writer = TrustWriter::new(Directory::open(Path::new(STATE_ROOT))?);
     writer.transaction(&mut ledger, |next| next.record_release(bytes, signature, super::now()?).map(|_| ()))
+}
+/// `record_release` with one caller-supplied time for the read, the stamp and the
+/// check (the bootstrap publication's transaction time). Requires update.lock.
+pub(super) fn record_release_at(bytes: &[u8], signature: &str, now: u64) -> Result<()> {
+    let mut ledger = ledger_at(now)?;
+    let mut writer = TrustWriter::new(Directory::open(Path::new(STATE_ROOT))?);
+    writer.transaction(&mut ledger, |next| next.record_release(bytes, signature, now).map(|_| ()))
 }
 pub fn verify_recorded(bytes: &[u8], signature: &str) -> Result<ReleaseManifest> {
     ledger()?.verify_installed(bytes, signature, super::now()?)

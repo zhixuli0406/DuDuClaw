@@ -87,6 +87,22 @@ fn valid_unit(unit: &str) -> bool {
     }
     true
 }
+/// Shape of a valid unit name (systemd's `unit_name_is_valid`): `prefix.type`,
+/// `prefix@.type` (a template) or `prefix@instance.type` (an instance), split at
+/// the first `@`; the prefix is never empty.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnitKind { Plain, Template, Instance }
+fn unit_kind(unit: &str) -> Result<UnitKind, Error> {
+    if !valid_unit(unit) { return Err(Error::Invalid); }
+    let (stem, _) = unit.rsplit_once('.').ok_or(Error::Invalid)?;
+    if stem.is_empty() { return Err(Error::Invalid); }
+    match stem.split_once('@') {
+        None => Ok(UnitKind::Plain),
+        Some(("", _)) => Err(Error::Invalid),
+        Some((_, "")) => Ok(UnitKind::Template),
+        Some(_) => Ok(UnitKind::Instance),
+    }
+}
 fn inventory_names(files: &str, loaded: &str) -> Result<BTreeSet<String>, Error> {
     let mut names = BTreeSet::new();
     for name in files.lines().chain(loaded.lines()).filter_map(|line| line.split_whitespace().next()) {
@@ -97,16 +113,28 @@ fn inventory_names(files: &str, loaded: &str) -> Result<BTreeSet<String>, Error>
     Ok(names)
 }
 fn units(plan: &RootPlan) -> Result<BTreeSet<String>, Error> {
-    let files = checked(plan, "systemctl", &["list-unit-files", "--no-legend", "--no-pager", "--type=service,socket,timer"])?;
+    units_with(plan, |args| checked(plan, "systemctl", args))
+}
+/// `units` over an injected `systemctl` runner (tests use a fake).
+fn units_with(plan: &RootPlan, mut systemctl: impl FnMut(&[&str]) -> Result<String, Error>) -> Result<BTreeSet<String>, Error> {
+    let files = systemctl(&["list-unit-files", "--no-legend", "--no-pager", "--type=service,socket,timer"])?;
     // Transient systemd-run units and loaded-only services have no unit file.
     // Include them while stopped and on every readback, including a delayed
     // Restart=always service whose process is currently absent.
-    let loaded = checked(plan, "systemctl", &["list-units", "--all", "--plain", "--no-legend", "--no-pager", "--type=service,socket,timer"])?;
+    let loaded = systemctl(&["list-units", "--all", "--plain", "--no-legend", "--no-pager", "--type=service,socket,timer"])?;
     let names = inventory_names(&files, &loaded)?;
     let mut selected = BTreeSet::from([GATEWAY.to_string(), format!("user@{}.service", plan.gateway_uid)]);
     let mut references = Vec::new();
     for name in names {
-        let show = checked(plan, "systemctl", &["show", &name, "--property=User,Triggers"])?;
+        // A template (`name@.type`, from list-unit-files only) is a unit FILE with no
+        // runtime state: systemd 255 refuses `show` for it ("neither a valid
+        // invocation ID nor unit name"). Its live instances (non-empty instance) are
+        // listed by `list-units --all` and inspected below like any other unit. The
+        // legacy account's stop set selects by User=/Triggers= of loadable units
+        // only, so no template is recorded (the product's own templates belong to
+        // the new environment). Every other `show` failure still refuses.
+        if unit_kind(&name)? == UnitKind::Template { continue; }
+        let show = systemctl(&["show", name.as_str(), "--property=User,Triggers"])?;
         let mut owner = "";
         let mut triggers = Vec::new();
         for line in show.lines() {
@@ -127,7 +155,9 @@ fn units(plan: &RootPlan) -> Result<BTreeSet<String>, Error> {
 }
 fn saved_units(plan: &RootPlan) -> Result<BTreeSet<String>, Error> {
     let names: BTreeSet<String> = serde_json::from_slice(&read_private(&plan.state_dir.join("stopped-units.json"), COMMAND_LIMIT, 0)?)?;
-    if names.len() > 10_000 || !names.contains(GATEWAY) || names.iter().any(|n| !valid_unit(n)) { return Err(Error::Invalid); }
+    // `units` never selects a template; one in the saved set is not our inventory.
+    if names.len() > 10_000 || !names.contains(GATEWAY)
+        || names.iter().any(|n| !matches!(unit_kind(n), Ok(UnitKind::Plain | UnitKind::Instance))) { return Err(Error::Invalid); }
     Ok(names)
 }
 fn mask_unit(plan: &RootPlan, unit: &str) -> Result<(), Error> {
@@ -316,6 +346,73 @@ mod tests {
         assert_eq!(found.len(), 2);
         assert!(found.contains("transient.service"));
         assert!(inventory_names("--help enabled", "").is_err());
+    }
+    #[test]
+    fn unit_kind_classifies_templates_instances_and_plain_names_strictly() {
+        for template in ["getty@.service", "apport-coredump-hook@.service", "duduclaw-migrate-expire@.timer", "a.b@.socket"] {
+            assert_eq!(unit_kind(template), Ok(UnitKind::Template), "{template}");
+        }
+        for instance in ["getty@tty1.service", "user@999.service", r"systemd-fsck@dev-disk-by\x2duuid-ab.service", "a@b@c.service"] {
+            assert_eq!(unit_kind(instance), Ok(UnitKind::Instance), "{instance}");
+        }
+        for plain in ["duduclaw-gateway.service", "dbus.socket", "apt-daily.timer"] {
+            assert_eq!(unit_kind(plain), Ok(UnitKind::Plain), "{plain}");
+        }
+        // The shape is validated before anything is called a template.
+        for bad in ["", "@.service", "@tty1.service", ".service", "getty@", "getty@.", "getty@.target", "-x@.service",
+            "a/b@.service", "a\n@.service", r"bad\xzz@.service"] {
+            assert_eq!(unit_kind(bad), Err(Error::Invalid), "{bad:?}");
+        }
+    }
+    /// A fake `systemctl` for `units_with`, shaped like systemd 255 on Ubuntu 24.04:
+    /// `show` of a template exits non-zero. `fail` makes one more `show` fail.
+    fn fake_systemctl<'a>(files: &'a str, loaded: &'a str, fail: Option<&'a str>, shown: &'a mut Vec<String>)
+        -> impl FnMut(&[&str]) -> Result<String, Error> + 'a {
+        move |args: &[&str]| match args {
+            ["list-unit-files", "--no-legend", "--no-pager", "--type=service,socket,timer"] => Ok(files.to_string()),
+            ["list-units", "--all", "--plain", "--no-legend", "--no-pager", "--type=service,socket,timer"] => Ok(loaded.to_string()),
+            ["show", name, "--property=User,Triggers"] => {
+                shown.push(name.to_string());
+                if name.contains("@.") || fail == Some(*name) { return Err(Error::Unavailable); }
+                Ok(match *name {
+                    "duduclaw-worker@1.service" => "User=duduclaw\nTriggers=\n",
+                    "worker-kick.timer" => "User=\nTriggers=duduclaw-worker@1.service\n",
+                    "numeric-owner.service" => "User=999\nTriggers=\n",
+                    _ => "User=\nTriggers=\n",
+                }.to_string())
+            }
+            _ => Err(Error::Invalid),
+        }
+    }
+    #[test]
+    fn inventory_skips_templates_inspects_instances_and_still_refuses_failed_show() {
+        let plan = RootPlan { migration: duduclaw_isolation::ids::RequestId([5; 16]), state_dir: "/nonexistent".into(),
+            legacy_home: "/nonexistent/home".into(), root_key_path: "/nonexistent/key".into(), gateway_uid: 999,
+            gateway_gid: 999, snapshot_content_limit: 1024, snapshot_encoded_limit: 4096, expires_at_unix: 2_000_000_000 };
+        let files = "getty@.service enabled enabled\napport-coredump-hook@.service static -\n\
+            duduclaw-worker@.service disabled enabled\nduduclaw-gateway.service enabled enabled\n\
+            numeric-owner.service enabled enabled\nunrelated.service enabled enabled\nworker-kick.timer enabled enabled\n";
+        let loaded = "getty@tty1.service loaded active running Getty on tty1\n\
+            duduclaw-worker@1.service loaded activating auto-restart Worker 1\n\
+            worker-kick.timer loaded active waiting Kick\nunrelated.service loaded active running Unrelated\n";
+        let mut shown = Vec::new();
+        let selected = units_with(&plan, fake_systemctl(files, loaded, None, &mut shown)).unwrap();
+        assert_eq!(selected, BTreeSet::from(["duduclaw-gateway.service", "user@999.service", "duduclaw-worker@1.service",
+            "worker-kick.timer", "numeric-owner.service"].map(String::from)));
+        // No template reached `show`; every instance and plain unit did.
+        assert!(shown.iter().all(|name| unit_kind(name) != Ok(UnitKind::Template)), "{shown:?}");
+        for name in ["getty@tty1.service", "duduclaw-worker@1.service", "unrelated.service", "duduclaw-gateway.service"] {
+            assert!(shown.iter().any(|shown| shown == name), "{name} not inspected");
+        }
+        // A genuine `show` failure of a non-template, plain or instance, still refuses.
+        for fail in ["unrelated.service", "getty@tty1.service"] {
+            let mut shown = Vec::new();
+            assert_eq!(units_with(&plan, fake_systemctl(files, loaded, Some(fail), &mut shown)), Err(Error::Unavailable), "{fail}");
+        }
+        // A malformed name in a listing refuses before any `show`.
+        let mut shown = Vec::new();
+        assert_eq!(units_with(&plan, fake_systemctl("@tty1.service enabled enabled\n", "", None, &mut shown)), Err(Error::Invalid));
+        assert!(shown.is_empty());
     }
     #[test]
     #[ignore = "root/systemd required; creates a disposable transient unit with a delayed restart"]
