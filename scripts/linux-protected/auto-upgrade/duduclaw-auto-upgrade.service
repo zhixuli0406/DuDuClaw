@@ -6,8 +6,10 @@ After=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/duduclaw-auto-upgrade
-# Root reads the ledger and drops the network child to duduclaw-dl.
-User=root
+# Root reads the ledger and drops the network child to duduclaw-dl. No User=
+# (R7g): root is the default, and an explicit User=root with NoNewPrivileges=
+# and a seccomp-based directive makes systemd 255 drop CAP_SETUID, which that
+# drop needs.
 # New temporary files are accessible only to root.
 UMask=0077
 # Children cannot gain privileges through set-ID executables; root stays root.
@@ -32,8 +34,10 @@ PrivateTmp=yes
 PrivateDevices=yes
 # systemctl asks PID 1 to restart; this process never writes cgroups.
 ProtectControlGroups=yes
-# The upgrade must not create or change set-ID files.
-RestrictSUIDSGID=yes
+# No RestrictSUIDSGID= (R7g): under it systemd's seccomp filter answers ENOSYS
+# for every openat2, and the updater binary this runs reads its state and
+# trusted paths through openat2 with RESOLVE_* guarantees. Still holds: a root
+# service that creates no set-ID files; NoNewPrivileges=yes stays.
 # No process personality changes are needed.
 LockPersonality=yes
 # Restrict system calls to the host's native architecture.

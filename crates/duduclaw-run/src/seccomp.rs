@@ -13,6 +13,8 @@ const JSET: u16 = 0x45;
 const RET: u16 = 0x06;
 const NEW_NAMESPACES: u32 = 0x00000080 | 0x00020000 | 0x02000000 | 0x04000000
     | 0x08000000 | 0x10000000 | 0x20000000 | 0x40000000;
+/// S_ISUID | S_ISGID.
+pub const SET_ID_MODE: u32 = 0o6000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Architecture { X86_64, Aarch64 }
@@ -37,6 +39,15 @@ impl Architecture {
     pub fn prctl(self) -> u32 { self.nr(157, 167) }
     pub fn seccomp(self) -> u32 { self.nr(317, 277) }
     pub fn setpgid(self) -> u32 { self.nr(109, 154) }
+    /// R7g: every call whose mode argument can set S_ISUID/S_ISGID on a file,
+    /// with that argument's index: chmod, fchmod, fchmodat, fchmodat2, mknod,
+    /// mknodat (asm-generic has no chmod or mknod; fchmodat2 is 452 on both).
+    pub fn set_id_mode_calls(self) -> &'static [(u32, u32)] {
+        match self {
+            Self::X86_64 => &[(90, 1), (91, 1), (268, 2), (452, 2), (133, 1), (259, 2)],
+            Self::Aarch64 => &[(52, 1), (53, 2), (452, 2), (33, 2)],
+        }
+    }
     /// HX §2.4 L_restrict calls without argument constraints: Landlock
     /// (create_ruleset, add_rule, restrict_self), `setsid`, `wait4`, `waitid`,
     /// `timerfd_create/settime/gettime`, `close_range`. Each only restricts the
@@ -172,6 +183,17 @@ fn common_rules(filter: &mut Filter, arch: Architecture, allowed: impl Fn(u32) -
     ]);
     let socketpair = arch.nr(53,199);
     filter.block(socketpair, &[ld(arg(0)), eq(1, 0, 1), ret(allowed(socketpair)), ret(DENY)]);
+    // R7g: the run unit no longer sets RestrictSUIDSGID (its systemd filter
+    // makes openat2 ENOSYS), so the employee side refuses set-id modes itself,
+    // as systemd's filter does: mode & (S_ISUID|S_ISGID) != 0 => EPERM. The
+    // kernel reads the mode as umode_t, so its low 32 bits are all that count.
+    // open/openat/creat with O_CREAT and a set-id mode are not covered here
+    // (nosuid mounts and no_new_privs keep such a bit inert); openat2 cannot
+    // be inspected and stays governed by `allowed` alone.
+    for (nr, mode) in arch.set_id_mode_calls() {
+        filter.block(*nr, &[ld(arg(*mode)), Instruction { code: JSET, jt: 0, jf: 1, k: SET_ID_MODE },
+            ret(DENY), ret(allowed(*nr))]);
+    }
 }
 
 pub fn common(arch: Architecture) -> Filter {
@@ -697,6 +719,71 @@ mod tests {
             }
             assert!(!parent_supports_launcher(arch, &parent_profile(arch)));
         }
+    }
+
+    #[test]
+    fn seccomp_decoded_common_refuses_set_id_modes() {
+        for arch in ARCHES {
+            let calls = arch.set_id_mode_calls();
+            let expected: &[(u32, u32)] = match arch {
+                // chmod, fchmod, fchmodat, fchmodat2, mknod, mknodat
+                Architecture::X86_64 => &[(90, 1), (91, 1), (268, 2), (452, 2), (133, 1), (259, 2)],
+                // fchmod, fchmodat, fchmodat2, mknodat
+                Architecture::Aarch64 => &[(52, 1), (53, 2), (452, 2), (33, 2)],
+            };
+            assert_eq!(calls, expected, "{arch:?}");
+            let openat2 = 437;
+            let profile = RuntimeProfile { allowed_syscalls: calls.iter().map(|(nr, _)| *nr)
+                .chain([openat2, arch.execveat(), arch.exit_group()]).collect() };
+            let digest = profile.digest(arch).unwrap();
+            let filters = [common(arch), runtime(arch, &profile, digest).unwrap(), launcher(arch, &profile, digest).unwrap()];
+            for filter in &filters {
+                for (nr, index) in calls {
+                    let with = |mode: u64| { let mut args = [3u64, 0x1000, 0, 0, 0, 0]; args[*index as usize] = mode; args };
+                    // S_ISUID / S_ISGID in any combination, on files, directories and nodes;
+                    // garbage in the upper half does not hide them.
+                    for mode in [0o4755u64, 0o2755, 0o6755, 0o4000, 0o2000, 0o6000, 0o104755, 0o042775,
+                        0o020000 | 0o2000, (1 << 32) | 0o4755, 0xffff_ffff] {
+                        assert_eq!(evaluate(filter, arch.audit(), *nr, with(mode)), DENY, "{arch:?} {nr} {mode:o}");
+                    }
+                    // Ordinary modes (sticky included) stay allowed by the profile.
+                    for mode in [0u64, 0o755, 0o644, 0o700, 0o1777, 0o100644, 0o020620, 0o010600, 1 << 32] {
+                        assert_eq!(evaluate(filter, arch.audit(), *nr, with(mode)), ALLOW, "{arch:?} {nr} {mode:o}");
+                    }
+                    // Only the mode argument is inspected.
+                    let mut others = [0o6000u64; 6];
+                    others[*index as usize] = 0o755;
+                    assert_eq!(evaluate(filter, arch.audit(), *nr, others), ALLOW, "{arch:?} {nr}");
+                }
+                // openat2 is never inspected: its open_how lives in user memory.
+                for args in [[3, 0x1000, 0x2000, 24, 0, 0], [3, 0o6000, 0o6000, 0o6000, 0o6000, 0o6000]] {
+                    assert_eq!(evaluate(filter, arch.audit(), openat2, args), ALLOW, "{arch:?} openat2");
+                }
+            }
+            // A runtime profile without the calls refuses them whatever the mode.
+            let plain = RuntimeProfile { allowed_syscalls: vec![openat2, arch.execveat(), arch.exit_group()] };
+            let filter = runtime(arch, &plain, plain.digest(arch).unwrap()).unwrap();
+            for (nr, _) in calls {
+                for mode in [0u64, 0o755, 0o4755] {
+                    assert_eq!(evaluate(&filter, arch.audit(), *nr, [3, 0x1000, mode, mode, 0, 0]), DENY, "{arch:?} {nr}");
+                }
+            }
+            assert_eq!(evaluate(&filter, arch.audit(), openat2, [3, 0x1000, 0x2000, 24, 0, 0]), ALLOW);
+        }
+    }
+
+    #[cfg(target_os="linux")]
+    #[test]
+    fn seccomp_native_uapi_numbers_for_set_id_mode_calls() {
+        let arch = Architecture::native().unwrap();
+        // libc has no SYS_fchmodat2 constant on every supported version: 452 (UAPI, both arches).
+        #[cfg(target_arch = "x86_64")]
+        let expected: Vec<libc::c_long> = vec![libc::SYS_chmod, libc::SYS_fchmod, libc::SYS_fchmodat, 452,
+            libc::SYS_mknod, libc::SYS_mknodat];
+        #[cfg(not(target_arch = "x86_64"))]
+        let expected: Vec<libc::c_long> = vec![libc::SYS_fchmod, libc::SYS_fchmodat, 452, libc::SYS_mknodat];
+        assert_eq!(arch.set_id_mode_calls().iter().map(|(nr, _)| *nr as libc::c_long).collect::<Vec<_>>(), expected);
+        assert_eq!(libc::SYS_openat2, 437);
     }
 
     #[cfg(target_os="linux")]

@@ -1024,9 +1024,29 @@ const SPAWND_UNIT: &str = include_str!("../../../scripts/linux-protected/spawnd/
 const READY_UNIT: &str = include_str!("../../../scripts/linux-protected/spawnd/duduclaw-isolation-ready.service");
 const EGRESS_UNIT: &str = include_str!("../../duduclaw-egress/systemd/duduclaw-egress.service");
 const UPDATED_UNIT: &str = include_str!("../../../scripts/linux-protected/updated/duduclaw-updated.service");
+const AUTO_UPGRADE_UNIT: &str = include_str!("../../../scripts/linux-protected/auto-upgrade/duduclaw-auto-upgrade.service");
 /// Directive lines (comments and blank lines dropped).
 fn directives(unit: &str) -> Vec<&str> {
     unit.lines().filter(|line| !line.is_empty() && !line.starts_with('#')).collect()
+}
+
+#[test]
+fn update_units_reaching_openat2_set_no_restrict_suid_sgid() {
+    // R7g (systemd 255): under RestrictSUIDSGID= systemd's filter answers ENOSYS
+    // for every openat2; these units' binaries need openat2's RESOLVE_*
+    // guarantees. NoNewPrivileges=yes stays on every one of them.
+    for unit in [SPAWND_UNIT, READY_UNIT, UPDATED_UNIT, AUTO_UPGRADE_UNIT] {
+        let lines = directives(unit);
+        assert!(!lines.iter().any(|line| line.starts_with("RestrictSUIDSGID=")), "{unit}");
+        assert!(lines.contains(&"NoNewPrivileges=yes"), "{unit}");
+    }
+    // The updater binary drops its downloader child to duduclaw-dl (CAP_SETUID):
+    // root by default, since an explicit User=root loses CAP_SETUID on systemd 255.
+    for unit in [UPDATED_UNIT, AUTO_UPGRADE_UNIT] {
+        assert!(!directives(unit).iter().any(|line| line.starts_with("User=") || line.starts_with("Group=")), "{unit}");
+    }
+    // Egress never calls openat2 (its own filter allows only openat): kept.
+    assert!(directives(EGRESS_UNIT).contains(&"RestrictSUIDSGID=yes"));
 }
 
 #[test]

@@ -9,7 +9,7 @@ fn service_protected_unit_has_fixed_root_launcher_and_hardening() {
         "KillMode=control-group", "Restart=on-failure", "ProtectSystem=strict",
         "ReadWritePaths=/var/lib/duduclaw /var/lib/duduclaw-protected", "ProtectHome=yes", "PrivateTmp=yes", "UMask=0077",
         "PrivateDevices=yes", "ProtectKernelTunables=yes", "ProtectKernelModules=yes",
-        "ProtectControlGroups=yes", "RestrictSUIDSGID=yes", "LockPersonality=yes",
+        "ProtectControlGroups=yes", "LockPersonality=yes",
         "SystemCallArchitectures=native",
         "InaccessiblePaths=-/run/docker.sock -/var/run/docker.sock -/run/containerd -/run/podman -/var/run/podman -/run/user -/run/docker"] {
         assert!(lines.contains(&required), "missing {required}");
@@ -19,6 +19,11 @@ fn service_protected_unit_has_fixed_root_launcher_and_hardening() {
     assert!(unit_section.lines().any(|line| line == "StartLimitIntervalSec=3600"));
     assert!(unit_section.lines().any(|line| line == "StartLimitBurst=4"));
     assert!(!lines.iter().any(|line| line.starts_with("RestrictNamespaces=")));
+    // R7g: RestrictSUIDSGID= makes every openat2 ENOSYS; the gateway needs openat2.
+    let isolated = duduclaw_core::root_key::recovery::isolated_unit_text();
+    for text in [unit.as_str(), isolated.as_str()] {
+        assert!(!text.lines().any(|line| line.starts_with("RestrictSUIDSGID=")));
+    }
     assert!(lines.contains(&format!("RestartForceExitStatus={}",
         duduclaw_core::root_key::RECOVERY_RESTART_EXIT_CODE).as_str()));
     assert!(!lines.iter().any(|line| line.starts_with("RestartPreventExitStatus=")

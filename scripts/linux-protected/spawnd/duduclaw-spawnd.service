@@ -76,7 +76,11 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
 ProtectControlGroups=yes
-RestrictSUIDSGID=yes
+# No RestrictSUIDSGID= (R7g): under it systemd's seccomp filter answers ENOSYS
+# for every openat2, and spawnd needs openat2's RESOLVE_* guarantees (work
+# broker, storage, cgroup leaves, bootstrap mounts, the trusted-file reader of
+# its signed manifests and state). Still holds: a root service that creates no
+# set-ID files; NoNewPrivileges=yes stays.
 LockPersonality=yes
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_NETLINK
