@@ -1131,28 +1131,34 @@ pub mod linux {
         impl Drop for ProbeDirectory {
             fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
         }
-        const OPENAT2_OK: &[u8] = b"r7g openat2 ok\n";
-        const OPENAT2_FAILED: &[u8] = b"r7g openat2 failed\n";
+        /// argv[0] the parent gives the child half; nothing else runs it.
+        const PROBE_ARGV0: &str = "duduclaw-r7g-openat2-probe";
+        /// The child's verdict, as its exit status. libtest itself only ever
+        /// exits 0 (including "running 0 tests") or 101, so neither collides.
+        const PROBE_OPENAT2_OK: i32 = 42;
+        const PROBE_OPENAT2_REFUSED: i32 = 43;
 
         /// Child half of `iso_root_run_unit_policy_keeps_setuid_and_openat2`,
-        /// run by a copy of this test binary as the run unit's main process.
-        /// A no-op anywhere else (its parent is not PID 1). Performs the
-        /// trampoline's own `openat2` (`fd::open_beneath`: RESOLVE_BENEATH |
-        /// NO_SYMLINKS | NO_MAGICLINKS | NO_XDEV, O_PATH) and reports on stdout
-        /// (written directly, never captured), then stays alive for the
-        /// parent's readback.
+        /// run by a copy of this test binary as the run unit's main process
+        /// with argv[0] = [`PROBE_ARGV0`]. A no-op anywhere else (other argv[0]
+        /// or a parent other than PID 1). Performs the trampoline's own
+        /// `openat2` (`fd::open_beneath`: RESOLVE_BENEATH | NO_SYMLINKS |
+        /// NO_MAGICLINKS | NO_XDEV, O_PATH), notes the result on stderr
+        /// (diagnostics only), stays alive for the parent's `/proc` readback,
+        /// then reports by exit status alone (read back from PID 1).
         #[test]
-        #[ignore = "iso_root_: child half of iso_root_run_unit_policy_keeps_setuid_and_openat2; no-op unless started by PID 1"]
+        #[ignore = "iso_root_: child half of iso_root_run_unit_policy_keeps_setuid_and_openat2; no-op unless PID 1 started it with the probe argv[0]"]
         fn iso_root_run_unit_openat2_child() {
             use std::io::Write;
-            if unsafe { libc::getppid() } != 1 { return; }
+            if std::env::args_os().next().as_deref() != Some(std::ffi::OsStr::new(PROBE_ARGV0))
+                || unsafe { libc::getppid() } != 1 { return; }
             let root = std::fs::File::open("/").unwrap();
             let opened = duduclaw_run::linux::fd::open_beneath(root.as_raw_fd(), c".", libc::O_PATH);
-            let mut stdout = std::io::stdout();
-            stdout.write_all(if opened.is_ok() { OPENAT2_OK } else { OPENAT2_FAILED }).unwrap();
-            stdout.flush().unwrap();
-            assert!(opened.is_ok(), "openat2 refused inside the run unit");
+            let errno = std::io::Error::last_os_error();
+            let _ = writeln!(std::io::stderr(), "r7g probe: open_beneath -> {:?} (errno after the call: {errno})",
+                opened.as_ref().map(|_| ()));
             std::thread::sleep(Duration::from_secs(5));
+            std::process::exit(if opened.is_ok() { PROBE_OPENAT2_OK } else { PROBE_OPENAT2_REFUSED });
         }
 
         /// R7g on a real host: a unit started with the production `UnitPolicy`
@@ -1190,37 +1196,64 @@ pub mod linux {
             let probe = directory.0.join("probe");
             let probe = probe.to_str().unwrap();
             let input = std::fs::File::open("/dev/null").unwrap();
-            let errors = std::fs::OpenOptions::new().write(true).open("/dev/null").unwrap();
+            // The child's stdout AND stderr (libtest, the loader, a panic) go
+            // to this pipe, for diagnostics only; the verdict is the exit status.
             let (reader, output) = nix::unistd::pipe2(OFlag::O_CLOEXEC | OFlag::O_NONBLOCK).unwrap();
             let cleanup = TestRunCleanup(&systemd, run);
             let started = systemd.start_exec(&policy, probe,
-                vec![probe, "iso_root_run_unit_openat2_child", "--ignored", "--test-threads=1"],
-                input.as_fd(), output.as_fd(), errors.as_fd());
+                vec![PROBE_ARGV0, "--exact", "systemd::linux::tests::iso_root_run_unit_openat2_child",
+                    "--ignored", "--test-threads=1", "--nocapture"],
+                input.as_fd(), output.as_fd(), output.as_fd());
             drop(output);
-            let until = Instant::now() + Duration::from_secs(10);
             let mut bytes = Vec::new();
-            let mut scratch = [0u8; 4096];
-            let contains = |bytes: &[u8], marker: &[u8]| bytes.windows(marker.len()).any(|window| window == marker);
-            while Instant::now() < until && !contains(&bytes, OPENAT2_OK) && !contains(&bytes, OPENAT2_FAILED) {
-                match nix::unistd::read(reader.as_raw_fd(), &mut scratch) {
-                    Ok(0) => break,
-                    Ok(size) => bytes.extend_from_slice(&scratch[..size]),
-                    Err(nix::errno::Errno::EAGAIN | nix::errno::Errno::EINTR) => std::thread::sleep(Duration::from_millis(25)),
-                    Err(error) => panic!("probe output: {error}"),
+            let drain = |bytes: &mut Vec<u8>| {
+                let mut scratch = [0u8; 4096];
+                loop {
+                    match nix::unistd::read(reader.as_raw_fd(), &mut scratch) {
+                        Ok(0) | Err(nix::errno::Errno::EAGAIN) => return,
+                        Ok(size) => bytes.extend_from_slice(&scratch[..size]),
+                        Err(nix::errno::Errno::EINTR) => {},
+                        Err(error) => panic!("probe output: {error}"),
+                    }
                 }
-            }
-            assert!(contains(&bytes, OPENAT2_OK) && !contains(&bytes, OPENAT2_FAILED),
-                "openat2 inside the run unit: {}", String::from_utf8_lossy(&bytes));
+            };
+            // start_exec holds a reference, so the unit stays loaded (and
+            // readable) even when its readback refused and stopped it.
+            let path: OwnedObjectPath = systemd.manager().unwrap().call("GetUnit", &(policy.name.as_str(),))
+                .unwrap_or_else(|error| panic!("{} never loaded ({error}); start_exec: {:?}", policy.name, started.as_ref().err()));
+            let unit = Proxy::new(&systemd.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Unit").unwrap();
+            let service = Proxy::new(&systemd.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Service").unwrap();
+            // The main process, read while it is still alive (it lingers 5 s).
+            let live = started.is_ok().then(|| {
+                let pid: u32 = service.get_property("MainPID").unwrap();
+                (pid, std::fs::read_to_string(format!("/proc/{pid}/status")))
+            });
+            let until = Instant::now() + Duration::from_secs(20);
+            let state = loop {
+                drain(&mut bytes);
+                let state: String = unit.get_property("ActiveState").unwrap();
+                if state == "inactive" || state == "failed" || Instant::now() >= until { break state; }
+                std::thread::sleep(Duration::from_millis(50));
+            };
+            drain(&mut bytes);
+            let code: i32 = service.get_property("ExecMainCode").unwrap();
+            let status: i32 = service.get_property("ExecMainStatus").unwrap();
+            let main_pid: u32 = service.get_property("ExecMainPID").unwrap();
+            let diagnostics = format!("unit {} {state}: ExecMainCode={code} (1 = exited) ExecMainStatus={status} \
+                ({PROBE_OPENAT2_OK} = openat2 worked, {PROBE_OPENAT2_REFUSED} = refused, 0 = probe guard skipped it, \
+                101 = libtest error or a probe panic, 1 or >= 200 = failed before/at exec); start_exec: {:?}; \
+                child stdout+stderr: {:?}; PID 1 and systemd-executor messages: `journalctl -b -u {}` and `journalctl -b _PID={main_pid}`",
+                policy.name, started.as_ref().err(), String::from_utf8_lossy(&bytes), policy.name);
+            assert!(state == "inactive" || state == "failed", "probe did not exit; {diagnostics}");
+            assert_eq!((code, status), (1, PROBE_OPENAT2_OK), "openat2 inside the run unit; {diagnostics}");
             // The production readback (properties, User/Group empty,
             // RestrictSUIDSGID false, main process root + full set) accepted it.
-            let started = started.expect("production run-unit readback");
-            let unit = Proxy::new(&systemd.connection, BUS, started.path.as_str(), "org.freedesktop.systemd1.Unit").unwrap();
-            let service = Proxy::new(&systemd.connection, BUS, started.path.as_str(), "org.freedesktop.systemd1.Service").unwrap();
+            let started = started.unwrap_or_else(|error| panic!("production run-unit readback: {error}; {diagnostics}"));
             for key in ["User", "Group"] { assert_eq!(service.get_property::<String>(key).unwrap(), "", "{key}"); }
             assert!(!service.get_property::<bool>("RestrictSUIDSGID").unwrap());
-            let pid: u32 = service.get_property("MainPID").unwrap();
-            assert_ne!(pid, 0);
-            let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+            let (pid, status) = live.expect("read while the probe ran");
+            assert_ne!(pid, 0, "{diagnostics}");
+            let status = status.unwrap_or_else(|error| panic!("/proc/{pid}/status while running: {error}; {diagnostics}"));
             assert_eq!(status_field(&status, "Uid:"), ["0"; 4]);
             assert_eq!(status_field(&status, "Gid:"), ["0"; 4]);
             for key in ["CapEff:", "CapPrm:"] {
@@ -1229,17 +1262,7 @@ pub mod linux {
             // CAP_SETUID (7), the bit an explicit User=root lost on systemd 255.
             assert_ne!(TRAMPOLINE_CAPABILITIES & (1 << 7), 0);
             assert!(run_process_status_ok(&status).unwrap());
-            // The child exits 0 only when its openat2 succeeded.
-            let until = Instant::now() + Duration::from_secs(20);
-            loop {
-                let state: String = unit.get_property("ActiveState").unwrap();
-                if state == "inactive" || state == "failed" { break; }
-                assert!(Instant::now() < until, "probe did not exit");
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            assert_eq!(service.get_property::<i32>("ExecMainCode").unwrap(), 1);
-            assert_eq!(service.get_property::<i32>("ExecMainStatus").unwrap(), 0);
-            // The proxies borrow `started.path`: end those borrows first.
+            // The proxies borrow `path`: end those borrows first.
             drop((unit, service));
             drop(started);
             drop(cleanup);
