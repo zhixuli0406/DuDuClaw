@@ -6,9 +6,16 @@ tarball and SHA-256 only. Offline operators may supply a reviewed F release
 template and their external target key; no key is copied and CI cannot sign.
 
 The root bootstrap verifier (duduclaw-bootstrap) is packaged only with an
-explicit production root pin (--bootstrap-root-sha256). Without one it is left
-out entirely. With one, a test-root build environment is refused and the staged
-binary must report exactly `PRODUCTION <pin>` and this release's version.
+explicit production root pin (--bootstrap-root-sha256). Omitting the pin is the
+documented way to build an archive WITHOUT the verifier: it is then not built,
+not archived, and both a SKIP line and the final summary say so. With a pin, a
+test-root build environment is refused, and this script itself executes the
+exact staged bytes, which must report exactly `PRODUCTION <pin>` and this
+release's version; the bytes archived are checked against the hash taken
+before and after that execution. There is no attestation alternative: a
+verifier this host cannot execute (foreign architecture, exec format error,
+missing loader) is refused with a non-zero exit, never skipped. Package each
+architecture that ships the verifier on a native Linux host of it.
 """
 import argparse
 import errno
@@ -72,8 +79,6 @@ TEST_ROOT_CFG = "duduclaw_test_root"
 # Flag variables Cargo hands to rustc, with their separators (Cargo reference,
 # "Environment variables"); CARGO_TARGET_<TRIPLE>_RUSTFLAGS is checked as well.
 RUSTFLAGS_VARIABLES = (("CARGO_ENCODED_RUSTFLAGS", "\x1f"), ("RUSTFLAGS", None), ("CARGO_BUILD_RUSTFLAGS", None))
-PIN_MARKER_HEADER = "duduclaw-bootstrap-pin-marker v1"
-MAX_PIN_MARKER_BYTES = 4096
 MAX_PROBE_OUTPUT_BYTES = 256
 OMITTED_BOOTSTRAP_LINE = ("SKIP duduclaw-bootstrap: no production root pin configured "
                           "(--bootstrap-root-sha256); the root bootstrap verifier is not packaged.")
@@ -178,69 +183,37 @@ def probe_bootstrap(path, flag):
     return result.returncode, result.stdout
 
 
-def pin_marker_text(arch, version, digest, pin):
-    return (f"{PIN_MARKER_HEADER}\narch {arch}\nversion {version}\nsha256 {digest}\n"
-            f"print-root-pin PRODUCTION {pin}\n")
-
-
-def read_pin_marker(path):
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
-    try:
-        descriptor = os.open(path, flags)
-    except OSError as error:
-        raise ValueError("bootstrap pin marker is missing or not a regular file") from error
-    with os.fdopen(descriptor, "rb") as source:
-        metadata = os.fstat(source.fileno())
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_PIN_MARKER_BYTES:
-            raise ValueError("bootstrap pin marker is missing or not a regular file")
-        raw = source.read(MAX_PIN_MARKER_BYTES + 1)
-    if len(raw) > MAX_PIN_MARKER_BYTES:
-        raise ValueError("bootstrap pin marker exceeds its size limit")
-    return raw
-
-
 def check_probe(path, flag, expected):
-    code, output = probe_bootstrap(path, flag)
+    try:
+        code, output = probe_bootstrap(path, flag)
+    except (OSError, subprocess.SubprocessError) as error:
+        # Exec format error, missing loader, not executable, timeout: fail closed.
+        raise ValueError(f"{BOOTSTRAP_BINARY} {flag} could not be executed on this host; "
+                         "refusing to package it") from error
     if code != 0 or len(output) > MAX_PROBE_OUTPUT_BYTES or output != expected.encode("ascii"):
         # The output itself is not echoed: only the fixed expectation is named.
         raise ValueError(f"{BOOTSTRAP_BINARY} {flag} did not print exactly the expected value "
                          f"({expected.strip()}); refusing to package it")
 
 
-def verify_bootstrap_binary(path, target, pin, version, marker=None):
-    """Require the exact verifier bytes to be a PRODUCTION build of this pin and version.
+def verify_bootstrap_binary(path, target, pin, version):
+    """Execute the exact verifier bytes; require a PRODUCTION build of this pin and version.
 
-    A host-compatible binary is executed. A foreign-architecture binary cannot be,
-    so a marker produced on that architecture (--emit-bootstrap-pin-marker) for
-    exactly these bytes, pin and version is required instead.
+    Returns the SHA-256 of the executed bytes, which is the only value the
+    archive writer accepts for the verifier. There is no attestation fallback:
+    a binary this host cannot execute is refused, never packaged unverified.
     """
     arch = TARGETS[target][0]
-    digest = sha256(path)
-    if host_architecture() == arch:
-        check_probe(path, "--print-root-pin", f"PRODUCTION {pin}\n")
-        check_probe(path, "--version", f"{BOOTSTRAP_BINARY} {version}\n")
-        if marker is None:
-            return
-    elif marker is None:
-        raise ValueError(f"{BOOTSTRAP_BINARY} for {arch} cannot be executed on this host; pass "
-                         "--bootstrap-pin-verified-by with a marker produced on that architecture")
-    if read_pin_marker(marker) != pin_marker_text(arch, version, digest, pin).encode("ascii"):
-        raise ValueError("bootstrap pin marker does not attest these exact bytes, architecture, version and pin")
-
-
-def emit_pin_marker(binary, target, pin, version, output):
-    """On a host of the target architecture: execute the verifier, then attest it."""
-    arch = TARGETS[target][0]
     if host_architecture() != arch:
-        raise ValueError(f"a {arch} pin marker must be produced on a {arch} Linux host")
-    with tempfile.TemporaryDirectory(prefix="bootstrap-marker-") as temporary:
-        copy = Path(temporary) / BOOTSTRAP_BINARY
-        stage_cargo_binary(binary, copy)
-        verify_bootstrap_binary(copy, target, pin, version)
-        text = pin_marker_text(arch, version, sha256(copy), pin)
-    with output.open("x", encoding="ascii") as destination:
-        destination.write(text)
-    return output
+        raise ValueError(f"{BOOTSTRAP_BINARY} for {arch} cannot be executed on this host, so its root pin "
+                         f"cannot be verified; package {arch} on a native {arch} Linux host, or omit "
+                         f"--bootstrap-root-sha256 to ship this architecture without {BOOTSTRAP_BINARY}")
+    digest = sha256(path)
+    check_probe(path, "--print-root-pin", f"PRODUCTION {pin}\n")
+    check_probe(path, "--version", f"{BOOTSTRAP_BINARY} {version}\n")
+    if sha256(path) != digest:
+        raise ValueError(f"{BOOTSTRAP_BINARY} changed while it was being probed; refusing to package it")
+    return digest
 
 
 def release_binary_dir(target):
@@ -298,10 +271,19 @@ def sha256(path):
     return digest.hexdigest()
 
 
-def create_archive(binary_dir, python_dir, target, output_dir, *, binaries):
-    """`binaries` comes from archive_binaries(); the verifier only after verify_bootstrap_binary."""
+def create_archive(binary_dir, python_dir, target, output_dir, *, binaries, verified=None):
+    """`binaries` comes from archive_binaries(); the verifier only after verify_bootstrap_binary.
+
+    `verified` maps a binary name to the SHA-256 of the bytes that were executed
+    and checked; the verifier is archived only with that digest, and both the
+    staged copy and the archived member must still have it.
+    """
+    verified = dict(verified or {})
     if not set(archive_binaries(False)) <= set(binaries) <= set(BIN_PACKAGES):
         raise ValueError("incomplete or unknown release binary set")
+    if not set(verified) <= set(binaries) or (
+            BOOTSTRAP_BINARY in binaries and not isinstance(verified.get(BOOTSTRAP_BINARY), str)):
+        raise ValueError(f"{BOOTSTRAP_BINARY} is archived only with the digest of the bytes that were probed")
     # Validate the whole set before creating any release output.
     for name in binaries:
         validate_binary(binary_dir / name)
@@ -318,6 +300,8 @@ def create_archive(binary_dir, python_dir, target, output_dir, *, binaries):
             shutil.copyfile(binary_dir / name, stage / name)
             (stage / name).chmod(0o755)
             validate_binary(stage / name)
+            if name in verified and sha256(stage / name) != verified[name]:
+                raise ValueError(f"{name} changed after it was verified; refusing to package it")
         for name, source in ARCHIVE_ALIASES.items():
             shutil.copyfile(stage / source, stage / name)
             (stage / name).chmod(0o755)
@@ -326,6 +310,16 @@ def create_archive(binary_dir, python_dir, target, output_dir, *, binaries):
             for name in [*binaries, *ARCHIVE_ALIASES]:
                 bundle.add(stage / name, arcname=name)
             bundle.add(python_dir, arcname="python")
+        # Re-read the written archive: the member must be the verified bytes.
+        with tarfile.open(staged_archive, "r:gz") as bundle:
+            for name, expected in verified.items():
+                member = bundle.getmember(name)
+                content = bundle.extractfile(member) if member.isfile() else None
+                actual = hashlib.sha256()
+                while content is not None and (chunk := content.read(1024 * 1024)):
+                    actual.update(chunk)
+                if content is None or actual.hexdigest() != expected:
+                    raise ValueError(f"archived {name} differs from the verified bytes; refusing to package it")
         digest = sha256(staged_archive)
         # Exclusive creation avoids silently replacing a previously signed file.
         with archive.open("xb") as destination, staged_archive.open("rb") as source:
@@ -534,14 +528,9 @@ def main():
     parser.add_argument("--bootstrap-root", type=Path, help="externally signed canonical root metadata for an inactive bootstrap inbox")
     parser.add_argument("--bootstrap-root-signatures", type=Path, help="root threshold signature JSON paired with --bootstrap-root")
     parser.add_argument("--bootstrap-root-sha256",
-                        help="expected PRODUCTION root pin (64 lowercase hex) of duduclaw-bootstrap; without it "
-                             "the verifier is not packaged")
-    parser.add_argument("--bootstrap-pin-verified-by", type=Path,
-                        help="pin marker produced on the target architecture (--emit-bootstrap-pin-marker) when "
-                             "the target's duduclaw-bootstrap cannot be executed on this host")
-    parser.add_argument("--emit-bootstrap-pin-marker", type=Path,
-                        help="on a host of the target architecture: verify --bootstrap-binary and write its pin marker, then exit")
-    parser.add_argument("--bootstrap-binary", type=Path, help="duduclaw-bootstrap to attest with --emit-bootstrap-pin-marker")
+                        help="expected PRODUCTION root pin (64 lowercase hex) of duduclaw-bootstrap; the verifier "
+                             "is then built, executed on this host (native architecture only) and packaged, or "
+                             "the run fails. Omit it to package the archive without duduclaw-bootstrap")
     args = parser.parse_args()
     if args.build_only and args.skip_build:
         parser.error("--build-only and --skip-build are mutually exclusive")
@@ -549,27 +538,12 @@ def main():
         parser.error("offline isolation signing keys must never be used in CI")
     if bool(args.bootstrap_root) != bool(args.bootstrap_root_signatures) or (args.bootstrap_root and not args.signing_key):
         parser.error("bootstrap inbox requires both root metadata files and the offline target signing key")
-    if bool(args.emit_bootstrap_pin_marker) != bool(args.bootstrap_binary):
-        parser.error("--emit-bootstrap-pin-marker and --bootstrap-binary are used together")
     version = version_text(workspace_version())
-    if args.emit_bootstrap_pin_marker:
-        if args.bootstrap_root_sha256 is None:
-            parser.error("--emit-bootstrap-pin-marker requires an explicit --bootstrap-root-sha256")
-        try:
-            pin = parse_bootstrap_pin(args.bootstrap_root_sha256)
-        except ValueError as error:
-            parser.error(str(error))
-        refuse_test_root_environment(os.environ, args.target)
-        emit_pin_marker(args.bootstrap_binary, args.target, pin, version, args.emit_bootstrap_pin_marker)
-        print(f"Bootstrap pin marker written: {args.emit_bootstrap_pin_marker}")
-        return
     try:
         pin = expected_bootstrap_pin(args.bootstrap_root_sha256, os.environ, not args.skip_build)
     except ValueError as error:
         parser.error(str(error))
     if pin is None:
-        if args.bootstrap_pin_verified_by is not None:
-            parser.error("--bootstrap-pin-verified-by requires --bootstrap-root-sha256")
         print(OMITTED_BOOTSTRAP_LINE)
     else:
         refuse_test_root_environment(os.environ, args.target)
@@ -585,10 +559,11 @@ def main():
             with tempfile.TemporaryDirectory(prefix="bootstrap-check-") as temporary:
                 copy = Path(temporary) / BOOTSTRAP_BINARY
                 stage_cargo_binary(release_binary_dir(args.target) / BOOTSTRAP_BINARY, copy)
-                verify_bootstrap_binary(copy, args.target, pin, version, args.bootstrap_pin_verified_by)
+                verify_bootstrap_binary(copy, args.target, pin, version)
         return
     binary_dir = release_binary_dir(args.target)
     binaries = archive_binaries(pin is not None)
+    verified = {}
     # Freeze a single input set for both the tarball and separately signed raw
     # assets; a concurrent build must not make these two outputs disagree.
     with tempfile.TemporaryDirectory(prefix="linux-release-inputs-") as temporary:
@@ -599,15 +574,22 @@ def main():
             subprocess.run([sys.executable, str(ROOT / "scripts/check_glibc.py"),
                             str(snapshot / name)], check=True)
         if pin is not None:
-            # The exact bytes that go into the archive (also with --skip-build).
-            verify_bootstrap_binary(snapshot / BOOTSTRAP_BINARY, args.target, pin, version,
-                                    args.bootstrap_pin_verified_by)
+            # Execute the exact bytes that go into the archive (also with
+            # --skip-build); create_archive re-checks them against this digest.
+            verified[BOOTSTRAP_BINARY] = verify_bootstrap_binary(snapshot / BOOTSTRAP_BINARY, args.target,
+                                                                 pin, version)
         signed = sign_release(snapshot, args.target, args.output_dir,
                               args.manifest_template, args.signing_key, args.ssh_keygen, args.runtime_artifacts_dir)
-        archive = create_archive(snapshot, ROOT / "python", args.target, args.output_dir, binaries=binaries)
+        archive = create_archive(snapshot, ROOT / "python", args.target, args.output_dir, binaries=binaries,
+                                 verified=verified)
         if args.bootstrap_root:
             create_bootstrap_inbox(args.target, args.output_dir, args.bootstrap_root, args.bootstrap_root_signatures)
-    print(f"Packaged {archive}; {len(signed)} protected update assets generated.")
+    if pin is None:
+        bootstrap = f"{BOOTSTRAP_BINARY} NOT included (no production root pin)"
+    else:
+        bootstrap = (f"{BOOTSTRAP_BINARY} included (executed here: PRODUCTION {pin}, "
+                     f"sha256 {verified[BOOTSTRAP_BINARY]})")
+    print(f"Packaged {archive}; {bootstrap}; {len(signed)} protected update assets generated.")
 
 
 if __name__ == "__main__":
