@@ -17,21 +17,70 @@ const RESULT_GRACE_MS: u64 = 5_000;
 pub struct InstalledProgramPlans { generation: Sha256Digest, gateway_gid: u32 }
 impl InstalledProgramPlans {
     pub fn new(generation: Sha256Digest, gateway_gid: u32) -> Result<Arc<Self>, VerificationError> {
-        if generation.0 == [0; 32] || gateway_gid == 0 { return Err(VerificationError::Invalid); }
+        Self::new_checked(generation, gateway_gid).map_err(PlansFailure::verification)
+    }
+
+    /// R8m 30a: [`Self::new`] with a fixed reason for the boot assembly's
+    /// not-ready report (no path, no OS error text).
+    pub fn new_checked(generation: Sha256Digest, gateway_gid: u32) -> Result<Arc<Self>, PlansFailure> {
+        if generation.0 == [0; 32] || gateway_gid == 0 { return Err(PlansFailure::InvalidInput); }
         let plans = Arc::new(Self { generation, gateway_gid });
-        plans.publication()?;
+        plans.checked_publication()?;
         Ok(plans)
     }
 
     fn publication(&self) -> Result<GatewayPublication, VerificationError> {
-        let publication = GatewayPublication::read(self.gateway_gid).map_err(|_| VerificationError::Unavailable)?;
-        if publication.generation != self.generation { return Err(VerificationError::BindingMismatch); }
+        self.checked_publication().map_err(PlansFailure::verification)
+    }
+
+    fn checked_publication(&self) -> Result<GatewayPublication, PlansFailure> {
+        let publication = GatewayPublication::read(self.gateway_gid).map_err(|_| PlansFailure::PublicationUnavailable)?;
+        if publication.generation != self.generation { return Err(PlansFailure::GenerationMismatch); }
         let matching = publication.runtimes.iter().filter(|record| helper_runtime(&record.runtime))
             .collect::<Vec<_>>();
-        if matching.is_empty() || matching.iter().any(|record| !valid_helper(&record.to_runtime())) {
-            return Err(VerificationError::Unavailable);
+        if matching.is_empty() { return Err(PlansFailure::NoHelperRuntimeInPolicy); }
+        if matching.iter().any(|record| !valid_helper(&record.to_runtime())) {
+            return Err(PlansFailure::InvalidHelperRuntime);
         }
         Ok(publication)
+    }
+}
+
+/// R8m 30a: why [`InstalledProgramPlans::new_checked`] refused. Each variant
+/// maps to one fixed reason string ([`PlansFailure::reason`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlansFailure {
+    /// Zero generation or root gid (never a real publication).
+    InvalidInput,
+    /// Root's gateway publication could not be read or verified.
+    PublicationUnavailable,
+    /// The publication belongs to another generation.
+    GenerationMismatch,
+    /// The published policy has no in-run helper runtime.
+    NoHelperRuntimeInPolicy,
+    /// A published helper runtime does not match its fixed protocol.
+    InvalidHelperRuntime,
+}
+impl PlansFailure {
+    pub const ALL: [Self; 5] = [Self::InvalidInput, Self::PublicationUnavailable, Self::GenerationMismatch,
+        Self::NoHelperRuntimeInPolicy, Self::InvalidHelperRuntime];
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::InvalidInput => "invalid_generation",
+            Self::PublicationUnavailable => "publication_unavailable",
+            Self::GenerationMismatch => "generation_mismatch",
+            Self::NoHelperRuntimeInPolicy => "no_helper_runtime_in_policy",
+            Self::InvalidHelperRuntime => "invalid_helper_runtime",
+        }
+    }
+    /// The refusal [`InstalledProgramPlans::new`] answered before R8m.
+    fn verification(self) -> VerificationError {
+        match self {
+            Self::InvalidInput => VerificationError::Invalid,
+            Self::GenerationMismatch => VerificationError::BindingMismatch,
+            Self::PublicationUnavailable | Self::NoHelperRuntimeInPolicy | Self::InvalidHelperRuntime =>
+                VerificationError::Unavailable,
+        }
     }
 }
 
@@ -346,6 +395,23 @@ mod tests {
         assert_eq!(in_run_timeout_ms(0), 1);
         assert!(InstalledProgramPlans::new(Sha256Digest([0; 32]), 1).is_err());
         assert!(InstalledProgramPlans::new(Sha256Digest([1; 32]), 0).is_err());
+    }
+
+    /// R8m 30a: fixed, distinct snake_case reasons; the pre-R8m refusal of
+    /// `new` is unchanged for every variant.
+    #[test]
+    fn program_plans_failure_reasons_are_fixed_and_total() {
+        let reasons: Vec<_> = PlansFailure::ALL.iter().map(|failure| failure.reason()).collect();
+        assert_eq!(reasons, ["invalid_generation", "publication_unavailable", "generation_mismatch",
+            "no_helper_runtime_in_policy", "invalid_helper_runtime"]);
+        assert_eq!(InstalledProgramPlans::new_checked(Sha256Digest([0; 32]), 1).err(), Some(PlansFailure::InvalidInput));
+        assert_eq!(InstalledProgramPlans::new_checked(Sha256Digest([1; 32]), 0).err(), Some(PlansFailure::InvalidInput));
+        assert!(matches!(PlansFailure::InvalidInput.verification(), VerificationError::Invalid));
+        assert!(matches!(PlansFailure::GenerationMismatch.verification(), VerificationError::BindingMismatch));
+        for failure in [PlansFailure::PublicationUnavailable, PlansFailure::NoHelperRuntimeInPolicy,
+            PlansFailure::InvalidHelperRuntime] {
+            assert!(matches!(failure.verification(), VerificationError::Unavailable));
+        }
     }
 
     #[test]

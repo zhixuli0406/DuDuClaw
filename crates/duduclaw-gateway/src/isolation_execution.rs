@@ -12,4 +12,4 @@ pub use worker::{install_worker, install_worker_services, InstalledWorkerService
 #[path = "isolation_execution_program.rs"]
 mod program;
 #[cfg(target_os = "linux")]
-pub use program::InstalledProgramPlans;
+pub use program::{InstalledProgramPlans, PlansFailure};

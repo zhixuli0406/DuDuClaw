@@ -184,16 +184,39 @@ fn service_protected_isolation_install_manifest_matches_migration() {
 /// composite check; the placeholder that always refused is gone. The
 /// composite itself is tested with injected sources in
 /// `protected_linux_readiness_tests.rs` (Linux only).
+/// R8m 30b: only the `readiness` command itself (without `--platform-only`)
+/// uses the gateway-view check; the install/upgrade returns and
+/// `--platform-only` use the platform result.
 #[test]
 fn service_protected_readiness_call_sites_use_installed_composite() {
     let install = include_str!("protected_linux_install.rs");
-    assert_eq!(install.matches("readiness::check(&mut readiness::InstalledComposite)").count(), 4);
-    assert_eq!(install.matches("readiness::check(").count(), 4, "no other composite at any call site");
+    assert_eq!(install.matches("readiness::check_platform_all(&mut readiness::InstalledComposite)").count(), 4);
+    assert_eq!(install.matches("readiness::check_platform_all(").count(), 4, "no other composite at any call site");
+    assert_eq!(install.matches("readiness::check(&mut readiness::InstalledComposite)").count(), 1);
+    assert_eq!(install.matches("readiness::check(").count(), 1, "only the readiness command reads the gateway view");
+    assert!(install.contains("if platform_only { return readiness::check_platform_all(&mut readiness::InstalledComposite); }\n    readiness::check(&mut readiness::InstalledComposite)\n}"));
     let readiness = include_str!("protected_linux_readiness.rs");
     for removed in ["MissingComposite", "尚未接上完整隔離就緒檢查"] {
         assert!(!install.contains(removed) && !readiness.contains(removed), "{removed}");
     }
     assert!(readiness.contains("impl CompositeReadiness for InstalledComposite"));
+}
+
+/// R8m 30b: the installer's S7 gate keeps its platform function (no gateway
+/// unit required) and S8/S9 the platform result; no bootstrap step ever
+/// waits for the gateway's own readiness view.
+#[test]
+fn service_protected_bootstrap_steps_use_platform_readiness_only() {
+    let bootstrap = include_str!("protected_linux_bootstrap.rs");
+    assert!(bootstrap.contains("readiness::check_platform(&mut readiness::InstalledComposite)\n        }),"), "S7 perform");
+    assert!(bootstrap.contains("Step::Readiness => with_version_lock(|| readiness::check_platform(&mut readiness::InstalledComposite)),"),
+        "S7 invariants");
+    assert!(bootstrap.contains("// service may still be assembling in the background.\n    readiness::check_platform_all(&mut readiness::InstalledComposite)\n}"),
+        "S8");
+    assert!(bootstrap.contains("verify_identities(&service_names())?;\n    readiness::check_platform_all(&mut readiness::InstalledComposite)?;"),
+        "S9");
+    assert_eq!(bootstrap.matches("readiness::check(").count(), 0, "no bootstrap step reads the gateway view");
+    assert_eq!(bootstrap.matches("gateway_view").count(), 0);
 }
 
 #[test]

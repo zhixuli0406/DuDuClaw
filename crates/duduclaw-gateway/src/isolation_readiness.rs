@@ -13,6 +13,10 @@ pub use integration::{IntegrationComponent, IntegrationProbe, ProbeError, PtyReq
 pub(crate) mod reasons;
 pub use reasons::{EmployeeReadiness, Overall, Reason, record_connector_build};
 
+/// R8m 30b: the gateway's readiness view published for the root CLI.
+#[path = "isolation_readiness/published.rs"]
+pub mod published;
+
 static REQUIRED: AtomicBool = AtomicBool::new(false);
 /// A TEAM edition was resolved on Linux by [`initialize`] (boot or a live
 /// promotion). Only then can isolation become required for this composite.
@@ -99,6 +103,10 @@ pub struct Readiness {
     /// now. Informational: they never make `status` `action_required`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notices: Option<Vec<Reason>>,
+    /// R8m 30b, set only by [`report`]: the boot assembly's missing producers
+    /// by fixed name (`published::ASSEMBLY`), the same list the root CLI reads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assembly_missing: Option<Vec<&'static str>>,
 }
 
 fn applies(linux: bool, protected: bool, team: bool) -> bool { linux && protected && team }
@@ -347,7 +355,7 @@ pub fn status() -> Option<Readiness> {
     if !REQUIRED.load(Ordering::Acquire) { return None; }
     let components = Components::current(spawnd_verified());
     Some(Readiness { required: true, ready: components.all_ready(), components,
-        status: None, reasons: None, employees: None, notices: None })
+        status: None, reasons: None, employees: None, notices: None, assembly_missing: None })
 }
 
 /// [`status`] plus the F3 reasons, for the dashboard. Blocking (SQLite and
@@ -363,7 +371,10 @@ pub fn report(home: &std::path::Path, admin: bool) -> Option<Readiness> {
     // v1.83 R4: migration pending confirmation (action) and the Landlock
     // clamp (notice only), from sources the gateway verifies itself.
     let host = reasons::installed_host_reasons(home);
-    Some(with_features(readiness, assessment, reasons::installed_feature_reasons(), needs, host, admin))
+    let mut readiness = with_features(readiness, assessment, reasons::installed_feature_reasons(), needs, host, admin);
+    // R8m 30b: the same fixed list the root CLI reads from the published view.
+    readiness.assembly_missing = Some(published::assembly_missing());
+    Some(readiness)
 }
 
 /// [`with_assessment`] after splitting the host-wide feature reasons by
@@ -388,7 +399,11 @@ fn with_features(readiness: Readiness, mut assessment: reasons::Assessment, feat
 /// The assessment itself could not run (blocking task failed): fail closed.
 pub fn report_failed() -> Option<Readiness> {
     let failed = reasons::Assessment { reasons: [Reason::ServiceUnavailable].into(), employees: Vec::new() };
-    status().map(|readiness| with_assessment(readiness, failed, false))
+    status().map(|readiness| {
+        let mut readiness = with_assessment(readiness, failed, false);
+        readiness.assembly_missing = Some(published::assembly_missing());
+        readiness
+    })
 }
 
 fn with_assessment(mut readiness: Readiness, assessment: reasons::Assessment, admin: bool) -> Readiness {
@@ -608,7 +623,7 @@ mod tests {
     fn operator_payload_has_fixed_component_states_only() {
         let components = Components::current(false);
         let value = serde_json::to_value(Readiness { required: true, ready: false, components,
-            status: None, reasons: None, employees: None, notices: None }).unwrap();
+            status: None, reasons: None, employees: None, notices: None, assembly_missing: None }).unwrap();
         assert_eq!(value["required"], true);
         assert_eq!(value["ready"], false);
         assert_eq!(value["components"].as_object().unwrap().len(), 8);
@@ -627,7 +642,7 @@ mod tests {
 
     fn base(components: Components) -> Readiness {
         Readiness { required: true, ready: components.all_ready(), components, status: None, reasons: None,
-            employees: None, notices: None }
+            employees: None, notices: None, assembly_missing: None }
     }
 
     /// W1 follow-up: a host that publishes no helpers (and whose spawnd lacks

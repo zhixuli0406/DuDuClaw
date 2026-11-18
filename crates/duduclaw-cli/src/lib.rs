@@ -3691,6 +3691,9 @@ enum ServiceCommands {
     Readiness {
         #[arg(long, required = true)]
         protected_linux: bool,
+        /// Report the platform checks only (no claim that employees can run)
+        #[arg(long, requires = "protected_linux")]
+        platform_only: bool,
     },
     /// Read or change root-managed native Linux protection policies
     ProtectedLinux {
@@ -5715,7 +5718,7 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             },
         },
         Commands::Ops(OpsCommands::Service { command }) => match command {
-            ServiceCommands::Readiness { protected_linux: _ } => service::protected_linux::readiness(),
+            ServiceCommands::Readiness { protected_linux: _, platform_only } => service::protected_linux::readiness(platform_only),
             ServiceCommands::ProtectedLinux { command } => {
                 service::protected_linux::policy::handle(command)
             }

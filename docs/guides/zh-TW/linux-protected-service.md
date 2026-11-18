@@ -122,6 +122,16 @@ sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux [--version X.Y
 
 可執行 `sudo duduclaw service readiness --protected-linux`（`ops` 為相同入口的別名），唯讀檢查執行檔、系統帳號、目錄權限、unit 內容與 systemd 實際屬性，並分項回報。每個未通過的群組都會在下方列出原因。I1 的綜合就緒介面尚未接上，`MissingComposite` 一律拒絕，不能因此放行員工執行。自訂 DNS drop-in 尚未納入驗證，目前會使 unit 檢查失敗。已由新版管理的安裝再次執行安裝時，只跑唯讀檢查，不改寫世代執行檔或服務單元。
 
+這個命令回報兩個分開的結果。**平台就緒**（四個安裝群組與九項主機檢查）是 `sudo duduclaw service readiness --protected-linux --platform-only` 唯一檢查的內容；全部通過時最後一行為「平台檢查均已通過。」，不會宣稱可以執行員工工作。不加 `--platform-only` 時，命令還會讀取 Gateway 自己的就緒狀態：執行中的 Gateway 會在內容變更時、且至少每 30 秒，改寫 `/run/duduclaw-gateway-update/isolation-readiness.json`（只含固定的元件、原因與啟動元件名稱）。Gateway 的狀態不會改變任何平台檢查的結果。平台檢查全部通過後有三種結果：
+
+| Gateway 狀態 | 最後一行 | 結束代碼 |
+|---|---|---|
+| 本次開機、不超過 90 秒、已就緒 | 「所有就緒檢查均已通過，可以執行員工工作。」（或資料遷移待確認的句子） | 0 |
+| 新的狀態、尚未就緒 | `[資訊]` 列出每個未就緒元件 `名稱(原因)` 與啟動組裝尚缺的項目，接著「平台檢查均已通過，但 Gateway 尚未就緒，員工工作仍暫停。」 | 非 0 |
+| 不存在、過期、屬於其他開機或無效（Gateway 未執行或剛啟動） | 「[資訊] 無法取得 Gateway 的就緒狀態（Gateway 未執行、剛啟動，或狀態檔無效）。」，接著拒絕確認可以執行員工工作 | 非 0 |
+
+安裝程式自己的就緒步驟只使用平台結果，因為安裝剛完成時，Gateway 的隔離工具服務可能仍在背景組裝。Gateway 的日誌會列出相同的尚缺項目，已知原因時附上固定原因，例如 `ConnectorProviders(catalog_file_unsafe)`（連接器目錄 `isolation-connectors.db` 或其 SQLite 附屬檔不是由 Gateway 帳號擁有、僅限擁有者存取的單一連結檔案）或 `ExecutionPlans(no_helper_runtime_in_policy)`。Gateway 會在背景重試組裝，修正原因後不需要重新啟動。
+
 ## 從 v1.79.3 遷移
 
 不要原地替換舊執行檔，也不要把舊資料庫複製進新 home。舊環境與員工共用 UID，其權威資料必須視為不可信。安裝器已將 v1.79.3 跨入 v1.80（含無法確認原版本下限、且無法確認為新主機的情況，見上方單一執行檔一節）的要求交給 G 遷移流程，固定讀取 root 擁有的 `/var/lib/duduclaw-migrate/plan.json`；計畫缺少或無法驗證時，在停止舊服務前拒絕，不退回原地更新。

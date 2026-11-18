@@ -761,6 +761,9 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // R8j round 3 F1: on an isolated install only a real spawnd backend marks
     // the read-back's `Backend` step, whatever the edition or licence state.
     crate::isolation_readiness::connect_backend().await;
+    // R8m 30b: publish the gateway's readiness view for the root CLI
+    // (protected Linux TEAM only; one background task, ends at shutdown).
+    crate::isolation_readiness::published::spawn();
     // Allow an old store with no MFA tables; refuse a partial MFA schema or
     // unreadable policy before schema initialization can hide the failure.
     precheck_identity_policy(&home_dir, boot_edition.is_personal())

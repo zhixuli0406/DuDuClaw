@@ -8,7 +8,8 @@
 #   sudo sh install-acceptance.sh root-tests <workspace> <iso_root_install_ test name>
 #
 # install    runs duduclaw-bootstrap install from /root/duduclaw-migrate and
-#            checks the committed journal, the readiness report, the frozen
+#            checks the committed journal, the platform readiness and the
+#            gateway readiness (employees can run) separately, the frozen
 #            launcher receipt and the nightly timer.
 # rollback   runs duduclaw-bootstrap rollback and checks that no isolation
 #            fact and no journal remain.
@@ -128,7 +129,11 @@ case "$mode" in
         if "$BOOTSTRAP" install "$@"; then record PASS 'duduclaw-bootstrap install'; else record FAIL 'duduclaw-bootstrap install'; fi
         check 'journal committed' journal_committed
         check 'gateway is the TEST-licence build' test_license_gateway
-        check 'readiness --protected-linux' /opt/duduclaw/bin/duduclaw service readiness --protected-linux
+        # R8m 30b: two separate results. The platform result alone, and the
+        # command's own result, which also requires the gateway's fresh
+        # "ready" view (it FAILS honestly while the gateway is not ready).
+        check 'platform readiness' /opt/duduclaw/bin/duduclaw service readiness --protected-linux --platform-only
+        check 'gateway readiness (employees can run)' /opt/duduclaw/bin/duduclaw service readiness --protected-linux
         check 'frozen launcher receipt root 0600' test "$(stat -c %u:%g:%a "$RECEIPT")" = 0:0:600
         check 'nightly update timer active' systemctl is-active --quiet duduclaw-auto-upgrade.timer
         check 'gateway unit enabled' systemctl is-enabled --quiet duduclaw-gateway.service

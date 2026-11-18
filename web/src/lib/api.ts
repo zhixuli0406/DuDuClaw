@@ -386,6 +386,10 @@ export interface IsolationReadiness {
   employees?: Array<{ label: string; ready: boolean; reasons: IsolationReason[] }>;
   /** Informational host-wide reasons no protected employee's tools need now. */
   notices?: IsolationReason[];
+  /** v1.83 R8m: the gateway's boot assembly's missing producers (fixed snake_case
+   *  names, e.g. `connector_providers`); the same list `duduclaw service readiness
+   *  --protected-linux` prints. Absent on older gateways. */
+  assembly_missing?: string[];
   correlation_id?: string;
   components: Record<'launch_service' | 'sandbox' | 'network' | 'storage' |
     'parse_worker' | 'update_service' | 'mcp_boundary' | 'runtime_adapters', IsolationComponentState>;

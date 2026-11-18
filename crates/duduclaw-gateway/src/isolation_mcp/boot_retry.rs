@@ -16,11 +16,16 @@ use super::{BootStatus, MissingProducer};
 pub(super) struct Failure {
     pub(super) missing: Vec<MissingProducer>,
     pub(super) retry: bool,
+    /// R8m 30a: the fixed reason of some missing producers (e.g.
+    /// `ConnectorProviders` ⇒ `catalog_file_unsafe`), for the log line only.
+    pub(super) reasons: Vec<Detail>,
 }
+/// A missing producer and its fixed reason (a `&'static str` from a fixed table).
+pub(super) type Detail = (MissingProducer, &'static str);
 impl Failure {
     /// R8j round 2 B3: the attempt ended at the shutdown gate. Nothing is
     /// published or logged and the boot task ends (no retry).
-    pub(super) fn closed() -> Self { Self { missing: Vec::new(), retry: false } }
+    pub(super) fn closed() -> Self { Self { missing: Vec::new(), retry: false, reasons: Vec::new() } }
     /// Only [`Failure::closed`] has an empty missing set.
     fn is_closed(&self) -> bool { self.missing.is_empty() && !self.retry }
 }
@@ -87,7 +92,22 @@ pub(super) trait BootAttempt: Send {
 /// latched failure), and the last missing set that was reported.
 pub(super) struct BootState {
     status: Mutex<Option<BootStatus>>,
-    reported: Mutex<Option<Vec<MissingProducer>>>,
+    reported: Mutex<Option<(Vec<MissingProducer>, Vec<Detail>)>>,
+}
+
+/// R8m 30a: the logged missing list, `[Backend, ConnectorProviders(catalog_file_unsafe)]`:
+/// each producer's name with its fixed reason when it has one.
+pub(super) struct Listed<'a>(pub(super) &'a [MissingProducer], pub(super) &'a [Detail]);
+impl std::fmt::Display for Listed<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[")?;
+        for (index, producer) in self.0.iter().enumerate() {
+            if index > 0 { f.write_str(", ")?; }
+            write!(f, "{producer:?}")?;
+            if let Some((_, reason)) = self.1.iter().find(|(named, _)| named == producer) { write!(f, "({reason})")?; }
+        }
+        f.write_str("]")
+    }
 }
 impl BootState {
     pub(super) const fn new() -> Self { Self { status: Mutex::new(None), reported: Mutex::new(None) } }
@@ -97,14 +117,17 @@ impl BootState {
         if let Ok(mut status) = self.status.lock() { *status = Some(BootStatus { constructed: true, missing: vec![] }); }
     }
     /// Publishes the not-ready reasons of a failed attempt. `true` when the
-    /// missing set differs from the last one reported (log only then).
-    fn failed(&self, missing: &[MissingProducer]) -> bool {
+    /// missing set or one of its fixed reasons differs from the last one
+    /// reported (log only then).
+    fn failed(&self, missing: &[MissingProducer], reasons: &[Detail]) -> bool {
         if let Ok(mut status) = self.status.lock() {
             *status = Some(BootStatus { constructed: false, missing: missing.to_vec() });
         }
         let Ok(mut reported) = self.reported.lock() else { return true };
-        if reported.as_deref() == Some(missing) { return false; }
-        *reported = Some(missing.to_vec());
+        if reported.as_ref().is_some_and(|(last, details)| last.as_slice() == missing && details.as_slice() == reasons) {
+            return false;
+        }
+        *reported = Some((missing.to_vec(), reasons.to_vec()));
         true
     }
 }
@@ -123,12 +146,12 @@ pub(super) async fn step(boot: &mut impl BootAttempt, state: &BootState, started
         }
         // Shutdown: the previous status stays, nothing is logged.
         Err(failure) if failure.is_closed() => Step::Stop,
-        Err(Failure { missing, retry }) => {
-            if state.failed(&missing) {
+        Err(Failure { missing, retry, reasons }) => {
+            if state.failed(&missing, &reasons) {
                 if matches!(missing.as_slice(), [MissingProducer::Initialization]) {
                     tracing::error!("隔離工具服務初始化未通過，團隊執行維持暫停。");
                 } else {
-                    tracing::error!(missing = ?missing, "隔離工具服務尚缺可信任的啟動資料，團隊執行維持暫停。");
+                    tracing::error!(missing = %Listed(&missing, &reasons), "隔離工具服務尚缺可信任的啟動資料，團隊執行維持暫停。");
                 }
             }
             if retry { Step::Retry } else { Step::Stop }
@@ -230,7 +253,7 @@ mod tests {
                 let attempt = self.attempts.fetch_add(1, Ordering::AcqRel) + 1;
                 assert_eq!(self.published.load(Ordering::Acquire), 0, "a success is never re-run");
                 if attempt <= self.missing_for {
-                    return Err(Failure { missing: MISSING.to_vec(), retry: self.retry });
+                    return Err(Failure { missing: MISSING.to_vec(), retry: self.retry, reasons: Vec::new() });
                 }
                 self.published.fetch_add(1, Ordering::AcqRel);
                 self.state.constructed();
@@ -449,15 +472,33 @@ mod tests {
     fn boot_retry_reports_missing_set_only_on_change() {
         let state = BootState::new();
         assert!(state.status().is_none());
-        assert!(state.failed(&MISSING));
-        assert!(!state.failed(&MISSING), "unchanged set: no second ERROR");
-        assert!(!state.failed(&MISSING));
-        assert!(state.failed(&[MissingProducer::MainPlans]), "changed set: reported");
+        assert!(state.failed(&MISSING, &[]));
+        assert!(!state.failed(&MISSING, &[]), "unchanged set: no second ERROR");
+        assert!(!state.failed(&MISSING, &[]));
+        assert!(state.failed(&[MissingProducer::MainPlans], &[]), "changed set: reported");
         assert_eq!(state.status().unwrap().missing, vec![MissingProducer::MainPlans]);
-        assert!(!state.failed(&[MissingProducer::MainPlans]));
-        assert!(state.failed(&MISSING), "back to an earlier set is a change");
-        assert!(state.failed(&[MissingProducer::Initialization]));
-        assert!(!state.failed(&[MissingProducer::Initialization]));
+        assert!(!state.failed(&[MissingProducer::MainPlans], &[]));
+        assert!(state.failed(&MISSING, &[]), "back to an earlier set is a change");
+        assert!(state.failed(&[MissingProducer::Initialization], &[]));
+        assert!(!state.failed(&[MissingProducer::Initialization], &[]));
+        // R8m 30a: a changed fixed reason under the same set is a change too.
+        let connectors = [MissingProducer::ConnectorProviders];
+        assert!(state.failed(&connectors, &[(MissingProducer::ConnectorProviders, "catalog_file_unsafe")]));
+        assert!(!state.failed(&connectors, &[(MissingProducer::ConnectorProviders, "catalog_file_unsafe")]));
+        assert!(state.failed(&connectors, &[(MissingProducer::ConnectorProviders, "catalog_home_unsafe")]));
+        assert!(state.failed(&connectors, &[]));
+    }
+
+    /// R8m 30a: the logged list names each producer and, when it has one,
+    /// its fixed reason; a reason of a producer that is not missing is not shown.
+    #[test]
+    fn boot_missing_list_shows_fixed_reasons() {
+        let missing = [MissingProducer::Backend, MissingProducer::ExecutionPlans, MissingProducer::ConnectorProviders];
+        let reasons = [(MissingProducer::ConnectorProviders, "catalog_home_unsafe"),
+            (MissingProducer::ExecutionPlans, "no_helper_runtime_in_policy"), (MissingProducer::MainPlans, "unused")];
+        assert_eq!(Listed(&missing, &reasons).to_string(),
+            "[Backend, ExecutionPlans(no_helper_runtime_in_policy), ConnectorProviders(catalog_home_unsafe)]");
+        assert_eq!(Listed(&missing, &[]).to_string(), "[Backend, ExecutionPlans, ConnectorProviders]");
     }
 
     /// Review round 1: spawnd not reachable at first, then reachable. The
