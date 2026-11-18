@@ -2043,8 +2043,8 @@ fn preflight(upstream: Option<SocketAddr>, hosts: &[IpAddr], stage: &StageReceip
     if !kernel.is_some_and(|version| version >= (5, 15)) { fail("需要 Linux 核心 5.15 以上。"); }
     if statfs_type(c"/sys/fs/cgroup") != Some(0x6367_7270) { fail("需要 cgroup v2（unified）。"); }
     if let Err(message) = storage_clear() { fail(message); }
-    for tool in ["systemctl", "useradd", "getent", "id", "loginctl", "python3", "setpriv"] {
-        if !tool_present(tool) { fail("缺少必要的系統工具（systemctl、useradd、getent、id、loginctl、python3、setpriv）。"); break; }
+    for tool in ["systemctl", "useradd", "usermod", "getent", "id", "loginctl", "python3", "setpriv"] {
+        if !tool_present(tool) { fail("缺少必要的系統工具（systemctl、useradd、usermod、getent、id、loginctl、python3、setpriv）。"); break; }
     }
     // Identities (design §5.1).
     match read_root_text("/etc/login.defs", 1024 * 1024) {

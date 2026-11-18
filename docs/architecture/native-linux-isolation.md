@@ -5935,7 +5935,10 @@ No formatter, release, service operation or production-home access was performed
   out-of-bounds effective maxima are refused. New accounts
   use a capped max-minus-one allocation, no subordinate ranges, and auxiliary
   accounts have locked/expired passwords, nologin, no home or supplementary
-  groups, and disabled linger. Service UID/GID pairs must be distinct. Existing
+  groups, and disabled linger. After validating the account identity and groups,
+  the installer sets expiry with `usermod --expiredate 1970-01-02` on both creation
+  and resume, because `useradd --system` ignores `--expiredate`; it then requires
+  shadow password `!*` and expiry day `1`. Service UID/GID pairs must be distinct. Existing
   incompatible accounts refuse; this hook does not silently repurpose them.
 - R7a account: `duduclaw-selftest` (`duduclaw_isolation::ids::SELFTEST_USER`, which `duduclaw-run-selftest` drops to) is one of the layout's auxiliary accounts, created, checked and kept under the same rules before spawnd starts.
 - R7a unit: `duduclaw-isolation-selftest.service` is installed with the layout units (root:root 0644, byte-equal to spawnd's `ISOLATION_SELFTEST_UNIT_TEXT`, daemon-reloaded before spawnd starts), stopped right after spawnd by the quiesce, removed by rollback/uninstall, and never enabled or started by the installer.
