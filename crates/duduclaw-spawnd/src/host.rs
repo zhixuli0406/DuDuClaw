@@ -6,7 +6,7 @@ use duduclaw_isolation::ipc::{HelperCallId, SpawndFeatures as Features};
 use crate::{Result, admission::{BrokerJob, BrokerReply, BrokerStep, Host, HostProgress, LaunchPolicy, Ticket,
         HelperEvent, HelperSignal, HelperStart, HelperStarted},
     helper_host::{CallPlan, HelperAudit, HelperEngine},
-    accounts::{self, InstallationEvidence, LinuxAccounts},
+    accounts::{self, LinuxAccounts},
     audit::{Detail, Event, Record, disk::AuditWorker}, bootstrap::{BootstrapPlan, Trampoline},
     channels::{OutputRelay, RevocablePair, ConnectionRevoker}, fds::SnapshotAuthority,
     host_state::{RunJournal, RunRecord}, host_worker::{WorkerHost, Scan}, policy::RootPolicy,
@@ -111,14 +111,16 @@ impl Egress for LinuxEgress {
     }
 }
 pub struct Components {
-    pub installation: Arc<dyn InstallationEvidence>,
+    /// R7c: per-account SSH denial probe results (`crate::ssh_evidence`);
+    /// the default proves nothing, so no account with sshd present is admitted.
+    pub ssh: Arc<dyn crate::ssh_evidence::SshEvidence>,
     pub publication: Box<dyn Publication>,
     pub storage: Box<dyn Storage>,
     pub trampoline: Box<dyn Trampoline>,
     pub egress: Box<dyn Egress>,
 }
 impl Default for Components {
-    fn default() -> Self { Self { installation: Arc::new(accounts::MissingInstallationEvidence),
+    fn default() -> Self { Self { ssh: Arc::new(crate::ssh_evidence::MissingSshEvidence),
         publication: Box::new(MissingPublication), storage: Box::new(UnavailableStorage),
         trampoline: Box::new(crate::native_trampoline::NativeTrampoline::default()), egress: Box::new(LinuxEgress::new(Box::new(MissingDnsEvidence))) } }
 }
@@ -228,11 +230,37 @@ struct Core {
     probe_schedule: probe::ProbeSchedule,
     /// Round 3 (N4): the published report's recording gate, readable without the view lock.
     recording_gate: crate::host_state::RecordingGate,
+    /// C2: the start-up reconciliation latch (retried by `refresh`).
+    startup: StartupReconcile,
+}
+/// C2: the cadence of start-up reconciliation retries.
+const STARTUP_RETRY: Duration = Duration::from_secs(2);
+/// C2: start-up reconciliation needs the updater's committed generation (the
+/// publication anchors), and the updater answers only once the gateway and
+/// egress run, which start after this process is open. The first attempt runs
+/// in `LinuxHost::open`; while it has never succeeded in this process and the
+/// core is not poisoned, `Core::refresh` attempts again at most once every
+/// `STARTUP_RETRY`. The first success latches: it is never run again. A
+/// poisoned core never recovers by retry.
+#[derive(Clone, Copy, Debug)]
+struct StartupReconcile { latched: bool, last_attempt: Instant }
+impl StartupReconcile {
+    fn opened(at: Instant, reconciled: bool) -> Self { Self { latched: reconciled, last_attempt: at } }
+    fn due(&self, now: Instant, poisoned: bool) -> bool {
+        !self.latched && !poisoned && now.saturating_duration_since(self.last_attempt) >= STARTUP_RETRY
+    }
+    /// Runs `attempt` when due; true exactly when this call latched success.
+    fn retry(&mut self, now: Instant, poisoned: bool, attempt: impl FnOnce() -> bool) -> bool {
+        if !self.due(now, poisoned) { return false; }
+        self.last_attempt = now;
+        self.latched = attempt();
+        self.latched
+    }
 }
 impl LinuxHost {
     pub fn open(gateway: (u32, u32), components: Components, audit: AuditWorker) -> io::Result<Self> {
         let registry = RegistryStore::initialize()?;
-        let mut accounts = LinuxAccounts { evidence: components.installation.as_ref() };
+        let mut accounts = LinuxAccounts::background(components.ssh.as_ref());
         registry.registry().validate(&accounts.policy()?)?;
         let monitor = Monitor::start(&registry.registry().employees, audit.clone())?;
         let scanner = ScanReader { state: monitor.state.clone(), entries: monitor.entries.clone() };
@@ -250,11 +278,15 @@ impl LinuxHost {
             components, policy: None, report: EvidenceReport::current(Readiness::default(), 0)?, gateway,
             monitor, runs: BTreeMap::new(), audit, last_refresh: Instant::now(), poisoned: false, view: view.clone(),
             helper_events: Vec::new(), recording_probe: probe::RecordingProbe::default(),
-            probe_schedule: probe::ProbeSchedule::default(), recording_gate: recording_gate.clone() };
+            probe_schedule: probe::ProbeSchedule::default(), recording_gate: recording_gate.clone(),
+            startup: StartupReconcile::opened(Instant::now(), false) };
         core.report.publish(gateway.1)?;
         // Cleanup is attempted even when C/H/F/G are absent. Failure is evidence,
         // never permission to skip an orphan or reinterpret a stale reservation.
-        core.report.checks.startup_reconciled = core.reconcile().is_ok();
+        // C2: a failure is retried by `refresh` (`StartupReconcile`).
+        let reconciled = core.reconcile().is_ok();
+        core.startup = StartupReconcile::opened(Instant::now(), reconciled);
+        core.report.checks.startup_reconciled = reconciled;
         // H4: anchors for allocations made before H3 (idempotent, audited).
         core.backfill_anchors();
         let snapshots = core.components.publication.snapshot_authority(gateway.0)
@@ -280,7 +312,10 @@ impl Core {
         for run in &runs { revoked &= self.components.egress.unregister(*run).is_ok(); }
         let units = self.systemd.reconcile_all();
         // Do not short circuit account/process quarantine on an unavailable C/H.
-        let accounts = self.registry.reconcile(&mut LinuxAccounts { evidence: self.components.installation.as_ref() });
+        // R7c: start-up recovery walks every account; a probe result still
+        // pending after the restart never fails it (background lookups ask the
+        // worker to re-probe every account; admission waits per employee).
+        let accounts = self.registry.reconcile(&mut LinuxAccounts::background(self.components.ssh.as_ref()));
         let mut absent = true;
         for account in &self.registry.registry().employees {
             for intruder in os(accounts::unexpected_processes(account.uid, None))? {
@@ -300,11 +335,31 @@ impl Core {
         for run in runs { os(self.journal.remove(run))?; }
         Ok(())
     }
+    /// C2 retry of `reconcile`. The updater's answer (the committed generation
+    /// behind the publication anchors, read-only) is asked FIRST: while it does
+    /// not answer, return before any side effect. Then the same `reconcile` as
+    /// at start-up; repeating it is safe because no run exists in this process
+    /// yet (admission needs `startup_reconciled`: `Core::ready` →
+    /// `Readiness::check`) and no reservation of this process exists either
+    /// (`Host::allocation` refuses `Allocate` until the latch).
+    fn retry_reconcile(&mut self) -> Result<()> {
+        self.components.publication.anchors()?;
+        self.reconcile()
+    }
     fn refresh(&mut self) {
         let probe_started = crate::host_state::boottime_ms().unwrap_or(0);
+        let mut startup = self.startup;
+        if startup.retry(Instant::now(), self.poisoned, || self.retry_reconcile().is_ok()) {
+            self.report.checks.startup_reconciled = true;
+        }
+        self.startup = startup;
         let startup_reconciled = self.report.checks.startup_reconciled && !self.poisoned;
         let mut checks = Readiness { startup_reconciled, ..Readiness::default() };
-        let registry = self.registry.registry().verify(&mut LinuxAccounts { evidence: self.components.installation.as_ref() }).is_ok();
+        // R7c: host-wide checks of every account (namespace, lockdown, cron/at,
+        // sshd configuration); each account's SSH probe result is per-employee
+        // and checked at its admission (`ready`), so one pending or failed
+        // probe never takes every employee down.
+        let registry = self.registry.verify(&mut LinuxAccounts::background(self.components.ssh.as_ref())).is_ok();
         self.policy = self.components.publication.load().ok();
         let snapshot = self.components.publication.snapshot_authority(self.gateway.0);
         checks.registry_verified = registry && self.policy.is_some() && snapshot.is_ok_and(|s| s.gateway_uid == self.gateway.0 && s.mount_id != 0);
@@ -361,6 +416,45 @@ impl Core {
         self.last_refresh = Instant::now();
     }
     fn account(&self, employee: EmployeeId) -> Result<EmployeeAccount> { os(self.registry.registry().lookup(employee)).cloned() }
+    /// Every registry row (one per employee) is monitored; a row that is not
+    /// Ready is fenced. Forces the next readiness refresh.
+    fn monitor_registry(&mut self) -> Result<()> {
+        let mut entries = self.monitor.entries.lock().map_err(|_| unavailable())?;
+        for account in &self.registry.registry().employees {
+            if let Some(entry) = entries.iter_mut().find(|e| e.account.employee == account.employee) {
+                entry.account = account.clone();
+                if account.state != crate::registry::AccountState::Ready { entry.cancelled.store(true, Ordering::Release); }
+            } else {
+                entries.push(ScanEntry { account: account.clone(), run: None, cgroup: None, revokers: vec![],
+                    cancelled: Arc::new(AtomicBool::new(account.state != crate::registry::AccountState::Ready)), deadline: None });
+            }
+        }
+        drop(entries);
+        self.last_refresh = Instant::now() - Duration::from_secs(10);
+        Ok(())
+    }
+    /// R7c (F6): the pending-reservation deadline, on this lifecycle thread
+    /// (so it never interleaves with an allocation). Never waits for a probe;
+    /// at most `MAX_PENDING_RESERVATIONS` retirements per turn, each the
+    /// failure branch's quarantine (`RegistryStore::expire_pending`).
+    fn expire_reservations(&mut self) {
+        if self.poisoned { return; }
+        let expired = self.registry.expire_pending(&mut LinuxAccounts::background(self.components.ssh.as_ref()));
+        match expired {
+            Ok(expired) if expired.is_empty() => {}
+            Ok(expired) => {
+                for retired in &expired {
+                    eprintln!("duduclaw-spawnd: employee reservation uid {} retired: SSH denial probe unresolved for {} s{}",
+                        retired.account.uid, crate::registry::PENDING_RESERVATION_TTL_MS / 1000,
+                        if retired.quarantine.is_ok() { "" } else { " (quarantine failed; retried at start-up)" });
+                }
+                if self.monitor_registry().is_err() { self.poisoned = true; }
+            }
+            // No clock, or a failed save (which poisons the registry store and
+            // keeps every reservation remembered): nothing changed.
+            Err(_) => {}
+        }
+    }
     /// H4 upgrade step (H3 open item 1): employees allocated before H3 have
     /// no anchor. Create the missing ones for every allocation Ready in both
     /// the journal and the registry; idempotent, never repairs; audited.
@@ -501,6 +595,12 @@ impl Host for Core {
         -> std::result::Result<duduclaw_migration::allocation::Reply, duduclaw_migration::allocation::ErrorCode> {
         use duduclaw_migration::allocation::ErrorCode as Wire;
         if self.poisoned { return Err(Wire::IsolationUnavailable); }
+        // C2: a reservation made before start-up reconciliation latched would
+        // be tombstoned as abandoned by the next attempt
+        // (`RegistryStore::reconcile`); allocating waits for the latch.
+        if request.action == duduclaw_migration::allocation::Action::Allocate && !self.startup.latched {
+            return Err(Wire::NotReady);
+        }
         // F6l: the idle readback (S14/S17) of a Ready subject, read in this
         // worker turn; every source readable or an error (never zero).
         let idle = self.allocator.subject(request).map(|employee| self.employee_idle(employee));
@@ -508,7 +608,11 @@ impl Host for Core {
         // answered before it (S15), ReadBack never waits for it.
         let host_busy = !self.runs.is_empty();
         let now_unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-        let mut accounts = LinuxAccounts { evidence: self.components.installation.as_ref() };
+        // R7c (F6): allocation never waits for a probe on this lifecycle
+        // thread: it queues the new account's forced probe and answers
+        // "pending" (`AccountHost::login_denied`); the same employee's next
+        // allocation picks the result up. Other accounts are not probed inline.
+        let mut accounts = LinuxAccounts::background(self.components.ssh.as_ref());
         let result = self.allocator.handle(request, crate::allocation::Env { registry: &mut self.registry, accounts: &mut accounts,
             storage: self.components.storage.as_mut(), host_busy, idle, now_unix });
         for event in self.allocator.take_events() {
@@ -518,20 +622,9 @@ impl Host for Core {
                 crate::allocation::AllocationEvent::Intruder { employee } => emit(&self.audit, Event::Intruder, Some(employee), None),
             }
         }
-        let mut entries = self.monitor.entries.lock().map_err(|_| Wire::IsolationUnavailable)?;
         // Even a failed allocation may have created a durable UID reservation.
         // Monitor every such identity before returning its failure to the gateway.
-        for account in &self.registry.registry().employees {
-            if let Some(entry) = entries.iter_mut().find(|e| e.account.employee == account.employee) {
-                entry.account = account.clone();
-                if account.state != crate::registry::AccountState::Ready { entry.cancelled.store(true, Ordering::Release); }
-            } else {
-                entries.push(ScanEntry { account: account.clone(), run: None, cgroup: None, revokers: vec![],
-                    cancelled: Arc::new(AtomicBool::new(account.state != crate::registry::AccountState::Ready)), deadline: None });
-            }
-        }
-        drop(entries);
-        self.last_refresh = Instant::now() - Duration::from_secs(10);
+        self.monitor_registry().map_err(|_| Wire::IsolationUnavailable)?;
         result
     }
     fn broker(&mut self, job: BrokerJob) -> Result<BrokerStep> {
@@ -578,7 +671,10 @@ impl Host for Core {
         if self.poisoned { return Err(unavailable()); }
         self.report.check()?;
         let account = self.account(employee)?;
-        os(LinuxAccounts { evidence: self.components.installation.as_ref() }.verify_locked(&account))?;
+        // R7c: this employee's SSH denial probe must be Denied for its current
+        // key; until the (re-)probe reports, only this employee is NotReady.
+        LinuxAccounts::admission(self.components.ssh.as_ref()).verify_locked(&account).map_err(|error|
+            if accounts::ssh_refusal(&error) == Some(&accounts::SshRefusal::Pending) { ErrorCode::NotReady } else { unavailable() })?;
         self.report.check()
 
     }
@@ -766,6 +862,7 @@ impl Host for Core {
                 emit(&self.audit, Event::OutputTruncated, Some(entry.employee), Some(*run)); entry.truncated_event = true;
             }
         }
+        self.expire_reservations();
         if self.last_refresh.elapsed() >= Duration::from_millis(250) { self.refresh(); }
         Ok(())
     }

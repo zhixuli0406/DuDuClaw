@@ -214,6 +214,12 @@ fn service_protected_readiness_components_match_the_signed_generation() {
     let mut fake = Fake::healthy();
     fake.manifest.as_mut().unwrap().artifacts.retain(|artifact| artifact.install_target != InstallTarget::TrampolineSelftest);
     assert_eq!(failures(&fake.assess()), [(Item::Components, "component_mismatch")]);
+    // R7c: the SSH denial probe binary likewise.
+    let mut fake = Fake::healthy(); fake.broken = vec!["/usr/lib/duduclaw/duduclaw-isolation-probe"];
+    assert_eq!(failures(&fake.assess()), [(Item::Components, "component_mismatch")]);
+    let mut fake = Fake::healthy();
+    fake.manifest.as_mut().unwrap().artifacts.retain(|artifact| artifact.install_target != InstallTarget::IsolationProbe);
+    assert_eq!(failures(&fake.assess()), [(Item::Components, "component_mismatch")]);
     // The gateway executable is compared too.
     let mut fake = Fake::healthy(); fake.broken = vec![BINARY];
     assert_eq!(failures(&fake.assess()), [(Item::Components, "component_mismatch")]);
@@ -262,6 +268,8 @@ fn service_protected_readiness_component_paths_map_to_distinct_signed_targets() 
     assert_eq!(component_target("/usr/lib/duduclaw/current/duduclaw"), Some(InstallTarget::Gateway));
     assert_eq!(component_target("/usr/lib/duduclaw/duduclaw-run-selftest"), Some(InstallTarget::TrampolineSelftest));
     assert_eq!(component_target(duduclaw_spawnd::systemd::SELFTEST_EXECUTABLE), Some(InstallTarget::TrampolineSelftest));
+    assert_eq!(component_target("/usr/lib/duduclaw/duduclaw-isolation-probe"), Some(InstallTarget::IsolationProbe));
+    assert_eq!(component_target(duduclaw_spawnd::systemd::PROBE_EXECUTABLE), Some(InstallTarget::IsolationProbe));
     assert!(layout::BINARIES.contains(&UPDATER_LAUNCHER));
     assert!(!component_paths().any(|path| path == UPDATER_LAUNCHER));
     assert!(component_target(UPDATER_LAUNCHER).is_none());
@@ -318,6 +326,22 @@ fn service_protected_readiness_launcher_receipt_record_is_strict() {
     let mut padded = bytes.clone();
     padded.extend(vec![b' '; MAX_LAUNCHER_RECEIPT_BYTES]);
     assert!(LauncherReceiptRecord::parse(&padded).is_err());
+}
+
+/// C4: the bootstrap's S6 refusal names each false field in the composite's wording.
+#[test]
+fn unmet_host_checks_use_the_composite_wording() {
+    assert!(unmet_host_checks(&all_checks()).is_empty());
+    let mut checks = all_checks();
+    checks.startup_reconciled = false;
+    assert_eq!(unmet_host_checks(&checks), ["啟動時的執行紀錄對帳尚未完成。"]);
+    checks.landlock_self_test = false;
+    checks.protocol = 2;
+    assert_eq!(unmet_host_checks(&checks), [MSG_HOST_PROTOCOL, "啟動時的執行紀錄對帳尚未完成。", MSG_LANDLOCK]);
+    let primary: Vec<_> = host_checks(&HostChecks::default()).into_iter().map(|(_, _, message)| message).collect();
+    let mut expected = primary.clone();
+    expected.push(MSG_LANDLOCK);
+    assert_eq!(unmet_host_checks(&HostChecks::default()), expected);
 }
 
 #[test]
@@ -483,6 +507,26 @@ fn service_protected_readiness_broker_config_uses_the_brokers_validator() {
     // No private copy of the config type is left in this module.
     let source = include_str!("protected_linux_readiness.rs");
     assert!(!source.contains(concat!("struct ", "BrokerConfigView")));
+}
+
+/// The broker unit is checked against the text generated for the upstream
+/// the broker config records (the shipped text without a config), through
+/// the broker's own reader; only its allow-rule mismatch is printed as detail.
+#[test]
+fn service_protected_readiness_broker_unit_expects_the_recorded_upstream() {
+    let source = include_str!("protected_linux_readiness.rs");
+    let body = |signature: &str| source.split(signature).nth(1).unwrap().split("\n}\n").next().unwrap();
+    let units = body("fn platform_units()");
+    assert!(units.contains("let upstream = recorded_broker_upstream()?;"));
+    assert!(units.contains("layout::dns_broker_unit_check(&fs::read(&path)?, upstream)"));
+    let recorded = body("fn recorded_broker_upstream()");
+    assert!(recorded.contains("if absent(BROKER_CONFIG_PATH)? { return Ok(None); }"));
+    assert!(recorded.contains("read_root_config(BROKER_CONFIG_PATH)") && recorded.contains("config.validate()"));
+    let upstream = Some("192.0.2.53:53".parse().unwrap());
+    let mismatch = layout::dns_broker_unit_check(layout::DNS_BROKER_UNIT_TEXT.as_bytes(), upstream).unwrap_err();
+    assert_eq!(broker_unit_detail(&Err(refused(mismatch.clone()))), Some(mismatch));
+    assert_eq!(broker_unit_detail(&Err(refused("隔離服務單元與安裝版本不符。"))), None);
+    assert_eq!(broker_unit_detail(&Ok(())), None);
 }
 
 #[test]

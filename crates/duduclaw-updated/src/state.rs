@@ -97,7 +97,8 @@ impl State {
             .iter().any(|v| *v != 1) { return Err(Error::Incompatible); }
         // A complete generation prevents partial upgrades from mixing privileged components.
         for required in [InstallTarget::Gateway, InstallTarget::Spawnd, InstallTarget::Trampoline,
-            InstallTarget::TrampolineSelftest, InstallTarget::Egress, InstallTarget::EgressForwarder, InstallTarget::McpBridge,
+            InstallTarget::TrampolineSelftest, InstallTarget::IsolationProbe, InstallTarget::Egress,
+            InstallTarget::EgressForwarder, InstallTarget::McpBridge,
             InstallTarget::ParseWorker, InstallTarget::Importer, InstallTarget::UpdateSlot] {
             if !manifest.artifacts.iter().any(|a| a.install_target == required && a.mode & 0o100 != 0) {
                 return Err(Error::Incompatible);
@@ -375,7 +376,8 @@ pub(crate) mod tests {
             os: OperatingSystem::Linux, channel: ReleaseChannel::Stable, version: version(80),
             minimum_version: version(79), serial: 11, created_at_unix: 100, expires_at_unix: 200,
             artifacts: [InstallTarget::Gateway, InstallTarget::Spawnd, InstallTarget::Trampoline,
-                InstallTarget::TrampolineSelftest, InstallTarget::Egress, InstallTarget::EgressForwarder, InstallTarget::McpBridge,
+                InstallTarget::TrampolineSelftest, InstallTarget::IsolationProbe, InstallTarget::Egress,
+                InstallTarget::EgressForwarder, InstallTarget::McpBridge,
                 InstallTarget::ParseWorker, InstallTarget::Importer, InstallTarget::UpdateSlot]
                 .into_iter().enumerate().map(|(index, target)| ReleaseArtifact {
                     id: format!("artifact-{index}"), sha256: Sha256Digest([index as u8; 32]), size_bytes: 1,

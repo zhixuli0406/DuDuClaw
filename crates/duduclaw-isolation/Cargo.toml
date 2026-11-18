@@ -9,5 +9,18 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
+# Used only by the `duduclaw-isolation-probe` binary below; the library itself
+# stays free of OS operations (`#![forbid(unsafe_code)]` in lib.rs).
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [lints]
 workspace = true
+
+# R7c: the shipped SSH denial probe, started only by PID 1 through the template
+# unit `duduclaw-isolation-probe@<account>.service`. Linux-only; on any other
+# target it is a stub that exits 125. Hosted here (not in spawnd) so it links
+# nothing but std, libc, serde_json and this crate's identity constants.
+[[bin]]
+name = "duduclaw-isolation-probe"
+path = "src/bin/probe.rs"

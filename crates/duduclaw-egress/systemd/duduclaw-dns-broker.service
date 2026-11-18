@@ -40,5 +40,12 @@ StandardError=journal
 LogRateLimitIntervalSec=60
 LogRateLimitBurst=10
 IPAddressDeny=any
-# Installer MUST add IPAddressAllow=<root-selected upstream>/32 or /128 here.
+# The installer generates the upstream's allow line from the validated
+# --dns-upstream: it replaces the marker line below with exactly one
+# IPAddressAllow=<upstream>/32 (IPv4) or /128 (IPv6) when it writes this file.
+# As shipped the marker is a comment, so the unit denies every address.
+# Drop-ins are refused (spawnd's readback requires none) and the installer's
+# readiness check requires these exact bytes; a different upstream means
+# re-running the installer, not editing this file.
+# @DUDUCLAW-DNS-UPSTREAM-ALLOW@
 # Only this separate process gets that exception; its protocol produces DNS only.

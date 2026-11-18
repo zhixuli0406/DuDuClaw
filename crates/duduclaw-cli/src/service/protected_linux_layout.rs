@@ -5,6 +5,8 @@ pub(super) const BINARIES: &[&str] = &[
     "/usr/lib/duduclaw/duduclaw-run",
     // R7a: the trampoline's isolation self-test (ExecStart of the fixed self-test unit).
     "/usr/lib/duduclaw/duduclaw-run-selftest",
+    // R7c: the SSH denial probe (ExecStart of the probe template unit).
+    "/usr/lib/duduclaw/duduclaw-isolation-probe",
     "/opt/duduclaw/bin/duduclaw-egress",
     "/usr/libexec/duduclaw/duduclaw-parse-worker",
     "/usr/lib/duduclaw/current/duduclaw-import",
@@ -50,13 +52,17 @@ pub(super) const UNITS: &[(&str, &str)] = &[
     ("duduclaw-isolation-ready.service", include_str!("../../../../scripts/linux-protected/spawnd/duduclaw-isolation-ready.service")),
     // R7a: no [Install]; never enabled or started here (spawnd starts it through PID 1).
     ("duduclaw-isolation-selftest.service", include_str!("../../../../scripts/linux-protected/spawnd/duduclaw-isolation-selftest.service")),
+    // R7c: template, no [Install]; never enabled or started here (spawnd starts
+    // `duduclaw-isolation-probe@<account>.service` through PID 1).
+    ("duduclaw-isolation-probe@.service", include_str!("../../../../scripts/linux-protected/spawnd/duduclaw-isolation-probe@.service")),
     ("duduclaw.slice", include_str!("../../../../scripts/linux-protected/spawnd/duduclaw.slice")),
     ("duduclaw-tcb.slice", include_str!("../../../../scripts/linux-protected/spawnd/duduclaw-tcb.slice")),
     ("duduclaw-employees.slice", include_str!("../../../../scripts/linux-protected/spawnd/duduclaw-employees.slice")),
     ("duduclaw-egress.socket", include_str!("../../../duduclaw-egress/systemd/duduclaw-egress.socket")),
     ("duduclaw-egress.service", include_str!("../../../duduclaw-egress/systemd/duduclaw-egress.service")),
     ("duduclaw-dns-broker.socket", include_str!("../../../duduclaw-egress/systemd/duduclaw-dns-broker.socket")),
-    ("duduclaw-dns-broker.service", include_str!("../../../duduclaw-egress/systemd/duduclaw-dns-broker.service")),
+    // Written as `dns_broker_unit_text` generates it for the install's route.
+    (DNS_BROKER_UNIT, DNS_BROKER_UNIT_TEXT),
     ("duduclaw-parse.socket", include_str!("../../../duduclaw-parse-worker/systemd/duduclaw-parse.socket")),
     ("duduclaw-parse@.service", include_str!("../../../duduclaw-parse-worker/systemd/duduclaw-parse@.service")),
     ("duduclaw-updated.service", include_str!("../../../../scripts/linux-protected/updated/duduclaw-updated.service")),
@@ -64,6 +70,107 @@ pub(super) const UNITS: &[(&str, &str)] = &[
     ("duduclaw-migrate-expire@.service", include_str!("../../../duduclaw-migration/systemd/duduclaw-migrate-expire@.service")),
     ("duduclaw-migrate-expire@.timer", include_str!("../../../duduclaw-migration/systemd/duduclaw-migrate-expire@.timer")),
 ];
+
+/// The DNS broker unit: the one layout unit whose installed text depends on
+/// the install (its upstream's network rule).
+pub(super) const DNS_BROKER_UNIT: &str = "duduclaw-dns-broker.service";
+/// As shipped: deny-all, no allow line (inert).
+pub(super) const DNS_BROKER_UNIT_TEXT: &str = include_str!("../../../duduclaw-egress/systemd/duduclaw-dns-broker.service");
+/// The shipped broker unit's one comment line the installer replaces with the
+/// upstream's `IPAddressAllow=` line.
+pub(super) const DNS_BROKER_ALLOW_MARKER: &str = "# @DUDUCLAW-DNS-UPSTREAM-ALLOW@";
+/// Start of every broker unit mismatch message ([`dns_broker_unit_mismatch`]).
+pub(super) const DNS_BROKER_MISMATCH_HEAD: &str = "DNS 轉送服務單元 /etc/systemd/system/duduclaw-dns-broker.service";
+
+/// The refusal of an IPv4 link-local DNS upstream (169.254.0.0/16), with
+/// what to do instead.
+pub(super) const LINK_LOCAL_UPSTREAM_REFUSED: &str = "DNS 上游不能是 IPv4 鏈路本地位址（169.254.0.0/16，例如雲端主機的中繼資料服務位址）：DNS 轉送服務的防火牆規則只限制主機、不限制連接埠，轉送服務因此也能連到該位址上的其他服務（例如雲端憑證）。如果這台主機唯一的 DNS 解析器是鏈路本地位址（雲端虛擬機常見），請安裝並啟用 systemd-resolved，安裝程式會直接使用它，不需要 --dns-upstream；或以 --dns-upstream 指定一個位址可路由的 DNS 解析器。";
+
+/// `upstream` is an IPv4 link-local address (169.254.0.0/16).
+pub(super) fn ipv4_link_local(upstream: std::net::SocketAddr) -> bool {
+    matches!(upstream.ip(), std::net::IpAddr::V4(ip) if ip.is_link_local())
+}
+
+/// The broker upstream's network rule: `IPAddressAllow=<ip>/32` (IPv4) or
+/// `IPAddressAllow=<ip>/128` (IPv6, as `Ipv6Addr` displays it). Refuses what
+/// the broker's own rule refuses (`duduclaw_egress::resolver::validate_broker_upstream`:
+/// port 53, not unspecified, multicast or the IPv4 broadcast address; restated
+/// because this module is std-only, and the installer applies that function
+/// too) and what the rule cannot carry: a loopback host (spawnd's readback
+/// refuses it; it would open every local service to the broker), an
+/// IPv4-mapped IPv6 address (its traffic is IPv4, the /128 rule would not
+/// match it), an IPv6 link-local address (the rule has no zone) and an IPv4
+/// link-local address (169.254.0.0/16, [`LINK_LOCAL_UPSTREAM_REFUSED`]): the
+/// rule limits the host, not the port, so a compromised broker could reach a
+/// link-local service such as the cloud metadata endpoint's HTTP port.
+pub(super) fn dns_broker_allow_line(upstream: std::net::SocketAddr) -> Result<String, &'static str> {
+    use std::net::IpAddr;
+    const REFUSED: &str = "DNS 上游必須是單一、非本機迴路的單點傳播 IP 位址加上連接埠 53。";
+    if ipv4_link_local(upstream) { return Err(LINK_LOCAL_UPSTREAM_REFUSED); }
+    if upstream.port() != 53 { return Err(REFUSED); }
+    match upstream.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() || ip.is_broadcast() => Err(REFUSED),
+        IpAddr::V4(ip) => Ok(format!("IPAddressAllow={ip}/32")),
+        IpAddr::V6(ip) if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast()
+            || ip.to_ipv4_mapped().is_some() || ip.segments()[0] & 0xffc0 == 0xfe80 => Err(REFUSED),
+        IpAddr::V6(ip) => Ok(format!("IPAddressAllow={ip}/128")),
+    }
+}
+
+/// The broker unit text the installer writes and every check expects:
+/// `shipped` unchanged on the resolved route (`upstream` `None`); on the
+/// broker route `shipped` with its marker line replaced by exactly one
+/// [`dns_broker_allow_line`]. Refuses unless the marker is exactly one line
+/// and `shipped` has no allow line of its own.
+pub(super) fn dns_broker_unit_text(shipped: &str, upstream: Option<std::net::SocketAddr>) -> Result<String, &'static str> {
+    if shipped.split('\n').filter(|line| *line == DNS_BROKER_ALLOW_MARKER).count() != 1
+        || shipped.lines().any(|line| line.trim_start().starts_with("IPAddressAllow")) {
+        return Err("DNS 轉送服務單元範本的上游規則標記不是剛好一行；安裝版本可能已損壞。");
+    }
+    let Some(upstream) = upstream else { return Ok(shipped.to_owned()) };
+    let allow = dns_broker_allow_line(upstream)?;
+    Ok(shipped.split('\n').map(|line| if line == DNS_BROKER_ALLOW_MARKER { allow.as_str() } else { line })
+        .collect::<Vec<_>>().join("\n"))
+}
+
+/// The text the installer writes for layout unit `name` (`shipped`, except
+/// the broker unit: [`dns_broker_unit_text`]).
+pub(super) fn installed_unit_text(name: &str, shipped: &str, upstream: Option<std::net::SocketAddr>)
+    -> Result<String, &'static str> {
+    if name == DNS_BROKER_UNIT { dns_broker_unit_text(shipped, upstream) } else { Ok(shipped.to_owned()) }
+}
+
+/// The installed broker unit bytes are exactly the text for `upstream` (this
+/// install's, `None` on the resolved route). Otherwise the error names the
+/// expected and the found allow rule ([`dns_broker_unit_mismatch`]).
+pub(super) fn dns_broker_unit_check(installed: &[u8], upstream: Option<std::net::SocketAddr>) -> Result<(), String> {
+    let expected = dns_broker_unit_text(DNS_BROKER_UNIT_TEXT, upstream).map_err(str::to_owned)?;
+    if installed == expected.as_bytes() { return Ok(()); }
+    Err(dns_broker_unit_mismatch(installed, upstream))
+}
+
+/// What differs, never the file: the expected allow line (and upstream) and
+/// at most three found allow lines, each bounded and printable ASCII only.
+pub(super) fn dns_broker_unit_mismatch(installed: &[u8], upstream: Option<std::net::SocketAddr>) -> String {
+    let text = String::from_utf8_lossy(installed);
+    let found: Vec<String> = text.lines().filter(|line| line.trim_start().starts_with("IPAddressAllow"))
+        .map(|line| line.chars().take(80).map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { '?' }).collect())
+        .collect();
+    let (wanted, wanted_lines) = match upstream.map(|upstream| (upstream, dns_broker_allow_line(upstream))) {
+        Some((upstream, Ok(line))) => (format!("{line}（上游 {upstream}）"), Some(vec![line])),
+        Some((upstream, Err(_))) => (format!("（無法產生：記錄的上游 {upstream} 不是可用的 DNS 上游）"), None),
+        None => ("沒有 IPAddressAllow（使用 systemd-resolved 的主機）".to_owned(), Some(Vec::new())),
+    };
+    if wanted_lines.as_ref() == Some(&found) {
+        return format!("{DNS_BROKER_MISMATCH_HEAD} 的上游規則相符，但其他內容與安裝版本不符。");
+    }
+    let shown = match found.len() {
+        0 => "沒有 IPAddressAllow".to_owned(),
+        count if count > 3 => format!("{} 等 {count} 行", found[..3].join("、")),
+        _ => found.join("、"),
+    };
+    format!("{DNS_BROKER_MISMATCH_HEAD} 的上游規則不符：預期 {wanted}，實際為 {shown}。不要手動修改這個單元或加入覆寫設定；要更換上游請重新執行安裝程式。")
+}
 
 pub(super) fn system_id_limit(defs: &str, key: &str) -> Result<u32, &'static str> {
     let mut found = None;
@@ -190,12 +297,16 @@ mod tests {
             assert!(DIRECTORIES.contains(&(root, 0o755)));
         }
         assert_eq!(ACCOUNTS.len(), 5);
-        assert_eq!(BINARIES.len(), 10);
+        assert_eq!(BINARIES.len(), 11);
         // R7a: the self-test unit runs the published self-test binary; the account it drops to is created here.
         let selftest = UNITS.iter().find(|(name, _)| *name == "duduclaw-isolation-selftest.service").unwrap().1;
         assert!(selftest.lines().any(|line| line == "ExecStart=/usr/lib/duduclaw/duduclaw-run-selftest"));
         assert!(!selftest.lines().any(|line| line.trim() == "[Install]"), "never enabled");
         assert!(ACCOUNTS.contains(&"duduclaw-selftest"));
+        // R7c: the probe template runs the published probe binary unprivileged as duduclaw-selftest (no account of its own).
+        let probe = UNITS.iter().find(|(name, _)| *name == "duduclaw-isolation-probe@.service").unwrap().1;
+        assert!(probe.lines().any(|line| line == "ExecStart=/usr/lib/duduclaw/duduclaw-isolation-probe %i"));
+        assert!(!probe.lines().any(|line| line.trim() == "[Install]"), "never enabled");
         // Every binary's parent directory is created by the layout (parent first).
         for binary in BINARIES {
             let parent = std::path::Path::new(binary).parent().unwrap().to_str().unwrap();
@@ -208,6 +319,109 @@ mod tests {
                 assert!(position < index, "{path} listed before its parent");
             }
         }
+    }
+
+    #[test]
+    fn service_protected_layout_dns_broker_unit_text_carries_exactly_the_upstream_allow_line() {
+        let shipped = DNS_BROKER_UNIT_TEXT;
+        // As shipped: deny-all, the marker one comment line, no allow line (inert).
+        assert_eq!(UNITS.iter().filter(|(name, text)| *name == DNS_BROKER_UNIT && *text == shipped).count(), 1);
+        assert!(shipped.lines().any(|line| line == "IPAddressDeny=any"));
+        assert_eq!(shipped.lines().filter(|line| *line == DNS_BROKER_ALLOW_MARKER).count(), 1);
+        assert!(!shipped.lines().any(|line| line.starts_with("IPAddressAllow")));
+        // The resolved route: the shipped bytes.
+        assert_eq!(dns_broker_unit_text(shipped, None).unwrap(), shipped);
+        assert_eq!(installed_unit_text(DNS_BROKER_UNIT, shipped, None).unwrap(), shipped);
+        for (upstream, line) in [("192.0.2.53:53", "IPAddressAllow=192.0.2.53/32"),
+            ("10.0.0.2:53", "IPAddressAllow=10.0.0.2/32"),
+            // Just outside 169.254.0.0/16.
+            ("169.253.255.255:53", "IPAddressAllow=169.253.255.255/32"),
+            ("169.255.0.1:53", "IPAddressAllow=169.255.0.1/32"),
+            ("[2001:4860:4860::8888]:53", "IPAddressAllow=2001:4860:4860::8888/128"),
+            ("[2001:DB8:0:0:0:0:0:35]:53", "IPAddressAllow=2001:db8::35/128"),
+            ("[fd00:ec2::253]:53", "IPAddressAllow=fd00:ec2::253/128")] {
+            let upstream: std::net::SocketAddr = upstream.parse().unwrap();
+            assert_eq!(dns_broker_allow_line(upstream).unwrap(), line);
+            let text = dns_broker_unit_text(shipped, Some(upstream)).unwrap();
+            assert_eq!(installed_unit_text(DNS_BROKER_UNIT, shipped, Some(upstream)).unwrap(), text);
+            assert!(text.lines().any(|candidate| candidate == "IPAddressDeny=any"));
+            let allow: Vec<_> = text.lines().filter(|candidate| candidate.starts_with("IPAddressAllow")).collect();
+            assert_eq!(allow, [line]);
+            assert!(!text.contains(DNS_BROKER_ALLOW_MARKER));
+            // No other difference: line by line, only the marker became the allow line.
+            let (before, after): (Vec<_>, Vec<_>) = (shipped.split('\n').collect(), text.split('\n').collect());
+            assert_eq!(before.len(), after.len());
+            let changed: Vec<_> = before.iter().zip(&after).filter(|(old, new)| old != new).collect();
+            assert_eq!(changed, [(&DNS_BROKER_ALLOW_MARKER, &line)]);
+            assert_eq!(text.len(), shipped.len() - DNS_BROKER_ALLOW_MARKER.len() + line.len());
+        }
+        // The broker's own refusals, plus what the rule cannot carry.
+        for bad in ["192.0.2.53:5353", "192.0.2.53:0", "0.0.0.0:53", "[::]:53", "224.0.0.1:53", "[ff02::1]:53",
+            "255.255.255.255:53", "127.0.0.1:53", "127.0.0.53:53", "[::1]:53", "[::ffff:127.0.0.1]:53",
+            "[::ffff:192.0.2.53]:53", "[fe80::1]:53"] {
+            let upstream: std::net::SocketAddr = bad.parse().unwrap();
+            assert!(dns_broker_allow_line(upstream).is_err(), "{bad}");
+            assert!(dns_broker_unit_text(shipped, Some(upstream)).is_err(), "{bad}");
+        }
+        // IPv4 link-local (cloud metadata and resolver hosts included): the
+        // rule limits the host, not the port. The refusal says what to do.
+        for bad in ["169.254.169.254:53", "169.254.169.253:53", "169.254.0.1:53", "169.254.255.255:53", "169.254.169.254:80"] {
+            let upstream: std::net::SocketAddr = bad.parse().unwrap();
+            assert!(ipv4_link_local(upstream), "{bad}");
+            assert_eq!(dns_broker_allow_line(upstream), Err(LINK_LOCAL_UPSTREAM_REFUSED), "{bad}");
+            assert_eq!(dns_broker_unit_text(shipped, Some(upstream)), Err(LINK_LOCAL_UPSTREAM_REFUSED), "{bad}");
+            assert!(installed_unit_text(DNS_BROKER_UNIT, shipped, Some(upstream)).is_err(), "{bad}");
+        }
+        assert!(LINK_LOCAL_UPSTREAM_REFUSED.contains("systemd-resolved") && LINK_LOCAL_UPSTREAM_REFUSED.contains("--dns-upstream"));
+        assert!(!ipv4_link_local("192.0.2.53:53".parse().unwrap()) && !ipv4_link_local("[fe80::1]:53".parse().unwrap()));
+        // The marker must be exactly one line and the template carry no allow line of its own.
+        let upstream = Some("192.0.2.53:53".parse().unwrap());
+        let damaged = [shipped.replace(&format!("{DNS_BROKER_ALLOW_MARKER}\n"), ""),
+            shipped.replace(DNS_BROKER_ALLOW_MARKER, &format!("{DNS_BROKER_ALLOW_MARKER}\n{DNS_BROKER_ALLOW_MARKER}")),
+            shipped.replace(DNS_BROKER_ALLOW_MARKER, &format!(" {DNS_BROKER_ALLOW_MARKER}")),
+            shipped.replace("IPAddressDeny=any\n", "IPAddressDeny=any\nIPAddressAllow=192.0.2.53/32\n")];
+        for text in &damaged {
+            assert_ne!(text, shipped);
+            assert!(dns_broker_unit_text(text, upstream).is_err());
+            assert!(dns_broker_unit_text(text, None).is_err());
+        }
+        // Every other unit is written as shipped, whatever the route.
+        for (name, text) in UNITS.iter().filter(|(name, _)| *name != DNS_BROKER_UNIT) {
+            assert_eq!(installed_unit_text(name, text, upstream).unwrap(), *text);
+            assert_eq!(installed_unit_text(name, text, None).unwrap(), *text);
+        }
+    }
+
+    #[test]
+    fn service_protected_layout_dns_broker_unit_check_expects_this_installs_upstream() {
+        let upstream = Some("192.0.2.53:53".parse().unwrap());
+        let generated = dns_broker_unit_text(DNS_BROKER_UNIT_TEXT, upstream).unwrap();
+        assert_eq!(dns_broker_unit_check(generated.as_bytes(), upstream), Ok(()));
+        assert_eq!(dns_broker_unit_check(DNS_BROKER_UNIT_TEXT.as_bytes(), None), Ok(()));
+        // The shipped (deny-all) text on the broker route.
+        let shipped = dns_broker_unit_check(DNS_BROKER_UNIT_TEXT.as_bytes(), upstream).unwrap_err();
+        assert!(shipped.starts_with(DNS_BROKER_MISMATCH_HEAD), "{shipped}");
+        assert!(shipped.contains("預期 IPAddressAllow=192.0.2.53/32（上游 192.0.2.53:53），實際為 沒有 IPAddressAllow。"), "{shipped}");
+        // The generated text on the resolved route.
+        let resolved = dns_broker_unit_check(generated.as_bytes(), None).unwrap_err();
+        assert!(resolved.contains("預期 沒有 IPAddressAllow（使用 systemd-resolved 的主機），實際為 IPAddressAllow=192.0.2.53/32。"), "{resolved}");
+        // A text generated for a different upstream.
+        let foreign = dns_broker_unit_text(DNS_BROKER_UNIT_TEXT, Some("198.51.100.53:53".parse().unwrap())).unwrap();
+        let other = dns_broker_unit_check(foreign.as_bytes(), upstream).unwrap_err();
+        assert!(other.contains("預期 IPAddressAllow=192.0.2.53/32（上游 192.0.2.53:53），實際為 IPAddressAllow=198.51.100.53/32。"), "{other}");
+        // The right allow line, other bytes changed.
+        let edited = dns_broker_unit_check(generated.replace("MemoryMax=64M", "MemoryMax=1G").as_bytes(), upstream).unwrap_err();
+        assert!(edited.contains("上游規則相符，但其他內容與安裝版本不符"), "{edited}");
+        // An extra allow line: shown bounded and printable; never the file.
+        let noisy = format!("{generated}IPAddressAllow=0.0.0.0/0\u{1b}[31m{}\n", "x".repeat(500));
+        let extra = dns_broker_unit_check(noisy.as_bytes(), upstream).unwrap_err();
+        assert!(extra.contains("實際為 IPAddressAllow=192.0.2.53/32、IPAddressAllow=0.0.0.0/0?[31m"), "{extra}");
+        assert!(!extra.contains('\u{1b}') && !extra.contains(&"x".repeat(80)), "{extra}");
+        for message in [&shipped, &resolved, &other, &edited, &extra] {
+            assert!(!message.contains("ExecStart=") && !message.contains("IPAddressDeny") && message.len() < 1024, "{message}");
+        }
+        // A loopback upstream (the broker's own validator accepts it) never yields an expected text.
+        assert!(dns_broker_unit_check(DNS_BROKER_UNIT_TEXT.as_bytes(), Some("127.0.0.1:53".parse().unwrap())).is_err());
     }
     #[cfg(unix)]
     struct Fixture(std::path::PathBuf);

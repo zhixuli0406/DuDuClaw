@@ -35,6 +35,15 @@ fn name(value: &str) -> Result<CString> {
     }
     cstring(value)
 }
+/// [`name`]'s rule plus `@`, for a systemd unit file name (a template such as
+/// `duduclaw-isolation-probe@.service`); no leading `.`.
+fn unit_name(value: &str) -> Result<CString> {
+    if value.is_empty() || value.starts_with('.') || value.len() > 200
+        || !value.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'@')) {
+        return Err(Error::Invalid);
+    }
+    cstring(value)
+}
 /// openat2 with O_CLOEXEC|O_NOFOLLOW and RESOLVE_BENEATH|NO_MAGICLINKS|NO_SYMLINKS
 /// (+NO_XDEV). Also used by the bootstrap verifier for its fixed inbox.
 pub(crate) fn open_at(parent: &File, path: &CString, flags: i32, mode: u32, no_xdev: bool) -> Result<File> {
@@ -147,6 +156,15 @@ impl Directory {
         owned_file(&file)?;
         Ok(file)
     }
+    /// [`Self::read`] for a systemd unit file name, which may contain `@`
+    /// ([`unit_name`]); the same descriptor checks (`Error::Invalid`: name
+    /// refused, `Error::Maintenance`: not a root:root regular file with one
+    /// link and no group/other write, `Error::Io`: open failed).
+    pub fn read_unit(&self, filename: &str) -> Result<File> {
+        let file = open_at(&self.0, &unit_name(filename)?, libc::O_RDONLY | libc::O_NONBLOCK, 0, true)?;
+        owned_file(&file)?;
+        Ok(file)
+    }
     pub fn bytes(&self, filename: &str, limit: usize) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         self.read(filename)?.take(limit as u64 + 1).read_to_end(&mut out)?;
@@ -251,6 +269,18 @@ mod tests {
     use super::*;
     use duduclaw_isolation::update::InstallTarget;
     use std::os::unix::fs::{symlink, PermissionsExt};
+    /// R7c: a template unit file name passes the unit rule (not the artifact rule).
+    #[test]
+    fn unit_name_admits_a_template_file_name_only() {
+        assert!(name("duduclaw-isolation-probe@.service").is_err());
+        for good in ["duduclaw-isolation-probe@.service", "duduclaw-isolation-selftest.service"] {
+            assert!(unit_name(good).is_ok(), "{good}");
+        }
+        let long = "a".repeat(201);
+        for bad in ["", ".", "..", ".hidden@.service", "a/b@.service", "a b.service", "a\0b.service", long.as_str()] {
+            assert!(unit_name(bad).is_err(), "{bad:?}");
+        }
+    }
     #[test]
     fn artifact_stream_size_hash_and_bound_checks() {
         let content = b"verified bytes";

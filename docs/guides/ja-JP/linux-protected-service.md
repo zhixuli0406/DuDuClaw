@@ -13,17 +13,17 @@ v1.83.0 以降、新しいホストへの保護インストールは、独立し
 1. root でダウンロード用ディレクトリを作成します：`install -d -m 0700 -o root -g root /root/duduclaw-migrate`。
 2. 次のファイルをファイルとしてこのディレクトリに保存します：`duduclaw-bootstrap`、`duduclaw-isolated-linux-<アーキテクチャ>-<バージョン>.tar` とその `.minisig`、`.authorization.json`、`.authorization.json.signatures.json`、およびチーム版ライセンス `license.json`（root 所有で、グループとその他のユーザーが書き込めないもの）。
 3. 公式サイトとライセンスコンソールで公開されている値と `sha256sum -c` で照合します。両方が一致している必要があります。
-4. `sudo /root/duduclaw-migrate/duduclaw-bootstrap install [--dns-upstream <IP:53>] [--host-public-address <IP>]... [--enable-now]` を実行します。
+4. `sudo /root/duduclaw-migrate/duduclaw-bootstrap install [--dns-upstream <IP:53>] [--host-public-address <IP>]...` を実行します。インストーラーが gateway を自分で起動し、起動時の自動起動も設定します。
 
 | オプション | 意味 |
 | --- | --- |
-| `--dns-upstream <IP:53>` | systemd-resolved のないホストでのみ使用：専用 DNS 転送サービスの唯一の上流。systemd-resolved がある場合は拒否されます。このアドレスは社員の外部接続ルールには追加されません。 |
+| `--dns-upstream <IP:53>` | systemd-resolved のないホストでのみ使用：専用 DNS 転送サービスの唯一の上流。systemd-resolved がある場合は拒否されます。ループバックアドレス（`127.0.0.1` 上のローカル DNS など）と IPv4 リンクローカルアドレス（`169.254.0.0/16`。クラウド VM のメタデータサービスや DNS のアドレスなど）も拒否されます。DNS 転送サービスのネットワークルールはホストを限定するだけでポートは限定しないため、転送サービスからメタデータサービスにも届いてしまうからです。唯一の DNS リゾルバーがリンクローカルアドレスのクラウド VM では、systemd-resolved をインストールして有効にするか（インストーラーがそれを直接使い、`--dns-upstream` は不要になります）、ルーティング可能なアドレスのリゾルバーを指定してください。インストーラーはこのアドレスを DNS 転送サービスのネットワークルールに書き込みます。社員の外部接続ルールには追加されません。上流を変更するにはインストーラーを再実行してください。DNS 転送サービスのユニットファイルを編集しないでください（準備状態チェックは編集されたファイルを拒否します）。ドロップインも追加しないでください（隔離実行サービスのネットワークルール確認が拒否します）。 |
 | `--host-public-address <IP>` | ネットワークインターフェースにないこのホストの公開アドレス（クラウドの 1:1 NAT）。複数指定可、最大 64 個。社員はこのアドレスに接続できません。 |
-| `--enable-now` | 最後に gateway を起動し、完全な準備検査を実行します。指定しない場合、gateway は自動起動の設定だけ行い、すぐには起動しません。 |
+| `--enable-now` | 不要になり、効果もありません：インストーラーは常に gateway を実行中のままにします。既存のスクリプトがそのまま動くよう引き続き受け付け、指定された場合は 1 行の案内を表示します。 |
 
 インストーラーは何かを変更する前にホストを検査し、不合格の項目をまとめて表示します：Ubuntu 22.04、Ubuntu 24.04 または Debian 12、systemd 249 以上、カーネル 5.15 以上、cgroup v2、`/var/lib` が ext4 または XFS、`/etc/login.defs` に `SYS_UID_MAX`／`SYS_GID_MAX` が明示されていること、70000〜99999 にアカウント・グループ・subordinate ID の範囲がないこと、sshd のメイン設定が `/etc/ssh/sshd_config.d/*.conf` を読み込むこと、`cron.allow`／`at.allow` が DuDuClaw のアカウントを許可していないこと、十分な空き容量、有効なチーム版ライセンス、以前の DuDuClaw のインストールがないこと。外部アカウントサービス（LDAP、SSSD など）を使うホストは、このインストーラーではサポートしていません。
 
-続いて、サービスアカウントのプロセスがないことを確認し、検証済みの更新信頼ルート・世代・固定パスのプログラムを配置し、サービスアカウント・ディレクトリ・サービスユニットを作成し、署名済みポリシーから外部接続と DNS の設定を書き込み、spawnd・egress・文書解析ソケット・更新サービスを起動し、夜間更新タイマー（`duduclaw-auto-upgrade.timer`）を有効にし、総合準備検査を実行して、合格した後にだけ gateway のユニットを導入・有効化します。総合準備検査に合格した場合にのみ、インストールは成功を報告します。
+続いて、サービスアカウントのプロセスがないことを確認し、検証済みの更新信頼ルート・世代・固定パスのプログラムを配置し、サービスアカウント・ディレクトリ・サービスユニットを作成し、署名済みポリシーから外部接続と DNS の設定を書き込みます（gateway のユニットもこの段階で配置しますが、まだ有効化しません）。次に、起動時と同じ順序でサービスを起動します：各ソケットと spawnd、整合性ゲート（spawnd が開いた状態）、egress、gateway、最後に更新サービス。更新サービスがインストールしたバージョンを報告するまで（最大 2 分）、spawnd がすべての準備検査の合格を報告するまで（最大 2 分 30 秒）待ちます。spawnd が時間内に準備できない場合、メッセージにまだ合格していない検査が表示されます。その後、夜間更新タイマー（`duduclaw-auto-upgrade.timer`）を有効にし、総合準備検査を実行して、合格した後にだけ gateway の自動起動を有効化します。gateway の実行中に完全な準備検査に合格した場合にのみ、インストールは成功を報告します。
 
 **再開：** 進捗は `/var/lib/duduclaw-protected/isolation-bootstrap.json` に記録されます。インストールが中断した場合（エラー、再起動、停電）は、表示された原因を直してから同じ `duduclaw-bootstrap install` コマンドをもう一度実行すると、最初の未完了の手順から続行します。再開時はオプションを省略できます。異なる値は拒否されます。別のインストールパッケージはロールバックするまで拒否されます。インストールが未完了の間、`service install`、`upgrade`、`uninstall --protected-linux` は拒否されます。
 
@@ -58,7 +58,7 @@ v1.83.0 以降、新しいホストへの保護インストールは、独立し
 
 Kernel 7.0 は**現在受け入れられません**。Trampoline は 7 より大きい Landlock ABI を拒否します。ディストリビューションや GCP イメージの名前ではなく、実際に起動した kernel を確認してください。検証には受け入れ可能な kernel 構成を使い、Landlock の無効化や ABI 検査の緩和を行わないでください。上記は完全なインストール、実際のベンダー CLI、完全な移行、更新復旧の検証ではありません。
 
-`getent`、`id`、`useradd`、util-linux、systemd ツール、curl などの信頼できるシステムツールが必要です。社員の loop ストレージには ext4 または XFS、対応する非 thin provisioning の下位デバイス構成、社員のクォータと TCB の予約容量が必要です。不明な構成や容量不足は準備完了を拒否します。外部 IAM／NSS は社員 UID 範囲を永続的に予約する必要があります。
+`getent`、`id`、`useradd`、util-linux、systemd ツール、curl などの信頼できるシステムツールが必要です。社員の loop ストレージには ext4 または XFS、対応する非 thin provisioning の下位デバイス構成、社員のクォータと TCB の予約容量が必要です。不明な構成や容量不足は準備完了を拒否します。`/etc/nsswitch.conf` の passwd 行と group 行に書けるのは `files` と `systemd` だけです（Ubuntu・Debian の既定値、および authselect の `minimal` プロファイルを使う RHEL／Fedora）。それ以外のモジュール（LDAP／SSSD の `sss`、Google Compute Engine OS Login の `oslogin`／`cache_oslogin`、`compat`、`[SUCCESS=merge]` のような角括弧のアクション句）を含むホストはサポート対象外で、準備完了を拒否します。こうしたモジュールは社員 UID 範囲にアカウントを持ち込む可能性があり、このリリースでは外部ディレクトリ側でその範囲を予約できないためです。
 
 ## 単一実行ファイルの保護サービス（現行版）
 
@@ -101,10 +101,16 @@ sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux [--version X.Y
 | サービス | Gateway、spawnd socket／service、egress socket／service、任意の DNS broker、更新サービス、parse socket／template、TCB／社員 slice |
 | セルフテスト用アカウント | `duduclaw-selftest`：隔離セルフテストが権限を下げて使うアカウント。他のサービスアカウントと同じシステム ID、ホームなし、ログイン不可、専用グループ、追加グループなし、ロック済み |
 | セルフテスト用ユニット | `/etc/systemd/system/duduclaw-isolation-selftest.service`。root:root 0644、同梱版と完全に同一でドロップインなし。`[Install]` がなく、インストーラーは有効化も起動もせず、spawnd が起動する |
+| SSH 拒否検査プログラム | `/usr/lib/duduclaw/duduclaw-isolation-probe`。root:root 0755、署名済みコンポーネント。特権のない隔離テスト用アカウント `duduclaw-selftest` で journal の読み取り権限（`systemd-journal` グループ）付きで実行し、root では決して実行しない。専用アカウントはない |
+| SSH 拒否検査ユニット | `/etc/systemd/system/duduclaw-isolation-probe@.service` テンプレート。root:root 0644、同梱版と完全に同一。`[Install]` がなく、インストーラーは有効化も起動もしない。社員アカウントと sshd ポートごとに 1 インスタンス（`duduclaw-isolation-probe@duduclaw-emp-<uid>.<port>.service`） |
 | 解析用 root | `/usr/lib/duduclaw/parse-root` と `/usr/lib/duduclaw/parse-root-tree`。root:root 0755、初期状態は空、ホストデータを置かない |
 | 署名済み状態 | Bootstrap の信頼、互換性のある世代、runtime 登録、更新スロット／状態、移行／準備完了の連携 |
 
 解析器は[インストール参考](../../../crates/duduclaw-parse-worker/README.md)に記載された既知の空マウントポイントを残す場合があります。予期しない内容は調査し、解析用 root を再帰的に削除しないでください。Spawnd が社員の SSH、cron、at、user manager を封鎖し、ホストの実効状態を検証します。検査に通すために制御を緩和しないでください。
+
+`/usr/sbin/sshd` がインストールされているホストでは、各社員アカウントの SSH が拒否されることを spawnd 自身が証明します。インストーラーの受領記録（レシート）は使いません。spawnd はまずそのアカウントに実際に適用される sshd 設定を自分で確認し、次にそのアカウントと sshd ポート用の SSH 拒否検査ユニットを systemd 経由で起動します。検査プログラムは特権のない隔離テスト用アカウント `duduclaw-selftest`（journal の読み取り権限付き）で動作し、その社員アカウントで稼働中の sshd に対して実際の公開鍵ログインとポート転送を 1 回ずつ試みます。どちらも `DenyUsers duduclaw-emp-*` ルールで拒否され、sshd 自身の journal 記録で確認できる必要があります。アカウントがログインできると判定するのは、検査プログラムの鍵を受け入れたことを sshd 自身が記録した場合だけです。sshd が記録していない成功（たとえば SSH ポートで別のプログラムが応答した場合）は判定不能として扱います。この証明はメモリ上にのみ保持され、sshd の再起動、そのアカウントに実際に適用される sshd 設定、アカウント、インストール済みの検査プログラムやそのユニット、署名済み世代、起動のいずれかが変わったとき、spawnd の再起動のたび、そしていずれにせよ少なくとも 6 時間ごと（spawnd が systemd 経由で稼働中の sshd を識別できない場合は 10 分ごと）に証明し直されます。更新は古い証明の期限が切れる前に始まるため、正常なホストでは空白期間が生じません。ある社員の証明が届くまでは、その社員だけが実行できない状態（not ready）になり、他の社員には影響しません。新しい社員の作成は証明を待ちません。最初の証明が進行している間、作成は「保留中」と応答します（現在の gateway では適用ステップの失敗として表示されます）。spawnd が動いている間に少し後で同じ作成を再試行すると結果が反映されます（spawnd を再起動すると未完了のアカウントは廃止され、作成を提案し直す必要があります）。保留中にできる新しい社員は同時に 4 人までで、そのうち 1 人の結果が出るまでそれ以上の作成は拒否されます。証明でそのアカウントがログインできると判明した場合、そのアカウントは恒久的に廃止されます。
+
+sshd のあるホストには `/usr/bin/ssh`、`/usr/bin/ssh-keygen`、`/usr/bin/journalctl`、`duduclaw-selftest` アカウント（インストーラーが作成）と `systemd-journal` グループも必要で、sshd は 127.0.0.1（設定の最初の `Port`）で待ち受け、ログを systemd journal に出力している必要があります。`UsePAM no` の sshd はサポート対象外です。その場合 sshd は `DenyUsers` を適用する前に期限切れの社員アカウントとして拒否するため、検査は拒否を確認できず、その社員は準備完了になりません。sshd のないホストではこの検査を省略します。
 
 インストーラーは固定パスの完全なコンポーネント群を検証してから、アカウント、ディレクトリ、unit を準備します。Linux 配布物には固定更新ランチャーも含まれ、オフラインツールは署名済み情報とファイルから bootstrap inbox を作成できます。独立に認証された `duduclaw-updated --bootstrap-stage` は、コンパイル時の root 指紋、root 閾値署名、target 署名、全ファイルのハッシュを検証し、**未有効化の世代**を配置します。`current` の選択、trust／state／slots の作成、旧版移行の二重署名検証、サービス有効化は行いません。完全な新規導入の手順はまだ提供していません。
 
@@ -186,7 +192,7 @@ sudo journalctl -u duduclaw-gateway.service -u duduclaw-spawnd.service -u duducl
 | --- | --- |
 | `UnsupportedKernel` | 起動 kernel と Landlock ABI を確認。ABI 8／kernel 7.0 は現在拒否するため、検査を維持する。 |
 | 準備情報が欠落、古い、非互換 | 完全な世代、プロトコル、アカウント登録、全サービスを確認。`active` だけでは不十分。 |
-| UID／アカウント／SSH／IAM 失敗 | 予約範囲の衝突、別名、補助グループ、ログイン／cron／at、linger を解決。外部 IAM の予約には管理者の証跡が必要。 |
+| UID／アカウント／SSH／IAM 失敗 | 予約範囲の衝突、別名、補助グループ、ログイン／cron／at、linger を解決。passwd や group に `files`／`systemd` 以外の NSS モジュール（SSSD や GCE OS Login など）を使う構成はサポート対象外。sshd のあるホストで特定の社員が準備完了にならない場合：journal の `SSH denial probe duduclaw-emp-<uid>: …` と `journalctl -u 'duduclaw-isolation-probe@*'` を確認。`DenyUsers` のドロップイン設定は削除しないこと。 |
 | ストレージ／クォータ失敗 | 下位デバイス構成、強制クォータ、空き容量、ホスト予約容量を確認。ディスク使用量ポーリングで代替しない。 |
 | DNS／egress 失敗 | root が選んだ resolved Varlink／DNS broker 経路を確認。egress に私設 resolver IP の例外を追加しない。DNS の準備状態（`host_dns_route_unverified`）はインストーラーのレシートではなく spawnd 自身のライブ検査です。spawnd は約 1 分ごとに、署名済みポリシーの `dns_probe_name` をその経路で解決するよう egress に依頼し、公開アドレスが 1 つ以上得られた場合のみ合格とします。署名済みポリシーが v4 より古い場合、egress が動いていない場合、このホストからその名前を解決できない場合は未検証のままです（外向き DNS と egress ジャーナルの `dns_probe` 行を確認）。 |
 | 解析 root 失敗 | 両 root の所有者、モード、予期しない内容を調査。ホスト `/etc` やデータをコピーしない。 |

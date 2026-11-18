@@ -1157,6 +1157,50 @@ fn update_unit_isolation_selftest_matches_the_trampoline_constants() {
         || line.starts_with("After=") || line.starts_with("Delegate=") || line.starts_with("DeviceAllow=")));
 }
 
+/// R7c: the SSH denial probe template unit runs exactly the shipped artifact
+/// with the instance name (`<account>.<port>`), UNPRIVILEGED as the isolation
+/// test account with the journal group and no capabilities, loopback-only,
+/// with no RestrictSUIDSGID line, and nothing that enables it.
+#[test]
+fn update_unit_isolation_probe_template_matches_the_probe_constants() {
+    use crate::systemd::{parse_run_unit, ISOLATION_PROBE_UNIT_TEXT, PROBE_EXECUTABLE};
+    use duduclaw_isolation::ids::{ISOLATION_PROBE_UNIT_PREFIX, ISOLATION_PROBE_UNIT_TEMPLATE, PROBE_JOURNAL_GROUP, SELFTEST_USER};
+    const PROBE_UNIT: &str = include_str!("../../../scripts/linux-protected/spawnd/duduclaw-isolation-probe@.service");
+    assert_eq!(PROBE_UNIT, ISOLATION_PROBE_UNIT_TEXT);
+    assert_eq!(ISOLATION_PROBE_UNIT_TEMPLATE, format!("{ISOLATION_PROBE_UNIT_PREFIX}.service"));
+    assert!(parse_run_unit(ISOLATION_PROBE_UNIT_TEMPLATE).is_none());
+    assert!(parse_run_unit(&format!("{ISOLATION_PROBE_UNIT_PREFIX}duduclaw-emp-70000.22.service")).is_none());
+    let artifact = artifact_name(&InstallTarget::IsolationProbe).unwrap();
+    assert_eq!(PROBE_EXECUTABLE, format!("/usr/lib/duduclaw/{artifact}"));
+    let lines = directives(PROBE_UNIT);
+    let exec: Vec<&&str> = lines.iter().filter(|line| line.starts_with("ExecStart")).collect();
+    assert_eq!(exec, [&format!("ExecStart={PROBE_EXECUTABLE} %i").as_str()]);
+    for expected in ["Type=oneshot", "RemainAfterExit=no", "Slice=duduclaw-tcb.slice", "TimeoutStartSec=30",
+        "KillMode=control-group", "CapabilityBoundingSet=", "AmbientCapabilities=", "NoNewPrivileges=yes",
+        "ProtectSystem=strict", "ProtectHome=yes", "PrivateTmp=yes", "PrivateDevices=yes", "ProtectKernelTunables=yes",
+        "ProtectKernelModules=yes", "ProtectKernelLogs=yes", "ProtectControlGroups=yes", "LockPersonality=yes",
+        "SystemCallArchitectures=native", "RestrictNamespaces=yes", "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+        "IPAddressDeny=any", "IPAddressAllow=localhost", "UMask=0077", "LimitCORE=0", "TasksMax=32", "MemoryMax=256M",
+        "Environment=", "StandardInput=null", "StandardOutput=journal", "StandardError=journal"] {
+        assert_eq!(lines.iter().filter(|line| **line == expected).count(), 1, "{expected}");
+    }
+    // F3: an explicit non-root identity with journal read access, one line each.
+    for expected in [format!("User={SELFTEST_USER}"), format!("Group={SELFTEST_USER}"),
+        format!("SupplementaryGroups={PROBE_JOURNAL_GROUP}")] {
+        assert_eq!(lines.iter().filter(|line| **line == expected).count(), 1, "{expected}");
+    }
+    for key in ["User", "Group", "SupplementaryGroups"] {
+        assert_eq!(lines.iter().filter(|line| line.starts_with(&format!("{key}="))).count(), 1, "{key}");
+    }
+    // Measured on systemd 255 (see the unit comment): no RestrictSUIDSGID=.
+    assert!(!lines.iter().any(|line| line.starts_with("RestrictSUIDSGID=")));
+    assert!(!PROBE_UNIT.lines().any(|line| line == "[Install]"));
+    assert!(!lines.iter().any(|line| line.starts_with("Restart=") || line.starts_with("RemainAfterExit=yes")
+        || line.starts_with("ReadWritePaths=") || line.starts_with("DynamicUser=") || line.starts_with("Wants=")
+        || line.starts_with("Requires=") || line.starts_with("BindsTo=") || line.starts_with("PrivateNetwork=")
+        || line.starts_with("CapabilityBoundingSet=CAP") || line.starts_with("AmbientCapabilities=CAP")));
+}
+
 #[test]
 fn update_units_reaching_openat2_set_no_restrict_suid_sgid() {
     // R7g (systemd 255): under RestrictSUIDSGID= systemd's filter answers ENOSYS
@@ -1906,7 +1950,7 @@ fn manifest_with(artifacts: Vec<ReleaseArtifact>) -> ReleaseManifest {
 }
 fn all_targets() -> Vec<InstallTarget> {
     vec![InstallTarget::Gateway, InstallTarget::Spawnd, InstallTarget::Trampoline, InstallTarget::TrampolineSelftest,
-        InstallTarget::Egress,
+        InstallTarget::IsolationProbe, InstallTarget::Egress,
         InstallTarget::EgressForwarder, InstallTarget::McpBridge, InstallTarget::ParseWorker, InstallTarget::Importer,
         InstallTarget::Migration, InstallTarget::UpdateSlot]
 }
@@ -1923,8 +1967,9 @@ fn update_readback_reports_only_spawnd_side_components_and_never_guesses() {
     let manifest = fixed_manifest();
     let trampoline = manifest.artifacts.iter().find(|a| a.install_target == InstallTarget::Trampoline).unwrap().sha256;
     let selftest = manifest.artifacts.iter().find(|a| a.install_target == InstallTarget::TrampolineSelftest).unwrap().sha256;
+    let probe = manifest.artifacts.iter().find(|a| a.install_target == InstallTarget::IsolationProbe).unwrap().sha256;
     let observed = |own_image, live, euid, trampoline| Observed { own_image, live, euid, trampoline,
-        trampoline_selftest: Some(selftest) };
+        trampoline_selftest: Some(selftest), isolation_probe: Some(probe) };
     let reports = components(&manifest, observed(Some(digest(42)), true, 0, Some(trampoline)));
     assert_eq!(reports.len(), manifest.artifacts.len() - 3);
     assert!(!reports.iter().any(|r| matches!(r.target, InstallTarget::Gateway | InstallTarget::Egress | InstallTarget::UpdateSlot)));
@@ -1960,13 +2005,27 @@ fn update_readback_reports_only_spawnd_side_components_and_never_guesses() {
         (selftest, manifest.version, 0, manifest.protocols.trampoline));
     assert_eq!(check.artifact_id, "duduclaw-run-selftest");
     let with_selftest = |value| Observed { own_image: Some(digest(42)), live: true, euid: 0, trampoline: Some(trampoline),
-        trampoline_selftest: value };
+        trampoline_selftest: value, isolation_probe: Some(probe) };
     for value in [None, Some(digest(9))] {
         let reports = components(&manifest, with_selftest(value));
         assert!(!find(&reports, InstallTarget::TrampolineSelftest).ready);
         assert!(find(&reports, InstallTarget::Trampoline).ready);
     }
     assert!(!find(&unprivileged, InstallTarget::TrampolineSelftest).ready);
+    // R7c: the SSH denial probe is read back by the same rule, with spawnd's protocol.
+    let check = find(&reports, InstallTarget::IsolationProbe);
+    assert!(check.ready);
+    assert_eq!((check.build_sha256, check.version, check.effective_uid, check.protocol),
+        (probe, manifest.version, 0, manifest.protocols.spawnd));
+    assert_eq!(check.artifact_id, "duduclaw-isolation-probe");
+    let with_probe = |value| Observed { own_image: Some(digest(42)), live: true, euid: 0, trampoline: Some(trampoline),
+        trampoline_selftest: Some(selftest), isolation_probe: value };
+    for value in [None, Some(digest(9))] {
+        let reports = components(&manifest, with_probe(value));
+        assert!(!find(&reports, InstallTarget::IsolationProbe).ready);
+        assert!(find(&reports, InstallTarget::TrampolineSelftest).ready);
+    }
+    assert!(!find(&unprivileged, InstallTarget::IsolationProbe).ready);
 }
 
 #[test]
@@ -1975,7 +2034,7 @@ fn update_publication_matches_the_installed_layout() {
         .map(|(target, directory)| format!("/{directory}/{}", artifact_name(target).unwrap())).collect();
     assert_eq!(published, [
         "/usr/lib/duduclaw/duduclaw-spawnd", "/usr/lib/duduclaw/duduclaw-run", "/usr/lib/duduclaw/duduclaw-run-selftest",
-        "/usr/libexec/duduclaw/duduclaw-parse-worker",
+        "/usr/lib/duduclaw/duduclaw-isolation-probe", "/usr/libexec/duduclaw/duduclaw-parse-worker",
         "/usr/lib/duduclaw/current/duduclaw-import", "/usr/lib/duduclaw/current/duduclaw-migrate",
         "/usr/lib/duduclaw/current/duduclaw-mcp-bridge", "/opt/duduclaw/bin/duduclaw-egress", "/opt/duduclaw/bin/duduclaw"]);
 }

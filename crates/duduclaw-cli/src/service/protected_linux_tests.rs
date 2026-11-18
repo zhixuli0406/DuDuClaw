@@ -92,6 +92,23 @@ fn service_protected_selftest_account_unit_and_binary_are_in_the_layout() {
     assert!(super::lifecycle::owned_unit(ISOLATION_SELFTEST_UNIT));
 }
 
+/// R7c: the SSH denial probe runs as root (no account of its own); its template
+/// unit and binary are in the layout, the install facts and the uninstall
+/// inventory, and the lifecycle's literal instance prefix is the shared constant.
+#[test]
+fn service_protected_isolation_probe_unit_and_binary_are_in_the_layout() {
+    use duduclaw_isolation::ids::{ISOLATION_PROBE_UNIT_PREFIX, ISOLATION_PROBE_UNIT_TEMPLATE};
+    assert_eq!(super::layout::UNITS.iter().filter(|(name, _)| *name == ISOLATION_PROBE_UNIT_TEMPLATE).count(), 1);
+    assert!(super::layout::BINARIES.contains(&"/usr/lib/duduclaw/duduclaw-isolation-probe"));
+    assert!(!super::layout::ACCOUNTS.iter().any(|name| name.contains("probe")));
+    let facts = duduclaw_core::isolation_install::FACTS;
+    assert!(facts.contains(&"/etc/systemd/system/duduclaw-isolation-probe@.service"));
+    assert!(facts.contains(&"/usr/lib/duduclaw/duduclaw-isolation-probe"));
+    assert!(super::lifecycle::owned_unit(ISOLATION_PROBE_UNIT_TEMPLATE));
+    assert!(super::lifecycle::owned_unit(&format!("{ISOLATION_PROBE_UNIT_PREFIX}duduclaw-emp-70000.service")));
+    assert_eq!(ISOLATION_PROBE_UNIT_PREFIX, "duduclaw-isolation-probe@");
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn service_protected_isolation_install_manifest_matches_migration() {

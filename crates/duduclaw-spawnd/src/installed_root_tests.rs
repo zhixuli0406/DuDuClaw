@@ -2,7 +2,7 @@
 //! records, accounts, or run receipts are manufactured by these tests.
 use super::*;
 use duduclaw_mcp_boundary::config::{RuntimeBridgeRegistry, runtime_projection, prepare_runtime_bridge};
-use crate::{accounts::{InstallationEvidence, LinuxAccounts}, registry::AccountHost};
+use crate::{accounts::LinuxAccounts, registry::AccountHost};
 
 fn require_disposable_root() {
     assert_eq!(std::env::var("DUDUCLAW_ISO_DISPOSABLE").as_deref(), Ok("1"),
@@ -72,24 +72,30 @@ fn iso_root_e2e_installed_publication_signed_policy_and_gateway_consumer() {
 }
 
 #[test]
-#[ignore = "iso_root_: installed disposable Linux TEAM VM with continuously renewed real install receipts; publication layer only"]
+#[ignore = "iso_root_: installed disposable Linux TEAM VM (files/systemd NSS only, the signed probe binary and template unit installed); publication layer only"]
 fn iso_root_e2e_installed_publication_live_install_evidence() {
     let b = installed_bundle();
-    let install = receipt().expect("fresh boot/generation-bound root install measurements");
-    assert_eq!(install.generation, b.generation);
     let registry: crate::registry::Registry = read(ROOT, "registry.json").expect("actual root account registry");
-    let evidence = InstalledEvidence;
-    let mut accounts = LinuxAccounts { evidence: &evidence };
-    registry.verify(&mut accounts).expect("current NSS, account lock, scheduler, SSH and process readback");
+    // R7c: no receipt. SSH denial comes from the probe unit through PID 1
+    // (this process's own worker); external NSS is refused outright.
+    let evidence = crate::ssh_evidence::installed();
+    let mut accounts = LinuxAccounts::background(&evidence);
+    registry.verify(&mut accounts).expect("current NSS, account lock, scheduler, sshd configuration and process readback");
     assert!(!b.host.entitlements.is_empty(), "confirmed employee required");
     for entitlement in &b.host.entitlements {
         let account = registry.lookup(entitlement.employee).expect("entitlement must have a ready permanent UID");
-        accounts.verify_locked(account).expect("live account lockdown readback");
-        evidence.ssh_public_key_and_forwarding_denied(&crate::registry::account_name(account.uid))
-            .expect("root harness's real positive/negative SSH observations");
-    }
-    if let Some(range) = install.external_nss_range {
-        evidence.external_nss_range_reserved_and_enumerable(range).expect("external IAM reservation evidence");
+        // Allocation never waits for the probe (`login_denied` returns
+        // pending at once); this test polls it, bounded, as a gateway retry would.
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(2 * crate::ssh_evidence::UNIT_DEADLINE_MS + 5_000);
+        loop {
+            match LinuxAccounts::admission(&evidence).login_denied(account) {
+                Ok(()) => break,
+                Err(error) if crate::accounts::probe_unresolved(&error) && std::time::Instant::now() < until =>
+                    std::thread::sleep(std::time::Duration::from_millis(500)),
+                Err(error) => panic!("the probe unit did not prove public-key login and forwarding denied for this account: {error}"),
+            }
+        }
+        LinuxAccounts::admission(&evidence).verify_locked(account).expect("live account lockdown and SSH denial readback");
     }
     // R7a: the trampoline facts come from spawnd's own self-test through PID 1.
     let mut selftest = crate::selftest::SelfTest::default();

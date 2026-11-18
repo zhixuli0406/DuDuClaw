@@ -3734,7 +3734,7 @@ enum ServiceCommands {
         /// Public address of this host that is on no interface (cloud 1:1 NAT); repeatable
         #[arg(long)]
         host_public_address: Vec<std::net::IpAddr>,
-        /// Start the gateway after the install
+        /// Accepted for compatibility; no effect (the install always leaves the gateway running)
         #[arg(long)]
         enable_now: bool,
     },

@@ -13,7 +13,9 @@ pub(super) fn owned_unit(name: &str) -> bool {
             return id.len() == 32 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
         }
     }
-    for prefix in ["duduclaw-parse@", "duduclaw-import@", "duduclaw-migrate-expire@"] {
+    // `duduclaw-isolation-probe@` is `duduclaw_isolation::ids::ISOLATION_PROBE_UNIT_PREFIX`
+    // (R7c; a literal: this module stays std-only; equality is tested in protected_linux_tests.rs).
+    for prefix in ["duduclaw-parse@", "duduclaw-import@", "duduclaw-migrate-expire@", "duduclaw-isolation-probe@"] {
         if let Some(instance) = name.strip_prefix(prefix).and_then(|s| s.strip_suffix(".service").or_else(|| s.strip_suffix(".timer"))) {
             return !instance.is_empty() && instance.len() <= 128
                 && instance.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b));
@@ -178,6 +180,12 @@ mod tests {
         // R7a: a loaded self-test unit is inventoried (fenced, stopped, removed), never refused as unknown.
         assert!(owned_unit("duduclaw-isolation-selftest.service"));
         assert_eq!(inventory("duduclaw-isolation-selftest.service static\n").unwrap().len(), 1);
+        // R7c: the probe template file and its per-account instances are owned too.
+        assert!(owned_unit("duduclaw-isolation-probe@.service"));
+        assert!(owned_unit("duduclaw-isolation-probe@duduclaw-emp-70000.service"));
+        assert_eq!(inventory("duduclaw-isolation-probe@.service static\n\
+            duduclaw-isolation-probe@duduclaw-emp-70000.service static\n").unwrap().len(), 2);
+        assert!(!owned_unit("duduclaw-isolation-probe@../x.service"));
         for name in ["--help", "duduclaw-run-x.service", "duduclaw-parse@../x.service",
             "duduclaw-gateway.service.evil", "duduclaw-other.service"] { assert!(!owned_unit(name)); }
         assert!(inventory("duduclaw-other.service enabled\n").is_err());

@@ -149,6 +149,67 @@ so no run inventory counts it.
 The protected installer installs this unit at `/etc/systemd/system/` (root:root 0644, exactly these bytes) before spawnd starts, and never enables or starts it.
 The protected installer creates the `duduclaw-selftest` system account (no login, no home, own group, no supplementary groups) before spawnd starts.
 
+`duduclaw-isolation-probe@.service` (R7c; template, oneshot,
+`RemainAfterExit=no`, no `[Install]`) runs
+`/usr/lib/duduclaw/duduclaw-isolation-probe %i` for one employee account and
+sshd port (`duduclaw-isolation-probe@duduclaw-emp-<uid>.<port>.service`;
+spawnd takes the port from its own `sshd -T` after that output already denies
+the account) UNPRIVILEGED as the isolation test account: `User=` and
+`Group=duduclaw-selftest`, `SupplementaryGroups=systemd-journal` (read access
+to sshd's journal records), in `duduclaw-tcb.slice`, with an empty
+`CapabilityBoundingSet=`, `IPAddressDeny=any` + `IPAddressAllow=localhost`,
+`TimeoutStartSec=30` and stdout/stderr to the journal. A hostile peer that
+exploits an ssh client bug therefore gets no root file or socket authority.
+Like the self-test it sets no `RestrictSUIDSGID=` (measured on systemd 255);
+the systemd 255 fact that made the self-test leave `User=` unset concerns an
+explicit `User=root` only. The probe refuses to run as root. It proves
+against the live sshd that a real public-key login and a real `-N -R`
+forwarding session as the account are refused: the ssh client (fresh,
+never-authorised ed25519 key; this binary as `ProxyCommand=… --relay`, so the
+source port is known) must exit 255 with `Permission denied (publickey).`, and
+the journal must hold sshd's (`sshd`, `sshd-session` or `sshd-auth`) root
+record, from the session of that source port (same `_PID` as a record carrying
+the port), saying the account is listed in `DenyUsers`. "NOT denied" needs
+sshd's own root `Accepted publickey for <account> from 127.0.0.1 port <source
+port> ssh2: ED25519 <fingerprint>` record for this run's key (fingerprint from
+`ssh-keygen -l`); a client that got in without it is only "unverified". Pass:
+exit 0 and one JSON line `{"version":1,"account":"…","port":N,"result":"denied"}`.
+Failure: `{"code":"ssh_probe_failed","stage":"<name>"}` and the stage's exit
+code (shared table `crates/duduclaw-isolation/src/probe_exit.rs`; 5 and 7
+belonged to stages the root probe had and are never reused):
+
+| Code | Stage | Meaning |
+|---|---|---|
+| 2 | `usage` | argv is not `<account>.<port>` (employee name rule, one `.`, port 1..=65535 without leading zero) or `--relay <src> <dst>` |
+| 3 | `identity` | running as root, or no single `/etc/passwd` row in the employee uid range |
+| 4 | `tools` | ssh, ssh-keygen, journalctl or the probe itself not a root-owned, non group/other-writable file |
+| 6 | `workspace` | private 0700 directory under the unit's `/tmp` |
+| 8 | `keygen` | ephemeral key generation or its `ssh-keygen -l` fingerprint |
+| 9 / 12 | `login_inconclusive` / `forward_inconclusive` | neither refused nor accepted (connection refused, timeout, tool error) |
+| 10 / 13 | `login_not_denied` / `forward_not_denied` | the account is reachable: client exit 0 (or the `-N` session stayed connected) AND sshd's matching root `Accepted publickey` record |
+| 11 / 14 | `login_journal` / `forward_journal` | client refused, but no matching sshd DenyUsers journal record |
+| 15 | `deadline` | the probe's 25 s deadline expired |
+| 16 | `output` | the result line could not be written |
+| 17 | `relay` | `--relay` mode only |
+| 18 / 19 | `login_unverified` / `forward_unverified` | client exit 0 (or still connected) WITHOUT sshd's Accepted record (inconclusive) |
+
+Host prerequisites where `/usr/sbin/sshd` exists: `/usr/bin/ssh`,
+`/usr/bin/ssh-keygen`, `/usr/bin/journalctl`, the `duduclaw-selftest` account
+and the `systemd-journal` group, sshd listening on 127.0.0.1 at the first
+`Port` of its effective configuration, and sshd logging to the journal.
+Hosts without sshd skip SSH checks entirely (spawnd never starts the unit
+there). The protected installer
+installs the template at `/etc/systemd/system/` (root:root 0644, exactly these
+bytes) and never enables or starts it; rollback stops any running instance and
+removes the file. No account is created for it (it reuses `duduclaw-selftest`).
+Spawnd starts one instance per employee account through PID 1
+(`Systemd::run_fixed_unit`, R7c part 2) and maps the exit code with
+`duduclaw_isolation::probe_exit`; results are re-proven when sshd restarts and
+at least every 6 hours, and allocation answers "pending" while the first proof
+runs; see the spawnd README, "R7c: SSH denial from spawnd's own probe through
+PID 1". sshd with `UsePAM no` is unsupported (sshd reports the expired account
+before `DenyUsers`).
+
 The native Linux service lifecycle and D-Bus fd handoff require root VM testing
 on systemd 249, 252 and 255. No installation or activation has been performed by
 this implementation change.

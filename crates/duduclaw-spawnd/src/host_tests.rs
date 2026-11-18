@@ -78,3 +78,71 @@ fn cancelling_a_queued_start_sets_the_same_fence_given_to_trampoline() {
     reader.register(RunHandle(RunId([3; 16])), employee, 1000).unwrap();
     assert!(b2_fence.load(Ordering::Acquire));
 }
+/// C2 fake of `Core::retry_reconcile`: the updater is asked first (an absent
+/// one answers like `MissingPublication::anchors`, generation unavailable);
+/// only then do the reconciliation's side effects run.
+struct FakeStartup { updater_answers: bool, attempts: u32, side_effects: u32 }
+impl FakeStartup {
+    fn new() -> Self { Self { updater_answers: false, attempts: 0, side_effects: 0 } }
+    fn attempt(&mut self) -> bool {
+        self.attempts += 1;
+        let updater = if self.updater_answers { Ok(()) } else { MissingPublication.anchors().map(|_| ()) };
+        if updater.is_err() { return false; }
+        self.side_effects += 1;
+        true
+    }
+}
+#[test]
+fn startup_reconciliation_retries_until_the_updater_answers_then_latches() {
+    let t0 = Instant::now();
+    let mut fake = FakeStartup::new();
+    // `LinuxHost::open`: the first attempt fails, the generation is unavailable.
+    let mut startup = StartupReconcile::opened(t0, fake.attempt());
+    assert!(!startup.latched);
+    assert_eq!((fake.attempts, fake.side_effects), (1, 0), "no side effect before the updater answers");
+    assert!(!startup.retry(t0 + STARTUP_RETRY, false, || fake.attempt()));
+    assert_eq!((fake.attempts, fake.side_effects), (2, 0));
+    fake.updater_answers = true;
+    assert!(startup.retry(t0 + STARTUP_RETRY * 2, false, || fake.attempt()), "this call latched success");
+    assert!(startup.latched);
+    assert_eq!((fake.attempts, fake.side_effects), (3, 1));
+    // Latched: never run again, however much time passes.
+    for seconds in [3, 10, 3600] {
+        assert!(!startup.retry(t0 + Duration::from_secs(seconds), false, || fake.attempt()));
+    }
+    assert_eq!((fake.attempts, fake.side_effects), (3, 1));
+    assert!(startup.latched);
+    // A success at start-up is never repeated either.
+    let mut opened = StartupReconcile::opened(t0, true);
+    assert!(!opened.retry(t0 + Duration::from_secs(60), false, || fake.attempt()));
+    assert_eq!(fake.attempts, 3);
+}
+#[test]
+fn poisoned_core_never_retries_startup_reconciliation() {
+    let t0 = Instant::now();
+    let mut fake = FakeStartup::new();
+    fake.updater_answers = true;
+    let mut startup = StartupReconcile::opened(t0, false);
+    for seconds in [2, 4, 60, 3600] {
+        assert!(!startup.due(t0 + Duration::from_secs(seconds), true));
+        assert!(!startup.retry(t0 + Duration::from_secs(seconds), true, || fake.attempt()));
+    }
+    assert_eq!(fake.attempts, 0, "a poisoned core does not recover by retry");
+    assert!(!startup.latched);
+}
+#[test]
+fn startup_retry_cadence_is_bounded() {
+    let t0 = Instant::now();
+    let mut fake = FakeStartup::new();
+    let mut startup = StartupReconcile::opened(t0, false);
+    // A refresh every 250 ms for 10 s: one attempt per `STARTUP_RETRY`.
+    for tick in 1..=40u32 {
+        startup.retry(t0 + Duration::from_millis(250) * tick, false, || fake.attempt());
+    }
+    assert_eq!(STARTUP_RETRY, Duration::from_secs(2));
+    assert_eq!(fake.attempts, 5, "attempts at 2, 4, 6, 8 and 10 s");
+    assert!(!startup.due(t0 + Duration::from_millis(11_999), false));
+    assert!(startup.due(t0 + Duration::from_secs(12), false));
+    // A clock that reads earlier than the last attempt never makes one due.
+    assert!(!StartupReconcile::opened(t0 + Duration::from_secs(5), false).due(t0, false));
+}

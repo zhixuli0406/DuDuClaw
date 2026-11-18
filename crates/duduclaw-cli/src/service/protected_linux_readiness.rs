@@ -303,6 +303,7 @@ pub(super) fn component_target(path: &str) -> Option<InstallTarget> {
         "/usr/lib/duduclaw/duduclaw-spawnd" => InstallTarget::Spawnd,
         "/usr/lib/duduclaw/duduclaw-run" => InstallTarget::Trampoline,
         "/usr/lib/duduclaw/duduclaw-run-selftest" => InstallTarget::TrampolineSelftest,
+        "/usr/lib/duduclaw/duduclaw-isolation-probe" => InstallTarget::IsolationProbe,
         "/opt/duduclaw/bin/duduclaw-egress" => InstallTarget::Egress,
         "/usr/libexec/duduclaw/duduclaw-parse-worker" => InstallTarget::ParseWorker,
         "/usr/lib/duduclaw/current/duduclaw-import" => InstallTarget::Importer,
@@ -388,6 +389,17 @@ fn host_checks(checks: &HostChecks) -> [(bool, &'static str, &'static str); 13] 
         (checks.startup_reconciled, "host_startup_unreconciled", "啟動時的執行紀錄對帳尚未完成。"),
         (checks.process_scan_verified, "host_process_scan_unverified", "員工程序掃描未通過。"),
     ]
+}
+
+/// The administrator text of every primary check `checks` still reports
+/// false, in the composite's wording ([`host_checks`], and #5's Landlock and
+/// the protocol line). Used by the bootstrap's S6 refusal (C4).
+pub(super) fn unmet_host_checks(checks: &HostChecks) -> Vec<&'static str> {
+    let mut unmet = Vec::new();
+    if checks.protocol != duduclaw_isolation::ipc::PROTOCOL_VERSION { unmet.push(MSG_HOST_PROTOCOL); }
+    unmet.extend(host_checks(checks).into_iter().filter(|(passed, _, _)| !passed).map(|(_, _, message)| message));
+    if !checks.landlock_self_test { unmet.push(MSG_LANDLOCK); }
+    unmet
 }
 
 // #4 and #5. Returns the evidence for #6's informational second layer.
@@ -931,15 +943,24 @@ fn units() -> Result<()> {
 }
 
 /// Every layout unit file as installed, and every isolation service active;
-/// the gateway unit is not part of it (it starts after the platform is ready).
+/// the gateway unit is not part of it (the bootstrap starts it at S6 and
+/// enables it at S8, after this check).
 /// The R7a self-test unit's bytes are checked with the others, but it is never
 /// required active (a `RemainAfterExit=no` oneshot spawnd starts; inactive after its run).
+/// The DNS broker unit must be the text generated for the upstream the
+/// root-owned broker config records (the shipped text when there is none).
 fn platform_units() -> Result<()> {
+    let upstream = recorded_broker_upstream()?;
     for (name, expected) in layout::UNITS {
         let path = Path::new("/etc/systemd/system").join(name);
         parents(&path)?;
         trusted(&path, false)?;
-        if fs::symlink_metadata(&path)?.mode() & 0o7777 != 0o644 || fs::read_to_string(&path)? != *expected {
+        if fs::symlink_metadata(&path)?.mode() & 0o7777 != 0o644 {
+            return Err(refused("隔離服務單元與安裝版本不符。"));
+        }
+        if *name == layout::DNS_BROKER_UNIT {
+            layout::dns_broker_unit_check(&fs::read(&path)?, upstream).map_err(refused)?;
+        } else if fs::read_to_string(&path)? != *expected {
             return Err(refused("隔離服務單元與安裝版本不符。"));
         }
     }
@@ -950,9 +971,27 @@ fn platform_units() -> Result<()> {
     Ok(())
 }
 
+/// This install's DNS broker upstream: `None` without the broker config (the
+/// resolved route), else the config's upstream through the broker's own
+/// reader and validator.
+fn recorded_broker_upstream() -> Result<Option<std::net::SocketAddr>> {
+    use duduclaw_egress::daemon::{read_root_config, BrokerConfig, BROKER_CONFIG_PATH};
+    if absent(BROKER_CONFIG_PATH)? { return Ok(None); }
+    let config: BrokerConfig = read_root_config(BROKER_CONFIG_PATH).map_err(|_| refused("DNS 轉送服務設定讀回失敗。"))?;
+    config.validate().map_err(|_| refused("DNS 轉送服務設定讀回失敗。"))?;
+    Ok(Some(config.upstream))
+}
+
+/// The broker unit's allow-rule mismatch is the one failure detail printed
+/// (`layout::dns_broker_unit_mismatch`: fixed wording naming the rule only).
+fn broker_unit_detail(result: &Result<()>) -> Option<String> {
+    let text = result.as_ref().err()?.to_string();
+    text.find(layout::DNS_BROKER_MISMATCH_HEAD).map(|start| text[start..].to_owned())
+}
+
 /// The bootstrap's step S7 (plan §4.3): the composite check before the
-/// gateway is started. Identical to [`check`] except that the gateway unit
-/// itself is not yet required to be active; every other group and every
+/// gateway is enabled. Identical to [`check`] except that the gateway unit
+/// itself is not required to be active; every other group and every
 /// composite item must pass. Prints the same fixed lines.
 pub(super) fn check_platform(composite: &mut impl CompositeReadiness) -> Result<()> {
     let results = [("執行檔", binaries()), ("服務帳號", accounts()),
@@ -961,12 +1000,13 @@ pub(super) fn check_platform(composite: &mut impl CompositeReadiness) -> Result<
     for (label, result) in results {
         if result.is_ok() { println!("[通過] {label}"); }
         else { failed += 1; println!("[未通過] {label}"); }
+        if let Some(detail) = broker_unit_detail(&result) { println!("  - {detail}"); }
     }
     let (lines, composite_failed, _) = render(&composite.assess());
     for line in lines { println!("{line}"); }
     failed += composite_failed;
     if failed != 0 {
-        return Err(refused(format!("{failed} 項就緒檢查未通過；尚未啟動 Gateway。修正後請再執行同一個安裝命令續接。")));
+        return Err(refused(format!("{failed} 項就緒檢查未通過；Gateway 尚未設為開機自動啟動。修正後請再執行同一個安裝命令續接。")));
     }
     Ok(())
 }
@@ -1014,6 +1054,7 @@ pub(super) fn check(composite: &mut impl CompositeReadiness) -> Result<()> {
     for (label, result) in results {
         if result.is_ok() { println!("[通過] {label}"); }
         else { failed += 1; println!("[未通過] {label}"); }
+        if let Some(detail) = broker_unit_detail(&result) { println!("  - {detail}"); }
     }
     let (lines, composite_failed, pending) = render(&composite.assess());
     for line in lines { println!("{line}"); }
