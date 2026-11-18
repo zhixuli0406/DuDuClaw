@@ -132,7 +132,7 @@ mod run_broker;
 #[cfg(target_os = "linux")]
 pub(crate) use run_broker::{readiness_feature_source, readiness_features, work_broker_installed};
 #[cfg(target_os = "linux")]
-pub(crate) use boot::a_producers_ready;
+pub(crate) use boot::{a_producers_ready, spawn_backend_retry};
 #[cfg(target_os = "linux")]
 pub(crate) use boot::control_recording;
 #[cfg(target_os = "linux")]

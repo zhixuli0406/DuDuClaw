@@ -120,7 +120,7 @@ sshd のあるホストには `/usr/bin/ssh`、`/usr/bin/ssh-keygen`、`/usr/bin
 
 インストーラーは固定パスの完全なコンポーネント群を検証してから、アカウント、ディレクトリ、unit を準備します。Linux 配布物には固定更新ランチャーも含まれ、オフラインツールは署名済み情報とファイルから bootstrap inbox を作成できます。独立に認証された `duduclaw-updated --bootstrap-stage` は、コンパイル時の root 指紋、root 閾値署名、target 署名、全ファイルのハッシュを検証し、**未有効化の世代**を配置します。`current` の選択、trust／state／slots の作成、旧版移行の二重署名検証、サービス有効化は行いません。完全な新規導入の手順はまだ提供していません。
 
-`sudo duduclaw service readiness --protected-linux`（`ops` は同じ入口の別名）は、実行ファイル、システムアカウント、ディレクトリ権限、unit 本文、systemd の実際の属性を読み取り専用で検査し、個別に報告します。I1 の総合検査アダプターは未接続のため、`MissingComposite` が必ず拒否し、社員実行を許可しません。カスタム DNS drop-in は未対応で unit 検査を拒否します。すでに新方式で管理される世代の再インストールは、この読み取り専用検査のみを行い、実行ファイルや unit を書き換えません。
+`sudo duduclaw service readiness --protected-linux`（`ops` は同じ入口の別名）は、実行ファイル、システムアカウント、ディレクトリ権限、unit 本文、systemd の実際の属性を読み取り専用で検査し、個別に報告します。失敗した各グループの下には、その理由も表示されます。I1 の総合検査アダプターは未接続のため、`MissingComposite` が必ず拒否し、社員実行を許可しません。カスタム DNS drop-in は未対応で unit 検査を拒否します。すでに新方式で管理される世代の再インストールは、この読み取り専用検査のみを行い、実行ファイルや unit を書き換えません。
 
 ## v1.79.3 からの移行
 
@@ -251,7 +251,7 @@ sudo sh /root/duduclaw-auto-upgrade/install.sh --uninstall
 
 **機能制限：** 保護されたネイティブモードでは、`InaccessiblePaths` でコンテナエンジンを遮断し、`PrivateDevices` でデバイスを隔離します。そのため、コンテナを使うタスクサンドボックス、コンピューター操作、ハードウェアに依存する機能は利用できません。AI 社員がコンテナエンジンにアクセスできないようにするための意図的な制限です。
 
-ランチャーは実行ファイルと全祖先ディレクトリ、自身の配置先が root 所有で他のユーザーに書き込みを許さないことを確認します。アカウントを検査して同 uid の残存プロセスを終了した後に鍵を開き、uid/gid を変更し、補助グループと全 capabilities を削除して `no_new_privs` を設定します。gateway は鍵を受け取る前に non-dumpable にし、systemd の親プロセス、正確な cgroup v2 行 `0::/system.slice/duduclaw-gateway.service`、実行ファイルとプロセスの権限、自身から鍵のパスを開けないことを検証します。ネイティブインストーラー、鍵を開く前のランチャー、Rust の検証はいずれも初期以外の user namespace を拒否します。`/run/.containerenv`、`/run/systemd/container`、PID 1 の環境内の `container=` も拒否理由です。root のインストーラーとランチャーは `/proc/1/environ` を読める必要があり、非特権 gateway は権限不足の場合だけその読み取りを省略できます。コンテナでは従来のコンテナ規則を適用し、モード変数でネイティブ保護を取得することはできません。
+ランチャーは実行ファイルと全祖先ディレクトリ、自身の配置先が root 所有で他のユーザーに書き込みを許さないことを確認します。アカウントを検査して同 uid の残存プロセスを終了した後に鍵を開き、uid/gid を変更し、補助グループと全 capabilities を削除して `no_new_privs` を設定します。gateway は鍵を受け取る前に non-dumpable にし、systemd の親プロセス、正確な cgroup v2 行（`0::/system.slice/duduclaw-gateway.service`、またはユニットが `Slice=duduclaw-tcb.slice` を持つ場合の `0::/duduclaw.slice/duduclaw-tcb.slice/duduclaw-gateway.service` のみ。隔離構成のユニットは後者）、実行ファイルとプロセスの権限、自身から鍵のパスを開けないことを検証します。ネイティブインストーラー、鍵を開く前のランチャー、Rust の検証はいずれも初期以外の user namespace を拒否します。`/run/.containerenv`、`/run/systemd/container`、PID 1 の環境内の `container=` も拒否理由です。root のインストーラーとランチャーは `/proc/1/environ` を読める必要があり、非特権 gateway は権限不足の場合だけその読み取りを省略できます。コンテナでは従来のコンテナ規則を適用し、モード変数でネイティブ保護を取得することはできません。
 
 既定の `revoke` ポリシーでは、既知の Docker／Podman／containerd ソケットは存在しないか、アクセス不能でなければなりません。書き込みアクセス検査と非ブロッキング接続の両方が拒否される必要があります。`DOCKER_HOST` は設定しないでください。独自 slice、cgroup v1／混在方式、想定外の sudo 出力、結果不明の検査はすべて拒否します。理由は journal または認証情報カードに表示されます。権限を緩めて回避しないでください。
 

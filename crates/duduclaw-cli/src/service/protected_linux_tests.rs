@@ -95,6 +95,34 @@ fn service_protected_isolation_install_facts_cover_layout() {
     assert!(unit_text().lines().any(|line| line == "Slice=duduclaw-tcb.slice"));
 }
 
+/// Defect 22: the isolated gateway unit's `Slice=` and the shipped slice units'
+/// nesting place the gateway exactly in the cgroup line the root-key
+/// attestation accepts (`root_key::GATEWAY_CGROUP_TCB_SLICE`), so the unit
+/// text and the attestation cannot drift apart. systemd derives a slice's
+/// parent from its name (`a-b.slice` under `a.slice`, `a.slice` under `-.slice`).
+#[test]
+fn service_protected_isolated_gateway_slice_matches_attested_cgroup() {
+    let isolated = duduclaw_core::root_key::recovery::isolated_unit_text();
+    let slices: Vec<&str> = isolated.lines().filter_map(|line| line.strip_prefix("Slice=")).collect();
+    assert_eq!(slices.len(), 1, "exactly one Slice= line");
+    let stem = slices[0].strip_suffix(".slice").expect("a slice unit");
+    let parts: Vec<&str> = stem.split('-').collect();
+    assert!(parts.iter().all(|part| !part.is_empty()), "{stem}");
+    let mut path = String::new();
+    for end in 1..=parts.len() {
+        let name = format!("{}.slice", parts[..end].join("-"));
+        let (_, text) = super::layout::UNITS.iter().find(|(unit, _)| *unit == name)
+            .unwrap_or_else(|| panic!("{name}: not a slice unit the installer ships"));
+        assert!(text.contains("\n[Slice]\n"), "{name}");
+        path.push('/');
+        path.push_str(&name);
+    }
+    assert_eq!(format!("0::{path}/{UNIT}"), duduclaw_core::root_key::GATEWAY_CGROUP_TCB_SLICE);
+    assert_eq!(path, "/duduclaw.slice/duduclaw-tcb.slice");
+    // The single-binary unit carries the same Slice= line: the same accepted path.
+    assert!(unit_text().lines().any(|line| line == format!("Slice={}", slices[0])));
+}
+
 #[test]
 fn service_protected_layout_and_facts_stay_outside_var_log() {
     // Ubuntu makes /var/log root:syslog 0775; a writable ancestor must remain refused.
@@ -255,4 +283,20 @@ fn service_protected_linux_allow_missing_runtime_cli() {
             assert!(crate::Cli::try_parse_from(["duduclaw", "service", action, "--allow-missing-runtime"]).is_err());
         }
     });
+}
+
+#[test]
+fn service_protected_parse_runtime_verify_does_not_lock_or_reread_state() {
+    let source = include_str!("protected_linux_install.rs");
+    let function = source.split("fn parse_runtime_tree(install: bool)").nth(1).unwrap()
+        .split("\n}\n").next().unwrap();
+    let (before, after) = function.split_once("let _update_lock = if needs_update_lock(install) {").unwrap();
+    let (install, verify) = after.split_once("} else { None };").unwrap();
+    assert!(!before.contains(".lock()"));
+    assert_eq!(install.matches(".lock()").count(), 1);
+    assert!(!verify.contains(".lock()"));
+    assert_eq!(function.matches("json(\"state.json\")").count(), 1);
+    assert!(verify.contains("state.validate()"));
+    assert!(verify.contains("state.pending.is_some() || current != state.effective_digest()"));
+    assert!(verify.contains("if install { \"--install\" } else { \"--verify\" }"));
 }

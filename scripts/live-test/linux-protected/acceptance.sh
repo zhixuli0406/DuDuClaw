@@ -343,7 +343,11 @@ s = dict(line.split(':', 1) for line in open('/proc/' + sys.argv[1] + '/status')
 assert all(int(x) != 0 for x in s['Uid'].split())
 assert s['NoNewPrivs'].strip() == '1' and int(s['CapEff'].strip(), 16) == 0
 PY
-check cgroup 'exact system unit cgroup' test "$(cat "/proc/$PID/cgroup")" = '0::/system.slice/duduclaw-gateway.service'
+# Exactly one of the two lines the gateway's attestation accepts (the unit's
+# Slice=duduclaw-tcb.slice nests it under duduclaw.slice; see root_key_native.rs).
+check cgroup 'exact system unit cgroup' sh -c 'case "$(cat "$1")" in
+    "0::/system.slice/duduclaw-gateway.service"|"0::/duduclaw.slice/duduclaw-tcb.slice/duduclaw-gateway.service") exit 0 ;;
+    *) exit 1 ;; esac' sh "/proc/$PID/cgroup"
 DUID=$(id -u duduclaw) DGID=$(id -g duduclaw)
 if ! setpriv --reuid "$DUID" --regid "$DGID" --clear-groups python3 -c \
     'import os,sys; assert os.getuid() == int(sys.argv[1]); open("/proc/self/status").read()' "$DUID" >/dev/null 2>&1; then

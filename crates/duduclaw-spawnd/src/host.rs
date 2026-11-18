@@ -41,16 +41,23 @@ impl Publication for MissingPublication {
 /// C's DNS/secondary BPF probe is independent of successful control connection.
 pub trait Egress: Send {
     fn readiness(&mut self) -> Result<crate::readiness::EgressSecondLayer>;
-    /// R7b: whether a fresh `ProbeDns` through egress passed. Reads a snapshot
-    /// only; never blocks the readiness refresh.
-    fn dns_route_verified(&mut self) -> bool;
+    /// R7b: whether a fresh `ProbeDns` through egress passed, else the fixed
+    /// reason (`crate::dns_evidence::Reason::name`). Reads a snapshot only;
+    /// never blocks the readiness refresh.
+    fn dns_route_status(&mut self) -> std::result::Result<(), &'static str>;
     fn register(&mut self, run: RunId, profile: duduclaw_isolation::egress::ProfileId, fd: OwnedFd) -> Result<()>;
     fn unregister(&mut self, run: RunId) -> Result<()>;
 }
 /// R7b: DNS route evidence (`crate::dns_evidence`), and the egress second
 /// layer's readback (`crate::egress_layer`) through the same snapshot view.
 /// `verified` never blocks: it reads the worker's snapshot; unknown is `false`.
-pub trait DnsEvidence: Send { fn verified(&mut self) -> bool; }
+pub trait DnsEvidence: Send {
+    fn verified(&mut self) -> bool;
+    /// `verified`, with a fixed reason when false (no detail: `pending`).
+    fn status(&mut self) -> std::result::Result<(), &'static str> {
+        if self.verified() { Ok(()) } else { Err(crate::dns_evidence::Reason::Pending.name()) }
+    }
+}
 pub struct MissingDnsEvidence;
 impl DnsEvidence for MissingDnsEvidence { fn verified(&mut self) -> bool { false } }
 /// R7b: the one egress control connection, shared by the lifecycle thread
@@ -100,7 +107,7 @@ impl Egress for LinuxEgress {
         Ok(if self.layer.verified() { crate::readiness::EgressSecondLayer::Verified }
             else { crate::readiness::EgressSecondLayer::Unavailable })
     }
-    fn dns_route_verified(&mut self) -> bool { self.dns.verified() }
+    fn dns_route_status(&mut self) -> std::result::Result<(), &'static str> { self.dns.status() }
     fn register(&mut self, run: RunId, profile: duduclaw_isolation::egress::ProfileId, fd: OwnedFd) -> Result<()> {
         let request = RequestId(os(crate::server::random_id())?);
         self.exchange(|client| client.register_owned(request, run, profile, fd))
@@ -232,6 +239,10 @@ struct Core {
     recording_gate: crate::host_state::RecordingGate,
     /// C2: the start-up reconciliation latch (retried by `refresh`).
     startup: StartupReconcile,
+    /// The last evidence line printed (`readiness::evidence_line`): printed
+    /// again only when the set of false checks (or the resources sub-condition)
+    /// changes, never every refresh.
+    evidence_line: Option<String>,
 }
 /// C2: the cadence of start-up reconciliation retries.
 const STARTUP_RETRY: Duration = Duration::from_secs(2);
@@ -283,7 +294,7 @@ impl LinuxHost {
             monitor, runs: BTreeMap::new(), audit, last_refresh: Instant::now(), poisoned: false, view: view.clone(),
             helper_events: Vec::new(), recording_probe: probe::RecordingProbe::default(),
             probe_schedule: probe::ProbeSchedule::default(), recording_gate: recording_gate.clone(),
-            startup: StartupReconcile::opened(Instant::now(), false) };
+            startup: StartupReconcile::opened(Instant::now(), false), evidence_line: None };
         startup_stage("report", core.report.publish(gateway.1))?;
         // Cleanup is attempted even when C/H/F/G are absent. Failure is evidence,
         // never permission to skip an orphan or reinterpret a stale reservation.
@@ -389,13 +400,24 @@ impl Core {
         }
         // R7b: a snapshot of the DNS probe worker (first call starts it, after
         // start-up recovery); never blocks this refresh.
-        let dns_route = self.components.egress.dns_route_verified();
-        checks.dns_route_verified = checks.egress_verified && dns_route;
+        let dns_route = self.components.egress.dns_route_status();
+        checks.dns_route_verified = checks.egress_verified && dns_route.is_ok();
+        // Defect 28: the fixed sub-reason for the evidence line.
+        let dns_reason = if checks.egress_verified { dns_route.err() }
+            else { Some(crate::dns_evidence::Reason::NoControlConnection.name()) };
         checks.storage_verified = self.components.storage.readiness().is_ok();
         checks.process_scan_verified = self.monitor.state.lock().is_ok_and(|state|
             state.at.elapsed() < Duration::from_secs(1) && state.result.as_ref().is_ok_and(Vec::is_empty));
         let ptys = self.systemd.resources_ready();
         checks.resources_verified = ptys.is_ok();
+        // Fixed names only: the readiness.json check names and, for
+        // resources, the first failing sub-condition (`ResourceCheck`), for
+        // the DNS route its `dns_evidence::Reason`.
+        let line = crate::readiness::evidence_line(&checks, ptys.err().map(crate::systemd::ResourceCheck::describe).as_deref(), dns_reason);
+        if self.evidence_line.as_deref() != Some(line.as_str()) {
+            eprintln!("duduclaw-spawnd: {line}");
+            self.evidence_line = Some(line);
+        }
         match EvidenceReport::current(checks, ptys.unwrap_or(0)) {
             Ok(mut report) => {
                 report.checked_boottime_ms = probe_started;

@@ -19,6 +19,8 @@ fn main() {
     if let Err(error) = result {
         // Never print paths, subprocess output or the detailed OS error.
         eprintln!("update_refused: {:?}", error.code());
+        // Fixed stage names only (`duduclaw_updated::stage`).
+        if let Some(stage) = duduclaw_updated::stage::describe() { eprintln!("update_stage: {stage}"); }
         std::process::exit(1);
     }
 }

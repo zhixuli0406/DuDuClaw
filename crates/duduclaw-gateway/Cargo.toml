@@ -222,9 +222,9 @@ test-support = []
 # Builds the CI-only duduclaw-license-marker-probe binary (see [[bin]] above);
 # no code depends on it and no release build enables it.
 marker-probe = []
-# Integration branch supplies Package E's dependency; Package D alone does not.
+# inert since v1.83: the worker integration is always compiled; kept so existing --features invocations resolve
 isolation-worker-integration = []
-default = ["dashboard", "desktop", "isolation-worker-integration"]
+default = ["dashboard", "desktop"]
 # Kept as an empty feature so existing `--features duduclaw-gateway/desktop`
 # invocations (release workflow) still resolve. It used to pull in
 # `duduclaw-desktop` + `enigo` for the computer-use native mode, which was

@@ -1543,6 +1543,27 @@ nothing waits on a unit that starts later.
   gateway's data snapshot, the root key's intent and its confirmation move with
   the gateway's first start from S8 to S6. A resumed S6 repeats every entry:
   started units stay as they are and only the waits run again.
+- **Start-up order rule.** A component's read-back `ready` means serving with
+  a complete identity AND, for the gateway, its own local initialisation
+  finished (stores open, service entry up, spawnd backend connected);
+  whole-host readiness and the updater's own answers are never an input of the
+  updater's verification (gateway and egress: their read-back endpoint serving;
+  spawnd: a recent healthy admission iteration; file measurements: the signed
+  digest). Whole-host readiness (spawnd's evidence, the gateway's
+  `isolation_readiness`) needs a fresh answer to a probe of the updater, which answers only after its
+  start-up verification (the first install deadlocked on exactly this: the
+  updater exited after its 30 s read-back deadline, forever). Whole-host
+  readiness is enforced at admission (spawnd `Readiness::check`; the gateway's
+  `check_execution` before every run). The gateway's isolation tool service
+  retries its start-up assembly until the updater and spawnd evidence are
+  available; no restart is needed after install, boot or update.
+  spawnd's unit `Wants=` and is `After=`
+  `duduclaw-employees.slice`, so the slice (and its cgroup) exists whenever
+  spawnd runs, before spawnd's mount namespace is built; otherwise nothing
+  starts it on a host with zero employees and `resources_verified` stays false.
+  Failures name themselves: the updater prints `update_stage: <phase>: <step>`
+  (and `<component> <verdict>` for a read-back) after `update_refused:`;
+  spawnd prints `evidence incomplete: …` / `evidence complete` on change.
 - **Installer S8** confirms the root key's ledger entry, `systemctl enable`s the
   gateway, confirms it is active and runs the full readiness check. S9 always
   runs the full check. `--enable-now` is accepted for compatibility and has no
@@ -4411,8 +4432,9 @@ retains the original scope checks and requires complete dispatcher services; no
 key is placed in runtime files/fds and no principal is manufactured from a slug.
 The owner retains Boundary/sweep and E services. `prepare_launch` re-reads G's
 confirmed root mapping and D's durable binding before creating the launch.
-`isolation-worker-integration` is enabled in gateway defaults; no E engine runs
-inside gateway. Missing producers are logged explicitly, and boot construction
+Worker integration is always compiled since v1.83;
+`isolation-worker-integration` remains an inert compatibility feature. No E engine
+runs inside gateway. Missing producers are logged explicitly, and boot construction
 never flips composite readiness to true. This is composition support, not a
 claim that runtime entry points already scope every call through it.
 

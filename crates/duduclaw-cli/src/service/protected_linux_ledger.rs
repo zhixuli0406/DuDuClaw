@@ -1518,6 +1518,90 @@ mod tests {
         component_resumes_only_through_the_producer_checks(duduclaw_core::root_key::KEY_PATH, Kind::File, key, 1);
     }
 
+    /// Defect 21: the gateway unit is active as soon as its launcher runs, a
+    /// moment before the launcher publishes the key. S6 waits (within the
+    /// start's one budget) for the key at its final path, then confirms once.
+    #[test]
+    fn gateway_root_key_is_confirmed_only_once_the_launcher_published_it() {
+        use super::super::bootstrap::{confirm_root_key_after_start, root_key_not_created};
+        use std::{cell::Cell, time::{Duration, Instant}};
+        let key = duduclaw_core::root_key::KEY_PATH;
+        let object = Identity { mode: libc::S_IFREG | duduclaw_core::root_key::KEY_MODE,
+            size: Some(duduclaw_core::root_key::KEY_BYTES), ..identity(Kind::File, 83) };
+        let (bound, ample) = (Duration::from_secs(60), || Instant::now() + Duration::from_secs(30));
+        let intended = |world: &Rc<RefCell<World>>| {
+            let mut recorder = open(world);
+            recorder.intend(&[(key, Kind::File)]).unwrap();
+            recorder
+        };
+        let present = |world: &Rc<RefCell<World>>| world.borrow().objects.iter().any(|(path, _)| path == key);
+
+        // The key appears at the third look: confirmed with its identity, in one save.
+        let world = Rc::new(RefCell::new(World::default()));
+        let mut recorder = intended(&world);
+        let saves = world.borrow().saved.len();
+        let (looks, asked) = (Cell::new(0), Cell::new(0));
+        confirm_root_key_after_start(&mut recorder, bound, ample(), Duration::ZERO, || true,
+            || {
+                looks.set(looks.get() + 1);
+                if looks.get() == 3 { world.borrow_mut().put(key, object.clone()); }
+                present(&world)
+            },
+            |_, absent, found| { asked.set(asked.get() + 1); absent && found == &object }).unwrap();
+        assert_eq!((looks.get(), asked.get()), (3, 1));
+        let entry = recorder.ledger().entry(key).unwrap().clone();
+        assert_eq!((entry.state, entry.identity), (State::Created, Some(object.clone())));
+        assert_eq!(world.borrow().saved.len(), saves + 1, "one confirm, one durable write");
+
+        // The key never appears: the new refusal, distinct from the provenance
+        // one; the proof is never asked, nothing is written, the entry stays `intent`.
+        let world = Rc::new(RefCell::new(World::default()));
+        let mut recorder = intended(&world);
+        let saves = world.borrow().saved.len();
+        let looks = Cell::new(0);
+        let error = confirm_root_key_after_start(&mut recorder, bound, Instant::now() + Duration::from_millis(30),
+            Duration::from_millis(1), || true, || { looks.set(looks.get() + 1); false },
+            |_, _, _| unreachable!("no key, no proof")).unwrap_err().to_string();
+        assert!(looks.get() > 1, "polled until the budget was spent");
+        assert_eq!(error, root_key_not_created(bound).to_string());
+        assert!(error.contains(key) && error.contains("journalctl -b -u duduclaw-gateway.service"), "{error}");
+        assert_ne!(error, component_unconfirmed(key).to_string());
+        let entry = recorder.ledger().entry(key).unwrap().clone();
+        assert_eq!((entry.state, entry.identity), (State::Intent, None));
+        assert_eq!(world.borrow().saved.len(), saves, "nothing written");
+
+        // Present at once: unchanged — one look, the proof decides (accepted / refused).
+        for accepted in [true, false] {
+            let world = Rc::new(RefCell::new(World::default()));
+            let mut recorder = intended(&world);
+            world.borrow_mut().put(key, object.clone());
+            let looks = Cell::new(0);
+            let result = confirm_root_key_after_start(&mut recorder, bound, ample(), Duration::ZERO, || true,
+                || { looks.set(looks.get() + 1); present(&world) }, |_, absent, _| absent && accepted);
+            assert_eq!(looks.get(), 1);
+            let entry = recorder.ledger().entry(key).unwrap().clone();
+            if accepted {
+                result.unwrap();
+                assert_eq!((entry.state, entry.identity), (State::Created, Some(object.clone())));
+            } else {
+                assert_eq!(result.unwrap_err().to_string(), component_unconfirmed(key).to_string());
+                assert_eq!((entry.state, entry.identity), (State::Intent, None));
+            }
+        }
+
+        // The unit never active: the existing refusal; the key is not waited for.
+        let world = Rc::new(RefCell::new(World::default()));
+        let mut recorder = intended(&world);
+        let looks = Cell::new(0);
+        let error = confirm_root_key_after_start(&mut recorder, bound, Instant::now() + Duration::from_millis(20),
+            Duration::from_millis(1), || false, || { looks.set(looks.get() + 1); false }, |_, _, _| true)
+            .unwrap_err().to_string();
+        assert!(error.contains("Gateway 未在時限內進入執行狀態。"), "{error}");
+        assert_eq!(looks.get(), 0);
+        let entry = recorder.ledger().entry(key).unwrap().clone();
+        assert_eq!((entry.state, entry.identity), (State::Intent, None));
+    }
+
     #[test]
     fn general_intent_without_identity_is_never_adopted_on_resume() {
         let world = Rc::new(RefCell::new(World::default()));

@@ -1009,6 +1009,149 @@ pub fn pty_budget(maximum: &str, reserved: &str) -> io::Result<u32> {
     Ok(budget as u32)
 }
 
+/// The sub-conditions of `linux::Systemd::resources_ready` (readiness
+/// `resources_verified`), each with a fixed name: spawnd's evidence line names
+/// the first one that failed. A TCB service sub-condition also names its fixed
+/// unit. Never a path, an id or OS error text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResourceCheck {
+    /// PID 1's manager interface could not be reached.
+    Manager,
+    /// `duduclaw-tcb.slice`: GetUnit or a property read failed.
+    TcbSliceUnit,
+    /// `duduclaw-tcb.slice`: no realised, canonical cgroup.
+    TcbSliceCgroup,
+    /// `duduclaw-tcb.slice`: MemoryMin is 0 or infinity, or its cgroup's
+    /// `memory.min` is unreadable or another value.
+    TcbSliceMemoryMin,
+    /// The same three for `duduclaw.slice`.
+    ParentSliceUnit,
+    ParentSliceCgroup,
+    ParentSliceMemoryMin,
+    /// `duduclaw-tcb.slice` is not a direct child of `duduclaw.slice`.
+    TcbSliceParent,
+    /// `duduclaw.slice` reserves less than `duduclaw-tcb.slice`.
+    ParentSliceReservation,
+    /// `duduclaw-employees.slice`: LoadUnit or a property read failed.
+    EmployeesSliceUnit,
+    /// `duduclaw-employees.slice` has no cgroup: the slice is not started
+    /// (measured on the first install: loaded, inactive, `ControlGroup=` empty).
+    EmployeesSliceCgroup,
+    /// `duduclaw-employees.slice` is not a direct child of `duduclaw.slice`.
+    EmployeesSliceParent,
+    EmployeesMemoryMax,
+    EmployeesTasksMax,
+    EmployeesSwapMax,
+    EmployeesCpuQuota,
+    /// A TCB service: LoadUnit/property read failed or it is not `loaded`.
+    TcbServiceUnit(&'static str),
+    /// A TCB service whose `Slice=` is not `duduclaw-tcb.slice`.
+    TcbServiceSlice(&'static str),
+    /// An active TCB service whose cgroup is not directly under the TCB slice.
+    TcbServiceCgroup(&'static str),
+    /// `/proc/sys/kernel/pty/{max,reserve}` unreadable or no budget left.
+    HostPtyBudget,
+}
+impl ResourceCheck {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Manager => "systemd_manager",
+            Self::TcbSliceUnit => "tcb_slice_unit",
+            Self::TcbSliceCgroup => "tcb_slice_cgroup",
+            Self::TcbSliceMemoryMin => "tcb_slice_memory_min",
+            Self::ParentSliceUnit => "parent_slice_unit",
+            Self::ParentSliceCgroup => "parent_slice_cgroup",
+            Self::ParentSliceMemoryMin => "parent_slice_memory_min",
+            Self::TcbSliceParent => "tcb_slice_parent",
+            Self::ParentSliceReservation => "parent_slice_reservation",
+            Self::EmployeesSliceUnit => "employees_slice_unit",
+            Self::EmployeesSliceCgroup => "employees_slice_cgroup",
+            Self::EmployeesSliceParent => "employees_slice_parent",
+            Self::EmployeesMemoryMax => "employees_memory_max",
+            Self::EmployeesTasksMax => "employees_tasks_max",
+            Self::EmployeesSwapMax => "employees_swap_max",
+            Self::EmployeesCpuQuota => "employees_cpu_quota",
+            Self::TcbServiceUnit(_) => "tcb_service_unit",
+            Self::TcbServiceSlice(_) => "tcb_service_slice",
+            Self::TcbServiceCgroup(_) => "tcb_service_cgroup",
+            Self::HostPtyBudget => "host_pty_budget",
+        }
+    }
+    /// [`Self::name`], and the fixed unit name of a TCB service sub-condition.
+    pub fn describe(self) -> String {
+        match self {
+            Self::TcbServiceUnit(unit) | Self::TcbServiceSlice(unit) | Self::TcbServiceCgroup(unit) => format!("{} {unit}", self.name()),
+            _ => self.name().to_string(),
+        }
+    }
+}
+/// The services that must run in `duduclaw-tcb.slice`.
+pub const TCB_SERVICES: [&str; 4] = ["duduclaw-gateway.service", "duduclaw-spawnd.service",
+    "duduclaw-updated.service", "duduclaw-egress.service"];
+/// `duduclaw-tcb.slice` or `duduclaw.slice` as read: PID 1's `MemoryMin`, the
+/// checked cgroup directory and its `memory.min`.
+#[derive(Clone, Debug)]
+pub struct ReservedSliceFacts { pub memory_min: u64, pub directory: std::path::PathBuf, pub cgroup_memory_min: u64 }
+/// `duduclaw-employees.slice` as read: PID 1's values and the cgroup files.
+#[derive(Clone, Debug)]
+pub struct EmployeesSliceFacts {
+    pub directory: std::path::PathBuf,
+    pub memory_max: u64, pub memory_max_file: u64,
+    pub tasks_max: u64, pub pids_max_file: u64,
+    pub swap_max_file: u64,
+    pub cpu_quota_per_sec_usec: u64, pub cpu_max_file: String,
+}
+/// One of [`TCB_SERVICES`] as read; `directory`: its checked cgroup, only
+/// while it is `active` (a unit between two starts has none).
+#[derive(Clone, Debug)]
+pub struct TcbServiceFacts { pub unit: &'static str, pub load_state: String, pub slice: String,
+    pub directory: Option<std::path::PathBuf> }
+/// Everything `resources_ready` reads, for [`evaluate_resources`].
+#[derive(Clone, Debug)]
+pub struct ResourceFacts {
+    pub tcb: ReservedSliceFacts, pub parent: ReservedSliceFacts, pub employees: EmployeesSliceFacts,
+    pub services: Vec<TcbServiceFacts>, pub pty_max: String, pub pty_reserve: String,
+}
+/// The value checks of `resources_ready` (reading is `linux::Systemd`'s):
+/// the host PTY budget when every sub-condition holds, else the first that
+/// does not. A configured MemoryMin without its ancestor reservation is not
+/// ready. MemoryMin of the employees slice is not a condition (measured 0:
+/// the slice reserves nothing, it caps).
+pub fn evaluate_resources(facts: &ResourceFacts) -> Result<u32, ResourceCheck> {
+    use ResourceCheck as C;
+    for (slice, check) in [(&facts.tcb, C::TcbSliceMemoryMin), (&facts.parent, C::ParentSliceMemoryMin)] {
+        if slice.memory_min == 0 || slice.memory_min == u64::MAX || slice.cgroup_memory_min != slice.memory_min { return Err(check); }
+    }
+    if facts.tcb.directory.parent() != Some(facts.parent.directory.as_path()) { return Err(C::TcbSliceParent); }
+    if facts.parent.memory_min < facts.tcb.memory_min { return Err(C::ParentSliceReservation); }
+    let employees = &facts.employees;
+    if employees.directory.parent() != Some(facts.parent.directory.as_path()) { return Err(C::EmployeesSliceParent); }
+    for (limit, file, check) in [(employees.memory_max, employees.memory_max_file, C::EmployeesMemoryMax),
+        (employees.tasks_max, employees.pids_max_file, C::EmployeesTasksMax)] {
+        if limit == 0 || limit == u64::MAX || file != limit { return Err(check); }
+    }
+    if employees.swap_max_file != 0 { return Err(C::EmployeesSwapMax); }
+    // systemd 255 reports `CPUQuota=200%` as CPUQuotaPerSecUSec 2000000 (µs per
+    // second; `systemctl show`: "2s") and writes cpu.max "200000 100000"
+    // (measured): quota/period may not exceed the configured share.
+    let cpu = employees.cpu_quota_per_sec_usec;
+    let words: Vec<_> = employees.cpu_max_file.split_whitespace().collect();
+    if words.len() != 2 || cpu == 0 || cpu == u64::MAX { return Err(C::EmployeesCpuQuota); }
+    let (Ok(quota), Ok(period)) = (words[0].parse::<u64>(), words[1].parse::<u64>()) else { return Err(C::EmployeesCpuQuota) };
+    if quota == 0 || period == 0 || u128::from(quota) * 1_000_000 > u128::from(cpu) * u128::from(period) {
+        return Err(C::EmployeesCpuQuota);
+    }
+    for unit in TCB_SERVICES {
+        let Some(service) = facts.services.iter().find(|service| service.unit == unit) else { return Err(C::TcbServiceUnit(unit)) };
+        if service.load_state != "loaded" { return Err(C::TcbServiceUnit(unit)); }
+        if service.slice != "duduclaw-tcb.slice" { return Err(C::TcbServiceSlice(unit)); }
+        if service.directory.as_ref().is_some_and(|directory| directory.parent() != Some(facts.tcb.directory.as_path())) {
+            return Err(C::TcbServiceCgroup(unit));
+        }
+    }
+    pty_budget(&facts.pty_max, &facts.pty_reserve).map_err(|_| C::HostPtyBudget)
+}
+
 #[cfg(target_os = "linux")]
 pub mod linux {
     use super::*;
@@ -1640,62 +1783,77 @@ pub mod linux {
             Ok(runs.len())
         }
 
-        /// Read actual cgroup v2 files as well as systemd's configured values.
-        /// A configured MemoryMin without its ancestor reservation is not ready.
-        pub fn resources_ready(&self) -> io::Result<u32> {
-            let manager = self.manager()?;
-            let mut tcb_min = 0;
-            let mut tcb_directory = PathBuf::new();
-            let mut parent_directory = PathBuf::new();
-            for name in ["duduclaw-tcb.slice", "duduclaw.slice"] {
-                let path: OwnedObjectPath = manager.call("GetUnit", &(name,)).map_err(bus_error)?;
-                let slice = Proxy::new(&self.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Slice").map_err(bus_error)?;
-                let minimum: u64 = slice.get_property("MemoryMin").map_err(bus_error)?;
-                let cgroup: String = slice.get_property("ControlGroup").map_err(bus_error)?;
-                let directory = checked_cgroup(&cgroup)?;
-                if minimum == 0 || minimum == u64::MAX || read_number(&directory.join("memory.min"))? != minimum {
-                    return Err(invalid());
-                }
-                if name == "duduclaw-tcb.slice" { tcb_min = minimum; tcb_directory = directory; }
-                else {
-                    if minimum < tcb_min || tcb_directory.parent() != Some(directory.as_path()) { return Err(invalid()); }
-                    parent_directory = directory;
-                }
+        /// Read actual cgroup v2 files as well as systemd's configured values
+        /// ([`evaluate_resources`] checks them). `Err` names the first failing
+        /// sub-condition ([`ResourceCheck`]).
+        pub fn resources_ready(&self) -> Result<u32, ResourceCheck> {
+            use ResourceCheck as C;
+            let manager = self.manager().map_err(|_| C::Manager)?;
+            let tcb = self.reserved_slice(&manager, "duduclaw-tcb.slice", [C::TcbSliceUnit, C::TcbSliceCgroup, C::TcbSliceMemoryMin])?;
+            let parent = self.reserved_slice(&manager, "duduclaw.slice",
+                [C::ParentSliceUnit, C::ParentSliceCgroup, C::ParentSliceMemoryMin])?;
+            let employees = self.employees_slice(&manager)?;
+            let mut services = Vec::with_capacity(TCB_SERVICES.len());
+            for unit in TCB_SERVICES { services.push(self.tcb_service(&manager, unit)?); }
+            let pty_max = std::fs::read_to_string("/proc/sys/kernel/pty/max").map_err(|_| C::HostPtyBudget)?;
+            let pty_reserve = std::fs::read_to_string("/proc/sys/kernel/pty/reserve").map_err(|_| C::HostPtyBudget)?;
+            evaluate_resources(&ResourceFacts { tcb, parent, employees, services, pty_max, pty_reserve })
+        }
+        fn reserved_slice(&self, manager: &Proxy<'_>, name: &str, [unit, cgroup, minimum]: [ResourceCheck; 3])
+            -> Result<ReservedSliceFacts, ResourceCheck> {
+            let path: OwnedObjectPath = manager.call("GetUnit", &(name,)).map_err(|_| unit)?;
+            let slice = Proxy::new(&self.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Slice").map_err(|_| unit)?;
+            let memory_min: u64 = slice.get_property("MemoryMin").map_err(|_| unit)?;
+            let text: String = slice.get_property("ControlGroup").map_err(|_| unit)?;
+            let directory = checked_cgroup(&text).map_err(|_| cgroup)?;
+            let cgroup_memory_min = read_number(&directory.join("memory.min")).map_err(|_| minimum)?;
+            Ok(ReservedSliceFacts { memory_min, directory, cgroup_memory_min })
+        }
+        fn employees_slice(&self, manager: &Proxy<'_>) -> Result<EmployeesSliceFacts, ResourceCheck> {
+            use ResourceCheck as C;
+            // LoadUnit, not GetUnit: PID 1 may have garbage-collected an
+            // inactive, unreferenced slice; it then reads as not started below
+            // (`employees_slice_cgroup`) instead of as a bus failure.
+            let path: OwnedObjectPath = manager.call("LoadUnit", &("duduclaw-employees.slice",)).map_err(|_| C::EmployeesSliceUnit)?;
+            let slice = Proxy::new(&self.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Slice")
+                .map_err(|_| C::EmployeesSliceUnit)?;
+            let text: String = slice.get_property("ControlGroup").map_err(|_| C::EmployeesSliceUnit)?;
+            // An inactive slice reports `ControlGroup=` "" (measured on the
+            // first install): no cgroup, no limits to verify.
+            let directory = checked_cgroup(&text).map_err(|_| C::EmployeesSliceCgroup)?;
+            let memory_max: u64 = slice.get_property("MemoryMax").map_err(|_| C::EmployeesMemoryMax)?;
+            let memory_max_file = read_number(&directory.join("memory.max")).map_err(|_| C::EmployeesMemoryMax)?;
+            let tasks_max: u64 = slice.get_property("TasksMax").map_err(|_| C::EmployeesTasksMax)?;
+            let pids_max_file = read_number(&directory.join("pids.max")).map_err(|_| C::EmployeesTasksMax)?;
+            let swap_max_file = read_number(&directory.join("memory.swap.max")).map_err(|_| C::EmployeesSwapMax)?;
+            let cpu_quota_per_sec_usec: u64 = slice.get_property("CPUQuotaPerSecUSec").map_err(|_| C::EmployeesCpuQuota)?;
+            let cpu_max_file = std::fs::read_to_string(directory.join("cpu.max")).map_err(|_| C::EmployeesCpuQuota)?;
+            Ok(EmployeesSliceFacts { directory, memory_max, memory_max_file, tasks_max, pids_max_file, swap_max_file,
+                cpu_quota_per_sec_usec, cpu_max_file })
+        }
+        fn tcb_service(&self, manager: &Proxy<'_>, name: &'static str) -> Result<TcbServiceFacts, ResourceCheck> {
+            use ResourceCheck as C;
+            let path: OwnedObjectPath = manager.call("LoadUnit", &(name,)).map_err(|_| C::TcbServiceUnit(name))?;
+            let unit = Proxy::new(&self.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Unit")
+                .map_err(|_| C::TcbServiceUnit(name))?;
+            let load_state: String = unit.get_property("LoadState").map_err(|_| C::TcbServiceUnit(name))?;
+            let service = Proxy::new(&self.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Service")
+                .map_err(|_| C::TcbServiceUnit(name))?;
+            let slice: String = service.get_property("Slice").map_err(|_| C::TcbServiceSlice(name))?;
+            let state: String = unit.get_property("ActiveState").map_err(|_| C::TcbServiceUnit(name))?;
+            if state != "active" { return Ok(TcbServiceFacts { unit: name, load_state, slice, directory: None }); }
+            let directory = service.get_property::<String>("ControlGroup").ok().and_then(|text| checked_cgroup(&text).ok());
+            if directory.is_none() {
+                // A unit that left `active` between the two reads has no cgroup
+                // to attest (measured: duduclaw-updated restarting every ≈36 s).
+                // Read again on a fresh proxy (no cached value): still active
+                // without a checked cgroup is a refusal.
+                let fresh = Proxy::new(&self.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Unit")
+                    .map_err(|_| C::TcbServiceUnit(name))?;
+                let again: String = fresh.get_property("ActiveState").map_err(|_| C::TcbServiceUnit(name))?;
+                if again == "active" { return Err(C::TcbServiceCgroup(name)); }
             }
-            let path: OwnedObjectPath = manager.call("GetUnit", &("duduclaw-employees.slice",)).map_err(bus_error)?;
-            let slice = Proxy::new(&self.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Slice").map_err(bus_error)?;
-            let cgroup: String = slice.get_property("ControlGroup").map_err(bus_error)?;
-            let directory = checked_cgroup(&cgroup)?;
-            if directory.parent() != Some(parent_directory.as_path()) { return Err(invalid()); }
-            for (property, file) in [("MemoryMax", "memory.max"), ("TasksMax", "pids.max")] {
-                let limit: u64 = slice.get_property(property).map_err(bus_error)?;
-                if limit == 0 || limit == u64::MAX || read_number(&directory.join(file))? != limit { return Err(invalid()); }
-            }
-            if read_number(&directory.join("memory.swap.max"))? != 0 { return Err(invalid()); }
-            let cpu: u64 = slice.get_property("CPUQuotaPerSecUSec").map_err(bus_error)?;
-            let actual = std::fs::read_to_string(directory.join("cpu.max"))?;
-            let words: Vec<_> = actual.split_whitespace().collect();
-            if words.len() != 2 || cpu == 0 || cpu == u64::MAX { return Err(invalid()); }
-            let quota: u64 = words[0].parse().map_err(|_| invalid())?;
-            let period: u64 = words[1].parse().map_err(|_| invalid())?;
-            if quota == 0 || period == 0 || u128::from(quota) * 1_000_000 > u128::from(cpu) * u128::from(period) {
-                return Err(invalid());
-            }
-            for name in ["duduclaw-gateway.service", "duduclaw-spawnd.service",
-                "duduclaw-updated.service", "duduclaw-egress.service"] {
-                let path: OwnedObjectPath = manager.call("LoadUnit", &(name,)).map_err(bus_error)?;
-                let unit = Proxy::new(&self.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Unit").map_err(bus_error)?;
-                let loaded: String = unit.get_property("LoadState").map_err(bus_error)?;
-                let service = Proxy::new(&self.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Service").map_err(bus_error)?;
-                let actual: String = service.get_property("Slice").map_err(bus_error)?;
-                if loaded != "loaded" || actual != "duduclaw-tcb.slice" { return Err(invalid()); }
-                let state: String = unit.get_property("ActiveState").map_err(bus_error)?;
-                if state == "active" {
-                    let cgroup: String = service.get_property("ControlGroup").map_err(bus_error)?;
-                    if checked_cgroup(&cgroup)?.parent() != Some(tcb_directory.as_path()) { return Err(invalid()); }
-                }
-            }
-            host_pty_budget()
+            Ok(TcbServiceFacts { unit: name, load_state, slice, directory })
         }
     }
     fn state_failed(unit: &Proxy<'_>) -> bool {
@@ -2111,6 +2269,15 @@ pub mod linux {
             assert_eq!(unsafe { libc::geteuid() }, 0);
             let systemd = Systemd::connect().unwrap();
             assert_eq!(systemd.resources_ready().unwrap(), host_pty_budget().unwrap());
+        }
+
+        /// An inactive slice reports `ControlGroup=` "" (measured: the
+        /// employees slice after install, before anything started it): that is
+        /// `employees_slice_cgroup`, never an accepted cgroup.
+        #[test]
+        fn an_unstarted_slice_has_no_cgroup_to_verify() {
+            assert!(checked_cgroup("").is_err());
+            assert!(checked_cgroup("/").is_err());
         }
 
         #[test]
@@ -3891,6 +4058,80 @@ mod tests {
         for (maximum, reserved) in [("0", "0"), ("1", "1"), ("1", "2"),
             ("max", "0"), ("4096", "-1"), ("4096", ""), ("1 2", "0")] {
             assert!(pty_budget(maximum, reserved).is_err());
+        }
+    }
+    /// The first complete install (Ubuntu 24.04, systemd 255, cgroup v2) with
+    /// no employees, once duduclaw-employees.slice is started. Measured:
+    /// both reserved slices MemoryMin=536870912; employees slice MemoryMax=
+    /// 4294967296 / memory.max 4294967296, TasksMax=1024 / pids.max 1024,
+    /// memory.swap.max 0, CPUQuotaPerSecUSec "2s" / cpu.max "200000 100000",
+    /// memory.min 0 (not a condition); the four services in the TCB slice;
+    /// pty max 4096, reserve 1024, nr 0. Not measured: the reserved slices'
+    /// own memory.min files (systemd writes MemoryMin there).
+    fn measured_resources() -> ResourceFacts {
+        let parent = std::path::PathBuf::from("/sys/fs/cgroup/duduclaw.slice");
+        let tcb = parent.join("duduclaw-tcb.slice");
+        ResourceFacts {
+            tcb: ReservedSliceFacts { memory_min: 536_870_912, directory: tcb.clone(), cgroup_memory_min: 536_870_912 },
+            parent: ReservedSliceFacts { memory_min: 536_870_912, directory: parent.clone(), cgroup_memory_min: 536_870_912 },
+            employees: EmployeesSliceFacts { directory: parent.join("duduclaw-employees.slice"), memory_max: 4_294_967_296,
+                memory_max_file: 4_294_967_296, tasks_max: 1024, pids_max_file: 1024, swap_max_file: 0,
+                cpu_quota_per_sec_usec: 2_000_000, cpu_max_file: "200000 100000\n".into() },
+            // duduclaw-updated was between two runs of its restart loop: no cgroup.
+            services: TCB_SERVICES.into_iter().map(|unit| TcbServiceFacts { unit, load_state: "loaded".into(),
+                slice: "duduclaw-tcb.slice".into(), directory: (unit != "duduclaw-updated.service").then(|| tcb.join(unit)) }).collect(),
+            pty_max: "4096\n".into(), pty_reserve: "1024\n".into(),
+        }
+    }
+    #[test]
+    fn resources_hold_on_the_measured_fresh_host_and_each_condition_is_named() {
+        use ResourceCheck as C;
+        assert_eq!(evaluate_resources(&measured_resources()), Ok(2764));
+        // The updater while it runs (its cgroup under the TCB slice).
+        let mut running = measured_resources();
+        running.services[2].directory = Some(running.tcb.directory.join("duduclaw-updated.service"));
+        assert_eq!(evaluate_resources(&running), Ok(2764));
+        let cases: [(ResourceCheck, fn(&mut ResourceFacts)); 20] = [
+            (C::TcbSliceMemoryMin, |f| f.tcb.memory_min = 0),
+            (C::TcbSliceMemoryMin, |f| { f.tcb.memory_min = u64::MAX; f.tcb.cgroup_memory_min = u64::MAX; }),
+            (C::TcbSliceMemoryMin, |f| f.tcb.cgroup_memory_min = 0),
+            (C::ParentSliceMemoryMin, |f| f.parent.cgroup_memory_min = 1),
+            (C::TcbSliceParent, |f| f.tcb.directory = "/sys/fs/cgroup/duduclaw-tcb.slice".into()),
+            (C::ParentSliceReservation, |f| { f.parent.memory_min = 4096; f.parent.cgroup_memory_min = 4096; }),
+            (C::EmployeesSliceParent, |f| f.employees.directory = "/sys/fs/cgroup/duduclaw-employees.slice".into()),
+            (C::EmployeesMemoryMax, |f| f.employees.memory_max_file = 8_589_934_592),
+            (C::EmployeesMemoryMax, |f| { f.employees.memory_max = u64::MAX; f.employees.memory_max_file = u64::MAX; }),
+            (C::EmployeesTasksMax, |f| f.employees.pids_max_file = 2048),
+            (C::EmployeesTasksMax, |f| { f.employees.tasks_max = 0; f.employees.pids_max_file = 0; }),
+            (C::EmployeesSwapMax, |f| f.employees.swap_max_file = 1),
+            (C::EmployeesCpuQuota, |f| f.employees.cpu_max_file = "max 100000\n".into()),
+            (C::EmployeesCpuQuota, |f| f.employees.cpu_max_file = "300000 100000\n".into()),
+            (C::EmployeesCpuQuota, |f| f.employees.cpu_quota_per_sec_usec = u64::MAX),
+            (C::TcbServiceUnit("duduclaw-gateway.service"), |f| f.services[0].load_state = "not-found".into()),
+            (C::TcbServiceSlice("duduclaw-spawnd.service"), |f| f.services[1].slice = "system.slice".into()),
+            (C::TcbServiceUnit("duduclaw-updated.service"), |f| { f.services.remove(2); }),
+            (C::TcbServiceCgroup("duduclaw-egress.service"), |f| f.services[3].directory =
+                Some("/sys/fs/cgroup/system.slice/duduclaw-egress.service".into())),
+            (C::HostPtyBudget, |f| f.pty_reserve = "4096\n".into()),
+        ];
+        for (expected, falsify) in cases {
+            let mut facts = measured_resources();
+            falsify(&mut facts);
+            assert_eq!(evaluate_resources(&facts), Err(expected), "{}", expected.describe());
+        }
+    }
+    #[test]
+    fn resource_check_names_are_fixed_and_distinct() {
+        use ResourceCheck as C;
+        let mut all = vec![C::Manager, C::TcbSliceUnit, C::TcbSliceCgroup, C::TcbSliceMemoryMin, C::ParentSliceUnit,
+            C::ParentSliceCgroup, C::ParentSliceMemoryMin, C::TcbSliceParent, C::ParentSliceReservation,
+            C::EmployeesSliceUnit, C::EmployeesSliceCgroup, C::EmployeesSliceParent, C::EmployeesMemoryMax,
+            C::EmployeesTasksMax, C::EmployeesSwapMax, C::EmployeesCpuQuota, C::HostPtyBudget];
+        for unit in TCB_SERVICES { all.extend([C::TcbServiceUnit(unit), C::TcbServiceSlice(unit), C::TcbServiceCgroup(unit)]); }
+        let described: std::collections::BTreeSet<String> = all.iter().map(|check| check.describe()).collect();
+        assert_eq!(described.len(), all.len());
+        for check in all {
+            assert!(check.name().bytes().all(|b| b.is_ascii_lowercase() || b == b'_'), "{}", check.name());
         }
     }
     fn prefixes(tokens: &[&str]) -> Vec<IpEntry> { tokens.iter().map(|token| parse_ip_prefix(token).unwrap()).collect() }

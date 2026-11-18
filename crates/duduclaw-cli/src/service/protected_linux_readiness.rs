@@ -12,13 +12,11 @@
 //! protocol mismatch or a timeout is "not ready" with a stable reason code,
 //! never "ready". Nothing here publishes an isolation fact.
 //!
-//! Side effects that remain (all pre-existing, none in the composite sources
-//! except the first and the last):
+//! `directories()` verifies the parse runtime without the live updater's lock;
+//! it reads one atomic state snapshot and refuses pending or invalid state.
+//! Side effects that remain (all pre-existing):
 //! - `command()` creates two temporary output files under `/run` for each
 //!   tool run and removes them afterwards;
-//! - the item #1 `directories()` group calls `parse_runtime_tree(false)`, which
-//!   takes the update lock (`/var/lib/duduclaw-updated/update.lock`, which the
-//!   lock call may create) for the duration of that check;
 //! - the DNS broker health probe makes the broker open (and immediately
 //!   close) one TCP connection to its configured upstream.
 use super::*;
@@ -847,77 +845,100 @@ pub(super) fn read_launcher_receipt() -> Result<Option<LauncherReceipt>> {
 // ── Installer groups (item #1) ────────────────────────────────────────────
 
 fn binaries() -> Result<()> {
-    if !layout::published_components(Path::new("/"), 0, 0)? {
-        return Err(refused("缺少隔離元件。"));
-    }
-    for name in [BINARY, LAUNCHER] {
+    for name in layout::BINARIES.iter().copied().chain([BINARY, LAUNCHER]) {
+        let failure = || refused(format!("服務執行檔權限或內容不符或無法讀取：{name}"));
         let path = Path::new(name);
-        parents(path)?;
-        trusted(path, false)?;
-        let metadata = fs::symlink_metadata(path)?;
+        parents(path).map_err(|_| failure())?;
+        trusted(path, false).map_err(|_| failure())?;
+        let metadata = fs::symlink_metadata(path).map_err(|_| failure())?;
         if metadata.mode() & 0o7777 != 0o755 || metadata.nlink() != 1 || metadata.len() == 0 {
-            return Err(refused("服務執行檔權限或內容不符。"));
+            return Err(failure());
         }
     }
     Ok(())
+}
+
+fn directory_failure(path: &str, mode_mismatch: bool) -> DuDuClawError {
+    refused(if mode_mismatch { format!("隔離服務目錄權限不符：{path}") }
+        else { format!("隔離服務目錄不符或無法讀取：{path}") })
 }
 
 fn directories() -> Result<()> {
     for (path, mode) in layout::DIRECTORIES {
-        parents(Path::new(path))?;
-        trusted(Path::new(path), true)?;
-        if fs::symlink_metadata(path)?.mode() & 0o7777 != *mode {
-            return Err(refused("隔離服務目錄權限不符。"));
+        parents(Path::new(path)).map_err(|_| directory_failure(path, false))?;
+        trusted(Path::new(path), true).map_err(|_| directory_failure(path, false))?;
+        if fs::symlink_metadata(path).map_err(|_| directory_failure(path, false))?.mode() & 0o7777 != *mode {
+            return Err(directory_failure(path, true));
         }
     }
-    for path in ["/usr/lib/duduclaw/parse-root"] {
-        if !layout::parse_root_is_reusable(Path::new(path), 0, 0)? {
-            return Err(refused("解析服務目錄含有非預期內容。"));
-        }
+    let parse_root_failure = || refused("解析服務目錄含有非預期內容：/usr/lib/duduclaw/parse-root");
+    if !layout::parse_root_is_reusable(Path::new("/usr/lib/duduclaw/parse-root"), 0, 0)
+        .map_err(|_| parse_root_failure())? {
+        return Err(parse_root_failure());
     }
-    parse_runtime_tree(false)?;
+    parse_runtime_tree(false).map_err(|error| {
+        // Only this function's fixed refusals may cross the group boundary.
+        let detail = group_detail(&Err(error));
+        match detail.as_deref() {
+            Some(reason @ ("缺少已驗證的隔離安裝狀態，未建立解析執行環境。"
+                | "隔離更新進行中，稍後再準備解析執行環境。"
+                | "隔離更新狀態無法完整讀取，未驗證解析執行環境。"
+                | "隔離更新狀態無效，未驗證解析執行環境。"
+                | "隔離世代尚未完成更新，未變更解析執行環境。"
+                | "隔離世代的簽章文件不符。"
+                | "解析元件與已啟用世代不符。"
+                | "簽章文件缺少解析元件。"
+                | "簽章文件的解析元件規格不符。"
+                | "已發布解析元件與簽章文件不符。"
+                | "解析服務掛載目錄含有非預期內容。")) => refused(reason),
+            _ => refused("解析執行環境驗證未通過：/usr/lib/duduclaw/parse-root-tree"),
+        }
+    })?;
     Ok(())
 }
 
 fn accounts() -> Result<()> {
-    let defs = fs::read_to_string("/etc/login.defs")?;
+    let defs = fs::read_to_string("/etc/login.defs")
+        .map_err(|_| refused("服務帳號系統範圍設定無法讀取：duduclaw（/etc/login.defs）"))?;
     let mut identities = Vec::new();
     for name in std::iter::once("duduclaw").chain(layout::ACCOUNTS.iter().copied()) {
-        let passwd = String::from_utf8(checked("getent", &["passwd", name])?.stdout)
-            .map_err(|_| refused("無法讀取服務帳號。"))?;
+        let unreadable = || refused(format!("服務帳號資料無法讀取：{name}"));
+        let passwd = String::from_utf8(checked("getent", &["passwd", name]).map_err(|_| unreadable())?.stdout)
+            .map_err(|_| refused(format!("無法讀取服務帳號：{name}")))?;
         let fields: Vec<_> = passwd.trim_end_matches('\n').split(':').collect();
         let expected_home = if name == "duduclaw" { "/var/lib/duduclaw" } else { "/nonexistent" };
         if fields.len() != 7 || fields[0] != name || fields[5] != expected_home
             || !matches!(fields[6], "/usr/sbin/nologin" | "/sbin/nologin") {
-            return Err(refused("服務帳號的家目錄或登入設定不符。"));
+            return Err(refused(format!("服務帳號的家目錄或登入設定不符：{name}")));
         }
-        let uid = fields[2].parse::<u32>().map_err(|_| refused("無效的服務身分。"))?;
-        let gid = fields[3].parse::<u32>().map_err(|_| refused("無效的服務群組。"))?;
-        layout::validate_system_ids(uid, gid, &defs).map_err(refused)?;
-        if identities.iter().any(|(u, g)| *u == uid || *g == gid) { return Err(refused("服務身分重複。")); }
+        let uid = fields[2].parse::<u32>().map_err(|_| refused(format!("無效的服務身分：{name}")))?;
+        let gid = fields[3].parse::<u32>().map_err(|_| refused(format!("無效的服務群組：{name}")))?;
+        layout::validate_system_ids(uid, gid, &defs)
+            .map_err(|_| refused(format!("服務帳號的系統身分範圍不符：{name}")))?;
+        if identities.iter().any(|(u, g)| *u == uid || *g == gid) { return Err(refused(format!("服務身分重複：{name}"))); }
         identities.push((uid, gid));
         if name == "duduclaw" {
             let home = Path::new(expected_home);
-            parents(home)?;
-            if !layout::migrated_home_is_private(home, 0, 0, uid, gid)? {
-                return Err(refused("遷移後的服務資料目錄擁有者或權限不符。"));
+            parents(home).map_err(|_| unreadable())?;
+            if !layout::migrated_home_is_private(home, 0, 0, uid, gid).map_err(|_| unreadable())? {
+                return Err(refused(format!("遷移後的服務資料目錄擁有者或權限不符：{name}")));
             }
         }
-        let groups = String::from_utf8(checked("id", &["-G", name])?.stdout)
-            .map_err(|_| refused("無法讀取服務群組。"))?;
+        let groups = String::from_utf8(checked("id", &["-G", name]).map_err(|_| unreadable())?.stdout)
+            .map_err(|_| refused(format!("無法讀取服務群組：{name}")))?;
         if groups.split_whitespace().collect::<Vec<_>>() != vec![fields[3]] {
-            return Err(refused("服務帳號帶有額外群組。"));
+            return Err(refused(format!("服務帳號帶有額外群組：{name}")));
         }
-        let shadow = String::from_utf8(checked("getent", &["shadow", name])?.stdout)
-            .map_err(|_| refused("無法確認服務帳號已鎖定。"))?;
+        let shadow = String::from_utf8(checked("getent", &["shadow", name]).map_err(|_| unreadable())?.stdout)
+            .map_err(|_| refused(format!("無法確認服務帳號已鎖定：{name}")))?;
         let shadow: Vec<_> = shadow.trim_end_matches('\n').split(':').collect();
         if shadow.len() != 9 || shadow[0] != name || !matches!(shadow[1].as_bytes().first(), Some(b'!' | b'*')) {
-            return Err(refused("服務帳號尚未鎖定密碼。"));
+            return Err(refused(format!("服務帳號尚未鎖定密碼：{name}")));
         }
-        if name != "duduclaw" && shadow[7] != "1" { return Err(refused("輔助服務帳號的到期封鎖設定不符。")); }
+        if name != "duduclaw" && shadow[7] != "1" { return Err(refused(format!("輔助服務帳號的到期封鎖設定不符：{name}"))); }
         match fs::symlink_metadata(format!("/var/lib/systemd/linger/{name}")) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
-            _ => return Err(refused("服務帳號仍可啟動背景登入工作階段。")),
+            _ => return Err(refused(format!("服務帳號仍可啟動背景登入工作階段：{name}"))),
         }
     }
     Ok(())
@@ -939,7 +960,7 @@ pub(super) fn unit_loaded_active(name: &str) -> Result<()> {
 
 fn units() -> Result<()> {
     platform_units()?;
-    unit_loaded_active(UNIT)
+    unit_loaded_active(UNIT).map_err(|_| refused(format!("隔離服務未就緒或設定不符：{UNIT}")))
 }
 
 /// Every layout unit file as installed, and every isolation service active;
@@ -950,23 +971,28 @@ fn units() -> Result<()> {
 /// The DNS broker unit must be the text generated for the upstream the
 /// root-owned broker config records (the shipped text when there is none).
 fn platform_units() -> Result<()> {
-    let upstream = recorded_broker_upstream()?;
+    let upstream = recorded_broker_upstream()
+        .map_err(|_| refused(format!("DNS 轉送服務設定無法讀取或不符：{}", layout::DNS_BROKER_UNIT)))?;
     for (name, expected) in layout::UNITS {
         let path = Path::new("/etc/systemd/system").join(name);
-        parents(&path)?;
-        trusted(&path, false)?;
-        if fs::symlink_metadata(&path)?.mode() & 0o7777 != 0o644 {
-            return Err(refused("隔離服務單元與安裝版本不符。"));
+        let failure = || refused(format!("隔離服務單元與安裝版本不符或無法讀取：{name}"));
+        parents(&path).map_err(|_| failure())?;
+        trusted(&path, false).map_err(|_| failure())?;
+        if fs::symlink_metadata(&path).map_err(|_| failure())?.mode() & 0o7777 != 0o644 {
+            return Err(failure());
         }
         if *name == layout::DNS_BROKER_UNIT {
-            layout::dns_broker_unit_check(&fs::read(&path)?, upstream).map_err(refused)?;
-        } else if fs::read_to_string(&path)? != *expected {
-            return Err(refused("隔離服務單元與安裝版本不符。"));
+            layout::dns_broker_unit_check(&fs::read(&path).map_err(|_| failure())?, upstream)
+                .map_err(|reason| if reason.strip_prefix(layout::DNS_BROKER_MISMATCH_HEAD).is_some() {
+                    refused(reason)
+                } else { failure() })?;
+        } else if fs::read_to_string(&path).map_err(|_| failure())? != *expected {
+            return Err(failure());
         }
     }
     for name in ["duduclaw-spawnd.service", "duduclaw-spawnd.socket", "duduclaw-isolation-ready.service", "duduclaw-egress.service",
         "duduclaw-egress.socket", "duduclaw-updated.service", "duduclaw-parse.socket"] {
-        unit_loaded_active(name)?;
+        unit_loaded_active(name).map_err(|_| refused(format!("隔離服務未就緒或設定不符：{name}")))?;
     }
     Ok(())
 }
@@ -982,11 +1008,15 @@ fn recorded_broker_upstream() -> Result<Option<std::net::SocketAddr>> {
     Ok(Some(config.upstream))
 }
 
-/// The broker unit's allow-rule mismatch is the one failure detail printed
-/// (`layout::dns_broker_unit_mismatch`: fixed wording naming the rule only).
-fn broker_unit_detail(result: &Result<()>) -> Option<String> {
-    let text = result.as_ref().err()?.to_string();
-    text.find(layout::DNS_BROKER_MISMATCH_HEAD).map(|start| text[start..].to_owned())
+/// Failed groups print only sanitized refusals; unexpected errors stay opaque.
+fn group_detail(result: &Result<()>) -> Option<String> {
+    let error = result.as_ref().err()?;
+    if let DuDuClawError::Config(text) = error {
+        if let Some(reason) = text.strip_prefix("Protected Linux service refused: ") {
+            return Some(reason.to_owned());
+        }
+    }
+    Some("無法完成這項檢查。".to_owned())
 }
 
 /// The bootstrap's step S7 (plan §4.3): the composite check before the
@@ -1000,7 +1030,7 @@ pub(super) fn check_platform(composite: &mut impl CompositeReadiness) -> Result<
     for (label, result) in results {
         if result.is_ok() { println!("[通過] {label}"); }
         else { failed += 1; println!("[未通過] {label}"); }
-        if let Some(detail) = broker_unit_detail(&result) { println!("  - {detail}"); }
+        if let Some(detail) = group_detail(&result) { println!("  - {detail}"); }
     }
     let (lines, composite_failed, _) = render(&composite.assess());
     for line in lines { println!("{line}"); }
@@ -1054,7 +1084,7 @@ pub(super) fn check(composite: &mut impl CompositeReadiness) -> Result<()> {
     for (label, result) in results {
         if result.is_ok() { println!("[通過] {label}"); }
         else { failed += 1; println!("[未通過] {label}"); }
-        if let Some(detail) = broker_unit_detail(&result) { println!("  - {detail}"); }
+        if let Some(detail) = group_detail(&result) { println!("  - {detail}"); }
     }
     let (lines, composite_failed, pending) = render(&composite.assess());
     for line in lines { println!("{line}"); }

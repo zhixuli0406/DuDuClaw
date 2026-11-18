@@ -205,6 +205,24 @@ fields refused, 5 s timeouts. Every refusal is the single `Refused` outcome.
   manifest's facts of exactly those bytes and `effective_uid` is the measurer's
   (0). A file that cannot be opened, verified or measured in time reports
   `ready: false`; nothing is guessed.
+- Read-back rule (all three daemons): a component's read-back `ready` means
+  serving with a complete identity AND, for the gateway, its own local
+  initialisation finished (stores open, service entry up, spawnd backend
+  connected); whole-host readiness and the updater's own answers are never an
+  input of the updater's verification (spawnd: a recent healthy admission-loop
+  iteration; gateway/egress: their read-back endpoint serving). Whole-host
+  readiness (spawnd's evidence, the gateway's `isolation_readiness`) needs the
+  updater's probe answer, which it gives only after its start-up verification,
+  so using it there is a circular wait. Whole-host readiness is enforced at admission instead (spawnd's
+  `Readiness::check`, the gateway's `check_execution` before every run).
+  Evidence: whenever the set of false checks changes, spawnd prints one stderr
+  line, `evidence incomplete: <readiness.json names>` with the first failing
+  resources sub-condition as `resources_verified(<name>)` (`ResourceCheck`,
+  e.g. `employees_slice_cgroup`) and the DNS probe's reason as
+  `dns_route_verified(<reason>)` (`dns_evidence::Reason`: `pending`, `stale`,
+  `no_probe_name`, `policy_unreadable`, `egress_config_unreadable`,
+  `no_control_connection`, `exchange_failed`, `refused`, `route_mismatch`,
+  `unresolved`, `no_public_answer`), or `evidence complete`.
 - `Resume{g}` requires that no journal exists or that it says `published` for
   `g`; it removes the journal, then the record, durably, then reopens admission.
   It is the only way to lift the barrier. At start the record is read strictly
@@ -287,7 +305,12 @@ Workload census (`Effects::workloads`, production `system_census`): PID 1's
 `ListUnits` over the system bus, counting every `duduclaw-run-<id>.service`
 (exact name) in a state other than `inactive`/`failed`, and
 `/sys/fs/cgroup/duduclaw.slice/duduclaw-employees.slice/cgroup.events`, which
-must say `populated 0` or be absent (every run unit lives below it). The cgroup
+must say `populated 0` or be absent (every run unit lives below it). The slice
+itself is started with spawnd (`Wants=`/`After=duduclaw-employees.slice` in the
+unit): it exists from install and after every reboot with zero employees, its
+cgroup is realised before spawnd's mount namespace is built (so the
+`-`-prefixed cgroup `ReadWritePaths=` entry is bound), and `resources_verified`
+requires it (`employees_slice_cgroup` while it is not started). The cgroup
 root must be the unified hierarchy (`cgroup.controllers`). Nothing comes from
 this process's memory, so runs started by an earlier spawnd process whose
 asynchronous teardown is still in progress are seen. A census that cannot be

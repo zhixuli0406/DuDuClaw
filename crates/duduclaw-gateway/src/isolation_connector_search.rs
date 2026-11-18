@@ -13,7 +13,6 @@ pub struct SearchConnectorProvider {
 impl SearchConnectorProvider {
     /// InstalledWorkerServices can only be obtained after installing a checked
     /// launcher; absence is a startup error, never a local HTML parser fallback.
-    #[cfg(feature = "isolation-worker-integration")]
     pub fn new(employee: EmployeeId, account: ProductConnectorAccount,
         _worker: &crate::isolation_execution::InstalledWorkerServices) -> Result<Self, VerificationError> {
         if !matches!(account, ProductConnectorAccount::SharedHome { .. }) || account.account().is_empty() {

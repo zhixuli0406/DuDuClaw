@@ -128,15 +128,13 @@ exchange, revalidating after transport waits and immediately before socket I/O.
 Cancellation is not a worker teardown receipt; E retains its admission lease
 until its own teardown rules permit release.
 
-On the integration branch, the gateway's `isolation-worker-integration` feature
-builds the direct Package E adapter. Trusted boot calls
+Since v1.83, the gateway always compiles the direct Package E adapter;
+`isolation-worker-integration` is an inert compatibility feature. Trusted boot calls
 `isolation_execution::install_worker_services` with a `WorkerLauncher` once,
 then uses its `.parser` for CSV/XLSX and `.tools(factory, resolver)` for worker
 operations. E owns `WorkerSession`, admission, sealed snapshots and teardown;
-the gateway does not enable E's `engine` feature. This feature needs the E
-dependency already present on the integration branch and is not buildable in
-the standalone Package D worktree. Actual E/gateway compilation and Linux
-launcher tests remain remote integration checks.
+the gateway does not enable E's `engine` feature. Actual E/gateway compilation
+and Linux launcher tests remain remote integration checks.
 
 `ExecutionToolBridge::with_jobs` installs a gateway-owned result/control store.
 Factories opting into typed result collection require it for both list and call.

@@ -1,6 +1,234 @@
 //! Hardware detection for automatic backend selection.
+//!
+//! R8j round 2 B2: every probe command (`nvidia-smi`, `rocm-smi`, `sysctl`)
+//! runs under a hard deadline ([`PROBE_COMMAND_TIMEOUT`]); on expiry the child
+//! is killed and reaped and detection continues with the safe default (no GPU
+//! detected). A hung GPU tool can no longer hold its caller forever.
+//! R8j round 3 F2: on Unix each probe runs in its own process group (its pid
+//! is the group id) and the whole group is SIGKILLed, so a helper the tool
+//! forked cannot outlive the deadline.
+//! R8j round 5: one guard (`ProbeProcess`) owns the child; it never signals a
+//! leader that was reaped (including by someone else: ECHILD), and its Drop
+//! kills the group when the caller cancels the probe mid-flight.
 
+use std::{process::{ExitStatus, Output, Stdio}, time::Duration};
 use crate::types::{BackendType, GpuType, HardwareInfo};
+
+/// Hard bound for one probe command. A healthy `nvidia-smi` answers in well
+/// under a second with the persistence daemon and in a few seconds on a cold
+/// multi-GPU driver start; 5 s keeps that margin while bounding a hang. At
+/// most two probe commands run per detection (GPU name, then VRAM or the AMD
+/// tool), so one detection takes at most 2 × (5 s + [`PROBE_REAP_GRACE`]).
+pub const PROBE_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+/// After the kill, how long the exit is awaited (which reaps the child). Only
+/// a process stuck in an uninterruptible kernel wait outlives SIGKILL longer;
+/// it is then handed, unsignalled, to tokio's orphan reaper when the probe's
+/// guard is dropped, which reaps it as soon as it exits.
+pub const PROBE_REAP_GRACE: Duration = Duration::from_secs(1);
+/// At most this much of a probe's stdout is kept.
+const PROBE_OUTPUT_LIMIT: u64 = 64 * 1024;
+
+/// Builds one probe command (`program` is a fixed platform tool); the seam
+/// tests replace.
+type ProbeCommand = fn(&'static str) -> tokio::process::Command;
+
+/// Production probe command: the named tool under the namespace guard.
+fn guarded_command(program: &'static str) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(program);
+    duduclaw_core::ns_guard::guard_command(&mut cmd);
+    cmd
+}
+
+/// How one bounded probe ended.
+#[derive(Debug)]
+enum Probe {
+    Finished(Output),
+    /// Could not start, or failed while running (killed and reaped).
+    Failed,
+    /// The deadline passed: killed; `reaped` once its exit was collected.
+    TimedOut { pid: Option<u32>, reaped: bool },
+}
+
+/// Whether the probe's direct child (the process group leader) may still be
+/// held by the kernel. While `Unreaped` its pid — and so the group id — stays
+/// allocated to it and cannot be reused; after `Reaped` it may be.
+#[derive(Debug, PartialEq, Eq)]
+enum LeaderState {
+    Unreaped,
+    Reaped,
+}
+
+/// `ECHILD` from a wait: the child is no longer ours to wait for — something
+/// else (SIGCHLD ignored, `SA_NOCLDWAIT`, another waiter) already reaped it.
+#[cfg(unix)]
+fn reaped_elsewhere(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ECHILD)
+}
+#[cfg(not(unix))]
+fn reaped_elsewhere(_: &std::io::Error) -> bool {
+    false
+}
+
+/// R8j round 5: the single owner of one probe child's lifetime. It is the
+/// only code that ever signals the child or its process group (the command
+/// is built with `kill_on_drop(false)`, so tokio never signals on its own).
+///
+/// Transition table (`leader`; nothing else ever sets `Reaped`):
+///
+/// | event (via [`ProbeProcess::observe_wait`])  | `leader` afterwards | signal |
+/// |---------------------------------------------|---------------------|--------|
+/// | `wait()` → `Ok(status)`                     | `Reaped`            | none   |
+/// | `wait()` → `Err(ECHILD)` (reaped elsewhere) | `Reaped`            | none, ever |
+/// | `wait()` → any other `Err`                  | `Unreaped`          | kill path ([`ProbeProcess::kill_group`]) |
+///
+/// `kill_group` signals only in `Unreaped` and at most once (`killed`).
+struct ProbeProcess {
+    child: tokio::process::Child,
+    /// The child's pid captured at spawn; `process_group(0)` made it the
+    /// group id on Unix.
+    pgid: u32,
+    leader: LeaderState,
+    /// `kill_group` has signalled (it never signals twice).
+    killed: bool,
+}
+
+impl ProbeProcess {
+    /// Takes ownership right after a successful spawn. A child without a pid
+    /// at this point is treated as a spawn failure: killed through its handle
+    /// (a no-op for one tokio already knows to have exited) and refused.
+    fn new(mut child: tokio::process::Child) -> Option<Self> {
+        let Some(pgid) = child.id() else {
+            let _ = child.start_kill();
+            return None;
+        };
+        Some(Self { child, pgid, leader: LeaderState::Unreaped, killed: false })
+    }
+
+    /// Records the result of a `wait()` / `try_wait()` on the child — the
+    /// only place `leader` becomes `Reaped` — and passes it through.
+    fn observe_wait(&mut self, waited: std::io::Result<ExitStatus>) -> std::io::Result<ExitStatus> {
+        match &waited {
+            Ok(_) => self.leader = LeaderState::Reaped,
+            // Gone and reaped elsewhere: its pid (and group id) may already
+            // belong to another process, so it is never signalled again.
+            Err(error) if reaped_elsewhere(error) => self.leader = LeaderState::Reaped,
+            // Any other wait failure: the kernel still holds the child.
+            Err(_) => {}
+        }
+        waited
+    }
+
+    /// SIGKILL to the probe's whole process group (Unix: `kill(-pgid)`), then
+    /// to the direct child through its handle. Synchronous, never waits, and
+    /// idempotent: signals only while the leader is `Unreaped` and only once.
+    fn kill_group(&mut self) {
+        if self.leader == LeaderState::Reaped || self.killed { return; }
+        self.killed = true;
+        #[cfg(all(test, unix))]
+        let _ = tests::GROUP_KILLS.try_with(|count| {
+            assert_eq!(self.leader, LeaderState::Unreaped);
+            count.set(count.get() + 1);
+        });
+        #[cfg(unix)]
+        if let Ok(group) = libc::pid_t::try_from(self.pgid) && group > 1 {
+            // SAFETY: kill takes scalar arguments only; a negative pid
+            // addresses the process group `group` (killpg). ESRCH (the
+            // group is already empty) is ignored.
+            unsafe { libc::kill(-group, libc::SIGKILL); }
+        }
+        let _ = self.child.start_kill();
+    }
+
+    /// The timeout/failure cleanup: [`Self::kill_group`], then collect the
+    /// child's exit (reaping it) for at most [`PROBE_REAP_GRACE`]. Returns
+    /// whether the leader is now reaped. If the grace passes, the leader
+    /// stays `Unreaped` with `killed` set, and Drop hands it unsignalled to
+    /// tokio's orphan reaper.
+    async fn kill_and_reap(&mut self) -> bool {
+        self.kill_group();
+        if self.leader == LeaderState::Reaped { return true; }
+        if let Ok(waited) = tokio::time::timeout(PROBE_REAP_GRACE, self.child.wait()).await {
+            let _ = self.observe_wait(waited);
+        }
+        self.leader == LeaderState::Reaped
+    }
+}
+
+/// Cancellation path: the caller dropped [`run_bounded`]'s future mid-read or
+/// mid-wait, so its cleanup never ran. An `Unreaped` leader that was not yet
+/// killed gets [`ProbeProcess::kill_group`] (the whole group, so a forked
+/// helper holding stdout dies too); a `Reaped` one, or one already killed, is
+/// left alone — the group kill is not repeated (at most once; a repeat would
+/// be safe only while unreaped, and adds nothing to a SIGKILL already sent).
+/// Never blocks: the `Child` field is then dropped normally and, with
+/// `kill_on_drop(false)`, tokio hands an unreaped child to its orphan reaper,
+/// which reaps it once it exits, without signalling it.
+impl Drop for ProbeProcess {
+    fn drop(&mut self) {
+        self.kill_group();
+    }
+}
+
+/// Runs `cmd` (stdin closed, stderr discarded, stdout captured up to
+/// [`PROBE_OUTPUT_LIMIT`]) for at most `limit`. Starts one child process, on
+/// Unix as the leader of a new process group (`process_group(0)`: group id =
+/// its pid), which everything it forks inherits.
+///
+/// Invariant: the process group is signalled only by
+/// [`ProbeProcess::kill_group`], only while the leader is unreaped (no
+/// successful wait and no ECHILD seen), and at most once. This also holds when
+/// the returned future is dropped early (the guard's Drop).
+async fn run_bounded(mut cmd: tokio::process::Command, limit: Duration) -> Probe {
+    use tokio::io::AsyncReadExt;
+    // The guard is the only signaller: tokio must not kill on drop.
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(false);
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let Ok(child) = cmd.spawn() else { return Probe::Failed };
+    let Some(mut guard) = ProbeProcess::new(child) else { return Probe::Failed };
+    let deadline = tokio::time::Instant::now() + limit;
+    let Some(mut stdout) = guard.child.stdout.take() else {
+        guard.kill_and_reap().await;
+        return Probe::Failed;
+    };
+    let ran = tokio::time::timeout_at(deadline, async {
+        let mut bytes = Vec::new();
+        let mut buffer = [0; 4096];
+        loop {
+            let read = stdout.read(&mut buffer).await?;
+            if read == 0 { break; }
+            let keep = read.min(PROBE_OUTPUT_LIMIT as usize - bytes.len());
+            bytes.extend_from_slice(&buffer[..keep]);
+        }
+        // Only wait after EOF, under the same deadline (the remaining time).
+        // A ready wait is observed in the same poll, so cancellation cannot
+        // fall between the reap and the state change.
+        let waited = guard.child.wait().await;
+        let status = guard.observe_wait(waited)?;
+        // A helper outliving a normally exited probe is left alone: after
+        // reaping, its former group id must never be signalled.
+        Ok::<_, std::io::Error>(Output { status, stdout: bytes, stderr: Vec::new() })
+    }).await;
+    match ran {
+        Ok(Ok(output)) => Probe::Finished(output),
+        // Read or wait failure; after ECHILD the guard refuses to signal.
+        Ok(Err(_)) => { guard.kill_and_reap().await; Probe::Failed }
+        Err(_) => { let reaped = guard.kill_and_reap().await; Probe::TimedOut { pid: Some(guard.pgid), reaped } }
+    }
+}
+
+/// [`run_bounded`]'s output, or `None` (not started, failed or timed out).
+async fn bounded_output(cmd: tokio::process::Command, limit: Duration) -> Option<Output> {
+    match run_bounded(cmd, limit).await {
+        Probe::Finished(output) => Some(output),
+        Probe::Failed => None,
+        Probe::TimedOut { pid, reaped } => {
+            tracing::warn!(pid = ?pid, reaped, limit_ms = limit.as_millis() as u64,
+                "hardware probe command exceeded its deadline and was killed; continuing without it");
+            None
+        }
+    }
+}
 
 /// Detect available hardware and recommend the best backend.
 pub async fn detect_hardware() -> HardwareInfo {
@@ -54,14 +282,19 @@ async fn detect_gpu() -> (GpuType, String) {
         let name = detect_apple_chip().await;
         return (GpuType::AppleSilicon, name);
     }
+    detect_discrete_gpu(guarded_command, PROBE_COMMAND_TIMEOUT).await
+}
 
+/// NVIDIA, then AMD; a tool that is missing, fails or exceeds `limit` counts
+/// as no such GPU (default: CPU only).
+async fn detect_discrete_gpu(command: ProbeCommand, limit: Duration) -> (GpuType, String) {
     // NVIDIA detection
-    if let Some(name) = detect_nvidia().await {
+    if let Some(name) = detect_nvidia(command, limit).await {
         return (GpuType::NvidiaCuda, name);
     }
 
     // AMD detection
-    if let Some(name) = detect_amd().await {
+    if let Some(name) = detect_amd(command, limit).await {
         return (GpuType::AmdRocm, name);
     }
 
@@ -69,27 +302,21 @@ async fn detect_gpu() -> (GpuType, String) {
 }
 
 async fn detect_apple_chip() -> String {
-    let output = tokio::process::Command::new("sysctl")
-        .args(["-n", "machdep.cpu.brand_string"])
-        .output()
-        .await;
+    let mut cmd = tokio::process::Command::new("sysctl");
+    cmd.args(["-n", "machdep.cpu.brand_string"]);
 
-    match output {
-        Ok(o) if o.status.success() => {
+    match bounded_output(cmd, PROBE_COMMAND_TIMEOUT).await {
+        Some(o) if o.status.success() => {
             String::from_utf8_lossy(&o.stdout).trim().to_string()
         }
         _ => "Apple Silicon".to_string(),
     }
 }
 
-async fn detect_nvidia() -> Option<String> {
-    let mut cmd = tokio::process::Command::new("nvidia-smi");
-    duduclaw_core::ns_guard::guard_command(&mut cmd);
-    let output = cmd
-        .args(["--query-gpu=name", "--format=csv,noheader,nounits"])
-        .output()
-        .await
-        .ok()?;
+async fn detect_nvidia(command: ProbeCommand, limit: Duration) -> Option<String> {
+    let mut cmd = command("nvidia-smi");
+    cmd.args(["--query-gpu=name", "--format=csv,noheader,nounits"]);
+    let output = bounded_output(cmd, limit).await?;
 
     if !output.status.success() {
         return None;
@@ -104,16 +331,13 @@ async fn detect_nvidia() -> Option<String> {
     Some(name)
 }
 
-async fn detect_amd() -> Option<String> {
+async fn detect_amd(command: ProbeCommand, limit: Duration) -> Option<String> {
     // Try rocm-smi first
-    let mut cmd = tokio::process::Command::new("rocm-smi");
-    duduclaw_core::ns_guard::guard_command(&mut cmd);
-    let output = cmd
-        .args(["--showproductname"])
-        .output()
-        .await;
+    let mut cmd = command("rocm-smi");
+    cmd.args(["--showproductname"]);
+    let output = bounded_output(cmd, limit).await;
 
-    if let Ok(o) = output
+    if let Some(o) = output
         && o.status.success() {
             let text = String::from_utf8_lossy(&o.stdout);
             if let Some(line) = text.lines().find(|l| l.contains("GPU")) {
@@ -275,24 +499,20 @@ fn detect_ram_windows() -> (u64, u64) {
 async fn detect_vram(gpu_type: &GpuType, ram_total: u64, ram_available: u64) -> (u64, u64) {
     match gpu_type {
         GpuType::AppleSilicon => (ram_total, ram_available), // Unified memory
-        GpuType::NvidiaCuda => detect_nvidia_vram().await,
+        GpuType::NvidiaCuda => detect_nvidia_vram(guarded_command, PROBE_COMMAND_TIMEOUT).await,
         _ => (0, 0),
     }
 }
 
-async fn detect_nvidia_vram() -> (u64, u64) {
-    let mut cmd = tokio::process::Command::new("nvidia-smi");
-    duduclaw_core::ns_guard::guard_command(&mut cmd);
-    let output = cmd
-        .args([
-            "--query-gpu=memory.total,memory.free",
-            "--format=csv,noheader,nounits",
-        ])
-        .output()
-        .await;
+async fn detect_nvidia_vram(command: ProbeCommand, limit: Duration) -> (u64, u64) {
+    let mut cmd = command("nvidia-smi");
+    cmd.args([
+        "--query-gpu=memory.total,memory.free",
+        "--format=csv,noheader,nounits",
+    ]);
 
-    match output {
-        Ok(o) if o.status.success() => {
+    match bounded_output(cmd, limit).await {
+        Some(o) if o.status.success() => {
             let text = String::from_utf8_lossy(&o.stdout);
             if let Some(line) = text.lines().next() {
                 let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
@@ -305,5 +525,250 @@ async fn detect_nvidia_vram() -> (u64, u64) {
             (0, 0)
         }
         _ => (0, 0),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    const SHORT: Duration = Duration::from_millis(200);
+
+    tokio::task_local! {
+        pub(super) static GROUP_KILLS: std::cell::Cell<usize>;
+    }
+
+    /// Stands in for any GPU tool: never exits (the tool's own arguments
+    /// become `$0…` of the script and are ignored).
+    fn hang(_: &'static str) -> tokio::process::Command {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", "exec sleep 30"]);
+        cmd
+    }
+    fn answer(_: &'static str) -> tokio::process::Command {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", "echo 'Tesla T4'"]);
+        cmd
+    }
+    /// The process still exists (a zombie counts: it was not reaped).
+    fn exists(pid: u32) -> bool {
+        std::process::Command::new("sh").args(["-c", &format!("kill -0 {pid} 2>/dev/null")])
+            .status().is_ok_and(|status| status.success())
+    }
+
+    #[tokio::test]
+    async fn hung_probe_is_killed_and_reaped_at_the_deadline() {
+        let started = Instant::now();
+        let probe = run_bounded(hang("nvidia-smi"), SHORT).await;
+        let elapsed = started.elapsed();
+        let Probe::TimedOut { pid: Some(pid), reaped } = probe else { panic!("not timed out") };
+        assert!(reaped, "the killed child's exit was collected");
+        assert!(!exists(pid), "no lingering child or zombie");
+        assert!(elapsed >= SHORT);
+        assert!(elapsed < SHORT + PROBE_REAP_GRACE + Duration::from_secs(1), "{elapsed:?}");
+        // A probe that answers in time is returned as is.
+        let Probe::Finished(output) = run_bounded(answer("nvidia-smi"), Duration::from_secs(5)).await else { panic!("not finished") };
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"Tesla T4\n");
+    }
+
+    /// `kill(pid, 0)` answers ESRCH (gone and reaped) within `bound`.
+    async fn gone_within(pid: libc::pid_t, bound: Duration) -> bool {
+        let until = Instant::now() + bound;
+        loop {
+            // SAFETY: scalar arguments only; signal 0 only checks existence.
+            let rc = unsafe { libc::kill(pid, 0) };
+            if rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) { return true; }
+            if Instant::now() >= until { return false; }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// R8j round 3 F2: a probe tool that forked a helper (which also keeps
+    /// stdout open) and hangs: at the deadline the whole process group is
+    /// killed, neither the shell nor its background `sleep` survives.
+    #[tokio::test]
+    async fn hung_probe_with_forked_helper_kills_the_whole_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let (shell_file, helper_file) = (dir.path().join("shell.pid"), dir.path().join("helper.pid"));
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", "echo $$ > \"$1\"; sleep 600 & echo $! > \"$2\"; wait", "sh"])
+            .arg(&shell_file).arg(&helper_file);
+        let limit = Duration::from_millis(500);
+        let started = Instant::now();
+        let Probe::TimedOut { pid: Some(pid), reaped } = run_bounded(cmd, limit).await else { panic!("not timed out") };
+        assert!(started.elapsed() < limit + PROBE_REAP_GRACE + Duration::from_secs(1), "{:?}", started.elapsed());
+        assert!(reaped, "the direct child was reaped");
+        let read = |path: &std::path::Path| std::fs::read_to_string(path).unwrap().trim().parse::<libc::pid_t>().unwrap();
+        let (shell, helper) = (read(&shell_file), read(&helper_file));
+        assert_eq!(shell as u32, pid, "the shell is the direct child");
+        assert_ne!(helper, shell);
+        assert!(gone_within(shell, Duration::from_secs(5)).await, "shell {shell} survived");
+        assert!(gone_within(helper, Duration::from_secs(5)).await, "forked helper {helper} survived the deadline");
+    }
+
+    #[tokio::test]
+    async fn exited_leader_with_stdout_helper_is_killed_before_reaping() {
+        let dir = tempfile::tempdir().unwrap();
+        let helper_file = dir.path().join("helper.pid");
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", "sleep 600 & echo $! > \"$1\"; exit 0", "sh"]).arg(&helper_file);
+        let limit = Duration::from_millis(500);
+        let started = Instant::now();
+        let probe = GROUP_KILLS.scope(std::cell::Cell::new(0), async {
+            let probe = run_bounded(cmd, limit).await;
+            // The hook also asserts Unreaped at the group-kill site.
+            GROUP_KILLS.with(|count| assert_eq!(count.get(), 1));
+            probe
+        }).await;
+        let Probe::TimedOut { pid: Some(pid), reaped } = probe else { panic!("not timed out") };
+        assert!(started.elapsed() >= limit);
+        assert!(started.elapsed() < limit + PROBE_REAP_GRACE + Duration::from_secs(1));
+        assert!(reaped, "the exited leader was reaped only after the group kill");
+        assert!(!exists(pid));
+        let helper = std::fs::read_to_string(&helper_file).unwrap().trim().parse::<libc::pid_t>().unwrap();
+        assert!(gone_within(helper, Duration::from_secs(5)).await, "helper {helper} survived the deadline");
+    }
+
+    #[tokio::test]
+    async fn normal_probe_returns_output_without_group_cleanup() {
+        GROUP_KILLS.scope(std::cell::Cell::new(0), async {
+            let Probe::Finished(output) = run_bounded(answer("nvidia-smi"), Duration::from_secs(5)).await else { panic!("not finished") };
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"Tesla T4\n");
+            GROUP_KILLS.with(|count| assert_eq!(count.get(), 0));
+        }).await;
+    }
+
+    /// A guard over a live, hanging child spawned like `run_bounded` does
+    /// (own process group, tokio never kills on drop).
+    fn spawn_hanging_guard() -> ProbeProcess {
+        let mut cmd = hang("nvidia-smi");
+        cmd.process_group(0).kill_on_drop(false);
+        ProbeProcess::new(cmd.spawn().unwrap()).expect("a freshly spawned child has a pid")
+    }
+
+    fn kills() -> usize {
+        GROUP_KILLS.with(|count| count.get())
+    }
+
+    #[tokio::test]
+    async fn kill_group_is_idempotent_and_refuses_a_reaped_leader() {
+        GROUP_KILLS.scope(std::cell::Cell::new(0), async {
+            let mut probe = spawn_hanging_guard();
+            let pid = probe.pgid as libc::pid_t;
+            // A live sentinel marked Reaped: any accidental signal would kill it.
+            probe.leader = LeaderState::Reaped;
+            probe.kill_group();
+            probe.kill_group();
+            assert!(probe.kill_and_reap().await);
+            assert_eq!(kills(), 0);
+            assert!(!probe.killed);
+            assert!(exists(pid as u32), "Reaped state must refuse all signalling");
+            // Unreaped: exactly one signal, however often it is asked for.
+            probe.leader = LeaderState::Unreaped;
+            probe.kill_group();
+            probe.kill_group();
+            assert_eq!(kills(), 1);
+            assert!(probe.killed);
+            assert!(probe.kill_and_reap().await, "the killed leader is reaped");
+            assert_eq!(probe.leader, LeaderState::Reaped);
+            // Drop after the explicit cleanup does not signal a second time.
+            drop(probe);
+            assert_eq!(kills(), 1);
+            assert!(gone_within(pid, Duration::from_secs(5)).await);
+        }).await;
+    }
+
+    /// R8j round 5 F-A: ECHILD means the leader was reaped elsewhere — its id
+    /// may already be reused, so neither the group nor the pid is signalled.
+    #[tokio::test]
+    async fn echild_marks_the_leader_reaped_and_sends_no_signal() {
+        GROUP_KILLS.scope(std::cell::Cell::new(0), async {
+            let mut probe = spawn_hanging_guard();
+            let pid = probe.pgid as libc::pid_t;
+            let waited = probe.observe_wait(Err(std::io::Error::from_raw_os_error(libc::ECHILD)));
+            assert!(waited.is_err(), "the probe is reported as failed");
+            assert_eq!(probe.leader, LeaderState::Reaped);
+            probe.kill_group();
+            assert!(probe.kill_and_reap().await);
+            assert!(!probe.killed);
+            assert_eq!(kills(), 0);
+            // The real child (standing in for a reused pid) was not touched.
+            assert!(exists(pid as u32), "no signal reached the sentinel");
+            // Test cleanup outside the guard; the guard's Drop sends nothing.
+            // SAFETY: scalar arguments only; `pid` is our unreaped child.
+            unsafe { libc::kill(pid, libc::SIGKILL); }
+            drop(probe);
+            assert_eq!(kills(), 0);
+            assert!(gone_within(pid, Duration::from_secs(5)).await, "tokio's orphan reaper collected it");
+        }).await;
+    }
+
+    /// Any other wait error leaves the kernel holding the child: the state
+    /// stays Unreaped and the kill path signals exactly once.
+    #[tokio::test]
+    async fn other_wait_errors_keep_the_leader_unreaped_and_kill_once() {
+        GROUP_KILLS.scope(std::cell::Cell::new(0), async {
+            let mut probe = spawn_hanging_guard();
+            let pid = probe.pgid as libc::pid_t;
+            for errno in [libc::EINTR, libc::EIO] {
+                assert!(probe.observe_wait(Err(std::io::Error::from_raw_os_error(errno))).is_err());
+                assert_eq!(probe.leader, LeaderState::Unreaped, "errno {errno}");
+            }
+            assert!(probe.kill_and_reap().await);
+            assert_eq!(probe.leader, LeaderState::Reaped);
+            assert_eq!(kills(), 1);
+            drop(probe);
+            assert_eq!(kills(), 1);
+            assert!(gone_within(pid, Duration::from_secs(5)).await);
+        }).await;
+    }
+
+    /// R8j round 5 F-B: the caller drops the probe future mid-read; the
+    /// guard's Drop kills the whole group, so neither the shell nor the
+    /// forked helper holding stdout survives.
+    #[tokio::test]
+    async fn cancelled_probe_kills_the_whole_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let (shell_file, helper_file) = (dir.path().join("shell.pid"), dir.path().join("helper.pid"));
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", "echo $$ > \"$1\"; sleep 600 & echo $! > \"$2\"; wait", "sh"])
+            .arg(&shell_file).arg(&helper_file);
+        let read = |path: &std::path::Path| std::fs::read_to_string(path).ok()?.trim().parse::<libc::pid_t>().ok();
+        GROUP_KILLS.scope(std::cell::Cell::new(0), async {
+            let mut probe = Box::pin(run_bounded(cmd, Duration::from_secs(30)));
+            let until = Instant::now() + Duration::from_secs(5);
+            // Drive the probe (≥ 200 ms) until the helper exists, then cancel.
+            let started = Instant::now();
+            while read(&helper_file).is_none() || started.elapsed() < Duration::from_millis(200) {
+                assert!(Instant::now() < until, "the probe script never started its helper");
+                tokio::select! {
+                    ended = &mut probe => panic!("the probe ended before cancellation: {ended:?}"),
+                    _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+                }
+            }
+            assert_eq!(kills(), 0);
+            drop(probe);
+            assert_eq!(kills(), 1, "the dropped guard killed the group once");
+        }).await;
+        let (shell, helper) = (read(&shell_file).unwrap(), read(&helper_file).unwrap());
+        assert_ne!(helper, shell);
+        assert!(gone_within(shell, Duration::from_secs(5)).await, "shell {shell} survived the cancellation");
+        assert!(gone_within(helper, Duration::from_secs(5)).await, "forked helper {helper} survived the cancellation");
+    }
+
+    #[tokio::test]
+    async fn hung_gpu_tools_default_to_no_gpu_within_the_bound() {
+        let started = Instant::now();
+        assert_eq!(detect_discrete_gpu(hang, SHORT).await, (GpuType::None, "CPU only".to_string()));
+        assert_eq!(detect_nvidia_vram(hang, SHORT).await, (0, 0));
+        // Three probes (NVIDIA, AMD, VRAM), each cut at the deadline.
+        assert!(started.elapsed() < 3 * (SHORT + PROBE_REAP_GRACE) + Duration::from_secs(1), "{:?}", started.elapsed());
+        // Through the same seam, an answering tool is detected.
+        assert_eq!(detect_discrete_gpu(answer, Duration::from_secs(5)).await, (GpuType::NvidiaCuda, "Tesla T4".to_string()));
+        // The production bound is a few seconds, never unbounded.
+        assert_eq!(PROBE_COMMAND_TIMEOUT, Duration::from_secs(5));
     }
 }

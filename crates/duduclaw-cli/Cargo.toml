@@ -137,8 +137,8 @@ http-body-util = "0.1"
 axum = { workspace = true }
 
 [features]
-# Protected MCP boot must explicitly install the checked E worker.
-isolation-worker-integration = ["duduclaw-gateway/isolation-worker-integration"]
+# inert since v1.83: the worker integration is always compiled; kept so existing --features invocations resolve
+isolation-worker-integration = []
 # Explicit non-shipping subprocess fault-injection build; never enabled by default.
 workflow-test-checkpoints = []
 # Aligned with `duduclaw-gateway/default = ["dashboard", "desktop"]` so that

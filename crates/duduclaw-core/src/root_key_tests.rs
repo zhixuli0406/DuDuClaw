@@ -281,6 +281,35 @@ fn native_cgroup_parser_requires_exact_single_unified_unit() {
     }
 }
 
+/// Defect 22: the gateway unit with `Slice=duduclaw-tcb.slice` runs in
+/// `duduclaw.slice/duduclaw-tcb.slice`; exactly that line is accepted besides
+/// the system.slice one, with the same strictness.
+#[test]
+fn native_cgroup_parser_accepts_exactly_the_two_gateway_unit_lines() {
+    assert_eq!(GATEWAY_CGROUP_SYSTEM_SLICE, "0::/system.slice/duduclaw-gateway.service");
+    let tcb = "0::/duduclaw.slice/duduclaw-tcb.slice/duduclaw-gateway.service";
+    assert_eq!(GATEWAY_CGROUP_TCB_SLICE, tcb);
+    for valid in [GATEWAY_CGROUP_SYSTEM_SLICE, tcb] {
+        assert_eq!(native::parse_cgroup(Some(valid)), CgroupState::Unit, "{valid}");
+        assert_eq!(native::parse_cgroup(Some(&format!("{valid}\n"))), CgroupState::Unit, "{valid}");
+    }
+    for text in ["1:name=systemd:/duduclaw.slice/duduclaw-tcb.slice/duduclaw-gateway.service".to_string(),
+        format!("{tcb}\n2:cpu,cpuacct:/duduclaw.slice/duduclaw-tcb.slice/duduclaw-gateway.service\n")] {
+        assert_eq!(native::parse_cgroup(Some(&text)), CgroupState::V1, "{text:?}");
+    }
+    for text in ["0::/duduclaw.slice/duduclaw-gateway.service".to_string(),
+        format!("{tcb}/child"), format!("{tcb}.evil"),
+        "0::/duduclaw.slice/duduclaw-employees.slice/duduclaw-gateway.service".to_string(),
+        "0::/user.slice/duduclaw.slice/duduclaw-tcb.slice/duduclaw-gateway.service".to_string(),
+        "0::/duduclaw-tcb.slice/duduclaw-gateway.service".to_string(),
+        "0::/system.slice/duduclaw-tcb.slice/duduclaw-gateway.service".to_string(),
+        format!(" {tcb}"), format!("{tcb} "), format!("{tcb}\n\n"), format!("{tcb}\n{tcb}\n"),
+        format!("{tcb}\n{GATEWAY_CGROUP_SYSTEM_SLICE}\n"), format!("{tcb}\r\n"),
+        "0:cpu:/duduclaw.slice/duduclaw-tcb.slice/duduclaw-gateway.service".to_string()] {
+        assert_eq!(native::parse_cgroup(Some(&text)), CgroupState::Invalid, "{text:?}");
+    }
+}
+
 
 #[cfg(target_os = "linux")]
 #[test]

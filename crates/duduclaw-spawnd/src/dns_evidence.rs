@@ -20,8 +20,59 @@
 //! spawnd's readiness gate). The refresh path only loads an atomic snapshot
 //! and wakes the worker. The worker never opens the control connection; the
 //! lifecycle thread does.
-use std::{io, sync::{atomic::{AtomicU64, Ordering}, mpsc, Arc}, time::Duration};
+use std::{io, sync::{atomic::{AtomicU64, AtomicU8, Ordering}, mpsc, Arc}, time::Duration};
 use duduclaw_isolation::egress::{DnsRoute, EgressControlResponse};
+
+/// Why `dns_route_verified` is false: the fixed name spawnd prints as
+/// `dns_route_verified(<name>)` in its `evidence incomplete:` line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Reason {
+    /// No probe outcome yet (or no clock to judge one by).
+    Pending = 1,
+    /// The last pass is older than [`PASS_FRESH_MS`] (or from the future).
+    Stale,
+    /// The signed policy is older than v4: nothing is sent.
+    NoProbeName,
+    /// The signed policy could not be read.
+    PolicyUnreadable,
+    /// `/etc/duduclaw/egress.json` could not be read (or has no single route).
+    EgressConfigUnreadable,
+    /// No egress control connection to probe over.
+    NoControlConnection,
+    /// The `ProbeDns` exchange failed (or answered something else).
+    ExchangeFailed,
+    /// Egress refused the probe.
+    Refused,
+    /// Egress probed through another route than the configured one.
+    RouteMismatch,
+    /// The lookup did not resolve (failure, timeout or empty answer).
+    Unresolved,
+    /// Resolved, but no answer passed the public-address filter.
+    NoPublicAnswer,
+}
+impl Reason {
+    pub const ALL: [Self; 11] = [Self::Pending, Self::Stale, Self::NoProbeName, Self::PolicyUnreadable,
+        Self::EgressConfigUnreadable, Self::NoControlConnection, Self::ExchangeFailed, Self::Refused,
+        Self::RouteMismatch, Self::Unresolved, Self::NoPublicAnswer];
+    /// Fixed identifier, never data from the host or egress.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Stale => "stale",
+            Self::NoProbeName => "no_probe_name",
+            Self::PolicyUnreadable => "policy_unreadable",
+            Self::EgressConfigUnreadable => "egress_config_unreadable",
+            Self::NoControlConnection => "no_control_connection",
+            Self::ExchangeFailed => "exchange_failed",
+            Self::Refused => "refused",
+            Self::RouteMismatch => "route_mismatch",
+            Self::Unresolved => "unresolved",
+            Self::NoPublicAnswer => "no_public_answer",
+        }
+    }
+    fn from_code(code: u8) -> Option<Self> { Self::ALL.into_iter().find(|reason| *reason as u8 == code) }
+}
 
 /// A passed probe vouches for the route this long after it was sent.
 pub const PASS_FRESH_MS: u64 = 60_000;
@@ -45,18 +96,32 @@ pub struct Inputs {
 
 /// Side effects of one probe (fakes in tests). Called only on the worker.
 pub trait Host {
-    fn inputs(&mut self) -> io::Result<Inputs>;
+    /// `Err` names which input was unreadable ([`Reason::PolicyUnreadable`],
+    /// [`Reason::EgressConfigUnreadable`]).
+    fn inputs(&mut self) -> Result<Inputs, Reason>;
     /// One `ProbeDns` exchange on the existing control connection; `Err` when
-    /// there is none or the exchange failed.
-    fn probe(&mut self, name: &str) -> io::Result<EgressControlResponse>;
+    /// there is none ([`Reason::NoControlConnection`]) or the exchange failed
+    /// ([`Reason::ExchangeFailed`]).
+    fn probe(&mut self, name: &str) -> Result<EgressControlResponse, Reason>;
     /// Monotonic milliseconds (CLOCK_BOOTTIME in production).
     fn now_ms(&mut self) -> io::Result<u64>;
 }
 
-/// The pass rule.
+/// The pass rule, with the fixed reason a response does not pass.
+pub fn classify(response: &EgressControlResponse, configured: DnsRoute) -> Result<(), Reason> {
+    match response {
+        EgressControlResponse::DnsProbed { route, .. } if *route != configured => Err(Reason::RouteMismatch),
+        EgressControlResponse::DnsProbed { resolved: false, .. } => Err(Reason::Unresolved),
+        EgressControlResponse::DnsProbed { public_addresses: 0, .. } => Err(Reason::NoPublicAnswer),
+        EgressControlResponse::DnsProbed { .. } => Ok(()),
+        EgressControlResponse::Refused { .. } => Err(Reason::Refused),
+        EgressControlResponse::Registered | EgressControlResponse::Unregistered => Err(Reason::ExchangeFailed),
+    }
+}
+
+/// The pass rule: the configured route, `resolved` and at least one public address.
 pub fn passes(response: &EgressControlResponse, configured: DnsRoute) -> bool {
-    matches!(response, EgressControlResponse::DnsProbed { route, resolved: true, public_addresses }
-        if *route == configured && *public_addresses >= 1)
+    classify(response, configured).is_ok()
 }
 
 /// The outcome of the probe sent at `at_ms`.
@@ -79,11 +144,21 @@ impl Snapshot {
 }
 
 /// Lock-free slot the worker stores into and the refresh path loads:
-/// `at_ms << 1 | passed`, or `u64::MAX` for none.
-pub struct Published(AtomicU64);
+/// `at_ms << 1 | passed`, or `u64::MAX` for none; beside it the failure's
+/// [`Reason`] code (0: none recorded). Diagnostic only: the reason is stored
+/// before the snapshot, so a reader never sees an older reason with a newer
+/// snapshot.
+pub struct Published(AtomicU64, AtomicU8);
 const NONE: u64 = u64::MAX;
-impl Default for Published { fn default() -> Self { Self(AtomicU64::new(NONE)) } }
+impl Default for Published { fn default() -> Self { Self(AtomicU64::new(NONE), AtomicU8::new(0)) } }
 impl Published {
+    /// The worker's outcome at `at_ms`: a pass, or a failure with its reason.
+    pub fn store_outcome(&self, at_ms: u64, outcome: Result<(), Reason>) {
+        self.1.store(outcome.err().map_or(0, |reason| reason as u8), Ordering::Release);
+        self.store(Some(Snapshot { passed: outcome.is_ok(), at_ms }));
+    }
+    /// The reason recorded with the last failed outcome, if any.
+    pub fn reason(&self) -> Option<Reason> { Reason::from_code(self.1.load(Ordering::Acquire)) }
     pub fn store(&self, snapshot: Option<Snapshot>) {
         let value = match snapshot {
             Some(s) if s.at_ms < 1 << 62 => (s.at_ms << 1) | u64::from(s.passed),
@@ -100,16 +175,18 @@ impl Published {
 }
 
 /// One worker pass: when due, read the inputs, probe (only with a v4 probe
-/// name) and publish the outcome, a failure included, so the retry cadence holds.
+/// name) and publish the outcome, a failure included (with its [`Reason`]),
+/// so the retry cadence holds.
 pub fn step(host: &mut dyn Host, published: &Published) {
     let Ok(now) = host.now_ms() else { published.store(None); return };
     if !Snapshot::due_at(published.load().as_ref(), now) { return; }
-    let passed = match host.inputs() {
-        Ok(Inputs { name: Some(name), route }) => host.probe(&name).is_ok_and(|response| passes(&response, route)),
+    let outcome = match host.inputs() {
+        Ok(Inputs { name: Some(name), route }) => host.probe(&name).and_then(|response| classify(&response, route)),
         // Policy older than v4, or unreadable inputs: nothing is sent.
-        _ => false,
+        Ok(Inputs { name: None, .. }) => Err(Reason::NoProbeName),
+        Err(reason) => Err(reason),
     };
-    published.store(Some(Snapshot { passed, at_ms: now }));
+    published.store_outcome(now, outcome);
 }
 
 /// The background worker: a pass now, then on every wake and at least every
@@ -141,11 +218,21 @@ impl DnsRouteEvidence {
     pub fn new(start_worker: StartWorker, clock: Clock) -> Self {
         Self { published: Arc::new(Published::default()), wake: None, start_worker, clock }
     }
-    pub fn current(&mut self) -> bool {
+    pub fn current(&mut self) -> bool { self.status().is_ok() }
+    /// [`Self::current`] with the fixed reason when not verified: no outcome
+    /// yet (or no clock) is `pending`, an expired pass `stale`, a failure its
+    /// recorded reason.
+    pub fn status(&mut self) -> Result<(), Reason> {
         let snapshot = self.published.load();
-        let Ok(now) = (self.clock)() else { self.request_pass(); return false };
+        let reason = self.published.reason();
+        let Ok(now) = (self.clock)() else { self.request_pass(); return Err(Reason::Pending) };
         if Snapshot::due_at(snapshot.as_ref(), now) { self.request_pass(); }
-        Snapshot::verified_at(snapshot.as_ref(), now)
+        if Snapshot::verified_at(snapshot.as_ref(), now) { return Ok(()); }
+        Err(match snapshot {
+            None => Reason::Pending,
+            Some(snapshot) if snapshot.passed => Reason::Stale,
+            Some(_) => reason.unwrap_or(Reason::Pending),
+        })
     }
     /// Non-blocking: starts the worker once, then at most one queued wake. A
     /// worker that has gone away is started again on the next request.
@@ -170,26 +257,26 @@ mod linux {
     use crate::host::SharedEgressClient;
     use super::*;
 
-    fn unavailable() -> io::Error { io::Error::other("egress DNS probe unavailable") }
-
     /// Production side effects: the signed policy, the installed egress
     /// configuration and the shared control connection.
     pub struct InstalledHost { pub client: SharedEgressClient }
     impl Host for InstalledHost {
-        fn inputs(&mut self) -> io::Result<Inputs> {
-            Ok(Inputs { name: crate::installed::installed_dns_probe_name()?, route: crate::installed::configured_dns_route()? })
+        fn inputs(&mut self) -> Result<Inputs, Reason> {
+            let name = crate::installed::installed_dns_probe_name().map_err(|_| Reason::PolicyUnreadable)?;
+            let route = crate::installed::configured_dns_route().map_err(|_| Reason::EgressConfigUnreadable)?;
+            Ok(Inputs { name, route })
         }
-        fn probe(&mut self, name: &str) -> io::Result<EgressControlResponse> {
-            let request = RequestId(crate::server::random_id()?);
+        fn probe(&mut self, name: &str) -> Result<EgressControlResponse, Reason> {
+            let request = RequestId(crate::server::random_id().map_err(|_| Reason::ExchangeFailed)?);
             // Held for this one exchange (see `SharedEgressClient`).
-            let mut slot = self.client.lock().map_err(|_| unavailable())?;
+            let mut slot = self.client.lock().map_err(|_| Reason::ExchangeFailed)?;
             // Never connects: no connection means egress is unreachable.
-            let client = slot.as_mut().ok_or_else(unavailable)?;
+            let client = slot.as_mut().ok_or(Reason::NoControlConnection)?;
             let result = client.probe_dns(request, name);
             // A failed exchange leaves the connection shut down; drop it so the
             // lifecycle thread reconnects.
             if result.is_err() { *slot = None; }
-            result
+            result.map_err(|_| Reason::ExchangeFailed)
         }
         fn now_ms(&mut self) -> io::Result<u64> { crate::host_state::boottime_ms() }
     }
@@ -205,6 +292,8 @@ mod linux {
     impl crate::host::DnsEvidence for DnsRouteEvidence {
         /// Never blocks: the latest fresh pass, or false.
         fn verified(&mut self) -> bool { self.current() }
+        /// Never blocks: as `verified`, with the fixed reason when false.
+        fn status(&mut self) -> Result<(), &'static str> { DnsRouteEvidence::status(self).map_err(Reason::name) }
     }
 }
 
@@ -215,17 +304,15 @@ mod tests {
     use duduclaw_isolation::egress::EgressError;
 
     /// A scripted host: inputs, queued probe answers, a clock, and every name sent.
-    struct Fake { inputs: io::Result<Inputs>, answers: Vec<io::Result<EgressControlResponse>>, sent: Vec<String>, now: u64 }
+    struct Fake { inputs: Result<Inputs, Reason>, answers: Vec<Result<EgressControlResponse, Reason>>, sent: Vec<String>, now: u64 }
     impl Fake {
-        fn new(answers: Vec<io::Result<EgressControlResponse>>) -> Self {
+        fn new(answers: Vec<Result<EgressControlResponse, Reason>>) -> Self {
             Self { inputs: Ok(inputs(Some("api.example.com"))), answers, sent: Vec::new(), now: 10_000 }
         }
     }
     impl Host for Fake {
-        fn inputs(&mut self) -> io::Result<Inputs> {
-            match &self.inputs { Ok(inputs) => Ok(inputs.clone()), Err(_) => Err(io::ErrorKind::PermissionDenied.into()) }
-        }
-        fn probe(&mut self, name: &str) -> io::Result<EgressControlResponse> {
+        fn inputs(&mut self) -> Result<Inputs, Reason> { self.inputs.clone() }
+        fn probe(&mut self, name: &str) -> Result<EgressControlResponse, Reason> {
             self.sent.push(name.to_owned());
             if self.answers.is_empty() { panic!("unexpected probe") }
             self.answers.remove(0)
@@ -233,7 +320,7 @@ mod tests {
         fn now_ms(&mut self) -> io::Result<u64> { Ok(self.now) }
     }
     fn inputs(name: Option<&str>) -> Inputs { Inputs { name: name.map(str::to_owned), route: DnsRoute::ResolvedVarlink } }
-    fn probed(route: DnsRoute, resolved: bool, public_addresses: u32) -> io::Result<EgressControlResponse> {
+    fn probed(route: DnsRoute, resolved: bool, public_addresses: u32) -> Result<EgressControlResponse, Reason> {
         Ok(EgressControlResponse::DnsProbed { route, resolved, public_addresses })
     }
     /// One pass at `host.now`, then whether the evidence is verified then.
@@ -244,7 +331,7 @@ mod tests {
 
     #[test]
     fn dns_evidence_pass_rule() {
-        let cases: [(io::Result<EgressControlResponse>, bool); 7] = [
+        let cases: [(Result<EgressControlResponse, Reason>, bool); 7] = [
             (probed(DnsRoute::ResolvedVarlink, true, 1), true),
             (probed(DnsRoute::ResolvedVarlink, true, 12), true),
             // Wrong route, unresolved, no public answer, a refusal, a connection error.
@@ -252,7 +339,7 @@ mod tests {
             (probed(DnsRoute::ResolvedVarlink, false, 0), false),
             (probed(DnsRoute::ResolvedVarlink, true, 0), false),
             (Ok(EgressControlResponse::Refused { code: EgressError::ResourceLimit }), false),
-            (Err(io::ErrorKind::TimedOut.into()), false),
+            (Err(Reason::ExchangeFailed), false),
         ];
         for (index, (answer, expected)) in cases.into_iter().enumerate() {
             let mut host = Fake::new(vec![answer]);
@@ -274,7 +361,7 @@ mod tests {
         host.inputs = Ok(inputs(None));
         let published = Published::default();
         assert!(!verified_after_step(&mut host, &published));
-        host.inputs = Err(io::ErrorKind::PermissionDenied.into());
+        host.inputs = Err(Reason::PolicyUnreadable);
         host.now += FAIL_RETRY_MS;
         assert!(!verified_after_step(&mut host, &published));
         assert!(host.sent.is_empty());
@@ -310,7 +397,7 @@ mod tests {
 
     #[test]
     fn dns_evidence_failure_is_retried_after_five_seconds() {
-        let mut host = Fake::new(vec![Err(io::ErrorKind::NotConnected.into()), probed(DnsRoute::ResolvedVarlink, true, 0),
+        let mut host = Fake::new(vec![Err(Reason::NoControlConnection), probed(DnsRoute::ResolvedVarlink, true, 0),
             probed(DnsRoute::ResolvedVarlink, true, 2)]);
         let published = Published::default();
         let start = host.now;
@@ -343,6 +430,78 @@ mod tests {
         assert_eq!(published.load(), None);
         published.store(None);
         assert_eq!(published.load(), None);
+    }
+
+    /// Defect 28 diagnostics: every reason has one distinct fixed name, the
+    /// code round-trips, and nothing else maps to a reason.
+    #[test]
+    fn dns_evidence_reason_mapping_is_total_and_fixed() {
+        let names: Vec<&str> = Reason::ALL.iter().map(|reason| reason.name()).collect();
+        assert_eq!(names, ["pending", "stale", "no_probe_name", "policy_unreadable", "egress_config_unreadable",
+            "no_control_connection", "exchange_failed", "refused", "route_mismatch", "unresolved", "no_public_answer"]);
+        for reason in Reason::ALL {
+            // Exhaustive: a new variant must be added to ALL (and named).
+            match reason {
+                Reason::Pending | Reason::Stale | Reason::NoProbeName | Reason::PolicyUnreadable
+                | Reason::EgressConfigUnreadable | Reason::NoControlConnection | Reason::ExchangeFailed
+                | Reason::Refused | Reason::RouteMismatch | Reason::Unresolved | Reason::NoPublicAnswer => {}
+            }
+            assert_eq!(Reason::from_code(reason as u8), Some(reason));
+            assert!(reason.name().bytes().all(|byte| byte.is_ascii_lowercase() || byte == b'_'));
+        }
+        assert_eq!(Reason::from_code(0), None);
+        assert!((12..=u8::MAX).all(|code| Reason::from_code(code).is_none()));
+    }
+
+    /// Each worker branch publishes its reason; the refresh side reports it,
+    /// `pending` before any outcome and `stale` for an expired pass.
+    #[test]
+    fn dns_evidence_each_branch_yields_its_reason() {
+        let refused = Ok(EgressControlResponse::Refused { code: EgressError::ResourceLimit });
+        let cases: Vec<(Result<Inputs, Reason>, Vec<Result<EgressControlResponse, Reason>>, Reason)> = vec![
+            (Ok(inputs(None)), vec![], Reason::NoProbeName),
+            (Err(Reason::PolicyUnreadable), vec![], Reason::PolicyUnreadable),
+            (Err(Reason::EgressConfigUnreadable), vec![], Reason::EgressConfigUnreadable),
+            (Ok(inputs(Some("api.example.com"))), vec![Err(Reason::NoControlConnection)], Reason::NoControlConnection),
+            (Ok(inputs(Some("api.example.com"))), vec![Err(Reason::ExchangeFailed)], Reason::ExchangeFailed),
+            (Ok(inputs(Some("api.example.com"))), vec![Ok(EgressControlResponse::Registered)], Reason::ExchangeFailed),
+            (Ok(inputs(Some("api.example.com"))), vec![refused], Reason::Refused),
+            (Ok(inputs(Some("api.example.com"))), vec![probed(DnsRoute::DedicatedDnsBroker, true, 2)], Reason::RouteMismatch),
+            (Ok(inputs(Some("api.example.com"))), vec![probed(DnsRoute::ResolvedVarlink, false, 0)], Reason::Unresolved),
+            (Ok(inputs(Some("api.example.com"))), vec![probed(DnsRoute::ResolvedVarlink, true, 0)], Reason::NoPublicAnswer),
+        ];
+        for (index, (host_inputs, answers, expected)) in cases.into_iter().enumerate() {
+            let mut host = Fake::new(answers);
+            host.inputs = host_inputs;
+            let published = Published::default();
+            step(&mut host, &published);
+            assert_eq!(published.reason(), Some(expected), "case {index}");
+            let slot = Arc::new(published);
+            let mut evidence = DnsRouteEvidence { published: slot, wake: None,
+                start_worker: Box::new(|_: Arc<Published>, _: mpsc::Receiver<()>| {}),
+                clock: Box::new(|| -> io::Result<u64> { Ok(10_000) }) };
+            assert_eq!(evidence.status(), Err(expected), "case {index}");
+            assert!(!evidence.current());
+        }
+        // No outcome yet, or no clock: pending.
+        let mut evidence = DnsRouteEvidence::new(Box::new(|_: Arc<Published>, _: mpsc::Receiver<()>| {}),
+            Box::new(|| -> io::Result<u64> { Ok(10_000) }));
+        assert_eq!(evidence.status(), Err(Reason::Pending));
+        let mut no_clock = DnsRouteEvidence::new(Box::new(|_: Arc<Published>, _: mpsc::Receiver<()>| {}),
+            Box::new(|| -> io::Result<u64> { Err(io::ErrorKind::Other.into()) }));
+        assert_eq!(no_clock.status(), Err(Reason::Pending));
+        // A pass: verified while fresh, then stale; a later pass clears the reason.
+        let clock = Arc::new(AtomicU64::new(10_000));
+        let time = clock.clone();
+        let mut evidence = DnsRouteEvidence::new(Box::new(|_: Arc<Published>, _: mpsc::Receiver<()>| {}),
+            Box::new(move || -> io::Result<u64> { Ok(time.load(Ordering::SeqCst)) }));
+        evidence.published.store_outcome(10_000, Err(Reason::Unresolved));
+        assert_eq!(evidence.status(), Err(Reason::Unresolved));
+        evidence.published.store_outcome(10_000, Ok(()));
+        assert_eq!(evidence.published.reason(), None);
+        assert_eq!(evidence.status(), Ok(()));
+        clock.store(10_000 + PASS_FRESH_MS, Ordering::SeqCst);
+        assert_eq!(evidence.status(), Err(Reason::Stale));
     }
 
     /// The refresh path never probes: it loads the snapshot, starts the worker
