@@ -4863,6 +4863,18 @@
       "rationale": "Test fixture or test helper; compiled/run only for regression verification, not a production employee execution entry point."
     },
     {
+      "symbol": "crates/duduclaw-inference/src/hardware.rs::tests::hung_probe_with_forked_helper_kills_the_whole_group",
+      "apis": {
+        "command_constructor": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test fixture or test helper; compiled/run only for regression verification, not a production employee execution entry point."
+    },
+    {
       "symbol": "crates/duduclaw-inference/src/llamafile.rs::LlamafileManager::start",
       "apis": {
         "backend_spawn": 1,
@@ -6477,6 +6489,18 @@
         "process_spawn"
       ],
       "rationale": "One-shot host authorization and fresh root publication prepare an isolated main run; SpawndBackend owns execution and teardown. The native marker has no authority and cannot run on the gateway uid."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/isolation_mcp/boot_retry.rs::tests::boot_permit_descheduled_across_close_installs_nothing",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "task_or_thread"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only scoped std::thread pauses inside enter while the shutdown gate closes, then verifies no boot attempt installs anything; no OS process is launched."
     },
     {
       "symbol": "crates/duduclaw-spawnd/src/bin/d8-fixture.rs::main",
