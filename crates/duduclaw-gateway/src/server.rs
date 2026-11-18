@@ -755,6 +755,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     info!("edition_profile={}", boot_edition.as_str());
     crate::isolation_readiness::initialize(!boot_edition.is_personal());
     // R6: the update service's gateway readback endpoint (isolated hosts only).
+    // Its `ready` stays false until this process's local latch is set (stores
+    // open, listener bound, spawnd backend connected: `update_readback::LocalStep`).
     crate::update_readback::start();
     crate::isolation_readiness::connect_backend().await;
     // Allow an old store with no MFA tables; refuse a partial MFA schema or
@@ -1916,6 +1918,9 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         duduclaw_core::error::DuDuClawError::Gateway(format!("Failed to open cron store: {e}"))
     })?);
     handler.set_cron_store(cron_store.clone()).await;
+    // Update read-back local latch, step 1: every store whose opening is fatal
+    // to start-up is open (users.db, the MCP identity key, the cron store).
+    crate::update_readback::mark_local(crate::update_readback::LocalStep::Stores);
 
     // Initialize task board store (SQLite tasks.db + activity feed)
     let task_store_opt: Option<Arc<crate::task_store::TaskStore>> =
@@ -3650,6 +3655,10 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .map_err(|e| duduclaw_core::error::DuDuClawError::Gateway(e.to_string()))?;
+    // Update read-back local latch, step 2: the service entry is bound (the
+    // kernel accepts connections from here; the same point as READY=1). Step 3
+    // (spawnd backend) is marked by `isolation_readiness::connect_backend`.
+    crate::update_readback::mark_local(crate::update_readback::LocalStep::Service);
 
     // WP-B: systemd sd_notify — tell systemd startup is complete, and start
     // watchdog pings if this unit is `Type=notify` with `WatchdogSec=` set.

@@ -1,10 +1,12 @@
 //! DEFECT 26: the trusted boot assembly converges without a restart. The first
-//! attempt runs inline (as before); while trusted inputs are still missing a
-//! background task repeats the whole attempt on a bounded schedule until it
+//! attempt runs in a background task (review round 1: off the gateway's
+//! start-up path); while trusted inputs are still missing that task repeats
+//! the whole attempt on a bounded schedule until it
 //! succeeds once, a missing producer can no longer appear in this process, or
 //! the gateway's shutdown gate closes. Each attempt is all-or-nothing: a failed
 //! one only replaces the closed not-ready reasons, it never publishes a
-//! partially assembled service. A success is never repeated.
+//! partially assembled service. A success is never repeated. The spawnd
+//! backend connection has its own retry (`retry_backend`) on the same pause.
 use std::{future::Future, pin::Pin, sync::Mutex, time::{Duration, Instant}};
 use super::{BootStatus, MissingProducer};
 
@@ -101,6 +103,28 @@ pub(super) async fn retry_until_assembled(boot: &mut impl BootAttempt, state: &B
             Step::Assembled => return true,
             Step::Stop => return false,
             Step::Retry => {}
+        }
+    }
+}
+
+/// The spawnd backend connection (a local socket connect, no waits): every
+/// 500 ms during the first minute after boot start, then every 5 s.
+pub(super) const BACKEND_SCHEDULE: Schedule = Schedule { early: Duration::from_millis(500),
+    early_for: Duration::from_secs(60), late: Duration::from_secs(5), poll: Duration::from_millis(100) };
+
+/// Retries the spawnd backend connection after a failed inline attempt at
+/// boot. `connect` answers `true` once a backend is installed (by this attempt
+/// or an earlier one; it never replaces one). The first `true` marks the
+/// gateway-local readiness step `Backend` in `local` and ends the loop
+/// (`true`); `false` when the shutdown gate closed first (the step stays unset).
+pub(super) async fn retry_backend<F, Fut>(mut connect: F, local: &crate::update_readback::LocalReadiness,
+    started: Instant, schedule: Schedule, closed: impl Fn() -> bool) -> bool
+where F: FnMut() -> Fut, Fut: Future<Output = bool> {
+    loop {
+        if !pause(schedule.delay(started.elapsed()), schedule.poll, &closed).await { return false; }
+        if connect().await {
+            local.mark(crate::update_readback::LocalStep::Backend);
+            return true;
         }
     }
 }
@@ -237,6 +261,60 @@ mod tests {
         assert!(state.failed(&MISSING), "back to an earlier set is a change");
         assert!(state.failed(&[MissingProducer::Initialization]));
         assert!(!state.failed(&[MissingProducer::Initialization]));
+    }
+
+    /// Review round 1: spawnd not reachable at first, then reachable. The
+    /// backend is installed exactly once, the local step is marked (with the
+    /// other steps the latch is set) and the loop ends; no attempt after.
+    #[tokio::test]
+    async fn backend_retry_installs_once_sets_the_latch_and_ends() {
+        use crate::update_readback::{LocalReadiness, LocalStep};
+        let local = LocalReadiness::new();
+        local.mark(LocalStep::Stores);
+        local.mark(LocalStep::Service);
+        let (attempts, installs) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let connect = || {
+            let (attempts, installs) = (attempts.clone(), installs.clone());
+            async move {
+                // Reachable from the fourth attempt on; installed once (set-once slot).
+                if attempts.fetch_add(1, Ordering::AcqRel) + 1 < 4 { return false; }
+                if installs.load(Ordering::Acquire) == 0 { installs.fetch_add(1, Ordering::AcqRel); }
+                true
+            }
+        };
+        assert!(!local.ready(), "the inline attempt failed: not ready");
+        assert!(retry_backend(connect, &local, Instant::now(), FAST, || false).await);
+        assert!(local.ready());
+        assert_eq!((attempts.load(Ordering::Acquire), installs.load(Ordering::Acquire)), (4, 1));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(attempts.load(Ordering::Acquire), 4, "the loop ended at the success");
+    }
+
+    /// spawnd never reachable: the latch is never set and the loop ends once
+    /// the shutdown gate closes (and at once if it is already closed).
+    #[tokio::test]
+    async fn backend_retry_never_connecting_never_sets_the_latch_and_stops_at_shutdown() {
+        use crate::update_readback::{LocalReadiness, LocalStep};
+        let local = LocalReadiness::new();
+        local.mark(LocalStep::Stores);
+        local.mark(LocalStep::Service);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let connect = || { let attempts = attempts.clone(); async move { attempts.fetch_add(1, Ordering::AcqRel); false } };
+        let gate = attempts.clone();
+        assert!(!retry_backend(connect, &local, Instant::now(), FAST, || gate.load(Ordering::Acquire) >= 5).await);
+        assert_eq!(attempts.load(Ordering::Acquire), 5, "no attempt after the gate closed");
+        assert!(!local.ready());
+        let connect = || { let attempts = attempts.clone(); async move { attempts.fetch_add(1, Ordering::AcqRel); true } };
+        assert!(!retry_backend(connect, &local, Instant::now(), FAST, || true).await);
+        assert_eq!(attempts.load(Ordering::Acquire), 5);
+        assert!(!local.ready());
+    }
+
+    #[test]
+    fn backend_retry_schedule_is_bounded_and_fast_at_start() {
+        assert_eq!(BACKEND_SCHEDULE.delay(Duration::ZERO), Duration::from_millis(500));
+        assert_eq!(BACKEND_SCHEDULE.delay(Duration::from_secs(60)), Duration::from_secs(5));
+        assert!(BACKEND_SCHEDULE.poll > Duration::ZERO && BACKEND_SCHEDULE.poll < BACKEND_SCHEDULE.early);
     }
 
     #[test]

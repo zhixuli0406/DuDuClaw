@@ -217,27 +217,46 @@ fn missing(sources: &BootSources, dispatcher: bool, backend: bool) -> Vec<Missin
 
 /// Called once after protected TEAM mode and A's backend have been installed.
 /// No employee work runs here; the existing composite gate stays authoritative.
-/// DEFECT 26: the first attempt runs inline as before; while trusted inputs
-/// are missing (the updater's generation, spawnd's projection, ...) the same
-/// all-or-nothing attempt is retried in the background (`spawn_boot_retry`)
-/// until it succeeds once. No restart is needed after install, boot or update.
+/// DEFECT 26: while trusted inputs are missing (the updater's generation,
+/// spawnd's projection, ...) the same all-or-nothing attempt is retried in the
+/// background until it succeeds once. No restart is needed after install, boot
+/// or update. Review round 1: the first attempt runs in that background task
+/// too (it waits up to 5 s for the updater's generation, which the updater
+/// gives only after its verification of this gateway's read-back), so it never
+/// delays the gateway's own start-up and its local readiness latch.
+/// `ATTEMPTED` is still decided here, synchronously.
 pub async fn boot_protected(home: &Path, users: Arc<duduclaw_auth::UserDb>, agents: Arc<super::AgentAdmission>) {
     if crate::isolation_readiness::status().is_none() || ATTEMPTED.swap(true, Ordering::AcqRel) { return; }
     let started = std::time::Instant::now();
     let sources = SOURCES.lock().ok().and_then(|mut slot| slot.take()).unwrap_or_default();
-    let mut boot = InstalledBoot { home: home.to_owned(), users, agents, sources };
-    if let retry::Step::Retry = retry::step(&mut boot, &STATE, started).await {
-        spawn_boot_retry(boot, started);
-    }
+    spawn_boot(InstalledBoot { home: home.to_owned(), users, agents, sources }, started);
 }
 
-/// DEFECT 26: the background boot retry (2 s for the first minute, then 10 s;
-/// each attempt bounded by its own waits). Ends at the first success, when a
-/// missing producer can no longer appear, or once the gateway's shutdown gate
-/// (`handlers::migration_shutdown_gate`) has closed.
-fn spawn_boot_retry(mut boot: InstalledBoot, started: std::time::Instant) {
+/// DEFECT 26: the boot attempt and its background retry (2 s for the first
+/// minute, then 10 s; each attempt bounded by its own waits). Ends at the
+/// first success, when a missing producer can no longer appear, or once the
+/// gateway's shutdown gate (`handlers::migration_shutdown_gate`) has closed.
+fn spawn_boot(mut boot: InstalledBoot, started: std::time::Instant) {
     drop(tokio::spawn(async move {
-        retry::retry_until_assembled(&mut boot, &STATE, started, retry::SCHEDULE, shutdown_begun).await;
+        if let retry::Step::Retry = retry::step(&mut boot, &STATE, started).await {
+            retry::retry_until_assembled(&mut boot, &STATE, started, retry::SCHEDULE, shutdown_begun).await;
+        }
+    }));
+}
+
+/// Review round 1: the spawnd backend connection retried after a failed
+/// inline attempt at boot (`isolation_readiness::connect_backend`), so a
+/// gateway started before spawnd's control socket is reachable converges
+/// without a restart. Never replaces an installed backend; ends at the first
+/// success (which marks the local readiness step `Backend`) or at shutdown.
+/// The boot assembly above picks the backend up at its next attempt.
+pub(crate) fn spawn_backend_retry() {
+    let started = std::time::Instant::now();
+    drop(tokio::spawn(async move {
+        if retry::retry_backend(crate::isolation_readiness::connect_backend_once, &crate::update_readback::LOCAL,
+            started, retry::BACKEND_SCHEDULE, shutdown_begun).await {
+            tracing::info!(elapsed_secs = started.elapsed().as_secs(), "受保護團隊已連接隔離執行服務。");
+        }
     }));
 }
 

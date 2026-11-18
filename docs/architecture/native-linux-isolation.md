@@ -1543,12 +1543,14 @@ nothing waits on a unit that starts later.
   gateway's data snapshot, the root key's intent and its confirmation move with
   the gateway's first start from S8 to S6. A resumed S6 repeats every entry:
   started units stay as they are and only the waits run again.
-- **Start-up order rule.** A component's read-back `ready` means "serving with
-  a complete identity" (gateway and egress: their read-back endpoint serving;
+- **Start-up order rule.** A component's read-back `ready` means serving with
+  a complete identity AND, for the gateway, its own local initialisation
+  finished (stores open, service entry up, spawnd backend connected);
+  whole-host readiness and the updater's own answers are never an input of the
+  updater's verification (gateway and egress: their read-back endpoint serving;
   spawnd: a recent healthy admission iteration; file measurements: the signed
   digest). Whole-host readiness (spawnd's evidence, the gateway's
-  `isolation_readiness`) is never an input of the updater's verification: both
-  need a fresh answer to a probe of the updater, which answers only after its
+  `isolation_readiness`) needs a fresh answer to a probe of the updater, which answers only after its
   start-up verification (the first install deadlocked on exactly this: the
   updater exited after its 30 s read-back deadline, forever). Whole-host
   readiness is enforced at admission (spawnd `Readiness::check`; the gateway's

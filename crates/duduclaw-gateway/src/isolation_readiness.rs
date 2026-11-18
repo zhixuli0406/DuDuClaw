@@ -23,7 +23,8 @@ static TEAM_SEEN: AtomicBool = AtomicBool::new(false);
 /// sets [`REQUIRED`] instead; the late check then no longer applies (it only
 /// covers an uninitialised readiness), and admission falls to the normal
 /// readiness gate, which is still fail closed: no isolation backend is
-/// connected after boot ([`connect_backend`] runs only at trusted boot).
+/// connected unless isolation was required at trusted boot ([`connect_backend`]
+/// and its background retry start only there).
 static LATE_REQUIRED: AtomicBool = AtomicBool::new(false);
 
 const NOT_READY: &str = "ISOLATION_NOT_READY: 受保護團隊的隔離服務尚未就緒，請由管理員檢查服務狀態。";
@@ -196,19 +197,44 @@ fn start_update_probe() {}
 
 /// Connect at trusted boot even if another component is still unavailable. The
 /// installed backend rechecks the composite gate before every reservation.
+/// One attempt inline; when spawnd's control socket is not reachable yet, the
+/// same attempt is retried in the background (`isolation_mcp::spawn_backend_retry`:
+/// bounded schedule, ends at the first success or at shutdown). The first
+/// success marks the gateway-local readiness step `Backend`
+/// (`update_readback::LocalStep`). Outside protected TEAM no spawnd backend is
+/// used, so that step does not apply and is marked at once.
 pub async fn connect_backend() {
-    if !REQUIRED.load(Ordering::Acquire) { return; }
+    if !REQUIRED.load(Ordering::Acquire) {
+        crate::update_readback::mark_local(crate::update_readback::LocalStep::Backend);
+        return;
+    }
     #[cfg(target_os = "linux")]
     {
-        let result = match duduclaw_execution::SpawndBackend::connect_with_admission(backend_admission).await {
-            // W1: spawnd's checked readiness bits narrow every run's own
-            // `Reserved.features`; without this source no work op is sent.
-            Ok(backend) => duduclaw_execution::selection::install_protected_backend(std::sync::Arc::new(
-                backend.with_feature_source(crate::isolation_mcp::readiness_feature_source())), backend_admission),
-            Err(error) => Err(error),
-        };
-        if result.is_err() { tracing::error!("受保護團隊無法連接隔離執行服務，員工執行維持暫停。"); }
+        if connect_backend_once().await {
+            crate::update_readback::mark_local(crate::update_readback::LocalStep::Backend);
+        } else {
+            tracing::error!("受保護團隊暫時無法連接隔離執行服務，員工執行維持暫停；閘道會在背景持續重試連線。");
+            crate::isolation_mcp::spawn_backend_retry();
+        }
     }
+}
+
+/// One connection attempt to spawnd's control socket. Needs only that socket
+/// (root-owned, `SO_PEERCRED` uid/gid 0; no frame is exchanged at connect),
+/// never the updater's answer or spawnd's complete evidence. `true` once a
+/// backend is installed, by this attempt or an earlier one; an installed
+/// backend is never replaced (`install_protected_backend` is set-once).
+#[cfg(target_os = "linux")]
+pub(crate) async fn connect_backend_once() -> bool {
+    use duduclaw_execution::selection::{install_protected_backend, protected_backend_for_boot};
+    if protected_backend_for_boot().is_ok() { return true; }
+    if let Ok(backend) = duduclaw_execution::SpawndBackend::connect_with_admission(backend_admission).await {
+        // W1: spawnd's checked readiness bits narrow every run's own
+        // `Reserved.features`; without this source no work op is sent.
+        let _ = install_protected_backend(std::sync::Arc::new(
+            backend.with_feature_source(crate::isolation_mcp::readiness_feature_source())), backend_admission);
+    }
+    protected_backend_for_boot().is_ok()
 }
 
 fn admit(required: bool, components: Option<Components>) -> Result<(), String> {
@@ -224,7 +250,7 @@ fn admit(required: bool, components: Option<Components>) -> Result<(), String> {
 /// never cleared, but a later live TEAM promotion (`initialize(true)`) sets
 /// the readiness latch, after which this check no longer applies; admission
 /// then goes through the normal readiness gate, still fail closed because no
-/// backend is connected after boot.
+/// backend is connected when isolation was not required at boot.
 /// `initialised`: the readiness latch is set (normal path, nothing to do).
 /// `team_seen`: a Linux TEAM edition was resolved. `applies_now` is consulted
 /// only when the answer is not already decided.

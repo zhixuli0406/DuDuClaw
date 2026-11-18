@@ -7,17 +7,21 @@
 //! data, unknown fields refused, 5 s socket timeouts). The record describes
 //! this running process: `build_sha256` is the SHA-256 of `/proc/self/exe`
 //! (the loaded image), `effective_uid` is `geteuid()`, `ready` means this
-//! process is serving its read-back with a complete identity (the same notion
-//! as egress's `serving`). A value that cannot be computed makes the record
-//! `ready: false`; nothing is guessed.
+//! process is serving its read-back with a complete identity AND its own local
+//! initialisation finished ([`LocalReadiness`]: core stores open, HTTP/WS
+//! listener bound, spawnd backend connected). A value that cannot be computed
+//! makes the record `ready: false`; nothing is guessed.
 //!
 //! Whole-host admission readiness (`isolation_readiness::status`) is never an
 //! input here: it needs a fresh answer to the gateway's probe of the updater,
 //! which the updater gives only after its start-up verification, which reads
 //! this record (a circular wait on every boot and update). It is enforced
 //! separately, before every employee run: `isolation_readiness::check_execution`
-//! (and spawnd's own admission).
+//! (and spawnd's own admission). The local latch needs neither the updater nor
+//! spawnd's complete evidence: only spawnd's control socket (open once spawnd
+//! has verified its own installed set, before its evidence is complete).
 #![allow(unsafe_code)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use duduclaw_isolation::{ids::Sha256Digest, update::{InstallTarget, Product, ReleaseVersion}};
 use duduclaw_updated::activation_contract::{ComponentReadback, ControlCommand, ControlOutcome, ControlRequest, ControlResponse};
 
@@ -35,23 +39,62 @@ pub struct Identity {
     pub effective_uid: u32,
 }
 
-/// `serving`: this process's read-back endpoint is serving. Whole-host
-/// readiness is deliberately not a parameter (module comment).
-pub fn readback(identity: &Identity, serving: bool) -> ComponentReadback {
+/// One critical step of the gateway's own start-up (`server::start_gateway`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalStep {
+    /// Every store whose opening is fatal to start-up succeeded: users.db,
+    /// the MCP identity key, the cron store.
+    Stores,
+    /// The HTTP/WS listener is bound (the point `READY=1` is sent).
+    Service,
+    /// Protected TEAM: the spawnd backend client is installed (first
+    /// successful connection, inline or by the background retry). Outside
+    /// protected TEAM no spawnd backend is used and this step is marked as
+    /// not applicable by `isolation_readiness::connect_backend`.
+    Backend,
+}
+/// The gateway-local readiness latch. Monotonic: steps are only ever set, and
+/// `ready` is set once every step is, never cleared for the life of the process.
+pub struct LocalReadiness { stores: AtomicBool, service: AtomicBool, backend: AtomicBool, ready: AtomicBool }
+impl LocalReadiness {
+    pub const fn new() -> Self {
+        Self { stores: AtomicBool::new(false), service: AtomicBool::new(false), backend: AtomicBool::new(false),
+            ready: AtomicBool::new(false) }
+    }
+    /// SeqCst: of two steps marked concurrently, at least one marker sees both.
+    pub fn mark(&self, step: LocalStep) {
+        let flag = match step { LocalStep::Stores => &self.stores, LocalStep::Service => &self.service,
+            LocalStep::Backend => &self.backend };
+        flag.store(true, Ordering::SeqCst);
+        if [&self.stores, &self.service, &self.backend].iter().all(|flag| flag.load(Ordering::SeqCst)) {
+            self.ready.store(true, Ordering::SeqCst);
+        }
+    }
+    pub fn ready(&self) -> bool { self.ready.load(Ordering::SeqCst) }
+}
+impl Default for LocalReadiness { fn default() -> Self { Self::new() } }
+/// This process's latch, read by every read-back answer.
+pub static LOCAL: LocalReadiness = LocalReadiness::new();
+pub fn mark_local(step: LocalStep) { LOCAL.mark(step); }
+
+/// `serving`: this process's read-back endpoint is serving. `local_ready`:
+/// [`LOCAL`] is set. Whole-host readiness is deliberately not a parameter
+/// (module comment).
+pub fn readback(identity: &Identity, serving: bool, local_ready: bool) -> ComponentReadback {
     let artifact_id = duduclaw_updated::publication::artifact_name(&InstallTarget::Gateway).ok();
     let complete = identity.build.is_some() && identity.version.is_some() && artifact_id.is_some()
         && identity.effective_uid != 0;
     ComponentReadback { artifact_id: artifact_id.unwrap_or_default(), target: InstallTarget::Gateway, product: PRODUCT,
         version: identity.version.unwrap_or(ReleaseVersion { major: 0, minor: 0, patch: 0 }), protocol: PROTOCOL,
         build_sha256: identity.build.unwrap_or(Sha256Digest([0; 32])), effective_uid: identity.effective_uid,
-        ready: serving && complete }
+        ready: serving && complete && local_ready }
 }
 
 /// Only `Readback` of a non-zero generation on schema 1 is answered with data.
-pub fn answer(request: &ControlRequest, identity: &Identity, serving: bool) -> ControlResponse {
+pub fn answer(request: &ControlRequest, identity: &Identity, serving: bool, local_ready: bool) -> ControlResponse {
     let outcome = match (request.schema_version, &request.command) {
         (SCHEMA, ControlCommand::Readback { generation }) if generation.0 != [0; 32] =>
-            ControlOutcome::Readback { components: vec![readback(identity, serving)] },
+            ControlOutcome::Readback { components: vec![readback(identity, serving, local_ready)] },
         _ => ControlOutcome::Refused,
     };
     ControlResponse { schema_version: SCHEMA, nonce: request.nonce, generation: request.command.generation(), outcome }
@@ -179,7 +222,8 @@ mod linux {
         let credentials = socket::getsockopt(&fd, sockopt::PeerCredentials)?;
         if (credentials.uid(), credentials.gid()) != peer { return Err(invalid()); }
         let request: ControlRequest = transport::receive(&fd).map_err(updated)?;
-        transport::send(&fd, &super::answer(&request, identity, serving)).map_err(updated)
+        // The local latch is read per answer: the updater polls until it is set.
+        transport::send(&fd, &super::answer(&request, identity, serving, super::LOCAL.ready())).map_err(updated)
     }
 
     fn run() {
@@ -199,7 +243,8 @@ mod linux {
                 Ok(raw) => {
                     // SAFETY: accept4 returned a new descriptor owned only here.
                     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-                    // Serving: the identity was observed and this accept loop runs.
+                    // Serving: the identity was observed and this accept loop
+                    // runs. Local readiness is read inside `serve_one`.
                     let _ = serve_one(fd, (0, 0), &identity, true);
                 }
                 Err(Errno::EAGAIN | Errno::EINTR | Errno::ECONNABORTED) => {}
@@ -309,17 +354,17 @@ mod tests {
 
     #[test]
     fn gateway_readback_fields_and_not_ready_cases() {
-        let record = readback(&identity(), true);
+        let record = readback(&identity(), true, true);
         assert!(record.ready);
         assert_eq!((record.target, record.product, record.protocol, record.effective_uid),
             (InstallTarget::Gateway, Product::Duduclaw, 1, 999));
         assert_eq!((record.artifact_id.as_str(), record.build_sha256), ("duduclaw", Sha256Digest([1; 32])));
         // Not serving, or any field that could not be computed.
-        assert!(!readback(&identity(), false).ready);
-        assert!(!readback(&Identity { build: None, ..identity() }, true).ready);
-        assert!(!readback(&Identity { version: None, ..identity() }, true).ready);
-        assert!(!readback(&Identity { effective_uid: 0, ..identity() }, true).ready);
-        let unknown = readback(&Identity { build: None, version: None, ..identity() }, true);
+        assert!(!readback(&identity(), false, true).ready);
+        assert!(!readback(&Identity { build: None, ..identity() }, true, true).ready);
+        assert!(!readback(&Identity { version: None, ..identity() }, true, true).ready);
+        assert!(!readback(&Identity { effective_uid: 0, ..identity() }, true, true).ready);
+        let unknown = readback(&Identity { build: None, version: None, ..identity() }, true, true);
         assert_eq!((unknown.build_sha256, unknown.version), (Sha256Digest([0; 32]), ReleaseVersion { major: 0, minor: 0, patch: 0 }));
     }
 
@@ -328,15 +373,15 @@ mod tests {
         let generation = Sha256Digest([3; 32]);
         let request = |schema_version, command| ControlRequest { schema_version, nonce: RequestId([2; 16]), command };
         let good = request(1, ControlCommand::Readback { generation });
-        let response = answer(&good, &identity(), true);
+        let response = answer(&good, &identity(), true, true);
         assert!(duduclaw_updated::activation_contract::validate_response(&good, &response).is_ok());
         assert!(matches!(response.outcome, ControlOutcome::Readback { ref components } if components.len() == 1 && components[0].ready));
-        let response = answer(&good, &identity(), false);
+        let response = answer(&good, &identity(), false, true);
         assert!(matches!(response.outcome, ControlOutcome::Readback { ref components } if !components[0].ready));
         for refused in [request(2, ControlCommand::Readback { generation }),
             request(1, ControlCommand::Readback { generation: Sha256Digest([0; 32]) }),
             request(1, ControlCommand::Drain { generation }), request(1, ControlCommand::Resume { generation })] {
-            let response = answer(&refused, &identity(), true);
+            let response = answer(&refused, &identity(), true, true);
             assert!(matches!(response.outcome, ControlOutcome::Refused));
             assert_eq!((response.nonce, response.generation), (refused.nonce, refused.command.generation()));
         }
@@ -344,26 +389,77 @@ mod tests {
 
     /// DEFECT 23: whole-host admission readiness is not established in this
     /// process (it never is in unit tests: no spawnd evidence, no updater
-    /// answer), yet a serving gateway with a complete identity is ready; an
-    /// incomplete identity never is.
+    /// answer), yet a serving gateway with a complete identity and its local
+    /// initialisation finished is ready; an incomplete identity never is.
     #[test]
     fn gateway_readback_ready_is_serving_with_complete_identity_not_host_readiness() {
         assert!(!crate::isolation_readiness::status().is_some_and(|readiness| readiness.ready));
-        assert!(readback(&identity(), true).ready);
+        assert!(readback(&identity(), true, true).ready);
         let generation = Sha256Digest([3; 32]);
         let request = ControlRequest { schema_version: 1, nonce: RequestId([2; 16]), command: ControlCommand::Readback { generation } };
-        assert!(matches!(answer(&request, &identity(), true).outcome,
+        assert!(matches!(answer(&request, &identity(), true, true).outcome,
             ControlOutcome::Readback { ref components } if components[0].ready));
         for incomplete in [Identity { build: None, ..identity() }, Identity { version: None, ..identity() },
             Identity { effective_uid: 0, ..identity() }] {
-            assert!(!readback(&incomplete, true).ready);
+            assert!(!readback(&incomplete, true, true).ready);
+        }
+    }
+
+    /// Review round 1: serving with a complete identity is not enough while
+    /// the gateway's own initialisation has not finished (latch unset); once
+    /// the latch is set the record is ready; the latch never makes an
+    /// incomplete identity ready.
+    #[test]
+    fn gateway_readback_not_ready_until_local_initialisation_finished() {
+        let local = LocalReadiness::new();
+        assert!(!readback(&identity(), true, local.ready()).ready);
+        let generation = Sha256Digest([3; 32]);
+        let request = ControlRequest { schema_version: 1, nonce: RequestId([2; 16]), command: ControlCommand::Readback { generation } };
+        assert!(matches!(answer(&request, &identity(), true, local.ready()).outcome,
+            ControlOutcome::Readback { ref components } if !components[0].ready));
+        for step in [LocalStep::Stores, LocalStep::Service, LocalStep::Backend] { local.mark(step); }
+        assert!(readback(&identity(), true, local.ready()).ready);
+        assert!(matches!(answer(&request, &identity(), true, local.ready()).outcome,
+            ControlOutcome::Readback { ref components } if components[0].ready));
+        for incomplete in [Identity { build: None, ..identity() }, Identity { version: None, ..identity() },
+            Identity { effective_uid: 0, ..identity() }] {
+            assert!(!readback(&incomplete, true, local.ready()).ready);
+        }
+        assert!(!readback(&identity(), false, local.ready()).ready);
+    }
+
+    /// The latch is set only once every critical step is marked (any order),
+    /// marking is idempotent, and it is never cleared.
+    #[test]
+    fn gateway_local_readiness_latch_sets_only_after_every_critical_step() {
+        use super::LocalStep::{Backend, Service, Stores};
+        let orders = [[Stores, Service, Backend], [Backend, Stores, Service], [Service, Backend, Stores]];
+        for order in orders {
+            let local = LocalReadiness::new();
+            assert!(!local.ready());
+            local.mark(order[0]);
+            local.mark(order[0]);
+            assert!(!local.ready(), "one step");
+            local.mark(order[1]);
+            assert!(!local.ready(), "two steps");
+            local.mark(order[2]);
+            assert!(local.ready(), "all steps");
+            for step in order { local.mark(step); assert!(local.ready(), "monotonic"); }
+        }
+        // Any single step missing keeps the latch unset.
+        for missing in [Stores, Service, Backend] {
+            let local = LocalReadiness::new();
+            for step in [Stores, Service, Backend] { if step != missing { local.mark(step); } }
+            assert!(!local.ready(), "{missing:?} missing");
         }
     }
 
     /// DEFECT 23 composition: the updater's start-up verification
     /// (`healthy_readback`, the same call `verify_committed` makes) over this
     /// gateway's real record and a fake spawnd. Whole-host readiness is not
-    /// ready, yet verification succeeds; a wrong image hash still fails.
+    /// ready, yet verification succeeds once the gateway's local latch is set;
+    /// without the latch (local initialisation unfinished) it fails, and a
+    /// wrong image hash still fails.
     #[test]
     fn gateway_readback_satisfies_the_updaters_startup_verification() {
         use duduclaw_isolation::update::*;
@@ -404,11 +500,21 @@ mod tests {
             effective_uid: 0, ready: true };
         let generation = Sha256Digest([9; 32]);
         assert!(!crate::isolation_readiness::status().is_some_and(|readiness| readiness.ready));
-        let gateway = readback(&identity(), true);
+        let local = LocalReadiness::new();
+        // A new binary that serves its read-back but never finished its own
+        // start-up (no stores / listener / spawnd backend): not committed.
+        let unfinished = readback(&identity(), true, local.ready());
+        assert!(healthy_readback(&mut Runtime(vec![spawnd.clone(), unfinished]), &mut Effects(generation), &manifest, generation).is_err());
+        local.mark(LocalStep::Stores);
+        local.mark(LocalStep::Service);
+        let no_backend = readback(&identity(), true, local.ready());
+        assert!(healthy_readback(&mut Runtime(vec![spawnd.clone(), no_backend]), &mut Effects(generation), &manifest, generation).is_err());
+        local.mark(LocalStep::Backend);
+        let gateway = readback(&identity(), true, local.ready());
         healthy_readback(&mut Runtime(vec![spawnd.clone(), gateway]), &mut Effects(generation), &manifest, generation).unwrap();
-        let wrong_hash = readback(&Identity { build: Some(Sha256Digest([0xee; 32])), ..identity() }, true);
+        let wrong_hash = readback(&Identity { build: Some(Sha256Digest([0xee; 32])), ..identity() }, true, local.ready());
         assert!(healthy_readback(&mut Runtime(vec![spawnd.clone(), wrong_hash]), &mut Effects(generation), &manifest, generation).is_err());
-        let incomplete = readback(&Identity { version: None, ..identity() }, true);
+        let incomplete = readback(&Identity { version: None, ..identity() }, true, local.ready());
         assert!(healthy_readback(&mut Runtime(vec![spawnd, incomplete]), &mut Effects(generation), &manifest, generation).is_err());
     }
 }

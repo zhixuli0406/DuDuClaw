@@ -205,13 +205,15 @@ fields refused, 5 s timeouts. Every refusal is the single `Refused` outcome.
   manifest's facts of exactly those bytes and `effective_uid` is the measurer's
   (0). A file that cannot be opened, verified or measured in time reports
   `ready: false`; nothing is guessed.
-- Read-back rule (all three daemons): a component's read-back `ready` means it
-  is serving with a complete identity (spawnd: a recent healthy admission-loop
+- Read-back rule (all three daemons): a component's read-back `ready` means
+  serving with a complete identity AND, for the gateway, its own local
+  initialisation finished (stores open, service entry up, spawnd backend
+  connected); whole-host readiness and the updater's own answers are never an
+  input of the updater's verification (spawnd: a recent healthy admission-loop
   iteration; gateway/egress: their read-back endpoint serving). Whole-host
-  readiness (spawnd's evidence, the gateway's `isolation_readiness`) is never an
-  input of the updater's verification: both need the updater's probe answer,
-  which it gives only after its start-up verification, so using them there is a
-  circular wait. Whole-host readiness is enforced at admission instead (spawnd's
+  readiness (spawnd's evidence, the gateway's `isolation_readiness`) needs the
+  updater's probe answer, which it gives only after its start-up verification,
+  so using it there is a circular wait. Whole-host readiness is enforced at admission instead (spawnd's
   `Readiness::check`, the gateway's `check_execution` before every run).
   Evidence: whenever the set of false checks changes, spawnd prints one stderr
   line, `evidence incomplete: <readiness.json names>` with the first failing
