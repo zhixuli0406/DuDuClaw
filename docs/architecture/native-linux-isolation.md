@@ -5789,10 +5789,13 @@ not been obtained.
   installer layout — spawnd, employees slice, egress, DNS broker, parse,
   updated, import, migrate-expire; `/usr/lib/duduclaw`,
   `/opt/duduclaw-isolated`, `/var/lib/duduclaw-spawnd`,
-  `/var/log/duduclaw-spawnd`, `/var/lib/duduclaw-updated`,
+  `/var/lib/duduclaw-updated`,
   `/etc/duduclaw-updated`, `/var/lib/duduclaw-migrate` — plus
   `/opt/duduclaw-isolated/current`, `/var/lib/duduclaw-updated/state.json`,
   `/etc/duduclaw/migration-import.json` and the layout's fixed binaries).
+  The installer creates the root-only audit directory `/var/lib/duduclaw-spawnd/audit`
+  (root:root 0700). It is outside `/var/log` because Ubuntu uses root:syslog 0775
+  there, which fails the root-managed path checks.
   Nothing a v1.80 single-binary install writes or uses is a fact
   (`isolation_install::SINGLE_BINARY_LAYOUT`: `/etc/duduclaw`,
   `duduclaw.slice`, `duduclaw-tcb.slice`, `/opt/duduclaw/bin`,

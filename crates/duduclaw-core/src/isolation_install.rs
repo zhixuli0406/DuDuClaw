@@ -18,7 +18,7 @@
 //! durable migration import manifest and the fixed-path isolation binaries.
 //! Paths a v1.80 single-binary install also writes are never facts
 //! ([`SINGLE_BINARY_LAYOUT`]). Every fact lives below a root-owned directory that the
-//! gateway's service account cannot write (`/run`, `/var/lib`, `/var/log`, `/etc`,
+//! gateway's service account cannot write (`/run`, `/var/lib`, `/etc`,
 //! `/etc/systemd/system`, `/opt`, `/opt/duduclaw-isolated`, `/opt/duduclaw/bin`,
 //! `/usr/lib`, `/usr/libexec`), so an employee running as that account can
 //! neither create one (which could only narrow: isolation required and
@@ -47,7 +47,8 @@ pub const DURABLE_IMPORT_MANIFEST: &str = "/etc/duduclaw/migration-import.json";
 
 /// The root-owned facts of an isolation install. Every isolation-only entry of
 /// the installer layout (`protected_linux_layout::{BINARIES, UNITS,
-/// DIRECTORIES}`) is included (tested in duduclaw-cli). Layout entries that a
+/// DIRECTORIES}`) is included or covered by its parent (tested in duduclaw-cli).
+/// The audit directory is covered by `/var/lib/duduclaw-spawnd`. Layout entries that a
 /// v1.80-style single-binary install also creates or uses are deliberately
 /// NOT facts: `/etc/duduclaw` (the protected-mode marker's directory) and the
 /// `duduclaw.slice` / `duduclaw-tcb.slice` units (the single-binary gateway
@@ -73,7 +74,7 @@ pub const FACTS: &[&str] = &[
     "/etc/systemd/system/duduclaw-import@.service",
     "/etc/systemd/system/duduclaw-migrate-expire@.service",
     "/etc/systemd/system/duduclaw-migrate-expire@.timer",
-    // Isolation-only directories (layout::DIRECTORIES minus /etc/duduclaw).
+    // Isolation-only directories (layout::DIRECTORIES minus /etc/duduclaw and audit, covered by its parent).
     "/usr/lib/duduclaw",
     "/usr/lib/duduclaw/parse-root",
     "/usr/lib/duduclaw/parse-root-tree",
@@ -81,7 +82,6 @@ pub const FACTS: &[&str] = &[
     "/usr/libexec/duduclaw",
     "/var/lib/duduclaw-spawnd",
     "/var/lib/duduclaw-spawnd/etc",
-    "/var/log/duduclaw-spawnd",
     "/etc/duduclaw-updated",
     "/var/lib/duduclaw-updated",
     "/opt/duduclaw-isolated",

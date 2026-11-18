@@ -29,7 +29,7 @@ SERVICE_UNITS=(duduclaw-gateway.service duduclaw-spawnd.service duduclaw-spawnd.
   duduclaw-egress.service duduclaw-egress.socket duduclaw-dns-broker.service
   duduclaw-dns-broker.socket duduclaw-parse.socket duduclaw-updated.service)
 FIXED_PATHS=(/var/lib/duduclaw /var/lib/duduclaw-protected /var/lib/duduclaw-spawnd
-  /var/log/duduclaw-spawnd /var/lib/duduclaw-updated /var/lib/duduclaw-migrate
+  /var/lib/duduclaw-updated /var/lib/duduclaw-migrate
   /etc/duduclaw /etc/duduclaw-updated /opt/duduclaw /opt/duduclaw-isolated
   /usr/lib/duduclaw /usr/libexec/duduclaw /usr/local/libexec/duduclaw)
 SERVICE_ACCOUNTS=(duduclaw duduclaw-runsup duduclaw-egress duduclaw-dl duduclaw-dns)

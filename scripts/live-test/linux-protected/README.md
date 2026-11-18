@@ -8,6 +8,11 @@
 | `fixtures/policy-source-test.json`, `fixtures/policy-syscalls-test-{x86_64,aarch64}.txt`, `fixtures/manifest-template-test.json` | **v1.83 R7d, TEST-only.** Inputs of the TEST isolation policy that `scripts/isolation-test-keys.sh bundle` now puts into every TEST generation (see "TEST isolation policy" below). |
 | `acceptance.sh` + `rpc_probe.py` | **Superseded for v1.81.** `acceptance.sh` asserts the removed `container_root_key` backend (`security.credential_protection` ⇒ `backend=container_root_key`), so it cannot pass on a v1.81 build. It is kept unchanged for the historical record (see "Legacy" at the end). `rpc_probe.py` is still used: `connectors_rpc.py` imports its WebSocket client. |
 
+The installer creates `/var/lib/duduclaw-spawnd/audit` as root:root 0700 for
+spawnd audit logs; spawnd refuses a missing directory. Audit logs stay outside
+`/var/log` because Ubuntu uses root:syslog 0775 there, which fails the root-managed
+path checks.
+
 ## TEST isolation policy (v1.83 R7d)
 
 Every generation must contain a signed isolation policy (`runtime-isolation-policy-v1`);

@@ -39,7 +39,7 @@ const SHARED_WITH_SINGLE_BINARY: &[&str] = &["/etc/duduclaw",
     "/etc/systemd/system/duduclaw.slice", "/etc/systemd/system/duduclaw-tcb.slice"];
 
 /// Every isolation-only binary, unit and directory the installer layout
-/// publishes is a fact of `duduclaw_core::isolation_install`, so an installed
+/// publishes is covered by a fact of `duduclaw_core::isolation_install`, so an installed
 /// isolation component always switches the gateway onto the isolation path.
 #[test]
 fn service_protected_isolation_install_facts_cover_layout() {
@@ -57,6 +57,11 @@ fn service_protected_isolation_install_facts_cover_layout() {
     assert_eq!(checked, super::layout::UNITS.len() - 2, "only the two shared slices are excluded");
     for (path, _) in super::layout::DIRECTORIES {
         if SHARED_WITH_SINGLE_BINARY.contains(path) { continue; }
+        if *path == "/var/lib/duduclaw-spawnd/audit" {
+            assert!(facts.contains(&"/var/lib/duduclaw-spawnd"));
+            assert!(!facts.contains(path), "the parent already covers the audit directory");
+            continue;
+        }
         assert!(facts.contains(path), "layout directory missing from isolation facts: {path}");
     }
     // The single-binary protected install writes none of them.
@@ -72,6 +77,19 @@ fn service_protected_isolation_install_facts_cover_layout() {
         assert!(single.contains(&path), "single-binary layout list misses {path}");
     }
     assert!(unit_text().lines().any(|line| line == "Slice=duduclaw-tcb.slice"));
+}
+
+#[test]
+fn service_protected_layout_and_facts_stay_outside_var_log() {
+    // Ubuntu makes /var/log root:syslog 0775; a writable ancestor must remain refused.
+    for path in super::layout::DIRECTORIES.iter().map(|(path, _)| *path)
+        .chain(duduclaw_core::isolation_install::FACTS.iter().copied()) {
+        assert!(!std::path::Path::new(path).ancestors().any(|ancestor| ancestor == std::path::Path::new("/var/log")), "{path}");
+    }
+    let directories = super::layout::DIRECTORIES;
+    let parent = directories.iter().position(|(path, mode)| *path == "/var/lib/duduclaw-spawnd" && *mode == 0o700).unwrap();
+    let audit = directories.iter().position(|(path, mode)| *path == "/var/lib/duduclaw-spawnd/audit" && *mode == 0o700).unwrap();
+    assert_eq!(audit, parent + 1, "create the audit directory after its parent");
 }
 
 /// R7a: the installer creates the account `duduclaw-run-selftest` looks up

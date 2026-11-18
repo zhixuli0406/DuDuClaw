@@ -354,8 +354,13 @@ pub mod disk {
     use std::{fs::{self, File, OpenOptions}, io::{self, Write}, os::unix::fs::{MetadataExt, OpenOptionsExt}, path::{Path, PathBuf}, sync::{atomic::Ordering, mpsc::RecvTimeoutError}, time::{Duration, SystemTime, UNIX_EPOCH}};
     use fs2::FileExt;
     use crate::registry::root_path;
-    const DIRECTORY: &str = "/var/log/duduclaw-spawnd";
+    const DIRECTORY: &str = "/var/lib/duduclaw-spawnd/audit";
     const SLOTS: usize = 4;
+
+    #[test]
+    fn audit_directory_is_in_installer_owned_state_tree() {
+        assert_eq!(DIRECTORY, "/var/lib/duduclaw-spawnd/audit");
+    }
 
     /// The server only calls try_send. Disk, lock and fsync latency never delay
     /// its two-second intrusion scan; dropping this handle never joins a worker.
@@ -406,6 +411,7 @@ pub mod disk {
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis().min(u64::MAX as u128) as u64
     }
     fn checked_directory() -> io::Result<&'static Path> {
+        // The installer creates this directory; a missing directory must refuse.
         let directory = Path::new(DIRECTORY);
         root_path(directory, true)?;
         if fs::metadata(directory)?.mode() & 0o077 != 0 { return Err(io::ErrorKind::PermissionDenied.into()); }

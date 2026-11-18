@@ -124,7 +124,7 @@ pub(super) const SPAWND_RUNTIME: &str = "/run/duduclaw-spawnd";
 /// The trees R1's `trust_init::publish` creates at S4(a).
 const TRUST_TREES: [&str; 3] = ["/opt/duduclaw-isolated", "/etc/duduclaw-updated", "/var/lib/duduclaw-updated"];
 /// The trees of `layout::DIRECTORIES` created at S4(c).
-const LAYOUT_TREES: [&str; 3] = ["/var/lib/duduclaw-spawnd", "/var/log/duduclaw-spawnd", "/var/lib/duduclaw-migrate"];
+const LAYOUT_TREES: [&str; 2] = ["/var/lib/duduclaw-spawnd", "/var/lib/duduclaw-migrate"];
 const MACHINE_ID: &str = "/etc/machine-id";
 /// `/sys/class/dmi/id/product_uuid` (`/sys/class/dmi/id` is a link to this
 /// canonical sysfs directory; links are never followed). Absent without DMI.

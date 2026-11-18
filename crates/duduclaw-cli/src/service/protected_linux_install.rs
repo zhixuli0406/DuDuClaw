@@ -1075,7 +1075,7 @@ mod spawnd_install_tests {
         assert!(ready.lines().any(|line| line == format!("ExecStart={SPAWND_BINARY} wait-consistent")));
         assert!(lookup("duduclaw-egress.service").contains(duduclaw_isolation::ids::ISOLATED_GATEWAY_UNIT_DEPENDENCIES));
         assert!(service.lines().any(|line| line == "Slice=duduclaw-tcb.slice"));
-        assert!(service.lines().any(|line| line == "ReadWritePaths=/var/lib/duduclaw-spawnd /var/log/duduclaw-spawnd /run/duduclaw-spawnd /etc -/var/lib/systemd/linger"));
+        assert!(service.lines().any(|line| line == "ReadWritePaths=/var/lib/duduclaw-spawnd /run/duduclaw-spawnd /etc -/var/lib/systemd/linger"));
         // HX: cgroupfs is writable only beneath the employees slice; the rest stays protected.
         assert!(service.lines().any(|line| line == "ReadWritePaths=-/sys/fs/cgroup/duduclaw.slice/duduclaw-employees.slice"));
         assert!(service.lines().any(|line| line == "ProtectControlGroups=yes"));
