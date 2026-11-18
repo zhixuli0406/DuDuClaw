@@ -131,6 +131,8 @@ pub(crate) fn is_enterprise_only_method(method: &str) -> bool {
         | "isolation.connector_list" | "isolation.connector_step_up"
         | "isolation.connector_provision" | "isolation.connector_revoke"
         | "isolation.connector_import_legacy"
+        // R8r-3a 隔離員工的模型連線資料（同上，Linux 團隊版）
+        | "isolation.provider_status" | "isolation.provider_set" | "isolation.provider_clear"
         // 受保護員工配置提案與個人專屬員工申請（同上，Linux 團隊版）
         | "isolation.employee_list" | "isolation.employee_propose" | "isolation.employee_tombstone"
         | "isolation.employee_purge_requests"

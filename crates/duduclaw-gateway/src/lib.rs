@@ -66,6 +66,9 @@ pub mod isolation_forks;
 pub mod isolation_readiness;
 /// R8d: the root host entitlement an employee's approved settings need.
 pub(crate) mod isolation_entitlement;
+/// R8r-3a: non-secret record of model connection documents set through the
+/// dashboard (`isolation.provider_status` reads it; never a key).
+pub(crate) mod isolation_provider_records;
 /// R6 update readback endpoint (`/run/duduclaw-gateway-update/readback.sock`).
 pub mod update_readback;
 // Read model and handover path; B1–B3 and the A4 admin RPC consume the parts

@@ -248,6 +248,8 @@ mod channel_ingress_rpc;
 mod computer_workspaces_rpc;
 mod isolation_recording_rpc;
 mod isolation_connectors_rpc;
+// R8r-3a: isolated employees' model connection documents (dashboard path).
+mod isolation_providers_rpc;
 mod isolation_employee_rpc;
 // F6g: the v2 employee-dir digest and marker rules for the adoption engine.
 pub(crate) use isolation_employee_rpc::employee_dirs;
@@ -511,6 +513,14 @@ impl MethodHandler {
         let credential_request = if method.split('.').next() == Some("transcription_credentials") {
             Some(transcription_credentials_rpc::Request::take(method, params.take()))
         } else { None };
+        // R8r-3a: model connection keys leave the params here, before any
+        // gate, plugin or log can see them: each `api_key` is moved into a
+        // zeroizing owner and every string left in the params is overwritten.
+        let provider_call = if isolation_providers_rpc::owns(method) {
+            // Boxed: keeps the shared dispatcher future small (only the
+            // zeroizing owners' handles move, never the key bytes).
+            Some(Box::new(isolation_providers_rpc::ProviderCall::take_from(method, &mut params)))
+        } else { None };
         if method == "system.update_config"
             && transcription_credentials_rpc::reject_generic_credentials(&mut params) {
             return WsFrame::error_response("", "請使用專用的會議轉錄憑證設定操作。");
@@ -625,6 +635,11 @@ impl MethodHandler {
                 return WsFrame::error_response("", &error);
             }
             return boxed_frame(|| self.handle_isolation_connectors(method, params, ctx)).await;
+        }
+        // Model connection documents are isolation authority too; the keys
+        // were taken out of the params above, no extension sees the namespace.
+        if let Some(call) = provider_call {
+            return boxed_frame(|| self.route_isolation_providers(*call, ctx)).await;
         }
         // Protected employee proposals are isolation authority too: the
         // handler applies the per-method role (self-service or Admin + step-up).
