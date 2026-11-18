@@ -179,13 +179,28 @@ fields refused, 5 s timeouts. Every refusal is the single `Refused` outcome.
   being read back (never through `current`; mounted at `/runtime` for runs):
   the MCP bridge and the egress forwarder (0755) and every runtime entry (0755;
   the signed `isolation-policy-v1` 0444). The signed mode must be the one
-  `publication` allows for that kind. Bounded: one `Readback` measures for at
-  most 2 s (checked before every file and every 64 KiB chunk, well inside the
-  client's 5 s socket timeout), a manifest whose measured files exceed 4 GiB in
-  total is not measured at all (logged once), and completed digests are cached
-  per generation with the file's `fstat` identity (device, inode, size, mode,
-  mtime, ctime; equal before and after hashing) so a retry re-hashes only what
-  changed or did not finish. A record is `ready` only when the measured digest is the
+  `publication` allows for that kind. Bounded: every `open`, `fstat` and `read`
+  of a measured file (including the identity re-check of a cached digest) runs
+  on one dedicated measuring thread (`spawnd-update-measure`, started by the
+  first `Readback`, alive as long as the endpoint); the request only reads the
+  thread's result table and waits for it at most 2 s (a hard condvar timeout,
+  well inside the client's 5 s socket timeout), then answers with what is
+  finished. At most one measuring pass is in flight: a `Readback` of the
+  generation in progress waits on that pass, one of another generation replaces
+  the pending job and cancels the current pass at its next check (before every
+  file and every 64 KiB chunk). A pass is not cut short by a request's wait, so
+  the updater's retries (every 200 ms for 30 s) see more and more of it. A
+  syscall that never returns (failing disk, stalled storage) blocks only the
+  measuring thread: every `Readback` still answers within 2 s with the affected
+  artifact and every later one not measured, so the update fails closed when
+  the client gives up; that thread is neither killed nor replaced (no second
+  measuring thread is ever started while one exists). A manifest whose measured
+  files exceed 4 GiB in total is not measured at all (decided before anything
+  is opened, logged once), and completed digests are cached per generation
+  (dropped when another generation is measured, at most 256) with the file's
+  `fstat` identity (device, inode, size, mode, mtime, ctime; equal before and
+  after hashing) so a later pass re-hashes only what changed or did not finish.
+  A record is `ready` only when the measured digest is the
   artifact's and spawnd's euid is 0; product, version and protocol are then the
   manifest's facts of exactly those bytes and `effective_uid` is the measurer's
   (0). A file that cannot be opened, verified or measured in time reports

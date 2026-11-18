@@ -7257,6 +7257,18 @@
       "rationale": "spawnd starts one fresh Rust thread that unshares CLONE_FS|CLONE_NEWNS to compose the native home mount in a disposable namespace and returns a detached clone; no employee process or OS child is started."
     },
     {
+      "symbol": "crates/duduclaw-spawnd/src/update_control.rs::Measurer::start",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "task_or_thread"
+      ],
+      "identity": "spawn_daemon",
+      "migration": "not_process",
+      "rationale": "R6 readback: std::thread::Builder::spawn starts the one spawnd-update-measure thread, owned by the update-control state and started by the first Readback, that opens (trusted reader), fstats and hashes the measured component files so the update endpoint's Readback only waits on its results with a hard 2 s timeout; at most one exists (never replaced, even if stuck in a syscall) and it stops when the state is dropped. It only reads files; no OS child process is launched."
+    },
+    {
       "symbol": "crates/duduclaw-spawnd/src/update_control.rs::Recovered::serve",
       "apis": {
         "terminal_spawn": 1

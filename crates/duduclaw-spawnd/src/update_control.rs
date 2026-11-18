@@ -85,7 +85,7 @@
 //! status file or a synchronously written audit record did not land.
 #![allow(unsafe_code)]
 use std::{collections::BTreeMap, fs::File, io::{self, Read}, os::{fd::{AsRawFd, FromRawFd, OwnedFd}, unix::fs::{FileTypeExt, MetadataExt, PermissionsExt}},
-    path::{Path, PathBuf}, sync::{Arc, Mutex}, time::{Duration, Instant}};
+    path::{Path, PathBuf}, sync::{Arc, Condvar, Mutex, MutexGuard}, time::{Duration, Instant}};
 use duduclaw_isolation::{ids::Sha256Digest, update::{InstallTarget, Product, ReleaseArtifact, ReleaseManifest, ReleaseVersion}};
 use duduclaw_updated::{activation_contract::{ComponentReadback, ControlCommand, ControlOutcome, ControlRequest, ControlResponse, Preparation},
     linux::{activation::SPAWND_UPDATE_SOCKET, files::{copy_artifact, verify_fd, Directory}, transport, INSTALL_ROOT},
@@ -1196,8 +1196,9 @@ enum Trust {
 /// Production effects over `/opt/duduclaw-isolated/generations/<hex>` and `/`.
 pub struct InstalledEffects {
     install_root: PathBuf, publish_root: PathBuf, trust: Trust, own_image: Option<Sha256Digest>,
-    /// Readback file measurements of the generation last read back ([`measure_files`]).
-    measurements: MeasureCache,
+    /// The readback's measuring thread ([`Measurer`]), started by the first
+    /// `Readback` and never replaced while it exists.
+    measurer: Option<Measurer>,
     /// Fault injection: the next `publish` stops (as a power loss would) after
     /// this many renames, before the next one.
     #[cfg(test)]
@@ -1210,23 +1211,18 @@ pub struct InstalledEffects {
 impl InstalledEffects {
     pub fn production() -> Self {
         Self { install_root: PathBuf::from(INSTALL_ROOT), publish_root: PathBuf::from("/"), trust: Trust::Recorded,
-            own_image: running_image().ok(), measurements: MeasureCache::default(), #[cfg(test)] power_loss_after: None,
+            own_image: running_image().ok(), measurer: None, #[cfg(test)] power_loss_after: None,
             #[cfg(test)] revoked: Vec::new() }
     }
     #[cfg(test)]
     fn for_test(install_root: &Path, publish_root: &Path) -> Self {
         Self { install_root: install_root.to_path_buf(), publish_root: publish_root.to_path_buf(),
-            trust: Trust::Unsigned, own_image: running_image().ok(), measurements: MeasureCache::default(),
+            trust: Trust::Unsigned, own_image: running_image().ok(), measurer: None,
             power_loss_after: None, revoked: Vec::new() }
     }
     /// `Ok(None)` only when the generation directory does not exist (yet).
     fn generation_directory(&self, generation: Sha256Digest) -> io::Result<Option<Directory>> {
-        let generations = Directory::open(&self.install_root).and_then(|root| root.child("generations")).map_err(updated)?;
-        match generations.child(&hex(&generation)) {
-            Ok(directory) => Ok(Some(directory)),
-            Err(duduclaw_updated::Error::Io(error)) if missing(&error) => Ok(None),
-            Err(error) => Err(updated(error)),
-        }
+        generation_directory_at(&self.install_root, generation)
     }
     /// The canonical manifest whose SHA-256 is the generation digest.
     fn manifest(&self, directory: &Directory, generation: Sha256Digest) -> io::Result<(Vec<u8>, ReleaseManifest)> {
@@ -1254,6 +1250,16 @@ impl InstalledEffects {
         Ok(())
     }
 }
+/// `<install_root>/generations/<hex>` through the trusted reader; `Ok(None)`
+/// only when it does not exist (yet).
+fn generation_directory_at(install_root: &Path, generation: Sha256Digest) -> io::Result<Option<Directory>> {
+    let generations = Directory::open(install_root).and_then(|root| root.child("generations")).map_err(updated)?;
+    match generations.child(&hex(&generation)) {
+        Ok(directory) => Ok(Some(directory)),
+        Err(duduclaw_updated::Error::Io(error)) if missing(&error) => Ok(None),
+        Err(error) => Err(updated(error)),
+    }
+}
 
 /// The permission bits of a file spawnd measures (the rule of
 /// `publication::validate_bootstrap_manifest`: executables 0755, the signed
@@ -1273,12 +1279,14 @@ fn measured_mode(target: &InstallTarget) -> Option<u32> {
 /// and SO_SNDTIMEO to 5 s on the client's connection to this endpoint (a test
 /// reads it back from a socket that function configured).
 const CLIENT_SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
-/// Absolute limit of one `Readback`'s measuring work, checked before every
-/// file and before every chunk read. At most 40% of the client's timeout, so
-/// the reply (and the manifest read before it) always lands while the client
-/// still waits; the client retries every 200 ms for 30 s, and the work done so
-/// far is kept in [`MeasureCache`]. On expiry the remaining artifacts have no
-/// measurement (their records are not ready); nothing is guessed.
+/// How long one `Readback` waits for the [`Measurer`]: a hard condvar timeout
+/// on the request path, which itself does no measuring I/O, so it holds
+/// however long any single `open`, `fstat` or `read` of the measuring thread
+/// takes. At most 40% of the client's timeout, so the reply (and the manifest
+/// read before it) always lands while the client still waits; the client
+/// retries every 200 ms for 30 s while the measuring thread keeps going. At
+/// the timeout the artifacts without a result have no measurement (their
+/// records are not ready); nothing is guessed.
 const READBACK_MEASURE_DEADLINE: Duration = Duration::from_secs(2);
 const _: () = assert!(READBACK_MEASURE_DEADLINE.as_millis() * 5 <= CLIENT_SOCKET_TIMEOUT.as_millis() * 2);
 /// Aggregate bytes spawnd hashes for one manifest (every measured site of
@@ -1363,8 +1371,8 @@ pub(crate) trait FileOpener {
 /// Every directory on the way and the file go through the trusted reader
 /// (`Directory`: no symlinks, root:root, not group/other-writable; the file a
 /// root:root regular file with one link).
-struct InstalledFiles<'a> { publish_root: &'a Path, generation: &'a Directory }
-impl FileOpener for InstalledFiles<'_> {
+struct InstalledFiles { publish_root: PathBuf, generation: Directory }
+impl FileOpener for InstalledFiles {
     type File = File;
     fn open(&mut self, site: Site, name: &str) -> io::Result<File> {
         match site {
@@ -1376,8 +1384,9 @@ impl FileOpener for InstalledFiles<'_> {
 }
 
 /// Completed measurements of one generation, by (artifact id, site), each with
-/// the identity it was measured from. Dropped whole when another generation is
-/// read back; at most [`MEASURE_CACHE_ENTRIES`] entries.
+/// the identity it was measured from. Owned by the measuring thread
+/// ([`Measurer`]); dropped whole when it starts a pass of another generation;
+/// at most [`MEASURE_CACHE_ENTRIES`] entries.
 #[derive(Default)]
 pub(crate) struct MeasureCache {
     generation: Option<Sha256Digest>,
@@ -1400,15 +1409,28 @@ fn measured_bytes(manifest: &ReleaseManifest) -> Option<u64> {
             .checked_mul(measured_sites(&artifact.install_target).len() as u64)
             .and_then(|bytes| total.checked_add(bytes)))
 }
-enum Measurement { Digest(Sha256Digest), Unmeasurable, Expired }
+/// Selects `generation` in `cache` (dropping another generation's entries) and
+/// says whether its manifest exceeds [`MEASURE_BUDGET_BYTES`] (logged once
+/// per generation). Decided before any file is opened.
+fn over_budget(cache: &mut MeasureCache, generation: Sha256Digest, manifest: &ReleaseManifest) -> bool {
+    cache.select(generation);
+    if matches!(measured_bytes(manifest), Some(bytes) if bytes <= MEASURE_BUDGET_BYTES) { return false; }
+    if !cache.over_budget_logged {
+        cache.over_budget_logged = true;
+        eprintln!("duduclaw-spawnd: readback of generation {} not measured: its files exceed the {MEASURE_BUDGET_BYTES}-byte \
+            measuring budget", hex(&generation));
+    }
+    true
+}
+enum Measurement { Digest(Sha256Digest), Unmeasurable, Cancelled }
 /// One site of one artifact: the file must carry the kind's mode (which must
 /// also be the signed mode) and the signed size (at most
 /// [`MAX_EXECUTABLE_BYTES`]); a cached digest is reused only for the identical
-/// identity; otherwise it is hashed in chunks with `expired` checked before
+/// identity; otherwise it is hashed in chunks with `cancelled` checked before
 /// each, and the identity must be unchanged afterwards.
 fn measure_one<O: FileOpener>(opener: &mut O, cache: &mut MeasureCache, artifact: &ReleaseArtifact, mode: u32, site: Site,
-    name: &str, expired: &mut dyn FnMut() -> bool) -> Measurement {
-    if expired() { return Measurement::Expired; }
+    name: &str, cancelled: &mut dyn FnMut() -> bool) -> Measurement {
+    if cancelled() { return Measurement::Cancelled; }
     let Ok(mut file) = opener.open(site, name) else { return Measurement::Unmeasurable };
     let Ok(before) = file.identity() else { return Measurement::Unmeasurable };
     if before.mode & 0o7777 != mode || before.size != artifact.size_bytes || before.size > MAX_EXECUTABLE_BYTES {
@@ -1423,7 +1445,7 @@ fn measure_one<O: FileOpener>(opener: &mut O, cache: &mut MeasureCache, artifact
     let mut buffer = vec![0u8; MEASURE_CHUNK_BYTES];
     let mut total = 0u64;
     loop {
-        if expired() { return Measurement::Expired; }
+        if cancelled() { return Measurement::Cancelled; }
         let count = match file.read_chunk(&mut buffer) {
             Ok(count) => count,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -1448,23 +1470,25 @@ fn measure_one<O: FileOpener>(opener: &mut O, cache: &mut MeasureCache, artifact
     Measurement::Digest(digest)
 }
 /// The file measurements of `generation`'s manifest, by artifact id
-/// ([`Observed::measured`]). An artifact gets an entry only when every one of
-/// its sites ([`measured_sites`]) was measured: the signed digest when all
-/// hold it, otherwise the first differing digest. Over
-/// [`MEASURE_BUDGET_BYTES`]: nothing (logged once per generation). `expired`:
-/// the artifact in progress and every later one get no entry.
+/// ([`Observed::measured`]): everything [`measure_pass`] reports.
+#[cfg(test)]
 pub(crate) fn measure_files<O: FileOpener>(opener: &mut O, cache: &mut MeasureCache, generation: Sha256Digest,
-    manifest: &ReleaseManifest, expired: &mut dyn FnMut() -> bool) -> BTreeMap<String, Sha256Digest> {
-    cache.select(generation);
+    manifest: &ReleaseManifest, cancelled: &mut dyn FnMut() -> bool) -> BTreeMap<String, Sha256Digest> {
     let mut measured = BTreeMap::new();
-    if !matches!(measured_bytes(manifest), Some(bytes) if bytes <= MEASURE_BUDGET_BYTES) {
-        if !cache.over_budget_logged {
-            cache.over_budget_logged = true;
-            eprintln!("duduclaw-spawnd: readback of generation {} not measured: its files exceed the {MEASURE_BUDGET_BYTES}-byte \
-                measuring budget", hex(&generation));
-        }
-        return measured;
-    }
+    measure_pass(opener, cache, generation, manifest, cancelled,
+        &mut |id: &str, digest: Sha256Digest| { measured.insert(id.to_owned(), digest); });
+    measured
+}
+/// One measuring pass over `generation`'s manifest. An artifact is reported
+/// (to `report`, as soon as it is done) only when every one of its sites
+/// ([`measured_sites`]) was measured: the signed digest when all hold it,
+/// otherwise the first differing digest. Over [`MEASURE_BUDGET_BYTES`]:
+/// nothing (logged once per generation). `cancelled` (checked before every
+/// file and every chunk): the artifact in progress and every later one are
+/// not reported.
+fn measure_pass<O: FileOpener>(opener: &mut O, cache: &mut MeasureCache, generation: Sha256Digest,
+    manifest: &ReleaseManifest, cancelled: &mut dyn FnMut() -> bool, report: &mut dyn FnMut(&str, Sha256Digest)) {
+    if over_budget(cache, generation, manifest) { return; }
     for artifact in &manifest.artifacts {
         let Some(mode) = measured_mode(&artifact.install_target) else { continue };
         let sites = measured_sites(&artifact.install_target);
@@ -1472,18 +1496,192 @@ pub(crate) fn measure_files<O: FileOpener>(opener: &mut O, cache: &mut MeasureCa
         let Ok(name) = artifact_name(&artifact.install_target) else { continue };
         let mut digests = Vec::with_capacity(sites.len());
         for site in sites {
-            match measure_one(opener, cache, artifact, mode, *site, &name, expired) {
+            match measure_one(opener, cache, artifact, mode, *site, &name, cancelled) {
                 Measurement::Digest(digest) => digests.push(digest),
                 Measurement::Unmeasurable => break,
-                Measurement::Expired => return measured,
+                Measurement::Cancelled => return,
             }
         }
         if digests.len() == sites.len() {
             let reported = digests.iter().copied().find(|digest| *digest != artifact.sha256).unwrap_or(artifact.sha256);
-            measured.insert(artifact.id.clone(), reported);
+            report(artifact.id.as_str(), reported);
         }
     }
-    measured
+}
+
+/// One measuring pass to run, as plain data: the measuring thread opens the
+/// generation directory and every file itself.
+struct MeasureJob { generation: Sha256Digest, manifest: ReleaseManifest }
+/// What the latest pass (in progress or ended) finished.
+#[derive(Default)]
+struct PassResults {
+    /// Its number ([`MeasureState::started`] when it began; 0: none yet).
+    pass: u64,
+    generation: Option<Sha256Digest>,
+    /// Every artifact the pass finished, as [`measure_pass`] reported it.
+    measured: BTreeMap<String, Sha256Digest>,
+    /// The pass reached its end or was cancelled.
+    ended: bool,
+}
+#[derive(Default)]
+struct MeasureState {
+    /// The next job; a Readback of another generation replaces it.
+    pending: Option<MeasureJob>,
+    /// The generation of the pass in progress.
+    running: Option<Sha256Digest>,
+    /// Passes started so far.
+    started: u64,
+    results: PassResults,
+    /// The owner is gone: the thread stops at its next check.
+    closed: bool,
+    /// The measuring thread returned.
+    stopped: bool,
+}
+#[derive(Default)]
+struct MeasureShared { state: Mutex<MeasureState>, changed: Condvar }
+impl MeasureShared {
+    /// `None` when poisoned (a panic under the lock): the caller fails closed.
+    fn lock(&self) -> Option<MutexGuard<'_, MeasureState>> { self.state.lock().ok() }
+    /// Waits for a change, at most until `deadline`; `None` when poisoned.
+    fn wait_until<'a>(&self, state: MutexGuard<'a, MeasureState>, deadline: Instant) -> Option<MutexGuard<'a, MeasureState>> {
+        let left = deadline.saturating_duration_since(Instant::now());
+        self.changed.wait_timeout(state, left).ok().map(|(state, _)| state)
+    }
+}
+
+/// The readback's measuring thread (`spawnd-update-measure`, owned by
+/// [`InstalledEffects`], started by the first `Readback`, alive as long as the
+/// endpoint) and the result table it shares with the request handler.
+///
+/// Every `open`, `fstat` and `read` of a measured file, including the
+/// identity re-check that validates a cached digest, happens on this one
+/// thread; the handler ([`Measurer::measured`]) only reads the table under
+/// the mutex and waits on the condvar at most until its deadline. At most one
+/// pass is in flight: a Readback of the generation in progress waits on that
+/// pass; one of another generation replaces the pending job and cancels the
+/// pass in progress at its next check (before every file and every 64 KiB
+/// read), and the thread drops the cache when it starts the other
+/// generation. A pass is never cut short by a request's deadline: a slow but
+/// healthy disk finishes it while the client retries, and a file in progress
+/// continues instead of being restarted.
+///
+/// A syscall that never returns (failing disk, stalled storage) blocks only
+/// this thread: every Readback still answers within
+/// [`READBACK_MEASURE_DEADLINE`], with the affected artifact and every later
+/// one not measured, so their records are not ready and the update fails
+/// closed when the client gives up after 30 s. Such a thread cannot be
+/// cancelled and is neither killed nor replaced: no second measuring thread
+/// is ever started while one exists.
+pub(crate) struct Measurer { shared: Arc<MeasureShared>, thread: Option<std::thread::JoinHandle<()>> }
+impl Measurer {
+    /// Starts the measuring thread; `files` gives it the opener of a
+    /// generation's sites (called on that thread, once per pass).
+    pub(crate) fn start<O, F>(mut files: F) -> io::Result<Self>
+    where O: FileOpener, F: FnMut(Sha256Digest) -> io::Result<O> + Send + 'static {
+        let shared = Arc::new(MeasureShared::default());
+        let measuring = shared.clone();
+        let thread = std::thread::Builder::new().name("spawnd-update-measure".into()).spawn(move || {
+            measuring_loop(&measuring, &mut files);
+            // Everything the thread holds is released before it says so.
+            drop(files);
+            if let Some(mut state) = measuring.lock() { state.stopped = true; }
+            measuring.changed.notify_all();
+        })?;
+        Ok(Self { shared, thread: Some(thread) })
+    }
+    /// The measurements of `generation` (`manifest`: its verified manifest)
+    /// that exist after at most `wait`: the artifacts its pass finished so
+    /// far (a cache hit counts once the measuring thread re-checked its
+    /// identity). Starts a pass unless one of this generation is in progress.
+    pub(crate) fn measured(&self, generation: Sha256Digest, manifest: &ReleaseManifest, wait: Duration)
+        -> BTreeMap<String, Sha256Digest> {
+        let deadline = Instant::now() + wait;
+        let Some(mut state) = self.shared.lock() else { return BTreeMap::new() };
+        let wanted = if state.running == Some(generation) && state.pending.is_none() {
+            state.results.pass
+        } else {
+            // Same generation already pending: kept (the digest names the manifest).
+            if state.pending.as_ref().map(|job| job.generation) != Some(generation) {
+                state.pending = Some(MeasureJob { generation, manifest: manifest.clone() });
+                self.shared.changed.notify_all();
+            }
+            state.started + 1
+        };
+        loop {
+            let results = &state.results;
+            if results.pass > wanted || (results.pass == wanted && results.ended) || Instant::now() >= deadline { break; }
+            let Some(next) = self.shared.wait_until(state, deadline) else { return BTreeMap::new() };
+            state = next;
+        }
+        let results = &state.results;
+        if results.pass >= wanted && results.generation == Some(generation) { results.measured.clone() } else { BTreeMap::new() }
+    }
+}
+impl Drop for Measurer {
+    /// Closes the measurer and waits, bounded, for the thread to return (it
+    /// does at its next check). A thread stuck in a syscall is left behind
+    /// (detached), never waited for without bound.
+    fn drop(&mut self) {
+        let deadline = Instant::now() + READBACK_MEASURE_DEADLINE;
+        let mut stopped = false;
+        if let Some(mut state) = self.shared.lock() {
+            state.closed = true;
+            state.pending = None;
+            self.shared.changed.notify_all();
+            loop {
+                if state.stopped { stopped = true; break; }
+                if Instant::now() >= deadline { break; }
+                match self.shared.wait_until(state, deadline) { Some(next) => state = next, None => break }
+            }
+        }
+        match self.thread.take() {
+            Some(thread) if stopped => { let _ = thread.join(); }
+            Some(_) => eprintln!("duduclaw-spawnd: readback measuring thread did not stop; left behind"),
+            None => {}
+        }
+    }
+}
+/// The measuring thread: takes the pending job, runs its pass (publishing
+/// every finished artifact at once), marks it ended; returns once closed.
+fn measuring_loop<O: FileOpener>(shared: &MeasureShared, files: &mut dyn FnMut(Sha256Digest) -> io::Result<O>) {
+    let mut cache = MeasureCache::default();
+    loop {
+        let (job, pass) = {
+            let Some(mut state) = shared.lock() else { return };
+            loop {
+                if state.closed { return; }
+                if let Some(job) = state.pending.take() {
+                    // Taken and begun in one critical section: a Readback
+                    // never finds a due pass neither pending nor running.
+                    state.started += 1;
+                    state.running = Some(job.generation);
+                    state.results = PassResults { pass: state.started, generation: Some(job.generation), ..PassResults::default() };
+                    break (job, state.started);
+                }
+                match shared.changed.wait(state) { Ok(next) => state = next, Err(_) => return }
+            }
+        };
+        let generation = job.generation;
+        // Superseded by a job of another generation, or closed (poisoned: cancelled too).
+        let mut cancelled = || shared.lock().map_or(true, |state| state.closed
+            || state.pending.as_ref().is_some_and(|next| next.generation != generation));
+        let mut report = |id: &str, digest: Sha256Digest| {
+            if let Some(mut state) = shared.lock() {
+                if state.results.pass == pass { state.results.measured.insert(id.to_owned(), digest); }
+            }
+        };
+        // The budget is decided before the generation directory is opened.
+        if !over_budget(&mut cache, generation, &job.manifest) {
+            if let Ok(mut opener) = files(generation) {
+                measure_pass(&mut opener, &mut cache, generation, &job.manifest, &mut cancelled, &mut report);
+            }
+        }
+        let Some(mut state) = shared.lock() else { return };
+        state.running = None;
+        if state.results.pass == pass { state.results.ended = true; }
+        drop(state);
+        shared.changed.notify_all();
+    }
 }
 
 /// The manifest-bound data-migration executor (G) is not part of this release:
@@ -1705,15 +1903,24 @@ impl Effects for InstalledEffects {
         }
     }
     fn readback(&mut self, generation: Sha256Digest, live: bool) -> io::Result<Vec<ComponentReadback>> {
-        let deadline = Instant::now() + READBACK_MEASURE_DEADLINE;
         let directory = self.generation_directory(generation)?.ok_or_else(invalid)?;
         let (_, manifest) = self.manifest(&directory, generation)?;
+        drop(directory);
         // Bounded: a file whose size is not the signed size is not hashed, the
-        // manifest's measured bytes are capped (`MEASURE_BUDGET_BYTES`), the
-        // work stops at the deadline, and a retry reuses what completed.
-        let mut files = InstalledFiles { publish_root: &self.publish_root, generation: &directory };
-        let measured = measure_files(&mut files, &mut self.measurements, generation, &manifest,
-            &mut || Instant::now() >= deadline);
+        // manifest's measured bytes are capped (`MEASURE_BUDGET_BYTES`), and
+        // no file is opened, checked or read on this path: the measuring
+        // thread does all of it, and this request waits for its results with
+        // a hard timeout, so a syscall that never returns there cannot hold
+        // this endpoint (the affected artifacts are just not measured).
+        if self.measurer.is_none() {
+            let (install_root, publish_root) = (self.install_root.clone(), self.publish_root.clone());
+            self.measurer = Some(Measurer::start(move |wanted: Sha256Digest| -> io::Result<InstalledFiles> {
+                let generation = generation_directory_at(&install_root, wanted)?.ok_or_else(invalid)?;
+                Ok(InstalledFiles { publish_root: publish_root.clone(), generation })
+            })?);
+        }
+        let Some(measurer) = &self.measurer else { return Err(invalid()) };
+        let measured = measurer.measured(generation, &manifest, READBACK_MEASURE_DEADLINE);
         // SAFETY: geteuid has no arguments and cannot fail.
         let euid = unsafe { libc::geteuid() };
         Ok(components(&manifest, Observed { own_image: self.own_image, live, euid, measured }))
@@ -1728,14 +1935,15 @@ pub(crate) struct Observed {
     pub own_image: Option<Sha256Digest>,
     pub live: bool,
     pub euid: u32,
-    /// File measurements by artifact id ([`measure_files`]): the SHA-256, by
+    /// File measurements by artifact id ([`Measurer::measured`]): the SHA-256, by
     /// descriptor, of every file the component is executed from
     /// ([`measured_sites`]: the run trampoline, its self-test and the SSH probe
     /// in `/usr/lib/duduclaw`; the parse worker in its runtime tree and its
     /// host copy; importer and migration in `/usr/lib/duduclaw/current`; the
     /// MCP bridge, the egress forwarder and every runtime entry in the
     /// committed generation directory). An artifact any of whose files could
-    /// not be opened, verified or measured before the deadline has no entry.
+    /// not be opened, verified or measured by the end of the Readback's wait
+    /// has no entry.
     pub measured: BTreeMap<String, Sha256Digest>,
 }
 

@@ -1,5 +1,5 @@
 use super::*;
-use std::{io::IoSlice, sync::{atomic::{AtomicBool, AtomicUsize, Ordering}, Arc, Mutex}};
+use std::{io::IoSlice, sync::{atomic::{AtomicBool, AtomicUsize, Ordering}, Arc, Condvar, Mutex}};
 use duduclaw_isolation::{bounded::List, execution::{RunHandle, RunOutcome, RuntimeKind, PtySize},
     ids::{EmployeeId, RequestId, RunId},
     ipc::{CleanupReadback, ControlConnectionId, ErrorCode, IoDelivery, QueueClass, SpawnRequest, MAX_FRAME_BYTES},
@@ -2130,9 +2130,12 @@ fn update_readback_measured_modes_follow_the_publication_rule() {
 /// shared log of files whose hashing began.
 struct FakeFile { bytes: Vec<u8>, identity: FileIdentity, position: usize, key: (Site, String),
     /// `fstat` reports another ctime once reading began (written while hashed).
-    unstable: bool, hashed: Arc<Mutex<Vec<(Site, String)>>> }
+    unstable: bool, hashed: Arc<Mutex<Vec<(Site, String)>>>,
+    /// `fstat` or `read` does not return until the test releases it.
+    stall: Option<(StallAt, Arc<Stall>)> }
 impl MeasuredFile for FakeFile {
     fn identity(&self) -> io::Result<FileIdentity> {
+        if let Some((StallAt::Identity, stall)) = &self.stall { stall.hold(); }
         if self.identity.mode & 0o170_000 != 0o100_000 { return Err(invalid()); }
         let mut identity = self.identity;
         if self.unstable && self.position > 0 { identity.ctime.1 += 1; }
@@ -2140,6 +2143,7 @@ impl MeasuredFile for FakeFile {
     }
     fn read_chunk(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         if self.position == 0 && !self.bytes.is_empty() { self.hashed.lock().unwrap().push(self.key.clone()); }
+        if let Some((StallAt::Read, stall)) = &self.stall { stall.hold(); }
         let remaining = &self.bytes[self.position..];
         let count = remaining.len().min(buffer.len());
         buffer[..count].copy_from_slice(&remaining[..count]);
@@ -2150,16 +2154,100 @@ impl MeasuredFile for FakeFile {
 /// Files by (site, name), each with a distinct inode.
 #[derive(Default)]
 struct FakeFiles { files: BTreeMap<(Site, String), (Vec<u8>, FileIdentity)>, next_inode: u64, opens: usize,
-    unstable: Option<(Site, String)>, hashed: Arc<Mutex<Vec<(Site, String)>>> }
+    unstable: Option<(Site, String)>, hashed: Arc<Mutex<Vec<(Site, String)>>>,
+    /// The one file whose `open` (only through [`SharedFiles`]), `fstat` or `read` stalls.
+    stall: Option<((Site, String), StallAt, Arc<Stall>)> }
 impl FileOpener for FakeFiles {
     type File = FakeFile;
     fn open(&mut self, site: Site, name: &str) -> io::Result<FakeFile> {
         self.opens += 1;
         let key = (site, name.to_owned());
         let (bytes, identity) = self.files.get(&key).cloned().ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+        let stall = self.stall.as_ref().filter(|(stalled, at, _)| *stalled == key && *at != StallAt::Open)
+            .map(|(_, at, stall)| (*at, stall.clone()));
         Ok(FakeFile { bytes, identity, position: 0, unstable: self.unstable.as_ref() == Some(&key), key,
-            hashed: self.hashed.clone() })
+            hashed: self.hashed.clone(), stall })
     }
+}
+/// The syscall a fake file stalls in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StallAt { Open, Identity, Read }
+/// A syscall that does not return (a failing disk) until the test releases it;
+/// released, it never stalls again.
+#[derive(Default)]
+struct Stall { state: Mutex<(bool, bool)>, changed: Condvar }
+impl Stall {
+    /// Entered by the measuring thread: blocks until released.
+    fn hold(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.0 = true;
+        self.changed.notify_all();
+        while !state.1 { state = self.changed.wait(state).unwrap(); }
+    }
+    fn release(&self) {
+        self.state.lock().unwrap().1 = true;
+        self.changed.notify_all();
+    }
+    /// The measuring thread is inside the stalled call (bounded wait).
+    fn wait_entered(&self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut state = self.state.lock().unwrap();
+        while !state.0 {
+            let left = deadline.saturating_duration_since(Instant::now());
+            assert!(!left.is_zero(), "the measuring thread never reached the stalled call");
+            state = self.changed.wait_timeout(state, left).unwrap().0;
+        }
+    }
+}
+/// [`FakeFiles`] shared with the measuring thread (the test keeps changing
+/// them); an `open` stall holds no lock.
+#[derive(Clone)]
+struct SharedFiles(Arc<Mutex<FakeFiles>>);
+impl FileOpener for SharedFiles {
+    type File = FakeFile;
+    fn open(&mut self, site: Site, name: &str) -> io::Result<FakeFile> {
+        let key = (site, name.to_owned());
+        let stall = self.with(|files| files.stall.as_ref()
+            .filter(|(stalled, at, _)| *stalled == key && *at == StallAt::Open).map(|(_, _, stall)| stall.clone()));
+        if let Some(stall) = stall { stall.hold(); }
+        self.with(|files| files.open(site, name))
+    }
+}
+impl SharedFiles {
+    fn exact(manifest: &ReleaseManifest) -> Self { Self(Arc::new(Mutex::new(FakeFiles::exact(manifest)))) }
+    fn with<T>(&self, change: impl FnOnce(&mut FakeFiles) -> T) -> T { change(&mut self.0.lock().unwrap()) }
+    /// `target` at `site` stalls in `at` from its next open on.
+    fn stall(&self, site: Site, target: &InstallTarget, at: StallAt) -> Arc<Stall> {
+        let stall = Arc::new(Stall::default());
+        self.with(|files| files.stall = Some(((site, artifact_name(target).unwrap()), at, stall.clone())));
+        stall
+    }
+    fn opens(&self) -> usize { self.with(|files| files.opens) }
+    /// Hashing passes begun, over every file.
+    fn hashed(&self) -> usize { self.with(|files| files.hashed.lock().unwrap().len()) }
+    fn hash_count(&self, site: Site, target: &InstallTarget) -> usize { self.with(|files| files.hash_count(site, target)) }
+}
+/// A measuring thread over `files`.
+fn measurer(files: &SharedFiles) -> Measurer {
+    let files = files.clone();
+    Measurer::start(move |_: Sha256Digest| -> io::Result<SharedFiles> { Ok(files.clone()) }).unwrap()
+}
+/// [`measurer`], whose thread also holds the returned probe until it returns.
+fn counted_measurer(files: &SharedFiles) -> (Measurer, Arc<()>) {
+    let held = Arc::new(());
+    let (probe, files) = (held.clone(), files.clone());
+    let measuring = Measurer::start(move |_: Sha256Digest| -> io::Result<SharedFiles> {
+        let _alive = &probe;
+        Ok(files.clone())
+    }).unwrap();
+    (measuring, held)
+}
+/// One Readback's measurements through `measurer`, and that it answered in time.
+fn read_back(measurer: &Measurer, generation: Sha256Digest, manifest: &ReleaseManifest) -> BTreeMap<String, Sha256Digest> {
+    let started = Instant::now();
+    let measured = measurer.measured(generation, manifest, READBACK_MEASURE_DEADLINE);
+    assert!(started.elapsed() < READBACK_MEASURE_DEADLINE + Duration::from_secs(1), "{:?}", started.elapsed());
+    measured
 }
 impl FakeFiles {
     /// Every site of every measured artifact holds exactly its signed bytes.
@@ -2320,13 +2408,13 @@ fn update_readback_deadline_is_well_below_the_client_timeout() {
 }
 
 #[test]
-fn update_readback_deadline_leaves_later_artifacts_unmeasured_and_the_retry_resumes_from_the_cache() {
+fn update_readback_cancelled_pass_leaves_later_artifacts_unmeasured_and_the_next_pass_resumes_from_the_cache() {
     let manifest = measured_manifest();
     let measured_artifacts = file_measured(&manifest);
     let sites: usize = measured_artifacts.iter().map(|a| measured_sites(&a.install_target).len()).sum();
     let mut files = FakeFiles::exact(&manifest);
     let mut cache = MeasureCache::default();
-    // The deadline passes once the third file's hashing began (inside its loop).
+    // The pass is cancelled once the third file's hashing began (inside its loop).
     let hashed = files.hashed.clone();
     let first = measure_files(&mut files, &mut cache, digest(9), &manifest, &mut || hashed.lock().unwrap().len() >= 3);
     let done: Vec<String> = measured_artifacts.iter().take(2).map(|a| a.id.clone()).collect();
@@ -2336,7 +2424,7 @@ fn update_readback_deadline_leaves_later_artifacts_unmeasured_and_the_retry_resu
     for (index, artifact) in measured_artifacts.iter().enumerate() {
         assert_eq!(report_of(&reports, &artifact.install_target).ready, index < 2, "{:?}", artifact.install_target);
     }
-    // The retry completes everything; the two finished files are not hashed again.
+    // The next pass completes everything; the two finished files are not hashed again.
     let second = measure(&mut files, &mut cache, digest(9), &manifest);
     assert_eq!(second.len(), measured_artifacts.len());
     assert!(components(&manifest, root_observation(second)).iter()
@@ -2344,13 +2432,13 @@ fn update_readback_deadline_leaves_later_artifacts_unmeasured_and_the_retry_resu
     assert_eq!(cache.len(), sites);
     for (index, artifact) in measured_artifacts.iter().enumerate() {
         for site in measured_sites(&artifact.install_target) {
-            // The interrupted third file is hashed again from the start.
+            // The cancelled third file is hashed again from the start.
             assert_eq!(files.hash_count(*site, &artifact.install_target), if index == 2 { 2 } else { 1 },
                 "{:?}", artifact.install_target);
         }
     }
-    // A third Readback hashes nothing (every identity unchanged), and an
-    // already expired deadline measures nothing at all.
+    // A third pass hashes nothing (every identity unchanged), and an
+    // already cancelled pass measures nothing at all.
     let before = files.hashed.lock().unwrap().len();
     assert_eq!(measure(&mut files, &mut cache, digest(9), &manifest).len(), measured_artifacts.len());
     assert_eq!(files.hashed.lock().unwrap().len(), before);
@@ -2409,6 +2497,12 @@ fn update_readback_over_budget_manifest_measures_nothing() {
         assert!(report_of(&reports, &InstallTarget::Spawnd).ready);
         // Refused again on the retry (logged only the first time).
         assert!(measure(&mut files, &mut cache, digest(9), &large).is_empty());
+        // The same through the measuring thread: decided before anything is opened.
+        let shared = SharedFiles::exact(&large);
+        let measuring = measurer(&shared);
+        assert!(read_back(&measuring, digest(9), &large).is_empty(), "{size}");
+        assert!(read_back(&measuring, digest(9), &large).is_empty(), "{size}");
+        assert_eq!(shared.opens(), 0, "{size}");
     }
 }
 
@@ -2429,6 +2523,148 @@ fn update_readback_generation_change_drops_the_cache() {
     assert_eq!((cache.len(), files.hash_count(here, &trampoline)), (sites, 2));
     measure(&mut files, &mut cache, digest(1), &manifest);
     assert_eq!(files.hash_count(here, &trampoline), 3);
+}
+
+// ---------------------------------------------------------------- the measuring thread
+
+#[test]
+fn update_readback_answers_within_the_deadline_while_a_read_never_returns() {
+    let manifest = measured_manifest();
+    let artifacts = file_measured(&manifest);
+    let first = artifacts[0].install_target.clone();
+    let files = SharedFiles::exact(&manifest);
+    let stall = files.stall(measured_sites(&first)[0], &first, StallAt::Read);
+    let measuring = measurer(&files);
+    // The first file's read does not return: answered in time, that artifact
+    // and every later one not measured (not ready).
+    let measured = read_back(&measuring, digest(9), &manifest);
+    stall.wait_entered();
+    assert!(measured.is_empty(), "{measured:?}");
+    let reports = components(&manifest, root_observation(measured));
+    for artifact in &artifacts {
+        assert!(!report_of(&reports, &artifact.install_target).ready, "{:?}", artifact.install_target);
+    }
+    // A second Readback during the stall answers in time too and starts no
+    // second pass: nothing more is opened or hashed.
+    assert_eq!((files.opens(), files.hashed()), (1, 1));
+    assert!(read_back(&measuring, digest(9), &manifest).is_empty());
+    assert_eq!((files.opens(), files.hashed()), (1, 1));
+    // Released: the pass continues where it stood (the stalled file is not
+    // restarted) and a later Readback has everything.
+    stall.release();
+    let measured = read_back(&measuring, digest(9), &manifest);
+    assert_eq!(measured.len(), artifacts.len());
+    assert!(components(&manifest, root_observation(measured)).iter()
+        .filter(|r| r.target != InstallTarget::Spawnd).all(|r| r.ready));
+    for artifact in &artifacts {
+        for site in measured_sites(&artifact.install_target) {
+            assert_eq!(files.hash_count(*site, &artifact.install_target), 1, "{:?}", artifact.install_target);
+        }
+    }
+    // Every later Readback re-checks the identities and hashes nothing.
+    let hashed = files.hashed();
+    assert_eq!(read_back(&measuring, digest(9), &manifest).len(), artifacts.len());
+    assert_eq!(files.hashed(), hashed);
+}
+
+#[test]
+fn update_readback_of_another_generation_supersedes_the_pass_in_progress() {
+    let manifest = measured_manifest();
+    let artifacts = file_measured(&manifest);
+    assert!(artifacts.iter().take(2).all(|a| measured_sites(&a.install_target).len() == 1));
+    // The third artifact's (first) read stalls.
+    let third = artifacts[2].install_target.clone();
+    let files = SharedFiles::exact(&manifest);
+    let stall = files.stall(measured_sites(&third)[0], &third, StallAt::Read);
+    let measuring = measurer(&files);
+    let mut done: Vec<String> = artifacts.iter().take(2).map(|a| a.id.clone()).collect();
+    done.sort();
+    assert_eq!(read_back(&measuring, digest(1), &manifest).into_keys().collect::<Vec<_>>(), done);
+    stall.wait_entered();
+    // Another generation while generation 1's pass is stuck: answered in time
+    // with nothing (generation 1's results are never its answer), nothing opened.
+    let opens = files.opens();
+    assert!(read_back(&measuring, digest(2), &manifest).is_empty());
+    assert_eq!(files.opens(), opens);
+    // Released: the superseded pass stops at its next check (the third file
+    // abandoned, the later ones never opened for generation 1), the cache is
+    // dropped and generation 2 is measured afresh.
+    stall.release();
+    let measured = read_back(&measuring, digest(2), &manifest);
+    assert_eq!(measured.len(), artifacts.len());
+    for (index, artifact) in artifacts.iter().enumerate() {
+        for (position, site) in measured_sites(&artifact.install_target).iter().enumerate() {
+            let expected = if index < 2 || (index == 2 && position == 0) { 2 } else { 1 };
+            assert_eq!(files.hash_count(*site, &artifact.install_target), expected, "{:?}", artifact.install_target);
+        }
+    }
+    // And back to generation 1: its cache went with the change, hashed again.
+    let earliest = &artifacts[0].install_target;
+    assert_eq!(read_back(&measuring, digest(1), &manifest).len(), artifacts.len());
+    assert_eq!(files.hash_count(measured_sites(earliest)[0], earliest), 3);
+}
+
+#[test]
+fn update_readback_cache_hits_are_rechecked_on_the_measuring_thread() {
+    let manifest = measured_manifest();
+    let artifacts = file_measured(&manifest);
+    let sites: usize = artifacts.iter().map(|a| measured_sites(&a.install_target).len()).sum();
+    let bridge = InstallTarget::McpBridge;
+    let first = artifacts[0].install_target.clone();
+    for at in [StallAt::Open, StallAt::Identity] {
+        let files = SharedFiles::exact(&manifest);
+        let measuring = measurer(&files);
+        let signed = read_back(&measuring, digest(9), &manifest);
+        assert_eq!(signed.len(), artifacts.len());
+        // A changed identity is seen by the next pass: same bytes, hashed again; nothing else is.
+        files.with(|files| files.touch(Site::Generation, &bridge));
+        assert_eq!(read_back(&measuring, digest(9), &manifest), signed);
+        assert_eq!(files.hash_count(Site::Generation, &bridge), 2);
+        assert_eq!(files.hash_count(Site::Generation, &InstallTarget::EgressForwarder), 1);
+        // The re-check (open, fstat) of a cached file stalls: its cached
+        // digest is not answered, and the Readback still answers in time.
+        let stall = files.stall(measured_sites(&first)[0], &first, at);
+        let measured = read_back(&measuring, digest(9), &manifest);
+        stall.wait_entered();
+        assert!(measured.is_empty(), "{at:?}: {measured:?}");
+        stall.release();
+        assert_eq!(read_back(&measuring, digest(9), &manifest), signed, "{at:?}");
+        assert_eq!(files.hashed(), sites + 1, "{at:?}");
+    }
+}
+
+#[test]
+fn update_readback_measuring_thread_stops_when_the_state_is_dropped() {
+    let manifest = measured_manifest();
+    let first = file_measured(&manifest)[0].install_target.clone();
+    // Never used, and after a completed pass: stopped, everything it held
+    // released, when the drop returns.
+    for used in [false, true] {
+        let files = SharedFiles::exact(&manifest);
+        let (measuring, held) = counted_measurer(&files);
+        if used { assert_eq!(read_back(&measuring, digest(9), &manifest).len(), file_measured(&manifest).len()); }
+        assert_eq!(Arc::strong_count(&held), 2);
+        drop(measuring);
+        assert_eq!(Arc::strong_count(&held), 1, "used {used}");
+    }
+    // Stuck in a read: the drop does not wait for it without bound; once the
+    // test releases the read the thread stops by itself, opening nothing more.
+    let files = SharedFiles::exact(&manifest);
+    let stall = files.stall(measured_sites(&first)[0], &first, StallAt::Read);
+    let (measuring, held) = counted_measurer(&files);
+    assert!(read_back(&measuring, digest(9), &manifest).is_empty());
+    stall.wait_entered();
+    let started = Instant::now();
+    drop(measuring);
+    assert!(started.elapsed() < READBACK_MEASURE_DEADLINE + Duration::from_secs(1));
+    assert_eq!(Arc::strong_count(&held), 2);
+    stall.release();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Arc::strong_count(&held) > 1 {
+        assert!(Instant::now() < deadline, "the released measuring thread did not stop");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(files.opens(), 1);
 }
 
 #[test]
