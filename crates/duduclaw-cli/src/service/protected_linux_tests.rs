@@ -31,6 +31,22 @@ fn service_protected_unit_has_fixed_root_launcher_and_hardening() {
     assert!(LAUNCHER_TEXT.starts_with("#!/bin/sh\n"));
 }
 
+#[test]
+fn service_protected_launcher_key_matches_intake_contract() {
+    use duduclaw_core::root_key::{KEY_BYTES, KEY_MODE};
+    assert!(LAUNCHER_TEXT.contains("chmod 0400"));
+    assert!(LAUNCHER_TEXT.contains("0:0:400:1"));
+    assert!(LAUNCHER_TEXT.contains(&format!("chmod {KEY_MODE:04o} ")));
+    assert!(LAUNCHER_TEXT.contains(&format!("= 0:0:{KEY_MODE:o}:1 ]")));
+    let generation = LAUNCHER_TEXT.lines().find(|line| line.trim_start().starts_with("dd ")).unwrap();
+    let argument = |name: &str| generation.split_whitespace().find_map(|field| field.strip_prefix(name))
+        .unwrap().parse::<u64>().unwrap();
+    assert_eq!(argument("bs=") * argument("count="), KEY_BYTES);
+    for file in ["$temp", "$KEY"] {
+        assert!(LAUNCHER_TEXT.contains(&format!("stat -c %s \"{file}\")\" = {KEY_BYTES} ]")));
+    }
+}
+
 /// Layout entries a v1.80-style single-binary install also creates or uses:
 /// `/etc/duduclaw` holds the protected-mode marker (`write_mode_marker`), and
 /// the single-binary gateway unit runs in `duduclaw-tcb.slice` (child of

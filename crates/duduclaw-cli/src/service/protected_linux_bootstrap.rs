@@ -3241,13 +3241,13 @@ pub(super) fn runtime_directory_proven(identity: &ledger::Identity, facts: &Comp
     socket_listens && component_shape(identity, facts, libc::S_IFDIR, false) && created_by_this_install(identity, facts)
 }
 
-/// Review round 4 item 2 (pure): the root key — a root-owned 0600 regular
-/// file with exactly one link and a recorded size and digest (so rollback's
+/// Review round 4 item 2 (pure): the root key — a root-owned 0400 regular
+/// file with exactly 32 bytes, one link and a recorded digest (so rollback's
 /// identity match is exact), created no earlier than the gateway start this
 /// install performed, while PID 1 loads this install's gateway unit (`gateway_ours`).
 pub(super) fn root_key_proven(identity: &ledger::Identity, facts: &ComponentFacts, gateway_ours: bool) -> bool {
-    gateway_ours && component_shape(identity, facts, libc::S_IFREG, true) && identity.mode & 0o7777 == 0o600
-        && identity.size.is_some() && identity.sha256.is_some()
+    gateway_ours && component_shape(identity, facts, libc::S_IFREG, true) && identity.mode & 0o7777 == duduclaw_core::root_key::KEY_MODE
+        && identity.size == Some(duduclaw_core::root_key::KEY_BYTES) && identity.sha256.is_some()
         && facts.creation.is_some_and(|creation| creation.nlink == 1) && created_by_this_install(identity, facts)
 }
 
@@ -3469,13 +3469,19 @@ fn await_updater(unit: &str, generation: Sha256Digest, bound: Duration) -> Resul
 /// root key at its first start, so the key's durable intent and window come
 /// right before this start and its confirmation right after it, exactly as
 /// S8 did before. Never enabled here (S8 enables it).
+///
+/// The keep list is captured exactly once per install, from the directory
+/// as it is before this install's gateway ever started: a resumed step (the
+/// gateway may have run and written its own data meanwhile) finds it in the
+/// durable ledger and never lists the directory again (`Recorder::contents`).
 fn first_gateway_start(context: &mut Context, bound: Duration) -> Result<()> {
-    let gateway = passwd_entry("duduclaw")?.ok_or_else(|| refused("無法查詢服務帳號。"))?;
-    let (data, _) = open_gateway_data(Some((gateway.uid, gateway.gid)))?;
-    let keep = directory_names(&data, 64)?.into_iter()
-        .map(|name| name.into_string().map_err(|_| refused("Gateway 資料目錄含有無法辨識的名稱。")))
-        .collect::<Result<Vec<_>>>()?;
-    context.recorder.contents(ledger::GATEWAY_DATA_PATH, keep)?;
+    context.recorder.contents(ledger::GATEWAY_DATA_PATH, || {
+        let gateway = passwd_entry("duduclaw")?.ok_or_else(|| refused("無法查詢服務帳號。"))?;
+        let (data, _) = open_gateway_data(Some((gateway.uid, gateway.gid)))?;
+        directory_names(&data, 64)?.into_iter()
+            .map(|name| name.into_string().map_err(|_| refused("Gateway 資料目錄含有無法辨識的名稱。")))
+            .collect::<Result<Vec<_>>>()
+    })?;
     // Review round 6 item 1: a root key the launcher created in an interrupted
     // run before it was confirmed is confirmed now (or the step refuses).
     resume_component(&mut context.recorder, duduclaw_core::root_key::KEY_PATH, context.generation)?;
@@ -3486,7 +3492,7 @@ fn first_gateway_start(context: &mut Context, bound: Duration) -> Result<()> {
     if !output.status.success() { return Err(refused(format!("無法啟動 {UNIT}。"))); }
     let started = wait_for(bound, || readiness::unit_loaded_active(UNIT).is_ok());
     // Review R3 item 4: the gateway's launcher created it, not this
-    // installer: recorded only as a root-owned 0600 single-link regular
+    // installer: recorded only as a root-owned 0400 single-link regular
     // file on the protected root's mount, absent at the durable intent
     // made before this start (review round 5 item 5), while PID 1 loads
     // this install's ledgered, unmodified gateway
@@ -4906,6 +4912,12 @@ gshadow:        files\nhosts:          files mdns4_minimal [NOTFOUND=return] dns
         assert!(!files.contains("\"enable\"") && !files.contains("\"start\""));
         let first = body("fn first_gateway_start(");
         assert!(first.contains("&[\"start\", UNIT]") && !first.contains("\"enable\""));
+        // R7d: the gateway data is listed only inside the once-per-install snapshot
+        // (`Recorder::contents` never calls it again once recorded).
+        let snapshot = first.find("context.recorder.contents(ledger::GATEWAY_DATA_PATH, || {").unwrap();
+        assert!(first.find("directory_names(").is_some_and(|listing| listing > snapshot));
+        assert!(first.find("open_gateway_data(").is_some_and(|open| open > snapshot));
+        assert_eq!(first.matches("directory_names(").count(), 1);
         let s8 = body("fn start_gateway(");
         assert!(s8.contains("&[\"enable\", UNIT]"));
         assert!(!s8.contains("\"start\"") && !s8.contains("update_text_if_different") && !s8.contains("intend("));
@@ -5191,8 +5203,8 @@ gshadow:        files\nhosts:          files mdns4_minimal [NOTFOUND=return] dns
         let boot = "0123abcd-0000-4000-8000-00000000beef".to_owned();
         let directory = |mode: u32| ledger::Identity { device: 1, inode: 2, mount_id: 3, mode: libc::S_IFDIR | mode, uid: 0, gid: 0,
             size: None, sha256: None, boot_id: boot.clone() };
-        let key = ledger::Identity { device: 1, inode: 4, mount_id: 3, mode: libc::S_IFREG | 0o600, uid: 0, gid: 0,
-            size: Some(32), sha256: Some("ab".repeat(32)), boot_id: boot.clone() };
+        let key = ledger::Identity { device: 1, inode: 4, mount_id: 3, mode: libc::S_IFREG | duduclaw_core::root_key::KEY_MODE, uid: 0, gid: 0,
+            size: Some(duduclaw_core::root_key::KEY_BYTES), sha256: Some("ab".repeat(32)), boot_id: boot.clone() };
         let (state, runtime) = (directory(0o700), directory(0o755));
         // Absent at intent, born inside the window: proven.
         assert!(state_root_proven(&state, &facts(&state, Some((2_000, 1)), 2), true));
@@ -5238,9 +5250,12 @@ gshadow:        files\nhosts:          files mdns4_minimal [NOTFOUND=return] dns
         assert!(!state_root_proven(&state, &facts(&state, Some((2_001, 0)), 2), false));
         assert!(!runtime_directory_proven(&runtime, &facts(&runtime, Some((2_001, 0)), 2), false));
         assert!(!root_key_proven(&key, &facts(&key, Some((2_001, 0)), 1), false));
-        // The root key: exactly 0600, one link, root-owned, with size and digest.
-        for bad in [ledger::Identity { mode: libc::S_IFREG | 0o640, ..key.clone() }, ledger::Identity { uid: 1, ..key.clone() },
-            ledger::Identity { sha256: None, ..key.clone() }, ledger::Identity { mode: libc::S_IFDIR | 0o600, ..key.clone() }] {
+        // The root key: exactly 0400 and 32 bytes, one link, root-owned, with a digest.
+        for bad in [ledger::Identity { mode: libc::S_IFREG | 0o640, ..key.clone() },
+            ledger::Identity { mode: libc::S_IFREG | 0o600, ..key.clone() },
+            ledger::Identity { size: Some(31), ..key.clone() }, ledger::Identity { size: Some(33), ..key.clone() },
+            ledger::Identity { size: None, ..key.clone() }, ledger::Identity { uid: 1, ..key.clone() },
+            ledger::Identity { sha256: None, ..key.clone() }, ledger::Identity { mode: libc::S_IFDIR | duduclaw_core::root_key::KEY_MODE, ..key.clone() }] {
             assert!(!root_key_proven(&bad, &facts(&bad, Some((2_001, 0)), 1), true), "{bad:?}");
         }
         assert!(!root_key_proven(&key, &facts(&key, Some((2_001, 0)), 2), true), "a second link");
