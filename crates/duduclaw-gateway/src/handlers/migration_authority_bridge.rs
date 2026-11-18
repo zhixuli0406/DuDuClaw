@@ -44,17 +44,17 @@ pub(crate) static SHUTDOWN_GATE: ShutdownGate = ShutdownGate::new();
 /// (c) if the process exits while an effect is in flight, its committed
 ///     intent stays in the journal and the next apply / retry / reject
 ///     repeats the same effect idempotently with the same binding.
+/// poisoned ⇒ closed.
 pub(crate) struct ShutdownGate { state: Mutex<GateState>, idle: Condvar }
 struct GateState { closed: bool, running: usize }
 impl ShutdownGate {
     pub(crate) const fn new() -> Self {
         Self { state: Mutex::new(GateState { closed: false, running: 0 }), idle: Condvar::new() }
     }
-    /// A panic elsewhere never disables the gate: the state is two plain
-    /// fields, consistent after any unwinding.
+    /// Recover only for observation, closing and permit cleanup, never admission.
     fn lock(&self) -> MutexGuard<'_, GateState> { self.state.lock().unwrap_or_else(PoisonError::into_inner) }
     /// Closes the gate (idempotent). Once this returns no `enter` succeeds.
-    pub(crate) fn close(&self) { self.lock().closed = true; }
+    pub(crate) fn close(&self) { self.lock().closed = true; self.idle.notify_all(); }
     /// Effects registered and not finished yet.
     pub(crate) fn running(&self) -> usize { self.lock().running }
     /// Blocks until no effect is registered (`true`) or `deadline` passes
@@ -72,16 +72,19 @@ impl ShutdownGate {
 impl EffectGate for ShutdownGate {
     fn enter(&self) -> Option<EffectPermit<'_>> {
         {
-            let mut state = self.lock();
+            let mut state = self.state.lock().ok()?;
             if state.closed { return None; }
             state.running += 1;
         }
         Some(EffectPermit::new(move || {
-            self.lock().running -= 1;
+            {
+                let mut state = self.lock();
+                state.running = state.running.saturating_sub(1);
+            }
             self.idle.notify_all();
         }))
     }
-    fn is_closed(&self) -> bool { self.lock().closed }
+    fn is_closed(&self) -> bool { self.state.lock().map_or(true, |state| state.closed) }
 }
 pub(crate) fn begin_shutdown() { SHUTDOWN_GATE.close(); }
 
@@ -244,6 +247,63 @@ fn bounded_for<F: Future>(handle: &tokio::runtime::Handle, timeout: Duration, fu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn poison_shutdown_gate(gate: &ShutdownGate) {
+        let result = std::panic::catch_unwind(|| {
+            let _guard = gate.state.lock().unwrap();
+            panic!("poison shutdown gate for testing");
+        });
+        assert!(result.is_err());
+        assert!(gate.state.is_poisoned());
+    }
+
+    #[test]
+    fn shutdown_gate_poison_refuses_enter_and_close_is_safe() {
+        let gate = ShutdownGate::new();
+        poison_shutdown_gate(&gate);
+        assert!(!gate.lock().closed, "poison alone leaves the stored flag open");
+        assert!(gate.enter().is_none());
+        assert_eq!(gate.running(), 0, "a poisoned enter registers nothing");
+        assert!(gate.is_closed());
+        assert!(std::panic::catch_unwind(|| gate.close()).is_ok());
+        assert!(gate.lock().closed, "close updates even poisoned state");
+    }
+
+    #[test]
+    fn shutdown_gate_permit_drop_after_poison_is_safe() {
+        let gate = ShutdownGate::new();
+        let permit = gate.enter().expect("open gate");
+        poison_shutdown_gate(&gate);
+        assert!(gate.enter().is_none());
+        assert_eq!(gate.running(), 1, "a poisoned enter leaves running untouched");
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(permit))).is_ok());
+        assert_eq!(gate.running(), 0);
+        assert!(gate.wait_idle(Instant::now() + Duration::from_millis(20)));
+    }
+
+    #[test]
+    fn shutdown_gate_poisoned_permit_drop_saturates_at_zero() {
+        let gate = ShutdownGate::new();
+        let permit = gate.enter().expect("open gate");
+        poison_shutdown_gate(&gate);
+        gate.lock().running = 0;
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(permit))).is_ok());
+        assert_eq!(gate.running(), 0);
+    }
+
+    #[test]
+    fn shutdown_gate_poisoned_wait_idle_respects_deadline() {
+        let gate = ShutdownGate::new();
+        let permit = gate.enter().expect("open gate");
+        poison_shutdown_gate(&gate);
+        let started = Instant::now();
+        assert!(!gate.wait_idle(started + Duration::from_millis(20)));
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(20) && elapsed < Duration::from_secs(2), "{elapsed:?}");
+        drop(permit);
+        assert_eq!(gate.running(), 0);
+    }
+
     #[tokio::test]
     async fn timeout_drops_operation_before_returning_failure() {
         use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
