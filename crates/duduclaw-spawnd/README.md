@@ -383,10 +383,12 @@ files). A lifetime flock protects the B1 journal; H separately locks its images.
 The daemon now calls `Components::installed()`: it attempts the real H adapter at
 fixed root installation paths `/var/lib/duduclaw-spawnd/images` (H images) and
 `/var/lib/duduclaw-spawnd/storage` (B1 journal). There is no environment, config or
-RPC override. The installer must precreate both root:root 0700 directories and
-provide a private image mount tree on H-supported ext4/XFS backing with the
-required capacity reserve. Boot does not create/mount those anchors or provision
-an employee image; it only opens verified existing anchors and their metadata.
+RPC override. The installer creates both root:root 0700 directories on
+H-supported ext4/XFS backing with the required capacity reserve. On every start,
+`duduclaw-spawnd.service` uses `MountFlags=private` to make the tree private in
+spawnd's mount namespace; employee images are mounted only there. The installer
+creates no host mount. Boot opens verified existing anchors and their metadata;
+it does not create those directories or provision an employee image.
 Any failure retains UnavailableStorage. The generic `Components::default()` stays
 refusing for explicit/incomplete compositions. Installation evidence and root
 runtime publication remain missing, so this does not enable TEAM execution.

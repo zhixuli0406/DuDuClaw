@@ -328,6 +328,10 @@ mod tests {
 
     #[test]
     fn service_protected_layout_covers_unit_executables_and_empty_parse_roots() {
+        let spawnd = UNITS.iter().find(|(name, _)| *name == "duduclaw-spawnd.service").unwrap().1;
+        assert_eq!(spawnd, include_str!("../../../../scripts/linux-protected/spawnd/duduclaw-spawnd.service"));
+        assert_eq!(spawnd.lines().filter(|line| *line == "MountFlags=private").count(), 1);
+        assert_eq!(spawnd.lines().filter(|line| line.starts_with("MountFlags=")).count(), 1);
         for (_, text) in UNITS {
             for command in text.lines().filter_map(|line| line.strip_prefix("ExecStart=")) {
                 let binary = command.split_whitespace().next().unwrap();

@@ -10,6 +10,12 @@ The per-employee isolation architecture (planned for a later release) separates 
 
 From v1.83.0, a new protected host is installed only through the independently verified `duduclaw-bootstrap install`. On a host that never had DuDuClaw, `sudo duduclaw service install --protected-linux` prints the steps below and changes nothing. `--migrate-from` is refused for every protected install. A host that already runs the v1.80–v1.82 single-binary protected service (or has its leftover files) is refused by this flow; it needs the upgrade path instead. The isolated install requires the TEAM edition.
 
+Storage prerequisites checked before installation changes the host:
+
+- Install `e2fsprogs`: `/usr/sbin/mkfs.ext4` must resolve to a regular root-managed executable with trusted ancestors.
+- Make the kernel loop module available (`modprobe loop`); `/dev/loop-control` must be character device 10:237.
+- Keep at least max(20 GiB, 10% of total capacity, rounded up) free on the filesystem holding `/var/lib`, in addition to satisfying the existing “2× package size + 1 GiB” space check. Device-mapper backing also needs `dmsetup` (the `dmsetup` / `lvm2` packages).
+
 1. As root, create the download directory: `install -d -m 0700 -o root -g root /root/duduclaw-migrate`.
 2. Save these as files in that directory: `duduclaw-bootstrap`, `duduclaw-isolated-linux-<arch>-<version>.tar` and its `.minisig`, `.authorization.json` and `.authorization.json.signatures.json`, plus your TEAM license `license.json` (owned by root, not writable by group or others).
 3. Compare them with `sha256sum -c` against the values published on the website and in the license console. Both must agree.

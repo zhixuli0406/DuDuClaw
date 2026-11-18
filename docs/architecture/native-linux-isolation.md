@@ -2529,8 +2529,11 @@ formats, canonical bytes and hard limits are unchanged.
 
 ### B1 integration
 
-1. Installation creates an empty root:root 0700 storage directory with root-owned,
-   non-writable ancestors on ext4/XFS. B1 makes the relevant mount tree private.
+1. The installer creates `/var/lib/duduclaw-spawnd/images` and
+   `/var/lib/duduclaw-spawnd/storage` as root:root 0700 directories with root-owned,
+   non-writable ancestors on ext4/XFS. On every start, `duduclaw-spawnd.service`
+   uses `MountFlags=private` to make the tree private in spawnd's mount namespace;
+   employee images are mounted only there. The installer creates no host mount.
 2. `Storage::open(path)` verifies the anchor, takes a lifetime exclusive flock,
    validates bounded metadata and compares the full persisted backing device
    graph. Opening allows maintenance even with low free space/incomplete images.

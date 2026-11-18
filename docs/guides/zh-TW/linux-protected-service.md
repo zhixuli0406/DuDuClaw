@@ -10,6 +10,12 @@
 
 從 v1.83.0 起，全新主機的受保護安裝只能透過已獨立驗證的 `duduclaw-bootstrap install` 進行。在從未安裝過 DuDuClaw 的主機上執行 `sudo duduclaw service install --protected-linux`，只會印出下方步驟，不會變更任何東西。所有受保護安裝都不再接受 `--migrate-from`。已經在執行 v1.80–v1.82 單一執行檔受保護服務（或留有它的檔案）的主機，這個流程會拒絕，要改走升級流程。隔離安裝需要團隊版。
 
+安裝器會在變更主機前檢查以下儲存需求：
+
+- 安裝 `e2fsprogs`；`/usr/sbin/mkfs.ext4` 解析後必須是由 root 管理的一般執行檔，上層目錄也必須可信任。
+- 核心 loop 模組必須可用（`modprobe loop`）；`/dev/loop-control` 必須是字元裝置 10:237。
+- `/var/lib` 所在檔案系統的可用空間至少要有 20 GiB 或總容量的 10%（取較大值，無條件進位），並且通過原有的「安裝包大小兩倍再加 1 GiB」空間檢查。底層含 device-mapper 時，也需要 `dmsetup`（`dmsetup`／`lvm2` 套件）。
+
 1. 以 root 建立下載目錄：`install -d -m 0700 -o root -g root /root/duduclaw-migrate`。
 2. 把以下檔案存成檔案放進該目錄：`duduclaw-bootstrap`、`duduclaw-isolated-linux-<架構>-<版本>.tar` 與它的 `.minisig`、`.authorization.json`、`.authorization.json.signatures.json`，以及團隊版授權檔 `license.json`（root 擁有，群組與其他人不可寫）。
 3. 用 `sha256sum -c` 與官網及授權 console 公布的值比對，兩處必須一致。

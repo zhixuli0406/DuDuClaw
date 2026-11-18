@@ -71,6 +71,8 @@ ReadWritePaths=-/sys/fs/cgroup/duduclaw.slice/duduclaw-employees.slice
 # Narrowing this needs a separate narrow publisher helper (known residual, R6).
 ReadWritePaths=-/usr/lib/duduclaw -/usr/libexec/duduclaw -/opt/duduclaw/bin
 ProtectHome=yes
+# The image anchor must be private; employee images mount only in spawnd's namespace.
+MountFlags=private
 PrivateTmp=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes

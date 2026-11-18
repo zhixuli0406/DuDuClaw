@@ -10,6 +10,12 @@
 
 v1.83.0 以降、新しいホストへの保護インストールは、独立して検証した `duduclaw-bootstrap install` でのみ行います。DuDuClaw を一度も導入していないホストで `sudo duduclaw service install --protected-linux` を実行すると、下記の手順を表示するだけで何も変更しません。`--migrate-from` はすべての保護インストールで拒否されます。v1.80〜v1.82 の単一実行ファイル保護サービスが動作している（またはその残りのファイルがある）ホストは、この手順では拒否されるため、アップグレード手順を使ってください。隔離インストールにはチーム版が必要です。
 
+インストーラーはホストを変更する前に、次のストレージ要件を検査します。
+
+- `e2fsprogs` をインストールします。`/usr/sbin/mkfs.ext4` の解決先は root 管理の通常の実行ファイルで、親ディレクトリも信頼できる必要があります。
+- カーネルの loop モジュールを利用可能にします（`modprobe loop`）。`/dev/loop-control` はキャラクターデバイス 10:237 である必要があります。
+- `/var/lib` のあるファイルシステムには、20 GiB または総容量の 10%（大きい方、端数切り上げ）以上の空き容量が必要です。既存の「パッケージサイズの 2 倍 + 1 GiB」の検査も満たす必要があります。下位に device-mapper がある場合は `dmsetup`（`dmsetup`／`lvm2` パッケージ）も必要です。
+
 1. root でダウンロード用ディレクトリを作成します：`install -d -m 0700 -o root -g root /root/duduclaw-migrate`。
 2. 次のファイルをファイルとしてこのディレクトリに保存します：`duduclaw-bootstrap`、`duduclaw-isolated-linux-<アーキテクチャ>-<バージョン>.tar` とその `.minisig`、`.authorization.json`、`.authorization.json.signatures.json`、およびチーム版ライセンス `license.json`（root 所有で、グループとその他のユーザーが書き込めないもの）。
 3. 公式サイトとライセンスコンソールで公開されている値と `sha256sum -c` で照合します。両方が一致している必要があります。

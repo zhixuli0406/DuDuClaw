@@ -1255,6 +1255,8 @@ fn update_unit_isolation_ready_lives_exactly_as_long_as_spawnd() {
 fn update_unit_spawnd_ready_is_bounded_and_restarts_after_repair() {
     use duduclaw_updated::linux::activation::{RESTART_DEADLINE, SPAWND_START_TIMEOUT_SECS, SPAWND_STOP_TIMEOUT_SECS};
     let lines = directives(SPAWND_UNIT);
+    assert_eq!(lines.iter().filter(|line| **line == "MountFlags=private").count(), 1);
+    assert_eq!(lines.iter().filter(|line| line.starts_with("MountFlags=")).count(), 1);
     let exit = RESTART_AFTER_REPAIR_EXIT.to_string();
     for expected in ["Type=notify".to_owned(), "NotifyAccess=main".to_owned(),
         format!("TimeoutStartSec={SPAWND_START_TIMEOUT_SECS}"), format!("TimeoutStopSec={SPAWND_STOP_TIMEOUT_SECS}"),

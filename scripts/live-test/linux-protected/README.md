@@ -13,6 +13,16 @@ spawnd audit logs; spawnd refuses a missing directory. Audit logs stay outside
 `/var/log` because Ubuntu uses root:syslog 0775 there, which fails the root-managed
 path checks.
 
+Storage prerequisites for the isolated installer: install `e2fsprogs` for the
+root-managed `/usr/sbin/mkfs.ext4`, load the kernel loop module (`modprobe loop`)
+and verify `/dev/loop-control` is character device 10:237. The filesystem holding
+`/var/lib` needs free space of at least max(20 GiB, 10% of total capacity, rounded
+up), as well as passing the existing 2× package size + 1 GiB check. Device-mapper
+backing also needs `dmsetup` (`dmsetup` / `lvm2` packages). The installer creates
+`images` and `storage` below `/var/lib/duduclaw-spawnd` as root:root 0700;
+`duduclaw-spawnd.service` uses `MountFlags=private` on every start. Employee images
+are mounted only inside that namespace; the installer creates no host mount.
+
 ## TEST isolation policy (v1.83 R7d)
 
 Every generation must contain a signed isolation policy (`runtime-isolation-policy-v1`);
@@ -55,13 +65,13 @@ Source of truth for the matrix: `wiki/duduclaw-kb/architecture/native-linux-isol
 
 ### Prerequisites per distro
 
-Common: run as root on the host (not in a container: the installer refuses containers); systemd as PID 1; unified cgroup v2 (`stat -f -c %T /sys/fs/cgroup` = `cgroup2fs`); initial user namespace; `SYS_UID_MAX`/`SYS_GID_MAX` in `/etc/login.defs` may be omitted (stock files on all three distros comment them out); as shadow `useradd -r`/`groupadd -r` do, the installer derives each absent maximum from `UID_MIN`/`GID_MIN` minus one (default minimum 1000, giving 999), while rejecting malformed, duplicate or unsafe values; outbound network is **not** required for the local checks; a candidate `duduclaw` binary verified by you beforehand (the script passes `--i-verified-this-binary` and `--allow-missing-runtime`, so no AI CLI has to be installed); about 2 GB free under `/var` and `/opt`; the scripts need `python3` ≥ 3.10, `setpriv` (util-linux), `getent`/`useradd`/`userdel`/`groupdel` (passwd), `journalctl`, `sha256sum`, GNU `date` and `openssl` (optional: without it the HTTPS canary origin is disabled).
+Common: run as root on the host (not in a container: the installer refuses containers); systemd as PID 1; unified cgroup v2 (`stat -f -c %T /sys/fs/cgroup` = `cgroup2fs`); initial user namespace; `SYS_UID_MAX`/`SYS_GID_MAX` in `/etc/login.defs` may be omitted (stock files on all three distros comment them out); as shadow `useradd -r`/`groupadd -r` do, the installer derives each absent maximum from `UID_MIN`/`GID_MIN` minus one (default minimum 1000, giving 999), while rejecting malformed, duplicate or unsafe values; outbound network is **not** required for the local checks; a candidate `duduclaw` binary verified by you beforehand (the script passes `--i-verified-this-binary` and `--allow-missing-runtime`, so no AI CLI has to be installed); the isolated-storage reserve above plus the package space check under `/var/lib`, `/opt` and `/usr`; the scripts need `python3` ≥ 3.10, `setpriv` (util-linux), `getent`/`useradd`/`userdel`/`groupdel` (passwd), `journalctl`, `sha256sum`, GNU `date` and `openssl` (optional: without it the HTTPS canary origin is disabled).
 
 | Distro | Packages to install first | Notes |
 |---|---|---|
-| Ubuntu 22.04 | `apt-get install -y python3 util-linux passwd openssl coreutils` (python3 = 3.10, the minimum) | Reference host (192.168.0.45). Run all 15 items. |
+| Ubuntu 22.04 | `apt-get install -y python3 util-linux passwd openssl coreutils e2fsprogs` (python3 = 3.10, the minimum) | Reference host (192.168.0.45). Run all 15 items. |
 | Ubuntu 24.04 | same (python3 = 3.12) | † items 2, 4, 6, 10, 12 must pass here too. |
-| Debian 12 | `apt-get install -y python3 util-linux passwd openssl coreutils procps sudo` (python3 = 3.11) | † items 2, 4, 6, 10, 12 must pass here too. Debian minimal images lack `sudo`/`procps`; log in as root instead. |
+| Debian 12 | `apt-get install -y python3 util-linux passwd openssl coreutils e2fsprogs procps sudo` (python3 = 3.11) | † items 2, 4, 6, 10, 12 must pass here too. Debian minimal images lack `sudo`/`procps`; log in as root instead. |
 
 The rest of the v1.81 acceptance (outside this script) is unchanged: `DUDUCLAW_ISO_DISPOSABLE=1 cargo test -p duduclaw-spawnd -- --ignored iso_root_ --test-threads=1` and `... cargo test -p duduclaw-gateway --test iso_personal_chain -- --ignored iso_root_e2e_ --test-threads=1 --nocapture`.
 

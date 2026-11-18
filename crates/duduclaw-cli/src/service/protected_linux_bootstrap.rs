@@ -90,7 +90,7 @@ pub(super) const NIGHTLY_TIMER: &str = "duduclaw-auto-upgrade.timer";
 /// "installed publication consumers"): 0700 directories and the root-only
 /// host publication with no entitlements yet.
 const SPAWND_ROOT: &str = "/var/lib/duduclaw-spawnd";
-const SPAWND_ANCHORS: [&str; 3] = ["etc-state", "projections", "snapshots"];
+const SPAWND_ANCHORS: [&str; 5] = ["etc-state", "projections", "snapshots", "images", "storage"];
 const SPAWND_PUBLICATION: &str = "publication.json";
 /// The signed isolation policy artifact (`duduclaw-spawnd` installed.rs).
 const POLICY_REGISTRY_ID: &str = "isolation-policy-v1";
@@ -1911,13 +1911,43 @@ fn statfs_type(path: &CStr) -> Option<i64> {
 }
 
 #[allow(clippy::unnecessary_cast)]
-fn free_bytes(path: &CStr) -> Option<u64> {
+fn filesystem_bytes(path: &CStr) -> Option<(u64, u64)> {
     let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
     // SAFETY: NUL-terminated path; the buffer is written on success.
     if unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 { return None; }
     // SAFETY: initialized by the successful statvfs.
     let stat = unsafe { stat.assume_init() };
-    (stat.f_bavail as u64).checked_mul(stat.f_frsize as u64)
+    Some(((stat.f_blocks as u64).checked_mul(stat.f_frsize as u64)?,
+        (stat.f_bavail as u64).checked_mul(stat.f_frsize as u64)?))
+}
+
+fn free_bytes(path: &CStr) -> Option<u64> { filesystem_bytes(path).map(|(_, free)| free) }
+
+const MKFS_REQUIRED: &str = "缺少可信任的 /usr/sbin/mkfs.ext4；請安裝 e2fsprogs，並確認檔案及上層目錄由 root 管理。";
+const LOOP_REQUIRED: &str = "核心 loop 模組必須可用：請執行 modprobe loop，確認 /dev/loop-control 是字元裝置 10:237。";
+const RESERVE_REQUIRED: &str = "/var/lib 所在檔案系統的可用空間必須至少保留 20 GiB 或總容量的 10%（取較大值）。";
+const DMSETUP_REQUIRED: &str = "無法讀取 device-mapper 裝置表；請確認已安裝 dmsetup／lvm2 套件，且 dmsetup 可由 root 執行。";
+
+// Pure decisions also cover absent/unreadable host evidence (fail closed).
+fn storage_tools_clear(mkfs_trusted: bool, loop_device: Option<(bool, u64, u64)>) -> std::result::Result<(), &'static str> {
+    if !mkfs_trusted { return Err(MKFS_REQUIRED); }
+    if loop_device != Some((true, 10, 237)) { return Err(LOOP_REQUIRED); }
+    Ok(())
+}
+fn storage_reserve_clear(capacity: Option<(u64, u64)>) -> std::result::Result<(), &'static str> {
+    match capacity {
+        Some((total, free)) if total != 0 && free <= total && free >= duduclaw_isolation::storage_reserve_bytes(total) => Ok(()),
+        _ => Err(RESERVE_REQUIRED),
+    }
+}
+fn storage_tools() -> std::result::Result<(), &'static str> {
+    use std::os::unix::fs::FileTypeExt;
+    let mkfs = Path::new("/usr/sbin/mkfs.ext4");
+    let trusted = fs::canonicalize(mkfs).ok().is_some_and(|path|
+        parents(&path).and_then(|_| trusted(&path, false)).is_ok());
+    let device = fs::symlink_metadata("/dev/loop-control").ok().map(|metadata|
+        (metadata.file_type().is_char_device(), libc::major(metadata.rdev()) as u64, libc::minor(metadata.rdev()) as u64));
+    storage_tools_clear(trusted, device)
 }
 
 fn tool_present(name: &str) -> bool {
@@ -2043,6 +2073,8 @@ fn preflight(upstream: Option<SocketAddr>, hosts: &[IpAddr], stage: &StageReceip
     if !kernel.is_some_and(|version| version >= (5, 15)) { fail("需要 Linux 核心 5.15 以上。"); }
     if statfs_type(c"/sys/fs/cgroup") != Some(0x6367_7270) { fail("需要 cgroup v2（unified）。"); }
     if let Err(message) = storage_clear() { fail(message); }
+    if let Err(message) = storage_tools() { fail(message); }
+    if let Err(message) = storage_reserve_clear(filesystem_bytes(c"/var/lib")) { fail(message); }
     for tool in ["systemctl", "useradd", "usermod", "getent", "id", "loginctl", "python3", "setpriv"] {
         if !tool_present(tool) { fail("缺少必要的系統工具（systemctl、useradd、usermod、getent、id、loginctl、python3、setpriv）。"); break; }
     }
@@ -2256,7 +2288,7 @@ pub(super) fn storage_chain(devices: &mut dyn BlockDevices, root: (u32, u32)) ->
         if devices.is_dir(&format!("{node}/dm")) {
             let uuid = devices.read(&format!("{node}/dm/uuid")).ok_or(undetermined)?;
             if NON_PREALLOCATED_UUID_SUFFIXES.iter().any(|suffix| uuid.trim().ends_with(suffix)) { return Err(STORAGE_THIN); }
-            let table = devices.dm_table(device).ok_or(undetermined)?;
+            let table = devices.dm_table(device).ok_or(DMSETUP_REQUIRED)?;
             dm_targets_clear(&table).map_err(|thin| if thin { STORAGE_THIN } else { undetermined })?;
             if below.is_empty() { return Err(undetermined); }
         } else if devices.exists(&format!("{node}/partition")) {
@@ -2927,7 +2959,7 @@ fn spawnd_anchors(digest: Sha256Digest, admitted: &dyn Fn(&[serde_json::Value]) 
             Err(_) => return Err(refused("隔離執行服務的目錄不符。")),
         }
         let metadata = fs::symlink_metadata(Path::new(SPAWND_ROOT).join(name))?;
-        if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o7777 != 0o700 {
+        if !metadata.is_dir() || metadata.uid() != 0 || metadata.gid() != 0 || metadata.mode() & 0o7777 != 0o700 {
             return Err(refused("隔離執行服務的目錄權限不符。"));
         }
     }
@@ -3592,7 +3624,11 @@ fn platform_published(context: &Context, dns: &Dns) -> Result<()> {
     }
     parse_runtime_tree(false)?;
     let spawnd = Directory::open(Path::new(SPAWND_ROOT)).map_err(|_| mismatch())?;
-    for name in SPAWND_ANCHORS { spawnd.child(name).map_err(|_| mismatch())?; }
+    for name in SPAWND_ANCHORS {
+        spawnd.child(name).map_err(|_| mismatch())?;
+        let metadata = fs::symlink_metadata(Path::new(SPAWND_ROOT).join(name))?;
+        if metadata.mode() & 0o7777 != 0o700 { return Err(mismatch()); }
+    }
     // Review H1 / R8d C: this generation, and no entitlement or only ones
     // spawnd's production check admits (a resumed install after employees exist).
     let admitted = |entitlements: &[serde_json::Value]| entitlements_admitted(context.generation, &context.generation_hex, entitlements);
@@ -3871,6 +3907,37 @@ mod tests {
         assert!(egress_document(&[policy[0], policy[0]], DnsRoute::ResolvedVarlink, &[]).is_err());
         let many: Vec<IpAddr> = (0..=MAX_HOST_PUBLIC_ADDRESSES).map(|index| IpAddr::from([198, 51, 100, index as u8])).collect();
         assert!(egress_document(&policy, DnsRoute::ResolvedVarlink, &many).is_err());
+    }
+
+    #[test]
+    fn preflight_storage_tools_refuse_missing_mkfs_and_invalid_loop_control() {
+        assert_eq!(storage_tools_clear(false, Some((true, 10, 237))), Err(MKFS_REQUIRED));
+        assert!(MKFS_REQUIRED.contains("mkfs.ext4") && MKFS_REQUIRED.contains("e2fsprogs"));
+        for device in [None, Some((false, 10, 237)), Some((true, 7, 237)), Some((true, 10, 236))] {
+            assert_eq!(storage_tools_clear(true, device), Err(LOOP_REQUIRED));
+        }
+        assert!(LOOP_REQUIRED.contains("modprobe loop"));
+        assert_eq!(storage_tools_clear(true, Some((true, 10, 237))), Ok(()));
+    }
+
+    #[test]
+    fn preflight_storage_reserve_accepts_only_at_or_above_shared_boundary() {
+        const G: u64 = 1024 * 1024 * 1024;
+        for (total, reserve) in [(100 * G, 20 * G), (300 * G + 1, 30 * G + 1)] {
+            assert_eq!(storage_reserve_clear(Some((total, reserve - 1))), Err(RESERVE_REQUIRED));
+            assert_eq!(storage_reserve_clear(Some((total, reserve))), Ok(()));
+            assert_eq!(storage_reserve_clear(Some((total, reserve + 1))), Ok(()));
+        }
+        for capacity in [None, Some((0, 0)), Some((10 * G, 10 * G)), Some((100 * G, 101 * G))] {
+            assert_eq!(storage_reserve_clear(capacity), Err(RESERVE_REQUIRED));
+        }
+    }
+
+    #[test]
+    fn spawnd_anchor_list_includes_storage_in_install_order() {
+        assert_eq!(SPAWND_ANCHORS, ["etc-state", "projections", "snapshots", "images", "storage"]);
+        // Both are below the already-ledgered tree; no new host installation fact.
+        assert!(duduclaw_core::isolation_install::FACTS.contains(&SPAWND_ROOT));
     }
 
     #[test]
@@ -5625,7 +5692,7 @@ duduclaw-dl:x:987:\nduduclaw-dns:x:986:\nduduclaw-selftest:x:985:\nsudo:x:27:ali
         dm(&mut sysfs, 7, "LVM-y", "0 2048 mystery 252:1 0\n", ("vda1", (252, 1)));
         assert_eq!(storage_chain(&mut sysfs, (253, 7)), Err(STORAGE_UNDETERMINED));
         sysfs.tables.retain(|(id, _)| *id != (253, 7));
-        assert_eq!(storage_chain(&mut sysfs, (253, 7)), Err(STORAGE_UNDETERMINED));
+        assert_eq!(storage_chain(&mut sysfs, (253, 7)), Err(DMSETUP_REQUIRED));
         let mut wrong = disk_with_partition();
         let partition_dev = format!("{DISK}/vda1/dev");
         wrong.files.retain(|(path, _)| *path != partition_dev);
@@ -5693,6 +5760,11 @@ duduclaw-dl:x:987:\nduduclaw-dns:x:986:\nduduclaw-selftest:x:985:\nsudo:x:27:ali
     fn iso_root_install_fresh_end_to_end() {
         let generation = disposable_generation();
         continue_with(options("install", &generation), false).unwrap();
+        for name in SPAWND_ANCHORS {
+            let metadata = fs::symlink_metadata(Path::new(SPAWND_ROOT).join(name)).unwrap();
+            assert!(metadata.is_dir());
+            assert_eq!((metadata.uid(), metadata.gid(), metadata.mode() & 0o7777), (0, 0, 0o700), "{name}");
+        }
         let journal = journal_now().unwrap();
         assert!(journal.committed && journal.step == Step::Commit);
         assert_eq!(journal.host, host_digest().unwrap());
