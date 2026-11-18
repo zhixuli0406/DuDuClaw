@@ -1985,6 +1985,12 @@ fn observing(manifest: &ReleaseManifest, own_image: Option<Sha256Digest>, live: 
     Observed { own_image, live, euid, measured }
 }
 
+fn different_digest(digest: Sha256Digest) -> Sha256Digest {
+    let mut bytes = digest.0;
+    bytes[0] ^= 1;
+    Sha256Digest(bytes)
+}
+
 #[test]
 fn update_readback_reports_only_spawnd_side_components_and_never_guesses() {
     let manifest = fixed_manifest();
@@ -2019,9 +2025,10 @@ fn update_readback_reports_only_spawnd_side_components_and_never_guesses() {
     assert!(!unread.ready && unread.build_sha256 == Sha256Digest([0; 32]));
     let unprivileged = components(&manifest, observed(Some(digest(42)), true, 1000, Some(trampoline)));
     assert!(!find(&unprivileged, InstallTarget::Spawnd).ready && !find(&unprivileged, InstallTarget::Trampoline).ready);
-    let replaced = find(&components(&manifest, observed(Some(digest(42)), true, 0, Some(digest(9)))), InstallTarget::Trampoline);
+    let wrong_trampoline = different_digest(trampoline);
+    let replaced = find(&components(&manifest, observed(Some(digest(42)), true, 0, Some(wrong_trampoline))), InstallTarget::Trampoline);
     assert!(!replaced.ready);
-    assert_eq!((replaced.build_sha256, replaced.version), (digest(9), ReleaseVersion { major: 0, minor: 0, patch: 0 }));
+    assert_eq!((replaced.build_sha256, replaced.version), (wrong_trampoline, ReleaseVersion { major: 0, minor: 0, patch: 0 }));
     assert!(!find(&components(&manifest, observed(Some(digest(42)), true, 0, None)), InstallTarget::Trampoline).ready);
     // R7a: the self-test binary is read back by the same rule as the trampoline.
     let check = find(&reports, InstallTarget::TrampolineSelftest);
@@ -2030,7 +2037,7 @@ fn update_readback_reports_only_spawnd_side_components_and_never_guesses() {
         (selftest, manifest.version, 0, manifest.protocols.trampoline));
     assert_eq!(check.artifact_id, "duduclaw-run-selftest");
     let with_selftest = |value| observing(&manifest, Some(digest(42)), true, 0, "duduclaw-run-selftest", value);
-    for value in [None, Some(digest(9))] {
+    for value in [None, Some(different_digest(selftest))] {
         let reports = components(&manifest, with_selftest(value));
         assert!(!find(&reports, InstallTarget::TrampolineSelftest).ready);
         assert!(find(&reports, InstallTarget::Trampoline).ready);
@@ -2043,7 +2050,7 @@ fn update_readback_reports_only_spawnd_side_components_and_never_guesses() {
         (probe, manifest.version, 0, manifest.protocols.spawnd));
     assert_eq!(check.artifact_id, "duduclaw-isolation-probe");
     let with_probe = |value| observing(&manifest, Some(digest(42)), true, 0, "duduclaw-isolation-probe", value);
-    for value in [None, Some(digest(9))] {
+    for value in [None, Some(different_digest(probe))] {
         let reports = components(&manifest, with_probe(value));
         assert!(!find(&reports, InstallTarget::IsolationProbe).ready);
         assert!(find(&reports, InstallTarget::TrampolineSelftest).ready);
@@ -2066,9 +2073,10 @@ fn update_readback_file_measurement_is_ready_only_on_the_exact_digest_as_root() 
             (manifest.product, manifest.version, artifact.sha256, 0,
                 duduclaw_updated::activation_contract::protocol(&manifest, &target)), "{target:?}");
         // Different bytes: reported as measured, never with the signed version.
-        let other = find(&components(&manifest, observing(&manifest, Some(digest(42)), true, 0, id, Some(digest(9)))), &target);
+        let wrong_digest = different_digest(artifact.sha256);
+        let other = find(&components(&manifest, observing(&manifest, Some(digest(42)), true, 0, id, Some(wrong_digest))), &target);
         assert!(!other.ready, "{target:?}");
-        assert_eq!((other.build_sha256, other.version), (digest(9), unknown), "{target:?}");
+        assert_eq!((other.build_sha256, other.version), (wrong_digest, unknown), "{target:?}");
         // No measurement (missing, replaced by a link, wrong owner or mode).
         let missing = find(&components(&manifest, observing(&manifest, Some(digest(42)), true, 0, id, None)), &target);
         assert!(!missing.ready, "{target:?}");
