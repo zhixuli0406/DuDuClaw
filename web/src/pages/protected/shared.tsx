@@ -80,8 +80,8 @@ export interface ProtectedPageContext {
   goTo: (tab: ProtectedTab, wizard?: WizardPreset) => void;
 }
 
-export type ProtectedTab = 'employees' | 'connectors' | 'tenant' | 'audit';
-export const PROTECTED_TABS: readonly ProtectedTab[] = ['employees', 'connectors', 'tenant', 'audit'];
+export type ProtectedTab = 'employees' | 'connectors' | 'providers' | 'tenant' | 'audit';
+export const PROTECTED_TABS: readonly ProtectedTab[] = ['employees', 'connectors', 'providers', 'tenant', 'audit'];
 
 export interface WizardPreset {
   employee?: string;

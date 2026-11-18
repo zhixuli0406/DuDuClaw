@@ -6398,6 +6398,35 @@ export interface ProtectedConnectorList extends ProtectedStepUpState {
   routes: ProtectedConnectorRoute[];
   next: string | null;
 }
+/** Model provider documents: status contains only dashboard-recorded metadata. */
+export type ProtectedProviderProtocol = 'chat_completions' | 'responses' | 'anthropic' | 'gemini';
+export interface ProtectedProviderInput {
+  name: string;
+  base_url: string;
+  api_key: string;
+  protocol?: ProtectedProviderProtocol;
+}
+export interface ProtectedProviderEmployee {
+  employee_id: string;
+  label: string;
+  kind: 'personal' | 'shared';
+  provisioned: boolean;
+  providers: { name: string; protocol: ProtectedProviderProtocol; origin: string }[];
+  source?: 'dashboard';
+  updated_unix?: number;
+}
+export interface ProtectedProviderStatus extends ProtectedStepUpState {
+  employees: ProtectedProviderEmployee[];
+  next: string | null;
+  hidden_personal: number;
+  personal_revealed: boolean;
+  visibility: 'dashboard_changes_only';
+}
+export interface ProtectedProviderResult {
+  provisioned: boolean;
+  updated_unix: number;
+  result: 'recorded' | 'not_recorded';
+}
 /** Reference-only details: there is no field for a token, password or URL. */
 export interface ProtectedConnectorDetails {
   employee: string;
@@ -10106,6 +10135,12 @@ export const api = {
       client.call('isolation.employee_purge_requests', { csrf_token: csrf }) as Promise<{ purged: number; index_rows_removed: number }>,
     connectorList: (after?: string) =>
       client.call('isolation.connector_list', after ? { after } : {}) as Promise<ProtectedConnectorList>,
+    providerStatus: (params: { employee_id?: string; after?: string; step_up_csrf?: number[] } = {}) =>
+      client.call('isolation.provider_status', params) as Promise<ProtectedProviderStatus>,
+    providerSet: (employeeId: string, providers: ProtectedProviderInput[], csrf: number[]) =>
+      client.call('isolation.provider_set', { employee_id: employeeId, providers, step_up_csrf: csrf }) as Promise<ProtectedProviderResult>,
+    providerClear: (employeeId: string, csrf: number[]) =>
+      client.call('isolation.provider_clear', { employee_id: employeeId, step_up_csrf: csrf }) as Promise<ProtectedProviderResult>,
     provision: (input: ProtectedConnectorProvisionInput, csrf: number[]) =>
       client.call('isolation.connector_provision', { ...input, csrf_token: csrf }) as Promise<{
         account: string;

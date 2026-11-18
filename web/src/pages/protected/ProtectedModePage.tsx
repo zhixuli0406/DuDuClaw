@@ -10,6 +10,7 @@ import { Empty, Tabs, TabsList, TabsPanel, TabsTab } from '@/components/mds';
 import { StepUpProvider } from './step-up';
 import { EmployeesTab } from './EmployeesTab';
 import { ConnectorsTab } from './ConnectorsTab';
+import { ProvidersTab } from './ProvidersTab';
 import { TenantSourceTab } from './TenantSourceTab';
 import { AuditTab } from './AuditTab';
 import {
@@ -112,6 +113,7 @@ export function ProtectedModePage() {
               <TabsPanel value="connectors" className="pt-4">
                 <ConnectorsTab wizardPreset={wizardPreset} onWizardPresetUsed={clearPreset} />
               </TabsPanel>
+              <TabsPanel value="providers" className="pt-4"><ProvidersTab /></TabsPanel>
               <TabsPanel value="tenant" className="pt-4"><TenantSourceTab /></TabsPanel>
               <TabsPanel value="audit" className="pt-4"><AuditTab /></TabsPanel>
             </Tabs>
