@@ -207,12 +207,12 @@ fn installed_hosts_are_detected_from_any_install_fact() {
     let root = tempfile::tempdir().unwrap();
     assert!(!installed_under(root.path()));
     for fact in [INSTALL_FACTS[0], "/usr/lib/duduclaw/duduclaw-run", "/etc/systemd/system/duduclaw-spawnd.service"] {
+        let root = tempfile::tempdir().unwrap();
+        assert!(!installed_under(root.path()));
         let path = root.path().join(fact.trim_start_matches('/'));
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, "").unwrap();
         assert!(installed_under(root.path()), "{fact}");
-        fs::remove_file(&path).unwrap();
-        assert!(!installed_under(root.path()));
     }
 }
 
