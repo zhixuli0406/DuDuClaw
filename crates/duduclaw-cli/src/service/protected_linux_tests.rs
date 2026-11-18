@@ -284,3 +284,19 @@ fn service_protected_linux_allow_missing_runtime_cli() {
         }
     });
 }
+
+#[test]
+fn service_protected_parse_runtime_verify_does_not_lock_or_reread_state() {
+    let source = include_str!("protected_linux_install.rs");
+    let function = source.split("fn parse_runtime_tree(install: bool)").nth(1).unwrap()
+        .split("\n}\n").next().unwrap();
+    let (before, after) = function.split_once("let _update_lock = if needs_update_lock(install) {").unwrap();
+    let (install, verify) = after.split_once("} else { None };").unwrap();
+    assert!(!before.contains(".lock()"));
+    assert_eq!(install.matches(".lock()").count(), 1);
+    assert!(!verify.contains(".lock()"));
+    assert_eq!(function.matches("json(\"state.json\")").count(), 1);
+    assert!(verify.contains("state.validate()"));
+    assert!(verify.contains("state.pending.is_some() || current != state.effective_digest()"));
+    assert!(verify.contains("if install { \"--install\" } else { \"--verify\" }"));
+}

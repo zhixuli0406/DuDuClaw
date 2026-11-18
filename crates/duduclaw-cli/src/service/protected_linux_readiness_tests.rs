@@ -511,22 +511,22 @@ fn service_protected_readiness_broker_config_uses_the_brokers_validator() {
 
 /// The broker unit is checked against the text generated for the upstream
 /// the broker config records (the shipped text without a config), through
-/// the broker's own reader; only its allow-rule mismatch is printed as detail.
+/// the broker's own reader; its fixed allow-rule mismatch remains a group detail.
 #[test]
 fn service_protected_readiness_broker_unit_expects_the_recorded_upstream() {
     let source = include_str!("protected_linux_readiness.rs");
     let body = |signature: &str| source.split(signature).nth(1).unwrap().split("\n}\n").next().unwrap();
     let units = body("fn platform_units()");
-    assert!(units.contains("let upstream = recorded_broker_upstream()?;"));
-    assert!(units.contains("layout::dns_broker_unit_check(&fs::read(&path)?, upstream)"));
+    assert!(units.contains("let upstream = recorded_broker_upstream()"));
+    assert!(units.contains("layout::dns_broker_unit_check(&fs::read(&path).map_err(|_| failure())?, upstream)"));
     let recorded = body("fn recorded_broker_upstream()");
     assert!(recorded.contains("if absent(BROKER_CONFIG_PATH)? { return Ok(None); }"));
     assert!(recorded.contains("read_root_config(BROKER_CONFIG_PATH)") && recorded.contains("config.validate()"));
     let upstream = Some("192.0.2.53:53".parse().unwrap());
     let mismatch = layout::dns_broker_unit_check(layout::DNS_BROKER_UNIT_TEXT.as_bytes(), upstream).unwrap_err();
-    assert_eq!(broker_unit_detail(&Err(refused(mismatch.clone()))), Some(mismatch));
-    assert_eq!(broker_unit_detail(&Err(refused("隔離服務單元與安裝版本不符。"))), None);
-    assert_eq!(broker_unit_detail(&Ok(())), None);
+    assert_eq!(group_detail(&Err(refused(mismatch.clone()))), Some(mismatch));
+    assert_eq!(group_detail(&Err(refused("隔離服務單元與安裝版本不符。"))), Some("隔離服務單元與安裝版本不符。".to_owned()));
+    assert_eq!(group_detail(&Ok(())), None);
 }
 
 #[test]
@@ -737,4 +737,38 @@ fn iso_root_install_readiness_reports_each_failed_component() {
     assert!(findings.iter().any(|finding| finding.item == Item::Components && finding.code == "component_mismatch"),
         "{findings:?}");
     wait_ready();
+}
+
+#[test]
+fn service_protected_readiness_group_detail_hides_non_refusal_errors() {
+    let error = std::io::Error::other("private OS error and stderr");
+    assert_eq!(group_detail(&Err(error.into())), Some("無法完成這項檢查。".to_owned()));
+    assert_eq!(group_detail(&Err(DuDuClawError::Config("internal error".to_owned()))),
+        Some("無法完成這項檢查。".to_owned()));
+}
+
+#[test]
+fn service_protected_parse_runtime_tree_only_install_needs_update_lock() {
+    assert!(needs_update_lock(true));
+    assert!(!needs_update_lock(false));
+}
+
+#[test]
+fn service_protected_readiness_directory_failures_name_fixed_paths() {
+    for (path, _) in layout::DIRECTORIES {
+        for mode_mismatch in [false, true] {
+            let detail = group_detail(&Err(directory_failure(path, mode_mismatch))).unwrap();
+            assert!(detail.ends_with(path), "{detail}");
+            assert_eq!(detail, if mode_mismatch { format!("隔離服務目錄權限不符：{path}") }
+                else { format!("隔離服務目錄不符或無法讀取：{path}") });
+        }
+    }
+    let source = include_str!("protected_linux_readiness.rs");
+    let directories = source.split("fn directories()").nth(1).unwrap().split("fn accounts()").next().unwrap();
+    for message in ["解析服務目錄含有非預期內容：/usr/lib/duduclaw/parse-root",
+        "解析執行環境驗證未通過：/usr/lib/duduclaw/parse-root-tree"] {
+        assert!(directories.contains(message), "{message}");
+    }
+    assert_eq!(directories.matches("directory_failure(path, false)").count(), 3);
+    assert!(directories.contains("directory_failure(path, true)"));
 }

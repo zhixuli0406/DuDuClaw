@@ -120,7 +120,7 @@ sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux [--version X.Y
 
 安裝器先驗證固定路徑的完整元件，再準備帳號、目錄與 unit。Linux 發行包已加入凍結的更新啟動器；離線工具可將已簽署的資料與元件組成 bootstrap inbox。經獨立驗證的 `duduclaw-updated --bootstrap-stage` 會檢查編譯時固定的根指紋、根金鑰門檻簽章、target 簽章與全部元件雜湊，再發布**尚未啟用的世代**；不選擇 `current`、不建立 trust／state／slots、不驗證舊版過渡雙簽，也不啟動服務。尚無可直接照做的完整新安裝步驟。
 
-可執行 `sudo duduclaw service readiness --protected-linux`（`ops` 為相同入口的別名），唯讀檢查執行檔、系統帳號、目錄權限、unit 內容與 systemd 實際屬性，並分項回報。I1 的綜合就緒介面尚未接上，`MissingComposite` 一律拒絕，不能因此放行員工執行。自訂 DNS drop-in 尚未納入驗證，目前會使 unit 檢查失敗。已由新版管理的安裝再次執行安裝時，只跑唯讀檢查，不改寫世代執行檔或服務單元。
+可執行 `sudo duduclaw service readiness --protected-linux`（`ops` 為相同入口的別名），唯讀檢查執行檔、系統帳號、目錄權限、unit 內容與 systemd 實際屬性，並分項回報。每個未通過的群組都會在下方列出原因。I1 的綜合就緒介面尚未接上，`MissingComposite` 一律拒絕，不能因此放行員工執行。自訂 DNS drop-in 尚未納入驗證，目前會使 unit 檢查失敗。已由新版管理的安裝再次執行安裝時，只跑唯讀檢查，不改寫世代執行檔或服務單元。
 
 ## 從 v1.79.3 遷移
 

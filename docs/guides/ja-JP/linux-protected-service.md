@@ -120,7 +120,7 @@ sshd のあるホストには `/usr/bin/ssh`、`/usr/bin/ssh-keygen`、`/usr/bin
 
 インストーラーは固定パスの完全なコンポーネント群を検証してから、アカウント、ディレクトリ、unit を準備します。Linux 配布物には固定更新ランチャーも含まれ、オフラインツールは署名済み情報とファイルから bootstrap inbox を作成できます。独立に認証された `duduclaw-updated --bootstrap-stage` は、コンパイル時の root 指紋、root 閾値署名、target 署名、全ファイルのハッシュを検証し、**未有効化の世代**を配置します。`current` の選択、trust／state／slots の作成、旧版移行の二重署名検証、サービス有効化は行いません。完全な新規導入の手順はまだ提供していません。
 
-`sudo duduclaw service readiness --protected-linux`（`ops` は同じ入口の別名）は、実行ファイル、システムアカウント、ディレクトリ権限、unit 本文、systemd の実際の属性を読み取り専用で検査し、個別に報告します。I1 の総合検査アダプターは未接続のため、`MissingComposite` が必ず拒否し、社員実行を許可しません。カスタム DNS drop-in は未対応で unit 検査を拒否します。すでに新方式で管理される世代の再インストールは、この読み取り専用検査のみを行い、実行ファイルや unit を書き換えません。
+`sudo duduclaw service readiness --protected-linux`（`ops` は同じ入口の別名）は、実行ファイル、システムアカウント、ディレクトリ権限、unit 本文、systemd の実際の属性を読み取り専用で検査し、個別に報告します。失敗した各グループの下には、その理由も表示されます。I1 の総合検査アダプターは未接続のため、`MissingComposite` が必ず拒否し、社員実行を許可しません。カスタム DNS drop-in は未対応で unit 検査を拒否します。すでに新方式で管理される世代の再インストールは、この読み取り専用検査のみを行い、実行ファイルや unit を書き換えません。
 
 ## v1.79.3 からの移行
 

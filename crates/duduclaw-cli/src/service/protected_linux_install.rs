@@ -285,6 +285,8 @@ const PARSE_RUNTIME_TREE: &str = "/usr/lib/duduclaw/parse-root-tree";
 const PARSE_WORKER: &str = "/usr/libexec/duduclaw/duduclaw-parse-worker";
 const PARSE_RUNTIME_BUILDER: &str = include_str!("../../../duduclaw-parse-worker/scripts/build-runtime-tree.py");
 
+fn needs_update_lock(install: bool) -> bool { install }
+
 // The published worker's own digest cannot establish trust. Read the current
 // generation through F's root-owned state and authenticate its recorded signed
 // manifest before asking the embedded helper to inspect/copy any executable.
@@ -293,9 +295,14 @@ fn parse_runtime_tree(install: bool) -> Result<()> {
     use duduclaw_isolation::update::InstallTarget;
     let state_root = Directory::open(Path::new(duduclaw_updated::linux::STATE_ROOT))
         .map_err(|_| refused("缺少已驗證的隔離安裝狀態，未建立解析執行環境。"))?;
-    let _update_lock = state_root.lock().map_err(|_| refused("隔離更新進行中，稍後再準備解析執行環境。"))?;
-    let state: duduclaw_updated::state::State = state_root.json("state.json").map_err(refused)?;
-    state.validate().map_err(refused)?;
+    let _update_lock = if needs_update_lock(install) {
+        Some(state_root.lock().map_err(|_| refused("隔離更新進行中，稍後再準備解析執行環境。"))?)
+    } else { None };
+    // atomic_json publishes by rename; this single descriptor read is one
+    // committed snapshot. Never re-read state during a lock-free verification.
+    let state: duduclaw_updated::state::State = state_root.json("state.json")
+        .map_err(|_| refused("隔離更新狀態無法完整讀取，未驗證解析執行環境。"))?;
+    state.validate().map_err(|_| refused("隔離更新狀態無效，未驗證解析執行環境。"))?;
     let current = activation::read_current().map_err(refused)?;
     if state.pending.is_some() || current != state.effective_digest() {
         return Err(refused("隔離世代尚未完成更新，未變更解析執行環境。"));
