@@ -1035,8 +1035,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("root.key");
-        fs::write(&path, b"key").unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&path, vec![0u8; duduclaw_core::root_key::KEY_BYTES as usize]).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(duduclaw_core::root_key::KEY_MODE)).unwrap();
         let dir = fs::File::open(directory.path()).unwrap();
         let boot_id = ledger::boot_id().unwrap();
         let key = duduclaw_core::root_key::KEY_PATH;
@@ -1057,7 +1057,8 @@ mod tests {
         assert_eq!(remove_quarantined(&dir, c"root.key", &still, &boot_id, me()).unwrap(), Removal::Kept(key.into()));
         assert!(path.exists());
         // Confirmed (absence restored from the durable intent, the checks hold): removed by the ordinary rule.
-        recorder.resume_component(key, |_, identity, absent| Ok(absent && identity.mode & 0o7777 == 0o600)).unwrap();
+        recorder.resume_component(key, |_, identity, absent| Ok(absent && identity.mode & 0o7777 == duduclaw_core::root_key::KEY_MODE
+            && identity.size == Some(duduclaw_core::root_key::KEY_BYTES))).unwrap();
         let confirmed = recorder.ledger().entry(key).unwrap().clone();
         assert_eq!((confirmed.state, confirmed.identity.is_some()), (State::Created, true));
         assert_eq!(remove_quarantined(&dir, c"root.key", &confirmed, &boot_id, me()).unwrap(), Removal::Removed);

@@ -1349,6 +1349,14 @@ mod tests {
             Ok(resumed_component_proven(path, &foreign, &early_facts(&foreign, absent, nlink), true))
         }).is_err());
         assert_eq!(recorder.ledger().entry(path).unwrap().state, State::Intent);
+        if path == duduclaw_core::root_key::KEY_PATH {
+            for bad in [Identity { mode: libc::S_IFREG | 0o600, ..object.clone() },
+                Identity { size: Some(31), ..object.clone() }, Identity { size: Some(33), ..object.clone() }] {
+                assert!(recorder.resume_component(path, |_, _, absent|
+                    Ok(resumed_component_proven(path, &bad, &early_facts(&bad, absent, nlink), true))).is_err());
+                assert_eq!(recorder.ledger().entry(path).unwrap().state, State::Intent);
+            }
+        }
         // Every producer-specific fact holds: confirmed. The absence is restored
         // from the durable intent; only the time comparison is skipped (the
         // ordinary proof refuses the same facts against the crashed run's window).
@@ -1383,7 +1391,8 @@ mod tests {
 
     #[test]
     fn interrupted_root_key_is_confirmed_on_resume_only_by_the_producer_checks() {
-        let key = Identity { mode: libc::S_IFREG | 0o600, ..identity(Kind::File, 82) };
+        let key = Identity { mode: libc::S_IFREG | duduclaw_core::root_key::KEY_MODE,
+            size: Some(duduclaw_core::root_key::KEY_BYTES), ..identity(Kind::File, 82) };
         component_resumes_only_through_the_producer_checks(duduclaw_core::root_key::KEY_PATH, Kind::File, key, 1);
     }
 
