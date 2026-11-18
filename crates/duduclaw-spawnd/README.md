@@ -1150,6 +1150,109 @@ run, mode and a 60-second consumption deadline; cleanup removes the receipt.
 Fixture publications retain their explicit independent launch contract through
 the default trait methods and are not proof of installed MCP acceptance.
 
+#### MCP acceptance harness (`duduclaw-isolation-policy accept`, R8r-4)
+
+The record is produced by running the runtime, never by asserting it. Today
+the harness covers only `open_ai_compat` (the api worker); other kinds are
+refused.
+
+```sh
+sudo env DUDUCLAW_ISO_DISPOSABLE=1 duduclaw-isolation-policy accept \
+    --source <policy-source.json> --artifacts-dir <dir> --arch <x86_64|aarch64> \
+    --label <runtime label> --trampoline <duduclaw-run> \
+    --evidence-dir <new or empty dir> --out-source <new file>
+```
+
+It runs **only on a disposable Linux host as root**: euid and egid 0,
+`DUDUCLAW_ISO_DISPOSABLE=1`, no isolation installation fact
+(`duduclaw_core::isolation_install::FACTS`, kept equal by a test) and no
+protected-mode marker, `--arch` = the host, `--evidence-dir` absent or empty,
+`--out-source` absent (and not `--source`), the labelled runtime
+`open_ai_compat` with `mcp: true` and no record yet. Every gate is a fixed
+refusal (exit 1) before any side effect.
+
+What it does:
+
+1. Generates the policy exactly as `build` does and takes the record's digests
+   from the artifact files the launch executes: `runtime_digest`/`bridge_digest`
+   (equal to the generated record and the manifest), `projection_digest` from
+   `runtime_projection`, `launch_policy_digest` from the same function
+   `McpAcceptance::validate_launch` compares.
+2. Launches through the production pieces in `Host::start`'s order:
+   `RootPolicy::derive`, `LoopStorage` (provision a temporary image, write a
+   provider document through the R8r-2 path — one provider `acceptance`,
+   `https://acceptance.invalid/v1`, a random key that never leaves the employee
+   home — usage check, attach), a `RevocablePair` for descriptor 3,
+   `BootstrapPlan::from_runtime`, the publication steps
+   (`AcceptancePublication`: every `InstalledPublication` check except requiring
+   an existing record), `bootstrap_mounts::prepare`, `NativeTrampoline::prepare`,
+   `UnitPolicy::new`, a PID 1 transient unit and `bind_unit`/`poll`. The unit is
+   the production one except `ExecStart` (the harness's root-owned copy of
+   `--trampoline`) and no `BindsTo`/`After` on `duduclaw-spawnd.service` (absent
+   on the disposable host). Not executed: the admission core (readiness, SSH
+   evidence, run journal and UID monitor, egress registration), the R7a
+   self-test readiness, the helper table, the work-broker root and the gateway's
+   `McpRunReceipt`. The employee uid is a free number in 70000..=99999 and the
+   supervisor/gateway ids free numbers below 1000; none is written to the host
+   account databases (the run's identity is the trampoline's own `/etc`
+   projection). The run has no network: its own namespace with loopback only;
+   with `network: egress` the forwarder's egress socket ends at the harness,
+   which never reads or forwards it.
+3. Plays the gateway end of descriptor 3 (newline-delimited JSON-RPC through the
+   byte-pump bridge): `initialize` (reply held, see 4), `notifications/initialized`,
+   `tools/list` answered with an empty inventory; everything else refused and
+   counted. Limits: 30 s, 64 frames, 256 KiB.
+4. Observes, without inferring from the transcript, while the `initialize`
+   reply is withheld: the unit's main process (PID 1's `MainPID`, pidfd-pinned)
+   executes the trampoline copy; below it, each process pinned by a pidfd with
+   its parent link re-checked, exactly one process whose `/proc/<pid>/exe`
+   SHA-256 is the runtime digest, with all four uids the temporary uid, in the
+   run cgroup, its descriptor 3 the recorded socket or absent (the socket is
+   identified by the inode and mount id `fd::observe` recorded on the runtime
+   end before the launch); exactly one descendant of it with the bridge digest,
+   same uid and cgroup, holding the same socket; one `initialize`, then
+   `notifications/initialized` after the reply and `tools/list`. Exclusive
+   config: the mounted projection is byte-exact and the only config the worker
+   accepts; decoy configs (`/home/employee/.mcp.json`,
+   `/home/employee/.config/duduclaw/mcp.json`, each naming a marker script in
+   the home and a second bridge) left no marker; exactly one bridge process
+   ever appeared in the cgroup (polled) and exactly one `initialize` arrived. An
+   environment-selected config is impossible (fixed plan environment; the worker
+   clears the bridge's). Any missing fact: no record.
+5. Ends the run (the worker's provider call cannot succeed; otherwise the unit
+   is killed), requires the cgroup empty and the trampoline exited, then tears
+   everything down on every path (also on panic and SIGINT/SIGTERM/SIGHUP/SIGQUIT,
+   which are blocked and polled): unit, slice, cgroup, temporary uid's
+   processes, image (detach, destroy), `/etc` projection, the harness directory
+   `/var/lib/duduclaw-acceptance-<random>`; then verifies each is gone and fails
+   with `accept: tear-down left <kinds> behind` (no record) otherwise.
+6. Writes `--evidence-dir` (root 0700, files 0600): `transcript.jsonl` (one
+   canonical JSON line per frame: `seq`, `direction`, `sha256`, `length`,
+   `payload_base64`; only the MCP conversation crosses this socket, no secret)
+   and `acceptance-manifest.json` (canonical JSON: domain
+   `duduclaw-runtime-mcp-acceptance-evidence-v1`, `format` 1, `arch`, the
+   SHA-256 of the harness, trampoline, runtime, bridge, projection, launch
+   policy and `transcript.jsonl`, the observations, `kernel`, `finished_unix`).
+   The record's `transcript_digest` is the SHA-256 of the manifest, so the
+   signed record binds all of them without a new policy field. The record goes
+   through `McpAcceptance::validate`/`validate_launch` and `check_policy` on a
+   policy generated from the output source before `--out-source` (the input
+   source with that runtime's `mcp_acceptance` filled in; relative syscall-list
+   paths become absolute when it is in another directory) is written.
+
+What the signed record therefore states: the vendor ran this exact runtime,
+bridge, configuration projection and launch policy through the real launcher
+on a disposable host and observed the four facts. It does not prove that a
+model endpoint works. Any change of the runtime binary, version, arguments,
+resource limits, timeouts, network, seccomp list or other native field changes
+the launch-policy (or projection) digest and requires running `accept` again.
+
+`verify --evidence-dir <dir>` additionally requires, for every record, an
+`acceptance-manifest.json` in `<dir>` or a direct subdirectory whose SHA-256 is
+the record's `transcript_digest`, whose digests are the record's and the
+artifacts', and whose `transcript_sha256` is the `transcript.jsonl` beside it.
+`scripts/isolation-test-keys.sh bundle --accept-mcp` runs all of this.
+
 ### Installed publication root acceptance (not a Claude turn test)
 
 The three `installed::root_acceptance::iso_root_e2e_installed_publication_*`
@@ -1297,7 +1400,8 @@ cargo build --locked --release -p duduclaw-spawnd --features policy-tool --bin d
 duduclaw-isolation-policy build  --source <policy-source.json> --artifacts-dir <dir> \
     --arch <x86_64|aarch64> --out <new policy.json> [--manifest <manifest.json>]
 duduclaw-isolation-policy verify --policy <policy.json> --artifacts-dir <dir> \
-    [--manifest <signed manifest.json>] [--arch <x86_64|aarch64>]
+    [--manifest <signed manifest.json>] [--arch <x86_64|aarch64>] [--evidence-dir <dir>]
+sudo env DUDUCLAW_ISO_DISPOSABLE=1 duduclaw-isolation-policy accept ...   # MCP acceptance harness (above)
 ```
 
 `--artifacts-dir` holds the real files under their installed generation names
@@ -1385,7 +1489,8 @@ trampoline (`forwarder_argv0`, forwarder present exactly for egress), the egress
 forwarder; with `mcp_acceptance`, `McpAcceptance::validate_launch` and
 `validate` against the manifest's MCP bridge.
 
-Not covered: producing MCP acceptance, reviewed production syscall lists,
+Not covered: MCP acceptance of other kinds than `open_ai_compat` (`accept`,
+"MCP acceptance harness" above), reviewed production syscall lists,
 vendor (Codex/Grok) runtimes in the TEST path, Script executables (the tool
 emits ELF entries only). The TEST bundle path (`scripts/isolation-test-keys.sh
 bundle`) and its fixtures are described in

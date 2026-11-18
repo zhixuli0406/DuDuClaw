@@ -1,7 +1,8 @@
 //! `duduclaw-isolation-policy` (R7d, feature `policy-tool`): build and verify
 //! the signed isolation policy artifact (`runtime-isolation-policy-v1`) with
-//! spawnd's own readers and publication checks. An offline vendor/test tool;
-//! never a release binary (scripts/package-linux-release.py refuses it).
+//! spawnd's own readers and publication checks; R8r-4 `accept` (the MCP
+//! acceptance harness, root on a disposable host only). An offline vendor/test
+//! tool; never a release binary (scripts/package-linux-release.py refuses it).
 //! Usage: see crates/duduclaw-spawnd/README.md "Isolation policy generator".
 
 #[cfg(target_os = "linux")]

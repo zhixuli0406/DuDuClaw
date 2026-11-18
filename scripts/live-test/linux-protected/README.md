@@ -52,10 +52,38 @@ What it can prove: the generation installs (S5 finds a valid signed policy and w
 `/etc/duduclaw/egress.json` for the `test-egress` profile), spawnd loads the policy and
 publishes it, and readiness (including the DNS probe of `example.com`) can be evaluated.
 What it cannot prove: any employee run. spawnd refuses every MCP run of a runtime without
-MCP acceptance at MCP preparation, so no OpenAI-compatible turn can start; Claude, Codex
+MCP acceptance at MCP preparation, so no OpenAI-compatible turn can start (unless the
+bundle was made with `--accept-mcp`, below); Claude, Codex
 and Grok are not in the TEST policy; the syscall lists say nothing about a production
 seccomp policy. The production policy content is a later, owner-reviewed step
 (`release/isolation/README.md`).
+
+### `--accept-mcp`: MCP acceptance of the api worker (v1.83 R8r-4)
+
+`bundle --accept-mcp` (default off) adds a step between 1 and 2: the snapshot's
+`duduclaw-run` is copied to the policy work directory too, and every
+`open_ai_compat` runtime of the source goes through `duduclaw-isolation-policy
+accept` (`sudo -n env DUDUCLAW_ISO_DISPOSABLE=1 …`, without sudo when already root),
+each producing `<work>/acceptance/<label>/{transcript.jsonl,acceptance-manifest.json}`
+and the next accepted source (chained, one per label). Step 2 then builds from the
+last accepted source, step 4 adds `--evidence-dir <work>/acceptance`, and after
+step 4 the evidence is copied to `<out>/TEST-runtime/acceptance-evidence/<label>/`.
+That copy happens after packaging: the packager reads only the
+`runtime-<registry_id>` files of `TEST-runtime`, and the migration bundle packs only
+the bootstrap inbox, so the evidence is never signed or packaged product content.
+
+Run it **only on a disposable Linux host of the target architecture as a user with
+passwordless sudo (or as root) and WITHOUT any DuDuClaw isolation installation or
+protected-mode marker**; it needs systemd as PID 1, cgroup v2, `/usr/sbin/mkfs.ext4`
+and a `/var/lib` on a block device (the harness creates a temporary loop image, a
+transient unit and slice, and `/var/lib/duduclaw-acceptance-<random>`, removes all of
+them and fails if anything is left). The harness launches the real api worker and
+bridge once with no network (provider `https://acceptance.invalid/v1`); see
+`crates/duduclaw-spawnd/README.md` "MCP acceptance harness" for what is observed and
+what the signed record then states. With the record, spawnd no longer refuses the
+fixture runtime at MCP preparation; the TEST syscall lists still say nothing about a
+production seccomp policy. Any change of the runtime binary, version, arguments,
+resource limits or syscall lists requires running `--accept-mcp` again.
 
 ## Connector acceptance (`connectors-acceptance.sh`)
 

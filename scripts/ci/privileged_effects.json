@@ -6454,6 +6454,19 @@
       "rationale": "Ignored disposable-root installed-account acceptance only: bounded real SSH/su/user-manager/crontab/at attempts with positive controls and cleanup; never linked into production."
     },
     {
+      "symbol": "crates/duduclaw-spawnd/src/installed_policy_tool_accept_tests.rs::iso_root_policy_accept_api_worker_end_to_end",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_status": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "R8r-4 ignored disposable-root test only: runs the operator-built duduclaw-isolation-policy (feature policy-tool, never a release binary) once as `accept` with a cleared environment (the harness needs its own single-threaded process for its private mount namespace), then checks build/verify --evidence-dir in-process; never linked into production."
+    },
+    {
       "symbol": "crates/duduclaw-execution/src/spawnd/transport.rs::tests::live_status_waits_for_existing_transaction_and_reads_its_own_reply",
       "apis": {
         "terminal_spawn": 1

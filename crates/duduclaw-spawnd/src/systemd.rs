@@ -1379,7 +1379,9 @@ pub mod linux {
         }
         /// Cancellation remains available even when no launch receipt was returned.
         pub fn kill_run(&self, run: RunId) -> io::Result<()> { self.kill_name(&run_unit(run)) }
-        #[cfg(test)]
+        /// Root tests; R8r-4: also the MCP acceptance harness's tear-down
+        /// (feature `policy-tool`, never a release build) of its own run unit.
+        #[cfg(any(test, feature = "policy-tool"))]
         pub(crate) fn cleanup_test_run(&self, run: RunId) -> io::Result<()> {
             let name = run_unit(run);
             let manager = self.manager()?;
@@ -1732,6 +1734,42 @@ pub mod linux {
             Ok(())
         }
         pub fn kill(&self, run: &StartedUnit) -> io::Result<()> { self.kill_name(&run.name) }
+        /// R8r-4 MCP acceptance harness only (feature `policy-tool`; the
+        /// feature is never part of a release build). [`Self::start`] with the
+        /// harness's root-owned copy of the trampoline as `ExecStart` and a
+        /// policy WITHOUT `BindsTo`/`After` on `duduclaw-spawnd.service` (the
+        /// disposable host has no spawnd unit; PID 1 would fail the start job
+        /// on the missing dependency). Every other property is the
+        /// production `UnitPolicy`'s and is read back exactly as in `start`.
+        #[cfg(any(test, feature = "policy-tool"))]
+        pub(crate) fnstart_acceptance(&self, policy: &UnitPolicy, trampoline: &str, bootstrap: BorrowedFd<'_>,
+            stdout: BorrowedFd<'_>, stderr: BorrowedFd<'_>) -> io::Result<StartedUnit> {
+            if policy.properties.contains_key("BindsTo") || policy.properties.contains_key("After")
+                || !trampoline.starts_with('/') || trampoline == TRAMPOLINE {
+                return Err(invalid_because("acceptance unit: spawnd dependency or trampoline path"));
+            }
+            self.start_exec(policy, trampoline, vec![trampoline], bootstrap, stdout, stderr)
+        }
+        /// R8r-4 (feature `policy-tool`): the unit's `MainPID` as PID 1 reports it now.
+        #[cfg(any(test, feature = "policy-tool"))]
+        pub(crate) fnacceptance_main_pid(&self, unit: &StartedUnit) -> io::Result<u32> {
+            let service = Proxy::new(&self.connection, BUS, unit.path.as_str(), "org.freedesktop.systemd1.Service").map_err(bus_error)?;
+            service.get_property("MainPID").map_err(bus_error)
+        }
+        /// R8r-4 (feature `policy-tool`): stop a unit the harness created
+        /// (its employee slice); `KillUnit` + `StopUnit` like [`Self::kill`].
+        #[cfg(any(test, feature = "policy-tool"))]
+        pub(crate) fnacceptance_stop(&self, name: &str) -> io::Result<()> { self.kill_name(name) }
+        /// R8r-4 (feature `policy-tool`): whether PID 1 still has `name` loaded.
+        #[cfg(any(test, feature = "policy-tool"))]
+        pub(crate) fnacceptance_loaded(&self, name: &str) -> io::Result<bool> {
+            let existing: zbus::Result<OwnedObjectPath> = self.manager()?.call("GetUnit", &(name,));
+            match existing {
+                Ok(_) => Ok(true),
+                Err(error) if missing_unit(&error) => Ok(false),
+                Err(error) => Err(bus_error(error)),
+            }
+        }
         /// Call only after all three cleanup readbacks, including the UID scan.
         pub fn release_reference(&self, run: &StartedUnit) -> io::Result<()> {
             let manager = self.manager()?;
