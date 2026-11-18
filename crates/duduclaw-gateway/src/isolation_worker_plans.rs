@@ -237,10 +237,32 @@ impl GatewayWorkerPlans {
         Ok((plan, state))
     }
 }
+/// R8n-2: what a producer of this factory needs before it can build a plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlanRequirement { Always, NeedsEmployee, NeedsEmployeeAndRoots }
+
+/// The ONE tool table of this factory: `provides` = a requirement exists,
+/// `supports` = it is met. A tool absent here is neither.
+pub(crate) fn plan_requirement(tool: &str) -> Option<PlanRequirement> {
+    match tool {
+        "web_extract" | "transcribe_audio" | "synthesize_speech" => Some(PlanRequirement::Always),
+        "skill_security_scan" | "shared_skill_adopt" | "skill_graduate" => Some(PlanRequirement::NeedsEmployee),
+        "skill_extract" => Some(PlanRequirement::NeedsEmployeeAndRoots),
+        _ => None,
+    }
+}
+
 impl WorkerPlanFactory for GatewayWorkerPlans {
-    fn supports(&self, tool: &str) -> bool { matches!(tool, "web_extract" | "transcribe_audio" | "synthesize_speech")
-        || (matches!(tool, "skill_security_scan" | "shared_skill_adopt" | "skill_graduate") && self.employee.is_some())
-        || (tool == "skill_extract" && self.employee.is_some() && self.roots.is_some()) }
+    fn supports(&self, tool: &str) -> bool {
+        match plan_requirement(tool) {
+            Some(PlanRequirement::Always) => true,
+            Some(PlanRequirement::NeedsEmployee) => self.employee.is_some(),
+            Some(PlanRequirement::NeedsEmployeeAndRoots) => self.employee.is_some() && self.roots.is_some(),
+            None => false,
+        }
+    }
+    /// Employee-independent: installed even in the employee-less boot factory.
+    fn provides(&self, tool: &str) -> bool { plan_requirement(tool).is_some() }
     fn authorize_handler<'a>(&'a self, call: &'a AuthorizedToolCall) -> PolicyFuture<'a, ()> {
         Box::pin(async move {
             if !self.supports(call.name()) { return Err(VerificationError::Unavailable); }

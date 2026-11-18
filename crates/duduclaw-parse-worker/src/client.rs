@@ -150,13 +150,8 @@ impl WorkerSession for SocketSession {
     }
     fn exchange_checked(&mut self, request: &ParseRequest, files: &[File],
         verify: &dyn Fn() -> Result<(), ParseError>) -> Result<ParseResponse, ParseError> {
-        use crate::transport;
-        let payload = serde_json::to_vec(request).map_err(|_| ParseError::InvalidContent)?;
-        transport::send_checked(&self.fd, &payload, files, self.deadline, verify)?;
-        let (payload, returned) = transport::receive_checked(&self.fd, 0, self.deadline, verify)?;
-        verify()?;
-        if !returned.is_empty() { return Err(ParseError::InvalidContent); }
-        let response = ParseResponse::decode_payload(&payload, request).map_err(|_| ParseError::InvalidContent)?;
+        // Shared with the retiring session (transport::exchange_checked).
+        let response = crate::transport::exchange_checked(&self.fd, request, files, self.deadline, verify)?;
         self.received_response = true;
         Ok(response)
     }

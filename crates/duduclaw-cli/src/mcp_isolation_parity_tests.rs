@@ -672,6 +672,48 @@ async fn helper_family_subsets_list_and_call_alike(dispatcher: &mut IsolationDis
     assert_eq!(Refusal::NotProvidedOnHost.message(), TOOL_NOT_PROVIDED);
 }
 
+/// R8n-2 B5: the boot producer check — `precheck`, `assemble` and the
+/// producer half of the McpBoundary integration probe all make exactly this
+/// call — with the PRODUCTION worker factory as boot builds it
+/// (`GatewayWorkerPlans::new(home)`, no employee) passes. Asking "usable for
+/// an employee now" instead (the pre-R8n-2 check) is refused and names the
+/// first employee-bound worker tool.
+#[test]
+fn r8n2_boot_producer_check_passes_with_the_production_worker_factory() {
+    use duduclaw_gateway::isolation_mcp::DispatcherFactory;
+    use duduclaw_gateway::isolation_worker_plans::GatewayWorkerPlans;
+    let home = tempfile::tempdir().unwrap();
+    let boot = GatewayWorkerPlans::new(home.path().to_owned()).unwrap();
+    let all = helper_subset(0b1111);
+    let execution = SubsetPlans { offered: all, supported: all };
+    let factory = crate::mcp_isolation_boot::CliDispatcherFactory;
+    assert!(factory.verify_producers(&execution, &boot, &ListingConnectors, &ListingSelection).is_ok());
+    assert_eq!(factory.unprovided_tool(&execution, &boot, &ListingConnectors, &ListingSelection), None);
+    for tool in ["skill_security_scan", "shared_skill_adopt", "skill_graduate", "skill_extract"] {
+        assert!(boot.provides(tool) && !boot.supports(tool), "{tool}: installed, not usable without an employee");
+    }
+
+    /// Answers only "usable now" (`provides` = the trait default `supports`).
+    struct UsableNow(GatewayWorkerPlans);
+    impl WorkerPlanFactory for UsableNow {
+        fn supports(&self, tool: &str) -> bool { self.0.supports(tool) }
+        fn authorize_handler<'a>(&'a self, _: &'a AuthorizedToolCall) -> PolicyFuture<'a, ()> {
+            Box::pin(async { Err(VerificationError::Unavailable) })
+        }
+        fn prepare<'a>(&'a self, _: &'a AuthorizedToolCall) -> PolicyFuture<'a, WorkerPlan> {
+            Box::pin(async { Err(VerificationError::Unavailable) })
+        }
+        fn finish<'a>(&'a self, _: &'a AuthorizedToolCall, _: WorkerReply) -> PolicyFuture<'a, Value> {
+            Box::pin(async { Err(VerificationError::Unavailable) })
+        }
+    }
+    let usable_now = UsableNow(boot);
+    assert!(factory.verify_producers(&execution, &usable_now, &ListingConnectors, &ListingSelection).is_err());
+    let named = factory.unprovided_tool(&execution, &usable_now, &ListingConnectors, &ListingSelection);
+    assert!(matches!(named, Some("skill_security_scan" | "shared_skill_adopt" | "skill_graduate" | "skill_extract")),
+        "{named:?}");
+}
+
 #[tokio::test]
 async fn isolated_round5_gateway_handler_dispatch_keeps_existing_capability_denials() {
     let home = tempfile::tempdir().unwrap();

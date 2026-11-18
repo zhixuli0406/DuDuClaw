@@ -22,6 +22,12 @@ pub trait DispatcherFactory: Send + Sync {
     fn verify_producers(&self, _execution: &dyn ExecutionPlanFactory, _worker: &dyn WorkerPlanFactory,
         _connectors: &dyn BoundConnectorExecutor, _selection: &dyn LiveConnectorSelectionPolicy)
         -> Result<(), VerificationError> { Err(VerificationError::Unavailable) }
+    /// R8n-2 B4: diagnostics only, never a readiness decision (that is
+    /// `verify_producers`, which fails closed by default): the first tool, by
+    /// its fixed tool-table name, that `verify_producers` finds unprovided.
+    fn unprovided_tool(&self, _execution: &dyn ExecutionPlanFactory, _worker: &dyn WorkerPlanFactory,
+        _connectors: &dyn BoundConnectorExecutor, _selection: &dyn LiveConnectorSelectionPolicy)
+        -> Option<&'static str> { None }
     /// Snapshot the real product catalog under the employee's current policy.
     /// Completeness is still checked independently when creating a dispatcher.
     fn ingress_tools(&self, _home: &Path, _agent: &str, _lane: duduclaw_isolation::capability::Lane)
@@ -409,9 +415,9 @@ fn install_and_publish(home: &Path, users: Arc<duduclaw_auth::UserDb>, sources: 
     // Side-effect-free checks of `assemble` first: a failure here is
     // retried. `assemble` itself installs process-wide producers, so a
     // failure there stays final (as before).
-    if precheck(home, sources).is_err() {
+    if let Err(reasons) = precheck(home, sources) {
         derived.forget(sources);
-        return Err(retry::Failure { missing: vec![MissingProducer::Initialization], retry: true, reasons: Vec::new() });
+        return Err(retry::Failure { missing: vec![MissingProducer::Initialization], retry: true, reasons });
     }
     let final_failure = || retry::Failure { missing: vec![MissingProducer::Initialization], retry: false, reasons: Vec::new() };
     let owner = assemble(home, backend.ok_or_else(final_failure)?, std::mem::take(sources))
@@ -446,16 +452,36 @@ fn connector_stack_inputs(sources: &BootSources) -> bool {
         && sources.product_authority.is_some()
 }
 
+/// R8n-2 B4: the fixed reason of a failed boot-time producer verification.
+const PRODUCER_VERIFICATION: &str = "producer_verification";
+
 /// The checks `assemble` makes before its first process-wide installation.
-fn precheck(home: &Path, sources: &BootSources) -> Result<(), VerificationError> {
+/// A refusal answers its fixed `Initialization` reasons (possibly none).
+fn precheck(home: &Path, sources: &BootSources) -> Result<(), Vec<retry::Detail>> {
     if !home.is_absolute() || sources.connector_catalog.is_none() || sources.installed_generation.is_none() {
-        return Err(VerificationError::Unavailable);
+        return Err(Vec::new());
     }
-    DISPATCHER.get().ok_or(VerificationError::Unavailable)?.verify_producers(
-        sources.execution_plans.as_deref().ok_or(VerificationError::Unavailable)?,
-        sources.worker_plans.as_deref().ok_or(VerificationError::Unavailable)?,
-        sources.connectors.as_deref().ok_or(VerificationError::Unavailable)?,
-        sources.connector_selection.as_deref().ok_or(VerificationError::Unavailable)?)
+    let (Some(dispatcher), Some(execution), Some(worker), Some(connectors), Some(selection)) = (DISPATCHER.get(),
+        sources.execution_plans.as_deref(), sources.worker_plans.as_deref(), sources.connectors.as_deref(),
+        sources.connector_selection.as_deref()) else { return Err(Vec::new()) };
+    verify_producers_with_reason(&**dispatcher, execution, worker, connectors, selection)
+}
+
+/// `verify_producers` decides; only on its refusal is `unprovided_tool` asked,
+/// for the log line. The reasons are `Initialization(producer_verification)`
+/// plus, when the adapter names one, the first unprovided tool's fixed name
+/// (`Initialization(producer_verification: skill_extract)` in the log). The
+/// published view carries producer names only (`initialization`).
+fn verify_producers_with_reason(dispatcher: &dyn DispatcherFactory, execution: &dyn ExecutionPlanFactory,
+    worker: &dyn WorkerPlanFactory, connectors: &dyn BoundConnectorExecutor,
+    selection: &dyn LiveConnectorSelectionPolicy) -> Result<(), Vec<retry::Detail>> {
+    dispatcher.verify_producers(execution, worker, connectors, selection).map_err(|_| {
+        let mut reasons = vec![(MissingProducer::Initialization, PRODUCER_VERIFICATION)];
+        if let Some(tool) = dispatcher.unprovided_tool(execution, worker, connectors, selection) {
+            reasons.push((MissingProducer::Initialization, tool));
+        }
+        reasons
+    })
 }
 
 /// F1 step 1 (before the producer check): the per-employee stack over the
@@ -509,7 +535,7 @@ fn fixed_reasons() -> Vec<&'static str> {
         .map(|failure| failure.reason()).collect();
     all.extend(crate::isolation_execution::PlansFailure::ALL.iter().map(|failure| failure.reason()));
     all.extend(["home_binding_unavailable", "lifecycle_unavailable", "connector_stack_unavailable",
-        "credential_vault_unavailable"]);
+        "credential_vault_unavailable", PRODUCER_VERIFICATION]);
     all
 }
 
@@ -1189,6 +1215,62 @@ mod tests {
         let owner_set = publish.find("OWNER.set(").unwrap();
         let probes = publish.find("install_probes(crate::isolation_readiness::install_integration_probe)").unwrap();
         assert!(owner_set < probes, "probes are installed after the owner exists");
+    }
+
+    /// R8n-2 B4: a refused boot producer verification publishes its fixed
+    /// reason (and the adapter's first unprovided tool) instead of an empty
+    /// `Initialization`; a passing one answers no reason; the decision is
+    /// always `verify_producers` (fail closed by default).
+    #[test]
+    fn r8n2_precheck_refusal_names_producer_verification_and_the_first_unprovided_tool() {
+        use duduclaw_mcp_boundary::{execution::{AuthorizedExecutionPlan, PolicyFuture}, tool_policy::AuthorizedToolCall};
+        struct NoPlans;
+        impl ExecutionPlanFactory for NoPlans {
+            fn supports(&self, _: &str) -> bool { false }
+            fn authorize_handler<'a>(&'a self, _: &'a AuthorizedToolCall) -> PolicyFuture<'a, ()> {
+                Box::pin(async { Err(VerificationError::Unavailable) })
+            }
+            fn prepare<'a>(&'a self, _: &'a AuthorizedToolCall, _: duduclaw_isolation::execution::RunHandle)
+                -> PolicyFuture<'a, AuthorizedExecutionPlan> { Box::pin(async { Err(VerificationError::Unavailable) }) }
+        }
+        /// `None`: only the trait defaults (refuses, names nothing).
+        /// `Some(None)`: passes. `Some(Some(tool))`: refuses naming `tool`.
+        struct Adapter(Option<Option<&'static str>>);
+        impl DispatcherFactory for Adapter {
+            fn create(&self, _: DispatcherInput) -> Result<Arc<dyn Dispatcher>, VerificationError> {
+                Err(VerificationError::Unavailable)
+            }
+            fn verify_producers(&self, _: &dyn ExecutionPlanFactory, _: &dyn WorkerPlanFactory,
+                _: &dyn BoundConnectorExecutor, _: &dyn LiveConnectorSelectionPolicy) -> Result<(), VerificationError> {
+                match self.0 { Some(None) => Ok(()), _ => Err(VerificationError::Unavailable) }
+            }
+            fn unprovided_tool(&self, _: &dyn ExecutionPlanFactory, _: &dyn WorkerPlanFactory,
+                _: &dyn BoundConnectorExecutor, _: &dyn LiveConnectorSelectionPolicy) -> Option<&'static str> {
+                self.0.flatten()
+            }
+        }
+        struct Defaults;
+        impl DispatcherFactory for Defaults {
+            fn create(&self, _: DispatcherInput) -> Result<Arc<dyn Dispatcher>, VerificationError> {
+                Err(VerificationError::Unavailable)
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        let worker = crate::isolation_worker_plans::GatewayWorkerPlans::new(home.path().to_owned()).unwrap();
+        let registry = crate::isolation_connector_registry::ConnectorProviderRegistry::default();
+        let check = |adapter: &dyn DispatcherFactory| verify_producers_with_reason(adapter, &NoPlans, &worker,
+            &registry, &registry);
+        let init = MissingProducer::Initialization;
+        assert_eq!(check(&Defaults), Err(vec![(init, "producer_verification")]));
+        assert_eq!(check(&Adapter(None)), Err(vec![(init, "producer_verification")]));
+        assert_eq!(check(&Adapter(Some(Some("skill_extract")))),
+            Err(vec![(init, "producer_verification"), (init, "skill_extract")]));
+        assert_eq!(check(&Adapter(Some(None))), Ok(()));
+        assert_eq!(retry::Listed(&[init], &check(&Adapter(Some(Some("skill_extract")))).unwrap_err()).to_string(),
+            "[Initialization(producer_verification: skill_extract)]");
+        // The published view stays producer names only (the strict reader is unchanged).
+        assert_eq!(init.name(), "initialization");
+        assert!(fixed_reasons().contains(&PRODUCER_VERIFICATION));
     }
 
     /// The readiness reads `boot_status`: not constructed (closed reasons)
