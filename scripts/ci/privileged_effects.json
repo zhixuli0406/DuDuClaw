@@ -4838,6 +4838,30 @@
       "rationale": "Test fixture or test helper; compiled/run only for regression verification, not a production employee execution entry point."
     },
     {
+      "symbol": "crates/duduclaw-inference/src/hardware.rs::tests::cleanup_refuses_to_signal_a_reaped_leader",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test fixture or test helper; compiled/run only for regression verification, not a production employee execution entry point."
+    },
+    {
+      "symbol": "crates/duduclaw-inference/src/hardware.rs::tests::exited_leader_with_stdout_helper_is_killed_before_reaping",
+      "apis": {
+        "command_constructor": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test fixture or test helper; compiled/run only for regression verification, not a production employee execution entry point."
+    },
+    {
       "symbol": "crates/duduclaw-inference/src/hardware.rs::tests::exists",
       "apis": {
         "command_constructor": 1,

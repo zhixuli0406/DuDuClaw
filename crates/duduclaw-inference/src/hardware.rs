@@ -46,44 +46,69 @@ enum Probe {
     TimedOut { pid: Option<u32>, reaped: bool },
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum LeaderState {
+    Unreaped,
+    Reaped,
+}
+
+impl LeaderState {
+    fn mark_reaped(&mut self) { *self = Self::Reaped; }
+}
+
 /// Runs `cmd` (stdin closed, stderr discarded, stdout captured up to
 /// [`PROBE_OUTPUT_LIMIT`]) for at most `limit`. Starts one child process, on
 /// Unix as the leader of a new process group (`process_group(0)`: group id =
 /// its pid), which everything it forks inherits.
 async fn run_bounded(mut cmd: tokio::process::Command, limit: Duration) -> Probe {
+    // Signal the process group only while its leader is still unreaped.
     use tokio::io::AsyncReadExt;
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
     #[cfg(unix)]
     cmd.process_group(0);
     let Ok(mut child) = cmd.spawn() else { return Probe::Failed };
     let pid = child.id();
-    let Some(stdout) = child.stdout.take() else {
-        kill_and_reap(&mut child, pid).await;
+    let mut leader = LeaderState::Unreaped;
+    let deadline = tokio::time::Instant::now() + limit;
+    let Some(mut stdout) = child.stdout.take() else {
+        kill_and_reap(&mut child, pid, &mut leader).await;
         return Probe::Failed;
     };
-    let ran = tokio::time::timeout(limit, async {
+    let ran = tokio::time::timeout_at(deadline, async {
         let mut bytes = Vec::new();
-        let mut limited = stdout.take(PROBE_OUTPUT_LIMIT);
-        let (read, status) = tokio::join!(limited.read_to_end(&mut bytes), child.wait());
-        match (read, status) {
-            (Ok(_), Ok(status)) => Some(Output { status, stdout: bytes, stderr: Vec::new() }),
-            _ => None,
+        let mut buffer = [0; 4096];
+        loop {
+            let read = stdout.read(&mut buffer).await?;
+            if read == 0 { break; }
+            let keep = read.min(PROBE_OUTPUT_LIMIT as usize - bytes.len());
+            bytes.extend_from_slice(&buffer[..keep]);
         }
+        // Only wait after EOF, under the same deadline (the remaining time).
+        let status = child.wait().await?;
+        leader.mark_reaped();
+        // A helper outliving a normally exited probe is left alone: after
+        // reaping, its former group id must never be signalled.
+        Ok::<_, std::io::Error>(Output { status, stdout: bytes, stderr: Vec::new() })
     }).await;
     match ran {
-        Ok(Some(output)) => Probe::Finished(output),
-        Ok(None) => { kill_and_reap(&mut child, pid).await; Probe::Failed }
-        Err(_) => { let reaped = kill_and_reap(&mut child, pid).await; Probe::TimedOut { pid, reaped } }
+        Ok(Ok(output)) => Probe::Finished(output),
+        Ok(Err(_)) => { kill_and_reap(&mut child, pid, &mut leader).await; Probe::Failed }
+        Err(_) => { let reaped = kill_and_reap(&mut child, pid, &mut leader).await; Probe::TimedOut { pid, reaped } }
     }
 }
 
 /// SIGKILL to the probe's whole process group (Unix; `group` is the pid
 /// recorded at spawn, which `process_group(0)` made the group id), then to
 /// the direct child, then collect the child's exit (reaping it) for at most
-/// [`PROBE_REAP_GRACE`]. The group id cannot name another group while the
-/// child is unreaped or any member of the group still exists (the kernel
-/// keeps that pid allocated); an already empty group answers ESRCH.
-async fn kill_and_reap(child: &mut tokio::process::Child, group: Option<u32>) -> bool {
+/// [`PROBE_REAP_GRACE`]. An unreaped leader keeps its pid allocated; refuse
+/// cleanup after reaping, when the former group id could have been reused.
+async fn kill_and_reap(child: &mut tokio::process::Child, group: Option<u32>, leader: &mut LeaderState) -> bool {
+    if *leader == LeaderState::Reaped { return true; }
+    #[cfg(all(test, unix))]
+    let _ = tests::GROUP_KILLS.try_with(|count| {
+        assert_eq!(*leader, LeaderState::Unreaped);
+        count.set(count.get() + 1);
+    });
     #[cfg(unix)]
     if let Some(group) = group.and_then(|pid| libc::pid_t::try_from(pid).ok()).filter(|pid| *pid > 1) {
         // SAFETY: kill takes scalar arguments only; a negative pid addresses
@@ -93,7 +118,9 @@ async fn kill_and_reap(child: &mut tokio::process::Child, group: Option<u32>) ->
     #[cfg(not(unix))]
     let _ = group;
     let _ = child.start_kill();
-    matches!(tokio::time::timeout(PROBE_REAP_GRACE, child.wait()).await, Ok(Ok(_)))
+    let reaped = matches!(tokio::time::timeout(PROBE_REAP_GRACE, child.wait()).await, Ok(Ok(_)));
+    if reaped { leader.mark_reaped(); }
+    reaped
 }
 
 /// [`run_bounded`]'s output, or `None` (not started, failed or timed out).
@@ -414,6 +441,10 @@ mod tests {
 
     const SHORT: Duration = Duration::from_millis(200);
 
+    tokio::task_local! {
+        pub(super) static GROUP_KILLS: std::cell::Cell<usize>;
+    }
+
     /// Stands in for any GPU tool: never exits (the tool's own arguments
     /// become `$0…` of the script and are ignored).
     fn hang(_: &'static str) -> tokio::process::Command {
@@ -481,6 +512,58 @@ mod tests {
         assert_ne!(helper, shell);
         assert!(gone_within(shell, Duration::from_secs(5)).await, "shell {shell} survived");
         assert!(gone_within(helper, Duration::from_secs(5)).await, "forked helper {helper} survived the deadline");
+    }
+
+    #[tokio::test]
+    async fn exited_leader_with_stdout_helper_is_killed_before_reaping() {
+        let dir = tempfile::tempdir().unwrap();
+        let helper_file = dir.path().join("helper.pid");
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", "sleep 600 & echo $! > \"$1\"; exit 0", "sh"]).arg(&helper_file);
+        let limit = Duration::from_millis(500);
+        let started = Instant::now();
+        let probe = GROUP_KILLS.scope(std::cell::Cell::new(0), async {
+            let probe = run_bounded(cmd, limit).await;
+            // The hook also asserts Unreaped at the group-kill site.
+            GROUP_KILLS.with(|count| assert_eq!(count.get(), 1));
+            probe
+        }).await;
+        let Probe::TimedOut { pid: Some(pid), reaped } = probe else { panic!("not timed out") };
+        assert!(started.elapsed() >= limit);
+        assert!(started.elapsed() < limit + PROBE_REAP_GRACE + Duration::from_secs(1));
+        assert!(reaped, "the exited leader was reaped only after the group kill");
+        assert!(!exists(pid));
+        let helper = std::fs::read_to_string(&helper_file).unwrap().trim().parse::<libc::pid_t>().unwrap();
+        assert!(gone_within(helper, Duration::from_secs(5)).await, "helper {helper} survived the deadline");
+    }
+
+    #[tokio::test]
+    async fn normal_probe_returns_output_without_group_cleanup() {
+        GROUP_KILLS.scope(std::cell::Cell::new(0), async {
+            let Probe::Finished(output) = run_bounded(answer("nvidia-smi"), Duration::from_secs(5)).await else { panic!("not finished") };
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"Tesla T4\n");
+            GROUP_KILLS.with(|count| assert_eq!(count.get(), 0));
+        }).await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_refuses_to_signal_a_reaped_leader() {
+        let mut cmd = hang("nvidia-smi");
+        cmd.process_group(0).kill_on_drop(true);
+        let mut child = cmd.spawn().unwrap();
+        let pid = child.id();
+        GROUP_KILLS.scope(std::cell::Cell::new(0), async {
+            // Use a live sentinel so an accidental signal is observable.
+            let mut leader = LeaderState::Reaped;
+            assert!(kill_and_reap(&mut child, pid, &mut leader).await);
+            GROUP_KILLS.with(|count| assert_eq!(count.get(), 0));
+            let alive = exists(pid.unwrap());
+            leader = LeaderState::Unreaped;
+            assert!(kill_and_reap(&mut child, pid, &mut leader).await);
+            assert_eq!(leader, LeaderState::Reaped);
+            assert!(alive, "Reaped state must refuse all signalling");
+        }).await;
     }
 
     #[tokio::test]
