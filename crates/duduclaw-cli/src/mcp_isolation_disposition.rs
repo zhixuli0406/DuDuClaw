@@ -1,7 +1,14 @@
 //! Isolation changes execution location, not employee permissions.
 //! Operator-only tools are refused by the existing gates, never this table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Refusal { HostAuthority, ForkNextRelease, ProposalRequired }
+pub enum Refusal {
+    HostAuthority, ForkNextRelease, ProposalRequired,
+    /// R8n-1: a helper tool family (program / office / code map / browser
+    /// recording) that this host's signed policy does not provide. Decided per
+    /// host by the assembled execution factory (`mcp_isolation::host_refusal`),
+    /// never by this static table.
+    NotProvidedOnHost,
+}
 impl Refusal {
     pub fn message(self) -> &'static str {
         self.message_for_language(None)
@@ -11,9 +18,15 @@ impl Refusal {
             Self::HostAuthority => "隔離執行沒有主機桌面、裝置或系統服務的控制權。",
             Self::ForkNextRelease => duduclaw_mcp_boundary::fork_policy::message(language),
             Self::ProposalRequired => PROPOSAL_REQUIRED,
+            Self::NotProvidedOnHost => TOOL_NOT_PROVIDED,
         }
     }
 }
+
+/// R8n-1: the one fixed refusal of a helper tool this host does not offer in
+/// isolation mode (stable code prefix, as `ISOLATION_NOT_READY:`).
+pub const TOOL_NOT_PROVIDED_CODE: &str = "ISOLATION_TOOL_NOT_PROVIDED";
+pub const TOOL_NOT_PROVIDED: &str = "ISOLATION_TOOL_NOT_PROVIDED: 此主機的隔離模式未提供這項工具。";
 
 /// Native Linux protected mode (v1.81, SR2): a protected employee exists only
 /// through an approved Employee proposal and its root allocation, so an

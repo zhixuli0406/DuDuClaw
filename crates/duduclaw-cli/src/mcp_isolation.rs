@@ -109,7 +109,7 @@ async fn authorize_resource_call(service: Arc<dyn ResourceToolService>, context:
 /// handlers retain their fd-only path; every other tool uses an explicit service.
 pub(crate) async fn dispatch_resource_tool(home: &std::path::Path, name: &str, arguments: &Value) -> Option<Value> {
     let current = current()?;
-    if let Some(reason) = crate::mcp_isolation_disposition::intentional_refusal(name) {
+    if let Some(reason) = refusal_for(&current.execution, name) {
         return Some(crate::mcp::tool_error(refusal_message(home, reason).await));
     }
     if home != current.home || check_tool_arguments(name, arguments).is_err() {
@@ -208,6 +208,27 @@ pub(crate) fn current() -> Option<Arc<IsolatedCall>> {
     ISOLATED_CALL.try_with(Arc::clone).ok()
 }
 
+/// R8n-1: a helper tool whose family the installed execution factory does
+/// not offer on this host (fixed for the life of the assembled service). No
+/// execution bridge at all is a missing service, not "not provided".
+fn not_offered(execution: &Option<Arc<crate::mcp_isolation_execution::ExecutionToolBridge>>, name: &str) -> bool {
+    execution.as_ref().is_some_and(|bridge| !bridge.offers(name))
+}
+
+/// The disposition shared by tools/list (hidden), tools/call (refused with
+/// its fixed message), the service manifest and the producer check: the
+/// static exceptions, then the host's own unavailable helper families.
+fn refusal_for(execution: &Option<Arc<crate::mcp_isolation_execution::ExecutionToolBridge>>, name: &str)
+    -> Option<crate::mcp_isolation_disposition::Refusal> {
+    crate::mcp_isolation_disposition::intentional_refusal(name)
+        .or_else(|| not_offered(execution, name).then_some(crate::mcp_isolation_disposition::Refusal::NotProvidedOnHost))
+}
+
+/// [`refusal_for`] of the current isolated call (`None` outside one).
+pub(crate) fn host_refusal(name: &str) -> Option<crate::mcp_isolation_disposition::Refusal> {
+    current().and_then(|call| refusal_for(&call.execution, name))
+}
+
 pub(crate) async fn refusal_message(home: &std::path::Path,
     reason: crate::mcp_isolation_disposition::Refusal) -> &'static str {
     if reason != crate::mcp_isolation_disposition::Refusal::ForkNextRelease { return reason.message(); }
@@ -227,7 +248,7 @@ pub(crate) fn process_lane() -> duduclaw_core::ProcessLane {
 pub(crate) fn tool_allowed(name: &str, principal: &Principal) -> bool {
     let Some(call) = current() else { return true; };
     let record = call.context.record();
-    if crate::mcp_isolation_disposition::intentional_refusal(name).is_some() { return false; }
+    if refusal_for(&call.execution, name).is_some() { return false; }
     let supported = match boundary_route(name) {
         Some(BoundaryRoute::File) => name == "file_read" || call.parser.is_some(),
         Some(BoundaryRoute::GatewayHandler(_)) if crate::mcp_fork::is_fork_tool(name) =>
@@ -280,7 +301,7 @@ impl IsolationDispatcher {
     pub fn service_manifest(&self) -> Vec<(&'static str, ServiceState)> {
         crate::mcp::tools().map(|tool| {
             let name = tool.name;
-            let state = if let Some(reason) = crate::mcp_isolation_disposition::intentional_refusal(name) {
+            let state = if let Some(reason) = refusal_for(&self.execution, name) {
                 ServiceState::IntentionalRefusal(reason)
             } else {
                 let ready = match boundary_route(name) {

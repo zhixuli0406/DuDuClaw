@@ -130,7 +130,7 @@ sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux [--version X.Y
 | 新的狀態、尚未就緒 | `[資訊]` 列出每個未就緒元件 `名稱(原因)` 與啟動組裝尚缺的項目，接著「平台檢查均已通過，但 Gateway 尚未就緒，員工工作仍暫停。」 | 非 0 |
 | 不存在、過期、屬於其他開機或無效（Gateway 未執行或剛啟動） | 「[資訊] 無法取得 Gateway 的就緒狀態（Gateway 未執行、剛啟動，或狀態檔無效）。」，接著拒絕確認可以執行員工工作 | 非 0 |
 
-安裝程式自己的就緒步驟只使用平台結果，因為安裝剛完成時，Gateway 的隔離工具服務可能仍在背景組裝。Gateway 的日誌會列出相同的尚缺項目，已知原因時附上固定原因，例如 `ConnectorProviders(catalog_file_unsafe)`（連接器目錄 `isolation-connectors.db` 或其 SQLite 附屬檔不是由 Gateway 帳號擁有、僅限擁有者存取的單一連結檔案）或 `ExecutionPlans(no_helper_runtime_in_policy)`。Gateway 會在背景重試組裝，修正原因後不需要重新啟動。
+安裝程式自己的就緒步驟只使用平台結果，因為安裝剛完成時，Gateway 的隔離工具服務可能仍在背景組裝。Gateway 的日誌會列出相同的尚缺項目，已知原因時附上固定原因，例如 `ConnectorProviders(catalog_file_unsafe)`（連接器目錄 `isolation-connectors.db` 或其 SQLite 附屬檔不是由 Gateway 帳號擁有、僅限擁有者存取的單一連結檔案）或 `ExecutionPlans(invalid_helper_runtime)`（已簽署的輔助執行環境不符合其固定協定；政策中完全沒有輔助執行環境是有效的，這些工具類別只是不提供）。Gateway 會在背景重試組裝，修正原因後不需要重新啟動。
 
 ## 從 v1.79.3 遷移
 

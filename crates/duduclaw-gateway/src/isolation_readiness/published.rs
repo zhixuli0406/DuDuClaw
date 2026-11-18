@@ -18,7 +18,7 @@
 // The writer runs on Linux only; elsewhere its helpers are exercised by tests.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 use serde::{Deserialize, Serialize};
-use super::{ComponentState, Components, Readiness};
+use super::{ComponentReasons, ComponentState, Components, Readiness};
 
 pub const SCHEMA: u32 = 1;
 /// The isolated gateway unit's `RuntimeDirectory=` under `/run`.
@@ -39,6 +39,28 @@ pub const COMPONENTS: [&str; 8] = ["launch_service", "sandbox", "network", "stor
 pub const STATES: [&str; 3] = ["ready", "not_ready", "pending"];
 /// A not-ready component's reason: its `ComponentState` serde name.
 pub const COMPONENT_REASONS: [&str; 2] = ["unavailable", "pending_integration"];
+/// R8n-1: the ParseWorker probe's fixed refusal reasons (a not-ready
+/// `parse_worker` may carry one instead of `unavailable`).
+pub const PARSE_WORKER_REASONS: [&str; 7] = ["assembly_incomplete", "launcher_not_installed",
+    "generation_mismatch", "socket_unavailable", "socket_unsafe", "socket_not_listening",
+    "retirement_lease_unavailable"];
+/// R8n-1: the RuntimeAdapters probe's fixed refusal reasons (`runtime_adapters`).
+pub const RUNTIME_ADAPTER_REASONS: [&str; 7] = ["assembly_incomplete", "helper_producer_missing",
+    "fork_reader_missing", "generation_mismatch", "publication_unavailable", "no_main_runtime",
+    "main_adapter_unavailable"];
+/// R8n-1: the helper tool family names (`isolation_execution::HelperFamily::name`).
+/// A listed family is not offered on this host: its tools are neither listed
+/// nor callable for isolated employees. Informational only.
+pub const TOOL_FAMILIES: [&str; 4] = ["program", "office", "code_map", "browser_record"];
+
+/// The probe reasons a not-ready component may carry, by component name.
+fn probe_reasons(component: &str) -> &'static [&'static str] {
+    match component {
+        "parse_worker" => &PARSE_WORKER_REASONS,
+        "runtime_adapters" => &RUNTIME_ADAPTER_REASONS,
+        _ => &[],
+    }
+}
 /// The boot assembly's producer names (`isolation_mcp::MissingProducer::name`).
 pub const ASSEMBLY: [&str; 13] = ["backend", "live_authority", "durable_bindings", "runtime_publication",
     "execution_plans", "worker_retirement", "worker_plans", "turn_authority", "dispatcher",
@@ -53,6 +75,10 @@ pub struct View {
     pub ready: bool,
     pub components: Vec<ComponentView>,
     pub assembly_missing: Vec<String>,
+    /// R8n-1: [`TOOL_FAMILIES`] not offered on this host (empty until the
+    /// boot assembly completed). Required: a document without it is rejected
+    /// (reads as "gateway view unavailable"); gateway and CLI ship together.
+    pub tools_unavailable: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,34 +93,42 @@ pub struct ComponentView {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Content {
     ready: bool,
-    components: [(&'static str, ComponentState); 8],
+    components: [(&'static str, ComponentState, Option<&'static str>); 8],
     assembly_missing: Vec<&'static str>,
+    tools_unavailable: Vec<&'static str>,
 }
 
 impl Content {
-    pub(crate) fn of(readiness: &Readiness, assembly_missing: Vec<&'static str>) -> Self {
+    pub(crate) fn of(readiness: &Readiness, reasons: ComponentReasons, assembly_missing: Vec<&'static str>,
+        tools_unavailable: Vec<&'static str>) -> Self {
         let Components { launch_service, sandbox, network, storage, parse_worker, update_service,
             mcp_boundary, runtime_adapters } = readiness.components;
         let states = [launch_service, sandbox, network, storage, parse_worker, update_service, mcp_boundary,
             runtime_adapters];
-        let mut components = [("", ComponentState::Unavailable); 8];
+        let mut components = [("", ComponentState::Unavailable, None); 8];
         for (slot, (name, state)) in components.iter_mut().zip(COMPONENTS.into_iter().zip(states)) {
-            *slot = (name, state);
+            // Only a fixed probe reason of this very component, and only while unavailable.
+            let reason = match name { "parse_worker" => reasons.parse_worker, "runtime_adapters" => reasons.runtime_adapters,
+                _ => None }.filter(|reason| state == ComponentState::Unavailable && probe_reasons(name).contains(reason));
+            *slot = (name, state, reason);
         }
-        Self { ready: readiness.ready, components, assembly_missing }
+        // Fixed family names only, each once, in table order.
+        let tools_unavailable = TOOL_FAMILIES.into_iter().filter(|family| tools_unavailable.contains(family)).collect();
+        Self { ready: readiness.ready, components, assembly_missing, tools_unavailable }
     }
 
     pub(crate) fn view(&self, boot_id: &str, written_unix: u64) -> View {
         View { schema: SCHEMA, boot_id: boot_id.to_owned(), written_unix, ready: self.ready,
-            components: self.components.iter().map(|(name, state)| {
+            components: self.components.iter().map(|(name, state, probe_reason)| {
                 let (state, reason) = match state {
                     ComponentState::Ready => ("ready", None),
-                    ComponentState::Unavailable => ("not_ready", Some("unavailable")),
+                    ComponentState::Unavailable => ("not_ready", Some(probe_reason.unwrap_or("unavailable"))),
                     ComponentState::PendingIntegration => ("pending", Some("pending_integration")),
                 };
                 ComponentView { name: (*name).to_owned(), state: state.to_owned(), reason: reason.map(str::to_owned) }
             }).collect(),
-            assembly_missing: self.assembly_missing.iter().map(|name| (*name).to_owned()).collect() }
+            assembly_missing: self.assembly_missing.iter().map(|name| (*name).to_owned()).collect(),
+            tools_unavailable: self.tools_unavailable.iter().map(|name| (*name).to_owned()).collect() }
     }
 }
 
@@ -147,21 +181,26 @@ pub fn parse(bytes: &[u8], boot_id: &str, now_unix: u64) -> Result<View, Rejecte
     if bytes.len() as u64 > MAX_BYTES { return Err(Rejected::Malformed); }
     let view: View = serde_json::from_slice(bytes).map_err(|_| Rejected::Malformed)?;
     if view.schema != SCHEMA || !valid_boot_id(&view.boot_id) { return Err(Rejected::Malformed); }
-    if view.components.len() != COMPONENTS.len() || view.assembly_missing.len() > ASSEMBLY.len() {
+    if view.components.len() != COMPONENTS.len() || view.assembly_missing.len() > ASSEMBLY.len()
+        || view.tools_unavailable.len() > TOOL_FAMILIES.len() {
         return Err(Rejected::Malformed);
     }
     for (expected, component) in COMPONENTS.iter().zip(&view.components) {
         let consistent = match (component.state.as_str(), component.reason.as_deref()) {
             ("ready", None) => true,
             ("not_ready", Some("unavailable")) | ("pending", Some("pending_integration")) => true,
+            // R8n-1: a probe-backed component's own fixed reason.
+            ("not_ready", Some(reason)) => probe_reasons(expected).contains(&reason),
             _ => false,
         };
         if component.name != *expected || !consistent { return Err(Rejected::Malformed); }
     }
-    let mut seen = Vec::new();
-    for name in &view.assembly_missing {
-        if !ASSEMBLY.contains(&name.as_str()) || seen.contains(&name) { return Err(Rejected::Malformed); }
-        seen.push(name);
+    for (names, table) in [(&view.assembly_missing, &ASSEMBLY[..]), (&view.tools_unavailable, &TOOL_FAMILIES[..])] {
+        let mut seen = Vec::new();
+        for name in names {
+            if !table.contains(&name.as_str()) || seen.contains(&name) { return Err(Rejected::Malformed); }
+            seen.push(name);
+        }
     }
     let all_ready = view.components.iter().all(|component| component.state == "ready");
     if view.ready && (!all_ready || !view.assembly_missing.is_empty()) { return Err(Rejected::Malformed); }
@@ -178,6 +217,15 @@ pub fn parse(bytes: &[u8], boot_id: &str, now_unix: u64) -> Result<View, Rejecte
 pub(crate) fn assembly_missing() -> Vec<&'static str> {
     #[cfg(target_os = "linux")]
     { crate::isolation_mcp::boot_status().missing.into_iter().map(|producer| producer.name()).collect() }
+    #[cfg(not(target_os = "linux"))]
+    { Vec::new() }
+}
+
+/// R8n-1: the helper tool families the assembled tool service does not offer
+/// (Linux only; empty until assembled and elsewhere).
+pub(crate) fn tools_unavailable() -> Vec<&'static str> {
+    #[cfg(target_os = "linux")]
+    { crate::isolation_mcp::tools_unavailable() }
     #[cfg(not(target_os = "linux"))]
     { Vec::new() }
 }
@@ -233,8 +281,8 @@ mod linux {
 
     /// One tick: the last written content, updated when a write landed.
     fn publish_once(last: Option<(Content, Instant)>) -> Option<(Content, Instant)> {
-        let Some(readiness) = super::super::status() else { return last };
-        let content = Content::of(&readiness, super::assembly_missing());
+        let Some((readiness, reasons)) = super::super::status_with_reasons() else { return last };
+        let content = Content::of(&readiness, reasons, super::assembly_missing(), super::tools_unavailable());
         let now = Instant::now();
         if !super::due(last.as_ref(), &content, now) { return last; }
         let Some(boot_id) = super::current_boot_id() else { return last };
@@ -284,16 +332,85 @@ mod tests {
             network: ComponentState::Ready, storage: ComponentState::Ready, parse_worker: ComponentState::Ready,
             update_service: ComponentState::Ready, mcp_boundary: state, runtime_adapters: ComponentState::Ready };
         Readiness { required: true, ready: components.all_ready(), components, status: None, reasons: None,
-            employees: None, notices: None, assembly_missing: None }
+            employees: None, notices: None, assembly_missing: None, tools_unavailable: None }
     }
     fn bytes(view: &View) -> Vec<u8> { serde_json::to_vec(view).unwrap() }
+    fn content(readiness: &Readiness, assembly_missing: Vec<&'static str>) -> Content {
+        Content::of(readiness, ComponentReasons::default(), assembly_missing, Vec::new())
+    }
+
+    /// R8n-1 1.6/2.3: probe reasons and the unavailable tool families round-trip
+    /// through the strict reader; only a component's own fixed reason, only
+    /// while it is not ready, and only fixed family names are accepted.
+    #[test]
+    fn r8n_published_view_round_trips_probe_reasons_and_unavailable_tools() {
+        let mut readiness = readiness(ComponentState::Ready);
+        readiness.components.parse_worker = ComponentState::Unavailable;
+        readiness.components.runtime_adapters = ComponentState::Unavailable;
+        readiness.ready = false;
+        let reasons = ComponentReasons { parse_worker: Some("socket_unavailable"), runtime_adapters: Some("no_main_runtime") };
+        let view = Content::of(&readiness, reasons, Vec::new(), vec!["office", "program"]).view(BOOT, NOW);
+        let value = serde_json::to_value(&view).unwrap();
+        assert_eq!(value["components"][4], serde_json::json!({"name": "parse_worker", "state": "not_ready",
+            "reason": "socket_unavailable"}));
+        assert_eq!(value["components"][7], serde_json::json!({"name": "runtime_adapters", "state": "not_ready",
+            "reason": "no_main_runtime"}));
+        // Table order, whatever order they were given in.
+        assert_eq!(value["tools_unavailable"], serde_json::json!(["program", "office"]));
+        assert_eq!(parse(&bytes(&view), BOOT, NOW).unwrap(), view);
+        // A ready host can still not offer every family: informational only.
+        let ready = Content::of(&readiness_all_ready(), ComponentReasons::default(), Vec::new(), TOOL_FAMILIES.to_vec())
+            .view(BOOT, NOW);
+        assert!(ready.ready);
+        assert_eq!(parse(&bytes(&ready), BOOT, NOW).unwrap().tools_unavailable, TOOL_FAMILIES);
+        // A reason of another component, an unknown name, or a reason on a
+        // ready component is never emitted.
+        let crossed = ComponentReasons { parse_worker: Some("no_main_runtime"), runtime_adapters: Some("/etc/passwd") };
+        let view = Content::of(&readiness, crossed, Vec::new(), vec!["shell"]).view(BOOT, NOW);
+        assert_eq!(view.components[4].reason.as_deref(), Some("unavailable"));
+        assert_eq!(view.components[7].reason.as_deref(), Some("unavailable"));
+        assert!(view.tools_unavailable.is_empty());
+        let view = Content::of(&readiness_all_ready(), reasons, Vec::new(), Vec::new()).view(BOOT, NOW);
+        assert!(view.components.iter().all(|component| component.reason.is_none()));
+        // The reader refuses the same contradictions in a forged document.
+        let good = Content::of(&readiness, reasons, Vec::new(), vec!["code_map"]).view(BOOT, NOW);
+        let cases: [fn(&mut View); 6] = [
+            |view| view.components[4].reason = Some("no_main_runtime".into()),
+            |view| view.components[7].reason = Some("socket_unavailable".into()),
+            |view| view.components[0].reason = Some("socket_unavailable".into()),
+            |view| view.tools_unavailable.push("shell".into()),
+            |view| view.tools_unavailable.push("code_map".into()),
+            |view| view.components[4].state = "pending".into(),
+        ];
+        for (index, case) in cases.into_iter().enumerate() {
+            let mut view = good.clone();
+            case(&mut view);
+            assert_eq!(parse(&bytes(&view), BOOT, NOW), Err(Rejected::Malformed), "case {index}");
+        }
+        // A document without the field (an older writer) reads as unavailable.
+        let mut value = serde_json::to_value(&good).unwrap();
+        value.as_object_mut().unwrap().remove("tools_unavailable");
+        assert_eq!(parse(value.to_string().as_bytes(), BOOT, NOW), Err(Rejected::Malformed));
+        for reason in PARSE_WORKER_REASONS.into_iter().chain(RUNTIME_ADAPTER_REASONS) {
+            assert!(!reason.is_empty() && reason.bytes().all(|byte| byte.is_ascii_lowercase() || byte == b'_'), "{reason}");
+        }
+    }
+    fn readiness_all_ready() -> Readiness { readiness(ComponentState::Ready) }
+
+    /// The family names are exactly `HelperFamily::name`, in order.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn published_tool_families_match_the_helper_families() {
+        let names: Vec<_> = crate::isolation_execution::HelperFamily::ALL.iter().map(|family| family.name()).collect();
+        assert_eq!(names, TOOL_FAMILIES);
+    }
 
     /// Every emitted name/state/reason is in the fixed tables, and the
     /// document has exactly the schema's keys.
     #[test]
     fn published_view_has_fixed_identifiers_only() {
         for state in [ComponentState::Ready, ComponentState::Unavailable, ComponentState::PendingIntegration] {
-            let view = Content::of(&readiness(state), ASSEMBLY.to_vec()).view(BOOT, NOW);
+            let view = content(&readiness(state), ASSEMBLY.to_vec()).view(BOOT, NOW);
             for component in &view.components {
                 assert!(COMPONENTS.contains(&component.name.as_str()));
                 assert!(STATES.contains(&component.state.as_str()));
@@ -302,15 +419,15 @@ mod tests {
             assert!(view.assembly_missing.iter().all(|name| ASSEMBLY.contains(&name.as_str())));
             let value: serde_json::Value = serde_json::from_slice(&bytes(&view)).unwrap();
             let keys: Vec<_> = value.as_object().unwrap().keys().cloned().collect();
-            assert_eq!(keys.len(), 6, "{keys:?}");
-            for key in ["schema", "boot_id", "written_unix", "ready", "components", "assembly_missing"] {
+            assert_eq!(keys.len(), 7, "{keys:?}");
+            for key in ["schema", "boot_id", "written_unix", "ready", "components", "assembly_missing", "tools_unavailable"] {
                 assert!(value.get(key).is_some(), "{key}");
             }
         }
         // The component reasons are exactly `ComponentState`'s not-ready serde names.
         assert_eq!([ComponentState::Unavailable, ComponentState::PendingIntegration]
             .map(|state| serde_json::to_value(state).unwrap()), COMPONENT_REASONS.map(|reason| serde_json::json!(reason)));
-        let view = Content::of(&readiness(ComponentState::PendingIntegration), vec!["connector_providers"]).view(BOOT, NOW);
+        let view = content(&readiness(ComponentState::PendingIntegration), vec!["connector_providers"]).view(BOOT, NOW);
         let value = serde_json::to_value(&view).unwrap();
         assert_eq!(value["ready"], false);
         assert_eq!(value["components"][6], serde_json::json!({"name": "mcp_boundary", "state": "pending",
@@ -333,14 +450,14 @@ mod tests {
     #[test]
     fn published_view_is_rewritten_on_change_and_every_thirty_seconds() {
         let start = Instant::now();
-        let ready = Content::of(&readiness(ComponentState::Ready), Vec::new());
-        let pending = Content::of(&readiness(ComponentState::PendingIntegration), vec!["connector_providers"]);
+        let ready = content(&readiness(ComponentState::Ready), Vec::new());
+        let pending = content(&readiness(ComponentState::PendingIntegration), vec!["connector_providers"]);
         assert!(due(None, &ready, start), "never written");
         let last = (ready.clone(), start);
         assert!(!due(Some(&last), &ready, start + Duration::from_secs(29)));
         assert!(due(Some(&last), &ready, start + Duration::from_secs(30)), "periodic rewrite");
         assert!(due(Some(&last), &pending, start + Duration::from_secs(1)), "content changed");
-        let other = Content::of(&readiness(ComponentState::PendingIntegration), vec!["dispatcher"]);
+        let other = content(&readiness(ComponentState::PendingIntegration), vec!["dispatcher"]);
         assert!(due(Some(&(pending, start)), &other, start), "assembly changed");
     }
 
@@ -349,9 +466,9 @@ mod tests {
     fn published_view_write_replaces_atomically_and_reads_back() {
         let home = crate::fs_safe::private_test_home().unwrap();
         let directory = crate::fs_safe::SafeDir::open_nofollow(home.path(), false).unwrap();
-        let first = Content::of(&readiness(ComponentState::Unavailable), vec!["backend"]).view(BOOT, NOW);
+        let first = content(&readiness(ComponentState::Unavailable), vec!["backend"]).view(BOOT, NOW);
         write_into(&directory, &first).unwrap();
-        let second = Content::of(&readiness(ComponentState::Ready), Vec::new()).view(BOOT, NOW + 30);
+        let second = content(&readiness(ComponentState::Ready), Vec::new()).view(BOOT, NOW + 30);
         write_into(&directory, &second).unwrap();
         let read = std::fs::read(home.path().join(FILE)).unwrap();
         assert_eq!(parse(&read, BOOT, NOW + 31).unwrap(), second);
@@ -361,7 +478,7 @@ mod tests {
 
     #[test]
     fn published_view_reader_rejects_everything_but_a_fresh_strict_document() {
-        let good = Content::of(&readiness(ComponentState::PendingIntegration), vec!["connector_providers"]).view(BOOT, NOW);
+        let good = content(&readiness(ComponentState::PendingIntegration), vec!["connector_providers"]).view(BOOT, NOW);
         assert_eq!(parse(&bytes(&good), BOOT, NOW + 10).unwrap(), good);
         // Other boot, stale, future.
         assert_eq!(parse(&bytes(&good), "fedcba98-7654-3210-fedc-ba9876543210", NOW), Err(Rejected::OtherBoot));

@@ -14,35 +14,111 @@ use serde_json::Value;
 // Leave time for helper kill/reap and typed result delivery before B2 retires the run.
 const RESULT_GRACE_MS: u64 = 5_000;
 
-pub struct InstalledProgramPlans { generation: Sha256Digest, gateway_gid: u32 }
+/// R8n-1: the helper tool families of the isolated layout. Each is offered
+/// individually, only when the signed policy provides its helper kind (the
+/// owner's decision: these families come from client-side downloaded,
+/// vendor-pinned interpreters/browsers a host may not register).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HelperFamily { Program, Office, CodeMap, BrowserRecord }
+impl HelperFamily {
+    pub const ALL: [Self; 4] = [Self::Program, Self::Office, Self::CodeMap, Self::BrowserRecord];
+    /// The fixed family name published in the readiness view
+    /// (`isolation_readiness::published::TOOL_FAMILIES`).
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Program => "program",
+            Self::Office => "office",
+            Self::CodeMap => "code_map",
+            Self::BrowserRecord => "browser_record",
+        }
+    }
+    /// The tools of the family (the recording: both or neither).
+    pub const fn tools(self) -> &'static [&'static str] {
+        match self {
+            Self::Program => &["execute_program"],
+            Self::Office => &["office_script"],
+            Self::CodeMap => &["code_map"],
+            Self::BrowserRecord => &["browser_record_start", "browser_record_stop"],
+        }
+    }
+    pub fn of_tool(name: &str) -> Option<Self> { Self::ALL.into_iter().find(|family| family.tools().contains(&name)) }
+    /// The family of a signed helper kind (`None`: not an in-run helper kind).
+    fn of_kind(runtime: &RuntimeKind) -> Option<Self> {
+        if !helper_runtime(runtime) { return None; }
+        let RuntimeKind::Registered(name) = runtime else { return None };
+        let name = name.as_str();
+        Some(if name == PROGRAM_RUNTIME { Self::Program }
+            else if name == code_map_helper::RUNTIME { Self::CodeMap }
+            else if name == recording_helper::RUNTIME { Self::BrowserRecord }
+            // `in_run_helper_kind` admits only the office script ids otherwise.
+            else { Self::Office })
+    }
+    const fn bit(self) -> u8 { 1 << self as u8 }
+}
+
+/// R8n-1: the set of helper families this host offers, fixed when the plans
+/// are built from the signed policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HelperFamilies(u8);
+impl HelperFamilies {
+    pub const NONE: Self = Self(0);
+    pub fn with(self, family: HelperFamily) -> Self { Self(self.0 | family.bit()) }
+    pub fn contains(self, family: HelperFamily) -> bool { self.0 & family.bit() != 0 }
+    /// `false` only for a helper tool whose family is not offered.
+    pub fn offers(self, tool: &str) -> bool { HelperFamily::of_tool(tool).is_none_or(|family| self.contains(family)) }
+    /// A factory's offer, read through its tools (each family's first tool).
+    pub fn from_offers(mut offers: impl FnMut(&str) -> bool) -> Self {
+        HelperFamily::ALL.into_iter().filter(|family| offers(family.tools()[0]))
+            .fold(Self::NONE, Self::with)
+    }
+    /// The fixed names of the families NOT offered, in [`HelperFamily::ALL`] order.
+    pub fn unavailable(self) -> Vec<&'static str> {
+        HelperFamily::ALL.into_iter().filter(|family| !self.contains(*family)).map(HelperFamily::name).collect()
+    }
+}
+
+/// R8n-1 1.1: the families offered by the signed helper runtimes. No helper
+/// runtime at all is a valid, empty set; a signed helper record that fails
+/// its fixed protocol is a broken policy and refuses the whole set.
+fn offered_families(runtimes: impl IntoIterator<Item = PublishedRuntime>) -> Result<HelperFamilies, PlansFailure> {
+    let mut offered = HelperFamilies::NONE;
+    for runtime in runtimes {
+        let Some(family) = HelperFamily::of_kind(&runtime.runtime) else { continue };
+        if !valid_helper(&runtime) { return Err(PlansFailure::InvalidHelperRuntime); }
+        offered = offered.with(family);
+    }
+    Ok(offered)
+}
+
+pub struct InstalledProgramPlans { generation: Sha256Digest, gateway_gid: u32, offered: HelperFamilies }
 impl InstalledProgramPlans {
     pub fn new(generation: Sha256Digest, gateway_gid: u32) -> Result<Arc<Self>, VerificationError> {
         Self::new_checked(generation, gateway_gid).map_err(PlansFailure::verification)
     }
 
     /// R8m 30a: [`Self::new`] with a fixed reason for the boot assembly's
-    /// not-ready report (no path, no OS error text).
+    /// not-ready report (no path, no OS error text). R8n-1: a policy without
+    /// any helper runtime gives a valid plan set that offers no helper tool.
     pub fn new_checked(generation: Sha256Digest, gateway_gid: u32) -> Result<Arc<Self>, PlansFailure> {
         if generation.0 == [0; 32] || gateway_gid == 0 { return Err(PlansFailure::InvalidInput); }
-        let plans = Arc::new(Self { generation, gateway_gid });
-        plans.checked_publication()?;
-        Ok(plans)
+        let mut plans = Self { generation, gateway_gid, offered: HelperFamilies::NONE };
+        let (_, offered) = plans.checked_publication()?;
+        plans.offered = offered;
+        Ok(Arc::new(plans))
     }
+
+    /// The families this plan set offers (fixed at construction).
+    pub fn offered(&self) -> HelperFamilies { self.offered }
 
     fn publication(&self) -> Result<GatewayPublication, VerificationError> {
-        self.checked_publication().map_err(PlansFailure::verification)
+        self.checked_publication().map(|(publication, _)| publication).map_err(PlansFailure::verification)
     }
 
-    fn checked_publication(&self) -> Result<GatewayPublication, PlansFailure> {
+    fn checked_publication(&self) -> Result<(GatewayPublication, HelperFamilies), PlansFailure> {
         let publication = GatewayPublication::read(self.gateway_gid).map_err(|_| PlansFailure::PublicationUnavailable)?;
         if publication.generation != self.generation { return Err(PlansFailure::GenerationMismatch); }
-        let matching = publication.runtimes.iter().filter(|record| helper_runtime(&record.runtime))
-            .collect::<Vec<_>>();
-        if matching.is_empty() { return Err(PlansFailure::NoHelperRuntimeInPolicy); }
-        if matching.iter().any(|record| !valid_helper(&record.to_runtime())) {
-            return Err(PlansFailure::InvalidHelperRuntime);
-        }
-        Ok(publication)
+        let offered = offered_families(publication.runtimes.iter().map(|record| record.to_runtime()))?;
+        Ok((publication, offered))
     }
 }
 
@@ -56,20 +132,18 @@ pub enum PlansFailure {
     PublicationUnavailable,
     /// The publication belongs to another generation.
     GenerationMismatch,
-    /// The published policy has no in-run helper runtime.
-    NoHelperRuntimeInPolicy,
-    /// A published helper runtime does not match its fixed protocol.
+    /// A published helper runtime does not match its fixed protocol. (R8n-1:
+    /// a policy WITHOUT helper runtimes is no longer a failure.)
     InvalidHelperRuntime,
 }
 impl PlansFailure {
-    pub const ALL: [Self; 5] = [Self::InvalidInput, Self::PublicationUnavailable, Self::GenerationMismatch,
-        Self::NoHelperRuntimeInPolicy, Self::InvalidHelperRuntime];
+    pub const ALL: [Self; 4] = [Self::InvalidInput, Self::PublicationUnavailable, Self::GenerationMismatch,
+        Self::InvalidHelperRuntime];
     pub const fn reason(self) -> &'static str {
         match self {
             Self::InvalidInput => "invalid_generation",
             Self::PublicationUnavailable => "publication_unavailable",
             Self::GenerationMismatch => "generation_mismatch",
-            Self::NoHelperRuntimeInPolicy => "no_helper_runtime_in_policy",
             Self::InvalidHelperRuntime => "invalid_helper_runtime",
         }
     }
@@ -78,8 +152,7 @@ impl PlansFailure {
         match self {
             Self::InvalidInput => VerificationError::Invalid,
             Self::GenerationMismatch => VerificationError::BindingMismatch,
-            Self::PublicationUnavailable | Self::NoHelperRuntimeInPolicy | Self::InvalidHelperRuntime =>
-                VerificationError::Unavailable,
+            Self::PublicationUnavailable | Self::InvalidHelperRuntime => VerificationError::Unavailable,
         }
     }
 }
@@ -215,8 +288,12 @@ fn request(context: &RequestContext, name: &str, arguments: &Value) -> Result<Pr
 }
 
 impl ExecutionPlanFactory for InstalledProgramPlans {
+    /// R8n-1: only the families of the signed helper kinds, fixed at construction.
+    fn offers(&self, name: &str) -> bool { self.offered.offers(name) }
     fn supports(&self, name: &str) -> bool {
-        self.publication().is_ok_and(|publication| publication.runtimes.iter().any(|record| {
+        // A family that is not offered is never supported, whatever a later read shows.
+        HelperFamily::of_tool(name).is_some_and(|family| self.offered.contains(family))
+            && self.publication().is_ok_and(|publication| publication.runtimes.iter().any(|record| {
             let runtime = record.to_runtime();
             valid_helper(&runtime) && match name {
                 "browser_record_start" | "browser_record_stop" => valid_recording_runtime(&runtime),
@@ -366,7 +443,7 @@ mod tests {
             let mut args = json!({"query":"query"}); args[field] = json!("forged");
             assert!(helper_request(&context, "code_map", &args).is_err());
         }
-        let factory = InstalledProgramPlans { generation: Sha256Digest([1; 32]), gateway_gid: 1 };
+        let factory = InstalledProgramPlans { generation: Sha256Digest([1; 32]), gateway_gid: 1, offered: HelperFamilies::NONE };
         let result = duduclaw_execution::program_helper::ProgramResult {
             status: duduclaw_execution::program_helper::ProgramStatus::Exited,
             exit_code: Some(0), signal: None, stdout: "hello".into(), stderr: String::new(), truncated: false,
@@ -402,16 +479,115 @@ mod tests {
     #[test]
     fn program_plans_failure_reasons_are_fixed_and_total() {
         let reasons: Vec<_> = PlansFailure::ALL.iter().map(|failure| failure.reason()).collect();
+        // R8n-1: no `no_helper_runtime_in_policy`: an empty helper set is valid.
         assert_eq!(reasons, ["invalid_generation", "publication_unavailable", "generation_mismatch",
-            "no_helper_runtime_in_policy", "invalid_helper_runtime"]);
+            "invalid_helper_runtime"]);
         assert_eq!(InstalledProgramPlans::new_checked(Sha256Digest([0; 32]), 1).err(), Some(PlansFailure::InvalidInput));
         assert_eq!(InstalledProgramPlans::new_checked(Sha256Digest([1; 32]), 0).err(), Some(PlansFailure::InvalidInput));
         assert!(matches!(PlansFailure::InvalidInput.verification(), VerificationError::Invalid));
         assert!(matches!(PlansFailure::GenerationMismatch.verification(), VerificationError::BindingMismatch));
-        for failure in [PlansFailure::PublicationUnavailable, PlansFailure::NoHelperRuntimeInPolicy,
-            PlansFailure::InvalidHelperRuntime] {
+        for failure in [PlansFailure::PublicationUnavailable, PlansFailure::InvalidHelperRuntime] {
             assert!(matches!(failure.verification(), VerificationError::Unavailable));
         }
+    }
+
+    fn signed_helper(kind: &str, fixed_args: Vec<String>, network: NetworkPolicy, runtime_ms: u64) -> PublishedRuntime {
+        use duduclaw_isolation::{egress::ProfileId, ipc::QueueClass};
+        PublishedRuntime {
+            runtime: RuntimeKind::Registered(Text::new(kind.into()).unwrap()),
+            profile: ProfileId(Sha256Digest([1; 32])), executable: duduclaw_spawnd::policy::Executable::Elf {
+                entry: Text::new("helper".into()).unwrap(), digest: Sha256Digest([2; 32]) },
+            pinned_version: Text::new("test-only".into()).unwrap(),
+            fixed_args: fixed_args.into_iter().map(|v| Text::new(v).unwrap()).collect(),
+            resources: ResourceLimits { memory_bytes: 1024, cpu_quota_percent: 100, tasks: 32, open_files: 4096, ptys: 0,
+                disk: DiskQuota::LoopFilesystem { bytes: 1024, inodes: 32 }, io_read_bytes_per_sec: 1024, io_write_bytes_per_sec: 1024,
+                io_read_ops_per_sec: 10, io_write_ops_per_sec: 10, output_buffer_bytes: 4096,
+                output_total_bytes: 2 * 1024 * 1024, memfd_total_bytes: 64 * 1024 },
+            timeouts: RunTimeouts { queue_ms: 1000, startup_ms: 1000, runtime_ms, pty_idle_ms: None, termination_grace_ms: 1000 },
+            network, mcp: false, pty_allowed: false, queue_class: QueueClass::Background, turn_limit: None,
+        }
+    }
+    /// One valid signed record of each family's kind (office: `docx` create).
+    fn valid_helper_record(family: HelperFamily) -> PublishedRuntime {
+        let digests = || ["a", "b", "c"].map(|byte| byte.repeat(64));
+        match family {
+            HelperFamily::Program => signed_helper(PROGRAM_RUNTIME,
+                [vec![PROGRAM_ARGUMENT.to_owned()], digests().to_vec()].concat(), NetworkPolicy::Offline, 305_000),
+            HelperFamily::CodeMap => signed_helper(code_map_helper::RUNTIME, vec![code_map_helper::ARGUMENT.to_owned()],
+                NetworkPolicy::Offline, 65_000),
+            HelperFamily::Office => signed_helper(&office_helper::script_id("docx", "create").unwrap(),
+                vec![office_helper::ARGUMENT.to_owned(), "docx".into(), "create".into(), "a".repeat(64), "b".repeat(64)],
+                NetworkPolicy::Offline, 185_000),
+            HelperFamily::BrowserRecord => signed_helper(recording_helper::RUNTIME,
+                [vec![recording_helper::ARGUMENT.to_owned()], digests().to_vec()].concat(),
+                NetworkPolicy::Egress(duduclaw_isolation::egress::ProfileId(Sha256Digest([3; 32]))), 320_000),
+        }
+    }
+
+    /// R8n-1 1.1/1.2: zero / one / all helper kinds in the signed policy. No
+    /// helper is a valid empty set; each family is offered individually; the
+    /// recording's two tools come together; a non-helper runtime is ignored.
+    #[test]
+    fn r8n_helper_families_follow_the_signed_helper_kinds() {
+        let main = signed_helper("generic-cli-v1.qwen", vec![], NetworkPolicy::Offline, 1);
+        // Zero helpers: valid, nothing offered, every family unavailable.
+        let none = offered_families([main.clone()]).unwrap();
+        assert_eq!(none, HelperFamilies::NONE);
+        assert_eq!(offered_families(Vec::<PublishedRuntime>::new()).unwrap(), HelperFamilies::NONE);
+        assert_eq!(none.unavailable(), ["program", "office", "code_map", "browser_record"]);
+        for tool in duduclaw_mcp_boundary::fork_policy::HELPER_TOOLS { assert!(!none.offers(tool), "{tool}"); }
+        // Non-helper tools are never "not offered".
+        for tool in ["web_search", "fork_run", "inspect_branches"] { assert!(none.offers(tool), "{tool}"); }
+        // Exactly one family at a time.
+        for family in HelperFamily::ALL {
+            assert!(valid_helper(&valid_helper_record(family)), "{family:?}");
+            let one = offered_families([main.clone(), valid_helper_record(family)]).unwrap();
+            assert_eq!(one, HelperFamilies::NONE.with(family));
+            for tool in duduclaw_mcp_boundary::fork_policy::HELPER_TOOLS {
+                assert_eq!(one.offers(tool), family.tools().contains(&tool), "{family:?} {tool}");
+            }
+            assert_eq!(one.unavailable().len(), 3);
+            assert!(!one.unavailable().contains(&family.name()));
+            assert_eq!(HelperFamilies::from_offers(|tool| one.offers(tool)), one);
+        }
+        // All kinds: everything offered.
+        let all = offered_families(HelperFamily::ALL.map(valid_helper_record)).unwrap();
+        assert!(all.unavailable().is_empty());
+        for tool in duduclaw_mcp_boundary::fork_policy::HELPER_TOOLS { assert!(all.offers(tool), "{tool}"); }
+        // The families cover exactly the five helper tools, each once.
+        let tools: Vec<_> = HelperFamily::ALL.iter().flat_map(|family| family.tools().iter().copied()).collect();
+        assert_eq!(tools, duduclaw_mcp_boundary::fork_policy::HELPER_TOOLS);
+        for tool in tools { assert!(HelperFamily::of_tool(tool).is_some()); }
+        assert_eq!(HelperFamily::of_tool("browser_record_stop"), Some(HelperFamily::BrowserRecord));
+    }
+
+    /// R8n-1 1.1: a signed helper record that fails its fixed protocol is a
+    /// broken policy: the whole set fails with `invalid_helper_runtime`,
+    /// whatever valid records accompany it.
+    #[test]
+    fn r8n_invalid_signed_helper_still_fails_closed() {
+        for family in HelperFamily::ALL {
+            let mut broken = valid_helper_record(family);
+            broken.mcp = true;
+            assert!(!valid_helper(&broken));
+            assert_eq!(offered_families([broken.clone()]), Err(PlansFailure::InvalidHelperRuntime), "{family:?}");
+            let mut mixed: Vec<_> = HelperFamily::ALL.map(valid_helper_record).into();
+            mixed.push(broken);
+            assert_eq!(offered_families(mixed), Err(PlansFailure::InvalidHelperRuntime), "{family:?}");
+        }
+        assert_eq!(PlansFailure::InvalidHelperRuntime.reason(), "invalid_helper_runtime");
+    }
+
+    /// R8n-1: a plan set never supports a family it does not offer.
+    #[test]
+    fn r8n_plans_offer_and_support_only_offered_families() {
+        let none = InstalledProgramPlans { generation: Sha256Digest([1; 32]), gateway_gid: 1, offered: HelperFamilies::NONE };
+        for tool in duduclaw_mcp_boundary::fork_policy::HELPER_TOOLS {
+            assert!(!none.offers(tool) && !none.supports(tool), "{tool}");
+        }
+        let program = InstalledProgramPlans { offered: HelperFamilies::NONE.with(HelperFamily::Program), ..none };
+        assert!(program.offers("execute_program") && !program.offers("code_map"));
+        assert_eq!(program.offered(), HelperFamilies::NONE.with(HelperFamily::Program));
     }
 
     #[test]
@@ -492,7 +668,7 @@ mod recording_tests {
             let mut args = json!({"url":"https://example.com", "headless":true}); args[field] = json!("forged");
             assert!(helper_request(&context(), "browser_record_start", &args).is_err());
         }
-        let factory = InstalledProgramPlans { generation: Sha256Digest([1; 32]), gateway_gid: 1 };
+        let factory = InstalledProgramPlans { generation: Sha256Digest([1; 32]), gateway_gid: 1, offered: HelperFamilies::NONE };
         // HX6: the stop is `HelperStop` from the bridge, not a child-run stdin write.
         assert!(!factory.cooperative_stop("browser_record_start"));
         for name in ["fork_run", "merge_or_select", "terminate_branch"] { assert!(!factory.supports(name)); }
@@ -502,7 +678,7 @@ mod recording_tests {
     /// flush (`RunEnded`) is accepted for the recording only.
     #[test]
     fn hx6_recording_helper_result_decoder_accepts_flush_at_run_end_only_for_recording() {
-        let factory = InstalledProgramPlans { generation: Sha256Digest([1; 32]), gateway_gid: 1 };
+        let factory = InstalledProgramPlans { generation: Sha256Digest([1; 32]), gateway_gid: 1, offered: HelperFamilies::NONE };
         let artifacts = ["trace.zip", "actions.json", "network.json"].map(|name| json!({"name":name,"bytes":1,"sha256":"a".repeat(64)}));
         let bytes = serde_json::to_vec(&json!({"id":"ab".repeat(16),"status":"recorded","reason":"stop","actions":0,
             "artifacts":artifacts,"navigation":"completed"})).unwrap();

@@ -452,7 +452,7 @@ async fn employee_tool_parity(home: &std::path::Path) {
     duduclaw_gateway::isolation_skill_jobs::install_recording_source(
         duduclaw_mcp_boundary::recording_jobs::SqliteRecordingJobs::open(&home.join("isolation-execution-jobs.db")).unwrap())
         .unwrap();
-    let (dispatcher, context) = fixture(home);
+    let (mut dispatcher, context) = fixture(home);
     assert_eq!(crate::mcp_namespace::verified_employee_from_env(home).as_deref(), Some("main"));
     dispatcher.require_complete_services().unwrap();
     dispatcher.require_context_services(&context).unwrap();
@@ -580,6 +580,96 @@ async fn employee_tool_parity(home: &std::path::Path) {
             }
         }
     }
+    helper_family_subsets_list_and_call_alike(&mut dispatcher, &context, home).await;
+}
+
+/// R8n-1: a plan set that offers the `offered` helper families and has a
+/// producer for the `supported` ones (`ListingPlans` for every other tool).
+/// Nothing is ever authorized or prepared.
+struct SubsetPlans {
+    offered: duduclaw_gateway::isolation_execution::HelperFamilies,
+    supported: duduclaw_gateway::isolation_execution::HelperFamilies,
+}
+impl ExecutionPlanFactory for SubsetPlans {
+    fn offers(&self, tool: &str) -> bool { self.offered.offers(tool) }
+    fn supports(&self, tool: &str) -> bool {
+        self.supported.offers(tool) && ExecutionPlanFactory::supports(&ListingPlans, tool)
+    }
+    fn authorize_handler<'a>(&'a self, _: &'a AuthorizedToolCall) -> PolicyFuture<'a, ()> {
+        Box::pin(async { Err(VerificationError::Unavailable) })
+    }
+    fn prepare<'a>(&'a self, _: &'a AuthorizedToolCall, _: RunHandle) -> PolicyFuture<'a, AuthorizedExecutionPlan> {
+        Box::pin(async { Err(VerificationError::Unavailable) })
+    }
+}
+
+fn helper_subset(mask: u8) -> duduclaw_gateway::isolation_execution::HelperFamilies {
+    use duduclaw_gateway::isolation_execution::{HelperFamilies, HelperFamily};
+    HelperFamily::ALL.iter().enumerate().filter(|(index, _)| mask & (1 << index) != 0)
+        .fold(HelperFamilies::NONE, |set, (_, family)| set.with(*family))
+}
+
+/// R8n-1 1.3/1.4, table-driven over every subset of the four helper families
+/// on the production listing/dispatch path: the listed helper tools are
+/// exactly the offered ones the employee could list anyway; every listed one
+/// passes the isolation gate; every unavailable one is hidden, marked
+/// `NotProvidedOnHost` in the manifest and refused with the one fixed code;
+/// the boot producer check needs producers for exactly the offered families.
+async fn helper_family_subsets_list_and_call_alike(dispatcher: &mut IsolationDispatcher, context: &RequestContext,
+    home: &std::path::Path) {
+    use crate::mcp_isolation_disposition::{Refusal, TOOL_NOT_PROVIDED, TOOL_NOT_PROVIDED_CODE};
+    use duduclaw_gateway::isolation_mcp::DispatcherFactory;
+    use duduclaw_mcp_boundary::fork_policy::HELPER_TOOLS;
+    std::fs::write(home.join("agents/main/agent.toml"), employee_config("")).unwrap();
+    let list = json!({"jsonrpc":"2.0", "id":1, "method":"tools/list"});
+    let helpers = |names: BTreeSet<String>| names.into_iter().filter(|name| HELPER_TOOLS.contains(&name.as_str()))
+        .collect::<BTreeSet<_>>();
+    // The fixture's plans offer every family: the employee's own helper list.
+    let baseline = helpers(names(&dispatcher.dispatch(context.clone(), "main", list.clone()).await.unwrap().unwrap()));
+    assert!(baseline.contains("execute_program") && baseline.contains("code_map"), "{baseline:?}");
+    let resolver = dispatcher.record_resolver.clone().unwrap();
+    let all = helper_subset(0b1111);
+    for mask in 0u8..16 {
+        let offered = helper_subset(mask);
+        let factories = GatewayFactories::assemble(Some(Arc::new(ListingBackend)),
+            Some(Arc::new(SubsetPlans { offered, supported: offered })), resolver.clone(), None, dispatcher.roots.clone())
+            .unwrap().with_recording_jobs(duduclaw_mcp_boundary::recording_jobs::SqliteRecordingJobs::open(
+                &home.join("isolation-execution-jobs.db")).unwrap());
+        dispatcher.execution = factories.execution;
+        dispatcher.require_complete_services().unwrap();
+        let listed = helpers(names(&dispatcher.dispatch(context.clone(), "main", list.clone()).await.unwrap().unwrap()));
+        let expected: BTreeSet<String> = baseline.iter().filter(|tool| offered.offers(tool)).cloned().collect();
+        assert_eq!(listed, expected, "subset {mask:04b}");
+        let manifest = dispatcher.service_manifest();
+        for tool in HELPER_TOOLS {
+            let state = manifest.iter().find(|(name, _)| *name == tool).unwrap().1;
+            let response = dispatcher.dispatch(context.clone(), "main", json!({"jsonrpc":"2.0", "id":2,
+                "method":"tools/call", "params":{"name":tool, "arguments":{}}})).await.unwrap().unwrap();
+            if offered.offers(tool) {
+                assert_eq!(state, ServiceState::Ready, "{tool} {mask:04b}");
+                assert!(!response.to_string().contains(TOOL_NOT_PROVIDED_CODE), "{tool} {mask:04b}: {response}");
+                if listed.contains(tool) {
+                    // Listed ⇒ the same predicate admits the call past the isolation gate.
+                    assert_ne!(response["error"]["message"], "隔離執行不允許此工具或參數，或所需服務尚未就緒。",
+                        "{tool} {mask:04b}: {response}");
+                }
+            } else {
+                assert_eq!(state, ServiceState::IntentionalRefusal(Refusal::NotProvidedOnHost), "{tool} {mask:04b}");
+                assert!(!listed.contains(tool));
+                assert_eq!(response["error"]["code"], -32003, "{tool} {mask:04b}: {response}");
+                assert_eq!(response["error"]["message"], TOOL_NOT_PROVIDED, "{tool} {mask:04b}: {response}");
+            }
+        }
+        // Producers for exactly the offered families: satisfied by this subset,
+        // refused when every family is offered but only this subset has one.
+        let factory = crate::mcp_isolation_boot::CliDispatcherFactory;
+        assert!(factory.verify_producers(&SubsetPlans { offered, supported: offered }, &ListingPlans,
+            &ListingConnectors, &ListingSelection).is_ok(), "subset {mask:04b}");
+        assert_eq!(factory.verify_producers(&SubsetPlans { offered: all, supported: offered }, &ListingPlans,
+            &ListingConnectors, &ListingSelection).is_ok(), mask == 0b1111, "subset {mask:04b}");
+    }
+    assert!(TOOL_NOT_PROVIDED.starts_with(TOOL_NOT_PROVIDED_CODE));
+    assert_eq!(Refusal::NotProvidedOnHost.message(), TOOL_NOT_PROVIDED);
 }
 
 #[tokio::test]

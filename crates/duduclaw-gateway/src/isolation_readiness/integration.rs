@@ -15,7 +15,19 @@ pub enum IntegrationComponent { ParseWorker, McpBoundary, RuntimeAdapters, PtyTr
 pub enum PtyRequirement { Required, NotRequired }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProbeError { Unavailable, AlreadyInstalled }
+pub enum ProbeError {
+    Unavailable,
+    AlreadyInstalled,
+    /// R8n-1: not ready for one fixed reason from the component's reason
+    /// table (`published::PARSE_WORKER_REASONS` / `RUNTIME_ADAPTER_REASONS`),
+    /// published as `component(reason)`. Never a path or an OS error text.
+    Refused(&'static str),
+}
+impl ProbeError {
+    pub fn reason(self) -> Option<&'static str> {
+        match self { Self::Refused(reason) => Some(reason), Self::Unavailable | Self::AlreadyInstalled => None }
+    }
+}
 
 /// The timestamp is captured BEFORE authenticated service readback, never when
 /// a cached result is returned. This type has no wire or configuration decoder.
@@ -116,12 +128,17 @@ impl Probes {
             Some(observation(self.pty.get(), generation, Instant::now))
         } else { None };
         let finished = Instant::now();
+        let (worker_reason, runtime_reason) = (worker.reason, runtime.reason);
         // A later probe may consume the lifetime of an earlier observation.
         // Validate every required source against the same final clock reading.
+        let parse_worker = final_state(worker, started, finished);
+        let runtime_adapters = runtime_state(runtime, pty, started, finished);
+        let reason = |state: ComponentState, reason: Option<&'static str>|
+            reason.filter(|_| state == ComponentState::Unavailable);
         States {
-            parse_worker: final_state(worker, started, finished),
-            mcp_boundary: final_state(mcp, started, finished),
-            runtime_adapters: runtime_state(runtime, pty, started, finished),
+            parse_worker, mcp_boundary: final_state(mcp, started, finished), runtime_adapters,
+            parse_worker_reason: reason(parse_worker, worker_reason),
+            runtime_adapters_reason: reason(runtime_adapters, runtime_reason),
         }
     }
 }
@@ -140,6 +157,10 @@ pub(super) struct States {
     pub parse_worker: ComponentState,
     pub mcp_boundary: ComponentState,
     pub runtime_adapters: ComponentState,
+    /// R8n-1: the fixed reason of a refused ParseWorker / RuntimeAdapters
+    /// probe (`ProbeError::Refused`), only while that component is unavailable.
+    pub parse_worker_reason: Option<&'static str>,
+    pub runtime_adapters_reason: Option<&'static str>,
 }
 impl States {
     pub(super) fn invalidate(&mut self) {
@@ -150,15 +171,29 @@ impl States {
 }
 pub(super) fn current(generation: Option<Sha256Digest>) -> States { PROBES.current(generation) }
 
+/// The states a fresh registry holding exactly `probes` reports (tests of the
+/// composite admission over faked probes; production uses [`PROBES`]).
+#[cfg(test)]
+pub(super) fn states_with(probes: Vec<(IntegrationComponent, Arc<dyn IntegrationProbe>)>,
+    generation: Option<Sha256Digest>) -> States {
+    let registry = Probes::default();
+    for (component, probe) in probes { registry.install(component, probe).expect("one probe per component"); }
+    registry.current(generation)
+}
+
 struct Observation {
     state: ComponentState,
     observed_at: Option<Instant>,
     pty: Option<PtyRequirement>,
+    /// R8n-1: the probe's fixed refusal reason, if it gave one.
+    reason: Option<&'static str>,
 }
 impl Observation {
-    fn absent(state: ComponentState) -> Self { Self { state, observed_at: None, pty: None } }
+    fn absent(state: ComponentState) -> Self { Self { state, observed_at: None, pty: None, reason: None } }
+    fn refused(error: ProbeError) -> Self { Self { reason: error.reason(), ..Self::absent(ComponentState::Unavailable) } }
 }
 
+/// No probe ⇒ `PendingIntegration`, never ready; any error ⇒ `Unavailable`.
 fn observation(probe: Option<&Arc<dyn IntegrationProbe>>, generation: Option<Sha256Digest>, now: impl Fn() -> Instant)
     -> Observation {
     let unavailable = Observation::absent(ComponentState::Unavailable);
@@ -167,14 +202,17 @@ fn observation(probe: Option<&Arc<dyn IntegrationProbe>>, generation: Option<Sha
         return unavailable;
     };
     let started = now();
-    if probe.verify_producers().is_err() { return unavailable; }
-    let Ok(observation) = probe.verify_service(generation) else { return unavailable; };
+    if let Err(error) = probe.verify_producers() { return Observation::refused(error); }
+    let observation = match probe.verify_service(generation) {
+        Ok(observation) => observation,
+        Err(error) => return Observation::refused(error),
+    };
     let finished = now();
     if observation.generation != generation
         || !fresh(started, finished) || !fresh(observation.observed_at, finished) {
         return unavailable;
     }
-    Observation { state: ComponentState::Ready, observed_at: Some(observation.observed_at), pty: observation.pty }
+    Observation { state: ComponentState::Ready, observed_at: Some(observation.observed_at), pty: observation.pty, reason: None }
 }
 
 fn fresh(observed: Instant, now: Instant) -> bool {
@@ -288,7 +326,7 @@ mod tests {
     #[test]
     fn integration_later_probe_cannot_keep_an_earlier_observation_alive() {
         let now = Instant::now();
-        let observation = || Observation { state: ComponentState::Ready, observed_at: Some(now), pty: None };
+        let observation = || Observation { state: ComponentState::Ready, observed_at: Some(now), pty: None, reason: None };
         let started = now + Duration::from_millis(1900);
         assert_eq!(final_state(observation(), started, now + Duration::from_secs(2)), ComponentState::Ready);
         assert_eq!(final_state(observation(), started, now + Duration::from_millis(2001)), ComponentState::Unavailable);
@@ -308,6 +346,45 @@ mod tests {
         assert_eq!(states.parse_worker, ComponentState::PendingIntegration);
         assert_eq!(states.mcp_boundary, ComponentState::Unavailable);
         assert_eq!(states.runtime_adapters, ComponentState::PendingIntegration);
+    }
+
+    /// R8n-1: a probe's fixed refusal reason reaches the component state only
+    /// while it is unavailable; no probe stays pending without a reason.
+    #[test]
+    fn integration_refusal_reasons_are_reported_for_unavailable_components_only() {
+        struct Refusing(&'static str, bool);
+        impl IntegrationProbe for Refusing {
+            fn verify_producers(&self) -> Result<(), ProbeError> {
+                if self.1 { Err(ProbeError::Refused(self.0)) } else { Ok(()) }
+            }
+            fn verify_service(&self, _: Sha256Digest) -> Result<ServiceObservation, ProbeError> {
+                Err(ProbeError::Refused(self.0))
+            }
+        }
+        fn refusing(reason: &'static str, producers: bool) -> Arc<dyn IntegrationProbe> { Arc::new(Refusing(reason, producers)) }
+        fn good(generation: Sha256Digest) -> Arc<dyn IntegrationProbe> { probe(generation, Instant::now()) }
+        let generation = Sha256Digest([1; 32]);
+        let states = states_with(vec![], Some(generation));
+        assert_eq!((states.parse_worker, states.parse_worker_reason), (ComponentState::PendingIntegration, None));
+        assert_eq!((states.runtime_adapters, states.runtime_adapters_reason), (ComponentState::PendingIntegration, None));
+        for producers in [true, false] {
+            let states = states_with(vec![
+                (IntegrationComponent::ParseWorker, refusing("socket_unavailable", producers)),
+                (IntegrationComponent::RuntimeAdapters, refusing("no_main_runtime", producers))], Some(generation));
+            assert_eq!((states.parse_worker, states.parse_worker_reason),
+                (ComponentState::Unavailable, Some("socket_unavailable")));
+            assert_eq!((states.runtime_adapters, states.runtime_adapters_reason),
+                (ComponentState::Unavailable, Some("no_main_runtime")));
+        }
+        // A generic failure and a ready probe carry no reason.
+        let states = states_with(vec![(IntegrationComponent::ParseWorker, good(generation)),
+            (IntegrationComponent::RuntimeAdapters, refusing("no_main_runtime", false))], None);
+        assert_eq!((states.parse_worker, states.parse_worker_reason), (ComponentState::Unavailable, None));
+        assert_eq!(states.runtime_adapters_reason, None);
+        let states = states_with(vec![(IntegrationComponent::ParseWorker, good(generation))], Some(generation));
+        assert_eq!((states.parse_worker, states.parse_worker_reason), (ComponentState::Ready, None));
+        assert_eq!(ProbeError::Unavailable.reason(), None);
+        assert_eq!(ProbeError::Refused("x").reason(), Some("x"));
     }
 
     #[test]
@@ -350,9 +427,9 @@ mod tests {
     fn integration_pty_observation_cannot_outlive_earlier_runtime_proof() {
         let now = Instant::now();
         let runtime = Observation { state: ComponentState::Ready, observed_at: Some(now),
-            pty: Some(PtyRequirement::Required) };
+            pty: Some(PtyRequirement::Required), reason: None };
         let pty = Observation { state: ComponentState::Ready,
-            observed_at: Some(now + Duration::from_millis(1900)), pty: None };
+            observed_at: Some(now + Duration::from_millis(1900)), pty: None, reason: None };
         assert_eq!(runtime_state(runtime, Some(pty), now + Duration::from_millis(1900),
             now + Duration::from_millis(2001)), ComponentState::Unavailable);
     }

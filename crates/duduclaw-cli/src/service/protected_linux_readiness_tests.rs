@@ -784,17 +784,32 @@ fn service_protected_readiness_final_sentence_follows_the_gateway_view() {
         DuDuClawError::Config(text) => text,
         other => panic!("{other:?}"),
     };
-    // Ready: the existing sentence (or the migration-pending one), exit 0.
-    let (lines, result) = gateway_verdict(false, GatewayView::Ready);
-    assert_eq!((lines, result.is_ok()), (vec![MSG_READY.to_owned()], true));
-    let (lines, result) = gateway_verdict(true, GatewayView::Ready);
-    assert_eq!((lines, result.is_ok()), (vec![Reason::MIGRATION_PENDING_MESSAGE.to_owned()], true));
     // Not ready: the components and missing producers, then a refusal.
     let view = View { schema: 1, boot_id: "0123abcd-4567-89ef-0123-456789abcdef".into(), written_unix: 1, ready: false,
         components: COMPONENTS.iter().map(|name| ComponentView { name: (*name).into(),
             state: if *name == "mcp_boundary" { "pending".into() } else { "ready".into() },
             reason: (*name == "mcp_boundary").then(|| "pending_integration".into()) }).collect(),
-        assembly_missing: vec!["connector_providers".into()] };
+        assembly_missing: vec!["connector_providers".into()], tools_unavailable: vec![] };
+    let mut ready_view = view.clone();
+    for component in &mut ready_view.components { component.state = "ready".into(); component.reason = None; }
+    ready_view.assembly_missing.clear();
+    ready_view.ready = true;
+    // Ready: the existing sentence (or the migration-pending one), exit 0.
+    let (lines, result) = gateway_verdict(false, GatewayView::Ready(ready_view.clone()));
+    assert_eq!((lines, result.is_ok()), (vec![MSG_READY.to_owned()], true));
+    let (lines, result) = gateway_verdict(true, GatewayView::Ready(ready_view.clone()));
+    assert_eq!((lines, result.is_ok()), (vec![Reason::MIGRATION_PENDING_MESSAGE.to_owned()], true));
+    // R8n-1: unavailable helper tool families are one `[資訊]` line first,
+    // and never change the exit result (ready or not).
+    let tools = "[資訊] 此主機的隔離模式未提供這些工具類別，隔離員工不會看到也無法呼叫：office、code_map。";
+    ready_view.tools_unavailable = vec!["office".into(), "code_map".into()];
+    let (lines, result) = gateway_verdict(false, GatewayView::Ready(ready_view));
+    assert_eq!((lines, result.is_ok()), (vec![tools.to_owned(), MSG_READY.to_owned()], true));
+    let mut without_tools = view.clone();
+    without_tools.tools_unavailable = vec!["office".into(), "code_map".into()];
+    let (lines, result) = gateway_verdict(false, GatewayView::NotReady(without_tools));
+    assert_eq!(lines.first().map(String::as_str), Some(tools));
+    assert!(message(result).ends_with(MSG_GATEWAY_NOT_READY));
     for pending in [false, true] {
         let (lines, result) = gateway_verdict(pending, GatewayView::NotReady(view.clone()));
         assert_eq!(lines, ["[資訊] 平台檢查均已通過。Gateway 回報尚未就緒：mcp_boundary(pending_integration)；啟動組裝尚缺：connector_providers。"]);

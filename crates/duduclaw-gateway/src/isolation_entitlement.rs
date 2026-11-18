@@ -76,8 +76,9 @@ pub(crate) fn in_run_helper_kind(runtime: &RuntimeKind) -> bool {
     }
 }
 
-/// Every helper kind (rule 3).
-fn helper_kind(runtime: &RuntimeKind) -> bool {
+/// Every helper kind (rule 3). R8n-1: every other signed runtime is a main
+/// runtime (the readiness probe's "main runtime kinds").
+pub(crate) fn helper_kind(runtime: &RuntimeKind) -> bool {
     in_run_helper_kind(runtime)
         || matches!(runtime, RuntimeKind::Registered(name) if name.as_str() == duduclaw_execution::fork_helper::RUNTIME)
 }
@@ -205,5 +206,22 @@ pub(crate) mod tests {
         assert!(in_run_helper_kind(&registered(duduclaw_execution::recording_helper::RUNTIME)));
         assert!(!in_run_helper_kind(&registered(duduclaw_execution::fork_helper::RUNTIME)));
         assert!(!in_run_helper_kind(&RuntimeKind::Claude));
+    }
+
+    /// R8n-1 1.5: a signed policy with zero helper kinds (the isolated layout
+    /// without client-registered helpers) yields exactly the main profile(s),
+    /// primary and fallback, and never fails because helpers are absent.
+    #[test]
+    fn r8n_zero_helpers_yield_exactly_the_main_profiles() {
+        let mains = vec![signed(1, RuntimeKind::Claude), signed(2, RuntimeKind::Codex), signed(3, registered("generic-cli-v1.qwen"))];
+        assert!(mains.iter().all(|runtime| !helper_kind(&runtime.runtime)));
+        for (provider, fallback, expected) in [(None, None, vec![1u8]), (Some("codex"), Some("claude"), vec![2, 1]),
+            (Some("qwen"), Some("codex"), vec![3, 2]), (Some("claude"), Some("grok"), vec![1])] {
+            let desired = desired(&mains, &settings(provider, fallback)).unwrap();
+            assert_eq!(desired.entitlement.profiles, profiles(&expected), "{provider:?} {fallback:?}");
+            assert_eq!(desired.entitlement.max_turns, None);
+        }
+        // The primary still has to be signed: absent helpers never mask that.
+        assert!(matches!(desired(&mains, &settings(Some("grok"), None)), Err(DesiredError::RuntimeNotInIsolation { .. })));
     }
 }

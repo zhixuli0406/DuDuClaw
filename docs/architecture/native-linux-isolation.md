@@ -8674,6 +8674,39 @@ from the 22-tool inventory. Other composite fields and admission requirements
 are unchanged; this hook is not root/provider/native acceptance and does not
 make a partially assembled installation executable.
 
+**R8n-1 (supersedes "all five" above).** The four helper tool families —
+`program` (`execute_program`), `office` (`office_script`, per signed office
+kind), `code_map` and `browser_record` (`browser_record_start` + `_stop`,
+both or neither) — are individually available: a family is offered only when
+the signed policy carries a valid helper runtime of its kind
+(`InstalledProgramPlans`; no helper runtime at all is a valid empty set, a
+signed helper that fails its fixed protocol still refuses with
+`invalid_helper_runtime`). The set is fixed for the life of the assembled
+service (the owner is set once; `tools.listChanged` stays `false`). An
+unavailable family is neither listed nor callable for isolated employees:
+tools/list and tools/call share `mcp_isolation::tool_allowed`, which consults
+the same disposition as the static host-authority refusals, and a call is
+refused with the fixed `ISOLATION_TOOL_NOT_PROVIDED: 此主機的隔離模式未提供這項工具。`
+(JSON-RPC `-32003`). Producers (`DispatcherFactory::verify_producers`,
+`a_producers_ready`) are required for exactly the offered families; the
+published readiness view and `system.status` list the others under
+`tools_unavailable` (an `[資訊]` line in `duduclaw service readiness
+--protected-linux`, never an exit-code change). Boot installs two more
+integration probes beside `BoundaryReadiness`: **ParseWorker** attests the
+assembled owner, the retirement-aware launcher installed with isolation
+required, and the fixed parse socket (`/run/duduclaw-parse/parse.sock`:
+root-owned, group-usable by the gateway, under a root-owned directory, found
+LISTENING in `/proc/net/unix` — never connected to, since the socket is
+`Accept=yes` and a connection would start a worker outside the retirement
+lease) plus the root-created retirement lease; **RuntimeAdapters** attests the
+offered helper producers and fork readers, and that the fresh publication of
+the booted generation parses, signs at least one main runtime, and that every
+main runtime is a kind the gateway launches and resolves in the installed
+runtime registry, with the PTY requirement taken from the same publication.
+Both cache one readback for one second (pre-readback timestamp) and refuse
+with a fixed reason shown as `parse_worker(<reason>)` /
+`runtime_adapters(<reason>)` in the root CLI's view.
+
 User/operator messages follow `[general] default_language` (unknown/missing
 language uses zh-TW):
 

@@ -19,7 +19,8 @@ const ROOT: &str = "/run";
 pub(super) enum GatewayView {
     /// Missing, unsafe, oversized, malformed, other boot or stale.
     Unavailable,
-    Ready,
+    /// Ready; the view still names the helper tool families not offered.
+    Ready(View),
     NotReady(View),
 }
 
@@ -27,10 +28,19 @@ impl GatewayView {
     fn of(view: Option<View>) -> Self {
         match view {
             None => Self::Unavailable,
-            Some(view) if view.ready => Self::Ready,
+            Some(view) if view.ready => Self::Ready(view),
             Some(view) => Self::NotReady(view),
         }
     }
+}
+
+/// R8n-1: the `[資訊]` line naming the helper tool families this host does
+/// not offer to isolated employees (fixed names validated by
+/// `published::parse`); `None` when every family is offered. Informational:
+/// it never changes the result.
+pub(super) fn tools_unavailable_line(view: &View) -> Option<String> {
+    (!view.tools_unavailable.is_empty()).then(|| format!(
+        "[資訊] 此主機的隔離模式未提供這些工具類別，隔離員工不會看到也無法呼叫：{}。", view.tools_unavailable.join("、")))
 }
 
 /// The installed gateway's view: account `duduclaw`, this boot, now.
@@ -123,7 +133,43 @@ mod tests {
         }).collect();
         let missing: Vec<&str> = if ready { Vec::new() } else { vec!["connector_providers"] };
         serde_json::json!({"schema": 1, "boot_id": BOOT, "written_unix": NOW, "ready": ready,
-            "components": components, "assembly_missing": missing})
+            "components": components, "assembly_missing": missing, "tools_unavailable": []})
+    }
+    fn is_ready(view: GatewayView) -> bool { matches!(view, GatewayView::Ready(_)) }
+
+    /// R8n-1 1.6: the gateway's `tools_unavailable` (and a probe reason) are
+    /// accepted and printed as `[資訊]` lines; a document without the field
+    /// or with an unknown family reads as unavailable.
+    #[test]
+    fn gateway_view_accepts_and_prints_unavailable_tool_families() {
+        let dir = directory();
+        let mut value = document(true);
+        value["tools_unavailable"] = serde_json::json!(["program", "browser_record"]);
+        write(dir.path(), value.to_string().as_bytes());
+        let GatewayView::Ready(view) = GatewayView::of(read_view(dir.path(), me(), me(), BOOT, NOW + 5)) else {
+            panic!("ready expected");
+        };
+        assert_eq!(tools_unavailable_line(&view).unwrap(),
+            "[資訊] 此主機的隔離模式未提供這些工具類別，隔離員工不會看到也無法呼叫：program、browser_record。");
+        let mut value = document(false);
+        value["components"][4] = serde_json::json!({"name": "parse_worker", "state": "not_ready", "reason": "socket_not_listening"});
+        write(dir.path(), value.to_string().as_bytes());
+        let GatewayView::NotReady(view) = GatewayView::of(read_view(dir.path(), me(), me(), BOOT, NOW + 5)) else {
+            panic!("not ready expected");
+        };
+        assert!(tools_unavailable_line(&view).is_none());
+        assert_eq!(not_ready_line(&view), "[資訊] 平台檢查均已通過。Gateway 回報尚未就緒：parse_worker(socket_not_listening)、\
+            mcp_boundary(pending_integration)；啟動組裝尚缺：connector_providers。");
+        for bad in [serde_json::json!(["shell"]), serde_json::json!(["office", "office"])] {
+            let mut value = document(true);
+            value["tools_unavailable"] = bad;
+            write(dir.path(), value.to_string().as_bytes());
+            assert_eq!(GatewayView::of(read_view(dir.path(), me(), me(), BOOT, NOW)), GatewayView::Unavailable);
+        }
+        let mut value = document(true);
+        value.as_object_mut().unwrap().remove("tools_unavailable");
+        write(dir.path(), value.to_string().as_bytes());
+        assert_eq!(GatewayView::of(read_view(dir.path(), me(), me(), BOOT, NOW)), GatewayView::Unavailable);
     }
     fn me() -> u32 { unsafe { libc::geteuid() } }
     fn directory() -> tempfile::TempDir {
@@ -141,7 +187,7 @@ mod tests {
     fn gateway_view_accepts_a_fresh_document_of_this_boot() {
         let dir = directory();
         write(dir.path(), document(true).to_string().as_bytes());
-        assert_eq!(GatewayView::of(read_view(dir.path(), me(), me(), BOOT, NOW + 5)), GatewayView::Ready);
+        assert!(is_ready(GatewayView::of(read_view(dir.path(), me(), me(), BOOT, NOW + 5))));
         write(dir.path(), document(false).to_string().as_bytes());
         let GatewayView::NotReady(view) = GatewayView::of(read_view(dir.path(), me(), me(), BOOT, NOW + 5)) else {
             panic!("not ready expected");
@@ -229,7 +275,7 @@ mod tests {
         std::fs::create_dir(&path).unwrap();
         write(root.path(), document(true).to_string().as_bytes());
         assert_eq!(read_bounded_at(&pinned, me()).unwrap(), original);
-        assert_eq!(GatewayView::of(read_view(root.path(), me(), me(), BOOT, NOW)), GatewayView::Ready);
+        assert!(is_ready(GatewayView::of(read_view(root.path(), me(), me(), BOOT, NOW))));
     }
 
     #[test]

@@ -22,6 +22,12 @@ impl DispatcherFactory for CliDispatcherFactory {
         use crate::mcp_isolation::BoundaryRoute;
         for tool in crate::mcp::tools() {
             if crate::mcp_isolation_disposition::intentional_refusal(tool.name).is_some() { continue; }
+            // R8n-1 1.4: a helper family this host does not offer is refused
+            // (`Refusal::NotProvidedOnHost`), so it needs no producer; an
+            // offered one still needs `execution.supports` below.
+            if duduclaw_mcp_boundary::fork_policy::HELPER_TOOLS.contains(&tool.name) && !execution.offers(tool.name) {
+                continue;
+            }
             let ready = match crate::mcp_isolation::boundary_route(tool.name) {
                 Some(BoundaryRoute::File) => true,
                 Some(BoundaryRoute::GatewayHandler(_)) => true,

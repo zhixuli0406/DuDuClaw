@@ -495,9 +495,9 @@ mod tests {
     fn boot_missing_list_shows_fixed_reasons() {
         let missing = [MissingProducer::Backend, MissingProducer::ExecutionPlans, MissingProducer::ConnectorProviders];
         let reasons = [(MissingProducer::ConnectorProviders, "catalog_home_unsafe"),
-            (MissingProducer::ExecutionPlans, "no_helper_runtime_in_policy"), (MissingProducer::MainPlans, "unused")];
+            (MissingProducer::ExecutionPlans, "invalid_helper_runtime"), (MissingProducer::MainPlans, "unused")];
         assert_eq!(Listed(&missing, &reasons).to_string(),
-            "[Backend, ExecutionPlans(no_helper_runtime_in_policy), ConnectorProviders(catalog_home_unsafe)]");
+            "[Backend, ExecutionPlans(invalid_helper_runtime), ConnectorProviders(catalog_home_unsafe)]");
         assert_eq!(Listed(&missing, &[]).to_string(), "[Backend, ExecutionPlans, ConnectorProviders]");
     }
 

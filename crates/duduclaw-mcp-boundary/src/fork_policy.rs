@@ -16,10 +16,13 @@ pub fn message(language: Option<&str>) -> &'static str {
 }
 
 /// Source inventory readiness is separate from native/provider acceptance.
-/// Missing signed helpers or read services must still block A readiness.
-pub fn remaining_producers_ready(mut helper: impl FnMut(&str) -> bool,
+/// R8n-1: a helper tool is required only when this host `offered` it (its
+/// family is in the signed policy); an offered helper without its producer
+/// and a missing read service still block A readiness. With no helper
+/// offered, only the read services remain.
+pub fn remaining_producers_ready(mut offered: impl FnMut(&str) -> bool, mut helper: impl FnMut(&str) -> bool,
     mut reader: impl FnMut(&str) -> bool) -> bool {
-    HELPER_TOOLS.into_iter().all(&mut helper) && READ_TOOLS.into_iter().all(&mut reader)
+    HELPER_TOOLS.into_iter().all(|name| !offered(name) || helper(name)) && READ_TOOLS.into_iter().all(&mut reader)
 }
 
 #[cfg(test)]
@@ -34,12 +37,29 @@ mod tests {
     }
     #[test]
     fn remaining_readiness_requires_every_real_service_but_no_deferred_producer() {
-        assert!(remaining_producers_ready(|name| HELPER_TOOLS.contains(&name), |name| READ_TOOLS.contains(&name)));
+        let all = |_: &str| true;
+        assert!(remaining_producers_ready(all, |name| HELPER_TOOLS.contains(&name), |name| READ_TOOLS.contains(&name)));
         for missing in HELPER_TOOLS.into_iter().chain(READ_TOOLS) {
-            assert!(!remaining_producers_ready(|name| name != missing, |name| name != missing), "{missing}");
+            assert!(!remaining_producers_ready(all, |name| name != missing, |name| name != missing), "{missing}");
         }
-        assert!(!remaining_producers_ready(|_| false, |_| true));
-        assert!(!remaining_producers_ready(|_| true, |_| false));
+        assert!(!remaining_producers_ready(all, |_| false, |_| true));
+        assert!(!remaining_producers_ready(all, |_| true, |_| false));
+    }
+
+    /// R8n-1: only offered helpers need a producer; the read services are
+    /// always required, whatever subset is offered (including none).
+    #[test]
+    fn remaining_readiness_requires_exactly_the_offered_helpers() {
+        for mask in 0u32..(1 << HELPER_TOOLS.len()) {
+            let offered = |name: &str| HELPER_TOOLS.iter().position(|tool| *tool == name)
+                .is_some_and(|index| mask & (1 << index) != 0);
+            // Producers exactly for the offered ones: ready.
+            assert!(remaining_producers_ready(offered, offered, |_| true), "{mask:b}");
+            // No helper producer at all: ready only when nothing is offered.
+            assert_eq!(remaining_producers_ready(offered, |_| false, |_| true), mask == 0, "{mask:b}");
+            // A missing read service always blocks.
+            assert!(!remaining_producers_ready(offered, offered, |_| false), "{mask:b}");
+        }
     }
     #[test]
     fn deferred_message_has_three_locales_and_safe_default() {
