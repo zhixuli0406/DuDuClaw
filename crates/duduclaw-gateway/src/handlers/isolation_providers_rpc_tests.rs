@@ -723,6 +723,36 @@ fn r8r3a_status_foreign_personal_is_indistinguishable_without_reveal() {
     assert_eq!((revealed, value["employees"].as_array().map(Vec::len)), (1, Some(3)));
 }
 
+/// R8r-3a round 2 (timing oracle): the filter scan applies visibility before
+/// the match and visits EVERY row, so a visible match at the first position, a
+/// foreign Personal match at the first position and an unknown id all cost the
+/// same number of row visits (= the total row count).
+#[test]
+fn r8r3a_status_filter_scan_visits_every_row() {
+    let mut rows = vec![principal("a-shared", 1, shared()), principal("b-bob", 2, personal(BOB))];
+    rows.extend((3..40u8).map(|id| principal(&format!("x{id:03}"), id, shared())));
+    let visits = |rows: &[ConfirmedPrincipal], id: EmployeeId| {
+        let count = std::cell::Cell::new(0usize);
+        let found = select_visible(rows, id, |row| { count.set(count.get() + 1); !foreign_personal(row, ADMIN) })
+            .map(|row| row.label.clone());
+        (found, count.get())
+    };
+    let total = rows.len();
+    assert_eq!(visits(&rows, EmployeeId([1; 16])), (Some("a-shared".into()), total), "visible, first");
+    // Foreign Personal at the first position (a fresh order).
+    let mut bob_first_rows = vec![principal("b-bob", 2, personal(BOB)), principal("a-shared", 1, shared())];
+    bob_first_rows.extend((3..40u8).map(|id| principal(&format!("x{id:03}"), id, shared())));
+    assert_eq!(visits(&bob_first_rows, EmployeeId([2; 16])), (None, total), "foreign personal, first");
+    assert_eq!(visits(&rows, EmployeeId([2; 16])), (None, total), "foreign personal, second");
+    assert_eq!(visits(&rows, EmployeeId([0xaa; 16])), (None, total), "unknown");
+    // And through status_value: foreign ≡ unknown.
+    let none = BTreeMap::new();
+    let current = |_: &ConfirmedPrincipal| -> Result<Option<u32>, ()> { Ok(Some(4)) };
+    let foreign = status_value(&bob_first_rows, &none, Some(EmployeeId([2; 16])), None, ADMIN, false, &current).unwrap_err();
+    let unknown = status_value(&bob_first_rows, &none, Some(EmployeeId([0xaa; 16])), None, ADMIN, false, &current).unwrap_err();
+    assert_eq!((foreign, unknown), (NOT_ALLOCATED, NOT_ALLOCATED));
+}
+
 /// F2: the `after` cursor and `next` run over the visible rows only; an
 /// `after` that is a hidden label behaves as any other string there.
 #[test]

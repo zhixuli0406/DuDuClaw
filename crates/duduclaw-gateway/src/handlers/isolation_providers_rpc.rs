@@ -822,7 +822,7 @@ fn status_value(rows: &[ConfirmedPrincipal], recorded: &BTreeMap<EmployeeId, Rec
     -> Result<(Value, usize), Refusal> {
     let visible = |row: &&ConfirmedPrincipal| reveal || !foreign_personal(row, caller);
     let candidates: Vec<&ConfirmedPrincipal> = match filter {
-        Some(id) => vec![rows.iter().find(|row| row.employee == id).filter(visible).ok_or(NOT_ALLOCATED)?],
+        Some(id) => vec![select_visible(rows, id, |row| visible(&row)).ok_or(NOT_ALLOCATED)?],
         None => rows.iter().filter(visible).filter(|row| after.is_none_or(|after| row.label.as_str() > after)).collect(),
     };
     let (mut listed, mut revealed, mut next) = (Vec::new(), 0usize, None);
@@ -843,6 +843,19 @@ fn status_value(rows: &[ConfirmedPrincipal], recorded: &BTreeMap<EmployeeId, Rec
     Ok((json!({ "employees": listed, "next": next, "hidden_personal": hidden, "personal_revealed": reveal,
         // Constant: only changes made through the dashboard are visible here.
         "visibility": "dashboard_changes_only" }), revealed))
+}
+
+/// The row named by a status filter (pure). Visibility is applied BEFORE the
+/// match and EVERY row is visited, with no early exit: `visible` is called
+/// once per row whether or not, and wherever, the id matches, so a hidden
+/// foreign Personal id and an unknown id cost the same scan (no timing oracle).
+fn select_visible<'a>(rows: &'a [ConfirmedPrincipal], id: EmployeeId,
+    mut visible: impl FnMut(&ConfirmedPrincipal) -> bool) -> Option<&'a ConfirmedPrincipal> {
+    rows.iter().fold(None, |found, row| {
+        // Both sides evaluated (no `&&` short-circuit on the visibility call).
+        let shown = visible(row);
+        if shown & (row.employee == id) { Some(row) } else { found }
+    })
 }
 
 fn row_value(row: &ConfirmedPrincipal, record: Option<&Record>) -> Value {
