@@ -263,9 +263,21 @@ fn account() -> Result<(u32, u32)> {
 }
 
 fn atomic_install(path: &str, mode: u32, write: impl FnOnce(&mut fs::File) -> Result<()>) -> Result<()> {
+    atomic_write(path, mode, true, write)
+}
+
+/// Review R8q F1: like [`atomic_install`], but only where nothing is: an
+/// object at `path` (also one appearing after the caller found the path
+/// absent) refuses instead of being renamed over (`persist_noclobber`).
+fn atomic_create(path: &str, mode: u32, write: impl FnOnce(&mut fs::File) -> Result<()>) -> Result<()> {
+    atomic_write(path, mode, false, write)
+}
+
+fn atomic_write(path: &str, mode: u32, replace: bool, write: impl FnOnce(&mut fs::File) -> Result<()>) -> Result<()> {
     let path = Path::new(path);
     parents(path)?;
     match fs::symlink_metadata(path) {
+        Ok(_) if !replace => return Err(refused(format!("{} 已存在，未覆蓋。", path.display()))),
         Ok(_) => trusted(path, false)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
         Err(error) => return Err(error.into()),
@@ -276,7 +288,8 @@ fn atomic_install(path: &str, mode: u32, write: impl FnOnce(&mut fs::File) -> Re
     if unsafe { libc::fchown(temp.as_raw_fd(), 0, 0) } != 0 { return Err(std::io::Error::last_os_error().into()); }
     temp.as_file().set_permissions(fs::Permissions::from_mode(mode))?;
     temp.as_file().sync_all()?;
-    let file = temp.persist(path).map_err(|error| error.error)?;
+    let persisted = if replace { temp.persist(path) } else { temp.persist_noclobber(path) };
+    let file = persisted.map_err(|error| error.error)?;
     fs::File::open(parent)?.sync_all()?;
     // R3 review item 4: what this call created (the O_EXCL temporary, now at
     // `path`), proven by its own descriptor for an active creation ledger record.

@@ -25,8 +25,11 @@ fn unit_inventory() -> Result<BTreeSet<String>> {
 fn removal_files() -> Vec<PathBuf> {
     // Persistent floors, keys, identity tombstones, update journal and generation
     // receipts deliberately survive. They are needed for recovery and anti-rollback.
+    // Review R8q F2: the parse worker's tmpfiles configuration is not listed
+    // here (a trusted shape does not make it ours); the parse lease step
+    // removes it only when its content is a known DuDuClaw text.
     let mut files: Vec<_> = layout::BINARIES.iter().copied().chain([BINARY, LAUNCHER,
-        "/usr/local/sbin/duduclaw-auto-upgrade", parse_lease::CONFIG]).map(PathBuf::from).collect();
+        "/usr/local/sbin/duduclaw-auto-upgrade"]).map(PathBuf::from).collect();
     for name in layout::UNITS.iter().map(|(name, _)| *name).chain(lifecycle::EXTRA_UNITS.iter().copied()) {
         files.push(Path::new("/etc/systemd/system").join(name));
     }
@@ -213,6 +216,10 @@ impl lifecycle::RemovalHost for NativeRemoval {
     fn remove(&mut self) -> std::result::Result<(), String> {
         let remove = || -> Result<()> {
             validate_removals(&self.files)?;
+            // Review R8q F2: after quiescence (lifecycle order) and before any
+            // other removal. It checks the configuration's content and lists
+            // the whole runtime tree first; a refusal removes nothing at all.
+            parse_lease::remove()?;
             for file in &self.files {
                 // Keep persistent masks so a vendor unit or still-present
                 // enablement link cannot resurrect a retained recovery binary.
@@ -223,7 +230,6 @@ impl lifecycle::RemovalHost for NativeRemoval {
                     Err(error) => return Err(error.into()),
                 }
             }
-            parse_lease::remove()?;
             checked("systemctl", &["daemon-reload"])?;
             Ok(())
         };
@@ -234,6 +240,9 @@ impl lifecycle::RemovalHost for NativeRemoval {
 pub(super) fn run() -> Result<()> {
     let files = removal_files();
     validate_removals(&files)?;
+    // Review R8q F2: an unrecognised parse configuration refuses before any
+    // unit is fenced or stopped (repeated in the removal step itself).
+    parse_lease::config_known()?;
     let units: Vec<_> = unit_inventory()?.into_iter().collect();
     mkdir("/var/lib/duduclaw-protected/uninstall-units", 0o700)?;
     let mut host = NativeRemoval { files };
