@@ -39,11 +39,15 @@ RestrictNamespaces=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallArchitectures=native
 # Fixed expansion; do not replace with the version-dependent @system-service set.
-# clone3 and clone: the one DNS probe worker thread (dns_probe.rs
-# post_lookup_worker) is created once, before the in-process seccomp filter
-# (daemon.rs host_main, seccomp::install) is installed; that filter denies
-# both afterwards. clone3 is listed so RestrictNamespaces= can answer it with
-# ENOSYS and glibc falls back to clone (an EPERM here would not fall back).
+# clone3 and clone: allowed here ONLY so the in-process BOOTSTRAP filter
+# (seccomp.rs install_bootstrap, the first step of daemon.rs host_main) can
+# narrow them to thread creation: clone3 => ENOSYS (glibc falls back to clone;
+# an EPERM would not fall back), clone only with CLONE_THREAD|CLONE_VM, fork,
+# vfork, execve and execveat => EPERM. No independent process can be created
+# during start-up. Under it the one DNS probe worker thread (dns_probe.rs
+# post_lookup_worker) is created, then the final default-deny filter
+# (seccomp::install) stacks on it and denies clone/clone3 entirely. execve is
+# listed only because systemd needs it to start this binary.
 SystemCallFilter=accept accept4 access arch_prctl bind brk capget chdir clock_gettime clock_nanosleep clone clone3 close close_range connect dup dup2 dup3 epoll_create1 epoll_ctl epoll_pwait epoll_wait eventfd2 execve exit exit_group fcntl fstat futex getcwd getdents64 getegid geteuid getgid getgroups getpeername getpid getrandom getresgid getresuid getrlimit getsockname getsockopt gettid getuid ioctl listen lseek madvise mmap mprotect mremap munmap nanosleep newfstatat openat poll ppoll prctl pread64 prlimit64 pselect6 read readlink readlinkat readv recvfrom recvmmsg recvmsg restart_syscall rseq rt_sigaction rt_sigprocmask rt_sigreturn sched_getaffinity sched_yield seccomp sendmsg sendto set_robust_list set_tid_address setsockopt shutdown sigaltstack socket socketpair statx uname write writev
 SystemCallErrorNumber=EPERM
 UMask=0077

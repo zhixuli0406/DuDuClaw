@@ -102,6 +102,11 @@ pub fn activated_listener(path: &str, kind: i32) -> Result<OwnedFd, EgressError>
 }
 
 pub async fn host_main() -> Result<(), EgressError> {
+    // R8j round 3 F4: first, before identity, configuration or any socket:
+    // the bootstrap filter (sets/reads back NNP itself, then narrows the
+    // unit's clone/clone3 to thread creation and refuses fork/vfork/exec).
+    // Nothing below execs. The final filter (`seccomp::install`) stacks on it.
+    crate::seccomp::install_bootstrap()?;
     harden(EGRESS_USER)?;
     let config: Config = read_root_config(CONFIG_PATH)?;
     config.validate()?;
@@ -118,7 +123,8 @@ pub async fn host_main() -> Result<(), EgressError> {
     // the configured NAT public addresses.
     crate::policy::configure_host_public_addresses(&config.host_public_addresses)?;
     crate::policy::init_host_addresses()?;
-    // The probe worker must exist before seccomp denies thread creation. Without
+    // The probe worker must exist before seccomp denies thread creation (the
+    // bootstrap filter admits only this thread-flag clone). Without
     // it no lookup can ever count: refuse to start, loudly (defect 28).
     let Some(probe) = crate::dns_probe::DnsProbe::start() else {
         eprintln!("{}", crate::dns_probe::WORKER_UNAVAILABLE);

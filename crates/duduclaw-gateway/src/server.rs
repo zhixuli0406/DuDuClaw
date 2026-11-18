@@ -758,11 +758,9 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // Its `ready` stays false until this process's local latch is set (stores
     // open, listener bound, spawnd backend connected: `update_readback::LocalStep`).
     crate::update_readback::start();
-    // R8j round 2 B1: an edition that rests on no verified licence is not
-    // proof that this isolated host needs no backend.
-    let edition_source = crate::isolation_readiness::EditionSource::from_boot(
-        !boot_edition.is_personal(), _license_runtime.licence_verified().await);
-    crate::isolation_readiness::connect_backend(edition_source).await;
+    // R8j round 3 F1: on an isolated install only a real spawnd backend marks
+    // the read-back's `Backend` step, whatever the edition or licence state.
+    crate::isolation_readiness::connect_backend().await;
     // Allow an old store with no MFA tables; refuse a partial MFA schema or
     // unreadable policy before schema initialization can hide the failure.
     precheck_identity_policy(&home_dir, boot_edition.is_personal())

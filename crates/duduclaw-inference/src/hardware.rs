@@ -4,6 +4,9 @@
 //! runs under a hard deadline ([`PROBE_COMMAND_TIMEOUT`]); on expiry the child
 //! is killed and reaped and detection continues with the safe default (no GPU
 //! detected). A hung GPU tool can no longer hold its caller forever.
+//! R8j round 3 F2: on Unix each probe runs in its own process group (its pid
+//! is the group id) and the whole group is SIGKILLed, so a helper the tool
+//! forked cannot outlive the deadline.
 
 use std::{process::{Output, Stdio}, time::Duration};
 use crate::types::{BackendType, GpuType, HardwareInfo};
@@ -44,14 +47,18 @@ enum Probe {
 }
 
 /// Runs `cmd` (stdin closed, stderr discarded, stdout captured up to
-/// [`PROBE_OUTPUT_LIMIT`]) for at most `limit`. Starts one child process.
+/// [`PROBE_OUTPUT_LIMIT`]) for at most `limit`. Starts one child process, on
+/// Unix as the leader of a new process group (`process_group(0)`: group id =
+/// its pid), which everything it forks inherits.
 async fn run_bounded(mut cmd: tokio::process::Command, limit: Duration) -> Probe {
     use tokio::io::AsyncReadExt;
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
     let Ok(mut child) = cmd.spawn() else { return Probe::Failed };
     let pid = child.id();
     let Some(stdout) = child.stdout.take() else {
-        kill_and_reap(&mut child).await;
+        kill_and_reap(&mut child, pid).await;
         return Probe::Failed;
     };
     let ran = tokio::time::timeout(limit, async {
@@ -65,13 +72,26 @@ async fn run_bounded(mut cmd: tokio::process::Command, limit: Duration) -> Probe
     }).await;
     match ran {
         Ok(Some(output)) => Probe::Finished(output),
-        Ok(None) => { kill_and_reap(&mut child).await; Probe::Failed }
-        Err(_) => { let reaped = kill_and_reap(&mut child).await; Probe::TimedOut { pid, reaped } }
+        Ok(None) => { kill_and_reap(&mut child, pid).await; Probe::Failed }
+        Err(_) => { let reaped = kill_and_reap(&mut child, pid).await; Probe::TimedOut { pid, reaped } }
     }
 }
 
-/// SIGKILL, then collect the exit (reaping it) for at most [`PROBE_REAP_GRACE`].
-async fn kill_and_reap(child: &mut tokio::process::Child) -> bool {
+/// SIGKILL to the probe's whole process group (Unix; `group` is the pid
+/// recorded at spawn, which `process_group(0)` made the group id), then to
+/// the direct child, then collect the child's exit (reaping it) for at most
+/// [`PROBE_REAP_GRACE`]. The group id cannot name another group while the
+/// child is unreaped or any member of the group still exists (the kernel
+/// keeps that pid allocated); an already empty group answers ESRCH.
+async fn kill_and_reap(child: &mut tokio::process::Child, group: Option<u32>) -> bool {
+    #[cfg(unix)]
+    if let Some(group) = group.and_then(|pid| libc::pid_t::try_from(pid).ok()).filter(|pid| *pid > 1) {
+        // SAFETY: kill takes scalar arguments only; a negative pid addresses
+        // the process group `group` (killpg).
+        unsafe { libc::kill(-group, libc::SIGKILL); }
+    }
+    #[cfg(not(unix))]
+    let _ = group;
     let _ = child.start_kill();
     matches!(tokio::time::timeout(PROBE_REAP_GRACE, child.wait()).await, Ok(Ok(_)))
 }
@@ -426,6 +446,41 @@ mod tests {
         let Probe::Finished(output) = run_bounded(answer("nvidia-smi"), Duration::from_secs(5)).await else { panic!("not finished") };
         assert!(output.status.success());
         assert_eq!(output.stdout, b"Tesla T4\n");
+    }
+
+    /// `kill(pid, 0)` answers ESRCH (gone and reaped) within `bound`.
+    async fn gone_within(pid: libc::pid_t, bound: Duration) -> bool {
+        let until = Instant::now() + bound;
+        loop {
+            // SAFETY: scalar arguments only; signal 0 only checks existence.
+            let rc = unsafe { libc::kill(pid, 0) };
+            if rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) { return true; }
+            if Instant::now() >= until { return false; }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// R8j round 3 F2: a probe tool that forked a helper (which also keeps
+    /// stdout open) and hangs: at the deadline the whole process group is
+    /// killed, neither the shell nor its background `sleep` survives.
+    #[tokio::test]
+    async fn hung_probe_with_forked_helper_kills_the_whole_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let (shell_file, helper_file) = (dir.path().join("shell.pid"), dir.path().join("helper.pid"));
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", "echo $$ > \"$1\"; sleep 600 & echo $! > \"$2\"; wait", "sh"])
+            .arg(&shell_file).arg(&helper_file);
+        let limit = Duration::from_millis(500);
+        let started = Instant::now();
+        let Probe::TimedOut { pid: Some(pid), reaped } = run_bounded(cmd, limit).await else { panic!("not timed out") };
+        assert!(started.elapsed() < limit + PROBE_REAP_GRACE + Duration::from_secs(1), "{:?}", started.elapsed());
+        assert!(reaped, "the direct child was reaped");
+        let read = |path: &std::path::Path| std::fs::read_to_string(path).unwrap().trim().parse::<libc::pid_t>().unwrap();
+        let (shell, helper) = (read(&shell_file), read(&helper_file));
+        assert_eq!(shell as u32, pid, "the shell is the direct child");
+        assert_ne!(helper, shell);
+        assert!(gone_within(shell, Duration::from_secs(5)).await, "shell {shell} survived");
+        assert!(gone_within(helper, Duration::from_secs(5)).await, "forked helper {helper} survived the deadline");
     }
 
     #[tokio::test]

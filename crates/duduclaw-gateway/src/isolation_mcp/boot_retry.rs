@@ -8,6 +8,7 @@
 //! partially assembled service. A success is never repeated. The spawnd
 //! backend connection has its own retry (`retry_backend`) on the same pause.
 use std::{future::Future, pin::Pin, sync::Mutex, time::{Duration, Instant}};
+use duduclaw_migration::confirmation::EffectGate;
 use super::{BootStatus, MissingProducer};
 
 /// A failed attempt. `retry: false` when no later attempt in this process can
@@ -42,10 +43,21 @@ pub(super) async fn wait_for_generation(present: impl Fn() -> bool, closed: &imp
 /// Production [`wait_for_generation`] bound: 50 checks, 100 ms apart.
 pub(super) const GENERATION_WAIT: (u32, Duration) = (50, Duration::from_millis(100));
 
-/// R8j round 2 B3: checked immediately before the side-effectful assembly
-/// (which installs process-wide singletons): a closed gate never assembles.
-pub(super) fn before_assemble(closed: &impl Fn() -> bool) -> Result<(), Failure> {
-    if closed() { Err(Failure::closed()) } else { Ok(()) }
+/// R8j round 3 F3: runs `effects` — every process-wide side effect of one
+/// attempt (singleton installations, assembly) and its publication — inside
+/// ONE permit of `gate` (`EffectGate::enter`, which tests "closed" and
+/// registers the effect atomically). A gate that refuses (closed) ends the
+/// attempt with [`Failure::closed`] and `effects` never runs, so nothing is
+/// installed; a gate closing after the permit was taken lets the attempt
+/// complete (shutdown waits for it, bounded). The permit drops after
+/// `effects` returned, publication included. `effects` must be synchronous
+/// local construction (no network or child-process wait).
+pub(super) fn under_permit<T>(gate: &(impl EffectGate + ?Sized), effects: impl FnOnce() -> Result<T, Failure>)
+    -> Result<T, Failure> {
+    let Some(permit) = gate.enter() else { return Err(Failure::closed()) };
+    let result = effects();
+    drop(permit);
+    result
 }
 
 /// The whole boot task: nothing at all once the gate is closed (R8j round 2
@@ -311,8 +323,18 @@ mod tests {
         assert_eq!((boot.attempts.load(Ordering::Acquire), boot.published.load(Ordering::Acquire)), (3, 1));
     }
 
-    /// Mirrors `attempt_installed`'s gated steps: the generation wait, then
-    /// the gate immediately before the side-effectful assembly.
+    /// A gate whose `enter` refuses once `.0` answers closed (the peek and the
+    /// permit read the same counter here; the real gate does both atomically).
+    struct Peek<F: Fn() -> bool>(F);
+    impl<F: Fn() -> bool> EffectGate for Peek<F> {
+        fn enter(&self) -> Option<duduclaw_migration::confirmation::EffectPermit<'_>> {
+            (!(self.0)()).then(duduclaw_migration::confirmation::EffectPermit::untracked)
+        }
+        fn is_closed(&self) -> bool { (self.0)() }
+    }
+
+    /// Mirrors `attempt_installed`'s gated steps: the generation wait (peeks),
+    /// then the side-effectful assembly inside one permit (`under_permit`).
     struct Gated { gate: Arc<AtomicUsize>, closes_at: usize, generation_checks: Arc<AtomicUsize>,
         assembled: Arc<AtomicUsize> }
     impl Gated {
@@ -327,9 +349,8 @@ mod tests {
                 // The updater's generation never appears.
                 wait_for_generation(|| { checks.fetch_add(1, Ordering::AcqRel); false }, &closed,
                     GENERATION_WAIT.0, Duration::from_millis(20)).await?;
-                before_assemble(&closed)?;
-                self.assembled.fetch_add(1, Ordering::AcqRel);
-                Ok(())
+                let assembled = self.assembled.clone();
+                under_permit(&Peek(&closed), || { assembled.fetch_add(1, Ordering::AcqRel); Ok(()) })
             })
         }
         fn assembled(&mut self) {}
@@ -351,21 +372,77 @@ mod tests {
         assert_eq!(gate.load(Ordering::Acquire), 4);
         // Nothing published or logged for a shutdown.
         assert!(state.status().is_none());
-        // The generation appears but the gate closes right before assembly.
+        // The generation appears but the gate closes right before the permit.
         let assembled = Arc::new(AtomicUsize::new(0));
         let closed_at_assembly = AtomicUsize::new(0);
         let closed = || closed_at_assembly.fetch_add(1, Ordering::AcqRel) >= 1;
         let outcome = async {
             wait_for_generation(|| true, &closed, GENERATION_WAIT.0, Duration::from_millis(20)).await?;
-            before_assemble(&closed)?;
-            assembled.fetch_add(1, Ordering::AcqRel);
-            Ok::<(), Failure>(())
+            under_permit(&Peek(&closed), || { assembled.fetch_add(1, Ordering::AcqRel); Ok(()) })
         }.await;
         assert!(outcome.is_err_and(|failure| failure.is_closed()));
         assert_eq!(assembled.load(Ordering::Acquire), 0);
         // An open gate and no generation: the bounded wait ends and the attempt continues.
         assert!(wait_for_generation(|| false, &|| false, 3, Duration::from_millis(1)).await.is_ok());
         assert_eq!(GENERATION_WAIT, (50, Duration::from_millis(100)));
+    }
+
+    /// R8j round 3 F3, with the real process-wide gate type: a gate closed
+    /// before the permit refuses it, and nothing (no singleton, no
+    /// publication) is installed.
+    #[test]
+    fn boot_permit_refused_by_a_closed_gate_installs_nothing() {
+        use crate::handlers::MigrationShutdownGate as ShutdownGate;
+        let gate = ShutdownGate::new();
+        gate.close();
+        let installed = AtomicUsize::new(0);
+        let outcome = under_permit(&gate, || { installed.fetch_add(1, Ordering::AcqRel); Ok(()) });
+        assert!(outcome.is_err_and(|failure| failure.is_closed()));
+        assert_eq!(installed.load(Ordering::Acquire), 0, "no singleton installed");
+        assert_eq!(gate.running(), 0);
+    }
+
+    /// The gate closes AFTER the permit was taken: the attempt completes
+    /// (installs and publishes), shutdown sees it running until then, and the
+    /// permit is released after the publication.
+    #[test]
+    fn boot_permit_taken_before_close_completes_the_attempt() {
+        use crate::handlers::MigrationShutdownGate as ShutdownGate;
+        let gate = ShutdownGate::new();
+        let (installed, published) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let outcome = under_permit(&gate, || {
+            installed.fetch_add(1, Ordering::AcqRel);
+            assert_eq!(gate.running(), 1, "registered while it installs");
+            gate.close();
+            assert!(!gate.wait_idle(Instant::now() + Duration::from_millis(20)), "shutdown waits for the permit");
+            published.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        });
+        assert!(outcome.is_ok());
+        assert_eq!((installed.load(Ordering::Acquire), published.load(Ordering::Acquire)), (1, 1));
+        assert_eq!(gate.running(), 0, "the permit dropped after the publication");
+        assert!(gate.wait_idle(Instant::now()));
+        // Every later attempt is refused.
+        assert!(under_permit(&gate, || -> Result<(), Failure> { panic!("never runs after close") })
+            .is_err_and(|failure| failure.is_closed()));
+    }
+
+    /// The worker is descheduled inside `enter` while shutdown closes the
+    /// gate: when it resumes `enter` answers None, the attempt ends and
+    /// nothing is installed; nothing stays registered.
+    #[test]
+    fn boot_permit_descheduled_across_close_installs_nothing() {
+        use crate::handlers::MigrationDescheduledGate as Descheduled;
+        let gate = Descheduled::new(1);
+        let installed = AtomicUsize::new(0);
+        let outcome = std::thread::scope(|s| {
+            let worker = s.spawn(|| under_permit(&gate, || { installed.fetch_add(1, Ordering::AcqRel); Ok(()) }));
+            gate.close_while_descheduled();
+            worker.join().unwrap()
+        });
+        assert!(outcome.is_err_and(|failure| failure.is_closed()));
+        assert_eq!(installed.load(Ordering::Acquire), 0, "no singleton installed");
+        assert_eq!((gate.enters(), gate.gate.running()), (1, 0));
     }
 
     #[test]

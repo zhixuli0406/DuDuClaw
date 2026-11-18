@@ -74,6 +74,10 @@ pub struct BootSources {
     /// (inventory only) and each launch gets an employee-bound handle.
     connector_stack: Option<Arc<EmployeeConnectorProviders>>,
     connector_inputs: Option<ConnectorBootInputs>,
+    /// R8j round 3 F3: the hardware detection for the connector factory, run
+    /// before an attempt's shutdown-gate permit (bounded child processes, no
+    /// process-wide state) and kept across attempts until the stack takes it.
+    hardware: Option<duduclaw_inference::types::HardwareInfo>,
 }
 
 /// Gateway-side inputs of the production connector factory, collected in
@@ -236,9 +240,11 @@ pub async fn boot_protected(home: &Path, users: Arc<duduclaw_auth::UserDb>, agen
 /// minute, then 10 s; each attempt bounded by its own waits). Ends at the
 /// first success, when a missing producer can no longer appear, or once the
 /// gateway's shutdown gate (`handlers::migration_shutdown_gate`) has closed.
-/// R8j round 2 B3: the gate is checked before the first attempt as well
-/// (`retry::run`), during its generation wait and immediately before
-/// `assemble` (`attempt_installed`). Starts one tokio task.
+/// R8j round 2 B3: the gate is peeked before the first attempt as well
+/// (`retry::run`) and during its generation wait; R8j round 3 F3: every
+/// process-wide side effect of an attempt and its publication run inside one
+/// permit of that gate (`attempt_installed`, `retry::under_permit`). Starts
+/// one tokio task.
 fn spawn_boot(mut boot: InstalledBoot, started: std::time::Instant) {
     drop(tokio::spawn(async move {
         retry::run(&mut boot, &STATE, started, retry::SCHEDULE, shutdown_begun).await;
@@ -315,44 +321,64 @@ async fn attempt_installed(boot: &mut InstalledBoot) -> Result<(), retry::Failur
             }
         }
     }
+    // R8j round 3 F3: the bounded hardware probe (≤ 2 × (5 s + 1 s)) has no
+    // process-wide side effect: it runs here, before the permit, so the
+    // permit covers only fast local construction. Once per process at most
+    // (kept in `sources` until the connector stack takes it).
+    if sources.connectors.is_none() && sources.connector_selection.is_none()
+        && connector_stack_inputs(sources) && sources.hardware.is_none() {
+        sources.hardware = Some(duduclaw_inference::hardware::detect_hardware().await);
+    }
+    // R8j round 3 F3: one shutdown-gate permit from here (before the first
+    // process-wide side effect, the credential vault in
+    // `install_connector_stack`) until the publication is complete.
+    let users = users.clone();
+    retry::under_permit(crate::handlers::migration_shutdown_gate(),
+        || install_and_publish(home, users, sources, derived, backend.ok()))
+}
+
+/// R8j round 3 F3: every process-wide side effect of one attempt and its
+/// publication (`OWNER`, `STATE`, the integration probe). Called only inside
+/// the attempt's shutdown-gate permit (`retry::under_permit`). Synchronous
+/// local construction only: no network or child-process wait.
+fn install_and_publish(home: &Path, users: Arc<duduclaw_auth::UserDb>, sources: &mut BootSources, derived: Derived,
+    backend: Option<Arc<duduclaw_execution::SpawndBackend>>) -> Result<(), retry::Failure> {
     // F1: the per-employee connector stack, over the very catalog handle the
     // authority above checks connector uses against. Only when the host did
     // not supply its own singletons; a missing catalog leaves the producer
     // missing (boot stays paused, every connector use Unavailable). Built at
     // most once: a later attempt finds it in `sources`.
     if sources.connectors.is_none() && sources.connector_selection.is_none() {
-        install_connector_stack(sources, home, users.clone()).await;
+        install_connector_stack(sources, home, users);
     }
-    let absent = missing(sources, DISPATCHER.get().is_some(), backend.is_ok());
+    let absent = missing(sources, DISPATCHER.get().is_some(), backend.is_some());
     if !absent.is_empty() {
         derived.forget(sources);
         return Err(retry::Failure { retry: !structural(&absent), missing: absent });
     }
-    {
-        // Side-effect-free checks of `assemble` first: a failure here is
-        // retried. `assemble` itself installs process-wide producers, so a
-        // failure there stays final (as before).
-        if precheck(home, sources).is_err() {
-            derived.forget(sources);
-            return Err(retry::Failure { missing: vec![MissingProducer::Initialization], retry: true });
-        }
-        // R8j round 2 B3: never enter the side-effectful `assemble` once the
-        // shutdown gate has closed.
-        if let Err(closed) = retry::before_assemble(&shutdown_begun) {
-            derived.forget(sources);
-            return Err(closed);
-        }
-        let final_failure = || retry::Failure { missing: vec![MissingProducer::Initialization], retry: false };
-        let owner = assemble(home, backend.map_err(|_| final_failure())?, std::mem::take(sources))
-            .map_err(|_| final_failure())?;
-        OWNER.set(Arc::new(owner)).map_err(|_| final_failure())?;
-        STATE.constructed();
-        if crate::isolation_readiness::install_integration_probe(
-            crate::isolation_readiness::IntegrationComponent::McpBoundary, Arc::new(BoundaryReadiness)).is_err() {
-            tracing::error!("隔離工具服務的狀態檢查無法註冊，團隊執行維持暫停。");
-        }
-        Ok(())
+    // Side-effect-free checks of `assemble` first: a failure here is
+    // retried. `assemble` itself installs process-wide producers, so a
+    // failure there stays final (as before).
+    if precheck(home, sources).is_err() {
+        derived.forget(sources);
+        return Err(retry::Failure { missing: vec![MissingProducer::Initialization], retry: true });
     }
+    let final_failure = || retry::Failure { missing: vec![MissingProducer::Initialization], retry: false };
+    let owner = assemble(home, backend.ok_or_else(final_failure)?, std::mem::take(sources))
+        .map_err(|_| final_failure())?;
+    OWNER.set(Arc::new(owner)).map_err(|_| final_failure())?;
+    STATE.constructed();
+    if crate::isolation_readiness::install_integration_probe(
+        crate::isolation_readiness::IntegrationComponent::McpBoundary, Arc::new(BoundaryReadiness)).is_err() {
+        tracing::error!("隔離工具服務的狀態檢查無法註冊，團隊執行維持暫停。");
+    }
+    Ok(())
+}
+
+/// The inputs [`install_connector_stack`] needs before it builds anything.
+fn connector_stack_inputs(sources: &BootSources) -> bool {
+    sources.connector_catalog.is_some() && sources.bindings.is_some() && sources.turns.is_some()
+        && sources.product_authority.is_some()
 }
 
 /// The checks `assemble` makes before its first process-wide installation.
@@ -371,11 +397,14 @@ fn precheck(home: &Path, sources: &BootSources) -> Result<(), VerificationError>
 /// boot catalog and the process credential vault, installed into the
 /// connector lifecycle so C3 revoke / C4 events drop exactly the material the
 /// executors read. Any failure leaves the connector producer missing.
-async fn install_connector_stack(sources: &mut BootSources, home: &Path, users: Arc<duduclaw_auth::UserDb>) {
+/// R8j round 3 F3: runs inside the attempt's shutdown-gate permit; the
+/// hardware detection it needs ran before the permit (`sources.hardware`,
+/// none ⇒ nothing is built).
+fn install_connector_stack(sources: &mut BootSources, home: &Path, users: Arc<duduclaw_auth::UserDb>) {
     use crate::isolation_connector_stack::{LifecycleBindings, installed_home_binding, readiness_report};
     let (Some(catalog), Some(bindings), Some(turns)) =
         (sources.connector_catalog.clone(), sources.bindings.clone(), sources.turns.clone()) else { return };
-    if sources.product_authority.is_none() { return; }
+    if sources.product_authority.is_none() || sources.hardware.is_none() { return; }
     // Unreadable users.db: no home routes are listed (narrower, never wider);
     // every lifecycle read refuses as well.
     let home_binding = installed_home_binding(home).ok();
@@ -394,7 +423,7 @@ async fn install_connector_stack(sources: &mut BootSources, home: &Path, users: 
         if let Some(stack) = weak.upgrade() { stack.schedule_refresh(); })).is_err() {
         tracing::warn!("隔離連接器的路由變更通知無法註冊；連接器仍會在每次使用時重新檢查。");
     }
-    let hardware = duduclaw_inference::hardware::detect_hardware().await;
+    let Some(hardware) = sources.hardware.take() else { return };
     sources.connectors = Some(stack.clone());
     sources.connector_selection = Some(stack.clone());
     sources.connector_stack = Some(stack);

@@ -809,6 +809,10 @@ pub(crate) use migration_authority::entitlement::spawn_startup_reconcile as spaw
 /// DEFECT 26: the isolation boot retry ends once this gate has closed.
 #[cfg(target_os = "linux")]
 pub(crate) use migration_authority::shutdown_gate as migration_shutdown_gate;
+/// R8j round 3 F3: the boot permit tests use the real gate and its
+/// descheduling test double.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use migration_authority::{Descheduled as MigrationDescheduledGate, ShutdownGate as MigrationShutdownGate};
 pub(crate) use migration_confirmations_rpc::wait_for_apply_loops as wait_migration_apply_loops;
 mod session_policy_rpc;
 mod a2a_rpc;
