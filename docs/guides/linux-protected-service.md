@@ -193,8 +193,17 @@ The document is read **from standard input only**: never from a command-line arg
 
 - 1 to 32 providers with unique names; `base_url` must be https without user information, query or fragment; `protocol` (`chat_completions`, `responses`, `anthropic` or `gemini`) is optional. An invalid document is refused with a fixed message that never repeats its content.
 - The key is stored in **the employee's own home** (owned by the employee, mode 0600) and is readable by that employee's runtime. Use a key dedicated to this employee; never a gateway or shared account key.
-- With this command, every change needs host root (a dashboard input follows in a later release). The write happens only while no run is live on the host and the employee is not in use; otherwise try again later. Every run rewrites the file. Success shows only the employee, the number of providers, and each provider's name and `https://host[:port]`, never the key.
+- With this command, every change needs host root. The write happens only while no run is live on the host and the employee is not in use; otherwise try again later. Every run rewrites the file. Success shows only the employee, the number of providers, and each provider's name and `https://host[:port]`, never the key.
 - Remove the document with `--clear` (standard input is not read). Disabling the employee removes it as well; retiring the employee destroys it with the employee's storage.
+
+### From the dashboard
+
+The gateway also accepts the same document from the dashboard (the gateway side is in place; the dashboard page ships in a following package):
+
+- Only a current Admin may set or remove it, after a fresh step-up: password plus second factor, valid for five minutes and bound to that dashboard session (the same step-up as connector accounts and migration decisions). Any allocated isolated employee can be targeted, including another person's Personal employee, as for connector accounts. Every attempt is audited with the actor, the employee, the result and the providers' names and endpoint origins, never the key or the endpoint path.
+- The gateway relays the key to root in memory only; root writes it into the employee's home exactly as the host command does. The key is never written to the gateway's disk, databases, configuration, logs, audit or error messages, and the gateway wipes its in-memory copies after the hand-off. The same rules apply as for the host command; in addition, names, keys and endpoints containing a quote, a backslash or a control character are refused.
+- The dashboard status shows, per employee, only the provider names, protocols, endpoint origins (`https://host[:port]`) and the time of the last confirmed dashboard change. **It reflects only changes made through the dashboard**: documents written or removed with the host command above are not visible there. Another person's Personal employees are hidden unless the Admin reveals them with the step-up (audited).
+- While a run is live on the host or the employee is in use, the change is refused as busy; retry when the employee is idle. When the isolation service does not confirm a change, the result is reported as unconfirmed and the status stays as it was; sending the same change again is safe.
 
 ## Upgrade and uninstall
 

@@ -64,7 +64,7 @@ describe('ProtectedModePage', () => {
     expect(screen.getByText('Protected mode is available in the Enterprise edition only.')).toBeInTheDocument();
   });
 
-  it('shows four tabs, names owners from the member list and switches tabs', async () => {
+  it('shows five tabs, names owners from the member list and switches tabs', async () => {
     setStatus({ isolation_readiness: { required: true, ready: true, components } });
     routeCalls({
       'users.list': () => ({ users: [{ id: 'u-alice', display_name: 'Alice Chen', email: 'alice@example.com',
@@ -75,7 +75,7 @@ describe('ProtectedModePage', () => {
     renderWithProviders(<ProtectedModePage />);
     expect(screen.getByRole('heading', { level: 1, name: 'Protected mode' })).toBeInTheDocument();
     const tabs = screen.getAllByRole('tab');
-    expect(tabs.map((tab) => tab.textContent)).toEqual(['AI employees', 'Connector accounts', 'Google tenant source', 'Records']);
+    expect(tabs.map((tab) => tab.textContent)).toEqual(['AI employees', 'Connector accounts', 'Model connections', 'Google tenant source', 'Records']);
     expect(screen.getByRole('tab', { name: 'AI employees' })).toHaveAttribute('aria-selected', 'true');
     const employees = await screen.findByRole('region', { name: 'Protected AI employees' });
     expect(await within(employees).findByText('Alice Chen')).toBeInTheDocument();

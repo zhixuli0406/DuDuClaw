@@ -88,6 +88,17 @@ pub(crate) const LIFECYCLE_ALLOWLIST: &[(&str, &str)] = &[
     ("isolation.connector_provision", "Admin + step-up connector authority; returns the new account id only"),
     ("isolation.connector_revoke", "Admin + step-up connector authority; returns account / active only"),
     ("isolation.connector_import_legacy", "stages migration proposals; returns counts only"),
+    // R8r-3a (reviewed 2026-11-20): model connection documents. The params
+    // name the employee by `employee_id` only (no `EMPLOYEE_PARAM_KEYS`) and
+    // are taken out of the request before these gates run. Status hides
+    // another person's Personal employees in the handler (binding from the
+    // confirmed row, fail closed) unless revealed by the audited step-up
+    // (`step_up_csrf`, same proof as personal_data_gate), like connector_list.
+    ("isolation.provider_status", "Admin read of the gateway's non-secret record (names, protocols, endpoint origins, \
+        time); hides another person's Personal employees in the handler unless revealed by the audited step-up"),
+    ("isolation.provider_set", "Admin + step-up root write of an employee's model connection document (any \
+        allocated employee, the connector PROVISION rule), audited; returns provisioned / updated_unix / result only"),
+    ("isolation.provider_clear", "Admin + step-up root removal of that document, audited; same reply"),
     ("isolation.recording_status", "D8 host control; `control_recording` (boot_recording.rs, HX6 store) \
         withholds a non-owned Personal employee's recording result (status only); audited either way"),
     ("isolation.recording_stop", "D8 host stop, audited; the result is withheld as for recording_status"),

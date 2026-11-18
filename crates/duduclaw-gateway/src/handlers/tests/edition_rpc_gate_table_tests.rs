@@ -66,6 +66,10 @@ fn enterprise_surfaces_are_listed() {
         "isolation.connector_provision",
         "isolation.connector_revoke",
         "isolation.connector_import_legacy",
+        // R8r-3a 隔離員工的模型連線資料
+        "isolation.provider_status",
+        "isolation.provider_set",
+        "isolation.provider_clear",
         // 受保護員工配置提案（A4）
         "isolation.employee_list",
         "isolation.employee_propose",
