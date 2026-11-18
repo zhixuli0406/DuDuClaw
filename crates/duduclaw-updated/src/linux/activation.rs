@@ -94,6 +94,11 @@ impl ActivationRuntime for SocketRuntime {
         }
     }
     fn read_back(&mut self, generation: Sha256Digest) -> Result<Vec<ComponentReadback>> {
+        // Each spawnd answer is bounded (its measuring deadline sits well inside
+        // `transport::timeout`'s 5 s, `READBACK_MEASURE_DEADLINE` in
+        // spawnd's update_control.rs) and spawnd caches completed file
+        // measurements per generation, so these retries make progress instead
+        // of re-hashing everything each time.
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             match self.read_back_once(generation) {

@@ -75,7 +75,13 @@ pub struct ComponentReadback {
     pub product: Product,
     pub version: ReleaseVersion,
     pub protocol: u16,
-    /// The SHA-256 of the executable actually loaded, not of a proposed pathname.
+    /// A SHA-256 whose meaning depends on the target's kind ([`readback_kind`]):
+    /// - LIVE PROCESS (gateway, egress, spawnd): the image the reporting process
+    ///   actually loaded (its own `/proc/self/exe`), never a pathname's.
+    /// - FILE MEASUREMENT (every other reported target): the bytes at the
+    ///   path(s) the component is executed (the policy: read) from, hashed by
+    ///   root spawnd by descriptor through its trusted reader. It says what that
+    ///   file holds now, not that a process has loaded it.
     pub build_sha256: Sha256Digest,
     pub effective_uid: u32,
     pub ready: bool,
@@ -161,11 +167,14 @@ pub fn protocol(manifest: &ReleaseManifest, target: &InstallTarget) -> u16 {
 ///   effective uid. `Gateway` and `Egress` must be non-root; `Spawnd` must be
 ///   root.
 /// - a FILE MEASUREMENT: root spawnd hashed, by descriptor through its trusted
-///   reader, the file the component is executed (the policy: read) from: the
-///   fixed publication path for `Trampoline`, `TrampolineSelftest`,
-///   `IsolationProbe`, `ParseWorker`, `Importer`, `Migration` and `McpBridge`,
-///   the committed generation directory for `EgressForwarder` and every
-///   `RuntimeEntry` (including `isolation-policy-v1`). `effective_uid` is the
+///   reader, every file the component is executed (the policy: read) from:
+///   the fixed publication path for `Trampoline`, `TrampolineSelftest`,
+///   `IsolationProbe`, `Importer` and `Migration`; for `ParseWorker` both the
+///   copy inside the parse runtime tree (what its unit executes) and the host
+///   publication copy (the tree builder's input), and `build_sha256` is the
+///   signed digest only when both hold it; the committed generation directory
+///   (mounted at `/runtime` for runs) for `McpBridge`, `EgressForwarder` and
+///   every `RuntimeEntry` (including `isolation-policy-v1`). `effective_uid` is the
 ///   measurer's and must be 0; the uid the component later runs under is not
 ///   claimed by this report.
 pub fn validate_readbacks(manifest: &ReleaseManifest, readbacks: &[ComponentReadback]) -> Result<()> {

@@ -1196,6 +1196,8 @@ enum Trust {
 /// Production effects over `/opt/duduclaw-isolated/generations/<hex>` and `/`.
 pub struct InstalledEffects {
     install_root: PathBuf, publish_root: PathBuf, trust: Trust, own_image: Option<Sha256Digest>,
+    /// Readback file measurements of the generation last read back ([`measure_files`]).
+    measurements: MeasureCache,
     /// Fault injection: the next `publish` stops (as a power loss would) after
     /// this many renames, before the next one.
     #[cfg(test)]
@@ -1208,12 +1210,14 @@ pub struct InstalledEffects {
 impl InstalledEffects {
     pub fn production() -> Self {
         Self { install_root: PathBuf::from(INSTALL_ROOT), publish_root: PathBuf::from("/"), trust: Trust::Recorded,
-            own_image: running_image().ok(), #[cfg(test)] power_loss_after: None, #[cfg(test)] revoked: Vec::new() }
+            own_image: running_image().ok(), measurements: MeasureCache::default(), #[cfg(test)] power_loss_after: None,
+            #[cfg(test)] revoked: Vec::new() }
     }
     #[cfg(test)]
     fn for_test(install_root: &Path, publish_root: &Path) -> Self {
         Self { install_root: install_root.to_path_buf(), publish_root: publish_root.to_path_buf(),
-            trust: Trust::Unsigned, own_image: running_image().ok(), power_loss_after: None, revoked: Vec::new() }
+            trust: Trust::Unsigned, own_image: running_image().ok(), measurements: MeasureCache::default(),
+            power_loss_after: None, revoked: Vec::new() }
     }
     /// `Ok(None)` only when the generation directory does not exist (yet).
     fn generation_directory(&self, generation: Sha256Digest) -> io::Result<Option<Directory>> {
@@ -1249,30 +1253,6 @@ impl InstalledEffects {
         for (_, directory) in publication() { Directory::open(&self.publish_root.join(directory)).map_err(updated)?; }
         Ok(())
     }
-    /// SHA-256, by descriptor, of the file this artifact is executed (or, for
-    /// the policy, read) from: its fixed publication destination, or for the
-    /// egress forwarder and runtime entries the file in `generation` (the
-    /// committed `generations/<hex>` directory, never `current`). Every
-    /// directory on the way and the file go through the trusted reader
-    /// (`Directory`: no symlinks, root:root, not group/other-writable, one
-    /// link, regular file); the file must carry the mode `publication` allows
-    /// for its kind, which must also be the signed mode, and the signed size
-    /// (`digest_file` caps it at [`MAX_EXECUTABLE_BYTES`]). `None`: not
-    /// measurable (no guess); daemons answer for themselves and are `None`.
-    fn measure(&self, generation: &Directory, artifact: &ReleaseArtifact) -> Option<Sha256Digest> {
-        let mode = measured_mode(&artifact.install_target)?;
-        if u32::from(artifact.mode) != mode { return None; }
-        let name = artifact_name(&artifact.install_target).ok()?;
-        let file = match &artifact.install_target {
-            InstallTarget::EgressForwarder | InstallTarget::RuntimeEntry { .. } => generation.read(&name).ok()?,
-            target => {
-                let (_, relative) = publication().into_iter().find(|(published, _)| published == target)?;
-                Directory::open(&self.publish_root.join(relative)).and_then(|directory| directory.read(&name)).ok()?
-            }
-        };
-        if file.metadata().ok()?.len() != artifact.size_bytes { return None; }
-        digest_file(file, Some(mode)).ok()
-    }
 }
 
 /// The permission bits of a file spawnd measures (the rule of
@@ -1287,6 +1267,223 @@ fn measured_mode(target: &InstallTarget) -> Option<u32> {
         | InstallTarget::EgressForwarder => Some(0o755),
         InstallTarget::RuntimeEntry { registry_id } => Some(if registry_id == "isolation-policy-v1" { 0o444 } else { 0o755 }),
     }
+}
+
+/// The updater client's socket timeout: `transport::timeout` sets SO_RCVTIMEO
+/// and SO_SNDTIMEO to 5 s on the client's connection to this endpoint (a test
+/// reads it back from a socket that function configured).
+const CLIENT_SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
+/// Absolute limit of one `Readback`'s measuring work, checked before every
+/// file and before every chunk read. At most 40% of the client's timeout, so
+/// the reply (and the manifest read before it) always lands while the client
+/// still waits; the client retries every 200 ms for 30 s, and the work done so
+/// far is kept in [`MeasureCache`]. On expiry the remaining artifacts have no
+/// measurement (their records are not ready); nothing is guessed.
+const READBACK_MEASURE_DEADLINE: Duration = Duration::from_secs(2);
+const _: () = assert!(READBACK_MEASURE_DEADLINE.as_millis() * 5 <= CLIENT_SOCKET_TIMEOUT.as_millis() * 2);
+/// Aggregate bytes spawnd hashes for one manifest (every measured site of
+/// every measured artifact, at the signed sizes; the parse worker counts
+/// twice). Chosen far above the shipped non-daemon set (the large gateway is a
+/// live daemon and never measured); a manifest above it is not measured at all
+/// and every file-measurement record is not ready.
+const MEASURE_BUDGET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// Bound of [`MeasureCache`]: at most two sites per artifact of a valid manifest.
+const MEASURE_CACHE_ENTRIES: usize = 2 * duduclaw_isolation::update::MAX_ARTIFACTS;
+const MEASURE_CHUNK_BYTES: usize = 64 * 1024;
+/// The parse worker as `duduclaw-parse@.service` executes it:
+/// `RootDirectory=/usr/lib/duduclaw/parse-root` with
+/// `BindReadOnlyPaths=/usr/lib/duduclaw/parse-root-tree:/`, so
+/// `ExecStart=/usr/libexec/duduclaw/duduclaw-parse-worker` is the copy the
+/// installer's tree builder (`build-runtime-tree.py`, `WORKER_TARGET`) placed
+/// in the runtime tree (root:root 0755, one link, every directory root:root
+/// 0755: its `verify_tree`). Relative to the publication root.
+const PARSE_RUNTIME_WORKER_DIRECTORY: &str = "usr/lib/duduclaw/parse-root-tree/usr/libexec/duduclaw";
+
+/// Where a measured file lives: the committed generation directory being read
+/// back, or a directory relative to the publication root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Site { Generation, Published(&'static str) }
+/// Every place `target` is executed (the policy: read) from; a file
+/// measurement is the signed digest only when every site holds it.
+/// - trampoline, its self-test, the SSH probe: `/usr/lib/duduclaw` (the run
+///   units' and probe/self-test units' fixed paths, `systemd.rs`);
+/// - parse worker: the runtime tree copy its unit executes, and the host copy
+///   `/usr/libexec/duduclaw` that the tree builder copies from. The tree is
+///   built only by the installer and NOT rebuilt by an update's `Apply`, so an
+///   update that changes the parse worker fails closed here (the tree copy
+///   still holds the old digest) until the tree is rebuilt;
+/// - importer, migration: `/usr/lib/duduclaw/current` (the migration
+///   pipeline's `installed("duduclaw-import")`, `duduclaw-import@.service`,
+///   `duduclaw-migrate-expire@.service`); neither is executed from a generation;
+/// - MCP bridge, egress forwarder, runtime entries: the generation directory
+///   (mounted at `/runtime` for runs, `installed::anchors`; the bridge runs as
+///   `/runtime/duduclaw-mcp-bridge`). Nothing executes the bridge's fixed copy
+///   in `/usr/lib/duduclaw/current` (start-up verification still checks it).
+/// Daemons and the updater slot: none.
+fn measured_sites(target: &InstallTarget) -> &'static [Site] {
+    match target {
+        InstallTarget::Trampoline | InstallTarget::TrampolineSelftest | InstallTarget::IsolationProbe =>
+            &[Site::Published("usr/lib/duduclaw")],
+        // The executed copy first: when both differ, its bytes are reported.
+        InstallTarget::ParseWorker =>
+            &[Site::Published(PARSE_RUNTIME_WORKER_DIRECTORY), Site::Published("usr/libexec/duduclaw")],
+        InstallTarget::Importer | InstallTarget::Migration => &[Site::Published("usr/lib/duduclaw/current")],
+        InstallTarget::McpBridge | InstallTarget::EgressForwarder | InstallTarget::RuntimeEntry { .. } => &[Site::Generation],
+        InstallTarget::Spawnd | InstallTarget::Gateway | InstallTarget::Egress | InstallTarget::UpdateSlot => &[],
+    }
+}
+
+/// What `fstat` on a measured file's descriptor says, before and after it is
+/// hashed. A digest is used and cached only when both are equal, and reused
+/// only when a fresh open of the same site shows the identical identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FileIdentity { pub device: u64, pub inode: u64, pub size: u64, pub mode: u32,
+    pub mtime: (i64, i64), pub ctime: (i64, i64) }
+/// An opened file being measured (production: a `File` from the trusted reader).
+pub(crate) trait MeasuredFile {
+    /// `fstat` of the descriptor; `Err` unless a regular file.
+    fn identity(&self) -> io::Result<FileIdentity>;
+    fn read_chunk(&mut self, buffer: &mut [u8]) -> io::Result<usize>;
+}
+impl MeasuredFile for File {
+    fn identity(&self) -> io::Result<FileIdentity> {
+        let metadata = self.metadata()?;
+        if !metadata.is_file() { return Err(invalid()); }
+        Ok(FileIdentity { device: metadata.dev(), inode: metadata.ino(), size: metadata.len(), mode: metadata.mode(),
+            mtime: (metadata.mtime(), metadata.mtime_nsec()), ctime: (metadata.ctime(), metadata.ctime_nsec()) })
+    }
+    fn read_chunk(&mut self, buffer: &mut [u8]) -> io::Result<usize> { Read::read(self, buffer) }
+}
+/// Opens a measured file (production: [`InstalledFiles`]).
+pub(crate) trait FileOpener {
+    type File: MeasuredFile;
+    /// `name` at `site`; `Err`: not measurable.
+    fn open(&mut self, site: Site, name: &str) -> io::Result<Self::File>;
+}
+/// Every directory on the way and the file go through the trusted reader
+/// (`Directory`: no symlinks, root:root, not group/other-writable; the file a
+/// root:root regular file with one link).
+struct InstalledFiles<'a> { publish_root: &'a Path, generation: &'a Directory }
+impl FileOpener for InstalledFiles<'_> {
+    type File = File;
+    fn open(&mut self, site: Site, name: &str) -> io::Result<File> {
+        match site {
+            Site::Generation => self.generation.read(name).map_err(updated),
+            Site::Published(relative) =>
+                Directory::open(&self.publish_root.join(relative)).and_then(|directory| directory.read(name)).map_err(updated),
+        }
+    }
+}
+
+/// Completed measurements of one generation, by (artifact id, site), each with
+/// the identity it was measured from. Dropped whole when another generation is
+/// read back; at most [`MEASURE_CACHE_ENTRIES`] entries.
+#[derive(Default)]
+pub(crate) struct MeasureCache {
+    generation: Option<Sha256Digest>,
+    entries: BTreeMap<(String, Site), (FileIdentity, Sha256Digest)>,
+    /// The over-budget refusal of `generation` was logged.
+    over_budget_logged: bool,
+}
+impl MeasureCache {
+    fn select(&mut self, generation: Sha256Digest) {
+        if self.generation != Some(generation) { *self = Self { generation: Some(generation), ..Self::default() }; }
+    }
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize { self.entries.len() }
+}
+/// The signed bytes of every measured site of every measured artifact;
+/// `None` on overflow.
+fn measured_bytes(manifest: &ReleaseManifest) -> Option<u64> {
+    manifest.artifacts.iter().filter(|artifact| measured_mode(&artifact.install_target).is_some())
+        .try_fold(0u64, |total, artifact| artifact.size_bytes
+            .checked_mul(measured_sites(&artifact.install_target).len() as u64)
+            .and_then(|bytes| total.checked_add(bytes)))
+}
+enum Measurement { Digest(Sha256Digest), Unmeasurable, Expired }
+/// One site of one artifact: the file must carry the kind's mode (which must
+/// also be the signed mode) and the signed size (at most
+/// [`MAX_EXECUTABLE_BYTES`]); a cached digest is reused only for the identical
+/// identity; otherwise it is hashed in chunks with `expired` checked before
+/// each, and the identity must be unchanged afterwards.
+fn measure_one<O: FileOpener>(opener: &mut O, cache: &mut MeasureCache, artifact: &ReleaseArtifact, mode: u32, site: Site,
+    name: &str, expired: &mut dyn FnMut() -> bool) -> Measurement {
+    if expired() { return Measurement::Expired; }
+    let Ok(mut file) = opener.open(site, name) else { return Measurement::Unmeasurable };
+    let Ok(before) = file.identity() else { return Measurement::Unmeasurable };
+    if before.mode & 0o7777 != mode || before.size != artifact.size_bytes || before.size > MAX_EXECUTABLE_BYTES {
+        return Measurement::Unmeasurable;
+    }
+    let key = (artifact.id.clone(), site);
+    if let Some((identity, digest)) = cache.entries.get(&key).copied() {
+        if identity == before { return Measurement::Digest(digest); }
+        cache.entries.remove(&key);
+    }
+    let mut hash = Sha256::new();
+    let mut buffer = vec![0u8; MEASURE_CHUNK_BYTES];
+    let mut total = 0u64;
+    loop {
+        if expired() { return Measurement::Expired; }
+        let count = match file.read_chunk(&mut buffer) {
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return Measurement::Unmeasurable,
+        };
+        if count == 0 { break; }
+        let Some(chunk) = buffer.get(..count) else { return Measurement::Unmeasurable };
+        total = match total.checked_add(count as u64) {
+            Some(total) if total <= before.size => total,
+            _ => return Measurement::Unmeasurable,
+        };
+        hash.update(chunk);
+    }
+    if total != before.size { return Measurement::Unmeasurable; }
+    // Changed while hashed: neither reported nor cached.
+    match file.identity() {
+        Ok(after) if after == before => {}
+        _ => return Measurement::Unmeasurable,
+    }
+    let digest = Sha256Digest(hash.finalize().into());
+    if cache.entries.len() < MEASURE_CACHE_ENTRIES { cache.entries.insert(key, (before, digest)); }
+    Measurement::Digest(digest)
+}
+/// The file measurements of `generation`'s manifest, by artifact id
+/// ([`Observed::measured`]). An artifact gets an entry only when every one of
+/// its sites ([`measured_sites`]) was measured: the signed digest when all
+/// hold it, otherwise the first differing digest. Over
+/// [`MEASURE_BUDGET_BYTES`]: nothing (logged once per generation). `expired`:
+/// the artifact in progress and every later one get no entry.
+pub(crate) fn measure_files<O: FileOpener>(opener: &mut O, cache: &mut MeasureCache, generation: Sha256Digest,
+    manifest: &ReleaseManifest, expired: &mut dyn FnMut() -> bool) -> BTreeMap<String, Sha256Digest> {
+    cache.select(generation);
+    let mut measured = BTreeMap::new();
+    if !matches!(measured_bytes(manifest), Some(bytes) if bytes <= MEASURE_BUDGET_BYTES) {
+        if !cache.over_budget_logged {
+            cache.over_budget_logged = true;
+            eprintln!("duduclaw-spawnd: readback of generation {} not measured: its files exceed the {MEASURE_BUDGET_BYTES}-byte \
+                measuring budget", hex(&generation));
+        }
+        return measured;
+    }
+    for artifact in &manifest.artifacts {
+        let Some(mode) = measured_mode(&artifact.install_target) else { continue };
+        let sites = measured_sites(&artifact.install_target);
+        if u32::from(artifact.mode) != mode || sites.is_empty() { continue; }
+        let Ok(name) = artifact_name(&artifact.install_target) else { continue };
+        let mut digests = Vec::with_capacity(sites.len());
+        for site in sites {
+            match measure_one(opener, cache, artifact, mode, *site, &name, expired) {
+                Measurement::Digest(digest) => digests.push(digest),
+                Measurement::Unmeasurable => break,
+                Measurement::Expired => return measured,
+            }
+        }
+        if digests.len() == sites.len() {
+            let reported = digests.iter().copied().find(|digest| *digest != artifact.sha256).unwrap_or(artifact.sha256);
+            measured.insert(artifact.id.clone(), reported);
+        }
+    }
+    measured
 }
 
 /// The manifest-bound data-migration executor (G) is not part of this release:
@@ -1508,14 +1705,15 @@ impl Effects for InstalledEffects {
         }
     }
     fn readback(&mut self, generation: Sha256Digest, live: bool) -> io::Result<Vec<ComponentReadback>> {
+        let deadline = Instant::now() + READBACK_MEASURE_DEADLINE;
         let directory = self.generation_directory(generation)?.ok_or_else(invalid)?;
         let (_, manifest) = self.manifest(&directory, generation)?;
-        // Each file once per Readback; one whose size is not the signed size is
-        // not hashed at all, so the work is bounded by the manifest's sizes.
-        let mut measured = BTreeMap::new();
-        for artifact in &manifest.artifacts {
-            if let Some(digest) = self.measure(&directory, artifact) { measured.insert(artifact.id.clone(), digest); }
-        }
+        // Bounded: a file whose size is not the signed size is not hashed, the
+        // manifest's measured bytes are capped (`MEASURE_BUDGET_BYTES`), the
+        // work stops at the deadline, and a retry reuses what completed.
+        let mut files = InstalledFiles { publish_root: &self.publish_root, generation: &directory };
+        let measured = measure_files(&mut files, &mut self.measurements, generation, &manifest,
+            &mut || Instant::now() >= deadline);
         // SAFETY: geteuid has no arguments and cannot fail.
         let euid = unsafe { libc::geteuid() };
         Ok(components(&manifest, Observed { own_image: self.own_image, live, euid, measured }))
@@ -1530,13 +1728,14 @@ pub(crate) struct Observed {
     pub own_image: Option<Sha256Digest>,
     pub live: bool,
     pub euid: u32,
-    /// File measurements by artifact id (`InstalledEffects::measure`), each
-    /// computed once per Readback: the SHA-256, by descriptor, of the file the
-    /// component is executed from (the run trampoline, its self-test and the
-    /// SSH probe in `/usr/lib/duduclaw`, the parse worker, importer, migration
-    /// and MCP bridge at their fixed destinations, the egress forwarder and
-    /// every runtime entry in the committed generation directory). An artifact
-    /// whose file could not be opened or verified has no entry.
+    /// File measurements by artifact id ([`measure_files`]): the SHA-256, by
+    /// descriptor, of every file the component is executed from
+    /// ([`measured_sites`]: the run trampoline, its self-test and the SSH probe
+    /// in `/usr/lib/duduclaw`; the parse worker in its runtime tree and its
+    /// host copy; importer and migration in `/usr/lib/duduclaw/current`; the
+    /// MCP bridge, the egress forwarder and every runtime entry in the
+    /// committed generation directory). An artifact any of whose files could
+    /// not be opened, verified or measured before the deadline has no entry.
     pub measured: BTreeMap<String, Sha256Digest>,
 }
 

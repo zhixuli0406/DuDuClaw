@@ -2099,20 +2099,336 @@ fn update_readback_measured_modes_follow_the_publication_rule() {
     for target in [InstallTarget::Spawnd, InstallTarget::Gateway, InstallTarget::Egress, InstallTarget::UpdateSlot] {
         assert_eq!(measured_mode(&target), None, "{target:?}");
     }
-    // A signed mode other than the kind's is refused before any file is opened
-    // (the roots below do not exist; `/` passes `Directory::open` unprivileged).
-    let effects = InstalledEffects::for_test(Path::new("/nonexistent-install"), Path::new("/nonexistent-publish"));
-    let generation = Directory::open(Path::new("/")).unwrap();
-    let manifest = template_manifest();
+    // A signed mode other than the kind's is refused before any file is opened.
+    let manifest = measured_manifest();
     for (target, mode) in [(policy_target(), 0o755), (InstallTarget::RuntimeEntry { registry_id: "api-worker-v1".into() }, 0o444),
         (InstallTarget::ParseWorker, 0o444), (InstallTarget::EgressForwarder, 0o700)] {
         let mut artifact = manifest.artifacts.iter().find(|a| a.install_target == target).unwrap().clone();
         artifact.mode = mode;
-        assert_eq!(effects.measure(&generation, &artifact), None, "{target:?}");
+        let mut files = FakeFiles::exact(&manifest);
+        assert!(measure(&mut files, &mut MeasureCache::default(), digest(9), &manifest_with(vec![artifact])).is_empty(),
+            "{target:?}");
+        assert_eq!(files.opens, 0, "{target:?}");
     }
-    // Live daemons are never measured as files.
-    let gateway = manifest.artifacts.iter().find(|a| a.install_target == InstallTarget::Gateway).unwrap();
-    assert_eq!(effects.measure(&generation, gateway), None);
+    // Live daemons and the updater slot are never measured as files; every
+    // measured kind has at least one site.
+    for target in [InstallTarget::Spawnd, InstallTarget::Gateway, InstallTarget::Egress, InstallTarget::UpdateSlot] {
+        assert!(measured_sites(&target).is_empty(), "{target:?}");
+    }
+    for artifact in &manifest.artifacts {
+        assert_eq!(measured_mode(&artifact.install_target).is_some(), !measured_sites(&artifact.install_target).is_empty());
+    }
+    let mut files = FakeFiles::exact(&manifest);
+    let daemons = manifest_with(manifest.artifacts.iter().filter(|a| measured_mode(&a.install_target).is_none()).cloned().collect());
+    assert!(measure(&mut files, &mut MeasureCache::default(), digest(9), &daemons).is_empty());
+    assert_eq!(files.opens, 0);
+}
+
+// ---------------------------------------------------------------- readback measurement over fake files
+
+/// An opened fake file: its bytes, the identity `fstat` reports, and the
+/// shared log of files whose hashing began.
+struct FakeFile { bytes: Vec<u8>, identity: FileIdentity, position: usize, key: (Site, String),
+    /// `fstat` reports another ctime once reading began (written while hashed).
+    unstable: bool, hashed: Arc<Mutex<Vec<(Site, String)>>> }
+impl MeasuredFile for FakeFile {
+    fn identity(&self) -> io::Result<FileIdentity> {
+        if self.identity.mode & 0o170_000 != 0o100_000 { return Err(invalid()); }
+        let mut identity = self.identity;
+        if self.unstable && self.position > 0 { identity.ctime.1 += 1; }
+        Ok(identity)
+    }
+    fn read_chunk(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.position == 0 && !self.bytes.is_empty() { self.hashed.lock().unwrap().push(self.key.clone()); }
+        let remaining = &self.bytes[self.position..];
+        let count = remaining.len().min(buffer.len());
+        buffer[..count].copy_from_slice(&remaining[..count]);
+        self.position += count;
+        Ok(count)
+    }
+}
+/// Files by (site, name), each with a distinct inode.
+#[derive(Default)]
+struct FakeFiles { files: BTreeMap<(Site, String), (Vec<u8>, FileIdentity)>, next_inode: u64, opens: usize,
+    unstable: Option<(Site, String)>, hashed: Arc<Mutex<Vec<(Site, String)>>> }
+impl FileOpener for FakeFiles {
+    type File = FakeFile;
+    fn open(&mut self, site: Site, name: &str) -> io::Result<FakeFile> {
+        self.opens += 1;
+        let key = (site, name.to_owned());
+        let (bytes, identity) = self.files.get(&key).cloned().ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+        Ok(FakeFile { bytes, identity, position: 0, unstable: self.unstable.as_ref() == Some(&key), key,
+            hashed: self.hashed.clone() })
+    }
+}
+impl FakeFiles {
+    /// Every site of every measured artifact holds exactly its signed bytes.
+    fn exact(manifest: &ReleaseManifest) -> Self {
+        let mut files = Self::default();
+        for artifact in &manifest.artifacts {
+            for site in measured_sites(&artifact.install_target) {
+                files.put(*site, &artifact.install_target, measured_content(&artifact.install_target), u32::from(artifact.mode));
+            }
+        }
+        files
+    }
+    /// A new file (new inode) at `site`.
+    fn put(&mut self, site: Site, target: &InstallTarget, bytes: Vec<u8>, mode: u32) {
+        self.next_inode += 1;
+        let identity = FileIdentity { device: 1, inode: self.next_inode, size: bytes.len() as u64, mode: 0o100_000 | mode,
+            mtime: (1, 0), ctime: (1, 0) };
+        self.files.insert((site, artifact_name(target).unwrap()), (bytes, identity));
+    }
+    /// Same bytes and inode, a new ctime (e.g. rewritten in place or chmod).
+    fn touch(&mut self, site: Site, target: &InstallTarget) {
+        self.files.get_mut(&(site, artifact_name(target).unwrap())).unwrap().1.ctime.0 += 1;
+    }
+    /// How often hashing of `target` at `site` began.
+    fn hash_count(&self, site: Site, target: &InstallTarget) -> usize {
+        let key = (site, artifact_name(target).unwrap());
+        self.hashed.lock().unwrap().iter().filter(|hashed| **hashed == key).count()
+    }
+}
+fn measured_content(target: &InstallTarget) -> Vec<u8> { format!("#!/bin/false\n{}\n", artifact_name(target).unwrap()).into_bytes() }
+/// Same size as [`measured_content`], other bytes (an older build).
+fn older_content(target: &InstallTarget) -> Vec<u8> {
+    let mut bytes = measured_content(target);
+    *bytes.last_mut().unwrap() ^= 1;
+    bytes
+}
+fn sha(bytes: &[u8]) -> Sha256Digest { Sha256Digest(Sha256::digest(bytes).into()) }
+/// [`template_manifest`] with real digests and sizes of [`measured_content`].
+fn measured_manifest() -> ReleaseManifest {
+    let mut manifest = template_manifest();
+    for artifact in &mut manifest.artifacts {
+        let bytes = measured_content(&artifact.install_target);
+        artifact.sha256 = sha(&bytes);
+        artifact.size_bytes = bytes.len() as u64;
+        artifact.mode = measured_mode(&artifact.install_target).unwrap_or(0o755) as u16;
+    }
+    manifest
+}
+fn measure(files: &mut FakeFiles, cache: &mut MeasureCache, generation: Sha256Digest, manifest: &ReleaseManifest)
+    -> BTreeMap<String, Sha256Digest> {
+    measure_files(files, cache, generation, manifest, &mut || false)
+}
+fn root_observation(measured: BTreeMap<String, Sha256Digest>) -> Observed {
+    Observed { own_image: Some(digest(42)), live: true, euid: 0, measured }
+}
+fn report_of(reports: &[ComponentReadback], target: &InstallTarget) -> ComponentReadback {
+    reports.iter().find(|r| &r.target == target).unwrap().clone()
+}
+/// Every artifact measured as a file, in manifest order.
+fn file_measured(manifest: &ReleaseManifest) -> Vec<&ReleaseArtifact> {
+    manifest.artifacts.iter().filter(|a| !measured_sites(&a.install_target).is_empty()).collect()
+}
+const TREE: Site = Site::Published("usr/lib/duduclaw/parse-root-tree/usr/libexec/duduclaw");
+const HOST: Site = Site::Published("usr/libexec/duduclaw");
+
+#[test]
+fn update_readback_parse_worker_is_ready_only_when_the_tree_and_host_copies_match() {
+    let manifest = measured_manifest();
+    let target = InstallTarget::ParseWorker;
+    let worker = manifest.artifacts.iter().find(|a| a.install_target == target).unwrap().clone();
+    assert_eq!(measured_sites(&target), &[TREE, HOST]);
+    let older = sha(&older_content(&target));
+    for (tree_current, host_current) in [(true, true), (true, false), (false, true), (false, false)] {
+        let mut files = FakeFiles::exact(&manifest);
+        if !tree_current { files.put(TREE, &target, older_content(&target), 0o755); }
+        if !host_current { files.put(HOST, &target, older_content(&target), 0o755); }
+        let measured = measure(&mut files, &mut MeasureCache::default(), digest(9), &manifest);
+        let report = report_of(&components(&manifest, root_observation(measured)), &target);
+        let both = tree_current && host_current;
+        assert_eq!(report.ready, both, "tree {tree_current} host {host_current}");
+        assert_eq!(report.build_sha256, if both { worker.sha256 } else { older }, "tree {tree_current} host {host_current}");
+        // Both sites are always read, whatever the first one held.
+        assert_eq!((files.hash_count(TREE, &target), files.hash_count(HOST, &target)), (1, 1));
+    }
+    // Either copy missing (or not a trusted single-link root file): no measurement.
+    for missing in [TREE, HOST] {
+        let mut files = FakeFiles::exact(&manifest);
+        files.files.remove(&(missing, artifact_name(&target).unwrap()));
+        let measured = measure(&mut files, &mut MeasureCache::default(), digest(9), &manifest);
+        assert!(!measured.contains_key(&worker.id), "{missing:?}");
+        assert!(!report_of(&components(&manifest, root_observation(measured)), &target).ready);
+    }
+}
+
+#[test]
+fn update_readback_measures_every_executed_path() {
+    let where_ = |target: &InstallTarget| -> Vec<String> {
+        measured_sites(target).iter().map(|site| match site {
+            Site::Generation => "<generation>".to_owned(),
+            Site::Published(directory) => format!("/{directory}/{}", artifact_name(target).unwrap()),
+        }).collect()
+    };
+    let name = |target: &InstallTarget| artifact_name(target).unwrap();
+    assert_eq!(where_(&InstallTarget::Trampoline), [crate::systemd::TRAMPOLINE]);
+    assert_eq!(where_(&InstallTarget::TrampolineSelftest), [crate::systemd::SELFTEST_EXECUTABLE]);
+    assert_eq!(where_(&InstallTarget::IsolationProbe), [crate::systemd::PROBE_EXECUTABLE]);
+    // The parse unit executes its ExecStart inside the runtime tree bound at `/`.
+    let parse = directives(include_str!("../../duduclaw-parse-worker/systemd/duduclaw-parse@.service"));
+    let exec = parse.iter().find_map(|line| line.strip_prefix("ExecStart=")).unwrap();
+    assert!(parse.contains(&"BindReadOnlyPaths=/usr/lib/duduclaw/parse-root-tree:/:norbind"));
+    assert!(parse.contains(&"RootDirectory=/usr/lib/duduclaw/parse-root"));
+    assert_eq!(exec, format!("/usr/libexec/duduclaw/{}", name(&InstallTarget::ParseWorker)));
+    assert_eq!(where_(&InstallTarget::ParseWorker), [format!("/usr/lib/duduclaw/parse-root-tree{exec}"), exec.to_owned()]);
+    // Importer and migration run from the fixed `current` copies.
+    let import = directives(include_str!("../../duduclaw-import/systemd/duduclaw-import@.service"));
+    let expire = directives(include_str!("../../duduclaw-migration/systemd/duduclaw-migrate-expire@.service"));
+    let importer = where_(&InstallTarget::Importer);
+    let migration = where_(&InstallTarget::Migration);
+    assert_eq!(importer, ["/usr/lib/duduclaw/current/duduclaw-import"]);
+    assert_eq!(migration, ["/usr/lib/duduclaw/current/duduclaw-migrate"]);
+    assert!(import.contains(&format!("ExecStart={}", importer[0]).as_str()));
+    assert!(expire.iter().any(|line| line.starts_with(&format!("ExecStart={} ", migration[0]))));
+    // The bridge runs from the generation directory mounted at `/runtime`.
+    // (`installed.rs` registers `bridge_executable: "/runtime/duduclaw-mcp-bridge"`
+    // and opens it below the `runtime` mount, whose source is the generation
+    // directory: `anchors`.)
+    let installed = include_str!("installed.rs");
+    assert!(installed.contains(&format!("bridge_executable: \"/runtime/{}\"", name(&InstallTarget::McpBridge))));
+    assert!(installed.contains("RootPublicationAnchors::new(b.directory,"));
+    for target in [InstallTarget::McpBridge, InstallTarget::EgressForwarder, policy_target(),
+        InstallTarget::RuntimeEntry { registry_id: "api-worker-v1".into() }] {
+        assert_eq!(where_(&target), ["<generation>"], "{target:?}");
+    }
+    // The bridge's fixed copy is not what runs: an altered one does not make
+    // the generation's bridge unready, an altered generation copy does.
+    let manifest = measured_manifest();
+    let bridge = InstallTarget::McpBridge;
+    let mut files = FakeFiles::exact(&manifest);
+    files.put(Site::Published("usr/lib/duduclaw/current"), &bridge, older_content(&bridge), 0o755);
+    let measured = measure(&mut files, &mut MeasureCache::default(), digest(9), &manifest);
+    assert!(report_of(&components(&manifest, root_observation(measured)), &bridge).ready);
+    files.put(Site::Generation, &bridge, older_content(&bridge), 0o755);
+    let measured = measure(&mut files, &mut MeasureCache::default(), digest(9), &manifest);
+    assert!(!report_of(&components(&manifest, root_observation(measured)), &bridge).ready);
+}
+
+#[test]
+fn update_readback_deadline_is_well_below_the_client_timeout() {
+    // `pair` configures the client end with the updater's own `transport::timeout`.
+    let (client, _server) = pair();
+    for configured in [socket::getsockopt(&client, sockopt::ReceiveTimeout).unwrap(),
+        socket::getsockopt(&client, sockopt::SendTimeout).unwrap()] {
+        let configured = Duration::from_secs(configured.tv_sec() as u64) + Duration::from_micros(configured.tv_usec() as u64);
+        assert_eq!(configured, CLIENT_SOCKET_TIMEOUT);
+    }
+    assert!(READBACK_MEASURE_DEADLINE * 5 <= CLIENT_SOCKET_TIMEOUT * 2);
+    assert!(READBACK_MEASURE_DEADLINE >= Duration::from_millis(500));
+}
+
+#[test]
+fn update_readback_deadline_leaves_later_artifacts_unmeasured_and_the_retry_resumes_from_the_cache() {
+    let manifest = measured_manifest();
+    let measured_artifacts = file_measured(&manifest);
+    let sites: usize = measured_artifacts.iter().map(|a| measured_sites(&a.install_target).len()).sum();
+    let mut files = FakeFiles::exact(&manifest);
+    let mut cache = MeasureCache::default();
+    // The deadline passes once the third file's hashing began (inside its loop).
+    let hashed = files.hashed.clone();
+    let first = measure_files(&mut files, &mut cache, digest(9), &manifest, &mut || hashed.lock().unwrap().len() >= 3);
+    let done: Vec<String> = measured_artifacts.iter().take(2).map(|a| a.id.clone()).collect();
+    assert_eq!(first.keys().cloned().collect::<Vec<_>>(), done);
+    assert_eq!(cache.len(), 2);
+    let reports = components(&manifest, root_observation(first));
+    for (index, artifact) in measured_artifacts.iter().enumerate() {
+        assert_eq!(report_of(&reports, &artifact.install_target).ready, index < 2, "{:?}", artifact.install_target);
+    }
+    // The retry completes everything; the two finished files are not hashed again.
+    let second = measure(&mut files, &mut cache, digest(9), &manifest);
+    assert_eq!(second.len(), measured_artifacts.len());
+    assert!(components(&manifest, root_observation(second)).iter()
+        .filter(|r| r.target != InstallTarget::Spawnd).all(|r| r.ready));
+    assert_eq!(cache.len(), sites);
+    for (index, artifact) in measured_artifacts.iter().enumerate() {
+        for site in measured_sites(&artifact.install_target) {
+            // The interrupted third file is hashed again from the start.
+            assert_eq!(files.hash_count(*site, &artifact.install_target), if index == 2 { 2 } else { 1 },
+                "{:?}", artifact.install_target);
+        }
+    }
+    // A third Readback hashes nothing (every identity unchanged), and an
+    // already expired deadline measures nothing at all.
+    let before = files.hashed.lock().unwrap().len();
+    assert_eq!(measure(&mut files, &mut cache, digest(9), &manifest).len(), measured_artifacts.len());
+    assert_eq!(files.hashed.lock().unwrap().len(), before);
+    assert!(measure_files(&mut files, &mut cache, digest(9), &manifest, &mut || true).is_empty());
+}
+
+#[test]
+fn update_readback_changed_identity_invalidates_the_cached_measurement() {
+    let manifest = measured_manifest();
+    let bridge = InstallTarget::McpBridge;
+    let id = artifact_name(&bridge).unwrap();
+    let mut files = FakeFiles::exact(&manifest);
+    let mut cache = MeasureCache::default();
+    let signed = measure(&mut files, &mut cache, digest(9), &manifest)[&id];
+    // Same bytes, new ctime: hashed again (and still exact); nothing else is.
+    files.touch(Site::Generation, &bridge);
+    assert_eq!(measure(&mut files, &mut cache, digest(9), &manifest)[&id], signed);
+    assert_eq!(files.hash_count(Site::Generation, &bridge), 2);
+    assert_eq!(files.hash_count(Site::Generation, &InstallTarget::EgressForwarder), 1);
+    // Replaced by other bytes (new inode): the new bytes are reported, never the cached digest.
+    files.put(Site::Generation, &bridge, older_content(&bridge), 0o755);
+    let measured = measure(&mut files, &mut cache, digest(9), &manifest);
+    assert_eq!(measured[&id], sha(&older_content(&bridge)));
+    assert!(!report_of(&components(&manifest, root_observation(measured)), &bridge).ready);
+    // Gone: no measurement, whatever was cached.
+    files.files.remove(&(Site::Generation, id.clone()));
+    assert!(!measure(&mut files, &mut cache, digest(9), &manifest).contains_key(&id));
+    // Changed while it was hashed: neither reported nor cached.
+    let mut files = FakeFiles::exact(&manifest);
+    files.unstable = Some((Site::Generation, id.clone()));
+    let mut cache = MeasureCache::default();
+    assert!(!measure(&mut files, &mut cache, digest(9), &manifest).contains_key(&id));
+    assert_eq!(cache.len(), file_measured(&manifest).iter().map(|a| measured_sites(&a.install_target).len()).sum::<usize>() - 1);
+}
+
+#[test]
+fn update_readback_over_budget_manifest_measures_nothing() {
+    let manifest = measured_manifest();
+    // The parse worker counts once per site.
+    let expected: u64 = file_measured(&manifest).iter()
+        .map(|a| a.size_bytes * measured_sites(&a.install_target).len() as u64).sum();
+    assert_eq!(measured_bytes(&manifest), Some(expected));
+    for size in [MEASURE_BUDGET_BYTES, MEASURE_BUDGET_BYTES / 2 + 1, u64::MAX] {
+        let mut large = manifest.clone();
+        // One bridge at the budget, or a parse worker counted twice above it, or an overflow.
+        let target = if size == MEASURE_BUDGET_BYTES { InstallTarget::McpBridge } else { InstallTarget::ParseWorker };
+        large.artifacts.iter_mut().find(|a| a.install_target == target).unwrap().size_bytes = size;
+        let mut files = FakeFiles::exact(&large);
+        let mut cache = MeasureCache::default();
+        assert!(measure(&mut files, &mut cache, digest(9), &large).is_empty(), "{size}");
+        assert_eq!((files.opens, cache.len()), (0, 0), "{size}");
+        let reports = components(&large, root_observation(BTreeMap::new()));
+        for artifact in file_measured(&large) {
+            assert!(!report_of(&reports, &artifact.install_target).ready, "{:?}", artifact.install_target);
+        }
+        assert!(report_of(&reports, &InstallTarget::Spawnd).ready);
+        // Refused again on the retry (logged only the first time).
+        assert!(measure(&mut files, &mut cache, digest(9), &large).is_empty());
+    }
+}
+
+#[test]
+fn update_readback_generation_change_drops_the_cache() {
+    let manifest = measured_manifest();
+    let sites: usize = file_measured(&manifest).iter().map(|a| measured_sites(&a.install_target).len()).sum();
+    let mut files = FakeFiles::exact(&manifest);
+    let mut cache = MeasureCache::default();
+    let trampoline = InstallTarget::Trampoline;
+    let here = Site::Published("usr/lib/duduclaw");
+    assert_eq!(measure(&mut files, &mut cache, digest(1), &manifest).len(), file_measured(&manifest).len());
+    assert_eq!((cache.len(), files.hash_count(here, &trampoline)), (sites, 1));
+    measure(&mut files, &mut cache, digest(1), &manifest);
+    assert_eq!(files.hash_count(here, &trampoline), 1);
+    // Another generation: every file is measured afresh, and so is the first one's on return.
+    measure(&mut files, &mut cache, digest(2), &manifest);
+    assert_eq!((cache.len(), files.hash_count(here, &trampoline)), (sites, 2));
+    measure(&mut files, &mut cache, digest(1), &manifest);
+    assert_eq!(files.hash_count(here, &trampoline), 3);
 }
 
 #[test]
