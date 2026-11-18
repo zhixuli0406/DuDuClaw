@@ -26,7 +26,7 @@ fn removal_files() -> Vec<PathBuf> {
     // Persistent floors, keys, identity tombstones, update journal and generation
     // receipts deliberately survive. They are needed for recovery and anti-rollback.
     let mut files: Vec<_> = layout::BINARIES.iter().copied().chain([BINARY, LAUNCHER,
-        "/usr/local/sbin/duduclaw-auto-upgrade"]).map(PathBuf::from).collect();
+        "/usr/local/sbin/duduclaw-auto-upgrade", parse_lease::CONFIG]).map(PathBuf::from).collect();
     for name in layout::UNITS.iter().map(|(name, _)| *name).chain(lifecycle::EXTRA_UNITS.iter().copied()) {
         files.push(Path::new("/etc/systemd/system").join(name));
     }
@@ -223,6 +223,7 @@ impl lifecycle::RemovalHost for NativeRemoval {
                     Err(error) => return Err(error.into()),
                 }
             }
+            parse_lease::remove()?;
             checked("systemctl", &["daemon-reload"])?;
             Ok(())
         };

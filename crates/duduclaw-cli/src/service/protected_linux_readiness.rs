@@ -239,6 +239,7 @@ pub(super) trait HostSources {
     fn host_evidence(&mut self) -> Result<HostEvidence>;
     /// Loaded from the installed fragment, active, no unverified drop-ins.
     fn unit_active(&mut self, unit: &'static str) -> Result<()>;
+    fn parse_lease(&mut self) -> Result<()>;
     fn egress_config(&mut self) -> Result<EgressView>;
     /// `Ok(true)`: the broker DNS route is configured and its config passes
     /// the broker's own validator (`duduclaw_egress::daemon::BrokerConfig`).
@@ -488,6 +489,9 @@ fn egress_findings(sources: &mut dyn HostSources, evidence: Option<&HostEvidence
 
 // #7: the socket; the executable is compared in #3.
 fn parse_findings(sources: &mut dyn HostSources, out: &mut Vec<Finding>) {
+    if sources.parse_lease().is_err() {
+        out.push(Finding::failed(Item::ParseWorker, "retirement_lease_unavailable", parse_lease::INVALID));
+    }
     if sources.unit_active("duduclaw-parse.socket").is_err() {
         out.push(Finding::failed(Item::ParseWorker, "parse_worker_inactive", MSG_PARSE));
     }
@@ -703,6 +707,10 @@ impl HostSources for LiveSources {
     }
 
     fn unit_active(&mut self, unit: &'static str) -> Result<()> { unit_loaded_active(unit) }
+    fn parse_lease(&mut self) -> Result<()> {
+        let (_, gid) = self.gateway_ids()?;
+        parse_lease::verify(gid)
+    }
 
     fn egress_config(&mut self) -> Result<EgressView> {
         use duduclaw_egress::daemon::{read_root_config, Config, CONFIG_PATH};

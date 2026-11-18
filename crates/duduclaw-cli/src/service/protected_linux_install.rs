@@ -2,6 +2,8 @@ use super::*;
 use std::{fs, io::Write, os::unix::{fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt}, io::AsRawFd}, path::Path, process::{Command, Output}};
 #[path = "protected_linux_readiness.rs"]
 mod readiness;
+#[path = "protected_linux_parse_lease.rs"]
+mod parse_lease;
 #[path = "protected_linux_uninstall.rs"]
 mod removal;
 #[path = "protected_linux_fresh.rs"]
@@ -460,6 +462,7 @@ fn install_isolation_support_for((uid, gid): (u32, u32), defs: &str, broker_upst
         atomic_install(&format!("/etc/systemd/system/{name}"), 0o644,
             |file| { file.write_all(text.as_bytes())?; Ok(()) })?;
     }
+    parse_lease::install(gid)?;
     println!("隔離服務的帳號、目錄與單元已備妥，尚未啟用。簽章世代、DNS 政策、遷移與完整就緒檢查仍須由已驗證的安裝流程完成。");
     Ok(())
 }

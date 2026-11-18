@@ -64,7 +64,7 @@
 
 Kernel 7.0 **目前不接受**：trampoline 會拒絕大於 7 的 Landlock ABI。請確認實際開機使用的 kernel，不能只看發行版或 GCP 映像名稱。驗收請使用已接受的 kernel 組態，不要關閉 Landlock 或自行放寬 ABI 檢查。上表不涵蓋完整安裝、真實廠商 CLI 執行、完整遷移或更新復原。
 
-主機需有可信任的系統工具，包括 `getent`、`id`、`useradd`、util-linux、systemd 工具及 curl。員工 loop 儲存空間需要 ext4 或 XFS、受支援且非 thin provisioning 的底層裝置鏈，並保留員工配額與 TCB 所需空間。未知儲存配置或容量不足會使就緒檢查失敗。`/etc/nsswitch.conf` 的 passwd 與 group 兩行只能列出 `files` 與 `systemd`（Ubuntu、Debian 的預設值，以及使用 authselect `minimal` 設定檔的 RHEL／Fedora）。列出其他模組的主機（LDAP／SSSD 的 `sss`、Google Compute Engine OS Login 的 `oslogin`／`cache_oslogin`、`compat`、`[SUCCESS=merge]` 這類方括號動作子句）不受支援，就緒檢查會失敗：這類模組可能在員工 UID 範圍內加入帳號，而這個版本無法在外部目錄中保留該範圍。
+主機需有可信任的系統工具，包括 `getent`、`id`、`useradd`、util-linux、systemd 工具（含 `systemd-tmpfiles`）及 curl。員工 loop 儲存空間需要 ext4 或 XFS、受支援且非 thin provisioning 的底層裝置鏈，並保留員工配額與 TCB 所需空間。未知儲存配置或容量不足會使就緒檢查失敗。`/etc/nsswitch.conf` 的 passwd 與 group 兩行只能列出 `files` 與 `systemd`（Ubuntu、Debian 的預設值，以及使用 authselect `minimal` 設定檔的 RHEL／Fedora）。列出其他模組的主機（LDAP／SSSD 的 `sss`、Google Compute Engine OS Login 的 `oslogin`／`cache_oslogin`、`compat`、`[SUCCESS=merge]` 這類方括號動作子句）不受支援，就緒檢查會失敗：這類模組可能在員工 UID 範圍內加入帳號，而這個版本無法在外部目錄中保留該範圍。
 
 ## 單一執行檔受保護服務（目前版本）
 

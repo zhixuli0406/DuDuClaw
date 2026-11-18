@@ -1950,6 +1950,12 @@ fn storage_tools() -> std::result::Result<(), &'static str> {
     storage_tools_clear(trusted, device)
 }
 
+const REQUIRED_TOOLS: [&str; 9] = ["systemctl", "systemd-tmpfiles", "useradd", "usermod", "getent", "id", "loginctl", "python3", "setpriv"];
+
+fn required_tools_present(mut present: impl FnMut(&str) -> bool) -> bool {
+    REQUIRED_TOOLS.into_iter().all(|tool| present(tool))
+}
+
 fn tool_present(name: &str) -> bool {
     ["/usr/sbin", "/usr/bin", "/sbin", "/bin"].iter().any(|dir| Path::new(dir).join(name).is_file())
 }
@@ -2075,8 +2081,8 @@ fn preflight(upstream: Option<SocketAddr>, hosts: &[IpAddr], stage: &StageReceip
     if let Err(message) = storage_clear() { fail(message); }
     if let Err(message) = storage_tools() { fail(message); }
     if let Err(message) = storage_reserve_clear(filesystem_bytes(c"/var/lib")) { fail(message); }
-    for tool in ["systemctl", "useradd", "usermod", "getent", "id", "loginctl", "python3", "setpriv"] {
-        if !tool_present(tool) { fail("缺少必要的系統工具（systemctl、useradd、usermod、getent、id、loginctl、python3、setpriv）。"); break; }
+    if !required_tools_present(tool_present) {
+        fail("缺少必要的系統工具（systemctl、systemd-tmpfiles、useradd、usermod、getent、id、loginctl、python3、setpriv）。");
     }
     // Identities (design §5.1).
     match read_root_text("/etc/login.defs", 1024 * 1024) {
@@ -2530,6 +2536,7 @@ fn publish_platform(context: &mut Context, dns: &Dns) -> Result<()> {
         if !layout::published_components(Path::new("/"), 0, 0)? { return Err(refused(STAGE_UNVERIFIED)); }
         let units: Vec<String> = layout::UNITS.iter().map(|(name, _)| unit_file(name)).collect();
         let mut items: Vec<(&str, Kind)> = LAYOUT_TREES.iter().map(|tree| (*tree, Kind::Tree)).collect();
+        items.extend([(parse_lease::CONFIG, Kind::File), (parse_lease::DIRECTORY, Kind::Tree)]);
         items.extend(units.iter().map(|unit| (unit.as_str(), Kind::File)));
         // Check point 1 for the helper accounts created below.
         verify_identities(GATEWAY_ONLY)?;
@@ -3567,6 +3574,7 @@ fn start_services(context: &mut Context, dns: &Dns) -> Result<()> {
     let output = command("systemctl", &["daemon-reload"])?;
     if !output.status.success() { return Err(refused(SYSTEMCTL_FAILED)); }
     let gateway = passwd_entry("duduclaw")?.ok_or_else(|| refused("無法查詢服務帳號。"))?;
+    parse_lease::verify(gateway.gid)?;
     // Review round 6 item 1: a runtime directory systemd created in an
     // interrupted run before it was confirmed is confirmed now (or the step refuses).
     resume_component(&mut context.recorder, SPAWND_RUNTIME, context.generation)?;
@@ -3669,6 +3677,8 @@ fn platform_published(context: &Context, dns: &Dns) -> Result<()> {
         if *name == layout::DNS_BROKER_UNIT { broker_unit_installed(upstream)?; }
         else { text_installed(&unit_file(name), 0o644, text)?; }
     }
+    text_installed(parse_lease::CONFIG, 0o644, parse_lease::TEXT)?;
+    parse_lease::verify(gateway.gid)?;
     parse_runtime_tree(false)?;
     let spawnd = Directory::open(Path::new(SPAWND_ROOT)).map_err(|_| mismatch())?;
     for name in SPAWND_ANCHORS {
@@ -6008,5 +6018,16 @@ duduclaw-dl:x:987:\nduduclaw-dns:x:986:\nduduclaw-selftest:x:985:\nsudo:x:27:ali
         assert_eq!(journal_now().unwrap().step, Step::Rollback);
         continue_with(rollback_options(&generation), false).unwrap();
         fs::remove_dir_all(target).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod parse_lease_preflight_tests {
+    use super::*;
+
+    #[test]
+    fn preflight_without_systemd_tmpfiles_refuses() {
+        assert!(required_tools_present(|_| true));
+        assert!(!required_tools_present(|tool| tool != "systemd-tmpfiles"));
     }
 }

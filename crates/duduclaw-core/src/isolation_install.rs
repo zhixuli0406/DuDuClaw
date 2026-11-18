@@ -57,6 +57,8 @@ pub const DURABLE_IMPORT_MANIFEST: &str = "/etc/duduclaw/migration-import.json";
 /// `/var/lib/duduclaw-protected` and `duduclaw-gateway.service`.
 pub const FACTS: &[&str] = &[
     duduclaw_isolation::ids::SPAWND_SOCKET,
+    "/run/duduclaw-parse",
+    "/usr/lib/tmpfiles.d/duduclaw-parse.conf",
     // Isolation units (layout::UNITS minus the two slices above).
     "/etc/systemd/system/duduclaw-spawnd.socket",
     "/etc/systemd/system/duduclaw-spawnd.service",
