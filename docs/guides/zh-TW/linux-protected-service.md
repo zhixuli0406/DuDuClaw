@@ -21,7 +21,7 @@
 | `--host-public-address <IP>` | 不在網路介面上的本機公開位址（雲端 1:1 NAT）；可重複，最多 64 個。員工連不到這些位址。 |
 | `--enable-now` | 已不需要，也沒有作用：安裝程式一定會讓 Gateway 保持執行。仍然接受這個選項，既有的指令稿不必修改；有加時安裝程式會顯示一行提醒。 |
 
-安裝程式在變更任何東西之前先檢查主機，並一次列出所有未通過的項目：Ubuntu 22.04、Ubuntu 24.04 或 Debian 12；systemd 249 以上；核心 5.15 以上；cgroup v2；`/var/lib` 為 ext4 或 XFS；`/etc/login.defs` 明確設定 `SYS_UID_MAX`／`SYS_GID_MAX`；70000–99999 沒有任何帳號、群組或 subordinate ID 範圍；sshd 主設定包含 `/etc/ssh/sshd_config.d/*.conf`；`cron.allow`／`at.allow` 沒有允許 DuDuClaw 帳號；磁碟空間足夠；有效的團隊版授權；沒有先前的 DuDuClaw 安裝。使用外部帳號服務（LDAP、SSSD 等）的主機，這個安裝程式不支援。
+安裝程式在變更任何東西之前先檢查主機，並一次列出所有未通過的項目：Ubuntu 22.04、Ubuntu 24.04 或 Debian 12；systemd 249 以上；核心 5.15 以上；cgroup v2；`/var/lib` 為 ext4 或 XFS；`/etc/login.defs` 的系統 ID 上限有效（原廠檔案將 `SYS_UID_MAX`／`SYS_GID_MAX` 註解掉；未設定時依 shadow 的規則，採一般帳號／群組下限減一，下限預設為 1000）；70000–99999 沒有任何帳號、群組或 subordinate ID 範圍；sshd 主設定包含 `/etc/ssh/sshd_config.d/*.conf`；`cron.allow`／`at.allow` 沒有允許 DuDuClaw 帳號；磁碟空間足夠；有效的團隊版授權；沒有先前的 DuDuClaw 安裝。使用外部帳號服務（LDAP、SSSD 等）的主機，這個安裝程式不支援。
 
 接著依序：確認服務帳號沒有任何程序；發布已驗證的更新信任根、世代與固定路徑程式；建立服務帳號、目錄與服務單元（包含 Gateway 單元，但還不設為開機啟動）；依簽章政策寫入對外連線與 DNS 設定。然後依照開機時相同的順序啟動服務：各個 socket 與 spawnd、一致性檢查（spawnd 已開放）、egress、Gateway，最後是更新服務。安裝程式會等到更新服務回報已安裝的版本（最多 2 分鐘），以及 spawnd 回報所有就緒檢查都通過（最多 2 分半）；spawnd 若未在時限內就緒，訊息會列出還沒通過的檢查。之後啟用每晚更新 timer（`duduclaw-auto-upgrade.timer`），跑綜合就緒檢查，通過後才把 Gateway 設為開機自動啟動。只有完整的就緒檢查在 Gateway 執行中通過，安裝才會回報成功。
 

@@ -2050,7 +2050,7 @@ fn preflight(upstream: Option<SocketAddr>, hosts: &[IpAddr], stage: &StageReceip
     match read_root_text("/etc/login.defs", 1024 * 1024) {
         Ok(Some(defs)) => {
             if layout::system_id_limit(&defs, "SYS_UID_MAX").is_err() || layout::system_id_limit(&defs, "SYS_GID_MAX").is_err() {
-                fail("/etc/login.defs 必須明確設定 SYS_UID_MAX 與 SYS_GID_MAX。");
+                fail("/etc/login.defs 的 SYS_UID_MAX 或 SYS_GID_MAX 設定或推算結果無效：請檢查是否有格式錯誤、重複設定，或數值超出允許範圍。");
             }
             if !login_range_clear(&defs, "UID") || !login_range_clear(&defs, "GID") {
                 fail("一般帳號的 uid／gid 範圍與員工專用範圍 70000–99999 重疊。");

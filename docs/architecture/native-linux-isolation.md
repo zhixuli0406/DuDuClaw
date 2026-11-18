@@ -5927,8 +5927,12 @@ No formatter, release, service operation or production-home access was performed
   templates. Every executable and ancestor is checked without following links;
   executable files require root:root, exact 0755, one link and nonzero size.
   These checks do not authenticate a release; signed bootstrap must publish first.
-- System IDs must be nonzero and strictly below explicit `SYS_UID_MAX` and
-  `SYS_GID_MAX`, whose values must be below DynamicUser's range. New accounts
+- System IDs must be nonzero and strictly below `SYS_UID_MAX` and
+  `SYS_GID_MAX`, whose effective values must be 2–61183, below DynamicUser's range.
+  Stock Ubuntu/Debian files comment these keys out; absent maxima follow shadow
+  `useradd -r`/`groupadd -r`: `UID_MIN`/`GID_MIN` minus one, defaulting to 999
+  when the login minimum is also absent. Malformed or duplicate settings and
+  out-of-bounds effective maxima are refused. New accounts
   use a capped max-minus-one allocation, no subordinate ranges, and auxiliary
   accounts have locked/expired passwords, nologin, no home or supplementary
   groups, and disabled linger. Service UID/GID pairs must be distinct. Existing

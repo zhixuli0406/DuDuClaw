@@ -18,9 +18,22 @@ pub fn parse_login_defs(text: &str) -> io::Result<(UidRange, UidRange)> {
         let value: u32 = words.next().ok_or_else(denied)?.parse().map_err(|_| denied())?;
         if words.next().is_some() || values.insert(key, value).is_some() { return Err(denied()); }
     }
-    let get = |key| values.get(key).copied().ok_or_else(denied);
-    let system = UidRange { first: get("SYS_UID_MIN")?.min(get("SYS_GID_MIN")?), last: get("SYS_UID_MAX")?.max(get("SYS_GID_MAX")?) };
-    let login = UidRange { first: get("UID_MIN")?.min(get("GID_MIN")?), last: get("UID_MAX")?.max(get("GID_MAX")?) };
+    let get = |key, default| values.get(key).copied().unwrap_or(default);
+    let uid_min = get("UID_MIN", 1000);
+    let gid_min = get("GID_MIN", 1000);
+    let uid_max = match values.get("SYS_UID_MAX") {
+        Some(value) => *value,
+        None => uid_min.checked_sub(1).ok_or_else(denied)?,
+    };
+    let gid_max = match values.get("SYS_GID_MAX") {
+        Some(value) => *value,
+        None => gid_min.checked_sub(1).ok_or_else(denied)?,
+    };
+    // This range excludes employee IDs; it does not allocate system accounts.
+    // The compiled shadow minimum varies (100/101), so conservatively reserve
+    // every positive ID below the maximum when the minimum is absent.
+    let system = UidRange { first: get("SYS_UID_MIN", 1).min(get("SYS_GID_MIN", 1)), last: uid_max.max(gid_max) };
+    let login = UidRange { first: uid_min.min(gid_min), last: get("UID_MAX", 60000).max(get("GID_MAX", 60000)) };
     if system.first > system.last || login.first > login.last { return Err(denied()); }
     Ok((system, login))
 }
@@ -820,10 +833,32 @@ mod tests {
     fn strict_host_range_parsers() {
         let defs = "SYS_UID_MIN 100\nSYS_UID_MAX 999\nUID_MIN 1000\nUID_MAX 60000\nSYS_GID_MIN 100\nSYS_GID_MAX 999\nGID_MIN 1000\nGID_MAX 60000\n";
         assert_eq!(parse_login_defs(defs).unwrap().1, UidRange { first: 1000, last: 60000 });
-        assert!(parse_login_defs("UID_MIN 1000").is_err());
+        assert!(parse_login_defs("UID_MIN invalid").is_err());
         assert!(parse_login_defs(&format!("{defs}UID_MIN 1001\n")).is_err());
         assert_eq!(parse_subids("alice:100000:65536\n").unwrap(), vec![UidRange { first: 100000, last: 165535 }]);
         for text in ["a:1:0", "a:4294967295:2", "a:2", "a:-1:2"] { assert!(parse_subids(text).is_err()); }
+    }
+    #[test]
+    fn host_ranges_use_shadow_defaults_and_conservative_system_minimum() {
+        let stock = "UID_MIN 1000\nUID_MAX 60000\n#SYS_UID_MIN 100\n#SYS_UID_MAX 999\nGID_MIN 1000\nGID_MAX 60000\n#SYS_GID_MIN 100\n#SYS_GID_MAX 999\n";
+        for defs in ["", stock, "UID_MIN 1000", "# SYS_UID_MAX 999\n#SYS_UID_MAX\t999\n"] {
+            let (system, login) = parse_login_defs(defs).unwrap();
+            assert_eq!(system, UidRange { first: 1, last: 999 });
+            assert_eq!(login, UidRange { first: 1000, last: 60000 });
+        }
+        let (system, login) = parse_login_defs("UID_MIN 500\nGID_MIN 500\n").unwrap();
+        assert_eq!(system, UidRange { first: 1, last: 499 });
+        assert_eq!(login, UidRange { first: 500, last: 60000 });
+        let (system, _) = parse_login_defs("SYS_UID_MIN 101\nSYS_GID_MIN 100\nSYS_UID_MAX 800\nSYS_GID_MAX 900\n").unwrap();
+        assert_eq!(system, UidRange { first: 100, last: 900 });
+        for key in ["SYS_UID_MIN", "SYS_UID_MAX", "UID_MIN", "UID_MAX", "SYS_GID_MIN", "SYS_GID_MAX", "GID_MIN", "GID_MAX"] {
+            for value in ["", "invalid", "999 extra", "4294967296"] {
+                assert!(parse_login_defs(&format!("{key} {value}\n")).is_err());
+            }
+            assert!(parse_login_defs(&format!("{key} 999\n{key} 999\n")).is_err());
+        }
+        assert!(parse_login_defs("UID_MIN 0\n").is_err());
+        assert!(parse_login_defs("GID_MIN 0\n").is_err());
     }
     #[test]
     fn allow_file_overrides_deny_and_ssh_readback_is_exact() {

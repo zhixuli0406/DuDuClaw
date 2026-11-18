@@ -172,7 +172,7 @@ pub(super) fn dns_broker_unit_mismatch(installed: &[u8], upstream: Option<std::n
     format!("{DNS_BROKER_MISMATCH_HEAD} 的上游規則不符：預期 {wanted}，實際為 {shown}。不要手動修改這個單元或加入覆寫設定；要更換上游請重新執行安裝程式。")
 }
 
-pub(super) fn system_id_limit(defs: &str, key: &str) -> Result<u32, &'static str> {
+fn login_defs_value(defs: &str, key: &str) -> Result<Option<u32>, &'static str> {
     let mut found = None;
     for line in defs.lines() {
         let fields: Vec<_> = line.split('#').next().unwrap_or("").split_whitespace().collect();
@@ -181,10 +181,23 @@ pub(super) fn system_id_limit(defs: &str, key: &str) -> Result<u32, &'static str
             found = Some(fields[1].parse::<u32>().map_err(|_| "invalid system ID range")?);
         }
     }
-    match found {
-        Some(value) if value > 1 && value < 61184 => Ok(value),
-        _ => Err("explicit static system ID range required in /etc/login.defs"),
-    }
+    Ok(found)
+}
+
+pub(super) fn system_id_limit(defs: &str, key: &str) -> Result<u32, &'static str> {
+    let minimum = match key {
+        "SYS_UID_MAX" => "UID_MIN",
+        "SYS_GID_MAX" => "GID_MIN",
+        _ => return Err("unknown system ID limit"),
+    };
+    // Like shadow useradd/groupadd -r, an absent maximum defaults to login min - 1.
+    let value = match login_defs_value(defs, key)? {
+        Some(value) => value,
+        None => login_defs_value(defs, minimum)?.unwrap_or(1000).checked_sub(1)
+            .ok_or("invalid system ID range")?,
+    };
+    if value > 1 && value < 61184 { Ok(value) }
+    else { Err("invalid system ID range in /etc/login.defs") }
 }
 
 pub(super) fn validate_system_ids(uid: u32, gid: u32, defs: &str) -> Result<(), &'static str> {
@@ -279,10 +292,38 @@ mod tests {
             assert!(validate_system_ids(id, 998, defs).is_err());
             assert!(validate_system_ids(998, id, defs).is_err());
         }
-        for defs in ["", "# SYS_UID_MAX 999\nSYS_GID_MAX 999", "SYS_UID_MAX 999\nSYS_UID_MAX 998\nSYS_GID_MAX 999",
+        for defs in ["SYS_UID_MAX 999\nSYS_UID_MAX 998\nSYS_GID_MAX 999",
             "SYS_UID_MAX 70000\nSYS_GID_MAX 999", "SYS_UID_MAX 999 extra\nSYS_GID_MAX 999"] {
             assert!(validate_system_ids(500, 500, defs).is_err());
         }
+    }
+
+    #[test]
+    fn service_protected_layout_uses_shadow_system_id_defaults() {
+        let stock = "UID_MIN 1000\nUID_MAX 60000\n#SYS_UID_MIN 100\n#SYS_UID_MAX 999\nGID_MIN 1000\nGID_MAX 60000\n#SYS_GID_MIN 100\n#SYS_GID_MAX 999\n";
+        for (key, minimum) in [("SYS_UID_MAX", "UID_MIN"), ("SYS_GID_MAX", "GID_MIN")] {
+            assert_eq!(system_id_limit(stock, key), Ok(999));
+            assert_eq!(system_id_limit("", key), Ok(999));
+            assert_eq!(system_id_limit(&format!("{minimum} 500\n"), key), Ok(499));
+            assert_eq!(system_id_limit(&format!("{minimum} invalid\n{key} 800 # explicit\n"), key), Ok(800));
+            for comment in [format!("# {key} 999\n"), format!("#{key}\t999\n")] {
+                assert_eq!(system_id_limit(&comment, key), Ok(999));
+            }
+            for name in [key, minimum] {
+                for value in ["", "invalid", "999 extra", "70000", "0", "1", "4294967296"] {
+                    assert!(system_id_limit(&format!("{name} {value}\n"), key).is_err());
+                }
+                assert!(system_id_limit(&format!("{name} 999\n{name} 999\n"), key).is_err());
+            }
+            assert_eq!(system_id_limit(&format!("{key} 2\n"), key), Ok(2));
+            assert!(system_id_limit(&format!("{minimum} 2\n"), key).is_err());
+            assert!(system_id_limit(&format!("{key} 61184\n"), key).is_err());
+            assert_eq!(system_id_limit(&format!("{key} 61183\n"), key), Ok(61183));
+            assert_eq!(system_id_limit(&format!("{minimum} 61184\n"), key), Ok(61183));
+            assert!(system_id_limit(&format!("{minimum} 61185\n"), key).is_err());
+        }
+        assert!(validate_system_ids(500, 500, "").is_ok());
+        assert!(validate_system_ids(500, 500, "# SYS_UID_MAX 999\nSYS_GID_MAX 999").is_ok());
     }
 
     #[test]
