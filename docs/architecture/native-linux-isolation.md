@@ -1543,6 +1543,22 @@ nothing waits on a unit that starts later.
   gateway's data snapshot, the root key's intent and its confirmation move with
   the gateway's first start from S8 to S6. A resumed S6 repeats every entry:
   started units stay as they are and only the waits run again.
+- **Start-up order rule.** A component's read-back `ready` means "serving with
+  a complete identity" (gateway and egress: their read-back endpoint serving;
+  spawnd: a recent healthy admission iteration; file measurements: the signed
+  digest). Whole-host readiness (spawnd's evidence, the gateway's
+  `isolation_readiness`) is never an input of the updater's verification: both
+  need a fresh answer to a probe of the updater, which answers only after its
+  start-up verification (the first install deadlocked on exactly this: the
+  updater exited after its 30 s read-back deadline, forever). Whole-host
+  readiness is enforced at admission (spawnd `Readiness::check`; the gateway's
+  `check_execution` before every run). spawnd's unit `Wants=` and is `After=`
+  `duduclaw-employees.slice`, so the slice (and its cgroup) exists whenever
+  spawnd runs, before spawnd's mount namespace is built; otherwise nothing
+  starts it on a host with zero employees and `resources_verified` stays false.
+  Failures name themselves: the updater prints `update_stage: <phase>: <step>`
+  (and `<component> <verdict>` for a read-back) after `update_refused:`;
+  spawnd prints `evidence incomplete: …` / `evidence complete` on change.
 - **Installer S8** confirms the root key's ledger entry, `systemctl enable`s the
   gateway, confirms it is active and runs the full readiness check. S9 always
   runs the full check. `--enable-now` is accepted for compatibility and has no

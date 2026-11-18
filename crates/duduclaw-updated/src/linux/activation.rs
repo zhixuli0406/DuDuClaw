@@ -84,6 +84,7 @@ impl ActivationRuntime for SocketRuntime {
     fn drain(&mut self, generation: Sha256Digest) -> Result<()> {
         // Type=simple ordering is not socket readiness. Retrying the same digest
         // also allows B1 to report active runs while its durable barrier drains.
+        crate::stage::step("drain");
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             match root_exchange(ControlCommand::Drain { generation }) {
@@ -99,16 +100,26 @@ impl ActivationRuntime for SocketRuntime {
         // spawnd's update_control.rs) and spawnd caches completed file
         // measurements per generation, so these retries make progress instead
         // of re-hashing everything each time.
+        // Every component's `ready` means "serving with a complete identity"
+        // (never whole-host admission readiness, which needs this updater's
+        // probe answer and would deadlock its start-up verification). The last
+        // refusal seen names its component (`crate::stage`).
+        crate::stage::step("read-back");
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            match self.read_back_once(generation) {
-                Ok(reports) if reports.iter().all(|r| r.ready) => return Ok(reports),
-                _ if Instant::now() >= deadline => return Err(Error::Maintenance),
-                _ => std::thread::sleep(Duration::from_millis(200)),
+            if let Ok(reports) = self.read_back_once(generation) {
+                match reports.iter().find(|r| !r.ready) {
+                    None => return Ok(reports),
+                    Some(report) => crate::stage::component(activation_contract::component_id(&report.target),
+                        crate::stage::ReadbackVerdict::NotReady),
+                }
             }
+            if Instant::now() >= deadline { return Err(Error::Maintenance); }
+            std::thread::sleep(Duration::from_millis(200));
         }
     }
     fn resume(&mut self, generation: Sha256Digest) -> Result<()> {
+        crate::stage::step("resume");
         root_exchange(ControlCommand::Resume { generation })?; Ok(())
     }
 }
@@ -116,21 +127,26 @@ impl ActivationRuntime for SocketRuntime {
 impl SocketRuntime {
     fn read_back_once(&mut self, generation: Sha256Digest) -> Result<Vec<ComponentReadback>> {
         use nix::unistd::User;
+        use crate::stage::{component, ReadbackVerdict::{Mismatched, Unanswered, Unexpected}};
+        crate::stage::clear_component();
         let gateway = User::from_name(duduclaw_isolation::ids::GATEWAY_USER).map_err(transport::errno)?.ok_or(Error::Maintenance)?;
         let egress = User::from_name(duduclaw_isolation::ids::EGRESS_USER).map_err(transport::errno)?.ok_or(Error::Maintenance)?;
         if gateway.uid.as_raw() == 0 || gateway.gid.as_raw() == 0 || egress.uid.as_raw() == 0
             || egress.gid.as_raw() == 0 || gateway.uid == egress.uid { return Err(Error::Maintenance); }
-        let gateway_reports = read_components(GATEWAY_READBACK_SOCKET, gateway.uid.as_raw(), gateway.gid.as_raw(), generation)?;
-        let egress_reports = read_components(EGRESS_READBACK_SOCKET, egress.uid.as_raw(), egress.gid.as_raw(), generation)?;
+        let gateway_reports = read_components(GATEWAY_READBACK_SOCKET, gateway.uid.as_raw(), gateway.gid.as_raw(), generation)
+            .inspect_err(|_| component("gateway", Unanswered))?;
         if gateway_reports.len() != 1 || gateway_reports[0].target != InstallTarget::Gateway
-            || gateway_reports[0].effective_uid != gateway.uid.as_raw()
-            || egress_reports.len() != 1 || egress_reports[0].target != InstallTarget::Egress
-            || egress_reports[0].effective_uid != egress.uid.as_raw() { return Err(Error::Maintenance); }
-        let mut reports = read_components(SPAWND_UPDATE_SOCKET, 0, 0, generation)?;
+            || gateway_reports[0].effective_uid != gateway.uid.as_raw() { component("gateway", Mismatched); return Err(Error::Maintenance); }
+        let egress_reports = read_components(EGRESS_READBACK_SOCKET, egress.uid.as_raw(), egress.gid.as_raw(), generation)
+            .inspect_err(|_| component("egress", Unanswered))?;
+        if egress_reports.len() != 1 || egress_reports[0].target != InstallTarget::Egress
+            || egress_reports[0].effective_uid != egress.uid.as_raw() { component("egress", Mismatched); return Err(Error::Maintenance); }
+        let mut reports = read_components(SPAWND_UPDATE_SOCKET, 0, 0, generation).inspect_err(|_| component("spawnd", Unanswered))?;
         // B1 reports itself and root file measurements of the non-daemon
         // components (`validate_readbacks`); it cannot substitute for the two
         // live non-root service endpoints.
         if reports.iter().any(|r| matches!(r.target, InstallTarget::Gateway | InstallTarget::Egress | InstallTarget::UpdateSlot)) {
+            component("spawnd", Unexpected);
             return Err(Error::Maintenance);
         }
         reports.extend(gateway_reports); reports.extend(egress_reports); Ok(reports)
@@ -514,7 +530,10 @@ impl<R: ActivationRuntime> LinuxGenerationActivator<R> {
 struct LinuxEffects { install: Directory, committed: Sha256Digest }
 impl GenerationEffects for LinuxEffects {
     fn verify(&mut self, manifest: &ReleaseManifest, digest: Sha256Digest) -> Result<()> {
-        verify_unit_identities()?; verify_generation(&self.install, manifest, digest)
+        crate::stage::step("unit identities");
+        verify_unit_identities()?;
+        crate::stage::step("generation");
+        verify_generation(&self.install, manifest, digest)
     }
     /// Runs right before `Apply` (`activation_contract::activate_generation`).
     fn quiesce(&mut self) -> Result<()> { quiesce_units(&mut Systemctl, QUIESCE_DEADLINE) }
@@ -524,6 +543,7 @@ impl GenerationEffects for LinuxEffects {
         restart_units(&mut Systemctl, RESTART_DEADLINE, RESTART_POLL)
     }
     fn processes(&mut self, manifest: &ReleaseManifest) -> Result<Vec<u32>> {
+        crate::stage::step("processes");
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             match live_processes(manifest) {
@@ -533,8 +553,8 @@ impl GenerationEffects for LinuxEffects {
             }
         }
     }
-    fn current(&mut self) -> Result<Sha256Digest> { read_current_at(&self.install) }
-    fn sync(&mut self) -> Result<()> { self.install.sync() }
+    fn current(&mut self) -> Result<Sha256Digest> { crate::stage::step("selector"); read_current_at(&self.install) }
+    fn sync(&mut self) -> Result<()> { crate::stage::step("sync"); self.install.sync() }
 }
 impl<R: ActivationRuntime> GenerationActivator for LinuxGenerationActivator<R> {
     fn preflight(&mut self, manifest: &ReleaseManifest, digest: Sha256Digest) -> Result<()> {

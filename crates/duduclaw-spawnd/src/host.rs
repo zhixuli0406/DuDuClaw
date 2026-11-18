@@ -232,6 +232,10 @@ struct Core {
     recording_gate: crate::host_state::RecordingGate,
     /// C2: the start-up reconciliation latch (retried by `refresh`).
     startup: StartupReconcile,
+    /// The last evidence line printed (`readiness::evidence_line`): printed
+    /// again only when the set of false checks (or the resources sub-condition)
+    /// changes, never every refresh.
+    evidence_line: Option<String>,
 }
 /// C2: the cadence of start-up reconciliation retries.
 const STARTUP_RETRY: Duration = Duration::from_secs(2);
@@ -283,7 +287,7 @@ impl LinuxHost {
             monitor, runs: BTreeMap::new(), audit, last_refresh: Instant::now(), poisoned: false, view: view.clone(),
             helper_events: Vec::new(), recording_probe: probe::RecordingProbe::default(),
             probe_schedule: probe::ProbeSchedule::default(), recording_gate: recording_gate.clone(),
-            startup: StartupReconcile::opened(Instant::now(), false) };
+            startup: StartupReconcile::opened(Instant::now(), false), evidence_line: None };
         startup_stage("report", core.report.publish(gateway.1))?;
         // Cleanup is attempted even when C/H/F/G are absent. Failure is evidence,
         // never permission to skip an orphan or reinterpret a stale reservation.
@@ -396,6 +400,13 @@ impl Core {
             state.at.elapsed() < Duration::from_secs(1) && state.result.as_ref().is_ok_and(Vec::is_empty));
         let ptys = self.systemd.resources_ready();
         checks.resources_verified = ptys.is_ok();
+        // Fixed names only: the readiness.json check names and, for
+        // resources, the first failing sub-condition (`ResourceCheck`).
+        let line = crate::readiness::evidence_line(&checks, ptys.err().map(crate::systemd::ResourceCheck::describe).as_deref());
+        if self.evidence_line.as_deref() != Some(line.as_str()) {
+            eprintln!("duduclaw-spawnd: {line}");
+            self.evidence_line = Some(line);
+        }
         match EvidenceReport::current(checks, ptys.unwrap_or(0)) {
             Ok(mut report) => {
                 report.checked_boottime_ms = probe_started;

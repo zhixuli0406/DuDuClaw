@@ -177,24 +177,67 @@ pub fn protocol(manifest: &ReleaseManifest, target: &InstallTarget) -> u16 {
 ///   every `RuntimeEntry` (including `isolation-policy-v1`). `effective_uid` is the
 ///   measurer's and must be 0; the uid the component later runs under is not
 ///   claimed by this report.
+///
+/// A record's `ready` is the component's own liveness with a complete
+/// identity (a live daemon serving its read-back; a file measurement that
+/// matched). Whole-host admission readiness is never an input: it depends on
+/// this updater answering probes, which it does only after this check.
 pub fn validate_readbacks(manifest: &ReleaseManifest, readbacks: &[ComponentReadback]) -> Result<()> {
     manifest.validate()?;
+    match readback_fault(manifest, readbacks) {
+        None => Ok(()),
+        Some((component, verdict)) => { crate::stage::component(component, verdict); Err(Error::Maintenance) }
+    }
+}
+/// The first refused record of [`validate_readbacks`] (after the manifest
+/// itself validated): the fixed component id ([`component_id`]) and why.
+/// `None`: every rule holds.
+pub fn readback_fault(manifest: &ReleaseManifest, readbacks: &[ComponentReadback])
+    -> Option<(&'static str, crate::stage::ReadbackVerdict)> {
+    use crate::stage::ReadbackVerdict as V;
     let expected: Vec<_> = manifest.artifacts.iter().filter(|a| a.install_target != InstallTarget::UpdateSlot).collect();
-    if expected.len() != readbacks.len() { return Err(Error::Maintenance); }
-    for artifact in expected {
+    for artifact in &expected {
+        let id = component_id(&artifact.install_target);
         let mut found = readbacks.iter().filter(|r| r.artifact_id == artifact.id);
-        let report = found.next().ok_or(Error::Maintenance)?;
-        if found.next().is_some() || report.target != artifact.install_target || report.product != manifest.product
+        let Some(report) = found.next() else { return Some((id, V::Missing)) };
+        if found.next().is_some() { return Some((id, V::Duplicated)); }
+        if report.target != artifact.install_target || report.product != manifest.product
             || report.version != manifest.version || report.protocol != protocol(manifest, &artifact.install_target)
-            || report.build_sha256 != artifact.sha256 || !report.ready { return Err(Error::Maintenance); }
+            || report.build_sha256 != artifact.sha256 { return Some((id, V::Mismatched)); }
+        if !report.ready { return Some((id, V::NotReady)); }
         let root = match readback_kind(&artifact.install_target) {
             Some(ReadbackKind::LiveProcess { root }) => root,
             Some(ReadbackKind::FileMeasurement) => true,
-            None => return Err(Error::Maintenance),
+            None => return Some((id, V::Unexpected)),
         };
-        if (report.effective_uid == 0) != root { return Err(Error::Maintenance); }
+        if (report.effective_uid == 0) != root { return Some((id, V::WrongUid)); }
     }
-    Ok(())
+    // Exact membership: every expected artifact matched exactly one record,
+    // so any further record names something the manifest does not expect.
+    if expected.len() != readbacks.len() {
+        let extra = readbacks.iter().find(|r| !expected.iter().any(|a| a.id == r.artifact_id));
+        return Some((extra.map_or("unknown", |r| component_id(&r.target)), V::Unexpected));
+    }
+    None
+}
+/// The fixed diagnostic id of a component (never a registry id, path or
+/// digest). No wildcard arm: every target has one.
+pub fn component_id(target: &InstallTarget) -> &'static str {
+    match target {
+        InstallTarget::Gateway => "gateway",
+        InstallTarget::Spawnd => "spawnd",
+        InstallTarget::Egress => "egress",
+        InstallTarget::Trampoline => "trampoline",
+        InstallTarget::TrampolineSelftest => "trampoline-selftest",
+        InstallTarget::IsolationProbe => "isolation-probe",
+        InstallTarget::ParseWorker => "parse-worker",
+        InstallTarget::Importer => "importer",
+        InstallTarget::Migration => "migration",
+        InstallTarget::McpBridge => "mcp-bridge",
+        InstallTarget::EgressForwarder => "egress-forwarder",
+        InstallTarget::RuntimeEntry { .. } => "runtime-entry",
+        InstallTarget::UpdateSlot => "update-slot",
+    }
 }
 /// How a component's readback is produced (see [`validate_readbacks`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -319,6 +362,40 @@ mod tests {
         // A second copy of one report in place of another is refused.
         let mut bad = good.clone(); bad.push(good[0].clone());
         assert!(validate_readbacks(&m, &bad).is_err());
+    }
+    /// DEFECT 25b: the refused record is named by its fixed component id and
+    /// verdict; every target has a non-empty id, distinct except that all
+    /// runtime entries share one (their registry ids are never printed).
+    #[test]
+    fn readback_fault_names_the_component_and_why() {
+        use crate::stage::ReadbackVerdict as V;
+        let m = template_manifest();
+        let good = template_reports(&m);
+        assert_eq!(readback_fault(&m, &good), None);
+        let index = |target: InstallTarget| good.iter().position(|r| r.target == target).unwrap();
+        let gateway = index(InstallTarget::Gateway);
+        let mut bad = good.clone(); bad[gateway].ready = false;
+        assert_eq!(readback_fault(&m, &bad), Some(("gateway", V::NotReady)));
+        let mut bad = good.clone(); bad[gateway].build_sha256 = Sha256Digest([0xee; 32]);
+        assert_eq!(readback_fault(&m, &bad), Some(("gateway", V::Mismatched)));
+        let mut bad = good.clone(); bad[gateway].effective_uid = 0;
+        assert_eq!(readback_fault(&m, &bad), Some(("gateway", V::WrongUid)));
+        let mut bad = good.clone(); bad.remove(index(InstallTarget::Egress));
+        assert_eq!(readback_fault(&m, &bad), Some(("egress", V::Missing)));
+        let spawnd = index(InstallTarget::Spawnd);
+        let mut bad = good.clone(); bad.push(good[spawnd].clone());
+        assert_eq!(readback_fault(&m, &bad), Some(("spawnd", V::Duplicated)));
+        let slot = m.artifacts.iter().find(|a| a.install_target == InstallTarget::UpdateSlot).unwrap();
+        let mut bad = good.clone();
+        bad.push(ComponentReadback { artifact_id: slot.id.clone(), target: slot.install_target.clone(), product: m.product,
+            version: m.version, protocol: m.protocols.updated, build_sha256: slot.sha256, effective_uid: 0, ready: true });
+        assert_eq!(readback_fault(&m, &bad), Some(("update-slot", V::Unexpected)));
+        let mut ids = std::collections::BTreeSet::new();
+        for artifact in &m.artifacts {
+            let id = component_id(&artifact.install_target);
+            assert!(!id.is_empty() && id.bytes().all(|b| b.is_ascii_lowercase() || b == b'-'), "{id}");
+            if !matches!(artifact.install_target, InstallTarget::RuntimeEntry { .. }) { assert!(ids.insert(id), "{id}"); }
+        }
     }
     #[test]
     fn barrier_requires_nonce_generation_zero_runs_and_persistent_admission() {

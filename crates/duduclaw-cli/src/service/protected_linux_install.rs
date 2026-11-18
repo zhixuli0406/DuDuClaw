@@ -1079,6 +1079,9 @@ mod spawnd_install_tests {
         // HX: cgroupfs is writable only beneath the employees slice; the rest stays protected.
         assert!(service.lines().any(|line| line == "ReadWritePaths=-/sys/fs/cgroup/duduclaw.slice/duduclaw-employees.slice"));
         assert!(service.lines().any(|line| line == "ProtectControlGroups=yes"));
+        // The slice is started with spawnd and realised before its namespace.
+        assert!(service.lines().any(|line| line == "Wants=duduclaw-employees.slice"));
+        assert!(service.lines().any(|line| line == "After=duduclaw-employees.slice"));
         assert!(lookup("duduclaw-employees.slice").lines().any(|line| line == "TasksMax=1024"));
         assert!(lookup("duduclaw.slice").lines().any(|line| line == "MemoryMin=512M"));
     }

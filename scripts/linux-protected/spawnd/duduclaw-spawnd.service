@@ -2,6 +2,16 @@
 Description=DuDuClaw root employee launch agent
 Requires=duduclaw-spawnd.socket
 After=duduclaw-spawnd.socket dbus.service
+# The employees slice (the aggregate ceiling of every run unit) exists whenever
+# spawnd runs: nothing else starts it before the first run unit (first install:
+# loaded, inactive, no cgroup, so `resources_verified` stayed false). Wants=
+# starts it at install and on every boot; After= realises its cgroup before
+# PID 1 builds this unit's mount namespace, so the `-`-prefixed ReadWritePaths=
+# entry below is bound instead of silently skipped. An active slice stays active
+# with no member units. Wants=, not Requires=: a stopped slice never stops
+# spawnd; admission stays closed (`employees_slice_cgroup`) until it is back.
+Wants=duduclaw-employees.slice
+After=duduclaw-employees.slice
 # R6 consistency gate: every start of this unit (boot, manual, Restart=) also
 # starts the gate, which is BindsTo=/PartOf=/After= this unit, so it drops with
 # every stop or restart and is re-armed only by the new process. A [Unit]

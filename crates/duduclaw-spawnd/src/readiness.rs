@@ -42,14 +42,35 @@ impl Default for Readiness {
 impl Readiness {
     pub fn check(&self) -> Result<()> {
         if self.protocol != PROTOCOL_VERSION { return Err(ErrorCode::UnsupportedVersion); }
-        if [self.registry_verified, self.accounts_locked, self.ssh_live_negative_checks,
-            self.cron_at_acl_and_jobs_verified, self.external_iam_reservation_verified,
-            self.trampoline_verified, self.landlock_self_test, self.namespace_self_test,
-            self.egress_verified, self.dns_route_verified, self.storage_verified,
-            self.resources_verified, self.startup_reconciled, self.process_scan_verified].into_iter().all(|value| value) {
+        if self.named_checks().into_iter().all(|(_, value)| value) {
             Ok(())
         } else { Err(ErrorCode::IsolationUnavailable) }
     }
+    /// Every primary check (all of them `check` requires) under its
+    /// readiness.json name.
+    pub fn named_checks(&self) -> [(&'static str, bool); 14] {
+        [("registry_verified", self.registry_verified), ("accounts_locked", self.accounts_locked),
+            ("ssh_live_negative_checks", self.ssh_live_negative_checks),
+            ("cron_at_acl_and_jobs_verified", self.cron_at_acl_and_jobs_verified),
+            ("external_iam_reservation_verified", self.external_iam_reservation_verified),
+            ("trampoline_verified", self.trampoline_verified), ("landlock_self_test", self.landlock_self_test),
+            ("namespace_self_test", self.namespace_self_test), ("egress_verified", self.egress_verified),
+            ("dns_route_verified", self.dns_route_verified), ("storage_verified", self.storage_verified),
+            ("resources_verified", self.resources_verified), ("startup_reconciled", self.startup_reconciled),
+            ("process_scan_verified", self.process_scan_verified)]
+    }
+}
+
+/// spawnd's one-line evidence diagnosis: `evidence complete`, or
+/// `evidence incomplete: <false checks>` with `resources` (the fixed name of
+/// the first failing resources sub-condition) after `resources_verified`.
+/// Fixed identifiers only.
+pub fn evidence_line(checks: &Readiness, resources: Option<&str>) -> String {
+    let failed: Vec<String> = checks.named_checks().into_iter().filter(|(_, value)| !value).map(|(name, _)| match resources {
+        Some(detail) if name == "resources_verified" => format!("{name}({detail})"),
+        _ => name.to_string(),
+    }).collect();
+    if failed.is_empty() { "evidence complete".into() } else { format!("evidence incomplete: {}", failed.join(", ")) }
 }
 
 /// HX in-run helper readiness (D8 revision §5). Reported beside, never inside,
@@ -108,6 +129,28 @@ mod tests {
         for check in checks { assert_eq!(check.check(), Err(ErrorCode::IsolationUnavailable)); }
         assert!(validate_egress_ip_allow(&["10.0.0.1/32".into()]).is_err());
         assert!(validate_egress_ip_allow(&[]).is_ok());
+    }
+    /// The evidence line uses exactly the readiness.json names, lists every
+    /// false primary check, the resources sub-condition, or "evidence complete".
+    #[test]
+    fn evidence_line_names_false_checks_with_readiness_json_names() {
+        let json = serde_json::to_value(Readiness::default()).unwrap();
+        let fields: Vec<&str> = json.as_object().unwrap().iter().filter(|(_, value)| value.is_boolean())
+            .map(|(name, _)| name.as_str()).collect();
+        let named: Vec<&str> = Readiness::default().named_checks().iter().map(|(name, _)| *name).collect();
+        assert_eq!(fields.len(), named.len());
+        assert!(named.iter().all(|name| fields.contains(name)), "{named:?}");
+        let mut all = Readiness::default();
+        assert_eq!(evidence_line(&all, None), format!("evidence incomplete: {}", named.join(", ")));
+        for (name, _) in all.named_checks() {
+            let mut value = serde_json::to_value(&all).unwrap(); value[name] = true.into();
+            all = serde_json::from_value(value).unwrap();
+        }
+        assert!(all.check().is_ok());
+        assert_eq!(evidence_line(&all, None), "evidence complete");
+        all.resources_verified = false; all.dns_route_verified = false;
+        assert_eq!(evidence_line(&all, Some("employees_slice_cgroup")),
+            "evidence incomplete: dns_route_verified, resources_verified(employees_slice_cgroup)");
     }
     #[test]
     fn helper_readiness_fails_closed_without_open_time_credentials() {

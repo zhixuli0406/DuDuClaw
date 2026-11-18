@@ -36,32 +36,49 @@ impl Service {
     }
 }
 pub fn run(slot: UpdateSlot) -> Result<()> {
+    use crate::stage::{phase, step};
+    // Every step names itself before it runs (`crate::stage`): `main` prints
+    // the last one with a start-up failure.
+    phase("start-up");
+    step("hardening");
     super::harden()?;
+    step("state directory");
     let mut disk = Directory::open(Path::new(STATE_ROOT))?;
+    step("lock");
     let _lock = disk.lock()?;
+    step("state");
     let mut state: State = disk.json("state.json")?;
     state.validate()?;
     let host_arch = if cfg!(target_arch = "x86_64") { Architecture::X86_64 }
         else if cfg!(target_arch = "aarch64") { Architecture::Aarch64 } else { return Err(Error::Incompatible); };
     if state.arch != host_arch { return Err(Error::Incompatible); }
+    step("trust");
     let root = load_trust()?;
+    step("executing slot");
     super::launcher::verify_executing_slot(&state, slot, &root)?;
     // The real first root run checks trust, signed known manifest, writable
     // journal and dir fsync before marking health; no version floor moves here.
+    step("self-test record");
     disk.atomic_json("self-test.json", &serde_json::json!({"event":"updater_self_test"}))?;
+    step("accounts");
     let (gateway_uid, gateway_gid, _) = accounts()?;
+    step("socket");
     let listener = transport::bind(gateway_gid)?;
+    step("state save");
     if state.selector.trial_slot == Some(slot) { state.mark_healthy(slot)?; }
     state.interrupted_requests();
     use state::DurableState;
     disk.save(&state)?;
     let mut disk = state::FailClosedDisk::new(disk);
+    step("emergency reconcile");
     super::emergency::reconcile(&mut state, &mut disk)?;
+    step("recovery request");
     let recovery = state.recovery_request()?;
     let shared = Arc::new(Mutex::new(Service { state, disk, working: recovery.is_some() }));
     // The launcher already verified the executing updater. Reconcile the product
     // selector before accepting work, even when the journal has no pending row.
     recover_committed(&shared)?;
+    phase("serving");
     if let Some((id, version)) = recovery { start_worker(Arc::clone(&shared), id, version); }
     loop {
         let fd = match transport::accept(&listener, gateway_uid, gateway_gid) { Ok(fd) => fd, Err(_) => continue };
@@ -199,12 +216,15 @@ fn verified_state_generation(state: &State, verify_all_artifacts: bool) -> Resul
     Ok((digest, manifest))
 }
 fn recover_committed(shared: &Arc<Mutex<Service>>) -> Result<()> {
+    use crate::stage::{phase, step};
+    phase("committed");
     let (committed, pending, resume) = {
         let service = shared.lock().map_err(|_| Error::Maintenance)?;
         (service.state.effective_digest(), service.state.pending.as_ref().map(|p| p.digest), service.state.resume_required)
     };
     let mut activator = super::activation::LinuxGenerationActivator::new(committed);
     if pending.is_some() {
+        step("pending selector");
         match super::activation::read_current() {
             Ok(current) if current == committed || Some(current) == pending => return Ok(()),
             _ => { let _ = activator.close_admission(committed); return Err(Error::Maintenance); }
@@ -213,16 +233,22 @@ fn recover_committed(shared: &Arc<Mutex<Service>>) -> Result<()> {
     // Every clean boot checks the actual running services. A matching symlink
     // alone cannot establish a consistent generation. Leave admission closed if
     // any bytes, trust, identity or live readback cannot be checked.
+    // (`drain`, `unit identities`, `generation`, `selector`, `processes`,
+    // `read-back`, `resume`: named by the activation steps themselves.)
     activator.close_admission(committed)?;
+    step("manifest");
     let (generation, bytes, signature) = installed_generation(committed)?;
     let manifest = super::trust_admin::verify_recorded(&bytes, &signature)?;
+    step("artifacts");
     verify_artifacts(&generation, &manifest)?;
     {
+        step("emergency");
         let service = shared.lock().map_err(|_| Error::Maintenance)?;
         super::emergency::complete_committed(&service.state)?;
     }
     activator.verify_committed(&manifest, committed)?;
     if resume {
+        step("finish resume");
         shared.lock().map_err(|_| Error::Maintenance)?.mutate(|state| state.finish_resume())?;
     }
     Ok(())

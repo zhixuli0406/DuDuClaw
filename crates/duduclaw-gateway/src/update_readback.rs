@@ -6,9 +6,17 @@
 //! frame out, through the updater's own transport functions (no ancillary
 //! data, unknown fields refused, 5 s socket timeouts). The record describes
 //! this running process: `build_sha256` is the SHA-256 of `/proc/self/exe`
-//! (the loaded image), `effective_uid` is `geteuid()`, `ready` is
-//! `isolation_readiness::status().ready`. A value that cannot be computed
-//! makes the record `ready: false`; nothing is guessed.
+//! (the loaded image), `effective_uid` is `geteuid()`, `ready` means this
+//! process is serving its read-back with a complete identity (the same notion
+//! as egress's `serving`). A value that cannot be computed makes the record
+//! `ready: false`; nothing is guessed.
+//!
+//! Whole-host admission readiness (`isolation_readiness::status`) is never an
+//! input here: it needs a fresh answer to the gateway's probe of the updater,
+//! which the updater gives only after its start-up verification, which reads
+//! this record (a circular wait on every boot and update). It is enforced
+//! separately, before every employee run: `isolation_readiness::check_execution`
+//! (and spawnd's own admission).
 #![allow(unsafe_code)]
 use duduclaw_isolation::{ids::Sha256Digest, update::{InstallTarget, Product, ReleaseVersion}};
 use duduclaw_updated::activation_contract::{ComponentReadback, ControlCommand, ControlOutcome, ControlRequest, ControlResponse};
@@ -27,23 +35,23 @@ pub struct Identity {
     pub effective_uid: u32,
 }
 
-/// `ready`: the gateway's isolation readiness (`isolation_readiness::status`).
-pub fn readback(identity: &Identity, ready: bool) -> ComponentReadback {
+/// `serving`: this process's read-back endpoint is serving. Whole-host
+/// readiness is deliberately not a parameter (module comment).
+pub fn readback(identity: &Identity, serving: bool) -> ComponentReadback {
     let artifact_id = duduclaw_updated::publication::artifact_name(&InstallTarget::Gateway).ok();
     let complete = identity.build.is_some() && identity.version.is_some() && artifact_id.is_some()
         && identity.effective_uid != 0;
     ComponentReadback { artifact_id: artifact_id.unwrap_or_default(), target: InstallTarget::Gateway, product: PRODUCT,
         version: identity.version.unwrap_or(ReleaseVersion { major: 0, minor: 0, patch: 0 }), protocol: PROTOCOL,
         build_sha256: identity.build.unwrap_or(Sha256Digest([0; 32])), effective_uid: identity.effective_uid,
-        ready: ready && complete }
+        ready: serving && complete }
 }
 
-/// Only `Readback` of a non-zero generation on schema 1 is answered with data;
-/// readiness is evaluated only for such a request.
-pub fn answer(request: &ControlRequest, identity: &Identity, ready: impl FnOnce() -> bool) -> ControlResponse {
+/// Only `Readback` of a non-zero generation on schema 1 is answered with data.
+pub fn answer(request: &ControlRequest, identity: &Identity, serving: bool) -> ControlResponse {
     let outcome = match (request.schema_version, &request.command) {
         (SCHEMA, ControlCommand::Readback { generation }) if generation.0 != [0; 32] =>
-            ControlOutcome::Readback { components: vec![readback(identity, ready())] },
+            ControlOutcome::Readback { components: vec![readback(identity, serving)] },
         _ => ControlOutcome::Refused,
     };
     ControlResponse { schema_version: SCHEMA, nonce: request.nonce, generation: request.command.generation(), outcome }
@@ -166,15 +174,13 @@ mod linux {
 
     /// One connection: peer check, one request frame, one reply frame, 5 s
     /// socket timeouts. Any error closes the connection without a reply.
-    pub(super) fn serve_one(fd: OwnedFd, peer: (u32, u32), identity: &Identity, ready: impl FnOnce() -> bool) -> io::Result<()> {
+    pub(super) fn serve_one(fd: OwnedFd, peer: (u32, u32), identity: &Identity, serving: bool) -> io::Result<()> {
         transport::timeout(&fd).map_err(updated)?;
         let credentials = socket::getsockopt(&fd, sockopt::PeerCredentials)?;
         if (credentials.uid(), credentials.gid()) != peer { return Err(invalid()); }
         let request: ControlRequest = transport::receive(&fd).map_err(updated)?;
-        transport::send(&fd, &super::answer(&request, identity, ready)).map_err(updated)
+        transport::send(&fd, &super::answer(&request, identity, serving)).map_err(updated)
     }
-
-    fn ready() -> bool { crate::isolation_readiness::status().is_some_and(|readiness| readiness.ready) }
 
     fn run() {
         // Hash first: the socket exists only once every answer can be computed.
@@ -193,7 +199,8 @@ mod linux {
                 Ok(raw) => {
                     // SAFETY: accept4 returned a new descriptor owned only here.
                     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-                    let _ = serve_one(fd, (0, 0), &identity, ready);
+                    // Serving: the identity was observed and this accept loop runs.
+                    let _ = serve_one(fd, (0, 0), &identity, true);
                 }
                 Err(Errno::EAGAIN | Errno::EINTR | Errno::ECONNABORTED) => {}
                 Err(_) => std::thread::sleep(Duration::from_millis(100)),
@@ -231,7 +238,7 @@ mod linux {
             let (client, server) = socketpair(AddressFamily::Unix, SockType::SeqPacket, None, SockFlag::SOCK_CLOEXEC).unwrap();
             transport::timeout(&client).unwrap();
             send(&client);
-            let result = serve_one(server, peer, &identity(), || true);
+            let result = serve_one(server, peer, &identity(), true);
             (result, transport::receive::<ControlResponse>(&client).ok())
         }
         fn raw(client: &OwnedFd, bytes: &[u8]) {
@@ -307,7 +314,7 @@ mod tests {
         assert_eq!((record.target, record.product, record.protocol, record.effective_uid),
             (InstallTarget::Gateway, Product::Duduclaw, 1, 999));
         assert_eq!((record.artifact_id.as_str(), record.build_sha256), ("duduclaw", Sha256Digest([1; 32])));
-        // Isolation not ready, or any field that could not be computed.
+        // Not serving, or any field that could not be computed.
         assert!(!readback(&identity(), false).ready);
         assert!(!readback(&Identity { build: None, ..identity() }, true).ready);
         assert!(!readback(&Identity { version: None, ..identity() }, true).ready);
@@ -317,21 +324,91 @@ mod tests {
     }
 
     #[test]
-    fn gateway_readback_answers_only_readback_and_reads_readiness_lazily() {
+    fn gateway_readback_answers_only_readback() {
         let generation = Sha256Digest([3; 32]);
         let request = |schema_version, command| ControlRequest { schema_version, nonce: RequestId([2; 16]), command };
         let good = request(1, ControlCommand::Readback { generation });
-        let response = answer(&good, &identity(), || true);
+        let response = answer(&good, &identity(), true);
         assert!(duduclaw_updated::activation_contract::validate_response(&good, &response).is_ok());
         assert!(matches!(response.outcome, ControlOutcome::Readback { ref components } if components.len() == 1 && components[0].ready));
-        let response = answer(&good, &identity(), || false);
+        let response = answer(&good, &identity(), false);
         assert!(matches!(response.outcome, ControlOutcome::Readback { ref components } if !components[0].ready));
         for refused in [request(2, ControlCommand::Readback { generation }),
             request(1, ControlCommand::Readback { generation: Sha256Digest([0; 32]) }),
             request(1, ControlCommand::Drain { generation }), request(1, ControlCommand::Resume { generation })] {
-            let response = answer(&refused, &identity(), || panic!("readiness read for a refused request"));
+            let response = answer(&refused, &identity(), true);
             assert!(matches!(response.outcome, ControlOutcome::Refused));
             assert_eq!((response.nonce, response.generation), (refused.nonce, refused.command.generation()));
         }
+    }
+
+    /// DEFECT 23: whole-host admission readiness is not established in this
+    /// process (it never is in unit tests: no spawnd evidence, no updater
+    /// answer), yet a serving gateway with a complete identity is ready; an
+    /// incomplete identity never is.
+    #[test]
+    fn gateway_readback_ready_is_serving_with_complete_identity_not_host_readiness() {
+        assert!(!crate::isolation_readiness::status().is_some_and(|readiness| readiness.ready));
+        assert!(readback(&identity(), true).ready);
+        let generation = Sha256Digest([3; 32]);
+        let request = ControlRequest { schema_version: 1, nonce: RequestId([2; 16]), command: ControlCommand::Readback { generation } };
+        assert!(matches!(answer(&request, &identity(), true).outcome,
+            ControlOutcome::Readback { ref components } if components[0].ready));
+        for incomplete in [Identity { build: None, ..identity() }, Identity { version: None, ..identity() },
+            Identity { effective_uid: 0, ..identity() }] {
+            assert!(!readback(&incomplete, true).ready);
+        }
+    }
+
+    /// DEFECT 23 composition: the updater's start-up verification
+    /// (`healthy_readback`, the same call `verify_committed` makes) over this
+    /// gateway's real record and a fake spawnd. Whole-host readiness is not
+    /// ready, yet verification succeeds; a wrong image hash still fails.
+    #[test]
+    fn gateway_readback_satisfies_the_updaters_startup_verification() {
+        use duduclaw_isolation::update::*;
+        use duduclaw_updated::activation_contract::{healthy_readback, ActivationRuntime, ComponentReadback,
+            GenerationEffects, GenerationPreparation, Preparation};
+        struct Runtime(Vec<ComponentReadback>);
+        impl GenerationPreparation for Runtime {
+            fn preflight(&mut self, _: &Preparation) -> duduclaw_updated::Result<()> { Ok(()) }
+            fn apply(&mut self, _: &Preparation) -> duduclaw_updated::Result<()> { Ok(()) }
+        }
+        impl ActivationRuntime for Runtime {
+            fn drain(&mut self, _: Sha256Digest) -> duduclaw_updated::Result<()> { Ok(()) }
+            fn read_back(&mut self, _: Sha256Digest) -> duduclaw_updated::Result<Vec<ComponentReadback>> { Ok(self.0.clone()) }
+            fn resume(&mut self, _: Sha256Digest) -> duduclaw_updated::Result<()> { Ok(()) }
+        }
+        struct Effects(Sha256Digest);
+        impl GenerationEffects for Effects {
+            fn verify(&mut self, _: &ReleaseManifest, _: Sha256Digest) -> duduclaw_updated::Result<()> { Ok(()) }
+            fn quiesce(&mut self) -> duduclaw_updated::Result<()> { Ok(()) }
+            fn publish(&mut self, _: Sha256Digest) -> duduclaw_updated::Result<()> { Ok(()) }
+            fn restart(&mut self) -> duduclaw_updated::Result<()> { Ok(()) }
+            fn processes(&mut self, _: &ReleaseManifest) -> duduclaw_updated::Result<Vec<u32>> { Ok(vec![7, 8]) }
+            fn current(&mut self) -> duduclaw_updated::Result<Sha256Digest> { Ok(self.0) }
+            fn sync(&mut self) -> duduclaw_updated::Result<()> { Ok(()) }
+        }
+        let artifact = |target: InstallTarget, digest: u8| ReleaseArtifact {
+            id: duduclaw_updated::publication::artifact_name(&target).unwrap(), install_target: target,
+            sha256: Sha256Digest([digest; 32]), size_bytes: 1, mode: 0o755 };
+        let manifest = ReleaseManifest { schema_version: 1, product: Product::Duduclaw,
+            version: ReleaseVersion { major: 1, minor: 83, patch: 0 }, minimum_version: ReleaseVersion { major: 1, minor: 79, patch: 0 },
+            serial: 1, channel: ReleaseChannel::Stable, arch: Architecture::X86_64, os: OperatingSystem::Linux,
+            created_at_unix: 1, expires_at_unix: 2,
+            protocols: ProtocolCompatibility { gateway: 1, spawnd: 1, trampoline: 1, egress: 1, updated: 1, mcp_bridge: 1, parse_worker: 1, importer: 1 },
+            artifacts: vec![artifact(InstallTarget::Gateway, 1), artifact(InstallTarget::Spawnd, 2), artifact(InstallTarget::UpdateSlot, 3)],
+            migrations: vec![] };
+        let spawnd = ComponentReadback { artifact_id: manifest.artifacts[1].id.clone(), target: InstallTarget::Spawnd,
+            product: manifest.product, version: manifest.version, protocol: 1, build_sha256: Sha256Digest([2; 32]),
+            effective_uid: 0, ready: true };
+        let generation = Sha256Digest([9; 32]);
+        assert!(!crate::isolation_readiness::status().is_some_and(|readiness| readiness.ready));
+        let gateway = readback(&identity(), true);
+        healthy_readback(&mut Runtime(vec![spawnd.clone(), gateway]), &mut Effects(generation), &manifest, generation).unwrap();
+        let wrong_hash = readback(&Identity { build: Some(Sha256Digest([0xee; 32])), ..identity() }, true);
+        assert!(healthy_readback(&mut Runtime(vec![spawnd.clone(), wrong_hash]), &mut Effects(generation), &manifest, generation).is_err());
+        let incomplete = readback(&Identity { version: None, ..identity() }, true);
+        assert!(healthy_readback(&mut Runtime(vec![spawnd, incomplete]), &mut Effects(generation), &manifest, generation).is_err());
     }
 }

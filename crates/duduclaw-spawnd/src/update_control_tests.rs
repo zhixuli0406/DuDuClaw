@@ -1282,6 +1282,25 @@ fn update_unit_spawnd_ready_is_bounded_and_restarts_after_repair() {
     assert!(!lines.contains(&"StandardError=null"));
 }
 
+/// DEFECT 24: the employees slice is started with spawnd (install, every
+/// boot) and its cgroup exists before spawnd's mount namespace is built, so
+/// the `-`-prefixed cgroup ReadWritePaths= entry is bound. A stopped slice
+/// never stops spawnd (no Requires=/BindsTo=/PartOf=).
+#[test]
+fn update_unit_spawnd_starts_after_the_employees_slice() {
+    let lines = directives(SPAWND_UNIT);
+    for expected in ["Wants=duduclaw-employees.slice", "After=duduclaw-employees.slice",
+        "ReadWritePaths=-/sys/fs/cgroup/duduclaw.slice/duduclaw-employees.slice", "ProtectControlGroups=yes"] {
+        assert!(lines.contains(&expected), "{expected}");
+    }
+    assert!(!lines.iter().any(|line| ["Requires=", "BindsTo=", "PartOf=", "Requisite="].iter()
+        .any(|key| line.starts_with(key) && line.contains("duduclaw-employees.slice"))));
+    // The [Unit] relation precedes [Service] (where systemd reads it).
+    let unit_end = SPAWND_UNIT.find("[Service]").unwrap();
+    assert!(SPAWND_UNIT.find("\nWants=duduclaw-employees.slice\n").is_some_and(|at| at < unit_end));
+    assert!(SPAWND_UNIT.find("\nAfter=duduclaw-employees.slice\n").is_some_and(|at| at < unit_end));
+}
+
 #[test]
 fn update_unit_egress_and_gateway_depend_on_isolation_ready() {
     use duduclaw_isolation::ids::ISOLATED_GATEWAY_UNIT_DEPENDENCIES;
@@ -3237,7 +3256,8 @@ impl GateUnits {
             .filter(|line| keys.iter().any(|key| line.starts_with(key))).map(|line| rename(line)).collect::<Vec<_>>().join("\n");
         let spawnd = format!("[Unit]\n{}\n[Service]\nType=simple\nExecStart=/bin/sh -c 'while [ ! -e {flag} ]; do sleep 0.2; done; \
             rm -f {flag}; exit {exit}'\n{}\nRestartSec=1\n",
-            relations(SPAWND_UNIT, &["Wants=", "StartLimitIntervalSec=", "StartLimitBurst="]),
+            // Only the gate relation: the stand-in must not start the real employees slice.
+            relations(SPAWND_UNIT, &["Wants=duduclaw-isolation-ready.service", "StartLimitIntervalSec=", "StartLimitBurst="]),
             relations(SPAWND_UNIT, &["Restart=", "RestartForceExitStatus=", "SuccessExitStatus="]),
             flag = units.flag().display(), exit = EXIT_SET_INCONSISTENT);
         let ready = format!("[Unit]\n{}\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/usr/bin/true\n",
