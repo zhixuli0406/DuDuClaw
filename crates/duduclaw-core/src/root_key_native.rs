@@ -265,7 +265,19 @@ fn engine_sockets_denied(uid: u32) -> Result<(), ProbeFailure> {
     match reachable { Some(failure) => Err(failure), None => Ok(()) }
 }
 
-/// Accept exactly one v2 unit line, with at most the kernel's trailing newline.
+/// The gateway unit's cgroup v2 line when the unit runs in systemd's default
+/// `system.slice` (a gateway unit without a `Slice=` line).
+pub const GATEWAY_CGROUP_SYSTEM_SLICE: &str = "0::/system.slice/duduclaw-gateway.service";
+
+/// The gateway unit's cgroup v2 line when the unit carries
+/// `Slice=duduclaw-tcb.slice` (the isolated layout's unit,
+/// `root_key::recovery::isolated_unit_text`): systemd nests `a-b.slice` under
+/// `a.slice`, so the unit's cgroup is `duduclaw.slice/duduclaw-tcb.slice/…`.
+pub const GATEWAY_CGROUP_TCB_SLICE: &str = "0::/duduclaw.slice/duduclaw-tcb.slice/duduclaw-gateway.service";
+
+/// Accept exactly one v2 unit line — [`GATEWAY_CGROUP_SYSTEM_SLICE`] or
+/// [`GATEWAY_CGROUP_TCB_SLICE`], nothing else — with at most the kernel's
+/// trailing newline.
 #[cfg(any(target_os = "linux", test))]
 pub(super) fn parse_cgroup(input: Option<&str>) -> CgroupState {
     let Some(input) = input else { return CgroupState::Invalid; };
@@ -276,7 +288,7 @@ pub(super) fn parse_cgroup(input: Option<&str>) -> CgroupState {
                 if id.parse::<u32>().is_ok_and(|id| id != 0) && !controllers.is_empty())
     }) { return CgroupState::V1; }
     match input.strip_suffix('\n').unwrap_or(input) {
-        "0::/system.slice/duduclaw-gateway.service" => CgroupState::Unit,
+        GATEWAY_CGROUP_SYSTEM_SLICE | GATEWAY_CGROUP_TCB_SLICE => CgroupState::Unit,
         _ => CgroupState::Invalid,
     }
 }

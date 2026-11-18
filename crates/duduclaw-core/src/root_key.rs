@@ -30,7 +30,8 @@ mod native;
 #[path = "root_key_version.rs"]
 mod version;
 pub use version::check_protected_version;
-pub use native::{CgroupState, ExecutableState, NativeInputs, initial_user_namespace_map};
+pub use native::{CgroupState, ExecutableState, NativeInputs, initial_user_namespace_map,
+    GATEWAY_CGROUP_SYSTEM_SLICE, GATEWAY_CGROUP_TCB_SLICE};
 #[cfg(target_os = "linux")]
 pub use native::native_host_check;
 

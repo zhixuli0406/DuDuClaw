@@ -3112,12 +3112,20 @@ fn dns_readback(context: &Context, dns: &Dns) -> Result<()> {
 
 // ── S6 StartServices ──────────────────────────────────────────────────────
 
-fn wait_for(deadline: Duration, mut ready: impl FnMut() -> bool) -> bool {
-    let end = Instant::now() + deadline;
+/// How often S6 asks again while it waits for a unit or an object.
+const START_POLL: Duration = Duration::from_millis(250);
+
+fn wait_for(deadline: Duration, ready: impl FnMut() -> bool) -> bool {
+    wait_until(Instant::now() + deadline, START_POLL, ready)
+}
+
+/// `ready` asked at once and then every `poll` until it holds (`true`) or
+/// `end` has passed (`false`; asked at least once even when `end` already passed).
+pub(super) fn wait_until(end: Instant, poll: Duration, mut ready: impl FnMut() -> bool) -> bool {
     loop {
         if ready() { return true; }
         if Instant::now() >= end { return false; }
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(poll);
     }
 }
 
@@ -3490,7 +3498,9 @@ fn first_gateway_start(context: &mut Context, bound: Duration) -> Result<()> {
     let window = ledger::window_start();
     let output = command("systemctl", &["start", UNIT])?;
     if !output.status.success() { return Err(refused(format!("無法啟動 {UNIT}。"))); }
-    let started = wait_for(bound, || readiness::unit_loaded_active(UNIT).is_ok());
+    // Defect 21: one budget for "unit active" and then "key published"
+    // (`confirm_root_key_after_start`); the key is confirmed only after both.
+    let end = Instant::now() + bound;
     // Review R3 item 4: the gateway's launcher created it, not this
     // installer: recorded only as a root-owned 0400 single-link regular
     // file on the protected root's mount, absent at the durable intent
@@ -3498,10 +3508,41 @@ fn first_gateway_start(context: &mut Context, bound: Duration) -> Result<()> {
     // this install's ledgered, unmodified gateway
     // unit. Review round 4 item 2: otherwise the step fails.
     let key = duduclaw_core::root_key::KEY_PATH;
-    let owner = live_unit_is_ours(context.recorder.ledger(), UNIT, Instant::now() + QUIESCE_COMMAND_CAP);
-    let absent = context.recorder.absent_at_intent(key);
-    let confirmed = context.recorder.confirm_component(key,
-        |identity| Ok(root_key_proven(identity, &component_facts(key, absent, window), owner)));
+    confirm_root_key_after_start(&mut context.recorder, bound, end, START_POLL,
+        || readiness::unit_loaded_active(UNIT).is_ok(),
+        || ledger::present(key).unwrap_or(false),
+        |recorded, absent, identity| {
+            let owner = live_unit_is_ours(recorded, UNIT, Instant::now() + QUIESCE_COMMAND_CAP);
+            root_key_proven(identity, &component_facts(key, absent, window), owner)
+        })
+}
+
+/// Defect 21: the gateway unit is `Type=simple`, so PID 1 reports it active as
+/// soon as the root launcher runs, a moment BEFORE the launcher publishes the
+/// root key (atomic rename onto [`duduclaw_core::root_key::KEY_PATH`]: present
+/// at that name means complete; its temporary name never counts).
+pub(super) fn root_key_not_created(bound: Duration) -> DuDuClawError {
+    refused(format!("Gateway 已進入執行狀態，但它的啟動器未在 {} 秒內建立 root 金鑰 {}；這一步未完成，金鑰的建立紀錄維持未確認，未記錄任何物件。請先執行 sudo journalctl -b -u {UNIT} 查看啟動器的紀錄，修正後以同一個 duduclaw-bootstrap install 命令續接，或執行 duduclaw-bootstrap rollback。",
+        bound.as_secs(), duduclaw_core::root_key::KEY_PATH))
+}
+
+/// S6, after `systemctl start` of the gateway (effects injected): within the
+/// one budget `end` (`bound` from the start), wait for the unit to be active
+/// (`active`), then for the launcher's key at its final path (`key_present`),
+/// then ONE [`ledger::Recorder::confirm_component`] of the key whose proof is
+/// `accept(ledger, absent_at_intent, identity)`. The key absent when the
+/// budget is spent: [`root_key_not_created`], nothing confirmed or saved (the
+/// entry stays `intent`, so a re-run resumes). The unit never active: the key
+/// is confirmed as before (a key the launcher made is still recorded for
+/// rollback), then the "not active in time" refusal.
+pub(super) fn confirm_root_key_after_start<H: ledger::LedgerHost>(recorder: &mut ledger::Recorder<H>,
+    bound: Duration, end: Instant, poll: Duration, active: impl FnMut() -> bool, key_present: impl FnMut() -> bool,
+    accept: impl FnOnce(&ledger::Ledger, bool, &ledger::Identity) -> bool) -> Result<()> {
+    let key = duduclaw_core::root_key::KEY_PATH;
+    let started = wait_until(end, poll, active);
+    if started && !wait_until(end, poll, key_present) { return Err(root_key_not_created(bound)); }
+    let (ledger, absent) = (recorder.ledger().clone(), recorder.absent_at_intent(key));
+    let confirmed = recorder.confirm_component(key, |identity| Ok(accept(&ledger, absent, identity)));
     if !started { return Err(refused("Gateway 未在時限內進入執行狀態。")); }
     confirmed
 }
