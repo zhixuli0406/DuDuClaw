@@ -113,7 +113,8 @@ test-root RUSTFLAGS, the TEST issuer/key variables, any `RUSTC`/`RUSTC_WRAPPER`/
 `RUSTC_WORKSPACE_WRAPPER`, and `.cargo/config*` naming the cfg). Cargo configuration
 files with a top-level `include` (never followed), decoded strings naming the cfg,
 release-sensitive `[env]` names, `build.rustc-wrapper`, `build.rustc-workspace-wrapper`
-or `build.rustc`, or that cannot be read or safely parsed, are also refused.
+or `build.rustc`, response files in compiler flags (refused without following them),
+or that cannot be read or safely parsed, are also refused.
 This check prevents accidental test-licence shipments through stray or unknown release-machine
 configuration; control of the machine or toolchain is covered by the signed-source and review
 process, since an attacker could change the compiler, this script or the sources.

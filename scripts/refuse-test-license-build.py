@@ -32,7 +32,10 @@ covers that threat.
       DUDUCLAW_BOOTSTRAP_TEST_MINISIGN_KEY or DUDUCLAW_TEST_LICENSE_ISSUER_PUBKEY set;
       `--cfg duduclaw_test_root` in RUSTFLAGS, CARGO_ENCODED_RUSTFLAGS,
       CARGO_BUILD_RUSTFLAGS or CARGO_TARGET_<TRIPLE>_RUSTFLAGS (only that target's with
-      --target, every target's without); RUSTC_WRAPPER, RUSTC_WORKSPACE_WRAPPER, RUSTC
+      --target, every target's without), the corresponding RUSTDOCFLAGS forms or
+      CARGO_PROFILE_*_RUSTFLAGS; response file tokens (@path) in those variables or
+      Cargo configuration compiler flags (refused, never followed);
+      RUSTC_WRAPPER, RUSTC_WORKSPACE_WRAPPER, RUSTC
       or their CARGO_BUILD_* forms set to anything (release builds use the toolchain's
       own rustc; no release job sets a wrapper); a .cargo/config.toml or .cargo/config
       containing `duduclaw_test_root` or a build.rustc/build.rustc-wrapper/
@@ -66,8 +69,11 @@ TEST_LICENSE_ISSUER_VARIABLE = "DUDUCLAW_TEST_LICENSE_ISSUER_PUBKEY"
 BOOTSTRAP_TEST_KEY_VARIABLE = "DUDUCLAW_BOOTSTRAP_TEST_MINISIGN_KEY"
 # Flag variables Cargo hands to rustc, with their separators (Cargo reference,
 # "Environment variables"); CARGO_TARGET_<TRIPLE>_RUSTFLAGS is checked as well.
-RUSTFLAGS_VARIABLES = (("CARGO_ENCODED_RUSTFLAGS", "\x1f"), ("RUSTFLAGS", None), ("CARGO_BUILD_RUSTFLAGS", None))
+RUSTFLAGS_VARIABLES = (("CARGO_ENCODED_RUSTFLAGS", "\x1f"), ("RUSTFLAGS", None), ("CARGO_BUILD_RUSTFLAGS", None),
+                       ("CARGO_ENCODED_RUSTDOCFLAGS", "\x1f"), ("RUSTDOCFLAGS", None),
+                       ("CARGO_BUILD_RUSTDOCFLAGS", None))
 TARGET_RUSTFLAGS = re.compile(r"CARGO_TARGET_[A-Za-z0-9_]+_RUSTFLAGS")
+PROFILE_RUSTFLAGS = re.compile(r"CARGO_PROFILE_[A-Za-z0-9_]+_RUSTFLAGS")
 # Anything that replaces or wraps rustc could add the cfg out of sight.
 RUSTC_VARIABLES = ("RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "RUSTC",
                    "CARGO_BUILD_RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_RUSTC")
@@ -276,7 +282,28 @@ def cargo_config_files(environment, cargo_dirs=None, cargo_home=None):
 
 
 def release_env_name(name):
-    return name in RELEASE_ENV_VARIABLES or TARGET_RUSTFLAGS.fullmatch(name) or TARGET_RUSTC.fullmatch(name)
+    return (name in RELEASE_ENV_VARIABLES or TARGET_RUSTFLAGS.fullmatch(name)
+            or PROFILE_RUSTFLAGS.fullmatch(name) or TARGET_RUSTC.fullmatch(name))
+
+
+def has_response_file(tokens):
+    """Refuse indirect compiler arguments without ever opening their files."""
+    return any(token.startswith("@") for token in tokens)
+
+
+def config_response_files(value, prefix=()):
+    """Yield flag settings using response files anywhere in the decoded TOML tree."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            path = (*prefix, key)
+            if key in ("rustflags", "rustdocflags"):
+                tokens = item.split() if isinstance(item, str) else item if isinstance(item, list) else []
+                if has_response_file(token for token in tokens if isinstance(token, str)):
+                    yield ".".join(path)
+            yield from config_response_files(item, path)
+    elif isinstance(value, list):
+        for item in value:
+            yield from config_response_files(item, prefix)
 
 
 def decoded_strings(value):
@@ -311,6 +338,8 @@ def cargo_config_problems(data, path):
         text = data.decode("utf-8")
         if tomllib is not None:
             document = tomllib.loads(text)
+            for key in config_response_files(document):
+                problems.append(f"{path} sets {key} with a response file: not allowed in a release environment")
             if "include" in document:
                 refuse_key(("include",))
             if (any(TEST_ROOT_CFG in value for value in decoded_strings(document))
@@ -325,8 +354,11 @@ def cargo_config_problems(data, path):
             env = document.get("env", {})
             if not isinstance(env, dict):
                 raise ValueError("env must be a table")
-            for name in env:
+            for name, item in env.items():
                 refuse_key(("env", name))
+                value = item.get("value") if isinstance(item, dict) else item
+                if "FLAGS" in name and isinstance(value, str) and has_response_file(value.split()):
+                    problems.append(f"{path} sets env.{name} with a response file: not allowed in a release environment")
             return problems
 
         # This is deliberately a small subset, not a replacement TOML parser.
@@ -334,6 +366,11 @@ def cargo_config_problems(data, path):
         # here and require Python 3.11+ rather than risking a missed override.
         if re.search(r"\\[uU]", text) or '"""' in text or "'''" in text:
             raise ValueError("cannot safely decode Cargo configuration without tomllib (use Python 3.11+)")
+        # Conservatively reject even unrelated @ characters with flag words here:
+        # arrays can span lines, and this fallback cannot safely decode their scope.
+        if "@" in text and re.search(r"\b(?:rustflags|rustdocflags)\b", text):
+            problems.append(f"{path}: possible response file in compiler flags without tomllib; "
+                            "not allowed in a release environment")
         key_pattern = r"[A-Za-z0-9_-]+(?:\s*\.\s*[A-Za-z0-9_-]+)*"
         string_pattern = r'''(?:"[^"\\\r\n]*"|'[^'\r\n]*')'''
         value_pattern = rf"(?:{string_pattern}|true|false|[+-]?(?:0|[1-9][0-9]*)|\[\s*(?:{string_pattern}\s*,\s*)*(?:{string_pattern}\s*)?\])"
@@ -358,6 +395,9 @@ def cargo_config_problems(data, path):
                 raise ValueError("duplicate or conflicting key")
             seen.add(key)
             refuse_key(key)
+            if len(key) >= 2 and key[0] == "env" and "FLAGS" in key[1] and "@" in line:
+                problems.append(f"{path} sets env.{key[1]} with a possible response file: "
+                                "not allowed in a release environment")
         return problems
     except ValueError as error:
         raise RefuserError(f"cannot parse Cargo configuration {path}: {error}") from error
@@ -378,10 +418,15 @@ def environment_problems(environment, target=None, cargo_dirs=None, cargo_home=N
         target_variables = sorted(name for name in environment if TARGET_RUSTFLAGS.fullmatch(name))
     else:
         target_variables = ["CARGO_TARGET_" + re.sub(r"[^A-Za-z0-9]", "_", target).upper() + "_RUSTFLAGS"]
-    for variable, separator in (*RUSTFLAGS_VARIABLES, *((name, None) for name in target_variables)):
+    profile_variables = sorted(name for name in environment if PROFILE_RUSTFLAGS.fullmatch(name))
+    for variable, separator in (*RUSTFLAGS_VARIABLES,
+                                *((name, None) for name in (*target_variables, *profile_variables))):
         value = environment.get(variable)
-        if value is not None and enables_test_root(rustflag_tokens(value, separator)):
+        tokens = rustflag_tokens(value, separator) if value is not None else []
+        if enables_test_root(tokens):
             problems.append(f"{variable} enables --cfg {TEST_ROOT_CFG}: refusing a production build or package")
+        if has_response_file(tokens):
+            problems.append(f"{variable} contains a response file: refusing a production build or package")
     for path in cargo_config_files(environment, cargo_dirs, cargo_home):
         try:
             data = path.read_bytes()

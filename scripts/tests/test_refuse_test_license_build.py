@@ -274,6 +274,99 @@ class RefuserTests(unittest.TestCase):
         # Every problem is reported.
         self.assertEqual(len(self.problems({"RUSTC_WRAPPER": "x", "RUSTFLAGS": "--cfg duduclaw_test_root"})), 2)
 
+    def test_environment_response_files_and_additional_flag_variables(self):
+        variables = (*REFUSER.RUSTFLAGS_VARIABLES,
+                     ("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS", None),
+                     ("CARGO_PROFILE_RELEASE_RUSTFLAGS", None),
+                     ("CARGO_PROFILE_CUSTOM_BUILD_RUSTFLAGS", None))
+        for name, separator in variables:
+            joiner = separator or " "
+            for value in ("@/nonexistent/flags.rsp", joiner.join(("-C", "opt-level=3", "@x"))):
+                with self.subTest(name=name, value=value):
+                    problems = self.problems({name: value})
+                    self.assertEqual(len(problems), 1, problems)
+                    self.assertIn(name, problems[0])
+                    self.assertIn("response file", problems[0])
+            with self.subTest(name=name, cfg=True):
+                problems = self.problems({name: joiner.join(("--cfg", REFUSER.TEST_ROOT_CFG))})
+                self.assertEqual(len(problems), 1, problems)
+                self.assertIn(name, problems[0])
+            with self.subTest(name=name, clean=True):
+                self.assertEqual(self.problems({name: joiner.join(("-C", "metadata=user@host"))}), [])
+        other = {"CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS": "@x"}
+        self.assertTrue(self.problems(other))
+        self.assertEqual(self.problems(other, target=TARGET), [])
+        self.assertTrue(self.problems(other, target="aarch64-unknown-linux-gnu"))
+
+    @unittest.skipIf(REFUSER.tomllib is None, "decoded TOML requires Python 3.11+")
+    def test_cargo_config_response_files_at_every_depth(self):
+        config = self.write("repo/.cargo/config.toml", b"")
+        for content in ('[build]\nrustflags = ["@x"]\n',
+                        '[target.x86_64-unknown-linux-gnu]\nrustflags = "@x"\n',
+                        "[target.'cfg(unix)']\nrustflags = ['-C', '@x']\n",
+                        '[profile.release]\nrustflags = ["@x"]\n',
+                        '[host]\nrustflags = "-C opt-level=3 @x"\n',
+                        '[unstable]\nrustflags = ["@x"]\n',
+                        '[arbitrary.deep.table]\nrustdocflags = ["@x"]\n',
+                        'arbitrary = [{ nested = { rustflags = ["@x"] } }]\n',
+                        '[build]\nrustflags = [\n "-C",\n "@x",\n]\n',
+                        r'[build]' + '\nrustflags = ["\\u0040x"]\n'):
+            with self.subTest(content=content):
+                config.write_text(content)
+                problems = self.problems({})
+                self.assertTrue(problems)
+                self.assertIn(str(config), problems[0])
+                self.assertIn("response file", problems[0])
+
+    @unittest.skipIf(REFUSER.tomllib is None, "decoded TOML requires Python 3.11+")
+    def test_cargo_config_env_response_files(self):
+        config = self.write("repo/.cargo/config.toml", b"")
+        for name in ("RUSTDOCFLAGS", "CARGO_PROFILE_RELEASE_RUSTFLAGS", "CUSTOM_FLAGS"):
+            for value in ('"-C opt-level=3 @x"', '{ value = "@x", force = true }'):
+                for content in (f'[env]\n{name} = {value}\n', f'env.{name} = {value}\n'):
+                    with self.subTest(content=content):
+                        config.write_text(content)
+                        problems = self.problems({})
+                        self.assertTrue(problems)
+                        self.assertTrue(any(name in problem and "response file" in problem for problem in problems))
+        for content in ('[env]\nCUSTOM_FLAGS = "metadata=user@host"\n',
+                        '[env]\nCUSTOM_FLAGS = { value = "-C opt-level=3" }\n',
+                        '[env]\nCONTACT = "@host"\n'):
+            with self.subTest(clean=content):
+                config.write_text(content)
+                self.assertEqual(self.problems({}), [])
+
+    def test_cargo_config_response_file_fallback_is_conservative(self):
+        config = self.write("repo/.cargo/config.toml", b"")
+        with patch.object(REFUSER, "tomllib", None):
+            for content in ('[build]\nrustflags = ["@x"]\n',
+                            '[elsewhere]\nrustdocflags = "@x"\n',
+                            '[build]\nrustflags = [\n "@x",\n]\n',
+                            '[build]\nrustflags = []\n# user@host\n',
+                            '# rustflags\n[registries.internal]\nindex = "https://user@host"\n',
+                            '[env]\nCUSTOM_FLAGS = "@x"\n'):
+                with self.subTest(content=content):
+                    config.write_text(content)
+                    try:
+                        problems = self.problems({})
+                    except REFUSER.RefuserError as error:
+                        self.assertIn(str(config), str(error))
+                    else:
+                        self.assertTrue(problems)
+                        self.assertIn(str(config), problems[0])
+                        self.assertIn("response file", problems[0])
+
+    @unittest.skipIf(REFUSER.tomllib is None, "decoded TOML requires Python 3.11+")
+    def test_cargo_config_unrelated_at_characters_are_accepted(self):
+        config = self.write("repo/.cargo/config.toml", b"")
+        config.write_text('[build]\nrustflags = ["-C", "target-cpu=x86-64-v2"]\n'
+                          'rustdocflags = "--cfg ordinary"\n'
+                          '[source.internal]\ngit = "ssh://user@host/repo"\n'
+                          '[registries.internal]\nindex = "https://user@host/index"\n'
+                          '[net]\ngit-fetch-with-cli = true # @comment\n'
+                          '# rustflags = ["@comment"]\n')
+        self.assertEqual(self.problems({}), [])
+
     def test_cargo_configuration_in_the_tree_its_parents_and_cargo_home(self):
         tree = self.root / "parent/repo/crate"
         tree.mkdir(parents=True)
