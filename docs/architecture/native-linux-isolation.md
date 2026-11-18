@@ -1552,7 +1552,10 @@ nothing waits on a unit that starts later.
   start-up verification (the first install deadlocked on exactly this: the
   updater exited after its 30 s read-back deadline, forever). Whole-host
   readiness is enforced at admission (spawnd `Readiness::check`; the gateway's
-  `check_execution` before every run). spawnd's unit `Wants=` and is `After=`
+  `check_execution` before every run). The gateway's isolation tool service
+  retries its start-up assembly until the updater and spawnd evidence are
+  available; no restart is needed after install, boot or update.
+  spawnd's unit `Wants=` and is `After=`
   `duduclaw-employees.slice`, so the slice (and its cgroup) exists whenever
   spawnd runs, before spawnd's mount namespace is built; otherwise nothing
   starts it on a host with zero employees and `resources_verified` stays false.

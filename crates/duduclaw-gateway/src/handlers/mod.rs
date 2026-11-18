@@ -806,6 +806,9 @@ pub(crate) use migration_authority::stage_import_proposals;
 pub(crate) use migration_authority::begin_shutdown as begin_migration_apply_shutdown;
 #[cfg(target_os = "linux")]
 pub(crate) use migration_authority::entitlement::spawn_startup_reconcile as spawn_entitlement_reconcile;
+/// DEFECT 26: the isolation boot retry ends once this gate has closed.
+#[cfg(target_os = "linux")]
+pub(crate) use migration_authority::shutdown_gate as migration_shutdown_gate;
 pub(crate) use migration_confirmations_rpc::wait_for_apply_loops as wait_migration_apply_loops;
 mod session_policy_rpc;
 mod a2a_rpc;

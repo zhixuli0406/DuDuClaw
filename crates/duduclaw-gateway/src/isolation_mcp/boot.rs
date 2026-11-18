@@ -104,7 +104,9 @@ static ATTEMPTED: AtomicBool = AtomicBool::new(false);
 static SOURCES: Mutex<Option<BootSources>> = Mutex::new(None);
 static DISPATCHER: OnceLock<Arc<dyn DispatcherFactory>> = OnceLock::new();
 static OWNER: OnceLock<Arc<BootOwner>> = OnceLock::new();
-static STATUS: OnceLock<BootStatus> = OnceLock::new();
+/// DEFECT 26: replaced by every boot attempt until the first success; never a
+/// latched failure (it was a `OnceLock` holding the first attempt's reasons).
+static STATE: retry::BootState = retry::BootState::new();
 static CONNECTOR_FACTORY: OnceLock<Arc<dyn ConnectorProviderFactory>> = OnceLock::new();
 
 pub fn install_dispatcher_factory(factory: Arc<dyn DispatcherFactory>) -> Result<(), VerificationError> {
@@ -125,12 +127,31 @@ pub fn install_boot_sources(sources: BootSources) -> Result<(), VerificationErro
     *slot = Some(sources);
     Ok(())
 }
-fn fill_installed_sources(sources: &mut BootSources, home: &Path) {
+/// The inputs `fill_installed_sources` derived in this attempt (from the
+/// updater's generation and spawnd's projection). A failed attempt forgets
+/// them, so no later attempt reuses a stale projection; host-installed inputs
+/// are kept.
+#[derive(Default)]
+struct Derived { worker_plans: bool, execution_plans: bool, main_plans: bool, runtime_registry: bool, worker_launcher: bool }
+impl Derived {
+    fn forget(self, sources: &mut BootSources) {
+        sources.installed_generation = None;
+        if self.worker_plans { sources.worker_plans = None; }
+        if self.execution_plans { sources.execution_plans = None; }
+        if self.main_plans { sources.main_plans = None; }
+        if self.runtime_registry { sources.runtime_registry = None; }
+        if self.worker_launcher { sources.worker_launcher = None; }
+    }
+}
+
+fn fill_installed_sources(sources: &mut BootSources, home: &Path) -> Derived {
+    let mut derived = Derived::default();
     let generation = crate::isolation_readiness::verified_generation();
     sources.installed_generation = generation;
     if sources.worker_plans.is_none() {
         if let Ok(factory) = crate::isolation_worker_plans::GatewayWorkerPlans::new(home.to_owned()) {
             sources.worker_plans = Some(Arc::new(factory));
+            derived.worker_plans = true;
         }
     }
     if sources.execution_plans.is_none() {
@@ -138,6 +159,7 @@ fn fill_installed_sources(sources: &mut BootSources, home: &Path) {
             if let Ok(factory) = crate::isolation_execution::InstalledProgramPlans::new(
                 generation, nix::unistd::getegid().as_raw()) {
                 sources.execution_plans = Some(factory);
+                derived.execution_plans = true;
             }
         }
     }
@@ -146,6 +168,7 @@ fn fill_installed_sources(sources: &mut BootSources, home: &Path) {
             if let Ok(factory) = duduclaw_spawnd::gateway_plan::InstalledMainPlanFactory::new(
                 generation, nix::unistd::getegid().as_raw()) {
                 sources.main_plans = Some(Arc::new(factory));
+                derived.main_plans = true;
             }
         }
     }
@@ -154,6 +177,7 @@ fn fill_installed_sources(sources: &mut BootSources, home: &Path) {
             if let Ok(registry) = duduclaw_spawnd::gateway_mcp::InstalledRuntimeRegistry::new(
                 generation, nix::unistd::getegid().as_raw()) {
                 sources.runtime_registry = Some(Arc::new(registry));
+                derived.runtime_registry = true;
             }
         }
     }
@@ -162,7 +186,16 @@ fn fill_installed_sources(sources: &mut BootSources, home: &Path) {
         // requires exact worker identity plus proven retirement. Construction
         // alone is deliberately not composite readiness evidence.
         sources.worker_launcher = Some(Box::new(duduclaw_parse_worker::retirement::RetiringLauncher));
+        derived.worker_launcher = true;
     }
+    derived
+}
+
+/// Producers that cannot appear later in this process: the dispatcher
+/// adapter is refused after the first attempt, worker integration is a build
+/// feature. Retrying cannot succeed; the reasons stay published.
+fn structural(missing: &[MissingProducer]) -> bool {
+    missing.iter().any(|producer| matches!(producer, MissingProducer::Dispatcher | MissingProducer::WorkerIntegration))
 }
 
 fn missing(sources: &BootSources, dispatcher: bool, backend: bool, worker: bool) -> Vec<MissingProducer> {
@@ -186,9 +219,56 @@ fn missing(sources: &BootSources, dispatcher: bool, backend: bool, worker: bool)
 
 /// Called once after protected TEAM mode and A's backend have been installed.
 /// No employee work runs here; the existing composite gate stays authoritative.
+/// DEFECT 26: the first attempt runs inline as before; while trusted inputs
+/// are missing (the updater's generation, spawnd's projection, ...) the same
+/// all-or-nothing attempt is retried in the background (`spawn_boot_retry`)
+/// until it succeeds once. No restart is needed after install, boot or update.
 pub async fn boot_protected(home: &Path, users: Arc<duduclaw_auth::UserDb>, agents: Arc<super::AgentAdmission>) {
     if crate::isolation_readiness::status().is_none() || ATTEMPTED.swap(true, Ordering::AcqRel) { return; }
-    let mut sources = SOURCES.lock().ok().and_then(|mut slot| slot.take()).unwrap_or_default();
+    let started = std::time::Instant::now();
+    let sources = SOURCES.lock().ok().and_then(|mut slot| slot.take()).unwrap_or_default();
+    let mut boot = InstalledBoot { home: home.to_owned(), users, agents, sources };
+    if let retry::Step::Retry = retry::step(&mut boot, &STATE, started).await {
+        spawn_boot_retry(boot, started);
+    }
+}
+
+/// DEFECT 26: the background boot retry (2 s for the first minute, then 10 s;
+/// each attempt bounded by its own waits). Ends at the first success, when a
+/// missing producer can no longer appear, or once the gateway's shutdown gate
+/// (`handlers::migration_shutdown_gate`) has closed.
+fn spawn_boot_retry(mut boot: InstalledBoot, started: std::time::Instant) {
+    drop(tokio::spawn(async move {
+        retry::retry_until_assembled(&mut boot, &STATE, started, retry::SCHEDULE, shutdown_begun).await;
+    }));
+}
+
+fn shutdown_begun() -> bool {
+    use duduclaw_migration::confirmation::EffectGate;
+    crate::handlers::migration_shutdown_gate().is_closed()
+}
+
+/// The production boot attempt. Host-installed sources and the once-per-process
+/// authority / connector stack are kept across attempts; everything derived
+/// from the updater's generation or spawnd's projection is re-read every time.
+struct InstalledBoot {
+    home: PathBuf,
+    users: Arc<duduclaw_auth::UserDb>,
+    agents: Arc<super::AgentAdmission>,
+    sources: BootSources,
+}
+impl retry::BootAttempt for InstalledBoot {
+    fn attempt(&mut self) -> retry::AttemptFuture<'_> { Box::pin(attempt_installed(self)) }
+    /// R8d D3: once per process, after the first successful boot (it needs the
+    /// spawnd connection), off the boot path (bounded retries until the
+    /// isolation service answers): every confirmed live employee's root
+    /// entitlement is re-sent from its approved settings.
+    fn assembled(&mut self) { crate::handlers::spawn_entitlement_reconcile(self.home.clone()); }
+}
+
+async fn attempt_installed(boot: &mut InstalledBoot) -> Result<(), retry::Failure> {
+    let InstalledBoot { home, users, agents, sources } = boot;
+    let home = home.as_path();
     // F's first asynchronous probe may still be in flight during startup. Wait
     // a bounded interval before consuming the root report; never mark it ready
     // merely because the unit/socket exists.
@@ -196,11 +276,7 @@ pub async fn boot_protected(home: &Path, users: Arc<duduclaw_auth::UserDb>, agen
         if crate::isolation_readiness::verified_generation().is_some() { break; }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    // R8d D3: once per process, off the boot path (bounded retries until the
-    // isolation service answers): every confirmed live employee's root
-    // entitlement is re-sent from its approved settings.
-    crate::handlers::spawn_entitlement_reconcile(home.to_owned());
-    fill_installed_sources(&mut sources, home);
+    let derived = fill_installed_sources(sources, home);
     let backend = duduclaw_execution::selection::protected_backend_for_boot();
     // Reuse the gateway's initialized users.db and confirmed employee registry.
     // No parallel principal/binding database is created for the boundary.
@@ -212,7 +288,7 @@ pub async fn boot_protected(home: &Path, users: Arc<duduclaw_auth::UserDb>, agen
             if sources.connector_catalog.is_none() {
                 sources.connector_catalog = ConnectorCatalog::open(home).ok().map(Arc::new);
             }
-            if let Ok(authority) = super::authority::GatewayAuthority::new(home.to_owned(), users.clone(), backend.clone(), agents,
+            if let Ok(authority) = super::authority::GatewayAuthority::new(home.to_owned(), users.clone(), backend.clone(), agents.clone(),
                 sources.connector_catalog.clone()) {
                 let authority = Arc::new(authority);
                 sources.authority = Some(authority.clone());
@@ -225,35 +301,54 @@ pub async fn boot_protected(home: &Path, users: Arc<duduclaw_auth::UserDb>, agen
     // F1: the per-employee connector stack, over the very catalog handle the
     // authority above checks connector uses against. Only when the host did
     // not supply its own singletons; a missing catalog leaves the producer
-    // missing (boot stays paused, every connector use Unavailable).
+    // missing (boot stays paused, every connector use Unavailable). Built at
+    // most once: a later attempt finds it in `sources`.
     if sources.connectors.is_none() && sources.connector_selection.is_none() {
-        install_connector_stack(&mut sources, home, users).await;
+        install_connector_stack(sources, home, users.clone()).await;
     }
-    let absent = missing(&sources, DISPATCHER.get().is_some(), backend.is_ok(), cfg!(feature = "isolation-worker-integration"));
+    let absent = missing(sources, DISPATCHER.get().is_some(), backend.is_ok(), cfg!(feature = "isolation-worker-integration"));
     if !absent.is_empty() {
-        tracing::error!(missing = ?absent, "隔離工具服務尚缺可信任的啟動資料，團隊執行維持暫停。");
-        let _ = STATUS.set(BootStatus { constructed: false, missing: absent });
-        return;
+        derived.forget(sources);
+        return Err(retry::Failure { retry: !structural(&absent), missing: absent });
     }
     #[cfg(feature = "isolation-worker-integration")]
     {
-        let result = assemble(home, backend.expect("checked backend"), sources);
-        match result {
-            Ok(owner) => {
-                if OWNER.set(Arc::new(owner)).is_ok() {
-                    let _ = STATUS.set(BootStatus { constructed: true, missing: vec![] });
-                    if crate::isolation_readiness::install_integration_probe(
-                        crate::isolation_readiness::IntegrationComponent::McpBoundary, Arc::new(BoundaryReadiness)).is_err() {
-                        tracing::error!("隔離工具服務的狀態檢查無法註冊，團隊執行維持暫停。");
-                    }
-                }
-            }
-            Err(_) => {
-                tracing::error!("隔離工具服務初始化未通過，團隊執行維持暫停。");
-                let _ = STATUS.set(BootStatus { constructed: false, missing: vec![MissingProducer::Initialization] });
-            }
+        // Side-effect-free checks of `assemble` first: a failure here is
+        // retried. `assemble` itself installs process-wide producers, so a
+        // failure there stays final (as before).
+        if precheck(home, sources).is_err() {
+            derived.forget(sources);
+            return Err(retry::Failure { missing: vec![MissingProducer::Initialization], retry: true });
         }
+        let final_failure = || retry::Failure { missing: vec![MissingProducer::Initialization], retry: false };
+        let owner = assemble(home, backend.map_err(|_| final_failure())?, std::mem::take(sources))
+            .map_err(|_| final_failure())?;
+        OWNER.set(Arc::new(owner)).map_err(|_| final_failure())?;
+        STATE.constructed();
+        if crate::isolation_readiness::install_integration_probe(
+            crate::isolation_readiness::IntegrationComponent::McpBoundary, Arc::new(BoundaryReadiness)).is_err() {
+            tracing::error!("隔離工具服務的狀態檢查無法註冊，團隊執行維持暫停。");
+        }
+        Ok(())
     }
+    #[cfg(not(feature = "isolation-worker-integration"))]
+    {
+        let _ = derived;
+        Err(retry::Failure { missing: vec![MissingProducer::WorkerIntegration], retry: false })
+    }
+}
+
+/// The checks `assemble` makes before its first process-wide installation.
+#[cfg(feature = "isolation-worker-integration")]
+fn precheck(home: &Path, sources: &BootSources) -> Result<(), VerificationError> {
+    if !home.is_absolute() || sources.connector_catalog.is_none() || sources.installed_generation.is_none() {
+        return Err(VerificationError::Unavailable);
+    }
+    DISPATCHER.get().ok_or(VerificationError::Unavailable)?.verify_producers(
+        sources.execution_plans.as_deref().ok_or(VerificationError::Unavailable)?,
+        sources.worker_plans.as_deref().ok_or(VerificationError::Unavailable)?,
+        sources.connectors.as_deref().ok_or(VerificationError::Unavailable)?,
+        sources.connector_selection.as_deref().ok_or(VerificationError::Unavailable)?)
 }
 
 /// F1 step 1 (before the producer check): the per-employee stack over the
@@ -317,10 +412,16 @@ fn install_stack_factory(home: &Path, stack: &Arc<EmployeeConnectorProviders>, i
     }
 }
 
+/// Re-evaluated on every read: the latest attempt's reasons until the first
+/// success, then the live owner's health.
 pub fn boot_status() -> BootStatus {
-    let mut status = STATUS.get().cloned().unwrap_or(BootStatus { constructed: false,
+    effective_status(STATE.status(), OWNER.get().is_some_and(|owner| owner.boundary.healthy()))
+}
+
+fn effective_status(status: Option<BootStatus>, owner_healthy: bool) -> BootStatus {
+    let mut status = status.unwrap_or(BootStatus { constructed: false,
         missing: vec![MissingProducer::Initialization] });
-    if status.constructed && OWNER.get().is_none_or(|owner| !owner.boundary.healthy()) {
+    if status.constructed && !owner_healthy {
         status.constructed = false;
         status.missing = vec![MissingProducer::Initialization];
     }
@@ -774,6 +875,10 @@ pub async fn prepare_launch(mut input: LaunchInput) -> Result<Arc<dyn duduclaw_e
     { let _ = connectors; Err(VerificationError::Unavailable) }
 }
 
+/// DEFECT 26: the bounded boot retry driver and its tests.
+#[path = "boot_retry.rs"]
+mod retry;
+
 #[cfg(test)]
 #[path = "authorization_tests.rs"]
 mod authorization_tests;
@@ -818,6 +923,41 @@ mod tests {
         assert!(!missing(&sources, true, true, true).contains(&MissingProducer::ConnectorProviders));
         sources.connectors = None;
         assert!(missing(&sources, true, true, true).contains(&MissingProducer::ConnectorProviders));
+    }
+    /// DEFECT 26: a failed attempt forgets what it derived from the updater's
+    /// generation / spawnd's projection; host-installed inputs survive.
+    #[test]
+    fn boot_failed_attempt_forgets_derived_inputs_and_keeps_host_inputs() {
+        let mut sources = BootSources::default();
+        sources.installed_generation = Some(duduclaw_isolation::ids::Sha256Digest([7; 32]));
+        sources.worker_launcher = Some(Box::new(duduclaw_parse_worker::retirement::RetiringLauncher));
+        Derived { worker_launcher: true, ..Derived::default() }.forget(&mut sources);
+        assert!(sources.installed_generation.is_none());
+        assert!(sources.worker_launcher.is_none());
+        sources.worker_launcher = Some(Box::new(duduclaw_parse_worker::retirement::RetiringLauncher));
+        Derived::default().forget(&mut sources);
+        assert!(sources.worker_launcher.is_some(), "a host-installed launcher is kept");
+    }
+    #[test]
+    fn boot_only_structural_producers_end_the_retry() {
+        assert!(structural(&[MissingProducer::WorkerIntegration]));
+        assert!(structural(&[MissingProducer::RuntimePublication, MissingProducer::Dispatcher]));
+        assert!(!structural(&[MissingProducer::RuntimePublication, MissingProducer::MainPlans,
+            MissingProducer::ExecutionPlans, MissingProducer::ConnectorProviders]));
+        assert!(!structural(&[MissingProducer::Initialization]));
+    }
+    /// The readiness reads `boot_status`: not constructed (closed reasons)
+    /// until an attempt succeeded, then constructed while the owner is healthy.
+    #[test]
+    fn boot_status_follows_the_latest_attempt_without_a_restart() {
+        let state = retry::BootState::new();
+        let initial = effective_status(state.status(), false);
+        assert!(!initial.constructed && initial.missing == vec![MissingProducer::Initialization]);
+        state.constructed();
+        let ready = effective_status(state.status(), true);
+        assert!(ready.constructed && ready.missing.is_empty());
+        let unhealthy = effective_status(state.status(), false);
+        assert!(!unhealthy.constructed && unhealthy.missing == vec![MissingProducer::Initialization]);
     }
 }
 
