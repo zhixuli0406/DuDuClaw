@@ -1473,6 +1473,23 @@ reads nothing under `/run/duduclaw-isolation-evidence`.
   or a run live on the host, both answered before spawnd changes anything) is
   waited for and, still not ready after the window, left `Applying` exactly
   like `pending`; `NotReady` on any other action or step keeps its meaning.
+- **Employee entitlements (R8d).** Before allocating, the stage derives the
+  employee's root entitlement from the item's approved settings (the signed
+  profiles of `runtime.provider`, of `runtime.fallback` when signed, and of
+  the helper kinds the gateway requests; a primary runtime without a signed
+  profile fails the item, `runtime_not_available_in_isolation`, before any
+  account exists). After the Ready receipt it sends `Entitle` (schema 4,
+  inside its own effect-gate permit; root writes the one record only for a
+  Ready allocation, after validating the whole candidate publication and its
+  64 KiB projection) and saves only when root answers exactly that set.
+  `Disable`/`Retire` remove the record first. A host publication of an older
+  generation is rolled over by spawnd's `load` (unsigned profiles dropped),
+  and the gateway re-sends every live employee's entitlement once at start-up
+  in the background (bounded retries; failures show as the employee's
+  `runtime_entitlement_missing` readiness reason). The gateway account is the
+  authority for entitlements exactly as for allocation; root enforces
+  signed-policy membership, Ready allocation and capacity
+  (`crates/duduclaw-spawnd/README.md`, "R8d").
 - **Unsupported hosts.** passwd/group NSS modules other than files/systemd
   (SSSD/LDAP, Google Compute Engine OS Login, `compat`, bracketed action
   clauses); sshd present without the ssh client, ssh-keygen or journalctl, or

@@ -613,8 +613,12 @@ impl Host for Core {
         // "pending" (`AccountHost::login_denied`); the same employee's next
         // allocation picks the result up. Other accounts are not probed inline.
         let mut accounts = LinuxAccounts::background(self.components.ssh.as_ref());
+        // R8d: Entitle and the Disable/Retire removal write the root host
+        // publication on this same worker; `monitor_registry` below forces
+        // the next refresh, which reloads it (and republishes the projection).
+        let mut entitlements = crate::installed::InstalledEntitlements;
         let result = self.allocator.handle(request, crate::allocation::Env { registry: &mut self.registry, accounts: &mut accounts,
-            storage: self.components.storage.as_mut(), host_busy, idle, now_unix });
+            storage: self.components.storage.as_mut(), host_busy, idle, now_unix, entitlements: &mut entitlements });
         for event in self.allocator.take_events() {
             match event {
                 crate::allocation::AllocationEvent::Retired { employee, detail } =>

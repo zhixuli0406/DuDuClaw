@@ -11,7 +11,7 @@ fn employee(status: ConfirmationStatus) -> ConfirmationItem {
         category:ConfirmationCategory::Employee,status,high_risk:true,fields}
 }
 fn request(action: Action, item: ConfirmationItem) -> Request {
-    Request { schema: 1, nonce: RequestId([2;16]), action, item, approver: None }
+    Request { schema: 1, nonce: RequestId([2;16]), action, item, approver: None, entitlement: None }
 }
 #[test]
 fn allocation_refuses_preconfirmation_and_changed_full_payload() {
@@ -114,7 +114,7 @@ pub(crate) fn retire_item(spec: &RetireSpec, status: ConfirmationStatus) -> Conf
         category: ConfirmationCategory::EmployeeRetire, status, high_risk: true, fields }
 }
 fn retire_request(item: ConfirmationItem) -> Request {
-    Request { schema: SCHEMA_V2, nonce: RequestId([2;16]), action: Action::Retire, item, approver: Some("admin-b".into()) }
+    Request { schema: SCHEMA_V2, nonce: RequestId([2;16]), action: Action::Retire, item, approver: Some("admin-b".into()), entitlement: None }
 }
 #[test]
 fn allocation_retire_requires_applying_retire_item() {
@@ -209,8 +209,10 @@ fn allocation_schema3_pending_kinds_and_fail_closed_pairs() {
         other.item.status = if action == Action::Disable { ConfirmationStatus::Failed } else { ConfirmationStatus::Applying };
         assert_eq!(other.check().unwrap_err(), Error::Invalid, "schema 3 is Allocate only: {action:?}");
     }
-    let mut v4 = v3.clone(); v4.schema = 4;
-    assert_eq!(v4.check().unwrap_err(), Error::Invalid, "unknown schema");
+    let mut v4 = v3.clone(); v4.schema = SCHEMA_V4;
+    assert_eq!(v4.check().unwrap_err(), Error::Invalid, "schema 4 is Entitle only");
+    let mut v5 = v3.clone(); v5.schema = 5;
+    assert_eq!(v5.check().unwrap_err(), Error::Invalid, "unknown schema");
     for code in [ErrorCode::Pending, ErrorCode::PendingLimit] {
         let wire: Response = serde_json::from_slice(&serde_json::to_vec(&Response::for_request(&v3, Err(code))).unwrap()).unwrap();
         assert_eq!(wire.schema, SCHEMA_V3);
@@ -222,14 +224,14 @@ fn allocation_schema3_pending_kinds_and_fail_closed_pairs() {
         let old = Response::for_request(&v1, Err(code));
         assert!(old.schema == 1 && old.error.is_none() && old.receipt.is_none());
         // A schema-2 reply never carries a pending kind.
-        let forged = Response { schema: SCHEMA_V2, nonce: v2.nonce, receipt: None, error: Some(code), phase: None, idle: None };
+        let forged = Response { schema: SCHEMA_V2, nonce: v2.nonce, receipt: None, error: Some(code), phase: None, idle: None, entitlement: None };
         assert!(check_response(&v2, forged).is_err());
     }
     assert_eq!(serde_json::to_value(ErrorCode::Pending).unwrap(), "pending");
     assert_eq!(serde_json::to_value(ErrorCode::PendingLimit).unwrap(), "pending_limit");
     // A schema-3 request refuses an older-schema reply, even a well-formed one.
     for schema in [1, SCHEMA_V2] {
-        let old = Response { schema, nonce: v3.nonce, receipt: None, error: Some(ErrorCode::Pending), phase: None, idle: None };
+        let old = Response { schema, nonce: v3.nonce, receipt: None, error: Some(ErrorCode::Pending), phase: None, idle: None, entitlement: None };
         assert!(check_response(&v3, old).is_err(), "schema {schema}");
     }
     // An unknown kind never decodes.
@@ -242,11 +244,80 @@ fn allocation_schema3_pending_kinds_and_fail_closed_pairs() {
     let spec = v3.validate().unwrap();
     let ready = Receipt { binding: v3.item.binding, label: spec.label, employee: EmployeeId([7;16]), uid: 70001, bytes: spec.bytes,
         inodes: spec.inodes, disabled: false, principal_binding: None };
-    let reply = Reply { receipt: ready.clone(), phase: Phase::Ready, idle: None };
+    let reply = Reply { receipt: ready.clone(), phase: Phase::Ready, idle: None, entitlement: None };
     let wire = Response::for_request(&v3, Ok(reply));
     assert!(matches!(check_response(&v3, wire).unwrap(), Answer::Reply(r) if r.receipt.uid == 70001));
-    let planned = Response { schema: SCHEMA_V3, nonce: v3.nonce, receipt: Some(ready), error: None, phase: Some(Phase::Planned), idle: None };
+    let planned = Response { schema: SCHEMA_V3, nonce: v3.nonce, receipt: Some(ready), error: None, phase: Some(Phase::Planned), idle: None, entitlement: None };
     assert!(check_response(&v3, planned).is_err(), "an Allocate answer is Ready or a refusal");
+}
+fn entitle_request(status: ConfirmationStatus) -> Request {
+    let profile = duduclaw_isolation::egress::ProfileId(Sha256Digest([5;32]));
+    Request { schema: SCHEMA_V4, nonce: RequestId([2;16]), action: Action::Entitle, item: employee(status), approver: None,
+        entitlement: Some(Entitlement { profiles: vec![profile], max_turns: None }) }
+}
+/// R8d: schema 4 is exactly `Entitle`; no older schema carries it, and no
+/// other action carries an entitlement.
+#[test]
+fn entitle_schema4_only_and_older_schemas_cannot_carry_it() {
+    for status in [ConfirmationStatus::Applying, ConfirmationStatus::Applied] {
+        assert!(entitle_request(status).check().is_ok(), "{status:?}");
+    }
+    for status in [ConfirmationStatus::Pending, ConfirmationStatus::Approved, ConfirmationStatus::Failed, ConfirmationStatus::Rejected] {
+        assert_eq!(entitle_request(status).check().unwrap_err(), Error::Authentication, "{status:?}");
+    }
+    for schema in [1, SCHEMA_V2, SCHEMA_V3, 5] {
+        let mut old = entitle_request(ConfirmationStatus::Applying); old.schema = schema;
+        assert_eq!(old.check().unwrap_err(), Error::Invalid, "schema {schema}");
+    }
+    let mut missing = entitle_request(ConfirmationStatus::Applying); missing.entitlement = None;
+    assert_eq!(missing.check().unwrap_err(), Error::Invalid);
+    for action in [Action::Allocate, Action::ReadBack, Action::Disable] {
+        let mut smuggled = request(action, employee(ConfirmationStatus::Applying));
+        smuggled.entitlement = entitle_request(ConfirmationStatus::Applying).entitlement;
+        assert_eq!(smuggled.check().unwrap_err(), Error::Invalid, "{action:?}");
+        smuggled.schema = SCHEMA_V4;
+        assert_eq!(smuggled.check().unwrap_err(), Error::Invalid, "{action:?} in schema 4");
+    }
+    // An older-schema request never serializes the new key (byte-identical shape).
+    let old = serde_json::to_value(request(Action::ReadBack, employee(ConfirmationStatus::Applied))).unwrap();
+    assert!(old.get("entitlement").is_none());
+}
+/// R8d: the schema-4 reply carries the entitlement in force with a Ready
+/// receipt; its four refusal codes exist in schema 4 only.
+#[test]
+fn entitle_response_carries_entitlement_and_codes_are_schema4_only() {
+    let request = entitle_request(ConfirmationStatus::Applying);
+    let spec = request.validate().unwrap();
+    let ready = Receipt { binding: request.item.binding, label: spec.label, employee: EmployeeId([7;16]), uid: 70001, bytes: spec.bytes,
+        inodes: spec.inodes, disabled: false, principal_binding: None };
+    let granted = request.entitlement.clone();
+    let reply = Reply { receipt: ready.clone(), phase: Phase::Ready, idle: None, entitlement: granted.clone() };
+    let wire: Response = serde_json::from_slice(&serde_json::to_vec(&Response::for_request(&request, Ok(reply))).unwrap()).unwrap();
+    assert!(matches!(check_response(&request, wire).unwrap(), Answer::Reply(r) if r.entitlement == granted));
+    // A success without the entitlement, or one on a non-Ready phase, is refused.
+    let bare = Response { schema: SCHEMA_V4, nonce: request.nonce, receipt: Some(ready.clone()), error: None, phase: Some(Phase::Ready),
+        idle: None, entitlement: None };
+    assert!(check_response(&request, bare).is_err());
+    let planned = Response { schema: SCHEMA_V4, nonce: request.nonce, receipt: Some(ready.clone()), error: None, phase: Some(Phase::Planned),
+        idle: None, entitlement: granted.clone() };
+    assert!(check_response(&request, planned).is_err());
+    // A schema-2 ReadBack reply never carries an entitlement.
+    let mut readback = request.clone(); readback.schema = SCHEMA_V2; readback.action = Action::ReadBack; readback.entitlement = None;
+    let smuggled = Response { schema: SCHEMA_V2, nonce: readback.nonce, receipt: Some(ready), error: None, phase: Some(Phase::Ready),
+        idle: None, entitlement: granted };
+    assert!(check_response(&readback, smuggled).is_err());
+    for code in [ErrorCode::NotAllocated, ErrorCode::NotSigned, ErrorCode::InvalidEntitlement, ErrorCode::Capacity] {
+        let wire: Response = serde_json::from_slice(&serde_json::to_vec(&Response::for_request(&request, Err(code))).unwrap()).unwrap();
+        assert!(matches!(check_response(&request, wire).unwrap(), Answer::Refused(c) if c == code), "{code:?}");
+        assert_eq!(code.for_schema(SCHEMA_V2), ErrorCode::InvalidRequest);
+        let forged = Response { schema: SCHEMA_V2, nonce: readback.nonce, receipt: None, error: Some(code), phase: None, idle: None,
+            entitlement: None };
+        assert!(check_response(&readback, forged).is_err(), "{code:?} in schema 2");
+    }
+    assert_eq!(serde_json::to_value(ErrorCode::NotAllocated).unwrap(), "not_allocated");
+    assert_eq!(serde_json::to_value(ErrorCode::NotSigned).unwrap(), "not_signed");
+    assert_eq!(serde_json::to_value(ErrorCode::InvalidEntitlement).unwrap(), "invalid_entitlement");
+    assert_eq!(serde_json::to_value(ErrorCode::Capacity).unwrap(), "capacity");
 }
 #[test]
 fn allocation_response_schema2_error_code() {
@@ -269,32 +340,32 @@ fn allocation_response_schema2_error_code() {
     // A refusal with a receipt, a wrong nonce or schema, or an unknown code is refused.
     let retired = Receipt { binding: spec.target, label: spec.label.clone(), employee: spec.employee, uid: spec.uid, bytes: 67108864,
         inodes: 4096, disabled: true, principal_binding: None };
-    let mixed = Response { schema: 2, nonce: retire.nonce, receipt: Some(retired.clone()), error: Some(ErrorCode::NotFound), phase: None, idle: None };
+    let mixed = Response { schema: 2, nonce: retire.nonce, receipt: Some(retired.clone()), error: Some(ErrorCode::NotFound), phase: None, idle: None, entitlement: None };
     assert!(check_response(&retire, mixed).is_err());
-    let wrong_nonce = Response { schema: 2, nonce: RequestId([3;16]), receipt: None, error: Some(ErrorCode::NotFound), phase: None, idle: None };
+    let wrong_nonce = Response { schema: 2, nonce: RequestId([3;16]), receipt: None, error: Some(ErrorCode::NotFound), phase: None, idle: None, entitlement: None };
     assert!(check_response(&retire, wrong_nonce).is_err());
     assert!(serde_json::from_str::<Response>(r#"{"schema":2,"nonce":"x","receipt":null,"error":"gone"}"#).is_err());
     // A Retired receipt must match the target, employee, UID and label.
-    let ok = Response { schema: 2, nonce: retire.nonce, receipt: Some(retired.clone()), error: None, phase: Some(Phase::Retired), idle: None };
+    let ok = Response { schema: 2, nonce: retire.nonce, receipt: Some(retired.clone()), error: None, phase: Some(Phase::Retired), idle: None, entitlement: None };
     assert!(matches!(check_response(&retire, ok).unwrap(), Answer::Reply(r) if r.phase == Phase::Retired));
     for change in 0..4 {
         let mut other = retired.clone();
         match change { 0 => other.uid += 1, 1 => other.employee = EmployeeId([8;16]), 2 => other.label = "other".into(), _ => other.disabled = false }
-        let response = Response { schema: 2, nonce: retire.nonce, receipt: Some(other), error: None, phase: Some(Phase::Retired), idle: None };
+        let response = Response { schema: 2, nonce: retire.nonce, receipt: Some(other), error: None, phase: Some(Phase::Retired), idle: None, entitlement: None };
         assert!(check_response(&retire, response).is_err(), "change {change}");
     }
-    let still_ready = Response { schema: 2, nonce: retire.nonce, receipt: Some(retired), error: None, phase: Some(Phase::Ready), idle: None };
+    let still_ready = Response { schema: 2, nonce: retire.nonce, receipt: Some(retired), error: None, phase: Some(Phase::Ready), idle: None, entitlement: None };
     assert!(check_response(&retire, still_ready).is_err());
     // ReadBack: any phase, idle only for Ready.
     v1.schema = SCHEMA_V2;
     let spec_e = v1.validate().unwrap();
     let live = Receipt { binding: v1.item.binding, label: spec_e.label, employee: EmployeeId([7;16]), uid: 70001, bytes: spec_e.bytes,
         inodes: spec_e.inodes, disabled: false, principal_binding: None };
-    let ready = Response { schema: 2, nonce: v1.nonce, receipt: Some(live.clone()), error: None, phase: Some(Phase::Ready), idle: Some(false) };
+    let ready = Response { schema: 2, nonce: v1.nonce, receipt: Some(live.clone()), error: None, phase: Some(Phase::Ready), idle: Some(false), entitlement: None };
     assert!(matches!(check_response(&v1, ready).unwrap(), Answer::Reply(r) if r.idle == Some(false)));
-    let retiring = Response { schema: 2, nonce: v1.nonce, receipt: Some(live.clone()), error: None, phase: Some(Phase::Retiring), idle: Some(true) };
+    let retiring = Response { schema: 2, nonce: v1.nonce, receipt: Some(live.clone()), error: None, phase: Some(Phase::Retiring), idle: Some(true), entitlement: None };
     assert!(check_response(&v1, retiring).is_err(), "idle is reported for Ready entries only");
     let mut dead = live; dead.disabled = true;
-    let gone = Response { schema: 2, nonce: v1.nonce, receipt: Some(dead), error: None, phase: Some(Phase::Retired), idle: None };
+    let gone = Response { schema: 2, nonce: v1.nonce, receipt: Some(dead), error: None, phase: Some(Phase::Retired), idle: None, entitlement: None };
     assert!(matches!(check_response(&v1, gone).unwrap(), Answer::Reply(r) if r.phase == Phase::Retired));
 }

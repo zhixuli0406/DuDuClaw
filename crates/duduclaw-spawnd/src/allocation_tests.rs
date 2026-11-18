@@ -76,12 +76,21 @@ impl RegistryOps for FakeRegistry{
 pub(super) fn quiet()->EmployeeIdleReport{EmployeeIdleReport{runs:0,attachments:0,processes:0,units:0}}
 /// One allocator + registry + hosts, portable (tempdir) or root (`/run`).
 pub(super) struct Fx{pub(super) dir:PathBuf,pub(super) registry:Box<dyn RegistryOps>,pub(super) accounts:Accounts,pub(super) disk:Disk,
-    pub(super) allocator:Allocator,pub(super) root:bool,_temp:Option<tempfile::TempDir>}
+    pub(super) allocator:Allocator,pub(super) root:bool,_temp:Option<tempfile::TempDir>,
+    /// R8d: the host publication (in memory; counts writes).
+    pub(super) entitlements:crate::entitlement::Memory}
+/// R8d: the signed runtimes of the fixture host (profiles 1 and 2).
+fn signed_runtimes()->crate::entitlement::Memory{
+    use crate::entitlement::fixture::runtime;
+    use duduclaw_isolation::execution::RuntimeKind;
+    crate::entitlement::Memory::new(vec![runtime(1,RuntimeKind::Codex),runtime(2,RuntimeKind::OpenAiCompat)])
+}
 impl Fx{
     pub(super) fn portable()->Self{
         let temp=tempfile::tempdir().unwrap();let dir=temp.path().to_path_buf();
         let allocator=Allocator{directory:dir.clone(),journal:Journal{schema:JOURNAL_SCHEMA,entries:vec![]},poisoned:false,events:vec![],traces_verified:true};
-        Self{dir,registry:Box::new(FakeRegistry(Registry::default())),accounts:Accounts::new(),disk:Disk::new(),allocator,root:false,_temp:Some(temp)}
+        Self{dir,registry:Box::new(FakeRegistry(Registry::default())),accounts:Accounts::new(),disk:Disk::new(),allocator,root:false,_temp:Some(temp),
+            entitlements:signed_runtimes()}
     }
     pub(super) fn root(name:&str)->Self{
         use std::os::unix::fs::DirBuilderExt;
@@ -90,13 +99,14 @@ impl Fx{
         fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
         let registry=RegistryStore::open_at(&dir).unwrap();let mut disk=Disk::new();
         let allocator=Allocator::open_at(&dir,RegistryOps::registry(&registry),&mut disk).unwrap();
-        Self{dir,registry:Box::new(registry),accounts:Accounts::new(),disk,allocator,root:true,_temp:None}
+        Self{dir,registry:Box::new(registry),accounts:Accounts::new(),disk,allocator,root:true,_temp:None,entitlements:signed_runtimes()}
     }
     pub(super) fn handle(&mut self,request:&Request)->Answer<Reply>{self.handle_with(request,false,None)}
     /// `idle: None` = a quiet readback for the request's subject, as the host would read it.
     pub(super) fn handle_with(&mut self,request:&Request,host_busy:bool,idle:Option<Result<EmployeeIdleReport>>)->Answer<Reply>{
         let idle=idle.or_else(||self.allocator.subject(request).map(|_|Ok(quiet())));
-        self.allocator.handle(request,Env{registry:self.registry.as_mut(),accounts:&mut self.accounts,storage:&mut self.disk,host_busy,idle,now_unix:1_000})
+        self.allocator.handle(request,Env{registry:self.registry.as_mut(),accounts:&mut self.accounts,storage:&mut self.disk,host_busy,idle,now_unix:1_000,
+            entitlements:&mut self.entitlements})
     }
     /// A daemon restart of the allocator (the journal is re-read from disk).
     pub(super) fn reopen(&mut self){
@@ -120,7 +130,7 @@ pub(super) fn employee_request(id:u8,label:&str,status:ConfirmationStatus,extra:
     let mut fields:Vec<ProposalField>=[("disk_bytes","67108864"),("employee_id",label)].iter().chain(extra)
         .map(|(n,v)|ProposalField{name:(*n).into(),value:ProposalValue::Text{value:(*v).into()}}).collect();
     fields.sort_by(|a,b|a.name.cmp(&b.name));
-    Request{schema:1,nonce:RequestId([2;16]),action:Action::Allocate,approver:None,item:ConfirmationItem{binding:ProposalBinding{operation_id:ProposalOperationId{proposal_id:RequestId([id;16]),revision:1},
+    Request{schema:1,nonce:RequestId([2;16]),action:Action::Allocate,approver:None,entitlement:None,item:ConfirmationItem{binding:ProposalBinding{operation_id:ProposalOperationId{proposal_id:RequestId([id;16]),revision:1},
         proposal_digest:digest_of(ConfirmationCategory::Employee,&fields)},category:ConfirmationCategory::Employee,status,high_risk:true,fields}}
 }
 fn request_with(status:ConfirmationStatus,extra:&[(&str,&str)])->Request{employee_request(1,"sales",status,extra)}
@@ -156,7 +166,7 @@ pub(super) fn retire_spec(receipt:&Receipt)->RetireSpec{
 }
 pub(super) fn retire_request_for(spec:&RetireSpec,id:u8)->Request{
     let fields=wire::retire_fields(spec);
-    Request{schema:wire::SCHEMA_V2,nonce:RequestId([2;16]),action:Action::Retire,approver:Some("admin-b".into()),
+    Request{schema:wire::SCHEMA_V2,nonce:RequestId([2;16]),action:Action::Retire,approver:Some("admin-b".into()),entitlement:None,
         item:ConfirmationItem{binding:ProposalBinding{operation_id:ProposalOperationId{proposal_id:RequestId([id;16]),revision:1},
             proposal_digest:digest_of(ConfirmationCategory::EmployeeRetire,&fields)},category:ConfirmationCategory::EmployeeRetire,
             status:ConfirmationStatus::Applying,high_risk:true,fields}}
@@ -383,6 +393,104 @@ fn f6fb_empty_open_with_unreadable_storage_refuses_allocate_until_traces_read(){
     assert!(fx.allocator.traces_verified);
     fx.disk.traces_fail=true;
     assert_eq!(allocate(&mut fx,2,"ops").label,"ops","verified once is enough");
+}
+// ---- R8d: Entitle, and the removal by Disable / Retire ----
+fn entitle_request(id:u8,label:&str,profiles:&[u8])->Request{
+    let mut request=employee_request(id,label,ConfirmationStatus::Applied,ALICE);
+    request.schema=wire::SCHEMA_V4;request.action=Action::Entitle;
+    request.entitlement=Some(wire::Entitlement{profiles:profiles.iter().map(|byte|crate::entitlement::fixture::profile(*byte)).collect(),max_turns:None});
+    request
+}
+fn disable_request(id:u8,label:&str)->Request{
+    let mut request=employee_request(id,label,ConfirmationStatus::Failed,ALICE);request.action=Action::Disable;request
+}
+#[test]
+fn entitle_ready_employee_writes_one_record_and_replies_what_is_in_force(){
+    let mut fx=Fx::portable();
+    let receipt=allocate(&mut fx,1,"sales");
+    let reply=fx.handle(&entitle_request(1,"sales",&[1])).unwrap();
+    assert_eq!((reply.phase,reply.receipt.employee),(Phase::Ready,receipt.employee));
+    assert_eq!(reply.entitlement.unwrap().profiles,vec![crate::entitlement::fixture::profile(1)]);
+    assert_eq!((fx.entitlements.writes,fx.entitlements.publication.entitlements.len()),(1,1));
+    assert!(fx.entitlements.held(receipt.employee).is_some());
+    // Identical: no write; the wire reply passes the gateway's check.
+    let request=entitle_request(1,"sales",&[1]);
+    let response=wire::Response::for_request(&request,fx.handle(&request));
+    assert!(matches!(wire::check_response(&request,response),Ok(wire::Answer::Reply(reply)) if reply.entitlement.is_some()));
+    assert_eq!(fx.entitlements.writes,1,"identical record: no write");
+}
+#[test]
+fn entitle_refuses_unknown_pending_and_disabled_employees_without_writing(){
+    let mut fx=Fx::portable();
+    assert_eq!(fx.handle(&entitle_request(1,"sales",&[1])).unwrap_err(),wire::ErrorCode::NotAllocated,"unknown");
+    fx.accounts.create_fail=true;
+    assert!(fx.handle(&employee_request(2,"planned",ConfirmationStatus::Applying,ALICE)).is_err());
+    assert_eq!(fx.handle(&entitle_request(2,"planned",&[1])).unwrap_err(),wire::ErrorCode::NotAllocated,"planned");
+    fx.accounts.create_fail=false;
+    let receipt=allocate(&mut fx,3,"gone");
+    assert_eq!(fx.handle(&disable_request(3,"gone")).unwrap().phase,Phase::Disabled);
+    assert_eq!(fx.handle(&entitle_request(3,"gone",&[1])).unwrap_err(),wire::ErrorCode::NotAllocated,"disabled");
+    assert!(fx.entitlements.held(receipt.employee).is_none());
+    // Not in the signed policy, or an invalid shape: distinct codes.
+    allocate(&mut fx,4,"live");
+    assert_eq!(fx.handle(&entitle_request(4,"live",&[9])).unwrap_err(),wire::ErrorCode::NotSigned);
+    assert_eq!(fx.handle(&entitle_request(4,"live",&[])).unwrap_err(),wire::ErrorCode::InvalidEntitlement);
+    assert_eq!(fx.handle(&entitle_request(4,"live",&[1,1])).unwrap_err(),wire::ErrorCode::InvalidEntitlement);
+    assert_eq!(fx.entitlements.writes,0,"no refusal writes anything");
+}
+#[test]
+fn older_schemas_cannot_entitle(){
+    let mut fx=Fx::portable();
+    allocate(&mut fx,1,"sales");
+    for schema in [1,wire::SCHEMA_V2,wire::SCHEMA_V3]{
+        let mut request=entitle_request(1,"sales",&[1]);request.schema=schema;
+        assert!(request.check().is_err(),"serve drops it: schema {schema}");
+        assert_eq!(fx.handle(&request).unwrap_err(),wire::ErrorCode::InvalidRequest,"schema {schema}");
+    }
+    assert_eq!(fx.entitlements.writes,0);
+}
+#[test]
+fn disable_removes_the_entitlement_first_and_idempotently(){
+    let mut fx=Fx::portable();
+    let receipt=allocate(&mut fx,1,"sales");
+    fx.handle(&entitle_request(1,"sales",&[1,2])).unwrap();
+    // A removal that cannot be written refuses the Disable before its state change.
+    fx.entitlements.fail=Some(crate::entitlement::Refusal::Unavailable);
+    assert_eq!(fx.handle(&disable_request(1,"sales")).unwrap_err(),wire::ErrorCode::IsolationUnavailable);
+    assert_eq!(fx.phase(receipt.employee),Phase::Ready);
+    assert!(fx.entitlements.held(receipt.employee).is_some());
+    fx.entitlements.fail=None;
+    assert_eq!(fx.handle(&disable_request(1,"sales")).unwrap().phase,Phase::Disabled);
+    assert!(fx.entitlements.held(receipt.employee).is_none());
+    let writes=fx.entitlements.writes;
+    assert_eq!(fx.handle(&disable_request(1,"sales")).unwrap().phase,Phase::Disabled,"replay");
+    assert_eq!(fx.entitlements.writes,writes,"already gone: no write");
+}
+#[test]
+fn retire_removes_the_entitlement_first_and_resumes_after_a_crash(){
+    let mut fx=Fx::portable();
+    let receipt=allocate(&mut fx,1,"sales");
+    fx.handle(&entitle_request(1,"sales",&[1])).unwrap();
+    let request=retire_request(&receipt,0x41);
+    // Crash after the removal and the Retiring save (the account step fails).
+    fx.accounts.recover_fail=1;
+    assert_eq!(fx.handle(&request).unwrap_err(),wire::ErrorCode::IsolationUnavailable);
+    assert_eq!(fx.phase(receipt.employee),Phase::Retiring);
+    assert!(fx.entitlements.held(receipt.employee).is_none(),"removed before Retiring");
+    let writes=fx.entitlements.writes;
+    fx.reopen();
+    assert_eq!(fx.handle(&request).unwrap().phase,Phase::Retired);
+    assert_eq!(fx.entitlements.writes,writes,"resume: already gone, no write");
+    assert_eq!(fx.handle(&request).unwrap().phase,Phase::Retired,"replay");
+}
+#[test]
+fn entitlement_write_of_unknown_outcome_poisons_the_allocator(){
+    let mut fx=Fx::portable();
+    allocate(&mut fx,1,"sales");
+    fx.entitlements.fail=Some(crate::entitlement::Refusal::Unknown);
+    assert_eq!(fx.handle(&entitle_request(1,"sales",&[1])).unwrap_err(),wire::ErrorCode::IsolationUnavailable);
+    fx.entitlements.fail=None;
+    assert_eq!(fx.handle(&entitle_request(1,"sales",&[1])).unwrap_err(),wire::ErrorCode::IsolationUnavailable,"poisoned until restart");
 }
 #[test]
 fn retire_scenarios_with_in_memory_registry(){

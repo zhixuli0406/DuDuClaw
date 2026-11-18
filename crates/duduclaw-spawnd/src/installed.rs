@@ -135,9 +135,10 @@ impl RuntimeRecord {
 }
 /// Root-owned host entitlement. `max_turns` (R6) can only narrow the signed
 /// step range; it is omitted when absent so existing files keep their shape.
-/// It is written only by root (see the R6 report: the approved-proposal RPC
-/// that writes it is not part of this change).
-#[derive(Clone, Serialize, Deserialize)]
+/// It is written only by root: R8d's `Entitle` (and the removal by `Disable`
+/// / `Retire`) on the allocation worker, and the generation rollover of
+/// [`InstalledPublication::load`] (`crate::entitlement`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EntitlementRecord { pub employee: EmployeeId, pub profiles: Vec<ProfileId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -198,9 +199,14 @@ impl McpRunReceipt {
         Ok(receipt)
     }
 }
-#[derive(Deserialize)]
+/// `/var/lib/duduclaw-spawnd/publication.json` (root:root 0600). The
+/// installer writes it once with no entitlement; afterwards only root writes
+/// it (R8d, `crate::entitlement`), always through [`write_host`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct HostPublication { version: u16, generation: Sha256Digest, entitlements: Vec<EntitlementRecord> }
+pub struct HostPublication { pub(crate) version: u16, pub(crate) generation: Sha256Digest,
+    pub(crate) entitlements: Vec<EntitlementRecord> }
+const HOST_PUBLICATION: &str = "publication.json";
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NativeRecord {
@@ -326,6 +332,18 @@ pub fn signed_policy_egress_profiles(bytes: &[u8]) -> io::Result<Vec<ProfileId>>
 pub fn signed_policy_dns_probe_name(bytes: &[u8]) -> io::Result<Option<String>> {
     Ok(signed_policy(bytes)?.dns_probe_name)
 }
+/// R8d (installer re-check): whether `entitlements` — the records of an
+/// existing host publication, as untyped JSON — are records spawnd reads
+/// (strict `EntitlementRecord`) and pass the production publication check
+/// (`RootPolicy::from_verified_publication`: one record per employee, 1..=128
+/// distinct profiles each in this signed policy, `max_turns` 1..=1000) against
+/// the policy behind `bytes`, read through the same strict reader as above.
+pub fn signed_policy_admits_entitlements(bytes: &[u8], entitlements: &[serde_json::Value]) -> io::Result<()> {
+    let policy = signed_policy(bytes)?;
+    let records = entitlements.iter().map(|value| EntitlementRecord::deserialize(value).map_err(|_| denied()))
+        .collect::<io::Result<Vec<_>>>()?;
+    io(crate::entitlement::admitted(&policy.runtimes, &records)).map(|_| ())
+}
 /// R7b: the probe name of the committed generation's verified policy (the
 /// full `bundle` checks). Blocking (updater probe): DNS evidence worker only.
 pub(crate) fn installed_dns_probe_name() -> io::Result<Option<String>> {
@@ -431,9 +449,18 @@ impl GatewayPublication {
 struct Bundle { generation: Sha256Digest, manifest: ReleaseManifest, directory: std::path::PathBuf,
     host: HostPublication, policy: SignedPolicy }
 fn bundle() -> io::Result<Bundle> {
+    let bundle = unchecked_bundle()?;
+    if bundle.host.generation != bundle.generation { return Err(denied()); }
+    Ok(bundle)
+}
+/// Every check of [`bundle`] except that the host publication names the
+/// committed generation (it must still parse strictly and be version 1).
+/// Only [`InstalledPublication::load`] uses it directly, to roll a host
+/// publication of another generation over (R8d B).
+fn unchecked_bundle() -> io::Result<Bundle> {
     let (generation, manifest) = committed_generation()?;
-    let host: HostPublication = read(ROOT, "publication.json")?;
-    if host.version != 1 || host.generation != generation { return Err(denied()); }
+    let host: HostPublication = read(ROOT, HOST_PUBLICATION)?;
+    if host.version != 1 { return Err(denied()); }
     let target = InstallTarget::RuntimeEntry { registry_id: POLICY_ID.into() };
     let artifact = policy_artifact(&manifest)?;
     let hex: String = generation.0.iter().map(|byte| format!("{byte:02x}")).collect();
@@ -516,13 +543,56 @@ impl InstalledPublication {
         self.generation = Some(generation);
         Ok(())
     }
-    fn checked_bundle(&mut self) -> Result<Bundle> {
-        let bundle = os(bundle())?;
+    fn checked_bundle(&mut self) -> Result<Bundle> { self.pinned(os(bundle())?) }
+    fn pinned(&mut self, bundle: Bundle) -> Result<Bundle> {
         // A verified policy/native artifact is immutable within a generation.
         // Never mix old plans or detached mounts with a later generation. F's
         // activation restarts B1; live policy swapping is deliberately refused.
         self.check_generation(bundle.generation)?;
         Ok(bundle)
+    }
+    /// R8d B, the one place a host publication is migrated: `load` (root's
+    /// lifecycle thread only; never the gateway-side reader). A publication
+    /// of another generation is rolled over to the pinned committed one
+    /// (`entitlement::rolled_over`) and written atomically before use; a
+    /// failed write refuses (fail closed). Structural garbage never gets
+    /// here: [`unchecked_bundle`] refuses it like [`bundle`] does.
+    fn rolled_bundle(&mut self) -> Result<Bundle> {
+        let mut bundle = self.pinned(os(unchecked_bundle())?)?;
+        if bundle.host.generation != bundle.generation {
+            bundle.host = crate::entitlement::roll_over(&mut InstalledEntitlements, &bundle.host, bundle.generation,
+                &bundle.policy.runtimes).map_err(|_| ErrorCode::IsolationUnavailable)?;
+        }
+        Ok(bundle)
+    }
+}
+/// The only writer of the host publication after install (R8d): the existing
+/// root writer (`host_state::atomic_json`: root:root 0600, temp file, fsync,
+/// rename, directory fsync). A failure is `Unavailable` only when a re-read
+/// proves `previous` is still in force; otherwise the on-disk state is
+/// unknown (`Unknown`, the allocation journal's poison rule).
+fn write_host(previous: &HostPublication, next: &HostPublication) -> std::result::Result<(), crate::entitlement::Refusal> {
+    use crate::entitlement::Refusal;
+    match crate::host_state::atomic_json(&Path::new(ROOT).join(HOST_PUBLICATION), next, 0, 0o600) {
+        Ok(()) => Ok(()),
+        Err(_) => match read::<HostPublication>(ROOT, HOST_PUBLICATION) {
+            Ok(current) if current == *previous => Err(Refusal::Unavailable),
+            _ => Err(Refusal::Unknown),
+        },
+    }
+}
+/// R8d: the allocation worker's view of the installed host publication.
+pub(crate) struct InstalledEntitlements;
+impl crate::entitlement::Entitlements for InstalledEntitlements {
+    /// The committed generation's verified signed runtimes (every `bundle`
+    /// check; a host publication not yet rolled over refuses).
+    fn signed(&mut self) -> io::Result<(Sha256Digest, Vec<RuntimeRecord>)> {
+        let bundle = bundle()?;
+        Ok((bundle.generation, bundle.policy.runtimes))
+    }
+    fn read(&mut self) -> io::Result<HostPublication> { read(ROOT, HOST_PUBLICATION) }
+    fn write(&mut self, previous: &HostPublication, next: &HostPublication) -> std::result::Result<(), crate::entitlement::Refusal> {
+        write_host(previous, next)
     }
 }
 fn checked_runtime<'a>(records: &'a [RuntimeRecord], runtime: &PublishedRuntime) -> Result<&'a RuntimeRecord> {
@@ -544,7 +614,7 @@ fn check_plan_runtime(plan: &crate::bootstrap::BootstrapPlan, runtime: &Publishe
 impl crate::host::Publication for InstalledPublication {
     fn load(&mut self) -> Result<RootPolicy> {
         let started = os(crate::host_state::boottime_ms())?;
-        let b = self.checked_bundle()?;
+        let b = self.rolled_bundle()?;
         let launchers = launchers(&b.policy);
         let report = GatewayPublication { version: 1, generation: b.generation,
             boot_id: os(fs::read_to_string("/proc/sys/kernel/random/boot_id"))?.trim().into(), checked_boottime_ms: started, valid_for_ms: 1000,
@@ -868,6 +938,29 @@ mod tests {
         assert!(serde_json::from_value::<HostPublication>(value.clone()).is_ok());
         value.as_object_mut().unwrap().insert("ready".into(), true.into());
         assert!(serde_json::from_value::<HostPublication>(value).is_err());
+    }
+    /// R8d C: the installer's re-check of an existing publication accepts
+    /// exactly the entitlements the production check admits for this policy.
+    #[test]
+    fn installer_entitlement_check_is_the_production_check() {
+        let bytes = serde_json::to_vec(&v1_document()).unwrap();
+        let profile = runtime_record().profile;
+        let employee = EmployeeId([5; 16]);
+        let good = serde_json::json!({ "employee": employee, "profiles": [profile] });
+        assert!(signed_policy_admits_entitlements(&bytes, &[]).is_ok());
+        assert!(signed_policy_admits_entitlements(&bytes, &[good.clone()]).is_ok());
+        for bad in [
+            serde_json::json!({ "employee": employee, "profiles": [ProfileId(Sha256Digest([9; 32]))] }),
+            serde_json::json!({ "employee": employee, "profiles": [] }),
+            serde_json::json!({ "employee": employee, "profiles": [profile, profile] }),
+            serde_json::json!({ "employee": employee, "profiles": [profile], "max_turns": 0 }),
+            serde_json::json!({ "employee": employee, "profiles": [profile], "ready": true }),
+            serde_json::json!({ "employee": "00".repeat(16), "profiles": [profile] }),
+        ] {
+            assert!(signed_policy_admits_entitlements(&bytes, &[bad.clone()]).is_err(), "{bad}");
+        }
+        assert!(signed_policy_admits_entitlements(&bytes, &[good.clone(), good]).is_err(), "one record per employee");
+        assert!(signed_policy_admits_entitlements(b"{}", &[]).is_err(), "an unreadable policy admits nothing");
     }
     #[test]
     fn mcp_acceptance_binds_exact_runtime_projection_and_child_exec() {
