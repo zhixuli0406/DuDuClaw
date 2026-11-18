@@ -7,8 +7,11 @@
 //! R8j round 3 F2: on Unix each probe runs in its own process group (its pid
 //! is the group id) and the whole group is SIGKILLed, so a helper the tool
 //! forked cannot outlive the deadline.
+//! R8j round 5: one guard (`ProbeProcess`) owns the child; it never signals a
+//! leader that was reaped (including by someone else: ECHILD), and its Drop
+//! kills the group when the caller cancels the probe mid-flight.
 
-use std::{process::{Output, Stdio}, time::Duration};
+use std::{process::{ExitStatus, Output, Stdio}, time::Duration};
 use crate::types::{BackendType, GpuType, HardwareInfo};
 
 /// Hard bound for one probe command. A healthy `nvidia-smi` answers in well
@@ -19,8 +22,8 @@ use crate::types::{BackendType, GpuType, HardwareInfo};
 pub const PROBE_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 /// After the kill, how long the exit is awaited (which reaps the child). Only
 /// a process stuck in an uninterruptible kernel wait outlives SIGKILL longer;
-/// it is then left to tokio's orphan reaper (`kill_on_drop`), which reaps it
-/// as soon as it exits.
+/// it is then handed, unsignalled, to tokio's orphan reaper when the probe's
+/// guard is dropped, which reaps it as soon as it exits.
 pub const PROBE_REAP_GRACE: Duration = Duration::from_secs(1);
 /// At most this much of a probe's stdout is kept.
 const PROBE_OUTPUT_LIMIT: u64 = 64 * 1024;
@@ -46,32 +49,146 @@ enum Probe {
     TimedOut { pid: Option<u32>, reaped: bool },
 }
 
+/// Whether the probe's direct child (the process group leader) may still be
+/// held by the kernel. While `Unreaped` its pid — and so the group id — stays
+/// allocated to it and cannot be reused; after `Reaped` it may be.
 #[derive(Debug, PartialEq, Eq)]
 enum LeaderState {
     Unreaped,
     Reaped,
 }
 
-impl LeaderState {
-    fn mark_reaped(&mut self) { *self = Self::Reaped; }
+/// `ECHILD` from a wait: the child is no longer ours to wait for — something
+/// else (SIGCHLD ignored, `SA_NOCLDWAIT`, another waiter) already reaped it.
+#[cfg(unix)]
+fn reaped_elsewhere(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ECHILD)
+}
+#[cfg(not(unix))]
+fn reaped_elsewhere(_: &std::io::Error) -> bool {
+    false
+}
+
+/// R8j round 5: the single owner of one probe child's lifetime. It is the
+/// only code that ever signals the child or its process group (the command
+/// is built with `kill_on_drop(false)`, so tokio never signals on its own).
+///
+/// Transition table (`leader`; nothing else ever sets `Reaped`):
+///
+/// | event (via [`ProbeProcess::observe_wait`])  | `leader` afterwards | signal |
+/// |---------------------------------------------|---------------------|--------|
+/// | `wait()` → `Ok(status)`                     | `Reaped`            | none   |
+/// | `wait()` → `Err(ECHILD)` (reaped elsewhere) | `Reaped`            | none, ever |
+/// | `wait()` → any other `Err`                  | `Unreaped`          | kill path ([`ProbeProcess::kill_group`]) |
+///
+/// `kill_group` signals only in `Unreaped` and at most once (`killed`).
+struct ProbeProcess {
+    child: tokio::process::Child,
+    /// The child's pid captured at spawn; `process_group(0)` made it the
+    /// group id on Unix.
+    pgid: u32,
+    leader: LeaderState,
+    /// `kill_group` has signalled (it never signals twice).
+    killed: bool,
+}
+
+impl ProbeProcess {
+    /// Takes ownership right after a successful spawn. A child without a pid
+    /// at this point is treated as a spawn failure: killed through its handle
+    /// (a no-op for one tokio already knows to have exited) and refused.
+    fn new(mut child: tokio::process::Child) -> Option<Self> {
+        let Some(pgid) = child.id() else {
+            let _ = child.start_kill();
+            return None;
+        };
+        Some(Self { child, pgid, leader: LeaderState::Unreaped, killed: false })
+    }
+
+    /// Records the result of a `wait()` / `try_wait()` on the child — the
+    /// only place `leader` becomes `Reaped` — and passes it through.
+    fn observe_wait(&mut self, waited: std::io::Result<ExitStatus>) -> std::io::Result<ExitStatus> {
+        match &waited {
+            Ok(_) => self.leader = LeaderState::Reaped,
+            // Gone and reaped elsewhere: its pid (and group id) may already
+            // belong to another process, so it is never signalled again.
+            Err(error) if reaped_elsewhere(error) => self.leader = LeaderState::Reaped,
+            // Any other wait failure: the kernel still holds the child.
+            Err(_) => {}
+        }
+        waited
+    }
+
+    /// SIGKILL to the probe's whole process group (Unix: `kill(-pgid)`), then
+    /// to the direct child through its handle. Synchronous, never waits, and
+    /// idempotent: signals only while the leader is `Unreaped` and only once.
+    fn kill_group(&mut self) {
+        if self.leader == LeaderState::Reaped || self.killed { return; }
+        self.killed = true;
+        #[cfg(all(test, unix))]
+        let _ = tests::GROUP_KILLS.try_with(|count| {
+            assert_eq!(self.leader, LeaderState::Unreaped);
+            count.set(count.get() + 1);
+        });
+        #[cfg(unix)]
+        if let Ok(group) = libc::pid_t::try_from(self.pgid) && group > 1 {
+            // SAFETY: kill takes scalar arguments only; a negative pid
+            // addresses the process group `group` (killpg). ESRCH (the
+            // group is already empty) is ignored.
+            unsafe { libc::kill(-group, libc::SIGKILL); }
+        }
+        let _ = self.child.start_kill();
+    }
+
+    /// The timeout/failure cleanup: [`Self::kill_group`], then collect the
+    /// child's exit (reaping it) for at most [`PROBE_REAP_GRACE`]. Returns
+    /// whether the leader is now reaped. If the grace passes, the leader
+    /// stays `Unreaped` with `killed` set, and Drop hands it unsignalled to
+    /// tokio's orphan reaper.
+    async fn kill_and_reap(&mut self) -> bool {
+        self.kill_group();
+        if self.leader == LeaderState::Reaped { return true; }
+        if let Ok(waited) = tokio::time::timeout(PROBE_REAP_GRACE, self.child.wait()).await {
+            let _ = self.observe_wait(waited);
+        }
+        self.leader == LeaderState::Reaped
+    }
+}
+
+/// Cancellation path: the caller dropped [`run_bounded`]'s future mid-read or
+/// mid-wait, so its cleanup never ran. An `Unreaped` leader that was not yet
+/// killed gets [`ProbeProcess::kill_group`] (the whole group, so a forked
+/// helper holding stdout dies too); a `Reaped` one, or one already killed, is
+/// left alone — the group kill is not repeated (at most once; a repeat would
+/// be safe only while unreaped, and adds nothing to a SIGKILL already sent).
+/// Never blocks: the `Child` field is then dropped normally and, with
+/// `kill_on_drop(false)`, tokio hands an unreaped child to its orphan reaper,
+/// which reaps it once it exits, without signalling it.
+impl Drop for ProbeProcess {
+    fn drop(&mut self) {
+        self.kill_group();
+    }
 }
 
 /// Runs `cmd` (stdin closed, stderr discarded, stdout captured up to
 /// [`PROBE_OUTPUT_LIMIT`]) for at most `limit`. Starts one child process, on
 /// Unix as the leader of a new process group (`process_group(0)`: group id =
 /// its pid), which everything it forks inherits.
+///
+/// Invariant: the process group is signalled only by
+/// [`ProbeProcess::kill_group`], only while the leader is unreaped (no
+/// successful wait and no ECHILD seen), and at most once. This also holds when
+/// the returned future is dropped early (the guard's Drop).
 async fn run_bounded(mut cmd: tokio::process::Command, limit: Duration) -> Probe {
-    // Signal the process group only while its leader is still unreaped.
     use tokio::io::AsyncReadExt;
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
+    // The guard is the only signaller: tokio must not kill on drop.
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(false);
     #[cfg(unix)]
     cmd.process_group(0);
-    let Ok(mut child) = cmd.spawn() else { return Probe::Failed };
-    let pid = child.id();
-    let mut leader = LeaderState::Unreaped;
+    let Ok(child) = cmd.spawn() else { return Probe::Failed };
+    let Some(mut guard) = ProbeProcess::new(child) else { return Probe::Failed };
     let deadline = tokio::time::Instant::now() + limit;
-    let Some(mut stdout) = child.stdout.take() else {
-        kill_and_reap(&mut child, pid, &mut leader).await;
+    let Some(mut stdout) = guard.child.stdout.take() else {
+        guard.kill_and_reap().await;
         return Probe::Failed;
     };
     let ran = tokio::time::timeout_at(deadline, async {
@@ -84,43 +201,20 @@ async fn run_bounded(mut cmd: tokio::process::Command, limit: Duration) -> Probe
             bytes.extend_from_slice(&buffer[..keep]);
         }
         // Only wait after EOF, under the same deadline (the remaining time).
-        let status = child.wait().await?;
-        leader.mark_reaped();
+        // A ready wait is observed in the same poll, so cancellation cannot
+        // fall between the reap and the state change.
+        let waited = guard.child.wait().await;
+        let status = guard.observe_wait(waited)?;
         // A helper outliving a normally exited probe is left alone: after
         // reaping, its former group id must never be signalled.
         Ok::<_, std::io::Error>(Output { status, stdout: bytes, stderr: Vec::new() })
     }).await;
     match ran {
         Ok(Ok(output)) => Probe::Finished(output),
-        Ok(Err(_)) => { kill_and_reap(&mut child, pid, &mut leader).await; Probe::Failed }
-        Err(_) => { let reaped = kill_and_reap(&mut child, pid, &mut leader).await; Probe::TimedOut { pid, reaped } }
+        // Read or wait failure; after ECHILD the guard refuses to signal.
+        Ok(Err(_)) => { guard.kill_and_reap().await; Probe::Failed }
+        Err(_) => { let reaped = guard.kill_and_reap().await; Probe::TimedOut { pid: Some(guard.pgid), reaped } }
     }
-}
-
-/// SIGKILL to the probe's whole process group (Unix; `group` is the pid
-/// recorded at spawn, which `process_group(0)` made the group id), then to
-/// the direct child, then collect the child's exit (reaping it) for at most
-/// [`PROBE_REAP_GRACE`]. An unreaped leader keeps its pid allocated; refuse
-/// cleanup after reaping, when the former group id could have been reused.
-async fn kill_and_reap(child: &mut tokio::process::Child, group: Option<u32>, leader: &mut LeaderState) -> bool {
-    if *leader == LeaderState::Reaped { return true; }
-    #[cfg(all(test, unix))]
-    let _ = tests::GROUP_KILLS.try_with(|count| {
-        assert_eq!(*leader, LeaderState::Unreaped);
-        count.set(count.get() + 1);
-    });
-    #[cfg(unix)]
-    if let Some(group) = group.and_then(|pid| libc::pid_t::try_from(pid).ok()).filter(|pid| *pid > 1) {
-        // SAFETY: kill takes scalar arguments only; a negative pid addresses
-        // the process group `group` (killpg).
-        unsafe { libc::kill(-group, libc::SIGKILL); }
-    }
-    #[cfg(not(unix))]
-    let _ = group;
-    let _ = child.start_kill();
-    let reaped = matches!(tokio::time::timeout(PROBE_REAP_GRACE, child.wait()).await, Ok(Ok(_)));
-    if reaped { leader.mark_reaped(); }
-    reaped
 }
 
 /// [`run_bounded`]'s output, or `None` (not started, failed or timed out).
@@ -547,23 +641,122 @@ mod tests {
         }).await;
     }
 
-    #[tokio::test]
-    async fn cleanup_refuses_to_signal_a_reaped_leader() {
+    /// A guard over a live, hanging child spawned like `run_bounded` does
+    /// (own process group, tokio never kills on drop).
+    fn spawn_hanging_guard() -> ProbeProcess {
         let mut cmd = hang("nvidia-smi");
-        cmd.process_group(0).kill_on_drop(true);
-        let mut child = cmd.spawn().unwrap();
-        let pid = child.id();
+        cmd.process_group(0).kill_on_drop(false);
+        ProbeProcess::new(cmd.spawn().unwrap()).expect("a freshly spawned child has a pid")
+    }
+
+    fn kills() -> usize {
+        GROUP_KILLS.with(|count| count.get())
+    }
+
+    #[tokio::test]
+    async fn kill_group_is_idempotent_and_refuses_a_reaped_leader() {
         GROUP_KILLS.scope(std::cell::Cell::new(0), async {
-            // Use a live sentinel so an accidental signal is observable.
-            let mut leader = LeaderState::Reaped;
-            assert!(kill_and_reap(&mut child, pid, &mut leader).await);
-            GROUP_KILLS.with(|count| assert_eq!(count.get(), 0));
-            let alive = exists(pid.unwrap());
-            leader = LeaderState::Unreaped;
-            assert!(kill_and_reap(&mut child, pid, &mut leader).await);
-            assert_eq!(leader, LeaderState::Reaped);
-            assert!(alive, "Reaped state must refuse all signalling");
+            let mut probe = spawn_hanging_guard();
+            let pid = probe.pgid as libc::pid_t;
+            // A live sentinel marked Reaped: any accidental signal would kill it.
+            probe.leader = LeaderState::Reaped;
+            probe.kill_group();
+            probe.kill_group();
+            assert!(probe.kill_and_reap().await);
+            assert_eq!(kills(), 0);
+            assert!(!probe.killed);
+            assert!(exists(pid as u32), "Reaped state must refuse all signalling");
+            // Unreaped: exactly one signal, however often it is asked for.
+            probe.leader = LeaderState::Unreaped;
+            probe.kill_group();
+            probe.kill_group();
+            assert_eq!(kills(), 1);
+            assert!(probe.killed);
+            assert!(probe.kill_and_reap().await, "the killed leader is reaped");
+            assert_eq!(probe.leader, LeaderState::Reaped);
+            // Drop after the explicit cleanup does not signal a second time.
+            drop(probe);
+            assert_eq!(kills(), 1);
+            assert!(gone_within(pid, Duration::from_secs(5)).await);
         }).await;
+    }
+
+    /// R8j round 5 F-A: ECHILD means the leader was reaped elsewhere — its id
+    /// may already be reused, so neither the group nor the pid is signalled.
+    #[tokio::test]
+    async fn echild_marks_the_leader_reaped_and_sends_no_signal() {
+        GROUP_KILLS.scope(std::cell::Cell::new(0), async {
+            let mut probe = spawn_hanging_guard();
+            let pid = probe.pgid as libc::pid_t;
+            let waited = probe.observe_wait(Err(std::io::Error::from_raw_os_error(libc::ECHILD)));
+            assert!(waited.is_err(), "the probe is reported as failed");
+            assert_eq!(probe.leader, LeaderState::Reaped);
+            probe.kill_group();
+            assert!(probe.kill_and_reap().await);
+            assert!(!probe.killed);
+            assert_eq!(kills(), 0);
+            // The real child (standing in for a reused pid) was not touched.
+            assert!(exists(pid as u32), "no signal reached the sentinel");
+            // Test cleanup outside the guard; the guard's Drop sends nothing.
+            // SAFETY: scalar arguments only; `pid` is our unreaped child.
+            unsafe { libc::kill(pid, libc::SIGKILL); }
+            drop(probe);
+            assert_eq!(kills(), 0);
+            assert!(gone_within(pid, Duration::from_secs(5)).await, "tokio's orphan reaper collected it");
+        }).await;
+    }
+
+    /// Any other wait error leaves the kernel holding the child: the state
+    /// stays Unreaped and the kill path signals exactly once.
+    #[tokio::test]
+    async fn other_wait_errors_keep_the_leader_unreaped_and_kill_once() {
+        GROUP_KILLS.scope(std::cell::Cell::new(0), async {
+            let mut probe = spawn_hanging_guard();
+            let pid = probe.pgid as libc::pid_t;
+            for errno in [libc::EINTR, libc::EIO] {
+                assert!(probe.observe_wait(Err(std::io::Error::from_raw_os_error(errno))).is_err());
+                assert_eq!(probe.leader, LeaderState::Unreaped, "errno {errno}");
+            }
+            assert!(probe.kill_and_reap().await);
+            assert_eq!(probe.leader, LeaderState::Reaped);
+            assert_eq!(kills(), 1);
+            drop(probe);
+            assert_eq!(kills(), 1);
+            assert!(gone_within(pid, Duration::from_secs(5)).await);
+        }).await;
+    }
+
+    /// R8j round 5 F-B: the caller drops the probe future mid-read; the
+    /// guard's Drop kills the whole group, so neither the shell nor the
+    /// forked helper holding stdout survives.
+    #[tokio::test]
+    async fn cancelled_probe_kills_the_whole_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let (shell_file, helper_file) = (dir.path().join("shell.pid"), dir.path().join("helper.pid"));
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", "echo $$ > \"$1\"; sleep 600 & echo $! > \"$2\"; wait", "sh"])
+            .arg(&shell_file).arg(&helper_file);
+        let read = |path: &std::path::Path| std::fs::read_to_string(path).ok()?.trim().parse::<libc::pid_t>().ok();
+        GROUP_KILLS.scope(std::cell::Cell::new(0), async {
+            let mut probe = Box::pin(run_bounded(cmd, Duration::from_secs(30)));
+            let until = Instant::now() + Duration::from_secs(5);
+            // Drive the probe (≥ 200 ms) until the helper exists, then cancel.
+            let started = Instant::now();
+            while read(&helper_file).is_none() || started.elapsed() < Duration::from_millis(200) {
+                assert!(Instant::now() < until, "the probe script never started its helper");
+                tokio::select! {
+                    ended = &mut probe => panic!("the probe ended before cancellation: {ended:?}"),
+                    _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+                }
+            }
+            assert_eq!(kills(), 0);
+            drop(probe);
+            assert_eq!(kills(), 1, "the dropped guard killed the group once");
+        }).await;
+        let (shell, helper) = (read(&shell_file).unwrap(), read(&helper_file).unwrap());
+        assert_ne!(helper, shell);
+        assert!(gone_within(shell, Duration::from_secs(5)).await, "shell {shell} survived the cancellation");
+        assert!(gone_within(helper, Duration::from_secs(5)).await, "forked helper {helper} survived the cancellation");
     }
 
     #[tokio::test]

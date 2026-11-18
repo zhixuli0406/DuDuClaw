@@ -4838,9 +4838,9 @@
       "rationale": "Test fixture or test helper; compiled/run only for regression verification, not a production employee execution entry point."
     },
     {
-      "symbol": "crates/duduclaw-inference/src/hardware.rs::tests::cleanup_refuses_to_signal_a_reaped_leader",
+      "symbol": "crates/duduclaw-inference/src/hardware.rs::tests::cancelled_probe_kills_the_whole_group",
       "apis": {
-        "terminal_spawn": 1
+        "command_constructor": 1
       },
       "effects": [
         "process_spawn"
@@ -4890,6 +4890,18 @@
       "symbol": "crates/duduclaw-inference/src/hardware.rs::tests::hung_probe_with_forked_helper_kills_the_whole_group",
       "apis": {
         "command_constructor": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test fixture or test helper; compiled/run only for regression verification, not a production employee execution entry point."
+    },
+    {
+      "symbol": "crates/duduclaw-inference/src/hardware.rs::tests::spawn_hanging_guard",
+      "apis": {
+        "terminal_spawn": 1
       },
       "effects": [
         "process_spawn"
