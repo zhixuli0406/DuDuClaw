@@ -82,6 +82,15 @@ pub(super) const DNS_BROKER_ALLOW_MARKER: &str = "# @DUDUCLAW-DNS-UPSTREAM-ALLOW
 /// Start of every broker unit mismatch message ([`dns_broker_unit_mismatch`]).
 pub(super) const DNS_BROKER_MISMATCH_HEAD: &str = "DNS 轉送服務單元 /etc/systemd/system/duduclaw-dns-broker.service";
 
+/// The refusal of an IPv4 link-local DNS upstream (169.254.0.0/16), with
+/// what to do instead.
+pub(super) const LINK_LOCAL_UPSTREAM_REFUSED: &str = "DNS 上游不能是 IPv4 鏈路本地位址（169.254.0.0/16，例如雲端主機的中繼資料服務位址）：DNS 轉送服務的防火牆規則只限制主機、不限制連接埠，轉送服務因此也能連到該位址上的其他服務（例如雲端憑證）。如果這台主機唯一的 DNS 解析器是鏈路本地位址（雲端虛擬機常見），請安裝並啟用 systemd-resolved，安裝程式會直接使用它，不需要 --dns-upstream；或以 --dns-upstream 指定一個位址可路由的 DNS 解析器。";
+
+/// `upstream` is an IPv4 link-local address (169.254.0.0/16).
+pub(super) fn ipv4_link_local(upstream: std::net::SocketAddr) -> bool {
+    matches!(upstream.ip(), std::net::IpAddr::V4(ip) if ip.is_link_local())
+}
+
 /// The broker upstream's network rule: `IPAddressAllow=<ip>/32` (IPv4) or
 /// `IPAddressAllow=<ip>/128` (IPv6, as `Ipv6Addr` displays it). Refuses what
 /// the broker's own rule refuses (`duduclaw_egress::resolver::validate_broker_upstream`:
@@ -90,10 +99,14 @@ pub(super) const DNS_BROKER_MISMATCH_HEAD: &str = "DNS 轉送服務單元 /etc/s
 /// too) and what the rule cannot carry: a loopback host (spawnd's readback
 /// refuses it; it would open every local service to the broker), an
 /// IPv4-mapped IPv6 address (its traffic is IPv4, the /128 rule would not
-/// match it) and an IPv6 link-local address (the rule has no zone).
+/// match it), an IPv6 link-local address (the rule has no zone) and an IPv4
+/// link-local address (169.254.0.0/16, [`LINK_LOCAL_UPSTREAM_REFUSED`]): the
+/// rule limits the host, not the port, so a compromised broker could reach a
+/// link-local service such as the cloud metadata endpoint's HTTP port.
 pub(super) fn dns_broker_allow_line(upstream: std::net::SocketAddr) -> Result<String, &'static str> {
     use std::net::IpAddr;
     const REFUSED: &str = "DNS 上游必須是單一、非本機迴路的單點傳播 IP 位址加上連接埠 53。";
+    if ipv4_link_local(upstream) { return Err(LINK_LOCAL_UPSTREAM_REFUSED); }
     if upstream.port() != 53 { return Err(REFUSED); }
     match upstream.ip() {
         IpAddr::V4(ip) if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() || ip.is_broadcast() => Err(REFUSED),
@@ -321,8 +334,9 @@ mod tests {
         assert_eq!(installed_unit_text(DNS_BROKER_UNIT, shipped, None).unwrap(), shipped);
         for (upstream, line) in [("192.0.2.53:53", "IPAddressAllow=192.0.2.53/32"),
             ("10.0.0.2:53", "IPAddressAllow=10.0.0.2/32"),
-            // Cloud metadata resolvers are link-local IPv4 hosts (kept).
-            ("169.254.169.253:53", "IPAddressAllow=169.254.169.253/32"),
+            // Just outside 169.254.0.0/16.
+            ("169.253.255.255:53", "IPAddressAllow=169.253.255.255/32"),
+            ("169.255.0.1:53", "IPAddressAllow=169.255.0.1/32"),
             ("[2001:4860:4860::8888]:53", "IPAddressAllow=2001:4860:4860::8888/128"),
             ("[2001:DB8:0:0:0:0:0:35]:53", "IPAddressAllow=2001:db8::35/128"),
             ("[fd00:ec2::253]:53", "IPAddressAllow=fd00:ec2::253/128")] {
@@ -349,6 +363,17 @@ mod tests {
             assert!(dns_broker_allow_line(upstream).is_err(), "{bad}");
             assert!(dns_broker_unit_text(shipped, Some(upstream)).is_err(), "{bad}");
         }
+        // IPv4 link-local (cloud metadata and resolver hosts included): the
+        // rule limits the host, not the port. The refusal says what to do.
+        for bad in ["169.254.169.254:53", "169.254.169.253:53", "169.254.0.1:53", "169.254.255.255:53", "169.254.169.254:80"] {
+            let upstream: std::net::SocketAddr = bad.parse().unwrap();
+            assert!(ipv4_link_local(upstream), "{bad}");
+            assert_eq!(dns_broker_allow_line(upstream), Err(LINK_LOCAL_UPSTREAM_REFUSED), "{bad}");
+            assert_eq!(dns_broker_unit_text(shipped, Some(upstream)), Err(LINK_LOCAL_UPSTREAM_REFUSED), "{bad}");
+            assert!(installed_unit_text(DNS_BROKER_UNIT, shipped, Some(upstream)).is_err(), "{bad}");
+        }
+        assert!(LINK_LOCAL_UPSTREAM_REFUSED.contains("systemd-resolved") && LINK_LOCAL_UPSTREAM_REFUSED.contains("--dns-upstream"));
+        assert!(!ipv4_link_local("192.0.2.53:53".parse().unwrap()) && !ipv4_link_local("[fe80::1]:53".parse().unwrap()));
         // The marker must be exactly one line and the template carry no allow line of its own.
         let upstream = Some("192.0.2.53:53".parse().unwrap());
         let damaged = [shipped.replace(&format!("{DNS_BROKER_ALLOW_MARKER}\n"), ""),

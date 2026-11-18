@@ -1233,9 +1233,16 @@ expects the text generated for the upstream recorded in
 `/etc/duduclaw/dns-broker.json` (the shipped text when that file is absent, as
 it must be on the resolved route); a mismatch names the expected and the found
 allow line, never the file. S1 accepts an upstream only when the broker's own
-validator accepts it and it is not loopback, an IPv4-mapped IPv6 address or
+validator accepts it and it is not loopback, an IPv4-mapped IPv6 address,
 IPv6 link-local (the rule could not carry it; spawnd's readback refuses
-loopback). Changing the upstream means re-running the installer, not editing
+loopback) or IPv4 link-local (169.254.0.0/16). `IPAddressAllow=` limits the
+host, not the port, so with an upstream such as the cloud metadata address
+`169.254.169.254:53` a compromised broker could reach the metadata service's
+HTTP port and its credentials. Cloud VMs whose only resolver is link-local
+(for example `169.254.169.253`) should install and enable systemd-resolved, so
+the installer takes the resolved route and needs no `--dns-upstream`, or
+point `--dns-upstream` at a resolver with a routable address; the refusal
+message says this. Changing the upstream means re-running the installer, not editing
 the unit or adding a drop-in.
 
 ### R7b: DNS route evidence through egress

@@ -703,6 +703,14 @@ it; an inconclusive result is re-run at most every 10 s,
 At most `registry::MAX_PENDING_RESERVATIONS` (4) reservations may be pending at
 once; a further new employee is refused with `registry::PendingLimit`
 (resource limit, wire `NotReady`, nothing reserved) until one resolves. A
+reservation still unresolved `registry::PENDING_RESERVATION_TTL_MS` (10 min)
+after it was made (a resume does not extend it) is retired by the lifecycle
+thread's maintenance like a failed allocation: Tombstone (saved durably before
+it is forgotten), then `recover_locked`; at most 4 per turn, never waiting for
+a probe. The employee keeps its single registry row (one row per employee is
+unchanged) and is from then on a tombstoned employee like any other: its next
+allocation is refused as every Tombstone is, and its slot under the cap is
+free for other employees. A
 pending reservation is not a host-wide verification failure. It is remembered
 in memory only: after a restart `reconcile` tombstones every `Reserved` row as
 before.

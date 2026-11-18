@@ -416,6 +416,45 @@ impl Core {
         self.last_refresh = Instant::now();
     }
     fn account(&self, employee: EmployeeId) -> Result<EmployeeAccount> { os(self.registry.registry().lookup(employee)).cloned() }
+    /// Every registry row (one per employee) is monitored; a row that is not
+    /// Ready is fenced. Forces the next readiness refresh.
+    fn monitor_registry(&mut self) -> Result<()> {
+        let mut entries = self.monitor.entries.lock().map_err(|_| unavailable())?;
+        for account in &self.registry.registry().employees {
+            if let Some(entry) = entries.iter_mut().find(|e| e.account.employee == account.employee) {
+                entry.account = account.clone();
+                if account.state != crate::registry::AccountState::Ready { entry.cancelled.store(true, Ordering::Release); }
+            } else {
+                entries.push(ScanEntry { account: account.clone(), run: None, cgroup: None, revokers: vec![],
+                    cancelled: Arc::new(AtomicBool::new(account.state != crate::registry::AccountState::Ready)), deadline: None });
+            }
+        }
+        drop(entries);
+        self.last_refresh = Instant::now() - Duration::from_secs(10);
+        Ok(())
+    }
+    /// R7c (F6): the pending-reservation deadline, on this lifecycle thread
+    /// (so it never interleaves with an allocation). Never waits for a probe;
+    /// at most `MAX_PENDING_RESERVATIONS` retirements per turn, each the
+    /// failure branch's quarantine (`RegistryStore::expire_pending`).
+    fn expire_reservations(&mut self) {
+        if self.poisoned { return; }
+        let expired = self.registry.expire_pending(&mut LinuxAccounts::background(self.components.ssh.as_ref()));
+        match expired {
+            Ok(expired) if expired.is_empty() => {}
+            Ok(expired) => {
+                for retired in &expired {
+                    eprintln!("duduclaw-spawnd: employee reservation uid {} retired: SSH denial probe unresolved for {} s{}",
+                        retired.account.uid, crate::registry::PENDING_RESERVATION_TTL_MS / 1000,
+                        if retired.quarantine.is_ok() { "" } else { " (quarantine failed; retried at start-up)" });
+                }
+                if self.monitor_registry().is_err() { self.poisoned = true; }
+            }
+            // No clock, or a failed save (which poisons the registry store and
+            // keeps every reservation remembered): nothing changed.
+            Err(_) => {}
+        }
+    }
     /// H4 upgrade step (H3 open item 1): employees allocated before H3 have
     /// no anchor. Create the missing ones for every allocation Ready in both
     /// the journal and the registry; idempotent, never repairs; audited.
@@ -583,20 +622,9 @@ impl Host for Core {
                 crate::allocation::AllocationEvent::Intruder { employee } => emit(&self.audit, Event::Intruder, Some(employee), None),
             }
         }
-        let mut entries = self.monitor.entries.lock().map_err(|_| Wire::IsolationUnavailable)?;
         // Even a failed allocation may have created a durable UID reservation.
         // Monitor every such identity before returning its failure to the gateway.
-        for account in &self.registry.registry().employees {
-            if let Some(entry) = entries.iter_mut().find(|e| e.account.employee == account.employee) {
-                entry.account = account.clone();
-                if account.state != crate::registry::AccountState::Ready { entry.cancelled.store(true, Ordering::Release); }
-            } else {
-                entries.push(ScanEntry { account: account.clone(), run: None, cgroup: None, revokers: vec![],
-                    cancelled: Arc::new(AtomicBool::new(account.state != crate::registry::AccountState::Ready)), deadline: None });
-            }
-        }
-        drop(entries);
-        self.last_refresh = Instant::now() - Duration::from_secs(10);
+        self.monitor_registry().map_err(|_| Wire::IsolationUnavailable)?;
         result
     }
     fn broker(&mut self, job: BrokerJob) -> Result<BrokerStep> {
@@ -834,6 +862,7 @@ impl Host for Core {
                 emit(&self.audit, Event::OutputTruncated, Some(entry.employee), Some(*run)); entry.truncated_event = true;
             }
         }
+        self.expire_reservations();
         if self.last_refresh.elapsed() >= Duration::from_millis(250) { self.refresh(); }
         Ok(())
     }

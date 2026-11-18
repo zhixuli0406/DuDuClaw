@@ -732,8 +732,10 @@ pub(super) fn dns_route(resolved: bool, upstream: Option<SocketAddr>,
         (true, None) => Ok((DnsRoute::ResolvedVarlink, None)),
         (true, Some(_)) => Err("這台主機使用 systemd-resolved，不需要也不接受 --dns-upstream。"),
         (false, None) => Err("這台主機沒有可用的 systemd-resolved；請以 --dns-upstream <IP:53> 指定專用 DNS 轉送服務的上游 DNS。"),
+        // Refused whatever `validate` says, with what to do instead.
+        (false, Some(upstream)) if layout::ipv4_link_local(upstream) => Err(layout::LINK_LOCAL_UPSTREAM_REFUSED),
         (false, Some(upstream)) if validate(upstream) => Ok((DnsRoute::DedicatedDnsBroker, Some(upstream))),
-        (false, Some(_)) => Err("--dns-upstream 必須是單一 IP 位址加上連接埠 53，且不能是本機迴路、未指定、群播、廣播、IPv6 鏈路本地或 IPv4 對應的 IPv6 位址。"),
+        (false, Some(_)) => Err("--dns-upstream 必須是單一 IP 位址加上連接埠 53，且不能是本機迴路、未指定、群播、廣播、IPv4 或 IPv6 鏈路本地、或 IPv4 對應的 IPv6 位址。"),
     }
 }
 
@@ -3057,13 +3059,27 @@ fn wait_for(deadline: Duration, mut ready: impl FnMut() -> bool) -> bool {
 }
 
 fn enable_now(unit: &str, bound: Duration) -> Result<()> {
-    let output = command("systemctl", &["enable", "--now", unit])?;
-    if !output.status.success() {
-        if let Some(result) = unit_failed_result(unit) { return Err(updater_failed(unit, &result)); }
+    enable_now_with(unit, unit_failed_result,
+        |unit| Ok(command("systemctl", &["enable", "--now", unit])?.status.success()),
+        || wait_for(bound, || readiness::unit_loaded_active(unit).is_ok()))
+}
+
+/// S6 `EnableNow` with its effects injected: `failed` is
+/// [`unit_failed_result`] (`None` for every unit but the updater), `start`
+/// runs `systemctl enable --now` (`Ok(false)`: it exited non-zero), `active`
+/// waits for the unit. A unit already `failed` (a resumed install after the
+/// updater failed) is refused BEFORE any start attempt, as its message says
+/// (the installer never restarts it); `failed` is asked again after a failed
+/// start or wait.
+pub(super) fn enable_now_with(unit: &str, mut failed: impl FnMut(&str) -> Option<String>,
+    start: impl FnOnce(&str) -> Result<bool>, active: impl FnOnce() -> bool) -> Result<()> {
+    if let Some(result) = failed(unit) { return Err(updater_failed(unit, &result)); }
+    if !start(unit)? {
+        if let Some(result) = failed(unit) { return Err(updater_failed(unit, &result)); }
         return Err(refused(format!("無法啟動 {unit}。")));
     }
-    if !wait_for(bound, || readiness::unit_loaded_active(unit).is_ok()) {
-        if let Some(result) = unit_failed_result(unit) { return Err(updater_failed(unit, &result)); }
+    if !active() {
+        if let Some(result) = failed(unit) { return Err(updater_failed(unit, &result)); }
         return Err(refused(format!("{unit} 未在時限內進入執行狀態，或含有未驗證的覆寫設定。")));
     }
     Ok(())
@@ -3768,8 +3784,17 @@ mod tests {
             assert!(duduclaw_egress::daemon::BrokerConfig { upstream: address }.validate().is_ok(), "{bad}");
             assert!(dns_route(false, Some(address), broker).is_err(), "{bad}");
         }
+        // IPv4 link-local (cloud metadata/resolver hosts): refused with the
+        // systemd-resolved advice, even by a validator that would accept it.
+        for bad in ["169.254.169.254:53", "169.254.169.253:53"] {
+            let address: SocketAddr = bad.parse().unwrap();
+            assert!(!upstream_valid(address), "{bad}");
+            assert_eq!(dns_route(false, Some(address), broker), Err(layout::LINK_LOCAL_UPSTREAM_REFUSED), "{bad}");
+            assert_eq!(dns_route(false, Some(address), |_| true), Err(layout::LINK_LOCAL_UPSTREAM_REFUSED), "{bad}");
+            assert!(layout::dns_broker_unit_text(layout::DNS_BROKER_UNIT_TEXT, Some(address)).is_err(), "{bad}");
+        }
         // Whatever S1 accepts, the broker accepts and the broker unit can be generated for.
-        for good in ["192.0.2.53:53", "10.0.0.2:53", "169.254.169.253:53", "[2001:4860:4860::8888]:53"] {
+        for good in ["192.0.2.53:53", "10.0.0.2:53", "[2001:4860:4860::8888]:53"] {
             let address: SocketAddr = good.parse().unwrap();
             assert!(upstream_valid(address), "{good}");
             assert!(duduclaw_egress::daemon::BrokerConfig { upstream: address }.validate().is_ok(), "{good}");
@@ -4875,6 +4900,44 @@ gshadow:        files\nhosts:          files mdns4_minimal [NOTFOUND=return] dns
         let rest = &source[start..];
         let body = &rest[..rest.find("\n}\n").unwrap()];
         assert!(body.contains("unit_failed_result(unit)") && !body.contains("systemctl"));
+        // `EnableNow` asks the failed state BEFORE `enable --now`: a resumed
+        // install after the updater failed is refused and nothing is started.
+        let run = |before: Option<&str>, after: Option<&str>, started: bool, active: bool| {
+            let calls = std::cell::RefCell::new(Vec::new());
+            let mut asked = 0;
+            let result = enable_now_with(UPDATER_UNIT,
+                |unit| { assert_eq!(unit, UPDATER_UNIT); calls.borrow_mut().push("failed?"); asked += 1;
+                    (if asked == 1 { before } else { after }).map(str::to_owned) },
+                |unit| { assert_eq!(unit, UPDATER_UNIT); calls.borrow_mut().push("enable --now"); Ok(started) },
+                || { calls.borrow_mut().push("wait"); active });
+            (result.map_err(|error| error.to_string()), calls.into_inner())
+        };
+        let (result, calls) = run(Some("exit-code"), None, true, true);
+        let message = result.unwrap_err();
+        assert!(message.contains("sudo systemctl reset-failed duduclaw-updated.service")
+            && message.contains("sudo journalctl -b -u duduclaw-updated.service"), "{message}");
+        assert_eq!(calls, ["failed?"], "failed before start: no start attempted");
+        let (result, calls) = run(Some("start-limit-hit"), None, true, true);
+        assert!(result.unwrap_err().contains("短時間內重新啟動太多次"));
+        assert_eq!(calls, ["failed?"]);
+        // Not failed: started, then waited for.
+        let (result, calls) = run(None, None, true, true);
+        assert!(result.is_ok());
+        assert_eq!(calls, ["failed?", "enable --now", "wait"]);
+        // The post-start failed check stays: after a non-zero start and after a timed-out wait.
+        let (result, calls) = run(None, Some("exit-code"), false, true);
+        assert!(result.unwrap_err().contains("reset-failed"));
+        assert_eq!(calls, ["failed?", "enable --now", "failed?"]);
+        let (result, calls) = run(None, Some("exit-code"), true, false);
+        assert!(result.unwrap_err().contains("reset-failed"));
+        assert_eq!(calls, ["failed?", "enable --now", "wait", "failed?"]);
+        let (result, _) = run(None, None, true, false);
+        assert!(result.unwrap_err().contains("未在時限內進入執行狀態"));
+        // Production wiring: `enable_now` uses this order with the real probe.
+        let start = source.find("fn enable_now(").unwrap();
+        let rest = &source[start..];
+        let body = &rest[..rest.find("\n}\n").unwrap()];
+        assert!(body.contains("enable_now_with(unit, unit_failed_result,"), "{body}");
     }
 
     /// `--enable-now` is accepted (compat) and has no effect beyond one notice.

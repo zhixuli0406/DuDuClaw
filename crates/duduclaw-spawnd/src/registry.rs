@@ -83,6 +83,11 @@ pub trait AccountHost {
 /// refused with [`PendingLimit`] until one resolves, so an untrusted gateway
 /// cannot pile up reserved uids or forced probe requests.
 pub const MAX_PENDING_RESERVATIONS: usize = 4;
+/// A reservation unresolved for longer than this (monotonic milliseconds
+/// since it was reserved; resuming does not extend it) is retired by the
+/// lifecycle thread's maintenance ([`Allocations::expire`]), so abandoned
+/// reservations cannot hold the [`MAX_PENDING_RESERVATIONS`] cap.
+pub const PENDING_RESERVATION_TTL_MS: u64 = 10 * 60 * 1000;
 /// The refusal of a new employee allocation while [`MAX_PENDING_RESERVATIONS`]
 /// reservations are pending (kind `WouldBlock`: retry later). Nothing was
 /// reserved.
@@ -186,29 +191,55 @@ impl Registry {
 ///   reachable (sshd's own Accepted record), ⇒ `Tombstone` + best-effort
 ///   `recover_locked`, as before.
 ///
+/// - Deadline ([`Self::expire`], lifecycle maintenance): a reservation still
+///   unresolved [`PENDING_RESERVATION_TTL_MS`] after it was reserved is
+///   retired as a failure is: `Tombstone` (saved durably first), then it is
+///   forgotten here, then best-effort `recover_locked`. The employee keeps
+///   its single row; from then on it is a tombstoned employee like any other
+///   (its next allocation is refused as every Tombstone is), and its cap
+///   slot is free for other employees. Before the deadline nothing changes.
+///
 /// The set is memory only: after a restart `RegistryStore::reconcile` turns
 /// every `Reserved` row into a `Tombstone` exactly as before (unchanged rule),
 /// so an unresolved reservation does not outlive the process that made it.
 #[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Default)]
-pub struct Allocations { unresolved: BTreeSet<EmployeeId> }
+pub struct Allocations {
+    unresolved: BTreeSet<EmployeeId>,
+    /// When each `unresolved` reservation was made (monotonic ms; same keys).
+    reserved_at: std::collections::BTreeMap<EmployeeId, u64>,
+}
+/// One reservation retired by the deadline, and its quarantine result.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug)]
+pub struct ExpiredReservation { pub account: EmployeeAccount, pub quarantine: io::Result<()> }
 #[cfg(any(target_os = "linux", test))]
 impl Allocations {
     /// Employees whose `Reserved` row an unresolved probe left resumable.
     pub fn resumable(&self) -> &BTreeSet<EmployeeId> { &self.unresolved }
-    /// Allocate (or resume) `employee` in `registry`; `save` persists the
-    /// registry durably (before useradd, and after the outcome is decided).
-    pub fn allocate(&mut self, registry: &mut Registry, employee: EmployeeId, host: &mut dyn AccountHost,
+    fn resolved(&mut self, employee: &EmployeeId) { self.unresolved.remove(employee); self.reserved_at.remove(employee); }
+    /// Allocate (or resume) `employee` in `registry` at monotonic `now_ms`;
+    /// `save` persists the registry durably (before useradd, and after the
+    /// outcome is decided).
+    pub fn allocate(&mut self, registry: &mut Registry, employee: EmployeeId, host: &mut dyn AccountHost, now_ms: u64,
         save: &mut dyn FnMut(&Registry) -> io::Result<()>) -> io::Result<EmployeeAccount> {
-        let (index, resumed) = match registry.employees.iter().position(|account| account.employee == employee) {
+        // `Some`: resume this process's unresolved reservation; `None`: a new
+        // employee. Every other existing row (a Tombstone, including one the
+        // deadline retired, or a Reserved row this process does not know) is
+        // refused.
+        let resume = match registry.employees.iter().position(|account| account.employee == employee) {
             Some(index) => match registry.employees[index].state {
                 AccountState::Ready => {
                     registry.verify_with(host, &self.unresolved)?;
                     return Ok(registry.employees[index].clone());
                 }
-                AccountState::Reserved if self.unresolved.contains(&employee) => (index, true),
+                AccountState::Reserved if self.unresolved.contains(&employee) => Some(index),
                 _ => return Err(invalid()),
             },
+            None => None,
+        };
+        let (index, resumed) = match resume {
+            Some(index) => (index, true),
             None => {
                 if self.unresolved.len() >= MAX_PENDING_RESERVATIONS { return Err(PendingLimit.error()); }
                 let index = registry.reserve(employee, host)?;
@@ -230,7 +261,11 @@ impl Allocations {
             (Err(_), true) => AccountState::Reserved,
             (Err(_), false) => AccountState::Tombstone,
         };
-        if unresolved { self.unresolved.insert(employee); } else { self.unresolved.remove(&employee); }
+        if unresolved {
+            // The deadline counts from the reservation; a resume never extends it.
+            self.unresolved.insert(employee);
+            self.reserved_at.entry(employee).or_insert(now_ms);
+        } else { self.resolved(&employee); }
         save(registry)?;
         if let Err(error) = result {
             // Best-effort immediate quarantine of a tombstone. A failure stays
@@ -240,8 +275,50 @@ impl Allocations {
         }
         Ok(registry.employees[index].clone())
     }
+    /// The deadline, run by the lifecycle thread's maintenance at monotonic
+    /// `now_ms` (never waits for a probe; at most [`MAX_PENDING_RESERVATIONS`]
+    /// entries). Each reservation unresolved for longer than
+    /// [`PENDING_RESERVATION_TTL_MS`] is retired exactly as a failed
+    /// allocation is: its row becomes `Tombstone` and the registry is saved
+    /// durably; only then is it forgotten here (so the saved registry never
+    /// holds a `Reserved` row this set forgot), and then `recover_locked`
+    /// quarantines it (best effort, as the failure branch; start-up retries a
+    /// failure). A save failure restores the rows and remembers them still.
+    /// The probe result is not consulted: completion to `Ready` stays the job
+    /// of the same employee's next allocation, before the deadline. After
+    /// it, the employee's single row is a Tombstone and its next allocation
+    /// is refused like any tombstoned employee's.
+    pub fn expire(&mut self, registry: &mut Registry, host: &mut dyn AccountHost, now_ms: u64,
+        save: &mut dyn FnMut(&Registry) -> io::Result<()>) -> io::Result<Vec<ExpiredReservation>> {
+        let due: Vec<EmployeeId> = self.reserved_at.iter()
+            .filter(|(_, reserved)| now_ms.saturating_sub(**reserved) > PENDING_RESERVATION_TTL_MS)
+            .map(|(employee, _)| *employee).take(MAX_PENDING_RESERVATIONS).collect();
+        if due.is_empty() { return Ok(Vec::new()); }
+        let mut retired = Vec::new();
+        for employee in &due {
+            if let Some(index) = registry.employees.iter().position(|account| account.employee == *employee) {
+                if registry.employees[index].state == AccountState::Reserved {
+                    registry.employees[index].state = AccountState::Tombstone;
+                    retired.push(index);
+                }
+            }
+        }
+        if !retired.is_empty() {
+            if let Err(error) = save(registry) {
+                for index in &retired { registry.employees[*index].state = AccountState::Reserved; }
+                return Err(error);
+            }
+        }
+        // Durable: forget them (a due entry without a Reserved row has nothing to retire).
+        for employee in &due { self.resolved(employee); }
+        Ok(retired.into_iter().map(|index| {
+            let account = registry.employees[index].clone();
+            let quarantine = host.recover_locked(&account);
+            ExpiredReservation { account, quarantine }
+        }).collect())
+    }
     /// The employee's row became a tombstone (explicit retirement/compensation).
-    pub fn forget(&mut self, employee: EmployeeId) { self.unresolved.remove(&employee); }
+    pub fn forget(&mut self, employee: EmployeeId) { self.resolved(&employee); }
 }
 
 #[cfg(target_os = "linux")]
@@ -362,8 +439,24 @@ mod disk {
         /// decision persisted (a failed save poisons the store).
         pub fn allocate(&mut self, employee: EmployeeId, host: &mut dyn AccountHost) -> io::Result<EmployeeAccount> {
             if self.poisoned { return Err(invalid()); }
+            let now_ms = crate::host_state::boottime_ms()?;
             let Self { directory, data, poisoned, allocations, .. } = self;
-            allocations.allocate(data, employee, host, &mut |registry: &Registry| {
+            allocations.allocate(data, employee, host, now_ms, &mut |registry: &Registry| {
+                if *poisoned { return Err(invalid()); }
+                let result = save_inner(directory.as_path(), registry);
+                if result.is_err() { *poisoned = true; }
+                result
+            })
+        }
+
+        /// The reservation deadline ([`Allocations::expire`]) at the current
+        /// boottime, for the lifecycle thread's maintenance.
+        pub fn expire_pending(&mut self, host: &mut dyn AccountHost) -> io::Result<Vec<ExpiredReservation>> {
+            if self.poisoned { return Err(invalid()); }
+            if self.allocations.resumable().is_empty() { return Ok(Vec::new()); }
+            let now_ms = crate::host_state::boottime_ms()?;
+            let Self { directory, data, poisoned, allocations, .. } = self;
+            allocations.expire(data, host, now_ms, &mut |registry: &Registry| {
                 if *poisoned { return Err(invalid()); }
                 let result = save_inner(directory.as_path(), registry);
                 if result.is_err() { *poisoned = true; }
@@ -485,6 +578,17 @@ mod tests {
         registry.reserve(EmployeeId([1; 16]), &mut Host).unwrap();
         registry.employees.push(registry.employees[0].clone());
         assert!(registry.validate(&Host.policy().unwrap()).is_err());
+        // One row per employee: a second row with its own uid is refused,
+        // even when the first one is a Tombstone.
+        registry.employees.truncate(1);
+        registry.employees[0].state = AccountState::Tombstone;
+        registry.employees.push(EmployeeAccount { employee: EmployeeId([1; 16]), uid: 70001, gid: 70001, state: AccountState::Reserved });
+        assert!(registry.validate(&Host.policy().unwrap()).is_err());
+        // One row per uid.
+        registry.employees[1].employee = EmployeeId([2; 16]);
+        registry.validate(&Host.policy().unwrap()).unwrap();
+        registry.employees[1].uid = 70000; registry.employees[1].gid = 70000;
+        assert!(registry.validate(&Host.policy().unwrap()).is_err());
     }
     #[test]
     fn uid_range_overlap_refuses_whole_range() {
@@ -498,7 +602,7 @@ mod tests {
     /// `login_denied`), with injected create/verify failures.
     #[derive(Default)]
     struct Probing { probes: Vec<io::Result<()>>, create_fail: bool, verify_fail: bool,
-        creates: usize, recoveries: usize, waits: usize }
+        creates: usize, recoveries: usize, waits: usize, recovered: Vec<u32> }
     impl AccountHost for Probing {
         fn policy(&mut self) -> io::Result<HostUidPolicy> { Host.policy() }
         fn verify_namespace(&mut self, _: &Registry) -> io::Result<()> { Ok(()) }
@@ -511,7 +615,7 @@ mod tests {
         fn verify_locked(&mut self, _: &EmployeeAccount) -> io::Result<()> {
             if self.verify_fail { Err(io::Error::other("injected lockdown readback failure")) } else { Ok(()) }
         }
-        fn recover_locked(&mut self, _: &EmployeeAccount) -> io::Result<()> { self.recoveries += 1; Ok(()) }
+        fn recover_locked(&mut self, account: &EmployeeAccount) -> io::Result<()> { self.recoveries += 1; self.recovered.push(account.uid); Ok(()) }
         fn login_denied(&mut self, _: &EmployeeAccount) -> io::Result<()> {
             self.waits += 1;
             if self.probes.is_empty() { panic!("unexpected probe request") }
@@ -522,11 +626,21 @@ mod tests {
     fn inconclusive() -> io::Result<()> { Err(SshRefusal::Inconclusive("identity (exit 3)".into()).error()) }
     fn reachable() -> io::Result<()> { Err(SshRefusal::Reachable("login_not_denied (exit 10)".into()).error()) }
     fn pending() -> io::Result<()> { Err(SshRefusal::Pending.error()) }
-    /// Runs `Allocations::allocate`, counting the durable saves.
+    /// Runs `Allocations::allocate` (at monotonic time 0), counting the durable saves.
     fn allocate(state: &mut Allocations, registry: &mut Registry, employee: u8, host: &mut Probing, saves: &mut usize)
         -> io::Result<EmployeeAccount> {
-        state.allocate(registry, EmployeeId([employee; 16]), host, &mut |_: &Registry| { *saves += 1; Ok(()) })
+        allocate_at(state, registry, employee, host, saves, 0)
     }
+    fn allocate_at(state: &mut Allocations, registry: &mut Registry, employee: u8, host: &mut Probing, saves: &mut usize, now: u64)
+        -> io::Result<EmployeeAccount> {
+        state.allocate(registry, EmployeeId([employee; 16]), host, now, &mut |_: &Registry| { *saves += 1; Ok(()) })
+    }
+    /// Runs the deadline (`Allocations::expire`) at `now`, counting the durable saves.
+    fn expire_at(state: &mut Allocations, registry: &mut Registry, host: &mut Probing, saves: &mut usize, now: u64)
+        -> io::Result<Vec<ExpiredReservation>> {
+        state.expire(registry, host, now, &mut |_: &Registry| { *saves += 1; Ok(()) })
+    }
+    fn states(registry: &Registry) -> Vec<AccountState> { registry.employees.iter().map(|account| account.state).collect() }
 
     #[test]
     fn allocation_denied_probe_is_ready() {
@@ -650,6 +764,160 @@ mod tests {
         assert!(!pending_limit(&io::Error::other("x")) && !pending_limit(&SshRefusal::Pending.error()));
     }
 
+    /// The deadline: four reservations a gateway abandoned stop holding the
+    /// cap after PENDING_RESERVATION_TTL_MS; each is retired as a failure is
+    /// (Tombstone, one durable save, quarantine), never probed; a fifth
+    /// employee is admitted, and the freed slots serve other employees.
+    #[test]
+    fn allocation_abandoned_pending_reservations_expire_after_the_ttl() {
+        const TTL: u64 = PENDING_RESERVATION_TTL_MS;
+        assert_eq!(TTL, 10 * 60 * 1000);
+        let (mut state, mut registry, mut saves) = (Allocations::default(), Registry::default(), 0);
+        let mut host = Probing { probes: (0..MAX_PENDING_RESERVATIONS).map(|_| pending()).collect(), ..Probing::default() };
+        for employee in 1..=MAX_PENDING_RESERVATIONS as u8 {
+            let error = allocate_at(&mut state, &mut registry, employee, &mut host, &mut saves, u64::from(employee)).unwrap_err();
+            assert!(crate::accounts::probe_unresolved(&error), "{error}");
+        }
+        assert!(pending_limit(&allocate_at(&mut state, &mut registry, 9, &mut host, &mut saves, 100).unwrap_err()));
+        // Exactly TTL after the oldest: nothing is due, nothing saved.
+        let recorded = saves;
+        assert!(expire_at(&mut state, &mut registry, &mut host, &mut saves, 1 + TTL).unwrap().is_empty());
+        assert_eq!((saves, state.resumable().len()), (recorded, MAX_PENDING_RESERVATIONS));
+        assert!(registry.employees.iter().all(|account| account.state == AccountState::Reserved));
+        // Past the deadline of all four.
+        let expired = expire_at(&mut state, &mut registry, &mut host, &mut saves, MAX_PENDING_RESERVATIONS as u64 + TTL + 1).unwrap();
+        assert_eq!(expired.len(), MAX_PENDING_RESERVATIONS);
+        assert!(expired.iter().all(|retired| retired.account.state == AccountState::Tombstone && retired.quarantine.is_ok()));
+        assert_eq!(saves, recorded + 1, "one durable save");
+        assert!(registry.employees.iter().all(|account| account.state == AccountState::Tombstone));
+        assert_eq!(host.recovered, [70000, 70001, 70002, 70003], "every expired row went through the quarantine path");
+        assert_eq!(host.waits, MAX_PENDING_RESERVATIONS, "the deadline never asks the probe");
+        assert!(state.resumable().is_empty());
+        assert!(expire_at(&mut state, &mut registry, &mut host, &mut saves, 3 * TTL).unwrap().is_empty(), "retired once");
+        // A fifth employee is admitted (and pends in turn), with the next uid.
+        let now = 2 * TTL;
+        host.probes = vec![pending()];
+        assert!(crate::accounts::probe_unresolved(&allocate_at(&mut state, &mut registry, 9, &mut host, &mut saves, now).unwrap_err()));
+        assert_eq!(registry.employees[4].uid, 70004);
+        // Every slot the four held is free for other employees: three more
+        // pend, then the cap applies again.
+        host.probes = (0..3).map(|_| pending()).collect();
+        for employee in 10..13 {
+            assert!(crate::accounts::probe_unresolved(&allocate_at(&mut state, &mut registry, employee, &mut host, &mut saves, now).unwrap_err()));
+        }
+        assert!(pending_limit(&allocate_at(&mut state, &mut registry, 13, &mut host, &mut saves, now).unwrap_err()));
+        // Still one row per employee; the expired rows stay burned Tombstones.
+        registry.validate(&Host.policy().unwrap()).unwrap();
+        assert_eq!(registry.employees[0], EmployeeAccount { employee: EmployeeId([1; 16]), uid: 70000, gid: 70000, state: AccountState::Tombstone });
+    }
+
+    /// After the deadline the expired employee is a tombstoned employee like
+    /// any other: its next allocation gets the existing Tombstone refusal
+    /// (not the cap, not a probe refusal; no reservation, no useradd, no
+    /// probe, no save), and the registry keeps exactly one row for it.
+    #[test]
+    fn allocation_after_expiry_refuses_the_same_employee_as_any_tombstone() {
+        const TTL: u64 = PENDING_RESERVATION_TTL_MS;
+        let (mut state, mut registry, mut saves) = (Allocations::default(), Registry::default(), 0);
+        let mut host = Probing { probes: vec![pending()], ..Probing::default() };
+        assert!(crate::accounts::probe_unresolved(&allocate_at(&mut state, &mut registry, 1, &mut host, &mut saves, 0).unwrap_err()));
+        // The reference: an employee tombstoned by a failed allocation, and its refusal.
+        host.create_fail = true;
+        assert!(allocate_at(&mut state, &mut registry, 2, &mut host, &mut saves, 0).is_err());
+        host.create_fail = false;
+        assert_eq!(registry.employees[1].state, AccountState::Tombstone);
+        let tombstoned = allocate_at(&mut state, &mut registry, 2, &mut host, &mut saves, 0).unwrap_err();
+        // The deadline retires employee 1.
+        let expired = expire_at(&mut state, &mut registry, &mut host, &mut saves, TTL + 1).unwrap();
+        assert_eq!(expired.iter().map(|retired| retired.account.uid).collect::<Vec<_>>(), [70000]);
+        assert!(state.resumable().is_empty(), "no slot is held");
+        let (rows, creates, waits, recorded) = (registry.employees.clone(), host.creates, host.waits, saves);
+        for now in [TTL + 2, 3 * TTL] {
+            let error = allocate_at(&mut state, &mut registry, 1, &mut host, &mut saves, now).unwrap_err();
+            assert_eq!((error.kind(), error.to_string()), (tombstoned.kind(), tombstoned.to_string()), "the Tombstone refusal");
+            assert!(!pending_limit(&error) && !crate::accounts::probe_unresolved(&error), "{error}");
+        }
+        assert_eq!(registry.employees, rows, "nothing reserved");
+        assert_eq!((host.creates, host.waits, saves), (creates, waits, recorded), "no useradd, no probe, no save");
+        assert_eq!(registry.employees.iter().filter(|account| account.employee == EmployeeId([1; 16])).count(), 1);
+        assert_eq!(registry.employees[0], EmployeeAccount { employee: EmployeeId([1; 16]), uid: 70000, gid: 70000, state: AccountState::Tombstone });
+        assert!(registry.lookup(EmployeeId([1; 16])).is_err());
+        registry.validate(&Host.policy().unwrap()).unwrap();
+        registry.verify(&mut Probing::default()).unwrap();
+        // Another employee is still admitted, with the next uid.
+        host.probes = vec![Ok(())];
+        assert_eq!(allocate_at(&mut state, &mut registry, 3, &mut host, &mut saves, 3 * TTL).unwrap().uid, 70002);
+    }
+
+    /// The deadline counts from the reservation (a pending resume does not
+    /// extend it), touches only reservations that are due, never a Ready one,
+    /// and an allocation before the deadline behaves as without it.
+    #[test]
+    fn allocation_expiry_spares_resumed_and_younger_reservations() {
+        const MINUTE: u64 = 60_000;
+        let (mut state, mut registry, mut saves) = (Allocations::default(), Registry::default(), 0);
+        let mut host = Probing { probes: vec![pending(), pending(), pending()], ..Probing::default() };
+        for (employee, now) in [(1, 0), (3, MINUTE), (2, 5 * MINUTE)] {
+            assert!(crate::accounts::probe_unresolved(&allocate_at(&mut state, &mut registry, employee, &mut host, &mut saves, now).unwrap_err()));
+        }
+        // Before the deadline: 1 resumes Denied ⇒ Ready; 3 resumes still pending.
+        host.probes = vec![Ok(()), pending()];
+        assert_eq!(allocate_at(&mut state, &mut registry, 1, &mut host, &mut saves, 9 * MINUTE).unwrap().state, AccountState::Ready);
+        assert!(crate::accounts::probe_unresolved(&allocate_at(&mut state, &mut registry, 3, &mut host, &mut saves, 9 * MINUTE).unwrap_err()));
+        assert!(host.probes.is_empty());
+        let recovered = host.recovered.len();
+        // 11 min + 1 ms: only 3 (reserved at 1 min) is due.
+        let expired = expire_at(&mut state, &mut registry, &mut host, &mut saves, 11 * MINUTE + 1).unwrap();
+        assert_eq!(expired.iter().map(|retired| retired.account.uid).collect::<Vec<_>>(), [70001]);
+        assert_eq!(states(&registry), [AccountState::Ready, AccountState::Tombstone, AccountState::Reserved]);
+        assert_eq!(host.recovered[recovered..], [70001]);
+        assert_eq!(state.resumable(), &BTreeSet::from([EmployeeId([2; 16])]));
+        // 2 resumes just before its deadline exactly as today (still pending), which stays 15 min.
+        host.probes = vec![pending()];
+        assert!(crate::accounts::probe_unresolved(&allocate_at(&mut state, &mut registry, 2, &mut host, &mut saves, 15 * MINUTE - 1).unwrap_err()));
+        assert!(expire_at(&mut state, &mut registry, &mut host, &mut saves, 15 * MINUTE).unwrap().is_empty());
+        let expired = expire_at(&mut state, &mut registry, &mut host, &mut saves, 15 * MINUTE + 1).unwrap();
+        assert_eq!(expired.iter().map(|retired| retired.account.uid).collect::<Vec<_>>(), [70002]);
+        assert_eq!(states(&registry), [AccountState::Ready, AccountState::Tombstone, AccountState::Tombstone]);
+        assert_eq!(registry.lookup(EmployeeId([1; 16])).unwrap().uid, 70000, "the Ready account is untouched");
+        assert_eq!(host.waits, 6, "the deadline never asks the probe");
+        assert!(state.resumable().is_empty());
+        registry.verify(&mut Probing::default()).unwrap();
+    }
+
+    /// The saved registry never holds a `Reserved` row the in-memory set
+    /// forgot: the Tombstones are saved before the set forgets them, and a
+    /// failed save keeps (and restores) every reservation.
+    #[test]
+    fn allocation_expiry_never_leaves_a_forgotten_reserved_row_on_disk() {
+        fn forgotten(disk: &Registry, state: &Allocations) -> bool {
+            disk.employees.iter().any(|account| account.state == AccountState::Reserved && !state.resumable().contains(&account.employee))
+        }
+        let (mut state, mut registry) = (Allocations::default(), Registry::default());
+        let mut host = Probing { probes: vec![pending(), pending()], ..Probing::default() };
+        let mut disk: Option<Registry> = None;
+        for (employee, now) in [(1u8, 0u64), (2, 1)] {
+            let mut save = |saved: &Registry| -> io::Result<()> { disk = Some(saved.clone()); Ok(()) };
+            assert!(state.allocate(&mut registry, EmployeeId([employee; 16]), &mut host, now, &mut save).is_err());
+            assert!(!forgotten(disk.as_ref().unwrap(), &state));
+        }
+        let due = PENDING_RESERVATION_TTL_MS + 2;
+        assert!(state.expire(&mut registry, &mut host, due,
+            &mut |_: &Registry| -> io::Result<()> { Err(io::Error::other("injected save failure")) }).is_err());
+        assert_eq!(state.resumable().len(), 2, "nothing forgotten");
+        assert!(registry.employees.iter().all(|account| account.state == AccountState::Reserved), "rows restored");
+        assert!(host.recovered.is_empty(), "nothing quarantined");
+        assert!(!forgotten(disk.as_ref().unwrap(), &state));
+        let expired = state.expire(&mut registry, &mut host, due, &mut |saved: &Registry| -> io::Result<()> {
+            assert!(saved.employees.iter().all(|account| account.state == AccountState::Tombstone), "saved before forgotten");
+            disk = Some(saved.clone()); Ok(())
+        }).unwrap();
+        assert_eq!(expired.len(), 2);
+        assert!(!forgotten(disk.as_ref().unwrap(), &state));
+        assert_eq!(disk.as_ref().unwrap().employees, registry.employees);
+        assert_eq!(host.recovered, [70000, 70001]);
+    }
+
     /// F6 with the real evidence component: allocation queues the forced
     /// probe and returns "pending" at once (no worker runs at all here); once
     /// the worker has proven the account denied, the same employee's next
@@ -695,21 +963,21 @@ mod tests {
         let (mut state, mut registry) = (Allocations::default(), Registry::default());
         let mut save = |_: &Registry| -> io::Result<()> { Ok(()) };
         let begun = std::time::Instant::now();
-        let error = state.allocate(&mut registry, EmployeeId([1; 16]), &mut Evidence { evidence: &evidence }, &mut save).unwrap_err();
+        let error = state.allocate(&mut registry, EmployeeId([1; 16]), &mut Evidence { evidence: &evidence }, 0, &mut save).unwrap_err();
         assert!(begun.elapsed() < std::time::Duration::from_secs(1), "allocation never waits for the probe");
         assert_eq!(crate::accounts::ssh_refusal(&error), Some(&SshRefusal::Pending), "{error}");
         assert_eq!(registry.employees[0].state, AccountState::Reserved);
         // Still pending until the worker runs.
         assert!(crate::accounts::probe_unresolved(&state.allocate(&mut registry, EmployeeId([1; 16]),
-            &mut Evidence { evidence: &evidence }, &mut save).unwrap_err()));
+            &mut Evidence { evidence: &evidence }, 0, &mut save).unwrap_err()));
         let shared = slot.lock().unwrap().clone().expect("worker started");
         assert!(ssh_evidence::step(&mut worker, &shared));
-        let account = state.allocate(&mut registry, EmployeeId([1; 16]), &mut Evidence { evidence: &evidence }, &mut save).unwrap();
+        let account = state.allocate(&mut registry, EmployeeId([1; 16]), &mut Evidence { evidence: &evidence }, 0, &mut save).unwrap();
         assert_eq!((account.uid, account.state), (70000, AccountState::Ready));
         // A second employee whose probe proves it reachable is tombstoned on resume.
-        assert!(state.allocate(&mut registry, EmployeeId([2; 16]), &mut Evidence { evidence: &evidence }, &mut save).is_err());
+        assert!(state.allocate(&mut registry, EmployeeId([2; 16]), &mut Evidence { evidence: &evidence }, 0, &mut save).is_err());
         assert!(ssh_evidence::step(&mut worker, &shared));
-        let error = state.allocate(&mut registry, EmployeeId([2; 16]), &mut Evidence { evidence: &evidence }, &mut save).unwrap_err();
+        let error = state.allocate(&mut registry, EmployeeId([2; 16]), &mut Evidence { evidence: &evidence }, 0, &mut save).unwrap_err();
         assert!(matches!(crate::accounts::ssh_refusal(&error), Some(SshRefusal::Reachable(_))), "{error}");
         assert_eq!(registry.employees[1].state, AccountState::Tombstone);
         assert!(state.resumable().is_empty());
