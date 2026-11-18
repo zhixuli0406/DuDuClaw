@@ -11619,7 +11619,7 @@
   "protectedMode.providers.title": "模型連線資料",
   "protectedMode.providers.description": "為隔離的 AI 員工設定模型服務的端點與 API 金鑰。",
   "protectedMode.providers.visibility.dashboard_changes_only": "這份清單只顯示從儀表板變更的資料；使用主機指令 duduclaw service provider set 寫入的資料不會顯示。",
-  "protectedMode.providers.hidden": "另有 {count} 位個人專屬員工未顯示。",
+  "protectedMode.providers.hidden": "其他人的個人 AI 員工不會列在這裡。通過兩步驟驗證後可顯示。",
   "protectedMode.providers.reveal": "驗證身分並顯示",
   "protectedMode.providers.refresh": "重新整理",
   "protectedMode.providers.empty": "目前沒有已配置的 AI 員工",
@@ -11667,6 +11667,7 @@
   "protectedMode.providers.verifyClear": "驗證身分並清除",
   "protectedMode.providers.saved": "模型連線資料已更新",
   "protectedMode.providers.notRecorded": "已寫入，但狀態紀錄未更新",
+  "protectedMode.providers.auditIncomplete": "這次操作的完成紀錄沒有寫入稽核紀錄，請通知管理員檢查稽核紀錄的儲存空間。",
   "protectedMode.providers.unknownCode": "未知錯誤",
   "protectedMode.providers.error.busy": "這位 AI 員工正在執行，請在它閒置時再試一次",
   "protectedMode.providers.error.unconfirmed": "結果未確認：重新送出同樣的內容是安全的",
@@ -11677,5 +11678,6 @@
   "protectedMode.providers.error.invalid_provider": "內容不符合規則",
   "protectedMode.providers.error.step_up_required": "請重新驗證身分後再試一次；若剛才已送出金鑰，請重新輸入",
   "protectedMode.providers.error.not_available": "這個安裝不是原生 Linux 隔離安裝，無法使用此功能",
+  "protectedMode.providers.error.audit_unavailable": "無法寫入稽核紀錄，未送出任何變更。請檢查稽核紀錄的儲存空間後再試一次。",
   "protectedMode.providers.error.generic": "操作失敗（{code}），請稍後再試"
 }

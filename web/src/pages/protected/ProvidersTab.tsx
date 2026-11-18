@@ -97,7 +97,7 @@ export function ProvidersTab() {
   const [data, setData] = useState<ProtectedProviderStatus | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<{ message: string; warning: boolean } | null>(null);
+  const [notice, setNotice] = useState<{ message: string; warning: boolean; auditWarning?: string } | null>(null);
   const [editing, setEditing] = useState<ProtectedProviderEmployee | null>(null);
   const [clearing, setClearing] = useState<ProtectedProviderEmployee | null>(null);
   const [verification, setVerification] = useState<{ employee?: ProtectedProviderEmployee; reveal?: boolean } | null>(null);
@@ -105,7 +105,9 @@ export function ProvidersTab() {
   const generation = useRef(0);
   const describe = useCallback((failure: unknown) => {
     const code = providerErrorCode(failure);
-    return t(providerErrorKey(code), { code: code === 'unknown' ? t('providers.unknownCode') : code });
+    const message = t(providerErrorKey(code), { code: code === 'unknown' ? t('providers.unknownCode') : code });
+    return failure && typeof failure === 'object' && 'audit' in failure && failure.audit === 'incomplete'
+      ? `${message}\n${t('providers.auditIncomplete')}` : message;
   }, [t]);
   const invalidate = useCallback((failure: unknown) => {
     if (['step_up_required', 'session_expired'].includes(providerErrorCode(failure))) {
@@ -140,7 +142,8 @@ export function ProvidersTab() {
   const completed = async (result: ProtectedProviderResult) => {
     const warning = result.result === 'not_recorded';
     const message = t(warning ? 'providers.notRecorded' : 'providers.saved');
-    setNotice({ message, warning });
+    const auditWarning = result.audit === 'incomplete' ? t('providers.auditIncomplete') : undefined;
+    setNotice({ message, warning, auditWarning });
     if (warning) toast.info(message); else toast.success(message);
     await load();
   };
@@ -152,17 +155,20 @@ export function ProvidersTab() {
   return <div className="space-y-6">
     <Refusal message={error} />
     <div aria-live="polite">
-      {notice && <p role="status" className={`rounded-lg border px-3 py-2 text-sm ${notice.warning
-        ? 'border-warning/30 bg-warning/10' : 'border-success/30 bg-success/10'}`}>{notice.message}</p>}
+      {notice && <div role="status" className={`rounded-lg border px-3 py-2 text-sm ${notice.warning || notice.auditWarning
+        ? 'border-warning/30 bg-warning/10' : 'border-success/30 bg-success/10'}`}>
+        <p>{notice.message}</p>{notice.auditWarning && <p>{notice.auditWarning}</p>}
+      </div>}
     </div>
     <Card>
       <CardHeader><CardTitle><h2>{t('providers.title')}</h2></CardTitle><CardDescription>{t('providers.description')}</CardDescription></CardHeader>
       <CardContent className="space-y-4">
         <p className="text-sm text-muted-foreground">{t('providers.visibility.dashboard_changes_only')}</p>
         <div className="flex flex-wrap items-center justify-between gap-2">
-          {data && <p className="text-sm text-muted-foreground">{t('providers.hidden', { count: data.hidden_personal })}</p>}
+          {data?.hidden_personal === null && !data.personal_revealed &&
+            <p className="text-sm text-muted-foreground">{t('providers.hidden')}</p>}
           <div className="flex gap-2">
-            {data && data.hidden_personal > 0 && !data.personal_revealed && <Button size="sm" variant="outline"
+            {data?.hidden_personal === null && !data.personal_revealed && <Button size="sm" variant="outline"
               disabled={loading} onClick={() => setVerification({ reveal: true })}>{t('providers.reveal')}</Button>}
             <Button size="sm" variant="outline" disabled={loading} onClick={() => void load()}>{t('providers.refresh')}</Button>
           </div>

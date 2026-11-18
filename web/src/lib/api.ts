@@ -6418,7 +6418,7 @@ export interface ProtectedProviderEmployee {
 export interface ProtectedProviderStatus extends ProtectedStepUpState {
   employees: ProtectedProviderEmployee[];
   next: string | null;
-  hidden_personal: number;
+  hidden_personal: number | null;
   personal_revealed: boolean;
   visibility: 'dashboard_changes_only';
 }
@@ -6426,6 +6426,7 @@ export interface ProtectedProviderResult {
   provisioned: boolean;
   updated_unix: number;
   result: 'recorded' | 'not_recorded';
+  audit?: 'incomplete';
 }
 /** Reference-only details: there is no field for a token, password or URL. */
 export interface ProtectedConnectorDetails {

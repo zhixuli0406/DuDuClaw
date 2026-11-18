@@ -11619,7 +11619,7 @@
   "protectedMode.providers.title": "Model connections",
   "protectedMode.providers.description": "Set model service endpoints and API keys for isolated AI employees.",
   "protectedMode.providers.visibility.dashboard_changes_only": "This list only reflects changes made from the dashboard. Changes made with the host command duduclaw service provider set are not shown.",
-  "protectedMode.providers.hidden": "{count} personal employees are hidden.",
+  "protectedMode.providers.hidden": "Other people’s personal AI employees are not listed here. Verify your identity to reveal them.",
   "protectedMode.providers.reveal": "Verify identity to reveal",
   "protectedMode.providers.refresh": "Refresh",
   "protectedMode.providers.empty": "No allocated AI employees",
@@ -11667,6 +11667,7 @@
   "protectedMode.providers.verifyClear": "Verify identity and clear",
   "protectedMode.providers.saved": "Model connections updated",
   "protectedMode.providers.notRecorded": "Written, but the status record was not updated",
+  "protectedMode.providers.auditIncomplete": "The completion record for this operation was not written to the audit log. Notify an administrator to check audit storage.",
   "protectedMode.providers.unknownCode": "unknown",
   "protectedMode.providers.error.busy": "This AI employee is running. Try again when it is idle.",
   "protectedMode.providers.error.unconfirmed": "Result unconfirmed: it is safe to submit the same content again.",
@@ -11677,5 +11678,6 @@
   "protectedMode.providers.error.invalid_provider": "The content does not meet the rules.",
   "protectedMode.providers.error.step_up_required": "Verify your identity again and retry. Re-enter any keys you just submitted.",
   "protectedMode.providers.error.not_available": "This feature requires a native Linux isolation installation.",
+  "protectedMode.providers.error.audit_unavailable": "Could not write the audit log, so no changes were sent. Check audit storage and try again.",
   "protectedMode.providers.error.generic": "Operation failed ({code}). Try again later."
 }

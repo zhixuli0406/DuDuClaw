@@ -11619,7 +11619,7 @@
   "protectedMode.providers.title": "モデル接続情報",
   "protectedMode.providers.description": "隔離された AI 社員のモデルサービスのエンドポイントと API キーを設定します。",
   "protectedMode.providers.visibility.dashboard_changes_only": "この一覧にはダッシュボードで変更した情報のみ表示されます。ホストのコマンド duduclaw service provider set で書き込んだ情報は表示されません。",
-  "protectedMode.providers.hidden": "個人専属の社員 {count} 人は非表示です。",
+  "protectedMode.providers.hidden": "他の人の個人 AI 社員はここには表示されません。二段階認証を行うと表示できます。",
   "protectedMode.providers.reveal": "本人確認して表示",
   "protectedMode.providers.refresh": "更新",
   "protectedMode.providers.empty": "割り当て済みの AI 社員はいません",
@@ -11667,6 +11667,7 @@
   "protectedMode.providers.verifyClear": "本人確認して削除",
   "protectedMode.providers.saved": "モデル接続情報を更新しました",
   "protectedMode.providers.notRecorded": "書き込み済みですが、状態記録は更新されていません",
+  "protectedMode.providers.auditIncomplete": "今回の操作の完了記録は監査ログに書き込まれていません。管理者に監査ログの保存領域を確認するようお知らせください。",
   "protectedMode.providers.unknownCode": "不明",
   "protectedMode.providers.error.busy": "この AI 社員は実行中です。待機中にもう一度お試しください。",
   "protectedMode.providers.error.unconfirmed": "結果を確認できませんでした。同じ内容を再送しても安全です。",
@@ -11677,5 +11678,6 @@
   "protectedMode.providers.error.invalid_provider": "入力内容が規則に合っていません。",
   "protectedMode.providers.error.step_up_required": "もう一度本人確認して再試行してください。送信済みのキーは再入力してください。",
   "protectedMode.providers.error.not_available": "この機能にはネイティブ Linux 隔離インストールが必要です。",
+  "protectedMode.providers.error.audit_unavailable": "監査ログに書き込めなかったため、変更は送信されていません。監査ログの保存領域を確認してから再試行してください。",
   "protectedMode.providers.error.generic": "操作に失敗しました（{code}）。後でもう一度お試しください。"
 }

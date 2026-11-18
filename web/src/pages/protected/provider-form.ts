@@ -11,7 +11,7 @@ export function providerErrorCode(error: unknown): string {
 export function providerErrorKey(code: string): string {
   switch (code) {
     case 'busy': case 'unconfirmed': case 'not_allocated': case 'home_entry_unsafe':
-    case 'storage_unavailable': case 'invalid_provider': case 'not_available':
+    case 'storage_unavailable': case 'invalid_provider': case 'not_available': case 'audit_unavailable':
       return `providers.error.${code}`;
     case 'unreachable': case 'service_unavailable': return 'providers.error.unreachable';
     case 'step_up_required': case 'session_expired': return 'providers.error.step_up_required';

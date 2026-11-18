@@ -15,7 +15,7 @@ const EMPLOYEE = {
   source: 'dashboard' as const, updated_unix: 1795000000,
 };
 const list = (overrides: Partial<ProtectedProviderStatus> = {}): ProtectedProviderStatus => ({
-  ...VERIFIED, employees: [EMPLOYEE], next: null, hidden_personal: 1, personal_revealed: false,
+  ...VERIFIED, employees: [EMPLOYEE], next: null, hidden_personal: null, personal_revealed: false,
   visibility: 'dashboard_changes_only', ...overrides,
 });
 const RESULT = { provisioned: true, updated_unix: 1795000001, result: 'recorded' };
@@ -54,11 +54,11 @@ const ERRORS = [
   ['admin_required', 'generic'], ['not_available', 'not_available'], ['users_unavailable', 'generic'],
   ['session_expired', 'step_up_required'], ['step_up_required', 'step_up_required'],
   ['request_invalid', 'generic'], ['clock_unavailable', 'generic'], ['employees_unavailable', 'generic'],
-  ['records_unavailable', 'generic'], ['audit_unavailable', 'generic'], ['service_unavailable', 'unreachable'],
+  ['records_unavailable', 'generic'], ['audit_unavailable', 'audit_unavailable'], ['service_unavailable', 'unreachable'],
 ] as const;
 
 describe('protected mode — model connections tab', () => {
-  it('renders recorded employee metadata, visibility, hidden count and paged rows', async () => {
+  it('renders recorded employee metadata, neutral hidden-personal visibility and paged rows', async () => {
     routeCalls({ 'isolation.provider_status': (params) => params.after
       ? list({ employees: [{ ...EMPLOYEE, employee_id: 'b'.repeat(32), label: 'shared-helper', kind: 'shared', provisioned: false, providers: [], updated_unix: undefined }], next: null })
       : list({ next: 'alice-helper' }) });
@@ -68,7 +68,8 @@ describe('protected mode — model connections tab', () => {
     expect(screen.getByText('Yes')).toBeInTheDocument();
     expect(screen.getByText(/Existing provider · Responses · https:\/\/models.example.com/)).toBeInTheDocument();
     expect(screen.getByText(/duduclaw service provider set/)).toBeInTheDocument();
-    expect(screen.getByText('1 personal employees are hidden.')).toBeInTheDocument();
+    expect(screen.getByText('Other people’s personal AI employees are not listed here. Verify your identity to reveal them.')).toBeInTheDocument();
+    expect(document.body).not.toHaveTextContent(/\d+ personal employees are hidden/);
     expect(document.body).not.toHaveTextContent(EMPLOYEE.employee_id);
     expect(screen.getByText(new Date(EMPLOYEE.updated_unix * 1000).toLocaleString('en', { dateStyle: 'medium', timeStyle: 'short' }))).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Load more' }));
@@ -106,7 +107,7 @@ describe('protected mode — model connections tab', () => {
   it('reveals personal employees only after an explicit step-up action', async () => {
     let verified = false;
     routeCalls({
-      'isolation.provider_status': (params) => list({ ...(verified ? VERIFIED : NOT_VERIFIED), personal_revealed: !!params.step_up_csrf, hidden_personal: params.step_up_csrf ? 0 : 1 }),
+      'isolation.provider_status': (params) => list({ ...(verified ? VERIFIED : NOT_VERIFIED), personal_revealed: !!params.step_up_csrf, hidden_personal: params.step_up_csrf ? 0 : null }),
       'isolation.employee_list': () => employeeList(verified ? VERIFIED : NOT_VERIFIED),
       'isolation.connector_step_up': () => { verified = true; return { verified: true }; },
     });
@@ -115,7 +116,8 @@ describe('protected mode — model connections tab', () => {
     const dialog = await screen.findByRole('dialog');
     verify(dialog);
     fireEvent.click(within(dialog).getByRole('button', { name: 'Verify identity and continue' }));
-    expect(await screen.findByText('0 personal employees are hidden.')).toBeInTheDocument();
+    expect(await screen.findByText('alice-helper')).toBeInTheDocument();
+    expect(screen.queryByText(/personal AI employees are not listed here/)).not.toBeInTheDocument();
     expect(calledWith('isolation.provider_status')).toEqual([{}, { step_up_csrf: CSRF }]);
   });
 
@@ -241,6 +243,31 @@ describe('protected mode — model connections tab', () => {
     expect(await screen.findByText('Written, but the status record was not updated')).toBeInTheDocument();
     expect(calledWith('isolation.provider_status')).toHaveLength(2);
     expect(document.body).not.toHaveTextContent(KEY);
+  });
+
+  it('shows the audit warning after the normal success message when the completion audit is incomplete', async () => {
+    routeCalls({ 'isolation.provider_status': () => list(), 'isolation.provider_set': () => ({ ...RESULT, audit: 'incomplete' }) });
+    renderTab(<ProvidersTab />);
+    const dialog = await openSet();
+    fill(dialog);
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Save' }));
+    const notice = await screen.findByRole('status');
+    expect(notice).toHaveTextContent('Model connections updated');
+    expect(notice).toHaveTextContent('The completion record for this operation was not written to the audit log. Notify an administrator to check audit storage.');
+  });
+
+  it('shows the audit warning alongside an error when the completion audit is incomplete', async () => {
+    routeCalls({
+      'isolation.provider_status': () => list(),
+      'isolation.provider_set': () => Promise.reject({ code: 'busy', audit: 'incomplete' }),
+    });
+    renderTab(<ProvidersTab />);
+    const dialog = await openSet();
+    fill(dialog);
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Save' }));
+    const alert = await within(dialog).findByRole('alert');
+    expect(alert).toHaveTextContent('This AI employee is running. Try again when it is idle.');
+    expect(alert).toHaveTextContent('The completion record for this operation was not written to the audit log. Notify an administrator to check audit storage.');
   });
 
   it('requires confirmation and step-up before clearing, and cancel changes nothing', async () => {
