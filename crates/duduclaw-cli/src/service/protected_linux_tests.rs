@@ -241,7 +241,8 @@ fn service_protected_operator_gate_precedes_platform_or_filesystem_work() {
         let _session = crate::ai_session_guard::test_session(&[(marker, "")]);
         assert!(install(InstallOptions { enable_now: false, migrate_from: None, force_migrate: false, i_verified_this_binary: false, allow_missing_runtime: false }).is_err());
         assert!(uninstall().is_err());
-        assert!(readiness().is_err());
+        assert!(readiness(false).is_err());
+        assert!(readiness(true).is_err());
     }
 }
 
