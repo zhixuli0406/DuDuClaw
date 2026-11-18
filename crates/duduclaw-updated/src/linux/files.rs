@@ -288,9 +288,10 @@ mod tests {
             size_bytes: content.len() as u64, mode: 0o755, install_target: InstallTarget::Gateway };
         let mut file = tempfile::tempfile().unwrap();
         assert!(copy_artifact(&mut &content[..], &mut file, &artifact).is_ok());
-        for invalid in [&content[..3], b"verified bytes!", b"corrupted bytes"] {
+        for invalid in [&content[..3], &b"verified bytes!"[..], &b"corrupted bytes"[..]] {
             let mut file = tempfile::tempfile().unwrap();
-            assert!(copy_artifact(&mut invalid.as_ref(), &mut file, &artifact).is_err());
+            let mut reader: &[u8] = invalid;
+            assert!(copy_artifact(&mut reader, &mut file, &artifact).is_err());
         }
     }
     #[test]
