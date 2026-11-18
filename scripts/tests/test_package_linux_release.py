@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -1120,6 +1121,125 @@ class LinuxReleaseTests(unittest.TestCase):
             payload = (inbox / "artifacts" / artifact["id"]).read_bytes()
             self.assertEqual(artifact["sha256"],list(hashlib.sha256(payload).digest()))
             self.assertEqual(artifact["size_bytes"],len(payload))
+
+    # ---------------------------------------------------------------- R7d: signed isolation policy (TEST path)
+
+    TEST_FIXTURES = ROOT / "scripts/live-test/linux-protected/fixtures"
+    # The smallest policy the offline validator (sign-isolation-manifest.py) accepts
+    # as v4; spawnd would refuse it (no runtime), which is not what this checks.
+    TINY_POLICY_V4 = (b'{"domain":"duduclaw-isolation-policy-v4","version":4,"runtimes":[],"native":[],'
+                      b'"dns_probe_name":"example.com"}')
+
+    def test_test_template_is_the_shipped_template_plus_policy_and_api_worker(self):
+        shipped = json.loads((ROOT / "release/isolation/manifest-template.json").read_bytes())
+        test = json.loads((self.TEST_FIXTURES / "manifest-template-test.json").read_bytes())
+        self.assertEqual({key: value for key, value in test.items() if key != "artifacts"},
+                         {key: value for key, value in shipped.items() if key != "artifacts"})
+        self.assertEqual(test["artifacts"][:-2], shipped["artifacts"])
+        self.assertEqual(test["artifacts"][-2:], [
+            {"id": "isolation-policy-v1", "mode": 0o444,
+             "install_target": {"kind": "runtime_entry", "registry_id": "isolation-policy-v1"}},
+            {"id": "api-worker-v1", "mode": 0o755,
+             "install_target": {"kind": "runtime_entry", "registry_id": "api-worker-v1"}}])
+        PACKAGE.validate_targets(test["artifacts"])
+        # The production template still carries no runtime entry (an owner decision).
+        self.assertFalse(any(a["install_target"]["kind"] == "runtime_entry" for a in shipped["artifacts"]))
+        self.assertEqual(PACKAGE.runtime_source(test["artifacts"][-1], self.binaries, None),
+                         self.binaries / "duduclaw-api-worker")
+        # The TEST policy source names files that exist next to it, and one egress runtime.
+        source = json.loads((self.TEST_FIXTURES / "policy-source-test.json").read_bytes())
+        self.assertEqual(source["schema"], "duduclaw-isolation-policy-source-v1")
+        self.assertEqual(source["dns_probe_name"], "example.com")
+        self.assertEqual(len(source["runtimes"]), 1)
+        runtime = source["runtimes"][0]
+        self.assertEqual((runtime["runtime"], runtime["executable"], runtime["network"]["kind"], runtime["mcp"]),
+                         ({"kind": "open_ai_compat"}, "runtime-api-worker-v1", "egress", True))
+        self.assertNotIn("mcp_acceptance", runtime)
+        for files in (source["forwarder_seccomp"], runtime["native"]["seccomp"]):
+            for arch in ("x86_64", "aarch64"):
+                self.assertTrue((self.TEST_FIXTURES / files[arch]).is_file(), files[arch])
+                self.assertIn("TEST-ONLY", (self.TEST_FIXTURES / files[arch]).read_text())
+
+    def test_stage_policy_inputs_copies_generation_names_from_signed_sources(self):
+        template = self.TEST_FIXTURES / "manifest-template-test.json"
+        destination = self.root / "policy-inputs"
+        names = PACKAGE.stage_policy_inputs(self.binaries, template, destination)
+        self.assertEqual(names, ["duduclaw-egress-forwarder", "duduclaw-mcp-bridge", "runtime-api-worker-v1"])
+        for name, source in (("duduclaw-egress-forwarder", "duduclaw-egress"), ("duduclaw-mcp-bridge", "duduclaw-mcp-bridge"),
+                             ("runtime-api-worker-v1", "duduclaw-api-worker")):
+            self.assertEqual((destination / name).read_bytes(), (self.binaries / source).read_bytes())
+            self.assertEqual((destination / name).stat().st_mode & 0o7777, 0o755)
+        # The policy entry is the generator's output, never an input.
+        self.assertFalse((destination / "runtime-isolation-policy-v1").exists())
+        self.assertEqual(destination.stat().st_mode & 0o777, 0o700)
+        with self.assertRaises(FileExistsError):
+            PACKAGE.stage_policy_inputs(self.binaries, template, destination)
+        (self.binaries / "duduclaw-api-worker").chmod(0o644)
+        with self.assertRaisesRegex(ValueError, "executable"):
+            PACKAGE.stage_policy_inputs(self.binaries, template, self.root / "other-inputs")
+
+    @unittest.skipUnless(shutil.which("ssh-keygen"), "requires OpenSSH")
+    def test_test_template_and_policy_flow_through_the_packager_into_the_signed_manifest(self):
+        key = self.root / "policy-test-key"
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)], check=True)
+        template = self.root / "rendered-test-template.json"
+        template.write_bytes(PACKAGE.render_release_template(
+            (self.TEST_FIXTURES / "manifest-template-test.json").read_bytes(), "x86_64",
+            PACKAGE.workspace_version(), int(time.time()), 30))
+        runtime_dir = self.root / "TEST-runtime"
+        runtime_dir.mkdir()
+        (runtime_dir / "runtime-isolation-policy-v1").write_bytes(self.TINY_POLICY_V4)
+        with patch.dict(os.environ, {"CI": "", "GITHUB_ACTIONS": ""}):
+            outputs = PACKAGE.sign_release(self.binaries, TARGET, self.output, template, key, "ssh-keygen", runtime_dir)
+        names = {path.name for path in outputs}
+        self.assertIn("isolated-linux-x86_64-isolation-policy-v1", names)
+        self.assertIn("isolated-linux-x86_64-api-worker-v1", names)
+        manifest = json.loads((self.output / "isolated-linux-x86_64-manifest.json").read_bytes())
+        by_id = {artifact["id"]: artifact for artifact in manifest["artifacts"]}
+        policy = by_id["isolation-policy-v1"]
+        self.assertEqual(policy["mode"], 0o444)
+        self.assertEqual(policy["install_target"], {"kind": "runtime_entry", "registry_id": "isolation-policy-v1"})
+        self.assertEqual(policy["sha256"], list(hashlib.sha256(self.TINY_POLICY_V4).digest()))
+        self.assertEqual(policy["size_bytes"], len(self.TINY_POLICY_V4))
+        self.assertEqual((self.output / "isolated-linux-x86_64-isolation-policy-v1").read_bytes(), self.TINY_POLICY_V4)
+        worker = by_id["api-worker-v1"]
+        self.assertEqual(worker["mode"], 0o755)
+        self.assertEqual(worker["sha256"], list(hashlib.sha256((self.binaries / "duduclaw-api-worker").read_bytes()).digest()))
+        # A policy the offline validator refuses (here: v4 without dns_probe_name) is never signed.
+        output = self.root / "refused-out"
+        (runtime_dir / "runtime-isolation-policy-v1").write_bytes(
+            b'{"domain":"duduclaw-isolation-policy-v4","version":4,"runtimes":[],"native":[]}')
+        with patch.dict(os.environ, {"CI": "", "GITHUB_ACTIONS": ""}), self.assertRaisesRegex(ValueError, "dns_probe_name"):
+            PACKAGE.sign_release(self.binaries, TARGET, output, template, key, "ssh-keygen", runtime_dir)
+        self.assertFalse((output / "isolated-linux-x86_64-manifest.json").exists())
+
+    def test_policy_generator_is_never_built_listed_or_packaged(self):
+        self.assertNotIn(PACKAGE.POLICY_TOOL_BINARY, PACKAGE.BIN_PACKAGES)
+        self.assertNotIn(PACKAGE.POLICY_TOOL_BINARY, PACKAGE.archive_binaries(True))
+        for bad in ({**PACKAGE.BIN_PACKAGES, PACKAGE.POLICY_TOOL_BINARY: "duduclaw-spawnd"},
+                    {**PACKAGE.BIN_PACKAGES, "x": "duduclaw-spawnd/policy-tool"}):
+            with self.assertRaises(ValueError):
+                PACKAGE.check_release_binary_set(bad)
+        for include in (True, False):
+            command = PACKAGE.build_command(TARGET, "cross", include)
+            self.assertEqual(PACKAGE.refuse_test_signer_build(command), command)
+            for extra in (["--features", "duduclaw-spawnd/policy-tool"], ["--features=policy-tool"],
+                          ["--bin", PACKAGE.POLICY_TOOL_BINARY]):
+                with self.subTest(extra=extra), self.assertRaisesRegex(ValueError, "policy generator"):
+                    PACKAGE.refuse_test_signer_build(command + extra)
+        # The Cargo manifest builds the generator only behind its non-default feature.
+        manifest = (ROOT / "crates/duduclaw-spawnd/Cargo.toml").read_text()
+        block = re.search(r'\[\[bin\]\]\nname = "duduclaw-isolation-policy"\n(?:[^\[\n][^\n]*\n)*', manifest)
+        self.assertIsNotNone(block)
+        self.assertIn('required-features = ["policy-tool"]', block[0])
+        self.assertIsNone(re.search(r'(?m)^default\s*=.*policy-tool', manifest))
+        # The TEST kit builds it the way it builds the TEST signer and signs with the TEST template.
+        kit = (ROOT / "scripts/isolation-test-keys.sh").read_text()
+        self.assertIn("--features policy-tool --bin duduclaw-isolation-policy", kit)
+        self.assertIn('CARGO_TARGET_DIR="$ROOT/target/isolation-policy-tool"', kit)
+        self.assertIn("manifest-template-test.json", kit)
+        self.assertIn('--runtime-artifacts-dir "$runtime_dir"', kit)
+        self.assertNotIn("release/isolation/manifest-template.json", kit)
 
     # ---------------------------------------------------------------- R2: test-key leak prevention
 

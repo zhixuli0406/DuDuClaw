@@ -5,6 +5,7 @@
 #   scripts/isolation-test-keys.sh keys    [--out <new dir>] [--signer <duduclaw-isolation-test-signer>]
 #   scripts/isolation-test-keys.sh bundle  --keys <keys dir> --archive <duduclaw-linux-<arch>.tar.gz>
 #                                          --target <triple> [--gateway <TEST duduclaw>]
+#                                          [--policy-source <file>] [--policy-tool <path>]
 #                                          [--out <new dir>] [--signer <path>]
 #   scripts/isolation-test-keys.sh license --keys <keys dir> --fingerprint <value> --out <new file>
 #                                          [--tier <tier>] [--days N] [--max-agents N] [--signer <path>]
@@ -29,6 +30,17 @@
 # for (or published as) the release archive, and every release path refuses its
 # duduclaw (scripts/refuse-test-license-build.py). Without --gateway the bundle
 # carries the production gateway, which no TEST licence passes.
+# Every generation needs a signed isolation policy (runtime-isolation-policy-v1):
+# `bundle` extracts the archive's runtime/forwarder/bridge binaries into a private
+# temporary directory, builds the policy generator (duduclaw-isolation-policy,
+# feature policy-tool; Linux only, or pass a prebuilt --policy-tool), generates the
+# policy from --policy-source (default: the TEST fixture
+# scripts/live-test/linux-protected/fixtures/policy-source-test.json, one
+# OpenAI-compatible egress runtime WITHOUT MCP acceptance: good for install and
+# readiness acceptance, every MCP run of it is refused) into <out>/TEST-runtime,
+# signs with the TEST template fixtures/manifest-template-test.json (the shipped
+# template plus the policy and api-worker-v1 entries) and --runtime-artifacts-dir,
+# then re-verifies the policy against the signed manifest.
 #
 # `license` signs a TEST license.json (0600) for the installer's licence rule
 # (self-host binding, not a Personal edition): --tier self_host_pro (default),
@@ -47,12 +59,17 @@ set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 SIGNER=""
+POLICY_TOOL=""
 OUT=""
+TEST_FIXTURES="$ROOT/scripts/live-test/linux-protected/fixtures"
 # Output directory of this run; removed again if the run fails part-way, so a
 # half-made TEST key set never lingers. Cleared once the run has succeeded.
 CLEANUP_DIR=""
+# Private temporary directory of `bundle`'s policy inputs; always removed.
+POLICY_WORK=""
 cleanup() {
     local status=$?
+    if [[ -n "$POLICY_WORK" ]]; then rm -rf -- "$POLICY_WORK"; fi
     if [[ "$status" -ne 0 && -n "$CLEANUP_DIR" ]]; then rm -rf -- "$CLEANUP_DIR"; fi
 }
 trap cleanup EXIT
@@ -93,6 +110,37 @@ ensure_signer() {
     (cd -- "$ROOT" && CARGO_TARGET_DIR="$ROOT/target/isolation-test-signer" \
         cargo build --locked -p duduclaw-updated --features test-signer --bin duduclaw-isolation-test-signer)
     SIGNER="$ROOT/target/isolation-test-signer/debug/duduclaw-isolation-test-signer"
+}
+
+# The offline policy generator (crates/duduclaw-spawnd, feature policy-tool; never a
+# release binary). It runs spawnd's Linux-only policy readers, so it needs Linux.
+ensure_policy_tool() {
+    if [[ -n "$POLICY_TOOL" ]]; then
+        [[ -x "$POLICY_TOOL" && -f "$POLICY_TOOL" ]] || fail "--policy-tool must be an executable file"
+        return
+    fi
+    [[ "$(uname -s)" == "Linux" ]] || fail "the policy generator runs only on Linux; run bundle on a Linux host or pass --policy-tool"
+    # Separate target directory, like the TEST signer: never mixed with release outputs.
+    (cd -- "$ROOT" && CARGO_TARGET_DIR="$ROOT/target/isolation-policy-tool" \
+        cargo build --locked --release -p duduclaw-spawnd --features policy-tool --bin duduclaw-isolation-policy)
+    POLICY_TOOL="$ROOT/target/isolation-policy-tool/release/duduclaw-isolation-policy"
+}
+
+# The release archive's policy-generator inputs (runtime entries of the TEST template,
+# egress forwarder, MCP bridge) under their generation names in the new directory $4,
+# through the packager's own archive check and staging (snapshot_release_archive,
+# stage_policy_inputs).
+stage_policy_inputs() {
+    python3 -I -B -c 'import importlib.util, sys, tempfile
+from pathlib import Path
+script, archive, target, template, destination = sys.argv[1:6]
+spec = importlib.util.spec_from_file_location("packager", script)
+packager = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(packager)
+with tempfile.TemporaryDirectory(prefix="snapshot-", dir=str(Path(destination).parent)) as snapshot:
+    packager.snapshot_release_archive(archive, target, Path(snapshot), test_archive=True)
+    for name in packager.stage_policy_inputs(Path(snapshot), Path(template), Path(destination)):
+        print("  policy input " + name)' "$ROOT/scripts/package-linux-release.py" "$1" "$2" "$3" "$4"
 }
 
 file_sha256() {
@@ -209,13 +257,15 @@ print(copy)' "$1" "$2" "$3" "$ROOT/scripts/refuse-test-license-build.py"
 }
 
 cmd_bundle() {
-    local keys="" archive="" target="" gateway=""
+    local keys="" archive="" target="" gateway="" policy_source="$TEST_FIXTURES/policy-source-test.json"
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --keys) keys="${2:?--keys needs a value}"; shift 2 ;;
             --archive) archive="${2:?--archive needs a value}"; shift 2 ;;
             --target) target="${2:?--target needs a value}"; shift 2 ;;
             --gateway) gateway="${2:?--gateway needs a value}"; shift 2 ;;
+            --policy-source) policy_source="${2:?--policy-source needs a value}"; shift 2 ;;
+            --policy-tool) POLICY_TOOL="${2:?--policy-tool needs a value}"; shift 2 ;;
             --out) OUT="${2:?--out needs a value}"; shift 2 ;;
             --signer) SIGNER="${2:?--signer needs a value}"; shift 2 ;;
             *) fail "unknown bundle option '$1'" ;;
@@ -229,8 +279,11 @@ cmd_bundle() {
         aarch64-unknown-linux-gnu) arch="aarch64" ;;
         *) fail "unknown --target" ;;
     esac
+    [[ -f "$policy_source" && ! -L "$policy_source" ]] || fail "--policy-source must be a regular file"
     ensure_signer
-    local out version tar_name expires
+    ensure_policy_tool
+    local out version tar_name expires template policy runtime_dir
+    template="$TEST_FIXTURES/manifest-template-test.json"
     out="$(make_out_dir "$OUT")"
     CLEANUP_DIR="$out"
     chmod 0700 -- "$out"
@@ -244,11 +297,25 @@ print(packager.version_text(packager.workspace_version()))' "$ROOT/scripts/packa
         archive="$(test_gateway_archive "$archive" "$gateway" "$out/TEST-archive")"
         echo "TEST-ONLY archive with the TEST-licence duduclaw (never upload it): $archive"
     fi
+    # The TEST isolation policy, generated from the archive's own bytes and checked by
+    # spawnd's readers before it is written; the packager signs it as a runtime entry.
+    POLICY_WORK="$(mktemp -d "${TMPDIR:-/tmp}/duduclaw-isolation-TEST-policy.XXXXXX")"
+    chmod 0700 -- "$POLICY_WORK"
+    stage_policy_inputs "$archive" "$target" "$template" "$POLICY_WORK/artifacts"
+    runtime_dir="$out/TEST-runtime"
+    mkdir -m 0700 -- "$runtime_dir"
+    policy="$runtime_dir/runtime-isolation-policy-v1"
+    "$POLICY_TOOL" build --source "$policy_source" --artifacts-dir "$POLICY_WORK/artifacts" --arch "$arch" --out "$policy"
+    echo "TEST-ONLY isolation policy (from $policy_source): $policy"
     python3 "$ROOT/scripts/package-linux-release.py" --target "$target" --from-release-archive "$archive" \
-        --manifest-template "$ROOT/release/isolation/manifest-template.json" --manifest-valid-days 30 \
+        --manifest-template "$template" --manifest-valid-days 30 \
+        --runtime-artifacts-dir "$runtime_dir" \
         --signing-key "$keys/target" --test-signer "$SIGNER" \
         --bootstrap-root "$keys/root.json" --bootstrap-root-signatures "$keys/root.json.signatures.json" \
         --output-dir "$out"
+    # The same checks again, now against the signed manifest (it must bind these policy bytes).
+    "$POLICY_TOOL" verify --policy "$policy" --artifacts-dir "$POLICY_WORK/artifacts" \
+        --manifest "$out/isolated-linux-$arch-manifest.json"
     python3 "$ROOT/scripts/package-linux-release.py" --target "$target" \
         --migration-bundle-from "$out/isolated-linux-$arch-bootstrap-inbox" --output-dir "$out"
     tar_name="duduclaw-isolated-linux-$arch-$version.tar"

@@ -273,6 +273,11 @@ fn registry_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Loopback port of the in-run egress forwarder: spawnd plans every egress run
+/// with this proxy port (`HTTP_PROXY=http://127.0.0.1:<port>`), and the signed
+/// forwarder record's argv names the same port (`forwarder <port>`).
+pub const RUNTIME_PROXY_PORT: u16 = 18080;
+
 /// Rebuilt from zero; no gateway, daemon or login-session variable is copied.
 pub fn runtime_environment(network: &NetworkPolicy, proxy_port: Option<u16>) -> Result<BTreeMap<String, String>> {
     let mut env: BTreeMap<_, _> = [("HOME", "/home/employee"), ("PATH", "/usr/bin:/bin"),

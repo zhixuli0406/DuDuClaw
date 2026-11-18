@@ -30,6 +30,24 @@ labels, no trailing dot, not an IP address, not `localhost` or a
 the configured DNS route as its DNS readiness evidence, and never reports the
 DNS route as verified with a policy older than v4.
 
+`manifest-template.json` does **not** list the policy yet, so a generation signed
+from it cannot install (S5 and spawnd refuse a generation without a valid
+policy); choosing the production runtime set is a pending owner decision. A
+production template will need `{"id": "isolation-policy-v1", "mode": 292,
+"install_target": {"kind": "runtime_entry", "registry_id": "isolation-policy-v1"}}`
+plus one `runtime_entry` (mode 493) for every runtime ELF the policy names —
+`api-worker-v1` (packaged from the built `duduclaw-api-worker`),
+`native-adapter-v1` (`duduclaw-runtime-adapter`) only if a Codex/Grok runtime is
+listed, and then `vendor-codex`/`vendor-grok` — with the reviewed policy (and
+vendor ELFs) supplied through `--runtime-artifacts-dir` as
+`runtime-isolation-policy-v1` (`runtime-vendor-*`). The policy itself is produced
+and checked with spawnd's own readers by `duduclaw-isolation-policy`
+(`crates/duduclaw-spawnd/README.md`, "Isolation policy generator") from a
+reviewed source document, real syscall lists and MCP acceptance records. The
+TEST-only counterpart is `scripts/live-test/linux-protected/fixtures/manifest-template-test.json`
+(this template plus the policy and `api-worker-v1`), used by
+`scripts/isolation-test-keys.sh bundle`.
+
 ## `../bootstrap-root.sha256` (not present yet)
 
 The production root pin: the SHA-256 of the signed production `root.json`, one

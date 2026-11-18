@@ -5,7 +5,42 @@
 | `connectors-acceptance.sh` (+ `connectors_rpc.py`, `fixtures/`) | **Current.** v1.81 Personal-binding / connector acceptance, matrix items 1-15 (see below). |
 | `package-h-acceptance.sh` (+ `fixtures/public_origin.py`) | **Current.** v1.81 Package H acceptance (H15, matrix additions 16-27) and the G2 lifecycle chain: installs the service, records host facts, runs the prebuilt `iso_package_h_chain` / `iso_personal_chain` test binaries (`crates/duduclaw-gateway/tests/`), prints a PASS/FAIL/SKIP table. Runbook: `docs/guides/linux-protected-acceptance.md`. |
 | `install-acceptance.sh` | **v1.83 (not yet run on a VM).** Fresh isolated install through `duduclaw-bootstrap install` with test root keys, rollback, and the `iso_root_install_` root tests one per fresh snapshot (usage in the script header). The team licence it needs is a **TEST licence**, never a production one: `scripts/isolation-test-keys.sh keys` prints the TEST-licence `duduclaw` build (`--cfg duduclaw_test_root` + `DUDUCLAW_TEST_LICENSE_ISSUER_PUBKEY`), `bundle --gateway <that duduclaw>` ships it in the TEST bundle, and `license --keys <dir> --fingerprint <line 1 of 'duduclaw license fingerprint' run as root on the VM> --out <file>` signs `/root/duduclaw-migrate/license.json` (tier `self_host_pro` by default; `partner` and `oem` also pass the installer's rule). Only the TEST build accepts it; the script checks `duduclaw print-license-issuer` prints `TEST-LICENSE <key>`. |
+| `fixtures/policy-source-test.json`, `fixtures/policy-syscalls-test-{x86_64,aarch64}.txt`, `fixtures/manifest-template-test.json` | **v1.83 R7d, TEST-only.** Inputs of the TEST isolation policy that `scripts/isolation-test-keys.sh bundle` now puts into every TEST generation (see "TEST isolation policy" below). |
 | `acceptance.sh` + `rpc_probe.py` | **Superseded for v1.81.** `acceptance.sh` asserts the removed `container_root_key` backend (`security.credential_protection` ⇒ `backend=container_root_key`), so it cannot pass on a v1.81 build. It is kept unchanged for the historical record (see "Legacy" at the end). `rpc_probe.py` is still used: `connectors_rpc.py` imports its WebSocket client. |
+
+## TEST isolation policy (v1.83 R7d)
+
+Every generation must contain a signed isolation policy (`runtime-isolation-policy-v1`);
+the installer's S5 and spawnd refuse one without it. `scripts/isolation-test-keys.sh
+bundle` therefore (Linux host only, or pass a prebuilt `--policy-tool`):
+
+1. extracts the archive's `duduclaw-api-worker`, `duduclaw-egress` (forwarder) and
+   `duduclaw-mcp-bridge` through the packager's own archive check into a private
+   temporary directory, under their generation names (`stage_policy_inputs`);
+2. builds `duduclaw-isolation-policy` (`cargo build --locked --release -p duduclaw-spawnd
+   --features policy-tool`, own target directory `target/isolation-policy-tool`) and runs
+   `build` with `--policy-source` (default `fixtures/policy-source-test.json`), writing
+   `<out>/TEST-runtime/runtime-isolation-policy-v1` only after spawnd's own checks pass;
+3. signs with `fixtures/manifest-template-test.json` (the shipped template plus
+   `isolation-policy-v1` and `api-worker-v1`) and `--runtime-artifacts-dir <out>/TEST-runtime`;
+4. runs `verify` against the signed manifest (it must bind exactly these policy bytes).
+
+The fixture is one OpenAI-compatible runtime (`api-worker-v1`, `fixed_args` the
+gateway's `--duduclaw-protocol openai-compat-v1 --mcp-config /config/mcp.json`),
+`network: egress` (profile label `test-egress`, forwarder on port 18080), `mcp: true`,
+conservative resources (1 GiB memory, 1 CPU, 256 tasks, 4096 open files, 8 MiB memfd,
+10 min runtime), `dns_probe_name` `example.com`, and **no MCP acceptance**. The syscall
+lists are permissive **TEST lists** (every syscall number in use on the architecture;
+duduclaw-run's fixed common refusals still apply on top), not reviewed production lists.
+
+What it can prove: the generation installs (S5 finds a valid signed policy and writes
+`/etc/duduclaw/egress.json` for the `test-egress` profile), spawnd loads the policy and
+publishes it, and readiness (including the DNS probe of `example.com`) can be evaluated.
+What it cannot prove: any employee run. spawnd refuses every MCP run of a runtime without
+MCP acceptance at MCP preparation, so no OpenAI-compatible turn can start; Claude, Codex
+and Grok are not in the TEST policy; the syscall lists say nothing about a production
+seccomp policy. The production policy content is a later, owner-reviewed step
+(`release/isolation/README.md`).
 
 ## Connector acceptance (`connectors-acceptance.sh`)
 

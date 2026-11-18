@@ -377,8 +377,15 @@ fn validate_turn_limits(policy: &SignedPolicy) -> io::Result<()> {
 }
 /// HX publication checks 1–7 against the verified runtime set (§2.3), plus the
 /// `/helper-tmp` budget, which must fit inside the parent's tmpfs budget.
+/// For the native architecture (the unit tests' entry; `bundle` calls
+/// `validate_launchers_for` through `verified_policy`).
+#[cfg(test)]
 fn validate_launchers(policy: &SignedPolicy) -> io::Result<()> {
-    let arch = io(duduclaw_run::seccomp::Architecture::native())?;
+    validate_launchers_for(policy, io(duduclaw_run::seccomp::Architecture::native())?)
+}
+/// `validate_launchers` for an explicit architecture (spawnd: the native one;
+/// the R7d policy tool: the generation's `--arch`).
+fn validate_launchers_for(policy: &SignedPolicy, arch: duduclaw_run::seccomp::Architecture) -> io::Result<()> {
     let runtimes: Vec<_> = policy.runtimes.iter().map(RuntimeRecord::to_runtime).collect();
     for native in &policy.native {
         let Some(launcher) = &native.launcher else { continue };
@@ -428,23 +435,44 @@ fn bundle() -> io::Result<Bundle> {
     let host: HostPublication = read(ROOT, "publication.json")?;
     if host.version != 1 || host.generation != generation { return Err(denied()); }
     let target = InstallTarget::RuntimeEntry { registry_id: POLICY_ID.into() };
-    let artifact = manifest.artifacts.iter().find(|a| a.install_target == target).ok_or_else(denied)?;
-    if artifact.size_bytes > 1024 * 1024 || artifact.mode != 0o444 { return Err(denied()); }
+    let artifact = policy_artifact(&manifest)?;
     let hex: String = generation.0.iter().map(|byte| format!("{byte:02x}")).collect();
     let directory = Path::new(INSTALL_ROOT).join("generations").join(hex);
     let bytes = io(io(Directory::open(&directory))?.bytes(&io(artifact_name(&target))?, 1024 * 1024))?;
-    if bytes.len() as u64 != artifact.size_bytes || Sha256Digest(Sha256::digest(&bytes).into()) != artifact.sha256 { return Err(denied()); }
-    let policy = parse_policy(&bytes)?;
+    policy_bytes_match(artifact, &bytes)?;
+    let policy = verified_policy(&bytes, &manifest, io(duduclaw_run::seccomp::Architecture::native())?)?;
+    Ok(Bundle { generation, manifest, directory, host, policy })
+}
+/// The signed policy artifact of a generation manifest: the one
+/// `isolation-policy-v1` runtime entry, mode 0444, at most 1 MiB.
+fn policy_artifact(manifest: &ReleaseManifest) -> io::Result<&duduclaw_isolation::update::ReleaseArtifact> {
+    let target = InstallTarget::RuntimeEntry { registry_id: POLICY_ID.into() };
+    let artifact = manifest.artifacts.iter().find(|a| a.install_target == target).ok_or_else(denied)?;
+    if artifact.size_bytes > 1024 * 1024 || artifact.mode != 0o444 { return Err(denied()); }
+    Ok(artifact)
+}
+/// The policy bytes are exactly the ones the manifest binds (size and sha256).
+fn policy_bytes_match(artifact: &duduclaw_isolation::update::ReleaseArtifact, bytes: &[u8]) -> io::Result<()> {
+    if bytes.len() as u64 != artifact.size_bytes || Sha256Digest(Sha256::digest(bytes).into()) != artifact.sha256 { return Err(denied()); }
+    Ok(())
+}
+/// Every check `bundle` applies to the policy bytes of a generation, against
+/// that generation's manifest, for `arch` (spawnd: the native architecture;
+/// the R7d policy tool runs exactly this on its own output for `--arch`):
+/// the strict reader, one native record per runtime, the runtime artifact
+/// cross-check, unique native profiles each with its runtime, each runtime
+/// seccomp filter against its signed digest, and the helper launchers.
+fn verified_policy(bytes: &[u8], manifest: &ReleaseManifest, arch: duduclaw_run::seccomp::Architecture) -> io::Result<SignedPolicy> {
+    let policy = parse_policy(bytes)?;
     if policy.native.len() != policy.runtimes.len() { return Err(denied()); }
-    validate_runtime_artifacts(&policy, &manifest)?;
+    validate_runtime_artifacts(&policy, manifest)?;
     let mut ids = std::collections::BTreeSet::new();
     for profile in &policy.native {
         if !ids.insert((profile.profile.0).0) || !policy.runtimes.iter().any(|r| r.profile == profile.profile) { return Err(denied()); }
-        let arch = io(duduclaw_run::seccomp::Architecture::native())?;
         io(duduclaw_run::seccomp::runtime(arch, &profile.runtime, profile.runtime_digest))?;
     }
-    validate_launchers(&policy)?;
-    Ok(Bundle { generation, manifest, directory, host, policy })
+    validate_launchers_for(&policy, arch)?;
+    Ok(policy)
 }
 /// A native acceptance binds the exact vendor ELF as part of its launch-policy
 /// digest. Replacing either adapter or vendor requires new signed acceptance.
@@ -469,6 +497,13 @@ fn validate_runtime_artifacts(policy: &SignedPolicy, manifest: &ReleaseManifest)
         if runtime.runtime == RuntimeKind::OpenAiCompat && entry != "runtime-api-worker-v1" { return Err(denied()); }
     }
     Ok(())
+}
+/// A signed forwarder record names the generation's egress forwarder by its
+/// generation entry and digest, with 1–128 arguments (`native_profile`).
+fn forwarder_artifact_matches(manifest: &ReleaseManifest, f: &ForwarderRecord) -> bool {
+    !f.argv.is_empty() && f.argv.len() <= 128 && manifest.artifacts.iter().any(|a|
+        a.install_target == InstallTarget::EgressForwarder && a.sha256 == f.executable_digest
+        && artifact_name(&a.install_target).is_ok_and(|name| name == f.entry))
 }
 
 #[derive(Default)]
@@ -645,9 +680,7 @@ impl crate::host::Publication for InstalledPublication {
         let (uid, _) = os(crate::server::gateway_identity())?;
         let snapshot = self.snapshot_authority(uid)?;
         let forwarder = native.forwarder.map(|f| -> Result<_> {
-            if f.argv.is_empty() || f.argv.len() > 128 || !b.manifest.artifacts.iter().any(|a|
-                a.install_target == InstallTarget::EgressForwarder && a.sha256 == f.executable_digest
-                && artifact_name(&a.install_target).is_ok_and(|name| name == f.entry)) { return Err(ErrorCode::RuntimeDenied); }
+            if !forwarder_artifact_matches(&b.manifest, &f) { return Err(ErrorCode::RuntimeDenied); }
             let argv = f.argv.into_iter().map(|arg| os(CString::new(arg))).collect::<Result<Vec<_>>>()?;
             Ok(crate::native_trampoline::ForwarderProfile { entry: f.entry, executable_digest: f.executable_digest,
                 argv, seccomp: f.seccomp, seccomp_digest: f.seccomp_digest })
@@ -1261,3 +1294,10 @@ mod root_acceptance;
 #[cfg(test)]
 #[path = "installed_account_root_tests.rs"]
 mod account_root_acceptance;
+
+/// R7d: the isolation policy generator behind `duduclaw-isolation-policy`
+/// (feature `policy-tool`, never a release binary). A child module so it runs
+/// this module's own readers and checks on its output, never copies of them.
+#[cfg(any(feature = "policy-tool", test))]
+#[path = "installed_policy_tool.rs"]
+pub mod policy_tool;

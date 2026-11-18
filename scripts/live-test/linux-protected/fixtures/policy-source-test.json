@@ -1,0 +1,42 @@
+{
+  "schema": "duduclaw-isolation-policy-source-v1",
+  "comment": "TEST-ONLY policy source for scripts/isolation-test-keys.sh bundle: install/readiness acceptance only. The runtime has no mcp_acceptance, so spawnd refuses every MCP run of it at MCP preparation; it cannot run an employee. The syscall lists are permissive TEST lists, not reviewed production lists.",
+  "dns_probe_name": "example.com",
+  "forwarder_seccomp": {"x86_64": "policy-syscalls-test-x86_64.txt", "aarch64": "policy-syscalls-test-aarch64.txt"},
+  "runtimes": [
+    {
+      "label": "api-worker-test",
+      "comment": "OpenAI-compatible API worker (registry api-worker-v1) with egress through the in-run forwarder.",
+      "runtime": {"kind": "open_ai_compat"},
+      "executable": "runtime-api-worker-v1",
+      "pinned_version": "api-worker-v1-test",
+      "fixed_args": "default",
+      "resources": {
+        "memory_bytes": 1073741824,
+        "cpu_quota_percent": 100,
+        "tasks": 256,
+        "open_files": 4096,
+        "ptys": 1,
+        "disk": {"kind": "loop_filesystem", "bytes": 1073741824, "inodes": 65536},
+        "io_read_bytes_per_sec": 52428800,
+        "io_write_bytes_per_sec": 52428800,
+        "io_read_ops_per_sec": 2000,
+        "io_write_ops_per_sec": 2000,
+        "output_buffer_bytes": 65536,
+        "output_total_bytes": 16777216,
+        "memfd_total_bytes": 8388608
+      },
+      "timeouts": {"queue_ms": 60000, "startup_ms": 30000, "runtime_ms": 600000, "pty_idle_ms": null, "termination_grace_ms": 10000},
+      "network": {"kind": "egress", "profile": "test-egress"},
+      "mcp": true,
+      "pty_allowed": false,
+      "queue_class": "background",
+      "native": {
+        "seccomp": {"x86_64": "policy-syscalls-test-x86_64.txt", "aarch64": "policy-syscalls-test-aarch64.txt"},
+        "tmpfs_bytes": 67108864,
+        "tmpfs_inodes": 4096,
+        "proc_subset_pid": true
+      }
+    }
+  ]
+}

@@ -163,6 +163,14 @@ MAX_PIN_FILE_BYTES = 128
 # or packaged by this script (plan R2 §4.2, test-key leak layer 1).
 TEST_SIGNER_BINARY = "duduclaw-isolation-test-signer"
 TEST_SIGNER_FEATURE = "test-signer"
+# Offline isolation policy generator (crates/duduclaw-spawnd, feature `policy-tool`, R7d):
+# a vendor/test tool that is never built or packaged by this script either.
+POLICY_TOOL_BINARY = "duduclaw-isolation-policy"
+POLICY_TOOL_FEATURE = "policy-tool"
+# Generation file names (crates/duduclaw-updated/src/publication.rs artifact_name) of the
+# non-runtime inputs the policy generator hashes (`duduclaw-isolation-policy --artifacts-dir`).
+POLICY_TOOL_INPUTS = {"egress_forwarder": "duduclaw-egress-forwarder", "mcp_bridge": "duduclaw-mcp-bridge"}
+POLICY_REGISTRY_ID = "isolation-policy-v1"
 # TEST-licence gateway (crates/duduclaw-gateway/src/license_runtime.rs): a
 # `--cfg duduclaw_test_root` duduclaw also trusts the TEST licence issuer compiled
 # in through this variable and embeds this marker, so it is recognised from its
@@ -241,6 +249,8 @@ def check_release_binary_set(packages=None):
     for name, package in packages.items():
         if TEST_SIGNER_BINARY in name or TEST_SIGNER_FEATURE in name or TEST_SIGNER_FEATURE in package:
             raise ValueError(f"{name} is a TEST-ONLY binary and can never be a release binary")
+        if POLICY_TOOL_BINARY in name or POLICY_TOOL_FEATURE in name or POLICY_TOOL_FEATURE in package:
+            raise ValueError(f"{name} is the offline policy generator and can never be a release binary")
 
 
 def archive_binaries(include_bootstrap):
@@ -265,12 +275,15 @@ def refuse_test_signer_build(command):
     """Test-key leak layer 1: no release build may compile the TEST-ONLY signer.
 
     The feature name, the binary name, and the selectors that would pull it in
-    (--all-features, --bins, --all-targets) are all refused.
+    (--all-features, --bins, --all-targets) are all refused. The offline policy
+    generator (feature `policy-tool`, `duduclaw-isolation-policy`) is refused the same way.
     """
     for token in command:
         if (TEST_SIGNER_FEATURE in token or TEST_SIGNER_BINARY in token
                 or token in ("--all-features", "--bins", "--all-targets")):
             raise ValueError(f"build arguments enable the TEST-ONLY signer ({token}); refusing a release build")
+        if POLICY_TOOL_FEATURE in token or POLICY_TOOL_BINARY in token:
+            raise ValueError(f"build arguments enable the offline policy generator ({token}); refusing a release build")
     return command
 
 
@@ -1103,6 +1116,40 @@ def runtime_source(artifact, binary_dir, runtime_dir):
     if runtime_dir is None:
         raise ValueError("signed vendor/config artifacts require --runtime-artifacts-dir")
     return runtime_dir / ("runtime-" + registry)
+
+
+def stage_policy_inputs(binary_dir, template, destination, runtime_dir=None):
+    """Copy the files the isolation policy generator hashes into the NEW directory
+    `destination`, under their installed generation names: the egress forwarder and
+    the MCP bridge (from INSTALL_BINARIES) and every 0755 runtime entry of `template`
+    as runtime-<registry_id>, from exactly the source sign_release signs
+    (runtime_source). The policy entry is the generator's output and is skipped.
+    Used by scripts/isolation-test-keys.sh bundle (TEST path); returns the names."""
+    signer = load_signer()
+    document = json.loads(Path(template).read_bytes(), object_pairs_hook=signer.unique_object,
+                          parse_float=signer.reject_number, parse_constant=signer.reject_number)
+    artifacts = document.get("artifacts") if isinstance(document, dict) else None
+    validate_targets(artifacts)
+    destination = Path(destination)
+    destination.mkdir(mode=0o700)
+    names = []
+    for artifact in artifacts:
+        kind = artifact["install_target"]["kind"]
+        if kind == "runtime_entry":
+            registry = runtime_target(artifact)
+            if registry == POLICY_REGISTRY_ID:
+                continue
+            source, name = runtime_source(artifact, Path(binary_dir), runtime_dir), "runtime-" + registry
+        elif kind in POLICY_TOOL_INPUTS:
+            source, name = Path(binary_dir) / INSTALL_BINARIES[kind], POLICY_TOOL_INPUTS[kind]
+        else:
+            continue
+        validate_binary(source)
+        with source.open("rb") as reader, (destination / name).open("xb") as writer:
+            shutil.copyfileobj(reader, writer)
+        (destination / name).chmod(0o755)
+        names.append(name)
+    return names
 
 
 def sign_release(binary_dir, target, output_dir, template, key, ssh_keygen, runtime_dir=None, test_signer=None,

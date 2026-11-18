@@ -1137,6 +1137,121 @@ and report `1 passed`; it is not evidence of a Claude turn, MCP tool call or D8
 admission. This development pass type-checked the test but did not execute these
 root attacks or provision the fixture.
 
+## Isolation policy generator (R7d, `duduclaw-isolation-policy`)
+
+Every generation must carry the signed isolation policy (manifest artifact
+`isolation-policy-v1`, `runtime_entry`, generation file
+`runtime-isolation-policy-v1`, mode 0444, at most 1 MiB); the installer's S5 and
+spawnd refuse a generation without a valid one. `duduclaw-isolation-policy`
+produces that document from a small reviewed source file and checks it with
+spawnd's own code (`src/installed_policy_tool.rs` is a child module of
+`installed`, so it calls the production readers and checks, never copies).
+
+It is an offline vendor/test tool behind the non-default feature `policy-tool`;
+`scripts/package-linux-release.py` refuses the feature and the binary name in a
+release build (`refuse_test_signer_build`, `check_release_binary_set`). It is
+**Linux only** (spawnd's policy readers are): on other hosts the binary only
+prints that. Any Linux architecture can build for either one (`--arch`).
+
+```sh
+cargo build --locked --release -p duduclaw-spawnd --features policy-tool --bin duduclaw-isolation-policy
+duduclaw-isolation-policy build  --source <policy-source.json> --artifacts-dir <dir> \
+    --arch <x86_64|aarch64> --out <new policy.json> [--manifest <manifest.json>]
+duduclaw-isolation-policy verify --policy <policy.json> --artifacts-dir <dir> \
+    [--manifest <signed manifest.json>] [--arch <x86_64|aarch64>]
+```
+
+`--artifacts-dir` holds the real files under their installed generation names
+(`duduclaw_updated::publication::artifact_name`): `runtime-<registry_id>` for
+runtime entries (`runtime-api-worker-v1` = the built `duduclaw-api-worker`,
+`runtime-native-adapter-v1` = `duduclaw-runtime-adapter`, `runtime-vendor-codex`,
+`runtime-vendor-grok`), `duduclaw-egress-forwarder` (= the `duduclaw-egress` ELF)
+and `duduclaw-mcp-bridge`; other files are ignored, symbolic links refused.
+`scripts/package-linux-release.py`'s `stage_policy_inputs` writes such a directory
+from a binary directory and a template. Without `--manifest` the cross-check
+runs against a manifest synthesised from those files (runtime ELF entries 0755,
+as the packager signs them); with `--manifest` against that manifest, and every
+file of `--artifacts-dir` it lists must have the same sha256 and size. `verify`
+with `--manifest` also requires the manifest's `isolation-policy-v1` entry
+(0444, ≤ 1 MiB) to be exactly the `--policy` bytes; without `--manifest`, a
+`runtime-isolation-policy-v1` in `--artifacts-dir` must be. `build` writes the
+policy (compact JSON, mode 0444, refusing an existing `--out`) only after every
+check passed; both commands exit 1 on a refusal (the message names the rule)
+and 2 on a usage error; `verify` prints a short summary (runtimes, kinds,
+entries, digest prefixes, network, MCP, MCP acceptance present or not).
+
+### Source format (`schema: "duduclaw-isolation-policy-source-v1"`)
+
+JSON, unknown fields refused everywhere. Top level:
+
+| Field | Meaning |
+| --- | --- |
+| `schema` | exactly `duduclaw-isolation-policy-source-v1` |
+| `comment` | optional free text, never copied into the policy |
+| `dns_probe_name` | policy v4 probe name (`egress::validate_dns_probe_name`) |
+| `forwarder_seccomp` | `{"x86_64": <file>, "aarch64": <file>}` syscall allow-lists of the egress forwarder; required exactly when a runtime uses egress (only the `--arch` one must exist) |
+| `runtimes` | 1–128 runtime entries |
+
+Each runtime:
+
+| Field | Meaning |
+| --- | --- |
+| `label` | 1–64 of `[a-z0-9-]`, unique; the profile id is derived from it |
+| `comment` | optional free text |
+| `runtime` | runtime kind as in the policy: `{"kind": "open_ai_compat"}`, `claude`, `codex`, `grok`, `{"kind": "registered", "name": …}` |
+| `executable` | generation file name of its ELF in `--artifacts-dir`, e.g. `runtime-api-worker-v1` |
+| `pinned_version` | signed version string (not empty, not `latest`/`*`) |
+| `fixed_args` | `"default"` = exactly what the gateway requires for the kind (`open_ai_compat`: `--duduclaw-protocol openai-compat-v1 --mcp-config /config/mcp.json`; Codex/Grok: the native adapter protocol; Claude: `gateway_plan::claude_arguments`, ranged when `turn_limit` is set; `generic-cli-v1.<id>`); requires `mcp: true`. Otherwise an explicit list |
+| `model` | Claude with `"default"` only: the `--model` value |
+| `resources`, `timeouts` | exactly the policy's `resources`/`timeouts` objects |
+| `network` | `{"kind": "offline"}` or `{"kind": "egress", "profile": "<egress label>"}` (egress labels must not equal a runtime label) |
+| `mcp`, `pty_allowed`, `queue_class`, `turn_limit` | as in the policy (`turn_limit` optional, Claude MCP only) |
+| `native` | `seccomp` (`{"x86_64": <file>, "aarch64": <file>}`), `tmpfs_bytes`, `tmpfs_inodes`, `proc_subset_pid`, optional `launcher` (a `LauncherRecord`, copied verbatim; helper `profile`s are derived ids, printed by `build`) |
+| `mcp_acceptance` | optional, copied verbatim from an acceptance record. Without it the policy loads, but spawnd refuses every MCP run of that runtime at MCP preparation (`prepare_mcp_projection`) |
+
+Syscall allow-list files (paths relative to the source file): one **decimal
+syscall number** or an inclusive range `N-M` per line, `#` comments, blank lines
+ignored; syscall names are not accepted. At most 512 unique numbers.
+
+### What the tool computes
+
+- Executable, vendor (`runtime-vendor-codex`/`-grok`, Codex/Grok only), forwarder
+  and bridge digests: sha256 of the real files' bytes.
+- Runtime and forwarder seccomp digests: `RuntimeProfile::digest(arch)`
+  (`crates/duduclaw-run/src/seccomp.rs`, `"duduclaw-runtime-seccomp-v1\0"` +
+  audit arch + count + sorted numbers), the digest `seccomp::runtime` checks.
+- Profile ids (runtime and egress): nothing in the product defines how they are
+  chosen, so the tool derives `sha256("duduclaw-isolation-profile-v1\0" ++ label)`
+  (`installed_policy_tool::profile_id`).
+- Forwarder record: entry `duduclaw-egress-forwarder`, argv
+  `["/runtime/duduclaw-egress-forwarder", "forwarder", "18080"]`; 18080 is
+  `policy::RUNTIME_PROXY_PORT`, the proxy port spawnd plans for every egress run
+  (`HTTP_PROXY=http://127.0.0.1:18080`, `host.rs`).
+- The document: policy v4 (`duduclaw-isolation-policy-v4`).
+
+### Checks run on the output (all production code)
+
+`installed::parse_policy` and `signed_policy` (installer reader); per runtime
+`systemd::UnitPolicy::new`, `policy::validate_turn_limit`,
+`RootPolicy::from_verified_publication`; `validate_runtime_artifacts`;
+`seccomp::runtime` per native record; `validate_launchers`; the complete `bundle`
+sequence (`verified_policy`); `load`'s `GatewayPublication::policy` +
+`with_launchers`; `RootPolicy::derive` per runtime (and with a PTY when
+`pty_allowed`, i.e. `LaunchPolicy::validate`); the installer S5 readers
+`signed_policy_egress_profiles` (at least one egress profile) and
+`signed_policy_dns_probe_name`; duduclaw-run `RootConfig::validate`; the
+forwarder rules of `native_profile` (`forwarder_artifact_matches`) and the
+trampoline (`forwarder_argv0`, forwarder present exactly for egress), the egress
+`forwarder <port> [limits]` argv shape and the runner's `seccomp::runtime` for the
+forwarder; with `mcp_acceptance`, `McpAcceptance::validate_launch` and
+`validate` against the manifest's MCP bridge.
+
+Not covered: producing MCP acceptance, reviewed production syscall lists,
+vendor (Codex/Grok) runtimes in the TEST path, Script executables (the tool
+emits ELF entries only). The TEST bundle path (`scripts/isolation-test-keys.sh
+bundle`) and its fixtures are described in
+`scripts/live-test/linux-protected/README.md`.
+
 ## License
 
 Apache-2.0, as declared by the workspace.
