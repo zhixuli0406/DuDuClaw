@@ -24,6 +24,11 @@ pub enum ConfirmationError {
     /// `apply_next` runs the same stage again. Any other step reporting it
     /// is a failure.
     #[error("proposal effect still pending")] Pending,
+    /// R7d round 1: [`Self::Pending`] that the caller must not wait for in
+    /// process (the root's pending-reservation cap refused a new employee;
+    /// the retry belongs to the operator / the next apply). `apply_next`
+    /// treats it exactly as `Pending` and answers `Pending`.
+    #[error("proposal effect pending at the root limit")] PendingLimit,
 }
 type Result<T> = std::result::Result<T, ConfirmationError>;
 const MAX_CONFIRMATIONS: u64 = 2048;
@@ -358,7 +363,7 @@ impl ConfirmationStore {
         };
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         effects::consume(&tx, &item, next, &intent)?;
-        if next == 0 && matches!(result, Err(ConfirmationError::Pending)) {
+        if next == 0 && matches!(result, Err(ConfirmationError::Pending | ConfirmationError::PendingLimit)) {
             // R7d: attempted, still pending. No receipt (the step stays 0, so
             // the next apply_next resumes the same stage with the same
             // binding), not Failed, no compensation.

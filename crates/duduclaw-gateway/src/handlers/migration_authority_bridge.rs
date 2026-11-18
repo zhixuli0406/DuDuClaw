@@ -1,7 +1,7 @@
 //! One bounded bridge for every migration authority async adapter. Call only from
 //! the blocking pool, after the confirmation intent transaction has committed.
 use super::{Error, Result};
-use std::{future::Future, sync::{Arc, atomic::{AtomicBool, Ordering}}, time::{Duration, Instant}};
+use std::{future::Future, sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}}, time::{Duration, Instant}};
 const ADAPTER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// R7d: the first allocation of an employee on a host with sshd answers
@@ -22,29 +22,54 @@ pub(crate) fn begin_shutdown() { SHUTTING_DOWN.store(true, Ordering::SeqCst); }
 
 /// The bounded retry of a stage that answered [`Error::Pending`].
 #[derive(Clone)]
-pub(crate) struct PendingWait { first: Duration, every: Duration, total: Duration, cancel: Option<Arc<AtomicBool>> }
+pub(crate) struct PendingWait { first: Duration, every: Duration, total: Duration, cancel: Option<Arc<AtomicBool>>,
+    /// Waits begun between attempts (tests read it).
+    sleeps: Arc<AtomicUsize> }
 impl Default for PendingWait {
-    fn default() -> Self { Self { first: PENDING_FIRST_RETRY, every: PENDING_RETRY_EVERY, total: PENDING_WAIT_TOTAL, cancel: None } }
+    fn default() -> Self { Self { first: PENDING_FIRST_RETRY, every: PENDING_RETRY_EVERY, total: PENDING_WAIT_TOTAL, cancel: None,
+        sleeps: Arc::default() } }
 }
 impl PendingWait {
     /// Tests: a shorter schedule and a private cancel flag.
     #[cfg(test)]
     pub(crate) fn for_test(first: Duration, every: Duration, total: Duration, cancel: Arc<AtomicBool>) -> Self {
-        Self { first, every, total, cancel: Some(cancel) }
+        Self { first, every, total, cancel: Some(cancel), sleeps: Arc::default() }
     }
+    /// Tests: how many waits between attempts began (shared by clones).
+    #[cfg(test)]
+    pub(crate) fn sleeps(&self) -> usize { self.sleeps.load(Ordering::SeqCst) }
     fn cancelled(&self) -> bool {
         SHUTTING_DOWN.load(Ordering::SeqCst) || self.cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst))
     }
     /// Runs `attempt` again while it answers `Pending`: after `first`, then
     /// every `every`, while the next attempt still starts within `total`.
-    /// Still pending at the end, or cancelled: `Err(Pending)` (never another
-    /// error, so the caller never compensates). Any other answer is returned.
+    /// Still pending at the end, `PendingLimit` (never waited for: only a
+    /// probe in flight for this employee holds the thread), or cancelled:
+    /// `Err(Pending)` (never another error, so the caller never compensates).
+    /// Any other answer is returned.
+    ///
+    /// Cancellation (shutdown) is checked right before and right after every
+    /// attempt, not only while sleeping: once shutdown has begun no attempt
+    /// starts, and the answer of an attempt in flight is discarded — a Ready
+    /// and a hard refusal included — as `Err(Pending)`, so nothing publishes,
+    /// reads back or compensates (`Disable`) during shutdown. Discarding is
+    /// what process death right after the attempt would do: no receipt is
+    /// recorded, the step stays 0, and the next apply after restart re-runs
+    /// the same (re-validated) stage with the same binding. For a discarded
+    /// Ready spawnd's row is Ready (or still Reserved) and its journal entry
+    /// is keyed by that binding, so the repeated Allocate is answered
+    /// idempotently from it (replay), never a second employee; a discarded
+    /// hard refusal is seen again then and compensated by a live gateway.
     pub(crate) fn run<T>(&self, mut attempt: impl FnMut() -> Result<T>) -> Result<T> {
         let started = Instant::now();
         let mut delay = self.first;
         loop {
-            match attempt() {
+            if self.cancelled() { return Err(Error::Pending); }
+            let answer = attempt();
+            if self.cancelled() { return Err(Error::Pending); }
+            match answer {
                 Err(Error::Pending) => {}
+                Err(Error::PendingLimit) => return Err(Error::Pending),
                 other => return other,
             }
             if started.elapsed() + delay > self.total || !self.sleep(delay) { return Err(Error::Pending); }
@@ -53,6 +78,7 @@ impl PendingWait {
     }
     /// `false` when cancelled before `delay` elapsed.
     fn sleep(&self, delay: Duration) -> bool {
+        self.sleeps.fetch_add(1, Ordering::SeqCst);
         let until = Instant::now() + delay;
         loop {
             if self.cancelled() { return false; }

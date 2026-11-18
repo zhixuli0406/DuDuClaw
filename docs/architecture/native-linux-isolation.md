@@ -1451,7 +1451,15 @@ reads nothing under `/run/duduclaw-isolation-evidence`.
   Retry runs the same stage with the same binding and spawnd resumes the
   reservation. After spawnd's 10-minute deadline its tombstone refusal is
   `isolation_unavailable`: the existing hard failure (Failed, compensation).
-  `NotReady` (host busy, start-up latch) on `Allocate` is still a hard failure.
+  At most 4 approve/retry apply loops run at once in the gateway (spawnd's
+  pending-reservation cap): a further one answers `allocation_pending` at once
+  before anything is read or written, and a `pending_limit` answer returns
+  `allocation_pending` at once instead of being waited for, so only a probe in
+  flight for that employee holds a blocking thread.
+  `NotReady` on a schema-3 `Allocate` (start-up reconciliation not latched,
+  or a run live on the host, both answered before spawnd changes anything) is
+  waited for and, still not ready after the window, left `Applying` exactly
+  like `pending`; `NotReady` on any other action or step keeps its meaning.
 - **Unsupported hosts.** passwd/group NSS modules other than files/systemd
   (SSSD/LDAP, Google Compute Engine OS Login, `compat`, bracketed action
   clauses); sshd present without the ssh client, ssh-keygen or journalctl, or

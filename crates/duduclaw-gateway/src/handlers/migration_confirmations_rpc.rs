@@ -11,6 +11,43 @@ use super::migration_authority::employee::EmployeeAuthority;
 /// `migrationConfirm.allocationPending`).
 pub(super) const ALLOCATION_PENDING: &str = "帳號安全驗證尚未完成，請稍後重試";
 
+/// R7d round 1: confirmation apply loops (approve / retry) that may run at
+/// once in this process. Equal to spawnd's pending-reservation cap
+/// (`registry::MAX_PENDING_RESERVATIONS`): more concurrent loops cannot make
+/// more allocations progress, they would only hold blocking threads.
+const APPLY_LOOPS_MAX: usize = 4;
+static APPLY_LOOPS: ApplyAdmission = ApplyAdmission::new(APPLY_LOOPS_MAX);
+
+/// A counting semaphore that never queues: a full one refuses at once.
+pub(super) struct ApplyAdmission { running: std::sync::atomic::AtomicUsize, capacity: usize }
+/// One admitted apply loop; dropping it (every path out of the loop, an
+/// unwinding panic and a task that never ran included) releases the slot.
+pub(super) struct ApplyPermit<'a>(&'a ApplyAdmission);
+impl ApplyAdmission {
+    pub(super) const fn new(capacity: usize) -> Self { Self { running: std::sync::atomic::AtomicUsize::new(0), capacity } }
+    pub(super) fn try_enter(&self) -> Option<ApplyPermit<'_>> {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.running.fetch_update(SeqCst, SeqCst, |n| (n < self.capacity).then_some(n + 1)).ok().map(|_| ApplyPermit(self))
+    }
+    #[cfg(test)]
+    pub(super) fn running(&self) -> usize { self.running.load(std::sync::atomic::Ordering::SeqCst) }
+}
+impl Drop for ApplyPermit<'_> {
+    fn drop(&mut self) { self.0.running.fetch_sub(1, std::sync::atomic::Ordering::SeqCst); }
+}
+/// Admission of one RPC. approve / retry need a permit (`Ok(Some)`); every
+/// other method needs none (`Ok(None)`). Full: `Err` with the retry-safe
+/// pending answer. Called before the blocking task starts, so a refused call
+/// has opened no store, checked no CSRF, approved nothing, written no intent
+/// and consumed nothing: every item stays exactly as it was.
+pub(super) fn admit<'a>(admission: &'a ApplyAdmission, method: &str, params: &Value) -> Result<Option<ApplyPermit<'a>>, Value> {
+    if !matches!(method, "migration.confirmations.approve" | "migration.confirmations.retry") { return Ok(None); }
+    admission.try_enter().map(Some).ok_or_else(|| {
+        let requested = params.get("bindings").and_then(Value::as_array).map_or(1, |b| b.len().clamp(1, 200));
+        json!({ "readback_required": true, "failed": 0, "allocation_pending": requested, "message": ALLOCATION_PENDING })
+    })
+}
+
 pub(super) fn known_method(method: &str) -> bool {
     matches!(method, "migration.confirmations.list" | "migration.confirmations.step_up"
         | "migration.confirmations.approve" | "migration.confirmations.retry"
@@ -55,7 +92,15 @@ impl MethodHandler {
         // F6g: set when an apply committed an adoption (its tree is now under agents/).
         let adopted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let adopted_flag = adopted.clone();
+        // R7d round 1: the process-wide apply-loop cap, taken before the
+        // blocking task (a full cap never queues, nothing has run yet).
+        let permit = match admit(&APPLY_LOOPS, &method, &params) {
+            Ok(permit) => permit,
+            Err(pending) => return WsFrame::ok_response("", pending),
+        };
         let result = tokio::task::spawn_blocking(move || -> Result<Value, &'static str> {
+            // Held until this closure ends (or is dropped unrun).
+            let _permit = permit;
             let now = chrono::Utc::now().timestamp();
             if now < 0 { return Err("無法確認目前時間。"); }
             let path = home.join("migration-confirmations.db");
@@ -267,5 +312,80 @@ mod tests {
     fn migration_decisions_refuse_client_authority_and_malformed_bindings() {
         assert!(serde_json::from_value::<Decision>(json!({"bindings":[], "csrf_token":[0], "admin":true})).is_err());
         assert!(serde_json::from_value::<Decision>(json!({"bindings":[], "csrf_token":vec![0;32], "mfa_enrolled":true})).is_err());
+    }
+
+    struct Valid;
+    impl duduclaw_migration::confirmation::ProposalValidator for Valid {
+        fn validate_fresh(&self, _: &duduclaw_migration::contract::ConfirmationItem)
+            -> std::result::Result<(), duduclaw_migration::confirmation::ConfirmationError> { Ok(()) }
+    }
+    /// A journal with one Pending Employee proposal.
+    fn journal() -> (ConfirmationStore, ProposalBinding) {
+        use duduclaw_migration::contract::{ConfirmationCategory, ProposalField, ProposalOperationId, ProposalValue};
+        let mut store = ConfirmationStore::from_connection(rusqlite::Connection::open_in_memory().unwrap()).unwrap();
+        let field = |name: &str, value: &str| ProposalField { name: name.into(), value: ProposalValue::Text { value: value.into() } };
+        let item = store.stage_proposal(ProposalOperationId { proposal_id: RequestId([5; 16]), revision: 1 }, ConfirmationCategory::Employee,
+            vec![field("disk_bytes", "67108864"), field("employee_id", "sales")], &Valid).unwrap();
+        (store, item.binding)
+    }
+    fn snapshot(store: &ConfirmationStore) -> Value { serde_json::to_value(store.list().unwrap()).unwrap() }
+
+    /// R7d round 1: a full cap answers at once with the retry-safe pending
+    /// outcome; the approve behind it never runs and the journal is unchanged.
+    #[test]
+    fn apply_admission_full_answers_pending_at_once_and_leaves_journal_unchanged() {
+        assert_eq!(APPLY_LOOPS_MAX, 4);
+        let admission = ApplyAdmission::new(APPLY_LOOPS_MAX);
+        let held: Vec<_> = (0..APPLY_LOOPS_MAX).map(|_| admission.try_enter().unwrap()).collect();
+        let (mut store, binding) = journal();
+        let before = snapshot(&store);
+        let session = ApprovalSession::from_verified_session(true, true, Some(100), [7; 32], RequestId([8; 16]));
+        for method in ["migration.confirmations.approve", "migration.confirmations.retry"] {
+            let started = std::time::Instant::now();
+            let params = json!({ "bindings": [binding], "csrf_token": vec![7u8; 32] });
+            let answer = match admit(&admission, method, &params) {
+                Ok(_) => { store.approve(&[binding], &session, [7; 32], 101, &Valid).unwrap(); panic!("admitted past a full cap") }
+                Err(answer) => answer,
+            };
+            assert!(started.elapsed() < std::time::Duration::from_secs(1));
+            assert_eq!(answer["allocation_pending"], json!(1));
+            assert_eq!(answer["failed"], json!(0));
+            assert_eq!(answer["message"], json!(ALLOCATION_PENDING));
+            assert_eq!(snapshot(&store), before, "{method}");
+            assert_eq!(admission.running(), APPLY_LOOPS_MAX);
+        }
+        // Methods without an apply loop take no permit, even when full.
+        for method in ["migration.confirmations.list", "migration.confirmations.step_up",
+            "migration.confirmations.reject", "migration.confirmations.rotate_secret"] {
+            assert!(matches!(admit(&admission, method, &json!({})), Ok(None)), "{method}");
+        }
+        drop(held);
+        assert_eq!(admission.running(), 0);
+        // With a slot free the same approve is admitted and runs.
+        let permit = admit(&admission, "migration.confirmations.approve", &json!({ "bindings": [binding] })).unwrap();
+        assert!(permit.is_some() && admission.running() == 1);
+        store.approve(&[binding], &session, [7; 32], 101, &Valid).unwrap();
+        drop(permit);
+        assert_eq!(admission.running(), 0);
+    }
+
+    /// The permit is released however the apply loop ends: success, failure,
+    /// and an early return.
+    #[test]
+    fn apply_admission_permit_released_on_every_path() {
+        fn apply_loop(permit: Option<ApplyPermit<'_>>, outcome: u8) -> std::result::Result<Value, &'static str> {
+            let _permit = permit;
+            if outcome == 2 { return Err("early"); }
+            let failed = outcome == 1;
+            if failed { Err("failed") } else { Ok(json!({ "readback_required": true })) }
+        }
+        let admission = ApplyAdmission::new(1);
+        for outcome in [0u8, 1, 2] {
+            let permit = admit(&admission, "migration.confirmations.approve", &json!({})).unwrap();
+            assert_eq!(admission.running(), 1);
+            assert!(admit(&admission, "migration.confirmations.retry", &json!({})).is_err(), "full at capacity 1");
+            assert_eq!(apply_loop(permit, outcome).is_ok(), outcome == 0);
+            assert_eq!(admission.running(), 0, "released after outcome {outcome}");
+        }
     }
 }

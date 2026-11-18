@@ -53,12 +53,12 @@ impl AllocationRoot for Root {
     }
 }
 /// The production Employee stage minus product validation and bookkeeping.
-struct Backend { root: Arc<Root>, disables: AtomicUsize }
+struct Backend { root: Arc<Root>, disables: AtomicUsize, publishes: AtomicUsize }
 impl MigrationAuthorityBackend for Backend {
     fn supports(&self, category: ConfirmationCategory) -> bool { category == ConfirmationCategory::Employee }
     fn validate(&self, _: &ConfirmationItem) -> Result<()> { Ok(()) }
     fn stage(&self, item: &ConfirmationItem) -> Result<()> { allocate_with(self.root.as_ref(), item).map(|_| ()) }
-    fn publish(&self, _: &ConfirmationItem) -> Result<()> { Ok(()) }
+    fn publish(&self, _: &ConfirmationItem) -> Result<()> { self.publishes.fetch_add(1, Ordering::SeqCst); Ok(()) }
     fn read_back(&self, _: &ConfirmationItem) -> Result<()> { Ok(()) }
     fn disable(&self, _: &ConfirmationItem) -> Result<()> { self.disables.fetch_add(1, Ordering::SeqCst); Ok(()) }
 }
@@ -67,22 +67,24 @@ impl ProposalValidator for Valid {
     fn validate_fresh(&self, _: &ConfirmationItem) -> Result<()> { Ok(()) }
 }
 struct Fx { _home: tempfile::TempDir, store: ConfirmationStore, authority: GatewayAuthority, root: Arc<Root>, backend: Arc<Backend>,
-    item: ConfirmationItem, cancel: Arc<AtomicBool> }
+    item: ConfirmationItem, cancel: Arc<AtomicBool>, wait: bridge::PendingWait }
 fn ms(value: u64) -> Duration { Duration::from_millis(value) }
 fn fx(first: u64, every: u64, total: u64) -> Fx {
     let home = tempfile::tempdir().unwrap();
     let root = Arc::new(Root::default());
-    let backend = Arc::new(Backend { root: root.clone(), disables: AtomicUsize::new(0) });
+    let backend = Arc::new(Backend { root: root.clone(), disables: AtomicUsize::new(0), publishes: AtomicUsize::new(0) });
     let cancel = Arc::new(AtomicBool::new(false));
+    // A clone shares the sleep counter with the authority's copy.
+    let wait = bridge::PendingWait::for_test(ms(first), ms(every), ms(total), cancel.clone());
     let authority = GatewayAuthority::new(home.path().into()).unwrap().with_backend(backend.clone())
-        .with_pending_wait(bridge::PendingWait::for_test(ms(first), ms(every), ms(total), cancel.clone()));
+        .with_pending_wait(wait.clone());
     let mut store = ConfirmationStore::from_connection(Connection::open_in_memory().unwrap()).unwrap();
     let field = |name: &str, value: &str| ProposalField { name: name.into(), value: ProposalValue::Text { value: value.into() } };
     let item = store.stage_proposal(ProposalOperationId { proposal_id: RequestId([5; 16]), revision: 1 }, ConfirmationCategory::Employee,
         vec![field("disk_bytes", "67108864"), field("employee_id", "sales")], &Valid).unwrap();
     let session = ApprovalSession::from_verified_session(true, true, Some(100), [7; 32], RequestId([8; 16]));
     store.approve(&[item.binding], &session, [7; 32], 101, &Valid).unwrap();
-    Fx { _home: home, store, authority, root, backend, item, cancel }
+    Fx { _home: home, store, authority, root, backend, item, cancel, wait }
 }
 impl Fx {
     fn apply(&mut self) -> std::result::Result<ConfirmationStatus, Error> {
@@ -92,6 +94,7 @@ impl Fx {
         self.store.list().unwrap().into_iter().find(|item| item.binding == self.item.binding).unwrap().status
     }
     fn disables(&self) -> usize { self.backend.disables.load(Ordering::SeqCst) }
+    fn publishes(&self) -> usize { self.backend.publishes.load(Ordering::SeqCst) }
     /// Publish + read back: the apply completes.
     fn finish(&mut self) {
         for _ in 0..2 { self.apply().unwrap(); }
@@ -122,13 +125,53 @@ fn allocation_pending_then_ready_succeeds_without_compensation() {
     assert_eq!((fx.root.calls(), fx.disables()), (3, 0));
 }
 
+/// Round 1: `pending_limit` (spawnd reserved nothing) is never waited for:
+/// one attempt, no sleep, the retry-safe outcome at once; the next apply
+/// sends the same Allocate.
 #[test]
-fn allocation_pending_limit_then_ready_succeeds() {
-    let mut fx = fx(5, 5, 5_000);
-    fx.root.push(&[Script::Refuse(Code::PendingLimit), Script::Refuse(Code::Pending), Script::Ready]);
+fn allocation_pending_limit_returns_at_once_without_sleeping() {
+    // A wait would take ≥ 10 s.
+    let mut fx = fx(10_000, 10_000, 120_000);
+    fx.root.push(&[Script::Refuse(Code::PendingLimit)]);
+    let started = Instant::now();
+    assert!(matches!(fx.apply(), Err(Error::Pending)));
+    assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+    assert_eq!((fx.root.calls(), fx.wait.sleeps()), (1, 0));
+    assert_eq!((fx.status(), fx.disables()), (ConfirmationStatus::Applying, 0));
+    fx.root.push(&[Script::Ready]);
     fx.apply().unwrap();
-    assert_eq!((fx.root.calls(), fx.disables()), (3, 0));
+    assert_eq!((fx.root.calls(), fx.wait.sleeps(), fx.disables()), (2, 0, 0));
     fx.assert_identical_allocates();
+    fx.finish();
+}
+
+/// Round 1: a transient `NotReady` (start-up latch, host busy — both before
+/// spawnd changes anything) is waited for like `pending`.
+#[test]
+fn allocation_not_ready_then_ready_succeeds_without_compensation() {
+    let mut fx = fx(5, 5, 5_000);
+    fx.root.push(&[Script::Refuse(Code::NotReady), Script::Refuse(Code::NotReady), Script::Ready]);
+    assert_eq!(fx.apply().unwrap(), ConfirmationStatus::Applying);
+    assert_eq!((fx.root.calls(), fx.wait.sleeps(), fx.disables()), (3, 2, 0));
+    fx.assert_identical_allocates();
+    fx.finish();
+    assert_eq!((fx.root.calls(), fx.disables()), (3, 0));
+}
+
+/// `NotReady` for the whole window: Applying, `Err(Pending)` (the RPC's
+/// retry-safe `allocation_pending` message), no Disable; it resumes.
+#[test]
+fn allocation_not_ready_for_the_whole_window_is_retry_safe() {
+    let mut fx = fx(5, 5, 100);
+    fx.root.push(&[Script::Refuse(Code::NotReady); 64]);
+    assert!(matches!(fx.apply(), Err(Error::Pending)));
+    let calls = fx.root.calls();
+    assert!((2..=21).contains(&calls), "bounded schedule: {calls}");
+    assert_eq!((fx.status(), fx.disables(), fx.publishes()), (ConfirmationStatus::Applying, 0, 0));
+    fx.root.script.lock().unwrap().clear();
+    fx.root.push(&[Script::Ready]);
+    fx.apply().unwrap();
+    assert_eq!((fx.root.calls(), fx.disables()), (calls + 1, 0));
     fx.finish();
 }
 
@@ -170,9 +213,10 @@ fn allocation_after_spawnd_window_surfaces_existing_failure() {
 /// Hard failures keep the existing behaviour: one call, Failed, compensated.
 /// An older-schema reply and a transport/decode failure (which is what an
 /// unknown kind is) are refused the same way, never read as Pending.
+/// (`NotReady` on Allocate is retry-safe since round 1: tests above.)
 #[test]
 fn allocation_hard_failure_old_schema_and_garbled_reply_are_refused() {
-    for step in [Script::Refuse(Code::IsolationUnavailable), Script::Refuse(Code::NotReady), Script::Refuse(Code::InvalidRequest),
+    for step in [Script::Refuse(Code::IsolationUnavailable), Script::Refuse(Code::InvalidRequest),
         Script::Refuse(Code::Inconsistent), Script::Older(1), Script::Older(allocation::SCHEMA_V2), Script::Down] {
         let mut fx = fx(5, 5, 5_000);
         fx.root.push(&[step]);
@@ -191,10 +235,50 @@ fn allocation_shutdown_during_wait_stops_without_disable() {
     assert!(matches!(fx.apply(), Err(Error::Pending)));
     assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
     assert_eq!((fx.root.calls(), fx.status(), fx.disables()), (2, ConfirmationStatus::Applying, 0));
+    // Restart: a fresh process has not begun shutting down.
+    fx.cancel.store(false, Ordering::SeqCst);
     fx.root.push(&[Script::Ready]);
     fx.apply().unwrap();
     assert_eq!((fx.root.calls(), fx.disables()), (3, 0));
     fx.finish();
+}
+
+/// Round 1: shutdown begins while an attempt is in flight and spawnd then
+/// answers Ready. The answer is discarded: Pending, no publish, no Disable;
+/// while shut down no further attempt starts; after restart the same
+/// Allocate resumes (spawnd replays the Ready entry).
+#[test]
+fn allocation_shutdown_during_attempt_discards_ready() {
+    let mut fx = fx(5, 5, 30_000);
+    fx.root.push(&[Script::Refuse(Code::Pending), Script::Ready]);
+    *fx.root.cancel_on.lock().unwrap() = Some((2, fx.cancel.clone()));
+    assert!(matches!(fx.apply(), Err(Error::Pending)));
+    assert_eq!((fx.root.calls(), fx.status(), fx.publishes(), fx.disables()), (2, ConfirmationStatus::Applying, 0, 0));
+    // Still shutting down: checked before the attempt, nothing is sent.
+    assert!(matches!(fx.apply(), Err(Error::Pending)));
+    assert_eq!((fx.root.calls(), fx.status(), fx.publishes(), fx.disables()), (2, ConfirmationStatus::Applying, 0, 0));
+    fx.cancel.store(false, Ordering::SeqCst);
+    fx.root.push(&[Script::Ready]);
+    fx.apply().unwrap();
+    assert_eq!((fx.root.calls(), fx.disables()), (3, 0));
+    fx.assert_identical_allocates();
+    fx.finish();
+}
+
+/// Round 1: shutdown during an attempt that then answers a hard refusal:
+/// Pending, nothing compensated during shutdown. A live gateway's next apply
+/// sees the refusal again and compensates then.
+#[test]
+fn allocation_shutdown_during_attempt_discards_hard_refusal() {
+    let mut fx = fx(5, 5, 30_000);
+    fx.root.push(&[Script::Refuse(Code::IsolationUnavailable)]);
+    *fx.root.cancel_on.lock().unwrap() = Some((1, fx.cancel.clone()));
+    assert!(matches!(fx.apply(), Err(Error::Pending)));
+    assert_eq!((fx.root.calls(), fx.status(), fx.publishes(), fx.disables()), (1, ConfirmationStatus::Applying, 0, 0));
+    fx.cancel.store(false, Ordering::SeqCst);
+    fx.root.push(&[Script::Refuse(Code::IsolationUnavailable)]);
+    assert!(matches!(fx.apply(), Err(Error::Apply)));
+    assert_eq!((fx.root.calls(), fx.status(), fx.disables()), (2, ConfirmationStatus::Failed, 1));
 }
 
 #[test]

@@ -72,7 +72,9 @@ fn pending_stage_stays_applying_without_compensation_and_resumes() {
     impl ProposalApplier for Root {
         fn stage(&mut self, _: &ConfirmationItem) -> Result<()> {
             self.stages += 1;
-            if self.pending > 0 { self.pending -= 1; return Err(ConfirmationError::Pending); }
+            // The last pending answer is `PendingLimit`: the same outcome.
+            if self.pending > 0 { self.pending -= 1;
+                return Err(if self.pending == 0 { ConfirmationError::PendingLimit } else { ConfirmationError::Pending }); }
             Ok(())
         }
         fn publish(&mut self, _: &ConfirmationItem) -> Result<()> {

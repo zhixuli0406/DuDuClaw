@@ -21,17 +21,27 @@ impl AllocationRoot for SpawndAllocationRoot {
     }
 }
 /// R7d: one `Allocate` (schema 3) of `item`. Ready (a receipt checked by
-/// `check_response`): the receipt. `Pending` / `PendingLimit`: the root keeps
-/// the reservation resumable, so the SAME request must be sent again later:
-/// `Err(Pending)`, which never compensates. Everything else — an older-schema
-/// or garbled reply, an unknown kind, a transport failure, any other refusal
-/// (a tombstoned employee's included) — is the existing hard failure.
+/// `check_response`): the receipt. `Pending`: the root keeps the reservation
+/// resumable, so the SAME request must be sent again later: `Err(Pending)`,
+/// which never compensates and is waited for (bounded). `PendingLimit`
+/// (nothing reserved): `Err(PendingLimit)`, the same retry-safe outcome but
+/// never waited for in process. `NotReady` (round 1): spawnd answers it to a
+/// schema-3 `Allocate` only before any journal entry or registry row is
+/// created or changed — start-up reconciliation not latched
+/// (`spawnd::host::Core::allocation`) or a run live on the host
+/// (`spawnd::allocation::Allocator::handle`, the host gate) — and it clears
+/// within seconds: `Err(Pending)`, waited for like `pending`. Everything else
+/// — an older-schema or garbled reply, an unknown kind, a transport failure,
+/// any other refusal (a tombstoned employee's included) — is the existing
+/// hard failure. Only the stage step calls this; `NotReady` from
+/// ReadBack/Disable/Retire (`exchange`, schema 1) keeps its meaning.
 pub(crate) fn allocate_with(root:&dyn AllocationRoot,item:&ConfirmationItem)->Result<Receipt> {
     let request=Request{schema:allocation::SCHEMA_V3,nonce:RequestId(*uuid::Uuid::new_v4().as_bytes()),action:Action::Allocate,item:item.clone(),approver:None};
     let response=root.round_trip(&request).map_err(|_|Error::Apply)?;
     match allocation::check_response(&request,response).map_err(|_|Error::Apply)? {
         Answer::Reply(reply)=>Ok(reply.receipt),
-        Answer::Refused(Code::Pending|Code::PendingLimit)=>Err(Error::Pending),
+        Answer::Refused(Code::Pending|Code::NotReady)=>Err(Error::Pending),
+        Answer::Refused(Code::PendingLimit)=>Err(Error::PendingLimit),
         Answer::Refused(_)=>Err(Error::Apply),
     }
 }
