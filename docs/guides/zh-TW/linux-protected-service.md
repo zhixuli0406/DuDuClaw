@@ -13,17 +13,17 @@
 1. 以 root 建立下載目錄：`install -d -m 0700 -o root -g root /root/duduclaw-migrate`。
 2. 把以下檔案存成檔案放進該目錄：`duduclaw-bootstrap`、`duduclaw-isolated-linux-<架構>-<版本>.tar` 與它的 `.minisig`、`.authorization.json`、`.authorization.json.signatures.json`，以及團隊版授權檔 `license.json`（root 擁有，群組與其他人不可寫）。
 3. 用 `sha256sum -c` 與官網及授權 console 公布的值比對，兩處必須一致。
-4. 執行 `sudo /root/duduclaw-migrate/duduclaw-bootstrap install [--dns-upstream <IP:53>] [--host-public-address <IP>]... [--enable-now]`。
+4. 執行 `sudo /root/duduclaw-migrate/duduclaw-bootstrap install [--dns-upstream <IP:53>] [--host-public-address <IP>]...`。安裝程式會自己啟動 Gateway，並設為開機自動啟動。
 
 | 選項 | 說明 |
 | --- | --- |
 | `--dns-upstream <IP:53>` | 只用在沒有 systemd-resolved 的主機：專用 DNS 轉送服務的唯一上游。有 systemd-resolved 時會被拒絕。這個位址不會加進員工的對外連線規則。 |
 | `--host-public-address <IP>` | 不在網路介面上的本機公開位址（雲端 1:1 NAT）；可重複，最多 64 個。員工連不到這些位址。 |
-| `--enable-now` | 最後啟動 Gateway 並跑完整的就緒檢查。不加時 Gateway 只會設為開機啟用，不會立刻啟動。 |
+| `--enable-now` | 已不需要，也沒有作用：安裝程式一定會讓 Gateway 保持執行。仍然接受這個選項，既有的指令稿不必修改；有加時安裝程式會顯示一行提醒。 |
 
 安裝程式在變更任何東西之前先檢查主機，並一次列出所有未通過的項目：Ubuntu 22.04、Ubuntu 24.04 或 Debian 12；systemd 249 以上；核心 5.15 以上；cgroup v2；`/var/lib` 為 ext4 或 XFS；`/etc/login.defs` 明確設定 `SYS_UID_MAX`／`SYS_GID_MAX`；70000–99999 沒有任何帳號、群組或 subordinate ID 範圍；sshd 主設定包含 `/etc/ssh/sshd_config.d/*.conf`；`cron.allow`／`at.allow` 沒有允許 DuDuClaw 帳號；磁碟空間足夠；有效的團隊版授權；沒有先前的 DuDuClaw 安裝。使用外部帳號服務（LDAP、SSSD 等）的主機，這個安裝程式不支援。
 
-接著依序：確認服務帳號沒有任何程序；發布已驗證的更新信任根、世代與固定路徑程式；建立服務帳號、目錄與服務單元；依簽章政策寫入對外連線與 DNS 設定；啟動 spawnd、egress、文件解析 socket 與更新服務；啟用每晚更新 timer（`duduclaw-auto-upgrade.timer`）；跑綜合就緒檢查，通過後才安裝並啟用 Gateway 單元。只有綜合就緒檢查通過，安裝才會回報成功。
+接著依序：確認服務帳號沒有任何程序；發布已驗證的更新信任根、世代與固定路徑程式；建立服務帳號、目錄與服務單元（包含 Gateway 單元，但還不設為開機啟動）；依簽章政策寫入對外連線與 DNS 設定。然後依照開機時相同的順序啟動服務：各個 socket 與 spawnd、一致性檢查（spawnd 已開放）、egress、Gateway，最後是更新服務。安裝程式會等到更新服務回報已安裝的版本（最多 2 分鐘），以及 spawnd 回報所有就緒檢查都通過（最多 2 分半）；spawnd 若未在時限內就緒，訊息會列出還沒通過的檢查。之後啟用每晚更新 timer（`duduclaw-auto-upgrade.timer`），跑綜合就緒檢查，通過後才把 Gateway 設為開機自動啟動。只有完整的就緒檢查在 Gateway 執行中通過，安裝才會回報成功。
 
 **續接：** 進度記錄在 `/var/lib/duduclaw-protected/isolation-bootstrap.json`。安裝中斷時（錯誤、重開機、斷電），修正畫面上的原因後再執行同一個 `duduclaw-bootstrap install` 命令，會從第一個未完成的步驟繼續。續接時可以省略選項；給了不同的值會被拒絕。換成另一個安裝包會被拒絕，要先回退。安裝未完成前，`service install`、`upgrade`、`uninstall --protected-linux` 都會被拒絕。
 

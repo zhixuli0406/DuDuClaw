@@ -1364,7 +1364,8 @@ reads nothing under `/run/duduclaw-isolation-evidence`.
 - **Per-employee effect.** The refresh's and start-up recovery's walk over all
   accounts (`Registry::verify`) used to fail as a whole when one account's SSH
   check failed, turning off registry/account/SSH/cron/IAM readiness for the
-  host (and a failed start-up reconcile is never re-evaluated). Those walks
+  host (and a failed start-up reconcile was never re-evaluated; see "Start
+  order" below for its retry). Those walks
   now only request probes. An account's probe result is required at that
   employee's admission (`Core::ready`); "pending" is answered `NotReady`.
 - **Allocation.** A new account waits (bounded, 85 s) for its own probe.
@@ -1383,6 +1384,54 @@ reads nothing under `/run/duduclaw-isolation-evidence`.
   on Ubuntu 24.04 refuses the key, exit 3). A mail spool under `/var/mail` or
   `/var/spool/mail` after useradd refuses the account, which is rolled back
   like any other post-create failure.
+
+### R7d: start order equals boot order
+
+The fresh install never completed on a real host: four start-order waits
+could not be satisfied. The installer's start order is now the boot order, and
+nothing waits on a unit that starts later.
+
+- **Why.** The updater answers `client::probe` only after its recovery
+  (`recover_committed`), which reads the live `duduclaw-gateway.service`,
+  `duduclaw-egress.service` and `duduclaw-spawnd.service` back (loaded, active,
+  signed executable). spawnd's start-up reconciliation needs the updater's
+  committed generation (the publication anchors). Gateway and egress are bound
+  to the consistency gate `duduclaw-isolation-ready.service`, which opens when
+  spawnd is open (its update status is `consistent`), not when every readiness
+  check passed. On a normal boot the gateway therefore already starts before
+  full readiness. spawnd's resource check loads the gateway unit, so that unit
+  file must exist before spawnd starts.
+- **spawnd: start-up reconciliation retries** (`crates/duduclaw-spawnd/src/host.rs`,
+  `StartupReconcile`). The first attempt runs when the host opens. While it has
+  never succeeded in this process and the core is not poisoned, the readiness
+  refresh tries again at most every 2 s; the first success latches and is never
+  repeated. A poisoned core is never recovered by a retry. Each retry first asks
+  the updater (the publication anchors, read-only) and returns without any side
+  effect while it does not answer; then the same reconciliation runs. Repeating
+  it is safe: no run can exist (admission needs `startup_reconciled`), and
+  `Allocate` is refused `NotReady` until the latch, because a retry tombstones
+  every `Reserved` row as abandoned.
+- **Installer S4** also writes the gateway unit, its recovery bound and the
+  launcher (ledgered; rollback removes them). Not enabled, not started.
+- **Installer S6** (`service_starts`, asserted as data): `enable --now` the
+  egress, DNS broker (broker route only), parse and spawnd sockets and
+  `duduclaw-spawnd.service`; start the gate; `enable --now`
+  `duduclaw-egress.service`; `start` (not enable) the gateway, 60 s; `enable
+  --now` `duduclaw-updated.service`, then wait up to 120 s for it to report the
+  installed generation (a unit in `failed`, start-limit hits included, refuses
+  at once with the journal command; it is never restarted in a loop); wait up
+  to 150 s for spawnd's full evidence (reconcile retry 2 s, self-test up to
+  40 s, DNS probe retry 5 s within egress's 10 s lookup window); on timeout the
+  refusal names each readiness field still false; then the nightly timer. The
+  gateway's data snapshot, the root key's intent and its confirmation move with
+  the gateway's first start from S8 to S6. A resumed S6 repeats every entry:
+  started units stay as they are and only the waits run again.
+- **Installer S8** confirms the root key's ledger entry, `systemctl enable`s the
+  gateway, confirms it is active and runs the full readiness check. S9 always
+  runs the full check. `--enable-now` is accepted for compatibility and has no
+  effect.
+- **Installation receipt.** The S6 refusal for the never-produced installation
+  receipt (`require_installation_receipt`) is removed.
 
 ### Validation and remaining acceptance
 

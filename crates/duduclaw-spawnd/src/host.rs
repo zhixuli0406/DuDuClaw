@@ -230,6 +230,32 @@ struct Core {
     probe_schedule: probe::ProbeSchedule,
     /// Round 3 (N4): the published report's recording gate, readable without the view lock.
     recording_gate: crate::host_state::RecordingGate,
+    /// C2: the start-up reconciliation latch (retried by `refresh`).
+    startup: StartupReconcile,
+}
+/// C2: the cadence of start-up reconciliation retries.
+const STARTUP_RETRY: Duration = Duration::from_secs(2);
+/// C2: start-up reconciliation needs the updater's committed generation (the
+/// publication anchors), and the updater answers only once the gateway and
+/// egress run, which start after this process is open. The first attempt runs
+/// in `LinuxHost::open`; while it has never succeeded in this process and the
+/// core is not poisoned, `Core::refresh` attempts again at most once every
+/// `STARTUP_RETRY`. The first success latches: it is never run again. A
+/// poisoned core never recovers by retry.
+#[derive(Clone, Copy, Debug)]
+struct StartupReconcile { latched: bool, last_attempt: Instant }
+impl StartupReconcile {
+    fn opened(at: Instant, reconciled: bool) -> Self { Self { latched: reconciled, last_attempt: at } }
+    fn due(&self, now: Instant, poisoned: bool) -> bool {
+        !self.latched && !poisoned && now.saturating_duration_since(self.last_attempt) >= STARTUP_RETRY
+    }
+    /// Runs `attempt` when due; true exactly when this call latched success.
+    fn retry(&mut self, now: Instant, poisoned: bool, attempt: impl FnOnce() -> bool) -> bool {
+        if !self.due(now, poisoned) { return false; }
+        self.last_attempt = now;
+        self.latched = attempt();
+        self.latched
+    }
 }
 impl LinuxHost {
     pub fn open(gateway: (u32, u32), components: Components, audit: AuditWorker) -> io::Result<Self> {
@@ -252,11 +278,15 @@ impl LinuxHost {
             components, policy: None, report: EvidenceReport::current(Readiness::default(), 0)?, gateway,
             monitor, runs: BTreeMap::new(), audit, last_refresh: Instant::now(), poisoned: false, view: view.clone(),
             helper_events: Vec::new(), recording_probe: probe::RecordingProbe::default(),
-            probe_schedule: probe::ProbeSchedule::default(), recording_gate: recording_gate.clone() };
+            probe_schedule: probe::ProbeSchedule::default(), recording_gate: recording_gate.clone(),
+            startup: StartupReconcile::opened(Instant::now(), false) };
         core.report.publish(gateway.1)?;
         // Cleanup is attempted even when C/H/F/G are absent. Failure is evidence,
         // never permission to skip an orphan or reinterpret a stale reservation.
-        core.report.checks.startup_reconciled = core.reconcile().is_ok();
+        // C2: a failure is retried by `refresh` (`StartupReconcile`).
+        let reconciled = core.reconcile().is_ok();
+        core.startup = StartupReconcile::opened(Instant::now(), reconciled);
+        core.report.checks.startup_reconciled = reconciled;
         // H4: anchors for allocations made before H3 (idempotent, audited).
         core.backfill_anchors();
         let snapshots = core.components.publication.snapshot_authority(gateway.0)
@@ -305,8 +335,24 @@ impl Core {
         for run in runs { os(self.journal.remove(run))?; }
         Ok(())
     }
+    /// C2 retry of `reconcile`. The updater's answer (the committed generation
+    /// behind the publication anchors, read-only) is asked FIRST: while it does
+    /// not answer, return before any side effect. Then the same `reconcile` as
+    /// at start-up; repeating it is safe because no run exists in this process
+    /// yet (admission needs `startup_reconciled`: `Core::ready` →
+    /// `Readiness::check`) and no reservation of this process exists either
+    /// (`Host::allocation` refuses `Allocate` until the latch).
+    fn retry_reconcile(&mut self) -> Result<()> {
+        self.components.publication.anchors()?;
+        self.reconcile()
+    }
     fn refresh(&mut self) {
         let probe_started = crate::host_state::boottime_ms().unwrap_or(0);
+        let mut startup = self.startup;
+        if startup.retry(Instant::now(), self.poisoned, || self.retry_reconcile().is_ok()) {
+            self.report.checks.startup_reconciled = true;
+        }
+        self.startup = startup;
         let startup_reconciled = self.report.checks.startup_reconciled && !self.poisoned;
         let mut checks = Readiness { startup_reconciled, ..Readiness::default() };
         // R7c: host-wide checks of every account (namespace, lockdown, cron/at,
@@ -510,6 +556,12 @@ impl Host for Core {
         -> std::result::Result<duduclaw_migration::allocation::Reply, duduclaw_migration::allocation::ErrorCode> {
         use duduclaw_migration::allocation::ErrorCode as Wire;
         if self.poisoned { return Err(Wire::IsolationUnavailable); }
+        // C2: a reservation made before start-up reconciliation latched would
+        // be tombstoned as abandoned by the next attempt
+        // (`RegistryStore::reconcile`); allocating waits for the latch.
+        if request.action == duduclaw_migration::allocation::Action::Allocate && !self.startup.latched {
+            return Err(Wire::NotReady);
+        }
         // F6l: the idle readback (S14/S17) of a Ready subject, read in this
         // worker turn; every source readable or an error (never zero).
         let idle = self.allocator.subject(request).map(|employee| self.employee_idle(employee));

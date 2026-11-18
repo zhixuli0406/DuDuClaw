@@ -13,17 +13,17 @@ v1.83.0 以降、新しいホストへの保護インストールは、独立し
 1. root でダウンロード用ディレクトリを作成します：`install -d -m 0700 -o root -g root /root/duduclaw-migrate`。
 2. 次のファイルをファイルとしてこのディレクトリに保存します：`duduclaw-bootstrap`、`duduclaw-isolated-linux-<アーキテクチャ>-<バージョン>.tar` とその `.minisig`、`.authorization.json`、`.authorization.json.signatures.json`、およびチーム版ライセンス `license.json`（root 所有で、グループとその他のユーザーが書き込めないもの）。
 3. 公式サイトとライセンスコンソールで公開されている値と `sha256sum -c` で照合します。両方が一致している必要があります。
-4. `sudo /root/duduclaw-migrate/duduclaw-bootstrap install [--dns-upstream <IP:53>] [--host-public-address <IP>]... [--enable-now]` を実行します。
+4. `sudo /root/duduclaw-migrate/duduclaw-bootstrap install [--dns-upstream <IP:53>] [--host-public-address <IP>]...` を実行します。インストーラーが gateway を自分で起動し、起動時の自動起動も設定します。
 
 | オプション | 意味 |
 | --- | --- |
 | `--dns-upstream <IP:53>` | systemd-resolved のないホストでのみ使用：専用 DNS 転送サービスの唯一の上流。systemd-resolved がある場合は拒否されます。このアドレスは社員の外部接続ルールには追加されません。 |
 | `--host-public-address <IP>` | ネットワークインターフェースにないこのホストの公開アドレス（クラウドの 1:1 NAT）。複数指定可、最大 64 個。社員はこのアドレスに接続できません。 |
-| `--enable-now` | 最後に gateway を起動し、完全な準備検査を実行します。指定しない場合、gateway は自動起動の設定だけ行い、すぐには起動しません。 |
+| `--enable-now` | 不要になり、効果もありません：インストーラーは常に gateway を実行中のままにします。既存のスクリプトがそのまま動くよう引き続き受け付け、指定された場合は 1 行の案内を表示します。 |
 
 インストーラーは何かを変更する前にホストを検査し、不合格の項目をまとめて表示します：Ubuntu 22.04、Ubuntu 24.04 または Debian 12、systemd 249 以上、カーネル 5.15 以上、cgroup v2、`/var/lib` が ext4 または XFS、`/etc/login.defs` に `SYS_UID_MAX`／`SYS_GID_MAX` が明示されていること、70000〜99999 にアカウント・グループ・subordinate ID の範囲がないこと、sshd のメイン設定が `/etc/ssh/sshd_config.d/*.conf` を読み込むこと、`cron.allow`／`at.allow` が DuDuClaw のアカウントを許可していないこと、十分な空き容量、有効なチーム版ライセンス、以前の DuDuClaw のインストールがないこと。外部アカウントサービス（LDAP、SSSD など）を使うホストは、このインストーラーではサポートしていません。
 
-続いて、サービスアカウントのプロセスがないことを確認し、検証済みの更新信頼ルート・世代・固定パスのプログラムを配置し、サービスアカウント・ディレクトリ・サービスユニットを作成し、署名済みポリシーから外部接続と DNS の設定を書き込み、spawnd・egress・文書解析ソケット・更新サービスを起動し、夜間更新タイマー（`duduclaw-auto-upgrade.timer`）を有効にし、総合準備検査を実行して、合格した後にだけ gateway のユニットを導入・有効化します。総合準備検査に合格した場合にのみ、インストールは成功を報告します。
+続いて、サービスアカウントのプロセスがないことを確認し、検証済みの更新信頼ルート・世代・固定パスのプログラムを配置し、サービスアカウント・ディレクトリ・サービスユニットを作成し、署名済みポリシーから外部接続と DNS の設定を書き込みます（gateway のユニットもこの段階で配置しますが、まだ有効化しません）。次に、起動時と同じ順序でサービスを起動します：各ソケットと spawnd、整合性ゲート（spawnd が開いた状態）、egress、gateway、最後に更新サービス。更新サービスがインストールしたバージョンを報告するまで（最大 2 分）、spawnd がすべての準備検査の合格を報告するまで（最大 2 分 30 秒）待ちます。spawnd が時間内に準備できない場合、メッセージにまだ合格していない検査が表示されます。その後、夜間更新タイマー（`duduclaw-auto-upgrade.timer`）を有効にし、総合準備検査を実行して、合格した後にだけ gateway の自動起動を有効化します。gateway の実行中に完全な準備検査に合格した場合にのみ、インストールは成功を報告します。
 
 **再開：** 進捗は `/var/lib/duduclaw-protected/isolation-bootstrap.json` に記録されます。インストールが中断した場合（エラー、再起動、停電）は、表示された原因を直してから同じ `duduclaw-bootstrap install` コマンドをもう一度実行すると、最初の未完了の手順から続行します。再開時はオプションを省略できます。異なる値は拒否されます。別のインストールパッケージはロールバックするまで拒否されます。インストールが未完了の間、`service install`、`upgrade`、`uninstall --protected-linux` は拒否されます。
 

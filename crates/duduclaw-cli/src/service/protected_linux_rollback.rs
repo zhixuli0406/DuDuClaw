@@ -14,7 +14,8 @@
 //! `/var/lib/duduclaw-spawnd`, `/var/log/duduclaw-spawnd`, `/usr/lib/duduclaw`,
 //! `/usr/libexec/duduclaw`, `/var/lib/duduclaw-migrate`, `/run/duduclaw-spawnd`),
 //! directories it created (only when empty afterwards), and in the gateway's
-//! data directory only what appeared after its S8 snapshot. Anything else at a
+//! data directory only what appeared after its snapshot, taken at S6 right
+//! before the gateway's first start. Anything else at a
 //! ledgered path is kept and listed; the rollback then ends incomplete: the
 //! journal stays in the rollback state and the same command finishes it once
 //! the administrator resolved the listed paths. Units are stopped through the
@@ -656,7 +657,8 @@ fn settle(parent: &fs::File, name: &CStr, entry: &Entry, quarantine: &CStr, insi
     Ok(Removal::Kept(kept))
 }
 
-/// The gateway's data written after its S8 snapshot (the account's own
+/// The gateway's data written after its snapshot (S6, before the gateway's
+/// first start; the account's own
 /// files, possibly sealed with the root key removed above). The directory and
 /// the snapshot's names (the license) stay.
 fn clear_contents(entry: &Entry, boot_id: &str) -> Result<bool> {

@@ -328,6 +328,22 @@ fn service_protected_readiness_launcher_receipt_record_is_strict() {
     assert!(LauncherReceiptRecord::parse(&padded).is_err());
 }
 
+/// C4: the bootstrap's S6 refusal names each false field in the composite's wording.
+#[test]
+fn unmet_host_checks_use_the_composite_wording() {
+    assert!(unmet_host_checks(&all_checks()).is_empty());
+    let mut checks = all_checks();
+    checks.startup_reconciled = false;
+    assert_eq!(unmet_host_checks(&checks), ["啟動時的執行紀錄對帳尚未完成。"]);
+    checks.landlock_self_test = false;
+    checks.protocol = 2;
+    assert_eq!(unmet_host_checks(&checks), [MSG_HOST_PROTOCOL, "啟動時的執行紀錄對帳尚未完成。", MSG_LANDLOCK]);
+    let primary: Vec<_> = host_checks(&HostChecks::default()).into_iter().map(|(_, _, message)| message).collect();
+    let mut expected = primary.clone();
+    expected.push(MSG_LANDLOCK);
+    assert_eq!(unmet_host_checks(&HostChecks::default()), expected);
+}
+
 #[test]
 fn service_protected_readiness_host_evidence_names_each_false_check() {
     type Flip = fn(&mut HostChecks);

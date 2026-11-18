@@ -861,7 +861,22 @@ spawnd reads no installer receipt (R7c removed the last reader of
 from spawnd's own self-test (R7a), the DNS route from its probe through egress
 (R7b), file owners from its own scan at allocation (R7b), SSH denial from the
 probe unit through PID 1 (R7c, above), and hosts with external NSS modules
-are refused (R7c). Root caches only a fully verified immutable F generation and its
+are refused (R7c). The installer no longer refuses at S6 for a missing receipt.
+
+R7d, start-up reconciliation retry (`host.rs`, `StartupReconcile`): the
+reconciliation needs F's committed generation (the publication anchors), and F
+answers only after its recovery reads the live gateway, egress and spawnd units
+back; those start after spawnd is open. The first attempt runs in
+`LinuxHost::open`. While it has never succeeded in this process and the core is
+not poisoned, `Core::refresh` attempts it again at most every 2 s; the first
+success latches and is never repeated, and a poisoned core is never recovered
+by a retry. A retry asks F first (the anchors, read-only) and returns before
+any side effect while F does not answer. Repeating the reconciliation is safe:
+no run exists while `startup_reconciled` is false (`Core::ready` →
+`Readiness::check`), and `Allocate` is answered `NotReady` until the latch,
+because `RegistryStore::reconcile` tombstones every `Reserved` row.
+
+Root caches only a fully verified immutable F generation and its
 manifest. Every consumption still makes an authenticated nonce probe and checks
 generation, product, exact binary version and all eight protocols; failed probes
 clear the cache, and generation changes trigger full artifact verification again.

@@ -391,6 +391,17 @@ fn host_checks(checks: &HostChecks) -> [(bool, &'static str, &'static str); 13] 
     ]
 }
 
+/// The administrator text of every primary check `checks` still reports
+/// false, in the composite's wording ([`host_checks`], and #5's Landlock and
+/// the protocol line). Used by the bootstrap's S6 refusal (C4).
+pub(super) fn unmet_host_checks(checks: &HostChecks) -> Vec<&'static str> {
+    let mut unmet = Vec::new();
+    if checks.protocol != duduclaw_isolation::ipc::PROTOCOL_VERSION { unmet.push(MSG_HOST_PROTOCOL); }
+    unmet.extend(host_checks(checks).into_iter().filter(|(passed, _, _)| !passed).map(|(_, _, message)| message));
+    if !checks.landlock_self_test { unmet.push(MSG_LANDLOCK); }
+    unmet
+}
+
 // #4 and #5. Returns the evidence for #6's informational second layer.
 fn host_findings(sources: &mut dyn HostSources, out: &mut Vec<Finding>) -> Option<HostEvidence> {
     let evidence = match sources.host_evidence() {
@@ -932,7 +943,8 @@ fn units() -> Result<()> {
 }
 
 /// Every layout unit file as installed, and every isolation service active;
-/// the gateway unit is not part of it (it starts after the platform is ready).
+/// the gateway unit is not part of it (the bootstrap starts it at S6 and
+/// enables it at S8, after this check).
 /// The R7a self-test unit's bytes are checked with the others, but it is never
 /// required active (a `RemainAfterExit=no` oneshot spawnd starts; inactive after its run).
 fn platform_units() -> Result<()> {
@@ -952,8 +964,8 @@ fn platform_units() -> Result<()> {
 }
 
 /// The bootstrap's step S7 (plan §4.3): the composite check before the
-/// gateway is started. Identical to [`check`] except that the gateway unit
-/// itself is not yet required to be active; every other group and every
+/// gateway is enabled. Identical to [`check`] except that the gateway unit
+/// itself is not required to be active; every other group and every
 /// composite item must pass. Prints the same fixed lines.
 pub(super) fn check_platform(composite: &mut impl CompositeReadiness) -> Result<()> {
     let results = [("執行檔", binaries()), ("服務帳號", accounts()),
@@ -967,7 +979,7 @@ pub(super) fn check_platform(composite: &mut impl CompositeReadiness) -> Result<
     for line in lines { println!("{line}"); }
     failed += composite_failed;
     if failed != 0 {
-        return Err(refused(format!("{failed} 項就緒檢查未通過；尚未啟動 Gateway。修正後請再執行同一個安裝命令續接。")));
+        return Err(refused(format!("{failed} 項就緒檢查未通過；Gateway 尚未設為開機自動啟動。修正後請再執行同一個安裝命令續接。")));
     }
     Ok(())
 }

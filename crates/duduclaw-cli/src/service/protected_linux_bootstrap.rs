@@ -100,14 +100,21 @@ pub(super) const EGRESS_MAX_RUNS: u16 = 32;
 pub(super) const EGRESS_RUN_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 pub(super) const EGRESS_RUN_TOTAL_CONNECTIONS: u32 = 4096;
 pub(super) const MAX_HOST_PUBLIC_ADDRESSES: usize = 64;
-/// Isolation services in start order (plan S6); the broker socket only on the broker route.
-const SERVICE_ORDER: [&str; 7] = ["duduclaw-egress.socket", "duduclaw-dns-broker.socket", "duduclaw-parse.socket",
-    "duduclaw-spawnd.socket", "duduclaw-spawnd.service", "duduclaw-egress.service", "duduclaw-updated.service"];
+/// The units S6 starts, in start order, which is the boot order (plan S6,
+/// [`service_starts`]): the sockets and spawnd, egress, the gateway (started,
+/// enabled only at S8) and the updater, whose recovery reads the live gateway,
+/// egress and spawnd units back before it answers. The broker socket only on
+/// the broker route; the consistency gate right after spawnd.
+const SERVICE_ORDER: [&str; 8] = ["duduclaw-egress.socket", "duduclaw-dns-broker.socket", "duduclaw-parse.socket",
+    "duduclaw-spawnd.socket", SPAWND_SERVICE, "duduclaw-egress.service", UNIT, UPDATER_UNIT];
+const SPAWND_SERVICE: &str = "duduclaw-spawnd.service";
+const UPDATER_UNIT: &str = "duduclaw-updated.service";
 /// The units the isolated gateway unit binds to
 /// (`duduclaw_isolation::ids::ISOLATED_GATEWAY_UNIT_DEPENDENCIES`): R6's
 /// consistency gate, a `layout::UNITS` oneshot (`RemainAfterExit=yes`, so
 /// "active (exited)" is its healthy state) bound to spawnd. It has no
-/// `[Install]` and is NEVER enabled: spawnd pulls it in (`Wants=`). At S6 it is
+/// `[Install]` and is NEVER enabled: spawnd pulls it in (`Wants=`). It means
+/// "spawnd is open", not "every readiness check passed". At S6 it is
 /// started right after spawnd and required active before egress (which binds
 /// to it) starts; on resume it must be active (and `static`); the quiesce and
 /// rollback stop it right after the gateway, before spawnd. Never invent a unit here.
@@ -118,8 +125,6 @@ pub(super) const SPAWND_RUNTIME: &str = "/run/duduclaw-spawnd";
 const TRUST_TREES: [&str; 3] = ["/opt/duduclaw-isolated", "/etc/duduclaw-updated", "/var/lib/duduclaw-updated"];
 /// The trees of `layout::DIRECTORIES` created at S4(c).
 const LAYOUT_TREES: [&str; 3] = ["/var/lib/duduclaw-spawnd", "/var/log/duduclaw-spawnd", "/var/lib/duduclaw-migrate"];
-/// spawnd's root installation receipt (`duduclaw-spawnd` installed.rs, `RECEIPTS`/`installation.json`).
-const INSTALLATION_RECEIPT: &str = "/run/duduclaw-isolation-evidence/installation.json";
 const MACHINE_ID: &str = "/etc/machine-id";
 /// `/sys/class/dmi/id/product_uuid` (`/sys/class/dmi/id` is a link to this
 /// canonical sysfs directory; links are never followed). Absent without DMI.
@@ -130,6 +135,18 @@ pub(super) const JOURNAL_SCHEMA: u16 = 2;
 /// Review H1: bound of spawnd's root host publication as this installer reads it.
 const MAX_PUBLICATION_BYTES: u64 = 64 * 1024;
 const READY_WAIT: Duration = Duration::from_secs(30);
+/// S6: the bound of the gateway's first start (S8's bound before C1).
+const GATEWAY_START_WAIT: Duration = Duration::from_secs(60);
+/// S6 (C1): the bound of the updater's first answer after its start. Before
+/// it answers, its recovery drains spawnd (up to 30 s) and reads the live
+/// gateway, egress and spawnd units back.
+const UPDATER_ANSWER_WAIT: Duration = Duration::from_secs(120);
+/// S6 (C2/C4): the bound of spawnd's full host evidence once the updater
+/// answers. Budget: start-up reconciliation retries every 2 s until the
+/// updater answers; the R7a self-test (it needs the updater's generation)
+/// takes up to 40 s; the DNS probe retries every 5 s and egress's lookup
+/// window is 10 s; the rest is margin for the per-account SSH probes.
+const SPAWND_EVIDENCE_WAIT: Duration = Duration::from_secs(150);
 /// Review R3 item 6 / round 4 item 4: ONE absolute deadline for the whole
 /// quiesce (enumerate, stop, wait, process scan, re-check); every command and
 /// every lookup of the process scan gets `min(QUIESCE_COMMAND_CAP, what is
@@ -236,7 +253,8 @@ const LICENSE_MODE: &str = "團隊版授權檔 license.json 的權限必須是 0
 const IDENTITY_ALIAS: &str = "服務帳號或群組的識別碼與其他帳號或群組重複、帶有額外成員，或帳號資料無法完整列出；其他帳號會因此取得相同的檔案權限，已停止。請先移除重複的帳號或群組。";
 const STORAGE_THIN: &str = "/var/lib 位於精簡配置（thin provisioning）、快照或快取的區塊裝置上；員工儲存空間需要預先配置的磁碟。";
 const STORAGE_UNDETERMINED: &str = "無法確定 /var/lib 的完整底層區塊裝置鏈（或含有不支援的裝置類型），無法證明它不是精簡配置的儲存。";
-const RECEIPT_PRODUCER_MISSING: &str = "隔離執行服務需要 root 量測收據 /run/duduclaw-isolation-evidence/installation.json（員工帳號 SSH 實測、trampoline 自我測試、DNS 實測），但這個版本沒有產生它的正式程式，設計也尚未決定由誰產生。安裝停在 S6，尚未啟動任何隔離服務；可以執行 duduclaw-bootstrap rollback 回退，或聯絡原廠。";
+/// `--enable-now` is accepted for compatibility only.
+const ENABLE_NOW_INERT: &str = "[資訊] 已不需要 --enable-now：安裝程式現在一定會啟動 Gateway。";
 
 // ── Journal ───────────────────────────────────────────────────────────────
 
@@ -263,7 +281,7 @@ impl Step {
         match self {
             Step::Verified => "驗證暫存的安裝包", Step::HostPreflight => "主機預檢", Step::StopGateway => "確認 Gateway 未執行",
             Step::ProcessesClear => "確認服務帳號沒有程序", Step::PublishPlatform => "發布隔離平台",
-            Step::DnsPolicy => "DNS 與對外連線設定", Step::StartServices => "啟動隔離服務",
+            Step::DnsPolicy => "DNS 與對外連線設定", Step::StartServices => "啟動隔離服務與 Gateway",
             Step::Readiness => "綜合就緒檢查", Step::StartGateway => "啟用 Gateway", Step::Commit => "提交",
             Step::Rollback => "回退",
         }
@@ -630,7 +648,8 @@ pub(super) fn print_fresh_install_instructions() {
     println!("1. 以 root 建立下載目錄：sudo install -d -m 0700 -o root -g root /root/duduclaw-migrate");
     println!("2. 從官網下載 duduclaw-bootstrap、duduclaw-isolated-linux-<架構>-<版本>.tar 與它的 .minisig、.authorization.json、.authorization.json.signatures.json，存成檔案放進該目錄；團隊版授權檔 license.json 也放進同一個目錄。");
     println!("3. 以 sha256sum -c 比對官網與授權 console 公布的 SHA-256，兩處必須一致。");
-    println!("4. 執行：sudo /root/duduclaw-migrate/duduclaw-bootstrap install [--dns-upstream <IP:53>] [--host-public-address <IP>] [--enable-now]");
+    println!("4. 執行：sudo /root/duduclaw-migrate/duduclaw-bootstrap install [--dns-upstream <IP:53>] [--host-public-address <IP>]");
+    println!("   安裝程式會啟動 Gateway 並設為開機自動啟動，不需要再加 --enable-now。");
 }
 
 // ── Continue options ──────────────────────────────────────────────────────
@@ -645,6 +664,8 @@ pub(crate) struct ContinueOptions {
     generation_hex: String,
     dns_upstream: Option<SocketAddr>,
     host_public_addresses: Vec<IpAddr>,
+    /// `--enable-now`: accepted for compatibility, no effect (the install
+    /// always leaves the gateway running); only [`ENABLE_NOW_INERT`] is printed.
     enable_now: bool,
 }
 
@@ -722,7 +743,6 @@ struct Context {
     generation: Sha256Digest,
     generation_hex: String,
     stage: StageReceipt,
-    enable_now: bool,
     /// Review F4: this transaction's creation ledger.
     recorder: LiveRecorder,
 }
@@ -761,6 +781,7 @@ fn continue_with(options: ContinueOptions, verify_self: bool) -> Result<()> {
         Mode::Upgrade => return Err(refused(UPGRADE_NOT_HERE)),
         Mode::Install => (),
     }
+    if options.enable_now { println!("{ENABLE_NOW_INERT}"); }
     if let Some(journal) = &journal {
         if journal.step == Step::Rollback {
             println!("上一次的回退尚未完成，現在繼續完成回退；完成後請重新執行 duduclaw-bootstrap install。");
@@ -796,7 +817,7 @@ fn continue_with(options: ContinueOptions, verify_self: bool) -> Result<()> {
     println!("[完成] S1 {}", Step::HostPreflight.label());
     let recorder = LiveRecorder::open_live(&options.generation_hex, &journal.nonce)?;
     let mut context = Context { generation: options.generation, generation_hex: options.generation_hex.clone(),
-        stage, enable_now: options.enable_now, recorder };
+        stage, recorder };
     let dns = journal.dns.clone();
     // S3's check after this transaction started its isolation services (S6
     // entered) admits their own processes (`processes_quiet`).
@@ -818,9 +839,6 @@ fn continue_with(options: ContinueOptions, verify_self: bool) -> Result<()> {
         eprintln!("警告：無法清除暫存的安裝包或安裝建立紀錄；安裝已完成，不影響運作。");
     }
     println!("員工隔離的受保護安裝已完成。");
-    if !context.enable_now {
-        println!("Gateway 已啟用但尚未啟動。啟動：sudo systemctl start {UNIT}，之後請執行 sudo duduclaw service readiness --protected-linux。");
-    }
     Ok(())
 }
 
@@ -1339,8 +1357,8 @@ fn claimed_complete(journal: &Journal) -> Option<Step> {
 /// against a state that no longer holds). S2/S3 are pure checks, so re-running
 /// them refuses rather than changes anything; S4–S8 are idempotent.
 ///
-/// Review H2 / R3 item 1: S2/S3 hold while the gateway this transaction
-/// published at S8 and the isolation services it started at S6 run. When
+/// Review H2 / R3 item 1: S2/S3 hold while the gateway (unit files published
+/// at S4) and the isolation services this transaction started at S6 run. When
 /// any step of S4–S7 is about to re-run, the gateway and every isolation unit
 /// this installation owns are quiesced FIRST (each stopped only when its unit
 /// is provably ours) and the full S3 process check must pass; only then do
@@ -1649,11 +1667,12 @@ fn perform(step: Step, context: &mut Context, dns: &Dns, services_started: bool)
 /// Review F1: the read-only invariants of each step on the real host.
 fn invariants(step: Step, context: &Context, dns: &Dns, services_started: bool) -> Result<()> {
     match step {
-        // A gateway may run only as the one this transaction published at S8
-        // (and is quiesced before any S4–S7 step re-runs, review H2).
-        Step::StopGateway => with_version_lock(|| if gateway_not_running().is_ok() { Ok(()) } else { gateway_published(context) }),
+        // A gateway may run only as the one whose unit files this transaction
+        // published at S4 (S6 starts it, S8 enables it; it is quiesced before
+        // any S4–S7 step re-runs, review H2).
+        Step::StopGateway => with_version_lock(|| if gateway_not_running().is_ok() { Ok(()) } else { gateway_ours(context) }),
         Step::ProcessesClear => with_version_lock(|| {
-            if gateway_active() && gateway_published(context).is_ok() { Ok(()) } else { processes_quiet(services_started) }
+            if gateway_active() && gateway_ours(context).is_ok() { Ok(()) } else { processes_quiet(services_started) }
         }),
         Step::PublishPlatform => with_version_lock(|| platform_published(context)),
         Step::DnsPolicy => with_version_lock(|| dns_readback(context, dns)),
@@ -2468,7 +2487,24 @@ fn publish_platform(context: &mut Context) -> Result<()> {
         verify_identities(&service_names())?;
         spawnd_anchors(digest)?;
         // (d) The nightly update requester: files only; enabled at S6 (Q11).
-        nightly_files(recorder)
+        nightly_files(recorder)?;
+        // (e) C3: the gateway unit files; neither enabled nor started here.
+        gateway_unit_files(recorder)
+    })
+}
+
+/// C3: spawnd's resource check loads `duduclaw-gateway.service`, so its unit
+/// file, the recovery bound and the launcher are published at S4, written
+/// exactly as S8 wrote them before (review R3 item 4: recorded only as the
+/// files these writes prove they created; rollback removes them). Neither
+/// enabled nor started: S6 starts the gateway, S8 enables it.
+fn gateway_unit_files(recorder: &mut LiveRecorder) -> Result<()> {
+    let text = duduclaw_core::root_key::recovery::isolated_unit_text();
+    recorder.record(&[(UNIT_PATH, Kind::File), (RECOVERY_BOUND, Kind::File), (LAUNCHER, Kind::File)], || {
+        invalidate_recovery_bound()?;
+        update_text_if_different(UNIT_PATH, 0o644, &text)?;
+        update_text_if_different(LAUNCHER, 0o755, LAUNCHER_TEXT)?;
+        reload_and_certify_recovery_text(&text)
     })
 }
 
@@ -2997,28 +3033,42 @@ fn wait_for(deadline: Duration, mut ready: impl FnMut() -> bool) -> bool {
     }
 }
 
-fn enable_now(unit: &str) -> Result<()> {
+fn enable_now(unit: &str, bound: Duration) -> Result<()> {
     let output = command("systemctl", &["enable", "--now", unit])?;
-    if !output.status.success() { return Err(refused(format!("無法啟動 {unit}。"))); }
-    if !wait_for(READY_WAIT, || readiness::unit_loaded_active(unit).is_ok()) {
+    if !output.status.success() {
+        if let Some(result) = unit_failed_result(unit) { return Err(updater_failed(unit, &result)); }
+        return Err(refused(format!("無法啟動 {unit}。")));
+    }
+    if !wait_for(bound, || readiness::unit_loaded_active(unit).is_ok()) {
+        if let Some(result) = unit_failed_result(unit) { return Err(updater_failed(unit, &result)); }
         return Err(refused(format!("{unit} 未在時限內進入執行狀態，或含有未驗證的覆寫設定。")));
     }
     Ok(())
 }
 
-/// Review F5: spawnd admits work only with a fresh root installation receipt
-/// at [`INSTALLATION_RECEIPT`] (`duduclaw-spawnd` installed.rs). The design
-/// and plan define no production producer of it (spawnd README "I1 round 3":
-/// a root-harness receipt this tree does not implement), so a host without
-/// one stops here, before any isolation service starts, with a fixed message
-/// instead of a 30-second evidence timeout. The consumer is unchanged; a
-/// present receipt is still validated only by spawnd.
-fn require_installation_receipt() -> Result<()> {
-    match fs::symlink_metadata(INSTALLATION_RECEIPT) {
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(refused(RECEIPT_PRODUCER_MISSING)),
-        Err(error) => Err(error.into()),
-    }
+/// The update service's `Result=` when PID 1 reports it `failed` (start-limit
+/// hits included); `None` for any other unit, state or unreadable answer.
+fn unit_failed_result(unit: &str) -> Option<String> {
+    if unit != UPDATER_UNIT { return None; }
+    let output = command("systemctl", &["show", unit, "--property=ActiveState,Result"]).ok()?;
+    if !output.status.success() { return None; }
+    failed_result(std::str::from_utf8(&output.stdout).ok()?).map(str::to_owned)
+}
+
+/// Pure: `Result=` of a `systemctl show --property=ActiveState,Result` answer
+/// whose `ActiveState` is `failed`.
+pub(super) fn failed_result(show: &str) -> Option<&str> {
+    let value = |key: &str| show.lines().find_map(|line| line.strip_prefix(key));
+    if value("ActiveState=")? != "failed" { return None; }
+    let result = value("Result=")?;
+    if !state_word(result) { return None; }
+    Some(result)
+}
+
+/// The update service is in `failed` state: never restarted in a loop here.
+pub(super) fn updater_failed(unit: &str, result: &str) -> DuDuClawError {
+    let cause = if result == "start-limit-hit" { "：短時間內重新啟動太多次，systemd 已停止再啟動它（start-limit-hit）" } else { "" };
+    refused(format!("{unit} 已停在失敗狀態（{result}）{cause}。安裝程式不會一直重新啟動它。請先執行 sudo journalctl -b -u {unit} 查看原因，修正後執行 sudo systemctl reset-failed {unit}，再以同一個 duduclaw-bootstrap install 命令續接。"))
 }
 
 /// Review R3 item 4 (pure): `systemctl show <socket> --property=Listen` names a
@@ -3175,15 +3225,68 @@ pub(super) fn confirm_components_for_rollback(ledger: ledger::Ledger) -> Result<
     Ok(recorder.ledger().clone())
 }
 
-/// The units S6 starts, in order (the broker socket only on the broker route);
-/// the consistency gate ([`GATEWAY_READY_UNITS`]) right after spawnd, before
-/// egress, which binds to it.
+/// What S6 does to one unit ([`service_starts`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum StartAction {
+    /// `systemctl enable --now`.
+    EnableNow,
+    /// The consistency gate: `systemctl start --no-block`, never enabled ([`start_gate`]).
+    Gate,
+    /// `systemctl start` only (the gateway: S8 enables it).
+    Start,
+    /// Nothing is started: only the wait (the unit was started earlier in the list).
+    Await,
+}
+
+/// What S6 waits for after a [`StartAction`], with its bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum StartWait {
+    /// Loaded from its fragment and active ([`readiness::unit_loaded_active`]).
+    Active(Duration),
+    /// The update service answers with this install's generation ([`updater_reports`]).
+    UpdaterGeneration(Duration),
+    /// spawnd publishes valid, complete host evidence ([`spawnd_evidence_valid`]).
+    SpawndEvidence(Duration),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ServiceStart { pub(super) unit: &'static str, pub(super) action: StartAction, pub(super) wait: StartWait }
+
+/// S6 as data (C1–C4): the start order equals the boot order, and nothing
+/// waits on a unit that starts later. The sockets and spawnd; the
+/// consistency gate ("spawnd is open"); egress; the gateway (started only;
+/// S8 enables it); the updater, then its first answer (its recovery reads the
+/// live gateway, egress and spawnd units back); then spawnd's full evidence
+/// (its start-up reconciliation needs the updater); last the nightly timer.
+/// The broker socket only on the broker route.
+pub(super) fn service_starts(dns: &Dns) -> Vec<ServiceStart> {
+    let mut plan = Vec::new();
+    for unit in SERVICE_ORDER {
+        if unit == "duduclaw-dns-broker.socket" && dns.route != DnsRoute::DedicatedDnsBroker { continue; }
+        plan.push(if unit == UNIT {
+            ServiceStart { unit, action: StartAction::Start, wait: StartWait::Active(GATEWAY_START_WAIT) }
+        } else {
+            ServiceStart { unit, action: StartAction::EnableNow, wait: StartWait::Active(READY_WAIT) }
+        });
+        if unit == SPAWND_SERVICE {
+            plan.extend(GATEWAY_READY_UNITS.iter().copied().map(|gate|
+                ServiceStart { unit: gate, action: StartAction::Gate, wait: StartWait::Active(READY_WAIT) }));
+        }
+        if unit == UPDATER_UNIT {
+            plan.push(ServiceStart { unit, action: StartAction::Await, wait: StartWait::UpdaterGeneration(UPDATER_ANSWER_WAIT) });
+        }
+    }
+    plan.push(ServiceStart { unit: SPAWND_SERVICE, action: StartAction::Await, wait: StartWait::SpawndEvidence(SPAWND_EVIDENCE_WAIT) });
+    plan.push(ServiceStart { unit: NIGHTLY_TIMER, action: StartAction::EnableNow, wait: StartWait::Active(READY_WAIT) });
+    plan
+}
+
+/// The units S6 starts, in order (every [`service_starts`] entry that starts
+/// a unit, except the nightly timer); the gateway among them.
 fn started_units(dns: &Dns) -> Vec<&'static str> {
-    SERVICE_ORDER.iter().copied()
-        .filter(|unit| *unit != "duduclaw-dns-broker.socket" || dns.route == DnsRoute::DedicatedDnsBroker)
-        .flat_map(|unit| std::iter::once(unit).chain(GATEWAY_READY_UNITS.iter().copied()
-            .filter(move |_| unit == "duduclaw-spawnd.service")))
-        .collect()
+    service_starts(dns).into_iter()
+        .filter(|start| start.action != StartAction::Await && start.unit != NIGHTLY_TIMER)
+        .map(|start| start.unit).collect()
 }
 
 /// Enabled (or static, for units without `[Install]`); the consistency gate
@@ -3203,10 +3306,10 @@ fn unit_enabled(unit: &str) -> Result<()> {
 /// normally queued it already) and without waiting on the job (its start has
 /// no timeout), then required "active (exited)" from its fragment within the
 /// same bound as every other unit.
-fn start_gate(unit: &str) -> Result<()> {
+fn start_gate(unit: &str, bound: Duration) -> Result<()> {
     let output = command("systemctl", &["start", "--no-block", unit])?;
     if !output.status.success() { return Err(refused(format!("無法啟動 {unit}。"))); }
-    if !wait_for(READY_WAIT, || readiness::unit_loaded_active(unit).is_ok()) {
+    if !wait_for(bound, || readiness::unit_loaded_active(unit).is_ok()) {
         return Err(refused(format!("{unit} 未在時限內確認隔離元件一致，或含有未驗證的覆寫設定。")));
     }
     Ok(())
@@ -3221,8 +3324,93 @@ fn updater_reports(generation: Sha256Digest) -> bool {
     duduclaw_updated::client::probe(nonce).is_ok_and(|evidence| evidence.generation == generation)
 }
 
+/// C2/C4: the S6 refusal when spawnd's evidence did not become valid within
+/// `bound`: the readiness fields still false in the published report
+/// (`checks`; `None`: unreadable), in the readiness check's wording.
+pub(super) fn evidence_timeout(bound: Duration, checks: Option<&duduclaw_spawnd::readiness::Readiness>) -> String {
+    let seconds = bound.as_secs();
+    let Some(checks) = checks else {
+        return format!("隔離執行服務未在 {seconds} 秒內發布有效的主機證據，目前的主機證據也無法讀取。");
+    };
+    let unmet = readiness::unmet_host_checks(checks);
+    if unmet.is_empty() {
+        format!("隔離執行服務未在 {seconds} 秒內發布有效的主機證據：各項檢查都已通過，但證據已過期、屬於其他開機或資源數量不符。")
+    } else {
+        format!("隔離執行服務未在 {seconds} 秒內發布有效的主機證據，仍未通過的項目：{}", unmet.join(""))
+    }
+}
+
+/// S6 step "spawnd's full evidence" ([`StartWait::SpawndEvidence`]).
+fn await_spawnd_evidence(gid: u32, bound: Duration) -> Result<()> {
+    if wait_for(bound, || spawnd_evidence_valid(gid)) { return Ok(()); }
+    let checks = duduclaw_spawnd::host::EvidenceReport::read(gid).ok().map(|report| report.checks);
+    Err(refused(evidence_timeout(bound, checks.as_ref())))
+}
+
+/// S6 step "the updater's first answer" ([`StartWait::UpdaterGeneration`]).
+/// A unit PID 1 reports `failed` (start-limit hits included) refuses at once.
+fn await_updater(unit: &str, generation: Sha256Digest, bound: Duration) -> Result<()> {
+    let end = Instant::now() + bound;
+    loop {
+        if updater_reports(generation) { return Ok(()); }
+        if let Some(result) = unit_failed_result(unit) { return Err(updater_failed(unit, &result)); }
+        if Instant::now() >= end {
+            return Err(refused(format!("更新服務未在 {} 秒內回報與安裝相同的世代。", bound.as_secs())));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// S6 step "the gateway" (C1): its first start. Review F4: before it can
+/// first start, the names its data directory holds (the license) are
+/// recorded; rollback keeps exactly those. The gateway's launcher creates the
+/// root key at its first start, so the key's durable intent and window come
+/// right before this start and its confirmation right after it, exactly as
+/// S8 did before. Never enabled here (S8 enables it).
+fn first_gateway_start(context: &mut Context, bound: Duration) -> Result<()> {
+    let gateway = passwd_entry("duduclaw")?.ok_or_else(|| refused("無法查詢服務帳號。"))?;
+    let (data, _) = open_gateway_data(Some((gateway.uid, gateway.gid)))?;
+    let keep = directory_names(&data, 64)?.into_iter()
+        .map(|name| name.into_string().map_err(|_| refused("Gateway 資料目錄含有無法辨識的名稱。")))
+        .collect::<Result<Vec<_>>>()?;
+    context.recorder.contents(ledger::GATEWAY_DATA_PATH, keep)?;
+    // Review round 6 item 1: a root key the launcher created in an interrupted
+    // run before it was confirmed is confirmed now (or the step refuses).
+    resume_component(&mut context.recorder, duduclaw_core::root_key::KEY_PATH, context.generation)?;
+    context.recorder.intend(&[(duduclaw_core::root_key::KEY_PATH, Kind::File)])?;
+    // Review round 4 item 2: the window of the root key opens before the launcher starts.
+    let window = ledger::window_start();
+    let output = command("systemctl", &["start", UNIT])?;
+    if !output.status.success() { return Err(refused(format!("無法啟動 {UNIT}。"))); }
+    let started = wait_for(bound, || readiness::unit_loaded_active(UNIT).is_ok());
+    // Review R3 item 4: the gateway's launcher created it, not this
+    // installer: recorded only as a root-owned 0600 single-link regular
+    // file on the protected root's mount, absent at the durable intent
+    // made before this start (review round 5 item 5), while PID 1 loads
+    // this install's ledgered, unmodified gateway
+    // unit. Review round 4 item 2: otherwise the step fails.
+    let key = duduclaw_core::root_key::KEY_PATH;
+    let owner = live_unit_is_ours(context.recorder.ledger(), UNIT, Instant::now() + QUIESCE_COMMAND_CAP);
+    let absent = context.recorder.absent_at_intent(key);
+    let confirmed = context.recorder.confirm_component(key,
+        |identity| Ok(root_key_proven(identity, &component_facts(key, absent, window), owner)));
+    if !started { return Err(refused("Gateway 未在時限內進入執行狀態。")); }
+    confirmed
+}
+
+/// One [`service_starts`] entry.
+fn run_start(context: &mut Context, start: ServiceStart, gid: u32) -> Result<()> {
+    match (start.action, start.wait) {
+        (StartAction::EnableNow, StartWait::Active(bound)) => enable_now(start.unit, bound),
+        (StartAction::Gate, StartWait::Active(bound)) => start_gate(start.unit, bound),
+        (StartAction::Start, StartWait::Active(bound)) if start.unit == UNIT => first_gateway_start(context, bound),
+        (StartAction::Await, StartWait::UpdaterGeneration(bound)) => await_updater(start.unit, context.generation, bound),
+        (StartAction::Await, StartWait::SpawndEvidence(bound)) => await_spawnd_evidence(gid, bound),
+        _ => Err(refused(SYSTEMCTL_FAILED)),
+    }
+}
+
 fn start_services(context: &mut Context, dns: &Dns) -> Result<()> {
-    require_installation_receipt()?;
     // Review F6: volatile host conditions, right before the services first use them.
     services_preconditions(dns)?;
     // Review F2, check point 3 for the helper accounts: before they first run.
@@ -3235,19 +3423,14 @@ fn start_services(context: &mut Context, dns: &Dns) -> Result<()> {
     resume_component(&mut context.recorder, SPAWND_RUNTIME, context.generation)?;
     // systemd creates spawnd's runtime directory: ledgered before it can exist.
     context.recorder.intend(&[(SPAWND_RUNTIME, Kind::Tree)])?;
-    let generation = context.generation;
     // Review round 4 item 2: the window of the runtime directory opens before the socket starts.
     let window = ledger::window_start();
+    // A resumed S6 repeats every entry: a unit already started stays as it
+    // is and only its wait is repeated.
+    let (plan, timer): (Vec<ServiceStart>, Vec<ServiceStart>) =
+        service_starts(dns).into_iter().partition(|start| start.unit != NIGHTLY_TIMER);
     let started = (|| -> Result<()> {
-        for unit in started_units(dns) {
-            if GATEWAY_READY_UNITS.contains(&unit) { start_gate(unit)?; } else { enable_now(unit)?; }
-            if unit == "duduclaw-spawnd.service" && !wait_for(READY_WAIT, || spawnd_evidence_valid(gateway.gid)) {
-                return Err(refused("隔離執行服務未在 30 秒內發布有效的主機證據。"));
-            }
-            if unit == "duduclaw-updated.service" && !wait_for(READY_WAIT, || updater_reports(generation)) {
-                return Err(refused("更新服務未在 30 秒內回報與安裝相同的世代。"));
-            }
-        }
+        for start in plan { run_start(context, start, gateway.gid)?; }
         Ok(())
     })();
     // Review R3 item 4: systemd created it, not this installer. Recorded (also
@@ -3263,7 +3446,8 @@ fn start_services(context: &mut Context, dns: &Dns) -> Result<()> {
     started?;
     confirmed?;
     // Q11: the nightly update requester is enabled after install.
-    enable_now(NIGHTLY_TIMER)
+    for start in timer { run_start(context, start, gateway.gid)?; }
+    Ok(())
 }
 
 // ── Resume invariants (review F1) ─────────────────────────────────────────
@@ -3326,23 +3510,30 @@ fn platform_published(context: &Context) -> Result<()> {
     if !publication_holds(&spawnd_root_fd()?, (0, 0), context.generation) { return Err(mismatch()); }
     text_installed(NIGHTLY_HELPER, 0o755, NIGHTLY_HELPER_TEXT)?;
     for (name, text) in NIGHTLY_UNITS { text_installed(&unit_file(name), 0o644, text)?; }
+    // C3: the gateway unit files are S4's now (unexpected bytes do not hold).
+    gateway_files()?;
     // A creation whose identity was never recorded (interrupted) does not
     // hold; the re-run's intent then refuses it by path (review H3: never adopted).
+    // The objects S6's producers create (spawnd's runtime directory, the
+    // gateway's root key) are confirmed by S6 itself (`resume_component`).
     for entry in &context.recorder.ledger().entries {
-        if entry.state == ledger::State::Intent && ledger::present(&entry.path)? && entry.path != duduclaw_core::root_key::KEY_PATH {
+        if entry.state == ledger::State::Intent && ledger::present(&entry.path)?
+            && entry.path != duduclaw_core::root_key::KEY_PATH && entry.path != SPAWND_RUNTIME {
             return Err(mismatch());
         }
     }
     Ok(())
 }
 
-/// S6's invariants: every started unit loaded from its fragment, active and
-/// enabled (the consistency gate: "active (exited)" and `static`); the helper identities unaliased; spawnd's evidence valid; the
-/// update service reports THIS generation.
+/// S6's invariants: every started unit loaded from its fragment and active;
+/// enabled (the consistency gate: "active (exited)" and `static`) except the
+/// gateway, which S8 enables; the helper identities unaliased; spawnd's
+/// evidence valid; the update service reports THIS generation.
 fn services_running(context: &Context, dns: &Dns) -> Result<()> {
     for unit in started_units(dns).into_iter().chain(std::iter::once(NIGHTLY_TIMER)) {
         readiness::unit_loaded_active(unit)?;
-        unit_enabled(unit)?;
+        // S6 only starts the gateway; S8 enables it.
+        if unit != UNIT { unit_enabled(unit)?; }
     }
     verify_identities(&service_names())?;
     let gateway = passwd_entry("duduclaw")?.ok_or_else(|| refused("無法查詢服務帳號。"))?;
@@ -3352,82 +3543,62 @@ fn services_running(context: &Context, dns: &Dns) -> Result<()> {
     Ok(())
 }
 
-/// S8's invariants: the gateway unit, its recovery bound and launcher exactly
-/// as published, the unit enabled, and active when `--enable-now` was asked.
-fn gateway_published(context: &Context) -> Result<()> {
+/// The gateway unit, its recovery bound and launcher exactly as S4 publishes them.
+fn gateway_files() -> Result<()> {
     let text = duduclaw_core::root_key::recovery::isolated_unit_text();
     text_installed(UNIT_PATH, 0o644, &text)?;
     text_installed(RECOVERY_BOUND, 0o644, &text)?;
-    text_installed(LAUNCHER, 0o755, LAUNCHER_TEXT)?;
+    text_installed(LAUNCHER, 0o755, LAUNCHER_TEXT)
+}
+
+/// S2/S3 (review H2): a running gateway is this transaction's — its unit
+/// files exactly as S4 published them, and PID 1 loads that ledgered,
+/// unmodified unit.
+fn gateway_ours(context: &Context) -> Result<()> {
+    gateway_files()?;
+    if !live_unit_is_ours(context.recorder.ledger(), UNIT, Instant::now() + QUIESCE_COMMAND_CAP) {
+        return Err(refused(PUBLISHED_MISMATCH));
+    }
+    Ok(())
+}
+
+/// S8's invariants: the gateway unit files exactly as published, the unit
+/// enabled and active, and its root key confirmed (not left an intent).
+fn gateway_published(context: &Context) -> Result<()> {
+    gateway_files()?;
     unit_enabled(UNIT)?;
-    if context.enable_now { readiness::unit_loaded_active(UNIT)?; }
+    readiness::unit_loaded_active(UNIT)?;
+    let key = context.recorder.ledger().entry(duduclaw_core::root_key::KEY_PATH);
+    if !key.is_some_and(|entry| entry.state == ledger::State::Created) { return Err(refused(PUBLISHED_MISMATCH)); }
     Ok(())
 }
 
 // ── S8 StartGateway / S9 Commit ───────────────────────────────────────────
 
+/// Plan S8. The unit files are S4's and the first start is S6's (C1); what
+/// stays here: the root key's ledger entry confirmed (a key S6's interrupted
+/// run left unconfirmed is confirmed now, or the step refuses), the unit
+/// enabled, the gateway confirmed active, and the full readiness check.
 fn start_gateway(context: &mut Context) -> Result<()> {
-    let text = duduclaw_core::root_key::recovery::isolated_unit_text();
-    let recorder = &mut context.recorder;
-    // Review R3 item 4: recorded only as the files these writes prove they created.
-    recorder.record(&[(UNIT_PATH, Kind::File), (RECOVERY_BOUND, Kind::File), (LAUNCHER, Kind::File)], || {
-        invalidate_recovery_bound()?;
-        update_text_if_different(UNIT_PATH, 0o644, &text)?;
-        update_text_if_different(LAUNCHER, 0o755, LAUNCHER_TEXT)?;
-        reload_and_certify_recovery_text(&text)
-    })?;
-    // Review F4: before the gateway can first start, the names its data
-    // directory holds (the license) are recorded; rollback keeps exactly those.
-    let gateway = passwd_entry("duduclaw")?.ok_or_else(|| refused("無法查詢服務帳號。"))?;
-    let (data, _) = open_gateway_data(Some((gateway.uid, gateway.gid)))?;
-    let keep = directory_names(&data, 64)?.into_iter()
-        .map(|name| name.into_string().map_err(|_| refused("Gateway 資料目錄含有無法辨識的名稱。")))
-        .collect::<Result<Vec<_>>>()?;
-    recorder.contents(ledger::GATEWAY_DATA_PATH, keep)?;
-    // Review round 6 item 1: a root key the launcher created in an interrupted
-    // run before it was confirmed is confirmed now (or the step refuses).
-    resume_component(recorder, duduclaw_core::root_key::KEY_PATH, context.generation)?;
-    // The gateway's launcher creates the root key at its first start.
-    recorder.intend(&[(duduclaw_core::root_key::KEY_PATH, Kind::File)])?;
+    resume_component(&mut context.recorder, duduclaw_core::root_key::KEY_PATH, context.generation)?;
+    let key = context.recorder.ledger().entry(duduclaw_core::root_key::KEY_PATH);
+    if !key.is_some_and(|entry| entry.state == ledger::State::Created) {
+        return Err(refused(format!("Gateway 的 root 金鑰 {} 尚未確認是這次安裝建立的。", duduclaw_core::root_key::KEY_PATH)));
+    }
     let output = command("systemctl", &["enable", UNIT])?;
     if !output.status.success() { return Err(refused(format!("無法啟用 {UNIT}。"))); }
-    if context.enable_now {
-        // Review round 4 item 2: the window of the root key opens before the launcher starts.
-        let window = ledger::window_start();
-        let output = command("systemctl", &["start", UNIT])?;
-        if !output.status.success() { return Err(refused(format!("無法啟動 {UNIT}。"))); }
-        let started = wait_for(Duration::from_secs(60), || readiness::unit_loaded_active(UNIT).is_ok());
-        // Review R3 item 4: the gateway's launcher created it, not this
-        // installer: recorded only as a root-owned 0600 single-link regular
-        // file on the protected root's mount, absent at the durable intent
-        // made before this start (review round 5 item 5), while PID 1 loads
-        // this install's ledgered, unmodified gateway
-        // unit. Review round 4 item 2: otherwise the step fails.
-        let key = duduclaw_core::root_key::KEY_PATH;
-        let owner = live_unit_is_ours(context.recorder.ledger(), UNIT, Instant::now() + QUIESCE_COMMAND_CAP);
-        let absent = context.recorder.absent_at_intent(key);
-        let confirmed = context.recorder.confirm_component(key,
-            |identity| Ok(root_key_proven(identity, &component_facts(key, absent, window), owner)));
-        if !started { return Err(refused("Gateway 未在時限內進入執行狀態。")); }
-        confirmed?;
-        // The install reports success only when the full check passes.
-        readiness::check(&mut readiness::InstalledComposite)?;
-    }
-    Ok(())
+    readiness::unit_loaded_active(UNIT).map_err(|_| refused("Gateway 沒有在執行。"))?;
+    // The install reports success only when the full check passes.
+    readiness::check(&mut readiness::InstalledComposite)
 }
 
 /// Plan S9. Review F1: never on the journal's word — S8's invariants, the
-/// service identities and the readiness check must pass in this same run
-/// (the full check when the gateway runs; otherwise the platform check, the
-/// full check minus the gateway being active), then the floor is recorded.
+/// service identities and the full readiness check must pass in this same
+/// run (the gateway runs: S6 started it), then the floor is recorded.
 fn commit(context: &mut Context) -> Result<()> {
     gateway_published(context)?;
     verify_identities(&service_names())?;
-    if context.enable_now || gateway_active() {
-        readiness::check(&mut readiness::InstalledComposite)?;
-    } else {
-        readiness::check_platform(&mut readiness::InstalledComposite)?;
-    }
+    readiness::check(&mut readiness::InstalledComposite)?;
     let manifest = readiness::authenticated_manifest(context.generation)?;
     let version = duduclaw_updated::version_text(manifest.version);
     context.recorder.record(&[(VERSION_FLOOR, Kind::File)], || record_floor(&version))
@@ -4474,6 +4645,167 @@ gshadow:        files\nhosts:          files mdns4_minimal [NOTFOUND=return] dns
         assert!(!order.iter().any(|unit| unit.starts_with("duduclaw-isolation-probe@")));
     }
 
+    /// C1–C4: S6 as data. The start order is the boot order and nothing
+    /// waits on a unit that starts later.
+    #[test]
+    fn s6_starts_in_boot_order_and_never_waits_on_a_later_unit() {
+        use duduclaw_isolation::ids::ISOLATION_READY_UNIT;
+        let entry = |unit: &'static str, action, wait| ServiceStart { unit, action, wait };
+        let active = StartWait::Active(READY_WAIT);
+        let broker = vec![
+            entry("duduclaw-egress.socket", StartAction::EnableNow, active),
+            entry("duduclaw-dns-broker.socket", StartAction::EnableNow, active),
+            entry("duduclaw-parse.socket", StartAction::EnableNow, active),
+            entry("duduclaw-spawnd.socket", StartAction::EnableNow, active),
+            entry(SPAWND_SERVICE, StartAction::EnableNow, active),
+            entry(ISOLATION_READY_UNIT, StartAction::Gate, active),
+            entry("duduclaw-egress.service", StartAction::EnableNow, active),
+            entry(UNIT, StartAction::Start, StartWait::Active(GATEWAY_START_WAIT)),
+            entry(UPDATER_UNIT, StartAction::EnableNow, active),
+            entry(UPDATER_UNIT, StartAction::Await, StartWait::UpdaterGeneration(UPDATER_ANSWER_WAIT)),
+            entry(SPAWND_SERVICE, StartAction::Await, StartWait::SpawndEvidence(SPAWND_EVIDENCE_WAIT)),
+            entry(NIGHTLY_TIMER, StartAction::EnableNow, active),
+        ];
+        assert_eq!(service_starts(&broker_dns()), broker);
+        let resolved = Dns { route: DnsRoute::ResolvedVarlink, upstream: None, host_public_addresses: Vec::new() };
+        let without_broker: Vec<_> = broker.iter().copied().filter(|start| start.unit != "duduclaw-dns-broker.socket").collect();
+        assert_eq!(service_starts(&resolved), without_broker);
+        for dns in [broker_dns(), resolved] {
+            let plan = service_starts(&dns);
+            let started_at = |unit: &str| plan.iter().position(|start| start.unit == unit && start.action != StartAction::Await).unwrap();
+            let waits_at = |wait: StartWait| plan.iter().position(|start| start.wait == wait).unwrap();
+            // Every wait-only entry waits on a unit started before it.
+            for (index, start) in plan.iter().enumerate() {
+                if start.action == StartAction::Await { assert!(started_at(start.unit) < index, "{start:?}"); }
+            }
+            // C1: the updater's recovery reads the live gateway, egress and
+            // spawnd back, so all of them are started before its answer is awaited.
+            let updater = waits_at(StartWait::UpdaterGeneration(UPDATER_ANSWER_WAIT));
+            for unit in [SPAWND_SERVICE, "duduclaw-egress.service", UNIT, UPDATER_UNIT] { assert!(started_at(unit) < updater, "{unit}"); }
+            // C2/C4: spawnd's full evidence only after the updater answered (and egress runs).
+            assert!(updater < waits_at(StartWait::SpawndEvidence(SPAWND_EVIDENCE_WAIT)));
+            // The gate ("spawnd is open") before egress, egress before the gateway.
+            assert_eq!(started_at(ISOLATION_READY_UNIT), started_at(SPAWND_SERVICE) + 1);
+            assert!(started_at("duduclaw-egress.service") < started_at(UNIT));
+            assert_eq!(plan.last().map(|start| start.unit), Some(NIGHTLY_TIMER));
+            // `started_units` (S6's resume check, the quiesce's coverage) is the started part; the gateway is in it.
+            let started: Vec<&str> = plan.iter().filter(|start| start.action != StartAction::Await && start.unit != NIGHTLY_TIMER)
+                .map(|start| start.unit).collect();
+            assert_eq!(started_units(&dns), started);
+            assert!(started.contains(&UNIT));
+            // Every started unit is stopped by the rollback/quiesce, the gateway first.
+            let order = super::super::rollback::stop_order();
+            assert_eq!(order[0], UNIT);
+            for unit in &started { assert!(order.contains(unit), "{unit}"); }
+        }
+        assert_eq!((GATEWAY_START_WAIT, UPDATER_ANSWER_WAIT, SPAWND_EVIDENCE_WAIT),
+            (Duration::from_secs(60), Duration::from_secs(120), Duration::from_secs(150)));
+    }
+
+    /// C3: the gateway unit files are written at S4 (ledgered, removed by
+    /// rollback), the gateway is started at S6 and enabled only at S8.
+    #[test]
+    fn gateway_unit_is_written_at_s4_started_at_s6_and_enabled_only_at_s8() {
+        let source = include_str!("protected_linux_bootstrap.rs");
+        let body = |signature: &str| -> &str {
+            let start = source.find(signature).unwrap_or_else(|| panic!("{signature}"));
+            let rest = &source[start..];
+            &rest[..rest.find("\n}\n").unwrap()]
+        };
+        assert!(body("fn publish_platform(").contains("gateway_unit_files(recorder)"));
+        let files = body("fn gateway_unit_files(");
+        for item in ["(UNIT_PATH, Kind::File)", "(RECOVERY_BOUND, Kind::File)", "(LAUNCHER, Kind::File)",
+            "invalidate_recovery_bound()", "update_text_if_different(UNIT_PATH, 0o644, &text)",
+            "update_text_if_different(LAUNCHER, 0o755, LAUNCHER_TEXT)", "reload_and_certify_recovery_text(&text)"] {
+            assert!(files.contains(item), "{item}");
+        }
+        assert!(!files.contains("\"enable\"") && !files.contains("\"start\""));
+        let first = body("fn first_gateway_start(");
+        assert!(first.contains("&[\"start\", UNIT]") && !first.contains("\"enable\""));
+        let s8 = body("fn start_gateway(");
+        assert!(s8.contains("&[\"enable\", UNIT]"));
+        assert!(!s8.contains("\"start\"") && !s8.contains("update_text_if_different") && !s8.contains("intend("));
+        // Resume checks: S4 covers the gateway unit files, S8 the enabled unit.
+        assert!(body("fn platform_published(").contains("gateway_files()?"));
+        assert!(body("fn gateway_published(").contains("unit_enabled(UNIT)?"));
+        // S6 never enables it (data).
+        for dns in [broker_dns(), Dns { route: DnsRoute::ResolvedVarlink, upstream: None, host_public_addresses: Vec::new() }] {
+            let gateway: Vec<_> = service_starts(&dns).into_iter().filter(|start| start.unit == UNIT).collect();
+            assert_eq!(gateway, [ServiceStart { unit: UNIT, action: StartAction::Start, wait: StartWait::Active(GATEWAY_START_WAIT) }]);
+        }
+        // Rollback removes what S4 ledgered.
+        let ledgered = super::super::rollback::ledger_files();
+        for path in [UNIT_PATH, RECOVERY_BOUND, LAUNCHER] { assert!(ledgered.iter().any(|file| file == path), "{path}"); }
+    }
+
+    /// C4: the S6 timeout names the readiness fields still false.
+    #[test]
+    fn s6_evidence_timeout_names_the_false_fields() {
+        let mut checks = duduclaw_spawnd::readiness::Readiness { protocol: duduclaw_isolation::ipc::PROTOCOL_VERSION,
+            registry_verified: true, accounts_locked: true, ssh_live_negative_checks: true, cron_at_acl_and_jobs_verified: true,
+            external_iam_reservation_verified: true, trampoline_verified: true, landlock_self_test: true, namespace_self_test: true,
+            egress_verified: true, dns_route_verified: true, storage_verified: true, resources_verified: true,
+            startup_reconciled: true, process_scan_verified: true,
+            egress_second_layer: duduclaw_spawnd::readiness::EgressSecondLayer::Unavailable };
+        assert!(readiness::unmet_host_checks(&checks).is_empty());
+        let passed = evidence_timeout(SPAWND_EVIDENCE_WAIT, Some(&checks));
+        assert!(passed.contains("150 秒") && passed.contains("各項檢查都已通過"), "{passed}");
+        checks.startup_reconciled = false;
+        checks.dns_route_verified = false;
+        let named = evidence_timeout(SPAWND_EVIDENCE_WAIT, Some(&checks));
+        assert!(named.contains("啟動時的執行紀錄對帳尚未完成。") && named.contains("DNS 解析路徑未通過驗證。"), "{named}");
+        assert!(!named.contains("員工身分登錄未通過驗證。") && !named.contains("Landlock"), "{named}");
+        checks.landlock_self_test = false;
+        assert!(evidence_timeout(SPAWND_EVIDENCE_WAIT, Some(&checks)).contains("Landlock"));
+        // Nothing true: every field (13 primary checks and Landlock) is named.
+        let none = duduclaw_spawnd::readiness::Readiness::default();
+        let unmet = readiness::unmet_host_checks(&none);
+        assert_eq!(unmet.len(), 14);
+        let text = evidence_timeout(SPAWND_EVIDENCE_WAIT, Some(&none));
+        for message in unmet { assert!(text.contains(message), "{message}"); }
+        assert!(evidence_timeout(SPAWND_EVIDENCE_WAIT, None).contains("無法讀取"));
+    }
+
+    /// S6: an update service PID 1 reports `failed` is named, with the journal command; never restarted in a loop.
+    #[test]
+    fn failed_updater_is_reported_with_its_journal_command() {
+        assert_eq!(failed_result("ActiveState=failed\nResult=start-limit-hit\n"), Some("start-limit-hit"));
+        assert_eq!(failed_result("Result=exit-code\nActiveState=failed\n"), Some("exit-code"));
+        assert_eq!(failed_result("ActiveState=active\nResult=success\n"), None);
+        assert_eq!(failed_result("ActiveState=activating\nResult=success\n"), None);
+        assert_eq!(failed_result("ActiveState=failed\nResult=Bad value\n"), None);
+        assert_eq!(failed_result("ActiveState=failed\n"), None);
+        let message = updater_failed(UPDATER_UNIT, "start-limit-hit").to_string();
+        for part in ["start-limit-hit", "短時間內重新啟動太多次", "sudo journalctl -b -u duduclaw-updated.service",
+            "sudo systemctl reset-failed duduclaw-updated.service", "不會一直重新啟動"] {
+            assert!(message.contains(part), "{part}: {message}");
+        }
+        assert!(!updater_failed(UPDATER_UNIT, "exit-code").to_string().contains("短時間內"));
+        // The wait loop refuses on `failed` instead of starting the unit again.
+        let source = include_str!("protected_linux_bootstrap.rs");
+        let start = source.find("fn await_updater(").unwrap();
+        let rest = &source[start..];
+        let body = &rest[..rest.find("\n}\n").unwrap()];
+        assert!(body.contains("unit_failed_result(unit)") && !body.contains("systemctl"));
+    }
+
+    /// `--enable-now` is accepted (compat) and has no effect beyond one notice.
+    #[test]
+    fn enable_now_is_accepted_and_inert() {
+        let args = |mode: &str, enable_now| super::super::super::BootstrapContinueArgs { mode: mode.into(),
+            generation: "ab".repeat(32), dns_upstream: None, host_public_address: Vec::new(), enable_now };
+        assert!(ContinueOptions::from_args(args("install", true)).unwrap().enable_now);
+        assert!(!ContinueOptions::from_args(args("install", false)).unwrap().enable_now);
+        // Outside an install it stays refused, as before.
+        assert!(ContinueOptions::from_args(args("rollback", true)).is_err());
+        assert!(ENABLE_NOW_INERT.contains("--enable-now"));
+        let source = include_str!("protected_linux_bootstrap.rs");
+        let production = &source[..source.find("#[cfg(test)]\nmod tests").unwrap()];
+        assert!(production.contains("if options.enable_now { println!(\"{ENABLE_NOW_INERT}\"); }"));
+        assert!(!production.contains("context.enable_now"));
+        assert_eq!(production.matches("options.enable_now").count(), 1, "read only for the notice");
+    }
+
     #[test]
     fn transient_runs_and_slices_must_be_transient_under_the_employees_slice() {
         let invocation = "00112233445566778899aabbccddeeff";
@@ -5110,9 +5442,7 @@ duduclaw-dl:x:987:\nduduclaw-dns:x:986:\nduduclaw-selftest:x:985:\nsudo:x:27:ali
     // ISO_BOOTSTRAP_GENERATION; a TEAM test license in /root/duduclaw-migrate;
     // a supported distribution with systemd-resolved (or ISO_DNS_UPSTREAM).
     // The test binary is not the staged gateway, so `verify_self` is off.
-    // Tests that pass S6 also need a root harness renewing
-    // /run/duduclaw-isolation-evidence/installation.json (review F5: no
-    // production producer exists; without it S6 refuses with a fixed message).
+    // `options("install", …)` passes `--enable-now`, which is accepted and inert.
 
     fn disposable_generation() -> String {
         assert_eq!(unsafe { libc::geteuid() }, 0, "requires root");
@@ -5149,6 +5479,9 @@ duduclaw-dl:x:987:\nduduclaw-dns:x:986:\nduduclaw-selftest:x:985:\nsudo:x:27:ali
         assert!(readiness::read_launcher_receipt().unwrap().is_some());
         assert_eq!(fs::read_to_string(UNIT_PATH).unwrap(), duduclaw_core::root_key::recovery::isolated_unit_text());
         readiness::unit_loaded_active(NIGHTLY_TIMER).unwrap();
+        // The gateway runs and is enabled without `--enable-now` mattering.
+        readiness::unit_loaded_active(UNIT).unwrap();
+        unit_enabled(UNIT).unwrap();
         // A committed install refuses a second run and any rollback.
         assert!(continue_with(options("install", &generation), false).is_err());
         assert!(continue_with(rollback_options(&generation), false).is_err());
@@ -5256,7 +5589,7 @@ duduclaw-dl:x:987:\nduduclaw-dns:x:986:\nduduclaw-selftest:x:985:\nsudo:x:27:ali
                 assert!(after.committed);
                 readiness::check(&mut readiness::InstalledComposite).unwrap();
             }
-            // A re-run step refused (e.g. S6 without an installation receipt): never committed.
+            // A re-run step refused (e.g. S6's evidence wait timed out): never committed.
             Err(_) => assert!(!after.committed),
         }
     }
