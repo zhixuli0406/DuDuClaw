@@ -175,6 +175,27 @@ At the end of `service install --protected-linux` and `service upgrade --protect
 
 Migration copies only `.duduclaw` data, **not AI CLI installations or their login credentials**. When Claude is installed but the service account has no login, installation prints the service-account login command above. Authenticate that account separately; do not copy credentials from the operator's home. On gateway startup, a missing configured inference binary produces an ERROR with repair guidance; runtime status and doctor also show the protected-service instructions.
 
+## Model connection data for isolated employees
+
+An isolated employee that uses the OpenAI-compatible runtime reads its endpoints and API keys only from `/home/employee/.duduclaw-api/providers.json` in its own home; gateway accounts, configuration and environment variables are never used. The host administrator writes or removes this document as root:
+
+```sh
+sudo duduclaw service provider set --protected-linux --employee <employee-label> < providers.json
+sudo duduclaw service provider set --protected-linux --employee-id <32 lowercase hex digits> < providers.json
+sudo duduclaw service provider set --protected-linux --employee <employee-label> --clear
+```
+
+The document is read **from standard input only**: never from a command-line argument, an environment variable or a path. Running the command at a terminal without redirecting a file is refused with a hint showing the format. The limit is 65,536 bytes. Format:
+
+```json
+{"providers":[{"name":"main","api_key":"<key>","base_url":"https://provider.example/v1"}]}
+```
+
+- 1 to 32 providers with unique names; `base_url` must be https without user information, query or fragment; `protocol` (`chat_completions`, `responses`, `anthropic` or `gemini`) is optional. An invalid document is refused with a fixed message that never repeats its content.
+- The key is stored in **the employee's own home** (owned by the employee, mode 0600) and is readable by that employee's runtime. Use a key dedicated to this employee; never a gateway or shared account key.
+- With this command, every change needs host root (a dashboard input follows in a later release). The write happens only while no run is live on the host and the employee is not in use; otherwise try again later. Every run rewrites the file. Success shows only the employee, the number of providers, and each provider's name and `https://host[:port]`, never the key.
+- Remove the document with `--clear` (standard input is not read). Disabling the employee removes it as well; retiring the employee destroys it with the employee's storage.
+
 ## Upgrade and uninstall
 
 The separate updater cannot be installed yet (planned for a later release); current hosts upgrade as described in the single-binary section above. After migration and complete updater provisioning, an Admin requests a stable release in the dashboard or uses the installed CLI:

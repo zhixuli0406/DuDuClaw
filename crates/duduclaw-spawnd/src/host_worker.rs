@@ -30,9 +30,17 @@ pub trait Scan: Send {
     fn register(&mut self, run: RunHandle, employee: EmployeeId, startup_ms: u64) -> Result<()>;
     fn cancel(&mut self, run: RunHandle) -> Result<()>;
 }
-/// One allocation request and its reply slot (schema-2 codes, F6l).
-pub(crate) type AllocationWork = (duduclaw_migration::allocation::Request,
-    SyncSender<std::result::Result<duduclaw_migration::allocation::Reply, duduclaw_migration::allocation::ErrorCode>>);
+/// One allocation request and its reply slot (schema-2 codes, F6l), or
+/// R8r-2: one schema-5 `provision_providers`, moved (never cloned) so its
+/// payload is wiped wherever it is dropped.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) enum AllocationWork {
+    Allocation(duduclaw_migration::allocation::Request,
+        SyncSender<std::result::Result<duduclaw_migration::allocation::Reply, duduclaw_migration::allocation::ErrorCode>>),
+    Providers(Box<duduclaw_migration::allocation::providers::ProviderRequest>,
+        SyncSender<std::result::Result<duduclaw_migration::allocation::providers::Provisioned,
+            duduclaw_migration::allocation::providers::ProviderErrorCode>>),
+}
 pub struct WorkerHost {
     allocation_sender: SyncSender<AllocationWork>,
     sender: SyncSender<(Key, Work)>, receiver: Receiver<Completed>, slots: BTreeMap<Key, Slot>,
@@ -63,8 +71,10 @@ impl WorkerHost {
                 let _ = host.maintenance();
                 // HX4: helper ends/drains/closes, decided root-side during maintenance.
                 for event in host.helper_events() { let _ = helper_sender.send(event); }
-                if let Ok((request, reply)) = allocation_commands.try_recv() {
-                    let _ = reply.send(host.allocation(&request));
+                match allocation_commands.try_recv() {
+                    Ok(AllocationWork::Allocation(request, reply)) => { let _ = reply.send(host.allocation(&request)); },
+                    Ok(AllocationWork::Providers(request, reply)) => { let _ = reply.send(host.providers(request)); },
+                    Err(_) => {},
                 }
                 match commands.recv_timeout(Duration::from_millis(25)) {
                     Ok((key, Work::Broker(job))) => {

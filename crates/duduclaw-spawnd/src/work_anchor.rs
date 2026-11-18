@@ -171,6 +171,12 @@ impl Storage for AnchoredStorage {
     fn usage(&mut self, employee: EmployeeId) -> Result<StorageUsage> { self.inner.usage(employee) }
     fn attachments(&mut self) -> Result<Vec<Attachment>> { self.inner.attachments() }
     fn traces(&mut self) -> Result<Vec<EmployeeId>> { self.inner.traces() }
+    // R8r-2: the provider document and its maintenance are the image's.
+    fn write_providers(&mut self, employee: EmployeeId, uid: u32, change: crate::storage::ProvidersChange<'_>)
+        -> std::result::Result<(), crate::storage::ProvidersFailure> {
+        self.inner.write_providers(employee, uid, change)
+    }
+    fn recover_maintenance(&mut self) -> Result<()> { self.inner.recover_maintenance() }
     fn work_anchor(&mut self, employee: EmployeeId) -> Result<WorkAnchorIdentity> { self.anchors.read(employee) }
     fn backfill_work_anchor(&mut self, employee: EmployeeId) -> Result<bool> {
         match self.anchors.read(employee) {

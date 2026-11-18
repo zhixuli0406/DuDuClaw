@@ -18,6 +18,9 @@ chacha20poly1305 = "0.10"
 rand = "0.8"
 tempfile = "3"
 chrono.workspace = true
+# R8r-2: the schema-5 provider payload (an employee API key) lives in a
+# zeroizing buffer from decode to write (already in the workspace).
+zeroize.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { version = "1.1", features = ["fs", "process"] }

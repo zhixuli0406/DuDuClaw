@@ -1068,6 +1068,67 @@ cargo test -p duduclaw-spawnd installed::tests -- --test-threads=1
 cargo test -p duduclaw-spawnd iso_root_e2e_publication_receipt_mode_and_symlink_refusal -- --ignored --test-threads=1
 ```
 
+### R8r-2: `provision_providers` (allocation socket, schema 5)
+
+The sandboxed OpenAI-compatible runtime reads its endpoints and API keys only
+from `/home/employee/.duduclaw-api/providers.json` in the employee's own home
+(the `home/` directory of its storage image). Root writes that file on the
+allocation worker; root never reads it (`allocation.rs`, `providers_file.rs`,
+`storage/adapter.rs`).
+
+- **Wire.** Its own frame type, schema 5 only (`allocation/providers.rs` in
+  `duduclaw-migration`): `{schema: 5, nonce, action: "provision_providers",
+  item | employee_id | label, payload | clear: true}`. `payload` is opaque to
+  root (never parsed): base64, 1..=65,536 bytes decoded, held in a zeroizing
+  buffer from decode to write, never cloned or printed (`Debug` redacts; the
+  socket's receive buffer is wiped; the client serialises into a wiped,
+  non-reallocating buffer). Schemas 1–4 are byte-identical and cannot carry
+  the action, its fields or its codes. Codes: `not_allocated`, `not_ready`
+  (busy), `invalid_payload`, `home_entry_unsafe`, `storage_unavailable`,
+  `invalid_request`, `isolation_unavailable` (also the 4 s worker timeout:
+  send the same call again). Success: `{provisioned, updated_unix}` only.
+- **Peers (SO_PEERCRED).** The gateway (uid/gid as for every action), naming
+  the employee by its confirmation item exactly like the other actions; or
+  host root, uid 0 AND gid 0, for this action only, naming it by
+  `employee_id` (32 lowercase hex) or by the exact label of its allocation
+  journal entry (the journal records labels; only a label-holding entry
+  matches). Root's frames for any other action are dropped; any other peer is
+  refused at accept. The entry must be Ready and not disabled and match a
+  Ready registry row with the same employee and UID (the `Entitle` rule), else
+  `not_allocated`.
+- **When.** Only after start-up reconciliation latched, while no run is live
+  on the host and the employee has no lease, else `not_ready`.
+- **Write.** A durable maintenance marker (`storage-adapter.json`, the temp
+  file name only, no secret) is saved, then the image is attached exactly like
+  `provision` (noexec, never handed to a runtime) and the `home` directory is
+  verified (uid:uid 0700, the image's device). From that descriptor only
+  (openat2 beneath, no symlinks, no magic links, no mount crossing):
+  `.duduclaw-api` must be a directory owned by the employee, mode 0700, on the
+  same mount (anything else: `home_entry_unsafe`, nothing written) or is
+  created so; a new `.providers.json.tmp-<16 hex>` is created
+  (O_CREAT|O_EXCL|O_NOFOLLOW), checked regular with one link, written, made
+  0600 and the employee's, fsynced and renamed over `providers.json` (the old
+  target — a FIFO, a symlink, a hard link — is never opened; a directory there
+  is `home_entry_unsafe`); the directory is fsynced and the result's metadata
+  read back. Any failure removes the temp file; the image is always detached
+  and the marker cleared only after the detach succeeded. ENOSPC/EDQUOT is
+  `storage_unavailable`. `clear` unlinks the file (absent ⇒ success) and
+  removes `.duduclaw-api` only when empty. Every call rewrites.
+- **Recovery.** A marker left by a crash or a failed detach blocks storage
+  readiness and that employee's attach; start-up reconciliation (and that
+  employee's next maintenance) attaches, removes the recorded temp file,
+  detaches and only then clears the marker.
+- **Journal.** The allocation entry records only `providers: {provisioned,
+  updated_unix}` (no payload, no hash), on a Ready entry only. `Disable`
+  removes a provisioned document (the same safe unlink) before its state
+  change and clears the record with it; a crash in between repeats the unlink
+  on resume. `Retire` clears the record when it marks the entry Retiring (the
+  image, and the file in it, is destroyed later in the same retire).
+
+Host root command: `sudo duduclaw service provider set --protected-linux
+(--employee-id <hex> | --employee <label>) [--clear]` (document from standard
+input only).
+
 For an MCP-enabled installed runtime, the signed runtime record also requires
 `mcp_acceptance`. It binds exact runtime/version, runtime and bridge hashes, D's
 projection digest, fd 3, successful real-runtime initialization/parent exec/MCP

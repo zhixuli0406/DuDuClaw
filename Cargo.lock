@@ -1773,6 +1773,7 @@ dependencies = [
  "dialoguer",
  "dirs 6.0.0",
  "duduclaw-agent",
+ "duduclaw-api-worker",
  "duduclaw-auth",
  "duduclaw-container",
  "duduclaw-core",
@@ -2359,6 +2360,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror 2.0.21",
+ "zeroize",
 ]
 
 [[package]]

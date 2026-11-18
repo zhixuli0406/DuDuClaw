@@ -24,9 +24,16 @@ impl AccountHost for Accounts{
 /// Storage double: images and quotas per employee, injected failures.
 pub(super) struct Disk{pub(super) fail_ready:bool,pub(super) images:Vec<(EmployeeId,DiskQuota)>,pub(super) provisions:usize,pub(super) destroys:usize,
     pub(super) destroy_fail:usize,pub(super) leases:Vec<Attachment>,pub(super) traces_fail:bool,pub(super) extra_traces:Vec<EmployeeId>,
-    pub(super) provision_fail:bool}
+    pub(super) provision_fail:bool,
+    /// R8r-2: the provider document per employee (what the image's home would hold),
+    /// every write/clear in order, and an injected failure.
+    pub(super) documents:std::collections::BTreeMap<EmployeeId,Vec<u8>>,pub(super) provider_calls:Vec<(EmployeeId,u32,bool)>,
+    pub(super) provider_fail:Option<ProvidersFailure>,
+    /// R8r-2 F1: when set, every provider call first records the allocation
+    /// journal as persisted at that moment (the order of save and unlink).
+    pub(super) journal_at:Option<PathBuf>,pub(super) journal_seen:Vec<String>}
 impl Disk{pub(super) fn new()->Self{Self{fail_ready:false,images:vec![],provisions:0,destroys:0,destroy_fail:0,leases:vec![],traces_fail:false,
-    extra_traces:vec![],provision_fail:false}}
+    extra_traces:vec![],provision_fail:false,documents:Default::default(),provider_calls:vec![],provider_fail:None,journal_at:None,journal_seen:vec![]}}
     pub(super) fn present(&self,e:EmployeeId)->bool{self.images.iter().any(|(i,_)|*i==e)}}
 impl Storage for Disk{
     fn readiness(&mut self)->Result<()>{if self.fail_ready{Err(unavailable())}else{Ok(())}}
@@ -51,6 +58,18 @@ impl Storage for Disk{
     fn traces(&mut self)->Result<Vec<EmployeeId>>{
         if self.traces_fail{return Err(unavailable())}
         Ok(self.images.iter().map(|(e,_)|*e).chain(self.extra_traces.iter().copied()).collect())
+    }
+    fn write_providers(&mut self,e:EmployeeId,uid:u32,change:ProvidersChange<'_>)->std::result::Result<(),ProvidersFailure>{
+        self.provider_calls.push((e,uid,matches!(change,ProvidersChange::Write(_))));
+        if let Some(path)=&self.journal_at{self.journal_seen.push(fs::read_to_string(path).unwrap_or_default());}
+        if let Some(failure)=self.provider_fail{return Err(failure)}
+        if self.leases.iter().any(|a|a.employee==e){return Err(ProvidersFailure::Busy)}
+        if !self.present(e){return Err(ProvidersFailure::Unavailable)}
+        match change{
+            ProvidersChange::Write(bytes)=>{self.documents.insert(e,bytes.to_vec());},
+            ProvidersChange::Clear=>{self.documents.remove(&e);},
+        }
+        Ok(())
     }
 }
 /// In-memory registry with the root store's rules (UIDs never reused).
@@ -176,7 +195,7 @@ fn entry(request:&Request,phase:Phase)->Entry{
     let spec=request.validate().unwrap();
     let (retire,retired_at)=match phase{Phase::Retiring=>(Some(retire_binding(0x40)),None),Phase::Retired=>(Some(retire_binding(0x40)),Some(5)),_=>(None,None)};
     Entry{receipt:Receipt{binding:request.item.binding,label:spec.label,employee:EmployeeId([7;16]),uid:70001,bytes:spec.bytes,inodes:spec.inodes,
-        disabled:matches!(phase,Phase::Disabled|Phase::Retired),principal_binding:spec.binding},phase,retire,retired_at}
+        disabled:matches!(phase,Phase::Disabled|Phase::Retired),principal_binding:spec.binding},phase,retire,retired_at,providers:None}
 }
 fn retire_binding(id:u8)->ProposalBinding{ProposalBinding{operation_id:ProposalOperationId{proposal_id:RequestId([id;16]),revision:1},proposal_digest:Sha256Digest([id;32])}}
 fn saved(journal:Journal)->Journal{

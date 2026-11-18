@@ -32,7 +32,14 @@ CLI login, the employee can read its own key. Names are unique; the requested
 provider must match exactly, or an omitted provider requires exactly one entry.
 No gateway config or API-key environment variable is read. HTTPS is mandatory,
 redirects are disabled, and the run's egress service controls network access.
-Credential provisioning/login UI is not added by this package. The release
+This crate never writes the file. On a protected Linux host, root writes it
+(employee-owned, `0600`, in a `0700` `.duduclaw-api`) with `sudo duduclaw
+service provider set --protected-linux (--employee-id <hex> | --employee <label>)`
+reading the document from standard input (`--clear` removes it); see
+`docs/guides/linux-protected-service.md` and spawnd's allocation channel
+(`crates/duduclaw-spawnd/README.md`, schema 5). A dashboard input is a later
+package. The CLI validates the document with this crate's `Credential::validate`
+and the `Credentials::select` rules. The release
 packager now stages worker/native-adapter ELFs and explicitly supplied signed
 runtime policy/vendor artifacts; no production signature or acceptance is generated.
 

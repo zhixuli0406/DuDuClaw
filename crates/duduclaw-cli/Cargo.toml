@@ -43,6 +43,10 @@ tracing-appender = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 duduclaw-gateway = { workspace = true }
+# R8r-2: `service provider set` validates the providers document with the
+# employee runtime's own rules (`Credential::validate`). Already in this
+# build through duduclaw-gateway (same default features): no new crate.
+duduclaw-api-worker = { path = "../duduclaw-api-worker" }
 bollard = { workspace = true }
 duduclaw-memory = { workspace = true }
 duduclaw-identity = { workspace = true }

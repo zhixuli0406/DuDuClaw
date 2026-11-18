@@ -211,6 +211,13 @@ pub trait Host {
         -> std::result::Result<duduclaw_migration::allocation::Reply, duduclaw_migration::allocation::ErrorCode> {
         Err(duduclaw_migration::allocation::ErrorCode::IsolationUnavailable)
     }
+    /// R8r-2: a schema-5 `provision_providers` (gateway or host root), on the
+    /// same lifecycle worker. The request is owned: its payload is wiped
+    /// when it is dropped. Missing implementation ⇒ refuse.
+    fn providers(&mut self, _: Box<duduclaw_migration::allocation::providers::ProviderRequest>)
+        -> std::result::Result<duduclaw_migration::allocation::providers::Provisioned, duduclaw_migration::allocation::providers::ProviderErrorCode> {
+        Err(duduclaw_migration::allocation::providers::ProviderErrorCode::IsolationUnavailable)
+    }
     /// H4 synchronous broker step. Called only on an adapter's own lifecycle
     /// thread, never on the control socket thread. Missing broker ⇒ refuse.
     fn broker(&mut self, _: BrokerJob) -> Result<BrokerStep> { Err(ErrorCode::WorkspaceBrokerUnavailable) }
