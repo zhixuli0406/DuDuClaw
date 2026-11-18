@@ -947,12 +947,20 @@ fn units() -> Result<()> {
 /// enables it at S8, after this check).
 /// The R7a self-test unit's bytes are checked with the others, but it is never
 /// required active (a `RemainAfterExit=no` oneshot spawnd starts; inactive after its run).
+/// The DNS broker unit must be the text generated for the upstream the
+/// root-owned broker config records (the shipped text when there is none).
 fn platform_units() -> Result<()> {
+    let upstream = recorded_broker_upstream()?;
     for (name, expected) in layout::UNITS {
         let path = Path::new("/etc/systemd/system").join(name);
         parents(&path)?;
         trusted(&path, false)?;
-        if fs::symlink_metadata(&path)?.mode() & 0o7777 != 0o644 || fs::read_to_string(&path)? != *expected {
+        if fs::symlink_metadata(&path)?.mode() & 0o7777 != 0o644 {
+            return Err(refused("隔離服務單元與安裝版本不符。"));
+        }
+        if *name == layout::DNS_BROKER_UNIT {
+            layout::dns_broker_unit_check(&fs::read(&path)?, upstream).map_err(refused)?;
+        } else if fs::read_to_string(&path)? != *expected {
             return Err(refused("隔離服務單元與安裝版本不符。"));
         }
     }
@@ -961,6 +969,24 @@ fn platform_units() -> Result<()> {
         unit_loaded_active(name)?;
     }
     Ok(())
+}
+
+/// This install's DNS broker upstream: `None` without the broker config (the
+/// resolved route), else the config's upstream through the broker's own
+/// reader and validator.
+fn recorded_broker_upstream() -> Result<Option<std::net::SocketAddr>> {
+    use duduclaw_egress::daemon::{read_root_config, BrokerConfig, BROKER_CONFIG_PATH};
+    if absent(BROKER_CONFIG_PATH)? { return Ok(None); }
+    let config: BrokerConfig = read_root_config(BROKER_CONFIG_PATH).map_err(|_| refused("DNS 轉送服務設定讀回失敗。"))?;
+    config.validate().map_err(|_| refused("DNS 轉送服務設定讀回失敗。"))?;
+    Ok(Some(config.upstream))
+}
+
+/// The broker unit's allow-rule mismatch is the one failure detail printed
+/// (`layout::dns_broker_unit_mismatch`: fixed wording naming the rule only).
+fn broker_unit_detail(result: &Result<()>) -> Option<String> {
+    let text = result.as_ref().err()?.to_string();
+    text.find(layout::DNS_BROKER_MISMATCH_HEAD).map(|start| text[start..].to_owned())
 }
 
 /// The bootstrap's step S7 (plan §4.3): the composite check before the
@@ -974,6 +1000,7 @@ pub(super) fn check_platform(composite: &mut impl CompositeReadiness) -> Result<
     for (label, result) in results {
         if result.is_ok() { println!("[通過] {label}"); }
         else { failed += 1; println!("[未通過] {label}"); }
+        if let Some(detail) = broker_unit_detail(&result) { println!("  - {detail}"); }
     }
     let (lines, composite_failed, _) = render(&composite.assess());
     for line in lines { println!("{line}"); }
@@ -1027,6 +1054,7 @@ pub(super) fn check(composite: &mut impl CompositeReadiness) -> Result<()> {
     for (label, result) in results {
         if result.is_ok() { println!("[通過] {label}"); }
         else { failed += 1; println!("[未通過] {label}"); }
+        if let Some(detail) = broker_unit_detail(&result) { println!("  - {detail}"); }
     }
     let (lines, composite_failed, pending) = render(&composite.assess());
     for line in lines { println!("{line}"); }

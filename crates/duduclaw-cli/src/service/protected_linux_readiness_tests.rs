@@ -509,6 +509,26 @@ fn service_protected_readiness_broker_config_uses_the_brokers_validator() {
     assert!(!source.contains(concat!("struct ", "BrokerConfigView")));
 }
 
+/// The broker unit is checked against the text generated for the upstream
+/// the broker config records (the shipped text without a config), through
+/// the broker's own reader; only its allow-rule mismatch is printed as detail.
+#[test]
+fn service_protected_readiness_broker_unit_expects_the_recorded_upstream() {
+    let source = include_str!("protected_linux_readiness.rs");
+    let body = |signature: &str| source.split(signature).nth(1).unwrap().split("\n}\n").next().unwrap();
+    let units = body("fn platform_units()");
+    assert!(units.contains("let upstream = recorded_broker_upstream()?;"));
+    assert!(units.contains("layout::dns_broker_unit_check(&fs::read(&path)?, upstream)"));
+    let recorded = body("fn recorded_broker_upstream()");
+    assert!(recorded.contains("if absent(BROKER_CONFIG_PATH)? { return Ok(None); }"));
+    assert!(recorded.contains("read_root_config(BROKER_CONFIG_PATH)") && recorded.contains("config.validate()"));
+    let upstream = Some("192.0.2.53:53".parse().unwrap());
+    let mismatch = layout::dns_broker_unit_check(layout::DNS_BROKER_UNIT_TEXT.as_bytes(), upstream).unwrap_err();
+    assert_eq!(broker_unit_detail(&Err(refused(mismatch.clone()))), Some(mismatch));
+    assert_eq!(broker_unit_detail(&Err(refused("隔離服務單元與安裝版本不符。"))), None);
+    assert_eq!(broker_unit_detail(&Ok(())), None);
+}
+
 #[test]
 fn service_protected_readiness_parse_worker_socket_required() {
     let mut fake = Fake::healthy(); fake.inactive = vec!["duduclaw-parse.socket"];

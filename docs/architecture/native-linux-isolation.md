@@ -1219,8 +1219,24 @@ Its private read-only `/run` exposes the control directory and, by default, only
 the resolved socket. A broker installation must replace that DNS bind with the
 broker socket/directory in a root-owned drop-in. Installations deliberately using
 both routes must bind both. The broker has its own `/run` projection and syscall
-allowlist. The installer supplies its exact upstream IP allow rule; the shipped
-broker template denies all IPs until that drop-in is present.
+allowlist. The shipped broker template denies every address
+(`IPAddressDeny=any`) and carries one marker comment line,
+`# @DUDUCLAW-DNS-UPSTREAM-ALLOW@`. When the installer writes the unit file
+(S4, with the S1 DNS decision from its journal) it replaces that line with
+exactly one `IPAddressAllow=<upstream>/32` (IPv4) or `/128` (IPv6, canonical
+compressed form) generated from the validated `--dns-upstream`
+(`protected_linux_layout.rs` `dns_broker_unit_text`); on the resolved route the
+shipped text is written unchanged. No drop-in is used: spawnd's readback
+refuses a broker unit with drop-ins. Every
+installer byte check of the unit (the S4 and S5 resume checks and readiness)
+expects the text generated for the upstream recorded in
+`/etc/duduclaw/dns-broker.json` (the shipped text when that file is absent, as
+it must be on the resolved route); a mismatch names the expected and the found
+allow line, never the file. S1 accepts an upstream only when the broker's own
+validator accepts it and it is not loopback, an IPv4-mapped IPv6 address or
+IPv6 link-local (the rule could not carry it; spawnd's readback refuses
+loopback). Changing the upstream means re-running the installer, not editing
+the unit or adding a drop-in.
 
 ### R7b: DNS route evidence through egress
 

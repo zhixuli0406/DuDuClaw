@@ -733,7 +733,24 @@ pub(super) fn dns_route(resolved: bool, upstream: Option<SocketAddr>,
         (true, Some(_)) => Err("這台主機使用 systemd-resolved，不需要也不接受 --dns-upstream。"),
         (false, None) => Err("這台主機沒有可用的 systemd-resolved；請以 --dns-upstream <IP:53> 指定專用 DNS 轉送服務的上游 DNS。"),
         (false, Some(upstream)) if validate(upstream) => Ok((DnsRoute::DedicatedDnsBroker, Some(upstream))),
-        (false, Some(_)) => Err("--dns-upstream 必須是單一 IP 位址加上連接埠 53。"),
+        (false, Some(_)) => Err("--dns-upstream 必須是單一 IP 位址加上連接埠 53，且不能是本機迴路、未指定、群播、廣播、IPv6 鏈路本地或 IPv4 對應的 IPv6 位址。"),
+    }
+}
+
+/// The upstream rule S1 applies (and re-applies before S5 and S6): the
+/// broker's own validator, and an upstream the broker unit's generated
+/// `IPAddressAllow=` line can carry (`layout::dns_broker_allow_line`).
+pub(super) fn upstream_valid(upstream: SocketAddr) -> bool {
+    duduclaw_egress::daemon::BrokerConfig { upstream }.validate().is_ok() && layout::dns_broker_allow_line(upstream).is_ok()
+}
+
+/// This install's broker upstream for the broker unit's text: `Some` on the
+/// broker route, `None` on the resolved route; any other pairing is damage.
+fn broker_upstream(dns: &Dns) -> Result<Option<SocketAddr>> {
+    match (dns.route, dns.upstream) {
+        (DnsRoute::DedicatedDnsBroker, Some(upstream)) => Ok(Some(upstream)),
+        (DnsRoute::ResolvedVarlink, None) => Ok(None),
+        _ => Err(refused(JOURNAL_DAMAGED)),
     }
 }
 
@@ -1651,7 +1668,7 @@ fn perform(step: Step, context: &mut Context, dns: &Dns, services_started: bool)
         Step::Verified | Step::HostPreflight | Step::Rollback => Err(refused(JOURNAL_DAMAGED)),
         Step::StopGateway => with_version_lock(gateway_not_running),
         Step::ProcessesClear => with_version_lock(|| processes_quiet(services_started)),
-        Step::PublishPlatform => publish_platform(context),
+        Step::PublishPlatform => publish_platform(context, dns),
         Step::DnsPolicy => with_version_lock(|| dns_policy(context, dns)),
         Step::StartServices => with_version_lock(|| start_services(context, dns)),
         Step::Readiness => with_version_lock(|| {
@@ -1674,7 +1691,7 @@ fn invariants(step: Step, context: &Context, dns: &Dns, services_started: bool) 
         Step::ProcessesClear => with_version_lock(|| {
             if gateway_active() && gateway_ours(context).is_ok() { Ok(()) } else { processes_quiet(services_started) }
         }),
-        Step::PublishPlatform => with_version_lock(|| platform_published(context)),
+        Step::PublishPlatform => with_version_lock(|| platform_published(context, dns)),
         Step::DnsPolicy => with_version_lock(|| dns_readback(context, dns)),
         Step::StartServices => with_version_lock(|| services_running(context, dns)),
         Step::Readiness => with_version_lock(|| readiness::check_platform(&mut readiness::InstalledComposite)),
@@ -2069,8 +2086,7 @@ fn preflight(upstream: Option<SocketAddr>, hosts: &[IpAddr], stage: &StageReceip
         }
     }
     // DNS (plan S5).
-    let decision = dns_route(resolved_available(), upstream,
-        |upstream| duduclaw_egress::daemon::BrokerConfig { upstream }.validate().is_ok());
+    let decision = dns_route(resolved_available(), upstream, upstream_valid);
     let dns = match decision {
         Ok((route, upstream)) => Some(Dns { route, upstream, host_public_addresses: hosts.to_vec() }),
         Err(message) => { fail(message); None }
@@ -2125,8 +2141,7 @@ fn sshd_clear() -> std::result::Result<(), &'static str> {
 
 /// The DNS decision of S1 still holds (before S5 writes it, before S6 uses it).
 fn dns_route_unchanged(dns: &Dns) -> Result<()> {
-    let decision = dns_route(resolved_available(), dns.upstream,
-        |upstream| duduclaw_egress::daemon::BrokerConfig { upstream }.validate().is_ok());
+    let decision = dns_route(resolved_available(), dns.upstream, upstream_valid);
     if decision != Ok((dns.route, dns.upstream)) { return Err(refused(HOST_DNS_CHANGED)); }
     Ok(())
 }
@@ -2412,7 +2427,12 @@ fn rerecord_layout_modes(recorder: &mut LiveRecorder) -> Result<()> {
     Ok(())
 }
 
-fn publish_platform(context: &mut Context) -> Result<()> {
+/// The unit files are written here with their final bytes: the broker unit
+/// carries the S1 upstream's allow line (`layout::installed_unit_text`; the
+/// journal's DNS decision, fixed for the run), so no later step rewrites a
+/// ledgered file. S6 reloads systemd before it starts the broker socket.
+fn publish_platform(context: &mut Context, dns: &Dns) -> Result<()> {
+    let upstream = broker_upstream(dns)?;
     rerecord_layout_modes(&mut context.recorder)?;
     // (a) Trust root, state, slot A, generation and `current` (R1). Called
     // WITHOUT the version lock: publish takes stage lock → version-lock →
@@ -2480,7 +2500,7 @@ fn publish_platform(context: &mut Context) -> Result<()> {
         verify_identities(GATEWAY_ONLY)?;
         recorder.record(&items, || {
             parse_runtime_tree(true)?;
-            install_isolation_support_for(gateway, &defs)
+            install_isolation_support_for(gateway, &defs, upstream)
         })?;
         rerecord_layout_modes(recorder)?;
         // Check point 2 for the helper accounts (check point 3: S6, before they run).
@@ -3007,17 +3027,20 @@ fn dns_policy(context: &mut Context, dns: &Dns) -> Result<()> {
 fn dns_readback(context: &Context, dns: &Dns) -> Result<()> {
     use duduclaw_egress::daemon::{read_root_config, BrokerConfig, Config, BROKER_CONFIG_PATH, CONFIG_PATH};
     let policy = signed_policy_profiles(context)?;
-    match (dns.route, dns.upstream) {
+    let recorded = match (dns.route, dns.upstream) {
         (DnsRoute::DedicatedDnsBroker, Some(upstream)) => {
             let written: BrokerConfig = read_root_config(BROKER_CONFIG_PATH).map_err(|_| refused("DNS 轉送服務設定讀回失敗。"))?;
             written.validate().map_err(|_| refused("DNS 轉送服務設定讀回失敗。"))?;
             if written.upstream != upstream { return Err(refused("DNS 轉送服務設定讀回不符。")); }
+            Some(written.upstream)
         }
         (DnsRoute::ResolvedVarlink, None) => if exists(BROKER_CONFIG_PATH)? {
             return Err(refused("使用 systemd-resolved 的主機不應有 DNS 轉送服務設定；請檢查 /etc/duduclaw/dns-broker.json。"));
-        },
+        } else { None },
         _ => return Err(refused(JOURNAL_DAMAGED)),
-    }
+    };
+    // The broker unit S4 wrote allows exactly the upstream the broker config records.
+    broker_unit_installed(recorded)?;
     let written: Config = read_root_config(CONFIG_PATH).map_err(|_| refused("對外連線設定讀回失敗。"))?;
     check_egress(&written, &policy, dns.route, &dns.host_public_addresses)
 }
@@ -3461,13 +3484,26 @@ fn text_installed(path: &str, mode: u32, expected: &str) -> Result<()> {
     Ok(())
 }
 
+/// The broker unit file holding exactly the text generated for `upstream`
+/// (`None`: the resolved route, the shipped text), root 0644. A byte
+/// mismatch names the expected and the found allow rule, never the file.
+fn broker_unit_installed(upstream: Option<SocketAddr>) -> Result<()> {
+    let path = unit_file(layout::DNS_BROKER_UNIT);
+    if let Some(installed) = read_root_file(&path, 256 * 1024)? {
+        layout::dns_broker_unit_check(&installed, upstream).map_err(refused)?;
+    }
+    let expected = layout::dns_broker_unit_text(layout::DNS_BROKER_UNIT_TEXT, upstream).map_err(refused)?;
+    text_installed(&path, 0o644, &expected)
+}
+
 /// S4's invariants: trust state and `current` bound to THIS generation, every
 /// program equal to its signed artifact (digest, owner, mode), the launcher
 /// receipt, launcher, version intent, accounts, gateway home and license,
 /// directories, unit files, the parse runtime tree, spawnd's publication, the
 /// nightly files, and no unconfirmed ledger intent left behind.
-fn platform_published(context: &Context) -> Result<()> {
+fn platform_published(context: &Context, dns: &Dns) -> Result<()> {
     let mismatch = || refused(PUBLISHED_MISMATCH);
+    let upstream = broker_upstream(dns)?;
     let current = duduclaw_updated::linux::activation::read_current().map_err(|_| mismatch())?;
     let state: duduclaw_updated::state::State = Directory::open(Path::new(duduclaw_updated::linux::STATE_ROOT))
         .and_then(|root| root.json("state.json")).map_err(|_| mismatch())?;
@@ -3502,7 +3538,11 @@ fn platform_published(context: &Context) -> Result<()> {
         trusted(Path::new(path), true)?;
         if fs::symlink_metadata(path)?.mode() & 0o7777 != *mode { return Err(mismatch()); }
     }
-    for (name, text) in layout::UNITS { text_installed(&unit_file(name), 0o644, text)?; }
+    for (name, text) in layout::UNITS {
+        // The broker unit: the text S4 generated for the journal's upstream.
+        if *name == layout::DNS_BROKER_UNIT { broker_unit_installed(upstream)?; }
+        else { text_installed(&unit_file(name), 0o644, text)?; }
+    }
     parse_runtime_tree(false)?;
     let spawnd = Directory::open(Path::new(SPAWND_ROOT)).map_err(|_| mismatch())?;
     for name in SPAWND_ANCHORS { spawnd.child(name).map_err(|_| mismatch())?; }
@@ -3711,7 +3751,7 @@ mod tests {
     #[test]
     fn dns_route_selection_requires_upstream_without_resolved() {
         let upstream: SocketAddr = "192.0.2.53:53".parse().unwrap();
-        let broker = |upstream| duduclaw_egress::daemon::BrokerConfig { upstream }.validate().is_ok();
+        let broker = upstream_valid;
         assert_eq!(dns_route(true, None, broker), Ok((DnsRoute::ResolvedVarlink, None)));
         assert!(dns_route(true, Some(upstream), broker).is_err(), "no upstream on resolved hosts");
         assert!(dns_route(false, None, broker).is_err(), "broker hosts need an upstream");
@@ -3722,6 +3762,25 @@ mod tests {
         for bad in ["192.0.2.53:5353", "0.0.0.0:53", "224.0.0.1:53", "255.255.255.255:53"] {
             assert!(dns_route(false, Some(bad.parse().unwrap()), broker).is_err(), "{bad}");
         }
+        // The broker's validator accepts these; the unit's allow line cannot carry them.
+        for bad in ["127.0.0.1:53", "[::1]:53", "[::ffff:192.0.2.53]:53", "[fe80::1]:53"] {
+            let address: SocketAddr = bad.parse().unwrap();
+            assert!(duduclaw_egress::daemon::BrokerConfig { upstream: address }.validate().is_ok(), "{bad}");
+            assert!(dns_route(false, Some(address), broker).is_err(), "{bad}");
+        }
+        // Whatever S1 accepts, the broker accepts and the broker unit can be generated for.
+        for good in ["192.0.2.53:53", "10.0.0.2:53", "169.254.169.253:53", "[2001:4860:4860::8888]:53"] {
+            let address: SocketAddr = good.parse().unwrap();
+            assert!(upstream_valid(address), "{good}");
+            assert!(duduclaw_egress::daemon::BrokerConfig { upstream: address }.validate().is_ok(), "{good}");
+            assert!(layout::dns_broker_unit_text(layout::DNS_BROKER_UNIT_TEXT, Some(address)).is_ok(), "{good}");
+        }
+        // The broker unit's upstream follows the route; any other pairing is damage.
+        assert_eq!(broker_upstream(&broker_dns()).unwrap(), Some(upstream));
+        let resolved = Dns { route: DnsRoute::ResolvedVarlink, upstream: None, host_public_addresses: Vec::new() };
+        assert_eq!(broker_upstream(&resolved).unwrap(), None);
+        assert!(broker_upstream(&Dns { upstream: Some(upstream), ..resolved.clone() }).is_err());
+        assert!(broker_upstream(&Dns { upstream: None, ..broker_dns() }).is_err());
         // A resumed run must use the decisions of its first run.
         let recorded = broker_dns();
         reconcile(&recorded, None, &[]).unwrap();
@@ -4736,6 +4795,35 @@ gshadow:        files\nhosts:          files mdns4_minimal [NOTFOUND=return] dns
         // Rollback removes what S4 ledgered.
         let ledgered = super::super::rollback::ledger_files();
         for path in [UNIT_PATH, RECOVERY_BOUND, LAUNCHER] { assert!(ledgered.iter().any(|file| file == path), "{path}"); }
+    }
+
+    /// The broker unit's allow line: written once at S4 with its final bytes
+    /// for the journal's upstream (no later step rewrites the ledgered file),
+    /// expected by S4's and S5's resume checks (S5: the upstream the broker
+    /// config records), and loaded by S6's daemon-reload before any start.
+    #[test]
+    fn broker_unit_is_written_at_s4_for_the_recorded_upstream_and_reloaded_before_start() {
+        let source = include_str!("protected_linux_bootstrap.rs");
+        let body = |signature: &str| -> &str {
+            let start = source.find(signature).unwrap_or_else(|| panic!("{signature}"));
+            let rest = &source[start..];
+            &rest[..rest.find("\n}\n").unwrap()]
+        };
+        let s4 = body("fn publish_platform(");
+        assert!(s4.contains("let upstream = broker_upstream(dns)?;"));
+        assert!(s4.contains("install_isolation_support_for(gateway, &defs, upstream)"));
+        assert!(body("fn platform_published(").contains("broker_unit_installed(upstream)?"));
+        let s5 = body("fn dns_readback(");
+        assert!(s5.contains("Some(written.upstream)") && s5.contains("broker_unit_installed(recorded)?"));
+        assert!(!body("fn dns_policy(").contains("unit_file("), "S5 never rewrites a unit file");
+        assert!(body("fn broker_unit_installed(").contains("layout::dns_broker_unit_check(&installed, upstream)"));
+        let staging = include_str!("protected_linux_install.rs").split("fn install_isolation_support_for(").nth(1).unwrap()
+            .split("\nfn isolation_account(").next().unwrap();
+        assert!(staging.contains("layout::installed_unit_text(name, shipped, broker_upstream)"));
+        // S6 reloads before its first start; the broker socket is one of them on the broker route.
+        let s6 = body("fn start_services(");
+        assert!(s6.find("&[\"daemon-reload\"]").unwrap() < s6.find("run_start(").unwrap());
+        assert!(service_starts(&broker_dns()).iter().any(|start| start.unit == "duduclaw-dns-broker.socket"));
     }
 
     /// C4: the S6 timeout names the readiness fields still false.

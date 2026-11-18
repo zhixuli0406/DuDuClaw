@@ -413,15 +413,22 @@ fn install_isolation_support_if_published() -> Result<()> {
     layout::system_id_limit(&defs, "SYS_UID_MAX").map_err(refused)?;
     layout::system_id_limit(&defs, "SYS_GID_MAX").map_err(refused)?;
     let gateway = account()?;
-    install_isolation_support_for(gateway, &defs)
+    // No DNS decision here: the broker unit stays as shipped (deny-all).
+    install_isolation_support_for(gateway, &defs, None)
 }
 
 /// The accounts, directories and unit files of the isolation layout, for an
 /// already resolved gateway identity (the v1.83 bootstrap resolves its own:
 /// its service home is the root-owned 0711 parent of a private data
 /// directory, which `account()` does not accept). Never enables anything.
-fn install_isolation_support_for((uid, gid): (u32, u32), defs: &str) -> Result<()> {
+/// `broker_upstream` is the install's DNS broker upstream (`None` on the
+/// resolved route): the broker unit is written with its allow line.
+fn install_isolation_support_for((uid, gid): (u32, u32), defs: &str, broker_upstream: Option<std::net::SocketAddr>) -> Result<()> {
     let defs = defs.to_owned();
+    // Every unit text first, so a refused upstream changes nothing.
+    let units = layout::UNITS.iter()
+        .map(|(name, shipped)| layout::installed_unit_text(name, shipped, broker_upstream).map(|text| (*name, text)))
+        .collect::<std::result::Result<Vec<_>, _>>().map_err(refused)?;
     layout::validate_system_ids(uid, gid, &defs).map_err(refused)?;
     let mut identities = vec![(uid, gid)];
     for name in layout::ACCOUNTS {
@@ -438,7 +445,7 @@ fn install_isolation_support_for((uid, gid): (u32, u32), defs: &str) -> Result<(
             return Err(refused("parse worker roots contain unexpected content; stop workers and inspect the directory"));
         }
     }
-    for (name, text) in layout::UNITS {
+    for (name, text) in &units {
         atomic_install(&format!("/etc/systemd/system/{name}"), 0o644,
             |file| { file.write_all(text.as_bytes())?; Ok(()) })?;
     }

@@ -17,7 +17,7 @@ From v1.83.0, a new protected host is installed only through the independently v
 
 | Option | Meaning |
 | --- | --- |
-| `--dns-upstream <IP:53>` | Only on hosts without systemd-resolved: the single upstream of the dedicated DNS broker. Refused when systemd-resolved is available. It is never added to the employees' egress rules. |
+| `--dns-upstream <IP:53>` | Only on hosts without systemd-resolved: the single upstream of the dedicated DNS broker. Refused when systemd-resolved is available, and refused for loopback addresses (such as a local resolver on `127.0.0.1`). The installer writes this address into the DNS broker's network rule; it is never added to the employees' egress rules. To change the upstream, re-run the installer: do not edit the broker's unit file (the readiness check refuses an edited file) or add a drop-in (the isolation service's network-rule check refuses it). |
 | `--host-public-address <IP>` | A public address of this host that is on no interface (cloud 1:1 NAT); repeatable, at most 64. Employees are denied connections to it. |
 | `--enable-now` | No longer needed and has no effect: the installer always leaves the gateway running. Still accepted, so existing scripts keep working; the installer prints a note when it is given. |
 
