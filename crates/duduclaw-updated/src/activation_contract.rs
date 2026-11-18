@@ -1,6 +1,8 @@
 //! Package F's integration seam. These messages are NOT the gateway update RPC.
-//! Implementations in A/B/C/G must derive readbacks from running processes and
-//! retain the drain barrier durably across their own restart before acknowledging.
+//! Implementations in A/B/C/G must derive readbacks from running processes (or,
+//! for non-daemon components, root spawnd's by-descriptor file measurement; see
+//! [`validate_readbacks`]) and retain the drain barrier durably across their own
+//! restart before acknowledging.
 use duduclaw_isolation::{ids::{RequestId, Sha256Digest}, update::*};
 use serde::{Deserialize, Serialize};
 use crate::{Error, Result};
@@ -73,7 +75,13 @@ pub struct ComponentReadback {
     pub product: Product,
     pub version: ReleaseVersion,
     pub protocol: u16,
-    /// The SHA-256 of the executable actually loaded, not of a proposed pathname.
+    /// A SHA-256 whose meaning depends on the target's kind ([`readback_kind`]):
+    /// - LIVE PROCESS (gateway, egress, spawnd): the image the reporting process
+    ///   actually loaded (its own `/proc/self/exe`), never a pathname's.
+    /// - FILE MEASUREMENT (every other reported target): the bytes at the
+    ///   path(s) the component is executed (the policy: read) from, hashed by
+    ///   root spawnd by descriptor through its trusted reader. It says what that
+    ///   file holds now, not that a process has loaded it.
     pub build_sha256: Sha256Digest,
     pub effective_uid: u32,
     pub ready: bool,
@@ -135,7 +143,9 @@ pub fn validate_response(request: &ControlRequest, response: &ControlResponse) -
     Ok(())
 }
 
-fn protocol(manifest: &ReleaseManifest, target: &InstallTarget) -> u16 {
+/// The protocol a readback of `target` must report (also used by spawnd for
+/// the file measurements it reports).
+pub fn protocol(manifest: &ReleaseManifest, target: &InstallTarget) -> u16 {
     match target {
         InstallTarget::Gateway => manifest.protocols.gateway,
         // R7c: the SSH denial probe's result contract is read by spawnd only.
@@ -148,8 +158,25 @@ fn protocol(manifest: &ReleaseManifest, target: &InstallTarget) -> u16 {
         InstallTarget::UpdateSlot => manifest.protocols.updated,
     }
 }
-/// The updater slot has its own same-fd root boot/self-test path. Every other
-/// signed artifact needs a real live or isolated non-root readiness readback.
+/// The updater slot has its own same-fd root boot/self-test path and is never
+/// reported. Every other signed artifact needs exactly one ready report (one
+/// per artifact id, nothing more) whose target, product, version, protocol
+/// and `build_sha256` are the manifest's, and which is one of two kinds,
+/// fixed per [`InstallTarget`] ([`ReadbackKind`]):
+/// - a LIVE PROCESS report: the daemon answers for itself, with its own
+///   effective uid. `Gateway` and `Egress` must be non-root; `Spawnd` must be
+///   root.
+/// - a FILE MEASUREMENT: root spawnd hashed, by descriptor through its trusted
+///   reader, every file the component is executed (the policy: read) from:
+///   the fixed publication path for `Trampoline`, `TrampolineSelftest`,
+///   `IsolationProbe`, `Importer` and `Migration`; for `ParseWorker` both the
+///   copy inside the parse runtime tree (what its unit executes) and the host
+///   publication copy (the tree builder's input), and `build_sha256` is the
+///   signed digest only when both hold it; the committed generation directory
+///   (mounted at `/runtime` for runs) for `McpBridge`, `EgressForwarder` and
+///   every `RuntimeEntry` (including `isolation-policy-v1`). `effective_uid` is the
+///   measurer's and must be 0; the uid the component later runs under is not
+///   claimed by this report.
 pub fn validate_readbacks(manifest: &ReleaseManifest, readbacks: &[ComponentReadback]) -> Result<()> {
     manifest.validate()?;
     let expected: Vec<_> = manifest.artifacts.iter().filter(|a| a.install_target != InstallTarget::UpdateSlot).collect();
@@ -160,12 +187,35 @@ pub fn validate_readbacks(manifest: &ReleaseManifest, readbacks: &[ComponentRead
         if found.next().is_some() || report.target != artifact.install_target || report.product != manifest.product
             || report.version != manifest.version || report.protocol != protocol(manifest, &artifact.install_target)
             || report.build_sha256 != artifact.sha256 || !report.ready { return Err(Error::Maintenance); }
-        let root_component = matches!(artifact.install_target,
-            InstallTarget::Spawnd | InstallTarget::Trampoline | InstallTarget::TrampolineSelftest
-            | InstallTarget::IsolationProbe);
-        if (report.effective_uid == 0) != root_component { return Err(Error::Maintenance); }
+        let root = match readback_kind(&artifact.install_target) {
+            Some(ReadbackKind::LiveProcess { root }) => root,
+            Some(ReadbackKind::FileMeasurement) => true,
+            None => return Err(Error::Maintenance),
+        };
+        if (report.effective_uid == 0) != root { return Err(Error::Maintenance); }
     }
     Ok(())
+}
+/// How a component's readback is produced (see [`validate_readbacks`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadbackKind {
+    /// The running daemon reports itself; `root`: it must run as uid 0.
+    LiveProcess { root: bool },
+    /// Root spawnd's by-descriptor hash of the file the component runs from.
+    FileMeasurement,
+}
+/// The one classification of every install target. No wildcard arm: a new
+/// target kind does not compile until it is classified here. `None`: never
+/// reported (the updater slot).
+pub fn readback_kind(target: &InstallTarget) -> Option<ReadbackKind> {
+    match target {
+        InstallTarget::Gateway | InstallTarget::Egress => Some(ReadbackKind::LiveProcess { root: false }),
+        InstallTarget::Spawnd => Some(ReadbackKind::LiveProcess { root: true }),
+        InstallTarget::Trampoline | InstallTarget::TrampolineSelftest | InstallTarget::IsolationProbe
+        | InstallTarget::ParseWorker | InstallTarget::Importer | InstallTarget::Migration | InstallTarget::McpBridge
+        | InstallTarget::EgressForwarder | InstallTarget::RuntimeEntry { .. } => Some(ReadbackKind::FileMeasurement),
+        InstallTarget::UpdateSlot => None,
+    }
 }
 
 #[cfg(test)]
@@ -200,6 +250,75 @@ mod tests {
             }
             assert!(validate_readbacks(&m, &[r]).is_err(), "case {case}");
         }
+    }
+    /// The shipped template's twelve kinds plus the signed policy (0444) and an
+    /// executable runtime entry (0755).
+    fn template_manifest() -> ReleaseManifest {
+        let mut m = manifest();
+        let mut targets = vec![InstallTarget::Gateway, InstallTarget::Spawnd, InstallTarget::Trampoline,
+            InstallTarget::TrampolineSelftest, InstallTarget::IsolationProbe, InstallTarget::Egress,
+            InstallTarget::EgressForwarder, InstallTarget::McpBridge, InstallTarget::ParseWorker, InstallTarget::Importer,
+            InstallTarget::Migration, InstallTarget::UpdateSlot];
+        targets.push(InstallTarget::RuntimeEntry { registry_id: "isolation-policy-v1".into() });
+        targets.push(InstallTarget::RuntimeEntry { registry_id: "api-worker-v1".into() });
+        m.protocols = ProtocolCompatibility { gateway: 2, spawnd: 3, trampoline: 4, egress: 5, updated: 6, mcp_bridge: 7,
+            parse_worker: 8, importer: 9 };
+        m.artifacts = targets.into_iter().enumerate().map(|(index, target)| ReleaseArtifact {
+            id: crate::publication::artifact_name(&target).unwrap(), sha256: Sha256Digest([index as u8 + 1; 32]), size_bytes: 1,
+            mode: if target == (InstallTarget::RuntimeEntry { registry_id: "isolation-policy-v1".into() }) { 0o444 } else { 0o755 },
+            install_target: target }).collect();
+        m
+    }
+    /// What spawnd (file measurements, itself) and the two daemons report.
+    fn template_reports(m: &ReleaseManifest) -> Vec<ComponentReadback> {
+        m.artifacts.iter().filter(|a| a.install_target != InstallTarget::UpdateSlot).map(|a| ComponentReadback {
+            artifact_id: a.id.clone(), target: a.install_target.clone(), product: m.product, version: m.version,
+            protocol: protocol(m, &a.install_target), build_sha256: a.sha256,
+            effective_uid: if matches!(a.install_target, InstallTarget::Gateway | InstallTarget::Egress) { 999 } else { 0 },
+            ready: true }).collect()
+    }
+    #[test]
+    fn health_readback_accepts_live_reports_and_root_file_measurements_of_the_template() {
+        let m = template_manifest();
+        let good = template_reports(&m);
+        assert_eq!(good.len(), 13);
+        assert!(validate_readbacks(&m, &good).is_ok());
+        // Every file measurement must be the root measurer's.
+        let measured = [InstallTarget::Trampoline, InstallTarget::TrampolineSelftest, InstallTarget::IsolationProbe,
+            InstallTarget::ParseWorker, InstallTarget::Importer, InstallTarget::Migration, InstallTarget::McpBridge,
+            InstallTarget::EgressForwarder, InstallTarget::RuntimeEntry { registry_id: "isolation-policy-v1".into() },
+            InstallTarget::RuntimeEntry { registry_id: "api-worker-v1".into() }];
+        for target in &measured {
+            assert_eq!(readback_kind(target), Some(ReadbackKind::FileMeasurement));
+            let index = good.iter().position(|r| &r.target == target).unwrap();
+            let mut bad = good.clone(); bad[index].effective_uid = 1000;
+            assert!(validate_readbacks(&m, &bad).is_err(), "{target:?} uid");
+            let mut bad = good.clone(); bad[index].ready = false;
+            assert!(validate_readbacks(&m, &bad).is_err(), "{target:?} not ready");
+            let mut bad = good.clone(); bad[index].build_sha256 = Sha256Digest([0xee; 32]);
+            assert!(validate_readbacks(&m, &bad).is_err(), "{target:?} digest");
+            let mut bad = good.clone(); bad.remove(index);
+            assert!(validate_readbacks(&m, &bad).is_err(), "{target:?} missing");
+            let other = if index == 0 { 1 } else { index - 1 };
+            let mut bad = good.clone(); bad[other] = good[index].clone();
+            assert!(validate_readbacks(&m, &bad).is_err(), "{target:?} duplicated");
+        }
+        // Live daemons: gateway and egress never root, spawnd always root.
+        for (target, uid) in [(InstallTarget::Gateway, 0), (InstallTarget::Egress, 0), (InstallTarget::Spawnd, 1000)] {
+            let index = good.iter().position(|r| r.target == target).unwrap();
+            let mut bad = good.clone(); bad[index].effective_uid = uid;
+            assert!(validate_readbacks(&m, &bad).is_err(), "{target:?} uid {uid}");
+        }
+        // The updater slot is never reported.
+        assert_eq!(readback_kind(&InstallTarget::UpdateSlot), None);
+        let slot = m.artifacts.iter().find(|a| a.install_target == InstallTarget::UpdateSlot).unwrap();
+        let mut bad = good.clone();
+        bad.push(ComponentReadback { artifact_id: slot.id.clone(), target: slot.install_target.clone(), product: m.product,
+            version: m.version, protocol: m.protocols.updated, build_sha256: slot.sha256, effective_uid: 0, ready: true });
+        assert!(validate_readbacks(&m, &bad).is_err());
+        // A second copy of one report in place of another is refused.
+        let mut bad = good.clone(); bad.push(good[0].clone());
+        assert!(validate_readbacks(&m, &bad).is_err());
     }
     #[test]
     fn barrier_requires_nonce_generation_zero_runs_and_persistent_admission() {

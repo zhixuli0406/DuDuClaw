@@ -3,6 +3,19 @@ name = "duduclaw-gateway"
 version.workspace = true
 edition.workspace = true
 
+# CI-only probe (.github/workflows/linux-release-smoke.yml): prints
+# license_runtime::license_build_identity() so the smoke can check that the
+# TEST-licence marker survives the release profile. Never a release binary:
+# built only with the non-default `marker-probe` feature, which no release
+# build list names (scripts/package-linux-release.py selects explicit --bin).
+[[bin]]
+name = "duduclaw-license-marker-probe"
+path = "src/bin/duduclaw-license-marker-probe.rs"
+required-features = ["marker-probe"]
+test = false
+bench = false
+doc = false
+
 [dependencies]
 duduclaw-api-worker = { path = "../duduclaw-api-worker" }
 duduclaw-parse-worker = { workspace = true }
@@ -206,6 +219,9 @@ atspi = "0.30"
 [features]
 # Shared lifecycle fixtures for downstream crate tests; never enabled by default.
 test-support = []
+# Builds the CI-only duduclaw-license-marker-probe binary (see [[bin]] above);
+# no code depends on it and no release build enables it.
+marker-probe = []
 # Integration branch supplies Package E's dependency; Package D alone does not.
 isolation-worker-integration = []
 default = ["dashboard", "desktop", "isolation-worker-integration"]
@@ -282,3 +298,8 @@ rand = "0.8"
 # so the two halves are proven compatible against actual code, not a
 # hand-written stand-in that could itself drift from the real service.
 duduclaw-relay = { workspace = true }
+
+# license_runtime.rs: a `--cfg duduclaw_test_root` build also trusts its compiled
+# TEST licence issuer (same cfg as the duduclaw-updated test-key verifier).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(duduclaw_test_root)'] }

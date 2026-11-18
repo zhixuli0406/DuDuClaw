@@ -1,0 +1,8 @@
+# TEST-ONLY syscall allow-list (x86_64) for scripts/isolation-test-keys.sh bundle.
+# NOT a reviewed production list: it allows every x86_64 syscall number in use
+# (0-334 and 424-467) so the test runtime and forwarder are never blocked by it.
+# The fixed refusals of duduclaw-run's common filter (namespaces, mount, ptrace,
+# bpf, io_uring, set-id modes, ...) still apply on top: seccomp::runtime embeds
+# them before this list. Format: one decimal number or inclusive range per line.
+0-334
+424-467

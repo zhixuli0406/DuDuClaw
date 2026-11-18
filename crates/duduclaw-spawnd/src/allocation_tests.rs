@@ -124,15 +124,20 @@ pub(super) fn employee_request(id:u8,label:&str,status:ConfirmationStatus,extra:
         proposal_digest:digest_of(ConfirmationCategory::Employee,&fields)},category:ConfirmationCategory::Employee,status,high_risk:true,fields}}
 }
 fn request_with(status:ConfirmationStatus,extra:&[(&str,&str)])->Request{employee_request(1,"sales",status,extra)}
-/// R7c (F6): a registry allocation still waiting for the SSH denial probe,
-/// or refused by the pending-reservation cap, is `NotReady` (retry later);
+/// R7c (F6) / R7d: a registry allocation still waiting for the SSH denial
+/// probe is `Pending`, one refused by the pending-reservation cap is
+/// `PendingLimit` (both "retry later"; a schema-2 reply reads `NotReady`);
 /// a proven-reachable account and every other failure stay `IsolationUnavailable`.
 #[test]
 fn allocation_probe_pending_and_pending_cap_answer_not_ready(){
     use crate::accounts::SshRefusal;
-    for error in [SshRefusal::Pending.error(),SshRefusal::Inconclusive("login_unverified (exit 18)".into()).error(),
-        crate::registry::PendingLimit.error()]{
-        assert_eq!(registry_code(error),wire::ErrorCode::NotReady);
+    for error in [SshRefusal::Pending.error(),SshRefusal::Inconclusive("login_unverified (exit 18)".into()).error()]{
+        assert_eq!(registry_code(error),wire::ErrorCode::Pending);
+    }
+    assert_eq!(registry_code(crate::registry::PendingLimit.error()),wire::ErrorCode::PendingLimit);
+    for code in [wire::ErrorCode::Pending,wire::ErrorCode::PendingLimit]{
+        assert_eq!(code.for_schema(wire::SCHEMA_V2),wire::ErrorCode::NotReady);
+        assert_eq!(code.for_schema(wire::SCHEMA_V3),code);
     }
     for error in [SshRefusal::Reachable("login_not_denied (exit 10)".into()).error(),io::Error::other("create"),
         io::Error::new(io::ErrorKind::WouldBlock,"busy")]{

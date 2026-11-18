@@ -2657,7 +2657,9 @@ version = "1.82.0"
 dependencies = [
  "base64 0.22.1",
  "blake2",
+ "chrono",
  "duduclaw-isolation",
+ "duduclaw-license",
  "ed25519-dalek",
  "hex",
  "libc",

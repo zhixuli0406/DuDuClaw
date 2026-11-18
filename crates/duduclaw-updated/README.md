@@ -9,7 +9,16 @@ fixed socket, downloader privilege separation and verified file descriptors.
 This package is not an installer: migration must provision its root trust and
 accounts. The Linux activator publishes one generation, restarts fixed services
 and compares authenticated live readiness and loaded-executable identity before
-advancing the version floor. Named A/B/C/G drain, migration/runtime and readiness
+advancing the version floor. `activation_contract::validate_readbacks` needs one
+ready report per signed artifact except the updater slot, each of a kind fixed
+per install target: a LIVE PROCESS report (gateway and egress answer for
+themselves and must be non-root; spawnd must be root) or a FILE MEASUREMENT made
+by root spawnd by descriptor at every path the component is executed from (run,
+run self-test, SSH probe, parse worker (runtime-tree copy and host copy, both),
+importer, migration, MCP bridge (generation directory), egress forwarder, every
+runtime entry including the signed policy), which must carry `effective_uid` 0,
+the measurer's. `build_sha256` therefore means the loaded image for a live
+process and the bytes at the executed path(s) for a file measurement. Named A/B/C/G drain, migration/runtime and readiness
 seams must be implemented; missing endpoints fail closed. Interrupted updates
 resume through the frozen A/B launcher. Root-only trust rotation and signed
 emergency rollback preserve the normal monotonic floor.
@@ -64,7 +73,10 @@ decision Q6), the migration bundle with the root threshold.
 
 `duduclaw-isolation-test-signer` (`--features test-signer`, module `test_signer`)
 is a TEST-ONLY software signer: simulated `sk-ssh-ed25519` root/target keys,
-plain ed25519 R2/R3 and a test minisign key. It is never a release binary
+plain ed25519 R2/R3 and a test minisign key, plus a TEST licence issuer
+(`license-keygen`, `license`: a `license.json` with key id `test-root`, signed over
+the duduclaw-license crate's own canonical payload, accepted only by a
+`--cfg duduclaw_test_root` duduclaw). It is never a release binary
 (`scripts/package-linux-release.py` refuses any build naming the feature or the
 binary). `scripts/isolation-test-keys.sh keys` creates a test key set and prints
 `TEST <pin>` with the environment of a `--cfg duduclaw_test_root` verifier build;

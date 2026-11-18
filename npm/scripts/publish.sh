@@ -95,6 +95,24 @@ else
   echo "  SKIP: ${WIN_ZIP} not found"
 fi
 
+# Step 2c: never publish a TEST-licence gateway. Every file a platform package
+# would ship (also one left over from an earlier run) is scanned before anything
+# is published; any non-zero exit of the refuser stops the script (set -e).
+echo "--- Refusing TEST-licence gateways ---"
+gateway_files=()
+for dir in duduclaw darwin-arm64 darwin-x64 linux-x64 linux-arm64 win32-x64; do
+  for bin in "${NPM_DIR}/${dir}/bin/duduclaw" "${NPM_DIR}/${dir}/bin/duduclaw.exe"; do
+    if [ -f "$bin" ]; then gateway_files+=("$bin"); fi
+  done
+  app="${NPM_DIR}/${dir}/DuDuClaw Gateway.app"
+  if [ -d "$app" ]; then
+    while IFS= read -r -d '' file; do gateway_files+=("$file"); done < <(find "$app" -type f -print0)
+  fi
+done
+if [ "${#gateway_files[@]}" -gt 0 ]; then
+  python3 -I -B "${SCRIPT_DIR}/../../scripts/refuse-test-license-build.py" "${gateway_files[@]}"
+fi
+
 # Idempotency (2026-09-08 incident): a partial run had published all five
 # platform packages before the wrapper failed on a token-permission 403. A
 # plain re-run then dies on the FIRST platform package ("cannot publish over

@@ -1,15 +1,54 @@
 //! Confirmed allocation for a freshly configured employee. Imported settings
 //! alone never create an enabled product employee or bypass normal product writes.
 use super::*;
-use duduclaw_migration::allocation::{self, Action, Receipt, Request};
+use duduclaw_migration::allocation::{self, Action, Answer, ErrorCode as Code, Receipt, Request, Response};
 use duduclaw_migration::ids::RequestId;
 use duduclaw_isolation::capability::EmployeeBinding;
 use crate::isolation_lifecycle::{self as lifecycle, LifecycleError};
 use std::sync::Arc;
 
-pub(crate) struct EmployeeAuthority { home:PathBuf, live:Arc<LiveAuthority>, agent_cap:usize, step_up_verified_at:Option<u64> }
+/// The root end of the schema-3 `Allocate` (R7d): the raw reply, which
+/// [`allocate_with`] checks. Tests inject a fake.
+pub(crate) trait AllocationRoot: Send + Sync {
+    fn round_trip(&self, request:&Request)->std::result::Result<Response,()>;
+}
+/// Production: spawnd's allocation socket.
+pub(crate) struct SpawndAllocationRoot;
+impl AllocationRoot for SpawndAllocationRoot {
+    fn round_trip(&self, request:&Request)->std::result::Result<Response,()> {
+        #[cfg(target_os="linux")]{ allocation::transport::round_trip(request).map_err(|_|()) }
+        #[cfg(not(target_os="linux"))]{ let _=request; Err(()) }
+    }
+}
+/// R7d: one `Allocate` (schema 3) of `item`. Ready (a receipt checked by
+/// `check_response`): the receipt. `Pending`: the root keeps the reservation
+/// resumable, so the SAME request must be sent again later: `Err(Pending)`,
+/// which never compensates and is waited for (bounded). `PendingLimit`
+/// (nothing reserved): `Err(PendingLimit)`, the same retry-safe outcome but
+/// never waited for in process. `NotReady` (round 1): spawnd answers it to a
+/// schema-3 `Allocate` only before any journal entry or registry row is
+/// created or changed — start-up reconciliation not latched
+/// (`spawnd::host::Core::allocation`) or a run live on the host
+/// (`spawnd::allocation::Allocator::handle`, the host gate) — and it clears
+/// within seconds: `Err(Pending)`, waited for like `pending`. Everything else
+/// — an older-schema or garbled reply, an unknown kind, a transport failure,
+/// any other refusal (a tombstoned employee's included) — is the existing
+/// hard failure. Only the stage step calls this; `NotReady` from
+/// ReadBack/Disable/Retire (`exchange`, schema 1) keeps its meaning.
+pub(crate) fn allocate_with(root:&dyn AllocationRoot,item:&ConfirmationItem)->Result<Receipt> {
+    let request=Request{schema:allocation::SCHEMA_V3,nonce:RequestId(*uuid::Uuid::new_v4().as_bytes()),action:Action::Allocate,item:item.clone(),approver:None};
+    let response=root.round_trip(&request).map_err(|_|Error::Apply)?;
+    match allocation::check_response(&request,response).map_err(|_|Error::Apply)? {
+        Answer::Reply(reply)=>Ok(reply.receipt),
+        Answer::Refused(Code::Pending|Code::NotReady)=>Err(Error::Pending),
+        Answer::Refused(Code::PendingLimit)=>Err(Error::PendingLimit),
+        Answer::Refused(_)=>Err(Error::Apply),
+    }
+}
+
+pub(crate) struct EmployeeAuthority { home:PathBuf, live:Arc<LiveAuthority>, agent_cap:usize, step_up_verified_at:Option<u64>, root:Arc<dyn AllocationRoot> }
 impl EmployeeAuthority {
-    pub(crate) fn new(home:PathBuf,live:Arc<LiveAuthority>)->Self{Self{home,live,agent_cap:0,step_up_verified_at:None}}
+    pub(crate) fn new(home:PathBuf,live:Arc<LiveAuthority>)->Self{Self{home,live,agent_cap:0,step_up_verified_at:None,root:Arc::new(SpawndAllocationRoot)}}
     /// F6fb item 8: the licence agent cap (`MethodHandler::effective_agent_cap`,
     /// 0 = unlimited) that an adoption's approval and apply enforce.
     pub(crate) fn with_agent_cap(mut self,agent_cap:usize)->Self{self.agent_cap=agent_cap;self}
@@ -170,7 +209,9 @@ impl MigrationAuthorityBackend for EmployeeAuthority {
     fn validate(&self,item:&ConfirmationItem)->Result<()>{if !self.supports(item.category){return Err(Error::Denied)}self.validate_current(item)}
     fn stage(&self,item:&ConfirmationItem)->Result<()>{
         self.validate(item)?;
-        let receipt=self.exchange(item,Action::Allocate)?;
+        // R7d: `Err(Pending)` leaves the step resumable (GatewayAuthority
+        // re-runs this stage; the root resumes the same reservation).
+        let receipt=allocate_with(self.root.as_ref(),item)?;
         if crate::isolation_adopt::proposal_ref(item).map_err(|_|Error::Invalid)?.is_some() {
             // F6g §3.10 steps 4–5: transform, re-key, marker, confirmed row, commit.
             let approver=self.approver(item)?;

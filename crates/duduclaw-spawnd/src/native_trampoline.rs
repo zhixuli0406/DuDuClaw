@@ -56,6 +56,9 @@ pub enum HelperState {
     /// Readiness / per-call reason, e.g. `helper_cgroup_unavailable`.
     Unavailable(&'static str),
 }
+/// The only `argv[0]` a signed forwarder may carry: its entry in the verified
+/// runtime mount (checked in `prepare`; the R7d policy tool generates it).
+pub(crate) fn forwarder_argv0(entry: &str) -> String { format!("/runtime/{entry}") }
 pub struct ForwarderProfile {
     pub entry: String,
     pub executable_digest: Sha256Digest,
@@ -210,7 +213,7 @@ impl Trampoline for NativeTrampoline {
         let forwarder = if let Some(value) = profile.forwarder {
             let verified = checked(crate::bootstrap_mounts::open_verified(runtime.as_fd(), &value.entry,
                 value.executable_digest, true, std::time::Instant::now() + std::time::Duration::from_secs(15)))?;
-            if value.argv.first().map(|arg| arg.as_bytes()) != Some(format!("/runtime/{}", value.entry).as_bytes()) {
+            if value.argv.first().map(|arg| arg.as_bytes()) != Some(forwarder_argv0(&value.entry).as_bytes()) {
                 return Err(unavailable());
             }
             Some((Program { identity: checked(fd::observe(verified.fd.as_raw_fd()))?.identity,

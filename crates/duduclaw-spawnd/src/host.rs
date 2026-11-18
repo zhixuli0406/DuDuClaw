@@ -753,7 +753,7 @@ impl Host for Core {
         let (supervisor_uid, supervisor_gid) = self.components.publication.supervisor_identity()?;
         let mut nonce = [0; 32]; nonce[..16].copy_from_slice(&os(crate::server::random_id())?); nonce[16..].copy_from_slice(&os(crate::server::random_id())?);
         let mut plan = BootstrapPlan::from_runtime(run, employee, account.uid, account.gid, supervisor_uid, supervisor_gid,
-            nonce, &runtime, *pty, *prompt_bytes, input_fds.as_slice(), if matches!(runtime.network, NetworkPolicy::Egress(_)) { Some(18080) } else { None },
+            nonce, &runtime, *pty, *prompt_bytes, input_fds.as_slice(), if matches!(runtime.network, NetworkPolicy::Egress(_)) { Some(crate::policy::RUNTIME_PROXY_PORT) } else { None },
             max_turns)?;
         plan.pty_size = launch_policy.pty_size;
         plan.validate()?;

@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "product": "duduclaw",
+  "channel": "stable",
+  "os": "linux",
+  "minimum_version": {"major": 1, "minor": 82, "patch": 0},
+  "protocols": {
+    "gateway": 1,
+    "spawnd": 1,
+    "trampoline": 1,
+    "egress": 1,
+    "updated": 1,
+    "mcp_bridge": 1,
+    "parse_worker": 1,
+    "importer": 1
+  },
+  "migrations": [],
+  "artifacts": [
+    {"id": "duduclaw", "mode": 493, "install_target": {"kind": "gateway"}},
+    {"id": "duduclaw-spawnd", "mode": 493, "install_target": {"kind": "spawnd"}},
+    {"id": "duduclaw-run", "mode": 493, "install_target": {"kind": "trampoline"}},
+    {"id": "duduclaw-run-selftest", "mode": 493, "install_target": {"kind": "trampoline_selftest"}},
+    {"id": "duduclaw-isolation-probe", "mode": 493, "install_target": {"kind": "isolation_probe"}},
+    {"id": "duduclaw-egress", "mode": 493, "install_target": {"kind": "egress"}},
+    {"id": "duduclaw-egress-forwarder", "mode": 493, "install_target": {"kind": "egress_forwarder"}},
+    {"id": "duduclaw-mcp-bridge", "mode": 493, "install_target": {"kind": "mcp_bridge"}},
+    {"id": "duduclaw-parse-worker", "mode": 493, "install_target": {"kind": "parse_worker"}},
+    {"id": "duduclaw-import", "mode": 493, "install_target": {"kind": "importer"}},
+    {"id": "duduclaw-migrate", "mode": 493, "install_target": {"kind": "migration"}},
+    {"id": "duduclaw-updated", "mode": 493, "install_target": {"kind": "update_slot"}},
+    {"id": "isolation-policy-v1", "mode": 292, "install_target": {"kind": "runtime_entry", "registry_id": "isolation-policy-v1"}},
+    {"id": "api-worker-v1", "mode": 493, "install_target": {"kind": "runtime_entry", "registry_id": "api-worker-v1"}}
+  ]
+}

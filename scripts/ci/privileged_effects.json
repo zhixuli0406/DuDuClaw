@@ -6895,6 +6895,54 @@
       "rationale": "Test-only Tokio JoinSet tasks race concurrent uploads; no OS process is launched."
     },
     {
+      "symbol": "crates/duduclaw-gateway/src/handlers/migration_authority_bridge.rs::tests::shutdown_gate_wait_idle_ends_at_last_permit_or_deadline",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "task_or_thread"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only scoped std::thread exercises ShutdownGate::wait_idle while permits are held and released; no OS process is launched."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/handlers/migration_authority_bridge.rs::tests::shutdown_gate_close_racing_enter_admits_nothing_after_close_returns",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "task_or_thread"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only scoped std::threads race ShutdownGate::close against enter and verify no permit is admitted after close returns; no OS process is launched."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/handlers/migration_authority_bridge.rs::tests::pending_wait_attempt_descheduled_across_close_never_runs",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "task_or_thread"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only scoped std::thread pauses a pending wait before gate registration, then verifies close prevents the attempt from running; no OS process is launched."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/handlers/migration_confirmations_rpc.rs::<module>",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "task_or_thread"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only descheduled! macro creates a scoped std::thread to pause confirmation effects across ShutdownGate::close; no OS process is launched."
+    },
+    {
       "symbol": "crates/duduclaw-gateway/src/isolation_connector_stack.rs::EmployeeConnectorProviders::schedule_refresh",
       "apis": {
         "terminal_spawn": 1
@@ -7255,6 +7303,18 @@
       "identity": "spawn_daemon",
       "migration": "not_process",
       "rationale": "spawnd starts one fresh Rust thread that unshares CLONE_FS|CLONE_NEWNS to compose the native home mount in a disposable namespace and returns a detached clone; no employee process or OS child is started."
+    },
+    {
+      "symbol": "crates/duduclaw-spawnd/src/update_control.rs::Measurer::start",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "task_or_thread"
+      ],
+      "identity": "spawn_daemon",
+      "migration": "not_process",
+      "rationale": "R6 readback: std::thread::Builder::spawn starts the one spawnd-update-measure thread, owned by the update-control state and started by the first Readback, that opens (trusted reader), fstats and hashes the measured component files so the update endpoint's Readback only waits on its results with a hard 2 s timeout; at most one exists (never replaced, even if stuck in a syscall) and it stops when the state is dropped. It only reads files; no OS child process is launched."
     },
     {
       "symbol": "crates/duduclaw-spawnd/src/update_control.rs::Recovered::serve",

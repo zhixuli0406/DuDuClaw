@@ -82,6 +82,20 @@ jobs:
           sudo chmod 600 /mnt/duduclaw-swap && sudo mkswap /mnt/duduclaw-swap && sudo swapon /mnt/duduclaw-swap
           free -h
 
+      # No release build next to TEST-licence settings: test-root rustc flags, the
+      # TEST issuer/key variables, rustc wrappers or Cargo configuration naming the
+      # cfg (scripts/refuse-test-license-build.py; the Linux packager applies the
+      # same rules again on every build/package run).
+      - name: Refuse test-root build settings
+        if: runner.os != 'Windows'
+        run: python3 -I -B scripts/refuse-test-license-build.py --check-environment
+
+      - name: Refuse test-root build settings (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          python -I -B scripts/refuse-test-license-build.py --check-environment
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7
         with:
           node-version: "22"
@@ -126,6 +140,18 @@ jobs:
         # NASM (Windows MSVC); all are preinstalled on GitHub-hosted runners, and the
         # Windows build already vendored OpenSSL via duduclaw-auth, so no extra env.
         run: cargo build --release --target ${{ matrix.target }} -p duduclaw-cli -p duduclaw-gateway --features duduclaw-gateway/dashboard,duduclaw-gateway/desktop,duduclaw-cli/dashboard,duduclaw-gateway/vendored-openssl
+
+      # Before anything signs, notarises, packages or uploads it: the built gateway
+      # must not be a TEST-licence build (static marker check, nothing executed).
+      - name: Refuse a TEST-licence gateway (macOS)
+        if: runner.os == 'macOS'
+        run: python3 -I -B scripts/refuse-test-license-build.py target/${{ matrix.target }}/release/duduclaw
+
+      - name: Refuse a TEST-licence gateway (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          python -I -B scripts/refuse-test-license-build.py target/${{ matrix.target }}/release/duduclaw.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Check binary is portable (macOS)
         if: runner.os == 'macOS'
@@ -463,6 +489,20 @@ jobs:
         with:
           pattern: duduclaw-*
           merge-multiple: true
+
+      # Every archive about to be minisigned and published: no duduclaw* member may
+      # be a TEST-licence build (scripts/refuse-test-license-build.py).
+      - name: Refuse TEST-licence gateways in the release archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          archives=(duduclaw-*.tar.gz duduclaw-*.zip)
+          if (( ${#archives[@]} == 0 )); then
+            echo "::error::no release archives to check"
+            exit 1
+          fi
+          python3 -I -B scripts/refuse-test-license-build.py "${archives[@]}"
 
       # The in-app updater (crates/duduclaw-gateway/src/updater.rs) REQUIRES a
       # valid .minisig for every archive — an unsigned release cannot be

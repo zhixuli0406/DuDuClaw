@@ -10146,6 +10146,7 @@
   "migrationConfirm.title": "Migration review",
   "migrationConfirm.description": "Review previous settings before they take effect. Approval is followed by application and verification.",
   "migrationConfirm.loadFailed": "Could not read the latest state. Refresh before taking action.",
+  "migrationConfirm.allocationPending": "The account's security check is not finished yet. Please retry in a moment.",
   "migrationConfirm.refresh": "Refresh",
   "migrationConfirm.loading": "Loading…",
   "migrationConfirm.inactive": "No migration is awaiting review.",

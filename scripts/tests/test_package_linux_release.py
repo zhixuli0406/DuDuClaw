@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -31,7 +32,11 @@ BOOTSTRAP = PACKAGE.BOOTSTRAP_BINARY
 # Every variable that could carry a pin or a test-root setting into a test run.
 BOOTSTRAP_ENVIRONMENT = (PACKAGE.BOOTSTRAP_PIN_VARIABLE, PACKAGE.BOOTSTRAP_TEST_KEY_VARIABLE, "RUSTFLAGS",
                          "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS",
-                         "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS")
+                         "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS", PACKAGE.TEST_LICENSE_ISSUER_VARIABLE,
+                         # rustc wrappers/overrides, refused by the shared environment rules.
+                         *PACKAGE.REFUSER.RUSTC_VARIABLES)
+# A duduclaw built with `--cfg duduclaw_test_root` and a TEST licence issuer.
+TEST_LICENSE_GATEWAY = b"\x7fELF\x00GLIBC_2.17\x00duduclaw" + PACKAGE.TEST_LICENSE_MARKER + b"\x00rest"
 
 
 LINUX = sys.platform.startswith("linux")
@@ -308,11 +313,19 @@ class LinuxReleaseTests(unittest.TestCase):
         # Without a pin the build the script runs does not even produce the verifier.
         self.assertNotIn(BOOTSTRAP, PACKAGE.build_command(TARGET, "cargo", False))
 
-    def test_no_pin_omits_bootstrap_even_from_a_test_root_build(self):
+    def test_test_root_build_settings_are_refused_without_a_pin_too(self):
+        # duduclaw itself is a test-root build there (TEST licence issuer): refused, pin or not.
         release = self.cargo_layout()
-        self.run_main(release, [], environment={"RUSTFLAGS": "--cfg duduclaw_test_root",
-                                                PACKAGE.BOOTSTRAP_TEST_KEY_VARIABLE: "RWQtest"})
-        self.assertNotIn(BOOTSTRAP, self.archive_names())
+        for environment in ({"RUSTFLAGS": "--cfg duduclaw_test_root"},
+                            {PACKAGE.BOOTSTRAP_TEST_KEY_VARIABLE: "RWQtest"},
+                            {PACKAGE.TEST_LICENSE_ISSUER_VARIABLE: "ab" * 32}):
+            for skip_build in (True, False):
+                with self.subTest(environment=environment, skip_build=skip_build):
+                    calls = []
+                    with self.assertRaisesRegex(ValueError, "refusing a production build or package"):
+                        self.run_main(release, calls, environment=environment, skip_build=skip_build)
+                    self.assertFalse(any(call[1:2] == ["build"] for call in calls))
+                    self.assertFalse(self.output.exists())
 
     def test_environment_pin_only_feeds_a_build_this_run_performs(self):
         release = self.cargo_layout()
@@ -1050,7 +1063,11 @@ class LinuxReleaseTests(unittest.TestCase):
         template.write_text(json.dumps(document))
         with patch.dict(os.environ, {"CI": "", "GITHUB_ACTIONS": ""}):
             outputs = PACKAGE.sign_release(self.binaries, TARGET, self.output, template, key, "ssh-keygen")
-        self.assertEqual(len(outputs), 13)
+        expected_outputs = {"isolated-linux-x86_64-" + artifact["id"]
+                            for artifact in document["artifacts"]}
+        expected_outputs.update({"isolated-linux-x86_64-manifest.json",
+                                 "isolated-linux-x86_64-manifest.json.signatures.json"})
+        self.assertCountEqual([path.name for path in outputs], expected_outputs)
         manifest = self.output / "isolated-linux-x86_64-manifest.json"
         document = json.loads(manifest.read_bytes())
         for artifact in document["artifacts"]:
@@ -1086,7 +1103,11 @@ class LinuxReleaseTests(unittest.TestCase):
         template.write_text(json.dumps(document))
         with patch.dict(os.environ, {"CI":"", "GITHUB_ACTIONS":""}):
             outputs = PACKAGE.sign_release(self.binaries,TARGET,self.output,template,key,"ssh-keygen",runtime_dir)
-        self.assertEqual(len(outputs),17)
+        expected_outputs = {"isolated-linux-x86_64-" + artifact["id"]
+                            for artifact in document["artifacts"]}
+        expected_outputs.update({"isolated-linux-x86_64-manifest.json",
+                                 "isolated-linux-x86_64-manifest.json.signatures.json"})
+        self.assertCountEqual([path.name for path in outputs], expected_outputs)
         canonical = lambda value: json.dumps(value,sort_keys=True,separators=(",", ":")).encode()
         root = self.root / "root.json"
         root.write_bytes(canonical({"schema_version":1,"version":1}))
@@ -1094,11 +1115,131 @@ class LinuxReleaseTests(unittest.TestCase):
         signatures.write_text('["root-fixture-a","root-fixture-b"]')
         inbox = PACKAGE.create_bootstrap_inbox(TARGET,self.output,root,signatures)
         manifest = json.loads((inbox / "manifest.json").read_bytes())
-        self.assertEqual(len(list((inbox / "artifacts").iterdir())),15)
+        self.assertCountEqual([path.name for path in (inbox / "artifacts").iterdir()],
+                              {artifact["id"] for artifact in document["artifacts"]})
         for artifact in manifest["artifacts"]:
             payload = (inbox / "artifacts" / artifact["id"]).read_bytes()
             self.assertEqual(artifact["sha256"],list(hashlib.sha256(payload).digest()))
             self.assertEqual(artifact["size_bytes"],len(payload))
+
+    # ---------------------------------------------------------------- R7d: signed isolation policy (TEST path)
+
+    TEST_FIXTURES = ROOT / "scripts/live-test/linux-protected/fixtures"
+    # The smallest policy the offline validator (sign-isolation-manifest.py) accepts
+    # as v4; spawnd would refuse it (no runtime), which is not what this checks.
+    TINY_POLICY_V4 = (b'{"domain":"duduclaw-isolation-policy-v4","version":4,"runtimes":[],"native":[],'
+                      b'"dns_probe_name":"example.com"}')
+
+    def test_test_template_is_the_shipped_template_plus_policy_and_api_worker(self):
+        shipped = json.loads((ROOT / "release/isolation/manifest-template.json").read_bytes())
+        test = json.loads((self.TEST_FIXTURES / "manifest-template-test.json").read_bytes())
+        self.assertEqual({key: value for key, value in test.items() if key != "artifacts"},
+                         {key: value for key, value in shipped.items() if key != "artifacts"})
+        self.assertEqual(test["artifacts"][:-2], shipped["artifacts"])
+        self.assertEqual(test["artifacts"][-2:], [
+            {"id": "isolation-policy-v1", "mode": 0o444,
+             "install_target": {"kind": "runtime_entry", "registry_id": "isolation-policy-v1"}},
+            {"id": "api-worker-v1", "mode": 0o755,
+             "install_target": {"kind": "runtime_entry", "registry_id": "api-worker-v1"}}])
+        PACKAGE.validate_targets(test["artifacts"])
+        # The production template still carries no runtime entry (an owner decision).
+        self.assertFalse(any(a["install_target"]["kind"] == "runtime_entry" for a in shipped["artifacts"]))
+        self.assertEqual(PACKAGE.runtime_source(test["artifacts"][-1], self.binaries, None),
+                         self.binaries / "duduclaw-api-worker")
+        # The TEST policy source names files that exist next to it, and one egress runtime.
+        source = json.loads((self.TEST_FIXTURES / "policy-source-test.json").read_bytes())
+        self.assertEqual(source["schema"], "duduclaw-isolation-policy-source-v1")
+        self.assertEqual(source["dns_probe_name"], "example.com")
+        self.assertEqual(len(source["runtimes"]), 1)
+        runtime = source["runtimes"][0]
+        self.assertEqual((runtime["runtime"], runtime["executable"], runtime["network"]["kind"], runtime["mcp"]),
+                         ({"kind": "open_ai_compat"}, "runtime-api-worker-v1", "egress", True))
+        self.assertNotIn("mcp_acceptance", runtime)
+        for files in (source["forwarder_seccomp"], runtime["native"]["seccomp"]):
+            for arch in ("x86_64", "aarch64"):
+                self.assertTrue((self.TEST_FIXTURES / files[arch]).is_file(), files[arch])
+                self.assertIn("TEST-ONLY", (self.TEST_FIXTURES / files[arch]).read_text())
+
+    def test_stage_policy_inputs_copies_generation_names_from_signed_sources(self):
+        template = self.TEST_FIXTURES / "manifest-template-test.json"
+        destination = self.root / "policy-inputs"
+        names = PACKAGE.stage_policy_inputs(self.binaries, template, destination)
+        self.assertEqual(names, ["duduclaw-egress-forwarder", "duduclaw-mcp-bridge", "runtime-api-worker-v1"])
+        for name, source in (("duduclaw-egress-forwarder", "duduclaw-egress"), ("duduclaw-mcp-bridge", "duduclaw-mcp-bridge"),
+                             ("runtime-api-worker-v1", "duduclaw-api-worker")):
+            self.assertEqual((destination / name).read_bytes(), (self.binaries / source).read_bytes())
+            self.assertEqual((destination / name).stat().st_mode & 0o7777, 0o755)
+        # The policy entry is the generator's output, never an input.
+        self.assertFalse((destination / "runtime-isolation-policy-v1").exists())
+        self.assertEqual(destination.stat().st_mode & 0o777, 0o700)
+        with self.assertRaises(FileExistsError):
+            PACKAGE.stage_policy_inputs(self.binaries, template, destination)
+        (self.binaries / "duduclaw-api-worker").chmod(0o644)
+        with self.assertRaisesRegex(ValueError, "executable"):
+            PACKAGE.stage_policy_inputs(self.binaries, template, self.root / "other-inputs")
+
+    @unittest.skipUnless(shutil.which("ssh-keygen"), "requires OpenSSH")
+    def test_test_template_and_policy_flow_through_the_packager_into_the_signed_manifest(self):
+        key = self.root / "policy-test-key"
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)], check=True)
+        template = self.root / "rendered-test-template.json"
+        template.write_bytes(PACKAGE.render_release_template(
+            (self.TEST_FIXTURES / "manifest-template-test.json").read_bytes(), "x86_64",
+            PACKAGE.workspace_version(), int(time.time()), 30))
+        runtime_dir = self.root / "TEST-runtime"
+        runtime_dir.mkdir()
+        (runtime_dir / "runtime-isolation-policy-v1").write_bytes(self.TINY_POLICY_V4)
+        with patch.dict(os.environ, {"CI": "", "GITHUB_ACTIONS": ""}):
+            outputs = PACKAGE.sign_release(self.binaries, TARGET, self.output, template, key, "ssh-keygen", runtime_dir)
+        names = {path.name for path in outputs}
+        self.assertIn("isolated-linux-x86_64-isolation-policy-v1", names)
+        self.assertIn("isolated-linux-x86_64-api-worker-v1", names)
+        manifest = json.loads((self.output / "isolated-linux-x86_64-manifest.json").read_bytes())
+        by_id = {artifact["id"]: artifact for artifact in manifest["artifacts"]}
+        policy = by_id["isolation-policy-v1"]
+        self.assertEqual(policy["mode"], 0o444)
+        self.assertEqual(policy["install_target"], {"kind": "runtime_entry", "registry_id": "isolation-policy-v1"})
+        self.assertEqual(policy["sha256"], list(hashlib.sha256(self.TINY_POLICY_V4).digest()))
+        self.assertEqual(policy["size_bytes"], len(self.TINY_POLICY_V4))
+        self.assertEqual((self.output / "isolated-linux-x86_64-isolation-policy-v1").read_bytes(), self.TINY_POLICY_V4)
+        worker = by_id["api-worker-v1"]
+        self.assertEqual(worker["mode"], 0o755)
+        self.assertEqual(worker["sha256"], list(hashlib.sha256((self.binaries / "duduclaw-api-worker").read_bytes()).digest()))
+        # A policy the offline validator refuses (here: v4 without dns_probe_name) is never signed.
+        output = self.root / "refused-out"
+        (runtime_dir / "runtime-isolation-policy-v1").write_bytes(
+            b'{"domain":"duduclaw-isolation-policy-v4","version":4,"runtimes":[],"native":[]}')
+        with patch.dict(os.environ, {"CI": "", "GITHUB_ACTIONS": ""}), self.assertRaisesRegex(ValueError, "dns_probe_name"):
+            PACKAGE.sign_release(self.binaries, TARGET, output, template, key, "ssh-keygen", runtime_dir)
+        self.assertFalse((output / "isolated-linux-x86_64-manifest.json").exists())
+
+    def test_policy_generator_is_never_built_listed_or_packaged(self):
+        self.assertNotIn(PACKAGE.POLICY_TOOL_BINARY, PACKAGE.BIN_PACKAGES)
+        self.assertNotIn(PACKAGE.POLICY_TOOL_BINARY, PACKAGE.archive_binaries(True))
+        for bad in ({**PACKAGE.BIN_PACKAGES, PACKAGE.POLICY_TOOL_BINARY: "duduclaw-spawnd"},
+                    {**PACKAGE.BIN_PACKAGES, "x": "duduclaw-spawnd/policy-tool"}):
+            with self.assertRaises(ValueError):
+                PACKAGE.check_release_binary_set(bad)
+        for include in (True, False):
+            command = PACKAGE.build_command(TARGET, "cross", include)
+            self.assertEqual(PACKAGE.refuse_test_signer_build(command), command)
+            for extra in (["--features", "duduclaw-spawnd/policy-tool"], ["--features=policy-tool"],
+                          ["--bin", PACKAGE.POLICY_TOOL_BINARY]):
+                with self.subTest(extra=extra), self.assertRaisesRegex(ValueError, "policy generator"):
+                    PACKAGE.refuse_test_signer_build(command + extra)
+        # The Cargo manifest builds the generator only behind its non-default feature.
+        manifest = (ROOT / "crates/duduclaw-spawnd/Cargo.toml").read_text()
+        block = re.search(r'\[\[bin\]\]\nname = "duduclaw-isolation-policy"\n(?:[^\[\n][^\n]*\n)*', manifest)
+        self.assertIsNotNone(block)
+        self.assertIn('required-features = ["policy-tool"]', block[0])
+        self.assertIsNone(re.search(r'(?m)^default\s*=.*policy-tool', manifest))
+        # The TEST kit builds it the way it builds the TEST signer and signs with the TEST template.
+        kit = (ROOT / "scripts/isolation-test-keys.sh").read_text()
+        self.assertIn("--features policy-tool --bin duduclaw-isolation-policy", kit)
+        self.assertIn('CARGO_TARGET_DIR="$ROOT/target/isolation-policy-tool"', kit)
+        self.assertIn("manifest-template-test.json", kit)
+        self.assertIn('--runtime-artifacts-dir "$runtime_dir"', kit)
+        self.assertNotIn("release/isolation/manifest-template.json", kit)
 
     # ---------------------------------------------------------------- R2: test-key leak prevention
 
@@ -1150,8 +1291,108 @@ class LinuxReleaseTests(unittest.TestCase):
         block = re.search(r'\[\[bin\]\]\nname = "duduclaw-isolation-test-signer"\n(?:[^\[\n][^\n]*\n)*', manifest)
         self.assertIsNotNone(block)
         self.assertIn('required-features = ["test-signer"]', block[0])
-        self.assertIn('test-signer = ["dep:blake2"]', manifest)
+        self.assertIn('test-signer = ["dep:blake2", "dep:duduclaw-license", "dep:chrono"]', manifest)
         self.assertNotRegex(manifest, r'(?m)^default\s*=.*test-signer')
+
+    # ---------------------------------------------------------------- TEST-licence gateway
+
+    def marked_archive(self, name):
+        """A release archive whose duduclaw is a TEST-licence build, made by hand
+        (as scripts/isolation-test-keys.sh bundle --gateway does): the packager refuses to."""
+        archive = self.archive_with(False, name)
+        directory = self.root / f"{name}-marked"
+        directory.mkdir()
+        copy = directory / archive.name
+        with tarfile.open(archive, "r:gz") as source, tarfile.open(copy, "w:gz") as bundle:
+            for member in source.getmembers():
+                if member.name == PACKAGE.GATEWAY_BINARY:
+                    member.size = len(TEST_LICENSE_GATEWAY)
+                    bundle.addfile(member, io.BytesIO(TEST_LICENSE_GATEWAY))
+                else:
+                    bundle.addfile(member, source.extractfile(member) if member.isfile() else None)
+        Path(str(copy) + ".sha256").write_text(f"{PACKAGE.sha256(copy)}  {copy.name}\n")
+        return copy
+
+    def run_from_release_archive(self, archive, extra=()):
+        """main() --from-release-archive with the glibc check and the signer faked; returns
+        (test_signer argument of each sign_release call, stdout)."""
+        signed, output = [], io.StringIO()
+        argv = ["package-linux-release.py", "--target", TARGET, "--output-dir", str(self.output),
+                "--from-release-archive", str(archive), "--signing-key", str(self.root / "target-key"),
+                "--manifest-template", str(self.root / "template.json"), *extra]
+        with patch.object(PACKAGE, "sign_release", lambda *args, **kwargs: signed.append(args[7]) or []), \
+                patch.object(PACKAGE.subprocess, "run", lambda command, **kwargs: subprocess.CompletedProcess(command, 0)), \
+                patch.object(sys, "argv", argv), patch.dict(os.environ, {"CI": "", "GITHUB_ACTIONS": ""}), \
+                contextlib.redirect_stdout(output):
+            PACKAGE.main()
+        return signed, output.getvalue()
+
+    def test_test_license_marker_matches_the_test_root_only_gateway_constant(self):
+        source = (ROOT / "crates/duduclaw-gateway/src/license_runtime.rs").read_text()
+        marker = PACKAGE.TEST_LICENSE_MARKER.decode("ascii")
+        # Compiled only into a test-root build, and kept alive there.
+        self.assertIn(f'#[cfg(duduclaw_test_root)]\n#[used]\nstatic TEST_LICENSE_BUILD_MARKER: &[u8] = b"{marker}";',
+                      source)
+        self.assertEqual(source.count(marker), 1)
+        self.assertIn(f'option_env!("{PACKAGE.TEST_LICENSE_ISSUER_VARIABLE}")', source)
+        # Found across read-chunk borders; a near miss is not a match.
+        def reader(*parts):
+            queue = list(parts)
+            return lambda size: queue.pop(0) if queue else b""
+        found = PACKAGE.TEST_LICENSE_MARKER
+        self.assertTrue(PACKAGE.has_test_license_marker(reader(b"x" * 9 + found[:5], found[5:] + b"y")))
+        self.assertTrue(PACKAGE.has_test_license_marker(reader(b"a", b"b" + found)))
+        self.assertFalse(PACKAGE.has_test_license_marker(reader(b"x" + found[:-1], b"z" + found[-1:])))
+        self.assertFalse(PACKAGE.has_test_license_marker(reader()))
+
+    def test_test_license_gateway_is_refused_by_every_packaging_path(self):
+        # A clean gateway passes, and --verify-archive says so.
+        clean = self.archive_with(False, "clean")
+        self.assertIn(f"{PACKAGE.GATEWAY_BINARY}: no TEST licence issuer",
+                      PACKAGE.verify_archive(clean, TARGET, None, VERSION))
+        marked = self.marked_archive("marked")
+        (self.binaries / PACKAGE.GATEWAY_BINARY).write_bytes(TEST_LICENSE_GATEWAY)
+        # The archive writer itself.
+        with self.assertRaisesRegex(ValueError, "TEST-licence build"):
+            self.create(pin=None)
+        self.assertFalse(self.output.exists())
+        release = self.cargo_layout()
+        # Packaging (no pin and pinned), the hand-off export and the native hand-off import.
+        for extra in ([], ["--bootstrap-root-sha256", PIN]):
+            with self.subTest(extra=extra):
+                with self.assertRaisesRegex(ValueError, "TEST-licence build"):
+                    self.run_main(release, [], extra=extra, probes=good_probes())
+                self.assertFalse(self.output.exists())
+        handoff = self.root / "marked-handoff"
+        with self.assertRaisesRegex(ValueError, "TEST-licence build"):
+            self.run_main(release, [], extra=["--export-binaries", str(handoff)])
+        self.assertFalse(handoff.exists())
+        # A finished archive holding one: --verify-archive refuses before any verifier is executed.
+        calls = []
+        for pin in (None, PIN):
+            with self.subTest(verify=pin), self.seam(calls=calls), self.assertRaisesRegex(ValueError, "TEST-licence"):
+                PACKAGE.verify_archive(marked, TARGET, pin, VERSION)
+        self.assertFalse(any(call[0] == "probe" for call in calls))
+
+    def test_only_the_test_signer_path_signs_over_a_test_license_gateway(self):
+        marked = self.marked_archive("signing")
+        with self.assertRaisesRegex(ValueError, "TEST-licence build"):
+            self.run_from_release_archive(marked)
+        signer = self.root / "test-signer"
+        signed, output = self.run_from_release_archive(marked, ["--test-signer", str(signer)])
+        self.assertEqual(signed, [signer])
+        self.assertIn(f"TEST-ONLY: {PACKAGE.GATEWAY_BINARY} is a TEST-licence build", output)
+        # A clean archive signs without the TEST note, with or without the test signer.
+        clean = self.archive_with(False, "clean-signing")
+        signed, output = self.run_from_release_archive(clean)
+        self.assertEqual(signed, [None])
+        self.assertNotIn("TEST-licence", output)
+
+    def test_test_license_issuer_variable_is_refused(self):
+        for value in ("ab" * 32, ""):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, PACKAGE.TEST_LICENSE_ISSUER_VARIABLE):
+                PACKAGE.refuse_test_root_environment({PACKAGE.TEST_LICENSE_ISSUER_VARIABLE: value}, TARGET)
+        PACKAGE.refuse_test_root_environment({"DUDUCLAW_LICENSE_PUBKEY_V2": "ab" * 32}, TARGET)
 
     def test_pin_file_absent_means_no_bootstrap_and_present_is_strict(self):
         missing = self.root / "release" / "bootstrap-root.sha256"

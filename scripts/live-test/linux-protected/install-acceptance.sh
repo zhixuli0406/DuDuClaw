@@ -16,6 +16,17 @@
 #            rollback before the first fact and after S6, refusals). They need
 #            ISO_BOOTSTRAP_GENERATION (a staged generation) in the environment.
 # Each check prints PASS/FAIL; the script exits non-zero on any FAIL.
+#
+# Licence of a TEST run: the installer requires a team licence at
+# /root/duduclaw-migrate/license.json (root, 0600 or 0644). A TEST run never uses
+# a production licence: `scripts/isolation-test-keys.sh keys` also makes a TEST
+# licence issuer and prints the TEST-licence duduclaw build; `bundle --gateway
+# <that duduclaw>` puts it into the bundle; run `duduclaw license fingerprint` as
+# root ON THIS VM (any duduclaw build; line 1) and sign with
+# `scripts/isolation-test-keys.sh license --keys <dir> --fingerprint <line 1> --out <file>`
+# (tier self_host_pro by default; partner and oem also qualify). Only that TEST
+# build accepts it (`duduclaw print-license-issuer` prints TEST-LICENSE <key>);
+# production builds and release tooling refuse it.
 set -eu
 umask 077
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
@@ -102,6 +113,7 @@ no_facts() {
     return 0
 }
 journal_committed() { grep -q '"committed":true' "$JOURNAL"; }
+test_license_gateway() { /opt/duduclaw/bin/duduclaw print-license-issuer | grep -Eqx 'TEST-LICENSE [0-9a-f]{64}'; }
 
 [ "$#" -ge 1 ] || usage
 [ "$(id -u)" = 0 ] || { echo 'FAIL preconditions: root required'; exit 1; }
@@ -116,6 +128,7 @@ case "$mode" in
             *) echo 'FAIL preconditions: acceptance uses TEST root keys only'; exit 1 ;; esac
         if "$BOOTSTRAP" install "$@"; then record PASS 'duduclaw-bootstrap install'; else record FAIL 'duduclaw-bootstrap install'; fi
         check 'journal committed' journal_committed
+        check 'gateway is the TEST-licence build' test_license_gateway
         check 'readiness --protected-linux' /opt/duduclaw/bin/duduclaw service readiness --protected-linux
         check 'frozen launcher receipt root 0600' test "$(stat -c %u:%g:%a "$RECEIPT")" = 0:0:600
         check 'nightly update timer active' systemctl is-active --quiet duduclaw-auto-upgrade.timer

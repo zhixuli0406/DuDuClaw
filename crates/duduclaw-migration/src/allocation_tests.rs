@@ -196,6 +196,58 @@ fn allocation_operation_kinds_distinct_and_stable() {
     }
     assert_eq!((OperationKind::Allocate as u8, OperationKind::Compensate as u8, OperationKind::Retire as u8), (0, 1, 2));
 }
+/// R7d: schema 3 (Allocate only) carries the two pending kinds; schema 2
+/// reads them as NotReady, schema 1 drops them; an older reply to a schema-3
+/// request, a pending kind in a schema-2 reply and an unknown kind are refused.
+#[test]
+fn allocation_schema3_pending_kinds_and_fail_closed_pairs() {
+    let mut v3 = request(Action::Allocate, employee(ConfirmationStatus::Applying));
+    v3.schema = SCHEMA_V3;
+    assert!(v3.check().is_ok());
+    for action in [Action::ReadBack, Action::Disable] {
+        let mut other = v3.clone(); other.action = action;
+        other.item.status = if action == Action::Disable { ConfirmationStatus::Failed } else { ConfirmationStatus::Applying };
+        assert_eq!(other.check().unwrap_err(), Error::Invalid, "schema 3 is Allocate only: {action:?}");
+    }
+    let mut v4 = v3.clone(); v4.schema = 4;
+    assert_eq!(v4.check().unwrap_err(), Error::Invalid, "unknown schema");
+    for code in [ErrorCode::Pending, ErrorCode::PendingLimit] {
+        let wire: Response = serde_json::from_slice(&serde_json::to_vec(&Response::for_request(&v3, Err(code))).unwrap()).unwrap();
+        assert_eq!(wire.schema, SCHEMA_V3);
+        assert!(matches!(check_response(&v3, wire).unwrap(), Answer::Refused(c) if c == code), "{code:?}");
+        // The same root answer to a schema-2 / schema-1 request.
+        let mut v2 = v3.clone(); v2.schema = SCHEMA_V2;
+        assert_eq!(Response::for_request(&v2, Err(code)).error, Some(ErrorCode::NotReady));
+        let mut v1 = v3.clone(); v1.schema = 1;
+        let old = Response::for_request(&v1, Err(code));
+        assert!(old.schema == 1 && old.error.is_none() && old.receipt.is_none());
+        // A schema-2 reply never carries a pending kind.
+        let forged = Response { schema: SCHEMA_V2, nonce: v2.nonce, receipt: None, error: Some(code), phase: None, idle: None };
+        assert!(check_response(&v2, forged).is_err());
+    }
+    assert_eq!(serde_json::to_value(ErrorCode::Pending).unwrap(), "pending");
+    assert_eq!(serde_json::to_value(ErrorCode::PendingLimit).unwrap(), "pending_limit");
+    // A schema-3 request refuses an older-schema reply, even a well-formed one.
+    for schema in [1, SCHEMA_V2] {
+        let old = Response { schema, nonce: v3.nonce, receipt: None, error: Some(ErrorCode::Pending), phase: None, idle: None };
+        assert!(check_response(&v3, old).is_err(), "schema {schema}");
+    }
+    // An unknown kind never decodes.
+    let known = serde_json::to_string(&Response::for_request(&v3, Err(ErrorCode::Pending))).unwrap();
+    assert!(serde_json::from_str::<Response>(&known).is_ok());
+    let unknown = known.replace(r#""error":"pending""#, r#""error":"pending_forever""#);
+    assert_ne!(unknown, known);
+    assert!(serde_json::from_str::<Response>(&unknown).is_err());
+    // A Ready schema-3 reply is checked like a schema-2 Allocate.
+    let spec = v3.validate().unwrap();
+    let ready = Receipt { binding: v3.item.binding, label: spec.label, employee: EmployeeId([7;16]), uid: 70001, bytes: spec.bytes,
+        inodes: spec.inodes, disabled: false, principal_binding: None };
+    let reply = Reply { receipt: ready.clone(), phase: Phase::Ready, idle: None };
+    let wire = Response::for_request(&v3, Ok(reply));
+    assert!(matches!(check_response(&v3, wire).unwrap(), Answer::Reply(r) if r.receipt.uid == 70001));
+    let planned = Response { schema: SCHEMA_V3, nonce: v3.nonce, receipt: Some(ready), error: None, phase: Some(Phase::Planned), idle: None };
+    assert!(check_response(&v3, planned).is_err(), "an Allocate answer is Ready or a refusal");
+}
 #[test]
 fn allocation_response_schema2_error_code() {
     let spec = retire_spec();

@@ -10146,6 +10146,7 @@
   "migrationConfirm.title": "移行の確認",
   "migrationConfirm.description": "以前の設定は再確認後に有効になります。承認後も適用と検証が必要です。",
   "migrationConfirm.loadFailed": "最新の状態を取得できません。更新してから操作してください。",
+  "migrationConfirm.allocationPending": "アカウントのセキュリティ検証がまだ完了していません。しばらくしてから再試行してください。",
   "migrationConfirm.refresh": "更新",
   "migrationConfirm.loading": "読み込み中…",
   "migrationConfirm.inactive": "確認待ちの移行はありません。",

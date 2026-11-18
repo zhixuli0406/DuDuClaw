@@ -17,6 +17,9 @@ on:
       - 'crates/duduclaw-core/src/root_key*.rs'
       - 'crates/duduclaw-updated/src/**'
       - 'release/**'
+      - 'crates/duduclaw-gateway/src/license_runtime.rs'
+      - 'crates/duduclaw-gateway/src/bin/**'
+      - 'scripts/refuse-test-license-build.py'
   workflow_dispatch:
 
 permissions:
@@ -190,6 +193,84 @@ jobs:
           path: target/${{ matrix.target }}/release/duduclaw
           if-no-files-found: error
           retention-days: 3
+
+  # TEST-licence marker probe (scripts/refuse-test-license-build.py): the marker every
+  # release path scans for must survive the release profile (thin LTO, strip) in a
+  # binary that links license_runtime's marker code. The probe is that binary
+  # (feature marker-probe, never packaged); this proves it for the probe, NOT for the
+  # full duduclaw binary. One leg per build, in parallel with the release smoke; the
+  # test-root leg uses its own target directory and no TEST issuer key.
+  license-marker-probe:
+    name: TEST-licence marker probe (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - production
+          - test-root
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
+
+      - name: Add swap (Linux)
+        # Release-mode rustc for duduclaw-gateway exceeds the 16 GB runner (SIGKILL).
+        # /mnt is the large ephemeral disk.
+        if: runner.os == 'Linux'
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 16G /mnt/duduclaw-swap || sudo dd if=/dev/zero of=/mnt/duduclaw-swap bs=1M count=16384
+          sudo chmod 600 /mnt/duduclaw-swap && sudo mkswap /mnt/duduclaw-swap && sudo swapon /mnt/duduclaw-swap
+          free -h
+
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca  # stable
+        with:
+          toolchain: stable
+
+      - name: Install native build deps (libdbus via keyring)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libdbus-1-dev
+
+      - name: Build the probe with the release profile and check the refuser and its identity
+        shell: bash
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          set -euo pipefail
+          unset DUDUCLAW_TEST_LICENSE_ISSUER_PUBKEY
+          if [[ "$VARIANT" == test-root ]]; then
+            export CARGO_TARGET_DIR=target/license-marker-probe-test-root RUSTFLAGS='--cfg duduclaw_test_root'
+          else
+            export CARGO_TARGET_DIR=target/license-marker-probe
+            unset RUSTFLAGS
+          fi
+          cargo build --locked --release -p duduclaw-gateway --no-default-features \
+            --features duduclaw-gateway/vendored-openssl,duduclaw-gateway/marker-probe --bin duduclaw-license-marker-probe
+          built="$CARGO_TARGET_DIR/release/duduclaw-license-marker-probe"
+          mkdir -m 0700 "$RUNNER_TEMP/probe"
+          stripped="$RUNNER_TEMP/probe/duduclaw-license-marker-probe"
+          cp -- "$built" "$stripped"
+          # The profile already strips symbols; strip everything else as well
+          # (scripts/release.sh strips the Linux Pro binary with --strip-all).
+          strip --strip-all "$stripped"
+          if [[ "$VARIANT" == test-root ]]; then expected_status=1; else expected_status=0; fi
+          for probe in "$built" "$stripped"; do
+            status=0
+            python3 -I -B scripts/refuse-test-license-build.py "$probe" || status=$?
+            if [[ "$status" != "$expected_status" ]]; then
+              echo "::error::refuse-test-license-build.py exited $status for the $VARIANT probe $probe (expected $expected_status)"
+              exit 1
+            fi
+            identity="$(env -i "$probe")"
+            if [[ "$VARIANT" == test-root ]]; then
+              [[ "$identity" == "TEST-LICENSE none" ]] || { echo "::error::test-root probe must print exactly TEST-LICENSE none"; exit 1; }
+            else
+              [[ "$identity" =~ ^PRODUCTION-LICENSE\ [0-9a-f]{16}$ ]] || { echo "::error::release probe must print PRODUCTION-LICENSE <16 hex>"; exit 1; }
+            fi
+          done
+          echo "license marker probe ($VARIANT): refuser exit $expected_status, identity '$identity' (release profile, stripped)." >> "$GITHUB_STEP_SUMMARY"
 
   package-arm64:
     name: Linux release smoke aarch64 native packaging

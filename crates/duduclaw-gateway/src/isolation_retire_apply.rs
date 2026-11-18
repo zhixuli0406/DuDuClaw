@@ -133,7 +133,8 @@ impl RetireBackend {
             Err(RetireError::RootInconsistent)
         };
         match self.root.exchange(&request) {
-            Err(()) | Ok(Answer::Refused(Root::IsolationUnavailable)) => Err(RetireError::RootUnavailable),
+            // Pending/PendingLimit: schema 3 (Allocate) only, never a retire answer.
+            Err(()) | Ok(Answer::Refused(Root::IsolationUnavailable | Root::Pending | Root::PendingLimit)) => Err(RetireError::RootUnavailable),
             Ok(Answer::Refused(Root::NotReady)) => {
                 self.host_busy(&v)?;
                 Err(RetireError::HostBusy)

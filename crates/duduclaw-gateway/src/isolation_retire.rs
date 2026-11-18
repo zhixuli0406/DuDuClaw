@@ -388,7 +388,8 @@ pub(crate) fn classify_readback(expected: &Receipt, answer: Result<Answer, ()>) 
     match answer {
         Err(()) => (RootClass::Unavailable, None),
         Ok(Answer::Refused(Root::NotFound)) => (RootClass::Gone, None),
-        Ok(Answer::Refused(Root::NotReady | Root::IsolationUnavailable)) => (RootClass::Unavailable, None),
+        // Pending/PendingLimit: schema 3 only (refused in a schema-2 reply).
+        Ok(Answer::Refused(Root::NotReady | Root::IsolationUnavailable | Root::Pending | Root::PendingLimit)) => (RootClass::Unavailable, None),
         Ok(Answer::Refused(Root::Inconsistent | Root::InvalidRequest)) => (RootClass::Inconsistent, None),
         Ok(Answer::Reply(reply)) => {
             let r = &reply.receipt;

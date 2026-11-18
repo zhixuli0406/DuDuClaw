@@ -1,0 +1,8 @@
+# TEST-ONLY syscall allow-list (aarch64, asm-generic numbers) for
+# scripts/isolation-test-keys.sh bundle. NOT a reviewed production list: it
+# allows every asm-generic syscall number in use (0-293 and 424-467) so the test
+# runtime and forwarder are never blocked by it. The fixed refusals of
+# duduclaw-run's common filter still apply on top (seccomp::runtime embeds them
+# before this list). Format: one decimal number or inclusive range per line.
+0-293
+424-467

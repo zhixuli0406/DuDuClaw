@@ -13,7 +13,8 @@ use std::{fs::{File, OpenOptions}, io::{Read, Write}, path::Path, process::ExitC
 use duduclaw_isolation::update::{RootMetadata, EMERGENCY_SSHSIG_NAMESPACE, MAX_MIGRATION_BUNDLE_BYTES,
     MIGRATION_BUNDLE_SSHSIG_NAMESPACE, RELEASE_SSHSIG_NAMESPACE, ROOT_SSHSIG_NAMESPACE, RUNTIME_SSHSIG_NAMESPACE};
 use duduclaw_updated::{metadata::{decode_canonical, MAX_METADATA_BYTES}, sshsig::SshSignature,
-    test_signer::{openssh_public_line, Role, TestKey}};
+    test_signer::{openssh_public_line, parse_license_tier, LicenseIssuerKey, Role, TestKey, TestLicense,
+        TEST_LICENSE_KEY_ID}};
 
 const USAGE: &str = "TEST-ONLY isolation signer (never use for a release)
 usage:
@@ -28,7 +29,13 @@ usage:
   duduclaw-isolation-test-signer verify <root.json> <root|release|runtime|emergency|bundle> <input> <signature> <key-id-hex>
       exit 0 only if <signature> (SSHSIG) was made by the root key <key-id-hex> (release/runtime:
       the target key) of the canonical <root.json> over exactly <input> under that kind's
-      namespace (production sshsig verifier)";
+      namespace (production sshsig verifier)
+  duduclaw-isolation-test-signer license-keygen <key-path>
+      TEST licence issuer: writes <key-path> (0600) and <key-path>.pub; prints the public key
+      hex for DUDUCLAW_TEST_LICENSE_ISSUER_PUBKEY of a --cfg duduclaw_test_root duduclaw build
+  duduclaw-isolation-test-signer license <key-path> <output> <tier> <fingerprint> <customer-id> <subscription-id> <days> [<max-agents>]
+      writes a TEST license.json (0600) with public_key_id test-root, bound to <fingerprint>
+      (`duduclaw license fingerprint` on the target machine); only a test-root build accepts it";
 
 const MAX_KEY_FILE_BYTES: u64 = 4096;
 const MAX_SIGNATURE_FILE_BYTES: u64 = 16 * 1024;
@@ -162,8 +169,51 @@ fn verify(root: &Path, kind: &str, input: &Path, signature: &Path, key_id: &str)
     Ok(())
 }
 
+fn license_keygen(path: &Path) -> Result<(), &'static str> {
+    let key = LicenseIssuerKey::from_seed(random_seed()?);
+    let public = format!("{}\n", key.public_hex());
+    let mut public_path = path.as_os_str().to_owned();
+    public_path.push(".pub");
+    let public_path = Path::new(&public_path);
+    if public_path.exists() { return Err("output exists or cannot be created"); }
+    write_new(path, 0o600, key.to_file().as_bytes())?;
+    write_new(public_path, 0o644, public.as_bytes())?;
+    print!("{public}");
+    Ok(())
+}
+
+/// Fields of `license` after the key and output paths.
+struct LicenseArguments<'a> {
+    tier: &'a str, fingerprint: &'a str, customer_id: &'a str, subscription_id: &'a str, days: &'a str,
+    max_agents: Option<&'a str>,
+}
+
+/// A TEST license.json (0600, never an overwrite). Prints only public facts.
+fn license(key: &Path, output: &Path, fields: LicenseArguments<'_>) -> Result<(), &'static str> {
+    let bytes = read_bounded(key, MAX_KEY_FILE_BYTES)?;
+    let issuer = std::str::from_utf8(&bytes).ok().and_then(LicenseIssuerKey::parse)
+        .ok_or("not a duduclaw TEST-ONLY licence issuer key file")?;
+    let tier = parse_license_tier(fields.tier).ok_or("unknown licence tier")?;
+    let valid_days: i64 = fields.days.parse().map_err(|_| "days must be a whole number")?;
+    let max_agents = fields.max_agents.map(str::parse::<u32>).transpose().map_err(|_| "max-agents must be a whole number")?;
+    let license = issuer.sign(&TestLicense { tier, fingerprint: fields.fingerprint, customer_id: fields.customer_id,
+        subscription_id: fields.subscription_id, valid_days, max_agents })
+        .ok_or("licence fields refused (printable fingerprint, ids [A-Za-z0-9_.-]{1,128}, 1-366 days)")?;
+    let mut json = serde_json::to_vec_pretty(&license).map_err(|_| "cannot encode the licence")?;
+    json.push(b'\n');
+    write_new(output, 0o600, &json)?;
+    println!("TEST licence written (key id {TEST_LICENSE_KEY_ID}, tier {}, expires {}); only a \
+        cfg(duduclaw_test_root) duduclaw build accepts it", license.tier, license.expires_at.to_rfc3339());
+    Ok(())
+}
+
 fn run(args: &[String]) -> Result<(), &'static str> {
     match args {
+        [command, path] if command == "license-keygen" => license_keygen(Path::new(path)),
+        [command, key, output, tier, fingerprint, customer_id, subscription_id, days, rest @ ..]
+            if command == "license" && rest.len() <= 1 =>
+            license(Path::new(key), Path::new(output), LicenseArguments { tier, fingerprint, customer_id,
+                subscription_id, days, max_agents: rest.first().map(String::as_str) }),
         [command, root, kind, input, signature, key_id] if command == "verify" =>
             verify(Path::new(root), kind, Path::new(input), Path::new(signature), key_id),
         [command, role, path] if command == "keygen" => keygen(role, Path::new(path)),

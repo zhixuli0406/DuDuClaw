@@ -1425,6 +1425,54 @@ reads nothing under `/run/duduclaw-isolation-evidence`.
   be pending at once; a further new employee is refused (resource limit,
   `NotReady`, nothing reserved). Start-up `reconcile` still tombstones every
   `Reserved` row.
+- **Pending on the wire (R7d).** Allocation schema 3 (`Allocate` only;
+  `duduclaw_migration::allocation::SCHEMA_V3`) adds two refusal kinds:
+  `pending` (probe pending or inconclusive) and `pending_limit` (the cap).
+  spawnd's `registry_code` emits them; `Response::for_request` sends them
+  only in a schema-3 reply, as `NotReady` in a schema-2 reply and drops them
+  in schema 1 as before. `check_response` refuses a reply whose schema differs
+  from the request (an older reply to a schema-3 request included), a pending
+  kind in a schema-2 reply, and any schema-3 request but `Allocate`; an
+  unknown kind does not decode. Only the enumerated kind crosses the wire.
+  Gateway and spawnd come from one signed generation; an older spawnd drops a
+  schema-3 request (no reply), which the gateway treats as a hard failure.
+- **Gateway retry (R7d).** `EmployeeAuthority::stage` sends schema 3
+  (`employee::allocate_with`); `pending` becomes `ConfirmationError::Pending`
+  and `pending_limit` `ConfirmationError::PendingLimit`, which `apply_next`
+  treats the same on the stage step. `GatewayAuthority::stage` re-runs the whole
+  (re-validated) stage, each attempt its own 30 s adapter operation, after
+  3 s and then every 5 s while the next attempt starts within 120 s
+  (`bridge::PENDING_*`: one probe ≤ 40 s plus one inconclusive re-run after
+  60 s). The wait runs in the confirmation RPC's blocking task, holds no
+  SQLite writer and only that proposal's lock, and stops at gateway shutdown
+  (`begin_migration_apply_shutdown`, which closes the effect gate
+  `ShutdownGate`). Once `close()` has returned no new external effect of the
+  confirmation flow can start — no stage, publish, read back or Disable, on
+  approve, retry, the retry of a `Failed` item or reject, and no further
+  allocation attempt — because every adapter call runs inside a gate permit
+  whose `enter` tests "closed" and registers the effect under the same lock
+  `close()` takes: this is enforced by that lock, not by timing. A refused
+  call keeps the item's state and the RPC answers retry-safe
+  (`allocation_pending`, or "服務正在關閉，請稍後重試" for reject). An effect
+  registered before `close()` may still complete: shutdown waits for the
+  gate's running effects only best effort (up to 40 s, `APPLY_SHUTDOWN_WAIT`),
+  and if the process exits mid-effect the journal repeats it idempotently on
+  the next apply. Still pending: `apply_next` consumes the
+  intent, audits `apply_pending`, keeps the item `Applying` with no receipt and
+  never compensates (no `Disable`); the RPC answers `allocation_pending` and
+  "帳號安全驗證尚未完成，請稍後重試" (dashboard `migrationConfirm.allocationPending`).
+  Retry runs the same stage with the same binding and spawnd resumes the
+  reservation. After spawnd's 10-minute deadline its tombstone refusal is
+  `isolation_unavailable`: the existing hard failure (Failed, compensation).
+  At most 4 approve/retry apply loops run at once in the gateway (spawnd's
+  pending-reservation cap): a further one answers `allocation_pending` at once
+  before anything is read or written, and a `pending_limit` answer returns
+  `allocation_pending` at once instead of being waited for, so only a probe in
+  flight for that employee holds a blocking thread.
+  `NotReady` on a schema-3 `Allocate` (start-up reconciliation not latched,
+  or a run live on the host, both answered before spawnd changes anything) is
+  waited for and, still not ready after the window, left `Applying` exactly
+  like `pending`; `NotReady` on any other action or step keeps its meaning.
 - **Unsupported hosts.** passwd/group NSS modules other than files/systemd
   (SSSD/LDAP, Google Compute Engine OS Login, `compat`, bracketed action
   clauses); sshd present without the ssh client, ssh-keygen or journalctl, or
@@ -2015,6 +2063,22 @@ website/console hash comparison and both migration-package signatures before
 provisioning; this function alone is not bootstrap acceptance. Never use curl
 piped to a shell. No production trust material is included in this package.
 
+**Test builds.** `--cfg duduclaw_test_root` selects test trust at compile time
+only. `duduclaw-bootstrap` then pins the TEST root of `scripts/isolation-test-keys.sh`
+and prints `TEST <pin>`; `duduclaw` additionally trusts the TEST licence issuer
+compiled in through `DUDUCLAW_TEST_LICENSE_ISSUER_PUBKEY` under key id `test-root`
+(`production_registry`, `crates/duduclaw-gateway/src/license_runtime.rs`) and
+`duduclaw print-license-issuer` prints `TEST-LICENSE <key>` instead of
+`PRODUCTION-LICENSE <16 hex>`. Every other licence rule (signature, machine
+binding, self-host tier and non-Personal edition, expiry, grace) is unchanged, so
+a TEST licence from `isolation-test-keys.sh license` passes exactly the
+production checks. A build without the cfg compiles none of this. Release tooling
+refuses test builds: the packager refuses the cfg and the variable on every
+build and packaging run, refuses a bootstrap that does not print `PRODUCTION <pin>`,
+and statically refuses a test-licence `duduclaw` (a fixed marker only a test-root
+build contains) wherever it packages, hands off, verifies or signs over an archive,
+except under `--test-signer`.
+
 ### Durability and A/B recovery
 
 `State` stores the committed version/serial/digest together in one atomic
@@ -2107,7 +2171,7 @@ fail closed. Adapters enforce bounded I/O/retry deadlines.
 | B1/G | `GenerationPreparation::{preflight,apply}`: typed digest-bound migrations and runtime artifacts. Preflight makes no data changes. Apply is idempotent and recovers any interrupted publication/migration; updater first drains and stops the gateway. Missing reverse-migration support causes emergency rollback across **any** migration to be refused. |
 | A | Live gateway readback at `/run/duduclaw-gateway-update/readback.sock`, peer UID/GID from the provisioned `duduclaw` account; exactly one gateway component. |
 | C | Live egress readback at `/run/duduclaw-egress-update/readback.sock`, peer UID/GID from `duduclaw-egress`; exactly one egress component. |
-| B1/B2/D/E/G | B1 supplies actual isolated readiness results for non-daemon artifacts. It cannot stand in for gateway/egress endpoints. Report product, version, protocol, actual loaded executable SHA-256, effective UID and readiness for every signed artifact except the updater slot, which has its independent root self-test. Root execution is allowed only for spawnd/trampoline. |
+| B1/B2/D/E/G | B1 reports itself (a live-process report, euid 0) and a FILE MEASUREMENT of every non-daemon artifact: root spawnd hashes, by descriptor through its trusted reader (no symlinks, root:root, not group/other-writable, one link, signed size, signed mode = the kind's: 0755, the signed `isolation-policy-v1` 0444), the file the component is executed (the policy: read) from: the fixed destination for run, run self-test, SSH probe, parse worker, importer, migration and MCP bridge; the committed `generations/<hex>` directory (never `current`) for the egress forwarder and every runtime entry. Such a record is ready only when the digest is the artifact's, and carries the manifest's product/version/protocol and `effective_uid` 0 (the measurer's). It cannot stand in for gateway/egress endpoints, which report live and non-root. `validate_readbacks` classifies every install target as exactly one of the two kinds (exhaustive `match`) and requires one ready report for every signed artifact except the updater slot, which has its independent root self-test. |
 | G | Provision independent bootstrap pin/dual migration signatures, accounts, initial state/receipts, frozen launcher, slots, units, `current`, and trusted anchors. Keep install/generations traversable for service UIDs. Non-root readback daemons bind their own socket in a dedicated service-owned leaf under root-owned `/run`; verify root client credentials. |
 
 `LinuxGenerationActivator` checks `current` is the committed/effective or pending
