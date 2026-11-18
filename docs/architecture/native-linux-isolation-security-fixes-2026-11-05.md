@@ -33,7 +33,7 @@
 
 **尚缺實際 requester bridge**：目前沿用 dedicated native owner 的 `Unknown`，不把 capability owner 冒充為 requester，因此預設 `bound_people`／`owner_only` 會安全拒絕。Delegate、service-account、Apps Script 等非 OAuth source owner 不由這個 adapter 假裝支援。
 
-`InstalledConnectorProviders::assemble` 與 `IsolationDispatcher::boot` 提供正式、具型別的組裝入口；九組 provider 由 policy table 一次註冊，policy／executor 缺件或重疊即拒絕，Google 欄位只能接受 sealed bridge。Resolver、已佈建 BindingStore／catalog、A/E factories 與 employee／agent／home readback 在 admission 前組合；不從偶然找到的 credentials 建立新 grant。Worker feature 明確轉接為 `isolation-worker-integration`，search constructor 只在 checked worker 可安裝時提供。
+`InstalledConnectorProviders::assemble` 與 `IsolationDispatcher::boot` 提供正式、具型別的組裝入口；九組 provider 由 policy table 一次註冊，policy／executor 缺件或重疊即拒絕，Google 欄位只能接受 sealed bridge。Resolver、已佈建 BindingStore／catalog、A/E factories 與 employee／agent／home readback 在 admission 前組合；不從偶然找到的 credentials 建立新 grant。自 v1.83 起 worker integration 與 search constructor 一律編入，`isolation-worker-integration` 僅保留為相容用的空 feature；可信任的 boot 仍須安裝 checked worker。
 
 **目前沒有 production binary／integration host caller 採用這兩個新入口**；這輪是完整組裝入口，不是已啟用的 gateway boot。既有安裝的隔離保證不因此改變。
 

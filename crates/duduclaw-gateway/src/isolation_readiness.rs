@@ -158,7 +158,7 @@ fn combined_worker_state(integration: ComponentState, producers: ComponentState)
 }
 
 fn parse_worker_state() -> ComponentState {
-    #[cfg(all(target_os = "linux", feature = "isolation-worker-integration"))]
+    #[cfg(target_os = "linux")]
     if duduclaw_parse_worker::client::launcher_installed()
         && crate::isolation_mcp::boot_status().constructed
         && update_service_state() == ComponentState::Ready {

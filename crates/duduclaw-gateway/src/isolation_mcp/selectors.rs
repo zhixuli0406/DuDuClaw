@@ -97,14 +97,12 @@ impl SelectorSources {
     /// (none if the backend has no readiness source), and the backend's
     /// readiness feature view (`SpawndBackend::features`; no source reads as
     /// no features).
-    #[cfg_attr(not(feature = "isolation-worker-integration"), allow(dead_code))]
     pub(crate) fn installed(home: &Path, backend: Arc<duduclaw_execution::SpawndBackend>) -> Self {
         let sources = Self::installed_over(home, Arc::new(super::run_broker::SpawndRunTransport::new(backend)));
         super::run_broker::mark_installed(sources.run_brokers.is_some());
         sources
     }
     /// [`Self::installed`] over any transport (boot and W1 tests).
-    #[cfg_attr(not(feature = "isolation-worker-integration"), allow(dead_code))]
     pub(crate) fn installed_over(home: &Path, transport: Arc<dyn super::run_broker::RunWorkTransport>) -> Self {
         let run_brokers = super::run_broker::RunBrokers::new(home, transport.clone());
         Self { #[cfg(any(test, feature = "test-support"))] work_broker: None, run_brokers,
@@ -113,7 +111,6 @@ impl SelectorSources {
     /// Test fixtures only: replace the run-bound factory with a host broker
     /// double (`BootSources.work_broker`).
     #[cfg(any(test, feature = "test-support"))]
-    #[cfg_attr(not(feature = "isolation-worker-integration"), allow(dead_code))]
     pub(crate) fn with_host_broker(mut self, broker: Arc<dyn WorkBroker>) -> Self {
         self.work_broker = Some(broker);
         self.run_brokers = None;

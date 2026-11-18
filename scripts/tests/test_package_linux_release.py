@@ -1,4 +1,5 @@
 """Exercise release staging, legacy size boundaries and offline signing locally."""
+import ast
 import contextlib
 import errno
 import fcntl
@@ -862,6 +863,24 @@ class LinuxReleaseTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.package()
         self.assertEqual(before, archive.read_bytes())
+
+    def test_release_build_explicitly_covers_non_inert_default_features(self):
+        command = PACKAGE.build_command(TARGET, "cross", True)
+        self.assertIn("--no-default-features", command)
+        enabled = set(command[command.index("--features") + 1].split(","))
+        inert = {"desktop", "isolation-worker-integration"}
+        for crate in ("duduclaw-gateway", "duduclaw-cli"):
+            with self.subTest(crate=crate):
+                manifest = (ROOT / "crates" / crate / "Cargo.toml").read_text()
+                section = re.search(r"(?ms)^\[features\][ \t]*\n(.*?)(?=^\[|\Z)", manifest)
+                self.assertIsNotNone(section, f"{crate} has no [features] section")
+                defaults = re.search(r"(?m)^default[ \t]*=[ \t]*(\[[^\]]*\])", section[1])
+                self.assertIsNotNone(defaults, f"{crate} must declare a literal default feature list")
+                for feature in ast.literal_eval(defaults[1]):
+                    self.assertTrue(feature in inert or f"{crate}/{feature}" in enabled,
+                                    f"{crate}/{feature} is default-only: release builds use "
+                                    "--no-default-features; explicitly enable it in build_command "
+                                    "or make its code unconditional")
 
     def test_explicit_production_build_includes_parser_engine(self):
         command = PACKAGE.build_command(TARGET, "cross", True)

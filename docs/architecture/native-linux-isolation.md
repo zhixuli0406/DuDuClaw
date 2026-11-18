@@ -4430,8 +4430,9 @@ retains the original scope checks and requires complete dispatcher services; no
 key is placed in runtime files/fds and no principal is manufactured from a slug.
 The owner retains Boundary/sweep and E services. `prepare_launch` re-reads G's
 confirmed root mapping and D's durable binding before creating the launch.
-`isolation-worker-integration` is enabled in gateway defaults; no E engine runs
-inside gateway. Missing producers are logged explicitly, and boot construction
+Worker integration is always compiled since v1.83;
+`isolation-worker-integration` remains an inert compatibility feature. No E engine
+runs inside gateway. Missing producers are logged explicitly, and boot construction
 never flips composite readiness to true. This is composition support, not a
 claim that runtime entry points already scope every call through it.
 

@@ -73,13 +73,11 @@ pub struct BootSources {
     /// creates it, `connectors`/`connector_selection` are this same object
     /// (inventory only) and each launch gets an employee-bound handle.
     connector_stack: Option<Arc<EmployeeConnectorProviders>>,
-    #[cfg_attr(not(feature = "isolation-worker-integration"), allow(dead_code))]
     connector_inputs: Option<ConnectorBootInputs>,
 }
 
 /// Gateway-side inputs of the production connector factory, collected in
 /// `boot_protected` and consumed by `assemble` (after the worker exists).
-#[cfg_attr(not(feature = "isolation-worker-integration"), allow(dead_code))]
 struct ConnectorBootInputs {
     users: Arc<duduclaw_auth::UserDb>,
     turns: Arc<dyn RunTurnResolver>,
@@ -192,13 +190,13 @@ fn fill_installed_sources(sources: &mut BootSources, home: &Path) -> Derived {
 }
 
 /// Producers that cannot appear later in this process: the dispatcher
-/// adapter is refused after the first attempt, worker integration is a build
-/// feature. Retrying cannot succeed; the reasons stay published.
+/// adapter is refused after the first attempt. Retrying cannot succeed; the
+/// reasons stay published.
 fn structural(missing: &[MissingProducer]) -> bool {
-    missing.iter().any(|producer| matches!(producer, MissingProducer::Dispatcher | MissingProducer::WorkerIntegration))
+    missing.iter().any(|producer| matches!(producer, MissingProducer::Dispatcher))
 }
 
-fn missing(sources: &BootSources, dispatcher: bool, backend: bool, worker: bool) -> Vec<MissingProducer> {
+fn missing(sources: &BootSources, dispatcher: bool, backend: bool) -> Vec<MissingProducer> {
     let mut absent = Vec::new();
     for (present, producer) in [(backend, MissingProducer::Backend),
         (sources.authority.is_some(), MissingProducer::LiveAuthority),
@@ -211,7 +209,7 @@ fn missing(sources: &BootSources, dispatcher: bool, backend: bool, worker: bool)
         (sources.turns.is_some(), MissingProducer::TurnAuthority),
         (sources.connector_catalog.is_some() && sources.connectors.is_some()
             && sources.connector_selection.is_some(), MissingProducer::ConnectorProviders),
-        (dispatcher, MissingProducer::Dispatcher), (worker, MissingProducer::WorkerIntegration)] {
+        (dispatcher, MissingProducer::Dispatcher)] {
         if !present { absent.push(producer); }
     }
     absent
@@ -306,12 +304,11 @@ async fn attempt_installed(boot: &mut InstalledBoot) -> Result<(), retry::Failur
     if sources.connectors.is_none() && sources.connector_selection.is_none() {
         install_connector_stack(sources, home, users.clone()).await;
     }
-    let absent = missing(sources, DISPATCHER.get().is_some(), backend.is_ok(), cfg!(feature = "isolation-worker-integration"));
+    let absent = missing(sources, DISPATCHER.get().is_some(), backend.is_ok());
     if !absent.is_empty() {
         derived.forget(sources);
         return Err(retry::Failure { retry: !structural(&absent), missing: absent });
     }
-    #[cfg(feature = "isolation-worker-integration")]
     {
         // Side-effect-free checks of `assemble` first: a failure here is
         // retried. `assemble` itself installs process-wide producers, so a
@@ -331,15 +328,9 @@ async fn attempt_installed(boot: &mut InstalledBoot) -> Result<(), retry::Failur
         }
         Ok(())
     }
-    #[cfg(not(feature = "isolation-worker-integration"))]
-    {
-        let _ = derived;
-        Err(retry::Failure { missing: vec![MissingProducer::WorkerIntegration], retry: false })
-    }
 }
 
 /// The checks `assemble` makes before its first process-wide installation.
-#[cfg(feature = "isolation-worker-integration")]
 fn precheck(home: &Path, sources: &BootSources) -> Result<(), VerificationError> {
     if !home.is_absolute() || sources.connector_catalog.is_none() || sources.installed_generation.is_none() {
         return Err(VerificationError::Unavailable);
@@ -391,7 +382,6 @@ async fn install_connector_stack(sources: &mut BootSources, home: &Path, users: 
 /// vault — then build every confirmed employee once (reported to F3). A
 /// factory that cannot be assembled leaves every connector tool refusing and
 /// every employee `connector_setup_required`; boot itself continues.
-#[cfg(feature = "isolation-worker-integration")]
 fn install_stack_factory(home: &Path, stack: &Arc<EmployeeConnectorProviders>, inputs: ConnectorBootInputs,
     worker: &crate::isolation_execution::InstalledWorkerServices) {
     use crate::isolation_connector_stack::{ConnectorStackInputs, EmployeeKeyGoogleBridges, gateway_factory};
@@ -463,7 +453,6 @@ struct BootOwner {
     recording_jobs: Arc<duduclaw_mcp_boundary::recording_jobs::SqliteRecordingJobs>,
     fork_tools: Arc<dyn duduclaw_mcp_boundary::forks::ForkToolService>,
     worker_plans: Arc<dyn WorkerPlanFactory>,
-    #[cfg(feature = "isolation-worker-integration")]
     worker: crate::isolation_execution::InstalledWorkerServices,
     turns: Arc<dyn RunTurnResolver>,
     catalog: Option<Arc<ConnectorCatalog>>,
@@ -483,7 +472,7 @@ impl crate::isolation_readiness::IntegrationProbe for BoundaryReadiness {
     fn verify_producers(&self) -> Result<(), crate::isolation_readiness::ProbeError> {
         use crate::isolation_readiness::ProbeError;
         let owner = OWNER.get().ok_or(ProbeError::Unavailable)?;
-        if owner.product_authority.is_none() || !cfg!(feature = "isolation-worker-integration") {
+        if owner.product_authority.is_none() {
             return Err(ProbeError::Unavailable);
         }
         DISPATCHER.get().ok_or(ProbeError::Unavailable)?.verify_producers(
@@ -697,7 +686,6 @@ pub(crate) fn delegation_source(home: &Path, sender: &str, context: &duduclaw_mc
     if source.agent != sender { return Err(VerificationError::BindingMismatch); }
     Ok(source)
 }
-#[cfg(feature = "isolation-worker-integration")]
 fn assemble(home: &Path, backend: Arc<duduclaw_execution::SpawndBackend>, mut sources: BootSources)
     -> Result<BootOwner, VerificationError> {
     if !home.is_absolute() { return Err(VerificationError::Invalid); }
@@ -842,7 +830,6 @@ pub async fn prepare_launch(mut input: LaunchInput) -> Result<Arc<dyn duduclaw_e
     };
     if let Some(selection) = selection { resolver = resolver.with_connector_selection_policy(selection); }
     let resolver = Arc::new(resolver);
-    #[cfg(feature = "isolation-worker-integration")]
     {
         let defaults = crate::isolation_worker_plans::GatewayWorkerPlans::for_employee(
             owner.home.clone(), input.agent.clone(), input.plan.employee)?.with_roots(input.roots.clone());
@@ -871,8 +858,6 @@ pub async fn prepare_launch(mut input: LaunchInput) -> Result<Arc<dyn duduclaw_e
             _ => Err(VerificationError::Unavailable),
         };
     }
-    #[cfg(not(feature = "isolation-worker-integration"))]
-    { let _ = connectors; Err(VerificationError::Unavailable) }
 }
 
 /// DEFECT 26: the bounded boot retry driver and its tests.
@@ -895,8 +880,14 @@ mod selectors_tests;
 mod tests {
     use super::*;
     #[test]
+    fn isolation_boot_worker_integration_is_present_with_any_build_features() {
+        let absent = missing(&BootSources::default(), true, true);
+        assert!(!absent.contains(&MissingProducer::WorkerIntegration),
+            "worker integration must be compiled even with --no-default-features");
+    }
+    #[test]
     fn isolation_boot_missing_authority_never_reports_constructed() {
-        let absent = missing(&BootSources::default(), true, true, true);
+        let absent = missing(&BootSources::default(), true, true);
         for producer in [MissingProducer::LiveAuthority, MissingProducer::DurableBindings,
             MissingProducer::RuntimePublication, MissingProducer::MainPlans, MissingProducer::ExecutionPlans, MissingProducer::WorkerRetirement,
             MissingProducer::WorkerPlans, MissingProducer::TurnAuthority,
@@ -905,10 +896,9 @@ mod tests {
     }
     #[test]
     fn isolation_boot_missing_backend_and_binary_adapter_are_independent() {
-        let absent = missing(&BootSources::default(), false, false, false);
+        let absent = missing(&BootSources::default(), false, false);
         assert!(absent.contains(&MissingProducer::Backend));
         assert!(absent.contains(&MissingProducer::Dispatcher));
-        assert!(absent.contains(&MissingProducer::WorkerIntegration));
     }
     #[test]
     fn isolation_boot_requires_catalog_execution_and_live_selection_together() {
@@ -917,12 +907,12 @@ mod tests {
         sources.connector_catalog = Some(Arc::new(ConnectorCatalog::new(
             rusqlite::Connection::open_in_memory().unwrap()).unwrap()));
         sources.connectors = Some(registry.clone());
-        assert!(missing(&sources, true, true, true).contains(&MissingProducer::ConnectorProviders));
+        assert!(missing(&sources, true, true).contains(&MissingProducer::ConnectorProviders));
         sources.connector_selection = Some(registry);
         // Presence is only the first gate; assemble separately checks every tool.
-        assert!(!missing(&sources, true, true, true).contains(&MissingProducer::ConnectorProviders));
+        assert!(!missing(&sources, true, true).contains(&MissingProducer::ConnectorProviders));
         sources.connectors = None;
-        assert!(missing(&sources, true, true, true).contains(&MissingProducer::ConnectorProviders));
+        assert!(missing(&sources, true, true).contains(&MissingProducer::ConnectorProviders));
     }
     /// DEFECT 26: a failed attempt forgets what it derived from the updater's
     /// generation / spawnd's projection; host-installed inputs survive.
@@ -940,7 +930,7 @@ mod tests {
     }
     #[test]
     fn boot_only_structural_producers_end_the_retry() {
-        assert!(structural(&[MissingProducer::WorkerIntegration]));
+        assert!(!structural(&[MissingProducer::WorkerIntegration]));
         assert!(structural(&[MissingProducer::RuntimePublication, MissingProducer::Dispatcher]));
         assert!(!structural(&[MissingProducer::RuntimePublication, MissingProducer::MainPlans,
             MissingProducer::ExecutionPlans, MissingProducer::ConnectorProviders]));
