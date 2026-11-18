@@ -122,8 +122,9 @@ impl SocketRuntime {
             || egress_reports.len() != 1 || egress_reports[0].target != InstallTarget::Egress
             || egress_reports[0].effective_uid != egress.uid.as_raw() { return Err(Error::Maintenance); }
         let mut reports = read_components(SPAWND_UPDATE_SOCKET, 0, 0, generation)?;
-        // B1 must independently execute non-daemon readbacks under non-root ids;
-        // it cannot substitute for the two live non-root service endpoints.
+        // B1 reports itself and root file measurements of the non-daemon
+        // components (`validate_readbacks`); it cannot substitute for the two
+        // live non-root service endpoints.
         if reports.iter().any(|r| matches!(r.target, InstallTarget::Gateway | InstallTarget::Egress | InstallTarget::UpdateSlot)) {
             return Err(Error::Maintenance);
         }

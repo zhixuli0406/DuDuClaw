@@ -9,7 +9,14 @@ fixed socket, downloader privilege separation and verified file descriptors.
 This package is not an installer: migration must provision its root trust and
 accounts. The Linux activator publishes one generation, restarts fixed services
 and compares authenticated live readiness and loaded-executable identity before
-advancing the version floor. Named A/B/C/G drain, migration/runtime and readiness
+advancing the version floor. `activation_contract::validate_readbacks` needs one
+ready report per signed artifact except the updater slot, each of a kind fixed
+per install target: a LIVE PROCESS report (gateway and egress answer for
+themselves and must be non-root; spawnd must be root) or a FILE MEASUREMENT made
+by root spawnd by descriptor at the path the component is executed from (run,
+run self-test, SSH probe, parse worker, importer, migration, MCP bridge, egress
+forwarder, every runtime entry including the signed policy), which must carry
+`effective_uid` 0, the measurer's. Named A/B/C/G drain, migration/runtime and readiness
 seams must be implemented; missing endpoints fail closed. Interrupted updates
 resume through the frozen A/B launcher. Root-only trust rotation and signed
 emergency rollback preserve the normal monotonic floor.

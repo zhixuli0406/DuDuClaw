@@ -1961,6 +1961,29 @@ fn fixed_manifest() -> ReleaseManifest {
         id: artifact_name(&target).unwrap(), sha256: Sha256Digest([index as u8 + 1; 32]), size_bytes: 1, mode: 0o755,
         install_target: target }).collect())
 }
+/// The shipped template's kinds plus an executable runtime entry (0755) and
+/// the signed isolation policy (0444).
+fn template_manifest() -> ReleaseManifest {
+    let mut manifest = fixed_manifest();
+    let target = InstallTarget::RuntimeEntry { registry_id: "isolation-policy-v1".into() };
+    manifest.artifacts.push(ReleaseArtifact { id: artifact_name(&target).unwrap(), sha256: Sha256Digest([0x50; 32]),
+        size_bytes: 1, mode: 0o444, install_target: target });
+    manifest
+}
+fn policy_target() -> InstallTarget { InstallTarget::RuntimeEntry { registry_id: "isolation-policy-v1".into() } }
+/// spawnd's observation with every file measurement exact, except artifact
+/// `id`, measured as `value` (`None`: its file could not be measured).
+fn observing(manifest: &ReleaseManifest, own_image: Option<Sha256Digest>, live: bool, euid: u32, id: &str,
+    value: Option<Sha256Digest>) -> Observed {
+    let mut measured: BTreeMap<String, Sha256Digest> = manifest.artifacts.iter()
+        .filter(|artifact| measured_mode(&artifact.install_target).is_some())
+        .map(|artifact| (artifact.id.clone(), artifact.sha256)).collect();
+    match value {
+        Some(value) => { measured.insert(id.to_owned(), value); }
+        None => { measured.remove(id); }
+    }
+    Observed { own_image, live, euid, measured }
+}
 
 #[test]
 fn update_readback_reports_only_spawnd_side_components_and_never_guesses() {
@@ -1968,8 +1991,7 @@ fn update_readback_reports_only_spawnd_side_components_and_never_guesses() {
     let trampoline = manifest.artifacts.iter().find(|a| a.install_target == InstallTarget::Trampoline).unwrap().sha256;
     let selftest = manifest.artifacts.iter().find(|a| a.install_target == InstallTarget::TrampolineSelftest).unwrap().sha256;
     let probe = manifest.artifacts.iter().find(|a| a.install_target == InstallTarget::IsolationProbe).unwrap().sha256;
-    let observed = |own_image, live, euid, trampoline| Observed { own_image, live, euid, trampoline,
-        trampoline_selftest: Some(selftest), isolation_probe: Some(probe) };
+    let observed = |own_image, live, euid, trampoline| observing(&manifest, own_image, live, euid, "duduclaw-run", trampoline);
     let reports = components(&manifest, observed(Some(digest(42)), true, 0, Some(trampoline)));
     assert_eq!(reports.len(), manifest.artifacts.len() - 3);
     assert!(!reports.iter().any(|r| matches!(r.target, InstallTarget::Gateway | InstallTarget::Egress | InstallTarget::UpdateSlot)));
@@ -1982,11 +2004,14 @@ fn update_readback_reports_only_spawnd_side_components_and_never_guesses() {
     let run = find(&reports, InstallTarget::Trampoline);
     assert!(run.ready);
     assert_eq!((run.build_sha256, run.version, run.effective_uid), (trampoline, manifest.version, 0));
+    // Every other non-daemon component is a file measurement by the same rule.
     for target in [InstallTarget::ParseWorker, InstallTarget::McpBridge, InstallTarget::Importer, InstallTarget::Migration,
         InstallTarget::EgressForwarder, InstallTarget::RuntimeEntry { registry_id: "api-worker-v1".into() }] {
-        let report = find(&reports, target);
-        assert!(!report.ready);
-        assert_eq!((report.build_sha256, report.effective_uid), (Sha256Digest([0; 32]), u32::MAX));
+        let report = find(&reports, target.clone());
+        assert!(report.ready, "{target:?}");
+        let artifact = manifest.artifacts.iter().find(|a| a.install_target == target).unwrap();
+        assert_eq!((report.build_sha256, report.version, report.effective_uid, report.protocol),
+            (artifact.sha256, manifest.version, 0, duduclaw_updated::activation_contract::protocol(&manifest, &target)));
     }
     // Each missing or wrong observation makes the record not ready.
     assert!(!find(&components(&manifest, observed(Some(digest(42)), false, 0, Some(trampoline))), InstallTarget::Spawnd).ready);
@@ -2004,8 +2029,7 @@ fn update_readback_reports_only_spawnd_side_components_and_never_guesses() {
     assert_eq!((check.build_sha256, check.version, check.effective_uid, check.protocol),
         (selftest, manifest.version, 0, manifest.protocols.trampoline));
     assert_eq!(check.artifact_id, "duduclaw-run-selftest");
-    let with_selftest = |value| Observed { own_image: Some(digest(42)), live: true, euid: 0, trampoline: Some(trampoline),
-        trampoline_selftest: value, isolation_probe: Some(probe) };
+    let with_selftest = |value| observing(&manifest, Some(digest(42)), true, 0, "duduclaw-run-selftest", value);
     for value in [None, Some(digest(9))] {
         let reports = components(&manifest, with_selftest(value));
         assert!(!find(&reports, InstallTarget::TrampolineSelftest).ready);
@@ -2018,14 +2042,93 @@ fn update_readback_reports_only_spawnd_side_components_and_never_guesses() {
     assert_eq!((check.build_sha256, check.version, check.effective_uid, check.protocol),
         (probe, manifest.version, 0, manifest.protocols.spawnd));
     assert_eq!(check.artifact_id, "duduclaw-isolation-probe");
-    let with_probe = |value| Observed { own_image: Some(digest(42)), live: true, euid: 0, trampoline: Some(trampoline),
-        trampoline_selftest: Some(selftest), isolation_probe: value };
+    let with_probe = |value| observing(&manifest, Some(digest(42)), true, 0, "duduclaw-isolation-probe", value);
     for value in [None, Some(digest(9))] {
         let reports = components(&manifest, with_probe(value));
         assert!(!find(&reports, InstallTarget::IsolationProbe).ready);
         assert!(find(&reports, InstallTarget::TrampolineSelftest).ready);
     }
     assert!(!find(&unprivileged, InstallTarget::IsolationProbe).ready);
+}
+
+#[test]
+fn update_readback_file_measurement_is_ready_only_on_the_exact_digest_as_root() {
+    let manifest = template_manifest();
+    let unknown = ReleaseVersion { major: 0, minor: 0, patch: 0 };
+    let find = |reports: &[ComponentReadback], target: &InstallTarget| reports.iter().find(|r| &r.target == target).unwrap().clone();
+    for target in [InstallTarget::ParseWorker, InstallTarget::Importer, InstallTarget::Migration, InstallTarget::McpBridge,
+        InstallTarget::EgressForwarder, InstallTarget::RuntimeEntry { registry_id: "api-worker-v1".into() }, policy_target()] {
+        let artifact = manifest.artifacts.iter().find(|a| a.install_target == target).unwrap();
+        let id = artifact.id.as_str();
+        let exact = find(&components(&manifest, observing(&manifest, Some(digest(42)), true, 0, id, Some(artifact.sha256))), &target);
+        assert!(exact.ready, "{target:?}");
+        assert_eq!((exact.product, exact.version, exact.build_sha256, exact.effective_uid, exact.protocol),
+            (manifest.product, manifest.version, artifact.sha256, 0,
+                duduclaw_updated::activation_contract::protocol(&manifest, &target)), "{target:?}");
+        // Different bytes: reported as measured, never with the signed version.
+        let other = find(&components(&manifest, observing(&manifest, Some(digest(42)), true, 0, id, Some(digest(9)))), &target);
+        assert!(!other.ready, "{target:?}");
+        assert_eq!((other.build_sha256, other.version), (digest(9), unknown), "{target:?}");
+        // No measurement (missing, replaced by a link, wrong owner or mode).
+        let missing = find(&components(&manifest, observing(&manifest, Some(digest(42)), true, 0, id, None)), &target);
+        assert!(!missing.ready, "{target:?}");
+        assert_eq!((missing.build_sha256, missing.version), (Sha256Digest([0; 32]), unknown), "{target:?}");
+        // Exact bytes, but not measured by root.
+        let unprivileged = find(&components(&manifest, observing(&manifest, Some(digest(42)), true, 1000, id, Some(artifact.sha256))), &target);
+        assert!(!unprivileged.ready, "{target:?}");
+        assert_eq!(unprivileged.effective_uid, 1000);
+    }
+}
+
+#[test]
+fn update_readback_measured_modes_follow_the_publication_rule() {
+    assert_eq!(measured_mode(&policy_target()), Some(0o444));
+    for target in [InstallTarget::Trampoline, InstallTarget::TrampolineSelftest, InstallTarget::IsolationProbe,
+        InstallTarget::ParseWorker, InstallTarget::Importer, InstallTarget::Migration, InstallTarget::McpBridge,
+        InstallTarget::EgressForwarder, InstallTarget::RuntimeEntry { registry_id: "api-worker-v1".into() }] {
+        assert_eq!(measured_mode(&target), Some(0o755), "{target:?}");
+    }
+    for target in [InstallTarget::Spawnd, InstallTarget::Gateway, InstallTarget::Egress, InstallTarget::UpdateSlot] {
+        assert_eq!(measured_mode(&target), None, "{target:?}");
+    }
+    // A signed mode other than the kind's is refused before any file is opened
+    // (the roots below do not exist; `/` passes `Directory::open` unprivileged).
+    let effects = InstalledEffects::for_test(Path::new("/nonexistent-install"), Path::new("/nonexistent-publish"));
+    let generation = Directory::open(Path::new("/")).unwrap();
+    let manifest = template_manifest();
+    for (target, mode) in [(policy_target(), 0o755), (InstallTarget::RuntimeEntry { registry_id: "api-worker-v1".into() }, 0o444),
+        (InstallTarget::ParseWorker, 0o444), (InstallTarget::EgressForwarder, 0o700)] {
+        let mut artifact = manifest.artifacts.iter().find(|a| a.install_target == target).unwrap().clone();
+        artifact.mode = mode;
+        assert_eq!(effects.measure(&generation, &artifact), None, "{target:?}");
+    }
+    // Live daemons are never measured as files.
+    let gateway = manifest.artifacts.iter().find(|a| a.install_target == InstallTarget::Gateway).unwrap();
+    assert_eq!(effects.measure(&generation, gateway), None);
+}
+
+#[test]
+fn update_readback_of_the_full_template_is_all_ready_and_passes_the_contract() {
+    // A manifest whose spawnd is exactly this build (image digest 42 stands in
+    // for `/proc/self/exe`), so spawnd's own record can match it too.
+    let mut manifest = template_manifest();
+    manifest.version = duduclaw_updated::parse_version(env!("CARGO_PKG_VERSION")).unwrap();
+    manifest.minimum_version = manifest.version;
+    manifest.protocols.spawnd = duduclaw_isolation::ipc::PROTOCOL_VERSION;
+    manifest.artifacts.iter_mut().find(|a| a.install_target == InstallTarget::Spawnd).unwrap().sha256 = digest(42);
+    let mut reports = components(&manifest, observing(&manifest, Some(digest(42)), true, 0, "", None));
+    assert_eq!(reports.len(), manifest.artifacts.len() - 3);
+    assert!(reports.iter().all(|r| r.ready), "{reports:?}");
+    let policy = reports.iter().find(|r| r.target == policy_target()).unwrap();
+    assert_eq!(policy.build_sha256, Sha256Digest([0x50; 32]));
+    // With the two live daemons' own reports the updater's contract accepts the set.
+    for target in [InstallTarget::Gateway, InstallTarget::Egress] {
+        let artifact = manifest.artifacts.iter().find(|a| a.install_target == target).unwrap();
+        reports.push(ComponentReadback { artifact_id: artifact.id.clone(), target: target.clone(), product: manifest.product,
+            version: manifest.version, protocol: duduclaw_updated::activation_contract::protocol(&manifest, &target),
+            build_sha256: artifact.sha256, effective_uid: 999, ready: true });
+    }
+    duduclaw_updated::activation_contract::validate_readbacks(&manifest, &reports).unwrap();
 }
 
 #[test]

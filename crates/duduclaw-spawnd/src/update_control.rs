@@ -84,7 +84,7 @@
 //! with `; status_file_write_failed` / `; audit_write_failed` appended when the
 //! status file or a synchronously written audit record did not land.
 #![allow(unsafe_code)]
-use std::{fs::File, io::{self, Read}, os::{fd::{AsRawFd, FromRawFd, OwnedFd}, unix::fs::{FileTypeExt, MetadataExt, PermissionsExt}},
+use std::{collections::BTreeMap, fs::File, io::{self, Read}, os::{fd::{AsRawFd, FromRawFd, OwnedFd}, unix::fs::{FileTypeExt, MetadataExt, PermissionsExt}},
     path::{Path, PathBuf}, sync::{Arc, Mutex}, time::{Duration, Instant}};
 use duduclaw_isolation::{ids::Sha256Digest, update::{InstallTarget, Product, ReleaseArtifact, ReleaseManifest, ReleaseVersion}};
 use duduclaw_updated::{activation_contract::{ComponentReadback, ControlCommand, ControlOutcome, ControlRequest, ControlResponse, Preparation},
@@ -129,7 +129,9 @@ const RECORD_VERSION: u16 = 1;
 const MAX_RECORD_BYTES: usize = 4096;
 const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 const MAX_SIGNATURE_BYTES: usize = 16 * 1024;
-/// Bound of one hashed executable (spawnd's own image, a published component).
+/// Bound of one hashed file (spawnd's own image, a published component, a
+/// measured generation file). Above `publication`'s 512 MiB per-artifact
+/// limit, so it admits every artifact a valid generation can carry.
 const MAX_EXECUTABLE_BYTES: u64 = 768 * 1024 * 1024;
 /// Longest wait for one admission-loop iteration (the loop runs every 25 ms).
 const OBSERVATION_WAIT: Duration = Duration::from_secs(2);
@@ -1247,6 +1249,44 @@ impl InstalledEffects {
         for (_, directory) in publication() { Directory::open(&self.publish_root.join(directory)).map_err(updated)?; }
         Ok(())
     }
+    /// SHA-256, by descriptor, of the file this artifact is executed (or, for
+    /// the policy, read) from: its fixed publication destination, or for the
+    /// egress forwarder and runtime entries the file in `generation` (the
+    /// committed `generations/<hex>` directory, never `current`). Every
+    /// directory on the way and the file go through the trusted reader
+    /// (`Directory`: no symlinks, root:root, not group/other-writable, one
+    /// link, regular file); the file must carry the mode `publication` allows
+    /// for its kind, which must also be the signed mode, and the signed size
+    /// (`digest_file` caps it at [`MAX_EXECUTABLE_BYTES`]). `None`: not
+    /// measurable (no guess); daemons answer for themselves and are `None`.
+    fn measure(&self, generation: &Directory, artifact: &ReleaseArtifact) -> Option<Sha256Digest> {
+        let mode = measured_mode(&artifact.install_target)?;
+        if u32::from(artifact.mode) != mode { return None; }
+        let name = artifact_name(&artifact.install_target).ok()?;
+        let file = match &artifact.install_target {
+            InstallTarget::EgressForwarder | InstallTarget::RuntimeEntry { .. } => generation.read(&name).ok()?,
+            target => {
+                let (_, relative) = publication().into_iter().find(|(published, _)| published == target)?;
+                Directory::open(&self.publish_root.join(relative)).and_then(|directory| directory.read(&name)).ok()?
+            }
+        };
+        if file.metadata().ok()?.len() != artifact.size_bytes { return None; }
+        digest_file(file, Some(mode)).ok()
+    }
+}
+
+/// The permission bits of a file spawnd measures (the rule of
+/// `publication::validate_bootstrap_manifest`: executables 0755, the signed
+/// isolation policy 0444); `None` for a component that is not measured as a
+/// file (a live daemon, the updater slot).
+fn measured_mode(target: &InstallTarget) -> Option<u32> {
+    match target {
+        InstallTarget::Spawnd | InstallTarget::Gateway | InstallTarget::Egress | InstallTarget::UpdateSlot => None,
+        InstallTarget::Trampoline | InstallTarget::TrampolineSelftest | InstallTarget::IsolationProbe
+        | InstallTarget::ParseWorker | InstallTarget::Importer | InstallTarget::Migration | InstallTarget::McpBridge
+        | InstallTarget::EgressForwarder => Some(0o755),
+        InstallTarget::RuntimeEntry { registry_id } => Some(if registry_id == "isolation-policy-v1" { 0o444 } else { 0o755 }),
+    }
 }
 
 /// The manifest-bound data-migration executor (G) is not part of this release:
@@ -1470,15 +1510,15 @@ impl Effects for InstalledEffects {
     fn readback(&mut self, generation: Sha256Digest, live: bool) -> io::Result<Vec<ComponentReadback>> {
         let directory = self.generation_directory(generation)?.ok_or_else(invalid)?;
         let (_, manifest) = self.manifest(&directory, generation)?;
-        let installed = |name: &str| Directory::open(&self.publish_root.join("usr/lib/duduclaw")).and_then(|d| d.read(name))
-            .map_err(updated).and_then(|file| digest_file(file, Some(0o755)));
-        let trampoline = installed("duduclaw-run");
-        let trampoline_selftest = installed("duduclaw-run-selftest");
-        let isolation_probe = installed("duduclaw-isolation-probe");
+        // Each file once per Readback; one whose size is not the signed size is
+        // not hashed at all, so the work is bounded by the manifest's sizes.
+        let mut measured = BTreeMap::new();
+        for artifact in &manifest.artifacts {
+            if let Some(digest) = self.measure(&directory, artifact) { measured.insert(artifact.id.clone(), digest); }
+        }
         // SAFETY: geteuid has no arguments and cannot fail.
         let euid = unsafe { libc::geteuid() };
-        Ok(components(&manifest, Observed { own_image: self.own_image, live, euid, trampoline: trampoline.ok(),
-            trampoline_selftest: trampoline_selftest.ok(), isolation_probe: isolation_probe.ok() }))
+        Ok(components(&manifest, Observed { own_image: self.own_image, live, euid, measured }))
     }
     fn workloads(&mut self) -> io::Result<Workloads> { system_census() }
     fn gated_units_down(&mut self) -> io::Result<bool> { system_gated_units_down() }
@@ -1490,18 +1530,20 @@ pub(crate) struct Observed {
     pub own_image: Option<Sha256Digest>,
     pub live: bool,
     pub euid: u32,
-    /// SHA-256 of the published `/usr/lib/duduclaw/duduclaw-run`, by descriptor.
-    pub trampoline: Option<Sha256Digest>,
-    /// R7a: SHA-256 of the published `/usr/lib/duduclaw/duduclaw-run-selftest`.
-    pub trampoline_selftest: Option<Sha256Digest>,
-    /// R7c: SHA-256 of the published `/usr/lib/duduclaw/duduclaw-isolation-probe`.
-    pub isolation_probe: Option<Sha256Digest>,
+    /// File measurements by artifact id (`InstalledEffects::measure`), each
+    /// computed once per Readback: the SHA-256, by descriptor, of the file the
+    /// component is executed from (the run trampoline, its self-test and the
+    /// SSH probe in `/usr/lib/duduclaw`, the parse worker, importer, migration
+    /// and MCP bridge at their fixed destinations, the egress forwarder and
+    /// every runtime entry in the committed generation directory). An artifact
+    /// whose file could not be opened or verified has no entry.
+    pub measured: BTreeMap<String, Sha256Digest>,
 }
 
-/// spawnd's readback: itself, the trampoline it executes, and every other
-/// non-daemon component of the generation. Never the gateway, egress or the
-/// updater slot (they answer for themselves). A field that cannot be computed
-/// makes its record `ready: false`; no value is guessed.
+/// spawnd's readback: itself (a live-process report) and a file measurement
+/// of every other non-daemon component of the generation. Never the gateway,
+/// egress or the updater slot (they answer for themselves). A field that
+/// cannot be computed makes its record `ready: false`; no value is guessed.
 pub(crate) fn components(manifest: &ReleaseManifest, observed: Observed) -> Vec<ComponentReadback> {
     let unknown = ReleaseVersion { major: 0, minor: 0, patch: 0 };
     let mut out = Vec::new();
@@ -1518,32 +1560,22 @@ pub(crate) fn components(manifest: &ReleaseManifest, observed: Observed) -> Vec<
             InstallTarget::Spawnd => record(PRODUCT, duduclaw_updated::parse_version(env!("CARGO_PKG_VERSION")).ok(),
                 duduclaw_isolation::ipc::PROTOCOL_VERSION, observed.own_image, Some(observed.euid),
                 observed.live && observed.euid == 0),
-            // The bytes this root process executes as the trampoline. Product,
+            // File measurements by this root process: the trampoline (R7a: its
+            // self-test, R7c: the SSH denial probe) and every non-daemon
+            // component (parse worker, importer, migration, MCP bridge, egress
+            // forwarder, runtime entries including the signed policy). Product,
             // version and protocol are the signed facts of exactly these bytes,
-            // so they are reported only when the observed digest is the artifact's.
-            InstallTarget::Trampoline => {
-                let matched = observed.trampoline == Some(artifact.sha256);
-                record(manifest.product, matched.then_some(manifest.version), manifest.protocols.trampoline,
-                    observed.trampoline, Some(observed.euid), matched && observed.euid == 0)
+            // so they are reported only when the measured digest is the
+            // artifact's; `effective_uid` is the measurer's (this process).
+            InstallTarget::Trampoline | InstallTarget::TrampolineSelftest | InstallTarget::IsolationProbe
+            | InstallTarget::ParseWorker | InstallTarget::Importer | InstallTarget::Migration | InstallTarget::McpBridge
+            | InstallTarget::EgressForwarder | InstallTarget::RuntimeEntry { .. } => {
+                let measured = observed.measured.get(&artifact.id).copied();
+                let matched = measured == Some(artifact.sha256);
+                record(manifest.product, matched.then_some(manifest.version),
+                    duduclaw_updated::activation_contract::protocol(manifest, &artifact.install_target),
+                    measured, Some(observed.euid), matched && observed.euid == 0)
             }
-            // R7a: the self-test bytes PID 1 executes for this root process, same rule.
-            InstallTarget::TrampolineSelftest => {
-                let matched = observed.trampoline_selftest == Some(artifact.sha256);
-                record(manifest.product, matched.then_some(manifest.version), manifest.protocols.trampoline,
-                    observed.trampoline_selftest, Some(observed.euid), matched && observed.euid == 0)
-            }
-            // R7c: the SSH denial probe PID 1 executes as root for this process,
-            // same rule; its result contract is spawnd's (protocol spawnd).
-            InstallTarget::IsolationProbe => {
-                let matched = observed.isolation_probe == Some(artifact.sha256);
-                record(manifest.product, matched.then_some(manifest.version), manifest.protocols.spawnd,
-                    observed.isolation_probe, Some(observed.euid), matched && observed.euid == 0)
-            }
-            // Non-daemon, non-root components (parse worker, MCP bridge, importer,
-            // migration, egress forwarder, runtime entries): no executable
-            // readback under a non-root identity exists yet, so their identity
-            // cannot be observed and they are not ready.
-            _ => record(manifest.product, None, 0, None, None, false),
         });
     }
     out

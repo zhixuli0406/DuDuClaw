@@ -159,13 +159,24 @@ fields refused, 5 s timeouts. Every refusal is the single `Refused` outcome.
   finally every destination file and directory is synced again and the journal
   says `published`. While a journal of another generation is `publishing`,
   `Apply` is refused except for that journal's previous generation (the roll-back).
-- `Readback` reports spawnd itself (`sha256(/proc/self/exe)`, liveness of the
-  admission loop), the trampoline it executes and (R7a) the published
-  `duduclaw-run-selftest`, by the trampoline's rule, and (R7c) the published
-  `duduclaw-isolation-probe` by the same rule with spawnd's protocol. Other non-daemon components
-  (parse worker, MCP bridge, importer, migration, egress forwarder, runtime
-  entries) report `ready: false`: no executable readback under a non-root
-  identity exists yet, so the updater cannot validate an activation until one does.
+- `Readback` reports spawnd itself (a live-process report:
+  `sha256(/proc/self/exe)`, liveness of the admission loop, euid 0) and a FILE
+  MEASUREMENT of every other non-daemon component: the SHA-256, by descriptor,
+  of the file the component is executed (the policy: read) from, opened through
+  the trusted reader (no symlinks on the way, root:root, not group/other-writable,
+  one link, regular file, the signed size, at most 768 MiB). Measured at the
+  fixed destination: run, run self-test (R7a), SSH denial probe (R7c) in
+  `/usr/lib/duduclaw`, parse worker in `/usr/libexec/duduclaw`, importer,
+  migration and MCP bridge in `/usr/lib/duduclaw/current`, all mode 0755.
+  Measured in the committed `generations/<hex>` directory of the generation
+  being read back (never through `current`): the egress forwarder (0755) and
+  every runtime entry (0755; the signed `isolation-policy-v1` 0444). The signed
+  mode must be the one `publication` allows for that kind. Each file is hashed
+  once per `Readback`. A record is `ready` only when the measured digest is the
+  artifact's and spawnd's euid is 0; product, version and protocol are then the
+  manifest's facts of exactly those bytes and `effective_uid` is the measurer's
+  (0). A file that cannot be opened or verified reports `ready: false`; nothing
+  is guessed.
 - `Resume{g}` requires that no journal exists or that it says `published` for
   `g`; it removes the journal, then the record, durably, then reopens admission.
   It is the only way to lift the barrier. At start the record is read strictly
