@@ -390,6 +390,11 @@ export interface IsolationReadiness {
    *  names, e.g. `connector_providers`); the same list `duduclaw service readiness
    *  --protected-linux` prints. Absent on older gateways. */
   assembly_missing?: string[];
+  /** v1.83 R8n-1: each not-ready component's fixed reason name (e.g.
+   *  `parse_worker: 'socket_not_listening'`, `mcp_boundary: 'pending_integration'`),
+   *  as in the root CLI's view. Ready components are absent. Absent on older gateways. */
+  component_reasons?: Partial<Record<'launch_service' | 'sandbox' | 'network' | 'storage' |
+    'parse_worker' | 'update_service' | 'mcp_boundary' | 'runtime_adapters', string>>;
   correlation_id?: string;
   components: Record<'launch_service' | 'sandbox' | 'network' | 'storage' |
     'parse_worker' | 'update_service' | 'mcp_boundary' | 'runtime_adapters', IsolationComponentState>;

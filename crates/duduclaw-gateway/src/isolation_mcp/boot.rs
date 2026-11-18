@@ -422,9 +422,12 @@ fn install_and_publish(home: &Path, users: Arc<duduclaw_auth::UserDb>, sources: 
     let final_failure = || retry::Failure { missing: vec![MissingProducer::Initialization], retry: false, reasons: Vec::new() };
     let owner = assemble(home, backend.ok_or_else(final_failure)?, std::mem::take(sources))
         .map_err(|_| final_failure())?;
+    let generation = owner.generation;
     OWNER.set(Arc::new(owner)).map_err(|_| final_failure())?;
     STATE.constructed();
     install_probes(crate::isolation_readiness::install_integration_probe);
+    // R8n-1 review F2: the probes read only what this one observer stores.
+    probes::start_observer(generation, shutdown_begun);
     Ok(())
 }
 

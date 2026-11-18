@@ -41,13 +41,16 @@ pub const STATES: [&str; 3] = ["ready", "not_ready", "pending"];
 pub const COMPONENT_REASONS: [&str; 2] = ["unavailable", "pending_integration"];
 /// R8n-1: the ParseWorker probe's fixed refusal reasons (a not-ready
 /// `parse_worker` may carry one instead of `unavailable`).
-pub const PARSE_WORKER_REASONS: [&str; 7] = ["assembly_incomplete", "launcher_not_installed",
+/// R8n-1 review F2: `observation_pending` (the background observer has not
+/// stored a readback yet) and `observation_stale` (its last one is older
+/// than the 2 s window) in both tables.
+pub const PARSE_WORKER_REASONS: [&str; 9] = ["assembly_incomplete", "launcher_not_installed",
     "generation_mismatch", "socket_unavailable", "socket_unsafe", "socket_not_listening",
-    "retirement_lease_unavailable"];
+    "retirement_lease_unavailable", "observation_pending", "observation_stale"];
 /// R8n-1: the RuntimeAdapters probe's fixed refusal reasons (`runtime_adapters`).
-pub const RUNTIME_ADAPTER_REASONS: [&str; 7] = ["assembly_incomplete", "helper_producer_missing",
+pub const RUNTIME_ADAPTER_REASONS: [&str; 9] = ["assembly_incomplete", "helper_producer_missing",
     "fork_reader_missing", "generation_mismatch", "publication_unavailable", "no_main_runtime",
-    "main_adapter_unavailable"];
+    "main_adapter_unavailable", "observation_pending", "observation_stale"];
 /// R8n-1: the helper tool family names (`isolation_execution::HelperFamily::name`).
 /// A listed family is not offered on this host: its tools are neither listed
 /// nor callable for isolated employees. Informational only.
@@ -120,16 +123,31 @@ impl Content {
     pub(crate) fn view(&self, boot_id: &str, written_unix: u64) -> View {
         View { schema: SCHEMA, boot_id: boot_id.to_owned(), written_unix, ready: self.ready,
             components: self.components.iter().map(|(name, state, probe_reason)| {
-                let (state, reason) = match state {
-                    ComponentState::Ready => ("ready", None),
-                    ComponentState::Unavailable => ("not_ready", Some(probe_reason.unwrap_or("unavailable"))),
-                    ComponentState::PendingIntegration => ("pending", Some("pending_integration")),
-                };
+                let (state, reason) = state_and_reason(*state, *probe_reason);
                 ComponentView { name: (*name).to_owned(), state: state.to_owned(), reason: reason.map(str::to_owned) }
             }).collect(),
             assembly_missing: self.assembly_missing.iter().map(|name| (*name).to_owned()).collect(),
             tools_unavailable: self.tools_unavailable.iter().map(|name| (*name).to_owned()).collect() }
     }
+}
+
+/// A component's published state name and fixed reason name.
+fn state_and_reason(state: ComponentState, probe_reason: Option<&'static str>) -> (&'static str, Option<&'static str>) {
+    match state {
+        ComponentState::Ready => ("ready", None),
+        ComponentState::Unavailable => ("not_ready", Some(probe_reason.unwrap_or("unavailable"))),
+        ComponentState::PendingIntegration => ("pending", Some("pending_integration")),
+    }
+}
+
+/// R8n-1 review F3: each not-ready component's fixed reason name, exactly as
+/// [`Content::view`] publishes it (same filtering of probe reasons, same
+/// tables), for `system.status`'s `isolation_readiness.component_reasons`.
+pub(crate) fn component_reasons(readiness: &Readiness, reasons: ComponentReasons)
+    -> std::collections::BTreeMap<&'static str, &'static str> {
+    Content::of(readiness, reasons, Vec::new(), Vec::new()).components.iter()
+        .filter_map(|(name, state, probe_reason)| state_and_reason(*state, *probe_reason).1.map(|reason| (*name, reason)))
+        .collect()
 }
 
 /// `true` when the document must be (re)written: never written, content
@@ -332,7 +350,7 @@ mod tests {
             network: ComponentState::Ready, storage: ComponentState::Ready, parse_worker: ComponentState::Ready,
             update_service: ComponentState::Ready, mcp_boundary: state, runtime_adapters: ComponentState::Ready };
         Readiness { required: true, ready: components.all_ready(), components, status: None, reasons: None,
-            employees: None, notices: None, assembly_missing: None, tools_unavailable: None }
+            employees: None, notices: None, assembly_missing: None, tools_unavailable: None, component_reasons: None }
     }
     fn bytes(view: &View) -> Vec<u8> { serde_json::to_vec(view).unwrap() }
     fn content(readiness: &Readiness, assembly_missing: Vec<&'static str>) -> Content {
@@ -396,6 +414,37 @@ mod tests {
         }
     }
     fn readiness_all_ready() -> Readiness { readiness(ComponentState::Ready) }
+
+    /// R8n-1 review F3: `system.status`'s `component_reasons` is the published
+    /// view's reason of every not-ready component (probe reason only from its
+    /// own table), and nothing for a ready one.
+    #[test]
+    fn r8n_status_component_reasons_match_the_published_view() {
+        let mut readiness = readiness(ComponentState::PendingIntegration);
+        readiness.components.parse_worker = ComponentState::Unavailable;
+        readiness.components.runtime_adapters = ComponentState::Unavailable;
+        readiness.components.storage = ComponentState::Unavailable;
+        readiness.ready = false;
+        for reasons in [ComponentReasons { parse_worker: Some("observation_stale"), runtime_adapters: Some("no_main_runtime") },
+            ComponentReasons { parse_worker: Some("no_main_runtime"), runtime_adapters: None }] {
+            let map = component_reasons(&readiness, reasons);
+            let view = Content::of(&readiness, reasons, Vec::new(), Vec::new()).view(BOOT, NOW);
+            let published: std::collections::BTreeMap<&str, &str> = view.components.iter()
+                .filter_map(|component| component.reason.as_deref().map(|reason| (component.name.as_str(), reason))).collect();
+            assert_eq!(map, published);
+            assert_eq!(map.len(), 4, "storage, parse_worker, mcp_boundary, runtime_adapters");
+            assert_eq!(map["mcp_boundary"], "pending_integration");
+            assert_eq!(map["storage"], "unavailable");
+        }
+        let map = component_reasons(&readiness, ComponentReasons { parse_worker: Some("observation_stale"), runtime_adapters: None });
+        assert_eq!((map["parse_worker"], map["runtime_adapters"]), ("observation_stale", "unavailable"));
+        assert!(component_reasons(&readiness_all_ready(), ComponentReasons::default()).is_empty());
+        let mut status = readiness.clone();
+        status.component_reasons = Some(map);
+        let value = serde_json::to_value(&status).unwrap();
+        assert_eq!(value["component_reasons"]["parse_worker"], "observation_stale");
+        assert_eq!(value["components"].as_object().unwrap().len(), 8, "the component map's shape is unchanged");
+    }
 
     /// The family names are exactly `HelperFamily::name`, in order.
     #[cfg(target_os = "linux")]

@@ -467,8 +467,15 @@ fn read_host_file_limit(home: &std::path::Path, directories: &[&str], filename: 
     let mut components = directories.to_vec(); components.push(filename);
     for (index, component) in components.iter().enumerate() {
         let directory = index + 1 != components.len();
-        let flags = OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK
-            | OFlag::O_NOCTTY | if directory { OFlag::O_DIRECTORY } else { OFlag::empty() };
+        // Directories are only traversed (used as openat dirfds): O_PATH needs
+        // search permission alone, so an absolute snapshot below the installed
+        // home's root-owned 0711 parent works. O_PATH|O_NOFOLLOW|O_DIRECTORY
+        // refuses a symlinked component (ENOTDIR). The file keeps O_RDONLY.
+        let flags = if directory {
+            OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_DIRECTORY
+        } else {
+            OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_NOCTTY
+        };
         let fd = match openat(Some(root.as_raw_fd()), *component, flags, Mode::empty()) {
             Ok(fd) => fd,
             Err(nix::errno::Errno::ENOENT) => return Ok(None),

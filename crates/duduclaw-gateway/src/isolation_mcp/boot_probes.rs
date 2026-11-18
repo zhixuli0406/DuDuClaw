@@ -3,24 +3,39 @@
 //! boundary's probe (inside the attempt's shutdown-gate permit).
 //!
 //! Both run on every readiness evaluation (every admission, every
-//! `system.status` read and the published view's 5 s tick). Their producer
-//! checks are in-memory; their service checks read local files only and are
-//! cached for [`TTL`] (a success or a refusal), keyed by generation, with the
-//! timestamp taken BEFORE the readback, so a cached success always expires
-//! inside the composite's two-second observation window. No thread, task or
-//! process is started, and nothing is sent to any service. Any error is a
-//! refusal with one fixed reason (`published::PARSE_WORKER_REASONS` /
+//! `system.status` read and the published view's 5 s tick) and read MEMORY
+//! only: their producer checks are in-memory and their service check is the
+//! last stored [`Observations`] entry. R8n-1 review F2: the service I/O
+//! (`/proc/net/unix` up to 8 MiB, the socket/lease metadata, the root
+//! publication) is done by ONE background observer per process
+//! ([`start_observer`]), never by a probe: a Tokio task that, every
+//! [`PERIOD`] while the service is assembled, runs both readbacks on the
+//! blocking pool and stores each result with a monotonic timestamp taken
+//! BEFORE that read started. Single-flight by construction (one task, each
+//! pass awaited before the next); it stops at the shutdown gate. A probe uses
+//! a stored entry while it is at most [`MAX_AGE`] old (the composite's 2 s
+//! window), so the evidence an admission relies on is at most 2 s stale;
+//! older is `observation_stale`, none yet `observation_pending`. A failed
+//! read stores its fixed refusal. Nothing is sent to any service. Any error is
+//! a refusal with one fixed reason (`published::PARSE_WORKER_REASONS` /
 //! `RUNTIME_ADAPTER_REASONS`); an absent probe stays `PendingIntegration`.
-use std::{path::Path, sync::Mutex, time::{Duration, Instant}};
+use std::{path::Path, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, time::{Duration, Instant}};
 use duduclaw_isolation::{execution::RuntimeKind, ids::Sha256Digest};
 use duduclaw_spawnd::policy::PublishedRuntime;
 use crate::isolation_readiness::{IntegrationProbe, ProbeError, PtyRequirement, ServiceObservation};
 use super::OWNER;
 
-/// How long one service readback is reused (half the observation window).
-const TTL: Duration = Duration::from_secs(1);
+/// The observer starts one pass at most this often (a slower pass delays the
+/// next one; passes never overlap).
+const PERIOD: Duration = Duration::from_secs(1);
+/// A stored observation is used while at most this old, measured from the
+/// timestamp taken before its read (the composite's observation window).
+const MAX_AGE: Duration = Duration::from_secs(2);
 /// `/proc/net/unix` is read up to this size; a larger table is a refusal.
 const MAX_SOCKET_TABLE_BYTES: u64 = 8 * 1024 * 1024;
+
+const OBSERVATION_PENDING: &str = "observation_pending";
+const OBSERVATION_STALE: &str = "observation_stale";
 
 const ASSEMBLY_INCOMPLETE: &str = "assembly_incomplete";
 const LAUNCHER_NOT_INSTALLED: &str = "launcher_not_installed";
@@ -37,28 +52,131 @@ const MAIN_ADAPTER_UNAVAILABLE: &str = "main_adapter_unavailable";
 
 type Readback = Result<Option<PtyRequirement>, &'static str>;
 
+/// One stored readback: `observed` was taken BEFORE the read started.
 #[derive(Clone, Copy)]
-struct Cached { generation: Sha256Digest, observed: Instant, result: Readback }
+struct Stored { generation: Sha256Digest, observed: Instant, result: Readback }
 
-/// The last readback, reused while younger than [`TTL`] for the same generation.
-#[derive(Default)]
-struct TtlCache(Mutex<Option<Cached>>);
-impl TtlCache {
-    /// `(timestamp taken before the readback, its result)`.
-    fn get_or(&self, generation: Sha256Digest, readback: impl FnOnce() -> Readback) -> (Instant, Readback) {
-        let now = Instant::now();
-        if let Ok(slot) = self.0.lock() {
-            if let Some(cached) = slot.as_ref().filter(|cached| cached.generation == generation
-                && now.checked_duration_since(cached.observed).is_some_and(|age| age < TTL)) {
-                return (cached.observed, cached.result);
-            }
-        }
-        let observed = Instant::now();
-        let result = readback();
-        // A poisoned slot only loses the cache, never the check.
-        if let Ok(mut slot) = self.0.lock() { *slot = Some(Cached { generation, observed, result }); }
-        (observed, result)
+/// The observer's latest readback of one probe (memory only).
+struct Slot(Mutex<Option<Stored>>);
+impl Slot {
+    const fn new() -> Self { Self(Mutex::new(None)) }
+    fn store(&self, value: Option<Stored>) {
+        // A poisoned slot is still overwritten: never keep older evidence.
+        *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = value;
     }
+    /// `(timestamp taken before the read, its result)` while fresh for
+    /// `generation`; otherwise the fixed reason (fail closed).
+    fn fresh(&self, generation: Sha256Digest, now: Instant) -> Result<(Instant, Readback), &'static str> {
+        let slot = self.0.lock().map_err(|_| OBSERVATION_PENDING)?;
+        let stored = slot.as_ref().ok_or(OBSERVATION_PENDING)?;
+        if stored.generation != generation
+            || !now.checked_duration_since(stored.observed).is_some_and(|age| age <= MAX_AGE) {
+            return Err(OBSERVATION_STALE);
+        }
+        Ok((stored.observed, stored.result))
+    }
+}
+
+/// The two probes' stored observations: written only by the observer, read
+/// (memory only) by the probes. A probe holds this and nothing else: it has
+/// no access to a [`ServiceReader`].
+pub(super) struct Observations { parse: Slot, runtime: Slot }
+impl Observations {
+    pub(super) const fn new() -> Self { Self { parse: Slot::new(), runtime: Slot::new() } }
+    fn clear(&self) {
+        self.parse.store(None);
+        self.runtime.store(None);
+    }
+}
+
+/// The process's observations (the one observer writes them).
+static OBSERVATIONS: Observations = Observations::new();
+/// Set once the process's one observer was started.
+static OBSERVER_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// The blocking service readbacks of both probes. Only the observer holds one.
+pub(super) trait ServiceReader: Send + Sync {
+    /// The parse service's local evidence (`Ok(None)` when it passed).
+    fn parse(&self, generation: Sha256Digest) -> Readback;
+    /// The root publication's main runtimes (`Ok(Some(pty))` when it passed).
+    fn runtime(&self, generation: Sha256Digest) -> Readback;
+}
+
+/// Production readbacks (see [`ParseWorkerReadiness`], [`RuntimeAdapterReadiness`]).
+struct InstalledReader;
+impl ServiceReader for InstalledReader {
+    fn parse(&self, _generation: Sha256Digest) -> Readback {
+        parse_service_evidence(Path::new(duduclaw_parse_worker::policy::SOCKET_PATH),
+            Path::new(duduclaw_parse_worker::retirement::LEASE_PATH), 0, &gateway_groups(), unix_socket_table)
+            .map(|()| None)
+    }
+    fn runtime(&self, generation: Sha256Digest) -> Readback {
+        let owner = OWNER.get().ok_or(ASSEMBLY_INCOMPLETE)?;
+        let publication = duduclaw_spawnd::installed::GatewayPublication::read(nix::unistd::getegid().as_raw())
+            .map_err(|_| PUBLICATION_UNAVAILABLE)?;
+        if publication.generation != generation { return Err(GENERATION_MISMATCH); }
+        publication.policy().map_err(|_| PUBLICATION_UNAVAILABLE)?;
+        let runtimes: Vec<PublishedRuntime> = publication.runtimes.iter().map(|record| record.to_runtime()).collect();
+        main_runtime_evidence(&runtimes, |kind| owner.registry.registration(kind).is_ok()).map(Some)
+    }
+}
+
+/// One observer pass: each read's timestamp is taken before it starts, and
+/// its result (a success or its fixed refusal) replaces the stored one.
+fn observe_once(reader: &dyn ServiceReader, observations: &Observations, generation: Sha256Digest) {
+    let observed = Instant::now();
+    let result = reader.parse(generation);
+    observations.parse.store(Some(Stored { generation, observed, result }));
+    let observed = Instant::now();
+    let result = reader.runtime(generation);
+    observations.runtime.store(Some(Stored { generation, observed, result }));
+}
+
+/// The observer loop: one pass on the blocking pool, awaited, then the rest
+/// of [`PERIOD`]; never two passes at once. Ends once `closed` answers true
+/// (checked before every pass and after every wait). A pass that panicked
+/// clears both entries (pending: fail closed at once).
+async fn observe(reader: Arc<dyn ServiceReader>, observations: &'static Observations, generation: Sha256Digest,
+    closed: impl Fn() -> bool) {
+    loop {
+        if closed() { return; }
+        let started = Instant::now();
+        let pass = reader.clone();
+        if tokio::task::spawn_blocking(move || observe_once(pass.as_ref(), observations, generation)).await.is_err() {
+            observations.clear();
+        }
+        tokio::time::sleep(PERIOD.saturating_sub(started.elapsed())).await;
+    }
+}
+
+/// Start the process's ONE observer for the assembled owner's `generation`
+/// (a later call does nothing). Called after the probes were installed,
+/// inside the boot attempt's shutdown-gate permit; `closed` is the shutdown
+/// gate. Without a Tokio runtime nothing is observed and both probes stay
+/// not ready (`observation_pending`).
+pub(super) fn start_observer(generation: Sha256Digest, closed: fn() -> bool) {
+    if tokio::runtime::Handle::try_current().is_err() {
+        tracing::error!("隔離服務狀態的背景觀察無法啟動，團隊執行維持暫停。");
+        return;
+    }
+    if OBSERVER_STARTED.swap(true, Ordering::AcqRel) { return; }
+    drop(tokio::spawn(observe(Arc::new(InstalledReader), &OBSERVATIONS, generation, closed)));
+}
+
+/// The ParseWorker service observation from memory only.
+fn parse_observation(observations: &Observations, generation: Sha256Digest, now: Instant)
+    -> Result<ServiceObservation, ProbeError> {
+    let (observed, result) = observations.parse.fresh(generation, now).map_err(ProbeError::Refused)?;
+    result.map_err(ProbeError::Refused)?;
+    Ok(ServiceObservation::checked(generation, observed))
+}
+
+/// The RuntimeAdapters service observation from memory only.
+fn runtime_observation(observations: &Observations, generation: Sha256Digest, now: Instant)
+    -> Result<ServiceObservation, ProbeError> {
+    let (observed, result) = observations.runtime.fresh(generation, now).map_err(ProbeError::Refused)?;
+    let pty = result.map_err(ProbeError::Refused)?.ok_or(ProbeError::Refused(PUBLICATION_UNAVAILABLE))?;
+    Ok(ServiceObservation::checked_runtime(generation, observed, pty))
 }
 
 fn healthy_owner() -> Result<&'static super::BootOwner, ProbeError> {
@@ -79,9 +197,12 @@ fn healthy_owner() -> Result<&'static super::BootOwner, ProbeError> {
 /// retirement lease exists with its fixed owner and mode. The worker
 /// operation routes are checked by the McpBoundary probe (the CLI's route
 /// inventory against the same `worker_plans`); spawnd's host evidence covers
-/// containment.
-#[derive(Default)]
-pub(super) struct ParseWorkerReadiness { cache: TtlCache }
+/// containment. The service evidence is read by the observer
+/// ([`InstalledReader::parse`]); this probe only reads its stored result.
+pub(super) struct ParseWorkerReadiness { observations: &'static Observations }
+impl Default for ParseWorkerReadiness {
+    fn default() -> Self { Self { observations: &OBSERVATIONS } }
+}
 impl IntegrationProbe for ParseWorkerReadiness {
     fn verify_producers(&self) -> Result<(), ProbeError> {
         healthy_owner()?;
@@ -94,13 +215,7 @@ impl IntegrationProbe for ParseWorkerReadiness {
     fn verify_service(&self, generation: Sha256Digest) -> Result<ServiceObservation, ProbeError> {
         let owner = OWNER.get().ok_or(ProbeError::Refused(ASSEMBLY_INCOMPLETE))?;
         if owner.generation != generation { return Err(ProbeError::Refused(GENERATION_MISMATCH)); }
-        let (observed, result) = self.cache.get_or(generation, || {
-            parse_service_evidence(Path::new(duduclaw_parse_worker::policy::SOCKET_PATH),
-                Path::new(duduclaw_parse_worker::retirement::LEASE_PATH), 0, &gateway_groups(), unix_socket_table)
-                .map(|()| None)
-        });
-        result.map_err(ProbeError::Refused)?;
-        Ok(ServiceObservation::checked(generation, observed))
+        parse_observation(self.observations, generation, Instant::now())
     }
 }
 
@@ -166,8 +281,12 @@ fn listening(table: &str, path: &str) -> bool {
 /// installed runtime registry (signed MCP bridge acceptance). The PTY
 /// requirement comes from the same publication: `Required` when a main
 /// runtime allows a PTY (then the separate PtyTransport proof is required).
-#[derive(Default)]
-pub(super) struct RuntimeAdapterReadiness { cache: TtlCache }
+/// The publication is read by the observer ([`InstalledReader::runtime`]);
+/// this probe only reads its stored result.
+pub(super) struct RuntimeAdapterReadiness { observations: &'static Observations }
+impl Default for RuntimeAdapterReadiness {
+    fn default() -> Self { Self { observations: &OBSERVATIONS } }
+}
 impl IntegrationProbe for RuntimeAdapterReadiness {
     fn verify_producers(&self) -> Result<(), ProbeError> {
         let owner = healthy_owner()?;
@@ -178,16 +297,7 @@ impl IntegrationProbe for RuntimeAdapterReadiness {
     fn verify_service(&self, generation: Sha256Digest) -> Result<ServiceObservation, ProbeError> {
         let owner = OWNER.get().ok_or(ProbeError::Refused(ASSEMBLY_INCOMPLETE))?;
         if owner.generation != generation { return Err(ProbeError::Refused(GENERATION_MISMATCH)); }
-        let (observed, result) = self.cache.get_or(generation, || {
-            let publication = duduclaw_spawnd::installed::GatewayPublication::read(nix::unistd::getegid().as_raw())
-                .map_err(|_| PUBLICATION_UNAVAILABLE)?;
-            if publication.generation != generation { return Err(GENERATION_MISMATCH); }
-            publication.policy().map_err(|_| PUBLICATION_UNAVAILABLE)?;
-            let runtimes: Vec<PublishedRuntime> = publication.runtimes.iter().map(|record| record.to_runtime()).collect();
-            main_runtime_evidence(&runtimes, |kind| owner.registry.registration(kind).is_ok()).map(Some)
-        });
-        let pty = result.map_err(ProbeError::Refused)?.ok_or(ProbeError::Refused(PUBLICATION_UNAVAILABLE))?;
-        Ok(ServiceObservation::checked_runtime(generation, observed, pty))
+        runtime_observation(self.observations, generation, Instant::now())
     }
 }
 
@@ -228,11 +338,13 @@ fn gateway_adapter(kind: &RuntimeKind) -> bool {
 
 /// Every reason these probes can give (each must be in the published tables).
 #[cfg(test)]
-const PARSE_REASONS: [&str; 7] = [ASSEMBLY_INCOMPLETE, LAUNCHER_NOT_INSTALLED, GENERATION_MISMATCH,
-    SOCKET_UNAVAILABLE, SOCKET_UNSAFE, SOCKET_NOT_LISTENING, LEASE_UNAVAILABLE];
+const PARSE_REASONS: [&str; 9] = [ASSEMBLY_INCOMPLETE, LAUNCHER_NOT_INSTALLED, GENERATION_MISMATCH,
+    SOCKET_UNAVAILABLE, SOCKET_UNSAFE, SOCKET_NOT_LISTENING, LEASE_UNAVAILABLE, OBSERVATION_PENDING,
+    OBSERVATION_STALE];
 #[cfg(test)]
-const RUNTIME_REASONS: [&str; 7] = [ASSEMBLY_INCOMPLETE, HELPER_PRODUCER_MISSING, FORK_READER_MISSING,
-    GENERATION_MISMATCH, PUBLICATION_UNAVAILABLE, NO_MAIN_RUNTIME, MAIN_ADAPTER_UNAVAILABLE];
+const RUNTIME_REASONS: [&str; 9] = [ASSEMBLY_INCOMPLETE, HELPER_PRODUCER_MISSING, FORK_READER_MISSING,
+    GENERATION_MISMATCH, PUBLICATION_UNAVAILABLE, NO_MAIN_RUNTIME, MAIN_ADAPTER_UNAVAILABLE, OBSERVATION_PENDING,
+    OBSERVATION_STALE];
 
 #[cfg(test)]
 mod tests {
@@ -412,24 +524,146 @@ mod tests {
         fd
     }
 
-    /// The cache reuses one readback inside the TTL (with its original
-    /// timestamp), never across generations, and caches refusals too.
+    use std::sync::atomic::AtomicUsize;
+
+    /// A counting fake reader: `delay` per parse read, tracking how many
+    /// reads run at once.
+    struct FakeReader {
+        calls: AtomicUsize, in_flight: AtomicUsize, max_in_flight: AtomicUsize,
+        delay: Duration, parse: Readback, runtime: Readback,
+    }
+    impl FakeReader {
+        fn new(delay: Duration, parse: Readback, runtime: Readback) -> Arc<Self> {
+            Arc::new(Self { calls: AtomicUsize::new(0), in_flight: AtomicUsize::new(0),
+                max_in_flight: AtomicUsize::new(0), delay, parse, runtime })
+        }
+        fn calls(&self) -> usize { self.calls.load(Ordering::Acquire) }
+    }
+    impl ServiceReader for FakeReader {
+        fn parse(&self, _: Sha256Digest) -> Readback {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            let now = self.in_flight.fetch_add(1, Ordering::AcqRel) + 1;
+            self.max_in_flight.fetch_max(now, Ordering::AcqRel);
+            std::thread::sleep(self.delay);
+            self.in_flight.fetch_sub(1, Ordering::AcqRel);
+            self.parse
+        }
+        fn runtime(&self, _: Sha256Digest) -> Readback {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            self.runtime
+        }
+    }
+    fn leaked() -> &'static Observations { Box::leak(Box::new(Observations::new())) }
+
+    /// R8n-1 review F2: the probes read memory only. A probe type holds only
+    /// `&Observations` (no reader); reading it any number of times never
+    /// calls the reader: only the observer's pass does. Nothing stored yet
+    /// is `observation_pending`; a stored refusal keeps its own reason.
     #[test]
-    fn r8n_probe_readback_is_cached_briefly_per_generation() {
-        let cache = TtlCache::default();
-        let (one, two) = (Sha256Digest([1; 32]), Sha256Digest([2; 32]));
-        let mut calls = 0;
-        let (first, result) = cache.get_or(one, || { calls += 1; Ok(None) });
-        assert_eq!(result, Ok(None));
-        let (again, _) = cache.get_or(one, || { calls += 1; Ok(None) });
-        assert_eq!((again, calls), (first, 1), "reused with its pre-readback timestamp");
-        let (_, refused) = cache.get_or(two, || { calls += 1; Err(SOCKET_UNAVAILABLE) });
-        assert_eq!((refused, calls), (Err(SOCKET_UNAVAILABLE), 2), "another generation reads again");
-        let (_, cached) = cache.get_or(two, || { calls += 1; Ok(None) });
-        assert_eq!((cached, calls), (Err(SOCKET_UNAVAILABLE), 2));
-        // Expired: read again.
-        *cache.0.lock().unwrap() = Some(Cached { generation: one, observed: Instant::now() - TTL, result: Ok(None) });
-        let (_, _) = cache.get_or(one, || { calls += 1; Ok(None) });
-        assert_eq!(calls, 3);
+    fn r8n_probes_perform_no_io_and_only_the_observer_reads() {
+        let generation = Sha256Digest([1; 32]);
+        let observations = leaked();
+        let reader = FakeReader::new(Duration::ZERO, Ok(None), Ok(Some(PtyRequirement::NotRequired)));
+        for _ in 0..3 {
+            assert!(matches!(parse_observation(observations, generation, Instant::now()),
+                Err(ProbeError::Refused(OBSERVATION_PENDING))));
+            assert!(matches!(runtime_observation(observations, generation, Instant::now()),
+                Err(ProbeError::Refused(OBSERVATION_PENDING))));
+        }
+        assert_eq!(reader.calls(), 0, "a probe never reads");
+        observe_once(reader.as_ref(), observations, generation);
+        assert_eq!(reader.calls(), 2, "one pass: one parse and one runtime read");
+        for _ in 0..5 {
+            assert!(parse_observation(observations, generation, Instant::now()).is_ok());
+            assert!(runtime_observation(observations, generation, Instant::now()).is_ok());
+        }
+        assert_eq!(reader.calls(), 2, "probes reuse the stored observation");
+        // A failed read stores "not ready" with its fixed reason.
+        let failing = FakeReader::new(Duration::ZERO, Err(SOCKET_NOT_LISTENING), Err(NO_MAIN_RUNTIME));
+        observe_once(failing.as_ref(), observations, generation);
+        assert!(matches!(parse_observation(observations, generation, Instant::now()),
+            Err(ProbeError::Refused(SOCKET_NOT_LISTENING))));
+        assert!(matches!(runtime_observation(observations, generation, Instant::now()),
+            Err(ProbeError::Refused(NO_MAIN_RUNTIME))));
+        // A runtime readback without a PTY requirement is never ready.
+        let no_pty = FakeReader::new(Duration::ZERO, Ok(None), Ok(None));
+        observe_once(no_pty.as_ref(), observations, generation);
+        assert!(matches!(runtime_observation(observations, generation, Instant::now()),
+            Err(ProbeError::Refused(PUBLICATION_UNAVAILABLE))));
+        // The production probes are built over the process's observations.
+        assert!(std::ptr::eq(ParseWorkerReadiness::default().observations, &OBSERVATIONS));
+        assert!(std::ptr::eq(RuntimeAdapterReadiness::default().observations, &OBSERVATIONS));
+    }
+
+    /// Older than the 2 s window (measured from the pre-read timestamp), from
+    /// the future, or of another generation: `observation_stale`.
+    #[test]
+    fn r8n_stale_observation_is_not_ready() {
+        let generation = Sha256Digest([1; 32]);
+        let observations = leaked();
+        observe_once(FakeReader::new(Duration::ZERO, Ok(None), Ok(Some(PtyRequirement::NotRequired))).as_ref(),
+            observations, generation);
+        let observed_at = |slot: &Slot| slot.0.lock().unwrap().as_ref().map(|stored| stored.observed).unwrap();
+        let (observed, runtime_observed) = (observed_at(&observations.parse), observed_at(&observations.runtime));
+        assert!(parse_observation(observations, generation, observed + MAX_AGE).is_ok());
+        assert!(runtime_observation(observations, generation, runtime_observed + MAX_AGE).is_ok());
+        for now in [observed + MAX_AGE + Duration::from_millis(1), observed + Duration::from_secs(60)] {
+            assert!(matches!(parse_observation(observations, generation, now), Err(ProbeError::Refused(OBSERVATION_STALE))));
+        }
+        assert!(matches!(runtime_observation(observations, generation, runtime_observed + Duration::from_secs(3)),
+            Err(ProbeError::Refused(OBSERVATION_STALE))));
+        // A stored timestamp after "now" is never fresh.
+        if let Some(before) = observed.checked_sub(Duration::from_millis(1)) {
+            assert!(matches!(parse_observation(observations, generation, before), Err(ProbeError::Refused(OBSERVATION_STALE))));
+        }
+        // Another generation's observation.
+        assert!(matches!(parse_observation(observations, Sha256Digest([2; 32]), observed),
+            Err(ProbeError::Refused(OBSERVATION_STALE))));
+        // A cleared slot (a pass that panicked) is pending again.
+        observations.clear();
+        assert!(matches!(parse_observation(observations, generation, Instant::now()),
+            Err(ProbeError::Refused(OBSERVATION_PENDING))));
+    }
+
+    /// Single-flight: a read slower than the period never overlaps a second
+    /// pass; the next pass starts only after the slow one ended.
+    #[tokio::test]
+    async fn r8n_observer_is_single_flight_with_a_slow_read() {
+        let generation = Sha256Digest([1; 32]);
+        let observations = leaked();
+        let reader = FakeReader::new(Duration::from_millis(1300), Ok(None), Ok(Some(PtyRequirement::NotRequired)));
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let task = tokio::spawn(observe(reader.clone(), observations, generation, move || flag.load(Ordering::Acquire)));
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+        // One 1.3 s pass done, the second one in progress (never two at once).
+        assert_eq!(reader.max_in_flight.load(Ordering::Acquire), 1);
+        assert!(reader.calls() <= 3, "at most one finished pass (2 reads) and one started parse read");
+        stop.store(true, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(5), task).await.expect("observer stops").unwrap();
+        assert_eq!(reader.max_in_flight.load(Ordering::Acquire), 1);
+    }
+
+    /// The observer stops at the shutdown gate: nothing is read once closed,
+    /// and a gate that closes later ends the loop within one period.
+    #[tokio::test]
+    async fn r8n_observer_stops_on_shutdown() {
+        let generation = Sha256Digest([1; 32]);
+        let reader = FakeReader::new(Duration::ZERO, Ok(None), Ok(Some(PtyRequirement::NotRequired)));
+        tokio::time::timeout(Duration::from_secs(1), observe(reader.clone(), leaked(), generation, || true))
+            .await.expect("a closed gate ends the observer at once");
+        assert_eq!(reader.calls(), 0);
+        let observations = leaked();
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let task = tokio::spawn(observe(reader.clone(), observations, generation, move || flag.load(Ordering::Acquire)));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(reader.calls(), 2, "the first pass ran at once");
+        assert!(parse_observation(observations, generation, Instant::now()).is_ok());
+        stop.store(true, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(3), task).await.expect("observer stops").unwrap();
+        let after = reader.calls();
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert_eq!(reader.calls(), after, "no pass after shutdown");
     }
 }

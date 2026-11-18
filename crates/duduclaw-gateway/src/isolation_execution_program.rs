@@ -80,11 +80,20 @@ impl HelperFamilies {
 /// R8n-1 1.1: the families offered by the signed helper runtimes. No helper
 /// runtime at all is a valid, empty set; a signed helper record that fails
 /// its fixed protocol is a broken policy and refuses the whole set.
+/// R8n-1 review F1: so is a full helper `RuntimeKind` signed twice. The
+/// entitlement derivation (`isolation_entitlement::desired`, via `single`)
+/// deliberately leaves an ambiguous kind out and spawnd's launcher rule
+/// refuses duplicate kinds, so offering the family would list a tool whose
+/// every call is refused at `derive`.
 fn offered_families(runtimes: impl IntoIterator<Item = PublishedRuntime>) -> Result<HelperFamilies, PlansFailure> {
     let mut offered = HelperFamilies::NONE;
+    let mut kinds: Vec<RuntimeKind> = Vec::new();
     for runtime in runtimes {
         let Some(family) = HelperFamily::of_kind(&runtime.runtime) else { continue };
-        if !valid_helper(&runtime) { return Err(PlansFailure::InvalidHelperRuntime); }
+        if !valid_helper(&runtime) || kinds.contains(&runtime.runtime) {
+            return Err(PlansFailure::InvalidHelperRuntime);
+        }
+        kinds.push(runtime.runtime);
         offered = offered.with(family);
     }
     Ok(offered)
@@ -576,6 +585,46 @@ mod tests {
             assert_eq!(offered_families(mixed), Err(PlansFailure::InvalidHelperRuntime), "{family:?}");
         }
         assert_eq!(PlansFailure::InvalidHelperRuntime.reason(), "invalid_helper_runtime");
+    }
+
+    /// R8n-1 review F1: two valid signed records of the SAME full helper kind
+    /// (different profiles) refuse the whole helper set, so no plan set is
+    /// built: the assembly does not complete and the tool is neither listed
+    /// nor callable. The entitlement derivation agrees (it leaves the
+    /// ambiguous kind out). Distinct office script ids are distinct kinds.
+    #[test]
+    fn r8n_duplicate_helper_kind_is_an_invalid_helper_set() {
+        use duduclaw_isolation::egress::ProfileId;
+        for family in HelperFamily::ALL {
+            let first = valid_helper_record(family);
+            let mut second = valid_helper_record(family);
+            second.profile = ProfileId(Sha256Digest([9; 32]));
+            assert!(valid_helper(&first) && valid_helper(&second), "{family:?}");
+            assert_eq!(offered_families([first.clone(), second.clone()]), Err(PlansFailure::InvalidHelperRuntime), "{family:?}");
+            let mut all: Vec<_> = HelperFamily::ALL.map(valid_helper_record).into();
+            all.push(second);
+            assert_eq!(offered_families(all), Err(PlansFailure::InvalidHelperRuntime), "{family:?}");
+        }
+        // Two office scripts: two kinds of one family, still valid.
+        let docx = valid_helper_record(HelperFamily::Office);
+        let mut xlsx = signed_helper(&office_helper::script_id("xlsx", "create").unwrap(),
+            vec![office_helper::ARGUMENT.to_owned(), "xlsx".into(), "create".into(), "a".repeat(64), "b".repeat(64)],
+            NetworkPolicy::Offline, 185_000);
+        xlsx.profile = ProfileId(Sha256Digest([8; 32]));
+        assert!(valid_helper(&xlsx));
+        assert_eq!(offered_families([docx, xlsx]), Ok(HelperFamilies::NONE.with(HelperFamily::Office)));
+        // Calling agrees: the employee is never entitled to the ambiguous kind.
+        #[cfg(target_os = "linux")]
+        {
+            let main = crate::isolation_entitlement::tests::signed(1, RuntimeKind::Claude);
+            let (mut one, mut two) = (valid_helper_record(HelperFamily::Program), valid_helper_record(HelperFamily::Program));
+            one.profile = ProfileId(Sha256Digest([7; 32]));
+            two.profile = ProfileId(Sha256Digest([9; 32]));
+            let desired = crate::isolation_entitlement::desired(&[main.clone(), one.clone(), two.clone()],
+                &json!({"runtime": {"provider": "claude"}})).unwrap();
+            assert_eq!(desired.entitlement.profiles, vec![main.profile]);
+            assert_eq!(offered_families([main, one, two]), Err(PlansFailure::InvalidHelperRuntime));
+        }
     }
 
     /// R8n-1: a plan set never supports a family it does not offer.

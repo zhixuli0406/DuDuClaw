@@ -74,8 +74,9 @@ impl Components {
 
 /// R8n-1: the fixed reasons of the two probe-backed components (a refused
 /// ParseWorker / RuntimeAdapters probe), beside [`Components`]; published as
-/// `component(reason)` in the root CLI's view. Never serialized in
-/// `system.status`'s component map, whose shape is unchanged.
+/// `component(reason)` in the root CLI's view, and (review F3) in
+/// `system.status`'s separate `component_reasons` map ([`report`]). Never
+/// serialized in the component map, whose shape is unchanged.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ComponentReasons {
     pub parse_worker: Option<&'static str>,
@@ -132,6 +133,13 @@ pub struct Readiness {
     /// Informational: never part of `ready` or `status`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools_unavailable: Option<Vec<&'static str>>,
+    /// R8n-1 review F3, set only by [`report`]: each NOT-ready component's
+    /// fixed reason name, exactly as the published view gives it
+    /// (`published::component_reasons`: a probe reason from
+    /// `published::PARSE_WORKER_REASONS` / `RUNTIME_ADAPTER_REASONS`, else
+    /// `unavailable` / `pending_integration`). Ready components are absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub component_reasons: Option<std::collections::BTreeMap<&'static str, &'static str>>,
 }
 
 fn applies(linux: bool, protected: bool, team: bool) -> bool { linux && protected && team }
@@ -383,15 +391,19 @@ pub(crate) fn status_with_reasons() -> Option<(Readiness, ComponentReasons)> {
     if !REQUIRED.load(Ordering::Acquire) { return None; }
     let (components, reasons) = Components::current_with_reasons(spawnd_verified());
     Some((Readiness { required: true, ready: components.all_ready(), components,
-        status: None, reasons: None, employees: None, notices: None, assembly_missing: None, tools_unavailable: None },
+        status: None, reasons: None, employees: None, notices: None, assembly_missing: None, tools_unavailable: None,
+        component_reasons: None },
         reasons))
 }
 
 /// [`status`] plus the F3 reasons, for the dashboard. Blocking (SQLite and
 /// root ReadBack per employee): call on the blocking pool. Diagnosis only;
 /// it never admits anything. Employee labels are included for admins only.
+/// R8n-1 review F3: the same source as the published view
+/// ([`status_with_reasons`]), so each not-ready component keeps its reason.
 pub fn report(home: &std::path::Path, admin: bool) -> Option<Readiness> {
-    let readiness = status()?;
+    let (readiness, component_reasons) = status_with_reasons()?;
+    let component_reasons = published::component_reasons(&readiness, component_reasons);
     let assessment = reasons::assess_installed(home);
     // W1: host-wide work-broker / in-run helper reasons (live feature view),
     // action-required only for tools some protected employee is configured with.
@@ -404,6 +416,7 @@ pub fn report(home: &std::path::Path, admin: bool) -> Option<Readiness> {
     // R8m 30b: the same fixed list the root CLI reads from the published view.
     readiness.assembly_missing = Some(published::assembly_missing());
     readiness.tools_unavailable = Some(published::tools_unavailable());
+    readiness.component_reasons = Some(component_reasons);
     Some(readiness)
 }
 
@@ -429,10 +442,12 @@ fn with_features(readiness: Readiness, mut assessment: reasons::Assessment, feat
 /// The assessment itself could not run (blocking task failed): fail closed.
 pub fn report_failed() -> Option<Readiness> {
     let failed = reasons::Assessment { reasons: [Reason::ServiceUnavailable].into(), employees: Vec::new() };
-    status().map(|readiness| {
+    status_with_reasons().map(|(readiness, component_reasons)| {
+        let component_reasons = published::component_reasons(&readiness, component_reasons);
         let mut readiness = with_assessment(readiness, failed, false);
         readiness.assembly_missing = Some(published::assembly_missing());
         readiness.tools_unavailable = Some(published::tools_unavailable());
+        readiness.component_reasons = Some(component_reasons);
         readiness
     })
 }
@@ -714,7 +729,7 @@ mod tests {
         let components = Components::current(false);
         let value = serde_json::to_value(Readiness { required: true, ready: false, components,
             status: None, reasons: None, employees: None, notices: None, assembly_missing: None,
-            tools_unavailable: None }).unwrap();
+            tools_unavailable: None, component_reasons: None }).unwrap();
         assert_eq!(value["required"], true);
         assert_eq!(value["ready"], false);
         assert_eq!(value["components"].as_object().unwrap().len(), 8);
@@ -733,7 +748,7 @@ mod tests {
 
     fn base(components: Components) -> Readiness {
         Readiness { required: true, ready: components.all_ready(), components, status: None, reasons: None,
-            employees: None, notices: None, assembly_missing: None, tools_unavailable: None }
+            employees: None, notices: None, assembly_missing: None, tools_unavailable: None, component_reasons: None }
     }
 
     /// W1 follow-up: a host that publishes no helpers (and whose spawnd lacks

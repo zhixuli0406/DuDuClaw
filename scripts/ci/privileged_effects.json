@@ -6466,7 +6466,7 @@
       "rationale": "Round 3 regression creates one scoped Rust thread to verify status-query transaction ordering; no OS process is launched."
     },
     {
-      "symbol": "crates/duduclaw-parse-worker/src/retirement.rs::DropforSession::drop",
+      "symbol": "crates/duduclaw-parse-worker/src/retirement.rs::Session::retire",
       "apis": {
         "terminal_spawn": 1
       },
@@ -6475,7 +6475,7 @@
       ],
       "identity": "gateway",
       "migration": "not_process",
-      "rationale": "Production worker-session teardown starts one bounded 40-second Rust thread to poll exact systemd retirement and retain the durable input lease until proven empty; no OS process is launched."
+      "rationale": "Production worker-session retirement (idempotent; called from Drop for Session and on a failed live-authority exchange) starts one bounded 40-second Rust thread to poll exact systemd retirement and retain the durable input lease until proven empty; no OS process is launched."
     },
     {
       "symbol": "crates/duduclaw-gateway/src/isolation_readiness.rs::start_update_probe",
@@ -7133,6 +7133,19 @@
       "identity": "test",
       "migration": "test_only",
       "rationale": "Test-only fork child issues only async-signal-safe fcntl(F_GETLK) and _exit to observe process-wide POSIX locks; not a production spawn path."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/fs_safe/sqlite.rs::tests::iso_root_private_db_opens_below_a_root_0711_parent",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_status": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Ignored root-VM test re-runs one copy of this test binary as uid/gid 65534 (an exact test filter) to open a private database below a root:root 0711 parent; not a production spawn path."
     },
     {
       "symbol": "crates/duduclaw-gateway/src/installation_identity/tests.rs::unix::extended_acl_on_the_key_is_refused_and_not_regenerated",
