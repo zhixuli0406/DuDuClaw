@@ -1,7 +1,9 @@
-//! R7c: the facts spawnd (`accounts.rs` `ssh_effective_denied`) and the SSH
-//! denial probe (`src/bin/probe.rs`, stage `effective_config`) read from
-//! `sshd -T -C user=<account>,host=localhost,addr=127.0.0.1`. One parser for
-//! both: neither keeps a copy.
+//! R7c: the facts spawnd (`accounts.rs` `ssh_effective_denied`, and the port
+//! it passes to the SSH denial probe in the unit instance name) and the root
+//! tests read from `sshd -T -C user=<account>,host=localhost,addr=127.0.0.1`.
+//! One parser for all of them: none keeps a copy. The probe itself runs
+//! unprivileged and cannot run `sshd -T`; [`port_number`] is also its (and the
+//! instance name's, `ids::probe_instance`) port rule.
 //!
 //! sshd prints one lower-case `key value…` per line, and ONE `denyusers` line
 //! PER pattern (OpenSSH 9.6p1: `DenyUsers duduclaw-emp-* duduclaw …` prints

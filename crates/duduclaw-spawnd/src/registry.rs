@@ -68,12 +68,38 @@ pub trait AccountHost {
     /// Must not create a missing user, delete the permanent mapping, or accept a
     /// same-uid alias. Success includes a complete no-process readback.
     fn recover_locked(&mut self, _account: &EmployeeAccount) -> io::Result<()> { Err(invalid()) }
-    /// R7c: wait, bounded, until the SSH denial probe of a just-created (or
-    /// resumed) account reports Denied. An unresolved result is an error
-    /// carrying `crate::accounts::SshRefusal` (`probe_unresolved`), which
-    /// keeps the reservation resumable instead of tombstoning it. Default:
-    /// nothing to wait for (hosts and fakes without a probe).
-    fn await_login_denied(&mut self, _account: &EmployeeAccount) -> io::Result<()> { Ok(()) }
+    /// R7c (F6): the SSH denial probe result of a just-created (or resumed)
+    /// account, WITHOUT waiting: `Ok` only when it is Denied; otherwise the
+    /// probe is requested (forced, ahead of background requests) and an error
+    /// carrying `crate::accounts::SshRefusal` is returned at once. An
+    /// unresolved one (`probe_unresolved`: pending, inconclusive) keeps the
+    /// reservation resumable instead of tombstoning it. Default: nothing to
+    /// prove (hosts and fakes without a probe).
+    fn login_denied(&mut self, _account: &EmployeeAccount) -> io::Result<()> { Ok(()) }
+}
+
+/// R7c (F6): at most this many reservations may wait for their SSH denial
+/// probe at once ([`Allocations`]); a further NEW employee allocation is
+/// refused with [`PendingLimit`] until one resolves, so an untrusted gateway
+/// cannot pile up reserved uids or forced probe requests.
+pub const MAX_PENDING_RESERVATIONS: usize = 4;
+/// The refusal of a new employee allocation while [`MAX_PENDING_RESERVATIONS`]
+/// reservations are pending (kind `WouldBlock`: retry later). Nothing was
+/// reserved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingLimit;
+impl std::fmt::Display for PendingLimit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "resource limit: {MAX_PENDING_RESERVATIONS} employee reservations already wait for their SSH denial probe")
+    }
+}
+impl std::error::Error for PendingLimit {}
+impl PendingLimit {
+    pub fn error(self) -> io::Error { io::Error::new(io::ErrorKind::WouldBlock, self) }
+}
+/// `error` is the [`PendingLimit`] refusal.
+pub fn pending_limit(error: &io::Error) -> bool {
+    error.get_ref().is_some_and(|inner| inner.downcast_ref::<PendingLimit>().is_some())
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -135,22 +161,30 @@ impl Registry {
 }
 
 /// R7c: the allocation state machine of one registry (portable; the root
-/// `RegistryStore` persists around it).
+/// `RegistryStore` persists around it). It runs on the lifecycle thread and
+/// NEVER waits for the SSH denial probe (F6): every step is bounded by the
+/// existing per-command limits.
 ///
-/// - New employee: `reserve` (durable `Reserved`), `create_locked`, then
-///   `await_login_denied` (the SSH probe of the new account, bounded wait),
-///   then `verify_locked`. All pass ⇒ `Ready`.
-/// - The probe is unresolved (pending at the deadline, inconclusive, PID 1
-///   error, contradictory "no sshd") ⇒ the row STAYS `Reserved`, is
-///   remembered here as resumable, nothing is quarantined, and the error is
-///   returned. The uid is not burned.
+/// - New employee: refused with [`PendingLimit`] (nothing reserved) while
+///   [`MAX_PENDING_RESERVATIONS`] reservations are pending; otherwise
+///   `reserve` (durable `Reserved`), `create_locked`, then `login_denied`
+///   (queues the forced probe of the new account and returns at once), then
+///   `verify_locked`. All pass ⇒ `Ready` (only on a host without a probe:
+///   a just-created account has no result yet, so it is normally pending).
+/// - The probe is unresolved (pending, inconclusive, PID 1 error) ⇒ the row
+///   STAYS `Reserved`, is remembered here as resumable, nothing is
+///   quarantined, and the error is returned at once ("probe pending"). The
+///   uid is not burned.
 /// - The next allocation of the SAME employee in this process resumes it:
-///   `recover_locked` (lockdown of the existing user and no-process readback,
-///   as start-up recovery does), then the same probe wait and `verify_locked`,
-///   with the same three outcomes. A `Reserved` row this set does not know
-///   (a crash mid-allocation) is still refused as before.
+///   `login_denied` first (the current result; re-queued if the worker
+///   dropped the request). Still unresolved ⇒ pending again, the account
+///   untouched. Denied ⇒ `recover_locked` (lockdown of the existing user and
+///   no-process readback, as start-up recovery does) and `verify_locked` ⇒
+///   `Ready`. A `Reserved` row this set does not know (a crash
+///   mid-allocation) is still refused as before.
 /// - Every other failure, including a probe that proves the account
-///   reachable, ⇒ `Tombstone` + best-effort `recover_locked`, as before.
+///   reachable (sshd's own Accepted record), ⇒ `Tombstone` + best-effort
+///   `recover_locked`, as before.
 ///
 /// The set is memory only: after a restart `RegistryStore::reconcile` turns
 /// every `Reserved` row into a `Tombstone` exactly as before (unchanged rule),
@@ -176,14 +210,20 @@ impl Allocations {
                 _ => return Err(invalid()),
             },
             None => {
+                if self.unresolved.len() >= MAX_PENDING_RESERVATIONS { return Err(PendingLimit.error()); }
                 let index = registry.reserve(employee, host)?;
                 save(registry)?;
                 (index, false)
             }
         };
         let account = registry.employees[index].clone();
-        let prepared = if resumed { host.recover_locked(&account) } else { host.create_locked(&account) };
-        let result = prepared.and_then(|()| host.await_login_denied(&account)).and_then(|()| host.verify_locked(&account));
+        let result = if resumed {
+            // Pending again leaves the account untouched; only a proven
+            // denial re-locks and reads it back before Ready.
+            host.login_denied(&account).and_then(|()| host.recover_locked(&account)).and_then(|()| host.verify_locked(&account))
+        } else {
+            host.create_locked(&account).and_then(|()| host.login_denied(&account)).and_then(|()| host.verify_locked(&account))
+        };
         let unresolved = result.as_ref().err().is_some_and(crate::accounts::probe_unresolved);
         registry.employees[index].state = match (&result, unresolved) {
             (Ok(()), _) => AccountState::Ready,
@@ -455,7 +495,7 @@ mod tests {
     }
 
     /// R7c: a host whose SSH probe outcomes are scripted (one per
-    /// `await_login_denied`), with injected create/verify failures.
+    /// `login_denied`), with injected create/verify failures.
     #[derive(Default)]
     struct Probing { probes: Vec<io::Result<()>>, create_fail: bool, verify_fail: bool,
         creates: usize, recoveries: usize, waits: usize }
@@ -472,9 +512,9 @@ mod tests {
             if self.verify_fail { Err(io::Error::other("injected lockdown readback failure")) } else { Ok(()) }
         }
         fn recover_locked(&mut self, _: &EmployeeAccount) -> io::Result<()> { self.recoveries += 1; Ok(()) }
-        fn await_login_denied(&mut self, _: &EmployeeAccount) -> io::Result<()> {
+        fn login_denied(&mut self, _: &EmployeeAccount) -> io::Result<()> {
             self.waits += 1;
-            if self.probes.is_empty() { panic!("unexpected probe wait") }
+            if self.probes.is_empty() { panic!("unexpected probe request") }
             self.probes.remove(0)
         }
     }
@@ -489,7 +529,7 @@ mod tests {
     }
 
     #[test]
-    fn allocation_waits_for_the_probe_and_denied_is_ready() {
+    fn allocation_denied_probe_is_ready() {
         let (mut state, mut registry, mut saves) = (Allocations::default(), Registry::default(), 0);
         let mut host = Probing { probes: vec![Ok(())], ..Probing::default() };
         let account = allocate(&mut state, &mut registry, 1, &mut host, &mut saves).unwrap();
@@ -519,7 +559,7 @@ mod tests {
     #[test]
     fn allocation_unresolved_probe_keeps_the_reservation_and_the_same_employee_resumes() {
         for unresolved in [inconclusive as fn() -> io::Result<()>, pending,
-            || Err(SshRefusal::NotApplicable.error())] {
+            || Err(SshRefusal::Inconclusive("login_unverified (exit 18)".into()).error())] {
             let (mut state, mut registry, mut saves) = (Allocations::default(), Registry::default(), 0);
             let mut host = Probing { probes: vec![unresolved(), unresolved(), Ok(())], ..Probing::default() };
             let error = allocate(&mut state, &mut registry, 1, &mut host, &mut saves).unwrap_err();
@@ -535,13 +575,15 @@ mod tests {
             // Another employee is allocated meanwhile, with the next uid.
             let mut other = Probing { probes: vec![Ok(())], ..Probing::default() };
             assert_eq!(allocate(&mut state, &mut registry, 2, &mut other, &mut saves).unwrap().uid, 70001);
-            // A retry for the same employee resumes: re-lock, probe again, no new account.
+            // A retry for the same employee asks the probe again; still
+            // unresolved ⇒ pending again, the account untouched, no new account.
             assert!(crate::accounts::probe_unresolved(&allocate(&mut state, &mut registry, 1, &mut host, &mut saves).unwrap_err()));
-            assert_eq!((host.creates, host.recoveries, host.waits), (1, 1, 2));
+            assert_eq!((host.creates, host.recoveries, host.waits), (1, 0, 2));
             assert_eq!(registry.employees[0].state, AccountState::Reserved);
+            // Denied ⇒ re-lock (recover_locked), readback, Ready.
             let account = allocate(&mut state, &mut registry, 1, &mut host, &mut saves).unwrap();
             assert_eq!((account.uid, account.state), (70000, AccountState::Ready), "same uid, now Ready");
-            assert_eq!((host.creates, host.recoveries, host.waits), (1, 2, 3));
+            assert_eq!((host.creates, host.recoveries, host.waits), (1, 1, 3));
             assert!(state.resumable().is_empty());
             registry.verify(&mut Probing::default()).unwrap();
         }
@@ -560,6 +602,117 @@ mod tests {
         state.forget(EmployeeId([1; 16]));
         assert!(allocate(&mut state, &mut registry, 1, &mut host, &mut saves).is_err(), "no longer resumable");
         assert_eq!(host.waits, 1);
+        // A resumed Denied whose re-lock readback fails is tombstoned.
+        let (mut state, mut registry, mut saves) = (Allocations::default(), Registry::default(), 0);
+        let mut host = Probing { probes: vec![pending(), Ok(())], ..Probing::default() };
+        assert!(allocate(&mut state, &mut registry, 1, &mut host, &mut saves).is_err());
+        host.verify_fail = true;
+        assert!(allocate(&mut state, &mut registry, 1, &mut host, &mut saves).is_err());
+        assert_eq!(registry.employees[0].state, AccountState::Tombstone);
+        assert!(state.resumable().is_empty());
+    }
+
+    /// F6: at most MAX_PENDING_RESERVATIONS reservations wait for their
+    /// probe; a further NEW employee is refused (resource limit, nothing
+    /// reserved, retry later); resuming a pending one is still allowed, and
+    /// once one resolves a new employee is admitted again.
+    #[test]
+    fn allocation_pending_reservations_are_capped() {
+        assert_eq!(MAX_PENDING_RESERVATIONS, 4);
+        let (mut state, mut registry, mut saves) = (Allocations::default(), Registry::default(), 0);
+        let mut host = Probing { probes: (0..MAX_PENDING_RESERVATIONS).map(|_| pending()).collect(), ..Probing::default() };
+        for employee in 1..=MAX_PENDING_RESERVATIONS as u8 {
+            assert!(crate::accounts::probe_unresolved(&allocate(&mut state, &mut registry, employee, &mut host, &mut saves).unwrap_err()));
+        }
+        assert_eq!(state.resumable().len(), MAX_PENDING_RESERVATIONS);
+        let rows = registry.employees.clone();
+        let (creates, recorded) = (host.creates, saves);
+        let error = allocate(&mut state, &mut registry, 9, &mut host, &mut saves).unwrap_err();
+        assert!(pending_limit(&error), "{error}");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(error.to_string().starts_with("resource limit: "), "{error}");
+        assert!(!crate::accounts::probe_unresolved(&error), "not a probe refusal");
+        assert_eq!(registry.employees, rows, "nothing reserved");
+        assert_eq!((host.creates, saves), (creates, recorded), "no useradd, no save");
+        // Resuming a pending reservation is not a new one.
+        host.probes = vec![pending(), Ok(())];
+        assert!(crate::accounts::probe_unresolved(&allocate(&mut state, &mut registry, 1, &mut host, &mut saves).unwrap_err()));
+        assert_eq!(allocate(&mut state, &mut registry, 1, &mut host, &mut saves).unwrap().state, AccountState::Ready);
+        // One resolved: a new employee is admitted (and pends in turn).
+        host.probes = vec![pending()];
+        assert!(crate::accounts::probe_unresolved(&allocate(&mut state, &mut registry, 9, &mut host, &mut saves).unwrap_err()));
+        assert_eq!(state.resumable().len(), MAX_PENDING_RESERVATIONS);
+        assert!(pending_limit(&allocate(&mut state, &mut registry, 10, &mut host, &mut saves).unwrap_err()));
+        // Retirement frees a slot too.
+        state.forget(EmployeeId([2; 16]));
+        host.probes = vec![pending()];
+        assert!(crate::accounts::probe_unresolved(&allocate(&mut state, &mut registry, 10, &mut host, &mut saves).unwrap_err()));
+        assert!(!pending_limit(&io::Error::other("x")) && !pending_limit(&SshRefusal::Pending.error()));
+    }
+
+    /// F6 with the real evidence component: allocation queues the forced
+    /// probe and returns "pending" at once (no worker runs at all here); once
+    /// the worker has proven the account denied, the same employee's next
+    /// allocation is Ready; a Reachable proof tombstones it.
+    #[test]
+    fn allocation_returns_pending_without_waiting_and_resumes_on_the_worker_result() {
+        use crate::ssh_evidence::{self, AccountKey, HostKey, ProbeEvidence, ProbeOutcome, Shared, SshEvidence};
+        use duduclaw_isolation::ids::Sha256Digest;
+        use std::sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex};
+        /// Accounts backed by a `ProbeEvidence`, as `LinuxAccounts::login_denied` is.
+        struct Evidence<'a> { evidence: &'a ProbeEvidence }
+        impl AccountHost for Evidence<'_> {
+            fn policy(&mut self) -> io::Result<HostUidPolicy> { Host.policy() }
+            fn verify_namespace(&mut self, _: &Registry) -> io::Result<()> { Ok(()) }
+            fn uid_available(&mut self, _: u32) -> io::Result<bool> { Ok(true) }
+            fn occupied_ids(&mut self, _: UidRange) -> io::Result<BTreeSet<u32>> { Ok(BTreeSet::new()) }
+            fn create_locked(&mut self, _: &EmployeeAccount) -> io::Result<()> { Ok(()) }
+            fn verify_locked(&mut self, _: &EmployeeAccount) -> io::Result<()> { Ok(()) }
+            fn recover_locked(&mut self, _: &EmployeeAccount) -> io::Result<()> { Ok(()) }
+            fn login_denied(&mut self, account: &EmployeeAccount) -> io::Result<()> {
+                let key = AccountKey { account: account_name(account.uid), uid: account.uid, sshd_config: Sha256Digest([5; 32]), port: 22 };
+                match ssh_evidence::refusal(self.evidence.request(&key).as_ref()) { None => Ok(()), Some(refusal) => Err(refusal.error()) }
+            }
+        }
+        struct Worker { clock: Arc<AtomicU64>, answers: Vec<ProbeOutcome> }
+        impl ssh_evidence::Host for Worker {
+            fn host_key(&mut self) -> io::Result<HostKey> {
+                Ok(HostKey { boot_id: "boot".into(), generation: Sha256Digest([1; 32]),
+                    probe: crate::selftest::ArtifactKey { sha256: Sha256Digest([2; 32]), size: 1, mode: 0o755 },
+                    unit: Sha256Digest([3; 32]), listener: None })
+            }
+            fn probe(&mut self, _: &str, port: u16) -> ProbeOutcome { assert_eq!(port, 22); self.answers.remove(0) }
+            fn now_ms(&mut self) -> io::Result<u64> { Ok(self.clock.load(Ordering::SeqCst)) }
+            fn log(&mut self, _: &str) {}
+        }
+        let clock = Arc::new(AtomicU64::new(10_000));
+        let slot: Arc<Mutex<Option<Arc<Shared>>>> = Arc::new(Mutex::new(None));
+        let (started, time) = (slot.clone(), clock.clone());
+        let evidence = ProbeEvidence::new(Box::new(move |shared: Arc<Shared>| *started.lock().unwrap() = Some(shared)),
+            Box::new(move || -> io::Result<u64> { Ok(time.load(Ordering::SeqCst)) }));
+        let mut worker = Worker { clock: clock.clone(), answers: vec![ProbeOutcome::Denied,
+            ProbeOutcome::Reachable("login_not_denied (exit 10)".into())] };
+        let (mut state, mut registry) = (Allocations::default(), Registry::default());
+        let mut save = |_: &Registry| -> io::Result<()> { Ok(()) };
+        let begun = std::time::Instant::now();
+        let error = state.allocate(&mut registry, EmployeeId([1; 16]), &mut Evidence { evidence: &evidence }, &mut save).unwrap_err();
+        assert!(begun.elapsed() < std::time::Duration::from_secs(1), "allocation never waits for the probe");
+        assert_eq!(crate::accounts::ssh_refusal(&error), Some(&SshRefusal::Pending), "{error}");
+        assert_eq!(registry.employees[0].state, AccountState::Reserved);
+        // Still pending until the worker runs.
+        assert!(crate::accounts::probe_unresolved(&state.allocate(&mut registry, EmployeeId([1; 16]),
+            &mut Evidence { evidence: &evidence }, &mut save).unwrap_err()));
+        let shared = slot.lock().unwrap().clone().expect("worker started");
+        assert!(ssh_evidence::step(&mut worker, &shared));
+        let account = state.allocate(&mut registry, EmployeeId([1; 16]), &mut Evidence { evidence: &evidence }, &mut save).unwrap();
+        assert_eq!((account.uid, account.state), (70000, AccountState::Ready));
+        // A second employee whose probe proves it reachable is tombstoned on resume.
+        assert!(state.allocate(&mut registry, EmployeeId([2; 16]), &mut Evidence { evidence: &evidence }, &mut save).is_err());
+        assert!(ssh_evidence::step(&mut worker, &shared));
+        let error = state.allocate(&mut registry, EmployeeId([2; 16]), &mut Evidence { evidence: &evidence }, &mut save).unwrap_err();
+        assert!(matches!(crate::accounts::ssh_refusal(&error), Some(SshRefusal::Reachable(_))), "{error}");
+        assert_eq!(registry.employees[1].state, AccountState::Tombstone);
+        assert!(state.resumable().is_empty());
     }
 
     #[test]

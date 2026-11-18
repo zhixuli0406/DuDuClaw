@@ -124,6 +124,21 @@ pub(super) fn employee_request(id:u8,label:&str,status:ConfirmationStatus,extra:
         proposal_digest:digest_of(ConfirmationCategory::Employee,&fields)},category:ConfirmationCategory::Employee,status,high_risk:true,fields}}
 }
 fn request_with(status:ConfirmationStatus,extra:&[(&str,&str)])->Request{employee_request(1,"sales",status,extra)}
+/// R7c (F6): a registry allocation still waiting for the SSH denial probe,
+/// or refused by the pending-reservation cap, is `NotReady` (retry later);
+/// a proven-reachable account and every other failure stay `IsolationUnavailable`.
+#[test]
+fn allocation_probe_pending_and_pending_cap_answer_not_ready(){
+    use crate::accounts::SshRefusal;
+    for error in [SshRefusal::Pending.error(),SshRefusal::Inconclusive("login_unverified (exit 18)".into()).error(),
+        crate::registry::PendingLimit.error()]{
+        assert_eq!(registry_code(error),wire::ErrorCode::NotReady);
+    }
+    for error in [SshRefusal::Reachable("login_not_denied (exit 10)".into()).error(),io::Error::other("create"),
+        io::Error::new(io::ErrorKind::WouldBlock,"busy")]{
+        assert_eq!(registry_code(error),wire::ErrorCode::IsolationUnavailable);
+    }
+}
 /// Allocate `label` and return the Ready receipt.
 pub(super) fn allocate(fx:&mut Fx,id:u8,label:&str)->Receipt{
     let request=employee_request(id,label,ConfirmationStatus::Applying,ALICE);

@@ -23,6 +23,14 @@ type Answer<T>=std::result::Result<T,wire::ErrorCode>;
 fn code(error:ErrorCode)->wire::ErrorCode{
     match error{ErrorCode::NotReady=>wire::ErrorCode::NotReady,ErrorCode::InvalidRequest=>wire::ErrorCode::InvalidRequest,_=>wire::ErrorCode::IsolationUnavailable}
 }
+/// R7c (F6): a registry allocation still waiting for the new account's SSH
+/// denial probe (pending or inconclusive: the reservation stays resumable)
+/// or refused by the pending-reservation cap is `NotReady` ("retry later");
+/// every other registry failure is `IsolationUnavailable`. A schema-1 reply
+/// carries no code at all (`Response::for_request`).
+fn registry_code(error:io::Error)->wire::ErrorCode{
+    if crate::accounts::probe_unresolved(&error) || crate::registry::pending_limit(&error){wire::ErrorCode::NotReady}else{wire::ErrorCode::IsolationUnavailable}
+}
 /// Schema 1 (v1.80) predates principal bindings; schema 2 adds the optional
 /// immutable `principal_binding` per receipt; schema 3 adds the retire phases.
 const JOURNAL_SCHEMA:u16=3;
@@ -175,7 +183,7 @@ impl Allocator {
                 // Never revives a compensated or retired entry (S6).
                 if !matches!(self.journal.entries[index].phase,Phase::Planned|Phase::Ready){return Err(wire::ErrorCode::InvalidRequest)}
                 env.storage.readiness().map_err(code)?;
-                let account=env.registry.allocate(employee,env.accounts).map_err(|_|wire::ErrorCode::IsolationUnavailable)?;
+                let account=env.registry.allocate(employee,env.accounts).map_err(registry_code)?;
                 self.journal.entries[index].receipt.uid=account.uid;self.save().map_err(code)?;
                 env.storage.provision(&ProvisionRequest{employee,uid:account.uid,operation_id:operation(binding,OperationKind::Allocate),proposal_digest:binding.proposal_digest,quota:quota.clone()})
                     .and_then(|usage|usage.check(employee,&quota)).map_err(code)?;

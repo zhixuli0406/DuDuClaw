@@ -517,8 +517,10 @@ impl Host for Core {
         // answered before it (S15), ReadBack never waits for it.
         let host_busy = !self.runs.is_empty();
         let now_unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-        // R7c: allocation waits for the new account's probe itself
-        // (`AccountHost::await_login_denied`); other accounts are not probed inline.
+        // R7c (F6): allocation never waits for a probe on this lifecycle
+        // thread: it queues the new account's forced probe and answers
+        // "pending" (`AccountHost::login_denied`); the same employee's next
+        // allocation picks the result up. Other accounts are not probed inline.
         let mut accounts = LinuxAccounts::background(self.components.ssh.as_ref());
         let result = self.allocator.handle(request, crate::allocation::Env { registry: &mut self.registry, accounts: &mut accounts,
             storage: self.components.storage.as_mut(), host_busy, idle, now_unix });

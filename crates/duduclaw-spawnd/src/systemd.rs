@@ -296,7 +296,8 @@ pub const TCB_SLICE: &str = "duduclaw-tcb.slice";
 pub const ISOLATION_SELFTEST_UNIT_TEXT: &str =
     include_str!("../../../scripts/linux-protected/spawnd/duduclaw-isolation-selftest.service");
 /// R7c: the one command the SSH denial probe template unit runs (the installed
-/// path of `InstallTarget::IsolationProbe`), followed by ` %i`.
+/// path of `InstallTarget::IsolationProbe`), followed by ` %i`
+/// (`<account>.<port>`).
 pub const PROBE_EXECUTABLE: &str = "/usr/lib/duduclaw/duduclaw-isolation-probe";
 /// R7c: the shipped probe template unit text
 /// ([`duduclaw_isolation::ids::ISOLATION_PROBE_UNIT_TEMPLATE`]); the installed
@@ -320,26 +321,37 @@ pub fn fixed_unit_file_valid(installed: &[u8]) -> bool { FixedUnit::SelfTest.fil
 pub enum FixedUnit {
     /// [`duduclaw_isolation::ids::ISOLATION_SELFTEST_UNIT`] (R7a), unchanged.
     SelfTest,
-    /// `duduclaw-isolation-probe@<account>.service` for an account name that
-    /// passes [`duduclaw_isolation::ids::employee_account_name_valid`].
-    Probe(String),
+    /// `duduclaw-isolation-probe@<account>.<port>.service` for an account name
+    /// that passes [`duduclaw_isolation::ids::employee_account_name_valid`]
+    /// and a port in 1..=65535 (the shared instance rule,
+    /// [`duduclaw_isolation::ids::probe_instance`]).
+    Probe { account: String, port: u16 },
 }
 impl FixedUnit {
-    /// The member named exactly `name`; `None` for every other unit name.
+    /// The member named exactly `name`; `None` for every other unit name. A
+    /// probe instance must be exactly `<account>.<port>` in canonical form
+    /// (one `.`; the account rule admits none; decimal port, no leading zero).
     pub fn from_name(name: &str) -> Option<Self> {
         use duduclaw_isolation::ids::{ISOLATION_PROBE_UNIT_PREFIX, ISOLATION_SELFTEST_UNIT};
         if name == ISOLATION_SELFTEST_UNIT { return Some(Self::SelfTest); }
-        Self::probe(name.strip_prefix(ISOLATION_PROBE_UNIT_PREFIX)?.strip_suffix(".service")?)
+        let instance = name.strip_prefix(ISOLATION_PROBE_UNIT_PREFIX)?.strip_suffix(".service")?;
+        let (account, port) = duduclaw_isolation::ids::probe_instance(instance)?;
+        Self::probe(account, port)
     }
-    /// The probe instance for `account`; `None` unless the name passes the
-    /// employee account rule (so `%i` can never carry anything else).
-    pub fn probe(account: &str) -> Option<Self> {
-        duduclaw_isolation::ids::employee_account_name_valid(account).then(|| Self::Probe(account.to_owned()))
+    /// The probe instance for `account` on sshd `port`; `None` unless the name
+    /// passes the employee account rule and the port is 1..=65535 (so `%i`
+    /// can never carry anything else).
+    pub fn probe(account: &str, port: u16) -> Option<Self> {
+        duduclaw_isolation::ids::probe_instance_text(account, port)?;
+        Some(Self::Probe { account: account.to_owned(), port })
     }
+    /// The probe instance string `<account>.<port>` (`%i`, the probe's argv[1]).
+    fn instance(account: &str, port: u16) -> String { format!("{account}.{port}") }
     pub fn name(&self) -> String {
         match self {
             Self::SelfTest => duduclaw_isolation::ids::ISOLATION_SELFTEST_UNIT.to_owned(),
-            Self::Probe(account) => format!("{}{account}.service", duduclaw_isolation::ids::ISOLATION_PROBE_UNIT_PREFIX),
+            Self::Probe { account, port } =>
+                format!("{}{}.service", duduclaw_isolation::ids::ISOLATION_PROBE_UNIT_PREFIX, Self::instance(account, *port)),
         }
     }
     /// The file name in [`FIXED_UNIT_DIRECTORY`] PID 1 must report as
@@ -347,19 +359,19 @@ impl FixedUnit {
     pub fn fragment(&self) -> &'static str {
         match self {
             Self::SelfTest => duduclaw_isolation::ids::ISOLATION_SELFTEST_UNIT,
-            Self::Probe(_) => duduclaw_isolation::ids::ISOLATION_PROBE_UNIT_TEMPLATE,
+            Self::Probe { .. } => duduclaw_isolation::ids::ISOLATION_PROBE_UNIT_TEMPLATE,
         }
     }
     /// The shipped bytes of [`Self::fragment`].
     pub fn text(&self) -> &'static str {
-        match self { Self::SelfTest => ISOLATION_SELFTEST_UNIT_TEXT, Self::Probe(_) => ISOLATION_PROBE_UNIT_TEXT }
+        match self { Self::SelfTest => ISOLATION_SELFTEST_UNIT_TEXT, Self::Probe { .. } => ISOLATION_PROBE_UNIT_TEXT }
     }
     /// `ExecStart`'s exact argv (`argv[0]` is also the path):
-    /// `[SELFTEST_EXECUTABLE]` or `[PROBE_EXECUTABLE, <account>]`.
+    /// `[SELFTEST_EXECUTABLE]` or `[PROBE_EXECUTABLE, "<account>.<port>"]`.
     pub fn argv(&self) -> Vec<String> {
         match self {
             Self::SelfTest => vec![SELFTEST_EXECUTABLE.to_owned()],
-            Self::Probe(account) => vec![PROBE_EXECUTABLE.to_owned(), account.clone()],
+            Self::Probe { account, port } => vec![PROBE_EXECUTABLE.to_owned(), Self::instance(account, *port)],
         }
     }
     /// The installed file is byte-for-byte [`Self::text`].
@@ -375,7 +387,7 @@ impl FixedUnit {
     }
     /// Every property PID 1 must report besides `ExecStart`, with its value.
     pub fn readback(&self) -> Vec<(&'static str, Property)> {
-        match self { Self::SelfTest => fixed_unit_readback(), Self::Probe(_) => probe_unit_readback() }
+        match self { Self::SelfTest => fixed_unit_readback(), Self::Probe { .. } => probe_unit_readback() }
     }
 }
 /// One `ExecStart` entry as PID 1 reports it, D-Bus `(sasbttttuii)`: path,
@@ -412,6 +424,10 @@ pub trait FixedUnitProperties {
     fn ip_list(&self, name: &'static str) -> io::Result<Vec<IpEntry>> {
         Err(invalid_because(format_args!("fixed unit readback {name}: no list reader")))
     }
+    /// `as` (R7c: `SupplementaryGroups`).
+    fn strings(&self, name: &'static str) -> io::Result<Vec<String>> {
+        Err(invalid_because(format_args!("fixed unit readback {name}: no list reader")))
+    }
 }
 /// R7a/R7g: every scalar property of the fixed unit PID 1 must report besides
 /// `ExecStart`, with its required value. The trampoline's privilege state is
@@ -437,16 +453,23 @@ pub fn fixed_unit_readback() -> Vec<(&'static str, Property)> {
 /// R7c: the probe template instance's effective configuration (shipped
 /// `duduclaw-isolation-probe@.service`): `Type=oneshot` in the TCB slice,
 /// NoNewPrivileges, no capability at all (bounding and ambient sets empty),
-/// every [`RUN_UNIT_DEFAULTED`] property at its default (no `User=`/`Group=`,
-/// no `RestrictSUIDSGID=`, as for the self-test), deny-all IP access except
-/// loopback (`IPAddressDeny=any` reads back as `::/0` and `0.0.0.0/0`,
-/// `IPAddressAllow=localhost` as `127.0.0.0/8` and `::1/128`, each an exact
-/// multiset), only AF_UNIX/AF_INET/AF_INET6 sockets, a private /tmp and a
-/// read-only file system (`ProtectSystem=strict`).
+/// the UNPRIVILEGED identity `User=`/`Group=` [`SELFTEST_USER`] with exactly
+/// the supplementary group [`PROBE_JOURNAL_GROUP`] (journal read access), no
+/// `RestrictSUIDSGID=` (false: its seccomp filter makes `openat2` ENOSYS on
+/// systemd 255), deny-all IP access except loopback (`IPAddressDeny=any`
+/// reads back as `::/0` and `0.0.0.0/0`, `IPAddressAllow=localhost` as
+/// `127.0.0.0/8` and `::1/128`, each an exact multiset), only
+/// AF_UNIX/AF_INET/AF_INET6 sockets, a private /tmp and a read-only file
+/// system (`ProtectSystem=strict`). The self-test unit's readback
+/// ([`fixed_unit_readback`], root by default) is unchanged.
+///
+/// [`SELFTEST_USER`]: duduclaw_isolation::ids::SELFTEST_USER
+/// [`PROBE_JOURNAL_GROUP`]: duduclaw_isolation::ids::PROBE_JOURNAL_GROUP
 pub fn probe_unit_readback() -> Vec<(&'static str, Property)> {
+    use duduclaw_isolation::ids::{PROBE_JOURNAL_GROUP, SELFTEST_USER};
     let mut loopback6 = vec![0u8; 16];
     loopback6[15] = 1;
-    let mut expected = vec![
+    vec![
         ("Type", Property::Text("oneshot".into())),
         ("Slice", Property::Text(TCB_SLICE.into())),
         ("NoNewPrivileges", Property::Bool(true)),
@@ -457,9 +480,11 @@ pub fn probe_unit_readback() -> Vec<(&'static str, Property)> {
         ("RestrictAddressFamilies", Property::AllowStrings(["AF_UNIX", "AF_INET", "AF_INET6"].map(String::from).to_vec())),
         ("IPAddressDeny", Property::IpAccess(vec![(IP_FAMILY_INET6, vec![0; 16], 0), (IP_FAMILY_INET, vec![0; 4], 0)])),
         ("IPAddressAllow", Property::IpAccess(vec![(IP_FAMILY_INET, vec![127, 0, 0, 0], 8), (IP_FAMILY_INET6, loopback6, 128)])),
-    ];
-    expected.extend(RUN_UNIT_DEFAULTED.iter().cloned());
-    expected
+        ("User", Property::Text(SELFTEST_USER.into())),
+        ("Group", Property::Text(SELFTEST_USER.into())),
+        ("SupplementaryGroups", Property::Strings(vec![PROBE_JOURNAL_GROUP.into()])),
+        ("RestrictSUIDSGID", Property::Bool(false)),
+    ]
 }
 /// One fixed-unit property as PID 1 reports it, read through the accessor of
 /// its expected value's type (`flag` `b`, `mask` `t`, `text` `s`,
@@ -473,6 +498,7 @@ fn read_fixed_unit_property(properties: &dyn FixedUnitProperties, key: &'static 
         Property::AllowStrings(_) => properties.allow_list(key)
             .map(|(allow, list)| if allow { Property::AllowStrings(list) } else { Property::Strings(list) }),
         Property::IpAccess(_) => properties.ip_list(key).map(Property::IpAccess),
+        Property::Strings(_) => properties.strings(key).map(Property::Strings),
         _ => Err(invalid_because(format_args!("fixed unit readback {key}: no scalar reader"))),
     }
 }
@@ -1357,6 +1383,41 @@ pub mod linux {
             released?;
             Ok(outcome)
         }
+        /// R7c (F4): PID 1's view of one sshd service unit, for the SSH
+        /// denial probe's live-listener identity
+        /// ([`crate::ssh_evidence::listener_identity`]): `Id`, `ActiveState`,
+        /// `MainPID`, `ExecMainStartTimestampMonotonic` and the `ExecStart`
+        /// commands. `Ok(None)` when PID 1 has no such unit loaded (`GetUnit`:
+        /// NoSuchUnit; an active unit is always loaded). Read-only: never
+        /// loads, references or starts anything. spawnd cannot read
+        /// `/proc/<sshd>/exe` itself (sshd's permitted capabilities are not a
+        /// subset of spawnd's bounded set, so the ptrace access check refuses
+        /// without CAP_SYS_PTRACE); PID 1's record is the source instead.
+        pub fn ssh_service_view(&self, name: &str) -> io::Result<Option<crate::ssh_evidence::ServiceView>> {
+            let manager = self.manager()?;
+            let path: OwnedObjectPath = match manager.call("GetUnit", &(name,)) {
+                Ok(path) => path,
+                Err(error) if missing_unit(&error) => return Ok(None),
+                Err(error) => return Err(bus_failed(format_args!("sshd unit {name}: GetUnit"), error)),
+            };
+            let unit = Proxy::new(&self.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Unit")
+                .map_err(|error| bus_failed(format_args!("sshd unit {name}: Unit interface"), error))?;
+            let service = Proxy::new(&self.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Service")
+                .map_err(|error| bus_failed(format_args!("sshd unit {name}: Service interface"), error))?;
+            fn read<'a, E: std::fmt::Display>(name: &'a str, what: &'static str) -> impl FnOnce(E) -> io::Error + 'a {
+                move |error| bus_failed(format!("sshd unit {name}: read {what}"), error)
+            }
+            let exec_start = FixedUnitProperties::exec_start(&service)?.into_iter()
+                .map(|entry| { let command = ExecCommand::from(entry); (command.path, command.argv) }).collect();
+            Ok(Some(crate::ssh_evidence::ServiceView {
+                id: unit.get_property("Id").map_err(read(name, "Id"))?,
+                active_state: unit.get_property("ActiveState").map_err(read(name, "ActiveState"))?,
+                main_pid: service.get_property("MainPID").map_err(read(name, "MainPID"))?,
+                started_us: service.get_property("ExecMainStartTimestampMonotonic")
+                    .map_err(read(name, "ExecMainStartTimestampMonotonic"))?,
+                exec_start,
+            }))
+        }
         /// [`Self::run_fixed_unit`] once the unit is pinned.
         fn run_pinned_fixed_unit(&self, fixed: &FixedUnit, name: &str, manager: &Proxy<'_>, path: &OwnedObjectPath, unit: &Proxy<'_>,
             deadline: Duration) -> io::Result<FixedUnitOutcome> {
@@ -1664,6 +1725,9 @@ pub mod linux {
         }
         fn ip_list(&self, name: &'static str) -> io::Result<Vec<IpEntry>> {
             self.get_property(name).map_err(|error| bus_failed(format_args!("fixed unit readback {name} (a(iayu))"), error))
+        }
+        fn strings(&self, name: &'static str) -> io::Result<Vec<String>> {
+            self.get_property(name).map_err(|error| bus_failed(format_args!("fixed unit readback {name} (as)"), error))
         }
     }
     /// R7a: the installed file of the fixed unit `name` ([`FixedUnit::fragment`];
@@ -2671,8 +2735,10 @@ pub mod linux {
 
         use crate::ssh_evidence::ProbeOutcome;
         /// The R7c probe root test's preconditions; anything missing panics
-        /// naming exactly what to install. Returns `ISO_PROBE_ACCOUNT`.
-        fn require_installed_probe() -> String {
+        /// naming exactly what to install. Returns `ISO_PROBE_ACCOUNT` and the
+        /// port the test itself reads (as root) from that account's `sshd -T`
+        /// through the shared parser, as spawnd does.
+        fn require_installed_probe() -> (String, u16) {
             use duduclaw_isolation::ids::{employee_account_name_valid, ISOLATION_PROBE_UNIT_TEMPLATE, EMPLOYEE_UID_MAX, EMPLOYEE_UID_MIN};
             use std::os::unix::fs::MetadataExt;
             let template = Path::new(FIXED_UNIT_DIRECTORY).join(ISOLATION_PROBE_UNIT_TEMPLATE);
@@ -2713,13 +2779,34 @@ pub mod linux {
                 }));
             assert!(covered, "no /etc/ssh/sshd_config.d/*.conf carries `DenyUsers duduclaw-emp-*`: write spawnd's drop-in \
                 (crates/duduclaw-spawnd/src/accounts.rs SSH_DROPIN) as /etc/ssh/sshd_config.d/10-duduclaw.conf and `systemctl reload ssh` (or sshd)");
-            account
+            // The unprivileged unit's identity: the isolation test account and the journal group.
+            let user = duduclaw_isolation::ids::SELFTEST_USER;
+            assert!(users.iter().any(|entry| entry.name == user),
+                "the isolation test account {user} must exist (the installer creates it; it is the probe unit's User=/Group=)");
+            let groups = crate::accounts::parse_group(&std::fs::read_to_string("/etc/group").unwrap()).unwrap();
+            for group in [user, duduclaw_isolation::ids::PROBE_JOURNAL_GROUP] {
+                assert!(groups.iter().any(|entry| entry.name == group),
+                    "group {group} must exist (the probe unit's Group=/SupplementaryGroups=; systemd-journal ships with systemd on Debian/Ubuntu)");
+            }
+            let port = sshd_port(&account);
+            (account, port)
+        }
+        /// The FIRST `port` of `sshd -T -C user=<account>,host=localhost,addr=127.0.0.1`,
+        /// through the shared parser (`duduclaw_isolation::ssh_config`), as spawnd reads it.
+        fn sshd_port(account: &str) -> u16 {
+            let context = format!("user={account},host=localhost,addr=127.0.0.1");
+            // spawnd's own fixed-argv helper (accounts.rs `command`), as `ssh_account_key` runs it.
+            let (status, text) = crate::accounts::root_command("/usr/sbin/sshd", &["-T", "-C", &context])
+                .expect("run /usr/sbin/sshd -T");
+            assert_eq!(status, 0, "sshd -T -C {context} failed");
+            duduclaw_isolation::ssh_config::SshdEffective::parse(&text).port
+                .unwrap_or_else(|| panic!("sshd -T -C {context} names no usable first port line"))
         }
         /// The production probe call (`ssh_evidence::run_probe`); any refusal or
         /// bus error is printed in full.
-        fn probe_through_pid1(systemd: &Systemd, account: &str, what: &str) -> (ProbeOutcome, FixedUnitOutcome) {
-            let name = FixedUnit::probe(account).map(|unit| unit.name()).unwrap_or_default();
-            let result = crate::ssh_evidence::run_probe(systemd, account).unwrap_or_else(|error| panic!(
+        fn probe_through_pid1(systemd: &Systemd, account: &str, port: u16, what: &str) -> (ProbeOutcome, FixedUnitOutcome) {
+            let name = FixedUnit::probe(account, port).map(|unit| unit.name()).unwrap_or_default();
+            let result = crate::ssh_evidence::run_probe(systemd, account, port).unwrap_or_else(|error| panic!(
                 "{what}: run_probe returned an error: {error} ({error:?}); see `journalctl -b -u {name}`"));
             assert!(systemd.references.lock().unwrap().units.is_empty(), "{what}: run_fixed_unit kept its reference");
             result
@@ -2741,25 +2828,26 @@ pub mod linux {
 
         /// R7c on a real host: the production probe path (closed fixed-unit
         /// set, template file bytes, instance load record, effective
-        /// properties including the IP and address-family lists, `Unit.Ref`,
-        /// outcome bound to this invocation) runs the probe instance for a
+        /// properties including the unprivileged identity, the journal group,
+        /// the IP and address-family lists, `Unit.Ref`, outcome bound to this
+        /// invocation) runs the probe instance `<account>.<port>` for a
         /// DenyUsers-covered account through PID 1 and it reports Denied, twice
         /// with distinct invocations, releasing its reference each time.
         /// Negative: a valid but absent account is Inconclusive at the identity
         /// stage (never Denied or Reachable), and a drop-in on the instance is
         /// refused before any start.
         #[test]
-        #[ignore = "iso_root_: root disposable systemd Linux VM (DUDUCLAW_ISO_DISPOSABLE=1) with a running sshd on loopback, this branch's duduclaw-isolation-probe@.service, duduclaw-tcb.slice and /usr/lib/duduclaw/duduclaw-isolation-probe installed, ISO_PROBE_ACCOUNT naming an existing employee-range account covered by spawnd's DenyUsers drop-in, no drop-in for the probe unit; daemon-reloads PID 1; --test-threads=1"]
+        #[ignore = "iso_root_: root disposable systemd Linux VM (DUDUCLAW_ISO_DISPOSABLE=1) with a running sshd on loopback, this branch's duduclaw-isolation-probe@.service, duduclaw-tcb.slice and /usr/lib/duduclaw/duduclaw-isolation-probe installed, the duduclaw-selftest account and the systemd-journal group present, ISO_PROBE_ACCOUNT naming an existing employee-range account covered by spawnd's DenyUsers drop-in, no drop-in for the probe unit; daemon-reloads PID 1; --test-threads=1"]
         fn iso_root_probe_unit_runs_through_pid1_for_a_denied_account() {
             assert_eq!(std::env::var("DUDUCLAW_ISO_DISPOSABLE").as_deref(), Ok("1"), "disposable host only");
             assert_eq!(unsafe { libc::geteuid() }, 0);
-            let account = require_installed_probe();
-            let unit = FixedUnit::probe(&account).unwrap();
+            let (account, port) = require_installed_probe();
+            let unit = FixedUnit::probe(&account, port).unwrap();
             let name = unit.name();
             let systemd = Systemd::connect().unwrap();
             let mut invocations = Vec::new();
             for what in ["first probe", "second probe"] {
-                let (outcome, record) = probe_through_pid1(&systemd, &account, what);
+                let (outcome, record) = probe_through_pid1(&systemd, &account, port, what);
                 assert_eq!(outcome, ProbeOutcome::Denied, "{what}: {record:?}; see `journalctl -b -u {name}`");
                 assert_eq!(record.exit_status_of_this_start(&unit), Ok(0), "{what}: {record:?}");
                 assert_unit_unreferenced(&name, what);
@@ -2772,10 +2860,10 @@ pub mod linux {
             let absent = "duduclaw-emp-isoprobe-absent";
             let users = crate::accounts::parse_passwd(&std::fs::read_to_string("/etc/passwd").unwrap()).unwrap();
             assert!(!users.iter().any(|user| user.name == absent), "{absent} exists; remove it for this negative control");
-            let (outcome, record) = probe_through_pid1(&systemd, absent, "absent account");
+            let (outcome, record) = probe_through_pid1(&systemd, absent, port, "absent account");
             assert_eq!(outcome, ProbeOutcome::Inconclusive("identity (exit 3)".into()), "{record:?}");
             assert_eq!(record.active_state, "failed", "{record:?}");
-            assert_unit_unreferenced(&FixedUnit::probe(absent).unwrap().name(), "absent account");
+            assert_unit_unreferenced(&FixedUnit::probe(absent, port).unwrap().name(), "absent account");
 
             // Negative 2: a drop-in on the instance, loaded by daemon-reload, refuses before any start.
             let directory = Path::new(FIXED_UNIT_DIRECTORY).join(format!("{name}.d"));
@@ -2789,7 +2877,7 @@ pub mod linux {
             daemon_reload().unwrap();
             assert_eq!(observer.drop_in_paths(), [drop_in.to_str().unwrap()], "PID 1 did not load the test drop-in");
             let before = observer.invocation();
-            let error = match crate::ssh_evidence::run_probe(&systemd, &account) {
+            let error = match crate::ssh_evidence::run_probe(&systemd, &account, port) {
                 Ok(outcome) => panic!("a drop-in on {name} was not refused: {outcome:?}"),
                 Err(error) => error,
             };
@@ -2800,7 +2888,7 @@ pub mod linux {
             drop(observer);
             drop(restore);
             // Restored: the production path passes again.
-            let (outcome, record) = probe_through_pid1(&systemd, &account, "drop-in removed and reloaded");
+            let (outcome, record) = probe_through_pid1(&systemd, &account, port, "drop-in removed and reloaded");
             assert_eq!(outcome, ProbeOutcome::Denied, "{record:?}");
         }
 
@@ -3232,16 +3320,47 @@ mod tests {
     }
 
     const PROBE_ACCOUNT: &str = "duduclaw-emp-70000";
-    fn probe_unit() -> FixedUnit { FixedUnit::probe(PROBE_ACCOUNT).unwrap() }
+    /// The probe's argv[1] / `%i` for [`PROBE_ACCOUNT`] on port 22.
+    const PROBE_INSTANCE: &str = "duduclaw-emp-70000.22";
+    fn probe_unit() -> FixedUnit { FixedUnit::probe(PROBE_ACCOUNT, 22).unwrap() }
     fn probe_load() -> FixedUnitLoad {
-        FixedUnitLoad { id: "duduclaw-isolation-probe@duduclaw-emp-70000.service".into(), load_state: "loaded".into(),
+        FixedUnitLoad { id: "duduclaw-isolation-probe@duduclaw-emp-70000.22.service".into(), load_state: "loaded".into(),
             fragment_path: "/etc/systemd/system/duduclaw-isolation-probe@.service".into(),
             drop_in_paths: vec![], need_daemon_reload: false, transient: false }
     }
+    /// R7c: the probe instance carries account AND port: `<account>.<port>`
+    /// in the unit name and as the probe's single argument; constructors and
+    /// `from_name` enforce the account rule and a canonical port 1..=65535.
+    #[test]
+    fn probe_unit_instance_and_argv_carry_account_and_port() {
+        let unit = FixedUnit::probe("duduclaw-emp-ab12", 22).unwrap();
+        assert_eq!(unit, FixedUnit::Probe { account: "duduclaw-emp-ab12".into(), port: 22 });
+        assert_eq!(unit.name(), "duduclaw-isolation-probe@duduclaw-emp-ab12.22.service");
+        assert_eq!(unit.argv(), [PROBE_EXECUTABLE, "duduclaw-emp-ab12.22"]);
+        assert_eq!(FixedUnit::from_name(&unit.name()), Some(unit));
+        for port in [1u16, 2222, 65535] {
+            let unit = FixedUnit::probe(PROBE_ACCOUNT, port).unwrap();
+            assert_eq!(unit.name(), format!("duduclaw-isolation-probe@{PROBE_ACCOUNT}.{port}.service"));
+            assert_eq!(FixedUnit::from_name(&unit.name()), Some(unit.clone()));
+            assert_eq!(unit.argv()[1], format!("{PROBE_ACCOUNT}.{port}"));
+        }
+        assert_eq!(FixedUnit::probe(PROBE_ACCOUNT, 0), None);
+        assert_eq!(FixedUnit::probe("root", 22), None);
+        assert_eq!(FixedUnit::probe("duduclaw-emp-a.b", 22), None);
+        for name in ["duduclaw-isolation-probe@duduclaw-emp-70000.service", "duduclaw-isolation-probe@duduclaw-emp-70000.0.service",
+            "duduclaw-isolation-probe@duduclaw-emp-70000.022.service", "duduclaw-isolation-probe@duduclaw-emp-70000.65536.service",
+            "duduclaw-isolation-probe@duduclaw-emp-70000.+22.service", "duduclaw-isolation-probe@duduclaw-emp-70000.22.22.service",
+            "duduclaw-isolation-probe@duduclaw-emp-70000..22.service", "duduclaw-isolation-probe@duduclaw-emp-70000.ssh.service",
+            "duduclaw-isolation-probe@duduclaw-emp-70000.-22.service", "duduclaw-isolation-probe@.22.service",
+            "duduclaw-isolation-probe@root.22.service", "duduclaw-isolation-probe@duduclaw-emp-70000.22 .service",
+            "duduclaw-isolation-probe@duduclaw-emp-70000.2\u{0}2.service"] {
+            assert_eq!(FixedUnit::from_name(name), None, "{name:?}");
+        }
+    }
     /// R7c item 1: the fixed-unit set is closed. The self-test member is
     /// exactly the R7a unit (name, file, text, argv, readback); the probe
-    /// member exists only for a valid account name and is loaded from the
-    /// template file.
+    /// member exists only for a valid account name and port and is loaded
+    /// from the template file.
     #[test]
     fn fixed_unit_descriptor_table_is_closed_and_keeps_the_selftest_unchanged() {
         use duduclaw_isolation::ids::{ISOLATION_PROBE_UNIT_TEMPLATE, ISOLATION_SELFTEST_UNIT};
@@ -3255,36 +3374,38 @@ mod tests {
         assert!(fixed_unit_file_valid(ISOLATION_SELFTEST_UNIT_TEXT.as_bytes()));
         assert!(!fixed_unit_file_valid(ISOLATION_PROBE_UNIT_TEXT.as_bytes()));
 
-        let probe = FixedUnit::from_name("duduclaw-isolation-probe@duduclaw-emp-70000.service").unwrap();
+        let probe = FixedUnit::from_name("duduclaw-isolation-probe@duduclaw-emp-70000.22.service").unwrap();
         assert_eq!(probe, probe_unit());
-        assert_eq!(probe.name(), "duduclaw-isolation-probe@duduclaw-emp-70000.service");
+        assert_eq!(probe.name(), "duduclaw-isolation-probe@duduclaw-emp-70000.22.service");
         assert_eq!((probe.fragment(), probe.text()), (ISOLATION_PROBE_UNIT_TEMPLATE, ISOLATION_PROBE_UNIT_TEXT));
-        assert_eq!(probe.argv(), [PROBE_EXECUTABLE, PROBE_ACCOUNT]);
+        assert_eq!(probe.argv(), [PROBE_EXECUTABLE, PROBE_INSTANCE]);
         assert!(probe.file_valid(ISOLATION_PROBE_UNIT_TEXT.as_bytes()) && !probe.file_valid(ISOLATION_SELFTEST_UNIT_TEXT.as_bytes()));
         assert!(ISOLATION_PROBE_UNIT_TEXT.lines().any(|line| line == format!("ExecStart={PROBE_EXECUTABLE} %i")));
-        for name in ["duduclaw-isolation-probe@.service", "duduclaw-isolation-probe@root.service",
-            "duduclaw-isolation-probe@duduclaw-emp-A.service", "duduclaw-isolation-probe@duduclaw-emp-1.socket",
-            "duduclaw-isolation-probe@duduclaw-emp-1.service.service", "duduclaw-isolation-probe@duduclaw-emp-1 .service",
-            "duduclaw-isolation-probe@duduclaw-runsup.service", "duduclaw-isolation-probe-duduclaw-emp-1.service",
+        for name in ["duduclaw-isolation-probe@.service", "duduclaw-isolation-probe@root.22.service",
+            "duduclaw-isolation-probe@duduclaw-emp-A.22.service", "duduclaw-isolation-probe@duduclaw-emp-1.22.socket",
+            "duduclaw-isolation-probe@duduclaw-emp-1.22.service.service", "duduclaw-isolation-probe@duduclaw-emp-1 .22.service",
+            "duduclaw-isolation-probe@duduclaw-runsup.22.service", "duduclaw-isolation-probe-duduclaw-emp-1.22.service",
+            "duduclaw-isolation-probe@duduclaw-emp-1.service",
             "duduclaw-spawnd.service", "duduclaw-isolation-ready.service", "duduclaw-egress.service",
             "duduclaw-run-00000000000000000000000000000000.service", ""] {
             assert_eq!(FixedUnit::from_name(name), None, "{name:?}");
             assert!(!fixed_unit_load_valid(name, &probe_load()), "{name:?}");
         }
-        assert_eq!(FixedUnit::probe(&format!("duduclaw-emp-{}", "a".repeat(49))), None);
+        assert_eq!(FixedUnit::probe(&format!("duduclaw-emp-{}", "a".repeat(49)), 22), None);
 
         // PID 1's view of an instance: Id is the instance, FragmentPath the template.
         assert_eq!(probe.load_mismatch(&probe_load()), None);
         assert!(fixed_unit_load_valid(&probe.name(), &probe_load()));
-        let cases: [(fn(&mut FixedUnitLoad), &str); 8] = [
-            (|l| l.fragment_path = "/etc/systemd/system/duduclaw-isolation-probe@duduclaw-emp-70000.service".into(), "FragmentPath"),
+        let cases: [(fn(&mut FixedUnitLoad), &str); 9] = [
+            (|l| l.fragment_path = "/etc/systemd/system/duduclaw-isolation-probe@duduclaw-emp-70000.22.service".into(), "FragmentPath"),
             (|l| l.fragment_path = "/run/systemd/system/duduclaw-isolation-probe@.service".into(), "FragmentPath"),
             (|l| l.fragment_path = "/usr/lib/systemd/system/duduclaw-isolation-probe@.service".into(), "FragmentPath"),
-            (|l| l.drop_in_paths = vec!["/etc/systemd/system/duduclaw-isolation-probe@duduclaw-emp-70000.service.d/10-test.conf".into()], "DropInPaths"),
+            (|l| l.drop_in_paths = vec!["/etc/systemd/system/duduclaw-isolation-probe@duduclaw-emp-70000.22.service.d/10-test.conf".into()], "DropInPaths"),
             (|l| l.drop_in_paths = vec!["/etc/systemd/system/duduclaw-isolation-probe@.service.d/x.conf".into()], "DropInPaths"),
             (|l| l.transient = true, "Transient"),
             (|l| l.need_daemon_reload = true, "NeedDaemonReload"),
-            (|l| l.id = "duduclaw-isolation-probe@duduclaw-emp-70001.service".into(), "Id"),
+            (|l| l.id = "duduclaw-isolation-probe@duduclaw-emp-70001.22.service".into(), "Id"),
+            (|l| l.id = "duduclaw-isolation-probe@duduclaw-emp-70000.2222.service".into(), "Id"),
         ];
         for (change, named) in cases {
             let mut load = probe_load();
@@ -3321,6 +3442,9 @@ mod tests {
         fn ip_list(&self, name: &'static str) -> io::Result<Vec<IpEntry>> {
             match self.values.get(name) { Some(Property::IpAccess(list)) => Ok(list.clone()), _ => Err(invalid()) }
         }
+        fn strings(&self, name: &'static str) -> io::Result<Vec<String>> {
+            match self.values.get(name) { Some(Property::Strings(list)) => Ok(list.clone()), _ => Err(invalid()) }
+        }
     }
     /// The shipped template's instance as PID 1 reports it: lists in an order
     /// of its own (measured for `IPAddressDeny`: `::/0` then `0.0.0.0/0`).
@@ -3333,7 +3457,51 @@ mod tests {
                 _ => panic!("{key}"),
             }
         }
-        FakeProbe { exec_start: vec![exec(PROBE_EXECUTABLE, &[PROBE_EXECUTABLE, PROBE_ACCOUNT])], values }
+        FakeProbe { exec_start: vec![exec(PROBE_EXECUTABLE, &[PROBE_EXECUTABLE, PROBE_INSTANCE])], values }
+    }
+    /// F3: the probe instance must run as the unprivileged isolation test
+    /// account with exactly the journal group; root (empty User/Group, the
+    /// self-test's default), any other identity or group set refuses.
+    #[test]
+    fn probe_unit_readback_requires_the_unprivileged_identity_and_journal_group() {
+        use duduclaw_isolation::ids::{PROBE_JOURNAL_GROUP, SELFTEST_USER};
+        let expected: BTreeMap<&str, Property> = probe_unit_readback().into_iter().collect();
+        assert_eq!(expected["User"], Property::Text(SELFTEST_USER.into()));
+        assert_eq!(expected["Group"], Property::Text(SELFTEST_USER.into()));
+        assert_eq!(expected["SupplementaryGroups"], Property::Strings(vec![PROBE_JOURNAL_GROUP.into()]));
+        assert_eq!(expected["RestrictSUIDSGID"], Property::Bool(false));
+        assert_eq!((SELFTEST_USER, PROBE_JOURNAL_GROUP), ("duduclaw-selftest", "systemd-journal"));
+        // The shipped unit file says the same.
+        for line in ["User=duduclaw-selftest", "Group=duduclaw-selftest", "SupplementaryGroups=systemd-journal"] {
+            assert_eq!(ISOLATION_PROBE_UNIT_TEXT.lines().filter(|text| *text == line).count(), 1, "{line}");
+        }
+        assert!(!ISOLATION_PROBE_UNIT_TEXT.lines().any(|line| line.starts_with("RestrictSUIDSGID=")));
+        let unit = probe_unit();
+        checked_fixed_unit_effective_for(&unit, &fake_probe()).unwrap();
+        let cases: Vec<(&'static str, Property)> = vec![
+            // Root: what the unit would read back without User=/Group=.
+            ("User", Property::Text(String::new())), ("Group", Property::Text(String::new())),
+            ("User", Property::Text("root".into())), ("User", Property::Text("0".into())),
+            ("User", Property::Text("nobody".into())), ("Group", Property::Text("systemd-journal".into())),
+            ("SupplementaryGroups", Property::Strings(vec![])),
+            ("SupplementaryGroups", Property::Strings(vec!["systemd-journal".into(), "adm".into()])),
+            ("SupplementaryGroups", Property::Strings(vec!["adm".into()])),
+            ("SupplementaryGroups", Property::Strings(vec!["root".into()])),
+        ];
+        for (key, value) in cases {
+            let mut view = fake_probe();
+            view.values.insert(key, value.clone());
+            let message = checked_fixed_unit_effective_for(&unit, &view).unwrap_err().to_string();
+            assert!(message.starts_with(&format!("invalid unit policy: fixed unit readback {key}: actual value ")), "{key} {value:?}: {message}");
+        }
+        // SupplementaryGroups is read as `as`; another type refuses.
+        let mut view = fake_probe();
+        view.values.insert("SupplementaryGroups", Property::Text("systemd-journal".into()));
+        assert!(checked_fixed_unit_effective_for(&unit, &view).is_err());
+        // The self-test's readback keeps root by default (empty User/Group).
+        let selftest: BTreeMap<&str, Property> = fixed_unit_readback().into_iter().collect();
+        assert_eq!(selftest["User"], Property::Text(String::new()));
+        assert!(!selftest.contains_key("SupplementaryGroups"));
     }
     fn ip(token: &str) -> IpEntry { parse_ip_prefix(token).unwrap() }
     /// R7c item 1: the probe instance's effective configuration must be the
@@ -3342,12 +3510,14 @@ mod tests {
     fn probe_unit_effective_properties_are_pinned_and_each_deviation_is_named() {
         let unit = probe_unit();
         let command = checked_fixed_unit_effective_for(&unit, &fake_probe()).unwrap();
-        assert_eq!(command.argv, [PROBE_EXECUTABLE, PROBE_ACCOUNT]);
+        assert_eq!(command.argv, [PROBE_EXECUTABLE, PROBE_INSTANCE]);
         let expected: BTreeMap<&str, Property> = probe_unit_readback().into_iter().collect();
         assert_eq!(expected.len(), probe_unit_readback().len(), "no key twice");
         assert_eq!(expected["IPAddressDeny"], Property::IpAccess(vec![ip("::/0"), ip("0.0.0.0/0")]));
         assert_eq!(expected["IPAddressAllow"], Property::IpAccess(vec![ip("127.0.0.0/8"), ip("::1/128")]));
-        for (key, value) in RUN_UNIT_DEFAULTED.iter() { assert_eq!(&expected[key], value, "{key}"); }
+        // R7c (F3): not the run units' root defaults any more, except RestrictSUIDSGID.
+        assert_eq!(expected["RestrictSUIDSGID"], Property::Bool(false));
+        for key in ["User", "Group"] { assert_ne!(expected[key], Property::Text(String::new()), "{key}"); }
         for (key, value) in [("CapabilityBoundingSet", Property::U64(0)), ("AmbientCapabilities", Property::U64(0)),
             ("NoNewPrivileges", Property::Bool(true)), ("Type", Property::Text("oneshot".into())),
             ("Slice", Property::Text(TCB_SLICE.into())), ("PrivateTmp", Property::Bool(true)),
@@ -3358,6 +3528,7 @@ mod tests {
         assert!(checked_fixed_unit_effective_for(&FixedUnit::SelfTest, &fake_probe()).is_err());
         let cases: Vec<(&'static str, Property)> = vec![
             ("User", Property::Text("root".into())), ("Group", Property::Text("root".into())),
+            ("User", Property::Text(String::new())), ("Group", Property::Text(String::new())),
             ("RestrictSUIDSGID", Property::Bool(true)), ("NoNewPrivileges", Property::Bool(false)),
             ("CapabilityBoundingSet", Property::U64(1 << 21)), ("CapabilityBoundingSet", Property::U64(TRAMPOLINE_CAPABILITIES)),
             ("AmbientCapabilities", Property::U64(1 << 12)), ("Slice", Property::Text("system.slice".into())),
@@ -3388,13 +3559,16 @@ mod tests {
         let message = checked_fixed_unit_effective_for(&unit, &widened).unwrap_err().to_string();
         assert!(message.ends_with("fixed unit readback IPAddressAllow: actual value [0.0.0.0/0 ::/0]"), "{message}");
         // ExecStart: another account, the self-test binary, extra arguments, `-` prefix, two commands.
-        for exec_start in [vec![exec(PROBE_EXECUTABLE, &[PROBE_EXECUTABLE, "duduclaw-emp-70001"])],
+        for exec_start in [vec![exec(PROBE_EXECUTABLE, &[PROBE_EXECUTABLE, "duduclaw-emp-70001.22"])],
             vec![exec(PROBE_EXECUTABLE, &[PROBE_EXECUTABLE])],
-            vec![exec(PROBE_EXECUTABLE, &[PROBE_EXECUTABLE, PROBE_ACCOUNT, "--relay"])],
+            // The former bare-account argv, and another port.
+            vec![exec(PROBE_EXECUTABLE, &[PROBE_EXECUTABLE, PROBE_ACCOUNT])],
+            vec![exec(PROBE_EXECUTABLE, &[PROBE_EXECUTABLE, "duduclaw-emp-70000.2222"])],
+            vec![exec(PROBE_EXECUTABLE, &[PROBE_EXECUTABLE, PROBE_INSTANCE, "--relay"])],
             vec![exec(SELFTEST_EXECUTABLE, &[SELFTEST_EXECUTABLE])],
-            vec![exec("/bin/true", &[PROBE_EXECUTABLE, PROBE_ACCOUNT])],
-            vec![(PROBE_EXECUTABLE.into(), vec![PROBE_EXECUTABLE.into(), PROBE_ACCOUNT.into()], true, 0, 0, 0, 0, 0, 0, 0)],
-            vec![exec(PROBE_EXECUTABLE, &[PROBE_EXECUTABLE, PROBE_ACCOUNT]), exec(PROBE_EXECUTABLE, &[PROBE_EXECUTABLE, PROBE_ACCOUNT])],
+            vec![exec("/bin/true", &[PROBE_EXECUTABLE, PROBE_INSTANCE])],
+            vec![(PROBE_EXECUTABLE.into(), vec![PROBE_EXECUTABLE.into(), PROBE_INSTANCE.into()], true, 0, 0, 0, 0, 0, 0, 0)],
+            vec![exec(PROBE_EXECUTABLE, &[PROBE_EXECUTABLE, PROBE_INSTANCE]), exec(PROBE_EXECUTABLE, &[PROBE_EXECUTABLE, PROBE_INSTANCE])],
             vec![]] {
             let view = FakeProbe { exec_start: exec_start.clone(), ..fake_probe() };
             let message = checked_fixed_unit_effective_for(&unit, &view).unwrap_err().to_string();
