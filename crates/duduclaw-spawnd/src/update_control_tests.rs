@@ -1158,17 +1158,18 @@ fn update_unit_isolation_selftest_matches_the_trampoline_constants() {
 }
 
 /// R7c: the SSH denial probe template unit runs exactly the shipped artifact
-/// with the instance name, as root with no capabilities, loopback-only, with
-/// no identity and no RestrictSUIDSGID lines, and nothing that enables it.
+/// with the instance name (`<account>.<port>`), UNPRIVILEGED as the isolation
+/// test account with the journal group and no capabilities, loopback-only,
+/// with no RestrictSUIDSGID line, and nothing that enables it.
 #[test]
 fn update_unit_isolation_probe_template_matches_the_probe_constants() {
-    use crate::systemd::{parse_run_unit, ISOLATION_PROBE_UNIT_TEXT, PROBE_EXECUTABLE, RUN_UNIT_DEFAULTED};
-    use duduclaw_isolation::ids::{ISOLATION_PROBE_UNIT_PREFIX, ISOLATION_PROBE_UNIT_TEMPLATE};
+    use crate::systemd::{parse_run_unit, ISOLATION_PROBE_UNIT_TEXT, PROBE_EXECUTABLE};
+    use duduclaw_isolation::ids::{ISOLATION_PROBE_UNIT_PREFIX, ISOLATION_PROBE_UNIT_TEMPLATE, PROBE_JOURNAL_GROUP, SELFTEST_USER};
     const PROBE_UNIT: &str = include_str!("../../../scripts/linux-protected/spawnd/duduclaw-isolation-probe@.service");
     assert_eq!(PROBE_UNIT, ISOLATION_PROBE_UNIT_TEXT);
     assert_eq!(ISOLATION_PROBE_UNIT_TEMPLATE, format!("{ISOLATION_PROBE_UNIT_PREFIX}.service"));
     assert!(parse_run_unit(ISOLATION_PROBE_UNIT_TEMPLATE).is_none());
-    assert!(parse_run_unit(&format!("{ISOLATION_PROBE_UNIT_PREFIX}duduclaw-emp-70000.service")).is_none());
+    assert!(parse_run_unit(&format!("{ISOLATION_PROBE_UNIT_PREFIX}duduclaw-emp-70000.22.service")).is_none());
     let artifact = artifact_name(&InstallTarget::IsolationProbe).unwrap();
     assert_eq!(PROBE_EXECUTABLE, format!("/usr/lib/duduclaw/{artifact}"));
     let lines = directives(PROBE_UNIT);
@@ -1183,11 +1184,16 @@ fn update_unit_isolation_probe_template_matches_the_probe_constants() {
         "Environment=", "StandardInput=null", "StandardOutput=journal", "StandardError=journal"] {
         assert_eq!(lines.iter().filter(|line| **line == expected).count(), 1, "{expected}");
     }
-    // Measured on systemd 255 (see the unit comment): no identity lines and no
-    // RestrictSUIDSGID=; root is the default identity.
-    for key in RUN_UNIT_DEFAULTED.iter().map(|(key, _)| *key) {
-        assert!(!lines.iter().any(|line| line.starts_with(&format!("{key}="))), "{key}");
+    // F3: an explicit non-root identity with journal read access, one line each.
+    for expected in [format!("User={SELFTEST_USER}"), format!("Group={SELFTEST_USER}"),
+        format!("SupplementaryGroups={PROBE_JOURNAL_GROUP}")] {
+        assert_eq!(lines.iter().filter(|line| **line == expected).count(), 1, "{expected}");
     }
+    for key in ["User", "Group", "SupplementaryGroups"] {
+        assert_eq!(lines.iter().filter(|line| line.starts_with(&format!("{key}="))).count(), 1, "{key}");
+    }
+    // Measured on systemd 255 (see the unit comment): no RestrictSUIDSGID=.
+    assert!(!lines.iter().any(|line| line.starts_with("RestrictSUIDSGID=")));
     assert!(!PROBE_UNIT.lines().any(|line| line == "[Install]"));
     assert!(!lines.iter().any(|line| line.starts_with("Restart=") || line.starts_with("RemainAfterExit=yes")
         || line.starts_with("ReadWritePaths=") || line.starts_with("DynamicUser=") || line.starts_with("Wants=")

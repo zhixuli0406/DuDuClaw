@@ -84,8 +84,17 @@ fn iso_root_e2e_installed_publication_live_install_evidence() {
     assert!(!b.host.entitlements.is_empty(), "confirmed employee required");
     for entitlement in &b.host.entitlements {
         let account = registry.lookup(entitlement.employee).expect("entitlement must have a ready permanent UID");
-        LinuxAccounts::admission(&evidence).await_login_denied(account)
-            .expect("the probe unit proved public-key login and forwarding denied for this account");
+        // Allocation never waits for the probe (`login_denied` returns
+        // pending at once); this test polls it, bounded, as a gateway retry would.
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(2 * crate::ssh_evidence::UNIT_DEADLINE_MS + 5_000);
+        loop {
+            match LinuxAccounts::admission(&evidence).login_denied(account) {
+                Ok(()) => break,
+                Err(error) if crate::accounts::probe_unresolved(&error) && std::time::Instant::now() < until =>
+                    std::thread::sleep(std::time::Duration::from_millis(500)),
+                Err(error) => panic!("the probe unit did not prove public-key login and forwarding denied for this account: {error}"),
+            }
+        }
         LinuxAccounts::admission(&evidence).verify_locked(account).expect("live account lockdown and SSH denial readback");
     }
     // R7a: the trampoline facts come from spawnd's own self-test through PID 1.

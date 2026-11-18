@@ -118,17 +118,18 @@ pub fn nss_supported(text: &str) -> io::Result<()> {
 }
 
 /// R7c: why an account's SSH denial is not proven, carried inside the
-/// `io::Error` of `verify_login` / `await_login_denied` ([`ssh_refusal`]).
+/// `io::Error` of `verify_login` / `login_denied` ([`ssh_refusal`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SshRefusal {
-    /// No probe result for the account's current key yet; the probe was
-    /// requested (kind `WouldBlock`, distinct from every other refusal).
+    /// No current probe result for the account's key (none yet, expired, or
+    /// under another key); the probe was requested (kind `WouldBlock`,
+    /// distinct from every other refusal).
     Pending,
-    /// The probe ran and proved nothing (failed stage, timeout, PID 1 refusal).
+    /// The probe ran and proved nothing (failed stage, a client success
+    /// without sshd's Accepted record, timeout, PID 1 refusal).
     Inconclusive(String),
-    /// The probe reported no sshd although `/usr/sbin/sshd` exists here.
-    NotApplicable,
-    /// The probe proved the public-key login or the forwarding session NOT denied.
+    /// The probe proved the public-key login or the forwarding session NOT
+    /// denied, with sshd's own Accepted record.
     Reachable(String),
 }
 impl std::fmt::Display for SshRefusal {
@@ -136,7 +137,6 @@ impl std::fmt::Display for SshRefusal {
         match self {
             Self::Pending => write!(formatter, "SSH denial probe pending"),
             Self::Inconclusive(reason) => write!(formatter, "SSH denial probe inconclusive: {reason}"),
-            Self::NotApplicable => write!(formatter, "SSH denial probe reports no sshd although /usr/sbin/sshd exists"),
             Self::Reachable(stage) => write!(formatter, "SSH denial probe: account NOT denied ({stage})"),
         }
     }
@@ -152,13 +152,17 @@ impl SshRefusal {
 pub fn ssh_refusal(error: &io::Error) -> Option<&SshRefusal> {
     error.get_ref().and_then(|inner| inner.downcast_ref::<SshRefusal>())
 }
-/// The account's SSH denial is neither proven nor disproven (pending, timed
-/// out, inconclusive, contradictory "no sshd"): an allocation keeps the
-/// account resumable instead of tombstoning it. `Reachable` and every other
-/// error are not unresolved.
+/// The account's SSH denial is neither proven nor disproven (pending,
+/// inconclusive): an allocation keeps the account resumable instead of
+/// tombstoning it. `Reachable` and every other error are not unresolved.
 pub fn probe_unresolved(error: &io::Error) -> bool {
-    matches!(ssh_refusal(error), Some(SshRefusal::Pending | SshRefusal::Inconclusive(_) | SshRefusal::NotApplicable))
+    matches!(ssh_refusal(error), Some(SshRefusal::Pending | SshRefusal::Inconclusive(_)))
 }
+/// R7c: `/usr/sbin/sshd` exists but its effective configuration for the
+/// account names no usable first `port` line, so the probe has no port to
+/// test: the account's SSH denial cannot be proven.
+pub const SSH_PORT_UNKNOWN: &str = "sshd -T names no usable port (first `port` line missing or malformed); \
+    the SSH denial probe cannot run";
 
 /// R7c: the `useradd` argument list of `create_locked`. No
 /// `--key CREATE_MAIL_SPOOL=no`: shadow 4.13 (Ubuntu 24.04) refuses that key
@@ -531,10 +535,15 @@ mod linux {
             let uid = account.uid.to_string();
             if success("/usr/bin/loginctl", &["list-sessions", "--no-legend", "--no-pager"])?.lines()
                 .any(|line| line.split_whitespace().nth(1) == Some(uid.as_str())) { return Err(denied()); }
+            // No /usr/sbin/sshd: SSH checks do not apply to this host.
             if Path::new("/usr/sbin/sshd").exists() {
+                // R7c order: spawnd's OWN `sshd -T` must deny the account
+                // (and name a port) BEFORE any probe result is consulted
+                // (`ssh_account_key` refuses otherwise); the unprivileged
+                // probe cannot run `sshd -T` and never checks it.
                 let key = self.ssh_account_key(account)?;
-                // R7c: the probe's result for the CURRENT key (a lookup asks
-                // the worker for a missing or stale one; never blocks).
+                // Then the probe's result for the CURRENT key (a lookup asks
+                // the worker for a missing, stale or expired one; never blocks).
                 let outcome = self.ssh.lookup(&key);
                 if self.require_probe {
                     if let Some(refusal) = crate::ssh_evidence::refusal(outcome.as_ref()) { return Err(refusal.error()); }
@@ -545,17 +554,21 @@ mod linux {
 
         /// `sshd -t`, then the account's effective configuration
         /// (`sshd -T -C user=<name>,host=localhost,addr=127.0.0.1`) must deny
-        /// it ([`ssh_effective_denied`]); the probe key is that output's
-        /// SHA-256 (the output itself is never logged or kept).
+        /// it ([`ssh_effective_denied`]: the shared parser) and name a first
+        /// `port` (refused with [`SSH_PORT_UNKNOWN`] otherwise); the probe key
+        /// is that output's SHA-256 and the port (the output itself is never
+        /// logged or kept). The port goes into the probe instance name.
         fn ssh_account_key(&self, account: &EmployeeAccount) -> io::Result<crate::ssh_evidence::AccountKey> {
             use sha2::{Digest, Sha256};
             let name = account_name(account.uid);
             success("/usr/sbin/sshd", &["-t"])?;
             let context = format!("user={name},host=localhost,addr=127.0.0.1");
             let effective = success("/usr/sbin/sshd", &["-T", "-C", &context])?;
-            if !ssh_effective_denied(&effective) { return Err(denied()); }
+            let facts = duduclaw_isolation::ssh_config::SshdEffective::parse(&effective);
+            if !facts.denies_employees() { return Err(denied()); }
+            let port = facts.port.ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, SSH_PORT_UNKNOWN))?;
             Ok(crate::ssh_evidence::AccountKey { account: name, uid: account.uid,
-                sshd_config: duduclaw_isolation::ids::Sha256Digest(Sha256::digest(effective.as_bytes()).into()) })
+                sshd_config: duduclaw_isolation::ids::Sha256Digest(Sha256::digest(effective.as_bytes()).into()), port })
         }
     }
 
@@ -733,16 +746,17 @@ mod linux {
             self.verify_login(account)
         }
 
-        /// R7c allocation: ask the worker to probe this account now (ahead of
-        /// background requests, even after an inconclusive result) and wait
-        /// for its result, at most `ssh_evidence::ALLOCATION_WAIT_MS`. Denied ⇒
-        /// `Ok`; anything else ⇒ the [`SshRefusal`] (a timeout is `Pending`).
-        /// Hosts without `/usr/sbin/sshd` skip it, as `verify_login` does.
-        fn await_login_denied(&mut self, account: &EmployeeAccount) -> io::Result<()> {
+        /// R7c allocation (F6: never waits): the account's current probe
+        /// result, strict whatever `require_probe` says. Denied ⇒ `Ok`;
+        /// otherwise a forced probe is queued (ahead of background requests;
+        /// again after an inconclusive result, see
+        /// `ssh_evidence::FORCED_RETRY_MS`) and the [`SshRefusal`] is returned
+        /// at once (no result yet ⇒ `Pending`). Same order as `verify_login`:
+        /// spawnd's own `sshd -T` first. Hosts without `/usr/sbin/sshd` skip it.
+        fn login_denied(&mut self, account: &EmployeeAccount) -> io::Result<()> {
             if !Path::new("/usr/sbin/sshd").exists() { return Ok(()); }
             let key = self.ssh_account_key(account)?;
-            let outcome = self.ssh.wait(&key, Duration::from_millis(crate::ssh_evidence::ALLOCATION_WAIT_MS));
-            match crate::ssh_evidence::refusal(outcome.as_ref()) {
+            match crate::ssh_evidence::refusal(self.ssh.request(&key).as_ref()) {
                 None => Ok(()),
                 Some(refusal) => Err(refusal.error()),
             }
@@ -922,7 +936,7 @@ mod tests {
         assert_eq!(pending.kind(), io::ErrorKind::WouldBlock);
         assert_eq!(ssh_refusal(&pending), Some(&SshRefusal::Pending));
         assert!(probe_unresolved(&pending));
-        for refusal in [SshRefusal::Inconclusive("identity (exit 3)".into()), SshRefusal::NotApplicable] {
+        for refusal in [SshRefusal::Inconclusive("identity (exit 3)".into()), SshRefusal::Inconclusive("login_unverified (exit 18)".into())] {
             let error = refusal.clone().error();
             assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
             assert_eq!(ssh_refusal(&error), Some(&refusal));

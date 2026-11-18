@@ -7,9 +7,18 @@ The existing gateway is not connected to these contracts yet.
 
 Exception, kept out of the library: the separate binary target
 `duduclaw-isolation-probe` (`src/bin/probe.rs`, R7c), the one-shot SSH denial
-probe run as root by `duduclaw-isolation-probe@<account>.service`. It links only
-std, libc (Linux only) and serde_json; the library stays free of OS operations.
-See `scripts/linux-protected/spawnd/README.md` for its exit codes.
+probe run UNPRIVILEGED as the isolation test account (`ids::SELFTEST_USER`)
+with the `systemd-journal` supplementary group (journal read access) by
+`duduclaw-isolation-probe@<account>.<port>.service`; it refuses to run as root
+and never runs `sshd -T` (spawnd checks that and chooses the port). Its single
+argument `<account>.<port>` follows `ids::probe_instance`. It reports an
+account reachable only with sshd's own `Accepted publickey` journal record for
+its ephemeral key and source port, and reads records from `sshd`,
+`sshd-session` and `sshd-auth`. It links only std, libc (Linux only) and
+serde_json; the library stays free of OS operations. Its exit codes are the
+shared table `probe_exit` (also listed in
+`scripts/linux-protected/spawnd/README.md`); `ssh_config` is the one `sshd -T`
+parser spawnd and the root tests use.
 
 The normative design is `DESIGN-native-linux-employee-isolation-2026-11`, revision
 r7; rustdoc references its sections. Section 17.7 supersedes earlier details.

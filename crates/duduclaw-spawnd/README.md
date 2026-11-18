@@ -604,19 +604,36 @@ names `duduclaw_isolation::ids::ISOLATION_PROBE_UNIT_PREFIX` /
 `ISOLATION_PROBE_UNIT_TEMPLATE`) prove per account against the live sshd that
 a public-key login and a `-N -R` forwarding session are refused (client
 `Permission denied (publickey).` plus sshd's root `DenyUsers` journal record
-for the probe's own source port). The exit-code table is
-`duduclaw_isolation::probe_exit` (shared by the probe and spawnd; also in
-`scripts/linux-protected/spawnd/README.md`).
+for the probe's own source port). The probe runs UNPRIVILEGED as the isolation
+test account (`duduclaw_isolation::ids::SELFTEST_USER`, `duduclaw-selftest`)
+with the supplementary group `systemd-journal` (journal read access) and no
+capability; it refuses to run as root. "NOT denied" (exit 10/13) is reported
+only with sshd's own root `Accepted publickey for <account> from 127.0.0.1 port
+<source port> ssh2: ED25519 <fingerprint of this run's ephemeral key>` record;
+a client that succeeded (or stayed connected) without it is
+`login_unverified`/`forward_unverified` (18/19), inconclusive, never a
+tombstone: something else answering on an unbound sshd port cannot burn a
+uid. The probe accepts journal records from `sshd`, `sshd-session` and
+`sshd-auth`; the DenyUsers record (no port) is bound to the source port by
+`_PID` equality with a record that carries it (OpenSSH ≥ 10 split-process
+correlation is not verified on a real host; the supported distributions ship
+≤ 9.6). The exit-code table is `duduclaw_isolation::probe_exit` (shared by the
+probe and spawnd; also in `scripts/linux-protected/spawnd/README.md`).
 
 Fixed-unit set. `Systemd::run_fixed_unit` accepts exactly the members of
 `systemd::FixedUnit`: the self-test unit (unchanged) and
-`duduclaw-isolation-probe@<account>.service` for an account name passing
-`employee_account_name_valid`. Each member fixes its fragment file (the
+`duduclaw-isolation-probe@<account>.<port>.service` (`FixedUnit::Probe {
+account, port }`) for an account name passing `employee_account_name_valid`
+and a port 1..=65535 in canonical decimal (`duduclaw_isolation::ids::probe_instance`:
+exactly one `.`). The port is the first `port` of spawnd's own `sshd -T` for
+the account (shared parser). Each member fixes its fragment file (the
 instance's is the template `/etc/systemd/system/duduclaw-isolation-probe@.service`;
 `Id` is the instance), the shipped bytes, the exact `ExecStart` argv
-(`[PROBE_EXECUTABLE, <account>]`) and the readback (`systemd::probe_unit_readback`):
+(`[PROBE_EXECUTABLE, "<account>.<port>"]`) and the readback (`systemd::probe_unit_readback`):
 `Type=oneshot`, `Slice=duduclaw-tcb.slice`, `NoNewPrivileges`, empty
-`CapabilityBoundingSet` and `AmbientCapabilities`, `RUN_UNIT_DEFAULTED`,
+`CapabilityBoundingSet` and `AmbientCapabilities`, `User` = `Group` =
+`duduclaw-selftest`, `SupplementaryGroups` = exactly [`systemd-journal`] (D-Bus
+`as`), `RestrictSUIDSGID` false,
 `IPAddressDeny` = {`::/0`, `0.0.0.0/0`}, `IPAddressAllow` = {`127.0.0.0/8`,
 `::1/128`}, `RestrictAddressFamilies` allow-list {AF_UNIX, AF_INET, AF_INET6},
 `PrivateTmp`, `ProtectSystem=strict` (lists compared as exact multisets, every
@@ -627,23 +644,37 @@ exit status is trusted only when bound to THIS invocation
 (`FixedUnitOutcome::exit_status_of_this_start`: new InvocationID, exited,
 `ExecStart` record pid/status of this start, `inactive`/`success` for 0,
 `failed`/`exit-code` otherwise) and mapped by `ssh_evidence::unit_outcome`:
-0 ⇒ Denied, 5 (no sshd) ⇒ NotApplicable, 10/13 (login/forwarding NOT denied)
+0 ⇒ Denied, 10/13 (login/forwarding NOT denied, with sshd's Accepted record)
 ⇒ Reachable, anything else (other codes, timeout, refused start, PID 1 error)
 ⇒ Inconclusive with the stage for the log. A failed instance is reset.
 
 Evidence (`ssh_evidence`). Results live in memory only, keyed by boot id,
 committed signed generation, account name and uid, SHA-256 of
 `sshd -T -C user=<account>,host=localhost,addr=127.0.0.1` (which `verify_login`
-reads anyway), the installed probe binary verified against the generation's
-`IsolationProbe` artifact (digest, size, mode) and the installed template
-unit's digest. Any change, and every spawnd restart, re-probes. One worker
+reads anyway) and the port taken from it, the installed probe binary verified
+against the generation's `IsolationProbe` artifact (digest, size, mode), the
+installed template unit's digest, and the live sshd listener's identity
+(`ssh_evidence::ListenerIdentity`): unit `Id`, `MainPID`,
+`ExecMainStartTimestampMonotonic` and the `ExecStart` argv (path must be
+`/usr/sbin/sshd`) of the one active `ssh.service`/`sshd.service`, read from
+PID 1 over the worker's D-Bus connection (spawnd cannot read
+`/proc/<sshd>/exe`: sshd's capabilities are not a subset of spawnd's bounded
+set, so the kernel's ptrace access check refuses). Any change (an sshd
+restart, `-f`/`-o` in its command line), and every spawnd restart, re-probes.
+A Denied result is current for at most `DENIED_TTL` (6 h) with the listener
+identity in its key, `DENIED_TTL_NO_IDENTITY` (10 min) without; the worker
+re-probes it in the background after 5/6 of that, so a healthy host shows no
+gap, and an expired result is "pending". Reachable results do not expire in
+the process. One worker
 thread (`duduclaw-ssh-probe`, its own D-Bus connection, started by the first
 lookup during start-up recovery) re-measures the host part every 2 s and runs
 queued probes one at a time, each bounded by the unit deadline (40 s); the
 250 ms refresh never starts a unit. `verify_login` keeps every earlier check
-(linger, `user@` unit, sessions, `sshd -t`, `ssh_effective_denied`) and then
-looks up the current key: Denied passes; NotApplicable, Reachable and
-Inconclusive refuse; no result asks the worker and refuses as "probe pending"
+(linger, `user@` unit, sessions, `sshd -t`) and then, in this order, requires
+its OWN `sshd -T` to deny the account (`ssh_effective_denied`'s shared parser)
+and name a port (otherwise refused: `accounts::SSH_PORT_UNKNOWN`) before it
+looks up the current key: Denied passes; Reachable and
+Inconclusive refuse; no current result asks the worker and refuses as "probe pending"
 (`io::ErrorKind::WouldBlock`, `accounts::SshRefusal::Pending`; the gateway sees
 `NotReady`). An inconclusive result is retried after 60 s. Hosts without
 `/usr/sbin/sshd` skip all of this as before.
@@ -659,22 +690,30 @@ probe state only requests a probe. The probe result is enforced per employee
 at admission (`Core::ready`, `LinuxAccounts::admission`), so after a restart
 each employee becomes runnable as soon as its own probe reports Denied.
 
-Allocation (`registry::Allocations`). A new account waits for its own probe
-(`AccountHost::await_login_denied`, at most 85 s: one probe already running
-plus its own). Denied ⇒ Ready. Reachable, and every other failure as before ⇒
-Tombstone. Unresolved (pending at the deadline, inconclusive, PID 1 error) ⇒
-the row stays `Reserved`, nothing is quarantined, and the next allocation of the
-same employee in this process resumes it (`recover_locked` re-lock and
-no-process readback, then the probe again). That reservation is not a host-wide
-verification failure. It is remembered in memory only: after a restart
-`reconcile` tombstones every `Reserved` row as before.
+Allocation (`registry::Allocations`). Allocation never waits for a probe on
+the lifecycle thread: a new account is reserved and created, its probe is
+queued ahead of background requests (`AccountHost::login_denied`), and the
+allocation answers "probe pending" at once (wire `NotReady`), leaving the row
+`Reserved` and remembered as resumable. The next allocation of the same
+employee asks again: Denied ⇒ `recover_locked` re-lock and no-process
+readback, `verify_locked`, Ready; Reachable ⇒ Tombstone; still pending or
+inconclusive ⇒ pending again (the request is re-queued if the worker dropped
+it; an inconclusive result is re-run at most every 10 s,
+`ssh_evidence::FORCED_RETRY_MS`). Every other failure as before ⇒ Tombstone.
+At most `registry::MAX_PENDING_RESERVATIONS` (4) reservations may be pending at
+once; a further new employee is refused with `registry::PendingLimit`
+(resource limit, wire `NotReady`, nothing reserved) until one resolves. A
+pending reservation is not a host-wide verification failure. It is remembered
+in memory only: after a restart `reconcile` tombstones every `Reserved` row as
+before.
 
 Unsupported hosts (refused, host prerequisites): passwd/group NSS modules other
 than `files`/`systemd` (LDAP/SSSD, Google Compute Engine OS Login, `compat`,
 bracketed action clauses; `accounts::nss_supported`, no IAM reservation
 producer exists); sshd present without `/usr/bin/ssh`, `/usr/bin/ssh-keygen` or
 `/usr/bin/journalctl`, or not listening on loopback, or not logging to the
-journal; sshd with `UsePAM no` (sshd then reports the expired account before
+journal; no `duduclaw-selftest` account or no `systemd-journal` group (the
+probe unit's identity); sshd with `UsePAM no` (sshd then reports the expired account before
 `DenyUsers`, so the probe cannot find the DenyUsers record and stays
 inconclusive).
 

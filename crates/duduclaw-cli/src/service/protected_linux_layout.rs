@@ -290,7 +290,7 @@ mod tests {
         assert!(selftest.lines().any(|line| line == "ExecStart=/usr/lib/duduclaw/duduclaw-run-selftest"));
         assert!(!selftest.lines().any(|line| line.trim() == "[Install]"), "never enabled");
         assert!(ACCOUNTS.contains(&"duduclaw-selftest"));
-        // R7c: the probe template runs the published probe binary as root (no account of its own).
+        // R7c: the probe template runs the published probe binary unprivileged as duduclaw-selftest (no account of its own).
         let probe = UNITS.iter().find(|(name, _)| *name == "duduclaw-isolation-probe@.service").unwrap().1;
         assert!(probe.lines().any(|line| line == "ExecStart=/usr/lib/duduclaw/duduclaw-isolation-probe %i"));
         assert!(!probe.lines().any(|line| line.trim() == "[Install]"), "never enabled");

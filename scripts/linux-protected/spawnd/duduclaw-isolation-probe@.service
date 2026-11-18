@@ -1,39 +1,48 @@
 [Unit]
-Description=DuDuClaw SSH denial probe for employee account %i
+Description=DuDuClaw SSH denial probe for employee account and sshd port %i
 # R7c: a template started only by duduclaw-spawnd through PID 1, one instance
-# per employee account (duduclaw-isolation-probe@duduclaw-emp-<uid>.service).
-# It proves against the LIVE sshd that a real public-key login and a real -N
-# port-forward session as %i are refused: ssh exits 255 with "Permission
-# denied (publickey)." AND sshd's own root journal record for that session's
-# source port says the account is listed in DenyUsers. Exit 0 with one JSON
-# line {"version":1,"account":"<name>","port":N,"result":"denied"} is the only pass.
+# per employee account and sshd port
+# (duduclaw-isolation-probe@duduclaw-emp-<uid>.<port>.service; spawnd takes
+# the port from its own `sshd -T` after that output already denies the
+# account). It runs UNPRIVILEGED as the isolation test account
+# duduclaw-selftest with read access to the journal (systemd-journal) and
+# proves against the LIVE sshd on that port that a real public-key login and
+# a real -N port-forward session as the account are refused: ssh exits 255
+# with "Permission denied (publickey)." AND sshd's own root journal record for
+# that session's source port says the account is listed in DenyUsers. Exit 0
+# with one JSON line {"version":1,"account":"<name>","port":N,"result":"denied"}
+# is the only pass. "NOT denied" needs sshd's own root "Accepted publickey"
+# record for the probe's ephemeral key and source port; a client success
+# without it is only "unverified".
 # Not a run unit (name is not duduclaw-run-<hex>.service). No [Install]:
 # nothing enables it; the installer only places this file.
 # Failure: one JSON line {"code":"ssh_probe_failed","stage":"<name>"} in the
-# journal and the stage's exit code
-# (crates/duduclaw-isolation/src/bin/probe.rs):
-#   2 usage, 3 identity, 4 tools, 5 no_sshd (no /usr/sbin/sshd: SSH checks
-#   not applicable), 6 workspace, 7 effective_config, 8 keygen,
-#   9 login_inconclusive, 10 login_not_denied, 11 login_journal,
-#   12 forward_inconclusive, 13 forward_not_denied, 14 forward_journal,
-#   15 deadline, 16 output, 17 relay.
+# journal and the stage's exit code (shared table
+# crates/duduclaw-isolation/src/probe_exit.rs):
+#   2 usage, 3 identity (root, or no employee-range account), 4 tools,
+#   6 workspace, 8 keygen, 9 login_inconclusive, 10 login_not_denied,
+#   11 login_journal, 12 forward_inconclusive, 13 forward_not_denied,
+#   14 forward_journal, 15 deadline, 16 output, 17 relay,
+#   18 login_unverified, 19 forward_unverified (5 and 7 are retired).
 
 [Service]
 Type=oneshot
 RemainAfterExit=no
 ExecStart=/usr/lib/duduclaw/duduclaw-isolation-probe %i
-# No User=/Group= and no RestrictSUIDSGID= (measured on systemd 255): an
-# explicit User=root together with NoNewPrivileges= and a seccomp-based
-# restriction changes the effective capability set, and RestrictSUIDSGID=yes
-# makes systemd's seccomp filter return ENOSYS for openat2. Root is the
-# default identity.
+# An explicit non-root identity: the probe never needs root (it only reads
+# /etc/passwd and the journal, writes a throw-away key to its private /tmp
+# and makes loopback TCP connections), so a hostile peer exploiting an ssh
+# client bug gets no root file or socket authority. The systemd 255 fact that
+# made the self-test unit leave User= unset (an explicit User=root changes
+# the effective capability set) concerns root only. No RestrictSUIDSGID=
+# (measured on systemd 255): its seccomp filter returns ENOSYS for openat2.
+User=duduclaw-selftest
+Group=duduclaw-selftest
+SupplementaryGroups=systemd-journal
 Slice=duduclaw-tcb.slice
 TimeoutStartSec=30
 KillMode=control-group
-# Root uid with no capabilities at all: the probe only reads root-owned files
-# (/etc/passwd, the sshd configuration and host keys through sshd -T, the
-# journal), writes a throw-away key to its private /tmp and makes loopback
-# TCP connections.
+# No capabilities at all.
 CapabilityBoundingSet=
 AmbientCapabilities=
 NoNewPrivileges=yes
@@ -44,7 +53,7 @@ PrivateDevices=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 # Hides only the kernel ring buffer (/dev/kmsg, /proc/kmsg, syslog(2));
-# journalctl reads journal files and talks to journald, which stays allowed.
+# journalctl reads journal files, which stays allowed.
 ProtectKernelLogs=yes
 ProtectControlGroups=yes
 LockPersonality=yes

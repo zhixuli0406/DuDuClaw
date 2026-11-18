@@ -74,12 +74,32 @@ pub const SELFTEST_USER: &str = "duduclaw-selftest";
 /// run inventory, census or reconciliation ever counts it as an employee run.
 pub const ISOLATION_SELFTEST_UNIT: &str = "duduclaw-isolation-selftest.service";
 /// R7c: the pre-installed template unit (root:root 0644, no `[Install]`) that
-/// runs the one-shot SSH denial probe for one employee account. Instances are
-/// `duduclaw-isolation-probe@<account>.service`; never the run-unit shape.
+/// runs the one-shot SSH denial probe for one employee account on one sshd
+/// port. Instances are `duduclaw-isolation-probe@<account>.<port>.service`
+/// ([`probe_instance`]); never the run-unit shape.
 pub const ISOLATION_PROBE_UNIT_TEMPLATE: &str = "duduclaw-isolation-probe@.service";
-/// R7c: name prefix of every probe instance (followed by the account name and
-/// `.service`).
+/// R7c: name prefix of every probe instance (followed by the instance
+/// `<account>.<port>` and `.service`).
 pub const ISOLATION_PROBE_UNIT_PREFIX: &str = "duduclaw-isolation-probe@";
+/// R7c: the supplementary group the (unprivileged) probe unit runs with, so it
+/// can read sshd's journal records.
+pub const PROBE_JOURNAL_GROUP: &str = "systemd-journal";
+
+/// R7c: the probe instance string `<account>.<port>` (also the probe's single
+/// argument, systemd's `%i`): exactly one `.`, the account passes
+/// [`employee_account_name_valid`] (which admits no `.`), the port is
+/// 1..=65535 in canonical decimal ([`crate::ssh_config::port_number`]: no sign,
+/// no leading zero). `None` for anything else.
+pub fn probe_instance(instance: &str) -> Option<(&str, u16)> {
+    let (account, port) = instance.split_once('.')?;
+    if port.contains('.') || !employee_account_name_valid(account) { return None; }
+    Some((account, crate::ssh_config::port_number(port)?))
+}
+/// The inverse of [`probe_instance`]; `None` unless the account passes the
+/// name rule and the port is non-zero.
+pub fn probe_instance_text(account: &str, port: u16) -> Option<String> {
+    (employee_account_name_valid(account) && port != 0).then(|| format!("{account}.{port}"))
+}
 /// The literal prefix of every employee account name (`EMPLOYEE_USER_PATTERN`).
 pub const EMPLOYEE_ACCOUNT_PREFIX: &str = "duduclaw-emp-";
 
@@ -208,6 +228,30 @@ mod tests {
             "Duduclaw-emp-1", "xduduclaw-emp-1", "duduclaw-emp-1\n", "duduclaw-emp-é", "duduclaw-runsup", "root", "",
             too_long.as_str()] {
             assert!(!employee_account_name_valid(bad), "{bad:?}");
+        }
+    }
+    /// R7c: the probe instance `<account>.<port>` (unit `%i` and probe argv):
+    /// one `.`, the account rule, a canonical decimal port.
+    #[test]
+    fn probe_instance_parses_account_and_port_strictly() {
+        assert_eq!(PROBE_JOURNAL_GROUP, "systemd-journal");
+        assert_eq!(probe_instance("duduclaw-emp-ab12.22"), Some(("duduclaw-emp-ab12", 22)));
+        assert_eq!(probe_instance("duduclaw-emp-70000.65535"), Some(("duduclaw-emp-70000", 65535)));
+        assert_eq!(probe_instance("duduclaw-emp-70000.1"), Some(("duduclaw-emp-70000", 1)));
+        assert_eq!(probe_instance_text("duduclaw-emp-ab12", 22).as_deref(), Some("duduclaw-emp-ab12.22"));
+        for port in [1u16, 22, 2222, 65535] {
+            let text = probe_instance_text("duduclaw-emp-70000", port).unwrap();
+            assert_eq!(probe_instance(&text), Some(("duduclaw-emp-70000", port)));
+        }
+        assert_eq!(probe_instance_text("duduclaw-emp-70000", 0), None);
+        assert_eq!(probe_instance_text("root", 22), None);
+        assert_eq!(probe_instance_text("duduclaw-emp-a.b", 22), None);
+        for bad in ["duduclaw-emp-70000", "duduclaw-emp-70000.", "duduclaw-emp-70000.0", "duduclaw-emp-70000.022",
+            "duduclaw-emp-70000.65536", "duduclaw-emp-70000.+22", "duduclaw-emp-70000.-1", "duduclaw-emp-70000.22.22",
+            "duduclaw-emp-70000.2 2", "duduclaw-emp-70000. 22", "duduclaw-emp-70000.22\n", "duduclaw-emp-70000.1e3",
+            "duduclaw-emp-70000.ssh", ".22", "root.22", "duduclaw-emp-A.22", "duduclaw-emp-a.b.22",
+            "duduclaw-emp-70000..22", "duduclaw-emp-70000.99999999", ""] {
+            assert_eq!(probe_instance(bad), None, "{bad:?}");
         }
     }
     #[test]

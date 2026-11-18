@@ -101,16 +101,16 @@ sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux [--version X.Y
 | 服務 | Gateway、spawnd socket／service、egress socket／service、選用的 DNS broker、更新服務、parse socket／template、TCB 與員工 slice |
 | 自我檢測帳號 | `duduclaw-selftest`：隔離自我檢測降權後使用的帳號；與其他服務帳號相同的系統 ID，無家目錄、不能登入、自有群組、無額外群組、已鎖定 |
 | 自我檢測單元 | `/etc/systemd/system/duduclaw-isolation-selftest.service`，root:root 0644，內容與隨附版本完全相同且不得有覆寫設定；沒有 `[Install]`：安裝程式不會啟用或啟動它，由 spawnd 啟動 |
-| SSH 拒絕檢測程式 | `/usr/lib/duduclaw/duduclaw-isolation-probe`，root:root 0755，已簽章元件；以 root 執行，沒有專用帳號 |
-| SSH 拒絕檢測單元 | `/etc/systemd/system/duduclaw-isolation-probe@.service` 範本，root:root 0644，內容與隨附版本完全相同；沒有 `[Install]`：安裝程式不會啟用或啟動它，每個員工帳號一個執行個體（`duduclaw-isolation-probe@duduclaw-emp-<uid>.service`） |
+| SSH 拒絕檢測程式 | `/usr/lib/duduclaw/duduclaw-isolation-probe`，root:root 0755，已簽章元件；以無特權的隔離測試帳號 `duduclaw-selftest` 執行，並具有讀取 journal 的權限（`systemd-journal` 群組），絕不以 root 執行；沒有專用帳號 |
+| SSH 拒絕檢測單元 | `/etc/systemd/system/duduclaw-isolation-probe@.service` 範本，root:root 0644，內容與隨附版本完全相同；沒有 `[Install]`：安裝程式不會啟用或啟動它，每個員工帳號與 sshd 連接埠一個執行個體（`duduclaw-isolation-probe@duduclaw-emp-<uid>.<port>.service`） |
 | 解析根目錄 | `/usr/lib/duduclaw/parse-root` 與 `/usr/lib/duduclaw/parse-root-tree`，root:root 0755，初始為空，不能放主機資料 |
 | 簽章狀態 | Bootstrap 信任、相容的元件世代、runtime 登錄表、更新槽與狀態、遷移及就緒檢查接線 |
 
 解析器可能留下[安裝參考](../../../crates/duduclaw-parse-worker/README.md)列出的已知空掛載點目錄。遇到其他內容應先調查，不要遞迴清空解析根目錄。Spawnd 負責員工的 SSH、cron、at 與 user manager 封鎖，並驗證主機上的有效狀態；不要手動放寬這些控制來通過檢查。
 
-若主機安裝了 `/usr/sbin/sshd`，spawnd 會自行證明每個員工帳號的 SSH 都被拒絕，不需要任何安裝收據：它透過 systemd 為該帳號啟動 SSH 拒絕檢測單元，檢測程式以該帳號對執行中的 sshd 實際嘗試一次公鑰登入與一次連接埠轉送，兩者都必須被 `DenyUsers duduclaw-emp-*` 規則拒絕，並由 sshd 自己的 journal 紀錄確認。這份證明只保存在記憶體中；當該帳號實際生效的 sshd 設定、帳號本身、已安裝的檢測程式或其單元、簽章版本或開機有任何變化，以及每次 spawnd 重新啟動之後，都會重新證明。在某位員工的證明完成之前，只有這位員工暫時無法執行（not ready），其他員工不受影響。新員工要等到自己的證明完成才會建立（最多約一分半鐘）。若證明無法完成，在 spawnd 持續執行期間重試建立會接續同一個帳號（spawnd 重新啟動後，未完成的帳號會被停用，必須重新提出建立）；若證明顯示該帳號可以登入，該帳號會被永久停用。
+若主機安裝了 `/usr/sbin/sshd`，spawnd 會自行證明每個員工帳號的 SSH 都被拒絕，不需要任何安裝收據：它先自行檢查該帳號實際生效的 sshd 設定，再透過 systemd 為該帳號與 sshd 連接埠啟動 SSH 拒絕檢測單元。檢測程式以無特權的隔離測試帳號 `duduclaw-selftest` 執行（具有讀取 journal 的權限），以該員工帳號對執行中的 sshd 實際嘗試一次公鑰登入與一次連接埠轉送，兩者都必須被 `DenyUsers duduclaw-emp-*` 規則拒絕，並由 sshd 自己的 journal 紀錄確認。只有當 sshd 自己記錄它接受了檢測程式的金鑰時，才會認定該帳號可以登入；sshd 沒有記錄的成功（例如 SSH 連接埠上是其他程式在回應）只算無法判定。這份證明只保存在記憶體中；當 sshd 重新啟動、該帳號實際生效的 sshd 設定、帳號本身、已安裝的檢測程式或其單元、簽章版本或開機有任何變化，以及每次 spawnd 重新啟動之後，都會重新證明，而且無論如何至少每 6 小時重新證明一次（spawnd 無法透過 systemd 識別執行中的 sshd 時為每 10 分鐘）；更新會在舊證明到期之前開始，正常的主機不會出現空檔。在某位員工的證明完成之前，只有這位員工暫時無法執行（not ready），其他員工不受影響。建立新員工時不會等待它的證明：第一次證明進行期間，建立會回報「等待中」（目前的 gateway 會顯示為套用步驟失敗）；在 spawnd 持續執行期間，稍後重試同一個建立即可取得結果（spawnd 重新啟動後，未完成的帳號會被停用，必須重新提出建立）。同時最多只能有四位新員工處於等待中；其中一位有結果之前，更多的建立會被拒絕。若證明顯示該帳號可以登入，該帳號會被永久停用。
 
-有 sshd 的主機還需要 `/usr/bin/ssh`、`/usr/bin/ssh-keygen` 與 `/usr/bin/journalctl`，sshd 必須在 127.0.0.1（其設定中的第一個 `Port`）上監聽，並把日誌寫入 systemd journal。不支援設定為 `UsePAM no` 的 sshd：此時 sshd 會在套用 `DenyUsers` 之前就以帳號已過期為由拒絕員工帳號，檢測無法確認拒絕原因，員工永遠不會就緒。沒有 sshd 的主機會略過這項檢測。
+有 sshd 的主機還需要 `/usr/bin/ssh`、`/usr/bin/ssh-keygen` 與 `/usr/bin/journalctl`、`duduclaw-selftest` 帳號（由安裝程式建立）與 `systemd-journal` 群組，sshd 必須在 127.0.0.1（其設定中的第一個 `Port`）上監聽，並把日誌寫入 systemd journal。不支援設定為 `UsePAM no` 的 sshd：此時 sshd 會在套用 `DenyUsers` 之前就以帳號已過期為由拒絕員工帳號，檢測無法確認拒絕原因，員工永遠不會就緒。沒有 sshd 的主機會略過這項檢測。
 
 安裝器先驗證固定路徑的完整元件，再準備帳號、目錄與 unit。Linux 發行包已加入凍結的更新啟動器；離線工具可將已簽署的資料與元件組成 bootstrap inbox。經獨立驗證的 `duduclaw-updated --bootstrap-stage` 會檢查編譯時固定的根指紋、根金鑰門檻簽章、target 簽章與全部元件雜湊，再發布**尚未啟用的世代**；不選擇 `current`、不建立 trust／state／slots、不驗證舊版過渡雙簽，也不啟動服務。尚無可直接照做的完整新安裝步驟。
 

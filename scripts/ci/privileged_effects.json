@@ -5526,7 +5526,7 @@
       ],
       "identity": "spawn_daemon",
       "migration": "privileged_service",
-      "rationale": "R7c shipped SSH denial probe (duduclaw-isolation-probe), started only by PID 1 through the root template unit duduclaw-isolation-probe@<account>.service with an empty capability bounding set and loopback-only IP access. Its only process creation: the fixed absolute host tools /usr/sbin/sshd -T, /usr/bin/ssh-keygen, /usr/bin/ssh and /usr/bin/journalctl (each fstat-verified root-owned, not group/other writable), fixed argv built from the validated employee account name and numeric ports, empty environment plus LC_ALL=C, cwd /, stdin /dev/null, output to 0600 files in a private 0700 directory, own process group, waited with a timer and group-killed on expiry. ssh runs this same binary as its ProxyCommand (--relay, numeric loopback ports only). No employee or gateway input."
+      "rationale": "R7c shipped SSH denial probe (duduclaw-isolation-probe), started only by PID 1 through the template unit duduclaw-isolation-probe@<account>.<port>.service, unprivileged as the isolation test account duduclaw-selftest with the systemd-journal supplementary group, an empty capability bounding set and loopback-only IP access; it refuses to run as root. Its only process creation: the fixed absolute host tools /usr/bin/ssh-keygen (key generation and fingerprint), /usr/bin/ssh and /usr/bin/journalctl (each fstat-verified root-owned, not group/other writable; no sshd: spawnd runs sshd -T itself), fixed argv built from the validated employee account name and numeric ports, empty environment plus LC_ALL=C, cwd /, stdin /dev/null, output to 0600 files in a private 0700 directory, own process group, waited with a timer and group-killed on expiry. ssh runs this same binary as its ProxyCommand (--relay, numeric loopback ports only). No employee or gateway input."
     },
     {
       "symbol": "crates/duduclaw-run/src/bin/root-fixture/launch.rs::run",
@@ -5785,7 +5785,7 @@
       ],
       "identity": "spawn_daemon",
       "migration": "not_process",
-      "rationale": "R7c: one std::thread::Builder::spawn of the duduclaw-ssh-probe worker thread inside spawnd, started once on the first SSH evidence lookup. It measures the probe inputs (committed generation, signed probe binary, template unit) and starts the fixed template unit duduclaw-isolation-probe@<valid employee account>.service through PID 1 over its own D-Bus connection, one at a time, bounded by the unit deadline. It launches no executable content itself; the probe process is created by PID 1 (inventoried at crates/duduclaw-isolation/src/bin/probe.rs)."
+      "rationale": "R7c: one std::thread::Builder::spawn of the duduclaw-ssh-probe worker thread inside spawnd, started once on the first SSH evidence lookup. It measures the probe inputs (committed generation, signed probe binary, template unit, and the live sshd listener identity read from PID 1) and starts the fixed template unit duduclaw-isolation-probe@<valid employee account>.<port>.service through PID 1 over its own D-Bus connection, one at a time, bounded by the unit deadline (allocation and admission only queue requests and never wait for it). It launches no executable content itself; the probe process is created by PID 1 (inventoried at crates/duduclaw-isolation/src/bin/probe.rs)."
     },
     {
       "symbol": "crates/duduclaw-sysd/src/dispatch.rs::bless_boot",
