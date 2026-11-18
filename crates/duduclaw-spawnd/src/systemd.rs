@@ -1770,6 +1770,26 @@ pub mod linux {
                 Err(error) => Err(bus_error(error)),
             }
         }
+        /// R8r-4 (feature `policy-tool`): PID 1's record of `name`'s main
+        /// process now, `(ActiveState, Result, ExecMainCode, ExecMainStatus)`,
+        /// for the harness's failure diagnosis; `None` when PID 1 has no such
+        /// unit loaded. Read-only: never loads, references or changes a unit.
+        #[cfg(any(test, feature = "policy-tool"))]
+        pub(crate) fn acceptance_result(&self, name: &str) -> io::Result<Option<(String, String, i32, i32)>> {
+            let existing: zbus::Result<OwnedObjectPath> = self.manager()?.call("GetUnit", &(name,));
+            let path = match existing {
+                Ok(path) => path,
+                Err(error) if missing_unit(&error) => return Ok(None),
+                Err(error) => return Err(bus_error(error)),
+            };
+            let unit = Proxy::new(&self.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Unit").map_err(bus_error)?;
+            let service = Proxy::new(&self.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Service").map_err(bus_error)?;
+            let state: String = unit.get_property("ActiveState").map_err(bus_error)?;
+            let result: String = service.get_property("Result").map_err(bus_error)?;
+            let code: i32 = service.get_property("ExecMainCode").map_err(bus_error)?;
+            let status: i32 = service.get_property("ExecMainStatus").map_err(bus_error)?;
+            Ok(Some((state, result, code, status)))
+        }
         /// Call only after all three cleanup readbacks, including the UID scan.
         pub fn release_reference(&self, run: &StartedUnit) -> io::Result<()> {
             let manager = self.manager()?;

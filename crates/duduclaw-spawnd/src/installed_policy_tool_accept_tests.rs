@@ -989,6 +989,152 @@ fn prepare_refuses_artifacts_that_differ_from_the_record() {
     assert!(prepare(&request, &raw).is_err());
 }
 
+// ── P2: the employee image is a left-over only while an object exists ───
+
+#[test]
+fn employee_image_is_left_over_only_while_one_of_its_objects_exists() {
+    use Presence::*;
+    let gone = ImageObjects { file: Absent, loop_device: Absent, mount: Absent };
+    // The first real-host run: destroy returned an error (its operation id was
+    // the provision's), yet nothing was left on the host. Nothing is reported.
+    assert!(image_leftovers(&gone).is_empty());
+    assert_eq!(image_leftovers(&ImageObjects { file: Present, ..gone }), [LEFT_IMAGE_FILE]);
+    assert_eq!(image_leftovers(&ImageObjects { loop_device: Present, ..gone }), [LEFT_IMAGE_LOOP]);
+    assert_eq!(image_leftovers(&ImageObjects { mount: Present, ..gone }), [LEFT_IMAGE_MOUNT]);
+    // A place that cannot be read never proves absence.
+    assert_eq!(image_leftovers(&ImageObjects { file: Unknown, loop_device: Unknown, mount: Unknown }),
+        [LEFT_IMAGE_FILE, LEFT_IMAGE_LOOP, LEFT_IMAGE_MOUNT]);
+    // H's storage directory: only its bookkeeping files may remain.
+    assert_eq!(storage_entries_presence(&[]), Absent);
+    assert_eq!(storage_entries_presence(&["storage.lock".into(), "state.json".into(), "state.new".into()]), Absent);
+    assert_eq!(storage_entries_presence(&["state.json".into(), format!("{}.img", "ab".repeat(16))]), Present);
+    assert_eq!(storage_entries_presence(&[format!("{}.mnt", "ab".repeat(16))]), Present);
+    assert_eq!(storage_entries_presence(&["anything-else".into()]), Present);
+    // A loop device backed by a file below the storage directory, also once unlinked.
+    let storage = Path::new("/var/lib/duduclaw-acceptance-0123/storage");
+    let image = format!("{}/{}.img", storage.display(), "ab".repeat(16));
+    assert!(backing_below(&format!("{image}\n"), storage));
+    assert!(backing_below(&format!("{image} (deleted)\n"), storage));
+    assert!(!backing_below("/var/lib/snapd/snaps/core22_1380.snap\n", storage));
+    assert!(!backing_below("/var/lib/duduclaw-acceptance-0123/storage2/x.img\n", storage));
+    assert!(!backing_below("\n", storage));
+    // A mount below the storage directory in the harness's own mountinfo.
+    let table = "22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n\
+        90 22 7:3 / /var/lib/duduclaw-acceptance-0123/storage/abab.mnt rw,nosuid,nodev,noexec - ext4 /dev/loop3 rw,errors=remount-ro\n";
+    assert!(mountinfo_below(table, storage));
+    assert!(!mountinfo_below(table.lines().next().unwrap(), storage));
+    assert!(mountinfo_below("91 22 7:4 / /var/lib/with\\040space/x rw - ext4 /dev/loop4 rw", Path::new("/var/lib/with space")));
+    assert!(!mountinfo_below("92 22 7:5 / /var/lib/duduclaw-acceptance-01234 rw - ext4 /dev/loop5 rw",
+        Path::new("/var/lib/duduclaw-acceptance-0123")));
+}
+
+// ── A: the failure diagnosis ────────────────────────────────────────────
+
+#[test]
+fn diagnosis_phase_names_are_fixed() {
+    let phases = [(HarnessPhase::Prepare, "prepare"), (HarnessPhase::Storage, "storage"), (HarnessPhase::Projection, "projection"),
+        (HarnessPhase::Seal, "seal"), (HarnessPhase::StartUnit, "start_unit"), (HarnessPhase::BindUnit, "bind_unit"),
+        (HarnessPhase::AwaitInitialize, "await_initialize"), (HarnessPhase::Observe, "observe"),
+        (HarnessPhase::AwaitToolsList, "await_tools_list"), (HarnessPhase::AwaitExit, "await_exit"),
+        (HarnessPhase::Teardown, "teardown")];
+    assert_eq!(HarnessPhase::default(), HarnessPhase::Prepare);
+    for (phase, name) in phases {
+        assert_eq!(phase.name(), name);
+        let diagnosis = Diagnosis { phase, ..Diagnosis::default() };
+        assert_eq!(diagnosis_lines(&diagnosis)[0], format!("{DIAG_PREFIX}phase {name}"));
+    }
+    // Nothing collected: every fact says so, no stream line.
+    let lines = diagnosis_lines(&Diagnosis::default());
+    for expected in ["harness error: none recorded", "unit: not read (never started)",
+        "trampoline status: no error record received", "stdout: last 0 of 0 bytes", "stderr: last 0 of 0 bytes"] {
+        assert!(lines.contains(&format!("{DIAG_PREFIX}{expected}")), "{expected}: {lines:?}");
+    }
+    assert!(!lines.iter().any(|line| line.contains("| ") || line.contains("run ") || line.contains("employee ")));
+}
+
+#[test]
+fn diagnosis_trampoline_error_names_are_the_status_codes() {
+    use duduclaw_run::Error as E;
+    let all = [E::UnsupportedPlatform, E::UnsupportedKernel, E::RegistryUnavailable, E::Bootstrap, E::Descriptors,
+        E::DescriptorLimit, E::Executable, E::Mount, E::Namespace, E::Privileges, E::Landlock, E::Seccomp, E::State,
+        E::Process, E::Status, E::Exec];
+    for (index, error) in all.into_iter().enumerate() {
+        let code = u8::try_from(index + 1).unwrap();
+        assert_eq!(Some(trampoline_error_name(code)), serde_json::to_value(error).unwrap().as_str());
+        #[cfg(target_os = "linux")]
+        assert_eq!(duduclaw_run::linux::bootstrap::error_status(error)[5], code);
+    }
+    assert_eq!(trampoline_error_name(0), "unknown");
+    assert_eq!(trampoline_error_name(17), "unknown");
+}
+
+#[test]
+fn diagnosis_tail_keeps_the_last_bytes() {
+    let mut tail = Tail::new(4);
+    tail.push(b"abcdef");
+    assert_eq!(tail.bytes(), b"cdef");
+    tail.push(b"gh");
+    assert_eq!(tail.bytes(), b"efgh");
+    tail.push(b"");
+    assert_eq!(tail.bytes(), b"efgh");
+    assert_eq!(Diagnosis::default().stderr.bytes().len(), 0);
+}
+
+#[test]
+fn diagnosis_is_bounded_printable_and_never_carries_a_provider_key() {
+    // The provider key's shape (`providers_document`): 32 lowercase hex digits.
+    let key = "0123456789abcdef0123456789abcdef";
+    let mut d = Diagnosis { run: Some([0xab; 16]), employee: Some([0xcd; 16]), phase: HarnessPhase::BindUnit,
+        harness_error: Some(ErrorFact::io("transient run unit", &io::Error::from_raw_os_error(libc::EACCES))),
+        unit: UnitReadback::Read(UnitResult { active_state: "failed".into(), result: "exit-code".into(), exec_main_code: 1,
+            exec_main_status: 125 }),
+        status_error: Some(4), run_end: Some(format!("exited 125\n{key}")), incomplete: Some(incomplete::LAUNCHER_MISSING),
+        teardown: vec![ErrorFact::code("storage destroy", ErrorCode::InvalidRequest), ErrorFact::timeout("run cgroup removal"),
+            ErrorFact::fixed("a mount below the harness directory")],
+        ..Diagnosis::default() };
+    let mut stderr = vec![b'x'; 3 * STDERR_TAIL_BYTES];
+    stderr.extend_from_slice(b"\n\x1b[31mred\r\tbell\x07\n");
+    stderr.extend_from_slice(format!("{{\"api_key\":\"{key}\"}}\n").as_bytes());
+    stderr.extend_from_slice(&[0xff, 0xfe, b'\n']);
+    d.stderr.push(&stderr);
+    d.stdout.push(format!("key={}\n", key.to_uppercase()).as_bytes());
+    let lines = diagnosis_lines(&d);
+    assert!(lines.iter().all(|line| line.starts_with(DIAG_PREFIX)), "{lines:?}");
+    let text = lines.join("\n");
+    assert!(!text.to_lowercase().contains(key), "the key never appears");
+    for expected in [
+        "phase bind_unit".to_owned(),
+        format!("run {}", "ab".repeat(16)),
+        format!("employee {}", "cd".repeat(16)),
+        format!("harness error: transient run unit (kind PermissionDenied, errno {})", libc::EACCES),
+        "unit: ActiveState failed Result exit-code ExecMainCode 1 (exited) ExecMainStatus 125".to_owned(),
+        "trampoline status: error bootstrap (code 4)".to_owned(),
+        format!("run end: exited 125?{}", "*".repeat(32)),
+        "incomplete: launcher_missing".to_owned(),
+        "teardown step failed: storage destroy (code InvalidRequest)".to_owned(),
+        "teardown step failed: run cgroup removal (kind TimedOut, errno none)".to_owned(),
+        "teardown step failed: a mount below the harness directory".to_owned(),
+        format!("stderr: last {STDERR_TAIL_BYTES} of {} bytes", stderr.len()),
+        "stderr| ?[31mred??bell?".to_owned(),
+        format!("stderr| {{\"api_key\":\"{}\"}}", "*".repeat(32)),
+        "stderr| \u{fffd}\u{fffd}".to_owned(),
+        format!("stdout| key={}", "*".repeat(32)),
+    ] {
+        assert!(lines.contains(&format!("{DIAG_PREFIX}{expected}")), "{expected}: {lines:?}");
+    }
+    // No control character survives (every `\n` became a line break).
+    assert!(lines.iter().all(|line| !line.chars().any(char::is_control)));
+    // Bounded: at most the last 8 KiB of stderr and 2 KiB of stdout, as characters.
+    for (name, bound) in [("stderr", STDERR_TAIL_BYTES), ("stdout", STDOUT_TAIL_BYTES)] {
+        let prefix = format!("{DIAG_PREFIX}{name}| ");
+        let shown: Vec<&str> = lines.iter().filter_map(|line| line.strip_prefix(prefix.as_str())).collect();
+        assert!(!shown.is_empty());
+        assert!(shown.iter().map(|line| line.chars().count() + 1).sum::<usize>() <= bound + 1, "{name}");
+    }
+    // A short hex value (an id, an errno) is printed as is.
+    assert_eq!(printable(b"abc123\x00", 64), "abc123?");
+}
+
 // ── the real launch (root, disposable host) ─────────────────────────────
 
 #[test]

@@ -839,6 +839,257 @@ pub(super) fn run_cgroups(unit_cgroup: &str, slice: &str) -> Vec<String> {
     groups
 }
 
+// ── the employee image after the tear-down (object-based, P2) ───────────
+//
+// R8r-4 first real-host run: the tear-down reported "the employee image" on a
+// host where nothing was left. The cause: `destroy` was called with the
+// PROVISION's operation id, which the H adapter's ledger refuses as a
+// duplicate operation (`storage/adapter_state.rs` `Journal::validate`), so the
+// journal kept the entry and `traces()` named it, while the image file itself
+// went with the harness directory. A left-over is now decided only from the
+// objects themselves; the storage steps' errors go to the diagnosis.
+
+/// Whether an object exists after the tear-down: `Unknown` (the place could
+/// not be read) is reported like `Present` (fail closed).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Presence { Absent, Present, Unknown }
+/// The employee image's three host objects: a file in H's storage directory
+/// (anything but H's own bookkeeping files), a loop device whose backing file
+/// is below that directory, a mount point below it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ImageObjects { pub file: Presence, pub loop_device: Presence, pub mount: Presence }
+pub(super) const LEFT_IMAGE_FILE: &str = "the employee image file";
+pub(super) const LEFT_IMAGE_LOOP: &str = "the employee image's loop device";
+pub(super) const LEFT_IMAGE_MOUNT: &str = "the employee image mount";
+/// The left-overs among the image objects: every object that still exists
+/// (or cannot be shown absent), whatever the storage steps returned.
+pub(super) fn image_leftovers(objects: &ImageObjects) -> Vec<&'static str> {
+    [(objects.file, LEFT_IMAGE_FILE), (objects.loop_device, LEFT_IMAGE_LOOP), (objects.mount, LEFT_IMAGE_MOUNT)]
+        .into_iter().filter(|(presence, _)| *presence != Presence::Absent).map(|(_, name)| name).collect()
+}
+/// H's storage directory listing after the tear-down: only H's own
+/// bookkeeping files may remain (any other entry, image or not, is reported).
+pub(super) fn storage_entries_presence(names: &[String]) -> Presence {
+    if names.iter().any(|name| !matches!(name.as_str(), "storage.lock" | "state.json" | "state.new")) { Presence::Present }
+    else { Presence::Absent }
+}
+/// One mountinfo path field with its octal escapes (`\040`, ...) decoded.
+fn mountinfo_path(field: &str) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let octal = bytes.get(index + 1..index + 4).filter(|digits| bytes[index] == b'\\'
+            && digits.iter().all(|digit| (b'0'..=b'7').contains(digit)));
+        match octal {
+            Some(digits) => {
+                out.push(digits.iter().fold(0u8, |value, digit| value.wrapping_mul(8).wrapping_add(digit - b'0')));
+                index += 4;
+            }
+            None => { out.push(bytes[index]); index += 1; }
+        }
+    }
+    PathBuf::from(std::ffi::OsString::from_vec(out))
+}
+/// Any mount point at or below `root` in a `/proc/<pid>/mountinfo` table.
+pub(super) fn mountinfo_below(table: &str, root: &Path) -> bool {
+    table.lines().any(|line| line.split_whitespace().nth(4).is_some_and(|point| mountinfo_path(point).starts_with(root)))
+}
+/// A loop device's `loop/backing_file` text names a file at or below
+/// `directory` (also after the file was unlinked: ` (deleted)`).
+pub(super) fn backing_below(text: &str, directory: &Path) -> bool {
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    let text = text.strip_suffix(" (deleted)").unwrap_or(text);
+    !text.is_empty() && Path::new(text).starts_with(directory)
+}
+
+// ── diagnostics (printed only when accept exits non-zero) ───────────────
+
+pub(super) const DIAG_PREFIX: &str = "accept: diag: ";
+pub(super) const STDERR_TAIL_BYTES: usize = 8 * 1024;
+pub(super) const STDOUT_TAIL_BYTES: usize = 2 * 1024;
+/// Bound of every other free-form value (PID 1's strings, the run end).
+const DIAG_VALUE_BYTES: usize = 128;
+/// A run of at least this many ASCII hex digits in a printed stream is masked:
+/// the provider key is 32 hex digits (`harness::providers_document`), so even
+/// a worker that printed it could not carry it into the diagnosis.
+pub(super) const DIAG_HEX_RUN_MASKED: usize = 32;
+
+/// Where the harness was when it gave up (fixed names).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum HarnessPhase {
+    #[default] Prepare, Storage, Projection, Seal, StartUnit, BindUnit, AwaitInitialize, Observe, AwaitToolsList, AwaitExit,
+    Teardown,
+}
+impl HarnessPhase {
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::Prepare => "prepare", Self::Storage => "storage", Self::Projection => "projection", Self::Seal => "seal",
+            Self::StartUnit => "start_unit", Self::BindUnit => "bind_unit", Self::AwaitInitialize => "await_initialize",
+            Self::Observe => "observe", Self::AwaitToolsList => "await_tools_list", Self::AwaitExit => "await_exit",
+            Self::Teardown => "teardown",
+        }
+    }
+}
+
+/// One failed step, without its message (which may name a path): a fixed
+/// context, and the io error kind + raw OS error or the refusal code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ErrorFact {
+    pub context: &'static str,
+    pub kind: Option<io::ErrorKind>,
+    pub errno: Option<i32>,
+    pub code: Option<ErrorCode>,
+}
+impl ErrorFact {
+    pub(super) fn io(context: &'static str, error: &io::Error) -> Self {
+        Self { context, kind: Some(error.kind()), errno: error.raw_os_error(), code: None }
+    }
+    pub(super) fn code(context: &'static str, code: ErrorCode) -> Self { Self { context, kind: None, errno: None, code: Some(code) } }
+    pub(super) fn timeout(context: &'static str) -> Self {
+        Self { context, kind: Some(io::ErrorKind::TimedOut), errno: None, code: None }
+    }
+    pub(super) fn fixed(context: &'static str) -> Self { Self { context, kind: None, errno: None, code: None } }
+    fn describe(&self) -> String {
+        match (self.code, self.kind) {
+            (Some(code), _) => format!("{} (code {code:?})", self.context),
+            (None, Some(kind)) => format!("{} (kind {kind:?}, errno {})", self.context,
+                self.errno.map_or_else(|| "none".to_owned(), |errno| errno.to_string())),
+            (None, None) => self.context.to_owned(),
+        }
+    }
+}
+
+/// PID 1's record of the run unit's main process.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct UnitResult { pub active_state: String, pub result: String, pub exec_main_code: i32, pub exec_main_status: i32 }
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) enum UnitReadback {
+    #[default] NotRead,
+    NotLoaded,
+    Unreadable(ErrorFact),
+    Read(UnitResult),
+}
+
+/// The last `capacity` bytes of a stream, and how many it carried in total.
+#[derive(Clone, Debug)]
+pub(super) struct Tail { capacity: usize, bytes: Vec<u8>, total: u64 }
+impl Tail {
+    pub(super) fn new(capacity: usize) -> Self { Self { capacity, bytes: Vec::new(), total: 0 } }
+    pub(super) fn push(&mut self, chunk: &[u8]) {
+        self.total = self.total.saturating_add(chunk.len() as u64);
+        self.bytes.extend_from_slice(&chunk[chunk.len().saturating_sub(self.capacity)..]);
+        if self.bytes.len() > self.capacity {
+            let excess = self.bytes.len() - self.capacity;
+            self.bytes.drain(..excess);
+        }
+    }
+    pub(super) fn bytes(&self) -> &[u8] { &self.bytes }
+}
+
+/// What a failed `accept` prints ([`diagnosis_lines`]). Collected during the
+/// run; it never holds the provider key, a path or an id other than the
+/// run/employee ids the harness generated.
+#[derive(Clone, Debug)]
+pub(super) struct Diagnosis {
+    pub run: Option<[u8; 16]>,
+    pub employee: Option<[u8; 16]>,
+    pub phase: HarnessPhase,
+    /// The first harness-side error of the launch.
+    pub harness_error: Option<ErrorFact>,
+    pub unit: UnitReadback,
+    /// The first error record (duduclaw-run `bootstrap::error_status`) the
+    /// trampoline sent on its status socket.
+    pub status_error: Option<u8>,
+    /// How the run ended ("exited 125", ...), when it did.
+    pub run_end: Option<String>,
+    pub stdout: Tail,
+    pub stderr: Tail,
+    pub incomplete: Option<&'static str>,
+    /// Every tear-down step that failed.
+    pub teardown: Vec<ErrorFact>,
+}
+impl Default for Diagnosis {
+    fn default() -> Self {
+        Self { run: None, employee: None, phase: HarnessPhase::default(), harness_error: None, unit: UnitReadback::default(),
+            status_error: None, run_end: None, stdout: Tail::new(STDOUT_TAIL_BYTES), stderr: Tail::new(STDERR_TAIL_BYTES),
+            incomplete: None, teardown: Vec::new() }
+    }
+}
+
+/// duduclaw-run's `Error` by its status code (`bootstrap::error_code`; the
+/// names are the enum's serde names).
+pub(super) fn trampoline_error_name(code: u8) -> &'static str {
+    match code {
+        1 => "unsupported_platform", 2 => "unsupported_kernel", 3 => "registry_unavailable", 4 => "bootstrap",
+        5 => "descriptors", 6 => "descriptor_limit", 7 => "executable", 8 => "mount", 9 => "namespace", 10 => "privileges",
+        11 => "landlock", 12 => "seccomp", 13 => "state", 14 => "process", 15 => "status", 16 => "exec",
+        _ => "unknown",
+    }
+}
+/// `ExecMainCode` (a `siginfo` `si_code`).
+fn exec_main_code_name(code: i32) -> &'static str {
+    match code { 0 => "none", 1 => "exited", 2 => "killed", 3 => "dumped", _ => "other" }
+}
+/// Every run of [`DIAG_HEX_RUN_MASKED`] or more ASCII hex digits replaced by
+/// as many `*`.
+fn mask_hex_runs(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut index = 0;
+    while index < chars.len() {
+        if !chars[index].is_ascii_hexdigit() { out.push(chars[index]); index += 1; continue; }
+        let end = chars[index..].iter().position(|c| !c.is_ascii_hexdigit()).map_or(chars.len(), |offset| index + offset);
+        if end - index >= DIAG_HEX_RUN_MASKED { out.extend(std::iter::repeat_n('*', end - index)); }
+        else { out.extend(&chars[index..end]); }
+        index = end;
+    }
+    out
+}
+/// The last `limit` bytes as lossy UTF-8, every control character other than
+/// `\n` replaced by `?`, long hex runs masked.
+pub(super) fn printable(bytes: &[u8], limit: usize) -> String {
+    let text = String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(limit)..]);
+    let cleaned: String = text.chars().map(|c| if c.is_control() && c != '\n' { '?' } else { c }).collect();
+    mask_hex_runs(&cleaned)
+}
+/// A one-line value: [`printable`] with `\n` replaced too.
+fn printable_value(text: &str) -> String { printable(text.as_bytes(), DIAG_VALUE_BYTES).replace('\n', "?") }
+
+/// The diagnosis, one `accept: diag: ` line per fact and per stream line.
+pub(super) fn diagnosis_lines(d: &Diagnosis) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut push = |text: String| lines.push(format!("{DIAG_PREFIX}{text}"));
+    push(format!("phase {}", d.phase.name()));
+    if let Some(run) = &d.run { push(format!("run {}", hex(run))); }
+    if let Some(employee) = &d.employee { push(format!("employee {}", hex(employee))); }
+    push(format!("harness error: {}", d.harness_error.as_ref().map_or_else(|| "none recorded".to_owned(), ErrorFact::describe)));
+    push(match &d.unit {
+        UnitReadback::NotRead => "unit: not read (never started)".to_owned(),
+        UnitReadback::NotLoaded => "unit: not loaded by PID 1".to_owned(),
+        UnitReadback::Unreadable(fact) => format!("unit: unreadable: {}", fact.describe()),
+        UnitReadback::Read(unit) => format!("unit: ActiveState {} Result {} ExecMainCode {} ({}) ExecMainStatus {}",
+            printable_value(&unit.active_state), printable_value(&unit.result), unit.exec_main_code,
+            exec_main_code_name(unit.exec_main_code), unit.exec_main_status),
+    });
+    push(match d.status_error {
+        Some(code) => format!("trampoline status: error {} (code {code})", trampoline_error_name(code)),
+        None => "trampoline status: no error record received".to_owned(),
+    });
+    if let Some(end) = &d.run_end { push(format!("run end: {}", printable_value(end))); }
+    if let Some(reason) = d.incomplete { push(format!("incomplete: {reason}")); }
+    for step in &d.teardown { push(format!("teardown step failed: {}", step.describe())); }
+    for (name, tail, limit) in [("stdout", &d.stdout, STDOUT_TAIL_BYTES), ("stderr", &d.stderr, STDERR_TAIL_BYTES)] {
+        let shown = &tail.bytes()[tail.bytes().len().saturating_sub(limit)..];
+        push(format!("{name}: last {} of {} bytes", shown.len(), tail.total));
+        if shown.is_empty() { continue; }
+        let text = printable(shown, limit);
+        for line in text.strip_suffix('\n').unwrap_or(&text).split('\n') { push(format!("{name}| {line}")); }
+    }
+    lines
+}
+
 // ── harness directory (F5) ──────────────────────────────────────────────
 
 /// Create `path`, hand it to `register` (the tear-down guard) right after the
@@ -1280,8 +1531,13 @@ pub(super) fn command(args: &[String], facts: &HostFacts) -> std::result::Result
     label_gate(&source, &request.label).map_err(|message| (1, message.to_owned()))?;
     drop(source);
     let prepared = prepare(&request, &raw).map_err(|message| (1, message))?;
-    let outcome = harness::run(&prepared, &request.trampoline, request.trampoline_sha256).map_err(|message| (1, message))?;
-    finish(&request, &raw, &prepared, &outcome).map_err(|message| (1, message))
+    let (outcome, diagnosis) = harness::run(&prepared, &request.trampoline, request.trampoline_sha256);
+    // A failed run, an incomplete observation or a refused decision: no
+    // record, and the diagnosis (stderr, `accept: diag: ` lines) says why.
+    outcome.and_then(|outcome| finish(&request, &raw, &prepared, &outcome)).map_err(|message| {
+        for line in diagnosis_lines(&diagnosis) { eprintln!("{line}"); }
+        (1, message)
+    })
 }
 
 /// Decide, encode the evidence, build and check the record and the output

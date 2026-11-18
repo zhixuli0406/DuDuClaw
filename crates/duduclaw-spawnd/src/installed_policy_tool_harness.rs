@@ -22,6 +22,14 @@
 //! egress service registration), the R7a trampoline self-test readiness, the
 //! helper table, the work-broker root and the gateway's `McpRunReceipt`.
 //!
+//! Diagnosis (first real-host run): every run collects a [`Diagnosis`] before
+//! the tear-down (the phase it gave up in, its first harness-side error,
+//! PID 1's `Result`/`ExecMainCode`/`ExecMainStatus` of the run unit, the
+//! trampoline's error record PEEKED from its status socket, the bounded output
+//! tails, every failed tear-down step); `accept` prints it only when it exits
+//! non-zero. The employee image is verified gone by its objects (file, loop
+//! device, mount), and the tear-down destroys it with its own operation id.
+//!
 //! Network: the run has its own network namespace with loopback only (the
 //! trampoline's `enter_namespaces` / `bring_loopback_up`); with `network:
 //! egress` the only way out is the forwarder's egress socket, whose other end
@@ -50,8 +58,21 @@ pub(super) struct Outcome {
     pub kernel: String,
 }
 
-fn os_error(what: &str) -> impl Fn(io::Error) -> String + '_ { move |error| format!("accept: {what}: {error}") }
-fn refused(what: &str) -> impl Fn(ErrorCode) -> String + '_ { move |code| format!("accept: {what} refused ({code:?})") }
+// The first harness-side error of the launch, without its message (which may
+// name a path): its fixed context and io kind/errno or refusal code, for the
+// diagnosis. The harness runs on its single main thread.
+thread_local! { static FIRST_ERROR: std::cell::Cell<Option<ErrorFact>> = const { std::cell::Cell::new(None) }; }
+fn note(fact: ErrorFact) { FIRST_ERROR.with(|first| if first.get().is_none() { first.set(Some(fact)); }); }
+fn take_noted() -> Option<ErrorFact> { FIRST_ERROR.with(std::cell::Cell::take) }
+
+fn os_error(what: &'static str) -> impl Fn(io::Error) -> String {
+    move |error| { note(ErrorFact::io(what, &error)); format!("accept: {what}: {error}") }
+}
+fn refused(what: &'static str) -> impl Fn(ErrorCode) -> String {
+    move |code| { note(ErrorFact::code(what, code)); format!("accept: {what} refused ({code:?})") }
+}
+/// A fixed harness refusal (`accept: <reason>`), noted for the diagnosis.
+fn fixed_error(reason: &'static str) -> String { note(ErrorFact::fixed(reason)); format!("accept: {reason}") }
 
 /// sha256 of everything an opened file yields.
 fn digest_file(mut file: File) -> io::Result<Sha256Digest> {
@@ -651,9 +672,133 @@ fn cgroup_empty(cgroup: &Path) -> bool {
 /// Any mount point at or below `root` in this (private) namespace.
 fn mounts_below(root: &Path) -> bool {
     let Ok(table) = fs::read_to_string("/proc/self/mountinfo") else { return true };
-    let prefix = root.to_string_lossy().into_owned();
-    table.lines().any(|line| line.split_whitespace().nth(4).is_some_and(|point|
-        point == prefix || point.starts_with(&format!("{prefix}/"))))
+    mountinfo_below(&table, root)
+}
+
+// ── what is left of the employee image (P2: objects, not return values) ─
+
+/// The image objects below H's storage directory `storage` after the
+/// tear-down: entries of the directory itself, loop devices backed by a file
+/// below it (`/sys/block/loop*/loop/backing_file`), mounts below it in this
+/// process's (private) mount namespace, where H mounted it.
+fn image_objects(storage: &Path) -> ImageObjects {
+    let file = match fs::read_dir(storage) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Presence::Absent,
+        Err(_) => Presence::Unknown,
+        Ok(entries) => match entries.map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+            .collect::<io::Result<Vec<String>>>() {
+            Ok(names) => storage_entries_presence(&names),
+            Err(_) => Presence::Unknown,
+        },
+    };
+    let mount = match fs::read_to_string("/proc/self/mountinfo") {
+        Ok(table) => if mountinfo_below(&table, storage) { Presence::Present } else { Presence::Absent },
+        Err(_) => Presence::Unknown,
+    };
+    ImageObjects { file, loop_device: loop_presence(storage), mount }
+}
+fn loop_presence(storage: &Path) -> Presence {
+    let Ok(entries) = fs::read_dir("/sys/block") else { return Presence::Unknown };
+    let mut unknown = false;
+    for entry in entries {
+        let Ok(entry) = entry else { unknown = true; continue };
+        let name = entry.file_name();
+        let is_loop = name.to_str().and_then(|name| name.strip_prefix("loop"))
+            .is_some_and(|number| !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit()));
+        if !is_loop { continue; }
+        match fs::read_to_string(entry.path().join("loop").join("backing_file")) {
+            Ok(text) if backing_below(&text, storage) => return Presence::Present,
+            Ok(_) => {}
+            // An unbound loop device has no `loop/` attribute group.
+            Err(error) if error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ENXIO) => {}
+            Err(_) => unknown = true,
+        }
+    }
+    if unknown { Presence::Unknown } else { Presence::Absent }
+}
+
+// ── the trampoline's status socket, for the diagnosis only ──────────────
+
+/// The head packet of the root end of the bootstrap/status socket, PEEKED
+/// (never consumed: `NativeTrampoline::poll` still receives it), when it is a
+/// 12-byte status record without descriptors.
+fn peek_status(socket: BorrowedFd<'_>) -> Option<duduclaw_run::status::StatusRecord> {
+    let mut packet = [0u8; 32];
+    let mut iov = libc::iovec { iov_base: packet.as_mut_ptr().cast(), iov_len: packet.len() };
+    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+    message.msg_iov = &mut iov;
+    message.msg_iovlen = 1;
+    let count = unsafe { libc::recvmsg(socket.as_raw_fd(), &mut message, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
+    if count != 12 || message.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 { return None; }
+    duduclaw_run::status::StatusRecord::decode(&packet[..12], 0).ok()
+}
+/// Record an error status into the diagnosis (the first one wins).
+fn note_status(d: &mut Diagnosis, record: Option<duduclaw_run::status::StatusRecord>) {
+    if let Some(duduclaw_run::status::StatusRecord::Error(code)) = record { d.status_error.get_or_insert(code); }
+}
+/// After the run: receive what the trampoline left on its status socket
+/// (bounded; nothing reads it any more).
+fn drain_status(socket: BorrowedFd<'_>, d: &mut Diagnosis) {
+    use duduclaw_run::status::StatusRecord;
+    for _ in 0..16 {
+        if !readable(socket.as_raw_fd(), 0) { return; }
+        let Ok((record, rights)) = duduclaw_run::linux::bootstrap::receive_status(socket.as_raw_fd()) else { return };
+        drop(rights);
+        match record {
+            StatusRecord::Error(code) => { d.status_error.get_or_insert(code); }
+            StatusRecord::Exited(code) => { d.run_end.get_or_insert_with(|| format!("exited {code}")); }
+            StatusRecord::Signalled(signal) => { d.run_end.get_or_insert_with(|| format!("signalled {signal}")); }
+            _ => {}
+        }
+    }
+}
+
+// ── the run's output pipes (the harness's read ends) ────────────────────
+
+/// Kept by [`run`] until after the tear-down, so the diagnosis can read the
+/// last bytes whatever step failed.
+#[derive(Default)]
+struct Streams { stdout: Option<OwnedFd>, stderr: Option<OwnedFd> }
+/// Everything readable now (non-blocking, bounded), into the tail.
+fn read_tail(fd: Option<&OwnedFd>, tail: &mut Tail) {
+    let Some(fd) = fd else { return };
+    let _ = set_nonblocking(fd.as_raw_fd());
+    let mut buffer = vec![0u8; 16 * 1024];
+    for _ in 0..256 {
+        match read_some(fd.as_raw_fd(), &mut buffer) {
+            Ok(Some(count)) if count > 0 => tail.push(&buffer[..count]),
+            _ => return,
+        }
+    }
+}
+
+/// How long the diagnosis waits for PID 1 to record the main process's end.
+const UNIT_SETTLE: Duration = Duration::from_secs(6);
+/// The diagnosis of the run, read BEFORE the tear-down (which resets and
+/// unloads the unit): the first harness-side error, what the trampoline left
+/// on its status socket, PID 1's record of the main process, the output tails.
+fn collect(d: &mut Diagnosis, t: &Teardown, streams: &Streams) {
+    d.harness_error = take_noted();
+    if let Some(run) = t.run { d.run = Some(run.0.0); }
+    if let (Some(trampoline), Some(run)) = (t.trampoline.as_ref(), t.run) {
+        if let Some(socket) = trampoline.acceptance_status_socket(run) { drain_status(socket, d); }
+    }
+    if let (Some(systemd), Some(run)) = (t.systemd.as_ref(), t.run) {
+        let name = crate::systemd::run_unit(run.0);
+        let deadline = Instant::now() + UNIT_SETTLE;
+        d.unit = loop {
+            match systemd.acceptance_result(&name) {
+                Ok(Some((state, ..))) if matches!(state.as_str(), "active" | "activating" | "deactivating" | "reloading")
+                    && Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+                Ok(Some((active_state, result, exec_main_code, exec_main_status))) =>
+                    break UnitReadback::Read(UnitResult { active_state, result, exec_main_code, exec_main_status }),
+                Ok(None) => break UnitReadback::NotLoaded,
+                Err(error) => break UnitReadback::Unreadable(ErrorFact::io("unit result readback", &error)),
+            }
+        };
+    }
+    read_tail(streams.stdout.as_ref(), &mut d.stdout);
+    read_tail(streams.stderr.as_ref(), &mut d.stderr);
 }
 fn anchors_of(root: &Path) -> io::Result<crate::bootstrap_mounts::RootPublicationAnchors> {
     crate::bootstrap_mounts::RootPublicationAnchors::new(root.join("runtime"), root.join("etc-state"), root.join("projections"))
@@ -781,12 +926,19 @@ struct Teardown {
     attached: Option<AttachedStorage>,
     attachment: Option<Attachment>,
     storage: Option<LoopStorage>,
+    /// `(employee, DESTROY operation id, destroy proposal digest)`: a fresh
+    /// operation, never the provision's (H's ledger refuses a reused one).
     provisioned: Option<(EmployeeId, duduclaw_isolation::ids::RequestId, Sha256Digest)>,
+    /// H's storage directory: the employee image's objects are verified gone
+    /// below it ([`image_objects`]).
+    image_storage: Option<PathBuf>,
     uid: Option<u32>,
     /// F3: the run unit's cgroup and the harness's own leaf slice
     /// ([`run_cgroups`]); the only places whose processes may be signalled.
     run_cgroups: Vec<String>,
     root: Option<PathBuf>,
+    /// Every step that failed, for the diagnosis (A6).
+    steps: Vec<ErrorFact>,
 }
 const LEFT_RUN_PROCESSES: &str = "processes of the temporary employee uid in the run cgroup";
 const LEFT_UNSCANNED: &str = "processes of the temporary employee uid (the process table could not be read)";
@@ -795,19 +947,27 @@ impl Teardown {
         if self.finished { return Ok(()); }
         self.finished = true;
         let mut left: Vec<&'static str> = Vec::new();
+        let mut steps: Vec<ErrorFact> = Vec::new();
         if let Some(flag) = &self.cancelled { flag.store(true, Ordering::Release); }
         if let (Some(systemd), Some(run)) = (&self.systemd, self.run) {
-            if systemd.cleanup_test_run(run.0).is_err() { left.push("the systemd run unit"); }
+            if let Err(error) = systemd.cleanup_test_run(run.0) {
+                steps.push(ErrorFact::io("stop and unload the run unit", &error));
+                left.push("the systemd run unit");
+            }
         }
         if let (Some(trampoline), Some(run)) = (self.trampoline.as_mut(), self.run) { let _ = trampoline.close(run); }
         self.trampoline = None;
         self.descriptors.clear();
         if let Some(cgroup) = &self.cgroup {
-            if !wait_until(Duration::from_secs(10), || !cgroup.exists()) { left.push("the run cgroup"); }
+            if !wait_until(Duration::from_secs(10), || !cgroup.exists()) {
+                steps.push(ErrorFact::timeout("run cgroup removal"));
+                left.push("the run cgroup");
+            }
         }
         if let (Some(systemd), Some(slice)) = (&self.systemd, &self.slice) {
-            let _ = systemd.acceptance_stop(slice);
+            if let Err(error) = systemd.acceptance_stop(slice) { steps.push(ErrorFact::io("stop the employee slice", &error)); }
             if !wait_until(Duration::from_secs(10), || systemd.acceptance_loaded(slice).is_ok_and(|loaded| !loaded)) {
+                steps.push(ErrorFact::timeout("employee slice unload"));
                 left.push("the employee slice unit");
             }
         }
@@ -817,39 +977,63 @@ impl Teardown {
         if let Some(uid) = self.uid {
             let settled = || uid_processes(uid).is_ok_and(|found| teardown_selection(&found, &groups).kill.is_empty());
             if !wait_until(Duration::from_secs(5), settled) {
-                if let Ok(found) = uid_processes(uid) {
-                    let selection = teardown_selection(&found, &groups);
-                    for process in found.iter().filter(|process| selection.kill.contains(&(process.pid, process.start))) {
-                        let _ = kill_member(process, uid, &groups);
+                match uid_processes(uid) {
+                    Ok(found) => {
+                        let selection = teardown_selection(&found, &groups);
+                        for process in found.iter().filter(|process| selection.kill.contains(&(process.pid, process.start))) {
+                            if let Err(error) = kill_member(process, uid, &groups) {
+                                steps.push(ErrorFact::io("signal a run process", &error));
+                            }
+                        }
                     }
+                    Err(error) => steps.push(ErrorFact::io("scan the temporary uid's processes", &error)),
                 }
-                if !wait_until(Duration::from_secs(5), settled) { left.push(LEFT_RUN_PROCESSES); }
+                if !wait_until(Duration::from_secs(5), settled) {
+                    steps.push(ErrorFact::timeout("run processes exit"));
+                    left.push(LEFT_RUN_PROCESSES);
+                }
             }
         }
+        // P2: detach (the run's lease), then destroy with the harness's own
+        // destroy operation. Their results are diagnostics only: whether the
+        // image is left over is decided from the objects after the tear-down.
         self.attached = None;
         if let Some(storage) = self.storage.as_mut() {
             if let Some(attachment) = &self.attachment {
-                if storage.detach(attachment).is_err() { left.push("the attached employee image"); }
+                if let Err(code) = storage.detach(attachment) { steps.push(ErrorFact::code("storage detach", code)); }
             }
             if let Some((employee, operation, digest)) = self.provisioned {
-                if storage.destroy(employee, operation, digest).is_err()
-                    || storage.traces().map_or(true, |traces| traces.contains(&employee)) {
-                    left.push("the employee image");
+                if let Err(code) = storage.destroy(employee, operation, digest) { steps.push(ErrorFact::code("storage destroy", code)); }
+                match storage.traces() {
+                    Ok(traces) if traces.contains(&employee) => steps.push(ErrorFact::fixed("storage ledger still names the employee")),
+                    Ok(_) => {}
+                    Err(code) => steps.push(ErrorFact::code("storage traces", code)),
                 }
             }
         }
         self.storage = None;
         if let (Some(root), Some(run)) = (&self.root, self.run) {
             match anchors_of(root) {
-                Ok(anchors) => if crate::bootstrap_mounts::cleanup_projection(&anchors, run).is_err() { left.push("the /etc projection"); },
-                Err(_) => left.push("the harness directory"),
+                Ok(anchors) => if let Err(error) = crate::bootstrap_mounts::cleanup_projection(&anchors, run) {
+                    steps.push(ErrorFact::io("remove the /etc projection", &error));
+                    left.push("the /etc projection");
+                },
+                Err(error) => { steps.push(ErrorFact::io("open the projection anchors", &error)); left.push("the harness directory"); }
             }
         }
         if let Some(root) = &self.root {
             // Never delete through a mount (remove_dir_all would descend into it).
-            if mounts_below(root) { left.push("a mount below the harness directory"); }
-            else if fs::remove_dir_all(root).is_err() || fs::symlink_metadata(root).is_ok() { left.push("the harness directory"); }
+            if mounts_below(root) {
+                steps.push(ErrorFact::fixed("a mount below the harness directory"));
+                left.push("a mount below the harness directory");
+            } else if let Err(error) = fs::remove_dir_all(root) {
+                steps.push(ErrorFact::io("remove the harness directory", &error));
+                left.push("the harness directory");
+            } else if fs::symlink_metadata(root).is_ok() { left.push("the harness directory"); }
         }
+        // P2: the employee image is left over only if one of its objects still
+        // exists (or cannot be shown absent) now.
+        if let Some(storage) = &self.image_storage { left.extend(image_leftovers(&image_objects(storage))); }
         // Verification of what must no longer exist.
         if let (Some(systemd), Some(run)) = (&self.systemd, self.run) {
             if systemd.list_runs().map_or(true, |runs| runs.contains(&run.0)) { left.push("the systemd run unit"); }
@@ -865,11 +1049,12 @@ impl Teardown {
                     if !selection.kill.is_empty() { left.push(LEFT_RUN_PROCESSES); }
                     if !selection.foreign.is_empty() { left.push(FOREIGN_UID_PROCESS); }
                 }
-                Err(_) => left.push(LEFT_UNSCANNED),
+                Err(error) => { steps.push(ErrorFact::io("verify the temporary uid's processes", &error)); left.push(LEFT_UNSCANNED); }
             }
         }
         if let Some(root) = &self.root { if fs::symlink_metadata(root).is_ok() { left.push("the harness directory"); } }
         self.systemd = None;
+        self.steps = steps;
         left.sort_unstable();
         left.dedup();
         if left.is_empty() { return Ok(()); }
@@ -887,8 +1072,16 @@ impl Drop for Teardown {
 // ── the run ─────────────────────────────────────────────────────────────
 
 /// Launch, converse, observe, tear down. `Err` for anything that prevented
-/// observing (with tear-down already verified); `Ok` carries the facts.
-pub(super) fn run(prepared: &Prepared, trampoline: &Path, trampoline_sha256: Sha256Digest) -> Checked<Outcome> {
+/// observing (with tear-down already verified); `Ok` carries the facts. The
+/// [`Diagnosis`] is always collected (printed by `accept` only when it exits
+/// non-zero); collecting it changes nothing the decision reads.
+pub(super) fn run(prepared: &Prepared, trampoline: &Path, trampoline_sha256: Sha256Digest) -> (Checked<Outcome>, Diagnosis) {
+    let mut diagnosis = Diagnosis::default();
+    let result = run_diagnosed(prepared, trampoline, trampoline_sha256, &mut diagnosis);
+    (result, diagnosis)
+}
+fn run_diagnosed(prepared: &Prepared, trampoline: &Path, trampoline_sha256: Sha256Digest, diagnosis: &mut Diagnosis)
+    -> Checked<Outcome> {
     // The gates once more against the real process (tests inject facts).
     if unsafe { libc::geteuid() } != 0 || unsafe { libc::getegid() } != 0 { return Err(refusal::NOT_ROOT.into()); }
     if std::env::var_os(DISPOSABLE_ENV).is_none_or(|value| value.as_os_str() != std::ffi::OsStr::new("1")) {
@@ -907,11 +1100,19 @@ pub(super) fn run(prepared: &Prepared, trampoline: &Path, trampoline_sha256: Sha
         || unsafe { libc::mount(std::ptr::null(), c"/".as_ptr(), std::ptr::null(), libc::MS_REC | libc::MS_PRIVATE, std::ptr::null()) } != 0 {
         return Err("accept: not supported on this host: no private mount namespace".into());
     }
+    let _ = take_noted();
     let mut teardown = Teardown::default();
-    let result = launch(prepared, trampoline, trampoline_sha256, &signals, &mut teardown);
+    let mut streams = Streams::default();
+    let result = launch(prepared, trampoline, trampoline_sha256, &signals, &mut teardown, diagnosis, &mut streams);
+    if let Ok(outcome) = &result { diagnosis.incomplete = outcome.observations.incomplete; }
+    // Before the tear-down resets and unloads the unit.
+    collect(diagnosis, &teardown, &streams);
     let cleaned = teardown.finish();
+    diagnosis.teardown = std::mem::take(&mut teardown.steps);
+    drop(streams);
     match (result, cleaned) {
-        (_, Err(leftover)) => Err(leftover),
+        (Ok(_), Err(leftover)) => { diagnosis.phase = HarnessPhase::Teardown; Err(leftover) }
+        (Err(_), Err(leftover)) => Err(leftover),
         (result, Ok(())) => result,
     }
 }
@@ -920,18 +1121,22 @@ const UID_TAKEN: &str = "accept: refused: a temporary uid (employee, supervisor 
     or a process before the launch";
 const TRAMPOLINE_COPY: &str = "accept: the root-owned trampoline copy is not --trampoline-sha256";
 
-fn launch(prepared: &Prepared, trampoline_source: &Path, trampoline_sha256: Sha256Digest, signals: &Signals, t: &mut Teardown)
-    -> Checked<Outcome> {
+#[allow(clippy::too_many_arguments)]
+fn launch(prepared: &Prepared, trampoline_source: &Path, trampoline_sha256: Sha256Digest, signals: &Signals, t: &mut Teardown,
+    d: &mut Diagnosis, streams: &mut Streams) -> Checked<Outcome> {
+    d.phase = HarnessPhase::Prepare;
     let record = prepared.record();
     let native = prepared.native();
     let egress = matches!(record.network, NetworkPolicy::Egress(_));
-    let ExecutableRecord::Elf { entry, .. } = &record.executable else { return Err("accept: ELF runtimes only".into()) };
+    let ExecutableRecord::Elf { entry, .. } = &record.executable else { return Err(fixed_error("ELF runtimes only")) };
     // Identities and the harness directory.
     let uid = temporary_employee_uid()?;
     t.uid = Some(uid);
     let (supervisor, gateway_uid) = temporary_service_uids()?;
     let employee = EmployeeId(random16()?);
     let run = RunHandle(duduclaw_isolation::ids::RunId(random16()?));
+    d.employee = Some(employee.0);
+    d.run = Some(run.0.0);
     let root = PathBuf::from(format!("/var/lib/duduclaw-acceptance-{}", hex(&random16()?)));
     // F5: the guard owns the directory from the moment it exists.
     make_registered_dir(&root, 0o700, |path| t.root = Some(path.to_path_buf()), |path| secure_dir(path, 0o700))
@@ -952,24 +1157,34 @@ fn launch(prepared: &Prepared, trampoline_source: &Path, trampoline_sha256: Sha2
     let launcher_path = root.join("launcher").join("duduclaw-run");
     install_copy(trampoline_source, &launcher_path, Some(trampoline_sha256))?;
     if File::open(&launcher_path).and_then(digest_file).map_err(os_error("trampoline copy"))? != trampoline_sha256 {
+        note(ErrorFact::fixed("the trampoline copy is not --trampoline-sha256"));
         return Err(TRAMPOLINE_COPY.into());
     }
     let launcher_text = launcher_path.to_str().ok_or("accept: harness path is not UTF-8")?.to_owned();
     t.systemd = Some(crate::systemd::linux::Systemd::connect().map_err(os_error("system bus"))?);
 
     // H storage: provision, the employee's provider document (R8r-2 path), usage, attach.
+    d.phase = HarnessPhase::Storage;
+    t.image_storage = Some(root.join("storage"));
     t.storage = Some(LoopStorage::open_diagnosed(&root.join("storage"), &root.join("storage-journal"))
-        .map_err(|reason| format!("accept: not supported on this host: employee storage ({reason})"))?);
+        .map_err(|reason| { note(ErrorFact::fixed("employee storage open")); format!("accept: not supported on this host: employee storage ({reason})") })?);
     let operation = duduclaw_isolation::ids::RequestId(random16()?);
     let proposal = Sha256Digest(random32()?);
+    // P2: the tear-down's destroy is its own operation. H's ledger refuses a
+    // destroy that reuses the provision's operation id (`Journal::validate`:
+    // every operation id once), which left the ledger entry behind.
+    let destroy_operation = duduclaw_isolation::ids::RequestId(random16()?);
+    let destroy_proposal = Sha256Digest(random32()?);
+    if destroy_operation == operation { return Err(fixed_error("getrandom repeated an operation id")); }
+    // Registered before provision: a provision that fails half-way is destroyed too.
+    t.provisioned = Some((employee, destroy_operation, destroy_proposal));
     let storage = t.storage.as_mut().ok_or("accept: storage")?;
     storage.provision(&ProvisionRequest { employee, uid, operation_id: operation, proposal_digest: proposal,
         quota: record.resources.disk.clone() }).map_err(refused("employee storage provision"))?;
-    t.provisioned = Some((employee, operation, proposal));
     let mut providers = providers_document()?;
     let written = storage.write_providers(employee, uid, ProvidersChange::Write(&providers));
     providers.fill(0);
-    written.map_err(|failure| format!("accept: provider document refused ({failure:?})"))?;
+    written.map_err(|failure| { note(ErrorFact::fixed("provider document write")); format!("accept: provider document refused ({failure:?})") })?;
 
     let mut publication = AcceptancePublication { policy: &prepared.policy, manifest: &prepared.manifest, arch: prepared.arch,
         employee, profile: record.profile, root: root.clone(), supervisor: (supervisor, supervisor), gateway_uid,
@@ -986,6 +1201,7 @@ fn launch(prepared: &Prepared, trampoline_source: &Path, trampoline_sha256: Sha2
     let receipt = attached.receipt.clone();
     let decoys_planted = plant_decoys(attached.home.as_fd(), uid).map_err(os_error("decoys"))?;
     t.attached = Some(attached);
+    d.phase = HarnessPhase::Projection;
     let pair = crate::channels::RevocablePair::new().map_err(os_error("MCP socketpair"))?;
     let (gateway_end, runtime_end) = (pair.gateway, pair.runtime);
     // The runtime-side endpoint's identity, recorded BEFORE the launch.
@@ -997,6 +1213,10 @@ fn launch(prepared: &Prepared, trampoline_source: &Path, trampoline_sha256: Sha2
     } else { (None, None) };
     let (stdout_read, stdout_write) = pipe()?;
     let (stderr_read, stderr_write) = pipe()?;
+    // The read ends stay with `run` until after the tear-down (diagnosis).
+    let (stdout_fd, stderr_fd) = (stdout_read.as_raw_fd(), stderr_read.as_raw_fd());
+    streams.stdout = Some(stdout_read);
+    streams.stderr = Some(stderr_read);
     let (stdin_read, stdin_write) = pipe()?;
     let request = worker_request();
     File::from(stdin_write).write_all(&request).map_err(os_error("stdin"))?;
@@ -1014,6 +1234,7 @@ fn launch(prepared: &Prepared, trampoline_source: &Path, trampoline_sha256: Sha2
     let mounts = crate::bootstrap_mounts::prepare(&plan, attached, &anchors).map_err(os_error("bootstrap_mounts::prepare"))?;
     publication.record_mcp_projection(&plan, &runtime, &mounts).map_err(refused("record_mcp_projection"))?;
     let native_profile = publication.native_profile(&runtime).map_err(refused("native_profile"))?;
+    d.phase = HarnessPhase::Seal;
     let sealed = plan.seal().map_err(refused("plan seal"))?;
     t.run = Some(run);
     let trampoline = t.trampoline.insert(crate::native_trampoline::NativeTrampoline::default());
@@ -1028,17 +1249,22 @@ fn launch(prepared: &Prepared, trampoline_source: &Path, trampoline_sha256: Sha2
     t.slice = Some(slice_name.clone());
     // F3: the numbers are re-checked immediately before the launch; a process
     // that took one meanwhile is never adopted (nor signalled) by this run.
-    if !number_free(uid) || !number_free(supervisor) || !number_free(gateway_uid) { return Err(UID_TAKEN.into()); }
+    d.phase = HarnessPhase::StartUnit;
+    if !number_free(uid) || !number_free(supervisor) || !number_free(gateway_uid) {
+        note(ErrorFact::fixed("a temporary uid was taken before the launch"));
+        return Err(UID_TAKEN.into());
+    }
     let systemd = t.systemd.as_ref().ok_or("accept: system bus")?;
     let unit = systemd.start_acceptance(&unit_policy, &launcher_text, bootstrap.bootstrap_for_unit.as_fd(),
         stdout_write.as_fd(), stderr_write.as_fd()).map_err(os_error("transient run unit"))?;
     t.cgroup = Some(unit.cgroup.clone());
-    let unit_cgroup = format!("/{}", unit.cgroup.strip_prefix("/sys/fs/cgroup").map_err(|_| "accept: run cgroup".to_owned())?.display());
+    let unit_cgroup = format!("/{}", unit.cgroup.strip_prefix("/sys/fs/cgroup").map_err(|_| fixed_error("run cgroup outside cgroupfs"))?.display());
     t.run_cgroups = run_cgroups(&unit_cgroup, &slice_name);
     // The launcher process, bound by a pidfd: PID 1's MainPID of this unit,
     // in its cgroup, executing the trampoline copy.
     let main_pid = systemd.acceptance_main_pid(&unit).map_err(os_error("MainPID"))?;
-    let launcher = pin(main_pid, None).map_err(os_error("launcher pidfd"))?.ok_or("accept: the trampoline exited before the bootstrap")?;
+    let launcher = pin(main_pid, None).map_err(os_error("launcher pidfd"))?
+        .ok_or_else(|| fixed_error("the trampoline exited before the bootstrap"))?;
     let launcher_exe = exe_digest(main_pid).ok().filter(|_| cgroup_member(main_pid, &unit_cgroup) && alive(&launcher));
     // F2: who may live in the run cgroup, and the bounds of a complete walk
     // (the unit's TasksMax is the record's task limit).
@@ -1050,12 +1276,22 @@ fn launch(prepared: &Prepared, trampoline_source: &Path, trampoline_sha256: Sha2
     let cancelled = Arc::new(AtomicBool::new(false));
     t.cancelled = Some(cancelled.clone());
     let trampoline = t.trampoline.as_mut().ok_or("accept: trampoline")?;
+    d.phase = HarnessPhase::BindUnit;
+    // Diagnosis: a trampoline that fails before its challenge sends an error
+    // record instead, which `bind_unit` consumes as a bad challenge. Wait for
+    // the first packet as `bind_unit` would (same bound) and PEEK it.
+    if let Some(socket) = trampoline.acceptance_status_socket(run) {
+        let bound = i32::try_from(duduclaw_isolation::ipc::CONTROL_TIMEOUT_MS).unwrap_or(i32::MAX);
+        readable(socket.as_raw_fd(), bound);
+        note_status(d, peek_status(socket));
+    }
     trampoline.bind_unit(run, &unit, cancelled).map_err(refused("NativeTrampoline::bind_unit"))?;
     drop(bootstrap);
     drop((stdout_write, stderr_write));
 
     // The conversation: the harness is the gateway end of descriptor 3.
-    for fd in [gateway_end.as_raw_fd(), stdout_read.as_raw_fd(), stderr_read.as_raw_fd()] { set_nonblocking(fd)?; }
+    d.phase = HarnessPhase::AwaitInitialize;
+    for fd in [gateway_end.as_raw_fd(), stdout_fd, stderr_fd] { set_nonblocking(fd)?; }
     let deadline = Instant::now() + CONVERSATION_LIMIT;
     let mut responder = Responder::default();
     let mut census = Census::default();
@@ -1065,8 +1301,13 @@ fn launch(prepared: &Prepared, trampoline_source: &Path, trampoline_sha256: Sha2
     let mut buffer = vec![0u8; 64 * 1024];
     let mut failure: Option<&'static str> = None;
     while run_end.is_none() {
-        if signals.pending() { return Err(INTERRUPTED.into()); }
+        d.phase = if responder.complete() { HarnessPhase::AwaitExit }
+            else if tree.is_some() { HarnessPhase::AwaitToolsList } else { HarnessPhase::AwaitInitialize };
+        if signals.pending() { note(ErrorFact::fixed("interrupted by a signal")); return Err(INTERRUPTED.into()); }
         if Instant::now() >= deadline { break; }
+        // Diagnosis: `poll` reduces an error record to `IsolationUnavailable`;
+        // the head packet is peeked first (never consumed).
+        if d.status_error.is_none() { note_status(d, trampoline.acceptance_status_socket(run).and_then(peek_status)); }
         match trampoline.poll(run) {
             Ok(crate::admission::HostProgress::Ended(outcome)) => run_end = Some(match outcome {
                 duduclaw_isolation::execution::RunOutcome::Exited(code) => format!("exited {code}"),
@@ -1094,6 +1335,7 @@ fn launch(prepared: &Prepared, trampoline_source: &Path, trampoline_sha256: Sha2
                     if !reply.is_empty() { send_all(gateway_end.as_raw_fd(), &reply, deadline).map_err(os_error("MCP socket"))?; }
                     if responder.initialize_held() && tree.is_none() {
                         // Facts a and b, while the reply is withheld.
+                        d.phase = HarnessPhase::Observe;
                         tree = Some(observe(&launcher, &unit.cgroup, &unit_cgroup, socket, &ids, &limits, &mut census, &mut cache));
                         let reply = match responder.release_initialize(true) {
                             Ok(reply) => reply,
@@ -1105,11 +1347,16 @@ fn launch(prepared: &Prepared, trampoline_source: &Path, trampoline_sha256: Sha2
                 None => {}
             }
         }
-        for fd in [stdout_read.as_raw_fd(), stderr_read.as_raw_fd()] {
-            // Drained and discarded: the worker's output is not evidence.
-            while matches!(read_some(fd, &mut buffer), Ok(Some(count)) if count > 0) {}
+        for (fd, tail) in [(stdout_fd, &mut d.stdout), (stderr_fd, &mut d.stderr)] {
+            // Drained; only the bounded tail is kept, for the diagnosis: the
+            // worker's output is not evidence.
+            while let Ok(Some(count)) = read_some(fd, &mut buffer) {
+                if count == 0 { break; }
+                tail.push(&buffer[..count]);
+            }
         }
     }
+    if failure.is_none() { d.phase = HarnessPhase::AwaitExit; }
     // The run must end: after the conversation by itself (its provider call
     // cannot succeed), otherwise the harness stops the unit.
     if run_end.is_none() {
@@ -1117,13 +1364,14 @@ fn launch(prepared: &Prepared, trampoline_source: &Path, trampoline_sha256: Sha2
         run_end = Some(if responder.complete() { "killed by the harness after the MCP conversation".into() }
             else { "killed by the harness before the MCP conversation completed".into() });
     }
+    d.run_end = run_end.clone();
     if !wait_until(Duration::from_secs(10), || cgroup_empty(&unit.cgroup)) {
-        return Err("accept: the run cgroup did not become empty".into());
+        return Err(fixed_error("the run cgroup did not become empty"));
     }
     if !wait_until(Duration::from_secs(10), || readable(launcher.fd.as_raw_fd(), 0)) {
-        return Err("accept: the trampoline process did not exit".into());
+        return Err(fixed_error("the trampoline process did not exit"));
     }
-    if let Some(reason) = failure { return Err(format!("accept: no record written: {reason}")); }
+    if let Some(reason) = failure { note(ErrorFact::fixed(reason)); return Err(format!("accept: no record written: {reason}")); }
 
     // Fact d's structural half: the projection file handed to B2 is the
     // byte-exact projection and the only configuration the worker accepts.
@@ -1145,7 +1393,7 @@ fn launch(prepared: &Prepared, trampoline_source: &Path, trampoline_sha256: Sha2
     let observations = Observations { uid, socket, runtime_digest: prepared.runtime_digest, bridge_digest: prepared.bridge_digest,
         trampoline_digest: trampoline_sha256, launcher_exe_sha256: launcher_exe, runtime: tree.runtime, runtime_fd3: tree.fd3,
         bridge: tree.bridge, initialize: responder.facts(), exclusive, run_end: run_end.unwrap_or_default(), incomplete };
-    t.descriptors.extend([gateway_end, stdout_read, stderr_read]);
+    t.descriptors.push(gateway_end);
     t.descriptors.extend(egress_gateway);
     Ok(Outcome { frames: responder.frames().to_vec(), observations, trampoline_sha256, kernel: kernel_release() })
 }
