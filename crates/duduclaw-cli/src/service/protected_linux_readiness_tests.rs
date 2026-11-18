@@ -842,8 +842,7 @@ fn service_protected_readiness_parse_lease_required() {
     assert_eq!(failures(&findings), [(Item::ParseWorker, "retirement_lease_unavailable")]);
     let (lines, failed, _) = render(&findings);
     assert_eq!(failed, 1);
-    assert!(lines.iter().any(|line| line.contains("文件解析服務")
-        && line.contains("/run/duduclaw-parse/retirement.lease")));
+    assert!(lines.iter().any(|line| line == &format!("  - {MSG_PARSE_LEASE}")));
     fake.lease = true;
     assert!(failures(&fake.assess()).is_empty());
 }

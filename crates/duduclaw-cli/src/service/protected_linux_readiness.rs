@@ -111,6 +111,7 @@ const MSG_DNS_BROKER_UNHEALTHY: &str = "DNS 轉送服務沒有在時限內回應
 const MSG_SECOND_LAYER: &str = "第二層 IP 過濾不可用。";
 const MSG_CLOUD_ADDRESS: &str = "偵測到雲端主機，但未設定主機的公開位址；若主機使用 1:1 NAT，員工可能連得到本機的公開 IP。";
 const MSG_PARSE: &str = "文件解析服務未就緒。";
+const MSG_PARSE_LEASE: &str = "文件解析服務的退役租約檔不存在，或擁有者與權限不符。";
 const MSG_TRUST: &str = "更新信任根無法驗證，需要人工修復。";
 const MSG_TRUST_FROZEN: &str = "更新信任根已凍結；解除凍結前不會套用新版本。";
 const MSG_MIGRATION_UNREADABLE: &str = "資料遷移進度無法驗證。";
@@ -490,7 +491,7 @@ fn egress_findings(sources: &mut dyn HostSources, evidence: Option<&HostEvidence
 // #7: the socket; the executable is compared in #3.
 fn parse_findings(sources: &mut dyn HostSources, out: &mut Vec<Finding>) {
     if sources.parse_lease().is_err() {
-        out.push(Finding::failed(Item::ParseWorker, "retirement_lease_unavailable", parse_lease::INVALID));
+        out.push(Finding::failed(Item::ParseWorker, "retirement_lease_unavailable", MSG_PARSE_LEASE));
     }
     if sources.unit_active("duduclaw-parse.socket").is_err() {
         out.push(Finding::failed(Item::ParseWorker, "parse_worker_inactive", MSG_PARSE));
