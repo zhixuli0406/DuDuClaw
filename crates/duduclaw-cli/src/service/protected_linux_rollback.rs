@@ -671,14 +671,21 @@ fn clear_contents(entry: &Entry, boot_id: &str) -> Result<bool> {
             let data = open_directory_at(&parent, &name)?;
             let opened = ledger::stat_at(data.as_raw_fd(), c"")?;
             if entry.identity.as_ref().is_none_or(|identity| identity.inode != opened.inode) { return Ok(true); }
-            for child in boot::directory_names(&data, MAX_DIRECTORY_ENTRIES)? {
-                if child.to_str().is_ok_and(|child| entry.keep.iter().any(|keep| keep == child)) { continue; }
-                remove_below(&data, &child)?;
-            }
-            data.sync_all()?;
+            clear_unkept(&data, &entry.keep)?;
             Ok(false)
         }
     }
+}
+
+/// Everything in the opened gateway data directory `data` except the names
+/// in `keep` (the snapshot recorded once, before this install's gateway first started).
+pub(super) fn clear_unkept(data: &fs::File, keep: &[String]) -> Result<()> {
+    for child in boot::directory_names(data, MAX_DIRECTORY_ENTRIES)? {
+        if child.to_str().is_ok_and(|child| keep.iter().any(|keep| keep == child)) { continue; }
+        remove_below(data, &child)?;
+    }
+    data.sync_all()?;
+    Ok(())
 }
 
 fn open_directory_at(parent: &fs::File, name: &CStr) -> Result<fs::File> {

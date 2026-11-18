@@ -881,10 +881,23 @@ impl<H: LedgerHost> Recorder<H> {
         self.save(next)
     }
 
-    /// The gateway data snapshot (S8, before the gateway can first start). The
-    /// first snapshot stands for the life of the transaction.
-    pub(super) fn contents(&mut self, path: &str, keep: Vec<String>) -> Result<()> {
-        if self.ledger.entry(path).is_some() { return Ok(()); }
+    /// The gateway data snapshot (S6, before the gateway of this install can
+    /// first start). The first snapshot stands for the life of the transaction:
+    /// the entry at `path` exists exactly when its keep list (possibly empty)
+    /// was recorded (only `Kind::Contents` is permitted there, always written
+    /// `created` with an identity, and no writer removes an entry). Once it
+    /// exists, `names` — the listing of the directory — is NOT called: a
+    /// resumed step never re-derives the keep list from what the gateway
+    /// created since. Otherwise `names` is called (its refusal, e.g. too many
+    /// names before the gateway ever ran, refuses) and the result is made
+    /// durable before this returns.
+    pub(super) fn contents(&mut self, path: &str, names: impl FnOnce() -> Result<Vec<String>>) -> Result<()> {
+        match self.ledger.entry(path) {
+            Some(entry) if entry.kind == Kind::Contents => return Ok(()),
+            Some(_) => return Err(refused(LEDGER_DAMAGED)),
+            None => (),
+        }
+        let keep = names()?;
         let identity = self.host.identity(path, Kind::Contents)?.ok_or_else(|| refused("Gateway 資料目錄不存在。"))?;
         let mut next = self.ledger.clone();
         next.entries.push(Entry { path: path.to_owned(), kind: Kind::Contents, state: State::Created,
@@ -966,6 +979,8 @@ mod tests {
             mutate(|v| v["entries"][0]["identity"]["boot_id"] = "x".into()),
             mutate(|v| v["entries"][0]["keep"] = serde_json::json!(["a"])),
             mutate(|v| v["entries"][2]["keep"] = serde_json::json!(["../x"])),
+            // R7d: "recorded" is the entry itself; no marker field exists.
+            mutate(|v| v["entries"][2]["keep_recorded"] = true.into()),
             mutate(|v| v["entries"][0]["state"] = "deleted".into()),
             b"[]".to_vec(), Vec::new()] {
             assert!(Ledger::parse(&bad).is_err(), "{}", String::from_utf8_lossy(&bad));
@@ -1075,6 +1090,113 @@ mod tests {
         recorder.intend(&[(UNIT_PATH, Kind::File)]).unwrap();
         let entry = recorder.ledger().entry(UNIT_PATH).unwrap().clone();
         assert_eq!((entry.state, entry.identity.is_some()), (State::Intent, true));
+    }
+
+    /// S6's listing of the gateway data (`first_gateway_start`): bounded at 64 names.
+    fn listed(directory: &Path) -> Result<Vec<String>> {
+        let data = fs::File::open(directory)?;
+        boot::directory_names(&data, 64)?.into_iter()
+            .map(|name| name.into_string().map_err(|_| refused("name")))
+            .collect()
+    }
+
+    fn fill(directory: &Path, prefix: &str, count: usize) {
+        for index in 0..count { fs::write(directory.join(format!("{prefix}{index}")), b"x").unwrap(); }
+    }
+
+    fn names(directory: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(directory).unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap()).collect();
+        names.sort();
+        names
+    }
+
+    /// Rollback's clearing of the gateway data (one mount throughout).
+    fn roll_back_contents(directory: &Path, ledger: &Ledger) {
+        let keep = ledger.entry(GATEWAY_DATA_PATH).unwrap().keep.clone();
+        MOUNT_ID_SEAM.with(|seam| *seam.borrow_mut() = Some(Box::new(|_: &CStr, _: Option<u64>| Some(1))));
+        let cleared = super::super::rollback::clear_unkept(&fs::File::open(directory).unwrap(), &keep);
+        MOUNT_ID_SEAM.with(|seam| *seam.borrow_mut() = None);
+        cleared.unwrap();
+    }
+
+    fn never_listed() -> Result<Vec<String>> { panic!("the gateway data was listed again on resume") }
+
+    /// Real host (R7d): the keep list of the gateway data is captured exactly
+    /// once per install, before this install's gateway first started. A
+    /// resumed S6 (the gateway ran and wrote its data meanwhile) finds it in
+    /// the durable ledger and never lists the directory again — with more
+    /// names than the limit or fewer — and rollback keeps exactly the names
+    /// recorded first.
+    #[test]
+    fn gateway_keep_list_is_captured_once_and_never_relisted() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path();
+        fs::write(data.join("license.json"), b"{}").unwrap();
+        let world = Rc::new(RefCell::new(World::default()));
+        world.borrow_mut().put(GATEWAY_DATA_PATH, identity(Kind::Contents, 9));
+        let mut recorder = open(&world);
+        // First pass: exactly the pre-existing names, durable when `contents` returns
+        // (before `systemctl start`).
+        recorder.contents(GATEWAY_DATA_PATH, || listed(data)).unwrap();
+        let recorded = recorder.ledger().clone();
+        let entry = recorded.entry(GATEWAY_DATA_PATH).unwrap();
+        assert_eq!((entry.state, entry.keep.clone()), (State::Created, vec!["license.json".to_owned()]));
+        assert_eq!(world.borrow().saved.last(), Some(&recorded));
+        // The strict parser accepts what was written.
+        assert_eq!(Ledger::parse(&serde_json::to_vec(&recorded).unwrap()).unwrap(), recorded);
+        // The gateway started and created 84 entries; a later failure in S6 made
+        // the operator re-run the install: a new run over the durable ledger.
+        fill(data, "gateway-", 84);
+        assert!(listed(data).is_err(), "above the listing limit");
+        let saves = world.borrow().saved.len();
+        let mut resumed = Recorder::open(FakeHost(world.clone()), Some(recorded.clone()), &"cd".repeat(32), &nonce()).unwrap();
+        resumed.contents(GATEWAY_DATA_PATH, || listed(data)).unwrap();
+        resumed.contents(GATEWAY_DATA_PATH, never_listed).unwrap();
+        assert_eq!(resumed.ledger(), &recorded);
+        // Below the limit: likewise never re-derived (the keep list is not widened).
+        for index in 0..80 { fs::remove_file(data.join(format!("gateway-{index}"))).unwrap(); }
+        assert_eq!(listed(data).unwrap().len(), 5);
+        resumed.contents(GATEWAY_DATA_PATH, || listed(data)).unwrap();
+        assert_eq!(resumed.ledger(), &recorded);
+        assert_eq!(world.borrow().saved.len(), saves, "nothing written on resume");
+        // Rollback after the resume keeps exactly the originally recorded names.
+        roll_back_contents(data, resumed.ledger());
+        assert_eq!(names(data), vec!["license.json".to_owned()]);
+    }
+
+    /// R7d: an empty pre-existing directory is "recorded, empty" (the entry
+    /// exists) and is not re-listed on resume; more than the limit of names
+    /// before this install's gateway ever ran still refuses (nothing recorded).
+    #[test]
+    fn gateway_keep_list_empty_is_recorded_and_first_pass_over_limit_refuses() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path();
+        let world = Rc::new(RefCell::new(World::default()));
+        world.borrow_mut().put(GATEWAY_DATA_PATH, identity(Kind::Contents, 9));
+        let mut recorder = open(&world);
+        fill(data, "foreign-", 65);
+        let saves = world.borrow().saved.len();
+        assert!(recorder.contents(GATEWAY_DATA_PATH, || listed(data)).is_err());
+        assert!(recorder.ledger().entry(GATEWAY_DATA_PATH).is_none());
+        assert_eq!(world.borrow().saved.len(), saves, "nothing written");
+        // The same run once the directory is empty: recorded, empty.
+        for index in 0..65 { fs::remove_file(data.join(format!("foreign-{index}"))).unwrap(); }
+        recorder.contents(GATEWAY_DATA_PATH, || listed(data)).unwrap();
+        let recorded = recorder.ledger().clone();
+        let entry = recorded.entry(GATEWAY_DATA_PATH).unwrap();
+        assert!(entry.keep.is_empty() && entry.state == State::Created && entry.identity.is_some());
+        let parsed = Ledger::parse(&serde_json::to_vec(&recorded).unwrap()).unwrap();
+        assert_eq!(parsed, recorded);
+        // Resumed after the gateway wrote its data: not re-listed, still empty.
+        fill(data, "gateway-", 84);
+        let mut resumed = Recorder::open(FakeHost(world.clone()), Some(parsed), &"cd".repeat(32), &nonce()).unwrap();
+        resumed.contents(GATEWAY_DATA_PATH, never_listed).unwrap();
+        resumed.contents(GATEWAY_DATA_PATH, || listed(data)).unwrap();
+        assert_eq!(resumed.ledger(), &recorded);
+        // Rollback removes everything the gateway created.
+        roll_back_contents(data, resumed.ledger());
+        assert!(names(data).is_empty());
     }
 
     #[test]
