@@ -60,14 +60,23 @@ seccomp policy. The production policy content is a later, owner-reviewed step
 
 ### `--accept-mcp`: MCP acceptance of the api worker (v1.83 R8r-4)
 
-`bundle --accept-mcp` (default off) adds a step between 1 and 2: the snapshot's
-`duduclaw-run` is copied to the policy work directory too, and every
-`open_ai_compat` runtime of the source goes through `duduclaw-isolation-policy
-accept` (`sudo -n env DUDUCLAW_ISO_DISPOSABLE=1 …`, without sudo when already root),
-each producing `<work>/acceptance/<label>/{transcript.jsonl,acceptance-manifest.json}`
-and the next accepted source (chained, one per label). Step 2 then builds from the
-last accepted source, step 4 adds `--evidence-dir <work>/acceptance`, and after
-step 4 the evidence is copied to `<out>/TEST-runtime/acceptance-evidence/<label>/`.
+`bundle --accept-mcp` (default off) adds a step between 1 and 2. The
+snapshot's `duduclaw-run` (the file the packager later signs as the manifest's
+trampoline entry) is also copied to the policy work directory. Its SHA-256 is
+hashed during the copy and re-checked on the copy. The signed manifest cannot
+exist yet, because it signs the policy these runs produce. Every
+`open_ai_compat` runtime of the source then goes through
+`duduclaw-isolation-policy accept --trampoline <copy> --trampoline-sha256
+<that digest>` (`sudo -n env DUDUCLAW_ISO_DISPOSABLE=1 …`, without sudo when
+already root). Each run produces
+`<work>/acceptance/<label>/{transcript.jsonl,acceptance-manifest.json}` and the
+next accepted source (chained, one per label). Step 2 then builds from the last
+accepted source. Step 4 adds `--evidence-dir <work>/acceptance --harness-sha256
+<sha256 of the policy tool that ran accept>` to the verify against the signed
+manifest. That verify parses the evidence strictly, replays the transcript and
+re-runs the decision. It also proves that the evidence's trampoline, runtime
+and bridge are the signed manifest's entries. After step 4 the evidence is
+copied to `<out>/TEST-runtime/acceptance-evidence/<label>/`.
 That copy happens after packaging: the packager reads only the
 `runtime-<registry_id>` files of `TEST-runtime`, and the migration bundle packs only
 the bootstrap inbox, so the evidence is never signed or packaged product content.
@@ -84,6 +93,29 @@ what the signed record then states. With the record, spawnd no longer refuses th
 fixture runtime at MCP preparation; the TEST syscall lists still say nothing about a
 production seccomp policy. Any change of the runtime binary, version, arguments,
 resource limits or syscall lists requires running `--accept-mcp` again.
+
+The harness signals only processes inside its own run cgroup and employee slice.
+A process with the temporary uid anywhere else is never touched and fails the run
+(`foreign_uid_process`). Any process in the run cgroup that is not the trampoline,
+forwarder, runtime or bridge in its documented place fails the run, and so does
+any observation it could not complete (`crates/duduclaw-spawnd/README.md`, MCP
+acceptance harness, "Completeness"). That README section also lists how the
+harness launch differs from a production launch.
+
+**`sudo -n` on a tool built by the invoking user is acceptable only on this
+disposable TEST VM.** That user, or anyone who can write the build tree or its
+parent directories, effectively has root there and could shape the evidence. The
+release signing ceremony does not use this script's build. It builds the tool
+from a clean checkout of a pinned source archive, installs it root-owned and
+records its digest, runs `accept` only from root-owned directories (never under a
+parent writable by an untrusted user), stores the evidence separately, and
+verifies it with `verify --manifest <signed manifest> --evidence-dir <dir>
+--harness-sha256 <recorded digest>`.
+
+After any change to the harness, trampoline, api worker, bridge, unit properties
+or the trampoline's process structure, re-run `bundle --accept-mcp` on a real
+disposable host. That run ends with the signed-manifest verify. Unit tests do
+not replace it.
 
 ## Connector acceptance (`connectors-acceptance.sh`)
 

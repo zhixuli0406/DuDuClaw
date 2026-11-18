@@ -43,10 +43,12 @@ const USAGE: &str = "usage:
   duduclaw-isolation-policy build  --source <policy-source.json> --artifacts-dir <dir> --arch <x86_64|aarch64>
                                    --out <new policy.json> [--manifest <manifest.json>]
   duduclaw-isolation-policy verify --policy <policy.json> --artifacts-dir <dir>
-                                   [--manifest <manifest.json>] [--arch <x86_64|aarch64>] [--evidence-dir <dir>]
+                                   [--manifest <manifest.json>] [--arch <x86_64|aarch64>]
+                                   [--evidence-dir <dir> (requires --manifest) [--harness-sha256 <hex>]]
   sudo env DUDUCLAW_ISO_DISPOSABLE=1 duduclaw-isolation-policy accept
                                    --source <policy-source.json> --artifacts-dir <dir> --arch <x86_64|aarch64>
                                    --label <runtime label> --trampoline <duduclaw-run>
+                                   --trampoline-sha256 <hex of the duduclaw-run the release manifest names>
                                    --evidence-dir <new empty dir> --out-source <new file>
                                    (root, disposable host without an isolation installation only)";
 
@@ -671,10 +673,22 @@ pub fn run(args: &[String]) -> std::result::Result<String, (i32, String)> {
             Ok(text + &summary(&policy, &generated.bytes, arch))
         }
         "verify" => {
-            let values = options(rest, &["--policy", "--artifacts-dir", "--manifest", "--arch", "--evidence-dir"]).map_err(usage)?;
+            let values = options(rest, &["--policy", "--artifacts-dir", "--manifest", "--arch", "--evidence-dir", "--harness-sha256"])
+                .map_err(usage)?;
             let get = |key: &str| values.get(key).ok_or_else(|| usage(format!("verify needs {key}")));
             let (policy_path, artifacts) = (get("--policy")?, get("--artifacts-dir")?);
             let manifest = values.get("--manifest").map(Path::new);
+            // R8r-4 review F1: evidence is only ever checked against a release
+            // manifest (its trampoline, runtime and bridge entries).
+            if values.contains_key("--evidence-dir") && manifest.is_none() {
+                return Err((1, accept::EVIDENCE_NEEDS_MANIFEST.to_owned()));
+            }
+            let harness_pin = match values.get("--harness-sha256") {
+                Some(_) if !values.contains_key("--evidence-dir") => return Err(usage("--harness-sha256 needs --evidence-dir".into())),
+                Some(text) => Some(accept::parse_digest_hex(text)
+                    .ok_or_else(|| usage("--harness-sha256 must be 64 lowercase hex characters".into()))?),
+                None => None,
+            };
             let arch = match values.get("--arch") {
                 Some(value) => parse_arch(value).map_err(usage)?,
                 None => match manifest {
@@ -692,7 +706,7 @@ pub fn run(args: &[String]) -> std::result::Result<String, (i32, String)> {
             // R8r-4: with --evidence-dir, every acceptance record must be backed by
             // the harness evidence it names. Without the flag nothing changes.
             let evidence = match values.get("--evidence-dir") {
-                Some(directory) => accept::verify_evidence(&policy, &manifest_document, arch, Path::new(directory))
+                Some(directory) => accept::verify_evidence(&policy, &manifest_document, arch, Path::new(directory), harness_pin)
                     .map_err(|message| (1, message))?,
                 None => String::new(),
             };

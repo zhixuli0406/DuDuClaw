@@ -7,8 +7,11 @@ use serde_json::json;
 const API_WORKER: &str = "\u{7f}ELF TEST api worker bytes";
 const FORWARDER: &str = "\u{7f}ELF TEST egress forwarder bytes";
 const BRIDGE: &str = "\u{7f}ELF TEST mcp bridge bytes";
+const TRAMPOLINE: &str = "\u{7f}ELF TEST trampoline";
 const LABEL: &str = "api-worker-test";
 const UID: u32 = 71_234;
+
+fn trampoline_digest() -> Sha256Digest { sha(TRAMPOLINE.as_bytes()) }
 
 struct Fixture { dir: tempfile::TempDir }
 impl Fixture {
@@ -25,7 +28,7 @@ impl Fixture {
         fs::write(source.join("x86_64.syscalls"), "# TEST-ONLY list\n0-334\n424-467\n").unwrap();
         fs::write(source.join("aarch64.syscalls"), "0-293\n424-467\n").unwrap();
         fs::create_dir(dir.path().join("out")).unwrap();
-        fs::write(dir.path().join("duduclaw-run"), "\u{7f}ELF TEST trampoline").unwrap();
+        fs::write(dir.path().join("duduclaw-run"), TRAMPOLINE).unwrap();
         let fixture = Fixture { dir };
         fixture.write_source(&fixture.source());
         fixture
@@ -61,14 +64,34 @@ impl Fixture {
     fn out_source(&self) -> PathBuf { self.dir.path().join("out").join("accepted.json") }
     fn request(&self) -> Request {
         Request { source: self.source_path(), artifacts: self.artifacts(), arch: Arch::X86_64, label: LABEL.into(),
-            trampoline: self.dir.path().join("duduclaw-run"), evidence: self.evidence(), out_source: self.out_source() }
+            trampoline: self.dir.path().join("duduclaw-run"), trampoline_sha256: trampoline_digest(), evidence: self.evidence(),
+            out_source: self.out_source() }
     }
     fn args(&self) -> Vec<String> {
         let request = self.request();
+        let trampoline_hex = hex(&trampoline_digest().0);
         ["--source", request.source.to_str().unwrap(), "--artifacts-dir", request.artifacts.to_str().unwrap(),
             "--arch", "x86_64", "--label", LABEL, "--trampoline", request.trampoline.to_str().unwrap(),
-            "--evidence-dir", request.evidence.to_str().unwrap(), "--out-source", request.out_source.to_str().unwrap()]
+            "--evidence-dir", request.evidence.to_str().unwrap(), "--out-source", request.out_source.to_str().unwrap(),
+            "--trampoline-sha256", trampoline_hex.as_str()]
             .iter().map(|value| (*value).to_owned()).collect()
+    }
+    /// The release manifest the packager would sign for these artifacts:
+    /// the scanned entries plus the shipped trampoline (F1).
+    fn release(&self) -> ReleaseManifest {
+        let mut manifest = load_manifest(&self.artifacts(), None, Arch::X86_64, false).unwrap();
+        manifest.artifacts.push(ReleaseArtifact { id: "duduclaw-run".into(), sha256: trampoline_digest(),
+            size_bytes: TRAMPOLINE.len() as u64, mode: 0o755, install_target: InstallTarget::Trampoline });
+        manifest
+    }
+    /// [`Self::release`] plus the policy entry, written as a `--manifest` file.
+    fn release_file(&self, policy: &[u8]) -> PathBuf {
+        let mut manifest = self.release();
+        manifest.artifacts.push(ReleaseArtifact { id: "isolation-policy-v1".into(), sha256: sha(policy),
+            size_bytes: policy.len() as u64, mode: 0o444, install_target: InstallTarget::RuntimeEntry { registry_id: POLICY_ID.into() } });
+        let path = self.dir.path().join("release-manifest.json");
+        fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        path
     }
     fn prepared(&self) -> Prepared {
         let raw = fs::read(self.source_path()).unwrap();
@@ -298,7 +321,18 @@ fn valid() -> Observations {
             tools_list_answered: true, refused_frames: 0, frames: 5 },
         exclusive: ExclusiveFacts { projection_bytes_exact: true, projection_is_api_worker_config: true, projection_mount_id: 77,
             decoys_planted: 2, decoy_markers_present: 0, bridge_processes_seen: 1 },
-        run_end: "exited 1".into() }
+        run_end: "exited 1".into(), incomplete: None }
+}
+/// [`valid`] with the fixture's real digests (what a genuine run of it observes).
+fn observed(prepared: &Prepared) -> Observations {
+    let mut o = valid();
+    o.runtime_digest = prepared.runtime_digest;
+    o.bridge_digest = prepared.bridge_digest;
+    o.trampoline_digest = trampoline_digest();
+    o.launcher_exe_sha256 = Some(trampoline_digest());
+    o.runtime.as_mut().unwrap().exe_sha256 = prepared.runtime_digest;
+    o.bridge.as_mut().unwrap().exe_sha256 = prepared.bridge_digest;
+    o
 }
 
 #[test]
@@ -344,6 +378,7 @@ fn every_missing_or_false_fact_means_no_record() {
         ("decoy ran", |o| o.exclusive.decoy_markers_present = 1),
         ("no bridge seen", |o| o.exclusive.bridge_processes_seen = 0),
         ("two bridges", |o| o.exclusive.bridge_processes_seen = 2),
+        ("incomplete observation", |o| o.incomplete = Some(incomplete::UNEXPECTED_PROCESS)),
     ];
     for (name, mutate) in mutations {
         let mut observations = valid();
@@ -354,15 +389,23 @@ fn every_missing_or_false_fact_means_no_record() {
 
 // ── evidence and the record ─────────────────────────────────────────────
 
-fn evidence(prepared: &Prepared) -> (Vec<u8>, Vec<u8>, McpAcceptance) {
-    let transcript = transcript_jsonl(&conversation());
-    let observations = valid();
-    let manifest = evidence_manifest(&EvidenceSummary { arch: Arch::X86_64, harness_sha256: digest(1), trampoline_sha256: digest(2),
-        runtime_sha256: prepared.runtime_digest, bridge_sha256: prepared.bridge_digest,
+/// `(transcript, manifest, record)` of a run with these frames and
+/// observations; `edit` changes the document before it is encoded (the
+/// record then names the edited bytes).
+fn evidence_from(prepared: &Prepared, frames: &[Frame], observations: &Observations, edit: impl FnOnce(&mut EvidenceDocument))
+    -> (Vec<u8>, Vec<u8>, McpAcceptance) {
+    let transcript = transcript_jsonl(frames);
+    let mut document = evidence_document(&EvidenceSummary { arch: Arch::X86_64, harness_sha256: digest(1),
+        trampoline_sha256: trampoline_digest(), runtime_sha256: prepared.runtime_digest, bridge_sha256: prepared.bridge_digest,
         projection_sha256: prepared.projection.digest(), launch_policy_sha256: prepared.launch_policy_digest,
-        transcript_sha256: sha(&transcript), observations: &observations, kernel: "6.8.0-test", finished_unix: 1 });
+        transcript_sha256: sha(&transcript), observations, kernel: "6.8.0-test", finished_unix: 1 });
+    edit(&mut document);
+    let manifest = encode_evidence(&document);
     let record = acceptance_record(prepared, &manifest);
     (transcript, manifest, record)
+}
+fn evidence(prepared: &Prepared) -> (Vec<u8>, Vec<u8>, McpAcceptance) {
+    evidence_from(prepared, &conversation(), &observed(prepared), |_| {})
 }
 
 #[test]
@@ -412,58 +455,477 @@ fn verify_evidence_dir_accepts_only_the_matching_evidence() {
     let (transcript, manifest, record) = evidence(&prepared);
     let out = accepted_source(&raw, &request.source, &request.out_source, LABEL, &record).unwrap();
     let (generated, policy) = build_policy_bytes(&out, &request.out_source, &request.artifacts, Arch::X86_64, None).unwrap();
-    let release = load_manifest(&request.artifacts, None, Arch::X86_64, false).unwrap();
+    let release = fixture.release();
     let evidence_dir = fixture.dir.path().join("evidence");
     let label_dir = evidence_dir.join(LABEL);
     fs::create_dir_all(&label_dir).unwrap();
     fs::write(label_dir.join(TRANSCRIPT_FILE), &transcript).unwrap();
     fs::write(label_dir.join(MANIFEST_FILE), &manifest).unwrap();
-    assert!(verify_evidence(&policy, &release, Arch::X86_64, &evidence_dir).unwrap().contains("1 acceptance record(s)"));
-    // Through the command line, with and without the flag.
+    assert!(verify_evidence(&policy, &release, Arch::X86_64, &evidence_dir, None).unwrap().contains("1 acceptance record(s)"));
+    // Through the command line: --evidence-dir always with the release manifest.
     let policy_path = fixture.dir.path().join("policy.json");
     fs::write(&policy_path, &generated.bytes).unwrap();
+    let release_path = fixture.release_file(&generated.bytes);
     let verify = |extra: &[&str]| {
         let mut args: Vec<String> = ["verify", "--policy", policy_path.to_str().unwrap(), "--artifacts-dir",
-            request.artifacts.to_str().unwrap(), "--arch", "x86_64"].iter().map(|v| (*v).to_owned()).collect();
+            request.artifacts.to_str().unwrap()].iter().map(|v| (*v).to_owned()).collect();
         args.extend(extra.iter().map(|v| (*v).to_owned()));
         super::super::run(&args)
     };
-    assert!(verify(&[]).is_ok());
-    assert!(verify(&["--evidence-dir", evidence_dir.to_str().unwrap()]).unwrap().contains("backed by harness evidence"));
+    let with_manifest = ["--manifest", release_path.to_str().unwrap()];
+    assert!(verify(&["--arch", "x86_64"]).is_ok());
+    assert!(verify(&with_manifest).is_ok(), "{:?}", verify(&with_manifest).err());
+    let evidence_args = ["--manifest", release_path.to_str().unwrap(), "--evidence-dir", evidence_dir.to_str().unwrap()];
+    assert!(verify(&evidence_args).unwrap().contains("backed by harness evidence"));
+    let pin = hex(&digest(1).0);
+    let pinned: Vec<&str> = [&evidence_args[..], &["--harness-sha256", pin.as_str()][..]].concat();
+    assert!(verify(&pinned).unwrap().contains("the pinned harness"));
+    let other_pin = hex(&digest(7).0);
+    let mispinned: Vec<&str> = [&evidence_args[..], &["--harness-sha256", other_pin.as_str()][..]].concat();
+    assert!(verify(&mispinned).err().unwrap().1.contains(evidence_refusal::HARNESS_PIN));
+    let malformed: Vec<&str> = [&evidence_args[..], &["--harness-sha256", "ABC"][..]].concat();
+    assert_eq!(verify(&malformed).err().map(|e| e.0), Some(2));
+    assert_eq!(verify(&["--arch", "x86_64", "--harness-sha256", pin.as_str()]).err().map(|e| e.0), Some(2));
     // No evidence at all.
     let empty = fixture.dir.path().join("empty");
     fs::create_dir(&empty).unwrap();
-    assert_eq!(verify(&["--evidence-dir", empty.to_str().unwrap()]).err().map(|e| e.0), Some(1));
+    assert_eq!(verify(&["--manifest", release_path.to_str().unwrap(), "--evidence-dir", empty.to_str().unwrap()]).err().map(|e| e.0),
+        Some(1));
     // A tampered transcript.
     let mut tampered = transcript.clone();
     tampered[10] ^= 1;
     fs::write(label_dir.join(TRANSCRIPT_FILE), &tampered).unwrap();
-    assert!(verify_evidence(&policy, &release, Arch::X86_64, &evidence_dir).is_err());
+    assert!(verify_evidence(&policy, &release, Arch::X86_64, &evidence_dir, None).is_err());
     fs::write(label_dir.join(TRANSCRIPT_FILE), &transcript).unwrap();
     // A tampered manifest (no longer the record's transcript_digest).
     let mut tampered = manifest.clone();
     let last = tampered.len() - 2;
     tampered[last] ^= 1;
     fs::write(label_dir.join(MANIFEST_FILE), &tampered).unwrap();
-    assert!(verify_evidence(&policy, &release, Arch::X86_64, &evidence_dir).is_err());
+    assert!(verify_evidence(&policy, &release, Arch::X86_64, &evidence_dir, None).is_err());
     fs::write(label_dir.join(MANIFEST_FILE), &manifest).unwrap();
-    assert!(verify_evidence(&policy, &release, Arch::X86_64, &evidence_dir).is_ok());
+    assert!(verify_evidence(&policy, &release, Arch::X86_64, &evidence_dir, None).is_ok());
     // Artifacts whose digests differ from the record and the manifest.
     let accepted = policy.runtimes.iter().find(|r| r.mcp_acceptance.is_some()).unwrap();
     let acceptance = accepted.mcp_acceptance.as_ref().unwrap();
-    assert!(check_evidence(&manifest, &transcript, acceptance, accepted, &release, Arch::X86_64).is_ok());
+    let check = |release: &ReleaseManifest, arch: Arch, transcript: &[u8]|
+        check_evidence(&manifest, transcript, acceptance, accepted, release, arch, None);
+    assert_eq!(check(&release, Arch::X86_64, &transcript), Ok(()));
     let mut other = release.clone();
     for artifact in &mut other.artifacts {
         if artifact.id == "runtime-api-worker-v1" { artifact.sha256 = digest(9); }
     }
-    assert!(check_evidence(&manifest, &transcript, acceptance, accepted, &other, Arch::X86_64).is_err());
+    assert_eq!(check(&other, Arch::X86_64, &transcript), Err(evidence_refusal::ARTIFACTS));
     let mut other = release.clone();
     for artifact in &mut other.artifacts {
         if artifact.install_target == InstallTarget::McpBridge { artifact.sha256 = digest(9); }
     }
-    assert!(check_evidence(&manifest, &transcript, acceptance, accepted, &other, Arch::X86_64).is_err());
-    assert!(check_evidence(&manifest, &transcript, acceptance, accepted, &release, Arch::Aarch64).is_err());
-    assert!(check_evidence(&manifest, b"", acceptance, accepted, &release, Arch::X86_64).is_err());
+    assert_eq!(check(&other, Arch::X86_64, &transcript), Err(evidence_refusal::ARTIFACTS));
+    assert_eq!(check(&release, Arch::Aarch64, &transcript), Err(evidence_refusal::ARCH));
+    assert_eq!(check(&release, Arch::X86_64, b""), Err(evidence_refusal::TRANSCRIPT_FILE));
+}
+
+// ── F1: the trampoline is the shipped one ───────────────────────────────
+
+#[test]
+fn accept_refuses_a_trampoline_whose_digest_differs() {
+    let fixture = Fixture::new();
+    let facts = good_facts();
+    let mut args = fixture.args();
+    let position = args.iter().position(|arg| arg == "--trampoline-sha256").unwrap();
+    // Another digest than the file's: refused before any side effect.
+    args[position + 1] = hex(&digest(9).0);
+    assert_eq!(command(&args, &facts).err(), Some((1, refusal::TRAMPOLINE_DIGEST.to_owned())));
+    assert!(untouched(&fixture));
+    // The file changed after its digest was computed.
+    fs::write(fixture.dir.path().join("duduclaw-run"), "\u{7f}ELF TEST another trampoline").unwrap();
+    assert_eq!(refusal_of(&fixture, &facts), Some((1, refusal::TRAMPOLINE_DIGEST.to_owned())));
+    assert!(untouched(&fixture));
+    // Missing or malformed: a usage error.
+    let bad_values: [String; 4] = [String::new(), "ABCD".into(), "0".repeat(63), "A".repeat(64)];
+    for bad in &bad_values {
+        let mut args = fixture.args();
+        args[position + 1] = bad.clone();
+        assert_eq!(command(&args, &facts).err().map(|e| e.0), Some(2), "{bad:?}");
+    }
+    let args: Vec<String> = fixture.args()[..position].to_vec();
+    assert_eq!(command(&args, &facts).err().map(|e| e.0), Some(2));
+    assert!(parse_digest_hex(&hex(&digest(0xab).0)) == Some(digest(0xab)));
+}
+
+#[test]
+fn verify_refuses_evidence_whose_trampoline_is_not_the_manifests() {
+    let fixture = Fixture::new();
+    let prepared = fixture.prepared();
+    let (transcript, manifest, record) = evidence(&prepared);
+    let release = fixture.release();
+    let check = |release: &ReleaseManifest| check_evidence(&manifest, &transcript, &record, prepared.record(), release,
+        Arch::X86_64, None);
+    assert_eq!(check(&release), Ok(()));
+    let mut other = release.clone();
+    other.artifacts.iter_mut().find(|a| a.install_target == InstallTarget::Trampoline).unwrap().sha256 = digest(9);
+    assert_eq!(check(&other), Err(evidence_refusal::TRAMPOLINE));
+    let mut none = release.clone();
+    none.artifacts.retain(|a| a.install_target != InstallTarget::Trampoline);
+    assert_eq!(check(&none), Err(evidence_refusal::NO_TRAMPOLINE));
+    // Evidence of a run with another trampoline than the shipped one.
+    let mut observations = observed(&prepared);
+    observations.trampoline_digest = digest(9);
+    observations.launcher_exe_sha256 = Some(digest(9));
+    let (transcript, manifest, record) = evidence_from(&prepared, &conversation(), &observations,
+        |document| document.trampoline_sha256 = hex(&digest(9).0));
+    assert_eq!(check_evidence(&manifest, &transcript, &record, prepared.record(), &release, Arch::X86_64, None),
+        Err(evidence_refusal::TRAMPOLINE));
+}
+
+#[test]
+fn verify_evidence_dir_requires_a_manifest() {
+    let fixture = Fixture::new();
+    let request = fixture.request();
+    let raw = fs::read(&request.source).unwrap();
+    let (generated, _) = build_policy_bytes(&raw, &request.source, &request.artifacts, Arch::X86_64, None).unwrap();
+    let policy_path = fixture.dir.path().join("policy.json");
+    fs::write(&policy_path, &generated.bytes).unwrap();
+    let evidence_dir = fixture.dir.path().join("evidence-dir");
+    fs::create_dir(&evidence_dir).unwrap();
+    let args: Vec<String> = ["verify", "--policy", policy_path.to_str().unwrap(), "--artifacts-dir", request.artifacts.to_str().unwrap(),
+        "--arch", "x86_64", "--evidence-dir", evidence_dir.to_str().unwrap()].iter().map(|v| (*v).to_owned()).collect();
+    assert_eq!(super::super::run(&args).err(), Some((1, EVIDENCE_NEEDS_MANIFEST.to_owned())));
+}
+
+// ── F4: the evidence is parsed, replayed and decided again ──────────────
+
+#[test]
+fn evidence_manifest_is_parsed_strictly_and_decided_again() {
+    let fixture = Fixture::new();
+    let prepared = fixture.prepared();
+    let release = fixture.release();
+    let check = |transcript: &[u8], manifest: &[u8], record: &McpAcceptance, pin: Option<Sha256Digest>|
+        check_evidence(manifest, transcript, record, prepared.record(), &release, Arch::X86_64, pin);
+    // The genuine fixture passes, pinned or not.
+    let (transcript, manifest, record) = evidence(&prepared);
+    assert_eq!(check(&transcript, &manifest, &record, None), Ok(()));
+    assert_eq!(check(&transcript, &manifest, &record, Some(digest(1))), Ok(()));
+    assert_eq!(check(&transcript, &manifest, &record, Some(digest(7))), Err(evidence_refusal::HARNESS_PIN));
+    // Value-level edits, re-bound as the record's transcript_digest.
+    let original: Value = serde_json::from_slice(&manifest).unwrap();
+    let edited = |edit: &dyn Fn(&mut Value), canonical_bytes: bool| {
+        let mut value = original.clone();
+        edit(&mut value);
+        let bytes = if canonical_bytes { canonical(&value) } else { serde_json::to_vec_pretty(&value).unwrap() };
+        let record = acceptance_record(&prepared, &bytes);
+        check(&transcript, &bytes, &record, None)
+    };
+    assert_eq!(edited(&|v: &mut Value| { v.as_object_mut().unwrap().remove("harness_sha256"); }, true), Err(evidence_refusal::SCHEMA));
+    assert_eq!(edited(&|v: &mut Value| { v.as_object_mut().unwrap().remove("observations"); }, true), Err(evidence_refusal::SCHEMA));
+    assert_eq!(edited(&|v: &mut Value| { v["observations"]["initialize"].as_object_mut().unwrap().remove("frames"); }, true),
+        Err(evidence_refusal::SCHEMA));
+    assert_eq!(edited(&|v: &mut Value| { v["extra"] = json!(1); }, true), Err(evidence_refusal::SCHEMA));
+    assert_eq!(edited(&|v: &mut Value| { v["observations"]["exclusive_config"]["extra"] = json!(true); }, true),
+        Err(evidence_refusal::SCHEMA));
+    assert_eq!(edited(&|v: &mut Value| { v["format"] = json!("1"); }, true), Err(evidence_refusal::SCHEMA));
+    // A missing nullable field parses but does not re-encode to the same bytes.
+    assert_eq!(edited(&|v: &mut Value| { v["observations"]["parent_exec"].as_object_mut().unwrap().remove("launcher_exe_sha256"); },
+        true), Err(evidence_refusal::CANONICAL));
+    assert_eq!(edited(&|_: &mut Value| {}, false), Err(evidence_refusal::CANONICAL));
+    // Typed edits.
+    let typed = |edit: fn(&mut EvidenceDocument)| {
+        let (transcript, manifest, record) = evidence_from(&prepared, &conversation(), &observed(&prepared), edit);
+        check(&transcript, &manifest, &record, None)
+    };
+    assert_eq!(typed(|d| d.domain = "another".into()), Err(evidence_refusal::DOMAIN));
+    assert_eq!(typed(|d| d.format = EVIDENCE_FORMAT + 1), Err(evidence_refusal::FORMAT));
+    assert_eq!(typed(|d| d.arch = "aarch64".into()), Err(evidence_refusal::ARCH));
+    assert_eq!(typed(|d| d.harness_sha256 = "00".into()), Err(evidence_refusal::DIGEST_SYNTAX));
+    assert_eq!(typed(|d| d.harness_sha256 = "AB".repeat(32)), Err(evidence_refusal::DIGEST_SYNTAX));
+    assert_eq!(typed(|d| d.bridge_sha256 = hex(&[9; 32])), Err(evidence_refusal::RECORD_DIGESTS));
+    assert_eq!(typed(|d| d.transcript_sha256 = hex(&[9; 32])), Err(evidence_refusal::TRANSCRIPT_FILE));
+    assert_eq!(typed(|d| d.observations.initialize.frames = 6), Err(evidence_refusal::TRANSCRIPT_FACTS));
+    assert_eq!(typed(|d| d.observations.exclusive_config.initialize_requests = 2), Err(evidence_refusal::TRANSCRIPT_FACTS));
+    assert_eq!(typed(|d| d.observations.parent_exec.fd3 = "maybe".into()), Err(evidence_refusal::SCHEMA));
+    // A false observation: the same decide refuses it.
+    let false_facts: Vec<fn(&mut Observations)> = vec![
+        |o| o.exclusive.decoy_markers_present = 1,
+        |o| o.exclusive.bridge_processes_seen = 2,
+        |o| o.runtime.as_mut().unwrap().alive_through_observation = false,
+        |o| o.launcher_exe_sha256 = None,
+        |o| o.initialize.observed_before_reply = false,
+        |o| o.bridge = None,
+    ];
+    for mutate in false_facts {
+        let mut observations = observed(&prepared);
+        mutate(&mut observations);
+        let (transcript, manifest, record) = evidence_from(&prepared, &conversation(), &observations, |_| {});
+        assert_eq!(check(&transcript, &manifest, &record, None), Err(evidence_refusal::DECISION));
+    }
+    // A record that does not state zero exits.
+    let (transcript, manifest, mut record) = evidence(&prepared);
+    record.parent_exec_exit = 1;
+    assert_eq!(check(&transcript, &manifest, &record, None), Err(evidence_refusal::RECORD_EXITS));
+}
+
+/// Frames the responder produces for these runtime messages (the held
+/// `initialize` released as the harness does).
+fn frames_of(messages: &[Value]) -> Vec<Frame> {
+    let mut responder = Responder::default();
+    for message in messages {
+        responder.feed(&line(message.clone())).unwrap();
+        if responder.initialize_held() { responder.release_initialize(true).unwrap(); }
+    }
+    responder.frames().to_vec()
+}
+
+#[test]
+fn transcript_is_replayed_through_the_responder() {
+    let fixture = Fixture::new();
+    let prepared = fixture.prepared();
+    let release = fixture.release();
+    let check = |frames: &[Frame]| {
+        let (transcript, manifest, record) = evidence_from(&prepared, frames, &observed(&prepared), |_| {});
+        check_evidence(&manifest, &transcript, &record, prepared.record(), &release, Arch::X86_64, None)
+    };
+    let initialize = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
+    let initialized = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+    let list = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}});
+    assert_eq!(frames_of(&[initialize.clone(), initialized.clone(), list.clone()]), conversation());
+    assert_eq!(check(&conversation()), Ok(()));
+    // Out of order: notifications/initialized and tools/list swapped.
+    let mut swapped = conversation();
+    swapped.swap(2, 3);
+    assert_eq!(check(&swapped), Err(evidence_refusal::TRANSCRIPT_ORDER));
+    // A harness frame the responder never writes.
+    let mut forged = conversation();
+    forged[4].payload = br#"{"id":2,"jsonrpc":"2.0","result":{"tools":[{"name":"x"}]}}"#.to_vec();
+    assert_eq!(check(&forged), Err(evidence_refusal::TRANSCRIPT_ORDER));
+    // Incomplete: no tools/list.
+    assert_eq!(check(&frames_of(&[initialize.clone(), initialized.clone()])), Err(evidence_refusal::TRANSCRIPT_ORDER));
+    // A second initialize after the conversation.
+    let again = json!({"jsonrpc": "2.0", "id": 3, "method": "initialize", "params": {}});
+    assert_eq!(check(&frames_of(&[initialize.clone(), initialized.clone(), list.clone(), again])),
+        Err(evidence_refusal::SECOND_INITIALIZE));
+    // A refused frame in the middle.
+    let ping = json!({"jsonrpc": "2.0", "id": 9, "method": "ping"});
+    assert_eq!(check(&frames_of(&[initialize.clone(), initialized.clone(), ping, list.clone()])),
+        Err(evidence_refusal::REFUSED_FRAME));
+    // Line-level damage: a non-canonical line, a wrong sequence number.
+    let (transcript, manifest, record) = evidence(&prepared);
+    let rebind = |transcript: Vec<u8>| {
+        let (_, manifest, record) = evidence_from(&prepared, &conversation(), &observed(&prepared),
+            |d| d.transcript_sha256 = hex(&sha(&transcript).0));
+        check_evidence(&manifest, &transcript, &record, prepared.record(), &release, Arch::X86_64, None)
+    };
+    let text = String::from_utf8(transcript.clone()).unwrap();
+    assert_eq!(rebind(text.replacen("{\"direction\"", "{ \"direction\"", 1).into_bytes()), Err(evidence_refusal::TRANSCRIPT_LINES));
+    assert_eq!(rebind(text.replacen("\"seq\":2", "\"seq\":3", 1).into_bytes()), Err(evidence_refusal::TRANSCRIPT_LINES));
+    assert_eq!(rebind(transcript[..transcript.len() - 1].to_vec()), Err(evidence_refusal::TRANSCRIPT_TRUNCATED));
+    assert_eq!(check_evidence(&manifest, &transcript, &record, prepared.record(), &release, Arch::X86_64, None), Ok(()));
+}
+
+// ── F2: complete enumeration, fail-closed classification ────────────────
+
+const LAUNCHER: u32 = 10;
+fn run_ids(forwarder: bool) -> Identities {
+    Identities { launcher: (LAUNCHER, start_of(LAUNCHER)), trampoline: digest(2), runtime: digest(3), bridge: digest(4),
+        forwarder: forwarder.then(|| digest(5)) }
+}
+fn start_of(pid: u32) -> u64 { 1000 + u64::from(pid) }
+fn live(pid: u32, ppid: u32, exe: Sha256Digest) -> Member {
+    Member { pid, read: MemberRead::Live { start: start_of(pid), ppid, exe } }
+}
+/// The legitimate run: supervisor 10, init 11, forwarder 12, runtime 13, bridge 14.
+fn run_members() -> Vec<Member> {
+    vec![live(10, 1, digest(2)), live(11, 10, digest(2)), live(12, 11, digest(5)), live(13, 11, digest(3)), live(14, 13, digest(4))]
+}
+fn snapshot_of(members: Vec<Member>) -> CgroupSnapshot { CgroupSnapshot { members, incomplete: None } }
+fn limits() -> WalkLimits { WalkLimits::for_tasks(256) }
+/// What `accept` would decide on a snapshot: the run's facts with the
+/// classification's and the census's verdict.
+fn decision_on(snapshot: &CgroupSnapshot, ids: &Identities, limits: &WalkLimits) -> std::result::Result<(), &'static str> {
+    let mut census = Census::default();
+    census.record(snapshot, ids, limits, false, false);
+    let mut observations = valid();
+    observations.incomplete = classify(snapshot, ids, limits).err().or_else(|| census.finish(ids));
+    decide(&observations)
+}
+
+#[test]
+fn the_legitimate_run_cgroup_classifies_completely() {
+    let ids = run_ids(true);
+    let classified = classify(&snapshot_of(run_members()), &ids, &limits()).unwrap();
+    assert_eq!((classified.runtime, classified.bridge), (Some((13, 2)), Some((14, 1))));
+    assert_eq!(classified.live.len(), 5);
+    assert_eq!(decision_on(&snapshot_of(run_members()), &ids, &limits()), Ok(()));
+    // Offline: no forwarder.
+    let offline: Vec<Member> = run_members().into_iter().filter(|m| m.pid != 12).collect();
+    assert!(classify(&snapshot_of(offline), &run_ids(false), &limits()).is_ok());
+    // The pre-exec windows and the documented exec transitions, over time.
+    let mut census = Census::default();
+    let ids = run_ids(true);
+    let turns = [
+        vec![live(10, 1, digest(2)), live(11, 10, digest(2)), live(12, 11, digest(2))],
+        vec![live(10, 1, digest(2)), live(11, 10, digest(2)), live(12, 11, digest(5)), live(13, 11, digest(2))],
+        vec![live(10, 1, digest(2)), live(11, 10, digest(2)), live(12, 11, digest(5)), live(13, 11, digest(3)), live(14, 13, digest(3))],
+        run_members(),
+    ];
+    for turn in &turns { census.record(&snapshot_of(turn.clone()), &ids, &limits(), false, false); }
+    assert_eq!((census.finish(&ids), census.bridges(&ids)), (None, 1));
+    // The runtime exits first: the bridge is re-parented to init.
+    let orphan = vec![live(10, 1, digest(2)), live(11, 10, digest(2)), live(12, 11, digest(5)), live(14, 11, digest(4))];
+    census.record(&snapshot_of(orphan), &ids, &limits(), false, true);
+    assert_eq!(census.finish(&ids), None);
+    // After the main process exited (confirmed) and the conversation completed, nothing is classified.
+    census.record(&snapshot_of(vec![live(99, 1, digest(9))]), &ids, &limits(), true, true);
+    assert_eq!(census.finish(&ids), None);
+    assert_eq!(WalkLimits::for_tasks(512), WalkLimits { max_nodes: 512, max_depth: 512, max_census: CENSUS_MAX });
+}
+
+#[test]
+fn reaching_any_walk_limit_is_incomplete_not_truncated() {
+    let ids = run_ids(true);
+    let snapshot = snapshot_of(run_members());
+    // Depth: the bridge is 3 below the main process.
+    let shallow = WalkLimits { max_depth: 2, ..limits() };
+    assert_eq!(classify(&snapshot, &ids, &shallow).err(), Some(incomplete::DEPTH_CAP));
+    assert!(decision_on(&snapshot, &ids, &shallow).unwrap_err().contains(incomplete::DEPTH_CAP));
+    // Nodes: five members, four allowed.
+    let narrow = WalkLimits { max_nodes: 4, ..limits() };
+    assert_eq!(classify(&snapshot, &ids, &narrow).err(), Some(incomplete::NODE_CAP));
+    assert!(decision_on(&snapshot, &ids, &narrow).unwrap_err().contains(incomplete::NODE_CAP));
+    // Census: five distinct processes, three kept.
+    let small = WalkLimits { max_census: 3, ..limits() };
+    let mut census = Census::default();
+    census.record(&snapshot, &ids, &small, false, false);
+    assert_eq!(census.finish(&ids), Some(incomplete::CENSUS_CAP));
+    assert!(decision_on(&snapshot, &ids, &small).unwrap_err().contains(incomplete::CENSUS_CAP));
+    // Enumeration-level gaps.
+    for reason in [incomplete::CGROUP_UNREADABLE, incomplete::CGROUP_UNSTABLE, incomplete::CGROUP_TREE_CAP] {
+        let gap = CgroupSnapshot { members: run_members(), incomplete: Some(reason) };
+        assert!(decision_on(&gap, &ids, &limits()).unwrap_err().contains(reason));
+    }
+}
+
+#[test]
+fn unreadable_unhashable_or_unknown_processes_mean_no_record() {
+    let ids = run_ids(true);
+    let with = |pid: u32, read: MemberRead| {
+        let mut members = run_members();
+        members.retain(|m| m.pid != pid);
+        members.push(Member { pid, read });
+        snapshot_of(members)
+    };
+    let cases = [
+        (with(14, MemberRead::Unreadable), incomplete::UNREADABLE_PROCESS),
+        (with(14, MemberRead::HashError), incomplete::HASH_ERROR),
+        (with(13, MemberRead::Exited { confirmed: false }), incomplete::UNCONFIRMED_EXIT),
+        // An executable no manifest entry or the trampoline names.
+        (snapshot_of([run_members(), vec![live(15, 13, digest(9))]].concat()), incomplete::UNEXPECTED_PROCESS),
+        // A second runtime, a second forwarder, a second init.
+        (snapshot_of([run_members(), vec![live(15, 11, digest(3))]].concat()), incomplete::UNEXPECTED_PROCESS),
+        (snapshot_of([run_members(), vec![live(15, 11, digest(5))]].concat()), incomplete::UNEXPECTED_PROCESS),
+        (snapshot_of([run_members(), vec![live(15, 10, digest(2))]].concat()), incomplete::UNEXPECTED_PROCESS),
+        // A process in the cgroup that does not descend from the main process.
+        (snapshot_of([run_members(), vec![live(15, 1, digest(4))]].concat()), incomplete::UNEXPECTED_PROCESS),
+        // The bridge spawned by init, a forwarder below the runtime.
+        (snapshot_of([run_members(), vec![live(15, 12, digest(4))]].concat()), incomplete::UNEXPECTED_PROCESS),
+        (snapshot_of([run_members(), vec![live(15, 13, digest(5))]].concat()), incomplete::UNEXPECTED_PROCESS),
+        // The main process missing or replaced.
+        (snapshot_of(run_members().into_iter().filter(|m| m.pid != LAUNCHER).collect()), incomplete::LAUNCHER_MISSING),
+        (with(LAUNCHER, MemberRead::Live { start: 1, ppid: 1, exe: digest(2) }), incomplete::UNEXPECTED_PROCESS),
+    ];
+    for (snapshot, reason) in cases {
+        let decision = decision_on(&snapshot, &ids, &limits());
+        assert!(decision.as_ref().unwrap_err().contains(reason), "{reason}: {decision:?}");
+    }
+    // A forwarder in an offline run.
+    assert!(decision_on(&snapshot_of(run_members()), &run_ids(false), &limits()).unwrap_err().contains(incomplete::UNEXPECTED_PROCESS));
+    // Census-only refusals: a second runtime over time; an undocumented exec.
+    let ids = run_ids(true);
+    let mut census = Census::default();
+    census.record(&snapshot_of(run_members()), &ids, &limits(), false, false);
+    let respawned = vec![live(10, 1, digest(2)), live(11, 10, digest(2)), live(12, 11, digest(5)), live(16, 11, digest(3)),
+        live(14, 16, digest(4))];
+    census.record(&snapshot_of(respawned), &ids, &limits(), false, false);
+    assert_eq!(census.finish(&ids), Some(incomplete::UNEXPECTED_PROCESS));
+    let mut census = Census::default();
+    census.record(&snapshot_of(run_members()), &ids, &limits(), false, false);
+    // The bridge's (pid, start) later shows the runtime digest: bridge → runtime is no documented exec.
+    let mut reexec = run_members();
+    reexec[4] = live(14, 13, digest(3));
+    census.record(&snapshot_of(reexec), &ids, &limits(), false, false);
+    assert_eq!(census.finish(&ids), Some(incomplete::UNEXPECTED_PROCESS));
+    // The main process gone before the conversation completed.
+    let mut census = Census::default();
+    census.record(&snapshot_of(run_members()), &ids, &limits(), true, false);
+    assert_eq!(census.finish(&ids), Some(incomplete::LAUNCHER_MISSING));
+}
+
+#[test]
+fn exited_processes_are_tolerated_only_with_exit_confirmation() {
+    let ids = run_ids(true);
+    let mut members = run_members();
+    members.push(Member { pid: 15, read: MemberRead::Exited { confirmed: true } });
+    let classified = classify(&snapshot_of(members.clone()), &ids, &limits()).unwrap();
+    assert_eq!((classified.runtime, classified.bridge), (Some((13, 2)), Some((14, 1))));
+    assert_eq!(decision_on(&snapshot_of(members.clone()), &ids, &limits()), Ok(()));
+    members.push(Member { pid: 16, read: MemberRead::Exited { confirmed: false } });
+    assert_eq!(classify(&snapshot_of(members.clone()), &ids, &limits()).err(), Some(incomplete::UNCONFIRMED_EXIT));
+    assert!(decision_on(&snapshot_of(members), &ids, &limits()).unwrap_err().contains(incomplete::UNCONFIRMED_EXIT));
+}
+
+// ── F3: the tear-down signals only the run's own processes ──────────────
+
+#[test]
+fn teardown_kills_only_members_of_the_run_cgroups() {
+    let slice = "duduclaw-employees-ab.slice";
+    let unit = "/duduclaw.slice/duduclaw-employees.slice/duduclaw-employees-ab.slice/duduclaw-run-cd.service";
+    let groups = run_cgroups(unit, slice);
+    assert_eq!(groups, [unit.to_owned(), "/duduclaw.slice/duduclaw-employees.slice/duduclaw-employees-ab.slice".to_owned()]);
+    assert_eq!(run_cgroups("/system.slice/other.service", slice), ["/system.slice/other.service".to_owned()]);
+    let refs: Vec<&str> = groups.iter().map(String::as_str).collect();
+    let process = |pid: u32, cgroup: Option<&str>| UidProcess { pid, start: start_of(pid), cgroup: cgroup.map(str::to_owned) };
+    let below_unit = format!("{unit}/runtime");
+    let processes = [
+        process(20, Some(unit)),
+        process(21, Some(below_unit.as_str())),
+        process(22, Some("/duduclaw.slice/duduclaw-employees.slice/duduclaw-employees-ab.slice")),
+        // Same uid elsewhere: never signalled.
+        process(30, Some("/user.slice/user-1000.slice/session-1.scope")),
+        process(31, Some("/duduclaw.slice/duduclaw-employees.slice/duduclaw-employees-abc.slice")),
+        process(32, Some("/duduclaw.slice/duduclaw-employees.slice")),
+        process(33, None),
+        process(1, Some(unit)),
+    ];
+    let selection = teardown_selection(&processes, &refs);
+    assert_eq!(selection.kill, [(20, start_of(20)), (21, start_of(21)), (22, start_of(22))]);
+    assert_eq!(selection.foreign, [(30, start_of(30)), (31, start_of(31)), (32, start_of(32)), (33, start_of(33)), (1, start_of(1))]);
+    assert!(selection.foreign.iter().all(|foreign| !selection.kill.contains(foreign)));
+    // No run cgroup known (the unit never started): nothing is ever signalled.
+    let none = teardown_selection(&processes, &[]);
+    assert!(none.kill.is_empty() && none.foreign.len() == processes.len());
+    assert_eq!(FOREIGN_UID_PROCESS, "foreign_uid_process");
+}
+
+// ── F5: the harness directory is the guard's from its mkdir on ──────────
+
+#[test]
+fn harness_directory_is_registered_before_it_is_secured() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("duduclaw-acceptance-test");
+    let mut registered: Option<PathBuf> = None;
+    let result = make_registered_dir(&path, 0o700, |created| registered = Some(created.to_path_buf()),
+        |_| Err(io::Error::from(io::ErrorKind::PermissionDenied)));
+    assert!(result.is_err());
+    assert_eq!(registered.as_deref(), Some(path.as_path()), "a failing chmod/chown leaves a registered directory");
+    assert!(path.is_dir());
+    // A failed mkdir registers nothing.
+    let mut again: Option<PathBuf> = None;
+    assert!(make_registered_dir(&path, 0o700, |created| again = Some(created.to_path_buf()), |_| Ok(())).is_err());
+    assert!(again.is_none());
+    // The success path runs the securing step on the registered directory.
+    let other = dir.path().join("second");
+    let mut secured = false;
+    assert!(make_registered_dir(&other, 0o700, |_| {}, |created| { secured = created == other.as_path(); Ok(()) }).is_ok());
+    assert!(secured);
 }
 
 #[test]
@@ -541,15 +1003,19 @@ fn iso_root_policy_accept_api_worker_end_to_end() {
     let env = |key: &str| std::env::var(key).unwrap_or_else(|_| panic!("{key} is required"));
     let (tool, source, artifacts, trampoline, label) = (env("DUDUCLAW_ISO_POLICY_TOOL"), env("DUDUCLAW_ISO_ACCEPT_SOURCE"),
         env("DUDUCLAW_ISO_ACCEPT_ARTIFACTS"), env("DUDUCLAW_ISO_ACCEPT_TRAMPOLINE"), env("DUDUCLAW_ISO_ACCEPT_LABEL"));
-    let arch = arch_name(Arch::native().unwrap());
+    let native = Arch::native().unwrap();
+    let arch = arch_name(native);
     let work = tempfile::tempdir().unwrap();
     let evidence = work.path().join("evidence");
     let out = work.path().join("accepted.json");
+    // F1: the trampoline's digest, as the bundle script computes it from the staged snapshot.
+    let (trampoline_digest, trampoline_size) = file_digest(Path::new(&trampoline)).unwrap();
+    let trampoline_hex = hex(&trampoline_digest.0);
     // The harness needs its own single-threaded process (private mount namespace).
     let status = std::process::Command::new(&tool)
         .args(["accept", "--source", source.as_str(), "--artifacts-dir", artifacts.as_str(), "--arch", arch,
-            "--label", label.as_str(), "--trampoline", trampoline.as_str(), "--evidence-dir", evidence.to_str().unwrap(),
-            "--out-source", out.to_str().unwrap()])
+            "--label", label.as_str(), "--trampoline", trampoline.as_str(), "--trampoline-sha256", trampoline_hex.as_str(),
+            "--evidence-dir", evidence.to_str().unwrap(), "--out-source", out.to_str().unwrap()])
         .env_clear().env("DUDUCLAW_ISO_DISPOSABLE", "1").status().expect("run the policy tool");
     assert!(status.success(), "accept failed: {status}");
     assert!(evidence.join(MANIFEST_FILE).is_file() && evidence.join(TRANSCRIPT_FILE).is_file());
@@ -558,8 +1024,20 @@ fn iso_root_policy_accept_api_worker_end_to_end() {
     let built = super::super::run(&strings(&["build", "--source", out.to_str().unwrap(), "--artifacts-dir", artifacts.as_str(),
         "--arch", arch, "--out", policy.to_str().unwrap()]));
     assert!(built.is_ok(), "{built:?}");
+    // A release manifest for these artifacts, this policy and the trampoline
+    // (what the packager signs; `verify --evidence-dir` requires one).
+    let policy_bytes = fs::read(&policy).unwrap();
+    let mut release = load_manifest(Path::new(&artifacts), None, native, false).unwrap();
+    release.artifacts.push(ReleaseArtifact { id: "duduclaw-run".into(), sha256: trampoline_digest, size_bytes: trampoline_size,
+        mode: 0o755, install_target: InstallTarget::Trampoline });
+    release.artifacts.push(ReleaseArtifact { id: "isolation-policy-v1".into(), sha256: sha(&policy_bytes),
+        size_bytes: policy_bytes.len() as u64, mode: 0o444, install_target: InstallTarget::RuntimeEntry { registry_id: POLICY_ID.into() } });
+    let release_path = work.path().join("release-manifest.json");
+    fs::write(&release_path, serde_json::to_vec(&release).unwrap()).unwrap();
+    let harness_hex = hex(&file_digest(Path::new(&tool)).unwrap().0 .0);
     let verified = super::super::run(&strings(&["verify", "--policy", policy.to_str().unwrap(), "--artifacts-dir", artifacts.as_str(),
-        "--arch", arch, "--evidence-dir", evidence.to_str().unwrap()]));
+        "--manifest", release_path.to_str().unwrap(), "--evidence-dir", evidence.to_str().unwrap(),
+        "--harness-sha256", harness_hex.as_str()]));
     assert!(verified.as_ref().is_ok_and(|text| text.contains("1 acceptance record(s)")), "{verified:?}");
     assert!(!installed_under(Path::new("/")), "the harness must leave no installation fact behind");
 }

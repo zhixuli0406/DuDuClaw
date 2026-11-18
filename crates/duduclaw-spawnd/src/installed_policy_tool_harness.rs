@@ -11,9 +11,13 @@
 //! requiring an acceptance record, which is what this run produces),
 //! `bootstrap_mounts::prepare`, `plan.seal`, `NativeTrampoline::prepare`,
 //! `fds::validate_bootstrap`, `UnitPolicy::new`, PID 1's transient unit
-//! (`Systemd::start_acceptance` = `start` with the harness's trampoline copy
+//! (`Systemd::start_acceptance` = `start` with the harness's trampoline copy,
+//! whose bytes are `--trampoline-sha256` = the release manifest's trampoline,
 //! and without the spawnd dependency) and `NativeTrampoline::bind_unit` /
-//! `poll`. Not executed (no installation exists): the admission core
+//! `poll`. Observation enumerates the whole run cgroup on every turn and
+//! classifies every member by executable digest ([`super::classify`]); any
+//! gap is an incomplete observation and no record. The tear-down signals only
+//! pidfd-pinned members of the run's own cgroups. Not executed (no installation exists): the admission core
 //! (readiness report, SSH evidence, the run journal and UID monitor, the
 //! egress service registration), the R7a trampoline self-test readiness, the
 //! helper table, the work-broker root and the gateway's `McpRunReceipt`.
@@ -135,18 +139,6 @@ fn readable(fd: RawFd, milliseconds: i32) -> bool {
 fn alive(process: &Pinned) -> bool {
     !readable(process.fd.as_raw_fd(), 0) && proc_stat(process.pid).is_ok_and(|(_, start)| start == process.start)
 }
-fn children(pid: u32) -> Vec<u32> {
-    let mut found = Vec::new();
-    let Ok(tasks) = fs::read_dir(format!("/proc/{pid}/task")) else { return found };
-    for task in tasks.flatten() {
-        if let Ok(text) = fs::read_to_string(task.path().join("children")) {
-            found.extend(text.split_whitespace().filter_map(|value| value.parse::<u32>().ok()));
-        }
-    }
-    found.sort_unstable();
-    found.dedup();
-    found
-}
 fn exe_digest(pid: u32) -> io::Result<Sha256Digest> { File::open(format!("/proc/{pid}/exe")).and_then(digest_file) }
 /// `(inode, mount id)` of a descriptor's target when it is a socket.
 fn fd_socket(pid: u32, fd: i32) -> io::Result<Option<SocketId>> {
@@ -189,88 +181,198 @@ fn process_facts(process: &Pinned, depth: u32, unit_cgroup: &str, socket: Socket
         alive_through_observation: alive }, fd3))
 }
 
-/// The process tree below the unit's main process (pinned at start), each
-/// node pinned by a pidfd with its parent link re-checked: the runtime is the
-/// one node with the runtime digest, the bridge the one node below it with
-/// the bridge digest. Observed while the `initialize` reply is withheld, so
-/// both are alive and blocked on the harness.
-struct Tree { runtime: Option<ProcessFacts>, fd3: Fd3, bridge: Option<ProcessFacts> }
-fn observe_tree(launcher: &Pinned, unit_cgroup: &str, socket: SocketId, runtime_digest: Sha256Digest,
-    bridge_digest: Sha256Digest) -> io::Result<Tree> {
-    let mut nodes: Vec<(Pinned, u32, Option<usize>)> = Vec::new();
-    let root = pin(launcher.pid, None)?.filter(|again| again.start == launcher.start)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "launcher"))?;
-    nodes.push((root, 0, None));
-    let mut next = 0;
-    while next < nodes.len() && nodes.len() < 256 {
-        let (pid, depth) = (nodes[next].0.pid, nodes[next].1);
-        for child in children(pid) {
-            if nodes.len() >= 256 || depth >= 8 { break; }
-            if let Some(pinned) = pin(child, Some(pid))? { nodes.push((pinned, depth + 1, Some(next))); }
+// ── the run cgroup, enumerated completely (F2; pure rules in the parent) ─
+
+/// Bounds of the sub-cgroup walk below the unit (`Delegate=yes`; without a
+/// helper launcher the trampoline creates none and nothing in the run reaches
+/// cgroupfs): exceeding them is an incomplete scan, never a truncated one.
+const CGROUP_DIRECTORIES_MAX: usize = 64;
+const CGROUP_DEPTH_MAX: u32 = 8;
+/// Enumerations per snapshot until the reads before and after the
+/// inspection agree.
+const SNAPSHOT_ATTEMPTS: usize = 16;
+
+/// The process (or its `/proc` entry) no longer exists.
+fn gone(error: &io::Error) -> bool { error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH) }
+
+/// Every pid in the unit cgroup and all its sub-cgroups, sorted; `None` when
+/// the unit cgroup itself is gone.
+fn cgroup_pid_list(unit: &Path) -> std::result::Result<Option<Vec<u32>>, &'static str> {
+    let mut pids = Vec::new();
+    let mut directories = 0usize;
+    let mut pending = vec![(unit.to_path_buf(), 0u32)];
+    while let Some((directory, depth)) = pending.pop() {
+        directories += 1;
+        if directories > CGROUP_DIRECTORIES_MAX || depth > CGROUP_DEPTH_MAX { return Err(incomplete::CGROUP_TREE_CAP); }
+        let top = depth == 0;
+        let text = match fs::read_to_string(directory.join("cgroup.procs")) {
+            Ok(text) => text,
+            // A sub-cgroup removed mid-walk: the second enumeration decides.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => if top { return Ok(None) } else { continue },
+            Err(_) => return Err(incomplete::CGROUP_UNREADABLE),
+        };
+        for token in text.split_whitespace() {
+            pids.push(token.parse::<u32>().map_err(|_| incomplete::CGROUP_UNREADABLE)?);
         }
-        next += 1;
-    }
-    let digests: Vec<Option<Sha256Digest>> = nodes.iter().map(|(node, _, _)| exe_digest(node.pid).ok()).collect();
-    let runtimes: Vec<usize> = (0..nodes.len()).filter(|index| digests[*index] == Some(runtime_digest)).collect();
-    let mut tree = Tree { runtime: None, fd3: Fd3::Other, bridge: None };
-    let [runtime] = runtimes.as_slice() else { return Ok(tree) };
-    let below = |mut index: usize| -> Option<u32> {
-        let mut distance = 0;
-        while let Some(parent) = nodes[index].2 {
-            distance += 1;
-            if parent == *runtime { return Some(distance); }
-            index = parent;
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => if top { return Ok(None) } else { continue },
+            Err(_) => return Err(incomplete::CGROUP_UNREADABLE),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|_| incomplete::CGROUP_UNREADABLE)?;
+            if entry.file_type().map_err(|_| incomplete::CGROUP_UNREADABLE)?.is_dir() { pending.push((entry.path(), depth + 1)); }
         }
-        None
-    };
-    let bridges: Vec<(usize, u32)> = (0..nodes.len()).filter(|index| digests[*index] == Some(bridge_digest))
-        .filter_map(|index| below(index).map(|distance| (index, distance))).collect();
-    let (facts, fd3) = process_facts(&nodes[*runtime].0, nodes[*runtime].1, unit_cgroup, socket)?;
-    tree.runtime = Some(facts);
-    tree.fd3 = fd3;
-    if let [(bridge, distance)] = bridges.as_slice() {
-        tree.bridge = Some(process_facts(&nodes[*bridge].0, *distance, unit_cgroup, socket)?.0);
     }
-    Ok(tree)
+    pids.sort_unstable();
+    Ok(Some(pids))
 }
 
-/// Every process ever seen in the run cgroup, by `(pid, start)`, and those
-/// with the bridge digest (scanned on every turn of the conversation loop).
+/// Executable identity → digest. A running executable cannot be written
+/// (ETXTBSY) and a write changes ctime, so the key names unchanged bytes.
 #[derive(Default)]
-struct Census { seen: BTreeMap<(u32, u64), Sha256Digest>, bridges: Vec<(u32, u64)> }
-fn cgroup_pids(directory: &Path, depth: u32, out: &mut Vec<u32>) {
-    if let Ok(text) = fs::read_to_string(directory.join("cgroup.procs")) {
-        out.extend(text.split_whitespace().filter_map(|value| value.parse::<u32>().ok()));
-    }
-    if depth >= 4 { return; }
-    if let Ok(entries) = fs::read_dir(directory) {
-        for entry in entries.flatten() {
-            if entry.file_type().is_ok_and(|kind| kind.is_dir()) { cgroup_pids(&entry.path(), depth + 1, out); }
+struct ExeCache(BTreeMap<(u64, u64, u64, i64, i64), Sha256Digest>);
+
+enum Inspected { Read(MemberRead, Option<Pinned>), Changed }
+
+/// One cgroup member: pinned by a pidfd between two reads of its stat, its
+/// executable opened and hashed, its start time re-checked. A vanished
+/// process counts as exited only when the kernel confirms it (`pidfd_open`
+/// ESRCH or a readable pidfd); every other failure is reported, never
+/// treated as absence. `keep` decides whether the pidfd is returned.
+fn inspect(pid: u32, cache: &mut ExeCache, keep: &dyn Fn(Sha256Digest) -> bool) -> Inspected {
+    use rustix::process::{pidfd_open, Pid, PidfdFlags};
+    use std::os::unix::fs::MetadataExt;
+    let Some(raw) = i32::try_from(pid).ok().and_then(Pid::from_raw) else { return Inspected::Read(MemberRead::Unreadable, None) };
+    let (ppid, start) = match proc_stat(pid) {
+        Ok(value) => value,
+        Err(error) if gone(&error) => {
+            let confirmed = matches!(pidfd_open(raw, PidfdFlags::empty()), Err(errno) if errno == rustix::io::Errno::SRCH);
+            return Inspected::Read(MemberRead::Exited { confirmed }, None);
         }
+        Err(_) => return Inspected::Read(MemberRead::Unreadable, None),
+    };
+    let fd = match pidfd_open(raw, PidfdFlags::empty()) {
+        Ok(fd) => fd,
+        Err(errno) if errno == rustix::io::Errno::SRCH => return Inspected::Read(MemberRead::Exited { confirmed: true }, None),
+        Err(_) => return Inspected::Read(MemberRead::Unreadable, None),
+    };
+    let pinned = Pinned { pid, start, fd };
+    let exited = |process: &Pinned| readable(process.fd.as_raw_fd(), 0);
+    match proc_stat(pid) {
+        Ok((again_ppid, again)) if again == start && again_ppid == ppid => {}
+        Ok(_) => return Inspected::Changed,
+        Err(error) if gone(&error) && exited(&pinned) => return Inspected::Read(MemberRead::Exited { confirmed: true }, None),
+        Err(_) => return Inspected::Read(MemberRead::Unreadable, None),
+    }
+    let file = match File::open(format!("/proc/{pid}/exe")) {
+        Ok(file) => file,
+        Err(_) if exited(&pinned) => return Inspected::Read(MemberRead::Exited { confirmed: true }, None),
+        Err(error) if gone(&error) => return Inspected::Read(MemberRead::Exited { confirmed: false }, None),
+        Err(_) => return Inspected::Read(MemberRead::Unreadable, None),
+    };
+    let identity = match file.metadata() {
+        Ok(metadata) => (metadata.dev(), metadata.ino(), metadata.size(), metadata.ctime(), metadata.ctime_nsec()),
+        Err(_) => return Inspected::Read(MemberRead::HashError, None),
+    };
+    let exe = match cache.0.get(&identity) {
+        Some(digest) => *digest,
+        None => match digest_file(file) {
+            Ok(digest) => { cache.0.insert(identity, digest); digest }
+            Err(_) => return Inspected::Read(MemberRead::HashError, None),
+        },
+    };
+    match proc_stat(pid) {
+        Ok((_, again)) if again == start => {
+            let pinned = keep(exe).then_some(pinned);
+            Inspected::Read(MemberRead::Live { start, ppid, exe }, pinned)
+        }
+        Ok(_) => Inspected::Changed,
+        Err(error) if gone(&error) && exited(&pinned) => Inspected::Read(MemberRead::Exited { confirmed: true }, None),
+        Err(_) => Inspected::Read(MemberRead::Unreadable, None),
     }
 }
-impl Census {
-    fn scan(&mut self, cgroup: &Path, bridge: Sha256Digest) {
-        let mut pids = Vec::new();
-        cgroup_pids(cgroup, 0, &mut pids);
-        for pid in pids {
-            let Ok((_, start)) = proc_stat(pid) else { continue };
-            if self.seen.contains_key(&(pid, start)) || self.seen.len() >= 1024 { continue; }
-            let Ok(digest) = exe_digest(pid) else { continue };
-            if !proc_stat(pid).is_ok_and(|(_, again)| again == start) { continue; }
-            self.seen.insert((pid, start), digest);
-            if digest == bridge { self.bridges.push((pid, start)); }
+
+enum Scan { Taken(CgroupSnapshot, BTreeMap<u32, Pinned>), Gone }
+
+/// The whole unit cgroup: enumerate, inspect every member, enumerate again;
+/// only two agreeing enumerations around a clean inspection make a snapshot.
+fn snapshot(unit: &Path, cache: &mut ExeCache, keep: &dyn Fn(Sha256Digest) -> bool) -> Scan {
+    let partial = |reason: &'static str| Scan::Taken(CgroupSnapshot { members: Vec::new(), incomplete: Some(reason) }, BTreeMap::new());
+    for _ in 0..SNAPSHOT_ATTEMPTS {
+        let before = match cgroup_pid_list(unit) { Ok(Some(pids)) => pids, Ok(None) => return Scan::Gone, Err(reason) => return partial(reason) };
+        let mut members = Vec::with_capacity(before.len());
+        let mut pinned = BTreeMap::new();
+        let mut changed = false;
+        for pid in &before {
+            match inspect(*pid, cache, keep) {
+                Inspected::Read(read, pin) => {
+                    if let Some(pin) = pin { pinned.insert(*pid, pin); }
+                    members.push(Member { pid: *pid, read });
+                }
+                Inspected::Changed => { changed = true; break; }
+            }
+        }
+        let after = match cgroup_pid_list(unit) { Ok(Some(pids)) => pids, Ok(None) => return Scan::Gone, Err(reason) => return partial(reason) };
+        if !changed && after == before { return Scan::Taken(CgroupSnapshot { members, incomplete: None }, pinned); }
+    }
+    partial(incomplete::CGROUP_UNSTABLE)
+}
+fn gone_snapshot() -> CgroupSnapshot { CgroupSnapshot { members: Vec::new(), incomplete: Some(incomplete::CGROUP_UNREADABLE) } }
+
+/// One census turn of the conversation loop.
+fn census_scan(census: &mut Census, unit: &Path, launcher: &Pinned, ids: &Identities, limits: &WalkLimits, cache: &mut ExeCache,
+    after_conversation: bool) {
+    let scan = snapshot(unit, cache, &|_: Sha256Digest| false);
+    // Read after the snapshot: a missing main process is explained only by its confirmed exit.
+    let launcher_exited = readable(launcher.fd.as_raw_fd(), 0);
+    let snapshot = match scan { Scan::Taken(snapshot, _) => snapshot, Scan::Gone => gone_snapshot() };
+    census.record(&snapshot, ids, limits, launcher_exited, after_conversation);
+}
+
+/// The runtime and the bridge, observed while the `initialize` reply is
+/// withheld (both are alive and blocked on the harness), from one complete
+/// snapshot of the run cgroup that is also a census turn.
+struct Tree { runtime: Option<ProcessFacts>, fd3: Fd3, bridge: Option<ProcessFacts>, incomplete: Option<&'static str> }
+#[allow(clippy::too_many_arguments)]
+fn observe(launcher: &Pinned, unit: &Path, unit_cgroup: &str, socket: SocketId, ids: &Identities, limits: &WalkLimits,
+    census: &mut Census, cache: &mut ExeCache) -> Tree {
+    let keep = |digest: Sha256Digest| digest == ids.runtime || digest == ids.bridge;
+    let scan = snapshot(unit, cache, &keep);
+    let launcher_exited = readable(launcher.fd.as_raw_fd(), 0);
+    let (snapshot, pinned) = match scan { Scan::Taken(snapshot, pinned) => (snapshot, pinned), Scan::Gone => (gone_snapshot(), BTreeMap::new()) };
+    census.record(&snapshot, ids, limits, launcher_exited, false);
+    let mut tree = Tree { runtime: None, fd3: Fd3::Other, bridge: None, incomplete: None };
+    let classified = match classify(&snapshot, ids, limits) {
+        Ok(classified) => classified,
+        Err(reason) => { tree.incomplete = Some(reason); return tree; }
+    };
+    if let Some((pid, depth)) = classified.runtime {
+        match pinned.get(&pid).map(|process| process_facts(process, depth, unit_cgroup, socket)) {
+            Some(Ok((facts, fd3))) => { tree.runtime = Some(facts); tree.fd3 = fd3; }
+            _ => { tree.incomplete = Some(incomplete::PROCESS_FACTS); return tree; }
         }
     }
+    if let Some((pid, distance)) = classified.bridge {
+        match pinned.get(&pid).map(|process| process_facts(process, distance, unit_cgroup, socket)) {
+            Some(Ok((facts, _))) => tree.bridge = Some(facts),
+            _ => tree.incomplete = Some(incomplete::PROCESS_FACTS),
+        }
+    }
+    tree
 }
 
 // ── files ───────────────────────────────────────────────────────────────
 
+/// Mode and root ownership of a directory the harness just created.
+fn secure_dir(path: &Path, mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    std::os::unix::fs::chown(path, Some(0), Some(0))
+}
+/// A directory below the (already registered) harness directory.
 fn make_dir(path: &Path, mode: u32) -> Checked<()> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    fs::DirBuilder::new().mode(mode).create(path).map_err(os_error("harness directory"))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(os_error("harness directory"))?;
-    std::os::unix::fs::chown(path, Some(0), Some(0)).map_err(os_error("harness directory"))
+    make_registered_dir(path, mode, |_| {}, |path| secure_dir(path, mode)).map_err(os_error("harness directory"))
 }
 
 /// A root-owned 0755 copy of a regular file; its sha256 (of the bytes copied)
@@ -295,7 +397,8 @@ fn install_copy(source: &Path, destination: &Path, expected: Option<Sha256Digest
     output.set_permissions(fs::Permissions::from_mode(0o755)).map_err(os_error("copy"))?;
     let digest = Sha256Digest(hasher.finalize().into());
     if expected.is_some_and(|expected| expected != digest) {
-        return Err(format!("accept: {} changed: its sha256 is not the generated record's", source.display()));
+        return Err(format!("accept: {} changed: its sha256 is not the expected (record / --trampoline-sha256) digest",
+            source.display()));
     }
     Ok(digest)
 }
@@ -442,6 +545,72 @@ fn number_free(id: u32) -> bool {
     if unsafe { libc::getgrgid_r(id, &mut group_entry, buffer.as_mut_ptr(), buffer.len(), &mut group) } != 0 || !group.is_null() { return false; }
     crate::accounts::unexpected_processes(id, None).is_ok_and(|found| found.is_empty())
 }
+/// Every process with `uid` in any uid or gid field (the temporary uid = gid),
+/// with its unified cgroup (`None` when unparseable). A process that vanishes
+/// mid-scan is skipped; any other read error fails the scan.
+fn uid_processes(uid: u32) -> io::Result<Vec<UidProcess>> {
+    let mut found = Vec::new();
+    for entry in fs::read_dir("/proc")? {
+        let entry = entry?;
+        let Some(pid) = entry.file_name().to_str().and_then(|name| name.parse::<u32>().ok()) else { continue };
+        let inspect = || -> io::Result<Option<UidProcess>> {
+            let (_, start) = proc_stat(pid)?;
+            let status = fs::read_to_string(format!("/proc/{pid}/status"))?;
+            if !crate::accounts::process_uids(&status)?.contains(&uid) && !crate::accounts::process_gids(&status)?.contains(&uid) {
+                return Ok(None);
+            }
+            let text = fs::read_to_string(format!("/proc/{pid}/cgroup"))?;
+            let cgroup = crate::accounts::unified_cgroup(&text).ok().map(str::to_owned);
+            if proc_stat(pid)?.1 != start { return Err(io::Error::new(io::ErrorKind::InvalidData, "pid reused during the scan")); }
+            Ok(Some(UidProcess { pid, start, cgroup }))
+        };
+        match inspect() {
+            Ok(Some(process)) => found.push(process),
+            Ok(None) => {}
+            Err(error) if gone(&error) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(found)
+}
+
+/// SIGKILL one process of the run through a pidfd, after re-checking (with
+/// the pidfd held) its start time, the temporary uid and its membership of a
+/// run cgroup. `Ok(false)` when it is gone or no longer qualifies (never
+/// signalled then).
+fn kill_member(process: &UidProcess, uid: u32, run_cgroups: &[&str]) -> io::Result<bool> {
+    use rustix::process::{pidfd_open, pidfd_send_signal, Pid, PidfdFlags, Signal};
+    if process.pid <= 1 { return Ok(false); }
+    let raw = i32::try_from(process.pid).ok().and_then(Pid::from_raw).ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let descriptor = match pidfd_open(raw, PidfdFlags::empty()) {
+        Ok(fd) => fd,
+        Err(errno) if errno == rustix::io::Errno::SRCH => return Ok(false),
+        Err(errno) => return Err(errno.into()),
+    };
+    let verify = || -> io::Result<bool> {
+        if proc_stat(process.pid)?.1 != process.start { return Ok(false); }
+        let status = fs::read_to_string(format!("/proc/{}/status", process.pid))?;
+        if !crate::accounts::process_uids(&status)?.contains(&uid) && !crate::accounts::process_gids(&status)?.contains(&uid) {
+            return Ok(false);
+        }
+        let text = fs::read_to_string(format!("/proc/{}/cgroup", process.pid))?;
+        let actual = crate::accounts::unified_cgroup(&text)?;
+        if !run_cgroups.iter().any(|allowed| crate::accounts::cgroup_member(actual, allowed)) { return Ok(false); }
+        Ok(proc_stat(process.pid)?.1 == process.start)
+    };
+    match verify() {
+        Ok(true) => {}
+        Ok(false) => return Ok(false),
+        Err(error) if gone(&error) => return Ok(false),
+        Err(error) => return Err(error),
+    }
+    match pidfd_send_signal(&descriptor, Signal::KILL) {
+        Ok(()) => Ok(true),
+        Err(errno) if errno == rustix::io::Errno::SRCH => Ok(false),
+        Err(errno) => Err(errno.into()),
+    }
+}
+
 /// A temporary employee uid (= gid) in 70000..=99999 that no account, group
 /// or process uses. It is never written to the host account databases: the
 /// run's identity is the trampoline's own `/etc` projection, so nothing about
@@ -614,8 +783,13 @@ struct Teardown {
     storage: Option<LoopStorage>,
     provisioned: Option<(EmployeeId, duduclaw_isolation::ids::RequestId, Sha256Digest)>,
     uid: Option<u32>,
+    /// F3: the run unit's cgroup and the harness's own leaf slice
+    /// ([`run_cgroups`]); the only places whose processes may be signalled.
+    run_cgroups: Vec<String>,
     root: Option<PathBuf>,
 }
+const LEFT_RUN_PROCESSES: &str = "processes of the temporary employee uid in the run cgroup";
+const LEFT_UNSCANNED: &str = "processes of the temporary employee uid (the process table could not be read)";
 impl Teardown {
     fn finish(&mut self) -> Checked<()> {
         if self.finished { return Ok(()); }
@@ -637,13 +811,19 @@ impl Teardown {
                 left.push("the employee slice unit");
             }
         }
+        // F3: only members of the run cgroups are ever signalled; a process
+        // with the temporary uid anywhere else is reported, never touched.
+        let groups: Vec<&str> = self.run_cgroups.iter().map(String::as_str).collect();
         if let Some(uid) = self.uid {
-            let none = || crate::accounts::unexpected_processes(uid, None).is_ok_and(|found| found.is_empty());
-            if !wait_until(Duration::from_secs(5), none) {
-                if let Ok(found) = crate::accounts::unexpected_processes(uid, None) {
-                    for process in &found { let _ = crate::accounts::terminate_intruder(process, uid, None); }
+            let settled = || uid_processes(uid).is_ok_and(|found| teardown_selection(&found, &groups).kill.is_empty());
+            if !wait_until(Duration::from_secs(5), settled) {
+                if let Ok(found) = uid_processes(uid) {
+                    let selection = teardown_selection(&found, &groups);
+                    for process in found.iter().filter(|process| selection.kill.contains(&(process.pid, process.start))) {
+                        let _ = kill_member(process, uid, &groups);
+                    }
                 }
-                if !wait_until(Duration::from_secs(5), none) { left.push("processes of the temporary employee uid"); }
+                if !wait_until(Duration::from_secs(5), settled) { left.push(LEFT_RUN_PROCESSES); }
             }
         }
         self.attached = None;
@@ -679,8 +859,13 @@ impl Teardown {
         }
         if let Some(cgroup) = &self.cgroup { if cgroup.exists() { left.push("the run cgroup"); } }
         if let Some(uid) = self.uid {
-            if !crate::accounts::unexpected_processes(uid, None).is_ok_and(|found| found.is_empty()) {
-                left.push("processes of the temporary employee uid");
+            match uid_processes(uid) {
+                Ok(found) => {
+                    let selection = teardown_selection(&found, &groups);
+                    if !selection.kill.is_empty() { left.push(LEFT_RUN_PROCESSES); }
+                    if !selection.foreign.is_empty() { left.push(FOREIGN_UID_PROCESS); }
+                }
+                Err(_) => left.push(LEFT_UNSCANNED),
             }
         }
         if let Some(root) = &self.root { if fs::symlink_metadata(root).is_ok() { left.push("the harness directory"); } }
@@ -703,7 +888,7 @@ impl Drop for Teardown {
 
 /// Launch, converse, observe, tear down. `Err` for anything that prevented
 /// observing (with tear-down already verified); `Ok` carries the facts.
-pub(super) fn run(prepared: &Prepared, trampoline: &Path) -> Checked<Outcome> {
+pub(super) fn run(prepared: &Prepared, trampoline: &Path, trampoline_sha256: Sha256Digest) -> Checked<Outcome> {
     // The gates once more against the real process (tests inject facts).
     if unsafe { libc::geteuid() } != 0 || unsafe { libc::getegid() } != 0 { return Err(refusal::NOT_ROOT.into()); }
     if std::env::var_os(DISPOSABLE_ENV).is_none_or(|value| value.as_os_str() != std::ffi::OsStr::new("1")) {
@@ -723,7 +908,7 @@ pub(super) fn run(prepared: &Prepared, trampoline: &Path) -> Checked<Outcome> {
         return Err("accept: not supported on this host: no private mount namespace".into());
     }
     let mut teardown = Teardown::default();
-    let result = launch(prepared, trampoline, &signals, &mut teardown);
+    let result = launch(prepared, trampoline, trampoline_sha256, &signals, &mut teardown);
     let cleaned = teardown.finish();
     match (result, cleaned) {
         (_, Err(leftover)) => Err(leftover),
@@ -731,7 +916,12 @@ pub(super) fn run(prepared: &Prepared, trampoline: &Path) -> Checked<Outcome> {
     }
 }
 
-fn launch(prepared: &Prepared, trampoline_source: &Path, signals: &Signals, t: &mut Teardown) -> Checked<Outcome> {
+const UID_TAKEN: &str = "accept: refused: a temporary uid (employee, supervisor or gateway) gained an account, a group \
+    or a process before the launch";
+const TRAMPOLINE_COPY: &str = "accept: the root-owned trampoline copy is not --trampoline-sha256";
+
+fn launch(prepared: &Prepared, trampoline_source: &Path, trampoline_sha256: Sha256Digest, signals: &Signals, t: &mut Teardown)
+    -> Checked<Outcome> {
     let record = prepared.record();
     let native = prepared.native();
     let egress = matches!(record.network, NetworkPolicy::Egress(_));
@@ -743,8 +933,9 @@ fn launch(prepared: &Prepared, trampoline_source: &Path, signals: &Signals, t: &
     let employee = EmployeeId(random16()?);
     let run = RunHandle(duduclaw_isolation::ids::RunId(random16()?));
     let root = PathBuf::from(format!("/var/lib/duduclaw-acceptance-{}", hex(&random16()?)));
-    make_dir(&root, 0o700)?;
-    t.root = Some(root.clone());
+    // F5: the guard owns the directory from the moment it exists.
+    make_registered_dir(&root, 0o700, |path| t.root = Some(path.to_path_buf()), |path| secure_dir(path, 0o700))
+        .map_err(os_error("harness directory"))?;
     for (name, mode) in [("runtime", 0o755), ("etc-state", 0o700), ("projections", 0o755), ("storage", 0o700),
         ("storage-journal", 0o700), ("launcher", 0o700), ("snapshots", 0o700)] {
         make_dir(&root.join(name), mode)?;
@@ -756,8 +947,13 @@ fn launch(prepared: &Prepared, trampoline_source: &Path, signals: &Signals, t: &
     if let Some(forwarder) = &native.forwarder {
         install_copy(&prepared.artifacts.join(&forwarder.entry), &root.join("runtime").join(&forwarder.entry), Some(forwarder.executable_digest))?;
     }
+    // F1: the copy the unit executes is the trampoline the release manifest
+    // names: copied with that expected digest, then hashed again from disk.
     let launcher_path = root.join("launcher").join("duduclaw-run");
-    let trampoline_sha256 = install_copy(trampoline_source, &launcher_path, None)?;
+    install_copy(trampoline_source, &launcher_path, Some(trampoline_sha256))?;
+    if File::open(&launcher_path).and_then(digest_file).map_err(os_error("trampoline copy"))? != trampoline_sha256 {
+        return Err(TRAMPOLINE_COPY.into());
+    }
     let launcher_text = launcher_path.to_str().ok_or("accept: harness path is not UTF-8")?.to_owned();
     t.systemd = Some(crate::systemd::linux::Systemd::connect().map_err(os_error("system bus"))?);
 
@@ -828,17 +1024,29 @@ fn launch(prepared: &Prepared, trampoline_source: &Path, signals: &Signals, t: &
         receipt.device_major, receipt.device_minor).map_err(os_error("UnitPolicy::new"))?;
     unit_policy.properties.remove("BindsTo");
     unit_policy.properties.remove("After");
-    t.slice = Some(crate::systemd::employee_slice(employee));
+    let slice_name = crate::systemd::employee_slice(employee);
+    t.slice = Some(slice_name.clone());
+    // F3: the numbers are re-checked immediately before the launch; a process
+    // that took one meanwhile is never adopted (nor signalled) by this run.
+    if !number_free(uid) || !number_free(supervisor) || !number_free(gateway_uid) { return Err(UID_TAKEN.into()); }
     let systemd = t.systemd.as_ref().ok_or("accept: system bus")?;
     let unit = systemd.start_acceptance(&unit_policy, &launcher_text, bootstrap.bootstrap_for_unit.as_fd(),
         stdout_write.as_fd(), stderr_write.as_fd()).map_err(os_error("transient run unit"))?;
     t.cgroup = Some(unit.cgroup.clone());
     let unit_cgroup = format!("/{}", unit.cgroup.strip_prefix("/sys/fs/cgroup").map_err(|_| "accept: run cgroup".to_owned())?.display());
+    t.run_cgroups = run_cgroups(&unit_cgroup, &slice_name);
     // The launcher process, bound by a pidfd: PID 1's MainPID of this unit,
     // in its cgroup, executing the trampoline copy.
     let main_pid = systemd.acceptance_main_pid(&unit).map_err(os_error("MainPID"))?;
     let launcher = pin(main_pid, None).map_err(os_error("launcher pidfd"))?.ok_or("accept: the trampoline exited before the bootstrap")?;
     let launcher_exe = exe_digest(main_pid).ok().filter(|_| cgroup_member(main_pid, &unit_cgroup) && alive(&launcher));
+    // F2: who may live in the run cgroup, and the bounds of a complete walk
+    // (the unit's TasksMax is the record's task limit).
+    let ids = Identities { launcher: (launcher.pid, launcher.start), trampoline: trampoline_sha256,
+        runtime: prepared.runtime_digest, bridge: prepared.bridge_digest,
+        forwarder: native.forwarder.as_ref().map(|forwarder| forwarder.executable_digest) };
+    let limits = WalkLimits::for_tasks(record.resources.tasks);
+    let mut cache = ExeCache::default();
     let cancelled = Arc::new(AtomicBool::new(false));
     t.cancelled = Some(cancelled.clone());
     let trampoline = t.trampoline.as_mut().ok_or("accept: trampoline")?;
@@ -871,7 +1079,9 @@ fn launch(prepared: &Prepared, trampoline_source: &Path, signals: &Signals, t: &
             Err(_) if responder.complete() => run_end = Some("ended with a launcher error status after the conversation".into()),
             Err(_) => { failure = Some("the trampoline reported an error before the MCP conversation completed"); break; }
         }
-        census.scan(&unit.cgroup, prepared.bridge_digest);
+        if run_end.is_none() {
+            census_scan(&mut census, &unit.cgroup, &launcher, &ids, &limits, &mut cache, responder.complete());
+        }
         readable(gateway_end.as_raw_fd(), 20);
         if !socket_closed {
             match read_some(gateway_end.as_raw_fd(), &mut buffer).map_err(os_error("MCP socket"))? {
@@ -884,9 +1094,7 @@ fn launch(prepared: &Prepared, trampoline_source: &Path, signals: &Signals, t: &
                     if !reply.is_empty() { send_all(gateway_end.as_raw_fd(), &reply, deadline).map_err(os_error("MCP socket"))?; }
                     if responder.initialize_held() && tree.is_none() {
                         // Facts a and b, while the reply is withheld.
-                        census.scan(&unit.cgroup, prepared.bridge_digest);
-                        tree = Some(observe_tree(&launcher, &unit_cgroup, socket, prepared.runtime_digest, prepared.bridge_digest)
-                            .map_err(os_error("process observation"))?);
+                        tree = Some(observe(&launcher, &unit.cgroup, &unit_cgroup, socket, &ids, &limits, &mut census, &mut cache));
                         let reply = match responder.release_initialize(true) {
                             Ok(reply) => reply,
                             Err(limit) => { failure = Some(limit); break; }
@@ -930,12 +1138,13 @@ fn launch(prepared: &Prepared, trampoline_source: &Path, signals: &Signals, t: &
         projection_is_api_worker_config: serde_json::from_slice::<Value>(&mounted).is_ok_and(|value| value == expected),
         projection_mount_id: publication.projection_mount_id.unwrap_or(0),
         decoys_planted, decoy_markers_present: decoy_markers(attached.home.as_fd()).map_err(os_error("decoy readback"))?,
-        bridge_processes_seen: census.bridges.len() as u32,
+        bridge_processes_seen: census.bridges(&ids),
     };
-    let tree = tree.unwrap_or(Tree { runtime: None, fd3: Fd3::Other, bridge: None });
+    let tree = tree.unwrap_or(Tree { runtime: None, fd3: Fd3::Other, bridge: None, incomplete: None });
+    let incomplete = tree.incomplete.or_else(|| census.finish(&ids));
     let observations = Observations { uid, socket, runtime_digest: prepared.runtime_digest, bridge_digest: prepared.bridge_digest,
         trampoline_digest: trampoline_sha256, launcher_exe_sha256: launcher_exe, runtime: tree.runtime, runtime_fd3: tree.fd3,
-        bridge: tree.bridge, initialize: responder.facts(), exclusive, run_end: run_end.unwrap_or_default() };
+        bridge: tree.bridge, initialize: responder.facts(), exclusive, run_end: run_end.unwrap_or_default(), incomplete };
     t.descriptors.extend([gateway_end, stdout_read, stderr_read]);
     t.descriptors.extend(egress_gateway);
     Ok(Outcome { frames: responder.frames().to_vec(), observations, trampoline_sha256, kernel: kernel_release() })

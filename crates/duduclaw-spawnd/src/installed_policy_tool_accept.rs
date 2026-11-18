@@ -12,9 +12,21 @@
 //! evidence and the output source; a record never carries a non-zero exit.
 //!
 //! This file holds the parts that need no privilege (gates, the responder,
-//! the decision, the evidence encoding and checks, the output source); the
-//! root launch is [`harness`].
+//! the classification of the run cgroup, the decision, the tear-down
+//! selection, the evidence encoding and checks, the output source); the root
+//! launch is [`harness`].
+//!
+//! Security review round 1 (R8r-4): the trampoline is bound to the shipped
+//! one (`--trampoline-sha256`, checked again by `verify --manifest
+//! --evidence-dir` against the manifest's `InstallTarget::Trampoline`, F1);
+//! every observation is complete or there is no record ([`classify`],
+//! [`Census`], [`incomplete`], F2); the tear-down signals only members of the
+//! run cgroup ([`teardown_selection`], F3); `verify --evidence-dir` re-parses,
+//! replays and re-decides the evidence ([`check_evidence`], F4); the harness
+//! directory is registered for removal right after its mkdir
+//! ([`make_registered_dir`], F5).
 use super::*;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::Duration;
 
@@ -107,6 +119,8 @@ pub(super) mod refusal {
     pub const OUT_SOURCE: &str = "accept: refused: --out-source must not exist and its directory must exist";
     pub const OUT_IS_SOURCE: &str = "accept: refused: --out-source must not be --source (the input is never modified)";
     pub const TRAMPOLINE: &str = "accept: refused: --trampoline must be a regular file (the duduclaw-run binary)";
+    pub const TRAMPOLINE_DIGEST: &str = "accept: refused: the SHA-256 of --trampoline is not --trampoline-sha256 \
+        (the duduclaw-run the release manifest will name)";
     pub const LABEL_MISSING: &str = "accept: refused: no runtime with this --label in the source";
     pub const NOT_API_WORKER: &str = "accept: refused: the labelled runtime is not open_ai_compat with mcp: true \
         (this harness covers only the api worker)";
@@ -158,16 +172,34 @@ pub(super) struct Request {
     pub arch: Arch,
     pub label: String,
     pub trampoline: PathBuf,
+    /// F1: the SHA-256 of the `duduclaw-run` the release manifest will name
+    /// (`InstallTarget::Trampoline`), computed from the same archive snapshot
+    /// the trampoline file was staged from. `verify --manifest --evidence-dir`
+    /// proves the equality with the signed manifest afterwards.
+    pub trampoline_sha256: Sha256Digest,
     pub evidence: PathBuf,
     pub out_source: PathBuf,
 }
 
+/// 64 lowercase hex characters.
+pub(super) fn parse_digest_hex(text: &str) -> Option<Sha256Digest> {
+    if text.len() != 64 || !text.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')) { return None; }
+    let mut out = [0u8; 32];
+    for (index, pair) in text.as_bytes().chunks(2).enumerate() {
+        out[index] = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+    }
+    Some(Sha256Digest(out))
+}
+
 fn parse_request(args: &[String]) -> Checked<Request> {
-    let values = options(args, &["--source", "--artifacts-dir", "--arch", "--label", "--trampoline", "--evidence-dir", "--out-source"])?;
+    let values = options(args, &["--source", "--artifacts-dir", "--arch", "--label", "--trampoline", "--trampoline-sha256",
+        "--evidence-dir", "--out-source"])?;
     let get = |key: &str| values.get(key).cloned().ok_or_else(|| format!("accept needs {key}"));
+    let trampoline_sha256 = parse_digest_hex(&get("--trampoline-sha256")?)
+        .ok_or_else(|| "--trampoline-sha256 must be 64 lowercase hex characters".to_owned())?;
     let request = Request { source: get("--source")?.into(), artifacts: get("--artifacts-dir")?.into(),
         arch: parse_arch(&get("--arch")?)?, label: get("--label")?, trampoline: get("--trampoline")?.into(),
-        evidence: get("--evidence-dir")?.into(), out_source: get("--out-source")?.into() };
+        trampoline_sha256, evidence: get("--evidence-dir")?.into(), out_source: get("--out-source")?.into() };
     check_label("--label", &request.label)?;
     Ok(request)
 }
@@ -194,7 +226,12 @@ pub(super) fn host_gate(facts: &HostFacts, request: &Request) -> std::result::Re
     if !fs::metadata(&out_parent).is_ok_and(|metadata| metadata.is_dir()) { return Err(refusal::OUT_SOURCE); }
     if request.out_source == request.source { return Err(refusal::OUT_IS_SOURCE); }
     if !fs::symlink_metadata(&request.trampoline).is_ok_and(|metadata| metadata.is_file()) { return Err(refusal::TRAMPOLINE); }
-    Ok(())
+    // F1: hashing is not a side effect; the root copy is checked again.
+    match file_digest(&request.trampoline) {
+        Ok((digest, _)) if digest == request.trampoline_sha256 => Ok(()),
+        Ok(_) => Err(refusal::TRAMPOLINE_DIGEST),
+        Err(_) => Err(refusal::TRAMPOLINE),
+    }
 }
 
 /// The labelled runtime exists, is the api worker with MCP, and has no record yet.
@@ -442,6 +479,10 @@ impl Fd3 {
     fn name(self) -> &'static str {
         match self { Self::ExpectedSocket => "expected_socket", Self::Absent => "absent", Self::Other => "other" }
     }
+    fn from_name(name: &str) -> Option<Self> {
+        match name { "expected_socket" => Some(Self::ExpectedSocket), "absent" => Some(Self::Absent), "other" => Some(Self::Other),
+            _ => None }
+    }
 }
 /// One process, observed while pinned by a pidfd.
 #[derive(Clone)]
@@ -495,12 +536,327 @@ pub(super) struct Observations {
     pub exclusive: ExclusiveFacts,
     /// How the run ended (after the conversation): "exited 1", "killed by the harness", ...
     pub run_end: String,
+    /// F2: why the observation is not complete ([`incomplete`]); `Some` means
+    /// no record. Never written to the evidence (a record has none).
+    pub incomplete: Option<&'static str>,
+}
+
+// ── the run cgroup: complete enumeration and classification (F2) ────────
+//
+// Which processes legitimately live in the run unit's cgroup (duduclaw-run
+// `runner.rs`; the harness refuses runtimes with a helper launcher, so the HX
+// launcher is never forked), each bound by its `/proc/<pid>/exe` SHA-256:
+//
+// | process | parent | exe digest bound to |
+// |---|---|---|
+// | supervisor = the unit's `MainPID` | PID 1 (systemd) | the trampoline (`--trampoline-sha256` = manifest `Trampoline`) |
+// | init (PID 1 of the run's PID namespace; a clone, never exec'd) | supervisor | the trampoline |
+// | forwarder (only `network: egress`) | init | `native.forwarder.executable_digest` = manifest `EgressForwarder` |
+// | runtime (the api worker) | init | the record's runtime digest = manifest `RuntimeEntry` |
+// | bridge (`/runtime/duduclaw-mcp-bridge`) | runtime (init once the runtime is gone) | the record's bridge digest = manifest `McpBridge` |
+//
+// plus the transient pre-exec windows of the same processes: a fork of init
+// still shows the trampoline digest before it executes the forwarder or the
+// runtime, a fork of the runtime still shows the runtime digest before it
+// executes the bridge. A process keeps its `(pid, start)` across exec, so the
+// census allows exactly the transitions trampoline → forwarder, trampoline →
+// runtime and runtime → bridge. Threads are not cgroup.procs entries. Any
+// other digest, parent or transition is `unexpected_process`: refused by
+// default. Nothing else is placed in the unit by systemd (`Type=exec`, one
+// main process) and nothing inside the run reaches cgroupfs.
+
+/// Fixed reasons an observation is incomplete; any of them means no record.
+pub(super) mod incomplete {
+    pub const CGROUP_UNREADABLE: &str = "cgroup_unreadable";
+    pub const CGROUP_UNSTABLE: &str = "cgroup_unstable";
+    pub const CGROUP_TREE_CAP: &str = "cgroup_tree_cap";
+    pub const NODE_CAP: &str = "tree_node_cap";
+    pub const DEPTH_CAP: &str = "tree_depth_cap";
+    pub const CENSUS_CAP: &str = "census_cap";
+    pub const UNREADABLE_PROCESS: &str = "unreadable_process";
+    pub const HASH_ERROR: &str = "hash_error";
+    pub const UNCONFIRMED_EXIT: &str = "unconfirmed_exit";
+    pub const UNEXPECTED_PROCESS: &str = "unexpected_process";
+    pub const LAUNCHER_MISSING: &str = "launcher_missing";
+    pub const PROCESS_FACTS: &str = "process_facts_unreadable";
+}
+
+/// The fixed refusal of [`decide`] for an incomplete observation.
+pub(super) fn incomplete_message(reason: &str) -> &'static str {
+    use incomplete::*;
+    match reason {
+        CGROUP_UNREADABLE => "incomplete observation (cgroup_unreadable): the run cgroup could not be enumerated",
+        CGROUP_UNSTABLE => "incomplete observation (cgroup_unstable): no two consecutive enumerations of the run cgroup agreed",
+        CGROUP_TREE_CAP => "incomplete observation (cgroup_tree_cap): the run cgroup has more sub-cgroups than the harness walks",
+        NODE_CAP => "incomplete observation (tree_node_cap): the run cgroup listed more processes than its task limit",
+        DEPTH_CAP => "incomplete observation (tree_depth_cap): a process chain is deeper than the run's task limit",
+        CENSUS_CAP => "incomplete observation (census_cap): more distinct processes than the census holds",
+        UNREADABLE_PROCESS => "incomplete observation (unreadable_process): a live process in the run cgroup could not be read",
+        HASH_ERROR => "incomplete observation (hash_error): the executable of a process in the run cgroup could not be hashed",
+        UNCONFIRMED_EXIT => "incomplete observation (unconfirmed_exit): a process vanished without its pidfd confirming the exit",
+        UNEXPECTED_PROCESS => "incomplete observation (unexpected_process): a process in the run cgroup is not the trampoline, \
+            the forwarder, the runtime or the bridge in its documented place",
+        LAUNCHER_MISSING => "incomplete observation (launcher_missing): the unit's main process was not in the run cgroup \
+            before the conversation completed",
+        PROCESS_FACTS => "incomplete observation (process_facts_unreadable): the runtime's or the bridge's facts could not be read",
+        _ => "incomplete observation (unknown reason)",
+    }
+}
+
+/// One cgroup member as one inspection saw it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum MemberRead {
+    /// Pinned by a pidfd between two reads of the same start time; `exe` is
+    /// the SHA-256 of its executable at that time.
+    Live { start: u64, ppid: u32, exe: Sha256Digest },
+    /// Its `/proc` entry was gone; `confirmed`: the pidfd reported the exit
+    /// (or `pidfd_open` reported ESRCH).
+    Exited { confirmed: bool },
+    /// Alive, but its stat or executable could not be read.
+    Unreadable,
+    /// Its executable could not be hashed.
+    HashError,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Member { pub pid: u32, pub read: MemberRead }
+/// One enumeration of the whole unit cgroup (its `cgroup.procs` and those of
+/// every sub-cgroup, re-read until two consecutive reads around the
+/// inspection agree), or why there is none.
+#[derive(Clone, Debug, Default)]
+pub(super) struct CgroupSnapshot { pub members: Vec<Member>, pub incomplete: Option<&'static str> }
+
+/// Who the run's processes may be, by digest (table above).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Identities {
+    /// `(pid, start)` of the unit's main process, pinned at start.
+    pub launcher: (u32, u64),
+    pub trampoline: Sha256Digest,
+    pub runtime: Sha256Digest,
+    pub bridge: Sha256Digest,
+    pub forwarder: Option<Sha256Digest>,
+}
+
+/// The distinct processes the census keeps. A legitimate run has at most five
+/// (supervisor, init, forwarder, runtime, bridge), so this is never reached
+/// by a legitimate run.
+pub(super) const CENSUS_MAX: usize = 4096;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct WalkLimits { pub max_nodes: usize, pub max_depth: u32, pub max_census: usize }
+impl WalkLimits {
+    /// The run unit's `TasksMax` is the record's `resources.tasks`
+    /// (`UnitPolicy::new`): the pids controller never lets the unit hold more
+    /// processes, so neither the member count nor a parent chain (at most the
+    /// member count) can legitimately exceed it. The walk is never truncated:
+    /// reaching a limit is an incomplete observation.
+    pub(super) fn for_tasks(tasks: u32) -> Self {
+        Self { max_nodes: tasks as usize, max_depth: tasks, max_census: CENSUS_MAX }
+    }
+}
+
+/// A live member with its depth below the unit's main process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct LiveMember { pub pid: u32, pub start: u64, pub ppid: u32, pub exe: Sha256Digest, pub depth: u32 }
+#[derive(Clone, Debug, Default)]
+pub(super) struct Classified {
+    pub live: Vec<LiveMember>,
+    /// `(pid, depth below the main process)` of the only runtime-digest member.
+    pub runtime: Option<(u32, u32)>,
+    /// `(pid, distance below the runtime)` of the only bridge-digest member.
+    pub bridge: Option<(u32, u32)>,
+}
+
+/// Classify one complete snapshot: every member must be live and in its
+/// documented place (table above), else the fixed reason.
+pub(super) fn classify(snapshot: &CgroupSnapshot, ids: &Identities, limits: &WalkLimits)
+    -> std::result::Result<Classified, &'static str> {
+    use incomplete::*;
+    if let Some(reason) = snapshot.incomplete { return Err(reason); }
+    if snapshot.members.len() > limits.max_nodes { return Err(NODE_CAP); }
+    let mut live: BTreeMap<u32, (u64, u32, Sha256Digest)> = BTreeMap::new();
+    for member in &snapshot.members {
+        match &member.read {
+            MemberRead::Live { start, ppid, exe } => {
+                if live.insert(member.pid, (*start, *ppid, *exe)).is_some() { return Err(CGROUP_UNSTABLE); }
+            }
+            MemberRead::Exited { confirmed: true } => {}
+            MemberRead::Exited { confirmed: false } => return Err(UNCONFIRMED_EXIT),
+            MemberRead::Unreadable => return Err(UNREADABLE_PROCESS),
+            MemberRead::HashError => return Err(HASH_ERROR),
+        }
+    }
+    let (launcher_pid, launcher_start) = ids.launcher;
+    match live.get(&launcher_pid) {
+        Some((start, _, _)) if *start == launcher_start => {}
+        Some(_) => return Err(UNEXPECTED_PROCESS),
+        None => return Err(LAUNCHER_MISSING),
+    }
+    // Every member descends from the main process inside the cgroup.
+    let mut members = Vec::with_capacity(live.len());
+    for (&pid, &(start, ppid, exe)) in &live {
+        let mut depth = 0u32;
+        let mut current = pid;
+        while current != launcher_pid {
+            let parent = live.get(&current).map(|(_, parent, _)| *parent).ok_or(UNEXPECTED_PROCESS)?;
+            if !live.contains_key(&parent) { return Err(UNEXPECTED_PROCESS); }
+            depth += 1;
+            if depth > limits.max_depth { return Err(DEPTH_CAP); }
+            if depth as usize > live.len() { return Err(UNEXPECTED_PROCESS); }
+            current = parent;
+        }
+        members.push(LiveMember { pid, start, ppid, exe, depth });
+    }
+    let depth_of: BTreeMap<u32, u32> = members.iter().map(|member| (member.pid, member.depth)).collect();
+    let digest_of = |pid: u32| live.get(&pid).map(|(_, _, exe)| *exe);
+    let (mut spawned_runtimes, mut forwarders, mut inits, mut init_forks) = (0usize, 0usize, 0usize, 0usize);
+    for member in &members {
+        let parent = digest_of(member.ppid);
+        let from_init = parent == Some(ids.trampoline) && depth_of.get(&member.ppid) == Some(&1);
+        let placed = if member.pid == launcher_pid {
+            member.exe == ids.trampoline
+        } else if member.exe == ids.trampoline {
+            // init (depth 1) and the pre-exec forks of init (depth 2: the
+            // forwarder and the runtime before their exec).
+            if member.depth == 1 { inits += 1; } else { init_forks += 1; }
+            parent == Some(ids.trampoline) && member.depth <= 2
+        } else if Some(member.exe) == ids.forwarder {
+            forwarders += 1;
+            from_init
+        } else if member.exe == ids.runtime {
+            if from_init { spawned_runtimes += 1; true } else { parent == Some(ids.runtime) }
+        } else if member.exe == ids.bridge {
+            parent == Some(ids.runtime) || from_init
+        } else {
+            false
+        };
+        if !placed { return Err(UNEXPECTED_PROCESS); }
+    }
+    if spawned_runtimes > 1 || forwarders > 1 || inits > 1 || init_forks > 2 { return Err(UNEXPECTED_PROCESS); }
+    let runtimes: Vec<&LiveMember> = members.iter().filter(|member| member.exe == ids.runtime).collect();
+    let bridges: Vec<&LiveMember> = members.iter().filter(|member| member.exe == ids.bridge).collect();
+    let runtime = match runtimes.as_slice() { [only] => Some((only.pid, only.depth)), _ => None };
+    let ancestor = |mut pid: u32, steps: u32| -> Option<u32> {
+        for _ in 0..steps { pid = live.get(&pid).map(|(_, parent, _)| *parent)?; }
+        Some(pid)
+    };
+    let bridge = match (runtime, bridges.as_slice()) {
+        (Some((runtime_pid, runtime_depth)), [only]) if only.depth > runtime_depth
+            && ancestor(only.pid, only.depth - runtime_depth) == Some(runtime_pid) => Some((only.pid, only.depth - runtime_depth)),
+        _ => None,
+    };
+    Ok(Classified { live: members, runtime, bridge })
+}
+
+/// The digests one `(pid, start)` had, in order: constant, or one documented exec.
+fn allowed_sequence(digests: &[Sha256Digest], ids: &Identities) -> bool {
+    let known = |digest: &Sha256Digest| *digest == ids.trampoline || *digest == ids.runtime || *digest == ids.bridge
+        || Some(*digest) == ids.forwarder;
+    match digests {
+        [one] => known(one),
+        [first, second] => (*first == ids.trampoline && (*second == ids.runtime || Some(*second) == ids.forwarder))
+            || (*first == ids.runtime && *second == ids.bridge),
+        _ => false,
+    }
+}
+
+/// Every process ever seen in the run cgroup by `(pid, start)` with the
+/// digests it had, from complete snapshots taken on every turn of the
+/// conversation loop; sticky `incomplete`.
+#[derive(Default)]
+pub(super) struct Census { pub seen: BTreeMap<(u32, u64), Vec<Sha256Digest>>, pub incomplete: Option<&'static str> }
+impl Census {
+    pub(super) fn fail(&mut self, reason: &'static str) {
+        if self.incomplete.is_none() { self.incomplete = Some(reason); }
+    }
+    /// `launcher_exited`: the main process's pidfd reported its exit (read
+    /// after the snapshot). The supervisor exits only after init, whose exit
+    /// SIGKILLs everything in the run's PID namespace, so a later snapshot
+    /// shows only processes being torn down and is not classified; before the
+    /// conversation completed that is itself a refusal.
+    pub(super) fn record(&mut self, snapshot: &CgroupSnapshot, ids: &Identities, limits: &WalkLimits, launcher_exited: bool,
+        after_conversation: bool) {
+        if self.incomplete.is_some() { return; }
+        if launcher_exited {
+            if !after_conversation { self.fail(incomplete::LAUNCHER_MISSING); }
+            return;
+        }
+        let classified = match classify(snapshot, ids, limits) {
+            Ok(classified) => classified,
+            Err(reason) => { self.fail(reason); return; }
+        };
+        for member in &classified.live {
+            let digests = self.seen.entry((member.pid, member.start)).or_default();
+            if digests.last() != Some(&member.exe) { digests.push(member.exe); }
+        }
+        if self.seen.len() > limits.max_census { self.fail(incomplete::CENSUS_CAP); return; }
+        if self.seen.values().any(|digests| !allowed_sequence(digests, ids)) { self.fail(incomplete::UNEXPECTED_PROCESS); }
+    }
+    /// The census's verdict: incomplete, or more than one runtime (a runtime-
+    /// digest process that never became the bridge) or forwarder ever.
+    pub(super) fn finish(&self, ids: &Identities) -> Option<&'static str> {
+        if self.incomplete.is_some() { return self.incomplete; }
+        let runtimes = self.seen.values().filter(|d| d.contains(&ids.runtime) && !d.contains(&ids.bridge)).count();
+        let forwarders = self.seen.values().filter(|d| ids.forwarder.is_some_and(|f| d.contains(&f))).count();
+        if runtimes > 1 || forwarders > 1 { return Some(incomplete::UNEXPECTED_PROCESS); }
+        None
+    }
+    /// Distinct processes that ever had the bridge digest.
+    pub(super) fn bridges(&self, ids: &Identities) -> u32 {
+        self.seen.values().filter(|digests| digests.contains(&ids.bridge)).count() as u32
+    }
+}
+
+// ── tear-down selection (F3) ────────────────────────────────────────────
+
+/// A process with the temporary uid (any uid or gid field), as the
+/// tear-down's scan saw it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct UidProcess { pub pid: u32, pub start: u64, pub cgroup: Option<String> }
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct TeardownSelection {
+    /// Members of the run cgroups: signalled (pidfd, start time re-checked).
+    pub kill: Vec<(u32, u64)>,
+    /// Same uid OUTSIDE them: never signalled, reported `foreign_uid_process`.
+    pub foreign: Vec<(u32, u64)>,
+}
+pub(super) const FOREIGN_UID_PROCESS: &str = "foreign_uid_process";
+/// Only processes proven to belong to this run may be signalled.
+pub(super) fn teardown_selection(processes: &[UidProcess], run_cgroups: &[&str]) -> TeardownSelection {
+    let mut selection = TeardownSelection::default();
+    for process in processes {
+        let inside = process.pid > 1 && process.cgroup.as_deref().is_some_and(|actual|
+            run_cgroups.iter().any(|allowed| crate::accounts::cgroup_member(actual, allowed)));
+        if inside { selection.kill.push((process.pid, process.start)); } else { selection.foreign.push((process.pid, process.start)); }
+    }
+    selection
+}
+/// The run unit's cgroup and, when it is its parent, the harness's own leaf
+/// employee slice.
+pub(super) fn run_cgroups(unit_cgroup: &str, slice: &str) -> Vec<String> {
+    let mut groups = vec![unit_cgroup.to_owned()];
+    if let Some((parent, _)) = unit_cgroup.rsplit_once('/') {
+        if !parent.is_empty() && parent.rsplit('/').next() == Some(slice) { groups.push(parent.to_owned()); }
+    }
+    groups
+}
+
+// ── harness directory (F5) ──────────────────────────────────────────────
+
+/// Create `path`, hand it to `register` (the tear-down guard) right after the
+/// mkdir succeeded, then `secure` it (chmod/chown): a failing `secure` leaves
+/// a registered directory the guard removes.
+pub(super) fn make_registered_dir(path: &Path, mode: u32, register: impl FnOnce(&Path),
+    secure: impl FnOnce(&Path) -> io::Result<()>) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new().mode(mode).create(path)?;
+    register(path);
+    secure(path)
 }
 
 /// The four facts of the record. `Ok` only when every fact was positively
 /// observed (then all four exits are 0); any missing or false fact is `Err`
 /// naming it, and no record is written.
 pub(super) fn decide(o: &Observations) -> std::result::Result<(), &'static str> {
+    if let Some(reason) = o.incomplete { return Err(incomplete_message(reason)); }
     let uid = [o.uid; 4];
     if o.socket.inode == 0 || o.socket.mount_id == 0 || o.runtime_digest == o.bridge_digest
         || !(duduclaw_isolation::ids::EMPLOYEE_UID_MIN..=duduclaw_isolation::ids::EMPLOYEE_UID_MAX).contains(&o.uid) {
@@ -620,20 +976,112 @@ fn sha(bytes: &[u8]) -> Sha256Digest { Sha256Digest(Sha256::digest(bytes).into()
 pub(super) fn transcript_jsonl(frames: &[Frame]) -> Vec<u8> {
     let mut out = Vec::new();
     for (index, frame) in frames.iter().enumerate() {
-        out.extend(canonical(&json!({"seq": index as u64 + 1, "direction": frame.direction.name(),
-            "sha256": hex(&sha(&frame.payload).0), "length": frame.payload.len() as u64,
-            "payload_base64": base64(&frame.payload)})));
+        out.extend(canonical_of(&TranscriptLine { seq: index as u64 + 1, direction: frame.direction.name().into(),
+            sha256: hex(&sha(&frame.payload).0), length: frame.payload.len() as u64, payload_base64: base64(&frame.payload) }));
         out.push(b'\n');
     }
     out
 }
 
-fn process_json(process: &Option<ProcessFacts>) -> Value {
-    match process {
-        None => Value::Null,
-        Some(p) => json!({"pid": p.pid, "depth": p.depth, "uids": p.uids.to_vec(), "exe_sha256": hex(&p.exe_sha256.0),
-            "cgroup_member": p.cgroup_member, "socket_fds": p.socket_fds, "alive_through_observation": p.alive_through_observation}),
-    }
+/// Canonical JSON of a typed value (its fields are plain JSON scalars,
+/// arrays and objects, so the conversion cannot fail).
+fn canonical_of<T: Serialize>(value: &T) -> Vec<u8> { canonical(&serde_json::to_value(value).unwrap_or(Value::Null)) }
+
+/// One line of `transcript.jsonl`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct TranscriptLine { pub seq: u64, pub direction: String, pub sha256: String, pub length: u64, pub payload_base64: String }
+
+/// `acceptance-manifest.json`, typed: the writer encodes exactly this and
+/// `verify --evidence-dir` accepts exactly this (unknown fields refused,
+/// canonical re-encoding byte-identical to the file).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct EvidenceDocument {
+    pub domain: String,
+    pub format: u64,
+    pub arch: String,
+    /// The policy tool that ran `accept` (`/proc/self/exe`). The tool is not
+    /// shipped, so no manifest names it: the signing ceremony pins it out of
+    /// band (`verify --harness-sha256`).
+    pub harness_sha256: String,
+    pub trampoline_sha256: String,
+    pub runtime_sha256: String,
+    pub bridge_sha256: String,
+    pub projection_sha256: String,
+    pub launch_policy_sha256: String,
+    pub transcript_sha256: String,
+    pub observations: ObservationsDocument,
+    pub kernel: String,
+    pub finished_unix: u64,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ObservationsDocument {
+    pub parent_exec: ParentExecDocument,
+    pub mcp_child_exec: McpChildExecDocument,
+    pub initialize: InitializeDocument,
+    pub exclusive_config: ExclusiveDocument,
+    pub run_end: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ParentExecDocument {
+    pub uid: u32,
+    pub socket: SocketDocument,
+    pub launcher_exe_sha256: Option<String>,
+    pub runtime: Option<ProcessDocument>,
+    pub fd3: String,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SocketDocument { pub inode: u64, pub mount_id: u64 }
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ProcessDocument {
+    pub pid: u32,
+    pub depth: u32,
+    pub uids: [u32; 4],
+    pub exe_sha256: String,
+    pub cgroup_member: bool,
+    pub socket_fds: Vec<i32>,
+    pub alive_through_observation: bool,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct McpChildExecDocument { pub bridge: Option<ProcessDocument> }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct InitializeDocument {
+    pub initialize_requests: u32,
+    pub observed_before_reply: bool,
+    pub initialized_after_reply: bool,
+    pub tools_list_answered: bool,
+    pub refused_frames: u32,
+    pub frames: u32,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ExclusiveDocument {
+    pub projection_bytes_exact: bool,
+    pub projection_is_api_worker_config: bool,
+    pub projection_mount_id: u64,
+    pub decoys_planted: u32,
+    pub decoy_markers_present: u32,
+    pub bridge_processes_seen: u32,
+    pub initialize_requests: u32,
+}
+
+fn process_document(process: &Option<ProcessFacts>) -> Option<ProcessDocument> {
+    process.as_ref().map(|p| ProcessDocument { pid: p.pid, depth: p.depth, uids: p.uids, exe_sha256: hex(&p.exe_sha256.0),
+        cgroup_member: p.cgroup_member, socket_fds: p.socket_fds.clone(), alive_through_observation: p.alive_through_observation })
+}
+fn process_facts_of(document: &Option<ProcessDocument>) -> std::result::Result<Option<ProcessFacts>, &'static str> {
+    document.as_ref().map(|p| -> std::result::Result<ProcessFacts, &'static str> {
+        Ok(ProcessFacts { pid: p.pid, depth: p.depth, uids: p.uids,
+            exe_sha256: parse_digest_hex(&p.exe_sha256).ok_or(evidence_refusal::DIGEST_SYNTAX)?, cgroup_member: p.cgroup_member,
+            socket_fds: p.socket_fds.clone(), alive_through_observation: p.alive_through_observation })
+    }).transpose()
 }
 
 /// The bindings of one acceptance run (all digests lowercase hex in the manifest).
@@ -654,33 +1102,60 @@ pub(super) struct EvidenceSummary<'a> {
 /// `acceptance-manifest.json` (canonical JSON). Its SHA-256 is the record's
 /// `transcript_digest`, so the signed record binds the transcript digest and
 /// the harness, trampoline, architecture and format without a new field.
-pub(super) fn evidence_manifest(s: &EvidenceSummary<'_>) -> Vec<u8> {
+pub(super) fn evidence_manifest(s: &EvidenceSummary<'_>) -> Vec<u8> { encode_evidence(&evidence_document(s)) }
+
+/// The canonical bytes of an evidence document.
+pub(super) fn encode_evidence(document: &EvidenceDocument) -> Vec<u8> { canonical_of(document) }
+
+pub(super) fn evidence_document(s: &EvidenceSummary<'_>) -> EvidenceDocument {
     let o = s.observations;
     let i = &o.initialize;
     let e = &o.exclusive;
-    canonical(&json!({
-        "domain": EVIDENCE_DOMAIN, "format": EVIDENCE_FORMAT, "arch": arch_name(s.arch),
-        "harness_sha256": hex(&s.harness_sha256.0), "trampoline_sha256": hex(&s.trampoline_sha256.0),
-        "runtime_sha256": hex(&s.runtime_sha256.0), "bridge_sha256": hex(&s.bridge_sha256.0),
-        "projection_sha256": hex(&s.projection_sha256.0), "launch_policy_sha256": hex(&s.launch_policy_sha256.0),
-        "transcript_sha256": hex(&s.transcript_sha256.0),
-        "observations": {
-            "parent_exec": {"uid": o.uid, "socket": {"inode": o.socket.inode, "mount_id": o.socket.mount_id},
-                "launcher_exe_sha256": o.launcher_exe_sha256.map(|d| hex(&d.0)), "runtime": process_json(&o.runtime),
-                "fd3": o.runtime_fd3.name()},
-            "mcp_child_exec": {"bridge": process_json(&o.bridge)},
-            "initialize": {"initialize_requests": i.initialize_requests, "observed_before_reply": i.observed_before_reply,
-                "initialized_after_reply": i.initialized_after_reply, "tools_list_answered": i.tools_list_answered,
-                "refused_frames": i.refused_frames, "frames": i.frames},
-            "exclusive_config": {"projection_bytes_exact": e.projection_bytes_exact,
-                "projection_is_api_worker_config": e.projection_is_api_worker_config,
-                "projection_mount_id": e.projection_mount_id, "decoys_planted": e.decoys_planted,
-                "decoy_markers_present": e.decoy_markers_present, "bridge_processes_seen": e.bridge_processes_seen,
-                "initialize_requests": i.initialize_requests},
-            "run_end": o.run_end,
+    EvidenceDocument {
+        domain: EVIDENCE_DOMAIN.into(), format: EVIDENCE_FORMAT, arch: arch_name(s.arch).into(),
+        harness_sha256: hex(&s.harness_sha256.0), trampoline_sha256: hex(&s.trampoline_sha256.0),
+        runtime_sha256: hex(&s.runtime_sha256.0), bridge_sha256: hex(&s.bridge_sha256.0),
+        projection_sha256: hex(&s.projection_sha256.0), launch_policy_sha256: hex(&s.launch_policy_sha256.0),
+        transcript_sha256: hex(&s.transcript_sha256.0),
+        observations: ObservationsDocument {
+            parent_exec: ParentExecDocument { uid: o.uid, socket: SocketDocument { inode: o.socket.inode, mount_id: o.socket.mount_id },
+                launcher_exe_sha256: o.launcher_exe_sha256.map(|d| hex(&d.0)), runtime: process_document(&o.runtime),
+                fd3: o.runtime_fd3.name().into() },
+            mcp_child_exec: McpChildExecDocument { bridge: process_document(&o.bridge) },
+            initialize: InitializeDocument { initialize_requests: i.initialize_requests, observed_before_reply: i.observed_before_reply,
+                initialized_after_reply: i.initialized_after_reply, tools_list_answered: i.tools_list_answered,
+                refused_frames: i.refused_frames, frames: i.frames },
+            exclusive_config: ExclusiveDocument { projection_bytes_exact: e.projection_bytes_exact,
+                projection_is_api_worker_config: e.projection_is_api_worker_config, projection_mount_id: e.projection_mount_id,
+                decoys_planted: e.decoys_planted, decoy_markers_present: e.decoy_markers_present,
+                bridge_processes_seen: e.bridge_processes_seen, initialize_requests: i.initialize_requests },
+            run_end: o.run_end.clone(),
         },
-        "kernel": s.kernel, "finished_unix": s.finished_unix,
-    }))
+        kernel: s.kernel.into(), finished_unix: s.finished_unix,
+    }
+}
+
+/// The observations an evidence document states, with the digests the
+/// checks already bound (record = artifacts = release manifest).
+fn observations_of(d: &EvidenceDocument, runtime: Sha256Digest, bridge: Sha256Digest, trampoline: Sha256Digest)
+    -> std::result::Result<Observations, &'static str> {
+    let p = &d.observations.parent_exec;
+    let i = &d.observations.initialize;
+    let e = &d.observations.exclusive_config;
+    let launcher = p.launcher_exe_sha256.as_deref()
+        .map(|text| parse_digest_hex(text).ok_or(evidence_refusal::DIGEST_SYNTAX)).transpose()?;
+    Ok(Observations { uid: p.uid, socket: SocketId { inode: p.socket.inode, mount_id: p.socket.mount_id },
+        runtime_digest: runtime, bridge_digest: bridge, trampoline_digest: trampoline, launcher_exe_sha256: launcher,
+        runtime: process_facts_of(&p.runtime)?, runtime_fd3: Fd3::from_name(&p.fd3).ok_or(evidence_refusal::SCHEMA)?,
+        bridge: process_facts_of(&d.observations.mcp_child_exec.bridge)?,
+        initialize: InitializeFacts { initialize_requests: i.initialize_requests, observed_before_reply: i.observed_before_reply,
+            initialized_after_reply: i.initialized_after_reply, tools_list_answered: i.tools_list_answered,
+            refused_frames: i.refused_frames, frames: i.frames },
+        exclusive: ExclusiveFacts { projection_bytes_exact: e.projection_bytes_exact,
+            projection_is_api_worker_config: e.projection_is_api_worker_config, projection_mount_id: e.projection_mount_id,
+            decoys_planted: e.decoys_planted, decoy_markers_present: e.decoy_markers_present,
+            bridge_processes_seen: e.bridge_processes_seen },
+        run_end: d.observations.run_end.clone(), incomplete: None })
 }
 
 /// The record of a run whose facts [`decide`] accepted: every exit 0, fd 3,
@@ -805,7 +1280,7 @@ pub(super) fn command(args: &[String], facts: &HostFacts) -> std::result::Result
     label_gate(&source, &request.label).map_err(|message| (1, message.to_owned()))?;
     drop(source);
     let prepared = prepare(&request, &raw).map_err(|message| (1, message))?;
-    let outcome = harness::run(&prepared, &request.trampoline).map_err(|message| (1, message))?;
+    let outcome = harness::run(&prepared, &request.trampoline, request.trampoline_sha256).map_err(|message| (1, message))?;
     finish(&request, &raw, &prepared, &outcome).map_err(|message| (1, message))
 }
 
@@ -841,66 +1316,149 @@ fn finish(request: &Request, raw: &[u8], prepared: &Prepared, outcome: &harness:
 
 // ── verify --evidence-dir ───────────────────────────────────────────────
 
-fn hex_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> { value.get(key).and_then(Value::as_str) }
+/// `verify --evidence-dir` without `--manifest` (F1): the evidence's
+/// trampoline can only be compared with a release manifest.
+pub(super) const EVIDENCE_NEEDS_MANIFEST: &str = "refused: --evidence-dir requires --manifest (the release manifest whose \
+    trampoline, runtime and bridge the evidence must name)";
 
-/// One record against its evidence: the manifest bytes hash to the record's
-/// `transcript_digest` and are canonical, name this format, architecture and
-/// the record's digests, the runtime and bridge digests are the release
-/// manifest's artifacts, and the transcript file is the one the manifest names
-/// (each line canonical, in sequence, its payload matching its digest/length).
+/// Fixed refusals of [`check_evidence`].
+pub(super) mod evidence_refusal {
+    pub const NOT_RECORD: &str = "acceptance-manifest.json is not the record's transcript_digest";
+    pub const SCHEMA: &str = "acceptance-manifest.json does not match the evidence schema (a missing or unknown field, or a wrong type)";
+    pub const CANONICAL: &str = "acceptance-manifest.json is not the canonical encoding of the evidence schema";
+    pub const DOMAIN: &str = "acceptance-manifest.json has another domain";
+    pub const FORMAT: &str = "acceptance-manifest.json has another format than this tool writes";
+    pub const ARCH: &str = "acceptance-manifest.json is for another architecture than the policy";
+    pub const DIGEST_SYNTAX: &str = "acceptance-manifest.json has a digest that is not 64 lowercase hex characters";
+    pub const HARNESS_PIN: &str = "acceptance-manifest.json harness_sha256 is not the pinned --harness-sha256";
+    pub const RECORD_DIGESTS: &str = "acceptance-manifest.json digests differ from the record";
+    pub const RECORD_EXITS: &str = "the record is not descriptor 3 with all four exits 0";
+    pub const NOT_ELF: &str = "the accepted runtime is not an ELF entry";
+    pub const ARTIFACTS: &str = "the record's runtime/bridge digests differ from the release manifest's artifacts";
+    pub const NO_TRAMPOLINE: &str = "the release manifest has no single trampoline (duduclaw-run) artifact";
+    pub const TRAMPOLINE: &str = "acceptance-manifest.json trampoline_sha256 is not the release manifest's trampoline";
+    pub const TRANSCRIPT_FILE: &str = "transcript.jsonl is not the transcript the manifest names";
+    pub const TRANSCRIPT_TRUNCATED: &str = "transcript.jsonl is empty or truncated";
+    pub const TRANSCRIPT_LINES: &str = "transcript.jsonl lines are not canonical, in sequence and directed";
+    pub const TRANSCRIPT_PAYLOAD: &str = "transcript.jsonl has a payload that is not base64";
+    pub const TRANSCRIPT_FRAME: &str = "transcript.jsonl has a frame whose digest or length is wrong";
+    pub const TRANSCRIPT_LIMIT: &str = "transcript.jsonl exceeds the conversation limits (64 frames, 256 KiB)";
+    pub const TRANSCRIPT_ORDER: &str = "transcript.jsonl is not, in order, initialize, its reply, notifications/initialized, \
+        tools/list and its reply as the harness responder answers them";
+    pub const SECOND_INITIALIZE: &str = "transcript.jsonl has more than one initialize";
+    pub const REFUSED_FRAME: &str = "transcript.jsonl has a frame the harness responder refused";
+    pub const TRANSCRIPT_FACTS: &str = "acceptance-manifest.json initialize observations are not those of the replayed transcript";
+    pub const DECISION: &str = "acceptance-manifest.json observations fail the harness decision (not all four exits 0)";
+}
+
+/// `transcript.jsonl` back into frames: typed lines, each canonical, in
+/// sequence, its payload matching its digest and length.
+pub(super) fn transcript_frames(transcript: &[u8]) -> std::result::Result<Vec<Frame>, &'static str> {
+    use evidence_refusal as refuse;
+    if transcript.is_empty() || !transcript.ends_with(b"\n") { return Err(refuse::TRANSCRIPT_TRUNCATED); }
+    let mut frames = Vec::new();
+    for line in transcript[..transcript.len() - 1].split(|byte| *byte == b'\n') {
+        if frames.len() >= MAX_FRAMES { return Err(refuse::TRANSCRIPT_LIMIT); }
+        let entry: TranscriptLine = serde_json::from_slice(line).map_err(|_| refuse::TRANSCRIPT_LINES)?;
+        if canonical_of(&entry) != line || entry.seq != frames.len() as u64 + 1 { return Err(refuse::TRANSCRIPT_LINES); }
+        let direction = match entry.direction.as_str() {
+            "runtime_to_harness" => Direction::RuntimeToHarness,
+            "harness_to_runtime" => Direction::HarnessToRuntime,
+            _ => return Err(refuse::TRANSCRIPT_LINES),
+        };
+        let payload = base64_decode(&entry.payload_base64).ok_or(refuse::TRANSCRIPT_PAYLOAD)?;
+        if entry.length != payload.len() as u64 || entry.sha256 != hex(&sha(&payload).0) { return Err(refuse::TRANSCRIPT_FRAME); }
+        frames.push(Frame { direction, payload });
+    }
+    Ok(frames)
+}
+
+/// Replay the runtime's frames through the SAME [`Responder`] the harness
+/// ran (releasing the held `initialize` as the harness does): every frame of
+/// the transcript, both directions, must be exactly what it produces, and
+/// the conversation must be the complete five-frame one.
+pub(super) fn replay(frames: &[Frame]) -> std::result::Result<InitializeFacts, &'static str> {
+    use evidence_refusal as refuse;
+    let mut responder = Responder::default();
+    for frame in frames.iter().filter(|frame| frame.direction == Direction::RuntimeToHarness) {
+        let mut bytes = frame.payload.clone();
+        bytes.push(b'\n');
+        responder.feed(&bytes).map_err(|_| refuse::TRANSCRIPT_LIMIT)?;
+        if responder.initialize_held() { responder.release_initialize(true).map_err(|_| refuse::TRANSCRIPT_LIMIT)?; }
+    }
+    if responder.frames() != frames { return Err(refuse::TRANSCRIPT_ORDER); }
+    let facts = responder.facts();
+    if facts.initialize_requests > 1 { return Err(refuse::SECOND_INITIALIZE); }
+    if facts.refused_frames > 0 { return Err(refuse::REFUSED_FRAME); }
+    if facts.initialize_requests != 1 || !responder.complete() || facts.frames != 5 { return Err(refuse::TRANSCRIPT_ORDER); }
+    Ok(facts)
+}
+
+/// One record against its evidence (F4): the manifest bytes hash to the
+/// record's `transcript_digest`, parse as the typed [`EvidenceDocument`]
+/// (unknown fields refused) whose canonical encoding is byte-identical,
+/// name this domain, format and architecture, carry well-formed digests (the
+/// harness one equal to `harness_pin` when given) equal to the record's, the
+/// release manifest's runtime/bridge artifacts and its trampoline (F1); the
+/// transcript is the one named, replays through the [`Responder`] and yields
+/// the stated initialize facts; and the stated observations pass [`decide`].
 pub(super) fn check_evidence(manifest_bytes: &[u8], transcript: &[u8], acceptance: &McpAcceptance, record: &RuntimeRecord,
-    release: &ReleaseManifest, arch: Arch) -> std::result::Result<(), &'static str> {
-    if sha(manifest_bytes) != acceptance.transcript_digest { return Err("acceptance-manifest.json is not the record's transcript_digest"); }
-    let value: Value = serde_json::from_slice(manifest_bytes).map_err(|_| "acceptance-manifest.json is not JSON")?;
-    if canonical(&value) != manifest_bytes { return Err("acceptance-manifest.json is not canonical JSON"); }
-    if value.get("domain").and_then(Value::as_str) != Some(EVIDENCE_DOMAIN) || value.get("format").and_then(Value::as_u64) != Some(EVIDENCE_FORMAT)
-        || value.get("arch").and_then(Value::as_str) != Some(arch_name(arch)) {
-        return Err("acceptance-manifest.json has another domain, format or architecture");
+    release: &ReleaseManifest, arch: Arch, harness_pin: Option<Sha256Digest>) -> std::result::Result<(), &'static str> {
+    use evidence_refusal as refuse;
+    if sha(manifest_bytes) != acceptance.transcript_digest { return Err(refuse::NOT_RECORD); }
+    let document: EvidenceDocument = serde_json::from_slice(manifest_bytes).map_err(|_| refuse::SCHEMA)?;
+    if encode_evidence(&document) != manifest_bytes { return Err(refuse::CANONICAL); }
+    if document.domain != EVIDENCE_DOMAIN { return Err(refuse::DOMAIN); }
+    if document.format != EVIDENCE_FORMAT { return Err(refuse::FORMAT); }
+    if document.arch != arch_name(arch) { return Err(refuse::ARCH); }
+    let digest = |text: &str| parse_digest_hex(text).ok_or(refuse::DIGEST_SYNTAX);
+    let harness = digest(&document.harness_sha256)?;
+    let trampoline = digest(&document.trampoline_sha256)?;
+    let runtime = digest(&document.runtime_sha256)?;
+    let bridge = digest(&document.bridge_sha256)?;
+    let projection = digest(&document.projection_sha256)?;
+    let launch = digest(&document.launch_policy_sha256)?;
+    let transcript_digest = digest(&document.transcript_sha256)?;
+    if harness_pin.is_some_and(|pin| pin != harness) { return Err(refuse::HARNESS_PIN); }
+    if runtime != acceptance.runtime_digest || bridge != acceptance.bridge_digest || projection != acceptance.projection_digest
+        || launch != acceptance.launch_policy_digest {
+        return Err(refuse::RECORD_DIGESTS);
     }
-    let ExecutableRecord::Elf { entry, digest } = &record.executable else { return Err("the accepted runtime is not an ELF entry") };
+    if acceptance.inherited_fd != duduclaw_mcp_boundary::config::MCP_FD || acceptance.initialize_exit != 0
+        || acceptance.parent_exec_exit != 0 || acceptance.mcp_child_exec_exit != 0 || acceptance.exclusive_config_exit != 0 {
+        return Err(refuse::RECORD_EXITS);
+    }
+    let ExecutableRecord::Elf { entry, digest: record_digest } = &record.executable else { return Err(refuse::NOT_ELF) };
     let runtime_artifact = release.artifacts.iter().find(|a| artifact_name(&a.install_target).is_ok_and(|name| name == entry.as_str()))
-        .ok_or("the release manifest has no artifact for the accepted runtime")?;
-    let bridge_artifact = release.artifacts.iter().find(|a| a.install_target == InstallTarget::McpBridge)
-        .ok_or("the release manifest has no duduclaw-mcp-bridge")?;
-    let pairs = [("runtime_sha256", acceptance.runtime_digest), ("bridge_sha256", acceptance.bridge_digest),
-        ("projection_sha256", acceptance.projection_digest), ("launch_policy_sha256", acceptance.launch_policy_digest)];
-    for (key, expected) in pairs {
-        if hex_field(&value, key) != Some(hex(&expected.0).as_str()) { return Err("acceptance-manifest.json digests differ from the record"); }
+        .ok_or(refuse::ARTIFACTS)?;
+    let bridge_artifact = release.artifacts.iter().find(|a| a.install_target == InstallTarget::McpBridge).ok_or(refuse::ARTIFACTS)?;
+    if runtime != *record_digest || runtime_artifact.sha256 != runtime || bridge_artifact.sha256 != bridge {
+        return Err(refuse::ARTIFACTS);
     }
-    if acceptance.runtime_digest != *digest || runtime_artifact.sha256 != *digest || bridge_artifact.sha256 != acceptance.bridge_digest {
-        return Err("the record's runtime/bridge digests differ from the artifacts");
+    let shipped: Vec<_> = release.artifacts.iter().filter(|a| a.install_target == InstallTarget::Trampoline).collect();
+    let [shipped] = shipped.as_slice() else { return Err(refuse::NO_TRAMPOLINE) };
+    if shipped.sha256 != trampoline { return Err(refuse::TRAMPOLINE); }
+    if sha(transcript) != transcript_digest { return Err(refuse::TRANSCRIPT_FILE); }
+    let replayed = replay(&transcript_frames(transcript)?)?;
+    let observations = observations_of(&document, runtime, bridge, trampoline)?;
+    let stated = &observations.initialize;
+    if (stated.initialize_requests, stated.initialized_after_reply, stated.tools_list_answered, stated.refused_frames, stated.frames)
+        != (replayed.initialize_requests, replayed.initialized_after_reply, replayed.tools_list_answered, replayed.refused_frames,
+            replayed.frames)
+        || document.observations.exclusive_config.initialize_requests != stated.initialize_requests {
+        return Err(refuse::TRANSCRIPT_FACTS);
     }
-    if hex_field(&value, "transcript_sha256") != Some(hex(&sha(transcript).0).as_str()) {
-        return Err("transcript.jsonl is not the transcript the manifest names");
-    }
-    let mut lines = 0u64;
-    for line in transcript.split(|byte| *byte == b'\n') {
-        if line.is_empty() { continue; }
-        lines += 1;
-        let entry: Value = serde_json::from_slice(line).map_err(|_| "transcript.jsonl has a line that is not JSON")?;
-        if canonical(&entry) != line || entry.get("seq").and_then(Value::as_u64) != Some(lines)
-            || !matches!(entry.get("direction").and_then(Value::as_str), Some("runtime_to_harness" | "harness_to_runtime")) {
-            return Err("transcript.jsonl lines are not canonical, in sequence and directed");
-        }
-        let payload = entry.get("payload_base64").and_then(Value::as_str).and_then(base64_decode)
-            .ok_or("transcript.jsonl has a payload that is not base64")?;
-        if entry.get("length").and_then(Value::as_u64) != Some(payload.len() as u64)
-            || hex_field(&entry, "sha256") != Some(hex(&sha(&payload).0).as_str()) {
-            return Err("transcript.jsonl has a frame whose digest or length is wrong");
-        }
-    }
-    if !transcript.is_empty() && !transcript.ends_with(b"\n") { return Err("transcript.jsonl is truncated"); }
-    if lines == 0 || lines > MAX_FRAMES as u64 { return Err("transcript.jsonl has no frames or more than 64"); }
-    Ok(())
+    decide(&observations).map_err(|_| refuse::DECISION)
 }
 
 /// `verify --evidence-dir <dir>`: every runtime with an acceptance record must
 /// have an `acceptance-manifest.json` (in `<dir>` or one of its immediate
 /// subdirectories, e.g. `<dir>/<label>/`) whose SHA-256 is the record's
 /// `transcript_digest`, checked by [`check_evidence`] with the
-/// `transcript.jsonl` beside it.
-pub(super) fn verify_evidence(policy: &SignedPolicy, release: &ReleaseManifest, arch: Arch, directory: &Path)
-    -> std::result::Result<String, String> {
+/// `transcript.jsonl` beside it. `release` is the `--manifest` document
+/// (required, F1); `harness_pin` is `--harness-sha256` when given.
+pub(super) fn verify_evidence(policy: &SignedPolicy, release: &ReleaseManifest, arch: Arch, directory: &Path,
+    harness_pin: Option<Sha256Digest>) -> std::result::Result<String, String> {
     let refuse = |what: &str| format!("refused: --evidence-dir {}: {what}", directory.display());
     if !fs::symlink_metadata(directory).is_ok_and(|metadata| metadata.is_dir()) { return Err(refuse("not a directory")); }
     let mut candidates = vec![directory.to_path_buf()];
@@ -927,10 +1485,12 @@ pub(super) fn verify_evidence(policy: &SignedPolicy, release: &ReleaseManifest, 
             .ok_or_else(|| refuse("no acceptance-manifest.json whose sha256 is a record's transcript_digest"))?;
         let manifest = read_limited(&found.join(MANIFEST_FILE), MAX_EVIDENCE_FILE_BYTES, "acceptance-manifest.json").map_err(|e| refuse(e.as_str()))?;
         let transcript = read_limited(&found.join(TRANSCRIPT_FILE), MAX_EVIDENCE_FILE_BYTES, "transcript.jsonl").map_err(|e| refuse(e.as_str()))?;
-        check_evidence(&manifest, &transcript, acceptance, record, release, arch).map_err(refuse)?;
+        check_evidence(&manifest, &transcript, acceptance, record, release, arch, harness_pin).map_err(refuse)?;
         checked += 1;
     }
-    Ok(format!("evidence: {checked} acceptance record(s) backed by harness evidence in {}\n", directory.display()))
+    let pin = if harness_pin.is_some() { "the pinned harness" } else { "an UNPINNED harness (no --harness-sha256)" };
+    Ok(format!("evidence: {checked} acceptance record(s) backed by harness evidence in {} ({pin}, the manifest's trampoline)\n",
+        directory.display()))
 }
 
 #[cfg(test)]

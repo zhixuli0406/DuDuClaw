@@ -1160,8 +1160,21 @@ refused.
 sudo env DUDUCLAW_ISO_DISPOSABLE=1 duduclaw-isolation-policy accept \
     --source <policy-source.json> --artifacts-dir <dir> --arch <x86_64|aarch64> \
     --label <runtime label> --trampoline <duduclaw-run> \
+    --trampoline-sha256 <hex: the duduclaw-run the release manifest will name> \
     --evidence-dir <new or empty dir> --out-source <new file>
 ```
+
+`--trampoline-sha256` binds the run to the shipped trampoline. The signed
+release manifest cannot exist yet when `accept` runs (it signs the policy that
+`accept` produces), so the digest comes from the same release-archive snapshot
+the trampoline file was staged from (`scripts/isolation-test-keys.sh`
+`stage_policy_inputs`: `packager.INSTALL_BINARIES["trampoline"]`, hashed
+while copied and re-checked). `accept` refuses before any side effect unless the
+file's SHA-256 is that digest. It copies the file root-owned with that expected
+digest and hashes the copy again from disk. It records the unit main process's
+executable digest, which must equal it. `verify --manifest … --evidence-dir …`
+then requires the evidence's `trampoline_sha256` to be the signed manifest's
+`InstallTarget::Trampoline` entry.
 
 It runs **only on a disposable Linux host as root**: euid and egid 0,
 `DUDUCLAW_ISO_DISPOSABLE=1`, no isolation installation fact
@@ -1204,8 +1217,8 @@ What it does:
    counted. Limits: 30 s, 64 frames, 256 KiB.
 4. Observes, without inferring from the transcript, while the `initialize`
    reply is withheld: the unit's main process (PID 1's `MainPID`, pidfd-pinned)
-   executes the trampoline copy; below it, each process pinned by a pidfd with
-   its parent link re-checked, exactly one process whose `/proc/<pid>/exe`
+   executes the trampoline copy; in one complete snapshot of the run cgroup
+   (below), exactly one process whose `/proc/<pid>/exe`
    SHA-256 is the runtime digest, with all four uids the temporary uid, in the
    run cgroup, its descriptor 3 the recorded socket or absent (the socket is
    identified by the inode and mount id `fd::observe` recorded on the runtime
@@ -1219,13 +1232,71 @@ What it does:
    ever appeared in the cgroup (polled) and exactly one `initialize` arrived. An
    environment-selected config is impossible (fixed plan environment; the worker
    clears the bridge's). Any missing fact: no record.
+
+   **Completeness (fail closed).** Every observation is a complete enumeration
+   of the WHOLE unit cgroup: `cgroup.procs` of the unit and of every
+   sub-cgroup, read before and after inspecting every member until two
+   consecutive reads agree. Each member is pinned by a pidfd between two reads
+   of its start time, and its executable is opened and hashed. Nothing is
+   capped silently. The member count and every parent chain are bounded by the
+   record's task limit, the unit's `TasksMax`, which the pids controller
+   enforces, so a legitimate run cannot reach these bounds. The distinct
+   processes ever seen are bounded by 4096; a legitimate run has at most five.
+   Any of the following makes the observation **incomplete**, and `decide`
+   refuses with a fixed message naming the reason (no record):
+   - reaching a bound (`tree_node_cap`, `tree_depth_cap`, `census_cap`,
+     `cgroup_tree_cap`);
+   - an unreadable cgroup (`cgroup_unreadable`) or an unstable one
+     (`cgroup_unstable`);
+   - a live process that cannot be read (`unreadable_process`) or hashed
+     (`hash_error`);
+   - a vanished process whose exit the kernel did not confirm
+     (`unconfirmed_exit`): `pidfd_open` ESRCH or a readable pidfd confirms it;
+   - the main process missing before the conversation completed
+     (`launcher_missing`);
+   - runtime or bridge facts that cannot be read (`process_facts_unreadable`);
+   - any process that is not in its documented place (`unexpected_process`).
+
+   The processes that legitimately live in the run cgroup are listed below.
+   No helper launcher runs: runtimes with one are refused.
+
+   | process | parent | `/proc/<pid>/exe` SHA-256 bound to |
+   |---|---|---|
+   | supervisor = unit `MainPID` | PID 1 | the trampoline (`--trampoline-sha256` = manifest `Trampoline`) |
+   | init, PID 1 of the run's PID namespace (a clone, never exec'd) | supervisor | the trampoline |
+   | egress forwarder (only `network: egress`) | init | `native.forwarder.executable_digest` = manifest `EgressForwarder` |
+   | runtime (api worker) | init | record runtime digest = manifest `RuntimeEntry` |
+   | MCP bridge | runtime (init once the runtime exited) | record bridge digest = manifest `McpBridge` |
+
+   The same processes also pass through their pre-exec windows. A fork of
+   init still shows the trampoline digest before it runs the forwarder or the
+   runtime. A fork of the runtime still shows the runtime digest before it
+   runs the bridge. A process keeps its `(pid, start)` across exec, so the
+   census allows only the transitions trampoline → forwarder, trampoline →
+   runtime and runtime → bridge. Each snapshot allows at most one init, at
+   most two pre-exec forks of init, one runtime and one forwarder. Over the
+   whole run, the census allows one runtime and one forwarder. Anything else,
+   including a process that does not descend from the main process inside
+   the cgroup, is refused by default. After the main process has exited
+   (pidfd-confirmed) and the conversation has completed, snapshots are not
+   classified. The supervisor exits only after init, and init's exit
+   SIGKILLs the whole run PID namespace.
 5. Ends the run (the worker's provider call cannot succeed; otherwise the unit
    is killed), requires the cgroup empty and the trampoline exited, then tears
    everything down on every path (also on panic and SIGINT/SIGTERM/SIGHUP/SIGQUIT,
-   which are blocked and polled): unit, slice, cgroup, temporary uid's
-   processes, image (detach, destroy), `/etc` projection, the harness directory
-   `/var/lib/duduclaw-acceptance-<random>`; then verifies each is gone and fails
-   with `accept: tear-down left <kinds> behind` (no record) otherwise.
+   which are blocked and polled): unit, slice, cgroup, the run's processes,
+   image (detach, destroy), `/etc` projection, the harness directory
+   `/var/lib/duduclaw-acceptance-<random>`. The guard owns that directory as
+   soon as its mkdir succeeded, before chmod/chown. The tear-down then verifies
+   each is gone and otherwise fails with `accept: tear-down left <kinds> behind`
+   (no record). The tear-down signals ONLY processes proven to belong to the
+   run: members of the run unit's cgroup or of the harness's own leaf employee
+   slice. Each is pinned by a pidfd, and its start time, uid and cgroup are
+   re-checked before SIGKILL. A process with the temporary uid outside these
+   cgroups is never signalled. It is reported as the left-over kind
+   `foreign_uid_process` (exit ≠ 0, no record). Immediately before the launch,
+   the temporary uid and the service ids are re-checked as free (no account,
+   group or process); otherwise the run is refused.
 6. Writes `--evidence-dir` (root 0700, files 0600): `transcript.jsonl` (one
    canonical JSON line per frame: `seq`, `direction`, `sha256`, `length`,
    `payload_base64`; only the MCP conversation crosses this socket, no secret)
@@ -1247,11 +1318,79 @@ model endpoint works. Any change of the runtime binary, version, arguments,
 resource limits, timeouts, network, seccomp list or other native field changes
 the launch-policy (or projection) digest and requires running `accept` again.
 
-`verify --evidence-dir <dir>` additionally requires, for every record, an
-`acceptance-manifest.json` in `<dir>` or a direct subdirectory whose SHA-256 is
-the record's `transcript_digest`, whose digests are the record's and the
-artifacts', and whose `transcript_sha256` is the `transcript.jsonl` beside it.
-`scripts/isolation-test-keys.sh bundle --accept-mcp` runs all of this.
+`verify --manifest <release manifest> --evidence-dir <dir> [--harness-sha256
+<hex>]` requires `--manifest`; without it the command is refused. For every
+record, it requires an `acceptance-manifest.json` in `<dir>` or a direct
+subdirectory whose SHA-256 is the record's `transcript_digest`, and checks
+that file as follows:
+
+- It parses as the typed evidence schema: unknown fields are refused, and its
+  canonical re-encoding must be byte-identical to the file, so missing,
+  reordered or reformatted fields are refused.
+- It names the evidence domain, `format` 1 and the policy's architecture.
+- Every digest is 64 lowercase hex characters.
+- `runtime_sha256`, `bridge_sha256`, `projection_sha256` and
+  `launch_policy_sha256` equal the record's digests. The runtime and bridge
+  digests also equal the release manifest's artifacts.
+- `trampoline_sha256` equals the release manifest's single `Trampoline` entry.
+- The record states descriptor 3 and all four exits 0.
+- `transcript_sha256` equals the `transcript.jsonl` beside it. The transcript's
+  typed, canonical lines replay through the same `Responder` state machine,
+  which must reproduce every frame (both directions) in the order initialize →
+  its reply → `notifications/initialized` → `tools/list` → its reply. That
+  means exactly one initialize, no refused frame and the same limits. The
+  replayed initialize facts must equal the stated ones.
+- The stated observations, rebuilt as `Observations`, pass the same `decide`,
+  which means all four exits 0.
+
+`harness_sha256` must be present but cannot be compared with a shipped
+artifact (the policy tool is never shipped). The signing ceremony pins it out
+of band and passes `--harness-sha256`, which must then match.
+`scripts/isolation-test-keys.sh bundle --accept-mcp` runs all of this. It pins
+the tool that ran `accept` and verifies against the signed manifest it has
+just produced.
+
+##### Harness launch vs. production launch (accepted differences)
+
+| Difference | Why the signed claim (this runtime, bridge, projection and launch policy, run through the real launcher: parent exec, MCP child exec, initialize, exclusive config) is unaffected |
+|---|---|
+| `ExecStart` is a root-owned copy of the trampoline below `/var/lib/duduclaw-acceptance-*/launcher/`, not `/usr/lib/duduclaw/duduclaw-run` | Same bytes: the copy is the manifest's `Trampoline` digest (checked before the copy, after the copy and on the unit's main process, and again by `verify --manifest`). The path is not part of what the trampoline does. |
+| No `BindsTo`/`After=duduclaw-spawnd.service` | Unit lifetime and ordering only. No spawnd exists on the disposable host. Every other unit property is `UnitPolicy::new` of the record. |
+| `AcceptancePublication` instead of `InstalledPublication` | It makes the same checks, except that it does not require an existing `mcp_acceptance`, which is this run's output. The record binds `launch_policy_digest` and the projection digest, and spawnd re-checks them on every production MCP launch (`validate_launch`, `validate`). |
+| Runtime, bridge and forwarder are copied from `--artifacts-dir` into the harness `runtime` anchor instead of an installed generation | Their digests are re-checked against the generated record and the manifest when copied. `verify` requires the manifest's entries. |
+| Temporary employee uid (free number in 70000..=99999) and service ids (< 1000), not in the host account databases | Production uses allocated accounts in the same ranges. Inside the run, the identity is the trampoline's own `/etc` projection in both cases. The facts concern the uid of the processes, which is observed. |
+| Not executed: admission core (readiness, SSH evidence, run journal, UID monitor, egress registration), R7a self-test readiness, helper table, work-broker root, gateway `McpRunReceipt` | These gate whether a run may start and what is recorded around it. They do not change which processes run inside it or what descriptor 3 carries. Production adds them on top of the same launch path. |
+| No egress service; the egress socket ends unread at the harness; the provider `https://acceptance.invalid/v1` is unreachable | The claim excludes provider and model success. The bridge is spawned and initialized before any provider call (`Bridge::connect`). |
+| The gateway end of descriptor 3 is the harness `Responder` with an empty tool inventory | The claim is inheritance, exec and the handshake, not tool behaviour. With no tools offered, no `tools/call` can be valid. |
+| `LoopStorage` below the harness directory, a fixed worker request | Same storage code and quota from the record. The bridge does not depend on the prompt. |
+
+##### Who may run it, and the signing ceremony
+
+`sudo -n` (or root) running a policy tool that the invoking user built is
+acceptable **only on a disposable TEST VM**. Whoever controls that build or
+its parent directories controls root on the host and could forge evidence.
+The release signing ceremony must instead:
+
+- build the tool from a clean checkout of the pinned source archive (record
+  the archive digest);
+- install it root-owned (not writable by anyone else) and record its SHA-256;
+- run `accept` only from root-owned directories, never in a parent directory
+  that an untrusted user can write;
+- store the evidence separately from the build tree and the bundle;
+- verify with `verify --manifest <signed manifest> --evidence-dir <dir>
+  --harness-sha256 <recorded tool digest>`.
+
+##### Re-verify on a real disposable host after any change
+
+Any change to the harness, the trampoline, the api worker, the bridge, the
+unit properties, `runner.rs` process structure (new forks or helpers), or
+the runtime's resources/arguments/seccomp needs a full `bundle --accept-mcp`
+on a disposable VM, followed by the signed-manifest `verify --evidence-dir
+--harness-sha256`. The following unit tests cannot replace that run:
+`iso_root_policy_accept_api_worker_end_to_end`, the classification table
+above and the tear-down's kill selection. A new process in the run cgroup
+must be added to the table, bound to a digest, before any run can be
+accepted again.
 
 ### Installed publication root acceptance (not a Claude turn test)
 
@@ -1400,7 +1539,8 @@ cargo build --locked --release -p duduclaw-spawnd --features policy-tool --bin d
 duduclaw-isolation-policy build  --source <policy-source.json> --artifacts-dir <dir> \
     --arch <x86_64|aarch64> --out <new policy.json> [--manifest <manifest.json>]
 duduclaw-isolation-policy verify --policy <policy.json> --artifacts-dir <dir> \
-    [--manifest <signed manifest.json>] [--arch <x86_64|aarch64>] [--evidence-dir <dir>]
+    [--manifest <signed manifest.json>] [--arch <x86_64|aarch64>] \
+    [--evidence-dir <dir> (requires --manifest) [--harness-sha256 <hex>]]
 sudo env DUDUCLAW_ISO_DISPOSABLE=1 duduclaw-isolation-policy accept ...   # MCP acceptance harness (above)
 ```
 
