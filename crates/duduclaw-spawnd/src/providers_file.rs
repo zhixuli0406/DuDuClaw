@@ -25,6 +25,7 @@ fn failure(error: ReplaceError) -> ProvidersFailure {
         ReplaceError::Unsafe => ProvidersFailure::HomeEntryUnsafe,
         ReplaceError::NoSpace => ProvidersFailure::NoSpace,
         ReplaceError::Io => ProvidersFailure::Unavailable,
+        ReplaceError::TempLeftBehind => ProvidersFailure::TempLeftBehind,
     }
 }
 /// Writes `bytes` (every call: a new file, never "unchanged ⇒ skip").
@@ -39,7 +40,8 @@ pub(crate) fn write(home: &OwnedFd, owner: Owner, temp: &str, bytes: &[u8]) -> R
 ///    checked regular with one link, written, made 0600 and `owner`'s,
 ///    fsynced; 3. renamed over `providers.json` (a directory there is
 ///    `HomeEntryUnsafe`), the directory fsynced; 4. metadata read back.
-///    5. Any failure before the rename removes `temp`.
+///    5. Any failure before the rename removes `temp`; if that removal
+///    fails, `TempLeftBehind` (the caller keeps its maintenance marker).
 pub(crate) fn write_with(home: &OwnedFd, owner: Owner, temp: &str, len: u64,
     fill: impl FnOnce(&mut File) -> io::Result<()>) -> Result<(), ProvidersFailure> {
     if !valid_providers_temp(temp) { return Err(ProvidersFailure::Unavailable); }
@@ -57,14 +59,18 @@ pub(crate) fn clear(home: &OwnedFd, owner: Owner) -> Result<(), ProvidersFailure
     blobs::remove_empty_directory(home, DIRECTORY).map_err(failure)
 }
 /// Start-up recovery of an unfinished maintenance: remove the recorded temp
-/// file. An absent or unsafe `.duduclaw-api`, or a non-file at that name,
-/// cannot hold a temp file root created there: nothing to remove.
+/// file. An absent or unsafe `.duduclaw-api` cannot hold a temp file root
+/// created there (root only creates one through a verified directory, and
+/// no run attaches while the marker exists): nothing to remove. Otherwise
+/// `Ok` only when the recorded name was removed or is confirmed absent
+/// (ENOENT); a directory there, EPERM or any I/O failure is an error, so the
+/// caller keeps the marker (F4: never cleared without confirmation).
 pub(crate) fn remove_temp(home: &OwnedFd, owner: Owner, temp: &str) -> Result<(), ProvidersFailure> {
     if !valid_providers_temp(temp) { return Err(ProvidersFailure::Unavailable); }
     match blobs::open_private_directory(home, DIRECTORY, owner, false) {
         Ok(Some(directory)) => match blobs::remove_entry(&directory, temp) {
-            Ok(()) | Err(ReplaceError::Unsafe) => Ok(()),
-            Err(error) => Err(failure(error)),
+            Ok(()) => Ok(()),
+            Err(_) => Err(ProvidersFailure::Unavailable),
         },
         Ok(None) | Err(ReplaceError::Unsafe) => Ok(()),
         Err(error) => Err(failure(error)),

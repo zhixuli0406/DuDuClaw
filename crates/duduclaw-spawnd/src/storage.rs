@@ -167,6 +167,10 @@ pub enum ProvidersFailure {
     NoSpace,
     /// Attach, detach, I/O, ledger or readback failure.
     Unavailable,
+    /// A write failed and removing its temp file failed too (review round 1,
+    /// F4): the recorded temp name may still hold the document. [`maintain`]
+    /// keeps the maintenance marker; answered like `Unavailable`.
+    TempLeftBehind,
 }
 /// The fixed prefix of the temporary file a provider write creates in
 /// `.duduclaw-api` (followed by 16 lowercase hex digits).
@@ -200,17 +204,22 @@ pub(crate) trait MaintenanceSteps {
 /// every outcome, once the marker is durable) → marker cleared only after the
 /// detach succeeded. A failed detach keeps the marker: [`recover`] (start-up,
 /// or the employee's next maintenance) finishes it, and the adapter refuses
-/// to attach the employee for a run meanwhile.
+/// to attach the employee for a run meanwhile. So does a write whose temp
+/// file may have been left behind ([`ProvidersFailure::TempLeftBehind`],
+/// F4): detached as usual, the marker (which records the temp name) stays
+/// so [`recover`] retries the removal through the verified descriptors.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn maintain<S: MaintenanceSteps>(steps: &mut S, temp: &str,
     work: impl FnOnce(&S::Home) -> std::result::Result<(), ProvidersFailure>) -> std::result::Result<(), ProvidersFailure> {
     steps.mark(temp)?;
     let outcome = steps.attach().and_then(|home| work(&home));
     steps.detach()?;
+    if outcome == Err(ProvidersFailure::TempLeftBehind) { return outcome; }
     steps.unmark()?;
     outcome
 }
-/// A left-over maintenance: attach, `work` (remove the left-over temp file),
+/// A left-over maintenance: attach, `work` (remove the left-over temp file:
+/// `Ok` only when the recorded name is confirmed absent or was removed),
 /// detach; the marker is cleared only when both succeeded.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn recover<S: MaintenanceSteps>(steps: &mut S,
@@ -332,6 +341,26 @@ mod tests {
         let mut steps = Steps { marker: Some(temp()), ..Steps::default() };
         assert!(recover(&mut steps, |_| Err(ProvidersFailure::Unavailable)).is_err());
         assert_eq!((steps.log.as_slice(), steps.marker.is_some()), (&["attach".to_string(), "detach".to_string()][..], true));
+    }
+
+    #[test]
+    fn providers_maintenance_temp_left_behind_keeps_the_marker_until_recovery_removes_it() {
+        // A write whose temp cleanup failed: detached, the marker (the temp name) stays.
+        let mut steps = Steps::default();
+        assert_eq!(maintain(&mut steps, &temp(), |_| Err(ProvidersFailure::TempLeftBehind)), Err(ProvidersFailure::TempLeftBehind));
+        assert_eq!(steps.log, ["mark", "attach", "detach"]);
+        assert_eq!((steps.marker.clone(), steps.mounted), (Some(temp()), false));
+        // The next recovery removes the recorded temp and only then clears the marker.
+        steps.log.clear();
+        let left = steps.marker.clone().unwrap();
+        let mut removed = None;
+        recover(&mut steps, |_| { removed = Some(left.clone()); Ok(()) }).unwrap();
+        assert_eq!(steps.log, ["attach", "detach", "unmark"]);
+        assert_eq!((removed, steps.marker.clone()), (Some(temp()), None));
+        // A recorded name that cannot be removed (a directory there, EPERM, I/O) keeps it.
+        let mut steps = Steps { marker: Some(temp()), ..Steps::default() };
+        assert_eq!(recover(&mut steps, |_| Err(ProvidersFailure::Unavailable)), Err(ProvidersFailure::Unavailable));
+        assert_eq!((steps.log.as_slice(), steps.marker.clone()), (&["attach".to_string(), "detach".to_string()][..], Some(temp())));
     }
 
     #[test]

@@ -186,3 +186,49 @@ fn providers_recovery_removes_only_the_recorded_temp_file() {
     assert_eq!(remove_temp(&home.fd, home.owner, "providers.json"), Err(ProvidersFailure::Unavailable));
     assert_eq!(fs::read(home.file()).unwrap(), DOCUMENT);
 }
+
+#[test]
+fn providers_failed_temp_cleanup_is_reported_and_recovery_removes_it() {
+    let home = home();
+    home.write(1, b"old").unwrap();
+    // Root ignores directory permissions: the simulated cleanup failure needs an unprivileged user.
+    if unsafe { libc::geteuid() } != 0 {
+        let api = home.api();
+        let result = write_with(&home.fd, home.owner, &temp(2), DOCUMENT.len() as u64, |file| {
+            io::Write::write_all(file, DOCUMENT)?;
+            // The unlink of the temp file will now fail (EACCES).
+            fs::set_permissions(&api, fs::Permissions::from_mode(0o500))?;
+            Err(io::Error::from_raw_os_error(libc::EIO))
+        });
+        fs::set_permissions(home.api(), fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(result, Err(ProvidersFailure::TempLeftBehind), "never the original failure");
+        let mut expected = vec![FILE.to_string(), temp(2)]; expected.sort();
+        assert_eq!(home.names(), expected, "the temp file is still there");
+        // The recovery (marker kept by `maintain`) removes it.
+        remove_temp(&home.fd, home.owner, &temp(2)).unwrap();
+        assert_eq!(home.names(), [FILE]);
+        assert_eq!(fs::read(home.file()).unwrap(), b"old");
+    }
+    // A recorded name that cannot be removed (a directory there) is an error: the marker stays.
+    fs::create_dir(home.api().join(temp(3))).unwrap();
+    assert_eq!(remove_temp(&home.fd, home.owner, &temp(3)), Err(ProvidersFailure::Unavailable));
+    assert!(fs::symlink_metadata(home.api().join(temp(3))).unwrap().is_dir());
+}
+
+#[test]
+fn providers_clear_refuses_a_planted_wrong_mode_or_symlinked_directory() {
+    // What Disable meets when the employee tampered with its own home (F1: Disable goes on).
+    let home = home();
+    home.write(1, DOCUMENT).unwrap();
+    fs::set_permissions(home.api(), fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(clear(&home.fd, home.owner), Err(ProvidersFailure::HomeEntryUnsafe));
+    assert_eq!(fs::read(home.file()).unwrap(), DOCUMENT, "nothing done through an unsafe entry");
+    let home = self::home();
+    let elsewhere = home.path.parent().unwrap().join("elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(elsewhere.join(FILE), b"outside").unwrap();
+    std::os::unix::fs::symlink(&elsewhere, home.api()).unwrap();
+    assert_eq!(clear(&home.fd, home.owner), Err(ProvidersFailure::HomeEntryUnsafe));
+    assert_eq!(fs::read(elsewhere.join(FILE)).unwrap(), b"outside");
+}

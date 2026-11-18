@@ -115,6 +115,11 @@ pub enum ReplaceError {
     /// ENOSPC / EDQUOT.
     NoSpace,
     Io,
+    /// [`replace_with`] failed (whatever the cause) AND removing its own temp
+    /// file failed with anything but ENOENT: the temp file (holding the
+    /// written bytes) may still exist. The caller must keep its record of the
+    /// temp name and retry the removal.
+    TempLeftBehind,
 }
 /// The owner every created entry is given (and every checked entry must have).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,7 +179,10 @@ pub fn open_private_directory(parent: &OwnedFd, name: &str, owner: Owner, create
 /// there fails as [`ReplaceError::Unsafe`]), fsyncs `directory`, and reads
 /// back metadata only (regular, one link, owner, 0600, `len`). Any failure
 /// before the rename removes `temp` (by name, beneath `directory`); a `temp`
-/// that already existed is someone else's and is never removed.
+/// that already existed is someone else's and is never removed. When that
+/// removal itself fails (anything but ENOENT) the answer is
+/// [`ReplaceError::TempLeftBehind`], never the original failure: the file
+/// may still hold the bytes.
 pub fn replace_with(directory: &OwnedFd, temp: &str, target: &str, len: u64, owner: Owner,
     fill: impl FnOnce(&mut File) -> std::io::Result<()>) -> Result<(), ReplaceError> {
     let mount = stat(directory).map_err(|_| ReplaceError::Io)?.stx_mnt_id;
@@ -198,8 +206,11 @@ pub fn replace_with(directory: &OwnedFd, temp: &str, target: &str, len: u64, own
         Err(e) => Err(errno_class(e)),
     });
     if let Err(error) = staged {
-        let _ = fs::unlinkat(directory, temp, AtFlags::empty());
-        return Err(error);
+        return match fs::unlinkat(directory, temp, AtFlags::empty()) {
+            Ok(()) => Err(error),
+            Err(e) if e == rustix::io::Errno::NOENT => Err(error),
+            Err(_) => Err(ReplaceError::TempLeftBehind),
+        };
     }
     fs::fsync(directory).map_err(errno_class)?;
     let s = fs::statx(directory, target, AtFlags::SYMLINK_NOFOLLOW, StatxFlags::BASIC_STATS).map_err(errno_class)?;

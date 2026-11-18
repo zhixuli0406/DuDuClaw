@@ -113,7 +113,7 @@ fn providers_storage_failures_are_fixed_codes_and_keep_the_conservative_record()
     let receipt=allocate(&mut fx,1,"sales");
     for (failure,code) in [(ProvidersFailure::HomeEntryUnsafe,ProviderErrorCode::HomeEntryUnsafe),
         (ProvidersFailure::NoSpace,ProviderErrorCode::StorageUnavailable),(ProvidersFailure::Unavailable,ProviderErrorCode::StorageUnavailable),
-        (ProvidersFailure::Busy,ProviderErrorCode::NotReady)]{
+        (ProvidersFailure::Busy,ProviderErrorCode::NotReady),(ProvidersFailure::TempLeftBehind,ProviderErrorCode::StorageUnavailable)]{
         fx.disk.provider_fail=Some(failure);
         assert_eq!(provide(&mut fx,set("sales"),false),Err(code));
     }
@@ -129,24 +129,21 @@ fn providers_storage_failures_are_fixed_codes_and_keep_the_conservative_record()
 }
 
 #[test]
-fn disable_removes_a_provisioned_document_first_and_resumes(){
+fn disable_removes_a_provisioned_document_after_its_state_change(){
     let mut fx=Fx::portable();
     let receipt=allocate(&mut fx,1,"sales");
     provide(&mut fx,set("sales"),false).unwrap();
-    // A removal that cannot run refuses the Disable before its state change.
-    fx.disk.provider_fail=Some(ProvidersFailure::Unavailable);
-    assert_eq!(fx.handle(&disable(1,"sales")).unwrap_err(),wire::ErrorCode::IsolationUnavailable);
-    assert_eq!(fx.phase(receipt.employee),Phase::Ready);
-    assert!(fx.disk.documents.contains_key(&receipt.employee));
-    fx.disk.provider_fail=Some(ProvidersFailure::Busy);
-    assert_eq!(fx.handle(&disable(1,"sales")).unwrap_err(),wire::ErrorCode::NotReady);
-    fx.disk.provider_fail=None;
     assert_eq!(fx.handle_with(&disable(1,"sales"),true,None).unwrap_err(),wire::ErrorCode::NotReady,"a live run: the existing gate");
+    fx.disk.journal_at=Some(fx.dir.join("allocations.json"));
     let calls=fx.disk.provider_calls.len();
     assert_eq!(fx.handle(&disable(1,"sales")).unwrap().phase,Phase::Disabled);
     assert_eq!(fx.disk.provider_calls.len(),calls+1);
     assert_eq!(fx.disk.provider_calls.last(),Some(&(receipt.employee,receipt.uid,false)),"the safe unlink");
+    // The non-runnable phase, without the record, was durable before the unlink was attempted.
+    let seen=fx.disk.journal_seen.last().unwrap();
+    assert!(seen.contains(r#""phase":"disabling""#) && !seen.contains(r#""providers""#),"{seen}");
     assert_eq!(record(&fx,receipt.employee),None,"the record is cleared");
+    assert!(!fx.disk.documents.contains_key(&receipt.employee) && !fx.disk.present(receipt.employee));
     assert_eq!(fx.handle(&disable(1,"sales")).unwrap().phase,Phase::Disabled,"replay");
     assert_eq!(fx.disk.provider_calls.len(),calls+1,"nothing more to remove");
     // Without a provisioned record Disable never touches the home.
@@ -156,6 +153,59 @@ fn disable_removes_a_provisioned_document_first_and_resumes(){
     let calls=fx.disk.provider_calls.len();
     assert_eq!(fx.handle(&disable(1,"sales")).unwrap().phase,Phase::Disabled);
     assert_eq!(fx.disk.provider_calls.len(),calls);
+}
+
+#[test]
+fn disable_completes_when_the_employee_planted_an_unsafe_entry_or_storage_fails(){
+    // `home_entry_unsafe` is what the real storage answers for a `.duduclaw-api`
+    // the employee replaced by a symlink or gave another mode/owner
+    // (`providers_file` tests); storage failures and a lease race likewise.
+    for failure in [ProvidersFailure::HomeEntryUnsafe,ProvidersFailure::Unavailable,ProvidersFailure::NoSpace,
+        ProvidersFailure::TempLeftBehind,ProvidersFailure::Busy]{
+        let mut fx=Fx::portable();
+        let receipt=allocate(&mut fx,1,"sales");
+        provide(&mut fx,set("sales"),false).unwrap();
+        fx.disk.provider_fail=Some(failure);
+        fx.disk.journal_at=Some(fx.dir.join("allocations.json"));
+        let calls=fx.disk.provider_calls.len();
+        assert_eq!(fx.handle(&disable(1,"sales")).unwrap().phase,Phase::Disabled,"{failure:?}");
+        assert_eq!(fx.disk.provider_calls.len(),calls+1,"attempted once: {failure:?}");
+        let seen=fx.disk.journal_seen.last().unwrap();
+        assert!(seen.contains(r#""phase":"disabling""#) && !seen.contains(r#""providers""#),"persisted first: {failure:?}");
+        assert_eq!(record(&fx,receipt.employee),None);
+        assert!(fx.allocator.journal.entries[0].receipt.disabled);
+        assert!(!fx.disk.present(receipt.employee),"the image (and the left-over document in it) is destroyed");
+        fx.reopen();
+        assert_eq!((fx.phase(receipt.employee),record(&fx,receipt.employee)),(Phase::Disabled,None),"durable");
+    }
+}
+
+#[test]
+fn disable_resumes_after_a_crash_between_the_state_change_and_the_unlink(){
+    // The state right after step (1): Disabling saved with the record cleared.
+    let mut fx=Fx::portable();
+    let receipt=allocate(&mut fx,1,"sales");
+    provide(&mut fx,set("sales"),false).unwrap();
+    let entry=&mut fx.allocator.journal.entries[0];
+    entry.providers=None;entry.phase=Phase::Disabling;
+    fx.allocator.save().unwrap();
+    fx.reopen();
+    let calls=fx.disk.provider_calls.len();
+    assert_eq!(fx.handle(&disable(1,"sales")).unwrap().phase,Phase::Disabled);
+    assert_eq!(fx.disk.provider_calls.len(),calls,"the record is gone: the unlink is skipped");
+    assert!(!fx.disk.present(receipt.employee),"the image is destroyed with whatever it held");
+    // A failure after the unlink: the resume does not repeat it and completes.
+    let mut fx=Fx::portable();
+    let receipt=allocate(&mut fx,1,"sales");
+    provide(&mut fx,set("sales"),false).unwrap();
+    fx.disk.destroy_fail=1;
+    let calls=fx.disk.provider_calls.len();
+    assert!(fx.handle(&disable(1,"sales")).is_err());
+    assert_eq!((fx.phase(receipt.employee),record(&fx,receipt.employee)),(Phase::Disabling,None));
+    assert_eq!(fx.disk.provider_calls.len(),calls+1);
+    fx.reopen();
+    assert_eq!(fx.handle(&disable(1,"sales")).unwrap().phase,Phase::Disabled);
+    assert_eq!(fx.disk.provider_calls.len(),calls+1);
 }
 
 #[test]

@@ -135,6 +135,71 @@ fn service_provider_set_refuses_every_ai_session_marker_and_non_root() {
     assert!(authorize(0, 0).is_ok());
 }
 
+#[test]
+fn service_provider_parse_error_after_a_provider_is_fixed_and_wipes_what_was_built() {
+    WIPED.with(|wiped| wiped.set(0));
+    let valid = provider("main", "https://llm.example/v1");
+    let broken = format!(r#"{{"providers":[{valid},{{"name":"second","api_key":"{KEY}" !!"#).into_bytes();
+    let error = validate(&broken).unwrap_err().to_string();
+    assert_eq!(error, refused(INVALID).to_string(), "one fixed line");
+    assert!(!error.contains(KEY) && !error.contains("llm.example") && !error.contains("main") && !error.contains("second"), "{error}");
+    // The complete first provider (3 strings) and the second one's built fields were dropped wiped.
+    assert!(WIPED.with(|wiped| wiped.get()) >= 5, "{}", WIPED.with(|wiped| wiped.get()));
+    // A wrong type after a complete provider: the same.
+    WIPED.with(|wiped| wiped.set(0));
+    let typed = format!(r#"{{"providers":[{valid},{{"name":7}}]}}"#).into_bytes();
+    assert_eq!(validate(&typed).unwrap_err().to_string(), refused(INVALID).to_string());
+    assert!(WIPED.with(|wiped| wiped.get()) >= 3);
+}
+
+#[test]
+fn service_provider_secret_wrapper_wipes_on_drop() {
+    WIPED.with(|wiped| wiped.set(0));
+    let secret: Secret = serde_json::from_str(&format!(r#""{KEY}""#)).unwrap();
+    assert_eq!(secret.as_str(), KEY, "copied once from the borrowed input");
+    drop(secret);
+    assert_eq!(WIPED.with(|wiped| wiped.get()), 1, "the drop zeroized it");
+    // A successful validation wipes every parsed string as well.
+    WIPED.with(|wiped| wiped.set(0));
+    validate(&document(&provider("main", "https://llm.example/v1"))).unwrap();
+    assert_eq!(WIPED.with(|wiped| wiped.get()), 3);
+    // An escaped string never reaches a buffer of ours: refused, never quoted.
+    let error = serde_json::from_str::<Secret>(r#""sk-NEVER""#).err().unwrap().to_string();
+    assert!(!error.contains("NEVER"), "{error}");
+}
+
+#[test]
+fn service_provider_escaped_strings_are_refused_although_the_runtime_accepts_them() {
+    // Refusing more than the runtime (never less): the escaped forms would pass through serde_json's
+    // unzeroized scratch buffer.
+    for escaped in [
+        format!(r#"{{"name":"main","api_key":"sk-{KEY}","base_url":"https://llm.example/v1"}}"#),
+        format!(r#"{{"name":"main","api_key":"{KEY}","base_url":"https:\/\/llm.example\/v1"}}"#),
+        format!(r#"{{"name":"m\"ain","api_key":"{KEY}","base_url":"https://llm.example/v1"}}"#),
+    ] {
+        let fixture = document(&escaped);
+        let error = validate(&fixture).unwrap_err().to_string();
+        assert!(error.contains("跳脫") && !error.contains(KEY) && !error.contains("llm.example"), "{error}");
+        let parsed: duduclaw_api_worker::Credentials = serde_json::from_slice(&fixture).unwrap();
+        assert!(parsed.select(None).is_ok(), "the runtime accepts it");
+    }
+}
+
+#[test]
+fn service_provider_transport_lines_say_whether_anything_may_have_changed() {
+    assert_eq!(transport_line(false), UNREACHABLE);
+    assert!(UNREACHABLE.contains("未變更"));
+    assert_eq!(transport_line(true), UNCONFIRMED);
+    assert!(UNCONFIRMED.contains("未確認") && UNCONFIRMED.contains("再次執行同一指令") && !UNCONFIRMED.contains("未變更"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn service_provider_isolation_unavailable_reply_is_unconfirmed() {
+    use duduclaw_migration::allocation::providers::ProviderErrorCode as Code;
+    assert_eq!(refusal_line(Code::IsolationUnavailable), UNCONFIRMED);
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn service_provider_refusal_lines_are_fixed() {

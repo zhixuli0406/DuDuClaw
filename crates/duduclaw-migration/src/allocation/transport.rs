@@ -141,17 +141,88 @@ pub fn receive_frame(fd:&OwnedFd)->Result<providers::Frame,Error>{
     if n<=0 || msg.msg_flags&(libc::MSG_TRUNC|libc::MSG_CTRUNC)!=0{return Err(Error::Invalid)}
     providers::decode_frame(&bytes[..n as usize])
 }
+/// R8r-2 review round 1 (F3): where a schema-5 exchange failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProvideFailure {
+    /// Before the request was fully sent (request check, connect, peer
+    /// check, serialisation, send): root never received it; nothing changed.
+    NotSent(Error),
+    /// After the request was sent (no reply, receive timeout, a garbled or
+    /// mismatched reply): root may have completed the change.
+    Unconfirmed(Error),
+}
 /// The schema-5 exchange. Takes the request by value: it is serialised into
 /// a zeroizing buffer and dropped (payload wiped) before the reply is read.
 /// `Ok(Err(code))` is root's refusal; `Err` is a transport failure or a
-/// reply that does not match the request (never a refusal).
-pub fn provide(request:providers::ProviderRequest)->Result<Result<providers::Provisioned,providers::ProviderErrorCode>,Error>{
-    request.check().map_err(|_|Error::Invalid)?;
+/// reply that does not match the request (never a refusal), classified by
+/// whether the request had been sent ([`ProvideFailure`]).
+pub fn provide(request:providers::ProviderRequest)->Result<Result<providers::Provisioned,providers::ProviderErrorCode>,ProvideFailure>{
+    request.check().map_err(|_|ProvideFailure::NotSent(Error::Invalid))?;
+    let fd=connect().map_err(ProvideFailure::NotSent)?;
+    provide_on(&fd,request)
+}
+/// [`provide`] over an already connected, authenticated socket.
+fn provide_on(fd:&OwnedFd,request:providers::ProviderRequest)->Result<Result<providers::Provisioned,providers::ProviderErrorCode>,ProvideFailure>{
     let (nonce,clear)=(request.nonce,request.clear);
-    let fd=connect()?;
-    let sent=send_secret(&fd,&request);
+    // A seqpacket send is all or nothing: a failed send queued no frame.
+    let sent=send_secret(fd,&request);
     drop(request);
-    sent?;
-    let response:providers::ProviderResponse=receive(&fd)?;
-    providers::check_provider_response(nonce,clear,response)
+    sent.map_err(ProvideFailure::NotSent)?;
+    let response:providers::ProviderResponse=receive(fd).map_err(ProvideFailure::Unconfirmed)?;
+    providers::check_provider_response(nonce,clear,response).map_err(ProvideFailure::Unconfirmed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use duduclaw_isolation::ids::RequestId;
+    use providers::{Payload, ProviderAction, ProviderErrorCode, ProviderRequest, ProviderResponse, SCHEMA_V5};
+    fn pair() -> (OwnedFd, OwnedFd) {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0, fds.as_mut_ptr()) }, 0);
+        let (a, b) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        timeout(&a).unwrap();
+        (a, b)
+    }
+    fn request() -> ProviderRequest {
+        ProviderRequest { schema: SCHEMA_V5, nonce: RequestId([3; 16]), action: ProviderAction::ProvisionProviders, item: None,
+            employee_id: None, label: Some("sales".into()),
+            payload: Some(Payload::new(zeroize::Zeroizing::new(br#"{"providers":[]}"#.to_vec())).unwrap()), clear: false }
+    }
+
+    #[test]
+    fn provide_failure_before_the_send_is_not_sent() {
+        let (client, server) = pair();
+        drop(server);
+        assert!(matches!(provide_on(&client, request()), Err(ProvideFailure::NotSent(_))));
+    }
+
+    #[test]
+    fn provide_failure_after_the_send_is_unconfirmed() {
+        // The peer takes the request and closes without a reply (a lost reply).
+        let (client, server) = pair();
+        let peer = std::thread::spawn(move || { let received = receive_frame(&server).is_ok(); drop(server); received });
+        assert!(matches!(provide_on(&client, request()), Err(ProvideFailure::Unconfirmed(_))));
+        assert!(peer.join().unwrap(), "the request was delivered");
+        // A reply that does not match the request (another nonce).
+        let (client, server) = pair();
+        let peer = std::thread::spawn(move || {
+            let _ = receive_frame(&server);
+            send(&server, &ProviderResponse::answer(RequestId([9; 16]), Err(ProviderErrorCode::NotReady))).unwrap();
+        });
+        assert!(matches!(provide_on(&client, request()), Err(ProvideFailure::Unconfirmed(_))));
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn provide_isolation_unavailable_reply_is_a_refusal_code() {
+        // Root's 4 s bound answers `isolation_unavailable`; the caller reports it as unconfirmed.
+        let (client, server) = pair();
+        let peer = std::thread::spawn(move || {
+            let _ = receive_frame(&server);
+            send(&server, &ProviderResponse::answer(RequestId([3; 16]), Err(ProviderErrorCode::IsolationUnavailable))).unwrap();
+        });
+        assert_eq!(provide_on(&client, request()), Ok(Err(ProviderErrorCode::IsolationUnavailable)));
+        peer.join().unwrap();
+    }
 }

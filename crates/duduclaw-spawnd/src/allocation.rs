@@ -20,10 +20,11 @@
 //! writes or removes a Ready employee's model connection document inside its
 //! own home (`crate::providers_file`, through `Storage::write_providers`).
 //! The entry records only `providers: {provisioned, updated_unix}` (journal
-//! schema 3, omitted when `None`; never a payload or a hash). `Disable`
-//! removes a provisioned document before its state change and `Disable` /
-//! `Retire` clear the record with their state change (Retire destroys the
-//! image).
+//! schema 3, omitted when `None`; never a payload or a hash). `Disable` /
+//! `Retire` clear the record with their state change; `Disable` then
+//! removes a provisioned document as best effort (review round 1, F1: it
+//! never refuses because of it) and destroys the image; Retire destroys the
+//! image.
 use std::{fs::{self,File,OpenOptions},io::{self,Read,Write},path::{Path,PathBuf},os::unix::fs::{OpenOptionsExt,MetadataExt}};
 use serde::{Serialize,Deserialize};
 use duduclaw_migration::allocation::{self as wire,Action,Request,Receipt,Reply,Phase,RetireSpec,Specification,OperationKind,operation,validate_principal_binding,
@@ -113,7 +114,7 @@ fn providers_code(failure:ProvidersFailure)->ProviderErrorCode{
     match failure{
         ProvidersFailure::Busy=>ProviderErrorCode::NotReady,
         ProvidersFailure::HomeEntryUnsafe=>ProviderErrorCode::HomeEntryUnsafe,
-        ProvidersFailure::NoSpace|ProvidersFailure::Unavailable=>ProviderErrorCode::StorageUnavailable,
+        ProvidersFailure::NoSpace|ProvidersFailure::Unavailable|ProvidersFailure::TempLeftBehind=>ProviderErrorCode::StorageUnavailable,
     }
 }
 /// Root audit facts produced by one request (the host emits them).
@@ -286,16 +287,19 @@ impl Allocator {
         self.save().map_err(|_|ProviderErrorCode::IsolationUnavailable)?;
         Ok(record)
     }
-    /// R8r-2 G: `Disable` removes a provisioned document before its state
-    /// change (the same safe unlink as `clear`; an absent file is success),
-    /// so a crash between the two steps repeats the removal on resume.
-    fn withdraw_providers(&self,storage:&mut dyn Storage,index:usize)->Answer<()>{
-        let entry=&self.journal.entries[index];
-        if !entry.providers.is_some_and(|record|record.provisioned){return Ok(())}
-        storage.write_providers(entry.receipt.employee,entry.receipt.uid,ProvidersChange::Clear).map_err(|failure|match failure{
-            ProvidersFailure::Busy=>wire::ErrorCode::NotReady,
-            _=>wire::ErrorCode::IsolationUnavailable,
-        })
+    /// R8r-2 G (review round 1, F1): `Disable` removes a provisioned document
+    /// AFTER its non-runnable state change was persisted, as best effort (the
+    /// same safe unlink as `clear`; an absent file is success). The employee
+    /// controls its own home: a `.duduclaw-api` it replaced by a symlink or a
+    /// wrong-owner / wrong-mode entry refuses the unlink (`home_entry_unsafe`),
+    /// and that must never keep an administrator from disabling it. Every
+    /// failure is one fixed stderr line (no id, no path) and the Disable goes
+    /// on. A document left behind stays in the image of an entry that can no
+    /// longer run, and the same Disable destroys that image right after.
+    fn withdraw_providers(storage:&mut dyn Storage,employee:EmployeeId,uid:u32){
+        if storage.write_providers(employee,uid,ProvidersChange::Clear).is_err(){
+            eprintln!("duduclaw-spawnd: provider document not removed during disable");
+        }
     }
     pub fn handle(&mut self,request:&Request,mut env:Env<'_>)->Answer<Reply>{
         if self.poisoned{return Err(wire::ErrorCode::IsolationUnavailable)}
@@ -365,11 +369,22 @@ impl Allocator {
                 if !disable_allowed(self.journal.entries[index].phase){return Err(wire::ErrorCode::InvalidRequest)}
                 // R8d A5: the entitlement goes before the state change.
                 self.revoke(&mut env,employee)?;
-                // R8r-2 G: so does a provisioned provider document; the
-                // record is cleared with the state change (same save).
-                self.withdraw_providers(env.storage,index)?;
+                // R8r-2 G (F1): the provider record is cleared with the
+                // state change (same save), which ALWAYS completes first:
+                // Disabling is not Ready (no `ready_employees`, no
+                // `provision_providers`, never revived by Allocate), the
+                // entitlement StartRun derives its policy from is already
+                // gone (above) and the registry row is tombstoned below.
+                // Only then is a provisioned document unlinked, best effort.
+                // A crash between the two skips the unlink on resume (the
+                // record is cleared); the image is destroyed below anyway.
+                let provisioned=self.journal.entries[index].providers.is_some_and(|record|record.provisioned);
                 self.journal.entries[index].providers=None;
                 self.journal.entries[index].phase=Phase::Disabling;self.save().map_err(code)?;
+                if provisioned{
+                    let uid=self.journal.entries[index].receipt.uid;
+                    Self::withdraw_providers(env.storage,employee,uid);
+                }
                 let account=env.registry.registry().employees.iter().find(|a|a.employee==employee).cloned();
                 if let Some(account)=account{
                     env.registry.retire(employee).map_err(|_|wire::ErrorCode::IsolationUnavailable)?;
