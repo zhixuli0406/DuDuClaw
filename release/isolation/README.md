@@ -100,7 +100,11 @@ tauri-action), `container/Dockerfile.server` (the build stage greps the built
 binary for the same marker before the runtime image copies it), `npm/scripts/publish.sh`
 (every binary before `npm publish`), `scripts/release.sh` (environment check before
 any change; the Pro binary before signing and upload) and the Linux packager, which
-shares its environment rules. `scripts/isolation-test-keys.sh bundle --gateway`
+shares its environment rules. For source-derived markers, the script and Docker
+guard print a notice and skip scanning only when `license_runtime.rs` has no marker
+definition and contains no `duduclaw_test_root` string (source predating the test-licence
+issuer). A missing file, multiple definitions, or test-root source without a definition
+still fails closed; `--marker-file` remains strict. `scripts/isolation-test-keys.sh bundle --gateway`
 names its TEST copy `duduclaw-linux-<arch>-TEST.tar.gz`. By hand:
 `python3 -I -B scripts/refuse-test-license-build.py <binary or .tar.gz/.tgz/.zip>...`
 (exit 0 clean, 1 test-licence build found, 2 usage or read error) and

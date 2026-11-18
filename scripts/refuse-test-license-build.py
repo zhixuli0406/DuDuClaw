@@ -4,8 +4,9 @@
 A `--cfg duduclaw_test_root` duduclaw (or duduclaw-pro) also trusts a compiled TEST
 licence issuer and embeds the constant TEST_LICENSE_BUILD_MARKER of
 crates/duduclaw-gateway/src/license_runtime.rs. This script reads the marker from
-that file at run time (exactly one definition, or it refuses to run), so the Rust
-constant stays its only copy. The check is static: nothing is executed or extracted.
+that file at run time (exactly one definition, or it refuses to run, except that
+source predating the test-licence issuer needs no scan), so the Rust constant stays
+its only copy. The check is static: nothing is executed or extracted.
 
   python3 -I -B scripts/refuse-test-license-build.py [--marker-file F] PATH...
       A PATH ending in .tar.gz, .tgz, .tar or .zip is an archive; anything else is a
@@ -84,11 +85,15 @@ def parse_marker(source):
     return definitions[0]
 
 
-def load_marker(path=LICENSE_RUNTIME):
+def load_marker(path=None):
+    """Read the source marker, or return None for source predating the test issuer."""
+    path = LICENSE_RUNTIME if path is None else path
     try:
         source = Path(path).read_bytes()
     except OSError as error:
         raise RefuserError(f"cannot read {path}: {error.strerror or error}") from error
+    if not MARKER_DECLARATION.search(source) and TEST_ROOT_CFG.encode() not in source:
+        return None
     return parse_marker(source)
 
 
@@ -337,6 +342,9 @@ def main(argv=None):
         except RefuserError as error:
             _emit(f"{PROG}: ERROR {error}")
             return 2
+        if marker is None:
+            _emit(f"{PROG}: source predates the test-licence issuer; skipping marker scan", sys.stdout)
+            return 1 if refused else 0
         for path in args.paths:
             try:
                 found, scanned = scan(path, marker)

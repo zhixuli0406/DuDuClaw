@@ -67,13 +67,23 @@ RUN if [ -n "$CARGO_JOBS" ]; then export CARGO_BUILD_JOBS="$CARGO_JOBS"; fi && \
 # Never ship a TEST-licence gateway (the scripts/refuse-test-license-build.py rule).
 # rust:slim has no python3, so the same static scan runs as grep -a -F against
 # the marker sed reads from its one definition in license_runtime.rs; fails closed
-# when that definition is missing, ambiguous or the scan itself fails.
+# unless the source predates the test issuer; otherwise fails closed on errors.
 RUN set -eu; \
+    source_file=crates/duduclaw-gateway/src/license_runtime.rs; \
     marker_file=/tmp/test-license-marker; \
+    declarations="$(grep -c -E 'TEST_LICENSE_BUILD_MARKER[[:space:]]*:' "$source_file")" || [ "$?" = 1 ]; \
+    if [ "$declarations" = 0 ]; then \
+        status=0; \
+        grep -q -F 'duduclaw_test_root' "$source_file" || status=$?; \
+        if [ "$status" = 1 ]; then \
+            echo "source predates the test-licence issuer; skipping marker scan"; exit 0; \
+        fi; \
+        echo "ERROR: cannot establish source predating the test-licence issuer" >&2; exit 1; \
+    fi; \
     sed -n 's/^static TEST_LICENSE_BUILD_MARKER: &\[u8\] = b"\([A-Za-z0-9_-]*\)";$/\1/p' \
-        crates/duduclaw-gateway/src/license_runtime.rs > "$marker_file"; \
-    if [ "$(grep -c '' "$marker_file")" != 1 ] || [ "$(wc -c < "$marker_file")" -lt 17 ]; then \
-        echo "ERROR: cannot read the one TEST_LICENSE_BUILD_MARKER definition in license_runtime.rs (a source older than the marker cannot be built with this recipe)" >&2; exit 1; \
+        "$source_file" > "$marker_file"; \
+    if [ "$declarations" != 1 ] || [ "$(grep -c '' "$marker_file")" != 1 ] || [ "$(wc -c < "$marker_file")" -lt 17 ]; then \
+        echo "ERROR: cannot read the one TEST_LICENSE_BUILD_MARKER definition in license_runtime.rs" >&2; exit 1; \
     fi; \
     status=0; \
     matches="$(grep -c -a -F -f "$marker_file" target/release/duduclaw)" || status=$?; \

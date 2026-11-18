@@ -95,6 +95,30 @@ class RefuserTests(unittest.TestCase):
                 REFUSER.parse_marker(bad)
         self.assertEqual(REFUSER.parse_marker(b"x\n" + definition + b"y\n"), MARKER)
 
+    def test_old_source_passes_without_scanning(self):
+        source = self.write("old/crates/duduclaw-gateway/src/license_runtime.rs", b"// Old licence runtime\n")
+        with patch.object(REFUSER, "LICENSE_RUNTIME", source), patch.object(REFUSER, "scan") as scan:
+            status, out, err = self.run_main(self.root / "absent-binary")
+        self.assertEqual(status, 0)
+        self.assertEqual(out.splitlines(), [
+            "refuse-test-license-build: source predates the test-licence issuer; skipping marker scan"])
+        self.assertEqual(err, "")
+        scan.assert_not_called()
+
+    def test_source_marker_errors_fail_closed(self):
+        definition = b'static TEST_LICENSE_BUILD_MARKER: &[u8] = b"' + MARKER + b'";\n'
+        for content in (b"#[cfg(duduclaw_test_root)]\n", definition + definition):
+            with self.subTest(content=content):
+                source = self.write("invalid/crates/duduclaw-gateway/src/license_runtime.rs", content)
+                with patch.object(REFUSER, "LICENSE_RUNTIME", source), patch.object(REFUSER, "scan") as scan:
+                    status, out, err = self.run_main(self.root / "absent-binary")
+                self.assertEqual(status, 2)
+                self.assertEqual(out, "")
+                self.assertIn("exactly once", err)
+                scan.assert_not_called()
+        with patch.object(REFUSER, "LICENSE_RUNTIME", self.root / "missing-source"):
+            self.assertEqual(self.run_main(self.root / "absent-binary")[0], 2)
+
     def test_no_release_tooling_keeps_a_copy_of_the_marker(self):
         files = [*(ROOT / "scripts").glob("*.py"), *(ROOT / "scripts").glob("*.sh"), ROOT / "scripts/release.sh",
                  *(ROOT / ".github/workflows").glob("*.yml"), ROOT / "container/Dockerfile.server",
