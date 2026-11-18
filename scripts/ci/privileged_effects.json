@@ -4764,56 +4764,16 @@
       "rationale": "Test fixture or test helper; compiled/run only for regression verification, not a production employee execution entry point."
     },
     {
-      "symbol": "crates/duduclaw-inference/src/hardware.rs::detect_amd",
-      "apis": {
-        "command_constructor": 1,
-        "terminal_output": 1
-      },
-      "effects": [
-        "process_spawn"
-      ],
-      "identity": "gateway",
-      "migration": "gateway_exception",
-      "rationale": "Read-only host GPU/RAM/CPU capability probe using fixed platform tools; no employee prompt is executed."
-    },
-    {
       "symbol": "crates/duduclaw-inference/src/hardware.rs::detect_apple_chip",
       "apis": {
-        "command_constructor": 1,
-        "terminal_output": 1
+        "command_constructor": 1
       },
       "effects": [
         "process_spawn"
       ],
       "identity": "gateway",
       "migration": "gateway_exception",
-      "rationale": "Read-only host GPU/RAM/CPU capability probe using fixed platform tools; no employee prompt is executed."
-    },
-    {
-      "symbol": "crates/duduclaw-inference/src/hardware.rs::detect_nvidia",
-      "apis": {
-        "command_constructor": 1,
-        "terminal_output": 1
-      },
-      "effects": [
-        "process_spawn"
-      ],
-      "identity": "gateway",
-      "migration": "gateway_exception",
-      "rationale": "Read-only host GPU/RAM/CPU capability probe using fixed platform tools; no employee prompt is executed."
-    },
-    {
-      "symbol": "crates/duduclaw-inference/src/hardware.rs::detect_nvidia_vram",
-      "apis": {
-        "command_constructor": 1,
-        "terminal_output": 1
-      },
-      "effects": [
-        "process_spawn"
-      ],
-      "identity": "gateway",
-      "migration": "gateway_exception",
-      "rationale": "Read-only host GPU/RAM/CPU capability probe using fixed platform tools; no employee prompt is executed."
+      "rationale": "Read-only host GPU/RAM/CPU capability probe using fixed platform tools; no employee prompt is executed. Run through run_bounded (hard deadline, killed and reaped on expiry)."
     },
     {
       "symbol": "crates/duduclaw-inference/src/hardware.rs::detect_ram_macos",
@@ -4840,6 +4800,67 @@
       "identity": "gateway",
       "migration": "gateway_exception",
       "rationale": "Read-only host GPU/RAM/CPU capability probe using fixed platform tools; no employee prompt is executed."
+    },
+    {
+      "symbol": "crates/duduclaw-inference/src/hardware.rs::guarded_command",
+      "apis": {
+        "command_constructor": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "gateway",
+      "migration": "gateway_exception",
+      "rationale": "Read-only host GPU capability probe (fixed tools nvidia-smi / rocm-smi under the namespace guard); no employee prompt is executed. Run through run_bounded (hard deadline, killed and reaped on expiry)."
+    },
+    {
+      "symbol": "crates/duduclaw-inference/src/hardware.rs::run_bounded",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "gateway",
+      "migration": "gateway_exception",
+      "rationale": "Starts one read-only hardware probe command built by guarded_command / detect_apple_chip, bounded by PROBE_COMMAND_TIMEOUT; on expiry the child is killed and reaped. No employee prompt is executed."
+    },
+    {
+      "symbol": "crates/duduclaw-inference/src/hardware.rs::tests::answer",
+      "apis": {
+        "command_constructor": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test fixture or test helper; compiled/run only for regression verification, not a production employee execution entry point."
+    },
+    {
+      "symbol": "crates/duduclaw-inference/src/hardware.rs::tests::exists",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_status": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test fixture or test helper; compiled/run only for regression verification, not a production employee execution entry point."
+    },
+    {
+      "symbol": "crates/duduclaw-inference/src/hardware.rs::tests::hang",
+      "apis": {
+        "command_constructor": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test fixture or test helper; compiled/run only for regression verification, not a production employee execution entry point."
     },
     {
       "symbol": "crates/duduclaw-inference/src/llamafile.rs::LlamafileManager::start",

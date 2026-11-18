@@ -37,8 +37,21 @@ struct PostLookup {
     reply: Option<tokio::sync::oneshot::Sender<(bool, u32)>>,
 }
 
+/// The syscalls one `std::thread` spawn needs on x86_64 / aarch64 glibc
+/// (stack and guard mapping, `clone3` with the `clone` fallback, signal mask,
+/// robust list, rseq, alternate signal stack, thread name). The unit's
+/// `SystemCallFilter=` must admit every one, or the worker is never created
+/// and no lookup can ever count (pinned by a test below). The in-process
+/// filter (`seccomp::install`) denies `clone`/`clone3` afterwards.
+pub const WORKER_START_SYSCALLS: [&str; 13] = ["clone3", "clone", "mmap", "mprotect", "munmap", "madvise",
+    "rt_sigprocmask", "set_robust_list", "rseq", "sigaltstack", "prctl", "futex", "exit"];
+
+/// The one fixed line egress prints before refusing to start without a worker.
+pub const WORKER_UNAVAILABLE: &str = "duduclaw-egress: dns probe worker unavailable";
+
 /// A single bounded worker: interface enumeration and stderr may block. Start
 /// before seccomp (which denies clone); never join a timed-out blocking job.
+/// Starts one thread ("dns-probe").
 fn post_lookup_worker() -> Option<std::sync::mpsc::SyncSender<PostLookup>> {
     let (sender, receiver) = std::sync::mpsc::sync_channel::<PostLookup>(1);
     let (ready, started) = std::sync::mpsc::sync_channel(0);
@@ -70,6 +83,16 @@ impl Default for DnsProbe {
     fn default() -> Self { Self { deadline: PROBE_DEADLINE, last: None, worker: post_lookup_worker() } }
 }
 impl DnsProbe {
+    /// The daemon's constructor: `None` when the worker thread cannot be
+    /// created (the caller then refuses to start instead of running a probe
+    /// that can never resolve). [`Default`] keeps the lenient behaviour.
+    pub fn start() -> Option<Self> { Self::with_worker(post_lookup_worker()) }
+
+    fn with_worker(worker: Option<std::sync::mpsc::SyncSender<PostLookup>>) -> Option<Self> {
+        let worker = worker?;
+        Some(Self { deadline: PROBE_DEADLINE, last: None, worker: Some(worker) })
+    }
+
     /// A shorter deadline (tests); never longer than [`PROBE_DEADLINE`].
     pub fn with_deadline(deadline: Duration) -> Self { Self { deadline: deadline.min(PROBE_DEADLINE), ..Self::default() } }
 
@@ -335,6 +358,30 @@ mod tests {
         assert_eq!(probe.answer("example.com", ROUTE, &fake, next + Duration::from_secs(9), own).await,
             probed(DnsRoute::ResolvedVarlink, false, 0));
         assert_eq!(fake.calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Real-host defect 28: the unit's allow-list lacked clone/clone3, the
+    /// worker spawn failed silently and every probe answered (false, 0).
+    #[test]
+    fn unit_admits_the_probe_worker_spawn_before_the_in_process_filter() {
+        const UNIT: &str = include_str!("../systemd/duduclaw-egress.service");
+        let filters: Vec<&str> = UNIT.lines().filter_map(|line| line.strip_prefix("SystemCallFilter=")).collect();
+        assert_eq!(filters.len(), 1, "exactly one allow-list line");
+        let allowed: BTreeSet<&str> = filters[0].split_whitespace().collect();
+        assert!(!allowed.iter().any(|call| call.starts_with('~') || call.starts_with('@')));
+        for call in WORKER_START_SYSCALLS { assert!(allowed.contains(call), "unit SystemCallFilter lacks {call}"); }
+        assert!(UNIT.lines().any(|line| line == "SystemCallErrorNumber=EPERM"));
+        assert!(UNIT.lines().any(|line| line.starts_with("TasksMax=")));
+    }
+
+    #[test]
+    fn probe_start_requires_its_worker() {
+        assert!(DnsProbe::with_worker(None).is_none());
+        let probe = DnsProbe::start().expect("worker thread starts in an unrestricted test process");
+        assert!(probe.worker.is_some());
+        assert_eq!(probe.deadline, PROBE_DEADLINE);
+        assert!(DnsProbe::default().worker.is_some());
+        assert_eq!(WORKER_UNAVAILABLE, "duduclaw-egress: dns probe worker unavailable");
     }
 
     #[test]

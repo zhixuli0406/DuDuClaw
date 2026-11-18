@@ -236,11 +236,12 @@ pub async fn boot_protected(home: &Path, users: Arc<duduclaw_auth::UserDb>, agen
 /// minute, then 10 s; each attempt bounded by its own waits). Ends at the
 /// first success, when a missing producer can no longer appear, or once the
 /// gateway's shutdown gate (`handlers::migration_shutdown_gate`) has closed.
+/// R8j round 2 B3: the gate is checked before the first attempt as well
+/// (`retry::run`), during its generation wait and immediately before
+/// `assemble` (`attempt_installed`). Starts one tokio task.
 fn spawn_boot(mut boot: InstalledBoot, started: std::time::Instant) {
     drop(tokio::spawn(async move {
-        if let retry::Step::Retry = retry::step(&mut boot, &STATE, started).await {
-            retry::retry_until_assembled(&mut boot, &STATE, started, retry::SCHEDULE, shutdown_begun).await;
-        }
+        retry::run(&mut boot, &STATE, started, retry::SCHEDULE, shutdown_begun).await;
     }));
 }
 
@@ -288,11 +289,10 @@ async fn attempt_installed(boot: &mut InstalledBoot) -> Result<(), retry::Failur
     let home = home.as_path();
     // F's first asynchronous probe may still be in flight during startup. Wait
     // a bounded interval before consuming the root report; never mark it ready
-    // merely because the unit/socket exists.
-    for _ in 0..50 {
-        if crate::isolation_readiness::verified_generation().is_some() { break; }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
+    // merely because the unit/socket exists. A shutdown ends the wait (B3).
+    let (tries, interval) = retry::GENERATION_WAIT;
+    retry::wait_for_generation(|| crate::isolation_readiness::verified_generation().is_some(),
+        &shutdown_begun, tries, interval).await?;
     let derived = fill_installed_sources(sources, home);
     let backend = duduclaw_execution::selection::protected_backend_for_boot();
     // Reuse the gateway's initialized users.db and confirmed employee registry.
@@ -335,6 +335,12 @@ async fn attempt_installed(boot: &mut InstalledBoot) -> Result<(), retry::Failur
         if precheck(home, sources).is_err() {
             derived.forget(sources);
             return Err(retry::Failure { missing: vec![MissingProducer::Initialization], retry: true });
+        }
+        // R8j round 2 B3: never enter the side-effectful `assemble` once the
+        // shutdown gate has closed.
+        if let Err(closed) = retry::before_assemble(&shutdown_begun) {
+            derived.forget(sources);
+            return Err(closed);
         }
         let final_failure = || retry::Failure { missing: vec![MissingProducer::Initialization], retry: false };
         let owner = assemble(home, backend.map_err(|_| final_failure())?, std::mem::take(sources))

@@ -73,7 +73,10 @@ fn program() -> Vec<Instruction> {
 
 /// Called after identity, configuration, listener and DNS startup probes. The
 /// daemon uses a current-thread runtime; TSYNC also covers any existing threads.
-/// No exec, clone, namespace or AF_VSOCK syscall is allowed. Filesystem
+/// No exec, clone, clone3, namespace or AF_VSOCK syscall is allowed (the
+/// default action below denies everything not in `allowed_syscalls`, which
+/// lists neither clone nor clone3); the unit admits clone/clone3 only so the
+/// DNS probe worker can be created before this runs. Filesystem
 /// writes are denied by the unit and openat rejects writable/creating flags.
 /// Read-only openat remains for NSS/config reads.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -126,8 +129,23 @@ mod tests {
             assert_eq!(evaluate_flags(&p,ARCH,libc::SYS_openat as u32,0,flags),
                 if flags & WRITE_OPEN_FLAGS == 0 {ALLOW}else{DENY}, "open flags {flags}");
         }
-        for syscall in [libc::SYS_execve,libc::SYS_clone,libc::SYS_mount,libc::SYS_unshare,libc::SYS_socketpair] {
+        for syscall in [libc::SYS_execve,libc::SYS_clone,libc::SYS_clone3,libc::SYS_mount,libc::SYS_unshare,libc::SYS_socketpair] {
             assert_eq!(evaluate(&p,ARCH,syscall as u32,0),DENY);
+        }
+    }
+    /// Defect 28: the unit admits clone/clone3 once, for the DNS probe worker
+    /// created before `install`; this filter must deny both afterwards.
+    #[test]
+    fn seccomp_denies_thread_and_process_creation_after_start() {
+        let allowed=allowed_syscalls();
+        for syscall in [libc::SYS_clone,libc::SYS_clone3,libc::SYS_execve,libc::SYS_execveat] {
+            assert!(!allowed.contains(&syscall),"syscall {syscall}");
+            assert_eq!(evaluate(&program(),ARCH,syscall as u32,0),DENY,"syscall {syscall}");
+        }
+        #[cfg(target_arch = "x86_64")]
+        for syscall in [libc::SYS_fork,libc::SYS_vfork] {
+            assert!(!allowed.contains(&syscall),"syscall {syscall}");
+            assert_eq!(evaluate(&program(),ARCH,syscall as u32,0),DENY,"syscall {syscall}");
         }
     }
 }

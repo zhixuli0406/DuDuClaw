@@ -16,6 +16,50 @@ pub(super) struct Failure {
     pub(super) missing: Vec<MissingProducer>,
     pub(super) retry: bool,
 }
+impl Failure {
+    /// R8j round 2 B3: the attempt ended at the shutdown gate. Nothing is
+    /// published or logged and the boot task ends (no retry).
+    pub(super) fn closed() -> Self { Self { missing: Vec::new(), retry: false } }
+    /// Only [`Failure::closed`] has an empty missing set.
+    fn is_closed(&self) -> bool { self.missing.is_empty() && !self.retry }
+}
+
+/// The bounded wait for the updater's generation at the start of an attempt:
+/// at most `tries` checks `interval` apart (production: [`GENERATION_WAIT`],
+/// 50 × 100 ms = 5 s). When it does not appear the attempt continues (and
+/// reports it missing). R8j round 2 B3: the gate is checked before every
+/// check, so a shutdown ends the wait within one `interval`
+/// (`Err(Failure::closed())`).
+pub(super) async fn wait_for_generation(present: impl Fn() -> bool, closed: &impl Fn() -> bool, tries: u32,
+    interval: Duration) -> Result<(), Failure> {
+    for _ in 0..tries {
+        if closed() { return Err(Failure::closed()); }
+        if present() { return Ok(()); }
+        tokio::time::sleep(interval).await;
+    }
+    if closed() { Err(Failure::closed()) } else { Ok(()) }
+}
+/// Production [`wait_for_generation`] bound: 50 checks, 100 ms apart.
+pub(super) const GENERATION_WAIT: (u32, Duration) = (50, Duration::from_millis(100));
+
+/// R8j round 2 B3: checked immediately before the side-effectful assembly
+/// (which installs process-wide singletons): a closed gate never assembles.
+pub(super) fn before_assemble(closed: &impl Fn() -> bool) -> Result<(), Failure> {
+    if closed() { Err(Failure::closed()) } else { Ok(()) }
+}
+
+/// The whole boot task: nothing at all once the gate is closed (R8j round 2
+/// B3: checked before the first attempt too), then the first attempt and,
+/// while it answers `Retry`, [`retry_until_assembled`]. `true` once assembled.
+pub(super) async fn run(boot: &mut impl BootAttempt, state: &BootState, started: Instant, schedule: Schedule,
+    closed: impl Fn() -> bool) -> bool {
+    if closed() { return false; }
+    match step(boot, state, started).await {
+        Step::Assembled => true,
+        Step::Stop => false,
+        Step::Retry => retry_until_assembled(boot, state, started, schedule, closed).await,
+    }
+}
 
 pub(super) type AttemptFuture<'a> = Pin<Box<dyn Future<Output = Result<(), Failure>> + Send + 'a>>;
 
@@ -65,6 +109,8 @@ pub(super) async fn step(boot: &mut impl BootAttempt, state: &BootState, started
             boot.assembled();
             Step::Assembled
         }
+        // Shutdown: the previous status stays, nothing is logged.
+        Err(failure) if failure.is_closed() => Step::Stop,
         Err(Failure { missing, retry }) => {
             if state.failed(&missing) {
                 if matches!(missing.as_slice(), [MissingProducer::Initialization]) {
@@ -246,6 +292,80 @@ mod tests {
         assert_eq!(boot.published.load(Ordering::Acquire), 0);
         assert_eq!(boot.reconciles.load(Ordering::Acquire), 0);
         assert!(state.status().is_some_and(|status| !status.constructed && status.missing == MISSING));
+    }
+
+    /// R8j round 2 B3: a gate already closed when the boot task starts: no
+    /// attempt at all, nothing published.
+    #[tokio::test]
+    async fn boot_gate_closed_before_the_first_attempt_attempts_nothing() {
+        let state = Arc::new(BootState::new());
+        let mut boot = Fake::new(&state, 0);
+        assert!(!run(&mut boot, &state, Instant::now(), FAST, || true).await);
+        assert_eq!(boot.attempts.load(Ordering::Acquire), 0);
+        assert_eq!(boot.published.load(Ordering::Acquire), 0);
+        assert_eq!(boot.reconciles.load(Ordering::Acquire), 0);
+        assert!(state.status().is_none());
+        // Open gate: the same task assembles (first attempt, then retries).
+        let mut boot = Fake::new(&state, 2);
+        assert!(run(&mut boot, &state, Instant::now(), FAST, || false).await);
+        assert_eq!((boot.attempts.load(Ordering::Acquire), boot.published.load(Ordering::Acquire)), (3, 1));
+    }
+
+    /// Mirrors `attempt_installed`'s gated steps: the generation wait, then
+    /// the gate immediately before the side-effectful assembly.
+    struct Gated { gate: Arc<AtomicUsize>, closes_at: usize, generation_checks: Arc<AtomicUsize>,
+        assembled: Arc<AtomicUsize> }
+    impl Gated {
+        /// Closed from the `closes_at`-th gate check on.
+        fn closed(&self) -> bool { self.gate.fetch_add(1, Ordering::AcqRel) + 1 >= self.closes_at }
+    }
+    impl BootAttempt for Gated {
+        fn attempt(&mut self) -> AttemptFuture<'_> {
+            Box::pin(async move {
+                let checks = self.generation_checks.clone();
+                let closed = || self.closed();
+                // The updater's generation never appears.
+                wait_for_generation(|| { checks.fetch_add(1, Ordering::AcqRel); false }, &closed,
+                    GENERATION_WAIT.0, Duration::from_millis(20)).await?;
+                before_assemble(&closed)?;
+                self.assembled.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            })
+        }
+        fn assembled(&mut self) {}
+    }
+
+    #[tokio::test]
+    async fn boot_gate_closed_during_the_generation_wait_never_assembles() {
+        let state = Arc::new(BootState::new());
+        let mut boot = Gated { gate: Arc::default(), closes_at: 4, generation_checks: Arc::default(),
+            assembled: Arc::default() };
+        let gate = boot.gate.clone();
+        let started = Instant::now();
+        // The task's own gate (before the first attempt) is still open.
+        assert!(!run(&mut boot, &state, started, FAST, || false).await);
+        assert_eq!(boot.assembled.load(Ordering::Acquire), 0, "never assembled after the gate closed");
+        // Ended promptly: 3 generation checks, not the 50-check bound (1 s here).
+        assert_eq!(boot.generation_checks.load(Ordering::Acquire), 3);
+        assert!(started.elapsed() < Duration::from_millis(500), "{:?}", started.elapsed());
+        assert_eq!(gate.load(Ordering::Acquire), 4);
+        // Nothing published or logged for a shutdown.
+        assert!(state.status().is_none());
+        // The generation appears but the gate closes right before assembly.
+        let assembled = Arc::new(AtomicUsize::new(0));
+        let closed_at_assembly = AtomicUsize::new(0);
+        let closed = || closed_at_assembly.fetch_add(1, Ordering::AcqRel) >= 1;
+        let outcome = async {
+            wait_for_generation(|| true, &closed, GENERATION_WAIT.0, Duration::from_millis(20)).await?;
+            before_assemble(&closed)?;
+            assembled.fetch_add(1, Ordering::AcqRel);
+            Ok::<(), Failure>(())
+        }.await;
+        assert!(outcome.is_err_and(|failure| failure.is_closed()));
+        assert_eq!(assembled.load(Ordering::Acquire), 0);
+        // An open gate and no generation: the bounded wait ends and the attempt continues.
+        assert!(wait_for_generation(|| false, &|| false, 3, Duration::from_millis(1)).await.is_ok());
+        assert_eq!(GENERATION_WAIT, (50, Duration::from_millis(100)));
     }
 
     #[test]

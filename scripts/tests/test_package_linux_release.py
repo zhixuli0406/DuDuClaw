@@ -864,23 +864,56 @@ class LinuxReleaseTests(unittest.TestCase):
             self.package()
         self.assertEqual(before, archive.read_bytes())
 
+    # Features treated as inert, per crate: declared as an empty list and gating
+    # no Rust code (both checked below), kept only so existing `--features`
+    # invocations still resolve.
+    INERT_FEATURES = {
+        "duduclaw-gateway": {"desktop", "isolation-worker-integration"},
+        "duduclaw-cli": {"isolation-worker-integration"},
+    }
+    # Default features intentionally OFF in release builds: {crate: {feature: reason}}.
+    # Empty: every non-inert default feature of a release crate is named by build_command.
+    RELEASE_OFF_DEFAULT_FEATURES = {}
+
     def test_release_build_explicitly_covers_non_inert_default_features(self):
         command = PACKAGE.build_command(TARGET, "cross", True)
         self.assertIn("--no-default-features", command)
         enabled = set(command[command.index("--features") + 1].split(","))
-        inert = {"desktop", "isolation-worker-integration"}
-        for crate in ("duduclaw-gateway", "duduclaw-cli"):
+        manifests = {}
+        for path in sorted((ROOT / "crates").glob("*/Cargo.toml")):
+            package = re.search(r'(?ms)^\[package\][ \t]*\n.*?^name[ \t]*=[ \t]*"([^"]+)"', path.read_text())
+            if package:
+                manifests[package[1]] = path
+        # Every crate whose binaries the packager ships, plus the gateway library.
+        crates = list(dict.fromkeys([*PACKAGE.BIN_PACKAGES.values(), "duduclaw-gateway"]))
+        self.assertTrue({"duduclaw-cli", "duduclaw-gateway", "duduclaw-api-worker"} <= set(crates))
+        self.assertTrue(set(self.INERT_FEATURES) | set(self.RELEASE_OFF_DEFAULT_FEATURES) <= set(crates))
+        for crate in crates:
             with self.subTest(crate=crate):
-                manifest = (ROOT / "crates" / crate / "Cargo.toml").read_text()
+                self.assertIn(crate, manifests, f"{crate}: no manifest under crates/")
+                manifest = manifests[crate].read_text()
                 section = re.search(r"(?ms)^\[features\][ \t]*\n(.*?)(?=^\[|\Z)", manifest)
-                self.assertIsNotNone(section, f"{crate} has no [features] section")
-                defaults = re.search(r"(?m)^default[ \t]*=[ \t]*(\[[^\]]*\])", section[1])
-                self.assertIsNotNone(defaults, f"{crate} must declare a literal default feature list")
-                for feature in ast.literal_eval(defaults[1]):
-                    self.assertTrue(feature in inert or f"{crate}/{feature}" in enabled,
+                features = section[1] if section else ""
+                defaults = re.search(r"(?m)^default[ \t]*=[ \t]*(\[[^\]]*\])", features)
+                if re.search(r"(?m)^default[ \t]*=", features):
+                    self.assertIsNotNone(defaults, f"{crate} must declare a literal default feature list")
+                inert = self.INERT_FEATURES.get(crate, set())
+                off = self.RELEASE_OFF_DEFAULT_FEATURES.get(crate, {})
+                for feature in (ast.literal_eval(defaults[1]) if defaults else []):
+                    self.assertTrue(feature in inert or feature in off or f"{crate}/{feature}" in enabled,
                                     f"{crate}/{feature} is default-only: release builds use "
                                     "--no-default-features; explicitly enable it in build_command "
                                     "or make its code unconditional")
+                for feature in sorted(inert):
+                    self.assertRegex(features, rf"(?m)^{re.escape(feature)}[ \t]*=[ \t]*\[[ \t]*\]",
+                                     f"{crate}/{feature} is treated as inert but is not an empty feature")
+                    gate = re.compile(r'feature\s*=\s*"' + re.escape(feature) + '"')
+                    for directory in ("src", "tests"):
+                        for source in sorted((manifests[crate].parent / directory).rglob("*.rs")):
+                            self.assertIsNone(gate.search(source.read_text()),
+                                              f"{crate}/{feature} is treated as inert but gates code in "
+                                              f"{source.relative_to(ROOT)}: enable it in build_command "
+                                              "or remove the cfg")
 
     def test_explicit_production_build_includes_parser_engine(self):
         command = PACKAGE.build_command(TARGET, "cross", True)

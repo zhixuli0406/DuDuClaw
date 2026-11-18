@@ -50,7 +50,8 @@ pub enum LocalStep {
     /// Protected TEAM: the spawnd backend client is installed (first
     /// successful connection, inline or by the background retry). Outside
     /// protected TEAM no spawnd backend is used and this step is marked as
-    /// not applicable by `isolation_readiness::connect_backend`.
+    /// not applicable by `isolation_readiness::connect_backend`, except on an
+    /// isolated install whose edition no verified licence backs (never marked).
     Backend,
 }
 /// The gateway-local readiness latch. Monotonic: steps are only ever set, and

@@ -63,11 +63,13 @@ impl Readiness {
 
 /// spawnd's one-line evidence diagnosis: `evidence complete`, or
 /// `evidence incomplete: <false checks>` with `resources` (the fixed name of
-/// the first failing resources sub-condition) after `resources_verified`.
+/// the first failing resources sub-condition) after `resources_verified` and
+/// `dns` (the fixed `dns_evidence::Reason` name) after `dns_route_verified`.
 /// Fixed identifiers only.
-pub fn evidence_line(checks: &Readiness, resources: Option<&str>) -> String {
-    let failed: Vec<String> = checks.named_checks().into_iter().filter(|(_, value)| !value).map(|(name, _)| match resources {
-        Some(detail) if name == "resources_verified" => format!("{name}({detail})"),
+pub fn evidence_line(checks: &Readiness, resources: Option<&str>, dns: Option<&str>) -> String {
+    let failed: Vec<String> = checks.named_checks().into_iter().filter(|(_, value)| !value).map(|(name, _)| match (resources, dns) {
+        (Some(detail), _) if name == "resources_verified" => format!("{name}({detail})"),
+        (_, Some(detail)) if name == "dns_route_verified" => format!("{name}({detail})"),
         _ => name.to_string(),
     }).collect();
     if failed.is_empty() { "evidence complete".into() } else { format!("evidence incomplete: {}", failed.join(", ")) }
@@ -141,16 +143,25 @@ mod tests {
         assert_eq!(fields.len(), named.len());
         assert!(named.iter().all(|name| fields.contains(name)), "{named:?}");
         let mut all = Readiness::default();
-        assert_eq!(evidence_line(&all, None), format!("evidence incomplete: {}", named.join(", ")));
+        assert_eq!(evidence_line(&all, None, None), format!("evidence incomplete: {}", named.join(", ")));
         for (name, _) in all.named_checks() {
             let mut value = serde_json::to_value(&all).unwrap(); value[name] = true.into();
             all = serde_json::from_value(value).unwrap();
         }
         assert!(all.check().is_ok());
-        assert_eq!(evidence_line(&all, None), "evidence complete");
+        assert_eq!(evidence_line(&all, None, None), "evidence complete");
+        // A detail for a passing check is never printed.
+        assert_eq!(evidence_line(&all, Some("employees_slice_cgroup"), Some("pending")), "evidence complete");
         all.resources_verified = false; all.dns_route_verified = false;
-        assert_eq!(evidence_line(&all, Some("employees_slice_cgroup")),
+        assert_eq!(evidence_line(&all, Some("employees_slice_cgroup"), None),
             "evidence incomplete: dns_route_verified, resources_verified(employees_slice_cgroup)");
+        // Defect 28: the DNS sub-reason, in the same form.
+        for reason in crate::dns_evidence::Reason::ALL {
+            assert_eq!(evidence_line(&all, Some("employees_slice_cgroup"), Some(reason.name())),
+                format!("evidence incomplete: dns_route_verified({}), resources_verified(employees_slice_cgroup)", reason.name()));
+        }
+        all.resources_verified = true;
+        assert_eq!(evidence_line(&all, None, Some("no_public_answer")), "evidence incomplete: dns_route_verified(no_public_answer)");
     }
     #[test]
     fn helper_readiness_fails_closed_without_open_time_credentials() {

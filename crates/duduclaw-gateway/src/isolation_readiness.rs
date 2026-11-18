@@ -202,10 +202,15 @@ fn start_update_probe() {}
 /// bounded schedule, ends at the first success or at shutdown). The first
 /// success marks the gateway-local readiness step `Backend`
 /// (`update_readback::LocalStep`). Outside protected TEAM no spawnd backend is
-/// used, so that step does not apply and is marked at once.
-pub async fn connect_backend() {
+/// used, so that step does not apply and is marked at once, except (R8j
+/// round 2 B1) on an isolated install whose edition rests on no verified
+/// licence ([`EditionSource::Undetermined`], [`backend_step`]): there the step
+/// stays unset and the update read-back is never ready.
+pub async fn connect_backend(edition: EditionSource) {
     if !REQUIRED.load(Ordering::Acquire) {
-        crate::update_readback::mark_local(crate::update_readback::LocalStep::Backend);
+        if mark_backend_step(false, edition, isolated_install, &crate::update_readback::LOCAL) == BackendStep::Withheld {
+            tracing::error!("此主機已安裝隔離架構，但授權無法讀取或驗證，無法確認版本；閘道的更新回讀維持未就緒，請由管理員檢查授權檔。");
+        }
         return;
     }
     #[cfg(target_os = "linux")]
@@ -217,6 +222,58 @@ pub async fn connect_backend() {
             crate::isolation_mcp::spawn_backend_retry();
         }
     }
+}
+
+/// R8j round 2 B1: what the boot edition rests on. A licence that cannot be
+/// read or verified silently degrades the edition to Personal/OpenSource, so
+/// "not TEAM" alone does not prove that isolation is not needed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EditionSource {
+    /// The edition was resolved TEAM, or a licence was read and verified
+    /// (whatever its tier: a verified Personal licence needs no isolation).
+    Verified,
+    /// No verified licence: none installed, unreadable, or failing
+    /// verification (signature, binding, expiry, grace period).
+    Undetermined,
+}
+impl EditionSource {
+    /// `team`: the resolved boot edition is not Personal. `licence_verified`:
+    /// `LicenseRuntime::licence_verified`.
+    pub fn from_boot(team: bool, licence_verified: bool) -> Self {
+        if team || licence_verified { Self::Verified } else { Self::Undetermined }
+    }
+}
+
+/// The isolated-install fact, from durable root-owned host facts that do not
+/// depend on the licence: the protected-mode marker AND the isolation install
+/// facts (`duduclaw_core::isolation_install`), the same pair [`initialize`]
+/// and [`check_execution`] use. Never true off Linux.
+fn isolated_install() -> bool {
+    cfg!(target_os = "linux") && duduclaw_core::protected_mode::active() && duduclaw_core::isolation_install::installed()
+}
+
+/// What [`connect_backend`] does with the `Backend` step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BackendStep {
+    /// Isolation is required: only a real spawnd backend marks the step.
+    NeedsBackend,
+    /// No spawnd backend is used here: marked at once.
+    NotApplicable,
+    /// Isolated install, edition undetermined: never marked by this decision.
+    Withheld,
+}
+/// `isolated` is consulted only when isolation is not required and the
+/// edition is undetermined.
+fn backend_step(required: bool, edition: EditionSource, isolated: impl FnOnce() -> bool) -> BackendStep {
+    if required { return BackendStep::NeedsBackend; }
+    if edition == EditionSource::Verified || !isolated() { BackendStep::NotApplicable } else { BackendStep::Withheld }
+}
+/// [`backend_step`], marking `latch` when the step does not apply.
+fn mark_backend_step(required: bool, edition: EditionSource, isolated: impl FnOnce() -> bool,
+    latch: &crate::update_readback::LocalReadiness) -> BackendStep {
+    let step = backend_step(required, edition, isolated);
+    if step == BackendStep::NotApplicable { latch.mark(crate::update_readback::LocalStep::Backend); }
+    step
 }
 
 /// One connection attempt to spawnd's control socket. Needs only that socket
@@ -374,6 +431,57 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// R8j round 2 B1: the update read-back's `Backend` step on each host kind.
+    fn latch_with_other_steps() -> crate::update_readback::LocalReadiness {
+        let latch = crate::update_readback::LocalReadiness::new();
+        latch.mark(crate::update_readback::LocalStep::Stores);
+        latch.mark(crate::update_readback::LocalStep::Service);
+        latch
+    }
+
+    #[test]
+    fn backend_step_isolated_install_with_verified_team_needs_the_real_backend() {
+        // Verified TEAM on an isolated install: `initialize(true)` set REQUIRED.
+        let edition = EditionSource::from_boot(true, true);
+        assert_eq!(edition, EditionSource::Verified);
+        let latch = latch_with_other_steps();
+        assert_eq!(mark_backend_step(true, edition, || panic!("not consulted"), &latch), BackendStep::NeedsBackend);
+        assert!(!latch.ready(), "only a connected spawnd backend marks the step");
+        // TEAM resolved without a verified licence (environment / override) is
+        // still TEAM: required, same path.
+        assert_eq!(EditionSource::from_boot(true, false), EditionSource::Verified);
+        assert_eq!(backend_step(true, EditionSource::Undetermined, || true), BackendStep::NeedsBackend);
+    }
+
+    #[test]
+    fn backend_step_isolated_install_with_unverifiable_licence_is_never_marked() {
+        // Licence missing, unreadable or failing verification: the edition
+        // degraded to Personal/OpenSource, so isolation is not "required".
+        let edition = EditionSource::from_boot(false, false);
+        assert_eq!(edition, EditionSource::Undetermined);
+        let latch = latch_with_other_steps();
+        assert_eq!(mark_backend_step(false, edition, || true, &latch), BackendStep::Withheld);
+        assert!(!latch.ready(), "read-back must not answer ready");
+        // Repeated decisions never mark it either.
+        assert_eq!(mark_backend_step(false, edition, || true, &latch), BackendStep::Withheld);
+        assert!(!latch.ready());
+    }
+
+    #[test]
+    fn backend_step_non_isolated_host_is_marked_at_once() {
+        // Personal (verified or not) on a host without the isolated install: unchanged.
+        for edition in [EditionSource::from_boot(false, true), EditionSource::from_boot(false, false)] {
+            let latch = latch_with_other_steps();
+            assert_eq!(mark_backend_step(false, edition, || false, &latch), BackendStep::NotApplicable);
+            assert!(latch.ready());
+        }
+        // A verified Personal licence on an isolated install needs no isolation.
+        let latch = latch_with_other_steps();
+        assert_eq!(mark_backend_step(false, EditionSource::Verified, || panic!("not consulted"), &latch),
+            BackendStep::NotApplicable);
+        assert!(latch.ready());
     }
 
     #[test]

@@ -583,6 +583,15 @@ impl LicenseRuntime {
         snapshot
     }
 
+    /// R8j round 2 B1: a licence was read AND verified (any tier). False when
+    /// none is installed, it could not be read, or it fails verification
+    /// (including expiry / grace period): the edition then silently degraded
+    /// to OpenSource/Personal and says nothing about the host.
+    pub async fn licence_verified(&self) -> bool {
+        let snapshot = self.snapshot().await;
+        snapshot.installed && snapshot.validation_warning.is_none()
+    }
+
     /// Verify a candidate license against this runtime's issuer registry +
     /// machine fingerprint + expiry, persist it as `license.json`, and
     /// hot-swap the in-memory license — the dashboard activation flow unlocks

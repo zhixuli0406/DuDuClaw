@@ -218,7 +218,11 @@ fields refused, 5 s timeouts. Every refusal is the single `Refused` outcome.
   Evidence: whenever the set of false checks changes, spawnd prints one stderr
   line, `evidence incomplete: <readiness.json names>` with the first failing
   resources sub-condition as `resources_verified(<name>)` (`ResourceCheck`,
-  e.g. `employees_slice_cgroup`), or `evidence complete`.
+  e.g. `employees_slice_cgroup`) and the DNS probe's reason as
+  `dns_route_verified(<reason>)` (`dns_evidence::Reason`: `pending`, `stale`,
+  `no_probe_name`, `policy_unreadable`, `egress_config_unreadable`,
+  `no_control_connection`, `exchange_failed`, `refused`, `route_mismatch`,
+  `unresolved`, `no_public_answer`), or `evidence complete`.
 - `Resume{g}` requires that no journal exists or that it says `published` for
   `g`; it removes the journal, then the record, durably, then reopens admission.
   It is the only way to lift the barrier. At start the record is read strictly
