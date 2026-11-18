@@ -123,6 +123,17 @@ const MSG_MIGRATION_LEGACY: &str = "資料遷移紀錄為舊版格式；請繼�
 const MSG_EDITION: &str = "此版本不支援員工隔離。";
 const MSG_EDITION_UNVERIFIED: &str = "無法確認團隊版授權；員工隔離維持停用。";
 const MSG_READY: &str = "所有就緒檢查均已通過，可以執行員工工作。";
+/// R8m 30b: the platform-only result (`check_platform_all`, `--platform-only`,
+/// the installer's S8/S9): it never claims that employees can run.
+const MSG_PLATFORM_READY: &str = "平台檢查均已通過。";
+const MSG_GATEWAY_NOT_READY: &str = "平台檢查均已通過，但 Gateway 尚未就緒，員工工作仍暫停。";
+const MSG_GATEWAY_UNAVAILABLE_INFO: &str = "[資訊] 無法取得 Gateway 的就緒狀態（Gateway 未執行、剛啟動，或狀態檔無效）。";
+const MSG_GATEWAY_UNCONFIRMED: &str = "平台檢查均已通過，但無法確認 Gateway 已就緒，尚未確認可以執行員工工作。";
+
+/// R8m 30b: the gateway's own readiness view (`/run/duduclaw-gateway-update`).
+#[path = "protected_linux_gateway_view.rs"]
+mod gateway_view;
+use gateway_view::GatewayView;
 
 /// The updater's committed state, reduced to what readiness compares.
 #[derive(Clone, Copy, Debug)]
@@ -1077,7 +1088,9 @@ fn render(findings: &[Finding]) -> (Vec<String>, usize, bool) {
 
 // Check every group even if one fails, so the administrator sees a useful
 // summary. Never echo subprocess output (getent shadow includes credentials).
-pub(super) fn check(composite: &mut impl CompositeReadiness) -> Result<()> {
+/// The 4 groups and 9 composite items. `Ok(pending)` when every one passed
+/// (`pending`: a migration waits for confirmation).
+fn report_platform(composite: &mut impl CompositeReadiness) -> Result<bool> {
     let results = [("執行檔", binaries()), ("服務帳號", accounts()),
         ("目錄權限", directories()), ("服務單元", units())];
     let mut failed = 0;
@@ -1090,8 +1103,41 @@ pub(super) fn check(composite: &mut impl CompositeReadiness) -> Result<()> {
     for line in lines { println!("{line}"); }
     failed += composite_failed;
     if failed != 0 { return Err(refused(format!("{failed} 項就緒檢查未通過；尚未確認可安全執行員工工作。"))); }
-    println!("{}", if pending { Reason::MIGRATION_PENDING_MESSAGE } else { MSG_READY });
+    Ok(pending)
+}
+
+/// R8m 30b: the platform result only (the former `check`, same groups and
+/// items, same failure): the installer's S8/S9 and its other readiness
+/// returns, and `service readiness --protected-linux --platform-only`. The
+/// gateway cannot be fully ready during an install (its isolation tool
+/// service assembles in the background), so this never consults it and
+/// never claims that employees can run.
+pub(super) fn check_platform_all(composite: &mut impl CompositeReadiness) -> Result<()> {
+    let pending = report_platform(composite)?;
+    println!("{}", if pending { Reason::MIGRATION_PENDING_MESSAGE } else { MSG_PLATFORM_READY });
     Ok(())
+}
+
+/// `service readiness --protected-linux`: "can employee work run?" The
+/// platform result (unchanged meaning) and then the gateway's own published
+/// view, which only decides the final sentence and the result.
+pub(super) fn check(composite: &mut impl CompositeReadiness) -> Result<()> {
+    let pending = report_platform(composite)?;
+    let (lines, result) = gateway_verdict(pending, gateway_view::read_installed());
+    for line in lines { println!("{line}"); }
+    result
+}
+
+/// R8m 30b: the final lines and result after every platform check passed.
+/// Only a fresh gateway view that says ready keeps the "employees can run"
+/// sentence (or the migration-pending one); a not-ready or unavailable view
+/// is the same non-zero refusal as a failed check, with its own message.
+fn gateway_verdict(pending: bool, view: GatewayView) -> (Vec<String>, Result<()>) {
+    match view {
+        GatewayView::Ready => (vec![(if pending { Reason::MIGRATION_PENDING_MESSAGE } else { MSG_READY }).to_owned()], Ok(())),
+        GatewayView::NotReady(view) => (vec![gateway_view::not_ready_line(&view)], Err(refused(MSG_GATEWAY_NOT_READY))),
+        GatewayView::Unavailable => (vec![MSG_GATEWAY_UNAVAILABLE_INFO.to_owned()], Err(refused(MSG_GATEWAY_UNCONFIRMED))),
+    }
 }
 
 #[cfg(test)]

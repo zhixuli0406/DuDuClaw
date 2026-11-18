@@ -122,6 +122,16 @@ The installer validates the complete fixed-path component set before preparing a
 
 Run `sudo duduclaw service readiness --protected-linux` (the `ops` alias is equivalent) to inspect binaries, system accounts, directory permissions, unit contents and actual systemd properties. The report separates these checks from composite isolation verification. Every failed group lists its reason on a detail line. Until I1 supplies that adapter, `MissingComposite` always refuses readiness; the command cannot certify employee execution. Custom DNS drop-ins are not integrated and currently refuse the unit check. Reinstalling an already managed generation performs these read-only checks instead of rewriting its programs or units.
 
+The command reports two separate results. **Platform readiness** (the four installer groups and the nine host items) is all that `sudo duduclaw service readiness --protected-linux --platform-only` checks; when every item passes it ends with "平台檢查均已通過。" (platform checks passed) and never claims that employees can run. Without `--platform-only`, the command also reads the gateway's own readiness view, which the running gateway rewrites at least every 30 seconds (and on every change) in `/run/duduclaw-gateway-update/isolation-readiness.json` (fixed component, reason and producer names only). The gateway view never changes a platform result. There are three outcomes once every platform item passes:
+
+| Gateway view | Last line | Exit |
+|---|---|---|
+| From this boot, at most 90 s old, ready | "所有就緒檢查均已通過，可以執行員工工作。" (or the migration-pending sentence) | 0 |
+| Fresh, not ready | `[資訊]` line listing each not-ready component as `name(reason)` and the boot assembly's missing producers, then "平台檢查均已通過，但 Gateway 尚未就緒，員工工作仍暫停。" | non-zero |
+| Missing, stale, from another boot or invalid (gateway stopped or just started) | "[資訊] 無法取得 Gateway 的就緒狀態（Gateway 未執行、剛啟動，或狀態檔無效）。", then a refusal that employees cannot be confirmed to run | non-zero |
+
+The installer's own readiness steps use the platform result only, because right after installation the gateway's isolation tool service may still be assembling in the background. The gateway journal names the same missing producers, with a fixed reason where one is known, for example `ConnectorProviders(catalog_file_unsafe)` (the connector catalog `isolation-connectors.db` or one of its SQLite sidecars is not a private, single-link file owned by the gateway account) or `ExecutionPlans(no_helper_runtime_in_policy)`. The gateway retries the assembly in the background, so after the cause has been fixed no restart is needed.
+
 ## Migrate from v1.79.3
 
 Do not replace the old binary in place or copy its databases into the new home. The old environment shares a UID with employees, so its authority data must be treated as untrusted. The installer now routes the v1.79.3-to-v1.80 boundary, including an unknown installed floor on a host that is not provably new (see the single-binary section above), into G's migration flow using the fixed root-owned plan `/var/lib/duduclaw-migrate/plan.json`. Missing or invalid plans refuse before stopping the old service; there is no legacy in-place fallback.

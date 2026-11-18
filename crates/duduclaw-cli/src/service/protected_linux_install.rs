@@ -842,7 +842,7 @@ pub(super) fn install(options: InstallOptions) -> Result<()> {
         // The invoking CLI's templates may be older than F's committed
         // generation. A reinstall cannot replace signed service policy.
         parse_runtime_tree(true)?;
-        return readiness::check(&mut readiness::InstalledComposite);
+        return readiness::check_platform_all(&mut readiness::InstalledComposite);
     }
     // The single authoritative probe, under the lock so no concurrent install,
     // upgrade or uninstall can change the answer. The lock file and the mode
@@ -855,7 +855,7 @@ pub(super) fn install(options: InstallOptions) -> Result<()> {
     // A fresh host has no earlier data, so there is nothing for G to migrate:
     // continue with the v1.80 gateway-only protected install.
     if !fresh_host && native_migration::run_if_required(floor.as_deref(), version)? {
-        return readiness::check(&mut readiness::InstalledComposite);
+        return readiness::check_platform_all(&mut readiness::InstalledComposite);
     }
     check_floor(version, false, fresh_host)?;
     let executable = fs::canonicalize("/proc/self/exe")?;
@@ -948,8 +948,11 @@ pub(super) fn uninstall() -> Result<()> {
     Ok(())
 }
 
-pub(super) fn readiness() -> Result<()> {
+/// R8m 30b: `--platform-only` reports the platform result alone; without it
+/// the command also requires the gateway's own fresh "ready" view.
+pub(super) fn readiness(platform_only: bool) -> Result<()> {
     gate()?;
+    if platform_only { return readiness::check_platform_all(&mut readiness::InstalledComposite); }
     readiness::check(&mut readiness::InstalledComposite)
 }
 
@@ -1024,7 +1027,7 @@ pub(super) async fn upgrade(version: Option<&str>, allow_missing_runtime: bool) 
     if route == in_place::Route::Migration {
         if let Some(requested) = version {
             if native_migration::run_if_required(floor.as_deref(), requested)? {
-                return readiness::check(&mut readiness::InstalledComposite);
+                return readiness::check_platform_all(&mut readiness::InstalledComposite);
             }
         }
         return Err(refused("無法確認這個安裝的版本下限，未執行升級。"));

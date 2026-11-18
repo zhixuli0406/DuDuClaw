@@ -95,6 +95,29 @@ pub enum MissingProducer {
     Backend, LiveAuthority, DurableBindings, RuntimePublication, ExecutionPlans,
     WorkerRetirement, WorkerPlans, TurnAuthority, Dispatcher, WorkerIntegration, MainPlans, ConnectorProviders, Initialization,
 }
+impl MissingProducer {
+    pub const ALL: [Self; 13] = [Self::Backend, Self::LiveAuthority, Self::DurableBindings, Self::RuntimePublication,
+        Self::ExecutionPlans, Self::WorkerRetirement, Self::WorkerPlans, Self::TurnAuthority, Self::Dispatcher,
+        Self::WorkerIntegration, Self::MainPlans, Self::ConnectorProviders, Self::Initialization];
+    /// R8m 30b: the fixed name (the serde name) published to the root CLI.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Backend => "backend",
+            Self::LiveAuthority => "live_authority",
+            Self::DurableBindings => "durable_bindings",
+            Self::RuntimePublication => "runtime_publication",
+            Self::ExecutionPlans => "execution_plans",
+            Self::WorkerRetirement => "worker_retirement",
+            Self::WorkerPlans => "worker_plans",
+            Self::TurnAuthority => "turn_authority",
+            Self::Dispatcher => "dispatcher",
+            Self::WorkerIntegration => "worker_integration",
+            Self::MainPlans => "main_plans",
+            Self::ConnectorProviders => "connector_providers",
+            Self::Initialization => "initialization",
+        }
+    }
+}
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct BootStatus {
     /// Constructed services are not root/runtime acceptance evidence.
@@ -146,7 +169,9 @@ impl Derived {
     }
 }
 
-fn fill_installed_sources(sources: &mut BootSources, home: &Path) -> Derived {
+/// R8m 30a: re-run by every attempt (nothing here is latched); an
+/// `ExecutionPlans` refusal adds its fixed reason to `reasons`.
+fn fill_installed_sources(sources: &mut BootSources, home: &Path, reasons: &mut Vec<retry::Detail>) -> Derived {
     let mut derived = Derived::default();
     let generation = crate::isolation_readiness::verified_generation();
     sources.installed_generation = generation;
@@ -158,10 +183,13 @@ fn fill_installed_sources(sources: &mut BootSources, home: &Path) -> Derived {
     }
     if sources.execution_plans.is_none() {
         if let Some(generation) = generation {
-            if let Ok(factory) = crate::isolation_execution::InstalledProgramPlans::new(
+            match crate::isolation_execution::InstalledProgramPlans::new_checked(
                 generation, nix::unistd::getegid().as_raw()) {
-                sources.execution_plans = Some(factory);
-                derived.execution_plans = true;
+                Ok(factory) => {
+                    sources.execution_plans = Some(factory);
+                    derived.execution_plans = true;
+                }
+                Err(failure) => reasons.push((MissingProducer::ExecutionPlans, failure.reason())),
             }
         }
     }
@@ -299,26 +327,30 @@ async fn attempt_installed(boot: &mut InstalledBoot) -> Result<(), retry::Failur
     let (tries, interval) = retry::GENERATION_WAIT;
     retry::wait_for_generation(|| crate::isolation_readiness::verified_generation().is_some(),
         &shutdown_begun, tries, interval).await?;
-    let derived = fill_installed_sources(sources, home);
+    let mut reasons = Vec::new();
+    let derived = fill_installed_sources(sources, home, &mut reasons);
     let backend = duduclaw_execution::selection::protected_backend_for_boot();
     // Reuse the gateway's initialized users.db and confirmed employee registry.
     // No parallel principal/binding database is created for the boundary.
     if sources.authority.is_none() && sources.bindings.is_none() {
-        if let Ok(backend) = &backend {
-            // C2: the authority checks connector uses against the production
-            // catalog, and must read the very instance selection pins against.
-            // Without one, every connector use is Unavailable.
-            if sources.connector_catalog.is_none() {
-                sources.connector_catalog = ConnectorCatalog::open(home).ok().map(Arc::new);
-            }
-            if let Ok(authority) = super::authority::GatewayAuthority::new(home.to_owned(), users.clone(), backend.clone(), agents.clone(),
-                sources.connector_catalog.clone()) {
-                let authority = Arc::new(authority);
-                sources.authority = Some(authority.clone());
-                sources.bindings = Some(authority.clone());
-                if sources.turns.is_none() { sources.turns = Some(authority.clone()); }
-                sources.product_authority = Some(authority);
-            }
+        // C2: the authority checks connector uses against the production
+        // catalog, and must read the very instance selection pins against.
+        // R8m 30a: opened BEFORE the authority, on every attempt while it is
+        // absent; the authority is never built without it (it was built once
+        // with `None` and kept, so one failed open latched
+        // `ConnectorProviders` missing for the life of the process).
+        match catalog_for_authority(&mut sources.connector_catalog, || ConnectorCatalog::open_checked(home)) {
+            Err(failure) => reasons.push((MissingProducer::ConnectorProviders, failure.reason())),
+            Ok(catalog) => if let Ok(backend) = &backend {
+                if let Ok(authority) = super::authority::GatewayAuthority::new(home.to_owned(), users.clone(), backend.clone(),
+                    agents.clone(), Some(catalog)) {
+                    let authority = Arc::new(authority);
+                    sources.authority = Some(authority.clone());
+                    sources.bindings = Some(authority.clone());
+                    if sources.turns.is_none() { sources.turns = Some(authority.clone()); }
+                    sources.product_authority = Some(authority);
+                }
+            },
         }
     }
     // R8j round 3 F3: the bounded hardware probe (≤ 2 × (5 s + 1 s)) has no
@@ -334,7 +366,21 @@ async fn attempt_installed(boot: &mut InstalledBoot) -> Result<(), retry::Failur
     // `install_connector_stack`) until the publication is complete.
     let users = users.clone();
     retry::under_permit(crate::handlers::migration_shutdown_gate(),
-        || install_and_publish(home, users, sources, derived, backend.ok()))
+        || install_and_publish(home, users, sources, derived, backend.ok(), reasons))
+}
+
+/// R8m 30a: the catalog the product authority is built over. Opened (or
+/// created) by `open` on every call while `slot` is empty and kept once
+/// opened; a failure leaves `slot` empty (the caller reports
+/// `ConnectorProviders(<reason>)` and builds no authority) so the next
+/// attempt opens again.
+fn catalog_for_authority(slot: &mut Option<Arc<ConnectorCatalog>>,
+    open: impl FnOnce() -> Result<ConnectorCatalog, crate::isolation_connectors::CatalogOpenFailure>)
+    -> Result<Arc<ConnectorCatalog>, crate::isolation_connectors::CatalogOpenFailure> {
+    if let Some(catalog) = slot { return Ok(catalog.clone()); }
+    let catalog = Arc::new(open()?);
+    *slot = Some(catalog.clone());
+    Ok(catalog)
 }
 
 /// R8j round 3 F3: every process-wide side effect of one attempt and its
@@ -342,28 +388,32 @@ async fn attempt_installed(boot: &mut InstalledBoot) -> Result<(), retry::Failur
 /// the attempt's shutdown-gate permit (`retry::under_permit`). Synchronous
 /// local construction only: no network or child-process wait.
 fn install_and_publish(home: &Path, users: Arc<duduclaw_auth::UserDb>, sources: &mut BootSources, derived: Derived,
-    backend: Option<Arc<duduclaw_execution::SpawndBackend>>) -> Result<(), retry::Failure> {
+    backend: Option<Arc<duduclaw_execution::SpawndBackend>>, mut reasons: Vec<retry::Detail>) -> Result<(), retry::Failure> {
     // F1: the per-employee connector stack, over the very catalog handle the
     // authority above checks connector uses against. Only when the host did
     // not supply its own singletons; a missing catalog leaves the producer
     // missing (boot stays paused, every connector use Unavailable). Built at
     // most once: a later attempt finds it in `sources`.
     if sources.connectors.is_none() && sources.connector_selection.is_none() {
-        install_connector_stack(sources, home, users);
+        if let Some(reason) = install_connector_stack(sources, home, users) {
+            reasons.push((MissingProducer::ConnectorProviders, reason));
+        }
     }
     let absent = missing(sources, DISPATCHER.get().is_some(), backend.is_some());
     if !absent.is_empty() {
         derived.forget(sources);
-        return Err(retry::Failure { retry: !structural(&absent), missing: absent });
+        // Only reasons of producers that are actually missing are reported.
+        reasons.retain(|(producer, _)| absent.contains(producer));
+        return Err(retry::Failure { retry: !structural(&absent), missing: absent, reasons });
     }
     // Side-effect-free checks of `assemble` first: a failure here is
     // retried. `assemble` itself installs process-wide producers, so a
     // failure there stays final (as before).
     if precheck(home, sources).is_err() {
         derived.forget(sources);
-        return Err(retry::Failure { missing: vec![MissingProducer::Initialization], retry: true });
+        return Err(retry::Failure { missing: vec![MissingProducer::Initialization], retry: true, reasons: Vec::new() });
     }
-    let final_failure = || retry::Failure { missing: vec![MissingProducer::Initialization], retry: false };
+    let final_failure = || retry::Failure { missing: vec![MissingProducer::Initialization], retry: false, reasons: Vec::new() };
     let owner = assemble(home, backend.ok_or_else(final_failure)?, std::mem::take(sources))
         .map_err(|_| final_failure())?;
     OWNER.set(Arc::new(owner)).map_err(|_| final_failure())?;
@@ -400,34 +450,52 @@ fn precheck(home: &Path, sources: &BootSources) -> Result<(), VerificationError>
 /// R8j round 3 F3: runs inside the attempt's shutdown-gate permit; the
 /// hardware detection it needs ran before the permit (`sources.hardware`,
 /// none ⇒ nothing is built).
-fn install_connector_stack(sources: &mut BootSources, home: &Path, users: Arc<duduclaw_auth::UserDb>) {
+/// R8m 30a: answers the fixed reason when it could have built the stack but
+/// a step refused (nothing is kept; the next attempt builds again), `None`
+/// when it built the stack or an input belonging to another producer is absent.
+fn install_connector_stack(sources: &mut BootSources, home: &Path, users: Arc<duduclaw_auth::UserDb>)
+    -> Option<&'static str> {
     use crate::isolation_connector_stack::{LifecycleBindings, installed_home_binding, readiness_report};
     let (Some(catalog), Some(bindings), Some(turns)) =
-        (sources.connector_catalog.clone(), sources.bindings.clone(), sources.turns.clone()) else { return };
-    if sources.product_authority.is_none() || sources.hardware.is_none() { return; }
-    // Unreadable users.db: no home routes are listed (narrower, never wider);
-    // every lifecycle read refuses as well.
-    let home_binding = installed_home_binding(home).ok();
-    let Ok(lifecycle) = LifecycleBindings::new(home.to_owned()) else { return };
+        (sources.connector_catalog.clone(), sources.bindings.clone(), sources.turns.clone()) else { return None };
+    if sources.product_authority.is_none() || sources.hardware.is_none() { return None; }
+    // R8m 30a: an unreadable users.db (or no installation tenant yet) was
+    // kept as "no home binding" for the life of the process (the stack is
+    // built once). Now the stack waits for the next attempt instead.
+    let Ok(home_binding) = installed_home_binding(home).map(Some) else { return Some("home_binding_unavailable") };
+    let Ok(lifecycle) = LifecycleBindings::new(home.to_owned()) else { return Some("lifecycle_unavailable") };
     let Ok(stack) = EmployeeConnectorProviders::new(home.to_owned(), catalog, bindings, home_binding.clone(),
-        Arc::new(lifecycle), readiness_report()) else { return };
+        Arc::new(lifecycle), readiness_report()) else { return Some("connector_stack_unavailable") };
     let stack = Arc::new(stack);
     let vault = Arc::new(crate::isolation_connector_clients::AccountCredentialVault::default());
     // The vault the executors use must be the one revoke drops from.
     if crate::isolation_connector_lifecycle::install_credential_material(vault.clone()).is_err() {
         tracing::error!("隔離連接器的憑證保管區已被其他元件註冊，連接器維持停用。");
-        return;
+        return Some("credential_vault_unavailable");
     }
     let weak = Arc::downgrade(&stack);
     if crate::isolation_connector_lifecycle::install_route_change_hook(Arc::new(move ||
         if let Some(stack) = weak.upgrade() { stack.schedule_refresh(); })).is_err() {
         tracing::warn!("隔離連接器的路由變更通知無法註冊；連接器仍會在每次使用時重新檢查。");
     }
-    let Some(hardware) = sources.hardware.take() else { return };
+    let hardware = sources.hardware.take()?;
     sources.connectors = Some(stack.clone());
     sources.connector_selection = Some(stack.clone());
     sources.connector_stack = Some(stack);
     sources.connector_inputs = Some(ConnectorBootInputs { users, turns, home_binding, hardware, vault });
+    None
+}
+
+/// R8m 30a: every fixed reason the boot assembly can attach to a missing
+/// producer (the log line's `Producer(<reason>)`).
+#[cfg(test)]
+fn fixed_reasons() -> Vec<&'static str> {
+    let mut all: Vec<&'static str> = crate::isolation_connectors::CatalogOpenFailure::ALL.iter()
+        .map(|failure| failure.reason()).collect();
+    all.extend(crate::isolation_execution::PlansFailure::ALL.iter().map(|failure| failure.reason()));
+    all.extend(["home_binding_unavailable", "lifecycle_unavailable", "connector_stack_unavailable",
+        "credential_vault_unavailable"]);
+    all
 }
 
 /// F1 step 2 (in `assemble`, after the worker exists): install the factory —
@@ -990,6 +1058,87 @@ mod tests {
             MissingProducer::ExecutionPlans, MissingProducer::ConnectorProviders]));
         assert!(!structural(&[MissingProducer::Initialization]));
     }
+    /// R8m 30a: mirrors `attempt_installed`'s catalog/authority step over the
+    /// real `catalog_for_authority`, driven by the real retry loop.
+    struct CatalogBoot {
+        catalog: Option<Arc<ConnectorCatalog>>,
+        /// The catalog the (fake) authority was built over.
+        authority: Option<Arc<ConnectorCatalog>>,
+        opens: usize,
+        failing_opens: usize,
+        authorities_built: usize,
+        state: Arc<retry::BootState>,
+    }
+    impl retry::BootAttempt for CatalogBoot {
+        fn attempt(&mut self) -> retry::AttemptFuture<'_> {
+            Box::pin(async move {
+                let mut reasons = Vec::new();
+                if self.authority.is_none() {
+                    let (opens, failing) = (&mut self.opens, self.failing_opens);
+                    let open = || {
+                        *opens += 1;
+                        if *opens <= failing { return Err(crate::isolation_connectors::CatalogOpenFailure::FileUnsafe); }
+                        ConnectorCatalog::new(rusqlite::Connection::open_in_memory().unwrap())
+                            .map_err(|_| crate::isolation_connectors::CatalogOpenFailure::Schema)
+                    };
+                    match catalog_for_authority(&mut self.catalog, open) {
+                        Err(failure) => reasons.push((MissingProducer::ConnectorProviders, failure.reason())),
+                        Ok(catalog) => { self.authorities_built += 1; self.authority = Some(catalog); }
+                    }
+                }
+                if self.authority.is_none() {
+                    return Err(retry::Failure { missing: vec![MissingProducer::ConnectorProviders], retry: true, reasons });
+                }
+                self.state.constructed();
+                Ok(())
+            })
+        }
+        fn assembled(&mut self) {}
+    }
+
+    /// R8m 30a: the catalog's first two opens fail, the third succeeds. A
+    /// failed attempt builds no authority and keeps nothing (the next attempt
+    /// opens again); the later attempt assembles without a restart, with the
+    /// authority over the very catalog that is kept.
+    #[tokio::test]
+    async fn boot_catalog_open_failure_is_retried_and_never_latched() {
+        const FAST: retry::Schedule = retry::Schedule { early: std::time::Duration::from_millis(2),
+            early_for: std::time::Duration::from_secs(60), late: std::time::Duration::from_millis(5),
+            poll: std::time::Duration::from_millis(1) };
+        let state = Arc::new(retry::BootState::new());
+        let mut boot = CatalogBoot { catalog: None, authority: None, opens: 0, failing_opens: 2,
+            authorities_built: 0, state: state.clone() };
+        let started = std::time::Instant::now();
+        assert!(matches!(retry::step(&mut boot, &state, started).await, retry::Step::Retry));
+        assert!(boot.catalog.is_none() && boot.authority.is_none(), "no authority without a catalog");
+        assert!(state.status().is_some_and(|status| !status.constructed
+            && status.missing == vec![MissingProducer::ConnectorProviders]));
+        assert!(retry::retry_until_assembled(&mut boot, &state, started, FAST, || false).await);
+        assert_eq!((boot.opens, boot.authorities_built), (3, 1), "opened on every attempt until it succeeded");
+        assert!(Arc::ptr_eq(boot.authority.as_ref().unwrap(), boot.catalog.as_ref().unwrap()));
+        assert!(state.status().is_some_and(|status| status.constructed));
+        // Once opened it is kept: no second open.
+        let kept = catalog_for_authority(&mut boot.catalog, || panic!("never reopened")).unwrap();
+        assert!(Arc::ptr_eq(&kept, boot.authority.as_ref().unwrap()));
+    }
+
+    /// R8m 30a: every reason the assembly can log is a fixed, distinct
+    /// snake_case identifier.
+    #[test]
+    fn boot_fixed_reasons_are_distinct_identifiers() {
+        let reasons = fixed_reasons();
+        let mut unique = reasons.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), reasons.len());
+        for reason in reasons {
+            assert!(!reason.is_empty() && reason.len() <= 64
+                && reason.bytes().all(|byte| byte.is_ascii_lowercase() || byte == b'_'), "{reason}");
+        }
+        assert!(fixed_reasons().contains(&"catalog_home_unsafe"));
+        assert!(fixed_reasons().contains(&"no_helper_runtime_in_policy"));
+    }
+
     /// The readiness reads `boot_status`: not constructed (closed reasons)
     /// until an attempt succeeded, then constructed while the owner is healthy.
     #[test]

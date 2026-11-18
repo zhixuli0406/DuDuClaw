@@ -3760,8 +3760,10 @@ fn start_gateway(context: &mut Context) -> Result<()> {
     let output = command("systemctl", &["enable", UNIT])?;
     if !output.status.success() { return Err(refused(format!("無法啟用 {UNIT}。"))); }
     readiness::unit_loaded_active(UNIT).map_err(|_| refused("Gateway 沒有在執行。"))?;
-    // The install reports success only when the full check passes.
-    readiness::check(&mut readiness::InstalledComposite)
+    // The install reports success only when the full platform check passes.
+    // R8m 30b: the platform result only — the gateway's isolation tool
+    // service may still be assembling in the background.
+    readiness::check_platform_all(&mut readiness::InstalledComposite)
 }
 
 /// Plan S9. Review F1: never on the journal's word — S8's invariants, the
@@ -3770,7 +3772,7 @@ fn start_gateway(context: &mut Context) -> Result<()> {
 fn commit(context: &mut Context) -> Result<()> {
     gateway_published(context)?;
     verify_identities(&service_names())?;
-    readiness::check(&mut readiness::InstalledComposite)?;
+    readiness::check_platform_all(&mut readiness::InstalledComposite)?;
     let manifest = readiness::authenticated_manifest(context.generation)?;
     let version = duduclaw_updated::version_text(manifest.version);
     context.recorder.record(&[(VERSION_FLOOR, Kind::File)], || record_floor(&version))
@@ -5827,7 +5829,7 @@ duduclaw-dl:x:987:\nduduclaw-dns:x:986:\nduduclaw-selftest:x:985:\nsudo:x:27:ali
         // The creation ledger ends with the commit.
         assert!(ledger::read(&Store::open().unwrap()).unwrap().is_none());
         assert!(duduclaw_core::isolation_install::installed_under(Path::new("/")));
-        readiness::check(&mut readiness::InstalledComposite).unwrap();
+        readiness::check_platform_all(&mut readiness::InstalledComposite).unwrap();
         assert!(readiness::read_launcher_receipt().unwrap().is_some());
         assert_eq!(fs::read_to_string(UNIT_PATH).unwrap(), duduclaw_core::root_key::recovery::isolated_unit_text());
         readiness::unit_loaded_active(NIGHTLY_TIMER).unwrap();
@@ -5853,7 +5855,7 @@ duduclaw-dl:x:987:\nduduclaw-dns:x:986:\nduduclaw-selftest:x:985:\nsudo:x:27:ali
         }
         continue_with(options("install", &generation), false).unwrap();
         assert!(journal_now().unwrap().committed);
-        readiness::check(&mut readiness::InstalledComposite).unwrap();
+        readiness::check_platform_all(&mut readiness::InstalledComposite).unwrap();
     }
 
     #[test]
@@ -5939,7 +5941,7 @@ duduclaw-dl:x:987:\nduduclaw-dns:x:986:\nduduclaw-selftest:x:985:\nsudo:x:27:ali
             // Re-established from S4 on and committed only after readiness passed in this run.
             Ok(()) => {
                 assert!(after.committed);
-                readiness::check(&mut readiness::InstalledComposite).unwrap();
+                readiness::check_platform_all(&mut readiness::InstalledComposite).unwrap();
             }
             // A re-run step refused (e.g. S6's evidence wait timed out): never committed.
             Err(_) => assert!(!after.committed),

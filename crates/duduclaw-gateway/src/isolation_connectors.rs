@@ -40,6 +40,35 @@ pub enum CatalogError {
     /// The route has been revoked; revocation is final.
     #[error("connector account revoked")] Revoked,
 }
+/// R8m 30a: why [`ConnectorCatalog::open_checked`] refused. Each variant maps
+/// to one fixed reason string ([`CatalogOpenFailure::reason`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogOpenFailure {
+    /// The home is not a real directory owned by the effective uid, or it is
+    /// group/other-writable.
+    HomeUnsafe,
+    /// The database or a SQLite sidecar is not a regular, single-link file
+    /// owned by the effective uid with no group/other bits.
+    FileUnsafe,
+    /// The private-database opener (ancestor walk, identity race) or SQLite
+    /// refused to open the file.
+    OpenFailed,
+    /// SQLite opened it, but the schema could not be created or does not
+    /// match exactly.
+    Schema,
+}
+impl CatalogOpenFailure {
+    pub const ALL: [Self; 4] = [Self::HomeUnsafe, Self::FileUnsafe, Self::OpenFailed, Self::Schema];
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::HomeUnsafe => "catalog_home_unsafe",
+            Self::FileUnsafe => "catalog_file_unsafe",
+            Self::OpenFailed => "catalog_open_failed",
+            Self::Schema => "catalog_schema",
+        }
+    }
+}
+
 impl From<CatalogError> for VerificationError {
     fn from(error: CatalogError) -> Self {
         match error {
@@ -209,18 +238,28 @@ impl ConnectorCatalog {
     /// before and after SQLite opens it. Anything else is `Unavailable`.
     /// Non-Unix platforms always refuse.
     pub fn open(home: &Path) -> Result<Self, CatalogError> {
+        Self::open_checked(home).map_err(|_| CatalogError::Unavailable)
+    }
+
+    /// R8m 30a: [`Self::open`] with the stage that refused, as a fixed reason
+    /// (no path, no OS error text) for the boot assembly's not-ready report.
+    /// The home check is diagnostic only: the private-database opener
+    /// enforces the same rule (and the ancestor walk) again.
+    pub fn open_checked(home: &Path) -> Result<Self, CatalogOpenFailure> {
         #[cfg(unix)]
         {
-            verify_private_files(home)?;
-            let connection = crate::fs_safe::sqlite::open(home, CATALOG_FILE).map_err(|_| CatalogError::Unavailable)?;
-            verify_private_files(home)?;
-            let catalog = Self::new(connection)?;
+            use CatalogOpenFailure as Failure;
+            verify_private_home(home)?;
+            verify_private_files(home).map_err(|_| Failure::FileUnsafe)?;
+            let connection = crate::fs_safe::sqlite::open(home, CATALOG_FILE).map_err(|_| Failure::OpenFailed)?;
+            verify_private_files(home).map_err(|_| Failure::FileUnsafe)?;
+            let catalog = Self::new(connection).map_err(|_| Failure::Schema)?;
             // WAL/SHM now exist; SQLite gives them the database's mode.
-            verify_private_files(home)?;
+            verify_private_files(home).map_err(|_| Failure::FileUnsafe)?;
             Ok(catalog)
         }
         #[cfg(not(unix))]
-        { let _ = home; Err(CatalogError::Unavailable) }
+        { let _ = home; Err(CatalogOpenFailure::OpenFailed) }
     }
 
     /// Use an already-opened connection (tests, in-memory). Creates the schema
@@ -552,6 +591,18 @@ fn verify_table(connection: &Connection, table: &str, schema: &[(&str, &str, &st
 /// single-link file owned by the effective uid with no group/other bits.
 /// lstat only: never follows a link and opens no descriptor (closing one
 /// would drop another connection's POSIX locks).
+/// R8m 30a, diagnostic: the home itself (lstat, never followed) is a
+/// directory owned by the effective uid and not group/other-writable.
+#[cfg(unix)]
+fn verify_private_home(home: &Path) -> Result<(), CatalogOpenFailure> {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::symlink_metadata(home) {
+        Ok(meta) if meta.file_type().is_dir() && meta.uid() == nix::unistd::geteuid().as_raw()
+            && meta.mode() & 0o022 == 0 => Ok(()),
+        _ => Err(CatalogOpenFailure::HomeUnsafe),
+    }
+}
+
 #[cfg(unix)]
 fn verify_private_files(home: &Path) -> Result<(), CatalogError> {
     use std::os::unix::fs::MetadataExt;

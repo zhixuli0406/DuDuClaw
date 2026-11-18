@@ -693,6 +693,33 @@ mod open_file {
         assert!(!root.path().join("missing").exists());
     }
 
+    /// R8m 30a: each refusal stage has its own fixed reason; the reasons are
+    /// distinct snake_case identifiers (no path, no OS text) and total.
+    #[test]
+    fn catalog_open_checked_names_the_refusing_stage() {
+        use CatalogOpenFailure::*;
+        let home = crate::fs_safe::private_test_home().unwrap();
+        std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert_eq!(ConnectorCatalog::open_checked(home.path()).err(), Some(HomeUnsafe));
+        assert!(!home.path().join(CATALOG_FILE).exists());
+        let root = crate::fs_safe::private_test_home().unwrap();
+        assert_eq!(ConnectorCatalog::open_checked(&root.path().join("missing")).err(), Some(HomeUnsafe));
+        let home = crate::fs_safe::private_test_home().unwrap();
+        drop(ConnectorCatalog::open(home.path()).unwrap());
+        std::fs::set_permissions(home.path().join(CATALOG_FILE), std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(ConnectorCatalog::open_checked(home.path()).err(), Some(FileUnsafe));
+        // Repaired: the same home opens.
+        std::fs::set_permissions(home.path().join(CATALOG_FILE), std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(ConnectorCatalog::open_checked(home.path()).is_ok());
+        let home = crate::fs_safe::private_test_home().unwrap();
+        let path = home.path().join(CATALOG_FILE);
+        std::fs::write(&path, b"not a sqlite database, definitely not").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(ConnectorCatalog::open_checked(home.path()).err(), Some(Schema));
+        let reasons: Vec<_> = CatalogOpenFailure::ALL.iter().map(|failure| failure.reason()).collect();
+        assert_eq!(reasons, ["catalog_home_unsafe", "catalog_file_unsafe", "catalog_open_failed", "catalog_schema"]);
+    }
+
     #[test]
     fn catalog_open_refuses_foreign_owner_when_privileged() {
         // Changing ownership needs root; unprivileged runs rely on the uid

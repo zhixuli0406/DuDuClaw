@@ -772,3 +772,44 @@ fn service_protected_readiness_directory_failures_name_fixed_paths() {
     assert_eq!(directories.matches("directory_failure(path, false)").count(), 3);
     assert!(directories.contains("directory_failure(path, true)"));
 }
+
+/// R8m 30b: after every platform check passed, the three gateway-view cases.
+/// Only a fresh "ready" view keeps the employees-can-run sentence; the other
+/// two are the same refusal (non-zero exit) as a failed check, with their
+/// own message.
+#[test]
+fn service_protected_readiness_final_sentence_follows_the_gateway_view() {
+    use duduclaw_gateway::isolation_readiness::published::{ComponentView, View, COMPONENTS};
+    let message = |result: Result<()>| match result.unwrap_err() {
+        DuDuClawError::Config(text) => text,
+        other => panic!("{other:?}"),
+    };
+    // Ready: the existing sentence (or the migration-pending one), exit 0.
+    let (lines, result) = gateway_verdict(false, GatewayView::Ready);
+    assert_eq!((lines, result.is_ok()), (vec![MSG_READY.to_owned()], true));
+    let (lines, result) = gateway_verdict(true, GatewayView::Ready);
+    assert_eq!((lines, result.is_ok()), (vec![Reason::MIGRATION_PENDING_MESSAGE.to_owned()], true));
+    // Not ready: the components and missing producers, then a refusal.
+    let view = View { schema: 1, boot_id: "0123abcd-4567-89ef-0123-456789abcdef".into(), written_unix: 1, ready: false,
+        components: COMPONENTS.iter().map(|name| ComponentView { name: (*name).into(),
+            state: if *name == "mcp_boundary" { "pending".into() } else { "ready".into() },
+            reason: (*name == "mcp_boundary").then(|| "pending_integration".into()) }).collect(),
+        assembly_missing: vec!["connector_providers".into()] };
+    for pending in [false, true] {
+        let (lines, result) = gateway_verdict(pending, GatewayView::NotReady(view.clone()));
+        assert_eq!(lines, ["[資訊] 平台檢查均已通過。Gateway 回報尚未就緒：mcp_boundary(pending_integration)；啟動組裝尚缺：connector_providers。"]);
+        let text = message(result);
+        assert!(text.ends_with(MSG_GATEWAY_NOT_READY), "{text}");
+        // Unavailable (missing, stale, other boot, malformed): a refusal too.
+        let (lines, result) = gateway_verdict(pending, GatewayView::Unavailable);
+        assert_eq!(lines, [MSG_GATEWAY_UNAVAILABLE_INFO]);
+        assert!(message(result).ends_with(MSG_GATEWAY_UNCONFIRMED));
+    }
+    assert_eq!(MSG_GATEWAY_UNAVAILABLE_INFO, "[資訊] 無法取得 Gateway 的就緒狀態（Gateway 未執行、剛啟動，或狀態檔無效）。");
+    assert_eq!(MSG_GATEWAY_NOT_READY, "平台檢查均已通過，但 Gateway 尚未就緒，員工工作仍暫停。");
+    // The platform-only result never claims that employees can run.
+    assert_eq!(MSG_PLATFORM_READY, "平台檢查均已通過。");
+    let source = include_str!("protected_linux_readiness.rs");
+    let platform = source.split("pub(super) fn check_platform_all(").nth(1).unwrap().split("pub(super) fn check(").next().unwrap();
+    assert!(platform.contains("MSG_PLATFORM_READY") && !platform.contains("MSG_READY }") && !platform.contains("gateway_view"));
+}

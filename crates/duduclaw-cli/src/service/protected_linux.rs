@@ -77,12 +77,12 @@ pub(crate) fn uninstall() -> Result<()> {
     { Err(refused("--protected-linux requires native Linux")) }
 }
 
-pub(crate) fn readiness() -> Result<()> {
+pub(crate) fn readiness(platform_only: bool) -> Result<()> {
     operator_gate()?;
     #[cfg(target_os = "linux")]
-    { linux::readiness() }
+    { linux::readiness(platform_only) }
     #[cfg(not(target_os = "linux"))]
-    { Err(refused("--protected-linux requires native Linux")) }
+    { let _ = platform_only; Err(refused("--protected-linux requires native Linux")) }
 }
 
 /// Typed arguments of the hidden `service bootstrap-continue` command, exactly
