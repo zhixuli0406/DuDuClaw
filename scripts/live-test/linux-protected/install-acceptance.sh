@@ -44,6 +44,8 @@ RECEIPT=/etc/duduclaw-updated/launcher-receipt.json
 # so a leftover outside a hand-picked subset cannot pass the rollback check.
 FACTS='
 /run/duduclaw-spawnd/control.sock
+/run/duduclaw-parse
+/usr/lib/tmpfiles.d/duduclaw-parse.conf
 /etc/systemd/system/duduclaw-spawnd.socket
 /etc/systemd/system/duduclaw-spawnd.service
 /etc/systemd/system/duduclaw-isolation-ready.service

@@ -65,7 +65,7 @@ Source of truth for the matrix: `wiki/duduclaw-kb/architecture/native-linux-isol
 
 ### Prerequisites per distro
 
-Common: run as root on the host (not in a container: the installer refuses containers); systemd as PID 1; unified cgroup v2 (`stat -f -c %T /sys/fs/cgroup` = `cgroup2fs`); initial user namespace; `SYS_UID_MAX`/`SYS_GID_MAX` in `/etc/login.defs` may be omitted (stock files on all three distros comment them out); as shadow `useradd -r`/`groupadd -r` do, the installer derives each absent maximum from `UID_MIN`/`GID_MIN` minus one (default minimum 1000, giving 999), while rejecting malformed, duplicate or unsafe values; outbound network is **not** required for the local checks; a candidate `duduclaw` binary verified by you beforehand (the script passes `--i-verified-this-binary` and `--allow-missing-runtime`, so no AI CLI has to be installed); the isolated-storage reserve above plus the package space check under `/var/lib`, `/opt` and `/usr`; the scripts need `python3` ≥ 3.10, `setpriv` (util-linux), `getent`/`useradd`/`userdel`/`groupdel` (passwd), `journalctl`, `sha256sum`, GNU `date` and `openssl` (optional: without it the HTTPS canary origin is disabled).
+Common: run as root on the host (not in a container: the installer refuses containers); systemd as PID 1; unified cgroup v2 (`stat -f -c %T /sys/fs/cgroup` = `cgroup2fs`); initial user namespace; `SYS_UID_MAX`/`SYS_GID_MAX` in `/etc/login.defs` may be omitted (stock files on all three distros comment them out); as shadow `useradd -r`/`groupadd -r` do, the installer derives each absent maximum from `UID_MIN`/`GID_MIN` minus one (default minimum 1000, giving 999), while rejecting malformed, duplicate or unsafe values; outbound network is **not** required for the local checks; a candidate `duduclaw` binary verified by you beforehand (the script passes `--i-verified-this-binary` and `--allow-missing-runtime`, so no AI CLI has to be installed); the isolated-storage reserve above plus the package space check under `/var/lib`, `/opt` and `/usr`; the scripts need `systemd-tmpfiles` (systemd), `python3` ≥ 3.10, `setpriv` (util-linux), `getent`/`useradd`/`userdel`/`groupdel` (passwd), `journalctl`, `sha256sum`, GNU `date` and `openssl` (optional: without it the HTTPS canary origin is disabled).
 
 | Distro | Packages to install first | Notes |
 |---|---|---|
@@ -169,7 +169,7 @@ Environment given to the driver: `DUDUCLAW_ISO_DATA` (service home), `DUDUCLAW_I
 
 在可丟棄的 Ubuntu 22.04 實體機／VM 上，驗收候選版的 systemd 安裝、資料搬移、憑證 RPC、程序隔離、拒絕條件、升級與 dashboard 更新限制。這套工具會修改系統、建立／移除服務帳號和資料，請使用專用主機及專用 sudo 使用者。
 
-需要 systemd 為 PID 1、cgroup v2、初始 user namespace、Python 3.10+、util-linux `setpriv`、GNU coreutils、passwd/group 管理工具及 sudo 權限。升級與 dashboard 更新檢查需要連到官方 GitHub release。候選 binary 必須事先由操作者驗證；腳本將它放到 root 管理的 staging 路徑，這不等同驗證發行簽章。不得在容器或 AI 員工執行環境執行。
+需要 systemd 為 PID 1、`systemd-tmpfiles`、cgroup v2、初始 user namespace、Python 3.10+、util-linux `setpriv`、GNU coreutils、passwd/group 管理工具及 sudo 權限。升級與 dashboard 更新檢查需要連到官方 GitHub release。候選 binary 必須事先由操作者驗證；腳本將它放到 root 管理的 staging 路徑，這不等同驗證發行簽章。不得在容器或 AI 員工執行環境執行。
 
 將候選 binary 與工具資料夾放在同一個目錄：
 

@@ -96,6 +96,52 @@ fn take_authorization(agent_dir: &std::path::Path) -> Result<RuntimeAuthorizatio
     Ok(authorization)
 }
 
+/// R8r-1: the single issuing rule for every protected main run (Claude, the
+/// OpenAI-compatible API worker, Codex/Grok and registered CLIs). An
+/// authorization installed by [`with_runtime_authorization`] is consumed (one
+/// use; a nested run never replaces or revives the outer principal). Without
+/// one, authority is issued only from the current legitimate origin: the
+/// background record when a background scope exists, otherwise the
+/// authenticated interactive ingress. Neither ⇒ refused. There is no
+/// synthetic/system origin. Callers run their own coarse gates first and hold
+/// the returned principal context until the run has finished.
+async fn take_or_issue_current(agent_dir: &std::path::Path)
+    -> Result<(RuntimeAuthorization, Option<crate::on_behalf_of::context::ContextGuard>), String> {
+    #[cfg(test)]
+    if let Ok(fake) = FAKE_ORIGIN.try_with(Arc::clone) {
+        return take_or_issue_with(agent_dir, || fake.has_background(),
+            |context| std::future::ready(fake.issue("background", agent_dir, context)),
+            |context| std::future::ready(fake.issue("ingress", agent_dir, context))).await;
+    }
+    take_or_issue_with(agent_dir, crate::isolation_background::has_scope,
+        |context| crate::isolation_background::authorize_current(agent_dir, context),
+        |context| super::ingress::authorize_current(agent_dir, context)).await
+}
+
+/// The rule itself, over the two issuers (production: the live background
+/// record and ingress scopes; unit tests: fakes through `FAKE_ORIGIN`).
+async fn take_or_issue_with<BF, BE, IF, IE>(agent_dir: &std::path::Path,
+    background_scope: impl FnOnce() -> bool,
+    background: impl FnOnce(Option<String>) -> BF, ingress: impl FnOnce(Option<String>) -> IF)
+    -> Result<(RuntimeAuthorization, Option<crate::on_behalf_of::context::ContextGuard>), String>
+where BF: Future<Output = Result<RuntimeAuthorization, BE>>, IF: Future<Output = Result<RuntimeAuthorization, IE>> {
+    if AUTHORIZATION.try_with(|_| ()).is_ok() {
+        return Ok((take_authorization(agent_dir)?, None));
+    }
+    let agent = agent_dir.file_name().and_then(|name| name.to_str()).ok_or_else(refusal)?;
+    let home = agent_dir.parent().and_then(|path| path.parent()).ok_or_else(refusal)?;
+    let guard = crate::on_behalf_of::context::register(home, agent).ok_or_else(refusal)?;
+    let authorization = if background_scope() {
+        background(Some(guard.reference().into())).await.map_err(|_| refusal())?
+    } else {
+        ingress(Some(guard.reference().into())).await.map_err(|_| refusal())?
+    };
+    Ok((authorization, Some(guard)))
+}
+
+#[cfg(test)]
+tokio::task_local! { static FAKE_ORIGIN: Arc<tests::FakeOrigin>; }
+
 /// R6: the step limit root will enforce for this employee's next Claude run.
 /// `desired` is the caller's own wish (work turn: the gateway resolution;
 /// utility call: at most 50); the result can only be lower. It consumes no
@@ -118,19 +164,7 @@ pub(crate) async fn claude_max_turns(agent_dir: &std::path::Path, desired: u64) 
 pub(crate) async fn spawn_claude(agent_dir: &std::path::Path, prompt: &str, system_prompt: &str, model: &str, max_turns: u64)
     -> Result<(crate::process_group::BackendChild, PromptWriter), String> {
     let max_turns = u16::try_from(max_turns).map_err(|_| refusal())?;
-    let (authorization, principal_context) = if AUTHORIZATION.try_with(|_| ()).is_ok() {
-        (take_authorization(agent_dir)?, None)
-    } else {
-        let agent = agent_dir.file_name().and_then(|name| name.to_str()).ok_or_else(refusal)?;
-        let home = agent_dir.parent().and_then(|path| path.parent()).ok_or_else(refusal)?;
-        let guard = crate::on_behalf_of::context::register(home, agent).ok_or_else(refusal)?;
-        let authorization = if crate::isolation_background::has_scope() {
-            crate::isolation_background::authorize_current(agent_dir, Some(guard.reference().into())).await
-        } else {
-            super::ingress::authorize_current(agent_dir, Some(guard.reference().into())).await
-        }.map_err(|_| refusal())?;
-        (authorization, Some(guard))
-    };
+    let (authorization, principal_context) = take_or_issue_current(agent_dir).await?;
     let class = crate::process_group::execution_class(ExecutionClass::EmployeeMain);
     let plan = super::boot::claude_plan(authorization.home.clone(), authorization.agent.clone(), class,
         prompt.as_bytes().to_vec(), system_prompt.as_bytes().to_vec(), model.into(), max_turns).await.map_err(|_| refusal())?;
@@ -185,7 +219,9 @@ pub(crate) async fn execute_registered_cli(id: &str, prompt: &str, context: &cra
     }
     let runtime = RuntimeKind::Registered(Text::new(format!("generic-cli-v1.{id}")).map_err(|_| refusal())?);
     duduclaw_mcp_boundary::config::registered_cli_arguments(&runtime).map_err(|_| refusal())?;
-    let authorization = take_authorization(agent_dir)?;
+    // R8r-1: every gate above runs before authority is taken or issued. The
+    // principal context stays registered until this run has been collected.
+    let (authorization, _principal_context) = take_or_issue_current(agent_dir).await?;
     let bytes = serde_json::to_vec(&serde_json::json!({
         "protocol": "generic-cli-v1", "runtime": id, "model": context.model,
         "system_prompt": context.system_prompt, "history": context.conversation_history,
@@ -252,13 +288,17 @@ pub(crate) async fn execute_native(runtime: RuntimeKind, prompt: String, context
     // protected projection. Refuse before consuming credentials or launching.
     if runtime == RuntimeKind::Codex && std::env::var_os("CODEX_HOME").is_some() { return Err(refusal()); }
     let protocol = match runtime { RuntimeKind::Codex => "codex-v1", RuntimeKind::Grok => "grok-v1", _ => return Err(refusal()) };
-    let authorization = take_authorization(agent_dir)?;
+    // R8r-1: product policy and the interceptor refusals need no authority;
+    // they run before it is taken or issued, so a refusal here never consumes
+    // a one-time background record or an installed authorization.
     crate::product_policy::require_runtime(&context.home_dir, name).map_err(|_| refusal())?;
     crate::product_policy::require_model(crate::product_policy::load(&context.home_dir).map_err(|_| refusal())?,
         &context.model).map_err(|_| refusal())?;
     if crate::ccr_runtime::for_agent(&context.home_dir, &context.agent_id).is_some()
         || crate::redaction_proxy::try_build_interceptor(&context.home_dir, &context.agent_id,
             &crate::redaction_proxy::current_session_id()).map_err(|_| refusal())?.is_some() { return Err(refusal()); }
+    // The principal context stays registered until this run has been collected.
+    let (authorization, _principal_context) = take_or_issue_current(agent_dir).await?;
     let bytes = duduclaw_api_worker::native::Request { protocol: protocol.into(), model: context.model.clone(), prompt }
         .encode().map_err(|_| refusal())?;
     let class = crate::process_group::execution_class(ExecutionClass::EmployeeMain);
@@ -301,9 +341,12 @@ async fn collect_native_pty(authorization: RuntimeAuthorization, plan: duduclaw_
         _ => { let _ = child.kill().await; Err(refusal()) } }
 }
 
-/// Consume initiating authority before resolving provider credentials. Unsupported
-/// utility, workspace and effort modes never enter the worker's provider path.
-pub(crate) fn authorize_api(context: &crate::runtime::RuntimeContext) -> Result<RuntimeAuthorization, String> {
+/// Take or issue initiating authority before resolving provider credentials.
+/// Unsupported utility, workspace and effort modes never enter the worker's
+/// provider path and are refused before any authority is consumed. The caller
+/// holds the returned principal context until the worker run has finished.
+pub(crate) async fn authorize_api(context: &crate::runtime::RuntimeContext)
+    -> Result<(RuntimeAuthorization, Option<crate::on_behalf_of::context::ContextGuard>), String> {
     let agent_dir = context.agent_dir.as_deref().ok_or_else(refusal)?;
     if context.effort.is_some() || crate::runtime_dispatch::in_utility_call()
         || crate::runtime::spawn_work_dir_override().is_some()
@@ -311,7 +354,7 @@ pub(crate) fn authorize_api(context: &crate::runtime::RuntimeContext) -> Result<
         || context.capabilities.as_ref().is_some_and(|caps| !caps.policy.is_empty()) {
         return Err(refusal());
     }
-    take_authorization(agent_dir)
+    take_or_issue_current(agent_dir).await
 }
 
 pub(crate) async fn execute_api_worker(authorization: RuntimeAuthorization,
@@ -336,12 +379,90 @@ mod tests {
     use std::path::Path;
     use duduclaw_isolation::{bounded::{List, Text}, capability::{EmployeeBinding, Lane, Principal}};
     fn authorization(agent: &str) -> RuntimeAuthorization {
-        RuntimeAuthorization { home: "/trusted-home".into(), agent: agent.into(), grant: GrantPolicy {
+        authorization_at(Path::new("/trusted-home"), agent, 1)
+    }
+    /// `revision` tells the installed (1), ingress (41) and background (42)
+    /// authorizations apart in the R8r-1 tests.
+    fn authorization_at(home: &Path, agent: &str, revision: u64) -> RuntimeAuthorization {
+        RuntimeAuthorization { home: home.into(), agent: agent.into(), grant: GrantPolicy {
             task: None, principal: Principal::Background { tenant_id: Text::new("tenant".into()).unwrap(), generation: 1 },
             binding: EmployeeBinding::Shared(Text::new("tenant".into()).unwrap()), lane: Lane::Standard,
-            tools: List::new(vec![]).unwrap(), resources: List::new(vec![]).unwrap(), policy_revision: 1,
+            tools: List::new(vec![]).unwrap(), resources: List::new(vec![]).unwrap(), policy_revision: revision,
             not_before: 1, expires_at: 2 }, roots: Arc::new(ResourceRoots::default()),
             origin: WaitOrigin::Gateway, caller: None, turn: None, authenticated_epoch: None }
+    }
+    const INGRESS_REVISION: u64 = 41;
+    const BACKGROUND_REVISION: u64 = 42;
+
+    /// R8r-1 seam (installed through `FAKE_ORIGIN`): stands in for the live
+    /// background-record and ingress issuers, which read private task-local
+    /// scopes of other modules. `background: Some` models a background scope;
+    /// its slot is the one-time record. Every issuer call is recorded.
+    pub(super) struct FakeOrigin {
+        background: Option<Mutex<Option<RuntimeAuthorization>>>,
+        ingress: Mutex<Option<RuntimeAuthorization>>,
+        calls: Mutex<Vec<(&'static str, std::path::PathBuf, Option<String>)>>,
+    }
+    impl FakeOrigin {
+        fn new(background: Option<Option<RuntimeAuthorization>>, ingress: Option<RuntimeAuthorization>) -> Arc<Self> {
+            Arc::new(Self { background: background.map(Mutex::new), ingress: Mutex::new(ingress),
+                calls: Mutex::new(Vec::new()) })
+        }
+        /// Both origins present: the background record and an ingress identity.
+        fn both(home: &Path) -> Arc<Self> {
+            Self::new(Some(Some(authorization_at(home, "alice", BACKGROUND_REVISION))),
+                Some(authorization_at(home, "alice", INGRESS_REVISION)))
+        }
+        pub(super) fn has_background(&self) -> bool { self.background.is_some() }
+        pub(super) fn issue(&self, origin: &'static str, agent_dir: &Path, context: Option<String>)
+            -> Result<RuntimeAuthorization, ()> {
+            self.calls.lock().unwrap().push((origin, agent_dir.to_owned(), context));
+            let slot = if origin == "background" { self.background.as_ref() } else { Some(&self.ingress) };
+            slot.and_then(|slot| slot.lock().unwrap().take()).ok_or(())
+        }
+        fn calls(&self) -> Vec<(&'static str, std::path::PathBuf, Option<String>)> { self.calls.lock().unwrap().clone() }
+        fn record_left(&self) -> bool { self.background.as_ref().is_some_and(|slot| slot.lock().unwrap().is_some()) }
+        fn ingress_left(&self) -> bool { self.ingress.lock().unwrap().is_some() }
+    }
+
+    /// A real, canonical gateway home, so the principal context registers.
+    fn live_home() -> (tempfile::TempDir, std::path::PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(home.join("agents").join("alice")).unwrap();
+        (temp, home)
+    }
+    fn live_context(home: &Path) -> crate::runtime::RuntimeContext {
+        let mut ctx = context();
+        ctx.agent_dir = Some(home.join("agents").join("alice"));
+        ctx.home_dir = home.to_owned();
+        ctx
+    }
+    /// The four protected paths (Codex only when no external CODEX_HOME,
+    /// which PL-0 refuses before any authority).
+    fn protected_paths() -> Vec<&'static str> {
+        let mut paths = vec!["claude", "api", "grok", "cli"];
+        if std::env::var_os("CODEX_HOME").is_none() { paths.push("codex"); }
+        paths
+    }
+    /// Drives one protected path. With authority every path except `api`
+    /// then refuses on the missing boot owner, i.e. after the helper.
+    /// `max_turns` above the wire range is Claude's coarse refusal.
+    async fn run_path(path: &str, ctx: &crate::runtime::RuntimeContext, max_turns: u64) -> Result<(), String> {
+        let agent_dir = ctx.agent_dir.clone().unwrap();
+        match path {
+            "claude" => spawn_claude(&agent_dir, "input", "system", "model", max_turns).await.map(|_| ()),
+            "api" => authorize_api(ctx).await.map(|_| ()),
+            "codex" => execute_native(RuntimeKind::Codex, "prompt".into(), ctx).await.map(|_| ()),
+            "grok" => execute_native(RuntimeKind::Grok, "prompt".into(), ctx).await.map(|_| ()),
+            "cli" => execute_registered_cli("qwen", "prompt", ctx,
+                duduclaw_core::runtime_catalog::OutputFormat::Text).await.map(|_| ()),
+            _ => unreachable!(),
+        }
+    }
+    fn assert_refused(path: &str, result: Result<(), String>) {
+        let error = result.expect_err(path);
+        assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error), "{path}: {error}");
     }
     fn context() -> crate::runtime::RuntimeContext {
         crate::runtime::RuntimeContext { agent_dir: Some("/trusted-home/agents/alice".into()),
@@ -350,20 +471,186 @@ mod tests {
             conversation_history: vec![], capabilities: None, account_pool: vec![], effort: None,
             allow_cross_family_failover: true }
     }
+    /// R8r-1: no installed scope AND no current origin (the live issuers, no
+    /// fake: no background scope, no ingress identity) ⇒ every protected path
+    /// refuses with the protected-mode refusal before boot, credentials or spawn.
     #[tokio::test]
-    async fn other_runtimes_refuse_missing_authority_before_boot_credentials_or_spawn() {
-        let context = context();
-        assert!(authorize_api(&context).is_err());
-        let error = execute_registered_cli("qwen", "prompt", &context,
-            duduclaw_core::runtime_catalog::OutputFormat::Text).await.unwrap_err();
-        assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error));
-    }
-    #[tokio::test]
-    async fn native_runtimes_refuse_missing_authority_before_boot_config_or_spawn() {
-        for kind in [RuntimeKind::Codex, RuntimeKind::Grok] {
-            let error = execute_native(kind,"prompt".into(),&context()).await.unwrap_err();
-            assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error));
+    async fn every_protected_path_refuses_without_scope_or_origin() {
+        let (_temp, home) = live_home();
+        let ctx = live_context(&home);
+        for path in protected_paths() { assert_refused(path, run_path(path, &ctx, 50).await); }
+        assert!(take_or_issue_current(&home.join("agents").join("alice")).await.is_err());
+        // The same with the fake seam: the ingress issuer is asked and refuses.
+        for path in protected_paths() {
+            let fake = FakeOrigin::new(None, None);
+            assert_refused(path, FAKE_ORIGIN.scope(fake.clone(), run_path(path, &ctx, 50)).await);
+            let calls = fake.calls();
+            assert_eq!(calls.len(), 1, "{path}");
+            assert_eq!(calls[0].0, "ingress", "{path}");
         }
+        // A background scope whose record is already consumed never falls
+        // back to the interactive ingress.
+        for path in protected_paths() {
+            let fake = FakeOrigin::new(Some(None), Some(authorization_at(&home, "alice", INGRESS_REVISION)));
+            assert_refused(path, FAKE_ORIGIN.scope(fake.clone(), run_path(path, &ctx, 50)).await);
+            assert_eq!(fake.calls().iter().map(|call| call.0).collect::<Vec<_>>(), vec!["background"], "{path}");
+            assert!(fake.ingress_left(), "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn helper_issues_from_interactive_origin_with_a_live_principal_context() {
+        let (_temp, home) = live_home();
+        let dir = home.join("agents").join("alice");
+        let fake = FakeOrigin::new(None, Some(authorization_at(&home, "alice", INGRESS_REVISION)));
+        FAKE_ORIGIN.scope(fake.clone(), async {
+            let (auth, guard) = take_or_issue_current(&dir).await.unwrap();
+            assert_eq!((auth.agent.as_str(), auth.grant.policy_revision), ("alice", INGRESS_REVISION));
+            let guard = guard.expect("an issued run holds its principal context");
+            assert_eq!(fake.calls(), vec![("ingress", dir.clone(), Some(guard.reference().to_owned()))]);
+            // The ingress identity is one-use.
+            assert!(take_or_issue_current(&dir).await.is_err());
+        }).await;
+    }
+
+    #[tokio::test]
+    async fn helper_prefers_background_record_consumes_it_once_and_never_falls_back() {
+        let (_temp, home) = live_home();
+        let dir = home.join("agents").join("alice");
+        let fake = FakeOrigin::both(&home);
+        FAKE_ORIGIN.scope(fake.clone(), async {
+            let (auth, guard) = take_or_issue_current(&dir).await.unwrap();
+            assert_eq!(auth.grant.policy_revision, BACKGROUND_REVISION);
+            let guard = guard.expect("an issued run holds its principal context");
+            assert_eq!(fake.calls(), vec![("background", dir.clone(), Some(guard.reference().to_owned()))]);
+            assert!(!fake.record_left());
+            assert!(take_or_issue_current(&dir).await.is_err());
+            assert_eq!(fake.calls().iter().map(|call| call.0).collect::<Vec<_>>(), vec!["background", "background"]);
+            assert!(fake.ingress_left());
+        }).await;
+    }
+
+    #[tokio::test]
+    async fn helper_consumes_installed_authorization_and_nested_scope_cannot_replace_it() {
+        let dir = Path::new("/trusted-home/agents/alice");
+        let fake = FakeOrigin::both(Path::new("/trusted-home"));
+        FAKE_ORIGIN.scope(fake.clone(), with_runtime_authorization(authorization("alice"), async {
+            let (auth, guard) = take_or_issue_current(dir).await.unwrap();
+            assert_eq!(auth.grant.policy_revision, 1);
+            assert!(guard.is_none());
+            with_runtime_authorization(authorization("bob"), async {
+                assert!(take_or_issue_current(Path::new("/trusted-home/agents/bob")).await.is_err());
+                assert!(take_or_issue_current(dir).await.is_err());
+            }).await;
+            assert!(take_or_issue_current(dir).await.is_err());
+        })).await;
+        assert!(fake.calls().is_empty());
+        assert!(fake.record_left() && fake.ingress_left());
+    }
+
+    /// Behavioural, per path: each of the four paths obtains authority through
+    /// the helper exactly as `spawn_claude` does (same issuer, same employee
+    /// directory, a registered principal context reference).
+    #[tokio::test]
+    async fn every_protected_path_issues_from_interactive_origin_like_claude() {
+        let (_temp, home) = live_home();
+        let ctx = live_context(&home);
+        let dir = home.join("agents").join("alice");
+        for path in protected_paths() {
+            let fake = FakeOrigin::new(None, Some(authorization_at(&home, "alice", INGRESS_REVISION)));
+            let result = FAKE_ORIGIN.scope(fake.clone(), run_path(path, &ctx, 50)).await;
+            if path == "api" { result.unwrap(); } else { assert_refused(path, result); }
+            let calls = fake.calls();
+            assert_eq!(calls.len(), 1, "{path}");
+            assert_eq!((calls[0].0, &calls[0].1), ("ingress", &dir), "{path}");
+            assert!(calls[0].2.as_ref().is_some_and(|reference| reference.len() == 64), "{path}");
+            assert!(!fake.ingress_left(), "{path}");
+        }
+        let fake = FakeOrigin::new(None, Some(authorization_at(&home, "alice", INGRESS_REVISION)));
+        FAKE_ORIGIN.scope(fake.clone(), async {
+            let (auth, guard) = authorize_api(&ctx).await.unwrap();
+            assert_eq!(auth.grant.policy_revision, INGRESS_REVISION);
+            assert_eq!(fake.calls()[0].2.as_deref(), guard.as_ref().map(|guard| guard.reference()));
+        }).await;
+    }
+
+    #[tokio::test]
+    async fn every_protected_path_consumes_the_background_record_once() {
+        let (_temp, home) = live_home();
+        let ctx = live_context(&home);
+        let dir = home.join("agents").join("alice");
+        for path in protected_paths() {
+            let fake = FakeOrigin::both(&home);
+            FAKE_ORIGIN.scope(fake.clone(), async {
+                let result = run_path(path, &ctx, 50).await;
+                if path == "api" { result.unwrap(); } else { assert_refused(path, result); }
+                let calls = fake.calls();
+                assert_eq!(calls.len(), 1, "{path}");
+                assert_eq!((calls[0].0, &calls[0].1), ("background", &dir), "{path}");
+                assert!(calls[0].2.is_some(), "{path}");
+                assert!(!fake.record_left(), "{path}");
+                // Consumed once: a second run of the same path is refused.
+                assert_refused(path, run_path(path, &ctx, 50).await);
+                assert_eq!(fake.calls().iter().map(|call| call.0).collect::<Vec<_>>(),
+                    vec!["background", "background"], "{path}");
+                assert!(fake.ingress_left(), "{path}");
+            }).await;
+        }
+        let fake = FakeOrigin::both(&home);
+        FAKE_ORIGIN.scope(fake.clone(), async {
+            let (auth, _guard) = authorize_api(&ctx).await.unwrap();
+            assert_eq!(auth.grant.policy_revision, BACKGROUND_REVISION);
+        }).await;
+    }
+
+    #[tokio::test]
+    async fn every_protected_path_uses_an_installed_authorization_without_issuing() {
+        let (_temp, home) = live_home();
+        let ctx = live_context(&home);
+        let dir = home.join("agents").join("alice");
+        for path in protected_paths() {
+            let fake = FakeOrigin::both(&home);
+            FAKE_ORIGIN.scope(fake.clone(), with_runtime_authorization(authorization_at(&home, "alice", 1), async {
+                // A nested scope cannot replace the outer authorization.
+                let result = with_runtime_authorization(authorization_at(&home, "alice", 99),
+                    run_path(path, &ctx, 50)).await;
+                if path == "api" { result.unwrap(); } else { assert_refused(path, result); }
+                // The outer authorization was the one consumed; no retry, no issuance.
+                assert!(take_authorization(&dir).is_err(), "{path}");
+                assert_refused(path, run_path(path, &ctx, 50).await);
+            })).await;
+            assert!(fake.calls().is_empty(), "{path}");
+            assert!(fake.record_left() && fake.ingress_left(), "{path}");
+        }
+        let fake = FakeOrigin::both(&home);
+        FAKE_ORIGIN.scope(fake.clone(), with_runtime_authorization(authorization_at(&home, "alice", 1), async {
+            let (auth, guard) = with_runtime_authorization(authorization_at(&home, "alice", 99),
+                authorize_api(&ctx)).await.unwrap();
+            assert_eq!(auth.grant.policy_revision, 1);
+            assert!(guard.is_none());
+        })).await;
+        assert!(fake.calls().is_empty());
+    }
+
+    /// Each path's coarse gate (Claude: step limit outside the wire range;
+    /// the others: the context's employee differs from the directory) refuses
+    /// before the helper: the background record is still consumable afterwards.
+    #[tokio::test]
+    async fn coarse_refusal_on_every_path_consumes_no_background_record() {
+        let (_temp, home) = live_home();
+        let mut bad = live_context(&home);
+        bad.agent_id = "bob".into();
+        let dir = home.join("agents").join("alice");
+        let fake = FakeOrigin::both(&home);
+        FAKE_ORIGIN.scope(fake.clone(), async {
+            for path in protected_paths() {
+                assert_refused(path, run_path(path, &bad, u64::from(u16::MAX) + 1).await);
+                assert!(fake.calls().is_empty(), "{path}");
+                assert!(fake.record_left(), "{path}");
+            }
+            let (auth, _guard) = take_or_issue_current(&dir).await.unwrap();
+            assert_eq!(auth.grant.policy_revision, BACKGROUND_REVISION);
+        }).await;
     }
     /// Runs every protected coarse route (Codex, Grok, a registered generic
     /// CLI) with `caps` inside a live authorization scope and returns the
@@ -438,10 +725,10 @@ mod tests {
     async fn api_authority_is_one_shot_and_rejects_context_identity_mismatch() {
         with_runtime_authorization(authorization("alice"), async {
             let mut wrong = context(); wrong.agent_id = "bob".into();
-            assert!(authorize_api(&wrong).is_err());
+            assert!(authorize_api(&wrong).await.is_err());
             let valid = context();
-            assert!(authorize_api(&valid).is_ok());
-            assert!(authorize_api(&valid).is_err());
+            assert!(authorize_api(&valid).await.is_ok());
+            assert!(authorize_api(&valid).await.is_err());
         }).await;
     }
     #[tokio::test]

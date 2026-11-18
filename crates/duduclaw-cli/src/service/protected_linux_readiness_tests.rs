@@ -54,6 +54,7 @@ struct Fake {
     broker: Option<bool>,
     /// The broker answers its health request in time.
     broker_healthy: bool,
+    lease: bool,
     cloud: bool,
     trust: Option<TrustView>,
     now: Option<u64>,
@@ -78,6 +79,7 @@ impl Fake {
             egress: Some(EgressView { host_public_addresses_empty: false }),
             broker: Some(false),
             broker_healthy: true,
+            lease: true,
             cloud: false,
             trust: Some(TrustView { expires_at_unix: 2000, frozen: false }),
             now: Some(1000),
@@ -90,7 +92,7 @@ impl Fake {
             launcher: digest(0), evidence: None,
             inactive: vec!["duduclaw-egress.socket", "duduclaw-egress.service", "duduclaw-parse.socket",
                 "duduclaw-dns-broker.socket"],
-            egress: None, broker: None, broker_healthy: false, cloud: true, trust: None, now: None,
+            egress: None, broker: None, broker_healthy: false, lease: false, cloud: true, trust: None, now: None,
             migration: Err("migration_state_unreadable"), team: None }
     }
     fn assess(&mut self) -> Vec<Finding> { assess_host(self, VERSION) }
@@ -99,6 +101,9 @@ impl Fake {
 fn unavailable<T>(value: Option<T>) -> Result<T> { value.ok_or_else(|| refused("fake source unavailable")) }
 
 impl HostSources for Fake {
+    fn parse_lease(&mut self) -> Result<()> {
+        if self.lease { Ok(()) } else { Err(refused(parse_lease::INVALID)) }
+    }
     fn update_probe(&mut self) -> Result<GenerationEvidence> { unavailable(self.probe.clone()) }
     fn update_state(&mut self) -> Result<UpdateStateView> { unavailable(self.state) }
     fn current_generation(&mut self) -> Result<Sha256Digest> { unavailable(self.current) }
@@ -827,4 +832,17 @@ fn service_protected_readiness_final_sentence_follows_the_gateway_view() {
     let source = include_str!("protected_linux_readiness.rs");
     let platform = source.split("pub(super) fn check_platform_all(").nth(1).unwrap().split("pub(super) fn check(").next().unwrap();
     assert!(platform.contains("MSG_PLATFORM_READY") && !platform.contains("MSG_READY }") && !platform.contains("gateway_view"));
+}
+
+#[test]
+fn service_protected_readiness_parse_lease_required() {
+    let mut fake = Fake::healthy();
+    fake.lease = false;
+    let findings = fake.assess();
+    assert_eq!(failures(&findings), [(Item::ParseWorker, "retirement_lease_unavailable")]);
+    let (lines, failed, _) = render(&findings);
+    assert_eq!(failed, 1);
+    assert!(lines.iter().any(|line| line == &format!("  - {MSG_PARSE_LEASE}")));
+    fake.lease = true;
+    assert!(failures(&fake.assess()).is_empty());
 }

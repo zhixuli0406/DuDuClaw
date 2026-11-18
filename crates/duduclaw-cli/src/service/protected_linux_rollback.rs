@@ -90,9 +90,9 @@ const ENABLED: [&str; 9] = [UNIT, boot::NIGHTLY_TIMER, "duduclaw-egress.socket",
     "duduclaw-parse.socket", "duduclaw-spawnd.socket", "duduclaw-spawnd.service", "duduclaw-egress.service",
     "duduclaw-updated.service"];
 /// Root-owned trees an install run creates (all isolation facts or below one).
-pub(super) const TREES: [&str; 8] = ["/opt/duduclaw-isolated", "/etc/duduclaw-updated", "/var/lib/duduclaw-updated",
+pub(super) const TREES: [&str; 9] = ["/opt/duduclaw-isolated", "/etc/duduclaw-updated", "/var/lib/duduclaw-updated",
     "/var/lib/duduclaw-spawnd", "/usr/lib/duduclaw", "/usr/libexec/duduclaw",
-    "/var/lib/duduclaw-migrate", "/run/duduclaw-spawnd"];
+    "/var/lib/duduclaw-migrate", "/run/duduclaw-spawnd", parse_lease::DIRECTORY];
 /// Directories outside the trees a run may create; ledgered only when this run
 /// created them, removed only when empty.
 pub(super) const LEDGER_DIRECTORIES: [&str; 5] = ["/usr/local/libexec/duduclaw", "/opt/duduclaw/bin", "/opt/duduclaw",
@@ -101,8 +101,9 @@ const MAX_TREE_ENTRIES: u32 = 200_000;
 const MAX_DIRECTORY_ENTRIES: usize = 100_000;
 const OTHER_MOUNT: &str = "要移除的目錄含有其他掛載點（或在檢查期間被更換），已停止回退；請先卸載後再執行同一個回退命令。";
 /// Review M3: the units whose runtime directory lives under `/run`.
-static RUNTIME_OWNERS: [(&str, [&str; 2]); 1] =
-    [(boot::SPAWND_RUNTIME, ["duduclaw-spawnd.socket", "duduclaw-spawnd.service"])];
+static RUNTIME_OWNERS: [(&str, [&str; 2]); 2] =
+    [(boot::SPAWND_RUNTIME, ["duduclaw-spawnd.socket", "duduclaw-spawnd.service"]),
+        (parse_lease::DIRECTORY, ["duduclaw-parse.socket", "duduclaw-parse@.service"])];
 /// Owner of every parent a quarantine is created in (production: root).
 const ROOT_OWNER: u32 = 0;
 
@@ -121,7 +122,7 @@ fn unit_path(name: &str) -> String { format!("/etc/systemd/system/{name}") }
 /// Every regular file a run may create (the ledger's `Kind::File` allowlist).
 pub(super) fn ledger_files() -> Vec<String> {
     let mut files: Vec<String> = [UNIT_PATH, RECOVERY_BOUND, LAUNCHER, BINARY, VERSION_PENDING, VERSION_FLOOR,
-        boot::NIGHTLY_HELPER, duduclaw_egress::daemon::CONFIG_PATH, duduclaw_egress::daemon::BROKER_CONFIG_PATH,
+        boot::NIGHTLY_HELPER, parse_lease::CONFIG, duduclaw_egress::daemon::CONFIG_PATH, duduclaw_egress::daemon::BROKER_CONFIG_PATH,
         duduclaw_core::root_key::KEY_PATH].iter().map(|path| (*path).to_owned()).collect();
     files.extend(layout::BINARIES.iter().map(|path| (*path).to_owned()));
     files.extend(layout::UNITS.iter().map(|(name, _)| unit_path(name)));

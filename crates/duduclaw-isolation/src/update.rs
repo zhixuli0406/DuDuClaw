@@ -26,6 +26,8 @@ pub const MAX_MIGRATION_BUNDLE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// change to the facts must update both.
 pub const ISOLATION_FACTS: &[&str] = &[
     crate::ids::SPAWND_SOCKET,
+    "/run/duduclaw-parse",
+    "/usr/lib/tmpfiles.d/duduclaw-parse.conf",
     "/etc/systemd/system/duduclaw-spawnd.socket",
     "/etc/systemd/system/duduclaw-spawnd.service",
     "/etc/systemd/system/duduclaw-isolation-ready.service",

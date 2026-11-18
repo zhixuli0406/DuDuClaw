@@ -64,7 +64,7 @@ v1.83.0 以降、新しいホストへの保護インストールは、独立し
 
 Kernel 7.0 は**現在受け入れられません**。Trampoline は 7 より大きい Landlock ABI を拒否します。ディストリビューションや GCP イメージの名前ではなく、実際に起動した kernel を確認してください。検証には受け入れ可能な kernel 構成を使い、Landlock の無効化や ABI 検査の緩和を行わないでください。上記は完全なインストール、実際のベンダー CLI、完全な移行、更新復旧の検証ではありません。
 
-`getent`、`id`、`useradd`、util-linux、systemd ツール、curl などの信頼できるシステムツールが必要です。社員の loop ストレージには ext4 または XFS、対応する非 thin provisioning の下位デバイス構成、社員のクォータと TCB の予約容量が必要です。不明な構成や容量不足は準備完了を拒否します。`/etc/nsswitch.conf` の passwd 行と group 行に書けるのは `files` と `systemd` だけです（Ubuntu・Debian の既定値、および authselect の `minimal` プロファイルを使う RHEL／Fedora）。それ以外のモジュール（LDAP／SSSD の `sss`、Google Compute Engine OS Login の `oslogin`／`cache_oslogin`、`compat`、`[SUCCESS=merge]` のような角括弧のアクション句）を含むホストはサポート対象外で、準備完了を拒否します。こうしたモジュールは社員 UID 範囲にアカウントを持ち込む可能性があり、このリリースでは外部ディレクトリ側でその範囲を予約できないためです。
+`getent`、`id`、`useradd`、util-linux、systemd ツール（`systemd-tmpfiles` を含む）、curl などの信頼できるシステムツールが必要です。社員の loop ストレージには ext4 または XFS、対応する非 thin provisioning の下位デバイス構成、社員のクォータと TCB の予約容量が必要です。不明な構成や容量不足は準備完了を拒否します。`/etc/nsswitch.conf` の passwd 行と group 行に書けるのは `files` と `systemd` だけです（Ubuntu・Debian の既定値、および authselect の `minimal` プロファイルを使う RHEL／Fedora）。それ以外のモジュール（LDAP／SSSD の `sss`、Google Compute Engine OS Login の `oslogin`／`cache_oslogin`、`compat`、`[SUCCESS=merge]` のような角括弧のアクション句）を含むホストはサポート対象外で、準備完了を拒否します。こうしたモジュールは社員 UID 範囲にアカウントを持ち込む可能性があり、このリリースでは外部ディレクトリ側でその範囲を予約できないためです。
 
 ## 単一実行ファイルの保護サービス（現行版）
 

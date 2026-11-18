@@ -5427,14 +5427,20 @@ on incomplete input, and observes writer completion before returning success.
 Cancellation drops both the managed child and writer. The root test checks an
 independent system nonce, so a user-prompt echo cannot impersonate fd 5 delivery.
 
-`RuntimeAuthorization` has no serde/environment/RPC constructor. An initiating
-host scope is consumed once, does not inherit into a new Tokio task, and cannot
-be replaced or revived by a nested scope. Both employee directory and gateway
-home must match. Missing authority, unsupported credential/env overrides,
-reasoning effort, explicit legacy MCP config, or channel session resume refuse
-with a terminal spawn-gate message. **There is currently no production ingress
-that constructs this scope.** The export is a consumer seam, not completed
-principal propagation. The root test uses its own explicitly marked authority.
+`RuntimeAuthorization` has no serde/environment/RPC constructor. All four
+protected main-run paths (Claude, the OpenAI-compatible API worker, Codex/Grok
+and registered CLIs) obtain it through one helper in `isolation_mcp/runtime.rs`
+(R8r-1), after their own coarse gates so a refusal there consumes nothing: an
+authorization installed with `with_runtime_authorization` is consumed once (it
+does not inherit into a new Tokio task, and a nested scope cannot replace or
+revive it; employee directory and gateway home must match); otherwise it is
+issued only from the current legitimate origin — the one-time background record
+when a background scope exists, else the authenticated interactive ingress —
+with the run's principal context registered for the run's lifetime. With
+neither, or with unsupported credential/env overrides, reasoning effort,
+explicit legacy MCP config or channel session resume, the run refuses with a
+terminal spawn-gate message. There is no synthetic, system or
+directory-derived origin.
 
 #### Remaining work, in dependency order
 
