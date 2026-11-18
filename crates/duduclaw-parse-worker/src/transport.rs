@@ -51,6 +51,24 @@ pub fn send_checked(fd: &impl AsFd, payload: &[u8], files: &[File], deadline: In
     Ok(())
 }
 
+/// The one live-authority request/reply sequence shared by every launcher
+/// session (socket-activated and retiring), so the two cannot drift: verify
+/// after each blocking wait and before each descriptor send/receive (inside
+/// send_checked/receive_checked), then once more after the reply is received
+/// and before it is decoded. Any verify failure returns its error and nothing
+/// is decoded or returned. Session-specific bookkeeping stays with the caller.
+pub(crate) fn exchange_checked(fd: &impl AsFd, request: &duduclaw_isolation::worker::ParseRequest,
+    files: &[File], deadline: Instant, verify: &dyn Fn() -> Result<(), ParseError>)
+    -> Result<duduclaw_isolation::worker::ParseResponse, ParseError> {
+    let payload = serde_json::to_vec(request).map_err(|_| ParseError::InvalidContent)?;
+    send_checked(fd, &payload, files, deadline, verify)?;
+    let (payload, returned) = receive_checked(fd, 0, deadline, verify)?;
+    verify()?;
+    if !returned.is_empty() { return Err(ParseError::InvalidContent); }
+    duduclaw_isolation::worker::ParseResponse::decode_payload(&payload, request)
+        .map_err(|_| ParseError::InvalidContent)
+}
+
 /// nix's cmsgs() refuses iteration on MSG_CTRUNC, leaving received descriptors
 /// unowned. Use recvmsg here so even a truncated ancillary set is closed first.
 #[allow(unsafe_code)]

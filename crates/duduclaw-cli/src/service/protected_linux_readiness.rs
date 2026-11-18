@@ -1132,10 +1132,16 @@ pub(super) fn check(composite: &mut impl CompositeReadiness) -> Result<()> {
 /// Only a fresh gateway view that says ready keeps the "employees can run"
 /// sentence (or the migration-pending one); a not-ready or unavailable view
 /// is the same non-zero refusal as a failed check, with its own message.
+/// R8n-1: a view's unavailable helper tool families add one `[資訊]` line
+/// first; they never change the result.
 fn gateway_verdict(pending: bool, view: GatewayView) -> (Vec<String>, Result<()>) {
+    let tools = |view: &duduclaw_gateway::isolation_readiness::published::View|
+        gateway_view::tools_unavailable_line(view).into_iter();
     match view {
-        GatewayView::Ready => (vec![(if pending { Reason::MIGRATION_PENDING_MESSAGE } else { MSG_READY }).to_owned()], Ok(())),
-        GatewayView::NotReady(view) => (vec![gateway_view::not_ready_line(&view)], Err(refused(MSG_GATEWAY_NOT_READY))),
+        GatewayView::Ready(view) => (tools(&view).chain([(if pending { Reason::MIGRATION_PENDING_MESSAGE } else { MSG_READY })
+            .to_owned()]).collect(), Ok(())),
+        GatewayView::NotReady(view) => (tools(&view).chain([gateway_view::not_ready_line(&view)]).collect(),
+            Err(refused(MSG_GATEWAY_NOT_READY))),
         GatewayView::Unavailable => (vec![MSG_GATEWAY_UNAVAILABLE_INFO.to_owned()], Err(refused(MSG_GATEWAY_UNCONFIRMED))),
     }
 }

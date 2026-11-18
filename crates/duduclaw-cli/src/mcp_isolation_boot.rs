@@ -19,9 +19,26 @@ impl DispatcherFactory for CliDispatcherFactory {
     fn verify_producers(&self, execution: &dyn duduclaw_mcp_boundary::execution::ExecutionPlanFactory,
         worker: &dyn duduclaw_mcp_boundary::worker_execution::WorkerPlanFactory,
         connectors: &dyn BoundConnectorExecutor, selection: &dyn LiveConnectorSelectionPolicy) -> Result<(), VerificationError> {
+        match self.unprovided_tool(execution, worker, connectors, selection) {
+            None => Ok(()),
+            Some(_) => Err(VerificationError::Unavailable),
+        }
+    }
+
+    /// The one producer walk behind `verify_producers`: the first tool without
+    /// an installed producer, or `None` when every routed tool has one.
+    fn unprovided_tool(&self, execution: &dyn duduclaw_mcp_boundary::execution::ExecutionPlanFactory,
+        worker: &dyn duduclaw_mcp_boundary::worker_execution::WorkerPlanFactory,
+        connectors: &dyn BoundConnectorExecutor, selection: &dyn LiveConnectorSelectionPolicy) -> Option<&'static str> {
         use crate::mcp_isolation::BoundaryRoute;
         for tool in crate::mcp::tools() {
             if crate::mcp_isolation_disposition::intentional_refusal(tool.name).is_some() { continue; }
+            // R8n-1 1.4: a helper family this host does not offer is refused
+            // (`Refusal::NotProvidedOnHost`), so it needs no producer; an
+            // offered one still needs `execution.supports` below.
+            if duduclaw_mcp_boundary::fork_policy::HELPER_TOOLS.contains(&tool.name) && !execution.offers(tool.name) {
+                continue;
+            }
             let ready = match crate::mcp_isolation::boundary_route(tool.name) {
                 Some(BoundaryRoute::File) => true,
                 Some(BoundaryRoute::GatewayHandler(_)) => true,
@@ -33,13 +50,16 @@ impl DispatcherFactory for CliDispatcherFactory {
                     }
                 },
                 Some(BoundaryRoute::Execution) => execution.supports(tool.name),
-                Some(BoundaryRoute::Worker) => worker.supports(tool.name),
+                // R8n-2 B2: "a producer is installed", not "usable for an
+                // employee now": the boot factory has no employee. The
+                // per-launch `require_complete_services` keeps "usable now".
+                Some(BoundaryRoute::Worker) => worker.provides(tool.name),
                 // Unknown/new routes require an explicit product adapter.
                 _ => false,
             };
-            if !ready { return Err(VerificationError::Unavailable); }
+            if !ready { return Some(tool.name); }
         }
-        Ok(())
+        None
     }
 
     fn ingress_tools(&self, home: &std::path::Path, agent: &str, lane: duduclaw_isolation::capability::Lane)

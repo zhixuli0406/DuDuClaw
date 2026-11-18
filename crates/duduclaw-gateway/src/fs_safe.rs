@@ -178,6 +178,148 @@ mod imp {
         fd: OwnedFd,
     }
 
+    /// Access mode for a directory the gateway only traverses (an ancestor of
+    /// the directory it actually uses). Linux: `O_PATH` needs only search
+    /// (`x`) permission, so the installed layout's root-owned 0711 parent of
+    /// the gateway home (`/var/lib/duduclaw`, traversable but not readable by
+    /// the gateway account) can be walked. Other Unix targets have no
+    /// `O_PATH` and keep `O_RDONLY`; the installed 0711 layout exists only on
+    /// Linux.
+    fn search_access() -> OFlag {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        { OFlag::O_PATH }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        { OFlag::O_RDONLY }
+    }
+
+    fn stat_at(fd: &OwnedFd, name: &str) -> io::Result<Option<FileStat>> {
+        match fstatat(Some(fd.as_raw_fd()), name, nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW) {
+            Ok(st) => Ok(Some(st)),
+            Err(Errno::ENOENT) => Ok(None),
+            Err(e) => Err(to_io(e)),
+        }
+    }
+
+    /// The lstat-at verdict on an existing entry that must be a real directory.
+    fn require_real_directory(name: &str, st: &FileStat) -> io::Result<()> {
+        if kind(st) == SFlag::S_IFLNK {
+            return Err(refused(format!("{name} is a symlink — refusing to follow it")));
+        }
+        if kind(st) != SFlag::S_IFDIR {
+            return Err(refused(format!("{name} is not a directory")));
+        }
+        Ok(())
+    }
+
+    /// `openat(parent, name, access|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC)`.
+    fn open_dir_at(parent: &OwnedFd, name: &str, access: OFlag) -> io::Result<OwnedFd> {
+        let raw = openat(
+            Some(parent.as_raw_fd()),
+            name,
+            access | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| match e {
+            Errno::ELOOP | Errno::ENOTDIR => refused(format!(
+                "{name} is not a real directory — refusing to follow it"
+            )),
+            other => to_io(other),
+        })?;
+        // SAFETY: freshly returned fd, owned by nobody else.
+        Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+    }
+
+    /// A directory opened only to be traversed ([`search_access`]): on Linux
+    /// an `O_PATH` descriptor. The only operations on it are `fstat`
+    /// ([`Self::metadata`], statx/fstat on the descriptor), `fstatat` and
+    /// `openat` relative to it, and `openat(fd, ".")` ([`Self::reopen_read`]);
+    /// all are valid on an `O_PATH` descriptor. It deliberately has no
+    /// listing, creation, `fsync`, `fchmod` or locking: those need a real open
+    /// ([`SafeDir`]), which [`Self::child_dir`] / [`Self::reopen_read`] give
+    /// for the directory actually used.
+    pub(crate) struct SearchDir {
+        fd: OwnedFd,
+    }
+
+    impl SearchDir {
+        /// `/`, search-only.
+        pub(crate) fn root() -> io::Result<Self> {
+            let raw = openat(
+                None,
+                Path::new("/"),
+                search_access() | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(to_io)?;
+            // SAFETY: freshly returned fd, owned by nobody else.
+            let dir = Self { fd: unsafe { OwnedFd::from_raw_fd(raw) } };
+            dir.require_directory()?;
+            Ok(dir)
+        }
+
+        /// `fstat` of the opened descriptor (never a pathname).
+        pub(crate) fn metadata(&self) -> io::Result<std::fs::Metadata> {
+            std::fs::File::from(self.fd.try_clone()?).metadata()
+        }
+
+        // `O_PATH|O_NOFOLLOW` would hand back a descriptor for a symlink
+        // itself (O_DIRECTORY refuses that with ENOTDIR); re-check the type
+        // on the descriptor anyway, after the lstat-at check before the open.
+        fn require_directory(&self) -> io::Result<()> {
+            if !self.metadata()?.is_dir() {
+                return Err(refused("traversed component is not a directory"));
+            }
+            Ok(())
+        }
+
+        /// Child directory `name`, search-only, never following a symlink.
+        /// `Ok(None)` when absent (never created).
+        pub(crate) fn child_search(&self, name: &str) -> io::Result<Option<SearchDir>> {
+            check_name(name)?;
+            match stat_at(&self.fd, name)? {
+                None => return Ok(None),
+                Some(st) => require_real_directory(name, &st)?,
+            }
+            let dir = SearchDir { fd: open_dir_at(&self.fd, name, search_access())? };
+            dir.require_directory()?;
+            Ok(Some(dir))
+        }
+
+        /// Child directory `name` opened for use (`O_RDONLY`, as
+        /// [`SafeDir::child_dir`]), never following a symlink. `Ok(None)`
+        /// when absent (never created).
+        pub(crate) fn child_dir(&self, name: &str) -> io::Result<Option<SafeDir>> {
+            check_name(name)?;
+            match stat_at(&self.fd, name)? {
+                None => return Ok(None),
+                Some(st) => require_real_directory(name, &st)?,
+            }
+            Ok(Some(SafeDir { fd: open_dir_at(&self.fd, name, OFlag::O_RDONLY)? }))
+        }
+
+        /// This same directory opened for use, through its own descriptor
+        /// (`openat(fd, ".")`, never by name). Needs read permission on it,
+        /// e.g. to create a missing child inside the gateway's own tree.
+        pub(crate) fn reopen_read(&self) -> io::Result<SafeDir> {
+            let raw = openat(
+                Some(self.fd.as_raw_fd()),
+                ".",
+                OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(to_io)?;
+            // SAFETY: freshly returned fd, owned by nobody else.
+            Ok(SafeDir { fd: unsafe { OwnedFd::from_raw_fd(raw) } })
+        }
+    }
+
+    impl From<SafeDir> for SearchDir {
+        // A read descriptor supports every SearchDir operation.
+        fn from(dir: SafeDir) -> Self {
+            Self { fd: dir.fd }
+        }
+    }
+
     #[cfg(target_os = "macos")]
     fn macos_system_path(path: &Path) -> io::Result<std::borrow::Cow<'_, Path>> {
         use std::os::unix::fs::MetadataExt;
@@ -213,6 +355,11 @@ mod imp {
 
         /// Walk from the filesystem root without resolving any symlink. Unlike
         /// open_root, this is for paths whose parent components are untrusted.
+        /// Every component above the target is opened search-only
+        /// ([`SearchDir`]: the gateway may traverse, not read, the installed
+        /// root-owned 0711 parent of its home); the target itself is opened
+        /// for use. With `create`, a missing component is made through a read
+        /// reopen of its parent (mkdirat + fsync need a real open).
         pub(crate) fn open_nofollow(path: &Path, create: bool) -> io::Result<Self> {
             use std::path::Component;
             let absolute = if path.is_absolute() { path.to_owned() } else { std::env::current_dir()?.join(path) };
@@ -220,18 +367,35 @@ mod imp {
             // entire suffix still use O_NOFOLLOW, never untrusted symlinks.
             #[cfg(target_os = "macos")]
             let absolute = macos_system_path(&absolute)?;
-            let mut dir = Self::open_root(Path::new("/"))?;
+            let mut names = Vec::new();
             for component in absolute.components() {
                 match component {
                     Component::RootDir => {}
                     Component::Normal(name) => {
-                        let name = name.to_str().ok_or_else(|| refused("non-UTF-8 directory"))?;
-                        dir = dir.child_dir(name, create)?.ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+                        names.push(name.to_str().ok_or_else(|| refused("non-UTF-8 directory"))?);
                     }
                     _ => return Err(refused("invalid directory component")),
                 }
             }
-            Ok(dir)
+            let not_found = || io::Error::from(io::ErrorKind::NotFound);
+            let Some((last, ancestors)) = names.split_last() else {
+                return Self::open_root(Path::new("/"));
+            };
+            let mut dir = SearchDir::root()?;
+            for name in ancestors {
+                dir = match dir.child_search(name)? {
+                    Some(next) => next,
+                    None if create => SearchDir::from(
+                        dir.reopen_read()?.child_dir(name, true)?.ok_or_else(not_found)?,
+                    ),
+                    None => return Err(not_found()),
+                };
+            }
+            match dir.child_dir(last)? {
+                Some(leaf) => Ok(leaf),
+                None if create => dir.reopen_read()?.child_dir(last, true)?.ok_or_else(not_found),
+                None => Err(not_found()),
+            }
         }
 
         pub(crate) fn metadata(&self) -> io::Result<std::fs::Metadata> {
@@ -247,15 +411,7 @@ mod imp {
         }
 
         fn stat(&self, name: &str) -> io::Result<Option<FileStat>> {
-            match fstatat(
-                Some(self.fd.as_raw_fd()),
-                name,
-                nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
-            ) {
-                Ok(st) => Ok(Some(st)),
-                Err(Errno::ENOENT) => Ok(None),
-                Err(e) => Err(to_io(e)),
-            }
+            stat_at(&self.fd, name)
         }
 
         /// What `name` is, without following it. `Ok(None)` when absent.
@@ -281,32 +437,11 @@ mod imp {
                     Err(e) => return Err(to_io(e)),
                 },
                 None => return Ok(None),
-                Some(st) if kind(&st) == SFlag::S_IFLNK => {
-                    return Err(refused(format!(
-                        "{name} is a symlink — refusing to follow it"
-                    )));
-                }
-                Some(st) if kind(&st) != SFlag::S_IFDIR => {
-                    return Err(refused(format!("{name} is not a directory")));
-                }
-                Some(_) => {}
+                Some(st) => require_real_directory(name, &st)?,
             }
-            let raw = openat(
-                Some(self.fd.as_raw_fd()),
-                name,
-                OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
-                Mode::empty(),
-            )
-            .map_err(|e| match e {
-                Errno::ELOOP | Errno::ENOTDIR => refused(format!(
-                    "{name} is not a real directory — refusing to follow it"
-                )),
-                other => to_io(other),
-            })?;
-            // SAFETY: freshly returned fd, owned by nobody else.
-            Ok(Some(SafeDir {
-                fd: unsafe { OwnedFd::from_raw_fd(raw) },
-            }))
+            // Directories the gateway uses keep a real read open (listing,
+            // creating entries, fsync); only SearchDir ancestors are O_PATH.
+            Ok(Some(SafeDir { fd: open_dir_at(&self.fd, name, OFlag::O_RDONLY)? }))
         }
 
         /// Read regular file `name` as bytes, refusing one larger than
@@ -1440,6 +1575,8 @@ mod imp {
 }
 
 pub(crate) use imp::SafeDir;
+#[cfg(unix)]
+pub(crate) use imp::SearchDir;
 
 #[cfg(all(test, windows))]
 #[path = "fs_safe/windows_tests.rs"]

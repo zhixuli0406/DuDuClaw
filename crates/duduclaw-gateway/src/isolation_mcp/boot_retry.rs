@@ -96,7 +96,9 @@ pub(super) struct BootState {
 }
 
 /// R8m 30a: the logged missing list, `[Backend, ConnectorProviders(catalog_file_unsafe)]`:
-/// each producer's name with its fixed reason when it has one.
+/// each producer's name with its fixed reason when it has one. R8n-2: several
+/// fixed details of one producer are joined in order,
+/// `Initialization(producer_verification: skill_extract)`.
 pub(super) struct Listed<'a>(pub(super) &'a [MissingProducer], pub(super) &'a [Detail]);
 impl std::fmt::Display for Listed<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -104,7 +106,12 @@ impl std::fmt::Display for Listed<'_> {
         for (index, producer) in self.0.iter().enumerate() {
             if index > 0 { f.write_str(", ")?; }
             write!(f, "{producer:?}")?;
-            if let Some((_, reason)) = self.1.iter().find(|(named, _)| named == producer) { write!(f, "({reason})")?; }
+            let mut details = self.1.iter().filter(|(named, _)| named == producer).map(|(_, reason)| *reason);
+            if let Some(first) = details.next() {
+                write!(f, "({first}")?;
+                for more in details { write!(f, ": {more}")?; }
+                f.write_str(")")?;
+            }
         }
         f.write_str("]")
     }
@@ -148,7 +155,9 @@ pub(super) async fn step(boot: &mut impl BootAttempt, state: &BootState, started
         Err(failure) if failure.is_closed() => Step::Stop,
         Err(Failure { missing, retry, reasons }) => {
             if state.failed(&missing, &reasons) {
-                if matches!(missing.as_slice(), [MissingProducer::Initialization]) {
+                // R8n-2 B4: an Initialization failure with a fixed reason
+                // (e.g. producer_verification) names it in the list line.
+                if matches!(missing.as_slice(), [MissingProducer::Initialization]) && reasons.is_empty() {
                     tracing::error!("隔離工具服務初始化未通過，團隊執行維持暫停。");
                 } else {
                     tracing::error!(missing = %Listed(&missing, &reasons), "隔離工具服務尚缺可信任的啟動資料，團隊執行維持暫停。");
@@ -495,10 +504,17 @@ mod tests {
     fn boot_missing_list_shows_fixed_reasons() {
         let missing = [MissingProducer::Backend, MissingProducer::ExecutionPlans, MissingProducer::ConnectorProviders];
         let reasons = [(MissingProducer::ConnectorProviders, "catalog_home_unsafe"),
-            (MissingProducer::ExecutionPlans, "no_helper_runtime_in_policy"), (MissingProducer::MainPlans, "unused")];
+            (MissingProducer::ExecutionPlans, "invalid_helper_runtime"), (MissingProducer::MainPlans, "unused")];
         assert_eq!(Listed(&missing, &reasons).to_string(),
-            "[Backend, ExecutionPlans(no_helper_runtime_in_policy), ConnectorProviders(catalog_home_unsafe)]");
+            "[Backend, ExecutionPlans(invalid_helper_runtime), ConnectorProviders(catalog_home_unsafe)]");
         assert_eq!(Listed(&missing, &[]).to_string(), "[Backend, ExecutionPlans, ConnectorProviders]");
+        // R8n-2 B4: the precheck's reason and its first unprovided tool.
+        let initialization = [MissingProducer::Initialization];
+        assert_eq!(Listed(&initialization, &[(MissingProducer::Initialization, "producer_verification"),
+            (MissingProducer::Initialization, "skill_extract")]).to_string(),
+            "[Initialization(producer_verification: skill_extract)]");
+        assert_eq!(Listed(&initialization, &[(MissingProducer::Initialization, "producer_verification")]).to_string(),
+            "[Initialization(producer_verification)]");
     }
 
     /// Review round 1: spawnd not reachable at first, then reachable. The

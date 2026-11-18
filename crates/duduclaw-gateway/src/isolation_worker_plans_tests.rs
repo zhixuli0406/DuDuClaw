@@ -50,6 +50,51 @@ fn i1c_web_rejects_unknown_arguments_and_bad_formats_before_fetch() {
     assert!(GatewayWorkerPlans::new(PathBuf::from("relative")).is_err());
 }
 
+/// R8n-2 B5: one table drives both answers. At boot (no employee) all seven
+/// producers are provided; the four skill tools are usable only once their
+/// employee (and, for skill_extract, roots) requirement is met.
+#[test]
+fn r8n2_provides_is_employee_independent_and_supports_follows_the_same_table() {
+    const ALWAYS: [&str; 3] = ["web_extract", "transcribe_audio", "synthesize_speech"];
+    const EMPLOYEE: [&str; 3] = ["skill_security_scan", "shared_skill_adopt", "skill_graduate"];
+    let boot = GatewayWorkerPlans::new(plans_home()).unwrap();
+    let employee = GatewayWorkerPlans::for_employee(plans_home(), "alice".into(), EmployeeId([2; 16])).unwrap();
+    let rooted = GatewayWorkerPlans::for_employee(plans_home(), "alice".into(), EmployeeId([2; 16])).unwrap()
+        .with_roots(Arc::new(duduclaw_mcp_boundary::resources::ResourceRoots::default()));
+    for tool in ALWAYS.into_iter().chain(EMPLOYEE).chain(["skill_extract"]) {
+        for factory in [&boot, &employee, &rooted] { assert!(factory.provides(tool), "{tool}"); }
+        assert!(rooted.supports(tool), "{tool}");
+    }
+    for tool in ALWAYS { assert!(boot.supports(tool) && employee.supports(tool), "{tool}"); }
+    for tool in EMPLOYEE { assert!(!boot.supports(tool) && employee.supports(tool), "{tool}"); }
+    assert!(!boot.supports("skill_extract"));
+    assert!(!employee.supports("skill_extract"), "an employee without roots cannot extract");
+    for tool in ["web_extract_extra", "skill_hub_install", "execute_program", ""] {
+        for factory in [&boot, &employee, &rooted] {
+            assert!(!factory.provides(tool) && !factory.supports(tool), "{tool}");
+        }
+    }
+    assert_eq!(plan_requirement("skill_extract"), Some(PlanRequirement::NeedsEmployeeAndRoots));
+}
+
+/// R8n-2 B5: the per-launch composite (boot factory first, then the
+/// employee's defaults) provides what any member provides, and is usable
+/// only where some member is usable now.
+#[test]
+fn r8n2_composite_provides_any_member_and_supports_only_usable_members() {
+    use duduclaw_mcp_boundary::worker_execution::CompositeWorkerPlans;
+    let boot: Arc<dyn WorkerPlanFactory> = Arc::new(GatewayWorkerPlans::new(plans_home()).unwrap());
+    let employee: Arc<dyn WorkerPlanFactory> = Arc::new(
+        GatewayWorkerPlans::for_employee(plans_home(), "alice".into(), EmployeeId([2; 16])).unwrap());
+    let only_boot = CompositeWorkerPlans::new(vec![boot.clone()]).unwrap();
+    assert!(only_boot.provides("skill_graduate") && !only_boot.supports("skill_graduate"));
+    let launch = CompositeWorkerPlans::new(vec![boot, employee]).unwrap();
+    assert!(launch.provides("skill_graduate") && launch.supports("skill_graduate"));
+    // No roots in either member: provided, still refused for this launch.
+    assert!(launch.provides("skill_extract") && !launch.supports("skill_extract"));
+    assert!(!launch.provides("skill_hub_install") && !launch.supports("skill_hub_install"));
+}
+
 #[test]
 fn i1c_web_result_preserves_metadata_and_treats_parser_text_as_data() {
     let state = json!({"url":"https://example.com/page","selector":"p","cached":true});

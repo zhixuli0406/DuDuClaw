@@ -452,6 +452,18 @@ fn check_policy(bytes: &[u8], manifest: &ReleaseManifest, arch: Arch, bind_polic
             RootPolicy::from_verified_publication (pinned_version non-empty and not latest/*, at most 128 fixed_args \
             without NUL, executable entry of [A-Za-z0-9._-])"))?;
     }
+    // R8n-1 review F1: one signed record per in-run helper kind. spawnd's
+    // launcher rule refuses duplicate kinds, the gateway's entitlement leaves
+    // an ambiguous kind out and its plan construction refuses the helper set.
+    let mut helper_kinds = Vec::new();
+    for (index, record) in policy.runtimes.iter().enumerate() {
+        if !crate::helper_policy::is_helper_kind(&record.runtime) { continue; }
+        if helper_kinds.contains(&&record.runtime) {
+            return Err(format!("{}: the helper kind is signed twice (rule: at most one record per in-run helper kind; \
+                the gateway refuses the whole helper set as invalid_helper_runtime)", describe(index, record)));
+        }
+        helper_kinds.push(&record.runtime);
+    }
     validate_runtime_artifacts(&policy, manifest).map_err(|_| "installed::validate_runtime_artifacts refused it: every ELF \
         entry must be a manifest artifact's generation name with the same sha256 and mode 0755; open_ai_compat runs \
         runtime-api-worker-v1; codex/grok run runtime-native-adapter-v1 with vendor_digest = the runtime-vendor-codex/-grok \

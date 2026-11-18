@@ -22,6 +22,12 @@ pub trait DispatcherFactory: Send + Sync {
     fn verify_producers(&self, _execution: &dyn ExecutionPlanFactory, _worker: &dyn WorkerPlanFactory,
         _connectors: &dyn BoundConnectorExecutor, _selection: &dyn LiveConnectorSelectionPolicy)
         -> Result<(), VerificationError> { Err(VerificationError::Unavailable) }
+    /// R8n-2 B4: diagnostics only, never a readiness decision (that is
+    /// `verify_producers`, which fails closed by default): the first tool, by
+    /// its fixed tool-table name, that `verify_producers` finds unprovided.
+    fn unprovided_tool(&self, _execution: &dyn ExecutionPlanFactory, _worker: &dyn WorkerPlanFactory,
+        _connectors: &dyn BoundConnectorExecutor, _selection: &dyn LiveConnectorSelectionPolicy)
+        -> Option<&'static str> { None }
     /// Snapshot the real product catalog under the employee's current policy.
     /// Completeness is still checked independently when creating a dispatcher.
     fn ingress_tools(&self, _home: &Path, _agent: &str, _lane: duduclaw_isolation::capability::Lane)
@@ -409,20 +415,38 @@ fn install_and_publish(home: &Path, users: Arc<duduclaw_auth::UserDb>, sources: 
     // Side-effect-free checks of `assemble` first: a failure here is
     // retried. `assemble` itself installs process-wide producers, so a
     // failure there stays final (as before).
-    if precheck(home, sources).is_err() {
+    if let Err(reasons) = precheck(home, sources) {
         derived.forget(sources);
-        return Err(retry::Failure { missing: vec![MissingProducer::Initialization], retry: true, reasons: Vec::new() });
+        return Err(retry::Failure { missing: vec![MissingProducer::Initialization], retry: true, reasons });
     }
     let final_failure = || retry::Failure { missing: vec![MissingProducer::Initialization], retry: false, reasons: Vec::new() };
     let owner = assemble(home, backend.ok_or_else(final_failure)?, std::mem::take(sources))
         .map_err(|_| final_failure())?;
+    let generation = owner.generation;
     OWNER.set(Arc::new(owner)).map_err(|_| final_failure())?;
     STATE.constructed();
-    if crate::isolation_readiness::install_integration_probe(
-        crate::isolation_readiness::IntegrationComponent::McpBoundary, Arc::new(BoundaryReadiness)).is_err() {
-        tracing::error!("隔離工具服務的狀態檢查無法註冊，團隊執行維持暫停。");
-    }
+    install_probes(crate::isolation_readiness::install_integration_probe);
+    // R8n-1 review F2: the probes read only what this one observer stores.
+    probes::start_observer(generation, shutdown_begun);
     Ok(())
+}
+
+/// The three integration probes of the assembled owner (R8n-1: ParseWorker
+/// and RuntimeAdapters beside the McpBoundary one). A probe that cannot be
+/// registered leaves its component `PendingIntegration` (never ready).
+fn install_probes(mut install: impl FnMut(crate::isolation_readiness::IntegrationComponent,
+    Arc<dyn crate::isolation_readiness::IntegrationProbe>) -> Result<(), crate::isolation_readiness::ProbeError>) {
+    use crate::isolation_readiness::IntegrationComponent;
+    let probes: [(IntegrationComponent, Arc<dyn crate::isolation_readiness::IntegrationProbe>); 3] = [
+        (IntegrationComponent::McpBoundary, Arc::new(BoundaryReadiness)),
+        (IntegrationComponent::ParseWorker, Arc::new(probes::ParseWorkerReadiness::default())),
+        (IntegrationComponent::RuntimeAdapters, Arc::new(probes::RuntimeAdapterReadiness::default())),
+    ];
+    for (component, probe) in probes {
+        if install(component, probe).is_err() {
+            tracing::error!(?component, "隔離服務的狀態檢查無法註冊，團隊執行維持暫停。");
+        }
+    }
 }
 
 /// The inputs [`install_connector_stack`] needs before it builds anything.
@@ -431,16 +455,36 @@ fn connector_stack_inputs(sources: &BootSources) -> bool {
         && sources.product_authority.is_some()
 }
 
+/// R8n-2 B4: the fixed reason of a failed boot-time producer verification.
+const PRODUCER_VERIFICATION: &str = "producer_verification";
+
 /// The checks `assemble` makes before its first process-wide installation.
-fn precheck(home: &Path, sources: &BootSources) -> Result<(), VerificationError> {
+/// A refusal answers its fixed `Initialization` reasons (possibly none).
+fn precheck(home: &Path, sources: &BootSources) -> Result<(), Vec<retry::Detail>> {
     if !home.is_absolute() || sources.connector_catalog.is_none() || sources.installed_generation.is_none() {
-        return Err(VerificationError::Unavailable);
+        return Err(Vec::new());
     }
-    DISPATCHER.get().ok_or(VerificationError::Unavailable)?.verify_producers(
-        sources.execution_plans.as_deref().ok_or(VerificationError::Unavailable)?,
-        sources.worker_plans.as_deref().ok_or(VerificationError::Unavailable)?,
-        sources.connectors.as_deref().ok_or(VerificationError::Unavailable)?,
-        sources.connector_selection.as_deref().ok_or(VerificationError::Unavailable)?)
+    let (Some(dispatcher), Some(execution), Some(worker), Some(connectors), Some(selection)) = (DISPATCHER.get(),
+        sources.execution_plans.as_deref(), sources.worker_plans.as_deref(), sources.connectors.as_deref(),
+        sources.connector_selection.as_deref()) else { return Err(Vec::new()) };
+    verify_producers_with_reason(&**dispatcher, execution, worker, connectors, selection)
+}
+
+/// `verify_producers` decides; only on its refusal is `unprovided_tool` asked,
+/// for the log line. The reasons are `Initialization(producer_verification)`
+/// plus, when the adapter names one, the first unprovided tool's fixed name
+/// (`Initialization(producer_verification: skill_extract)` in the log). The
+/// published view carries producer names only (`initialization`).
+fn verify_producers_with_reason(dispatcher: &dyn DispatcherFactory, execution: &dyn ExecutionPlanFactory,
+    worker: &dyn WorkerPlanFactory, connectors: &dyn BoundConnectorExecutor,
+    selection: &dyn LiveConnectorSelectionPolicy) -> Result<(), Vec<retry::Detail>> {
+    dispatcher.verify_producers(execution, worker, connectors, selection).map_err(|_| {
+        let mut reasons = vec![(MissingProducer::Initialization, PRODUCER_VERIFICATION)];
+        if let Some(tool) = dispatcher.unprovided_tool(execution, worker, connectors, selection) {
+            reasons.push((MissingProducer::Initialization, tool));
+        }
+        reasons
+    })
 }
 
 /// F1 step 1 (before the producer check): the per-employee stack over the
@@ -494,7 +538,7 @@ fn fixed_reasons() -> Vec<&'static str> {
         .map(|failure| failure.reason()).collect();
     all.extend(crate::isolation_execution::PlansFailure::ALL.iter().map(|failure| failure.reason()));
     all.extend(["home_binding_unavailable", "lifecycle_unavailable", "connector_stack_unavailable",
-        "credential_vault_unavailable"]);
+        "credential_vault_unavailable", PRODUCER_VERIFICATION]);
     all
 }
 
@@ -543,11 +587,23 @@ fn effective_status(status: Option<BootStatus>, owner_healthy: bool) -> BootStat
 /// A's v1.80 producer hook excludes exactly the documented fork mutations.
 /// Recheck the installed helpers on every observation; source presence alone
 /// does not override missing/replaced signed runtime publications.
+/// R8n-1: only the helper families this host offers (fixed at assembly from
+/// the signed policy) need their producer; the three fork readers always do.
+/// With no helper offered this is the healthy owner plus the fork readers;
+/// the main runtimes are attested by the RuntimeAdapters probe (`probes`).
 pub fn a_producers_ready() -> bool {
     OWNER.get().is_some_and(|owner| owner.boundary.healthy()
         && duduclaw_mcp_boundary::fork_policy::remaining_producers_ready(
+            |name| owner.execution_plans.offers(name),
             |name| owner.execution_plans.supports(name),
             |name| owner.fork_tools.supports(name)))
+}
+
+/// R8n-1 1.6: the fixed names of the helper families the assembled tool
+/// service does not offer; empty until the assembly succeeded.
+pub fn tools_unavailable() -> Vec<&'static str> {
+    OWNER.get().map(|owner| crate::isolation_execution::HelperFamilies::from_offers(
+        |name| owner.execution_plans.offers(name)).unavailable()).unwrap_or_default()
 }
 
 pub struct LaunchInput {
@@ -986,6 +1042,10 @@ pub async fn prepare_launch(mut input: LaunchInput) -> Result<Arc<dyn duduclaw_e
 #[path = "boot_retry.rs"]
 mod retry;
 
+/// R8n-1: the ParseWorker and RuntimeAdapters integration probes.
+#[path = "boot_probes.rs"]
+mod probes;
+
 #[cfg(test)]
 #[path = "authorization_tests.rs"]
 mod authorization_tests;
@@ -1136,7 +1196,84 @@ mod tests {
                 && reason.bytes().all(|byte| byte.is_ascii_lowercase() || byte == b'_'), "{reason}");
         }
         assert!(fixed_reasons().contains(&"catalog_home_unsafe"));
-        assert!(fixed_reasons().contains(&"no_helper_runtime_in_policy"));
+        assert!(fixed_reasons().contains(&"invalid_helper_runtime"));
+        // R8n-1: a policy without helper runtimes is no longer a missing producer.
+        assert!(!fixed_reasons().contains(&"no_helper_runtime_in_policy"));
+    }
+
+    /// R8n-1 2.4: the assembly installs exactly the three integration probes
+    /// (McpBoundary, ParseWorker, RuntimeAdapters), and does so inside
+    /// `install_and_publish` (the shutdown-gate permit), after the owner is set.
+    #[test]
+    fn r8n_assembly_installs_the_three_integration_probes() {
+        use crate::isolation_readiness::IntegrationComponent;
+        let mut installed = Vec::new();
+        install_probes(|component, _| { installed.push(component); Ok(()) });
+        assert_eq!(installed, [IntegrationComponent::McpBoundary, IntegrationComponent::ParseWorker,
+            IntegrationComponent::RuntimeAdapters]);
+        // A refused registration is logged, never retried as "ready".
+        install_probes(|_, _| Err(crate::isolation_readiness::ProbeError::AlreadyInstalled));
+        let source = include_str!("boot.rs");
+        let publish = source.split("fn install_and_publish(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        let owner_set = publish.find("OWNER.set(").unwrap();
+        let probes = publish.find("install_probes(crate::isolation_readiness::install_integration_probe)").unwrap();
+        assert!(owner_set < probes, "probes are installed after the owner exists");
+    }
+
+    /// R8n-2 B4: a refused boot producer verification publishes its fixed
+    /// reason (and the adapter's first unprovided tool) instead of an empty
+    /// `Initialization`; a passing one answers no reason; the decision is
+    /// always `verify_producers` (fail closed by default).
+    #[test]
+    fn r8n2_precheck_refusal_names_producer_verification_and_the_first_unprovided_tool() {
+        use duduclaw_mcp_boundary::{execution::{AuthorizedExecutionPlan, PolicyFuture}, tool_policy::AuthorizedToolCall};
+        struct NoPlans;
+        impl ExecutionPlanFactory for NoPlans {
+            fn supports(&self, _: &str) -> bool { false }
+            fn authorize_handler<'a>(&'a self, _: &'a AuthorizedToolCall) -> PolicyFuture<'a, ()> {
+                Box::pin(async { Err(VerificationError::Unavailable) })
+            }
+            fn prepare<'a>(&'a self, _: &'a AuthorizedToolCall, _: duduclaw_isolation::execution::RunHandle)
+                -> PolicyFuture<'a, AuthorizedExecutionPlan> { Box::pin(async { Err(VerificationError::Unavailable) }) }
+        }
+        /// `None`: only the trait defaults (refuses, names nothing).
+        /// `Some(None)`: passes. `Some(Some(tool))`: refuses naming `tool`.
+        struct Adapter(Option<Option<&'static str>>);
+        impl DispatcherFactory for Adapter {
+            fn create(&self, _: DispatcherInput) -> Result<Arc<dyn Dispatcher>, VerificationError> {
+                Err(VerificationError::Unavailable)
+            }
+            fn verify_producers(&self, _: &dyn ExecutionPlanFactory, _: &dyn WorkerPlanFactory,
+                _: &dyn BoundConnectorExecutor, _: &dyn LiveConnectorSelectionPolicy) -> Result<(), VerificationError> {
+                match self.0 { Some(None) => Ok(()), _ => Err(VerificationError::Unavailable) }
+            }
+            fn unprovided_tool(&self, _: &dyn ExecutionPlanFactory, _: &dyn WorkerPlanFactory,
+                _: &dyn BoundConnectorExecutor, _: &dyn LiveConnectorSelectionPolicy) -> Option<&'static str> {
+                self.0.flatten()
+            }
+        }
+        struct Defaults;
+        impl DispatcherFactory for Defaults {
+            fn create(&self, _: DispatcherInput) -> Result<Arc<dyn Dispatcher>, VerificationError> {
+                Err(VerificationError::Unavailable)
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        let worker = crate::isolation_worker_plans::GatewayWorkerPlans::new(home.path().to_owned()).unwrap();
+        let registry = crate::isolation_connector_registry::ConnectorProviderRegistry::default();
+        let check = |adapter: &dyn DispatcherFactory| verify_producers_with_reason(adapter, &NoPlans, &worker,
+            &registry, &registry);
+        let init = MissingProducer::Initialization;
+        assert_eq!(check(&Defaults), Err(vec![(init, "producer_verification")]));
+        assert_eq!(check(&Adapter(None)), Err(vec![(init, "producer_verification")]));
+        assert_eq!(check(&Adapter(Some(Some("skill_extract")))),
+            Err(vec![(init, "producer_verification"), (init, "skill_extract")]));
+        assert_eq!(check(&Adapter(Some(None))), Ok(()));
+        assert_eq!(retry::Listed(&[init], &check(&Adapter(Some(Some("skill_extract")))).unwrap_err()).to_string(),
+            "[Initialization(producer_verification: skill_extract)]");
+        // The published view stays producer names only (the strict reader is unchanged).
+        assert_eq!(init.name(), "initialization");
+        assert!(fixed_reasons().contains(&PRODUCER_VERIFICATION));
     }
 
     /// The readiness reads `boot_status`: not constructed (closed reasons)

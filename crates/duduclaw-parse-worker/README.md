@@ -148,10 +148,17 @@ Linux VM; it has not been run on macOS.
 through `install_launcher`. Protected gateway installation requires
 `supports_live_authority()`, and protected calls use `exchange_checked`; its
 default implementation refuses rather than invoking a legacy unchecked session.
-The fixed socket session rechecks the retained caller authority after poll and
-immediately before sending or receiving descriptors. Silent peers are polled in
-at most 50 ms intervals so revocation also ends blocked transport waits. Legacy
-unprotected calls retain their original exchange API.
+Both launchers support live authority: `RetiringLauncher` (the production
+launcher the protected gateway boot installs, with host-wide retirement) and the
+fixed `SocketActivatedLauncher`. Their sessions run one shared checked sequence
+(`transport::exchange_checked`): the retained caller authority is rechecked after
+each poll and immediately before sending or receiving descriptors, and once more
+after the reply is received and before it is decoded; any failed check returns an
+error and no reply. A retiring session is exchanged at most once, and every
+failure of its checked exchange (including a revoked check) closes the worker
+socket and hands the unit to the same lease-holding retirement as Drop. Silent
+peers are polled in at most 50 ms intervals so revocation also ends blocked
+transport waits. Legacy unprotected calls retain their original exchange API.
 
 The default fixed socket launcher has process-local admission and failure
 quarantine, but does not provide host-wide cancellation receipts. Closing a

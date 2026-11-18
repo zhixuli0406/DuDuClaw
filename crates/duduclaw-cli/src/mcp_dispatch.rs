@@ -954,7 +954,7 @@ impl McpDispatcher {
         // before any denial audit or injection scanner can persist caller input.
         let denial: Option<(Value, &str, String, Option<String>)> = async {
             if isolation_denied {
-                let message = match crate::mcp_isolation_disposition::intentional_refusal(tool_name) {
+                let message = match crate::mcp_isolation::host_refusal(tool_name) {
                     Some(reason) => crate::mcp_isolation::refusal_message(&self.home_dir, reason).await,
                     None => "隔離執行不允許此工具或參數，或所需服務尚未就緒。",
                 }.to_owned();

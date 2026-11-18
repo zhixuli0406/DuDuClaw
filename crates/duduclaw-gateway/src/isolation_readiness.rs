@@ -56,7 +56,9 @@ impl Components {
             self.runtime_adapters].into_iter().all(|state| state == ComponentState::Ready)
     }
 
-    fn current(host_was_verified: bool) -> Self {
+    fn current(host_was_verified: bool) -> Self { Self::current_with_reasons(host_was_verified).0 }
+
+    fn current_with_reasons(host_was_verified: bool) -> (Self, ComponentReasons) {
         let generation = current_generation();
         let mut integration = integration::current(generation);
         // A generation rotation during a probe cannot combine old adapters
@@ -65,16 +67,35 @@ impl Components {
         if current != generation { integration.invalidate(); }
         // Integration probes can consume B1's sub-second receipt lifetime.
         // Re-read at final admission instead of retaining an earlier bool.
-        let host = if host_was_verified && spawnd_verified() { ComponentState::Ready }
-            else { ComponentState::Unavailable };
-        Self { launch_service: host, sandbox: host, network: host, storage: host,
-            parse_worker: combined_worker_state(integration.parse_worker, parse_worker_state()),
-            update_service: if generation.is_some() && current == generation {
-                ComponentState::Ready
-            } else { ComponentState::Unavailable },
-            mcp_boundary: integration.mcp_boundary,
-            runtime_adapters: combined_worker_state(integration.runtime_adapters, runtime_adapters_state()) }
+        compose(host_was_verified && spawnd_verified(), generation.is_some() && current == generation,
+            integration, parse_worker_state(), runtime_adapters_state())
     }
+}
+
+/// R8n-1: the fixed reasons of the two probe-backed components (a refused
+/// ParseWorker / RuntimeAdapters probe), beside [`Components`]; published as
+/// `component(reason)` in the root CLI's view, and (review F3) in
+/// `system.status`'s separate `component_reasons` map ([`report`]). Never
+/// serialized in the component map, whose shape is unchanged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ComponentReasons {
+    pub parse_worker: Option<&'static str>,
+    pub runtime_adapters: Option<&'static str>,
+}
+
+/// The composite from its sources. An absent probe leaves its component
+/// `PendingIntegration` (never ready); missing producers make it unavailable.
+fn compose(host: bool, update: bool, integration: integration::States, parse_producers: ComponentState,
+    runtime_producers: ComponentState) -> (Components, ComponentReasons) {
+    let host = if host { ComponentState::Ready } else { ComponentState::Unavailable };
+    let parse_worker = combined_worker_state(integration.parse_worker, parse_producers);
+    let runtime_adapters = combined_worker_state(integration.runtime_adapters, runtime_producers);
+    let reason = |state: ComponentState, reason: Option<&'static str>| reason.filter(|_| state == ComponentState::Unavailable);
+    (Components { launch_service: host, sandbox: host, network: host, storage: host, parse_worker,
+        update_service: if update { ComponentState::Ready } else { ComponentState::Unavailable },
+        mcp_boundary: integration.mcp_boundary, runtime_adapters },
+     ComponentReasons { parse_worker: reason(parse_worker, integration.parse_worker_reason),
+        runtime_adapters: reason(runtime_adapters, integration.runtime_adapters_reason) })
 }
 
 fn runtime_adapters_state() -> ComponentState {
@@ -107,6 +128,18 @@ pub struct Readiness {
     /// by fixed name (`published::ASSEMBLY`), the same list the root CLI reads.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assembly_missing: Option<Vec<&'static str>>,
+    /// R8n-1, set only by [`report`]: the helper tool families this host does
+    /// not offer (`published::TOOL_FAMILIES` names; empty until assembled).
+    /// Informational: never part of `ready` or `status`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools_unavailable: Option<Vec<&'static str>>,
+    /// R8n-1 review F3, set only by [`report`]: each NOT-ready component's
+    /// fixed reason name, exactly as the published view gives it
+    /// (`published::component_reasons`: a probe reason from
+    /// `published::PARSE_WORKER_REASONS` / `RUNTIME_ADAPTER_REASONS`, else
+    /// `unavailable` / `pending_integration`). Ready components are absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub component_reasons: Option<std::collections::BTreeMap<&'static str, &'static str>>,
 }
 
 fn applies(linux: bool, protected: bool, team: bool) -> bool { linux && protected && team }
@@ -351,18 +384,26 @@ fn backend_admission() -> Result<(), duduclaw_isolation::execution::BackendError
 
 /// Every read uses fresh, authenticated B1 evidence. This result contains no
 /// paths, process IDs, key material, raw service errors or caller-supplied flags.
-pub fn status() -> Option<Readiness> {
+pub fn status() -> Option<Readiness> { status_with_reasons().map(|(readiness, _)| readiness) }
+
+/// [`status`] with the probe-backed components' fixed reasons (the published view).
+pub(crate) fn status_with_reasons() -> Option<(Readiness, ComponentReasons)> {
     if !REQUIRED.load(Ordering::Acquire) { return None; }
-    let components = Components::current(spawnd_verified());
-    Some(Readiness { required: true, ready: components.all_ready(), components,
-        status: None, reasons: None, employees: None, notices: None, assembly_missing: None })
+    let (components, reasons) = Components::current_with_reasons(spawnd_verified());
+    Some((Readiness { required: true, ready: components.all_ready(), components,
+        status: None, reasons: None, employees: None, notices: None, assembly_missing: None, tools_unavailable: None,
+        component_reasons: None },
+        reasons))
 }
 
 /// [`status`] plus the F3 reasons, for the dashboard. Blocking (SQLite and
 /// root ReadBack per employee): call on the blocking pool. Diagnosis only;
 /// it never admits anything. Employee labels are included for admins only.
+/// R8n-1 review F3: the same source as the published view
+/// ([`status_with_reasons`]), so each not-ready component keeps its reason.
 pub fn report(home: &std::path::Path, admin: bool) -> Option<Readiness> {
-    let readiness = status()?;
+    let (readiness, component_reasons) = status_with_reasons()?;
+    let component_reasons = published::component_reasons(&readiness, component_reasons);
     let assessment = reasons::assess_installed(home);
     // W1: host-wide work-broker / in-run helper reasons (live feature view),
     // action-required only for tools some protected employee is configured with.
@@ -374,6 +415,8 @@ pub fn report(home: &std::path::Path, admin: bool) -> Option<Readiness> {
     let mut readiness = with_features(readiness, assessment, reasons::installed_feature_reasons(), needs, host, admin);
     // R8m 30b: the same fixed list the root CLI reads from the published view.
     readiness.assembly_missing = Some(published::assembly_missing());
+    readiness.tools_unavailable = Some(published::tools_unavailable());
+    readiness.component_reasons = Some(component_reasons);
     Some(readiness)
 }
 
@@ -399,9 +442,12 @@ fn with_features(readiness: Readiness, mut assessment: reasons::Assessment, feat
 /// The assessment itself could not run (blocking task failed): fail closed.
 pub fn report_failed() -> Option<Readiness> {
     let failed = reasons::Assessment { reasons: [Reason::ServiceUnavailable].into(), employees: Vec::new() };
-    status().map(|readiness| {
+    status_with_reasons().map(|(readiness, component_reasons)| {
+        let component_reasons = published::component_reasons(&readiness, component_reasons);
         let mut readiness = with_assessment(readiness, failed, false);
         readiness.assembly_missing = Some(published::assembly_missing());
+        readiness.tools_unavailable = Some(published::tools_unavailable());
+        readiness.component_reasons = Some(component_reasons);
         readiness
     })
 }
@@ -619,11 +665,71 @@ mod tests {
         assert!(admit(true, Some(stale)).is_err());
     }
 
+    /// A faked probe: refuses with `reason` when given, otherwise ready with a
+    /// fresh runtime observation that needs no PTY.
+    struct FakeProbe(Option<&'static str>);
+    impl IntegrationProbe for FakeProbe {
+        fn verify_producers(&self) -> Result<(), ProbeError> { self.0.map_or(Ok(()), |reason| Err(ProbeError::Refused(reason))) }
+        fn verify_service(&self, generation: duduclaw_isolation::ids::Sha256Digest) -> Result<ServiceObservation, ProbeError> {
+            Ok(ServiceObservation::checked_runtime(generation, Instant::now(), PtyRequirement::NotRequired))
+        }
+    }
+
+    /// R8n-1 2.x, over the admission decision `check_execution` makes
+    /// (`admit` of the composite): a fully faked ready host (host evidence,
+    /// update service, producers and all three probes) is admitted; without
+    /// the ParseWorker / RuntimeAdapters probe it stays pending (no "no probe
+    /// ⇒ ready"); a refused probe is unavailable with its fixed reason.
+    #[test]
+    fn r8n_probes_decide_parse_worker_and_runtime_adapters_admission() {
+        use std::sync::Arc;
+        let generation = Some(duduclaw_isolation::ids::Sha256Digest([7; 32]));
+        let probe = |reason: Option<&'static str>| -> Arc<dyn IntegrationProbe> { Arc::new(FakeProbe(reason)) };
+        let host = |probes: Vec<(IntegrationComponent, Arc<dyn IntegrationProbe>)>|
+            compose(true, true, integration::states_with(probes, generation), ComponentState::Ready, ComponentState::Ready);
+        // Every probe installed and passing: ready, admitted, no reasons.
+        let (components, reasons) = host(vec![(IntegrationComponent::ParseWorker, probe(None)),
+            (IntegrationComponent::McpBoundary, probe(None)), (IntegrationComponent::RuntimeAdapters, probe(None))]);
+        assert!(components.all_ready(), "{components:?}");
+        assert!(admit(true, Some(components)).is_ok());
+        assert_eq!(reasons, ComponentReasons::default());
+        // Only the MCP boundary probe (the state before R8n-1): never ready.
+        let (components, reasons) = host(vec![(IntegrationComponent::McpBoundary, probe(None))]);
+        assert_eq!(components.parse_worker, ComponentState::PendingIntegration);
+        assert_eq!(components.runtime_adapters, ComponentState::PendingIntegration);
+        assert_eq!(reasons, ComponentReasons::default());
+        assert!(admit(true, Some(components)).is_err());
+        // Each probe's own refusal: unavailable with its fixed reason.
+        let (components, reasons) = host(vec![(IntegrationComponent::ParseWorker, probe(Some("socket_not_listening"))),
+            (IntegrationComponent::McpBoundary, probe(None)), (IntegrationComponent::RuntimeAdapters, probe(None))]);
+        assert_eq!((components.parse_worker, reasons.parse_worker), (ComponentState::Unavailable, Some("socket_not_listening")));
+        assert_eq!(components.runtime_adapters, ComponentState::Ready);
+        assert!(admit(true, Some(components)).is_err());
+        let (components, reasons) = host(vec![(IntegrationComponent::ParseWorker, probe(None)),
+            (IntegrationComponent::McpBoundary, probe(None)), (IntegrationComponent::RuntimeAdapters, probe(Some("no_main_runtime")))]);
+        assert_eq!((components.runtime_adapters, reasons.runtime_adapters), (ComponentState::Unavailable, Some("no_main_runtime")));
+        assert_eq!(reasons.parse_worker, None);
+        assert!(admit(true, Some(components)).is_err());
+        // Passing probes never override missing producers or host evidence.
+        let all = || vec![(IntegrationComponent::ParseWorker, probe(None)),
+            (IntegrationComponent::McpBoundary, probe(None)), (IntegrationComponent::RuntimeAdapters, probe(None))];
+        let (components, _) = compose(true, true, integration::states_with(all(), generation),
+            ComponentState::Unavailable, ComponentState::Ready);
+        assert_eq!(components.parse_worker, ComponentState::Unavailable);
+        let (components, _) = compose(true, true, integration::states_with(all(), generation),
+            ComponentState::Ready, ComponentState::PendingIntegration);
+        assert_eq!(components.runtime_adapters, ComponentState::Unavailable);
+        let (components, _) = compose(false, true, integration::states_with(all(), generation),
+            ComponentState::Ready, ComponentState::Ready);
+        assert!(admit(true, Some(components)).is_err());
+    }
+
     #[test]
     fn operator_payload_has_fixed_component_states_only() {
         let components = Components::current(false);
         let value = serde_json::to_value(Readiness { required: true, ready: false, components,
-            status: None, reasons: None, employees: None, notices: None, assembly_missing: None }).unwrap();
+            status: None, reasons: None, employees: None, notices: None, assembly_missing: None,
+            tools_unavailable: None, component_reasons: None }).unwrap();
         assert_eq!(value["required"], true);
         assert_eq!(value["ready"], false);
         assert_eq!(value["components"].as_object().unwrap().len(), 8);
@@ -642,7 +748,7 @@ mod tests {
 
     fn base(components: Components) -> Readiness {
         Readiness { required: true, ready: components.all_ready(), components, status: None, reasons: None,
-            employees: None, notices: None, assembly_missing: None }
+            employees: None, notices: None, assembly_missing: None, tools_unavailable: None, component_reasons: None }
     }
 
     /// W1 follow-up: a host that publishes no helpers (and whose spawnd lacks

@@ -155,17 +155,29 @@ pub(super) fn own_agent_dir(home: &Path, agent: &str) -> Result<std::fs::File, V
     use nix::fcntl::{open, openat, OFlag};
     use nix::sys::stat::Mode;
     let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
-    let root = open(Path::new("/"), flags, Mode::empty()).map_err(|_| VerificationError::Unavailable)?;
+    // Every component above the agent directory is only traversed: O_PATH
+    // needs search permission alone (the installed home's root-owned 0711
+    // parent is not readable by the gateway). O_PATH|O_NOFOLLOW|O_DIRECTORY
+    // refuses a symlink (ENOTDIR); the descriptors are used only as openat
+    // dirfds. The agent directory itself keeps the read open.
+    let search = OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    let root = open(Path::new("/"), search, Mode::empty()).map_err(|_| VerificationError::Unavailable)?;
     // SAFETY: each successful open/openat returns a new owned descriptor.
     let mut directory = unsafe { std::fs::File::from_raw_fd(root) };
     use std::os::fd::AsRawFd;
     if !home.is_absolute() || !duduclaw_core::is_valid_agent_id(agent) { return Err(VerificationError::Invalid); }
+    let mut parts = Vec::new();
     for part in home.components().chain(Path::new("agents").components()).chain(Path::new(agent).components()) {
         let std::path::Component::Normal(part) = part else {
             if part == std::path::Component::RootDir { continue; }
             return Err(VerificationError::Invalid);
         };
-        let fd = openat(Some(directory.as_raw_fd()), Path::new(part), flags, Mode::empty())
+        parts.push(part);
+    }
+    let count = parts.len();
+    for (index, part) in parts.into_iter().enumerate() {
+        let step = if index + 1 == count { flags } else { search };
+        let fd = openat(Some(directory.as_raw_fd()), Path::new(part), step, Mode::empty())
             .map_err(|_| VerificationError::Unavailable)?;
         directory = unsafe { std::fs::File::from_raw_fd(fd) };
     }

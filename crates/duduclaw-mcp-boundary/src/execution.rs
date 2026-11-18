@@ -28,6 +28,14 @@ pub use recording::control_recording;
 /// There is intentionally no default implementation or blanket support claim.
 pub trait ExecutionPlanFactory: Send + Sync {
     fn supports(&self, tool: &str) -> bool;
+    /// R8n-1: whether this host offers `tool` at all. Only consulted for the
+    /// helper tool families (`fork_policy::HELPER_TOOLS`): a helper family the
+    /// signed policy does not provide is not offered, so it is neither listed
+    /// nor required as a producer, and a call is refused with the fixed
+    /// "not provided" disposition. Fixed for the life of the factory. The
+    /// default (offered) keeps every other factory fail closed: an offered
+    /// tool still needs `supports`.
+    fn offers(&self, _tool: &str) -> bool { true }
     fn collects_results(&self, _tool: &str) -> bool { false }
     fn cooperative_stop(&self, _tool: &str) -> bool { false }
     fn decode_result(&self, _tool: &str, _stdout: &[u8], _stderr: &[u8],
@@ -106,6 +114,12 @@ impl ExecutionToolBridge {
     pub fn with_recording_audit(&self, audit: Arc<dyn crate::recording_audit::RecordingAudit>) -> Self {
         Self { backend: self.backend.clone(), factory: self.factory.clone(), resolver: self.resolver.clone(),
             jobs: self.jobs.clone(), recordings: self.recordings.clone(), recording_audit: Some(audit) }
+    }
+
+    /// R8n-1: `false` only for a helper tool (`fork_policy::HELPER_TOOLS`)
+    /// whose family the installed factory does not offer on this host.
+    pub fn offers(&self, name: &str) -> bool {
+        !crate::fork_policy::HELPER_TOOLS.contains(&name) || self.factory.offers(name)
     }
 
     /// Use this same predicate for tools/list and tools/call. In-run helper

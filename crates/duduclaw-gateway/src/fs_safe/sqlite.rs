@@ -106,35 +106,58 @@ fn ancestor_policy(owner: u32, mode: u32, uid: u32, after_sticky: bool) -> bool 
         && (mode & 0o022 == 0 || (owner == 0 && mode & 0o1000 != 0))
 }
 
+/// [`ancestor_policy`] on the metadata of an opened descriptor; returns the
+/// next step's `after_sticky`.
+#[cfg(unix)]
+fn check_ancestor(meta: &std::fs::Metadata, path: &Path, uid: u32, after_sticky: bool) -> Result<bool, String> {
+    use std::os::unix::fs::MetadataExt;
+    if !meta.is_dir() || !ancestor_policy(meta.uid(), meta.mode(), uid, after_sticky) {
+        return Err(format!("secure database open refused: unsafe ancestor {} (uid {}, mode {:04o}); ancestors must be owned by the effective uid or root and not group/other writable; a writable root-owned sticky directory requires the next component to be owned by the effective uid", path.display(), meta.uid(), meta.mode() & 0o7777));
+    }
+    Ok(meta.mode() & 0o022 != 0)
+}
+
+/// Descriptor walk from `/` to `home`. Every directory ABOVE the home is
+/// opened search-only (`SearchDir`: Linux `O_PATH|O_DIRECTORY|O_NOFOLLOW`,
+/// after an lstat-at that refuses a symlink), because the installed layout
+/// gives the gateway only search permission on its home's root-owned 0711
+/// parent (`/var/lib/duduclaw`). On those descriptors only `fstat` (policy)
+/// and `fstatat`/`openat` of the next component are performed, all valid on
+/// `O_PATH`. The home itself is opened `O_RDONLY` (it is listed, written and
+/// fsynced). Each policy check runs on the opened descriptor, never just a
+/// pathname, and / itself is included.
 #[cfg(unix)]
 fn trusted_directory(home: &Path) -> Result<super::SafeDir, String> {
-    use std::os::unix::fs::MetadataExt;
     use std::path::Component;
     let uid = nix::unistd::geteuid().as_raw();
-    let mut directory = super::SafeDir::open_root(Path::new("/")).map_err(|e| e.to_string())?;
-    let mut path = std::path::PathBuf::from("/");
-    let mut after_sticky = false;
-    // Include / itself. child_dir uses lstat-at + openat(O_NOFOLLOW); the
-    // policy is checked on the opened descriptor, never just a pathname.
+    let mut names = Vec::new();
     for component in home.components() {
         match component {
             Component::RootDir => {}
             Component::Normal(name) => {
-                path.push(name);
-                let name = name.to_str().ok_or("secure database open refused: non-UTF-8 directory")?;
-                directory = directory.child_dir(name, false)
-                    .map_err(|e| format!("secure database ancestor {}: {e}", path.display()))?
-                    .ok_or_else(|| format!("secure database ancestor {} is missing", path.display()))?;
+                names.push(name.to_str().ok_or("secure database open refused: non-UTF-8 directory")?);
             }
             _ => return Err("secure database open refused: non-absolute home path".into()),
         }
-        let meta = directory.metadata().map_err(|e| e.to_string())?;
-        if !meta.is_dir() || !ancestor_policy(meta.uid(), meta.mode(), uid, after_sticky) {
-            return Err(format!("secure database open refused: unsafe ancestor {} (uid {}, mode {:04o}); ancestors must be owned by the effective uid or root and not group/other writable; a writable root-owned sticky directory requires the next component to be owned by the effective uid", path.display(), meta.uid(), meta.mode() & 0o7777));
-        }
-        after_sticky = meta.mode() & 0o022 != 0;
     }
-    Ok(directory)
+    let (last, ancestors) = names.split_last()
+        .ok_or("secure database open refused: the filesystem root is not a database home")?;
+    let mut path = std::path::PathBuf::from("/");
+    let mut directory = super::SearchDir::root().map_err(|e| e.to_string())?;
+    let mut after_sticky = check_ancestor(&directory.metadata().map_err(|e| e.to_string())?, &path, uid, false)?;
+    for name in ancestors {
+        path.push(name);
+        directory = directory.child_search(name)
+            .map_err(|e| format!("secure database ancestor {}: {e}", path.display()))?
+            .ok_or_else(|| format!("secure database ancestor {} is missing", path.display()))?;
+        after_sticky = check_ancestor(&directory.metadata().map_err(|e| e.to_string())?, &path, uid, after_sticky)?;
+    }
+    path.push(last);
+    let home = directory.child_dir(last)
+        .map_err(|e| format!("secure database ancestor {}: {e}", path.display()))?
+        .ok_or_else(|| format!("secure database ancestor {} is missing", path.display()))?;
+    check_ancestor(&home.metadata().map_err(|e| e.to_string())?, &path, uid, after_sticky)?;
+    Ok(home)
 }
 
 #[cfg(unix)]
@@ -272,6 +295,125 @@ mod tests {
             std::fs::set_permissions(&home, std::fs::Permissions::from_mode(mode)).unwrap();
             open(&home, "state.db").unwrap();
         }
+    }
+
+    /// Restores a directory's mode on drop, so the temp tree can be removed.
+    #[cfg(target_os = "linux")]
+    struct RestoreMode(std::path::PathBuf);
+    #[cfg(target_os = "linux")]
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    /// Defect 33, permission half (ownership needs root, see the iso_root_
+    /// test below): the installed home's parent is search-only for the
+    /// gateway (root:root 0711). Here the test user owns the parent, so the
+    /// read bit is removed for the owner too (0311: write+search, no read);
+    /// the ancestor policy passes because the effective uid owns it and it is
+    /// not group/other writable. Linux only: other Unix keeps O_RDONLY.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_sqlite_walks_a_search_only_ancestor() {
+        let root = crate::fs_safe::private_test_home().unwrap();
+        let parent = root.path().join("a");
+        let home = parent.join("home");
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&home).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o311)).unwrap();
+        let _restore = RestoreMode(parent.clone());
+        // Premise: a read open of the parent (the old walk's O_RDONLY) is
+        // refused. Root bypasses DAC (CAP_DAC_READ_SEARCH), so only checked
+        // unprivileged.
+        if !nix::unistd::geteuid().is_root() {
+            let error = std::fs::File::open(&parent).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EACCES), "{error}");
+        }
+        let db = open(&home, "state.db").unwrap();
+        db.execute_batch("CREATE TABLE example(value); PRAGMA journal_mode=WAL; INSERT INTO example VALUES(1)").unwrap();
+        drop(db);
+        let count: i64 = open_existing(&home, "state.db", Access::ReadOnly).unwrap()
+            .query_row("SELECT count(*) FROM example", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 1);
+        // The no-follow walk used by the other private stores reaches it too,
+        // and the home itself is a real (listable) open.
+        let directory = crate::fs_safe::SafeDir::open_nofollow(&home, false).unwrap();
+        assert!(directory.list().unwrap().iter().any(|entry| entry.name == "state.db"));
+        // Search-only does not relax the policy: group-writable is refused.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o331)).unwrap();
+        assert!(open(&home, "state.db").unwrap_err().contains("unsafe ancestor"));
+        // A symlinked ancestor is still refused on the search-only path.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let alias = root.path().join("alias");
+        symlink(&parent, &alias).unwrap();
+        assert!(open(&alias.join("home"), "state.db").is_err());
+        assert!(crate::fs_safe::SafeDir::open_nofollow(&alias.join("home"), false).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    const ROOT_CHILD_HOME: &str = "DUDUCLAW_ISO_PRIVATE_DB_HOME";
+
+    /// The installed shape on a root VM: `/var/lib/duduclaw-isotest-*` is
+    /// root:root 0711 (as `/var/lib/duduclaw`), its `.duduclaw` child is owned
+    /// by an unprivileged account (uid/gid 65534) with mode 0700, and a copy
+    /// of this test binary re-runs [`private_db_child_as_account`] as that
+    /// account, which must create and reopen a private database.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "iso_root_: root Linux VM; root:root 0711 parent under /var/lib, account-owned 0700 home, child process as uid 65534"]
+    fn iso_root_private_db_opens_below_a_root_0711_parent() {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::process::CommandExt;
+        const ACCOUNT: u32 = 65534;
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        assert!(nix::unistd::geteuid().is_root(), "run as root on a disposable VM");
+        let parent = std::path::PathBuf::from(format!("/var/lib/duduclaw-isotest-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::DirBuilder::new().mode(0o700).create(&parent).unwrap();
+        let _cleanup = Cleanup(parent.clone());
+        nix::unistd::chown(&parent, Some(nix::unistd::Uid::from_raw(0)), Some(nix::unistd::Gid::from_raw(0))).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o711)).unwrap();
+        let home = parent.join(".duduclaw");
+        std::fs::DirBuilder::new().mode(0o700).create(&home).unwrap();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        nix::unistd::chown(&home, Some(nix::unistd::Uid::from_raw(ACCOUNT)), Some(nix::unistd::Gid::from_raw(ACCOUNT))).unwrap();
+        // The checkout may sit below a private home; run a copy the account can execute.
+        let binary = parent.join("test-binary");
+        std::fs::copy(std::env::current_exe().unwrap(), &binary).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let status = std::process::Command::new(&binary)
+            .args(["--exact", "fs_safe::sqlite::tests::private_db_child_as_account", "--ignored", "--test-threads=1", "--nocapture"])
+            .env(ROOT_CHILD_HOME, &home)
+            .current_dir("/")
+            .uid(ACCOUNT)
+            .gid(ACCOUNT)
+            .status()
+            .unwrap();
+        assert!(status.success(), "child as uid {ACCOUNT}: {status}");
+        let meta = std::fs::symlink_metadata(home.join("state.db")).unwrap();
+        assert_eq!((meta.uid(), meta.mode() & 0o777), (ACCOUNT, 0o600));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "internal: executed by iso_root_private_db_opens_below_a_root_0711_parent as the unprivileged account"]
+    fn private_db_child_as_account() {
+        let Some(home) = std::env::var_os(ROOT_CHILD_HOME) else { return };
+        let home = std::path::PathBuf::from(home);
+        assert!(!nix::unistd::geteuid().is_root());
+        // Premise, as measured on the installed host: the parent is not readable.
+        let error = std::fs::File::open(home.parent().unwrap()).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EACCES), "{error}");
+        let db = open(&home, "state.db").unwrap();
+        db.execute_batch("CREATE TABLE example(value); PRAGMA journal_mode=WAL; INSERT INTO example VALUES(1)").unwrap();
+        drop(db);
+        let count: i64 = open_existing(&home, "state.db", Access::ReadOnly).unwrap()
+            .query_row("SELECT count(*) FROM example", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 1);
+        let directory = crate::fs_safe::SafeDir::open_nofollow(&home, false).unwrap();
+        assert!(directory.list().unwrap().iter().any(|entry| entry.name == "state.db"));
     }
 
     #[test]
