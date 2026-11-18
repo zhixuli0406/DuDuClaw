@@ -6,7 +6,7 @@ use duduclaw_isolation::bounded::Text;
 use duduclaw_migration::contract::{ConfirmationCategory, ConfirmationStatus, ProposalBinding, ProposalField,
     ProposalOperationId, ProposalValue};
 use duduclaw_migration::ids::Sha256Digest;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 const ADMIN: &str = "0b6f2f8e-8c1d-4a51-9b40-2f1d4f6c9a10";
 const BOB: &str = "5a0c1e2d-3b4f-4a6e-8d7c-9b1a2c3d4e5f";
@@ -61,11 +61,15 @@ struct FakeRoot {
     /// Answer `Done` exactly as configured (otherwise it matches the request).
     echo: bool,
     seen: Mutex<Vec<ProviderRequest>>,
+    /// Effects in order (`provide`, and every audit write through [`FakeAudit::sharing`]).
+    log: Arc<Mutex<Vec<String>>>,
 }
 impl FakeRoot {
     fn new(binding: EmployeeBinding) -> Self {
-        Self { binding, resolve: Ok(()), answer: Mutex::new(done()), echo: false, seen: Mutex::new(Vec::new()) }
+        Self { binding, resolve: Ok(()), answer: Mutex::new(done()), echo: false, seen: Mutex::new(Vec::new()),
+            log: Arc::new(Mutex::new(Vec::new())) }
     }
+    fn log(&self) -> Vec<String> { self.log.lock().unwrap().clone() }
     fn answering(binding: EmployeeBinding, answer: Delivery) -> Self {
         let root = Self::new(binding);
         *root.answer.lock().unwrap() = answer;
@@ -82,6 +86,7 @@ impl ProviderRoot for FakeRoot {
     }
     fn provide(&self, request: ProviderRequest) -> Delivery {
         let clear = request.clear;
+        self.log.lock().unwrap().push("provide".into());
         self.seen.lock().unwrap().push(request);
         match *self.answer.lock().unwrap() {
             Delivery::Done(done) if !self.echo => Delivery::Done(Provisioned { provisioned: !clear, updated_unix: done.updated_unix }),
@@ -90,6 +95,23 @@ impl ProviderRoot for FakeRoot {
     }
 }
 fn done() -> Delivery { Delivery::Done(Provisioned { provisioned: true, updated_unix: UPDATED }) }
+
+/// The strict audit writer stand-in: writes through the production strict
+/// writer ([`SecurityAudit`]) unless `fail` names the entry's phase, and logs
+/// every call (`audit:<phase>`) into the root's effect log.
+struct FakeAudit { fail: &'static [&'static str], log: Arc<Mutex<Vec<String>>> }
+impl FakeAudit {
+    fn sharing(root: &FakeRoot) -> Self { Self { fail: &[], log: root.log.clone() } }
+    fn failing(root: &FakeRoot, fail: &'static [&'static str]) -> Self { Self { fail, log: root.log.clone() } }
+}
+impl AuditLog for FakeAudit {
+    fn append(&self, home: &Path, event: &duduclaw_security::audit::AuditEvent) -> Result<(), ()> {
+        let phase = event.details["phase"].as_str().unwrap_or_default().to_owned();
+        self.log.lock().unwrap().push(format!("audit:{phase}"));
+        if self.fail.iter().any(|fail| *fail == phase) { return Err(()); }
+        SecurityAudit.append(home, event)
+    }
+}
 
 fn caller() -> Caller<'static> { Caller { user: ADMIN, session: SESSION, epoch: 1 } }
 fn entry(name: &str, key: &str, url: &str) -> Value { json!({ "name": name, "api_key": key, "base_url": url }) }
@@ -100,7 +122,10 @@ fn one() -> Value { set_params(vec![entry("main", KEY, "https://api.example.test
 fn clear_params() -> Value { json!({ "employee_id": employee_hex(), "step_up_csrf": CSRF.to_vec() }) }
 fn call(method: &str, mut params: Value) -> ProviderCall { ProviderCall::take_from(method, &mut params) }
 fn run(home: &Path, admin: &FakeAdmin, root: &FakeRoot, method: &str, params: Value) -> Result<Value, Refusal> {
-    serve(home, admin, &caller(), call(method, params), root, NOW)
+    serve(home, admin, &caller(), call(method, params), root, &FakeAudit::sharing(root), NOW)
+}
+fn run_audited(home: &Path, root: &FakeRoot, audit: &FakeAudit, method: &str, params: Value) -> Result<Value, Refusal> {
+    serve(home, &FakeAdmin::fresh(), &caller(), call(method, params), root, audit, NOW)
 }
 fn audit_text(home: &Path) -> String { std::fs::read_to_string(home.join("security_audit.jsonl")).unwrap_or_default() }
 fn audit_entries(home: &Path) -> Vec<Value> {
@@ -181,7 +206,8 @@ fn r8r3a_gate_matrix() {
     assert_eq!(code(run(home.path(), &FakeAdmin::fresh(), &root, SET, wrong)), Some("step_up_required"));
     // Another dashboard session of the same Admin has no proof.
     let other_session = Caller { user: ADMIN, session: "9d8c7b6a-5f4e-4d3c-8b2a-1f0e9d8c7b6a", epoch: 1 };
-    assert_eq!(code(serve(home.path(), &FakeAdmin::fresh(), &other_session, call(SET, one()), &root, NOW)), Some("step_up_required"));
+    assert_eq!(code(serve(home.path(), &FakeAdmin::fresh(), &other_session, call(SET, one()), &root, &FakeAudit::sharing(&root), NOW)),
+        Some("step_up_required"));
     // A request cannot claim Admin, MFA or step-up state.
     for forged in ["step_up_valid", "admin", "mfa_enrolled", "item", "label"] {
         let mut params = one();
@@ -194,7 +220,8 @@ fn r8r3a_gate_matrix() {
     // OK.
     assert!(run(home.path(), &FakeAdmin::fresh(), &root, SET, one()).is_ok());
     assert_eq!(root.sent(), 1);
-    let results: Vec<String> = audit_entries(home.path()).iter().map(|row| row["details"]["result"].as_str().unwrap().to_owned()).collect();
+    let results: Vec<String> = audit_entries(home.path()).iter().filter(|row| row["details"]["phase"] != "admitted")
+        .map(|row| row["details"]["result"].as_str().unwrap().to_owned()).collect();
     assert_eq!(results, ["session_expired", "step_up_required", "step_up_required", "step_up_required", "step_up_required",
         "step_up_required", "request_invalid", "request_invalid", "request_invalid", "request_invalid", "request_invalid",
         "step_up_required", "ok"]);
@@ -375,10 +402,12 @@ fn r8r3a_status_never_shows_key_path_or_query() {
     let current = |_: &ConfirmedPrincipal| -> Result<Option<u32>, ()> { Ok(Some(4)) };
     let (value, revealed) = status_value(&rows, &recorded, None, None, ADMIN, false, &current).unwrap();
     let text = value.to_string();
-    for forbidden in [KEY, PATH_MARKER, "/v1", "api_key", "base_url", "bob-helper", BOB] {
+    let bob_id = hex::encode([2u8; 16]);
+    for forbidden in [KEY, PATH_MARKER, "/v1", "api_key", "base_url", "bob-helper", BOB, bob_id.as_str()] {
         assert!(!text.contains(forbidden), "{forbidden}: {text}");
     }
-    assert_eq!((revealed, value["hidden_personal"].as_u64(), value["next"].is_null()), (0, Some(1), true));
+    // No count of hidden rows: the key stays (stable shape), its value is null.
+    assert_eq!((revealed, value.get("hidden_personal"), value["next"].is_null()), (0, Some(&Value::Null), true));
     let employees = value["employees"].as_array().unwrap();
     let row = |label: &str| employees.iter().find(|row| row["label"] == label).unwrap().clone();
     let sales = row("sales-bot");
@@ -386,9 +415,10 @@ fn r8r3a_status_never_shows_key_path_or_query() {
         "source": "dashboard", "updated_unix": UPDATED,
         "providers": [{ "name": "main", "protocol": "chat_completions", "origin": "https://api.example.test:8443" }] }));
     let alice = row("alice-helper");
-    let mut keys: Vec<_> = alice.as_object().unwrap().keys().cloned().collect();
-    keys.sort();
-    assert_eq!(keys, ["employee_id", "kind", "label", "provisioned", "providers"], "no record: no source / time");
+    // Order-independent (serde_json maps may or may not preserve insertion
+    // order); exactly these keys, nothing more.
+    let keys: BTreeSet<&str> = alice.as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(keys, BTreeSet::from(["employee_id", "kind", "label", "provisioned", "providers"]), "no record: no source / time");
     assert_eq!((alice["provisioned"].as_bool(), alice["kind"].as_str()), (Some(false), Some("personal")));
 
     // Break-glass reveal: the row is shown and counted for the audit.
@@ -435,15 +465,26 @@ fn r8r3a_audit_entry_contents() {
         set_params(vec![json!({ "name": "main", "api_key": KEY, "base_url": url, "protocol": "gemini" })])).unwrap();
     run(home.path(), &FakeAdmin::fresh(), &root, CLEAR, clear_params()).unwrap();
     let entries = audit_entries(home.path());
-    assert_eq!(entries.len(), 2);
-    let set = &entries[0];
-    assert_eq!((set["event_type"].as_str(), set["agent_id"].as_str()), (Some("isolation.provider_set"), Some(AUDIT_AGENT)));
-    assert!(set["timestamp"].as_str().is_some_and(|time| !time.is_empty()));
-    assert_eq!(set["details"], json!({ "actor_user_id": ADMIN, "action": "set", "employee_id": employee_hex(),
-        "label": "sales-bot", "kind": "personal", "foreign_personal": true, "result": "ok",
+    assert_eq!(entries.len(), 4, "admitted + completed per attempt");
+    let (admitted, set) = (&entries[0], &entries[1]);
+    let attempt = admitted["details"]["attempt_id"].as_str().unwrap().to_owned();
+    assert!(attempt.len() == 32 && attempt.chars().all(|c| c.is_ascii_hexdigit()), "{attempt}");
+    for (row, severity) in [(admitted, "info"), (set, "info")] {
+        assert_eq!((row["event_type"].as_str(), row["agent_id"].as_str()), (Some("isolation.provider_set"), Some(AUDIT_AGENT)));
+        assert!(row["timestamp"].as_str().is_some_and(|time| !time.is_empty()));
+        assert_eq!(row["severity"], severity);
+    }
+    assert_eq!(admitted["details"], json!({ "actor_user_id": ADMIN, "action": "set", "attempt_id": attempt, "phase": "admitted",
+        "employee_id": employee_hex(), "label": "sales-bot", "kind": "personal", "foreign_personal": true,
+        "providers": [{ "name": "main", "origin": "https://api.example.test" }] }));
+    assert_eq!(set["details"], json!({ "actor_user_id": ADMIN, "action": "set", "attempt_id": attempt, "phase": "completed",
+        "employee_id": employee_hex(), "label": "sales-bot", "kind": "personal", "foreign_personal": true, "result": "ok",
         "providers": [{ "name": "main", "origin": "https://api.example.test" }], "recorded": true }));
-    let clear = &entries[1];
-    assert_eq!(clear["event_type"], "isolation.provider_clear");
+    let (clear_admitted, clear) = (&entries[2], &entries[3]);
+    assert_eq!((clear_admitted["event_type"].as_str(), clear["event_type"].as_str()),
+        (Some("isolation.provider_clear"), Some("isolation.provider_clear")));
+    assert_eq!(clear_admitted["details"]["attempt_id"], clear["details"]["attempt_id"]);
+    assert_ne!(clear["details"]["attempt_id"].as_str(), Some(attempt.as_str()), "a fresh attempt id per attempt");
     assert_eq!((clear["details"]["action"].as_str(), clear["details"]["result"].as_str(), clear["details"]["providers"].clone()),
         (Some("clear"), Some("ok"), json!([])));
     let text = audit_text(home.path());
@@ -528,4 +569,219 @@ fn r8r3a_document_cap_duplicates_and_count() {
     assert_eq!(exact.capacity(), MAX_DOCUMENT, "allocated once at its final size");
     assert!(serde_json::from_slice::<Value>(&exact).is_ok());
     assert_eq!(document(&one_entry(MAX_DOCUMENT - overhead + 1)).unwrap_err(), INVALID_PROVIDER);
+}
+
+/// F1: the admission entry is written strictly before anything reaches root;
+/// when it cannot be written the attempt answers `audit_unavailable` and
+/// nothing is sent, recorded or forgotten.
+#[cfg(unix)]
+#[test]
+fn r8r3a_admission_audit_failure_sends_nothing() {
+    let home = crate::fs_safe::private_test_home().unwrap();
+    let root = FakeRoot::new(shared());
+    let failing = FakeAudit::failing(&root, &["admitted"]);
+    let refusal = run_audited(home.path(), &root, &failing, SET, one()).unwrap_err();
+    assert_eq!((refusal.code, refusal.audit_incomplete), ("audit_unavailable", false));
+    assert!(!serde_json::to_string(&refusal.frame()).unwrap().contains(KEY));
+    assert_eq!(root.sent(), 0, "the fake provide was not called");
+    assert_eq!(root.log(), ["audit:admitted"]);
+    assert!(!home.path().join(records::RECORDS_FILE).exists(), "no record written");
+    assert!(audit_entries(home.path()).is_empty());
+
+    // A clear refused the same way leaves an existing record untouched.
+    run(home.path(), &FakeAdmin::fresh(), &root, SET, one()).unwrap();
+    let before = records::read_all(home.path()).unwrap();
+    assert_eq!(root.sent(), 1);
+    let refusal = run_audited(home.path(), &root, &failing, CLEAR, clear_params()).unwrap_err();
+    assert_eq!(refusal.code, "audit_unavailable");
+    assert_eq!(root.sent(), 1, "the clear was not sent");
+    assert_eq!(records::read_all(home.path()).unwrap(), before);
+}
+
+/// F1: admission → root → completion, in that order; the completion entry
+/// carries the admission's attempt id and the result (Warning unless `ok`).
+/// A request refused before root gets one `refused` entry and no admission.
+#[cfg(unix)]
+#[test]
+fn r8r3a_admission_precedes_root_and_completion_carries_attempt_and_result() {
+    let home = crate::fs_safe::private_test_home().unwrap();
+    let root = FakeRoot::new(shared());
+    let admin = FakeAdmin::fresh();
+    run(home.path(), &admin, &root, SET, one()).unwrap();
+    assert_eq!(root.log(), ["audit:admitted", "provide", "audit:completed"]);
+    let entries = audit_entries(home.path());
+    assert_eq!(entries.len(), 2);
+    let (admitted, completed) = (&entries[0]["details"], &entries[1]["details"]);
+    assert_eq!((admitted["phase"].as_str(), completed["phase"].as_str()), (Some("admitted"), Some("completed")));
+    assert!(admitted["attempt_id"].as_str().is_some_and(|id| !id.is_empty()));
+    assert_eq!(admitted["attempt_id"], completed["attempt_id"]);
+    assert!(admitted.get("result").is_none() && admitted.get("recorded").is_none(), "admission precedes any outcome");
+    assert_eq!((completed["result"].as_str(), completed["recorded"].as_bool()), (Some("ok"), Some(true)));
+
+    // A refusal from root: same order, its code in the completion, Warning.
+    root.answer(Delivery::Refused(ProviderErrorCode::NotReady));
+    assert_eq!(run(home.path(), &admin, &root, CLEAR, clear_params()).unwrap_err(), BUSY);
+    assert_eq!(root.log()[3..], ["audit:admitted", "provide", "audit:completed"]);
+    let entries = audit_entries(home.path());
+    let (admitted, completed) = (&entries[2], &entries[3]);
+    assert_eq!(admitted["details"]["attempt_id"], completed["details"]["attempt_id"]);
+    assert_ne!(admitted["details"]["attempt_id"], entries[0]["details"]["attempt_id"]);
+    assert_eq!((admitted["severity"].as_str(), completed["severity"].as_str()), (Some("info"), Some("warning")));
+    assert_eq!((completed["details"]["phase"].as_str(), completed["details"]["result"].as_str()), (Some("completed"), Some("busy")));
+
+    // Refused before root (validation): one `refused` entry, nothing admitted or sent.
+    root.answer(done());
+    assert_eq!(run(home.path(), &admin, &root, SET, set_params(vec![])).unwrap_err(), INVALID_PROVIDER);
+    assert_eq!(root.log()[6..], ["audit:refused"]);
+    assert_eq!(root.sent(), 2);
+    let last = audit_entries(home.path()).pop().unwrap();
+    assert_eq!((last["details"]["phase"].as_str(), last["details"]["result"].as_str()), (Some("refused"), Some("invalid_provider")));
+}
+
+/// F1: the completion entry cannot be written after root acted: the real
+/// outcome is still returned, marked `"audit":"incomplete"`; the admission
+/// entry is the durable trace.
+#[cfg(unix)]
+#[test]
+fn r8r3a_completion_audit_failure_returns_the_outcome_marked_incomplete() {
+    let home = crate::fs_safe::private_test_home().unwrap();
+    let root = FakeRoot::new(shared());
+    let failing = FakeAudit::failing(&root, &["completed"]);
+    let value = run_audited(home.path(), &root, &failing, SET, one()).unwrap();
+    assert_eq!(value, json!({ "provisioned": true, "updated_unix": UPDATED, "result": "recorded", "audit": "incomplete" }));
+    assert_eq!(root.sent(), 1);
+    assert!(records::read_all(home.path()).unwrap().contains_key(&EMPLOYEE), "the change happened and was recorded");
+    let entries = audit_entries(home.path());
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["details"]["phase"], "admitted");
+
+    // A refusal from root keeps its code and is marked too.
+    root.answer(Delivery::Refused(ProviderErrorCode::NotReady));
+    let refusal = run_audited(home.path(), &root, &failing, CLEAR, clear_params()).unwrap_err();
+    assert_eq!((refusal.code, refusal.audit_incomplete), ("busy", true));
+    assert_eq!(refusal.error_value(), json!({ "code": "busy", "message": BUSY.message, "audit": "incomplete" }));
+    assert!(BUSY.error_value().get("audit").is_none(), "an ordinary refusal carries no audit marker");
+    // Fully audited replies carry no marker either.
+    let value = run(home.path(), &FakeAdmin::fresh(), &FakeRoot::new(shared()), SET, one()).unwrap();
+    assert!(value.get("audit").is_none());
+}
+
+/// F4: a change root confirmed but the store could not save answers
+/// `not_recorded` and is audited as `not_recorded` at Warning.
+#[cfg(unix)]
+#[test]
+fn r8r3a_not_recorded_is_audited_as_not_recorded_at_warning() {
+    let home = crate::fs_safe::private_test_home().unwrap();
+    // The store path is a directory: every save fails.
+    std::fs::create_dir(home.path().join(records::RECORDS_FILE)).unwrap();
+    let root = FakeRoot::new(shared());
+    let value = run(home.path(), &FakeAdmin::fresh(), &root, SET, one()).unwrap();
+    assert_eq!(value, json!({ "provisioned": true, "updated_unix": UPDATED, "result": "not_recorded" }));
+    let completed = audit_entries(home.path()).pop().unwrap();
+    assert_eq!((completed["details"]["phase"].as_str(), completed["details"]["result"].as_str(),
+        completed["details"]["recorded"].as_bool(), completed["severity"].as_str()),
+        (Some("completed"), Some("not_recorded"), Some(false), Some("warning")));
+}
+
+/// F2: without a reveal, another person's Personal employee does not exist
+/// for status: no count, no trace, and a filter naming it answers exactly as
+/// an unknown id (with the same lookups). With a reveal it is shown and
+/// counted for the audit.
+#[test]
+fn r8r3a_status_foreign_personal_is_indistinguishable_without_reveal() {
+    let rows = vec![principal("alice-helper", 1, personal(ADMIN)), principal("bob-helper", 2, personal(BOB)),
+        principal("sales-bot", 3, shared())];
+    let summary = || vec![ProviderSummary { name: "main".into(), protocol: "chat_completions".into(),
+        origin: "https://api.example.test".into() }];
+    let recorded: BTreeMap<EmployeeId, Record> = [EmployeeId([2; 16]), EMPLOYEE].into_iter()
+        .map(|id| (id, Record { incarnation: 4, providers: summary(), updated_unix: UPDATED })).collect();
+    let lookups = std::cell::Cell::new(0usize);
+    let current = |_: &ConfirmedPrincipal| -> Result<Option<u32>, ()> { lookups.set(lookups.get() + 1); Ok(Some(4)) };
+    let bob_id = hex::encode([2u8; 16]);
+
+    let (value, revealed) = status_value(&rows, &recorded, None, None, ADMIN, false, &current).unwrap();
+    assert_eq!(revealed, 0);
+    assert_eq!(value.get("hidden_personal"), Some(&Value::Null), "the key stays, without a count");
+    let text = serde_json::to_string(&value).unwrap();
+    for forbidden in ["bob-helper", BOB, bob_id.as_str()] {
+        assert!(!text.contains(forbidden), "{forbidden}: {text}");
+    }
+
+    lookups.set(0);
+    let foreign = status_value(&rows, &recorded, Some(EmployeeId([2; 16])), None, ADMIN, false, &current).unwrap_err();
+    let foreign_lookups = lookups.replace(0);
+    let unknown = status_value(&rows, &recorded, Some(EmployeeId([8; 16])), None, ADMIN, false, &current).unwrap_err();
+    assert_eq!((foreign, foreign_lookups), (unknown, lookups.get()), "same answer, same lookups");
+    assert_eq!(foreign, NOT_ALLOCATED);
+    assert_eq!(serde_json::to_string(&foreign.frame()).unwrap(), serde_json::to_string(&unknown.frame()).unwrap());
+
+    // Reveal: shown, counted for the reveal audit, and the count is 0.
+    let (value, revealed) = status_value(&rows, &recorded, Some(EmployeeId([2; 16])), None, ADMIN, true, &current).unwrap();
+    assert_eq!((revealed, value["hidden_personal"].as_u64()), (1, Some(0)));
+    assert_eq!(value["employees"][0]["label"], "bob-helper");
+    let (value, revealed) = status_value(&rows, &recorded, None, None, ADMIN, true, &current).unwrap();
+    assert_eq!((revealed, value["employees"].as_array().map(Vec::len)), (1, Some(3)));
+}
+
+/// F2: the `after` cursor and `next` run over the visible rows only; an
+/// `after` that is a hidden label behaves as any other string there.
+#[test]
+fn r8r3a_status_cursor_runs_over_visible_rows_only() {
+    let none = BTreeMap::new();
+    let current = |_: &ConfirmedPrincipal| -> Result<Option<u32>, ()> { Ok(Some(4)) };
+    let rows = vec![principal("a-bot", 1, shared()), principal("bob-helper", 2, personal(BOB)), principal("c-bot", 3, shared())];
+    let page = |after: &str| status_value(&rows, &none, None, Some(after), ADMIN, false, &current).unwrap().0;
+    let reference = page("b");
+    for after in ["bob-helper", "bob", "bob-helpe", "bob-helperz"] {
+        assert_eq!(page(after), reference, "{after}");
+    }
+    let labels: Vec<&str> = reference["employees"].as_array().unwrap().iter().map(|row| row["label"].as_str().unwrap()).collect();
+    assert_eq!(labels, ["c-bot"]);
+
+    // A full page of visible rows followed only by hidden ones: no next page.
+    let mut many: Vec<ConfirmedPrincipal> = (0..PAGE).map(|index| {
+        let mut id = [9u8; 16];
+        id[0] = index as u8;
+        id[1] = (index >> 8) as u8;
+        ConfirmedPrincipal { label: format!("e{index:04}"), employee: EmployeeId(id), binding: Some(shared()), disabled: false }
+    }).collect();
+    many.push(ConfirmedPrincipal { label: "z-bob".into(), employee: EmployeeId([0xee; 16]), binding: Some(personal(BOB)),
+        disabled: false });
+    let (value, _) = status_value(&many, &none, None, None, ADMIN, false, &current).unwrap();
+    assert_eq!((value["employees"].as_array().map(Vec::len), value["next"].is_null()), (Some(PAGE), true),
+        "a hidden row never creates a next page");
+    assert!(!value.to_string().contains("z-bob"));
+    // Revealed, it is a visible row: the page now has a next.
+    let (value, revealed) = status_value(&many, &none, None, None, ADMIN, true, &current).unwrap();
+    assert_eq!((value["next"].as_str(), revealed), (Some(format!("e{:04}", PAGE - 1).as_str()), 0));
+}
+
+/// F3: the early take leaves nothing of the request in the params — no
+/// value and no property NAME, at any depth — and still delivers the keys.
+#[test]
+fn r8r3a_take_wipes_property_names_at_every_depth() {
+    const NAME: &str = "sk-NAME-CANARY-r8r3a-f3";
+    fn named(name: &str, value: Value) -> Value {
+        let mut map = serde_json::Map::new();
+        map.insert(name.to_owned(), value);
+        Value::Object(map)
+    }
+    let nested = || named(NAME, json!([NAME, named(NAME, json!([[NAME], named(NAME, json!(null))])), 1, true]));
+    for method in [SET, STATUS, CLEAR, "isolation.provider_purge"] {
+        let mut params = one();
+        params.as_object_mut().unwrap().insert(NAME.into(), nested());
+        params["providers"].as_array_mut().unwrap().push(nested());
+        let taken = ProviderCall::take_from(method, &mut params);
+        assert!(taken.input.is_err(), "{method}");
+        let left = serde_json::to_string(&params).unwrap();
+        assert!(!left.contains(NAME) && !left.contains(KEY), "{method}: {left}");
+        assert_eq!(params, json!({}), "{method}");
+    }
+    // A valid request: the params are left empty, the key is delivered.
+    let mut params = one();
+    let taken = ProviderCall::take_from(SET, &mut params);
+    assert_eq!(params, json!({}));
+    let Ok(Input::Set(request)) = taken.input else { panic!("a valid set is taken") };
+    assert_eq!((request.providers.len(), request.providers[0].api_key.as_str(), request.employee_id.as_str()),
+        (1, KEY, employee_hex().as_str()));
 }

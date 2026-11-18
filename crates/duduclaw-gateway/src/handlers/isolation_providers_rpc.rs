@@ -8,9 +8,11 @@
 //!   confirmed dashboard changes (names, protocols, endpoint origins, time);
 //!   never a key, path, query or hash. Documents written by the host root
 //!   command (`duduclaw service provider set`) bypass the gateway and are not
-//!   visible here. Another person's Personal employees are hidden (counted in
-//!   `hidden_personal`) unless the request carries the step-up CSRF token,
-//!   which reveals them and is audited (the connector list's P1 rule).
+//!   visible here. Another person's Personal employees are hidden unless the
+//!   request carries the step-up CSRF token, which reveals them and is
+//!   audited (the connector list's P1 rule). Hidden means absent: no count
+//!   (`hidden_personal: null`; `0` when revealed), a filtered request for one
+//!   answers as an unknown id, and paging runs over the visible rows only.
 //! - `isolation.provider_set` / `isolation.provider_clear` — exactly the
 //!   connector PROVISION gate: a current Admin re-read from users.db, the
 //!   caller's dashboard session, the fresh dashboard step-up (password +
@@ -19,7 +21,12 @@
 //!   or `migration.confirmations.step_up`, the same proof) and that proof's
 //!   CSRF token. Root writes the document through spawnd's allocation channel
 //!   (schema 5 `provision_providers`, gateway peer: the employee's Applied
-//!   confirmation item). One audit entry per attempt.
+//!   confirmation item). Audited fail-closed in two phases: a strict
+//!   `admitted` entry before anything is sent to root (a failed write answers
+//!   `audit_unavailable`, nothing sent), then a `completed` entry with the same
+//!   attempt id and the result (a failed write still returns the real outcome,
+//!   marked `"audit":"incomplete"`). A request refused before root gets one
+//!   best-effort `refused` entry.
 //!
 //! THE GATEWAY NEVER STORES A KEY. [`ProviderCall::take_from`] runs at the top
 //! of dispatch: every `api_key` string is MOVED out of the parsed params into
@@ -71,13 +78,20 @@ const AUDIT_AGENT: &str = "isolation-providers";
 
 /// A fixed refusal: a stable machine `code` (the dashboard keys its copy off
 /// it) and a fixed zh-TW line. Never contains anything from the request.
+/// `audit_incomplete`: the outcome is real (root was asked) but its completion
+/// audit entry could not be written; the frame then carries `"audit":"incomplete"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Refusal { pub(crate) code: &'static str, pub(crate) message: &'static str }
+pub(crate) struct Refusal { pub(crate) code: &'static str, pub(crate) message: &'static str, pub(crate) audit_incomplete: bool }
 impl Refusal {
-    const fn new(code: &'static str, message: &'static str) -> Self { Self { code, message } }
+    const fn new(code: &'static str, message: &'static str) -> Self { Self { code, message, audit_incomplete: false } }
+    const fn with_incomplete_audit(self) -> Self { Self { audit_incomplete: true, ..self } }
+    fn error_value(self) -> Value {
+        let mut error = json!({ "code": self.code, "message": self.message });
+        if self.audit_incomplete { error["audit"] = json!("incomplete"); }
+        error
+    }
     fn frame(self) -> WsFrame {
-        WsFrame::Response { id: String::new(), ok: false, payload: None,
-            error: Some(json!({ "code": self.code, "message": self.message })) }
+        WsFrame::Response { id: String::new(), ok: false, payload: None, error: Some(self.error_value()) }
     }
 }
 
@@ -107,6 +121,8 @@ const UNREACHABLE: Refusal = Refusal::new("unreachable", "無法連線到隔離�
 const EMPLOYEES_UNAVAILABLE: Refusal = Refusal::new("employees_unavailable", "無法讀取受保護員工清單，已拒絕列出。");
 const RECORDS_UNAVAILABLE: Refusal = Refusal::new("records_unavailable", "無法讀取模型連線紀錄，已拒絕列出。");
 const AUDIT_UNAVAILABLE: Refusal = Refusal::new("audit_unavailable", "無法寫入稽核紀錄，已拒絕列出。");
+/// Set/clear: the admission entry could not be written; nothing was sent to root.
+const AUDIT_UNAVAILABLE_CHANGE: Refusal = Refusal::new("audit_unavailable", "無法寫入稽核紀錄，未送出任何變更。");
 const SERVICE_UNAVAILABLE: Refusal = Refusal::new("service_unavailable", "模型連線資料服務無法使用，請重新載入。");
 
 /// The isolation gate (same predicate as the connector RPCs).
@@ -157,12 +173,27 @@ pub(crate) struct ProviderCall {
     employee: Option<EmployeeId>,
 }
 
-/// Overwrite every string left in `value` (object keys are field names).
+/// Overwrite every string left in `value`, object KEYS included (a secret may
+/// sit in an unknown property's name): containers are taken out whole
+/// (`std::mem::take`), each owned key is zeroized and each value erased
+/// recursively, so `value` is left as `""`, `[]` or `{}`.
+///
+/// Residuals this layer cannot reach: serde_json's parser drops the earlier
+/// value of a DUPLICATE key (last wins) without zeroizing it, and the
+/// WebSocket text frame / buffer the params were parsed from is owned and
+/// dropped by the transport, not by this handler.
 fn erase(value: &mut Value) {
     match value {
         Value::String(text) => text.zeroize(),
-        Value::Array(items) => items.iter_mut().for_each(erase),
-        Value::Object(fields) => fields.values_mut().for_each(erase),
+        Value::Array(items) => {
+            for mut item in std::mem::take(items) { erase(&mut item); }
+        }
+        Value::Object(fields) => {
+            for (mut key, mut item) in std::mem::take(fields) {
+                key.zeroize();
+                erase(&mut item);
+            }
+        }
         _ => {}
     }
 }
@@ -269,17 +300,43 @@ impl ProviderCall {
         Self { action, input, employee }
     }
 
-    /// Audit a set/clear refused before [`serve`] (status is not audited).
+    /// Audit a set/clear refused before [`serve`] (status is not audited);
+    /// nothing was sent, so the single entry is best effort.
     fn audit_refusal(&self, home: &Path, actor: &str, refusal: Refusal) {
-        Attempt::new(self.action, self.employee).audit(home, actor, refusal.code);
+        Attempt::new(self.action, self.employee).refused(home, &SECURITY_AUDIT, actor, refusal.code);
     }
 }
 
+/// The set/clear audit writer. Production: `security_audit.jsonl` through the
+/// STRICT `duduclaw_security::audit::try_append_audit_event` (lock,
+/// serialisation, write and sync errors are returned, never swallowed), then
+/// the autopilot bus mirror. Tests inject a fake.
+pub(crate) trait AuditLog {
+    fn append(&self, home: &Path, event: &duduclaw_security::audit::AuditEvent) -> Result<(), ()>;
+}
+pub(crate) struct SecurityAudit;
+impl AuditLog for SecurityAudit {
+    fn append(&self, home: &Path, event: &duduclaw_security::audit::AuditEvent) -> Result<(), ()> {
+        duduclaw_security::audit::try_append_audit_event(home, event).map_err(|_| ())?;
+        crate::security_autopilot::emit_security_autopilot_event(&event.severity, &event.event_type,
+            Some(event.agent_id.as_str()), crate::security_autopilot::SOURCE_AUDIT);
+        Ok(())
+    }
+}
+static SECURITY_AUDIT: SecurityAudit = SecurityAudit;
+
 /// What one set/clear attempt is audited with: actor, employee id / label,
-/// action, result code, provider NAMES and ORIGINS only (and the time, from
-/// the audit event). Never a key, hash, path or query.
+/// action, a random attempt id, the phase, result code, provider NAMES and
+/// ORIGINS only (and the time, from the audit event). Never a key, hash, path
+/// or query.
+///
+/// Phases: `refused` (one best-effort entry; nothing was sent to root),
+/// `admitted` (written strictly BEFORE root is asked; a failed write refuses
+/// with `audit_unavailable` and sends nothing) and `completed` (same attempt
+/// id, the result code; Warning unless `ok`).
 struct Attempt {
     action: Action,
+    attempt_id: String,
     employee: Option<EmployeeId>,
     label: Option<String>,
     kind: Option<&'static str>,
@@ -289,21 +346,43 @@ struct Attempt {
 }
 impl Attempt {
     fn new(action: Action, employee: Option<EmployeeId>) -> Self {
-        Self { action, employee, label: None, kind: None, foreign_personal: None, providers: Vec::new(), recorded: None }
+        Self { action, attempt_id: hex::encode(uuid::Uuid::new_v4().as_bytes()), employee, label: None, kind: None,
+            foreign_personal: None, providers: Vec::new(), recorded: None }
     }
-    fn audit(&self, home: &Path, actor: &str, result: &str) {
-        let Some(action) = self.action.audited() else { return };
+    /// `None` for an unaudited action (status, unknown members).
+    fn event(&self, actor: &str, phase: &str, result: Option<&str>) -> Option<duduclaw_security::audit::AuditEvent> {
+        use duduclaw_security::audit::{AuditEvent, Severity};
+        let action = self.action.audited()?;
         let providers: Vec<Value> = self.providers.iter()
             .map(|(name, origin)| json!({ "name": name, "origin": origin })).collect();
-        let details = json!({
-            "actor_user_id": actor, "action": action,
+        let mut details = json!({
+            "actor_user_id": actor, "action": action, "attempt_id": self.attempt_id, "phase": phase,
             "employee_id": self.employee.map(|employee| hex::encode(employee.0)), "label": self.label,
-            "kind": self.kind, "foreign_personal": self.foreign_personal,
-            "result": result, "providers": providers, "recorded": self.recorded,
+            "kind": self.kind, "foreign_personal": self.foreign_personal, "providers": providers,
         });
-        let severity = if result == "ok" { duduclaw_security::audit::Severity::Info } else { duduclaw_security::audit::Severity::Warning };
-        crate::security_autopilot::audit_and_emit(home, &duduclaw_security::audit::AuditEvent::new(
-            format!("isolation.provider_{action}"), AUDIT_AGENT, severity, details));
+        if let Some(result) = result {
+            details["result"] = json!(result);
+            details["recorded"] = json!(self.recorded);
+        }
+        let severity = if result.is_none_or(|result| result == "ok") { Severity::Info } else { Severity::Warning };
+        Some(AuditEvent::new(format!("isolation.provider_{action}"), AUDIT_AGENT, severity, details))
+    }
+    /// Refused before anything was admitted or sent: one best-effort entry.
+    fn refused(&self, home: &Path, log: &dyn AuditLog, actor: &str, code: &str) {
+        let Some(event) = self.event(actor, "refused", Some(code)) else { return };
+        if log.append(home, &event).is_err() {
+            tracing::warn!("model connection request refused; its audit entry could not be written");
+        }
+    }
+    /// The durable admission entry, strict.
+    fn admit(&self, home: &Path, log: &dyn AuditLog, actor: &str) -> Result<(), ()> {
+        let event = self.event(actor, "admitted", None).ok_or(())?;
+        log.append(home, &event)
+    }
+    /// The completion entry (same attempt id), strict.
+    fn complete(&self, home: &Path, log: &dyn AuditLog, actor: &str, result: &str) -> Result<(), ()> {
+        let event = self.event(actor, "completed", Some(result)).ok_or(())?;
+        log.append(home, &event)
     }
 }
 
@@ -537,7 +616,7 @@ impl MethodHandler {
         let joined = tokio::task::spawn_blocking(move || {
             let now = chrono::Utc::now().timestamp();
             let admin: &UserDb = &db;
-            serve(&home, admin, &Caller { user: &user, session: &session, epoch }, call, &SPAWND, now)
+            serve(&home, admin, &Caller { user: &user, session: &session, epoch }, call, &SPAWND, &SECURITY_AUDIT, now)
         }).await;
         match joined {
             Ok(Ok(value)) => WsFrame::ok_response("", value),
@@ -548,9 +627,12 @@ impl MethodHandler {
 }
 
 /// Blocking (SQLite, the lifecycle's root ReadBack, the allocation socket).
-/// Every set/clear that reaches this is audited exactly once.
-fn serve(home: &Path, admin: &dyn AdminSession, caller: &Caller<'_>, call: ProviderCall, root: &dyn ProviderRoot, now: i64)
-    -> Result<Value, Refusal> {
+/// Every set/clear that reaches this is audited: one best-effort `refused`
+/// entry when it stops before root, otherwise a strict `admitted` entry
+/// before root is asked and a `completed` entry with the outcome.
+#[allow(clippy::too_many_arguments)]
+fn serve(home: &Path, admin: &dyn AdminSession, caller: &Caller<'_>, call: ProviderCall, root: &dyn ProviderRoot,
+    audit: &dyn AuditLog, now: i64) -> Result<Value, Refusal> {
     let ProviderCall { action, input, employee } = call;
     match action {
         Action::Status => match input {
@@ -560,17 +642,89 @@ fn serve(home: &Path, admin: &dyn AdminSession, caller: &Caller<'_>, call: Provi
         },
         Action::Set | Action::Clear => {
             let mut attempt = Attempt::new(action, employee);
-            let result = mutate(home, admin, caller, action, input, root, now, &mut attempt);
-            attempt.audit(home, caller.user, result.as_ref().err().map_or("ok", |refusal| refusal.code));
-            result
+            match prepare(home, admin, caller, action, input, root, now, &mut attempt) {
+                Ok(prepared) => deliver(home, root, audit, caller.user, &mut attempt, prepared),
+                // Nothing was admitted or sent.
+                Err(refusal) => {
+                    attempt.refused(home, audit, caller.user, refusal.code);
+                    Err(refusal)
+                }
+            }
         }
         Action::Unknown => Err(NOT_ALLOWED),
     }
 }
 
+/// A validated, resolved set/clear, ready for root. Deliberately neither
+/// `Debug` nor `Clone`: the payload holds keys (wiped when it drops).
+struct Prepared {
+    employee: EmployeeId,
+    incarnation: u32,
+    item: ConfirmationItem,
+    clear: bool,
+    summary: Vec<ProviderSummary>,
+    payload: Option<Payload>,
+}
+
+/// Two-phase audited delivery: the admission entry is durable BEFORE root is
+/// asked (a failed write answers `audit_unavailable` and sends nothing); the
+/// completion entry carries the same attempt id and the result. A failed
+/// completion write cannot undo what root did: the real outcome is returned
+/// with `"audit":"incomplete"` and the admission entry is the durable trace.
+fn deliver(home: &Path, root: &dyn ProviderRoot, audit: &dyn AuditLog, actor: &str, attempt: &mut Attempt,
+    prepared: Prepared) -> Result<Value, Refusal> {
+    let Prepared { employee, incarnation, item, clear, summary, payload } = prepared;
+    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if attempt.admit(home, audit, actor).is_err() {
+        // The payload (the document) is wiped as it drops here.
+        drop(payload);
+        return Err(AUDIT_UNAVAILABLE_CHANGE);
+    }
+    let request = ProviderRequest { schema: wire::SCHEMA_V5, nonce: RequestId(*uuid::Uuid::new_v4().as_bytes()),
+        action: ProviderAction::ProvisionProviders, item: Some(item), employee_id: None, label: None, payload, clear };
+    let outcome = match root.provide(request) {
+        // A success must match what was asked (the transport checks it too).
+        Delivery::Done(done) if done.provisioned != clear => Ok(done),
+        Delivery::Done(_) | Delivery::Unconfirmed => Err(UNCONFIRMED),
+        Delivery::Refused(code) => Err(refusal_for(code)),
+        Delivery::NotSent => Err(UNREACHABLE),
+    };
+    let (result, code) = match outcome {
+        Ok(done) => {
+            // Confirmed: record (set) or forget (clear) the non-secret summary.
+            let recorded = if clear {
+                records::remove(home, employee).is_ok()
+            } else {
+                records::put(home, employee, &Record { incarnation, providers: summary, updated_unix: done.updated_unix })
+                    .is_ok()
+            };
+            if !recorded {
+                tracing::warn!(employee = %hex::encode(employee.0),
+                    "model connection change confirmed by root but not recorded; status may be stale");
+            }
+            attempt.recorded = Some(recorded);
+            (Ok(json!({ "provisioned": done.provisioned, "updated_unix": done.updated_unix,
+                "result": if recorded { "recorded" } else { "not_recorded" } })),
+                if recorded { "ok" } else { "not_recorded" })
+        }
+        Err(refusal) => (Err(refusal), refusal.code),
+    };
+    if attempt.complete(home, audit, actor, code).is_err() {
+        tracing::warn!("model connection change finished but its completion audit entry could not be written; \
+            the admission entry is the durable trace");
+        return match result {
+            Ok(mut value) => { value["audit"] = json!("incomplete"); Ok(value) }
+            Err(refusal) => Err(refusal.with_incomplete_audit()),
+        };
+    }
+    result
+}
+
+/// Every check before root: session, input, step-up, provider validation,
+/// the document, employee resolution. Fills in what the audit entries carry.
 #[allow(clippy::too_many_arguments)]
-fn mutate(home: &Path, admin: &dyn AdminSession, caller: &Caller<'_>, action: Action, input: Result<Input, Refusal>,
-    root: &dyn ProviderRoot, now: i64, attempt: &mut Attempt) -> Result<Value, Refusal> {
+fn prepare(home: &Path, admin: &dyn AdminSession, caller: &Caller<'_>, action: Action, input: Result<Input, Refusal>,
+    root: &dyn ProviderRoot, now: i64, attempt: &mut Attempt) -> Result<Prepared, Refusal> {
     if now < 0 { return Err(CLOCK_UNAVAILABLE); }
     let proof = admin.proof(caller.user, caller.session, caller.epoch, now).map_err(|()| SESSION_EXPIRED)?;
     let (employee_id, csrf, entries) = match (action, input?) {
@@ -609,29 +763,7 @@ fn mutate(home: &Path, admin: &dyn AdminSession, caller: &Caller<'_>, action: Ac
         Some((summary, bytes)) => (summary, Some(Payload::new(bytes).map_err(|_| INVALID_PROVIDER)?)),
         None => (Vec::new(), None),
     };
-    let request = ProviderRequest { schema: wire::SCHEMA_V5, nonce: RequestId(*uuid::Uuid::new_v4().as_bytes()),
-        action: ProviderAction::ProvisionProviders, item: Some(target.item), employee_id: None, label: None, payload, clear };
-    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let done = match root.provide(request) {
-        // A success must match what was asked (the transport checks it too).
-        Delivery::Done(done) if done.provisioned != clear => done,
-        Delivery::Done(_) | Delivery::Unconfirmed => return Err(UNCONFIRMED),
-        Delivery::Refused(code) => return Err(refusal_for(code)),
-        Delivery::NotSent => return Err(UNREACHABLE),
-    };
-    // Confirmed: record (set) or forget (clear) the non-secret summary.
-    let recorded = if clear {
-        records::remove(home, employee).is_ok()
-    } else {
-        records::put(home, employee, &Record { incarnation: target.incarnation, providers: summary, updated_unix: done.updated_unix })
-            .is_ok()
-    };
-    if !recorded {
-        tracing::warn!(employee = %hex::encode(employee.0), "model connection change confirmed by root but not recorded; status may be stale");
-    }
-    attempt.recorded = Some(recorded);
-    Ok(json!({ "provisioned": done.provisioned, "updated_unix": done.updated_unix,
-        "result": if recorded { "recorded" } else { "not_recorded" } }))
+    Ok(Prepared { employee, incarnation: target.incarnation, item: target.item, clear, summary, payload })
 }
 
 fn status(home: &Path, admin: &dyn AdminSession, caller: &Caller<'_>, request: StatusRequest, now: i64) -> Result<Value, Refusal> {
@@ -670,32 +802,44 @@ fn status(home: &Path, admin: &dyn AdminSession, caller: &Caller<'_>, request: S
     Ok(value)
 }
 
-/// One status page (pure). Rows of another person's Personal employees are
-/// hidden (counted) unless `reveal`; the count of revealed rows is returned
-/// for the audit. A record counts only for the incarnation it was made for.
+/// Another person's Personal employee (P1).
+fn foreign_personal(row: &ConfirmedPrincipal, caller: &str) -> bool {
+    matches!(&row.binding, Some(EmployeeBinding::Personal(owner)) if owner.as_str() != caller)
+}
+
+/// One status page (pure). Without `reveal`, rows of another person's
+/// Personal employees do not exist for this reply: no count
+/// (`hidden_personal: null`), a filter naming one answers exactly as an
+/// unknown id (`not_allocated`, same lookups), and the `after` cursor and
+/// `next` are computed over the VISIBLE rows only (an `after` that is a hidden
+/// label behaves as any other string: "rows after it"). With `reveal` every
+/// row is listed (`hidden_personal: 0`) and the count of revealed rows is
+/// returned for the audit. A record counts only for the incarnation it was
+/// made for.
 #[allow(clippy::too_many_arguments)]
 fn status_value(rows: &[ConfirmedPrincipal], recorded: &BTreeMap<EmployeeId, Record>, filter: Option<EmployeeId>,
     after: Option<&str>, caller: &str, reveal: bool, incarnation: &dyn Fn(&ConfirmedPrincipal) -> Result<Option<u32>, ()>)
     -> Result<(Value, usize), Refusal> {
+    let visible = |row: &&ConfirmedPrincipal| reveal || !foreign_personal(row, caller);
     let candidates: Vec<&ConfirmedPrincipal> = match filter {
-        Some(id) => vec![rows.iter().find(|row| row.employee == id).ok_or(NOT_ALLOCATED)?],
-        None => rows.iter().filter(|row| after.is_none_or(|after| row.label.as_str() > after)).collect(),
+        Some(id) => vec![rows.iter().find(|row| row.employee == id).filter(visible).ok_or(NOT_ALLOCATED)?],
+        None => rows.iter().filter(visible).filter(|row| after.is_none_or(|after| row.label.as_str() > after)).collect(),
     };
-    let (mut listed, mut hidden, mut revealed, mut next) = (Vec::new(), 0usize, 0usize, None);
+    let (mut listed, mut revealed, mut next) = (Vec::new(), 0usize, None);
     for row in candidates {
-        let foreign = matches!(&row.binding, Some(EmployeeBinding::Personal(owner)) if owner.as_str() != caller);
-        if foreign && !reveal { hidden += 1; continue; }
         if listed.len() == PAGE {
             next = listed.last().and_then(|value: &Value| value["label"].as_str().map(str::to_owned));
             break;
         }
-        if foreign { revealed += 1; }
+        if foreign_personal(row, caller) { revealed += 1; }
         let record = match recorded.get(&row.employee) {
             Some(record) => (incarnation(row).map_err(|()| RECORDS_UNAVAILABLE)? == Some(record.incarnation)).then_some(record),
             None => None,
         };
         listed.push(row_value(row, record));
     }
+    // Kept as a key for a stable reply shape; a number only when revealed.
+    let hidden = if reveal { json!(0) } else { Value::Null };
     Ok((json!({ "employees": listed, "next": next, "hidden_personal": hidden, "personal_revealed": reveal,
         // Constant: only changes made through the dashboard are visible here.
         "visibility": "dashboard_changes_only" }), revealed))
