@@ -2015,6 +2015,22 @@ website/console hash comparison and both migration-package signatures before
 provisioning; this function alone is not bootstrap acceptance. Never use curl
 piped to a shell. No production trust material is included in this package.
 
+**Test builds.** `--cfg duduclaw_test_root` selects test trust at compile time
+only. `duduclaw-bootstrap` then pins the TEST root of `scripts/isolation-test-keys.sh`
+and prints `TEST <pin>`; `duduclaw` additionally trusts the TEST licence issuer
+compiled in through `DUDUCLAW_TEST_LICENSE_ISSUER_PUBKEY` under key id `test-root`
+(`production_registry`, `crates/duduclaw-gateway/src/license_runtime.rs`) and
+`duduclaw print-license-issuer` prints `TEST-LICENSE <key>` instead of
+`PRODUCTION-LICENSE <16 hex>`. Every other licence rule (signature, machine
+binding, self-host tier and non-Personal edition, expiry, grace) is unchanged, so
+a TEST licence from `isolation-test-keys.sh license` passes exactly the
+production checks. A build without the cfg compiles none of this. Release tooling
+refuses test builds: the packager refuses the cfg and the variable on every
+build and packaging run, refuses a bootstrap that does not print `PRODUCTION <pin>`,
+and statically refuses a test-licence `duduclaw` (a fixed marker only a test-root
+build contains) wherever it packages, hands off, verifies or signs over an archive,
+except under `--test-signer`.
+
 ### Durability and A/B recovery
 
 `State` stores the committed version/serial/digest together in one atomic
@@ -2107,7 +2123,7 @@ fail closed. Adapters enforce bounded I/O/retry deadlines.
 | B1/G | `GenerationPreparation::{preflight,apply}`: typed digest-bound migrations and runtime artifacts. Preflight makes no data changes. Apply is idempotent and recovers any interrupted publication/migration; updater first drains and stops the gateway. Missing reverse-migration support causes emergency rollback across **any** migration to be refused. |
 | A | Live gateway readback at `/run/duduclaw-gateway-update/readback.sock`, peer UID/GID from the provisioned `duduclaw` account; exactly one gateway component. |
 | C | Live egress readback at `/run/duduclaw-egress-update/readback.sock`, peer UID/GID from `duduclaw-egress`; exactly one egress component. |
-| B1/B2/D/E/G | B1 supplies actual isolated readiness results for non-daemon artifacts. It cannot stand in for gateway/egress endpoints. Report product, version, protocol, actual loaded executable SHA-256, effective UID and readiness for every signed artifact except the updater slot, which has its independent root self-test. Root execution is allowed only for spawnd/trampoline. |
+| B1/B2/D/E/G | B1 reports itself (a live-process report, euid 0) and a FILE MEASUREMENT of every non-daemon artifact: root spawnd hashes, by descriptor through its trusted reader (no symlinks, root:root, not group/other-writable, one link, signed size, signed mode = the kind's: 0755, the signed `isolation-policy-v1` 0444), the file the component is executed (the policy: read) from: the fixed destination for run, run self-test, SSH probe, parse worker, importer, migration and MCP bridge; the committed `generations/<hex>` directory (never `current`) for the egress forwarder and every runtime entry. Such a record is ready only when the digest is the artifact's, and carries the manifest's product/version/protocol and `effective_uid` 0 (the measurer's). It cannot stand in for gateway/egress endpoints, which report live and non-root. `validate_readbacks` classifies every install target as exactly one of the two kinds (exhaustive `match`) and requires one ready report for every signed artifact except the updater slot, which has its independent root self-test. |
 | G | Provision independent bootstrap pin/dual migration signatures, accounts, initial state/receipts, frozen launcher, slots, units, `current`, and trusted anchors. Keep install/generations traversable for service UIDs. Non-root readback daemons bind their own socket in a dedicated service-owned leaf under root-owned `/run`; verify root client credentials. |
 
 `LinuxGenerationActivator` checks `current` is the committed/effective or pending

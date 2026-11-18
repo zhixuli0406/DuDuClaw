@@ -9,6 +9,8 @@
 //! accepts them. A software "security key" proves nothing about hardware, which is
 //! exactly why these keys may only ever pin a `cfg(duduclaw_test_root)` build that
 //! reports `TEST <pin>` (layer 2). This module holds no key material itself.
+//! It also issues TEST licences ([`LicenseIssuerKey`]) that only a
+//! `cfg(duduclaw_test_root)` duduclaw build (`TEST-LICENSE <key>`) accepts.
 use base64::{engine::general_purpose::STANDARD, Engine};
 use duduclaw_isolation::{ids::Sha256Digest, update::*};
 use ed25519_dalek::{Signer, SigningKey as PrivateKey};
@@ -232,6 +234,92 @@ impl TestMinisign {
     }
 }
 
+// ---------------------------------------------------------------- TEST licence issuer
+// Owner decision 2026-11-18: "a TEST build accepts a test issuer". Only a
+// `cfg(duduclaw_test_root)` duduclaw build compiled with this key's public half
+// (`DUDUCLAW_TEST_LICENSE_ISSUER_PUBKEY`) trusts these licences; a production
+// build has no issuer under TEST_LICENSE_KEY_ID.
+
+/// Key id a test-root gateway registers its TEST issuer under (`TEST_ISSUER_KEY_ID`
+/// in crates/duduclaw-gateway/src/license_runtime.rs).
+pub const TEST_LICENSE_KEY_ID: &str = "test-root";
+/// First line of a TEST licence issuer key file (no production key format is accepted).
+pub const LICENSE_KEY_FILE_HEADER: &str = "duduclaw-license-TEST-ONLY-issuer-key-v1";
+/// Longest validity a TEST licence is signed for.
+pub const MAX_TEST_LICENSE_DAYS: i64 = 366;
+
+/// What a TEST licence states; everything else is fixed by [`LicenseIssuerKey::sign`].
+pub struct TestLicense<'a> {
+    pub tier: duduclaw_license::LicenseTier,
+    pub fingerprint: &'a str,
+    pub customer_id: &'a str,
+    pub subscription_id: &'a str,
+    pub valid_days: i64,
+    pub max_agents: Option<u32>,
+}
+
+/// A licence tier by its wire name (`self_host_pro`, `partner`, `oem`, ...).
+pub fn parse_license_tier(text: &str) -> Option<duduclaw_license::LicenseTier> {
+    serde_json::from_value(serde_json::Value::String(text.to_owned())).ok()
+}
+
+fn license_identifier(text: &str) -> bool {
+    !text.is_empty() && text.len() <= 128 && text.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+}
+
+/// The TEST licence issuer: a 32-byte Ed25519 seed in its own TEST-ONLY file format.
+pub struct LicenseIssuerKey { secret: PrivateKey }
+
+impl LicenseIssuerKey {
+    pub fn from_seed(seed: [u8; 32]) -> Self { Self { secret: PrivateKey::from_bytes(&seed) } }
+
+    /// `header\nseed <64 hex>\n`.
+    pub fn to_file(&self) -> String {
+        format!("{LICENSE_KEY_FILE_HEADER}\nseed {}\n", hex::encode(self.secret.to_bytes()))
+    }
+
+    /// Strict inverse of [`LicenseIssuerKey::to_file`]; anything else is `None`.
+    pub fn parse(text: &str) -> Option<Self> {
+        let body = text.strip_suffix('\n')?;
+        let mut lines = body.split('\n');
+        if lines.next()? != LICENSE_KEY_FILE_HEADER { return None; }
+        let seed = lines.next()?.strip_prefix("seed ")?;
+        if lines.next().is_some() || seed.len() != 64
+            || !seed.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) { return None; }
+        Some(Self::from_seed(hex::decode(seed).ok()?.try_into().ok()?))
+    }
+
+    /// 64 lower-case hex: the `DUDUCLAW_TEST_LICENSE_ISSUER_PUBKEY` of a test-root build.
+    pub fn public_hex(&self) -> String { hex::encode(self.secret.verifying_key().to_bytes()) }
+
+    /// A `License` with `public_key_id = TEST_LICENSE_KEY_ID`, signed over the license
+    /// crate's own `canonical_payload()` (the format cannot drift) and checked with its
+    /// `PublicKeyRegistry` before it is returned. `issued_at`/`last_phone_home` are one
+    /// hour in the past so a VM clock slightly behind the signing host still accepts it.
+    /// `None` for an empty or non-printable fingerprint, an identifier outside
+    /// `[A-Za-z0-9_.-]{1,128}` or a validity outside 1..=MAX_TEST_LICENSE_DAYS days.
+    pub fn sign(&self, request: &TestLicense<'_>) -> Option<duduclaw_license::License> {
+        let fingerprint = request.fingerprint;
+        if !(1..=MAX_TEST_LICENSE_DAYS).contains(&request.valid_days) || fingerprint.is_empty()
+            || fingerprint.len() > 256 || !fingerprint.bytes().all(|b| b.is_ascii_graphic())
+            || !license_identifier(request.customer_id) || !license_identifier(request.subscription_id) {
+            return None;
+        }
+        let mut license = duduclaw_license::License::new(request.subscription_id, request.customer_id, request.tier,
+            fingerprint, chrono::Duration::days(request.valid_days), TEST_LICENSE_KEY_ID);
+        let issued = license.issued_at - chrono::Duration::hours(1);
+        license.issued_at = issued;
+        license.last_phone_home = issued;
+        license.max_agents = request.max_agents;
+        let payload = license.canonical_payload().ok()?;
+        license.signature = self.secret.sign(&payload).to_bytes().to_vec();
+        duduclaw_license::PublicKeyRegistry::new()
+            .with_key(TEST_LICENSE_KEY_ID, self.secret.verifying_key().to_bytes().to_vec())
+            .verify(&license).ok()?;
+        Some(license)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,6 +424,61 @@ mod tests {
             good.replace(KEY_FILE_HEADER, "duduclaw-isolation-key-v1"), good.to_uppercase(), good.replace("seed 07", "seed 0g"),
             "-----BEGIN OPENSSH PRIVATE KEY-----\n".to_owned(), good.replace('\n', "\r\n")] {
             assert!(TestKey::parse(&bad).is_none(), "{bad:?}");
+        }
+    }
+
+    fn test_license<'a>(fingerprint: &'a str, max_agents: Option<u32>) -> TestLicense<'a> {
+        TestLicense { tier: duduclaw_license::LicenseTier::SelfHostPro, fingerprint, customer_id: "cus_TEST",
+            subscription_id: "sub_TEST.1", valid_days: 30, max_agents }
+    }
+
+    #[test]
+    fn test_licence_round_trips_through_the_license_crate_verifier() {
+        use duduclaw_license::{License, LicenseError, PublicKeyRegistry};
+        let issuer = LicenseIssuerKey::from_seed([41; 32]);
+        let parsed_key = LicenseIssuerKey::parse(&issuer.to_file()).unwrap();
+        assert_eq!(parsed_key.public_hex(), issuer.public_hex());
+        assert_eq!(issuer.public_hex().len(), 64);
+        let public = hex::decode(issuer.public_hex()).unwrap();
+        let registry = PublicKeyRegistry::new().with_key(TEST_LICENSE_KEY_ID, public.clone());
+        let license = issuer.sign(&test_license("macos-uuid-v2:00112233445566778899aabbccddeeff", Some(3))).unwrap();
+        assert_eq!(license.public_key_id, "test-root");
+        assert_eq!(license.max_agents, Some(3));
+        assert!(license.issued_at < chrono::Utc::now());
+        // Through the JSON file exactly as the installer and the gateway read it.
+        let file = serde_json::to_vec_pretty(&license).unwrap();
+        let read: License = serde_json::from_slice(&file).unwrap();
+        registry.verify(&read).unwrap();
+        // The same licence under the production id, or from another issuer, does not verify.
+        let production = PublicKeyRegistry::new().with_key("v2", public);
+        assert!(matches!(production.verify(&read), Err(LicenseError::UnknownPublicKeyId(_))));
+        let other = LicenseIssuerKey::from_seed([42; 32]).sign(&test_license("fp", None)).unwrap();
+        assert!(matches!(registry.verify(&other), Err(LicenseError::InvalidSignature)));
+        // Every signed field is covered: tier, binding and quota edits are refused.
+        let edits: [fn(&mut License); 4] = [|l| l.tier = duduclaw_license::LicenseTier::Oem,
+            |l| l.machine_fingerprint = "elsewhere".into(), |l| l.max_agents = None,
+            |l| l.expires_at = l.expires_at + chrono::Duration::days(1)];
+        for edit in edits {
+            let mut tampered = read.clone();
+            edit(&mut tampered);
+            assert!(matches!(registry.verify(&tampered), Err(LicenseError::InvalidSignature)));
+        }
+        // Inputs outside the TEST rules are refused, never clamped.
+        for request in [test_license("", None), test_license("has space", None),
+                        TestLicense { valid_days: 0, ..test_license("fp", None) },
+                        TestLicense { valid_days: MAX_TEST_LICENSE_DAYS + 1, ..test_license("fp", None) },
+                        TestLicense { customer_id: "cus/../x", ..test_license("fp", None) },
+                        TestLicense { subscription_id: "", ..test_license("fp", None) }] {
+            assert!(issuer.sign(&request).is_none());
+        }
+        assert_eq!(parse_license_tier("self_host_pro"), Some(duduclaw_license::LicenseTier::SelfHostPro));
+        assert_eq!(parse_license_tier("partner"), Some(duduclaw_license::LicenseTier::Partner));
+        assert!(parse_license_tier("team").is_none());
+        // The key file format is strict and distinct from the isolation key files.
+        let good = issuer.to_file();
+        for bad in [good.trim_end().to_owned(), format!("{good}\n"), good.to_uppercase(),
+                    good.replace(LICENSE_KEY_FILE_HEADER, KEY_FILE_HEADER), TestKey::from_seed(Role::Root, [41; 32]).to_file()] {
+            assert!(LicenseIssuerKey::parse(&bad).is_none(), "{bad:?}");
         }
     }
 }

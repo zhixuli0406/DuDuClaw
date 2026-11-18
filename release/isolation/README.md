@@ -77,3 +77,15 @@ Implementation and VM acceptance use the TEST key set of
 `scripts/isolation-test-keys.sh` (owner decision Q1). Its pin only ever goes into a
 `--cfg duduclaw_test_root` build, which prints `TEST <pin>` and is refused by every
 release path; it is never written to this directory.
+
+The same kit makes the TEST licence the VM install needs (owner decision
+2026-11-18: no production team licence is issued for tests). Only a test-root
+`duduclaw` compiled with `DUDUCLAW_TEST_LICENSE_ISSUER_PUBKEY` trusts its issuer
+(key id `test-root`; `duduclaw print-license-issuer` prints `TEST-LICENSE <key>`,
+a release build `PRODUCTION-LICENSE <16 hex>`); a production build contains no
+trace of it. Release tooling refuses both: `scripts/package-linux-release.py`
+refuses test-root RUSTFLAGS and that variable on every build or packaging run and
+statically refuses a test-licence `duduclaw` (it carries a fixed marker) in
+packaging, the cross-build hand-off, `--verify-archive` and
+`--from-release-archive` (so also `scripts/release.sh isolation-sign`); the only
+exception is `--test-signer`, whose outputs are TEST-ONLY.

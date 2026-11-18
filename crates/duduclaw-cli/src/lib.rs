@@ -2049,6 +2049,12 @@ enum ToolingCommands {
         max_chars: usize,
     },
 
+    /// (internal) Print this build's licence issuer identity as one line
+    /// (`PRODUCTION-LICENSE <16 hex>` or `TEST-LICENSE <hex|none>`) and exit.
+    /// Reads only compiled constants: no configuration, home directory or network.
+    #[command(hide = true, name = "print-license-issuer")]
+    PrintLicenseIssuer,
+
     /// Document knowledge base tools.
     #[command(subcommand)]
     Knowledge(KnowledgeCommands),
@@ -3305,6 +3311,18 @@ mod agent_interactive_deprecation_tests {
             assert!(agent.get_subcommands().any(|command| command.get_name() == "run"));
         });
     }
+
+    #[test]
+    fn print_license_issuer_is_a_hidden_argument_free_leaf() {
+        run_on_big_stack(|| {
+            let cli = Cli::try_parse_from(["duduclaw", "print-license-issuer"]).unwrap();
+            assert!(matches!(cli.command, Commands::Tooling(ToolingCommands::PrintLicenseIssuer)));
+            assert!(Cli::try_parse_from(["duduclaw", "print-license-issuer", "x"]).is_err());
+            let root = Cli::command();
+            let leaf = root.find_subcommand("print-license-issuer").expect("print-license-issuer");
+            assert!(leaf.is_hide_set());
+        });
+    }
 }
 
 /// H10 (2026-09 feature audit): `duduclaw hook data-file-guard` exists as a
@@ -4250,6 +4268,11 @@ pub async fn entry_point() {
     if import_requested && (!matches!(&cli.command, Commands::Run { .. }) || cli.force_disable_redaction) {
         eprintln!("Error: migration import startup refused");
         std::process::exit(1);
+    }
+    if matches!(&cli.command, Commands::Tooling(ToolingCommands::PrintLicenseIssuer)) {
+        // Build identity only: before logging, TLS, the home directory or anything else.
+        println!("{}", duduclaw_gateway::license_runtime::license_build_identity());
+        return;
     }
     if matches!(&cli.command, Commands::Run { .. }) {
         match duduclaw_gateway::migration_startup::maybe_run(&duduclaw_home()).await {
@@ -5828,6 +5851,10 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         Commands::Tooling(ToolingCommands::McpServer) => cmd_mcp_server().await,
         Commands::Tooling(ToolingCommands::KnowledgeExtract { format, input, max_chars }) => {
             knowledge_extract_cmd::run(&format, &input, max_chars)
+        }
+        Commands::Tooling(ToolingCommands::PrintLicenseIssuer) => {
+            println!("{}", duduclaw_gateway::license_runtime::license_build_identity());
+            Ok(())
         }
         Commands::Tooling(ToolingCommands::Knowledge(KnowledgeCommands::Eval {
             docs,

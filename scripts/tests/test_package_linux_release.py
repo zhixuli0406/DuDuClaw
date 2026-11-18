@@ -31,7 +31,9 @@ BOOTSTRAP = PACKAGE.BOOTSTRAP_BINARY
 # Every variable that could carry a pin or a test-root setting into a test run.
 BOOTSTRAP_ENVIRONMENT = (PACKAGE.BOOTSTRAP_PIN_VARIABLE, PACKAGE.BOOTSTRAP_TEST_KEY_VARIABLE, "RUSTFLAGS",
                          "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS",
-                         "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS")
+                         "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS", PACKAGE.TEST_LICENSE_ISSUER_VARIABLE)
+# A duduclaw built with `--cfg duduclaw_test_root` and a TEST licence issuer.
+TEST_LICENSE_GATEWAY = b"\x7fELF\x00GLIBC_2.17\x00duduclaw" + PACKAGE.TEST_LICENSE_MARKER + b"\x00rest"
 
 
 LINUX = sys.platform.startswith("linux")
@@ -308,11 +310,19 @@ class LinuxReleaseTests(unittest.TestCase):
         # Without a pin the build the script runs does not even produce the verifier.
         self.assertNotIn(BOOTSTRAP, PACKAGE.build_command(TARGET, "cargo", False))
 
-    def test_no_pin_omits_bootstrap_even_from_a_test_root_build(self):
+    def test_test_root_build_settings_are_refused_without_a_pin_too(self):
+        # duduclaw itself is a test-root build there (TEST licence issuer): refused, pin or not.
         release = self.cargo_layout()
-        self.run_main(release, [], environment={"RUSTFLAGS": "--cfg duduclaw_test_root",
-                                                PACKAGE.BOOTSTRAP_TEST_KEY_VARIABLE: "RWQtest"})
-        self.assertNotIn(BOOTSTRAP, self.archive_names())
+        for environment in ({"RUSTFLAGS": "--cfg duduclaw_test_root"},
+                            {PACKAGE.BOOTSTRAP_TEST_KEY_VARIABLE: "RWQtest"},
+                            {PACKAGE.TEST_LICENSE_ISSUER_VARIABLE: "ab" * 32}):
+            for skip_build in (True, False):
+                with self.subTest(environment=environment, skip_build=skip_build):
+                    calls = []
+                    with self.assertRaisesRegex(ValueError, "refusing a production build or package"):
+                        self.run_main(release, calls, environment=environment, skip_build=skip_build)
+                    self.assertFalse(any(call[1:2] == ["build"] for call in calls))
+                    self.assertFalse(self.output.exists())
 
     def test_environment_pin_only_feeds_a_build_this_run_performs(self):
         release = self.cargo_layout()
@@ -1150,8 +1160,108 @@ class LinuxReleaseTests(unittest.TestCase):
         block = re.search(r'\[\[bin\]\]\nname = "duduclaw-isolation-test-signer"\n(?:[^\[\n][^\n]*\n)*', manifest)
         self.assertIsNotNone(block)
         self.assertIn('required-features = ["test-signer"]', block[0])
-        self.assertIn('test-signer = ["dep:blake2"]', manifest)
+        self.assertIn('test-signer = ["dep:blake2", "dep:duduclaw-license", "dep:chrono"]', manifest)
         self.assertNotRegex(manifest, r'(?m)^default\s*=.*test-signer')
+
+    # ---------------------------------------------------------------- TEST-licence gateway
+
+    def marked_archive(self, name):
+        """A release archive whose duduclaw is a TEST-licence build, made by hand
+        (as scripts/isolation-test-keys.sh bundle --gateway does): the packager refuses to."""
+        archive = self.archive_with(False, name)
+        directory = self.root / f"{name}-marked"
+        directory.mkdir()
+        copy = directory / archive.name
+        with tarfile.open(archive, "r:gz") as source, tarfile.open(copy, "w:gz") as bundle:
+            for member in source.getmembers():
+                if member.name == PACKAGE.GATEWAY_BINARY:
+                    member.size = len(TEST_LICENSE_GATEWAY)
+                    bundle.addfile(member, io.BytesIO(TEST_LICENSE_GATEWAY))
+                else:
+                    bundle.addfile(member, source.extractfile(member) if member.isfile() else None)
+        Path(str(copy) + ".sha256").write_text(f"{PACKAGE.sha256(copy)}  {copy.name}\n")
+        return copy
+
+    def run_from_release_archive(self, archive, extra=()):
+        """main() --from-release-archive with the glibc check and the signer faked; returns
+        (test_signer argument of each sign_release call, stdout)."""
+        signed, output = [], io.StringIO()
+        argv = ["package-linux-release.py", "--target", TARGET, "--output-dir", str(self.output),
+                "--from-release-archive", str(archive), "--signing-key", str(self.root / "target-key"),
+                "--manifest-template", str(self.root / "template.json"), *extra]
+        with patch.object(PACKAGE, "sign_release", lambda *args, **kwargs: signed.append(args[7]) or []), \
+                patch.object(PACKAGE.subprocess, "run", lambda command, **kwargs: subprocess.CompletedProcess(command, 0)), \
+                patch.object(sys, "argv", argv), patch.dict(os.environ, {"CI": "", "GITHUB_ACTIONS": ""}), \
+                contextlib.redirect_stdout(output):
+            PACKAGE.main()
+        return signed, output.getvalue()
+
+    def test_test_license_marker_matches_the_test_root_only_gateway_constant(self):
+        source = (ROOT / "crates/duduclaw-gateway/src/license_runtime.rs").read_text()
+        marker = PACKAGE.TEST_LICENSE_MARKER.decode("ascii")
+        # Compiled only into a test-root build, and kept alive there.
+        self.assertIn(f'#[cfg(duduclaw_test_root)]\n#[used]\nstatic TEST_LICENSE_BUILD_MARKER: &[u8] = b"{marker}";',
+                      source)
+        self.assertEqual(source.count(marker), 1)
+        self.assertIn(f'option_env!("{PACKAGE.TEST_LICENSE_ISSUER_VARIABLE}")', source)
+        # Found across read-chunk borders; a near miss is not a match.
+        def reader(*parts):
+            queue = list(parts)
+            return lambda size: queue.pop(0) if queue else b""
+        found = PACKAGE.TEST_LICENSE_MARKER
+        self.assertTrue(PACKAGE.has_test_license_marker(reader(b"x" * 9 + found[:5], found[5:] + b"y")))
+        self.assertTrue(PACKAGE.has_test_license_marker(reader(b"a", b"b" + found)))
+        self.assertFalse(PACKAGE.has_test_license_marker(reader(b"x" + found[:-1], b"z" + found[-1:])))
+        self.assertFalse(PACKAGE.has_test_license_marker(reader()))
+
+    def test_test_license_gateway_is_refused_by_every_packaging_path(self):
+        # A clean gateway passes, and --verify-archive says so.
+        clean = self.archive_with(False, "clean")
+        self.assertIn(f"{PACKAGE.GATEWAY_BINARY}: no TEST licence issuer",
+                      PACKAGE.verify_archive(clean, TARGET, None, VERSION))
+        marked = self.marked_archive("marked")
+        (self.binaries / PACKAGE.GATEWAY_BINARY).write_bytes(TEST_LICENSE_GATEWAY)
+        # The archive writer itself.
+        with self.assertRaisesRegex(ValueError, "TEST-licence build"):
+            self.create(pin=None)
+        self.assertFalse(self.output.exists())
+        release = self.cargo_layout()
+        # Packaging (no pin and pinned), the hand-off export and the native hand-off import.
+        for extra in ([], ["--bootstrap-root-sha256", PIN]):
+            with self.subTest(extra=extra):
+                with self.assertRaisesRegex(ValueError, "TEST-licence build"):
+                    self.run_main(release, [], extra=extra, probes=good_probes())
+                self.assertFalse(self.output.exists())
+        handoff = self.root / "marked-handoff"
+        with self.assertRaisesRegex(ValueError, "TEST-licence build"):
+            self.run_main(release, [], extra=["--export-binaries", str(handoff)])
+        self.assertFalse(handoff.exists())
+        # A finished archive holding one: --verify-archive refuses before any verifier is executed.
+        calls = []
+        for pin in (None, PIN):
+            with self.subTest(verify=pin), self.seam(calls=calls), self.assertRaisesRegex(ValueError, "TEST-licence"):
+                PACKAGE.verify_archive(marked, TARGET, pin, VERSION)
+        self.assertFalse(any(call[0] == "probe" for call in calls))
+
+    def test_only_the_test_signer_path_signs_over_a_test_license_gateway(self):
+        marked = self.marked_archive("signing")
+        with self.assertRaisesRegex(ValueError, "TEST-licence build"):
+            self.run_from_release_archive(marked)
+        signer = self.root / "test-signer"
+        signed, output = self.run_from_release_archive(marked, ["--test-signer", str(signer)])
+        self.assertEqual(signed, [signer])
+        self.assertIn(f"TEST-ONLY: {PACKAGE.GATEWAY_BINARY} is a TEST-licence build", output)
+        # A clean archive signs without the TEST note, with or without the test signer.
+        clean = self.archive_with(False, "clean-signing")
+        signed, output = self.run_from_release_archive(clean)
+        self.assertEqual(signed, [None])
+        self.assertNotIn("TEST-licence", output)
+
+    def test_test_license_issuer_variable_is_refused(self):
+        for value in ("ab" * 32, ""):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, PACKAGE.TEST_LICENSE_ISSUER_VARIABLE):
+                PACKAGE.refuse_test_root_environment({PACKAGE.TEST_LICENSE_ISSUER_VARIABLE: value}, TARGET)
+        PACKAGE.refuse_test_root_environment({"DUDUCLAW_LICENSE_PUBKEY_V2": "ab" * 32}, TARGET)
 
     def test_pin_file_absent_means_no_bootstrap_and_present_is_strict(self):
         missing = self.root / "release" / "bootstrap-root.sha256"

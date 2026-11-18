@@ -10,8 +10,9 @@ explicit production root pin: --bootstrap-root-sha256 <hex>, or
 --bootstrap-root-pin-file release/bootstrap-root.sha256 (the public file added
 after the key ceremony; while it is absent there is no production pin, which is
 the documented way to build an archive WITHOUT the verifier: it is then not
-built, not archived, and both a SKIP line and the final summary say so). With a
-pin, a test-root build environment is refused, and create_archive() itself runs
+built, not archived, and both a SKIP line and the final summary say so). A
+test-root build environment is refused on every build/package run (pin or not;
+see TEST-licence gateway below). With a pin, create_archive() itself runs
 one uninterruptible flow for the verifier: read the staged file ONCE into an
 anonymous memfd, seal it, check the seals, hash it, require an ELF for the
 target, execute that descriptor twice (it must report exactly `PRODUCTION <pin>`
@@ -55,6 +56,15 @@ TEST-ONLY: duduclaw-isolation-test-signer is never built, listed or packaged her
 a build command that names the `test-signer` feature or that binary is refused.
 --test-signer is accepted only with --from-release-archive and without any root
 pin (scripts/isolation-test-keys.sh), never for a production artifact.
+
+TEST-licence gateway: a `--cfg duduclaw_test_root` duduclaw also trusts a
+compiled TEST licence issuer (`duduclaw print-license-issuer` prints
+TEST-LICENSE) and carries TEST_LICENSE_MARKER. Every run that builds, hands off
+or packages refuses test-root RUSTFLAGS and DUDUCLAW_TEST_LICENSE_ISSUER_PUBKEY in
+its environment, and the duduclaw bytes that are packaged, handed off, checked by
+--verify-archive or signed over by --from-release-archive must not carry the
+marker (a static check, so cross-built archives are covered). The only exception
+is --from-release-archive --test-signer, whose outputs are TEST-ONLY anyway.
 """
 import argparse
 import collections
@@ -137,6 +147,14 @@ MAX_PIN_FILE_BYTES = 128
 # or packaged by this script (plan R2 §4.2, test-key leak layer 1).
 TEST_SIGNER_BINARY = "duduclaw-isolation-test-signer"
 TEST_SIGNER_FEATURE = "test-signer"
+# TEST-licence gateway (crates/duduclaw-gateway/src/license_runtime.rs): a
+# `--cfg duduclaw_test_root` duduclaw also trusts the TEST licence issuer compiled
+# in through this variable and embeds this marker, so it is recognised from its
+# bytes alone (cross-built archives cannot be executed here). It is never built,
+# packaged or verified as a release; the only exception is --test-signer.
+GATEWAY_BINARY = "duduclaw"
+TEST_LICENSE_ISSUER_VARIABLE = "DUDUCLAW_TEST_LICENSE_ISSUER_PUBKEY"
+TEST_LICENSE_MARKER = b"DUDUCLAW-TEST-LICENSE-ISSUER-BUILD"
 # Flag variables Cargo hands to rustc, with their separators (Cargo reference,
 # "Environment variables"); CARGO_TARGET_<TRIPLE>_RUSTFLAGS is checked as well.
 RUSTFLAGS_VARIABLES = (("CARGO_ENCODED_RUSTFLAGS", "\x1f"), ("RUSTFLAGS", None), ("CARGO_BUILD_RUSTFLAGS", None))
@@ -351,14 +369,39 @@ def enables_test_root(tokens):
 
 
 def refuse_test_root_environment(environment, target):
-    """A pinned production verifier is never built or packaged next to test-root settings."""
-    if BOOTSTRAP_TEST_KEY_VARIABLE in environment:
-        raise ValueError(f"{BOOTSTRAP_TEST_KEY_VARIABLE} is set: refusing to package a production bootstrap verifier")
+    """No production build or package (duduclaw and the pinned verifier) runs next to test-root settings."""
+    for variable in (BOOTSTRAP_TEST_KEY_VARIABLE, TEST_LICENSE_ISSUER_VARIABLE):
+        if variable in environment:
+            raise ValueError(f"{variable} is set: refusing a production build or package")
     target_variable = "CARGO_TARGET_" + re.sub(r"[^A-Za-z0-9]", "_", target).upper() + "_RUSTFLAGS"
     for variable, separator in (*RUSTFLAGS_VARIABLES, (target_variable, None)):
         value = environment.get(variable)
         if value is not None and enables_test_root(rustflag_tokens(value, separator)):
-            raise ValueError(f"{variable} enables --cfg {TEST_ROOT_CFG}: refusing to package a production bootstrap verifier")
+            raise ValueError(f"{variable} enables --cfg {TEST_ROOT_CFG}: refusing a production build or package")
+
+
+def has_test_license_marker(read):
+    """True when the bytes `read(size)` yields contain TEST_LICENSE_MARKER (also across chunk borders)."""
+    keep = len(TEST_LICENSE_MARKER) - 1
+    tail = b""
+    while chunk := read(1024 * 1024):
+        window = tail + chunk
+        if TEST_LICENSE_MARKER in window:
+            return True
+        tail = window[-keep:]
+    return False
+
+
+def refuse_test_license_build(read, name):
+    """Static check, never an execution: a TEST-licence duduclaw is never packaged or shipped."""
+    if has_test_license_marker(read):
+        raise ValueError(f"{name} is a TEST-licence build (cfg({TEST_ROOT_CFG}) with a compiled TEST licence "
+                         "issuer); refusing to package or ship it")
+
+
+def refuse_test_license_binary(path, name):
+    with open(path, "rb") as source:
+        refuse_test_license_build(source.read, name)
 
 
 def host_architecture():
@@ -783,6 +826,8 @@ def create_archive(binary_dir, python_dir, target, output_dir, *, binaries, boot
             shutil.copyfile(binary_dir / name, stage / name)
             (stage / name).chmod(0o755)
             validate_binary(stage / name)
+        # The archived gateway bytes themselves: no release archive holds a TEST-licence build.
+        refuse_test_license_binary(stage / GATEWAY_BINARY, GATEWAY_BINARY)
         for name, source in ARCHIVE_ALIASES.items():
             shutil.copyfile(stage / source, stage / name)
             (stage / name).chmod(0o755)
@@ -914,6 +959,7 @@ def extract_member(bundle, member, destination):
 def verify_archive(archive, target, pin, version):
     """Check a finished release archive: with a pin its verifier is executed here
     and must report PRODUCTION <pin> and this version; without one it must be absent.
+    Its duduclaw must not be a TEST-licence build (static check of the member bytes).
 
     The member is executed through the sealed flow from a sealed copy of exactly
     its archived bytes, never from an extracted path. Returns one summary line
@@ -925,17 +971,20 @@ def verify_archive(archive, target, pin, version):
         copy, digest = verified_release_archive(archive, target, stage)
         with tarfile.open(copy, "r:gz") as bundle:
             members = bundle.getmembers()
+            with _member_source(bundle, single_member(members, GATEWAY_BINARY, MAX_BINARY_BYTES)) as (read, _):
+                refuse_test_license_build(read, GATEWAY_BINARY)
+            gateway = f"{GATEWAY_BINARY}: no TEST licence issuer"
             shipped = [member for member in members if member.name == BOOTSTRAP_BINARY]
             if pin is None:
                 if shipped:
                     raise ValueError(f"{Path(archive).name} contains {BOOTSTRAP_BINARY} although no production "
                                      "root pin is configured; refusing")
                 return (f"{arch}: {BOOTSTRAP_BINARY} NOT shipped (no production root pin configured); "
-                        f"archive sha256 {digest}")
+                        f"{gateway}; archive sha256 {digest}")
             member = single_member(members, BOOTSTRAP_BINARY, MAX_BINARY_BYTES)
             report = _verified_bootstrap(lambda: _member_source(bundle, member), target, pin, version)
         return (f"{arch}: {BOOTSTRAP_BINARY} shipped, executed on this host: PRODUCTION {report.pin}, "
-                f"sha256 {report.sha256}; archive sha256 {digest}")
+                f"sha256 {report.sha256}; {gateway}; archive sha256 {digest}")
 
 
 def extract_bootstrap(archive, target, output_dir):
@@ -1498,6 +1547,14 @@ def main():
             snapshot = Path(temporary)
             snapshot.chmod(0o700)
             names, digest = snapshot_release_archive(args.from_release_archive, args.target, snapshot)
+            # The one exception: the explicit TEST path (scripts/isolation-test-keys.sh bundle) may
+            # sign over a TEST-licence duduclaw; its outputs are already TEST-labelled above.
+            if args.test_signer is None:
+                refuse_test_license_binary(snapshot / GATEWAY_BINARY, GATEWAY_BINARY)
+            else:
+                with open(snapshot / GATEWAY_BINARY, "rb") as source:
+                    if has_test_license_marker(source.read):
+                        print(f"TEST-ONLY: {GATEWAY_BINARY} is a TEST-licence build; it accepts TEST licences.")
             for name in names:
                 subprocess.run([sys.executable, "-I", "-B", str(ROOT / "scripts/check_glibc.py"), str(snapshot / name)],
                                check=True, env=load_signer().child_environment(), stdin=subprocess.DEVNULL)
@@ -1529,10 +1586,11 @@ def main():
     if args.verify_archive is not None:
         print(verify_archive(args.verify_archive, args.target, pin, version))
         return
+    # Every run that builds, hands off or packages duduclaw (with or without a pinned
+    # verifier) refuses test-root and TEST-licence build settings.
+    refuse_test_root_environment(os.environ, args.target)
     if pin is None:
         print(OMITTED_BOOTSTRAP_LINE)
-    else:
-        refuse_test_root_environment(os.environ, args.target)
     if not args.skip_build:
         command = refuse_test_signer_build(build_command(args.target, args.build_tool, pin is not None))
         subprocess.run(command, cwd=ROOT, check=True, env=build_environment(os.environ, pin, args.build_tool))
@@ -1566,6 +1624,8 @@ def main():
                 raise ValueError(f"handed-off {name} does not match {TRANSFER_SUMS}; refusing to package it")
             subprocess.run([sys.executable, "-I", "-B", str(ROOT / "scripts/check_glibc.py"),
                             str(snapshot / name)], check=True)
+        # Before a hand-off or an archive: never a TEST-licence gateway (create_archive checks again).
+        refuse_test_license_binary(snapshot / GATEWAY_BINARY, GATEWAY_BINARY)
         if args.export_binaries is not None:
             export_binaries(snapshot, binaries, args.export_binaries, pin)
             return

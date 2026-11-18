@@ -282,3 +282,8 @@ rand = "0.8"
 # so the two halves are proven compatible against actual code, not a
 # hand-written stand-in that could itself drift from the real service.
 duduclaw-relay = { workspace = true }
+
+# license_runtime.rs: a `--cfg duduclaw_test_root` build also trusts its compiled
+# TEST licence issuer (same cfg as the duduclaw-updated test-key verifier).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(duduclaw_test_root)'] }

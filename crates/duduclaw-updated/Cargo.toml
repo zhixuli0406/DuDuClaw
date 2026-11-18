@@ -20,8 +20,9 @@ path = "src/bin/duduclaw-isolation-test-signer.rs"
 required-features = ["test-signer"]
 
 [features]
-# Software-simulated root/target/minisign test keys. Never enabled by a release build.
-test-signer = ["dep:blake2"]
+# Software-simulated root/target/minisign test keys and the TEST licence issuer.
+# Never enabled by a release build.
+test-signer = ["dep:blake2", "dep:duduclaw-license", "dep:chrono"]
 
 [dependencies]
 duduclaw-isolation.workspace = true
@@ -37,6 +38,11 @@ minisign-verify = "0.2"
 # Only for the `test-signer` feature (prehashed minisign test signatures); already
 # in Cargo.lock as this crate's dev-dependency.
 blake2 = { version = "0.10", optional = true }
+# Only for the `test-signer` feature: TEST licences are built and signed with the
+# license crate's own types and canonical payload (workspace crate; chrono is
+# already in Cargo.lock).
+duduclaw-license = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
@@ -46,6 +52,9 @@ nix = { version = "0.29", features = ["socket", "uio", "user", "fs"] }
 tempfile = "3"
 # Test-only minisign signer (prehashed BLAKE2b-512); already in Cargo.lock.
 blake2 = "0.10"
+# Unit tests of the TEST licence issuer (test_signer.rs).
+duduclaw-license = { workspace = true }
+chrono = { workspace = true }
 
 [lints]
 workspace = true
