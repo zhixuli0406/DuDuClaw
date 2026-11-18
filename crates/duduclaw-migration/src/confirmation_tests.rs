@@ -536,9 +536,19 @@ impl ProposalApplier for Calls {
     fn read_back(&mut self, _: &ConfirmationItem) -> Result<()> { self.call(2) }
     fn disable_and_read_back(&mut self, _: &ConfirmationItem) -> Result<()> { self.call(3) }
 }
-/// A `stop` answering `true` from its `from`-th call on (1-based); `calls` counts them.
-fn stop_from(calls: &std::cell::Cell<usize>, from: usize) -> impl Fn() -> bool + '_ {
-    move || { calls.set(calls.get() + 1); calls.get() >= from }
+/// A gate closed from its `from`-th use on (1-based; an `is_closed` peek and
+/// an `enter` each count as one use); `calls` counts them.
+struct ClosedFrom<'a> { calls: &'a std::cell::Cell<usize>, from: usize }
+impl EffectGate for ClosedFrom<'_> {
+    fn enter(&self) -> Option<EffectPermit<'_>> { (!self.is_closed()).then(EffectPermit::untracked) }
+    fn is_closed(&self) -> bool { self.calls.set(self.calls.get() + 1); self.calls.get() >= self.from }
+}
+fn stop_from(calls: &std::cell::Cell<usize>, from: usize) -> ClosedFrom<'_> { ClosedFrom { calls, from } }
+/// A gate closed from the start.
+struct Closed;
+impl EffectGate for Closed {
+    fn enter(&self) -> Option<EffectPermit<'_>> { None }
+    fn is_closed(&self) -> bool { true }
 }
 fn state(store: &ConfirmationStore, binding: &ProposalBinding) -> (ConfirmationStatus, Option<i64>) {
     (required(&store.conn, binding).unwrap().status, step(&store.conn, binding).unwrap())
@@ -629,7 +639,7 @@ fn retry_effect_gate_sends_no_disable_keeps_failed_and_the_same_retry_completes(
         assert_eq!(intents(&store), 0);
     }
     assert_eq!(events(&store, "retry_interrupted"), 1);
-    store.retry_until(&item.binding, &session(), [7; 32], 101, &mut adapter, &Valid, &|| false).unwrap();
+    store.retry_until(&item.binding, &session(), [7; 32], 101, &mut adapter, &Valid, &OpenGate).unwrap();
     assert_eq!(adapter.calls, vec![0, 3, 3]);
     assert_eq!(state(&store, &item.binding).0, ConfirmationStatus::Applying);
     for _ in 0..3 { store.apply_next(&item.binding, &mut adapter).unwrap(); }
@@ -663,13 +673,13 @@ fn reject_effect_gate_sends_no_disable_keeps_state_and_the_same_reject_completes
             assert_eq!(intents(&store), 0);
         }
         assert_eq!(events(&store, "reject_interrupted"), 1);
-        store.reject_until(&item.binding, &session(), [7; 32], 101, &mut adapter, &|| false).unwrap();
+        store.reject_until(&item.binding, &session(), [7; 32], 101, &mut adapter, &OpenGate).unwrap();
         assert_eq!(adapter.calls.last(), Some(&3));
         assert_eq!(state(&store, &item.binding).0, ConfirmationStatus::Rejected);
     }
     let mut store = store(); let item = stage(&mut store, 1, ConfirmationCategory::Department);
     let mut adapter = Calls::default();
-    store.reject_until(&item.binding, &session(), [7; 32], 101, &mut adapter, &|| true).unwrap();
+    store.reject_until(&item.binding, &session(), [7; 32], 101, &mut adapter, &Closed).unwrap();
     assert!(adapter.calls.is_empty());
     assert_eq!(state(&store, &item.binding).0, ConfirmationStatus::Rejected);
 }
@@ -694,10 +704,15 @@ fn retry_waiting_for_the_writer_while_shutdown_begins_sends_no_disable() {
     let stopping = Arc::new(AtomicBool::new(false));
     let flag = stopping.clone();
     let binding = item.binding;
+    /// Closed once the flag is set (a test stand-in for the gateway's gate).
+    struct Flag(Arc<AtomicBool>);
+    impl EffectGate for Flag {
+        fn enter(&self) -> Option<EffectPermit<'_>> { (!self.is_closed()).then(EffectPermit::untracked) }
+        fn is_closed(&self) -> bool { self.0.load(Ordering::SeqCst) }
+    }
     let worker = std::thread::spawn(move || {
         let mut adapter = Calls::default();
-        let result = store.retry_until(&binding, &session(), [7; 32], 101, &mut adapter, &Valid,
-            &|| flag.load(Ordering::SeqCst));
+        let result = store.retry_until(&binding, &session(), [7; 32], 101, &mut adapter, &Valid, &Flag(flag));
         (store, adapter.calls, result)
     });
     std::thread::sleep(std::time::Duration::from_millis(300));

@@ -81,10 +81,14 @@ pub(crate) struct GatewayAuthority {
     /// R7d: the bounded re-run of a stage the root answered "pending".
     pending: bridge::PendingWait,
 }
-/// R7d: stops every pending-allocation wait (gateway shutdown).
+/// R7d round 4: closes the process-wide effect gate (gateway shutdown): no
+/// new migration effect starts, every pending-allocation wait stops.
 pub(crate) fn begin_shutdown() { bridge::begin_shutdown() }
-/// R7d round 2: whether gateway shutdown has begun (apply step gate).
-pub(crate) fn shutting_down() -> bool { bridge::shutting_down() }
+/// R7d round 4: the process-wide effect gate of the confirmation flow.
+pub(crate) fn shutdown_gate() -> &'static ShutdownGate { &bridge::SHUTDOWN_GATE }
+pub(crate) use bridge::ShutdownGate;
+#[cfg(test)]
+pub(crate) use bridge::Descheduled;
 #[derive(Serialize, Deserialize)]
 #[serde(tag="kind", deny_unknown_fields)]
 enum Plan {

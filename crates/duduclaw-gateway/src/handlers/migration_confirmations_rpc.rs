@@ -1,8 +1,8 @@
 //! Live dashboard authorization, atomic decisions, and bounded durable apply.
 use super::*;
-use duduclaw_migration::{confirmation::{ApprovalSession, ConfirmationStore},
+use duduclaw_migration::{confirmation::{ApprovalSession, ConfirmationStore, EffectGate},
     contract::{ProposalBinding, ConfirmationStatus}, ids::RequestId};
-use super::migration_authority::{GatewayAuthority, GatewayAccountReadback, LiveAuthority, MigrationAuthorityBackend};
+use super::migration_authority::{GatewayAuthority, GatewayAccountReadback, LiveAuthority, MigrationAuthorityBackend, ShutdownGate};
 use super::migration_authority::employee::EmployeeAuthority;
 
 /// R7d: an employee allocation whose SSH refusal spawnd has not verified
@@ -14,8 +14,8 @@ pub(super) const ALLOCATION_PENDING: &str = "帳號安全驗證尚未完成，�
 /// because gateway shutdown has begun; the item keeps its state.
 pub(super) const SHUTTING_DOWN_RETRY: &str = "服務正在關閉，請稍後重試";
 
-/// R7d round 1: confirmation apply loops (approve / retry / reject) that may run at
-/// once in this process. Equal to spawnd's pending-reservation cap
+/// R7d round 1: confirmation apply loops (approve / retry / a reject that
+/// may Disable) that may run at once in this process. Equal to spawnd's pending-reservation cap
 /// (`registry::MAX_PENDING_RESERVATIONS`): more concurrent loops cannot make
 /// more allocations progress, they would only hold blocking threads.
 const APPLY_LOOPS_MAX: usize = 4;
@@ -33,33 +33,33 @@ impl ApplyAdmission {
         self.running.fetch_update(SeqCst, SeqCst, |n| (n < self.capacity).then_some(n + 1)).ok().map(|_| ApplyPermit(self))
     }
     /// Read only: the number of permits held now.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn running(&self) -> usize { self.running.load(std::sync::atomic::Ordering::SeqCst) }
 }
 
-/// R7d round 2: how long gateway shutdown waits (best effort) for permits
-/// still held, so an effect already in progress can finish cleanly. It does
-/// not enforce anything: see the shutdown flag (`bridge::SHUTTING_DOWN`).
+/// R7d round 2/4: how long gateway shutdown waits (best effort) for
+/// effects registered at the effect gate before it closed, so they can
+/// finish cleanly. It does not enforce anything: see [`ShutdownGate`].
 /// On expiry shutdown continues.
 pub(crate) const APPLY_SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(40);
-const APPLY_SHUTDOWN_POLL: std::time::Duration = std::time::Duration::from_millis(100);
-/// Called after `begin_migration_apply_shutdown`: no new effect starts
-/// (effect gate), so this only waits for one already in progress. Async
-/// sleeps, never a blocked runtime worker.
+/// Called after `begin_migration_apply_shutdown` closed the effect gate: no
+/// new effect can start, so this only waits for effects in flight (the
+/// gate's `running`). The apply permits are not waited for: a loop holding
+/// one but no gate permit is between effects and, the gate being closed,
+/// only writes its interrupted state back and returns; the journal is
+/// crash-consistent there anyway. The blocking wait runs on the blocking
+/// pool, never on an async worker.
 pub(crate) async fn wait_for_apply_loops() {
-    if !wait_idle(&APPLY_LOOPS, APPLY_SHUTDOWN_WAIT, APPLY_SHUTDOWN_POLL).await {
-        warn!(running = APPLY_LOOPS.running(), "migration apply loops still running after {}s — continuing shutdown",
+    let gate = super::migration_authority::shutdown_gate();
+    if !wait_gate_idle(gate, APPLY_SHUTDOWN_WAIT).await {
+        warn!(running = gate.running(), "migration effects still in progress after {}s — continuing shutdown",
             APPLY_SHUTDOWN_WAIT.as_secs());
     }
 }
-/// `true` once no permit is held; `false` when `bound` elapsed first.
-async fn wait_idle(admission: &ApplyAdmission, bound: std::time::Duration, poll: std::time::Duration) -> bool {
-    let until = tokio::time::Instant::now() + bound;
-    loop {
-        if admission.running() == 0 { return true; }
-        let now = tokio::time::Instant::now();
-        if now >= until { return false; }
-        tokio::time::sleep((until - now).min(poll)).await;
-    }
+/// `true` once no effect is registered; `false` when `bound` elapsed first.
+async fn wait_gate_idle(gate: &'static ShutdownGate, bound: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + bound;
+    tokio::task::spawn_blocking(move || gate.wait_idle(deadline)).await.unwrap_or(false)
 }
 
 fn apply_outcome(failed: usize, pending: usize) -> Value {
@@ -70,25 +70,25 @@ fn apply_outcome(failed: usize, pending: usize) -> Value {
     json!({ "readback_required": true, "failed": failed })
 }
 
-/// The approve / retry apply loop. R7d round 2 step gate: `stopping`
-/// (gateway shutdown) is checked before every `apply_next_until` call and,
-/// inside it, before the step and before compensation. Once it answers
-/// `true` no new effect starts: the current and every remaining binding
-/// count as `allocation_pending` and keep the state the journal already has.
-/// The stop path never reaches the `Failed` transition (only a step failure
-/// seen while not stopping does).
+/// The approve / retry apply loop. R7d round 2–4: `gate` (gateway shutdown)
+/// is peeked before every `apply_next_until` call, and inside it every step
+/// and compensation runs only inside a gate permit. Once the gate is closed
+/// no new effect starts: the current and every remaining binding count as
+/// `allocation_pending` and keep the state the journal already has. The
+/// stop path never reaches the `Failed` transition (only a step failure
+/// seen while the gate is open does).
 pub(super) fn apply_bindings(store: &mut ConfirmationStore, bindings: &[ProposalBinding],
-    applier: &mut dyn duduclaw_migration::confirmation::ProposalApplier, stopping: &dyn Fn() -> bool,
+    applier: &mut dyn duduclaw_migration::confirmation::ProposalApplier, gate: &dyn EffectGate,
     session_live: &mut dyn FnMut() -> bool,
     on_applied: &mut dyn FnMut(&duduclaw_migration::contract::ConfirmationItem)) -> Result<Value, &'static str> {
     let (mut failed, mut pending) = (0, 0);
     'items: for binding in bindings {
         for _ in 0..3 {
-            if stopping() { pending += 1; continue 'items; }
+            if gate.is_closed() { pending += 1; continue 'items; }
             // A role/epoch change during a long bulk operation stops the
             // remaining effects; their approved states remain resumable.
             if !session_live() { return Err("身分驗證已失效，請重新驗證後繼續。"); }
-            match store.apply_next_until(binding, applier, stopping) {
+            match store.apply_next_until(binding, applier, gate) {
                 Ok(item) if item.status == ConfirmationStatus::Applied => { on_applied(&item); break }
                 Ok(_) => {},
                 // R7d: still Applying and uncompensated; Retry resumes it.
@@ -100,62 +100,88 @@ pub(super) fn apply_bindings(store: &mut ConfirmationStore, bindings: &[Proposal
     Ok(apply_outcome(failed, pending))
 }
 
-/// Retry of a `Failed` item (R7d round 3): its compensation is an effect
-/// behind the effect gate (`stopping` checked right before it). Stopped:
-/// the retry-safe pending answer, the item stays `Failed`. `Ok(Some)` ends
-/// the call with that answer; `Ok(None)`: the item is `Applying` again and
-/// the apply loop runs. Called while the RPC holds its apply permit.
+/// Retry of a `Failed` item (R7d round 3/4): its compensation is an effect
+/// that runs only inside a gate permit. Refused: the retry-safe pending
+/// answer, the item stays `Failed`. `Ok(Some)` ends the call with that
+/// answer; `Ok(None)`: the item is `Applying` again and the apply loop
+/// runs. Called while the RPC holds its apply permit.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn retry_failed(store: &mut ConfirmationStore, item: &duduclaw_migration::contract::ConfirmationItem,
     approval: &ApprovalSession, csrf: [u8; 32], now: u64,
     applier: &mut dyn duduclaw_migration::confirmation::ProposalApplier,
     validator: &dyn duduclaw_migration::confirmation::ProposalValidator,
-    stopping: &dyn Fn() -> bool, error: &'static str) -> Result<Option<Value>, &'static str> {
+    gate: &dyn EffectGate, error: &'static str) -> Result<Option<Value>, &'static str> {
     if item.category == duduclaw_migration::contract::ConfirmationCategory::Employee {
         // Reconcile any interrupted compensation, but never
         // revive a permanently tombstoned UID on Retry.
         approval.authorize(&csrf, now).map_err(|_| error)?;
-        // Effect gate: nothing that can block between this check and the call.
-        if stopping() { return Ok(Some(apply_outcome(0, 1))); }
-        duduclaw_migration::confirmation::ProposalApplier::disable_and_read_back(applier, item).map_err(|_| error)?;
+        // Effect gate: deciding and registering the effect is one operation.
+        let Some(running) = gate.enter() else { return Ok(Some(apply_outcome(0, 1))); };
+        let disabled = duduclaw_migration::confirmation::ProposalApplier::disable_and_read_back(applier, item);
+        drop(running);
+        disabled.map_err(|_| error)?;
         return Err("此員工配置已撤銷，舊身分不會重用。請重新建立員工配置提案，再逐筆確認。");
     }
-    match store.retry_until(&item.binding, approval, csrf, now, applier, validator, stopping) {
+    match store.retry_until(&item.binding, approval, csrf, now, applier, validator, gate) {
         Ok(()) => Ok(None),
         Err(duduclaw_migration::confirmation::ConfirmationError::Pending) => Ok(Some(apply_outcome(0, 1))),
         Err(_) => Err(error),
     }
 }
 
-/// One `reject` (R7d round 3): the compensation (Disable) is behind the
-/// effect gate. Stopped: [`SHUTTING_DOWN_RETRY`], the item keeps its state.
+/// One `reject` (R7d round 3/4): the compensation (Disable) runs only inside
+/// a gate permit. Refused: [`SHUTTING_DOWN_RETRY`], the item keeps its state.
 /// Called while the RPC holds its apply permit.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn reject_one(store: &mut ConfirmationStore, binding: &ProposalBinding, approval: &ApprovalSession,
     csrf: [u8; 32], now: u64, applier: &mut dyn duduclaw_migration::confirmation::ProposalApplier,
-    stopping: &dyn Fn() -> bool, error: &'static str) -> Result<Value, &'static str> {
-    match store.reject_until(binding, approval, csrf, now, applier, stopping) {
+    gate: &dyn EffectGate, error: &'static str) -> Result<Value, &'static str> {
+    match store.reject_until(binding, approval, csrf, now, applier, gate) {
         Ok(()) => Ok(json!({ "readback_required": true })),
         Err(duduclaw_migration::confirmation::ConfirmationError::Pending) => Err(SHUTTING_DOWN_RETRY),
         Err(_) => Err(error),
     }
 }
+
+/// `migration.confirmations.reject` (R7d round 4): only a reject that can
+/// produce an effect takes an apply permit. A bulk reject and the reject of
+/// a `Pending` item go through `reject_pending`, which performs no external
+/// effect and rechecks `Pending` inside its own transaction (an item that
+/// moved on meanwhile is refused, nothing starts), so they are never refused
+/// by a full admission cap. Any other single reject takes a permit first; a
+/// full cap answers retry-safe pending before the CSRF check or any write.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn reject_decision(store: &mut ConfirmationStore, admission: &ApplyAdmission, bindings: &[ProposalBinding],
+    approval: &ApprovalSession, csrf: [u8; 32], now: u64,
+    applier: &mut dyn duduclaw_migration::confirmation::ProposalApplier,
+    gate: &dyn EffectGate, error: &'static str) -> Result<Value, &'static str> {
+    let pending_only = bindings.len() > 1
+        || store.status(&bindings[0]).map_err(|_| error)? == ConfirmationStatus::Pending;
+    if pending_only {
+        store.reject_pending(bindings, approval, csrf, now).map_err(|_| error)?;
+        return Ok(json!({ "readback_required": true }));
+    }
+    let Some(_permit) = admission.try_enter() else { return Ok(admission_full(1)); };
+    reject_one(store, &bindings[0], approval, csrf, now, applier, gate, error)
+}
 impl Drop for ApplyPermit<'_> {
     fn drop(&mut self) { self.0.running.fetch_sub(1, std::sync::atomic::Ordering::SeqCst); }
 }
-/// Admission of one RPC. approve / retry / reject (each may run an effect,
-/// reject a Disable) need a permit (`Ok(Some)`), so the shutdown wait also
-/// covers an effect already in progress there; every other method needs
-/// none (`Ok(None)`). Full: `Err` with the retry-safe
-/// pending answer. Called before the blocking task starts, so a refused call
-/// has opened no store, checked no CSRF, approved nothing, written no intent
-/// and consumed nothing: every item stays exactly as it was.
+/// The retry-safe answer of a full admission cap.
+fn admission_full(requested: usize) -> Value {
+    json!({ "readback_required": true, "failed": 0, "allocation_pending": requested, "message": ALLOCATION_PENDING })
+}
+/// Admission of one RPC. approve / retry (each may run effects) need a
+/// permit (`Ok(Some)`); every other method needs none here (`Ok(None)`) —
+/// `reject` takes one itself only when it may Disable ([`reject_decision`]).
+/// Full: `Err` with the retry-safe pending answer. Called before the
+/// blocking task starts, so a refused call has opened no store, checked no
+/// CSRF, approved nothing, written no intent and consumed nothing: every
+/// item stays exactly as it was.
 pub(super) fn admit<'a>(admission: &'a ApplyAdmission, method: &str, params: &Value) -> Result<Option<ApplyPermit<'a>>, Value> {
-    if !matches!(method, "migration.confirmations.approve" | "migration.confirmations.retry"
-        | "migration.confirmations.reject") { return Ok(None); }
+    if !matches!(method, "migration.confirmations.approve" | "migration.confirmations.retry") { return Ok(None); }
     admission.try_enter().map(Some).ok_or_else(|| {
-        let requested = params.get("bindings").and_then(Value::as_array).map_or(1, |b| b.len().clamp(1, 200));
-        json!({ "readback_required": true, "failed": 0, "allocation_pending": requested, "message": ALLOCATION_PENDING })
+        admission_full(params.get("bindings").and_then(Value::as_array).map_or(1, |b| b.len().clamp(1, 200)))
     })
 }
 
@@ -336,10 +362,10 @@ impl MethodHandler {
                     let item = store.list().map_err(|_| error)?.into_iter()
                         .find(|item| item.binding == input.bindings[0]).ok_or(error)?;
                     if item.status == ConfirmationStatus::Failed {
-                        // R7d round 3: compensation is an effect; none starts
-                        // once shutdown has begun (the item stays Failed).
+                        // R7d round 3/4: compensation is an effect; none starts
+                        // once the gate is closed (the item stays Failed).
                         if let Some(answer) = retry_failed(&mut store, &item, &approval, input.csrf_token, now as u64,
-                            &mut applier, &validator, &super::migration_authority::shutting_down, error)? {
+                            &mut applier, &validator, super::migration_authority::shutdown_gate(), error)? {
                             return Ok(answer);
                         }
                     } else {
@@ -350,17 +376,13 @@ impl MethodHandler {
                     }
                 }
                 "migration.confirmations.reject" => {
-                    if input.bindings.len() > 1 {
-                        // Pending items only: no external effect.
-                        store.reject_pending(&input.bindings, &approval, input.csrf_token, now as u64).map_err(|_| error)?;
-                        return Ok(json!({ "readback_required": true }));
-                    }
-                    return reject_one(&mut store, &input.bindings[0], &approval, input.csrf_token, now as u64,
-                        &mut applier, &super::migration_authority::shutting_down, error);
+                    // R7d round 4: a permit only when a Disable may run.
+                    return reject_decision(&mut store, &APPLY_LOOPS, &input.bindings, &approval, input.csrf_token,
+                        now as u64, &mut applier, super::migration_authority::shutdown_gate(), error);
                 }
                 _ => return Err("不允許此遷移操作。"),
             }
-            apply_bindings(&mut store, &input.bindings, &mut applier, &super::migration_authority::shutting_down,
+            apply_bindings(&mut store, &input.bindings, &mut applier, super::migration_authority::shutdown_gate(),
                 &mut || db.migration_confirmation_session(&user, &session, epoch, chrono::Utc::now().timestamp())
                     .ok().flatten().is_some(),
                 // F6g: an adoption committed inside this call — notice now, rescan below.
@@ -431,8 +453,7 @@ mod tests {
         let (mut store, binding) = journal();
         let before = snapshot(&store);
         let session = ApprovalSession::from_verified_session(true, true, Some(100), [7; 32], RequestId([8; 16]));
-        for method in ["migration.confirmations.approve", "migration.confirmations.retry",
-            "migration.confirmations.reject"] {
+        for method in ["migration.confirmations.approve", "migration.confirmations.retry"] {
             let started = std::time::Instant::now();
             let params = json!({ "bindings": [binding], "csrf_token": vec![7u8; 32] });
             let answer = match admit(&admission, method, &params) {
@@ -446,9 +467,10 @@ mod tests {
             assert_eq!(snapshot(&store), before, "{method}");
             assert_eq!(admission.running(), APPLY_LOOPS_MAX);
         }
-        // Methods without an apply effect take no permit, even when full.
+        // Methods without an apply effect take no permit, even when full
+        // (R7d round 4: reject takes one itself only when it may Disable).
         for method in ["migration.confirmations.list", "migration.confirmations.step_up",
-            "migration.confirmations.rotate_secret"] {
+            "migration.confirmations.rotate_secret", "migration.confirmations.reject"] {
             assert!(matches!(admit(&admission, method, &json!({})), Ok(None)), "{method}");
         }
         drop(held);
@@ -461,26 +483,28 @@ mod tests {
         assert_eq!(admission.running(), 0);
     }
 
-    /// R7d round 2: the shutdown wait returns at once when idle, as soon as
-    /// the last permit is dropped, and at the (injected) bound while one is
-    /// still held.
+    /// R7d round 2/4: the shutdown wait (on the gate's effects in flight,
+    /// off the async workers) returns at once when idle, at the (injected)
+    /// bound while an effect registered before `close` is still running, and
+    /// as soon as the last one finishes.
     #[tokio::test]
-    async fn apply_shutdown_wait_ends_at_last_permit_or_bound() {
+    async fn apply_shutdown_wait_ends_at_last_effect_or_bound() {
         use std::time::{Duration, Instant};
-        assert_eq!((APPLY_SHUTDOWN_WAIT, APPLY_SHUTDOWN_POLL), (Duration::from_secs(40), Duration::from_millis(100)));
-        static ADMISSION: ApplyAdmission = ApplyAdmission::new(2);
+        assert_eq!(APPLY_SHUTDOWN_WAIT, Duration::from_secs(40));
+        static GATE: ShutdownGate = ShutdownGate::new();
         let started = Instant::now();
-        assert!(wait_idle(&ADMISSION, Duration::from_secs(5), APPLY_SHUTDOWN_POLL).await);
+        assert!(wait_gate_idle(&GATE, Duration::from_secs(5)).await);
         assert!(started.elapsed() < Duration::from_millis(500));
-        // Held: times out at the bound.
-        let first = ADMISSION.try_enter().unwrap();
+        // Two effects registered before the gate closes.
+        let (first, second) = (GATE.enter().unwrap(), GATE.enter().unwrap());
+        GATE.close();
+        assert!(GATE.enter().is_none());
         let started = Instant::now();
-        assert!(!wait_idle(&ADMISSION, Duration::from_millis(150), Duration::from_millis(10)).await);
+        assert!(!wait_gate_idle(&GATE, Duration::from_millis(150)).await);
         let elapsed = started.elapsed();
         assert!(elapsed >= Duration::from_millis(150) && elapsed < Duration::from_secs(2), "{elapsed:?}");
-        assert_eq!(ADMISSION.running(), 1);
-        // Two held, dropped at ~50 ms and ~150 ms: the wait ends with the last.
-        let second = ADMISSION.try_enter().unwrap();
+        assert_eq!(GATE.running(), 2);
+        // Finished at ~50 ms and ~150 ms: the wait ends with the last.
         let release = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
             drop(first);
@@ -488,10 +512,9 @@ mod tests {
             drop(second);
         });
         let started = Instant::now();
-        assert!(wait_idle(&ADMISSION, Duration::from_secs(10), Duration::from_millis(10)).await);
-        let elapsed = started.elapsed();
-        assert!(elapsed >= Duration::from_millis(150) && elapsed < Duration::from_secs(2), "{elapsed:?}");
-        assert_eq!(ADMISSION.running(), 0);
+        assert!(wait_gate_idle(&GATE, Duration::from_secs(10)).await);
+        assert_eq!(GATE.running(), 0, "returned with the last effect");
+        assert!(started.elapsed() < Duration::from_secs(5));
         release.await.unwrap();
     }
 
@@ -526,33 +549,34 @@ mod tests {
         store.list().unwrap().into_iter().find(|item| item.binding == *binding).unwrap().status
     }
 
-    /// R7d round 3: reject and the retry of a Failed item hold an apply
-    /// permit while they run (their Disable runs under it); during shutdown
-    /// neither sends a Disable — reject answers `SHUTTING_DOWN_RETRY`, the
-    /// retry the pending answer — and the journal is unchanged; the same
-    /// call afterwards completes.
+    /// A closed gate (gateway shutdown has begun).
+    fn closed_gate() -> ShutdownGate { let gate = ShutdownGate::new(); gate.close(); gate }
+
+    /// R7d round 3/4: a reject that may Disable and the retry of a Failed
+    /// item hold an apply permit while they run (their Disable runs under
+    /// it); during shutdown neither sends a Disable — reject answers
+    /// `SHUTTING_DOWN_RETRY`, the retry the pending answer — and the journal
+    /// is unchanged; the same call afterwards completes.
     #[test]
     fn reject_and_failed_retry_hold_a_permit_and_start_no_disable_during_shutdown() {
         let admission = ApplyAdmission::new(APPLY_LOOPS_MAX);
         let session = ApprovalSession::from_verified_session(true, true, Some(100), [7; 32], RequestId([8; 16]));
         let error = "項目已變更";
-        // Reject of an Applying (staged) item.
+        // Reject of an Applying (staged) item: `reject_decision` takes the permit.
         let (mut store, binding) = department();
         let mut probe = Probe { admission: &admission, fail_stage: false, disables: Vec::new() };
         store.apply_next(&binding, &mut probe).unwrap();
         let before = snapshot(&store);
-        let permit = admit(&admission, "migration.confirmations.reject", &json!({ "bindings": [binding] })).unwrap();
-        assert!(permit.is_some() && admission.running() == 1);
-        assert_eq!(reject_one(&mut store, &binding, &session, [7; 32], 101, &mut probe, &|| true, error),
+        assert_eq!(reject_decision(&mut store, &admission, &[binding], &session, [7; 32], 101, &mut probe, &closed_gate(), error),
             Err(SHUTTING_DOWN_RETRY));
         assert!(probe.disables.is_empty(), "no Disable during shutdown");
         assert_eq!(snapshot(&store), before);
         assert_eq!(status_of(&store, &binding), ConfirmationStatus::Applying);
-        assert_eq!(reject_one(&mut store, &binding, &session, [7; 32], 101, &mut probe, &|| false, error).unwrap(),
-            json!({ "readback_required": true }));
+        assert_eq!(admission.running(), 0, "the permit ends with the call");
+        assert_eq!(reject_decision(&mut store, &admission, &[binding], &session, [7; 32], 101, &mut probe,
+            &duduclaw_migration::confirmation::OpenGate, error).unwrap(), json!({ "readback_required": true }));
         assert_eq!(probe.disables, vec![1], "the Disable ran under the reject's permit");
         assert_eq!(status_of(&store, &binding), ConfirmationStatus::Rejected);
-        drop(permit);
         assert_eq!(admission.running(), 0);
         // Retry of a Failed item (store path, then the Employee branch).
         for employee in [false, true] {
@@ -570,12 +594,13 @@ mod tests {
             let before = snapshot(&store);
             let permit = admit(&admission, "migration.confirmations.retry", &json!({ "bindings": [binding] })).unwrap();
             assert!(permit.is_some() && admission.running() == 1);
-            let answer = retry_failed(&mut store, &item, &session, [7; 32], 101, &mut probe, &Valid, &|| true, error)
+            let answer = retry_failed(&mut store, &item, &session, [7; 32], 101, &mut probe, &Valid, &closed_gate(), error)
                 .unwrap().expect("ends the call");
             assert_eq!((answer["allocation_pending"].clone(), answer["message"].clone()), (json!(1), json!(ALLOCATION_PENDING)));
             assert_eq!(probe.disables, vec![0], "no Disable during shutdown (employee: {employee})");
             assert_eq!(snapshot(&store), before);
-            let resumed = retry_failed(&mut store, &item, &session, [7; 32], 101, &mut probe, &Valid, &|| false, error);
+            let resumed = retry_failed(&mut store, &item, &session, [7; 32], 101, &mut probe, &Valid,
+                &duduclaw_migration::confirmation::OpenGate, error);
             assert_eq!(probe.disables, vec![0, 1], "the Disable ran under the retry's permit");
             if employee {
                 assert!(resumed.is_err(), "a tombstoned employee is never revived");
@@ -606,5 +631,145 @@ mod tests {
             assert_eq!(apply_loop(permit, outcome).is_ok(), outcome == 0);
             assert_eq!(admission.running(), 0, "released after outcome {outcome}");
         }
+    }
+
+    /// R7d round 4: rejecting Pending items (one, or in bulk) performs no
+    /// effect and needs no apply permit, so it works while the admission cap
+    /// is full; a reject that may Disable is refused retry-safe there (no
+    /// Disable, journal unchanged) and runs once a slot is free.
+    #[test]
+    fn reject_of_pending_items_works_while_the_admission_cap_is_full() {
+        use duduclaw_migration::contract::{ConfirmationCategory, ProposalField, ProposalOperationId, ProposalValue};
+        let admission = ApplyAdmission::new(APPLY_LOOPS_MAX);
+        let held: Vec<_> = (0..APPLY_LOOPS_MAX).map(|_| admission.try_enter().unwrap()).collect();
+        let session = ApprovalSession::from_verified_session(true, true, Some(100), [7; 32], RequestId([8; 16]));
+        let error = "項目已變更";
+        let open = duduclaw_migration::confirmation::OpenGate;
+        let mut probe = Probe { admission: &admission, fail_stage: false, disables: Vec::new() };
+        // One Pending item.
+        let (mut store, binding) = journal();
+        assert_eq!(reject_decision(&mut store, &admission, &[binding], &session, [7; 32], 101, &mut probe, &open, error).unwrap(),
+            json!({ "readback_required": true }));
+        assert_eq!(status_of(&store, &binding), ConfirmationStatus::Rejected);
+        // A bulk reject of Pending items.
+        let mut store = ConfirmationStore::from_connection(rusqlite::Connection::open_in_memory().unwrap()).unwrap();
+        let bindings: Vec<_> = [1u8, 2].into_iter().map(|id| store.stage_proposal(
+            ProposalOperationId { proposal_id: RequestId([id; 16]), revision: 1 }, ConfirmationCategory::Department,
+            vec![ProposalField { name: "name".into(), value: ProposalValue::Text { value: format!("d{id}") } }], &Valid)
+            .unwrap().binding).collect();
+        assert_eq!(reject_decision(&mut store, &admission, &bindings, &session, [7; 32], 101, &mut probe, &open, error).unwrap(),
+            json!({ "readback_required": true }));
+        assert!(bindings.iter().all(|binding| status_of(&store, binding) == ConfirmationStatus::Rejected));
+        assert!(probe.disables.is_empty());
+        assert_eq!(admission.running(), APPLY_LOOPS_MAX);
+        // A reject that may Disable (Applying item): refused at once, nothing changed.
+        let (mut store, binding) = department();
+        store.apply_next(&binding, &mut probe).unwrap();
+        let before = snapshot(&store);
+        let answer = reject_decision(&mut store, &admission, &[binding], &session, [7; 32], 101, &mut probe, &open, error).unwrap();
+        assert_eq!((answer["allocation_pending"].clone(), answer["message"].clone()), (json!(1), json!(ALLOCATION_PENDING)));
+        assert!(probe.disables.is_empty());
+        assert_eq!(snapshot(&store), before);
+        drop(held);
+        assert_eq!(reject_decision(&mut store, &admission, &[binding], &session, [7; 32], 101, &mut probe, &open, error).unwrap(),
+            json!({ "readback_required": true }));
+        assert_eq!(probe.disables, vec![1]);
+        assert_eq!(status_of(&store, &binding), ConfirmationStatus::Rejected);
+        assert_eq!(admission.running(), 0);
+    }
+
+    /// Records every adapter call (0 stage, 1 publish, 2 read back, 3
+    /// Disable); `fail` makes that call answer `Apply`.
+    #[derive(Default)]
+    struct Recorder { calls: Vec<u8>, fail: Option<u8> }
+    impl Recorder {
+        fn call(&mut self, step: u8) -> std::result::Result<(), duduclaw_migration::confirmation::ConfirmationError> {
+            self.calls.push(step);
+            if self.fail == Some(step) { Err(duduclaw_migration::confirmation::ConfirmationError::Apply) } else { Ok(()) }
+        }
+    }
+    impl duduclaw_migration::confirmation::ProposalApplier for Recorder {
+        fn stage(&mut self, _: &duduclaw_migration::contract::ConfirmationItem)
+            -> std::result::Result<(), duduclaw_migration::confirmation::ConfirmationError> { self.call(0) }
+        fn publish(&mut self, _: &duduclaw_migration::contract::ConfirmationItem)
+            -> std::result::Result<(), duduclaw_migration::confirmation::ConfirmationError> { self.call(1) }
+        fn read_back(&mut self, _: &duduclaw_migration::contract::ConfirmationItem)
+            -> std::result::Result<(), duduclaw_migration::confirmation::ConfirmationError> { self.call(2) }
+        fn disable_and_read_back(&mut self, _: &duduclaw_migration::contract::ConfirmationItem)
+            -> std::result::Result<(), duduclaw_migration::confirmation::ConfirmationError> { self.call(3) }
+    }
+    /// Runs `$work` on a worker thread that gets descheduled inside its
+    /// `at`-th `enter` of `$gate` while this thread closes the gate.
+    macro_rules! descheduled {
+        ($gate:expr, $work:expr) => {
+            std::thread::scope(|s| {
+                let worker = s.spawn($work);
+                $gate.close_while_descheduled();
+                worker.join().unwrap()
+            })
+        };
+    }
+
+    /// R7d round 4, the review's interleaving made deterministic: the worker
+    /// is descheduled right before registering an effect (inside `enter`)
+    /// while the gate closes; when it resumes it is refused and no adapter
+    /// call happens — each apply step, the compensation of a failed step,
+    /// the retry of a Failed item, a reject, and the direct Employee Disable
+    /// of `retry_failed` (the allocation attempt: the bridge's
+    /// `pending_wait_attempt_descheduled_across_close_never_runs`). Every
+    /// item keeps its state; nothing stays registered.
+    #[test]
+    fn effect_descheduled_across_close_never_starts() {
+        use super::super::migration_authority::Descheduled;
+        use duduclaw_migration::confirmation::ConfirmationError;
+        let session = ApprovalSession::from_verified_session(true, true, Some(100), [7; 32], RequestId([8; 16]));
+        let error = "項目已變更";
+        // Stage, publish, read back; then a failed stage's compensation (enter #2).
+        for (done, fail, at) in [(0usize, None, 1usize), (1, None, 1), (2, None, 1), (0, Some(0u8), 2)] {
+            let (mut store, binding) = department();
+            let mut adapter = Recorder { fail, ..Recorder::default() };
+            for _ in 0..done { store.apply_next(&binding, &mut adapter).unwrap(); }
+            let (before, made) = (status_of(&store, &binding), adapter.calls.clone());
+            let gate = Descheduled::new(at);
+            let result = descheduled!(gate, || store.apply_next_until(&binding, &mut adapter, &gate));
+            assert!(matches!(result, Err(ConfirmationError::Pending)), "step {done}, enter #{at}");
+            let expected = if fail.is_some() { vec![0] } else { made };
+            assert_eq!(adapter.calls, expected, "no adapter call after close (step {done}, enter #{at})");
+            assert_eq!(status_of(&store, &binding), before, "never Failed");
+            assert_eq!((gate.enters(), gate.gate.running()), (at, 0));
+        }
+        // Retry of a Failed item.
+        let (mut store, binding) = department();
+        let mut adapter = Recorder { fail: Some(0), ..Recorder::default() };
+        assert!(store.apply_next(&binding, &mut adapter).is_err());
+        adapter.fail = None;
+        let gate = Descheduled::new(1);
+        let result = descheduled!(gate, || store.retry_until(&binding, &session, [7; 32], 101, &mut adapter, &Valid, &gate));
+        assert!(matches!(result, Err(ConfirmationError::Pending)));
+        assert_eq!(adapter.calls, vec![0, 3], "no Disable after close");
+        assert_eq!(status_of(&store, &binding), ConfirmationStatus::Failed);
+        // Reject of an Applying item.
+        let (mut store, binding) = department();
+        let mut adapter = Recorder::default();
+        store.apply_next(&binding, &mut adapter).unwrap();
+        let gate = Descheduled::new(1);
+        let result = descheduled!(gate, || store.reject_until(&binding, &session, [7; 32], 101, &mut adapter, &gate));
+        assert!(matches!(result, Err(ConfirmationError::Pending)));
+        assert_eq!(adapter.calls, vec![0], "no Disable after close");
+        assert_eq!(status_of(&store, &binding), ConfirmationStatus::Applying);
+        // The direct Employee Disable of `retry_failed`.
+        let (mut store, binding) = journal();
+        store.approve(&[binding], &session, [7; 32], 101, &Valid).unwrap();
+        let mut adapter = Recorder { fail: Some(0), ..Recorder::default() };
+        assert!(store.apply_next(&binding, &mut adapter).is_err());
+        adapter.fail = None;
+        let item = store.list().unwrap().into_iter().find(|item| item.binding == binding).unwrap();
+        assert_eq!(item.status, ConfirmationStatus::Failed);
+        let gate = Descheduled::new(1);
+        let answer = descheduled!(gate, || retry_failed(&mut store, &item, &session, [7; 32], 101, &mut adapter, &Valid, &gate, error));
+        assert_eq!(answer, Ok(Some(apply_outcome(0, 1))));
+        assert_eq!(adapter.calls, vec![0, 3], "no Disable after close");
+        assert_eq!(status_of(&store, &binding), ConfirmationStatus::Failed);
+        assert_eq!(gate.gate.running(), 0);
     }
 }

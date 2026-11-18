@@ -3745,12 +3745,13 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             } => {},
         }
         info!("Shutdown signal received, flushing state...");
-        // R7d: a migration apply waiting for a pending employee allocation
-        // stops at once (the item stays Applying, nothing is compensated).
+        // R7d round 4: close the migration effect gate. Once this returns no
+        // new migration effect can start (enforced by the gate's lock); a
+        // pending employee-allocation wait stops (the item stays Applying,
+        // nothing is compensated).
         crate::handlers::begin_migration_apply_shutdown();
-        // R7d round 2/3: from here no new migration effect starts (each is
-        // gated on the flag); best-effort wait (async, up to
-        // APPLY_SHUTDOWN_WAIT = 40 s, warn on expiry) for one in progress.
+        // Best-effort wait (blocking pool, up to APPLY_SHUTDOWN_WAIT = 40 s,
+        // warn on expiry) for effects registered before the gate closed.
         crate::handlers::wait_migration_apply_loops().await;
         // sd_notify STOPPING=1 — best-effort, no-op off-systemd.
         let _ = crate::watchdog::notify_stopping();
