@@ -1742,7 +1742,7 @@ pub mod linux {
         /// on the missing dependency). Every other property is the
         /// production `UnitPolicy`'s and is read back exactly as in `start`.
         #[cfg(any(test, feature = "policy-tool"))]
-        pub(crate) fnstart_acceptance(&self, policy: &UnitPolicy, trampoline: &str, bootstrap: BorrowedFd<'_>,
+        pub(crate) fn start_acceptance(&self, policy: &UnitPolicy, trampoline: &str, bootstrap: BorrowedFd<'_>,
             stdout: BorrowedFd<'_>, stderr: BorrowedFd<'_>) -> io::Result<StartedUnit> {
             if policy.properties.contains_key("BindsTo") || policy.properties.contains_key("After")
                 || !trampoline.starts_with('/') || trampoline == TRAMPOLINE {
@@ -1752,17 +1752,17 @@ pub mod linux {
         }
         /// R8r-4 (feature `policy-tool`): the unit's `MainPID` as PID 1 reports it now.
         #[cfg(any(test, feature = "policy-tool"))]
-        pub(crate) fnacceptance_main_pid(&self, unit: &StartedUnit) -> io::Result<u32> {
+        pub(crate) fn acceptance_main_pid(&self, unit: &StartedUnit) -> io::Result<u32> {
             let service = Proxy::new(&self.connection, BUS, unit.path.as_str(), "org.freedesktop.systemd1.Service").map_err(bus_error)?;
             service.get_property("MainPID").map_err(bus_error)
         }
         /// R8r-4 (feature `policy-tool`): stop a unit the harness created
         /// (its employee slice); `KillUnit` + `StopUnit` like [`Self::kill`].
         #[cfg(any(test, feature = "policy-tool"))]
-        pub(crate) fnacceptance_stop(&self, name: &str) -> io::Result<()> { self.kill_name(name) }
+        pub(crate) fn acceptance_stop(&self, name: &str) -> io::Result<()> { self.kill_name(name) }
         /// R8r-4 (feature `policy-tool`): whether PID 1 still has `name` loaded.
         #[cfg(any(test, feature = "policy-tool"))]
-        pub(crate) fnacceptance_loaded(&self, name: &str) -> io::Result<bool> {
+        pub(crate) fn acceptance_loaded(&self, name: &str) -> io::Result<bool> {
             let existing: zbus::Result<OwnedObjectPath> = self.manager()?.call("GetUnit", &(name,));
             match existing {
                 Ok(_) => Ok(true),
