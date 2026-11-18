@@ -392,9 +392,10 @@ account. It locks/expires the password/account, installs nologin and `/nonexiste
 removes supplementary groups, disables linger and user managers, fixes effective
 cron/at ACLs, reloads SSH, and reads the results back. Unknown aliases or jobs are
 not silently accepted. User creation disables subordinate-ID allocation and
-lastlog initialization. External IAM range reservation and live SSH
-public-key/forwarding negatives remain explicit evidence hooks;
-`MissingInstallationEvidence` always refuses them. The existing-owner check is
+lastlog initialization. Live SSH public-key/forwarding negatives come from the
+R7c probe unit run through PID 1 (see "R7c: SSH denial through PID 1"); hosts
+whose passwd/group NSS names a module other than files/systemd are refused
+(no external IAM reservation producer exists). The existing-owner check is
 no longer installer evidence (R7b): each allocation takes one file-owner
 inventory of spawnd's own state directories (`owner_inventory`, see "R7b: egress
 second layer and file-owner inventory") before trying any candidate. `userdbctl` supports bounded
@@ -492,7 +493,8 @@ neither destroys nor recycles a UID mapping. No H implementation was duplicated.
 
 `Publication` supplies F/G's verified root policy, gateway snapshot mount authority,
 supervisor identity and root runtime/projection anchors. It is not deserializable
-from StartRun. `InstallationEvidence` supplies actual IAM/owner-scan/SSH results.
+from StartRun. `ssh_evidence` supplies the per-account SSH probe results (R7c);
+owner scans are spawnd's own (R7b); external IAM is refused (R7c).
 C uses the authenticated fixed control endpoint, correlated Register/Unregister
 acknowledgements and a separate DNS/secondary-layer evidence adapter. Missing
 adapters and unknown evidence reject readiness. C's installed socket ownership and
@@ -1321,6 +1323,66 @@ spawnd itself.
   Exceeding a bound or any error except a root that does not exist yet (an
   empty contribution on a fresh install) fails the inventory and refuses the
   allocation without reserving or tombstoning anything.
+
+### R7c: SSH denial through PID 1
+
+The last facts of the never-produced installation receipt are gone: spawnd
+reads nothing under `/run/duduclaw-isolation-evidence`.
+
+- **Fixed-unit set.** `Systemd::run_fixed_unit` starts only a member of
+  `systemd::FixedUnit`: the R7a self-test unit (unchanged) or
+  `duduclaw-isolation-probe@<account>.service` for a name passing
+  `employee_account_name_valid`. Each member fixes its fragment (an instance
+  is loaded from the template file, `Id` the instance), its shipped bytes, the
+  exact `ExecStart` argv (`[/usr/lib/duduclaw/duduclaw-isolation-probe,
+  <account>]`) and its readback: oneshot in `duduclaw-tcb.slice`,
+  NoNewPrivileges, empty bounding and ambient capability sets, `User`/`Group`
+  empty and `RestrictSUIDSGID` false, `IPAddressDeny` {`::/0`, `0.0.0.0/0`},
+  `IPAddressAllow` {`127.0.0.0/8`, `::1/128`} (exact multisets; the allow
+  value has not been measured yet, and the root test prints PID 1's actual
+  value on mismatch), AF_UNIX/AF_INET/AF_INET6 only, PrivateTmp,
+  `ProtectSystem=strict`. A drop-in, transient unit, pending reload, other
+  fragment or other argv is refused before any start. The `Unit.Ref` pin is
+  held for the whole call. The exit status counts only when bound to THIS
+  invocation (new InvocationID, exited, the `ExecStart` record's pid and
+  status, `inactive`/`success` for 0 and `failed`/`exit-code` otherwise), and
+  a failed instance is reset before the next start.
+- **Outcome.** Exit 0 ⇒ denied; 5 (no sshd) ⇒ not applicable (a contradiction
+  where `/usr/sbin/sshd` exists, so refused); 10/13 (login/forwarding NOT
+  denied) ⇒ reachable; any other code, a timeout, a refused start or a PID 1
+  error ⇒ inconclusive. The table is `duduclaw_isolation::probe_exit`.
+- **Evidence.** Results are memory-only, keyed by boot id, committed signed
+  generation, account name and uid, SHA-256 of `sshd -T -C
+  user=<account>,host=localhost,addr=127.0.0.1`, the installed probe binary
+  verified against the generation's artifact (digest, size, mode) and the
+  installed template's digest. One worker thread with its own D-Bus
+  connection re-measures the host part every 2 s and runs queued probes one
+  at a time (40 s deadline each). The 250 ms refresh only reads and queues.
+  A key change re-probes, an inconclusive result is retried after 60 s, and a
+  spawnd restart re-probes every account. Logs record state changes only and
+  never sshd output.
+- **Per-employee effect.** The refresh's and start-up recovery's walk over all
+  accounts (`Registry::verify`) used to fail as a whole when one account's SSH
+  check failed, turning off registry/account/SSH/cron/IAM readiness for the
+  host (and a failed start-up reconcile is never re-evaluated). Those walks
+  now only request probes. An account's probe result is required at that
+  employee's admission (`Core::ready`); "pending" is answered `NotReady`.
+- **Allocation.** A new account waits (bounded, 85 s) for its own probe.
+  Denied ⇒ Ready. Reachable, or any other failure as before ⇒ Tombstone.
+  Unresolved (pending at the deadline, inconclusive, PID 1 error) ⇒ the row
+  stays `Reserved` and resumable in this process: the next allocation of the
+  same employee re-locks it (`recover_locked`) and probes again. Start-up
+  `reconcile` still tombstones every `Reserved` row.
+- **Unsupported hosts.** passwd/group NSS modules other than files/systemd
+  (SSSD/LDAP, Google Compute Engine OS Login, `compat`, bracketed action
+  clauses); sshd present without the ssh client, ssh-keygen or journalctl, or
+  not listening on loopback; sshd with `UsePAM no` (sshd reports the expired
+  account before DenyUsers, so the probe cannot corroborate and stays
+  inconclusive).
+- **useradd.** `--key CREATE_MAIL_SPOOL=no` is no longer passed (shadow 4.13
+  on Ubuntu 24.04 refuses the key, exit 3). A mail spool under `/var/mail` or
+  `/var/spool/mail` after useradd refuses the account, which is rolled back
+  like any other post-create failure.
 
 ### Validation and remaining acceptance
 
@@ -4470,10 +4532,10 @@ runtime context; a deny-all placeholder would not satisfy the requested turn.
 
 B1 consumes `/var/lib/duduclaw-spawnd/publication.json` for generation-bound host
 entitlements, and the signed F `RuntimeEntry` artifact `isolation-policy-v1` for
-runtime/native profiles. Root installation measurements live under
-`/run/duduclaw-isolation-evidence`; they bind boot, generation, inventory and
-bounded freshness. Account readiness requires real positive/negative SSH evidence
-and the other account controls; no receipt is inferred from a unit's existence.
+runtime/native profiles. No root installation receipt is read (R7c removed the
+last reader of `/run/duduclaw-isolation-evidence`). Account readiness requires a
+Denied result of the account's own SSH probe run through PID 1 and the other
+account controls; nothing is inferred from a unit's existence.
 The exact strict schemas and limits are documented in the spawnd README.
 
 F is nonce-probed every time a committed generation is consumed. Only the expensive
@@ -5692,7 +5754,7 @@ No formatter, release, service operation or production-home access was performed
 - R7a account: `duduclaw-selftest` (`duduclaw_isolation::ids::SELFTEST_USER`, which `duduclaw-run-selftest` drops to) is one of the layout's auxiliary accounts, created, checked and kept under the same rules before spawnd starts.
 - R7a unit: `duduclaw-isolation-selftest.service` is installed with the layout units (root:root 0644, byte-equal to spawnd's `ISOLATION_SELFTEST_UNIT_TEXT`, daemon-reloaded before spawnd starts), stopped right after spawnd by the quiesce, removed by rollback/uninstall, and never enabled or started by the installer.
 - R7c binary: `/usr/lib/duduclaw/duduclaw-isolation-probe` (signed target `IsolationProbe`, root:root 0755, a `[[bin]]` of `duduclaw-isolation` that links only std, libc and serde_json) is in `BINARIES`, the readiness component map, spawnd's publication/readback and the isolation install facts. No account: it runs as root.
-- R7c unit: the template `duduclaw-isolation-probe@.service` (root:root 0644, byte-equal to spawnd's `ISOLATION_PROBE_UNIT_TEXT`, no `[Install]`) is installed with the layout units and never enabled or started by the installer; its instances `duduclaw-isolation-probe@<account>.service` are an owned template shape (`TEMPLATES`, lifecycle `owned_unit`), so the quiesce/rollback stops any running instance, and rollback/uninstall removes the file. Each instance proves, against the live sshd, that a real public-key login and a real `-N -R` forwarding session as that employee are refused: ssh exits 255 with `Permission denied (publickey).` and sshd's own root journal record (`sshd` or `sshd-session`, same session PID, the probe's own source port via `ProxyCommand=duduclaw-isolation-probe --relay`) says the account is listed in `DenyUsers`. Hosts where `/usr/sbin/sshd` exists also need `/usr/bin/ssh`, `/usr/bin/ssh-keygen`, `/usr/bin/journalctl`, sshd listening on loopback and logging to the journal; hosts without sshd skip the probe (exit 5). Spawnd does not start it yet; replacing the installation-receipt reader in `verify_login` is R7c part 2.
+- R7c unit: the template `duduclaw-isolation-probe@.service` (root:root 0644, byte-equal to spawnd's `ISOLATION_PROBE_UNIT_TEXT`, no `[Install]`) is installed with the layout units and never enabled or started by the installer; its instances `duduclaw-isolation-probe@<account>.service` are an owned template shape (`TEMPLATES`, lifecycle `owned_unit`), so the quiesce/rollback stops any running instance, and rollback/uninstall removes the file. Each instance proves, against the live sshd, that a real public-key login and a real `-N -R` forwarding session as that employee are refused: ssh exits 255 with `Permission denied (publickey).` and sshd's own root journal record (`sshd` or `sshd-session`, same session PID, the probe's own source port via `ProxyCommand=duduclaw-isolation-probe --relay`) says the account is listed in `DenyUsers`. Hosts where `/usr/sbin/sshd` exists also need `/usr/bin/ssh`, `/usr/bin/ssh-keygen`, `/usr/bin/journalctl`, sshd listening on loopback and logging to the journal; hosts without sshd skip the probe (exit 5). Spawnd starts the instances itself (R7c part 2, "R7c: SSH denial through PID 1"); the installation-receipt reader is gone.
 - The two parser roots start root:root 0755 and empty. Reinstall accepts only the
   bounded empty mountpoint skeleton that systemd can leave; files, symlinks,
   unexpected descendants, writable directories and different devices refuse.

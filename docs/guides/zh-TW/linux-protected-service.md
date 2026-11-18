@@ -58,7 +58,7 @@
 
 Kernel 7.0 **目前不接受**：trampoline 會拒絕大於 7 的 Landlock ABI。請確認實際開機使用的 kernel，不能只看發行版或 GCP 映像名稱。驗收請使用已接受的 kernel 組態，不要關閉 Landlock 或自行放寬 ABI 檢查。上表不涵蓋完整安裝、真實廠商 CLI 執行、完整遷移或更新復原。
 
-主機需有可信任的系統工具，包括 `getent`、`id`、`useradd`、util-linux、systemd 工具及 curl。員工 loop 儲存空間需要 ext4 或 XFS、受支援且非 thin provisioning 的底層裝置鏈，並保留員工配額與 TCB 所需空間。未知儲存配置或容量不足會使就緒檢查失敗。使用外部 IAM／NSS 時，必須永久保留員工 UID 範圍。
+主機需有可信任的系統工具，包括 `getent`、`id`、`useradd`、util-linux、systemd 工具及 curl。員工 loop 儲存空間需要 ext4 或 XFS、受支援且非 thin provisioning 的底層裝置鏈，並保留員工配額與 TCB 所需空間。未知儲存配置或容量不足會使就緒檢查失敗。`/etc/nsswitch.conf` 的 passwd 與 group 兩行只能列出 `files` 與 `systemd`（Ubuntu、Debian 的預設值，以及使用 authselect `minimal` 設定檔的 RHEL／Fedora）。列出其他模組的主機（LDAP／SSSD 的 `sss`、Google Compute Engine OS Login 的 `oslogin`／`cache_oslogin`、`compat`、`[SUCCESS=merge]` 這類方括號動作子句）不受支援，就緒檢查會失敗：這類模組可能在員工 UID 範圍內加入帳號，而這個版本無法在外部目錄中保留該範圍。
 
 ## 單一執行檔受保護服務（目前版本）
 
@@ -108,7 +108,9 @@ sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux [--version X.Y
 
 解析器可能留下[安裝參考](../../../crates/duduclaw-parse-worker/README.md)列出的已知空掛載點目錄。遇到其他內容應先調查，不要遞迴清空解析根目錄。Spawnd 負責員工的 SSH、cron、at 與 user manager 封鎖，並驗證主機上的有效狀態；不要手動放寬這些控制來通過檢查。
 
-若主機安裝了 `/usr/sbin/sshd`，SSH 拒絕檢測會以每個員工帳號對執行中的 sshd 實際嘗試一次公鑰登入與一次連接埠轉送，兩者都必須被 `DenyUsers duduclaw-emp-*` 規則拒絕。這類主機還需要 `/usr/bin/ssh`、`/usr/bin/ssh-keygen` 與 `/usr/bin/journalctl`，sshd 必須在 127.0.0.1（其設定中的第一個 `Port`）上監聽，並把日誌寫入 systemd journal。沒有 sshd 的主機會略過這項檢測。
+若主機安裝了 `/usr/sbin/sshd`，spawnd 會自行證明每個員工帳號的 SSH 都被拒絕，不需要任何安裝收據：它透過 systemd 為該帳號啟動 SSH 拒絕檢測單元，檢測程式以該帳號對執行中的 sshd 實際嘗試一次公鑰登入與一次連接埠轉送，兩者都必須被 `DenyUsers duduclaw-emp-*` 規則拒絕，並由 sshd 自己的 journal 紀錄確認。這份證明只保存在記憶體中；當該帳號實際生效的 sshd 設定、帳號本身、已安裝的檢測程式或其單元、簽章版本或開機有任何變化，以及每次 spawnd 重新啟動之後，都會重新證明。在某位員工的證明完成之前，只有這位員工暫時無法執行（not ready），其他員工不受影響。新員工要等到自己的證明完成才會建立（最多約一分半鐘）。若證明無法完成，在 spawnd 持續執行期間重試建立會接續同一個帳號（spawnd 重新啟動後，未完成的帳號會被停用，必須重新提出建立）；若證明顯示該帳號可以登入，該帳號會被永久停用。
+
+有 sshd 的主機還需要 `/usr/bin/ssh`、`/usr/bin/ssh-keygen` 與 `/usr/bin/journalctl`，sshd 必須在 127.0.0.1（其設定中的第一個 `Port`）上監聽，並把日誌寫入 systemd journal。不支援設定為 `UsePAM no` 的 sshd：此時 sshd 會在套用 `DenyUsers` 之前就以帳號已過期為由拒絕員工帳號，檢測無法確認拒絕原因，員工永遠不會就緒。沒有 sshd 的主機會略過這項檢測。
 
 安裝器先驗證固定路徑的完整元件，再準備帳號、目錄與 unit。Linux 發行包已加入凍結的更新啟動器；離線工具可將已簽署的資料與元件組成 bootstrap inbox。經獨立驗證的 `duduclaw-updated --bootstrap-stage` 會檢查編譯時固定的根指紋、根金鑰門檻簽章、target 簽章與全部元件雜湊，再發布**尚未啟用的世代**；不選擇 `current`、不建立 trust／state／slots、不驗證舊版過渡雙簽，也不啟動服務。尚無可直接照做的完整新安裝步驟。
 
@@ -190,7 +192,7 @@ sudo journalctl -u duduclaw-gateway.service -u duduclaw-spawnd.service -u duducl
 | --- | --- |
 | `UnsupportedKernel` | 檢查實際 kernel 與 Landlock ABI；ABI 8／kernel 7.0 目前會拒絕，保留此檢查。 |
 | 就緒資料缺失、過期或不相容 | 確認完整世代、協定版本、帳號登錄表與全部服務；只有 `active` 不足以放行。 |
-| UID／帳號／SSH／IAM 失敗 | 處理保留範圍衝突、別名、附加群組、登入／cron／at 或 linger；外部 IAM 保留需管理員證明。 |
+| UID／帳號／SSH／IAM 失敗 | 處理保留範圍衝突、別名、附加群組、登入／cron／at 或 linger。passwd 或 group 使用 `files`／`systemd` 以外的 NSS 模組（例如 SSSD 或 GCE OS Login）不受支援。在有 sshd 的主機上某位員工一直未就緒時：查看 journal 中的 `SSH denial probe duduclaw-emp-<uid>: …` 與 `journalctl -u 'duduclaw-isolation-probe@*'`；不要移除 `DenyUsers` 的設定片段。 |
 | 儲存／配額失敗 | 確認底層裝置鏈、硬性配額、可用容量與主機保留空間；不能用磁碟用量輪詢代替硬性配額。 |
 | DNS／egress 失敗 | 檢查 root 指定的 resolved Varlink 或 DNS broker 路徑；不要替 egress 服務加入私有 resolver IP 例外。DNS 就緒（`host_dns_route_unverified`）是 spawnd 自己的即時檢查，不讀安裝收據：spawnd 約每分鐘請 egress 經由該路徑解析簽章政策中的 `dns_probe_name`，至少要得到一個公開位址才算通過。簽章政策版本低於 v4、egress 沒有執行，或這台主機解析不到該名稱時，都維持未驗證（請檢查對外 DNS 與 egress 日誌中的 `dns_probe` 紀錄）。 |
 | 解析根目錄失敗 | 檢查兩個根目錄的擁有者、權限與非預期內容；不要複製主機 `/etc` 或資料進去。 |

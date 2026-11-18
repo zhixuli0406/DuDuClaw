@@ -250,6 +250,9 @@ impl SelfTestInstallation {
 
 #[cfg(target_os = "linux")]
 pub use linux::{live_key, InstalledHost};
+/// R7c: the same signed-artifact check for the SSH probe binary (`crate::ssh_evidence`).
+#[cfg(target_os = "linux")]
+pub(crate) use linux::verified_artifact;
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -264,7 +267,7 @@ mod linux {
     /// The exact file PID 1 executes, verified by descriptor against the one
     /// signed artifact of `target` (moved from the receipt reader, so the
     /// trampoline check no longer depends on any receipt).
-    fn verified_artifact(directory: &Directory, manifest: &ReleaseManifest, target: InstallTarget) -> io::Result<ArtifactKey> {
+    pub(crate) fn verified_artifact(directory: &Directory, manifest: &ReleaseManifest, target: InstallTarget) -> io::Result<ArtifactKey> {
         let mut matching = manifest.artifacts.iter().filter(|a| a.install_target == target);
         let artifact = matching.next().ok_or_else(denied)?;
         if matching.next().is_some() { return Err(denied()); }

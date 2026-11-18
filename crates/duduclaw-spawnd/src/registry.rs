@@ -68,6 +68,12 @@ pub trait AccountHost {
     /// Must not create a missing user, delete the permanent mapping, or accept a
     /// same-uid alias. Success includes a complete no-process readback.
     fn recover_locked(&mut self, _account: &EmployeeAccount) -> io::Result<()> { Err(invalid()) }
+    /// R7c: wait, bounded, until the SSH denial probe of a just-created (or
+    /// resumed) account reports Denied. An unresolved result is an error
+    /// carrying `crate::accounts::SshRefusal` (`probe_unresolved`), which
+    /// keeps the reservation resumable instead of tombstoning it. Default:
+    /// nothing to wait for (hosts and fakes without a probe).
+    fn await_login_denied(&mut self, _account: &EmployeeAccount) -> io::Result<()> { Ok(()) }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -93,11 +99,16 @@ impl Registry {
             .ok_or_else(invalid)
     }
 
-    pub fn verify(&self, host: &mut dyn AccountHost) -> io::Result<()> {
+    pub fn verify(&self, host: &mut dyn AccountHost) -> io::Result<()> { self.verify_with(host, &BTreeSet::new()) }
+    /// [`Self::verify`], except that a `Reserved` row of an employee in
+    /// `resumable` ([`Allocations`]: an allocation of this process stopped on an
+    /// unresolved SSH probe) is not a refusal; its local account is still
+    /// checked by `verify_namespace` like every account in the range.
+    pub fn verify_with(&self, host: &mut dyn AccountHost, resumable: &BTreeSet<EmployeeId>) -> io::Result<()> {
         self.validate(&host.policy()?)?;
         host.verify_namespace(self)?;
         for account in &self.employees {
-            if account.state == AccountState::Reserved { return Err(invalid()); }
+            if account.state == AccountState::Reserved && !resumable.contains(&account.employee) { return Err(invalid()); }
             if account.state == AccountState::Ready { host.verify_locked(account)?; }
         }
         Ok(())
@@ -121,6 +132,76 @@ impl Registry {
         }
         Err(io::Error::new(io::ErrorKind::StorageFull, "employee identity range exhausted"))
     }
+}
+
+/// R7c: the allocation state machine of one registry (portable; the root
+/// `RegistryStore` persists around it).
+///
+/// - New employee: `reserve` (durable `Reserved`), `create_locked`, then
+///   `await_login_denied` (the SSH probe of the new account, bounded wait),
+///   then `verify_locked`. All pass ⇒ `Ready`.
+/// - The probe is unresolved (pending at the deadline, inconclusive, PID 1
+///   error, contradictory "no sshd") ⇒ the row STAYS `Reserved`, is
+///   remembered here as resumable, nothing is quarantined, and the error is
+///   returned. The uid is not burned.
+/// - The next allocation of the SAME employee in this process resumes it:
+///   `recover_locked` (lockdown of the existing user and no-process readback,
+///   as start-up recovery does), then the same probe wait and `verify_locked`,
+///   with the same three outcomes. A `Reserved` row this set does not know
+///   (a crash mid-allocation) is still refused as before.
+/// - Every other failure, including a probe that proves the account
+///   reachable, ⇒ `Tombstone` + best-effort `recover_locked`, as before.
+///
+/// The set is memory only: after a restart `RegistryStore::reconcile` turns
+/// every `Reserved` row into a `Tombstone` exactly as before (unchanged rule),
+/// so an unresolved reservation does not outlive the process that made it.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Default)]
+pub struct Allocations { unresolved: BTreeSet<EmployeeId> }
+#[cfg(any(target_os = "linux", test))]
+impl Allocations {
+    /// Employees whose `Reserved` row an unresolved probe left resumable.
+    pub fn resumable(&self) -> &BTreeSet<EmployeeId> { &self.unresolved }
+    /// Allocate (or resume) `employee` in `registry`; `save` persists the
+    /// registry durably (before useradd, and after the outcome is decided).
+    pub fn allocate(&mut self, registry: &mut Registry, employee: EmployeeId, host: &mut dyn AccountHost,
+        save: &mut dyn FnMut(&Registry) -> io::Result<()>) -> io::Result<EmployeeAccount> {
+        let (index, resumed) = match registry.employees.iter().position(|account| account.employee == employee) {
+            Some(index) => match registry.employees[index].state {
+                AccountState::Ready => {
+                    registry.verify_with(host, &self.unresolved)?;
+                    return Ok(registry.employees[index].clone());
+                }
+                AccountState::Reserved if self.unresolved.contains(&employee) => (index, true),
+                _ => return Err(invalid()),
+            },
+            None => {
+                let index = registry.reserve(employee, host)?;
+                save(registry)?;
+                (index, false)
+            }
+        };
+        let account = registry.employees[index].clone();
+        let prepared = if resumed { host.recover_locked(&account) } else { host.create_locked(&account) };
+        let result = prepared.and_then(|()| host.await_login_denied(&account)).and_then(|()| host.verify_locked(&account));
+        let unresolved = result.as_ref().err().is_some_and(crate::accounts::probe_unresolved);
+        registry.employees[index].state = match (&result, unresolved) {
+            (Ok(()), _) => AccountState::Ready,
+            (Err(_), true) => AccountState::Reserved,
+            (Err(_), false) => AccountState::Tombstone,
+        };
+        if unresolved { self.unresolved.insert(employee); } else { self.unresolved.remove(&employee); }
+        save(registry)?;
+        if let Err(error) = result {
+            // Best-effort immediate quarantine of a tombstone. A failure stays
+            // durable and startup retries it before any protected execution.
+            if !unresolved { let _ = host.recover_locked(&registry.employees[index]); }
+            return Err(error);
+        }
+        Ok(registry.employees[index].clone())
+    }
+    /// The employee's row became a tombstone (explicit retirement/compensation).
+    pub fn forget(&mut self, employee: EmployeeId) { self.unresolved.remove(&employee); }
 }
 
 #[cfg(target_os = "linux")]
@@ -147,7 +228,9 @@ mod disk {
     }
 
     /// An instance owns the global lock for its entire lifetime, including useradd.
-    pub struct RegistryStore { directory: PathBuf, _lock: File, data: Registry, poisoned: bool }
+    /// `allocations` (R7c) remembers which `Reserved` rows of this process
+    /// an unresolved SSH probe left resumable.
+    pub struct RegistryStore { directory: PathBuf, _lock: File, data: Registry, poisoned: bool, allocations: Allocations }
 
     impl RegistryStore {
         pub fn open() -> io::Result<Self> { Self::open_at(Path::new(REGISTRY_DIRECTORY)) }
@@ -196,7 +279,8 @@ mod disk {
             };
             // Recovery must retain the reservation until it can quarantine any
             // group/user created before the previous daemon stopped.
-            let mut store = Self { directory: directory.to_path_buf(), _lock: lock, data, poisoned: false };
+            let mut store = Self { directory: directory.to_path_buf(), _lock: lock, data, poisoned: false,
+                allocations: Allocations::default() };
             // Persist even an empty initial registry; never infer unused IDs later.
             store.save()?;
             Ok(store)
@@ -204,26 +288,9 @@ mod disk {
 
         fn save(&mut self) -> io::Result<()> {
             if self.poisoned { return Err(invalid()); }
-            let result = self.save_inner();
+            let result = save_inner(&self.directory, &self.data);
             if result.is_err() { self.poisoned = true; }
             result
-        }
-
-        fn save_inner(&self) -> io::Result<()> {
-            let path = self.directory.join("registry.json");
-            let temporary = self.directory.join("registry.next");
-            match fs::symlink_metadata(&temporary) {
-                Ok(_) => { root_path(&temporary, false)?; fs::remove_file(&temporary)?; }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {},
-                Err(error) => return Err(error),
-            }
-            let bytes = serde_json::to_vec(&self.data).map_err(|_| invalid())?;
-            if bytes.len() as u64 > MAX_REGISTRY_BYTES { return Err(invalid()); }
-            let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temporary)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            fs::rename(&temporary, path)?;
-            File::open(&self.directory)?.sync_all()
         }
 
         pub fn registry(&self) -> &Registry { &self.data }
@@ -251,26 +318,24 @@ mod disk {
             Ok(report)
         }
 
+        /// The R7c allocation state machine ([`Allocations::allocate`]), each
+        /// decision persisted (a failed save poisons the store).
         pub fn allocate(&mut self, employee: EmployeeId, host: &mut dyn AccountHost) -> io::Result<EmployeeAccount> {
             if self.poisoned { return Err(invalid()); }
-            if let Some(existing) = self.data.employees.iter().find(|account| account.employee == employee) {
-                if existing.state != AccountState::Ready { return Err(invalid()); }
-                self.data.verify(host)?;
-                return Ok(existing.clone());
-            }
-            let index = self.data.reserve(employee, host)?;
-            self.save()?;
-            let result = host.create_locked(&self.data.employees[index])
-                .and_then(|()| host.verify_locked(&self.data.employees[index]));
-            self.data.employees[index].state = if result.is_ok() { AccountState::Ready } else { AccountState::Tombstone };
-            self.save()?;
-            if let Err(error) = result {
-                // Best-effort immediate quarantine. A failure stays durable and
-                // startup retries it before any protected execution is admitted.
-                let _ = host.recover_locked(&self.data.employees[index]);
-                return Err(error);
-            }
-            Ok(self.data.employees[index].clone())
+            let Self { directory, data, poisoned, allocations, .. } = self;
+            allocations.allocate(data, employee, host, &mut |registry: &Registry| {
+                if *poisoned { return Err(invalid()); }
+                let result = save_inner(directory.as_path(), registry);
+                if result.is_err() { *poisoned = true; }
+                result
+            })
+        }
+
+        /// [`Registry::verify_with`] for this store: a reservation an
+        /// unresolved SSH probe of this process left resumable is not a
+        /// host-wide refusal (readiness refresh).
+        pub fn verify(&self, host: &mut dyn AccountHost) -> io::Result<()> {
+            self.data.verify_with(host, self.allocations.resumable())
         }
 
         /// Explicit retirement never removes the mapping and never recycles its uid.
@@ -278,8 +343,26 @@ mod disk {
             if self.poisoned { return Err(invalid()); }
             let account = self.data.employees.iter_mut().find(|account| account.employee == employee).ok_or_else(invalid)?;
             account.state = AccountState::Tombstone;
+            self.allocations.forget(employee);
             self.save()
         }
+    }
+
+    fn save_inner(directory: &Path, data: &Registry) -> io::Result<()> {
+        let path = directory.join("registry.json");
+        let temporary = directory.join("registry.next");
+        match fs::symlink_metadata(&temporary) {
+            Ok(_) => { root_path(&temporary, false)?; fs::remove_file(&temporary)?; }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+            Err(error) => return Err(error),
+        }
+        let bytes = serde_json::to_vec(data).map_err(|_| invalid())?;
+        if bytes.len() as u64 > MAX_REGISTRY_BYTES { return Err(invalid()); }
+        let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        File::open(directory)?.sync_all()
     }
 }
 #[cfg(target_os = "linux")]
@@ -369,6 +452,140 @@ mod tests {
         policy.subgids.push(UidRange { first: 99999, last: 150000 });
         assert!(policy.check(Registry::default().range, 70000).is_err());
         assert_eq!(account_name(70000), "duduclaw-emp-70000");
+    }
+
+    /// R7c: a host whose SSH probe outcomes are scripted (one per
+    /// `await_login_denied`), with injected create/verify failures.
+    #[derive(Default)]
+    struct Probing { probes: Vec<io::Result<()>>, create_fail: bool, verify_fail: bool,
+        creates: usize, recoveries: usize, waits: usize }
+    impl AccountHost for Probing {
+        fn policy(&mut self) -> io::Result<HostUidPolicy> { Host.policy() }
+        fn verify_namespace(&mut self, _: &Registry) -> io::Result<()> { Ok(()) }
+        fn uid_available(&mut self, _: u32) -> io::Result<bool> { Ok(true) }
+        fn occupied_ids(&mut self, _: UidRange) -> io::Result<BTreeSet<u32>> { Ok(BTreeSet::new()) }
+        fn create_locked(&mut self, _: &EmployeeAccount) -> io::Result<()> {
+            self.creates += 1;
+            if self.create_fail { Err(io::Error::other("injected useradd failure")) } else { Ok(()) }
+        }
+        fn verify_locked(&mut self, _: &EmployeeAccount) -> io::Result<()> {
+            if self.verify_fail { Err(io::Error::other("injected lockdown readback failure")) } else { Ok(()) }
+        }
+        fn recover_locked(&mut self, _: &EmployeeAccount) -> io::Result<()> { self.recoveries += 1; Ok(()) }
+        fn await_login_denied(&mut self, _: &EmployeeAccount) -> io::Result<()> {
+            self.waits += 1;
+            if self.probes.is_empty() { panic!("unexpected probe wait") }
+            self.probes.remove(0)
+        }
+    }
+    use crate::accounts::SshRefusal;
+    fn inconclusive() -> io::Result<()> { Err(SshRefusal::Inconclusive("identity (exit 3)".into()).error()) }
+    fn reachable() -> io::Result<()> { Err(SshRefusal::Reachable("login_not_denied (exit 10)".into()).error()) }
+    fn pending() -> io::Result<()> { Err(SshRefusal::Pending.error()) }
+    /// Runs `Allocations::allocate`, counting the durable saves.
+    fn allocate(state: &mut Allocations, registry: &mut Registry, employee: u8, host: &mut Probing, saves: &mut usize)
+        -> io::Result<EmployeeAccount> {
+        state.allocate(registry, EmployeeId([employee; 16]), host, &mut |_: &Registry| { *saves += 1; Ok(()) })
+    }
+
+    #[test]
+    fn allocation_waits_for_the_probe_and_denied_is_ready() {
+        let (mut state, mut registry, mut saves) = (Allocations::default(), Registry::default(), 0);
+        let mut host = Probing { probes: vec![Ok(())], ..Probing::default() };
+        let account = allocate(&mut state, &mut registry, 1, &mut host, &mut saves).unwrap();
+        assert_eq!((account.uid, account.state), (70000, AccountState::Ready));
+        assert_eq!((host.creates, host.waits, host.recoveries, saves), (1, 1, 0, 2));
+        assert!(state.resumable().is_empty());
+        // A replay of a Ready employee neither creates nor probes again.
+        assert_eq!(allocate(&mut state, &mut registry, 1, &mut host, &mut saves).unwrap(), account);
+        assert_eq!((host.creates, host.waits), (1, 1));
+    }
+
+    #[test]
+    fn allocation_reachable_probe_tombstones_and_burns_the_uid() {
+        let (mut state, mut registry, mut saves) = (Allocations::default(), Registry::default(), 0);
+        let mut host = Probing { probes: vec![reachable(), Ok(())], ..Probing::default() };
+        let error = allocate(&mut state, &mut registry, 1, &mut host, &mut saves).unwrap_err();
+        assert!(matches!(crate::accounts::ssh_refusal(&error), Some(SshRefusal::Reachable(_))), "{error}");
+        assert_eq!(registry.employees[0].state, AccountState::Tombstone);
+        assert_eq!(host.recoveries, 1, "a tombstone is quarantined at once");
+        assert!(state.resumable().is_empty());
+        // Never resumed, never recycled.
+        assert!(allocate(&mut state, &mut registry, 1, &mut host, &mut saves).is_err());
+        assert_eq!((host.creates, host.waits), (1, 1));
+        assert_eq!(allocate(&mut state, &mut registry, 2, &mut host, &mut saves).unwrap().uid, 70001);
+    }
+
+    #[test]
+    fn allocation_unresolved_probe_keeps_the_reservation_and_the_same_employee_resumes() {
+        for unresolved in [inconclusive as fn() -> io::Result<()>, pending,
+            || Err(SshRefusal::NotApplicable.error())] {
+            let (mut state, mut registry, mut saves) = (Allocations::default(), Registry::default(), 0);
+            let mut host = Probing { probes: vec![unresolved(), unresolved(), Ok(())], ..Probing::default() };
+            let error = allocate(&mut state, &mut registry, 1, &mut host, &mut saves).unwrap_err();
+            assert!(crate::accounts::probe_unresolved(&error), "{error}");
+            assert_eq!(registry.employees[0].state, AccountState::Reserved, "never tombstoned");
+            assert_eq!(host.recoveries, 0, "nothing quarantined");
+            assert!(state.resumable().contains(&EmployeeId([1; 16])));
+            assert_eq!(saves, 2, "the Reserved outcome is durable");
+            // Host-wide: the resumable reservation does not fail verification;
+            // any other Reserved row (or the plain rule) still does.
+            registry.verify_with(&mut Probing::default(), state.resumable()).unwrap();
+            assert!(registry.verify(&mut Probing::default()).is_err());
+            // Another employee is allocated meanwhile, with the next uid.
+            let mut other = Probing { probes: vec![Ok(())], ..Probing::default() };
+            assert_eq!(allocate(&mut state, &mut registry, 2, &mut other, &mut saves).unwrap().uid, 70001);
+            // A retry for the same employee resumes: re-lock, probe again, no new account.
+            assert!(crate::accounts::probe_unresolved(&allocate(&mut state, &mut registry, 1, &mut host, &mut saves).unwrap_err()));
+            assert_eq!((host.creates, host.recoveries, host.waits), (1, 1, 2));
+            assert_eq!(registry.employees[0].state, AccountState::Reserved);
+            let account = allocate(&mut state, &mut registry, 1, &mut host, &mut saves).unwrap();
+            assert_eq!((account.uid, account.state), (70000, AccountState::Ready), "same uid, now Ready");
+            assert_eq!((host.creates, host.recoveries, host.waits), (1, 2, 3));
+            assert!(state.resumable().is_empty());
+            registry.verify(&mut Probing::default()).unwrap();
+        }
+        // An unresolved reservation whose resumed probe proves the account reachable is tombstoned.
+        let (mut state, mut registry, mut saves) = (Allocations::default(), Registry::default(), 0);
+        let mut host = Probing { probes: vec![inconclusive(), reachable()], ..Probing::default() };
+        assert!(allocate(&mut state, &mut registry, 1, &mut host, &mut saves).is_err());
+        assert!(allocate(&mut state, &mut registry, 1, &mut host, &mut saves).is_err());
+        assert_eq!(registry.employees[0].state, AccountState::Tombstone);
+        assert!(state.resumable().is_empty());
+        assert!(allocate(&mut state, &mut registry, 1, &mut host, &mut saves).is_err());
+        // Retirement (compensation) forgets it.
+        let (mut state, mut registry, mut saves) = (Allocations::default(), Registry::default(), 0);
+        let mut host = Probing { probes: vec![pending()], ..Probing::default() };
+        assert!(allocate(&mut state, &mut registry, 1, &mut host, &mut saves).is_err());
+        state.forget(EmployeeId([1; 16]));
+        assert!(allocate(&mut state, &mut registry, 1, &mut host, &mut saves).is_err(), "no longer resumable");
+        assert_eq!(host.waits, 1);
+    }
+
+    #[test]
+    fn allocation_keeps_every_existing_tombstone_trigger() {
+        // useradd/groupadd/lockdown failure: tombstone, quarantine, no probe wait.
+        let (mut state, mut registry, mut saves) = (Allocations::default(), Registry::default(), 0);
+        let mut host = Probing { create_fail: true, ..Probing::default() };
+        assert!(allocate(&mut state, &mut registry, 1, &mut host, &mut saves).is_err());
+        assert_eq!((registry.employees[0].state, host.waits, host.recoveries), (AccountState::Tombstone, 0, 1));
+        // Readback after a Denied probe fails: tombstone.
+        let mut host = Probing { probes: vec![Ok(())], verify_fail: true, ..Probing::default() };
+        assert!(allocate(&mut state, &mut registry, 2, &mut host, &mut saves).is_err());
+        assert_eq!(registry.employees[1].state, AccountState::Tombstone);
+        // A non-probe error from the probe step (e.g. the sshd effective configuration) tombstones.
+        let mut host = Probing { probes: vec![Err(io::Error::new(io::ErrorKind::PermissionDenied, "sshd -T"))], ..Probing::default() };
+        assert!(allocate(&mut state, &mut registry, 3, &mut host, &mut saves).is_err());
+        assert_eq!(registry.employees[2].state, AccountState::Tombstone);
+        assert!(state.resumable().is_empty());
+        // A Reserved row this process did not leave resumable (a crash) is refused untouched.
+        registry.employees.push(EmployeeAccount { employee: EmployeeId([9; 16]), uid: 70009, gid: 70009, state: AccountState::Reserved });
+        let mut host = Probing::default();
+        assert!(allocate(&mut state, &mut registry, 9, &mut host, &mut saves).is_err());
+        assert_eq!((registry.employees[3].state, host.creates, host.recoveries, host.waits), (AccountState::Reserved, 0, 0, 0));
+        assert!(registry.verify_with(&mut Probing::default(), state.resumable()).is_err());
+        // Tombstones are never revived.
+        assert!(allocate(&mut state, &mut registry, 1, &mut Probing::default(), &mut saves).is_err());
     }
 
     #[cfg(target_os = "linux")]

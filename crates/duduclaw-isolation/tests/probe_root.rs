@@ -23,9 +23,8 @@ const SSH_DROPIN: &str = "DenyUsers duduclaw-emp-* duduclaw duduclaw-runsup dudu
 const DROPIN_PATH: &str = "/etc/ssh/sshd_config.d/10-duduclaw.conf";
 /// Disposable, locked, nologin account in the employee uid range.
 const ACCOUNT: &str = "duduclaw-emp-probetest";
-/// Exit codes of the probe (crates/duduclaw-isolation/src/bin/probe.rs).
-const EXIT_IDENTITY: i32 = 3;
-const EXIT_EFFECTIVE_CONFIG: i32 = 7;
+/// Exit codes of the probe (the shared table the binary and spawnd use).
+use duduclaw_isolation::probe_exit::{EXIT_EFFECTIVE_CONFIG, EXIT_IDENTITY};
 
 fn unit_service_settings() -> Vec<&'static str> {
     let (_, service) = PROBE_UNIT_TEXT.split_once("\n[Service]\n").expect("[Service] section");
@@ -113,7 +112,10 @@ fn passwd_uid(name: &str) -> Option<u32> {
     }
 }
 /// The locked, nologin employee-range account, created like spawnd's
-/// `create_locked` when absent.
+/// `create_locked` when absent (same useradd argument list: no
+/// `--key CREATE_MAIL_SPOOL=no`, which shadow 4.13 on Ubuntu 24.04 refuses with
+/// "unknown item" and exit 3; and the same check that useradd created no mail
+/// spool). useradd may warn that the uid is outside UID_MIN/UID_MAX.
 fn ensure_account(created: &mut Created) {
     use duduclaw_isolation::ids::{EMPLOYEE_UID_MAX, EMPLOYEE_UID_MIN};
     if let Some(uid) = passwd_uid(ACCOUNT) {
@@ -128,9 +130,15 @@ fn ensure_account(created: &mut Created) {
     created.account = true;
     let (code, _, stderr) = tool("/usr/sbin/useradd", &["--uid", &uid, "--gid", &uid, "--no-user-group",
         "--no-create-home", "--no-log-init", "--key", "SUB_UID_COUNT=0", "--key", "SUB_GID_COUNT=0",
-        "--key", "CREATE_MAIL_SPOOL=no", "--home-dir", "/nonexistent", "--shell", "/usr/sbin/nologin",
+        "--home-dir", "/nonexistent", "--shell", "/usr/sbin/nologin",
         "--password", "!*", "--expiredate", "1970-01-02", ACCOUNT]);
     assert_eq!(code, Some(0), "useradd: {stderr}");
+    for spool in ["/var/mail", "/var/spool/mail"] {
+        let path = Path::new(spool).join(ACCOUNT);
+        assert!(std::fs::symlink_metadata(&path).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+            "useradd created a mail spool {} (spawnd refuses such an account); remove it and set CREATE_MAIL_SPOOL=no in /etc/default/useradd",
+            path.display());
+    }
     let (code, _, stderr) = tool("/usr/bin/chage", &["-E", "1", ACCOUNT]);
     assert_eq!(code, Some(0), "chage: {stderr}");
 }

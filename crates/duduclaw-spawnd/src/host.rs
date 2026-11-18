@@ -6,7 +6,7 @@ use duduclaw_isolation::ipc::{HelperCallId, SpawndFeatures as Features};
 use crate::{Result, admission::{BrokerJob, BrokerReply, BrokerStep, Host, HostProgress, LaunchPolicy, Ticket,
         HelperEvent, HelperSignal, HelperStart, HelperStarted},
     helper_host::{CallPlan, HelperAudit, HelperEngine},
-    accounts::{self, InstallationEvidence, LinuxAccounts},
+    accounts::{self, LinuxAccounts},
     audit::{Detail, Event, Record, disk::AuditWorker}, bootstrap::{BootstrapPlan, Trampoline},
     channels::{OutputRelay, RevocablePair, ConnectionRevoker}, fds::SnapshotAuthority,
     host_state::{RunJournal, RunRecord}, host_worker::{WorkerHost, Scan}, policy::RootPolicy,
@@ -111,14 +111,16 @@ impl Egress for LinuxEgress {
     }
 }
 pub struct Components {
-    pub installation: Arc<dyn InstallationEvidence>,
+    /// R7c: per-account SSH denial probe results (`crate::ssh_evidence`);
+    /// the default proves nothing, so no account with sshd present is admitted.
+    pub ssh: Arc<dyn crate::ssh_evidence::SshEvidence>,
     pub publication: Box<dyn Publication>,
     pub storage: Box<dyn Storage>,
     pub trampoline: Box<dyn Trampoline>,
     pub egress: Box<dyn Egress>,
 }
 impl Default for Components {
-    fn default() -> Self { Self { installation: Arc::new(accounts::MissingInstallationEvidence),
+    fn default() -> Self { Self { ssh: Arc::new(crate::ssh_evidence::MissingSshEvidence),
         publication: Box::new(MissingPublication), storage: Box::new(UnavailableStorage),
         trampoline: Box::new(crate::native_trampoline::NativeTrampoline::default()), egress: Box::new(LinuxEgress::new(Box::new(MissingDnsEvidence))) } }
 }
@@ -232,7 +234,7 @@ struct Core {
 impl LinuxHost {
     pub fn open(gateway: (u32, u32), components: Components, audit: AuditWorker) -> io::Result<Self> {
         let registry = RegistryStore::initialize()?;
-        let mut accounts = LinuxAccounts { evidence: components.installation.as_ref() };
+        let mut accounts = LinuxAccounts::background(components.ssh.as_ref());
         registry.registry().validate(&accounts.policy()?)?;
         let monitor = Monitor::start(&registry.registry().employees, audit.clone())?;
         let scanner = ScanReader { state: monitor.state.clone(), entries: monitor.entries.clone() };
@@ -280,7 +282,10 @@ impl Core {
         for run in &runs { revoked &= self.components.egress.unregister(*run).is_ok(); }
         let units = self.systemd.reconcile_all();
         // Do not short circuit account/process quarantine on an unavailable C/H.
-        let accounts = self.registry.reconcile(&mut LinuxAccounts { evidence: self.components.installation.as_ref() });
+        // R7c: start-up recovery walks every account; a probe result still
+        // pending after the restart never fails it (background lookups ask the
+        // worker to re-probe every account; admission waits per employee).
+        let accounts = self.registry.reconcile(&mut LinuxAccounts::background(self.components.ssh.as_ref()));
         let mut absent = true;
         for account in &self.registry.registry().employees {
             for intruder in os(accounts::unexpected_processes(account.uid, None))? {
@@ -304,7 +309,11 @@ impl Core {
         let probe_started = crate::host_state::boottime_ms().unwrap_or(0);
         let startup_reconciled = self.report.checks.startup_reconciled && !self.poisoned;
         let mut checks = Readiness { startup_reconciled, ..Readiness::default() };
-        let registry = self.registry.registry().verify(&mut LinuxAccounts { evidence: self.components.installation.as_ref() }).is_ok();
+        // R7c: host-wide checks of every account (namespace, lockdown, cron/at,
+        // sshd configuration); each account's SSH probe result is per-employee
+        // and checked at its admission (`ready`), so one pending or failed
+        // probe never takes every employee down.
+        let registry = self.registry.verify(&mut LinuxAccounts::background(self.components.ssh.as_ref())).is_ok();
         self.policy = self.components.publication.load().ok();
         let snapshot = self.components.publication.snapshot_authority(self.gateway.0);
         checks.registry_verified = registry && self.policy.is_some() && snapshot.is_ok_and(|s| s.gateway_uid == self.gateway.0 && s.mount_id != 0);
@@ -508,7 +517,9 @@ impl Host for Core {
         // answered before it (S15), ReadBack never waits for it.
         let host_busy = !self.runs.is_empty();
         let now_unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-        let mut accounts = LinuxAccounts { evidence: self.components.installation.as_ref() };
+        // R7c: allocation waits for the new account's probe itself
+        // (`AccountHost::await_login_denied`); other accounts are not probed inline.
+        let mut accounts = LinuxAccounts::background(self.components.ssh.as_ref());
         let result = self.allocator.handle(request, crate::allocation::Env { registry: &mut self.registry, accounts: &mut accounts,
             storage: self.components.storage.as_mut(), host_busy, idle, now_unix });
         for event in self.allocator.take_events() {
@@ -578,7 +589,10 @@ impl Host for Core {
         if self.poisoned { return Err(unavailable()); }
         self.report.check()?;
         let account = self.account(employee)?;
-        os(LinuxAccounts { evidence: self.components.installation.as_ref() }.verify_locked(&account))?;
+        // R7c: this employee's SSH denial probe must be Denied for its current
+        // key; until the (re-)probe reports, only this employee is NotReady.
+        LinuxAccounts::admission(self.components.ssh.as_ref()).verify_locked(&account).map_err(|error|
+            if accounts::ssh_refusal(&error) == Some(&accounts::SshRefusal::Pending) { ErrorCode::NotReady } else { unavailable() })?;
         self.report.check()
 
     }

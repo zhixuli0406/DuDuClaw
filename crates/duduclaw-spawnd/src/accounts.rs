@@ -91,6 +91,9 @@ pub fn ssh_effective_denied(text: &str) -> bool {
 }
 
 /// NSS modules outside files/systemd need an explicit, permanent IAM reservation.
+/// `Ok(true)`: the passwd or group line names another module (any token but
+/// `files`/`systemd`, bracketed action clauses included); `Err`: not exactly
+/// one passwd and one group line.
 pub fn external_nss(text: &str) -> io::Result<bool> {
     let mut seen = 0;
     let mut external = false;
@@ -107,6 +110,94 @@ pub fn external_nss(text: &str) -> io::Result<bool> {
     }
     if seen != 2 { return Err(denied()); }
     Ok(external)
+}
+
+/// R7c: why a host whose passwd/group NSS configuration names a module other
+/// than `files`/`systemd` is refused. Such a module (LDAP/SSSD, Google
+/// Compute Engine OS Login, …) can introduce identities in the employee uid
+/// range; only an explicit, permanent IAM reservation of that range could make
+/// it safe, and v1.83 has no producer of that reservation (it used to be read
+/// from the installer receipt), so the host is unsupported.
+pub const EXTERNAL_NSS_REFUSED: &str = "passwd/group NSS modules other than files and systemd are not supported \
+    (no permanent IAM reservation of the employee uid range exists for them)";
+/// `Ok` only when `nsswitch.conf` names nothing but `files`/`systemd` for
+/// passwd and group ([`external_nss`]); otherwise refused with [`EXTERNAL_NSS_REFUSED`].
+pub fn nss_supported(text: &str) -> io::Result<()> {
+    if external_nss(text)? { return Err(io::Error::new(io::ErrorKind::PermissionDenied, EXTERNAL_NSS_REFUSED)); }
+    Ok(())
+}
+
+/// R7c: why an account's SSH denial is not proven, carried inside the
+/// `io::Error` of `verify_login` / `await_login_denied` ([`ssh_refusal`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SshRefusal {
+    /// No probe result for the account's current key yet; the probe was
+    /// requested (kind `WouldBlock`, distinct from every other refusal).
+    Pending,
+    /// The probe ran and proved nothing (failed stage, timeout, PID 1 refusal).
+    Inconclusive(String),
+    /// The probe reported no sshd although `/usr/sbin/sshd` exists here.
+    NotApplicable,
+    /// The probe proved the public-key login or the forwarding session NOT denied.
+    Reachable(String),
+}
+impl std::fmt::Display for SshRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pending => write!(formatter, "SSH denial probe pending"),
+            Self::Inconclusive(reason) => write!(formatter, "SSH denial probe inconclusive: {reason}"),
+            Self::NotApplicable => write!(formatter, "SSH denial probe reports no sshd although /usr/sbin/sshd exists"),
+            Self::Reachable(stage) => write!(formatter, "SSH denial probe: account NOT denied ({stage})"),
+        }
+    }
+}
+impl std::error::Error for SshRefusal {}
+impl SshRefusal {
+    pub fn error(self) -> io::Error {
+        let kind = if self == Self::Pending { io::ErrorKind::WouldBlock } else { io::ErrorKind::PermissionDenied };
+        io::Error::new(kind, self)
+    }
+}
+/// The [`SshRefusal`] inside `error`, if any.
+pub fn ssh_refusal(error: &io::Error) -> Option<&SshRefusal> {
+    error.get_ref().and_then(|inner| inner.downcast_ref::<SshRefusal>())
+}
+/// The account's SSH denial is neither proven nor disproven (pending, timed
+/// out, inconclusive, contradictory "no sshd"): an allocation keeps the
+/// account resumable instead of tombstoning it. `Reachable` and every other
+/// error are not unresolved.
+pub fn probe_unresolved(error: &io::Error) -> bool {
+    matches!(ssh_refusal(error), Some(SshRefusal::Pending | SshRefusal::Inconclusive(_) | SshRefusal::NotApplicable))
+}
+
+/// R7c: the `useradd` argument list of `create_locked`. No
+/// `--key CREATE_MAIL_SPOOL=no`: shadow 4.13 (Ubuntu 24.04) refuses that key
+/// ("unknown item", exit 3); a mail spool useradd creates anyway is refused
+/// afterwards ([`mail_spool_absent`]). The SUB_*_COUNT keys stay (no
+/// /etc/subuid or /etc/subgid rows).
+pub fn useradd_arguments<'a>(uid: &'a str, name: &'a str) -> Vec<&'a str> {
+    vec!["--uid", uid, "--gid", uid, "--no-user-group", "--no-create-home", "--no-log-init",
+        "--key", "SUB_UID_COUNT=0", "--key", "SUB_GID_COUNT=0",
+        "--home-dir", "/nonexistent", "--shell", "/usr/sbin/nologin", "--password", "!*", "--expiredate", "1970-01-02", name]
+}
+/// R7c: after useradd, neither `<root>/var/mail/<name>` nor
+/// `<root>/var/spool/mail/<name>` may exist (lstat: a symlink counts). Such a
+/// spool would be an employee-owned file outside the isolated tree; spawnd
+/// never deletes files outside its own state, so the account is refused and
+/// rolled back like any other post-create verification failure. An unreadable
+/// path refuses too.
+pub fn mail_spool_absent(root: &std::path::Path, name: &str) -> io::Result<()> {
+    for directory in ["var/mail", "var/spool/mail"] {
+        let path = root.join(directory).join(name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => return Err(io::Error::new(io::ErrorKind::PermissionDenied,
+                format!("useradd created a mail spool {} for the employee account", path.display()))),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return Err(io::Error::new(io::ErrorKind::PermissionDenied,
+                format!("mail spool path {} unreadable", path.display()))),
+        }
+    }
+    Ok(())
 }
 
 /// UID aliases are checked by enumeration, not just getpwuid's first result.
@@ -139,21 +230,11 @@ pub fn partial_identity(account: &EmployeeAccount, users: &[PasswdEntry], groups
     Ok((!users.is_empty(), !groups.is_empty()))
 }
 
-/// Deployment evidence is supplied by the privileged installer/readiness harness.
-/// It cannot be supplied by SpawnRequest or inferred from a successful `sshd -T`.
-/// R7b: file ownership is not installer evidence; spawnd scans its own state
-/// directories at each allocation (`AccountHost::occupied_ids`).
-pub trait InstallationEvidence: Send + Sync {
-    fn external_nss_range_reserved_and_enumerable(&self, range: UidRange) -> io::Result<()>;
-    fn ssh_public_key_and_forwarding_denied(&self, account: &str) -> io::Result<()>;
-}
-
-/// The binary never substitutes an operator assertion for installation evidence.
-pub struct MissingInstallationEvidence;
-impl InstallationEvidence for MissingInstallationEvidence {
-    fn external_nss_range_reserved_and_enumerable(&self, _: UidRange) -> io::Result<()> { Err(denied()) }
-    fn ssh_public_key_and_forwarding_denied(&self, _: &str) -> io::Result<()> { Err(denied()) }
-}
+// R7c: there is no installer receipt any more. SSH denial is proven per
+// account by the probe unit run through PID 1 (`crate::ssh_evidence`), never
+// inferred from a successful `sshd -T` alone; external NSS is refused
+// ([`nss_supported`]). R7b: file ownership is spawnd's own scan of its state
+// directories at each allocation (`AccountHost::occupied_ids`).
 
 #[cfg(any(target_os = "linux", test))]
 #[path = "accounts_userdb.rs"]
@@ -225,6 +306,7 @@ fn start_ticks(stat: &str) -> io::Result<u64> {
 mod linux {
     use super::*;
     use crate::registry::{root_path, AccountHost};
+    use crate::ssh_evidence::SshEvidence;
     use std::{fs::{self, File, OpenOptions}, io::{Read, Write}, os::{fd::OwnedFd, unix::{fs::OpenOptionsExt, net::UnixStream}},
         path::Path, process::{Command, Stdio}, time::{Duration, Instant}};
 
@@ -300,14 +382,28 @@ mod linux {
         File::open(parent)?.sync_all()
     }
 
-    pub struct LinuxAccounts<'a> { pub evidence: &'a dyn InstallationEvidence }
+    /// Host account authority. `ssh` holds the per-account SSH denial probe
+    /// results (`crate::ssh_evidence`); `require_probe` decides whether a
+    /// missing or failed result refuses ([`Self::admission`]) or only asks
+    /// for a probe ([`Self::background`]).
+    pub struct LinuxAccounts<'a> { pub ssh: &'a dyn SshEvidence, pub require_probe: bool }
+
+    impl<'a> LinuxAccounts<'a> {
+        /// Readiness refresh, start-up recovery and allocation: they walk every
+        /// account, so one account's SSH probe state must not refuse them
+        /// (that would make it a host-wide effect). Every host-level check
+        /// still applies (`sshd -t`, the effective configuration); a missing or
+        /// stale probe result is requested (non-blocking).
+        pub fn background(ssh: &'a dyn SshEvidence) -> Self { Self { ssh, require_probe: false } }
+        /// One employee's admission (`Core::ready`): the account's probe must
+        /// have reported Denied for its current key.
+        pub fn admission(ssh: &'a dyn SshEvidence) -> Self { Self { ssh, require_probe: true } }
+    }
 
     impl LinuxAccounts<'_> {
         fn partial_local_identity(&self, account: &EmployeeAccount) -> io::Result<(bool, bool)> {
             let registry = Registry { employees: vec![account.clone()], ..Registry::default() };
-            if external_nss(&host_text(Path::new("/etc/nsswitch.conf"))?)? {
-                self.evidence.external_nss_range_reserved_and_enumerable(registry.range)?;
-            }
+            nss_supported(&host_text(Path::new("/etc/nsswitch.conf"))?)?;
             let nss = partial_identity(account, &parse_passwd(&success("/usr/bin/getent", &["passwd"])?)?,
                 &parse_group(&success("/usr/bin/getent", &["group"])?)?)?;
             let local = partial_identity(account, &parse_passwd(&host_text(Path::new("/etc/passwd"))?)?,
@@ -446,12 +542,30 @@ mod linux {
             if success("/usr/bin/loginctl", &["list-sessions", "--no-legend", "--no-pager"])?.lines()
                 .any(|line| line.split_whitespace().nth(1) == Some(uid.as_str())) { return Err(denied()); }
             if Path::new("/usr/sbin/sshd").exists() {
-                success("/usr/sbin/sshd", &["-t"])?;
-                let context = format!("user={name},host=localhost,addr=127.0.0.1");
-                if !ssh_effective_denied(&success("/usr/sbin/sshd", &["-T", "-C", &context])?) { return Err(denied()); }
-                self.evidence.ssh_public_key_and_forwarding_denied(&name)?;
+                let key = self.ssh_account_key(account)?;
+                // R7c: the probe's result for the CURRENT key (a lookup asks
+                // the worker for a missing or stale one; never blocks).
+                let outcome = self.ssh.lookup(&key);
+                if self.require_probe {
+                    if let Some(refusal) = crate::ssh_evidence::refusal(outcome.as_ref()) { return Err(refusal.error()); }
+                }
             }
             Ok(())
+        }
+
+        /// `sshd -t`, then the account's effective configuration
+        /// (`sshd -T -C user=<name>,host=localhost,addr=127.0.0.1`) must deny
+        /// it ([`ssh_effective_denied`]); the probe key is that output's
+        /// SHA-256 (the output itself is never logged or kept).
+        fn ssh_account_key(&self, account: &EmployeeAccount) -> io::Result<crate::ssh_evidence::AccountKey> {
+            use sha2::{Digest, Sha256};
+            let name = account_name(account.uid);
+            success("/usr/sbin/sshd", &["-t"])?;
+            let context = format!("user={name},host=localhost,addr=127.0.0.1");
+            let effective = success("/usr/sbin/sshd", &["-T", "-C", &context])?;
+            if !ssh_effective_denied(&effective) { return Err(denied()); }
+            Ok(crate::ssh_evidence::AccountKey { account: name, uid: account.uid,
+                sshd_config: duduclaw_isolation::ids::Sha256Digest(Sha256::digest(effective.as_bytes()).into()) })
         }
     }
 
@@ -549,9 +663,7 @@ mod linux {
         }
 
         fn verify_namespace(&mut self, registry: &Registry) -> io::Result<()> {
-            if external_nss(&host_text(Path::new("/etc/nsswitch.conf"))?)? {
-                self.evidence.external_nss_range_reserved_and_enumerable(registry.range)?;
-            }
+            nss_supported(&host_text(Path::new("/etc/nsswitch.conf"))?)?;
             let users = parse_passwd(&success("/usr/bin/getent", &["passwd"])?)?;
             let groups = parse_group(&success("/usr/bin/getent", &["group"])?)?;
             if users.is_empty() || groups.is_empty() { return Err(denied()); }
@@ -592,9 +704,8 @@ mod linux {
             if self.partial_local_identity(account)? != (false, false) { return Err(denied()); }
             self.install_login_barriers(&name)?;
             success("/usr/sbin/groupadd", &["--gid", &uid, &name])?;
-            success("/usr/sbin/useradd", &["--uid", &uid, "--gid", &uid, "--no-user-group", "--no-create-home",
-                "--no-log-init", "--key", "SUB_UID_COUNT=0", "--key", "SUB_GID_COUNT=0", "--key", "CREATE_MAIL_SPOOL=no",
-                "--home-dir", "/nonexistent", "--shell", "/usr/sbin/nologin", "--password", "!*", "--expiredate", "1970-01-02", &name])?;
+            success("/usr/sbin/useradd", &useradd_arguments(&uid, &name))?;
+            mail_spool_absent(Path::new("/"), &name)?;
             success("/usr/bin/chage", &["-E", "1", &name])?;
             success("/usr/bin/loginctl", &["disable-linger", &name])?;
             self.verify_locked(account)
@@ -631,6 +742,21 @@ mod linux {
             self.verify_schedulers(&name)?;
             self.verify_login(account)
         }
+
+        /// R7c allocation: ask the worker to probe this account now (ahead of
+        /// background requests, even after an inconclusive result) and wait
+        /// for its result, at most `ssh_evidence::ALLOCATION_WAIT_MS`. Denied ⇒
+        /// `Ok`; anything else ⇒ the [`SshRefusal`] (a timeout is `Pending`).
+        /// Hosts without `/usr/sbin/sshd` skip it, as `verify_login` does.
+        fn await_login_denied(&mut self, account: &EmployeeAccount) -> io::Result<()> {
+            if !Path::new("/usr/sbin/sshd").exists() { return Ok(()); }
+            let key = self.ssh_account_key(account)?;
+            let outcome = self.ssh.wait(&key, Duration::from_millis(crate::ssh_evidence::ALLOCATION_WAIT_MS));
+            match crate::ssh_evidence::refusal(outcome.as_ref()) {
+                None => Ok(()),
+                Some(refusal) => Err(refusal.error()),
+            }
+        }
     }
 
     #[cfg(test)]
@@ -652,7 +778,8 @@ mod linux {
             assert_eq!(std::env::var("DUDUCLAW_ISO_DISPOSABLE").as_deref(), Ok("1"));
             let account = EmployeeAccount { employee: duduclaw_isolation::ids::EmployeeId([97; 16]),
                 uid: 99997, gid: 99997, state: AccountState::Tombstone };
-            let mut host = LinuxAccounts { evidence: &MissingInstallationEvidence };
+            // Admission strictness, without any probe result: a present sshd refuses.
+            let mut host = LinuxAccounts::admission(&crate::ssh_evidence::MissingSshEvidence);
             assert_eq!(host.partial_local_identity(&account).unwrap(), (false, false));
             let name = account_name(account.uid);
             success("/usr/sbin/groupadd", &["--gid", "99997", &name]).unwrap();
@@ -669,7 +796,9 @@ mod linux {
             assert!(unexpected_processes(account.uid, None).unwrap().is_empty());
             if Path::new("/usr/sbin/sshd").exists() {
                 // Host settings alone never stand in for live SSH negative proof.
-                assert!(recovery.is_err());
+                let error = recovery.unwrap_err();
+                assert_eq!(ssh_refusal(&error), Some(&SshRefusal::Pending), "{error}");
+                assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
             } else { recovery.unwrap(); }
         }
     }
@@ -715,6 +844,104 @@ mod tests {
         assert!(external_nss("passwd: files systemd\ngroup: files systemd\n").unwrap() == false);
         assert!(external_nss("passwd: files sss\ngroup: files sss\n").unwrap());
         assert!(external_nss("passwd: files\n").is_err());
+    }
+    /// R7c item 3: external NSS is refused by name (no IAM reservation
+    /// producer exists); the stock files/systemd configurations stay accepted.
+    #[test]
+    fn external_nss_is_refused_and_stock_configurations_are_accepted() {
+        for accepted in [
+            // Ubuntu 24.04 / Debian 12 (libnss-systemd), with the other databases and comments.
+            "# /etc/nsswitch.conf\npasswd:         files systemd\ngroup:          files systemd\nshadow:         files systemd\n\
+             gshadow:        files systemd\nhosts:          files dns\nnetgroup:       nis\n",
+            // Debian without libnss-systemd, RHEL/Fedora authselect "minimal" profile.
+            "passwd: files\ngroup: files\n",
+            "passwd:     files systemd\nshadow:     files\ngroup:      files systemd\nhosts:      files myhostname dns\n",
+            "passwd: files systemd # local only\ngroup: files systemd\n",
+        ] {
+            assert!(!external_nss(accepted).unwrap(), "{accepted:?}");
+            nss_supported(accepted).unwrap();
+        }
+        for refused in [
+            "passwd: files sss\ngroup: files sss\n",
+            "passwd: sss files systemd\ngroup: sss files systemd\n",
+            "passwd: files ldap\ngroup: files\n",
+            // Google Compute Engine OS Login.
+            "passwd: files cache_oslogin oslogin\ngroup: files cache_oslogin oslogin\n",
+            "passwd: compat\ngroup: compat\n",
+            "passwd: files [NOTFOUND=return] systemd\ngroup: files systemd\n",
+            "passwd: files systemd\ngroup: files [SUCCESS=merge] systemd\n",
+        ] {
+            assert!(external_nss(refused).unwrap(), "{refused:?}");
+            let error = nss_supported(refused).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(error.to_string(), EXTERNAL_NSS_REFUSED);
+        }
+        // Unreadable structure is still an error, never "not external".
+        for broken in ["passwd: files\n", "", "passwd: files\ngroup: files\ngroup: files\n"] {
+            assert!(external_nss(broken).is_err() && nss_supported(broken).is_err(), "{broken:?}");
+        }
+    }
+    /// R7c item 4: the useradd argument list no longer carries the key shadow
+    /// 4.13 refuses; the sub-id keys stay.
+    #[test]
+    fn useradd_arguments_have_no_mail_spool_key_and_keep_the_subid_keys() {
+        let args = useradd_arguments("70000", "duduclaw-emp-70000");
+        assert!(!args.iter().any(|arg| arg.contains("CREATE_MAIL_SPOOL") || arg.contains("MAIL")), "{args:?}");
+        let keys: Vec<&str> = args.windows(2).filter(|pair| pair[0] == "--key").map(|pair| pair[1]).collect();
+        assert_eq!(keys, ["SUB_UID_COUNT=0", "SUB_GID_COUNT=0"]);
+        assert_eq!(args, ["--uid", "70000", "--gid", "70000", "--no-user-group", "--no-create-home", "--no-log-init",
+            "--key", "SUB_UID_COUNT=0", "--key", "SUB_GID_COUNT=0", "--home-dir", "/nonexistent",
+            "--shell", "/usr/sbin/nologin", "--password", "!*", "--expiredate", "1970-01-02", "duduclaw-emp-70000"]);
+    }
+    /// R7c item 4: a mail spool in either directory refuses the account; the
+    /// check never follows or removes anything.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mail_spool_check_refuses_either_spool_path() {
+        let root = tempfile::tempdir().unwrap();
+        let name = "duduclaw-emp-70000";
+        // Neither directory exists, then both exist but hold nothing for the account.
+        mail_spool_absent(root.path(), name).unwrap();
+        for directory in ["var/mail", "var/spool/mail"] { std::fs::create_dir_all(root.path().join(directory)).unwrap(); }
+        std::fs::write(root.path().join("var/mail/duduclaw-emp-70001"), b"").unwrap();
+        mail_spool_absent(root.path(), name).unwrap();
+        for directory in ["var/mail", "var/spool/mail"] {
+            let spool = root.path().join(directory).join(name);
+            std::fs::write(&spool, b"").unwrap();
+            let error = mail_spool_absent(root.path(), name).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert!(error.to_string().contains(&spool.display().to_string()), "{error}");
+            std::fs::remove_file(&spool).unwrap();
+            assert!(mail_spool_absent(root.path(), name).is_ok());
+            // A dangling symlink is still a spool entry (lstat, never followed).
+            std::os::unix::fs::symlink(root.path().join("absent-target"), &spool).unwrap();
+            assert!(mail_spool_absent(root.path(), name).is_err(), "{}", spool.display());
+            std::fs::remove_file(&spool).unwrap();
+        }
+        // The check removed nothing.
+        assert!(root.path().join("var/mail/duduclaw-emp-70001").exists());
+    }
+    /// R7c: the probe refusals carried in `io::Error`: only `Pending` has its
+    /// own kind; `Reachable` is the one resolved refusal.
+    #[test]
+    fn ssh_refusals_are_typed_and_classified() {
+        let pending = SshRefusal::Pending.error();
+        assert_eq!(pending.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(ssh_refusal(&pending), Some(&SshRefusal::Pending));
+        assert!(probe_unresolved(&pending));
+        for refusal in [SshRefusal::Inconclusive("identity (exit 3)".into()), SshRefusal::NotApplicable] {
+            let error = refusal.clone().error();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(ssh_refusal(&error), Some(&refusal));
+            assert!(probe_unresolved(&error));
+        }
+        let reachable = SshRefusal::Reachable("login_not_denied (exit 10)".into()).error();
+        assert!(!probe_unresolved(&reachable));
+        assert!(reachable.to_string().contains("NOT denied"), "{reachable}");
+        for other in [denied(), io::Error::new(io::ErrorKind::WouldBlock, "busy"), io::ErrorKind::TimedOut.into()] {
+            assert_eq!(ssh_refusal(&other), None);
+            assert!(!probe_unresolved(&other));
+        }
     }
     #[test]
     fn recovery_rejects_aliases_and_accepts_group_only_residue() {

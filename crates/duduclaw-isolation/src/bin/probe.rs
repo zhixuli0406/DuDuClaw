@@ -24,37 +24,14 @@
 #![allow(unsafe_code)]
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
-/// Exit codes (one per stage). 0 = denied (pass). Never 1 (generic), 101
-/// (Rust panic), 125 (unsupported platform), 200–243 (systemd's own exec
-/// failures) or 255 (ssh's own failure code).
-pub const EXIT_USAGE: i32 = 2;
-/// euid not 0, name outside `^duduclaw-emp-[a-z0-9-]{1,48}$`, or no single
-/// /etc/passwd entry with a uid in the employee range.
-pub const EXIT_IDENTITY: i32 = 3;
-/// A tool (or this binary) is not a root-owned, non group/other-writable file.
-pub const EXIT_TOOLS: i32 = 4;
-/// `/usr/sbin/sshd` does not exist: SSH checks are not applicable on this host.
-pub const EXIT_NO_SSHD: i32 = 5;
-pub const EXIT_WORKSPACE: i32 = 6;
-/// `sshd -T -C …` failed or lacks DenyUsers duduclaw-emp-* / DisableForwarding
-/// yes / PermitTTY no, or names no usable port.
-pub const EXIT_EFFECTIVE_CONFIG: i32 = 7;
-pub const EXIT_KEYGEN: i32 = 8;
-/// Login attempt neither denied nor accepted (refused connection, timeout, …).
-pub const EXIT_LOGIN_INCONCLUSIVE: i32 = 9;
-/// Login attempt exited 0: the account is reachable over SSH.
-pub const EXIT_LOGIN_NOT_DENIED: i32 = 10;
-/// Login denied by the client, but no matching sshd DenyUsers journal record.
-pub const EXIT_LOGIN_JOURNAL: i32 = 11;
-pub const EXIT_FORWARD_INCONCLUSIVE: i32 = 12;
-/// Forwarding session exited 0 or stayed connected until the kill timer.
-pub const EXIT_FORWARD_NOT_DENIED: i32 = 13;
-pub const EXIT_FORWARD_JOURNAL: i32 = 14;
-/// The 25 s overall deadline expired.
-pub const EXIT_DEADLINE: i32 = 15;
-pub const EXIT_OUTPUT: i32 = 16;
-/// `--relay` mode only: socket, bind, connect or copy failed.
-pub const EXIT_RELAY: i32 = 17;
+/// Exit codes (one per stage): the shared table in
+/// `duduclaw_isolation::probe_exit` (spawnd maps the same constants). 0 =
+/// denied (pass). Never 1 (generic), 101 (Rust panic), 125 (unsupported
+/// platform), 200–243 (systemd's own exec failures) or 255 (ssh's own failure code).
+#[allow(unused_imports)]
+pub use duduclaw_isolation::probe_exit::{EXIT_USAGE, EXIT_IDENTITY, EXIT_TOOLS, EXIT_NO_SSHD, EXIT_WORKSPACE,
+    EXIT_EFFECTIVE_CONFIG, EXIT_KEYGEN, EXIT_LOGIN_INCONCLUSIVE, EXIT_LOGIN_NOT_DENIED, EXIT_LOGIN_JOURNAL,
+    EXIT_FORWARD_INCONCLUSIVE, EXIT_FORWARD_NOT_DENIED, EXIT_FORWARD_JOURNAL, EXIT_DEADLINE, EXIT_OUTPUT, EXIT_RELAY};
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
@@ -604,7 +581,11 @@ mod tests {
             assert!(!(200..=243).contains(code) && *code != 255 && *code != 101 && *code != 125, "{code}");
         }
         assert!(names.iter().all(|name| name.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')));
-        // The codes spawnd will distinguish in part 2.
+        // spawnd logs the shared table's names: they are the probe's own.
+        for stage in Stage::ALL {
+            assert_eq!(duduclaw_isolation::probe_exit::stage_name(stage.code()), Some(stage.name()), "{stage:?}");
+        }
+        // The codes spawnd distinguishes (crates/duduclaw-spawnd/src/ssh_evidence.rs).
         assert_eq!(Stage::NoSshd.code(), EXIT_NO_SSHD);
         assert_eq!(Stage::LoginNotDenied.code(), EXIT_LOGIN_NOT_DENIED);
         assert_eq!(Stage::ForwardNotDenied.code(), EXIT_FORWARD_NOT_DENIED);

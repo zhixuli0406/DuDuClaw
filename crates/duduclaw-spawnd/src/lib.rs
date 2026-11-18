@@ -67,6 +67,10 @@ pub mod dns_evidence;
 #[cfg(any(target_os = "linux", test))]
 pub mod egress_layer;
 
+/// R7c: per-account SSH denial evidence from the probe unit run through PID 1.
+#[cfg(any(target_os = "linux", test))]
+pub mod ssh_evidence;
+
 /// R7b: employee-range owners of files in spawnd's own state directories,
 /// scanned once per UID allocation.
 #[cfg(target_os = "linux")]

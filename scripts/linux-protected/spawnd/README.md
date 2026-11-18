@@ -189,8 +189,11 @@ the first `Port` of its effective configuration, and sshd logging to the
 journal. Hosts without sshd skip the probe (exit 5). The protected installer
 installs the template at `/etc/systemd/system/` (root:root 0644, exactly these
 bytes) and never enables or starts it; rollback stops any running instance and
-removes the file. No account is created for it. Spawnd does not start it yet
-(R7c part 2).
+removes the file. No account is created for it. Spawnd starts one instance per
+employee account through PID 1 (`Systemd::run_fixed_unit`, R7c part 2) and maps
+the exit code with `duduclaw_isolation::probe_exit`; see the spawnd README,
+"R7c: SSH denial from spawnd's own probe through PID 1". sshd with `UsePAM no`
+is unsupported (sshd reports the expired account before `DenyUsers`).
 
 The native Linux service lifecycle and D-Bus fd handoff require root VM testing
 on systemd 249, 252 and 255. No installation or activation has been performed by

@@ -565,7 +565,8 @@ generation's `Trampoline` / `TrampolineSelftest` artifacts (sha256, size and
 mode, by descriptor; the check moved here from the receipt reader).
 `landlock_self_test` and `namespace_self_test` are the cached pass of the fixed
 unit `duduclaw-isolation-selftest.service`, which spawnd starts through PID 1
-(`Systemd::run_fixed_unit`: only that name; PID 1 must load it from
+(`Systemd::run_fixed_unit`: only the members of `systemd::FixedUnit`, this unit
+or an R7c probe instance; PID 1 must load it from
 `/etc/systemd/system/duduclaw-isolation-selftest.service` with no drop-in, no
 pending daemon-reload, not transient and not already running; PID 1 must
 report the run units' `NoNewPrivileges`, `TRAMPOLINE_CAPABILITIES`, no ambient
@@ -591,25 +592,95 @@ installer creates the `duduclaw-selftest` system account and installs the unit
 file (`protected_linux_layout.rs`) before it starts spawnd; without them this
 readiness fails closed.
 
-### R7c: SSH denial probe (part 1: program and unit only)
+### R7c: SSH denial from spawnd's own probe through PID 1
 
-`/usr/lib/duduclaw/duduclaw-isolation-probe` (signed target `IsolationProbe`,
-root:root 0755, built from `crates/duduclaw-isolation/src/bin/probe.rs`) and
-the template unit `duduclaw-isolation-probe@.service` (embedded here as
+There is no installer receipt any more: `installed.rs` reads nothing under
+`/run/duduclaw-isolation-evidence`. `/usr/lib/duduclaw/duduclaw-isolation-probe`
+(signed target `IsolationProbe`, root:root 0755, built from
+`crates/duduclaw-isolation/src/bin/probe.rs`) and the template unit
+`duduclaw-isolation-probe@.service` (embedded here as
 `systemd::ISOLATION_PROBE_UNIT_TEXT`, executable `systemd::PROBE_EXECUTABLE`,
 names `duduclaw_isolation::ids::ISOLATION_PROBE_UNIT_PREFIX` /
 `ISOLATION_PROBE_UNIT_TEMPLATE`) prove per account against the live sshd that
 a public-key login and a `-N -R` forwarding session are refused (client
 `Permission denied (publickey).` plus sshd's root `DenyUsers` journal record
-for the probe's own source port). Exit 0 with
-`{"version":1,"account":"…","port":N,"result":"denied"}` is the only pass;
-exit 5 means no `/usr/sbin/sshd` (SSH checks not applicable, as in
-`verify_login` today); the full exit-code table is in
-`scripts/linux-protected/spawnd/README.md`. Spawnd does not start the unit
-yet: `verify_login` still asks `InstallationEvidence` (the receipt reader) until
-part 2 replaces it with a cached run of this unit. Host prerequisites where
-sshd exists: ssh client, ssh-keygen, journalctl, sshd listening on loopback and
-logging to the journal.
+for the probe's own source port). The exit-code table is
+`duduclaw_isolation::probe_exit` (shared by the probe and spawnd; also in
+`scripts/linux-protected/spawnd/README.md`).
+
+Fixed-unit set. `Systemd::run_fixed_unit` accepts exactly the members of
+`systemd::FixedUnit`: the self-test unit (unchanged) and
+`duduclaw-isolation-probe@<account>.service` for an account name passing
+`employee_account_name_valid`. Each member fixes its fragment file (the
+instance's is the template `/etc/systemd/system/duduclaw-isolation-probe@.service`;
+`Id` is the instance), the shipped bytes, the exact `ExecStart` argv
+(`[PROBE_EXECUTABLE, <account>]`) and the readback (`systemd::probe_unit_readback`):
+`Type=oneshot`, `Slice=duduclaw-tcb.slice`, `NoNewPrivileges`, empty
+`CapabilityBoundingSet` and `AmbientCapabilities`, `RUN_UNIT_DEFAULTED`,
+`IPAddressDeny` = {`::/0`, `0.0.0.0/0`}, `IPAddressAllow` = {`127.0.0.0/8`,
+`::1/128`}, `RestrictAddressFamilies` allow-list {AF_UNIX, AF_INET, AF_INET6},
+`PrivateTmp`, `ProtectSystem=strict` (lists compared as exact multisets, every
+mismatch named with PID 1's actual value). A drop-in, transient unit, pending
+daemon-reload, other fragment or other argv refuses before any start. The
+`Unit.Ref` pin and the outcome binding are the self-test's; for the probe the
+exit status is trusted only when bound to THIS invocation
+(`FixedUnitOutcome::exit_status_of_this_start`: new InvocationID, exited,
+`ExecStart` record pid/status of this start, `inactive`/`success` for 0,
+`failed`/`exit-code` otherwise) and mapped by `ssh_evidence::unit_outcome`:
+0 ⇒ Denied, 5 (no sshd) ⇒ NotApplicable, 10/13 (login/forwarding NOT denied)
+⇒ Reachable, anything else (other codes, timeout, refused start, PID 1 error)
+⇒ Inconclusive with the stage for the log. A failed instance is reset.
+
+Evidence (`ssh_evidence`). Results live in memory only, keyed by boot id,
+committed signed generation, account name and uid, SHA-256 of
+`sshd -T -C user=<account>,host=localhost,addr=127.0.0.1` (which `verify_login`
+reads anyway), the installed probe binary verified against the generation's
+`IsolationProbe` artifact (digest, size, mode) and the installed template
+unit's digest. Any change, and every spawnd restart, re-probes. One worker
+thread (`duduclaw-ssh-probe`, its own D-Bus connection, started by the first
+lookup during start-up recovery) re-measures the host part every 2 s and runs
+queued probes one at a time, each bounded by the unit deadline (40 s); the
+250 ms refresh never starts a unit. `verify_login` keeps every earlier check
+(linger, `user@` unit, sessions, `sshd -t`, `ssh_effective_denied`) and then
+looks up the current key: Denied passes; NotApplicable, Reachable and
+Inconclusive refuse; no result asks the worker and refuses as "probe pending"
+(`io::ErrorKind::WouldBlock`, `accounts::SshRefusal::Pending`; the gateway sees
+`NotReady`). An inconclusive result is retried after 60 s. Hosts without
+`/usr/sbin/sshd` skip all of this as before.
+
+Per-employee, not host-wide. `Registry::verify` in the readiness refresh and
+start-up recovery walks every account, and before R7c one account's failing
+SSH check failed it, which turned off `registry_verified`, `accounts_locked`,
+`ssh_live_negative_checks`, `cron_at_acl_and_jobs_verified` and
+`external_iam_reservation_verified` for the whole host (and a failed start-up
+reconcile is never re-evaluated). Those walks now use
+`LinuxAccounts::background`: host-level checks still refuse, but an account's
+probe state only requests a probe. The probe result is enforced per employee
+at admission (`Core::ready`, `LinuxAccounts::admission`), so after a restart
+each employee becomes runnable as soon as its own probe reports Denied.
+
+Allocation (`registry::Allocations`). A new account waits for its own probe
+(`AccountHost::await_login_denied`, at most 85 s: one probe already running
+plus its own). Denied ⇒ Ready. Reachable, and every other failure as before ⇒
+Tombstone. Unresolved (pending at the deadline, inconclusive, PID 1 error) ⇒
+the row stays `Reserved`, nothing is quarantined, and the next allocation of the
+same employee in this process resumes it (`recover_locked` re-lock and
+no-process readback, then the probe again). That reservation is not a host-wide
+verification failure. It is remembered in memory only: after a restart
+`reconcile` tombstones every `Reserved` row as before.
+
+Unsupported hosts (refused, host prerequisites): passwd/group NSS modules other
+than `files`/`systemd` (LDAP/SSSD, Google Compute Engine OS Login, `compat`,
+bracketed action clauses; `accounts::nss_supported`, no IAM reservation
+producer exists); sshd present without `/usr/bin/ssh`, `/usr/bin/ssh-keygen` or
+`/usr/bin/journalctl`, or not listening on loopback, or not logging to the
+journal; sshd with `UsePAM no` (sshd then reports the expired account before
+`DenyUsers`, so the probe cannot find the DenyUsers record and stays
+inconclusive).
+
+Account creation no longer passes `--key CREATE_MAIL_SPOOL=no` (shadow 4.13
+refuses it); a mail spool at `/var/mail/<name>` or `/var/spool/mail/<name>`
+after useradd refuses the account (rolled back, never deleted by spawnd).
 
 ### R7b: DNS route evidence
 
@@ -785,22 +856,12 @@ artifact filenames visible in the generation. Publication emits a root-owned
 ownership/mode, boot ID, freshness and root-policy validity. No root private
 state or executable path is disclosed through the projection.
 
-`/run/duduclaw-isolation-evidence/installation.json` is a root-harness receipt,
-not an operator configuration. It binds the committed generation and current
-boot with at most 60 seconds validity. It records the permanent external-IAM
-reservation digest and per-account SSH positive control, denied public-key
-login and forwarding observations. Since R7b it carries no file-owner
-inventory (`unowned_uids`, `owner_inventory_digest` are refused as unknown
-fields; see "R7b: file-owner inventory at UID allocation"). Since R7a it carries no trampoline
-facts (a receipt with a `trampoline` member is refused as an unknown field); the
-trampoline digest, self-test and ABI evidence come from spawnd's own self-test
-(see "R7a: trampoline facts from spawnd's own self-test" above). Since R7b it
-carries no DNS facts either (a receipt with a `dns` member is refused as an
-unknown field); `dns_route_verified` comes from spawnd's own probe through
-egress (see "R7b: DNS route evidence" above). Missing, stale, changed
-or malformed receipts deny admission. The trusted root harness must renew real
-observations; this change does not implement that harness or claim an installed
-host is ready. Root caches only a fully verified immutable F generation and its
+spawnd reads no installer receipt (R7c removed the last reader of
+`/run/duduclaw-isolation-evidence/installation.json`): the trampoline facts come
+from spawnd's own self-test (R7a), the DNS route from its probe through egress
+(R7b), file owners from its own scan at allocation (R7b), SSH denial from the
+probe unit through PID 1 (R7c, above), and hosts with external NSS modules
+are refused (R7c). Root caches only a fully verified immutable F generation and its
 manifest. Every consumption still makes an authenticated nonce probe and checks
 generation, product, exact binary version and all eight protocols; failed probes
 clear the cache, and generation changes trigger full artifact verification again.
@@ -863,9 +924,10 @@ or fresh login attacks.
 The VM must have the compiled-version F service running with a committed signed
 generation; B1 must continuously publish current root/gateway reports, with at
 least one confirmed MCP-enabled Claude entitlement. The signed runtime policy
-must contain real exact-runtime MCP inheritance acceptance. The root measurement
-harness must continuously renew the installation/SSH receipts; the second
-test also starts the installed `duduclaw-isolation-selftest.service` through
+must contain real exact-runtime MCP inheritance acceptance. The second test
+starts the installed probe instance for every entitled account through PID 1
+(R7c: the signed probe binary, the template unit, files/systemd NSS only) and
+the installed `duduclaw-isolation-selftest.service` through
 PID 1 (R7a), which needs the unit file and the `duduclaw-selftest` account, and
 (R7b) requires a policy v4 `dns_probe_name` and one DNS route in
 `/etc/duduclaw/egress.json` (the probe itself needs spawnd's own control

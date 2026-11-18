@@ -68,7 +68,8 @@ pub const ISOLATION_GATED_UNITS: [&str; 4] = [ISOLATION_READY_UNIT, EGRESS_SOCKE
 /// owns no data, is never an employee and never a service identity.
 pub const SELFTEST_USER: &str = "duduclaw-selftest";
 /// R7a: the fixed, pre-installed oneshot unit that runs the isolation self-test.
-/// The only unit spawnd starts by name (`Systemd::run_fixed_unit`); its name is
+/// One of the fixed units spawnd starts by name (`Systemd::run_fixed_unit`,
+/// with the R7c probe instances below); its name is
 /// deliberately not of the run-unit shape (`duduclaw-run-<hex>.service`), so no
 /// run inventory, census or reconciliation ever counts it as an employee run.
 pub const ISOLATION_SELFTEST_UNIT: &str = "duduclaw-isolation-selftest.service";

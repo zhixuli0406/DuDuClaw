@@ -58,7 +58,7 @@ v1.83.0 以降、新しいホストへの保護インストールは、独立し
 
 Kernel 7.0 は**現在受け入れられません**。Trampoline は 7 より大きい Landlock ABI を拒否します。ディストリビューションや GCP イメージの名前ではなく、実際に起動した kernel を確認してください。検証には受け入れ可能な kernel 構成を使い、Landlock の無効化や ABI 検査の緩和を行わないでください。上記は完全なインストール、実際のベンダー CLI、完全な移行、更新復旧の検証ではありません。
 
-`getent`、`id`、`useradd`、util-linux、systemd ツール、curl などの信頼できるシステムツールが必要です。社員の loop ストレージには ext4 または XFS、対応する非 thin provisioning の下位デバイス構成、社員のクォータと TCB の予約容量が必要です。不明な構成や容量不足は準備完了を拒否します。外部 IAM／NSS は社員 UID 範囲を永続的に予約する必要があります。
+`getent`、`id`、`useradd`、util-linux、systemd ツール、curl などの信頼できるシステムツールが必要です。社員の loop ストレージには ext4 または XFS、対応する非 thin provisioning の下位デバイス構成、社員のクォータと TCB の予約容量が必要です。不明な構成や容量不足は準備完了を拒否します。`/etc/nsswitch.conf` の passwd 行と group 行に書けるのは `files` と `systemd` だけです（Ubuntu・Debian の既定値、および authselect の `minimal` プロファイルを使う RHEL／Fedora）。それ以外のモジュール（LDAP／SSSD の `sss`、Google Compute Engine OS Login の `oslogin`／`cache_oslogin`、`compat`、`[SUCCESS=merge]` のような角括弧のアクション句）を含むホストはサポート対象外で、準備完了を拒否します。こうしたモジュールは社員 UID 範囲にアカウントを持ち込む可能性があり、このリリースでは外部ディレクトリ側でその範囲を予約できないためです。
 
 ## 単一実行ファイルの保護サービス（現行版）
 
@@ -108,7 +108,9 @@ sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux [--version X.Y
 
 解析器は[インストール参考](../../../crates/duduclaw-parse-worker/README.md)に記載された既知の空マウントポイントを残す場合があります。予期しない内容は調査し、解析用 root を再帰的に削除しないでください。Spawnd が社員の SSH、cron、at、user manager を封鎖し、ホストの実効状態を検証します。検査に通すために制御を緩和しないでください。
 
-`/usr/sbin/sshd` がインストールされているホストでは、SSH 拒否検査が各社員アカウントで稼働中の sshd に対して実際の公開鍵ログインとポート転送を 1 回ずつ試み、どちらも `DenyUsers duduclaw-emp-*` ルールで拒否されることを確認します。このようなホストには `/usr/bin/ssh`、`/usr/bin/ssh-keygen`、`/usr/bin/journalctl` も必要で、sshd は 127.0.0.1（設定の最初の `Port`）で待ち受け、ログを systemd journal に出力している必要があります。sshd のないホストではこの検査を省略します。
+`/usr/sbin/sshd` がインストールされているホストでは、各社員アカウントの SSH が拒否されることを spawnd 自身が証明します。インストーラーの受領記録（レシート）は使いません。spawnd はそのアカウント用の SSH 拒否検査ユニットを systemd 経由で起動し、検査プログラムがそのアカウントで稼働中の sshd に対して実際の公開鍵ログインとポート転送を 1 回ずつ試みます。どちらも `DenyUsers duduclaw-emp-*` ルールで拒否され、sshd 自身の journal 記録で確認できる必要があります。この証明はメモリ上にのみ保持され、そのアカウントに実際に適用される sshd 設定、アカウント、インストール済みの検査プログラムやそのユニット、署名済み世代、起動のいずれかが変わったとき、および spawnd の再起動のたびに証明し直されます。ある社員の証明が届くまでは、その社員だけが実行できない状態（not ready）になり、他の社員には影響しません。新しい社員は自身の証明が届いてから作成されます（最大で約 1 分半）。証明を完了できなかった場合、spawnd が動いている間に作成を再試行すると同じアカウントで再開します（spawnd を再起動すると未完了のアカウントは廃止され、作成を提案し直す必要があります）。証明でそのアカウントがログインできると判明した場合、そのアカウントは恒久的に廃止されます。
+
+sshd のあるホストには `/usr/bin/ssh`、`/usr/bin/ssh-keygen`、`/usr/bin/journalctl` も必要で、sshd は 127.0.0.1（設定の最初の `Port`）で待ち受け、ログを systemd journal に出力している必要があります。`UsePAM no` の sshd はサポート対象外です。その場合 sshd は `DenyUsers` を適用する前に期限切れの社員アカウントとして拒否するため、検査は拒否を確認できず、その社員は準備完了になりません。sshd のないホストではこの検査を省略します。
 
 インストーラーは固定パスの完全なコンポーネント群を検証してから、アカウント、ディレクトリ、unit を準備します。Linux 配布物には固定更新ランチャーも含まれ、オフラインツールは署名済み情報とファイルから bootstrap inbox を作成できます。独立に認証された `duduclaw-updated --bootstrap-stage` は、コンパイル時の root 指紋、root 閾値署名、target 署名、全ファイルのハッシュを検証し、**未有効化の世代**を配置します。`current` の選択、trust／state／slots の作成、旧版移行の二重署名検証、サービス有効化は行いません。完全な新規導入の手順はまだ提供していません。
 
@@ -190,7 +192,7 @@ sudo journalctl -u duduclaw-gateway.service -u duduclaw-spawnd.service -u duducl
 | --- | --- |
 | `UnsupportedKernel` | 起動 kernel と Landlock ABI を確認。ABI 8／kernel 7.0 は現在拒否するため、検査を維持する。 |
 | 準備情報が欠落、古い、非互換 | 完全な世代、プロトコル、アカウント登録、全サービスを確認。`active` だけでは不十分。 |
-| UID／アカウント／SSH／IAM 失敗 | 予約範囲の衝突、別名、補助グループ、ログイン／cron／at、linger を解決。外部 IAM の予約には管理者の証跡が必要。 |
+| UID／アカウント／SSH／IAM 失敗 | 予約範囲の衝突、別名、補助グループ、ログイン／cron／at、linger を解決。passwd や group に `files`／`systemd` 以外の NSS モジュール（SSSD や GCE OS Login など）を使う構成はサポート対象外。sshd のあるホストで特定の社員が準備完了にならない場合：journal の `SSH denial probe duduclaw-emp-<uid>: …` と `journalctl -u 'duduclaw-isolation-probe@*'` を確認。`DenyUsers` のドロップイン設定は削除しないこと。 |
 | ストレージ／クォータ失敗 | 下位デバイス構成、強制クォータ、空き容量、ホスト予約容量を確認。ディスク使用量ポーリングで代替しない。 |
 | DNS／egress 失敗 | root が選んだ resolved Varlink／DNS broker 経路を確認。egress に私設 resolver IP の例外を追加しない。DNS の準備状態（`host_dns_route_unverified`）はインストーラーのレシートではなく spawnd 自身のライブ検査です。spawnd は約 1 分ごとに、署名済みポリシーの `dns_probe_name` をその経路で解決するよう egress に依頼し、公開アドレスが 1 つ以上得られた場合のみ合格とします。署名済みポリシーが v4 より古い場合、egress が動いていない場合、このホストからその名前を解決できない場合は未検証のままです（外向き DNS と egress ジャーナルの `dns_probe` 行を確認）。 |
 | 解析 root 失敗 | 両 root の所有者、モード、予期しない内容を調査。ホスト `/etc` やデータをコピーしない。 |

@@ -5776,6 +5776,18 @@
       "rationale": "Two std::thread::Builder::spawn calls inside spawnd: the bounded lifecycle command queue and (H4) the spawnd-work-broker snapshot-copy worker fed by a bounded sync_channel, which answers on the same completion channel. Both are Rust threads of the reviewed lifecycle worker; neither launches executable content. Actual host process creation is inventoried at its native launch sites."
     },
     {
+      "symbol": "crates/duduclaw-spawnd/src/ssh_evidence.rs::linux::start_worker",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "task_or_thread"
+      ],
+      "identity": "spawn_daemon",
+      "migration": "not_process",
+      "rationale": "R7c: one std::thread::Builder::spawn of the duduclaw-ssh-probe worker thread inside spawnd, started once on the first SSH evidence lookup. It measures the probe inputs (committed generation, signed probe binary, template unit) and starts the fixed template unit duduclaw-isolation-probe@<valid employee account>.service through PID 1 over its own D-Bus connection, one at a time, bounded by the unit deadline. It launches no executable content itself; the probe process is created by PID 1 (inventoried at crates/duduclaw-isolation/src/bin/probe.rs)."
+    },
+    {
       "symbol": "crates/duduclaw-sysd/src/dispatch.rs::bless_boot",
       "apis": {
         "command_constructor": 1
