@@ -30,9 +30,10 @@ pub struct OpenAiCompatRuntime;
 impl OpenAiCompatRuntime {
     #[cfg(target_os = "linux")]
     async fn execute_protected(&self, prompt: &str, context: &RuntimeContext) -> Result<RuntimeResponse, String> {
-        let authorization = crate::isolation_mcp::runtime::authorize_api(context)?;
         let refusal = || duduclaw_agent::mcp_spawn_gate::spawn_gate_error(
             "所選隔離執行設定尚未支援這次工作，請由管理員確認服務與資料保護設定。");
+        // R8r-1: these refusals need no authority and run before it is taken
+        // or issued, so they never consume a one-time background record.
         validate_model(&context.model)?;
         crate::product_policy::require_runtime(&context.home_dir, "openai_compat")?;
         crate::product_policy::require_model(crate::product_policy::load(&context.home_dir)?, &context.model)?;
@@ -43,6 +44,8 @@ impl OpenAiCompatRuntime {
                 &crate::redaction_proxy::current_session_id()).map_err(|_| refusal())?.is_some() {
             return Err(refusal());
         }
+        // The principal context stays registered until the worker run returns.
+        let (authorization, _principal_context) = crate::isolation_mcp::runtime::authorize_api(context).await?;
         let mut messages = vec![duduclaw_api_worker::Message { role: "system".into(), content: context.system_prompt.clone() }];
         messages.extend(super::cap_conversation_history(&context.conversation_history).iter().map(|turn| duduclaw_api_worker::Message {
             role: turn.role.clone(), content: turn.content.clone() }));
