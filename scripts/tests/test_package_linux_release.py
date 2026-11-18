@@ -31,7 +31,9 @@ BOOTSTRAP = PACKAGE.BOOTSTRAP_BINARY
 # Every variable that could carry a pin or a test-root setting into a test run.
 BOOTSTRAP_ENVIRONMENT = (PACKAGE.BOOTSTRAP_PIN_VARIABLE, PACKAGE.BOOTSTRAP_TEST_KEY_VARIABLE, "RUSTFLAGS",
                          "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS",
-                         "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS", PACKAGE.TEST_LICENSE_ISSUER_VARIABLE)
+                         "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS", PACKAGE.TEST_LICENSE_ISSUER_VARIABLE,
+                         # rustc wrappers/overrides, refused by the shared environment rules.
+                         *PACKAGE.REFUSER.RUSTC_VARIABLES)
 # A duduclaw built with `--cfg duduclaw_test_root` and a TEST licence issuer.
 TEST_LICENSE_GATEWAY = b"\x7fELF\x00GLIBC_2.17\x00duduclaw" + PACKAGE.TEST_LICENSE_MARKER + b"\x00rest"
 

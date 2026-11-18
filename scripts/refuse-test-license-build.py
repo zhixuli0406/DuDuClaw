@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+"""Refuse a TEST-licence gateway build on every path that signs, packages or publishes one.
+
+A `--cfg duduclaw_test_root` duduclaw (or duduclaw-pro) also trusts a compiled TEST
+licence issuer and embeds the constant TEST_LICENSE_BUILD_MARKER of
+crates/duduclaw-gateway/src/license_runtime.rs. This script reads the marker from
+that file at run time (exactly one definition, or it refuses to run), so the Rust
+constant stays its only copy. The check is static: nothing is executed or extracted.
+
+  python3 -I -B scripts/refuse-test-license-build.py [--marker-file F] PATH...
+      A PATH ending in .tar.gz, .tgz, .tar or .zip is an archive; anything else is a
+      raw binary and is scanned whole. In an archive every regular member whose base
+      name is duduclaw, duduclaw.exe, duduclaw-pro or duduclaw-pro.exe, or starts with
+      `duduclaw-` and has no extension other than .exe, is read through the archive
+      API (never extracted; absolute or `..` names are just names). A gateway-named
+      link or special member, an unreadable member or a damaged archive is an error.
+      --marker-file F takes the marker from F (its bytes, one optional trailing
+      newline) where the source tree is not present.
+
+  python3 -I -B scripts/refuse-test-license-build.py --check-environment
+          [--target TRIPLE] [--cargo-dir DIR]...
+      Refuses test-root build settings (shared with scripts/package-linux-release.py):
+      DUDUCLAW_BOOTSTRAP_TEST_MINISIGN_KEY or DUDUCLAW_TEST_LICENSE_ISSUER_PUBKEY set;
+      `--cfg duduclaw_test_root` in RUSTFLAGS, CARGO_ENCODED_RUSTFLAGS,
+      CARGO_BUILD_RUSTFLAGS or CARGO_TARGET_<TRIPLE>_RUSTFLAGS (only that target's with
+      --target, every target's without); RUSTC_WRAPPER, RUSTC_WORKSPACE_WRAPPER, RUSTC
+      or their CARGO_BUILD_* forms set to anything (release builds use the toolchain's
+      own rustc; no release job sets a wrapper); a .cargo/config.toml or .cargo/config
+      containing `duduclaw_test_root` in a --cargo-dir (default: the repository root
+      and the current directory), any parent of it, or $CARGO_HOME (default ~/.cargo).
+
+Exit status: 0 no marker / clean environment; 1 refused (one line per finding on
+stderr, naming the file and member or the setting); 2 usage or I/O error. Callers
+must treat every non-zero status as failure.
+"""
+import argparse
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+import tarfile
+import zipfile
+import zlib
+
+PROG = "refuse-test-license-build"
+ROOT = Path(__file__).resolve().parents[1]
+LICENSE_RUNTIME = ROOT / "crates/duduclaw-gateway/src/license_runtime.rs"
+TEST_ROOT_CFG = "duduclaw_test_root"
+TEST_LICENSE_ISSUER_VARIABLE = "DUDUCLAW_TEST_LICENSE_ISSUER_PUBKEY"
+BOOTSTRAP_TEST_KEY_VARIABLE = "DUDUCLAW_BOOTSTRAP_TEST_MINISIGN_KEY"
+# Flag variables Cargo hands to rustc, with their separators (Cargo reference,
+# "Environment variables"); CARGO_TARGET_<TRIPLE>_RUSTFLAGS is checked as well.
+RUSTFLAGS_VARIABLES = (("CARGO_ENCODED_RUSTFLAGS", "\x1f"), ("RUSTFLAGS", None), ("CARGO_BUILD_RUSTFLAGS", None))
+TARGET_RUSTFLAGS = re.compile(r"CARGO_TARGET_[A-Za-z0-9_]+_RUSTFLAGS")
+# Anything that replaces or wraps rustc could add the cfg out of sight.
+RUSTC_VARIABLES = ("RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "RUSTC",
+                   "CARGO_BUILD_RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_RUSTC")
+CARGO_CONFIG_NAMES = ("config.toml", "config")
+# The one definition in license_runtime.rs (also parsed by container/Dockerfile.server).
+MARKER_DEFINITION = re.compile(rb'^static TEST_LICENSE_BUILD_MARKER: &\[u8\] = b"([A-Za-z0-9_-]+)";\r?$', re.MULTILINE)
+MARKER_DECLARATION = re.compile(rb"\bTEST_LICENSE_BUILD_MARKER\s*:")
+MARKER_TEXT = re.compile(rb"[A-Za-z0-9_-]{16,}")
+MIN_MARKER_BYTES = 16
+MAX_MARKER_FILE_BYTES = 256
+GATEWAY_NAMES = ("duduclaw", "duduclaw.exe", "duduclaw-pro", "duduclaw-pro.exe")
+CHUNK_BYTES = 1024 * 1024
+
+
+class RefuserError(ValueError):
+    """The check could not be performed (usage or I/O problem; exit 2)."""
+
+
+# ---------------------------------------------------------------- marker
+
+def parse_marker(source):
+    """The marker bytes of the single TEST_LICENSE_BUILD_MARKER definition in `source`."""
+    if len(MARKER_DECLARATION.findall(source)) != 1:
+        raise RefuserError("license_runtime.rs must declare TEST_LICENSE_BUILD_MARKER exactly once")
+    definitions = MARKER_DEFINITION.findall(source)
+    if len(definitions) != 1 or len(definitions[0]) < MIN_MARKER_BYTES:
+        raise RefuserError("cannot read the one TEST_LICENSE_BUILD_MARKER definition in license_runtime.rs "
+                           '(expected `static TEST_LICENSE_BUILD_MARKER: &[u8] = b"<marker>";`)')
+    return definitions[0]
+
+
+def load_marker(path=LICENSE_RUNTIME):
+    try:
+        source = Path(path).read_bytes()
+    except OSError as error:
+        raise RefuserError(f"cannot read {path}: {error.strerror or error}") from error
+    return parse_marker(source)
+
+
+def read_marker_file(path):
+    try:
+        with open(path, "rb") as source:
+            raw = source.read(MAX_MARKER_FILE_BYTES + 1)
+    except OSError as error:
+        raise RefuserError(f"cannot read --marker-file {path}: {error.strerror or error}") from error
+    if raw.endswith(b"\n"):
+        raw = raw[:-1]
+    if MARKER_TEXT.fullmatch(raw) is None:
+        raise RefuserError("--marker-file must hold the marker alone: at least 16 of [A-Za-z0-9_-], "
+                           "one optional trailing newline")
+    return raw
+
+
+def contains_marker(read, marker):
+    """True when the bytes `read(size)` yields contain `marker` (also across chunk borders)."""
+    keep = len(marker) - 1
+    tail = b""
+    while True:
+        chunk = read(CHUNK_BYTES)
+        if not chunk:
+            return False
+        window = tail + chunk
+        if marker in window:
+            return True
+        tail = window[-keep:]
+
+
+# ---------------------------------------------------------------- binaries and archives
+
+def is_gateway_name(name):
+    base = name.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].lower()
+    if base in GATEWAY_NAMES:
+        return True
+    if not base.startswith("duduclaw-"):
+        return False
+    stem = base[:-4] if base.endswith(".exe") else base
+    return "." not in stem
+
+
+def archive_mode(path):
+    name = Path(path).name.lower()
+    if name.endswith((".tar.gz", ".tgz")):
+        return "r|gz"
+    if name.endswith(".tar"):
+        return "r|"
+    if name.endswith(".zip"):
+        return "zip"
+    return None
+
+
+def _scan_raw(path, marker):
+    with open(path, "rb") as source:
+        if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+            raise RefuserError(f"{path} is not a regular file")
+        return ([""] if contains_marker(source.read, marker) else []), 1
+
+
+def _scan_tar(path, mode, marker):
+    found, scanned = [], 0
+    with tarfile.open(str(path), mode) as bundle:
+        for member in bundle:
+            if member.isdir() or not is_gateway_name(member.name):
+                continue
+            if not member.isreg():
+                raise RefuserError(f"{path}:{member.name} is a link or special member, not a regular binary")
+            source = bundle.extractfile(member)
+            if source is None:
+                raise RefuserError(f"cannot read {path}:{member.name}")
+            scanned += 1
+            if contains_marker(source.read, marker):
+                found.append(member.name)
+    return found, scanned
+
+
+def _scan_zip(path, marker):
+    found, scanned = [], 0
+    with zipfile.ZipFile(str(path)) as bundle:
+        for info in bundle.infolist():
+            if info.is_dir():
+                continue
+            gateway = is_gateway_name(info.filename)
+            kind = stat.S_IFMT(info.external_attr >> 16)
+            if gateway and kind not in (0, stat.S_IFREG):
+                raise RefuserError(f"{path}:{info.filename} is a link or special member, not a regular binary")
+            # Every member is read (CRC-checked); only gateway members are searched.
+            with bundle.open(info) as source:
+                if gateway:
+                    scanned += 1
+                    if contains_marker(source.read, marker):
+                        found.append(info.filename)
+                else:
+                    while source.read(CHUNK_BYTES):
+                        pass
+    return found, scanned
+
+
+def scan(path, marker):
+    """(labels that carry the marker, number of binaries scanned) for one raw binary or archive.
+
+    A label is "" for a raw binary and the member name for an archive member."""
+    mode = archive_mode(path)
+    try:
+        if mode is None:
+            return _scan_raw(path, marker)
+        if mode == "zip":
+            return _scan_zip(path, marker)
+        return _scan_tar(path, mode, marker)
+    except RefuserError:
+        raise
+    except (OSError, EOFError, tarfile.TarError, zipfile.BadZipFile, zlib.error, RuntimeError,
+            NotImplementedError, ValueError) as error:
+        raise RefuserError(f"cannot read {path}: {error}") from error
+
+
+# ---------------------------------------------------------------- build environment
+
+def rustflag_tokens(value, separator):
+    if separator is not None:
+        return [token for token in value.split(separator) if token]
+    return value.split()
+
+
+def enables_test_root(tokens):
+    """True when the tokens configure `--cfg duduclaw_test_root` (any spelling rustc accepts)."""
+    for index, token in enumerate(tokens):
+        if token == TEST_ROOT_CFG:
+            return True
+        if token == "--cfg":
+            value = tokens[index + 1] if index + 1 < len(tokens) else ""
+        elif token.startswith("--cfg="):
+            value = token.split("=", 1)[1]
+        else:
+            continue
+        name = value.split("=", 1)[0].strip("'\"")
+        if name == TEST_ROOT_CFG:
+            return True
+    return False
+
+
+def cargo_config_files(environment, cargo_dirs=None, cargo_home=None):
+    """Cargo configuration files that apply to builds started in `cargo_dirs`."""
+    directories = []
+    for start in cargo_dirs or (ROOT,):
+        current = Path(start).resolve()
+        for directory in (current, *current.parents):
+            if directory / ".cargo" not in directories:
+                directories.append(directory / ".cargo")
+    if cargo_home is None:
+        cargo_home = environment.get("CARGO_HOME")
+    if not cargo_home:
+        try:
+            cargo_home = Path.home() / ".cargo"
+        except (KeyError, RuntimeError) as error:
+            raise RefuserError("cannot determine CARGO_HOME (no home directory)") from error
+    if Path(cargo_home) not in directories:
+        directories.append(Path(cargo_home))
+    return [directory / name for directory in directories for name in CARGO_CONFIG_NAMES]
+
+
+def environment_problems(environment, target=None, cargo_dirs=None, cargo_home=None):
+    """Every test-root build setting in `environment` and the applicable Cargo configuration."""
+    problems = []
+    for variable in (BOOTSTRAP_TEST_KEY_VARIABLE, TEST_LICENSE_ISSUER_VARIABLE):
+        if variable in environment:
+            problems.append(f"{variable} is set: refusing a production build or package")
+    if target is None:
+        target_variables = sorted(name for name in environment if TARGET_RUSTFLAGS.fullmatch(name))
+    else:
+        target_variables = ["CARGO_TARGET_" + re.sub(r"[^A-Za-z0-9]", "_", target).upper() + "_RUSTFLAGS"]
+    for variable, separator in (*RUSTFLAGS_VARIABLES, *((name, None) for name in target_variables)):
+        value = environment.get(variable)
+        if value is not None and enables_test_root(rustflag_tokens(value, separator)):
+            problems.append(f"{variable} enables --cfg {TEST_ROOT_CFG}: refusing a production build or package")
+    for variable in RUSTC_VARIABLES:
+        if variable in environment:
+            problems.append(f"{variable} is set: release builds use the toolchain's own rustc; "
+                            "refusing a production build or package")
+    for path in cargo_config_files(environment, cargo_dirs, cargo_home):
+        try:
+            data = path.read_bytes()
+        except (FileNotFoundError, NotADirectoryError, IsADirectoryError):
+            continue
+        except OSError as error:
+            raise RefuserError(f"cannot read Cargo configuration {path}: {error.strerror or error}") from error
+        if TEST_ROOT_CFG.encode("ascii") in data:
+            problems.append(f"{path} mentions {TEST_ROOT_CFG}: refusing a production build or package")
+    return problems
+
+
+def refuse_test_root_environment(environment, target=None, cargo_dirs=None, cargo_home=None):
+    """Raise ValueError (the first problem) unless the build environment is free of test-root settings."""
+    problems = environment_problems(environment, target, cargo_dirs, cargo_home)
+    if problems:
+        raise ValueError(problems[0])
+
+
+# ---------------------------------------------------------------- command line
+
+def _emit(text, stream=None):
+    stream = sys.stderr if stream is None else stream
+    encoding = getattr(stream, "encoding", None) or "ascii"
+    stream.write(text.encode(encoding, "backslashreplace").decode(encoding) + "\n")
+    stream.flush()
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="refuse-test-license-build.py",
+        description="Exit 1 when a binary/archive is a TEST-licence gateway build or the build "
+                    "environment carries test-root settings; exit 2 on usage or I/O errors.")
+    parser.add_argument("paths", nargs="*", metavar="PATH", help="raw binary or .tar.gz/.tgz/.tar/.zip archive")
+    parser.add_argument("--marker-file", help="read the marker from this file instead of license_runtime.rs")
+    parser.add_argument("--check-environment", action="store_true",
+                        help="refuse test-root build settings in the environment and Cargo configuration")
+    parser.add_argument("--target", help="with --check-environment: check only this target's CARGO_TARGET_*_RUSTFLAGS")
+    parser.add_argument("--cargo-dir", action="append", dest="cargo_dirs",
+                        help="with --check-environment: a directory Cargo runs in (repeatable)")
+    args = parser.parse_args(argv)
+    if not args.paths and not args.check_environment:
+        parser.error("name at least one binary or archive, or --check-environment")
+    if (args.target is not None or args.cargo_dirs) and not args.check_environment:
+        parser.error("--target and --cargo-dir belong to --check-environment")
+    if args.marker_file is not None and not args.paths:
+        parser.error("--marker-file needs a binary or archive to scan")
+    refused = failed = False
+    if args.check_environment:
+        directories = args.cargo_dirs or [str(ROOT), os.getcwd()]
+        try:
+            problems = environment_problems(os.environ, args.target, directories)
+        except RefuserError as error:
+            _emit(f"{PROG}: ERROR {error}")
+            return 2
+        for problem in problems:
+            _emit(f"{PROG}: REFUSED {problem}")
+        if problems:
+            refused = True
+        else:
+            _emit(f"{PROG}: OK build environment has no test-root setting", sys.stdout)
+    if args.paths:
+        try:
+            marker = read_marker_file(args.marker_file) if args.marker_file is not None else load_marker()
+        except RefuserError as error:
+            _emit(f"{PROG}: ERROR {error}")
+            return 2
+        for path in args.paths:
+            try:
+                found, scanned = scan(path, marker)
+            except RefuserError as error:
+                _emit(f"{PROG}: ERROR {error}")
+                failed = True
+                continue
+            for member in found:
+                label = f"{path}:{member}" if member else path
+                _emit(f"{PROG}: REFUSED {label} is a TEST-licence gateway build (cfg({TEST_ROOT_CFG}) marker); "
+                      "it must never be signed, packaged or published")
+            if found:
+                refused = True
+            else:
+                _emit(f"{PROG}: OK {path}: no TEST-licence marker ({scanned} gateway binaries scanned)", sys.stdout)
+    if refused:
+        return 1
+    return 2 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -431,6 +431,8 @@ ISOLATION_CEREMONY_FILES=(
     scripts/isolation-sign
     scripts/release.sh
     scripts/package-linux-release.py
+    scripts/refuse-test-license-build.py
+    crates/duduclaw-gateway/src/license_runtime.rs
     scripts/sign-isolation-manifest.py
     scripts/check_glibc.py
     release/isolation/manifest-template.json
@@ -1872,6 +1874,20 @@ if $DRY_RUN; then
     exit 0
 fi
 
+# --- TEST-licence build settings (before any source mutation) ---
+# This host builds the darwin duduclaw-pro (cargo, below) and starts the Pro image
+# build/push: refuse test-root rustc flags, the TEST issuer/key variables, rustc
+# wrappers/overrides and Cargo configuration naming the cfg here, for the repository
+# and the private Pro crate (scripts/refuse-test-license-build.py --check-environment).
+REFUSER_CARGO_DIRS=(--cargo-dir .)
+if [[ -d commercial/duduclaw-pro-gateway ]]; then
+    REFUSER_CARGO_DIRS+=(--cargo-dir commercial/duduclaw-pro-gateway)
+fi
+if ! python3 -I -B "$(dirname "$0")/refuse-test-license-build.py" --check-environment "${REFUSER_CARGO_DIRS[@]}"; then
+    echo "Error: TEST-licence build settings in this environment (above); unset them before releasing."
+    exit 1
+fi
+
 # --- Enterprise release preflight (before any source mutation) ---
 # The enterprise channel (duduclaw-pro image, offline tar, bare-metal binaries,
 # control-plane allowlist) rides the same release train. Every one of those
@@ -2380,6 +2396,9 @@ package_and_upload_pro_bin() {
             return 1
         fi
     fi
+    # Hard failure, before any signature, notarisation or upload: never a
+    # TEST-licence gateway (static marker check of the exact staged bytes).
+    python3 -I -B scripts/refuse-test-license-build.py "$staged_dir/$plat/duduclaw-pro" || exit 1
     local app_path="${staged_dir}/duduclaw-pro-${plat}.app.zip"
     if [[ "$plat" == darwin-* ]]; then
         # Sign before creating either asset. A signing failure skips this platform.

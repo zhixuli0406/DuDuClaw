@@ -89,3 +89,21 @@ statically refuses a test-licence `duduclaw` (it carries a fixed marker) in
 packaging, the cross-build hand-off, `--verify-archive` and
 `--from-release-archive` (so also `scripts/release.sh isolation-sign`); the only
 exception is `--test-signer`, whose outputs are TEST-ONLY.
+
+Every other release path refuses a test-licence build the same way, through one
+script, `scripts/refuse-test-license-build.py` (it reads the marker from its single
+definition in `crates/duduclaw-gateway/src/license_runtime.rs` at run time, so no
+copy of it exists anywhere else): `release.yml` (job-start environment check, the
+macOS/Windows gateway before signing and packaging, every archive before minisign
+and the GitHub release), `desktop-release.yml` (the staged sidecar before
+tauri-action), `container/Dockerfile.server` (the build stage greps the built
+binary for the same marker before the runtime image copies it), `npm/scripts/publish.sh`
+(every binary before `npm publish`), `scripts/release.sh` (environment check before
+any change; the Pro binary before signing and upload) and the Linux packager, which
+shares its environment rules. `scripts/isolation-test-keys.sh bundle --gateway`
+names its TEST copy `duduclaw-linux-<arch>-TEST.tar.gz`. By hand:
+`python3 -I -B scripts/refuse-test-license-build.py <binary or .tar.gz/.tgz/.zip>...`
+(exit 0 clean, 1 test-licence build found, 2 usage or read error) and
+`python3 -I -B scripts/refuse-test-license-build.py --check-environment` (refuses
+test-root RUSTFLAGS, the TEST issuer/key variables, any `RUSTC`/`RUSTC_WRAPPER`/
+`RUSTC_WORKSPACE_WRAPPER`, and `.cargo/config*` naming the cfg).

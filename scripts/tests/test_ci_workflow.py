@@ -90,14 +90,18 @@ class CiWorkflowTests(unittest.TestCase):
             "crates/duduclaw-cli/assets/native-protected-launcher.sh",
             "crates/duduclaw-cli/src/service/**", "crates/duduclaw-core/src/root_key*.rs",
             "crates/duduclaw-updated/src/**", "release/**",
+            "crates/duduclaw-gateway/src/license_runtime.rs", "crates/duduclaw-gateway/src/bin/**",
+            "scripts/refuse-test-license-build.py",
         ]})
         self.assertEqual(smoke["permissions"], {"contents": "read"})
         self.assertNotRegex(text, r"(?i)secrets\s*(?:\.|\[|\}\})")
         # A PR build never produces a PRODUCTION-pinned verifier: no pin file or pin argument.
         for needle in ("release/bootstrap-root.sha256", "--bootstrap-root-pin-file", "--bootstrap-root-sha256",
-                       "--signing-key", "--test-signer", "PRODUCTION"):
+                       "--signing-key", "--test-signer"):
             self.assertNotIn(needle, text)
-        self.assertEqual(set(smoke["jobs"]), {"build", "package-arm64"})
+        # PRODUCTION only as the licence identity the marker probe expects, never `PRODUCTION <pin>`.
+        self.assertNotRegex(text, r"PRODUCTION(?!-LICENSE)")
+        self.assertEqual(set(smoke["jobs"]), {"build", "package-arm64", "license-marker-probe"})
         self.assertNotIn("env", smoke)
         for job in smoke["jobs"].values():
             self.assertNotIn("permissions", job)
@@ -138,6 +142,85 @@ class CiWorkflowTests(unittest.TestCase):
         handoff = next(s for s in arm["steps"] if s.get("name", "").startswith("Execute TEST-root"))
         self.assertEqual(handoff["env"]["VERIFIER_SHA256"], "${{ needs.build.outputs.arm64_test_verifier_sha256 }}")
         self.assertIn('[[ "${actual%% *}" == "$VERIFIER_SHA256" ]]', handoff["run"])
+
+    def test_every_release_path_refuses_a_test_license_build(self):
+        refuser = "scripts/refuse-test-license-build.py"
+
+        def names(steps):
+            return [s.get("name", s.get("uses", "")) for s in steps]
+
+        def first(steps, needle):
+            return next(i for i, s in enumerate(steps) if needle in s.get("run", ""))
+
+        # release.yml build job: the environment at job start, the built gateway before
+        # anything signs, notarises, packages or uploads it.
+        release = self.load_workflow("release")
+        steps = release["jobs"]["build"]["steps"]
+        listed = names(steps)
+        checks = [i for i, s in enumerate(steps) if refuser + " --check-environment" in s.get("run", "")]
+        self.assertEqual([steps[i]["if"] for i in checks], ["runner.os != 'Windows'", "runner.os == 'Windows'"])
+        self.assertLess(max(checks), min(first(steps, "cargo build"), first(steps, "package-linux-release.py")))
+        mac = listed.index("Refuse a TEST-licence gateway (macOS)")
+        win = listed.index("Refuse a TEST-licence gateway (Windows)")
+        self.assertEqual(steps[mac]["if"], "runner.os == 'macOS'")
+        self.assertEqual(steps[win]["if"], "runner.os == 'Windows'")
+        self.assertIn(refuser + " target/${{ matrix.target }}/release/duduclaw\n", steps[mac]["run"] + "\n")
+        self.assertIn(refuser + " target/${{ matrix.target }}/release/duduclaw.exe", steps[win]["run"])
+        self.assertIn("if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }", steps[win]["run"])
+        build = listed.index("Build binary (macOS/Windows — with desktop feature)")
+        self.assertEqual(mac, build + 1)
+        self.assertEqual(win, build + 2)
+        for later in ("Import macOS gateway signing certificate", "Build, sign and notarize macOS gateway",
+                      "Package (macOS)", "Package (Windows)", "Preserve unsigned archives and checksums"):
+            self.assertLess(win, listed.index(later))
+        publish = release["jobs"]["release"]["steps"]
+        guard = names(publish).index("Refuse TEST-licence gateways in the release archives")
+        self.assertIn(refuser + ' "${archives[@]}"', publish[guard]["run"])
+        self.assertIn("set -euo pipefail", publish[guard]["run"])
+        self.assertLess(guard, names(publish).index("Sign release assets with minisign (Ed25519)"))
+        # desktop-release.yml: the environment before any Cargo run, the staged sidecar before tauri-action.
+        desktop = self.load_workflow("desktop-release")["jobs"]["build"]["steps"]
+        checks = [i for i, s in enumerate(desktop) if refuser + " --check-environment" in s.get("run", "")]
+        self.assertEqual(len(checks), 2)
+        self.assertLess(max(checks), first(desktop, "cargo "))
+        stage = names(desktop).index("Build & stage gateway sidecar")
+        sidecar = names(desktop).index("Refuse a TEST-licence gateway sidecar")
+        self.assertEqual(sidecar, stage + 1)
+        self.assertIn(refuser + ' "src-tauri/binaries/duduclaw-$TARGET$EXT"', desktop[sidecar]["run"])
+        tauri = next(i for i, s in enumerate(desktop) if s.get("uses", "").startswith("tauri-apps/tauri-action@"))
+        self.assertLess(sidecar, tauri)
+        # Dockerfile.server: scanned in the build stage, before the runtime copies it.
+        docker = (ROOT / "container/Dockerfile.server").read_text()
+        scan = docker.index('grep -c -a -F -f "$marker_file" target/release/duduclaw')
+        self.assertLess(docker.index("cargo build --release"), scan)
+        self.assertLess(scan, docker.index("FROM python:3.12-slim AS cli-tools"))
+        self.assertLess(scan, docker.index("COPY --from=rust-builder /build/target/release/duduclaw"))
+        # npm publisher: every extracted binary before the first publish.
+        npm = (ROOT / "npm/scripts/publish.sh").read_text()
+        self.assertLess(npm.index(refuser), npm.index("already_published() {"))
+        # release.sh: the environment before any source change, the Pro binary before signing/upload.
+        script = (ROOT / "scripts/release.sh").read_text()
+        self.assertLess(script.index('refuse-test-license-build.py" --check-environment'),
+                        script.index("# --- Enterprise release preflight"))
+        function = script[script.index("package_and_upload_pro_bin() {"):]
+        check = function.index(refuser + ' "$staged_dir/$plat/duduclaw-pro" || exit 1')
+        for later in ("build-gateway-bundle.py", "sign-gateway.sh", "minisign -S", "gcloud storage cp"):
+            self.assertLess(check, function.index(later))
+        # The marker probe: release profile, stripped, refused exactly in the test-root build.
+        probe = self.load_workflow("linux-release-smoke")["jobs"]["license-marker-probe"]
+        self.assertEqual(probe["strategy"]["matrix"]["variant"], ["production", "test-root"])
+        run = probe["steps"][-1]["run"]
+        for needle in ("CARGO_TARGET_DIR=target/license-marker-probe-test-root RUSTFLAGS='--cfg duduclaw_test_root'",
+                       "unset DUDUCLAW_TEST_LICENSE_ISSUER_PUBKEY", "cargo build --locked --release",
+                       "--bin duduclaw-license-marker-probe", "duduclaw-gateway/marker-probe", "strip --strip-all",
+                       "python3 -I -B " + refuser, '[[ "$identity" == "TEST-LICENSE none" ]]',
+                       '[[ "$identity" =~ ^PRODUCTION-LICENSE\\ [0-9a-f]{16}$ ]]'):
+            self.assertIn(needle, run)
+        # The Python job runs the refuser's and the release packaging tests.
+        python = "\n".join(s.get("run", "") for s in self.jobs["python"]["steps"])
+        for test in ("test_refuse_test_license_build.py", "test_package_linux_release.py",
+                     "test_sign_isolation_manifest.py"):
+            self.assertIn(f"python3 -m unittest discover -s scripts/tests -p '{test}' -v", python)
 
     def test_linux_release_smoke_matches_release_build_steps(self):
         release = self.load_workflow("release")

@@ -25,7 +25,10 @@
 # --kind bundle (R1+R2 BundleAuthorization) and a TEST minisign signature.
 # --gateway first replaces duduclaw in a private TEST copy of the archive with the
 # TEST-licence build printed by `keys` (the packager never writes such an archive);
-# without it the bundle carries the production gateway, which no TEST licence passes.
+# the copy is named duduclaw-linux-<arch>-TEST.tar.gz so it can never be mistaken
+# for (or published as) the release archive, and every release path refuses its
+# duduclaw (scripts/refuse-test-license-build.py). Without --gateway the bundle
+# carries the production gateway, which no TEST licence passes.
 #
 # `license` signs a TEST license.json (0600) for the installer's licence rule
 # (self-host binding, not a Personal edition): --tier self_host_pro (default),
@@ -155,14 +158,21 @@ EOF
 }
 
 # A private TEST copy of a release archive (plus its .sha256) whose duduclaw is the
-# given TEST-licence build; prints the copy's path. The source archive must match
-# its own .sha256 and hold exactly one regular duduclaw; the replacement must carry
-# the test-root marker (scripts/package-linux-release.py TEST_LICENSE_MARKER).
+# given TEST-licence build, named <release name>-TEST.tar.gz; prints the copy's path.
+# The source archive must match its own .sha256 and hold exactly one regular
+# duduclaw; the replacement must carry the test-root marker (parsed by
+# scripts/refuse-test-license-build.py from license_runtime.rs).
 test_gateway_archive() {
-    python3 -I -c 'import hashlib, io, os, sys, tarfile
-archive, gateway, directory = sys.argv[1:4]
+    python3 -I -B -c 'import hashlib, importlib.util, io, os, sys, tarfile
+archive, gateway, directory, refuser_path = sys.argv[1:5]
 name = os.path.basename(archive)
-marker = b"DUDUCLAW-TEST-LICENSE-ISSUER-BUILD"
+if not name.endswith(".tar.gz"):
+    sys.exit("isolation-test-keys: --archive must be a duduclaw-linux-<arch>.tar.gz release archive")
+test_name = name[:-len(".tar.gz")] + "-TEST.tar.gz"
+spec = importlib.util.spec_from_file_location("test_license_refuser", refuser_path)
+refuser = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(refuser)
+marker = refuser.load_marker()
 def sha256(path):
     digest = hashlib.sha256()
     with open(path, "rb") as source:
@@ -177,7 +187,7 @@ with open(archive + ".sha256", encoding="ascii") as sidecar:
     if sidecar.read() != f"{sha256(archive)}  {name}\n":
         sys.exit("isolation-test-keys: --archive does not match its .sha256 file")
 os.mkdir(directory, 0o700)
-copy = os.path.join(directory, name)
+copy = os.path.join(directory, test_name)
 replaced = 0
 with tarfile.open(archive, "r:gz") as source, tarfile.open(copy, "x:gz") as bundle:
     for member in source.getmembers():
@@ -194,8 +204,8 @@ with tarfile.open(archive, "r:gz") as source, tarfile.open(copy, "x:gz") as bund
 if replaced != 1:
     sys.exit("isolation-test-keys: --archive must hold exactly one duduclaw")
 with open(copy + ".sha256", "x", encoding="ascii") as sidecar:
-    sidecar.write(f"{sha256(copy)}  {name}\n")
-print(copy)' "$1" "$2" "$3"
+    sidecar.write(f"{sha256(copy)}  {test_name}\n")
+print(copy)' "$1" "$2" "$3" "$ROOT/scripts/refuse-test-license-build.py"
 }
 
 cmd_bundle() {
@@ -232,7 +242,7 @@ print(packager.version_text(packager.workspace_version()))' "$ROOT/scripts/packa
     if [[ -n "$gateway" ]]; then
         [[ -f "$gateway" && ! -L "$gateway" ]] || fail "--gateway must be a regular file"
         archive="$(test_gateway_archive "$archive" "$gateway" "$out/TEST-archive")"
-        echo "TEST-ONLY archive with the TEST-licence duduclaw: $archive"
+        echo "TEST-ONLY archive with the TEST-licence duduclaw (never upload it): $archive"
     fi
     python3 "$ROOT/scripts/package-linux-release.py" --target "$target" --from-release-archive "$archive" \
         --manifest-template "$ROOT/release/isolation/manifest-template.json" --manifest-valid-days 30 \
