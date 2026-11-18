@@ -29,6 +29,11 @@ pub(crate) mod runtime;
 #[path = "protected_linux_policy.rs"]
 pub(crate) mod policy;
 
+/// R8r-2: `service provider set --protected-linux` (host root writes an
+/// isolated employee's model connection document through spawnd).
+#[path = "protected_linux_provider.rs"]
+pub(crate) mod provider;
+
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) struct InstallOptions {
     pub enable_now: bool,

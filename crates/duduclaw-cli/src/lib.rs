@@ -3700,6 +3700,11 @@ enum ServiceCommands {
         #[command(subcommand)]
         command: service::protected_linux::policy::ProtectedLinuxCommand,
     },
+    /// Set or remove an isolated employee's model connection document (protected Linux, root)
+    Provider {
+        #[command(subcommand)]
+        command: service::protected_linux::provider::ProviderCommand,
+    },
     /// Install DuDuClaw as a system service
     Install {
         /// Install the root-protected native Linux system service (requires sudo)
@@ -5721,6 +5726,9 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             ServiceCommands::Readiness { protected_linux: _, platform_only } => service::protected_linux::readiness(platform_only),
             ServiceCommands::ProtectedLinux { command } => {
                 service::protected_linux::policy::handle(command)
+            }
+            ServiceCommands::Provider { command } => {
+                service::protected_linux::provider::handle(command)
             }
             ServiceCommands::Install { protected_linux, enable_now, migrate_from, force_migrate, i_verified_this_binary, allow_missing_runtime } => {
                 if protected_linux {

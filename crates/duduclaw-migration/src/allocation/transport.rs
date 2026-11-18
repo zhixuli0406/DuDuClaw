@@ -99,3 +99,59 @@ pub fn accept(listener:&OwnedFd,gateway:(u32,u32))->Result<OwnedFd,Error>{
     if raw<0{return Err(Error::Unavailable)}let fd=unsafe{OwnedFd::from_raw_fd(raw)};timeout(&fd)?;
     if gateway.0==0 || gateway.1==0 || peer(&fd)?!=gateway{return invalid()}Ok(fd)
 }
+
+// ---- R8r-2: schema 5 (`provision_providers`) ----
+
+/// R8r-2: [`accept`] that also admits host root (uid 0 AND gid 0) and says
+/// which peer connected ([`providers::classify`]); the caller applies
+/// [`providers::admits`] (root may send `provision_providers` only).
+pub fn accept_peer(listener:&OwnedFd,gateway:(u32,u32))->Result<(OwnedFd,providers::Peer),Error>{
+    let raw=unsafe{libc::accept4(listener.as_raw_fd(),std::ptr::null_mut(),std::ptr::null_mut(),libc::SOCK_CLOEXEC)};
+    if raw<0{return Err(Error::Unavailable)}let fd=unsafe{OwnedFd::from_raw_fd(raw)};timeout(&fd)?;
+    let who=providers::classify(peer(&fd)?,gateway).ok_or(Error::Authentication)?;
+    Ok((fd,who))
+}
+/// A frame buffer that never grows past the capacity reserved up front, so
+/// serialising a secret never reallocates (no unzeroized copy is left).
+struct Bounded<'a>(&'a mut Vec<u8>);
+impl std::io::Write for Bounded<'_>{
+    fn write(&mut self,buf:&[u8])->std::io::Result<usize>{
+        let end=self.0.len().checked_add(buf.len()).ok_or_else(||std::io::Error::other("frame limit"))?;
+        if end>MAX_BYTES || end>self.0.capacity(){return Err(std::io::Error::other("frame limit"))}
+        self.0.extend_from_slice(buf);Ok(buf.len())
+    }
+    fn flush(&mut self)->std::io::Result<()>{Ok(())}
+}
+/// [`send`] for a frame carrying a secret: serialised into a zeroizing
+/// buffer that is wiped when this returns.
+pub fn send_secret<T:Serialize>(fd:&OwnedFd,value:&T)->Result<(),Error>{
+    let mut bytes=zeroize::Zeroizing::new(Vec::with_capacity(MAX_BYTES));
+    serde_json::to_writer(Bounded(&mut bytes),value).map_err(|_|Error::Limit)?;
+    let n=unsafe{libc::send(fd.as_raw_fd(),bytes.as_ptr().cast(),bytes.len(),libc::MSG_NOSIGNAL)};
+    if n<0 || n as usize!=bytes.len(){return Err(Error::Unavailable)}Ok(())
+}
+/// Server side: one frame (schema 1–4 [`Request`] or schema-5
+/// [`providers::ProviderRequest`]) from a receive buffer that is wiped when
+/// this returns (a payload is moved into its own zeroizing buffer).
+pub fn receive_frame(fd:&OwnedFd)->Result<providers::Frame,Error>{
+    let mut bytes=zeroize::Zeroizing::new(vec![0u8;MAX_BYTES]);
+    let mut iov=libc::iovec{iov_base:bytes.as_mut_ptr().cast(),iov_len:bytes.len()};
+    let mut msg:libc::msghdr=unsafe{std::mem::zeroed()};msg.msg_iov=&mut iov;msg.msg_iovlen=1;
+    let n=unsafe{libc::recvmsg(fd.as_raw_fd(),&mut msg,libc::MSG_CMSG_CLOEXEC)};
+    if n<=0 || msg.msg_flags&(libc::MSG_TRUNC|libc::MSG_CTRUNC)!=0{return Err(Error::Invalid)}
+    providers::decode_frame(&bytes[..n as usize])
+}
+/// The schema-5 exchange. Takes the request by value: it is serialised into
+/// a zeroizing buffer and dropped (payload wiped) before the reply is read.
+/// `Ok(Err(code))` is root's refusal; `Err` is a transport failure or a
+/// reply that does not match the request (never a refusal).
+pub fn provide(request:providers::ProviderRequest)->Result<Result<providers::Provisioned,providers::ProviderErrorCode>,Error>{
+    request.check().map_err(|_|Error::Invalid)?;
+    let (nonce,clear)=(request.nonce,request.clear);
+    let fd=connect()?;
+    let sent=send_secret(&fd,&request);
+    drop(request);
+    sent?;
+    let response:providers::ProviderResponse=receive(&fd)?;
+    providers::check_provider_response(nonce,clear,response)
+}

@@ -23,6 +23,10 @@
 //!   Its refusals may also be [`ErrorCode::NotAllocated`],
 //!   [`ErrorCode::NotSigned`], [`ErrorCode::InvalidEntitlement`] or
 //!   [`ErrorCode::Capacity`]. Older schemas can never carry either field.
+//! - Schema 5 (R8r-2): `provision_providers` only, as its own frame type
+//!   ([`providers::ProviderRequest`] / [`providers::ProviderResponse`], codes
+//!   [`providers::ProviderErrorCode`]); the gateway or host root may send it.
+//!   Schemas 1–4 and their types are unchanged and can never carry it.
 use duduclaw_isolation::{bounded::Text, capability::EmployeeBinding, egress::ProfileId, ids::{EmployeeId, RequestId, Sha256Digest,
     EMPLOYEE_UID_MAX, EMPLOYEE_UID_MIN}, migration::*};
 use serde::{Deserialize, Serialize};
@@ -433,6 +437,7 @@ pub fn check_response(request: &Request, response: Response) -> Result<Answer, E
 }
 #[cfg(target_os="linux")]
 pub mod transport;
+pub mod providers;
 
 #[cfg(test)]
 #[path = "allocation_tests.rs"]

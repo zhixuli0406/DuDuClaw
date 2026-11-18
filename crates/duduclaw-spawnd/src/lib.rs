@@ -46,6 +46,10 @@ pub type Result<T> = std::result::Result<T, duduclaw_isolation::ipc::ErrorCode>;
 
 #[cfg(target_os = "linux")]
 pub mod allocation;
+/// R8r-2: root's write of an employee's model connection document inside
+/// the verified home of its temporarily attached image.
+#[cfg(target_os = "linux")]
+pub(crate) mod providers_file;
 
 #[cfg(target_os = "linux")]
 pub mod native_trampoline;

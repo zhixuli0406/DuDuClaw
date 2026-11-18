@@ -15,11 +15,22 @@
 //! entry is Ready (`crate::entitlement::entitle`); `Disable` and `Retire`
 //! remove it FIRST (before their state change; absent ⇒ nothing to do), so a
 //! crash between the two steps resumes cleanly.
+//!
+//! R8r-2: `provision_providers` (wire schema 5, [`Allocator::providers`])
+//! writes or removes a Ready employee's model connection document inside its
+//! own home (`crate::providers_file`, through `Storage::write_providers`).
+//! The entry records only `providers: {provisioned, updated_unix}` (journal
+//! schema 3, omitted when `None`; never a payload or a hash). `Disable`
+//! removes a provisioned document before its state change and `Disable` /
+//! `Retire` clear the record with their state change (Retire destroys the
+//! image).
 use std::{fs::{self,File,OpenOptions},io::{self,Read,Write},path::{Path,PathBuf},os::unix::fs::{OpenOptionsExt,MetadataExt}};
 use serde::{Serialize,Deserialize};
-use duduclaw_migration::allocation::{self as wire,Action,Request,Receipt,Reply,Phase,RetireSpec,Specification,OperationKind,operation,validate_principal_binding};
+use duduclaw_migration::allocation::{self as wire,Action,Request,Receipt,Reply,Phase,RetireSpec,Specification,OperationKind,operation,validate_principal_binding,
+    providers::{Identification,ProviderErrorCode,ProviderRequest,Provisioned}};
 use duduclaw_isolation::{ids::EmployeeId,execution::DiskQuota,ipc::{ErrorCode,EmployeeIdleReport},migration::ProposalBinding};
-use crate::{Result,audit::Detail,registry::{Registry,RegistryStore,AccountHost,AccountState,EmployeeAccount,root_path,REGISTRY_DIRECTORY},storage::{Storage,ProvisionRequest}};
+use crate::{Result,audit::Detail,registry::{Registry,RegistryStore,AccountHost,AccountState,EmployeeAccount,root_path,REGISTRY_DIRECTORY},
+    storage::{Storage,ProvisionRequest,ProvidersChange,ProvidersFailure}};
 fn unavailable()->ErrorCode{ErrorCode::IsolationUnavailable}
 /// Allocation answers (schema-2 codes; a schema-1 reply drops them).
 type Answer<T>=std::result::Result<T,wire::ErrorCode>;
@@ -54,6 +65,10 @@ struct Entry {
     retire:Option<ProposalBinding>,
     #[serde(default,skip_serializing_if="Option::is_none")]
     retired_at:Option<u64>,
+    /// R8r-2: the last provider-document change root made (Ready, not
+    /// disabled entries only). No payload, no hash: nothing consumes one.
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    providers:Option<Provisioned>,
 }
 #[derive(Clone,Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -83,6 +98,23 @@ pub struct Env<'a> {
     pub now_unix:u64,
     /// R8d: the root host publication (production: `installed::InstalledEntitlements`).
     pub entitlements:&'a mut dyn crate::entitlement::Entitlements,
+}
+/// R8r-2: what one `provision_providers` may touch.
+pub struct ProvidersEnv<'a> {
+    pub registry:&'a Registry,
+    pub storage:&'a mut dyn Storage,
+    /// Some run is live on the host (the same gate as the mutating actions).
+    pub host_busy:bool,
+    pub now_unix:u64,
+}
+/// R8r-2: a storage failure as a schema-5 code (fixed; nothing of the
+/// payload or the home reaches the answer).
+fn providers_code(failure:ProvidersFailure)->ProviderErrorCode{
+    match failure{
+        ProvidersFailure::Busy=>ProviderErrorCode::NotReady,
+        ProvidersFailure::HomeEntryUnsafe=>ProviderErrorCode::HomeEntryUnsafe,
+        ProvidersFailure::NoSpace|ProvidersFailure::Unavailable=>ProviderErrorCode::StorageUnavailable,
+    }
 }
 /// Root audit facts produced by one request (the host emits them).
 pub enum AllocationEvent {
@@ -194,6 +226,77 @@ impl Allocator {
         reply.entitlement=Some(granted);
         Ok(reply)
     }
+    /// R8r-2 C: the one journal entry a schema-5 request names — by the
+    /// gateway's confirmation binding (exactly as the other actions replay
+    /// it), by `EmployeeId`, or by the label a label-holding entry carries.
+    /// It must be Ready and not disabled, and the registry must hold a Ready
+    /// row of the same employee with the receipt's UID (GID = UID), the
+    /// `Entitle` rule; anything else is `NotAllocated`.
+    fn provider_entry(&self,identification:&Identification,request:&ProviderRequest,registry:&Registry)->std::result::Result<usize,ProviderErrorCode>{
+        let index=match identification{
+            Identification::Binding(spec)=>{
+                let binding=request.item.as_ref().ok_or(ProviderErrorCode::InvalidRequest)?.binding;
+                match replay_index(&self.journal,&binding,spec){Ok(Some(index))=>index,_=>return Err(ProviderErrorCode::NotAllocated)}
+            },
+            Identification::Employee(employee)=>self.journal.entries.iter().position(|e|e.receipt.employee==*employee).ok_or(ProviderErrorCode::NotAllocated)?,
+            Identification::Label(label)=>self.journal.entries.iter().position(|e|e.receipt.label==*label && e.phase.holds_label()).ok_or(ProviderErrorCode::NotAllocated)?,
+        };
+        let receipt=&self.journal.entries[index].receipt;
+        if self.journal.entries[index].phase!=Phase::Ready || receipt.disabled{return Err(ProviderErrorCode::NotAllocated)}
+        match registry.lookup(receipt.employee){
+            Ok(account) if account.employee==receipt.employee && account.uid==receipt.uid && account.gid==receipt.uid=>Ok(index),
+            _=>Err(ProviderErrorCode::NotAllocated),
+        }
+    }
+    /// R8r-2 (schema 5, `provision_providers`), on the lifecycle worker.
+    /// C: resolve the entry; D: no run live host-wide and no lease of the
+    /// employee, else `NotReady`; G: the record says "provisioned" before a
+    /// write can leave a file behind (so `Disable` removes it), then the
+    /// write — every call rewrites, there is no "unchanged ⇒ skip" — then the
+    /// record `{provisioned, updated_unix}`. The request (and its payload)
+    /// is dropped, wiping the payload, as soon as the write returns.
+    pub fn providers(&mut self,request:Box<ProviderRequest>,env:ProvidersEnv<'_>)->std::result::Result<Provisioned,ProviderErrorCode>{
+        if self.poisoned{return Err(ProviderErrorCode::IsolationUnavailable)}
+        let identification=request.check()?;
+        let index=self.provider_entry(&identification,&request,env.registry)?;
+        if env.host_busy{return Err(ProviderErrorCode::NotReady)}
+        let (employee,uid)={let receipt=&self.journal.entries[index].receipt;(receipt.employee,receipt.uid)};
+        match env.storage.attachments(){
+            Ok(attachments) if attachments.iter().any(|a|a.employee==employee)=>return Err(ProviderErrorCode::NotReady),
+            Ok(_)=>{},
+            Err(_)=>return Err(ProviderErrorCode::StorageUnavailable),
+        }
+        let clear=request.clear;
+        let change=match (&request.payload,clear){
+            (Some(payload),false)=>ProvidersChange::Write(payload.bytes().ok_or(ProviderErrorCode::InvalidPayload)?),
+            (None,true)=>ProvidersChange::Clear,
+            _=>return Err(ProviderErrorCode::InvalidRequest),
+        };
+        let previous=self.journal.entries[index].providers;
+        if !clear && !previous.is_some_and(|record|record.provisioned){
+            let updated_unix=previous.map_or(env.now_unix,|record|record.updated_unix);
+            self.journal.entries[index].providers=Some(Provisioned{provisioned:true,updated_unix});
+            self.save().map_err(|_|ProviderErrorCode::IsolationUnavailable)?;
+        }
+        let written=env.storage.write_providers(employee,uid,change);
+        drop(request);
+        written.map_err(providers_code)?;
+        let record=Provisioned{provisioned:!clear,updated_unix:env.now_unix};
+        self.journal.entries[index].providers=Some(record);
+        self.save().map_err(|_|ProviderErrorCode::IsolationUnavailable)?;
+        Ok(record)
+    }
+    /// R8r-2 G: `Disable` removes a provisioned document before its state
+    /// change (the same safe unlink as `clear`; an absent file is success),
+    /// so a crash between the two steps repeats the removal on resume.
+    fn withdraw_providers(&self,storage:&mut dyn Storage,index:usize)->Answer<()>{
+        let entry=&self.journal.entries[index];
+        if !entry.providers.is_some_and(|record|record.provisioned){return Ok(())}
+        storage.write_providers(entry.receipt.employee,entry.receipt.uid,ProvidersChange::Clear).map_err(|failure|match failure{
+            ProvidersFailure::Busy=>wire::ErrorCode::NotReady,
+            _=>wire::ErrorCode::IsolationUnavailable,
+        })
+    }
     pub fn handle(&mut self,request:&Request,mut env:Env<'_>)->Answer<Reply>{
         if self.poisoned{return Err(wire::ErrorCode::IsolationUnavailable)}
         if request.action==Action::Retire{return self.retire(request,env)}
@@ -224,7 +327,7 @@ impl Allocator {
                 if employee.0==[0;16] || self.journal.entries.iter().any(|e|e.receipt.employee==employee){return Err(wire::ErrorCode::IsolationUnavailable)}
                 // The principal comes only from this confirmed proposal, never
                 // from an earlier (possibly disabled) entry with the same label.
-                self.journal.entries.push(Entry{receipt:Receipt{binding,label:spec.label.clone(),employee,uid:0,bytes:spec.bytes,inodes:spec.inodes,disabled:false,principal_binding:spec.binding.clone()},phase:Phase::Planned,retire:None,retired_at:None});
+                self.journal.entries.push(Entry{receipt:Receipt{binding,label:spec.label.clone(),employee,uid:0,bytes:spec.bytes,inodes:spec.inodes,disabled:false,principal_binding:spec.binding.clone()},phase:Phase::Planned,retire:None,retired_at:None,providers:None});
                 // The complete binding and random principal survive before UID or disk side effects.
                 self.save().map_err(code)?;self.journal.entries.len()-1
             }
@@ -262,6 +365,10 @@ impl Allocator {
                 if !disable_allowed(self.journal.entries[index].phase){return Err(wire::ErrorCode::InvalidRequest)}
                 // R8d A5: the entitlement goes before the state change.
                 self.revoke(&mut env,employee)?;
+                // R8r-2 G: so does a provisioned provider document; the
+                // record is cleared with the state change (same save).
+                self.withdraw_providers(env.storage,index)?;
+                self.journal.entries[index].providers=None;
                 self.journal.entries[index].phase=Phase::Disabling;self.save().map_err(code)?;
                 let account=env.registry.registry().employees.iter().find(|a|a.employee==employee).cloned();
                 if let Some(account)=account{
@@ -312,9 +419,11 @@ impl Allocator {
             used=env.storage.usage(spec.employee).ok().map(|usage|(usage.bytes,usage.inodes));
             // R8d A5: the entitlement goes before the state change.
             self.revoke(&mut env,spec.employee)?;
-            // 5. Retiring, saved before any side effect.
+            // 5. Retiring, saved before any side effect. R8r-2 G: the
+            // provider record is cleared here (the image, and the document
+            // in it, is destroyed in step 7; no separate unlink).
             let entry=&mut self.journal.entries[index];
-            entry.phase=Phase::Retiring;entry.retire=Some(retire);
+            entry.phase=Phase::Retiring;entry.retire=Some(retire);entry.providers=None;
             self.save().map_err(code)?;
         }else{
             // R8d A5 resume: already gone after a crash ⇒ nothing to write.
@@ -423,6 +532,8 @@ fn decode_journal(bytes:&[u8])->io::Result<Journal>{
         };
         // Schemas 1–2 were never written with the retire phases or fields.
         if !shape || (journal.schema<JOURNAL_SCHEMA && matches!(e.phase,Phase::Retiring|Phase::Retired)){return Err(bad())}
+        // R8r-2: a provider record belongs to a Ready, enabled entry of schema 3 only.
+        if e.providers.is_some() && (e.phase!=Phase::Ready || e.receipt.disabled || journal.schema<JOURNAL_SCHEMA){return Err(bad())}
         match &e.receipt.principal_binding{
             // Schema 1 was never written with bindings: one there is forged.
             Some(_) if journal.schema==1=>return Err(bad()),
@@ -442,19 +553,43 @@ fn replay_index(journal:&Journal,binding:&ProposalBinding,spec:&Specification)->
 }
 
 pub(crate) fn serve(gateway:(u32,u32),sender:std::sync::mpsc::SyncSender<crate::host_worker::AllocationWork>)->io::Result<()> {
-    use duduclaw_migration::allocation::{transport,Response};
+    use duduclaw_migration::allocation::{transport,Response,providers::{self as schema5,Frame,ProviderResponse}};
+    use crate::host_worker::AllocationWork;
     let listener=transport::bind(gateway.1).map_err(|_|io::Error::other("allocation socket unavailable"))?;
     std::thread::Builder::new().name("spawnd-allocation".into()).spawn(move||loop{
-        let fd=match transport::accept(&listener,gateway){Ok(fd)=>fd,Err(_)=>continue};
-        let request:Request=match transport::receive(&fd){Ok(r)=>r,Err(_)=>continue};
-        if request.check().is_err(){continue;}
-        let (reply,receive)=std::sync::mpsc::sync_channel(1);
-        // A full mailbox or the 4 s worker timeout is IsolationUnavailable
-        // (S5d): the gateway retries; it is never a NotFound.
-        let result=if sender.try_send((request.clone(),reply)).is_ok(){
-            receive.recv_timeout(std::time::Duration::from_secs(4)).unwrap_or(Err(wire::ErrorCode::IsolationUnavailable))
-        }else{Err(wire::ErrorCode::IsolationUnavailable)};
-        let _=transport::send(&fd,&Response::for_request(&request,result));
+        // R8r-2 C: the gateway exactly as before, or host root (uid 0 AND
+        // gid 0); the received frame buffer is wiped by `receive_frame`.
+        let (fd,peer)=match transport::accept_peer(&listener,gateway){Ok(accepted)=>accepted,Err(_)=>continue};
+        let frame=match transport::receive_frame(&fd){Ok(frame)=>frame,Err(_)=>continue};
+        // Every schema 1–4 action is the gateway's only; root may send
+        // `provision_providers` only (naming the employee by id or label).
+        if !schema5::admits(peer,&frame){continue;}
+        match frame{
+            Frame::Allocation(request)=>{
+                if request.check().is_err(){continue;}
+                let (reply,receive)=std::sync::mpsc::sync_channel(1);
+                // A full mailbox or the 4 s worker timeout is IsolationUnavailable
+                // (S5d): the gateway retries; it is never a NotFound.
+                let result=if sender.try_send(AllocationWork::Allocation(request.clone(),reply)).is_ok(){
+                    receive.recv_timeout(std::time::Duration::from_secs(4)).unwrap_or(Err(wire::ErrorCode::IsolationUnavailable))
+                }else{Err(wire::ErrorCode::IsolationUnavailable)};
+                let _=transport::send(&fd,&Response::for_request(&request,result));
+            },
+            Frame::Providers(request)=>{
+                if request.envelope().is_err(){continue;}
+                // R8r-2 B: moved to the worker, never cloned (the reply needs
+                // the nonce only); a refused send drops — and wipes — it here.
+                // H: the same 4 s bound; on timeout the worker still finishes
+                // (detach included) and the caller may send the same call
+                // again (every call rewrites).
+                let nonce=request.nonce;
+                let (reply,receive)=std::sync::mpsc::sync_channel(1);
+                let result=if sender.try_send(AllocationWork::Providers(request,reply)).is_ok(){
+                    receive.recv_timeout(std::time::Duration::from_secs(4)).unwrap_or(Err(ProviderErrorCode::IsolationUnavailable))
+                }else{Err(ProviderErrorCode::IsolationUnavailable)};
+                let _=transport::send(&fd,&ProviderResponse::answer(nonce,result));
+            },
+        }
     })?;
     Ok(())
 }
@@ -465,3 +600,6 @@ mod tests;
 #[cfg(test)]
 #[path = "allocation_retire_tests.rs"]
 mod retire_tests;
+#[cfg(test)]
+#[path = "allocation_providers_tests.rs"]
+mod providers_tests;

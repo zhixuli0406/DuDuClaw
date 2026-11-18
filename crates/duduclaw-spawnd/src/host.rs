@@ -344,6 +344,10 @@ impl Core {
             if !self.registry.registry().employees.iter().any(|a| a.employee == attachment.employee) { return Err(unavailable()); }
             self.components.storage.detach(&attachment)?;
         }
+        // R8r-2 E: a provider maintenance a crash left unfinished is finished
+        // here (left-over mount detached, left-over temp file removed) before
+        // any run or maintenance of that employee.
+        self.components.storage.recover_maintenance()?;
         if !self.components.storage.attachments()?.is_empty() { return Err(unavailable()); }
         let anchors = self.components.publication.anchors()?;
         for run in os(crate::bootstrap_mounts::projection_runs(&anchors))? { os(crate::bootstrap_mounts::cleanup_projection(&anchors, run))?; }
@@ -656,6 +660,20 @@ impl Host for Core {
         // Monitor every such identity before returning its failure to the gateway.
         self.monitor_registry().map_err(|_| Wire::IsolationUnavailable)?;
         result
+    }
+    /// R8r-2 (schema 5): only after start-up reconciliation latched (it
+    /// finishes any maintenance a crash left), only while no run is live on
+    /// the host (`Allocator::providers` applies the gate and the per-employee
+    /// lease check). Nothing here logs or audits the request.
+    fn providers(&mut self, request: Box<duduclaw_migration::allocation::providers::ProviderRequest>)
+        -> std::result::Result<duduclaw_migration::allocation::providers::Provisioned, duduclaw_migration::allocation::providers::ProviderErrorCode> {
+        use duduclaw_migration::allocation::providers::ProviderErrorCode as Code;
+        if self.poisoned { return Err(Code::IsolationUnavailable); }
+        if !self.startup.latched { return Err(Code::NotReady); }
+        let host_busy = !self.runs.is_empty();
+        let now_unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        self.allocator.providers(request, crate::allocation::ProvidersEnv { registry: self.registry.registry(),
+            storage: self.components.storage.as_mut(), host_busy, now_unix })
     }
     fn broker(&mut self, job: BrokerJob) -> Result<BrokerStep> {
         if self.poisoned {

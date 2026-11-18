@@ -175,6 +175,27 @@ sudo -u duduclaw -H claude auth login
 
 遷移只複製 `.duduclaw` 資料，**不會搬移 AI CLI 或其登入憑證**。Claude 已安裝但服務帳號尚未登入時，安裝流程會顯示上面的服務帳號登入指令。請另行登入，不要複製原使用者家目錄的憑證。Gateway 啟動時若找不到設定的推論執行檔，會記錄 ERROR 與修復方式；runtime 狀態與 doctor 也會顯示受保護服務專用的指引。
 
+## 隔離員工的模型連線資料
+
+使用 OpenAI 相容 runtime 的隔離員工，只從自己家目錄中的 `/home/employee/.duduclaw-api/providers.json` 讀取端點與 API 金鑰；Gateway 的帳號、設定與環境變數都不會被使用。主機管理員以 root 執行下列指令寫入或移除這份資料：
+
+```sh
+sudo duduclaw service provider set --protected-linux --employee <員工名稱> < providers.json
+sudo duduclaw service provider set --protected-linux --employee-id <32 個小寫十六進位字元> < providers.json
+sudo duduclaw service provider set --protected-linux --employee <員工名稱> --clear
+```
+
+文件**只從標準輸入讀取**：不接受命令列參數、環境變數或檔案路徑，直接在終端機執行而沒有導入檔案時會被拒絕並顯示格式提示；上限 65,536 位元組。格式如下：
+
+```json
+{"providers":[{"name":"main","api_key":"<金鑰>","base_url":"https://provider.example/v1"}]}
+```
+
+- 可有 1 至 32 個名稱不重複的提供者；`base_url` 必須是 https，且不可含帳號密碼、查詢字串或片段；可選填 `protocol`（`chat_completions`、`responses`、`anthropic` 或 `gemini`）。格式不正確時只會顯示固定訊息，不會回顯內容。
+- 金鑰存放在**該員工自己的家目錄**（員工擁有、權限 0600），該員工的 runtime 可以讀取。請使用專屬於這位員工的金鑰，不要放入 Gateway 或共用帳號的金鑰。
+- 在此指令中，每次變更都需要主機 root（儀表板輸入會在之後的版本提供）。只有在主機上沒有執行中的工作、且該員工未在使用時才會寫入，否則請稍後再試。每次執行都會重新寫入。成功時只顯示員工、提供者數量，以及各提供者名稱與 `https://主機[:連接埠]`，不會顯示金鑰。
+- 移除請加 `--clear`（不讀取標準輸入）。員工被停用時資料也會一併移除；員工退役時，資料會隨其儲存空間一起銷毀。
+
 ## 升級與解除安裝
 
 獨立更新服務目前還無法安裝（預計在之後的版本提供）；現有主機請依上方單一執行檔一節升級。完成遷移及更新服務佈署後，Admin 可在儀表板要求正式版更新，或使用已安裝的 CLI：
