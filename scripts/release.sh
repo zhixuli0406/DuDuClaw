@@ -1879,6 +1879,7 @@ fi
 # build/push: refuse test-root rustc flags, the TEST issuer/key variables, rustc
 # wrappers/overrides and Cargo configuration naming the cfg here, for the repository
 # and the private Pro crate (scripts/refuse-test-license-build.py --check-environment).
+# Cargo config files with a rustc wrapper or compiler override are refused too.
 REFUSER_CARGO_DIRS=(--cargo-dir .)
 if [[ -d commercial/duduclaw-pro-gateway ]]; then
     REFUSER_CARGO_DIRS+=(--cargo-dir commercial/duduclaw-pro-gateway)

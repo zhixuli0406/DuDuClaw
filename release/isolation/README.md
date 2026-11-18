@@ -110,4 +110,6 @@ names its TEST copy `duduclaw-linux-<arch>-TEST.tar.gz`. By hand:
 (exit 0 clean, 1 test-licence build found, 2 usage or read error) and
 `python3 -I -B scripts/refuse-test-license-build.py --check-environment` (refuses
 test-root RUSTFLAGS, the TEST issuer/key variables, any `RUSTC`/`RUSTC_WRAPPER`/
-`RUSTC_WORKSPACE_WRAPPER`, and `.cargo/config*` naming the cfg).
+`RUSTC_WORKSPACE_WRAPPER`, and `.cargo/config*` naming the cfg). Cargo configuration
+files that set `build.rustc-wrapper`, `build.rustc-workspace-wrapper` or `build.rustc`,
+or cannot be read or parsed, are also refused.

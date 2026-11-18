@@ -27,7 +27,8 @@ its only copy. The check is static: nothing is executed or extracted.
       --target, every target's without); RUSTC_WRAPPER, RUSTC_WORKSPACE_WRAPPER, RUSTC
       or their CARGO_BUILD_* forms set to anything (release builds use the toolchain's
       own rustc; no release job sets a wrapper); a .cargo/config.toml or .cargo/config
-      containing `duduclaw_test_root` in a --cargo-dir (default: the repository root
+      containing `duduclaw_test_root` or a build.rustc/build.rustc-wrapper/
+      build.rustc-workspace-wrapper setting in a --cargo-dir (default: the repository root
       and the current directory), any parent of it, or $CARGO_HOME (default ~/.cargo).
 
 Exit status: 0 no marker / clean environment; 1 refused (one line per finding on
@@ -44,6 +45,11 @@ import tarfile
 import zipfile
 import zlib
 
+try:
+    import tomllib
+except ImportError:  # Python < 3.11: accept only unambiguous, simple TOML lines.
+    tomllib = None
+
 PROG = "refuse-test-license-build"
 ROOT = Path(__file__).resolve().parents[1]
 LICENSE_RUNTIME = ROOT / "crates/duduclaw-gateway/src/license_runtime.rs"
@@ -58,6 +64,7 @@ TARGET_RUSTFLAGS = re.compile(r"CARGO_TARGET_[A-Za-z0-9_]+_RUSTFLAGS")
 RUSTC_VARIABLES = ("RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "RUSTC",
                    "CARGO_BUILD_RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_RUSTC")
 CARGO_CONFIG_NAMES = ("config.toml", "config")
+RUSTC_CONFIG_KEYS = ("rustc-wrapper", "rustc-workspace-wrapper", "rustc")
 # The one definition in license_runtime.rs (also parsed by container/Dockerfile.server).
 MARKER_DEFINITION = re.compile(rb'^static TEST_LICENSE_BUILD_MARKER: &\[u8\] = b"([A-Za-z0-9_-]+)";\r?$', re.MULTILINE)
 MARKER_DECLARATION = re.compile(rb"\bTEST_LICENSE_BUILD_MARKER\s*:")
@@ -257,6 +264,50 @@ def cargo_config_files(environment, cargo_dirs=None, cargo_home=None):
     return [directory / name for directory in directories for name in CARGO_CONFIG_NAMES]
 
 
+def cargo_rustc_settings(data, path):
+    """Return rustc overrides; an unreadable/ambiguous configuration fails closed."""
+    try:
+        text = data.decode("utf-8")
+        if tomllib is not None:
+            build = tomllib.loads(text).get("build", {})
+            if not isinstance(build, dict):
+                raise ValueError("build must be a table")
+            return [key for key in RUSTC_CONFIG_KEYS if key in build]
+
+        # This is deliberately a small subset, not a replacement TOML parser.
+        # Quoted keys, escapes, inline tables and multiline values are ambiguous
+        # here and require Python 3.11+ rather than risking a missed override.
+        key_pattern = r"[A-Za-z0-9_-]+(?:\s*\.\s*[A-Za-z0-9_-]+)*"
+        string_pattern = r'''(?:"[^"\\\r\n]*"|'[^'\r\n]*')'''
+        value_pattern = rf"(?:{string_pattern}|true|false|[+-]?(?:0|[1-9][0-9]*)|\[\s*(?:{string_pattern}\s*,\s*)*(?:{string_pattern}\s*)?\])"
+        table, settings, seen, tables = (), [], set(), set()
+        for line in text.splitlines():
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            header = re.fullmatch(rf"\s*\[\s*({key_pattern})\s*\]\s*(?:#.*)?", line)
+            if header:
+                table = tuple(part.strip() for part in header[1].split("."))
+                if table in tables or any(table[:len(key)] == key for key in seen):
+                    raise ValueError("duplicate or conflicting table")
+                tables.add(table)
+                if len(table) >= 2 and table[0] == "build" and table[1] in RUSTC_CONFIG_KEYS:
+                    settings.append(table[1])
+                continue
+            setting = re.fullmatch(rf"\s*({key_pattern})\s*=\s*{value_pattern}\s*(?:#.*)?", line)
+            if setting is None:
+                raise ValueError("cannot safely parse Cargo configuration without tomllib (use Python 3.11+)")
+            key = table + tuple(part.strip() for part in setting[1].split("."))
+            if (any(key[:len(other)] == other or other[:len(key)] == key for other in seen)
+                    or any(other[:len(key)] == key for other in tables)):
+                raise ValueError("duplicate or conflicting key")
+            seen.add(key)
+            if len(key) >= 2 and key[0] == "build" and key[1] in RUSTC_CONFIG_KEYS:
+                settings.append(key[1])
+        return settings
+    except ValueError as error:
+        raise RefuserError(f"cannot parse Cargo configuration {path}: {error}") from error
+
+
 def environment_problems(environment, target=None, cargo_dirs=None, cargo_home=None):
     """Every test-root build setting in `environment` and the applicable Cargo configuration."""
     problems = []
@@ -278,12 +329,15 @@ def environment_problems(environment, target=None, cargo_dirs=None, cargo_home=N
     for path in cargo_config_files(environment, cargo_dirs, cargo_home):
         try:
             data = path.read_bytes()
-        except (FileNotFoundError, NotADirectoryError, IsADirectoryError):
+        except FileNotFoundError:
             continue
         except OSError as error:
             raise RefuserError(f"cannot read Cargo configuration {path}: {error.strerror or error}") from error
         if TEST_ROOT_CFG.encode("ascii") in data:
             problems.append(f"{path} mentions {TEST_ROOT_CFG}: refusing a production build or package")
+        for key in cargo_rustc_settings(data, path):
+            problems.append(f"{path} sets build.{key}: release builds use the toolchain's own rustc; "
+                            "refusing a production build or package")
     return problems
 
 

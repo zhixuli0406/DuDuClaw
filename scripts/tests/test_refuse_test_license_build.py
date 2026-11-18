@@ -295,6 +295,92 @@ class RefuserTests(unittest.TestCase):
         (home / "config.toml").write_text('[target.x86_64-unknown-linux-gnu]\nrustflags = "--cfg=duduclaw_test_root"\n')
         self.assertEqual(len(REFUSER.environment_problems({"CARGO_HOME": str(home)}, None, [tree])), 1)
 
+    def test_cargo_rustc_overrides_in_table_and_dotted_forms(self):
+        config = self.write("repo/.cargo/config.toml", b"")
+        parsers = (REFUSER.tomllib, None) if REFUSER.tomllib is not None else (None,)
+        for parser in parsers:
+            for key in REFUSER.RUSTC_CONFIG_KEYS:
+                for content in (f'[build]\n{key} = "compiler-shim"\n',
+                                f'build.{key} = "compiler-shim"\n'):
+                    with self.subTest(parser=parser, content=content), patch.object(REFUSER, "tomllib", parser):
+                        config.write_text(content)
+                        problems = self.problems({})
+                        self.assertEqual(len(problems), 1, problems)
+                        self.assertIn(str(config), problems[0])
+                        self.assertIn(f"build.{key}", problems[0])
+                        config.write_text("\n".join("# " + line for line in content.splitlines()))
+                        self.assertEqual(self.problems({}), [])
+                        config.write_text(f'[build]\n# {key} = "compiler-shim"\n')
+                        self.assertEqual(self.problems({}), [])
+
+    def test_cargo_config_unrelated_settings_and_parse_errors(self):
+        config = self.write("repo/.cargo/config", b"")
+        parsers = (REFUSER.tomllib, None) if REFUSER.tomllib is not None else (None,)
+        for parser in parsers:
+            with self.subTest(parser=parser), patch.object(REFUSER, "tomllib", parser):
+                config.write_text('[net]\noffline = true\n[target.x86_64-unknown-linux-gnu]\n'
+                                  'linker = "cc"\nrunner = "emulator"\n')
+                self.assertEqual(self.problems({}), [])
+                for content in (b"[build\n", b'[build]\nrustc-wrapper = "unterminated\n',
+                                b"\xff", b"[net]\noffline = true\noffline = false\n"):
+                    with self.subTest(content=content):
+                        config.write_bytes(content)
+                        with self.assertRaisesRegex(REFUSER.RefuserError, re.escape(str(config))):
+                            self.problems({})
+                config.write_text("# duduclaw_test_root\n")
+                self.assertEqual(len(self.problems({})), 1)
+
+    def test_cargo_config_unreadable_file_fails_closed(self):
+        config = self.write("repo/.cargo/config.toml", b"[net]\noffline = true\n")
+        read_bytes = Path.read_bytes
+
+        def unreadable(path):
+            if path == config:
+                raise PermissionError("permission denied")
+            return read_bytes(path)
+
+        with patch.object(Path, "read_bytes", unreadable):
+            with self.assertRaisesRegex(REFUSER.RefuserError, re.escape(str(config))):
+                self.problems({})
+        config.unlink()
+        config.mkdir()
+        with self.assertRaisesRegex(REFUSER.RefuserError, re.escape(str(config))):
+            self.problems({})
+
+    def test_cargo_rustc_overrides_in_parents_and_cargo_home(self):
+        tree = self.root / "parent/repo/crate"
+        tree.mkdir(parents=True)
+        for name in ("parent/.cargo/config", "parent/repo/.cargo/config.toml",
+                     "cargo-home/config.toml"):
+            with self.subTest(name=name):
+                config = self.write(name, b'[build]\nrustc-wrapper = "compiler-shim"\n')
+                problems = self.problems({}, cargo_dirs=[tree])
+                self.assertEqual(len(problems), 1, problems)
+                self.assertIn(str(config), problems[0])
+                config.unlink()
+        config = self.write("env-home/config", b'build.rustc = "compiler-shim"\n')
+        problems = REFUSER.environment_problems({"CARGO_HOME": str(config.parent)}, cargo_dirs=[tree])
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn(str(config), problems[0])
+
+    def test_cargo_config_quoted_keys_and_conservative_fallback(self):
+        config = self.write("repo/.cargo/config.toml", b"")
+        for content in ('["build"]\n"rustc-wrapper" = "shim"\n',
+                        '"build"."rustc" = "shim"\n',
+                        'build = { rustc-workspace-wrapper = "shim" }\n',
+                        '[build.rustc-wrapper]\n'):
+            with self.subTest(content=content):
+                config.write_text(content)
+                if REFUSER.tomllib is not None:
+                    self.assertTrue(self.problems({}))
+                with patch.object(REFUSER, "tomllib", None):
+                    try:
+                        problems = self.problems({})
+                    except REFUSER.RefuserError as error:
+                        self.assertIn(str(config), str(error))
+                    else:
+                        self.assertTrue(problems)
+
     def test_check_environment_cli(self):
         start = self.root / "work"
         start.mkdir()
