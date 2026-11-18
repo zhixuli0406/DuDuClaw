@@ -347,6 +347,78 @@ class RefuserTests(unittest.TestCase):
         with self.assertRaisesRegex(REFUSER.RefuserError, re.escape(str(config))):
             self.problems({})
 
+    def test_cargo_config_includes_are_refused(self):
+        config = self.write("repo/.cargo/config.toml", b"")
+        parsers = (REFUSER.tomllib, None) if REFUSER.tomllib is not None else (None,)
+        for parser in parsers:
+            for value in ('"extra.toml"', '["one.toml", "two.toml"]', 'false', '42'):
+                with self.subTest(parser=parser, value=value), patch.object(REFUSER, "tomllib", parser):
+                    config.write_text(f"include = {value}\n")
+                    problems = self.problems({})
+                    self.assertTrue(problems)
+                    self.assertIn(str(config), problems[0])
+                    self.assertIn("include is not allowed in a release environment", problems[0])
+
+    @unittest.skipIf(REFUSER.tomllib is None, "decoded TOML requires Python 3.11+")
+    def test_cargo_config_decoded_cfg_in_keys_and_values_is_refused(self):
+        config = self.write("repo/.cargo/config.toml", b"")
+        escaped = r"duduclaw_\u0074est_root"
+        for content in (f'[build]\nrustflags = ["--cfg", "{escaped}"]\n',
+                        f'[build]\nrustflags = [\n"--cfg",\n"{escaped}",\n]\n',
+                        f'[alias]\n"{escaped}" = "check"\n',
+                        f'[alias]\n"{escaped}" = {{ nested = ["check"] }}\n',
+                        f'[alias]\nnested = {{ values = ["{escaped}"] }}\n',
+                        '[build]\nrustflags = ["--cfg", """duduclaw_\\\n  test_root"""]\n'):
+            with self.subTest(content=content):
+                config.write_text(content)
+                self.assertNotIn(REFUSER.TEST_ROOT_CFG.encode(), config.read_bytes())
+                problems = self.problems({})
+                self.assertTrue(problems)
+                self.assertIn(str(config), problems[0])
+                self.assertIn(REFUSER.TEST_ROOT_CFG, problems[0])
+
+    def test_cargo_config_fallback_refuses_unsafe_decoding(self):
+        config = self.write("repo/.cargo/config.toml", b"")
+        with patch.object(REFUSER, "tomllib", None):
+            for content in ('# \\u0074\n', '# \\U00000074\n', '# """\n', "# '''\n",
+                            '[alias]\ncheck = """check"""\n'):
+                with self.subTest(content=content):
+                    config.write_text(content)
+                    with self.assertRaisesRegex(REFUSER.RefuserError, re.escape(str(config))):
+                        self.problems({})
+
+    def test_cargo_config_env_names_are_refused(self):
+        config = self.write("repo/.cargo/config.toml", b"")
+        names = (*REFUSER.RELEASE_ENV_VARIABLES, 'CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS',
+                 'CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTC',
+                 'CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTC_WRAPPER',
+                 'CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTC_WORKSPACE_WRAPPER')
+        parsers = (REFUSER.tomllib, None) if REFUSER.tomllib is not None else (None,)
+        for parser in parsers:
+            for name in names:
+                for content in (f'[env]\n{name} = "value"\n', f'env.{name} = "value"\n'):
+                    with self.subTest(parser=parser, content=content), patch.object(REFUSER, "tomllib", parser):
+                        config.write_text(content)
+                        problems = self.problems({})
+                        self.assertTrue(problems)
+                        self.assertIn(str(config), problems[0])
+                        self.assertIn(name, problems[0])
+
+    def test_cargo_config_legitimate_release_settings_are_accepted(self):
+        config = self.write("repo/.cargo/config.toml", b"")
+        parsers = (REFUSER.tomllib, None) if REFUSER.tomllib is not None else (None,)
+        for parser in parsers:
+            for content in ((ROOT / ".cargo/config.toml").read_text(),
+                            '[env]\nPYO3_PYTHON = "/usr/bin/python3"\n',
+                            '[target.x86_64-unknown-linux-gnu]\nlinker = "x"\n'
+                            'rustflags = ["-C", "target-cpu=x86-64-v2"]\n',
+                            '[net]\noffline = true\n[profile.release]\nopt-level = 3\n'
+                            '[alias]\nb = "build"\n[registries.internal]\nindex = "https://example.com"\n'
+                            '[source.crates-io]\nreplace-with = "internal"\n'):
+                with self.subTest(parser=parser, content=content), patch.object(REFUSER, "tomllib", parser):
+                    config.write_text(content)
+                    self.assertEqual(self.problems({}), [])
+
     def test_cargo_rustc_overrides_in_parents_and_cargo_home(self):
         tree = self.root / "parent/repo/crate"
         tree.mkdir(parents=True)

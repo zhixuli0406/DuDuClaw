@@ -8,6 +8,14 @@ that file at run time (exactly one definition, or it refuses to run, except that
 source predating the test-licence issuer needs no scan), so the Rust constant stays
 its only copy. The check is static: nothing is executed or extracted.
 
+Scope
+-----
+This check stops a test-licence build from being shipped by mistake or through
+stray or unknown configuration on the release machine. It is not a defence
+against someone who controls that machine or toolchain: they could alter the
+compiler, this script or the sources. The signed-source and review process
+covers that threat.
+
   python3 -I -B scripts/refuse-test-license-build.py [--marker-file F] PATH...
       A PATH ending in .tar.gz, .tgz, .tar or .zip is an archive; anything else is a
       raw binary and is scanned whole. In an archive every regular member whose base
@@ -63,6 +71,9 @@ TARGET_RUSTFLAGS = re.compile(r"CARGO_TARGET_[A-Za-z0-9_]+_RUSTFLAGS")
 # Anything that replaces or wraps rustc could add the cfg out of sight.
 RUSTC_VARIABLES = ("RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "RUSTC",
                    "CARGO_BUILD_RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_RUSTC")
+RELEASE_ENV_VARIABLES = (BOOTSTRAP_TEST_KEY_VARIABLE, TEST_LICENSE_ISSUER_VARIABLE,
+                         *(name for name, _ in RUSTFLAGS_VARIABLES), *RUSTC_VARIABLES)
+TARGET_RUSTC = re.compile(r"CARGO_TARGET_[A-Za-z0-9_]+_RUSTC.*")
 CARGO_CONFIG_NAMES = ("config.toml", "config")
 RUSTC_CONFIG_KEYS = ("rustc-wrapper", "rustc-workspace-wrapper", "rustc")
 # The one definition in license_runtime.rs (also parsed by container/Dockerfile.server).
@@ -264,23 +275,69 @@ def cargo_config_files(environment, cargo_dirs=None, cargo_home=None):
     return [directory / name for directory in directories for name in CARGO_CONFIG_NAMES]
 
 
-def cargo_rustc_settings(data, path):
-    """Return rustc overrides; an unreadable/ambiguous configuration fails closed."""
+def release_env_name(name):
+    return name in RELEASE_ENV_VARIABLES or TARGET_RUSTFLAGS.fullmatch(name) or TARGET_RUSTC.fullmatch(name)
+
+
+def decoded_strings(value):
+    """Yield every decoded string, including table keys."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield from decoded_strings(key)
+            yield from decoded_strings(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from decoded_strings(item)
+
+
+def cargo_config_problems(data, path):
+    """Return unsafe settings; an unreadable/ambiguous configuration fails closed."""
+    problems = []
+    if TEST_ROOT_CFG.encode("ascii") in data:
+        problems.append(f"{path} mentions {TEST_ROOT_CFG}: refusing a production build or package")
+
+    def refuse_key(key):
+        if key[0] == "include":
+            problems.append(f"{path}: include is not allowed in a release environment")
+        elif len(key) >= 2 and key[0] == "build" and key[1] in RUSTC_CONFIG_KEYS:
+            problems.append(f"{path} sets build.{key[1]}: release builds use the toolchain's own rustc; "
+                            "refusing a production build or package")
+        elif len(key) >= 2 and key[0] == "env" and release_env_name(key[1]):
+            problems.append(f"{path} sets env.{key[1]}: not allowed in a release environment")
+
     try:
         text = data.decode("utf-8")
         if tomllib is not None:
-            build = tomllib.loads(text).get("build", {})
+            document = tomllib.loads(text)
+            if "include" in document:
+                refuse_key(("include",))
+            if (any(TEST_ROOT_CFG in value for value in decoded_strings(document))
+                    and TEST_ROOT_CFG.encode("ascii") not in data):
+                problems.append(f"{path} mentions decoded {TEST_ROOT_CFG}: refusing a production build or package")
+            build = document.get("build", {})
             if not isinstance(build, dict):
                 raise ValueError("build must be a table")
-            return [key for key in RUSTC_CONFIG_KEYS if key in build]
+            for key in RUSTC_CONFIG_KEYS:
+                if key in build:
+                    refuse_key(("build", key))
+            env = document.get("env", {})
+            if not isinstance(env, dict):
+                raise ValueError("env must be a table")
+            for name in env:
+                refuse_key(("env", name))
+            return problems
 
         # This is deliberately a small subset, not a replacement TOML parser.
         # Quoted keys, escapes, inline tables and multiline values are ambiguous
         # here and require Python 3.11+ rather than risking a missed override.
+        if re.search(r"\\[uU]", text) or '"""' in text or "'''" in text:
+            raise ValueError("cannot safely decode Cargo configuration without tomllib (use Python 3.11+)")
         key_pattern = r"[A-Za-z0-9_-]+(?:\s*\.\s*[A-Za-z0-9_-]+)*"
         string_pattern = r'''(?:"[^"\\\r\n]*"|'[^'\r\n]*')'''
         value_pattern = rf"(?:{string_pattern}|true|false|[+-]?(?:0|[1-9][0-9]*)|\[\s*(?:{string_pattern}\s*,\s*)*(?:{string_pattern}\s*)?\])"
-        table, settings, seen, tables = (), [], set(), set()
+        table, seen, tables = (), set(), set()
         for line in text.splitlines():
             if not line.strip() or line.lstrip().startswith("#"):
                 continue
@@ -290,8 +347,7 @@ def cargo_rustc_settings(data, path):
                 if table in tables or any(table[:len(key)] == key for key in seen):
                     raise ValueError("duplicate or conflicting table")
                 tables.add(table)
-                if len(table) >= 2 and table[0] == "build" and table[1] in RUSTC_CONFIG_KEYS:
-                    settings.append(table[1])
+                refuse_key(table)
                 continue
             setting = re.fullmatch(rf"\s*({key_pattern})\s*=\s*{value_pattern}\s*(?:#.*)?", line)
             if setting is None:
@@ -301,9 +357,8 @@ def cargo_rustc_settings(data, path):
                     or any(other[:len(key)] == key for other in tables)):
                 raise ValueError("duplicate or conflicting key")
             seen.add(key)
-            if len(key) >= 2 and key[0] == "build" and key[1] in RUSTC_CONFIG_KEYS:
-                settings.append(key[1])
-        return settings
+            refuse_key(key)
+        return problems
     except ValueError as error:
         raise RefuserError(f"cannot parse Cargo configuration {path}: {error}") from error
 
@@ -311,9 +366,14 @@ def cargo_rustc_settings(data, path):
 def environment_problems(environment, target=None, cargo_dirs=None, cargo_home=None):
     """Every test-root build setting in `environment` and the applicable Cargo configuration."""
     problems = []
-    for variable in (BOOTSTRAP_TEST_KEY_VARIABLE, TEST_LICENSE_ISSUER_VARIABLE):
+    for variable in (*RELEASE_ENV_VARIABLES,
+                     *sorted(name for name in environment if TARGET_RUSTC.fullmatch(name))):
+        if variable in dict(RUSTFLAGS_VARIABLES):
+            continue
         if variable in environment:
-            problems.append(f"{variable} is set: refusing a production build or package")
+            reason = ("release builds use the toolchain's own rustc; "
+                      if variable in RUSTC_VARIABLES or TARGET_RUSTC.fullmatch(variable) else "")
+            problems.append(f"{variable} is set: {reason}refusing a production build or package")
     if target is None:
         target_variables = sorted(name for name in environment if TARGET_RUSTFLAGS.fullmatch(name))
     else:
@@ -322,10 +382,6 @@ def environment_problems(environment, target=None, cargo_dirs=None, cargo_home=N
         value = environment.get(variable)
         if value is not None and enables_test_root(rustflag_tokens(value, separator)):
             problems.append(f"{variable} enables --cfg {TEST_ROOT_CFG}: refusing a production build or package")
-    for variable in RUSTC_VARIABLES:
-        if variable in environment:
-            problems.append(f"{variable} is set: release builds use the toolchain's own rustc; "
-                            "refusing a production build or package")
     for path in cargo_config_files(environment, cargo_dirs, cargo_home):
         try:
             data = path.read_bytes()
@@ -333,11 +389,7 @@ def environment_problems(environment, target=None, cargo_dirs=None, cargo_home=N
             continue
         except OSError as error:
             raise RefuserError(f"cannot read Cargo configuration {path}: {error.strerror or error}") from error
-        if TEST_ROOT_CFG.encode("ascii") in data:
-            problems.append(f"{path} mentions {TEST_ROOT_CFG}: refusing a production build or package")
-        for key in cargo_rustc_settings(data, path):
-            problems.append(f"{path} sets build.{key}: release builds use the toolchain's own rustc; "
-                            "refusing a production build or package")
+        problems.extend(cargo_config_problems(data, path))
     return problems
 
 
