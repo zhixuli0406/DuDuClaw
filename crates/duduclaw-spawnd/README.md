@@ -1011,7 +1011,14 @@ root:root 0600: temp file, fsync, rename, directory fsync); `entitlement.rs`:
   another generation keeps, per record, only the profiles the new signed
   policy still has, drops records left empty, drops a `max_turns` that no
   longer narrows every signed step range validly, is stamped with the new
-  generation and written atomically, then validated as usual. A failed write
+  generation and written atomically, then validated as usual. Before that
+  write it must pass the same check as `Entitle` (production validation, 64
+  KiB projection): when the new policy leaves less room, trailing records
+  (file order) are dropped one at a time until it fits — those employees are
+  not entitled (their runs are refused) until re-entitled, so an update that
+  would do this should be avoided by keeping the signed runtime list small —
+  and any other failure, or an empty list that still does not fit, refuses
+  with nothing written. A failed write
   refuses the publication (fail closed). Unreadable content, another version
   or unknown fields are refused as before, never migrated. The gateway's
   start-up reconcile re-sends every live employee's entitlement afterwards.

@@ -439,6 +439,29 @@ fn entitle_refuses_unknown_pending_and_disabled_employees_without_writing(){
     assert_eq!(fx.entitlements.writes,0,"no refusal writes anything");
 }
 #[test]
+fn entitle_refuses_when_the_registry_disagrees_with_a_ready_journal_entry(){
+    // Journal Ready, registry row Tombstone.
+    let mut fx=Fx::portable();
+    let receipt=allocate(&mut fx,1,"sales");
+    assert_eq!(fx.account(receipt.employee).uid,receipt.uid,"the happy-path fixture carries a matching Ready row");
+    fx.registry.retire(receipt.employee).unwrap();
+    let before=fx.entitlements.publication.clone();
+    assert_eq!(fx.handle(&entitle_request(1,"sales",&[1])).unwrap_err(),wire::ErrorCode::NotAllocated,"tombstone");
+    assert_eq!((fx.entitlements.writes,&fx.entitlements.publication),(0,&before));
+    // Journal Ready, registry Ready row with another UID.
+    let mut fx=Fx::portable();
+    let receipt=allocate(&mut fx,1,"sales");
+    let mut registry=fx.registry.registry().clone();
+    let row=registry.employees.iter_mut().find(|a|a.employee==receipt.employee).unwrap();
+    row.uid+=1;row.gid+=1;
+    fx.registry=Box::new(FakeRegistry(registry));
+    assert_eq!(fx.handle(&entitle_request(1,"sales",&[1])).unwrap_err(),wire::ErrorCode::NotAllocated,"other uid");
+    // Journal Ready, no registry row at all.
+    fx.registry=Box::new(FakeRegistry(Registry::default()));
+    assert_eq!(fx.handle(&entitle_request(1,"sales",&[1])).unwrap_err(),wire::ErrorCode::NotAllocated,"missing");
+    assert_eq!(fx.entitlements.writes,0,"no refusal writes anything");
+}
+#[test]
 fn older_schemas_cannot_entitle(){
     let mut fx=Fx::portable();
     allocate(&mut fx,1,"sales");

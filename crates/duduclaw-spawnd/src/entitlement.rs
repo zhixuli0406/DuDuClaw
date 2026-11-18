@@ -17,6 +17,9 @@
 //!   generation keeps, per record, only the profiles the new signed policy
 //!   still has; empty records are dropped, a `max_turns` that no longer
 //!   narrows every signed range validly is dropped, the generation stamped.
+//!   The result must pass the same in-force check as `entitle` before it is
+//!   written; if only capacity fails, trailing records (file order) are
+//!   dropped one at a time until it passes (`fit`); otherwise it refuses.
 use std::io;
 use duduclaw_isolation::{egress::ProfileId, ids::{EmployeeId, Sha256Digest}};
 use duduclaw_migration::allocation::Entitlement;
@@ -153,12 +156,34 @@ pub fn rolled_over(host: &HostPublication, generation: Sha256Digest, runtimes: &
     HostPublication { version: host.version, generation, entitlements }
 }
 
+/// The fit rule of a rollover: the candidate must pass [`in_force`] (the
+/// check `entitle` runs) before it is written. While it fails only on
+/// capacity, the LAST record (file order) is dropped, one at a time; the kept
+/// records are a prefix of the candidate. Any other failure, or an empty
+/// candidate that still does not fit, refuses. Returns how many were dropped.
+fn fit(next: &mut HostPublication, runtimes: &[RuntimeRecord]) -> Result<usize, Refusal> {
+    let mut dropped = 0;
+    loop {
+        match in_force(next.generation, runtimes, &next.entitlements) {
+            Ok(()) => return Ok(dropped),
+            Err(Refusal::Capacity) if !next.entitlements.is_empty() => { next.entitlements.pop(); dropped += 1; },
+            Err(refusal) => return Err(refusal),
+        }
+    }
+}
+
 /// Roll `host` over to `generation` and write it. Only a version-1
 /// publication is migrated; any failure refuses (the caller fails closed).
+/// The candidate is fitted first ([`fit`]); dropped employees are simply not
+/// entitled until the gateway re-sends their `Entitle`.
 pub fn roll_over(store: &mut dyn Entitlements, host: &HostPublication, generation: Sha256Digest, runtimes: &[RuntimeRecord])
     -> Result<HostPublication, Refusal> {
     if host.version != 1 { return Err(Refusal::Unavailable); }
-    let next = rolled_over(host, generation, runtimes);
+    let mut next = rolled_over(host, generation, runtimes);
+    let dropped = fit(&mut next, runtimes)?;
+    if dropped > 0 {
+        eprintln!("duduclaw-spawnd: entitlement rollover dropped {dropped} trailing record(s) that no longer fit the publication");
+    }
     store.write(host, &next)?;
     read_back(store, &next)?;
     Ok(next)
@@ -403,5 +428,81 @@ mod tests {
         // Unknown fields are structural garbage: refused by the strict reader, never migrated.
         let value = serde_json::json!({"version": 1, "generation": Sha256Digest([8; 32]), "entitlements": [], "next": true});
         assert!(serde_json::from_value::<HostPublication>(value).is_err());
+    }
+
+    /// A valid signed runtime made large by one 4000-byte fixed argument.
+    fn fat(byte: u8) -> RuntimeRecord {
+        let mut record = runtime(byte, RuntimeKind::Codex);
+        record.fixed_args = vec![duduclaw_isolation::bounded::Text::new("a".repeat(4000)).unwrap()];
+        record
+    }
+    /// The bytes one record adds to the projection's list (with its separator).
+    fn cost(record: &EntitlementRecord) -> usize { serde_json::to_vec(record).unwrap().len() + 1 }
+
+    #[test]
+    fn rollover_drops_trailing_records_until_the_larger_policy_fits() {
+        // The old generation's projection is full: the next Entitle was refused.
+        let mut memory = store();
+        let mut index = 0u16;
+        let refused = loop {
+            match entitle(&mut memory, employee(index), &wanted(&[1], None)) {
+                Ok(_) => index += 1,
+                Err(refusal) => break refusal,
+            }
+            assert!(index < 2000, "the 64 KiB projection must fill up");
+        };
+        assert_eq!(refused, Refusal::Capacity);
+        let old = memory.publication.entitlements.clone();
+        // The slack left is below the cost of the refused record.
+        let slack_bound = cost(&EntitlementRecord { employee: employee(index), profiles: vec![profile(1)], max_turns: None });
+        let host = HostPublication { version: 1, generation: Sha256Digest([8; 32]), entitlements: old.clone() };
+        // The new signed runtime list is larger (real serialized size, with its separator).
+        let added = serde_json::to_vec(&fat(10)).unwrap().len() + 1;
+        assert!(added > 2 * cost(&old[0]), "the new policy leaves room for fewer records");
+        memory.publication = host.clone();
+        memory.runtimes.push(fat(10));
+        memory.writes = 0;
+        let (generation, runtimes) = (memory.generation, memory.runtimes.clone());
+        let next = roll_over(&mut memory, &host, generation, &runtimes).unwrap();
+        let kept = next.entitlements.len();
+        assert!(kept > 0 && kept < old.len(), "trailing records dropped, not all");
+        assert_eq!(next.entitlements[..], old[..kept], "the kept records are a prefix of the old order");
+        // Enough was dropped to make room for the new runtime ...
+        let freed: usize = old[kept..].iter().map(cost).sum();
+        assert!(freed + slack_bound > added);
+        // ... and no more: the first dropped record would not fit.
+        let mut more = next.entitlements.clone();
+        more.push(old[kept].clone());
+        assert_eq!(in_force(generation, &runtimes, &more), Err(Refusal::Capacity));
+        assert_eq!(next.generation, generation);
+        assert_eq!((memory.writes, &memory.publication), (1, &next));
+        assert!(loads(&memory), "the fitted publication reloads");
+    }
+
+    #[test]
+    fn rollover_that_cannot_be_in_force_is_refused_and_writes_nothing() {
+        // Even the empty candidate exceeds the projection cap: refused.
+        let mut memory = store();
+        entitle(&mut memory, employee(1), &wanted(&[1], None)).unwrap();
+        let host = HostPublication { version: 1, generation: Sha256Digest([8; 32]), entitlements: memory.publication.entitlements.clone() };
+        memory.publication = host.clone();
+        memory.writes = 0;
+        let mut byte = 10u8;
+        while serde_json::to_vec(&projection(memory.generation, &memory.runtimes, &[])).unwrap().len() as u64 <= crate::host_state::MAX_BYTES {
+            memory.runtimes.push(fat(byte));
+            byte += 1;
+        }
+        assert!(memory.runtimes.len() <= 128, "a valid signed list, only too large");
+        let (generation, runtimes) = (memory.generation, memory.runtimes.clone());
+        assert_eq!(roll_over(&mut memory, &host, generation, &runtimes).unwrap_err(), Refusal::Capacity);
+        assert_eq!((memory.writes, &memory.publication), (0, &host), "nothing written");
+        // A failure other than capacity (a duplicated employee) refuses without dropping.
+        let mut memory = store();
+        let record = EntitlementRecord { employee: employee(1), profiles: vec![profile(1)], max_turns: None };
+        let host = HostPublication { version: 1, generation: Sha256Digest([8; 32]), entitlements: vec![record.clone(), record] };
+        memory.publication = host.clone();
+        let (generation, runtimes) = (memory.generation, memory.runtimes.clone());
+        assert_eq!(roll_over(&mut memory, &host, generation, &runtimes).unwrap_err(), Refusal::Unavailable);
+        assert_eq!((memory.writes, &memory.publication), (0, &host), "nothing written");
     }
 }

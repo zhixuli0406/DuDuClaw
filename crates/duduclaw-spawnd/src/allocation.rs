@@ -172,6 +172,9 @@ impl Allocator {
     /// R8d A1–A4, A6: `Entitle` of the item's employee. Only an entry in the
     /// Ready state (not disabled) is entitled; the reply is the stored
     /// receipt plus what is now in force. Never creates or changes an entry.
+    /// The root account registry must agree with the journal: a Ready row of
+    /// the same employee with the receipt's UID (and GID = UID); anything
+    /// else (missing, Reserved, Tombstone, another UID) is `NotAllocated`.
     fn entitle(&mut self,request:&Request,env:Env<'_>)->Answer<Reply>{
         let spec=request.validate().map_err(|_|wire::ErrorCode::InvalidRequest)?;
         let wanted=request.entitlement.as_ref().ok_or(wire::ErrorCode::InvalidRequest)?;
@@ -180,7 +183,12 @@ impl Allocator {
             Ok(_)=>return Err(wire::ErrorCode::NotAllocated),
             Err(error)=>return Err(code(error)),
         };
-        let employee=self.journal.entries[index].receipt.employee;
+        let receipt=&self.journal.entries[index].receipt;
+        let employee=receipt.employee;
+        match env.registry.registry().lookup(employee){
+            Ok(account) if account.employee==employee && account.uid==receipt.uid && account.gid==receipt.uid=>{},
+            _=>return Err(wire::ErrorCode::NotAllocated),
+        }
         let granted=crate::entitlement::entitle(env.entitlements,employee,wanted).map_err(|refusal|self.entitlement_code(refusal))?;
         let mut reply=stored(&self.journal.entries[index]);
         reply.entitlement=Some(granted);

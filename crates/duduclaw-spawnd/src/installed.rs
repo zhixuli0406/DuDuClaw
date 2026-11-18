@@ -554,7 +554,9 @@ impl InstalledPublication {
     /// R8d B, the one place a host publication is migrated: `load` (root's
     /// lifecycle thread only; never the gateway-side reader). A publication
     /// of another generation is rolled over to the pinned committed one
-    /// (`entitlement::rolled_over`) and written atomically before use; a
+    /// (`entitlement::rolled_over`), fitted to the same in-force check as
+    /// `Entitle` (trailing records dropped while only capacity fails;
+    /// anything else refuses) and written atomically before use; a
     /// failed write refuses (fail closed). Structural garbage never gets
     /// here: [`unchecked_bundle`] refuses it like [`bundle`] does.
     fn rolled_bundle(&mut self) -> Result<Bundle> {
