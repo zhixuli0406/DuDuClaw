@@ -1445,10 +1445,15 @@ reads nothing under `/run/duduclaw-isolation-evidence`.
   (`bridge::PENDING_*`: one probe ≤ 40 s plus one inconclusive re-run after
   60 s). The wait runs in the confirmation RPC's blocking task, holds no
   SQLite writer and only that proposal's lock, and stops at gateway shutdown
-  (`begin_migration_apply_shutdown`). Once shutdown begins no new step of an
-  apply starts (no stage, publish, read back or compensation; the item keeps
-  its journal state and the RPC answers `allocation_pending`), and shutdown
-  waits up to 40 s (`APPLY_SHUTDOWN_WAIT`) for a step in progress. Still pending: `apply_next` consumes the
+  (`begin_migration_apply_shutdown`). Once shutdown begins no new external
+  effect of the confirmation flow starts — no stage, publish, read back or
+  Disable, on approve, retry, the retry of a `Failed` item or reject —
+  because every adapter call is immediately preceded by a check of the
+  shutdown flag; the item keeps its state and the RPC answers retry-safe
+  (`allocation_pending`, or "服務正在關閉，請稍後重試" for reject). An effect
+  already started may still complete: shutdown waits for it only best effort
+  (up to 40 s, `APPLY_SHUTDOWN_WAIT`), and if the process exits first the
+  journal repeats it idempotently on the next apply. Still pending: `apply_next` consumes the
   intent, audits `apply_pending`, keeps the item `Applying` with no receipt and
   never compensates (no `Disable`); the RPC answers `allocation_pending` and
   "帳號安全驗證尚未完成，請稍後重試" (dashboard `migrationConfirm.allocationPending`).

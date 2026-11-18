@@ -15,11 +15,30 @@ pub(crate) const PENDING_RETRY_EVERY: Duration = Duration::from_secs(5);
 pub(crate) const PENDING_WAIT_TOTAL: Duration = Duration::from_secs(120);
 /// Granularity at which a sleeping wait notices shutdown.
 const PENDING_CANCEL_POLL: Duration = Duration::from_millis(200);
-/// Set once when the gateway starts shutting down; every pending wait stops
-/// at its next poll (the item stays `Applying`, nothing is compensated).
+/// Set once when the gateway starts shutting down
+/// (`begin_migration_apply_shutdown`); every pending wait stops at its next
+/// poll (the item stays `Applying`, nothing is compensated).
+///
+/// Guarantee (R7d round 3), for the confirmation flow (approve, retry, the
+/// retry of a `Failed` item, reject):
+/// (a) once this flag is set no new external effect (Allocate/stage,
+///     publish, read back, Disable) starts, because every adapter call is
+///     immediately preceded by a check of it, made after the proposal lock,
+///     the SQLite transaction and the intent commit, with nothing that can
+///     block in between (`ConfirmationStore::{apply_next_until, retry_until,
+///     reject_until}`, the Employee branch of `retry_failed`). A stopped call
+///     keeps the item's state and answers retry-safe.
+/// (b) an effect that had already started may still complete. The shutdown
+///     wait (`APPLY_SHUTDOWN_WAIT`, best effort, on the apply permits that
+///     approve / retry / reject hold) only gives it time to finish cleanly;
+///     it is not what enforces (a) and is not bounded by the adapter budget,
+///     which is cooperative.
+/// (c) if the process exits while an effect is in flight, its committed
+///     intent stays in the journal and the next apply / retry / reject
+///     repeats the same effect idempotently with the same binding.
 static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 pub(crate) fn begin_shutdown() { SHUTTING_DOWN.store(true, Ordering::SeqCst); }
-/// R7d round 2: read by the confirmation apply loop's step gate.
+/// R7d round 2/3: read by the confirmation flow's effect gate (see [`SHUTTING_DOWN`]).
 pub(crate) fn shutting_down() -> bool { SHUTTING_DOWN.load(Ordering::SeqCst) }
 
 /// The bounded retry of a stage that answered [`Error::Pending`].
