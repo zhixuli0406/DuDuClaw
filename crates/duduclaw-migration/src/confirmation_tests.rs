@@ -61,6 +61,54 @@ impl ProposalApplier for Adapter {
     fn disable_and_read_back(&mut self, item: &ConfirmationItem) -> Result<()> { self.effect(item, 3) }
 }
 
+/// R7d: a stage answering `Pending` (root allocation still verifying) keeps
+/// the item `Applying` with no receipt, no Failed and no compensation; the
+/// next `apply_next` re-runs the same stage and the apply resumes. One
+/// intent row per proposal throughout; `Pending` from a later step fails.
+#[test]
+fn pending_stage_stays_applying_without_compensation_and_resumes() {
+    #[derive(Default)]
+    struct Root { pending: usize, stages: usize, disables: usize, publish_pending: bool }
+    impl ProposalApplier for Root {
+        fn stage(&mut self, _: &ConfirmationItem) -> Result<()> {
+            self.stages += 1;
+            if self.pending > 0 { self.pending -= 1; return Err(ConfirmationError::Pending); }
+            Ok(())
+        }
+        fn publish(&mut self, _: &ConfirmationItem) -> Result<()> {
+            if self.publish_pending { Err(ConfirmationError::Pending) } else { Ok(()) }
+        }
+        fn read_back(&mut self, _: &ConfirmationItem) -> Result<()> { Ok(()) }
+        fn disable_and_read_back(&mut self, _: &ConfirmationItem) -> Result<()> { self.disables += 1; Ok(()) }
+    }
+    let status = |store: &ConfirmationStore, binding: &ProposalBinding|
+        store.list().unwrap().into_iter().find(|i| i.binding == *binding).unwrap().status;
+    let count = |store: &ConfirmationStore, sql: &str| store.conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
+    let mut store = store();
+    let item = stage(&mut store, 1, ConfirmationCategory::Employee);
+    approve(&mut store, &item);
+    let mut root = Root { pending: 2, ..Root::default() };
+    for attempt in 1..=2 {
+        assert!(matches!(store.apply_next(&item.binding, &mut root), Err(ConfirmationError::Pending)));
+        assert_eq!(status(&store, &item.binding), ConfirmationStatus::Applying);
+        assert_eq!((root.stages, root.disables), (attempt, 0), "no compensation while pending");
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM migration_apply"), 0, "no receipt for a pending stage");
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM migration_effect_intents"), 0, "the intent is consumed");
+    }
+    assert_eq!(count(&store, "SELECT COUNT(*) FROM migration_confirmation_audit WHERE event='apply_pending'"), 2);
+    for _ in 0..3 { store.apply_next(&item.binding, &mut root).unwrap(); }
+    assert_eq!(status(&store, &item.binding), ConfirmationStatus::Applied);
+    assert_eq!((root.stages, root.disables), (3, 0), "the same stage resumed once more, nothing compensated");
+    assert_eq!(count(&store, "SELECT COUNT(*) FROM migration_apply"), 1);
+    // Only the stage may be pending: a later step reporting it fails and compensates.
+    let other = stage(&mut store, 2, ConfirmationCategory::Employee);
+    approve(&mut store, &other);
+    let mut late = Root { publish_pending: true, ..Root::default() };
+    store.apply_next(&other.binding, &mut late).unwrap();
+    assert!(matches!(store.apply_next(&other.binding, &mut late), Err(ConfirmationError::Apply)));
+    assert_eq!((status(&store, &other.binding), late.disables), (ConfirmationStatus::Failed, 1));
+}
+
 #[test]
 fn planted_admin_mcp_and_employees_remain_inert_until_approved() {
     let mut store = store(); let mut adapter = Adapter::default();

@@ -1,8 +1,67 @@
 //! One bounded bridge for every migration authority async adapter. Call only from
 //! the blocking pool, after the confirmation intent transaction has committed.
 use super::{Error, Result};
-use std::{future::Future, time::{Duration, Instant}};
+use std::{future::Future, sync::{Arc, atomic::{AtomicBool, Ordering}}, time::{Duration, Instant}};
 const ADAPTER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// R7d: the first allocation of an employee on a host with sshd answers
+/// "pending" while spawnd's one-shot probe proves the live sshd refuses the
+/// new account (≤ ~40 s), and spawnd's worker retries an inconclusive probe
+/// once after 60 s; 120 s covers one probe plus that one retry. Each attempt
+/// is its own [`operation`] (30 s budget); the wait between attempts holds no
+/// adapter deadline, no SQLite writer and no lock but the proposal's own.
+pub(crate) const PENDING_FIRST_RETRY: Duration = Duration::from_secs(3);
+pub(crate) const PENDING_RETRY_EVERY: Duration = Duration::from_secs(5);
+pub(crate) const PENDING_WAIT_TOTAL: Duration = Duration::from_secs(120);
+/// Granularity at which a sleeping wait notices shutdown.
+const PENDING_CANCEL_POLL: Duration = Duration::from_millis(200);
+/// Set once when the gateway starts shutting down; every pending wait stops
+/// at its next poll (the item stays `Applying`, nothing is compensated).
+static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+pub(crate) fn begin_shutdown() { SHUTTING_DOWN.store(true, Ordering::SeqCst); }
+
+/// The bounded retry of a stage that answered [`Error::Pending`].
+#[derive(Clone)]
+pub(crate) struct PendingWait { first: Duration, every: Duration, total: Duration, cancel: Option<Arc<AtomicBool>> }
+impl Default for PendingWait {
+    fn default() -> Self { Self { first: PENDING_FIRST_RETRY, every: PENDING_RETRY_EVERY, total: PENDING_WAIT_TOTAL, cancel: None } }
+}
+impl PendingWait {
+    /// Tests: a shorter schedule and a private cancel flag.
+    #[cfg(test)]
+    pub(crate) fn for_test(first: Duration, every: Duration, total: Duration, cancel: Arc<AtomicBool>) -> Self {
+        Self { first, every, total, cancel: Some(cancel) }
+    }
+    fn cancelled(&self) -> bool {
+        SHUTTING_DOWN.load(Ordering::SeqCst) || self.cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst))
+    }
+    /// Runs `attempt` again while it answers `Pending`: after `first`, then
+    /// every `every`, while the next attempt still starts within `total`.
+    /// Still pending at the end, or cancelled: `Err(Pending)` (never another
+    /// error, so the caller never compensates). Any other answer is returned.
+    pub(crate) fn run<T>(&self, mut attempt: impl FnMut() -> Result<T>) -> Result<T> {
+        let started = Instant::now();
+        let mut delay = self.first;
+        loop {
+            match attempt() {
+                Err(Error::Pending) => {}
+                other => return other,
+            }
+            if started.elapsed() + delay > self.total || !self.sleep(delay) { return Err(Error::Pending); }
+            delay = self.every;
+        }
+    }
+    /// `false` when cancelled before `delay` elapsed.
+    fn sleep(&self, delay: Duration) -> bool {
+        let until = Instant::now() + delay;
+        loop {
+            if self.cancelled() { return false; }
+            let now = Instant::now();
+            if now >= until { return true; }
+            std::thread::sleep((until - now).min(PENDING_CANCEL_POLL));
+        }
+    }
+}
 
 /// The outer adapter boundary covers synchronous publication/compensation too,
 /// including filesystem work that runs before or after an async bridge call.

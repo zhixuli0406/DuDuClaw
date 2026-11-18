@@ -25,11 +25,15 @@ fn code(error:ErrorCode)->wire::ErrorCode{
 }
 /// R7c (F6): a registry allocation still waiting for the new account's SSH
 /// denial probe (pending or inconclusive: the reservation stays resumable)
-/// or refused by the pending-reservation cap is `NotReady` ("retry later");
-/// every other registry failure is `IsolationUnavailable`. A schema-1 reply
-/// carries no code at all (`Response::for_request`).
+/// is `Pending`; one refused by the pending-reservation cap is
+/// `PendingLimit` (both "retry the same request later"); every other
+/// registry failure is `IsolationUnavailable`. R7d: reply encoding only — a
+/// schema-2 reply carries both as `NotReady`, a schema-1 reply no code at
+/// all (`Response::for_request`).
 fn registry_code(error:io::Error)->wire::ErrorCode{
-    if crate::accounts::probe_unresolved(&error) || crate::registry::pending_limit(&error){wire::ErrorCode::NotReady}else{wire::ErrorCode::IsolationUnavailable}
+    if crate::accounts::probe_unresolved(&error){wire::ErrorCode::Pending}
+    else if crate::registry::pending_limit(&error){wire::ErrorCode::PendingLimit}
+    else{wire::ErrorCode::IsolationUnavailable}
 }
 /// Schema 1 (v1.80) predates principal bindings; schema 2 adds the optional
 /// immutable `principal_binding` per receipt; schema 3 adds the retire phases.

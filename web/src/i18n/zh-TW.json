@@ -10146,6 +10146,7 @@
   "migrationConfirm.title": "遷移確認",
   "migrationConfirm.description": "舊設定需重新確認後才會生效。請檢查每項內容；核准後仍需完成套用與驗證。",
   "migrationConfirm.loadFailed": "無法讀取最新狀態。請重新整理後再操作。",
+  "migrationConfirm.allocationPending": "帳號安全驗證尚未完成，請稍後重試",
   "migrationConfirm.refresh": "重新整理",
   "migrationConfirm.loading": "正在讀取…",
   "migrationConfirm.inactive": "目前沒有待處理的遷移。",

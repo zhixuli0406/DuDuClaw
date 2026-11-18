@@ -15,6 +15,7 @@ export function MigrationConfirmationsPage() {
   const generation = useRef(0);
   const [busy, setBusy] = useState(false);
   const [failed, setFailed] = useState(false);
+  const [allocationPending, setAllocationPending] = useState(false);
   const [password, setPassword] = useState('');
   const [code, setCode] = useState('');
   const [authFailed, setAuthFailed] = useState(false);
@@ -45,10 +46,12 @@ export function MigrationConfirmationsPage() {
     if (!ready || !data?.csrf_token || items.length === 0) return;
     if (action === 'approve' && items.length > 1 && items.some(item => !bulkEligible(item))) return;
     if (items.some(item => item.high_risk) && !data.mfa_enrolled) return;
-    setBusy(true); setFailed(false);
+    setBusy(true); setFailed(false); setAllocationPending(false);
     try {
-      await confirmationApi.decide(action, items, data.csrf_token);
-      // Readback, never the approval response, determines displayed state.
+      const result = await confirmationApi.decide(action, items, data.csrf_token);
+      // Readback, never the approval response, determines displayed state;
+      // the notice only explains why an item is still applying (R7d).
+      setAllocationPending(Boolean(result?.allocation_pending));
       await load();
     } catch { setData(null); setSelected([]); setFailed(true); }
     finally { setBusy(false); }
@@ -64,6 +67,7 @@ export function MigrationConfirmationsPage() {
   return <div className="mx-auto max-w-4xl space-y-5">
     <header><h1 className="text-2xl font-semibold">{t('title')}</h1><p className="mt-2 text-muted-foreground">{t('description')}</p></header>
     {failed && <p role="alert" className="rounded-lg border border-destructive p-4">{t('loadFailed')}</p>}
+    {allocationPending && !failed && <p role="status" className="rounded-lg border p-4">{t('allocationPending')}</p>}
     <button className={buttonClass} disabled={busy || connection !== 'authenticated'} onClick={() => void load()}>{t('refresh')}</button>
     {!data && !failed && <p role="status">{t('loading')}</p>}
     {data && <>

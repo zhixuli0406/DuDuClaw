@@ -10,6 +10,12 @@
 //!   (ReadBack of a Ready entry, S17). All three are omitted when `None`, so a
 //!   schema-1 reply serializes exactly as before. A schema-1 request is
 //!   always answered with schema-1 semantics.
+//! - Schema 3 (R7d): `Allocate` only, otherwise exactly schema 2. Its refusal
+//!   may also be [`ErrorCode::Pending`] (the new account's SSH denial probe
+//!   has not settled) or [`ErrorCode::PendingLimit`] (too many reservations
+//!   wait for theirs): both mean "send the SAME request again later". A
+//!   schema-2 reply carries either as `NotReady`; a schema-1 reply drops it.
+//!   A schema-3 request is only ever answered by a schema-3 reply.
 use duduclaw_isolation::{bounded::Text, capability::EmployeeBinding, ids::{EmployeeId, RequestId, Sha256Digest,
     EMPLOYEE_UID_MAX, EMPLOYEE_UID_MIN}, migration::*};
 use serde::{Deserialize, Serialize};
@@ -19,6 +25,9 @@ pub const SOCKET: &str = "/run/duduclaw-spawnd/allocation.sock";
 pub const MAX_BYTES: usize = 512 * 1024;
 /// The schema that carries `Retire` and the schema-2 response fields.
 pub const SCHEMA_V2: u16 = 2;
+/// The `Allocate` schema whose reply distinguishes the retryable pending
+/// answers (R7d). The gateway sends it for `Allocate` only.
+pub const SCHEMA_V3: u16 = 3;
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all="snake_case")]
 pub enum Action { Allocate, ReadBack, Disable, Retire }
@@ -47,6 +56,23 @@ pub enum ErrorCode {
     InvalidRequest,
     /// Includes the 4 s worker timeout (S5d); never a `NotFound`.
     IsolationUnavailable,
+    /// Schema 3 only (R7d): the reservation stays resumable while the new
+    /// account's SSH denial probe is pending or inconclusive; send the same
+    /// `Allocate` again later.
+    Pending,
+    /// Schema 3 only (R7d): the pending-reservation cap refused a new
+    /// reservation; send the same `Allocate` again later.
+    PendingLimit,
+}
+impl ErrorCode {
+    /// The code as a reply of `schema` carries it: schema 2 predates the two
+    /// pending codes and reads them as `NotReady` ("retry later").
+    pub fn for_schema(self, schema: u16) -> Self {
+        match self {
+            Self::Pending | Self::PendingLimit if schema != SCHEMA_V3 => Self::NotReady,
+            code => code,
+        }
+    }
 }
 /// Operation-id kinds (F6 §3.12 step 1). The byte values are part of every
 /// stored operation id: `Allocate` 0 and `Compensate` 1 equal the v1.80
@@ -97,13 +123,14 @@ pub struct Reply {
 impl Response {
     /// The wire reply for `request` (schema follows the request).
     pub fn for_request(request: &Request, result: Result<Reply, ErrorCode>) -> Self {
-        if request.schema != SCHEMA_V2 {
+        let schema = request.schema;
+        if !matches!(schema, SCHEMA_V2 | SCHEMA_V3) {
             return Self { schema: 1, nonce: request.nonce, receipt: result.ok().map(|r| r.receipt), error: None, phase: None, idle: None };
         }
         match result {
-            Ok(reply) => Self { schema: SCHEMA_V2, nonce: request.nonce, receipt: Some(reply.receipt), error: None,
+            Ok(reply) => Self { schema, nonce: request.nonce, receipt: Some(reply.receipt), error: None,
                 phase: Some(reply.phase), idle: reply.idle },
-            Err(code) => Self { schema: SCHEMA_V2, nonce: request.nonce, receipt: None, error: Some(code), phase: None, idle: None },
+            Err(code) => Self { schema, nonce: request.nonce, receipt: None, error: Some(code.for_schema(schema)), phase: None, idle: None },
         }
     }
 }
@@ -268,7 +295,9 @@ pub fn operation(binding: ProposalBinding, kind: OperationKind) -> RequestId {
 }
 impl Request {
     fn envelope(&self) -> Result<(), Error> {
-        if !matches!(self.schema, 1 | SCHEMA_V2) || self.nonce.0 == [0; 16] { return Err(Error::Invalid); }
+        if !matches!(self.schema, 1 | SCHEMA_V2 | SCHEMA_V3) || self.nonce.0 == [0; 16] { return Err(Error::Invalid); }
+        // Schema 3 exists for `Allocate` only (R7d).
+        if self.schema == SCHEMA_V3 && self.action != Action::Allocate { return Err(Error::Invalid); }
         Ok(())
     }
     /// Allocate / ReadBack / Disable of an Employee item. A `Retire` request
@@ -305,14 +334,18 @@ pub enum Answer {
     Reply(Reply),
     Refused(ErrorCode),
 }
-/// Client-side validation of a schema-2 response to `request`: nonce, the
+/// Client-side validation of a schema-2 or schema-3 response to `request`:
+/// the same schema as the request (an older reply is refused), nonce, the
 /// error/receipt exclusivity, and a receipt that matches what was asked
 /// (Retire: the target allocation, label, employee, UID; phase Retired).
+/// The two pending codes are valid only in a schema-3 (`Allocate`) reply.
 pub fn check_response(request: &Request, response: Response) -> Result<Answer, Error> {
-    if request.schema != SCHEMA_V2 || response.schema != SCHEMA_V2 || response.nonce != request.nonce {
+    if !matches!(request.schema, SCHEMA_V2 | SCHEMA_V3) || response.schema != request.schema || response.nonce != request.nonce {
         return Err(Error::Authentication);
     }
+    if request.schema == SCHEMA_V3 && request.action != Action::Allocate { return Err(Error::Authentication); }
     match (response.error, response.receipt, response.phase) {
+        (Some(ErrorCode::Pending | ErrorCode::PendingLimit), _, _) if request.schema != SCHEMA_V3 => Err(Error::Authentication),
         (Some(code), None, None) if response.idle.is_none() => return Ok(Answer::Refused(code)),
         (None, Some(receipt), Some(phase)) => {
             if receipt.employee.0 == [0; 16] || (receipt.uid < 1000 && !(receipt.disabled && receipt.uid == 0)) {

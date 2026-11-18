@@ -5,6 +5,12 @@ use duduclaw_migration::{confirmation::{ApprovalSession, ConfirmationStore},
 use super::migration_authority::{GatewayAuthority, GatewayAccountReadback, LiveAuthority, MigrationAuthorityBackend};
 use super::migration_authority::employee::EmployeeAuthority;
 
+/// R7d: an employee allocation whose SSH refusal spawnd has not verified
+/// within the bounded wait. The item stays `applying` (nothing compensated);
+/// Retry resumes the same reservation (dashboard key
+/// `migrationConfirm.allocationPending`).
+pub(super) const ALLOCATION_PENDING: &str = "帳號安全驗證尚未完成，請稍後重試";
+
 pub(super) fn known_method(method: &str) -> bool {
     matches!(method, "migration.confirmations.list" | "migration.confirmations.step_up"
         | "migration.confirmations.approve" | "migration.confirmations.retry"
@@ -200,7 +206,7 @@ impl MethodHandler {
                 }
                 _ => return Err("不允許此遷移操作。"),
             }
-            let mut failed = 0;
+            let (mut failed, mut pending) = (0, 0);
             for binding in &input.bindings {
                 for _ in 0..3 {
                     // A role/epoch change during a long bulk operation stops the
@@ -216,9 +222,15 @@ impl MethodHandler {
                             break
                         }
                         Ok(_) => {},
+                        // R7d: still Applying and uncompensated; Retry resumes it.
+                        Err(duduclaw_migration::confirmation::ConfirmationError::Pending) => { pending += 1; break; },
                         Err(_) => { failed += 1; break; },
                     }
                 }
+            }
+            if pending > 0 {
+                return Ok(json!({ "readback_required": true, "failed": failed, "allocation_pending": pending,
+                    "message": ALLOCATION_PENDING }));
             }
             Ok(json!({ "readback_required": true, "failed": failed }))
         }).await;

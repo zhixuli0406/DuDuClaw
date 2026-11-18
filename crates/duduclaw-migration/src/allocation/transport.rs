@@ -65,14 +65,19 @@ pub fn request(request:&Request)->Result<Receipt,Error>{
         || receipt.disabled!=(request.action==Action::Disable){return invalid()}
     Ok(receipt)
 }
-/// Schema-2 exchange (F6l): the checked answer, a refusal code included.
-/// Any transport failure or missing/garbled reply is an `Err` (the caller
-/// reports `ROOT_UNAVAILABLE`, never `NotFound`, S5d).
+/// Schema-2 exchange (F6l), or the schema-3 `Allocate` (R7d): the checked
+/// answer, a refusal code included. Any transport failure or missing/garbled
+/// reply (an unknown refusal kind included) is an `Err` (the caller reports
+/// `ROOT_UNAVAILABLE`, never `NotFound`, S5d).
 pub fn exchange(request:&Request)->Result<Answer,Error>{
-    if request.schema!=SCHEMA_V2{return Err(Error::Invalid)}
+    check_response(request,round_trip(request)?)
+}
+/// The unchecked reply to a schema-2/3 request; callers must pass it through
+/// [`check_response`] ([`exchange`] does).
+pub fn round_trip(request:&Request)->Result<Response,Error>{
+    if !matches!(request.schema,SCHEMA_V2|SCHEMA_V3){return Err(Error::Invalid)}
     request.check()?;let fd=connect()?;
-    send(&fd,request)?;let response:Response=receive(&fd)?;
-    check_response(request,response)
+    send(&fd,request)?;receive(&fd)
 }
 /// Caller is the root daemon holding the registry lock. This function never
 /// accepts a socket path from a request or an environment variable.

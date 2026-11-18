@@ -18,6 +18,12 @@ pub enum ConfirmationError {
     /// started cannot be rejected; it stays where it was and `retry`
     /// resumes the same retire operation (UI: `RETIRE_FORWARD_ONLY`).
     #[error("retire is forward only")] ForwardOnly,
+    /// R7d: the stage effect is still pending at the root (an employee
+    /// allocation whose SSH refusal is not verified yet). `apply_next` keeps
+    /// the item `Applying` with no receipt and no compensation; the next
+    /// `apply_next` runs the same stage again. Any other step reporting it
+    /// is a failure.
+    #[error("proposal effect still pending")] Pending,
 }
 type Result<T> = std::result::Result<T, ConfirmationError>;
 const MAX_CONFIRMATIONS: u64 = 2048;
@@ -352,6 +358,14 @@ impl ConfirmationStore {
         };
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         effects::consume(&tx, &item, next, &intent)?;
+        if next == 0 && matches!(result, Err(ConfirmationError::Pending)) {
+            // R7d: attempted, still pending. No receipt (the step stays 0, so
+            // the next apply_next resumes the same stage with the same
+            // binding), not Failed, no compensation.
+            audit(&tx, &item, "apply_pending", None)?;
+            tx.commit()?;
+            return Err(ConfirmationError::Pending);
+        }
         if result.is_err() {
             item.transition(ConfirmationStatus::Failed).map_err(|_| ConfirmationError::Invalid)?;
             save(&tx, &item)?;

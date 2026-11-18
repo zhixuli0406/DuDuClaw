@@ -3745,6 +3745,9 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             } => {},
         }
         info!("Shutdown signal received, flushing state...");
+        // R7d: a migration apply waiting for a pending employee allocation
+        // stops at once (the item stays Applying, nothing is compensated).
+        crate::handlers::begin_migration_apply_shutdown();
         // sd_notify STOPPING=1 — best-effort, no-op off-systemd.
         let _ = crate::watchdog::notify_stopping();
         // Withdraw the LAN advertisement first so peers stop offering a

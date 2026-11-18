@@ -1425,6 +1425,33 @@ reads nothing under `/run/duduclaw-isolation-evidence`.
   be pending at once; a further new employee is refused (resource limit,
   `NotReady`, nothing reserved). Start-up `reconcile` still tombstones every
   `Reserved` row.
+- **Pending on the wire (R7d).** Allocation schema 3 (`Allocate` only;
+  `duduclaw_migration::allocation::SCHEMA_V3`) adds two refusal kinds:
+  `pending` (probe pending or inconclusive) and `pending_limit` (the cap).
+  spawnd's `registry_code` emits them; `Response::for_request` sends them
+  only in a schema-3 reply, as `NotReady` in a schema-2 reply and drops them
+  in schema 1 as before. `check_response` refuses a reply whose schema differs
+  from the request (an older reply to a schema-3 request included), a pending
+  kind in a schema-2 reply, and any schema-3 request but `Allocate`; an
+  unknown kind does not decode. Only the enumerated kind crosses the wire.
+  Gateway and spawnd come from one signed generation; an older spawnd drops a
+  schema-3 request (no reply), which the gateway treats as a hard failure.
+- **Gateway retry (R7d).** `EmployeeAuthority::stage` sends schema 3
+  (`employee::allocate_with`); `pending`/`pending_limit` become
+  `ConfirmationError::Pending`. `GatewayAuthority::stage` re-runs the whole
+  (re-validated) stage, each attempt its own 30 s adapter operation, after
+  3 s and then every 5 s while the next attempt starts within 120 s
+  (`bridge::PENDING_*`: one probe ≤ 40 s plus one inconclusive re-run after
+  60 s). The wait runs in the confirmation RPC's blocking task, holds no
+  SQLite writer and only that proposal's lock, and stops at gateway shutdown
+  (`begin_migration_apply_shutdown`). Still pending: `apply_next` consumes the
+  intent, audits `apply_pending`, keeps the item `Applying` with no receipt and
+  never compensates (no `Disable`); the RPC answers `allocation_pending` and
+  "帳號安全驗證尚未完成，請稍後重試" (dashboard `migrationConfirm.allocationPending`).
+  Retry runs the same stage with the same binding and spawnd resumes the
+  reservation. After spawnd's 10-minute deadline its tombstone refusal is
+  `isolation_unavailable`: the existing hard failure (Failed, compensation).
+  `NotReady` (host busy, start-up latch) on `Allocate` is still a hard failure.
 - **Unsupported hosts.** passwd/group NSS modules other than files/systemd
   (SSSD/LDAP, Google Compute Engine OS Login, `compat`, bracketed action
   clauses); sshd present without the ssh client, ssh-keygen or journalctl, or

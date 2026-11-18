@@ -26,11 +26,20 @@ export interface ConfirmationList {
 }
 export const proposalKey = (item: ConfirmationItem) => `${item.binding.operation_id.proposal_id.join('-')}:${item.binding.operation_id.revision}`;
 export const bulkEligible = (item: ConfirmationItem) => item.status === 'pending' && !item.high_risk && item.apply_available;
+/** Approve/retry apply in the same call; a first employee allocation may wait
+ * up to 120 s server-side for its SSH refusal check (R7d), plus the apply steps. */
+export const APPLY_TIMEOUT_MS = 240_000;
+/** `allocation_pending`: the employee's account check is not finished; the item stays applying and Retry resumes it. */
+export interface DecisionResult { readback_required?: boolean; failed?: number; allocation_pending?: number }
 export const confirmationApi = {
   list: () => client.call('migration.confirmations.list', {}) as Promise<ConfirmationList>,
   stepUp: (password: string, code: string) => client.call('migration.confirmations.step_up', { password, code }),
   rotateSecret: (binding: ProposalBinding, new_value: string, csrf_token: number[]) =>
     client.call('migration.confirmations.rotate_secret', { binding, new_value, csrf_token }),
-  decide: (action: 'approve' | 'retry' | 'reject', items: ConfirmationItem[], csrf_token: number[]) =>
-    client.call(`migration.confirmations.${action}`, { bindings: items.map(item => item.binding), csrf_token }),
+  decide: (action: 'approve' | 'retry' | 'reject', items: ConfirmationItem[], csrf_token: number[]) => {
+    const params = { bindings: items.map(item => item.binding), csrf_token };
+    return (action === 'reject'
+      ? client.call(`migration.confirmations.${action}`, params)
+      : client.call(`migration.confirmations.${action}`, params, false, APPLY_TIMEOUT_MS)) as Promise<DecisionResult>;
+  },
 };
