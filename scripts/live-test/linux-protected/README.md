@@ -163,6 +163,43 @@ Environment given to the driver: `DUDUCLAW_ISO_DATA` (service home), `DUDUCLAW_I
 * 6b may legitimately FAIL while spawnd keeps the UID/storage of a tombstoned Personal employee and refuses a new live allocation with the same label (A2 open item 1).
 * The sqlite stand-in proves binding/lifecycle/refusal behaviour, not a Google/Notion/GitHub/Odoo request path; those only count when their provider checks PASS.
 
+## 第一個員工回合的假模型端點
+
+`fake-model-endpoint/` 提供第一個隔離員工回合驗收用的固定回覆服務，文字固定為
+`DUDUCLAW-ACCEPTANCE-OK`，沒有工具呼叫；僅供驗收，驗收後必須刪除。
+容器以 HTTP 監聽 `0.0.0.0:$PORT`（預設 8080），HTTPS 由 Cloud Run 終止。
+`ENDPOINT_TOKEN` 啟動時必填，至少 32 字元；請使用隨機 ASCII token。
+唯一免認證路徑為 `GET /healthz`；完成請求須帶 Bearer token、
+`Content-Type: application/json`、`Content-Length`，JSON 物件最多 1 MiB，不接受 chunked。
+
+worker 的 `endpoint()` 在 base URL 後加上 `/chat/completions`
+（`crates/duduclaw-api-worker/src/vendor.rs:19–22`）；本服務只接受
+`POST /v1/chat/completions`，所以交給員工的 `providers.json` 如下。
+以 Cloud Run 的 HTTPS 服務網址替換 `<service-url>`（不含尾端斜線），
+以同一 token 替換 `<token>`；網址不可含 query、fragment 或使用者資訊。
+省略 `protocol` 即採預設 `ChatCompletions`，模型名稱不影響固定回覆。
+
+```json
+{
+  "providers": [{
+    "name": "acceptance-only",
+    "base_url": "<service-url>/v1",
+    "api_key": "<token>"
+  }]
+}
+```
+
+由維護者替換佔位符後部署與刪除（此處指令尚未實際部署驗證）：
+
+```sh
+gcloud run deploy <service> --source scripts/live-test/linux-protected/fake-model-endpoint --region asia-east1 --allow-unauthenticated --set-env-vars ENDPOINT_TOKEN=<token> --max-instances 1
+gcloud run services delete <service> --region asia-east1
+```
+
+本機測試：在 `fake-model-endpoint/` 執行 `python3 -m unittest -v`。
+服務僅記錄方法、去除 query 的路徑、狀態與請求／回覆本文位元組數，不保存本文，
+不記錄標頭或 token；每個連線的 socket timeout 為 15 秒。
+
 ## Legacy: `acceptance.sh` (superseded, kept for the record)
 
 > Targets the removed `container_root_key` credential backend. Do not use it to accept v1.81. The text below is the original description.
