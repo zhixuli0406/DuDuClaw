@@ -109,13 +109,9 @@ mod logic {
             _ => None,
         }
     }
-    /// 1..=65535 written as plain decimal digits without a leading zero.
-    pub(crate) fn port_number(text: &str) -> Option<u16> {
-        if text.is_empty() || text.len() > 5 || text.starts_with('0') || !text.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        text.parse::<u16>().ok()
-    }
+    /// 1..=65535 written as plain decimal digits without a leading zero (the
+    /// shared rule, also the `port` line's).
+    pub(crate) fn port_number(text: &str) -> Option<u16> { duduclaw_isolation::ssh_config::port_number(text) }
 
     /// uid of the single /etc/passwd row named `name`; `None` when absent,
     /// duplicated or malformed.
@@ -148,23 +144,13 @@ mod logic {
     }
 
     /// Stage `effective_config`: the same three settings accounts.rs
-    /// `ssh_effective_denied` requires (last occurrence wins, as there), and
-    /// the FIRST `port` line as the port to probe.
+    /// `ssh_effective_denied` requires, through the same shared parser
+    /// ([`duduclaw_isolation::ssh_config::SshdEffective`]: the employee
+    /// pattern on any `denyusers` line, every forwarding/TTY occurrence
+    /// holding), and the FIRST `port` line as the port to probe.
     pub(crate) fn effective_port(text: &str) -> Option<u16> {
-        let (mut deny, mut forwarding, mut tty) = (false, false, false);
-        let mut port: Option<Option<u16>> = None;
-        for line in text.lines() {
-            let words: Vec<&str> = line.split_whitespace().collect();
-            match words.first().copied() {
-                Some("denyusers") => deny = words.iter().skip(1).any(|word| *word == "duduclaw-emp-*"),
-                Some("disableforwarding") => forwarding = words.as_slice() == ["disableforwarding", "yes"],
-                Some("permittty") => tty = words.as_slice() == ["permittty", "no"],
-                Some("port") if port.is_none() => port = Some(match words.as_slice() {
-                    [_, value] => port_number(value), _ => None }),
-                _ => {}
-            }
-        }
-        if deny && forwarding && tty { port.flatten() } else { None }
+        let facts = duduclaw_isolation::ssh_config::SshdEffective::parse(text);
+        if facts.denies_employees() { facts.port } else { None }
     }
 
     /// The ssh client argv: the root-test harness option set
@@ -608,9 +594,15 @@ mod tests {
         assert_eq!(effective_port(&denied.replace("port 2222", "port 0")), None);
         assert_eq!(effective_port(&denied.replace("port 2222", "port 70000")), None);
         assert_eq!(effective_port(&denied.replace("port 2222", "port 22 23")), None);
-        // Last occurrence of a setting wins, as in accounts.rs ssh_effective_denied.
+        // A later contrary occurrence refuses (shared parser, as accounts.rs ssh_effective_denied).
         assert_eq!(effective_port(&format!("{denied}permittty yes\n")), None);
+        assert_eq!(effective_port(&format!("{denied}disableforwarding no\n")), None);
         assert_eq!(effective_port(""), None);
+        // R7c: real OpenSSH 9.6p1 output, one denyusers line per pattern (was exit 7).
+        let real = "port 22\npermittty no\ndisableforwarding yes\ndenyusers duduclaw-emp-*\ndenyusers duduclaw\n\
+            denyusers duduclaw-runsup\ndenyusers duduclaw-egress\ndenyusers duduclaw-dl\n";
+        assert_eq!(effective_port(real), Some(22));
+        assert_eq!(effective_port(&real.replace("denyusers duduclaw-emp-*\n", "")), None);
     }
 
     #[test]

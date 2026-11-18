@@ -11,6 +11,7 @@ pub mod ipc;
 pub mod migration;
 pub mod probe_exit;
 pub mod recording_layout;
+pub mod ssh_config;
 pub mod update;
 pub mod worker;
 

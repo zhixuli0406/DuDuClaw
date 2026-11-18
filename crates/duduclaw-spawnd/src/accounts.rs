@@ -74,20 +74,10 @@ pub fn scheduler_denied(name: &str, allow: Option<&str>, deny: &str) -> bool {
     !allow.is_some_and(has) && has(deny)
 }
 
+/// `sshd -T -C …` output denies the employee account: the shared parser
+/// ([`duduclaw_isolation::ssh_config::SshdEffective`], also the probe's).
 pub fn ssh_effective_denied(text: &str) -> bool {
-    let mut deny = false;
-    let mut forwarding = false;
-    let mut tty = false;
-    for line in text.lines() {
-        let words: Vec<_> = line.split_whitespace().collect();
-        match words.first().copied() {
-            Some("denyusers") => deny = words.iter().skip(1).any(|word| *word == "duduclaw-emp-*"),
-            Some("disableforwarding") => forwarding = words.as_slice() == ["disableforwarding", "yes"],
-            Some("permittty") => tty = words.as_slice() == ["permittty", "no"],
-            _ => {},
-        }
-    }
-    deny && forwarding && tty
+    duduclaw_isolation::ssh_config::SshdEffective::parse(text).denies_employees()
 }
 
 /// NSS modules outside files/systemd need an explicit, permanent IAM reservation.
@@ -828,6 +818,9 @@ mod tests {
         assert!(!scheduler_denied("alice", None, "malice\n"));
         assert!(ssh_effective_denied("denyusers duduclaw-emp-*\ndisableforwarding yes\npermittty no\n"));
         assert!(!ssh_effective_denied("denyusers fake-duduclaw-emp-*\ndisableforwarding yes\npermittty no\n"));
+        // R7c: OpenSSH 9.6p1 prints one denyusers line per pattern; a later one never resets the employee pattern.
+        assert!(ssh_effective_denied("port 22\npermittty no\ndisableforwarding yes\ndenyusers duduclaw-emp-*\n\
+            denyusers duduclaw\ndenyusers duduclaw-runsup\ndenyusers duduclaw-egress\ndenyusers duduclaw-dl\n"));
     }
     #[test]
     fn shadow_must_be_locked_and_expired() {

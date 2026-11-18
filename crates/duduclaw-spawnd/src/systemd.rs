@@ -530,7 +530,7 @@ pub fn checked_fixed_unit_effective_for(unit: &FixedUnit, properties: &dyn Fixed
         refusals.check(if fixed_property_matches(&expected, &actual) { Ok(()) } else { Err(fixed_property_refusal(key, &actual)) });
     }
     refusals.finish()?;
-    exec_start.pop().ok_or_else(invalid)
+    exec_start.pop().ok_or_else(|| invalid_because("fixed unit readback ExecStart: no command"))
 }
 /// The started invocation has finished: PID 1 reports a new, non-zero
 /// InvocationID (not the one read before `StartUnit`) and the unit is back to
@@ -936,7 +936,9 @@ impl UnitReferences {
     fn acquire(&mut self, name: &str, reuse: bool, operation: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
         match self.units.get(name) {
             Some(ReferenceState::Held) if reuse => return Ok(()),
-            Some(_) => return Err(invalid()),
+            Some(ReferenceState::Held) => return Err(invalid_because(format_args!("unit {name}: reference already held on this connection"))),
+            Some(ReferenceState::Uncertain) => return Err(invalid_because(format_args!(
+                "unit {name}: reference uncertain on this connection (an earlier Ref/Unref reply failed)"))),
             None => {},
         }
         self.units.insert(name.into(), ReferenceState::Uncertain);
@@ -947,7 +949,8 @@ impl UnitReferences {
     fn release(&mut self, name: &str, operation: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
         match self.units.get(name) {
             None => return Ok(()),
-            Some(ReferenceState::Uncertain) => return Err(invalid()),
+            Some(ReferenceState::Uncertain) => return Err(invalid_because(format_args!(
+                "unit {name}: reference uncertain on this connection (an earlier Ref/Unref reply failed)"))),
             Some(ReferenceState::Held) => {},
         }
         self.units.insert(name.into(), ReferenceState::Uncertain);
@@ -990,6 +993,13 @@ pub mod linux {
     fn bus_error(_: impl std::fmt::Display) -> io::Error {
         io::Error::new(io::ErrorKind::Other, "systemd operation unavailable")
     }
+    /// [`bus_error`] (same kind, `Other`) naming the step that failed:
+    /// `systemd operation unavailable: <what>: <PID 1 / bus error, bounded>`.
+    fn bus_failed(what: impl std::fmt::Display, error: impl std::fmt::Display) -> io::Error {
+        io::Error::new(io::ErrorKind::Other, format!("systemd operation unavailable: {what}: {}", bounded_text(&error.to_string())))
+    }
+    /// The connection's unit reference table is unusable (a panic while held).
+    fn references_poisoned() -> io::Error { invalid_because("unit reference table lock poisoned") }
     fn missing_unit(error: &zbus::Error) -> bool {
         matches!(error, zbus::Error::MethodError(name, _, _)
             if name.as_str() == "org.freedesktop.systemd1.NoSuchUnit")
@@ -1040,12 +1050,13 @@ pub mod linux {
     }
     impl Systemd {
         pub fn connect() -> io::Result<Self> {
-            let connection = Builder::system().map_err(bus_error)?
-                .method_timeout(Duration::from_secs(5)).build().map_err(bus_error)?;
+            let connection = Builder::system().map_err(|error| bus_failed("system bus", error))?
+                .method_timeout(Duration::from_secs(5)).build().map_err(|error| bus_failed("system bus connection", error))?;
             Ok(Self { connection, references: Mutex::new(UnitReferences::default()) })
         }
         fn manager(&self) -> io::Result<Proxy<'_>> {
-            Proxy::new(&self.connection, BUS, "/org/freedesktop/systemd1", MANAGER).map_err(bus_error)
+            Proxy::new(&self.connection, BUS, "/org/freedesktop/systemd1", MANAGER)
+                .map_err(|error| bus_failed("Manager interface", error))
         }
         fn start_referenced(&self, name: &str, mut properties: Vec<(&str, Value<'_>)>) -> io::Result<()> {
             if properties.iter().any(|(key, _)| *key == "AddRef") { return Err(invalid_because("AddRef preset by caller")); }
@@ -1324,18 +1335,23 @@ pub mod linux {
         /// one PID 1 call (a separate `LoadUnit` result may be collected first).
         pub fn run_fixed_unit(&self, name: &str, deadline: Duration) -> io::Result<FixedUnitOutcome> {
             let fixed = FixedUnit::from_name(name).ok_or_else(|| invalid_because("fixed unit name not in the fixed set"))?;
-            if !fixed.file_valid(&installed_fixed_unit(name)?) {
-                return Err(invalid_because(format_args!("fixed unit {FIXED_UNIT_DIRECTORY}/{} is not the shipped text", fixed.fragment())));
+            let installed = installed_fixed_unit(name)?;
+            // `FixedUnit::file_valid`, named.
+            if let Some(reason) = unit_file_mismatch(fixed.text().as_bytes(), &installed) {
+                return Err(invalid_because(format_args!("fixed unit {FIXED_UNIT_DIRECTORY}/{} is not the shipped text ({reason})",
+                    fixed.fragment())));
             }
             let manager = self.manager()?;
-            let path: OwnedObjectPath = manager.call("LoadUnit", &(name,)).map_err(bus_error)?;
-            let unit = Proxy::new(&self.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Unit").map_err(bus_error)?;
-            self.references.lock().map_err(|_| invalid())?.acquire(name, false, || {
-                unit.call::<_, _, ()>("Ref", &()).map_err(bus_error)
+            let path: OwnedObjectPath = manager.call("LoadUnit", &(name,))
+                .map_err(|error| bus_failed(format_args!("fixed unit {name}: LoadUnit"), error))?;
+            let unit = Proxy::new(&self.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Unit")
+                .map_err(|error| bus_failed(format_args!("fixed unit {name}: Unit interface"), error))?;
+            self.references.lock().map_err(|_| references_poisoned())?.acquire(name, false, || {
+                unit.call::<_, _, ()>("Ref", &()).map_err(|error| bus_failed(format_args!("fixed unit {name}: Unit.Ref"), error))
             })?;
             let outcome = self.run_pinned_fixed_unit(&fixed, name, &manager, &path, &unit, deadline);
-            let released = self.references.lock().map_err(|_| invalid())?.release(name, || {
-                manager.call::<_, _, ()>("UnrefUnit", &(name,)).map_err(bus_error)
+            let released = self.references.lock().map_err(|_| references_poisoned())?.release(name, || {
+                manager.call::<_, _, ()>("UnrefUnit", &(name,)).map_err(|error| bus_failed(format_args!("fixed unit {name}: UnrefUnit"), error))
             });
             let outcome = outcome?;
             released?;
@@ -1344,48 +1360,57 @@ pub mod linux {
         /// [`Self::run_fixed_unit`] once the unit is pinned.
         fn run_pinned_fixed_unit(&self, fixed: &FixedUnit, name: &str, manager: &Proxy<'_>, path: &OwnedObjectPath, unit: &Proxy<'_>,
             deadline: Duration) -> io::Result<FixedUnitOutcome> {
+            // Every bus failure names the step and property (kind unchanged, `Other`).
+            fn read_failed<'a, E: std::fmt::Display>(name: &'a str, what: &'static str) -> impl FnOnce(E) -> io::Error + 'a {
+                move |error| bus_failed(format!("fixed unit {name}: read {what}"), error)
+            }
             let load = FixedUnitLoad {
-                id: unit.get_property("Id").map_err(bus_error)?,
-                load_state: unit.get_property("LoadState").map_err(bus_error)?,
-                fragment_path: unit.get_property("FragmentPath").map_err(bus_error)?,
-                drop_in_paths: unit.get_property("DropInPaths").map_err(bus_error)?,
-                need_daemon_reload: unit.get_property("NeedDaemonReload").map_err(bus_error)?,
-                transient: unit.get_property("Transient").map_err(bus_error)?,
+                id: unit.get_property("Id").map_err(read_failed(name, "Id"))?,
+                load_state: unit.get_property("LoadState").map_err(read_failed(name, "LoadState"))?,
+                fragment_path: unit.get_property("FragmentPath").map_err(read_failed(name, "FragmentPath"))?,
+                drop_in_paths: unit.get_property("DropInPaths").map_err(read_failed(name, "DropInPaths"))?,
+                need_daemon_reload: unit.get_property("NeedDaemonReload").map_err(read_failed(name, "NeedDaemonReload"))?,
+                transient: unit.get_property("Transient").map_err(read_failed(name, "Transient"))?,
             };
             if let Some(reason) = fixed.load_mismatch(&load) {
                 return Err(invalid_because(format_args!("fixed unit {name}: {reason}")));
             }
-            let state: String = unit.get_property("ActiveState").map_err(bus_error)?;
+            let state: String = unit.get_property("ActiveState").map_err(read_failed(name, "ActiveState"))?;
             match state.as_str() {
                 "inactive" => {}
                 // A previous failed invocation: clear it so this start is fresh.
-                "failed" => manager.call::<_, _, ()>("ResetFailedUnit", &(name,)).map_err(bus_error)?,
+                "failed" => manager.call::<_, _, ()>("ResetFailedUnit", &(name,))
+                    .map_err(|error| bus_failed(format_args!("fixed unit {name}: ResetFailedUnit before start"), error))?,
                 // Someone else's invocation is in progress: never adopt its result.
-                other => return Err(invalid_because(format_args!("fixed unit {name}: ActiveState {:?}", bounded_text(other)))),
+                other => return Err(invalid_because(format_args!("fixed unit {name}: ActiveState {:?} before start", bounded_text(other)))),
             }
-            let before: Vec<u8> = unit.get_property("InvocationID").map_err(bus_error)?;
-            let service = Proxy::new(&self.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Service").map_err(bus_error)?;
+            let before: Vec<u8> = unit.get_property("InvocationID").map_err(read_failed(name, "InvocationID"))?;
+            let service = Proxy::new(&self.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Service")
+                .map_err(|error| bus_failed(format_args!("fixed unit {name}: Service interface"), error))?;
             // Content as PID 1 will execute it: an unreadable, unparsable or
             // different property refuses. A reload racing this read cannot pass
             // either: the outcome must be recorded by the pinned command.
             let previous = checked_fixed_unit_effective_for(fixed, &service)?;
-            let _job: OwnedObjectPath = manager.call("StartUnit", &(name, "replace")).map_err(bus_error)?;
+            let _job: OwnedObjectPath = manager.call("StartUnit", &(name, "replace"))
+                .map_err(|error| bus_failed(format_args!("fixed unit {name}: StartUnit"), error))?;
             let until = Instant::now() + deadline;
             let outcome = loop {
-                let state: String = unit.get_property("ActiveState").map_err(bus_error)?;
-                let invocation: Vec<u8> = unit.get_property("InvocationID").map_err(bus_error)?;
+                let state: String = unit.get_property("ActiveState").map_err(read_failed(name, "ActiveState"))?;
+                let invocation: Vec<u8> = unit.get_property("InvocationID").map_err(read_failed(name, "InvocationID"))?;
                 if fixed_unit_finished(&before, &invocation, &state) {
-                    break FixedUnitOutcome { result: service.get_property("Result").map_err(bus_error)?,
-                        exec_main_code: service.get_property("ExecMainCode").map_err(bus_error)?,
-                        exec_main_status: service.get_property("ExecMainStatus").map_err(bus_error)?,
-                        exec_main_pid: service.get_property("ExecMainPID").map_err(bus_error)?, invocation,
+                    break FixedUnitOutcome { result: service.get_property("Result").map_err(read_failed(name, "Result"))?,
+                        exec_main_code: service.get_property("ExecMainCode").map_err(read_failed(name, "ExecMainCode"))?,
+                        exec_main_status: service.get_property("ExecMainStatus").map_err(read_failed(name, "ExecMainStatus"))?,
+                        exec_main_pid: service.get_property("ExecMainPID").map_err(read_failed(name, "ExecMainPID"))?, invocation,
                         previous_invocation: before.clone(), active_state: state,
                         recorded: FixedUnitProperties::exec_start(&service)?.into_iter().map(ExecCommand::from).collect(),
                         previous_start_us: previous.start_monotonic_us };
                 }
                 if Instant::now() >= until {
                     let _: zbus::Result<OwnedObjectPath> = manager.call("StopUnit", &(name, "replace"));
-                    return Err(io::ErrorKind::TimedOut.into());
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, format!(
+                        "fixed unit {name}: invocation not finished within {} ms (ActiveState {:?}); StopUnit requested",
+                        deadline.as_millis(), bounded_text(&state))));
                 }
                 std::thread::sleep(Duration::from_millis(50));
             };
@@ -1622,12 +1647,24 @@ pub mod linux {
     /// `CapabilityBoundingSet`/`AmbientCapabilities`/`RestrictNamespaces` `t`);
     /// any other type is an error, so the check refuses.
     impl FixedUnitProperties for Proxy<'_> {
-        fn exec_start(&self) -> io::Result<Vec<ExecStartEntry>> { self.get_property("ExecStart").map_err(bus_error) }
-        fn text(&self, name: &'static str) -> io::Result<String> { self.get_property(name).map_err(bus_error) }
-        fn flag(&self, name: &'static str) -> io::Result<bool> { self.get_property(name).map_err(bus_error) }
-        fn mask(&self, name: &'static str) -> io::Result<u64> { self.get_property(name).map_err(bus_error) }
-        fn allow_list(&self, name: &'static str) -> io::Result<(bool, Vec<String>)> { self.get_property(name).map_err(bus_error) }
-        fn ip_list(&self, name: &'static str) -> io::Result<Vec<IpEntry>> { self.get_property(name).map_err(bus_error) }
+        fn exec_start(&self) -> io::Result<Vec<ExecStartEntry>> {
+            self.get_property("ExecStart").map_err(|error| bus_failed("fixed unit readback ExecStart (a(sasbttttuii))", error))
+        }
+        fn text(&self, name: &'static str) -> io::Result<String> {
+            self.get_property(name).map_err(|error| bus_failed(format_args!("fixed unit readback {name} (s)"), error))
+        }
+        fn flag(&self, name: &'static str) -> io::Result<bool> {
+            self.get_property(name).map_err(|error| bus_failed(format_args!("fixed unit readback {name} (b)"), error))
+        }
+        fn mask(&self, name: &'static str) -> io::Result<u64> {
+            self.get_property(name).map_err(|error| bus_failed(format_args!("fixed unit readback {name} (t)"), error))
+        }
+        fn allow_list(&self, name: &'static str) -> io::Result<(bool, Vec<String>)> {
+            self.get_property(name).map_err(|error| bus_failed(format_args!("fixed unit readback {name} ((bas))"), error))
+        }
+        fn ip_list(&self, name: &'static str) -> io::Result<Vec<IpEntry>> {
+            self.get_property(name).map_err(|error| bus_failed(format_args!("fixed unit readback {name} (a(iayu))"), error))
+        }
     }
     /// R7a: the installed file of the fixed unit `name` ([`FixedUnit::fragment`];
     /// a probe instance's is the template file), read through the
@@ -1635,16 +1672,54 @@ pub mod linux {
     /// regular file with one link and no group/other write, at most
     /// [`MAX_FIXED_UNIT_BYTES`]).
     pub fn installed_fixed_unit(name: &str) -> io::Result<Vec<u8>> {
-        let unit = FixedUnit::from_name(name).ok_or_else(invalid)?;
+        let unit = FixedUnit::from_name(name).ok_or_else(|| invalid_because("fixed unit name not in the fixed set"))?;
         installed_unit_file(unit.fragment())
     }
     /// R7c: the installed probe template file (same reader).
     pub fn installed_probe_template() -> io::Result<Vec<u8>> {
         installed_unit_file(duduclaw_isolation::ids::ISOLATION_PROBE_UNIT_TEMPLATE)
     }
+    /// Every refusal names the step (open directory, open file, read, size
+    /// bound) and why. R7c: the file is opened with the unit-name rule
+    /// (`Directory::read_unit`), which admits the probe template's `@`; the
+    /// artifact-name rule of `Directory::bytes` refused it, so every probe
+    /// instance and the probe host key were refused before any start.
     fn installed_unit_file(fragment: &str) -> io::Result<Vec<u8>> {
-        let directory = duduclaw_updated::linux::files::Directory::open(Path::new(FIXED_UNIT_DIRECTORY)).map_err(|_| invalid())?;
-        directory.bytes(fragment, MAX_FIXED_UNIT_BYTES).map_err(|_| invalid())
+        use std::io::Read as _;
+        let path = format!("{FIXED_UNIT_DIRECTORY}/{fragment}");
+        let directory = duduclaw_updated::linux::files::Directory::open(Path::new(FIXED_UNIT_DIRECTORY))
+            .map_err(|error| invalid_because(format_args!("fixed unit file {path}: open directory {FIXED_UNIT_DIRECTORY}: {}",
+                trusted_file_error(&error, "a directory on the path is not root:root or is group/other-writable"))))?;
+        let file = directory.read_unit(fragment)
+            .map_err(|error| invalid_because(format_args!("fixed unit file {path}: open: {}", trusted_file_error(&error,
+                "not a root:root regular file with one link and no group/other write"))))?;
+        let mut bytes = Vec::new();
+        file.take(MAX_FIXED_UNIT_BYTES as u64 + 1).read_to_end(&mut bytes)
+            .map_err(|error| invalid_because(format_args!("fixed unit file {path}: read: {}", bounded_text(&error.to_string()))))?;
+        if bytes.len() > MAX_FIXED_UNIT_BYTES {
+            return Err(invalid_because(format_args!("fixed unit file {path}: larger than {MAX_FIXED_UNIT_BYTES} bytes")));
+        }
+        Ok(bytes)
+    }
+    /// A trusted-directory reader error, rendered for a refusal (`Maintenance`
+    /// is the ownership/mode/link rule, described by `maintenance`).
+    fn trusted_file_error(error: &duduclaw_updated::Error, maintenance: &str) -> String {
+        match error {
+            duduclaw_updated::Error::Invalid => "name or path refused by the trusted-directory reader".into(),
+            duduclaw_updated::Error::Maintenance => maintenance.into(),
+            duduclaw_updated::Error::Io(error) => bounded_text(&error.to_string()),
+            other => bounded_text(&other.to_string()),
+        }
+    }
+    /// Why `installed` is not the `shipped` unit text, never its content:
+    /// `None` exactly when the bytes are equal ([`FixedUnit::file_valid`]);
+    /// otherwise both lengths and the first 8 bytes (hex) of both SHA-256 digests.
+    pub fn unit_file_mismatch(shipped: &[u8], installed: &[u8]) -> Option<String> {
+        use sha2::{Digest, Sha256};
+        if installed == shipped { return None; }
+        let prefix = |bytes: &[u8]| Sha256::digest(bytes)[..8].iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        Some(format!("installed {} bytes, SHA-256 {}...; shipped {} bytes, SHA-256 {}...",
+            installed.len(), prefix(installed), shipped.len(), prefix(shipped)))
     }
     pub fn host_pty_budget() -> io::Result<u32> {
         pty_budget(&std::fs::read_to_string("/proc/sys/kernel/pty/max")?,
@@ -3137,6 +3212,23 @@ mod tests {
             .unwrap_err().to_string();
         assert!(!message.chars().any(char::is_control), "{message}");
         assert!(message.len() <= "invalid unit policy: fixed unit readback Slice: actual value ".len() + 203, "{message}");
+    }
+
+    /// R7c: "bytes differ" names both lengths and SHA-256 prefixes, never the content.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fixed_unit_file_mismatch_names_length_and_digest_prefix_only() {
+        let shipped = ISOLATION_PROBE_UNIT_TEXT.as_bytes();
+        assert_eq!(linux::unit_file_mismatch(shipped, shipped), None);
+        let stale = b"[Service]\nExecStart=/bin/true SECRET-MARKER\n";
+        let reason = linux::unit_file_mismatch(shipped, stale).unwrap();
+        assert!(reason.starts_with(&format!("installed {} bytes, SHA-256 ", stale.len())), "{reason}");
+        assert!(reason.contains(&format!("; shipped {} bytes, SHA-256 ", shipped.len())), "{reason}");
+        assert!(!reason.contains("SECRET-MARKER") && !reason.contains("ExecStart"), "{reason}");
+        let digests: Vec<&str> = reason.split("SHA-256 ").skip(1).map(|rest| rest.split("...").next().unwrap()).collect();
+        assert_eq!(digests.len(), 2, "{reason}");
+        assert!(digests.iter().all(|hex| hex.len() == 16 && hex.bytes().all(|b| b.is_ascii_hexdigit())), "{reason}");
+        assert_ne!(digests[0], digests[1]);
     }
 
     const PROBE_ACCOUNT: &str = "duduclaw-emp-70000";

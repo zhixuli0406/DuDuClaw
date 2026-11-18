@@ -155,8 +155,8 @@ fn ensure_dropin(created: &mut Created) {
         }
         Err(error) => panic!("{DROPIN_PATH}: {error}"),
     }
-    assert!(effective_config(ACCOUNT).lines().any(|line| line.starts_with("denyusers ") && line.contains("duduclaw-emp-*")),
-        "sshd must include /etc/ssh/sshd_config.d/*.conf");
+    assert!(effective_denies(ACCOUNT),
+        "sshd must include /etc/ssh/sshd_config.d/*.conf (DenyUsers duduclaw-emp-*, DisableForwarding yes, PermitTTY no)");
 }
 
 /// A root-owned 0755 copy of the built probe in a fresh root-owned 0700
@@ -171,13 +171,38 @@ fn private_copy(created: &mut Created) -> PathBuf {
     std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).expect("binary mode");
     binary
 }
-/// The probe for `account` under every shipped `[Service]` setting.
-fn run_unit(binary: &Path, account: &str) -> (Option<i32>, String, String) {
+/// The `systemd-run` command for `account` under every shipped `[Service]`
+/// setting: shell-less, so each setting is ONE `-p` argument even when its
+/// value has spaces (`RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`).
+fn unit_command(binary: &Path, account: &str) -> Command {
     let mut command = Command::new("/usr/bin/systemd-run");
     command.args(["--quiet", "--wait", "--collect", "--pipe"]);
     for setting in unit_service_settings() { command.args(["-p", setting]); }
     command.arg(binary).arg(account);
-    bounded(command)
+    command
+}
+/// The probe for `account` under every shipped `[Service]` setting.
+fn run_unit(binary: &Path, account: &str) -> (Option<i32>, String, String) {
+    bounded(unit_command(binary, account))
+}
+/// sshd's effective configuration for `account` denies it, by the parser
+/// spawnd and the probe share (one `denyusers` line per pattern on OpenSSH 9.6p1).
+fn effective_denies(account: &str) -> bool {
+    duduclaw_isolation::ssh_config::SshdEffective::parse(&effective_config(account)).denies_employees()
+}
+
+/// Not root: the argument builder passes every applied `[Service]` line as
+/// exactly one argument after its own `-p`, spaces included.
+#[test]
+fn probe_unit_settings_are_passed_one_argument_each() {
+    let settings = unit_service_settings();
+    assert!(settings.contains(&"RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6"), "{settings:?}");
+    let command = unit_command(Path::new("/var/lib/x/duduclaw-isolation-probe"), ACCOUNT);
+    let args: Vec<&str> = command.get_args().map(|arg| arg.to_str().expect("UTF-8 argument")).collect();
+    assert_eq!(&args[..4], ["--quiet", "--wait", "--collect", "--pipe"]);
+    let pairs: Vec<&str> = args[4..args.len() - 2].chunks(2).map(|pair| { assert_eq!(pair[0], "-p", "{args:?}"); pair[1] }).collect();
+    assert_eq!(pairs, settings);
+    assert_eq!(&args[args.len() - 2..], ["/var/lib/x/duduclaw-isolation-probe", ACCOUNT]);
 }
 fn assert_failed_at((code, stdout, stderr): (Option<i32>, String, String), exit: i32, stage: &str) {
     assert_eq!(code, Some(exit), "stdout {stdout:?} stderr {stderr:?}");
@@ -202,7 +227,9 @@ fn iso_root_isolation_probe_denied_account_passes_under_the_shipped_unit() {
     ensure_dropin(&mut created);
     let binary = private_copy(&mut created);
 
-    // Positive: the live sshd refuses both attempts and logs DenyUsers for them.
+    // Positive: the live sshd refuses both attempts and logs DenyUsers for them
+    // (with the account and the drop-in present the probe passes
+    // effective_config: every denyusers line counts, not only the last).
     let (code, stdout, stderr) = run_unit(&binary, ACCOUNT);
     assert_eq!(code, Some(0), "probe failed: stdout {stdout:?} stderr {stderr:?}");
     let lines: Vec<&str> = stdout.lines().collect();
@@ -227,7 +254,7 @@ fn iso_root_isolation_probe_denied_account_passes_under_the_shipped_unit() {
         std::fs::remove_file(DROPIN_PATH).expect("remove the test's drop-in");
         created.dropin = false;
         assert!(reload_sshd(), "reload the running sshd");
-        assert!(!effective_config(ACCOUNT).lines().any(|line| line.starts_with("denyusers ") && line.contains("duduclaw-emp-*")),
+        assert!(!effective_denies(ACCOUNT),
             "another sshd configuration still denies duduclaw-emp-*; the negative control cannot run here");
         assert_failed_at(run_unit(&binary, ACCOUNT), EXIT_EFFECTIVE_CONFIG, "effective_config");
     } else {

@@ -357,21 +357,32 @@ mod linux {
     use super::*;
 
     fn unavailable(what: &str) -> io::Error { io::Error::new(io::ErrorKind::PermissionDenied, format!("{what} unavailable")) }
+    /// [`unavailable`] carrying the underlying error (same kind).
+    fn unavailable_because(what: &str, error: impl std::fmt::Display) -> io::Error {
+        io::Error::new(io::ErrorKind::PermissionDenied, format!("{what} unavailable: {error}"))
+    }
 
     /// The live host key: the committed signed generation (updater probe),
     /// the boot id, the installed probe binary verified by descriptor against
     /// that generation's `IsolationProbe` artifact, and the installed template
-    /// unit, which must be byte-for-byte the shipped text.
+    /// unit, which must be byte-for-byte the shipped text. This is the only
+    /// place the signed generation and the probe binary's digest are checked:
+    /// `run_probe` / `Systemd::run_fixed_unit` do not need a signed generation.
     pub fn host_key() -> io::Result<HostKey> {
-        let (generation, manifest) = crate::installed::committed_generation().map_err(|_| unavailable("committed generation"))?;
-        let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim().to_owned();
+        let (generation, manifest) = crate::installed::committed_generation()
+            .map_err(|error| unavailable_because("committed generation", error))?;
+        let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .map_err(|error| io::Error::new(error.kind(), format!("boot id unavailable: {error}")))?.trim().to_owned();
         if boot_id.is_empty() { return Err(unavailable("boot id")); }
-        let directory = Directory::open(Path::new(crate::selftest::TRAMPOLINE_DIRECTORY)).map_err(|_| unavailable("/usr/lib/duduclaw"))?;
+        let directory = Directory::open(Path::new(crate::selftest::TRAMPOLINE_DIRECTORY))
+            .map_err(|error| unavailable_because("/usr/lib/duduclaw", error))?;
         let probe = crate::selftest::verified_artifact(&directory, &manifest, InstallTarget::IsolationProbe)
-            .map_err(|_| unavailable("signed probe binary /usr/lib/duduclaw/duduclaw-isolation-probe"))?;
+            .map_err(|error| unavailable_because("signed probe binary /usr/lib/duduclaw/duduclaw-isolation-probe", error))?;
         let unit = crate::systemd::linux::installed_probe_template()
-            .map_err(|_| unavailable("probe template unit"))?;
-        if unit != ISOLATION_PROBE_UNIT_TEXT.as_bytes() { return Err(unavailable("shipped probe template unit")); }
+            .map_err(|error| unavailable_because("probe template unit", error))?;
+        if let Some(reason) = crate::systemd::linux::unit_file_mismatch(ISOLATION_PROBE_UNIT_TEXT.as_bytes(), &unit) {
+            return Err(unavailable_because("shipped probe template unit", reason));
+        }
         Ok(HostKey { boot_id, generation, probe, unit: Sha256Digest(Sha256::digest(&unit).into()) })
     }
 
@@ -398,7 +409,7 @@ mod linux {
             if self.systemd.is_none() {
                 match Systemd::connect() {
                     Ok(systemd) => self.systemd = Some(systemd),
-                    Err(_) => return ProbeOutcome::Inconclusive("systemd unavailable".into()),
+                    Err(error) => return ProbeOutcome::Inconclusive(format!("systemd unavailable: {error}")),
                 }
             }
             let Some(systemd) = self.systemd.as_ref() else { return ProbeOutcome::Inconclusive("systemd unavailable".into()) };
