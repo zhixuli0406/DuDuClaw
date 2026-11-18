@@ -164,7 +164,7 @@ fn service_provider_secret_wrapper_wipes_on_drop() {
     validate(&document(&provider("main", "https://llm.example/v1"))).unwrap();
     assert_eq!(WIPED.with(|wiped| wiped.get()), 3);
     // An escaped string never reaches a buffer of ours: refused, never quoted.
-    let error = serde_json::from_str::<Secret>(r#""sk-NEVER""#).err().unwrap().to_string();
+    let error = serde_json::from_str::<Secret>(r#""sk-NEV\u0045R""#).err().unwrap().to_string();
     assert!(!error.contains("NEVER"), "{error}");
 }
 
@@ -173,7 +173,7 @@ fn service_provider_escaped_strings_are_refused_although_the_runtime_accepts_the
     // Refusing more than the runtime (never less): the escaped forms would pass through serde_json's
     // unzeroized scratch buffer.
     for escaped in [
-        format!(r#"{{"name":"main","api_key":"sk-{KEY}","base_url":"https://llm.example/v1"}}"#),
+        format!(r#"{{"name":"main","api_key":"sk-A\u0042{KEY}","base_url":"https://llm.example/v1"}}"#),
         format!(r#"{{"name":"main","api_key":"{KEY}","base_url":"https:\/\/llm.example\/v1"}}"#),
         format!(r#"{{"name":"m\"ain","api_key":"{KEY}","base_url":"https://llm.example/v1"}}"#),
     ] {
