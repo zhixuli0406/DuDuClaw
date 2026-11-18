@@ -74,7 +74,8 @@ impl RootProbe for SpawndRootProbe {
             let nonce = duduclaw_migration::ids::RequestId(*uuid::Uuid::new_v4().as_bytes());
             // `approver` is Retire-only (F6l): a ReadBack carries `None`, as
             // `isolation_lifecycle`'s schema-1 ReadBack does.
-            match allocation::transport::request(&Request { schema: 1, nonce, action: Action::ReadBack, item: item.clone(), approver: None }) {
+            match allocation::transport::request(&Request { schema: 1, nonce, action: Action::ReadBack, item: item.clone(), approver: None,
+                entitlement: None }) {
                 Ok(receipt) => Ok(RootReadBack { receipt, phase: RootPhase::Ready, idle: None }),
                 Err(duduclaw_migration::Error::Authentication) => Err(RootError::Inconsistent),
                 Err(_) => Err(RootError::Transport),

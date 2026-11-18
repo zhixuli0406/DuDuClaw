@@ -47,7 +47,7 @@ impl AllocationRoot for Root {
                 let spec = allocation::specification(&request.item).unwrap();
                 let receipt = Receipt { binding: request.item.binding, label: spec.label, employee: EmployeeId([7; 16]), uid: 70001,
                     bytes: spec.bytes, inodes: spec.inodes, disabled: false, principal_binding: spec.binding };
-                Ok(Response::for_request(request, Ok(Reply { receipt, phase: Phase::Ready, idle: None })))
+                Ok(Response::for_request(request, Ok(Reply { receipt, phase: Phase::Ready, idle: None, entitlement: None })))
             }
         }
     }

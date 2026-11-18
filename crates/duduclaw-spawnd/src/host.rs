@@ -125,8 +125,8 @@ impl Default for Components {
         trampoline: Box::new(crate::native_trampoline::NativeTrampoline::default()), egress: Box::new(LinuxEgress::new(Box::new(MissingDnsEvidence))) } }
 }
 /// Fixed root installer layout. These are not request/config/environment inputs.
-/// The installer creates 0700 root-owned directories and makes the image anchor
-/// a private mount on H-supported backing. Boot never creates/mounts that anchor.
+/// The installer creates 0700 root-owned directories on H-supported backing.
+/// The service unit makes its mount namespace private on every start; no host mount.
 pub const STORAGE_IMAGES: &str = "/var/lib/duduclaw-spawnd/images";
 pub const STORAGE_JOURNAL: &str = "/var/lib/duduclaw-spawnd/storage";
 impl Components {
@@ -135,12 +135,12 @@ impl Components {
         crate::installed::install(&mut components);
         // H3: the allocation/retire hook wraps H's storage so every provisioned
         // employee has its root-owned work anchor (`employee-work` identity).
-        let storage = crate::storage::LoopStorage::open(std::path::Path::new(STORAGE_IMAGES), std::path::Path::new(STORAGE_JOURNAL))
+        let storage = crate::storage::LoopStorage::open_diagnosed(std::path::Path::new(STORAGE_IMAGES), std::path::Path::new(STORAGE_JOURNAL))
             .and_then(|storage| Ok(crate::work_anchor::AnchoredStorage::new(Box::new(storage),
-                crate::work_anchor::WorkAnchors::open_installed()?)));
+                crate::work_anchor::WorkAnchors::open_installed().map_err(|_| "work anchors")?)));
         match storage {
             Ok(storage) => components.storage = Box::new(storage),
-            Err(_) => eprintln!("duduclaw-spawnd: installed storage unavailable"),
+            Err(reason) => eprintln!("duduclaw-spawnd: installed storage unavailable: {reason}"),
         }
         components
     }
@@ -257,30 +257,34 @@ impl StartupReconcile {
         self.latched
     }
 }
+/// Emit only caller-selected fixed stages, never the underlying error text.
+fn startup_stage<T, E>(stage: &'static str, result: std::result::Result<T, E>) -> std::result::Result<T, E> {
+    result.map_err(|error| { eprintln!("duduclaw-spawnd: start-up failed: {stage}"); error })
+}
 impl LinuxHost {
     pub fn open(gateway: (u32, u32), components: Components, audit: AuditWorker) -> io::Result<Self> {
-        let registry = RegistryStore::initialize()?;
+        let registry = startup_stage("registry", RegistryStore::initialize())?;
         let mut accounts = LinuxAccounts::background(components.ssh.as_ref());
-        registry.registry().validate(&accounts.policy()?)?;
-        let monitor = Monitor::start(&registry.registry().employees, audit.clone())?;
+        startup_stage("account policy", registry.registry().validate(&startup_stage("account policy", accounts.policy())?))?;
+        let monitor = startup_stage("monitor", Monitor::start(&registry.registry().employees, audit.clone()))?;
         let scanner = ScanReader { state: monitor.state.clone(), entries: monitor.entries.clone() };
         let worker_scanner = Box::new(ScanReader { state: monitor.state.clone(), entries: monitor.entries.clone() });
         let view = Arc::new(Mutex::new(PublishedView {
-            report: EvidenceReport::current(Readiness::default(), 0)?, policy: None,
+            report: startup_stage("report", EvidenceReport::current(Readiness::default(), 0))?, policy: None,
             employees: registry.registry().employees.iter().filter(|a| a.state == crate::registry::AccountState::Ready).map(|a| a.employee).collect(),
         }));
         let recording_gate = crate::host_state::RecordingGate::default();
         // F6l S5a: a missing allocation journal is refused while the registry
         // or storage still shows an employee (no silent empty journal).
         let mut components = components;
-        let allocator = crate::allocation::Allocator::open(registry.registry(), components.storage.as_mut())?;
-        let mut core = Core { allocator, registry, systemd: Systemd::connect()?, journal: RunJournal::open()?,
-            components, policy: None, report: EvidenceReport::current(Readiness::default(), 0)?, gateway,
+        let allocator = startup_stage("allocation journal", crate::allocation::Allocator::open(registry.registry(), components.storage.as_mut()))?;
+        let mut core = Core { allocator, registry, systemd: startup_stage("systemd", Systemd::connect())?, journal: startup_stage("run journal", RunJournal::open())?,
+            components, policy: None, report: startup_stage("report", EvidenceReport::current(Readiness::default(), 0))?, gateway,
             monitor, runs: BTreeMap::new(), audit, last_refresh: Instant::now(), poisoned: false, view: view.clone(),
             helper_events: Vec::new(), recording_probe: probe::RecordingProbe::default(),
             probe_schedule: probe::ProbeSchedule::default(), recording_gate: recording_gate.clone(),
             startup: StartupReconcile::opened(Instant::now(), false) };
-        core.report.publish(gateway.1)?;
+        startup_stage("report", core.report.publish(gateway.1))?;
         // Cleanup is attempted even when C/H/F/G are absent. Failure is evidence,
         // never permission to skip an orphan or reinterpret a stale reservation.
         // C2: a failure is retried by `refresh` (`StartupReconcile`).
@@ -293,8 +297,8 @@ impl LinuxHost {
             .unwrap_or(SnapshotAuthority { gateway_uid: gateway.0, mount_id: 0 });
         let host_ptys = crate::systemd::linux::host_pty_budget().unwrap_or(0);
         core.refresh();
-        let worker = WorkerHost::spawn(core, worker_scanner)?;
-        crate::allocation::serve(gateway, worker.allocation_sender())?;
+        let worker = startup_stage("worker", WorkerHost::spawn(core, worker_scanner))?;
+        startup_stage("allocation channel", crate::allocation::serve(gateway, worker.allocation_sender()))?;
         Ok(Self { worker, view, scanner, snapshots, host_ptys, recording_gate })
     }
 }
@@ -613,8 +617,12 @@ impl Host for Core {
         // "pending" (`AccountHost::login_denied`); the same employee's next
         // allocation picks the result up. Other accounts are not probed inline.
         let mut accounts = LinuxAccounts::background(self.components.ssh.as_ref());
+        // R8d: Entitle and the Disable/Retire removal write the root host
+        // publication on this same worker; `monitor_registry` below forces
+        // the next refresh, which reloads it (and republishes the projection).
+        let mut entitlements = crate::installed::InstalledEntitlements;
         let result = self.allocator.handle(request, crate::allocation::Env { registry: &mut self.registry, accounts: &mut accounts,
-            storage: self.components.storage.as_mut(), host_busy, idle, now_unix });
+            storage: self.components.storage.as_mut(), host_busy, idle, now_unix, entitlements: &mut entitlements });
         for event in self.allocator.take_events() {
             match event {
                 crate::allocation::AllocationEvent::Retired { employee, detail } =>

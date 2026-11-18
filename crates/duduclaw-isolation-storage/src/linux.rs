@@ -51,7 +51,7 @@ pub struct Storage {
 }
 impl Storage {
     /// Caller creates the root:root 0700 storage directory during installation.
-    /// B1 must make its mount tree private before this call.
+    /// The spawnd unit makes its mount tree private on every start before this call.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         if !nix::unistd::geteuid().is_root() { return Err(Error::Unsupported); }
         let path = path.as_ref().to_path_buf();

@@ -53,14 +53,9 @@ fn valid_runtime(runtime: &PublishedRuntime) -> bool {
         && runtime.timeouts.runtime_ms > 0 && runtime.timeouts.runtime_ms <= 300_000 + RESULT_GRACE_MS
 }
 
-fn helper_runtime(runtime: &RuntimeKind) -> bool {
-    match runtime {
-        RuntimeKind::Registered(name) => name.as_str() == PROGRAM_RUNTIME || name.as_str() == code_map_helper::RUNTIME || name.as_str() == recording_helper::RUNTIME
-            || name.as_str().strip_prefix("duduclaw-office-").and_then(|v| v.strip_suffix("-v1"))
-                .and_then(|v| v.split_once('-')).is_some_and(|(skill, script)| office_helper::script_id(skill, script).is_ok()),
-        _ => false,
-    }
-}
+/// R8d: one predicate shared with the entitlement derivation, so every
+/// helper this producer requests is one the employee is entitled to.
+fn helper_runtime(runtime: &RuntimeKind) -> bool { crate::isolation_entitlement::in_run_helper_kind(runtime) }
 fn valid_helper(runtime: &PublishedRuntime) -> bool {
     if is_program_runtime(&runtime.runtime) { return valid_runtime(runtime); }
     let RuntimeKind::Registered(name) = &runtime.runtime else { return false; };

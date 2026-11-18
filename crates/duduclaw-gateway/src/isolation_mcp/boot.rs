@@ -196,6 +196,10 @@ pub async fn boot_protected(home: &Path, users: Arc<duduclaw_auth::UserDb>, agen
         if crate::isolation_readiness::verified_generation().is_some() { break; }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+    // R8d D3: once per process, off the boot path (bounded retries until the
+    // isolation service answers): every confirmed live employee's root
+    // entitlement is re-sent from its approved settings.
+    crate::handlers::spawn_entitlement_reconcile(home.to_owned());
     fill_installed_sources(&mut sources, home);
     let backend = duduclaw_execution::selection::protected_backend_for_boot();
     // Reuse the gateway's initialized users.db and confirmed employee registry.

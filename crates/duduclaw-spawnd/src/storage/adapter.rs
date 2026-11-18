@@ -7,6 +7,24 @@ use super::{adapter_state::{Employee, Journal, Lease, Operation, Phase, MAX_BYTE
 
 fn unavailable<T>(_: T) -> ErrorCode { ErrorCode::IsolationUnavailable }
 
+/// Root-local diagnostics only; never crosses the IPC boundary.
+pub(crate) fn storage_open_reason(error: duduclaw_isolation_storage::Error) -> &'static str {
+    use duduclaw_isolation_storage::Error;
+    match error {
+        Error::Unsupported => "unsupported host",
+        Error::Invalid => "invalid storage",
+        Error::Capacity => "capacity reserve",
+        // H uses the same error for the device graph and mount propagation.
+        Error::UnsafeBacking => "backing not supported or mount not private",
+        Error::RecoveryRequired => "recovery required",
+        Error::Busy => "busy",
+        Error::NotFound => "image not found",
+        Error::Quarantined => "quarantined",
+        Error::ResizeUnsupported => "resize not supported",
+        Error::Io => "storage I/O",
+    }
+}
+
 /// Construct after root installation has created both directories. The adapter
 /// never allocates accounts or authorizes a migration proposal. B1 retains its
 /// admission/UID/cgroup fences while calling these synchronous methods.
@@ -21,6 +39,15 @@ impl LoopStorage {
     pub fn open(storage_directory: &Path, journal_directory: &Path) -> Result<Self> {
         let provider = duduclaw_isolation_storage::Storage::open(storage_directory).map_err(unavailable)?;
         Self::with_provider(Box::new(provider), journal_directory)
+    }
+    pub(crate) fn open_diagnosed(storage_directory: &Path, journal_directory: &Path) -> std::result::Result<Self, &'static str> {
+        let directory_ok = |path: &Path| crate::registry::root_path(path, true).is_ok()
+            && fs::symlink_metadata(path).is_ok_and(|meta|
+                meta.is_dir() && meta.uid() == 0 && meta.gid() == 0 && meta.mode() & 0o7777 == 0o700);
+        if !directory_ok(storage_directory) { return Err("image directory"); }
+        let provider = duduclaw_isolation_storage::Storage::open(storage_directory).map_err(storage_open_reason)?;
+        if !directory_ok(journal_directory) { return Err("journal directory"); }
+        Self::with_provider(Box::new(provider), journal_directory).map_err(|_| "journal unavailable")
     }
     fn with_provider(provider: Box<dyn EmployeeStorage>, directory: &Path) -> Result<Self> {
         if unsafe { libc::geteuid() } != 0 { return Err(ErrorCode::IsolationUnavailable); }
@@ -349,5 +376,21 @@ mod tests {
         for name in ["storage.lock", "state.json"] { fs::remove_file(images.join(name)).unwrap(); }
         for name in ["storage-adapter.lock", "storage-adapter.json"] { fs::remove_file(journal.join(name)).unwrap(); }
         fs::remove_dir(images).unwrap(); fs::remove_dir(journal).unwrap(); fs::remove_dir(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod open_reason_tests {
+    use super::*;
+    #[test]
+    fn storage_open_reasons_cover_every_variant() {
+        use duduclaw_isolation_storage::Error::*;
+        for (error, expected) in [(Unsupported, "unsupported host"), (Invalid, "invalid storage"),
+            (Capacity, "capacity reserve"), (UnsafeBacking, "backing not supported or mount not private"),
+            (RecoveryRequired, "recovery required"), (Busy, "busy"), (NotFound, "image not found"),
+            (Quarantined, "quarantined"), (ResizeUnsupported, "resize not supported"), (Io, "storage I/O")] {
+            assert_eq!(storage_open_reason(error), expected);
+            assert!(!expected.is_empty());
+        }
     }
 }

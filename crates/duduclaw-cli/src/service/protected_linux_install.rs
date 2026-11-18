@@ -208,7 +208,11 @@ fn command_within(name: &str, args: &[&str], deadline: std::time::Instant) -> Re
 }
 
 fn checked(name: &str, args: &[&str]) -> Result<Output> {
-    let output = command(name, args)?;
+    checked_with(name, args, &mut command)
+}
+
+fn checked_with(name: &str, args: &[&str], run: &mut impl FnMut(&str, &[&str]) -> Result<Output>) -> Result<Output> {
+    let output = run(name, args)?;
     if !output.status.success() {
         return Err(refused(format!("{name} failed: {}", String::from_utf8_lossy(&output.stderr).trim())));
     }
@@ -454,21 +458,32 @@ fn install_isolation_support_for((uid, gid): (u32, u32), defs: &str, broker_upst
 }
 
 fn isolation_account(name: &str, defs: &str) -> Result<(u32, u32)> {
-    let query = command("getent", &["passwd", name])?;
+    let (uid, gid) = isolation_account_with(name, defs, command)?;
+    checked("loginctl", &["disable-linger", name])?;
+    match fs::symlink_metadata(format!("/var/lib/systemd/linger/{name}")) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        _ => return Err(refused("isolation service linger remains enabled")),
+    }
+    Ok((uid, gid))
+}
+
+fn isolation_account_with(name: &str, defs: &str,
+    mut run: impl FnMut(&str, &[&str]) -> Result<Output>) -> Result<(u32, u32)> {
+    let query = run("getent", &["passwd", name])?;
     match query.status.code() {
         Some(2) => {
             let uid_max = format!("SYS_UID_MAX={}", layout::system_id_limit(defs, "SYS_UID_MAX").map_err(refused)? - 1);
             let gid_max = format!("SYS_GID_MAX={}", layout::system_id_limit(defs, "SYS_GID_MAX").map_err(refused)? - 1);
-            checked("useradd", &["--system", "--user-group", "--no-create-home", "--no-log-init",
+            checked_with("useradd", &["--system", "--user-group", "--no-create-home", "--no-log-init",
                 "--key", "SUB_UID_COUNT=0", "--key", "SUB_GID_COUNT=0",
                 "--key", &uid_max, "--key", &gid_max,
                 "--home-dir", "/nonexistent", "--shell", "/usr/sbin/nologin",
-                "--password", "!*", "--expiredate", "1970-01-02", name])?;
+                "--password", "!*", "--expiredate", "1970-01-02", name], &mut run)?;
         }
         Some(0) => (),
         _ => return Err(refused("cannot query isolation service account")),
     }
-    let passwd = checked("getent", &["passwd", name])?;
+    let passwd = checked_with("getent", &["passwd", name], &mut run)?;
     let passwd = String::from_utf8(passwd.stdout).map_err(|_| refused("invalid service account"))?;
     let fields: Vec<_> = passwd.trim_end_matches('\n').split(':').collect();
     if fields.len() != 7 || fields[0] != name || fields[5] != "/nonexistent"
@@ -476,23 +491,139 @@ fn isolation_account(name: &str, defs: &str) -> Result<(u32, u32)> {
     let uid: u32 = fields[2].parse().map_err(|_| refused("invalid service uid"))?;
     let gid: u32 = fields[3].parse().map_err(|_| refused("invalid service gid"))?;
     layout::validate_system_ids(uid, gid, defs).map_err(refused)?;
-    let groups = checked("id", &["-G", name])?;
+    let groups = checked_with("id", &["-G", name], &mut run)?;
     let groups = String::from_utf8(groups.stdout).map_err(|_| refused("invalid service groups"))?;
     if groups.split_whitespace().collect::<Vec<_>>() != vec![fields[3]] {
         return Err(refused("isolation service has supplementary groups"));
     }
-    let shadow = checked("getent", &["shadow", name])?;
+    // shadow's useradd --system ignores --expiredate. Reapply after identity
+    // validation on both creation and resume, then prove the effective shadow.
+    checked_with("usermod", &["--expiredate", "1970-01-02", name], &mut run)
+        .map_err(|error| refused(format!("cannot expire isolation service account with usermod: {error}")))?;
+    let shadow = checked_with("getent", &["shadow", name], &mut run)?;
     let shadow = String::from_utf8(shadow.stdout).map_err(|_| refused("invalid service lockdown"))?;
     let shadow: Vec<_> = shadow.trim_end_matches('\n').split(':').collect();
     if shadow.len() != 9 || shadow[0] != name || shadow[1] != "!*" || shadow[7] != "1" {
         return Err(refused("isolation service account lockdown mismatch"));
     }
-    checked("loginctl", &["disable-linger", name])?;
-    match fs::symlink_metadata(format!("/var/lib/systemd/linger/{name}")) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
-        _ => return Err(refused("isolation service linger remains enabled")),
-    }
     Ok((uid, gid))
+}
+
+#[cfg(test)]
+mod isolation_account_tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    const NAME: &str = "duduclaw-runsup";
+    const DEFS: &str = "SYS_UID_MAX 999\nSYS_GID_MAX 999\n";
+    const PASSWD: &str = "duduclaw-runsup:x:900:900::/nonexistent:/usr/sbin/nologin\n";
+
+    struct AccountCommands {
+        exists: bool,
+        passwd: String,
+        groups: String,
+        expiry: String,
+        usermod_failure: bool,
+        usermod_missing: bool,
+        calls: Vec<(String, Vec<String>)>,
+    }
+
+    impl AccountCommands {
+        fn new(exists: bool) -> Self {
+            Self { exists, passwd: PASSWD.into(), groups: "900\n".into(), expiry: String::new(),
+                usermod_failure: false, usermod_missing: false, calls: Vec::new() }
+        }
+
+        fn run(&mut self, name: &str, args: &[&str]) -> Result<Output> {
+            self.calls.push((name.into(), args.iter().map(|arg| (*arg).to_owned()).collect()));
+            let (code, text) = match (name, args) {
+                ("getent", ["passwd", NAME]) if !self.exists => (2, String::new()),
+                ("useradd", _) => { self.exists = true; (0, String::new()) }
+                ("getent", ["passwd", NAME]) => (0, self.passwd.clone()),
+                ("id", ["-G", NAME]) => (0, self.groups.clone()),
+                ("usermod", ["--expiredate", "1970-01-02", NAME]) => {
+                    if self.usermod_missing {
+                        return Err(std::io::Error::from(std::io::ErrorKind::NotFound).into());
+                    }
+                    if self.usermod_failure { (1, String::new()) }
+                    else { self.expiry = "1".into(); (0, String::new()) }
+                }
+                ("getent", ["shadow", NAME]) => (0, format!("{NAME}:!*:20775:::::{}:\n", self.expiry)),
+                _ => panic!("unexpected command: {name} {args:?}"),
+            };
+            Ok(Output { status: std::process::ExitStatus::from_raw(code << 8),
+                stdout: text.into_bytes(), stderr: Vec::new() })
+        }
+
+        fn assert_order(&self, expected: &[(&str, &[&str])]) {
+            let expected: Vec<_> = expected.iter().map(|(name, args)|
+                ((*name).to_owned(), args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>())).collect();
+            assert_eq!(self.calls, expected);
+        }
+    }
+
+    #[test]
+    fn isolation_account_new_expires_after_identity_validation_before_shadow() {
+        let mut host = AccountCommands::new(false);
+        assert_eq!(isolation_account_with(NAME, DEFS, |name, args| host.run(name, args)).unwrap(), (900, 900));
+        host.assert_order(&[
+            ("getent", &["passwd", NAME]),
+            ("useradd", &["--system", "--user-group", "--no-create-home", "--no-log-init",
+                "--key", "SUB_UID_COUNT=0", "--key", "SUB_GID_COUNT=0",
+                "--key", "SYS_UID_MAX=998", "--key", "SYS_GID_MAX=998",
+                "--home-dir", "/nonexistent", "--shell", "/usr/sbin/nologin",
+                "--password", "!*", "--expiredate", "1970-01-02", NAME]),
+            ("getent", &["passwd", NAME]), ("id", &["-G", NAME]),
+            ("usermod", &["--expiredate", "1970-01-02", NAME]), ("getent", &["shadow", NAME]),
+        ]);
+    }
+
+    #[test]
+    fn isolation_account_existing_empty_expiry_converges_and_is_idempotent() {
+        let mut host = AccountCommands::new(true);
+        assert!(host.expiry.is_empty());
+        for _ in 0..2 {
+            host.calls.clear();
+            assert_eq!(isolation_account_with(NAME, DEFS, |name, args| host.run(name, args)).unwrap(), (900, 900));
+            assert_eq!(host.expiry, "1");
+            host.assert_order(&[
+                ("getent", &["passwd", NAME]), ("getent", &["passwd", NAME]), ("id", &["-G", NAME]),
+                ("usermod", &["--expiredate", "1970-01-02", NAME]), ("getent", &["shadow", NAME]),
+            ]);
+        }
+    }
+
+    #[test]
+    fn isolation_account_unsafe_identity_refuses_before_usermod() {
+        for passwd in [PASSWD.replace(NAME, "foreign"), PASSWD.replace("/nonexistent", "/home/foreign"),
+            PASSWD.replace("/usr/sbin/nologin", "/bin/sh"), PASSWD.replace(":900:900:", ":0:900:"),
+            PASSWD.replace(":900:900:", ":999:900:"), PASSWD.replace(":900:900:", ":900:999:")] {
+            let mut host = AccountCommands::new(true);
+            host.passwd = passwd;
+            assert!(isolation_account_with(NAME, DEFS, |name, args| host.run(name, args)).is_err());
+            host.assert_order(&[("getent", &["passwd", NAME]), ("getent", &["passwd", NAME])]);
+        }
+        let mut host = AccountCommands::new(true);
+        host.groups = "900 901\n".into();
+        assert!(isolation_account_with(NAME, DEFS, |name, args| host.run(name, args)).is_err());
+        host.assert_order(&[("getent", &["passwd", NAME]), ("getent", &["passwd", NAME]), ("id", &["-G", NAME])]);
+    }
+
+    #[test]
+    fn isolation_account_usermod_failure_or_missing_refuses_before_shadow() {
+        for missing in [false, true] {
+            let mut host = AccountCommands::new(true);
+            host.usermod_failure = !missing;
+            host.usermod_missing = missing;
+            let error = isolation_account_with(NAME, DEFS, |name, args| host.run(name, args)).unwrap_err().to_string();
+            assert!(error.contains("usermod"), "{error}");
+            assert!(host.expiry.is_empty());
+            host.assert_order(&[
+                ("getent", &["passwd", NAME]), ("getent", &["passwd", NAME]), ("id", &["-G", NAME]),
+                ("usermod", &["--expiredate", "1970-01-02", NAME]),
+            ]);
+        }
+    }
 }
 
 // Serialize binary and floor changes across install, upgrade and uninstall.
@@ -944,7 +1075,7 @@ mod spawnd_install_tests {
         assert!(ready.lines().any(|line| line == format!("ExecStart={SPAWND_BINARY} wait-consistent")));
         assert!(lookup("duduclaw-egress.service").contains(duduclaw_isolation::ids::ISOLATED_GATEWAY_UNIT_DEPENDENCIES));
         assert!(service.lines().any(|line| line == "Slice=duduclaw-tcb.slice"));
-        assert!(service.lines().any(|line| line == "ReadWritePaths=/var/lib/duduclaw-spawnd /var/log/duduclaw-spawnd /run/duduclaw-spawnd /etc -/var/lib/systemd/linger"));
+        assert!(service.lines().any(|line| line == "ReadWritePaths=/var/lib/duduclaw-spawnd /run/duduclaw-spawnd /etc -/var/lib/systemd/linger"));
         // HX: cgroupfs is writable only beneath the employees slice; the rest stays protected.
         assert!(service.lines().any(|line| line == "ReadWritePaths=-/sys/fs/cgroup/duduclaw.slice/duduclaw-employees.slice"));
         assert!(service.lines().any(|line| line == "ProtectControlGroups=yes"));

@@ -95,6 +95,10 @@ pub enum Reason {
     /// set and its self test passed. Informational only (`notices`), never an
     /// admission input. Same code as the installer's host-side check.
     LandlockAbiClamped,
+    /// R8d: the gateway's start-up reconcile could not put this employee's
+    /// root host entitlement (the signed profiles of its approved runtimes)
+    /// in force ([`record_entitlement`]); root refuses its runs until it does.
+    RuntimeEntitlementMissing,
 }
 
 impl Reason {
@@ -121,7 +125,7 @@ impl Reason {
             Reason::BindingEvidenceMissing | Reason::ConnectorSetupRequired { .. } | Reason::PersonalBindingConflict
             | Reason::Revoked | Reason::ServiceUnavailable | Reason::HelperLauncherUnavailable { .. }
             | Reason::HelperRuntimeMissing { .. } | Reason::WorkspaceBrokerUnavailable
-            | Reason::HelperRecordingUnsupported | Reason::MigrationPending => false,
+            | Reason::HelperRecordingUnsupported | Reason::MigrationPending | Reason::RuntimeEntitlementMissing => false,
         }
     }
 
@@ -231,7 +235,7 @@ impl ToolNeeds {
             Reason::LandlockAbiClamped => false,
             Reason::BindingEvidenceMissing | Reason::ConnectorSetupRequired { .. } | Reason::PersonalBindingConflict
             | Reason::Revoked | Reason::ServiceUnavailable | Reason::HelperRecordingUnsupported
-            | Reason::MigrationPending => true,
+            | Reason::MigrationPending | Reason::RuntimeEntitlementMissing => true,
         }
     }
 
@@ -447,6 +451,25 @@ fn connector_reports() -> Option<BTreeMap<String, ConnectorReport>> {
     CONNECTOR_REPORTS.lock().ok().map(|reports| reports.clone())
 }
 
+/// R8d: the last start-up entitlement outcome per label (employee, put in force).
+static ENTITLEMENT_REPORTS: Mutex<BTreeMap<String, (EmployeeId, bool)>> = Mutex::new(BTreeMap::new());
+
+/// Called by the gateway's start-up entitlement reconcile for every live
+/// confirmed employee it handled. A newer outcome of the label replaces the
+/// older one; one for another employee id under the label is ignored at read.
+pub(crate) fn record_entitlement(label: &str, employee: EmployeeId, in_force: bool) {
+    let Ok(mut reports) = ENTITLEMENT_REPORTS.lock() else { return };
+    if reports.len() >= MAX_REPORTS && !reports.contains_key(label) { return; }
+    reports.insert(label.to_owned(), (employee, in_force));
+}
+
+/// Whether the last reconcile of this exact employee failed. No report (not
+/// reconciled yet) is not a failure: the run gate itself still refuses.
+fn entitlement_failed(label: &str, employee: EmployeeId) -> bool {
+    ENTITLEMENT_REPORTS.lock().map_or(true, |reports|
+        reports.get(label).is_some_and(|(reported, in_force)| *reported == employee && !*in_force))
+}
+
 /// The assessed state of every confirmed protected employee.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Assessment {
@@ -505,6 +528,7 @@ fn employee_reasons(home: &Path, entry: &lifecycle::ConfirmedEntry, root: &dyn R
         }
     }
     factory_reasons(&lifecycle, reports, &mut reasons);
+    if entitlement_failed(&lifecycle.label, lifecycle.employee) { reasons.insert(Reason::RuntimeEntitlementMissing); }
     match catalog {
         Err(_) => { reasons.insert(Reason::ServiceUnavailable); }
         Ok(None) => {}

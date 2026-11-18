@@ -36,6 +36,10 @@ mod departments;
 mod config_receipt;
 #[path = "migration_authority_employee.rs"]
 pub(crate) mod employee;
+// R8d D3: the start-up entitlement reconcile (spawned by the protected boot).
+#[path = "migration_authority_entitlement.rs"]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) mod entitlement;
 // F6l: `EmployeeRetire` proposals (F6 design r5 §3.12); wired into the
 // confirmation RPC by F6d.
 #[path = "migration_authority_retire.rs"]

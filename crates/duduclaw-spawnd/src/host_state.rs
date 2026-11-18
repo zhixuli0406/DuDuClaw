@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use duduclaw_isolation::{ids::{EmployeeId, RunId}, ipc::ErrorCode};
 use crate::{registry::{root_path, REGISTRY_DIRECTORY}, readiness::Readiness};
 pub const READINESS_PATH: &str = "/run/duduclaw-spawnd/readiness.json";
-const MAX_BYTES: u64 = 64 * 1024;
+/// Size cap of every document written by [`atomic_json`] or read by
+/// [`read_json`] (R8d: the gateway projection's capacity bound).
+pub(crate) const MAX_BYTES: u64 = 64 * 1024;
 fn invalid() -> io::Error { io::Error::other("invalid spawnd state") }
 
 pub fn atomic_json<T: Serialize>(path: &Path, value: &T, gid: u32, mode: u32) -> io::Result<()> {

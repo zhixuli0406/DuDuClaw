@@ -65,17 +65,18 @@ pub fn request(request:&Request)->Result<Receipt,Error>{
         || receipt.disabled!=(request.action==Action::Disable){return invalid()}
     Ok(receipt)
 }
-/// Schema-2 exchange (F6l), or the schema-3 `Allocate` (R7d): the checked
-/// answer, a refusal code included. Any transport failure or missing/garbled
-/// reply (an unknown refusal kind included) is an `Err` (the caller reports
-/// `ROOT_UNAVAILABLE`, never `NotFound`, S5d).
+/// Schema-2 exchange (F6l), the schema-3 `Allocate` (R7d) or the schema-4
+/// `Entitle` (R8d): the checked answer, a refusal code included. Any
+/// transport failure or missing/garbled reply (an unknown refusal kind
+/// included) is an `Err` (the caller reports `ROOT_UNAVAILABLE`, never
+/// `NotFound`, S5d).
 pub fn exchange(request:&Request)->Result<Answer,Error>{
     check_response(request,round_trip(request)?)
 }
-/// The unchecked reply to a schema-2/3 request; callers must pass it through
-/// [`check_response`] ([`exchange`] does).
+/// The unchecked reply to a schema-2/3/4 request; callers must pass it
+/// through [`check_response`] ([`exchange`] does).
 pub fn round_trip(request:&Request)->Result<Response,Error>{
-    if !matches!(request.schema,SCHEMA_V2|SCHEMA_V3){return Err(Error::Invalid)}
+    if !matches!(request.schema,SCHEMA_V2|SCHEMA_V3|SCHEMA_V4){return Err(Error::Invalid)}
     request.check()?;let fd=connect()?;
     send(&fd,request)?;receive(&fd)
 }

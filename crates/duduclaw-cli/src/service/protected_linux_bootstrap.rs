@@ -90,7 +90,7 @@ pub(super) const NIGHTLY_TIMER: &str = "duduclaw-auto-upgrade.timer";
 /// "installed publication consumers"): 0700 directories and the root-only
 /// host publication with no entitlements yet.
 const SPAWND_ROOT: &str = "/var/lib/duduclaw-spawnd";
-const SPAWND_ANCHORS: [&str; 3] = ["etc-state", "projections", "snapshots"];
+const SPAWND_ANCHORS: [&str; 5] = ["etc-state", "projections", "snapshots", "images", "storage"];
 const SPAWND_PUBLICATION: &str = "publication.json";
 /// The signed isolation policy artifact (`duduclaw-spawnd` installed.rs).
 const POLICY_REGISTRY_ID: &str = "isolation-policy-v1";
@@ -124,7 +124,7 @@ pub(super) const SPAWND_RUNTIME: &str = "/run/duduclaw-spawnd";
 /// The trees R1's `trust_init::publish` creates at S4(a).
 const TRUST_TREES: [&str; 3] = ["/opt/duduclaw-isolated", "/etc/duduclaw-updated", "/var/lib/duduclaw-updated"];
 /// The trees of `layout::DIRECTORIES` created at S4(c).
-const LAYOUT_TREES: [&str; 3] = ["/var/lib/duduclaw-spawnd", "/var/log/duduclaw-spawnd", "/var/lib/duduclaw-migrate"];
+const LAYOUT_TREES: [&str; 2] = ["/var/lib/duduclaw-spawnd", "/var/lib/duduclaw-migrate"];
 const MACHINE_ID: &str = "/etc/machine-id";
 /// `/sys/class/dmi/id/product_uuid` (`/sys/class/dmi/id` is a link to this
 /// canonical sysfs directory; links are never followed). Absent without DMI.
@@ -246,7 +246,7 @@ fn cgroup_not_quiet(cgroup: &str) -> DuDuClawError {
 fn unit_redefined(unit: &str) -> DuDuClawError {
     refused(format!("{QUIESCE_CONTEXT}，{unit} 的單元檔或 systemd 載入的定義在停止它的期間被更換或重新載入；被停止的可能不是這次安裝的單元。已停止，未重新執行任何步驟，也未移除任何東西。請確認 {unit} 的來源（sudo systemctl status {unit}）後再執行同一個命令。"))
 }
-const PUBLICATION_MISMATCH: &str = "隔離執行服務的發布紀錄 /var/lib/duduclaw-spawnd/publication.json 不是這次安裝寫入的內容（必須是 root 擁有、權限 0600 的一般檔案，只含這個世代且沒有任何授權）；已停止，未覆蓋它。";
+const PUBLICATION_MISMATCH: &str = "隔離執行服務的發布紀錄 /var/lib/duduclaw-spawnd/publication.json 不是這次安裝的內容（必須是 root 擁有、權限 0600 的一般檔案，只含這個世代，且沒有授權或只有通過簽署政策檢查的授權）；已停止，未覆蓋它。";
 const HOST_DNS_CHANGED: &str = "主機的 DNS 狀態（systemd-resolved 是否可用）與第一次執行時不同。請恢復原狀後續接，或先執行 duduclaw-bootstrap rollback。";
 const PUBLISHED_MISMATCH: &str = "已發布的內容與這次安裝不符。";
 const LICENSE_MODE: &str = "團隊版授權檔 license.json 的權限必須是 0600 或 0644。";
@@ -1911,13 +1911,43 @@ fn statfs_type(path: &CStr) -> Option<i64> {
 }
 
 #[allow(clippy::unnecessary_cast)]
-fn free_bytes(path: &CStr) -> Option<u64> {
+fn filesystem_bytes(path: &CStr) -> Option<(u64, u64)> {
     let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
     // SAFETY: NUL-terminated path; the buffer is written on success.
     if unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 { return None; }
     // SAFETY: initialized by the successful statvfs.
     let stat = unsafe { stat.assume_init() };
-    (stat.f_bavail as u64).checked_mul(stat.f_frsize as u64)
+    Some(((stat.f_blocks as u64).checked_mul(stat.f_frsize as u64)?,
+        (stat.f_bavail as u64).checked_mul(stat.f_frsize as u64)?))
+}
+
+fn free_bytes(path: &CStr) -> Option<u64> { filesystem_bytes(path).map(|(_, free)| free) }
+
+const MKFS_REQUIRED: &str = "缺少可信任的 /usr/sbin/mkfs.ext4；請安裝 e2fsprogs，並確認檔案及上層目錄由 root 管理。";
+const LOOP_REQUIRED: &str = "核心 loop 模組必須可用：請執行 modprobe loop，確認 /dev/loop-control 是字元裝置 10:237。";
+const RESERVE_REQUIRED: &str = "/var/lib 所在檔案系統的可用空間必須至少保留 20 GiB 或總容量的 10%（取較大值）。";
+const DMSETUP_REQUIRED: &str = "無法讀取 device-mapper 裝置表；請確認已安裝 dmsetup／lvm2 套件，且 dmsetup 可由 root 執行。";
+
+// Pure decisions also cover absent/unreadable host evidence (fail closed).
+fn storage_tools_clear(mkfs_trusted: bool, loop_device: Option<(bool, u64, u64)>) -> std::result::Result<(), &'static str> {
+    if !mkfs_trusted { return Err(MKFS_REQUIRED); }
+    if loop_device != Some((true, 10, 237)) { return Err(LOOP_REQUIRED); }
+    Ok(())
+}
+fn storage_reserve_clear(capacity: Option<(u64, u64)>) -> std::result::Result<(), &'static str> {
+    match capacity {
+        Some((total, free)) if total != 0 && free <= total && free >= duduclaw_isolation::storage_reserve_bytes(total) => Ok(()),
+        _ => Err(RESERVE_REQUIRED),
+    }
+}
+fn storage_tools() -> std::result::Result<(), &'static str> {
+    use std::os::unix::fs::FileTypeExt;
+    let mkfs = Path::new("/usr/sbin/mkfs.ext4");
+    let trusted = fs::canonicalize(mkfs).ok().is_some_and(|path|
+        parents(&path).and_then(|_| trusted(&path, false)).is_ok());
+    let device = fs::symlink_metadata("/dev/loop-control").ok().map(|metadata|
+        (metadata.file_type().is_char_device(), libc::major(metadata.rdev()) as u64, libc::minor(metadata.rdev()) as u64));
+    storage_tools_clear(trusted, device)
 }
 
 fn tool_present(name: &str) -> bool {
@@ -2043,14 +2073,16 @@ fn preflight(upstream: Option<SocketAddr>, hosts: &[IpAddr], stage: &StageReceip
     if !kernel.is_some_and(|version| version >= (5, 15)) { fail("需要 Linux 核心 5.15 以上。"); }
     if statfs_type(c"/sys/fs/cgroup") != Some(0x6367_7270) { fail("需要 cgroup v2（unified）。"); }
     if let Err(message) = storage_clear() { fail(message); }
-    for tool in ["systemctl", "useradd", "getent", "id", "loginctl", "python3", "setpriv"] {
-        if !tool_present(tool) { fail("缺少必要的系統工具（systemctl、useradd、getent、id、loginctl、python3、setpriv）。"); break; }
+    if let Err(message) = storage_tools() { fail(message); }
+    if let Err(message) = storage_reserve_clear(filesystem_bytes(c"/var/lib")) { fail(message); }
+    for tool in ["systemctl", "useradd", "usermod", "getent", "id", "loginctl", "python3", "setpriv"] {
+        if !tool_present(tool) { fail("缺少必要的系統工具（systemctl、useradd、usermod、getent、id、loginctl、python3、setpriv）。"); break; }
     }
     // Identities (design §5.1).
     match read_root_text("/etc/login.defs", 1024 * 1024) {
         Ok(Some(defs)) => {
             if layout::system_id_limit(&defs, "SYS_UID_MAX").is_err() || layout::system_id_limit(&defs, "SYS_GID_MAX").is_err() {
-                fail("/etc/login.defs 必須明確設定 SYS_UID_MAX 與 SYS_GID_MAX。");
+                fail("/etc/login.defs 的 SYS_UID_MAX 或 SYS_GID_MAX 設定或推算結果無效：請檢查是否有格式錯誤、重複設定，或數值超出允許範圍。");
             }
             if !login_range_clear(&defs, "UID") || !login_range_clear(&defs, "GID") {
                 fail("一般帳號的 uid／gid 範圍與員工專用範圍 70000–99999 重疊。");
@@ -2256,7 +2288,7 @@ pub(super) fn storage_chain(devices: &mut dyn BlockDevices, root: (u32, u32)) ->
         if devices.is_dir(&format!("{node}/dm")) {
             let uuid = devices.read(&format!("{node}/dm/uuid")).ok_or(undetermined)?;
             if NON_PREALLOCATED_UUID_SUFFIXES.iter().any(|suffix| uuid.trim().ends_with(suffix)) { return Err(STORAGE_THIN); }
-            let table = devices.dm_table(device).ok_or(undetermined)?;
+            let table = devices.dm_table(device).ok_or(DMSETUP_REQUIRED)?;
             dm_targets_clear(&table).map_err(|thin| if thin { STORAGE_THIN } else { undetermined })?;
             if below.is_empty() { return Err(undetermined); }
         } else if devices.exists(&format!("{node}/partition")) {
@@ -2473,6 +2505,7 @@ fn publish_platform(context: &mut Context, dns: &Dns) -> Result<()> {
     if manifest.artifacts != context.stage.artifacts || version != duduclaw_gateway::updater::current_version() {
         return Err(refused(STAGE_UNVERIFIED));
     }
+    let generation_hex = context.generation_hex.clone();
     let recorder = &mut context.recorder;
     with_version_lock(|| {
         // The protected-mode marker only narrows; rollback keeps it (not ledgered).
@@ -2507,7 +2540,7 @@ fn publish_platform(context: &mut Context, dns: &Dns) -> Result<()> {
         rerecord_layout_modes(recorder)?;
         // Check point 2 for the helper accounts (check point 3: S6, before they run).
         verify_identities(&service_names())?;
-        spawnd_anchors(digest)?;
+        spawnd_anchors(digest, &|entitlements| entitlements_admitted(digest, &generation_hex, entitlements))?;
         // (d) The nightly update requester: files only; enabled at S6 (Q11).
         nightly_files(recorder)?;
         // (e) C3: the gateway unit files; neither enabled nor started here.
@@ -2842,11 +2875,12 @@ fn install_license((uid, gid): (u32, u32)) -> Result<()> {
 }
 
 /// Review H1: spawnd's root host publication `publication.json`. Its consumer
-/// type (`duduclaw-spawnd` installed.rs `HostPublication`) is private to
-/// spawnd, so it is mirrored here with the same three fields and
-/// `deny_unknown_fields` (pinned by `spawnd_publication_field_set_is_pinned`).
-/// Entitlements are only ever compared with the empty list this install
-/// writes, so their records stay untyped JSON here.
+/// type (`duduclaw-spawnd` installed.rs `HostPublication`) is mirrored here
+/// with the same three fields and `deny_unknown_fields` (pinned by
+/// `spawnd_publication_field_set_is_pinned`). This install writes the empty
+/// list; after it, spawnd writes the entitlements (R8d), so the records stay
+/// untyped JSON here and are judged by spawnd's own check
+/// (`signed_policy_admits_entitlements`).
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct HostPublication {
@@ -2888,10 +2922,21 @@ pub(super) fn read_publication_at(directory: &fs::File, (uid, gid): (u32, u32)) 
     serde_json::from_slice(&bytes).map(Some).map_err(|_| mismatch())
 }
 
-/// Review H1: S4 holds for the publication only when it is, field for field,
-/// what this install publishes.
-pub(super) fn publication_holds(directory: &fs::File, owner: (u32, u32), generation: Sha256Digest) -> bool {
-    matches!(read_publication_at(directory, owner), Ok(Some(publication)) if publication == HostPublication::expected(generation))
+/// Review H1 / R8d C: S4 holds for the publication when it is version 1 of
+/// THIS generation and its entitlements are either the empty list this
+/// install publishes or, once spawnd has entitled employees, records that
+/// `admitted` (spawnd's production check against this generation's signed
+/// policy) accepts. Another generation or invalid content never holds.
+pub(super) fn publication_holds(directory: &fs::File, owner: (u32, u32), generation: Sha256Digest,
+    admitted: &dyn Fn(&[serde_json::Value]) -> bool) -> bool {
+    matches!(read_publication_at(directory, owner), Ok(Some(publication)) if publication_admitted(&publication, generation, admitted))
+}
+
+fn publication_admitted(publication: &HostPublication, generation: Sha256Digest,
+    admitted: &dyn Fn(&[serde_json::Value]) -> bool) -> bool {
+    let expected = HostPublication::expected(generation);
+    publication.version == expected.version && publication.generation == expected.generation
+        && (publication.entitlements.is_empty() || admitted(&publication.entitlements))
 }
 
 /// `/var/lib/duduclaw-spawnd` as a no-follow dirfd after its ancestors and itself were checked.
@@ -2903,8 +2948,9 @@ fn spawnd_root_fd() -> Result<fs::File> {
 }
 
 /// spawnd's root anchors and its root-only host publication (no entitlement
-/// yet: employees are confirmed later through spawnd's own RPC).
-fn spawnd_anchors(digest: Sha256Digest) -> Result<()> {
+/// on a fresh install: spawnd writes them later through its own RPC, R8d; a
+/// re-run after that accepts them when `admitted`, never rewriting them).
+fn spawnd_anchors(digest: Sha256Digest, admitted: &dyn Fn(&[serde_json::Value]) -> bool) -> Result<()> {
     let root = Directory::open(Path::new(SPAWND_ROOT)).map_err(|_| refused("隔離執行服務的狀態目錄不符。"))?;
     for name in SPAWND_ANCHORS {
         match root.child(name) {
@@ -2913,20 +2959,21 @@ fn spawnd_anchors(digest: Sha256Digest) -> Result<()> {
             Err(_) => return Err(refused("隔離執行服務的目錄不符。")),
         }
         let metadata = fs::symlink_metadata(Path::new(SPAWND_ROOT).join(name))?;
-        if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o7777 != 0o700 {
+        if !metadata.is_dir() || metadata.uid() != 0 || metadata.gid() != 0 || metadata.mode() & 0o7777 != 0o700 {
             return Err(refused("隔離執行服務的目錄權限不符。"));
         }
     }
-    // Review H1: an existing publication must be exactly this install's (never
-    // overwritten); an absent one is written (root 0600) and read back.
+    // Review H1: an existing publication must be this install's generation
+    // with admitted entitlements (never overwritten); an absent one is
+    // written (root 0600, no entitlement) and read back.
     let expected = HostPublication::expected(digest);
     let directory = spawnd_root_fd()?;
     match read_publication_at(&directory, (0, 0))? {
-        Some(existing) if existing == expected => (),
+        Some(existing) if publication_admitted(&existing, digest, admitted) => (),
         Some(_) => return Err(refused(PUBLICATION_MISMATCH)),
         None => root.atomic_json(SPAWND_PUBLICATION, &expected).map_err(|_| refused("無法寫入隔離執行服務的發布紀錄。"))?,
     }
-    if !publication_holds(&directory, (0, 0), digest) { return Err(refused(PUBLICATION_MISMATCH)); }
+    if !publication_holds(&directory, (0, 0), digest, admitted) { return Err(refused(PUBLICATION_MISMATCH)); }
     Ok(())
 }
 
@@ -2988,19 +3035,35 @@ pub(super) fn check_egress(config: &duduclaw_egress::daemon::Config, policy: &[P
 
 /// The signed policy's egress profile ids, through spawnd's own strict reader.
 fn signed_policy_profiles(context: &Context) -> Result<Vec<ProfileId>> {
+    let bytes = signed_policy_bytes(context.generation, &context.generation_hex)?;
+    duduclaw_spawnd::installed::signed_policy_egress_profiles(&bytes).map_err(|_| refused(POLICY_REFUSED))
+}
+
+/// The bytes of `generation`'s signed policy artifact, exactly as its
+/// authenticated manifest binds them (mode, size, sha256).
+fn signed_policy_bytes(generation: Sha256Digest, generation_hex: &str) -> Result<Vec<u8>> {
     use duduclaw_updated::linux::INSTALL_ROOT;
-    let manifest = readiness::authenticated_manifest(context.generation)?;
+    let manifest = readiness::authenticated_manifest(generation)?;
     let target = InstallTarget::RuntimeEntry { registry_id: POLICY_REGISTRY_ID.into() };
     let artifact = single_artifact(&manifest.artifacts, &target).ok_or_else(|| refused(POLICY_REFUSED))?;
     if artifact.mode != 0o444 || artifact.size_bytes == 0 || artifact.size_bytes > 1024 * 1024 { return Err(refused(POLICY_REFUSED)); }
     let name = duduclaw_updated::publication::artifact_name(&target).map_err(|_| refused(POLICY_REFUSED))?;
-    let generation = Directory::open(Path::new(INSTALL_ROOT)).and_then(|install| install.child("generations"))
-        .and_then(|generations| generations.child(&context.generation_hex)).map_err(|_| refused(POLICY_REFUSED))?;
-    let bytes = generation.bytes(&name, 1024 * 1024).map_err(|_| refused(POLICY_REFUSED))?;
+    let directory = Directory::open(Path::new(INSTALL_ROOT)).and_then(|install| install.child("generations"))
+        .and_then(|generations| generations.child(generation_hex)).map_err(|_| refused(POLICY_REFUSED))?;
+    let bytes = directory.bytes(&name, 1024 * 1024).map_err(|_| refused(POLICY_REFUSED))?;
     if bytes.len() as u64 != artifact.size_bytes || duduclaw_updated::publication::manifest_digest(&bytes) != artifact.sha256 {
         return Err(refused(POLICY_REFUSED));
     }
-    duduclaw_spawnd::installed::signed_policy_egress_profiles(&bytes).map_err(|_| refused(POLICY_REFUSED))
+    Ok(bytes)
+}
+
+/// R8d C: whether the entitlements of an existing host publication pass
+/// spawnd's production check against `generation`'s signed policy. The empty
+/// list (a fresh install) needs no policy read; anything unreadable admits
+/// nothing.
+fn entitlements_admitted(generation: Sha256Digest, generation_hex: &str, entitlements: &[serde_json::Value]) -> bool {
+    entitlements.is_empty() || signed_policy_bytes(generation, generation_hex).is_ok_and(|bytes|
+        duduclaw_spawnd::installed::signed_policy_admits_entitlements(&bytes, entitlements).is_ok())
 }
 
 /// Write `bytes` to a root config (0644) unless it already holds exactly them.
@@ -3561,9 +3624,15 @@ fn platform_published(context: &Context, dns: &Dns) -> Result<()> {
     }
     parse_runtime_tree(false)?;
     let spawnd = Directory::open(Path::new(SPAWND_ROOT)).map_err(|_| mismatch())?;
-    for name in SPAWND_ANCHORS { spawnd.child(name).map_err(|_| mismatch())?; }
-    // Review H1: every field equal to what this install publishes (no entitlement).
-    if !publication_holds(&spawnd_root_fd()?, (0, 0), context.generation) { return Err(mismatch()); }
+    for name in SPAWND_ANCHORS {
+        spawnd.child(name).map_err(|_| mismatch())?;
+        let metadata = fs::symlink_metadata(Path::new(SPAWND_ROOT).join(name))?;
+        if metadata.mode() & 0o7777 != 0o700 { return Err(mismatch()); }
+    }
+    // Review H1 / R8d C: this generation, and no entitlement or only ones
+    // spawnd's production check admits (a resumed install after employees exist).
+    let admitted = |entitlements: &[serde_json::Value]| entitlements_admitted(context.generation, &context.generation_hex, entitlements);
+    if !publication_holds(&spawnd_root_fd()?, (0, 0), context.generation, &admitted) { return Err(mismatch()); }
     text_installed(NIGHTLY_HELPER, 0o755, NIGHTLY_HELPER_TEXT)?;
     for (name, text) in NIGHTLY_UNITS { text_installed(&unit_file(name), 0o644, text)?; }
     // C3: the gateway unit files are S4's now (unexpected bytes do not hold).
@@ -3838,6 +3907,37 @@ mod tests {
         assert!(egress_document(&[policy[0], policy[0]], DnsRoute::ResolvedVarlink, &[]).is_err());
         let many: Vec<IpAddr> = (0..=MAX_HOST_PUBLIC_ADDRESSES).map(|index| IpAddr::from([198, 51, 100, index as u8])).collect();
         assert!(egress_document(&policy, DnsRoute::ResolvedVarlink, &many).is_err());
+    }
+
+    #[test]
+    fn preflight_storage_tools_refuse_missing_mkfs_and_invalid_loop_control() {
+        assert_eq!(storage_tools_clear(false, Some((true, 10, 237))), Err(MKFS_REQUIRED));
+        assert!(MKFS_REQUIRED.contains("mkfs.ext4") && MKFS_REQUIRED.contains("e2fsprogs"));
+        for device in [None, Some((false, 10, 237)), Some((true, 7, 237)), Some((true, 10, 236))] {
+            assert_eq!(storage_tools_clear(true, device), Err(LOOP_REQUIRED));
+        }
+        assert!(LOOP_REQUIRED.contains("modprobe loop"));
+        assert_eq!(storage_tools_clear(true, Some((true, 10, 237))), Ok(()));
+    }
+
+    #[test]
+    fn preflight_storage_reserve_accepts_only_at_or_above_shared_boundary() {
+        const G: u64 = 1024 * 1024 * 1024;
+        for (total, reserve) in [(100 * G, 20 * G), (300 * G + 1, 30 * G + 1)] {
+            assert_eq!(storage_reserve_clear(Some((total, reserve - 1))), Err(RESERVE_REQUIRED));
+            assert_eq!(storage_reserve_clear(Some((total, reserve))), Ok(()));
+            assert_eq!(storage_reserve_clear(Some((total, reserve + 1))), Ok(()));
+        }
+        for capacity in [None, Some((0, 0)), Some((10 * G, 10 * G)), Some((100 * G, 101 * G))] {
+            assert_eq!(storage_reserve_clear(capacity), Err(RESERVE_REQUIRED));
+        }
+    }
+
+    #[test]
+    fn spawnd_anchor_list_includes_storage_in_install_order() {
+        assert_eq!(SPAWND_ANCHORS, ["etc-state", "projections", "snapshots", "images", "storage"]);
+        // Both are below the already-ledgered tree; no new host installation fact.
+        assert!(duduclaw_core::isolation_install::FACTS.contains(&SPAWND_ROOT));
     }
 
     #[test]
@@ -5201,6 +5301,8 @@ gshadow:        files\nhosts:          files mdns4_minimal [NOTFOUND=return] dns
         let dir = fs::File::open(directory.path()).unwrap();
         let me = unsafe { (libc::geteuid(), libc::getegid()) };
         let generation = digest(1);
+        // spawnd's check refusing every entitlement (the pre-R8d rule).
+        let refuse = |_: &[serde_json::Value]| false;
         let path = directory.path().join("publication.json");
         let write = |value: &serde_json::Value| {
             let _ = fs::remove_file(&path);
@@ -5209,11 +5311,11 @@ gshadow:        files\nhosts:          files mdns4_minimal [NOTFOUND=return] dns
         };
         let good = serde_json::json!({ "version": 1, "generation": generation, "entitlements": [] });
         write(&good);
-        assert!(publication_holds(&dir, me, generation));
+        assert!(publication_holds(&dir, me, generation, &refuse));
         // Absent: nothing holds (and the reader says absent, not damaged).
         fs::remove_file(&path).unwrap();
         assert!(read_publication_at(&dir, me).unwrap().is_none());
-        assert!(!publication_holds(&dir, me, generation));
+        assert!(!publication_holds(&dir, me, generation, &refuse));
         // Same generation, but forged or left-over content: S4 does not hold.
         let entitlement = serde_json::json!([{ "employee": "00".repeat(16), "profiles": [digest(2)] }]);
         for bad in [
@@ -5225,22 +5327,22 @@ gshadow:        files\nhosts:          files mdns4_minimal [NOTFOUND=return] dns
             serde_json::json!([]),
         ] {
             write(&bad);
-            assert!(!publication_holds(&dir, me, generation), "{bad}");
+            assert!(!publication_holds(&dir, me, generation, &refuse), "{bad}");
         }
         // Wrong mode, another owner, a hard link, oversize: refused before parsing.
         write(&good);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(!publication_holds(&dir, me, generation));
+        assert!(!publication_holds(&dir, me, generation, &refuse));
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(!publication_holds(&dir, (me.0.wrapping_add(1), me.1), generation));
+        assert!(!publication_holds(&dir, (me.0.wrapping_add(1), me.1), generation, &refuse));
         fs::hard_link(&path, directory.path().join("alias")).unwrap();
-        assert!(!publication_holds(&dir, me, generation));
+        assert!(!publication_holds(&dir, me, generation, &refuse));
         fs::remove_file(directory.path().join("alias")).unwrap();
-        assert!(publication_holds(&dir, me, generation));
+        assert!(publication_holds(&dir, me, generation, &refuse));
         let mut padded = serde_json::to_vec(&good).unwrap();
         padded.resize(MAX_PUBLICATION_BYTES as usize + 1, b' ');
         fs::write(&path, &padded).unwrap();
-        assert!(!publication_holds(&dir, me, generation));
+        assert!(!publication_holds(&dir, me, generation, &refuse));
         // A symlink to a correct publication is never followed.
         fs::remove_file(&path).unwrap();
         let target = directory.path().join("real.json");
@@ -5248,7 +5350,45 @@ gshadow:        files\nhosts:          files mdns4_minimal [NOTFOUND=return] dns
         fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
         std::os::unix::fs::symlink(&target, &path).unwrap();
         assert!(read_publication_at(&dir, me).is_err());
-        assert!(!publication_holds(&dir, me, generation));
+        assert!(!publication_holds(&dir, me, generation, &refuse));
+    }
+
+    /// R8d C: a resumed / re-run install after spawnd entitled employees
+    /// holds when the entitlements pass spawnd's check for THIS generation;
+    /// another generation or invalid content never holds.
+    #[test]
+    fn publication_with_admitted_entitlements_of_this_generation_holds() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let dir = fs::File::open(directory.path()).unwrap();
+        let me = unsafe { (libc::geteuid(), libc::getegid()) };
+        let generation = digest(1);
+        let path = directory.path().join("publication.json");
+        let write = |value: &serde_json::Value| {
+            let _ = fs::remove_file(&path);
+            fs::write(&path, serde_json::to_vec(value).unwrap()).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        let record = serde_json::json!({ "employee": vec![5u8; 16], "profiles": [digest(2)] });
+        let entitled = serde_json::json!({ "version": 1, "generation": generation, "entitlements": [record.clone()] });
+        // What the check is asked about is exactly the stored records.
+        let seen = std::cell::RefCell::new(Vec::new());
+        let admit = |entitlements: &[serde_json::Value]| { seen.borrow_mut().push(entitlements.to_vec()); true };
+        let refuse = |_: &[serde_json::Value]| false;
+        write(&entitled);
+        assert!(publication_holds(&dir, me, generation, &admit));
+        assert_eq!(*seen.borrow(), vec![vec![record.clone()]]);
+        assert!(!publication_holds(&dir, me, generation, &refuse), "invalid entitlements");
+        // Another generation never holds, whatever the check says.
+        write(&serde_json::json!({ "version": 1, "generation": digest(3), "entitlements": [record.clone()] }));
+        assert!(!publication_holds(&dir, me, generation, &admit));
+        write(&serde_json::json!({ "version": 2, "generation": generation, "entitlements": [record] }));
+        assert!(!publication_holds(&dir, me, generation, &admit));
+        // A fresh install's empty list holds without asking the check.
+        seen.borrow_mut().clear();
+        write(&serde_json::json!({ "version": 1, "generation": generation, "entitlements": [] }));
+        assert!(publication_holds(&dir, me, generation, &refuse));
+        assert!(seen.borrow().is_empty());
     }
 
     fn drive_scripted(journal: &mut Journal, host: &mut ScriptedHost) -> (Result<()>, Vec<(Step, Phase)>) {
@@ -5552,7 +5692,7 @@ duduclaw-dl:x:987:\nduduclaw-dns:x:986:\nduduclaw-selftest:x:985:\nsudo:x:27:ali
         dm(&mut sysfs, 7, "LVM-y", "0 2048 mystery 252:1 0\n", ("vda1", (252, 1)));
         assert_eq!(storage_chain(&mut sysfs, (253, 7)), Err(STORAGE_UNDETERMINED));
         sysfs.tables.retain(|(id, _)| *id != (253, 7));
-        assert_eq!(storage_chain(&mut sysfs, (253, 7)), Err(STORAGE_UNDETERMINED));
+        assert_eq!(storage_chain(&mut sysfs, (253, 7)), Err(DMSETUP_REQUIRED));
         let mut wrong = disk_with_partition();
         let partition_dev = format!("{DISK}/vda1/dev");
         wrong.files.retain(|(path, _)| *path != partition_dev);
@@ -5620,6 +5760,11 @@ duduclaw-dl:x:987:\nduduclaw-dns:x:986:\nduduclaw-selftest:x:985:\nsudo:x:27:ali
     fn iso_root_install_fresh_end_to_end() {
         let generation = disposable_generation();
         continue_with(options("install", &generation), false).unwrap();
+        for name in SPAWND_ANCHORS {
+            let metadata = fs::symlink_metadata(Path::new(SPAWND_ROOT).join(name)).unwrap();
+            assert!(metadata.is_dir());
+            assert_eq!((metadata.uid(), metadata.gid(), metadata.mode() & 0o7777), (0, 0, 0o700), "{name}");
+        }
         let journal = journal_now().unwrap();
         assert!(journal.committed && journal.step == Step::Commit);
         assert_eq!(journal.host, host_digest().unwrap());

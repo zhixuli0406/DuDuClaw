@@ -10,6 +10,11 @@
 //! burned: never recycled, §7 N4), the loop image is destroyed and the entry
 //! becomes `Retired`, which no longer holds the label. It never creates an
 //! entry, is idempotent, and is resumed by the gateway after any failure.
+//!
+//! R8d: `Entitle` (schema 4) writes the host entitlement of an employee whose
+//! entry is Ready (`crate::entitlement::entitle`); `Disable` and `Retire`
+//! remove it FIRST (before their state change; absent ⇒ nothing to do), so a
+//! crash between the two steps resumes cleanly.
 use std::{fs::{self,File,OpenOptions},io::{self,Read,Write},path::{Path,PathBuf},os::unix::fs::{OpenOptionsExt,MetadataExt}};
 use serde::{Serialize,Deserialize};
 use duduclaw_migration::allocation::{self as wire,Action,Request,Receipt,Reply,Phase,RetireSpec,Specification,OperationKind,operation,validate_principal_binding};
@@ -76,6 +81,8 @@ pub struct Env<'a> {
     /// unreadable source is an `Err`, never a zero.
     pub idle:Option<Result<EmployeeIdleReport>>,
     pub now_unix:u64,
+    /// R8d: the root host publication (production: `installed::InstalledEntitlements`).
+    pub entitlements:&'a mut dyn crate::entitlement::Entitlements,
 }
 /// Root audit facts produced by one request (the host emits them).
 pub enum AllocationEvent {
@@ -146,9 +153,51 @@ impl Allocator {
     }
     /// Root audit facts of the last requests, oldest first.
     pub fn take_events(&mut self)->Vec<AllocationEvent>{std::mem::take(&mut self.events)}
+    /// R8d: an entitlement refusal as a wire code. A write whose on-disk
+    /// result is unknown poisons the allocator like a failed journal save.
+    fn entitlement_code(&mut self,refusal:crate::entitlement::Refusal)->wire::ErrorCode{
+        use crate::entitlement::Refusal;
+        match refusal{
+            Refusal::NotSigned=>wire::ErrorCode::NotSigned,
+            Refusal::Invalid=>wire::ErrorCode::InvalidEntitlement,
+            Refusal::Capacity=>wire::ErrorCode::Capacity,
+            Refusal::Unavailable=>wire::ErrorCode::IsolationUnavailable,
+            Refusal::Unknown=>{self.poisoned=true;wire::ErrorCode::IsolationUnavailable},
+        }
+    }
+    /// R8d A5: `Disable` / `Retire` remove the employee's entitlement first.
+    fn revoke(&mut self,env:&mut Env<'_>,employee:EmployeeId)->Answer<()>{
+        crate::entitlement::revoke(env.entitlements,employee).map_err(|refusal|self.entitlement_code(refusal))
+    }
+    /// R8d A1–A4, A6: `Entitle` of the item's employee. Only an entry in the
+    /// Ready state (not disabled) is entitled; the reply is the stored
+    /// receipt plus what is now in force. Never creates or changes an entry.
+    /// The root account registry must agree with the journal: a Ready row of
+    /// the same employee with the receipt's UID (and GID = UID); anything
+    /// else (missing, Reserved, Tombstone, another UID) is `NotAllocated`.
+    fn entitle(&mut self,request:&Request,env:Env<'_>)->Answer<Reply>{
+        let spec=request.validate().map_err(|_|wire::ErrorCode::InvalidRequest)?;
+        let wanted=request.entitlement.as_ref().ok_or(wire::ErrorCode::InvalidRequest)?;
+        let index=match replay_index(&self.journal,&request.item.binding,&spec){
+            Ok(Some(index)) if self.journal.entries[index].phase==Phase::Ready && !self.journal.entries[index].receipt.disabled=>index,
+            Ok(_)=>return Err(wire::ErrorCode::NotAllocated),
+            Err(error)=>return Err(code(error)),
+        };
+        let receipt=&self.journal.entries[index].receipt;
+        let employee=receipt.employee;
+        match env.registry.registry().lookup(employee){
+            Ok(account) if account.employee==employee && account.uid==receipt.uid && account.gid==receipt.uid=>{},
+            _=>return Err(wire::ErrorCode::NotAllocated),
+        }
+        let granted=crate::entitlement::entitle(env.entitlements,employee,wanted).map_err(|refusal|self.entitlement_code(refusal))?;
+        let mut reply=stored(&self.journal.entries[index]);
+        reply.entitlement=Some(granted);
+        Ok(reply)
+    }
     pub fn handle(&mut self,request:&Request,mut env:Env<'_>)->Answer<Reply>{
         if self.poisoned{return Err(wire::ErrorCode::IsolationUnavailable)}
         if request.action==Action::Retire{return self.retire(request,env)}
+        if request.action==Action::Entitle{return self.entitle(request,env)}
         let spec=request.validate().map_err(|_|wire::ErrorCode::InvalidRequest)?;
         let v2=request.schema==wire::SCHEMA_V2;
         // Allocation never races an active run or the lifecycle's H journal.
@@ -207,10 +256,12 @@ impl Allocator {
                 env.storage.usage(employee).and_then(|usage|usage.check(employee,&quota)).map_err(code)?;
                 // S17: idle only from a complete readback; unknown is not idle.
                 let idle=if v2{match env.idle{Some(Ok(report))=>Some(report.idle()),_=>None}}else{None};
-                return Ok(Reply{receipt:self.journal.entries[index].receipt.clone(),phase:Phase::Ready,idle});
+                return Ok(Reply{receipt:self.journal.entries[index].receipt.clone(),phase:Phase::Ready,idle,entitlement:None});
             },
             Action::Disable=>{
                 if !disable_allowed(self.journal.entries[index].phase){return Err(wire::ErrorCode::InvalidRequest)}
+                // R8d A5: the entitlement goes before the state change.
+                self.revoke(&mut env,employee)?;
                 self.journal.entries[index].phase=Phase::Disabling;self.save().map_err(code)?;
                 let account=env.registry.registry().employees.iter().find(|a|a.employee==employee).cloned();
                 if let Some(account)=account{
@@ -223,7 +274,8 @@ impl Allocator {
                 self.journal.entries[index].receipt.disabled=true;
                 self.journal.entries[index].phase=Phase::Disabled;self.save().map_err(code)?;
             },
-            Action::Retire=>return Err(wire::ErrorCode::InvalidRequest),
+            // Both are answered above, never here.
+            Action::Retire|Action::Entitle=>return Err(wire::ErrorCode::InvalidRequest),
         }
         Ok(stored(&self.journal.entries[index]))
     }
@@ -258,10 +310,15 @@ impl Allocator {
             }
             // Audit only (the last observed usage); unreadable is not a refusal.
             used=env.storage.usage(spec.employee).ok().map(|usage|(usage.bytes,usage.inodes));
+            // R8d A5: the entitlement goes before the state change.
+            self.revoke(&mut env,spec.employee)?;
             // 5. Retiring, saved before any side effect.
             let entry=&mut self.journal.entries[index];
             entry.phase=Phase::Retiring;entry.retire=Some(retire);
             self.save().map_err(code)?;
+        }else{
+            // R8d A5 resume: already gone after a crash ⇒ nothing to write.
+            self.revoke(&mut env,spec.employee)?;
         }
         // 6. Account → Tombstone (runs resolve Ready accounts only), then kill
         // anything that appeared after step 4 with a no-process readback.
@@ -286,7 +343,7 @@ impl Allocator {
 }
 /// The stored receipt and phase (S5c). `idle` is only ever reported by a
 /// live ReadBack of a Ready entry.
-fn stored(entry:&Entry)->Reply{Reply{receipt:entry.receipt.clone(),phase:entry.phase,idle:None}}
+fn stored(entry:&Entry)->Reply{Reply{receipt:entry.receipt.clone(),phase:entry.phase,idle:None,entitlement:None}}
 /// `Disable` (compensation) refuses a retiring or retired entry (S6).
 fn disable_allowed(phase:Phase)->bool{!matches!(phase,Phase::Retiring|Phase::Retired)}
 enum Lookup{Missing,Replay(usize),Resume(usize),Fresh(usize)}

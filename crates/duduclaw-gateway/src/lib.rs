@@ -64,6 +64,8 @@ pub mod isolation_skill_jobs;
 #[cfg(target_os = "linux")]
 pub mod isolation_forks;
 pub mod isolation_readiness;
+/// R8d: the root host entitlement an employee's approved settings need.
+pub(crate) mod isolation_entitlement;
 /// R6 update readback endpoint (`/run/duduclaw-gateway-update/readback.sock`).
 pub mod update_readback;
 // Read model and handover path; B1–B3 and the A4 admin RPC consume the parts

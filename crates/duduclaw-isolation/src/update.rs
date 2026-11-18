@@ -49,7 +49,6 @@ pub const ISOLATION_FACTS: &[&str] = &[
     "/usr/libexec/duduclaw",
     "/var/lib/duduclaw-spawnd",
     "/var/lib/duduclaw-spawnd/etc",
-    "/var/log/duduclaw-spawnd",
     "/etc/duduclaw-updated",
     "/var/lib/duduclaw-updated",
     "/opt/duduclaw-isolated",

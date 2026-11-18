@@ -383,10 +383,12 @@ files). A lifetime flock protects the B1 journal; H separately locks its images.
 The daemon now calls `Components::installed()`: it attempts the real H adapter at
 fixed root installation paths `/var/lib/duduclaw-spawnd/images` (H images) and
 `/var/lib/duduclaw-spawnd/storage` (B1 journal). There is no environment, config or
-RPC override. The installer must precreate both root:root 0700 directories and
-provide a private image mount tree on H-supported ext4/XFS backing with the
-required capacity reserve. Boot does not create/mount those anchors or provision
-an employee image; it only opens verified existing anchors and their metadata.
+RPC override. The installer creates both root:root 0700 directories on
+H-supported ext4/XFS backing with the required capacity reserve. On every start,
+`duduclaw-spawnd.service` uses `MountFlags=private` to make the tree private in
+spawnd's mount namespace; employee images are mounted only there. The installer
+creates no host mount. Boot opens verified existing anchors and their metadata;
+it does not create those directories or provision an employee image.
 Any failure retains UnavailableStorage. The generic `Components::default()` stays
 refusing for explicit/incomplete compositions. Installation evidence and root
 runtime publication remain missing, so this does not enable TEAM execution.
@@ -980,6 +982,59 @@ new native policy cannot be mixed into an older plan between preparation stages.
 The gateway publication is limited
 to 64 KiB after encoding; larger runtime/entitlement sets refuse rather than
 truncate, even when individual table bounds would permit them.
+
+### R8d: who writes the host entitlements
+
+The installer writes `/var/lib/duduclaw-spawnd/publication.json` once, with
+an empty entitlement list. After that only root writes it, on the allocation
+worker, through the existing atomic root writer (`host_state::atomic_json`,
+root:root 0600: temp file, fsync, rename, directory fsync); `entitlement.rs`:
+
+- `Entitle` (allocation socket, request/response schema 4 only; schemas 1–3
+  cannot carry it): `{ item, entitlement: { profiles, max_turns? } }` for the
+  item's employee. The allocation entry must be `Ready` (not disabled), else
+  `not_allocated`. The whole candidate publication (this employee's one record
+  replaced) passes the production check (`RootPolicy::from_verified_publication`
+  against the committed generation's signed runtimes) and its gateway
+  projection, sized with the longest boot id and timestamp, fits 64 KiB, before
+  anything is written. Refusals write nothing: `not_signed` (a profile outside
+  the signed policy), `invalid_entitlement` (empty, over 128 or duplicated
+  profiles; `max_turns` outside 1..=1000 or below a signed step minimum),
+  `capacity` (over 30,000 records or the 64 KiB projection). An identical
+  record is answered without a write. The reply carries the stored receipt
+  and the entitlement now in force, which the gateway compares with what it
+  asked for. A write whose outcome on disk is unknown poisons the allocator
+  (the journal's rule); one that provably left the old file in force does not.
+- `Disable` and `Retire` remove the employee's record first, before their
+  state change (absent ⇒ no write), so a crash between the two steps resumes
+  cleanly.
+- Generation rollover, in `InstalledPublication::load` only (root's lifecycle
+  thread; the gateway-side reader never migrates): a version-1 publication of
+  another generation keeps, per record, only the profiles the new signed
+  policy still has, drops records left empty, drops a `max_turns` that no
+  longer narrows every signed step range validly, is stamped with the new
+  generation and written atomically, then validated as usual. Before that
+  write it must pass the same check as `Entitle` (production validation, 64
+  KiB projection): when the new policy leaves less room, trailing records
+  (file order) are dropped one at a time until it fits — those employees are
+  not entitled (their runs are refused) until re-entitled, so an update that
+  would do this should be avoided by keeping the signed runtime list small —
+  and any other failure, or an empty list that still does not fit, refuses
+  with nothing written. A failed write
+  refuses the publication (fail closed). Unreadable content, another version
+  or unknown fields are refused as before, never migrated. The gateway's
+  start-up reconcile re-sends every live employee's entitlement afterwards.
+
+Trust statement: the gateway account is the authority for entitlements
+exactly as it is for account allocation; root enforces signed-policy
+membership, Ready allocation, capacity.
+
+Capacity: the projection is `299 + R + 222·n` bytes in the worst case for `n`
+one-profile records (envelope 300 bytes including the longest boot id,
+timestamp and generation; 221 bytes per record plus a separator; `R` = the
+serialized signed runtimes), so `n ≤ ⌊(65 237 − R) / 222⌋` — 293 with no
+runtimes, fewer with a real signed policy. Each further profile adds up to
+130 bytes to its record.
 
 Linux builder checks and focused tests:
 

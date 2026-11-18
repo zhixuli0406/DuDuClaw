@@ -1,7 +1,7 @@
 //! Admission accounting includes pending/deleting/quarantined images, not usage.
 use crate::{Error, Result};
 
-pub const MIN_RESERVE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+pub use duduclaw_isolation::STORAGE_MIN_RESERVE_BYTES as MIN_RESERVE_BYTES;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Capacity { pub total: u64, pub available: u64 }
@@ -9,7 +9,7 @@ impl Capacity {
     pub fn reserve(self) -> Result<u64> {
         if self.total == 0 || self.available > self.total { return Err(Error::UnsafeBacking); }
         // Round UP to ten percent without overflowing.
-        Ok(MIN_RESERVE_BYTES.max(self.total / 10 + u64::from(self.total % 10 != 0)))
+        Ok(duduclaw_isolation::storage_reserve_bytes(self.total))
     }
     pub fn admit(self, existing: impl IntoIterator<Item = u64>, additional: u64) -> Result<()> {
         let reserve = self.reserve()?;

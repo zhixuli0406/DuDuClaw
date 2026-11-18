@@ -1473,6 +1473,23 @@ reads nothing under `/run/duduclaw-isolation-evidence`.
   or a run live on the host, both answered before spawnd changes anything) is
   waited for and, still not ready after the window, left `Applying` exactly
   like `pending`; `NotReady` on any other action or step keeps its meaning.
+- **Employee entitlements (R8d).** Before allocating, the stage derives the
+  employee's root entitlement from the item's approved settings (the signed
+  profiles of `runtime.provider`, of `runtime.fallback` when signed, and of
+  the helper kinds the gateway requests; a primary runtime without a signed
+  profile fails the item, `runtime_not_available_in_isolation`, before any
+  account exists). After the Ready receipt it sends `Entitle` (schema 4,
+  inside its own effect-gate permit; root writes the one record only for a
+  Ready allocation, after validating the whole candidate publication and its
+  64 KiB projection) and saves only when root answers exactly that set.
+  `Disable`/`Retire` remove the record first. A host publication of an older
+  generation is rolled over by spawnd's `load` (unsigned profiles dropped),
+  and the gateway re-sends every live employee's entitlement once at start-up
+  in the background (bounded retries; failures show as the employee's
+  `runtime_entitlement_missing` readiness reason). The gateway account is the
+  authority for entitlements exactly as for allocation; root enforces
+  signed-policy membership, Ready allocation and capacity
+  (`crates/duduclaw-spawnd/README.md`, "R8d").
 - **Unsupported hosts.** passwd/group NSS modules other than files/systemd
   (SSSD/LDAP, Google Compute Engine OS Login, `compat`, bracketed action
   clauses); sshd present without the ssh client, ssh-keygen or journalctl, or
@@ -2512,8 +2529,11 @@ formats, canonical bytes and hard limits are unchanged.
 
 ### B1 integration
 
-1. Installation creates an empty root:root 0700 storage directory with root-owned,
-   non-writable ancestors on ext4/XFS. B1 makes the relevant mount tree private.
+1. The installer creates `/var/lib/duduclaw-spawnd/images` and
+   `/var/lib/duduclaw-spawnd/storage` as root:root 0700 directories with root-owned,
+   non-writable ancestors on ext4/XFS. On every start, `duduclaw-spawnd.service`
+   uses `MountFlags=private` to make the tree private in spawnd's mount namespace;
+   employee images are mounted only there. The installer creates no host mount.
 2. `Storage::open(path)` verifies the anchor, takes a lifetime exclusive flock,
    validates bounded metadata and compares the full persisted backing device
    graph. Opening allows maintenance even with low free space/incomplete images.
@@ -5772,10 +5792,13 @@ not been obtained.
   installer layout — spawnd, employees slice, egress, DNS broker, parse,
   updated, import, migrate-expire; `/usr/lib/duduclaw`,
   `/opt/duduclaw-isolated`, `/var/lib/duduclaw-spawnd`,
-  `/var/log/duduclaw-spawnd`, `/var/lib/duduclaw-updated`,
+  `/var/lib/duduclaw-updated`,
   `/etc/duduclaw-updated`, `/var/lib/duduclaw-migrate` — plus
   `/opt/duduclaw-isolated/current`, `/var/lib/duduclaw-updated/state.json`,
   `/etc/duduclaw/migration-import.json` and the layout's fixed binaries).
+  The installer creates the root-only audit directory `/var/lib/duduclaw-spawnd/audit`
+  (root:root 0700). It is outside `/var/log` because Ubuntu uses root:syslog 0775
+  there, which fails the root-managed path checks.
   Nothing a v1.80 single-binary install writes or uses is a fact
   (`isolation_install::SINGLE_BINARY_LAYOUT`: `/etc/duduclaw`,
   `duduclaw.slice`, `duduclaw-tcb.slice`, `/opt/duduclaw/bin`,
@@ -5910,11 +5933,18 @@ No formatter, release, service operation or production-home access was performed
   templates. Every executable and ancestor is checked without following links;
   executable files require root:root, exact 0755, one link and nonzero size.
   These checks do not authenticate a release; signed bootstrap must publish first.
-- System IDs must be nonzero and strictly below explicit `SYS_UID_MAX` and
-  `SYS_GID_MAX`, whose values must be below DynamicUser's range. New accounts
+- System IDs must be nonzero and strictly below `SYS_UID_MAX` and
+  `SYS_GID_MAX`, whose effective values must be 2–61183, below DynamicUser's range.
+  Stock Ubuntu/Debian files comment these keys out; absent maxima follow shadow
+  `useradd -r`/`groupadd -r`: `UID_MIN`/`GID_MIN` minus one, defaulting to 999
+  when the login minimum is also absent. Malformed or duplicate settings and
+  out-of-bounds effective maxima are refused. New accounts
   use a capped max-minus-one allocation, no subordinate ranges, and auxiliary
   accounts have locked/expired passwords, nologin, no home or supplementary
-  groups, and disabled linger. Service UID/GID pairs must be distinct. Existing
+  groups, and disabled linger. After validating the account identity and groups,
+  the installer sets expiry with `usermod --expiredate 1970-01-02` on both creation
+  and resume, because `useradd --system` ignores `--expiredate`; it then requires
+  shadow password `!*` and expiry day `1`. Service UID/GID pairs must be distinct. Existing
   incompatible accounts refuse; this hook does not silently repurpose them.
 - R7a account: `duduclaw-selftest` (`duduclaw_isolation::ids::SELFTEST_USER`, which `duduclaw-run-selftest` drops to) is one of the layout's auxiliary accounts, created, checked and kept under the same rules before spawnd starts.
 - R7a unit: `duduclaw-isolation-selftest.service` is installed with the layout units (root:root 0644, byte-equal to spawnd's `ISOLATION_SELFTEST_UNIT_TEXT`, daemon-reloaded before spawnd starts), stopped right after spawnd by the quiesce, removed by rollback/uninstall, and never enabled or started by the installer.

@@ -11,7 +11,7 @@
 //! are removed — regular files (units, programs, launchers, policy files,
 //! version files, the root key), the trees this transaction created
 //! (`/opt/duduclaw-isolated`, `/etc/duduclaw-updated`, `/var/lib/duduclaw-updated`,
-//! `/var/lib/duduclaw-spawnd`, `/var/log/duduclaw-spawnd`, `/usr/lib/duduclaw`,
+//! `/var/lib/duduclaw-spawnd`, `/usr/lib/duduclaw`,
 //! `/usr/libexec/duduclaw`, `/var/lib/duduclaw-migrate`, `/run/duduclaw-spawnd`),
 //! directories it created (only when empty afterwards), and in the gateway's
 //! data directory only what appeared after its snapshot, taken at S6 right
@@ -90,8 +90,8 @@ const ENABLED: [&str; 9] = [UNIT, boot::NIGHTLY_TIMER, "duduclaw-egress.socket",
     "duduclaw-parse.socket", "duduclaw-spawnd.socket", "duduclaw-spawnd.service", "duduclaw-egress.service",
     "duduclaw-updated.service"];
 /// Root-owned trees an install run creates (all isolation facts or below one).
-pub(super) const TREES: [&str; 9] = ["/opt/duduclaw-isolated", "/etc/duduclaw-updated", "/var/lib/duduclaw-updated",
-    "/var/lib/duduclaw-spawnd", "/var/log/duduclaw-spawnd", "/usr/lib/duduclaw", "/usr/libexec/duduclaw",
+pub(super) const TREES: [&str; 8] = ["/opt/duduclaw-isolated", "/etc/duduclaw-updated", "/var/lib/duduclaw-updated",
+    "/var/lib/duduclaw-spawnd", "/usr/lib/duduclaw", "/usr/libexec/duduclaw",
     "/var/lib/duduclaw-migrate", "/run/duduclaw-spawnd"];
 /// Directories outside the trees a run may create; ledgered only when this run
 /// created them, removed only when empty.
