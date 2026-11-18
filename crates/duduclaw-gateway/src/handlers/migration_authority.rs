@@ -83,6 +83,8 @@ pub(crate) struct GatewayAuthority {
 }
 /// R7d: stops every pending-allocation wait (gateway shutdown).
 pub(crate) fn begin_shutdown() { bridge::begin_shutdown() }
+/// R7d round 2: whether gateway shutdown has begun (apply step gate).
+pub(crate) fn shutting_down() -> bool { bridge::shutting_down() }
 #[derive(Serialize, Deserialize)]
 #[serde(tag="kind", deny_unknown_fields)]
 enum Plan {

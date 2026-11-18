@@ -804,5 +804,6 @@ pub(crate) use migration_authority::employee::resolve_confirmed_employee;
 pub(crate) use migration_authority::employee::{save_confirmed_receipt, save_confirmed_receipt_gated};
 pub(crate) use migration_authority::stage_import_proposals;
 pub(crate) use migration_authority::begin_shutdown as begin_migration_apply_shutdown;
+pub(crate) use migration_confirmations_rpc::wait_for_apply_loops as wait_migration_apply_loops;
 mod session_policy_rpc;
 mod a2a_rpc;

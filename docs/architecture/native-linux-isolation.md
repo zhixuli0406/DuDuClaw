@@ -1437,14 +1437,18 @@ reads nothing under `/run/duduclaw-isolation-evidence`.
   Gateway and spawnd come from one signed generation; an older spawnd drops a
   schema-3 request (no reply), which the gateway treats as a hard failure.
 - **Gateway retry (R7d).** `EmployeeAuthority::stage` sends schema 3
-  (`employee::allocate_with`); `pending`/`pending_limit` become
-  `ConfirmationError::Pending`. `GatewayAuthority::stage` re-runs the whole
+  (`employee::allocate_with`); `pending` becomes `ConfirmationError::Pending`
+  and `pending_limit` `ConfirmationError::PendingLimit`, which `apply_next`
+  treats the same on the stage step. `GatewayAuthority::stage` re-runs the whole
   (re-validated) stage, each attempt its own 30 s adapter operation, after
   3 s and then every 5 s while the next attempt starts within 120 s
   (`bridge::PENDING_*`: one probe ≤ 40 s plus one inconclusive re-run after
   60 s). The wait runs in the confirmation RPC's blocking task, holds no
   SQLite writer and only that proposal's lock, and stops at gateway shutdown
-  (`begin_migration_apply_shutdown`). Still pending: `apply_next` consumes the
+  (`begin_migration_apply_shutdown`). Once shutdown begins no new step of an
+  apply starts (no stage, publish, read back or compensation; the item keeps
+  its journal state and the RPC answers `allocation_pending`), and shutdown
+  waits up to 40 s (`APPLY_SHUTDOWN_WAIT`) for a step in progress. Still pending: `apply_next` consumes the
   intent, audits `apply_pending`, keeps the item `Applying` with no receipt and
   never compensates (no `Disable`); the RPC answers `allocation_pending` and
   "帳號安全驗證尚未完成，請稍後重試" (dashboard `migrationConfirm.allocationPending`).

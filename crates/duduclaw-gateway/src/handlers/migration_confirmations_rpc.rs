@@ -29,8 +29,71 @@ impl ApplyAdmission {
         use std::sync::atomic::Ordering::SeqCst;
         self.running.fetch_update(SeqCst, SeqCst, |n| (n < self.capacity).then_some(n + 1)).ok().map(|_| ApplyPermit(self))
     }
-    #[cfg(test)]
+    /// Read only: the number of permits held now.
     pub(super) fn running(&self) -> usize { self.running.load(std::sync::atomic::Ordering::SeqCst) }
+}
+
+/// R7d round 2: how long gateway shutdown waits for apply loops still in a
+/// step: one 30 s adapter budget plus margin. On expiry shutdown continues
+/// (the journal is crash-safe: an interrupted step is re-run on restart).
+pub(crate) const APPLY_SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(40);
+const APPLY_SHUTDOWN_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+/// Called after `begin_migration_apply_shutdown`: no new step starts (step
+/// gate), so this only waits for a step already in progress. Async sleeps,
+/// never a blocked runtime worker.
+pub(crate) async fn wait_for_apply_loops() {
+    if !wait_idle(&APPLY_LOOPS, APPLY_SHUTDOWN_WAIT, APPLY_SHUTDOWN_POLL).await {
+        warn!(running = APPLY_LOOPS.running(), "migration apply loops still running after {}s — continuing shutdown",
+            APPLY_SHUTDOWN_WAIT.as_secs());
+    }
+}
+/// `true` once no permit is held; `false` when `bound` elapsed first.
+async fn wait_idle(admission: &ApplyAdmission, bound: std::time::Duration, poll: std::time::Duration) -> bool {
+    let until = tokio::time::Instant::now() + bound;
+    loop {
+        if admission.running() == 0 { return true; }
+        let now = tokio::time::Instant::now();
+        if now >= until { return false; }
+        tokio::time::sleep((until - now).min(poll)).await;
+    }
+}
+
+fn apply_outcome(failed: usize, pending: usize) -> Value {
+    if pending > 0 {
+        return json!({ "readback_required": true, "failed": failed, "allocation_pending": pending,
+            "message": ALLOCATION_PENDING });
+    }
+    json!({ "readback_required": true, "failed": failed })
+}
+
+/// The approve / retry apply loop. R7d round 2 step gate: `stopping`
+/// (gateway shutdown) is checked before every `apply_next_until` call and,
+/// inside it, before the step and before compensation. Once it answers
+/// `true` no new effect starts: the current and every remaining binding
+/// count as `allocation_pending` and keep the state the journal already has.
+/// The stop path never reaches the `Failed` transition (only a step failure
+/// seen while not stopping does).
+pub(super) fn apply_bindings(store: &mut ConfirmationStore, bindings: &[ProposalBinding],
+    applier: &mut dyn duduclaw_migration::confirmation::ProposalApplier, stopping: &dyn Fn() -> bool,
+    session_live: &mut dyn FnMut() -> bool,
+    on_applied: &mut dyn FnMut(&duduclaw_migration::contract::ConfirmationItem)) -> Result<Value, &'static str> {
+    let (mut failed, mut pending) = (0, 0);
+    'items: for binding in bindings {
+        for _ in 0..3 {
+            if stopping() { pending += 1; continue 'items; }
+            // A role/epoch change during a long bulk operation stops the
+            // remaining effects; their approved states remain resumable.
+            if !session_live() { return Err("身分驗證已失效，請重新驗證後繼續。"); }
+            match store.apply_next_until(binding, applier, stopping) {
+                Ok(item) if item.status == ConfirmationStatus::Applied => { on_applied(&item); break }
+                Ok(_) => {},
+                // R7d: still Applying and uncompensated; Retry resumes it.
+                Err(duduclaw_migration::confirmation::ConfirmationError::Pending) => { pending += 1; break; },
+                Err(_) => { failed += 1; break; },
+            }
+        }
+    }
+    Ok(apply_outcome(failed, pending))
 }
 impl Drop for ApplyPermit<'_> {
     fn drop(&mut self) { self.0.running.fetch_sub(1, std::sync::atomic::Ordering::SeqCst); }
@@ -225,6 +288,12 @@ impl MethodHandler {
                     let item = store.list().map_err(|_| error)?.into_iter()
                         .find(|item| item.binding == input.bindings[0]).ok_or(error)?;
                     if item.status == ConfirmationStatus::Failed {
+                        // R7d round 2: compensation is an effect; none starts
+                        // once shutdown has begun (the item stays Failed).
+                        if super::migration_authority::shutting_down() {
+                            approval.authorize(&input.csrf_token, now as u64).map_err(|_| error)?;
+                            return Ok(apply_outcome(0, 1));
+                        }
                         if item.category == duduclaw_migration::contract::ConfirmationCategory::Employee {
                             // Reconcile any interrupted compensation, but never
                             // revive a permanently tombstoned UID on Retry.
@@ -251,33 +320,15 @@ impl MethodHandler {
                 }
                 _ => return Err("不允許此遷移操作。"),
             }
-            let (mut failed, mut pending) = (0, 0);
-            for binding in &input.bindings {
-                for _ in 0..3 {
-                    // A role/epoch change during a long bulk operation stops the
-                    // remaining effects; their approved states remain resumable.
-                    if db.migration_confirmation_session(&user, &session, epoch, chrono::Utc::now().timestamp())
-                        .ok().flatten().is_none() { return Err("身分驗證已失效，請重新驗證後繼續。"); }
-                    match store.apply_next(binding, &mut applier) {
-                        Ok(item) if item.status == ConfirmationStatus::Applied => {
-                            // F6g: an adoption committed inside this call — notice now, rescan below.
-                            if crate::isolation_restore_rpc::adoption_committed(&adopt_home, &item, &user, chrono::Utc::now().timestamp()) {
-                                adopted_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                            }
-                            break
-                        }
-                        Ok(_) => {},
-                        // R7d: still Applying and uncompensated; Retry resumes it.
-                        Err(duduclaw_migration::confirmation::ConfirmationError::Pending) => { pending += 1; break; },
-                        Err(_) => { failed += 1; break; },
+            apply_bindings(&mut store, &input.bindings, &mut applier, &super::migration_authority::shutting_down,
+                &mut || db.migration_confirmation_session(&user, &session, epoch, chrono::Utc::now().timestamp())
+                    .ok().flatten().is_some(),
+                // F6g: an adoption committed inside this call — notice now, rescan below.
+                &mut |item: &duduclaw_migration::contract::ConfirmationItem| {
+                    if crate::isolation_restore_rpc::adoption_committed(&adopt_home, item, &user, chrono::Utc::now().timestamp()) {
+                        adopted_flag.store(true, std::sync::atomic::Ordering::SeqCst);
                     }
-                }
-            }
-            if pending > 0 {
-                return Ok(json!({ "readback_required": true, "failed": failed, "allocation_pending": pending,
-                    "message": ALLOCATION_PENDING }));
-            }
-            Ok(json!({ "readback_required": true, "failed": failed }))
+                })
         }).await;
         if adopted.load(std::sync::atomic::Ordering::SeqCst) {
             // Same as a restore: the adopted tree is back under agents/ (F6d).
@@ -367,6 +418,40 @@ mod tests {
         store.approve(&[binding], &session, [7; 32], 101, &Valid).unwrap();
         drop(permit);
         assert_eq!(admission.running(), 0);
+    }
+
+    /// R7d round 2: the shutdown wait returns at once when idle, as soon as
+    /// the last permit is dropped, and at the (injected) bound while one is
+    /// still held.
+    #[tokio::test]
+    async fn apply_shutdown_wait_ends_at_last_permit_or_bound() {
+        use std::time::{Duration, Instant};
+        assert_eq!((APPLY_SHUTDOWN_WAIT, APPLY_SHUTDOWN_POLL), (Duration::from_secs(40), Duration::from_millis(100)));
+        static ADMISSION: ApplyAdmission = ApplyAdmission::new(2);
+        let started = Instant::now();
+        assert!(wait_idle(&ADMISSION, Duration::from_secs(5), APPLY_SHUTDOWN_POLL).await);
+        assert!(started.elapsed() < Duration::from_millis(500));
+        // Held: times out at the bound.
+        let first = ADMISSION.try_enter().unwrap();
+        let started = Instant::now();
+        assert!(!wait_idle(&ADMISSION, Duration::from_millis(150), Duration::from_millis(10)).await);
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(150) && elapsed < Duration::from_secs(2), "{elapsed:?}");
+        assert_eq!(ADMISSION.running(), 1);
+        // Two held, dropped at ~50 ms and ~150 ms: the wait ends with the last.
+        let second = ADMISSION.try_enter().unwrap();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(first);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(second);
+        });
+        let started = Instant::now();
+        assert!(wait_idle(&ADMISSION, Duration::from_secs(10), Duration::from_millis(10)).await);
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(150) && elapsed < Duration::from_secs(2), "{elapsed:?}");
+        assert_eq!(ADMISSION.running(), 0);
+        release.await.unwrap();
     }
 
     /// The permit is released however the apply loop ends: success, failure,

@@ -19,6 +19,8 @@ const PENDING_CANCEL_POLL: Duration = Duration::from_millis(200);
 /// at its next poll (the item stays `Applying`, nothing is compensated).
 static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 pub(crate) fn begin_shutdown() { SHUTTING_DOWN.store(true, Ordering::SeqCst); }
+/// R7d round 2: read by the confirmation apply loop's step gate.
+pub(crate) fn shutting_down() -> bool { SHUTTING_DOWN.load(Ordering::SeqCst) }
 
 /// The bounded retry of a stage that answered [`Error::Pending`].
 #[derive(Clone)]

@@ -281,6 +281,78 @@ fn allocation_shutdown_during_attempt_discards_hard_refusal() {
     assert_eq!((fx.root.calls(), fx.status(), fx.disables()), (2, ConfirmationStatus::Failed, 1));
 }
 
+/// R7d round 2: shutdown begins right after the stage attempt's post-check —
+/// the flag the RPC's step gate reads is set as `stage` returns, so the
+/// pending wait (its own flag untouched) hands back the attempt's real result.
+struct LateShutdown<'a> { inner: &'a mut GatewayAuthority, stop: Arc<AtomicBool> }
+impl ProposalApplier for LateShutdown<'_> {
+    fn stage(&mut self, item: &ConfirmationItem) -> Result<()> {
+        let result = self.inner.stage(item);
+        self.stop.store(true, Ordering::SeqCst);
+        result
+    }
+    fn publish(&mut self, item: &ConfirmationItem) -> Result<()> { self.inner.publish(item) }
+    fn read_back(&mut self, item: &ConfirmationItem) -> Result<()> { self.inner.read_back(item) }
+    fn disable_and_read_back(&mut self, item: &ConfirmationItem) -> Result<()> { self.inner.disable_and_read_back(item) }
+}
+/// The confirmation RPC's apply loop for one binding, `stop` as shutdown.
+fn rpc_loop(store: &mut ConfirmationStore, binding: ProposalBinding, applier: &mut dyn ProposalApplier,
+    stop: &AtomicBool) -> serde_json::Value {
+    super::super::migration_confirmations_rpc::apply_bindings(store, &[binding], applier,
+        &|| stop.load(Ordering::SeqCst), &mut || true, &mut |_: &ConfirmationItem| {}).unwrap()
+}
+fn pending_answer() -> serde_json::Value {
+    serde_json::json!({ "readback_required": true, "failed": 0, "allocation_pending": 1,
+        "message": super::super::migration_confirmations_rpc::ALLOCATION_PENDING })
+}
+
+/// A Ready that slipped past the post-check is recorded (stage done) but
+/// publish does not start; the answer is retry-safe pending, no Disable.
+/// After restart the next apply publishes and reads back without re-staging.
+#[test]
+fn allocation_shutdown_after_stage_post_check_records_ready_but_publishes_nothing() {
+    let mut fx = fx(5, 5, 5_000);
+    fx.root.push(&[Script::Ready]);
+    let stop = Arc::new(AtomicBool::new(false));
+    let answer = {
+        let mut late = LateShutdown { inner: &mut fx.authority, stop: stop.clone() };
+        rpc_loop(&mut fx.store, fx.item.binding, &mut late, &stop)
+    };
+    assert_eq!(answer, pending_answer());
+    assert!(!fx.cancel.load(Ordering::SeqCst), "the wait's own flag never saw shutdown");
+    assert_eq!((fx.root.calls(), fx.status(), fx.publishes(), fx.disables()), (1, ConfirmationStatus::Applying, 0, 0));
+    // Still shutting down: the gate stops before any step.
+    assert_eq!(rpc_loop(&mut fx.store, fx.item.binding, &mut fx.authority, &stop), pending_answer());
+    assert_eq!((fx.root.calls(), fx.status(), fx.publishes(), fx.disables()), (1, ConfirmationStatus::Applying, 0, 0));
+    // Restart: publish + read back; the recorded stage is not re-sent.
+    stop.store(false, Ordering::SeqCst);
+    assert_eq!(rpc_loop(&mut fx.store, fx.item.binding, &mut fx.authority, &stop),
+        serde_json::json!({ "readback_required": true, "failed": 0 }));
+    assert_eq!((fx.root.calls(), fx.status(), fx.publishes(), fx.disables()), (1, ConfirmationStatus::Applied, 1, 0));
+}
+
+/// A hard refusal that slipped past the post-check does not start
+/// compensation and never marks the item Failed; a live gateway's next apply
+/// re-sends the Allocate, sees the refusal and compensates then.
+#[test]
+fn allocation_shutdown_after_stage_post_check_defers_compensation() {
+    let mut fx = fx(5, 5, 5_000);
+    fx.root.push(&[Script::Refuse(Code::IsolationUnavailable)]);
+    let stop = Arc::new(AtomicBool::new(false));
+    let answer = {
+        let mut late = LateShutdown { inner: &mut fx.authority, stop: stop.clone() };
+        rpc_loop(&mut fx.store, fx.item.binding, &mut late, &stop)
+    };
+    assert_eq!(answer, pending_answer());
+    assert_eq!((fx.root.calls(), fx.status(), fx.publishes(), fx.disables()), (1, ConfirmationStatus::Applying, 0, 0));
+    stop.store(false, Ordering::SeqCst);
+    fx.root.push(&[Script::Refuse(Code::IsolationUnavailable)]);
+    assert_eq!(rpc_loop(&mut fx.store, fx.item.binding, &mut fx.authority, &stop),
+        serde_json::json!({ "readback_required": true, "failed": 1 }));
+    assert_eq!((fx.root.calls(), fx.status(), fx.disables()), (2, ConfirmationStatus::Failed, 1));
+    fx.assert_identical_allocates();
+}
+
 #[test]
 fn allocation_pending_wait_production_schedule() {
     assert_eq!((bridge::PENDING_FIRST_RETRY, bridge::PENDING_RETRY_EVERY, bridge::PENDING_WAIT_TOTAL),

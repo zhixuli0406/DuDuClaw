@@ -344,6 +344,21 @@ impl ConfirmationStore {
     /// proposals remain writable throughout an external call.
     pub fn apply_next(&mut self, binding: &ProposalBinding,
         adapter: &mut dyn ProposalApplier) -> Result<ConfirmationItem> {
+        self.apply_next_until(binding, adapter, &|| false)
+    }
+
+    /// [`Self::apply_next`] that starts no new external effect once `stop`
+    /// answers `true` (R7d round 2: gateway shutdown). One call performs up
+    /// to two effects — the step (stage / publish / read back) and, when it
+    /// fails, the compensation (`disable_and_read_back`) — and `stop` is
+    /// checked before each. Stopped before the step: nothing is written.
+    /// Stopped after a failed step: the intent is consumed, no receipt, the
+    /// item stays `Applying` (never `Failed`), no compensation; the answer is
+    /// `Err(Pending)` and the next apply re-runs the same idempotent step
+    /// (exactly what process death right after the step would leave). A
+    /// successful step is still recorded (journal only, crash-safe).
+    pub fn apply_next_until(&mut self, binding: &ProposalBinding,
+        adapter: &mut dyn ProposalApplier, stop: &dyn Fn() -> bool) -> Result<ConfirmationItem> {
         let _guard = effects::lock(&self.conn, binding)?;
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut item = required(&tx, binding)?;
@@ -351,6 +366,8 @@ impl ConfirmationStore {
         if item.status == ConfirmationStatus::Approved {
             item.transition(ConfirmationStatus::Applying).map_err(|_| ConfirmationError::Denied)?;
         } else if item.status != ConfirmationStatus::Applying { return Err(ConfirmationError::Denied); }
+        // Dropping `tx` rolls back: the journal is exactly as it was.
+        if stop() { return Err(ConfirmationError::Pending); }
         let next = match step(&tx, binding)? {
             None | Some(3) => 0, Some(0) => 1, Some(1) => 2,
             _ => return Err(ConfirmationError::Stale),
@@ -368,6 +385,15 @@ impl ConfirmationStore {
             // the next apply_next resumes the same stage with the same
             // binding), not Failed, no compensation.
             audit(&tx, &item, "apply_pending", None)?;
+            tx.commit()?;
+            return Err(ConfirmationError::Pending);
+        }
+        if result.is_err() && stop() {
+            // R7d round 2: a failure seen after shutdown began. Compensation
+            // is a new effect and does not start; the item stays Applying
+            // with no receipt (the next apply re-runs this step, sees the
+            // failure again and compensates then).
+            audit(&tx, &item, "apply_interrupted", None)?;
             tx.commit()?;
             return Err(ConfirmationError::Pending);
         }
