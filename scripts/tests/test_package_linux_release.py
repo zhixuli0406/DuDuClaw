@@ -1060,7 +1060,11 @@ class LinuxReleaseTests(unittest.TestCase):
         template.write_text(json.dumps(document))
         with patch.dict(os.environ, {"CI": "", "GITHUB_ACTIONS": ""}):
             outputs = PACKAGE.sign_release(self.binaries, TARGET, self.output, template, key, "ssh-keygen")
-        self.assertEqual(len(outputs), 13)
+        expected_outputs = {"isolated-linux-x86_64-" + artifact["id"]
+                            for artifact in document["artifacts"]}
+        expected_outputs.update({"isolated-linux-x86_64-manifest.json",
+                                 "isolated-linux-x86_64-manifest.json.signatures.json"})
+        self.assertCountEqual([path.name for path in outputs], expected_outputs)
         manifest = self.output / "isolated-linux-x86_64-manifest.json"
         document = json.loads(manifest.read_bytes())
         for artifact in document["artifacts"]:
@@ -1096,7 +1100,11 @@ class LinuxReleaseTests(unittest.TestCase):
         template.write_text(json.dumps(document))
         with patch.dict(os.environ, {"CI":"", "GITHUB_ACTIONS":""}):
             outputs = PACKAGE.sign_release(self.binaries,TARGET,self.output,template,key,"ssh-keygen",runtime_dir)
-        self.assertEqual(len(outputs),17)
+        expected_outputs = {"isolated-linux-x86_64-" + artifact["id"]
+                            for artifact in document["artifacts"]}
+        expected_outputs.update({"isolated-linux-x86_64-manifest.json",
+                                 "isolated-linux-x86_64-manifest.json.signatures.json"})
+        self.assertCountEqual([path.name for path in outputs], expected_outputs)
         canonical = lambda value: json.dumps(value,sort_keys=True,separators=(",", ":")).encode()
         root = self.root / "root.json"
         root.write_bytes(canonical({"schema_version":1,"version":1}))
@@ -1104,7 +1112,8 @@ class LinuxReleaseTests(unittest.TestCase):
         signatures.write_text('["root-fixture-a","root-fixture-b"]')
         inbox = PACKAGE.create_bootstrap_inbox(TARGET,self.output,root,signatures)
         manifest = json.loads((inbox / "manifest.json").read_bytes())
-        self.assertEqual(len(list((inbox / "artifacts").iterdir())),15)
+        self.assertCountEqual([path.name for path in (inbox / "artifacts").iterdir()],
+                              {artifact["id"] for artifact in document["artifacts"]})
         for artifact in manifest["artifacts"]:
             payload = (inbox / "artifacts" / artifact["id"]).read_bytes()
             self.assertEqual(artifact["sha256"],list(hashlib.sha256(payload).digest()))
