@@ -257,13 +257,15 @@ The first line comes from the host-wide account check. It checks every `duduclaw
 | `passwd_row`, `shadow_row`, `groups` | The account's passwd row (`/nonexistent`, `/usr/sbin/nologin`), shadow row (`!*`, expired) or group list (its own gid only) is wrong. |
 | `cron_acl`, `at_acl` | `/etc/cron.deny` or `/etc/at.deny` does not deny the account, or an allow file overrides it. |
 | `cron_spool`, `cron_tables` | The account has a user crontab, or a line in `/etc/crontab` or `/etc/cron.d` runs as it (an unreadable or non-root file there also fails). |
-| `at_spool` | An at spool directory (`/var/spool/cron/atjobs`, `/var/spool/cron/atspool`, `/var/spool/at`, `/var/spool/at/spool`) holds an entry owned by the account, or exists but cannot be read. |
+| `at_spool` | An at spool directory (`/var/spool/cron/atjobs`, `/var/spool/cron/atspool`, `/var/spool/at`, `/var/spool/at/spool`) holds an entry owned by the account, or exists but cannot be read, or lists an entry that disappears or cannot be inspected before its owner is checked. atd removes a job from `atjobs` when it starts the job, so a disappearing entry is not treated as harmless. The next refresh repeats the check, which clears a passing change such as another account's job finishing. |
 | `linger`, `sessions` | A linger file exists, or `user@<uid>.service` or a logind session of the account is active. |
 | `ssh_config`, `ssh_probe` | `sshd -t`/`sshd -T` does not deny the account or names no port, or the SSH denial probe has no Denied result. |
 | `userdb_service`, `userdb_user`, `userdb_group` | `/run/systemd/userdb` is unreadable, or a userdb user or group record touches the employee namespace. |
 | `local_identity`, `candidate`, `owner_inventory` | Allocation: an identity or alias already exists for the new account, a candidate uid lookup failed, or spawnd's file-owner inventory failed. |
 | `login_barriers`, `create_group`, `create_user`, `lock_user`, `quarantine` | Allocation or recovery: the deny entries or sshd drop-in, groupadd, useradd (or a mail spool it created), the usermod/chage/loginctl lockdown, or stopping the account's processes failed. |
-| `reserve`, `create_account`, `readback`, `unlabelled` | An allocation step failed with no finer label. For example, `reserve` means the employee uid range is exhausted. |
+| `reserve`, `create_account`, `readback` | An allocation step failed with no finer label. For example, `reserve` means the employee uid range is exhausted. |
+| `existing_row`, `persist_reservation`, `persist_final`, `store_poisoned`, `clock` | Allocation: the employee already has a retired or unresumable registry row; writing the registry before account creation or after the outcome failed; the registry store refuses writes after an earlier failed write in this process; or the monotonic clock could not be read. |
+| `unlabelled` | An error outside spawnd's labelled checks. Allocation never produces it. |
 
 The `at` package may stay installed: spawnd reads its spool as root and never runs `/usr/bin/at`. Do not edit deny files, spools or accounts by hand to clear a line. Fix the cause; the next refresh then prints `evidence complete`. A failed allocation retires its uid permanently and leaves the proposal Failed. After the cause is fixed, retry the failed item's compensation in Migration review. A new proposal then receives the next uid.
 

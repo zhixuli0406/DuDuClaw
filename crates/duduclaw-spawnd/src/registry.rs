@@ -107,6 +107,13 @@ impl PendingLimit {
 pub fn pending_limit(error: &io::Error) -> bool {
     crate::accounts::unstepped(error).get_ref().is_some_and(|inner| inner.downcast_ref::<PendingLimit>().is_some())
 }
+/// R8w: the journal line of a failed allocation (`RegistryStore::allocate`),
+/// `None` for the two "retry later" answers that are not failures: an
+/// unresolved SSH probe and [`PendingLimit`].
+pub fn allocation_log_line(error: &io::Error) -> Option<String> {
+    if crate::accounts::probe_unresolved(error) || pending_limit(error) { return None; }
+    Some(crate::accounts::allocation_line(error))
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RecoveryReport { pub abandoned_reservations: usize, pub quarantined_identities: usize }
@@ -226,23 +233,38 @@ impl Allocations {
     /// Employees whose `Reserved` row an unresolved probe left resumable.
     pub fn resumable(&self) -> &BTreeSet<EmployeeId> { &self.unresolved }
     fn resolved(&mut self, employee: &EmployeeId) { self.unresolved.remove(employee); self.reserved_at.remove(employee); }
+    /// R8w review round 1: the store-level entry of [`Self::allocate`]
+    /// (`RegistryStore::allocate`): a poisoned store (`store_poisoned`) and an
+    /// unreadable monotonic clock (`clock`) are refused here, labelled, so
+    /// that every allocation failure passes through the store's single
+    /// logging point with a step.
+    pub fn allocate_stored(&mut self, registry: &mut Registry, employee: EmployeeId, host: &mut dyn AccountHost,
+        poisoned: bool, clock: &mut dyn FnMut() -> io::Result<u64>,
+        save: &mut dyn FnMut(&Registry) -> io::Result<()>) -> io::Result<EmployeeAccount> {
+        if poisoned { return Err(at_step(Step::StorePoisoned)(invalid())); }
+        let now_ms = clock().map_err(at_step(Step::Clock))?;
+        self.allocate(registry, employee, host, now_ms, save)
+    }
     /// Allocate (or resume) `employee` in `registry` at monotonic `now_ms`;
     /// `save` persists the registry durably (before useradd, and after the
-    /// outcome is decided).
+    /// outcome is decided). R8w: every failure carries a step
+    /// (`crate::accounts::step_of`), never `unlabelled`; the [`PendingLimit`]
+    /// answer is not a failure (nothing reserved, not logged) and carries none.
     pub fn allocate(&mut self, registry: &mut Registry, employee: EmployeeId, host: &mut dyn AccountHost, now_ms: u64,
         save: &mut dyn FnMut(&Registry) -> io::Result<()>) -> io::Result<EmployeeAccount> {
         // `Some`: resume this process's unresolved reservation; `None`: a new
         // employee. Every other existing row (a Tombstone, including one the
         // deadline retired, or a Reserved row this process does not know) is
-        // refused.
+        // refused (`existing_row`).
         let resume = match registry.employees.iter().position(|account| account.employee == employee) {
             Some(index) => match registry.employees[index].state {
                 AccountState::Ready => {
-                    registry.verify_with(host, &self.unresolved)?;
+                    // The host's own step wins; `readback` only for an unlabelled one.
+                    registry.verify_with(host, &self.unresolved).map_err(at_step(Step::Readback))?;
                     return Ok(registry.employees[index].clone());
                 }
                 AccountState::Reserved if self.unresolved.contains(&employee) => Some(index),
-                _ => return Err(invalid()),
+                _ => return Err(for_account(registry.employees[index].uid)(at_step(Step::ExistingRow)(invalid()))),
             },
             None => None,
         };
@@ -251,7 +273,8 @@ impl Allocations {
             None => {
                 if self.unresolved.len() >= MAX_PENDING_RESERVATIONS { return Err(PendingLimit.error()); }
                 let index = registry.reserve(employee, host).map_err(at_step(Step::Reserve))?;
-                save(registry)?;
+                save(registry).map_err(at_step(Step::PersistReservation))
+                    .map_err(for_account(registry.employees[index].uid))?;
                 (index, false)
             }
         };
@@ -282,7 +305,7 @@ impl Allocations {
             self.unresolved.insert(employee);
             self.reserved_at.entry(employee).or_insert(now_ms);
         } else { self.resolved(&employee); }
-        save(registry)?;
+        save(registry).map_err(at_step(Step::PersistFinal)).map_err(for_account(account.uid))?;
         if let Err(error) = result {
             // Best-effort immediate quarantine of a tombstone. A failure stays
             // durable and startup retries it before any protected execution.
@@ -454,24 +477,28 @@ mod disk {
         /// The R7c allocation state machine ([`Allocations::allocate`]), each
         /// decision persisted (a failed save poisons the store).
         /// R8w: a failed allocation logs one fixed line naming its step
-        /// (`accounts::allocation_line`). An unresolved SSH probe and the
+        /// ([`allocation_log_line`]). An unresolved SSH probe and the
         /// pending-reservation cap are not logged: they are "retry later"
         /// answers with their own wire codes, repeated at the gateway's
-        /// retry cadence.
+        /// retry cadence. Every other failure, the poisoned store and the
+        /// clock included ([`Allocations::allocate_stored`]), reaches this
+        /// one logging point exactly once.
         pub fn allocate(&mut self, employee: EmployeeId, host: &mut dyn AccountHost) -> io::Result<EmployeeAccount> {
-            if self.poisoned { return Err(invalid()); }
-            let now_ms = crate::host_state::boottime_ms()?;
             let Self { directory, data, poisoned, allocations, .. } = self;
-            let result = allocations.allocate(data, employee, host, now_ms, &mut |registry: &Registry| {
-                if *poisoned { return Err(invalid()); }
-                let result = save_inner(directory.as_path(), registry);
-                if result.is_err() { *poisoned = true; }
-                result
-            });
+            let was_poisoned = *poisoned;
+            let result = allocations.allocate_stored(data, employee, host, was_poisoned, &mut || crate::host_state::boottime_ms(),
+                &mut |registry: &Registry| {
+                    if *poisoned { return Err(invalid()); }
+                    let result = save_inner(directory.as_path(), registry);
+                    if result.is_err() { *poisoned = true; }
+                    result
+                });
             if let Err(error) = &result {
-                if !crate::accounts::probe_unresolved(error) && !pending_limit(error) {
-                    eprintln!("duduclaw-spawnd: {}", crate::accounts::allocation_line(error));
-                }
+                // Logged per failing request, not only when the step changes
+                // (unlike the verification line): Allocate requests are
+                // operator-initiated (a confirmed migration proposal), so
+                // their volume is the operator's, not a refresh cadence.
+                if let Some(line) = allocation_log_line(error) { eprintln!("duduclaw-spawnd: {line}"); }
             }
             result
         }
@@ -631,12 +658,23 @@ mod tests {
     struct Probing { probes: Vec<io::Result<()>>, create_fail: bool, verify_fail: bool,
         creates: usize, recoveries: usize, waits: usize, recovered: Vec<u32>,
         /// R8w: the step a failing readback names itself (as `LinuxAccounts` does).
-        verify_step: Option<Step> }
+        verify_step: Option<Step>,
+        /// R8w round 1: unlabelled failures of the other host calls.
+        policy_fail: bool, namespace_fail: bool, candidate_fail: bool, inventory_fail: bool, recover_fail: bool }
     impl AccountHost for Probing {
-        fn policy(&mut self) -> io::Result<HostUidPolicy> { Host.policy() }
-        fn verify_namespace(&mut self, _: &Registry) -> io::Result<()> { Ok(()) }
-        fn uid_available(&mut self, _: u32) -> io::Result<bool> { Ok(true) }
-        fn occupied_ids(&mut self, _: UidRange) -> io::Result<BTreeSet<u32>> { Ok(BTreeSet::new()) }
+        fn policy(&mut self) -> io::Result<HostUidPolicy> {
+            if self.policy_fail { return Err(io::Error::other("injected policy failure")); }
+            Host.policy()
+        }
+        fn verify_namespace(&mut self, _: &Registry) -> io::Result<()> {
+            if self.namespace_fail { Err(io::Error::other("injected namespace failure")) } else { Ok(()) }
+        }
+        fn uid_available(&mut self, _: u32) -> io::Result<bool> {
+            if self.candidate_fail { Err(io::Error::other("injected getent failure")) } else { Ok(true) }
+        }
+        fn occupied_ids(&mut self, _: UidRange) -> io::Result<BTreeSet<u32>> {
+            if self.inventory_fail { Err(io::Error::other("injected inventory failure")) } else { Ok(BTreeSet::new()) }
+        }
         fn create_locked(&mut self, _: &EmployeeAccount) -> io::Result<()> {
             self.creates += 1;
             if self.create_fail { Err(io::Error::other("injected useradd failure")) } else { Ok(()) }
@@ -646,7 +684,10 @@ mod tests {
             let error = io::Error::other("injected lockdown readback failure");
             Err(match self.verify_step { Some(step) => at_step(step)(error), None => error })
         }
-        fn recover_locked(&mut self, account: &EmployeeAccount) -> io::Result<()> { self.recoveries += 1; self.recovered.push(account.uid); Ok(()) }
+        fn recover_locked(&mut self, account: &EmployeeAccount) -> io::Result<()> {
+            self.recoveries += 1; self.recovered.push(account.uid);
+            if self.recover_fail { Err(io::Error::other("injected quarantine failure")) } else { Ok(()) }
+        }
         fn login_denied(&mut self, _: &EmployeeAccount) -> io::Result<()> {
             self.waits += 1;
             if self.probes.is_empty() { panic!("unexpected probe request") }
@@ -1056,6 +1097,109 @@ mod tests {
         full.employees.remove(0);
         let error = full.verify(&mut Probing::default()).unwrap_err();
         assert_eq!((step_of(&error), step_account(&error)), (Some(Step::RegistryRows), Some(70000)));
+    }
+
+    /// R8w review round 1 (F2): EVERY production failure branch of the
+    /// store-level allocation (`Allocations::allocate_stored`, what
+    /// `RegistryStore::allocate` runs) yields a fixed step, never
+    /// `unlabelled`, and its journal line ([`allocation_log_line`]) names it;
+    /// the two "retry later" answers (unresolved probe, pending limit) are
+    /// not logged. The fakes fail without a label of their own wherever the
+    /// production host could, so the allocation's own label is what is
+    /// pinned. (`reserve`'s "employee already has a row" refusal is
+    /// unreachable through `allocate`: the existing row is refused first,
+    /// `existing_row`.)
+    #[test]
+    fn every_allocation_failure_branch_is_labelled() {
+        use crate::accounts::step_of;
+        type Prepare = fn(&mut Allocations, &mut Registry, &mut Probing);
+        struct Case { name: &'static str, step: Step, poisoned: bool, clock_fails: bool, fail_save: usize, prepare: Prepare }
+        fn row(registry: &mut Registry, employee: u8, uid: u32, state: AccountState) {
+            registry.employees.push(EmployeeAccount { employee: EmployeeId([employee; 16]), uid, gid: uid, state });
+        }
+        /// Employee 1 left resumable by a pending probe (its Reserved row, uid 70000).
+        fn resumable(state: &mut Allocations, registry: &mut Registry, host: &mut Probing) {
+            host.probes = vec![pending()];
+            let error = state.allocate(registry, EmployeeId([1; 16]), host, 0, &mut |_: &Registry| Ok(())).unwrap_err();
+            assert!(crate::accounts::probe_unresolved(&error));
+        }
+        fn case(name: &'static str, step: Step, prepare: Prepare) -> Case {
+            Case { name, step, poisoned: false, clock_fails: false, fail_save: 0, prepare }
+        }
+        let cases = [
+            Case { poisoned: true, ..case("store poisoned", Step::StorePoisoned, |_, _, _| {}) },
+            Case { clock_fails: true, ..case("clock unreadable", Step::Clock, |_, _, _| {}) },
+            // A Ready employee is re-verified (host-wide).
+            case("ready: policy", Step::Readback, |_, registry, host| { row(registry, 1, 70000, AccountState::Ready); host.policy_fail = true; }),
+            case("ready: namespace", Step::Readback, |_, registry, host| { row(registry, 1, 70000, AccountState::Ready); host.namespace_fail = true; }),
+            case("ready: readback", Step::Readback, |_, registry, host| { row(registry, 1, 70000, AccountState::Ready); host.verify_fail = true; }),
+            case("ready: foreign reserved row", Step::RegistryRows, |_, registry, _| {
+                row(registry, 1, 70000, AccountState::Ready); row(registry, 9, 70001, AccountState::Reserved); }),
+            // An existing row no allocation can use.
+            case("tombstone", Step::ExistingRow, |_, registry, _| row(registry, 1, 70000, AccountState::Tombstone)),
+            case("unknown reserved row", Step::ExistingRow, |_, registry, _| row(registry, 1, 70000, AccountState::Reserved)),
+            // The reservation.
+            case("reserve: policy", Step::Reserve, |_, _, host| host.policy_fail = true),
+            case("reserve: registry rows", Step::RegistryRows, |_, registry, _| registry.version = 2),
+            case("reserve: namespace", Step::Reserve, |_, _, host| host.namespace_fail = true),
+            case("reserve: owner inventory", Step::OwnerInventory, |_, _, host| host.inventory_fail = true),
+            case("reserve: candidate", Step::Candidate, |_, _, host| host.candidate_fail = true),
+            case("reserve: range exhausted", Step::Reserve, |_, registry, _| {
+                registry.range = UidRange { first: 70000, last: 70000 }; row(registry, 9, 70000, AccountState::Tombstone); }),
+            Case { fail_save: 1, ..case("persist reservation", Step::PersistReservation, |_, _, _| {}) },
+            // A new account.
+            case("create", Step::CreateAccount, |_, _, host| host.create_fail = true),
+            case("probe: sshd -T", Step::SshProbe, |_, _, host| host.probes = vec![Err(io::Error::new(io::ErrorKind::PermissionDenied, "sshd -T"))]),
+            case("probe: reachable", Step::SshProbe, |_, _, host| host.probes = vec![reachable()]),
+            case("readback", Step::Readback, |_, _, host| { host.probes = vec![Ok(())]; host.verify_fail = true; }),
+            Case { fail_save: 2, ..case("persist final: ready", Step::PersistFinal, |_, _, host| host.probes = vec![Ok(())]) },
+            Case { fail_save: 2, ..case("persist final: tombstone", Step::PersistFinal, |_, _, host| host.create_fail = true) },
+            Case { fail_save: 2, ..case("persist final: pending", Step::PersistFinal, |_, _, host| host.probes = vec![pending()]) },
+            // A resumed reservation.
+            case("resume: reachable", Step::SshProbe, |state, registry, host| { resumable(state, registry, host); host.probes = vec![reachable()]; }),
+            case("resume: sshd -T", Step::SshProbe, |state, registry, host| {
+                resumable(state, registry, host); host.probes = vec![Err(io::Error::new(io::ErrorKind::PermissionDenied, "sshd -T"))]; }),
+            case("resume: quarantine", Step::Quarantine, |state, registry, host| {
+                resumable(state, registry, host); host.probes = vec![Ok(())]; host.recover_fail = true; }),
+            case("resume: readback", Step::Readback, |state, registry, host| {
+                resumable(state, registry, host); host.probes = vec![Ok(())]; host.verify_fail = true; }),
+            Case { fail_save: 1, ..case("resume: persist final", Step::PersistFinal, |state, registry, host| {
+                resumable(state, registry, host); host.probes = vec![Ok(())]; }) },
+        ];
+        let mut covered = BTreeSet::new();
+        for case in &cases {
+            let (mut state, mut registry, mut host) = (Allocations::default(), Registry::default(), Probing::default());
+            (case.prepare)(&mut state, &mut registry, &mut host);
+            let (rows, creates) = (registry.employees.clone(), host.creates);
+            let mut saves = 0usize;
+            let error = state.allocate_stored(&mut registry, EmployeeId([1; 16]), &mut host, case.poisoned,
+                &mut || if case.clock_fails { Err(io::Error::other("injected clock failure")) } else { Ok(0) },
+                &mut |_: &Registry| { saves += 1; if saves == case.fail_save { Err(io::Error::other("injected save failure")) } else { Ok(()) } })
+                .unwrap_err();
+            assert_eq!(step_of(&error), Some(case.step), "{}: {error}", case.name);
+            assert_ne!(step_of(&error), Some(Step::Unlabelled), "{}", case.name);
+            assert_eq!(allocation_log_line(&error), Some(format!("allocation failed: step={}", case.step.name())), "{}", case.name);
+            if case.poisoned || case.clock_fails {
+                assert_eq!((registry.employees, host.creates, saves), (rows, creates, 0), "{}: refused before any effect", case.name);
+            }
+            covered.insert(case.step.name());
+        }
+        for step in [Step::StorePoisoned, Step::Clock, Step::ExistingRow, Step::PersistReservation, Step::PersistFinal,
+            Step::Reserve, Step::CreateAccount, Step::SshProbe, Step::Quarantine, Step::Readback] {
+            assert!(covered.contains(step.name()), "{}", step.name());
+        }
+        // Not failures, not logged: the unresolved probe and the pending cap.
+        let (mut state, mut registry, mut saves) = (Allocations::default(), Registry::default(), 0);
+        let mut host = Probing { probes: (0..MAX_PENDING_RESERVATIONS).map(|_| pending()).collect(), ..Probing::default() };
+        for employee in 1..=MAX_PENDING_RESERVATIONS as u8 {
+            let error = allocate(&mut state, &mut registry, employee, &mut host, &mut saves).unwrap_err();
+            assert_eq!(allocation_log_line(&error), None, "{error}");
+        }
+        let error = state.allocate_stored(&mut registry, EmployeeId([9; 16]), &mut host, false, &mut || Ok(0),
+            &mut |_: &Registry| Ok(())).unwrap_err();
+        assert!(pending_limit(&error));
+        assert_eq!(allocation_log_line(&error), None);
+        assert_eq!(allocation_log_line(&inconclusive().unwrap_err()), None);
     }
 
     #[test]

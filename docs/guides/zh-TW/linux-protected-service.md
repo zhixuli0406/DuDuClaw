@@ -257,13 +257,15 @@ duduclaw-spawnd: allocation failed: step=<label>
 | `passwd_row`、`shadow_row`、`groups` | 帳號的 passwd 列（`/nonexistent`、`/usr/sbin/nologin`）、shadow 列（`!*`、已過期）或群組清單（只能有自己的 gid）不正確。 |
 | `cron_acl`、`at_acl` | `/etc/cron.deny` 或 `/etc/at.deny` 沒有拒絕該帳號，或被 allow 檔覆蓋。 |
 | `cron_spool`、`cron_tables` | 該帳號有使用者 crontab，或 `/etc/crontab`、`/etc/cron.d` 中有以它執行的行（該處有無法讀取或非 root 擁有的檔案也會失敗）。 |
-| `at_spool` | at spool 目錄（`/var/spool/cron/atjobs`、`/var/spool/cron/atspool`、`/var/spool/at`、`/var/spool/at/spool`）中有該帳號擁有的項目，或目錄存在但無法讀取。 |
+| `at_spool` | at spool 目錄（`/var/spool/cron/atjobs`、`/var/spool/cron/atspool`、`/var/spool/at`、`/var/spool/at/spool`）中有該帳號擁有的項目、目錄存在但無法讀取，或列出的項目在檢查擁有者前消失或無法檢查。atd 開始執行工作時會把它從 `atjobs` 移除，所以項目消失不會被視為無害。下一次更新會重新檢查，像其他帳號的工作剛結束這類短暫變化會因此解除。 |
 | `linger`、`sessions` | 有 linger 檔，或該帳號的 `user@<uid>.service` 或 logind session 仍在執行。 |
 | `ssh_config`、`ssh_probe` | `sshd -t`／`sshd -T` 沒有拒絕該帳號或沒有 port，或 SSH 拒絕探測沒有 Denied 結果。 |
 | `userdb_service`、`userdb_user`、`userdb_group` | `/run/systemd/userdb` 無法讀取，或 userdb 的使用者或群組紀錄觸及員工命名空間。 |
 | `local_identity`、`candidate`、`owner_inventory` | 配置時：新帳號已存在身分或別名、候選 uid 查詢失敗，或 spawnd 的檔案擁有者盤點失敗。 |
 | `login_barriers`、`create_group`、`create_user`、`lock_user`、`quarantine` | 配置或復原時：deny 項目或 sshd 設定片段、groupadd、useradd（或它建立的郵件 spool）、usermod／chage／loginctl 鎖定，或停止該帳號的程序失敗。 |
-| `reserve`、`create_account`、`readback`、`unlabelled` | 某個配置步驟失敗，且沒有更細的 label。例如 `reserve` 表示員工 uid 範圍已用完。 |
+| `reserve`、`create_account`、`readback` | 某個配置步驟失敗，且沒有更細的 label。例如 `reserve` 表示員工 uid 範圍已用完。 |
+| `existing_row`、`persist_reservation`、`persist_final`、`store_poisoned`、`clock` | 配置時：該員工已有已退役或無法續行的登錄列；建立帳號前或決定結果後寫入登錄表失敗；本程序先前寫入失敗後，登錄儲存拒絕再寫入；或無法讀取單調時鐘。 |
+| `unlabelled` | 來自 spawnd 已標記檢查以外的錯誤。配置不會產生此 label。 |
 
 `at` 套件可以保留：spawnd 以 root 直接讀取它的 spool，從不執行 `/usr/bin/at`。不要為了消除紀錄而手動修改 deny 檔、spool 或帳號。修正原因後，下一次更新會印出 `evidence complete`。配置失敗會永久退役該 uid，提案維持「失敗」。修正原因後，請在遷移確認頁重試該失敗項目的補償，之後新的提案會取得下一個 uid。
 

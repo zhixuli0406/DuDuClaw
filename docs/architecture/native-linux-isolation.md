@@ -604,7 +604,12 @@ The fixed account utility paths follow the [Debian passwd file list](https://pac
 (`/var/spool/cron/atjobs` and `/var/spool/cron/atspool` on Debian/Ubuntu, `/var/spool/at` and
 `/var/spool/at/spool` on RHEL/Fedora: no entry may be owned by the employee uid), never by
 executing `at`, which Debian/Ubuntu ship setuid/setgid `daemon:daemon` (root runs only root-owned
-utilities). These paths still require distro acceptance.
+utilities). An entry that is listed and then cannot be inspected for any reason, `ENOENT`
+included, fails that verification round: atd 3.2.5 unlinks a due job from `atjobs` before it
+creates the job's output file in `atspool`, so a vanished entry can be a job that is starting.
+Nothing is retried within the round; the next refresh repeats it, which clears a benign
+transient. `openat2` being unavailable (`ENOSYS`) also fails closed. These paths still require
+distro acceptance.
 This page records implementation boundaries; it is not an installation guide or
 evidence that protected execution is enabled.
 

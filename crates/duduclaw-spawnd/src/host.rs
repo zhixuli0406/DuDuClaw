@@ -387,10 +387,8 @@ impl Core {
         // R8w: WHY it failed, as one fixed line per change of the failing
         // step/account (`accounts::Step`; never the error text). Journal
         // only: readiness.json and the wire keep their fixed check names.
-        let account_line = verified.err().map(|error| accounts::verification_line(&error));
-        if account_line != self.account_line {
-            if let Some(line) = &account_line { eprintln!("duduclaw-spawnd: {line}"); }
-            self.account_line = account_line;
+        if let Some(line) = accounts::verification_change(&mut self.account_line, &verified) {
+            eprintln!("duduclaw-spawnd: {line}");
         }
         self.policy = self.components.publication.load().ok();
         let snapshot = self.components.publication.snapshot_authority(self.gateway.0);

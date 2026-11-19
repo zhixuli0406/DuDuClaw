@@ -257,13 +257,15 @@ duduclaw-spawnd: allocation failed: step=<label>
 | `passwd_row`、`shadow_row`、`groups` | アカウントの passwd 行（`/nonexistent`、`/usr/sbin/nologin`）、shadow 行（`!*`、期限切れ）、グループ一覧（自身の gid のみ）のいずれかが正しくない。 |
 | `cron_acl`、`at_acl` | `/etc/cron.deny` または `/etc/at.deny` がアカウントを拒否していない、または allow ファイルで上書きされている。 |
 | `cron_spool`、`cron_tables` | アカウントのユーザー crontab がある、または `/etc/crontab`、`/etc/cron.d` にそのアカウントで実行される行がある（そこに読めないファイルや root 所有でないファイルがある場合も失敗）。 |
-| `at_spool` | at の spool ディレクトリ（`/var/spool/cron/atjobs`、`/var/spool/cron/atspool`、`/var/spool/at`、`/var/spool/at/spool`）にアカウント所有のエントリがある、またはディレクトリはあるが読めない。 |
+| `at_spool` | at の spool ディレクトリ（`/var/spool/cron/atjobs`、`/var/spool/cron/atspool`、`/var/spool/at`、`/var/spool/at/spool`）にアカウント所有のエントリがある、ディレクトリはあるが読めない、または一覧にあったエントリが所有者の確認前に消えたか確認できない。atd はジョブの開始時にそれを `atjobs` から削除するため、エントリが消えても無害とは扱いません。次の更新で再検査されるので、他のアカウントのジョブが終わったなどの一時的な変化はそこで解消します。 |
 | `linger`、`sessions` | linger ファイルがある、またはアカウントの `user@<uid>.service` か logind セッションが動いている。 |
 | `ssh_config`、`ssh_probe` | `sshd -t`／`sshd -T` がアカウントを拒否していない、または port がない。あるいは SSH 拒否プローブに Denied の結果がない。 |
 | `userdb_service`、`userdb_user`、`userdb_group` | `/run/systemd/userdb` が読めない、または userdb のユーザー／グループレコードが社員の名前空間に触れている。 |
 | `local_identity`、`candidate`、`owner_inventory` | 割り当て時：新アカウントの ID や別名が既にある、候補 uid の検索に失敗した、または spawnd のファイル所有者一覧の作成に失敗した。 |
 | `login_barriers`、`create_group`、`create_user`、`lock_user`、`quarantine` | 割り当てまたは復旧時：deny エントリや sshd ドロップイン、groupadd、useradd（またはそれが作ったメール spool）、usermod／chage／loginctl によるロック、アカウントのプロセス停止のいずれかが失敗した。 |
-| `reserve`、`create_account`、`readback`、`unlabelled` | より細かい label のない割り当てステップが失敗した。たとえば `reserve` は社員 uid 範囲を使い切ったことを表す。 |
+| `reserve`、`create_account`、`readback` | より細かい label のない割り当てステップが失敗した。たとえば `reserve` は社員 uid 範囲を使い切ったことを表す。 |
+| `existing_row`、`persist_reservation`、`persist_final`、`store_poisoned`、`clock` | 割り当て時：社員に退役済みまたは再開できない登録行がある、アカウント作成前または結果確定後の登録の書き込みに失敗した、このプロセスで以前に書き込みが失敗したため登録ストアが書き込みを拒否している、または単調時計を読めない。 |
+| `unlabelled` | spawnd のラベル付き検査の外から来たエラー。割り当てでは出力されない。 |
 
 `at` パッケージは削除不要です。spawnd は root として spool を直接読み、`/usr/bin/at` を実行しません。行を消すために deny ファイル、spool、アカウントを手で編集しないでください。原因を直すと、次の更新で `evidence complete` が出力されます。失敗した割り当ての uid は永久に退役し、提案は「失敗」のままです。原因を直した後、移行の確認で失敗項目の補償を再試行してください。その後の新しい提案には次の uid が割り当てられます。
 

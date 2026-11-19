@@ -78,17 +78,32 @@ pub enum Step {
     Reserve,
     /// Allocation: account creation, no finer step known.
     CreateAccount,
-    /// Allocation: the final readback, no finer step known.
+    /// Allocation: the final readback (or a Ready employee's re-verification),
+    /// no finer step known.
     Readback,
-    /// No step was recorded (never produced by spawnd's own checks).
+    /// Allocation: the employee already has a row no allocation can use (a
+    /// Tombstone, or a `Reserved` row this process cannot resume).
+    ExistingRow,
+    /// Allocation: persisting the new reservation (before useradd) failed.
+    PersistReservation,
+    /// Allocation: persisting the outcome (Ready/Reserved/Tombstone) failed.
+    PersistFinal,
+    /// Allocation: the registry store is poisoned by an earlier failed save.
+    StorePoisoned,
+    /// Allocation: the monotonic clock (`CLOCK_BOOTTIME`) could not be read.
+    Clock,
+    /// No step was recorded: an error from outside spawnd's labelled checks.
+    /// Never produced by an allocation (every branch of `allocate` is
+    /// labelled; `registry.rs` tests pin each one).
     Unlabelled,
 }
 impl Step {
-    pub const ALL: [Step; 32] = [Step::LoginDefs, Step::Subids, Step::RegistryRows, Step::NssModules, Step::Enumerate,
+    pub const ALL: [Step; 37] = [Step::LoginDefs, Step::Subids, Step::RegistryRows, Step::NssModules, Step::Enumerate,
         Step::PasswdRow, Step::ShadowRow, Step::Groups, Step::CronAcl, Step::CronSpool, Step::CronTables, Step::AtAcl,
         Step::AtSpool, Step::Linger, Step::Sessions, Step::SshConfig, Step::SshProbe, Step::UserdbService, Step::UserdbUser,
         Step::UserdbGroup, Step::LocalIdentity, Step::Candidate, Step::OwnerInventory, Step::LoginBarriers, Step::CreateGroup,
-        Step::CreateUser, Step::LockUser, Step::Quarantine, Step::Reserve, Step::CreateAccount, Step::Readback, Step::Unlabelled];
+        Step::CreateUser, Step::LockUser, Step::Quarantine, Step::Reserve, Step::CreateAccount, Step::Readback,
+        Step::ExistingRow, Step::PersistReservation, Step::PersistFinal, Step::StorePoisoned, Step::Clock, Step::Unlabelled];
     pub const fn name(self) -> &'static str {
         match self {
             Step::LoginDefs => "login_defs", Step::Subids => "subids", Step::RegistryRows => "registry_rows",
@@ -101,7 +116,9 @@ impl Step {
             Step::Candidate => "candidate", Step::OwnerInventory => "owner_inventory", Step::LoginBarriers => "login_barriers",
             Step::CreateGroup => "create_group", Step::CreateUser => "create_user", Step::LockUser => "lock_user",
             Step::Quarantine => "quarantine", Step::Reserve => "reserve", Step::CreateAccount => "create_account",
-            Step::Readback => "readback", Step::Unlabelled => "unlabelled",
+            Step::Readback => "readback", Step::ExistingRow => "existing_row", Step::PersistReservation => "persist_reservation",
+            Step::PersistFinal => "persist_final", Step::StorePoisoned => "store_poisoned", Step::Clock => "clock",
+            Step::Unlabelled => "unlabelled",
         }
     }
 }
@@ -149,6 +166,17 @@ pub fn verification_line(error: &io::Error) -> String {
 /// spawnd's journal line for a failed Allocate: `allocation failed: step=<label>`.
 pub fn allocation_line(error: &io::Error) -> String {
     format!("allocation failed: step={}", step_of(error).unwrap_or(Step::Unlabelled).name())
+}
+/// The account-verification journal state machine of `Core::refresh`: given
+/// this round's `result` and the line printed last (`last`, updated), the
+/// [`verification_line`] to print now: `Some` only when the failing
+/// step/account differs from the last one printed; a success prints nothing
+/// and resets `last`, so the next failure is printed again.
+pub fn verification_change(last: &mut Option<String>, result: &io::Result<()>) -> Option<String> {
+    let line = result.as_ref().err().map(verification_line);
+    if line == *last { return None; }
+    last.clone_from(&line);
+    line
 }
 
 pub fn parse_login_defs(text: &str) -> io::Result<(UidRange, UidRange)> {
@@ -1125,7 +1153,8 @@ mod tests {
         }
         for name in ["login_defs", "nss_modules", "enumerate", "passwd_row", "shadow_row", "groups", "cron_acl", "cron_spool",
             "cron_tables", "at_acl", "at_spool", "ssh_config", "ssh_probe", "linger", "userdb_user", "userdb_group",
-            "create_group", "create_user", "lock_user"] {
+            "create_group", "create_user", "lock_user", "existing_row", "persist_reservation", "persist_final",
+            "store_poisoned", "clock"] {
             assert!(names.contains(name), "{name}");
         }
         let error = for_account(70000)(at_step(Step::AtSpool)(denied()));
@@ -1157,6 +1186,39 @@ mod tests {
                 assert_eq!(allocation_line(&error), format!("allocation failed: step={}", step.name()));
             }
         }
+    }
+    /// R8w round 1: the account-verification journal line is printed only
+    /// when the failing step/account changes, and a success resets it (the
+    /// same failure after a success is printed again; a success prints nothing).
+    #[test]
+    fn verification_line_is_printed_on_change_and_reset_on_success() {
+        let fail = |step: Step, uid: Option<u32>| -> io::Result<()> {
+            let error = at_step(step)(denied());
+            Err(match uid { Some(uid) => for_account(uid)(error), None => error })
+        };
+        let mut last = None;
+        assert_eq!(verification_change(&mut last, &Ok(())), None, "a first success prints nothing");
+        let at = "employee account verification failed: step=at_spool account=duduclaw-emp-70000";
+        assert_eq!(verification_change(&mut last, &fail(Step::AtSpool, Some(70000))).as_deref(), Some(at));
+        for _ in 0..3 {
+            assert_eq!(verification_change(&mut last, &fail(Step::AtSpool, Some(70000))), None, "unchanged: not again");
+        }
+        assert_eq!(last.as_deref(), Some(at));
+        // Another account, then another step: each change is printed once.
+        assert_eq!(verification_change(&mut last, &fail(Step::AtSpool, Some(70001))).as_deref(),
+            Some("employee account verification failed: step=at_spool account=duduclaw-emp-70001"));
+        assert_eq!(verification_change(&mut last, &fail(Step::NssModules, None)).as_deref(),
+            Some("employee account verification failed: step=nss_modules account=-"));
+        assert_eq!(verification_change(&mut last, &fail(Step::NssModules, None)), None);
+        // Success resets (prints nothing); the same failure is then printed again.
+        assert_eq!(verification_change(&mut last, &Ok(())), None);
+        assert_eq!(last, None);
+        assert_eq!(verification_change(&mut last, &Ok(())), None);
+        assert_eq!(verification_change(&mut last, &fail(Step::NssModules, None)).as_deref(),
+            Some("employee account verification failed: step=nss_modules account=-"));
+        // An unlabelled error is a line too (the fixed fallback, never its text).
+        assert_eq!(verification_change(&mut last, &Err(io::Error::other("secret"))).as_deref(),
+            Some("employee account verification failed: step=unlabelled account=-"));
     }
     #[test]
     fn recovery_rejects_aliases_and_accepts_group_only_residue() {

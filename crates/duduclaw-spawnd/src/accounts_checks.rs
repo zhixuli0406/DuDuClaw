@@ -240,6 +240,8 @@ mod tests {
     struct Fake {
         files: BTreeMap<PathBuf, String>,
         present: BTreeSet<PathBuf>,
+        /// Paths whose presence cannot be read (`lstat` fails, e.g. EACCES/EIO).
+        unreadable: BTreeSet<PathBuf>,
         replies: BTreeMap<String, (i32, String)>,
         cron_d: Vec<PathBuf>,
         at_job: bool,
@@ -257,7 +259,10 @@ mod tests {
             self.files.get(path).cloned().ok_or_else(|| io::ErrorKind::NotFound.into())
         }
         fn optional_text(&mut self, path: &Path) -> io::Result<Option<String>> { Ok(self.files.get(path).cloned()) }
-        fn present(&mut self, path: &Path) -> io::Result<bool> { Ok(self.files.contains_key(path) || self.present.contains(path)) }
+        fn present(&mut self, path: &Path) -> io::Result<bool> {
+            if self.unreadable.contains(path) { return Err(io::Error::from(io::ErrorKind::PermissionDenied)); }
+            Ok(self.files.contains_key(path) || self.present.contains(path))
+        }
         fn cron_d(&mut self) -> io::Result<Vec<PathBuf>> { Ok(self.cron_d.clone()) }
         fn at_spool(&mut self, uid: u32) -> io::Result<()> {
             self.spool_checks.push(uid);
@@ -400,5 +405,33 @@ mod tests {
         assert!(matches!(ssh_refusal(&reachable), Some(SshRefusal::Reachable(_))) && !probe_unresolved(&reachable));
         assert_eq!(step_account(&reachable), Some(70000));
         assert!(reachable.to_string().contains("NOT denied"), "{reachable}");
+    }
+
+    /// R8w review round 1: a presence check that cannot be read fails
+    /// closed with its own label, never "absent": the linger file
+    /// (`linger`, naming the account) and `/usr/sbin/sshd` (`ssh_config`).
+    #[test]
+    fn unreadable_presence_fails_with_its_label() {
+        let mut host = Fake::healthy();
+        host.unreadable.insert(PathBuf::from(format!("/var/lib/systemd/linger/{NAME}")));
+        let error = verify_account(&mut host, &account()).unwrap_err();
+        assert_eq!((step_of(&error), step_account(&error)), (Some(Step::Linger), Some(70000)), "{error}");
+        assert_eq!(verification_line(&error), format!("employee account verification failed: step=linger account={NAME}"));
+        // Sessions were never consulted after the failed linger check.
+        assert!(!host.runs.iter().any(|run| run.contains("user@70000.service")), "{:?}", host.runs);
+
+        let mut host = Fake::healthy();
+        host.unreadable.insert(PathBuf::from("/usr/sbin/sshd"));
+        let error = ssh_present(&mut host).unwrap_err();
+        assert_eq!(step_of(&error), Some(Step::SshConfig), "{error}");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        // Without sshd the check would be skipped: an unreadable path is not that.
+        let mut absent = Fake::healthy();
+        absent.present.remove(Path::new("/usr/sbin/sshd"));
+        assert!(!ssh_present(&mut absent).unwrap());
+        // A cron spool path that cannot be read is `cron_spool`, not absent either.
+        let mut host = Fake::healthy();
+        host.unreadable.insert(PathBuf::from(format!("/var/spool/cron/crontabs/{NAME}")));
+        assert_eq!(step_of(&verify_account(&mut host, &account()).unwrap_err()), Some(Step::CronSpool));
     }
 }
