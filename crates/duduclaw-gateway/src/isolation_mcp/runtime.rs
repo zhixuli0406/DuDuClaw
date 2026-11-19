@@ -117,7 +117,7 @@ pub(crate) fn keep(site: RefusalSite) -> impl FnOnce(String) -> String {
 /// R8x: the single logging point of a protected turn. Every protected entry
 /// (this module's, the API runtime's, and the Codex/Grok/registered-CLI
 /// runtimes' protected branches) runs its whole protected turn inside it. A
-/// failed turn logs exactly one line: nothing more when the R8t `isolated run
+/// failed user turn logs exactly one line: nothing more when the R8t `isolated run
 /// refused` line was already written; `isolated run refused after start` when
 /// the run started but ended without that line; otherwise `isolated run not
 /// started`. All fields are fixed: runtime label, employee label, site label
@@ -150,9 +150,8 @@ where F: Future<Output = Result<T, String>> {
     result
 }
 
-/// One WARN per failed protected turn, no local rate limit: the volume is
-/// bounded by turn admission upstream, not here — see the log-volume note in
-/// `refusal.rs` (above `log_not_started`) for where that admission lives.
+/// User refusals retain WARN; expected background refusals use DEBUG and a
+/// bounded once-per-employee/site INFO notice. Trace recording is unchanged.
 fn log_trace(runtime: &'static str, agent: &str, trace: Trace) {
     if trace.logged { return; }
     // No recorded site is passed as `None`; the logger prints `unlabelled`.

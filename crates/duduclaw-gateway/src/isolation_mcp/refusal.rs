@@ -647,28 +647,50 @@ pub(crate) fn agent_label(agent: &str) -> &str {
     if duduclaw_core::is_valid_agent_id(agent) { agent } else { "invalid" }
 }
 
-// Log volume (R8x review note): this module's three warnings (`log_refused`
-// above, the two below) are, together, written at most once per protected
-// turn, so their rate is the rate of protected turns the gateway accepted;
-// there is deliberately no limiter here. Turns that
-// reach a start pass spawn admission (`crate::autonomous_runtime::admit_current`,
-// src/autonomous_runtime.rs:302 — the autonomy pause gate, not a rate limit);
-// refusals before it are bounded only by the per-ingress admission of turns
-// (channel/WebChat/API/scheduler), which is not centralised in one place.
+// User-turn warnings retain their existing admission-bound volume. Expected
+// background refusals use DEBUG plus a bounded, process-lifetime INFO notice.
+const BACKGROUND_NOTICE_LIMIT: usize = 1024;
+type BackgroundNotices = std::collections::HashSet<(String, &'static str)>;
+static BACKGROUND_NOTICES: std::sync::OnceLock<std::sync::Mutex<BackgroundNotices>> = std::sync::OnceLock::new();
 
-/// R8x: the single warning for a refused protected turn that never reached a
+fn first_background_notice(seen: &mut BackgroundNotices, agent: &str, site: &'static str) -> bool {
+    if seen.len() >= BACKGROUND_NOTICE_LIMIT { return false; }
+    seen.insert((agent.to_owned(), site))
+}
+
+fn log_expected_background(runtime: &'static str, agent: &str, site: Option<RefusalSite>) -> bool {
+    let expected = crate::runtime_dispatch::in_utility_call()
+        || (site == Some(site!("authorization.ingress.no_scope"))
+            // Evolution maps to Judge; employee turns and scheduled/delegated
+            // work use distinct classes and must retain their warnings.
+            && duduclaw_core::execution_gate::capture_class()
+                == duduclaw_core::execution_gate::ExecutionClass::Judge);
+    if !expected { return false; }
+    let site = site_text(site);
+    tracing::debug!(runtime, agent, site, "isolated background call not available in protected mode");
+    let first = BACKGROUND_NOTICES.get_or_init(Default::default).lock()
+        .map(|mut seen| first_background_notice(&mut seen, agent, site)).unwrap_or(false);
+    if first {
+        tracing::info!(agent, site, "protected mode: background model calls are not run for this employee");
+    }
+    true
+}
+
+/// The refusal log for a protected turn that never reached a
 /// started run. Fixed fields only: runtime label, employee label, site label
 /// (`unlabelled` when no site was recorded).
 pub(crate) fn log_not_started(runtime: &'static str, agent: &str, site: Option<RefusalSite>) {
     let agent = agent_label(agent);
+    if log_expected_background(runtime, agent, site) { return; }
     tracing::warn!(runtime, agent, site = site_text(site), "isolated run not started");
 }
 
-/// R8x: the single warning for a run that started but was refused without the
+/// The refusal log for a run that started but was refused without the
 /// R8t line (its pipes were missing, or it exited 0 with unusable output).
 /// `site` as in [`log_not_started`].
 pub(crate) fn log_refused_after_start(runtime: &'static str, agent: &str, site: Option<RefusalSite>) {
     let agent = agent_label(agent);
+    if log_expected_background(runtime, agent, site) { return; }
     tracing::warn!(runtime, agent, site = site_text(site), "isolated run refused after start");
 }
 
@@ -795,6 +817,128 @@ mod tests {
             self.0.lock().unwrap().extend_from_slice(bytes); Ok(bytes.len())
         }
         fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+
+    fn capture_background_logs(future: impl std::future::Future<Output = ()>) -> String {
+        let log = LogCapture(Default::default());
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG).with_writer(move || writer.clone()).finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(future);
+        });
+        let bytes = log.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    fn assert_background_logs(logs: &str, info_count: usize, site: RefusalSite) {
+        assert!(!logs.contains("WARN"), "{logs}");
+        assert_eq!(logs.lines().filter(|line| line.contains("DEBUG")).count(), 1, "{logs}");
+        assert_eq!(logs.lines().filter(|line| line.contains("INFO")).count(), info_count, "{logs}");
+        assert!(logs.contains("isolated background call not available in protected mode"), "{logs}");
+        assert!(logs.contains("runtime=\"openai_compat\""), "{logs}");
+        assert!(logs.contains(&format!("site=\"{}\"", site.as_str())), "{logs}");
+        if info_count != 0 {
+            let info = logs.lines().find(|line| line.contains("INFO")).unwrap();
+            assert!(info.contains("protected mode: background model calls are not run for this employee"), "{logs}");
+            assert!(info.contains("agent=") && info.contains("site="), "{logs}");
+            assert!(!info.contains("runtime="), "{logs}");
+        }
+    }
+
+    #[test]
+    fn utility_refusals_are_debug_with_one_info_per_agent_and_site() {
+        // Classification follows the task-local even for a site other than *.utility_call.
+        for site in [site!("authorize.utility_call"), site!("preflight.utility_call"), site!("plan.root_publication")] {
+            for attempt in 0..2 {
+                let logs = capture_background_logs(crate::runtime_dispatch::UTILITY_CALL.scope((), async {
+                    log_not_started("openai_compat", "r8z9-utility", Some(site));
+                }));
+                assert_background_logs(&logs, usize::from(attempt == 0), site);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn observed_utility_refusal_keeps_the_returned_error() {
+        let site = site!("authorize.utility_call");
+        let logs = capture_background_logs(crate::runtime_dispatch::UTILITY_CALL.scope((), async {
+            let expected = user_error(None);
+            let result = crate::isolation_mcp::runtime::observed("openai_compat", "r8z9-observed", async {
+                crate::isolation_mcp::runtime::note_site(site);
+                Err::<(), String>(expected.clone())
+            }).await;
+            assert_eq!(result, Err(expected));
+        }));
+        assert_background_logs(&logs, 1, site);
+    }
+
+    #[test]
+    fn evolution_no_scope_refusal_is_expected_background() {
+        let site = site!("authorization.ingress.no_scope");
+        let class = crate::process_group::request_class(crate::cost_telemetry::RequestType::Evolution);
+        assert_eq!(class, duduclaw_core::execution_gate::ExecutionClass::Judge);
+        for attempt in 0..2 {
+            let logs = capture_background_logs(crate::process_group::with_class(class, async {
+                log_not_started("openai_compat", "r8z9-evolution", Some(site));
+            }));
+            assert_background_logs(&logs, usize::from(attempt == 0), site);
+        }
+    }
+
+    #[test]
+    fn autonomous_work_no_scope_refusals_keep_the_warning() {
+        use duduclaw_core::execution_gate::ExecutionClass;
+        let site = site!("authorization.ingress.no_scope");
+        for class in [ExecutionClass::EmployeeMain, ExecutionClass::Scheduled,
+            ExecutionClass::Dispatch, ExecutionClass::Reminder] {
+            let logs = capture_background_logs(crate::process_group::with_class(class,
+                crate::autonomous_runtime::scope(
+                    std::path::Path::new("unused-background-log-fixture"), "r8z9-work", &[], async {
+                        log_not_started("openai_compat", "r8z9-work", Some(site));
+                    },
+                ),
+            ));
+            assert_eq!(logs.lines().count(), 1, "{logs}");
+            assert!(logs.contains("WARN") && logs.contains("isolated run not started"), "{logs}");
+            assert!(logs.contains("runtime=\"openai_compat\"") && logs.contains("agent=\"r8z9-work\""), "{logs}");
+            assert!(logs.contains(&format!("site=\"{}\"", site.as_str())), "{logs}");
+        }
+    }
+
+    #[test]
+    fn user_no_scope_and_other_user_refusals_keep_the_warning() {
+        for site in [site!("authorization.ingress.no_scope"), site!("plan.root_publication")] {
+            let logs = capture_background_logs(async {
+                log_not_started("openai_compat", "r8z9-user", Some(site));
+            });
+            assert_eq!(logs.lines().count(), 1, "{logs}");
+            assert!(logs.contains("WARN") && logs.contains("isolated run not started"), "{logs}");
+            assert!(logs.contains("runtime=\"openai_compat\"") && logs.contains("agent=\"r8z9-user\""), "{logs}");
+            assert!(logs.contains(&format!("site=\"{}\"", site.as_str())), "{logs}");
+        }
+        // An autonomous scope alone does not downgrade any other refusal site.
+        let logs = capture_background_logs(crate::autonomous_runtime::scope(
+            std::path::Path::new("unused-background-log-fixture"), "r8z9-other", &[], async {
+                log_not_started("openai_compat", "r8z9-other", Some(site!("plan.root_publication")));
+            },
+        ));
+        assert_eq!(logs.lines().count(), 1, "{logs}");
+        assert!(logs.contains("WARN") && logs.contains("isolated run not started"), "{logs}");
+    }
+
+    #[test]
+    fn background_notice_set_is_bounded() {
+        let mut seen = BackgroundNotices::new();
+        assert!(first_background_notice(&mut seen, "first", "authorize.utility_call"));
+        assert!(!first_background_notice(&mut seen, "first", "authorize.utility_call"));
+        for index in 1..BACKGROUND_NOTICE_LIMIT {
+            assert!(first_background_notice(&mut seen, &format!("agent-{index}"), "authorize.utility_call"));
+        }
+        assert!(!first_background_notice(&mut seen, "overflow", "authorize.utility_call"));
+        assert!(!first_background_notice(&mut seen, "first", "authorize.utility_call"));
+        assert_eq!(seen.len(), BACKGROUND_NOTICE_LIMIT);
     }
 
     #[test]

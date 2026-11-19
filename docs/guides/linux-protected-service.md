@@ -224,11 +224,13 @@ For the OpenAI-compatible runtime, `reason` is the worker's fixed reason (the li
 | 這次工作超過時間上限而停止。 | `timeout` | The run's time limit, or a slow provider. |
 | 受保護模式尚無這次工作的隔離執行授權，或所選執行設定尚未通過驗證；請由管理員檢查服務狀態。 | any other, or `unrecognised` | Readiness and the journal (`reason`, `exit`); see "Troubleshoot readiness". |
 
-A turn refused **before a run was started** logs exactly one warning `isolated run not started` instead, with the fields `runtime`, `agent` (the employee label) and `site`, a fixed label naming where it was refused. A run that started but ended without the line above (its pipes were missing, or it exited successfully with an unusable result) logs `isolated run refused after start` with the same fields. A failed protected turn has exactly one of these three lines. No request content, path or identifier other than the employee label is logged. The sentence shown to the person does not change.
+A turn refused **before a run was started** logs exactly one warning `isolated run not started` instead, with the fields `runtime`, `agent` (the employee label) and `site`, a fixed label naming where it was refused. A run that started but ended without the line above (its pipes were missing, or it exited successfully with an unusable result) logs `isolated run refused after start` with the same fields. A failed protected user turn has exactly one of these three lines; expected background refusals are described below. No request content, path or identifier other than the employee label is logged. The sentence shown to the person does not change.
 
 ```sh
 sudo journalctl -u duduclaw-gateway.service --no-pager | grep -E 'isolated run (not started|refused)'
 ```
+
+Background model calls after a successful turn can produce `authorize.utility_call` (or another utility-call site) and, only for the employee's post-turn self-improvement call without a captured chat identity, `authorization.ingress.no_scope`. These refusals are expected in protected mode and do not mean the user's turn failed. They log `isolated background call not available in protected mode` at DEBUG, with one INFO notice per employee and site for the life of the service process (`protected mode: background model calls are not run for this employee`, subject to a bounded notice limit). A `no_scope` refusal for a chat turn, scheduled task, reminder or delegated work is a real refusal and is still logged as a warning (WARN), even inside an autonomous scope.
 
 | `site` group | Labels | What to check |
 | --- | --- | --- |
@@ -387,7 +389,8 @@ The per-second limits (`frames_per_second`, `bytes_per_second`) slow a run down;
 
 | `terminal_code` | `terminal_detail` | Meaning |
 | --- | --- | --- |
-| `unavailable` | `peer_closed` | The run's forwarder closed the connection; this is also a normal end. |
+| `closed` | `peer_closed` | The sandbox side closed the connection between frames after the work ended. |
+| `unavailable` | `peer_closed` | A frame was interrupted or the connection failed. |
 | `unavailable` | `revoked` | The spawn service ended the run, or the control connection was lost. |
 | `resource_limit` | `total_bytes`, `total_connections` | The run reached the `run_caps` total. Raise the cap in `/etc/duduclaw/egress.json` only if the volume is expected. |
 | `resource_limit` | `max_tunnels` | The run had `max_tunnels` connections open at once. |
