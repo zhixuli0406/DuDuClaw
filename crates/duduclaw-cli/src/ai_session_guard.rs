@@ -14,47 +14,14 @@
 //! memory operations additionally need dashboard approval; employee status
 //! and evolution switches remain directly available in an operator's terminal.
 
-/// Variables that mark a DuDuClaw-spawned employee process.
-pub(crate) const AI_SESSION_ENV_VARS: &[&str] = &[
-    duduclaw_core::ENV_AGENT_ID,
-    duduclaw_core::ENV_AGENT_TOKEN,
-    // RM-166 round 2: the hook-only proof a Claude employee's CLI env carries.
-    duduclaw_core::ENV_HOOK_TOKEN,
-    duduclaw_core::ENV_TRUST_TURN_ID,
-    duduclaw_core::ENV_TRUST_SESSION_ID,
-    duduclaw_core::ENV_TURN_USER_MESSAGE_SEQ,
-    duduclaw_core::ENV_TURN_USER_MESSAGE_AT,
-    duduclaw_core::ENV_DISPATCH_SESSION,
-    duduclaw_core::ENV_DISPATCH_RUN_ID,
-    duduclaw_core::ENV_UPSTREAM_UNKNOWN,
-    duduclaw_core::ENV_DELEGATION_SENDER,
-    duduclaw_core::ENV_DELEGATION_ORIGIN,
-    duduclaw_core::ENV_DELEGATION_DEPTH,
-    duduclaw_core::ENV_HOP_DEPTH,
-    duduclaw_core::ENV_REPLY_CHANNEL,
-    duduclaw_core::ENV_REPLY_SENDER,
-    // The WebChat conversation a turn answers (RM-124).
-    duduclaw_core::ENV_ORIGIN_SESSION,
-    // The task of a goal round (set per call by the gateway's runtimes).
-    duduclaw_core::ENV_TASK_ID,
-    // The read-only explore lane (heartbeat proactive check, 2026-10).
-    duduclaw_core::ENV_LANE,
-    // The person the run works for (`on_behalf_of`).
-    duduclaw_core::ENV_ON_BEHALF_OF,
-    duduclaw_gateway::on_behalf_of::context::ENV_CONTEXT,
-    // Also refused by the LINE inbox and computer-workspace commands before
-    // the lists were merged into this one.
-    "DUDUCLAW_MCP_API_KEY",
-    "DUDUCLAW_DATA_FILE_GUARD",
-];
+/// Variables that mark a DuDuClaw-spawned employee process. The single list
+/// lives in `duduclaw_isolation::ai_session`, shared with the root installer
+/// `duduclaw-bootstrap` (which does not link this crate).
+pub(crate) const AI_SESSION_ENV_VARS: &[&str] = duduclaw_isolation::ai_session::AI_SESSION_ENV_VARS;
 
 /// The marker variables present according to `is_set`.
 pub(crate) fn markers_with(is_set: &dyn Fn(&str) -> bool) -> Vec<&'static str> {
-    AI_SESSION_ENV_VARS
-        .iter()
-        .copied()
-        .filter(|k| is_set(k))
-        .collect()
+    duduclaw_isolation::ai_session::markers_with(is_set)
 }
 
 /// The marker variables present in this process.
@@ -212,5 +179,40 @@ mod tests {
         assert!(AI_SESSION_ENV_VARS.contains(&"DUDUCLAW_TASK_ID"));
         assert!(AI_SESSION_ENV_VARS.contains(&"DUDUCLAW_ON_BEHALF_OF"));
         assert!(AI_SESSION_ENV_VARS.contains(&"DUDUCLAW_LANE"));
+    }
+
+    /// The shared list (duduclaw-isolation, also used by `duduclaw-bootstrap`)
+    /// holds string literals; it must stay exactly the named constants of
+    /// duduclaw-core / duduclaw-gateway, in this order, so the CLI and the
+    /// root installer cannot drift from the variables the gateway sets.
+    #[test]
+    fn shared_marker_list_equals_the_named_constants() {
+        let expected: &[&str] = &[
+            duduclaw_core::ENV_AGENT_ID,
+            duduclaw_core::ENV_AGENT_TOKEN,
+            duduclaw_core::ENV_HOOK_TOKEN,
+            duduclaw_core::ENV_TRUST_TURN_ID,
+            duduclaw_core::ENV_TRUST_SESSION_ID,
+            duduclaw_core::ENV_TURN_USER_MESSAGE_SEQ,
+            duduclaw_core::ENV_TURN_USER_MESSAGE_AT,
+            duduclaw_core::ENV_DISPATCH_SESSION,
+            duduclaw_core::ENV_DISPATCH_RUN_ID,
+            duduclaw_core::ENV_UPSTREAM_UNKNOWN,
+            duduclaw_core::ENV_DELEGATION_SENDER,
+            duduclaw_core::ENV_DELEGATION_ORIGIN,
+            duduclaw_core::ENV_DELEGATION_DEPTH,
+            duduclaw_core::ENV_HOP_DEPTH,
+            duduclaw_core::ENV_REPLY_CHANNEL,
+            duduclaw_core::ENV_REPLY_SENDER,
+            duduclaw_core::ENV_ORIGIN_SESSION,
+            duduclaw_core::ENV_TASK_ID,
+            duduclaw_core::ENV_LANE,
+            duduclaw_core::ENV_ON_BEHALF_OF,
+            duduclaw_gateway::on_behalf_of::context::ENV_CONTEXT,
+            "DUDUCLAW_MCP_API_KEY",
+            "DUDUCLAW_DATA_FILE_GUARD",
+        ];
+        assert_eq!(AI_SESSION_ENV_VARS, expected);
+        assert_eq!(duduclaw_isolation::ai_session::AI_SESSION_ENV_VARS, expected);
     }
 }

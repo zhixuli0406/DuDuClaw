@@ -117,6 +117,57 @@ pub fn parse_invocation<I: IntoIterator<Item = OsString>>(args: I) -> (Command, 
     (command, forwarded)
 }
 
+/// The one fixed line `duduclaw-bootstrap` prints when it refuses a
+/// state-changing command inside an AI session (never the marker or its value).
+/// `duduclaw-updated` prints the same line for its own state-changing operator
+/// commands (`updated_cli::parse_guarded`).
+pub const AI_SESSION_REFUSAL: &str =
+    "bootstrap_refused: ai_session 這個指令會變更主機狀態，必須由人在終端機中親自執行，不能從 AI 工作階段中執行。";
+
+/// A state-changing command was selected inside an AI session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AiSessionRefused;
+impl AiSessionRefused {
+    pub fn line(self) -> &'static str { AI_SESSION_REFUSAL }
+}
+
+/// Whether `command` must be refused because an AI-session marker
+/// (`duduclaw_isolation::ai_session::AI_SESSION_ENV_VARS`, the list duduclaw-cli
+/// uses too) is present according to `env`. Every state-changing command is
+/// refused; only the read-only words (and the usage error) pass. The match is
+/// exhaustive so a new command must be classified here. Pure: no I/O.
+///
+/// The root installer execs the verified gateway with a cleared environment, so
+/// the gateway's own operator gate never sees these markers; this is the only
+/// place they are checked for install/upgrade/rollback. It is a guard against
+/// mistakes, not a privilege boundary: a process can unset its environment.
+pub fn refuse_ai_session(command: Command, env: impl Fn(&str) -> Option<String>) -> bool {
+    let guarded = match command {
+        Command::PrintRootPin | Command::Version | Command::Usage => false,
+        Command::Install | Command::Upgrade | Command::Rollback => true,
+    };
+    guarded && duduclaw_isolation::ai_session::in_ai_session(&|key| env(key).is_some())
+}
+
+/// [`parse_invocation`] followed at once by [`refuse_ai_session`]: the first
+/// thing `duduclaw-bootstrap` does, before hardening, verification, any
+/// high-water write, staging or lock. Pure: reads only `args` and `env`.
+pub fn parse_guarded<I: IntoIterator<Item = OsString>>(
+    args: I,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<(Command, Forwarded), AiSessionRefused> {
+    let (command, forwarded) = parse_invocation(args);
+    if refuse_ai_session(command, env) { return Err(AiSessionRefused); }
+    Ok((command, forwarded))
+}
+
+/// Presence of a variable in this process's environment, for [`parse_guarded`].
+/// Only presence matters (an empty or non-UTF-8 value counts); the value is
+/// never kept or printed.
+pub fn process_env_presence(key: &str) -> Option<String> {
+    std::env::var_os(key).map(|_| String::new())
+}
+
 /// `--version` output: the crate (= workspace release) version. The packaging
 /// script requires it to equal the version being packaged.
 pub fn version_line() -> String { format!("duduclaw-bootstrap {}", env!("CARGO_PKG_VERSION")) }
@@ -180,6 +231,62 @@ mod tests {
         assert_eq!(parse_invocation(std::iter::repeat(OsString::from("--enable-now"))).0, Command::Usage);
         let endless = std::iter::once(OsString::from("install")).chain(std::iter::repeat(OsString::from("--enable-now")));
         assert_eq!(parse_invocation(endless).0, Command::Usage);
+    }
+
+    const ALL: [Command; 6] = [Command::PrintRootPin, Command::Version, Command::Install, Command::Upgrade,
+        Command::Rollback, Command::Usage];
+
+    #[test]
+    fn every_state_changing_command_is_refused_with_each_ai_session_marker() {
+        let markers = duduclaw_isolation::ai_session::AI_SESSION_ENV_VARS;
+        assert!(!markers.is_empty());
+        for marker in markers {
+            // Present, even empty, counts.
+            for value in ["", "x"] {
+                let env = |key: &str| (key == *marker).then(|| value.to_owned());
+                for command in ALL {
+                    assert_eq!(refuse_ai_session(command, env), command.changes_state(), "{command:?} {marker}");
+                }
+            }
+        }
+        // No marker: nothing is refused.
+        for command in ALL { assert!(!refuse_ai_session(command, |_| None)); }
+        // An unrelated variable is not a marker.
+        for command in ALL {
+            assert!(!refuse_ai_session(command, |key| (key == "PATH" || key == "SUDO_USER").then(String::new)));
+        }
+        // The refusal is one fixed line and never names a marker.
+        assert_eq!(AiSessionRefused.line(), AI_SESSION_REFUSAL);
+        assert!(AI_SESSION_REFUSAL.starts_with("bootstrap_refused: ai_session "));
+        assert!(!AI_SESSION_REFUSAL.contains('\n'));
+        for marker in markers { assert!(!AI_SESSION_REFUSAL.contains(marker)); }
+    }
+
+    #[test]
+    fn bootstrap_entry_refuses_in_an_ai_session_before_anything_else() {
+        // `parse_guarded` is the binary's first step; it reads only argv and the env
+        // callback, so a refusal here happens before any verification, high-water
+        // write, staging or lock (the binary exits on Err without calling anything else).
+        let marked = |key: &str| (key == "DUDUCLAW_AGENT_ID").then(String::new);
+        let looked_up = std::cell::RefCell::new(Vec::new());
+        let recording = |key: &str| {
+            looked_up.borrow_mut().push(key.to_owned());
+            marked(key)
+        };
+        for word in [&["install"][..], &["install", "--enable-now"], &["upgrade"], &["rollback"]] {
+            assert_eq!(parse_guarded(args(word), recording), Err(AiSessionRefused), "{word:?}");
+        }
+        // Only marker names were consulted.
+        let markers = duduclaw_isolation::ai_session::AI_SESSION_ENV_VARS;
+        assert!(looked_up.borrow().iter().all(|key| markers.contains(&key.as_str())));
+        // The read-only words and a usage error pass even inside an AI session.
+        assert_eq!(parse_guarded(args(&["--version"]), marked), Ok((Command::Version, Forwarded::default())));
+        assert_eq!(parse_guarded(args(&["--print-root-pin"]), marked), Ok((Command::PrintRootPin, Forwarded::default())));
+        assert_eq!(parse_guarded(args(&["help"]), marked), Ok((Command::Usage, Forwarded::default())));
+        // Outside an AI session the parse result is unchanged.
+        let (command, forwarded) = parse_guarded(args(&["install", "--enable-now"]), |_| None).unwrap();
+        assert_eq!((command, forwarded.args()), (Command::Install, vec!["--enable-now".to_owned()]));
+        assert_eq!(parse_guarded(args(&["rollback"]), |_| None).unwrap().0, Command::Rollback);
     }
 
     #[cfg(unix)]
