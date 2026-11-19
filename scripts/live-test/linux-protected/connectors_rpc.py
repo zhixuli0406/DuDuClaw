@@ -92,6 +92,20 @@ def http_base():
     return url.replace("ws://", "http://", 1).rsplit("/ws", 1)[0]
 
 
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    """Every redirect is refused: the client only ever talks to the loopback gateway
+    and must never carry a request (or its Authorization header) to another URL."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise Fail(f"HTTP redirect refused (HTTP {code})")
+
+
+# The one opener for every HTTP request of this script: no redirects, and no
+# proxy from the environment (http_proxy & co. would send loopback requests,
+# with their Authorization header, to another host).
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _RefuseRedirect())
+
+
 def http_json(method, path, body=None, bearer=None):
     data = None if body is None else json.dumps(body).encode()
     request = urllib.request.Request(http_base() + path, data=data, method=method)
@@ -99,7 +113,7 @@ def http_json(method, path, body=None, bearer=None):
     if bearer:
         request.add_header("Authorization", "Bearer " + bearer)
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with OPENER.open(request, timeout=30) as response:
             raw = response.read()
             status = response.status
     except urllib.error.HTTPError as error:

@@ -4,7 +4,7 @@
 //!
 //! This whole module, its clap variant ([`super::UsersCommands`]), its Bash-lane
 //! entry and every string in it exist only in a `--cfg duduclaw_test_root`
-//! build (the build that also accepts TEST licences and carries the TEST
+//! build (the build that accepts only TEST licences and carries the TEST
 //! licence marker the release pipeline refuses). A production build compiles
 //! none of it; `scripts/refuse-test-license-build.py` additionally refuses any
 //! gateway binary containing [`SUBCOMMAND`] or [`NOTICE`].
@@ -20,7 +20,11 @@
 //! O_NOFOLLOW, 0600, owned by root) in a root-owned directory not writable by
 //! group or other, created before the code is issued and removed again when
 //! nothing was issued. stdout stays empty; stderr gets [`NOTICE`] and one
-//! fixed result line. Exit: 0 issued, 3 not needed, 1 refused or failed.
+//! fixed result line. Exit: 0 issued, 3 nothing to issue (two-factor sign-in
+//! not enforced, no single first Administrator, or the first Administrator
+//! already completed two-factor setup), 1 refused or failed. If the unused file
+//! cannot be removed it is truncated and synced, and the run fails with the
+//! fixed label `cleanup`.
 
 use std::path::Path;
 
@@ -33,6 +37,8 @@ pub(super) const NOTICE: &str = "TEST BUILD ONLY: issuing a first-run setup code
 const ISSUED_LINE: &str = "TEST BUILD ONLY: setup code written to --out";
 const NOT_NEEDED_LINE: &str =
     "TEST BUILD ONLY: no setup code needed (two-factor sign-in not enforced, or no single first Administrator)";
+const ALREADY_COMPLETED_LINE: &str =
+    "TEST BUILD ONLY: no setup code needed (the first Administrator already completed two-factor setup)";
 const REFUSED_PREFIX: &str = "TEST BUILD ONLY: refused: ";
 /// Audit actor of `mfa.bootstrap_code_issued`, distinct from the host command's.
 pub(super) const ACTOR: &str = "測試建置的自動驗收（身分未驗證）";
@@ -62,9 +68,10 @@ pub(super) enum Refusal {
     OutCreateFailed,
     UsersDbMissing,
     UsersDbUnavailable,
-    BootstrapClosed,
     IssueFailed,
     WriteFailed,
+    /// The unused `--out` file could not be removed (it was truncated instead).
+    Cleanup,
 }
 
 impl Refusal {
@@ -80,9 +87,9 @@ impl Refusal {
             Self::OutCreateFailed => "out_create_failed",
             Self::UsersDbMissing => "users_db_missing",
             Self::UsersDbUnavailable => "users_db_unavailable",
-            Self::BootstrapClosed => "first_admin_setup_already_completed",
             Self::IssueFailed => "issue_failed",
             Self::WriteFailed => "write_failed",
+            Self::Cleanup => "cleanup",
         }
     }
 }
@@ -90,7 +97,13 @@ impl Refusal {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Outcome {
     Issued,
+    /// `mfa_issue_bootstrap_token` → `Ok(None)`: policy not enforced, or no
+    /// single active first Administrator.
     NotNeeded,
+    /// `mfa_issue_bootstrap_token` → `Err(BOOTSTRAP_CLOSED)`: the closed latch
+    /// is set (the first Administrator finished two-factor setup). Nothing to
+    /// issue, so the same exit status as [`Outcome::NotNeeded`].
+    AlreadyCompleted,
     Refused(Refusal),
 }
 
@@ -98,7 +111,7 @@ impl Outcome {
     pub(super) fn exit_code(self) -> i32 {
         match self {
             Self::Issued => EXIT_ISSUED,
-            Self::NotNeeded => EXIT_NOT_NEEDED,
+            Self::NotNeeded | Self::AlreadyCompleted => EXIT_NOT_NEEDED,
             Self::Refused(_) => EXIT_REFUSED,
         }
     }
@@ -107,6 +120,7 @@ impl Outcome {
         match self {
             Self::Issued => ISSUED_LINE.to_owned(),
             Self::NotNeeded => NOT_NEEDED_LINE.to_owned(),
+            Self::AlreadyCompleted => ALREADY_COMPLETED_LINE.to_owned(),
             Self::Refused(reason) => format!("{REFUSED_PREFIX}{}", reason.label()),
         }
     }
@@ -195,8 +209,10 @@ pub(super) fn issue(home: &Path, out: &Path, host: &Host, now: i64) -> Outcome {
         Err(reason) => return Outcome::Refused(reason),
     };
     let outcome = issue_into(home, &file, now);
-    if outcome != Outcome::Issued {
-        file.discard();
+    if outcome != Outcome::Issued && !file.discard() {
+        // The empty or partial file could not be removed (it was truncated):
+        // the run fails whatever the reason was.
+        return Outcome::Refused(Refusal::Cleanup);
     }
     outcome
 }
@@ -212,7 +228,7 @@ fn issue_into(home: &Path, file: &OutFile, now: i64) -> Outcome {
     let code = match db.mfa_issue_bootstrap_token(ACTOR, now) {
         Ok(Some(code)) => Zeroizing::new(code),
         Ok(None) => return Outcome::NotNeeded,
-        Err(error) if error == duduclaw_auth::mfa::BOOTSTRAP_CLOSED => return Outcome::Refused(Refusal::BootstrapClosed),
+        Err(error) if error == duduclaw_auth::mfa::BOOTSTRAP_CLOSED => return Outcome::AlreadyCompleted,
         Err(_) => return Outcome::Refused(Refusal::IssueFailed),
     };
     match file.write_code(&code) {
@@ -283,8 +299,7 @@ impl OutFile {
                 meta.is_file() && meta.uid() == owner && meta.mode() & 0o7777 == 0o600 && meta.nlink() == 1
             });
         if !checked {
-            created.discard();
-            return Err(Refusal::OutCreateFailed);
+            return Err(if created.discard() { Refusal::OutCreateFailed } else { Refusal::Cleanup });
         }
         Ok(created)
     }
@@ -301,13 +316,35 @@ impl OutFile {
     }
 
     /// Remove the file this run created (nothing, or nothing usable, in it).
-    fn discard(self) {
-        use std::os::fd::AsRawFd;
-        // SAFETY: valid directory descriptor and NUL-terminated name.
-        unsafe {
-            libc::unlinkat(self.dir.as_raw_fd(), self.name.as_ptr(), 0);
+    /// `false` when it could not be unlinked: the still-open descriptor is then
+    /// truncated to zero and synced (best effort) so no partial code remains,
+    /// and the caller reports [`Refusal::Cleanup`].
+    fn discard(self) -> bool {
+        if unlink_out(&self.dir, &self.name) {
+            return true;
         }
+        let _ = self.file.set_len(0);
+        let _ = self.file.sync_all();
+        false
     }
+}
+
+/// `unlinkat(dir, name, 0)` succeeded. Unit tests can force a failure (`FAIL_UNLINK`).
+#[cfg(unix)]
+fn unlink_out(dir: &std::fs::File, name: &std::ffi::CStr) -> bool {
+    use std::os::fd::AsRawFd;
+    #[cfg(test)]
+    if FAIL_UNLINK.with(std::cell::Cell::get) {
+        return false;
+    }
+    // SAFETY: valid directory descriptor and NUL-terminated name.
+    unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) == 0 }
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    /// Test seam: make [`unlink_out`] fail on this thread (read-only remount, I/O error).
+    static FAIL_UNLINK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Not Unix: never reached past the Linux gate; refuses anyway.
@@ -324,7 +361,9 @@ impl OutFile {
         Err(Refusal::NotLinux)
     }
 
-    fn discard(self) {}
+    fn discard(self) -> bool {
+        true
+    }
 }
 
 /// Run only in a test-root build:
@@ -432,20 +471,76 @@ mod tests {
         assert!(!out.exists());
         assert!(issued_rows(&db).is_empty());
 
-        // Closed latch: refused, no file.
+        // Closed latch (first Administrator already finished two-factor setup):
+        // nothing to issue, exit 3 like "not needed", its own fixed line, no file.
         let (home, db) = pending_bootstrap();
         let owner = db.get_bootstrap_owner().unwrap().unwrap();
         rusqlite::Connection::open(home.path().join("users.db")).unwrap()
             .execute("INSERT INTO mfa_credentials(user_id,secret_enc,last_step) VALUES(?1,'enc',0)", [&owner.id])
             .unwrap();
-        assert_eq!(issue(home.path(), &out, &host(), now()), Outcome::Refused(Refusal::BootstrapClosed));
+        let outcome = issue(home.path(), &out, &host(), now());
+        assert_eq!(outcome, Outcome::AlreadyCompleted);
+        assert_eq!(outcome.exit_code(), EXIT_NOT_NEEDED);
+        assert_eq!(outcome.line(), ALREADY_COMPLETED_LINE);
         assert!(!out.exists());
+        assert!(issued_rows(&db).is_empty());
 
         // No users.db in the home: refused, no file, nothing created there.
         let empty = tempfile::tempdir().unwrap();
         assert_eq!(issue(empty.path(), &out, &host(), now()), Outcome::Refused(Refusal::UsersDbMissing));
         assert!(!out.exists());
         assert!(!empty.path().join("users.db").exists());
+    }
+
+    /// Restores the unlink seam even when an assertion fails.
+    struct FailUnlink;
+    impl FailUnlink {
+        fn on() -> Self {
+            FAIL_UNLINK.with(|flag| flag.set(true));
+            Self
+        }
+    }
+    impl Drop for FailUnlink {
+        fn drop(&mut self) {
+            FAIL_UNLINK.with(|flag| flag.set(false));
+        }
+    }
+
+    #[test]
+    fn mfa_setup_code_test_failed_cleanup_truncates_and_fails_with_a_fixed_label() {
+        // A partial code in a file that cannot be unlinked is truncated and synced.
+        let out_dir = out_dir();
+        let partial = out_dir.path().join("partial");
+        let file = OutFile::create(&partial, me()).unwrap();
+        {
+            use std::io::Write;
+            (&file.file).write_all(b"0123456789abcdef").unwrap();
+        }
+        let guard = FailUnlink::on();
+        assert!(!file.discard());
+        drop(guard);
+        assert_eq!(std::fs::metadata(&partial).unwrap().len(), 0, "no partial code remains");
+
+        // Nothing to issue but the unused file cannot be removed: exit 1 with
+        // the fixed `cleanup` label instead of exit 3; the file left is empty.
+        let home = tempfile::tempdir().unwrap();
+        let db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+        db.ensure_default_admin().unwrap();
+        let out = out_dir.path().join("code");
+        let outcome = {
+            let _guard = FailUnlink::on();
+            issue(home.path(), &out, &host(), now())
+        };
+        assert_eq!(outcome, Outcome::Refused(Refusal::Cleanup));
+        assert_eq!(outcome.exit_code(), EXIT_REFUSED);
+        assert_eq!(outcome.line(), format!("{REFUSED_PREFIX}cleanup"));
+        assert_eq!(std::fs::metadata(&out).unwrap().len(), 0);
+        assert!(issued_rows(&db).is_empty());
+
+        // The seam is off again: a normal discard removes the file.
+        let again = out_dir.path().join("again");
+        assert!(OutFile::create(&again, me()).unwrap().discard());
+        assert!(!again.exists());
     }
 
     #[test]
@@ -525,8 +620,13 @@ mod tests {
             assert!(super::super::bash_decision("duduclaw ops users mfa-setup-code-test --out /root/code", &caller).is_some());
         }
         // Exit codes and the fixed lines.
-        assert_eq!((Outcome::Issued.exit_code(), Outcome::NotNeeded.exit_code()), (0, 3));
-        assert!(Outcome::Refused(Refusal::NotRoot).line().starts_with(REFUSED_PREFIX));
-        assert!([Outcome::Issued.line(), Outcome::NotNeeded.line(), NOTICE.to_owned()].iter().all(|line| !line.contains('\n')));
+        assert_eq!((Outcome::Issued.exit_code(), Outcome::NotNeeded.exit_code(), Outcome::AlreadyCompleted.exit_code()),
+            (0, 3, 3));
+        for reason in [Refusal::NotRoot, Refusal::WriteFailed, Refusal::Cleanup] {
+            assert_eq!(Outcome::Refused(reason).exit_code(), 1);
+            assert!(Outcome::Refused(reason).line().starts_with(REFUSED_PREFIX));
+        }
+        assert!([Outcome::Issued.line(), Outcome::NotNeeded.line(), Outcome::AlreadyCompleted.line(), NOTICE.to_owned()]
+            .iter().all(|line| !line.contains('\n')));
     }
 }

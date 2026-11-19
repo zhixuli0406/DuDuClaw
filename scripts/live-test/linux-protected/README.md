@@ -144,11 +144,13 @@ outstanding one) with the audit actor `測試建置的自動驗收（身分未�
 only to `--out`: a new file (must not exist; never follows a symlink) created 0600 and
 owned by root, in a directory owned by root and not writable by group or other.
 stdout stays empty; stderr gets `TEST BUILD ONLY: issuing a first-run setup code for
-automated acceptance` and one fixed result line. Exit status: `0` written, `3` not
-needed (policy not enforced or no single first Administrator; no file is left), `1`
-refused or failed (a closed reason label on stderr; no file is left, and a refused
-`--out` never mints a code). After the first Administrator has finished two-factor
-setup it is refused for good, like the host command.
+automated acceptance` and one fixed result line. Exit status: `0` written, `3`
+nothing to issue (policy not enforced, no single first Administrator, or the first
+Administrator has already finished two-factor setup — from then on it never issues a
+code again, like the host command; no file is left), `1` refused or failed (a closed
+reason label on stderr; no file is left, and a refused `--out` never mints a code).
+If the unused `--out` file cannot be removed (read-only remount, I/O error) it is
+truncated to empty and the run exits `1` with the label `cleanup`.
 
 Then complete the enforced first-run enrolment with the acceptance client (loopback,
 Python standard library):
@@ -164,6 +166,10 @@ python3 connectors_rpc.py --state <private dir>/admin.json --data-home /var/lib/
 `POST /api/mfa/verify {challenge_id, code}`. The state file (0600) ends with a usable
 session and the TOTP secret, so `call … --stepup` works and later logins answer the
 TOTP challenge themselves. The setup code is never printed; delete the file afterwards.
+Every HTTP request of `connectors_rpc.py` goes through one opener that refuses any
+redirect (a fixed error, nothing is followed) and ignores proxy environment variables;
+the WebSocket connects only to `ws://127.0.0.1:<port>/ws` (port from the data home's
+`config.toml` or `DUDUCLAW_PORT`).
 Unit tests of the sub-command's gates run only in a test-root build:
 `RUSTFLAGS='--cfg duduclaw_test_root' CARGO_TARGET_DIR=target/test-root cargo test -p duduclaw-cli --lib users_mfa_cmd`.
 

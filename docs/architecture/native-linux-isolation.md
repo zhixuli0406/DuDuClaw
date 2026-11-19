@@ -2103,10 +2103,13 @@ piped to a shell. No production trust material is included in this package.
 
 **Test builds.** `--cfg duduclaw_test_root` selects test trust at compile time
 only. `duduclaw-bootstrap` then pins the TEST root of `scripts/isolation-test-keys.sh`
-and prints `TEST <pin>`; `duduclaw` additionally trusts the TEST licence issuer
+and prints `TEST <pin>`; `duduclaw` trusts ONLY the TEST licence issuer
 compiled in through `DUDUCLAW_TEST_LICENSE_ISSUER_PUBKEY` under key id `test-root`
-(`production_registry`, `crates/duduclaw-gateway/src/license_runtime.rs`) and
-`duduclaw print-license-issuer` prints `TEST-LICENSE <key>` instead of
+(`production_registry`, `crates/duduclaw-gateway/src/license_runtime.rs`): no
+baked production issuer and no `DUDUCLAW_LICENSE_PUBKEY_<ID>` environment issuer,
+so a production licence is never accepted, and without a compiled TEST issuer
+(`TEST-LICENSE none`) no licence is accepted at all. `duduclaw print-license-issuer`
+prints `TEST-LICENSE <key>` instead of
 `PRODUCTION-LICENSE <16 hex>`. Every other licence rule (signature, machine
 binding, self-host tier and non-Personal edition, expiry, grace) is unchanged, so
 a TEST licence from `isolation-test-keys.sh license` passes exactly the
