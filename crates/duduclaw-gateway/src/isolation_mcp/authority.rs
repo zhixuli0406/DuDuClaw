@@ -811,11 +811,15 @@ impl LiveAuthority for GatewayAuthority {
     }
 }
 /// The resolved form of one captured turn (shared by both resolutions).
+/// B0: the utility runner is the explicit, refusing in-run judge runner
+/// (`isolation_egress::InRunJudgeRefusal`, which documents why), never an
+/// implicit `None`.
 fn resolved_turn(turn: CapturedTurn) -> Result<ResolvedRunTurn, VerificationError> {
     if turn.turn.is_empty() { return Err(VerificationError::Unavailable); }
     Ok(ResolvedRunTurn { identity: RunTurnIdentity { turn: turn.turn, approval_session: turn.approval_session },
         egress_turn: turn.egress_turn,
-        metadata: turn.metadata, principal_context: turn.principal_context, utility_runner: None })
+        metadata: turn.metadata, principal_context: turn.principal_context,
+        utility_runner: Some(crate::isolation_egress::in_run_judge_runner()) })
 }
 
 impl RunTurnResolver for GatewayAuthority {

@@ -105,6 +105,32 @@ fn apply_claude_utility_env(cmd: &mut tokio::process::Command, api_key: Option<&
     cmd.env_remove("CLAUDECODE");
 }
 
+/// B0 item 3: the Claude utility lane in protected mode refuses through the
+/// same mechanism as the other runtimes' utility refusals (their protected
+/// gate's site `authorize.utility_call`, the by-design DEBUG/INFO background
+/// log, the fixed spawn-gate refusal `refusal::user_error(None)`), instead of
+/// surfacing a bare `ISOLATION_UNAVAILABLE` from the spawn gate. The error
+/// stays a spawn-gate-enveloped `String`, as the spawn gate's refusal
+/// (`process_group::backend_error`) already was. `None` outside protected
+/// mode: the lane is unchanged.
+fn protected_utility_refusal() -> Option<String> {
+    if !duduclaw_core::execution_gate::isolation_required() {
+        return None;
+    }
+    let agent = crate::runtime_dispatch::CLAUDE_UTILITY_AGENT_ID.try_with(Clone::clone).unwrap_or_default();
+    crate::isolation_mcp::refusal::note_utility_refusal(
+        crate::isolation_mcp::refusal::provider_label(duduclaw_core::types::RuntimeType::Claude), &agent,
+        crate::isolation_mcp::refusal::site!("authorize.utility_call"));
+    Some(crate::isolation_mcp::refusal::user_error(None))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: lightweight-lane calls that got past the protected refusal and
+    /// went on to look up the binary / build the command line.
+    static LIGHTWEIGHT_SPAWN_PREPARED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Lightweight Claude CLI call for single-turn metadata tasks.
 ///
 /// Optimized for: session compression, instruction extraction, key-fact extraction,
@@ -118,6 +144,13 @@ pub(super) async fn call_claude_cli_lightweight(
     home_dir: &Path,
 ) -> Result<String, String> {
     crate::autonomous_runtime::require_utility_context(home_dir).await?;
+    // B0 item 3: refused here in protected mode, before the command line is
+    // built or the spawn gate is touched (the gate stays the backstop).
+    if let Some(refusal) = protected_utility_refusal() {
+        return Err(refusal);
+    }
+    #[cfg(test)]
+    LIGHTWEIGHT_SPAWN_PREPARED.with(|count| count.set(count.get() + 1));
     let claude_path =
         duduclaw_core::which_claude().ok_or_else(|| "claude CLI not found in PATH".to_string())?;
 
@@ -656,6 +689,35 @@ where
 #[cfg(test)]
 mod utility_profile_tests {
     use super::*;
+
+    /// B0 item 3: protected mode refuses the Claude utility lane with the
+    /// site `authorize.utility_call` and the by-design DEBUG/INFO log, before
+    /// the binary lookup / command line (zero lane calls get that far) and so
+    /// before the spawn gate. The error is the spawn-gate-enveloped fixed
+    /// refusal the other runtimes return for a utility call.
+    #[test]
+    fn b0_protected_claude_utility_lane_refuses_with_its_site_before_any_spawn() {
+        use crate::isolation_mcp::refusal::{site, test_support};
+        let home = tempfile::tempdir().unwrap();
+        LIGHTWEIGHT_SPAWN_PREPARED.with(|count| count.set(0));
+        let (result, logs) = test_support::with_isolation_required(|| test_support::run_capturing_logs(
+            crate::autonomous_runtime::human_interactive(home.path(),
+                crate::runtime_dispatch::CLAUDE_UTILITY_AGENT_ID.scope("b0-claude".to_owned(),
+                    call_claude_cli_public("summarize", "claude-haiku-4-5", "", home.path())))));
+        let error = result.unwrap_err();
+        assert_eq!(error, crate::isolation_mcp::refusal::user_error(None));
+        assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error), "{error}");
+        assert_eq!(LIGHTWEIGHT_SPAWN_PREPARED.with(std::cell::Cell::get), 0, "no spawn was prepared");
+        test_support::assert_utility_refusal_logged(&logs, site!("authorize.utility_call"));
+        assert!(logs.contains("runtime=\"claude\"") && logs.contains("agent=\"b0-claude\""), "{logs}");
+    }
+
+    /// B0 item 3: outside protected mode the lane takes no new refusal.
+    #[test]
+    fn b0_claude_utility_lane_is_unchanged_outside_protected_mode() {
+        if duduclaw_core::execution_gate::isolation_required() { return; }
+        assert_eq!(protected_utility_refusal(), None);
+    }
 
     #[test]
     fn utility_prompt_larger_than_linux_single_arg_limit_uses_stdin() {

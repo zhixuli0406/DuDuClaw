@@ -329,6 +329,37 @@ pub(crate) async fn obtain_approval(
 
 
 #[cfg(test)]
+mod b0_in_run_judge_tests {
+    use super::*;
+    use crate::isolation_mcp::refusal::{site, test_support};
+
+    /// B0 item 1: inside an isolated MCP request the action reviewer's
+    /// utility call (`decide::decide_for_agent`) reaches the production in-run
+    /// judge runner, which refuses (site `utility.in_run_judge`, DEBUG/INFO
+    /// log). `decide` keeps its fallback (no decision), and the computer-use
+    /// gate keeps its own: under `enforce`, no verdict asks a person.
+    #[test]
+    fn b0_in_mcp_action_review_refusal_keeps_the_ask_a_person_fallback() {
+        let home = tempfile::tempdir().unwrap();
+        let agent = crate::isolation_egress::test_support::employee(home.path(), "worker");
+        let (choice, logs) = test_support::run_capturing_logs(
+            crate::isolation_egress::test_support::in_mcp_request(home.path(), "worker",
+                crate::autonomous_runtime::scope(home.path(), "worker", &[],
+                    crate::decide::decide_for_agent(home.path(), Some(&agent), "q?", &["allow", "ask", "block"], "ctx"))));
+        assert_eq!(choice, None);
+        test_support::assert_utility_refusal_logged(&logs, site!("utility.in_run_judge"));
+
+        std::fs::write(home.path().join("config.toml"), "[action_review]\nmode = \"enforce\"\n").unwrap();
+        assert!(duduclaw_core::effect_of(TOOL_TYPE).is_side_effecting());
+        let (outcome, logs) = test_support::run_capturing_logs(
+            crate::isolation_egress::test_support::in_mcp_request(home.path(), "worker",
+                action_review(home.path(), "worker", TOOL_TYPE, &json!({ "text": "hello" }))));
+        assert!(matches!(outcome, Ok(true)), "no verdict must ask a person");
+        test_support::assert_utility_refusal_logged(&logs, site!("utility.in_run_judge"));
+    }
+}
+
+#[cfg(test)]
 mod egress_tests {
     use super::*;
 

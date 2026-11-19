@@ -1123,7 +1123,20 @@ pub(crate) fn utility_profile_refusal(provider: RuntimeType) -> String {
 }
 
 /// Resolve execution, keeping explicit judge hints fail-closed. Only an
-/// employee's unsupported runtime may fall back to the global utility spec.
+/// employee's unsupported runtime may fall back to the global utility spec,
+/// and only outside protected mode.
+///
+/// B0: when `execution_gate::isolation_required()`, an employee's utility
+/// call (one with an agent directory) is never resolved to the GLOBAL
+/// utility provider — that would be a different credential set than the
+/// employee's own. It is refused here, at resolution, with the fixed site
+/// `utility.global_fallback`, before the global configuration is read, before
+/// any provider is selected and before the product-policy and budget gates
+/// (`runtime_dispatch::run_utility_prompt_with_hint`). Previously the
+/// resolved global call was refused only later (the global runtime's protected
+/// gate, the in-MCP utility runner or the Claude spawn gate); this guarantee no
+/// longer depends on those. Agent-less (system) callers never take this
+/// fallback: an unsupported global provider is refused below either way.
 pub(crate) fn resolve_utility_profile(
     home: &Path,
     agent: Option<&Path>,
@@ -1148,6 +1161,13 @@ pub(crate) fn resolve_utility_profile(
     if utility_profile_supported(spec.provider) { return Ok(spec); }
     if explicit_hint || agent.is_none() {
         return Err(utility_profile_refusal(spec.provider));
+    }
+    if duduclaw_core::execution_gate::isolation_required() {
+        let label = agent.and_then(|dir| dir.file_name()).and_then(|name| name.to_str()).unwrap_or("");
+        crate::isolation_mcp::refusal::note_utility_refusal(
+            crate::isolation_mcp::refusal::provider_label(spec.provider), label,
+            crate::isolation_mcp::refusal::site!("utility.global_fallback"));
+        return Err(crate::isolation_mcp::refusal::user_error(None));
     }
     validate_utility_config(&home.join("config.toml"), "utility_provider", true)?;
     ensure_active_utility_provider(home)?;
@@ -1236,6 +1256,58 @@ mod tests {
         assert_eq!(resolve_utility_profile(home.path(), Some(agent.path()),
             UtilitySpec { provider: RuntimeType::Grok, model: "grok".into() }, false).unwrap(),
             UtilitySpec { provider: RuntimeType::OpenAiCompat, model: "fixture-model".into() });
+    }
+
+    /// B0 item 2: in protected mode an employee whose runtime has no utility
+    /// profile is refused AT RESOLUTION (site `utility.global_fallback`, the
+    /// by-design DEBUG/INFO log), before the global configuration is read: a
+    /// global `utility_provider` that would itself be refused while being read
+    /// does not change the answer, and no global spec is returned.
+    #[test]
+    fn b0_protected_employee_utility_never_resolves_to_the_global_provider() {
+        use crate::isolation_mcp::refusal::{site, test_support};
+        let home = TempDir::new().unwrap();
+        let agent = home.path().join("agents/worker");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(agent.join("agent.toml"), "[agent]\nname='worker'\n[runtime]\nprovider='grok'\n").unwrap();
+        // Read only by the fallback: an unknown provider refuses with its own text.
+        std::fs::write(home.path().join("config.toml"), "[runtime]\nutility_provider='not-a-runtime'\n").unwrap();
+        let grok = UtilitySpec { provider: RuntimeType::Grok, model: "grok-3".into() };
+        if !duduclaw_core::execution_gate::isolation_required() {
+            let unprotected = resolve_utility_profile(home.path(), Some(&agent), grok.clone(), false).unwrap_err();
+            assert!(unprotected.contains("unknown utility runtime"), "{unprotected}");
+        }
+        let expected = crate::isolation_mcp::refusal::user_error(None);
+        for provider in RuntimeType::ALL.iter().copied().filter(|p| !utility_profile_supported(*p)) {
+            let spec = UtilitySpec { provider, model: "fixture".into() };
+            let (result, logs) = test_support::with_isolation_required(|| test_support::run_capturing_logs(async {
+                resolve_utility_profile(home.path(), Some(&agent), spec.clone(), false)
+            }));
+            assert_eq!(result, Err(expected.clone()), "{provider:?}");
+            test_support::assert_utility_refusal_logged(&logs, site!("utility.global_fallback"));
+            assert!(!logs.contains("using global background settings"), "no provider was selected: {logs}");
+        }
+        // A valid global provider is not selected either.
+        std::fs::write(home.path().join("config.toml"),
+            "[runtime]\nutility_provider='openai_compat'\nutility_model='fixture-model'\n").unwrap();
+        let (result, _) = test_support::with_isolation_required(|| test_support::run_capturing_logs(async {
+            resolve_utility_profile(home.path(), Some(&agent), grok.clone(), false)
+        }));
+        assert_eq!(result, Err(expected));
+        // Supported employee runtimes and agent-less callers resolve exactly as before.
+        test_support::with_isolation_required(|| {
+            for provider in [RuntimeType::Claude, RuntimeType::Codex, RuntimeType::OpenAiCompat] {
+                let spec = UtilitySpec { provider, model: "fixture".into() };
+                assert_eq!(resolve_utility_profile(home.path(), Some(&agent), spec.clone(), false).unwrap(), spec);
+            }
+            assert_eq!(resolve_utility_profile(home.path(), None, grok.clone(), false),
+                Err(utility_profile_refusal(RuntimeType::Grok)));
+        });
+        // Outside protected mode the fallback is unchanged.
+        if !duduclaw_core::execution_gate::isolation_required() {
+            assert_eq!(resolve_utility_profile(home.path(), Some(&agent), grok, false).unwrap(),
+                UtilitySpec { provider: RuntimeType::OpenAiCompat, model: "fixture-model".into() });
+        }
     }
 
     #[test]

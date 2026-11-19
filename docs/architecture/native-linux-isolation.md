@@ -3246,9 +3246,14 @@ registry rather than counting source strings.
 - `hardware_info`, `model_search`, and `model_recommend` use Execution despite
   their read effect: `detect_hardware` can start `nvidia-smi` / `rocm-smi`.
   Shared approval judges can also invoke CLI utility runtimes. Under the
-  isolated request scope, `run_utility_prompt_with_hint` now returns an error
-  before runtime selection, retaining the existing fail-closed escalation.
-  A utility-backend integration is still needed; no gateway-uid fallback.
+  isolated request scope, `run_utility_prompt_with_hint` first runs utility
+  resolution (B0: in protected mode an employee whose runtime has no utility
+  profile is refused here, site `utility.global_fallback`, instead of falling
+  back to the global utility provider), then the product runtime/model policy,
+  the model/provider check and the budget gate, and only then hands the call to
+  the request's utility runner. That runner refuses by design (site
+  `utility.in_run_judge`), retaining the callers' existing fail-closed
+  escalation; there is no gateway-uid fallback.
 - `mcp_isolation_identity` is a task-local compatibility projection, never
   `set_var`. Existing identity helpers and handler reads get the verified
   employee/home/task/lane/principal/turn. Signed loopback clients may read an
@@ -3395,8 +3400,14 @@ enumerates all 259 ToolDefs and the 34 host-authority exceptions.
   hostile parsing still uses E and fd inputs. File routes retain their fd-only
   workspace boundary. Missing execution/parser factories fail boot readiness,
   not a new product permission rule. Utility judges retain original provider/model/autonomy/budget checks, then
-  use the host `UtilityRunner` execution seam. CLI utilities can retain Read
-  tools, so they must not fall through to a gateway-uid subprocess.
+  reach the request's `UtilityRunner`. No executing implementation exists: the
+  production runner (`isolation_egress::InRunJudgeRefusal`) refuses by design
+  (site `utility.in_run_judge`), because these judges decide on the calling
+  employee's own action and a second run of that employee waited on from its
+  own run cannot be admitted (`WouldDeadlock`). The sandbox Claude command line
+  has no built-in tools such as Read (`--tools ""`; only the DuDuClaw MCP tools
+  are allowed), and no utility call may fall through to a gateway-uid
+  subprocess.
 - Host desktop/device/power/network/system-service tools are the only explicit
   isolation refusals. The exact set is in the matrix. Host model lifecycle and
   shared co-drive desktop tools are included; computer containers are excluded.

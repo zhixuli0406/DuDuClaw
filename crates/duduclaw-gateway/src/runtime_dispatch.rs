@@ -887,7 +887,9 @@ pub async fn run_utility_prompt_with_hint(
         return Err("test forbids utility execution".into());
     }
     // Never enter a conversational fallback from a utility call. Unsupported
-    // employee providers were resolved to the global utility spec above.
+    // employee providers were resolved to the global utility spec above
+    // (outside protected mode only: there `resolve_utility_profile` refuses
+    // the global fallback with site `utility.global_fallback`).
     let allow_cross_family_failover = false;
     // Live round 8: the reply-shape preference, honoured only where the CLI can
     // actually constrain output. Reported as a `debug!` on every other runtime
@@ -903,7 +905,9 @@ pub async fn run_utility_prompt_with_hint(
     }
     if crate::isolation_egress::resolved_identity().is_some() {
         // Keep original provider, model, autonomy and budget gates before the
-        // host execution handoff. CLI utilities can retain read-capable tools.
+        // host execution handoff. In production that handoff is the refusing
+        // in-run judge runner (`isolation_egress::InRunJudgeRefusal`): a judge
+        // of the calling employee's own action is never executed here.
         if spec.provider != RuntimeType::Claude {
             crate::runtime_config::ensure_model_provider(&spec.model, spec.provider)?;
         }
@@ -1606,6 +1610,28 @@ mod utility_policy_tests {
             run_utility_prompt(home.path(), Some(&agent), "worker", "", "Summarize this", 16),
         )).await.unwrap_err();
         assert_eq!(error, denied);
+    }
+
+    /// B0 item 2, end to end: in protected mode the unsupported employee's
+    /// utility call is refused at resolution — before the product-policy gate
+    /// that refuses the same call outside protected mode (previous test), and
+    /// so before the budget gate and any runtime.
+    #[test]
+    fn b0_protected_employee_global_fallback_is_refused_before_policy_and_budget() {
+        use crate::isolation_mcp::refusal::{site, test_support};
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"),
+            "[product]\nprofile='restricted'\n[runtime]\nutility_provider='claude'\n").unwrap();
+        let agent = home.path().join("agents/worker");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(agent.join("agent.toml"), "[agent]\nname='worker'\nstatus='active'\n[runtime]\nprovider='grok'\n[model]\npreferred='grok-3'\n").unwrap();
+        let (result, logs) = test_support::with_isolation_required(|| test_support::run_capturing_logs(
+            DENY_EXECUTION.scope((), with_utility_context(home.path(),
+                UtilityContext::Autonomous { target: "worker", callers: &[] },
+                run_utility_prompt(home.path(), Some(&agent), "worker", "", "Summarize this", 16),
+            ))));
+        assert_eq!(result.unwrap_err(), crate::isolation_mcp::refusal::user_error(None));
+        test_support::assert_utility_refusal_logged(&logs, site!("utility.global_fallback"));
     }
 }
 
