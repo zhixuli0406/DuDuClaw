@@ -229,6 +229,12 @@ pub trait Host {
         -> std::result::Result<duduclaw_migration::allocation::Reply, duduclaw_migration::allocation::ErrorCode> {
         Err(duduclaw_migration::allocation::ErrorCode::IsolationUnavailable)
     }
+    /// R8y review round 1 (F1): publish the admission view (the same full
+    /// refresh the periodic path runs: registry, policy reload, report) on
+    /// the lifecycle thread, AFTER an allocation action and BEFORE its reply
+    /// is sent (`WorkerHost`'s lifecycle loop; `publishes_view`). An adapter
+    /// without a published view has nothing to do.
+    fn publish_view(&mut self) {}
     /// R8r-2: a schema-5 `provision_providers` (gateway or host root), on the
     /// same lifecycle worker. The request is owned: its payload is wiped
     /// when it is dropped. Missing implementation ⇒ refuse.
@@ -370,11 +376,20 @@ pub struct Coordinator<H: Host> {
     /// R6 update drain barrier (`None`: no update endpoint, e.g. unit tests).
     drain: Option<DrainBarrier>,
     /// R8y: start refusals not yet printed (the server drains them every
-    /// iteration, `take_refusals`); bounded by `MAX_PENDING_REFUSALS`.
-    refusals: Vec<StartStep>,
+    /// iteration, `take_refusal_counts`, into its rate limiter). R8y review
+    /// round 1 (F2): aggregated as (step, count) in first-seen order, so a
+    /// burst is never dropped; at most one entry per label of the closed set
+    /// (`start_refusal::label_bound`).
+    refusals: Vec<(StartStep, u64)>,
 }
-/// R8y: bound on unprinted start refusals (the server prints every 25 ms).
-pub const MAX_PENDING_REFUSALS: usize = 256;
+/// R8y review round 1 (F2): one more `step` in the pending tally (a free
+/// function so a field borrow of `entries` may be live at the call).
+fn tally_refusal(refusals: &mut Vec<(StartStep, u64)>, step: StartStep) {
+    match refusals.iter_mut().find(|(pending, _)| *pending == step) {
+        Some((_, count)) => *count = count.saturating_add(1),
+        None => refusals.push((step, 1)),
+    }
+}
 impl<H: Host> Coordinator<H> {
     pub fn new(host: H, limits: Limits) -> Result<Self> {
         if limits.host_runs == 0 || limits.host_requests < limits.host_runs || limits.host_requests > 1024
@@ -389,12 +404,16 @@ impl<H: Host> Coordinator<H> {
             refusals: Vec::new() })
     }
     /// R8y: record one refused start (printed by the server as
-    /// `start refused: step=<label>`). Beyond the bound it is dropped.
-    pub fn note_refusal(&mut self, step: StartStep) {
-        if self.refusals.len() < MAX_PENDING_REFUSALS { self.refusals.push(step); }
+    /// `start refused: step=<label>`, rate limited). Never dropped (F2).
+    pub fn note_refusal(&mut self, step: StartStep) { tally_refusal(&mut self.refusals, step); }
+    /// R8y: the refused starts recorded since the last call, one (step,
+    /// count) per label, in first-seen order.
+    pub fn take_refusal_counts(&mut self) -> Vec<(StartStep, u64)> { std::mem::take(&mut self.refusals) }
+    /// Tests: [`Self::take_refusal_counts`] with every occurrence listed.
+    #[cfg(test)]
+    pub fn take_refusals(&mut self) -> Vec<StartStep> {
+        self.take_refusal_counts().into_iter().flat_map(|(step, count)| std::iter::repeat_n(step, count as usize)).collect()
     }
-    /// R8y: the refused starts recorded since the last call, oldest first.
-    pub fn take_refusals(&mut self) -> Vec<StartStep> { std::mem::take(&mut self.refusals) }
     fn refused<T>(&mut self, result: Labelled<T>) -> Result<T> {
         result.map_err(|refusal| { self.note_refusal(refusal.step); refusal.code() })
     }
@@ -831,8 +850,8 @@ impl<H: Host> Coordinator<H> {
                     let expired = now.saturating_sub(entry.started) >= budget;
                     // R8y: Running never reached within the startup budget.
                     // (A field borrow: `entry` and `policy` borrow `self.entries`.)
-                    if expired && entry.state == AdmissionState::Starting && self.refusals.len() < MAX_PENDING_REFUSALS {
-                        self.refusals.push(StartStep::StartupTimeout);
+                    if expired && entry.state == AdmissionState::Starting {
+                        tally_refusal(&mut self.refusals, StartStep::StartupTimeout);
                     }
                     let progress = self.host.poll(run);
                     let reason = if expired { Some(RunOutcome::RuntimeTimeout) } else { match progress {
@@ -884,8 +903,13 @@ impl<H: Host> Coordinator<H> {
         // R8y: each `continue`/`break` records what held the run back
         // (`Entry::blocked`); it is printed only if the run then expires or
         // is cancelled while queued (`queue_timeout(..)`/`queue_cancelled(..)`).
-        for (_, id) in candidates {
-            if self.entries.values().filter(|e| e.active()).count() >= self.limits.host_runs { self.block(id, Blocker::HostRuns); break; }
+        for (index, &(_, id)) in candidates.iter().enumerate() {
+            if self.entries.values().filter(|e| e.active()).count() >= self.limits.host_runs {
+                // R8y review round 1 (F3): this run AND every run still queued
+                // behind it are held by the host run limit (not a stale blocker).
+                for &(_, held) in &candidates[index..] { self.block(held, Blocker::HostRuns); }
+                break;
+            }
             let entry = self.entries.get(&id).ok_or(ErrorCode::Internal)?;
             let employee = entry.employee;
             if self.entries.values().any(|e| e.employee == employee && e.active()) { self.block(id, Blocker::EmployeeBusy); continue; }

@@ -246,7 +246,7 @@ duduclaw-spawnd: employee account verification failed: step=<label> account=<dud
 duduclaw-spawnd: allocation failed: step=<label>
 ```
 
-第一行來自全主機的帳號檢查，會檢查員工範圍內每個 `duduclaw-emp-*` 帳號，包含已退役（tombstone）的帳號。`account=-` 表示主機層級的步驟。第二行在每次員工配置失敗時印一次。SSH 探測尚未完成或待處理保留數已達上限都不算失敗，不會記錄。label 是固定識別字，兩行都不含檔案內容或錯誤文字。就緒輸出與 `readiness.json` 的檢查名稱不變。
+第一行來自全主機的帳號檢查，會檢查員工範圍內每個 `duduclaw-emp-*` 帳號，包含已退役（tombstone）的帳號。`account=-` 表示主機層級的步驟。第二行在每次員工配置失敗時印一次，但同一個 label 在 10 秒內最多印 5 次；同一 label 之後的失敗只計數，並在這 10 秒結束時以一行 `duduclaw-spawnd: allocation failed: step=<label> suppressed=<count>` 回報。SSH 探測尚未完成或待處理保留數已達上限都不算失敗，不會記錄。label 是固定識別字，兩行都不含檔案內容或錯誤文字。就緒輸出與 `readiness.json` 的檢查名稱不變。
 
 | label | 失敗的項目 |
 | --- | --- |
@@ -279,6 +279,14 @@ duduclaw-spawnd: start refused: step=<label>
 
 這行不含員工 ID、執行 ID、路徑或請求內容。傳給閘道的錯誤碼不變。准入關卡的 label 可能來自 `ReserveRun`、`StartRun` 或排隊中執行的准入。
 
+這行依 label 限制頻率：10 秒內同一個 label 只印前 5 次拒絕。之後同一 label 的拒絕只計數，並在這 10 秒結束時改印一行計數：
+
+```text
+duduclaw-spawnd: start refused: step=<label> suppressed=<count>
+```
+
+每次拒絕都會印出，或計入某個 `suppressed=` 計數。印出的行數加上這些計數，就等於被拒絕的啟動次數。
+
 | label | 拒絕啟動的原因 |
 | --- | --- |
 | `frame`、`peer`、`request`、`fds`、`run_id` | 控制 socket：無法解碼的訊框、非閘道的連線端、未通過自身驗證的請求、與請求不符的描述元，或無法產生隨機執行 ID。 |
@@ -294,7 +302,7 @@ duduclaw-spawnd: start refused: step=<label>
 | `unit_start`、`unit_cgroup`、`bind_unit`、`launch_poll`、`startup_timeout` | systemd 拒絕 unit、unit 的 cgroup 或 trampoline 綁定失敗、在 Running 前啟動失敗，或未在啟動額度內到達 Running。 |
 | `host_gate`、`host_policy`、`host_start` | 僅測試用轉接器。 |
 
-在此版本之前，配置日誌中已是 Ready 的員工出現 `employee_not_admitted` 是一個缺陷：spawnd 只在啟動時讀取可准入的員工，因此 spawnd 啟動後才配置的員工會一直被拒絕，直到 spawnd 重新啟動。
+在此版本之前，配置日誌中已是 Ready 的員工出現 `employee_not_admitted` 是一個缺陷：spawnd 只在啟動時讀取可准入的員工，因此 spawnd 啟動後才配置的員工會一直被拒絕，直到 spawnd 重新啟動。現在 spawnd 會先發布可准入的員工，再回覆配置、授權、停用或退役請求。在配置或授權的回覆之後送出的 `ReserveRun`，會以更新後的員工與授權檢查；停用或退役的回覆之後，該員工會被拒絕。
 
 受保護員工環境不提供容器引擎與依賴主機硬體的功能。所有必要元件均需通過檢查才能恢復工作；套件測試通過或本指南都不能當作正式環境驗收。
 

@@ -246,7 +246,7 @@ duduclaw-spawnd: employee account verification failed: step=<label> account=<dud
 duduclaw-spawnd: allocation failed: step=<label>
 ```
 
-The first line comes from the host-wide account check. It checks every `duduclaw-emp-*` account in the employee range, including retired (tombstoned) ones. `account=-` means a host-level step. The second line is printed once for each failed employee allocation. A pending SSH probe or the pending-reservation limit is not a failure and is not logged. The label is a fixed identifier: neither line contains file contents or error text. The readiness output and `readiness.json` keep their check names.
+The first line comes from the host-wide account check. It checks every `duduclaw-emp-*` account in the employee range, including retired (tombstoned) ones. `account=-` means a host-level step. The second line is printed once for each failed employee allocation, at most 5 times per label in 10 seconds; further failures with that label are counted and reported when the 10 seconds end as one `duduclaw-spawnd: allocation failed: step=<label> suppressed=<count>` line. A pending SSH probe or the pending-reservation limit is not a failure and is not logged. The label is a fixed identifier: neither line contains file contents or error text. The readiness output and `readiness.json` keep their check names.
 
 | Label | What failed |
 | --- | --- |
@@ -279,6 +279,14 @@ duduclaw-spawnd: start refused: step=<label>
 
 The line has no employee id, run id, path or request content. The wire code sent to the gateway is unchanged. Labels from the admission gate can come from `ReserveRun`, `StartRun` or the queued run's admission.
 
+The line is rate limited per label: within 10 seconds the first 5 refusals with a label are printed. Further refusals with that label are counted, and when the 10 seconds end spawnd prints one line with the count instead:
+
+```text
+duduclaw-spawnd: start refused: step=<label> suppressed=<count>
+```
+
+Every refusal is either printed or included in a `suppressed=` count. The printed lines plus the counts add up to the number of refused starts.
+
 | Label | What refused the start |
 | --- | --- |
 | `frame`, `peer`, `request`, `fds`, `run_id` | Control socket: an undecodable frame, a peer that is not the gateway, a request that fails its own validation, descriptors that do not match it, or no random run id. |
@@ -294,7 +302,7 @@ The line has no employee id, run id, path or request content. The wire code sent
 | `unit_start`, `unit_cgroup`, `bind_unit`, `launch_poll`, `startup_timeout` | systemd refused the unit, the unit's cgroup or the trampoline binding failed, the launch failed before Running, or Running was not reached within the startup budget. |
 | `host_gate`, `host_policy`, `host_start` | Test adapters only. |
 
-An `employee_not_admitted` for an employee that is Ready in the allocation journal was a defect before this release: spawnd read its admitted employees only at start, so an employee allocated after spawnd started was refused until spawnd restarted.
+An `employee_not_admitted` for an employee that is Ready in the allocation journal was a defect before this release: spawnd read its admitted employees only at start, so an employee allocated after spawnd started was refused until spawnd restarted. spawnd now publishes its admitted employees before it answers an allocation, entitlement, disable or retire. A `ReserveRun` sent after an allocation or entitlement reply is checked against the updated employees and entitlement. After a disable or retire reply, the employee is refused.
 
 Container engines and hardware-dependent features remain unavailable through the protected employee environment. Every required component must pass its own checks before work resumes; neither a successful package test nor this guide is production acceptance.
 

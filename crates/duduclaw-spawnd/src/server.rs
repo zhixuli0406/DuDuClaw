@@ -140,6 +140,7 @@ pub fn serve_with_drain<H: Host<Inputs = Vec<OwnedFd>, Io = Vec<OwnedFd>>>(liste
     if let Some(barrier) = &drain { coordinator.set_drain_barrier(barrier.clone()); }
     coordination_time_ms()?;
     let mut clients: Vec<Client> = Vec::new();
+    let mut refusal_lines = crate::start_refusal::LineLimiter::new("start refused", crate::start_refusal::label_bound());
     loop {
         // Read before any admission of this iteration; reported after them.
         let epoch = drain.as_ref().map(crate::admission::DrainBarrier::epoch);
@@ -211,7 +212,14 @@ pub fn serve_with_drain<H: Host<Inputs = Vec<OwnedFd>, Io = Vec<OwnedFd>>>(liste
             barrier.observe(epoch, coordinator.admitted_runs(), healthy);
         }
         // R8y: one fixed journal line per refused start (no id, no path).
-        for step in coordinator.take_refusals() { eprintln!("duduclaw-spawnd: {}", step.line()); }
+        // R8y review round 1 (F2): rate limited per label (`LineLimiter`:
+        // the first 5 per label per 10 s, then one `suppressed=<count>`
+        // line per label when the window ends; this loop is the flush cadence).
+        let instant = Instant::now();
+        for (step, count) in coordinator.take_refusal_counts() {
+            for line in refusal_lines.note(step.line(), count, instant) { eprintln!("duduclaw-spawnd: {line}"); }
+        }
+        for line in refusal_lines.flush(instant) { eprintln!("duduclaw-spawnd: {line}"); }
         std::thread::sleep(Duration::from_millis(25));
     }
 }
@@ -475,6 +483,17 @@ mod tests {
         // The wire code is unchanged; only the journal names the step.
         assert_eq!(response.message, SpawnResponse::Error { code: ErrorCode::IsolationUnavailable });
         assert_eq!(coordinator.take_refusals(), vec![StartStep::Gate(crate::start_refusal::Gate::Host)]);
+        // R8y review round 1: a valid StartRun without its prompt fd is `fds`
+        // (`invalid_fds` on the wire, unchanged).
+        let start = Envelope { version: ipc::PROTOCOL_VERSION, request_id: RequestId([6; 16]),
+            message: SpawnRequest::StartRun { run: RunHandle(RunId([3; 16])), employee_id: EmployeeId([2; 16]),
+                runtime_request: RuntimeKind::Codex, task_ref: None, workspace: None, prompt_bytes: 1,
+                input_fds: duduclaw_isolation::bounded::List::new(vec![]).unwrap(), pty: false, requested_max_turns: None } };
+        gateway.send(&ipc::encode(&start).unwrap(), &[]).unwrap();
+        let Ok(Reply::Now(response, ..)) = dispatch(&mut coordinator, ControlConnectionId([1; 16]), server.recv().unwrap(), authority, 100)
+            else { panic!("unexpected reply") };
+        assert_eq!(response.message, SpawnResponse::Error { code: ErrorCode::InvalidFds });
+        assert_eq!(coordinator.take_refusals(), vec![StartStep::Fds]);
         let status = Envelope { version: ipc::PROTOCOL_VERSION, request_id: RequestId([5; 16]),
             message: SpawnRequest::Status { run: RunHandle(RunId([3; 16])) } };
         gateway.send(&ipc::encode(&status).unwrap(), &[]).unwrap();

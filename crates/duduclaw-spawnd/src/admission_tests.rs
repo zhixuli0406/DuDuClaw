@@ -373,10 +373,51 @@ fn r8y_coordinator_start_refusals_are_recorded_with_their_step() {
     assert_eq!(c.status(run(1), conn()).unwrap(), RunStatus::Starting);
     c.tick(1_100).unwrap();
     assert_eq!(c.take_refusals(), vec![StartStep::StartupTimeout]);
-    // The pending list is bounded.
+    // R8y review round 1 (F2): the pending list is one (step, count) per
+    // label, so a burst beyond the old 256-entry buffer loses nothing.
     let mut c = fresh();
-    for _ in 0..(MAX_PENDING_REFUSALS + 10) { c.note_refusal(StartStep::Peer); }
-    assert_eq!(c.take_refusals().len(), MAX_PENDING_REFUSALS);
+    for _ in 0..1_000 { c.note_refusal(StartStep::Peer); }
+    c.note_refusal(StartStep::Fds);
+    c.note_refusal(StartStep::Peer);
+    assert_eq!(c.take_refusal_counts(), vec![(StartStep::Peer, 1_001), (StartStep::Fds, 1)]);
+    assert!(c.take_refusal_counts().is_empty());
+    // The coordinator's tally through the server's limiter: every refusal is
+    // accounted for (printed or in the window's `suppressed=` count).
+    let t0 = std::time::Instant::now();
+    let mut limiter = crate::start_refusal::LineLimiter::new("start refused", crate::start_refusal::label_bound());
+    for _ in 0..1_000 { c.note_refusal(StartStep::QueueTimeout(Blocker::HostRuns)); }
+    let mut lines = Vec::new();
+    for (step, count) in c.take_refusal_counts() { lines.extend(limiter.note(step.line(), count, t0)); }
+    lines.extend(limiter.flush(t0 + crate::start_refusal::LINE_WINDOW));
+    assert_eq!(lines.len(), 6, "{lines:?}");
+    assert_eq!(lines[5], "start refused: step=queue_timeout(host_runs) suppressed=995");
+}
+
+/// R8y review round 1 (F3): with the host run slots full, EVERY queued run
+/// (not only the first examined) is held by `host_runs`, so each one's
+/// timeout and a cancel name it.
+#[test]
+fn r8y_every_queued_run_behind_full_host_slots_is_held_by_host_runs() {
+    let setup = || {
+        let mut c = Coordinator::new(FakeHost::default(), Limits { host_runs: 1, ..Limits::default() }).unwrap();
+        for n in 1..=4 { queue(&mut c, n, n, RuntimeKind::Codex); }
+        c.tick(100).unwrap();
+        assert_eq!(c.host.starts, vec![run(1)], "one slot, taken by run 1");
+        assert!(c.take_refusals().is_empty());
+        c
+    };
+    // Three queued runs time out: each line names the host run limit.
+    let mut c = setup();
+    c.tick(10_100).unwrap();
+    for n in 2..=4 { assert_eq!(c.status(run(n), conn()).unwrap(), RunStatus::Ended(RunOutcome::QueueTimeout)); }
+    let timeouts: Vec<StartStep> = c.take_refusals().into_iter().filter(|step| matches!(step, StartStep::QueueTimeout(_))).collect();
+    assert_eq!(timeouts, vec![StartStep::QueueTimeout(Blocker::HostRuns); 3]);
+    assert_eq!(timeouts[0].line(), "start refused: step=queue_timeout(host_runs)");
+    // A cancelled one (the last queued) prints `queue_cancelled(host_runs)`.
+    let mut c = setup();
+    c.cancel(run(4), conn(), 101).unwrap();
+    assert_eq!(c.take_refusals(), vec![StartStep::QueueCancelled(Blocker::HostRuns)]);
+    assert_eq!(StartStep::QueueCancelled(Blocker::HostRuns).line(), "start refused: step=queue_cancelled(host_runs)");
 }
 
 #[test]

@@ -41,6 +41,19 @@ pub(crate) enum AllocationWork {
         SyncSender<std::result::Result<duduclaw_migration::allocation::providers::Provisioned,
             duduclaw_migration::allocation::providers::ProviderErrorCode>>),
 }
+/// R8y review round 1 (F1): the allocation actions whose effect admission
+/// reads (the registry's Ready rows, the host entitlement in the root
+/// publication): their reply waits for `Host::publish_view`. Even a FAILED
+/// one may have changed either (a durable reservation, a revoked
+/// entitlement, a tombstoned row), so the result does not matter. ReadBack
+/// changes nothing.
+fn publishes_view(action: duduclaw_migration::allocation::Action) -> bool {
+    use duduclaw_migration::allocation::Action;
+    match action {
+        Action::Allocate | Action::Entitle | Action::Disable | Action::Retire => true,
+        Action::ReadBack => false,
+    }
+}
 pub struct WorkerHost {
     allocation_sender: SyncSender<AllocationWork>,
     sender: SyncSender<(Key, Work)>, receiver: Receiver<Completed>, slots: BTreeMap<Key, Slot>,
@@ -72,7 +85,17 @@ impl WorkerHost {
                 // HX4: helper ends/drains/closes, decided root-side during maintenance.
                 for event in host.helper_events() { let _ = helper_sender.send(event); }
                 match allocation_commands.try_recv() {
-                    Ok(AllocationWork::Allocation(request, reply)) => { let _ = reply.send(host.allocation(&request)); },
+                    Ok(AllocationWork::Allocation(request, reply)) => {
+                        let result = host.allocation(&request);
+                        // R8y review round 1 (F1): the gateway acts on this
+                        // reply at once (ReserveRun after Allocate/Entitle;
+                        // nothing after Disable/Retire), so the view it is
+                        // admitted against is published first, on this
+                        // thread. The reply is the action's own result.
+                        if publishes_view(request.action) { host.publish_view(); }
+                        let _ = reply.send(result);
+                    },
+                    // Provider provisioning changes nothing admission reads.
                     Ok(AllocationWork::Providers(request, reply)) => { let _ = reply.send(host.providers(request)); },
                     Err(_) => {},
                 }

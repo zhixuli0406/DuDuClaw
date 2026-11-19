@@ -301,6 +301,91 @@ pub fn at(step: StartStep) -> impl Fn(ErrorCode) -> Refusal { move |code| Refusa
 /// Labels an `ErrorCode` with a gate, code unchanged.
 pub fn gate(gate: Gate) -> impl Fn(ErrorCode) -> Refusal { at(StartStep::Gate(gate)) }
 
+/// [`StartStep`] variants without a parameter (all but `Gate`, `QueueTimeout`,
+/// `QueueCancelled`). Pinned against the exhaustive test list.
+const UNIT_STEPS: usize = 58;
+/// [`Gate`] variants without a parameter (all but `NotReady`, `Account`).
+const UNIT_GATES: usize = 17;
+/// [`Blocker`] variants without a parameter (all but `Gate`).
+const UNIT_BLOCKERS: usize = 6;
+/// R8y review round 1 (F2): the size of the closed set of rendered start
+/// refusal labels. The parameterised labels have bounded inner sets:
+/// `not_ready(<flag>)` over the readiness.json check names (14),
+/// `account(<step>)` over [`crate::accounts::Step::ALL`] (37), so
+/// G = 17 + 14 + 37 = 68 gate labels, and `queue_timeout(<blocker>)` /
+/// `queue_cancelled(<blocker>)` over 6 + G = 74 blockers each:
+/// 58 + 68 + 2 × 74 = 274 labels.
+pub fn label_bound() -> usize {
+    let gates = UNIT_GATES + crate::readiness::Readiness::default().named_checks().len() + crate::accounts::Step::ALL.len();
+    UNIT_STEPS + gates + 2 * (UNIT_BLOCKERS + gates)
+}
+
+/// R8y review round 1 (F2): at most this many identical journal lines are
+/// printed per [`LINE_WINDOW`]; further ones are only counted.
+pub const LINES_PER_WINDOW: u64 = 5;
+/// R8y review round 1 (F2): the aggregation window.
+pub const LINE_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// R8y review round 1 (F2): bounded, aggregated journal lines a peer can
+/// trigger repeatedly (`start refused: step=<label>`, `allocation failed:
+/// step=<label>`). Keyed by the full fixed line (its label determines it).
+/// In one window the first [`LINES_PER_WINDOW`] occurrences of a line are
+/// printed as before; further ones are counted, and when the window ends ONE
+/// `<line> suppressed=<count>` is printed per line that was suppressed. No
+/// occurrence is lost: printed + suppressed = noted. Memory: at most `cap`
+/// distinct lines (the closed label set's size, [`label_bound`]) per window,
+/// cleared at every roll-over; a line beyond `cap` (unreachable when `cap` is
+/// the closed set's size) is still counted, as `<kind>: step=other`.
+/// No thread of its own: callers pass their monotonic `Instant` and call
+/// [`Self::flush`] on their existing cadence (server loop, lifecycle refresh).
+#[derive(Debug)]
+pub struct LineLimiter {
+    kind: &'static str,
+    cap: usize,
+    window: Option<std::time::Instant>,
+    seen: std::collections::BTreeMap<String, Seen>,
+    other: u64,
+}
+#[derive(Debug, Default)]
+struct Seen { printed: u64, suppressed: u64 }
+impl LineLimiter {
+    /// `kind` is the line's fixed prefix before `: step=` (for the overflow line).
+    pub fn new(kind: &'static str, cap: usize) -> Self {
+        Self { kind, cap, window: None, seen: std::collections::BTreeMap::new(), other: 0 }
+    }
+    /// `count` occurrences of `line` at `now`: the lines to print now (a
+    /// finished window's summaries first, then up to the remaining budget of
+    /// copies of `line`).
+    pub fn note(&mut self, line: String, count: u64, now: std::time::Instant) -> Vec<String> {
+        let mut out = self.flush(now);
+        if count == 0 { return out; }
+        if !self.seen.contains_key(&line) && self.seen.len() >= self.cap {
+            self.other = self.other.saturating_add(count);
+            return out;
+        }
+        let seen = self.seen.entry(line.clone()).or_default();
+        let print = LINES_PER_WINDOW.saturating_sub(seen.printed).min(count);
+        seen.printed += print;
+        seen.suppressed = seen.suppressed.saturating_add(count - print);
+        out.extend((0..print).map(|_| line.clone()));
+        out
+    }
+    /// Ends the window when [`LINE_WINDOW`] has passed since it began: one
+    /// `<line> suppressed=<count>` per suppressed line (fixed order), and a
+    /// new window begins at `now`. Otherwise nothing.
+    pub fn flush(&mut self, now: std::time::Instant) -> Vec<String> {
+        let start = *self.window.get_or_insert(now);
+        if now.saturating_duration_since(start) < LINE_WINDOW { return Vec::new(); }
+        self.window = Some(now);
+        let mut out: Vec<String> = self.seen.iter().filter(|(_, seen)| seen.suppressed > 0)
+            .map(|(line, seen)| format!("{line} suppressed={}", seen.suppressed)).collect();
+        if self.other > 0 { out.push(format!("{}: step=other suppressed={}", self.kind, self.other)); }
+        self.seen.clear();
+        self.other = 0;
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,10 +461,127 @@ mod tests {
         assert_eq!(StartStep::QueueTimeout(Blocker::Unexamined).to_string(), "queue_timeout");
         assert_eq!(StartStep::QueueTimeout(Blocker::Gate(Gate::SshPending)).to_string(), "queue_timeout(ssh_pending)");
         assert_eq!(StartStep::QueueCancelled(Blocker::HostRuns).to_string(), "queue_cancelled(host_runs)");
+        // R8y review round 1: the server's hand-labelled exits (no fake can
+        // reach the peer and random-id exits) are pinned by their labels.
+        assert_eq!(StartStep::Peer.line(), "start refused: step=peer");
+        assert_eq!(StartStep::Fds.line(), "start refused: step=fds");
+        assert_eq!(StartStep::RunId.line(), "start refused: step=run_id");
+        assert_eq!(StartStep::Frame.line(), "start refused: step=frame");
         // Every readiness flag parameter is a readiness.json name.
         for (flag, _) in crate::readiness::Readiness::default().named_checks() {
             assert_eq!(StartStep::Gate(Gate::NotReady(flag)).to_string(), format!("not_ready({flag})"));
         }
+    }
+
+    fn blocker_listed(blocker: Blocker) {
+        match blocker {
+            Blocker::Unexamined | Blocker::HostRuns | Blocker::EmployeeBusy | Blocker::HostPtys | Blocker::Cleanup
+            | Blocker::CleanupIncomplete | Blocker::Gate(_) => {}
+        }
+    }
+    /// Every rendered label (every parameter of every variant).
+    fn every_label() -> std::collections::BTreeSet<String> {
+        let listed = all();
+        let units: Vec<StartStep> = listed.iter().copied()
+            .filter(|step| !matches!(step, StartStep::Gate(_) | StartStep::QueueTimeout(_) | StartStep::QueueCancelled(_))).collect();
+        let mut gates: Vec<Gate> = listed.iter().filter_map(|step| match step {
+            StartStep::Gate(gate) if !matches!(gate, Gate::NotReady(_) | Gate::Account(_)) => Some(*gate), _ => None }).collect();
+        assert_eq!((units.len(), gates.len()), (UNIT_STEPS, UNIT_GATES));
+        gates.extend(crate::readiness::Readiness::default().named_checks().into_iter().map(|(flag, _)| Gate::NotReady(flag)));
+        gates.extend(Step::ALL.into_iter().map(Gate::Account));
+        let mut blockers = vec![Blocker::Unexamined, Blocker::HostRuns, Blocker::EmployeeBusy, Blocker::HostPtys,
+            Blocker::Cleanup, Blocker::CleanupIncomplete];
+        for blocker in &blockers { blocker_listed(*blocker); }
+        assert_eq!(blockers.len(), UNIT_BLOCKERS);
+        blockers.extend(gates.iter().copied().map(Blocker::Gate));
+        let mut steps = units;
+        steps.extend(gates.iter().copied().map(StartStep::Gate));
+        steps.extend(blockers.iter().copied().map(StartStep::QueueTimeout));
+        steps.extend(blockers.iter().copied().map(StartStep::QueueCancelled));
+        let labels: std::collections::BTreeSet<String> = steps.iter().map(ToString::to_string).collect();
+        assert_eq!(labels.len(), steps.len(), "rendered labels are distinct");
+        labels
+    }
+    /// R8y review round 1 (F2): the limiter's cap is the closed set's size.
+    #[test]
+    fn label_bound_is_the_closed_label_set_size() {
+        assert_eq!(every_label().len(), label_bound());
+        assert_eq!(label_bound(), 274);
+    }
+
+    fn summed(lines: &[String], line: &str) -> u64 {
+        let printed = lines.iter().filter(|l| *l == line).count() as u64;
+        let prefix = format!("{line} suppressed=");
+        printed + lines.iter().filter_map(|l| l.strip_prefix(prefix.as_str())).map(|n| n.parse::<u64>().unwrap()).sum::<u64>()
+    }
+    /// R8y review round 1 (F2): 1,000 refusals of one label in one window
+    /// print at most N + 1 lines, and the counts add up.
+    #[test]
+    fn limiter_prints_at_most_n_plus_one_lines_per_label_and_window() {
+        let t0 = std::time::Instant::now();
+        let line = StartStep::Gate(Gate::EmployeeNotAdmitted).line();
+        let mut limiter = LineLimiter::new("start refused", label_bound());
+        let mut out = Vec::new();
+        for i in 0..1_000u64 { out.extend(limiter.note(line.clone(), 1, t0 + std::time::Duration::from_millis(i))); }
+        assert_eq!(out, vec![line.clone(); LINES_PER_WINDOW as usize], "the first N, as before");
+        assert!(limiter.flush(t0 + LINE_WINDOW - std::time::Duration::from_millis(1)).is_empty(), "the window has not ended");
+        out.extend(limiter.flush(t0 + LINE_WINDOW));
+        assert!(out.len() as u64 <= LINES_PER_WINDOW + 1, "{out:?}");
+        assert_eq!(out.last().unwrap(), "start refused: step=employee_not_admitted suppressed=995");
+        assert_eq!(summed(&out, &line), 1_000);
+        // Nothing left over: the next window starts empty.
+        assert!(limiter.flush(t0 + LINE_WINDOW * 3).is_empty());
+    }
+    #[test]
+    fn limiter_counts_two_interleaved_labels_separately() {
+        let t0 = std::time::Instant::now();
+        let (a, b) = (StartStep::Fds.line(), StartStep::QueueTimeout(Blocker::HostRuns).line());
+        let mut limiter = LineLimiter::new("start refused", label_bound());
+        let mut out = Vec::new();
+        for _ in 0..20 {
+            out.extend(limiter.note(a.clone(), 1, t0));
+            out.extend(limiter.note(b.clone(), 1, t0));
+        }
+        assert_eq!(out.iter().filter(|l| **l == a).count(), 5);
+        assert_eq!(out.iter().filter(|l| **l == b).count(), 5);
+        let summaries = limiter.flush(t0 + LINE_WINDOW);
+        assert_eq!(summaries, vec![format!("{a} suppressed=15"), format!("{b} suppressed=15")]);
+        out.extend(summaries);
+        assert_eq!((summed(&out, &a), summed(&out, &b)), (20, 20));
+    }
+    #[test]
+    fn limiter_window_rolls_over_and_reports_before_the_next_line() {
+        let t0 = std::time::Instant::now();
+        let line = StartStep::Peer.line();
+        let mut limiter = LineLimiter::new("start refused", label_bound());
+        let mut out = Vec::new();
+        for _ in 0..7 { out.extend(limiter.note(line.clone(), 1, t0)); }
+        assert_eq!(out.len(), 5);
+        // The first note after the window: the summary, then a fresh budget.
+        let next = limiter.note(line.clone(), 1, t0 + LINE_WINDOW);
+        assert_eq!(next, vec![format!("{line} suppressed=2"), line.clone()]);
+        // A window with no suppression prints no summary.
+        assert!(limiter.flush(t0 + LINE_WINDOW * 2).is_empty());
+        // Idle for an hour: the next line prints at once.
+        assert_eq!(limiter.note(line.clone(), 1, t0 + std::time::Duration::from_secs(3_600)), vec![line]);
+    }
+    /// R8y review round 1 (F2): a burst far beyond the old 256-entry buffer
+    /// (one aggregated count, as the coordinator hands it over) loses nothing.
+    #[test]
+    fn limiter_burst_beyond_the_old_buffer_loses_nothing_from_the_count() {
+        let t0 = std::time::Instant::now();
+        let line = StartStep::QueueTimeout(Blocker::HostRuns).line();
+        let mut limiter = LineLimiter::new("start refused", label_bound());
+        let mut out = limiter.note(line.clone(), 10_000, t0);
+        assert_eq!(out.len(), LINES_PER_WINDOW as usize);
+        out.extend(limiter.flush(t0 + LINE_WINDOW));
+        assert_eq!(summed(&out, &line), 10_000);
+        // Beyond the cap (unreachable with `label_bound`): still counted.
+        let mut tiny = LineLimiter::new("start refused", 1);
+        let mut out = tiny.note(StartStep::Peer.line(), 1, t0);
+        out.extend(tiny.note(StartStep::Fds.line(), 3, t0));
+        out.extend(tiny.flush(t0 + LINE_WINDOW));
+        assert_eq!(out, vec![StartStep::Peer.line(), "start refused: step=other suppressed=3".to_string()]);
     }
     #[test]
     fn labelling_keeps_the_wire_code() {

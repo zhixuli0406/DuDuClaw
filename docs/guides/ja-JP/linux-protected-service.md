@@ -246,7 +246,7 @@ duduclaw-spawnd: employee account verification failed: step=<label> account=<dud
 duduclaw-spawnd: allocation failed: step=<label>
 ```
 
-1 行目はホスト全体のアカウント検査から出力されます。この検査は社員範囲内のすべての `duduclaw-emp-*` アカウントを対象とし、退役済み（tombstone）のアカウントも含みます。`account=-` はホスト単位のステップを表します。2 行目は社員の割り当てが失敗するたびに 1 回出力されます。SSH プローブの結果待ちと保留中予約の上限到達は失敗ではないため、出力されません。label は固定の識別子で、どちらの行にもファイル内容やエラー文は含まれません。準備状態の出力と `readiness.json` の検査名は変わりません。
+1 行目はホスト全体のアカウント検査から出力されます。この検査は社員範囲内のすべての `duduclaw-emp-*` アカウントを対象とし、退役済み（tombstone）のアカウントも含みます。`account=-` はホスト単位のステップを表します。2 行目は社員の割り当てが失敗するたびに 1 回出力されますが、同じ label は 10 秒間に最大 5 回までです。それ以降の同じ label の失敗は数だけ数えられ、その 10 秒が終わったときに `duduclaw-spawnd: allocation failed: step=<label> suppressed=<count>` の 1 行で報告されます。SSH プローブの結果待ちと保留中予約の上限到達は失敗ではないため、出力されません。label は固定の識別子で、どちらの行にもファイル内容やエラー文は含まれません。準備状態の出力と `readiness.json` の検査名は変わりません。
 
 | label | 失敗した内容 |
 | --- | --- |
@@ -279,6 +279,14 @@ duduclaw-spawnd: start refused: step=<label>
 
 この行には社員 ID、実行 ID、パス、リクエスト内容は含まれません。ゲートウェイに返すエラーコードは変わりません。受け入れゲートの label は `ReserveRun`、`StartRun`、キュー中の実行の受け入れのいずれからも出力されます。
 
+この行は label ごとに出力頻度が制限されます。10 秒間に同じ label の拒否は最初の 5 件だけが出力されます。それ以降の同じ label の拒否は数だけ数えられ、その 10 秒が終わったときに件数を示す 1 行が代わりに出力されます。
+
+```text
+duduclaw-spawnd: start refused: step=<label> suppressed=<count>
+```
+
+すべての拒否は、出力されるか `suppressed=` の件数に含まれます。出力された行数とこれらの件数の合計は、拒否された起動の数と一致します。
+
 | label | 起動を拒否した内容 |
 | --- | --- |
 | `frame`、`peer`、`request`、`fds`、`run_id` | 制御ソケット：デコードできないフレーム、ゲートウェイ以外の接続相手、自身の検証に失敗したリクエスト、リクエストと合わないディスクリプタ、またはランダムな実行 ID を作れない。 |
@@ -294,7 +302,7 @@ duduclaw-spawnd: start refused: step=<label>
 | `unit_start`、`unit_cgroup`、`bind_unit`、`launch_poll`、`startup_timeout` | systemd が unit を拒否した、unit の cgroup や trampoline の結び付けに失敗した、Running 前に起動が失敗した、または起動予算内に Running にならなかった。 |
 | `host_gate`、`host_policy`、`host_start` | テスト用アダプターのみ。 |
 
-このリリースより前は、割り当てジャーナルで Ready の社員に `employee_not_admitted` が出るのは不具合でした。spawnd は受け入れ対象の社員を起動時にしか読まなかったため、spawnd の起動後に割り当てた社員は spawnd を再起動するまで拒否され続けました。
+このリリースより前は、割り当てジャーナルで Ready の社員に `employee_not_admitted` が出るのは不具合でした。spawnd は受け入れ対象の社員を起動時にしか読まなかったため、spawnd の起動後に割り当てた社員は spawnd を再起動するまで拒否され続けました。現在の spawnd は、割り当て、権利付与、無効化、退役に応答する前に、受け入れ対象の社員を公開します。割り当てや権利付与の応答後に送られた `ReserveRun` は、更新後の社員と権利付与で検査されます。無効化や退役の応答後は、その社員は拒否されます。
 
 保護された社員環境ではコンテナエンジンやホストハードウェア依存の機能を提供しません。作業再開前に全必須コンポーネントの検査が必要です。パッケージテストの成功や本ガイドを本番環境の受け入れ完了とは扱わないでください。
 

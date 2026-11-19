@@ -271,6 +271,10 @@ struct Core {
     /// (`accounts::verification_line`): printed again only when the failing
     /// step or account changes; cleared when verification passes.
     account_line: Option<String>,
+    /// R8y review round 1 (F2): the lifecycle thread's own `start refused`
+    /// lines (`Core::start`, `Core::poll`), rate limited per label like the
+    /// server's; its window ends on the refresh cadence (`refresh`).
+    start_lines: crate::start_refusal::LineLimiter,
 }
 /// C2: the cadence of start-up reconciliation retries.
 const STARTUP_RETRY: Duration = Duration::from_secs(2);
@@ -322,7 +326,8 @@ impl LinuxHost {
             monitor, runs: BTreeMap::new(), audit, last_refresh: Instant::now(), poisoned: false, view: view.clone(),
             helper_events: Vec::new(), recording_probe: probe::RecordingProbe::default(),
             probe_schedule: probe::ProbeSchedule::default(), recording_gate: recording_gate.clone(),
-            startup: StartupReconcile::opened(Instant::now(), false), evidence_line: None, account_line: None };
+            startup: StartupReconcile::opened(Instant::now(), false), evidence_line: None, account_line: None,
+            start_lines: crate::start_refusal::LineLimiter::new("start refused", crate::start_refusal::label_bound()) };
         startup_stage("report", core.report.publish(gateway.1))?;
         // Cleanup is attempted even when C/H/F/G are absent. Failure is evidence,
         // never permission to skip an orphan or reinterpret a stale reservation.
@@ -483,7 +488,18 @@ impl Core {
         } else { self.poisoned = true; }
         // Round 3 (N4): the gate next to the published report (closed when poisoned).
         self.recording_gate.publish(&self.report, self.poisoned);
+        // R8y review round 1 (F2): the lifecycle thread's rate-limited lines
+        // (start refusals, allocation failures) end their window here.
+        let now = Instant::now();
+        for line in self.start_lines.flush(now).into_iter().chain(self.registry.flush_lines(now)) {
+            eprintln!("duduclaw-spawnd: {line}");
+        }
         self.last_refresh = Instant::now();
+    }
+    /// R8y review round 1: one `start refused` line of the lifecycle thread,
+    /// through its rate limiter.
+    fn journal_start_refusal(&mut self, step: StartStep) {
+        for line in self.start_lines.note(step.line(), 1, Instant::now()) { eprintln!("duduclaw-spawnd: {line}"); }
     }
     fn account(&self, employee: EmployeeId) -> Result<EmployeeAccount> { os(self.registry.registry().lookup(employee)).cloned() }
     /// Every registry row (one per employee) is monitored; a row that is not
@@ -844,8 +860,10 @@ impl Host for Core {
         // allocation picks the result up. Other accounts are not probed inline.
         let mut accounts = LinuxAccounts::background(self.components.ssh.as_ref());
         // R8d: Entitle and the Disable/Retire removal write the root host
-        // publication on this same worker; `monitor_registry` below forces
-        // the next refresh, which reloads it (and republishes the projection).
+        // publication on this same worker. R8y review round 1 (F1): the
+        // lifecycle loop then runs `publish_view` (the full `refresh`: it
+        // reloads it, re-reads the registry's Ready rows and republishes
+        // the view) BEFORE this result is replied to the gateway.
         let mut entitlements = crate::installed::InstalledEntitlements;
         let result = self.allocator.handle(request, crate::allocation::Env { registry: &mut self.registry, accounts: &mut accounts,
             storage: self.components.storage.as_mut(), host_busy, idle, now_unix, entitlements: &mut entitlements });
@@ -912,6 +930,18 @@ impl Host for Core {
         self.signal_helper(run, call, signal)
     }
     fn helper_events(&mut self) -> Vec<HelperEvent> { self.collect_helper_events() }
+    /// R8y review round 1 (F1): the same full refresh the periodic path
+    /// runs (registry verification, policy reload, report publish, and the
+    /// admitted set re-read from the registry's Ready rows), run by the
+    /// lifecycle loop between an allocation action and its reply. Whatever
+    /// part of it fails, `refresh` still recomputes the admitted set from the
+    /// registry and stores it (a failed check, policy or report fails EVERY
+    /// employee's admission, never this one alone); only a poisoned view
+    /// lock skips the store, and that poisons the core (nothing is admitted).
+    /// The periodic refresh (`maintenance`, every 250 ms) recomputes it again
+    /// regardless, so a Ready employee is never left unadmitted by a
+    /// refresh that failed once.
+    fn publish_view(&mut self) { self.refresh(); }
     type Inputs = Vec<OwnedFd>; type Io = Vec<OwnedFd>;
     fn ready(&mut self, employee: EmployeeId) -> Result<()> { self.ready_labelled(employee).map_err(Refusal::code) }
     fn ready_step(&mut self, employee: EmployeeId) -> Labelled<()> { self.ready_labelled(employee) }
@@ -925,8 +955,9 @@ impl Host for Core {
     /// asynchronously: the coordinator learns of it only as an
     /// `isolation_failure` outcome). Codes unchanged.
     fn start(&mut self, run: RunHandle, employee: EmployeeId, request: &SpawnRequest, launch_policy: &LaunchPolicy, inputs: Self::Inputs) -> Result<()> {
-        self.start_labelled(run, employee, request, launch_policy, inputs).map_err(|refusal| {
-            eprintln!("duduclaw-spawnd: {}", refusal.step.line());
+        let started = self.start_labelled(run, employee, request, launch_policy, inputs);
+        started.map_err(|refusal| {
+            self.journal_start_refusal(refusal.step);
             refusal.code()
         })
     }
@@ -937,7 +968,7 @@ impl Host for Core {
         // coordinator drains the run on this error and polls it no more.
         if progress.as_ref().is_err_and(|code| *code != ErrorCode::NotReady)
             && self.runs.get(&run.0).is_some_and(|entry| !entry.started_event && !entry.closed && entry.unit.is_some()) {
-            eprintln!("duduclaw-spawnd: {}", StartStep::LaunchPoll.line());
+            self.journal_start_refusal(StartStep::LaunchPoll);
         }
         let progress = progress?;
         if matches!(progress, HostProgress::Running { .. } | HostProgress::Ended(_)) {

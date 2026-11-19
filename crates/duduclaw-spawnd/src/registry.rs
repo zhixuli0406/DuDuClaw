@@ -386,7 +386,10 @@ mod disk {
     /// An instance owns the global lock for its entire lifetime, including useradd.
     /// `allocations` (R7c) remembers which `Reserved` rows of this process
     /// an unresolved SSH probe left resumable.
-    pub struct RegistryStore { directory: PathBuf, _lock: File, data: Registry, poisoned: bool, allocations: Allocations }
+    /// R8y review round 1 (F2): `lines` rate-limits the `allocation failed:
+    /// step=<label>` journal line per label (at most `Step::ALL.len()` labels).
+    pub struct RegistryStore { directory: PathBuf, _lock: File, data: Registry, poisoned: bool, allocations: Allocations,
+        lines: crate::start_refusal::LineLimiter }
 
     impl RegistryStore {
         pub fn open() -> io::Result<Self> { Self::open_at(Path::new(REGISTRY_DIRECTORY)) }
@@ -436,7 +439,8 @@ mod disk {
             // Recovery must retain the reservation until it can quarantine any
             // group/user created before the previous daemon stopped.
             let mut store = Self { directory: directory.to_path_buf(), _lock: lock, data, poisoned: false,
-                allocations: Allocations::default() };
+                allocations: Allocations::default(),
+                lines: crate::start_refusal::LineLimiter::new("allocation failed", crate::accounts::Step::ALL.len()) };
             // Persist even an empty initial registry; never infer unused IDs later.
             store.save()?;
             Ok(store)
@@ -484,7 +488,7 @@ mod disk {
         /// clock included ([`Allocations::allocate_stored`]), reaches this
         /// one logging point exactly once.
         pub fn allocate(&mut self, employee: EmployeeId, host: &mut dyn AccountHost) -> io::Result<EmployeeAccount> {
-            let Self { directory, data, poisoned, allocations, .. } = self;
+            let Self { directory, data, poisoned, allocations, lines, .. } = self;
             let was_poisoned = *poisoned;
             let result = allocations.allocate_stored(data, employee, host, was_poisoned, &mut || crate::host_state::boottime_ms(),
                 &mut |registry: &Registry| {
@@ -498,10 +502,19 @@ mod disk {
                 // (unlike the verification line): Allocate requests are
                 // operator-initiated (a confirmed migration proposal), so
                 // their volume is the operator's, not a refresh cadence.
-                if let Some(line) = allocation_log_line(error) { eprintln!("duduclaw-spawnd: {line}"); }
+                // R8y review round 1 (F2): but the gateway account can repeat
+                // them, so the line is rate limited per label (first 5 per
+                // 10 s, then a `suppressed=<count>` line; `flush_lines`).
+                if let Some(line) = allocation_log_line(error) {
+                    for line in lines.note(line, 1, std::time::Instant::now()) { eprintln!("duduclaw-spawnd: {line}"); }
+                }
             }
             result
         }
+
+        /// R8y review round 1 (F2): the allocation-failure summaries of an
+        /// ended window (`Core::refresh` calls this on its cadence).
+        pub fn flush_lines(&mut self, now: std::time::Instant) -> Vec<String> { self.lines.flush(now) }
 
         /// The reservation deadline ([`Allocations::expire`]) at the current
         /// boottime, for the lifecycle thread's maintenance.
