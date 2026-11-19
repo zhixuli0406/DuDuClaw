@@ -235,11 +235,18 @@ fn resource_bytes(resource: &ResourceGrant) -> Vec<u8> {
     }
     out
 }
-fn set_bytes(out: &mut Vec<u8>, mut entries: Vec<Vec<u8>>) -> Result<(), ContractError> {
+
+/// The canonical (sorted) order of a grant set; a repeated entry is refused.
+fn distinct_sorted(mut entries: Vec<Vec<u8>>) -> Result<Vec<Vec<u8>>, ContractError> {
     entries.sort();
     if entries.windows(2).any(|pair| pair[0] == pair[1]) {
         return Err(ContractError::InvalidValue("duplicate capability grant"));
     }
+    Ok(entries)
+}
+
+fn set_bytes(out: &mut Vec<u8>, entries: Vec<Vec<u8>>) -> Result<(), ContractError> {
+    let entries = distinct_sorted(entries)?;
     out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
     for entry in entries { out.extend_from_slice(&entry); }
     Ok(())
@@ -344,13 +351,38 @@ impl CapabilityRecord {
         Ok(())
     }
 
-    /// Stable v2 bytes to MAC/sign. Times are Unix seconds. Tags and field order
-    /// are protocol constants; do not replace this with JSON serialization (§6.1).
-    pub fn canonical_bytes(&self) -> Result<Vec<u8>, ContractError> {
-        self.validate_resource_mode()?;
+    /// The validity interval rule of [`Self::canonical_bytes`]: a capability is
+    /// never valid before it is issued (`issued_at <= not_before`) and its
+    /// window is non-empty (`not_before < expires_at`). Times are Unix seconds.
+    pub fn validate_interval(&self) -> Result<(), ContractError> {
         if self.issued_at > self.not_before || self.not_before >= self.expires_at {
             return Err(ContractError::InvalidValue("capability validity interval"));
         }
+        Ok(())
+    }
+
+    fn tool_entries(&self) -> Vec<Vec<u8>> {
+        self.tools.as_slice().iter().map(|tool| {
+            let mut bytes = Vec::new(); text_bytes(&mut bytes, tool.as_str()); bytes
+        }).collect()
+    }
+
+    /// The grant-set rule of [`Self::canonical_bytes`]: neither the tool set
+    /// nor the resource set repeats an entry (compared by canonical bytes).
+    pub fn validate_distinct_grants(&self) -> Result<(), ContractError> {
+        distinct_sorted(self.tool_entries())?;
+        distinct_sorted(self.resources.as_slice().iter().map(resource_bytes).collect())?;
+        Ok(())
+    }
+
+    /// Stable v2 bytes to MAC/sign. Times are Unix seconds. Tags and field order
+    /// are protocol constants; do not replace this with JSON serialization (§6.1).
+    /// The refusals, in order: [`Self::validate_resource_mode`],
+    /// [`Self::validate_interval`], then [`Self::validate_distinct_grants`]
+    /// (tools, then resources).
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, ContractError> {
+        self.validate_resource_mode()?;
+        self.validate_interval()?;
         let mut out = CAPABILITY_DOMAIN.to_vec();
         out.extend_from_slice(&CAPABILITY_ENCODING_VERSION.to_be_bytes());
         out.extend_from_slice(&(self.id.0).0);
@@ -370,10 +402,7 @@ impl CapabilityRecord {
         }
         binding_bytes(&mut out, &self.employee_binding);
         out.push(match self.lane { Lane::Standard => 0, Lane::Explore => 1 });
-        let tools = self.tools.as_slice().iter().map(|tool| {
-            let mut bytes = Vec::new(); text_bytes(&mut bytes, tool.as_str()); bytes
-        }).collect();
-        set_bytes(&mut out, tools)?;
+        set_bytes(&mut out, self.tool_entries())?;
         set_bytes(&mut out, self.resources.as_slice().iter().map(resource_bytes).collect())?;
         out.extend_from_slice(&self.policy_revision.to_be_bytes());
         out.extend_from_slice(&self.gateway_epoch);

@@ -464,6 +464,142 @@ fn r8z3_activation_refusals_name_their_check() {
         Some((S::LiveSnapshot, VerificationError::Unavailable)));
 }
 
+/// R8z-4: a fresh boundary whose run is reserved until 130 s (as `setup`).
+fn reserved() -> (Arc<Boundary>, Arc<Live>) {
+    let live = Arc::new(Live(Mutex::new((RunStatus::Reserved { expires_at_unix_ms: 130_000 }, 1, false))));
+    (Boundary::new(live.clone()).unwrap(), live)
+}
+
+/// R8z-4 regression: the grant's `not_before` is stamped when the per-run
+/// authorization is issued (t = 100); the capability is issued after the run
+/// was reserved, a second or more later. Issue must succeed, the record's
+/// window starts at the issue (never before it), keeps the grant's expiry,
+/// and the capability activates afterwards.
+#[test]
+fn r8z4_issue_after_the_grant_second_ticked_succeeds_and_activates() {
+    let stamped = policy().not_before;
+    for (issue_at, activate_at) in [(stamped + 1, stamped + 5), (stamped + 5, stamped + 6)] {
+        let (boundary, live) = reserved();
+        let id = boundary.issue_checked(&reservation(), policy(), issue_at)
+            .unwrap_or_else(|refusal| panic!("issue at {issue_at}: {refusal:?}"));
+        let (record, _, _) = proof(&boundary, id);
+        assert_eq!(record.issued_at, issue_at);
+        assert_eq!(record.not_before, issue_at, "never valid before it is issued");
+        assert_eq!(record.expires_at, policy().expires_at, "the grant's expiry is unchanged");
+        assert!(record.canonical_bytes().is_ok());
+        live.0.lock().unwrap().0 = RunStatus::Running;
+        let connection = boundary.activate_inner(id, &reservation(), activate_at)
+            .unwrap_or_else(|error| panic!("activate at {activate_at}: {error:?}"));
+        assert!(connection.context(activate_at).is_ok());
+    }
+    // Only narrowed: before its issue second the capability is not valid
+    // (a backwards clock step between issue and activation is a refusal).
+    let (boundary, live) = reserved();
+    let id = boundary.issue(&reservation(), policy(), stamped + 5).unwrap();
+    live.0.lock().unwrap().0 = RunStatus::Running;
+    assert_eq!(boundary.activate_inner_checked(id, &reservation(), stamped + 4).err(),
+        Some((BoundaryActivateStep::Time, VerificationError::InvalidTime)));
+}
+
+/// R8z-4: a grant whose `not_before` is later than the issue was accepted
+/// before this change (the record kept `issued_at < not_before`) and still
+/// is; the record keeps the grant's later `not_before`, so it cannot activate
+/// before then.
+#[test]
+fn r8z4_a_grant_valid_later_keeps_its_not_before() {
+    let mut later = policy();
+    later.not_before = 110;
+    let (boundary, live) = reserved();
+    let id = boundary.issue_checked(&reservation(), later, 100).unwrap();
+    let (record, _, _) = proof(&boundary, id);
+    assert_eq!((record.issued_at, record.not_before, record.expires_at), (100, 110, 200));
+    live.0.lock().unwrap().0 = RunStatus::Running;
+    assert_eq!(boundary.activate_inner_checked(id, &reservation(), 105).err(),
+        Some((BoundaryActivateStep::Time, VerificationError::InvalidTime)));
+    let mut later = policy();
+    later.not_before = 110;
+    let (boundary, live) = reserved();
+    let id = boundary.issue(&reservation(), later, 100).unwrap();
+    live.0.lock().unwrap().0 = RunStatus::Running;
+    assert!(boundary.activate_inner(id, &reservation(), 110).is_ok());
+}
+
+/// R8z-4: a grant whose window has passed (`now >= expires_at`), or is
+/// empty, is still refused by the encoding with the unchanged error
+/// (`Invalid`, formerly reported as `issue.encode`, now `issue.encode.interval`).
+#[test]
+fn r8z4_issue_at_or_after_the_grant_expiry_is_still_refused() {
+    let interval = Some((IssueStep::Encode(EncodeCheck::Interval), VerificationError::Invalid));
+    for now in [120, 121, 129] {
+        let mut short = policy();
+        short.expires_at = 120;
+        let (boundary, _) = reserved();
+        assert_eq!(boundary.issue_checked(&reservation(), short, now).err(), interval, "now {now}");
+        let mut short = policy();
+        short.expires_at = 120;
+        let (boundary, _) = reserved();
+        assert_eq!(boundary.issue(&reservation(), short, now).err(), Some(VerificationError::Invalid));
+    }
+    // The last second of the window still issues.
+    let mut short = policy();
+    short.expires_at = 120;
+    assert!(reserved().0.issue(&reservation(), short, 119).is_ok());
+    // An empty grant window.
+    let mut empty = policy();
+    empty.not_before = 150;
+    empty.expires_at = 150;
+    assert_eq!(reserved().0.issue_checked(&reservation(), empty, 100).err(), interval);
+}
+
+/// R8z-4: each rule of the capability encoding names its own sub-step.
+/// `interval` and `duplicate_grant` are reached through `issue_checked`;
+/// `resource_mode` is not (`validate_grants` applies the same rule first, as
+/// `issue.grants`), so it and `other` are checked on `EncodeCheck::of`.
+#[test]
+fn r8z4_encode_refusals_name_their_rule() {
+    // Duplicate tool grant: passes `validate_grants`, refused by the encoding.
+    let mut twice = policy();
+    twice.tools = List::new(vec![Text::new("file_read".into()).unwrap(), Text::new("file_read".into()).unwrap()]).unwrap();
+    assert_eq!(reserved().0.issue_checked(&reservation(), twice, 100).err(),
+        Some((IssueStep::Encode(EncodeCheck::DuplicateGrant), VerificationError::Invalid)));
+    let mut twice = policy();
+    twice.tools = List::new(vec![Text::new("file_read".into()).unwrap(), Text::new("file_read".into()).unwrap()]).unwrap();
+    assert_eq!(reserved().0.issue(&reservation(), twice, 100).err(), Some(VerificationError::Invalid));
+    // Through the classifier, one rule violated at a time, each with the
+    // same `ContractError` the encoding returns.
+    let (boundary, _, id) = setup();
+    let (valid, _, _) = proof(&boundary, id);
+    assert!(valid.canonical_bytes().is_ok());
+    assert_eq!(EncodeCheck::of(&valid), EncodeCheck::Other);
+    let mut mode = valid.clone();
+    mode.resources = List::new(vec![ResourceGrant::EmployeeScope { id: EmployeeId([9; 16]) }]).unwrap();
+    let mut interval = valid.clone();
+    interval.issued_at = interval.not_before + 1;
+    let mut duplicate = valid.clone();
+    duplicate.tools = List::new(vec![Text::new("a".into()).unwrap(), Text::new("a".into()).unwrap()]).unwrap();
+    for (record, check, rule) in [
+        (&mode, EncodeCheck::ResourceMode, mode.validate_resource_mode()),
+        (&interval, EncodeCheck::Interval, interval.validate_interval()),
+        (&duplicate, EncodeCheck::DuplicateGrant, duplicate.validate_distinct_grants()),
+    ] {
+        let refused = record.canonical_bytes().err();
+        assert!(refused.is_some(), "{check:?}");
+        assert_eq!(refused, rule.err(), "{check:?}");
+        assert_eq!(EncodeCheck::of(record), check);
+    }
+    assert_eq!(interval.validate_interval(),
+        Err(duduclaw_isolation::ContractError::InvalidValue("capability validity interval")));
+    assert_eq!(duplicate.validate_distinct_grants(),
+        Err(duduclaw_isolation::ContractError::InvalidValue("duplicate capability grant")));
+    // In `canonical_bytes`' order: a record violating every rule is `resource_mode`.
+    let mut all = duplicate.clone();
+    all.resources = mode.resources.clone();
+    all.issued_at = all.not_before + 1;
+    assert_eq!(EncodeCheck::of(&all), EncodeCheck::ResourceMode);
+    all.resources = valid.resources.clone();
+    assert_eq!(EncodeCheck::of(&all), EncodeCheck::Interval);
+}
+
 #[test]
 fn detached_context_has_no_live_io_authority() {
     let (boundary, _, id) = setup();

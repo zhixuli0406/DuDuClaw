@@ -5,7 +5,7 @@ use hmac::{Hmac, Mac};
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
-pub use crate::launch_steps::{BoundaryActivateStep, IssueStep};
+pub use crate::launch_steps::{BoundaryActivateStep, EncodeCheck, IssueStep};
 
 type HmacSha256 = Hmac<Sha256>;
 const MAX_RECORDS: usize = 4096;
@@ -149,15 +149,22 @@ impl Boundary {
         let random_step = |error: VerificationError| (IssueStep::Random, error);
         let bearer = Zeroizing::new(random::<32>().map_err(random_step)?);
         let id = CapabilityId(Sha256Digest(Sha256::digest(bearer.as_ref()).into()));
+        // R8z-4: the grant's `not_before` is stamped when the per-run
+        // authorization is issued, before the run is reserved; `now` is this
+        // (later) issue. The capability is never valid before it is issued,
+        // so its window starts at the later of the two. This only narrows the
+        // grant's window (`expires_at` is the grant's); a grant whose window
+        // has passed (`now >= expires_at`) still fails the interval rule.
         let record = CapabilityRecord {
             id, employee: reservation.employee, run: reservation.run.0, task: policy.task,
             principal: policy.principal, employee_binding: policy.binding, lane: policy.lane,
             tools: policy.tools, resources: policy.resources, policy_revision: policy.policy_revision,
-            gateway_epoch: self.epoch, issued_at: now, not_before: policy.not_before,
+            gateway_epoch: self.epoch, issued_at: now, not_before: policy.not_before.max(now),
             expires_at: policy.expires_at, nonce: random().map_err(random_step)?, jti: random().map_err(random_step)?,
         };
         crate::resources::validate_grants(&record).map_err(|error| (IssueStep::Grants, error))?;
-        let bytes = record.canonical_bytes().map_err(|_| (IssueStep::Encode, VerificationError::Invalid))?;
+        let bytes = record.canonical_bytes()
+            .map_err(|_| (IssueStep::Encode(EncodeCheck::of(&record)), VerificationError::Invalid))?;
         let mut signer = HmacSha256::new_from_slice(self.key.as_ref())
             .map_err(|_| (IssueStep::Signer, VerificationError::Unavailable))?;
         signer.update(&bytes);

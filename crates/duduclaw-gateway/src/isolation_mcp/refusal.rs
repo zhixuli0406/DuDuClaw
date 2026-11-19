@@ -431,7 +431,11 @@ sites! {
     LaunchBindInnerPrepareIssueAgentSlug => "launch.bind.inner_prepare.issue.agent_slug",
     LaunchBindInnerPrepareIssueBindingPrincipal => "launch.bind.inner_prepare.issue.binding_principal",
     LaunchBindInnerPrepareIssueGrants => "launch.bind.inner_prepare.issue.grants",
-    LaunchBindInnerPrepareIssueEncode => "launch.bind.inner_prepare.issue.encode",
+    // R8z-4: the rule of the capability encoding that refused.
+    LaunchBindInnerPrepareIssueEncodeResourceMode => "launch.bind.inner_prepare.issue.encode.resource_mode",
+    LaunchBindInnerPrepareIssueEncodeInterval => "launch.bind.inner_prepare.issue.encode.interval",
+    LaunchBindInnerPrepareIssueEncodeDuplicateGrant => "launch.bind.inner_prepare.issue.encode.duplicate_grant",
+    LaunchBindInnerPrepareIssueEncodeOther => "launch.bind.inner_prepare.issue.encode.other",
     LaunchBindInnerPrepareIssueRandom => "launch.bind.inner_prepare.issue.random",
     LaunchBindInnerPrepareIssueSigner => "launch.bind.inner_prepare.issue.signer",
     LaunchBindInnerPrepareIssueStateLock => "launch.bind.inner_prepare.issue.state_lock",

@@ -291,7 +291,8 @@ sudo journalctl -u duduclaw-gateway.service --no-pager | grep -E 'isolated (laun
 | `inner_prepare.issue.not_reserved`、`.reservation`、`.expiry`、`.time` | 隔離サービスがこの予約をもう予約中と報告しない、または予約が期限切れ（システム時計のずれの後にも表れます）。 |
 | `inner_prepare.issue.principal`、`.binding`、`.policy_revision`、`.agent_slug`、`.binding_principal` | ターンで取得した権限が現在の権限と異なる（その人、社員の所属、ポリシーが途中で変わった）、またはその人がこの社員の所属のもとで行動できない。 |
 | `inner_prepare.issue.grants` | このターンのリソース権限（ワークスペース、コネクタ、Web の接続先）がこの社員には認められない。 |
-| `inner_prepare.issue.encode`、`.random`、`.signer`、`.state_lock`、`.capacity`、`.duplicate`、`inner_prepare.employee_mismatch`、`.prepared_missing`、`.state_lock`、`.pending_duplicate`、`.argv`、`.clock`、`.registry.unreported` | OS の乱数源またはシステム時計の失敗、または不具合（報告してください）。 |
+| `inner_prepare.issue.encode.<rule>`（`resource_mode`、`interval`、`duplicate_grant`、`other`） | 実行用権限をエンコードできない：`interval` — ターンの権限が実行用権限の発行前に期限切れになった（またはシステム時計のずれ）。その他は不具合（報告してください）。 |
+| `inner_prepare.issue.random`、`.signer`、`.state_lock`、`.capacity`、`.duplicate`、`inner_prepare.employee_mismatch`、`.prepared_missing`、`.state_lock`、`.pending_duplicate`、`.argv`、`.clock`、`.registry.unreported` | OS の乱数源またはシステム時計の失敗、または不具合（報告してください）。 |
 | `inner_prepare.verify_blocking` | 上の `verify_blocking` と同じ（ツール境界のブロッキング確認）。 |
 
 実行の開始後、ツール境界はその MCP エンドポイントを有効にします。ここで拒否されると `isolated launch activation refused`（固定の `step`：`inner_activate.<substep>` のみ）が記録され、続いて `isolated spawn refused locally step="launch_activate"` が記録されます。ターンの site は `launch.activate.<step>` です。開始済みの実行は取り消され、実行用権限も無効化されます。

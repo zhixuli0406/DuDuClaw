@@ -291,7 +291,8 @@ sudo journalctl -u duduclaw-gateway.service --no-pager | grep -E 'isolated (laun
 | `inner_prepare.issue.not_reserved`、`.reservation`、`.expiry`、`.time` | 隔離服務已不再把這個預約回報為預約中，或預約已過期（系統時鐘跳動後也會出現）。 |
 | `inner_prepare.issue.principal`、`.binding`、`.policy_revision`、`.agent_slug`、`.binding_principal` | 這一輪擷取的授權與即時授權不同（此人、員工的歸屬或政策在期間有變動），或此人不能代表這位員工的歸屬行事。 |
 | `inner_prepare.issue.grants` | 這一輪的資源授權（工作區、連接器、網站來源）對這位員工不被接受。 |
-| `inner_prepare.issue.encode`、`.random`、`.signer`、`.state_lock`、`.capacity`、`.duplicate`、`inner_prepare.employee_mismatch`、`.prepared_missing`、`.state_lock`、`.pending_duplicate`、`.argv`、`.clock`、`.registry.unreported` | 作業系統亂數來源或系統時鐘失敗，或是缺陷（請回報）。 |
+| `inner_prepare.issue.encode.<rule>`（`resource_mode`、`interval`、`duplicate_grant`、`other`） | 這次執行的能力憑證無法編碼：`interval`——這一輪的授權在能力憑證核發前已過期（或系統時鐘跳動）；其他則是缺陷（請回報）。 |
+| `inner_prepare.issue.random`、`.signer`、`.state_lock`、`.capacity`、`.duplicate`、`inner_prepare.employee_mismatch`、`.prepared_missing`、`.state_lock`、`.pending_duplicate`、`.argv`、`.clock`、`.registry.unreported` | 作業系統亂數來源或系統時鐘失敗，或是缺陷（請回報）。 |
 | `inner_prepare.verify_blocking` | 同上方 `verify_blocking`，發生在工具邊界的阻塞檢查。 |
 
 執行開始後，工具邊界會啟用它的 MCP 端點。若在這裡被拒，會記一筆 `isolated launch activation refused`（只有一個固定的 `step`：`inner_activate.<substep>`），接著是 `isolated spawn refused locally step="launch_activate"`；這一輪的 site 為 `launch.activate.<step>`。已開始的執行會被取消，能力憑證也會撤銷。

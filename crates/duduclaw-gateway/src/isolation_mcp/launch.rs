@@ -244,7 +244,7 @@ mod tests {
             assert!(super::super::refusal::SITES.contains(&site), "{site}");
             assert!(seen.insert(site), "duplicate site {site}");
         }
-        assert_eq!(seen.len(), 58 + 83);
+        assert_eq!(seen.len(), 61 + 83);
         // Every listed `launch.bind.inner_prepare.*` / `launch.activate.*`
         // site is reachable from exactly one step (no orphan literal).
         let listed = super::super::refusal::SITES.iter()

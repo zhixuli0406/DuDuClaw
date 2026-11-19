@@ -8,7 +8,7 @@
 //! string-to-site function: each arm names its listed label.
 use duduclaw_isolation::execution::BackendError;
 use duduclaw_mcp_boundary::launch_steps::{AcceptanceCheck as A, ActivateStep, BoundaryActivateStep as BA, BridgeStep,
-    IssueStep as I, PrepareStep, PublishStep, ReceiptCheck as RC, RegistrationStep as R};
+    EncodeCheck as E, IssueStep as I, PrepareStep, PublishStep, ReceiptCheck as RC, RegistrationStep as R};
 use super::super::refusal::{site, RefusalSite};
 
 pub(super) fn prepare(step: PrepareStep) -> RefusalSite {
@@ -70,7 +70,12 @@ pub(super) fn prepare(step: PrepareStep) -> RefusalSite {
             I::AgentSlug => site!("launch.bind.inner_prepare.issue.agent_slug"),
             I::BindingPrincipal => site!("launch.bind.inner_prepare.issue.binding_principal"),
             I::Grants => site!("launch.bind.inner_prepare.issue.grants"),
-            I::Encode => site!("launch.bind.inner_prepare.issue.encode"),
+            I::Encode(check) => match check {
+                E::ResourceMode => site!("launch.bind.inner_prepare.issue.encode.resource_mode"),
+                E::Interval => site!("launch.bind.inner_prepare.issue.encode.interval"),
+                E::DuplicateGrant => site!("launch.bind.inner_prepare.issue.encode.duplicate_grant"),
+                E::Other => site!("launch.bind.inner_prepare.issue.encode.other"),
+            },
             I::Random => site!("launch.bind.inner_prepare.issue.random"),
             I::Signer => site!("launch.bind.inner_prepare.issue.signer"),
             I::StateLock => site!("launch.bind.inner_prepare.issue.state_lock"),

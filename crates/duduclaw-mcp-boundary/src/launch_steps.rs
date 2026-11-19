@@ -221,6 +221,40 @@ impl BridgeStep {
     }
 }
 
+/// R8z-4: the rule of `CapabilityRecord::canonical_bytes` that refused (in its
+/// order). Derived from the record's own public checks, never from the
+/// message text of the `ContractError`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EncodeCheck {
+    /// `CapabilityRecord::validate_resource_mode`.
+    ResourceMode,
+    /// `CapabilityRecord::validate_interval` (`issued_at <= not_before < expires_at`).
+    Interval,
+    /// `CapabilityRecord::validate_distinct_grants` (a repeated tool or resource).
+    DuplicateGrant,
+    /// The encoding refused, but none of the checks above does.
+    Other,
+}
+impl EncodeCheck {
+    pub const ALL: [Self; 4] = [Self::ResourceMode, Self::Interval, Self::DuplicateGrant, Self::Other];
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ResourceMode => "resource_mode",
+            Self::Interval => "interval",
+            Self::DuplicateGrant => "duplicate_grant",
+            Self::Other => "other",
+        }
+    }
+    /// Which rule refused a record whose `canonical_bytes` returned `Err`
+    /// (the same checks in the same order as `canonical_bytes`).
+    pub fn of(record: &duduclaw_isolation::capability::CapabilityRecord) -> Self {
+        if record.validate_resource_mode().is_err() { Self::ResourceMode }
+        else if record.validate_interval().is_err() { Self::Interval }
+        else if record.validate_distinct_grants().is_err() { Self::DuplicateGrant }
+        else { Self::Other }
+    }
+}
+
 /// A check of `Boundary::issue` (in its order).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IssueStep {
@@ -246,8 +280,8 @@ pub enum IssueStep {
     BindingPrincipal,
     /// The grant's resource set is refused (`resources::validate_grants`).
     Grants,
-    /// The capability record does not encode.
-    Encode,
+    /// The capability record does not encode (this rule refused).
+    Encode(EncodeCheck),
     /// The OS random source failed.
     Random,
     /// The signing key is unusable.
@@ -260,11 +294,19 @@ pub enum IssueStep {
     Duplicate,
 }
 impl IssueStep {
-    pub const ALL: [Self; 17] = [Self::LiveSnapshot, Self::NotReserved, Self::Reservation, Self::Expiry, Self::Time,
+    /// Every step, in declaration order with each encode rule expanded.
+    pub const ALL: [Self; 20] = [Self::LiveSnapshot, Self::NotReserved, Self::Reservation, Self::Expiry, Self::Time,
         Self::Principal, Self::Binding, Self::PolicyRevision, Self::AgentSlug, Self::BindingPrincipal, Self::Grants,
-        Self::Encode, Self::Random, Self::Signer, Self::StateLock, Self::Capacity, Self::Duplicate];
-    pub const fn as_str(self) -> &'static str {
+        Self::Encode(EncodeCheck::ResourceMode), Self::Encode(EncodeCheck::Interval),
+        Self::Encode(EncodeCheck::DuplicateGrant), Self::Encode(EncodeCheck::Other),
+        Self::Random, Self::Signer, Self::StateLock, Self::Capacity, Self::Duplicate];
+    pub fn segments(self, out: &mut Vec<&'static str>) {
+        if let Self::Encode(check) = self { out.push("encode"); out.push(check.as_str()); return; }
+        out.push(self.plain_str());
+    }
+    const fn plain_str(self) -> &'static str {
         match self {
+            Self::Encode(_) => "encode",
             Self::LiveSnapshot => "live_snapshot",
             Self::NotReserved => "not_reserved",
             Self::Reservation => "reservation",
@@ -276,7 +318,6 @@ impl IssueStep {
             Self::AgentSlug => "agent_slug",
             Self::BindingPrincipal => "binding_principal",
             Self::Grants => "grants",
-            Self::Encode => "encode",
             Self::Random => "random",
             Self::Signer => "signer",
             Self::StateLock => "state_lock",
@@ -393,7 +434,7 @@ impl PrepareStep {
             Self::Projection => out.push("projection"),
             Self::Argv => out.push("argv"),
             Self::Clock => out.push("clock"),
-            Self::Issue(step) => { out.push("issue"); out.push(step.as_str()); }
+            Self::Issue(step) => { out.push("issue"); step.segments(out); }
             Self::VerifyBlocking => out.push("verify_blocking"),
             Self::PendingDuplicate => out.push("pending_duplicate"),
             Self::RevokedAfter => out.push("revoked_after"),
@@ -488,11 +529,16 @@ mod tests {
         assert!(prepare.contains(&"registry.acceptance.projection_digest".to_owned()));
         assert!(prepare.contains(&"reservation.denied".to_owned()));
         assert!(prepare.contains(&"issue.binding_principal".to_owned()));
+        for label in ["issue.encode.resource_mode", "issue.encode.interval", "issue.encode.duplicate_grant",
+            "issue.encode.other"] {
+            assert!(prepare.contains(&label.to_owned()), "{label}");
+        }
+        assert!(!prepare.contains(&"issue.encode".to_owned()));
         assert!(activate.contains(&"bridge.publish.receipt.mount".to_owned()));
         assert!(activate.contains(&"bridge.registry.acceptance_missing".to_owned()));
         assert!(activate.contains(&"boundary_activate.live_mismatch".to_owned()));
         // Expanded sizes (a new variant must be listed in `every`).
-        assert_eq!(prepare.len(), 1 + 7 + 6 + 20 + 4 + 17 + 3);
+        assert_eq!(prepare.len(), 1 + 7 + 6 + 20 + 4 + 20 + 3);
         assert_eq!(activate.len(), 1 + 7 + 3 + (1 + 20 + 2 + 33 + 1) + 3 + 9 + 3);
     }
 }
