@@ -13,11 +13,13 @@ use duduclaw_isolation::ids::RunId;
 struct Counting {
     state: Mutex<RunStatus>,
     calls: AtomicUsize,
+    checked_at: Mutex<Vec<std::time::Instant>>,
     slow: AtomicBool,
     entered: AtomicBool,
 }
 impl LiveAuthority for Counting {
     fn snapshot(&self, employee: EmployeeId, run: RunHandle) -> Result<LiveSnapshot, VerificationError> {
+        self.checked_at.lock().unwrap().push(std::time::Instant::now());
         self.calls.fetch_add(1, Ordering::SeqCst);
         let status = self.state.lock().unwrap().clone();
         if self.slow.load(Ordering::Acquire) {
@@ -38,7 +40,8 @@ fn activated() -> (Arc<Boundary>, CapabilityId, Connection, Arc<Counting>, u64) 
     let res = Reservation { run: RunHandle(RunId([1; 16])), employee: EmployeeId([2; 16]),
         control: ControlConnectionId([3; 16]), expires_at_unix_ms: (now + 30) * 1000 };
     let live = Arc::new(Counting { state: Mutex::new(RunStatus::Reserved { expires_at_unix_ms: res.expires_at_unix_ms }),
-        calls: AtomicUsize::new(0), slow: AtomicBool::new(false), entered: AtomicBool::new(false) });
+        calls: AtomicUsize::new(0), checked_at: Mutex::new(Vec::new()),
+        slow: AtomicBool::new(false), entered: AtomicBool::new(false) });
     let boundary = Boundary::new(live.clone()).unwrap();
     let id = boundary.issue(&res, GrantPolicy { task: None, principal: principal(), binding: binding(),
         lane: Lane::Standard, tools: List::new(vec![]).unwrap(), resources: List::new(vec![]).unwrap(),
@@ -46,6 +49,7 @@ fn activated() -> (Arc<Boundary>, CapabilityId, Connection, Arc<Counting>, u64) 
     *live.state.lock().unwrap() = RunStatus::Running;
     let connection = boundary.activate_inner(id, &res, now).unwrap();
     live.calls.store(0, Ordering::SeqCst);
+    live.checked_at.lock().unwrap().clear();
     (boundary, id, connection, live, now)
 }
 
@@ -215,6 +219,10 @@ mod served {
     /// back) and still closes it on a live change within about one period.
     #[tokio::test]
     async fn r8z7_the_watch_still_closes_an_idle_session_within_its_period() {
+        // Allow timer resolution and scheduler/blocking-pool jitter on real clocks.
+        const EARLY_JITTER: Duration = Duration::from_millis(20);
+        const LATE_JITTER: Duration = Duration::from_millis(80);
+        const CLOSE_JITTER: Duration = Duration::from_millis(150);
         let (_boundary, connection, _client, live) = served(WATCH_PERIOD);
         let dispatcher = Counted::new(true);
         let serving = tokio::spawn(async move { crate::server::serve_checked(connection, dispatcher.as_ref()).await });
@@ -224,10 +232,23 @@ mod served {
         tokio::time::sleep(Duration::from_millis(550)).await;
         let watched = live.calls.load(Ordering::SeqCst) - idle;
         assert!((2..=7).contains(&watched), "about one watch read per 100 ms, got {watched}");
+        {
+            let checked_at = live.checked_at.lock().unwrap();
+            // The first read is admission; all subsequent reads are idle watches.
+            let watches = &checked_at[1..];
+            assert!(watches.len() >= 4, "need at least three watch intervals, got {} reads", watches.len());
+            for pair in watches.windows(2) {
+                let interval = pair[1].duration_since(pair[0]);
+                assert!(interval >= WATCH_PERIOD - EARLY_JITTER && interval <= WATCH_PERIOD + LATE_JITTER,
+                    "idle watch interval {interval:?} outside {:?}..={:?}",
+                    WATCH_PERIOD - EARLY_JITTER, WATCH_PERIOD + LATE_JITTER);
+            }
+        }
         let changed = std::time::Instant::now();
         *live.state.lock().unwrap() = RunStatus::Ended(duduclaw_isolation::execution::RunOutcome::Cancelled);
         let outcome = tokio::time::timeout(Duration::from_secs(2), serving).await.unwrap().unwrap();
         assert_eq!(outcome, Err((S::Context(C::LiveMismatch), VerificationError::Revoked)));
+        assert!(changed.elapsed() <= WATCH_PERIOD + CLOSE_JITTER, "closed after {:?}", changed.elapsed());
         assert!(changed.elapsed() < Duration::from_millis(500), "closed after {:?}", changed.elapsed());
     }
 
