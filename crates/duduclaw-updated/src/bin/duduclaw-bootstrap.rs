@@ -22,8 +22,24 @@ fn quiet_panics() {
 #[cfg(target_os = "linux")]
 fn refuse(refusal: duduclaw_updated::linux::bootstrap_verify::Refusal) -> ! {
     eprintln!("bootstrap_refused: step {} {:?}", refusal.step.number(), refusal.error.code());
-    eprintln!("{}", refusal.step.hint());
+    eprintln!("{}", refusal.hint());
     std::process::exit(1);
+}
+
+/// Parse argv and refuse a state-changing command inside an AI session: one
+/// fixed line (never the marker or its value), exit 1. Runs before anything
+/// else (hardening, verification, high-water write, staging, locks), because
+/// the verified gateway is exec'd with a cleared environment and so its own
+/// operator gate never sees the markers. A guard against mistakes, not a
+/// privilege boundary: a process can unset its environment.
+fn parse_or_refuse_ai_session() -> (Command, bootstrap_cli::Forwarded) {
+    match bootstrap_cli::parse_guarded(std::env::args_os().skip(1), bootstrap_cli::process_env_presence) {
+        Ok(parsed) => parsed,
+        Err(refused) => {
+            eprintln!("{}", refused.line());
+            std::process::exit(1);
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -32,10 +48,10 @@ fn main() {
     quiet_panics();
     // Only `install` carries options: three typed values, re-rendered from their
     // parsed types and forwarded to `service bootstrap-continue` (never a path).
-    let (command, forwarded) = bootstrap_cli::parse_invocation(std::env::args_os().skip(1));
+    let (command, forwarded) = parse_or_refuse_ai_session();
     if command.changes_state() {
         // A state-changing command was selected: harden before any other work.
-        if let Err(error) = platform::harden() { refuse(Refusal { step: Step::Harden, error }); }
+        if let Err(error) = platform::harden() { refuse(Refusal::at(Step::Harden, error)); }
     }
     let mode = match command {
         Command::PrintRootPin => match bootstrap_verify::pinned_root() {
@@ -69,7 +85,7 @@ fn main() {
 #[cfg(not(target_os = "linux"))]
 fn main() {
     quiet_panics();
-    if bootstrap_cli::parse(std::env::args_os().skip(1)) == Command::Version {
+    if parse_or_refuse_ai_session().0 == Command::Version {
         println!("{}", bootstrap_cli::version_line());
         return;
     }

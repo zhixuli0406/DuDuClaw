@@ -2,6 +2,7 @@
 //! No OS operations, cryptography, persistent state or authorization live here.
 #![forbid(unsafe_code)]
 
+pub mod ai_session;
 pub mod bounded;
 pub mod capability;
 pub mod egress;

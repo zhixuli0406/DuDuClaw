@@ -87,7 +87,7 @@ sudo ./duduclaw service install --protected-linux --enable-now
 sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux [--version X.Y.Z]
 ```
 
-未指定 `--version` 時使用最新版本。指令會先檢查設定的 AI CLI（見下方），再下載官方發行版、驗證檢查碼、簽章與內嵌版本，以原子方式替換程式；服務單元與啟動器內容不同時一併更新，重新確認自動復原設定，記錄新的版本下限，並重新啟動執行中的 gateway。目標版本必須比執行指令的程式新，而且執行指令的程式不能比已記錄的版本下限舊（否則會寫入較舊的服務單元與啟動器），請使用已安裝的 `/opt/duduclaw/bin/duduclaw`。若要改用已驗證過的較新程式，請改執行該程式的 `sudo ./duduclaw service install --protected-linux`；只有在版本下限仍存在時，重新安裝才會保留資料與根金鑰。`service uninstall --protected-linux` 會移除版本下限，但保留資料、根金鑰與帳號，因此之後的安裝會被視為版本下限不明的主機而拒絕。
+未指定 `--version` 時使用最新版本。指令會先檢查設定的 AI CLI（見下方），再下載官方發行版、驗證檢查碼、簽章與內嵌版本，以原子方式替換程式；服務單元與啟動器內容不同時一併更新，重新確認自動復原設定，記錄新的版本下限，並重新啟動執行中的 gateway。目標版本必須比執行指令的程式新，而且執行指令的程式不能比已記錄的版本下限舊（否則會寫入較舊的服務單元與啟動器），請使用已安裝的 `/opt/duduclaw/bin/duduclaw`。若要改用已驗證過的較新程式，請改執行該程式的 `sudo ./duduclaw service install --protected-linux`；只有在版本下限仍存在時，重新安裝才會保留資料與根金鑰。在單一執行檔主機上，`service uninstall --protected-linux` 會移除版本下限，但保留資料、根金鑰與帳號，因此之後的安裝會被視為版本下限不明的主機而拒絕（隔離安裝會保留版本下限，見「升級與解除安裝」）。
 
 **儀表板。** 沒有獨立更新服務時，儀表板無法更新受保護安裝。畫面會說明這點並顯示上面的指令，不會送出任何要求。
 
@@ -344,7 +344,7 @@ sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux --version X.Y.
 
 只有版本與要求 ID 會跨入更新邊界。更新服務驗證簽章中繼資料、雜湊、平台、到期日、版本下限與序號，切換完整世代後讀回實際執行版本及協定，才提交結果。服務重啟後仍以同一要求追蹤，只有 `committed` 才算成功。服務、信任或就緒資料缺失會拒絕更新，不會呼叫舊安裝器。一般更新不能降版，緊急回退需要另外的簽章授權。
 
-移除入口為 `sudo duduclaw service uninstall --protected-linux`。隔離安裝會先把 unit 備份到 `/var/lib/duduclaw-protected/uninstall-units`，建立持久的 `/etc` mask，停止 timer、socket 與服務後再讀回 mask；只有確認服務停止、已知 cgroup 為空、沒有服務／員工程序、已知儲存根目錄下沒有掛載後，才移除固定路徑的執行檔。不執行強制或 lazy unmount。金鑰、資料、系統帳號、永久 UID 對照、更新狀態／世代及版本下限均保留，mask 也保留以阻止自動重啟。H 的任意自訂儲存根目錄介面仍未接上，不能視為自訂儲存配置的完整移除驗收。本輪未做 root 實機移除；不要用舊 uninstaller 或刪除保留狀態來繞過拒絕。
+移除入口為 `sudo duduclaw service uninstall --protected-linux`。隔離安裝會先把 unit 備份到 `/var/lib/duduclaw-protected/uninstall-units`，建立持久的 `/etc` mask，停止 timer、socket 與服務後再讀回 mask；只有確認服務停止、已知 cgroup 為空、沒有服務／員工程序、已知儲存根目錄下沒有掛載後，才移除固定路徑的執行檔。不執行強制或 lazy unmount。金鑰、資料、系統帳號、永久 UID 對照、更新狀態／世代及版本下限均保留，mask 也保留以阻止自動重啟。H 的任意自訂儲存根目錄介面仍未接上，不能視為自訂儲存配置的完整移除驗收。移除已在真實的 Ubuntu 24.04 主機上、於員工執行過工作後驗證；不要用舊 uninstaller 或刪除保留狀態來繞過拒絕。執行 `service uninstall --protected-linux` 後，`duduclaw-bootstrap install` 會拒絕在這台主機上再次安裝，而這個版本沒有可以重新啟用產品或清除保留狀態的指令；請聯絡供應商。
 
 員工的執行也由移除一併處理：員工執行單元（`duduclaw-run-<id>.service`）與每位員工的 slice（`duduclaw-employees-<id>.slice`，員工第一次執行時建立）在服務之後、`duduclaw-employees.slice`、`duduclaw-tcb.slice`、`duduclaw.slice` 之前停止。它們是暫時單元，不會被 mask；已 mask 的上層 slice 與已 mask 並停止的 spawnd 讓它們無法再啟動。檢查之前會先要求每個單元停止，所以被拒絕時服務是停止且 mask 的狀態，不會留下「已 mask 但仍在執行」。拒絕訊息會寫出第一個擋下檢查的單元：60 秒後仍在執行的單元（請執行 `sudo systemctl stop <單元>` 後再執行同一個移除命令）、mask 未生效的單元，或名稱不符合本產品格式的 `duduclaw` 單元（不會停止或 mask 它；請先確認來源）。重複執行移除是安全的：已 mask 或已停止的單元都會被接受。若舊版本留下「已 mask 但仍在執行」的主機（拒絕訊息「無法證明服務啟動已封鎖；未移除執行檔。」）：用這個版本再執行一次移除即可，它會自行停止全部單元，並移除舊版本在員工 slice 名稱上留下的 mask。若只能用舊版本，先停止每個仍在執行的員工 slice（`systemctl list-units --all 'duduclaw-employees-*'`，再 `sudo systemctl stop <slice>`），再執行它的移除。
 

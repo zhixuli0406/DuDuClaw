@@ -129,8 +129,44 @@ impl Step {
     }
 }
 
+/// Step-2 hint for a host whose bootstrap journal is committed: a completed
+/// installation, or the state an uninstall retained. Rollback can never apply
+/// there, and this version has no command to re-enable or clear that state.
+pub const COMPLETED_INSTALLATION_HINT: &str = "這台主機已有完成的隔離安裝，或已解除安裝但保留的狀態；install 不會重新執行已完成的安裝。若產品目前已安裝，請使用已安裝的 duduclaw 管理它；若已解除安裝，這個版本還沒有可以恢復或清除保留狀態的指令，請聯絡供應商。";
+
+/// Which step-2 rule refused ([`precondition_rule`]). It selects only the step-2
+/// hint; the error code is always `MaintenanceRequired` ([`Self::error`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreconditionRefusal {
+    /// The journal records a committed run (installed, or uninstalled with retained state).
+    CompletedInstallation,
+    /// An uncommitted journal of another mode, isolation facts without a journal,
+    /// or rollback without a journal.
+    NotResumable,
+}
+impl PreconditionRefusal {
+    /// The error every step-2 refusal reports (unchanged by the sub-case).
+    pub fn error(self) -> Error { Error::Maintenance }
+}
+
 #[derive(Debug)]
-pub struct Refusal { pub step: Step, pub error: Error }
+pub struct Refusal {
+    pub step: Step,
+    pub error: Error,
+    /// Set only for a step-2 refusal decided by [`precondition_rule`]; hint selection only.
+    pub precondition: Option<PreconditionRefusal>,
+}
+impl Refusal {
+    pub fn at(step: Step, error: Error) -> Self { Self { step, error, precondition: None } }
+    /// Fixed zh-TW guidance: the step's hint, except for a step-2 refusal on a host
+    /// with a completed installation (see [`COMPLETED_INSTALLATION_HINT`]).
+    pub fn hint(&self) -> &'static str {
+        match (self.step, self.precondition) {
+            (Step::Preconditions, Some(PreconditionRefusal::CompletedInstallation)) => COMPLETED_INSTALLATION_HINT,
+            (step, _) => step.hint(),
+        }
+    }
+}
 
 #[cfg(duduclaw_test_root)]
 const BUILD_PIN_KIND: PinKind = PinKind::Test;
@@ -289,15 +325,17 @@ pub fn run(mode: BootstrapMode) -> std::result::Result<std::convert::Infallible,
 /// Any other tail, or a tail on another mode, refuses before anything is read.
 pub fn run_with(mode: BootstrapMode, forwarded: &[String]) -> std::result::Result<std::convert::Infallible, Refusal> {
     if !forwarded_tail_allowed(mode, forwarded) {
-        return Err(Refusal { step: Step::Harden, error: Error::Invalid });
+        return Err(Refusal::at(Step::Harden, Error::Invalid));
     }
-    let config = harden_and_configure().map_err(|error| Refusal { step: Step::Harden, error })?;
+    let config = harden_and_configure().map_err(|error| Refusal::at(Step::Harden, error))?;
     let mut step = Step::Harden;
-    let staged = verify_and_stage_with(&config, mode, &mut step).map_err(move |error| Refusal { step, error })?;
-    announce(&config.context, &staged).map_err(|error| Refusal { step: Step::Announce, error })?;
+    let mut precondition = None;
+    let staged = verify_and_stage_reporting(&config, mode, &mut step, &mut precondition)
+        .map_err(move |error| Refusal { step, error, precondition })?;
+    announce(&config.context, &staged).map_err(|error| Refusal::at(Step::Announce, error))?;
     let error = match exec_gateway(&config.paths, &staged, mode, forwarded) {
         Ok(never) => match never {}, Err(error) => error };
-    Err(Refusal { step: Step::Exec, error })
+    Err(Refusal::at(Step::Exec, error))
 }
 
 /// The tail must be exactly what `bootstrap_cli::parse_invocation` +
@@ -330,8 +368,15 @@ fn harden_and_configure() -> Result<Config> {
 }
 
 pub(crate) fn verify_and_stage_with(config: &Config, mode: BootstrapMode, step: &mut Step) -> Result<Staged> {
+    verify_and_stage_reporting(config, mode, step, &mut None)
+}
+
+/// [`verify_and_stage_with`] that also reports which step-2 rule refused (set
+/// only when [`precondition_rule`] refuses; used for the hint, never the code).
+fn verify_and_stage_reporting(config: &Config, mode: BootstrapMode, step: &mut Step,
+    precondition: &mut Option<PreconditionRefusal>) -> Result<Staged> {
     *step = Step::Preconditions;
-    let resume = preconditions(&config.paths, mode)?;
+    let resume = preconditions(&config.paths, mode, precondition)?;
     *step = Step::OpenInbox;
     let Inbox { tar, tar_size, side } = open_inbox(&config.paths, &config.context)?;
     *step = Step::Seal;
@@ -403,9 +448,15 @@ fn read_journal(protected: &Path) -> Result<Option<Journal>> {
 
 /// No fact may exist unless R3's journal records an uncommitted run (of the same
 /// mode, except for rollback); its generation must equal the one verified later.
-fn preconditions(paths: &Paths, mode: BootstrapMode) -> Result<Option<Sha256Digest>> {
+/// A refusal reports `Error::Maintenance` (MaintenanceRequired) whatever the
+/// sub-case; the sub-case is written to `refused` for the hint only.
+fn preconditions(paths: &Paths, mode: BootstrapMode, refused: &mut Option<PreconditionRefusal>)
+    -> Result<Option<Sha256Digest>> {
     let facts = !facts_present(&paths.facts_root).is_empty();
-    precondition_rule(read_journal(&paths.protected)?.as_ref(), facts, mode)
+    precondition_rule(read_journal(&paths.protected)?.as_ref(), facts, mode).map_err(|case| {
+        *refused = Some(case);
+        case.error()
+    })
 }
 
 /// Pure step-2 rule. Rollback is authority only to undo the in-progress run: it
@@ -413,13 +464,15 @@ fn preconditions(paths: &Paths, mode: BootstrapMode) -> Result<Option<Sha256Dige
 /// (checked after step 8), and it never stages anything new (see `stage`). No
 /// emergency authorization exists for the bootstrap path (plan §4.1/§4.3), so an
 /// ordinary migration authorization can never move a host to another generation.
-pub(crate) fn precondition_rule(journal: Option<&Journal>, facts: bool, mode: BootstrapMode) -> Result<Option<Sha256Digest>> {
+/// A refusal names its sub-case; every sub-case is `Error::Maintenance` to the caller.
+pub(crate) fn precondition_rule(journal: Option<&Journal>, facts: bool, mode: BootstrapMode)
+    -> std::result::Result<Option<Sha256Digest>, PreconditionRefusal> {
     match journal {
-        Some(journal) if journal.committed => Err(Error::Maintenance),
-        Some(journal) if mode != BootstrapMode::Rollback && journal.mode != mode => Err(Error::Maintenance),
+        Some(journal) if journal.committed => Err(PreconditionRefusal::CompletedInstallation),
+        Some(journal) if mode != BootstrapMode::Rollback && journal.mode != mode => Err(PreconditionRefusal::NotResumable),
         Some(journal) => Ok(Some(journal.generation)),
-        None if mode == BootstrapMode::Rollback => Err(Error::Maintenance),
-        None if facts => Err(Error::Maintenance),
+        None if mode == BootstrapMode::Rollback => Err(PreconditionRefusal::NotResumable),
+        None if facts => Err(PreconditionRefusal::NotResumable),
         None => Ok(None),
     }
 }
@@ -1769,6 +1822,75 @@ pub(crate) mod tests {
         assert_eq!(precondition_rule(Some(&journal(Upgrade, false)), true, Upgrade).unwrap(), Some(generation));
     }
 
+    /// The hint names the committed-journal case; every other step-2 refusal keeps the
+    /// rollback hint. The refusal set and the MaintenanceRequired code are unchanged.
+    #[test]
+    fn committed_journal_refusal_gets_the_completed_installation_hint() {
+        use BootstrapMode::{Install, Rollback, Upgrade};
+        let generation = Sha256Digest([3; 32]);
+        let journal = |mode, committed| Journal { mode, generation, committed };
+        let printed = |case: PreconditionRefusal| Refusal { step: Step::Preconditions, error: case.error(),
+            precondition: Some(case) }.hint();
+        let old = Step::Preconditions.hint();
+        assert_ne!(COMPLETED_INSTALLATION_HINT, old);
+        // The committed journal (installed, or uninstalled with retained state): the new
+        // hint, for every mode and fact state; it never suggests rollback.
+        for journal_mode in [Install, Upgrade] {
+            for mode in [Install, Upgrade, Rollback] {
+                for facts in [false, true] {
+                    let case = precondition_rule(Some(&journal(journal_mode, true)), facts, mode).unwrap_err();
+                    assert_eq!(case, PreconditionRefusal::CompletedInstallation);
+                    assert_eq!(printed(case), COMPLETED_INSTALLATION_HINT);
+                }
+            }
+        }
+        assert!(!COMPLETED_INSTALLATION_HINT.contains("rollback"));
+        // Every other step-2 refusal keeps the existing hint.
+        let others = [
+            precondition_rule(Some(&journal(Install, false)), false, Upgrade),
+            precondition_rule(Some(&journal(Install, false)), true, Upgrade),
+            precondition_rule(Some(&journal(Upgrade, false)), false, Install),
+            precondition_rule(Some(&journal(Upgrade, false)), true, Install),
+            precondition_rule(None, true, Install),
+            precondition_rule(None, true, Upgrade),
+            precondition_rule(None, false, Rollback),
+            precondition_rule(None, true, Rollback),
+        ];
+        for refused in others {
+            let case = refused.unwrap_err();
+            assert_eq!(case, PreconditionRefusal::NotResumable);
+            assert_eq!(printed(case), old);
+        }
+        // A step-2 refusal without a sub-case (malformed journal, generation bound after
+        // step 8) and every other step keep their own hints.
+        assert_eq!(Refusal::at(Step::Preconditions, Error::Maintenance).hint(), old);
+        for step in [Step::Harden, Step::OpenInbox, Step::Manifest, Step::Exec] {
+            assert_eq!(Refusal { step, error: Error::Maintenance,
+                precondition: Some(PreconditionRefusal::CompletedInstallation) }.hint(), step.hint());
+        }
+        // The code stays MaintenanceRequired for both sub-cases.
+        for case in [PreconditionRefusal::CompletedInstallation, PreconditionRefusal::NotResumable] {
+            assert_eq!(case.error().code(), Error::Maintenance.code());
+        }
+        // The refusal set is unchanged: exactly a committed journal, another mode's
+        // uncommitted journal (except rollback), and no journal with facts or for rollback.
+        for committed_journal in [None, Some(Install), Some(Upgrade)] {
+            for committed in [false, true] {
+                for facts in [false, true] {
+                    for mode in [Install, Upgrade, Rollback] {
+                        let entry = committed_journal.map(|journal_mode| journal(journal_mode, committed));
+                        let expected_refused = match &entry {
+                            Some(entry) => entry.committed || (mode != Rollback && entry.mode != mode),
+                            None => mode == Rollback || facts,
+                        };
+                        assert_eq!(precondition_rule(entry.as_ref(), facts, mode).is_err(), expected_refused,
+                            "{committed_journal:?} {committed} {facts} {mode:?}");
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn acceptance_waits_for_the_version_lock_and_rechecks_a_floor_raised_meanwhile() {
         use std::os::unix::fs::OpenOptionsExt;
@@ -2045,6 +2167,10 @@ pub(crate) mod tests {
         write_journal(&later, "install", &generation, true);
         assert!(verify_and_stage_with(&later, BootstrapMode::Install, &mut step).is_err());
         assert_eq!(step, Step::Preconditions);
+        // The committed journal is reported as a completed installation (hint only).
+        let mut precondition = None;
+        assert!(verify_and_stage_reporting(&later, BootstrapMode::Install, &mut step, &mut precondition).is_err());
+        assert_eq!((step, precondition), (Step::Preconditions, Some(PreconditionRefusal::CompletedInstallation)));
         std::fs::write(later.paths.protected.join(BOOTSTRAP_JOURNAL), b"{not json").unwrap();
         assert!(verify_and_stage_with(&later, BootstrapMode::Rollback, &mut step).is_err());
         assert_eq!(step, Step::Preconditions);
