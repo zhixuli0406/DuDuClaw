@@ -28,21 +28,38 @@ use super::{AgentRuntime, RuntimeContext, RuntimeResponse};
 pub struct OpenAiCompatRuntime;
 
 impl OpenAiCompatRuntime {
+    /// R8x: the single logging point of a protected API turn. A failed turn
+    /// logs exactly one line: the R8t `isolated run refused` (written while
+    /// collecting a started run), `isolated run refused after start`, or
+    /// `isolated run not started` with the fixed site that refused.
     #[cfg(target_os = "linux")]
     async fn execute_protected(&self, prompt: &str, context: &RuntimeContext) -> Result<RuntimeResponse, String> {
-        let refusal = || duduclaw_agent::mcp_spawn_gate::spawn_gate_error(
-            "所選隔離執行設定尚未支援這次工作，請由管理員確認服務與資料保護設定。");
+        let runtime = crate::isolation_mcp::refusal::runtime_label(
+            &duduclaw_isolation::execution::RuntimeKind::OpenAiCompat);
+        crate::isolation_mcp::runtime::observed(runtime, &context.agent_id, Self::protected_turn(prompt, context)).await
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn protected_turn(prompt: &str, context: &RuntimeContext) -> Result<RuntimeResponse, String> {
+        use crate::isolation_mcp::runtime::{keep, note_site};
+        // Same sentence as before R8x; the site is recorded for the log line.
+        let refused = |site: &'static str| {
+            note_site(site);
+            duduclaw_agent::mcp_spawn_gate::spawn_gate_error(
+                "所選隔離執行設定尚未支援這次工作，請由管理員確認服務與資料保護設定。")
+        };
         // R8r-1: these refusals need no authority and run before it is taken
         // or issued, so they never consume a one-time background record.
-        validate_model(&context.model)?;
-        crate::product_policy::require_runtime(&context.home_dir, "openai_compat")?;
-        crate::product_policy::require_model(crate::product_policy::load(&context.home_dir)?, &context.model)?;
+        validate_model(&context.model).map_err(keep("preflight.model"))?;
+        crate::product_policy::require_runtime(&context.home_dir, "openai_compat").map_err(keep("preflight.runtime_policy"))?;
+        crate::product_policy::require_model(crate::product_policy::load(&context.home_dir)
+            .map_err(keep("preflight.model_policy"))?, &context.model).map_err(keep("preflight.model_policy"))?;
         // No silent loss of host interceptors or disclosure leases. These modes
         // need a separate typed worker adapter before protected API execution.
         if crate::ccr_runtime::for_agent(&context.home_dir, &context.agent_id).is_some()
             || crate::redaction_proxy::try_build_interceptor(&context.home_dir, &context.agent_id,
-                &crate::redaction_proxy::current_session_id()).map_err(|_| refusal())?.is_some() {
-            return Err(refusal());
+                &crate::redaction_proxy::current_session_id()).map_err(|_| refused("preflight.redaction"))?.is_some() {
+            return Err(refused("preflight.interceptor"));
         }
         // The principal context stays registered until the worker run returns.
         let (authorization, _principal_context) = crate::isolation_mcp::runtime::authorize_api(context).await?;

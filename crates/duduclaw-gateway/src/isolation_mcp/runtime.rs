@@ -53,9 +53,95 @@ pub async fn with_runtime_authorization<F: Future>(authorization: RuntimeAuthori
     AUTHORIZATION.scope(Mutex::new(Some(authorization)), future).await
 }
 
-fn refusal() -> String {
-    // The fixed default sentence (`refusal::DEFAULT_MESSAGE`), spawn-gate prefixed.
+/// R8x: what one protected turn did, read by its single logging point
+/// ([`observed`]). `site` is the first fixed label recorded (the innermost
+/// refusal; an outer mapping of the same failure never overwrites it).
+#[derive(Clone, Copy, Default)]
+struct Trace { site: Option<&'static str>, started: bool, logged: bool }
+tokio::task_local! { static TRACE: std::cell::Cell<Trace>; }
+
+fn record(update: impl FnOnce(&mut Trace)) {
+    let _ = TRACE.try_with(|cell| {
+        let mut trace = cell.get();
+        update(&mut trace);
+        cell.set(trace);
+    });
+}
+
+/// R8x: record a fixed site label (one of `refusal::SITES`) for the current
+/// protected turn. Outside an observed turn this is a no-op.
+pub(crate) fn note_site(site: &'static str) {
+    record(|trace| if trace.site.is_none() { trace.site = Some(site); });
+}
+
+/// The only builder of this module's refusal: the fixed default sentence
+/// (`refusal::DEFAULT_MESSAGE`), spawn-gate prefixed, exactly as before R8x,
+/// plus the site that refused. There is deliberately no unlabelled variant
+/// (a source-scan test rejects any other refusal builder in this file).
+fn refuse(site: &'static str) -> String {
+    note_site(site);
     super::refusal::user_error(None)
+}
+
+/// R8x: keep another module's own error text unchanged and record `site`.
+pub(crate) fn keep(site: &'static str) -> impl FnOnce(String) -> String {
+    move |error| {
+        note_site(site);
+        error
+    }
+}
+
+/// R8x: the single logging point of a protected turn. Every protected entry
+/// of this module (and the API runtime) runs inside it. A failed turn logs
+/// exactly one line: nothing more when the R8t `isolated run refused` line was
+/// already written; `isolated run refused after start` when the run started
+/// but ended without that line; otherwise `isolated run not started`. All
+/// fields are fixed: runtime label, employee label, site label (a forgotten
+/// label shows as `unlabelled`, never as a missing line). `runtime` is the
+/// fixed `refusal::runtime_label` value.
+pub(crate) async fn observed<T, F>(runtime: &'static str, agent: &str, future: F) -> Result<T, String>
+where F: Future<Output = Result<T, String>> {
+    let (result, trace) = TRACE.scope(std::cell::Cell::new(Trace::default()), async move {
+        let result = future.await;
+        (result, TRACE.with(|cell| cell.get()))
+    }).await;
+    if result.is_err() { log_trace(runtime, agent, trace); }
+    result
+}
+
+fn log_trace(runtime: &'static str, agent: &str, trace: Trace) {
+    if trace.logged { return; }
+    let site = trace.site.unwrap_or(super::refusal::UNLABELLED_SITE);
+    if trace.started { super::refusal::log_refused_after_start(runtime, agent, site); }
+    else { super::refusal::log_not_started(runtime, agent, site); }
+}
+
+/// R8x: the fixed site of a refused start. A spawnd/transport refusal arrives
+/// as an `io::Error` carrying the fixed `BackendError` class (spawnd's wire
+/// error codes are folded into it by `duduclaw-execution`); otherwise only the
+/// error kind is used. Never the error text.
+fn spawn_site(error: &std::io::Error) -> &'static str {
+    use duduclaw_isolation::execution::BackendError;
+    match error.get_ref().and_then(|inner| inner.downcast_ref::<BackendError>()) {
+        Some(BackendError::Unavailable) => "spawn.backend.unavailable",
+        Some(BackendError::Denied) => "spawn.backend.denied",
+        Some(BackendError::WouldDeadlock) => "spawn.backend.would_deadlock",
+        Some(BackendError::NotFound) => "spawn.backend.not_found",
+        Some(BackendError::Timeout) => "spawn.backend.timeout",
+        Some(BackendError::Io) => "spawn.backend.io",
+        Some(BackendError::Protocol) => "spawn.backend.protocol",
+        None => match error.kind() {
+            std::io::ErrorKind::PermissionDenied => "spawn.start.permission_denied",
+            std::io::ErrorKind::NotFound => "spawn.start.not_found",
+            std::io::ErrorKind::TimedOut => "spawn.start.timed_out",
+            _ => "spawn.start.other",
+        },
+    }
+}
+
+/// The employee label used by every protected log line of a turn.
+fn agent_of(agent_dir: &std::path::Path) -> &str {
+    agent_dir.file_name().and_then(|name| name.to_str()).unwrap_or("")
 }
 
 pub(crate) async fn available(runtime: RuntimeKind) -> bool {
@@ -70,7 +156,7 @@ pub(crate) struct PromptWriter {
 }
 impl PromptWriter {
     pub(crate) async fn finish(&mut self) -> Result<(), String> {
-        (&mut self.task).await.map_err(|_| refusal())?
+        (&mut self.task).await.map_err(|_| refuse("run.input"))?
     }
 }
 impl Drop for PromptWriter { fn drop(&mut self) { self.task.abort(); } }
@@ -83,15 +169,15 @@ async fn write_prompt<W: tokio::io::AsyncWrite + Unpin>(mut stdin: W, bytes: &[u
         stdin.shutdown().await
     }).await {
         Ok(Ok(())) => Ok(()),
-        _ => Err(refusal()),
+        _ => Err(refuse("run.input")),
     }
 }
 
 fn take_authorization(agent_dir: &std::path::Path) -> Result<RuntimeAuthorization, String> {
     let authorization = AUTHORIZATION.try_with(|slot| slot.lock().ok().and_then(|mut value| value.take()))
-        .ok().flatten().ok_or_else(refusal)?;
+        .ok().flatten().ok_or_else(|| refuse("authorization.consumed"))?;
     if !authorization.home.is_absolute() || agent_dir != authorization.home.join("agents").join(&authorization.agent) {
-        return Err(refusal());
+        return Err(refuse("authorization.installed_mismatch"));
     }
     Ok(authorization)
 }
@@ -128,13 +214,16 @@ where BF: Future<Output = Result<RuntimeAuthorization, BE>>, IF: Future<Output =
     if AUTHORIZATION.try_with(|_| ()).is_ok() {
         return Ok((take_authorization(agent_dir)?, None));
     }
-    let agent = agent_dir.file_name().and_then(|name| name.to_str()).ok_or_else(refusal)?;
-    let home = agent_dir.parent().and_then(|path| path.parent()).ok_or_else(refusal)?;
-    let guard = crate::on_behalf_of::context::register(home, agent).ok_or_else(refusal)?;
+    let agent = agent_dir.file_name().and_then(|name| name.to_str())
+        .ok_or_else(|| refuse("authorization.agent_label"))?;
+    let home = agent_dir.parent().and_then(|path| path.parent()).ok_or_else(|| refuse("authorization.home"))?;
+    let guard = crate::on_behalf_of::context::register(home, agent)
+        .ok_or_else(|| refuse("authorization.principal_context"))?;
+    // The issuers record their own finer `authorization.*` site first.
     let authorization = if background_scope() {
-        background(Some(guard.reference().into())).await.map_err(|_| refusal())?
+        background(Some(guard.reference().into())).await.map_err(|_| refuse("authorization.background_issue"))?
     } else {
-        ingress(Some(guard.reference().into())).await.map_err(|_| refusal())?
+        ingress(Some(guard.reference().into())).await.map_err(|_| refuse("authorization.ingress_issue"))?
     };
     Ok((authorization, Some(guard)))
 }
@@ -149,25 +238,33 @@ tokio::task_local! { static FAKE_ORIGIN: Arc<tests::FakeOrigin>; }
 /// sentence, uses it to classify a max-turns outcome, and passes it to
 /// [`spawn_claude`], which refuses the run if root would enforce anything else.
 pub(crate) async fn claude_max_turns(agent_dir: &std::path::Path, desired: u64) -> Result<u16, String> {
-    let agent = agent_dir.file_name().and_then(|name| name.to_str()).ok_or_else(refusal)?;
-    let home = agent_dir.parent().and_then(|path| path.parent()).ok_or_else(refusal)?;
+    let agent = agent_dir.file_name().and_then(|name| name.to_str()).ok_or_else(|| refuse("step_limit.agent_dir"))?;
+    let home = agent_dir.parent().and_then(|path| path.parent()).ok_or_else(|| refuse("step_limit.agent_dir"))?;
     match super::boot::claude_max_turns(home.to_path_buf(), agent.to_owned(), desired).await {
         Ok(value) => Ok(value),
         Err(_) => {
             // Agent id and numbers only; no path, policy or entitlement content.
             tracing::warn!(agent, desired, "protected step limit unavailable or outside the root-signed range; run refused");
-            Err(refusal())
+            Err(refuse("step_limit.unavailable"))
         }
     }
 }
 
+/// R8x: observed (one log line when refused before or without the R8t line).
 pub(crate) async fn spawn_claude(agent_dir: &std::path::Path, prompt: &str, system_prompt: &str, model: &str, max_turns: u64)
     -> Result<(crate::process_group::BackendChild, PromptWriter), String> {
-    let max_turns = u16::try_from(max_turns).map_err(|_| refusal())?;
+    observed(super::refusal::runtime_label(&RuntimeKind::Claude), agent_of(agent_dir),
+        spawn_claude_inner(agent_dir, prompt, system_prompt, model, max_turns)).await
+}
+
+async fn spawn_claude_inner(agent_dir: &std::path::Path, prompt: &str, system_prompt: &str, model: &str, max_turns: u64)
+    -> Result<(crate::process_group::BackendChild, PromptWriter), String> {
+    let max_turns = u16::try_from(max_turns).map_err(|_| refuse("authorize.max_turns"))?;
     let (authorization, principal_context) = take_or_issue_current(agent_dir).await?;
     let class = crate::process_group::execution_class(ExecutionClass::EmployeeMain);
     let plan = super::boot::claude_plan(authorization.home.clone(), authorization.agent.clone(), class,
-        prompt.as_bytes().to_vec(), system_prompt.as_bytes().to_vec(), model.into(), max_turns).await.map_err(|_| refusal())?;
+        prompt.as_bytes().to_vec(), system_prompt.as_bytes().to_vec(), model.into(), max_turns).await
+        .map_err(|_| refuse("plan.unavailable"))?;
     spawn_plan(authorization, plan, class, RuntimeKind::Claude, prompt.as_bytes().to_vec(), principal_context).await
 }
 
@@ -175,28 +272,31 @@ async fn spawn_plan(authorization: RuntimeAuthorization, plan: duduclaw_isolatio
     class: ExecutionClass, runtime: RuntimeKind, bytes: Vec<u8>,
     principal_context: Option<crate::on_behalf_of::context::ContextGuard>)
     -> Result<(crate::process_group::BackendChild, PromptWriter), String> {
+    // `prepare_launch` records its own finer `launch.*` site first.
     let launch = super::prepare_launch(super::LaunchInput { agent: authorization.agent, plan,
         grant: authorization.grant, roots: authorization.roots, origin: authorization.origin,
         caller: authorization.caller, turn: authorization.turn, authenticated_epoch: authorization.authenticated_epoch })
-        .await.map_err(|_| refusal())?;
+        .await.map_err(|_| refuse("spawn.prepare"))?;
     // This builder is only an adapter marker. A cannot execute it locally: the
     // protected latch is required and the root publication selects the binary.
-    if !duduclaw_core::execution_gate::isolation_required() { return Err(refusal()); }
+    if !duduclaw_core::execution_gate::isolation_required() { return Err(refuse("spawn.not_protected")); }
     let mut marker = tokio::process::Command::new("root-selected-runtime");
-    let admission = crate::autonomous_runtime::admit_current().await?;
+    let admission = crate::autonomous_runtime::admit_current().await.map_err(keep("spawn.admission"))?;
     let mut child = duduclaw_execution::command::with_context(launch,
         duduclaw_execution::command::with_runtime(runtime,
             crate::process_group::BackendChild::spawn_class(&mut marker, class))).await
-        .map_err(|_| refusal())?;
+        .map_err(|error| refuse(spawn_site(&error)))?;
+    // R8x: from here on the run exists (spawnd accepted StartRun).
+    record(|trace| trace.started = true);
     crate::autonomous_runtime::mark_handoff();
     drop(admission);
-    let stdin = child.child().stdin.take().ok_or_else(refusal)?;
+    let stdin = child.child().stdin.take().ok_or_else(|| refuse("run.stdin_missing"))?;
     let control = child.child().control();
     let writer = tokio::spawn(async move {
         let result = write_prompt(stdin, &bytes, Duration::from_secs(30)).await;
         if result.is_err() {
             let _ = control.start_kill();
-            return Err(refusal());
+            return Err(refuse("run.input"));
         }
         Ok(())
     });
@@ -205,20 +305,43 @@ async fn spawn_plan(authorization: RuntimeAuthorization, plan: duduclaw_isolatio
 
 /// A registered adapter receives one JSON document followed by EOF. Native
 /// vendor flags, credentials and legacy configs never enter this launch path.
+/// R8x: the coarse gates shared by the protected non-Claude paths, each with
+/// its own site (same conditions and the same single refusal as before).
+/// `policy`: the `[capabilities] policy` gate (API worker and native paths).
+fn coarse_gates(context: &crate::runtime::RuntimeContext, policy: bool) -> Result<&std::path::Path, String> {
+    let agent_dir = context.agent_dir.as_deref().ok_or_else(|| refuse("authorize.agent_dir_missing"))?;
+    if context.effort.is_some() { return Err(refuse("authorize.effort")); }
+    if crate::runtime_dispatch::in_utility_call() { return Err(refuse("authorize.utility_call")); }
+    if crate::runtime::spawn_work_dir_override().is_some() { return Err(refuse("authorize.work_dir_override")); }
+    if agent_dir != context.home_dir.join("agents").join(&context.agent_id) { return Err(refuse("authorize.agent_dir")); }
+    if policy && context.capabilities.as_ref().is_some_and(|caps| !caps.policy.is_empty()) {
+        return Err(refuse("authorize.capabilities_policy"));
+    }
+    Ok(agent_dir)
+}
+
+/// The `runtime` log value of a registered CLI (`refusal::runtime_label`).
+const REGISTERED_LABEL: &str = "registered";
+
+/// A registered adapter receives one JSON document followed by EOF. Native
+/// vendor flags, credentials and legacy configs never enter this launch path.
+/// R8x: observed (one log line per refused turn).
 pub(crate) async fn execute_registered_cli(id: &str, prompt: &str, context: &crate::runtime::RuntimeContext,
+    format: duduclaw_core::runtime_catalog::OutputFormat) -> Result<crate::runtime::RuntimeResponse, String> {
+    observed(REGISTERED_LABEL, &context.agent_id, execute_registered_cli_inner(id, prompt, context, format)).await
+}
+
+async fn execute_registered_cli_inner(id: &str, prompt: &str, context: &crate::runtime::RuntimeContext,
     format: duduclaw_core::runtime_catalog::OutputFormat) -> Result<crate::runtime::RuntimeResponse, String> {
     use duduclaw_isolation::bounded::Text;
     // RM-103 S3: refused before any authority is consumed (see
     // `runtime::protected_coarse_native_gate`).
-    crate::runtime::protected_coarse_native_gate(context.capabilities.as_ref(), id, &context.agent_id)?;
-    let agent_dir = context.agent_dir.as_deref().ok_or_else(refusal)?;
-    if context.effort.is_some() || crate::runtime_dispatch::in_utility_call()
-        || crate::runtime::spawn_work_dir_override().is_some()
-        || agent_dir != context.home_dir.join("agents").join(&context.agent_id) {
-        return Err(refusal());
-    }
-    let runtime = RuntimeKind::Registered(Text::new(format!("generic-cli-v1.{id}")).map_err(|_| refusal())?);
-    duduclaw_mcp_boundary::config::registered_cli_arguments(&runtime).map_err(|_| refusal())?;
+    crate::runtime::protected_coarse_native_gate(context.capabilities.as_ref(), id, &context.agent_id)
+        .map_err(keep("authorize.native_gate"))?;
+    let agent_dir = coarse_gates(context, false)?;
+    let runtime = RuntimeKind::Registered(Text::new(format!("generic-cli-v1.{id}"))
+        .map_err(|_| refuse("authorize.runtime_id"))?);
+    duduclaw_mcp_boundary::config::registered_cli_arguments(&runtime).map_err(|_| refuse("authorize.runtime_id"))?;
     // R8r-1: every gate above runs before authority is taken or issued. The
     // principal context stays registered until this run has been collected.
     let (authorization, _principal_context) = take_or_issue_current(agent_dir).await?;
@@ -226,14 +349,14 @@ pub(crate) async fn execute_registered_cli(id: &str, prompt: &str, context: &cra
         "protocol": "generic-cli-v1", "runtime": id, "model": context.model,
         "system_prompt": context.system_prompt, "history": context.conversation_history,
         "prompt": prompt, "max_tokens": context.max_tokens,
-    })).map_err(|_| refusal())?;
+    })).map_err(|_| refuse("request.encode"))?;
     let class = crate::process_group::execution_class(ExecutionClass::EmployeeMain);
     let plan = super::boot::other_runtime_plan(authorization.home.clone(), authorization.agent.clone(),
-        class, runtime.clone(), bytes.clone()).await.map_err(|_| refusal())?;
+        class, runtime.clone(), bytes.clone()).await.map_err(|_| refuse("plan.unavailable"))?;
     let deadline = Duration::from_secs(crate::runtime_config::call_timeout_secs(Some(agent_dir)));
     let out = collect_plan(authorization, plan, class, runtime, bytes, deadline, false).await?;
-    let stdout = std::str::from_utf8(&out).map_err(|_| refusal())?;
-    let content = crate::runtime::generic_cli::parse_output(stdout, format).ok_or_else(refusal)?;
+    let stdout = std::str::from_utf8(&out).map_err(|_| refuse("output.utf8"))?;
+    let content = crate::runtime::generic_cli::parse_output(stdout, format).ok_or_else(|| refuse("output.parse"))?;
     Ok(crate::runtime::RuntimeResponse { partial_timeout_secs: None,
         input_tokens: crate::prompt_compression::estimate_tokens(&crate::runtime::generic_cli::build_prompt(context, prompt, id)),
         output_tokens: crate::prompt_compression::estimate_tokens(&content), content,
@@ -252,17 +375,17 @@ async fn collect_plan(authorization: RuntimeAuthorization, plan: duduclaw_isolat
     let agent = authorization.agent.clone();
     let label = super::refusal::runtime_label(&runtime);
     let (mut child, mut writer) = spawn_plan(authorization, plan, class, runtime, bytes, None).await?;
-    let mut stdout = child.child().stdout.take().ok_or_else(refusal)?;
-    let mut stderr = child.child().stderr.take().ok_or_else(refusal)?;
+    let mut stdout = child.child().stdout.take().ok_or_else(|| refuse("run.stdout_missing"))?;
+    let mut stderr = child.child().stderr.take().ok_or_else(|| refuse("run.stderr_missing"))?;
     let mut out = Vec::new();
     let mut err = Vec::new();
     let result = tokio::time::timeout(deadline, async {
         tokio::try_join!(writer.finish(),
             async { crate::process_group::drain_bounded(&mut stdout, &mut out, 8 * 1024 * 1024, false)
-                .await.map_err(|_| refusal()) },
+                .await.map_err(|_| refuse("run.output_drain")) },
             async { crate::process_group::drain_bounded(&mut stderr, &mut err, 64 * 1024, true)
-                .await.map_err(|_| refusal()) },
-            async { child.child().wait().await.map_err(|_| refusal()) })
+                .await.map_err(|_| refuse("run.stderr_drain")) },
+            async { child.child().wait().await.map_err(|_| refuse("run.wait")) })
     }).await;
     let exit = match &result {
         Ok(Ok(((), false, _, status))) if status.success() => None,
@@ -274,9 +397,12 @@ async fn collect_plan(authorization: RuntimeAuthorization, plan: duduclaw_isolat
         child.kill_and_reap().await;
         let reason = if api_reason { super::refusal::refusal_reason(&err) } else { None };
         super::refusal::log_refused(label, &agent, reason, exit, err.len());
+        // R8x: the R8t line is this turn's one line.
+        record(|trace| trace.logged = true);
         drop(err);
+        note_site("run.refused");
         return Err(if api_reason { super::refusal::user_error(reason.and_then(super::refusal::class_of)) }
-            else { refusal() });
+            else { refuse("run.refused") });
     }
     child.leader_exited();
     child.disarm();
@@ -285,44 +411,55 @@ async fn collect_plan(authorization: RuntimeAuthorization, plan: duduclaw_isolat
 
 /// Native adapters receive only a bounded sealed request. The root publication
 /// selects both adapter and vendor ELF; native gateway configs are never used.
+/// R8x: observed (one log line per refused turn).
 pub(crate) async fn execute_native(runtime: RuntimeKind, prompt: String, context: &crate::runtime::RuntimeContext)
+    -> Result<Vec<u8>, String> {
+    let label = super::refusal::runtime_label(&runtime);
+    observed(label, &context.agent_id, execute_native_inner(runtime, prompt, context)).await
+}
+
+async fn execute_native_inner(runtime: RuntimeKind, prompt: String, context: &crate::runtime::RuntimeContext)
     -> Result<Vec<u8>, String> {
     // RM-103 S3: the native write/shell restrictions `execute_native`'s list
     // checks below do not see (`action_rules`, a malformed `[capabilities]`)
     // refuse here, before any authority is consumed.
-    let name = match runtime { RuntimeKind::Codex => "codex", RuntimeKind::Grok => "grok", _ => return Err(refusal()) };
-    crate::runtime::protected_coarse_native_gate(context.capabilities.as_ref(), name, &context.agent_id)?;
-    let agent_dir = context.agent_dir.as_deref().ok_or_else(refusal)?;
-    if context.effort.is_some() || crate::runtime_dispatch::in_utility_call()
-        || crate::runtime::spawn_work_dir_override().is_some()
-        || agent_dir != context.home_dir.join("agents").join(&context.agent_id)
-        || context.capabilities.as_ref().is_some_and(|caps| !caps.policy.is_empty()) {
-        return Err(refusal());
-    }
-    if crate::explore_lane::in_explore()
-        || context.capabilities.as_ref().is_some_and(|caps| caps.has_tool_restrictions()
+    let name = match runtime { RuntimeKind::Codex => "codex", RuntimeKind::Grok => "grok",
+        _ => return Err(refuse("authorize.runtime_kind")) };
+    crate::runtime::protected_coarse_native_gate(context.capabilities.as_ref(), name, &context.agent_id)
+        .map_err(keep("authorize.native_gate"))?;
+    let agent_dir = coarse_gates(context, true)?;
+    if crate::explore_lane::in_explore() { return Err(refuse("authorize.explore_lane")); }
+    if context.capabilities.as_ref().is_some_and(|caps| caps.has_tool_restrictions()
             || !caps.scoped_tools.is_empty() || !caps.approval_required_tools.is_empty()
-            || !caps.irreversible_tools.is_empty() || !caps.maybe_irreversible_tools.is_empty()) { return Err(refusal()); }
+            || !caps.irreversible_tools.is_empty() || !caps.maybe_irreversible_tools.is_empty()) {
+        return Err(refuse("authorize.tool_restrictions"));
+    }
     // PL-0: an externally selected Codex home is not silently replaced by a
     // protected projection. Refuse before consuming credentials or launching.
-    if runtime == RuntimeKind::Codex && std::env::var_os("CODEX_HOME").is_some() { return Err(refusal()); }
-    let protocol = match runtime { RuntimeKind::Codex => "codex-v1", RuntimeKind::Grok => "grok-v1", _ => return Err(refusal()) };
+    if runtime == RuntimeKind::Codex && std::env::var_os("CODEX_HOME").is_some() {
+        return Err(refuse("authorize.codex_home"));
+    }
+    let protocol = match runtime { RuntimeKind::Codex => "codex-v1", RuntimeKind::Grok => "grok-v1",
+        _ => return Err(refuse("authorize.runtime_kind")) };
     // R8r-1: product policy and the interceptor refusals need no authority;
     // they run before it is taken or issued, so a refusal here never consumes
     // a one-time background record or an installed authorization.
-    crate::product_policy::require_runtime(&context.home_dir, name).map_err(|_| refusal())?;
-    crate::product_policy::require_model(crate::product_policy::load(&context.home_dir).map_err(|_| refusal())?,
-        &context.model).map_err(|_| refusal())?;
+    crate::product_policy::require_runtime(&context.home_dir, name).map_err(|_| refuse("authorize.product_policy"))?;
+    crate::product_policy::require_model(crate::product_policy::load(&context.home_dir)
+        .map_err(|_| refuse("authorize.product_policy"))?, &context.model)
+        .map_err(|_| refuse("authorize.product_policy"))?;
     if crate::ccr_runtime::for_agent(&context.home_dir, &context.agent_id).is_some()
         || crate::redaction_proxy::try_build_interceptor(&context.home_dir, &context.agent_id,
-            &crate::redaction_proxy::current_session_id()).map_err(|_| refusal())?.is_some() { return Err(refusal()); }
+            &crate::redaction_proxy::current_session_id()).map_err(|_| refuse("authorize.interceptor"))?.is_some() {
+        return Err(refuse("authorize.interceptor"));
+    }
     // The principal context stays registered until this run has been collected.
     let (authorization, _principal_context) = take_or_issue_current(agent_dir).await?;
     let bytes = duduclaw_api_worker::native::Request { protocol: protocol.into(), model: context.model.clone(), prompt }
-        .encode().map_err(|_| refusal())?;
+        .encode().map_err(|_| refuse("request.encode"))?;
     let class = crate::process_group::execution_class(ExecutionClass::EmployeeMain);
     let plan = super::boot::other_runtime_plan(authorization.home.clone(), authorization.agent.clone(),
-        class, runtime.clone(), bytes.clone()).await.map_err(|_| refusal())?;
+        class, runtime.clone(), bytes.clone()).await.map_err(|_| refuse("plan.unavailable"))?;
     let deadline = Duration::from_secs(crate::runtime_config::call_timeout_secs(Some(agent_dir)));
     if runtime != RuntimeKind::Grok { return collect_plan(authorization, plan, class, runtime, bytes, deadline, false).await; }
     collect_native_pty(authorization, plan, class, deadline).await
@@ -335,28 +472,30 @@ async fn collect_native_pty(authorization: RuntimeAuthorization, plan: duduclaw_
     let launch = super::prepare_launch(super::LaunchInput { agent: authorization.agent, plan,
         grant: authorization.grant, roots: authorization.roots, origin: authorization.origin,
         caller: authorization.caller, turn: authorization.turn, authenticated_epoch: authorization.authenticated_epoch })
-        .await.map_err(|_| refusal())?;
-    if !duduclaw_core::execution_gate::isolation_required() { return Err(refusal()); }
+        .await.map_err(|_| refuse("spawn.prepare"))?;
+    if !duduclaw_core::execution_gate::isolation_required() { return Err(refuse("spawn.not_protected")); }
     let marker = portable_pty::CommandBuilder::new("root-selected-runtime");
-    let admission = crate::autonomous_runtime::admit_current().await?;
+    let admission = crate::autonomous_runtime::admit_current().await.map_err(keep("spawn.admission"))?;
     // I1e supplies protected PTY delivery and resize through this existing A API.
     // Never create a host PTY or retry this one-shot authorization locally.
     let mut child = duduclaw_execution::command::with_context(launch,
         duduclaw_execution::command::with_runtime(RuntimeKind::Grok,
             duduclaw_execution::command::spawn_pty(marker,
                 duduclaw_isolation::execution::PtySize { rows: 40, columns: 120 }, class, true)))
-        .await.map_err(|_| refusal())?;
+        .await.map_err(|error| refuse(spawn_site(&error)))?;
+    // R8x: from here on the run exists.
+    record(|trace| trace.started = true);
     crate::autonomous_runtime::mark_handoff();
     drop(admission);
     // The adapter reads sealed fd 4, not terminal input. No JSON is echoed into
     // the PTY. Dropping this input follows I1e's close/write-half semantics.
     drop(child.input.take());
-    let mut stdout = child.output.take().ok_or_else(refusal)?;
+    let mut stdout = child.output.take().ok_or_else(|| refuse("run.stdout_missing"))?;
     let mut out = Vec::new();
     let result = tokio::time::timeout(deadline, async {
         tokio::try_join!(async { crate::process_group::drain_bounded(&mut stdout, &mut out,
-            8 * 1024 * 1024, false).await.map_err(|_| refusal()) },
-            async { child.wait().await.map_err(|_| refusal()) })
+            8 * 1024 * 1024, false).await.map_err(|_| refuse("run.output_drain")) },
+            async { child.wait().await.map_err(|_| refuse("run.wait")) })
     }).await;
     use super::refusal::RunExit;
     let exit = match &result {
@@ -367,45 +506,44 @@ async fn collect_native_pty(authorization: RuntimeAuthorization, plan: duduclaw_
     };
     let _ = child.kill().await;
     super::refusal::log_refused(super::refusal::runtime_label(&RuntimeKind::Grok), &agent, None, exit, 0);
-    Err(refusal())
+    // R8x: the R8t line is this turn's one line.
+    record(|trace| trace.logged = true);
+    Err(refuse("run.refused"))
 }
 
 /// Take or issue initiating authority before resolving provider credentials.
 /// Unsupported utility, workspace and effort modes never enter the worker's
 /// provider path and are refused before any authority is consumed. The caller
 /// holds the returned principal context until the worker run has finished.
+/// R8x: call inside [`observed`] (the API runtime's protected turn does).
 pub(crate) async fn authorize_api(context: &crate::runtime::RuntimeContext)
     -> Result<(RuntimeAuthorization, Option<crate::on_behalf_of::context::ContextGuard>), String> {
-    let agent_dir = context.agent_dir.as_deref().ok_or_else(refusal)?;
-    if context.effort.is_some() || crate::runtime_dispatch::in_utility_call()
-        || crate::runtime::spawn_work_dir_override().is_some()
-        || agent_dir != context.home_dir.join("agents").join(&context.agent_id)
-        || context.capabilities.as_ref().is_some_and(|caps| !caps.policy.is_empty()) {
-        return Err(refusal());
-    }
+    let agent_dir = coarse_gates(context, true)?;
     take_or_issue_current(agent_dir).await
 }
 
+/// R8x: call inside [`observed`] (the API runtime's protected turn does).
 pub(crate) async fn execute_api_worker(authorization: RuntimeAuthorization,
     request: duduclaw_api_worker::Request, context: &crate::runtime::RuntimeContext)
     -> Result<crate::runtime::RuntimeResponse, String> {
-    let bytes = request.encode().map_err(|_| refusal())?;
+    let bytes = request.encode().map_err(|_| refuse("request.encode"))?;
     let class = crate::process_group::execution_class(ExecutionClass::EmployeeMain);
+    // `other_runtime_plan` records its own finer `plan.*` site first.
     let plan = super::boot::other_runtime_plan(authorization.home.clone(), authorization.agent.clone(),
-        class, RuntimeKind::OpenAiCompat, bytes.clone()).await.map_err(|_| refusal())?;
+        class, RuntimeKind::OpenAiCompat, bytes.clone()).await.map_err(|_| refuse("plan.unavailable"))?;
     // R8t: a refusal names the worker's fixed reason in the log and selects
     // the class message (still spawn-gate prefixed: no rotation/fallback).
     let out = collect_plan(authorization, plan, class, RuntimeKind::OpenAiCompat, bytes,
         Duration::from_secs(request.timeout_secs), true).await?;
-    let response: duduclaw_api_worker::Response = serde_json::from_slice(&out).map_err(|_| refusal())?;
-    if response.content.trim().is_empty() { return Err(refusal()); }
+    let response: duduclaw_api_worker::Response = serde_json::from_slice(&out).map_err(|_| refuse("output.parse"))?;
+    if response.content.trim().is_empty() { return Err(refuse("output.empty")); }
     Ok(crate::runtime::RuntimeResponse { partial_timeout_secs: None, content: response.content,
         input_tokens: response.input_tokens, output_tokens: response.output_tokens, cache_read_tokens: 0,
         model_used: context.model.clone(), runtime_name: "openai_compat".into() })
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::path::Path;
     use duduclaw_isolation::{bounded::{List, Text}, capability::{EmployeeBinding, Lane, Principal}};
@@ -823,5 +961,194 @@ mod tests {
     async fn prompt_input_stalled_reader_is_bounded() {
         let (writer, _reader) = tokio::io::duplex(1);
         assert!(write_prompt(writer, b"more than capacity", Duration::from_millis(25)).await.is_err());
+    }
+
+    // ── R8x: refusal sites ──────────────────────────────────────────────
+
+    const LABEL_PREFIXES: [&str; 10] = ["preflight.", "authorize.", "step_limit.", "authorization.", "request.",
+        "plan.", "launch.", "spawn.", "run.", "output."];
+
+    /// Runs `future` inside a fresh turn carrier; returns the site it recorded.
+    pub(crate) async fn site_of(future: impl Future<Output = ()>) -> Option<&'static str> {
+        TRACE.scope(std::cell::Cell::new(Trace::default()), async {
+            future.await;
+            TRACE.with(|cell| cell.get()).site
+        }).await
+    }
+
+    async fn api_site(ctx: &crate::runtime::RuntimeContext) -> Option<&'static str> {
+        site_of(async { assert_refused("api", authorize_api(ctx).await.map(|_| ())); }).await
+    }
+
+    /// Every double-quoted literal shaped like a site label.
+    fn quoted_labels(source: &str) -> Vec<String> {
+        source.match_indices('"').filter_map(|(index, _)| {
+            let rest = &source[index + 1..];
+            let text = &rest[..rest.find('"')?];
+            (LABEL_PREFIXES.iter().any(|prefix| text.starts_with(prefix)) && !text.ends_with('.')
+                && text.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'_'))
+                .then(|| text.to_owned())
+        }).collect()
+    }
+
+    #[test]
+    fn site_labels_are_a_closed_fixed_set() {
+        use super::super::refusal::{SITES, UNLABELLED_SITE};
+        let unique: std::collections::BTreeSet<_> = SITES.iter().collect();
+        assert_eq!(unique.len(), SITES.len(), "duplicate site label");
+        for site in SITES {
+            assert!(*site == UNLABELLED_SITE || LABEL_PREFIXES.iter().any(|prefix| site.starts_with(prefix)), "{site}");
+            assert!(site.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'_'), "{site}");
+        }
+        // Every label written in the protected sources is listed, and every
+        // listed label is used (no dead entries).
+        let sources = [include_str!("runtime.rs"), include_str!("boot.rs"), include_str!("ingress.rs"),
+            include_str!("../runtime/openai_compat.rs")];
+        let mut used = std::collections::BTreeSet::new();
+        for source in sources {
+            for label in quoted_labels(source) {
+                assert!(SITES.contains(&label.as_str()), "label missing from refusal::SITES: {label}");
+                used.insert(label);
+            }
+        }
+        for site in SITES.iter().filter(|site| **site != UNLABELLED_SITE) {
+            assert!(used.contains(*site), "unused site label: {site}");
+        }
+    }
+
+    /// The guard: no refusal on these paths can be built without a site.
+    /// Adding a bare `refusal()`, an unlabelled `refuse(..)` or another
+    /// refusal builder to runtime.rs (or to the API runtime's protected turn)
+    /// fails here.
+    #[test]
+    fn protected_paths_have_no_unlabelled_refusal() {
+        let source = include_str!("runtime.rs");
+        let production = source.split("#[cfg(test)]\npub(super) mod tests").next().unwrap();
+        assert!(production.len() < source.len(), "test-module marker not found");
+        for banned in ["refusal()", "ok_or_else(refusal)", "fn refusal(", "spawn_gate_error("] {
+            assert!(!production.contains(banned), "unlabelled refusal builder in runtime.rs: {banned}");
+        }
+        // `refuse` itself and the R8t class message of a started API run.
+        assert_eq!(production.matches("user_error(").count(), 2);
+        for (index, _) in production.match_indices("refuse(") {
+            let after = &production[index + "refuse(".len()..];
+            assert!(after.starts_with('"') || after.starts_with("spawn_site(") || production[..index].ends_with("fn "),
+                "refuse( without a fixed label: {}", after.chars().take(40).collect::<String>());
+        }
+        let api = include_str!("../runtime/openai_compat.rs");
+        let start = api.find("async fn protected_turn").expect("protected API turn");
+        let end = start + api[start..].find("pub fn new()").expect("end of the protected API turn");
+        let protected = &api[start..end];
+        assert!(!protected.contains("refusal()"));
+        assert_eq!(protected.matches("spawn_gate_error(").count(), 1, "one labelled builder only");
+        assert!(api[..start].contains("isolation_mcp::runtime::observed("), "the API turn has one logging point");
+    }
+
+    #[tokio::test]
+    async fn each_authorize_api_condition_yields_its_label() {
+        let base = context();
+        let mut missing = base.clone();
+        missing.agent_dir = None;
+        assert_eq!(api_site(&missing).await, Some("authorize.agent_dir_missing"));
+        let mut effort = base.clone();
+        effort.effort = Some(duduclaw_core::effort::Effort::High);
+        assert_eq!(api_site(&effort).await, Some("authorize.effort"));
+        assert_eq!(crate::runtime_dispatch::UTILITY_CALL.scope((), api_site(&base)).await,
+            Some("authorize.utility_call"));
+        assert_eq!(crate::runtime::SPAWN_OVERRIDE.scope(
+            crate::runtime::SpawnOverride { work_dir: Some("/tmp".into()) }, api_site(&base)).await,
+            Some("authorize.work_dir_override"));
+        let mut other = base.clone();
+        other.agent_id = "bob".into();
+        assert_eq!(api_site(&other).await, Some("authorize.agent_dir"));
+        let mut policy = base.clone();
+        policy.capabilities = Some(toml::from_str("[[policy]]\ntool = \"shell_exec\"\neffect = \"forbid\"\n").unwrap());
+        assert_eq!(api_site(&policy).await, Some("authorize.capabilities_policy"));
+        // Past the coarse gates: the authority step that refused.
+        assert_eq!(api_site(&base).await, Some("authorization.principal_context"), "no canonical home");
+        let (_temp, home) = live_home();
+        let live = live_context(&home);
+        assert_eq!(api_site(&live).await, Some("authorization.ingress.no_scope"));
+        let fake = FakeOrigin::new(None, None);
+        assert_eq!(FAKE_ORIGIN.scope(fake, api_site(&live)).await, Some("authorization.ingress_issue"));
+        let fake = FakeOrigin::new(Some(None), None);
+        assert_eq!(FAKE_ORIGIN.scope(fake, api_site(&live)).await, Some("authorization.background_issue"));
+        with_runtime_authorization(authorization_at(&home, "alice", 1), async {
+            assert!(site_of(async { authorize_api(&live).await.unwrap(); }).await.is_none());
+            assert_eq!(api_site(&live).await, Some("authorization.consumed"));
+        }).await;
+        with_runtime_authorization(authorization_at(&home, "bob", 1), async {
+            assert_eq!(api_site(&live).await, Some("authorization.installed_mismatch"));
+        }).await;
+    }
+
+    #[test]
+    fn spawn_refusals_map_to_fixed_sites_never_text() {
+        use duduclaw_isolation::execution::BackendError;
+        for (error, site) in [(BackendError::Unavailable, "spawn.backend.unavailable"),
+            (BackendError::Denied, "spawn.backend.denied"), (BackendError::WouldDeadlock, "spawn.backend.would_deadlock"),
+            (BackendError::NotFound, "spawn.backend.not_found"), (BackendError::Timeout, "spawn.backend.timeout"),
+            (BackendError::Io, "spawn.backend.io"), (BackendError::Protocol, "spawn.backend.protocol")] {
+            assert_eq!(spawn_site(&std::io::Error::new(std::io::ErrorKind::Other, error)), site);
+        }
+        for (kind, site) in [(std::io::ErrorKind::PermissionDenied, "spawn.start.permission_denied"),
+            (std::io::ErrorKind::NotFound, "spawn.start.not_found"), (std::io::ErrorKind::TimedOut, "spawn.start.timed_out"),
+            (std::io::ErrorKind::BrokenPipe, "spawn.start.other")] {
+            assert_eq!(spawn_site(&std::io::Error::new(kind, "planted spawnd text")), site);
+        }
+    }
+
+    #[derive(Clone)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes); Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+
+    /// One failed turn ⇒ exactly one line with fixed fields: `not started`
+    /// (with the site, or `unlabelled`), `refused after start`, or nothing
+    /// extra when the R8t line was written. Success logs nothing; request
+    /// content and an invalid agent label never appear.
+    #[tokio::test]
+    async fn a_refused_turn_logs_exactly_one_fixed_line() {
+        const MARKER: &str = "R8X-PLANTED-MARKER-41c9";
+        let log = LogCapture(Default::default());
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
+            .with_max_level(tracing::Level::WARN).with_writer(move || writer.clone()).finish();
+        let _default = tracing::subscriber::set_default(subscriber);
+        let mut ctx = context();
+        ctx.effort = Some(duduclaw_core::effort::Effort::High);
+        ctx.system_prompt = MARKER.into();
+        ctx.model = MARKER.into();
+        let error = observed("openai_compat", &ctx.agent_id, async { authorize_api(&ctx).await.map(|_| ()) })
+            .await.unwrap_err();
+        // The user-visible refusal is exactly the pre-R8x sentence.
+        assert_eq!(error, super::super::refusal::user_error(None));
+        observed("openai_compat", "alice", async { Err::<(), _>(format!("{MARKER} provider text")) }).await.unwrap_err();
+        observed("openai_compat", "alice", async {
+            record(|trace| trace.started = true);
+            Err::<(), _>(refuse("output.parse"))
+        }).await.unwrap_err();
+        observed("openai_compat", "alice", async {
+            record(|trace| trace.started = true);
+            record(|trace| trace.logged = true);
+            Err::<(), _>(refuse("run.refused"))
+        }).await.unwrap_err();
+        observed("openai_compat", "alice", async { Ok::<_, String>(()) }).await.unwrap();
+        observed("openai_compat", "../etc/passwd", async { Err::<(), _>(refuse("request.encode")) }).await.unwrap_err();
+        let logs = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<_> = logs.lines().collect();
+        assert_eq!(lines.len(), 4, "{logs}");
+        for field in ["isolated run not started", "runtime=\"openai_compat\"", "agent=\"alice\"", "site=\"authorize.effort\""] {
+            assert!(lines[0].contains(field), "{field}: {logs}");
+        }
+        assert!(lines[1].contains("isolated run not started") && lines[1].contains("site=\"unlabelled\""), "{logs}");
+        assert!(lines[2].contains("isolated run refused after start") && lines[2].contains("site=\"output.parse\""), "{logs}");
+        assert!(lines[3].contains("agent=\"invalid\"") && lines[3].contains("site=\"request.encode\""), "{logs}");
+        assert!(!logs.contains(MARKER) && !logs.contains("passwd") && !logs.contains("provider text"), "{logs}");
+        assert_eq!(logs.matches("isolated run not started").count(), 3, "{logs}");
     }
 }

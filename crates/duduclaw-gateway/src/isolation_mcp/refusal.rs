@@ -179,6 +179,92 @@ pub(crate) fn log_refused(runtime: &'static str, agent: &str, reason: Option<&'s
         "isolated run refused");
 }
 
+/// R8x: the site recorded when a refused protected turn carried no label (a
+/// forgotten site still produces exactly one line, never none).
+pub(crate) const UNLABELLED_SITE: &str = "unlabelled";
+
+/// R8x: every place a protected turn can be refused, as the fixed `site` log
+/// value. Grouped by prefix: `preflight.*`/`authorize.*` (coarse gates, no
+/// authority consumed), `authorization.*` (taking or issuing the one-time
+/// run authority), `plan.*` (the root-published run plan), `launch.*` (the
+/// protected MCP launch context), `spawn.*` (asking spawnd to start the run;
+/// `spawn.backend.*` is spawnd's or the transport's fixed refusal class),
+/// `run.*` (the run started and then failed) and `output.*` (the run exited
+/// successfully but its result was unusable). Closed set: tests require that
+/// every label used in the source is listed here.
+pub(crate) const SITES: &[&str] = &[
+    UNLABELLED_SITE,
+    // Coarse gates (no authority taken or issued yet).
+    "preflight.model", "preflight.runtime_policy", "preflight.model_policy", "preflight.redaction",
+    "preflight.interceptor",
+    "authorize.agent_dir_missing", "authorize.effort", "authorize.utility_call", "authorize.work_dir_override",
+    "authorize.agent_dir", "authorize.capabilities_policy", "authorize.native_gate", "authorize.runtime_kind",
+    "authorize.explore_lane", "authorize.tool_restrictions", "authorize.codex_home", "authorize.product_policy",
+    "authorize.interceptor", "authorize.runtime_id", "authorize.max_turns",
+    "step_limit.agent_dir", "step_limit.unavailable",
+    // The one-time run authority.
+    "authorization.consumed", "authorization.installed_mismatch", "authorization.agent_label",
+    "authorization.home", "authorization.principal_context", "authorization.background_issue",
+    "authorization.ingress_issue",
+    "authorization.ingress.no_scope", "authorization.ingress.consumed",
+    "authorization.ingress.capture.no_web_credential", "authorization.ingress.capture.web_identity",
+    "authorization.ingress.capture.channel_conflict", "authorization.ingress.capture.channel_mapping",
+    "authorization.ingress.capture.requester", "authorization.ingress.capture.user_db",
+    "authorization.ingress.capture.user_inactive", "authorization.ingress.capture.epoch",
+    "authorization.ingress.capture.blocking",
+    "authorization.ingress.agent_path", "authorization.ingress.home_mismatch", "authorization.ingress.no_turn",
+    "authorization.ingress.no_session", "authorization.ingress.no_attended_proof",
+    "authorization.ingress.attended_proof_invalid", "authorization.ingress.nested_dispatch",
+    "authorization.ingress.principal_mismatch", "authorization.ingress.proof_expired",
+    "authorization.ingress.identity_recheck", "authorization.ingress.blocking",
+    "authorization.issue.boot_owner", "authorization.issue.product_authority", "authorization.issue.lifecycle",
+    "authorization.issue.snapshot", "authorization.issue.epoch", "authorization.issue.principal",
+    "authorization.issue.binding", "authorization.issue.policy_revision", "authorization.issue.tools",
+    "authorization.issue.human", "authorization.issue.selectors", "authorization.issue.capability",
+    "authorization.issue.users_recheck", "authorization.issue.policy_changed",
+    "authorization.issue.lifecycle_recheck", "authorization.issue.snapshot_recheck",
+    "authorization.issue.facts_recheck",
+    // The request and the root-published plan.
+    "request.encode",
+    "plan.unavailable", "plan.readiness", "plan.boot_owner", "plan.home_mismatch", "plan.employee_unconfirmed",
+    "plan.root_publication", "plan.blocking",
+    // The protected launch context.
+    "launch.readiness", "launch.boot_owner", "launch.boundary_unhealthy", "launch.employee_unconfirmed",
+    "launch.employee_mismatch", "launch.product_prepare", "launch.binding", "launch.blocking",
+    "launch.resolver", "launch.connectors", "launch.worker_plans", "launch.factories", "launch.dispatcher",
+    "launch.protected_launch", "launch.authority_pairing",
+    // Asking spawnd to start the run.
+    "spawn.prepare", "spawn.not_protected", "spawn.admission",
+    "spawn.backend.unavailable", "spawn.backend.denied", "spawn.backend.would_deadlock",
+    "spawn.backend.not_found", "spawn.backend.timeout", "spawn.backend.io", "spawn.backend.protocol",
+    "spawn.start.permission_denied", "spawn.start.not_found", "spawn.start.timed_out", "spawn.start.other",
+    // The run started.
+    "run.stdin_missing", "run.stdout_missing", "run.stderr_missing", "run.input", "run.output_drain",
+    "run.stderr_drain", "run.wait", "run.refused",
+    // The run exited successfully; its result was refused.
+    "output.parse", "output.empty", "output.utf8",
+];
+
+/// The `agent` log value: the employee label when it is a valid agent id,
+/// otherwise a fixed placeholder (never arbitrary caller text).
+pub(crate) fn agent_label(agent: &str) -> &str {
+    if duduclaw_core::is_valid_agent_id(agent) { agent } else { "invalid" }
+}
+
+/// R8x: the single warning for a refused protected turn that never reached a
+/// started run. Fixed fields only: runtime label, employee label, site label.
+pub(crate) fn log_not_started(runtime: &'static str, agent: &str, site: &'static str) {
+    let agent = agent_label(agent);
+    tracing::warn!(runtime, agent, site, "isolated run not started");
+}
+
+/// R8x: the single warning for a run that started but was refused without the
+/// R8t line (its pipes were missing, or it exited 0 with unusable output).
+pub(crate) fn log_refused_after_start(runtime: &'static str, agent: &str, site: &'static str) {
+    let agent = agent_label(agent);
+    tracing::warn!(runtime, agent, site, "isolated run refused after start");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,6 +418,33 @@ mod tests {
         assert_eq!(RunExit::Timeout.to_string(), "timeout");
         assert_eq!(RunExit::Signal.to_string(), "signal");
         assert_eq!(RunExit::Incomplete.to_string(), "incomplete");
+    }
+
+    /// R8x: the two new lines carry fixed fields only; an agent label that is
+    /// not a valid agent id is replaced, never logged.
+    #[test]
+    fn the_not_started_lines_have_fixed_fields_only() {
+        for (agent, shown) in [("alice", "alice"), ("../x y", "invalid")] {
+            for after_start in [false, true] {
+                let log = LogCapture(Default::default());
+                let writer = log.clone();
+                let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
+                    .with_max_level(tracing::Level::WARN).with_writer(move || writer.clone()).finish();
+                tracing::subscriber::with_default(subscriber, || if after_start {
+                    log_refused_after_start("openai_compat", agent, "output.empty")
+                } else {
+                    log_not_started("openai_compat", agent, "plan.root_publication")
+                });
+                let logs = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+                assert_eq!(logs.lines().count(), 1, "{logs}");
+                let (message, site) = if after_start { ("isolated run refused after start", "output.empty") }
+                    else { ("isolated run not started", "plan.root_publication") };
+                assert!(logs.contains(message) && logs.contains(&format!("site=\"{site}\"")), "{logs}");
+                assert!(logs.contains("runtime=\"openai_compat\"") && logs.contains(&format!("agent=\"{shown}\"")), "{logs}");
+                assert!(!logs.contains("../x"), "{logs}");
+                assert!(SITES.contains(&site));
+            }
+        }
     }
 
     #[test]

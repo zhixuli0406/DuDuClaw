@@ -224,6 +224,24 @@ OpenAI 互換ランタイムの `reason` はワーカーの固定理由です（
 | 這次工作超過時間上限而停止。 | `timeout` | この作業の制限時間、またはプロバイダーの応答の遅さ。 |
 | 受保護模式尚無這次工作的隔離執行授權，或所選執行設定尚未通過驗證；請由管理員檢查服務狀態。 | その他、または `unrecognised` | 準備完了の状態とジャーナルの `reason`、`exit`。「準備完了エラーの調査」を参照。 |
 
+作業が**実行の開始前に**拒否された場合は、代わりに警告 `isolated run not started` が 1 件記録されます。フィールドは `runtime`、`agent`（社員ラベル）、`site` です。`site` は拒否された場所を示す固定ラベルです。実行が始まったのに上の行を残さずに終わった場合（パイプがない、または正常終了したが結果を使えない）は、同じフィールドで `isolated run refused after start` が記録されます。失敗した保護作業 1 件につき、この 3 種類のうち 1 行だけが記録されます。リクエストの内容、パス、社員ラベル以外の識別子は記録しません。利用者に表示されるメッセージは変わりません。
+
+```sh
+sudo journalctl -u duduclaw-gateway.service --no-pager | grep -E 'isolated run (not started|refused)'
+```
+
+| `site` のグループ | ラベル | 確認すること |
+| --- | --- | --- |
+| 事前チェック（権限はまだ使われていない） | `preflight.model`、`preflight.runtime_policy`、`preflight.model_policy`、`preflight.redaction`、`preflight.interceptor`、`authorize.agent_dir_missing`、`authorize.effort`、`authorize.utility_call`、`authorize.work_dir_override`、`authorize.agent_dir`、`authorize.capabilities_policy`、`authorize.native_gate`、`authorize.runtime_kind`、`authorize.explore_lane`、`authorize.tool_restrictions`、`authorize.codex_home`、`authorize.product_policy`、`authorize.interceptor`、`authorize.runtime_id`、`authorize.max_turns`、`step_limit.agent_dir`、`step_limit.unavailable` | 社員の `agent.toml`（`[model] effort`、`[capabilities]`）、ランタイムとモデルの製品ポリシー、マスキングと CCR の設定。 |
+| 認可（1 回限りの実行権限） | `authorization.ingress.*`（依頼した人：`no_scope`、`consumed`、`capture.*`（メッセージ受信時のサインイン確認：`no_web_credential`、`web_identity`、`channel_conflict`、`channel_mapping`、`requester`、`user_db`、`user_inactive`、`epoch`、`blocking`）、`agent_path`、`home_mismatch`、`no_turn`、`no_session`、`no_attended_proof`、`attended_proof_invalid`、`nested_dispatch`、`principal_mismatch`、`proof_expired`、`identity_recheck`、`blocking`）、`authorization.issue.*`（権限の発行：`boot_owner`、`product_authority`、`lifecycle`、`snapshot`、`epoch`、`principal`、`binding`、`policy_revision`、`tools`、`human`、`selectors`、`capability`、`users_recheck`、`policy_changed`、`lifecycle_recheck`、`snapshot_recheck`、`facts_recheck`）、および `authorization.consumed`、`authorization.installed_mismatch`、`authorization.agent_label`、`authorization.home`、`authorization.principal_context`、`authorization.background_issue`、`authorization.ingress_issue` | その人のアカウントが有効で、パスワード変更が不要で、この社員に作業を割り当てられること。サインインが有効なこと。社員の所属（共有の組織または個人の所有者）と割り当ての状態。 |
+| 実行計画 | `request.encode`、`plan.readiness`、`plan.boot_owner`、`plan.home_mismatch`、`plan.employee_unconfirmed`、`plan.root_publication`、`plan.blocking`、`plan.unavailable` | 準備完了の状態。社員が確認済みであること。root の公開設定がこの社員にこのランタイムを提供していること。 |
+| 起動準備 | `launch.readiness`、`launch.boot_owner`、`launch.boundary_unhealthy`、`launch.employee_unconfirmed`、`launch.employee_mismatch`、`launch.product_prepare`、`launch.binding`、`launch.blocking`、`launch.resolver`、`launch.connectors`、`launch.worker_plans`、`launch.factories`、`launch.dispatcher`、`launch.protected_launch`、`launch.authority_pairing` | この社員の保護されたツール境界（ツールの投影、コネクター）。 |
+| 実行開始の依頼 | `spawn.prepare`、`spawn.not_protected`、`spawn.admission`、`spawn.backend.unavailable`、`.denied`、`.would_deadlock`、`.not_found`、`.timeout`、`.io`、`.protocol`、`spawn.start.permission_denied`、`.not_found`、`.timed_out`、`.other` | `spawn.backend.*` は隔離サービス（またはその制御ソケット）が拒否したときの固定分類です。隔離サービスは開始の拒否をログに残さないため、`duduclaw-spawnd` のジャーナルに何もなくても、このグループは除外できません。 |
+| 開始後（`isolated run refused after start`） | `run.stdin_missing`、`run.stdout_missing`、`run.stderr_missing`、`run.input`、`run.output_drain`、`run.stderr_drain`、`run.wait`、`run.refused`、`output.parse`、`output.empty`、`output.utf8` | ランタイムの結果。`isolated run refused` の行がすでにある場合は追加で記録しません。 |
+| `unlabelled` | — | ラベルのない拒否。不具合なので報告してください。 |
+
+保護モードでは、拒否された作業の原因を文面から判定できない場合、末尾の理由コードは `unknown` ではなく `safety_gate` になります。
+
 ## 更新とアンインストール
 
 独立した更新サービスはまだインストールできません（今後のバージョンで提供予定）。現在のホストは上記の単一実行ファイルの節に従って更新してください。移行と更新サービスの完全な準備後、Admin はダッシュボードで安定版を要求するか、インストール済み CLI を使います。
