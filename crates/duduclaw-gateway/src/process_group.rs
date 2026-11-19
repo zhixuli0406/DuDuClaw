@@ -101,7 +101,10 @@ pub(crate) async fn drain_bounded<R: tokio::io::AsyncRead + Unpin>(
     tail: bool,
 ) -> std::io::Result<bool> {
     use tokio::io::AsyncReadExt;
-    let mut buffer = [0u8; 8192];
+    // Heap, not `[u8; 8192]`: the buffer is held across `.await`, so an array
+    // would make every future embedding this drain (two per protected run)
+    // 8 KiB larger, and a debug poll frame copies such futures by value.
+    let mut buffer = vec![0u8; 8192];
     let mut truncated = false;
     loop {
         let count = reader.read(&mut buffer).await?;

@@ -1994,3 +1994,30 @@ mod product_policy_tests {
         }
     }
 }
+
+/// Stack bound of the protected API turn (same bound and rationale as
+/// `isolation_mcp::runtime::tests::PROTECTED_FUTURE_BOUND`): constructed,
+/// never polled, the turn's futures stay small because the run lives on the
+/// heap behind `observed` and the boxed plan/collect steps.
+#[cfg(all(test, target_os = "linux"))]
+mod protected_future_size_tests {
+    const BOUND: usize = 16 * 1024;
+
+    #[test]
+    fn the_protected_api_turn_future_has_a_bounded_size() {
+        let context = crate::runtime::RuntimeContext { agent_dir: Some("/trusted-home/agents/alice".into()),
+            system_prompt: "system".into(), model: "model".into(), max_tokens: 100,
+            home_dir: "/trusted-home".into(), agent_id: "alice".into(), preferred_provider: None,
+            conversation_history: vec![], capabilities: None, account_pool: vec![], effort: None,
+            allow_cross_family_failover: true };
+        let runtime = super::OpenAiCompatRuntime::new();
+        let future = runtime.execute_protected("prompt", &context);
+        let size = std::mem::size_of_val(&future);
+        assert!(size <= BOUND, "execute_protected: {size} bytes > {BOUND}");
+        drop(future);
+        let future = super::OpenAiCompatRuntime::protected_turn("prompt", &context);
+        let size = std::mem::size_of_val(&future);
+        assert!(size <= BOUND, "protected_turn: {size} bytes > {BOUND}");
+        drop(future);
+    }
+}

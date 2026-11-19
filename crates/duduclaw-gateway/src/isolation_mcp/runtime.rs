@@ -1,6 +1,6 @@
 //! One-shot host authorization and protected main-run execution contexts.
 //! Ingress must supply authenticated authority; absence is never background.
-use std::{future::Future, sync::{Arc, Mutex}, time::Duration};
+use std::{future::Future, pin::Pin, sync::{Arc, Mutex}, time::Duration};
 use duduclaw_isolation::{execution::{ExecutionClass, RuntimeKind, WaitOrigin}, ids::EmployeeId};
 use duduclaw_mcp_boundary::{GrantPolicy, resources::ResourceRoots};
 
@@ -46,7 +46,16 @@ tokio::task_local! { static AUTHORIZATION: Mutex<Option<RuntimeAuthorization>>; 
 
 /// Only authenticated host ingress/dispatch may call this. It has no serde,
 /// environment or RPC constructor. One scope permits one launch, never retries.
-pub async fn with_runtime_authorization<F: Future>(authorization: RuntimeAuthorization, future: F) -> F::Output {
+///
+/// Stack bound: the wrapped future is moved to the heap here, at the call, so
+/// the returned future (and every parent state machine and debug poll frame
+/// holding it) carries a pointer, never a copy of the protected run.
+pub fn with_runtime_authorization<F: Future>(authorization: RuntimeAuthorization, future: F)
+    -> impl Future<Output = F::Output> {
+    authorization_scope(authorization, Box::pin(future))
+}
+
+async fn authorization_scope<F: Future>(authorization: RuntimeAuthorization, future: Pin<Box<F>>) -> F::Output {
     // Nested helpers cannot replace the initiating host's identity or revive a
     // consumed authorization. The outer scope remains the sole authority.
     if AUTHORIZATION.try_with(|_| ()).is_ok() { return future.await; }
@@ -118,7 +127,19 @@ pub(crate) fn keep(site: RefusalSite) -> impl FnOnce(String) -> String {
 /// Re-entrant: under an outer `observed` scope (same task) an inner one is
 /// part of the outer turn — it neither opens a new trace nor logs; the outer
 /// scope keeps the one trace and writes the one line.
-pub(crate) async fn observed<T, F>(runtime: &'static str, agent: &str, future: F) -> Result<T, String>
+///
+/// Stack bound: the turn's future is moved to the heap here, at the call. A
+/// by-value wrapper would embed it about three times (argument, scope, inner
+/// await) and every nesting level would multiply that again; in debug builds
+/// each embedding is also a stack temporary of the poll frame. The returned
+/// future holds a pointer, so its size does not depend on the turn.
+pub(crate) fn observed<T, F>(runtime: &'static str, agent: &str, future: F)
+    -> impl Future<Output = Result<T, String>>
+where F: Future<Output = Result<T, String>> {
+    observed_boxed(runtime, agent, Box::pin(future))
+}
+
+async fn observed_boxed<T, F>(runtime: &'static str, agent: &str, future: Pin<Box<F>>) -> Result<T, String>
 where F: Future<Output = Result<T, String>> {
     if TRACE.try_with(|_| ()).is_ok() { return future.await; }
     let (result, trace) = TRACE.scope(std::cell::Cell::new(Trace::default()), async move {
@@ -216,15 +237,17 @@ fn take_authorization(agent_dir: &std::path::Path) -> Result<RuntimeAuthorizatio
 /// the returned principal context until the run has finished.
 async fn take_or_issue_current(agent_dir: &std::path::Path)
     -> Result<(RuntimeAuthorization, Option<crate::on_behalf_of::context::ContextGuard>), String> {
+    // Stack bound: the issuers (closures capturing their whole turn metadata)
+    // live on the heap; this future holds a pointer.
     #[cfg(test)]
     if let Ok(fake) = FAKE_ORIGIN.try_with(Arc::clone) {
-        return take_or_issue_with(agent_dir, || fake.has_background(),
+        return Box::pin(take_or_issue_with(agent_dir, || fake.has_background(),
             |context| std::future::ready(fake.issue("background", agent_dir, context)),
-            |context| std::future::ready(fake.issue("ingress", agent_dir, context))).await;
+            |context| std::future::ready(fake.issue("ingress", agent_dir, context)))).await;
     }
-    take_or_issue_with(agent_dir, crate::isolation_background::has_scope,
+    Box::pin(take_or_issue_with(agent_dir, crate::isolation_background::has_scope,
         |context| crate::isolation_background::authorize_current(agent_dir, context),
-        |context| super::ingress::authorize_current(agent_dir, context)).await
+        |context| super::ingress::authorize_current(agent_dir, context))).await
 }
 
 /// The rule itself, over the two issuers (production: the live background
@@ -265,7 +288,7 @@ tokio::task_local! { static FAKE_ORIGIN: Arc<tests::FakeOrigin>; }
 async fn claude_max_turns(agent_dir: &std::path::Path, desired: u64) -> Result<u16, String> {
     let agent = agent_dir.file_name().and_then(|name| name.to_str()).ok_or_else(|| refuse!("step_limit.agent_dir"))?;
     let home = agent_dir.parent().and_then(|path| path.parent()).ok_or_else(|| refuse!("step_limit.agent_dir"))?;
-    super::boot::claude_max_turns(home.to_path_buf(), agent.to_owned(), desired).await
+    Box::pin(super::boot::claude_max_turns(home.to_path_buf(), agent.to_owned(), desired)).await
         .map_err(|_| refuse!("step_limit.unavailable"))
 }
 
@@ -314,10 +337,10 @@ async fn spawn_claude_inner(agent_dir: &std::path::Path, prompt: &str, system_pr
     let max_turns = u16::try_from(max_turns).map_err(|_| refuse!("authorize.max_turns"))?;
     let (authorization, principal_context) = take_or_issue_current(agent_dir).await?;
     let class = crate::process_group::execution_class(ExecutionClass::EmployeeMain);
-    let plan = super::boot::claude_plan(authorization.home.clone(), authorization.agent.clone(), class,
-        prompt.as_bytes().to_vec(), system_prompt.as_bytes().to_vec(), model.into(), max_turns).await
+    let plan = Box::pin(super::boot::claude_plan(authorization.home.clone(), authorization.agent.clone(), class,
+        prompt.as_bytes().to_vec(), system_prompt.as_bytes().to_vec(), model.into(), max_turns)).await
         .map_err(|_| refuse!("plan.unavailable"))?;
-    spawn_plan(authorization, plan, class, RuntimeKind::Claude, prompt.as_bytes().to_vec(), principal_context).await
+    Box::pin(spawn_plan(authorization, plan, class, RuntimeKind::Claude, prompt.as_bytes().to_vec(), principal_context)).await
 }
 
 async fn spawn_plan(authorization: RuntimeAuthorization, plan: duduclaw_isolation::execution::SpawnPolicy,
@@ -325,18 +348,19 @@ async fn spawn_plan(authorization: RuntimeAuthorization, plan: duduclaw_isolatio
     principal_context: Option<crate::on_behalf_of::context::ContextGuard>)
     -> Result<(crate::process_group::BackendChild, PromptWriter), String> {
     // `prepare_launch` records its own finer `launch.*` site first.
-    let launch = super::prepare_launch(super::LaunchInput { agent: authorization.agent, plan,
+    // Stack bound: the launch, admission and spawn futures are boxed.
+    let launch = Box::pin(super::prepare_launch(super::LaunchInput { agent: authorization.agent, plan,
         grant: authorization.grant, roots: authorization.roots, origin: authorization.origin,
-        caller: authorization.caller, turn: authorization.turn, authenticated_epoch: authorization.authenticated_epoch })
+        caller: authorization.caller, turn: authorization.turn, authenticated_epoch: authorization.authenticated_epoch }))
         .await.map_err(|_| refuse!("spawn.prepare"))?;
     // This builder is only an adapter marker. A cannot execute it locally: the
     // protected latch is required and the root publication selects the binary.
     if !duduclaw_core::execution_gate::isolation_required() { return Err(refuse!("spawn.not_protected")); }
     let mut marker = tokio::process::Command::new("root-selected-runtime");
-    let admission = crate::autonomous_runtime::admit_current().await.map_err(keep!("spawn.admission"))?;
-    let mut child = duduclaw_execution::command::with_context(launch,
+    let admission = Box::pin(crate::autonomous_runtime::admit_current()).await.map_err(keep!("spawn.admission"))?;
+    let mut child = Box::pin(duduclaw_execution::command::with_context(launch,
         duduclaw_execution::command::with_runtime(runtime,
-            crate::process_group::BackendChild::spawn_class(&mut marker, class))).await
+            crate::process_group::BackendChild::spawn_class(&mut marker, class)))).await
         .map_err(|error| refuse(spawn_site(&error)))?;
     // R8x: from here on the run exists (spawnd accepted StartRun).
     record(|trace| trace.started = true);
@@ -405,10 +429,10 @@ async fn execute_registered_cli_inner(id: &str, prompt: &str, context: &crate::r
         "prompt": prompt, "max_tokens": context.max_tokens,
     })).map_err(|_| refuse!("request.encode"))?;
     let class = crate::process_group::execution_class(ExecutionClass::EmployeeMain);
-    let plan = super::boot::other_runtime_plan(authorization.home.clone(), authorization.agent.clone(),
-        class, runtime.clone(), bytes.clone()).await.map_err(|_| refuse!("plan.unavailable"))?;
+    let plan = Box::pin(super::boot::other_runtime_plan(authorization.home.clone(), authorization.agent.clone(),
+        class, runtime.clone(), bytes.clone())).await.map_err(|_| refuse!("plan.unavailable"))?;
     let deadline = Duration::from_secs(crate::runtime_config::call_timeout_secs(Some(agent_dir)));
-    let out = collect_plan(authorization, plan, class, runtime, bytes, deadline, false).await?;
+    let out = Box::pin(collect_plan(authorization, plan, class, runtime, bytes, deadline, false)).await?;
     let stdout = std::str::from_utf8(&out).map_err(|_| refuse!("output.utf8"))?;
     let content = crate::runtime::generic_cli::parse_output(stdout, format).ok_or_else(|| refuse!("output.parse"))?;
     Ok(crate::runtime::RuntimeResponse { partial_timeout_secs: None,
@@ -428,19 +452,20 @@ async fn collect_plan(authorization: RuntimeAuthorization, plan: duduclaw_isolat
     use super::refusal::RunExit;
     let agent = authorization.agent.clone();
     let label = super::refusal::runtime_label(&runtime);
-    let (mut child, mut writer) = spawn_plan(authorization, plan, class, runtime, bytes, None).await?;
+    let (mut child, mut writer) = Box::pin(spawn_plan(authorization, plan, class, runtime, bytes, None)).await?;
     let mut stdout = child.child().stdout.take().ok_or_else(|| refuse!("run.stdout_missing"))?;
     let mut stderr = child.child().stderr.take().ok_or_else(|| refuse!("run.stderr_missing"))?;
     let mut out = Vec::new();
     let mut err = Vec::new();
-    let result = tokio::time::timeout(deadline, async {
+    // Stack bound: the joined drains live on the heap.
+    let result = Box::pin(tokio::time::timeout(deadline, async {
         tokio::try_join!(writer.finish(),
             async { crate::process_group::drain_bounded(&mut stdout, &mut out, 8 * 1024 * 1024, false)
                 .await.map_err(|_| refuse!("run.output_drain")) },
             async { crate::process_group::drain_bounded(&mut stderr, &mut err, 64 * 1024, true)
                 .await.map_err(|_| refuse!("run.stderr_drain")) },
             async { child.child().wait().await.map_err(|_| refuse!("run.wait")) })
-    }).await;
+    })).await;
     let exit = match &result {
         Ok(Ok(((), false, _, status))) if status.success() => None,
         Ok(Ok((_, _, _, status))) => Some(RunExit::from_status(*status)),
@@ -514,30 +539,33 @@ async fn execute_native_inner(runtime: RuntimeKind, prompt: String, context: &cr
     let bytes = duduclaw_api_worker::native::Request { protocol: protocol.into(), model: context.model.clone(), prompt }
         .encode().map_err(|_| refuse!("request.encode"))?;
     let class = crate::process_group::execution_class(ExecutionClass::EmployeeMain);
-    let plan = super::boot::other_runtime_plan(authorization.home.clone(), authorization.agent.clone(),
-        class, runtime.clone(), bytes.clone()).await.map_err(|_| refuse!("plan.unavailable"))?;
+    let plan = Box::pin(super::boot::other_runtime_plan(authorization.home.clone(), authorization.agent.clone(),
+        class, runtime.clone(), bytes.clone())).await.map_err(|_| refuse!("plan.unavailable"))?;
     let deadline = Duration::from_secs(crate::runtime_config::call_timeout_secs(Some(agent_dir)));
-    if runtime != RuntimeKind::Grok { return collect_plan(authorization, plan, class, runtime, bytes, deadline, false).await; }
-    collect_native_pty(authorization, plan, class, deadline).await
+    if runtime != RuntimeKind::Grok {
+        return Box::pin(collect_plan(authorization, plan, class, runtime, bytes, deadline, false)).await;
+    }
+    Box::pin(collect_native_pty(authorization, plan, class, deadline)).await
 }
 
 async fn collect_native_pty(authorization: RuntimeAuthorization, plan: duduclaw_isolation::execution::SpawnPolicy,
     class: ExecutionClass, deadline: Duration) -> Result<Vec<u8>, String> {
     // R8t: for the `isolated run refused` log line only (PTY: no separate stderr).
     let agent = authorization.agent.clone();
-    let launch = super::prepare_launch(super::LaunchInput { agent: authorization.agent, plan,
+    // Stack bound: the launch, admission, spawn and drain futures are boxed.
+    let launch = Box::pin(super::prepare_launch(super::LaunchInput { agent: authorization.agent, plan,
         grant: authorization.grant, roots: authorization.roots, origin: authorization.origin,
-        caller: authorization.caller, turn: authorization.turn, authenticated_epoch: authorization.authenticated_epoch })
+        caller: authorization.caller, turn: authorization.turn, authenticated_epoch: authorization.authenticated_epoch }))
         .await.map_err(|_| refuse!("spawn.prepare"))?;
     if !duduclaw_core::execution_gate::isolation_required() { return Err(refuse!("spawn.not_protected")); }
     let marker = portable_pty::CommandBuilder::new("root-selected-runtime");
-    let admission = crate::autonomous_runtime::admit_current().await.map_err(keep!("spawn.admission"))?;
+    let admission = Box::pin(crate::autonomous_runtime::admit_current()).await.map_err(keep!("spawn.admission"))?;
     // I1e supplies protected PTY delivery and resize through this existing A API.
     // Never create a host PTY or retry this one-shot authorization locally.
-    let mut child = duduclaw_execution::command::with_context(launch,
+    let mut child = Box::pin(duduclaw_execution::command::with_context(launch,
         duduclaw_execution::command::with_runtime(RuntimeKind::Grok,
             duduclaw_execution::command::spawn_pty(marker,
-                duduclaw_isolation::execution::PtySize { rows: 40, columns: 120 }, class, true)))
+                duduclaw_isolation::execution::PtySize { rows: 40, columns: 120 }, class, true))))
         .await.map_err(|error| refuse(spawn_site(&error)))?;
     // R8x: from here on the run exists.
     record(|trace| trace.started = true);
@@ -548,11 +576,11 @@ async fn collect_native_pty(authorization: RuntimeAuthorization, plan: duduclaw_
     drop(child.input.take());
     let mut stdout = child.output.take().ok_or_else(|| refuse!("run.stdout_missing"))?;
     let mut out = Vec::new();
-    let result = tokio::time::timeout(deadline, async {
+    let result = Box::pin(tokio::time::timeout(deadline, async {
         tokio::try_join!(async { crate::process_group::drain_bounded(&mut stdout, &mut out,
             8 * 1024 * 1024, false).await.map_err(|_| refuse!("run.output_drain")) },
             async { child.wait().await.map_err(|_| refuse!("run.wait")) })
-    }).await;
+    })).await;
     use super::refusal::RunExit;
     let exit = match &result {
         Ok(Ok((false, status))) if status.success() => return Ok(out),
@@ -585,12 +613,12 @@ pub(crate) async fn execute_api_worker(authorization: RuntimeAuthorization,
     let bytes = request.encode().map_err(|_| refuse!("request.encode"))?;
     let class = crate::process_group::execution_class(ExecutionClass::EmployeeMain);
     // `other_runtime_plan` records its own finer `plan.*` site first.
-    let plan = super::boot::other_runtime_plan(authorization.home.clone(), authorization.agent.clone(),
-        class, RuntimeKind::OpenAiCompat, bytes.clone()).await.map_err(|_| refuse!("plan.unavailable"))?;
+    let plan = Box::pin(super::boot::other_runtime_plan(authorization.home.clone(), authorization.agent.clone(),
+        class, RuntimeKind::OpenAiCompat, bytes.clone())).await.map_err(|_| refuse!("plan.unavailable"))?;
     // R8t: a refusal names the worker's fixed reason in the log and selects
     // the class message (still spawn-gate prefixed: no rotation/fallback).
-    let out = collect_plan(authorization, plan, class, RuntimeKind::OpenAiCompat, bytes,
-        Duration::from_secs(request.timeout_secs), true).await?;
+    let out = Box::pin(collect_plan(authorization, plan, class, RuntimeKind::OpenAiCompat, bytes,
+        Duration::from_secs(request.timeout_secs), true)).await?;
     let response: duduclaw_api_worker::Response = serde_json::from_slice(&out).map_err(|_| refuse!("output.parse"))?;
     if response.content.trim().is_empty() { return Err(refuse!("output.empty")); }
     Ok(crate::runtime::RuntimeResponse { partial_timeout_secs: None, content: response.content,
@@ -855,6 +883,84 @@ pub(super) mod tests {
             assert!(guard.is_none());
         })).await;
         assert!(fake.calls().is_empty());
+    }
+
+    // ── Stack bound of protected turns ─────────────────────────────────
+
+    /// The largest future a protected turn may hand its caller (and a tokio
+    /// worker may poll on its 2 MiB stack). Regression guard for the stack
+    /// overflow of `every_protected_path_uses_an_installed_authorization_without_issuing`:
+    /// `observed` and `with_runtime_authorization` used to embed the whole
+    /// protected run by value (about three copies per layer, and in debug
+    /// builds one more stack temporary per copy in each poll frame), with two
+    /// 8 KiB drain buffers at the bottom. Now the run lives on the heap behind
+    /// those boundaries. Expected by reasoning (64-bit): the wrappers and the
+    /// entry futures are a few hundred bytes to ~3 KiB (the largest hold one
+    /// or two `RuntimeAuthorization` values or the started Claude child); the
+    /// bound has ≥ 5× headroom and the pre-fix native/CLI entries exceed it.
+    /// It is a size check, independent of any stack size setting.
+    const PROTECTED_FUTURE_BOUND: usize = 16 * 1024;
+
+    /// Measures a constructed, never polled, future.
+    fn assert_bounded<F: Future>(name: &str, future: F) {
+        let size = std::mem::size_of_val(&future);
+        assert!(size <= PROTECTED_FUTURE_BOUND, "{name}: {size} bytes > {PROTECTED_FUTURE_BOUND}");
+        drop(future);
+    }
+
+    #[tokio::test]
+    async fn protected_entry_futures_have_a_bounded_size() {
+        let (_temp, home) = live_home();
+        let ctx = live_context(&home);
+        let dir = home.join("agents").join("alice");
+        assert_bounded("execute_native(codex)", execute_native(RuntimeKind::Codex, "prompt".into(), &ctx));
+        assert_bounded("execute_native(grok)", execute_native(RuntimeKind::Grok, "prompt".into(), &ctx));
+        assert_bounded("execute_registered_cli", execute_registered_cli("qwen", "prompt", &ctx,
+            duduclaw_core::runtime_catalog::OutputFormat::Text));
+        assert_bounded("start_claude", start_claude(&dir, 50, "input", |_| String::new(), "model"));
+        assert_bounded("spawn_claude", spawn_claude(&dir, "input", "system", "model", 50));
+        assert_bounded("authorize_api", authorize_api(&ctx));
+        assert_bounded("take_or_issue_current", take_or_issue_current(&dir));
+        let request = duduclaw_api_worker::Request { protocol: duduclaw_api_worker::PROTOCOL.into(), provider: None,
+            model: "model".into(), messages: vec![], max_tokens: 100, timeout_secs: 1 };
+        assert_bounded("execute_api_worker", execute_api_worker(authorization_at(&home, "alice", 1), request, &ctx));
+        // The inner halves, through the observed boundary.
+        assert_bounded("observed(execute_native_inner)", observed("codex", "alice",
+            execute_native_inner(RuntimeKind::Codex, "prompt".into(), &ctx)));
+        assert_bounded("observed(execute_registered_cli_inner)", observed(REGISTERED_LABEL, "alice",
+            execute_registered_cli_inner("qwen", "prompt", &ctx, duduclaw_core::runtime_catalog::OutputFormat::Text)));
+        assert_bounded("observed(spawn_claude_inner)", observed("claude", "alice",
+            spawn_claude_inner(&dir, "input", "system", "model", 50)));
+        for path in protected_paths() {
+            assert_bounded(path, run_path(path, &ctx, 50));
+            assert_bounded(path, with_runtime_authorization(authorization_at(&home, "alice", 1), run_path(path, &ctx, 50)));
+            // Exactly the shape the installed-authorization test polls.
+            assert_bounded(path, FAKE_ORIGIN.scope(FakeOrigin::both(&home),
+                with_runtime_authorization(authorization_at(&home, "alice", 1), async {
+                    let result = with_runtime_authorization(authorization_at(&home, "alice", 99),
+                        run_path(path, &ctx, 50)).await;
+                    let _ = result;
+                    let _ = run_path(path, &ctx, 50).await;
+                })));
+        }
+    }
+
+    /// The two scope boundaries do not grow with what they wrap: a 64 KiB
+    /// future inside either (or both, nested) still yields a small future.
+    #[tokio::test]
+    async fn scope_boundaries_hold_the_wrapped_future_on_the_heap() {
+        async fn large() -> Result<(), String> {
+            let buffer = [7u8; 64 * 1024];
+            tokio::task::yield_now().await;
+            if buffer[0] == 7 { Err(String::new()) } else { Ok(()) }
+        }
+        assert!(std::mem::size_of_val(&large()) >= 64 * 1024, "the probe future is large");
+        assert_bounded("observed(large)", observed("codex", "alice", large()));
+        assert_bounded("with_runtime_authorization(large)", with_runtime_authorization(authorization("alice"), large()));
+        assert_bounded("nested", with_runtime_authorization(authorization("alice"), async {
+            let _ = observed("codex", "alice", async { observed("codex", "alice", large()).await }).await;
+            with_runtime_authorization(authorization("bob"), large()).await
+        }));
     }
 
     /// Each path's coarse gate (Claude: step limit outside the wire range;
