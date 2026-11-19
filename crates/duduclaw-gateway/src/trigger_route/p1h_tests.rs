@@ -212,5 +212,5 @@ fn p1h_runtime_refuses_a_non_owner_foreground_turn() {
     assert!(boot.contains("personal_facts(agent, owner.as_str(), principal, current)"));
     let ingress = include_str!("../isolation_mcp/ingress.rs");
     assert!(ingress.contains("RequesterIdentity::ChannelUser { channel, sender, user_id: Some(user), .. }"));
-    assert!(ingress.contains("_ => return Err(VerificationError::Invalid)"));
+    assert!(ingress.contains("_ => return Err(site!(\"authorization.ingress.capture.requester\"))"));
 }
