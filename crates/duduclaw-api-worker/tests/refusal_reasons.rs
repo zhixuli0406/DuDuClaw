@@ -5,7 +5,7 @@
 //!
 //! Recognised error-producing forms (whitespace between tokens is free):
 //!   `Err("…")`, `.map_err(|_| "…")`, `.ok_or("…")`, `.ok_or_else(|| "…")`.
-//! Every other use of `Err(`, `map_err(`, `ok_or(` or `ok_or_else(` outside
+//! Every other call to `Err`, `map_err`, `ok_or` or `ok_or_else` outside
 //! comments and string literals (e.g. `Err(reason)`, `.map_err(|e| …)`,
 //! `.ok_or(CONST)`) FAILS the test as an unrecognised form: extend the
 //! scanner and the list instead of silently skipping it. Raw string literals
@@ -86,30 +86,41 @@ fn lex(source: &str) -> Result<(String, Vec<String>), String> {
     Ok((skeleton, literals))
 }
 
-/// `(head, closure)`: after `head` (and `closure`, when not empty) the only
+/// `(head, closure)`: after `head`, `(` (and `closure`, when not empty) the only
 /// accepted argument is one string literal followed by `)`.
-const FORMS: &[(&str, &str)] = &[("Err(", ""), ("map_err(", "|_|"), ("ok_or(", ""), ("ok_or_else(", "||")];
+const FORMS: &[(&str, &str)] = &[("Err", ""), ("map_err", "|_|"), ("ok_or", ""), ("ok_or_else", "||")];
 
 /// Every error literal produced by a recognised form; any other use of a
 /// form head is an error naming the file and line.
 fn error_literals(name: &str, source: &str) -> Result<Vec<String>, String> {
     let (skeleton, literals) = lex(source)?;
-    let mut found = Vec::new();
-    for (head, closure) in FORMS {
-        for (position, _) in skeleton.match_indices(head) {
-            if skeleton[..position].chars().next_back().is_some_and(|c| c.is_alphanumeric() || c == '_') { continue; }
-            let line = skeleton[..position].matches('\n').count() + 1;
-            let unrecognised = || format!("{name}:{line} (approximate): unrecognised error-producing form `{head}…`");
-            let rest = skeleton[position + head.len()..].trim_start();
-            let rest = rest.strip_prefix(closure).ok_or_else(unrecognised)?.trim_start();
-            let rest = rest.strip_prefix("\"@").ok_or_else(unrecognised)?;
-            let digits = rest.find('"').ok_or_else(unrecognised)?;
-            let index: usize = rest[..digits].parse().map_err(|_| unrecognised())?;
-            if !rest[digits + 1..].trim_start().starts_with(')') { return Err(unrecognised()); }
-            found.push(literals.get(index).ok_or_else(unrecognised)?.clone());
+    // Keep the existing form-grouped result order while walking whole identifiers.
+    let mut found = vec![Vec::new(); FORMS.len()];
+    let mut chars = skeleton.char_indices().peekable();
+    while let Some((position, c)) = chars.next() {
+        if !c.is_alphanumeric() && c != '_' { continue; }
+        let mut end = position + c.len_utf8();
+        while let Some(&(offset, c)) = chars.peek() {
+            if !c.is_alphanumeric() && c != '_' { break; }
+            end = offset + c.len_utf8();
+            chars.next();
         }
+        let identifier = &skeleton[position..end];
+        let Some(form) = FORMS.iter().position(|(head, _)| *head == identifier) else { continue; };
+        let (head, closure) = FORMS[form];
+        // Comments have already become whitespace in lex(). A bare identifier
+        // without a following opening parenthesis is not an error form.
+        let Some(rest) = skeleton[end..].trim_start().strip_prefix('(') else { continue; };
+        let line = skeleton[..position].matches('\n').count() + 1;
+        let unrecognised = || format!("{name}:{line} (approximate): unrecognised error-producing form `{head}(…`");
+        let rest = rest.trim_start().strip_prefix(closure).ok_or_else(unrecognised)?.trim_start();
+        let rest = rest.strip_prefix("\"@").ok_or_else(unrecognised)?;
+        let digits = rest.find('"').ok_or_else(unrecognised)?;
+        let index: usize = rest[..digits].parse().map_err(|_| unrecognised())?;
+        if !rest[digits + 1..].trim_start().starts_with(')') { return Err(unrecognised()); }
+        found[form].push(literals.get(index).ok_or_else(unrecognised)?.clone());
     }
-    Ok(found)
+    Ok(found.into_iter().flatten().collect())
 }
 
 #[test]
@@ -157,4 +168,28 @@ fn scanner_refuses_unrecognised_error_forms() {
     let good = "// Err(ignored)\n/* ok_or(x) */ let s = \"Err(x)\"; let c = '\"'; fn f<'a>() { \
         x.map_err(|_| \"one\")?.ok_or( \"two\" )?; return Err(\"three\"); y.ok_or_else(|| \"four\"); z.is_err(); }";
     assert_eq!(error_literals("snippet", good).unwrap(), ["three", "one", "two", "four"]);
+}
+
+#[test]
+fn scanner_collects_error_literals_across_whitespace_and_comments() {
+    for source in ["return Err (\"x\")", "Err\n(\n\"x\"\n)",
+        ".map_err /* c */ (|_| \"x\")", ".ok_or_else  (|| \"x\")", ".ok_or (\"x\")"] {
+        assert_eq!(error_literals("snippet", source).unwrap(), ["x"], "{source}");
+    }
+}
+
+#[test]
+fn scanner_refuses_unrecognised_error_forms_across_whitespace() {
+    for source in ["Err (format!(\"…\"))", ".map_err (|e| e.to_string())",
+        "match value { Err (_) => () }", "if let Err (e) = value {}"] {
+        let error = error_literals("snippet", source).unwrap_err();
+        assert!(error.contains("unrecognised error-producing form"), "{source}: {error}");
+    }
+}
+
+#[test]
+fn scanner_ignores_other_identifiers_and_non_call_uses() {
+    let source = "MyErr(\"x\"); map_err_with(\"x\"); ok_or_else_with(\"x\"); \
+        my_ok_or(\"x\"); let constructor = Err; use Result::Err;";
+    assert!(error_literals("snippet", source).unwrap().is_empty());
 }
