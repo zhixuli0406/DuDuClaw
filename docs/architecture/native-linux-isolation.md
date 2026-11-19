@@ -511,8 +511,9 @@ prints the structured report, and exits nonzero when unavailable/stale.
 The report has no secrets, command lines, host process IDs or free-form errors.
 It contains the primary `Readiness` booleans, secondary BPF status, observed host
 PTY budget and timestamps. Evidence is dated at probe **start**, with a maximum
-one-second report lifetime; scanner evidence must be less than one second old at
-publication. Expired/missing evidence denies. Slow probes can therefore keep a
+one-second report lifetime; scanner evidence (dated at its scan's start) must be
+younger than two scan periods (2 s: one period plus one scan's duration, R8w) at
+publication, the same rule admission applies. Expired/missing evidence denies. Slow probes can therefore keep a
 large installation unavailable; no performance acceptance has been claimed.
 Production ReserveRun/policy selection uses the same verified in-process view,
 not an extra per-request slow-probe RPC. Start performs fresh host/UID/storage
@@ -599,8 +600,11 @@ and [execution properties](https://raw.githubusercontent.com/systemd/systemd/v24
 source inspection does not substitute for the native tests above.
 
 The fixed account utility paths follow the [Debian passwd file list](https://packages.debian.org/bookworm/amd64/passwd/filelist)
-(`/usr/bin/chage`); scheduler inspection uses [at -l](https://manpages.debian.org/bookworm/at/at.1.en.html)
-instead of executing the atq symlink. These paths still require distro acceptance.
+(`/usr/bin/chage`). R8w: at jobs are inspected by reading the at spool directly as root
+(`/var/spool/cron/atjobs` and `/var/spool/cron/atspool` on Debian/Ubuntu, `/var/spool/at` and
+`/var/spool/at/spool` on RHEL/Fedora: no entry may be owned by the employee uid), never by
+executing `at`, which Debian/Ubuntu ship setuid/setgid `daemon:daemon` (root runs only root-owned
+utilities). These paths still require distro acceptance.
 This page records implementation boundaries; it is not an installation guide or
 evidence that protected execution is enabled.
 

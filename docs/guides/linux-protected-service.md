@@ -237,6 +237,36 @@ sudo journalctl -u duduclaw-gateway.service -u duduclaw-spawnd.service -u duducl
 | Pending review/rotation | Finish supported confirmations, retries and fresh credential setup in Migration review; approval alone does not complete migration. |
 | Update accepted but not committed | Follow the durable request status and readiness error; do not start a concurrent manual binary replacement. |
 
+### Account verification lines in the spawnd journal
+
+When `registry_verified`, `accounts_locked`, `ssh_live_negative_checks`, `cron_at_acl_and_jobs_verified` and `external_iam_reservation_verified` fail together, spawnd's journal names the failing step. Each line is printed once, and again only when the step or account changes:
+
+```text
+duduclaw-spawnd: employee account verification failed: step=<label> account=<duduclaw-emp-NNNNN|->
+duduclaw-spawnd: allocation failed: step=<label>
+```
+
+The first line comes from the host-wide account check. It checks every `duduclaw-emp-*` account in the employee range, including retired (tombstoned) ones. `account=-` means a host-level step. The second line is printed once for each failed employee allocation. A pending SSH probe or the pending-reservation limit is not a failure and is not logged. The label is a fixed identifier: neither line contains file contents or error text. The readiness output and `readiness.json` keep their check names.
+
+| Label | What failed |
+| --- | --- |
+| `login_defs`, `subids` | `/etc/login.defs`, `/etc/subuid` or `/etc/subgid` is unreadable or malformed. |
+| `registry_rows` | The employee registry does not fit the host's uid ranges, or a reservation cannot be resumed. |
+| `nss_modules` | passwd or group uses an NSS module other than `files`/`systemd`. |
+| `enumerate` | `getent passwd`/`group` is unreadable, or has an alias or a foreign entry in the employee range. |
+| `passwd_row`, `shadow_row`, `groups` | The account's passwd row (`/nonexistent`, `/usr/sbin/nologin`), shadow row (`!*`, expired) or group list (its own gid only) is wrong. |
+| `cron_acl`, `at_acl` | `/etc/cron.deny` or `/etc/at.deny` does not deny the account, or an allow file overrides it. |
+| `cron_spool`, `cron_tables` | The account has a user crontab, or a line in `/etc/crontab` or `/etc/cron.d` runs as it (an unreadable or non-root file there also fails). |
+| `at_spool` | An at spool directory (`/var/spool/cron/atjobs`, `/var/spool/cron/atspool`, `/var/spool/at`, `/var/spool/at/spool`) holds an entry owned by the account, or exists but cannot be read. |
+| `linger`, `sessions` | A linger file exists, or `user@<uid>.service` or a logind session of the account is active. |
+| `ssh_config`, `ssh_probe` | `sshd -t`/`sshd -T` does not deny the account or names no port, or the SSH denial probe has no Denied result. |
+| `userdb_service`, `userdb_user`, `userdb_group` | `/run/systemd/userdb` is unreadable, or a userdb user or group record touches the employee namespace. |
+| `local_identity`, `candidate`, `owner_inventory` | Allocation: an identity or alias already exists for the new account, a candidate uid lookup failed, or spawnd's file-owner inventory failed. |
+| `login_barriers`, `create_group`, `create_user`, `lock_user`, `quarantine` | Allocation or recovery: the deny entries or sshd drop-in, groupadd, useradd (or a mail spool it created), the usermod/chage/loginctl lockdown, or stopping the account's processes failed. |
+| `reserve`, `create_account`, `readback`, `unlabelled` | An allocation step failed with no finer label. For example, `reserve` means the employee uid range is exhausted. |
+
+The `at` package may stay installed: spawnd reads its spool as root and never runs `/usr/bin/at`. Do not edit deny files, spools or accounts by hand to clear a line. Fix the cause; the next refresh then prints `evidence complete`. A failed allocation retires its uid permanently and leaves the proposal Failed. After the cause is fixed, retry the failed item's compensation in Migration review. A new proposal then receives the next uid.
+
 Container engines and hardware-dependent features remain unavailable through the protected employee environment. Every required component must pass its own checks before work resumes; neither a successful package test nor this guide is production acceptance.
 
 ## Released v1.80.x single-binary protected service

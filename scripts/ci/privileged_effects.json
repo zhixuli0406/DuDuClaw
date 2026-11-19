@@ -5793,7 +5793,7 @@
       ],
       "identity": "spawn_daemon",
       "migration": "privileged_service",
-      "rationale": "B1 root account authority invokes trusted fixed OS utilities for NSS allocation, SSH/cron/at readback, locked-account setup and session cleanup; bounded argv/output/time and cleared environment. These host prerequisites cannot execute under employee identities."
+      "rationale": "B1 root account authority invokes trusted fixed root-owned OS utilities for NSS allocation, SSH readback, locked-account setup and session cleanup; bounded argv/output/time and cleared environment. These host prerequisites cannot execute under employee identities. R8w: at jobs are read from the spool directly; at is never executed."
     },
     {
       "symbol": "crates/duduclaw-spawnd/src/accounts.rs::tests::iso_root_intruder_is_signalled_through_pidfd",

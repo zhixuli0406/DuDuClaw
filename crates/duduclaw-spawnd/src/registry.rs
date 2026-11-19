@@ -2,6 +2,7 @@
 use std::{collections::BTreeSet, io};
 use serde::{Deserialize, Serialize};
 use duduclaw_isolation::ids::{EmployeeId, UidPolicy, UidRange, EMPLOYEE_UID_MIN, EMPLOYEE_UID_MAX};
+use crate::accounts::{at_step, for_account, Step};
 
 fn invalid() -> io::Error { io::Error::new(io::ErrorKind::InvalidData, "employee registry unavailable") }
 
@@ -104,7 +105,7 @@ impl PendingLimit {
 }
 /// `error` is the [`PendingLimit`] refusal.
 pub fn pending_limit(error: &io::Error) -> bool {
-    error.get_ref().is_some_and(|inner| inner.downcast_ref::<PendingLimit>().is_some())
+    crate::accounts::unstepped(error).get_ref().is_some_and(|inner| inner.downcast_ref::<PendingLimit>().is_some())
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -135,11 +136,17 @@ impl Registry {
     /// `resumable` ([`Allocations`]: an allocation of this process stopped on an
     /// unresolved SSH probe) is not a refusal; its local account is still
     /// checked by `verify_namespace` like every account in the range.
+    /// R8w: every failure carries its step (`crate::accounts::step_of`):
+    /// the host's own (`login_defs`, `nss_modules`, `passwd_row`, …), or
+    /// `registry_rows` for the rows themselves.
     pub fn verify_with(&self, host: &mut dyn AccountHost, resumable: &BTreeSet<EmployeeId>) -> io::Result<()> {
-        self.validate(&host.policy()?)?;
+        let policy = host.policy()?;
+        self.validate(&policy).map_err(at_step(Step::RegistryRows))?;
         host.verify_namespace(self)?;
         for account in &self.employees {
-            if account.state == AccountState::Reserved && !resumable.contains(&account.employee) { return Err(invalid()); }
+            if account.state == AccountState::Reserved && !resumable.contains(&account.employee) {
+                return Err(for_account(account.uid)(at_step(Step::RegistryRows)(invalid())));
+            }
             if account.state == AccountState::Ready { host.verify_locked(account)?; }
         }
         Ok(())
@@ -148,15 +155,16 @@ impl Registry {
     /// Persistence must be durable before this returns a candidate to useradd.
     #[cfg(any(target_os = "linux", test))]
     fn reserve(&mut self, employee: EmployeeId, host: &mut dyn AccountHost) -> io::Result<usize> {
-        self.validate(&host.policy()?)?;
+        let policy = host.policy()?;
+        self.validate(&policy).map_err(at_step(Step::RegistryRows))?;
         host.verify_namespace(self)?;
-        if self.employees.iter().any(|account| account.employee == employee) { return Err(invalid()); }
+        if self.employees.iter().any(|account| account.employee == employee) { return Err(at_step(Step::RegistryRows)(invalid())); }
         let used: BTreeSet<_> = self.employees.iter().map(|account| account.uid).collect();
         // R7b: one file-owner inventory per allocation. The candidate's gid is
         // its uid, so an id owning a file as either is skipped.
-        let occupied = host.occupied_ids(self.range)?;
+        let occupied = host.occupied_ids(self.range).map_err(at_step(Step::OwnerInventory))?;
         for uid in self.range.first..=self.range.last {
-            if !used.contains(&uid) && !occupied.contains(&uid) && host.uid_available(uid)? {
+            if !used.contains(&uid) && !occupied.contains(&uid) && host.uid_available(uid).map_err(at_step(Step::Candidate))? {
                 self.employees.push(EmployeeAccount { employee, uid, gid: uid, state: AccountState::Reserved });
                 return Ok(self.employees.len() - 1);
             }
@@ -242,19 +250,27 @@ impl Allocations {
             Some(index) => (index, true),
             None => {
                 if self.unresolved.len() >= MAX_PENDING_RESERVATIONS { return Err(PendingLimit.error()); }
-                let index = registry.reserve(employee, host)?;
+                let index = registry.reserve(employee, host).map_err(at_step(Step::Reserve))?;
                 save(registry)?;
                 (index, false)
             }
         };
         let account = registry.employees[index].clone();
+        // R8w: each allocation step labels a failure the host left
+        // unlabelled (the host's own, finer step wins): `create_account`,
+        // `ssh_probe`, `quarantine`, `readback`.
         let result = if resumed {
             // Pending again leaves the account untouched; only a proven
             // denial re-locks and reads it back before Ready.
-            host.login_denied(&account).and_then(|()| host.recover_locked(&account)).and_then(|()| host.verify_locked(&account))
+            host.login_denied(&account).map_err(at_step(Step::SshProbe))
+                .and_then(|()| host.recover_locked(&account).map_err(at_step(Step::Quarantine)))
+                .and_then(|()| host.verify_locked(&account).map_err(at_step(Step::Readback)))
         } else {
-            host.create_locked(&account).and_then(|()| host.login_denied(&account)).and_then(|()| host.verify_locked(&account))
+            host.create_locked(&account).map_err(at_step(Step::CreateAccount))
+                .and_then(|()| host.login_denied(&account).map_err(at_step(Step::SshProbe)))
+                .and_then(|()| host.verify_locked(&account).map_err(at_step(Step::Readback)))
         };
+        let result = result.map_err(for_account(account.uid));
         let unresolved = result.as_ref().err().is_some_and(crate::accounts::probe_unresolved);
         registry.employees[index].state = match (&result, unresolved) {
             (Ok(()), _) => AccountState::Ready,
@@ -437,16 +453,27 @@ mod disk {
 
         /// The R7c allocation state machine ([`Allocations::allocate`]), each
         /// decision persisted (a failed save poisons the store).
+        /// R8w: a failed allocation logs one fixed line naming its step
+        /// (`accounts::allocation_line`). An unresolved SSH probe and the
+        /// pending-reservation cap are not logged: they are "retry later"
+        /// answers with their own wire codes, repeated at the gateway's
+        /// retry cadence.
         pub fn allocate(&mut self, employee: EmployeeId, host: &mut dyn AccountHost) -> io::Result<EmployeeAccount> {
             if self.poisoned { return Err(invalid()); }
             let now_ms = crate::host_state::boottime_ms()?;
             let Self { directory, data, poisoned, allocations, .. } = self;
-            allocations.allocate(data, employee, host, now_ms, &mut |registry: &Registry| {
+            let result = allocations.allocate(data, employee, host, now_ms, &mut |registry: &Registry| {
                 if *poisoned { return Err(invalid()); }
                 let result = save_inner(directory.as_path(), registry);
                 if result.is_err() { *poisoned = true; }
                 result
-            })
+            });
+            if let Err(error) = &result {
+                if !crate::accounts::probe_unresolved(error) && !pending_limit(error) {
+                    eprintln!("duduclaw-spawnd: {}", crate::accounts::allocation_line(error));
+                }
+            }
+            result
         }
 
         /// The reservation deadline ([`Allocations::expire`]) at the current
@@ -602,7 +629,9 @@ mod tests {
     /// `login_denied`), with injected create/verify failures.
     #[derive(Default)]
     struct Probing { probes: Vec<io::Result<()>>, create_fail: bool, verify_fail: bool,
-        creates: usize, recoveries: usize, waits: usize, recovered: Vec<u32> }
+        creates: usize, recoveries: usize, waits: usize, recovered: Vec<u32>,
+        /// R8w: the step a failing readback names itself (as `LinuxAccounts` does).
+        verify_step: Option<Step> }
     impl AccountHost for Probing {
         fn policy(&mut self) -> io::Result<HostUidPolicy> { Host.policy() }
         fn verify_namespace(&mut self, _: &Registry) -> io::Result<()> { Ok(()) }
@@ -613,7 +642,9 @@ mod tests {
             if self.create_fail { Err(io::Error::other("injected useradd failure")) } else { Ok(()) }
         }
         fn verify_locked(&mut self, _: &EmployeeAccount) -> io::Result<()> {
-            if self.verify_fail { Err(io::Error::other("injected lockdown readback failure")) } else { Ok(()) }
+            if !self.verify_fail { return Ok(()); }
+            let error = io::Error::other("injected lockdown readback failure");
+            Err(match self.verify_step { Some(step) => at_step(step)(error), None => error })
         }
         fn recover_locked(&mut self, account: &EmployeeAccount) -> io::Result<()> { self.recoveries += 1; self.recovered.push(account.uid); Ok(()) }
         fn login_denied(&mut self, _: &EmployeeAccount) -> io::Result<()> {
@@ -981,6 +1012,50 @@ mod tests {
         assert!(matches!(crate::accounts::ssh_refusal(&error), Some(SshRefusal::Reachable(_))), "{error}");
         assert_eq!(registry.employees[1].state, AccountState::Tombstone);
         assert!(state.resumable().is_empty());
+    }
+
+    /// R8w item 2: every allocation failure names its step: the host's own
+    /// when it gave one, else the allocation step; the account is the
+    /// reserved uid; kind, text and the typed probe refusal are unchanged.
+    #[test]
+    fn allocation_failures_carry_their_step() {
+        use crate::accounts::{step_account, step_of};
+        let (mut state, mut registry, mut saves) = (Allocations::default(), Registry::default(), 0);
+        let mut host = Probing { create_fail: true, ..Probing::default() };
+        let error = allocate(&mut state, &mut registry, 1, &mut host, &mut saves).unwrap_err();
+        assert_eq!((step_of(&error), step_account(&error)), (Some(Step::CreateAccount), Some(70000)));
+        assert_eq!(error.to_string(), "injected useradd failure");
+        assert_eq!(crate::accounts::allocation_line(&error), "allocation failed: step=create_account");
+        let mut host = Probing { probes: vec![Ok(())], verify_fail: true, ..Probing::default() };
+        let error = allocate(&mut state, &mut registry, 2, &mut host, &mut saves).unwrap_err();
+        assert_eq!((step_of(&error), step_account(&error)), (Some(Step::Readback), Some(70001)));
+        // The host's finer step wins over the allocation step.
+        let mut host = Probing { probes: vec![Ok(())], verify_fail: true, verify_step: Some(Step::AtSpool), ..Probing::default() };
+        let error = allocate(&mut state, &mut registry, 3, &mut host, &mut saves).unwrap_err();
+        assert_eq!((step_of(&error), step_account(&error)), (Some(Step::AtSpool), Some(70002)));
+        assert_eq!(registry.employees[2].state, AccountState::Tombstone);
+        let mut host = Probing { probes: vec![reachable()], ..Probing::default() };
+        let error = allocate(&mut state, &mut registry, 4, &mut host, &mut saves).unwrap_err();
+        assert_eq!(step_of(&error), Some(Step::SshProbe));
+        assert!(matches!(crate::accounts::ssh_refusal(&error), Some(SshRefusal::Reachable(_))), "{error}");
+        let mut host = Probing { probes: vec![pending()], ..Probing::default() };
+        let error = allocate(&mut state, &mut registry, 5, &mut host, &mut saves).unwrap_err();
+        assert!(crate::accounts::probe_unresolved(&error), "{error}");
+        assert_eq!((step_of(&error), error.kind()), (Some(Step::SshProbe), io::ErrorKind::WouldBlock));
+        // Reservation: the inventory, then an exhausted range.
+        let mut inventory = Inventory { occupied: Err(io::ErrorKind::Other.into()), scans: 0, candidates: vec![] };
+        assert_eq!(step_of(&registry.reserve(EmployeeId([6; 16]), &mut inventory).unwrap_err()), Some(Step::OwnerInventory));
+        let mut full = Registry { range: UidRange { first: 70000, last: 70000 }, ..Registry::default() };
+        let mut host = Probing { probes: vec![Ok(())], ..Probing::default() };
+        let mut fresh = Allocations::default();
+        allocate(&mut fresh, &mut full, 1, &mut host, &mut saves).unwrap();
+        let error = allocate(&mut fresh, &mut full, 2, &mut host, &mut saves).unwrap_err();
+        assert_eq!((step_of(&error), step_account(&error), error.kind()), (Some(Step::Reserve), None, io::ErrorKind::StorageFull));
+        // Host-wide verification: a Reserved row nobody can resume.
+        full.employees.push(EmployeeAccount { employee: EmployeeId([9; 16]), uid: 70000, gid: 70000, state: AccountState::Reserved });
+        full.employees.remove(0);
+        let error = full.verify(&mut Probing::default()).unwrap_err();
+        assert_eq!((step_of(&error), step_account(&error)), (Some(Step::RegistryRows), Some(70000)));
     }
 
     #[test]
