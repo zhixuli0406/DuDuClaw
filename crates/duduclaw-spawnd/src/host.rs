@@ -13,8 +13,19 @@ use crate::{Result, admission::{BrokerJob, BrokerReply, BrokerStep, Host, HostPr
     readiness::Readiness, registry::{AccountHost, RegistryStore, EmployeeAccount},
     storage::{Storage, Attachment, UnavailableStorage}, systemd::{UnitPolicy, linux::{Systemd, StartedUnit}}};
 pub use crate::host_state::{EvidenceReport, SpawndFeatures, READINESS_PATH};
+use crate::start_refusal::{at, gate, Gate, Labelled, Refusal, StartStep};
 fn unavailable() -> ErrorCode { ErrorCode::IsolationUnavailable }
 fn os<T>(r: io::Result<T>) -> Result<T> { r.map_err(|_| unavailable()) }
+/// R8y: `os` with the step (same code, `isolation_unavailable`).
+fn io_at(step: StartStep) -> impl Fn(io::Error) -> Refusal { move |_| at(step)(unavailable()) }
+/// R8y: the employees spawnd admits: the registry's Ready rows. Computed at
+/// open AND on every refresh, so an employee allocated after spawnd started
+/// is admitted (before R8y the set was only computed at open, and the first
+/// run of a freshly allocated employee was refused `isolation_unavailable`
+/// at `ReserveRun` until spawnd restarted).
+fn admitted_employees(registry: &crate::registry::Registry) -> BTreeSet<EmployeeId> {
+    registry.employees.iter().filter(|a| a.state == crate::registry::AccountState::Ready).map(|a| a.employee).collect()
+}
 
 /// F/G supply a signature-verified root publication, never a JSON flag or IPC
 /// policy. Snapshot mount authority must be derived from an opened gateway mount.
@@ -154,7 +165,7 @@ impl Components {
 }
 #[path = "host_monitor.rs"]
 mod monitor;
-use monitor::{Monitor, ScanEntry, ScanReader};
+use monitor::{scan_fresh, Monitor, ScanEntry, ScanReader, SCAN_PERIOD};
 #[cfg(test)]
 use monitor::ScanState;
 /// HX4 helper glue of `Core` (engine link, per-call start/signal, audit).
@@ -221,6 +232,19 @@ enum RunHelper { Engine(Box<HelperEngine<crate::helper_cgroup::linux::UnitTree>>
 /// The core owns every privileged side effect. WorkerHost supplies bounded
 /// mailboxes and the independent UID monitor supplies live fail-closed fencing.
 struct PublishedView { report: EvidenceReport, policy: Option<RootPolicy>, employees: BTreeSet<EmployeeId> }
+impl PublishedView {
+    /// `Core::refresh`'s publication: report, policy AND (R8y) the admitted
+    /// employees, re-read from the registry every time.
+    fn update(&mut self, report: &EvidenceReport, policy: Option<RootPolicy>, registry: &crate::registry::Registry) {
+        self.report = report.clone(); self.policy = policy; self.employees = admitted_employees(registry);
+    }
+    /// `LinuxHost::ready_step`'s view half, labelled (codes unchanged).
+    fn admit(&self, employee: EmployeeId) -> Labelled<()> {
+        if !self.employees.contains(&employee) { return Err(gate(Gate::EmployeeNotAdmitted)(unavailable())); }
+        if self.policy.is_none() { return Err(gate(Gate::PolicyMissing)(unavailable())); }
+        self.report.check_labelled()
+    }
+}
 pub struct LinuxHost { worker: WorkerHost, view: Arc<Mutex<PublishedView>>, scanner: ScanReader, pub snapshots: SnapshotAuthority, pub host_ptys: u32,
     recording_gate: crate::host_state::RecordingGate }
 struct Core {
@@ -243,6 +267,14 @@ struct Core {
     /// again only when the set of false checks (or the resources sub-condition)
     /// changes, never every refresh.
     evidence_line: Option<String>,
+    /// R8w: the last account verification line printed
+    /// (`accounts::verification_line`): printed again only when the failing
+    /// step or account changes; cleared when verification passes.
+    account_line: Option<String>,
+    /// R8y review round 1 (F2): the lifecycle thread's own `start refused`
+    /// lines (`Core::start`, `Core::poll`), rate limited per label like the
+    /// server's; its window ends on the refresh cadence (`refresh`).
+    start_lines: crate::start_refusal::LineLimiter,
 }
 /// C2: the cadence of start-up reconciliation retries.
 const STARTUP_RETRY: Duration = Duration::from_secs(2);
@@ -282,7 +314,7 @@ impl LinuxHost {
         let worker_scanner = Box::new(ScanReader { state: monitor.state.clone(), entries: monitor.entries.clone() });
         let view = Arc::new(Mutex::new(PublishedView {
             report: startup_stage("report", EvidenceReport::current(Readiness::default(), 0))?, policy: None,
-            employees: registry.registry().employees.iter().filter(|a| a.state == crate::registry::AccountState::Ready).map(|a| a.employee).collect(),
+            employees: admitted_employees(registry.registry()),
         }));
         let recording_gate = crate::host_state::RecordingGate::default();
         // F6l S5a: a missing allocation journal is refused while the registry
@@ -294,7 +326,8 @@ impl LinuxHost {
             monitor, runs: BTreeMap::new(), audit, last_refresh: Instant::now(), poisoned: false, view: view.clone(),
             helper_events: Vec::new(), recording_probe: probe::RecordingProbe::default(),
             probe_schedule: probe::ProbeSchedule::default(), recording_gate: recording_gate.clone(),
-            startup: StartupReconcile::opened(Instant::now(), false), evidence_line: None };
+            startup: StartupReconcile::opened(Instant::now(), false), evidence_line: None, account_line: None,
+            start_lines: crate::start_refusal::LineLimiter::new("start refused", crate::start_refusal::label_bound()) };
         startup_stage("report", core.report.publish(gateway.1))?;
         // Cleanup is attempted even when C/H/F/G are absent. Failure is evidence,
         // never permission to skip an orphan or reinterpret a stale reservation.
@@ -378,7 +411,14 @@ impl Core {
         // sshd configuration); each account's SSH probe result is per-employee
         // and checked at its admission (`ready`), so one pending or failed
         // probe never takes every employee down.
-        let registry = self.registry.verify(&mut LinuxAccounts::background(self.components.ssh.as_ref())).is_ok();
+        let verified = self.registry.verify(&mut LinuxAccounts::background(self.components.ssh.as_ref()));
+        let registry = verified.is_ok();
+        // R8w: WHY it failed, as one fixed line per change of the failing
+        // step/account (`accounts::Step`; never the error text). Journal
+        // only: readiness.json and the wire keep their fixed check names.
+        if let Some(line) = accounts::verification_change(&mut self.account_line, &verified) {
+            eprintln!("duduclaw-spawnd: {line}");
+        }
         self.policy = self.components.publication.load().ok();
         let snapshot = self.components.publication.snapshot_authority(self.gateway.0);
         checks.registry_verified = registry && self.policy.is_some() && snapshot.is_ok_and(|s| s.gateway_uid == self.gateway.0 && s.mount_id != 0);
@@ -410,8 +450,12 @@ impl Core {
         let dns_reason = if checks.egress_verified { dns_route.err() }
             else { Some(crate::dns_evidence::Reason::NoControlConnection.name()) };
         checks.storage_verified = self.components.storage.readiness().is_ok();
+        // R8w item 3: the monitor's own freshness rule (`scan_fresh`), so a
+        // healthy monitor between "one period elapsed" and "next result
+        // stored" is not read stale; a scan error or a sticky intruder still
+        // reads false.
         checks.process_scan_verified = self.monitor.state.lock().is_ok_and(|state|
-            state.at.elapsed() < Duration::from_secs(1) && state.result.as_ref().is_ok_and(Vec::is_empty));
+            scan_fresh(Instant::now(), state.at, SCAN_PERIOD) && state.result.as_ref().is_ok_and(Vec::is_empty));
         let ptys = self.systemd.resources_ready();
         checks.resources_verified = ptys.is_ok();
         // Fixed names only: the readiness.json check names and, for
@@ -439,11 +483,23 @@ impl Core {
             Err(_) => self.poisoned = true,
         }
         if let Ok(mut view) = self.view.lock() {
-            view.report = self.report.clone(); view.policy = if self.poisoned { None } else { self.policy.clone() };
+            // R8y: the admitted set follows the registry (allocation, retire).
+            view.update(&self.report, if self.poisoned { None } else { self.policy.clone() }, self.registry.registry());
         } else { self.poisoned = true; }
         // Round 3 (N4): the gate next to the published report (closed when poisoned).
         self.recording_gate.publish(&self.report, self.poisoned);
+        // R8y review round 1 (F2): the lifecycle thread's rate-limited lines
+        // (start refusals, allocation failures) end their window here.
+        let now = Instant::now();
+        for line in self.start_lines.flush(now).into_iter().chain(self.registry.flush_lines(now)) {
+            eprintln!("duduclaw-spawnd: {line}");
+        }
         self.last_refresh = Instant::now();
+    }
+    /// R8y review round 1: one `start refused` line of the lifecycle thread,
+    /// through its rate limiter.
+    fn journal_start_refusal(&mut self, step: StartStep) {
+        for line in self.start_lines.note(step.line(), 1, Instant::now()) { eprintln!("duduclaw-spawnd: {line}"); }
     }
     fn account(&self, employee: EmployeeId) -> Result<EmployeeAccount> { os(self.registry.registry().lookup(employee)).cloned() }
     /// Every registry row (one per employee) is monitored; a row that is not
@@ -620,6 +676,166 @@ impl Core {
         Ok(proof)
     }
 }
+/// R8y: the labelled start path of the lifecycle worker. These return
+/// [`Labelled`], which has no `From<ErrorCode>`: every exit names its
+/// [`StartStep`] or this does not compile. Codes are the pre-R8y codes.
+impl Core {
+    fn ready_labelled(&mut self, employee: EmployeeId) -> Labelled<()> {
+        if self.poisoned { return Err(gate(Gate::Poisoned)(unavailable())); }
+        if self.last_refresh.elapsed() > Duration::from_secs(1) { self.refresh(); }
+        if self.poisoned { return Err(gate(Gate::Poisoned)(unavailable())); }
+        self.report.check_labelled()?;
+        let account = self.account(employee).map_err(gate(Gate::AccountUnknown))?;
+        // R7c: this employee's SSH denial probe must be Denied for its current
+        // key; until the (re-)probe reports, only this employee is NotReady.
+        LinuxAccounts::admission(self.components.ssh.as_ref()).verify_locked(&account).map_err(|error|
+            if accounts::ssh_refusal(&error) == Some(&accounts::SshRefusal::Pending) { gate(Gate::SshPending)(ErrorCode::NotReady) }
+            else { gate(Gate::Account(accounts::step_of(&error).unwrap_or(accounts::Step::Unlabelled)))(unavailable()) })?;
+        self.report.check_labelled()
+    }
+    fn start_labelled(&mut self, run: RunHandle, employee: EmployeeId, request: &SpawnRequest, launch_policy: &LaunchPolicy,
+        mut inputs: Vec<OwnedFd>) -> Labelled<()> {
+        use StartStep as S;
+        // Pre-R8y codes: a missing own run record was `not_found`, a missing
+        // projection/unit just stored `isolation_unavailable`.
+        let internal = || at(S::Internal)(ErrorCode::NotFound);
+        let missing = || at(S::Internal)(unavailable());
+        self.monitor.check_run(run).map_err(at(S::RunFence))?;
+        self.ready_labelled(employee)?;
+        if !self.cleanup_run(employee, None).map_err(at(S::Cleanup))?.complete() { return Err(at(S::CleanupIncomplete)(unavailable())); }
+        let SpawnRequest::StartRun { runtime_request, pty, prompt_bytes, input_fds, workspace, requested_max_turns, .. } = request
+            else { return Err(at(S::Request)(ErrorCode::InvalidRequest)); };
+        let account = self.account(employee).map_err(gate(Gate::AccountUnknown))?;
+        let root_policy = self.policy.as_ref().ok_or_else(|| gate(Gate::PolicyMissing)(unavailable()))?;
+        let (runtime, _) = root_policy.derive_labelled(employee, runtime_request, *pty)?;
+        // R6: the one `turn_limit` rule, before any journal entry or resource
+        // exists. Out of range or narrowed below the request: this run is
+        // refused, never clamped (the gateway already shows the request).
+        let max_turns = match root_policy.max_turns(employee, runtime, *requested_max_turns) {
+            Ok(value) => value,
+            Err(code) => {
+                emit_detail(&self.audit, Event::Refused, Some(employee), Some(run.0), Some(Detail::Code { code }));
+                return Err(at(S::TurnLimit)(code));
+            }
+        };
+        let runtime = runtime.clone();
+        self.components.storage.usage(employee).map_err(at(S::StorageUsage))?
+            .check(employee, &runtime.resources.disk).map_err(at(S::DiskQuota))?;
+        // WAL before any external attachment, endpoint or transient unit exists.
+        os(self.journal.add(RunRecord { run: run.0, employee, uid: account.uid })).inspect_err(|_| self.poisoned = true)
+            .map_err(at(S::RunJournal))?;
+        self.runs.insert(run.0, LiveRun { employee, unit: None, attachment: None, revokers: vec![], gateway_io: Some(vec![]),
+            relays: vec![], egress: false, pty: *pty, pty_taken: false, closed: false, started_event: false, truncated_event: false,
+            runtime_deadline: Instant::now() + Duration::from_millis(runtime.timeouts.runtime_ms), bootstrap_attempted: false, projection: None,
+            broker: crate::work_broker::BrokerRoot::new(None), helper_parent: Some(runtime.clone()), helper: None,
+            mcp_revoker: None });
+        let mut storage = self.components.storage.attach(employee, account.uid, run, &runtime.resources.disk).map_err(at(S::StorageAttach))?;
+        storage.receipt.check(employee, run).map_err(at(S::StorageReceipt))?;
+        self.runs.get_mut(&run.0).ok_or_else(internal)?.attachment = Some(storage.receipt.clone());
+        // H4: the broker's root, before `select_workspace` narrows `storage.work`.
+        // A failed clone fails the broker for this run (refusals), not the run.
+        let work_root = crate::bootstrap_mounts::work_broker_root(&storage).ok();
+        self.runs.get_mut(&run.0).ok_or_else(internal)?.broker = crate::work_broker::BrokerRoot::new(work_root);
+        if let Some(selection) = workspace {
+            let pin = inputs.pop().ok_or(at(S::Workspace)(ErrorCode::InvalidFds))?;
+            crate::fds::validate_workspace_directory(pin.as_fd(), selection).map_err(io_at(S::Workspace))?;
+            crate::bootstrap_mounts::select_workspace(&mut storage, selection, account.uid).map_err(io_at(S::Workspace))?;
+            // The root-owned detached mount now pins the authorized inode.
+            drop(pin);
+        }
+        let mut gateway_io = Vec::new();
+        let mut revokers = Vec::new();
+        let mut mcp_revoker = None;
+        let mcp = if runtime.mcp {
+            let pair = RevocablePair::new().map_err(io_at(S::McpChannel))?;
+            let revoker = Arc::new(pair.revoker().map_err(io_at(S::McpChannel))?);
+            revokers.push(revoker.clone()); mcp_revoker = Some(revoker);
+            gateway_io.push(pair.gateway); Some(pair.runtime)
+        } else { None };
+        let egress = match runtime.network {
+            NetworkPolicy::Offline => None,
+            NetworkPolicy::Egress(profile) => {
+                let pair = RevocablePair::new().map_err(io_at(S::EgressChannel))?;
+                revokers.push(Arc::new(pair.revoker().map_err(io_at(S::EgressChannel))?));
+                // Mark before registration: a timeout can follow successful C commit.
+                self.runs.get_mut(&run.0).ok_or_else(internal)?.egress = true;
+                self.components.egress.register(run.0, profile, pair.gateway).map_err(at(S::EgressRegister))?;
+                Some(pair.runtime)
+            }
+        };
+        let output_budget = Arc::new(std::sync::atomic::AtomicU64::new(runtime.resources.output_total_bytes));
+        let (out, stdout, out_reader) = OutputRelay::pipes_shared(runtime.resources.output_buffer_bytes as usize, output_budget.clone())
+            .map_err(io_at(S::OutputRelay))?;
+        let (err, stderr, err_reader) = OutputRelay::pipes_shared(runtime.resources.output_buffer_bytes as usize, output_budget)
+            .map_err(io_at(S::OutputRelay))?;
+        let stdin = if *pty { None } else {
+            let (reader, writer) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).map_err(|_| at(S::StdinPipe)(unavailable()))?;
+            gateway_io.extend([writer, out_reader, err_reader]); Some(reader)
+        };
+        let (supervisor_uid, supervisor_gid) = self.components.publication.supervisor_identity().map_err(at(S::SupervisorIdentity))?;
+        let mut nonce = [0; 32];
+        nonce[..16].copy_from_slice(&crate::server::random_id().map_err(io_at(S::Nonce))?);
+        nonce[16..].copy_from_slice(&crate::server::random_id().map_err(io_at(S::Nonce))?);
+        let mut plan = BootstrapPlan::from_runtime(run, employee, account.uid, account.gid, supervisor_uid, supervisor_gid,
+            nonce, &runtime, *pty, *prompt_bytes, input_fds.as_slice(), if matches!(runtime.network, NetworkPolicy::Egress(_)) { Some(crate::policy::RUNTIME_PROXY_PORT) } else { None },
+            max_turns).map_err(at(S::BootstrapPlan))?;
+        plan.pty_size = launch_policy.pty_size;
+        plan.validate().map_err(at(S::BootstrapPlan))?;
+        let entry = self.runs.get_mut(&run.0).ok_or_else(internal)?;
+        entry.gateway_io = Some(gateway_io); entry.relays = vec![out, err]; entry.revokers = revokers.clone();
+        entry.mcp_revoker = mcp_revoker;
+        self.monitor.set_run(employee, Some(run.0), None, revokers.clone()).map_err(at(S::UidMonitor))?;
+        self.components.publication.prepare_mcp_projection(&plan, &runtime).map_err(at(S::McpProjection))?;
+        let anchors = self.components.publication.anchors().map_err(at(S::Anchors))?;
+        self.runs.get_mut(&run.0).ok_or_else(internal)?.projection = Some(anchors);
+        let anchors = self.runs.get(&run.0).and_then(|entry| entry.projection.as_ref()).ok_or_else(missing)?;
+        let mounts =crate::bootstrap_mounts::prepare(&plan, &storage, anchors).map_err(io_at(S::Mounts))?;
+        self.components.publication.record_mcp_projection(&plan, &runtime, &mounts).map_err(at(S::McpRecord))?;
+        self.monitor.check_run(run).map_err(at(S::RunFence))?;
+        self.runs.get_mut(&run.0).ok_or_else(internal)?.bootstrap_attempted = true;
+        let mut native_profile = self.components.publication.native_profile(&runtime).map_err(at(S::NativeProfile))?;
+        // HX: the helper table is derived from this run's employee, never from
+        // the request (D8 revision §2.3). Planned only once the trampoline has a launcher.
+        if duduclaw_run::linux::runner::LAUNCHER_SUPPORTED {
+            let policy = self.policy.as_ref().ok_or_else(|| gate(Gate::PolicyMissing)(unavailable()))?;
+            let table = policy.helper_table(employee, &runtime);
+            if !table.is_empty() {
+                let anchors = self.runs.get(&run.0).and_then(|entry| entry.projection.as_ref()).ok_or_else(missing)?;
+                let executables: Vec<_> = table.iter().map(|entry| &entry.runtime.executable).collect();
+                // HX6 security fix round (finding 5): the recording's signed browser files.
+                let files: Vec<_> = table.iter().map(|entry|
+                    crate::helper_policy::recording_files(&entry.runtime).unwrap_or_default()).collect();
+                let prepared = crate::bootstrap_mounts::prepare_helpers(anchors, &executables, &files).map_err(io_at(S::HelperMounts))?;
+                let helpers = table.iter().zip(prepared.executables).zip(prepared.files)
+                    .map(|((entry, (executable, script)), files)|
+                    crate::native_trampoline::HelperRun { index: entry.index, binding: entry.binding.clone(),
+                        runtime: entry.runtime.clone(), executable, script, files }).collect();
+                native_profile.launcher = Some(crate::native_trampoline::LauncherProfile { helpers, mount: prepared.mount,
+                    tmpfs_bytes: policy.helper_tmpfs_bytes(&runtime).ok_or_else(|| at(S::HelperMounts)(unavailable()))?,
+                    drain_ms: crate::native_trampoline::launcher_drain_ms(runtime.timeouts.termination_grace_ms) });
+            }
+        }
+        let sealed_plan = plan.seal().map_err(at(S::Seal))?;
+        let prepared = self.components.trampoline.prepare(plan, sealed_plan, mounts, inputs, stdin, mcp, egress, native_profile)
+            .map_err(at(S::TrampolinePrepare))?;
+        crate::fds::validate_bootstrap(prepared.bootstrap_for_unit.as_fd()).map_err(io_at(S::BootstrapInvalid))?;
+        let policy = UnitPolicy::new(run.0, employee, &runtime.resources, &runtime.timeouts, storage.receipt.device_major,
+            storage.receipt.device_minor).map_err(io_at(S::UnitPolicy))?;
+        self.monitor.check_run(run).map_err(at(S::RunFence))?;
+        let unit = self.systemd.start(&policy, prepared.bootstrap_for_unit.as_fd(), stdout.as_fd(), stderr.as_fd())
+            .map_err(io_at(S::UnitStart))?;
+        let cgroup = proc_cgroup(&unit.cgroup).map_err(at(S::UnitCgroup))?;
+        // The B2 barrier prevents employee-uid processes before this allowlist exists.
+        self.monitor.set_run(employee, Some(run.0), Some(cgroup), revokers).map_err(at(S::UidMonitor))?;
+        self.runs.get_mut(&run.0).ok_or_else(internal)?.unit = Some(unit);
+        let unit = self.runs.get(&run.0).and_then(|r| r.unit.as_ref()).ok_or_else(missing)?;
+        self.monitor.check_run(run).map_err(at(S::RunFence))?;
+        let fence = self.monitor.cancellation(run).map_err(at(S::BindUnit))?;
+        self.components.trampoline.bind_unit(run, unit, fence).map_err(at(S::BindUnit))?;
+        drop(prepared); drop(storage); drop(stdout); drop(stderr);
+        Ok(())
+    }
+}
 impl Host for Core {
     fn allocation(&mut self, request: &duduclaw_migration::allocation::Request)
         -> std::result::Result<duduclaw_migration::allocation::Reply, duduclaw_migration::allocation::ErrorCode> {
@@ -644,8 +860,10 @@ impl Host for Core {
         // allocation picks the result up. Other accounts are not probed inline.
         let mut accounts = LinuxAccounts::background(self.components.ssh.as_ref());
         // R8d: Entitle and the Disable/Retire removal write the root host
-        // publication on this same worker; `monitor_registry` below forces
-        // the next refresh, which reloads it (and republishes the projection).
+        // publication on this same worker. R8y review round 1 (F1): the
+        // lifecycle loop then runs `publish_view` (the full `refresh`: it
+        // reloads it, re-reads the registry's Ready rows and republishes
+        // the view) BEFORE this result is replied to the gateway.
         let mut entitlements = crate::installed::InstalledEntitlements;
         let result = self.allocator.handle(request, crate::allocation::Env { registry: &mut self.registry, accounts: &mut accounts,
             storage: self.components.storage.as_mut(), host_busy, idle, now_unix, entitlements: &mut entitlements });
@@ -712,151 +930,47 @@ impl Host for Core {
         self.signal_helper(run, call, signal)
     }
     fn helper_events(&mut self) -> Vec<HelperEvent> { self.collect_helper_events() }
+    /// R8y review round 1 (F1): the same full refresh the periodic path
+    /// runs (registry verification, policy reload, report publish, and the
+    /// admitted set re-read from the registry's Ready rows), run by the
+    /// lifecycle loop between an allocation action and its reply. Whatever
+    /// part of it fails, `refresh` still recomputes the admitted set from the
+    /// registry and stores it (a failed check, policy or report fails EVERY
+    /// employee's admission, never this one alone); only a poisoned view
+    /// lock skips the store, and that poisons the core (nothing is admitted).
+    /// The periodic refresh (`maintenance`, every 250 ms) recomputes it again
+    /// regardless, so a Ready employee is never left unadmitted by a
+    /// refresh that failed once.
+    fn publish_view(&mut self) { self.refresh(); }
     type Inputs = Vec<OwnedFd>; type Io = Vec<OwnedFd>;
-    fn ready(&mut self, employee: EmployeeId) -> Result<()> {
-        if self.poisoned { return Err(unavailable()); }
-        if self.last_refresh.elapsed() > Duration::from_secs(1) { self.refresh(); }
-        if self.poisoned { return Err(unavailable()); }
-        self.report.check()?;
-        let account = self.account(employee)?;
-        // R7c: this employee's SSH denial probe must be Denied for its current
-        // key; until the (re-)probe reports, only this employee is NotReady.
-        LinuxAccounts::admission(self.components.ssh.as_ref()).verify_locked(&account).map_err(|error|
-            if accounts::ssh_refusal(&error) == Some(&accounts::SshRefusal::Pending) { ErrorCode::NotReady } else { unavailable() })?;
-        self.report.check()
-
-    }
+    fn ready(&mut self, employee: EmployeeId) -> Result<()> { self.ready_labelled(employee).map_err(Refusal::code) }
+    fn ready_step(&mut self, employee: EmployeeId) -> Labelled<()> { self.ready_labelled(employee) }
     fn policy(&mut self, employee: EmployeeId, runtime: &RuntimeKind, pty: bool) -> Result<LaunchPolicy> {
         self.ready(employee)?;
         Ok(self.policy.as_ref().ok_or_else(unavailable)?.derive(employee, runtime, pty)?.1)
     }
     fn cleanup(&mut self, employee: EmployeeId, previous: Option<RunHandle>) -> Result<CleanupReadback> { self.cleanup_run(employee, previous) }
-    fn start(&mut self, run: RunHandle, employee: EmployeeId, request: &SpawnRequest, launch_policy: &LaunchPolicy, mut inputs: Self::Inputs) -> Result<()> {
-        self.monitor.check_run(run)?;
-        self.ready(employee)?;
-        if !self.cleanup_run(employee, None)?.complete() { return Err(unavailable()); }
-        let SpawnRequest::StartRun { runtime_request, pty, prompt_bytes, input_fds, workspace, requested_max_turns, .. } = request else { return Err(ErrorCode::InvalidRequest); };
-        let account = self.account(employee)?;
-        let root_policy = self.policy.as_ref().ok_or_else(unavailable)?;
-        let (runtime, _) = root_policy.derive(employee, runtime_request, *pty)?;
-        // R6: the one `turn_limit` rule, before any journal entry or resource
-        // exists. Out of range or narrowed below the request: this run is
-        // refused, never clamped (the gateway already shows the request).
-        let max_turns = match root_policy.max_turns(employee, runtime, *requested_max_turns) {
-            Ok(value) => value,
-            Err(code) => {
-                emit_detail(&self.audit, Event::Refused, Some(employee), Some(run.0), Some(Detail::Code { code }));
-                return Err(code);
-            }
-        };
-        let runtime = runtime.clone();
-        self.components.storage.usage(employee)?.check(employee, &runtime.resources.disk)?;
-        // WAL before any external attachment, endpoint or transient unit exists.
-        os(self.journal.add(RunRecord { run: run.0, employee, uid: account.uid })).inspect_err(|_| self.poisoned = true)?;
-        self.runs.insert(run.0, LiveRun { employee, unit: None, attachment: None, revokers: vec![], gateway_io: Some(vec![]),
-            relays: vec![], egress: false, pty: *pty, pty_taken: false, closed: false, started_event: false, truncated_event: false,
-            runtime_deadline: Instant::now() + Duration::from_millis(runtime.timeouts.runtime_ms), bootstrap_attempted: false, projection: None,
-            broker: crate::work_broker::BrokerRoot::new(None), helper_parent: Some(runtime.clone()), helper: None,
-            mcp_revoker: None });
-        let mut storage = self.components.storage.attach(employee, account.uid, run, &runtime.resources.disk)?;
-        storage.receipt.check(employee, run)?;
-        self.runs.get_mut(&run.0).ok_or(ErrorCode::NotFound)?.attachment = Some(storage.receipt.clone());
-        // H4: the broker's root, before `select_workspace` narrows `storage.work`.
-        // A failed clone fails the broker for this run (refusals), not the run.
-        let work_root = crate::bootstrap_mounts::work_broker_root(&storage).ok();
-        self.runs.get_mut(&run.0).ok_or(ErrorCode::NotFound)?.broker = crate::work_broker::BrokerRoot::new(work_root);
-        if let Some(selection) = workspace {
-            let pin = inputs.pop().ok_or(ErrorCode::InvalidFds)?;
-            os(crate::fds::validate_workspace_directory(pin.as_fd(), selection))?;
-            os(crate::bootstrap_mounts::select_workspace(&mut storage, selection, account.uid))?;
-            // The root-owned detached mount now pins the authorized inode.
-            drop(pin);
-        }
-        let mut gateway_io = Vec::new();
-        let mut revokers = Vec::new();
-        let mut mcp_revoker = None;
-        let mcp = if runtime.mcp {
-            let pair = os(RevocablePair::new())?;
-            let revoker = Arc::new(os(pair.revoker())?);
-            revokers.push(revoker.clone()); mcp_revoker = Some(revoker);
-            gateway_io.push(pair.gateway); Some(pair.runtime)
-        } else { None };
-        let egress = match runtime.network {
-            NetworkPolicy::Offline => None,
-            NetworkPolicy::Egress(profile) => {
-                let pair = os(RevocablePair::new())?; revokers.push(Arc::new(os(pair.revoker())?));
-                // Mark before registration: a timeout can follow successful C commit.
-                self.runs.get_mut(&run.0).ok_or(ErrorCode::NotFound)?.egress = true;
-                self.components.egress.register(run.0, profile, pair.gateway)?;
-                Some(pair.runtime)
-            }
-        };
-        let output_budget = Arc::new(std::sync::atomic::AtomicU64::new(runtime.resources.output_total_bytes));
-        let (out, stdout, out_reader) = os(OutputRelay::pipes_shared(runtime.resources.output_buffer_bytes as usize, output_budget.clone()))?;
-        let (err, stderr, err_reader) = os(OutputRelay::pipes_shared(runtime.resources.output_buffer_bytes as usize, output_budget))?;
-        let stdin = if *pty { None } else {
-            let (reader, writer) = os(nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).map_err(Into::into))?;
-            gateway_io.extend([writer, out_reader, err_reader]); Some(reader)
-        };
-        let (supervisor_uid, supervisor_gid) = self.components.publication.supervisor_identity()?;
-        let mut nonce = [0; 32]; nonce[..16].copy_from_slice(&os(crate::server::random_id())?); nonce[16..].copy_from_slice(&os(crate::server::random_id())?);
-        let mut plan = BootstrapPlan::from_runtime(run, employee, account.uid, account.gid, supervisor_uid, supervisor_gid,
-            nonce, &runtime, *pty, *prompt_bytes, input_fds.as_slice(), if matches!(runtime.network, NetworkPolicy::Egress(_)) { Some(crate::policy::RUNTIME_PROXY_PORT) } else { None },
-            max_turns)?;
-        plan.pty_size = launch_policy.pty_size;
-        plan.validate()?;
-        let entry = self.runs.get_mut(&run.0).ok_or(ErrorCode::NotFound)?;
-        entry.gateway_io = Some(gateway_io); entry.relays = vec![out, err]; entry.revokers = revokers.clone();
-        entry.mcp_revoker = mcp_revoker;
-        self.monitor.set_run(employee, Some(run.0), None, revokers.clone())?;
-        self.components.publication.prepare_mcp_projection(&plan, &runtime)?;
-        let anchors = self.components.publication.anchors()?;
-        self.runs.get_mut(&run.0).ok_or(ErrorCode::NotFound)?.projection = Some(anchors);
-        let anchors = self.runs.get(&run.0).and_then(|entry| entry.projection.as_ref()).ok_or_else(unavailable)?;
-        let mounts = os(crate::bootstrap_mounts::prepare(&plan, &storage, anchors))?;
-        self.components.publication.record_mcp_projection(&plan, &runtime, &mounts)?;
-        self.monitor.check_run(run)?;
-        self.runs.get_mut(&run.0).ok_or(ErrorCode::NotFound)?.bootstrap_attempted = true;
-        let mut native_profile = self.components.publication.native_profile(&runtime)?;
-        // HX: the helper table is derived from this run's employee, never from
-        // the request (D8 revision §2.3). Planned only once the trampoline has a launcher.
-        if duduclaw_run::linux::runner::LAUNCHER_SUPPORTED {
-            let policy = self.policy.as_ref().ok_or_else(unavailable)?;
-            let table = policy.helper_table(employee, &runtime);
-            if !table.is_empty() {
-                let anchors = self.runs.get(&run.0).and_then(|entry| entry.projection.as_ref()).ok_or_else(unavailable)?;
-                let executables: Vec<_> = table.iter().map(|entry| &entry.runtime.executable).collect();
-                // HX6 security fix round (finding 5): the recording's signed browser files.
-                let files: Vec<_> = table.iter().map(|entry|
-                    crate::helper_policy::recording_files(&entry.runtime).unwrap_or_default()).collect();
-                let prepared = os(crate::bootstrap_mounts::prepare_helpers(anchors, &executables, &files))?;
-                let helpers = table.iter().zip(prepared.executables).zip(prepared.files)
-                    .map(|((entry, (executable, script)), files)|
-                    crate::native_trampoline::HelperRun { index: entry.index, binding: entry.binding.clone(),
-                        runtime: entry.runtime.clone(), executable, script, files }).collect();
-                native_profile.launcher = Some(crate::native_trampoline::LauncherProfile { helpers, mount: prepared.mount,
-                    tmpfs_bytes: policy.helper_tmpfs_bytes(&runtime).ok_or_else(unavailable)?,
-                    drain_ms: crate::native_trampoline::launcher_drain_ms(runtime.timeouts.termination_grace_ms) });
-            }
-        }
-        let sealed_plan = plan.seal()?;
-        let prepared = self.components.trampoline.prepare(plan, sealed_plan, mounts, inputs, stdin, mcp, egress, native_profile)?;
-        os(crate::fds::validate_bootstrap(prepared.bootstrap_for_unit.as_fd()))?;
-        let policy = os(UnitPolicy::new(run.0, employee, &runtime.resources, &runtime.timeouts, storage.receipt.device_major, storage.receipt.device_minor))?;
-        self.monitor.check_run(run)?;
-        let unit = os(self.systemd.start(&policy, prepared.bootstrap_for_unit.as_fd(), stdout.as_fd(), stderr.as_fd()))?;
-        let cgroup = proc_cgroup(&unit.cgroup)?;
-        // The B2 barrier prevents employee-uid processes before this allowlist exists.
-        self.monitor.set_run(employee, Some(run.0), Some(cgroup), revokers)?;
-        self.runs.get_mut(&run.0).ok_or(ErrorCode::NotFound)?.unit = Some(unit);
-        let unit = self.runs.get(&run.0).and_then(|r| r.unit.as_ref()).ok_or_else(unavailable)?;
-        self.monitor.check_run(run)?;
-        self.components.trampoline.bind_unit(run, unit, self.monitor.cancellation(run)?)?;
-        drop(prepared); drop(storage); drop(stdout); drop(stderr);
-        Ok(())
+    /// R8y: every refusal exit of the start is labelled (`start_labelled`)
+    /// and printed here, once, on the lifecycle thread (this start runs
+    /// asynchronously: the coordinator learns of it only as an
+    /// `isolation_failure` outcome). Codes unchanged.
+    fn start(&mut self, run: RunHandle, employee: EmployeeId, request: &SpawnRequest, launch_policy: &LaunchPolicy, inputs: Self::Inputs) -> Result<()> {
+        let started = self.start_labelled(run, employee, request, launch_policy, inputs);
+        started.map_err(|refusal| {
+            self.journal_start_refusal(refusal.step);
+            refusal.code()
+        })
     }
     fn poll(&mut self, run: RunHandle) -> Result<HostProgress> {
-        let progress = self.components.trampoline.poll(run)?;
+        let progress = self.components.trampoline.poll(run);
+        // R8y: a launch that fails before Running (handshake, bootstrap
+        // status, unit exit) is a refused start too. Printed once: the
+        // coordinator drains the run on this error and polls it no more.
+        if progress.as_ref().is_err_and(|code| *code != ErrorCode::NotReady)
+            && self.runs.get(&run.0).is_some_and(|entry| !entry.started_event && !entry.closed && entry.unit.is_some()) {
+            self.journal_start_refusal(StartStep::LaunchPoll);
+        }
+        let progress = progress?;
         if matches!(progress, HostProgress::Running { .. } | HostProgress::Ended(_)) {
             let entry = self.runs.get_mut(&run.0).ok_or(ErrorCode::NotFound)?;
             if entry.pty && !entry.pty_taken {
@@ -921,23 +1035,34 @@ impl Drop for Core {
         for run in runs { let _ = self.revoke(RunHandle(run)); let _ = self.kill(RunHandle(run)); }
         self.report.checks.startup_reconciled = false; let _ = self.report.publish(self.gateway.1);
         self.recording_gate.publish(&self.report, true);
+        // R8y review round 2: last, after the revokes/kills above (which may
+        // still journal), the lifecycle thread's rate-limited lines print
+        // their pending `suppressed=<count>` before the window ends.
+        for line in self.start_lines.drain().into_iter().chain(self.registry.drain_lines()) {
+            eprintln!("duduclaw-spawnd: {line}");
+        }
     }
 }
 impl Host for LinuxHost {
     type Inputs = Vec<OwnedFd>; type Io = Vec<OwnedFd>;
-    fn ready(&mut self, e: EmployeeId) -> Result<()> {
-        self.scanner.health(e)?;
-        let view = self.view.try_lock().map_err(|_| unavailable())?;
-        if !view.employees.contains(&e) || view.policy.is_none() { return Err(unavailable()); }
-        view.report.check()
+    fn ready(&mut self, e: EmployeeId) -> Result<()> { self.ready_step(e).map_err(Refusal::code) }
+    /// R8y: the admission gate of `ReserveRun`, `StartRun` and queued
+    /// admission, labelled (codes unchanged).
+    fn ready_step(&mut self, e: EmployeeId) -> Labelled<()> {
+        self.scanner.health_step(e)?;
+        self.view.try_lock().map_err(|_| gate(Gate::ViewBusy)(unavailable()))?.admit(e)
     }
-    fn policy(&mut self, e: EmployeeId, r: &RuntimeKind, p: bool) -> Result<LaunchPolicy> {
-        self.ready(e)?;
-        let view = self.view.try_lock().map_err(|_| unavailable())?;
-        Ok(view.policy.as_ref().ok_or_else(unavailable)?.derive(e, r, p)?.1)
+    fn policy(&mut self, e: EmployeeId, r: &RuntimeKind, p: bool) -> Result<LaunchPolicy> { self.policy_step(e, r, p).map_err(Refusal::code) }
+    fn policy_step(&mut self, e: EmployeeId, r: &RuntimeKind, p: bool) -> Labelled<LaunchPolicy> {
+        self.ready_step(e)?;
+        let view = self.view.try_lock().map_err(|_| gate(Gate::ViewBusy)(unavailable()))?;
+        Ok(view.policy.as_ref().ok_or_else(|| gate(Gate::PolicyMissing)(unavailable()))?.derive_labelled(e, r, p)?.1)
     }
     fn cleanup(&mut self, e: EmployeeId, r: Option<RunHandle>) -> Result<CleanupReadback> { self.worker.cleanup(e, r) }
     fn start(&mut self, r: RunHandle, e: EmployeeId, q: &SpawnRequest, p: &LaunchPolicy, f: Self::Inputs) -> Result<()> { self.worker.start(r, e, q, p, f) }
+    fn start_step(&mut self, r: RunHandle, e: EmployeeId, q: &SpawnRequest, p: &LaunchPolicy, f: Self::Inputs) -> Labelled<()> {
+        self.worker.start_step(r, e, q, p, f)
+    }
     fn poll(&mut self, r: RunHandle) -> Result<HostProgress> { self.worker.poll(r) }
     fn revoke(&mut self, r: RunHandle) -> Result<()> { self.worker.revoke(r) }
     fn kill(&mut self, r: RunHandle) -> Result<()> { self.worker.kill(r) }

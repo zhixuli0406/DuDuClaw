@@ -1,5 +1,5 @@
 //! Bounded NUL-framed Varlink enumeration and lookups, independent of userdbctl.
-use super::{denied, GroupEntry, PasswdEntry};
+use super::{at_step, denied, GroupEntry, PasswdEntry, Step};
 use duduclaw_isolation::ids::UidRange;
 use serde_json::Value;
 use std::io;
@@ -378,9 +378,11 @@ fn provider_records(service: &str, local: &LocalIdentity<'_>, employees: &[(u32,
     mut query: impl FnMut(&str, &str, &str, Value, &mut Replies) -> io::Result<()>)
     -> io::Result<Vec<Vec<(u32, String)>>> {
     let mut results = Vec::new();
-    for (user, method, id_key, name_key) in [
-        (true, "GetUserRecord", "uid", "userName"),
-        (false, "GetGroupRecord", "gid", "groupName"),
+    // R8w: a failure while reading or validating user records is
+    // `userdb_user`, group records `userdb_group`.
+    for (user, method, id_key, name_key, step) in [
+        (true, "GetUserRecord", "uid", "userName", Step::UserdbUser),
+        (false, "GetGroupRecord", "gid", "groupName", Step::UserdbGroup),
     ] {
         let mut merged = std::collections::BTreeSet::new();
         let mut run = |selector: Option<(&str, Value)>| -> io::Result<()> {
@@ -404,13 +406,13 @@ fn provider_records(service: &str, local: &LocalIdentity<'_>, employees: &[(u32,
             }
             merge_records(&mut merged, records, local, deadline)
         };
-        run(None)?;
-        let targets = lookup_targets(local, employees, user, deadline)?;
+        run(None).map_err(at_step(step))?;
+        let targets = lookup_targets(local, employees, user, deadline).map_err(at_step(step))?;
         for name in targets.iter().map(|(_, name)| name).collect::<std::collections::BTreeSet<_>>() {
-            run(Some((name_key, Value::from(name.clone()))))?;
+            run(Some((name_key, Value::from(name.clone())))).map_err(at_step(step))?;
         }
         for id in targets.iter().map(|(id, _)| *id).collect::<std::collections::BTreeSet<_>>() {
-            run(Some((id_key, Value::from(id))))?;
+            run(Some((id_key, Value::from(id)))).map_err(at_step(step))?;
         }
         results.push(merged.into_iter().collect());
     }
@@ -1017,6 +1019,27 @@ mod tests {
             else { assert_eq!(result.unwrap(), vec![Vec::new(), Vec::new()]); }
             fs::remove_file(fixture.0.join("io.systemd.DynamicUser")).unwrap();
         }
+    }
+
+    /// R8w: a refused user record is `userdb_user`, a refused group record
+    /// `userdb_group`; the refusal itself is unchanged.
+    #[test]
+    fn userdb_refusals_name_the_record_kind() {
+        with_local(|local| {
+            for (user, step) in [(true, Step::UserdbUser), (false, Step::UserdbGroup)] {
+                let error = fixture_provider("org.example.Provider", local, &[(70000, 70000)],
+                    &mut (MAX_HOST_BYTES, MAX_RECORDS), |method, parameters| {
+                        let selected = method == if user { "GetUserRecord" } else { "GetGroupRecord" };
+                        if selected && parameters.as_object().unwrap().len() == 1 {
+                            // Enumeration reveals the employee id from a foreign provider.
+                            fixture_reply(Some(if user { serde_json::json!({"uid":70000,"userName":"duduclaw-emp-70000"}) }
+                                else { serde_json::json!({"gid":70000,"groupName":"duduclaw-emp-70000"}) }))
+                        } else { fixture_reply(None) }
+                    }).unwrap_err();
+                assert_eq!(super::super::step_of(&error), Some(step), "{error}");
+                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            }
+        });
     }
 
     #[test]

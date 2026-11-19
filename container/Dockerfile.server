@@ -66,8 +66,9 @@ RUN if [ -n "$CARGO_JOBS" ]; then export CARGO_BUILD_JOBS="$CARGO_JOBS"; fi && \
     -p duduclaw-cli -p duduclaw-gateway $EXTRA_PACKAGES
 # Never ship a TEST-licence gateway (the scripts/refuse-test-license-build.py rule).
 # rust:slim has no python3, so the same static scan runs as grep -a -F against
-# the marker sed reads from its one definition in license_runtime.rs; fails closed
-# unless the source predates the test issuer; otherwise fails closed on errors.
+# the marker sed reads from its one definition in license_runtime.rs plus the
+# refuser's TEST_ONLY_COMMAND_MARKERS (TEST-only mfa-setup-code-test strings); fails
+# closed unless the source predates the test issuer; otherwise fails closed on errors.
 RUN set -eu; \
     source_file=crates/duduclaw-gateway/src/license_runtime.rs; \
     marker_file=/tmp/test-license-marker; \
@@ -85,6 +86,8 @@ RUN set -eu; \
     if [ "$declarations" != 1 ] || [ "$(grep -c '' "$marker_file")" != 1 ] || [ "$(wc -c < "$marker_file")" -lt 17 ]; then \
         echo "ERROR: cannot read the one TEST_LICENSE_BUILD_MARKER definition in license_runtime.rs" >&2; exit 1; \
     fi; \
+    printf '%s\n' 'mfa-setup-code-test' \
+        'TEST BUILD ONLY: issuing a first-run setup code for automated acceptance' >> "$marker_file"; \
     status=0; \
     matches="$(grep -c -a -F -f "$marker_file" target/release/duduclaw)" || status=$?; \
     rm -f "$marker_file"; \

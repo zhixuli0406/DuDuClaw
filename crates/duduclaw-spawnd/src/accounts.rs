@@ -8,6 +8,177 @@ use crate::registry::HostUidPolicy;
 
 fn denied() -> io::Error { io::Error::new(io::ErrorKind::PermissionDenied, "employee account verification unavailable") }
 
+/// R8w: the fixed step at which an account verification or an allocation
+/// failed. A closed set of identifiers, never input-derived and never file
+/// contents; carried inside the `io::Error` ([`at_step`], [`step_of`]) with
+/// the account it concerns ([`for_account`]). The error's kind and text are
+/// unchanged, so wire codes, readiness.json and the CLI readiness text stay
+/// as they were; only spawnd's journal names the step ([`verification_line`],
+/// [`allocation_line`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    /// `/etc/login.defs` unreadable or malformed.
+    LoginDefs,
+    /// `/etc/subuid` or `/etc/subgid` unreadable or malformed.
+    Subids,
+    /// The registry rows against the host uid policy (version, size,
+    /// overlaps, duplicates), or a `Reserved` row no allocation can resume.
+    RegistryRows,
+    /// `nsswitch.conf`: passwd/group name a module other than files/systemd.
+    NssModules,
+    /// getent passwd/group enumeration: unreadable, alias, foreign row in range.
+    Enumerate,
+    /// The account's passwd row (uid, gid, home, shell).
+    PasswdRow,
+    /// The account's shadow row (`!*`, expired).
+    ShadowRow,
+    /// The account's group list (its own gid only).
+    Groups,
+    /// `/etc/cron.allow`/`/etc/cron.deny` do not deny the account.
+    CronAcl,
+    /// A user crontab of the account exists.
+    CronSpool,
+    /// `/etc/crontab` or `/etc/cron.d` runs a line as the account (or is unreadable).
+    CronTables,
+    /// `/etc/at.allow`/`/etc/at.deny` do not deny the account.
+    AtAcl,
+    /// The at spool holds an entry of the account, or cannot be read.
+    AtSpool,
+    /// A systemd linger file exists for the account.
+    Linger,
+    /// The account's user manager or a logind session of it is active.
+    Sessions,
+    /// `sshd -t` / `sshd -T` do not prove the account denied (or no port).
+    SshConfig,
+    /// The per-account SSH denial probe has no Denied result.
+    SshProbe,
+    /// `/run/systemd/userdb`: a service socket unreadable or incomplete.
+    UserdbService,
+    /// A userdb user record touches the employee namespace.
+    UserdbUser,
+    /// A userdb group record touches the employee namespace.
+    UserdbGroup,
+    /// The pre-creation identity check (an alias or a foreign row).
+    LocalIdentity,
+    /// A candidate uid's getent lookup failed.
+    Candidate,
+    /// spawnd's file-owner inventory of its state directories failed.
+    OwnerInventory,
+    /// Installing cron/at deny entries or the sshd drop-in failed.
+    LoginBarriers,
+    /// groupadd failed.
+    CreateGroup,
+    /// useradd failed, or it left a mail spool.
+    CreateUser,
+    /// usermod/chage/loginctl/systemctl lockdown failed.
+    LockUser,
+    /// Terminating the account's processes, or the no-process readback, failed.
+    Quarantine,
+    /// Allocation: the reservation itself (e.g. the range is exhausted).
+    Reserve,
+    /// Allocation: account creation, no finer step known.
+    CreateAccount,
+    /// Allocation: the final readback (or a Ready employee's re-verification),
+    /// no finer step known.
+    Readback,
+    /// Allocation: the employee already has a row no allocation can use (a
+    /// Tombstone, or a `Reserved` row this process cannot resume).
+    ExistingRow,
+    /// Allocation: persisting the new reservation (before useradd) failed.
+    PersistReservation,
+    /// Allocation: persisting the outcome (Ready/Reserved/Tombstone) failed.
+    PersistFinal,
+    /// Allocation: the registry store is poisoned by an earlier failed save.
+    StorePoisoned,
+    /// Allocation: the monotonic clock (`CLOCK_BOOTTIME`) could not be read.
+    Clock,
+    /// No step was recorded: an error from outside spawnd's labelled checks.
+    /// Never produced by an allocation (every branch of `allocate` is
+    /// labelled; `registry.rs` tests pin each one).
+    Unlabelled,
+}
+impl Step {
+    pub const ALL: [Step; 37] = [Step::LoginDefs, Step::Subids, Step::RegistryRows, Step::NssModules, Step::Enumerate,
+        Step::PasswdRow, Step::ShadowRow, Step::Groups, Step::CronAcl, Step::CronSpool, Step::CronTables, Step::AtAcl,
+        Step::AtSpool, Step::Linger, Step::Sessions, Step::SshConfig, Step::SshProbe, Step::UserdbService, Step::UserdbUser,
+        Step::UserdbGroup, Step::LocalIdentity, Step::Candidate, Step::OwnerInventory, Step::LoginBarriers, Step::CreateGroup,
+        Step::CreateUser, Step::LockUser, Step::Quarantine, Step::Reserve, Step::CreateAccount, Step::Readback,
+        Step::ExistingRow, Step::PersistReservation, Step::PersistFinal, Step::StorePoisoned, Step::Clock, Step::Unlabelled];
+    pub const fn name(self) -> &'static str {
+        match self {
+            Step::LoginDefs => "login_defs", Step::Subids => "subids", Step::RegistryRows => "registry_rows",
+            Step::NssModules => "nss_modules", Step::Enumerate => "enumerate", Step::PasswdRow => "passwd_row",
+            Step::ShadowRow => "shadow_row", Step::Groups => "groups", Step::CronAcl => "cron_acl",
+            Step::CronSpool => "cron_spool", Step::CronTables => "cron_tables", Step::AtAcl => "at_acl",
+            Step::AtSpool => "at_spool", Step::Linger => "linger", Step::Sessions => "sessions",
+            Step::SshConfig => "ssh_config", Step::SshProbe => "ssh_probe", Step::UserdbService => "userdb_service",
+            Step::UserdbUser => "userdb_user", Step::UserdbGroup => "userdb_group", Step::LocalIdentity => "local_identity",
+            Step::Candidate => "candidate", Step::OwnerInventory => "owner_inventory", Step::LoginBarriers => "login_barriers",
+            Step::CreateGroup => "create_group", Step::CreateUser => "create_user", Step::LockUser => "lock_user",
+            Step::Quarantine => "quarantine", Step::Reserve => "reserve", Step::CreateAccount => "create_account",
+            Step::Readback => "readback", Step::ExistingRow => "existing_row", Step::PersistReservation => "persist_reservation",
+            Step::PersistFinal => "persist_final", Step::StorePoisoned => "store_poisoned", Step::Clock => "clock",
+            Step::Unlabelled => "unlabelled",
+        }
+    }
+}
+/// The labelled error: displays exactly as the error it carries.
+#[derive(Debug)]
+struct Stepped { step: Step, uid: Option<u32>, error: io::Error }
+impl std::fmt::Display for Stepped {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { std::fmt::Display::fmt(&self.error, formatter) }
+}
+impl std::error::Error for Stepped {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.error) }
+}
+fn stepped(error: &io::Error) -> Option<&Stepped> { error.get_ref().and_then(|inner| inner.downcast_ref::<Stepped>()) }
+/// Labels an error with `step`, same kind and text. An error that already
+/// carries a step keeps it: the innermost (most specific) step wins.
+pub fn at_step(step: Step) -> impl Fn(io::Error) -> io::Error {
+    move |error| if stepped(&error).is_some() { error } else {
+        let kind = error.kind();
+        io::Error::new(kind, Stepped { step, uid: None, error })
+    }
+}
+/// Records the account (`uid`, spawnd's own registry value) on a labelled
+/// error that names none yet; an unlabelled error is returned unchanged.
+pub fn for_account(uid: u32) -> impl Fn(io::Error) -> io::Error {
+    move |mut error| {
+        if let Some(stepped) = error.get_mut().and_then(|inner| inner.downcast_mut::<Stepped>()) {
+            if stepped.uid.is_none() { stepped.uid = Some(uid); }
+        }
+        error
+    }
+}
+/// The step `error` carries, if any.
+pub fn step_of(error: &io::Error) -> Option<Step> { stepped(error).map(|stepped| stepped.step) }
+/// The account uid `error` names, if any.
+pub fn step_account(error: &io::Error) -> Option<u32> { stepped(error).and_then(|stepped| stepped.uid) }
+/// The error under the step label (itself when unlabelled).
+pub fn unstepped(error: &io::Error) -> &io::Error { stepped(error).map_or(error, |stepped| &stepped.error) }
+/// spawnd's journal line for a failed account verification (after the
+/// `duduclaw-spawnd: ` prefix): `employee account verification failed:
+/// step=<label> account=<duduclaw-emp-NNNNN|->`. Fixed identifiers only.
+pub fn verification_line(error: &io::Error) -> String {
+    format!("employee account verification failed: step={} account={}", step_of(error).unwrap_or(Step::Unlabelled).name(),
+        step_account(error).map_or_else(|| "-".to_string(), account_name))
+}
+/// spawnd's journal line for a failed Allocate: `allocation failed: step=<label>`.
+pub fn allocation_line(error: &io::Error) -> String {
+    format!("allocation failed: step={}", step_of(error).unwrap_or(Step::Unlabelled).name())
+}
+/// The account-verification journal state machine of `Core::refresh`: given
+/// this round's `result` and the line printed last (`last`, updated), the
+/// [`verification_line`] to print now: `Some` only when the failing
+/// step/account differs from the last one printed; a success prints nothing
+/// and resets `last`, so the next failure is printed again.
+pub fn verification_change(last: &mut Option<String>, result: &io::Result<()>) -> Option<String> {
+    let line = result.as_ref().err().map(verification_line);
+    if line == *last { return None; }
+    last.clone_from(&line);
+    line
+}
+
 pub fn parse_login_defs(text: &str) -> io::Result<(UidRange, UidRange)> {
     let mut values = BTreeMap::new();
     for line in text.lines() {
@@ -131,7 +302,7 @@ pub fn nss_supported(text: &str) -> io::Result<()> {
 }
 
 /// R7c: why an account's SSH denial is not proven, carried inside the
-/// `io::Error` of `verify_login` / `login_denied` ([`ssh_refusal`]).
+/// `io::Error` of `verify_locked` / `login_denied` ([`ssh_refusal`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SshRefusal {
     /// No current probe result for the account's key (none yet, expired, or
@@ -161,9 +332,9 @@ impl SshRefusal {
         io::Error::new(kind, self)
     }
 }
-/// The [`SshRefusal`] inside `error`, if any.
+/// The [`SshRefusal`] inside `error` (under a step label too), if any.
 pub fn ssh_refusal(error: &io::Error) -> Option<&SshRefusal> {
-    error.get_ref().and_then(|inner| inner.downcast_ref::<SshRefusal>())
+    unstepped(error).get_ref().and_then(|inner| inner.downcast_ref::<SshRefusal>())
 }
 /// The account's SSH denial is neither proven nor disproven (pending,
 /// inconclusive): an allocation keeps the account resumable instead of
@@ -246,6 +417,14 @@ pub fn partial_identity(account: &EmployeeAccount, users: &[PasswdEntry], groups
 #[cfg(any(target_os = "linux", test))]
 #[path = "accounts_userdb.rs"]
 mod userdb;
+/// R8w: the labelled account checks over a host seam.
+#[cfg(any(target_os = "linux", test))]
+#[path = "accounts_checks.rs"]
+mod checks;
+/// R8w: the at-spool rule (direct inspection, never `at` itself).
+#[cfg(target_os = "linux")]
+#[path = "accounts_spool.rs"]
+pub mod spool;
 
 /// All four credential IDs matter: a different effective uid does not make a
 /// process with the employee's saved uid safe to ignore.
@@ -336,6 +515,8 @@ mod linux {
     }
 
     /// Fixed executable paths and argv only; bounded output, deadline, no inherited env.
+    /// `root_path` keeps root from executing a binary another account owns
+    /// (the binary and every ancestor root-owned, not group/other-writable).
     pub(crate) fn command(path: &str, args: &[&str]) -> io::Result<(i32, String)> {
         root_path(Path::new(path), false)?;
         let (mut output, writer) = UnixStream::pair()?;
@@ -368,6 +549,32 @@ mod linux {
         let (status, text) = command(path, args)?;
         if status != 0 { return Err(denied()); }
         Ok(text)
+    }
+
+    /// R8w: the production host seam of the labelled checks
+    /// (`accounts_checks.rs`). Executables only through [`command`] (fixed
+    /// root-owned paths; `/usr/bin/at` is no longer one of them: the at jobs
+    /// are read from the spool, `accounts_spool.rs`).
+    pub(crate) struct RootSeam;
+    impl checks::HostSeam for RootSeam {
+        fn run(&mut self, path: &'static str, args: &[&str]) -> io::Result<(i32, String)> { command(path, args) }
+        fn text(&mut self, path: &Path) -> io::Result<String> { host_text(path) }
+        fn optional_text(&mut self, path: &Path) -> io::Result<Option<String>> { optional_text(path) }
+        fn present(&mut self, path: &Path) -> io::Result<bool> {
+            match fs::symlink_metadata(path) {
+                Ok(_) => Ok(true),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(error),
+            }
+        }
+        fn cron_d(&mut self) -> io::Result<Vec<std::path::PathBuf>> {
+            let directory = Path::new("/etc/cron.d");
+            if !checks::HostSeam::present(self, directory)? { return Ok(Vec::new()); }
+            root_path(directory, true)?;
+            fs::read_dir(directory)?.map(|entry| entry.map(|entry| entry.path())).collect()
+        }
+        fn at_spool(&mut self, uid: u32) -> io::Result<()> { super::spool::installed_at_spools_clear(uid) }
+        fn mail_spool(&mut self, name: &str) -> io::Result<()> { mail_spool_absent(Path::new("/"), name) }
     }
 
     fn replace_root_file(path: &Path, text: &str) -> io::Result<()> {
@@ -408,9 +615,13 @@ mod linux {
     }
 
     impl LinuxAccounts<'_> {
+        /// `local_identity` (the inner nss/userdb steps keep their own labels).
         fn partial_local_identity(&self, account: &EmployeeAccount) -> io::Result<(bool, bool)> {
+            self.local_identity(account).map_err(at_step(Step::LocalIdentity))
+        }
+        fn local_identity(&self, account: &EmployeeAccount) -> io::Result<(bool, bool)> {
             let registry = Registry { employees: vec![account.clone()], ..Registry::default() };
-            nss_supported(&host_text(Path::new("/etc/nsswitch.conf"))?)?;
+            host_text(Path::new("/etc/nsswitch.conf")).and_then(|text| nss_supported(&text)).map_err(at_step(Step::NssModules))?;
             let nss = partial_identity(account, &parse_passwd(&success("/usr/bin/getent", &["passwd"])?)?,
                 &parse_group(&success("/usr/bin/getent", &["group"])?)?)?;
             let local = partial_identity(account, &parse_passwd(&host_text(Path::new("/etc/passwd"))?)?,
@@ -463,22 +674,19 @@ mod linux {
             Ok(())
         }
 
+        /// `lock_user` (`checks::lock_existing`), then `login_barriers`.
         fn lockdown_existing(&self, account: &EmployeeAccount) -> io::Result<()> {
-            let name = account_name(account.uid);
-            success("/usr/sbin/usermod", &["--password", "!*", "--expiredate", "1970-01-02",
-                "--shell", "/usr/sbin/nologin", "--home", "/nonexistent", "--groups", "", &name])?;
-            success("/usr/bin/chage", &["-E", "1", &name])?;
-            success("/usr/bin/loginctl", &["disable-linger", &name])?;
-            let uid = account.uid.to_string();
-            if success("/usr/bin/loginctl", &["list-sessions", "--no-legend", "--no-pager"])?.lines()
-                .any(|line| line.split_whitespace().nth(1) == Some(uid.as_str())) {
-                success("/usr/bin/loginctl", &["terminate-user", &uid])?;
-            }
-            success("/usr/bin/systemctl", &["stop", &format!("user@{}.service", account.uid)])?;
-            self.install_login_barriers(&name)
+            checks::lock_existing(&mut RootSeam, account)?;
+            self.install_login_barriers(&account_name(account.uid)).map_err(at_step(Step::LoginBarriers))
         }
 
+        /// `userdb_user`/`userdb_group` per record (`accounts_userdb.rs`);
+        /// everything else (the directory, a socket, the local files) is
+        /// `userdb_service`.
         fn userdb_identities(&self, ranges: &[UidRange], employees: &[(u32, u32)]) -> io::Result<Vec<Vec<(u32, String)>>> {
+            self.userdb_records(ranges, employees).map_err(at_step(Step::UserdbService))
+        }
+        fn userdb_records(&self, ranges: &[UidRange], employees: &[(u32, u32)]) -> io::Result<Vec<Vec<(u32, String)>>> {
             match fs::symlink_metadata("/run/systemd/userdb") {
                 Ok(_) => root_path(Path::new("/run/systemd/userdb"), true)?,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -493,79 +701,41 @@ mod linux {
         }
 
         fn userdb(&self, registry: &Registry) -> io::Result<()> {
-            for values in self.userdb_identities(&[registry.range],
-                &registry.employees.iter().map(|entry| (entry.uid, entry.gid)).collect::<Vec<_>>())? {
+            for (index, values) in self.userdb_identities(&[registry.range],
+                &registry.employees.iter().map(|entry| (entry.uid, entry.gid)).collect::<Vec<_>>())?.into_iter().enumerate() {
+                let step = if index == 0 { Step::UserdbUser } else { Step::UserdbGroup };
                 let mut seen = std::collections::BTreeSet::new();
                 for (id, name) in values {
                     if id >= registry.range.first && id <= registry.range.last
                         && (!seen.insert(id) || !registry.employees.iter().any(|entry| entry.uid == id && name == account_name(id))) {
-                        return Err(denied());
+                        return Err(at_step(step)(denied()));
                     }
                 }
             }
             Ok(())
         }
 
-        fn verify_schedulers(&self, name: &str) -> io::Result<()> {
-            for family in ["cron", "at"] {
-                let allow = optional_text(Path::new(&format!("/etc/{family}.allow")))?;
-                let deny = host_text(Path::new(&format!("/etc/{family}.deny")))?;
-                if !scheduler_denied(name, allow.as_deref(), &deny) { return Err(denied()); }
-            }
-            for path in [format!("/var/spool/cron/crontabs/{name}"), format!("/var/spool/cron/{name}")] {
-                match fs::symlink_metadata(path) { Ok(_) => return Err(denied()),
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}, Err(error) => return Err(error) }
-            }
-            let mut cron_files = vec![Path::new("/etc/crontab").to_path_buf()];
-            if Path::new("/etc/cron.d").exists() {
-                root_path(Path::new("/etc/cron.d"), true)?;
-                for file in fs::read_dir("/etc/cron.d")? { cron_files.push(file?.path()); }
-            }
-            for file in cron_files {
-                let Some(text) = optional_text(&file)? else { continue };
-                for line in text.lines() {
-                    let words: Vec<_> = line.split('#').next().unwrap_or("").split_whitespace().collect();
-                    let owner = if words.first().is_some_and(|word| word.as_bytes().first() == Some(&b'@')) {
-                        words.get(1)
-                    } else { words.get(5) };
-                    if owner.is_some_and(|owner| *owner == name) { return Err(denied()); }
-                }
-            }
-            if Path::new("/usr/bin/at").exists() {
-                if success("/usr/bin/at", &["-l"])?.lines().any(|line| line.split_whitespace().last() == Some(name)) { return Err(denied()); }
-            } else if Path::new("/var/spool/cron/atjobs").exists() || Path::new("/var/spool/at").exists() {
-                return Err(denied());
+        /// The SSH part of `verify_locked` (the rest is
+        /// `checks::verify_account`): no `/usr/sbin/sshd` ⇒ nothing to check;
+        /// otherwise `ssh_config`, then (admission) `ssh_probe`.
+        fn verify_ssh(&self, account: &EmployeeAccount) -> io::Result<()> {
+            if !checks::ssh_present(&mut RootSeam)? { return Ok(()); }
+            // R7c order: spawnd's OWN `sshd -T` must deny the account
+            // (and name a port) BEFORE any probe result is consulted
+            // (`ssh_account_key` refuses otherwise); the unprivileged
+            // probe cannot run `sshd -T` and never checks it.
+            let key = self.ssh_account_key(account)?;
+            // Then the probe's result for the CURRENT key (a lookup asks
+            // the worker for a missing, stale or expired one; never blocks).
+            let outcome = self.ssh.lookup(&key);
+            if self.require_probe {
+                if let Some(refusal) = crate::ssh_evidence::refusal(outcome.as_ref()) { return Err(checks::probe_refused(refusal)); }
             }
             Ok(())
         }
 
-        fn verify_login(&self, account: &EmployeeAccount) -> io::Result<()> {
-            let name = account_name(account.uid);
-            if Path::new(&format!("/var/lib/systemd/linger/{name}")).exists() { return Err(denied()); }
-            let unit = format!("user@{}.service", account.uid);
-            let state = success("/usr/bin/systemctl", &["show", "--property=ActiveState", "--value", &unit])?;
-            if !matches!(state.trim(), "inactive" | "failed") { return Err(denied()); }
-            let uid = account.uid.to_string();
-            if success("/usr/bin/loginctl", &["list-sessions", "--no-legend", "--no-pager"])?.lines()
-                .any(|line| line.split_whitespace().nth(1) == Some(uid.as_str())) { return Err(denied()); }
-            // No /usr/sbin/sshd: SSH checks do not apply to this host.
-            if Path::new("/usr/sbin/sshd").exists() {
-                // R7c order: spawnd's OWN `sshd -T` must deny the account
-                // (and name a port) BEFORE any probe result is consulted
-                // (`ssh_account_key` refuses otherwise); the unprivileged
-                // probe cannot run `sshd -T` and never checks it.
-                let key = self.ssh_account_key(account)?;
-                // Then the probe's result for the CURRENT key (a lookup asks
-                // the worker for a missing, stale or expired one; never blocks).
-                let outcome = self.ssh.lookup(&key);
-                if self.require_probe {
-                    if let Some(refusal) = crate::ssh_evidence::refusal(outcome.as_ref()) { return Err(refusal.error()); }
-                }
-            }
-            Ok(())
-        }
-
-        /// `sshd -t`, then the account's effective configuration
+        /// `ssh_config` (`checks::ssh_effective`): `sshd -t`, then the
+        /// account's effective configuration
         /// (`sshd -T -C user=<name>,host=localhost,addr=127.0.0.1`) must deny
         /// it ([`ssh_effective_denied`]: the shared parser) and name a first
         /// `port` (refused with [`SSH_PORT_UNKNOWN`] otherwise); the probe key
@@ -574,14 +744,44 @@ mod linux {
         fn ssh_account_key(&self, account: &EmployeeAccount) -> io::Result<crate::ssh_evidence::AccountKey> {
             use sha2::{Digest, Sha256};
             let name = account_name(account.uid);
-            success("/usr/sbin/sshd", &["-t"])?;
-            let context = format!("user={name},host=localhost,addr=127.0.0.1");
-            let effective = success("/usr/sbin/sshd", &["-T", "-C", &context])?;
-            let facts = duduclaw_isolation::ssh_config::SshdEffective::parse(&effective);
-            if !facts.denies_employees() { return Err(denied()); }
-            let port = facts.port.ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, SSH_PORT_UNKNOWN))?;
+            let (effective, port) = checks::ssh_effective(&mut RootSeam, &name)?;
             Ok(crate::ssh_evidence::AccountKey { account: name, uid: account.uid,
                 sshd_config: duduclaw_isolation::ids::Sha256Digest(Sha256::digest(effective.as_bytes()).into()), port })
+        }
+
+        /// `create_locked`'s steps: `local_identity`, `login_barriers`, then
+        /// `checks::create_account` (`create_group`, `create_user`,
+        /// `lock_user`) and the readback.
+        fn create_steps(&mut self, account: &EmployeeAccount) -> io::Result<()> {
+            if self.partial_local_identity(account)? != (false, false) { return Err(at_step(Step::LocalIdentity)(denied())); }
+            self.install_login_barriers(&account_name(account.uid)).map_err(at_step(Step::LoginBarriers))?;
+            checks::create_account(&mut RootSeam, account)?;
+            self.verify_locked(account)
+        }
+
+        /// `recover_locked`'s steps: `local_identity`, the lockdown of an
+        /// existing user (`lock_user`, `login_barriers`), `quarantine` (no
+        /// process of the uid), then the readback.
+        fn recover_steps(&mut self, account: &EmployeeAccount) -> io::Result<()> {
+            let (user, group) = self.partial_local_identity(account)?;
+            if user && !group { return Err(at_step(Step::LocalIdentity)(denied())); }
+            if user { self.lockdown_existing(account)?; }
+            // No user is ever recreated for a tombstone. A group-only residue
+            // stays reserved and cannot be assigned to a future employee.
+            Self::quarantine(account).map_err(at_step(Step::Quarantine))?;
+            if user { self.verify_locked(account)?; }
+            Ok(())
+        }
+        fn quarantine(account: &EmployeeAccount) -> io::Result<()> {
+            for process in unexpected_processes(account.uid, None)? {
+                terminate_intruder(&process, account.uid, None)?;
+            }
+            let deadline = Instant::now() + Duration::from_secs(COMMAND_SECONDS);
+            loop {
+                if unexpected_processes(account.uid, None)?.is_empty() { return Ok(()); }
+                if Instant::now() >= deadline { return Err(denied()); }
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
     }
 
@@ -670,93 +870,43 @@ mod linux {
     }
 
     impl AccountHost for LinuxAccounts<'_> {
-        fn policy(&mut self) -> io::Result<HostUidPolicy> {
-            let (system, login) = parse_login_defs(&host_text(Path::new("/etc/login.defs"))?)?;
-            Ok(HostUidPolicy { system, login,
-                subuids: parse_subids(&host_text(Path::new("/etc/subuid"))?)?,
-                subgids: parse_subids(&host_text(Path::new("/etc/subgid"))?)?,
-                systemd: duduclaw_isolation::ids::PERMANENT_UID_EXCLUSIONS.to_vec() })
-        }
+        /// `login_defs`, `subids` (`checks::host_policy`).
+        fn policy(&mut self) -> io::Result<HostUidPolicy> { checks::host_policy(&mut RootSeam) }
 
+        /// `nss_modules`, `enumerate`, every account with a passwd row in the
+        /// range (tombstones included: `verify_locked`'s labels), then
+        /// `userdb_*`.
         fn verify_namespace(&mut self, registry: &Registry) -> io::Result<()> {
-            nss_supported(&host_text(Path::new("/etc/nsswitch.conf"))?)?;
-            let users = parse_passwd(&success("/usr/bin/getent", &["passwd"])?)?;
-            let groups = parse_group(&success("/usr/bin/getent", &["group"])?)?;
-            if users.is_empty() || groups.is_empty() { return Err(denied()); }
-            verify_enumerated(registry, &users, &groups)?;
-            // A retired/partially-created account must not regain a login entry
-            // merely because its permanent registry row is a tombstone.
-            for user in users.iter().filter(|user| user.uid >= registry.range.first && user.uid <= registry.range.last) {
-                let account = registry.employees.iter().find(|entry| entry.uid == user.uid).ok_or_else(denied)?;
-                self.verify_locked(account)?;
+            for account in checks::enumerated_accounts(&mut RootSeam, registry)? {
+                self.verify_locked(&account)?;
             }
             self.userdb(registry)
         }
 
-        fn uid_available(&mut self, uid: u32) -> io::Result<bool> {
-            let id = uid.to_string();
-            let name = account_name(uid);
-            for database in ["passwd", "group"] {
-                for key in [&id, &name] {
-                    match command("/usr/bin/getent", &[database, key])? {
-                        (0, _) => return Ok(false), (2, text) if text.is_empty() => {}, _ => return Err(denied()),
-                    }
-                }
-            }
-            // File owners are checked once per allocation (`occupied_ids`).
-            Ok(true)
-        }
+        /// `candidate`. File owners are checked once per allocation (`occupied_ids`).
+        fn uid_available(&mut self, uid: u32) -> io::Result<bool> { checks::uid_free(&mut RootSeam, uid) }
 
         /// R7b: the employee-range uids and gids owning anything in spawnd's
         /// own state directories (`crate::owner_inventory`), scanned once per
-        /// allocation; a failed or bounded-out scan refuses the allocation.
+        /// allocation; a failed or bounded-out scan refuses the allocation
+        /// (`owner_inventory`).
         fn occupied_ids(&mut self, range: UidRange) -> io::Result<std::collections::BTreeSet<u32>> {
-            Ok(crate::owner_inventory::scan_installed(range)?.occupied())
+            crate::owner_inventory::scan_installed(range).map(|inventory| inventory.occupied()).map_err(at_step(Step::OwnerInventory))
         }
 
         fn create_locked(&mut self, account: &EmployeeAccount) -> io::Result<()> {
-            let uid = account.uid.to_string();
-            let name = account_name(account.uid);
-            if self.partial_local_identity(account)? != (false, false) { return Err(denied()); }
-            self.install_login_barriers(&name)?;
-            success("/usr/sbin/groupadd", &["--gid", &uid, &name])?;
-            success("/usr/sbin/useradd", &useradd_arguments(&uid, &name))?;
-            mail_spool_absent(Path::new("/"), &name)?;
-            success("/usr/bin/chage", &["-E", "1", &name])?;
-            success("/usr/bin/loginctl", &["disable-linger", &name])?;
-            self.verify_locked(account)
+            self.create_steps(account).map_err(for_account(account.uid))
         }
 
         fn recover_locked(&mut self, account: &EmployeeAccount) -> io::Result<()> {
-            let (user, group) = self.partial_local_identity(account)?;
-            if user && !group { return Err(denied()); }
-            if user { self.lockdown_existing(account)?; }
-            // No user is ever recreated for a tombstone. A group-only residue
-            // stays reserved and cannot be assigned to a future employee.
-            for process in unexpected_processes(account.uid, None)? {
-                terminate_intruder(&process, account.uid, None)?;
-            }
-            let deadline = Instant::now() + Duration::from_secs(COMMAND_SECONDS);
-            loop {
-                if unexpected_processes(account.uid, None)?.is_empty() { break; }
-                if Instant::now() >= deadline { return Err(denied()); }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            if user { self.verify_locked(account)?; }
-            Ok(())
+            self.recover_steps(account).map_err(for_account(account.uid))
         }
 
+        /// `checks::verify_account` (`passwd_row` … `sessions`), then the
+        /// SSH part (`ssh_config`, `ssh_probe`).
         fn verify_locked(&mut self, account: &EmployeeAccount) -> io::Result<()> {
-            let name = account_name(account.uid);
-            let users = parse_passwd(&success("/usr/bin/getent", &["passwd", &name])?)?;
-            if users.len() != 1 || users[0].uid != account.uid || users[0].gid != account.gid
-                || users[0].home != "/nonexistent" || users[0].shell != "/usr/sbin/nologin" { return Err(denied()); }
-            verify_shadow(&success("/usr/bin/getent", &["shadow", &name])?, &name)?;
-            let groups = success("/usr/bin/id", &["--groups", &name])?;
-            let actual: Vec<u32> = groups.split_whitespace().map(|value| value.parse().map_err(|_| denied())).collect::<io::Result<_>>()?;
-            if actual != [account.gid] { return Err(denied()); }
-            self.verify_schedulers(&name)?;
-            self.verify_login(account)
+            checks::verify_account(&mut RootSeam, account)?;
+            self.verify_ssh(account).map_err(for_account(account.uid))
         }
 
         /// R7c allocation (F6: never waits): the account's current probe
@@ -764,15 +914,19 @@ mod linux {
         /// otherwise a forced probe is queued (ahead of background requests;
         /// again after an inconclusive result, see
         /// `ssh_evidence::FORCED_RETRY_MS`) and the [`SshRefusal`] is returned
-        /// at once (no result yet ⇒ `Pending`). Same order as `verify_login`:
-        /// spawnd's own `sshd -T` first. Hosts without `/usr/sbin/sshd` skip it.
+        /// at once (no result yet ⇒ `Pending`, labelled `ssh_probe`). Same
+        /// order as `verify_locked`: spawnd's own `sshd -T` first
+        /// (`ssh_config`). Hosts without `/usr/sbin/sshd` skip it.
         fn login_denied(&mut self, account: &EmployeeAccount) -> io::Result<()> {
-            if !Path::new("/usr/sbin/sshd").exists() { return Ok(()); }
-            let key = self.ssh_account_key(account)?;
-            match crate::ssh_evidence::refusal(self.ssh.request(&key).as_ref()) {
-                None => Ok(()),
-                Some(refusal) => Err(refusal.error()),
-            }
+            let result = (|| -> io::Result<()> {
+                if !checks::ssh_present(&mut RootSeam)? { return Ok(()); }
+                let key = self.ssh_account_key(account)?;
+                match crate::ssh_evidence::refusal(self.ssh.request(&key).as_ref()) {
+                    None => Ok(()),
+                    Some(refusal) => Err(checks::probe_refused(refusal)),
+                }
+            })();
+            result.map_err(for_account(account.uid))
         }
     }
 
@@ -984,6 +1138,87 @@ mod tests {
             assert_eq!(ssh_refusal(&other), None);
             assert!(!probe_unresolved(&other));
         }
+    }
+    /// R8w item 2: the labels are a closed set of fixed identifiers; the
+    /// journal lines have one shape, the step from that set and the account
+    /// only as spawnd's own `duduclaw-emp-<digits>` name (or `-`); the
+    /// innermost step wins and the error's kind and text stay unchanged.
+    #[test]
+    fn step_labels_and_journal_lines_have_a_fixed_shape() {
+        let mut names = std::collections::BTreeSet::new();
+        for step in Step::ALL {
+            let name = step.name();
+            assert!(!name.is_empty() && name.bytes().all(|byte| byte.is_ascii_lowercase() || byte == b'_'), "{name}");
+            assert!(names.insert(name), "duplicate label {name}");
+        }
+        for name in ["login_defs", "nss_modules", "enumerate", "passwd_row", "shadow_row", "groups", "cron_acl", "cron_spool",
+            "cron_tables", "at_acl", "at_spool", "ssh_config", "ssh_probe", "linger", "userdb_user", "userdb_group",
+            "create_group", "create_user", "lock_user", "existing_row", "persist_reservation", "persist_final",
+            "store_poisoned", "clock"] {
+            assert!(names.contains(name), "{name}");
+        }
+        let error = for_account(70000)(at_step(Step::AtSpool)(denied()));
+        assert_eq!(verification_line(&error), "employee account verification failed: step=at_spool account=duduclaw-emp-70000");
+        assert_eq!((error.kind(), error.to_string()), (io::ErrorKind::PermissionDenied, denied().to_string()));
+        assert_eq!(unstepped(&error).to_string(), denied().to_string());
+        // The innermost step and the first account stay.
+        let outer = for_account(70001)(at_step(Step::Readback)(error));
+        assert_eq!((step_of(&outer), step_account(&outer)), (Some(Step::AtSpool), Some(70000)));
+        assert_eq!(allocation_line(&outer), "allocation failed: step=at_spool");
+        assert_eq!(verification_line(&at_step(Step::NssModules)(denied())),
+            "employee account verification failed: step=nss_modules account=-");
+        // Nothing recorded: the fixed fallback, never the error text.
+        let plain = for_account(70000)(io::Error::other("/etc/shadow: secret detail"));
+        assert_eq!(verification_line(&plain), "employee account verification failed: step=unlabelled account=-");
+        assert_eq!(allocation_line(&plain), "allocation failed: step=unlabelled");
+        for step in Step::ALL {
+            for uid in [None, Some(70000), Some(99999)] {
+                let mut error = at_step(step)(io::Error::new(io::ErrorKind::NotFound, "input-derived text"));
+                if let Some(uid) = uid { error = for_account(uid)(error); }
+                assert_eq!(error.kind(), io::ErrorKind::NotFound);
+                let line = verification_line(&error);
+                let rest = line.strip_prefix("employee account verification failed: step=").unwrap();
+                let (label, account) = rest.split_once(" account=").unwrap();
+                assert_eq!(label, step.name());
+                assert!(account == "-" || account.strip_prefix("duduclaw-emp-")
+                    .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())), "{line}");
+                assert!(!line.contains("input-derived"), "{line}");
+                assert_eq!(allocation_line(&error), format!("allocation failed: step={}", step.name()));
+            }
+        }
+    }
+    /// R8w round 1: the account-verification journal line is printed only
+    /// when the failing step/account changes, and a success resets it (the
+    /// same failure after a success is printed again; a success prints nothing).
+    #[test]
+    fn verification_line_is_printed_on_change_and_reset_on_success() {
+        let fail = |step: Step, uid: Option<u32>| -> io::Result<()> {
+            let error = at_step(step)(denied());
+            Err(match uid { Some(uid) => for_account(uid)(error), None => error })
+        };
+        let mut last = None;
+        assert_eq!(verification_change(&mut last, &Ok(())), None, "a first success prints nothing");
+        let at = "employee account verification failed: step=at_spool account=duduclaw-emp-70000";
+        assert_eq!(verification_change(&mut last, &fail(Step::AtSpool, Some(70000))).as_deref(), Some(at));
+        for _ in 0..3 {
+            assert_eq!(verification_change(&mut last, &fail(Step::AtSpool, Some(70000))), None, "unchanged: not again");
+        }
+        assert_eq!(last.as_deref(), Some(at));
+        // Another account, then another step: each change is printed once.
+        assert_eq!(verification_change(&mut last, &fail(Step::AtSpool, Some(70001))).as_deref(),
+            Some("employee account verification failed: step=at_spool account=duduclaw-emp-70001"));
+        assert_eq!(verification_change(&mut last, &fail(Step::NssModules, None)).as_deref(),
+            Some("employee account verification failed: step=nss_modules account=-"));
+        assert_eq!(verification_change(&mut last, &fail(Step::NssModules, None)), None);
+        // Success resets (prints nothing); the same failure is then printed again.
+        assert_eq!(verification_change(&mut last, &Ok(())), None);
+        assert_eq!(last, None);
+        assert_eq!(verification_change(&mut last, &Ok(())), None);
+        assert_eq!(verification_change(&mut last, &fail(Step::NssModules, None)).as_deref(),
+            Some("employee account verification failed: step=nss_modules account=-"));
+        // An unlabelled error is a line too (the fixed fallback, never its text).
+        assert_eq!(verification_change(&mut last, &Err(io::Error::other("secret"))).as_deref(),
+            Some("employee account verification failed: step=unlabelled account=-"));
     }
     #[test]
     fn recovery_rejects_aliases_and_accepts_group_only_residue() {

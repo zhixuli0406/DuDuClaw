@@ -92,6 +92,11 @@ impl PublicKeyRegistry {
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
     }
+
+    /// Number of registered (id, key) entries.
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
 }
 
 #[cfg(test)]

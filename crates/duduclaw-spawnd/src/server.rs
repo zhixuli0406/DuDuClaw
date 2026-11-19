@@ -4,7 +4,7 @@ use duduclaw_isolation::{execution::{RunHandle, RuntimeKind, PtySize}, ids::{Emp
     ipc::{self, CleanupReadback, ControlConnectionId, Envelope, ErrorCode, HelperCallId, Opcode, SpawnRequest, SpawnResponse}};
 use crate::{admission::{Coordinator, Host, HostProgress, LaunchPolicy, Limits, Ticket, BROKER_REPLY_MS},
     audit::{Detail, Event, Record}, fds::{self, SnapshotAuthority},
-    readiness::Readiness, transport::{Listener, Seqpacket}, Result};
+    readiness::Readiness, start_refusal::{LineLimiter, StartStep}, transport::{Listener, Seqpacket}, Result};
 
 const MAX_CONNECTIONS: usize = 32;
 const IDLE_CONNECTION_MS: u64 = 60_000;
@@ -140,19 +140,14 @@ pub fn serve_with_drain<H: Host<Inputs = Vec<OwnedFd>, Io = Vec<OwnedFd>>>(liste
     if let Some(barrier) = &drain { coordinator.set_drain_barrier(barrier.clone()); }
     coordination_time_ms()?;
     let mut clients: Vec<Client> = Vec::new();
+    let mut refusal_lines = LineLimiter::new("start refused", crate::start_refusal::label_bound());
+    let mut journal = |line: String| eprintln!("duduclaw-spawnd: {line}");
     loop {
         // Read before any admission of this iteration; reported after them.
         let epoch = drain.as_ref().map(crate::admission::DrainBarrier::epoch);
         let now = coordination_time_ms()?;
         if STOP.load(Ordering::Relaxed) {
-            coordinator.begin_shutdown(now);
-            let until = Instant::now() + Duration::from_secs(10);
-            while coordinator.has_active_runs() && Instant::now() < until {
-                let now = coordination_time_ms()?;
-                let _ = coordinator.tick(now);
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            return if coordinator.has_active_runs() { Err(unavailable()) } else { Ok(()) };
+            return shut_down(&mut coordinator, now, &mut refusal_lines, &mut journal);
         }
         // Host adapters may not block this loop: slow probes/startup belong in
         // adapter-owned jobs with finite deadlines, observed by poll().
@@ -165,7 +160,9 @@ pub fn serve_with_drain<H: Host<Inputs = Vec<OwnedFd>, Io = Vec<OwnedFd>>>(liste
                     if clients.iter().any(|client| client.id == id) { return Err(unavailable()); }
                     clients.push(Client { socket, id, last_request: now, deferred: None });
                 }
-                Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::PermissionDenied) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                // R8y: a peer that is not the gateway (no request is read).
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => coordinator.note_refusal(StartStep::Peer),
                 Err(error) => return Err(error),
             }
         }
@@ -208,8 +205,47 @@ pub fn serve_with_drain<H: Host<Inputs = Vec<OwnedFd>, Io = Vec<OwnedFd>>>(liste
         if let (Some(barrier), Some(epoch)) = (&drain, epoch) {
             barrier.observe(epoch, coordinator.admitted_runs(), healthy);
         }
+        // R8y: one fixed journal line per refused start (no id, no path).
+        // R8y review round 1 (F2): rate limited per label (`LineLimiter`:
+        // the first 5 per label per 10 s, then one `suppressed=<count>`
+        // line per label when the window ends; this loop is the flush cadence).
+        journal_refusals(&mut coordinator, &mut refusal_lines, Instant::now(), &mut journal);
         std::thread::sleep(Duration::from_millis(25));
     }
+}
+
+/// R8y: the coordinator's pending refusal tally through the server's limiter
+/// into `sink` (the journal), then the limiter's ended-window summaries.
+fn journal_refusals<H: Host>(coordinator: &mut Coordinator<H>, lines: &mut LineLimiter, instant: Instant,
+    sink: &mut dyn FnMut(String)) {
+    for (step, count) in coordinator.take_refusal_counts() {
+        for line in lines.note(step.line(), count, instant) { sink(line); }
+    }
+    for line in lines.flush(instant) { sink(line); }
+}
+
+/// The normal (SIGTERM/SIGINT) exit: stop admission, cancel and wait up to
+/// 10 s for active runs. R8y review round 2: then, in this order, the
+/// coordinator's pending refusal tally (incl. the cancels of shutdown itself)
+/// goes into the limiter and the limiter is drained, so a `suppressed=<count>`
+/// of an unfinished window is printed before spawnd exits. A clock failure
+/// while waiting still drains before it is returned.
+fn shut_down<H: Host>(coordinator: &mut Coordinator<H>, now: u64, lines: &mut LineLimiter,
+    sink: &mut dyn FnMut(String)) -> io::Result<()> {
+    coordinator.begin_shutdown(now);
+    let until = Instant::now() + Duration::from_secs(10);
+    let mut waited = Ok(());
+    while coordinator.has_active_runs() && Instant::now() < until {
+        match coordination_time_ms() {
+            Ok(now) => { let _ = coordinator.tick(now); }
+            Err(error) => { waited = Err(error); break; }
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    journal_refusals(coordinator, lines, Instant::now(), sink);
+    for line in lines.drain() { sink(line); }
+    waited?;
+    if coordinator.has_active_runs() { Err(unavailable()) } else { Ok(()) }
 }
 
 /// Encode, audit and send one reply. `true` means the connection must close.
@@ -303,17 +339,38 @@ fn finish<H: Host<Inputs = Vec<OwnedFd>, Io = Vec<OwnedFd>>>(coordinator: &mut C
 fn dispatch<H: Host<Inputs = Vec<OwnedFd>, Io = Vec<OwnedFd>>>(coordinator: &mut Coordinator<H>,
     connection: ControlConnectionId, packet: crate::transport::Packet, snapshots: SnapshotAuthority,
     now: u64) -> io::Result<Reply> {
-    let frame = ipc::decode::<SpawnRequest>(&packet.bytes).map_err(|_| unavailable())?;
+    let frame = match ipc::decode::<SpawnRequest>(&packet.bytes) {
+        Ok(frame) => frame,
+        Err(_) => {
+            // R8y: the op is unknown; the connection is closed without a reply.
+            coordinator.note_refusal(StartStep::Frame);
+            return Err(unavailable());
+        }
+    };
     let request_id = frame.request_id;
     let subject = Subject::of(&frame.message);
     let subject = subject.resolve(subject.run.and_then(|run| coordinator.run_employee(RunHandle(run))));
+    // R8y: the server's own refusals of a run start are labelled here; the
+    // coordinator labels its own (`Coordinator::reserve`/`start`).
+    let start_op = matches!(subject.op, Opcode::ReserveRun | Opcode::StartRun);
     let result = (|| -> Result<Dispatched> {
         // Preserve closed validation codes before fd_plan maps them to InvalidFds.
-        frame.message.validation_code()?;
-        fds::validate_start(&frame.message, &packet.fds, snapshots).map_err(|_| ErrorCode::InvalidFds)?;
+        if let Err(code) = frame.message.validation_code() {
+            if start_op { coordinator.note_refusal(StartStep::Request); }
+            return Err(code);
+        }
+        if fds::validate_start(&frame.message, &packet.fds, snapshots).is_err() {
+            if start_op { coordinator.note_refusal(StartStep::Fds); }
+            return Err(ErrorCode::InvalidFds);
+        }
         let response = match frame.message {
-            SpawnRequest::ReserveRun { employee_id } => coordinator.reserve(connection, employee_id,
-                RunHandle(RunId(random_id().map_err(|_| ErrorCode::Internal)?)), now)?,
+            SpawnRequest::ReserveRun { employee_id } => {
+                let Ok(id) = random_id() else {
+                    coordinator.note_refusal(StartStep::RunId);
+                    return Err(ErrorCode::Internal);
+                };
+                coordinator.reserve(connection, employee_id, RunHandle(RunId(id)), now)?
+            }
             request @ SpawnRequest::StartRun { .. } => coordinator.start(connection, request, packet.fds, now)?,
             SpawnRequest::Cancel { run } => { coordinator.cancel(run, connection, now)?; SpawnResponse::Ack }
             SpawnRequest::Status { run } => SpawnResponse::Status { run, status: coordinator.status(run, connection)? },
@@ -427,8 +484,74 @@ mod tests {
                 assert_eq!(record.detail, Some(Detail::Code { code: ErrorCode::StepLimitDenied }));
                 assert_eq!(serde_json::to_value(&record).unwrap()["detail"]["code"], "step_limit_denied");
                 assert_eq!(coordinator.admitted_runs(), 0);
+                // R8y: exactly one labelled refusal, from the server's own validation.
+                assert_eq!(coordinator.take_refusals(), vec![StartStep::Request]);
             }
         }
+    }
+    /// R8y: the server's own start exits are labelled (an undecodable frame,
+    /// a ReserveRun refused by the host gate); other ops record nothing.
+    #[test]
+    fn server_start_refusals_are_labelled() {
+        let mut coordinator = Coordinator::new(UnavailableHost, Limits::default()).unwrap();
+        let authority = SnapshotAuthority { gateway_uid: 1000, mount_id: 1 };
+        let (gateway, server) = Seqpacket::pair().unwrap();
+        gateway.send(&ipc::frame_payload(b"{}").unwrap(), &[]).unwrap();
+        assert!(dispatch(&mut coordinator, ControlConnectionId([1; 16]), server.recv().unwrap(), authority, 100).is_err());
+        assert_eq!(coordinator.take_refusals(), vec![StartStep::Frame]);
+        let reserve = Envelope { version: ipc::PROTOCOL_VERSION, request_id: RequestId([4; 16]),
+            message: SpawnRequest::ReserveRun { employee_id: EmployeeId([2; 16]) } };
+        gateway.send(&ipc::encode(&reserve).unwrap(), &[]).unwrap();
+        let Ok(Reply::Now(response, ..)) = dispatch(&mut coordinator, ControlConnectionId([1; 16]), server.recv().unwrap(), authority, 100)
+            else { panic!("unexpected reply") };
+        // The wire code is unchanged; only the journal names the step.
+        assert_eq!(response.message, SpawnResponse::Error { code: ErrorCode::IsolationUnavailable });
+        assert_eq!(coordinator.take_refusals(), vec![StartStep::Gate(crate::start_refusal::Gate::Host)]);
+        // R8y review round 1: a valid StartRun without its prompt fd is `fds`
+        // (`invalid_fds` on the wire, unchanged).
+        let start = Envelope { version: ipc::PROTOCOL_VERSION, request_id: RequestId([6; 16]),
+            message: SpawnRequest::StartRun { run: RunHandle(RunId([3; 16])), employee_id: EmployeeId([2; 16]),
+                runtime_request: RuntimeKind::Codex, task_ref: None, workspace: None, prompt_bytes: 1,
+                input_fds: duduclaw_isolation::bounded::List::new(vec![]).unwrap(), pty: false, requested_max_turns: None } };
+        gateway.send(&ipc::encode(&start).unwrap(), &[]).unwrap();
+        let Ok(Reply::Now(response, ..)) = dispatch(&mut coordinator, ControlConnectionId([1; 16]), server.recv().unwrap(), authority, 100)
+            else { panic!("unexpected reply") };
+        assert_eq!(response.message, SpawnResponse::Error { code: ErrorCode::InvalidFds });
+        assert_eq!(coordinator.take_refusals(), vec![StartStep::Fds]);
+        let status = Envelope { version: ipc::PROTOCOL_VERSION, request_id: RequestId([5; 16]),
+            message: SpawnRequest::Status { run: RunHandle(RunId([3; 16])) } };
+        gateway.send(&ipc::encode(&status).unwrap(), &[]).unwrap();
+        assert!(dispatch(&mut coordinator, ControlConnectionId([1; 16]), server.recv().unwrap(), authority, 100).is_ok());
+        assert!(coordinator.take_refusals().is_empty());
+    }
+    /// R8y review round 2: the server's normal exit path (`shut_down`, what
+    /// `serve_with_drain` returns on SIGTERM/SIGINT) prints each label's
+    /// pending `suppressed=<count>` exactly once before the window ends,
+    /// including refusals still queued in the coordinator's tally.
+    #[test]
+    fn server_shutdown_drains_the_pending_refusal_tally_once() {
+        let mut coordinator = Coordinator::new(UnavailableHost, Limits::default()).unwrap();
+        let mut limiter = LineLimiter::new("start refused", crate::start_refusal::label_bound());
+        let mut journal: Vec<String> = Vec::new();
+        let (peer, fds) = (StartStep::Peer.line(), StartStep::Fds.line());
+        for _ in 0..7 { coordinator.note_refusal(StartStep::Peer); }
+        for _ in 0..6 { coordinator.note_refusal(StartStep::Fds); }
+        // One loop iteration: the first 5 of each label, the rest counted.
+        journal_refusals(&mut coordinator, &mut limiter, Instant::now(), &mut |line: String| journal.push(line));
+        assert_eq!(journal.len(), 10, "{journal:?}");
+        assert!(journal.iter().all(|line| !line.contains("suppressed=")), "the window has not ended");
+        // Refused after the last iteration: still in the coordinator's tally.
+        for _ in 0..2 { coordinator.note_refusal(StartStep::Peer); }
+        let now = coordination_time_ms().unwrap();
+        shut_down(&mut coordinator, now, &mut limiter, &mut |line: String| journal.push(line)).unwrap();
+        assert_eq!(journal[10..], [format!("{fds} suppressed=1"), format!("{peer} suppressed=4")], "{journal:?}");
+        for line in [&peer, &fds] {
+            assert_eq!(journal.iter().filter(|l| l.starts_with(&format!("{line} suppressed="))).count(), 1, "{line}");
+        }
+        assert!(coordinator.take_refusals().is_empty(), "the tally was handed over");
+        // Idempotent: a second exit prints nothing more.
+        shut_down(&mut coordinator, now, &mut limiter, &mut |line: String| journal.push(line)).unwrap();
+        assert_eq!(journal.len(), 12, "{journal:?}");
     }
     #[test]
     fn missing_adapters_refuse_every_launch_and_readiness() {

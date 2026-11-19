@@ -142,6 +142,26 @@ class RefuserTests(unittest.TestCase):
                 self.assertIn("--marker-file", err)
         self.assertEqual(self.run_main("--marker-file", self.root / "absent", marked)[0], 2)
 
+    def test_test_only_command_strings_are_refused_as_well(self):
+        # E10: the TEST-only setup-code sub-command, compiled only into a test-root duduclaw.
+        cli = ROOT / "crates/duduclaw-cli/src"
+        self.assertIn('#[cfg(duduclaw_test_root)]\n#[path = "users_mfa_test_build.rs"]\nmod test_build;',
+                      (cli / "users_mfa_cmd.rs").read_text(encoding="utf-8"))
+        rust = (cli / "users_mfa_test_build.rs").read_text(encoding="utf-8")
+        body = b"\x7fELF" + b"\x00" * 4096
+        for marker in REFUSER.TEST_ONLY_COMMAND_MARKERS:
+            with self.subTest(marker=marker):
+                self.assertIn('"' + marker.decode("ascii") + '"', rust)
+                marked = self.write("cmd/duduclaw", body + marker + b"\x00")
+                self.assertEqual(self.run_main(marked)[0], 1)
+                near = self.write("near/duduclaw", body + marker[:-1] + b"\x00")
+                self.assertEqual(self.run_main(near)[0], 0)
+                border = self.write("border-cmd", b"x" * (REFUSER.CHUNK_BYTES - 5) + marker + b"y")
+                self.assertEqual(self.run_main(border)[0], 1)
+                self.assertEqual(self.run_main(self.tar("cmd.tar.gz", [("pkg/duduclaw", body + marker)]))[0], 1)
+                if PACKAGE is not None:
+                    self.assertTrue(PACKAGE.has_test_license_marker(io.BytesIO(b"a" + marker + b"b").read))
+
     # ---------------------------------------------------------------- binaries and archives
 
     def test_raw_binaries(self):

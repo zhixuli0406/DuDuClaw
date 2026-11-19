@@ -165,3 +165,9 @@ live-test-mocks = ["duduclaw-gateway/live-test-mocks"]
 # `--features app-compat`; main-repo CI keeps one `cargo check` on it so the
 # OS-only surface cannot bit-rot.
 app-compat = ["duduclaw-core/app-compat"]
+
+# users_mfa_test_build.rs (E10): the TEST-only first-run setup-code issuer
+# exists only in a `--cfg duduclaw_test_root` build (same cfg as the gateway's
+# TEST licence issuer and the duduclaw-updated test-key verifier).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(duduclaw_test_root)'] }

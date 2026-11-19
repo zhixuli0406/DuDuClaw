@@ -397,6 +397,73 @@ The per-second limits (`frames_per_second`, `bytes_per_second`) slow a run down;
 
 When a destination accepts no data for `idle_timeout_ms`, egress closes only that connection, and the run continues. The CONNECT header limits (`max_header_bytes`, `max_headers`) apply only to the CONNECT request inside the employee sandbox. That request is refused with HTTP 431 and does not end the run.
 
+### Account verification lines in the spawnd journal
+
+When `registry_verified`, `accounts_locked`, `ssh_live_negative_checks`, `cron_at_acl_and_jobs_verified` and `external_iam_reservation_verified` fail together, spawnd's journal names the failing step. Each line is printed once, and again only when the step or account changes:
+
+```text
+duduclaw-spawnd: employee account verification failed: step=<label> account=<duduclaw-emp-NNNNN|->
+duduclaw-spawnd: allocation failed: step=<label>
+```
+
+The first line comes from the host-wide account check. It checks every `duduclaw-emp-*` account in the employee range, including retired (tombstoned) ones. `account=-` means a host-level step. The second line is printed once for each failed employee allocation, at most 5 times per label in 10 seconds; further failures with that label are counted and reported when the 10 seconds end as one `duduclaw-spawnd: allocation failed: step=<label> suppressed=<count>` line. A pending SSH probe or the pending-reservation limit is not a failure and is not logged. The label is a fixed identifier: neither line contains file contents or error text. The readiness output and `readiness.json` keep their check names.
+
+| Label | What failed |
+| --- | --- |
+| `login_defs`, `subids` | `/etc/login.defs`, `/etc/subuid` or `/etc/subgid` is unreadable or malformed. |
+| `registry_rows` | The employee registry does not fit the host's uid ranges, or a reservation cannot be resumed. |
+| `nss_modules` | passwd or group uses an NSS module other than `files`/`systemd`. |
+| `enumerate` | `getent passwd`/`group` is unreadable, or has an alias or a foreign entry in the employee range. |
+| `passwd_row`, `shadow_row`, `groups` | The account's passwd row (`/nonexistent`, `/usr/sbin/nologin`), shadow row (`!*`, expired) or group list (its own gid only) is wrong. |
+| `cron_acl`, `at_acl` | `/etc/cron.deny` or `/etc/at.deny` does not deny the account, or an allow file overrides it. |
+| `cron_spool`, `cron_tables` | The account has a user crontab, or a line in `/etc/crontab` or `/etc/cron.d` runs as it (an unreadable or non-root file there also fails). |
+| `at_spool` | An at spool directory (`/var/spool/cron/atjobs`, `/var/spool/cron/atspool`, `/var/spool/at`, `/var/spool/at/spool`) holds an entry owned by the account, or exists but cannot be read, or lists an entry that disappears or cannot be inspected before its owner is checked. atd removes a job from `atjobs` when it starts the job, so a disappearing entry is not treated as harmless. The next refresh repeats the check, which clears a passing change such as another account's job finishing. |
+| `linger`, `sessions` | A linger file exists, or `user@<uid>.service` or a logind session of the account is active. |
+| `ssh_config`, `ssh_probe` | `sshd -t`/`sshd -T` does not deny the account or names no port, or the SSH denial probe has no Denied result. |
+| `userdb_service`, `userdb_user`, `userdb_group` | `/run/systemd/userdb` is unreadable, or a userdb user or group record touches the employee namespace. |
+| `local_identity`, `candidate`, `owner_inventory` | Allocation: an identity or alias already exists for the new account, a candidate uid lookup failed, or spawnd's file-owner inventory failed. |
+| `login_barriers`, `create_group`, `create_user`, `lock_user`, `quarantine` | Allocation or recovery: the deny entries or sshd drop-in, groupadd, useradd (or a mail spool it created), the usermod/chage/loginctl lockdown, or stopping the account's processes failed. |
+| `reserve`, `create_account`, `readback` | An allocation step failed with no finer label. For example, `reserve` means the employee uid range is exhausted. |
+| `existing_row`, `persist_reservation`, `persist_final`, `store_poisoned`, `clock` | Allocation: the employee already has a retired or unresumable registry row; writing the registry before account creation or after the outcome failed; the registry store refuses writes after an earlier failed write in this process; or the monotonic clock could not be read. |
+| `unlabelled` | An error outside spawnd's labelled checks. Allocation never produces it. |
+
+The `at` package may stay installed: spawnd reads its spool as root and never runs `/usr/bin/at`. Do not edit deny files, spools or accounts by hand to clear a line. Fix the cause; the next refresh then prints `evidence complete`. A failed allocation retires its uid permanently and leaves the proposal Failed. After the cause is fixed, retry the failed item's compensation in Migration review. A new proposal then receives the next uid.
+
+### Start refusal lines in the spawnd journal
+
+When the gateway logs `isolated run not started` (for example `site="spawn.backend.unavailable"`), spawnd's journal has one line for that refused start:
+
+```text
+duduclaw-spawnd: start refused: step=<label>
+```
+
+The line has no employee id, run id, path or request content. The wire code sent to the gateway is unchanged. Labels from the admission gate can come from `ReserveRun`, `StartRun` or the queued run's admission.
+
+The line is rate limited per label: within 10 seconds the first 5 refusals with a label are printed. Further refusals with that label are counted, and when the 10 seconds end spawnd prints one line with the count instead:
+
+```text
+duduclaw-spawnd: start refused: step=<label> suppressed=<count>
+```
+
+Every refusal is either printed or included in a `suppressed=` count. The printed lines plus the counts add up to the number of refused starts.
+
+| Label | What refused the start |
+| --- | --- |
+| `frame`, `peer`, `request`, `fds`, `run_id` | Control socket: an undecodable frame, a peer that is not the gateway, a request that fails its own validation, descriptors that do not match it, or no random run id. |
+| `clock`, `update_drain`, `stopping`, `not_reserved`, `reservation`, `pty`, `queue_full`, `launch_policy`, `input_bytes`, `input_fds`, `internal` | Admission: the clock went back, an update drain is closed, a stop of this employee is running, no or a wrong/expired reservation, a PTY mismatch, a full queue, an invalid launch policy, or no room in the input budgets. |
+| `employee_not_admitted` | The employee is not a Ready row in spawnd's registry. |
+| `not_ready(<check>)`, `report_stale`, `report_invalid`, `pty_budget`, `landlock_evidence`, `protocol`, `boot_clock`, `policy_missing`, `poisoned` | Host readiness: the named readiness.json check is false, the evidence report is older than 1 s or of another boot, there is no PTY budget or Landlock evidence, no verified policy is loaded, or spawnd needs a restart. |
+| `scan_stale`, `scan_failed`, `scan_busy`, `intruder`, `view_busy` | The UID monitor's scan is old, failed or locked, it saw a process of this employee outside a run, or the admission view was locked. |
+| `account_unknown`, `ssh_pending`, `account(<step>)` | The employee has no registry row, its SSH denial probe has no result yet, or its account verification failed at `<step>` (the labels of the table above). |
+| `entitlement_missing`, `runtime_not_entitled`, `runtime_ambiguous`, `pty_not_allowed`, `turn_limit` | Entitlement: no entitlement for the employee, no or two entitled profiles of the requested runtime, PTY not allowed, or the step limit is outside the signed range. |
+| `queue_timeout(<blocker>)`, `queue_cancelled(<blocker>)` | A queued run expired, or the gateway cancelled it, while `<blocker>` held it back: an admission label, `host_runs`, `employee_busy`, `host_ptys`, `cleanup` or `cleanup_incomplete`. |
+| `uid_monitor_register`, `worker_mailbox`, `run_fence`, `cleanup`, `cleanup_incomplete`, `storage_usage`, `disk_quota`, `run_journal`, `storage_attach`, `storage_receipt`, `workspace` | Start, before any unit: monitor registration, the lifecycle mailbox, a cancelled run, the cleanup readback, storage usage or quota, the run journal, the image attach or its receipt, or the workspace. |
+| `mcp_channel`, `egress_channel`, `egress_register`, `output_relay`, `stdin_pipe`, `supervisor_identity`, `nonce`, `bootstrap_plan`, `uid_monitor`, `mcp_projection`, `anchors`, `mounts`, `mcp_record`, `native_profile`, `helper_mounts`, `seal`, `trampoline_prepare`, `bootstrap_invalid`, `unit_policy` | Start, before any unit: a channel or pipe, the egress service's registration (unknown profile or no egress control connection), the bootstrap plan, the MCP projection, the publication anchors, the mounts, the native profile, the trampoline or the unit policy. |
+| `unit_start`, `unit_cgroup`, `bind_unit`, `launch_poll`, `startup_timeout` | systemd refused the unit, the unit's cgroup or the trampoline binding failed, the launch failed before Running, or Running was not reached within the startup budget. |
+| `host_gate`, `host_policy`, `host_start` | Test adapters only. |
+
+An `employee_not_admitted` for an employee that is Ready in the allocation journal was a defect before this release: spawnd read its admitted employees only at start, so an employee allocated after spawnd started was refused until spawnd restarted. spawnd now publishes its admitted employees before it answers an allocation, entitlement, disable or retire. A `ReserveRun` sent after an allocation or entitlement reply is checked against the updated employees and entitlement. After a disable or retire reply, the employee is refused.
+
 Container engines and hardware-dependent features remain unavailable through the protected employee environment. Every required component must pass its own checks before work resumes; neither a successful package test nor this guide is production acceptance.
 
 ## Released v1.80.x single-binary protected service

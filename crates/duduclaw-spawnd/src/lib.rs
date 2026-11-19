@@ -1,5 +1,7 @@
 //! Root launch coordinator. Wire authority is always re-derived by the host.
 pub mod admission;
+/// R8y: the closed set of start-refusal steps and the labelled error type.
+pub mod start_refusal;
 pub mod readiness;
 pub mod audit;
 pub mod registry;

@@ -15,7 +15,7 @@
 //! "login/forwarding NOT denied" ⇒ `Reachable`, anything else (other codes
 //! including the `*_unverified` ones, timeout, a refused start, PID 1 errors)
 //! ⇒ `Inconclusive`. spawnd consults a result only after its own
-//! `sshd -T` already denies the account (`accounts.rs` `verify_login`).
+//! `sshd -T` already denies the account (`accounts.rs` `verify_ssh`).
 //!
 //! A result is kept in memory under a [`ProbeKey`]: the host part (boot id,
 //! committed signed generation, the installed probe binary verified against
@@ -24,7 +24,7 @@
 //! from PID 1 ([`ListenerIdentity`]: unit, main pid, start time, command)) and
 //! the account part (name, uid, SHA-256 of
 //! `sshd -T -C user=<account>,host=localhost,addr=127.0.0.1`, which
-//! `verify_login` computes anyway, and the port taken from it). Any component
+//! `verify_ssh` computes anyway, and the port taken from it). Any component
 //! change makes the result not current: the account is probed again. A
 //! Denied result is also current for at most [`DENIED_TTL`] (only
 //! [`DENIED_TTL_NO_IDENTITY`] when the listener identity could not be
@@ -125,7 +125,7 @@ pub struct HostKey {
     /// `None`: not determinable (results then expire after [`DENIED_TTL_NO_IDENTITY`]).
     pub listener: Option<ListenerIdentity>,
 }
-/// The account's inputs, computed by `verify_login` (after its own
+/// The account's inputs, computed by `verify_ssh` (after its own
 /// `sshd -T` denies the account): `port` is that output's first `port`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountKey { pub account: String, pub uid: u32, pub sshd_config: Sha256Digest, pub port: u16 }
@@ -153,7 +153,7 @@ impl ProbeOutcome {
         }
     }
 }
-/// `verify_login`'s answer for a lookup: `None` only for Denied; no current
+/// `verify_ssh`'s answer for a lookup: `None` only for Denied; no current
 /// result (none yet, expired, or under another key) is [`SshRefusal::Pending`].
 pub fn refusal(outcome: Option<&ProbeOutcome>) -> Option<SshRefusal> {
     match outcome {
