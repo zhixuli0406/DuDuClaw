@@ -342,7 +342,9 @@ sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux --version X.Y.
 
 更新境界を通るのはバージョンと要求 ID だけです。サービスは署名済み metadata、ハッシュ、プラットフォーム、期限、バージョン下限、通し番号を検証し、完全な世代へ切り替え、実際のバージョン／プロトコルを読み戻してから commit します。再起動後も同じ要求を追跡し、`committed` だけを成功とします。サービス、信頼、準備完了情報がなければ拒否し、旧インストーラーを呼びません。通常の更新では降格できず、緊急ロールバックには別の署名認可が必要です。
 
-削除入口は `sudo duduclaw service uninstall --protected-linux` です。隔離環境では unit を `/var/lib/duduclaw-protected/uninstall-units` に保存し、永続的な `/etc` mask を作成して読み戻し、timer、socket、サービスを停止します。停止済み unit、既知の空 cgroup、サービス／社員プロセスがないこと、既知のストレージ root にマウントがないことを確認した後で、固定パスの実行ファイルだけを削除します。強制・lazy unmount は行いません。鍵、データ、システムアカウント、永続 UID 対応、更新状態／世代、バージョン下限は復旧用に保持し、mask は自動再起動を防ぐため残します。H の任意カスタムストレージ root アダプターは未接続のため、その構成での完全な削除検証ではありません。今回は root 実機で削除していません。旧 uninstaller や保存状態の削除で拒否を回避しないでください。
+削除入口は `sudo duduclaw service uninstall --protected-linux` です。隔離環境では unit を `/var/lib/duduclaw-protected/uninstall-units` に保存し、永続的な `/etc` mask を作成し、timer、socket、サービスを停止してから mask を読み戻します。停止済み unit、既知の空 cgroup、サービス／社員プロセスがないこと、既知のストレージ root にマウントがないことを確認した後で、固定パスの実行ファイルだけを削除します。強制・lazy unmount は行いません。鍵、データ、システムアカウント、永続 UID 対応、更新状態／世代、バージョン下限は復旧用に保持し、mask は自動再起動を防ぐため残します。H の任意カスタムストレージ root アダプターは未接続のため、その構成での完全な削除検証ではありません。今回は root 実機で削除していません。旧 uninstaller や保存状態の削除で拒否を回避しないでください。
+
+社員の実行も削除の対象です。実行ユニット（`duduclaw-run-<id>.service`）と社員ごとの slice（`duduclaw-employees-<id>.slice`、社員が初めて実行したときに作成）は、サービスの後、`duduclaw-employees.slice`、`duduclaw-tcb.slice`、`duduclaw.slice` の前に停止します。これらは一時ユニットなので mask しません。mask 済みの親 slice と、mask 済みで停止した spawnd により再起動できません。確認の前にすべてのユニットへ停止を要求するため、拒否された場合もサービスは停止・mask 済みで、「mask 済みなのに実行中」の状態は残りません。拒否メッセージは確認を止めた最初のユニットを示します：60 秒後も実行中のユニット（`sudo systemctl stop <ユニット>` で停止してから同じ削除コマンドを再実行）、mask が効かないユニット、または本製品の名前の形式に合わない `duduclaw` ユニット（停止も mask もしません。先に出所を確認してください）。再実行は安全で、mask 済み・停止済みのユニットはそのまま受け入れます。旧バージョンが「mask 済みなのに実行中」のまま残したホスト（拒否メッセージ「無法證明服務啟動已封鎖；未移除執行檔。」）は、このバージョンで削除を再実行してください。すべてを自ら停止し、旧バージョンが社員 slice 名に残した mask も削除します。旧バージョンしか使えない場合は、まだ実行中の社員 slice をすべて停止してから（`systemctl list-units --all 'duduclaw-employees-*'`、続けて `sudo systemctl stop <slice>`）その削除を再実行してください。
 
 ## 毎晩の自動更新
 
