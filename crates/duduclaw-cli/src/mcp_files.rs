@@ -636,23 +636,103 @@ mod contained_imp {
         Ok(MountKey { dev, mnt })
     }
 
+    /// Access mode for a directory that is only traversed on the way to the
+    /// allowed root (R8v-2, mirroring `duduclaw_agent`'s `safe_dir` and the
+    /// gateway's `fs_safe::search_access`). Linux: `O_PATH` needs only search
+    /// (`x`) permission, so the installed layout's root:root 0711
+    /// `/var/lib/duduclaw` above the gateway home (traversable, not readable
+    /// by the gateway account) can be walked. Other Unix targets have no
+    /// `O_PATH` and keep `O_RDONLY` (the installed 0711 layout is Linux-only).
+    fn search_access() -> libc::c_int {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            libc::O_PATH
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            libc::O_RDONLY
+        }
+    }
+
+    /// `O_PATH|O_NOFOLLOW` without `O_DIRECTORY` would hand back a symlink
+    /// descriptor; `O_DIRECTORY` refuses that, and the type is re-checked on
+    /// the descriptor anyway (`fstat`, valid on an `O_PATH` descriptor).
+    fn require_search_directory(dir: &File) -> io::Result<()> {
+        if !dir.metadata()?.is_dir() {
+            return Err(refused("traversed component is not a directory"));
+        }
+        Ok(())
+    }
+
+    /// `/`, search-only. Only ever an `openat` base and `fstat`ed.
+    fn search_root() -> io::Result<File> {
+        let slash = c"/";
+        // SAFETY: a NUL-terminated absolute path; no dirfd involved.
+        let fd = unsafe { libc::open(slash.as_ptr(), search_access() | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: open returned a new, uniquely owned descriptor.
+        let dir = unsafe { File::from_raw_fd(fd) };
+        require_search_directory(&dir)?;
+        Ok(dir)
+    }
+
+    /// Ancestor `name` of the allowed root, search-only, never following a
+    /// symlink: an lstat-at refusal of anything but a real directory, then
+    /// `openat(search_access|O_DIRECTORY|O_NOFOLLOW)`. No mount check — the
+    /// path to the trusted allowed root may legitimately cross mounts.
+    fn search_child(parent: &File, name: &CString) -> io::Result<File> {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: a valid directory fd, a NUL-terminated single component
+        // and a writable `stat` buffer.
+        let rc = unsafe {
+            libc::fstatat(parent.as_raw_fd(), name.as_ptr(), stat.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW)
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fstatat succeeded and initialised the buffer.
+        if unsafe { stat.assume_init() }.st_mode & libc::S_IFMT != libc::S_IFDIR {
+            return Err(refused("path component is a symlink or not a directory"));
+        }
+        let dir = open_component(parent.as_raw_fd(), name, search_access() | libc::O_DIRECTORY, false)?;
+        require_search_directory(&dir)?;
+        Ok(dir)
+    }
+
     pub(super) fn open_root(anchor: &Path, rel: &[String], identity: Option<(u64, u64)>) -> io::Result<Root> {
         if !anchor.is_absolute() {
             return Err(refused("absolute root required"));
         }
-        let mut dir = File::open("/")?;
+        let mut names = Vec::new();
         for component in anchor.components() {
             match component {
                 Component::RootDir => {}
                 Component::Normal(part) => {
-                    let name = cname(part.to_str().ok_or_else(|| refused("non-UTF8 path"))?)?;
-                    // The path to the trusted allowed root may legitimately
-                    // cross mounts.
-                    dir = open_component(dir.as_raw_fd(), &name, libc::O_RDONLY | libc::O_DIRECTORY, false)?;
+                    names.push(cname(part.to_str().ok_or_else(|| refused("non-UTF8 path"))?)?);
                 }
                 _ => return Err(refused("non-normal root component")),
             }
         }
+        // R8v-2: every component ABOVE the allowed root is only traversed
+        // (search-only; Linux `O_PATH`), so the gateway account needs only
+        // search permission on ancestors it does not own. The allowed root
+        // itself is opened `O_RDONLY|O_DIRECTORY|O_NOFOLLOW` exactly as
+        // before; it is the descriptor whose mount key is the baseline and
+        // the base of the contained walk below.
+        let mut dir = match names.split_last() {
+            None => File::open("/")?,
+            Some((last, ancestors)) => {
+                let mut search = search_root()?;
+                for name in ancestors {
+                    search = search_child(&search, name)?;
+                }
+                // The path to the trusted allowed root may legitimately
+                // cross mounts.
+                open_component(search.as_raw_fd(), last, libc::O_RDONLY | libc::O_DIRECTORY, false)?
+            }
+        };
         if !dir.metadata()?.is_dir() {
             return Err(refused("root is not a directory"));
         }
@@ -2195,6 +2275,119 @@ mod tests {
         assert!(ContainedTree::open(&raw(home.path().canonicalize().unwrap(), &["alias"])).is_err());
         assert!(ContainedTree::open(&raw(PathBuf::from("relative"), &[])).is_err());
         assert!(ContainedTree::open(&raw(real.clone(), &[".."])).is_err());
+    }
+
+    /// Puts a fixture directory back to 0700 so the temp dir can be removed.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    struct RestoreMode(PathBuf);
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    /// R8v-2: on the installed layout the gateway has only search permission
+    /// on its home's root:root 0711 parent. A 0o311 (-wx--x--x) ancestor
+    /// reproduces that without root: a read open of it fails with EACCES, as
+    /// the old per-ancestor `O_RDONLY` walk to the allowed root did. Only the
+    /// ancestors of the allowed root relax: the search-only directory itself,
+    /// as the allowed root or as the scan root, still needs read permission.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn contained_tree_reaches_an_allowed_root_below_a_search_only_ancestor() {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let parent = root.join("parent");
+        let agents = parent.join("home/agents");
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(agents.join("coder/src")).unwrap();
+        std::fs::write(agents.join("coder/src/a.rs"), "fn inside() {}\n").unwrap();
+        let meta = std::fs::metadata(agents.join("coder")).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o311)).unwrap();
+        let _restore = RestoreMode(parent.clone());
+        // Root bypasses DAC, so the premise is only checked unprivileged.
+        let unprivileged = unsafe { libc::geteuid() } != 0;
+        if unprivileged {
+            let error = std::fs::File::open(&parent).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EACCES), "{error}");
+        }
+        let vetted = VettedDir {
+            path: agents.join("coder"),
+            anchor: agents.clone(),
+            rel: vec!["coder".to_string()],
+            identity: Some((meta.dev(), meta.ino())),
+        };
+        let tree = ContainedTree::open(&vetted).expect("allowed root below a search-only ancestor opens");
+        assert_eq!(tree.read_to_string(Path::new("src/a.rs"), 1024).unwrap(), "fn inside() {}\n");
+        if unprivileged {
+            let as_anchor = VettedDir { path: parent.clone(), anchor: parent.clone(), rel: vec![], identity: None };
+            let error = ContainedTree::open(&as_anchor).err().expect("search-only allowed root must not open");
+            assert_eq!(error.raw_os_error(), Some(libc::EACCES), "{error}");
+            let as_scan_root = VettedDir {
+                path: parent.clone(),
+                anchor: root.clone(),
+                rel: vec!["parent".to_string()],
+                identity: None,
+            };
+            let error = ContainedTree::open(&as_scan_root).err().expect("search-only scan root must not open");
+            assert_eq!(error.raw_os_error(), Some(libc::EACCES), "{error}");
+        }
+    }
+
+    /// Below a search-only ancestor the walk keeps every refusal: a symlinked
+    /// ancestor of the allowed root (above or below the search-only one) is
+    /// refused by the lstat-at check (no OS error), a symlinked allowed root
+    /// or scan root is refused, and a scan root whose identity does not match
+    /// the vetted one is refused.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn contained_tree_below_a_search_only_ancestor_keeps_symlink_and_identity_refusals() {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt, symlink};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let parent = root.join("parent");
+        let agents = parent.join("home/agents");
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(agents.join("coder")).unwrap();
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(agents.join("other")).unwrap();
+        std::fs::write(agents.join("coder/a.rs"), "fn inside() {}\n").unwrap();
+        symlink("agents", parent.join("home/agents-link")).unwrap();
+        symlink("home", parent.join("linked-home")).unwrap();
+        symlink(&parent, root.join("alias")).unwrap();
+        symlink("coder", agents.join("coder-link")).unwrap();
+        let coder = std::fs::metadata(agents.join("coder")).unwrap();
+        let other = std::fs::metadata(agents.join("other")).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o311)).unwrap();
+        let _restore = RestoreMode(parent.clone());
+        let vetted = |anchor: PathBuf, rel: &[&str], identity: Option<(u64, u64)>| VettedDir {
+            path: anchor.clone(),
+            anchor,
+            rel: rel.iter().map(|s| s.to_string()).collect(),
+            identity,
+        };
+        let coder_id = Some((coder.dev(), coder.ino()));
+        let tree = ContainedTree::open(&vetted(agents.clone(), &["coder"], coder_id)).expect("control opens");
+        assert_eq!(tree.read_to_string(Path::new("a.rs"), 1024).unwrap(), "fn inside() {}\n");
+        // Symlinked ancestors of the allowed root: below and above the
+        // search-only directory.
+        for anchor in [parent.join("linked-home/agents"), root.join("alias/home/agents")] {
+            let error = ContainedTree::open(&vetted(anchor.clone(), &["coder"], coder_id))
+                .err()
+                .unwrap_or_else(|| panic!("{} must be refused", anchor.display()));
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied, "{}: {error}", anchor.display());
+            assert_eq!(error.raw_os_error(), None, "{}: {error}", anchor.display());
+        }
+        // Symlinked allowed root, symlinked scan root.
+        assert!(ContainedTree::open(&vetted(parent.join("home/agents-link"), &["coder"], coder_id)).is_err());
+        assert!(ContainedTree::open(&vetted(agents.clone(), &["coder-link"], coder_id)).is_err());
+        // The identity check still refuses a scan root that is not the
+        // vetted directory.
+        let error = ContainedTree::open(&vetted(agents.clone(), &["coder"], Some((other.dev(), other.ino()))))
+            .err()
+            .expect("mismatching identity must be refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied, "{error}");
+        assert_eq!(error.raw_os_error(), None, "{error}");
     }
 
     /// The Daybreak Low: a scan root replaced between [`vet_dir`] and
