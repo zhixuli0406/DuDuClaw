@@ -11,7 +11,7 @@
 //! [`ActivateStep::segments`]); each segment is lowercase `[a-z_]`. The
 //! gateway's site list holds the joined labels as literals and its tests check
 //! every one against these segments.
-use duduclaw_isolation::execution::BackendError;
+use duduclaw_isolation::{capability::VerificationError, execution::BackendError};
 
 /// Every `BackendError`, in declaration order.
 pub const BACKEND_ERRORS: [BackendError; 7] = [BackendError::Unavailable, BackendError::Denied,
@@ -507,6 +507,188 @@ impl ActivateStep {
     pub fn label(self) -> String { let mut out = Vec::new(); self.segments(&mut out); out.join(".") }
 }
 
+/// Every `VerificationError`, in declaration order.
+pub const VERIFICATION_ERRORS: [VerificationError; 5] = [VerificationError::Invalid, VerificationError::InvalidTime,
+    VerificationError::Revoked, VerificationError::BindingMismatch, VerificationError::Unavailable];
+
+/// The fixed class segment of a verification error.
+pub const fn verification_class(error: VerificationError) -> &'static str {
+    match error {
+        VerificationError::Invalid => "invalid",
+        VerificationError::InvalidTime => "invalid_time",
+        VerificationError::Revoked => "revoked",
+        VerificationError::BindingMismatch => "binding_mismatch",
+        VerificationError::Unavailable => "unavailable",
+    }
+}
+
+/// R8z-5: the check of a live session's request context that refused
+/// (`ConnectionVerifier::context_checked`: admission, every request, after
+/// every handler, and the 100 ms live watch).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContextStep {
+    /// The connection's own authority read stayed busy for 2 s (one read of a
+    /// connection runs at a time).
+    SerialWait,
+    /// The shared blocking pool: 2 s slot wait, 10 s job limit, or the job panicked.
+    Blocking,
+    /// The wall clock is unreadable.
+    Clock,
+    /// The capability is no longer this connection's active one (revoked).
+    Revoked,
+    /// The capability proof or its connection binding does not verify.
+    Proof,
+    /// Outside the capability's validity window.
+    Time,
+    /// The live authority snapshot refused.
+    LiveSnapshot,
+    /// The live snapshot differs from the capability, or the run is not `Running`.
+    LiveMismatch,
+    /// The capability table lock is poisoned.
+    StateLock,
+    /// The capability window ended while the authority read ran.
+    ExpiredAfter,
+}
+impl ContextStep {
+    pub const ALL: [Self; 10] = [Self::SerialWait, Self::Blocking, Self::Clock, Self::Revoked, Self::Proof,
+        Self::Time, Self::LiveSnapshot, Self::LiveMismatch, Self::StateLock, Self::ExpiredAfter];
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SerialWait => "serial_wait",
+            Self::Blocking => "blocking",
+            Self::Clock => "clock",
+            Self::Revoked => "revoked",
+            Self::Proof => "proof",
+            Self::Time => "time",
+            Self::LiveSnapshot => "live_snapshot",
+            Self::LiveMismatch => "live_mismatch",
+            Self::StateLock => "state_lock",
+            Self::ExpiredAfter => "expired_after",
+        }
+    }
+}
+
+/// R8z-5: why the gateway side of a run's MCP session ended abnormally
+/// (`server::serve_checked`). Each `Err` return of `serve` has exactly one of
+/// these; the two `PeerClosed*` steps end with `Ok(())` from `serve`. The
+/// normal end (the peer closes between requests after at least one) has no
+/// step. Labels are fixed literals ([`SessionStep::as_str`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionStep {
+    /// The activated connection carries no socket.
+    SocketMissing,
+    /// The socket could not be made nonblocking or registered with the reactor.
+    SocketSetup,
+    /// The capability's employee label could not be read (revoked meanwhile).
+    AgentSlug,
+    /// The capability's revocation signal could not be subscribed (revoked meanwhile).
+    Subscribe,
+    /// The run's capability was revoked by someone else than this session's
+    /// own context reads (the run's release, the 1 s sweep, control loss).
+    Revoked,
+    /// A live check of a request-context read refused (that refusal also
+    /// revokes the capability; the session then names this check).
+    Context(ContextStep),
+    /// The admission context read exceeded the request timeout.
+    AdmissionTimeout,
+    /// The dispatcher refused the activated capability's mode at admission.
+    Readiness,
+    /// Reading the socket failed.
+    ReadFailed,
+    /// A frame exceeded 256 KiB.
+    FrameTooLarge,
+    /// The peer closed in the middle of a frame.
+    FramePartial,
+    /// A frame is not one JSON-RPC 2.0 request/notification (batch, extra
+    /// envelope keys, bad id).
+    FrameInvalid,
+    /// More than 120 frames within 60 s.
+    WindowLimit,
+    /// A request (approvals included) exceeded the request timeout.
+    RequestTimeout,
+    /// The dispatcher returned this error for a request.
+    Dispatcher(VerificationError),
+    /// A second request arrived while one was in flight (not its cancel).
+    SecondRequest,
+    /// The response exceeded 4 MiB.
+    ResponseEncode,
+    /// Writing a response took longer than 5 s.
+    WriteTimeout,
+    /// Writing a response failed.
+    WriteFailed,
+    /// The peer closed before it sent any frame.
+    PeerClosedBeforeRequest,
+    /// The peer closed while a request was being handled or answered.
+    PeerClosedInRequest,
+}
+impl SessionStep {
+    /// Every step, in declaration order with nested steps expanded.
+    pub fn every() -> Vec<Self> {
+        let mut steps = vec![Self::SocketMissing, Self::SocketSetup, Self::AgentSlug, Self::Subscribe, Self::Revoked];
+        steps.extend(ContextStep::ALL.map(Self::Context));
+        steps.extend([Self::AdmissionTimeout, Self::Readiness, Self::ReadFailed, Self::FrameTooLarge,
+            Self::FramePartial, Self::FrameInvalid, Self::WindowLimit, Self::RequestTimeout]);
+        steps.extend(VERIFICATION_ERRORS.map(Self::Dispatcher));
+        steps.extend([Self::SecondRequest, Self::ResponseEncode, Self::WriteTimeout, Self::WriteFailed,
+            Self::PeerClosedBeforeRequest, Self::PeerClosedInRequest]);
+        steps
+    }
+    pub fn segments(self, out: &mut Vec<&'static str>) {
+        match self {
+            Self::Context(step) => { out.push("context"); out.push(step.as_str()); }
+            Self::Dispatcher(error) => { out.push("dispatcher"); out.push(verification_class(error)); }
+            plain => out.push(plain.as_str()),
+        }
+    }
+    /// The segments joined with `.` (tests and documentation).
+    pub fn label(self) -> String { let mut out = Vec::new(); self.segments(&mut out); out.join(".") }
+    /// The fixed `step` log value: [`Self::label`] as one `&'static str` literal.
+    pub const fn as_str(self) -> &'static str {
+        use ContextStep as C;
+        use VerificationError as V;
+        match self {
+            Self::SocketMissing => "socket_missing",
+            Self::SocketSetup => "socket_setup",
+            Self::AgentSlug => "agent_slug",
+            Self::Subscribe => "subscribe",
+            Self::Revoked => "revoked",
+            Self::Context(step) => match step {
+                C::SerialWait => "context.serial_wait",
+                C::Blocking => "context.blocking",
+                C::Clock => "context.clock",
+                C::Revoked => "context.revoked",
+                C::Proof => "context.proof",
+                C::Time => "context.time",
+                C::LiveSnapshot => "context.live_snapshot",
+                C::LiveMismatch => "context.live_mismatch",
+                C::StateLock => "context.state_lock",
+                C::ExpiredAfter => "context.expired_after",
+            },
+            Self::AdmissionTimeout => "admission_timeout",
+            Self::Readiness => "readiness",
+            Self::ReadFailed => "read_failed",
+            Self::FrameTooLarge => "frame_too_large",
+            Self::FramePartial => "frame_partial",
+            Self::FrameInvalid => "frame_invalid",
+            Self::WindowLimit => "window_limit",
+            Self::RequestTimeout => "request_timeout",
+            Self::Dispatcher(error) => match error {
+                V::Invalid => "dispatcher.invalid",
+                V::InvalidTime => "dispatcher.invalid_time",
+                V::Revoked => "dispatcher.revoked",
+                V::BindingMismatch => "dispatcher.binding_mismatch",
+                V::Unavailable => "dispatcher.unavailable",
+            },
+            Self::SecondRequest => "second_request",
+            Self::ResponseEncode => "response_encode",
+            Self::WriteTimeout => "write_timeout",
+            Self::WriteFailed => "write_failed",
+            Self::PeerClosedBeforeRequest => "peer_closed_before_request",
+            Self::PeerClosedInRequest => "peer_closed_in_request",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,5 +722,25 @@ mod tests {
         // Expanded sizes (a new variant must be listed in `every`).
         assert_eq!(prepare.len(), 1 + 7 + 6 + 20 + 4 + 20 + 3);
         assert_eq!(activate.len(), 1 + 7 + 3 + (1 + 20 + 2 + 33 + 1) + 3 + 9 + 3);
+    }
+
+    /// R8z-5: every session step has a distinct, well-formed label, and its
+    /// `as_str` literal is exactly its segments joined.
+    #[test]
+    fn r8z5_session_step_labels_are_fixed_distinct_and_well_formed() {
+        let steps = SessionStep::every();
+        let labels: Vec<String> = steps.iter().map(|step| step.label()).collect();
+        let distinct: std::collections::BTreeSet<_> = labels.iter().collect();
+        assert_eq!(distinct.len(), labels.len(), "duplicate label");
+        for (step, label) in steps.iter().zip(&labels) {
+            assert!(well_formed(label), "{label}");
+            assert_eq!(step.as_str(), label, "{step:?}");
+        }
+        assert_eq!(steps.len(), 5 + 10 + 8 + 5 + 6);
+        for label in ["second_request", "context.live_mismatch", "context.serial_wait", "dispatcher.binding_mismatch",
+            "peer_closed_before_request", "peer_closed_in_request", "frame_too_large", "revoked"] {
+            assert!(labels.contains(&label.to_owned()), "{label}");
+        }
+        assert!(!labels.contains(&"context".to_owned()) && !labels.contains(&"dispatcher".to_owned()));
     }
 }

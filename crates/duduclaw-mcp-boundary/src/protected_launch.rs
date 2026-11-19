@@ -1,11 +1,15 @@
 //! Concrete A/D run lifecycle. Construction is restricted to host-owned plans;
 //! no argv/environment from the native command builder is elevated into policy.
-use std::{collections::BTreeMap, os::{fd::OwnedFd, unix::net::UnixStream}, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}};
+use std::{collections::BTreeMap, os::{fd::OwnedFd, unix::net::UnixStream}, sync::{Arc, Mutex, OnceLock, atomic::{AtomicBool, Ordering}}};
 use duduclaw_execution::{command::{NativeCommandSnapshot, ProtectedLaunch}, SpawndBackend};
 use duduclaw_isolation::{bounded::Text, capability::CapabilityId, execution::*, ids::{EmployeeId, RunId}};
-use crate::{Boundary, GrantPolicy, Reservation, config::{prepare_runtime_bridge_checked, runtime_projection, RuntimeBridgeRegistry},
+use crate::{Boundary, GrantPolicy, Reservation, VerificationError, config::{prepare_runtime_bridge_checked, runtime_projection, RuntimeBridgeRegistry},
     server::Dispatcher, socket::McpDelivery};
-pub use crate::launch_steps::{ActivateStep, PrepareStep};
+pub use crate::launch_steps::{ActivateStep, PrepareStep, SessionStep};
+
+/// R8z-5: called once, with its fixed step, when a run's MCP session ends
+/// abnormally before the run is released (see [`ProtectedMcpLaunch::observe_sessions`]).
+pub type SessionObserver = Arc<dyn Fn(SessionStep) + Send + Sync>;
 
 struct Pending {
     reservation: Reservation,
@@ -20,7 +24,27 @@ impl Drop for Pending {
         if self.armed { let _ = self.boundary.revoke_run(self.reservation.run); }
     }
 }
-struct Active { task: tokio::task::JoinHandle<Result<(), crate::VerificationError>> }
+struct Active {
+    task: tokio::task::JoinHandle<Result<(), crate::VerificationError>>,
+    /// R8z-5: set before the run's release revokes it; the session's end is
+    /// then the release, not an abnormal end.
+    released: Arc<AtomicBool>,
+}
+
+/// R8z-5: the serve task's body. `serve` is awaited unchanged and its
+/// result returned as before; when it ended abnormally (an `Err`, or an
+/// abnormal close) and the run was not released meanwhile, the observer is
+/// called exactly once with the step. A normal end, or a release (which also
+/// aborts this task), calls nothing.
+async fn observed_session(session: impl std::future::Future<Output = crate::server::SessionOutcome>,
+    released: Arc<AtomicBool>, observer: Option<SessionObserver>) -> Result<(), VerificationError> {
+    let outcome = session.await;
+    let step = match &outcome { Ok(step) => *step, Err((step, _)) => Some(*step) };
+    if let (Some(step), Some(observer)) = (step, observer) {
+        if !released.load(Ordering::Acquire) { observer(step); }
+    }
+    outcome.map(|_| ()).map_err(|(_, error)| error)
+}
 
 /// One host-authorized invocation, including its bounded input streams. The
 /// `plan.run` placeholder is replaced only with A's authenticated reservation.
@@ -40,8 +64,23 @@ pub struct ProtectedMcpLaunch {
     revoked: AtomicBool,
     pending: Mutex<BTreeMap<RunId, Pending>>,
     active: Mutex<BTreeMap<RunId, Active>>,
+    sessions: OnceLock<SessionObserver>,
 }
 impl ProtectedMcpLaunch {
+    /// R8z-5: install the observer of this launch's MCP session ends (once;
+    /// `false` if one is already installed). Sessions activated before it is
+    /// installed are not observed. Nothing in this crate logs.
+    pub fn observe_sessions(&self, observer: SessionObserver) -> bool { self.sessions.set(observer).is_ok() }
+
+    /// R8z-5: the run is being released. A session end from here on (the
+    /// release's own revocation, a live check failing because the owner
+    /// dropped the run's authority first) is not reported. Idempotent; does
+    /// not revoke anything itself.
+    pub fn mark_released(&self, run: RunHandle) {
+        let active = self.active.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(session) = active.get(&run.0) { session.released.store(true, Ordering::Release); }
+    }
+
     /// The gateway supplies policy and grants from its live authenticated
     /// principal/binding/approval stores. Neither value may come from MCP data,
     /// process environment, or runtime-generated command arguments.
@@ -57,7 +96,7 @@ impl ProtectedMcpLaunch {
         }
         Ok(Arc::new(Self { employee: plan.employee, task: grant.task.clone(), backend,
             boundary, registry, dispatcher, origin, caller, prepared: Mutex::new(Some((plan, grant))), revoked: AtomicBool::new(false),
-            pending: Mutex::new(BTreeMap::new()), active: Mutex::new(BTreeMap::new()) }))
+            pending: Mutex::new(BTreeMap::new()), active: Mutex::new(BTreeMap::new()), sessions: OnceLock::new() }))
     }
 
     /// R8z-3: [`ProtectedLaunch::prepare`] with the fixed check that refused.
@@ -148,8 +187,14 @@ impl ProtectedMcpLaunch {
         if self.revoked.load(Ordering::Acquire) { return Err(denied(S::RevokedAfter)); }
         if active.contains_key(&run.0) { return Err(denied(S::ActiveDuplicate)); }
         let dispatcher = self.dispatcher.clone();
-        let task = tokio::spawn(async move { crate::server::serve(connection, dispatcher.as_ref()).await });
-        active.insert(run.0, Active { task });
+        let released = Arc::new(AtomicBool::new(false));
+        let (ended, observer) = (released.clone(), self.sessions.get().cloned());
+        // R8z-5: `serve` itself is unchanged (`serve` = `serve_checked`
+        // without the step); the wrapper only reports how it ended.
+        let task = tokio::spawn(async move {
+            observed_session(crate::server::serve_checked(connection, dispatcher.as_ref()), ended, observer).await
+        });
+        active.insert(run.0, Active { task, released });
         // The active connection/task now owns revocation. Until this exact
         // point every failure/cancellation drops the still-armed guard.
         guard.armed = false;
@@ -171,6 +216,8 @@ impl ProtectedLaunch for ProtectedMcpLaunch {
     fn revoke(&self, run: RunHandle) -> BackendFuture<'_, ()> {
         Box::pin(async move {
             self.revoked.store(true, Ordering::Release);
+            // R8z-5: before the revocation the session would observe.
+            self.mark_released(run);
             let mut revoked = self.boundary.revoke_run(run).map_err(|_| BackendError::Unavailable);
             let mut pending = self.pending.lock().unwrap_or_else(|error| {
                 revoked = Err(BackendError::Unavailable);
@@ -194,6 +241,7 @@ impl Drop for ProtectedMcpLaunch {
         let pending = self.pending.get_mut().unwrap_or_else(|error| error.into_inner());
         for run in pending.keys() { let _ = self.boundary.revoke_run(RunHandle(*run)); }
         let active = self.active.get_mut().unwrap_or_else(|error| error.into_inner());
+        for session in active.values() { session.released.store(true, Ordering::Release); }
         for (run, session) in active.iter() {
             let _ = self.boundary.revoke_run(RunHandle(*run));
             session.task.abort();
@@ -241,6 +289,39 @@ mod tests {
         let delivery = McpDelivery { run: reservation.run, control: reservation.control, socket };
         assert!(boundary.activate(capability, reservation, delivery, crate::authority::now_seconds().unwrap()).is_err());
     }
+    /// R8z-5: the session wrapper returns `serve`'s result unchanged and calls
+    /// the observer exactly once on an abnormal end, never on the normal end
+    /// or after the run was released.
+    #[tokio::test(flavor = "current_thread")]
+    async fn r8z5_the_session_observer_is_called_once_on_an_abnormal_end_only() {
+        let seen = Arc::new(Mutex::new(Vec::<SessionStep>::new()));
+        let observer = || -> Option<SessionObserver> {
+            let seen = seen.clone();
+            let observer: SessionObserver = Arc::new(move |step: SessionStep| seen.lock().unwrap().push(step));
+            Some(observer)
+        };
+        let end = |outcome: crate::server::SessionOutcome| std::future::ready(outcome);
+        let live = || Arc::new(AtomicBool::new(false));
+        // `serve` returned an error.
+        let refused = Err((SessionStep::SecondRequest, VerificationError::Invalid));
+        assert_eq!(observed_session(end(refused), live(), observer()).await, Err(VerificationError::Invalid));
+        assert_eq!(*seen.lock().unwrap(), vec![SessionStep::SecondRequest]);
+        // `serve` returned `Ok(())`, but the peer closed in a request.
+        let closed = Ok(Some(SessionStep::PeerClosedInRequest));
+        assert_eq!(observed_session(end(closed), live(), observer()).await, Ok(()));
+        assert_eq!(*seen.lock().unwrap(), vec![SessionStep::SecondRequest, SessionStep::PeerClosedInRequest]);
+        // The normal end: nothing.
+        assert_eq!(observed_session(end(Ok(None)), live(), observer()).await, Ok(()));
+        // Released before the end (the release's own revocation): nothing.
+        let released = Arc::new(AtomicBool::new(true));
+        let revoked = Err((SessionStep::Revoked, VerificationError::Revoked));
+        assert_eq!(observed_session(end(revoked), released, observer()).await, Err(VerificationError::Revoked));
+        // No observer installed: the result alone.
+        let refused = Err((SessionStep::FrameInvalid, VerificationError::Invalid));
+        assert_eq!(observed_session(end(refused), live(), None).await, Err(VerificationError::Invalid));
+        assert_eq!(seen.lock().unwrap().len(), 2, "exactly one call per abnormal end");
+    }
+
     #[test]
     fn pending_guard_drop_revokes_issued_capability() {
         let (boundary, live, guard) = pending();

@@ -1115,6 +1115,9 @@ pub async fn prepare_launch(mut input: LaunchInput)
         let launch = ProtectedMcpLaunch::new(owner.backend.clone(), owner.boundary.boundary().clone(),
             owner.registry.clone(), dispatcher, input.plan, input.grant, input.origin, input.caller)
             .map_err(|_| sited(site!("launch.protected_launch"), VerificationError::Unavailable))?;
+        // R8z-5: one `isolated MCP session ended` line per abnormal session
+        // end (a fresh launch: the observer slot is empty).
+        let _ = launch.observe_sessions(Arc::new(super::launch::log_session_ended));
         return match (&owner.product_authority, prepared) {
             (Some(authority), Some(prepared)) => Ok(Arc::new(super::launch::AuthorizedLaunch::new(
                 launch, authority.clone(), prepared))),

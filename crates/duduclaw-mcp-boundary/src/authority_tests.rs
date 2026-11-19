@@ -161,7 +161,27 @@ mod transport {
             })
         }
     }
+    /// R8z-5: like the production dispatcher (it resolves the run's turn in
+    /// the blocking pool before every handler), every handler here yields,
+    /// notifications included. `fail` is refused; `wait` never answers.
+    struct Yielding;
+    impl crate::server::Dispatcher for Yielding {
+        fn require_complete_services(&self) -> Result<(), VerificationError> { Ok(()) }
+        fn dispatch<'a>(&'a self, _context: RequestContext, _slug: &'a str, request: Value)
+            -> Pin<Box<dyn Future<Output = Result<Option<Value>, VerificationError>> + Send + 'a>> {
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                if request["method"] == "wait" { std::future::pending::<()>().await; }
+                if request["method"] == "fail" { return Err(VerificationError::BindingMismatch); }
+                Ok(request.get("id").map(|id| json!({"jsonrpc":"2.0", "id":id, "result":{}})))
+            })
+        }
+    }
     fn live_connection() -> (Arc<Boundary>, CapabilityId, Connection, tokio::net::UnixStream) {
+        let (boundary, id, connection, client, _) = live_connection_with_authority();
+        (boundary, id, connection, client)
+    }
+    fn live_connection_with_authority() -> (Arc<Boundary>, CapabilityId, Connection, tokio::net::UnixStream, Arc<Live>) {
         let now = now_seconds().unwrap();
         let mut res = reservation();
         res.expires_at_unix_ms = (now + 30) * 1000;
@@ -179,7 +199,169 @@ mod transport {
         let delivery = crate::socket::McpDelivery::from_take_io(&reply, res.control, host).unwrap();
         let connection = boundary.activate(id, &res, delivery, now).unwrap();
         client.set_nonblocking(true).unwrap();
-        (boundary, id, connection, tokio::net::UnixStream::from_std(client).unwrap())
+        (boundary, id, connection, tokio::net::UnixStream::from_std(client).unwrap(), live)
+    }
+
+    /// R8z-5 (the real-host defect): the API worker sends `initialize`, then
+    /// `notifications/initialized` and at once `tools/list`. With a handler
+    /// that yields, the notification used to count as a request in flight and
+    /// `tools/list` as a second one: the session closed and the worker saw
+    /// "MCP disconnected". Both requests are now answered, in order.
+    #[tokio::test]
+    async fn r8z5_a_yielding_initialized_notification_does_not_refuse_the_next_request() {
+        let (boundary, id, connection, mut client) = live_connection();
+        let serving = tokio::spawn(async { crate::server::serve(connection, &Yielding).await });
+        client.write_all(concat!(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n"
+        ).as_bytes()).await.unwrap();
+        let mut reader = tokio::io::BufReader::new(client);
+        for id in [1, 2] {
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut line)).await.unwrap().unwrap();
+            assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["id"], id);
+        }
+        // The worker's own order: the notification and the request written
+        // separately after the initialize reply.
+        let mut client = reader.into_inner();
+        client.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n").await.unwrap();
+        client.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/list\"}\n").await.unwrap();
+        let mut reader = tokio::io::BufReader::new(client);
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut line)).await.unwrap().unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["id"], 3);
+        drop(reader);
+        assert!(serving.await.unwrap().is_ok());
+        assert!(matches!(boundary.entries.lock().unwrap()[&id.0].state, State::Revoked));
+    }
+
+    /// R8z-5: one session fed `input` (then the peer's write side closed when
+    /// `close`), served with the checked loop.
+    async fn session_end(connection: &mut Connection, client: tokio::net::UnixStream,
+        dispatcher: &dyn crate::server::Dispatcher, input: Vec<u8>, close: bool, deadline: Duration)
+        -> crate::server::SessionOutcome {
+        let (_read, mut write) = client.into_split();
+        let feed = async move {
+            let _ = write.write_all(&input).await;
+            if close { let _ = write.shutdown().await; }
+            // Keep the write half until the session has ended.
+            std::future::pending::<()>().await
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                outcome = crate::server::serve_with_deadline_checked(connection, dispatcher, deadline) => outcome,
+                _ = feed => unreachable!(),
+            }
+        }).await.expect("the session must end")
+    }
+    async fn step_of(dispatcher: &dyn crate::server::Dispatcher, input: &[u8], close: bool)
+        -> crate::server::SessionOutcome {
+        let (_boundary, _id, mut connection, client) = live_connection();
+        session_end(&mut connection, client, dispatcher, input.to_vec(), close, Duration::from_secs(5)).await
+    }
+
+    /// R8z-5: each exit of the serving loop names its fixed step; the error
+    /// is the one `serve` returns.
+    #[tokio::test]
+    async fn r8z5_every_reachable_session_exit_names_its_step() {
+        use crate::server::SessionStep as S;
+        let line = |method: &str, id: Option<u32>| match id {
+            Some(id) => format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"{method}\"}}\n"),
+            None => format!("{{\"jsonrpc\":\"2.0\",\"method\":\"{method}\"}}\n"),
+        };
+        // The normal end: a request answered and its reply read, then the
+        // peer closes (the runtime exits between requests).
+        let (_boundary, _id, mut connection, client) = live_connection();
+        let request = line("initialize", Some(1));
+        let peer = async move {
+            let mut reader = tokio::io::BufReader::new(client);
+            reader.get_mut().write_all(request.as_bytes()).await.unwrap();
+            let mut reply = String::new();
+            reader.read_line(&mut reply).await.unwrap();
+            assert_eq!(serde_json::from_str::<Value>(&reply).unwrap()["id"], 1);
+        };
+        let (outcome, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(crate::server::serve_with_deadline_checked(&mut connection, &Yielding, Duration::from_secs(5)), peer)
+        }).await.unwrap();
+        assert_eq!(outcome, Ok(None));
+        // Closing before reading the reply loses it: abnormal.
+        assert_eq!(step_of(&Yielding, line("initialize", Some(1)).as_bytes(), true).await,
+            Ok(Some(S::PeerClosedInRequest)));
+        // A notification then close is the normal end too (nothing unanswered).
+        assert_eq!(step_of(&Yielding, line("notifications/initialized", None).as_bytes(), true).await, Ok(None));
+        assert_eq!(step_of(&Yielding, b"", true).await, Ok(Some(S::PeerClosedBeforeRequest)));
+        assert_eq!(step_of(&Yielding, line("wait", Some(1)).as_bytes(), true).await, Ok(Some(S::PeerClosedInRequest)));
+        assert_eq!(step_of(&Yielding, b"[]\n", false).await, Err((S::FrameInvalid, VerificationError::Invalid)));
+        assert_eq!(step_of(&Yielding, b"{\"jsonrpc\"", true).await, Err((S::FramePartial, VerificationError::Invalid)));
+        assert_eq!(step_of(&Yielding, &vec![b'x'; crate::server::MAX_REQUEST_BYTES + 1], false).await,
+            Err((S::FrameTooLarge, VerificationError::Invalid)));
+        assert_eq!(step_of(&Yielding, line("fail", Some(1)).as_bytes(), false).await,
+            Err((S::Dispatcher(VerificationError::BindingMismatch), VerificationError::BindingMismatch)));
+        let two = format!("{}{}", line("wait", Some(1)), line("wait", Some(2)));
+        assert_eq!(step_of(&Yielding, two.as_bytes(), false).await, Err((S::SecondRequest, VerificationError::Invalid)));
+        let many: String = (0..121).map(|_| line("notifications/initialized", None)).collect();
+        assert_eq!(step_of(&Echo, many.as_bytes(), false).await, Err((S::WindowLimit, VerificationError::Unavailable)));
+        struct Incomplete;
+        impl crate::server::Dispatcher for Incomplete {
+            fn dispatch<'a>(&'a self, _: RequestContext, _: &'a str, _: Value)
+                -> Pin<Box<dyn Future<Output = Result<Option<Value>, VerificationError>> + Send + 'a>> {
+                panic!("startup must reject before handler")
+            }
+        }
+        assert_eq!(step_of(&Incomplete, b"", false).await, Err((S::Readiness, VerificationError::Unavailable)));
+        // The request deadline.
+        let (_boundary, _id, mut connection, client) = live_connection();
+        assert_eq!(session_end(&mut connection, client, &Yielding, line("wait", Some(1)).into_bytes(), false,
+            Duration::from_millis(150)).await, Err((S::RequestTimeout, VerificationError::Unavailable)));
+        // No socket on the activated connection.
+        let (_boundary, _id, mut connection, client) = live_connection();
+        connection.socket = None;
+        assert_eq!(session_end(&mut connection, client, &Yielding, vec![], false, Duration::from_secs(5)).await,
+            Err((S::SocketMissing, VerificationError::Invalid)));
+    }
+
+    /// R8z-5: the run's revocation, and the live watch refusing (the run no
+    /// longer running; the live authority unreadable), name their steps.
+    #[tokio::test]
+    async fn r8z5_revocation_and_the_live_watch_name_their_steps() {
+        use crate::server::SessionStep as S;
+        use crate::launch_steps::ContextStep as C;
+        let (boundary, _id, mut connection, client, _live) = live_connection_with_authority();
+        let revoke = async {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            boundary.revoke_run(reservation().run).unwrap();
+            std::future::pending::<()>().await
+        };
+        let outcome = tokio::select! {
+            outcome = session_end(&mut connection, client, &Yielding, vec![], false, Duration::from_secs(5)) => outcome,
+            _ = revoke => unreachable!(),
+        };
+        assert_eq!(outcome, Err((S::Revoked, VerificationError::Revoked)));
+        for unreadable in [false, true] {
+            let (_boundary, _id, mut connection, client, live) = live_connection_with_authority();
+            let change = async {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                let mut state = live.0.lock().unwrap();
+                if unreadable { state.2 = true; } else { state.0 = RunStatus::Ended(RunOutcome::Cancelled); }
+                drop(state);
+                std::future::pending::<()>().await
+            };
+            let outcome = tokio::select! {
+                outcome = session_end(&mut connection, client, &Yielding, vec![], false, Duration::from_secs(5)) => outcome,
+                _ = change => unreachable!(),
+            };
+            // The refusing read also revokes the capability; whichever of the
+            // two wakes the session first, the step is the live check (the
+            // error is the one `serve` always returned for that branch).
+            let (step, error) = outcome.unwrap_err();
+            if unreadable {
+                assert_eq!(step, S::Context(C::LiveSnapshot));
+                assert!(matches!(error, VerificationError::Unavailable | VerificationError::Revoked), "{error:?}");
+            } else {
+                assert_eq!((step, error), (S::Context(C::LiveMismatch), VerificationError::Revoked));
+            }
+        }
     }
     #[tokio::test]
     async fn incomplete_dispatcher_cannot_activate_a_serving_endpoint() {
