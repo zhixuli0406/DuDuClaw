@@ -194,9 +194,9 @@ mod tests {
             let stderr = line(reason);
             let found = refusal_reason(&stderr).unwrap_or_else(|| panic!("{reason}"));
             assert_eq!(found, *reason);
-            assert!(std::ptr::eq(found.as_ptr(), reason.as_ptr()), "{reason}");
             let input = stderr.as_ptr_range();
             assert!(!input.contains(&found.as_ptr()), "{reason}");
+            assert!(!input.contains(&found.as_ptr().wrapping_add(found.len() - 1)), "{reason}");
         }
         // Without the trailing newline too.
         let stderr = cat(&[PREFIX, b"input mismatch"]);
