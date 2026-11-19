@@ -1,18 +1,22 @@
 #[cfg(target_os = "linux")]
-fn main() {
-    use duduclaw_updated::{Error, linux, bootstrap_cli, updated_cli::{self, UpdatedCommand}};
-    // First step, before hardening, any file open, socket connect or lock: parse
-    // argv (exact fixed words, `updated_cli`) and refuse a state-changing operator
-    // command inside an AI session with the same fixed line as duduclaw-bootstrap
-    // (never the marker or its value). The service modes and read-only queries
-    // pass. A guard against mistakes, not a privilege boundary.
-    let command = match updated_cli::parse_guarded(std::env::args_os().skip(1), bootstrap_cli::process_env_presence) {
+use duduclaw_updated::{Error, linux, bootstrap_cli, updated_cli::{self, UpdatedCommand}};
+
+// Refuse every state-changing mode, including service modes, before any I/O.
+// Normal systemd/launcher environments do not carry AI-session markers.
+#[cfg(target_os = "linux")]
+fn guarded_command() -> UpdatedCommand {
+    match updated_cli::parse_guarded(std::env::args_os().skip(1), bootstrap_cli::process_env_presence) {
         Ok(command) => command,
         Err(refused) => {
             eprintln!("{}", refused.line());
             std::process::exit(1);
         }
-    };
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn main() {
+    let command = guarded_command();
     let result = match command {
         UpdatedCommand::Launch => linux::launcher::launch(),
         UpdatedCommand::BootstrapStage => linux::bootstrap::stage().map(|digest| {

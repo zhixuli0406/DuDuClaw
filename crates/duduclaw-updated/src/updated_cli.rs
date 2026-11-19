@@ -5,7 +5,7 @@
 //!
 //! Every mode is classified ([`UpdatedCommand::class`], an exhaustive match) as
 //! the systemd service, a read-only query or a state-changing operator command;
-//! the last kind is refused inside an AI session (the marker list
+//! both service and operator modes are refused inside an AI session (the marker list
 //! `duduclaw_isolation::ai_session::AI_SESSION_ENV_VARS`, shared with
 //! duduclaw-cli and `duduclaw-bootstrap`) with the bootstrap binary's fixed line,
 //! before any file, socket or lock is touched.
@@ -41,13 +41,14 @@ pub enum UpdatedCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Class {
     /// Started by systemd (or by the launcher's exec), whose environment never
-    /// carries a marker. Never refused; argv is exact, so no operator action
-    /// flag can be appended to it.
+    /// carries a marker (the launcher passes only PATH and LANG). These modes
+    /// change root update state and are refused inside an AI session too;
+    /// guarding them therefore leaves the normal service path unaffected.
     Service,
     /// Writes no host state; allowed inside an AI session.
     ReadOnly,
-    /// Changes root state; refused inside an AI session.
-    ChangesState,
+    /// Operator command that changes root state; refused inside an AI session.
+    OperatorChangesState,
 }
 
 impl UpdatedCommand {
@@ -68,7 +69,7 @@ impl UpdatedCommand {
             Self::CheckLatestDryRun | Self::Usage => Class::ReadOnly,
             // Apply request over the control socket / generation publication /
             // trust ledger write / emergency pending write.
-            Self::CheckLatest | Self::BootstrapStage | Self::RotateRoot | Self::Emergency => Class::ChangesState,
+            Self::CheckLatest | Self::BootstrapStage | Self::RotateRoot | Self::Emergency => Class::OperatorChangesState,
         }
     }
 }
@@ -112,15 +113,16 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> UpdatedCommand {
 }
 
 /// Whether `command` must be refused because an AI-session marker is present
-/// according to `env` (presence only). Only [`Class::ChangesState`] is refused.
+/// according to `env` (presence only). Both service and state-changing operator
+/// modes are refused; only [`Class::ReadOnly`] is allowed.
 /// Pure: no I/O.
 ///
 /// A guard against mistakes, not a privilege boundary: a process can unset its
 /// environment.
 pub fn refuse_ai_session(command: UpdatedCommand, env: impl Fn(&str) -> Option<String>) -> bool {
     let guarded = match command.class() {
-        Class::Service | Class::ReadOnly => false,
-        Class::ChangesState => true,
+        Class::ReadOnly => false,
+        Class::Service | Class::OperatorChangesState => true,
     };
     guarded && duduclaw_isolation::ai_session::in_ai_session(&|key| env(key).is_some())
 }
@@ -167,13 +169,15 @@ mod tests {
         for command in UpdatedCommand::ALL {
             assert!(seen.insert(format!("{command:?}")), "{command:?} listed twice");
             assert_eq!(parse(args(argv(command))), command, "{command:?}");
+            assert_eq!(parse_guarded(args(argv(command)), |_| Some(String::new())).is_err(),
+                command.class() != Class::ReadOnly, "{command:?}");
         }
         assert_eq!(seen.len(), UpdatedCommand::ALL.len());
         let of = |class: Class| UpdatedCommand::ALL.into_iter().filter(|c| c.class() == class).collect::<Vec<_>>();
         assert_eq!(of(Class::Service), [UpdatedCommand::Launch, UpdatedCommand::ServeSlot(UpdateSlot::A),
             UpdatedCommand::ServeSlot(UpdateSlot::B)]);
         assert_eq!(of(Class::ReadOnly), [UpdatedCommand::CheckLatestDryRun, UpdatedCommand::Usage]);
-        assert_eq!(of(Class::ChangesState), [UpdatedCommand::CheckLatest, UpdatedCommand::BootstrapStage,
+        assert_eq!(of(Class::OperatorChangesState), [UpdatedCommand::CheckLatest, UpdatedCommand::BootstrapStage,
             UpdatedCommand::RotateRoot, UpdatedCommand::Emergency]);
     }
 
@@ -215,16 +219,16 @@ mod tests {
             for value in ["", "x"] {
                 let env = |key: &str| (key == *marker).then(|| value.to_owned());
                 for command in UpdatedCommand::ALL {
-                    assert_eq!(refuse_ai_session(command, env), command.class() == Class::ChangesState,
+                    assert_eq!(refuse_ai_session(command, env), command.class() != Class::ReadOnly,
                         "{command:?} {marker}");
                 }
-                for command in [UpdatedCommand::CheckLatest, UpdatedCommand::BootstrapStage,
+                for command in [UpdatedCommand::Launch, UpdatedCommand::ServeSlot(UpdateSlot::A),
+                    UpdatedCommand::ServeSlot(UpdateSlot::B), UpdatedCommand::CheckLatest, UpdatedCommand::BootstrapStage,
                     UpdatedCommand::RotateRoot, UpdatedCommand::Emergency] {
                     assert_eq!(parse_guarded(args(argv(command)), env), Err(AiSessionRefused), "{command:?} {marker}");
                 }
-                // The service and read-only modes pass inside an AI session.
-                for command in [UpdatedCommand::Launch, UpdatedCommand::ServeSlot(UpdateSlot::A),
-                    UpdatedCommand::ServeSlot(UpdateSlot::B), UpdatedCommand::CheckLatestDryRun, UpdatedCommand::Usage] {
+                // Only read-only modes pass inside an AI session.
+                for command in [UpdatedCommand::CheckLatestDryRun, UpdatedCommand::Usage] {
                     assert_eq!(parse_guarded(args(argv(command)), env), Ok(command), "{command:?} {marker}");
                 }
             }
@@ -241,9 +245,65 @@ mod tests {
         for marker in markers { assert!(!AI_SESSION_REFUSAL.contains(marker)); }
     }
 
+    // The checked prefixes contain no string literals. Strip whitespace and both
+    // comment forms, including nested block comments, without hiding statements.
+    fn compact_entry_prefix(source: &str) -> String {
+        let mut chars = source.chars().peekable();
+        let mut result = String::new();
+        while let Some(ch) = chars.next() {
+            if ch == '/' && chars.peek() == Some(&'/') {
+                chars.next();
+                for ch in chars.by_ref() { if ch == '\n' { break; } }
+            } else if ch == '/' && chars.peek() == Some(&'*') {
+                chars.next();
+                let mut depth = 1;
+                while let Some(ch) = chars.next() {
+                    if ch == '/' && chars.peek() == Some(&'*') {
+                        chars.next();
+                        depth += 1;
+                    } else if ch == '*' && chars.peek() == Some(&'/') {
+                        chars.next();
+                        depth -= 1;
+                        if depth == 0 { break; }
+                    }
+                }
+                assert_eq!(depth, 0, "unterminated entry comment");
+            } else if !ch.is_whitespace() {
+                result.push(ch);
+            }
+        }
+        result
+    }
+
+    fn assert_entry_guard_order() {
+        let updated = include_str!("main.rs");
+        let body = updated.split_once("fn main() {").expect("updated main").1;
+        let prefix = body.split_once("guarded_command();").expect("updated guard call").0;
+        assert_eq!(compact_entry_prefix(prefix), "letcommand=",
+            "updated guard must be main's first statement");
+
+        // Check both Linux and non-Linux bootstrap entries. The Linux `use`
+        // is an item, not an executable statement; only quiet_panics may run first.
+        let bootstrap = include_str!("bin/duduclaw-bootstrap.rs");
+        let bodies = bootstrap.split("fn main() {").skip(1).collect::<Vec<_>>();
+        assert_eq!(bodies.len(), 2, "check every bootstrap main");
+        for (index, body) in bodies.into_iter().enumerate() {
+            let prefix = body.split_once("parse_or_refuse_ai_session()")
+                .expect("bootstrap guard call").0;
+            let expected = if index == 0 {
+                "use duduclaw_updated::linux::{self as platform, bootstrap_verify::{self, BootstrapMode, Refusal, Step}}; quiet_panics(); let (command, forwarded) = "
+            } else {
+                "quiet_panics(); if "
+            };
+            assert_eq!(compact_entry_prefix(prefix), compact_entry_prefix(expected),
+                "only quiet_panics may precede the bootstrap guard");
+        }
+    }
+
     #[test]
     fn updated_entry_refuses_in_an_ai_session_before_anything_else() {
-        // `parse_guarded` is the binary's first step; it reads only argv and the env
+        assert_entry_guard_order();
+        // `parse_guarded` reads only argv and the env
         // callback, so a refusal here happens before hardening, any file open,
         // socket connect or lock (the binary exits on Err without calling anything else).
         let marked = |key: &str| (key == "DUDUCLAW_AGENT_ID").then(String::new);
@@ -252,16 +312,17 @@ mod tests {
             looked_up.borrow_mut().push(key.to_owned());
             marked(key)
         };
-        for word in [&["--check-latest"][..], &["--bootstrap-stage"], &["--rotate-root"], &["--emergency"]] {
+        for word in [&["--launch"][..], &["--serve-slot", "a"], &["--serve-slot", "b"],
+            &["--check-latest"], &["--bootstrap-stage"], &["--rotate-root"], &["--emergency"]] {
             assert_eq!(parse_guarded(args(word), recording), Err(AiSessionRefused), "{word:?}");
         }
         // Only marker names were consulted.
         let markers = duduclaw_isolation::ai_session::AI_SESSION_ENV_VARS;
         assert!(!looked_up.borrow().is_empty());
         assert!(looked_up.borrow().iter().all(|key| markers.contains(&key.as_str())));
-        // Service and read-only modes do not even consult the environment.
+        // Read-only modes do not even consult the environment.
         looked_up.borrow_mut().clear();
-        for word in [&["--launch"][..], &["--serve-slot", "a"], &["--serve-slot", "b"], &["--check-latest", "--dry-run"],
+        for word in [&["--check-latest", "--dry-run"][..],
             &["help"]] {
             assert!(parse_guarded(args(word), recording).is_ok(), "{word:?}");
         }
