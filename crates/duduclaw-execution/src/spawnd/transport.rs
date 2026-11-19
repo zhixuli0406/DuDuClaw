@@ -149,7 +149,7 @@ impl ControlIo {
             validate_response(&request, &envelope.message, fds.len())?;
             validate_fds(&envelope.message.fd_plan(), &fds)?;
             if self.closed.load(Ordering::Acquire) { return Err(BackendError::Unavailable); }
-            check()?;
+            check().map_err(refused(Step::LiveCheck))?;
             transaction.completed = true;
             Ok(Packet { response: envelope.message, fds })
         })();
@@ -345,7 +345,7 @@ impl Connection {
         let transaction_check = check.clone();
         let result = tokio::task::spawn_blocking(move || io.transact(request, inputs, deadline, transaction_check.as_ref(), None))
             .await.map_err(|_| BackendError::Unavailable)?;
-        check()?;
+        check().map_err(refused(Step::LiveCheck))?;
         cancellation.0 = None;
         result
     }
@@ -568,6 +568,23 @@ fn validate_fds(roles: &[FdRole], fds: &[OwnedFd]) -> Result<(), BackendError> {
 mod tests {
     use super::*;
     use duduclaw_isolation::{execution::RunHandle, ids::RunId, ipc::IoDelivery};
+
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+    impl io::Write for LogCapture {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    }
+    impl LogCapture {
+        fn text(&self) -> String { String::from_utf8(self.0.lock().unwrap().clone()).unwrap() }
+    }
+    fn subscriber(writer: LogCapture) -> impl tracing::Subscriber + Send + Sync + 'static {
+        tracing_subscriber::fmt().without_time().with_ansi(false).with_max_level(tracing::Level::WARN)
+            .with_writer(move || writer.clone()).finish()
+    }
 
     fn status_peer(peer: OwnedFd, response: impl FnOnce(Envelope<SpawnRequest>) -> (Envelope<SpawnResponse>, Vec<OwnedFd>)
         + Send + 'static) -> std::thread::JoinHandle<()> {
@@ -839,8 +856,45 @@ mod tests {
         });
         let check: Arc<LiveCheck> = Arc::new(move || if live.load(Ordering::SeqCst) { Ok(()) } else { Err(BackendError::Denied) });
         let request = SpawnRequest::ReserveRun { employee_id: duduclaw_isolation::ids::EmployeeId([1; 16]) };
-        assert!(matches!(connection.request_checked(request, &[], check).await, Err(BackendError::Denied)));
+        let log = LogCapture::default();
+        let guard = tracing::subscriber::set_default(subscriber(log.clone()));
+        let result = connection.request_checked(request, &[], check).await;
+        drop(guard);
+        assert_eq!(result, Err(BackendError::Denied));
+        let logs = log.text();
+        assert_eq!(logs.lines().count(), 1, "{logs}");
+        assert!(logs.contains("step=\"live_check\"") && logs.contains("isolated spawn refused locally"), "{logs}");
         assert!(connection.is_closed());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn checked_request_outer_recheck_logs_revocation_after_error_reply() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        let (left, right) = socket::socketpair(AddressFamily::Unix, SockType::SeqPacket, None,
+            SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK).unwrap();
+        let connection = Connection::test_connection(left);
+        let live = Arc::new(AtomicBool::new(true));
+        let server_live = live.clone();
+        let server = tokio::spawn(async move {
+            let right = AsyncFd::new(right).unwrap();
+            let (bytes, _) = receive(&right).await.unwrap();
+            let request: Envelope<SpawnRequest> = ipc::decode(&bytes).unwrap();
+            server_live.store(false, Ordering::SeqCst);
+            let response = Envelope { version: ipc::PROTOCOL_VERSION, request_id: request.request_id,
+                message: SpawnResponse::Error { code: ErrorCode::Denied } };
+            send_checked(&right, &ipc::encode(&response).unwrap(), &[], &|| Ok(())).await.unwrap();
+        });
+        let check: Arc<LiveCheck> = Arc::new(move || if live.load(Ordering::SeqCst) { Ok(()) } else { Err(BackendError::Unavailable) });
+        let request = SpawnRequest::ReserveRun { employee_id: duduclaw_isolation::ids::EmployeeId([1; 16]) };
+        let log = LogCapture::default();
+        let guard = tracing::subscriber::set_default(subscriber(log.clone()));
+        let result = connection.request_checked(request, &[], check).await;
+        drop(guard);
+        assert_eq!(result, Err(BackendError::Unavailable));
+        let logs = log.text();
+        assert_eq!(logs.lines().count(), 1, "{logs}");
+        assert!(logs.contains("step=\"live_check\"") && logs.contains("isolated spawn refused locally"), "{logs}");
         server.await.unwrap();
     }
 
