@@ -401,6 +401,11 @@ impl Responder {
     /// `tools/list` was answered: the conversation the record needs is over.
     pub(super) fn complete(&self) -> bool { self.phase == Phase::Complete }
     pub(super) fn frames(&self) -> &[Frame] { &self.frames }
+    /// `(received, sent)` frames so far (diagnosis).
+    pub(super) fn counts(&self) -> (u32, u32) {
+        let received = self.frames.iter().filter(|frame| frame.direction == Direction::RuntimeToHarness).count() as u32;
+        (received, self.frames.len() as u32 - received)
+    }
     pub(super) fn facts(&self) -> InitializeFacts {
         InitializeFacts { initialize_requests: self.initialize_requests, observed_before_reply: self.observed_before_reply,
             initialized_after_reply: self.initialized_after_reply, tools_list_answered: self.tools_list_answered,
@@ -579,7 +584,37 @@ pub(super) mod incomplete {
     pub const UNEXPECTED_PROCESS: &str = "unexpected_process";
     pub const LAUNCHER_MISSING: &str = "launcher_missing";
     pub const PROCESS_FACTS: &str = "process_facts_unreadable";
+    /// R8r-4 third real-host run: a runtime-digest or bridge-digest process
+    /// had been classified, then a complete snapshot before the conversation
+    /// completed held neither (the run ended early).
+    pub const RUNTIME_GONE: &str = "runtime_gone";
 }
+
+/// Which code site raised an incomplete reason (diagnosis only; a reason has
+/// more than one site, e.g. `launcher_missing`).
+pub(super) mod site {
+    pub const SNAPSHOT: &str = "snapshot.incomplete";
+    pub const NODE_CAP: &str = "classify.node_cap";
+    pub const DUPLICATE_PID: &str = "classify.duplicate_pid";
+    pub const MEMBER_EXIT_UNCONFIRMED: &str = "classify.member_exit_unconfirmed";
+    pub const MEMBER_UNREADABLE: &str = "classify.member_unreadable";
+    pub const MEMBER_HASH_ERROR: &str = "classify.member_hash_error";
+    pub const LAUNCHER_REPLACED: &str = "classify.launcher_replaced";
+    pub const LAUNCHER_ABSENT: &str = "classify.launcher_absent";
+    pub const PARENT_ABSENT: &str = "classify.parent_absent";
+    pub const DEPTH_CAP: &str = "classify.depth_cap";
+    pub const PARENT_CYCLE: &str = "classify.parent_cycle";
+    pub const MISPLACED: &str = "classify.misplaced";
+    pub const DUPLICATE_ROLE: &str = "classify.duplicate_role";
+    pub const LAUNCHER_EXITED_EARLY: &str = "census.launcher_exited_early";
+    pub const RUNTIME_GONE_EARLY: &str = "census.runtime_gone_early";
+    pub const CENSUS_CAP: &str = "census.cap";
+    pub const EXEC_SEQUENCE: &str = "census.exec_sequence";
+    pub const FINISH: &str = "census.finish";
+    pub const PROCESS_FACTS: &str = "observe.process_facts";
+}
+/// A fixed incomplete reason and the site that raised it.
+pub(super) type Refusal = (&'static str, &'static str);
 
 /// The fixed refusal of [`decide`] for an incomplete observation.
 pub(super) fn incomplete_message(reason: &str) -> &'static str {
@@ -597,8 +632,10 @@ pub(super) fn incomplete_message(reason: &str) -> &'static str {
         UNEXPECTED_PROCESS => "incomplete observation (unexpected_process): a process in the run cgroup is not the trampoline, \
             the forwarder, the runtime or the bridge in its documented place",
         LAUNCHER_MISSING => "incomplete observation (launcher_missing): the unit's main process was not in the run cgroup \
-            before the conversation completed",
+            without its pidfd confirming its exit, or it exited before the conversation completed",
         PROCESS_FACTS => "incomplete observation (process_facts_unreadable): the runtime's or the bridge's facts could not be read",
+        RUNTIME_GONE => "incomplete observation (runtime_gone): the runtime and the bridge left the run cgroup before the \
+            conversation completed",
         _ => "incomplete observation (unknown reason)",
     }
 }
@@ -669,26 +706,41 @@ pub(super) struct Classified {
 /// documented place (table above), else the fixed reason.
 pub(super) fn classify(snapshot: &CgroupSnapshot, ids: &Identities, limits: &WalkLimits)
     -> std::result::Result<Classified, &'static str> {
+    classify_sited(snapshot, ids, limits).map_err(|(reason, _)| reason)
+}
+
+/// `(start, ppid, exe)` of every live member of a complete snapshot; every
+/// other member must be a confirmed exit. No placement rule.
+fn live_members(snapshot: &CgroupSnapshot, limits: &WalkLimits)
+    -> std::result::Result<BTreeMap<u32, (u64, u32, Sha256Digest)>, Refusal> {
     use incomplete::*;
-    if let Some(reason) = snapshot.incomplete { return Err(reason); }
-    if snapshot.members.len() > limits.max_nodes { return Err(NODE_CAP); }
+    if let Some(reason) = snapshot.incomplete { return Err((reason, site::SNAPSHOT)); }
+    if snapshot.members.len() > limits.max_nodes { return Err((NODE_CAP, site::NODE_CAP)); }
     let mut live: BTreeMap<u32, (u64, u32, Sha256Digest)> = BTreeMap::new();
     for member in &snapshot.members {
         match &member.read {
             MemberRead::Live { start, ppid, exe } => {
-                if live.insert(member.pid, (*start, *ppid, *exe)).is_some() { return Err(CGROUP_UNSTABLE); }
+                if live.insert(member.pid, (*start, *ppid, *exe)).is_some() { return Err((CGROUP_UNSTABLE, site::DUPLICATE_PID)); }
             }
             MemberRead::Exited { confirmed: true } => {}
-            MemberRead::Exited { confirmed: false } => return Err(UNCONFIRMED_EXIT),
-            MemberRead::Unreadable => return Err(UNREADABLE_PROCESS),
-            MemberRead::HashError => return Err(HASH_ERROR),
+            MemberRead::Exited { confirmed: false } => return Err((UNCONFIRMED_EXIT, site::MEMBER_EXIT_UNCONFIRMED)),
+            MemberRead::Unreadable => return Err((UNREADABLE_PROCESS, site::MEMBER_UNREADABLE)),
+            MemberRead::HashError => return Err((HASH_ERROR, site::MEMBER_HASH_ERROR)),
         }
     }
+    Ok(live)
+}
+
+/// [`classify`] with the site that refused (diagnosis).
+pub(super) fn classify_sited(snapshot: &CgroupSnapshot, ids: &Identities, limits: &WalkLimits)
+    -> std::result::Result<Classified, Refusal> {
+    use incomplete::*;
+    let live = live_members(snapshot, limits)?;
     let (launcher_pid, launcher_start) = ids.launcher;
     match live.get(&launcher_pid) {
         Some((start, _, _)) if *start == launcher_start => {}
-        Some(_) => return Err(UNEXPECTED_PROCESS),
-        None => return Err(LAUNCHER_MISSING),
+        Some(_) => return Err((UNEXPECTED_PROCESS, site::LAUNCHER_REPLACED)),
+        None => return Err((LAUNCHER_MISSING, site::LAUNCHER_ABSENT)),
     }
     // Every member descends from the main process inside the cgroup.
     let mut members = Vec::with_capacity(live.len());
@@ -696,11 +748,11 @@ pub(super) fn classify(snapshot: &CgroupSnapshot, ids: &Identities, limits: &Wal
         let mut depth = 0u32;
         let mut current = pid;
         while current != launcher_pid {
-            let parent = live.get(&current).map(|(_, parent, _)| *parent).ok_or(UNEXPECTED_PROCESS)?;
-            if !live.contains_key(&parent) { return Err(UNEXPECTED_PROCESS); }
+            let parent = live.get(&current).map(|(_, parent, _)| *parent).ok_or((UNEXPECTED_PROCESS, site::PARENT_ABSENT))?;
+            if !live.contains_key(&parent) { return Err((UNEXPECTED_PROCESS, site::PARENT_ABSENT)); }
             depth += 1;
-            if depth > limits.max_depth { return Err(DEPTH_CAP); }
-            if depth as usize > live.len() { return Err(UNEXPECTED_PROCESS); }
+            if depth > limits.max_depth { return Err((DEPTH_CAP, site::DEPTH_CAP)); }
+            if depth as usize > live.len() { return Err((UNEXPECTED_PROCESS, site::PARENT_CYCLE)); }
             current = parent;
         }
         members.push(LiveMember { pid, start, ppid, exe, depth });
@@ -728,9 +780,9 @@ pub(super) fn classify(snapshot: &CgroupSnapshot, ids: &Identities, limits: &Wal
         } else {
             false
         };
-        if !placed { return Err(UNEXPECTED_PROCESS); }
+        if !placed { return Err((UNEXPECTED_PROCESS, site::MISPLACED)); }
     }
-    if spawned_runtimes > 1 || forwarders > 1 || inits > 1 || init_forks > 2 { return Err(UNEXPECTED_PROCESS); }
+    if spawned_runtimes > 1 || forwarders > 1 || inits > 1 || init_forks > 2 { return Err((UNEXPECTED_PROCESS, site::DUPLICATE_ROLE)); }
     let runtimes: Vec<&LiveMember> = members.iter().filter(|member| member.exe == ids.runtime).collect();
     let bridges: Vec<&LiveMember> = members.iter().filter(|member| member.exe == ids.bridge).collect();
     let runtime = match runtimes.as_slice() { [only] => Some((only.pid, only.depth)), _ => None };
@@ -746,6 +798,34 @@ pub(super) fn classify(snapshot: &CgroupSnapshot, ids: &Identities, limits: &Wal
     Ok(Classified { live: members, runtime, bridge })
 }
 
+/// The processes a complete snapshot names (as the main process, or as the
+/// parent of a live member) but does not list as live: the main process when
+/// it is not a live member, and every parent of a live member (other than the
+/// main process's own parent) outside the live set; sorted, without repeats.
+///
+/// R8r-4 third real-host run: the kernel stops listing an exiting thread-group
+/// leader in `cgroup.procs` (`css_task_iter`: a dying leader without live
+/// threads) BEFORE its pidfd becomes readable (`exit_notify`, after the exit
+/// path has released the process's memory, files and namespaces; with
+/// threads, after the last thread's whole exit). During that window a
+/// complete, agreeing snapshot lacks the process although nothing confirms its
+/// exit yet. The harness waits (bounded) for the kernel's confirmation of
+/// exactly these processes before it classifies; it never assumes it.
+pub(super) fn absent_parents(snapshot: &CgroupSnapshot, ids: &Identities) -> Vec<u32> {
+    let live: BTreeMap<u32, u32> = snapshot.members.iter().filter_map(|member| match &member.read {
+        MemberRead::Live { ppid, .. } => Some((member.pid, *ppid)),
+        _ => None,
+    }).collect();
+    let launcher = ids.launcher.0;
+    let mut absent: Vec<u32> = live.iter()
+        .filter(|(pid, ppid)| **pid != launcher && !live.contains_key(ppid))
+        .map(|(_, ppid)| *ppid).collect();
+    if !live.contains_key(&launcher) { absent.push(launcher); }
+    absent.sort_unstable();
+    absent.dedup();
+    absent
+}
+
 /// The digests one `(pid, start)` had, in order: constant, or one documented exec.
 fn allowed_sequence(digests: &[Sha256Digest], ids: &Identities) -> bool {
     let known = |digest: &Sha256Digest| *digest == ids.trampoline || *digest == ids.runtime || *digest == ids.bridge
@@ -758,37 +838,101 @@ fn allowed_sequence(digests: &[Sha256Digest], ids: &Identities) -> bool {
     }
 }
 
+/// What one census turn did with its snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Turn {
+    /// Classified completely; the census holds its members.
+    Classified,
+    /// Not classified: the main process's exit was confirmed after the
+    /// conversation completed (the run is being torn down).
+    Ended,
+    /// This turn made the observation incomplete.
+    Failed,
+    /// The observation was already incomplete.
+    AlreadyFailed,
+}
+
 /// Every process ever seen in the run cgroup by `(pid, start)` with the
 /// digests it had, from complete snapshots taken on every turn of the
-/// conversation loop; sticky `incomplete`.
+/// conversation loop; sticky `incomplete` (the FIRST failure, with its site).
+///
+/// Start: a snapshot without the runtime (only the supervisor, init, the
+/// forwarder or their pre-exec forks) is "not yet" while no runtime-digest or
+/// bridge-digest process was ever classified. That wait is bounded by the
+/// conversation loop itself (`CONVERSATION_LIMIT`): a run whose runtime never
+/// sends `initialize` within it is stopped by the harness and has no runtime
+/// facts, so no record. Once a runtime was classified, a complete snapshot
+/// without any runtime-digest or bridge-digest process before the
+/// conversation completed is [`incomplete::RUNTIME_GONE`].
 #[derive(Default)]
-pub(super) struct Census { pub seen: BTreeMap<(u32, u64), Vec<Sha256Digest>>, pub incomplete: Option<&'static str> }
+pub(super) struct Census {
+    pub seen: BTreeMap<(u32, u64), Vec<Sha256Digest>>,
+    pub incomplete: Option<&'static str>,
+    /// Where `incomplete` was raised ([`site`]).
+    pub site: Option<&'static str>,
+    /// A runtime-digest or bridge-digest process was classified.
+    pub runtime_seen: bool,
+}
 impl Census {
-    pub(super) fn fail(&mut self, reason: &'static str) {
-        if self.incomplete.is_none() { self.incomplete = Some(reason); }
+    pub(super) fn fail(&mut self, reason: &'static str, site: &'static str) {
+        if self.incomplete.is_none() { self.incomplete = Some(reason); self.site = Some(site); }
     }
     /// `launcher_exited`: the main process's pidfd reported its exit (read
-    /// after the snapshot). The supervisor exits only after init, whose exit
-    /// SIGKILLs everything in the run's PID namespace, so a later snapshot
-    /// shows only processes being torn down and is not classified; before the
-    /// conversation completed that is itself a refusal.
+    /// after the snapshot; the harness waits for it, bounded, whenever the
+    /// snapshot does not list the main process as live). The supervisor exits
+    /// only after init, whose exit SIGKILLs everything in the run's PID
+    /// namespace, so a later snapshot shows only processes being torn down and
+    /// is not classified; before the conversation completed that is itself a
+    /// refusal.
     pub(super) fn record(&mut self, snapshot: &CgroupSnapshot, ids: &Identities, limits: &WalkLimits, launcher_exited: bool,
-        after_conversation: bool) {
-        if self.incomplete.is_some() { return; }
+        after_conversation: bool) -> Turn {
+        if self.incomplete.is_some() { return Turn::AlreadyFailed; }
         if launcher_exited {
-            if !after_conversation { self.fail(incomplete::LAUNCHER_MISSING); }
-            return;
+            if !after_conversation { self.fail(incomplete::LAUNCHER_MISSING, site::LAUNCHER_EXITED_EARLY); return Turn::Failed; }
+            return Turn::Ended;
         }
-        let classified = match classify(snapshot, ids, limits) {
+        let classified = match classify_sited(snapshot, ids, limits) {
             Ok(classified) => classified,
-            Err(reason) => { self.fail(reason); return; }
+            Err((reason, site)) => { self.fail(reason, site); return Turn::Failed; }
         };
-        for member in &classified.live {
-            let digests = self.seen.entry((member.pid, member.start)).or_default();
-            if digests.last() != Some(&member.exe) { digests.push(member.exe); }
+        let digests: Vec<((u32, u64), Sha256Digest)> = classified.live.iter()
+            .map(|member| ((member.pid, member.start), member.exe)).collect();
+        if !self.add(&digests, ids, limits) { return Turn::Failed; }
+        let running = classified.live.iter().any(|member| member.exe == ids.runtime || member.exe == ids.bridge);
+        if running { self.runtime_seen = true; }
+        else if self.runtime_seen && !after_conversation {
+            self.fail(incomplete::RUNTIME_GONE, site::RUNTIME_GONE_EARLY);
+            return Turn::Failed;
         }
-        if self.seen.len() > limits.max_census { self.fail(incomplete::CENSUS_CAP); return; }
-        if self.seen.values().any(|digests| !allowed_sequence(digests, ids)) { self.fail(incomplete::UNEXPECTED_PROCESS); }
+        Turn::Classified
+    }
+    /// A complete snapshot the harness could not classify yet because a
+    /// parent it names is exiting ([`absent_parents`]; the harness confirmed
+    /// that exit and takes another snapshot): every member must still be a
+    /// live process with a documented digest or a confirmed exit, and its
+    /// digests join the census (so a process seen only then is still counted).
+    pub(super) fn witness(&mut self, snapshot: &CgroupSnapshot, ids: &Identities, limits: &WalkLimits) -> Turn {
+        if self.incomplete.is_some() { return Turn::AlreadyFailed; }
+        let live = match live_members(snapshot, limits) {
+            Ok(live) => live,
+            Err((reason, site)) => { self.fail(reason, site); return Turn::Failed; }
+        };
+        let digests: Vec<((u32, u64), Sha256Digest)> = live.iter().map(|(pid, (start, _, exe))| ((*pid, *start), *exe)).collect();
+        if !self.add(&digests, ids, limits) { return Turn::Failed; }
+        if digests.iter().any(|(_, exe)| *exe == ids.runtime || *exe == ids.bridge) { self.runtime_seen = true; }
+        Turn::Classified
+    }
+    fn add(&mut self, members: &[((u32, u64), Sha256Digest)], ids: &Identities, limits: &WalkLimits) -> bool {
+        for (key, exe) in members {
+            let digests = self.seen.entry(*key).or_default();
+            if digests.last() != Some(exe) { digests.push(*exe); }
+        }
+        if self.seen.len() > limits.max_census { self.fail(incomplete::CENSUS_CAP, site::CENSUS_CAP); return false; }
+        if self.seen.values().any(|digests| !allowed_sequence(digests, ids)) {
+            self.fail(incomplete::UNEXPECTED_PROCESS, site::EXEC_SEQUENCE);
+            return false;
+        }
+        true
     }
     /// The census's verdict: incomplete, or more than one runtime (a runtime-
     /// digest process that never became the bridge) or forwarder ever.
@@ -972,6 +1116,105 @@ pub(super) enum UnitReadback {
     Read(UnitResult),
 }
 
+/// What the harness read about one cgroup member besides the census facts,
+/// for the diagnosis only: the real uid of a live member, the errno of a
+/// failed read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct MemberNote { pub uid: Option<u32>, pub errno: Option<i32> }
+
+/// The documented role a live member's digest and parent give it, for the
+/// diagnosis only (the decision is [`classify`]): `supervisor`, `init`,
+/// `forwarder`, `runtime`, `bridge`, `pre-exec` (a fork of init or of the
+/// runtime before its exec) or `unknown`.
+pub(super) fn member_class(pid: u32, ppid: u32, exe: Sha256Digest, parent: Option<Sha256Digest>, ids: &Identities) -> &'static str {
+    if pid == ids.launcher.0 { return if exe == ids.trampoline { "supervisor" } else { "unknown" }; }
+    if exe == ids.trampoline {
+        return if ppid == ids.launcher.0 { "init" } else if parent == Some(ids.trampoline) { "pre-exec" } else { "unknown" };
+    }
+    if Some(exe) == ids.forwarder { return "forwarder"; }
+    if exe == ids.runtime { return if parent == Some(ids.runtime) { "pre-exec" } else { "runtime" }; }
+    if exe == ids.bridge { return "bridge"; }
+    "unknown"
+}
+fn errno_text(errno: Option<i32>) -> String { errno.map_or_else(|| "none".to_owned(), |errno| errno.to_string()) }
+
+/// One line per member: `pid ppid uid class digest8` for a live member, else
+/// `pid - - <read failure>` (`exited_confirmed`, `exited_unconfirmed`,
+/// `unreadable(errno)`, `hash_error(errno)`). No path; 8 hex of a digest.
+pub(super) fn member_lines(snapshot: &CgroupSnapshot, notes: &BTreeMap<u32, MemberNote>, ids: &Identities) -> Vec<String> {
+    let digests: BTreeMap<u32, Sha256Digest> = snapshot.members.iter().filter_map(|member| match &member.read {
+        MemberRead::Live { exe, .. } => Some((member.pid, *exe)),
+        _ => None,
+    }).collect();
+    snapshot.members.iter().map(|member| {
+        let note = notes.get(&member.pid).copied().unwrap_or_default();
+        match &member.read {
+            MemberRead::Live { ppid, exe, .. } => format!("{} {} {} {} {}", member.pid, ppid,
+                note.uid.map_or_else(|| "?".to_owned(), |uid| uid.to_string()),
+                member_class(member.pid, *ppid, *exe, digests.get(ppid).copied(), ids), hex(&exe.0[..4])),
+            MemberRead::Exited { confirmed: true } => format!("{} - - exited_confirmed", member.pid),
+            MemberRead::Exited { confirmed: false } => format!("{} - - exited_unconfirmed", member.pid),
+            MemberRead::Unreadable => format!("{} - - unreadable({})", member.pid, errno_text(note.errno)),
+            MemberRead::HashError => format!("{} - - hash_error({})", member.pid, errno_text(note.errno)),
+        }
+    }).collect()
+}
+
+/// One census turn as the diagnosis shows it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct SnapshotDiag {
+    /// Milliseconds since the harness asked PID 1 to start the unit.
+    pub at_ms: u64,
+    /// The snapshot's own gap (`cgroup_unstable`, ...), if any.
+    pub gap: Option<&'static str>,
+    pub members: Vec<String>,
+    /// The main process's pidfd reported its exit after this snapshot.
+    pub launcher_exited: bool,
+    pub received: u32,
+    pub sent: u32,
+    pub after_conversation: bool,
+}
+/// The census as the diagnosis shows it: the pinned main process, the last
+/// classified turn and the turn that made the observation incomplete.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct CensusDiag {
+    /// `(pid, start)` the harness pinned for the unit's main process.
+    pub launcher: Option<(u32, u64)>,
+    pub last_good: Option<SnapshotDiag>,
+    pub first_failure: Option<SnapshotDiag>,
+    /// The site of the reported incomplete reason ([`site`]).
+    pub site: Option<&'static str>,
+}
+impl CensusDiag {
+    /// Keep `turn`'s snapshot as the last good one or the first failure.
+    pub(super) fn note(&mut self, turn: Turn, snapshot: impl FnOnce() -> SnapshotDiag) {
+        match turn {
+            Turn::Classified => self.last_good = Some(snapshot()),
+            Turn::Failed if self.first_failure.is_none() => self.first_failure = Some(snapshot()),
+            _ => {}
+        }
+    }
+}
+/// Members shown per snapshot (with one header line each, two snapshots, the
+/// launcher and the site line, the census block stays within 40 lines).
+pub(super) const DIAG_MEMBERS_SHOWN: usize = 16;
+fn census_lines(c: &CensusDiag) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some((pid, start)) = c.launcher { lines.push(format!("census: pinned main process pid {pid} start {start}")); }
+    if let Some(site) = c.site { lines.push(format!("incomplete site: {site}")); }
+    for (name, snapshot) in [("first failing snapshot", &c.first_failure), ("last good snapshot", &c.last_good)] {
+        let Some(s) = snapshot else { lines.push(format!("census {name}: none")); continue };
+        lines.push(format!("census {name}: +{} ms, gap {}, main pidfd exited {}, frames received {} sent {}, \
+            after_conversation {}, {} members", s.at_ms, s.gap.unwrap_or("none"), s.launcher_exited, s.received, s.sent,
+            s.after_conversation, s.members.len()));
+        for member in s.members.iter().take(DIAG_MEMBERS_SHOWN) { lines.push(format!("census {name}| {}", printable_value(member))); }
+        if s.members.len() > DIAG_MEMBERS_SHOWN {
+            lines.push(format!("census {name}| ... {} more", s.members.len() - DIAG_MEMBERS_SHOWN));
+        }
+    }
+    lines
+}
+
 /// The last `capacity` bytes of a stream, and how many it carried in total.
 #[derive(Clone, Debug)]
 pub(super) struct Tail { capacity: usize, bytes: Vec<u8>, total: u64 }
@@ -1007,6 +1250,8 @@ pub(super) struct Diagnosis {
     pub stdout: Tail,
     pub stderr: Tail,
     pub incomplete: Option<&'static str>,
+    /// The census turns behind `incomplete` (printed only when it is set).
+    pub census: CensusDiag,
     /// Every tear-down step that failed.
     pub teardown: Vec<ErrorFact>,
 }
@@ -1014,7 +1259,7 @@ impl Default for Diagnosis {
     fn default() -> Self {
         Self { run: None, employee: None, phase: HarnessPhase::default(), harness_error: None, unit: UnitReadback::default(),
             status_error: None, run_end: None, stdout: Tail::new(STDOUT_TAIL_BYTES), stderr: Tail::new(STDERR_TAIL_BYTES),
-            incomplete: None, teardown: Vec::new() }
+            incomplete: None, census: CensusDiag::default(), teardown: Vec::new() }
     }
 }
 
@@ -1078,7 +1323,10 @@ pub(super) fn diagnosis_lines(d: &Diagnosis) -> Vec<String> {
         None => "trampoline status: no error record received".to_owned(),
     });
     if let Some(end) = &d.run_end { push(format!("run end: {}", printable_value(end))); }
-    if let Some(reason) = d.incomplete { push(format!("incomplete: {reason}")); }
+    if let Some(reason) = d.incomplete {
+        push(format!("incomplete: {reason}"));
+        for line in census_lines(&d.census) { push(line); }
+    }
     for step in &d.teardown { push(format!("teardown step failed: {}", step.describe())); }
     for (name, tail, limit) in [("stdout", &d.stdout, STDOUT_TAIL_BYTES), ("stderr", &d.stderr, STDERR_TAIL_BYTES)] {
         let shown = &tail.bytes()[tail.bytes().len().saturating_sub(limit)..];

@@ -3,6 +3,7 @@
 //! unprivileged; the real launch is `iso_root_policy_accept_api_worker_end_to_end`.
 use super::*;
 use serde_json::json;
+use std::collections::BTreeMap;
 
 const API_WORKER: &str = "\u{7f}ELF TEST api worker bytes";
 const FORWARDER: &str = "\u{7f}ELF TEST egress forwarder bytes";
@@ -870,6 +871,242 @@ fn exited_processes_are_tolerated_only_with_exit_confirmation() {
     members.push(Member { pid: 16, read: MemberRead::Exited { confirmed: false } });
     assert_eq!(classify(&snapshot_of(members.clone()), &ids, &limits()).err(), Some(incomplete::UNCONFIRMED_EXIT));
     assert!(decision_on(&snapshot_of(members), &ids, &limits()).unwrap_err().contains(incomplete::UNCONFIRMED_EXIT));
+}
+
+// ── R8r-4 third real-host run: the observed process tree ────────────────
+
+/// The run as sampled on the host: supervisor 42644 (the unit's MainPID,
+/// parent PID 1, uid 0 at start then the supervisor id 988), init 42673,
+/// forwarder 42674 and runtime 42675 below init, bridge 42677 below the
+/// runtime; all but the supervisor run as the employee uid 76202, in ONE
+/// flat cgroup.
+const HOST_SUPERVISOR: u32 = 42644;
+fn host_ids() -> Identities {
+    Identities { launcher: (HOST_SUPERVISOR, start_of(HOST_SUPERVISOR)), trampoline: digest(2), runtime: digest(3), bridge: digest(4),
+        forwarder: Some(digest(5)) }
+}
+fn host_members() -> Vec<Member> {
+    vec![live(42644, 1, digest(2)), live(42673, 42644, digest(2)), live(42674, 42673, digest(5)), live(42675, 42673, digest(3)),
+        live(42677, 42675, digest(4))]
+}
+fn host_notes(supervisor_uid: u32) -> BTreeMap<u32, MemberNote> {
+    [(42644, supervisor_uid), (42673, 76202), (42674, 76202), (42675, 76202), (42677, 76202)].into_iter()
+        .map(|(pid, uid)| (pid, MemberNote { uid: Some(uid), errno: None })).collect()
+}
+
+#[test]
+fn the_host_ground_truth_classifies_completely_with_all_four_facts_obtainable() {
+    let ids = host_ids();
+    let snapshot = snapshot_of(host_members());
+    assert_eq!(absent_parents(&snapshot, &ids), Vec::<u32>::new());
+    let classified = classify_sited(&snapshot, &ids, &limits()).unwrap();
+    // Facts a and b are read from exactly these two pidfd-pinned members.
+    assert_eq!((classified.runtime, classified.bridge), (Some((42675, 2)), Some((42677, 1))));
+    assert_eq!(classified.live.len(), 5);
+    let mut census = Census::default();
+    assert_eq!(census.record(&snapshot, &ids, &limits(), false, false), Turn::Classified);
+    assert!(census.runtime_seen);
+    assert_eq!((census.finish(&ids), census.bridges(&ids)), (None, 1));
+    // With the runtime and bridge facts observed, all four facts decide.
+    assert_eq!(decision_on(&snapshot, &ids, &limits()), Ok(()));
+    assert_eq!(member_lines(&snapshot, &host_notes(988), &ids), [
+        "42644 1 988 supervisor 02020202", "42673 42644 76202 init 02020202", "42674 42673 76202 forwarder 05050505",
+        "42675 42673 76202 runtime 03030303", "42677 42675 76202 bridge 04040404"]);
+}
+
+#[test]
+fn the_supervisor_changing_uid_after_start_changes_nothing() {
+    // Sample 1 (activating): only the supervisor, still uid 0; then the tree,
+    // the supervisor now uid 988. Uids are no census fact; the supervisor's
+    // (pid, start) and digest are the same in both turns.
+    let ids = host_ids();
+    let first = snapshot_of(vec![live(42644, 1, digest(2))]);
+    let later = snapshot_of(host_members());
+    let mut census = Census::default();
+    assert_eq!(census.record(&first, &ids, &limits(), false, false), Turn::Classified);
+    assert_eq!(census.record(&later, &ids, &limits(), false, false), Turn::Classified);
+    assert_eq!(census.finish(&ids), None);
+    assert_eq!(census.seen.get(&(42644, start_of(42644))), Some(&vec![digest(2)]));
+    assert_eq!(member_lines(&first, &host_notes(0), &ids), ["42644 1 0 supervisor 02020202"]);
+    assert_eq!(member_lines(&later, &host_notes(988), &ids)[0], "42644 1 988 supervisor 02020202");
+    assert_eq!(decision_on(&later, &ids, &limits()), Ok(()));
+}
+
+#[test]
+fn a_supervisor_only_cgroup_is_starting_until_a_runtime_was_seen() {
+    let ids = host_ids();
+    let supervisor_only = snapshot_of(vec![live(42644, 1, digest(2))]);
+    let with_init = snapshot_of(vec![live(42644, 1, digest(2)), live(42673, 42644, digest(2))]);
+    // Starting: "not yet" (bounded by the conversation loop), never a refusal.
+    let mut census = Census::default();
+    for snapshot in [&supervisor_only, &supervisor_only, &with_init] {
+        assert_eq!(census.record(snapshot, &ids, &limits(), false, false), Turn::Classified);
+    }
+    assert!(!census.runtime_seen);
+    assert_eq!(census.finish(&ids), None);
+    // Once the runtime was seen, the run ending before the conversation completed is refused.
+    assert_eq!(census.record(&snapshot_of(host_members()), &ids, &limits(), false, false), Turn::Classified);
+    assert_eq!(census.record(&supervisor_only, &ids, &limits(), false, false), Turn::Failed);
+    assert_eq!((census.finish(&ids), census.site), (Some(incomplete::RUNTIME_GONE), Some(site::RUNTIME_GONE_EARLY)));
+    assert!(incomplete_message(incomplete::RUNTIME_GONE).contains("runtime_gone"));
+    // ... but not after it completed (the tear-down).
+    let mut census = Census::default();
+    census.record(&snapshot_of(host_members()), &ids, &limits(), false, false);
+    assert_eq!(census.record(&supervisor_only, &ids, &limits(), false, true), Turn::Classified);
+    assert_eq!(census.finish(&ids), None);
+    // The bridge's pre-exec fork (a second runtime digest, two runtime-digest
+    // members) is still a running runtime; it then becomes the bridge.
+    let mut census = Census::default();
+    let runtime_only = snapshot_of(host_members()[..4].to_vec());
+    let pre_exec = snapshot_of([host_members()[..4].to_vec(), vec![live(42677, 42675, digest(3))]].concat());
+    for snapshot in [&runtime_only, &pre_exec, &snapshot_of(host_members())] {
+        assert_eq!(census.record(snapshot, &ids, &limits(), false, false), Turn::Classified);
+    }
+    assert_eq!(census.finish(&ids), None);
+}
+
+/// The regression: at the end of the run (after `tools/list` was answered,
+/// the worker exited 125) the supervisor is in its exit path, no longer listed
+/// in `cgroup.procs`, while its pidfd is not readable yet. The harness used to
+/// classify that agreeing snapshot at once and refuse `launcher_missing`.
+#[test]
+fn an_exiting_main_process_is_awaited_not_refused() {
+    let ids = host_ids();
+    let exiting = snapshot_of(Vec::new());
+    // What the harness waits for: the main process's exit, nothing else.
+    assert_eq!(absent_parents(&exiting, &ids), [HOST_SUPERVISOR]);
+    // Old behaviour: classified at once (no confirmation yet) -> refused.
+    assert_eq!(classify_sited(&exiting, &ids, &limits()).err(), Some((incomplete::LAUNCHER_MISSING, site::LAUNCHER_ABSENT)));
+    let mut census = Census::default();
+    census.record(&snapshot_of(host_members()), &ids, &limits(), false, false);
+    assert_eq!(census.record(&exiting, &ids, &limits(), false, true), Turn::Failed);
+    assert_eq!((census.incomplete, census.site), (Some(incomplete::LAUNCHER_MISSING), Some(site::LAUNCHER_ABSENT)));
+    // New: the harness waits for the pidfd; once it confirms the exit after
+    // the conversation, the turn is the tear-down and not classified.
+    let mut census = Census::default();
+    census.record(&snapshot_of(host_members()), &ids, &limits(), false, false);
+    assert_eq!(census.record(&exiting, &ids, &limits(), true, true), Turn::Ended);
+    assert_eq!(census.finish(&ids), None);
+    // A confirmed exit before the conversation completed is still refused, at its own site.
+    let mut census = Census::default();
+    assert_eq!(census.record(&snapshot_of(host_members()), &ids, &limits(), true, false), Turn::Failed);
+    assert_eq!((census.incomplete, census.site), (Some(incomplete::LAUNCHER_MISSING), Some(site::LAUNCHER_EXITED_EARLY)));
+    // A pinned main process still listed is never "absent".
+    assert!(absent_parents(&snapshot_of(host_members()), &ids).is_empty());
+    let replaced = snapshot_of(vec![Member { pid: HOST_SUPERVISOR, read: MemberRead::Live { start: 1, ppid: 1, exe: digest(2) } }]);
+    assert!(absent_parents(&replaced, &ids).is_empty());
+    assert_eq!(classify_sited(&replaced, &ids, &limits()).err(), Some((incomplete::UNEXPECTED_PROCESS, site::LAUNCHER_REPLACED)));
+}
+
+#[test]
+fn an_exiting_init_is_awaited_and_its_children_are_still_witnessed() {
+    // The PID-namespace tear-down: init (42673) is exiting and unlisted while
+    // the forwarder and the re-parented bridge are still listed.
+    let ids = host_ids();
+    let zapping = snapshot_of(vec![live(42644, 1, digest(2)), live(42674, 42673, digest(5)), live(42677, 42673, digest(4))]);
+    assert_eq!(absent_parents(&zapping, &ids), [42673]);
+    assert_eq!(classify_sited(&zapping, &ids, &limits()).err(), Some((incomplete::UNEXPECTED_PROCESS, site::PARENT_ABSENT)));
+    // Init's exit confirmed: the snapshot is witnessed (documented digests,
+    // known sequences) and taken again; the retake classifies.
+    let mut census = Census::default();
+    census.record(&snapshot_of(host_members()), &ids, &limits(), false, false);
+    assert_eq!(census.witness(&zapping, &ids, &limits()), Turn::Classified);
+    assert_eq!(census.record(&snapshot_of(vec![live(42644, 1, digest(2))]), &ids, &limits(), false, true), Turn::Classified);
+    assert_eq!((census.finish(&ids), census.bridges(&ids)), (None, 1));
+    // A process seen only in a witnessed snapshot is still counted and checked.
+    let mut census = Census::default();
+    census.record(&snapshot_of(host_members()), &ids, &limits(), false, false);
+    let second_bridge = snapshot_of(vec![live(42644, 1, digest(2)), live(42690, 42673, digest(4))]);
+    assert_eq!(census.witness(&second_bridge, &ids, &limits()), Turn::Classified);
+    assert_eq!(census.bridges(&ids), 2);
+    let unknown = snapshot_of(vec![live(42644, 1, digest(2)), live(42691, 42673, digest(9))]);
+    assert_eq!(census.witness(&unknown, &ids, &limits()), Turn::Failed);
+    assert_eq!((census.incomplete, census.site), (Some(incomplete::UNEXPECTED_PROCESS), Some(site::EXEC_SEQUENCE)));
+    // Member-level gaps refuse a witnessed snapshot as well.
+    for (read, reason) in [(MemberRead::Exited { confirmed: false }, incomplete::UNCONFIRMED_EXIT),
+        (MemberRead::Unreadable, incomplete::UNREADABLE_PROCESS), (MemberRead::HashError, incomplete::HASH_ERROR)] {
+        let mut census = Census::default();
+        let gap = snapshot_of(vec![live(42644, 1, digest(2)), live(42674, 42673, digest(5)), Member { pid: 42675, read }]);
+        assert_eq!(census.witness(&gap, &ids, &limits()), Turn::Failed);
+        assert_eq!(census.incomplete, Some(reason));
+    }
+}
+
+#[test]
+fn the_first_failure_is_kept_with_its_site() {
+    let ids = host_ids();
+    let mut census = Census::default();
+    let unknown = snapshot_of([host_members(), vec![live(42699, 42675, digest(9))]].concat());
+    assert_eq!(census.record(&unknown, &ids, &limits(), false, false), Turn::Failed);
+    census.fail(incomplete::PROCESS_FACTS, site::PROCESS_FACTS);
+    assert_eq!(census.record(&snapshot_of(Vec::new()), &ids, &limits(), false, true), Turn::AlreadyFailed);
+    assert_eq!((census.finish(&ids), census.site), (Some(incomplete::UNEXPECTED_PROCESS), Some(site::MISPLACED)));
+    // The diagnosis keeps the last good turn and the FIRST failing one.
+    let mut diag = CensusDiag::default();
+    let turn = |at_ms: u64| SnapshotDiag { at_ms, ..SnapshotDiag::default() };
+    diag.note(Turn::Classified, || turn(1));
+    diag.note(Turn::Failed, || turn(2));
+    diag.note(Turn::Failed, || turn(3));
+    diag.note(Turn::AlreadyFailed, || turn(4));
+    diag.note(Turn::Ended, || turn(5));
+    assert_eq!((diag.last_good.map(|s| s.at_ms), diag.first_failure.map(|s| s.at_ms)), (Some(1), Some(2)));
+}
+
+#[test]
+fn member_read_failures_and_roles_are_named_for_the_diagnosis() {
+    let ids = host_ids();
+    let snapshot = snapshot_of(vec![live(42644, 1, digest(2)), live(42673, 42644, digest(2)), live(42680, 42673, digest(2)),
+        live(42675, 42673, digest(3)), live(42681, 42675, digest(3)), live(42682, 42675, digest(9)),
+        Member { pid: 42683, read: MemberRead::Exited { confirmed: true } }, Member { pid: 42684, read: MemberRead::Exited { confirmed: false } },
+        Member { pid: 42685, read: MemberRead::Unreadable }, Member { pid: 42686, read: MemberRead::HashError }]);
+    let notes: BTreeMap<u32, MemberNote> = [(42685, MemberNote { uid: None, errno: Some(libc::EACCES) }),
+        (42686, MemberNote { uid: None, errno: Some(libc::EIO) })].into_iter().collect();
+    assert_eq!(member_lines(&snapshot, &notes, &ids), [
+        "42644 1 ? supervisor 02020202".to_owned(), "42673 42644 ? init 02020202".to_owned(),
+        "42680 42673 ? pre-exec 02020202".to_owned(), "42675 42673 ? runtime 03030303".to_owned(),
+        "42681 42675 ? pre-exec 03030303".to_owned(), "42682 42675 ? unknown 09090909".to_owned(),
+        "42683 - - exited_confirmed".to_owned(), "42684 - - exited_unconfirmed".to_owned(),
+        format!("42685 - - unreadable({})", libc::EACCES), format!("42686 - - hash_error({})", libc::EIO)]);
+    let mut responder = Responder::default();
+    responder.feed(&line(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}))).unwrap();
+    assert_eq!(responder.counts(), (1, 0));
+    responder.release_initialize(true).unwrap();
+    assert_eq!(responder.counts(), (1, 1));
+}
+
+#[test]
+fn diagnosis_names_the_incomplete_site_and_the_census_turns_within_40_lines() {
+    let ids = host_ids();
+    let good = snapshot_of(host_members());
+    let many = snapshot_of((0..100u32).map(|index| live(50000 + index, 1, digest(9))).collect());
+    let d = Diagnosis { incomplete: Some(incomplete::LAUNCHER_MISSING), census: CensusDiag {
+        launcher: Some((HOST_SUPERVISOR, 777)), site: Some(site::LAUNCHER_ABSENT),
+        last_good: Some(SnapshotDiag { at_ms: 5100, gap: None, members: member_lines(&good, &host_notes(988), &ids),
+            launcher_exited: false, received: 3, sent: 2, after_conversation: true }),
+        first_failure: Some(SnapshotDiag { at_ms: 5230, gap: None, members: member_lines(&many, &BTreeMap::new(), &ids),
+            launcher_exited: false, received: 3, sent: 2, after_conversation: true }) },
+        ..Diagnosis::default() };
+    let lines = diagnosis_lines(&d);
+    for expected in [
+        "incomplete: launcher_missing",
+        "census: pinned main process pid 42644 start 777",
+        "incomplete site: classify.launcher_absent",
+        "census first failing snapshot: +5230 ms, gap none, main pidfd exited false, frames received 3 sent 2, \
+            after_conversation true, 100 members",
+        "census first failing snapshot| ... 84 more",
+        "census last good snapshot: +5100 ms, gap none, main pidfd exited false, frames received 3 sent 2, \
+            after_conversation true, 5 members",
+        "census last good snapshot| 42644 1 988 supervisor 02020202",
+        "census last good snapshot| 42677 42675 76202 bridge 04040404",
+    ] {
+        assert!(lines.contains(&format!("{DIAG_PREFIX}{expected}")), "{expected}: {lines:?}");
+    }
+    let census_block = lines.iter().filter(|line| line.starts_with(&format!("{DIAG_PREFIX}census"))
+        || line.starts_with(&format!("{DIAG_PREFIX}incomplete site"))).count();
+    assert!(census_block <= 40, "{census_block}");
+    // Nothing of it without an incomplete observation.
+    let quiet = diagnosis_lines(&Diagnosis { census: d.census.clone(), ..Diagnosis::default() });
+    assert!(!quiet.iter().any(|line| line.contains("census")));
 }
 
 // ── F3: the tear-down signals only the run's own processes ──────────────

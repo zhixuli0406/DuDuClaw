@@ -30,6 +30,15 @@
 //! non-zero. The employee image is verified gone by its objects (file, loop
 //! device, mount), and the tear-down destroys it with its own operation id.
 //!
+//! Third real-host run (`launcher_missing` after a complete conversation): an
+//! exiting process leaves `cgroup.procs` before its pidfd becomes readable,
+//! so a snapshot taken during the supervisor's (or init's) exit path lacked it
+//! with nothing confirming the exit yet. Every such absence is now resolved
+//! by waiting, bounded, for the kernel's confirmation
+//! ([`settled_snapshot`], [`EXIT_CONFIRM_MS`]) before classifying; the census
+//! keeps the first failure with its site, and the diagnosis shows the first
+//! failing and the last good census turn.
+//!
 //! Network: the run has its own network namespace with loopback only (the
 //! trampoline's `enter_namespaces` / `bring_loopback_up`); with `network:
 //! egress` the only way out is the forwarder's egress socket, whose other end
@@ -156,9 +165,40 @@ fn readable(fd: RawFd, milliseconds: i32) -> bool {
     let mut poll = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
     unsafe { libc::poll(&mut poll, 1, milliseconds) == 1 }
 }
+/// The kernel confirmed the exit of the process a pidfd names: `poll` returned
+/// it with `POLLIN` (exited; `POLLHUP` is added once reaped) within
+/// `milliseconds`. A timeout, `EINTR`, an error or `POLLNVAL`/`POLLERR` alone
+/// is never an exit.
+fn pidfd_exited(fd: RawFd, milliseconds: i32) -> bool {
+    let mut poll = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+    unsafe { libc::poll(&mut poll, 1, milliseconds) == 1 && poll.revents & libc::POLLIN != 0 }
+}
+/// Bound of every wait for the kernel to confirm an exit the walk already
+/// implies: a process listed but without an executable (its memory is gone),
+/// or not listed although a snapshot names it. The exit path of the
+/// supervisor or init releases the run's namespaces and mounts (the employee
+/// image) before the pidfd becomes readable; the same bound as the harness's
+/// later wait for the trampoline's exit. Only a failure waits this long.
+const EXIT_CONFIRM_MS: i32 = 10_000;
 /// The pinned process is still the same live process.
 fn alive(process: &Pinned) -> bool {
-    !readable(process.fd.as_raw_fd(), 0) && proc_stat(process.pid).is_ok_and(|(_, start)| start == process.start)
+    !pidfd_exited(process.fd.as_raw_fd(), 0) && proc_stat(process.pid).is_ok_and(|(_, start)| start == process.start)
+}
+/// The process `pid` names now is confirmed gone: `pidfd_open` ESRCH, or its
+/// pidfd readable within [`EXIT_CONFIRM_MS`]. Fail closed: a pid that names
+/// another live process (reuse, or a parent outside the run) is not confirmed.
+fn exit_confirmed(pid: u32) -> bool {
+    use rustix::process::{pidfd_open, Pid, PidfdFlags};
+    let Some(raw) = i32::try_from(pid).ok().and_then(Pid::from_raw) else { return false };
+    match pidfd_open(raw, PidfdFlags::empty()) {
+        Err(errno) => errno == rustix::io::Errno::SRCH,
+        Ok(fd) => pidfd_exited(fd.as_raw_fd(), EXIT_CONFIRM_MS),
+    }
+}
+/// The real uid of `pid`, for the diagnosis only.
+fn diag_uid(pid: u32) -> Option<u32> {
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    crate::accounts::process_uids(&status).ok().map(|uids| uids[0])
 }
 fn exe_digest(pid: u32) -> io::Result<Sha256Digest> { File::open(format!("/proc/{pid}/exe")).and_then(digest_file) }
 /// `(inode, mount id)` of a descriptor's target when it is a socket.
@@ -254,130 +294,226 @@ fn cgroup_pid_list(unit: &Path) -> std::result::Result<Option<Vec<u32>>, &'stati
 #[derive(Default)]
 struct ExeCache(BTreeMap<(u64, u64, u64, i64, i64), Sha256Digest>);
 
-enum Inspected { Read(MemberRead, Option<Pinned>), Changed }
+/// A member read, its pidfd when `keep` wants it, and the errno of a failed
+/// read (diagnosis only).
+enum Inspected { Read(MemberRead, Option<Pinned>, Option<i32>), Changed }
 
 /// One cgroup member: pinned by a pidfd between two reads of its stat, its
 /// executable opened and hashed, its start time re-checked. A vanished
 /// process counts as exited only when the kernel confirms it (`pidfd_open`
 /// ESRCH or a readable pidfd); every other failure is reported, never
 /// treated as absence. `keep` decides whether the pidfd is returned.
+///
+/// R8r-4 third real-host run: a listed process whose executable is already
+/// gone (`/proc/<pid>/exe` ENOENT: its exit released its memory) is in its
+/// exit path, but its pidfd becomes readable only at `exit_notify`, after the
+/// rest of that path (files, namespaces, the run's mounts). The exit is now
+/// awaited (bounded, [`EXIT_CONFIRM_MS`]) instead of read once; it is still
+/// `confirmed` only when the pidfd says so. EACCES/EPERM and every other
+/// error on a live process stay `Unreadable` (never "exited").
 fn inspect(pid: u32, cache: &mut ExeCache, keep: &dyn Fn(Sha256Digest) -> bool) -> Inspected {
     use rustix::process::{pidfd_open, Pid, PidfdFlags};
     use std::os::unix::fs::MetadataExt;
-    let Some(raw) = i32::try_from(pid).ok().and_then(Pid::from_raw) else { return Inspected::Read(MemberRead::Unreadable, None) };
+    let plain = |read: MemberRead| Inspected::Read(read, None, None);
+    let failed = |read: MemberRead, error: &io::Error| Inspected::Read(read, None, error.raw_os_error());
+    let Some(raw) = i32::try_from(pid).ok().and_then(Pid::from_raw) else { return plain(MemberRead::Unreadable) };
     let (ppid, start) = match proc_stat(pid) {
         Ok(value) => value,
         Err(error) if gone(&error) => {
             let confirmed = matches!(pidfd_open(raw, PidfdFlags::empty()), Err(errno) if errno == rustix::io::Errno::SRCH);
-            return Inspected::Read(MemberRead::Exited { confirmed }, None);
+            return plain(MemberRead::Exited { confirmed });
         }
-        Err(_) => return Inspected::Read(MemberRead::Unreadable, None),
+        Err(error) => return failed(MemberRead::Unreadable, &error),
     };
     let fd = match pidfd_open(raw, PidfdFlags::empty()) {
         Ok(fd) => fd,
-        Err(errno) if errno == rustix::io::Errno::SRCH => return Inspected::Read(MemberRead::Exited { confirmed: true }, None),
-        Err(_) => return Inspected::Read(MemberRead::Unreadable, None),
+        Err(errno) if errno == rustix::io::Errno::SRCH => return plain(MemberRead::Exited { confirmed: true }),
+        Err(errno) => return Inspected::Read(MemberRead::Unreadable, None, Some(errno.raw_os_error())),
     };
     let pinned = Pinned { pid, start, fd };
-    let exited = |process: &Pinned| readable(process.fd.as_raw_fd(), 0);
+    let exited_now = |process: &Pinned| pidfd_exited(process.fd.as_raw_fd(), 0);
+    let confirm = |process: &Pinned| pidfd_exited(process.fd.as_raw_fd(), EXIT_CONFIRM_MS);
     match proc_stat(pid) {
         Ok((again_ppid, again)) if again == start && again_ppid == ppid => {}
         Ok(_) => return Inspected::Changed,
-        Err(error) if gone(&error) && exited(&pinned) => return Inspected::Read(MemberRead::Exited { confirmed: true }, None),
-        Err(_) => return Inspected::Read(MemberRead::Unreadable, None),
+        Err(error) if gone(&error) && confirm(&pinned) => return plain(MemberRead::Exited { confirmed: true }),
+        Err(error) => return failed(MemberRead::Unreadable, &error),
     }
     let file = match File::open(format!("/proc/{pid}/exe")) {
         Ok(file) => file,
-        Err(_) if exited(&pinned) => return Inspected::Read(MemberRead::Exited { confirmed: true }, None),
-        Err(error) if gone(&error) => return Inspected::Read(MemberRead::Exited { confirmed: false }, None),
-        Err(_) => return Inspected::Read(MemberRead::Unreadable, None),
+        Err(_) if exited_now(&pinned) => return plain(MemberRead::Exited { confirmed: true }),
+        Err(error) if gone(&error) => return plain(MemberRead::Exited { confirmed: confirm(&pinned) }),
+        Err(error) => return failed(MemberRead::Unreadable, &error),
     };
     let identity = match file.metadata() {
         Ok(metadata) => (metadata.dev(), metadata.ino(), metadata.size(), metadata.ctime(), metadata.ctime_nsec()),
-        Err(_) => return Inspected::Read(MemberRead::HashError, None),
+        Err(error) => return failed(MemberRead::HashError, &error),
     };
     let exe = match cache.0.get(&identity) {
         Some(digest) => *digest,
         None => match digest_file(file) {
             Ok(digest) => { cache.0.insert(identity, digest); digest }
-            Err(_) => return Inspected::Read(MemberRead::HashError, None),
+            Err(error) => return failed(MemberRead::HashError, &error),
         },
     };
     match proc_stat(pid) {
         Ok((_, again)) if again == start => {
             let pinned = keep(exe).then_some(pinned);
-            Inspected::Read(MemberRead::Live { start, ppid, exe }, pinned)
+            Inspected::Read(MemberRead::Live { start, ppid, exe }, pinned, None)
         }
         Ok(_) => Inspected::Changed,
-        Err(error) if gone(&error) && exited(&pinned) => Inspected::Read(MemberRead::Exited { confirmed: true }, None),
-        Err(_) => Inspected::Read(MemberRead::Unreadable, None),
+        Err(error) if gone(&error) && confirm(&pinned) => plain(MemberRead::Exited { confirmed: true }),
+        Err(error) => failed(MemberRead::Unreadable, &error),
     }
 }
 
-enum Scan { Taken(CgroupSnapshot, BTreeMap<u32, Pinned>), Gone }
+enum Scan { Taken(CgroupSnapshot, BTreeMap<u32, Pinned>, BTreeMap<u32, MemberNote>), Gone }
 
 /// The whole unit cgroup: enumerate, inspect every member, enumerate again;
 /// only two agreeing enumerations around a clean inspection make a snapshot.
 fn snapshot(unit: &Path, cache: &mut ExeCache, keep: &dyn Fn(Sha256Digest) -> bool) -> Scan {
-    let partial = |reason: &'static str| Scan::Taken(CgroupSnapshot { members: Vec::new(), incomplete: Some(reason) }, BTreeMap::new());
+    let partial = |reason: &'static str| Scan::Taken(CgroupSnapshot { members: Vec::new(), incomplete: Some(reason) },
+        BTreeMap::new(), BTreeMap::new());
     for _ in 0..SNAPSHOT_ATTEMPTS {
         let before = match cgroup_pid_list(unit) { Ok(Some(pids)) => pids, Ok(None) => return Scan::Gone, Err(reason) => return partial(reason) };
         let mut members = Vec::with_capacity(before.len());
         let mut pinned = BTreeMap::new();
+        let mut notes = BTreeMap::new();
         let mut changed = false;
         for pid in &before {
             match inspect(*pid, cache, keep) {
-                Inspected::Read(read, pin) => {
+                Inspected::Read(read, pin, errno) => {
                     if let Some(pin) = pin { pinned.insert(*pid, pin); }
+                    let uid = if matches!(read, MemberRead::Live { .. }) { diag_uid(*pid) } else { None };
+                    notes.insert(*pid, MemberNote { uid, errno });
                     members.push(Member { pid: *pid, read });
                 }
                 Inspected::Changed => { changed = true; break; }
             }
         }
         let after = match cgroup_pid_list(unit) { Ok(Some(pids)) => pids, Ok(None) => return Scan::Gone, Err(reason) => return partial(reason) };
-        if !changed && after == before { return Scan::Taken(CgroupSnapshot { members, incomplete: None }, pinned); }
+        if !changed && after == before { return Scan::Taken(CgroupSnapshot { members, incomplete: None }, pinned, notes); }
     }
     partial(incomplete::CGROUP_UNSTABLE)
 }
 fn gone_snapshot() -> CgroupSnapshot { CgroupSnapshot { members: Vec::new(), incomplete: Some(incomplete::CGROUP_UNREADABLE) } }
 
+/// Snapshots per census turn while a parent the snapshot names is exiting.
+const SETTLE_ROUNDS: usize = 8;
+
+/// A census turn's snapshot, settled against exits in progress.
+struct Settled {
+    snapshot: CgroupSnapshot,
+    pinned: BTreeMap<u32, Pinned>,
+    notes: BTreeMap<u32, MemberNote>,
+    /// The main process's pidfd reported its exit (read after the snapshot).
+    launcher_exited: bool,
+    /// [`Census::witness`] refused this snapshot (it is the failing turn).
+    witness_failed: bool,
+}
+/// What the census turn reports to the diagnosis.
+struct TurnContext<'a> { started: Instant, responder: &'a Responder, diag: &'a mut CensusDiag }
+
+/// A snapshot to classify (R8r-4 third real-host run, the `launcher_missing`
+/// fix). When the snapshot does not list the main process as live (or the
+/// unit cgroup is already gone), the harness waits, bounded, for the main
+/// process's pidfd: a readable pidfd is the confirmed exit [`Census::record`]
+/// handles; otherwise `classify` refuses (`classify.launcher_absent`). When a
+/// live member's parent is not listed ([`absent_parents`]), that parent's exit
+/// is confirmed (bounded) and, only then, the snapshot is witnessed by the
+/// census and taken again ([`SETTLE_ROUNDS`]); an unconfirmed parent goes to
+/// `classify`, which refuses. Nothing is assumed: every exit that excuses an
+/// absence is the kernel's.
+fn settled_snapshot(unit: &Path, launcher: &Pinned, ids: &Identities, limits: &WalkLimits, census: &mut Census,
+    cache: &mut ExeCache, keep: &dyn Fn(Sha256Digest) -> bool) -> Settled {
+    let mut round = 0;
+    loop {
+        round += 1;
+        let (snapshot, pinned, notes, absent) = match snapshot(unit, cache, keep) {
+            Scan::Taken(snapshot, pinned, notes) => {
+                let absent = if snapshot.incomplete.is_none() { absent_parents(&snapshot, ids) } else { Vec::new() };
+                (snapshot, pinned, notes, absent)
+            }
+            // The unit cgroup is gone: so is the main process from it.
+            Scan::Gone => (gone_snapshot(), BTreeMap::new(), BTreeMap::new(), vec![ids.launcher.0]),
+        };
+        let mut launcher_exited = pidfd_exited(launcher.fd.as_raw_fd(), 0);
+        if !launcher_exited && absent.contains(&ids.launcher.0) {
+            launcher_exited = pidfd_exited(launcher.fd.as_raw_fd(), EXIT_CONFIRM_MS);
+        }
+        let others: Vec<u32> = absent.into_iter().filter(|pid| *pid != ids.launcher.0).collect();
+        let settled = launcher_exited || others.is_empty() || round >= SETTLE_ROUNDS
+            || !others.iter().all(|pid| exit_confirmed(*pid));
+        if settled { return Settled { snapshot, pinned, notes, launcher_exited, witness_failed: false }; }
+        match census.witness(&snapshot, ids, limits) {
+            Turn::Classified => {}
+            turn => return Settled { snapshot, pinned, notes, launcher_exited, witness_failed: turn == Turn::Failed },
+        }
+    }
+}
+
+/// Record one census turn and keep it for the diagnosis.
+fn record_turn(census: &mut Census, settled: &Settled, ids: &Identities, limits: &WalkLimits, after_conversation: bool,
+    context: &mut TurnContext<'_>) {
+    let recorded = census.record(&settled.snapshot, ids, limits, settled.launcher_exited, after_conversation);
+    let turn = if settled.witness_failed { Turn::Failed } else { recorded };
+    let (received, sent) = context.responder.counts();
+    let at_ms = u64::try_from(context.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    context.diag.note(turn, || SnapshotDiag { at_ms, gap: settled.snapshot.incomplete,
+        members: member_lines(&settled.snapshot, &settled.notes, ids), launcher_exited: settled.launcher_exited,
+        received, sent, after_conversation });
+}
+
 /// One census turn of the conversation loop.
+#[allow(clippy::too_many_arguments)]
 fn census_scan(census: &mut Census, unit: &Path, launcher: &Pinned, ids: &Identities, limits: &WalkLimits, cache: &mut ExeCache,
-    after_conversation: bool) {
-    let scan = snapshot(unit, cache, &|_: Sha256Digest| false);
-    // Read after the snapshot: a missing main process is explained only by its confirmed exit.
-    let launcher_exited = readable(launcher.fd.as_raw_fd(), 0);
-    let snapshot = match scan { Scan::Taken(snapshot, _) => snapshot, Scan::Gone => gone_snapshot() };
-    census.record(&snapshot, ids, limits, launcher_exited, after_conversation);
+    after_conversation: bool, context: &mut TurnContext<'_>) {
+    let settled = settled_snapshot(unit, launcher, ids, limits, census, cache, &|_: Sha256Digest| false);
+    record_turn(census, &settled, ids, limits, after_conversation, context);
 }
 
 /// The runtime and the bridge, observed while the `initialize` reply is
 /// withheld (both are alive and blocked on the harness), from one complete
-/// snapshot of the run cgroup that is also a census turn.
+/// snapshot of the run cgroup that is also a census turn. A failure here is
+/// also the census's (sticky: the FIRST failure of the run is reported).
 struct Tree { runtime: Option<ProcessFacts>, fd3: Fd3, bridge: Option<ProcessFacts>, incomplete: Option<&'static str> }
+impl Tree {
+    /// Facts a and b were positively observed.
+    fn observed(&self) -> bool { self.incomplete.is_none() && self.runtime.is_some() && self.bridge.is_some() }
+}
 #[allow(clippy::too_many_arguments)]
 fn observe(launcher: &Pinned, unit: &Path, unit_cgroup: &str, socket: SocketId, ids: &Identities, limits: &WalkLimits,
-    census: &mut Census, cache: &mut ExeCache) -> Tree {
+    census: &mut Census, cache: &mut ExeCache, context: &mut TurnContext<'_>) -> Tree {
     let keep = |digest: Sha256Digest| digest == ids.runtime || digest == ids.bridge;
-    let scan = snapshot(unit, cache, &keep);
-    let launcher_exited = readable(launcher.fd.as_raw_fd(), 0);
-    let (snapshot, pinned) = match scan { Scan::Taken(snapshot, pinned) => (snapshot, pinned), Scan::Gone => (gone_snapshot(), BTreeMap::new()) };
-    census.record(&snapshot, ids, limits, launcher_exited, false);
+    let settled = settled_snapshot(unit, launcher, ids, limits, census, cache, &keep);
+    record_turn(census, &settled, ids, limits, false, context);
     let mut tree = Tree { runtime: None, fd3: Fd3::Other, bridge: None, incomplete: None };
-    let classified = match classify(&snapshot, ids, limits) {
+    if settled.launcher_exited {
+        tree.incomplete = Some(incomplete::LAUNCHER_MISSING);
+        return tree;
+    }
+    let classified = match classify(&settled.snapshot, ids, limits) {
         Ok(classified) => classified,
         Err(reason) => { tree.incomplete = Some(reason); return tree; }
     };
+    let pinned = &settled.pinned;
     if let Some((pid, depth)) = classified.runtime {
         match pinned.get(&pid).map(|process| process_facts(process, depth, unit_cgroup, socket)) {
             Some(Ok((facts, fd3))) => { tree.runtime = Some(facts); tree.fd3 = fd3; }
-            _ => { tree.incomplete = Some(incomplete::PROCESS_FACTS); return tree; }
+            _ => {
+                tree.incomplete = Some(incomplete::PROCESS_FACTS);
+                census.fail(incomplete::PROCESS_FACTS, site::PROCESS_FACTS);
+                return tree;
+            }
         }
     }
     if let Some((pid, distance)) = classified.bridge {
         match pinned.get(&pid).map(|process| process_facts(process, distance, unit_cgroup, socket)) {
             Some(Ok((facts, _))) => tree.bridge = Some(facts),
-            _ => tree.incomplete = Some(incomplete::PROCESS_FACTS),
+            _ => {
+                tree.incomplete = Some(incomplete::PROCESS_FACTS);
+                census.fail(incomplete::PROCESS_FACTS, site::PROCESS_FACTS);
+            }
         }
     }
     tree
@@ -1255,6 +1391,8 @@ fn launch(prepared: &Prepared, trampoline_source: &Path, trampoline_sha256: Sha2
         return Err(UID_TAKEN.into());
     }
     let systemd = t.systemd.as_ref().ok_or("accept: system bus")?;
+    // Diagnosis time base: the start request to PID 1.
+    let started = Instant::now();
     let unit = systemd.start_acceptance(&unit_policy, &launcher_text, bootstrap.bootstrap_for_unit.as_fd(),
         stdout_write.as_fd(), stderr_write.as_fd()).map_err(os_error("transient run unit"))?;
     t.cgroup = Some(unit.cgroup.clone());
@@ -1266,6 +1404,7 @@ fn launch(prepared: &Prepared, trampoline_source: &Path, trampoline_sha256: Sha2
     let launcher = pin(main_pid, None).map_err(os_error("launcher pidfd"))?
         .ok_or_else(|| fixed_error("the trampoline exited before the bootstrap"))?;
     let launcher_exe = exe_digest(main_pid).ok().filter(|_| cgroup_member(main_pid, &unit_cgroup) && alive(&launcher));
+    d.census.launcher = Some((launcher.pid, launcher.start));
     // F2: who may live in the run cgroup, and the bounds of a complete walk
     // (the unit's TasksMax is the record's task limit).
     let ids = Identities { launcher: (launcher.pid, launcher.start), trampoline: trampoline_sha256,
@@ -1321,9 +1460,11 @@ fn launch(prepared: &Prepared, trampoline_source: &Path, trampoline_sha256: Sha2
             Err(_) => { failure = Some("the trampoline reported an error before the MCP conversation completed"); break; }
         }
         if run_end.is_none() {
-            census_scan(&mut census, &unit.cgroup, &launcher, &ids, &limits, &mut cache, responder.complete());
+            census_scan(&mut census, &unit.cgroup, &launcher, &ids, &limits, &mut cache, responder.complete(),
+                &mut TurnContext { started, responder: &responder, diag: &mut d.census });
         }
-        readable(gateway_end.as_raw_fd(), 20);
+        // A closed socket is always readable: pace the census turns instead.
+        if socket_closed { std::thread::sleep(Duration::from_millis(20)); } else { readable(gateway_end.as_raw_fd(), 20); }
         if !socket_closed {
             match read_some(gateway_end.as_raw_fd(), &mut buffer).map_err(os_error("MCP socket"))? {
                 Some(0) => socket_closed = true,
@@ -1336,8 +1477,15 @@ fn launch(prepared: &Prepared, trampoline_source: &Path, trampoline_sha256: Sha2
                     if responder.initialize_held() && tree.is_none() {
                         // Facts a and b, while the reply is withheld.
                         d.phase = HarnessPhase::Observe;
-                        tree = Some(observe(&launcher, &unit.cgroup, &unit_cgroup, socket, &ids, &limits, &mut census, &mut cache));
-                        let reply = match responder.release_initialize(true) {
+                        let observation = observe(&launcher, &unit.cgroup, &unit_cgroup, socket, &ids, &limits, &mut census,
+                            &mut cache, &mut TurnContext { started, responder: &responder, diag: &mut d.census });
+                        // The reply is released either way, so the run can end
+                        // for the tear-down; it counts as observed only when
+                        // facts a and b were, and a failed observation is
+                        // already the census's (first) incomplete reason.
+                        let facts_observed = observation.observed();
+                        tree = Some(observation);
+                        let reply = match responder.release_initialize(facts_observed) {
                             Ok(reply) => reply,
                             Err(limit) => { failure = Some(limit); break; }
                         };
@@ -1368,7 +1516,7 @@ fn launch(prepared: &Prepared, trampoline_source: &Path, trampoline_sha256: Sha2
     if !wait_until(Duration::from_secs(10), || cgroup_empty(&unit.cgroup)) {
         return Err(fixed_error("the run cgroup did not become empty"));
     }
-    if !wait_until(Duration::from_secs(10), || readable(launcher.fd.as_raw_fd(), 0)) {
+    if !wait_until(Duration::from_secs(10), || pidfd_exited(launcher.fd.as_raw_fd(), 0)) {
         return Err(fixed_error("the trampoline process did not exit"));
     }
     if let Some(reason) = failure { note(ErrorFact::fixed(reason)); return Err(format!("accept: no record written: {reason}")); }
@@ -1389,7 +1537,9 @@ fn launch(prepared: &Prepared, trampoline_source: &Path, trampoline_sha256: Sha2
         bridge_processes_seen: census.bridges(&ids),
     };
     let tree = tree.unwrap_or(Tree { runtime: None, fd3: Fd3::Other, bridge: None, incomplete: None });
-    let incomplete = tree.incomplete.or_else(|| census.finish(&ids));
+    // The census holds the FIRST failure of the run (the tree's included).
+    let incomplete = census.finish(&ids).or(tree.incomplete);
+    d.census.site = incomplete.map(|_| census.site.unwrap_or(site::FINISH));
     let observations = Observations { uid, socket, runtime_digest: prepared.runtime_digest, bridge_digest: prepared.bridge_digest,
         trampoline_digest: trampoline_sha256, launcher_exe_sha256: launcher_exe, runtime: tree.runtime, runtime_fd3: tree.fd3,
         bridge: tree.bridge, initialize: responder.facts(), exclusive, run_end: run_end.unwrap_or_default(), incomplete };
