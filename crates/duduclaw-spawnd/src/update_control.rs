@@ -1304,7 +1304,10 @@ const MEASURE_CHUNK_BYTES: usize = 64 * 1024;
 /// `ExecStart=/usr/libexec/duduclaw/duduclaw-parse-worker` is the copy the
 /// installer's tree builder (`build-runtime-tree.py`, `WORKER_TARGET`) placed
 /// in the runtime tree (root:root 0755, one link, every directory root:root
-/// 0755: its `verify_tree`). Relative to the publication root.
+/// 0755: its `verify_tree`). Relative to the publication root. Only this one
+/// file is measured here, never the tree's inventory: the unit's empty
+/// mount-point directories at the tree root (R8s, `MOUNT_POINTS`, part of the
+/// tree `verify_tree` requires) are not on this path.
 const PARSE_RUNTIME_WORKER_DIRECTORY: &str = "usr/lib/duduclaw/parse-root-tree/usr/libexec/duduclaw";
 
 /// Where a measured file lives: the committed generation directory being read

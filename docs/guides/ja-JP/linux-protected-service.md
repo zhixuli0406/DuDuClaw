@@ -109,7 +109,7 @@ sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux [--version X.Y
 | セルフテスト用ユニット | `/etc/systemd/system/duduclaw-isolation-selftest.service`。root:root 0644、同梱版と完全に同一でドロップインなし。`[Install]` がなく、インストーラーは有効化も起動もせず、spawnd が起動する |
 | SSH 拒否検査プログラム | `/usr/lib/duduclaw/duduclaw-isolation-probe`。root:root 0755、署名済みコンポーネント。特権のない隔離テスト用アカウント `duduclaw-selftest` で journal の読み取り権限（`systemd-journal` グループ）付きで実行し、root では決して実行しない。専用アカウントはない |
 | SSH 拒否検査ユニット | `/etc/systemd/system/duduclaw-isolation-probe@.service` テンプレート。root:root 0644、同梱版と完全に同一。`[Install]` がなく、インストーラーは有効化も起動もしない。社員アカウントと sshd ポートごとに 1 インスタンス（`duduclaw-isolation-probe@duduclaw-emp-<uid>.<port>.service`） |
-| 解析用 root | `/usr/lib/duduclaw/parse-root` と `/usr/lib/duduclaw/parse-root-tree`。root:root 0755、初期状態は空、ホストデータを置かない |
+| 解析用 root | `/usr/lib/duduclaw/parse-root` と `/usr/lib/duduclaw/parse-root-tree`。root:root 0755、ホストデータを置かない。`parse-root` は初期状態で空。`parse-root-tree` には検証済みのパーサー、その実行時ライブラリ、パーサーユニットが必要とする空のマウントポイントディレクトリ（`.tmp`、`dev`、`proc`、`run`、`sys`、`tmp`、`var`、`var/tmp`）だけがあり、すべてインストーラーが作成する |
 | 署名済み状態 | Bootstrap の信頼、互換性のある世代、runtime 登録、更新スロット／状態、移行／準備完了の連携 |
 
 解析器は[インストール参考](../../../crates/duduclaw-parse-worker/README.md)に記載された既知の空マウントポイントを残す場合があります。予期しない内容は調査し、解析用 root を再帰的に削除しないでください。Spawnd が社員の SSH、cron、at、user manager を封鎖し、ホストの実効状態を検証します。検査に通すために制御を緩和しないでください。

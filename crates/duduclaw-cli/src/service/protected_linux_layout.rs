@@ -252,6 +252,23 @@ pub(super) fn parse_root_is_reusable(path: &std::path::Path, uid: u32, gid: u32)
     Ok(true)
 }
 
+/// R8s: the parse runtime tree's mount points, read from their one
+/// definition: the `MOUNT_POINTS = (…)` line of the embedded tree
+/// builder/verifier (`build-runtime-tree.py`, which the installer and every
+/// readiness/acceptance check run). Test-only: nothing in Rust builds or
+/// walks the tree.
+#[cfg(test)]
+pub(super) fn parse_runtime_mount_points() -> Vec<&'static str> {
+    const BUILDER: &str = include_str!("../../../duduclaw-parse-worker/scripts/build-runtime-tree.py");
+    let lines: Vec<&'static str> = BUILDER.lines().filter(|line| line.starts_with("MOUNT_POINTS")).collect();
+    assert_eq!(lines.len(), 1, "exactly one MOUNT_POINTS line");
+    let items = lines[0].strip_prefix("MOUNT_POINTS = (").and_then(|rest| rest.strip_suffix(')'))
+        .expect("MOUNT_POINTS = ('…', …) on one line");
+    items.split(',').map(str::trim).filter(|item| !item.is_empty())
+        .map(|item| item.strip_prefix('\'').and_then(|item| item.strip_suffix('\'')).expect("quoted mount point"))
+        .collect()
+}
+
 // The caller fixes root to / and expected ownership to 0:0. Tests use an
 // isolated tree; there is no environment-controlled production destination.
 #[cfg(unix)]
@@ -363,6 +380,173 @@ mod tests {
             if let Some(position) = DIRECTORIES.iter().position(|(other, _)| *other == parent) {
                 assert!(position < index, "{path} listed before its parent");
             }
+        }
+    }
+
+    /// R8s: the directories PID 1 needs (and would otherwise create) inside
+    /// the parse runtime tree when it starts `duduclaw-parse@.service`,
+    /// derived from the unit's `[Service]` directives: the tree is bound at the
+    /// worker's `/` (`RootDirectory=` + `BindReadOnlyPaths=<tree>:/`), so every
+    /// later mount target's missing path is created in the tree. Over-
+    /// approximates (a directive that may mount under a path counts); a target
+    /// below another mount target (`/dev/shm` in the private `/dev`) lives on
+    /// that mount, not in the tree. `Err` names a directive this model does
+    /// not cover: decide whether it needs a mount point in the tree first.
+    fn parse_unit_tree_mount_points(unit: &str) -> Result<std::collections::BTreeSet<String>, String> {
+        use std::collections::BTreeSet;
+        const TREE: &str = "/usr/lib/duduclaw/parse-root-tree";
+        const ROOT: &str = "/usr/lib/duduclaw/parse-root";
+        // Directives that mount nothing in the worker's mount namespace.
+        const NO_MOUNT: &[&str] = &["Type", "ExecStart", "StandardInput", "StandardOutput", "StandardError",
+            "IPAddressDeny", "RestrictNamespaces", "RestrictSUIDSGID", "RestrictRealtime", "LockPersonality",
+            "NoNewPrivileges", "CapabilityBoundingSet", "AmbientCapabilities", "RestrictAddressFamilies",
+            "SystemCallArchitectures", "SystemCallFilter", "SystemCallErrorNumber", "MemoryMax", "MemorySwapMax",
+            "CPUQuota", "TasksMax", "LimitNOFILE", "LimitCORE", "LimitFSIZE", "RuntimeMaxSec", "TimeoutStartSec",
+            "TimeoutStopSec", "KillMode", "SendSIGKILL", "UMask"];
+        fn flag(key: &str, value: &str) -> Result<bool, String> {
+            match value {
+                "yes" | "true" | "on" | "1" => Ok(true),
+                "no" | "false" | "off" | "0" => Ok(false),
+                _ => Err(format!("{key}={value}: not modelled")),
+            }
+        }
+        fn add(targets: &mut Vec<String>, paths: &[&str]) { targets.extend(paths.iter().map(|path| (*path).to_owned())); }
+        let mut targets: Vec<String> = Vec::new();
+        let mut root = None;
+        let mut tree_bound = 0;
+        let mut sources_under_root: Vec<String> = Vec::new();
+        let mut section = "";
+        for line in unit.lines().map(str::trim) {
+            if line.is_empty() || line.starts_with('#') || line.starts_with(';') { continue; }
+            if line.starts_with('[') { section = line; continue; }
+            if section != "[Service]" { continue; }
+            let (key, value) = line.split_once('=').ok_or_else(|| format!("not a directive: {line}"))?;
+            match key {
+                _ if NO_MOUNT.contains(&key) => {}
+                // PrivateTmp (DynamicUser forces it): /tmp and /var/tmp.
+                "DynamicUser" | "PrivateTmp" => { if flag(key, value)? { add(&mut targets, &["/tmp", "/var/tmp"]); } }
+                // A private /dev (PrivateIPC: its mqueue under /dev).
+                "PrivateDevices" | "PrivateIPC" => { if flag(key, value)? { add(&mut targets, &["/dev"]); } }
+                // A read-only /sys projection (sysfs for the private network, /sys/fs/cgroup).
+                "PrivateNetwork" | "ProtectControlGroups" => { if flag(key, value)? { add(&mut targets, &["/sys"]); } }
+                "ProtectKernelTunables" => { if flag(key, value)? { add(&mut targets, &["/proc", "/sys"]); } }
+                // /proc/kmsg and /dev/kmsg.
+                "ProtectKernelLogs" => { if flag(key, value)? { add(&mut targets, &["/proc", "/dev"]); } }
+                "ProtectHostname" => { if flag(key, value)? { add(&mut targets, &["/proc"]); } }
+                // Module directories made inaccessible only when present.
+                "ProtectKernelModules" => { flag(key, value)?; }
+                // A private procfs.
+                "ProtectProc" => match value {
+                    "default" => {}
+                    "invisible" | "noaccess" | "ptraceable" => add(&mut targets, &["/proc"]),
+                    _ => return Err(format!("{key}={value}: not modelled")),
+                },
+                "ProcSubset" => match value {
+                    "all" => {}
+                    "pid" => add(&mut targets, &["/proc"]),
+                    _ => return Err(format!("{key}={value}: not modelled")),
+                },
+                "MountAPIVFS" => { if flag(key, value)? { add(&mut targets, &["/proc", "/sys", "/dev", "/run"]); } }
+                // Read-only remounts of what exists (/usr, /boot, /efi skipped when absent).
+                "ProtectSystem" if matches!(value, "strict" | "full" | "yes" | "true" | "no" | "false") => {}
+                // /home, /root, /run/user made inaccessible only when present.
+                "ProtectHome" => { flag(key, value)?; }
+                "RootDirectory" => root = Some(value),
+                "TemporaryFileSystem" => {
+                    for item in value.split_whitespace() {
+                        targets.push(item.split(':').next().unwrap_or_default().to_owned());
+                    }
+                }
+                "BindPaths" | "BindReadOnlyPaths" => {
+                    for item in value.split_whitespace() {
+                        let mut fields = item.split(':');
+                        let source = fields.next().unwrap_or_default().trim_start_matches('-');
+                        let target = fields.next().unwrap_or(source);
+                        if target == "/" {
+                            if key != "BindReadOnlyPaths" || source != TREE {
+                                return Err(format!("{key}={item}: only the runtime tree may be bound at /"));
+                            }
+                            tree_bound += 1;
+                            continue;
+                        }
+                        if let Some(relative) = source.strip_prefix(ROOT).and_then(|rest| rest.strip_prefix('/')) {
+                            sources_under_root.push(relative.to_owned());
+                        }
+                        targets.push(target.to_owned());
+                    }
+                }
+                // Optional ('-') paths: applied only to what exists, never created.
+                "InaccessiblePaths" | "ReadOnlyPaths" | "ReadWritePaths" | "ExecPaths" | "NoExecPaths" => {
+                    for item in value.split_whitespace() {
+                        if !item.starts_with('-') { return Err(format!("{key}={item}: not optional ('-')")); }
+                    }
+                }
+                _ => return Err(format!("{key}=: not modelled; decide whether PID 1 creates a mount point for it in the tree")),
+            }
+        }
+        if root != Some(ROOT) || tree_bound != 1 {
+            return Err("the runtime tree must be bound exactly once at the unit's RootDirectory".to_owned());
+        }
+        let mounts: BTreeSet<String> = targets.iter().map(|target| target.trim_end_matches('/').to_owned()).collect();
+        let mut required = BTreeSet::new();
+        for target in &mounts {
+            let parts: Vec<&str> = target.strip_prefix('/').ok_or_else(|| format!("unusual mount target {target:?}"))?
+                .split('/').collect();
+            if parts.iter().any(|part| part.is_empty() || *part == "." || *part == "..") {
+                return Err(format!("unusual mount target {target:?}"));
+            }
+            for index in 0..parts.len() {
+                let prefix = parts[..=index].join("/");
+                // Below another mount target: created on that mount, not in the tree.
+                let below_mount = index + 1 < parts.len() && mounts.contains(&format!("/{prefix}"));
+                required.insert(prefix);
+                if below_mount { break; }
+            }
+        }
+        // A bind source inside the RootDirectory resolves through the tree
+        // bound there (`parse-root/.tmp` is the `/.tmp` tmpfs).
+        for relative in sources_under_root {
+            if !mounts.contains(&format!("/{relative}")) {
+                return Err(format!("bind source {ROOT}/{relative} is not a mount target in the tree"));
+            }
+        }
+        Ok(required)
+    }
+
+    #[test]
+    fn service_protected_layout_parse_tree_mount_points_derive_from_the_worker_unit() {
+        use std::collections::BTreeSet;
+        let unit = UNITS.iter().find(|(name, _)| *name == "duduclaw-parse@.service").unwrap().1;
+        let list = parse_runtime_mount_points();
+        // What one real start created on systemd 255 (R8s), parent first.
+        assert_eq!(list, [".tmp", "dev", "proc", "run", "sys", "tmp", "var", "var/tmp"]);
+        for (index, path) in list.iter().enumerate() {
+            if let Some((parent, _)) = path.rsplit_once('/') {
+                assert!(list[..index].iter().any(|candidate| *candidate == parent), "{path} listed before its parent");
+            }
+        }
+        let listed: BTreeSet<String> = list.iter().map(|path| (*path).to_owned()).collect();
+        assert_eq!(parse_unit_tree_mount_points(unit), Ok(listed.clone()));
+        // A directive added or changed so that another mount point is needed
+        // (or one is no longer accounted for) no longer matches the list.
+        for (from, to) in [
+            ("TemporaryFileSystem=/run:ro\n", "TemporaryFileSystem=/run:ro\nTemporaryFileSystem=/srv:ro\n"),
+            ("BindPaths=/usr/lib/duduclaw/parse-root/.tmp:/var/tmp:norbind\n",
+                "BindPaths=/usr/lib/duduclaw/parse-root/.tmp:/var/cache:norbind\n"),
+            ("TemporaryFileSystem=/dev/shm:ro\n", "TemporaryFileSystem=/dev/shm:ro\nBindReadOnlyPaths=/etc/ssl:/etc/ssl\n"),
+            ("TemporaryFileSystem=/.tmp:rw,nosuid,nodev,noexec,size=8M,nr_inodes=1024,mode=0700\n", ""),
+            ("BindReadOnlyPaths=/usr/lib/duduclaw/parse-root-tree:/:norbind\n", ""),
+            ("RootDirectory=/usr/lib/duduclaw/parse-root\n", ""),
+        ] {
+            assert!(unit.contains(from), "{from}");
+            let changed = unit.replace(from, to);
+            assert_ne!(parse_unit_tree_mount_points(&changed).ok(), Some(listed.clone()), "{to}");
+        }
+        // A mount-related directive this model does not cover refuses.
+        for extra in ["RuntimeDirectory=parse", "StateDirectory=parse", "LoadCredential=key:/etc/key",
+            "PrivateTmp=disconnected", "ProtectHome=tmpfs", "ProtectProc=other", "InaccessiblePaths=/usr/local",
+            "TemporaryFileSystem=/", "BindPaths=/srv:/", "MountImages=/image:/mnt", "ExtensionDirectories=/ext"] {
+            assert!(parse_unit_tree_mount_points(&format!("{unit}{extra}\n")).is_err(), "{extra}");
         }
     }
 

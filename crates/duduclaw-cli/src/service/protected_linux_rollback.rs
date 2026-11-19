@@ -1120,6 +1120,28 @@ mod tests {
         assert_eq!(names(directory.path()), vec!["dir".to_owned(), "unit".to_owned()]);
     }
 
+    /// R8s: the parse runtime tree's mount points are inside the ledgered
+    /// `/usr/lib/duduclaw` tree (no entry of their own, like every other tree
+    /// entry): removing that tree removes them, also after a worker start
+    /// left them exactly as built.
+    #[test]
+    fn ledgered_tree_removal_takes_the_parse_runtime_mount_points() {
+        let directory = tempfile::tempdir().unwrap();
+        let tree = directory.path().join("tree");
+        let runtime = tree.join("parse-root-tree");
+        fs::create_dir_all(runtime.join("usr/libexec/duduclaw")).unwrap();
+        fs::write(runtime.join("usr/libexec/duduclaw/duduclaw-parse-worker"), b"worker").unwrap();
+        let mount_points = layout::parse_runtime_mount_points();
+        assert!(!mount_points.is_empty());
+        for relative in &mount_points { fs::create_dir(runtime.join(relative)).unwrap(); }
+        let dir = fs::File::open(directory.path()).unwrap();
+        let boot_id = ledger::boot_id().unwrap();
+        let entry = Entry { path: "/usr/lib/duduclaw".into(), kind: Kind::Tree, state: State::Created,
+            identity: ledger::identity_at(&dir, c"tree", Kind::Tree).unwrap(), keep: Vec::new(), quarantine: None };
+        assert_eq!(remove_quarantined(&dir, c"tree", &entry, &boot_id, me()).unwrap(), Removal::Removed);
+        assert!(names(directory.path()).is_empty(), "tree, mount points and quarantine gone");
+    }
+
     #[test]
     fn quarantine_refuses_parent_not_owned_or_writable_by_others() {
         use std::os::unix::fs::PermissionsExt;

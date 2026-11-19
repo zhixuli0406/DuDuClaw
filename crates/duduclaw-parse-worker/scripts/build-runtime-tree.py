@@ -18,6 +18,22 @@ import tempfile
 WORKER_TARGET = PurePosixPath('/usr/libexec/duduclaw/duduclaw-parse-worker')
 LOADERS = {'/lib64/ld-linux-x86-64.so.2', '/lib/ld-linux-aarch64.so.1'}
 MAX_ELF_BYTES = 256 * 1024 * 1024
+# R8s: the mount points PID 1 needs inside this tree when it starts
+# duduclaw-parse@.service (the tree is bound read-only at the worker's /, so a
+# missing one is created HERE, in the verified tree, at the first start). Part
+# of the tree contract: built by build_tree, required (each an empty
+# directory) by verify_tree. The single definition; parent first, one line
+# (crates/duduclaw-cli protected_linux_layout.rs tests derive this list from
+# the shipped unit's directives and compare it with this line):
+#   .tmp      TemporaryFileSystem=/.tmp
+#   dev       PrivateDevices=yes (/dev/shm is inside that private /dev)
+#   proc      ProtectProc=invisible, ProcSubset=pid, ProtectKernelTunables/Logs
+#   run       TemporaryFileSystem=/run
+#   sys       ProtectKernelTunables, ProtectControlGroups, PrivateNetwork
+#   tmp       BindPaths=…:/tmp (and DynamicUser's implied PrivateTmp)
+#   var       parent of var/tmp
+#   var/tmp   BindPaths=…:/var/tmp (and DynamicUser's implied PrivateTmp)
+MOUNT_POINTS = ('.tmp', 'dev', 'proc', 'run', 'sys', 'tmp', 'var', 'var/tmp')
 
 
 def trusted_file(path):
@@ -127,6 +143,14 @@ def build_tree(worker, expected_sha256, destination):
         output.chmod(0o755)
         with output.open('rb') as copied:
             os.fsync(copied.fileno())
+    # R8s: the worker unit's mount points, empty root:root 0755 directories,
+    # so starting the worker creates nothing here. mkdir without exist_ok never
+    # reuses an entry (a closure path colliding with one refuses) and never
+    # follows a link at the final component; parents come first in the list.
+    for relative in MOUNT_POINTS:
+        mount_point = destination.joinpath(*PurePosixPath(relative).parts)
+        mount_point.mkdir(mode=0o755)
+        mount_point.chmod(0o755)
     # No symlinks or broad binds are needed, including merged-/usr systems.
     # Recheck the copied worker before publication; errors leave an inactive tree.
     if hashlib.sha256(destination.joinpath(*WORKER_TARGET.parts[1:]).read_bytes()).hexdigest() != expected_sha256:
@@ -158,10 +182,15 @@ def verify_tree(worker, expected_sha256, destination):
     expected_directories = {'.'}
     for target in expected_files:
         expected_directories.update(str(p) for p in PurePosixPath(target).parents)
+    # R8s: the worker unit's mount points are part of the tree: each must be
+    # present as a real, empty directory (only another listed mount point may
+    # be inside one, var/tmp in var), never a file or link, never content.
+    expected_directories.update(MOUNT_POINTS)
     pending = [destination]
     root_device = destination.lstat().st_dev
     seen = 1
     observed = set()
+    observed_directories = set()
     while pending:
         path = pending.pop()
         info = path.lstat()
@@ -171,10 +200,14 @@ def verify_tree(worker, expected_sha256, destination):
         if stat.S_ISDIR(info.st_mode):
             if relative not in expected_directories:
                 raise ValueError('unexpected runtime directory')
+            observed_directories.add(relative)
             for child in path.iterdir():
                 seen += 1
                 if seen > 1024:
                     raise ValueError('runtime tree inventory exceeds limit')
+                if (relative in MOUNT_POINTS
+                        and str(child.relative_to(destination)) not in MOUNT_POINTS):
+                    raise ValueError('runtime mount point is not empty')
                 pending.append(child)
         elif stat.S_ISREG(info.st_mode):
             source = expected_files.get(relative)
@@ -187,7 +220,7 @@ def verify_tree(worker, expected_sha256, destination):
             observed.add(relative)
         else:
             raise ValueError('runtime tree contains a link or special entry')
-    if observed != set(expected_files):
+    if observed != set(expected_files) or observed_directories != expected_directories:
         raise ValueError('runtime tree is incomplete')
     return sorted(inputs)
 

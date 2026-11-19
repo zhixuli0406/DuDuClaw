@@ -66,6 +66,17 @@ base directories that systemd 249 creates in a bare `RootDirectory`. The staging
 root must be root-owned with non-writable ancestors. Only empty mountpoints may
 be added by systemd; never put configuration, user data, homes or sockets there.
 
+Because the tree is bound at the worker's `/`, systemd creates every missing
+mount point of the unit's later mounts inside `parse-root-tree` itself. Those
+mount points are therefore part of the tree: the builder creates them (empty,
+root:root 0755) and the verifier requires each of them, exactly `.tmp`, `dev`,
+`proc`, `run`, `sys`, `tmp`, `var` and `var/tmp` (`MOUNT_POINTS` in
+`scripts/build-runtime-tree.py`), so starting a worker creates nothing there.
+A missing, non-empty, linked or differently owned/moded mount point, or any
+other entry, still refuses the tree. A unit change that needs another mount
+point fails the CLI's layout test, which derives the list from the unit's
+directives.
+
 `DynamicUser` forces `ProtectSystem=strict` and `PrivateTmp` in systemd 249.
 Its read-only `/` rule overrides a tmpfs at `/`, and its private `/tmp` rule
 overrides a tmpfs at `/tmp`. The unit therefore mounts the bounded tmpfs at

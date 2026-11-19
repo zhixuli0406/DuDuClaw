@@ -109,7 +109,7 @@ sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux [--version X.Y
 | 自我檢測單元 | `/etc/systemd/system/duduclaw-isolation-selftest.service`，root:root 0644，內容與隨附版本完全相同且不得有覆寫設定；沒有 `[Install]`：安裝程式不會啟用或啟動它，由 spawnd 啟動 |
 | SSH 拒絕檢測程式 | `/usr/lib/duduclaw/duduclaw-isolation-probe`，root:root 0755，已簽章元件；以無特權的隔離測試帳號 `duduclaw-selftest` 執行，並具有讀取 journal 的權限（`systemd-journal` 群組），絕不以 root 執行；沒有專用帳號 |
 | SSH 拒絕檢測單元 | `/etc/systemd/system/duduclaw-isolation-probe@.service` 範本，root:root 0644，內容與隨附版本完全相同；沒有 `[Install]`：安裝程式不會啟用或啟動它，每個員工帳號與 sshd 連接埠一個執行個體（`duduclaw-isolation-probe@duduclaw-emp-<uid>.<port>.service`） |
-| 解析根目錄 | `/usr/lib/duduclaw/parse-root` 與 `/usr/lib/duduclaw/parse-root-tree`，root:root 0755，初始為空，不能放主機資料 |
+| 解析根目錄 | `/usr/lib/duduclaw/parse-root` 與 `/usr/lib/duduclaw/parse-root-tree`，root:root 0755，不能放主機資料。`parse-root` 初始為空；`parse-root-tree` 只含已驗證的解析元件、其執行期函式庫，以及解析服務單元需要的空掛載點目錄（`.tmp`、`dev`、`proc`、`run`、`sys`、`tmp`、`var`、`var/tmp`），全部由安裝程式建立 |
 | 簽章狀態 | Bootstrap 信任、相容的元件世代、runtime 登錄表、更新槽與狀態、遷移及就緒檢查接線 |
 
 解析器可能留下[安裝參考](../../../crates/duduclaw-parse-worker/README.md)列出的已知空掛載點目錄。遇到其他內容應先調查，不要遞迴清空解析根目錄。Spawnd 負責員工的 SSH、cron、at 與 user manager 封鎖，並驗證主機上的有效狀態；不要手動放寬這些控制來通過檢查。
