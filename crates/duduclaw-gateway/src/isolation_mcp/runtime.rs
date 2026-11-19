@@ -132,9 +132,9 @@ where F: Future<Output = Result<T, String>> {
 /// `refusal.rs` (above `log_not_started`) for where that admission lives.
 fn log_trace(runtime: &'static str, agent: &str, trace: Trace) {
     if trace.logged { return; }
-    let site = trace.site.unwrap_or(RefusalSite::UNLABELLED);
-    if trace.started { super::refusal::log_refused_after_start(runtime, agent, site); }
-    else { super::refusal::log_not_started(runtime, agent, site); }
+    // No recorded site is passed as `None`; the logger prints `unlabelled`.
+    if trace.started { super::refusal::log_refused_after_start(runtime, agent, trace.site); }
+    else { super::refusal::log_not_started(runtime, agent, trace.site); }
 }
 
 /// R8x: the fixed site of a refused start. A spawnd/transport refusal arrives
@@ -1061,11 +1061,12 @@ pub(super) mod tests {
     /// duplicates, and no dead entries.
     #[test]
     fn site_labels_are_a_closed_fixed_set() {
-        use super::super::refusal::{SITES, UNLABELLED_SITE};
+        use super::super::refusal::SITES;
         let unique: std::collections::BTreeSet<_> = SITES.iter().collect();
         assert_eq!(unique.len(), SITES.len(), "duplicate site label");
+        assert!(!SITES.contains(&"unlabelled"), "`unlabelled` is the logger's fallback text, not a site");
         for site in SITES {
-            assert!(*site == UNLABELLED_SITE || LABEL_PREFIXES.iter().any(|prefix| site.starts_with(prefix)), "{site}");
+            assert!(LABEL_PREFIXES.iter().any(|prefix| site.starts_with(prefix)), "{site}");
             assert!(site.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'_'), "{site}");
         }
         let mut used = std::collections::BTreeSet::new();
@@ -1075,7 +1076,7 @@ pub(super) mod tests {
                 used.insert(label);
             }
         }
-        for site in SITES.iter().filter(|site| **site != UNLABELLED_SITE) {
+        for site in SITES {
             assert!(used.contains(*site), "unused site label: {site}");
         }
     }
@@ -1097,11 +1098,8 @@ pub(super) mod tests {
         }
         // `refuse` itself and the R8t class message of a started API run.
         assert_eq!(production.matches("user_error(").count(), 2);
-        // `RefusalSite::checked` runs only inside `site!`'s const (refusal.rs).
-        let checked = ["RefusalSite", "::checked("].concat();
-        for source in SITE_SOURCES {
-            assert!(!source.contains(checked.as_str()), "a site built outside site!");
-        }
+        // A site is built only inside `site!`'s const: the crate-wide scan is
+        // `refusal::tests::the_site_builder_is_named_only_by_site_macro`.
         // A synthetic negative case for the label scan above.
         let planted = ["refuse", "!(\"plan.planted\")"].concat();
         assert_eq!(macro_labels(&planted), vec!["plan.planted".to_owned()]);

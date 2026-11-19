@@ -181,9 +181,16 @@ pub(crate) fn log_refused(runtime: &'static str, agent: &str, reason: Option<&'s
         "isolated run refused");
 }
 
-/// R8x: the site recorded when a refused protected turn carried no label (a
-/// forgotten site still produces exactly one line, never none).
-pub(crate) const UNLABELLED_SITE: &str = "unlabelled";
+/// R8x: the fixed `site` log text when a refused protected turn recorded no
+/// site (a forgotten site still produces exactly one line, never none). This
+/// is log text only, not a [`RefusalSite`]: no site value carries it, and only
+/// the two loggers below print it, for `None`.
+const UNLABELLED_SITE: &str = "unlabelled";
+
+/// The `site` log value: the recorded site, or the fixed `unlabelled` text.
+fn site_text(site: Option<RefusalSite>) -> &'static str {
+    site.map_or(UNLABELLED_SITE, RefusalSite::as_str)
+}
 
 /// R8x: every place a protected turn can be refused, as the fixed `site` log
 /// value. Grouped by prefix: `preflight.*`/`authorize.*` (coarse gates, no
@@ -194,9 +201,10 @@ pub(crate) const UNLABELLED_SITE: &str = "unlabelled";
 /// `run.*` (the run started and then failed) and `output.*` (the run exited
 /// successfully but its result was unusable). Closed set, enforced by the
 /// compiler: a site exists only as a [`RefusalSite`], whose sole builder
-/// ([`site!`]) rejects at compile time any literal not listed here.
+/// ([`site!`]) rejects at compile time any literal not listed here. The
+/// `unlabelled` log text is deliberately not an entry (asserted at compile
+/// time below), so no site can carry it.
 pub(crate) const SITES: &[&str] = &[
-    UNLABELLED_SITE,
     // Coarse gates (no authority taken or issued yet).
     "preflight.model", "preflight.runtime_policy", "preflight.model_policy", "preflight.redaction",
     "preflight.interceptor", "preflight.mcp_isolation", "preflight.explore_lane", "preflight.utility_call",
@@ -252,24 +260,43 @@ pub(crate) const SITES: &[&str] = &[
 /// R8x (F3): one entry of [`SITES`], as a type. Every site recorder
 /// (`runtime::refuse`/`keep`/`note_site`, [`Sited`], the boot/ingress step
 /// labels) takes this, never a string. Built only by [`site!`], which checks
-/// the literal at compile time: a label missing from [`SITES`] — or
-/// `unlabelled`, which only the logging point itself may use
-/// ([`RefusalSite::UNLABELLED`]) — does not compile.
+/// the literal at compile time: a label missing from [`SITES`] (including
+/// `unlabelled`, which is not an entry) does not compile.
+///
+/// Closure (R8x review round 2): the field is private to this module, so
+/// `RefusalSite(..)` does not compile elsewhere; there is no other public or
+/// crate-visible constant or constructor. The one builder,
+/// [`RefusalSite::__from_listed`], is crate-visible only because `site!`
+/// expands at its call site; it additionally needs a [`__ListedSiteToken`],
+/// which only this module can create (private field) and which reaches the
+/// macro only through the hidden [`__LISTED_SITE`] constant.
+/// `macro_rules!` has no definition-site privacy on stable Rust, so anything
+/// the expansion names, crate code could name too: a direct (non-`const`)
+/// call is therefore not a compile error, and the backstop is the source-scan
+/// test `the_site_builder_is_named_only_by_site_macro`, which fails if either
+/// hidden name appears in any crate source file other than this one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RefusalSite(&'static str);
 
-impl RefusalSite {
-    /// The logging point's own fallback when a refused turn recorded no site.
-    pub(crate) const UNLABELLED: Self = Self(UNLABELLED_SITE);
+/// Proof that the caller is [`site!`]'s expansion. Not constructible outside
+/// this module (private field); see [`RefusalSite`].
+#[doc(hidden)]
+#[derive(Clone, Copy)]
+pub struct __ListedSiteToken(());
 
-    /// Only for [`site!`] (evaluated in a `const`, so a failure is a compile
-    /// error there). Panics on a label outside [`SITES`] or on `unlabelled`.
+/// The one [`__ListedSiteToken`], named only by [`site!`]'s expansion.
+#[doc(hidden)]
+pub(crate) const __LISTED_SITE: __ListedSiteToken = __ListedSiteToken(());
+
+impl RefusalSite {
+    /// Only for [`site!`], which evaluates it in a `const` item, so an
+    /// unlisted label is a const-evaluation (build) error in every profile.
+    /// Panics on a label outside [`SITES`].
     #[doc(hidden)]
-    pub(crate) const fn checked(label: &'static str) -> Self {
-        if const_str_eq(label, UNLABELLED_SITE) { panic!("`unlabelled` is not a refusal site"); }
+    pub(crate) const fn __from_listed(label: &'static str, _token: __ListedSiteToken) -> Self {
         let mut index = 0;
         while index < SITES.len() {
-            if const_str_eq(SITES[index], label) { return Self(label); }
+            if const_str_eq(SITES[index], label) { return Self(SITES[index]); }
             index += 1;
         }
         panic!("unknown refusal site: list the label in isolation_mcp::refusal::SITES")
@@ -278,6 +305,16 @@ impl RefusalSite {
     /// The fixed `site` log value.
     pub(crate) const fn as_str(self) -> &'static str { self.0 }
 }
+
+// Compile-time invariant (every build): `unlabelled` is log text, never a
+// listed site, so no `RefusalSite` can carry it.
+const _: () = {
+    let mut index = 0;
+    while index < SITES.len() {
+        assert!(!const_str_eq(SITES[index], UNLABELLED_SITE), "`unlabelled` must not be a refusal site");
+        index += 1;
+    }
+};
 
 const fn const_str_eq(left: &str, right: &str) -> bool {
     let (left, right) = (left.as_bytes(), right.as_bytes());
@@ -291,12 +328,14 @@ const fn const_str_eq(left: &str, right: &str) -> bool {
 }
 
 /// R8x (F3): the only way to name a refusal site: `site!("plan.readiness")`.
-/// The label is checked against [`SITES`] in a `const`, so an unknown label is
-/// a compile error, never a run-time `unlabelled`.
+/// Only a literal is accepted, and it is checked against [`SITES`] in a
+/// `const` item, so an unknown label is a compile error in every profile,
+/// never a run-time panic or a run-time `unlabelled`.
 macro_rules! site {
     ($label:literal) => {{
         const SITE: $crate::isolation_mcp::refusal::RefusalSite =
-            $crate::isolation_mcp::refusal::RefusalSite::checked($label);
+            $crate::isolation_mcp::refusal::RefusalSite::__from_listed(
+                $label, $crate::isolation_mcp::refusal::__LISTED_SITE);
         SITE
     }};
 }
@@ -339,17 +378,19 @@ pub(crate) fn agent_label(agent: &str) -> &str {
 // (channel/WebChat/API/scheduler), which is not centralised in one place.
 
 /// R8x: the single warning for a refused protected turn that never reached a
-/// started run. Fixed fields only: runtime label, employee label, site label.
-pub(crate) fn log_not_started(runtime: &'static str, agent: &str, site: RefusalSite) {
+/// started run. Fixed fields only: runtime label, employee label, site label
+/// (`unlabelled` when no site was recorded).
+pub(crate) fn log_not_started(runtime: &'static str, agent: &str, site: Option<RefusalSite>) {
     let agent = agent_label(agent);
-    tracing::warn!(runtime, agent, site = site.as_str(), "isolated run not started");
+    tracing::warn!(runtime, agent, site = site_text(site), "isolated run not started");
 }
 
 /// R8x: the single warning for a run that started but was refused without the
 /// R8t line (its pipes were missing, or it exited 0 with unusable output).
-pub(crate) fn log_refused_after_start(runtime: &'static str, agent: &str, site: RefusalSite) {
+/// `site` as in [`log_not_started`].
+pub(crate) fn log_refused_after_start(runtime: &'static str, agent: &str, site: Option<RefusalSite>) {
     let agent = agent_label(agent);
-    tracing::warn!(runtime, agent, site = site.as_str(), "isolated run refused after start");
+    tracing::warn!(runtime, agent, site = site_text(site), "isolated run refused after start");
 }
 
 #[cfg(test)]
@@ -518,9 +559,9 @@ mod tests {
                 let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
                     .with_max_level(tracing::Level::WARN).with_writer(move || writer.clone()).finish();
                 tracing::subscriber::with_default(subscriber, || if after_start {
-                    log_refused_after_start("openai_compat", agent, site!("output.empty"))
+                    log_refused_after_start("openai_compat", agent, Some(site!("output.empty")))
                 } else {
-                    log_not_started("openai_compat", agent, site!("plan.root_publication"))
+                    log_not_started("openai_compat", agent, Some(site!("plan.root_publication")))
                 });
                 let logs = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
                 assert_eq!(logs.lines().count(), 1, "{logs}");
@@ -555,21 +596,108 @@ mod tests {
         assert_eq!(agent_label("alice"), "alice");
     }
 
+    /// R8x: with no recorded site both lines print the fixed `unlabelled`
+    /// text — the logger's own fallback, not a site value.
+    #[test]
+    fn a_turn_without_a_site_logs_unlabelled() {
+        for after_start in [false, true] {
+            let log = LogCapture(Default::default());
+            let writer = log.clone();
+            let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
+                .with_max_level(tracing::Level::WARN).with_writer(move || writer.clone()).finish();
+            tracing::subscriber::with_default(subscriber, || if after_start {
+                log_refused_after_start("openai_compat", "alice", None)
+            } else {
+                log_not_started("openai_compat", "alice", None)
+            });
+            let logs = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+            assert_eq!(logs.lines().count(), 1, "{logs}");
+            assert!(logs.contains("site=\"unlabelled\""), "{logs}");
+        }
+        assert_eq!(site_text(None), "unlabelled");
+        assert!(!SITES.contains(&"unlabelled"));
+    }
+
+    /// R8x review round 2 (a): every [`SITES`] entry round-trips through the
+    /// exact builder `site!` expands to, evaluated in a `const` item, so a
+    /// failure here is a build error of the test target, not a test failure.
+    #[test]
+    fn every_listed_site_round_trips_at_compile_time() {
+        const ROUND_TRIP: usize = {
+            let mut index = 0;
+            while index < SITES.len() {
+                let site = RefusalSite::__from_listed(SITES[index], __LISTED_SITE);
+                assert!(const_str_eq(site.as_str(), SITES[index]), "a listed site does not round-trip");
+                index += 1;
+            }
+            index
+        };
+        assert_eq!(ROUND_TRIP, SITES.len());
+        // And through the macro itself, for a sample of literals.
+        const FROM_MACRO: [RefusalSite; 3] = [site!("preflight.model"), site!("spawn.admission"), site!("output.utf8")];
+        assert_eq!(FROM_MACRO.map(RefusalSite::as_str), ["preflight.model", "spawn.admission", "output.utf8"]);
+    }
+
     /// R8x F3: the site type is closed. `site!` with an unlisted label (or
     /// `unlabelled`) is a compile error — that is the primary guard and has no
-    /// run-time test; here the same checker is exercised outside a `const`,
-    /// where it panics instead, and every listed label round-trips.
+    /// run-time test; here the same builder is called outside a `const` (only
+    /// this module may do so, see the source-scan test below), where it panics
+    /// instead.
     #[test]
     fn refusal_sites_are_a_closed_type() {
-        for label in SITES.iter().copied().filter(|label| *label != UNLABELLED_SITE) {
-            assert_eq!(RefusalSite::checked(label).as_str(), label);
-        }
         for label in ["plan.not_a_site", "", UNLABELLED_SITE, "plan.readiness ", "Plan.readiness"] {
-            assert!(std::panic::catch_unwind(|| RefusalSite::checked(label)).is_err(), "{label:?}");
+            assert!(std::panic::catch_unwind(|| RefusalSite::__from_listed(label, __LISTED_SITE)).is_err(), "{label:?}");
         }
-        assert_eq!(RefusalSite::UNLABELLED.as_str(), UNLABELLED_SITE);
         assert_eq!(site!("spawn.admission").as_str(), "spawn.admission");
         assert_eq!(Sited::new(site!("launch.binding"), ()).site(), site!("launch.binding"));
+    }
+
+    /// R8x review round 2 (b): the backstop for what `macro_rules!` cannot
+    /// make private. Every `.rs` file under this crate's `src/` other than
+    /// this one must not name the site builder or its token (only `site!`'s
+    /// expansion does, and that text lives here); in this file's production
+    /// part, each hidden name appears only at its definition and in `site!`,
+    /// and the tuple constructor only in the builder.
+    #[test]
+    fn the_site_builder_is_named_only_by_site_macro() {
+        const HIDDEN: [&str; 3] = ["__from_listed", "__LISTED_SITE", "__ListedSiteToken"];
+        fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap_or_else(|error| panic!("{}: {error}", dir.display())) {
+                let path = entry.unwrap().path();
+                if path.is_dir() { rust_files(&path, out); }
+                else if path.extension().is_some_and(|ext| ext == "rs") { out.push(path); }
+            }
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_files(&src, &mut files);
+        let this = src.join("isolation_mcp").join("refusal.rs");
+        assert!(files.contains(&this), "scan did not find refusal.rs");
+        assert!(files.len() > 10, "scan found too few files: {}", files.len());
+        for file in files.iter().filter(|file| **file != this) {
+            let text = std::fs::read_to_string(file).unwrap_or_else(|error| panic!("{}: {error}", file.display()));
+            for name in HIDDEN {
+                assert!(!text.contains(name), "{} names the site builder `{name}` outside site!", file.display());
+            }
+        }
+        let source = include_str!("refusal.rs");
+        let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+        assert!(production.len() < source.len(), "test-module marker not found");
+        // Definition + `site!`.
+        assert_eq!(production.matches("fn __from_listed(").count(), 1);
+        assert_eq!(production.matches("RefusalSite::__from_listed(").count(), 1);
+        assert_eq!(production.matches("__from_listed").count(), 2 + doc_mentions(production, "__from_listed"));
+        assert_eq!(production.matches("const __LISTED_SITE:").count(), 1);
+        assert_eq!(production.matches("refusal::__LISTED_SITE)").count(), 1);
+        assert_eq!(production.matches("__LISTED_SITE").count(), 2 + doc_mentions(production, "__LISTED_SITE"));
+        // The tuple constructors: the token's one value and the builder's return.
+        assert_eq!(production.matches("__ListedSiteToken(())").count(), 2, "struct definition + the one value");
+        assert_eq!(production.matches("Self(").count(), 1, "RefusalSite is built only in __from_listed");
+    }
+
+    /// Mentions of `name` inside doc/line comments of `source` (not code).
+    fn doc_mentions(source: &str, name: &str) -> usize {
+        source.lines().filter(|line| line.trim_start().starts_with("//")).map(|line| line.matches(name).count()).sum()
     }
 
     #[test]
