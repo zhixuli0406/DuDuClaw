@@ -192,118 +192,203 @@ fn site_text(site: Option<RefusalSite>) -> &'static str {
     site.map_or(UNLABELLED_SITE, RefusalSite::as_str)
 }
 
-/// R8x: every place a protected turn can be refused, as the fixed `site` log
-/// value. Grouped by prefix: `preflight.*`/`authorize.*` (coarse gates, no
-/// authority consumed), `authorization.*` (taking or issuing the one-time
-/// run authority), `plan.*` (the root-published run plan), `launch.*` (the
-/// protected MCP launch context), `spawn.*` (asking spawnd to start the run;
-/// `spawn.backend.*` is spawnd's or the transport's fixed refusal class),
-/// `run.*` (the run started and then failed) and `output.*` (the run exited
-/// successfully but its result was unusable). Closed set, enforced by the
-/// compiler: a site exists only as a [`RefusalSite`], whose sole builder
-/// ([`site!`]) rejects at compile time any literal not listed here. The
-/// `unlabelled` log text is deliberately not an entry (asserted at compile
-/// time below), so no site can carry it.
-pub(crate) const SITES: &[&str] = &[
-    // Coarse gates (no authority taken or issued yet).
-    "preflight.model", "preflight.runtime_policy", "preflight.model_policy", "preflight.redaction",
-    "preflight.interceptor", "preflight.mcp_isolation", "preflight.explore_lane", "preflight.utility_call",
-    "preflight.claude_options",
-    "authorize.agent_dir_missing", "authorize.effort", "authorize.utility_call", "authorize.work_dir_override",
-    "authorize.agent_dir", "authorize.capabilities_policy", "authorize.native_gate", "authorize.runtime_kind",
-    "authorize.explore_lane", "authorize.tool_restrictions", "authorize.codex_home", "authorize.product_policy",
-    "authorize.interceptor", "authorize.runtime_id", "authorize.max_turns",
-    "step_limit.agent_dir", "step_limit.unavailable",
-    // The one-time run authority.
-    "authorization.consumed", "authorization.installed_mismatch", "authorization.agent_label",
-    "authorization.home", "authorization.principal_context", "authorization.background_issue",
-    "authorization.ingress_issue",
-    "authorization.ingress.no_scope", "authorization.ingress.consumed",
-    "authorization.ingress.capture.no_web_credential", "authorization.ingress.capture.web_identity",
-    "authorization.ingress.capture.channel_conflict", "authorization.ingress.capture.channel_mapping",
-    "authorization.ingress.capture.requester", "authorization.ingress.capture.user_db",
-    "authorization.ingress.capture.user_inactive", "authorization.ingress.capture.epoch",
-    "authorization.ingress.capture.blocking",
-    "authorization.ingress.agent_path", "authorization.ingress.home_mismatch", "authorization.ingress.no_turn",
-    "authorization.ingress.no_session", "authorization.ingress.no_attended_proof",
-    "authorization.ingress.attended_proof_invalid", "authorization.ingress.nested_dispatch",
-    "authorization.ingress.principal_mismatch", "authorization.ingress.proof_expired",
-    "authorization.ingress.identity_recheck", "authorization.ingress.blocking",
-    "authorization.issue.boot_owner", "authorization.issue.product_authority", "authorization.issue.lifecycle",
-    "authorization.issue.snapshot", "authorization.issue.epoch", "authorization.issue.principal",
-    "authorization.issue.binding", "authorization.issue.policy_revision", "authorization.issue.tools",
-    "authorization.issue.human", "authorization.issue.selectors", "authorization.issue.capability",
-    "authorization.issue.users_recheck", "authorization.issue.policy_changed",
-    "authorization.issue.lifecycle_recheck", "authorization.issue.snapshot_recheck",
-    "authorization.issue.facts_recheck",
-    // The request and the root-published plan.
-    "request.encode",
-    "plan.unavailable", "plan.readiness", "plan.boot_owner", "plan.home_mismatch", "plan.employee_unconfirmed",
-    "plan.root_publication", "plan.blocking",
-    // The protected launch context.
-    "launch.readiness", "launch.boot_owner", "launch.boundary_unhealthy", "launch.employee_unconfirmed",
-    "launch.employee_mismatch", "launch.product_prepare", "launch.binding", "launch.blocking",
-    "launch.resolver", "launch.connectors", "launch.worker_plans", "launch.factories", "launch.dispatcher",
-    "launch.protected_launch", "launch.authority_pairing",
-    // Asking spawnd to start the run.
-    "spawn.prepare", "spawn.not_protected", "spawn.admission",
-    "spawn.backend.unavailable", "spawn.backend.denied", "spawn.backend.would_deadlock",
-    "spawn.backend.not_found", "spawn.backend.timeout", "spawn.backend.io", "spawn.backend.protocol",
-    "spawn.start.permission_denied", "spawn.start.not_found", "spawn.start.timed_out", "spawn.start.other",
-    // The run started.
-    "run.stdin_missing", "run.stdout_missing", "run.stderr_missing", "run.input", "run.output_drain",
-    "run.stderr_drain", "run.wait", "run.refused",
-    // The run exited successfully; its result was refused.
-    "output.parse", "output.empty", "output.utf8",
-];
-
-/// R8x (F3): one entry of [`SITES`], as a type. Every site recorder
-/// (`runtime::refuse`/`keep`/`note_site`, [`Sited`], the boot/ingress step
-/// labels) takes this, never a string. Built only by [`site!`], which checks
-/// the literal at compile time: a label missing from [`SITES`] (including
-/// `unlabelled`, which is not an entry) does not compile.
+/// R8x review round 3: the ONE list of refusal sites. Each entry
+/// `Variant => "label"` generates, from this single source:
+/// * the [`RefusalSite`] variant and its arm in [`RefusalSite::as_str`],
+/// * its entry in [`RefusalSite::ALL`] and in [`SITES`] (same order),
+/// * one arm `("label") => { …::RefusalSite::Variant }` of [`site!`],
+/// * one `const` assertion that `site!("label").as_str() == "label"`.
 ///
-/// Closure (R8x review round 2): the field is private to this module, so
-/// `RefusalSite(..)` does not compile elsewhere; there is no other public or
-/// crate-visible constant or constructor. The one builder,
-/// [`RefusalSite::__from_listed`], is crate-visible only because `site!`
-/// expands at its call site; it additionally needs a [`__ListedSiteToken`],
-/// which only this module can create (private field) and which reaches the
-/// macro only through the hidden [`__LISTED_SITE`] constant.
-/// `macro_rules!` has no definition-site privacy on stable Rust, so anything
-/// the expansion names, crate code could name too: a direct (non-`const`)
-/// call is therefore not a compile error, and the backstop is the source-scan
-/// test `the_site_builder_is_named_only_by_site_macro`, which fails if either
-/// hidden name appears in any crate source file other than this one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RefusalSite(&'static str);
+/// The inner `site!` arms need no metavariables (they name the variant by
+/// the absolute `crate::` path, the macro being crate-local), so there is no
+/// `$`-escaping problem on stable. Labels are captured as `tt` so they reach
+/// the inner matcher as plain literal tokens, not opaque fragments.
+macro_rules! sites {
+    ($($variant:ident => $label:tt),+ $(,)?) => {
+        /// R8x (F3): one entry of [`SITES`], as a type. Every site recorder
+        /// (`runtime::refuse`/`keep`/`note_site`, [`Sited`], the boot/ingress
+        /// step labels) takes this, never a string.
+        ///
+        /// Closure (R8x review round 3): a plain enum generated from the one
+        /// list in `sites!`. There is no constructor, no builder and no
+        /// function from a string to a site; [`site!`] is a literal-token
+        /// lookup with one arm per listed label, so an unlisted literal
+        /// (including `unlabelled`, which is not an entry) is a "no rules
+        /// expected" compile error in every profile.
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        pub(crate) enum RefusalSite { $($variant),+ }
 
-/// Proof that the caller is [`site!`]'s expansion. Not constructible outside
-/// this module (private field); see [`RefusalSite`].
-#[doc(hidden)]
-#[derive(Clone, Copy)]
-pub struct __ListedSiteToken(());
+        impl RefusalSite {
+            /// Every site, in [`SITES`] order.
+            pub(crate) const ALL: &'static [RefusalSite] = &[$(RefusalSite::$variant),+];
 
-/// The one [`__ListedSiteToken`], named only by [`site!`]'s expansion.
-#[doc(hidden)]
-pub(crate) const __LISTED_SITE: __ListedSiteToken = __ListedSiteToken(());
-
-impl RefusalSite {
-    /// Only for [`site!`], which evaluates it in a `const` item, so an
-    /// unlisted label is a const-evaluation (build) error in every profile.
-    /// Panics on a label outside [`SITES`].
-    #[doc(hidden)]
-    pub(crate) const fn __from_listed(label: &'static str, _token: __ListedSiteToken) -> Self {
-        let mut index = 0;
-        while index < SITES.len() {
-            if const_str_eq(SITES[index], label) { return Self(SITES[index]); }
-            index += 1;
+            /// The fixed `site` log value.
+            pub(crate) const fn as_str(self) -> &'static str {
+                match self { $(RefusalSite::$variant => $label),+ }
+            }
         }
-        panic!("unknown refusal site: list the label in isolation_mcp::refusal::SITES")
-    }
 
-    /// The fixed `site` log value.
-    pub(crate) const fn as_str(self) -> &'static str { self.0 }
+        /// R8x: every place a protected turn can be refused, as the fixed
+        /// `site` log value. Grouped by prefix: `preflight.*`/`authorize.*`
+        /// (coarse gates, no authority consumed), `authorization.*` (taking
+        /// or issuing the one-time run authority), `plan.*` (the
+        /// root-published run plan), `launch.*` (the protected MCP launch
+        /// context), `spawn.*` (asking spawnd to start the run;
+        /// `spawn.backend.*` is spawnd's or the transport's fixed refusal
+        /// class), `run.*` (the run started and then failed) and `output.*`
+        /// (the run exited successfully but its result was unusable). Closed
+        /// set, enforced by the compiler: generated with [`RefusalSite`] and
+        /// [`site!`] from the one `sites!` list. The `unlabelled` log text is
+        /// deliberately not an entry (asserted at compile time below).
+        pub(crate) const SITES: &[&str] = &[$($label),+];
+
+        /// R8x (F3): the only way to name a refusal site:
+        /// `site!("plan.readiness")`. One arm per listed label; any other
+        /// token is a compile error, never a run-time panic or `unlabelled`.
+        macro_rules! site {
+            $( ($label) => { crate::isolation_mcp::refusal::RefusalSite::$variant }; )+
+        }
+        pub(crate) use site;
+
+        // One compile-time assertion per arm: `site!` of the label yields
+        // the variant whose `as_str()` is that label.
+        $( const _: () = assert!(const_str_eq(site!($label).as_str(), $label),
+            "a site! arm does not map to its own label"); )+
+
+        /// Every `site!` arm, evaluated, in [`SITES`] order (for tests).
+        #[cfg(test)]
+        const SITE_ARMS: &[RefusalSite] = &[$(site!($label)),+];
+    };
+}
+
+sites! {
+    // Coarse gates (no authority taken or issued yet).
+    PreflightModel => "preflight.model",
+    PreflightRuntimePolicy => "preflight.runtime_policy",
+    PreflightModelPolicy => "preflight.model_policy",
+    PreflightRedaction => "preflight.redaction",
+    PreflightInterceptor => "preflight.interceptor",
+    PreflightMcpIsolation => "preflight.mcp_isolation",
+    PreflightExploreLane => "preflight.explore_lane",
+    PreflightUtilityCall => "preflight.utility_call",
+    PreflightClaudeOptions => "preflight.claude_options",
+    AuthorizeAgentDirMissing => "authorize.agent_dir_missing",
+    AuthorizeEffort => "authorize.effort",
+    AuthorizeUtilityCall => "authorize.utility_call",
+    AuthorizeWorkDirOverride => "authorize.work_dir_override",
+    AuthorizeAgentDir => "authorize.agent_dir",
+    AuthorizeCapabilitiesPolicy => "authorize.capabilities_policy",
+    AuthorizeNativeGate => "authorize.native_gate",
+    AuthorizeRuntimeKind => "authorize.runtime_kind",
+    AuthorizeExploreLane => "authorize.explore_lane",
+    AuthorizeToolRestrictions => "authorize.tool_restrictions",
+    AuthorizeCodexHome => "authorize.codex_home",
+    AuthorizeProductPolicy => "authorize.product_policy",
+    AuthorizeInterceptor => "authorize.interceptor",
+    AuthorizeRuntimeId => "authorize.runtime_id",
+    AuthorizeMaxTurns => "authorize.max_turns",
+    StepLimitAgentDir => "step_limit.agent_dir",
+    StepLimitUnavailable => "step_limit.unavailable",
+    // The one-time run authority.
+    AuthorizationConsumed => "authorization.consumed",
+    AuthorizationInstalledMismatch => "authorization.installed_mismatch",
+    AuthorizationAgentLabel => "authorization.agent_label",
+    AuthorizationHome => "authorization.home",
+    AuthorizationPrincipalContext => "authorization.principal_context",
+    AuthorizationBackgroundIssue => "authorization.background_issue",
+    AuthorizationIngressIssue => "authorization.ingress_issue",
+    AuthorizationIngressNoScope => "authorization.ingress.no_scope",
+    AuthorizationIngressConsumed => "authorization.ingress.consumed",
+    AuthorizationIngressCaptureNoWebCredential => "authorization.ingress.capture.no_web_credential",
+    AuthorizationIngressCaptureWebIdentity => "authorization.ingress.capture.web_identity",
+    AuthorizationIngressCaptureChannelConflict => "authorization.ingress.capture.channel_conflict",
+    AuthorizationIngressCaptureChannelMapping => "authorization.ingress.capture.channel_mapping",
+    AuthorizationIngressCaptureRequester => "authorization.ingress.capture.requester",
+    AuthorizationIngressCaptureUserDb => "authorization.ingress.capture.user_db",
+    AuthorizationIngressCaptureUserInactive => "authorization.ingress.capture.user_inactive",
+    AuthorizationIngressCaptureEpoch => "authorization.ingress.capture.epoch",
+    AuthorizationIngressCaptureBlocking => "authorization.ingress.capture.blocking",
+    AuthorizationIngressAgentPath => "authorization.ingress.agent_path",
+    AuthorizationIngressHomeMismatch => "authorization.ingress.home_mismatch",
+    AuthorizationIngressNoTurn => "authorization.ingress.no_turn",
+    AuthorizationIngressNoSession => "authorization.ingress.no_session",
+    AuthorizationIngressNoAttendedProof => "authorization.ingress.no_attended_proof",
+    AuthorizationIngressAttendedProofInvalid => "authorization.ingress.attended_proof_invalid",
+    AuthorizationIngressNestedDispatch => "authorization.ingress.nested_dispatch",
+    AuthorizationIngressPrincipalMismatch => "authorization.ingress.principal_mismatch",
+    AuthorizationIngressProofExpired => "authorization.ingress.proof_expired",
+    AuthorizationIngressIdentityRecheck => "authorization.ingress.identity_recheck",
+    AuthorizationIngressBlocking => "authorization.ingress.blocking",
+    AuthorizationIssueBootOwner => "authorization.issue.boot_owner",
+    AuthorizationIssueProductAuthority => "authorization.issue.product_authority",
+    AuthorizationIssueLifecycle => "authorization.issue.lifecycle",
+    AuthorizationIssueSnapshot => "authorization.issue.snapshot",
+    AuthorizationIssueEpoch => "authorization.issue.epoch",
+    AuthorizationIssuePrincipal => "authorization.issue.principal",
+    AuthorizationIssueBinding => "authorization.issue.binding",
+    AuthorizationIssuePolicyRevision => "authorization.issue.policy_revision",
+    AuthorizationIssueTools => "authorization.issue.tools",
+    AuthorizationIssueHuman => "authorization.issue.human",
+    AuthorizationIssueSelectors => "authorization.issue.selectors",
+    AuthorizationIssueCapability => "authorization.issue.capability",
+    AuthorizationIssueUsersRecheck => "authorization.issue.users_recheck",
+    AuthorizationIssuePolicyChanged => "authorization.issue.policy_changed",
+    AuthorizationIssueLifecycleRecheck => "authorization.issue.lifecycle_recheck",
+    AuthorizationIssueSnapshotRecheck => "authorization.issue.snapshot_recheck",
+    AuthorizationIssueFactsRecheck => "authorization.issue.facts_recheck",
+    // The request and the root-published plan.
+    RequestEncode => "request.encode",
+    PlanUnavailable => "plan.unavailable",
+    PlanReadiness => "plan.readiness",
+    PlanBootOwner => "plan.boot_owner",
+    PlanHomeMismatch => "plan.home_mismatch",
+    PlanEmployeeUnconfirmed => "plan.employee_unconfirmed",
+    PlanRootPublication => "plan.root_publication",
+    PlanBlocking => "plan.blocking",
+    // The protected launch context.
+    LaunchReadiness => "launch.readiness",
+    LaunchBootOwner => "launch.boot_owner",
+    LaunchBoundaryUnhealthy => "launch.boundary_unhealthy",
+    LaunchEmployeeUnconfirmed => "launch.employee_unconfirmed",
+    LaunchEmployeeMismatch => "launch.employee_mismatch",
+    LaunchProductPrepare => "launch.product_prepare",
+    LaunchBinding => "launch.binding",
+    LaunchBlocking => "launch.blocking",
+    LaunchResolver => "launch.resolver",
+    LaunchConnectors => "launch.connectors",
+    LaunchWorkerPlans => "launch.worker_plans",
+    LaunchFactories => "launch.factories",
+    LaunchDispatcher => "launch.dispatcher",
+    LaunchProtectedLaunch => "launch.protected_launch",
+    LaunchAuthorityPairing => "launch.authority_pairing",
+    // Asking spawnd to start the run.
+    SpawnPrepare => "spawn.prepare",
+    SpawnNotProtected => "spawn.not_protected",
+    SpawnAdmission => "spawn.admission",
+    SpawnBackendUnavailable => "spawn.backend.unavailable",
+    SpawnBackendDenied => "spawn.backend.denied",
+    SpawnBackendWouldDeadlock => "spawn.backend.would_deadlock",
+    SpawnBackendNotFound => "spawn.backend.not_found",
+    SpawnBackendTimeout => "spawn.backend.timeout",
+    SpawnBackendIo => "spawn.backend.io",
+    SpawnBackendProtocol => "spawn.backend.protocol",
+    SpawnStartPermissionDenied => "spawn.start.permission_denied",
+    SpawnStartNotFound => "spawn.start.not_found",
+    SpawnStartTimedOut => "spawn.start.timed_out",
+    SpawnStartOther => "spawn.start.other",
+    // The run started.
+    RunStdinMissing => "run.stdin_missing",
+    RunStdoutMissing => "run.stdout_missing",
+    RunStderrMissing => "run.stderr_missing",
+    RunInput => "run.input",
+    RunOutputDrain => "run.output_drain",
+    RunStderrDrain => "run.stderr_drain",
+    RunWait => "run.wait",
+    RunRefused => "run.refused",
+    // The run exited successfully; its result was refused.
+    OutputParse => "output.parse",
+    OutputEmpty => "output.empty",
+    OutputUtf8 => "output.utf8",
 }
 
 // Compile-time invariant (every build): `unlabelled` is log text, never a
@@ -312,6 +397,32 @@ const _: () = {
     let mut index = 0;
     while index < SITES.len() {
         assert!(!const_str_eq(SITES[index], UNLABELLED_SITE), "`unlabelled` must not be a refusal site");
+        index += 1;
+    }
+};
+
+// Compile-time invariants (every build) of the generated list: labels are
+// non-empty, lowercase `[a-z0-9_.]`, pairwise distinct, and `ALL[i]` is the
+// variant whose `as_str()` is `SITES[i]`.
+const _: () = {
+    assert!(RefusalSite::ALL.len() == SITES.len(), "ALL and SITES differ in length");
+    let mut index = 0;
+    while index < SITES.len() {
+        let bytes = SITES[index].as_bytes();
+        assert!(!bytes.is_empty(), "empty refusal site label");
+        let mut at = 0;
+        while at < bytes.len() {
+            let byte = bytes[at];
+            assert!(byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'.' || byte == b'_',
+                "a refusal site label is not lowercase [a-z0-9_.]");
+            at += 1;
+        }
+        assert!(const_str_eq(RefusalSite::ALL[index].as_str(), SITES[index]), "ALL and SITES out of order");
+        let mut other = index + 1;
+        while other < SITES.len() {
+            assert!(!const_str_eq(SITES[index], SITES[other]), "duplicate refusal site label");
+            other += 1;
+        }
         index += 1;
     }
 };
@@ -326,20 +437,6 @@ const fn const_str_eq(left: &str, right: &str) -> bool {
     }
     true
 }
-
-/// R8x (F3): the only way to name a refusal site: `site!("plan.readiness")`.
-/// Only a literal is accepted, and it is checked against [`SITES`] in a
-/// `const` item, so an unknown label is a compile error in every profile,
-/// never a run-time panic or a run-time `unlabelled`.
-macro_rules! site {
-    ($label:literal) => {{
-        const SITE: $crate::isolation_mcp::refusal::RefusalSite =
-            $crate::isolation_mcp::refusal::RefusalSite::__from_listed(
-                $label, $crate::isolation_mcp::refusal::__LISTED_SITE);
-        SITE
-    }};
-}
-pub(crate) use site;
 
 /// R8x (F3): a protected helper's refusal — its error together with the site
 /// that refused. There is deliberately no `From` conversion from a bare error:
@@ -618,86 +715,56 @@ mod tests {
         assert!(!SITES.contains(&"unlabelled"));
     }
 
-    /// R8x review round 2 (a): every [`SITES`] entry round-trips through the
-    /// exact builder `site!` expands to, evaluated in a `const` item, so a
-    /// failure here is a build error of the test target, not a test failure.
+    /// R8x review round 3: every `site!` arm, generated from the same
+    /// `sites!` list as the enum, yields the variant whose `as_str()` is its
+    /// own label (also a per-arm `const` assertion, i.e. a build error), and
+    /// the arms, `ALL` and `SITES` line up one to one.
     #[test]
     fn every_listed_site_round_trips_at_compile_time() {
-        const ROUND_TRIP: usize = {
-            let mut index = 0;
-            while index < SITES.len() {
-                let site = RefusalSite::__from_listed(SITES[index], __LISTED_SITE);
-                assert!(const_str_eq(site.as_str(), SITES[index]), "a listed site does not round-trip");
-                index += 1;
-            }
-            index
-        };
-        assert_eq!(ROUND_TRIP, SITES.len());
-        // And through the macro itself, for a sample of literals.
+        assert_eq!(SITE_ARMS.len(), SITES.len());
+        assert_eq!(SITE_ARMS, RefusalSite::ALL);
+        for (site, label) in SITE_ARMS.iter().zip(SITES) {
+            assert_eq!(site.as_str(), *label);
+        }
+        // And for a sample of literals, through the macro in a `const`.
         const FROM_MACRO: [RefusalSite; 3] = [site!("preflight.model"), site!("spawn.admission"), site!("output.utf8")];
+        assert_eq!(FROM_MACRO, [RefusalSite::PreflightModel, RefusalSite::SpawnAdmission, RefusalSite::OutputUtf8]);
         assert_eq!(FROM_MACRO.map(RefusalSite::as_str), ["preflight.model", "spawn.admission", "output.utf8"]);
     }
 
-    /// R8x F3: the site type is closed. `site!` with an unlisted label (or
-    /// `unlabelled`) is a compile error — that is the primary guard and has no
-    /// run-time test; here the same builder is called outside a `const` (only
-    /// this module may do so, see the source-scan test below), where it panics
-    /// instead.
+    /// R8x review round 3: each variant's label is unique, non-empty and
+    /// lowercase `[a-z0-9_.]`; `ALL` and `SITES` have the same length and
+    /// order. (Also asserted at compile time in the module.)
+    #[test]
+    fn every_site_label_is_unique_and_well_formed() {
+        assert_eq!(RefusalSite::ALL.len(), SITES.len());
+        let mut seen = std::collections::BTreeSet::new();
+        for (site, label) in RefusalSite::ALL.iter().zip(SITES) {
+            let text = site.as_str();
+            assert_eq!(text, *label, "{site:?}");
+            assert!(!text.is_empty(), "{site:?}");
+            assert!(text.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'_'),
+                "{text}");
+            assert!(seen.insert(text), "duplicate label {text}");
+        }
+        for (index, site) in RefusalSite::ALL.iter().enumerate() {
+            assert!(!RefusalSite::ALL[index + 1..].contains(site), "{site:?} is listed twice in ALL");
+        }
+    }
+
+    /// R8x F3: the site type is closed. It is a plain enum with no string
+    /// constructor; `site!` with an unlisted label (or `unlabelled`) has no
+    /// matching arm, a compile error with no run-time counterpart. Here: no
+    /// site carries `unlabelled` or a near-miss of a listed label.
     #[test]
     fn refusal_sites_are_a_closed_type() {
         for label in ["plan.not_a_site", "", UNLABELLED_SITE, "plan.readiness ", "Plan.readiness"] {
-            assert!(std::panic::catch_unwind(|| RefusalSite::__from_listed(label, __LISTED_SITE)).is_err(), "{label:?}");
+            assert!(RefusalSite::ALL.iter().all(|site| site.as_str() != label), "{label:?}");
+            assert!(!SITES.contains(&label), "{label:?}");
         }
+        assert_eq!(site!("spawn.admission"), RefusalSite::SpawnAdmission);
         assert_eq!(site!("spawn.admission").as_str(), "spawn.admission");
         assert_eq!(Sited::new(site!("launch.binding"), ()).site(), site!("launch.binding"));
-    }
-
-    /// R8x review round 2 (b): the backstop for what `macro_rules!` cannot
-    /// make private. Every `.rs` file under this crate's `src/` other than
-    /// this one must not name the site builder or its token (only `site!`'s
-    /// expansion does, and that text lives here); in this file's production
-    /// part, each hidden name appears only at its definition and in `site!`,
-    /// and the tuple constructor only in the builder.
-    #[test]
-    fn the_site_builder_is_named_only_by_site_macro() {
-        const HIDDEN: [&str; 3] = ["__from_listed", "__LISTED_SITE", "__ListedSiteToken"];
-        fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-            for entry in std::fs::read_dir(dir).unwrap_or_else(|error| panic!("{}: {error}", dir.display())) {
-                let path = entry.unwrap().path();
-                if path.is_dir() { rust_files(&path, out); }
-                else if path.extension().is_some_and(|ext| ext == "rs") { out.push(path); }
-            }
-        }
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut files = Vec::new();
-        rust_files(&src, &mut files);
-        let this = src.join("isolation_mcp").join("refusal.rs");
-        assert!(files.contains(&this), "scan did not find refusal.rs");
-        assert!(files.len() > 10, "scan found too few files: {}", files.len());
-        for file in files.iter().filter(|file| **file != this) {
-            let text = std::fs::read_to_string(file).unwrap_or_else(|error| panic!("{}: {error}", file.display()));
-            for name in HIDDEN {
-                assert!(!text.contains(name), "{} names the site builder `{name}` outside site!", file.display());
-            }
-        }
-        let source = include_str!("refusal.rs");
-        let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
-        assert!(production.len() < source.len(), "test-module marker not found");
-        // Definition + `site!`.
-        assert_eq!(production.matches("fn __from_listed(").count(), 1);
-        assert_eq!(production.matches("RefusalSite::__from_listed(").count(), 1);
-        assert_eq!(production.matches("__from_listed").count(), 2 + doc_mentions(production, "__from_listed"));
-        assert_eq!(production.matches("const __LISTED_SITE:").count(), 1);
-        assert_eq!(production.matches("refusal::__LISTED_SITE)").count(), 1);
-        assert_eq!(production.matches("__LISTED_SITE").count(), 2 + doc_mentions(production, "__LISTED_SITE"));
-        // The tuple constructors: the token's one value and the builder's return.
-        assert_eq!(production.matches("__ListedSiteToken(())").count(), 2, "struct definition + the one value");
-        assert_eq!(production.matches("Self(").count(), 1, "RefusalSite is built only in __from_listed");
-    }
-
-    /// Mentions of `name` inside doc/line comments of `source` (not code).
-    fn doc_mentions(source: &str, name: &str) -> usize {
-        source.lines().filter(|line| line.trim_start().starts_with("//")).map(|line| line.matches(name).count()).sum()
     }
 
     #[test]

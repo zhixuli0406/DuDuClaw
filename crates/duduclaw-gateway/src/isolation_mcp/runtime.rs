@@ -63,12 +63,14 @@ tokio::task_local! { static TRACE: std::cell::Cell<Trace>; }
 use super::refusal::{site, RefusalSite};
 
 /// `refuse!(<label literal>)`: [`refuse`] with a compile-time checked site.
+/// (`tt`, not `literal`: a forwarded `literal` fragment is opaque and could
+/// not match `site!`'s per-label literal arms.)
 macro_rules! refuse {
-    ($label:literal) => { refuse(site!($label)) };
+    ($label:tt) => { refuse(site!($label)) };
 }
 /// `keep!(<label literal>)`: [`keep`] with a compile-time checked site.
 macro_rules! keep {
-    ($label:literal) => { keep(site!($label)) };
+    ($label:tt) => { keep(site!($label)) };
 }
 
 fn record(update: impl FnOnce(&mut Trace)) {
@@ -1054,11 +1056,12 @@ pub(super) mod tests {
         labels
     }
 
-    /// F3: the closed set is structural — a site is a `RefusalSite`, built only
-    /// by `site!`, whose compile-time check rejects any label missing from
-    /// `refusal::SITES` (so a missing entry is a build failure, not a test
-    /// failure). This test keeps the list itself tidy: well-formed, no
-    /// duplicates, and no dead entries.
+    /// F3: the closed set is structural — a site is a `RefusalSite` enum
+    /// variant, generated with `site!` and `refusal::SITES` from one list;
+    /// `site!` has one arm per listed label, so a missing entry is a build
+    /// failure, not a test failure. This test keeps the list itself tidy:
+    /// well-formed, no duplicates, and no dead entries. Its sources are
+    /// `include_str!` (compile-time), not a run-time read of the source tree.
     #[test]
     fn site_labels_are_a_closed_fixed_set() {
         use super::super::refusal::SITES;
@@ -1098,8 +1101,8 @@ pub(super) mod tests {
         }
         // `refuse` itself and the R8t class message of a started API run.
         assert_eq!(production.matches("user_error(").count(), 2);
-        // A site is built only inside `site!`'s const: the crate-wide scan is
-        // `refusal::tests::the_site_builder_is_named_only_by_site_macro`.
+        // A site is an enum variant with no string constructor; `site!` is
+        // the literal-to-variant lookup (refusal.rs, `sites!`).
         // A synthetic negative case for the label scan above.
         let planted = ["refuse", "!(\"plan.planted\")"].concat();
         assert_eq!(macro_labels(&planted), vec!["plan.planted".to_owned()]);

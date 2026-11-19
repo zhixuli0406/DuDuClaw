@@ -678,8 +678,10 @@ impl crate::isolation_readiness::IntegrationProbe for BoundaryReadiness {
 }
 
 /// `step!(<label literal>)`: [`issue_step`] with a compile-time checked site.
+/// (`tt`, not `literal`: a forwarded `literal` fragment is opaque and could
+/// not match `site!`'s per-label literal arms.)
 macro_rules! step {
-    ($label:literal) => { issue_step(site!($label)) };
+    ($label:tt) => { issue_step(site!($label)) };
 }
 
 /// Authenticated ingress and approved background records share this issuer.
