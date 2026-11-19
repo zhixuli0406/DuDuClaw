@@ -149,10 +149,13 @@ pub(crate) async fn serve_with_deadline_checked(connection: &mut crate::Connecti
     let revocation = || (connection.revocation_cause().map_or(S::Revoked, S::Context), VerificationError::Revoked);
     // This future is polled alongside the handler/deadline, never awaited in
     // a selected branch. Slow authority I/O cannot monopolize the reactor.
+    // R8z-7: a full verification at most one watch period (100 ms) after the
+    // previous one of this session completed — the request reads below count,
+    // so the watch no longer runs back to back with them (it used to hold the
+    // connection's single authority slot while a request's read queued).
     let watch = async {
         loop {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            verifier.context_checked().await.map_err(context_step)?;
+            verifier.watch_checked().await.map_err(context_step)?;
         }
         #[allow(unreachable_code)]
         Ok::<Option<SessionStep>, (SessionStep, VerificationError)>(None)
@@ -203,14 +206,20 @@ pub(crate) async fn serve_with_deadline_checked(connection: &mut crate::Connecti
         let in_request = (!notification).then_some(S::PeerClosedInRequest);
         let deadline = tokio::time::sleep(request_timeout);
         tokio::pin!(deadline);
+        // R8z-7: a full verification started after this frame was read (it
+        // never reuses an earlier one). Its context carries the single-use
+        // dispatch proof for this dispatch's turn resolution.
         let context = tokio::select! {
             biased;
             _ = wait_revoked(&mut revoked) => return Err(revocation()),
-            result = verifier.context_checked() => result.map_err(context_step)?,
+            result = verifier.dispatch_context_checked() => result.map_err(context_step)?,
             result = &mut watch => return result,
             result = peer_eof(&mut reader) => return result.map(|()| in_request),
             _ = &mut deadline => return Err(expired),
         };
+        // R8z-7: an unused proof ends with this request's handler (whichever
+        // way this iteration ends), never reaching a later await of it.
+        let proof = RetireDispatchProof(context.clone());
         let request_id = request.get("id").cloned().unwrap_or(Value::Null);
         let call = dispatcher.dispatch(context, &agent_slug, request);
         tokio::pin!(call);
@@ -273,6 +282,13 @@ pub(crate) async fn serve_with_deadline_checked(connection: &mut crate::Connecti
                 }
             }
         };
+        drop(proof);
+        // A response is published only under a full verification started
+        // after its handler ended. R8z-7: a handler with nothing to publish
+        // (a notification) needs no such read; it was dispatched under its
+        // own, and the watch and revocation stay armed while the next frame
+        // is read.
+        let Some(response) = response else { continue; };
         tokio::select! {
             biased;
             _ = wait_revoked(&mut revoked) => return Err(revocation()),
@@ -281,7 +297,7 @@ pub(crate) async fn serve_with_deadline_checked(connection: &mut crate::Connecti
             result = peer_eof(&mut reader) => return result.map(|()| in_request),
             _ = &mut deadline => return Err(expired),
         }
-        if let Some(response) = response {
+        {
             let bytes = encode_response(&response).map_err(at(S::ResponseEncode))?;
             let write = tokio::time::timeout(Duration::from_secs(5), writer.write_all(&bytes));
             tokio::pin!(write);
@@ -296,6 +312,17 @@ pub(crate) async fn serve_with_deadline_checked(connection: &mut crate::Connecti
             }
         }
     }
+}
+
+/// R8z-7: consumes the dispatch proof of a request's context when dropped
+/// (its handler ended, was cancelled, or the session ended). The proof is
+/// shared by every clone of that context, so no clone a handler kept can
+/// present it afterwards.
+#[cfg(target_os = "linux")]
+struct RetireDispatchProof(RequestContext);
+#[cfg(target_os = "linux")]
+impl Drop for RetireDispatchProof {
+    fn drop(&mut self) { let _ = self.0.take_dispatch_proof(); }
 }
 
 /// Resolves `Ok(())` at EOF; a read error is `read_failed`.

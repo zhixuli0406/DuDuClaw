@@ -431,6 +431,14 @@ impl CapabilityRecord {
 /// and re-read run, principal and policy authority immediately before I/O.
 pub trait LiveRequestVerifier: Send + Sync {
     fn verify_live(&self, record: &CapabilityRecord, now: u64) -> Result<(), VerificationError>;
+
+    /// R8z-7: consume this context's dispatch proof. `true` exactly once, and
+    /// only for the context D's MCP server produced by the full live
+    /// verification it ran for the request now being dispatched (a
+    /// verification that started after that request's frame was read). The
+    /// server consumes any unused proof when the request's handler ends, so a
+    /// proof never outlives its dispatch. Every other verifier has none.
+    fn take_dispatch_proof(&self) -> bool { false }
 }
 
 #[derive(Clone)]
@@ -471,6 +479,11 @@ impl RequestContext {
             return Err(VerificationError::InvalidTime);
         }
         self.live.as_ref().ok_or(VerificationError::Unavailable)?.verify_live(&self.record, now)
+    }
+    /// R8z-7: see [`LiveRequestVerifier::take_dispatch_proof`]. Single use,
+    /// shared by every clone of this context; record-only contexts have none.
+    pub fn take_dispatch_proof(&self) -> bool {
+        self.live.as_ref().is_some_and(|live| live.take_dispatch_proof())
     }
 }
 

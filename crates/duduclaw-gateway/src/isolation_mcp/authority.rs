@@ -577,6 +577,27 @@ impl GatewayAuthority {
         self.prepared(RunHandle(record.run))?.turn.ok_or(VerificationError::Unavailable)
     }
 
+    /// R8z-7: [`Self::turn`] for a context carrying the MCP server's dispatch
+    /// proof. That server has just run, for this very dispatch and after the
+    /// request was read, the full live verification `turn` would repeat:
+    /// `Boundary::check_live` over this authority's [`LiveAuthority::snapshot`]
+    /// (the same recheck, root Status, users.db re-read and revision fence)
+    /// comparing every field `turn` compares (principal, binding, policy
+    /// revision, `Running`) and more. What is not part of that verification
+    /// stays here: the run's prepared association must still exist (removed
+    /// by `revoke_run`) and carry the same employee, principal, binding and
+    /// revision handle — `snapshot`'s own in-memory checks, with its errors.
+    fn dispatched_turn(&self, context: &RequestContext) -> Result<CapturedTurn, VerificationError> {
+        let record = context.record();
+        let prepared = self.prepared(RunHandle(record.run))?;
+        if prepared.employee != record.employee { return Err(VerificationError::BindingMismatch); }
+        if prepared.principal != record.principal || prepared.binding != record.employee_binding
+            || prepared.revision != record.policy_revision {
+            return Err(VerificationError::Revoked);
+        }
+        prepared.turn.ok_or(VerificationError::Unavailable)
+    }
+
     pub(super) fn delegation_source(&self, context: &RequestContext)
         -> Result<crate::isolation_background::DelegationSource, VerificationError> {
         let turn = self.turn(context)?;
@@ -789,13 +810,27 @@ impl LiveAuthority for GatewayAuthority {
             policy_revision: prepared.revision, agent_slug: prepared.agent })
     }
 }
+/// The resolved form of one captured turn (shared by both resolutions).
+fn resolved_turn(turn: CapturedTurn) -> Result<ResolvedRunTurn, VerificationError> {
+    if turn.turn.is_empty() { return Err(VerificationError::Unavailable); }
+    Ok(ResolvedRunTurn { identity: RunTurnIdentity { turn: turn.turn, approval_session: turn.approval_session },
+        egress_turn: turn.egress_turn,
+        metadata: turn.metadata, principal_context: turn.principal_context, utility_runner: None })
+}
+
 impl RunTurnResolver for GatewayAuthority {
     fn resolve_run(&self, context: &RequestContext) -> Result<ResolvedRunTurn, VerificationError> {
-        let turn = self.turn(context)?;
-        if turn.turn.is_empty() { return Err(VerificationError::Unavailable); }
-        Ok(ResolvedRunTurn { identity: RunTurnIdentity { turn: turn.turn, approval_session: turn.approval_session },
-            egress_turn: turn.egress_turn,
-            metadata: turn.metadata, principal_context: turn.principal_context, utility_runner: None })
+        resolved_turn(self.turn(context)?)
+    }
+    /// R8z-7: before every handler the dispatcher resolved the turn through
+    /// `resolve_run`, i.e. a second full live verification (root ReadBack,
+    /// root Status, policy digest, users.db) right after the server's own for
+    /// the same request. With the server's single-use dispatch proof the
+    /// in-memory part only ([`Self::dispatched_turn`]); without it, exactly
+    /// `resolve_run`.
+    fn resolve_dispatch(&self, context: &RequestContext) -> Result<ResolvedRunTurn, VerificationError> {
+        let turn = if context.take_dispatch_proof() { self.dispatched_turn(context)? } else { self.turn(context)? };
+        resolved_turn(turn)
     }
     fn resolve(&self, context: &RequestContext) -> Result<RunTurnIdentity, VerificationError> {
         let turn = self.turn(context)?;

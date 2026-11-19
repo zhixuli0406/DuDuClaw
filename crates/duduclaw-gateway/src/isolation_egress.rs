@@ -13,6 +13,16 @@ pub trait RunTurnResolver: Send + Sync {
             principal_context: self.principal_context(context)?, utility_runner: self.utility_runner() })
     }
 
+    /// R8z-7: the resolution [`scope`] performs when a request is dispatched.
+    /// The default is [`Self::resolve_run`]. A registry may skip repeating
+    /// the full live verification only when `context.take_dispatch_proof()`
+    /// is `true` (the MCP server ran that verification for this very
+    /// dispatch, after the request was read); without the proof it must do
+    /// everything `resolve_run` does.
+    fn resolve_dispatch(&self, context: &RequestContext) -> Result<ResolvedRunTurn, VerificationError> {
+        self.resolve_run(context)
+    }
+
     fn resolve(&self, context: &RequestContext) -> Result<RunTurnIdentity, VerificationError>;
 
     /// Host-minted execution alias, distinct from the original conversation
@@ -162,7 +172,7 @@ pub async fn scope<F: Future>(home: &Path, agent: &str, context: &RequestContext
     let ResolvedRunTurn { identity, egress_turn, metadata, principal_context: registered, utility_runner } = match resolver {
         Some(resolver) => {
             let context = context.clone();
-            duduclaw_mcp_boundary::authority::verify_blocking(move || resolver.resolve_run(&context)).await?
+            duduclaw_mcp_boundary::authority::verify_blocking(move || resolver.resolve_dispatch(&context)).await?
         }
         // Never register this as a fresh clean turn. Unknown lineage is tainted.
         None => ResolvedRunTurn { identity: RunTurnIdentity {
@@ -333,6 +343,37 @@ mod tests {
             assert_eq!(run_metadata(), Some(RunMetadata::root()));
         }).await.unwrap();
         assert_eq!(resolver.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    /// R8z-7: a dispatch resolves the run's turn through `resolve_dispatch`
+    /// exactly once (the registry decides there whether the server's
+    /// dispatch proof lets it skip its own full verification); a record-only
+    /// context carries no proof.
+    #[tokio::test(flavor = "current_thread")]
+    async fn r8z7_scope_resolves_the_dispatch_once_through_resolve_dispatch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Dispatch { dispatch: AtomicUsize, proofs: AtomicUsize }
+        impl RunTurnResolver for Dispatch {
+            fn resolve(&self, _: &RequestContext) -> Result<RunTurnIdentity, VerificationError> {
+                panic!("scope must use the dispatch resolution")
+            }
+            fn resolve_run(&self, _: &RequestContext) -> Result<ResolvedRunTurn, VerificationError> {
+                panic!("scope must use the dispatch resolution")
+            }
+            fn resolve_dispatch(&self, context: &RequestContext) -> Result<ResolvedRunTurn, VerificationError> {
+                self.dispatch.fetch_add(1, Ordering::Relaxed);
+                if context.take_dispatch_proof() { self.proofs.fetch_add(1, Ordering::Relaxed); }
+                Ok(ResolvedRunTurn { identity: RunTurnIdentity { turn: "host-turn".into(), approval_session: None },
+                    egress_turn: None, metadata: Some(RunMetadata::root()), principal_context: None, utility_runner: None })
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        let resolver = Arc::new(Dispatch { dispatch: AtomicUsize::new(0), proofs: AtomicUsize::new(0) });
+        scope(home.path(), "main", &context(), Some(resolver.clone()), async {
+            assert_eq!(resolved_identity(), Some(("host-turn".into(), None)));
+        }).await.unwrap();
+        assert_eq!(resolver.dispatch.load(Ordering::Relaxed), 1);
+        assert_eq!(resolver.proofs.load(Ordering::Relaxed), 0, "a record-only context has no dispatch proof");
     }
 
     #[tokio::test]
