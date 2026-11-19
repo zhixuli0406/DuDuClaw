@@ -369,6 +369,101 @@ fn live_request_verifier_fences_effects_after_run_or_policy_change() {
     }
 }
 
+/// R8z-3: a live authority whose principal, binding and agent slug are chosen.
+struct Shaped { principal: Principal, binding: EmployeeBinding, slug: &'static str }
+impl LiveAuthority for Shaped {
+    fn snapshot(&self, employee: EmployeeId, run: RunHandle) -> Result<LiveSnapshot, VerificationError> {
+        Ok(LiveSnapshot { employee, run, control: ControlConnectionId([3; 16]),
+            status: RunStatus::Reserved { expires_at_unix_ms: 130_000 }, principal: self.principal.clone(),
+            binding: self.binding.clone(), policy_revision: 1, agent_slug: self.slug.into() })
+    }
+}
+
+/// R8z-3: every refusal of `issue` names its check, and the error is the
+/// one `issue` returns for the same inputs.
+#[test]
+fn r8z3_issue_refusals_name_their_check_with_the_unchanged_error() {
+    use VerificationError as E;
+    let other = || Text::new("other".into()).unwrap();
+    // (mutation, step, the error the former single condition chain returned;
+    // `None`: whatever `validate_grants` returns).
+    let cases = [(0, IssueStep::LiveSnapshot, Some(E::Unavailable)), (1, IssueStep::NotReserved, Some(E::Invalid)),
+        (2, IssueStep::Reservation, Some(E::BindingMismatch)), (3, IssueStep::Expiry, Some(E::BindingMismatch)),
+        (4, IssueStep::Time, Some(E::BindingMismatch)), (5, IssueStep::Time, Some(E::InvalidTime)),
+        (6, IssueStep::Principal, Some(E::BindingMismatch)), (7, IssueStep::Binding, Some(E::BindingMismatch)),
+        (8, IssueStep::PolicyRevision, Some(E::BindingMismatch)), (9, IssueStep::Grants, None)];
+    for (mode, step, error) in cases {
+        let live = Arc::new(Live(Mutex::new((RunStatus::Reserved { expires_at_unix_ms: 130_000 }, 1, false))));
+        let boundary = Boundary::new(live.clone()).unwrap();
+        let (mut res, mut now) = (reservation(), 100);
+        let grant = || {
+            let mut grant = policy();
+            match mode {
+                6 => grant.principal = Principal::Human { user_id: other(), generation: 1 },
+                7 => grant.binding = EmployeeBinding::Personal(other()),
+                8 => grant.policy_revision = 2,
+                9 => grant.resources = List::new(vec![ResourceGrant::Connector {
+                    account: Text::new("account".into()).unwrap(), binding: EmployeeBinding::Personal(other()) }]).unwrap(),
+                _ => {}
+            }
+            grant
+        };
+        match mode {
+            0 => live.0.lock().unwrap().2 = true,
+            1 => live.0.lock().unwrap().0 = RunStatus::Running,
+            2 => res.control = ControlConnectionId([7; 16]),
+            3 => res.expires_at_unix_ms = 130_001,
+            4 => now = 130,
+            5 => now = u64::MAX,
+            _ => {}
+        }
+        let (refused, checked) = boundary.issue_checked(&res, grant(), now).err().unwrap();
+        assert_eq!(refused, step, "mode {mode}");
+        if let Some(error) = error { assert_eq!(checked, error, "mode {mode}"); }
+        assert_eq!(boundary.issue(&res, grant(), now).err(), Some(checked), "mode {mode}");
+    }
+    // The second capability for one run.
+    let (boundary, _, _) = setup();
+    assert_eq!(boundary.issue_checked(&reservation(), policy(), 100).err(),
+        Some((IssueStep::Duplicate, VerificationError::Invalid)));
+    // Slug and binding/principal admission come from the live snapshot.
+    let tenant = |name: &str| Text::new(name.to_owned()).unwrap();
+    for (shaped, step) in [
+        (Shaped { principal: principal(), binding: binding(), slug: "../x" }, IssueStep::AgentSlug),
+        (Shaped { principal: Principal::Background { tenant_id: tenant("a"), generation: 1 },
+            binding: EmployeeBinding::Shared(tenant("b")), slug: "alice" }, IssueStep::BindingPrincipal),
+    ] {
+        let mut grant = policy();
+        grant.principal = shaped.principal.clone();
+        grant.binding = shaped.binding.clone();
+        let boundary = Boundary::new(Arc::new(shaped)).unwrap();
+        assert_eq!(boundary.issue_checked(&reservation(), grant, 100).err(),
+            Some((step, VerificationError::BindingMismatch)));
+    }
+}
+
+/// R8z-3: refusals of the capability activation name their check.
+#[test]
+fn r8z3_activation_refusals_name_their_check() {
+    use BoundaryActivateStep as S;
+    // Reserved, not Running: the live check refuses (and revokes).
+    let (boundary, _, id) = setup();
+    assert_eq!(boundary.activate_inner_checked(id, &reservation(), 101).err().map(|r| r.0), Some(S::LiveMismatch));
+    let (boundary, live, id) = setup();
+    live.0.lock().unwrap().0 = RunStatus::Running;
+    assert_eq!(boundary.activate_inner_checked(CapabilityId(Sha256Digest([9; 32])), &reservation(), 101).err().map(|r| r.0),
+        Some(S::Unknown));
+    let mut other = reservation();
+    other.run = RunHandle(RunId([7; 16]));
+    assert_eq!(boundary.activate_inner_checked(id, &other, 101).err(), Some((S::Binding, VerificationError::BindingMismatch)));
+    assert_eq!(boundary.activate_inner_checked(id, &reservation(), 200).err(), Some((S::Time, VerificationError::InvalidTime)));
+    let (boundary, live, id) = setup();
+    live.0.lock().unwrap().0 = RunStatus::Running;
+    live.0.lock().unwrap().2 = true;
+    assert_eq!(boundary.activate_inner_checked(id, &reservation(), 101).err(),
+        Some((S::LiveSnapshot, VerificationError::Unavailable)));
+}
+
 #[test]
 fn detached_context_has_no_live_io_authority() {
     let (boundary, _, id) = setup();

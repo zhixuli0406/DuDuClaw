@@ -252,12 +252,13 @@ sudo journalctl -u duduclaw-gateway.service --no-pager | grep -E 'isolated (spaw
 | 予約後、開始前 | `launch_prepare`、`policy_binding`、`task_binding`、`pty_size` | 保護された起動コンテキストが拒否した（ゲートウェイによるこの実行の権限の再確認、またはツール境界による実行用権限の発行。準備状態、社員の所属、ランタイムの MCP 登録を確認）。準備した計画が予約した実行と一致しない。予約の終了後にタスクを結び付けた。端末サイズが無効。 |
 | 開始の依頼の作成 | `admission`、`workspace_delivery`、`workspace`、`entry`、`reservation_state`、`resource_limits`、`inputs`、`attachments`、`request_invalid`、`connection_state`、`live_check`、`fd_plan` | 準備状態が変わった。ワークスペースの証明が一致しない。計画が社員自身以外のワークスペースを指定している。実行が不明、別の社員のもの、開始済み、または 30 秒の予約が期限切れ。ランタイムの記録で出力または入力の上限が 0。入力が上限を超えた。添付が多すぎる。依頼が無効（例：ステップ上限が 1〜1000 の範囲外）。制御接続が閉じている。権限の即時確認が拒否した。記述子の構成が一致しない。 |
 | 送信後 | `admission_after_send`、`start_reply` | 開始の依頼の送信中に準備状態が変わった（実行は取り消されます）。想定外の応答。 |
+| 開始後、ツールの提供前 | `launch_activate` | 保護された起動コンテキストがこの実行の MCP エンドポイントを拒否した（下の `isolated launch activation refused` を参照）。開始済みの実行は取り消され、実行用権限も無効化されます。 |
 | その他の制御依頼 | `cancel_state`、`live_status_reservation`、`work_op`、`helper_op` | 取り消しが中断済み、または既に拒否された。状態の応答が別の予約を指している。その経路では許可されていない操作。 |
 
 `step` が `launch_prepare` のとき、ゲートウェイはその直前にもう 1 件、警告 `isolated launch preparation refused` を記録します。フィールドは拒否した確認を示す固定の `step` だけです（識別子、パス、内容は含みません）。そのターンの `isolated run not started` の行には `spawn.backend.denied` ではなく `site="launch.bind.<step>"` が表示されます。
 
 ```sh
-sudo journalctl -u duduclaw-gateway.service --no-pager | grep -E 'isolated (launch preparation refused|spawn refused locally|run not started)'
+sudo journalctl -u duduclaw-gateway.service --no-pager | grep -E 'isolated (launch (preparation|activation) refused|spawn refused locally|run not started)'
 ```
 
 | `step` | 意味 |
@@ -273,8 +274,39 @@ sudo journalctl -u duduclaw-gateway.service --no-pager | grep -E 'isolated (laun
 | `binding_mismatch` | 隔離サービスが、この実行を別の社員のもの、またはもう予約状態ではないと報告した。 |
 | `revoked_before`、`revoked_after` | 準備中に実行が取り消された（例：ターンが停止された）。 |
 | `verify_blocking` | 権限確認用のブロッキング処理プールが 2 秒間空かなかった、または確認に 10 秒以上かかった（`users.db`／`apply.db` や root の読み戻しが遅い）。 |
-| `inner_prepare.<class>` | ツール境界が実行用権限の発行を拒否した。`<class>` は `unavailable`、`denied`、`would_deadlock`、`not_found`、`timeout`、`io`、`protocol` のいずれか（`denied`：予約が終了した、計画が実行と一致しない、またはランタイムの MCP 登録や権限の発行が拒否された）。 |
 | `prepared_missing`、`state_lock`、`associations` | 同じ起動が 2 回準備された、状態が壊れた、またはゲートウェイの結び付け済み実行の表（4096 件）が満杯か既にこの実行を含んでいる。不具合なので報告してください。 |
+
+ゲートウェイ自身の確認を通過すると、ツール境界がこの実行を登録します（`inner_prepare.<substep>`）。各ステップ：
+
+| `step` | 確認すること |
+| --- | --- |
+| `inner_prepare.revoked`、`inner_prepare.revoked_after` | ツール境界の準備中に実行が取り消された。 |
+| `inner_prepare.reservation.<class>`（`unavailable`、`denied`、`would_deadlock`、`not_found`、`timeout`、`io`、`protocol`） | ゲートウェイが持つ予約の記録：`denied` は 30 秒の予約の期限切れ、制御接続が閉じた、または開始済み。`not_found` はこのゲートウェイが実行を知らない。 |
+| `inner_prepare.plan_class`、`inner_prepare.plan_runtime`、`inner_prepare.plan_pty` | このターン用に準備した計画の実行クラス、ランタイム、端末モードが実際の起動と一致しない。不具合なので報告してください。 |
+| `inner_prepare.registry.publication_read`、`inner_prepare.registry.generation` | ゲートウェイが root のランタイム公開情報 `/run/duduclaw-spawnd/publication.json` を読めない（所有者、グループ、権限、別の起動、または 1 秒の有効期間切れ：`duduclaw-spawnd` が動作し停止していないか確認）、または別のインストール済み世代を指している（更新後はゲートウェイを再起動）。 |
+| `inner_prepare.registry.runtime_missing`、`.runtime_duplicate`、`.mcp_disabled`、`.script_executable` | 公開情報にこのランタイムの記録がない（または 2 件ある）、記録が `mcp: false`、または実行ファイルがスクリプト：インストール済みの署名ポリシーがこのランタイムをツール付きで提供していない。 |
+| `inner_prepare.registry.acceptance_missing` | インストール済みバンドルにこのランタイムの MCP 受け入れ記録がない：`--accept-mcp` でビルドしたバンドルをインストールしてください。 |
+| `inner_prepare.registry.acceptance.<check>`（`runtime`、`version`、`runtime_digest`、`bridge_digest`、`projection_digest`、`inherited_fd`、`initialize_exit`、`parent_exec_exit`、`mcp_child_exec_exit`、`exclusive_config_exit`、`transcript_digest`）、`inner_prepare.registry.projection_invalid`、`inner_prepare.registration_runtime`、`inner_prepare.projection` | インストール済みバンドルの MCP 受け入れ記録が公開されたランタイムと一致しない（別のランタイムのバイナリ、バージョン、ブリッジ、または別リリースのポリシーツールで受け入れた）。一致するバンドルを再インストールしてください。そのバンドルに `duduclaw-isolation-policy verify` を実行すると同じ確認が示されます。 |
+| `inner_prepare.issue.live_snapshot` | 実行用権限の発行時の即時の再確認が失敗した（原因は上の `recheck.*` と `live_snapshot` と同じ）。 |
+| `inner_prepare.issue.not_reserved`、`.reservation`、`.expiry`、`.time` | 隔離サービスがこの予約をもう予約中と報告しない、または予約が期限切れ（システム時計のずれの後にも表れます）。 |
+| `inner_prepare.issue.principal`、`.binding`、`.policy_revision`、`.agent_slug`、`.binding_principal` | ターンで取得した権限が現在の権限と異なる（その人、社員の所属、ポリシーが途中で変わった）、またはその人がこの社員の所属のもとで行動できない。 |
+| `inner_prepare.issue.grants` | このターンのリソース権限（ワークスペース、コネクタ、Web の接続先）がこの社員には認められない。 |
+| `inner_prepare.issue.encode`、`.random`、`.signer`、`.state_lock`、`.capacity`、`.duplicate`、`inner_prepare.employee_mismatch`、`.prepared_missing`、`.state_lock`、`.pending_duplicate`、`.argv`、`.clock`、`.registry.unreported` | OS の乱数源またはシステム時計の失敗、または不具合（報告してください）。 |
+| `inner_prepare.verify_blocking` | 上の `verify_blocking` と同じ（ツール境界のブロッキング確認）。 |
+
+実行の開始後、ツール境界はその MCP エンドポイントを有効にします。ここで拒否されると `isolated launch activation refused`（固定の `step`：`inner_activate.<substep>` のみ）が記録され、続いて `isolated spawn refused locally step="launch_activate"` が記録されます。ターンの site は `launch.activate.<step>` です。開始済みの実行は取り消され、実行用権限も無効化されます。
+
+| `step` | 確認すること |
+| --- | --- |
+| `inner_activate.mcp_fd_missing`、`inner_activate.mcp_receipt.<class>` | 隔離サービスがこの実行の MCP エンドポイントを渡さなかった（実行が早く終了した、または I/O の受け渡しがない）。`duduclaw-spawnd` のジャーナルを確認してください。 |
+| `inner_activate.bridge.registry.*` | 上の `inner_prepare.registry.*` と同じ（開始後に読み直したもの）。 |
+| `inner_activate.bridge.publish.*`（上の `registry` の名前）、`.publish.policy`、`.publish.derive`、`.publish.record`、`.publish.registration_changed` | 準備から有効化までの間に公開情報が変わった（更新または利用権の変更）、またはこの社員にこのランタイムがもう提供されていない。 |
+| `inner_activate.bridge.publish.run_receipt_read` | root の実行ごとの MCP 受領記録 `/run/duduclaw-spawnd/mcp-<run>.json` がない、別の起動のもの、または 60 秒より古い。`duduclaw-spawnd` のジャーナルを確認してください。 |
+| `inner_activate.bridge.publish.receipt.<group>`（`generation`、`run`、`employee`、`runtime`、`digests`、`projection_digest`、`mount`、`acceptance`）、`inner_activate.bridge.receipt_binding`、`.bridge.registration_runtime`、`.bridge.projection`、`inner_activate.projection_digest` | マウントしたツール設定の root による読み戻しが、この実行用に準備したものと一致しない。一致するバンドルを再インストールし、続く場合は報告してください。 |
+| `inner_activate.bridge.platform` | Linux ではない。 |
+| `inner_activate.boundary_activate.live_mismatch`、`.live_snapshot`、`.time` | エンドポイントが届いた時点で実行がもう動作中でない、その人の権限が変わった、即時確認が失敗した、または実行用権限が期限切れ。 |
+| `inner_activate.delivery`、`.receipt_control`、`.boundary_activate.delivery`、`.boundary_activate.unknown`、`.boundary_activate.binding`、`.boundary_activate.revoked`、`inner_activate.pending_missing`、`.revoked_after`、`.active_duplicate` | エンドポイントがこの実行の予約のものではない、または途中で実行が取り消された。それ以外は不具合。 |
+| `inner_activate.boundary_activate.random`、`.boundary_activate.state_lock`、`inner_activate.state_lock`、`.clock`、`.verify_blocking` | OS の乱数源、システム時計、ブロッキング確認のプールの失敗、または不具合。 |
 
 保護モードでは、拒否された作業の原因を文面から判定できない場合、末尾の理由コードは `unknown` ではなく `safety_gate` になります。
 

@@ -5,6 +5,7 @@ use hmac::{Hmac, Mac};
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
+pub use crate::launch_steps::{BoundaryActivateStep, IssueStep};
 
 type HmacSha256 = Hmac<Sha256>;
 const MAX_RECORDS: usize = 4096;
@@ -118,40 +119,56 @@ impl Boundary {
 
     pub fn issue(&self, reservation: &Reservation, policy: GrantPolicy, now: u64)
         -> Result<CapabilityId, VerificationError> {
-        let snapshot = self.live.snapshot(reservation.employee, reservation.run)?;
+        self.issue_checked(reservation, policy, now).map_err(|(_, error)| error)
+    }
+
+    /// R8z-3: [`Self::issue`] with the fixed check that refused. The checks,
+    /// their order and every returned error are exactly `issue`'s (the former
+    /// single condition chain is split in its own order).
+    pub fn issue_checked(&self, reservation: &Reservation, policy: GrantPolicy, now: u64)
+        -> Result<CapabilityId, (IssueStep, VerificationError)> {
+        let mismatch = |step: IssueStep| (step, VerificationError::BindingMismatch);
+        let snapshot = self.live.snapshot(reservation.employee, reservation.run)
+            .map_err(|error| (IssueStep::LiveSnapshot, error))?;
         let RunStatus::Reserved { expires_at_unix_ms } = snapshot.status else {
-            return Err(VerificationError::Invalid);
+            return Err((IssueStep::NotReserved, VerificationError::Invalid));
         };
         if snapshot.employee != reservation.employee || snapshot.run != reservation.run
-            || snapshot.control != reservation.control
-            || expires_at_unix_ms != reservation.expires_at_unix_ms
-            || now.checked_mul(1000).ok_or(VerificationError::InvalidTime)? >= expires_at_unix_ms
-            || snapshot.principal != policy.principal || snapshot.binding != policy.binding
-            || snapshot.policy_revision != policy.policy_revision || !valid_slug(&snapshot.agent_slug)
-            || !binding_matches(&policy.binding, &policy.principal) {
-            return Err(VerificationError::BindingMismatch);
+            || snapshot.control != reservation.control {
+            return Err(mismatch(IssueStep::Reservation));
         }
-        let bearer = Zeroizing::new(random::<32>()?);
+        if expires_at_unix_ms != reservation.expires_at_unix_ms { return Err(mismatch(IssueStep::Expiry)); }
+        if now.checked_mul(1000).ok_or((IssueStep::Time, VerificationError::InvalidTime))? >= expires_at_unix_ms {
+            return Err(mismatch(IssueStep::Time));
+        }
+        if snapshot.principal != policy.principal { return Err(mismatch(IssueStep::Principal)); }
+        if snapshot.binding != policy.binding { return Err(mismatch(IssueStep::Binding)); }
+        if snapshot.policy_revision != policy.policy_revision { return Err(mismatch(IssueStep::PolicyRevision)); }
+        if !valid_slug(&snapshot.agent_slug) { return Err(mismatch(IssueStep::AgentSlug)); }
+        if !binding_matches(&policy.binding, &policy.principal) { return Err(mismatch(IssueStep::BindingPrincipal)); }
+        let random_step = |error: VerificationError| (IssueStep::Random, error);
+        let bearer = Zeroizing::new(random::<32>().map_err(random_step)?);
         let id = CapabilityId(Sha256Digest(Sha256::digest(bearer.as_ref()).into()));
         let record = CapabilityRecord {
             id, employee: reservation.employee, run: reservation.run.0, task: policy.task,
             principal: policy.principal, employee_binding: policy.binding, lane: policy.lane,
             tools: policy.tools, resources: policy.resources, policy_revision: policy.policy_revision,
             gateway_epoch: self.epoch, issued_at: now, not_before: policy.not_before,
-            expires_at: policy.expires_at, nonce: random()?, jti: random()?,
+            expires_at: policy.expires_at, nonce: random().map_err(random_step)?, jti: random().map_err(random_step)?,
         };
-        crate::resources::validate_grants(&record)?;
-        let bytes = record.canonical_bytes().map_err(|_| VerificationError::Invalid)?;
-        let mut signer = HmacSha256::new_from_slice(self.key.as_ref()).map_err(|_| VerificationError::Unavailable)?;
+        crate::resources::validate_grants(&record).map_err(|error| (IssueStep::Grants, error))?;
+        let bytes = record.canonical_bytes().map_err(|_| (IssueStep::Encode, VerificationError::Invalid))?;
+        let mut signer = HmacSha256::new_from_slice(self.key.as_ref())
+            .map_err(|_| (IssueStep::Signer, VerificationError::Unavailable))?;
         signer.update(&bytes);
         let mac = signer.finalize().into_bytes().into();
-        let mut entries = self.entries.lock().map_err(|_| VerificationError::Unavailable)?;
+        let mut entries = self.entries.lock().map_err(|_| (IssueStep::StateLock, VerificationError::Unavailable))?;
         entries.retain(|_, e| {
             if e.record.expires_at > now { true } else { e.revoke(); false }
         });
-        if entries.len() >= MAX_RECORDS || entries.contains_key(&id.0)
-            || entries.values().any(|entry| entry.record.run == record.run) {
-            return Err(VerificationError::Invalid);
+        if entries.len() >= MAX_RECORDS { return Err((IssueStep::Capacity, VerificationError::Invalid)); }
+        if entries.contains_key(&id.0) || entries.values().any(|entry| entry.record.run == record.run) {
+            return Err((IssueStep::Duplicate, VerificationError::Invalid));
         }
         entries.insert(id.0, Entry { record, mac, control: reservation.control,
             agent_slug: snapshot.agent_slug, state: State::Pending, revoked: tokio::sync::watch::channel(false).0 });
@@ -159,14 +176,22 @@ impl Boundary {
     }
 
     fn check_live(&self, entry: &Entry, now: u64) -> Result<(), VerificationError> {
+        self.check_live_checked(entry, now).map_err(|(_, error)| error)
+    }
+
+    /// R8z-3: [`Self::check_live`] with the fixed check that refused.
+    fn check_live_checked(&self, entry: &Entry, now: u64) -> Result<(), (BoundaryActivateStep, VerificationError)> {
         let r = &entry.record;
-        if now < r.not_before || now >= r.expires_at { return Err(VerificationError::InvalidTime); }
-        let live = self.live.snapshot(r.employee, RunHandle(r.run))?;
+        if now < r.not_before || now >= r.expires_at {
+            return Err((BoundaryActivateStep::Time, VerificationError::InvalidTime));
+        }
+        let live = self.live.snapshot(r.employee, RunHandle(r.run))
+            .map_err(|error| (BoundaryActivateStep::LiveSnapshot, error))?;
         if live.employee != r.employee || live.run.0 != r.run || live.control != entry.control
             || live.principal != r.principal || live.binding != r.employee_binding
             || live.policy_revision != r.policy_revision || live.agent_slug != entry.agent_slug
             || !matches!(live.status, RunStatus::Running) {
-            return Err(VerificationError::Revoked);
+            return Err((BoundaryActivateStep::LiveMismatch, VerificationError::Revoked));
         }
         Ok(())
     }
@@ -177,30 +202,45 @@ impl Boundary {
     #[cfg(target_os = "linux")]
     pub fn activate(self: &Arc<Self>, id: CapabilityId, reservation: &Reservation,
         delivery: crate::socket::McpDelivery, now: u64) -> Result<Connection, VerificationError> {
+        self.activate_checked(id, reservation, delivery, now).map_err(|(_, error)| error)
+    }
+
+    /// R8z-3: [`Self::activate`] with the fixed check that refused (same
+    /// checks, order, errors and revocation as `activate`).
+    #[cfg(target_os = "linux")]
+    pub fn activate_checked(self: &Arc<Self>, id: CapabilityId, reservation: &Reservation,
+        delivery: crate::socket::McpDelivery, now: u64) -> Result<Connection, (BoundaryActivateStep, VerificationError)> {
         if delivery.run != reservation.run || delivery.control != reservation.control {
-            return Err(VerificationError::BindingMismatch);
+            return Err((BoundaryActivateStep::Delivery, VerificationError::BindingMismatch));
         }
-        let mut connection = self.activate_inner(id, reservation, now)?;
+        let mut connection = self.activate_inner_checked(id, reservation, now)?;
         connection.socket = Some(delivery.socket);
         Ok(connection)
     }
 
-    #[cfg(any(target_os = "linux", test))]
+    #[cfg(test)]
     fn activate_inner(self: &Arc<Self>, id: CapabilityId, reservation: &Reservation, now: u64)
         -> Result<Connection, VerificationError> {
-        let snapshot = self.entries.lock().map_err(|_| VerificationError::Unavailable)?
-            .get(&id.0).cloned().ok_or(VerificationError::Invalid)?;
+        self.activate_inner_checked(id, reservation, now).map_err(|(_, error)| error)
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    fn activate_inner_checked(self: &Arc<Self>, id: CapabilityId, reservation: &Reservation, now: u64)
+        -> Result<Connection, (BoundaryActivateStep, VerificationError)> {
+        use BoundaryActivateStep as S;
+        let snapshot = self.entries.lock().map_err(|_| (S::StateLock, VerificationError::Unavailable))?
+            .get(&id.0).cloned().ok_or((S::Unknown, VerificationError::Invalid))?;
         if snapshot.state != State::Pending || snapshot.record.run != reservation.run.0
             || snapshot.record.employee != reservation.employee || snapshot.control != reservation.control {
-            return Err(VerificationError::BindingMismatch);
+            return Err((S::Binding, VerificationError::BindingMismatch));
         }
         // Never call the external live store while holding the capability lock.
-        let live = self.check_live(&snapshot, now);
-        let nonce = random()?;
-        let mut entries = self.entries.lock().map_err(|_| VerificationError::Unavailable)?;
-        let entry = entries.get_mut(&id.0).ok_or(VerificationError::Revoked)?;
-        if entry.state != State::Pending { return Err(VerificationError::Revoked); }
-        if let Err(error) = live { entry.revoke(); return Err(error); }
+        let live = self.check_live_checked(&snapshot, now);
+        let nonce = random().map_err(|error| (S::Random, error))?;
+        let mut entries = self.entries.lock().map_err(|_| (S::StateLock, VerificationError::Unavailable))?;
+        let entry = entries.get_mut(&id.0).ok_or((S::Revoked, VerificationError::Revoked))?;
+        if entry.state != State::Pending { return Err((S::Revoked, VerificationError::Revoked)); }
+        if let Err(refusal) = live { entry.revoke(); return Err(refusal); }
         entry.state = State::Active(nonce);
         Ok(Connection { boundary: self.clone(), id, nonce,
             #[cfg(target_os = "linux")] socket: None })

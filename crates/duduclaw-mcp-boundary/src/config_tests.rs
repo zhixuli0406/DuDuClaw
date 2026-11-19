@@ -181,6 +181,23 @@ fn runtime_preparation_refuses_every_missing_or_mismatched_readback() {
     assert!(prepare_runtime_bridge(&Registry { fault: 0 }, &RuntimeKind::Claude, run, employee).is_err());
 }
 
+/// R8z-3: each refusal of the bridge preparation names its step; the error
+/// is the one `prepare` returns.
+#[test]
+fn r8z3_bridge_preparation_names_the_refusing_step() {
+    let run = RunHandle(RunId([3; 16]));
+    let employee = EmployeeId([4; 16]);
+    for fault in 1..=13u8 {
+        let expected = if fault == 1 { BridgeStep::Registry(RegistrationStep::Unreported) } else { BridgeStep::ReceiptBinding };
+        let (step, error) = prepare_checked(&Registry { fault }, &RuntimeKind::Claude, run, employee).err().unwrap();
+        assert_eq!(step, expected, "fault {fault}");
+        assert_eq!(Err(error), prepare(&Registry { fault }, &RuntimeKind::Claude, run, employee).map(|_| ()), "fault {fault}");
+    }
+    #[cfg(not(target_os = "linux"))]
+    assert!(matches!(prepare_runtime_bridge_checked(&Registry { fault: 0 }, &RuntimeKind::Claude, run, employee),
+        Err((BridgeStep::Platform, VerificationError::Unavailable))));
+}
+
 #[test]
 fn native_cli_projections_have_closed_names_and_exact_adapter_protocols() {
     for (kind, protocol, names) in [

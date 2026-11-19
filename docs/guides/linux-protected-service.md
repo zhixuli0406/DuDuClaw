@@ -252,12 +252,13 @@ sudo journalctl -u duduclaw-gateway.service --no-pager | grep -E 'isolated (spaw
 | Between reservation and start | `launch_prepare`, `policy_binding`, `task_binding`, `pty_size` | The protected launch context refused (the gateway re-checking the person's authority for this run, or the tool boundary issuing the run's capability: readiness, the employee's binding, the runtime's MCP registration); the prepared plan does not match the reserved run; the task was bound after the reservation ended; an invalid terminal size. |
 | Building the start request | `admission`, `workspace_delivery`, `workspace`, `entry`, `reservation_state`, `resource_limits`, `inputs`, `attachments`, `request_invalid`, `connection_state`, `live_check`, `fd_plan` | Readiness changed; the workspace proof does not match; the plan names a workspace other than the employee's own; the run is unknown, belongs to another employee, was already started or its 30-second reservation expired; the runtime record has a zero output or input budget; the request exceeds the input budget; too many attachments; the request is invalid (for example a step limit outside 1–1000); the control connection is closed; the live authority check refused; the descriptor plan does not match. |
 | After sending it | `admission_after_send`, `start_reply` | Readiness changed while the start was in flight (the run is cancelled); an unexpected reply. |
+| After start, before the run's tools are served | `launch_activate` | The protected launch context refused the run's MCP endpoint (see `isolated launch activation refused`, below). The started run is cancelled and its capability revoked. |
 | Other control requests | `cancel_state`, `live_status_reservation`, `work_op`, `helper_op` | A cancel abandoned or already refused; a status reply naming another reservation; an operation not allowed on that path. |
 
 When the step is `launch_prepare`, the gateway logs one more warning just before it, `isolated launch preparation refused`, with one fixed field `step` naming the check that refused (no identifiers, paths or content). The turn's `isolated run not started` line then shows `site="launch.bind.<step>"` instead of `spawn.backend.denied`.
 
 ```sh
-sudo journalctl -u duduclaw-gateway.service --no-pager | grep -E 'isolated (launch preparation refused|spawn refused locally|run not started)'
+sudo journalctl -u duduclaw-gateway.service --no-pager | grep -E 'isolated (launch (preparation|activation) refused|spawn refused locally|run not started)'
 ```
 
 | `step` | What it means |
@@ -273,8 +274,39 @@ sudo journalctl -u duduclaw-gateway.service --no-pager | grep -E 'isolated (laun
 | `binding_mismatch` | The isolation service reports the run for another employee, or no longer in the reserved state. |
 | `revoked_before`, `revoked_after` | The run was cancelled while it was being prepared (for example the turn was stopped). |
 | `verify_blocking` | The gateway's pool for blocking authority checks stayed busy for 2 s, or the check took longer than 10 s (slow `users.db`/`apply.db` or root read-back). |
-| `inner_prepare.<class>` | The tool boundary refused to issue the run's capability; `<class>` is `unavailable`, `denied`, `would_deadlock`, `not_found`, `timeout`, `io` or `protocol` (`denied`: the reservation ended, the plan does not match the run, or the runtime's MCP registration or capability issuance refused). |
 | `prepared_missing`, `state_lock`, `associations` | The launch was prepared twice, its state was poisoned, or the gateway's table of bound runs (4096) is full or already holds the run: a defect, please report it. |
+
+After the gateway's own checks pass, the tool boundary registers the run (`inner_prepare.<substep>`); its steps:
+
+| `step` | What to check |
+| --- | --- |
+| `inner_prepare.revoked`, `inner_prepare.revoked_after` | The run was cancelled while the tool boundary prepared it. |
+| `inner_prepare.reservation.<class>` (`unavailable`, `denied`, `would_deadlock`, `not_found`, `timeout`, `io`, `protocol`) | The gateway's record of the reservation: `denied` — the 30-second reservation expired, its control connection closed, or it was already started; `not_found` — the run is unknown to this gateway. |
+| `inner_prepare.plan_class`, `inner_prepare.plan_runtime`, `inner_prepare.plan_pty` | The plan prepared for this turn names another execution class, runtime or terminal mode than the spawn: a defect, please report it. |
+| `inner_prepare.registry.publication_read`, `inner_prepare.registry.generation` | The gateway could not read root's runtime publication `/run/duduclaw-spawnd/publication.json` (owner, group, mode, other boot, or older than its 1-second validity: check that `duduclaw-spawnd` is running and not stalled), or it names another installed generation (restart the gateway after an update). |
+| `inner_prepare.registry.runtime_missing`, `.runtime_duplicate`, `.mcp_disabled`, `.script_executable` | The publication has no (or two) records for this runtime, the record has `mcp: false`, or its executable is a script: the installed signed policy does not offer this runtime with tools. |
+| `inner_prepare.registry.acceptance_missing` | The installed bundle has no MCP acceptance record for this runtime: install a bundle built with `--accept-mcp`. |
+| `inner_prepare.registry.acceptance.<check>` (`runtime`, `version`, `runtime_digest`, `bridge_digest`, `projection_digest`, `inherited_fd`, `initialize_exit`, `parent_exec_exit`, `mcp_child_exec_exit`, `exclusive_config_exit`, `transcript_digest`), `inner_prepare.registry.projection_invalid`, `inner_prepare.registration_runtime`, `inner_prepare.projection` | The installed bundle's MCP acceptance record does not match the published runtime (it was accepted for another runtime binary, version or bridge, or by another release's policy tool). Reinstall the matching bundle; `duduclaw-isolation-policy verify` on the bundle names the same check. |
+| `inner_prepare.issue.live_snapshot` | The live authority re-check at capability issuance failed (same causes as `recheck.*` and `live_snapshot` above). |
+| `inner_prepare.issue.not_reserved`, `.reservation`, `.expiry`, `.time` | The isolation service no longer reports this exact reservation as reserved, or it expired (also after a system clock jump). |
+| `inner_prepare.issue.principal`, `.binding`, `.policy_revision`, `.agent_slug`, `.binding_principal` | The authority captured for the turn differs from the live one (the person, the employee's binding or the policy changed meanwhile), or the person may not act for this employee's binding. |
+| `inner_prepare.issue.grants` | The turn's resource grants (workspace, connectors, web origins) are refused for this employee. |
+| `inner_prepare.issue.encode`, `.random`, `.signer`, `.state_lock`, `.capacity`, `.duplicate`, `inner_prepare.employee_mismatch`, `.prepared_missing`, `.state_lock`, `.pending_duplicate`, `.argv`, `.clock`, `.registry.unreported` | The OS random source or the wall clock failed, or a defect (please report it). |
+| `inner_prepare.verify_blocking` | As `verify_blocking` above, for the tool boundary's blocking checks. |
+
+After the run has started, the tool boundary activates its MCP endpoint. A refusal there logs `isolated launch activation refused` with one fixed `step` (`inner_activate.<substep>`), then `isolated spawn refused locally step="launch_activate"`; the turn's site is `launch.activate.<step>`. The started run is cancelled and the run's capability revoked.
+
+| `step` | What to check |
+| --- | --- |
+| `inner_activate.mcp_fd_missing`, `inner_activate.mcp_receipt.<class>` | The isolation service did not hand over the run's MCP endpoint (the run ended early, or its I/O handoff is missing). Check the `duduclaw-spawnd` journal. |
+| `inner_activate.bridge.registry.*` | As `inner_prepare.registry.*` above, read again after the start. |
+| `inner_activate.bridge.publish.*` (the `registry` names above), `.publish.policy`, `.publish.derive`, `.publish.record`, `.publish.registration_changed` | The publication changed between preparation and activation (an update or an entitlement change), or no longer offers this runtime to this employee. |
+| `inner_activate.bridge.publish.run_receipt_read` | Root's per-run MCP receipt `/run/duduclaw-spawnd/mcp-<run>.json` is missing, from another boot, or older than 60 s. Check the `duduclaw-spawnd` journal. |
+| `inner_activate.bridge.publish.receipt.<group>` (`generation`, `run`, `employee`, `runtime`, `digests`, `projection_digest`, `mount`, `acceptance`), `inner_activate.bridge.receipt_binding`, `.bridge.registration_runtime`, `.bridge.projection`, `inner_activate.projection_digest` | Root's read-back of the mounted tool configuration does not match what was prepared for this run. Reinstall the matching bundle; if it persists, report it. |
+| `inner_activate.bridge.platform` | Not Linux. |
+| `inner_activate.boundary_activate.live_mismatch`, `.live_snapshot`, `.time` | When the endpoint arrived the run was no longer running, the person's authority had changed, the live check failed, or the capability had expired. |
+| `inner_activate.delivery`, `.receipt_control`, `.boundary_activate.delivery`, `.boundary_activate.unknown`, `.boundary_activate.binding`, `.boundary_activate.revoked`, `inner_activate.pending_missing`, `.revoked_after`, `.active_duplicate` | The endpoint does not belong to this run's reservation, or the run was cancelled meanwhile; otherwise a defect. |
+| `inner_activate.boundary_activate.random`, `.boundary_activate.state_lock`, `inner_activate.state_lock`, `.clock`, `.verify_blocking` | The OS random source, the wall clock or the blocking-check pool failed, or a defect. |
 
 In protected mode, a refused turn whose cause the text classifier cannot name ends with the reason code `safety_gate` instead of `unknown`.
 
