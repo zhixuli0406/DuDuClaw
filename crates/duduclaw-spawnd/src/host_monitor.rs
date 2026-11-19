@@ -143,13 +143,20 @@ impl Monitor {
     }
 }
 pub(super) struct ScanReader { pub(super) state: Arc<Mutex<ScanState>>, pub(super) entries: Arc<Mutex<Vec<ScanEntry>>> }
-impl Scan for ScanReader {
-    fn health(&mut self, employee: EmployeeId) -> Result<()> {
-        let state = self.state.try_lock().map_err(|_| unavailable())?;
-        if !scan_fresh(Instant::now(), state.at, SCAN_PERIOD) { return Err(unavailable()); }
-        if state.result.as_ref().map_err(|e| *e)?.contains(&employee) { return Err(unavailable()); }
+impl ScanReader {
+    /// R8y: `health` with the gate that refused (same codes).
+    pub(super) fn health_step(&mut self, employee: EmployeeId) -> crate::start_refusal::Labelled<()> {
+        use crate::start_refusal::{gate, Gate};
+        let state = self.state.try_lock().map_err(|_| gate(Gate::ScanBusy)(unavailable()))?;
+        if !scan_fresh(Instant::now(), state.at, SCAN_PERIOD) { return Err(gate(Gate::ScanStale)(unavailable())); }
+        if state.result.as_ref().map_err(|e| gate(Gate::ScanFailed)(*e))?.contains(&employee) {
+            return Err(gate(Gate::Intruder)(unavailable()));
+        }
         Ok(())
     }
+}
+impl Scan for ScanReader {
+    fn health(&mut self, employee: EmployeeId) -> Result<()> { self.health_step(employee).map_err(crate::start_refusal::Refusal::code) }
     fn register(&mut self, run: RunHandle, employee: EmployeeId, startup_ms: u64) -> Result<()> {
         let mut entries = self.entries.try_lock().map_err(|_| unavailable())?;
         let entry = entries.iter_mut().find(|v| v.account.employee == employee).ok_or_else(unavailable)?;

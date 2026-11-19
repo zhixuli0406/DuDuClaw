@@ -269,6 +269,33 @@ duduclaw-spawnd: allocation failed: step=<label>
 
 `at` 套件可以保留：spawnd 以 root 直接讀取它的 spool，從不執行 `/usr/bin/at`。不要為了消除紀錄而手動修改 deny 檔、spool 或帳號。修正原因後，下一次更新會印出 `evidence complete`。配置失敗會永久退役該 uid，提案維持「失敗」。修正原因後，請在遷移確認頁重試該失敗項目的補償，之後新的提案會取得下一個 uid。
 
+### spawnd 日誌中的啟動拒絕紀錄
+
+當閘道記錄 `isolated run not started`（例如 `site="spawn.backend.unavailable"`）時，spawnd 的 journal 會為這次被拒絕的啟動記一行：
+
+```text
+duduclaw-spawnd: start refused: step=<label>
+```
+
+這行不含員工 ID、執行 ID、路徑或請求內容。傳給閘道的錯誤碼不變。准入關卡的 label 可能來自 `ReserveRun`、`StartRun` 或排隊中執行的准入。
+
+| label | 拒絕啟動的原因 |
+| --- | --- |
+| `frame`、`peer`、`request`、`fds`、`run_id` | 控制 socket：無法解碼的訊框、非閘道的連線端、未通過自身驗證的請求、與請求不符的描述元，或無法產生隨機執行 ID。 |
+| `clock`、`update_drain`、`stopping`、`not_reserved`、`reservation`、`pty`、`queue_full`、`launch_policy`、`input_bytes`、`input_fds`、`internal` | 准入：時鐘倒退、更新排空已關閉、正在停止該員工的執行、沒有或錯誤／過期的保留、PTY 不符、佇列已滿、啟動政策無效，或輸入額度不足。 |
+| `employee_not_admitted` | 該員工不是 spawnd 登錄表中的 Ready 列。 |
+| `not_ready(<check>)`、`report_stale`、`report_invalid`、`pty_budget`、`landlock_evidence`、`protocol`、`boot_clock`、`policy_missing`、`poisoned` | 主機就緒：指名的 readiness.json 檢查為 false、證據報告超過 1 秒或屬於其他開機、沒有 PTY 額度或 Landlock 證據、未載入已驗證的政策，或 spawnd 需要重新啟動。 |
+| `scan_stale`、`scan_failed`、`scan_busy`、`intruder`、`view_busy` | UID 監視器的掃描過舊、失敗或被鎖住，發現該員工在執行外的程序，或准入檢視被鎖住。 |
+| `account_unknown`、`ssh_pending`、`account(<step>)` | 該員工沒有登錄列、SSH 拒絕探測尚無結果，或帳號驗證在 `<step>` 失敗（上表的 label）。 |
+| `entitlement_missing`、`runtime_not_entitled`、`runtime_ambiguous`、`pty_not_allowed`、`turn_limit` | 授權：該員工沒有授權、所要求的 runtime 沒有或有兩個已授權設定檔、不允許 PTY，或步數上限超出簽署範圍。 |
+| `queue_timeout(<blocker>)`、`queue_cancelled(<blocker>)` | 排隊中的執行在 `<blocker>` 擋住時逾時或被閘道取消：准入 label、`host_runs`、`employee_busy`、`host_ptys`、`cleanup` 或 `cleanup_incomplete`。 |
+| `uid_monitor_register`、`worker_mailbox`、`run_fence`、`cleanup`、`cleanup_incomplete`、`storage_usage`、`disk_quota`、`run_journal`、`storage_attach`、`storage_receipt`、`workspace` | 啟動（尚未建立 unit）：監視器登記、生命週期信箱、執行已取消、清理讀回、儲存用量或配額、執行日誌、映像掛載或其收據，或工作區。 |
+| `mcp_channel`、`egress_channel`、`egress_register`、`output_relay`、`stdin_pipe`、`supervisor_identity`、`nonce`、`bootstrap_plan`、`uid_monitor`、`mcp_projection`、`anchors`、`mounts`、`mcp_record`、`native_profile`、`helper_mounts`、`seal`、`trampoline_prepare`、`bootstrap_invalid`、`unit_policy` | 啟動（尚未建立 unit）：通道或管線、egress 服務的登記（未知的設定檔或沒有 egress 控制連線）、bootstrap 計畫、MCP 投影、發布錨點、掛載、原生設定檔、trampoline 或 unit 政策。 |
+| `unit_start`、`unit_cgroup`、`bind_unit`、`launch_poll`、`startup_timeout` | systemd 拒絕 unit、unit 的 cgroup 或 trampoline 綁定失敗、在 Running 前啟動失敗，或未在啟動額度內到達 Running。 |
+| `host_gate`、`host_policy`、`host_start` | 僅測試用轉接器。 |
+
+在此版本之前，配置日誌中已是 Ready 的員工出現 `employee_not_admitted` 是一個缺陷：spawnd 只在啟動時讀取可准入的員工，因此 spawnd 啟動後才配置的員工會一直被拒絕，直到 spawnd 重新啟動。
+
 受保護員工環境不提供容器引擎與依賴主機硬體的功能。所有必要元件均需通過檢查才能恢復工作；套件測試通過或本指南都不能當作正式環境驗收。
 
 ## v1.80.x 已發行的單一執行檔受保護服務

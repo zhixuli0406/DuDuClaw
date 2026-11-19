@@ -269,6 +269,33 @@ duduclaw-spawnd: allocation failed: step=<label>
 
 `at` パッケージは削除不要です。spawnd は root として spool を直接読み、`/usr/bin/at` を実行しません。行を消すために deny ファイル、spool、アカウントを手で編集しないでください。原因を直すと、次の更新で `evidence complete` が出力されます。失敗した割り当ての uid は永久に退役し、提案は「失敗」のままです。原因を直した後、移行の確認で失敗項目の補償を再試行してください。その後の新しい提案には次の uid が割り当てられます。
 
+### spawnd ジャーナルの起動拒否行
+
+ゲートウェイが `isolated run not started`（たとえば `site="spawn.backend.unavailable"`）を記録した場合、spawnd のジャーナルにはその拒否された起動ごとに 1 行が出力されます。
+
+```text
+duduclaw-spawnd: start refused: step=<label>
+```
+
+この行には社員 ID、実行 ID、パス、リクエスト内容は含まれません。ゲートウェイに返すエラーコードは変わりません。受け入れゲートの label は `ReserveRun`、`StartRun`、キュー中の実行の受け入れのいずれからも出力されます。
+
+| label | 起動を拒否した内容 |
+| --- | --- |
+| `frame`、`peer`、`request`、`fds`、`run_id` | 制御ソケット：デコードできないフレーム、ゲートウェイ以外の接続相手、自身の検証に失敗したリクエスト、リクエストと合わないディスクリプタ、またはランダムな実行 ID を作れない。 |
+| `clock`、`update_drain`、`stopping`、`not_reserved`、`reservation`、`pty`、`queue_full`、`launch_policy`、`input_bytes`、`input_fds`、`internal` | 受け入れ：時計が戻った、更新のドレインが閉じている、この社員の停止が進行中、予約がない／誤り／期限切れ、PTY の不一致、キューが満杯、起動ポリシーが不正、または入力の予算に空きがない。 |
+| `employee_not_admitted` | 社員が spawnd の登録で Ready 行になっていない。 |
+| `not_ready(<check>)`、`report_stale`、`report_invalid`、`pty_budget`、`landlock_evidence`、`protocol`、`boot_clock`、`policy_missing`、`poisoned` | ホストの準備状態：名前の readiness.json 検査が false、証拠レポートが 1 秒より古いか別のブートのもの、PTY 予算や Landlock の証拠がない、検証済みポリシーが読み込まれていない、または spawnd の再起動が必要。 |
+| `scan_stale`、`scan_failed`、`scan_busy`、`intruder`、`view_busy` | UID モニターのスキャンが古い／失敗／ロック中、実行外のこの社員のプロセスを検出した、または受け入れビューがロック中。 |
+| `account_unknown`、`ssh_pending`、`account(<step>)` | 社員の登録行がない、SSH 拒否プローブの結果がまだない、またはアカウント検証が `<step>`（上の表の label）で失敗した。 |
+| `entitlement_missing`、`runtime_not_entitled`、`runtime_ambiguous`、`pty_not_allowed`、`turn_limit` | 権利付与：社員の権利付与がない、要求されたランタイムの付与済みプロファイルがないか 2 つある、PTY が許可されていない、またはステップ上限が署名された範囲外。 |
+| `queue_timeout(<blocker>)`、`queue_cancelled(<blocker>)` | キュー中の実行が `<blocker>` に止められたまま期限切れになった、またはゲートウェイに取り消された：受け入れの label、`host_runs`、`employee_busy`、`host_ptys`、`cleanup`、`cleanup_incomplete`。 |
+| `uid_monitor_register`、`worker_mailbox`、`run_fence`、`cleanup`、`cleanup_incomplete`、`storage_usage`、`disk_quota`、`run_journal`、`storage_attach`、`storage_receipt`、`workspace` | 起動（unit 作成前）：モニター登録、ライフサイクルのメールボックス、取り消された実行、クリーンアップの読み戻し、ストレージ使用量やクォータ、実行ジャーナル、イメージのアタッチやその受領、ワークスペース。 |
+| `mcp_channel`、`egress_channel`、`egress_register`、`output_relay`、`stdin_pipe`、`supervisor_identity`、`nonce`、`bootstrap_plan`、`uid_monitor`、`mcp_projection`、`anchors`、`mounts`、`mcp_record`、`native_profile`、`helper_mounts`、`seal`、`trampoline_prepare`、`bootstrap_invalid`、`unit_policy` | 起動（unit 作成前）：チャネルやパイプ、egress サービスへの登録（不明なプロファイル、または egress 制御接続がない）、bootstrap 計画、MCP 投影、公開アンカー、マウント、ネイティブプロファイル、trampoline、unit ポリシー。 |
+| `unit_start`、`unit_cgroup`、`bind_unit`、`launch_poll`、`startup_timeout` | systemd が unit を拒否した、unit の cgroup や trampoline の結び付けに失敗した、Running 前に起動が失敗した、または起動予算内に Running にならなかった。 |
+| `host_gate`、`host_policy`、`host_start` | テスト用アダプターのみ。 |
+
+このリリースより前は、割り当てジャーナルで Ready の社員に `employee_not_admitted` が出るのは不具合でした。spawnd は受け入れ対象の社員を起動時にしか読まなかったため、spawnd の起動後に割り当てた社員は spawnd を再起動するまで拒否され続けました。
+
 保護された社員環境ではコンテナエンジンやホストハードウェア依存の機能を提供しません。作業再開前に全必須コンポーネントの検査が必要です。パッケージテストの成功や本ガイドを本番環境の受け入れ完了とは扱わないでください。
 
 ## リリース済み v1.80.x の単一実行ファイル保護サービス

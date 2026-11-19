@@ -41,6 +41,53 @@ fn employee_idle_reports_processes_and_attachments() {
     // Counts saturate instead of wrapping.
     assert_eq!(idle_report(me, uid, &[], &[], &[], usize::MAX, &[]).processes, u16::MAX);
 }
+/// R8y defect: the admitted set was computed only in `LinuxHost::open`, so
+/// an employee allocated after spawnd started was refused at every
+/// `ReserveRun` (`isolation_unavailable`, no unit, no journal line) until
+/// spawnd restarted. `Core::refresh` now republishes it from the registry
+/// (`PublishedView::update`); retire removes it the same way.
+#[test]
+fn employee_allocated_after_open_is_admitted_after_the_next_refresh() {
+    let employee = EmployeeId([7; 16]);
+    let report = EvidenceReport::current(Readiness::default(), 1).unwrap();
+    let account = |state| EmployeeAccount { employee, uid: 70_007, gid: 70_007, state };
+    // At open: no row yet (the empty registry of a fresh install).
+    let mut view = PublishedView { report: report.clone(), policy: None,
+        employees: admitted_employees(&crate::registry::Registry::default()) };
+    let refusal = view.admit(employee).unwrap_err();
+    assert_eq!((refusal.step.to_string(), refusal.code()), ("employee_not_admitted".to_string(), ErrorCode::IsolationUnavailable));
+    // A reservation is not admitted.
+    let reserved = crate::registry::Registry { employees: vec![account(crate::registry::AccountState::Reserved)],
+        ..crate::registry::Registry::default() };
+    view.update(&report, None, &reserved);
+    assert_eq!(view.admit(employee).unwrap_err().step.to_string(), "employee_not_admitted");
+    // The allocation made it Ready: the next refresh admits it (the next
+    // gate, here the missing policy, is what refuses now).
+    let ready = crate::registry::Registry { employees: vec![account(crate::registry::AccountState::Ready)],
+        ..crate::registry::Registry::default() };
+    view.update(&report, None, &ready);
+    assert!(view.employees.contains(&employee));
+    assert_eq!(view.admit(employee).unwrap_err().step.to_string(), "policy_missing");
+    // Retired (tombstoned): no longer admitted.
+    let retired = crate::registry::Registry { employees: vec![account(crate::registry::AccountState::Tombstone)],
+        ..crate::registry::Registry::default() };
+    view.update(&report, None, &retired);
+    assert_eq!(view.admit(employee).unwrap_err().step.to_string(), "employee_not_admitted");
+}
+#[test]
+fn readiness_gate_of_the_uid_monitor_is_labelled() {
+    let employee = EmployeeId([1; 16]);
+    let state = Arc::new(Mutex::new(ScanState { at: Instant::now(), result: Ok(vec![employee]) }));
+    let mut reader = ScanReader { state: state.clone(), entries: Arc::new(Mutex::new(vec![entry()])) };
+    assert_eq!(reader.health_step(employee).unwrap_err().step.to_string(), "intruder");
+    state.lock().unwrap().result = Err(ErrorCode::IsolationUnavailable);
+    assert_eq!(reader.health_step(employee).unwrap_err().step.to_string(), "scan_failed");
+    state.lock().unwrap().at = Instant::now() - Duration::from_secs(3);
+    assert_eq!(reader.health_step(employee).unwrap_err().step.to_string(), "scan_stale");
+    let guard = state.lock().unwrap();
+    assert_eq!(reader.health_step(employee).unwrap_err().step.to_string(), "scan_busy");
+    drop(guard);
+}
 #[test]
 fn cgroup_receipt_is_converted_to_absolute_proc_membership() {
     assert_eq!(proc_cgroup(std::path::Path::new("/sys/fs/cgroup/duduclaw.slice/run.service")).unwrap(), "/duduclaw.slice/run.service");

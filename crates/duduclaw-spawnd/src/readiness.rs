@@ -40,11 +40,16 @@ impl Default for Readiness {
     }
 }
 impl Readiness {
-    pub fn check(&self) -> Result<()> {
-        if self.protocol != PROTOCOL_VERSION { return Err(ErrorCode::UnsupportedVersion); }
-        if self.named_checks().into_iter().all(|(_, value)| value) {
-            Ok(())
-        } else { Err(ErrorCode::IsolationUnavailable) }
+    pub fn check(&self) -> Result<()> { self.check_labelled().map_err(crate::start_refusal::Refusal::code) }
+    /// R8y: [`Self::check`] with the step: `protocol`, or `not_ready(<the
+    /// first false check's readiness.json name>)`. Same codes as before.
+    pub fn check_labelled(&self) -> crate::start_refusal::Labelled<()> {
+        use crate::start_refusal::{gate, Gate};
+        if self.protocol != PROTOCOL_VERSION { return Err(gate(Gate::Protocol)(ErrorCode::UnsupportedVersion)); }
+        match self.named_checks().into_iter().find(|(_, value)| !value) {
+            None => Ok(()),
+            Some((name, _)) => Err(gate(Gate::NotReady(name))(ErrorCode::IsolationUnavailable)),
+        }
     }
     /// Every primary check (all of them `check` requires) under its
     /// readiness.json name.
@@ -128,7 +133,15 @@ mod tests {
         checks[11].resources_verified = false;
         checks[12].startup_reconciled = false;
         checks[13].process_scan_verified = false;
-        for check in checks { assert_eq!(check.check(), Err(ErrorCode::IsolationUnavailable)); }
+        // R8y: the label names exactly the false check (its readiness.json name).
+        let names = valid.named_checks();
+        for (check, (name, _)) in checks.into_iter().zip(names) {
+            assert_eq!(check.check(), Err(ErrorCode::IsolationUnavailable));
+            assert_eq!(check.check_labelled().unwrap_err().step.to_string(), format!("not_ready({name})"));
+        }
+        let mut other = valid.clone(); other.protocol = PROTOCOL_VERSION + 1;
+        assert_eq!(other.check(), Err(ErrorCode::UnsupportedVersion));
+        assert_eq!(other.check_labelled().unwrap_err().step.to_string(), "protocol");
         assert!(validate_egress_ip_allow(&["10.0.0.1/32".into()]).is_err());
         assert!(validate_egress_ip_allow(&[]).is_ok());
     }

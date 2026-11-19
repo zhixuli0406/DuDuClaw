@@ -4,7 +4,7 @@ use duduclaw_isolation::{execution::{RunHandle, RuntimeKind, PtySize}, ids::{Emp
     ipc::{self, CleanupReadback, ControlConnectionId, Envelope, ErrorCode, HelperCallId, Opcode, SpawnRequest, SpawnResponse}};
 use crate::{admission::{Coordinator, Host, HostProgress, LaunchPolicy, Limits, Ticket, BROKER_REPLY_MS},
     audit::{Detail, Event, Record}, fds::{self, SnapshotAuthority},
-    readiness::Readiness, transport::{Listener, Seqpacket}, Result};
+    readiness::Readiness, start_refusal::StartStep, transport::{Listener, Seqpacket}, Result};
 
 const MAX_CONNECTIONS: usize = 32;
 const IDLE_CONNECTION_MS: u64 = 60_000;
@@ -165,7 +165,9 @@ pub fn serve_with_drain<H: Host<Inputs = Vec<OwnedFd>, Io = Vec<OwnedFd>>>(liste
                     if clients.iter().any(|client| client.id == id) { return Err(unavailable()); }
                     clients.push(Client { socket, id, last_request: now, deferred: None });
                 }
-                Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::PermissionDenied) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                // R8y: a peer that is not the gateway (no request is read).
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => coordinator.note_refusal(StartStep::Peer),
                 Err(error) => return Err(error),
             }
         }
@@ -208,6 +210,8 @@ pub fn serve_with_drain<H: Host<Inputs = Vec<OwnedFd>, Io = Vec<OwnedFd>>>(liste
         if let (Some(barrier), Some(epoch)) = (&drain, epoch) {
             barrier.observe(epoch, coordinator.admitted_runs(), healthy);
         }
+        // R8y: one fixed journal line per refused start (no id, no path).
+        for step in coordinator.take_refusals() { eprintln!("duduclaw-spawnd: {}", step.line()); }
         std::thread::sleep(Duration::from_millis(25));
     }
 }
@@ -303,17 +307,38 @@ fn finish<H: Host<Inputs = Vec<OwnedFd>, Io = Vec<OwnedFd>>>(coordinator: &mut C
 fn dispatch<H: Host<Inputs = Vec<OwnedFd>, Io = Vec<OwnedFd>>>(coordinator: &mut Coordinator<H>,
     connection: ControlConnectionId, packet: crate::transport::Packet, snapshots: SnapshotAuthority,
     now: u64) -> io::Result<Reply> {
-    let frame = ipc::decode::<SpawnRequest>(&packet.bytes).map_err(|_| unavailable())?;
+    let frame = match ipc::decode::<SpawnRequest>(&packet.bytes) {
+        Ok(frame) => frame,
+        Err(_) => {
+            // R8y: the op is unknown; the connection is closed without a reply.
+            coordinator.note_refusal(StartStep::Frame);
+            return Err(unavailable());
+        }
+    };
     let request_id = frame.request_id;
     let subject = Subject::of(&frame.message);
     let subject = subject.resolve(subject.run.and_then(|run| coordinator.run_employee(RunHandle(run))));
+    // R8y: the server's own refusals of a run start are labelled here; the
+    // coordinator labels its own (`Coordinator::reserve`/`start`).
+    let start_op = matches!(subject.op, Opcode::ReserveRun | Opcode::StartRun);
     let result = (|| -> Result<Dispatched> {
         // Preserve closed validation codes before fd_plan maps them to InvalidFds.
-        frame.message.validation_code()?;
-        fds::validate_start(&frame.message, &packet.fds, snapshots).map_err(|_| ErrorCode::InvalidFds)?;
+        if let Err(code) = frame.message.validation_code() {
+            if start_op { coordinator.note_refusal(StartStep::Request); }
+            return Err(code);
+        }
+        if fds::validate_start(&frame.message, &packet.fds, snapshots).is_err() {
+            if start_op { coordinator.note_refusal(StartStep::Fds); }
+            return Err(ErrorCode::InvalidFds);
+        }
         let response = match frame.message {
-            SpawnRequest::ReserveRun { employee_id } => coordinator.reserve(connection, employee_id,
-                RunHandle(RunId(random_id().map_err(|_| ErrorCode::Internal)?)), now)?,
+            SpawnRequest::ReserveRun { employee_id } => {
+                let Ok(id) = random_id() else {
+                    coordinator.note_refusal(StartStep::RunId);
+                    return Err(ErrorCode::Internal);
+                };
+                coordinator.reserve(connection, employee_id, RunHandle(RunId(id)), now)?
+            }
             request @ SpawnRequest::StartRun { .. } => coordinator.start(connection, request, packet.fds, now)?,
             SpawnRequest::Cancel { run } => { coordinator.cancel(run, connection, now)?; SpawnResponse::Ack }
             SpawnRequest::Status { run } => SpawnResponse::Status { run, status: coordinator.status(run, connection)? },
@@ -427,8 +452,34 @@ mod tests {
                 assert_eq!(record.detail, Some(Detail::Code { code: ErrorCode::StepLimitDenied }));
                 assert_eq!(serde_json::to_value(&record).unwrap()["detail"]["code"], "step_limit_denied");
                 assert_eq!(coordinator.admitted_runs(), 0);
+                // R8y: exactly one labelled refusal, from the server's own validation.
+                assert_eq!(coordinator.take_refusals(), vec![StartStep::Request]);
             }
         }
+    }
+    /// R8y: the server's own start exits are labelled (an undecodable frame,
+    /// a ReserveRun refused by the host gate); other ops record nothing.
+    #[test]
+    fn server_start_refusals_are_labelled() {
+        let mut coordinator = Coordinator::new(UnavailableHost, Limits::default()).unwrap();
+        let authority = SnapshotAuthority { gateway_uid: 1000, mount_id: 1 };
+        let (gateway, server) = Seqpacket::pair().unwrap();
+        gateway.send(&ipc::frame_payload(b"{}").unwrap(), &[]).unwrap();
+        assert!(dispatch(&mut coordinator, ControlConnectionId([1; 16]), server.recv().unwrap(), authority, 100).is_err());
+        assert_eq!(coordinator.take_refusals(), vec![StartStep::Frame]);
+        let reserve = Envelope { version: ipc::PROTOCOL_VERSION, request_id: RequestId([4; 16]),
+            message: SpawnRequest::ReserveRun { employee_id: EmployeeId([2; 16]) } };
+        gateway.send(&ipc::encode(&reserve).unwrap(), &[]).unwrap();
+        let Ok(Reply::Now(response, ..)) = dispatch(&mut coordinator, ControlConnectionId([1; 16]), server.recv().unwrap(), authority, 100)
+            else { panic!("unexpected reply") };
+        // The wire code is unchanged; only the journal names the step.
+        assert_eq!(response.message, SpawnResponse::Error { code: ErrorCode::IsolationUnavailable });
+        assert_eq!(coordinator.take_refusals(), vec![StartStep::Gate(crate::start_refusal::Gate::Host)]);
+        let status = Envelope { version: ipc::PROTOCOL_VERSION, request_id: RequestId([5; 16]),
+            message: SpawnRequest::Status { run: RunHandle(RunId([3; 16])) } };
+        gateway.send(&ipc::encode(&status).unwrap(), &[]).unwrap();
+        assert!(dispatch(&mut coordinator, ControlConnectionId([1; 16]), server.recv().unwrap(), authority, 100).is_ok());
+        assert!(coordinator.take_refusals().is_empty());
     }
     #[test]
     fn missing_adapters_refuse_every_launch_and_readiness() {

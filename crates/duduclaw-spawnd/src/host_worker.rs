@@ -179,9 +179,16 @@ impl Host for WorkerHost {
         match self.take(&key)? { Value::Cleanup(v) => Ok(v), _ => Err(ErrorCode::Internal) }
     }
     fn start(&mut self, r: RunHandle, e: EmployeeId, q: &SpawnRequest, p: &LaunchPolicy, f: Self::Inputs) -> Result<()> {
+        self.start_step(r, e, q, p, f).map_err(crate::start_refusal::Refusal::code)
+    }
+    /// R8y: the synchronous half of a start, labelled (codes unchanged). The
+    /// lifecycle worker's own start labels and prints its refusals.
+    fn start_step(&mut self, r: RunHandle, e: EmployeeId, q: &SpawnRequest, p: &LaunchPolicy, f: Self::Inputs)
+        -> crate::start_refusal::Labelled<()> {
+        use crate::start_refusal::{at, StartStep};
         self.slots.remove(&Key::Cleanup(e, None));
-        self.scanner.register(r, e, p.startup_ms)?;
-        self.request(Key::Start(r.0), Work::Start(r, e, q.clone(), p.clone(), f))
+        self.scanner.register(r, e, p.startup_ms).map_err(at(StartStep::UidMonitorRegister))?;
+        self.request(Key::Start(r.0), Work::Start(r, e, q.clone(), p.clone(), f)).map_err(at(StartStep::WorkerMailbox))
     }
     fn poll(&mut self, r: RunHandle) -> Result<HostProgress> {
         self.receive();
