@@ -179,16 +179,18 @@ impl McpAcceptance {
         -> std::result::Result<(), duduclaw_mcp_boundary::config::AcceptanceCheck> {
         use duduclaw_mcp_boundary::config::AcceptanceCheck as C;
         let r = &projection.registration;
-        let checks = [(self.runtime == r.runtime, C::Runtime), (self.version == r.version, C::Version),
-            (self.runtime_digest == r.runtime_digest, C::RuntimeDigest), (self.bridge_digest == r.bridge_digest, C::BridgeDigest),
-            (self.projection_digest == projection.digest(), C::ProjectionDigest), (self.inherited_fd == 3, C::InheritedFd),
-            (self.initialize_exit == 0, C::InitializeExit), (self.parent_exec_exit == 0, C::ParentExecExit),
-            (self.mcp_child_exec_exit == 0, C::McpChildExecExit), (self.exclusive_config_exit == 0, C::ExclusiveConfigExit),
-            (nonzero(self.transcript_digest), C::TranscriptDigest)];
-        match checks.into_iter().find(|(passed, _)| !passed) {
-            Some((_, check)) => Err(check),
-            None => Ok(()),
-        }
+        if self.runtime != r.runtime { return Err(C::Runtime); }
+        if self.version != r.version { return Err(C::Version); }
+        if self.runtime_digest != r.runtime_digest { return Err(C::RuntimeDigest); }
+        if self.bridge_digest != r.bridge_digest { return Err(C::BridgeDigest); }
+        if self.projection_digest != projection.digest() { return Err(C::ProjectionDigest); }
+        if self.inherited_fd != 3 { return Err(C::InheritedFd); }
+        if self.initialize_exit != 0 { return Err(C::InitializeExit); }
+        if self.parent_exec_exit != 0 { return Err(C::ParentExecExit); }
+        if self.mcp_child_exec_exit != 0 { return Err(C::McpChildExecExit); }
+        if self.exclusive_config_exit != 0 { return Err(C::ExclusiveConfigExit); }
+        if !nonzero(self.transcript_digest) { return Err(C::TranscriptDigest); }
+        Ok(())
     }
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -1036,10 +1038,13 @@ mod tests {
         let mut other = good.clone();
         other.launch_policy_digest = Sha256Digest([9; 32]);
         assert_eq!(other.validate_check(&projection), Ok(()));
-        // The first failing check in order wins.
-        let mut both = good;
-        both.inherited_fd = 4; both.version = "other".into();
-        assert_eq!(both.validate_check(&projection), Err(C::Version));
+        // Every adjacent pair reports the earlier check when both fail.
+        for pair in edits.windows(2) {
+            let mut both = good.clone();
+            (pair[0].1)(&mut both);
+            (pair[1].1)(&mut both);
+            assert_eq!(both.validate_check(&projection), Err(pair[0].0), "{:?} before {:?}", pair[0].0, pair[1].0);
+        }
     }
     #[test]
     #[ignore = "iso_root_: disposable Linux VM; verifies root receipt ownership and mode"]
