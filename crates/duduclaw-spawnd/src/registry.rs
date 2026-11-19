@@ -515,6 +515,9 @@ mod disk {
         /// R8y review round 1 (F2): the allocation-failure summaries of an
         /// ended window (`Core::refresh` calls this on its cadence).
         pub fn flush_lines(&mut self, now: std::time::Instant) -> Vec<String> { self.lines.flush(now) }
+        /// R8y review round 2: the pending allocation-failure summaries at
+        /// shutdown, whatever the window's age (`Core::drop`; idempotent).
+        pub fn drain_lines(&mut self) -> Vec<String> { self.lines.drain() }
 
         /// The reservation deadline ([`Allocations::expire`]) at the current
         /// boottime, for the lifecycle thread's maintenance.

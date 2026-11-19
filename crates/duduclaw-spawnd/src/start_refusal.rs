@@ -377,6 +377,20 @@ impl LineLimiter {
         let start = *self.window.get_or_insert(now);
         if now.saturating_duration_since(start) < LINE_WINDOW { return Vec::new(); }
         self.window = Some(now);
+        self.summaries()
+    }
+    /// R8y review round 2: ends the current window NOW, whatever its age, for
+    /// a normal shutdown: the same `<line> suppressed=<count>` lines
+    /// [`Self::flush`] would print when the window ends (same format, same
+    /// order), so a tally pending at shutdown is not lost. Empty when nothing
+    /// is suppressed; idempotent (a second call returns nothing). A later
+    /// [`Self::note`] starts a fresh window.
+    pub fn drain(&mut self) -> Vec<String> {
+        self.window = None;
+        self.summaries()
+    }
+    /// The window's summaries; clears its counts.
+    fn summaries(&mut self) -> Vec<String> {
         let mut out: Vec<String> = self.seen.iter().filter(|(_, seen)| seen.suppressed > 0)
             .map(|(line, seen)| format!("{line} suppressed={}", seen.suppressed)).collect();
         if self.other > 0 { out.push(format!("{}: step=other suppressed={}", self.kind, self.other)); }
@@ -582,6 +596,50 @@ mod tests {
         out.extend(tiny.note(StartStep::Fds.line(), 3, t0));
         out.extend(tiny.flush(t0 + LINE_WINDOW));
         assert_eq!(out, vec![StartStep::Peer.line(), "start refused: step=other suppressed=3".to_string()]);
+    }
+    /// R8y review round 2: a shutdown before the window ends prints each
+    /// label's pending `suppressed=<count>` exactly once (the sink is the
+    /// returned lines, which every caller writes to the journal verbatim).
+    #[test]
+    fn limiter_drain_prints_pending_summaries_once_before_the_window_ends() {
+        let t0 = std::time::Instant::now();
+        let (a, b) = (StartStep::Fds.line(), StartStep::Peer.line());
+        let mut limiter = LineLimiter::new("start refused", label_bound());
+        let mut sink: Vec<String> = Vec::new();
+        for _ in 0..8 { sink.extend(limiter.note(a.clone(), 1, t0)); }
+        sink.extend(limiter.note(b.clone(), 12, t0));
+        // A label within its budget has nothing pending.
+        let c = StartStep::Request.line();
+        sink.extend(limiter.note(c.clone(), 2, t0));
+        assert!(limiter.flush(t0 + std::time::Duration::from_secs(1)).is_empty(), "the window has not ended");
+        let drained = limiter.drain();
+        assert_eq!(drained, vec![format!("{a} suppressed=3"), format!("{b} suppressed=7")]);
+        sink.extend(drained);
+        assert_eq!((summed(&sink, &a), summed(&sink, &b), summed(&sink, &c)), (8, 12, 2), "nothing lost");
+        for line in [&a, &b] {
+            assert_eq!(sink.iter().filter(|l| l.starts_with(&format!("{line} suppressed="))).count(), 1, "{line}: exactly once");
+        }
+        // Idempotent: a second drain, and the window's own end, print nothing more.
+        assert!(limiter.drain().is_empty());
+        assert!(limiter.flush(t0 + LINE_WINDOW).is_empty());
+        // The overflow tally is drained in the same format.
+        let mut tiny = LineLimiter::new("allocation failed", 1);
+        let _ = tiny.note("allocation failed: step=one".into(), 1, t0);
+        let _ = tiny.note("allocation failed: step=two".into(), 4, t0);
+        assert_eq!(tiny.drain(), vec!["allocation failed: step=other suppressed=4".to_string()]);
+        assert!(tiny.drain().is_empty());
+    }
+    #[test]
+    fn limiter_drain_of_an_empty_limiter_prints_nothing() {
+        let mut limiter = LineLimiter::new("start refused", label_bound());
+        assert!(limiter.drain().is_empty());
+        assert!(limiter.drain().is_empty());
+        // Nothing suppressed (within budget): nothing to drain either.
+        let t0 = std::time::Instant::now();
+        assert_eq!(limiter.note(StartStep::Peer.line(), 5, t0).len(), 5);
+        assert!(limiter.drain().is_empty());
+        // After a drain the next line starts a fresh window and prints at once.
+        assert_eq!(limiter.note(StartStep::Peer.line(), 1, t0), vec![StartStep::Peer.line()]);
     }
     #[test]
     fn labelling_keeps_the_wire_code() {

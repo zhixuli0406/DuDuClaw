@@ -1035,6 +1035,12 @@ impl Drop for Core {
         for run in runs { let _ = self.revoke(RunHandle(run)); let _ = self.kill(RunHandle(run)); }
         self.report.checks.startup_reconciled = false; let _ = self.report.publish(self.gateway.1);
         self.recording_gate.publish(&self.report, true);
+        // R8y review round 2: last, after the revokes/kills above (which may
+        // still journal), the lifecycle thread's rate-limited lines print
+        // their pending `suppressed=<count>` before the window ends.
+        for line in self.start_lines.drain().into_iter().chain(self.registry.drain_lines()) {
+            eprintln!("duduclaw-spawnd: {line}");
+        }
     }
 }
 impl Host for LinuxHost {
