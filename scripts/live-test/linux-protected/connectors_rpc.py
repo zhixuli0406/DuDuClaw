@@ -3,8 +3,10 @@
 
 Reuses the WebSocket client of rpc_probe.py. Unlike rpc_probe.py (which uses the
 legacy admin token), the protected connector/employee RPCs need a real account
-session: JWT login, optional TOTP enrolment and the dashboard step-up
-(`isolation.connector_step_up`, password + a fresh TOTP code, 5 minutes).
+session: JWT login, optional TOTP enrolment (or, under an enforced policy, the
+first Administrator's setup-code enrolment `enroll-mfa-bootstrap`), TOTP sign-in
+and the dashboard step-up (`isolation.connector_step_up`, password + a fresh TOTP
+code, 5 minutes).
 
 Every sub-command prints exactly one JSON object on stdout and never prints a
 password, token or TOTP secret:
@@ -113,10 +115,16 @@ def http_json(method, path, body=None, bearer=None):
 
 def login(state, path, new_password=None):
     status, body = http_json("POST", "/api/login", {"email": state["email"], "password": state["password"]})
+    # An enrolled account under MFA: answer the TOTP challenge with the stored secret.
+    if (status == 200 and isinstance(body, dict) and body.get("mfa_required") and body.get("challenge_id")
+            and state.get("totp_secret")):
+        status, body = http_json("POST", "/api/mfa/verify",
+                                 {"challenge_id": body["challenge_id"], "code": fresh_code(state, path)})
     if status != 200 or not isinstance(body, dict) or not body.get("access_token"):
         keys = sorted(body) if isinstance(body, dict) else None
         raise Fail(f"login did not return a session (HTTP {status}, keys {keys}); "
-                   "an enforced MFA policy needs a pre-enrolled account")
+                   "an enforced MFA policy needs an enrolled account with its TOTP secret in the state file "
+                   "(first Administrator: enroll-mfa-bootstrap)")
     state["access_token"], state["refresh_token"] = body["access_token"], body.get("refresh_token")
     user = body.get("user") or {}
     state["user_id"] = user.get("id", state.get("user_id"))
@@ -256,6 +264,74 @@ def cmd_enroll_mfa(args):
     return {"enrolled": True}
 
 
+SETUP_CODE_MAX_BYTES = 256
+
+
+def read_setup_code(path):
+    """The one-time setup code from a file (never a symlink); never echoed, not even in errors."""
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+    except OSError as error:
+        raise Fail(f"cannot open the setup code file ({error.strerror or 'error'})") from None
+    with os.fdopen(fd, "rb") as source:
+        raw = source.read(SETUP_CODE_MAX_BYTES + 1)
+    code = raw.decode("ascii", "replace").strip()
+    if len(raw) > SETUP_CODE_MAX_BYTES or not (16 <= len(code) <= 128) or any(c not in "0123456789abcdefABCDEF" for c in code):
+        raise Fail("the setup code file does not hold exactly one setup code")
+    return code
+
+
+def cmd_enroll_mfa_bootstrap(args):
+    """Enforced first-run flow of the first Administrator (RM-135), over the HTTP endpoints only.
+
+    POST /api/login -> {mfa_enrollment_required, enrollment_token, setup_code_required}
+    POST /api/mfa/enroll/bootstrap {enrollment_token, setup_code}
+    POST /api/mfa/enroll/begin     {enrollment_token}             -> {secret, otpauth_uri}
+    POST /api/mfa/enroll/confirm   {enrollment_token, code}       -> session + recovery codes
+    then a normal login answered with TOTP (login()), so the state file ends with a usable
+    session and the TOTP secret. The setup code comes from --setup-code-file (for a TEST
+    build: `duduclaw ops users mfa-setup-code-test --out <file>`) and is never printed.
+    """
+    if not args.state:
+        raise Fail("--state is required (the session and TOTP secret are kept there)")
+    state = load_state(args.state)
+    if args.email:
+        state.update(email=args.email, password=args.password)
+    if not state.get("email") or not state.get("password"):
+        raise Fail("no account in the state file (claim first, or pass --email and --password)")
+    setup_code = read_setup_code(args.setup_code_file)
+    status, body = http_json("POST", "/api/login", {"email": state["email"], "password": state["password"]})
+    if status != 200 or not isinstance(body, dict) or not body.get("mfa_enrollment_required") \
+            or not body.get("enrollment_token"):
+        keys = sorted(body) if isinstance(body, dict) else None
+        raise Fail(f"login did not ask for first two-factor setup (HTTP {status}, keys {keys})")
+    if not body.get("setup_code_required"):
+        raise Fail("the gateway offers no first-Administrator setup for this account "
+                   "(setup_code_required is false: policy not enforced, not the first Administrator, "
+                   "or first setup already completed)")
+    token = body["enrollment_token"]
+    status, _ = http_json("POST", "/api/mfa/enroll/bootstrap", {"enrollment_token": token, "setup_code": setup_code})
+    del setup_code
+    if status != 200:
+        raise Fail(f"setup code refused (HTTP {status}; expired, used, replaced or wrong)")
+    status, begin = http_json("POST", "/api/mfa/enroll/begin", {"enrollment_token": token})
+    if status != 200 or not isinstance(begin, dict) or not begin.get("secret"):
+        raise Fail(f"MFA enrolment could not begin after the setup code (HTTP {status})")
+    state["totp_secret"] = begin["secret"]
+    state["totp_last"] = -1
+    save_state(args.state, state)
+    status, done = http_json("POST", "/api/mfa/enroll/confirm",
+                             {"enrollment_token": token, "code": fresh_code(state, args.state)})
+    if status != 200 or not isinstance(done, dict) or not done.get("access_token"):
+        raise Fail(f"MFA enrolment was not confirmed (HTTP {status})")
+    state["access_token"], state["refresh_token"] = done["access_token"], done.get("refresh_token")
+    state["recovery_codes_count"] = len(done.get("recovery_codes") or [])
+    save_state(args.state, state)
+    # A normal sign-in with the new factor (also handles a forced password change).
+    login(state, args.state, args.new_password)
+    return {"enrolled": True, "user_id": state.get("user_id")}
+
+
 def cmd_call(args):
     state = load_state(args.state)
     params = json.loads(args.params)
@@ -391,6 +467,9 @@ def main():
     p = sub.add_parser("claim"); p.add_argument("--email", required=True); p.add_argument("--password", required=True); p.set_defaults(fn=cmd_claim)
     p = sub.add_parser("login"); p.add_argument("--email"); p.add_argument("--password"); p.add_argument("--new-password"); p.set_defaults(fn=cmd_login)
     p = sub.add_parser("enroll-mfa"); p.set_defaults(fn=cmd_enroll_mfa)
+    p = sub.add_parser("enroll-mfa-bootstrap"); p.add_argument("--setup-code-file", required=True)
+    p.add_argument("--email"); p.add_argument("--password"); p.add_argument("--new-password")
+    p.set_defaults(fn=cmd_enroll_mfa_bootstrap)
     p = sub.add_parser("connect-only"); p.set_defaults(fn=cmd_connect_only)
     p = sub.add_parser("call"); p.add_argument("method"); p.add_argument("params", nargs="?", default="{}")
     p.add_argument("--stepup", action="store_true"); p.set_defaults(fn=cmd_call)

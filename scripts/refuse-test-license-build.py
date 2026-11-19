@@ -6,7 +6,10 @@ licence issuer and embeds the constant TEST_LICENSE_BUILD_MARKER of
 crates/duduclaw-gateway/src/license_runtime.rs. This script reads the marker from
 that file at run time (exactly one definition, or it refuses to run, except that
 source predating the test-licence issuer needs no scan), so the Rust constant stays
-its only copy. The check is static: nothing is executed or extracted.
+its only copy. A gateway binary is also refused when it contains one of
+TEST_ONLY_COMMAND_MARKERS (strings of the TEST-only `ops users mfa-setup-code-test`
+sub-command, compiled only into a test-root build). The check is static: nothing
+is executed or extracted.
 
 Scope
 -----
@@ -88,6 +91,15 @@ MARKER_DECLARATION = re.compile(rb"\bTEST_LICENSE_BUILD_MARKER\s*:")
 MARKER_TEXT = re.compile(rb"[A-Za-z0-9_-]{16,}")
 MIN_MARKER_BYTES = 16
 MAX_MARKER_FILE_BYTES = 256
+# E10 (2026-11-20): strings only a test-root duduclaw contains besides the licence
+# marker: the TEST-only setup-code sub-command and its fixed stderr line
+# (crates/duduclaw-cli/src/users_mfa_test_build.rs SUBCOMMAND / NOTICE, which its
+# test-root unit test checks against this list). Scanned in every gateway binary
+# together with the licence marker.
+TEST_ONLY_COMMAND_MARKERS = (
+    b"mfa-setup-code-test",
+    b"TEST BUILD ONLY: issuing a first-run setup code for automated acceptance",
+)
 GATEWAY_NAMES = ("duduclaw", "duduclaw.exe", "duduclaw-pro", "duduclaw-pro.exe")
 CHUNK_BYTES = 1024 * 1024
 
@@ -137,16 +149,26 @@ def read_marker_file(path):
 
 def contains_marker(read, marker):
     """True when the bytes `read(size)` yields contain `marker` (also across chunk borders)."""
-    keep = len(marker) - 1
+    return contains_any_marker(read, (marker,))
+
+
+def contains_any_marker(read, markers):
+    """True when the bytes `read(size)` yields contain any of `markers` (one pass, also across chunk borders)."""
+    keep = max(len(marker) for marker in markers) - 1
     tail = b""
     while True:
         chunk = read(CHUNK_BYTES)
         if not chunk:
             return False
         window = tail + chunk
-        if marker in window:
+        if any(marker in window for marker in markers):
             return True
-        tail = window[-keep:]
+        tail = window[-keep:] if keep else b""
+
+
+def release_markers(marker):
+    """The licence marker plus the TEST-only command markers: none may occur in a release binary."""
+    return (marker, *TEST_ONLY_COMMAND_MARKERS)
 
 
 # ---------------------------------------------------------------- binaries and archives
@@ -176,7 +198,7 @@ def _scan_raw(path, marker):
     with open(path, "rb") as source:
         if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
             raise RefuserError(f"{path} is not a regular file")
-        return ([""] if contains_marker(source.read, marker) else []), 1
+        return ([""] if contains_any_marker(source.read, release_markers(marker)) else []), 1
 
 
 def _scan_tar(path, mode, marker):
@@ -191,7 +213,7 @@ def _scan_tar(path, mode, marker):
             if source is None:
                 raise RefuserError(f"cannot read {path}:{member.name}")
             scanned += 1
-            if contains_marker(source.read, marker):
+            if contains_any_marker(source.read, release_markers(marker)):
                 found.append(member.name)
     return found, scanned
 
@@ -210,7 +232,7 @@ def _scan_zip(path, marker):
             with bundle.open(info) as source:
                 if gateway:
                     scanned += 1
-                    if contains_marker(source.read, marker):
+                    if contains_any_marker(source.read, release_markers(marker)):
                         found.append(info.filename)
                 else:
                     while source.read(CHUNK_BYTES):
@@ -219,7 +241,8 @@ def _scan_zip(path, marker):
 
 
 def scan(path, marker):
-    """(labels that carry the marker, number of binaries scanned) for one raw binary or archive.
+    """(labels that carry the marker or a TEST-only command marker, number of binaries scanned)
+    for one raw binary or archive.
 
     A label is "" for a raw binary and the member name for an archive member."""
     mode = archive_mode(path)

@@ -388,8 +388,9 @@ def refuse_test_root_environment(environment, target):
 
 
 def has_test_license_marker(read):
-    """True when the bytes `read(size)` yields contain TEST_LICENSE_MARKER (also across chunk borders)."""
-    return REFUSER.contains_marker(read, TEST_LICENSE_MARKER)
+    """True when the bytes `read(size)` yields contain TEST_LICENSE_MARKER or one of the refuser's
+    TEST_ONLY_COMMAND_MARKERS (TEST-only sub-command strings; also across chunk borders)."""
+    return REFUSER.contains_any_marker(read, REFUSER.release_markers(TEST_LICENSE_MARKER))
 
 
 def refuse_test_license_build(read, name):

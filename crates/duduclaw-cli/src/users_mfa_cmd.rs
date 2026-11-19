@@ -19,18 +19,41 @@ pub enum UsersCommands {
     MfaEnrollmentCode { email: String, challenge_ref: String },
     /// 在閘道主機產生第一位管理員的一次性首次設定碼（30 分鐘有效）
     MfaSetupCode,
+    /// TEST BUILD ONLY (never in a release): write the first Administrator's
+    /// one-time setup code to a new root-only file for automated acceptance.
+    /// Linux, root, a TEST-licence build and DUDUCLAW_ISO_DISPOSABLE=1 only.
+    #[cfg(duduclaw_test_root)]
+    MfaSetupCodeTest {
+        /// New file for the code (must not exist; its directory must be
+        /// root-owned and not writable by group or other).
+        #[arg(long)]
+        out: std::path::PathBuf,
+    },
 }
+
+/// E10 (owner decision 2026-11-20): exists only in a `--cfg duduclaw_test_root` build.
+#[cfg(duduclaw_test_root)]
+#[path = "users_mfa_test_build.rs"]
+mod test_build;
+
+const MFA_RESET_COMMAND: duduclaw_core::OperatorCommand = duduclaw_core::OperatorCommand {
+    name: "duduclaw ops users mfa-reset",
+    path: &["ops", "users", "mfa-reset"],
+};
+const MFA_ENROLLMENT_CODE_COMMAND: duduclaw_core::OperatorCommand = duduclaw_core::OperatorCommand {
+    name: "duduclaw ops users mfa-enrollment-code",
+    path: &["ops", "users", "mfa-enrollment-code"],
+};
+const MFA_SETUP_CODE_COMMAND: duduclaw_core::OperatorCommand = duduclaw_core::OperatorCommand {
+    name: "duduclaw ops users mfa-setup-code",
+    path: &["ops", "users", "mfa-setup-code"],
+};
+#[cfg(not(duduclaw_test_root))]
 pub const OPERATOR_COMMANDS: &[duduclaw_core::OperatorCommand] =
-    &[duduclaw_core::OperatorCommand {
-        name: "duduclaw ops users mfa-reset",
-        path: &["ops", "users", "mfa-reset"],
-    }, duduclaw_core::OperatorCommand {
-        name: "duduclaw ops users mfa-enrollment-code",
-        path: &["ops", "users", "mfa-enrollment-code"],
-    }, duduclaw_core::OperatorCommand {
-        name: "duduclaw ops users mfa-setup-code",
-        path: &["ops", "users", "mfa-setup-code"],
-    }];
+    &[MFA_RESET_COMMAND, MFA_ENROLLMENT_CODE_COMMAND, MFA_SETUP_CODE_COMMAND];
+#[cfg(duduclaw_test_root)]
+pub const OPERATOR_COMMANDS: &[duduclaw_core::OperatorCommand] =
+    &[MFA_RESET_COMMAND, MFA_ENROLLMENT_CODE_COMMAND, MFA_SETUP_CODE_COMMAND, test_build::OPERATOR_COMMAND];
 pub fn bash_decision(
     command: &str,
     caller: &duduclaw_core::HookCaller,
@@ -51,6 +74,10 @@ pub fn run(home: &Path, command: UsersCommands) -> Result<()> {
             use std::io::IsTerminal;
             run_setup_code(home, &markers, std::io::stdout().is_terminal(), &mut std::io::stdout())
         }
+        // Own gates (no AI-marker or terminal check: unattended acceptance);
+        // prints only fixed lines and exits 0 / 3 / 1.
+        #[cfg(duduclaw_test_root)]
+        UsersCommands::MfaSetupCodeTest { out } => std::process::exit(test_build::run(home, &out)),
     }
 }
 /// RM-135: the first Administrator's one-time setup code. Host access only;
@@ -123,7 +150,12 @@ mod tests {
             let path=[ops.get_name(),users.get_name(),command.get_name()];
             assert!(OPERATOR_COMMANDS.iter().any(|entry|entry.path==path));
             let mut argv=vec!["duduclaw",path[0],path[1],path[2]];
-            if path[2]!="mfa-setup-code" { argv.push("a@example.com"); }
+            match path[2] {
+                "mfa-setup-code" => {}
+                // Only present in a `--cfg duduclaw_test_root` build.
+                "mfa-setup-code-test" => argv.extend(["--out", "/root/setup-code"]),
+                _ => argv.push("a@example.com"),
+            }
             if path[2]=="mfa-enrollment-code" { argv.push("0123456789ab"); }
             assert!(crate::Cli::try_parse_from(&argv).is_ok());
             assert!(bash_decision(&argv.join(" "), &duduclaw_core::HookCaller::Agent("a".into())).is_some());
@@ -185,7 +217,44 @@ mod tests {
         run_setup_code(dir.path(), &[], true, &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(text.split(|c: char| !c.is_ascii_hexdigit()).any(|word| word.len() == 32), "{text}");
-        assert_eq!(db.query_audit_log(None, Some("mfa.bootstrap_code_issued"), 10).unwrap().len(), 1);
+        let rows = db.query_audit_log(None, Some("mfa.bootstrap_code_issued"), 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        // The host command's audit actor is unchanged (E10 gives the TEST-build issuer its own).
+        assert_eq!(rows[0].detail.as_deref(), Some("本機指令列（身分未驗證）"));
+    }
+
+    /// E10 production proof: a normal build has no TEST-only setup-code
+    /// sub-command anywhere in the clap tree, no Bash-lane entry for it, and
+    /// `mfa-setup-code` keeps every gate (AI markers, interactive terminal).
+    #[cfg(not(duduclaw_test_root))]
+    #[test]
+    fn production_build_has_no_test_only_setup_code_command() {
+        use clap::{CommandFactory, Parser};
+        fn names(command: &clap::Command, out: &mut Vec<String>) {
+            out.push(command.get_name().to_owned());
+            out.extend(command.get_all_aliases().map(str::to_owned));
+            for sub in command.get_subcommands() {
+                names(sub, out);
+            }
+        }
+        let mut all = Vec::new();
+        names(&crate::Cli::command(), &mut all);
+        assert!(all.iter().any(|name| name == "mfa-setup-code"), "walked the real command tree");
+        assert!(all.iter().all(|name| !name.contains("mfa-setup-code-test")), "TEST-only sub-command in a production build");
+        assert!(crate::Cli::try_parse_from(["duduclaw", "ops", "users", "mfa-setup-code-test", "--out", "/root/code"]).is_err());
+        assert!(crate::Cli::try_parse_from(["duduclaw", "ops", "users", "mfa-setup-code", "--out", "/root/code"]).is_err(),
+            "no hidden flag on the production command");
+        assert_eq!(OPERATOR_COMMANDS.len(), 3);
+        assert!(OPERATOR_COMMANDS.iter().all(|entry| !entry.name.contains("mfa-setup-code-test")));
+        // `mfa-setup-code` behaviour unchanged: AI markers and non-terminals refused, nothing minted.
+        let (dir, db) = pending_bootstrap();
+        let mut out = Vec::new();
+        for marker in crate::ai_session_guard::AI_SESSION_ENV_VARS {
+            assert!(run_setup_code(dir.path(), &[*marker], true, &mut out).unwrap_err().to_string().contains("AI"));
+        }
+        assert!(run_setup_code(dir.path(), &[], false, &mut out).is_err());
+        assert!(out.is_empty());
+        assert!(db.query_audit_log(None, Some("mfa.bootstrap_code_issued"), 10).unwrap().is_empty());
     }
 
     #[test]

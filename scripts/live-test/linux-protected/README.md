@@ -117,6 +117,56 @@ or the trampoline's process structure, re-run `bundle --accept-mcp` on a real
 disposable host. That run ends with the signed-manifest verify. Unit tests do
 not replace it.
 
+## TEST-only first-run setup code (v1.83 R8u, owner decision E10)
+
+A fresh team-edition home enforces two-factor sign-in: the first Administrator's
+login returns `{mfa_enrollment_required, enrollment_token, setup_code_required}`, and
+the setup code normally comes only from `duduclaw ops users mfa-setup-code` on an
+interactive terminal. For unattended acceptance a TEST-key `duduclaw` (built with
+`--cfg duduclaw_test_root`, `scripts/isolation-test-keys.sh keys`) has one more
+sub-command that **exists only in such builds** (a release build has no such
+variant, help text or string, and `scripts/refuse-test-license-build.py`, the
+packager and `container/Dockerfile.server` refuse any gateway binary containing
+`mfa-setup-code-test` or its fixed stderr line; it is never in a release):
+
+```sh
+sudo env DUDUCLAW_ISO_DISPOSABLE=1 DUDUCLAW_HOME=/var/lib/duduclaw/.duduclaw \
+  duduclaw ops users mfa-setup-code-test --out /root/<private dir>/setup-code
+```
+
+It runs only on Linux as root, only when the binary reports `TEST-LICENSE <key>`
+(the licence build identity; `TEST-LICENSE none` is refused) and only with
+`DUDUCLAW_ISO_DISPOSABLE=1`. It does not refuse AI-session markers and needs no
+terminal. `DUDUCLAW_HOME` selects the home exactly as for the other `ops users`
+commands (default `~/.duduclaw`, so the protected service home must be named). The
+code is issued like the host command's (same 30-minute, single-use, replaces an
+outstanding one) with the audit actor `測試建置的自動驗收（身分未驗證）`, and is written
+only to `--out`: a new file (must not exist; never follows a symlink) created 0600 and
+owned by root, in a directory owned by root and not writable by group or other.
+stdout stays empty; stderr gets `TEST BUILD ONLY: issuing a first-run setup code for
+automated acceptance` and one fixed result line. Exit status: `0` written, `3` not
+needed (policy not enforced or no single first Administrator; no file is left), `1`
+refused or failed (a closed reason label on stderr; no file is left, and a refused
+`--out` never mints a code). After the first Administrator has finished two-factor
+setup it is refused for good, like the host command.
+
+Then complete the enforced first-run enrolment with the acceptance client (loopback,
+Python standard library):
+
+```sh
+python3 connectors_rpc.py --state <private dir>/admin.json --data-home /var/lib/duduclaw/.duduclaw \
+  enroll-mfa-bootstrap --setup-code-file /root/<private dir>/setup-code [--email E --password P]
+```
+
+`POST /api/login` → `POST /api/mfa/enroll/bootstrap {enrollment_token, setup_code}` →
+`POST /api/mfa/enroll/begin {enrollment_token}` → `POST /api/mfa/enroll/confirm
+{enrollment_token, code}` (TOTP from the returned secret) → a normal login answered on
+`POST /api/mfa/verify {challenge_id, code}`. The state file (0600) ends with a usable
+session and the TOTP secret, so `call … --stepup` works and later logins answer the
+TOTP challenge themselves. The setup code is never printed; delete the file afterwards.
+Unit tests of the sub-command's gates run only in a test-root build:
+`RUSTFLAGS='--cfg duduclaw_test_root' CARGO_TARGET_DIR=target/test-root cargo test -p duduclaw-cli --lib users_mfa_cmd`.
+
 ## Connector acceptance (`connectors-acceptance.sh`)
 
 Source of truth for the matrix: `wiki/duduclaw-kb/architecture/native-linux-isolation-v181-work-breakdown.md` (task G3, "Infrastructure and acceptance"). The script executes items 1-15 as numbered checks (`01a`, `01b`, ... sub-checks), prints `PASS` / `FAIL` / `SKIP` per check, a final summary, and exits non-zero on any `FAIL`. A `SKIP` always names what is missing; it is never counted as a pass.
@@ -218,7 +268,7 @@ Environment given to the driver: `DUDUCLAW_ISO_DATA` (service home), `DUDUCLAW_I
 
 * Written against the v1.81 RPC surface and the F3 readiness reason names (`personal_binding_conflict`, `connector_setup_required`, `revoked`, `binding_evidence_missing`, `service_unavailable`). On a build without F3, 2c and 12a FAIL by design. **The script was written without a shell or a Linux host available: it has been read through but neither executed nor run through `bash -n` / `shellcheck` / `python3 -m py_compile`. Do those three first, then expect a first-run shakedown.**
 * Response shapes the harness assumes and searches for (and reports as FAIL/SKIP with evidence if they differ): `isolation.employee_list` nodes carry `label`, `employee_id` and a status/usable field; the staff request response carries a request id; `migration.confirmations.list` items carry `category`, `status`, `binding`; `system.status` exposes `isolation_readiness`.
-* Admin MFA: the harness enrols TOTP for the first-run admin through `mfa.enroll_begin`/`confirm`. If the build enforces an independent enrolment proof (`proof_required`), automation stops with a clear `FAIL setup`; enrol by hand (`--pause-after-setup` is too late for that) or run on a build/policy where the admin can enrol directly. Login of alice/bob/carol/dave must return a session without MFA for the same reason.
+* Admin MFA: the harness enrols TOTP for the first-run admin through `mfa.enroll_begin`/`confirm`, which needs a session, i.e. a policy that does not enforce two-factor sign-in. Under an enforced policy (fresh team-edition home) that path stops with a clear `FAIL setup`; on a TEST-key build use the first-run flow of "TEST-only first-run setup code" above instead (`mfa-setup-code-test` then `connectors_rpc.py enroll-mfa-bootstrap`); a release build has no unattended way, so enrol by hand there. The harness script itself has not been switched to that flow. Login of alice/bob/carol/dave must return a session without MFA (each would need its own enrolment proof under enforcement).
 * 2c and 5 tamper with `users.db` as the service account (they drop and re-create `isolation_personal_binding_insert` / overwrite `auth_meta.isolation_tenant_id`) and restore it afterwards. This simulates a database-level attacker or an A3 trigger bypass; if the product opens `users.db` differently the check reports `SKIP` with the database error.
 * 6b may legitimately FAIL while spawnd keeps the UID/storage of a tombstoned Personal employee and refuses a new live allocation with the same label (A2 open item 1).
 * The sqlite stand-in proves binding/lifecycle/refusal behaviour, not a Google/Notion/GitHub/Odoo request path; those only count when their provider checks PASS.
