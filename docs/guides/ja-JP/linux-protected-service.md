@@ -235,7 +235,7 @@ sudo journalctl -u duduclaw-gateway.service --no-pager | grep -E 'isolated run (
 | 事前チェック（権限はまだ使われていない） | `preflight.model`、`preflight.runtime_policy`、`preflight.model_policy`、`preflight.redaction`、`preflight.interceptor`、`authorize.agent_dir_missing`、`authorize.effort`、`authorize.utility_call`、`authorize.work_dir_override`、`authorize.agent_dir`、`authorize.capabilities_policy`、`authorize.native_gate`、`authorize.runtime_kind`、`authorize.explore_lane`、`authorize.tool_restrictions`、`authorize.codex_home`、`authorize.product_policy`、`authorize.interceptor`、`authorize.runtime_id`、`authorize.max_turns`、`step_limit.agent_dir`、`step_limit.unavailable` | 社員の `agent.toml`（`[model] effort`、`[capabilities]`）、ランタイムとモデルの製品ポリシー、マスキングと CCR の設定。 |
 | 認可（1 回限りの実行権限） | `authorization.ingress.*`（依頼した人：`no_scope`、`consumed`、`capture.*`（メッセージ受信時のサインイン確認：`no_web_credential`、`web_identity`、`channel_conflict`、`channel_mapping`、`requester`、`user_db`、`user_inactive`、`epoch`、`blocking`）、`agent_path`、`home_mismatch`、`no_turn`、`no_session`、`no_attended_proof`、`attended_proof_invalid`、`nested_dispatch`、`principal_mismatch`、`proof_expired`、`identity_recheck`、`blocking`）、`authorization.issue.*`（権限の発行：`boot_owner`、`product_authority`、`lifecycle`、`snapshot`、`epoch`、`principal`、`binding`、`policy_revision`、`tools`、`human`、`selectors`、`capability`、`users_recheck`、`policy_changed`、`lifecycle_recheck`、`snapshot_recheck`、`facts_recheck`）、および `authorization.consumed`、`authorization.installed_mismatch`、`authorization.agent_label`、`authorization.home`、`authorization.principal_context`、`authorization.background_issue`、`authorization.ingress_issue` | その人のアカウントが有効で、パスワード変更が不要で、この社員に作業を割り当てられること。サインインが有効なこと。社員の所属（共有の組織または個人の所有者）と割り当ての状態。 |
 | 実行計画 | `request.encode`、`plan.readiness`、`plan.boot_owner`、`plan.home_mismatch`、`plan.employee_unconfirmed`、`plan.root_publication`、`plan.blocking`、`plan.unavailable` | 準備完了の状態。社員が確認済みであること。root の公開設定がこの社員にこのランタイムを提供していること。 |
-| 起動準備 | `launch.readiness`、`launch.boot_owner`、`launch.boundary_unhealthy`、`launch.employee_unconfirmed`、`launch.employee_mismatch`、`launch.product_prepare`、`launch.binding`、`launch.blocking`、`launch.resolver`、`launch.connectors`、`launch.worker_plans`、`launch.factories`、`launch.dispatcher`、`launch.protected_launch`、`launch.authority_pairing` | この社員の保護されたツール境界（ツールの投影、コネクター）。 |
+| 起動準備 | `launch.readiness`、`launch.boot_owner`、`launch.boundary_unhealthy`、`launch.employee_unconfirmed`、`launch.employee_mismatch`、`launch.product_prepare`、`launch.binding`、`launch.blocking`、`launch.resolver`、`launch.connectors`、`launch.worker_plans`、`launch.factories`、`launch.dispatcher`、`launch.protected_launch`、`launch.authority_pairing`、`launch.bind.<step>`（実行の予約後。`<step>` は下の `isolated launch preparation refused` と同じ） | この社員の保護されたツール境界（ツールの投影、コネクター）。`launch.bind.*` は下の表を参照。 |
 | 実行開始の依頼 | `spawn.prepare`、`spawn.not_protected`、`spawn.admission`、`spawn.backend.unavailable`、`.denied`、`.would_deadlock`、`.not_found`、`.timeout`、`.io`、`.protocol`、`spawn.start.permission_denied`、`.not_found`、`.timed_out`、`.other` | `spawn.backend.*` は隔離サービス（またはその制御ソケット）が拒否したときの固定分類です。隔離サービスは開始の拒否をログに残さないため、`duduclaw-spawnd` のジャーナルに何もなくても、このグループは除外できません。 |
 | 開始後（`isolated run refused after start`） | `run.stdin_missing`、`run.stdout_missing`、`run.stderr_missing`、`run.input`、`run.output_drain`、`run.stderr_drain`、`run.wait`、`run.refused`、`output.parse`、`output.empty`、`output.utf8` | ランタイムの結果。`isolated run refused` の行がすでにある場合は追加で記録しません。 |
 | `unlabelled` | — | ラベルのない拒否。不具合なので報告してください。 |
@@ -253,6 +253,28 @@ sudo journalctl -u duduclaw-gateway.service --no-pager | grep -E 'isolated (spaw
 | 開始の依頼の作成 | `admission`、`workspace_delivery`、`workspace`、`entry`、`reservation_state`、`resource_limits`、`inputs`、`attachments`、`request_invalid`、`connection_state`、`live_check`、`fd_plan` | 準備状態が変わった。ワークスペースの証明が一致しない。計画が社員自身以外のワークスペースを指定している。実行が不明、別の社員のもの、開始済み、または 30 秒の予約が期限切れ。ランタイムの記録で出力または入力の上限が 0。入力が上限を超えた。添付が多すぎる。依頼が無効（例：ステップ上限が 1〜1000 の範囲外）。制御接続が閉じている。権限の即時確認が拒否した。記述子の構成が一致しない。 |
 | 送信後 | `admission_after_send`、`start_reply` | 開始の依頼の送信中に準備状態が変わった（実行は取り消されます）。想定外の応答。 |
 | その他の制御依頼 | `cancel_state`、`live_status_reservation`、`work_op`、`helper_op` | 取り消しが中断済み、または既に拒否された。状態の応答が別の予約を指している。その経路では許可されていない操作。 |
+
+`step` が `launch_prepare` のとき、ゲートウェイはその直前にもう 1 件、警告 `isolated launch preparation refused` を記録します。フィールドは拒否した確認を示す固定の `step` だけです（識別子、パス、内容は含みません）。そのターンの `isolated run not started` の行には `spawn.backend.denied` ではなく `site="launch.bind.<step>"` が表示されます。
+
+```sh
+sudo journalctl -u duduclaw-gateway.service --no-pager | grep -E 'isolated (launch preparation refused|spawn refused locally|run not started)'
+```
+
+| `step` | 意味 |
+| --- | --- |
+| `recheck.expired` | 実行権限の期限切れ。権限は保護された実行を依頼した時点で発行され、有効期間は 30 分で、Web サインイン自体の有効期限を超えません。サインインし直してください。システム時計のずれもここに表れます。 |
+| `recheck.agent` | 社員がゲートウェイの現在の社員一覧にもういない。 |
+| `recheck.identity` | 権限の発行後に、社員のライフサイクル（割り当て、確認、root の読み戻し）またはその人のアカウント情報（組織、アクセス世代、ポリシー世代、サインイン世代）が変わった。例：適用中の社員承認や所属の変更、全端末からのサインアウト、二要素認証の変更。 |
+| `recheck.policy_revision` | ポリシーの入力ファイルが存在するのに読めない・解析できない、社員の `agent.toml` に `[agent] status = "active"` がない、または `config.toml` がない。入力：社員の有効な `agent.toml`、`CONTRACT.toml`（省略可）、`preset_bindings.toml`、`org.toml`、`config.toml`、カスタムのマスキング設定、`KILLSWITCH.toml`。 |
+| `recheck.revision_changed` | 権限の発行後にポリシーの入力が変わった：`agent.toml` の `[capabilities]`、`[permissions]`、`[agent]` の `reports_to`／`department`／`role`、`CONTRACT.toml`、プリセットの割り当て、`org.toml` の上位の連鎖、`config.toml` の `[delegation]`、`[acp]`、`[provenance]`、`[integrations]`、`[redaction]`、カスタムのマスキング設定、`KILLSWITCH.toml`。会話履歴、記憶、`.claude/`、`.mcp.json`、`SOUL.md`、スキルは入力ではありません。 |
+| `recheck.epoch`、`epoch_after_snapshot` | 確認の途中（下の状態問い合わせの前または後）にその人のアカウント情報が変わった。 |
+| `recheck.background` | スケジュールや委任の作業のみ：そのバックグラウンド記録がもうこの実行を認可していない。 |
+| `live_snapshot` | 予約した実行について隔離サービスの状態応答が失敗した、または 250 ミリ秒以内に届かなかった（その後この実行の制御接続は閉じられます）。`duduclaw-spawnd` のジャーナルとホストの負荷を確認してください。 |
+| `binding_mismatch` | 隔離サービスが、この実行を別の社員のもの、またはもう予約状態ではないと報告した。 |
+| `revoked_before`、`revoked_after` | 準備中に実行が取り消された（例：ターンが停止された）。 |
+| `verify_blocking` | 権限確認用のブロッキング処理プールが 2 秒間空かなかった、または確認に 10 秒以上かかった（`users.db`／`apply.db` や root の読み戻しが遅い）。 |
+| `inner_prepare.<class>` | ツール境界が実行用権限の発行を拒否した。`<class>` は `unavailable`、`denied`、`would_deadlock`、`not_found`、`timeout`、`io`、`protocol` のいずれか（`denied`：予約が終了した、計画が実行と一致しない、またはランタイムの MCP 登録や権限の発行が拒否された）。 |
+| `prepared_missing`、`state_lock`、`associations` | 同じ起動が 2 回準備された、状態が壊れた、またはゲートウェイの結び付け済み実行の表（4096 件）が満杯か既にこの実行を含んでいる。不具合なので報告してください。 |
 
 保護モードでは、拒否された作業の原因を文面から判定できない場合、末尾の理由コードは `unknown` ではなく `safety_gate` になります。
 

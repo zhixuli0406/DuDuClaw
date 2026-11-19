@@ -1143,7 +1143,8 @@ pub(super) mod tests {
     }
 
     /// The protected sources that name sites (the macros' literal arguments).
-    const SITE_SOURCES: [&str; 7] = [include_str!("runtime.rs"), include_str!("boot.rs"), include_str!("ingress.rs"),
+    const SITE_SOURCES: [&str; 8] = [include_str!("runtime.rs"), include_str!("boot.rs"), include_str!("ingress.rs"),
+        include_str!("launch.rs"),
         include_str!("../runtime/openai_compat.rs"), include_str!("../runtime/codex.rs"),
         include_str!("../runtime/grok.rs"), include_str!("../runtime/generic_cli.rs")];
 

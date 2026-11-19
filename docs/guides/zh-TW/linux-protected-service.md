@@ -235,7 +235,7 @@ sudo journalctl -u duduclaw-gateway.service --no-pager | grep -E 'isolated run (
 | 前置檢查（尚未使用任何授權） | `preflight.model`、`preflight.runtime_policy`、`preflight.model_policy`、`preflight.redaction`、`preflight.interceptor`；`authorize.agent_dir_missing`、`authorize.effort`、`authorize.utility_call`、`authorize.work_dir_override`、`authorize.agent_dir`、`authorize.capabilities_policy`、`authorize.native_gate`、`authorize.runtime_kind`、`authorize.explore_lane`、`authorize.tool_restrictions`、`authorize.codex_home`、`authorize.product_policy`、`authorize.interceptor`、`authorize.runtime_id`、`authorize.max_turns`；`step_limit.agent_dir`、`step_limit.unavailable` | 員工的 `agent.toml`（`[model] effort`、`[capabilities]`）、執行環境與模型的產品政策、遮罩與 CCR 設定。 |
 | 授權（一次性的執行授權） | `authorization.ingress.*`：提出要求的人——`no_scope`、`consumed`、`capture.*`（訊息進來時的登入檢查：`no_web_credential`、`web_identity`、`channel_conflict`、`channel_mapping`、`requester`、`user_db`、`user_inactive`、`epoch`、`blocking`）、`agent_path`、`home_mismatch`、`no_turn`、`no_session`、`no_attended_proof`、`attended_proof_invalid`、`nested_dispatch`、`principal_mismatch`、`proof_expired`、`identity_recheck`、`blocking`；`authorization.issue.*`：核發授權——`boot_owner`、`product_authority`、`lifecycle`、`snapshot`、`epoch`、`principal`、`binding`、`policy_revision`、`tools`、`human`、`selectors`、`capability`、`users_recheck`、`policy_changed`、`lifecycle_recheck`、`snapshot_recheck`、`facts_recheck`；以及 `authorization.consumed`、`authorization.installed_mismatch`、`authorization.agent_label`、`authorization.home`、`authorization.principal_context`、`authorization.background_issue`、`authorization.ingress_issue` | 這個人的帳號仍有效、不需要更改密碼，且可以指派工作給這位員工；登入仍有效；員工的歸屬（共用組織或個人擁有者）與配置狀態。 |
 | 執行計畫 | `request.encode`、`plan.readiness`、`plan.boot_owner`、`plan.home_mismatch`、`plan.employee_unconfirmed`、`plan.root_publication`、`plan.blocking`、`plan.unavailable` | 就緒狀態；員工已確認；root 發布的設定有提供這個執行環境給這位員工。 |
-| 啟動準備 | `launch.readiness`、`launch.boot_owner`、`launch.boundary_unhealthy`、`launch.employee_unconfirmed`、`launch.employee_mismatch`、`launch.product_prepare`、`launch.binding`、`launch.blocking`、`launch.resolver`、`launch.connectors`、`launch.worker_plans`、`launch.factories`、`launch.dispatcher`、`launch.protected_launch`、`launch.authority_pairing` | 這位員工的受保護工具邊界（工具投影、連接器）。 |
+| 啟動準備 | `launch.readiness`、`launch.boot_owner`、`launch.boundary_unhealthy`、`launch.employee_unconfirmed`、`launch.employee_mismatch`、`launch.product_prepare`、`launch.binding`、`launch.blocking`、`launch.resolver`、`launch.connectors`、`launch.worker_plans`、`launch.factories`、`launch.dispatcher`、`launch.protected_launch`、`launch.authority_pairing`；`launch.bind.<step>`（執行已預約之後；`<step>` 與下方 `isolated launch preparation refused` 相同） | 這位員工的受保護工具邊界（工具投影、連接器）；`launch.bind.*` 見下方的表。 |
 | 要求開始執行 | `spawn.prepare`、`spawn.not_protected`、`spawn.admission`；`spawn.backend.unavailable`、`.denied`、`.would_deadlock`、`.not_found`、`.timeout`、`.io`、`.protocol`；`spawn.start.permission_denied`、`.not_found`、`.timed_out`、`.other` | `spawn.backend.*` 是隔離服務（或其控制通道）拒絕時的固定類別。隔離服務拒絕開始執行時不會寫日誌，所以 `duduclaw-spawnd` 日誌沒有紀錄，並不能排除這一組。 |
 | 開始之後（`isolated run refused after start`） | `run.stdin_missing`、`run.stdout_missing`、`run.stderr_missing`、`run.input`、`run.output_drain`、`run.stderr_drain`、`run.wait`、`run.refused`；`output.parse`、`output.empty`、`output.utf8` | 執行環境的結果；已有 `isolated run refused` 那一行時，不會再多記。 |
 | `unlabelled` | — | 沒有代號的拒絕：這是缺陷，請回報。 |
@@ -253,6 +253,28 @@ sudo journalctl -u duduclaw-gateway.service --no-pager | grep -E 'isolated (spaw
 | 組成開始要求 | `admission`、`workspace_delivery`、`workspace`、`entry`、`reservation_state`、`resource_limits`、`inputs`、`attachments`、`request_invalid`、`connection_state`、`live_check`、`fd_plan` | 就緒狀態改變；工作區證明不符；計畫指定的不是員工自己的工作區；執行不存在、屬於其他員工、已經開始，或 30 秒的預約已過期；執行環境紀錄的輸出或輸入額度為零；請求超過輸入額度；附件太多；要求無效（例如步數上限不在 1–1000）；控制連線已關閉；即時授權檢查拒絕；描述子配置不符。 |
 | 送出之後 | `admission_after_send`、`start_reply` | 開始要求送出期間就緒狀態改變（這次執行會被取消）；非預期的回覆。 |
 | 其他控制要求 | `cancel_state`、`live_status_reservation`、`work_op`、`helper_op` | 取消已放棄或已被拒絕；狀態回覆指向另一個預約；該路徑不允許的操作。 |
+
+`step` 為 `launch_prepare` 時，閘道會在它之前再記一筆警告 `isolated launch preparation refused`，只有一個固定欄位 `step`，指出是哪一項檢查拒絕（不含識別資訊、路徑或內容）。這一輪的 `isolated run not started` 那一行則會顯示 `site="launch.bind.<step>"`，而不是 `spawn.backend.denied`。
+
+```sh
+sudo journalctl -u duduclaw-gateway.service --no-pager | grep -E 'isolated (launch preparation refused|spawn refused locally|run not started)'
+```
+
+| `step` | 代表什麼 |
+| --- | --- |
+| `recheck.expired` | 執行授權已過期。授權在要求受保護執行時核發，有效 30 分鐘，且不會超過網頁登入本身的到期時間；請重新登入。系統時鐘跳動也會出現在這裡。 |
+| `recheck.agent` | 這位員工已不在閘道的即時員工清單中。 |
+| `recheck.identity` | 授權之後，員工的生命週期（配置、確認、root 讀回）或此人的帳號資料（組織、存取世代、政策世代、登入世代）有變動，例如仍在套用中的員工核准或歸屬變更、登出所有裝置、第二道驗證變更。 |
+| `recheck.policy_revision` | 某個政策來源存在但無法讀取或解析、員工的 `agent.toml` 沒有 `[agent] status = "active"`，或缺少 `config.toml`。來源：員工實際生效的 `agent.toml`、`CONTRACT.toml`（可省略）、`preset_bindings.toml`、`org.toml`、`config.toml`、自訂遮蔽設定檔、`KILLSWITCH.toml`。 |
+| `recheck.revision_changed` | 授權之後某個政策來源有變動：`agent.toml` 的 `[capabilities]`、`[permissions]`、`[agent]` 的 `reports_to`／`department`／`role`；`CONTRACT.toml`；預設組合的綁定；`org.toml` 的上層鏈；`config.toml` 的 `[delegation]`、`[acp]`、`[provenance]`、`[integrations]`、`[redaction]`；自訂遮蔽設定檔；`KILLSWITCH.toml`。對話紀錄、記憶、`.claude/`、`.mcp.json`、`SOUL.md` 與技能都不是來源。 |
+| `recheck.epoch`、`epoch_after_snapshot` | 檢查期間（下方狀態查詢之前或之後）此人的帳號資料有變動。 |
+| `recheck.background` | 僅限排程或委派的工作：它的背景紀錄已不再授權這次執行。 |
+| `live_snapshot` | 隔離服務對這個已預約執行的狀態回覆失敗，或 250 毫秒內沒有回覆（之後這次執行的控制連線會關閉）。請檢查 `duduclaw-spawnd` 日誌與主機負載。 |
+| `binding_mismatch` | 隔離服務回報這個執行屬於其他員工，或已不在預約狀態。 |
+| `revoked_before`、`revoked_after` | 準備期間這次執行被取消（例如這一輪被停止）。 |
+| `verify_blocking` | 閘道用來做授權檢查的阻塞工作池忙碌超過 2 秒，或檢查超過 10 秒（`users.db`／`apply.db` 或 root 讀回太慢）。 |
+| `inner_prepare.<class>` | 工具邊界拒絕發出這次執行的能力憑證；`<class>` 為 `unavailable`、`denied`、`would_deadlock`、`not_found`、`timeout`、`io` 或 `protocol`（`denied`：預約已結束、計畫與執行不符，或執行環境的 MCP 註冊或憑證核發被拒）。 |
+| `prepared_missing`、`state_lock`、`associations` | 同一個啟動被準備兩次、其狀態已損壞，或閘道的已綁定執行表（4096）已滿或已有這個執行：這是缺陷，請回報。 |
 
 在受保護模式下，若被拒絕的工作無法從文字判斷原因，結尾的原因代碼會是 `safety_gate`，不再是 `unknown`。
 
