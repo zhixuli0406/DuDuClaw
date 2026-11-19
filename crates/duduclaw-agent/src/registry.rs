@@ -482,8 +482,11 @@ impl AgentRegistry {
         const MAX_PROMPT_BYTES: u64 = 1024 * 1024;
         let mut skills: Vec<SkillFile> = Vec::new();
         // The layer root and every ancestor are checked with lstat semantics
-        // and opened component by component with O_NOFOLLOW. Keep handles,
-        // never a canonicalize-then-reopen pathname, during the entire walk.
+        // and opened component by component with O_NOFOLLOW; ancestors only
+        // search-only (Linux O_PATH: the installed home's root-owned 0711
+        // parent is traversable, not readable), the layer itself O_RDONLY.
+        // Keep handles, never a canonicalize-then-reopen pathname, during the
+        // entire walk.
         let root = match SafeDir::open(skills_dir) {
             Ok(root) => root,
             Err(error) => {
@@ -833,6 +836,103 @@ mod load_skills_tests {
             vec!["honest"],
             "symlink to outside the skill root must not be followed"
         );
+    }
+
+    /// R8v regression: on the installed host both journal layers
+    /// (`<home>/skills`, `<home>/agents/acc1/SKILLS`) sat below the root-owned
+    /// 0711 `/var/lib/duduclaw` and were refused with EACCES ("refused unsafe
+    /// skill layer"). A search-only (0o311) ancestor reproduces it unprivileged.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn layers_below_a_search_only_ancestor_load() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let parent = tmp.path().join("lib");
+        let home = parent.join(".duduclaw");
+        write_skill(&home, "skills/pdf/SKILL.md", "global");
+        write_skill(&home, "agents/acc1/SKILLS/notes.md", "local");
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o311)).unwrap();
+        let global = load(&home.join("skills")).await;
+        let local = load(&home.join("agents/acc1/SKILLS")).await;
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(names(&global), ["pdf"]);
+        assert_eq!(names(&local), ["notes"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    const ROOT_CHILD_HOME: &str = "DUDUCLAW_ISO_SKILL_LAYER_HOME";
+
+    /// The installed shape on a root VM (R8v): `/var/lib/duduclaw-isotest-*`
+    /// is root:root 0711 (as `/var/lib/duduclaw`); its `.duduclaw` child and
+    /// `skills`, `agents`, `agents/acc1`, `agents/acc1/SKILLS` are owned by an
+    /// unprivileged account (uid/gid 65534) with mode 0700, and a copy of this
+    /// test binary re-runs [`skill_layer_child_as_account`] as that account,
+    /// which must seed and load the company-wide layer and load the per-agent
+    /// layer.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "iso_root_: root Linux VM; root:root 0711 parent under /var/lib, account-owned 0700 home and skill layers, child process as uid 65534"]
+    fn iso_root_skill_layer_loads_below_a_root_0711_parent() {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+        use std::os::unix::process::CommandExt;
+        const ACCOUNT: u32 = 65534;
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        assert_eq!(unsafe { libc::geteuid() }, 0, "run as root on a disposable VM");
+        let parent = std::path::PathBuf::from(format!("/var/lib/duduclaw-isotest-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::DirBuilder::new().mode(0o700).create(&parent).unwrap();
+        let _cleanup = Cleanup(parent.clone());
+        std::os::unix::fs::chown(&parent, Some(0), Some(0)).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o711)).unwrap();
+        let home = parent.join(".duduclaw");
+        for dir in [home.clone(), home.join("skills"), home.join("agents"),
+            home.join("agents/acc1"), home.join("agents/acc1/SKILLS")] {
+            std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::os::unix::fs::chown(&dir, Some(ACCOUNT), Some(ACCOUNT)).unwrap();
+        }
+        let local = home.join("agents/acc1/SKILLS/notes.md");
+        std::fs::write(&local, "local").unwrap();
+        std::os::unix::fs::chown(&local, Some(ACCOUNT), Some(ACCOUNT)).unwrap();
+        // The checkout may sit below a private home; run a copy the account can execute.
+        let binary = parent.join("test-binary");
+        std::fs::copy(std::env::current_exe().unwrap(), &binary).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let status = std::process::Command::new(&binary)
+            .args(["--exact", "registry::load_skills_tests::skill_layer_child_as_account", "--ignored", "--test-threads=1", "--nocapture"])
+            .env(ROOT_CHILD_HOME, &home)
+            .current_dir("/")
+            .uid(ACCOUNT)
+            .gid(ACCOUNT)
+            .status()
+            .unwrap();
+        assert!(status.success(), "child as uid {ACCOUNT}: {status}");
+        let meta = std::fs::symlink_metadata(home.join("skills/pdf/SKILL.md")).unwrap();
+        assert_eq!((meta.uid(), meta.mode() & 0o777), (ACCOUNT, 0o600));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "internal: executed by iso_root_skill_layer_loads_below_a_root_0711_parent as the unprivileged account"]
+    fn skill_layer_child_as_account() {
+        let Some(home) = std::env::var_os(ROOT_CHILD_HOME) else { return };
+        let home = std::path::PathBuf::from(home);
+        assert_ne!(unsafe { libc::geteuid() }, 0);
+        // Premise, as measured on the installed host: the parent is not readable.
+        let error = std::fs::File::open(home.parent().unwrap()).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EACCES), "{error}");
+        // The WP19 seed (third journal message) into the company-wide layer.
+        let seeded = crate::builtin_skills::install_office_skills(&home.join("skills")).unwrap();
+        assert!(!seeded.is_empty());
+        let conflicts = crate::builtin_skills::office_script_conflicts(&home.join("skills"));
+        assert!(conflicts.is_empty(), "{conflicts:?}");
+        // Both layers from the journal load.
+        let global = AgentRegistry::load_skills_blocking(&home.join("skills"));
+        assert!(names(&global).iter().any(|name| name == "pdf"), "{:?}", names(&global));
+        let local = AgentRegistry::load_skills_blocking(&home.join("agents/acc1/SKILLS"));
+        assert_eq!(names(&local), ["notes"]);
     }
 }
 

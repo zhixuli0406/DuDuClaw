@@ -270,25 +270,95 @@ pub fn read_attachment(agent_dir: &Path, input: &Path, max_bytes: u64) -> Result
     Ok(bytes)
 }
 
+/// Search-only directory walk (R8v-2), a private mirror of
+/// `duduclaw_agent::skill_loader::safe_dir` (this crate does not depend on it).
+/// On the installed native-Linux layout the gateway home sits under the
+/// root:root 0711 `/var/lib/duduclaw`, which the gateway account may search
+/// but not read, so ancestors of the directory actually used are opened
+/// `O_PATH` and only `fstat`ed / used as `openat` bases.
+#[cfg(unix)]
+mod search_walk {
+    use std::{ffi::CStr, fs::File, io, os::fd::{AsRawFd, FromRawFd}};
+
+    /// Linux: `O_PATH` needs only search (`x`) permission. Other Unix targets
+    /// have no `O_PATH` and keep `O_RDONLY` (the 0711 layout is Linux-only).
+    fn search_access() -> libc::c_int {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        { libc::O_PATH }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        { libc::O_RDONLY }
+    }
+
+    // `O_PATH|O_NOFOLLOW` without `O_DIRECTORY` would hand back a symlink
+    // descriptor; `O_DIRECTORY` refuses that, and the type is re-checked on
+    // the descriptor anyway (`fstat` is valid on an `O_PATH` descriptor).
+    fn require_directory(dir: File) -> io::Result<File> {
+        if !dir.metadata()?.is_dir() {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "traversed component is not a directory"));
+        }
+        Ok(dir)
+    }
+
+    /// `/`, search-only.
+    pub(super) fn root() -> io::Result<File> {
+        // SAFETY: a NUL-terminated absolute path; no dirfd involved.
+        let fd = unsafe { libc::open(c"/".as_ptr(), search_access() | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+        if fd < 0 { return Err(io::Error::last_os_error()); }
+        // SAFETY: open returned a new, uniquely owned descriptor.
+        require_directory(unsafe { File::from_raw_fd(fd) })
+    }
+
+    /// Child directory `name` of a search-only `parent`, itself search-only,
+    /// never following a symlink: lstat-at refusal of anything but a real
+    /// directory, then `openat(search|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC)`.
+    pub(super) fn child(parent: &File, name: &CStr) -> io::Result<File> {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: a valid directory fd, a NUL-terminated single component
+        // and a writable `stat` buffer.
+        if unsafe { libc::fstatat(parent.as_raw_fd(), name.as_ptr(), stat.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fstatat succeeded and initialised the buffer.
+        if unsafe { stat.assume_init() }.st_mode & libc::S_IFMT != libc::S_IFDIR {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "directory is a symlink or non-directory"));
+        }
+        // SAFETY: a valid directory fd and a NUL-terminated single component.
+        let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(),
+            search_access() | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+        if fd < 0 { return Err(io::Error::last_os_error()); }
+        // SAFETY: openat returned a new, uniquely owned descriptor.
+        require_directory(unsafe { File::from_raw_fd(fd) })
+    }
+}
+
 // Walk relative to held directory descriptors, so replacing an ancestor with a
 // symlink between validation and open cannot redirect a read/write (Unix).
+// Components above the target are only traversed ([`search_walk`]); the target
+// itself is opened `O_RDONLY|O_DIRECTORY|O_NOFOLLOW` as before, because its
+// handle is used for `openat`/`unlinkat`/`renameat` and `fsync`.
 #[cfg(unix)]
 fn directory_handle(path: &Path) -> Result<File, String> {
     use std::os::{fd::{AsRawFd, FromRawFd}, unix::ffi::OsStrExt};
-    let mut dir = File::open("/").map_err(|_| "無法開啟附件目錄".to_string())?;
+    let mut names = Vec::new();
     for part in path.components() {
         match part {
             Component::RootDir | Component::CurDir => continue,
             Component::Normal(name) => {
-                let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| "目錄名稱無效".to_string())?;
-                let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
-                if fd < 0 { return Err("無法安全開啟附件目錄".into()); }
-                dir = unsafe { File::from_raw_fd(fd) };
+                names.push(std::ffi::CString::new(name.as_bytes()).map_err(|_| "目錄名稱無效".to_string())?);
             }
             _ => return Err("附件目錄必須是完整路徑".into()),
         }
     }
-    Ok(dir)
+    let Some((last, ancestors)) = names.split_last() else {
+        return File::open("/").map_err(|_| "無法開啟附件目錄".to_string());
+    };
+    let mut dir = search_walk::root().map_err(|_| "無法開啟附件目錄".to_string())?;
+    for name in ancestors {
+        dir = search_walk::child(&dir, name).map_err(|_| "無法安全開啟附件目錄".to_string())?;
+    }
+    let fd = unsafe { libc::openat(dir.as_raw_fd(), last.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    if fd < 0 { return Err("無法安全開啟附件目錄".into()); }
+    Ok(unsafe { File::from_raw_fd(fd) })
 }
 
 /// Windows has no openat in std: pin every ancestor against rename/deletion,

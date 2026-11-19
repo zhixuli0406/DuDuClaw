@@ -234,6 +234,25 @@ pub fn office_script_conflicts(skills_dir: &Path) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// R8v: the WP19 seed ("could not seed the bundled skills", EACCES) walked
+    /// the home's ancestors with read opens. Below a search-only (0o311)
+    /// ancestor it must seed and verify the company-wide layer.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn office_seed_works_below_a_search_only_ancestor() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let parent = temp.path().join("lib");
+        let home = parent.join(".duduclaw");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o311)).unwrap();
+        let installed = install_office_skills(&home.join("skills"));
+        let conflicts = office_script_conflicts(&home.join("skills"));
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(installed.unwrap(), ["docx", "xlsx", "pptx", "pdf"]);
+        assert!(conflicts.is_empty(), "{conflicts:?}");
+    }
+
     #[test]
     fn office_defaults_exclude_programming_and_preserve_existing_content() {
         let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
