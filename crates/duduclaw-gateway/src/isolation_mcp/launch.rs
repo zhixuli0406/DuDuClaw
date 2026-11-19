@@ -2,8 +2,12 @@
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use duduclaw_execution::command::{NativeCommandSnapshot, ProtectedLaunch};
 use duduclaw_isolation::{bounded::Text, execution::*, ids::EmployeeId};
+use duduclaw_mcp_boundary::launch_steps::{ActivateStep, PrepareStep};
 use super::{ProtectedMcpLaunch, authority::{BindStep, GatewayAuthority, PreparedAuthority}};
 use super::refusal::{site, RefusalSite};
+
+#[path = "launch_sites.rs"]
+mod sites;
 
 /// R8z-2: the fixed step at which [`AuthorizedLaunch::prepare`] gave up.
 /// Every refusal of that preparation is exactly one of these; the returned
@@ -23,14 +27,16 @@ pub(super) enum LaunchStep {
     /// The blocking-pool wrapper itself failed (2 s slot wait, 10 s job
     /// limit, or the job panicked).
     VerifyBlocking,
-    /// The MCP-boundary launch (`ProtectedMcpLaunch::prepare`) refused with
-    /// this backend error class.
-    InnerPrepare(BackendError),
+    /// R8z-3: the MCP-boundary launch (`ProtectedMcpLaunch::prepare_checked`)
+    /// refused at this check.
+    InnerPrepare(PrepareStep),
 }
 
 impl LaunchStep {
-    /// The fixed `step` log value.
-    pub(super) const fn as_str(self) -> &'static str {
+    /// The fixed `step` log value. R8z-3: an `InnerPrepare` step is its site
+    /// label without the `launch.bind.` prefix (`inner_prepare.<substep>`),
+    /// a slice of that `&'static str` literal.
+    pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::PreparedMissing => "prepared_missing",
             Self::StateLock => "state_lock",
@@ -38,20 +44,12 @@ impl LaunchStep {
             Self::Bind(step) => step.as_str(),
             Self::RevokedAfter => "revoked_after",
             Self::VerifyBlocking => "verify_blocking",
-            Self::InnerPrepare(error) => match error {
-                BackendError::Unavailable => "inner_prepare.unavailable",
-                BackendError::Denied => "inner_prepare.denied",
-                BackendError::WouldDeadlock => "inner_prepare.would_deadlock",
-                BackendError::NotFound => "inner_prepare.not_found",
-                BackendError::Timeout => "inner_prepare.timeout",
-                BackendError::Io => "inner_prepare.io",
-                BackendError::Protocol => "inner_prepare.protocol",
-            },
+            Self::InnerPrepare(_) => self.site().as_str().strip_prefix("launch.bind.").unwrap_or("inner_prepare"),
         }
     }
 
     /// The per-turn refusal site: `launch.bind.<step>`.
-    pub(super) const fn site(self) -> RefusalSite {
+    pub(super) fn site(self) -> RefusalSite {
         match self {
             Self::PreparedMissing => site!("launch.bind.prepared_missing"),
             Self::StateLock => site!("launch.bind.state_lock"),
@@ -71,16 +69,23 @@ impl LaunchStep {
             },
             Self::RevokedAfter => site!("launch.bind.revoked_after"),
             Self::VerifyBlocking => site!("launch.bind.verify_blocking"),
-            Self::InnerPrepare(error) => match error {
-                BackendError::Unavailable => site!("launch.bind.inner_prepare.unavailable"),
-                BackendError::Denied => site!("launch.bind.inner_prepare.denied"),
-                BackendError::WouldDeadlock => site!("launch.bind.inner_prepare.would_deadlock"),
-                BackendError::NotFound => site!("launch.bind.inner_prepare.not_found"),
-                BackendError::Timeout => site!("launch.bind.inner_prepare.timeout"),
-                BackendError::Io => site!("launch.bind.inner_prepare.io"),
-                BackendError::Protocol => site!("launch.bind.inner_prepare.protocol"),
-            },
+            Self::InnerPrepare(step) => sites::prepare(step),
         }
+    }
+}
+
+/// R8z-3: the fixed check at which `ProtectedMcpLaunch::activate_checked`
+/// refused (after StartRun, before the run's MCP endpoint is served).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ActivationStep(pub(super) ActivateStep);
+
+impl ActivationStep {
+    /// The per-turn refusal site: `launch.activate.inner_activate.<substep>`.
+    pub(super) fn site(self) -> RefusalSite { sites::activate(self.0) }
+    /// The fixed `step` log value: the site label without `launch.activate.`
+    /// (`inner_activate.<substep>`), a slice of that `&'static str` literal.
+    pub(super) fn as_str(self) -> &'static str {
+        self.site().as_str().strip_prefix("launch.activate.").unwrap_or("inner_activate")
     }
 }
 
@@ -89,12 +94,27 @@ impl LaunchStep {
 /// `duduclaw_execution::command::protected` on the turn's own task, so the
 /// turn trace is in scope here (outside a turn, `note_site` is a no-op). The
 /// blocking-pool job never logs or records: it returns its step to here.
+/// R8z-3: the MCP-boundary layer does not log either; it returns its step
+/// (`prepare_checked`) and this line is the only one for it.
 fn log_refused(step: LaunchStep) {
     tracing::warn!(step = step.as_str(), "isolated launch preparation refused");
 }
 
 fn refused(step: LaunchStep, error: BackendError) -> BackendError {
     log_refused(step);
+    super::runtime::note_site(step.site());
+    error
+}
+
+/// R8z-3: the one line for a refused activation (fixed `step` only). Like
+/// `prepare`, `activate` is awaited inline by `duduclaw_execution::command`
+/// on the turn's own task, so the site reaches this turn's trace.
+fn log_activation_refused(step: ActivationStep) {
+    tracing::warn!(step = step.as_str(), "isolated launch activation refused");
+}
+
+fn activation_refused(step: ActivationStep, error: BackendError) -> BackendError {
+    log_activation_refused(step);
     super::runtime::note_site(step.site());
     error
 }
@@ -145,17 +165,26 @@ impl ProtectedLaunch for AuthorizedLaunch {
                 Err(_) => return Err(refused(LaunchStep::VerifyBlocking, BackendError::Denied)),
             };
             if self.revoked.load(Ordering::Acquire) { return Err(refused(LaunchStep::RevokedAfter, BackendError::Denied)); }
-            match self.inner.prepare(run, class, runtime, native, pty).await {
+            // R8z-3: the same preparation as `inner.prepare` (which ignores
+            // the native snapshot), with the check that refused.
+            let _ = native;
+            match self.inner.prepare_checked(run, class, runtime, pty).await {
                 Ok(policy) => {
                     lease.armed = false;
                     Ok(policy)
                 }
-                Err(error) => Err(refused(LaunchStep::InnerPrepare(error), error)),
+                Err((step, error)) => Err(refused(LaunchStep::InnerPrepare(step), error)),
             }
         })
     }
     fn activate(&self, run: RunHandle, mcp: Option<std::os::fd::OwnedFd>) -> BackendFuture<'_, ()> {
-        self.inner.activate(run, mcp)
+        Box::pin(async move {
+            // R8z-3: `inner.activate` with the check that refused; the error
+            // and every side effect (a dropped pending guard revokes the
+            // capability; the caller cancels the started run) are unchanged.
+            self.inner.activate_checked(run, mcp).await
+                .map_err(|(step, error)| activation_refused(ActivationStep(step), error))
+        })
     }
     fn revoke(&self, run: RunHandle) -> BackendFuture<'_, ()> {
         Box::pin(async move {
@@ -186,15 +215,83 @@ mod tests {
     use super::*;
     use super::super::refusal::site;
 
-    const ERRORS: [BackendError; 7] = [BackendError::Unavailable, BackendError::Denied, BackendError::WouldDeadlock,
-        BackendError::NotFound, BackendError::Timeout, BackendError::Io, BackendError::Protocol];
-
     fn every_step() -> Vec<LaunchStep> {
         let mut steps = vec![LaunchStep::PreparedMissing, LaunchStep::StateLock, LaunchStep::RevokedBefore,
             LaunchStep::RevokedAfter, LaunchStep::VerifyBlocking];
         steps.extend(BindStep::ALL.map(LaunchStep::Bind));
-        steps.extend(ERRORS.map(LaunchStep::InnerPrepare));
+        steps.extend(PrepareStep::every().into_iter().map(LaunchStep::InnerPrepare));
         steps
+    }
+
+    fn every_activation() -> Vec<ActivationStep> { ActivateStep::every().into_iter().map(ActivationStep).collect() }
+
+    /// R8z-3: every MCP-boundary step maps to the listed site whose label is
+    /// the step's own segments (`launch_steps`) under its fixed prefix, so
+    /// the boundary's structure and this crate's literals cannot drift.
+    #[test]
+    fn r8z3_every_boundary_step_maps_to_its_listed_site() {
+        let mut seen = std::collections::BTreeSet::new();
+        for step in PrepareStep::every() {
+            let site = LaunchStep::InnerPrepare(step).site().as_str();
+            assert_eq!(site, format!("launch.bind.inner_prepare.{}", step.label()), "{step:?}");
+            assert_eq!(LaunchStep::InnerPrepare(step).as_str(), format!("inner_prepare.{}", step.label()));
+            assert!(seen.insert(site), "duplicate site {site}");
+        }
+        for step in every_activation() {
+            let site = step.site().as_str();
+            assert_eq!(site, format!("launch.activate.inner_activate.{}", step.0.label()), "{step:?}");
+            assert_eq!(step.as_str(), format!("inner_activate.{}", step.0.label()));
+            assert!(super::super::refusal::SITES.contains(&site), "{site}");
+            assert!(seen.insert(site), "duplicate site {site}");
+        }
+        assert_eq!(seen.len(), 61 + 83);
+        // Every listed `launch.bind.inner_prepare.*` / `launch.activate.*`
+        // site is reachable from exactly one step (no orphan literal).
+        let listed = super::super::refusal::SITES.iter()
+            .filter(|site| site.starts_with("launch.bind.inner_prepare.") || site.starts_with("launch.activate."))
+            .count();
+        assert_eq!(listed, seen.len());
+        use duduclaw_mcp_boundary::launch_steps::{AcceptanceCheck, BridgeStep, PublishStep, ReceiptCheck, RegistrationStep};
+        assert_eq!(LaunchStep::InnerPrepare(PrepareStep::Registry(RegistrationStep::Acceptance(AcceptanceCheck::RuntimeDigest)))
+            .as_str(), "inner_prepare.registry.acceptance.runtime_digest");
+        assert_eq!(ActivationStep(ActivateStep::Bridge(BridgeStep::Publish(PublishStep::Receipt(ReceiptCheck::Mount)))).site().as_str(),
+            "launch.activate.inner_activate.bridge.publish.receipt.mount");
+    }
+
+    /// R8z-3: one activation line per refusal, fixed `step` field only.
+    #[test]
+    fn r8z3_the_activation_refused_line_has_the_fixed_step_field_only() {
+        for step in every_activation() {
+            let log = LogCapture(Default::default());
+            let writer = log.clone();
+            let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false).with_target(false)
+                .with_max_level(tracing::Level::WARN).with_writer(move || writer.clone()).finish();
+            tracing::subscriber::with_default(subscriber, || log_activation_refused(step));
+            let logs = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+            assert_eq!(logs.lines().count(), 1, "{logs}");
+            assert!(logs.contains("WARN") && logs.contains("isolated launch activation refused"), "{logs}");
+            assert!(logs.trim_end().ends_with(&format!("refused step=\"{}\"", step.as_str())), "{logs}");
+            assert_eq!(logs.matches('=').count(), 1, "{logs}");
+        }
+    }
+
+    /// R8z-3: a refused preparation and a refused activation each record
+    /// their own site before the outer `spawn.backend.*` mapping.
+    #[tokio::test]
+    async fn r8z3_inner_refusals_record_their_sites() {
+        use duduclaw_mcp_boundary::launch_steps::{AcceptanceCheck, RegistrationStep};
+        let step = LaunchStep::InnerPrepare(PrepareStep::Registry(RegistrationStep::Acceptance(AcceptanceCheck::Version)));
+        let site = super::super::runtime::tests::site_of(async move {
+            assert_eq!(refused(step, BackendError::Denied), BackendError::Denied);
+            super::super::runtime::note_site(site!("spawn.backend.denied"));
+        }).await;
+        assert_eq!(site, Some("launch.bind.inner_prepare.registry.acceptance.version"));
+        let step = ActivationStep(ActivateStep::McpReceipt(BackendError::Unavailable));
+        let site = super::super::runtime::tests::site_of(async move {
+            assert_eq!(activation_refused(step, BackendError::Unavailable), BackendError::Unavailable);
+            super::super::runtime::note_site(site!("spawn.backend.unavailable"));
+        }).await;
+        assert_eq!(site, Some("launch.activate.inner_activate.mcp_receipt.unavailable"));
     }
 
     /// R8z-2: every step has a distinct fixed label, and its turn site is
@@ -211,7 +308,8 @@ mod tests {
             assert!(super::super::refusal::SITES.contains(&step.site().as_str()), "{label}");
         }
         assert_eq!(LaunchStep::Bind(BindStep::RecheckPolicyRevision).as_str(), "recheck.policy_revision");
-        assert_eq!(LaunchStep::InnerPrepare(BackendError::Denied).as_str(), "inner_prepare.denied");
+        assert_eq!(LaunchStep::InnerPrepare(PrepareStep::Reservation(BackendError::Denied)).as_str(),
+            "inner_prepare.reservation.denied");
         assert_eq!(LaunchStep::VerifyBlocking.site().as_str(), "launch.bind.verify_blocking");
     }
 

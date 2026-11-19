@@ -477,7 +477,11 @@ fn valid_policy_binding(policy: &SpawnPolicy, run: RunHandle, employee: Employee
 #[cfg(target_os = "linux")]
 async fn activate(backend: &crate::SpawndBackend, run: RunHandle, lifecycle: &dyn ProtectedLaunch, mcp_requested: bool) -> io::Result<()> {
     let mcp = if mcp_requested { Some(backend.take_mcp(run).await.map_err(error)?) } else { None };
-    lifecycle.activate(run, mcp).await.map_err(error)
+    // R8z-3: like `launch_prepare`, the context collapses its refusals into
+    // one `BackendError`; this names the step. The caller's still-armed
+    // `Prepared` then cancels the started run and revokes the launch.
+    use crate::spawnd::local_refusal::{refuse, Step};
+    lifecycle.activate(run, mcp).await.map_err(|reason| error(refuse(Step::LaunchActivate, reason)))
 }
 
 #[cfg(test)]

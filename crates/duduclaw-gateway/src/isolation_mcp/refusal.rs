@@ -380,13 +380,155 @@ sites! {
     LaunchBindAssociations => "launch.bind.associations",
     LaunchBindRevokedAfter => "launch.bind.revoked_after",
     LaunchBindVerifyBlocking => "launch.bind.verify_blocking",
-    LaunchBindInnerPrepareUnavailable => "launch.bind.inner_prepare.unavailable",
-    LaunchBindInnerPrepareDenied => "launch.bind.inner_prepare.denied",
-    LaunchBindInnerPrepareWouldDeadlock => "launch.bind.inner_prepare.would_deadlock",
-    LaunchBindInnerPrepareNotFound => "launch.bind.inner_prepare.not_found",
-    LaunchBindInnerPrepareTimeout => "launch.bind.inner_prepare.timeout",
-    LaunchBindInnerPrepareIo => "launch.bind.inner_prepare.io",
-    LaunchBindInnerPrepareProtocol => "launch.bind.inner_prepare.protocol",
+    // R8z-3: the MCP-boundary launch preparation (`launch_steps::PrepareStep`,
+    // mapped in `launch_sites.rs`): `launch.bind.inner_prepare.<label>`.
+    LaunchBindInnerPrepareRevoked => "launch.bind.inner_prepare.revoked",
+    LaunchBindInnerPrepareReservationUnavailable => "launch.bind.inner_prepare.reservation.unavailable",
+    LaunchBindInnerPrepareReservationDenied => "launch.bind.inner_prepare.reservation.denied",
+    LaunchBindInnerPrepareReservationWouldDeadlock => "launch.bind.inner_prepare.reservation.would_deadlock",
+    LaunchBindInnerPrepareReservationNotFound => "launch.bind.inner_prepare.reservation.not_found",
+    LaunchBindInnerPrepareReservationTimeout => "launch.bind.inner_prepare.reservation.timeout",
+    LaunchBindInnerPrepareReservationIo => "launch.bind.inner_prepare.reservation.io",
+    LaunchBindInnerPrepareReservationProtocol => "launch.bind.inner_prepare.reservation.protocol",
+    LaunchBindInnerPrepareEmployeeMismatch => "launch.bind.inner_prepare.employee_mismatch",
+    LaunchBindInnerPrepareStateLock => "launch.bind.inner_prepare.state_lock",
+    LaunchBindInnerPreparePreparedMissing => "launch.bind.inner_prepare.prepared_missing",
+    LaunchBindInnerPreparePlanClass => "launch.bind.inner_prepare.plan_class",
+    LaunchBindInnerPreparePlanRuntime => "launch.bind.inner_prepare.plan_runtime",
+    LaunchBindInnerPreparePlanPty => "launch.bind.inner_prepare.plan_pty",
+    LaunchBindInnerPrepareRegistryPublicationRead => "launch.bind.inner_prepare.registry.publication_read",
+    LaunchBindInnerPrepareRegistryGeneration => "launch.bind.inner_prepare.registry.generation",
+    LaunchBindInnerPrepareRegistryRuntimeMissing => "launch.bind.inner_prepare.registry.runtime_missing",
+    LaunchBindInnerPrepareRegistryRuntimeDuplicate => "launch.bind.inner_prepare.registry.runtime_duplicate",
+    LaunchBindInnerPrepareRegistryAcceptanceMissing => "launch.bind.inner_prepare.registry.acceptance_missing",
+    LaunchBindInnerPrepareRegistryScriptExecutable => "launch.bind.inner_prepare.registry.script_executable",
+    LaunchBindInnerPrepareRegistryMcpDisabled => "launch.bind.inner_prepare.registry.mcp_disabled",
+    LaunchBindInnerPrepareRegistryProjectionInvalid => "launch.bind.inner_prepare.registry.projection_invalid",
+    LaunchBindInnerPrepareRegistryUnreported => "launch.bind.inner_prepare.registry.unreported",
+    LaunchBindInnerPrepareRegistryAcceptanceRuntime => "launch.bind.inner_prepare.registry.acceptance.runtime",
+    LaunchBindInnerPrepareRegistryAcceptanceVersion => "launch.bind.inner_prepare.registry.acceptance.version",
+    LaunchBindInnerPrepareRegistryAcceptanceRuntimeDigest => "launch.bind.inner_prepare.registry.acceptance.runtime_digest",
+    LaunchBindInnerPrepareRegistryAcceptanceBridgeDigest => "launch.bind.inner_prepare.registry.acceptance.bridge_digest",
+    LaunchBindInnerPrepareRegistryAcceptanceProjectionDigest => "launch.bind.inner_prepare.registry.acceptance.projection_digest",
+    LaunchBindInnerPrepareRegistryAcceptanceInheritedFd => "launch.bind.inner_prepare.registry.acceptance.inherited_fd",
+    LaunchBindInnerPrepareRegistryAcceptanceInitializeExit => "launch.bind.inner_prepare.registry.acceptance.initialize_exit",
+    LaunchBindInnerPrepareRegistryAcceptanceParentExecExit => "launch.bind.inner_prepare.registry.acceptance.parent_exec_exit",
+    LaunchBindInnerPrepareRegistryAcceptanceMcpChildExecExit => "launch.bind.inner_prepare.registry.acceptance.mcp_child_exec_exit",
+    LaunchBindInnerPrepareRegistryAcceptanceExclusiveConfigExit => "launch.bind.inner_prepare.registry.acceptance.exclusive_config_exit",
+    LaunchBindInnerPrepareRegistryAcceptanceTranscriptDigest => "launch.bind.inner_prepare.registry.acceptance.transcript_digest",
+    LaunchBindInnerPrepareRegistrationRuntime => "launch.bind.inner_prepare.registration_runtime",
+    LaunchBindInnerPrepareProjection => "launch.bind.inner_prepare.projection",
+    LaunchBindInnerPrepareArgv => "launch.bind.inner_prepare.argv",
+    LaunchBindInnerPrepareClock => "launch.bind.inner_prepare.clock",
+    LaunchBindInnerPrepareIssueLiveSnapshot => "launch.bind.inner_prepare.issue.live_snapshot",
+    LaunchBindInnerPrepareIssueNotReserved => "launch.bind.inner_prepare.issue.not_reserved",
+    LaunchBindInnerPrepareIssueReservation => "launch.bind.inner_prepare.issue.reservation",
+    LaunchBindInnerPrepareIssueExpiry => "launch.bind.inner_prepare.issue.expiry",
+    LaunchBindInnerPrepareIssueTime => "launch.bind.inner_prepare.issue.time",
+    LaunchBindInnerPrepareIssuePrincipal => "launch.bind.inner_prepare.issue.principal",
+    LaunchBindInnerPrepareIssueBinding => "launch.bind.inner_prepare.issue.binding",
+    LaunchBindInnerPrepareIssuePolicyRevision => "launch.bind.inner_prepare.issue.policy_revision",
+    LaunchBindInnerPrepareIssueAgentSlug => "launch.bind.inner_prepare.issue.agent_slug",
+    LaunchBindInnerPrepareIssueBindingPrincipal => "launch.bind.inner_prepare.issue.binding_principal",
+    LaunchBindInnerPrepareIssueGrants => "launch.bind.inner_prepare.issue.grants",
+    // R8z-4: the rule of the capability encoding that refused.
+    LaunchBindInnerPrepareIssueEncodeResourceMode => "launch.bind.inner_prepare.issue.encode.resource_mode",
+    LaunchBindInnerPrepareIssueEncodeInterval => "launch.bind.inner_prepare.issue.encode.interval",
+    LaunchBindInnerPrepareIssueEncodeDuplicateGrant => "launch.bind.inner_prepare.issue.encode.duplicate_grant",
+    LaunchBindInnerPrepareIssueEncodeOther => "launch.bind.inner_prepare.issue.encode.other",
+    LaunchBindInnerPrepareIssueRandom => "launch.bind.inner_prepare.issue.random",
+    LaunchBindInnerPrepareIssueSigner => "launch.bind.inner_prepare.issue.signer",
+    LaunchBindInnerPrepareIssueStateLock => "launch.bind.inner_prepare.issue.state_lock",
+    LaunchBindInnerPrepareIssueCapacity => "launch.bind.inner_prepare.issue.capacity",
+    LaunchBindInnerPrepareIssueDuplicate => "launch.bind.inner_prepare.issue.duplicate",
+    LaunchBindInnerPrepareVerifyBlocking => "launch.bind.inner_prepare.verify_blocking",
+    LaunchBindInnerPreparePendingDuplicate => "launch.bind.inner_prepare.pending_duplicate",
+    LaunchBindInnerPrepareRevokedAfter => "launch.bind.inner_prepare.revoked_after",
+    // R8z-3: the MCP-boundary activation after StartRun
+    // (`launch_steps::ActivateStep`): `launch.activate.inner_activate.<label>`.
+    LaunchActivateMcpFdMissing => "launch.activate.inner_activate.mcp_fd_missing",
+    LaunchActivateMcpReceiptUnavailable => "launch.activate.inner_activate.mcp_receipt.unavailable",
+    LaunchActivateMcpReceiptDenied => "launch.activate.inner_activate.mcp_receipt.denied",
+    LaunchActivateMcpReceiptWouldDeadlock => "launch.activate.inner_activate.mcp_receipt.would_deadlock",
+    LaunchActivateMcpReceiptNotFound => "launch.activate.inner_activate.mcp_receipt.not_found",
+    LaunchActivateMcpReceiptTimeout => "launch.activate.inner_activate.mcp_receipt.timeout",
+    LaunchActivateMcpReceiptIo => "launch.activate.inner_activate.mcp_receipt.io",
+    LaunchActivateMcpReceiptProtocol => "launch.activate.inner_activate.mcp_receipt.protocol",
+    LaunchActivateStateLock => "launch.activate.inner_activate.state_lock",
+    LaunchActivatePendingMissing => "launch.activate.inner_activate.pending_missing",
+    LaunchActivateReceiptControl => "launch.activate.inner_activate.receipt_control",
+    LaunchActivateBridgePlatform => "launch.activate.inner_activate.bridge.platform",
+    LaunchActivateBridgeRegistryPublicationRead => "launch.activate.inner_activate.bridge.registry.publication_read",
+    LaunchActivateBridgeRegistryGeneration => "launch.activate.inner_activate.bridge.registry.generation",
+    LaunchActivateBridgeRegistryRuntimeMissing => "launch.activate.inner_activate.bridge.registry.runtime_missing",
+    LaunchActivateBridgeRegistryRuntimeDuplicate => "launch.activate.inner_activate.bridge.registry.runtime_duplicate",
+    LaunchActivateBridgeRegistryAcceptanceMissing => "launch.activate.inner_activate.bridge.registry.acceptance_missing",
+    LaunchActivateBridgeRegistryScriptExecutable => "launch.activate.inner_activate.bridge.registry.script_executable",
+    LaunchActivateBridgeRegistryMcpDisabled => "launch.activate.inner_activate.bridge.registry.mcp_disabled",
+    LaunchActivateBridgeRegistryProjectionInvalid => "launch.activate.inner_activate.bridge.registry.projection_invalid",
+    LaunchActivateBridgeRegistryUnreported => "launch.activate.inner_activate.bridge.registry.unreported",
+    LaunchActivateBridgeRegistryAcceptanceRuntime => "launch.activate.inner_activate.bridge.registry.acceptance.runtime",
+    LaunchActivateBridgeRegistryAcceptanceVersion => "launch.activate.inner_activate.bridge.registry.acceptance.version",
+    LaunchActivateBridgeRegistryAcceptanceRuntimeDigest => "launch.activate.inner_activate.bridge.registry.acceptance.runtime_digest",
+    LaunchActivateBridgeRegistryAcceptanceBridgeDigest => "launch.activate.inner_activate.bridge.registry.acceptance.bridge_digest",
+    LaunchActivateBridgeRegistryAcceptanceProjectionDigest => "launch.activate.inner_activate.bridge.registry.acceptance.projection_digest",
+    LaunchActivateBridgeRegistryAcceptanceInheritedFd => "launch.activate.inner_activate.bridge.registry.acceptance.inherited_fd",
+    LaunchActivateBridgeRegistryAcceptanceInitializeExit => "launch.activate.inner_activate.bridge.registry.acceptance.initialize_exit",
+    LaunchActivateBridgeRegistryAcceptanceParentExecExit => "launch.activate.inner_activate.bridge.registry.acceptance.parent_exec_exit",
+    LaunchActivateBridgeRegistryAcceptanceMcpChildExecExit => "launch.activate.inner_activate.bridge.registry.acceptance.mcp_child_exec_exit",
+    LaunchActivateBridgeRegistryAcceptanceExclusiveConfigExit => "launch.activate.inner_activate.bridge.registry.acceptance.exclusive_config_exit",
+    LaunchActivateBridgeRegistryAcceptanceTranscriptDigest => "launch.activate.inner_activate.bridge.registry.acceptance.transcript_digest",
+    LaunchActivateBridgeRegistrationRuntime => "launch.activate.inner_activate.bridge.registration_runtime",
+    LaunchActivateBridgeProjection => "launch.activate.inner_activate.bridge.projection",
+    LaunchActivateBridgePublishPublicationRead => "launch.activate.inner_activate.bridge.publish.publication_read",
+    LaunchActivateBridgePublishGeneration => "launch.activate.inner_activate.bridge.publish.generation",
+    LaunchActivateBridgePublishRuntimeMissing => "launch.activate.inner_activate.bridge.publish.runtime_missing",
+    LaunchActivateBridgePublishRuntimeDuplicate => "launch.activate.inner_activate.bridge.publish.runtime_duplicate",
+    LaunchActivateBridgePublishAcceptanceMissing => "launch.activate.inner_activate.bridge.publish.acceptance_missing",
+    LaunchActivateBridgePublishScriptExecutable => "launch.activate.inner_activate.bridge.publish.script_executable",
+    LaunchActivateBridgePublishMcpDisabled => "launch.activate.inner_activate.bridge.publish.mcp_disabled",
+    LaunchActivateBridgePublishProjectionInvalid => "launch.activate.inner_activate.bridge.publish.projection_invalid",
+    LaunchActivateBridgePublishUnreported => "launch.activate.inner_activate.bridge.publish.unreported",
+    LaunchActivateBridgePublishAcceptanceRuntime => "launch.activate.inner_activate.bridge.publish.acceptance.runtime",
+    LaunchActivateBridgePublishAcceptanceVersion => "launch.activate.inner_activate.bridge.publish.acceptance.version",
+    LaunchActivateBridgePublishAcceptanceRuntimeDigest => "launch.activate.inner_activate.bridge.publish.acceptance.runtime_digest",
+    LaunchActivateBridgePublishAcceptanceBridgeDigest => "launch.activate.inner_activate.bridge.publish.acceptance.bridge_digest",
+    LaunchActivateBridgePublishAcceptanceProjectionDigest => "launch.activate.inner_activate.bridge.publish.acceptance.projection_digest",
+    LaunchActivateBridgePublishAcceptanceInheritedFd => "launch.activate.inner_activate.bridge.publish.acceptance.inherited_fd",
+    LaunchActivateBridgePublishAcceptanceInitializeExit => "launch.activate.inner_activate.bridge.publish.acceptance.initialize_exit",
+    LaunchActivateBridgePublishAcceptanceParentExecExit => "launch.activate.inner_activate.bridge.publish.acceptance.parent_exec_exit",
+    LaunchActivateBridgePublishAcceptanceMcpChildExecExit => "launch.activate.inner_activate.bridge.publish.acceptance.mcp_child_exec_exit",
+    LaunchActivateBridgePublishAcceptanceExclusiveConfigExit => "launch.activate.inner_activate.bridge.publish.acceptance.exclusive_config_exit",
+    LaunchActivateBridgePublishAcceptanceTranscriptDigest => "launch.activate.inner_activate.bridge.publish.acceptance.transcript_digest",
+    LaunchActivateBridgePublishPolicy => "launch.activate.inner_activate.bridge.publish.policy",
+    LaunchActivateBridgePublishDerive => "launch.activate.inner_activate.bridge.publish.derive",
+    LaunchActivateBridgePublishRecord => "launch.activate.inner_activate.bridge.publish.record",
+    LaunchActivateBridgePublishRegistrationChanged => "launch.activate.inner_activate.bridge.publish.registration_changed",
+    LaunchActivateBridgePublishRunReceiptRead => "launch.activate.inner_activate.bridge.publish.run_receipt_read",
+    LaunchActivateBridgePublishReceiptGeneration => "launch.activate.inner_activate.bridge.publish.receipt.generation",
+    LaunchActivateBridgePublishReceiptRun => "launch.activate.inner_activate.bridge.publish.receipt.run",
+    LaunchActivateBridgePublishReceiptEmployee => "launch.activate.inner_activate.bridge.publish.receipt.employee",
+    LaunchActivateBridgePublishReceiptRuntime => "launch.activate.inner_activate.bridge.publish.receipt.runtime",
+    LaunchActivateBridgePublishReceiptDigests => "launch.activate.inner_activate.bridge.publish.receipt.digests",
+    LaunchActivateBridgePublishReceiptProjectionDigest => "launch.activate.inner_activate.bridge.publish.receipt.projection_digest",
+    LaunchActivateBridgePublishReceiptMount => "launch.activate.inner_activate.bridge.publish.receipt.mount",
+    LaunchActivateBridgePublishReceiptAcceptance => "launch.activate.inner_activate.bridge.publish.receipt.acceptance",
+    LaunchActivateBridgeReceiptBinding => "launch.activate.inner_activate.bridge.receipt_binding",
+    LaunchActivateProjectionDigest => "launch.activate.inner_activate.projection_digest",
+    LaunchActivateDelivery => "launch.activate.inner_activate.delivery",
+    LaunchActivateClock => "launch.activate.inner_activate.clock",
+    LaunchActivateBoundaryActivateDelivery => "launch.activate.inner_activate.boundary_activate.delivery",
+    LaunchActivateBoundaryActivateUnknown => "launch.activate.inner_activate.boundary_activate.unknown",
+    LaunchActivateBoundaryActivateBinding => "launch.activate.inner_activate.boundary_activate.binding",
+    LaunchActivateBoundaryActivateTime => "launch.activate.inner_activate.boundary_activate.time",
+    LaunchActivateBoundaryActivateLiveSnapshot => "launch.activate.inner_activate.boundary_activate.live_snapshot",
+    LaunchActivateBoundaryActivateLiveMismatch => "launch.activate.inner_activate.boundary_activate.live_mismatch",
+    LaunchActivateBoundaryActivateRandom => "launch.activate.inner_activate.boundary_activate.random",
+    LaunchActivateBoundaryActivateStateLock => "launch.activate.inner_activate.boundary_activate.state_lock",
+    LaunchActivateBoundaryActivateRevoked => "launch.activate.inner_activate.boundary_activate.revoked",
+    LaunchActivateVerifyBlocking => "launch.activate.inner_activate.verify_blocking",
+    LaunchActivateActiveDuplicate => "launch.activate.inner_activate.active_duplicate",
+    LaunchActivateRevokedAfter => "launch.activate.inner_activate.revoked_after",
     // Asking spawnd to start the run.
     SpawnPrepare => "spawn.prepare",
     SpawnNotProtected => "spawn.not_protected",
@@ -432,21 +574,35 @@ const _: () = {
 // variant whose `as_str()` is `SITES[i]`.
 const _: () = {
     assert!(RefusalSite::ALL.len() == SITES.len(), "ALL and SITES differ in length");
+    // R8z-3: the list roughly doubled (the MCP-boundary launch steps), so the
+    // pairwise distinctness check compares a per-label FNV-1a hash first and
+    // the bytes only on a hash match; equal labels always have equal hashes,
+    // so the check is unchanged and stays far inside the const-eval budget.
+    const N: usize = SITES.len();
+    let mut hashes = [0u64; N];
     let mut index = 0;
-    while index < SITES.len() {
+    while index < N {
         let bytes = SITES[index].as_bytes();
         assert!(!bytes.is_empty(), "empty refusal site label");
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
         let mut at = 0;
         while at < bytes.len() {
             let byte = bytes[at];
             assert!(byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'.' || byte == b'_',
                 "a refusal site label is not lowercase [a-z0-9_.]");
+            hash = (hash ^ byte as u64).wrapping_mul(0x0100_0000_01b3);
             at += 1;
         }
+        hashes[index] = hash;
         assert!(const_str_eq(RefusalSite::ALL[index].as_str(), SITES[index]), "ALL and SITES out of order");
+        index += 1;
+    }
+    let mut index = 0;
+    while index < N {
         let mut other = index + 1;
-        while other < SITES.len() {
-            assert!(!const_str_eq(SITES[index], SITES[other]), "duplicate refusal site label");
+        while other < N {
+            assert!(hashes[index] != hashes[other] || !const_str_eq(SITES[index], SITES[other]),
+                "duplicate refusal site label");
             other += 1;
         }
         index += 1;

@@ -252,12 +252,13 @@ sudo journalctl -u duduclaw-gateway.service --no-pager | grep -E 'isolated (spaw
 | 預約之後、開始之前 | `launch_prepare`、`policy_binding`、`task_binding`、`pty_size` | 受保護的啟動環境拒絕（閘道為這次執行重新檢查此人的授權，或工具邊界發出這次執行的能力憑證：就緒狀態、員工的歸屬、執行環境的 MCP 註冊）；準備好的計畫與預約的執行不符；預約結束後才綁定任務；終端機大小無效。 |
 | 組成開始要求 | `admission`、`workspace_delivery`、`workspace`、`entry`、`reservation_state`、`resource_limits`、`inputs`、`attachments`、`request_invalid`、`connection_state`、`live_check`、`fd_plan` | 就緒狀態改變；工作區證明不符；計畫指定的不是員工自己的工作區；執行不存在、屬於其他員工、已經開始，或 30 秒的預約已過期；執行環境紀錄的輸出或輸入額度為零；請求超過輸入額度；附件太多；要求無效（例如步數上限不在 1–1000）；控制連線已關閉；即時授權檢查拒絕；描述子配置不符。 |
 | 送出之後 | `admission_after_send`、`start_reply` | 開始要求送出期間就緒狀態改變（這次執行會被取消）；非預期的回覆。 |
+| 開始之後、提供工具之前 | `launch_activate` | 受保護的啟動環境拒絕了這次執行的 MCP 端點（見下方 `isolated launch activation refused`）。已開始的執行會被取消，能力憑證也會撤銷。 |
 | 其他控制要求 | `cancel_state`、`live_status_reservation`、`work_op`、`helper_op` | 取消已放棄或已被拒絕；狀態回覆指向另一個預約；該路徑不允許的操作。 |
 
 `step` 為 `launch_prepare` 時，閘道會在它之前再記一筆警告 `isolated launch preparation refused`，只有一個固定欄位 `step`，指出是哪一項檢查拒絕（不含識別資訊、路徑或內容）。這一輪的 `isolated run not started` 那一行則會顯示 `site="launch.bind.<step>"`，而不是 `spawn.backend.denied`。
 
 ```sh
-sudo journalctl -u duduclaw-gateway.service --no-pager | grep -E 'isolated (launch preparation refused|spawn refused locally|run not started)'
+sudo journalctl -u duduclaw-gateway.service --no-pager | grep -E 'isolated (launch (preparation|activation) refused|spawn refused locally|run not started)'
 ```
 
 | `step` | 代表什麼 |
@@ -273,8 +274,40 @@ sudo journalctl -u duduclaw-gateway.service --no-pager | grep -E 'isolated (laun
 | `binding_mismatch` | 隔離服務回報這個執行屬於其他員工，或已不在預約狀態。 |
 | `revoked_before`、`revoked_after` | 準備期間這次執行被取消（例如這一輪被停止）。 |
 | `verify_blocking` | 閘道用來做授權檢查的阻塞工作池忙碌超過 2 秒，或檢查超過 10 秒（`users.db`／`apply.db` 或 root 讀回太慢）。 |
-| `inner_prepare.<class>` | 工具邊界拒絕發出這次執行的能力憑證；`<class>` 為 `unavailable`、`denied`、`would_deadlock`、`not_found`、`timeout`、`io` 或 `protocol`（`denied`：預約已結束、計畫與執行不符，或執行環境的 MCP 註冊或憑證核發被拒）。 |
 | `prepared_missing`、`state_lock`、`associations` | 同一個啟動被準備兩次、其狀態已損壞，或閘道的已綁定執行表（4096）已滿或已有這個執行：這是缺陷，請回報。 |
+
+閘道自己的檢查通過後，工具邊界會登記這次執行（`inner_prepare.<substep>`），各步驟如下：
+
+| `step` | 要檢查什麼 |
+| --- | --- |
+| `inner_prepare.revoked`、`inner_prepare.revoked_after` | 工具邊界準備期間這次執行被取消。 |
+| `inner_prepare.reservation.<class>`（`unavailable`、`denied`、`would_deadlock`、`not_found`、`timeout`、`io`、`protocol`） | 閘道對這個預約的紀錄：`denied` 表示 30 秒的預約已過期、控制連線已關閉，或已經開始；`not_found` 表示此閘道不認得這次執行。 |
+| `inner_prepare.plan_class`、`inner_prepare.plan_runtime`、`inner_prepare.plan_pty` | 為這一輪準備的計畫，其執行類別、執行環境或終端機模式與實際啟動不符：這是缺陷，請回報。 |
+| `inner_prepare.registry.publication_read`、`inner_prepare.registry.generation` | 閘道無法讀取 root 的執行環境公告 `/run/duduclaw-spawnd/publication.json`（擁有者、群組、權限、不同開機，或超過 1 秒的有效期：請確認 `duduclaw-spawnd` 正在執行且未卡住），或公告指向另一個已安裝世代（更新後請重新啟動閘道）。 |
+| `inner_prepare.registry.runtime_missing`、`.runtime_duplicate`、`.mcp_disabled`、`.script_executable` | 公告中沒有（或有兩筆）這個執行環境的紀錄、紀錄為 `mcp: false`，或可執行檔是腳本：已安裝的簽章政策沒有提供帶工具的這個執行環境。 |
+| `inner_prepare.registry.acceptance_missing` | 已安裝的套件沒有這個執行環境的 MCP 驗收紀錄：請安裝以 `--accept-mcp` 建置的套件。 |
+| `inner_prepare.registry.acceptance.<check>`（`runtime`、`version`、`runtime_digest`、`bridge_digest`、`projection_digest`、`inherited_fd`、`initialize_exit`、`parent_exec_exit`、`mcp_child_exec_exit`、`exclusive_config_exit`、`transcript_digest`）、`inner_prepare.registry.projection_invalid`、`inner_prepare.registration_runtime`、`inner_prepare.projection` | 已安裝套件的 MCP 驗收紀錄與公告的執行環境不符（驗收時用的是另一個執行環境二進位檔、版本或橋接程式，或另一個版本的政策工具）。請重新安裝相符的套件；對該套件執行 `duduclaw-isolation-policy verify` 會指出同一項檢查。 |
+| `inner_prepare.issue.live_snapshot` | 核發能力憑證時的即時授權重新檢查失敗（原因同上方的 `recheck.*` 與 `live_snapshot`）。 |
+| `inner_prepare.issue.not_reserved`、`.reservation`、`.expiry`、`.time` | 隔離服務已不再把這個預約回報為預約中，或預約已過期（系統時鐘跳動後也會出現）。 |
+| `inner_prepare.issue.principal`、`.binding`、`.policy_revision`、`.agent_slug`、`.binding_principal` | 這一輪擷取的授權與即時授權不同（此人、員工的歸屬或政策在期間有變動），或此人不能代表這位員工的歸屬行事。 |
+| `inner_prepare.issue.grants` | 這一輪的資源授權（工作區、連接器、網站來源）對這位員工不被接受。 |
+| `inner_prepare.issue.encode.<rule>`（`resource_mode`、`interval`、`duplicate_grant`、`other`） | 這次執行的能力憑證無法編碼：`interval`——這一輪的授權在能力憑證核發前已過期（或系統時鐘跳動）；其他則是缺陷（請回報）。 |
+| `inner_prepare.issue.random`、`.signer`、`.state_lock`、`.capacity`、`.duplicate`、`inner_prepare.employee_mismatch`、`.prepared_missing`、`.state_lock`、`.pending_duplicate`、`.argv`、`.clock`、`.registry.unreported` | 作業系統亂數來源或系統時鐘失敗，或是缺陷（請回報）。 |
+| `inner_prepare.verify_blocking` | 同上方 `verify_blocking`，發生在工具邊界的阻塞檢查。 |
+
+執行開始後，工具邊界會啟用它的 MCP 端點。若在這裡被拒，會記一筆 `isolated launch activation refused`（只有一個固定的 `step`：`inner_activate.<substep>`），接著是 `isolated spawn refused locally step="launch_activate"`；這一輪的 site 為 `launch.activate.<step>`。已開始的執行會被取消，能力憑證也會撤銷。
+
+| `step` | 要檢查什麼 |
+| --- | --- |
+| `inner_activate.mcp_fd_missing`、`inner_activate.mcp_receipt.<class>` | 隔離服務沒有交出這次執行的 MCP 端點（執行提早結束，或缺少 I/O 交接）。請檢查 `duduclaw-spawnd` 日誌。 |
+| `inner_activate.bridge.registry.*` | 同上方 `inner_prepare.registry.*`，在開始後重新讀取。 |
+| `inner_activate.bridge.publish.*`（上方 `registry` 的名稱）、`.publish.policy`、`.publish.derive`、`.publish.record`、`.publish.registration_changed` | 準備與啟用之間公告有變動（更新或授權變更），或已不再對這位員工提供這個執行環境。 |
+| `inner_activate.bridge.publish.run_receipt_read` | root 的單次執行 MCP 收據 `/run/duduclaw-spawnd/mcp-<run>.json` 不存在、來自其他開機，或超過 60 秒。請檢查 `duduclaw-spawnd` 日誌。 |
+| `inner_activate.bridge.publish.receipt.<group>`（`generation`、`run`、`employee`、`runtime`、`digests`、`projection_digest`、`mount`、`acceptance`）、`inner_activate.bridge.receipt_binding`、`.bridge.registration_runtime`、`.bridge.projection`、`inner_activate.projection_digest` | root 對已掛載工具設定的讀回與為這次執行準備的不符。請重新安裝相符的套件；若持續發生請回報。 |
+| `inner_activate.bridge.platform` | 不是 Linux。 |
+| `inner_activate.boundary_activate.live_mismatch`、`.live_snapshot`、`.time` | 端點送達時執行已不在進行中、此人的授權已改變、即時檢查失敗，或能力憑證已過期。 |
+| `inner_activate.delivery`、`.receipt_control`、`.boundary_activate.delivery`、`.boundary_activate.unknown`、`.boundary_activate.binding`、`.boundary_activate.revoked`、`inner_activate.pending_missing`、`.revoked_after`、`.active_duplicate` | 端點不屬於這次執行的預約，或期間執行被取消；否則是缺陷。 |
+| `inner_activate.boundary_activate.random`、`.boundary_activate.state_lock`、`inner_activate.state_lock`、`.clock`、`.verify_blocking` | 作業系統亂數來源、系統時鐘或阻塞檢查工作池失敗，或是缺陷。 |
 
 在受保護模式下，若被拒絕的工作無法從文字判斷原因，結尾的原因代碼會是 `safety_gate`，不再是 `unknown`。
 

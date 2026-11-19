@@ -2,6 +2,8 @@
 pub mod authority;
 pub mod io_authority;
 pub mod config;
+/// R8z-3: the fixed steps of the MCP-boundary launch's refusals.
+pub mod launch_steps;
 pub mod execution;
 pub mod execution_jobs;
 pub mod recording_jobs;

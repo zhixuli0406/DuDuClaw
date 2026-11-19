@@ -171,11 +171,25 @@ impl McpAcceptance {
         Ok(Sha256Digest(Sha256::digest(bytes).into()))
     }
     pub fn validate(&self, projection: &duduclaw_mcp_boundary::config::RuntimeProjection) -> io::Result<()> {
+        self.validate_check(projection).map_err(|_| denied())
+    }
+    /// R8z-3: [`Self::validate`] naming the first check that refused (the
+    /// former single condition chain, in its order).
+    pub fn validate_check(&self, projection: &duduclaw_mcp_boundary::config::RuntimeProjection)
+        -> std::result::Result<(), duduclaw_mcp_boundary::config::AcceptanceCheck> {
+        use duduclaw_mcp_boundary::config::AcceptanceCheck as C;
         let r = &projection.registration;
-        if self.runtime != r.runtime || self.version != r.version || self.runtime_digest != r.runtime_digest
-            || self.bridge_digest != r.bridge_digest || self.projection_digest != projection.digest()
-            || self.inherited_fd != 3 || self.initialize_exit != 0 || self.parent_exec_exit != 0
-            || self.mcp_child_exec_exit != 0 || self.exclusive_config_exit != 0 || !nonzero(self.transcript_digest) { return Err(denied()); }
+        if self.runtime != r.runtime { return Err(C::Runtime); }
+        if self.version != r.version { return Err(C::Version); }
+        if self.runtime_digest != r.runtime_digest { return Err(C::RuntimeDigest); }
+        if self.bridge_digest != r.bridge_digest { return Err(C::BridgeDigest); }
+        if self.projection_digest != projection.digest() { return Err(C::ProjectionDigest); }
+        if self.inherited_fd != 3 { return Err(C::InheritedFd); }
+        if self.initialize_exit != 0 { return Err(C::InitializeExit); }
+        if self.parent_exec_exit != 0 { return Err(C::ParentExecExit); }
+        if self.mcp_child_exec_exit != 0 { return Err(C::McpChildExecExit); }
+        if self.exclusive_config_exit != 0 { return Err(C::ExclusiveConfigExit); }
+        if !nonzero(self.transcript_digest) { return Err(C::TranscriptDigest); }
         Ok(())
     }
 }
@@ -985,6 +999,52 @@ mod tests {
         acceptance.mcp_child_exec_exit = 1; assert!(acceptance.validate(&projection).is_err());
         acceptance.mcp_child_exec_exit = 0; acceptance.inherited_fd = 4; assert!(acceptance.validate(&projection).is_err());
         acceptance.inherited_fd = 3; acceptance.bridge_digest = Sha256Digest([8; 32]); assert!(acceptance.validate(&projection).is_err());
+    }
+    /// R8z-3: each acceptance check that refuses is named, in the order of
+    /// the former condition chain; `validate` refuses exactly then.
+    #[test]
+    fn r8z3_mcp_acceptance_names_the_first_refusing_check() {
+        use duduclaw_mcp_boundary::config::AcceptanceCheck as C;
+        let registration = duduclaw_mcp_boundary::config::RuntimeRegistration { runtime: RuntimeKind::OpenAiCompat,
+            version: "api-worker-v1".into(), runtime_digest: Sha256Digest([1; 32]), bridge_digest: Sha256Digest([2; 32]),
+            bridge_executable: "/runtime/duduclaw-mcp-bridge".into() };
+        let projection = duduclaw_mcp_boundary::config::runtime_projection(registration).unwrap();
+        let good = McpAcceptance { runtime: RuntimeKind::OpenAiCompat, version: "api-worker-v1".into(),
+            runtime_digest: Sha256Digest([1; 32]), bridge_digest: Sha256Digest([2; 32]),
+            projection_digest: projection.digest(), launch_policy_digest: Sha256Digest([4; 32]), inherited_fd: 3,
+            initialize_exit: 0, parent_exec_exit: 0, mcp_child_exec_exit: 0, exclusive_config_exit: 0,
+            transcript_digest: Sha256Digest([3; 32]) };
+        assert_eq!(good.validate_check(&projection), Ok(()));
+        let edits: [(C, fn(&mut McpAcceptance)); 11] = [
+            (C::Runtime, |a| a.runtime = RuntimeKind::Claude),
+            (C::Version, |a| a.version = "v-api-worker-v1".into()),
+            (C::RuntimeDigest, |a| a.runtime_digest = Sha256Digest([9; 32])),
+            (C::BridgeDigest, |a| a.bridge_digest = Sha256Digest([9; 32])),
+            (C::ProjectionDigest, |a| a.projection_digest = Sha256Digest([9; 32])),
+            (C::InheritedFd, |a| a.inherited_fd = 4),
+            (C::InitializeExit, |a| a.initialize_exit = 1),
+            (C::ParentExecExit, |a| a.parent_exec_exit = 1),
+            (C::McpChildExecExit, |a| a.mcp_child_exec_exit = 1),
+            (C::ExclusiveConfigExit, |a| a.exclusive_config_exit = 1),
+            (C::TranscriptDigest, |a| a.transcript_digest = Sha256Digest([0; 32])),
+        ];
+        for (check, edit) in edits {
+            let mut bad = good.clone();
+            edit(&mut bad);
+            assert_eq!(bad.validate_check(&projection), Err(check), "{check:?}");
+            assert!(bad.validate(&projection).is_err(), "{check:?}");
+        }
+        // The launch-policy digest is `validate_launch`'s, not `validate`'s.
+        let mut other = good.clone();
+        other.launch_policy_digest = Sha256Digest([9; 32]);
+        assert_eq!(other.validate_check(&projection), Ok(()));
+        // Every adjacent pair reports the earlier check when both fail.
+        for pair in edits.windows(2) {
+            let mut both = good.clone();
+            (pair[0].1)(&mut both);
+            (pair[1].1)(&mut both);
+            assert_eq!(both.validate_check(&projection), Err(pair[0].0), "{:?} before {:?}", pair[0].0, pair[1].0);
+        }
     }
     #[test]
     #[ignore = "iso_root_: disposable Linux VM; verifies root receipt ownership and mode"]
