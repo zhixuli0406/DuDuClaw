@@ -5280,6 +5280,52 @@ pub use subject_listing::{SubjectFact, SubjectTripleForgetReport};
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn released_repro_1_cross_chat_fallback() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        for i in 0..4 {
+            let id = engine.store_fact(
+                "shared-agent", &format!("Alice orchard fact {i}"), "telegram",
+                "private-alice", "session-alice", crate::lineage::Provenance::test_only(),
+            ).await.unwrap();
+            // Explicit timestamps make the recency cutoff independent of clock resolution.
+            engine.conn.lock().await.execute(
+                "UPDATE key_facts SET timestamp = ?1 WHERE id = ?2",
+                params![format!("2026-01-0{}T00:00:00Z", i + 1), id],
+            ).unwrap();
+        }
+        // Bob's private turn: the public search API takes no chat/session/principal.
+        let hits = engine.search_facts("shared-agent", "Bob unmatchedquartz", 3).await.unwrap();
+        assert_eq!(hits.iter().map(|f| f.fact.as_str()).collect::<Vec<_>>(),
+            vec!["Alice orchard fact 3", "Alice orchard fact 2", "Alice orchard fact 1"]);
+        assert!(hits.iter().all(|f| f.chat_id == "private-alice" && f.source_session == "session-alice"));
+    }
+
+    #[tokio::test]
+    async fn released_repro_1_cross_chat_fts_match() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let id = engine.store_fact(
+            "shared-agent", "Alice uniqueorchid preference", "telegram", "private-alice",
+            "session-alice", crate::lineage::Provenance::test_only(),
+        ).await.unwrap();
+        engine.conn.lock().await.execute(
+            "UPDATE key_facts SET timestamp = '2000-01-01T00:00:00Z' WHERE id = ?1",
+            params![id],
+        ).unwrap();
+        engine.store_fact("shared-agent", "Unrelated newest fact", "telegram", "private-alice",
+            "session-alice", crate::lineage::Provenance::test_only()).await.unwrap();
+        // A recency fallback with limit 1 would return the unrelated fact instead.
+        assert_ne!(engine.get_recent_facts("shared-agent", 1).await.unwrap()[0].id, id);
+        // A matching query from Bob has the same agent-only API as Alice's query.
+        let hits = engine.search_facts("shared-agent", "uniqueorchid", 1).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, id);
+        assert_eq!(hits[0].fact, "Alice uniqueorchid preference");
+        assert_eq!(hits[0].chat_id, "private-alice");
+        assert_eq!(hits[0].source_session, "session-alice");
+        assert!(engine.search_facts("other-agent", "uniqueorchid", 3).await.unwrap().is_empty());
+    }
+
     /// Regression: two `duduclaw mcp-server` children opening one fresh
     /// `memory.db` at once — one died with "database is locked" because the
     /// WAL switch failed BUSY before `busy_timeout` was set. Every concurrent

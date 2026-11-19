@@ -4590,3 +4590,68 @@ pub(crate) async fn resolve_fallback_agent_in<'r>(
         }
     }
 }
+
+
+#[cfg(test)]
+mod released_repro_source_tests {
+    // Only inspect the shipped implementation, never these assertions themselves.
+    fn shipped_source() -> &'static str {
+        include_str!("inner.rs").split("\n#[cfg(test)]\nmod released_repro_source_tests {").next().unwrap()
+    }
+
+    #[test]
+    fn released_repro_2_private_facts_agent_only_source() {
+        let source = shipped_source();
+        assert!(source.contains("cognitive_memory_db.clone().filter(|_| is_private)"));
+        let call = source.lines().find(|line| line.contains("engine.search_facts(")).unwrap().trim();
+        assert_eq!(call, "let facts = rt.block_on(engine.search_facts(&aid, &query, 3)).ok()?;");
+        assert!(source.contains("let aid = agent_id.clone();\n            let query = sanitized_text.clone();"));
+        assert!(source.contains(r#"prompt = format!("{prompt}\n\n## Key Facts About This User\n{ft}");"#));
+    }
+
+    #[test]
+    fn released_repro_3a_pinned_must_follow_source() {
+        assert!(shipped_source().contains(r#"if !pinned.is_empty() {
+            prompt = format!(
+                "{prompt}\n\n## Pinned Task Instructions\n\
+                 The user's core task requirements (ALWAYS follow these throughout the conversation):\n\
+                 {pinned}"
+            );
+        }"#));
+    }
+
+    #[test]
+    fn released_repro_3b_unescaped_recap_source() {
+        assert!(shipped_source().contains(r#"let effective_message = if pinned.is_empty() || !has_history {
+        user_part
+    } else {
+        format!("<task_recap>\n{pinned}\n</task_recap>\n\n{user_part}")
+    };"#));
+    }
+
+    #[test]
+    fn released_repro_3c_clarification_append_source() {
+        let source = shipped_source();
+        let start = source.find("    if has_history && !pinned.is_empty() {").unwrap();
+        let block = &source[start..source[start..].find("\n\n    // Inject key facts").unwrap() + start];
+        // Exact full branch: no sender comparison or private-session condition;
+        // credentials are masked and the current sanitized message is truncated.
+        assert_eq!(block, r#"    if has_history && !pinned.is_empty() {
+        if let Some(last_assistant) = conversation_history
+            .iter()
+            .rev()
+            .find(|t| t.role == "assistant")
+        {
+            if last_assistant.content.contains('？') || last_assistant.content.contains('?') {
+                let masked_answer = duduclaw_security::credential_detect::mask(&sanitized_text);
+                let answer_snippet = duduclaw_core::truncate_bytes(&masked_answer, 200);
+                // Cap pinned at ~1000 chars to prevent bloat
+                if pinned.len() < 1000 {
+                    pinned = format!("{pinned}\n- 用戶確認：{answer_snippet}");
+                    let _ = session_mgr.set_pinned(session_id, &pinned).await;
+                }
+            }
+        }
+    }"#);
+    }
+}

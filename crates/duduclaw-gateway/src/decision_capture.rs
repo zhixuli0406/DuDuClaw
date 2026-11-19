@@ -686,6 +686,55 @@ pub fn parse_extracted_decision(reply: &str) -> Option<DecisionDraft> {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn released_repro_7_cross_session_list_render_resolve() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = super::SqliteMemoryEngine::new(&dir.path().join("memory.db")).unwrap();
+        let agent = "shared-agent";
+        let id = super::decision_id(agent, "session-a-message");
+        let draft = super::DecisionDraft {
+            question: "Alice private deployment choice".into(),
+            options: vec![("A".into(), "Deploy Alice project".into()), ("B".into(), "Wait".into())],
+        };
+        super::persist_decision(&engine, agent, &id, &draft,
+            serde_json::json!({"session_id": "session-a", "chat_id": "private-alice"}),
+            duduclaw_memory::lineage::Provenance::source(
+                duduclaw_memory::lineage::SourceRef::channel_message(
+                    "session-a", 1, "2026-01-01T00:00:00Z".parse().unwrap(), None,
+                ),
+            )).await.unwrap();
+        // Session B uses the same agent-only listing/rendering APIs as the reply pipeline.
+        let open_for_b = engine.list_open_decisions(agent, 20).await.unwrap();
+        assert_eq!(open_for_b.len(), 1);
+        assert_eq!(open_for_b[0].id, id);
+        let section_for_b = super::build_open_decisions_section(&engine, agent).await;
+        assert!(section_for_b.contains("Alice private deployment choice"));
+        assert!(section_for_b.contains("A：Deploy Alice project"));
+        assert!(section_for_b.contains("若使用者引用某個選項，直接依此內容執行，不要重新詢問、也不要從歷史臆測。"));
+        let (target, key) = super::detect_decision_reference("用方案 A", &open_for_b).unwrap();
+        assert_eq!(target, id);
+        // A choice sourced from session B is accepted against A's decision.
+        let outcome = engine.resolve_decision(agent, &target, &key,
+            duduclaw_memory::lineage::Provenance::source(
+                duduclaw_memory::lineage::SourceRef::channel_message(
+                    "session-b", 2, "2026-01-02T00:00:00Z".parse().unwrap(), None,
+                ),
+            )).await.unwrap();
+        assert!(matches!(outcome, duduclaw_memory::DecisionResolveOutcome::Resolved { .. }));
+        assert_eq!(engine.decision_status(agent, &id).await.unwrap().as_deref(), Some("resolved:A"));
+        assert!(engine.list_open_decisions(agent, 20).await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn released_repro_7_decision_continuity_default_off() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!crate::runtime_config::decision_continuity_enabled(dir.path()));
+        std::fs::write(dir.path().join("agent.toml"), "[memory]\n").unwrap();
+        assert!(!crate::runtime_config::decision_continuity_enabled(dir.path()));
+        std::fs::write(dir.path().join("agent.toml"), "[memory]\ndecision_continuity = true\n").unwrap();
+        assert!(crate::runtime_config::decision_continuity_enabled(dir.path()));
+    }
     use super::*;
     use duduclaw_core::traits::MemoryEngine;
     use tempfile::TempDir;

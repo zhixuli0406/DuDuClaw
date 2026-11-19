@@ -2688,6 +2688,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn released_repro_4_stale_pin_after_new() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+        let sid = "telegram:private-repro";
+        mgr.get_or_create(sid, "agent").await.unwrap();
+        mgr.set_pinned(sid, "old").await.unwrap();
+        let stale = mgr.get_pinned(sid).await.unwrap();
+        let archived = mgr.clear_for_user(sid).await.unwrap().expect("old row moved");
+        mgr.get_or_create(sid, "agent").await.unwrap();
+        assert!(mgr.get_pinned(sid).await.unwrap().is_empty());
+        mgr.set_pinned(sid, "newer state").await.unwrap();
+        mgr.set_pinned(sid, &stale).await.unwrap();
+        assert_eq!(mgr.get_pinned(sid).await.unwrap(), "old");
+        assert_eq!(mgr.get_pinned(&archived).await.unwrap(), "old");
+    }
+
+    #[tokio::test]
     async fn stale_summary_cannot_overwrite_state_or_history_and_compression_resets_cursor() {
         let tmp = NamedTempFile::new().unwrap();
         let mgr = SessionManager::new(tmp.path()).unwrap();
