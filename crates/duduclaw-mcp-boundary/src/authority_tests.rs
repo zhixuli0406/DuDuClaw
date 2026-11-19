@@ -202,38 +202,48 @@ mod transport {
         (boundary, id, connection, tokio::net::UnixStream::from_std(client).unwrap(), live)
     }
 
-    /// R8z-5 (the real-host defect): the API worker sends `initialize`, then
-    /// `notifications/initialized` and at once `tools/list`. With a handler
+    /// R8z-5 (the real-host defect): the API worker awaits the `initialize`
+    /// reply first, then sends `notifications/initialized` and at once `tools/list`. With a handler
     /// that yields, the notification used to count as a request in flight and
     /// `tools/list` as a second one: the session closed and the worker saw
     /// "MCP disconnected". Both requests are now answered, in order.
     #[tokio::test]
     async fn r8z5_a_yielding_initialized_notification_does_not_refuse_the_next_request() {
-        let (boundary, id, connection, mut client) = live_connection();
+        let (boundary, id, connection, client) = live_connection();
         let serving = tokio::spawn(async { crate::server::serve(connection, &Yielding).await });
-        client.write_all(concat!(
-            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n",
+        let mut reader = tokio::io::BufReader::new(client);
+        reader.get_mut().write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n").await.unwrap();
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut line)).await.unwrap().unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["id"], 1);
+        line.clear();
+        reader.get_mut().write_all(concat!(
             "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
             "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n"
         ).as_bytes()).await.unwrap();
-        let mut reader = tokio::io::BufReader::new(client);
-        for id in [1, 2] {
-            let mut line = String::new();
-            tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut line)).await.unwrap().unwrap();
-            assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["id"], id);
-        }
+        tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut line)).await.unwrap().unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["id"], 2);
         // The worker's own order: the notification and the request written
         // separately after the initialize reply.
-        let mut client = reader.into_inner();
-        client.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n").await.unwrap();
-        client.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/list\"}\n").await.unwrap();
-        let mut reader = tokio::io::BufReader::new(client);
-        let mut line = String::new();
+        reader.get_mut().write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n").await.unwrap();
+        reader.get_mut().write_all(b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/list\"}\n").await.unwrap();
+        line.clear();
         tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut line)).await.unwrap().unwrap();
         assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["id"], 3);
         drop(reader);
         assert!(serving.await.unwrap().is_ok());
         assert!(matches!(boundary.entries.lock().unwrap()[&id.0].state, State::Revoked));
+    }
+
+    #[tokio::test]
+    async fn r8z5_a_frame_behind_an_unanswered_initialize_is_still_refused() {
+        let (_, _, connection, mut client) = live_connection();
+        let serving = tokio::spawn(async { crate::server::serve(connection, &Yielding).await });
+        client.write_all(concat!(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n"
+        ).as_bytes()).await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(2), serving).await.unwrap().unwrap().is_err());
     }
 
     /// R8z-5: one session fed `input` (then the peer's write side closed when
