@@ -860,7 +860,7 @@ mod tests {
         let guard = tracing::subscriber::set_default(subscriber(log.clone()));
         let result = connection.request_checked(request, &[], check).await;
         drop(guard);
-        assert_eq!(result, Err(BackendError::Denied));
+        assert_eq!(result.err(), Some(BackendError::Denied));
         let logs = log.text();
         assert_eq!(logs.lines().count(), 1, "{logs}");
         assert!(logs.contains("step=\"live_check\"") && logs.contains("isolated spawn refused locally"), "{logs}");
@@ -882,7 +882,7 @@ mod tests {
             let request: Envelope<SpawnRequest> = ipc::decode(&bytes).unwrap();
             server_live.store(false, Ordering::SeqCst);
             let response = Envelope { version: ipc::PROTOCOL_VERSION, request_id: request.request_id,
-                message: SpawnResponse::Error { code: ErrorCode::Denied } };
+                message: SpawnResponse::Error { code: ErrorCode::Unauthorized } };
             send_checked(&right, &ipc::encode(&response).unwrap(), &[], &|| Ok(())).await.unwrap();
         });
         let check: Arc<LiveCheck> = Arc::new(move || if live.load(Ordering::SeqCst) { Ok(()) } else { Err(BackendError::Unavailable) });
@@ -891,7 +891,7 @@ mod tests {
         let guard = tracing::subscriber::set_default(subscriber(log.clone()));
         let result = connection.request_checked(request, &[], check).await;
         drop(guard);
-        assert_eq!(result, Err(BackendError::Unavailable));
+        assert_eq!(result.err(), Some(BackendError::Unavailable));
         let logs = log.text();
         assert_eq!(logs.lines().count(), 1, "{logs}");
         assert!(logs.contains("step=\"live_check\"") && logs.contains("isolated spawn refused locally"), "{logs}");
