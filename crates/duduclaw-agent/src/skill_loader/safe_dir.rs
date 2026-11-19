@@ -49,7 +49,92 @@ mod imp {
         Ok(std::borrow::Cow::Borrowed(path))
     }
 
+    /// Access mode for a directory that is only traversed (an ancestor of the
+    /// directory actually opened), mirroring the gateway's
+    /// `fs_safe::search_access`. Linux: `O_PATH` needs only search (`x`)
+    /// permission, so the installed layout's root-owned 0711 parent of the
+    /// gateway home (`/var/lib/duduclaw`: traversable, not readable by the
+    /// gateway account) can be walked. Other Unix targets have no `O_PATH`
+    /// and keep `O_RDONLY` (the installed 0711 layout exists only on Linux).
+    fn search_access() -> libc::c_int {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        { libc::O_PATH }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        { libc::O_RDONLY }
+    }
+
+    /// A directory opened only to be traversed ([`search_access`]). The only
+    /// operations on it are `fstat` and `fstatat`/`openat` relative to it,
+    /// all valid on an `O_PATH` descriptor. It is private to [`SafeDir::open`]
+    /// and never handed out: listing, creation and reads need [`SafeDir`].
+    struct SearchDir(File);
+
+    impl SearchDir {
+        /// `/`, search-only.
+        fn root() -> io::Result<Self> {
+            let slash = CString::new("/").unwrap();
+            // SAFETY: a NUL-terminated absolute path; no dirfd involved.
+            let fd = unsafe { libc::open(slash.as_ptr(), search_access() | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+            if fd < 0 { return Err(io::Error::last_os_error()); }
+            // SAFETY: open returned a new, uniquely owned descriptor.
+            let dir = Self(unsafe { File::from_raw_fd(fd) });
+            dir.require_directory()?;
+            Ok(dir)
+        }
+
+        // `O_PATH|O_NOFOLLOW` without `O_DIRECTORY` would hand back a symlink
+        // descriptor; `O_DIRECTORY` refuses that, and the type is re-checked
+        // on the descriptor anyway (as the gateway's `SearchDir`).
+        fn require_directory(&self) -> io::Result<()> {
+            if !self.0.metadata()?.is_dir() {
+                return Err(refused("traversed component is not a directory"));
+            }
+            Ok(())
+        }
+
+        /// Child directory `value`, search-only, never following a symlink.
+        fn child_search(&self, value: &str) -> io::Result<Self> {
+            let dir = Self(open_child_dir(&self.0, value, search_access())?);
+            dir.require_directory()?;
+            Ok(dir)
+        }
+
+        /// Child directory `value` opened for use (`O_RDONLY`, exactly as
+        /// [`SafeDir::child`]), never following a symlink.
+        fn child_dir(&self, value: &str) -> io::Result<SafeDir> {
+            Ok(SafeDir(open_child_dir(&self.0, value, libc::O_RDONLY)?))
+        }
+    }
+
+    /// lstat-at check that `value` is a real directory, then
+    /// `openat(parent, value, access|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC|O_NONBLOCK)`
+    /// (`O_NONBLOCK` is ignored with `O_PATH`).
+    fn open_child_dir(parent: &File, value: &str, access: libc::c_int) -> io::Result<File> {
+        // lstat semantics also provide an explicit refusal before the atomic open.
+        let value_c = name(value)?;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        let result = unsafe { libc::fstatat(parent.as_raw_fd(), value_c.as_ptr(), stat.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) };
+        if result < 0 { return Err(io::Error::last_os_error()); }
+        let stat = unsafe { stat.assume_init() };
+        if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+            return Err(refused("directory is a symlink or non-directory"));
+        }
+        // SAFETY: a valid directory fd and a NUL-terminated single component.
+        let fd = unsafe { libc::openat(parent.as_raw_fd(), value_c.as_ptr(),
+            access | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK) };
+        if fd < 0 { return Err(io::Error::last_os_error()); }
+        // SAFETY: openat returned a new, uniquely owned descriptor.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
     impl SafeDir {
+        /// Open `path` without following a symlink at any component. Every
+        /// component ABOVE the target is only traversed and opened
+        /// search-only ([`SearchDir`]; Linux `O_PATH`), so the gateway account
+        /// needs only search permission on ancestors it does not own (the
+        /// installed root:root 0711 `/var/lib/duduclaw`). The target itself is
+        /// opened `O_RDONLY|O_DIRECTORY|O_NOFOLLOW` after an lstat-at check,
+        /// unchanged, and is the only handle returned.
         pub fn open(path: &Path) -> io::Result<Self> {
             if !path.is_absolute() {
                 return Err(refused("absolute directory required"));
@@ -61,17 +146,24 @@ mod imp {
             let system_path = macos_system_path(path)?;
             #[cfg(target_os = "macos")]
             let path = system_path.as_ref();
-            let mut dir = Self(File::open("/")?);
+            let mut names = Vec::new();
             for component in path.components() {
                 match component {
                     Component::RootDir => {}
                     Component::Normal(part) => {
-                        dir = dir.child(part.to_str().ok_or_else(|| refused("non-UTF8 path"))?)?;
+                        names.push(part.to_str().ok_or_else(|| refused("non-UTF8 path"))?);
                     }
                     _ => return Err(refused("non-normal directory component")),
                 }
             }
-            Ok(dir)
+            let Some((last, ancestors)) = names.split_last() else {
+                return Ok(Self(File::open("/")?));
+            };
+            let mut dir = SearchDir::root()?;
+            for part in ancestors {
+                dir = dir.child_search(part)?;
+            }
+            dir.child_dir(last)
         }
 
         fn open_file(&self, value: &str, flags: i32, mode: u32) -> io::Result<File> {
@@ -85,16 +177,7 @@ mod imp {
         }
 
         pub fn child(&self, value: &str) -> io::Result<Self> {
-            // lstat semantics also provide an explicit refusal before the atomic open.
-            let value_c = name(value)?;
-            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-            let result = unsafe { libc::fstatat(self.0.as_raw_fd(), value_c.as_ptr(), stat.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) };
-            if result < 0 { return Err(io::Error::last_os_error()); }
-            let stat = unsafe { stat.assume_init() };
-            if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
-                return Err(refused("directory is a symlink or non-directory"));
-            }
-            Ok(Self(self.open_file(value, libc::O_RDONLY | libc::O_DIRECTORY, 0)?))
+            Ok(Self(open_child_dir(&self.0, value, libc::O_RDONLY)?))
         }
 
         pub fn mkdir_child(&self, value: &str, mode: u32) -> io::Result<Self> {
@@ -441,6 +524,83 @@ mod tests {
             assert!(SafeDir::open(&root.join("skills/nested")).is_err());
             symlink("real/SKILL.md", root.join("linked.md")).unwrap();
             assert!(SafeDir::open(root).unwrap().read_file("linked.md").is_err());
+        }
+    }
+
+    /// Puts a fixture directory back to 0700 so the temp dir can be removed.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    struct RestoreMode(std::path::PathBuf);
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    /// R8v: the installed layout gives the gateway only search permission on
+    /// its home's root-owned 0711 parent. A 0o311 (-wx--x--x) ancestor
+    /// reproduces that without root: a read open of it fails with EACCES, as
+    /// the old walk's per-ancestor `O_RDONLY` did. Only ancestors relax: the
+    /// layer is still a full read open, and the search-only directory itself
+    /// as the target still needs read permission.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn search_only_ancestor_reaches_a_private_layer() {
+        use std::io::Read;
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let parent = root.join("parent");
+        let layer = parent.join("home/skills");
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(layer.join("pdf")).unwrap();
+        std::fs::write(layer.join("pdf/SKILL.md"), "body").unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o311)).unwrap();
+        let _restore = RestoreMode(parent.clone());
+        // Root bypasses DAC, so the premise is only checked unprivileged.
+        let unprivileged = unsafe { libc::geteuid() } != 0;
+        if unprivileged {
+            let error = File::open(&parent).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EACCES), "{error}");
+        }
+        let dir = SafeDir::open(&layer).unwrap();
+        assert_eq!(dir.list().unwrap(), ["pdf"]);
+        let mut content = String::new();
+        dir.child("pdf").unwrap().read_file("SKILL.md").unwrap().read_to_string(&mut content).unwrap();
+        assert_eq!(content, "body");
+        if unprivileged {
+            let error = SafeDir::open(&parent).err().unwrap();
+            assert_eq!(error.raw_os_error(), Some(libc::EACCES), "{error}");
+        }
+    }
+
+    /// The search-only walk keeps every no-follow refusal: a symlinked layer
+    /// below the search-only ancestor, a symlinked ancestor below it, and a
+    /// symlinked ancestor above it. The refusals come from the lstat-at
+    /// check (no OS error), not from a permission failure.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn search_only_ancestor_keeps_symlink_refusals() {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let parent = root.join("parent");
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent.join("home/real")).unwrap();
+        symlink("real", parent.join("home/skills")).unwrap();
+        symlink("home", parent.join("linked-home")).unwrap();
+        symlink(&parent, root.join("alias")).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o311)).unwrap();
+        let _restore = RestoreMode(parent.clone());
+        assert!(SafeDir::open(&parent.join("home/real")).is_ok());
+        for refused_path in [
+            parent.join("home/skills"),
+            parent.join("linked-home/real"),
+            root.join("alias/home/real"),
+        ] {
+            let error = SafeDir::open(&refused_path).err()
+                .unwrap_or_else(|| panic!("{} must be refused", refused_path.display()));
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{}", refused_path.display());
+            assert_eq!(error.raw_os_error(), None, "{}: {error}", refused_path.display());
         }
     }
 

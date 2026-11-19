@@ -114,6 +114,19 @@
       "rationale": "Typed ExecutionBackend handoff; original native Command/PTY builder retained by LocalBackend. Protected launch requires trusted immutable policy/input/capability context and uses daemon run handles; missing context is refused without gateway execution."
     },
     {
+      "symbol": "crates/duduclaw-agent/src/registry.rs::load_skills_tests::iso_root_skill_layer_loads_below_a_root_0711_parent",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_status": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Ignored root-VM test re-runs one copy of this test binary as uid/gid 65534 (an exact test filter) to seed and load skill layers below a root:root 0711 parent; not a production spawn path."
+    },
+    {
       "symbol": "crates/duduclaw-agent/src/runner.rs::call_claude_streaming",
       "apis": {
         "backend_spawn": 1
