@@ -240,6 +240,20 @@ sudo journalctl -u duduclaw-gateway.service --no-pager | grep -E 'isolated run (
 | 開始之後（`isolated run refused after start`） | `run.stdin_missing`、`run.stdout_missing`、`run.stderr_missing`、`run.input`、`run.output_drain`、`run.stderr_drain`、`run.wait`、`run.refused`；`output.parse`、`output.empty`、`output.utf8` | 執行環境的結果；已有 `isolated run refused` 那一行時，不會再多記。 |
 | `unlabelled` | — | 沒有代號的拒絕：這是缺陷，請回報。 |
 
+`spawn.backend.*` 看不出是閘道還是隔離服務拒絕了開始執行。若是閘道自己拒絕（在送出開始要求之前，或沒有送出），它會在 `isolated run not started` 那一行之前，另外記一筆警告 `isolated spawn refused locally`，只有一個固定欄位 `step`（不含識別資訊、路徑或內容）。如果 `spawn.backend.*` 那一行之前沒有這筆警告，就是隔離服務拒絕的（它不會為此寫日誌，見上表「要求開始執行」一列）。
+
+```sh
+sudo journalctl -u duduclaw-gateway.service --no-pager | grep -E 'isolated (spawn refused locally|run not started)'
+```
+
+| 時機 | `step` | 代表什麼 |
+| --- | --- | --- |
+| 預約執行 | `admission`、`tracked_runs`、`reservation_reply`、`reservation_queue`、`endpoint_directory`、`endpoint_socket`、`endpoint_connect`、`peer_identity` | 就緒狀態改變；閘道的執行表已滿；預約回覆無法使用（到期時間必須在閘道時鐘的 30 秒內）；這位員工在此閘道已有 32 個未結束的執行；控制通道的目錄、socket 或對端檢查失敗。 |
+| 預約之後、開始之前 | `launch_prepare`、`policy_binding`、`task_binding`、`pty_size` | 受保護的啟動環境拒絕（閘道為這次執行重新檢查此人的授權，或工具邊界發出這次執行的能力憑證：就緒狀態、員工的歸屬、執行環境的 MCP 註冊）；準備好的計畫與預約的執行不符；預約結束後才綁定任務；終端機大小無效。 |
+| 組成開始要求 | `admission`、`workspace_delivery`、`workspace`、`entry`、`reservation_state`、`resource_limits`、`inputs`、`attachments`、`request_invalid`、`connection_state`、`live_check`、`fd_plan` | 就緒狀態改變；工作區證明不符；計畫指定的不是員工自己的工作區；執行不存在、屬於其他員工、已經開始，或 30 秒的預約已過期；執行環境紀錄的輸出或輸入額度為零；請求超過輸入額度；附件太多；要求無效（例如步數上限不在 1–1000）；控制連線已關閉；即時授權檢查拒絕；描述子配置不符。 |
+| 送出之後 | `admission_after_send`、`start_reply` | 開始要求送出期間就緒狀態改變（這次執行會被取消）；非預期的回覆。 |
+| 其他控制要求 | `cancel_state`、`live_status_reservation`、`work_op`、`helper_op` | 取消已放棄或已被拒絕；狀態回覆指向另一個預約；該路徑不允許的操作。 |
+
 在受保護模式下，若被拒絕的工作無法從文字判斷原因，結尾的原因代碼會是 `safety_gate`，不再是 `unknown`。
 
 ## 升級與解除安裝

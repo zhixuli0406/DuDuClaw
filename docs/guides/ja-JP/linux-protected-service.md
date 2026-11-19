@@ -240,6 +240,20 @@ sudo journalctl -u duduclaw-gateway.service --no-pager | grep -E 'isolated run (
 | 開始後（`isolated run refused after start`） | `run.stdin_missing`、`run.stdout_missing`、`run.stderr_missing`、`run.input`、`run.output_drain`、`run.stderr_drain`、`run.wait`、`run.refused`、`output.parse`、`output.empty`、`output.utf8` | ランタイムの結果。`isolated run refused` の行がすでにある場合は追加で記録しません。 |
 | `unlabelled` | — | ラベルのない拒否。不具合なので報告してください。 |
 
+`spawn.backend.*` だけでは、開始を拒否したのがゲートウェイか隔離サービスかは分かりません。ゲートウェイ自身が拒否した場合（開始の依頼を送る前、または送らずに）、`isolated run not started` の行の直前に警告 `isolated spawn refused locally` が 1 件記録されます。フィールドは固定の `step` だけです（識別子、パス、内容は含みません）。`spawn.backend.*` の行の前にこの警告がない場合は隔離サービスが拒否しています（隔離サービスはこれをログに残しません。上の表の「実行開始の依頼」の行を参照）。
+
+```sh
+sudo journalctl -u duduclaw-gateway.service --no-pager | grep -E 'isolated (spawn refused locally|run not started)'
+```
+
+| 時点 | `step` | 意味 |
+| --- | --- | --- |
+| 実行の予約 | `admission`、`tracked_runs`、`reservation_reply`、`reservation_queue`、`endpoint_directory`、`endpoint_socket`、`endpoint_connect`、`peer_identity` | 準備状態が変わった。ゲートウェイの実行表が満杯。予約の応答が使えない（有効期限はゲートウェイの時計で 30 秒以内である必要があります）。この社員はこのゲートウェイで未終了の実行を既に 32 件持っている。制御ソケットのディレクトリ、ソケット、接続先の確認に失敗した。 |
+| 予約後、開始前 | `launch_prepare`、`policy_binding`、`task_binding`、`pty_size` | 保護された起動コンテキストが拒否した（ゲートウェイによるこの実行の権限の再確認、またはツール境界による実行用権限の発行。準備状態、社員の所属、ランタイムの MCP 登録を確認）。準備した計画が予約した実行と一致しない。予約の終了後にタスクを結び付けた。端末サイズが無効。 |
+| 開始の依頼の作成 | `admission`、`workspace_delivery`、`workspace`、`entry`、`reservation_state`、`resource_limits`、`inputs`、`attachments`、`request_invalid`、`connection_state`、`live_check`、`fd_plan` | 準備状態が変わった。ワークスペースの証明が一致しない。計画が社員自身以外のワークスペースを指定している。実行が不明、別の社員のもの、開始済み、または 30 秒の予約が期限切れ。ランタイムの記録で出力または入力の上限が 0。入力が上限を超えた。添付が多すぎる。依頼が無効（例：ステップ上限が 1〜1000 の範囲外）。制御接続が閉じている。権限の即時確認が拒否した。記述子の構成が一致しない。 |
+| 送信後 | `admission_after_send`、`start_reply` | 開始の依頼の送信中に準備状態が変わった（実行は取り消されます）。想定外の応答。 |
+| その他の制御依頼 | `cancel_state`、`live_status_reservation`、`work_op`、`helper_op` | 取り消しが中断済み、または既に拒否された。状態の応答が別の予約を指している。その経路では許可されていない操作。 |
+
 保護モードでは、拒否された作業の原因を文面から判定できない場合、末尾の理由コードは `unknown` ではなく `safety_gate` になります。
 
 ## 更新とアンインストール

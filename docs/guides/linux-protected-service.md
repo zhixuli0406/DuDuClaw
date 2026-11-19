@@ -240,6 +240,20 @@ sudo journalctl -u duduclaw-gateway.service --no-pager | grep -E 'isolated run (
 | After start (`isolated run refused after start`) | `run.stdin_missing`, `run.stdout_missing`, `run.stderr_missing`, `run.input`, `run.output_drain`, `run.stderr_drain`, `run.wait`, `run.refused`; `output.parse`, `output.empty`, `output.utf8` | The runtime's result; `run.*` labels after the `isolated run refused` line add nothing new. |
 | `unlabelled` | — | A refusal without a site: a defect, please report it. |
 
+`spawn.backend.*` does not tell whether the gateway or the isolation service refused the start. When the gateway refuses it itself (before or instead of sending the start request), it also logs one warning `isolated spawn refused locally`, just before the `isolated run not started` line, with one fixed field `step` (no identifiers, paths or content). If a `spawn.backend.*` line has no such warning before it, the isolation service refused (it does not log that, see the Spawn row above).
+
+```sh
+sudo journalctl -u duduclaw-gateway.service --no-pager | grep -E 'isolated (spawn refused locally|run not started)'
+```
+
+| When | `step` | What it means |
+| --- | --- | --- |
+| Reserving the run | `admission`, `tracked_runs`, `reservation_reply`, `reservation_queue`, `endpoint_directory`, `endpoint_socket`, `endpoint_connect`, `peer_identity` | Readiness changed; the gateway's run table is full; the reservation reply was unusable (its expiry must be within 30 s of the gateway's clock); the employee already has 32 unfinished runs in this gateway; the control socket's directory, socket or peer checks failed. |
+| Between reservation and start | `launch_prepare`, `policy_binding`, `task_binding`, `pty_size` | The protected launch context refused (the gateway re-checking the person's authority for this run, or the tool boundary issuing the run's capability: readiness, the employee's binding, the runtime's MCP registration); the prepared plan does not match the reserved run; the task was bound after the reservation ended; an invalid terminal size. |
+| Building the start request | `admission`, `workspace_delivery`, `workspace`, `entry`, `reservation_state`, `resource_limits`, `inputs`, `attachments`, `request_invalid`, `connection_state`, `live_check`, `fd_plan` | Readiness changed; the workspace proof does not match; the plan names a workspace other than the employee's own; the run is unknown, belongs to another employee, was already started or its 30-second reservation expired; the runtime record has a zero output or input budget; the request exceeds the input budget; too many attachments; the request is invalid (for example a step limit outside 1–1000); the control connection is closed; the live authority check refused; the descriptor plan does not match. |
+| After sending it | `admission_after_send`, `start_reply` | Readiness changed while the start was in flight (the run is cancelled); an unexpected reply. |
+| Other control requests | `cancel_state`, `live_status_reservation`, `work_op`, `helper_op` | A cancel abandoned or already refused; a status reply naming another reservation; an operation not allowed on that path. |
+
 In protected mode, a refused turn whose cause the text classifier cannot name ends with the reason code `safety_gate` instead of `unknown`.
 
 ## Upgrade and uninstall
