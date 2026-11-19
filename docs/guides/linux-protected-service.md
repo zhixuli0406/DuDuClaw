@@ -373,6 +373,30 @@ sudo journalctl -u duduclaw-gateway.service -u duduclaw-spawnd.service -u duducl
 | Pending review/rotation | Finish supported confirmations, retries and fresh credential setup in Migration review; approval alone does not complete migration. |
 | Update accepted but not committed | Follow the durable request status and readiness error; do not start a concurrent manual binary replacement. |
 
+### Egress run record
+
+Each isolated run with network access ends with exactly one JSON line in the egress journal: `run_id`, `profile_id`, `bytes` (both directions), `connection_attempts`, `terminal_code` and, from v1.83, `terminal_detail`, a fixed label for where the run ended. The line never contains a host name, address or request content.
+
+```sh
+sudo journalctl -u duduclaw-egress.service --no-pager | grep terminal_code
+```
+
+The per-second limits (`frames_per_second`, `bytes_per_second`) slow a run down; they do not end it. The run ends with a rate label only when one frame could not be admitted within `idle_timeout_ms`.
+
+| `terminal_code` | `terminal_detail` | Meaning |
+| --- | --- | --- |
+| `unavailable` | `peer_closed` | The run's forwarder closed the connection; this is also a normal end. |
+| `unavailable` | `revoked` | The spawn service ended the run, or the control connection was lost. |
+| `resource_limit` | `total_bytes`, `total_connections` | The run reached the `run_caps` total. Raise the cap in `/etc/duduclaw/egress.json` only if the volume is expected. |
+| `resource_limit` | `max_tunnels` | The run had `max_tunnels` connections open at once. |
+| `resource_limit` | `frame_rate`, `byte_rate` | One frame could not pass the rate limit within `idle_timeout_ms` (for example, `bytes_per_second` below the 8 KiB frame size). |
+| `resource_limit` | `invalid_limits` | The profile limits or run caps are invalid. |
+| `timeout` | `idle_timeout`, `frame_timeout`, `write_timeout` | No traffic for `idle_timeout_ms`, a frame that was not completed, or a forwarder that did not accept a frame in time. |
+| `invalid_request` | `invalid_frame`, `frame_too_large`, `protocol_state` | The forwarder sent a frame that does not decode, a frame larger than `max_frame_bytes`, or a frame in the wrong state. Report it as a defect. |
+| any | `internal` | Internal egress failure. Report it with the journal line. |
+
+When a destination accepts no data for `idle_timeout_ms`, egress closes only that connection, and the run continues. The CONNECT header limits (`max_header_bytes`, `max_headers`) apply only to the CONNECT request inside the employee sandbox. That request is refused with HTTP 431 and does not end the run.
+
 Container engines and hardware-dependent features remain unavailable through the protected employee environment. Every required component must pass its own checks before work resumes; neither a successful package test nor this guide is production acceptance.
 
 ## Released v1.80.x single-binary protected service

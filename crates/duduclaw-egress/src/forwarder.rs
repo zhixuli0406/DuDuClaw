@@ -2,7 +2,7 @@
 use std::{collections::BTreeMap, net::Ipv4Addr, num::NonZeroU16, time::Duration};
 use duduclaw_isolation::{bounded::List, egress::*};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}, sync::mpsc, task::JoinSet};
-use crate::{budget::default_limits, http::{parse_connect, HttpError}, session::{read_frame_started, write_frame}, transport::CheckedSocket};
+use crate::{budget::default_limits, http::{parse_connect, HttpError}, session::{chunk_bytes, read_frame_started, write_frame, Activity}, transport::CheckedSocket};
 
 const MAX_CLIENTS: usize = 16;
 const MAX_CONNECTIONS: u32 = 4096;
@@ -128,7 +128,7 @@ async fn forward_loop(listener: TcpListener, writer: &mut tokio::io::WriteHalf<C
                     drain_retired(state, &message)?;
                     continue;
                 }
-                let entry = clients.values_mut().find(|entry| match entry.state {
+                let (&key, entry) = clients.iter_mut().find(|(_, entry)| match entry.state {
                     State::Pending(tunnel) | State::Open(tunnel) => tunnel == id,
                     _ => false,
                 }).ok_or(EgressError::InvalidRequest)?;
@@ -152,11 +152,28 @@ async fn forward_loop(listener: TcpListener, writer: &mut tokio::io::WriteHalf<C
                     }
                     _ => return Err(EgressError::InvalidRequest),
                 };
-                // A closed receiver's Done event is already queued. Drain host
+                // R8z-6 backpressure: wait for room in this client's 4-command
+                // queue instead of failing the forwarder when it is full. Host
+                // frames stay in the socket meanwhile (nothing more is read).
+                // A closed receiver's Done event is already queued; drain host
                 // output until the actor processes it and sends Close.
-                match entry.input.try_send(command) {
-                    Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
-                    Err(mpsc::error::TrySendError::Full(_)) => return Err(EgressError::ResourceLimit),
+                let open = matches!(entry.state, State::Open(_));
+                let input = entry.input.clone();
+                let sent = tokio::time::timeout(idle, input.send(command)).await;
+                drop(input);
+                if sent.is_err() {
+                    // The client read nothing for the idle timeout: end it
+                    // alone. Dropping the only sender ends its session; the
+                    // host drains the tunnel after our Close.
+                    if let Some(entry) = clients.get_mut(&key) {
+                        let (closed, _) = mpsc::channel(1);
+                        entry.input = closed;
+                        entry.state = State::Terminal;
+                    }
+                    if open {
+                        retired.insert(id, Retired::Open);
+                        send(writer, EgressMessage::Close { tunnel_id: TunnelId(id) }, limits, idle).await?;
+                    }
                 }
             }
         }
@@ -222,28 +239,36 @@ async fn client_session(mut socket: TcpStream, client: u64, mut input: mpsc::Rec
         Ok(Some(Command::Refused(code))) => { let _ = write_client(&mut socket, refused_response(code), idle).await; return; }
         _ => { let _ = write_client(&mut socket, refused_response(EgressError::Unavailable), idle).await; return; }
     }
-    let chunk = (limits.max_frame_bytes.get() as usize).saturating_sub(128) / 4;
-    let mut buffer = vec![0; chunk.clamp(1, MAX_TUNNEL_CHUNK_BYTES)];
-    loop {
-        let activity = async {
-            tokio::select! {
-                command = input.recv() => match command {
-                    Some(Command::Data(bytes)) => {
-                        socket.write_all(&bytes).await.map_err(|_| EgressError::Unavailable)?;
-                        Ok(true)
-                    }
-                    Some(Command::Close) | None => Ok(false),
-                    _ => Err(EgressError::InvalidRequest),
-                },
-                read = socket.read(&mut buffer) => {
-                    let size = read.map_err(|_| EgressError::Unavailable)?;
-                    if size == 0 { return Ok(false); }
-                    events.send(Event::Data { client, bytes: buffer[..size].to_vec() }).await.map_err(|_| EgressError::Unavailable)?;
-                    Ok(true)
-                }
-            }
-        };
-        if !matches!(tokio::time::timeout(idle, activity).await, Ok(Ok(true))) { return; }
+    // R8z-6: both directions run independently. Upstream reads at most one
+    // chunk (one frame, never above `max_frame_bytes`) and reads again only
+    // after the actor accepted it: a busy host pauses the client, nothing is
+    // buffered beyond that chunk. Downstream writes host data to the client.
+    // A blocked direction never stalls the other, so the actor waiting on
+    // `input` cannot deadlock with this session waiting on `events`. The
+    // session ends on EOF, Close, an error or `idle` without progress in
+    // either direction; returning drops the socket (the client sees EOF or a
+    // reset at once).
+    let mut buffer = vec![0; chunk_bytes(limits)];
+    let activity = Activity::default();
+    let (mut reader, mut writer) = socket.split();
+    let upstream = async {
+        loop {
+            let size = match reader.read(&mut buffer).await { Ok(0) | Err(_) => return, Ok(size) => size };
+            activity.touch();
+            if events.send(Event::Data { client, bytes: buffer[..size].to_vec() }).await.is_err() { return; }
+            activity.touch();
+        }
+    };
+    let downstream = async {
+        while let Some(Command::Data(bytes)) = input.recv().await {
+            if writer.write_all(&bytes).await.is_err() { return; }
+            activity.touch();
+        }
+    };
+    tokio::select! {
+        _ = upstream => {}
+        _ = downstream => {}
+        _ = activity.expired(idle) => {}
     }
 }
 
@@ -393,6 +418,124 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), fast.read_exact(&mut response)).await.unwrap().unwrap();
         assert_eq!(response, CONNECTED);
         task.abort();
+    }
+
+    /// Connect one client (optionally with a small receive buffer) and open its tunnel.
+    async fn open_tunnel(address: std::net::SocketAddr, host: &mut tokio::net::UnixStream, limits: &EgressLimits, small: bool) -> (TcpStream, TunnelId) {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        if small { socket.set_recv_buffer_size(4096).unwrap(); }
+        let mut client = socket.connect(address).await.unwrap();
+        client.write_all(b"CONNECT example.com:443 HTTP/1.1\r\n\r\n").await.unwrap();
+        let tunnel_id = match read_frame(host, limits).await.unwrap() {
+            EgressMessage::Connect { tunnel_id, .. } => tunnel_id,
+            _ => panic!("expected CONNECT"),
+        };
+        write_frame(host, EgressMessage::Connected { tunnel_id }, limits).await.unwrap();
+        client.read_exact(&mut vec![0; CONNECTED.len()]).await.unwrap();
+        (client, tunnel_id)
+    }
+
+    /// R8z-6: 256 KiB of host data written without waiting for a client that
+    /// reads late and slowly. The full client queue used to end the
+    /// forwarder with `ResourceLimit`; now the forwarder pauses the host.
+    #[tokio::test]
+    async fn forwarder_download_burst_waits_for_a_slow_client() {
+        let (address, mut host, task) = fixture().await;
+        let (mut client, tunnel_id) = open_tunnel(address, &mut host, &default_limits(), true).await;
+        let writer = tokio::spawn(async move {
+            for index in 0..32u8 {
+                write_frame(&mut host, EgressMessage::Data { tunnel_id, bytes: List::new(vec![index; 8192]).unwrap() }, &default_limits()).await.unwrap();
+            }
+            host
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut received = Vec::new();
+        let mut buffer = vec![0; 4096];
+        while received.len() < 256 * 1024 {
+            let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buffer)).await.unwrap().unwrap();
+            assert!(n > 0);
+            received.extend_from_slice(&buffer[..n]);
+        }
+        for (index, chunk) in received.chunks(8192).enumerate() { assert!(chunk.iter().all(|b| *b == index as u8)); }
+        let _host = tokio::time::timeout(Duration::from_secs(5), writer).await.unwrap().unwrap();
+        assert!(!task.is_finished());
+        task.abort();
+    }
+
+    /// R8z-6: a 256 KiB upload while the host is busy completes, in frames of
+    /// at most one chunk (`read_frame` also refuses anything above `max_frame_bytes`).
+    #[tokio::test]
+    async fn forwarder_upload_of_256_kib_completes_in_bounded_frames() {
+        let (address, mut host, task) = fixture().await;
+        let (mut client, _) = open_tunnel(address, &mut host, &default_limits(), false).await;
+        let payload: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
+        let expected = payload.clone();
+        let uploader = tokio::spawn(async move { client.write_all(&payload).await.unwrap(); client });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut received = Vec::new();
+        while received.len() < expected.len() {
+            match tokio::time::timeout(Duration::from_secs(5), read_frame(&mut host, &default_limits())).await.unwrap().unwrap() {
+                EgressMessage::Data { bytes, .. } => {
+                    assert!(bytes.as_slice().len() <= chunk_bytes(&default_limits()));
+                    received.extend_from_slice(bytes.as_slice());
+                }
+                _ => panic!("expected upload"),
+            }
+        }
+        assert_eq!(received, expected);
+        let _client = uploader.await.unwrap();
+        assert!(!task.is_finished());
+        task.abort();
+    }
+
+    /// R8z-6: a client that reads nothing while the host pushes data is ended
+    /// alone after the idle timeout; the host gets Close for its tunnel.
+    #[tokio::test]
+    async fn forwarder_paused_client_is_closed_by_idle_timeout() {
+        let mut limits = default_limits();
+        limits.idle_timeout_ms = 300.try_into().unwrap();
+        let (address, mut host, task) = fixture_with_limits(limits.clone()).await;
+        let (client, tunnel_id) = open_tunnel(address, &mut host, &limits, true).await;
+        let (mut host_reader, mut host_writer) = host.into_split();
+        let writer_limits = limits.clone();
+        let writer = tokio::spawn(async move {
+            for _ in 0..64 {
+                if write_frame(&mut host_writer, EgressMessage::Data { tunnel_id, bytes: List::new(vec![1; 8192]).unwrap() }, &writer_limits).await.is_err() { break; }
+            }
+            host_writer
+        });
+        let started = tokio::time::Instant::now();
+        match tokio::time::timeout(Duration::from_secs(5), read_frame(&mut host_reader, &limits)).await.unwrap().unwrap() {
+            EgressMessage::Close { tunnel_id: closed } => assert_eq!(closed, tunnel_id),
+            _ => panic!("expected Close"),
+        }
+        assert!(started.elapsed() >= Duration::from_millis(250));
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(5), writer).await.unwrap();
+        task.abort();
+    }
+
+    /// R8z-6: spawnd holds a duplicate of the host end, so the daemon's close
+    /// alone shows no EOF; its shutdown does, and the client socket is
+    /// closed at once (not after the 30 s idle timeout).
+    #[tokio::test]
+    async fn forwarder_host_shutdown_closes_the_client_at_once() {
+        use std::os::fd::AsRawFd;
+        let (forwarder, host) = std::os::unix::net::UnixStream::pair().unwrap();
+        let revoker = host.try_clone().unwrap();
+        host.set_nonblocking(true).unwrap();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(run_with_listener(CheckedSocket::new(forwarder.into()).unwrap(), listener, default_limits()));
+        let mut host = tokio::net::UnixStream::from_std(host).unwrap();
+        let (mut client, _) = open_tunnel(address, &mut host, &default_limits(), false).await;
+        client.write_all(b"partial request").await.unwrap();
+        crate::transport::shutdown_both(host.as_raw_fd());
+        let mut byte = [0; 1];
+        let read = tokio::time::timeout(Duration::from_secs(1), client.read(&mut byte)).await.expect("client closed at once");
+        assert!(matches!(read, Ok(0) | Err(_)));
+        assert!(tokio::time::timeout(Duration::from_secs(1), task).await.unwrap().unwrap().is_err());
+        drop(revoker);
     }
 
     #[test]

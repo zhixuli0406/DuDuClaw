@@ -373,6 +373,30 @@ sudo journalctl -u duduclaw-gateway.service -u duduclaw-spawnd.service -u duducl
 | 等待確認／輪替 | 在遷移確認頁完成支援的確認、重試與新憑證設定；核准本身不代表遷移完成。 |
 | 更新已受理但未 committed | 追蹤持久要求狀態與就緒錯誤，不要同時手動替換執行檔。 |
 
+### egress 的執行紀錄
+
+每次可連外的隔離執行結束時，egress 日誌中都會有一行 JSON：`run_id`、`profile_id`、`bytes`（雙向合計）、`connection_attempts`、`terminal_code`，以及 v1.83 起新增的 `terminal_detail`，這是一個固定標籤，表示執行在哪裡結束。這行不會包含主機名稱、位址或請求內容。
+
+```sh
+sudo journalctl -u duduclaw-egress.service --no-pager | grep terminal_code
+```
+
+每秒限制（`frames_per_second`、`bytes_per_second`）只會讓執行變慢，不會讓它結束。只有當某一個訊框在 `idle_timeout_ms` 內都無法通過速率限制時，執行才會以速率類標籤結束。
+
+| `terminal_code` | `terminal_detail` | 意義 |
+| --- | --- | --- |
+| `unavailable` | `peer_closed` | 這次執行的轉送程式關閉了連線，正常結束也是這個值。 |
+| `unavailable` | `revoked` | spawn 服務結束了這次執行，或控制連線中斷。 |
+| `resource_limit` | `total_bytes`、`total_connections` | 達到 `run_caps` 的總量上限。只有在流量確實符合預期時，才調高 `/etc/duduclaw/egress.json` 中的上限。 |
+| `resource_limit` | `max_tunnels` | 同時開啟的連線數達到 `max_tunnels`。 |
+| `resource_limit` | `frame_rate`、`byte_rate` | 某一個訊框在 `idle_timeout_ms` 內無法通過速率限制（例如 `bytes_per_second` 小於 8 KiB 的訊框大小）。 |
+| `resource_limit` | `invalid_limits` | profile 限制或 run caps 無效。 |
+| `timeout` | `idle_timeout`、`frame_timeout`、`write_timeout` | 在 `idle_timeout_ms` 內沒有任何流量、訊框沒有傳完，或轉送程式沒有及時接收訊框。 |
+| `invalid_request` | `invalid_frame`、`frame_too_large`、`protocol_state` | 轉送程式送出無法解碼的訊框、大於 `max_frame_bytes` 的訊框，或狀態不符的訊框。請回報為缺陷。 |
+| 任一 | `internal` | egress 內部錯誤。請附上這行日誌回報。 |
+
+目的端在 `idle_timeout_ms` 內完全不接收資料時，egress 只會關閉那一條連線，這次執行會繼續。CONNECT 標頭限制（`max_header_bytes`、`max_headers`）只套用在員工沙箱內的 CONNECT 請求。超過限制時會以 HTTP 431 拒絕該請求，不會結束這次執行。
+
 受保護員工環境不提供容器引擎與依賴主機硬體的功能。所有必要元件均需通過檢查才能恢復工作；套件測試通過或本指南都不能當作正式環境驗收。
 
 ## v1.80.x 已發行的單一執行檔受保護服務
