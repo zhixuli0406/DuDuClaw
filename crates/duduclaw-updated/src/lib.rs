@@ -8,6 +8,8 @@ pub mod trust_store;
 pub mod publication;
 pub mod bundle;
 pub mod bootstrap_cli;
+/// `duduclaw-updated` argv: mode classification and the AI-session guard.
+pub mod updated_cli;
 /// Fixed start-up stage names printed with a start-up failure.
 pub mod stage;
 /// TEST-ONLY software signer (plan §3.3, R2 §4.2): unit tests and feature `test-signer` only.

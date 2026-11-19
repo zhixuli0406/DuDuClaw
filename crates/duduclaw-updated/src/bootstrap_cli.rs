@@ -119,6 +119,8 @@ pub fn parse_invocation<I: IntoIterator<Item = OsString>>(args: I) -> (Command, 
 
 /// The one fixed line `duduclaw-bootstrap` prints when it refuses a
 /// state-changing command inside an AI session (never the marker or its value).
+/// `duduclaw-updated` prints the same line for its own state-changing operator
+/// commands (`updated_cli::parse_guarded`).
 pub const AI_SESSION_REFUSAL: &str =
     "bootstrap_refused: ai_session 這個指令會變更主機狀態，必須由人在終端機中親自執行，不能從 AI 工作階段中執行。";
 
