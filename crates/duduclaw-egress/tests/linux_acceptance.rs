@@ -194,6 +194,7 @@ async fn iso_root_concurrent_live_tunnels_and_byte_cap() {
         let audit=task.await.unwrap();
         assert_eq!(audit.bytes,512);assert_eq!(audit.connection_attempts,2);
         assert_eq!(audit.terminal_code,EgressError::ResourceLimit);
+        assert_eq!(audit.terminal_detail,duduclaw_egress::budget::TerminalDetail::TotalBytes);
         assert!(read_frame(&mut client,&limits).await.is_err());
     }).await.unwrap();
 }

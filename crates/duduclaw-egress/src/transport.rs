@@ -96,6 +96,14 @@ impl CheckedSocket {
         }
     }
 }
+/// R8z-6: shut down both directions of a socket this process still holds
+/// open (the caller keeps an owner alive across the call). Unlike closing our
+/// descriptor, this reaches the peer even while another process (spawnd's
+/// revoker) holds a duplicate of the same socket. Errors are ignored: a
+/// socket that is already shut down or disconnected needs nothing more.
+pub fn shutdown_both(fd: RawFd) {
+    let _ = nix::sys::socket::shutdown(fd, nix::sys::socket::Shutdown::Both);
+}
 fn send(fd: RawFd, bytes: &[u8]) -> io::Result<usize> {
     // MSG_NOSIGNAL prevents a peer disconnect from terminating the daemon.
     let n = unsafe { libc::send(fd, bytes.as_ptr().cast(), bytes.len(), libc::MSG_NOSIGNAL) };

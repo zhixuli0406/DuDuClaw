@@ -1,6 +1,6 @@
 #![cfg(target_os = "linux")]
 use std::{collections::VecDeque, net::IpAddr, os::fd::OwnedFd, sync::{Arc, Mutex}, time::Duration};
-use duduclaw_egress::{budget::{default_limits, RunCaps}, policy::authorize_answers, resolver::Resolver, session::{pinned_addresses, read_frame, serve_run, write_frame}, transport::{CheckedSocket, socket_info}};
+use duduclaw_egress::{budget::{default_limits, RunCaps, TerminalDetail}, policy::authorize_answers, resolver::Resolver, session::{pinned_addresses, read_frame, serve_run, write_frame}, transport::{CheckedSocket, socket_info}};
 use duduclaw_isolation::{bounded::{List, Text}, egress::*, ids::{RunId, Sha256Digest}};
 use tokio::io::AsyncWriteExt;
 
@@ -255,6 +255,99 @@ async fn iso_root_egress_dns_probe_through_control_socket() {
     assert_eq!(probe(&control, 6, "does-not-exist.example.com").await, missing);
     drop(control);
     assert!(tokio::time::timeout(Duration::from_secs(1), task).await.unwrap().unwrap().is_err());
+}
+
+/// R8z-6: spawnd keeps a revoker duplicate of the run socket's host end. A run
+/// that ends must still show the forwarder EOF at once (socket shutdown), not
+/// leave it waiting for its own idle timeout.
+#[tokio::test]
+async fn run_end_shuts_the_socket_down_despite_a_duplicate_descriptor() {
+    let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+    let revoker = b.try_clone().unwrap();
+    let mut client = CheckedSocket::new(OwnedFd::from(a)).unwrap();
+    let host = CheckedSocket::new(OwnedFd::from(b)).unwrap();
+    let task = tokio::spawn(serve_run(host, RunId([1;16]), profile(), RunCaps {total_bytes: 100, total_connections: 1}, Arc::new(FakeResolver(Mutex::new(VecDeque::new())))));
+    // Data for a tunnel that was never opened ends the run.
+    write_frame(&mut client, EgressMessage::Data {tunnel_id: TunnelId(1), bytes: List::new(vec![1]).unwrap()}, &default_limits()).await.unwrap();
+    let audit = tokio::time::timeout(Duration::from_secs(1), task).await.unwrap().unwrap();
+    assert_eq!((audit.terminal_code, audit.terminal_detail), (EgressError::InvalidRequest, TerminalDetail::ProtocolState));
+    assert!(tokio::time::timeout(Duration::from_secs(1), read_frame(&mut client, &default_limits())).await
+        .expect("EOF at once, not after the idle timeout").is_err());
+    drop(revoker);
+}
+
+/// R8z-6: the hard caps still terminate, each with its fixed detail.
+#[tokio::test]
+async fn hard_caps_terminate_with_their_fixed_detail() {
+    struct Waiting;
+    impl Resolver for Waiting {
+        fn resolve<'a>(&'a self, _: &'a str, _: DnsRoute) -> std::pin::Pin<Box<dyn std::future::Future<Output=Result<Vec<IpAddr>,EgressError>> + Send + 'a>> {
+            Box::pin(std::future::pending())
+        }
+    }
+    // (max_tunnels, total_connections) ⇒ the second pending Connect's detail.
+    for (max_tunnels, total, detail) in [(1u16, 3u32, TerminalDetail::MaxTunnels), (4, 1, TerminalDetail::TotalConnections)] {
+        let mut p = profile(); p.limits.max_tunnels = max_tunnels.try_into().unwrap();
+        let (mut client, host) = sockets();
+        let task = tokio::spawn(serve_run(host, RunId([1;16]), p, RunCaps {total_bytes: 100, total_connections: total}, Arc::new(Waiting)));
+        for id in 1..=2 {
+            write_frame(&mut client, EgressMessage::Connect {tunnel_id: TunnelId(id), target: target()}, &default_limits()).await.unwrap();
+        }
+        let audit = tokio::time::timeout(Duration::from_secs(1), task).await.unwrap().unwrap();
+        assert_eq!((audit.terminal_code, audit.terminal_detail), (EgressError::ResourceLimit, detail));
+        let json = serde_json::to_string(&audit).unwrap();
+        assert!(!json.contains("example.com"));
+    }
+    // A frame length above max_frame_bytes.
+    let (mut client, host) = sockets();
+    let task = tokio::spawn(serve_run(host, RunId([1;16]), profile(), RunCaps {total_bytes: 100, total_connections: 1}, Arc::new(Waiting)));
+    client.write_u32(65537).await.unwrap();
+    let audit = tokio::time::timeout(Duration::from_secs(1), task).await.unwrap().unwrap();
+    assert_eq!((audit.terminal_code, audit.terminal_detail), (EgressError::InvalidRequest, TerminalDetail::FrameTooLarge));
+}
+
+/// Requires root on Linux and an operator-controlled PUBLIC TCP echo server.
+/// R8z-6: 256 KiB written back-to-back through one tunnel under the default
+/// rates (1024 frames/s, 4 MiB/s) completes; the run ends only when the
+/// client closes it.
+#[tokio::test]
+#[ignore = "root Linux VM and ISO_EGRESS_ECHO_ADDR public echo endpoint required"]
+async fn iso_root_live_256_kib_upload_under_default_rates() {
+    assert_eq!(nix::unistd::geteuid().as_raw(), 0);
+    let address: std::net::SocketAddr = std::env::var("ISO_EGRESS_ECHO_ADDR").expect("public controlled echo address").parse().unwrap();
+    assert!(duduclaw_egress::policy::is_public_ip(address.ip()));
+    let mut p = profile(); p.allowed_connect_ports = List::new(vec![address.port().try_into().unwrap()]).unwrap();
+    let limits = p.limits.clone();
+    let (client, host) = sockets();
+    let task = tokio::spawn(serve_run(host, RunId([8;16]), p, RunCaps {total_bytes: 1 << 32, total_connections: 1}, Arc::new(FakeResolver(Mutex::new(VecDeque::new())))));
+    let (mut reader, mut writer) = tokio::io::split(client);
+    let target = ConnectTarget {host:Text::new(address.ip().to_string()).unwrap(),port:address.port().try_into().unwrap()};
+    write_frame(&mut writer,EgressMessage::Connect{tunnel_id:TunnelId(1),target},&limits).await.unwrap();
+    assert!(matches!(read_frame(&mut reader,&limits).await.unwrap(),EgressMessage::Connected{..}));
+    let upload_limits = limits.clone();
+    let upload = tokio::spawn(async move {
+        for index in 0..32u8 {
+            write_frame(&mut writer,EgressMessage::Data{tunnel_id:TunnelId(1),bytes:List::new(vec![index;8192]).unwrap()},&upload_limits).await.unwrap();
+        }
+        writer
+    });
+    let echoed = tokio::time::timeout(Duration::from_secs(30), async {
+        let mut echoed = Vec::new();
+        while echoed.len() < 256 * 1024 {
+            match read_frame(&mut reader,&limits).await.unwrap() {
+                EgressMessage::Data{tunnel_id:TunnelId(1),bytes}=>echoed.extend_from_slice(bytes.as_slice()),
+                other=>panic!("unexpected {other:?}"),
+            }
+        }
+        echoed
+    }).await.unwrap();
+    for (index, chunk) in echoed.chunks(8192).enumerate() { assert!(chunk.iter().all(|b| *b == index as u8)); }
+    let writer = upload.await.unwrap();
+    assert!(!task.is_finished());
+    drop(reader); drop(writer);
+    let audit = task.await.unwrap();
+    assert_eq!(audit.bytes, 2 * 256 * 1024);
+    assert_eq!((audit.terminal_code, audit.terminal_detail), (EgressError::Unavailable, TerminalDetail::PeerClosed));
 }
 
 #[test]

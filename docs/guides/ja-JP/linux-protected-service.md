@@ -373,6 +373,30 @@ sudo journalctl -u duduclaw-gateway.service -u duduclaw-spawnd.service -u duducl
 | 確認／交換待ち | 移行の確認で対応項目の確認、再試行、新しい認証情報設定を完了。承認だけでは移行完了にならない。 |
 | 更新受理済みだが未 committed | 永続的な要求状態と準備エラーを追跡し、手動バイナリ交換を並行実行しない。 |
 
+### egress の実行記録
+
+外部接続を許可された隔離実行が終わるたびに、egress のジャーナルに JSON が 1 行だけ記録されます。項目は `run_id`、`profile_id`、`bytes`（双方向の合計）、`connection_attempts`、`terminal_code` と、v1.83 で追加された `terminal_detail` です。`terminal_detail` は実行がどこで終わったかを示す固定ラベルです。この行にホスト名、アドレス、リクエスト内容は含まれません。
+
+```sh
+sudo journalctl -u duduclaw-egress.service --no-pager | grep terminal_code
+```
+
+毎秒の制限（`frames_per_second`、`bytes_per_second`）は実行を遅くするだけで、実行を終了させません。1 つのフレームが `idle_timeout_ms` 以内にレート制限を通過できなかった場合に限り、実行はレート系のラベルで終了します。
+
+| `terminal_code` | `terminal_detail` | 意味 |
+| --- | --- | --- |
+| `unavailable` | `peer_closed` | 実行のフォワーダーが接続を閉じました。正常終了もこの値になります。 |
+| `unavailable` | `revoked` | spawn サービスが実行を終了したか、制御接続が切れました。 |
+| `resource_limit` | `total_bytes`、`total_connections` | `run_caps` の合計上限に達しました。通信量が想定どおりの場合に限り、`/etc/duduclaw/egress.json` の上限を引き上げてください。 |
+| `resource_limit` | `max_tunnels` | 同時に開いた接続数が `max_tunnels` に達しました。 |
+| `resource_limit` | `frame_rate`、`byte_rate` | 1 つのフレームが `idle_timeout_ms` 以内にレート制限を通過できませんでした（例：`bytes_per_second` が 8 KiB のフレームサイズより小さい）。 |
+| `resource_limit` | `invalid_limits` | プロファイルの制限または run caps が無効です。 |
+| `timeout` | `idle_timeout`、`frame_timeout`、`write_timeout` | `idle_timeout_ms` の間通信がなかった、フレームが途中で止まった、またはフォワーダーがフレームを時間内に受け取りませんでした。 |
+| `invalid_request` | `invalid_frame`、`frame_too_large`、`protocol_state` | フォワーダーが、復号できないフレーム、`max_frame_bytes` を超えるフレーム、または状態に合わないフレームを送りました。不具合として報告してください。 |
+| すべて | `internal` | egress の内部エラーです。このジャーナル行を添えて報告してください。 |
+
+接続先が `idle_timeout_ms` の間まったくデータを受け取らない場合、egress はその接続だけを閉じ、実行は続きます。CONNECT ヘッダーの制限（`max_header_bytes`、`max_headers`）は、社員サンドボックス内の CONNECT リクエストにだけ適用されます。そのリクエストは HTTP 431 で拒否され、実行は終了しません。
+
 ### spawnd ジャーナルのアカウント検証行
 
 `registry_verified`、`accounts_locked`、`ssh_live_negative_checks`、`cron_at_acl_and_jobs_verified`、`external_iam_reservation_verified` がまとめて失敗する場合、spawnd のジャーナルに失敗したステップが出力されます。各行は 1 回だけ出力され、ステップまたはアカウントが変わったときだけ再出力されます。
