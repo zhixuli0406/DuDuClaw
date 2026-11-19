@@ -230,7 +230,9 @@ macro_rules! sites {
 
         /// R8x: every place a protected turn can be refused, as the fixed
         /// `site` log value. Grouped by prefix: `preflight.*`/`authorize.*`
-        /// (coarse gates, no authority consumed), `authorization.*` (taking
+        /// (coarse gates, no authority consumed), `utility.*` (a utility call
+        /// refused by design before any runtime, see
+        /// [`note_utility_refusal`]), `authorization.*` (taking
         /// or issuing the one-time run authority), `plan.*` (the
         /// root-published run plan), `launch.*` (the protected MCP launch
         /// context), `spawn.*` (asking spawnd to start the run;
@@ -289,6 +291,14 @@ sites! {
     AuthorizeMaxTurns => "authorize.max_turns",
     StepLimitAgentDir => "step_limit.agent_dir",
     StepLimitUnavailable => "step_limit.unavailable",
+    // B0: utility calls refused by design before any runtime is selected or
+    // entered (`note_utility_refusal`). `utility.in_run_judge`: a judge called
+    // from inside an isolated MCP request (`isolation_egress`'s refusing
+    // runner); `utility.global_fallback`: an employee whose runtime has no
+    // utility profile would have used the global utility provider
+    // (`runtime_config::resolve_utility_profile`).
+    UtilityInRunJudge => "utility.in_run_judge",
+    UtilityGlobalFallback => "utility.global_fallback",
     // The one-time run authority.
     AuthorizationConsumed => "authorization.consumed",
     AuthorizationInstalledMismatch => "authorization.installed_mismatch",
@@ -692,6 +702,99 @@ pub(crate) fn log_refused_after_start(runtime: &'static str, agent: &str, site: 
     let agent = agent_label(agent);
     if log_expected_background(runtime, agent, site) { return; }
     tracing::warn!(runtime, agent, site = site_text(site), "isolated run refused after start");
+}
+
+/// B0: the fixed `runtime` log value of a configured provider, the same
+/// labels as [`runtime_label`] (every registered CLI is `registered`).
+pub(crate) fn provider_label(provider: duduclaw_core::types::RuntimeType) -> &'static str {
+    use duduclaw_core::types::RuntimeType;
+    match provider {
+        RuntimeType::Claude => "claude",
+        RuntimeType::Codex => "codex",
+        RuntimeType::Grok => "grok",
+        RuntimeType::OpenAiCompat => "openai_compat",
+        _ => "registered",
+    }
+}
+
+/// B0: the record of a utility (background) call that protected mode refuses
+/// by design before it reaches any runtime's protected path (an in-run judge,
+/// the global utility fallback, the Claude utility lane). It is the standard
+/// by-design background refusal: [`log_not_started`] under the utility-call
+/// scope, i.e. one DEBUG `isolated background call not available in protected
+/// mode` plus at most one INFO per employee and site, never a WARN. Inside an
+/// open protected turn (Linux; `runtime::observed`) only the site is recorded
+/// and that turn's single logging point writes the line. The caller returns
+/// its own fixed error; nothing here reads or logs request content.
+pub(crate) fn note_utility_refusal(runtime: &'static str, agent: &str, site: RefusalSite) {
+    #[cfg(target_os = "linux")]
+    if super::runtime::in_observed_turn() {
+        super::runtime::note_site(site);
+        return;
+    }
+    crate::runtime_dispatch::UTILITY_CALL.sync_scope((), || log_not_started(runtime, agent, Some(site)));
+}
+
+/// Test fixtures shared by the B0 utility-refusal tests in other modules.
+#[cfg(test)]
+pub(crate) mod test_support {
+    /// Run `f` with `execution_gate::isolation_required()` true on THIS
+    /// thread only: a thread-local protected-mode marker plus a thread-local
+    /// isolation-install fact (never latched process-wide, so parallel tests
+    /// are unaffected).
+    pub(crate) fn with_isolation_required<R>(f: impl FnOnce() -> R) -> R {
+        let facts = tempfile::tempdir().unwrap();
+        let marker = facts.path().join("protected-mode");
+        std::fs::write(&marker, b"native-systemd\n").unwrap();
+        let sources = duduclaw_core::protected_mode::Sources { env: None, marker,
+            service_home: facts.path().join("no-service-home") };
+        let isolation = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(isolation.path().join("var/lib/duduclaw-spawnd")).unwrap();
+        duduclaw_core::protected_mode::with_thread_sources(sources, ||
+            duduclaw_core::isolation_install::with_thread_root(isolation.path().to_path_buf(), || {
+                assert!(duduclaw_core::execution_gate::isolation_required());
+                f()
+            }))
+    }
+
+    #[derive(Clone)]
+    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes); Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+
+    /// Run `future` to completion on a current-thread runtime on THIS thread
+    /// (so thread-local fixtures apply) and return its output with every log
+    /// line written meanwhile at DEBUG and above.
+    pub(crate) fn run_capturing_logs<F: std::future::Future>(future: F) -> (F::Output, String) {
+        let log = Capture(Default::default());
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG).with_writer(move || writer.clone()).finish();
+        let output = tracing::subscriber::with_default(subscriber, ||
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(future));
+        let bytes = log.0.lock().unwrap().clone();
+        (output, String::from_utf8(bytes).unwrap())
+    }
+
+    /// The B0 by-design utility refusal was logged for `site`: exactly one
+    /// DEBUG line (plus at most the one process-lifetime INFO notice, which an
+    /// earlier test may already have taken), never the WARN refusal lines.
+    /// (A caller's own fallback warning, e.g. "fail-closed to Chat", is not a
+    /// refusal line and is allowed.)
+    pub(crate) fn assert_utility_refusal_logged(logs: &str, site: super::RefusalSite) {
+        let debug: Vec<&str> = logs.lines().filter(|line| line.contains("DEBUG")
+            && line.contains("isolated background call not available in protected mode")).collect();
+        assert_eq!(debug.len(), 1, "{logs}");
+        assert!(debug[0].contains(&format!("site=\"{}\"", site.as_str())), "{logs}");
+        for line in logs.lines().filter(|line| line.contains("protected mode: background model calls are not run")) {
+            assert!(line.contains("INFO") && line.contains(&format!("site=\"{}\"", site.as_str())), "{logs}");
+        }
+        assert!(!logs.contains("isolated run not started") && !logs.contains("isolated run refused"), "{logs}");
+    }
 }
 
 #[cfg(test)]

@@ -1067,6 +1067,23 @@ pub async fn route_os_intent(
 mod tests {
     use super::*;
 
+    /// B0 item 1: inside an isolated MCP request the L2 utility call reaches
+    /// the production in-run judge runner, which refuses (site
+    /// `utility.in_run_judge`, DEBUG/INFO log). The router keeps its existing
+    /// fallback for a failed call: fail-closed to `Chat` (`l2_llm_error`).
+    #[test]
+    fn b0_in_mcp_l2_refusal_keeps_the_fail_closed_chat_fallback() {
+        use crate::isolation_mcp::refusal::{site, test_support};
+        let home = tempfile::tempdir().unwrap();
+        let agent = crate::isolation_egress::test_support::employee(home.path(), "worker");
+        let (result, logs) = test_support::run_capturing_logs(
+            crate::isolation_egress::test_support::in_mcp_request(home.path(), "worker",
+                crate::autonomous_runtime::scope(home.path(), "worker", &[],
+                    resolve_l2(home.path(), Some(&agent), "幫我查一下網路狀態"))));
+        assert_eq!(result, OsIntentResult::chat(OsIntentSource::L2LlmError, vec!["l2_llm_error"]));
+        test_support::assert_utility_refusal_logged(&logs, site!("utility.in_run_judge"));
+    }
+
     fn sync_route(text: &str) -> OsIntentResult {
         // Every test case below resolves at L0/L1 (or the L1-empty→goal/chat
         // fallback, which is also synchronous underneath) — none needs the

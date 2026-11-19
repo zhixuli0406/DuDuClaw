@@ -96,6 +96,12 @@ pub(crate) fn note_site(site: RefusalSite) {
     record(|trace| if trace.site.is_none() { trace.site = Some(site); });
 }
 
+/// B0: is a protected turn's [`observed`] scope open on this task? Its single
+/// logging point then writes the line (`refusal::note_utility_refusal`).
+pub(crate) fn in_observed_turn() -> bool {
+    TRACE.try_with(|_| ()).is_ok()
+}
+
 /// The only builder of this module's refusal: the fixed default sentence
 /// (`refusal::DEFAULT_MESSAGE`), spawn-gate prefixed, exactly as before R8x,
 /// plus the site that refused. It takes a [`RefusalSite`], so a refusal
@@ -1126,8 +1132,8 @@ pub(super) mod tests {
 
     // ── R8x: refusal sites ──────────────────────────────────────────────
 
-    const LABEL_PREFIXES: [&str; 10] = ["preflight.", "authorize.", "step_limit.", "authorization.", "request.",
-        "plan.", "launch.", "spawn.", "run.", "output."];
+    const LABEL_PREFIXES: [&str; 11] = ["preflight.", "authorize.", "step_limit.", "utility.", "authorization.",
+        "request.", "plan.", "launch.", "spawn.", "run.", "output."];
 
     /// Runs `future` inside a fresh turn carrier; returns the site it recorded.
     pub(crate) async fn site_of(future: impl Future<Output = ()>) -> Option<&'static str> {
@@ -1142,11 +1148,14 @@ pub(super) mod tests {
     }
 
     /// The protected sources that name sites (the macros' literal arguments).
-    const SITE_SOURCES: [&str; 9] = [include_str!("runtime.rs"), include_str!("boot.rs"), include_str!("ingress.rs"),
+    const SITE_SOURCES: [&str; 12] = [include_str!("runtime.rs"), include_str!("boot.rs"), include_str!("ingress.rs"),
         include_str!("launch.rs"),
         include_str!("launch_sites.rs"),
         include_str!("../runtime/openai_compat.rs"), include_str!("../runtime/codex.rs"),
-        include_str!("../runtime/grok.rs"), include_str!("../runtime/generic_cli.rs")];
+        include_str!("../runtime/grok.rs"), include_str!("../runtime/generic_cli.rs"),
+        // B0: the by-design utility refusals (`refusal::note_utility_refusal`).
+        include_str!("../isolation_egress.rs"), include_str!("../runtime_config.rs"),
+        include_str!("../channel_reply/cli_spawn.rs")];
 
     /// Every literal passed to a site macro (`site!`, `refuse!`, `keep!`,
     /// boot's `step!`). The needles are built so this function's own text
