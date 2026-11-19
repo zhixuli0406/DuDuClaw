@@ -9,6 +9,55 @@ pub const MAX_RESPONSE: usize = 4 * 1024 * 1024;
 pub const MAX_ROUNDS: usize = 50;
 pub const ARGUMENTS: &[&str] = &["--duduclaw-protocol", PROTOCOL, "--mcp-config", "/config/mcp.json"];
 
+/// The line prefix the worker prints on stderr before exiting 125
+/// (`src/main.rs`); the rest of that line is exactly one [`REFUSAL_REASONS`] entry.
+pub const REFUSAL_LINE_PREFIX: &str = "isolated API execution unavailable: ";
+
+/// R8t: every fixed reason that can reach `linux::run()`'s error (and so the
+/// worker's single stderr line), plus `main.rs`'s non-Linux reason. This is
+/// the single allow-list shared with the gateway, which recognises only these
+/// exact strings. `tests/refusal_reasons.rs` fails when an error literal in
+/// `src/{lib,linux,sealed,vendor}.rs` is missing here. Grouped by origin.
+pub const REFUSAL_REASONS: &[&str] = &[
+    // Launch (linux.rs, main.rs)
+    "worker launch refused", "unsupported platform",
+    // Sealed input and request (sealed.rs, linux.rs, lib.rs, vendor.rs)
+    "sealed input unavailable", "sealed input invalid", "sealed input read failed", "input fencing failed",
+    "input timeout", "input read failed", "input mismatch", "request invalid", "invalid request",
+    "request too large", "provider request invalid", "invalid Gemini model",
+    // MCP projection (linux.rs, lib.rs)
+    "MCP projection unavailable", "MCP projection invalid", "invalid MCP projection",
+    // Employee credentials (linux.rs, lib.rs)
+    "employee credentials unavailable", "employee credentials invalid", "employee credentials too large",
+    "invalid employee credentials", "invalid employee credential", "invalid endpoint",
+    "duplicate employee provider", "employee provider required", "employee provider unavailable",
+    // Provider transport (linux.rs)
+    "HTTP transport unavailable", "provider transport failed", "provider response failed",
+    // Provider refused (non-success HTTP status, linux.rs)
+    "provider refused request",
+    // Provider response and vendor translation (linux.rs, lib.rs, vendor.rs)
+    "provider response invalid", "provider usage missing", "provider choice invalid", "provider message missing",
+    "provider role invalid", "provider calls invalid", "provider completion incomplete", "empty provider answer",
+    "invalid tool call", "unadvertised tool", "invalid tool arguments", "duplicate tool call",
+    "invalid provider field", "invalid tool replay", "invalid replay", "invalid replay protocol",
+    "missing tool replay", "invalid role", "invalid tool", "invalid schema", "invalid protocol",
+    "invalid provider message", "invalid response", "unsupported provider block", "incomplete provider response",
+    "unsupported provider content", "incomplete provider call", "invalid candidates", "invalid arguments",
+    "usage overflow",
+    // MCP bridge (linux.rs, lib.rs)
+    "MCP bridge unavailable", "MCP input unavailable", "MCP output unavailable", "MCP request invalid",
+    "MCP write failed", "MCP read failed", "MCP disconnected", "MCP response invalid", "MCP request refused",
+    "MCP result missing", "MCP authority changed", "incomplete tool inventory", "invalid tool inventory",
+    "invalid tool name", "invalid tool schema", "tool result invalid",
+    // Timeout (linux.rs)
+    "API execution timeout",
+    // Limits (linux.rs, lib.rs)
+    "MCP request too large", "MCP response too large", "MCP notification limit", "response too large",
+    "conversation too large", "provider response too large", "tool round limit reached", "tool inventory too large",
+    // Worker output (linux.rs)
+    "response invalid", "output failed",
+];
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {

@@ -205,6 +205,25 @@ The gateway also accepts the same document from the dashboard (the gateway side 
 - The dashboard status shows, per employee, only the provider names, protocols, endpoint origins (`https://host[:port]`) and the time of the last confirmed dashboard change. **It reflects only changes made through the dashboard**: documents written or removed with the host command above are not visible there. Another person's Personal employees are hidden unless the Admin reveals them with the step-up (audited).
 - While a run is live on the host or the employee is in use, the change is refused as busy; retry when the employee is idle. When the isolation service does not confirm a change, the result is reported as unconfirmed and the status stays as it was; sending the same change again is safe.
 
+### When an employee cannot run
+
+When an isolated run fails, the gateway journal has exactly one warning `isolated run refused` with the fields `runtime`, `agent` (the employee label), `reason`, `class`, `exit` (exit code, `signal`, `timeout` or `incomplete`) and `stderr_len`:
+
+```sh
+sudo journalctl -u duduclaw-gateway.service --no-pager | grep 'isolated run refused'
+```
+
+For the OpenAI-compatible runtime, `reason` is the worker's fixed reason (the list is in `crates/duduclaw-api-worker/README.md`, "Diagnostics"). Other runtimes, and any output that is not exactly one known reason, log `reason="unrecognised"`. The runtime's own output is never logged or shown. In a chat channel, a person allowed to see operator diagnostics sees one of these fixed sentences; everyone else sees the general failure message, and public website visitors only the visitor message:
+
+| Sentence shown (zh-TW) | `class` | What to check |
+| --- | --- | --- |
+| 這位 AI 員工尚未設定模型連線資料，或設定內容無法使用；請管理員到『受保護模式 → 模型連線資料』檢查。 | `employee_credentials` | Model connection data exists for this employee, is valid, and names the requested provider (see above). |
+| 連不到這位 AI 員工設定的模型服務；請管理員檢查端點位址與對外連線。 | `provider_transport` | `base_url` host, TLS, and that the egress policy allows that host. |
+| 模型服務拒絕了這次請求；請管理員檢查這位 AI 員工的金鑰與模型名稱。 | `provider_refused` | API key, model name, account quota at the provider. |
+| 模型服務的回覆無法使用；請管理員檢查端點是否為相容的服務。 | `provider_response` | `base_url` and `protocol` match the provider's API (`chat_completions`, `responses`, `anthropic`, `gemini`). |
+| 這次工作超過時間上限而停止。 | `timeout` | The run's time limit, or a slow provider. |
+| 受保護模式尚無這次工作的隔離執行授權，或所選執行設定尚未通過驗證；請由管理員檢查服務狀態。 | any other, or `unrecognised` | Readiness and the journal (`reason`, `exit`); see "Troubleshoot readiness". |
+
 ## Upgrade and uninstall
 
 The separate updater cannot be installed yet (planned for a later release); current hosts upgrade as described in the single-binary section above. After migration and complete updater provisioning, an Admin requests a stable release in the dashboard or uses the installed CLI:
