@@ -54,8 +54,8 @@ pub async fn with_runtime_authorization<F: Future>(authorization: RuntimeAuthori
 }
 
 fn refusal() -> String {
-    duduclaw_agent::mcp_spawn_gate::spawn_gate_error(
-        "受保護模式尚無這次工作的隔離執行授權，或所選執行設定尚未通過驗證；請由管理員檢查服務狀態。")
+    // The fixed default sentence (`refusal::DEFAULT_MESSAGE`), spawn-gate prefixed.
+    super::refusal::user_error(None)
 }
 
 pub(crate) async fn available(runtime: RuntimeKind) -> bool {
@@ -231,7 +231,7 @@ pub(crate) async fn execute_registered_cli(id: &str, prompt: &str, context: &cra
     let plan = super::boot::other_runtime_plan(authorization.home.clone(), authorization.agent.clone(),
         class, runtime.clone(), bytes.clone()).await.map_err(|_| refusal())?;
     let deadline = Duration::from_secs(crate::runtime_config::call_timeout_secs(Some(agent_dir)));
-    let out = collect_plan(authorization, plan, class, runtime, bytes, deadline).await?;
+    let out = collect_plan(authorization, plan, class, runtime, bytes, deadline, false).await?;
     let stdout = std::str::from_utf8(&out).map_err(|_| refusal())?;
     let content = crate::runtime::generic_cli::parse_output(stdout, format).ok_or_else(refusal)?;
     Ok(crate::runtime::RuntimeResponse { partial_timeout_secs: None,
@@ -240,8 +240,17 @@ pub(crate) async fn execute_registered_cli(id: &str, prompt: &str, context: &cra
         cache_read_tokens: 0, model_used: context.model.clone(), runtime_name: id.into() })
 }
 
+/// R8t: a failed run logs one `isolated run refused` warning (fixed fields,
+/// never stderr bytes). Only the API worker (`api_reason`) has its stderr
+/// matched against the fixed refusal reasons, which then select the class
+/// message; the other runtimes log `reason="unrecognised"` and keep the
+/// default refusal. The stderr buffer is dropped before returning.
 async fn collect_plan(authorization: RuntimeAuthorization, plan: duduclaw_isolation::execution::SpawnPolicy,
-    class: ExecutionClass, runtime: RuntimeKind, bytes: Vec<u8>, deadline: Duration) -> Result<Vec<u8>, String> {
+    class: ExecutionClass, runtime: RuntimeKind, bytes: Vec<u8>, deadline: Duration, api_reason: bool)
+    -> Result<Vec<u8>, String> {
+    use super::refusal::RunExit;
+    let agent = authorization.agent.clone();
+    let label = super::refusal::runtime_label(&runtime);
     let (mut child, mut writer) = spawn_plan(authorization, plan, class, runtime, bytes, None).await?;
     let mut stdout = child.child().stdout.take().ok_or_else(refusal)?;
     let mut stderr = child.child().stderr.take().ok_or_else(refusal)?;
@@ -255,10 +264,20 @@ async fn collect_plan(authorization: RuntimeAuthorization, plan: duduclaw_isolat
                 .await.map_err(|_| refusal()) },
             async { child.child().wait().await.map_err(|_| refusal()) })
     }).await;
-    match result {
-        Ok(Ok(((), false, _, status))) if status.success() => {},
-        _ => { child.kill_and_reap().await; return Err(refusal()); }
+    let exit = match &result {
+        Ok(Ok(((), false, _, status))) if status.success() => None,
+        Ok(Ok((_, _, _, status))) => Some(RunExit::from_status(*status)),
+        Ok(Err(_)) => Some(RunExit::Incomplete),
+        Err(_) => Some(RunExit::Timeout),
     };
+    if let Some(exit) = exit {
+        child.kill_and_reap().await;
+        let reason = if api_reason { super::refusal::refusal_reason(&err) } else { None };
+        super::refusal::log_refused(label, &agent, reason, exit, err.len());
+        drop(err);
+        return Err(if api_reason { super::refusal::user_error(reason.and_then(super::refusal::class_of)) }
+            else { refusal() });
+    }
     child.leader_exited();
     child.disarm();
     Ok(out)
@@ -305,12 +324,14 @@ pub(crate) async fn execute_native(runtime: RuntimeKind, prompt: String, context
     let plan = super::boot::other_runtime_plan(authorization.home.clone(), authorization.agent.clone(),
         class, runtime.clone(), bytes.clone()).await.map_err(|_| refusal())?;
     let deadline = Duration::from_secs(crate::runtime_config::call_timeout_secs(Some(agent_dir)));
-    if runtime != RuntimeKind::Grok { return collect_plan(authorization, plan, class, runtime, bytes, deadline).await; }
+    if runtime != RuntimeKind::Grok { return collect_plan(authorization, plan, class, runtime, bytes, deadline, false).await; }
     collect_native_pty(authorization, plan, class, deadline).await
 }
 
 async fn collect_native_pty(authorization: RuntimeAuthorization, plan: duduclaw_isolation::execution::SpawnPolicy,
     class: ExecutionClass, deadline: Duration) -> Result<Vec<u8>, String> {
+    // R8t: for the `isolated run refused` log line only (PTY: no separate stderr).
+    let agent = authorization.agent.clone();
     let launch = super::prepare_launch(super::LaunchInput { agent: authorization.agent, plan,
         grant: authorization.grant, roots: authorization.roots, origin: authorization.origin,
         caller: authorization.caller, turn: authorization.turn, authenticated_epoch: authorization.authenticated_epoch })
@@ -337,8 +358,16 @@ async fn collect_native_pty(authorization: RuntimeAuthorization, plan: duduclaw_
             8 * 1024 * 1024, false).await.map_err(|_| refusal()) },
             async { child.wait().await.map_err(|_| refusal()) })
     }).await;
-    match result { Ok(Ok((false, status))) if status.success() => Ok(out),
-        _ => { let _ = child.kill().await; Err(refusal()) } }
+    use super::refusal::RunExit;
+    let exit = match &result {
+        Ok(Ok((false, status))) if status.success() => return Ok(out),
+        Ok(Ok((_, status))) => RunExit::from_status(*status),
+        Ok(Err(_)) => RunExit::Incomplete,
+        Err(_) => RunExit::Timeout,
+    };
+    let _ = child.kill().await;
+    super::refusal::log_refused(super::refusal::runtime_label(&RuntimeKind::Grok), &agent, None, exit, 0);
+    Err(refusal())
 }
 
 /// Take or issue initiating authority before resolving provider credentials.
@@ -364,8 +393,10 @@ pub(crate) async fn execute_api_worker(authorization: RuntimeAuthorization,
     let class = crate::process_group::execution_class(ExecutionClass::EmployeeMain);
     let plan = super::boot::other_runtime_plan(authorization.home.clone(), authorization.agent.clone(),
         class, RuntimeKind::OpenAiCompat, bytes.clone()).await.map_err(|_| refusal())?;
+    // R8t: a refusal names the worker's fixed reason in the log and selects
+    // the class message (still spawn-gate prefixed: no rotation/fallback).
     let out = collect_plan(authorization, plan, class, RuntimeKind::OpenAiCompat, bytes,
-        Duration::from_secs(request.timeout_secs)).await?;
+        Duration::from_secs(request.timeout_secs), true).await?;
     let response: duduclaw_api_worker::Response = serde_json::from_slice(&out).map_err(|_| refusal())?;
     if response.content.trim().is_empty() { return Err(refusal()); }
     Ok(crate::runtime::RuntimeResponse { partial_timeout_secs: None, content: response.content,

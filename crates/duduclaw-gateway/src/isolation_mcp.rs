@@ -135,6 +135,10 @@ pub(crate) use run_broker::{readiness_feature_source, readiness_features, work_b
 pub(crate) use boot::{a_producers_ready, spawn_backend_retry, tools_unavailable};
 #[cfg(target_os = "linux")]
 pub(crate) use boot::control_recording;
+/// R8t: recognises the API worker's fixed refusal reason (allow-list only)
+/// and selects the operator log fields and message. Pure; built everywhere.
+#[path = "isolation_mcp/refusal.rs"]
+pub(crate) mod refusal;
 #[cfg(target_os = "linux")]
 #[path = "isolation_mcp/runtime.rs"]
 pub(crate) mod runtime;
