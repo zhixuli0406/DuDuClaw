@@ -224,6 +224,60 @@ For the OpenAI-compatible runtime, `reason` is the worker's fixed reason (the li
 | 這次工作超過時間上限而停止。 | `timeout` | The run's time limit, or a slow provider. |
 | 受保護模式尚無這次工作的隔離執行授權，或所選執行設定尚未通過驗證；請由管理員檢查服務狀態。 | any other, or `unrecognised` | Readiness and the journal (`reason`, `exit`); see "Troubleshoot readiness". |
 
+A turn refused **before a run was started** logs exactly one warning `isolated run not started` instead, with the fields `runtime`, `agent` (the employee label) and `site`, a fixed label naming where it was refused. A run that started but ended without the line above (its pipes were missing, or it exited successfully with an unusable result) logs `isolated run refused after start` with the same fields. A failed protected turn has exactly one of these three lines. No request content, path or identifier other than the employee label is logged. The sentence shown to the person does not change.
+
+```sh
+sudo journalctl -u duduclaw-gateway.service --no-pager | grep -E 'isolated run (not started|refused)'
+```
+
+| `site` group | Labels | What to check |
+| --- | --- | --- |
+| Coarse gates (nothing consumed yet) | `preflight.model`, `preflight.runtime_policy`, `preflight.model_policy`, `preflight.redaction`, `preflight.interceptor`; `authorize.agent_dir_missing`, `authorize.effort`, `authorize.utility_call`, `authorize.work_dir_override`, `authorize.agent_dir`, `authorize.capabilities_policy`, `authorize.native_gate`, `authorize.runtime_kind`, `authorize.explore_lane`, `authorize.tool_restrictions`, `authorize.codex_home`, `authorize.product_policy`, `authorize.interceptor`, `authorize.runtime_id`, `authorize.max_turns`; `step_limit.agent_dir`, `step_limit.unavailable` | The employee's `agent.toml` (`[model] effort`, `[capabilities]`), the product policy for the runtime and model, redaction and CCR settings. |
+| Authorization (the one-time run authority) | `authorization.ingress.*` — the person asking: `no_scope`, `consumed`, `capture.*` (the sign-in check made when the message arrived: `no_web_credential`, `web_identity`, `channel_conflict`, `channel_mapping`, `requester`, `user_db`, `user_inactive`, `epoch`, `blocking`), `agent_path`, `home_mismatch`, `no_turn`, `no_session`, `no_attended_proof`, `attended_proof_invalid`, `nested_dispatch`, `principal_mismatch`, `proof_expired`, `identity_recheck`, `blocking`; `authorization.issue.*` — issuing it: `boot_owner`, `product_authority`, `lifecycle`, `snapshot`, `epoch`, `principal`, `binding`, `policy_revision`, `tools`, `human`, `selectors`, `capability`, `users_recheck`, `policy_changed`, `lifecycle_recheck`, `snapshot_recheck`, `facts_recheck`; and `authorization.consumed`, `authorization.installed_mismatch`, `authorization.agent_label`, `authorization.home`, `authorization.principal_context`, `authorization.background_issue`, `authorization.ingress_issue` | The person's account is active, needs no password change and may assign work to this employee; the sign-in is still valid; the employee's binding (Shared organization or Personal owner) and allocation. |
+| Plan | `request.encode`, `plan.readiness`, `plan.boot_owner`, `plan.home_mismatch`, `plan.employee_unconfirmed`, `plan.root_publication`, `plan.blocking`, `plan.unavailable` | Readiness; the employee is confirmed; the root publication offers this runtime to this employee. |
+| Launch | `launch.readiness`, `launch.boot_owner`, `launch.boundary_unhealthy`, `launch.employee_unconfirmed`, `launch.employee_mismatch`, `launch.product_prepare`, `launch.binding`, `launch.blocking`, `launch.resolver`, `launch.connectors`, `launch.worker_plans`, `launch.factories`, `launch.dispatcher`, `launch.protected_launch`, `launch.authority_pairing`; `launch.bind.<step>` (after the run was reserved; `<step>` as in `isolated launch preparation refused`, below) | The employee's protected tool boundary (tool projection, connectors); for `launch.bind.*`, the table below. |
+| Spawn | `spawn.prepare`, `spawn.not_protected`, `spawn.admission`; `spawn.backend.unavailable`, `.denied`, `.would_deadlock`, `.not_found`, `.timeout`, `.io`, `.protocol`; `spawn.start.permission_denied`, `.not_found`, `.timed_out`, `.other` | `spawn.backend.*` is the fixed class of the isolation service's (or its control socket's) refusal. The isolation service does not log a refused start, so a quiet `duduclaw-spawnd` journal does not rule this group out. |
+| After start (`isolated run refused after start`) | `run.stdin_missing`, `run.stdout_missing`, `run.stderr_missing`, `run.input`, `run.output_drain`, `run.stderr_drain`, `run.wait`, `run.refused`; `output.parse`, `output.empty`, `output.utf8` | The runtime's result; `run.*` labels after the `isolated run refused` line add nothing new. |
+| `unlabelled` | — | A refusal without a site: a defect, please report it. |
+
+`spawn.backend.*` does not tell whether the gateway or the isolation service refused the start. When the gateway refuses it itself (before or instead of sending the start request), it also logs one warning `isolated spawn refused locally`, just before the `isolated run not started` line, with one fixed field `step` (no identifiers, paths or content). If a `spawn.backend.*` line has no such warning before it, the isolation service refused (it does not log that, see the Spawn row above).
+
+```sh
+sudo journalctl -u duduclaw-gateway.service --no-pager | grep -E 'isolated (spawn refused locally|run not started)'
+```
+
+| When | `step` | What it means |
+| --- | --- | --- |
+| Reserving the run | `admission`, `tracked_runs`, `reservation_reply`, `reservation_queue`, `endpoint_directory`, `endpoint_socket`, `endpoint_connect`, `peer_identity` | Readiness changed; the gateway's run table is full; the reservation reply was unusable (its expiry must be within 30 s of the gateway's clock); the employee already has 32 unfinished runs in this gateway; the control socket's directory, socket or peer checks failed. |
+| Between reservation and start | `launch_prepare`, `policy_binding`, `task_binding`, `pty_size` | The protected launch context refused (the gateway re-checking the person's authority for this run, or the tool boundary issuing the run's capability: readiness, the employee's binding, the runtime's MCP registration); the prepared plan does not match the reserved run; the task was bound after the reservation ended; an invalid terminal size. |
+| Building the start request | `admission`, `workspace_delivery`, `workspace`, `entry`, `reservation_state`, `resource_limits`, `inputs`, `attachments`, `request_invalid`, `connection_state`, `live_check`, `fd_plan` | Readiness changed; the workspace proof does not match; the plan names a workspace other than the employee's own; the run is unknown, belongs to another employee, was already started or its 30-second reservation expired; the runtime record has a zero output or input budget; the request exceeds the input budget; too many attachments; the request is invalid (for example a step limit outside 1–1000); the control connection is closed; the live authority check refused; the descriptor plan does not match. |
+| After sending it | `admission_after_send`, `start_reply` | Readiness changed while the start was in flight (the run is cancelled); an unexpected reply. |
+| Other control requests | `cancel_state`, `live_status_reservation`, `work_op`, `helper_op` | A cancel abandoned or already refused; a status reply naming another reservation; an operation not allowed on that path. |
+
+When the step is `launch_prepare`, the gateway logs one more warning just before it, `isolated launch preparation refused`, with one fixed field `step` naming the check that refused (no identifiers, paths or content). The turn's `isolated run not started` line then shows `site="launch.bind.<step>"` instead of `spawn.backend.denied`.
+
+```sh
+sudo journalctl -u duduclaw-gateway.service --no-pager | grep -E 'isolated (launch preparation refused|spawn refused locally|run not started)'
+```
+
+| `step` | What it means |
+| --- | --- |
+| `recheck.expired` | The run authority expired. It is issued when the protected run is requested, for 30 minutes and never beyond the web sign-in's own expiry; sign in again. A system clock jump also shows here. |
+| `recheck.agent` | The employee is no longer in the gateway's live employee list. |
+| `recheck.identity` | Since the run was authorized, the employee's lifecycle (allocation, confirmation, the root read-back) or the person's account facts (organization, access generation, policy epoch, sign-in epoch) changed — for example an employee approval or binding change still being applied, sign-out on all devices, or a second-factor change. |
+| `recheck.policy_revision` | A policy input exists but cannot be read or parsed, the employee's `agent.toml` lacks `[agent] status = "active"`, or `config.toml` is missing. Inputs: the employee's effective `agent.toml`, `CONTRACT.toml` (optional), `preset_bindings.toml`, `org.toml`, `config.toml`, the custom redaction profile, `KILLSWITCH.toml`. |
+| `recheck.revision_changed` | A policy input changed since the run was authorized: `agent.toml` `[capabilities]`, `[permissions]`, `[agent]` `reports_to`/`department`/`role`; `CONTRACT.toml`; the preset binding; the `org.toml` chain; `config.toml` `[delegation]`, `[acp]`, `[provenance]`, `[integrations]`, `[redaction]`; the custom redaction profile; `KILLSWITCH.toml`. Sessions, memory, `.claude/`, `.mcp.json`, `SOUL.md` and skills are not inputs. |
+| `recheck.epoch`, `epoch_after_snapshot` | The person's account facts changed during the check (before or after the status request below). |
+| `recheck.background` | Scheduled or delegated work only: its background record no longer authorizes the run. |
+| `live_snapshot` | The isolation service's status reply for the reserved run failed or did not arrive within 250 ms (the run's control connection is then closed). Check the `duduclaw-spawnd` journal and host load. |
+| `binding_mismatch` | The isolation service reports the run for another employee, or no longer in the reserved state. |
+| `revoked_before`, `revoked_after` | The run was cancelled while it was being prepared (for example the turn was stopped). |
+| `verify_blocking` | The gateway's pool for blocking authority checks stayed busy for 2 s, or the check took longer than 10 s (slow `users.db`/`apply.db` or root read-back). |
+| `inner_prepare.<class>` | The tool boundary refused to issue the run's capability; `<class>` is `unavailable`, `denied`, `would_deadlock`, `not_found`, `timeout`, `io` or `protocol` (`denied`: the reservation ended, the plan does not match the run, or the runtime's MCP registration or capability issuance refused). |
+| `prepared_missing`, `state_lock`, `associations` | The launch was prepared twice, its state was poisoned, or the gateway's table of bound runs (4096) is full or already holds the run: a defect, please report it. |
+
+In protected mode, a refused turn whose cause the text classifier cannot name ends with the reason code `safety_gate` instead of `unknown`.
+
 ## Upgrade and uninstall
 
 The separate updater cannot be installed yet (planned for a later release); current hosts upgrade as described in the single-binary section above. After migration and complete updater provisioning, an Admin requests a stable release in the dashboard or uses the installed CLI:

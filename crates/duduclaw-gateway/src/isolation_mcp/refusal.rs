@@ -171,12 +171,349 @@ pub(crate) fn runtime_label(runtime: &duduclaw_isolation::execution::RuntimeKind
 }
 
 /// The single `isolated run refused` warning. Only fixed strings, the agent
-/// label the neighbouring warnings use, the exit and the stderr *length*.
+/// label the neighbouring warnings use ([`agent_label`]: an invalid id is
+/// replaced, never logged), the exit and the stderr *length*.
 pub(crate) fn log_refused(runtime: &'static str, agent: &str, reason: Option<&'static str>, exit: RunExit,
     stderr_len: usize) {
+    let agent = agent_label(agent);
     let class = reason.and_then(class_of).map_or("unrecognised", RefusalClass::as_str);
     tracing::warn!(runtime, agent, reason = reason.unwrap_or("unrecognised"), class, exit = %exit, stderr_len,
         "isolated run refused");
+}
+
+/// R8x: the fixed `site` log text when a refused protected turn recorded no
+/// site (a forgotten site still produces exactly one line, never none). This
+/// is log text only, not a [`RefusalSite`]: no site value carries it, and only
+/// the two loggers below print it, for `None`.
+const UNLABELLED_SITE: &str = "unlabelled";
+
+/// The `site` log value: the recorded site, or the fixed `unlabelled` text.
+fn site_text(site: Option<RefusalSite>) -> &'static str {
+    site.map_or(UNLABELLED_SITE, RefusalSite::as_str)
+}
+
+/// R8x review round 3: the ONE list of refusal sites. Each entry
+/// `Variant => "label"` generates, from this single source:
+/// * the [`RefusalSite`] variant and its arm in [`RefusalSite::as_str`],
+/// * its entry in [`RefusalSite::ALL`] and in [`SITES`] (same order),
+/// * one arm `("label") => { …::RefusalSite::Variant }` of [`site!`],
+/// * one `const` assertion that `site!("label").as_str() == "label"`.
+///
+/// The inner `site!` arms need no metavariables (they name the variant by
+/// the absolute `crate::` path, the macro being crate-local), so there is no
+/// `$`-escaping problem on stable. Labels are captured as `tt` so they reach
+/// the inner matcher as plain literal tokens, not opaque fragments.
+macro_rules! sites {
+    ($($variant:ident => $label:tt),+ $(,)?) => {
+        /// R8x (F3): one entry of [`SITES`], as a type. Every site recorder
+        /// (`runtime::refuse`/`keep`/`note_site`, [`Sited`], the boot/ingress
+        /// step labels) takes this, never a string.
+        ///
+        /// Closure (R8x review round 3): a plain enum generated from the one
+        /// list in `sites!`. There is no constructor, no builder and no
+        /// function from a string to a site; [`site!`] is a literal-token
+        /// lookup with one arm per listed label, so an unlisted literal
+        /// (including `unlabelled`, which is not an entry) is a "no rules
+        /// expected" compile error in every profile.
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        pub(crate) enum RefusalSite { $($variant),+ }
+
+        impl RefusalSite {
+            /// Every site, in [`SITES`] order.
+            pub(crate) const ALL: &'static [RefusalSite] = &[$(RefusalSite::$variant),+];
+
+            /// The fixed `site` log value.
+            pub(crate) const fn as_str(self) -> &'static str {
+                match self { $(RefusalSite::$variant => $label),+ }
+            }
+        }
+
+        /// R8x: every place a protected turn can be refused, as the fixed
+        /// `site` log value. Grouped by prefix: `preflight.*`/`authorize.*`
+        /// (coarse gates, no authority consumed), `authorization.*` (taking
+        /// or issuing the one-time run authority), `plan.*` (the
+        /// root-published run plan), `launch.*` (the protected MCP launch
+        /// context), `spawn.*` (asking spawnd to start the run;
+        /// `spawn.backend.*` is spawnd's or the transport's fixed refusal
+        /// class), `run.*` (the run started and then failed) and `output.*`
+        /// (the run exited successfully but its result was unusable). Closed
+        /// set, enforced by the compiler: generated with [`RefusalSite`] and
+        /// [`site!`] from the one `sites!` list. The `unlabelled` log text is
+        /// deliberately not an entry (asserted at compile time below).
+        pub(crate) const SITES: &[&str] = &[$($label),+];
+
+        /// R8x (F3): the only way to name a refusal site:
+        /// `site!("plan.readiness")`. One arm per listed label; any other
+        /// token is a compile error, never a run-time panic or `unlabelled`.
+        macro_rules! site {
+            $( ($label) => { crate::isolation_mcp::refusal::RefusalSite::$variant }; )+
+        }
+        pub(crate) use site;
+
+        // One compile-time assertion per arm: `site!` of the label yields
+        // the variant whose `as_str()` is that label.
+        $( const _: () = assert!(const_str_eq(site!($label).as_str(), $label),
+            "a site! arm does not map to its own label"); )+
+
+        /// Every `site!` arm, evaluated, in [`SITES`] order (for tests).
+        #[cfg(test)]
+        const SITE_ARMS: &[RefusalSite] = &[$(site!($label)),+];
+    };
+}
+
+sites! {
+    // Coarse gates (no authority taken or issued yet).
+    PreflightModel => "preflight.model",
+    PreflightRuntimePolicy => "preflight.runtime_policy",
+    PreflightModelPolicy => "preflight.model_policy",
+    PreflightRedaction => "preflight.redaction",
+    PreflightInterceptor => "preflight.interceptor",
+    PreflightMcpIsolation => "preflight.mcp_isolation",
+    PreflightExploreLane => "preflight.explore_lane",
+    PreflightUtilityCall => "preflight.utility_call",
+    PreflightClaudeOptions => "preflight.claude_options",
+    AuthorizeAgentDirMissing => "authorize.agent_dir_missing",
+    AuthorizeEffort => "authorize.effort",
+    AuthorizeUtilityCall => "authorize.utility_call",
+    AuthorizeWorkDirOverride => "authorize.work_dir_override",
+    AuthorizeAgentDir => "authorize.agent_dir",
+    AuthorizeCapabilitiesPolicy => "authorize.capabilities_policy",
+    AuthorizeNativeGate => "authorize.native_gate",
+    AuthorizeRuntimeKind => "authorize.runtime_kind",
+    AuthorizeExploreLane => "authorize.explore_lane",
+    AuthorizeToolRestrictions => "authorize.tool_restrictions",
+    AuthorizeCodexHome => "authorize.codex_home",
+    AuthorizeProductPolicy => "authorize.product_policy",
+    AuthorizeInterceptor => "authorize.interceptor",
+    AuthorizeRuntimeId => "authorize.runtime_id",
+    AuthorizeMaxTurns => "authorize.max_turns",
+    StepLimitAgentDir => "step_limit.agent_dir",
+    StepLimitUnavailable => "step_limit.unavailable",
+    // The one-time run authority.
+    AuthorizationConsumed => "authorization.consumed",
+    AuthorizationInstalledMismatch => "authorization.installed_mismatch",
+    AuthorizationAgentLabel => "authorization.agent_label",
+    AuthorizationHome => "authorization.home",
+    AuthorizationPrincipalContext => "authorization.principal_context",
+    AuthorizationBackgroundIssue => "authorization.background_issue",
+    AuthorizationIngressIssue => "authorization.ingress_issue",
+    AuthorizationIngressNoScope => "authorization.ingress.no_scope",
+    AuthorizationIngressConsumed => "authorization.ingress.consumed",
+    AuthorizationIngressCaptureNoWebCredential => "authorization.ingress.capture.no_web_credential",
+    AuthorizationIngressCaptureWebIdentity => "authorization.ingress.capture.web_identity",
+    AuthorizationIngressCaptureChannelConflict => "authorization.ingress.capture.channel_conflict",
+    AuthorizationIngressCaptureChannelMapping => "authorization.ingress.capture.channel_mapping",
+    AuthorizationIngressCaptureRequester => "authorization.ingress.capture.requester",
+    AuthorizationIngressCaptureUserDb => "authorization.ingress.capture.user_db",
+    AuthorizationIngressCaptureUserInactive => "authorization.ingress.capture.user_inactive",
+    AuthorizationIngressCaptureEpoch => "authorization.ingress.capture.epoch",
+    AuthorizationIngressCaptureBlocking => "authorization.ingress.capture.blocking",
+    AuthorizationIngressAgentPath => "authorization.ingress.agent_path",
+    AuthorizationIngressHomeMismatch => "authorization.ingress.home_mismatch",
+    AuthorizationIngressNoTurn => "authorization.ingress.no_turn",
+    AuthorizationIngressNoSession => "authorization.ingress.no_session",
+    AuthorizationIngressNoAttendedProof => "authorization.ingress.no_attended_proof",
+    AuthorizationIngressAttendedProofInvalid => "authorization.ingress.attended_proof_invalid",
+    AuthorizationIngressNestedDispatch => "authorization.ingress.nested_dispatch",
+    AuthorizationIngressPrincipalMismatch => "authorization.ingress.principal_mismatch",
+    AuthorizationIngressProofExpired => "authorization.ingress.proof_expired",
+    AuthorizationIngressIdentityRecheck => "authorization.ingress.identity_recheck",
+    AuthorizationIngressBlocking => "authorization.ingress.blocking",
+    AuthorizationIssueBootOwner => "authorization.issue.boot_owner",
+    AuthorizationIssueProductAuthority => "authorization.issue.product_authority",
+    AuthorizationIssueLifecycle => "authorization.issue.lifecycle",
+    AuthorizationIssueSnapshot => "authorization.issue.snapshot",
+    AuthorizationIssueEpoch => "authorization.issue.epoch",
+    AuthorizationIssuePrincipal => "authorization.issue.principal",
+    AuthorizationIssueBinding => "authorization.issue.binding",
+    AuthorizationIssuePolicyRevision => "authorization.issue.policy_revision",
+    AuthorizationIssueTools => "authorization.issue.tools",
+    AuthorizationIssueHuman => "authorization.issue.human",
+    AuthorizationIssueSelectors => "authorization.issue.selectors",
+    AuthorizationIssueCapability => "authorization.issue.capability",
+    AuthorizationIssueUsersRecheck => "authorization.issue.users_recheck",
+    AuthorizationIssuePolicyChanged => "authorization.issue.policy_changed",
+    AuthorizationIssueLifecycleRecheck => "authorization.issue.lifecycle_recheck",
+    AuthorizationIssueSnapshotRecheck => "authorization.issue.snapshot_recheck",
+    AuthorizationIssueFactsRecheck => "authorization.issue.facts_recheck",
+    // The request and the root-published plan.
+    RequestEncode => "request.encode",
+    PlanUnavailable => "plan.unavailable",
+    PlanReadiness => "plan.readiness",
+    PlanBootOwner => "plan.boot_owner",
+    PlanHomeMismatch => "plan.home_mismatch",
+    PlanEmployeeUnconfirmed => "plan.employee_unconfirmed",
+    PlanRootPublication => "plan.root_publication",
+    PlanBlocking => "plan.blocking",
+    // The protected launch context.
+    LaunchReadiness => "launch.readiness",
+    LaunchBootOwner => "launch.boot_owner",
+    LaunchBoundaryUnhealthy => "launch.boundary_unhealthy",
+    LaunchEmployeeUnconfirmed => "launch.employee_unconfirmed",
+    LaunchEmployeeMismatch => "launch.employee_mismatch",
+    LaunchProductPrepare => "launch.product_prepare",
+    LaunchBinding => "launch.binding",
+    LaunchBlocking => "launch.blocking",
+    LaunchResolver => "launch.resolver",
+    LaunchConnectors => "launch.connectors",
+    LaunchWorkerPlans => "launch.worker_plans",
+    LaunchFactories => "launch.factories",
+    LaunchDispatcher => "launch.dispatcher",
+    LaunchProtectedLaunch => "launch.protected_launch",
+    LaunchAuthorityPairing => "launch.authority_pairing",
+    // R8z-2: the launch preparation after spawnd reserved the run
+    // (`launch::LaunchStep`: the gateway's run binding, then the MCP-boundary
+    // launch). Recorded before the outer `spawn.backend.*` mapping.
+    LaunchBindPreparedMissing => "launch.bind.prepared_missing",
+    LaunchBindStateLock => "launch.bind.state_lock",
+    LaunchBindRevokedBefore => "launch.bind.revoked_before",
+    LaunchBindRecheckBackground => "launch.bind.recheck.background",
+    LaunchBindRecheckExpired => "launch.bind.recheck.expired",
+    LaunchBindRecheckAgent => "launch.bind.recheck.agent",
+    LaunchBindRecheckIdentity => "launch.bind.recheck.identity",
+    LaunchBindRecheckPolicyRevision => "launch.bind.recheck.policy_revision",
+    LaunchBindRecheckRevisionChanged => "launch.bind.recheck.revision_changed",
+    LaunchBindRecheckEpoch => "launch.bind.recheck.epoch",
+    LaunchBindLiveSnapshot => "launch.bind.live_snapshot",
+    LaunchBindBindingMismatch => "launch.bind.binding_mismatch",
+    LaunchBindEpochAfterSnapshot => "launch.bind.epoch_after_snapshot",
+    LaunchBindAssociations => "launch.bind.associations",
+    LaunchBindRevokedAfter => "launch.bind.revoked_after",
+    LaunchBindVerifyBlocking => "launch.bind.verify_blocking",
+    LaunchBindInnerPrepareUnavailable => "launch.bind.inner_prepare.unavailable",
+    LaunchBindInnerPrepareDenied => "launch.bind.inner_prepare.denied",
+    LaunchBindInnerPrepareWouldDeadlock => "launch.bind.inner_prepare.would_deadlock",
+    LaunchBindInnerPrepareNotFound => "launch.bind.inner_prepare.not_found",
+    LaunchBindInnerPrepareTimeout => "launch.bind.inner_prepare.timeout",
+    LaunchBindInnerPrepareIo => "launch.bind.inner_prepare.io",
+    LaunchBindInnerPrepareProtocol => "launch.bind.inner_prepare.protocol",
+    // Asking spawnd to start the run.
+    SpawnPrepare => "spawn.prepare",
+    SpawnNotProtected => "spawn.not_protected",
+    SpawnAdmission => "spawn.admission",
+    SpawnBackendUnavailable => "spawn.backend.unavailable",
+    SpawnBackendDenied => "spawn.backend.denied",
+    SpawnBackendWouldDeadlock => "spawn.backend.would_deadlock",
+    SpawnBackendNotFound => "spawn.backend.not_found",
+    SpawnBackendTimeout => "spawn.backend.timeout",
+    SpawnBackendIo => "spawn.backend.io",
+    SpawnBackendProtocol => "spawn.backend.protocol",
+    SpawnStartPermissionDenied => "spawn.start.permission_denied",
+    SpawnStartNotFound => "spawn.start.not_found",
+    SpawnStartTimedOut => "spawn.start.timed_out",
+    SpawnStartOther => "spawn.start.other",
+    // The run started.
+    RunStdinMissing => "run.stdin_missing",
+    RunStdoutMissing => "run.stdout_missing",
+    RunStderrMissing => "run.stderr_missing",
+    RunInput => "run.input",
+    RunOutputDrain => "run.output_drain",
+    RunStderrDrain => "run.stderr_drain",
+    RunWait => "run.wait",
+    RunRefused => "run.refused",
+    // The run exited successfully; its result was refused.
+    OutputParse => "output.parse",
+    OutputEmpty => "output.empty",
+    OutputUtf8 => "output.utf8",
+}
+
+// Compile-time invariant (every build): `unlabelled` is log text, never a
+// listed site, so no `RefusalSite` can carry it.
+const _: () = {
+    let mut index = 0;
+    while index < SITES.len() {
+        assert!(!const_str_eq(SITES[index], UNLABELLED_SITE), "`unlabelled` must not be a refusal site");
+        index += 1;
+    }
+};
+
+// Compile-time invariants (every build) of the generated list: labels are
+// non-empty, lowercase `[a-z0-9_.]`, pairwise distinct, and `ALL[i]` is the
+// variant whose `as_str()` is `SITES[i]`.
+const _: () = {
+    assert!(RefusalSite::ALL.len() == SITES.len(), "ALL and SITES differ in length");
+    let mut index = 0;
+    while index < SITES.len() {
+        let bytes = SITES[index].as_bytes();
+        assert!(!bytes.is_empty(), "empty refusal site label");
+        let mut at = 0;
+        while at < bytes.len() {
+            let byte = bytes[at];
+            assert!(byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'.' || byte == b'_',
+                "a refusal site label is not lowercase [a-z0-9_.]");
+            at += 1;
+        }
+        assert!(const_str_eq(RefusalSite::ALL[index].as_str(), SITES[index]), "ALL and SITES out of order");
+        let mut other = index + 1;
+        while other < SITES.len() {
+            assert!(!const_str_eq(SITES[index], SITES[other]), "duplicate refusal site label");
+            other += 1;
+        }
+        index += 1;
+    }
+};
+
+const fn const_str_eq(left: &str, right: &str) -> bool {
+    let (left, right) = (left.as_bytes(), right.as_bytes());
+    if left.len() != right.len() { return false; }
+    let mut index = 0;
+    while index < left.len() {
+        if left[index] != right[index] { return false; }
+        index += 1;
+    }
+    true
+}
+
+/// R8x (F3): a protected helper's refusal — its error together with the site
+/// that refused. There is deliberately no `From` conversion from a bare error:
+/// a new `?`/`Err(..)` exit in a helper returning `Sited` does not compile
+/// without a [`RefusalSite`]. Building one records the site for the current
+/// protected turn (first recorded wins; no-op outside a turn).
+/// (The protected callers map every refusal to their fixed sentence, so the
+/// fields are read only through `Debug` and by tests.)
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct Sited<E> { site: RefusalSite, error: E }
+
+impl<E> Sited<E> {
+    pub(crate) fn new(site: RefusalSite, error: E) -> Self {
+        #[cfg(target_os = "linux")]
+        super::runtime::note_site(site);
+        Self { site, error }
+    }
+    #[cfg(test)]
+    pub(crate) fn site(&self) -> RefusalSite { self.site }
+}
+
+/// The `agent` log value: the employee label when it is a valid agent id,
+/// otherwise a fixed placeholder (never arbitrary caller text).
+pub(crate) fn agent_label(agent: &str) -> &str {
+    if duduclaw_core::is_valid_agent_id(agent) { agent } else { "invalid" }
+}
+
+// Log volume (R8x review note): this module's three warnings (`log_refused`
+// above, the two below) are, together, written at most once per protected
+// turn, so their rate is the rate of protected turns the gateway accepted;
+// there is deliberately no limiter here. Turns that
+// reach a start pass spawn admission (`crate::autonomous_runtime::admit_current`,
+// src/autonomous_runtime.rs:302 — the autonomy pause gate, not a rate limit);
+// refusals before it are bounded only by the per-ingress admission of turns
+// (channel/WebChat/API/scheduler), which is not centralised in one place.
+
+/// R8x: the single warning for a refused protected turn that never reached a
+/// started run. Fixed fields only: runtime label, employee label, site label
+/// (`unlabelled` when no site was recorded).
+pub(crate) fn log_not_started(runtime: &'static str, agent: &str, site: Option<RefusalSite>) {
+    let agent = agent_label(agent);
+    tracing::warn!(runtime, agent, site = site_text(site), "isolated run not started");
+}
+
+/// R8x: the single warning for a run that started but was refused without the
+/// R8t line (its pipes were missing, or it exited 0 with unusable output).
+/// `site` as in [`log_not_started`].
+pub(crate) fn log_refused_after_start(runtime: &'static str, agent: &str, site: Option<RefusalSite>) {
+    let agent = agent_label(agent);
+    tracing::warn!(runtime, agent, site = site_text(site), "isolated run refused after start");
 }
 
 #[cfg(test)]
@@ -332,6 +669,128 @@ mod tests {
         assert_eq!(RunExit::Timeout.to_string(), "timeout");
         assert_eq!(RunExit::Signal.to_string(), "signal");
         assert_eq!(RunExit::Incomplete.to_string(), "incomplete");
+    }
+
+    /// R8x: the two new lines carry fixed fields only; an agent label that is
+    /// not a valid agent id is replaced, never logged.
+    #[test]
+    fn the_not_started_lines_have_fixed_fields_only() {
+        for (agent, shown) in [("alice", "alice"), ("../x y", "invalid")] {
+            for after_start in [false, true] {
+                let log = LogCapture(Default::default());
+                let writer = log.clone();
+                let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
+                    .with_max_level(tracing::Level::WARN).with_writer(move || writer.clone()).finish();
+                tracing::subscriber::with_default(subscriber, || if after_start {
+                    log_refused_after_start("openai_compat", agent, Some(site!("output.empty")))
+                } else {
+                    log_not_started("openai_compat", agent, Some(site!("plan.root_publication")))
+                });
+                let logs = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+                assert_eq!(logs.lines().count(), 1, "{logs}");
+                let (message, site) = if after_start { ("isolated run refused after start", "output.empty") }
+                    else { ("isolated run not started", "plan.root_publication") };
+                assert!(logs.contains(message) && logs.contains(&format!("site=\"{site}\"")), "{logs}");
+                assert!(logs.contains("runtime=\"openai_compat\"") && logs.contains(&format!("agent=\"{shown}\"")), "{logs}");
+                assert!(!logs.contains("../x"), "{logs}");
+                assert!(SITES.contains(&site));
+            }
+        }
+    }
+
+    /// R8x F2: the R8t line applies the same agent label rule as the R8x
+    /// lines: an id that is not a valid agent id is logged as `invalid`.
+    #[test]
+    fn the_refused_line_never_logs_an_invalid_agent_label() {
+        const AGENT: &str = "R8X-F2 agent\nforged=\"line\"";
+        let log = LogCapture(Default::default());
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
+            .with_max_level(tracing::Level::WARN).with_writer(move || writer.clone()).finish();
+        tracing::subscriber::with_default(subscriber, ||
+            log_refused("registered", AGENT, None, RunExit::Code(1), 0));
+        let logs = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(logs.lines().count(), 1, "{logs}");
+        assert!(logs.contains("isolated run refused") && logs.contains("agent=\"invalid\""), "{logs}");
+        for part in ["R8X-F2", "forged", "agent\\n", "\nforged"] {
+            assert!(!logs.contains(part), "{part}: {logs}");
+        }
+        assert_eq!(agent_label(AGENT), "invalid");
+        assert_eq!(agent_label("alice"), "alice");
+    }
+
+    /// R8x: with no recorded site both lines print the fixed `unlabelled`
+    /// text — the logger's own fallback, not a site value.
+    #[test]
+    fn a_turn_without_a_site_logs_unlabelled() {
+        for after_start in [false, true] {
+            let log = LogCapture(Default::default());
+            let writer = log.clone();
+            let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
+                .with_max_level(tracing::Level::WARN).with_writer(move || writer.clone()).finish();
+            tracing::subscriber::with_default(subscriber, || if after_start {
+                log_refused_after_start("openai_compat", "alice", None)
+            } else {
+                log_not_started("openai_compat", "alice", None)
+            });
+            let logs = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+            assert_eq!(logs.lines().count(), 1, "{logs}");
+            assert!(logs.contains("site=\"unlabelled\""), "{logs}");
+        }
+        assert_eq!(site_text(None), "unlabelled");
+        assert!(!SITES.contains(&"unlabelled"));
+    }
+
+    /// R8x review round 3: every `site!` arm, generated from the same
+    /// `sites!` list as the enum, yields the variant whose `as_str()` is its
+    /// own label (also a per-arm `const` assertion, i.e. a build error), and
+    /// the arms, `ALL` and `SITES` line up one to one.
+    #[test]
+    fn every_listed_site_round_trips_at_compile_time() {
+        assert_eq!(SITE_ARMS.len(), SITES.len());
+        assert_eq!(SITE_ARMS, RefusalSite::ALL);
+        for (site, label) in SITE_ARMS.iter().zip(SITES) {
+            assert_eq!(site.as_str(), *label);
+        }
+        // And for a sample of literals, through the macro in a `const`.
+        const FROM_MACRO: [RefusalSite; 3] = [site!("preflight.model"), site!("spawn.admission"), site!("output.utf8")];
+        assert_eq!(FROM_MACRO, [RefusalSite::PreflightModel, RefusalSite::SpawnAdmission, RefusalSite::OutputUtf8]);
+        assert_eq!(FROM_MACRO.map(RefusalSite::as_str), ["preflight.model", "spawn.admission", "output.utf8"]);
+    }
+
+    /// R8x review round 3: each variant's label is unique, non-empty and
+    /// lowercase `[a-z0-9_.]`; `ALL` and `SITES` have the same length and
+    /// order. (Also asserted at compile time in the module.)
+    #[test]
+    fn every_site_label_is_unique_and_well_formed() {
+        assert_eq!(RefusalSite::ALL.len(), SITES.len());
+        let mut seen = std::collections::BTreeSet::new();
+        for (site, label) in RefusalSite::ALL.iter().zip(SITES) {
+            let text = site.as_str();
+            assert_eq!(text, *label, "{site:?}");
+            assert!(!text.is_empty(), "{site:?}");
+            assert!(text.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'_'),
+                "{text}");
+            assert!(seen.insert(text), "duplicate label {text}");
+        }
+        for (index, site) in RefusalSite::ALL.iter().enumerate() {
+            assert!(!RefusalSite::ALL[index + 1..].contains(site), "{site:?} is listed twice in ALL");
+        }
+    }
+
+    /// R8x F3: the site type is closed. It is a plain enum with no string
+    /// constructor; `site!` with an unlisted label (or `unlabelled`) has no
+    /// matching arm, a compile error with no run-time counterpart. Here: no
+    /// site carries `unlabelled` or a near-miss of a listed label.
+    #[test]
+    fn refusal_sites_are_a_closed_type() {
+        for label in ["plan.not_a_site", "", UNLABELLED_SITE, "plan.readiness ", "Plan.readiness"] {
+            assert!(RefusalSite::ALL.iter().all(|site| site.as_str() != label), "{label:?}");
+            assert!(!SITES.contains(&label), "{label:?}");
+        }
+        assert_eq!(site!("spawn.admission"), RefusalSite::SpawnAdmission);
+        assert_eq!(site!("spawn.admission").as_str(), "spawn.admission");
+        assert_eq!(Sited::new(site!("launch.binding"), ()).site(), site!("launch.binding"));
     }
 
     #[test]

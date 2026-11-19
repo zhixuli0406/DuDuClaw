@@ -3,6 +3,7 @@ use std::{future::Future, path::{Path, PathBuf}, sync::Mutex};
 use duduclaw_auth::jwt::Claims;
 use duduclaw_knowledge::requester::RequesterIdentity;
 use super::{RuntimeAuthorization, VerificationError};
+use super::refusal::{site, RefusalSite, Sited};
 
 #[derive(Clone)]
 enum Source {
@@ -15,9 +16,19 @@ struct HumanIngress {
     epoch: u64,
     source: Source,
 }
+/// R8x: a failed capture keeps its fixed reason label (read once, by the
+/// run that would have consumed the identity); it never becomes authority.
+type Captured = Result<HumanIngress, RefusalSite>;
 tokio::task_local! {
     static WEB_CREDENTIAL: Option<Claims>;
-    static INGRESS: Mutex<Option<HumanIngress>>;
+    static INGRESS: Mutex<Option<Captured>>;
+}
+
+/// R8x: a refusal with its site (recorded for the current protected turn).
+/// F3: [`authorize_current`] returns [`Sited`], so an exit without a site
+/// does not compile.
+fn noted(site: RefusalSite, error: VerificationError) -> Sited<VerificationError> {
+    Sited::new(site, error)
 }
 
 /// Called only after the WebChat socket and this queued turn revalidate Claims.
@@ -35,55 +46,74 @@ pub(crate) async fn reply_scope<F: Future>(home: &Path, requester: &RequesterIde
     if !duduclaw_core::execution_gate::isolation_required() { return future.await; }
     let web = WEB_CREDENTIAL.try_with(Clone::clone).ok().flatten();
     let (home, requester) = (home.to_owned(), requester.clone());
-    let captured = duduclaw_mcp_boundary::authority::verify_blocking(move || {
-        let (user, source, expected_epoch) = match requester {
-            RequesterIdentity::DashboardUser { user_id } => {
-                let claims = web.ok_or(VerificationError::Invalid)?;
-                check_web_identity(&claims, &user_id, duduclaw_mcp_boundary::authority::now_seconds()?)?;
-                let epoch = claims.credential_epoch;
-                (user_id, Source::Web(claims), Some(epoch))
-            }
-            RequesterIdentity::ChannelUser { channel, sender, user_id: Some(user), .. } => {
-                if web.is_some() { return Err(VerificationError::Revoked); }
-                check_channel_mapping(&user, crate::trigger_route::access::verified_user_for_channel_sender(
-                    &home, &channel, &sender).as_deref())?;
-                (user, Source::Channel { channel, sender }, None)
-            }
-            _ => return Err(VerificationError::Invalid),
-        };
-        let db = crate::decision_notify::open_user_db(&home)
-            .map_err(|_| VerificationError::Unavailable)?.ok_or(VerificationError::Unavailable)?;
-        let context = db.live_user_context(&user).map_err(|_| VerificationError::Unavailable)?
-            .ok_or(VerificationError::Revoked)?;
-        if let Some(epoch) = expected_epoch { require_epoch(epoch, Some(context.credential_epoch))?; }
-        Ok(HumanIngress { home, user, epoch: context.credential_epoch, source })
-    }).await.ok();
+    let captured = match duduclaw_mcp_boundary::authority::verify_blocking(move ||
+        Ok(capture_human(home, requester, web))).await {
+        Ok(captured) => captured,
+        Err(_) => Err(site!("authorization.ingress.capture.blocking")),
+    };
     // A failed capture is a consumed/absent identity, never background authority.
-    INGRESS.scope(Mutex::new(captured), future).await
+    INGRESS.scope(Mutex::new(Some(captured)), future).await
+}
+
+/// The identity checks of [`reply_scope`]; a refusal is a fixed label only.
+fn capture_human(home: PathBuf, requester: RequesterIdentity, web: Option<Claims>) -> Captured {
+    let (user, source, expected_epoch) = match requester {
+        RequesterIdentity::DashboardUser { user_id } => {
+            let claims = web.ok_or(site!("authorization.ingress.capture.no_web_credential"))?;
+            let now = duduclaw_mcp_boundary::authority::now_seconds()
+                .map_err(|_| site!("authorization.ingress.capture.web_identity"))?;
+            check_web_identity(&claims, &user_id, now).map_err(|_| site!("authorization.ingress.capture.web_identity"))?;
+            let epoch = claims.credential_epoch;
+            (user_id, Source::Web(claims), Some(epoch))
+        }
+        RequesterIdentity::ChannelUser { channel, sender, user_id: Some(user), .. } => {
+            if web.is_some() { return Err(site!("authorization.ingress.capture.channel_conflict")); }
+            check_channel_mapping(&user, crate::trigger_route::access::verified_user_for_channel_sender(
+                &home, &channel, &sender).as_deref())
+                .map_err(|_| site!("authorization.ingress.capture.channel_mapping"))?;
+            (user, Source::Channel { channel, sender }, None)
+        }
+        _ => return Err(site!("authorization.ingress.capture.requester")),
+    };
+    let db = crate::decision_notify::open_user_db(&home).ok().flatten()
+        .ok_or(site!("authorization.ingress.capture.user_db"))?;
+    let context = db.live_user_context(&user).map_err(|_| site!("authorization.ingress.capture.user_db"))?
+        .ok_or(site!("authorization.ingress.capture.user_inactive"))?;
+    if let Some(epoch) = expected_epoch {
+        require_epoch(epoch, Some(context.credential_epoch)).map_err(|_| site!("authorization.ingress.capture.epoch"))?;
+    }
+    Ok(HumanIngress { home, user, epoch: context.credential_epoch, source })
 }
 
 pub(super) async fn authorize_current(agent_dir: &Path, principal_context: Option<String>)
-    -> Result<RuntimeAuthorization, VerificationError> {
+    -> Result<RuntimeAuthorization, Sited<VerificationError>> {
+    // R8x: each refusal carries its fixed `authorization.ingress.*` site.
     let human = take_human()?;
-    let agent = agent_dir.file_name().and_then(|name| name.to_str()).ok_or(VerificationError::Invalid)?.to_owned();
-    if agent_dir != human.home.join("agents").join(&agent) { return Err(VerificationError::BindingMismatch); }
+    let agent = agent_dir.file_name().and_then(|name| name.to_str())
+        .ok_or_else(|| noted(site!("authorization.ingress.agent_path"), VerificationError::Invalid))?.to_owned();
+    if agent_dir != human.home.join("agents").join(&agent) {
+        return Err(noted(site!("authorization.ingress.home_mismatch"), VerificationError::BindingMismatch));
+    }
     let turn = duduclaw_memory::feedback::CURRENT_TURN_ID.try_with(Clone::clone).ok().flatten()
-        .ok_or(VerificationError::Unavailable)?;
+        .ok_or_else(|| noted(site!("authorization.ingress.no_turn"), VerificationError::Unavailable))?;
     let session = duduclaw_memory::feedback::CURRENT_SESSION_ID.try_with(Clone::clone).ok().flatten()
-        .ok_or(VerificationError::Unavailable)?;
+        .ok_or_else(|| noted(site!("authorization.ingress.no_session"), VerificationError::Unavailable))?;
     let proof = crate::computer_use_sessions::attended::capture(&agent, &turn)
-        .ok_or(VerificationError::Unavailable)?;
-    if !proof.valid_for(&agent, &turn) { return Err(VerificationError::Revoked); }
+        .ok_or_else(|| noted(site!("authorization.ingress.no_attended_proof"), VerificationError::Unavailable))?;
+    if !proof.valid_for(&agent, &turn) {
+        return Err(noted(site!("authorization.ingress.attended_proof_invalid"), VerificationError::Revoked));
+    }
     // A fresh human message must not launder a nested/background dispatch.
     if crate::claude_runner::DELEGATION_ENV.try_with(|_| ()).is_ok()
         || crate::memory_provenance::DISPATCH_RUN.try_with(Clone::clone).ok().flatten().is_some()
         || crate::runtime::round_task_env().is_some() {
-        return Err(VerificationError::BindingMismatch);
+        return Err(noted(site!("authorization.ingress.nested_dispatch"), VerificationError::BindingMismatch));
     }
     let expected = duduclaw_core::HumanPrincipal::user(&human.user)
-        .ok_or(VerificationError::Invalid)?.to_string();
+        .ok_or_else(|| noted(site!("authorization.ingress.principal_mismatch"), VerificationError::Invalid))?
+        .to_string();
     if crate::on_behalf_of::current().as_deref() != Some(expected.as_str()) {
-        return Err(VerificationError::BindingMismatch);
+        return Err(noted(site!("authorization.ingress.principal_mismatch"), VerificationError::BindingMismatch));
     }
     let metadata = crate::isolation_egress::RunMetadata {
         reply_channel: crate::claude_runner::REPLY_CHANNEL.try_with(Clone::clone).ok(),
@@ -99,24 +129,39 @@ pub(super) async fn authorize_current(agent_dir: &Path, principal_context: Optio
     let lane = if crate::explore_lane::in_explore() { duduclaw_isolation::capability::Lane::Explore }
         else { duduclaw_isolation::capability::Lane::Standard };
     let egress_turn = crate::runtime_turn::current();
-    duduclaw_mcp_boundary::authority::verify_blocking(move || {
-        if !proof.valid_for(&agent, &turn) { return Err(VerificationError::Revoked); }
+    super::boot::labelled_blocking(site!("authorization.ingress.blocking"), move || {
+        const RECHECK: RefusalSite = site!("authorization.ingress.identity_recheck");
+        if !proof.valid_for(&agent, &turn) {
+            return Err((site!("authorization.ingress.proof_expired"), VerificationError::Revoked));
+        }
         match &human.source {
-            Source::Web(claims) => check_web_identity(claims, &human.user, duduclaw_mcp_boundary::authority::now_seconds()?)?,
+            Source::Web(claims) => check_web_identity(claims, &human.user,
+                duduclaw_mcp_boundary::authority::now_seconds().map_err(|error| (RECHECK, error))?)
+                .map_err(|error| (RECHECK, error))?,
             Source::Channel { channel, sender } => check_channel_mapping(&human.user,
-                crate::trigger_route::access::verified_user_for_channel_sender(&human.home, channel, sender).as_deref())?,
+                crate::trigger_route::access::verified_user_for_channel_sender(&human.home, channel, sender).as_deref())
+                .map_err(|error| (RECHECK, error))?,
         }
         let expiry = match &human.source { Source::Web(claims) => Some(claims.exp), _ => None };
         super::boot::record_authorization(human.home, agent, human.user, human.epoch, lane,
             super::HostTurn { identity: crate::isolation_egress::RunTurnIdentity {
                 turn, approval_session: Some(session) }, metadata: Some(metadata), principal_context,
                 egress_turn, background: None }, expiry, None)
+            // Read on this blocking thread, right after the step that failed.
+            .map_err(|error| (super::boot::issue_step_reached(), error))
     }).await
 }
 
-fn take_human() -> Result<HumanIngress, VerificationError> {
-    INGRESS.try_with(|slot| slot.lock().ok().and_then(|mut slot| slot.take()))
-        .ok().flatten().ok_or(VerificationError::Unavailable)
+/// The one-use identity. R8x: a refusal records why it is absent (no ingress
+/// scope, already consumed, or the capture's own fixed reason).
+fn take_human() -> Result<HumanIngress, Sited<VerificationError>> {
+    let site = match INGRESS.try_with(|slot| slot.lock().ok().and_then(|mut slot| slot.take())) {
+        Ok(Some(Ok(human))) => return Ok(human),
+        Ok(Some(Err(site))) => site,
+        Ok(None) => site!("authorization.ingress.consumed"),
+        Err(_) => site!("authorization.ingress.no_scope"),
+    };
+    Err(noted(site, VerificationError::Unavailable))
 }
 
 fn check_web_identity(claims: &Claims, user: &str, now: u64) -> Result<(), VerificationError> {
@@ -216,7 +261,7 @@ mod tests {
     #[tokio::test]
     async fn ingress_is_one_use_and_never_implicitly_crosses_spawn() {
         assert!(take_human().is_err());
-        INGRESS.scope(Mutex::new(Some(human())), async {
+        INGRESS.scope(Mutex::new(Some(Ok(human()))), async {
             assert!(tokio::spawn(async { take_human().is_err() }).await.unwrap());
             let captured = take_human().unwrap();
             assert_eq!(captured.user, "original-user");
@@ -227,10 +272,38 @@ mod tests {
     }
     #[tokio::test]
     async fn ingress_wrong_home_consumes_proof_without_retargeting() {
-        INGRESS.scope(Mutex::new(Some(human())), async {
+        INGRESS.scope(Mutex::new(Some(Ok(human()))), async {
             assert!(authorize_current(Path::new("/other/agents/alice"), None).await.is_err());
             assert!(take_human().is_err());
         }).await;
+    }
+    /// R8x: an absent identity names why, inside the turn's carrier: no
+    /// ingress scope, already consumed, or the capture's own fixed reason.
+    #[tokio::test]
+    async fn absent_identity_records_a_fixed_site() {
+        let cases: [(Option<Option<Captured>>, &str); 3] = [
+            (None, "authorization.ingress.no_scope"),
+            (Some(None), "authorization.ingress.consumed"),
+            (Some(Some(Err(site!("authorization.ingress.capture.web_identity")))),
+                "authorization.ingress.capture.web_identity"),
+        ];
+        for (slot, expected) in cases {
+            let probe = async { super::super::runtime::tests::site_of(async {
+                assert!(take_human().is_err());
+            }).await };
+            let site = match slot {
+                None => probe.await,
+                Some(slot) => INGRESS.scope(Mutex::new(slot), probe).await,
+            };
+            assert_eq!(site, Some(expected));
+            assert!(super::super::refusal::SITES.contains(&expected));
+        }
+        // The capture refuses with fixed labels only.
+        let captured = capture_human("/trusted".into(), RequesterIdentity::Unknown, None);
+        assert_eq!(captured.err().map(RefusalSite::as_str), Some("authorization.ingress.capture.requester"));
+        let captured = capture_human("/trusted".into(),
+            RequesterIdentity::DashboardUser { user_id: "original-user".into() }, None);
+        assert_eq!(captured.err().map(RefusalSite::as_str), Some("authorization.ingress.capture.no_web_credential"));
     }
     #[tokio::test]
     async fn ingress_unknown_or_consumed_scope_cannot_be_replaced() {

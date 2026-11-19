@@ -14,6 +14,7 @@ use crate::isolation_connector_stack::EmployeeConnectorProviders;
 use crate::isolation_lifecycle::{self as lifecycle, EmployeeLifecycle, RootAllocation, RootAllocator};
 use super::authority::{lifecycle_refusal, personal_facts};
 use super::selectors::{self, SelectorInput, SelectorSources};
+use super::refusal::{site, RefusalSite, Sited};
 
 /// CLI supplies its adapter before start_gateway. The gateway owns every input;
 /// the adapter must authenticate its original dispatcher and check completeness.
@@ -676,6 +677,13 @@ impl crate::isolation_readiness::IntegrationProbe for BoundaryReadiness {
     }
 }
 
+/// `step!(<label literal>)`: [`issue_step`] with a compile-time checked site.
+/// (`tt`, not `literal`: a forwarded `literal` fragment is opaque and could
+/// not match `site!`'s per-label literal arms.)
+macro_rules! step {
+    ($label:tt) => { issue_step(site!($label)) };
+}
+
 /// Authenticated ingress and approved background records share this issuer.
 /// The wrapper owns live store reads. Additional IO grants come only from the
 /// H9 selectors (`selectors.rs`), which read their inputs at issuance from the
@@ -684,31 +692,59 @@ impl crate::isolation_readiness::IntegrationProbe for BoundaryReadiness {
 pub(crate) fn record_authorization(home: PathBuf, agent: String, user: String, epoch: u64,
     lane: duduclaw_isolation::capability::Lane, turn: super::HostTurn, credential_expiry: Option<u64>,
     task: Option<String>) -> Result<super::RuntimeAuthorization, VerificationError> {
+    // R8x: each step names itself (fixed label) on this blocking thread; an
+    // ingress caller reads the last one reached when issuing fails.
+    step!("authorization.issue.boot_owner");
     let owner = OWNER.get().ok_or(VerificationError::Unavailable)?;
     if owner.home != home || !owner.boundary.healthy() { return Err(VerificationError::Unavailable); }
+    step!("authorization.issue.product_authority");
     let authority = owner.product_authority.as_ref().ok_or(VerificationError::Unavailable)?;
+    step!("authorization.issue.lifecycle");
     let lifecycle = lifecycle::read_lifecycle(&home, &agent).map_err(lifecycle_refusal)?;
+    step!("authorization.issue.snapshot");
     let current = authority.ingress_snapshot(&user, &agent)?;
+    step!("authorization.issue.epoch");
     super::ingress::require_epoch(epoch, current.human.as_ref().map(|human| human.credential_epoch))?;
+    step!("authorization.issue.principal");
     let principal = issuance_principal(&user, &current)?;
+    step!("authorization.issue.binding");
     issuance_facts(&agent, &lifecycle, &principal, &current, turn.background.as_ref())?;
+    step!("authorization.issue.policy_revision");
     let policy = crate::approval::strict_policy_revision(&home, &agent)
         .map_err(|_| VerificationError::Unavailable)?;
+    step!("authorization.issue.tools");
     let tools = DISPATCHER.get().ok_or(VerificationError::Unavailable)?.ingress_tools(&home, &agent, lane)?;
     // Keep the lifecycle pinned before the policy/catalog I/O; never repin to
     // a replacement employee in the constructor.
     let authorization = human_authorization_with(home.clone(), agent.clone(), lifecycle.employee,
         user.clone(), epoch, lane, &current, tools, turn, credential_expiry, &lifecycle, &RootAllocator,
         &owner.selectors, task.as_deref())?;
+    step!("authorization.issue.policy_changed");
     if crate::approval::strict_policy_revision(&home, &agent).ok().as_deref() != Some(policy.as_str()) {
         return Err(VerificationError::Revoked);
     }
+    step!("authorization.issue.lifecycle_recheck");
     lifecycle::recheck_with(&home, &lifecycle, &RootAllocator).map_err(lifecycle_refusal)?;
+    step!("authorization.issue.snapshot_recheck");
     let after = authority.ingress_snapshot(&user, &agent)?;
+    step!("authorization.issue.facts_recheck");
     recheck_issuance_facts(&agent, &lifecycle, &principal, epoch, &current, &after,
         authorization.turn.as_ref().and_then(|turn| turn.background.as_ref()))?;
     Ok(authorization)
 }
+
+/// R8x: the first issuing step (also the value before any step was reached).
+const FIRST_ISSUE_STEP: RefusalSite = site!("authorization.issue.boot_owner");
+thread_local! {
+    /// R8x: the issuing step [`record_authorization`] last reached on this
+    /// thread (it runs synchronously on one blocking thread). Every exit of
+    /// the issuer is attributed to the step it was reached in, so a new exit
+    /// there is labelled by construction.
+    static ISSUE_STEP: std::cell::Cell<RefusalSite> = const { std::cell::Cell::new(FIRST_ISSUE_STEP) };
+}
+fn issue_step(step: RefusalSite) { ISSUE_STEP.with(|current| current.set(step)); }
+/// R8x: read on the same blocking thread right after issuing failed.
+pub(super) fn issue_step_reached() -> RefusalSite { ISSUE_STEP.with(|current| current.get()) }
 
 fn issuance_principal(user: &str, current: &duduclaw_auth::IsolationAuthoritySnapshot)
     -> Result<duduclaw_isolation::capability::Principal, VerificationError> {
@@ -778,6 +814,7 @@ fn human_authorization_with(home: PathBuf, agent: String, employee: EmployeeId,
     sources: &SelectorSources, task: Option<&str>)
     -> Result<super::RuntimeAuthorization, VerificationError> {
     use duduclaw_isolation::{bounded::{List, Text}, capability::ResourceGrant};
+    step!("authorization.issue.human");
     if lifecycle.employee != employee || lifecycle.label != agent { return Err(VerificationError::Revoked); }
     if current.human.as_ref().is_none_or(|human| human.user_id != user
         || human.credential_epoch != epoch || human.must_change_password
@@ -794,7 +831,9 @@ fn human_authorization_with(home: PathBuf, agent: String, employee: EmployeeId,
     let select = || selectors::select(sources, &SelectorInput { home: &home, agent: &agent, user: &user,
         tools: &tools, task, record })
         .map_err(|error| lifecycle::recheck_with(&home, lifecycle, root).err().map_or(error, lifecycle_refusal));
+    step!("authorization.issue.selectors");
     let selection = select()?;
+    step!("authorization.issue.capability");
     let signed_tools = selection.signed_tools(&tools)?; // Workspace signs File (+ HX5 helpers), never pending A/E
     // H13c: a background run of a Personal employee never lists spawn tools.
     let signed_tools = crate::isolation_background::same_owner::record_run_tools(&lifecycle.binding, record, signed_tools)?;
@@ -833,6 +872,8 @@ fn human_authorization_with(home: PathBuf, agent: String, employee: EmployeeId,
     lifecycle::recheck_with(&home, lifecycle, root).map_err(lifecycle_refusal)?;
     // SR2 finding 7: the hardened private-SQLite opener, as on every
     // lifecycle path (no-follow walk, owner/mode/link/inode checks).
+    // R8x: this read waits up to 5 s on a locked users.db (busy timeout).
+    step!("authorization.issue.users_recheck");
     let mut users = crate::fs_safe::sqlite::open_existing(&home, "users.db", crate::fs_safe::sqlite::Access::ReadOnly)
         .map_err(|_| VerificationError::Unavailable)?;
     users.busy_timeout(std::time::Duration::from_secs(5)).map_err(|_| VerificationError::Unavailable)?;
@@ -921,45 +962,74 @@ fn assemble(home: &Path, backend: Arc<duduclaw_execution::SpawndBackend>, mut so
     Ok(owner)
 }
 
+/// R8x: a refusal of a protected helper with its site (recorded for the
+/// current protected turn; no-op outside one). F3: the helpers on the
+/// protected path return [`Sited`], so an exit without a site does not compile.
+fn sited(site: RefusalSite, error: VerificationError) -> Sited<VerificationError> {
+    Sited::new(site, error)
+}
+
+/// R8x: [`duduclaw_mcp_boundary::authority::verify_blocking`] whose work names
+/// its failing step. A blocking thread cannot reach the turn's task-local
+/// carrier, so the label travels back with the error and is recorded on the
+/// calling task; `blocking` names a failure of the blocking call itself (its
+/// slot wait or deadline). Same values and errors as `verify_blocking`.
+pub(super) async fn labelled_blocking<T, F>(blocking: RefusalSite, work: F) -> Result<T, Sited<VerificationError>>
+where T: Send + 'static, F: FnOnce() -> Result<T, (RefusalSite, VerificationError)> + Send + 'static {
+    match duduclaw_mcp_boundary::authority::verify_blocking(move || Ok(work())).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err((site, error))) => Err(sited(site, error)),
+        Err(error) => Err(sited(blocking, error)),
+    }
+}
+
 pub(super) async fn claude_plan(home: PathBuf, agent: String, class: duduclaw_isolation::execution::ExecutionClass,
-    prompt: Vec<u8>, system_prompt: Vec<u8>, model: String, max_turns: u16) -> Result<SpawnPolicy, VerificationError> {
-    crate::isolation_readiness::check_execution().map_err(|_| VerificationError::Unavailable)?;
-    let owner = OWNER.get().cloned().ok_or(VerificationError::Unavailable)?;
-    if owner.home != home { return Err(VerificationError::BindingMismatch); }
-    duduclaw_mcp_boundary::authority::verify_blocking(move || {
+    prompt: Vec<u8>, system_prompt: Vec<u8>, model: String, max_turns: u16)
+    -> Result<SpawnPolicy, Sited<VerificationError>> {
+    crate::isolation_readiness::check_execution()
+        .map_err(|_| sited(site!("plan.readiness"), VerificationError::Unavailable))?;
+    let owner = OWNER.get().cloned().ok_or_else(|| sited(site!("plan.boot_owner"), VerificationError::Unavailable))?;
+    if owner.home != home { return Err(sited(site!("plan.home_mismatch"), VerificationError::BindingMismatch)); }
+    labelled_blocking(site!("plan.blocking"), move || {
         let employee = crate::handlers::resolve_confirmed_employee(&owner.home, &agent)
-            .map_err(|_| VerificationError::Unavailable)?;
+            .map_err(|_| (site!("plan.employee_unconfirmed"), VerificationError::Unavailable))?;
         owner.main_plans.claude(employee.employee, class, prompt, system_prompt, &model, max_turns)
-            .map_err(|_| VerificationError::Unavailable)
+            .map_err(|_| (site!("plan.root_publication"), VerificationError::Unavailable))
     }).await
 }
 
 /// R6: the step limit root will enforce for this employee's Claude run, from
-/// the fresh root publication (same rule spawnd applies at StartRun).
-pub(super) async fn claude_max_turns(home: PathBuf, agent: String, desired: u64) -> Result<u16, VerificationError> {
-    crate::isolation_readiness::check_execution().map_err(|_| VerificationError::Unavailable)?;
-    let owner = OWNER.get().cloned().ok_or(VerificationError::Unavailable)?;
-    if owner.home != home { return Err(VerificationError::BindingMismatch); }
-    duduclaw_mcp_boundary::authority::verify_blocking(move || {
+/// the fresh root publication (same rule spawnd applies at StartRun). R8x:
+/// every refusal is `step_limit.unavailable` (same errors as before; the
+/// blocking call is `verify_blocking` through [`labelled_blocking`]).
+pub(super) async fn claude_max_turns(home: PathBuf, agent: String, desired: u64)
+    -> Result<u16, Sited<VerificationError>> {
+    const UNAVAILABLE: RefusalSite = site!("step_limit.unavailable");
+    crate::isolation_readiness::check_execution().map_err(|_| sited(UNAVAILABLE, VerificationError::Unavailable))?;
+    let owner = OWNER.get().cloned().ok_or_else(|| sited(UNAVAILABLE, VerificationError::Unavailable))?;
+    if owner.home != home { return Err(sited(UNAVAILABLE, VerificationError::BindingMismatch)); }
+    labelled_blocking(UNAVAILABLE, move || {
         let employee = crate::handlers::resolve_confirmed_employee(&owner.home, &agent)
-            .map_err(|_| VerificationError::Unavailable)?;
+            .map_err(|_| (UNAVAILABLE, VerificationError::Unavailable))?;
         owner.main_plans.claude_max_turns(employee.employee, desired)
-            .map_err(|_| VerificationError::Unavailable)
+            .map_err(|_| (UNAVAILABLE, VerificationError::Unavailable))
     }).await
 }
 
 /// Derive only from the fresh root publication and the confirmed employee.
 pub(super) async fn other_runtime_plan(home: PathBuf, agent: String,
     class: duduclaw_isolation::execution::ExecutionClass,
-    runtime: duduclaw_isolation::execution::RuntimeKind, request: Vec<u8>) -> Result<SpawnPolicy, VerificationError> {
-    crate::isolation_readiness::check_execution().map_err(|_| VerificationError::Unavailable)?;
-    let owner = OWNER.get().cloned().ok_or(VerificationError::Unavailable)?;
-    if owner.home != home { return Err(VerificationError::BindingMismatch); }
-    duduclaw_mcp_boundary::authority::verify_blocking(move || {
+    runtime: duduclaw_isolation::execution::RuntimeKind, request: Vec<u8>)
+    -> Result<SpawnPolicy, Sited<VerificationError>> {
+    crate::isolation_readiness::check_execution()
+        .map_err(|_| sited(site!("plan.readiness"), VerificationError::Unavailable))?;
+    let owner = OWNER.get().cloned().ok_or_else(|| sited(site!("plan.boot_owner"), VerificationError::Unavailable))?;
+    if owner.home != home { return Err(sited(site!("plan.home_mismatch"), VerificationError::BindingMismatch)); }
+    labelled_blocking(site!("plan.blocking"), move || {
         let employee = crate::handlers::resolve_confirmed_employee(&owner.home, &agent)
-            .map_err(|_| VerificationError::Unavailable)?;
+            .map_err(|_| (site!("plan.employee_unconfirmed"), VerificationError::Unavailable))?;
         owner.main_plans.other_runtime(employee.employee, class, runtime, request)
-            .map_err(|_| VerificationError::Unavailable)
+            .map_err(|_| (site!("plan.root_publication"), VerificationError::Unavailable))
     }).await
 }
 
@@ -972,36 +1042,48 @@ pub(super) async fn runtime_available(runtime: duduclaw_isolation::execution::Ru
 
 /// Trusted runtime entry points supply host-selected policy and resource roots.
 /// Native command arguments and environment never become launch authority.
-pub async fn prepare_launch(mut input: LaunchInput) -> Result<Arc<dyn duduclaw_execution::command::ProtectedLaunch>, VerificationError> {
-    crate::isolation_readiness::check_execution().map_err(|_| VerificationError::Unavailable)?;
-    let owner = OWNER.get().cloned().ok_or(VerificationError::Unavailable)?;
-    if !owner.boundary.healthy() { return Err(VerificationError::Unavailable); }
+pub async fn prepare_launch(mut input: LaunchInput)
+    -> Result<Arc<dyn duduclaw_execution::command::ProtectedLaunch>, Sited<VerificationError>> {
+    // R8x: every refusal below carries a fixed `launch.*` site (same errors).
+    crate::isolation_readiness::check_execution()
+        .map_err(|_| sited(site!("launch.readiness"), VerificationError::Unavailable))?;
+    let owner = OWNER.get().cloned().ok_or_else(|| sited(site!("launch.boot_owner"), VerificationError::Unavailable))?;
+    if !owner.boundary.healthy() {
+        return Err(sited(site!("launch.boundary_unhealthy"), VerificationError::Unavailable));
+    }
     let checking_owner = owner.clone();
-    let (input, prepared) = duduclaw_mcp_boundary::authority::verify_blocking(move || {
+    let (input, prepared) = labelled_blocking(site!("launch.blocking"), move || {
         let mapping = crate::handlers::resolve_confirmed_employee(&checking_owner.home, &input.agent)
-            .map_err(|_| VerificationError::Unavailable)?;
-        if mapping.employee != input.plan.employee { return Err(VerificationError::BindingMismatch); }
+            .map_err(|_| (site!("launch.employee_unconfirmed"), VerificationError::Unavailable))?;
+        if mapping.employee != input.plan.employee {
+            return Err((site!("launch.employee_mismatch"), VerificationError::BindingMismatch));
+        }
         // F1: a changed binding/employee forgets the connector build (rebuilt at first use).
         if let Some(stack) = &checking_owner.connector_stack { stack.observe_lifecycle(&input.agent); }
         let prepared = match &checking_owner.product_authority {
             Some(authority) => {
-                let prepared = authority.prepare(&input.agent, &mut input.grant, input.authenticated_epoch)?;
-                if prepared.employee() != input.plan.employee { return Err(VerificationError::BindingMismatch); }
+                let prepared = authority.prepare(&input.agent, &mut input.grant, input.authenticated_epoch)
+                    .map_err(|error| (site!("launch.product_prepare"), error))?;
+                if prepared.employee() != input.plan.employee {
+                    return Err((site!("launch.product_prepare"), VerificationError::BindingMismatch));
+                }
                 Some(match input.turn.take() { Some(turn) => prepared.with_turn(turn), None => prepared })
             }
             None => None,
         };
         checking_owner.bindings.validate(input.plan.employee, &input.grant.binding, &input.grant.principal)
-            .map_err(|_| VerificationError::BindingMismatch)?;
+            .map_err(|_| (site!("launch.binding"), VerificationError::BindingMismatch))?;
         Ok((input, prepared))
     }).await?;
-    let mut resolver = GatewayResourceResolver::new(owner.home.clone(), input.plan.employee, input.agent.clone(), owner.bindings.clone())?;
+    let mut resolver = GatewayResourceResolver::new(owner.home.clone(), input.plan.employee, input.agent.clone(), owner.bindings.clone())
+        .map_err(|error| sited(site!("launch.resolver"), error))?;
     if let Some(catalog) = &owner.catalog { resolver = resolver.with_connector_catalog(catalog.clone()); }
     // F1: this employee's providers (rebuilt on route/binding change); the
     // boot singletons are inventory objects and never serve a call.
     let (selection, connectors) = match &owner.connector_stack {
         Some(stack) => {
-            let handle = Arc::new(stack.for_employee(&input.agent, input.plan.employee)?);
+            let handle = Arc::new(stack.for_employee(&input.agent, input.plan.employee)
+                .map_err(|error| sited(site!("launch.connectors"), error))?);
             (Some(handle.clone() as Arc<dyn LiveConnectorSelectionPolicy>), Some(handle as Arc<dyn BoundConnectorExecutor>))
         }
         None => (owner.connector_selection.clone(), owner.connectors.clone()),
@@ -1010,11 +1092,14 @@ pub async fn prepare_launch(mut input: LaunchInput) -> Result<Arc<dyn duduclaw_e
     let resolver = Arc::new(resolver);
     {
         let defaults = crate::isolation_worker_plans::GatewayWorkerPlans::for_employee(
-            owner.home.clone(), input.agent.clone(), input.plan.employee)?.with_roots(input.roots.clone());
+            owner.home.clone(), input.agent.clone(), input.plan.employee)
+            .map_err(|error| sited(site!("launch.worker_plans"), error))?.with_roots(input.roots.clone());
         let worker_plans = Arc::new(duduclaw_mcp_boundary::worker_execution::CompositeWorkerPlans::new(
-            vec![owner.worker_plans.clone(), Arc::new(defaults)])?);
+            vec![owner.worker_plans.clone(), Arc::new(defaults)])
+            .map_err(|error| sited(site!("launch.worker_plans"), error))?);
         let factories = GatewayFactories::assemble(Some(owner.backend.clone()), Some(owner.execution_plans.clone()),
-            resolver.clone(), Some(owner.worker.parser.clone()), input.roots.clone())?
+            resolver.clone(), Some(owner.worker.parser.clone()), input.roots.clone())
+            .map_err(|error| sited(site!("launch.factories"), error))?
             .with_execution_jobs(owner.execution_jobs.clone())
             .with_recording_jobs(owner.recording_jobs.clone())
             .with_recording_audit(Arc::new(recording::GatewayRecordingAudit::new(owner.home.clone())))
@@ -1025,15 +1110,16 @@ pub async fn prepare_launch(mut input: LaunchInput) -> Result<Arc<dyn duduclaw_e
             roots: input.roots, resolver, factories, turns: owner.turns.clone(), connectors,
         };
         let dispatcher = duduclaw_mcp_boundary::authority::verify_blocking(move ||
-            DISPATCHER.get().ok_or(VerificationError::Unavailable)?.create(dispatcher_input)).await?;
+            DISPATCHER.get().ok_or(VerificationError::Unavailable)?.create(dispatcher_input)).await
+            .map_err(|error| sited(site!("launch.dispatcher"), error))?;
         let launch = ProtectedMcpLaunch::new(owner.backend.clone(), owner.boundary.boundary().clone(),
             owner.registry.clone(), dispatcher, input.plan, input.grant, input.origin, input.caller)
-            .map_err(|_| VerificationError::Unavailable)?;
+            .map_err(|_| sited(site!("launch.protected_launch"), VerificationError::Unavailable))?;
         return match (&owner.product_authority, prepared) {
             (Some(authority), Some(prepared)) => Ok(Arc::new(super::launch::AuthorizedLaunch::new(
                 launch, authority.clone(), prepared))),
             (None, None) => Ok(launch),
-            _ => Err(VerificationError::Unavailable),
+            _ => Err(sited(site!("launch.authority_pairing"), VerificationError::Unavailable)),
         };
     }
 }

@@ -523,19 +523,10 @@ impl GatewayAuthority {
             policy, credential_epoch, policy_epoch, tenant_id, lifecycle, expires_at: grant.expires_at, turn: None })
     }
 
+    /// The same checks, in the same order, as [`recheck_steps`]; only the
+    /// step is dropped (the live MCP snapshot needs the error alone).
     fn recheck(&self, prepared: &PreparedAuthority) -> Result<(), VerificationError> {
-        if let Some(receipt) = prepared.turn.as_ref().and_then(|turn| turn.background.as_ref()) {
-            crate::isolation_background::recheck(receipt)?;
-        }
-        if duduclaw_mcp_boundary::authority::now_seconds()? >= prepared.expires_at {
-            return Err(VerificationError::InvalidTime);
-        }
-        (self.agents)(&prepared.agent)?;
-        let identity = recheck_identity(&self.stores(), prepared)?;
-        let policy = crate::approval::strict_policy_revision(&self.home, &prepared.agent)
-            .map_err(|_| VerificationError::Unavailable)?;
-        compare_revision(prepared, identity.credential_epoch, identity.policy_epoch, &policy)?;
-        self.check_epoch(prepared)
+        recheck_steps(self, prepared).map_err(VerificationError::from)
     }
 
     // Re-read after file/root I/O: a policy writer may have fenced and restored
@@ -548,16 +539,12 @@ impl GatewayAuthority {
 
     /// Called after A reserves the run and before D issues its capability.
     /// Duplicate runs cannot replace the original host-authorized association.
-    pub fn bind_run(&self, run: RunHandle, prepared: PreparedAuthority) -> Result<(), VerificationError> {
-        self.recheck(&prepared)?;
-        let (reservation, status) = self.backend.live_snapshot(run).map_err(|_| VerificationError::Unavailable)?;
-        if reservation.employee != prepared.employee || reservation.run != run
-            || !matches!(status, RunStatus::Reserved { .. }) {
-            return Err(VerificationError::BindingMismatch);
-        }
-        self.check_epoch(&prepared)?;
-        let mut runs = self.runs.lock().map_err(|_| VerificationError::Unavailable)?;
-        if runs.len() >= MAX_ASSOCIATIONS || runs.contains_key(&run.0) { return Err(VerificationError::Unavailable); }
+    /// R8z-2: a refusal carries the fixed [`BindStep`] that refused; its
+    /// `error` is exactly the `VerificationError` returned before.
+    pub(super) fn bind_run(&self, run: RunHandle, prepared: PreparedAuthority) -> Result<(), BindRefusal> {
+        bind_steps(self, run, &prepared)?;
+        let mut runs = self.runs.lock().map_err(|_| BindStep::Associations.refuse(VerificationError::Unavailable))?;
+        association_room(&runs, run)?;
         // H13b: the ephemeral-job start reads this as "the parent holds its capability".
         crate::isolation_ephemeral_runs::record_bound(run, prepared.employee);
         // H13d: an ephemeral child's run ends its job (`revoke_run`).
@@ -618,6 +605,147 @@ fn compare_revision(prepared: &PreparedAuthority, epoch: Option<u64>, policy_epo
     -> Result<(), VerificationError> {
     if epoch != prepared.credential_epoch || policy_epoch != prepared.policy_epoch || policy != prepared.policy {
         return Err(VerificationError::Revoked);
+    }
+    Ok(())
+}
+
+// ── R8z-2: which check of a run binding refused ─────────────────────────────
+
+/// R8z-2: the fixed check of [`GatewayAuthority::bind_run`] (and of its
+/// recheck) that refused. Log text only through [`BindStep::as_str`]; the
+/// refusal itself is unchanged ([`BindRefusal::error`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BindStep {
+    /// The background record receipt recheck (record-backed runs only).
+    RecheckBackground,
+    /// The authorization's `expires_at` (stamped at issue: now + 30 min,
+    /// capped by the web credential's expiry), or an unreadable clock.
+    RecheckExpired,
+    /// The gateway's live employee registry (`AgentAdmission`).
+    RecheckAgent,
+    /// Lifecycle (apply.db, confirmations, root ReadBack) and users.db facts
+    /// against the ones pinned at prepare.
+    RecheckIdentity,
+    /// `strict_policy_revision` could not be computed (unreadable/malformed
+    /// policy file, inactive employee, missing config).
+    RecheckPolicyRevision,
+    /// The policy revision differs from the one pinned at prepare.
+    RecheckRevisionChanged,
+    /// The users.db re-read after the policy I/O.
+    RecheckEpoch,
+    /// The root Status RPC for the run failed.
+    LiveSnapshot,
+    /// Root's reservation is another employee/run, or not `Reserved`.
+    BindingMismatch,
+    /// The users.db re-read after the Status RPC.
+    EpochAfterSnapshot,
+    /// The epoch-local run association table (full, duplicate, poisoned).
+    Associations,
+}
+
+impl BindStep {
+    #[cfg(test)]
+    pub(super) const ALL: [Self; 11] = [Self::RecheckBackground, Self::RecheckExpired, Self::RecheckAgent,
+        Self::RecheckIdentity, Self::RecheckPolicyRevision, Self::RecheckRevisionChanged, Self::RecheckEpoch,
+        Self::LiveSnapshot, Self::BindingMismatch, Self::EpochAfterSnapshot, Self::Associations];
+
+    /// The fixed `step` log value.
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::RecheckBackground => "recheck.background",
+            Self::RecheckExpired => "recheck.expired",
+            Self::RecheckAgent => "recheck.agent",
+            Self::RecheckIdentity => "recheck.identity",
+            Self::RecheckPolicyRevision => "recheck.policy_revision",
+            Self::RecheckRevisionChanged => "recheck.revision_changed",
+            Self::RecheckEpoch => "recheck.epoch",
+            Self::LiveSnapshot => "live_snapshot",
+            Self::BindingMismatch => "binding_mismatch",
+            Self::EpochAfterSnapshot => "epoch_after_snapshot",
+            Self::Associations => "associations",
+        }
+    }
+
+    fn refuse(self, error: VerificationError) -> BindRefusal { BindRefusal { step: self, error } }
+    fn at(self) -> impl Fn(VerificationError) -> BindRefusal { move |error| self.refuse(error) }
+}
+
+/// R8z-2: a refused run binding — the unchanged error plus the step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct BindRefusal { pub(super) step: BindStep, pub(super) error: VerificationError }
+
+impl From<BindRefusal> for VerificationError {
+    fn from(refusal: BindRefusal) -> Self { refusal.error }
+}
+
+/// The reads one run binding performs, in [`recheck_steps`]/[`bind_steps`]
+/// order. Production: [`GatewayAuthority`]; tests substitute single reads.
+trait BindSources {
+    /// The background record receipt of the prepared turn, if any.
+    fn background(&self, prepared: &PreparedAuthority) -> Result<(), VerificationError>;
+    fn now(&self) -> Result<u64, VerificationError>;
+    fn agent(&self, agent: &str) -> Result<(), VerificationError>;
+    /// [`recheck_identity`]: the (credential, policy) epochs it established.
+    fn identity(&self, prepared: &PreparedAuthority) -> Result<(Option<u64>, u64), VerificationError>;
+    fn policy(&self, agent: &str) -> Result<String, VerificationError>;
+    /// [`GatewayAuthority::check_epoch`].
+    fn current(&self, prepared: &PreparedAuthority) -> Result<(), VerificationError>;
+    /// Root's reservation (employee, run) and fresh status for `run`.
+    fn live(&self, run: RunHandle) -> Result<(EmployeeId, RunHandle, RunStatus), VerificationError>;
+}
+
+impl BindSources for GatewayAuthority {
+    fn background(&self, prepared: &PreparedAuthority) -> Result<(), VerificationError> {
+        match prepared.turn.as_ref().and_then(|turn| turn.background.as_ref()) {
+            Some(receipt) => crate::isolation_background::recheck(receipt),
+            None => Ok(()),
+        }
+    }
+    fn now(&self) -> Result<u64, VerificationError> { duduclaw_mcp_boundary::authority::now_seconds() }
+    fn agent(&self, agent: &str) -> Result<(), VerificationError> { (self.agents)(agent) }
+    fn identity(&self, prepared: &PreparedAuthority) -> Result<(Option<u64>, u64), VerificationError> {
+        recheck_identity(&self.stores(), prepared).map(|identity| (identity.credential_epoch, identity.policy_epoch))
+    }
+    fn policy(&self, agent: &str) -> Result<String, VerificationError> {
+        crate::approval::strict_policy_revision(&self.home, agent).map_err(|_| VerificationError::Unavailable)
+    }
+    fn current(&self, prepared: &PreparedAuthority) -> Result<(), VerificationError> { self.check_epoch(prepared) }
+    fn live(&self, run: RunHandle) -> Result<(EmployeeId, RunHandle, RunStatus), VerificationError> {
+        let (reservation, status) = self.backend.live_snapshot(run).map_err(|_| VerificationError::Unavailable)?;
+        Ok((reservation.employee, reservation.run, status))
+    }
+}
+
+/// Recheck of a prepared run (bind and every live MCP snapshot): background
+/// receipt, expiry, live registry, identity, policy digest, users.db.
+fn recheck_steps<S: BindSources + ?Sized>(sources: &S, prepared: &PreparedAuthority) -> Result<(), BindRefusal> {
+    sources.background(prepared).map_err(BindStep::RecheckBackground.at())?;
+    if sources.now().map_err(BindStep::RecheckExpired.at())? >= prepared.expires_at {
+        return Err(BindStep::RecheckExpired.refuse(VerificationError::InvalidTime));
+    }
+    sources.agent(&prepared.agent).map_err(BindStep::RecheckAgent.at())?;
+    let (credential_epoch, policy_epoch) = sources.identity(prepared).map_err(BindStep::RecheckIdentity.at())?;
+    let policy = sources.policy(&prepared.agent).map_err(BindStep::RecheckPolicyRevision.at())?;
+    compare_revision(prepared, credential_epoch, policy_epoch, &policy).map_err(BindStep::RecheckRevisionChanged.at())?;
+    sources.current(prepared).map_err(BindStep::RecheckEpoch.at())
+}
+
+/// [`recheck_steps`], then root's live reservation of exactly this run and
+/// employee in `Reserved`, then the users.db re-read after that RPC.
+fn bind_steps<S: BindSources + ?Sized>(sources: &S, run: RunHandle, prepared: &PreparedAuthority)
+    -> Result<(), BindRefusal> {
+    recheck_steps(sources, prepared)?;
+    let (employee, reserved, status) = sources.live(run).map_err(BindStep::LiveSnapshot.at())?;
+    if employee != prepared.employee || reserved != run || !matches!(status, RunStatus::Reserved { .. }) {
+        return Err(BindStep::BindingMismatch.refuse(VerificationError::BindingMismatch));
+    }
+    sources.current(prepared).map_err(BindStep::EpochAfterSnapshot.at())
+}
+
+/// A new association needs room and an unused run id.
+fn association_room(runs: &BTreeMap<RunId, PreparedAuthority>, run: RunHandle) -> Result<(), BindRefusal> {
+    if runs.len() >= MAX_ASSOCIATIONS || runs.contains_key(&run.0) {
+        return Err(BindStep::Associations.refuse(VerificationError::Unavailable));
     }
     Ok(())
 }
@@ -774,5 +902,138 @@ mod tests {
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0124").is_err());
         assert!(compare_revision(&prepared, Some(10), 12, &prepared.policy).is_err());
         assert!(compare_revision(&prepared, None, 12, &prepared.policy).is_err());
+    }
+
+    // ── R8z-2: every refusing check of a run binding names its step ─────────
+
+    const RUN: RunHandle = RunHandle(RunId([7; 16]));
+    const EXPIRES: u64 = 1_000;
+
+    fn bindable() -> PreparedAuthority {
+        let binding = EmployeeBinding::Shared(Text::new("tenant".into()).unwrap());
+        let lifecycle = EmployeeLifecycle { employee: EmployeeId([1; 16]), label: "employee".into(),
+            allocation: duduclaw_migration::contract::ProposalBinding {
+                operation_id: duduclaw_migration::contract::ProposalOperationId {
+                    proposal_id: duduclaw_migration::ids::RequestId([1; 16]), revision: 1 },
+                proposal_digest: duduclaw_isolation::ids::Sha256Digest([2; 32]) },
+            uid: 70_001, binding: binding.clone(), incarnation: 0 };
+        PreparedAuthority { agent: "employee".into(), employee: EmployeeId([1; 16]),
+            principal: Principal::Human { user_id: Text::new("user".into()).unwrap(), generation: 5 },
+            binding, revision: 1, policy: "policy".into(), credential_epoch: Some(9), policy_epoch: 12,
+            tenant_id: "tenant".into(), lifecycle, expires_at: EXPIRES, turn: None }
+    }
+
+    /// One read of the binding goes wrong (`fail`); all others answer as a
+    /// healthy store would for [`bindable`]. Each failing read returns a
+    /// distinct error so the test also proves the error is passed through.
+    struct Fake { fail: Option<BindStep>, current_calls: std::cell::Cell<u32> }
+    impl Fake {
+        fn failing(step: Option<BindStep>) -> Self { Self { fail: step, current_calls: std::cell::Cell::new(0) } }
+        fn check(&self, step: BindStep, error: VerificationError) -> Result<(), VerificationError> {
+            if self.fail == Some(step) { Err(error) } else { Ok(()) }
+        }
+    }
+    impl BindSources for Fake {
+        fn background(&self, _: &PreparedAuthority) -> Result<(), VerificationError> {
+            self.check(BindStep::RecheckBackground, VerificationError::Revoked)
+        }
+        fn now(&self) -> Result<u64, VerificationError> {
+            Ok(if self.fail == Some(BindStep::RecheckExpired) { EXPIRES } else { EXPIRES - 1 })
+        }
+        fn agent(&self, _: &str) -> Result<(), VerificationError> {
+            self.check(BindStep::RecheckAgent, VerificationError::Invalid)
+        }
+        fn identity(&self, prepared: &PreparedAuthority) -> Result<(Option<u64>, u64), VerificationError> {
+            self.check(BindStep::RecheckIdentity, VerificationError::BindingMismatch)?;
+            Ok((prepared.credential_epoch, prepared.policy_epoch))
+        }
+        fn policy(&self, _: &str) -> Result<String, VerificationError> {
+            self.check(BindStep::RecheckPolicyRevision, VerificationError::Unavailable)?;
+            Ok(if self.fail == Some(BindStep::RecheckRevisionChanged) { "edited".into() } else { "policy".into() })
+        }
+        fn current(&self, _: &PreparedAuthority) -> Result<(), VerificationError> {
+            let call = self.current_calls.get() + 1;
+            self.current_calls.set(call);
+            match (self.fail, call) {
+                (Some(BindStep::RecheckEpoch), 1) | (Some(BindStep::EpochAfterSnapshot), 2) =>
+                    Err(VerificationError::Revoked),
+                _ => Ok(()),
+            }
+        }
+        fn live(&self, run: RunHandle) -> Result<(EmployeeId, RunHandle, RunStatus), VerificationError> {
+            self.check(BindStep::LiveSnapshot, VerificationError::Unavailable)?;
+            let status = if self.fail == Some(BindStep::BindingMismatch) { RunStatus::Starting }
+                else { RunStatus::Reserved { expires_at_unix_ms: u64::MAX } };
+            Ok((EmployeeId([1; 16]), run, status))
+        }
+    }
+
+    #[test]
+    fn r8z2_each_refusing_bind_check_names_its_step_and_keeps_its_error() {
+        let prepared = bindable();
+        assert_eq!(bind_steps(&Fake::failing(None), RUN, &prepared), Ok(()));
+        for (step, error) in [
+            (BindStep::RecheckBackground, VerificationError::Revoked),
+            (BindStep::RecheckExpired, VerificationError::InvalidTime),
+            (BindStep::RecheckAgent, VerificationError::Invalid),
+            (BindStep::RecheckIdentity, VerificationError::BindingMismatch),
+            (BindStep::RecheckPolicyRevision, VerificationError::Unavailable),
+            (BindStep::RecheckRevisionChanged, VerificationError::Revoked),
+            (BindStep::RecheckEpoch, VerificationError::Revoked),
+            (BindStep::LiveSnapshot, VerificationError::Unavailable),
+            (BindStep::BindingMismatch, VerificationError::BindingMismatch),
+            (BindStep::EpochAfterSnapshot, VerificationError::Revoked),
+        ] {
+            let refusal = bind_steps(&Fake::failing(Some(step)), RUN, &prepared).unwrap_err();
+            assert_eq!(refusal, BindRefusal { step, error }, "{}", step.as_str());
+            // Callers that need only the error see exactly the same one.
+            assert_eq!(VerificationError::from(refusal), error);
+        }
+        // The recheck alone (live MCP snapshot path) stops before the RPC.
+        assert_eq!(recheck_steps(&Fake::failing(Some(BindStep::LiveSnapshot)), &prepared), Ok(()));
+        assert_eq!(recheck_steps(&Fake::failing(Some(BindStep::RecheckEpoch)), &prepared).unwrap_err().step,
+            BindStep::RecheckEpoch);
+        // Root's reservation of another employee or run is a mismatch too.
+        struct Other;
+        impl BindSources for Other {
+            fn background(&self, _: &PreparedAuthority) -> Result<(), VerificationError> { Ok(()) }
+            fn now(&self) -> Result<u64, VerificationError> { Ok(0) }
+            fn agent(&self, _: &str) -> Result<(), VerificationError> { Ok(()) }
+            fn identity(&self, p: &PreparedAuthority) -> Result<(Option<u64>, u64), VerificationError> {
+                Ok((p.credential_epoch, p.policy_epoch))
+            }
+            fn policy(&self, _: &str) -> Result<String, VerificationError> { Ok("policy".into()) }
+            fn current(&self, _: &PreparedAuthority) -> Result<(), VerificationError> { Ok(()) }
+            fn live(&self, run: RunHandle) -> Result<(EmployeeId, RunHandle, RunStatus), VerificationError> {
+                Ok((EmployeeId([2; 16]), run, RunStatus::Reserved { expires_at_unix_ms: u64::MAX }))
+            }
+        }
+        assert_eq!(bind_steps(&Other, RUN, &prepared).unwrap_err().step, BindStep::BindingMismatch);
+        assert_eq!(bind_steps(&Other, RUN, &prepared).unwrap_err().error, VerificationError::BindingMismatch);
+    }
+
+    #[test]
+    fn r8z2_association_table_refusals_are_the_associations_step() {
+        let mut runs = BTreeMap::new();
+        assert_eq!(association_room(&runs, RUN), Ok(()));
+        runs.insert(RUN.0, bindable());
+        assert_eq!(association_room(&runs, RUN),
+            Err(BindRefusal { step: BindStep::Associations, error: VerificationError::Unavailable }));
+        let mut full = BTreeMap::new();
+        for index in 0..MAX_ASSOCIATIONS {
+            let mut id = [0u8; 16];
+            id[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            full.insert(RunId(id), bindable());
+        }
+        assert_eq!(association_room(&full, RUN).unwrap_err().step, BindStep::Associations);
+    }
+
+    #[test]
+    fn r8z2_bind_step_labels_are_fixed_distinct_and_well_formed() {
+        let labels: std::collections::BTreeSet<_> = BindStep::ALL.iter().map(|step| step.as_str()).collect();
+        assert_eq!(labels.len(), BindStep::ALL.len());
+        for label in labels {
+            assert!(!label.is_empty() && label.bytes().all(|b| b.is_ascii_lowercase() || b == b'.' || b == b'_'), "{label}");
+        }
     }
 }

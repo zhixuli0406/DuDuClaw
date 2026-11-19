@@ -430,13 +430,22 @@ async fn protected(native: NativeCommandSnapshot, class: ExecutionClass, pty: bo
     let run = backend.reserve(employee).await.map_err(error)?;
     let mut prepared = Prepared { backend: backend.clone(), run, lifecycle: lifecycle.clone(), mcp: false, armed: true, io_deadline: tokio::time::Instant::now() };
     let runtime = capture_runtime();
+    // R8z: the launch context's refusals (D's capability issuance, the
+    // gateway's run binding) are collapsed into one `BackendError` by the
+    // context; this names the step before the rollback's own traffic.
+    use crate::spawnd::local_refusal::{refuse, Step};
     let policy = match lifecycle.prepare(run, class, runtime.clone(), &native, pty).await {
         Ok(policy) => policy,
-        Err(reason) => { rollback(&backend, run, lifecycle.as_ref()).await; return Err(error(reason)); },
+        Err(reason) => {
+            let reason = refuse(Step::LaunchPrepare, reason);
+            rollback(&backend, run, lifecycle.as_ref()).await;
+            return Err(error(reason));
+        },
     };
     if !valid_policy_binding(&policy, run, employee, class, &runtime, pty, capture_memory_limit()) {
+        let reason = refuse(Step::PolicyBinding, BackendError::Denied);
         rollback(&backend, run, lifecycle.as_ref()).await;
-        return Err(error(BackendError::Denied));
+        return Err(error(reason));
     }
     if let Err(reason) = backend.bind_task(run, lifecycle.task()).await {
         rollback(&backend, run, lifecycle.as_ref()).await;

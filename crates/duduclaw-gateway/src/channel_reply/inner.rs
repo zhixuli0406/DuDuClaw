@@ -4115,6 +4115,10 @@ async fn build_reply_with_session_inner_impl(
     let diagnostic = failure.audit();
     let err_str = diagnostic.to_string();
     let notice_reason = failure.notice_reason();
+    // R8x: a protected-mode gate refusal shows the existing `safety_gate`
+    // code instead of `unknown` (suffix, stored notice and audit row alike).
+    let reason_code = super::failure_notice::displayed_code(reason, failure.spawn_gate_message().is_some(),
+        duduclaw_core::execution_gate::isolation_required());
     super::failure::mark_turn_failure(notice_reason);
     let partial_saved = if !super::assembly::public_session(session_id) {
         if let Some(outcome) = crate::work_outcome::WorkOutcome::decode(&failure) {
@@ -4122,7 +4126,7 @@ async fn build_reply_with_session_inner_impl(
             super::failure_notice::persist_work_partial(ctx, session_id, &agent_id, &partial, turn_generation.as_deref()).await
         } else { false }
     } else { false };
-    super::failure_notice::FAILURE_DETAILS.scope((reason.as_str(), crate::work_outcome::WorkOutcome::decode(&failure)),
+    super::failure_notice::FAILURE_DETAILS.scope((reason_code, crate::work_outcome::WorkOutcome::decode(&failure)),
         super::persist_failure_notice(ctx, session_id, &agent_id, &turn_id, notice_reason, turn_generation.as_deref())).await;
     if partial_saved {
         let _ = super::ccr_delivery::CCR_TURN_DELIVERY.try_with(|delivery| {
@@ -4195,7 +4199,7 @@ async fn build_reply_with_session_inner_impl(
         "doc_url": doc_url,
         "timestamp": chrono::Utc::now().to_rfc3339(),
     });
-    super::failure_notice::attach_failure_reference(&mut audit, reason.as_str(), &turn_id);
+    super::failure_notice::attach_failure_reference(&mut audit, reason_code, &turn_id);
     // Shared JSONL appends must use the existing cross-process file lock.
     // Await off-thread I/O, then preserve the same best-effort reply path.
     let audit_home = ctx.home_dir.clone();
@@ -4215,7 +4219,7 @@ async fn build_reply_with_session_inner_impl(
 
     let language = crate::prompt_identity::resolve_fixed_message_language_for_id(&ctx.home_dir, &agent_id).await;
     let visitor = super::assembly::public_session(session_id);
-    let reference = super::failure_notice::notice_suffix(language.as_deref(), (!visitor).then_some(reason.as_str()), &turn_id);
+    let reference = super::failure_notice::notice_suffix(language.as_deref(), (!visitor).then_some(reason_code), &turn_id);
     if let Some(outcome) = crate::work_outcome::WorkOutcome::decode(&failure) {
         if visitor { return format!("{}\n{reference}", crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE); }
         let notice = super::failure_notice::work_notice(&outcome, language.as_deref());

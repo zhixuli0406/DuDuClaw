@@ -142,6 +142,11 @@ pub(crate) mod refusal;
 #[cfg(target_os = "linux")]
 #[path = "isolation_mcp/runtime.rs"]
 pub(crate) mod runtime;
+/// R8z: the API worker path's step-limit rule, pinned against spawnd's own
+/// rule functions for the published `open_ai_compat` record.
+#[cfg(all(test, target_os = "linux"))]
+#[path = "isolation_mcp/api_step_limit_tests.rs"]
+mod api_step_limit_tests;
 #[cfg(target_os = "linux")]
 pub use runtime::{RuntimeAuthorization, with_runtime_authorization};
 #[cfg(target_os = "linux")]
