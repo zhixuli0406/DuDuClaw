@@ -673,8 +673,9 @@ mod tests {
         let flood = host.flood(tunnels.clone(), &limits, stop.clone());
         // Generous: the actor waits for one full client queue at a time.
         let mut kept = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         for handle in stuck {
-            let (_, client) = tokio::time::timeout(Duration::from_secs(10), handle).await
+            let (_, client) = tokio::time::timeout_at(deadline, handle).await
                 .expect("the forwarder closes every stuck client").unwrap();
             kept.push(client);
         }
