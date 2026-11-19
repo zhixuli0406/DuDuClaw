@@ -511,8 +511,9 @@ prints the structured report, and exits nonzero when unavailable/stale.
 The report has no secrets, command lines, host process IDs or free-form errors.
 It contains the primary `Readiness` booleans, secondary BPF status, observed host
 PTY budget and timestamps. Evidence is dated at probe **start**, with a maximum
-one-second report lifetime; scanner evidence must be less than one second old at
-publication. Expired/missing evidence denies. Slow probes can therefore keep a
+one-second report lifetime; scanner evidence (dated at its scan's start) must be
+younger than two scan periods (2 s: one period plus one scan's duration, R8w) at
+publication, the same rule admission applies. Expired/missing evidence denies. Slow probes can therefore keep a
 large installation unavailable; no performance acceptance has been claimed.
 Production ReserveRun/policy selection uses the same verified in-process view,
 not an extra per-request slow-probe RPC. Start performs fresh host/UID/storage
@@ -599,8 +600,16 @@ and [execution properties](https://raw.githubusercontent.com/systemd/systemd/v24
 source inspection does not substitute for the native tests above.
 
 The fixed account utility paths follow the [Debian passwd file list](https://packages.debian.org/bookworm/amd64/passwd/filelist)
-(`/usr/bin/chage`); scheduler inspection uses [at -l](https://manpages.debian.org/bookworm/at/at.1.en.html)
-instead of executing the atq symlink. These paths still require distro acceptance.
+(`/usr/bin/chage`). R8w: at jobs are inspected by reading the at spool directly as root
+(`/var/spool/cron/atjobs` and `/var/spool/cron/atspool` on Debian/Ubuntu, `/var/spool/at` and
+`/var/spool/at/spool` on RHEL/Fedora: no entry may be owned by the employee uid), never by
+executing `at`, which Debian/Ubuntu ship setuid/setgid `daemon:daemon` (root runs only root-owned
+utilities). An entry that is listed and then cannot be inspected for any reason, `ENOENT`
+included, fails that verification round: atd 3.2.5 unlinks a due job from `atjobs` before it
+creates the job's output file in `atspool`, so a vanished entry can be a job that is starting.
+Nothing is retried within the round; the next refresh repeats it, which clears a benign
+transient. `openat2` being unavailable (`ENOSYS`) also fails closed. These paths still require
+distro acceptance.
 This page records implementation boundaries; it is not an installation guide or
 evidence that protected execution is enabled.
 
@@ -2103,10 +2112,13 @@ piped to a shell. No production trust material is included in this package.
 
 **Test builds.** `--cfg duduclaw_test_root` selects test trust at compile time
 only. `duduclaw-bootstrap` then pins the TEST root of `scripts/isolation-test-keys.sh`
-and prints `TEST <pin>`; `duduclaw` additionally trusts the TEST licence issuer
+and prints `TEST <pin>`; `duduclaw` trusts ONLY the TEST licence issuer
 compiled in through `DUDUCLAW_TEST_LICENSE_ISSUER_PUBKEY` under key id `test-root`
-(`production_registry`, `crates/duduclaw-gateway/src/license_runtime.rs`) and
-`duduclaw print-license-issuer` prints `TEST-LICENSE <key>` instead of
+(`production_registry`, `crates/duduclaw-gateway/src/license_runtime.rs`): no
+baked production issuer and no `DUDUCLAW_LICENSE_PUBKEY_<ID>` environment issuer,
+so a production licence is never accepted, and without a compiled TEST issuer
+(`TEST-LICENSE none`) no licence is accepted at all. `duduclaw print-license-issuer`
+prints `TEST-LICENSE <key>` instead of
 `PRODUCTION-LICENSE <16 hex>`. Every other licence rule (signature, machine
 binding, self-host tier and non-Personal edition, expiry, grace) is unchanged, so
 a TEST licence from `isolation-test-keys.sh license` passes exactly the

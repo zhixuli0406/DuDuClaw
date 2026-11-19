@@ -154,7 +154,7 @@ impl Components {
 }
 #[path = "host_monitor.rs"]
 mod monitor;
-use monitor::{Monitor, ScanEntry, ScanReader};
+use monitor::{scan_fresh, Monitor, ScanEntry, ScanReader, SCAN_PERIOD};
 #[cfg(test)]
 use monitor::ScanState;
 /// HX4 helper glue of `Core` (engine link, per-call start/signal, audit).
@@ -243,6 +243,10 @@ struct Core {
     /// again only when the set of false checks (or the resources sub-condition)
     /// changes, never every refresh.
     evidence_line: Option<String>,
+    /// R8w: the last account verification line printed
+    /// (`accounts::verification_line`): printed again only when the failing
+    /// step or account changes; cleared when verification passes.
+    account_line: Option<String>,
 }
 /// C2: the cadence of start-up reconciliation retries.
 const STARTUP_RETRY: Duration = Duration::from_secs(2);
@@ -294,7 +298,7 @@ impl LinuxHost {
             monitor, runs: BTreeMap::new(), audit, last_refresh: Instant::now(), poisoned: false, view: view.clone(),
             helper_events: Vec::new(), recording_probe: probe::RecordingProbe::default(),
             probe_schedule: probe::ProbeSchedule::default(), recording_gate: recording_gate.clone(),
-            startup: StartupReconcile::opened(Instant::now(), false), evidence_line: None };
+            startup: StartupReconcile::opened(Instant::now(), false), evidence_line: None, account_line: None };
         startup_stage("report", core.report.publish(gateway.1))?;
         // Cleanup is attempted even when C/H/F/G are absent. Failure is evidence,
         // never permission to skip an orphan or reinterpret a stale reservation.
@@ -378,7 +382,14 @@ impl Core {
         // sshd configuration); each account's SSH probe result is per-employee
         // and checked at its admission (`ready`), so one pending or failed
         // probe never takes every employee down.
-        let registry = self.registry.verify(&mut LinuxAccounts::background(self.components.ssh.as_ref())).is_ok();
+        let verified = self.registry.verify(&mut LinuxAccounts::background(self.components.ssh.as_ref()));
+        let registry = verified.is_ok();
+        // R8w: WHY it failed, as one fixed line per change of the failing
+        // step/account (`accounts::Step`; never the error text). Journal
+        // only: readiness.json and the wire keep their fixed check names.
+        if let Some(line) = accounts::verification_change(&mut self.account_line, &verified) {
+            eprintln!("duduclaw-spawnd: {line}");
+        }
         self.policy = self.components.publication.load().ok();
         let snapshot = self.components.publication.snapshot_authority(self.gateway.0);
         checks.registry_verified = registry && self.policy.is_some() && snapshot.is_ok_and(|s| s.gateway_uid == self.gateway.0 && s.mount_id != 0);
@@ -410,8 +421,12 @@ impl Core {
         let dns_reason = if checks.egress_verified { dns_route.err() }
             else { Some(crate::dns_evidence::Reason::NoControlConnection.name()) };
         checks.storage_verified = self.components.storage.readiness().is_ok();
+        // R8w item 3: the monitor's own freshness rule (`scan_fresh`), so a
+        // healthy monitor between "one period elapsed" and "next result
+        // stored" is not read stale; a scan error or a sticky intruder still
+        // reads false.
         checks.process_scan_verified = self.monitor.state.lock().is_ok_and(|state|
-            state.at.elapsed() < Duration::from_secs(1) && state.result.as_ref().is_ok_and(Vec::is_empty));
+            scan_fresh(Instant::now(), state.at, SCAN_PERIOD) && state.result.as_ref().is_ok_and(Vec::is_empty));
         let ptys = self.systemd.resources_ready();
         checks.resources_verified = ptys.is_ok();
         // Fixed names only: the readiness.json check names and, for

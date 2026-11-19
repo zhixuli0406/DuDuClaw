@@ -714,7 +714,7 @@ exit status is trusted only when bound to THIS invocation
 
 Evidence (`ssh_evidence`). Results live in memory only, keyed by boot id,
 committed signed generation, account name and uid, SHA-256 of
-`sshd -T -C user=<account>,host=localhost,addr=127.0.0.1` (which `verify_login`
+`sshd -T -C user=<account>,host=localhost,addr=127.0.0.1` (which `verify_ssh`
 reads anyway) and the port taken from it, the installed probe binary verified
 against the generation's `IsolationProbe` artifact (digest, size, mode), the
 installed template unit's digest, and the live sshd listener's identity
@@ -733,7 +733,7 @@ the process. One worker
 thread (`duduclaw-ssh-probe`, its own D-Bus connection, started by the first
 lookup during start-up recovery) re-measures the host part every 2 s and runs
 queued probes one at a time, each bounded by the unit deadline (40 s); the
-250 ms refresh never starts a unit. `verify_login` keeps every earlier check
+250 ms refresh never starts a unit. `verify_locked` keeps every earlier check
 (linger, `user@` unit, sessions, `sshd -t`) and then, in this order, requires
 its OWN `sshd -T` to deny the account (`ssh_effective_denied`'s shared parser)
 and name a port (otherwise refused: `accounts::SSH_PORT_UNKNOWN`) before it

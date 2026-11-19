@@ -265,6 +265,38 @@ sudo journalctl -u duduclaw-gateway.service -u duduclaw-spawnd.service -u duducl
 | 確認／交換待ち | 移行の確認で対応項目の確認、再試行、新しい認証情報設定を完了。承認だけでは移行完了にならない。 |
 | 更新受理済みだが未 committed | 永続的な要求状態と準備エラーを追跡し、手動バイナリ交換を並行実行しない。 |
 
+### spawnd ジャーナルのアカウント検証行
+
+`registry_verified`、`accounts_locked`、`ssh_live_negative_checks`、`cron_at_acl_and_jobs_verified`、`external_iam_reservation_verified` がまとめて失敗する場合、spawnd のジャーナルに失敗したステップが出力されます。各行は 1 回だけ出力され、ステップまたはアカウントが変わったときだけ再出力されます。
+
+```text
+duduclaw-spawnd: employee account verification failed: step=<label> account=<duduclaw-emp-NNNNN|->
+duduclaw-spawnd: allocation failed: step=<label>
+```
+
+1 行目はホスト全体のアカウント検査から出力されます。この検査は社員範囲内のすべての `duduclaw-emp-*` アカウントを対象とし、退役済み（tombstone）のアカウントも含みます。`account=-` はホスト単位のステップを表します。2 行目は社員の割り当てが失敗するたびに 1 回出力されます。SSH プローブの結果待ちと保留中予約の上限到達は失敗ではないため、出力されません。label は固定の識別子で、どちらの行にもファイル内容やエラー文は含まれません。準備状態の出力と `readiness.json` の検査名は変わりません。
+
+| label | 失敗した内容 |
+| --- | --- |
+| `login_defs`、`subids` | `/etc/login.defs`、`/etc/subuid`、`/etc/subgid` のいずれかが読めない、または形式が不正。 |
+| `registry_rows` | 社員登録がホストの uid 範囲と合わない、または再開できない予約がある。 |
+| `nss_modules` | passwd または group が `files`／`systemd` 以外の NSS モジュールを使っている。 |
+| `enumerate` | `getent passwd`／`group` が読めない、または社員範囲に別名や外部のエントリがある。 |
+| `passwd_row`、`shadow_row`、`groups` | アカウントの passwd 行（`/nonexistent`、`/usr/sbin/nologin`）、shadow 行（`!*`、期限切れ）、グループ一覧（自身の gid のみ）のいずれかが正しくない。 |
+| `cron_acl`、`at_acl` | `/etc/cron.deny` または `/etc/at.deny` がアカウントを拒否していない、または allow ファイルで上書きされている。 |
+| `cron_spool`、`cron_tables` | アカウントのユーザー crontab がある、または `/etc/crontab`、`/etc/cron.d` にそのアカウントで実行される行がある（そこに読めないファイルや root 所有でないファイルがある場合も失敗）。 |
+| `at_spool` | at の spool ディレクトリ（`/var/spool/cron/atjobs`、`/var/spool/cron/atspool`、`/var/spool/at`、`/var/spool/at/spool`）にアカウント所有のエントリがある、ディレクトリはあるが読めない、または一覧にあったエントリが所有者の確認前に消えたか確認できない。atd はジョブの開始時にそれを `atjobs` から削除するため、エントリが消えても無害とは扱いません。次の更新で再検査されるので、他のアカウントのジョブが終わったなどの一時的な変化はそこで解消します。 |
+| `linger`、`sessions` | linger ファイルがある、またはアカウントの `user@<uid>.service` か logind セッションが動いている。 |
+| `ssh_config`、`ssh_probe` | `sshd -t`／`sshd -T` がアカウントを拒否していない、または port がない。あるいは SSH 拒否プローブに Denied の結果がない。 |
+| `userdb_service`、`userdb_user`、`userdb_group` | `/run/systemd/userdb` が読めない、または userdb のユーザー／グループレコードが社員の名前空間に触れている。 |
+| `local_identity`、`candidate`、`owner_inventory` | 割り当て時：新アカウントの ID や別名が既にある、候補 uid の検索に失敗した、または spawnd のファイル所有者一覧の作成に失敗した。 |
+| `login_barriers`、`create_group`、`create_user`、`lock_user`、`quarantine` | 割り当てまたは復旧時：deny エントリや sshd ドロップイン、groupadd、useradd（またはそれが作ったメール spool）、usermod／chage／loginctl によるロック、アカウントのプロセス停止のいずれかが失敗した。 |
+| `reserve`、`create_account`、`readback` | より細かい label のない割り当てステップが失敗した。たとえば `reserve` は社員 uid 範囲を使い切ったことを表す。 |
+| `existing_row`、`persist_reservation`、`persist_final`、`store_poisoned`、`clock` | 割り当て時：社員に退役済みまたは再開できない登録行がある、アカウント作成前または結果確定後の登録の書き込みに失敗した、このプロセスで以前に書き込みが失敗したため登録ストアが書き込みを拒否している、または単調時計を読めない。 |
+| `unlabelled` | spawnd のラベル付き検査の外から来たエラー。割り当てでは出力されない。 |
+
+`at` パッケージは削除不要です。spawnd は root として spool を直接読み、`/usr/bin/at` を実行しません。行を消すために deny ファイル、spool、アカウントを手で編集しないでください。原因を直すと、次の更新で `evidence complete` が出力されます。失敗した割り当ての uid は永久に退役し、提案は「失敗」のままです。原因を直した後、移行の確認で失敗項目の補償を再試行してください。その後の新しい提案には次の uid が割り当てられます。
+
 保護された社員環境ではコンテナエンジンやホストハードウェア依存の機能を提供しません。作業再開前に全必須コンポーネントの検査が必要です。パッケージテストの成功や本ガイドを本番環境の受け入れ完了とは扱わないでください。
 
 ## リリース済み v1.80.x の単一実行ファイル保護サービス

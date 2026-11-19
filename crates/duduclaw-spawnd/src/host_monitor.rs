@@ -3,6 +3,27 @@
 //! only visibility widened to `pub(super)`).
 use super::*;
 
+/// R8w item 3: the monitor STARTS a scan every `SCAN_PERIOD` (or right after
+/// a slower scan ends) and publishes its result, stamped with that start,
+/// when the scan ends.
+pub(super) const SCAN_PERIOD: Duration = Duration::from_secs(1);
+/// R8w item 3: whether a result whose scan started at `started` is fresh at
+/// `now`, for a monitor scanning every `period`: its START is younger than
+/// `period` plus a grace of one more `period`. Just before the next result
+/// is stored the newest one's start is `period` + the next scan's duration
+/// old, so the grace covers a scan of up to one period and a healthy monitor
+/// is never read stale (the pre-fix rule, younger than `period` alone,
+/// flapped in exactly that window). A stopped monitor reads stale at most
+/// 2 × `period` = 2 s after its last scan started; `LinuxHost::ready`
+/// (`ScanReader::health`) checks this before every admission of a run, so a
+/// run is never admitted on a scan older than that, within the 3 s bound;
+/// the readiness flag (`process_scan_verified`) follows at the next refresh
+/// (≤ 250 ms later). The one rule for the readiness flag, admission
+/// (`health`) and intruder detection (`scan`).
+pub(super) fn scan_fresh(now: Instant, started: Instant, period: Duration) -> bool {
+    now.saturating_duration_since(started) < period.saturating_mul(2)
+}
+
 #[derive(Clone)]
 pub(super) struct ScanEntry { pub(super) account: EmployeeAccount, pub(super) run: Option<RunId>, pub(super) cgroup: Option<String>,
     pub(super) revokers: Vec<Arc<ConnectionRevoker>>, pub(super) cancelled: Arc<AtomicBool>, pub(super) deadline: Option<Instant> }
@@ -91,8 +112,9 @@ impl Monitor {
                     };
                     *state = ScanState { at: started, result };
                 }
-                // Schedule at <=1 second, leave margin for the two-second fence.
-                while started.elapsed() < Duration::from_secs(1) && !worker_stop.load(Ordering::Relaxed) {
+                // Schedule at <=1 second (`SCAN_PERIOD`), leave margin for the
+                // two-second fence (`scan_fresh`).
+                while started.elapsed() < SCAN_PERIOD && !worker_stop.load(Ordering::Relaxed) {
                     std::thread::sleep(Duration::from_millis(25));
                 }
             }
@@ -124,7 +146,7 @@ pub(super) struct ScanReader { pub(super) state: Arc<Mutex<ScanState>>, pub(supe
 impl Scan for ScanReader {
     fn health(&mut self, employee: EmployeeId) -> Result<()> {
         let state = self.state.try_lock().map_err(|_| unavailable())?;
-        if state.at.elapsed() >= Duration::from_secs(2) { return Err(unavailable()); }
+        if !scan_fresh(Instant::now(), state.at, SCAN_PERIOD) { return Err(unavailable()); }
         if state.result.as_ref().map_err(|e| *e)?.contains(&employee) { return Err(unavailable()); }
         Ok(())
     }
@@ -146,10 +168,44 @@ impl Scan for ScanReader {
     }
     fn scan(&mut self) -> Result<Vec<EmployeeId>> {
         let mut state = self.state.try_lock().map_err(|_| unavailable())?;
-        if state.at.elapsed() >= Duration::from_secs(2) { return Err(unavailable()); }
+        if !scan_fresh(Instant::now(), state.at, SCAN_PERIOD) { return Err(unavailable()); }
         let result = state.result.clone();
         if result.is_ok() { state.result = Ok(vec![]); }
         result
     }
 }
 impl Drop for Monitor { fn drop(&mut self) { self.stop.store(true, Ordering::Relaxed); } }
+
+#[cfg(test)]
+mod freshness_tests {
+    use super::*;
+    /// R8w item 3: fresh within one period plus one period of grace, stale
+    /// after; the exact pre-fix flapping window (start between 1 s and
+    /// 1 s + one scan's duration ago, the next result not stored yet) is fresh.
+    #[test]
+    fn scan_freshness_covers_one_scan_duration_and_detects_a_stopped_monitor() {
+        assert_eq!(SCAN_PERIOD, Duration::from_secs(1));
+        let started = Instant::now();
+        let at = |ms: u64| started + Duration::from_millis(ms);
+        for fresh in [0, 1, 300, 700, 999, 1_000, 1_050, 1_300, 1_700, 1_999] {
+            assert!(scan_fresh(at(fresh), started, SCAN_PERIOD), "{fresh} ms");
+        }
+        for stale in [2_000, 2_001, 2_500, 3_000, 60_000] {
+            assert!(!scan_fresh(at(stale), started, SCAN_PERIOD), "{stale} ms");
+        }
+        // The observed flapping: a 50–700 ms scan started a second ago and
+        // not yet stored; the pre-fix rule (`elapsed < 1 s`) read it stale.
+        for scan_ms in [50, 300, 700] {
+            let now = at(1_000 + scan_ms - 1);
+            assert!(now.saturating_duration_since(started) >= SCAN_PERIOD, "pre-fix: stale");
+            assert!(scan_fresh(now, started, SCAN_PERIOD), "now fresh ({scan_ms} ms scan)");
+        }
+        // A clock read before the stamp (another thread) is not an age.
+        assert!(scan_fresh(started, at(5), SCAN_PERIOD));
+        // Derived from the one period: a different period scales the window.
+        assert!(scan_fresh(at(3_999), started, Duration::from_secs(2)));
+        assert!(!scan_fresh(at(4_000), started, Duration::from_secs(2)));
+        // A stopped monitor is detected within the bound admission needs (≤ 3 s).
+        assert!(!scan_fresh(at(3_000), started, SCAN_PERIOD));
+    }
+}
