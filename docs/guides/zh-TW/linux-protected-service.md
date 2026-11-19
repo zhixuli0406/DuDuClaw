@@ -230,6 +230,8 @@ OpenAI 相容執行環境的 `reason` 是執行程式的固定原因（清單見
 sudo journalctl -u duduclaw-gateway.service --no-pager | grep -E 'isolated run (not started|refused)'
 ```
 
+成功回覆後的背景模型呼叫可能出現 `authorize.utility_call`（或其他輔助呼叫代號），以及僅限員工回合結束後的自我改善呼叫、沒有已擷取的聊天身分時出現的 `authorization.ingress.no_scope`。這些是受保護模式中預期的拒絕，不代表使用者的回合失敗。日誌會以 DEBUG 記錄 `isolated background call not available in protected mode`；服務程序存續期間，每位員工的每個代號只記一次 INFO 提示（`protected mode: background model calls are not run for this employee`，提示數有上限）。聊天回合、排程任務、提醒或委派工作出現的 `no_scope` 都是真正的拒絕，即使在自主作用域內，仍會記為警告（WARN）。
+
 | `site` 群組 | 代號 | 要檢查的項目 |
 | --- | --- | --- |
 | 前置檢查（尚未使用任何授權） | `preflight.model`、`preflight.runtime_policy`、`preflight.model_policy`、`preflight.redaction`、`preflight.interceptor`；`authorize.agent_dir_missing`、`authorize.effort`、`authorize.utility_call`、`authorize.work_dir_override`、`authorize.agent_dir`、`authorize.capabilities_policy`、`authorize.native_gate`、`authorize.runtime_kind`、`authorize.explore_lane`、`authorize.tool_restrictions`、`authorize.codex_home`、`authorize.product_policy`、`authorize.interceptor`、`authorize.runtime_id`、`authorize.max_turns`；`step_limit.agent_dir`、`step_limit.unavailable` | 員工的 `agent.toml`（`[model] effort`、`[capabilities]`）、執行環境與模型的產品政策、遮罩與 CCR 設定。 |
@@ -387,7 +389,8 @@ sudo journalctl -u duduclaw-egress.service --no-pager | grep terminal_code
 
 | `terminal_code` | `terminal_detail` | 意義 |
 | --- | --- | --- |
-| `unavailable` | `peer_closed` | 這次執行的轉送程式關閉了連線，正常結束也是這個值。 |
+| `closed` | `peer_closed` | 工作結束後，沙箱端在兩個 frame 之間關閉連線。 |
+| `unavailable` | `peer_closed` | frame 傳輸中斷，或連線發生錯誤。 |
 | `unavailable` | `revoked` | spawn 服務結束了這次執行，或控制連線中斷。 |
 | `resource_limit` | `total_bytes`、`total_connections` | 達到 `run_caps` 的總量上限。只有在流量確實符合預期時，才調高 `/etc/duduclaw/egress.json` 中的上限。 |
 | `resource_limit` | `max_tunnels` | 同時開啟的連線數達到 `max_tunnels`。 |

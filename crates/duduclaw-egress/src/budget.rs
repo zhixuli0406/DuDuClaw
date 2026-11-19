@@ -45,7 +45,7 @@ pub enum TerminalDetail {
     FrameTimeout,
     /// `timeout`: the forwarder did not accept a frame within `idle_timeout_ms`.
     WriteTimeout,
-    /// `unavailable`: the forwarder closed the run socket (normal end included).
+    /// `closed` for a clean end; `unavailable` for an interrupted frame or I/O failure.
     PeerClosed,
     /// `unavailable`: spawnd unregistered the run or the controller went away.
     Revoked,
@@ -55,9 +55,13 @@ pub enum TerminalDetail {
 
 /// A terminal code with its fixed detail. Converts to the wire code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Terminal { pub code: EgressError, pub detail: TerminalDetail }
+pub struct Terminal { pub code: EgressError, pub detail: TerminalDetail, pub(crate) clean_end: bool }
 impl Terminal {
-    pub const fn new(code: EgressError, detail: TerminalDetail) -> Self { Self { code, detail } }
+    pub const fn new(code: EgressError, detail: TerminalDetail) -> Self { Self { code, detail, clean_end: false } }
+    /// EOF between frames is a clean journal end; the wire error stays unchanged.
+    pub(crate) const fn closed() -> Self {
+        Self { code: EgressError::Unavailable, detail: TerminalDetail::PeerClosed, clean_end: true }
+    }
     pub const fn limit(detail: TerminalDetail) -> Self { Self::new(EgressError::ResourceLimit, detail) }
 }
 impl From<Terminal> for EgressError {
@@ -72,7 +76,7 @@ impl From<EgressError> for Terminal {
             EgressError::Unavailable => TerminalDetail::PeerClosed,
             EgressError::ResourceLimit | EgressError::DestinationDenied | EgressError::PortDenied => TerminalDetail::Internal,
         };
-        Self { code, detail }
+        Self { code, detail, clean_end: false }
     }
 }
 

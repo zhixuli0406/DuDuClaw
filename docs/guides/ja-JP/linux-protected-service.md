@@ -224,11 +224,13 @@ OpenAI 互換ランタイムの `reason` はワーカーの固定理由です（
 | 這次工作超過時間上限而停止。 | `timeout` | この作業の制限時間、またはプロバイダーの応答の遅さ。 |
 | 受保護模式尚無這次工作的隔離執行授權，或所選執行設定尚未通過驗證；請由管理員檢查服務狀態。 | その他、または `unrecognised` | 準備完了の状態とジャーナルの `reason`、`exit`。「準備完了エラーの調査」を参照。 |
 
-作業が**実行の開始前に**拒否された場合は、代わりに警告 `isolated run not started` が 1 件記録されます。フィールドは `runtime`、`agent`（社員ラベル）、`site` です。`site` は拒否された場所を示す固定ラベルです。実行が始まったのに上の行を残さずに終わった場合（パイプがない、または正常終了したが結果を使えない）は、同じフィールドで `isolated run refused after start` が記録されます。失敗した保護作業 1 件につき、この 3 種類のうち 1 行だけが記録されます。リクエストの内容、パス、社員ラベル以外の識別子は記録しません。利用者に表示されるメッセージは変わりません。
+作業が**実行の開始前に**拒否された場合は、代わりに警告 `isolated run not started` が 1 件記録されます。フィールドは `runtime`、`agent`（社員ラベル）、`site` です。`site` は拒否された場所を示す固定ラベルです。実行が始まったのに上の行を残さずに終わった場合（パイプがない、または正常終了したが結果を使えない）は、同じフィールドで `isolated run refused after start` が記録されます。失敗した利用者の保護作業 1 件につき、この 3 種類のうち 1 行だけが記録されます。リクエストの内容、パス、社員ラベル以外の識別子は記録しません。利用者に表示されるメッセージは変わりません。
 
 ```sh
 sudo journalctl -u duduclaw-gateway.service --no-pager | grep -E 'isolated run (not started|refused)'
 ```
+
+正常に応答したターンの後のバックグラウンドモデル呼び出しでは、`authorize.utility_call`（または別の補助呼び出しラベル）が出ることがあります。また、社員のターン終了後の自己改善呼び出しで取得済みのチャット本人情報がない場合に限り、`authorization.ingress.no_scope` は想定された拒否です。これらは保護モードで想定された拒否であり、利用者のターンが失敗したことを意味しません。`isolated background call not available in protected mode` を DEBUG で記録し、サービスプロセスの存続中、スタッフとラベルの組み合わせごとに INFO を 1 回だけ記録します（`protected mode: background model calls are not run for this employee`。通知数には上限があります）。チャットターン、スケジュールタスク、リマインダー、委任された作業での `no_scope` は実際の拒否であり、自律的な処理のスコープ内でも引き続き警告（WARN）として記録されます。
 
 | `site` のグループ | ラベル | 確認すること |
 | --- | --- | --- |
@@ -387,7 +389,8 @@ sudo journalctl -u duduclaw-egress.service --no-pager | grep terminal_code
 
 | `terminal_code` | `terminal_detail` | 意味 |
 | --- | --- | --- |
-| `unavailable` | `peer_closed` | 実行のフォワーダーが接続を閉じました。正常終了もこの値になります。 |
+| `closed` | `peer_closed` | 作業終了後、サンドボックス側がフレーム間で接続を閉じました。 |
+| `unavailable` | `peer_closed` | フレームの転送が中断されたか、接続に障害が発生しました。 |
 | `unavailable` | `revoked` | spawn サービスが実行を終了したか、制御接続が切れました。 |
 | `resource_limit` | `total_bytes`、`total_connections` | `run_caps` の合計上限に達しました。通信量が想定どおりの場合に限り、`/etc/duduclaw/egress.json` の上限を引き上げてください。 |
 | `resource_limit` | `max_tunnels` | 同時に開いた接続数が `max_tunnels` に達しました。 |

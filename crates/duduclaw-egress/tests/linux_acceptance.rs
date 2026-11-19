@@ -4,7 +4,7 @@
 #![cfg(target_os = "linux")]
 #![allow(unsafe_code)]
 use std::{net::SocketAddr, time::Duration};
-use duduclaw_egress::{controller::{EgressController, RootEgressController}, resolver::{HostResolver, Resolver}, session::{read_frame, write_frame}, transport::CheckedSocket};
+use duduclaw_egress::{controller::{EgressController, RootEgressController}, resolver::{HostResolver, Resolver}, session::{JournalTerminalCode, read_frame, write_frame}, transport::CheckedSocket};
 use duduclaw_isolation::{bounded::{List, Text}, egress::*, ids::RunId};
 
 #[test]
@@ -193,7 +193,7 @@ async fn iso_root_concurrent_live_tunnels_and_byte_cap() {
         write_frame(&mut client,EgressMessage::Data{tunnel_id:TunnelId(1),bytes:List::new(vec![9;513]).unwrap()},&limits).await.unwrap();
         let audit=task.await.unwrap();
         assert_eq!(audit.bytes,512);assert_eq!(audit.connection_attempts,2);
-        assert_eq!(audit.terminal_code,EgressError::ResourceLimit);
+        assert_eq!(audit.terminal_code,JournalTerminalCode::Error(EgressError::ResourceLimit));
         assert_eq!(audit.terminal_detail,duduclaw_egress::budget::TerminalDetail::TotalBytes);
         assert!(read_frame(&mut client,&limits).await.is_err());
     }).await.unwrap();

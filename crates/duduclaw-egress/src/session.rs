@@ -28,7 +28,10 @@ fn read_failed(error: std::io::Error) -> Terminal {
 }
 /// [`read_frame_started`] with the run record's fixed detail (R8z-6).
 async fn read_frame_detailed<R: AsyncRead + Unpin>(reader: &mut R, limits: &EgressLimits) -> Result<EgressMessage, Terminal> {
-    let first = reader.read_u8().await.map_err(read_failed)?;
+    let first = reader.read_u8().await.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::UnexpectedEof { Terminal::closed() }
+        else { read_failed(error) }
+    })?;
     tokio::time::timeout(Duration::from_millis(limits.idle_timeout_ms.get().into()), async {
         let mut header = [first, 0, 0, 0];
         reader.read_exact(&mut header[1..]).await.map_err(read_failed)?;
@@ -106,6 +109,26 @@ async fn connect(resolver: &dyn Resolver, target: &ConnectTarget, profile: &Egre
     }).await.map_err(|_| EgressError::Timeout)?
 }
 
+/// Journal-only code. Error serialization delegates to the unchanged wire enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JournalTerminalCode { Closed, Error(EgressError) }
+impl From<EgressError> for JournalTerminalCode {
+    fn from(code: EgressError) -> Self { Self::Error(code) }
+}
+impl serde::Serialize for JournalTerminalCode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Closed => serializer.serialize_str("closed"),
+            Self::Error(code) => serde::Serialize::serialize(code, serializer),
+        }
+    }
+}
+impl From<Terminal> for JournalTerminalCode {
+    fn from(terminal: Terminal) -> Self {
+        if terminal.clean_end { Self::Closed } else { Self::Error(terminal.code) }
+    }
+}
+
 /// One journal line per run. `terminal_detail` (R8z-6) is a fixed label
 /// derived where the run ended; it never carries a host, address or content.
 #[derive(Debug, serde::Serialize)]
@@ -114,7 +137,7 @@ pub struct AuditRecord {
     pub profile_id: ProfileId,
     pub bytes: u64,
     pub connection_attempts: u32,
-    pub terminal_code: EgressError,
+    pub terminal_code: JournalTerminalCode,
     pub terminal_detail: TerminalDetail,
 }
 
@@ -141,14 +164,14 @@ pub async fn serve_run_limited(socket: CheckedSocket, run: RunId, profile: Egres
             // Same prompt end for the forwarder as after a served run.
             crate::transport::shutdown_both(socket.raw_fd());
             return AuditRecord { run_id: run, profile_id: profile.id, bytes: 0, connection_attempts: 0,
-                terminal_code: code, terminal_detail: TerminalDetail::InvalidLimits };
+                terminal_code: code.into(), terminal_detail: TerminalDetail::InvalidLimits };
         }
     };
     let result = run_loop(socket, &profile, resolver, &mut budget, cancel, global).await;
     let (bytes, connection_attempts) = budget.totals();
-    let terminal = result.err().unwrap_or(Terminal::new(EgressError::Unavailable, TerminalDetail::PeerClosed));
+    let terminal = result.err().unwrap_or(Terminal::closed());
     AuditRecord { run_id: run, profile_id: profile.id, bytes, connection_attempts,
-        terminal_code: terminal.code, terminal_detail: terminal.detail }
+        terminal_code: terminal.into(), terminal_detail: terminal.detail }
 }
 
 const fn protocol_state() -> Terminal { Terminal::new(EgressError::InvalidRequest, TerminalDetail::ProtocolState) }
@@ -442,11 +465,44 @@ mod tests {
         assert_eq!(chunk_bytes(&default_limits()), MAX_TUNNEL_CHUNK_BYTES);
     }
 
+    #[tokio::test]
+    async fn clean_eof_is_closed_but_interrupted_frame_keeps_error_code() {
+        let limits = default_limits();
+        for (input, code) in [
+            (Vec::new(), JournalTerminalCode::Closed),
+            (vec![0], JournalTerminalCode::Error(EgressError::Unavailable)),
+            (vec![0, 0, 0, 2, 1], JournalTerminalCode::Error(EgressError::Unavailable)),
+        ] {
+            let mut reader = input.as_slice();
+            let terminal = read_frame_detailed(&mut reader, &limits).await.unwrap_err();
+            assert_eq!(terminal.code, EgressError::Unavailable);
+            assert_eq!(terminal.detail, TerminalDetail::PeerClosed);
+            assert_eq!(JournalTerminalCode::from(terminal), code);
+            let record = AuditRecord { run_id: RunId([1; 16]),
+                profile_id: ProfileId(duduclaw_isolation::ids::Sha256Digest([2; 32])),
+                bytes: 0, connection_attempts: 0, terminal_code: terminal.into(), terminal_detail: terminal.detail };
+            let json = serde_json::to_value(record).unwrap();
+            assert_eq!(json["terminal_code"], if input.is_empty() { "closed" } else { "unavailable" });
+            assert_eq!(json["terminal_detail"], "peer_closed");
+        }
+    }
+
+    #[test]
+    fn journal_error_termination_codes_are_unchanged() {
+        for code in [EgressError::InvalidRequest, EgressError::Timeout, EgressError::Unavailable,
+            EgressError::ResourceLimit, EgressError::DestinationDenied, EgressError::PortDenied] {
+            assert_eq!(serde_json::to_value(JournalTerminalCode::from(code)).unwrap(), serde_json::to_value(code).unwrap());
+        }
+        let reset = read_failed(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+        assert_eq!(JournalTerminalCode::from(reset), JournalTerminalCode::Error(EgressError::Unavailable));
+        assert_eq!(reset.detail, TerminalDetail::PeerClosed);
+    }
+
     /// The run record's detail is a fixed label next to the code.
     #[test]
     fn audit_record_carries_the_fixed_detail() {
         let record = AuditRecord { run_id: RunId([1; 16]), profile_id: ProfileId(duduclaw_isolation::ids::Sha256Digest([2; 32])),
-            bytes: 41131, connection_attempts: 1, terminal_code: EgressError::ResourceLimit, terminal_detail: TerminalDetail::TotalBytes };
+            bytes: 41131, connection_attempts: 1, terminal_code: EgressError::ResourceLimit.into(), terminal_detail: TerminalDetail::TotalBytes };
         let json = serde_json::to_value(&record).unwrap();
         assert_eq!(json["terminal_code"], "resource_limit");
         assert_eq!(json["terminal_detail"], "total_bytes");

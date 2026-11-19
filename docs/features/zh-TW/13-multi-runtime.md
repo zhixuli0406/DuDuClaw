@@ -186,6 +186,8 @@ Grok 在管線模式回傳空白內容時，不再使用 PTY 重試，因該路�
 
 背景決策確認、指令擷取、事實擷取與對話壓縮，Claude、Codex 與 OpenAI 相容 API 員工沿用自己的後端。明確填寫且非空白的 `[model] utility` 優先；否則 Claude 使用 `claude-haiku-4-5`，Codex 與 OpenAI 相容 API 沿用 `[model] preferred`。兩者都空白時，Codex 省略 `-m`、使用 CLI 預設模型；OpenAI 相容 API 則拒絕呼叫。Grok 與通用 CLI 員工改用全域背景設定。明確指定的輔助模型與後端屬於不同廠商家族時，儀表板會顯示警告。
 
+受保護模式的員工在所有執行環境都會拒絕這些模型輔助呼叫，詳見[受保護模式中的模型輔助功能](77-protected-mode.md#auxiliary-model-functions-in-protected-mode)。
+
 Claude 輔助呼叫先清空繼承的環境、套用共用 spawn 白名單，再從一般 Claude 無輪替路徑相同的來源注入 Anthropic API key（OAuth 保留原有 HOME／鑰匙圈／設定目錄），走輕量路徑，不進入帳號輪替；一般對話仍保留原有帳號輪替。
 
 輔助呼叫（含分類與評審）使用專用執行模式。Claude 使用無工具、單回合的輕量路徑；OpenAI 相容 API 只送出一次不帶工具的請求，不進入工具迴圈。Codex 使用受限模式：唯讀沙箱、不注入平台 MCP 設定、每次建立只有擁有者能存取的空白暫存工作目錄、忽略使用者設定，且不保存工作階段。呼叫結束後刪除暫存目錄，包含錯誤與逾時；系統提示放進 prompt，不寫入 `AGENTS.md`。明確指定 Codex 的 judge 與團隊 verifier 也使用此模式。Grok 與通用 CLI 仍不支援輔助執行，員工背景工作改用全域輔助後端／模型（預設 Claude／`claude-haiku-4-5`），每個員工／後端組合記錄一次警告。全域後端必須是 Claude、Codex 或 OpenAI 相容 API；不支援的全域後端或明確指定會被拒絕。明確指定的 Codex 判官遭拒時直接使驗收失敗，不以預設判官重試；其他後端維持既有降級策略。Codex 可能保留內建讀取工具，剩餘風險見[安全防禦](05-security-defense.md)。
