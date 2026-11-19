@@ -68,7 +68,31 @@ struct Entry {
     /// entry (diagnosis only; first cause wins). `None` for every other
     /// revocation (release, sweep, control loss, connection drop).
     cause: Option<ContextStep>,
+    /// R8z-7: when the latest full live check of this entry that succeeded
+    /// STARTED, among the checks of an activated connection's own reads (its
+    /// request contexts and live watch, `verify_live`); activation does not
+    /// count, so an active entry that is not being served is checked by every
+    /// sweep. Read only by [`Boundary::sweep`], never as authority for a request.
+    live_ok: Option<std::time::Instant>,
 }
+impl Entry {
+    /// R8z-7: record a successful full live check that started at `started`.
+    fn checked_at(&mut self, started: std::time::Instant) {
+        if self.live_ok.is_none_or(|at| at < started) { self.live_ok = Some(started); }
+    }
+}
+
+/// R8z-7: the gateway's lifecycle sweep runs every second
+/// (`duduclaw-gateway` `isolation_mcp.rs`). An active entry whose own full
+/// live check started less than this long ago and succeeded was already
+/// checked within the sweep's period, so the sweep does not repeat it.
+const SWEEP_REUSE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// R8z-7: the live watch of a served connection: a full verification starts
+/// no later than this long after the connection's previous one completed
+/// (any of them: admission, a request's, or the watch's own).
+#[cfg(target_os = "linux")]
+pub(crate) const WATCH_PERIOD: std::time::Duration = std::time::Duration::from_millis(100);
 impl Entry {
     fn revoke(&mut self) {
         self.state = State::Revoked;
@@ -183,7 +207,7 @@ impl Boundary {
         }
         entries.insert(id.0, Entry { record, mac, control: reservation.control,
             agent_slug: snapshot.agent_slug, state: State::Pending, revoked: tokio::sync::watch::channel(false).0,
-            cause: None });
+            cause: None, live_ok: None });
         Ok(id)
     }
 
@@ -255,7 +279,8 @@ impl Boundary {
         if let Err(refusal) = live { entry.revoke(); return Err(refusal); }
         entry.state = State::Active(nonce);
         Ok(Connection { boundary: self.clone(), id, nonce,
-            #[cfg(target_os = "linux")] socket: None })
+            #[cfg(target_os = "linux")] socket: None,
+            #[cfg(target_os = "linux")] watch_period: WATCH_PERIOD })
     }
 
     pub fn revoke_run(&self, run: RunHandle) -> Result<(), VerificationError> {
@@ -279,13 +304,21 @@ impl Boundary {
     /// Run from the gateway's lifecycle sweep even when no socket has arrived.
     /// A queued/starting run may outlive its consumed reservation, but an unused
     /// reservation, dead control connection or unreadable authority never may.
+    ///
+    /// R8z-7: an active entry whose own full live check (a served
+    /// connection's watch or request read) started less than [`SWEEP_REUSE`]
+    /// ago and succeeded is not checked again here: it has been fully checked
+    /// within the sweep's period, and that check revokes on failure exactly
+    /// as this one would. Expiry is still checked on every pass.
     pub fn sweep(&self, now: u64) -> Result<(), VerificationError> {
         let entries: Vec<_> = self.entries.lock().map_err(|_| VerificationError::Unavailable)?
             .iter().map(|(id, entry)| (*id, entry.clone())).collect();
         for (id, entry) in entries {
             if entry.state == State::Revoked { continue; }
             let valid = if now >= entry.record.expires_at { false }
-            else if matches!(entry.state, State::Active(_)) { self.check_live(&entry, now).is_ok() }
+            else if matches!(entry.state, State::Active(_)) {
+                entry.live_ok.is_some_and(|at| at.elapsed() < SWEEP_REUSE) || self.check_live(&entry, now).is_ok()
+            }
             else { self.live.snapshot(entry.record.employee, RunHandle(entry.record.run)).is_ok_and(|s| {
                 s.run.0 == entry.record.run && s.employee == entry.record.employee && s.control == entry.control
                     && s.principal == entry.record.principal && s.binding == entry.record.employee_binding
@@ -310,8 +343,12 @@ impl Boundary {
 impl Boundary {
     /// R8z-5: [`CapabilityVerifier::verify`] with the fixed check that
     /// refused (same checks, order, errors and revocation as `verify`).
+    ///
+    /// R8z-7: `dispatch` arms the returned context's single-use dispatch
+    /// proof ([`RequestContext::take_dispatch_proof`]); only the MCP server's
+    /// pre-dispatch read of a request sets it.
     fn verify_checked(&self, record: &CapabilityRecord, proof: CapabilityProof<'_>, binding: &ConnectionBinding,
-        now: u64) -> Result<RequestContext, (ContextStep, VerificationError)> {
+        now: u64, dispatch: bool) -> Result<RequestContext, (ContextStep, VerificationError)> {
         use ContextStep as S;
         let revoked = (S::Revoked, VerificationError::Revoked);
         let bytes = record.canonical_bytes().map_err(|_| (S::Proof, VerificationError::Invalid))?;
@@ -328,6 +365,7 @@ impl Boundary {
         if !matches!(snapshot.state, State::Active(_)) || &snapshot.record != record {
             return Err(revoked);
         }
+        let started = std::time::Instant::now();
         let live = self.check_live_checked(&snapshot, now);
         let mut entries = self.entries.lock().map_err(|_| (S::StateLock, VerificationError::Unavailable))?;
         let entry = entries.get_mut(&record.id.0).ok_or(revoked)?;
@@ -346,11 +384,13 @@ impl Boundary {
             return Err((step, error));
         }
         let State::Active(nonce) = entry.state else { return Err(revoked); };
+        entry.checked_at(started);
         // HX5 [F7]: this context came from the run's own activated MCP
         // connection; the binding's run (== record.run, checked above) is the
         // transport run that in-run helper calls must target.
         Ok(RequestContext::with_transport(record.clone(), Arc::new(RequestAuthority {
             boundary: self.weak.clone(), id: record.id, nonce,
+            dispatch: std::sync::atomic::AtomicBool::new(dispatch),
         }), binding.run))
     }
 }
@@ -358,7 +398,7 @@ impl Boundary {
 impl CapabilityVerifier for Boundary {
     fn verify(&self, record: &CapabilityRecord, proof: CapabilityProof<'_>, binding: &ConnectionBinding,
         now: u64) -> Result<RequestContext, VerificationError> {
-        self.verify_checked(record, proof, binding, now).map_err(|(_, error)| error)
+        self.verify_checked(record, proof, binding, now, false).map_err(|(_, error)| error)
     }
 }
 
@@ -368,6 +408,10 @@ struct RequestAuthority {
     boundary: Weak<Boundary>,
     id: CapabilityId,
     nonce: [u8; 16],
+    /// R8z-7: the single-use dispatch proof (armed only by the server's
+    /// pre-dispatch read; consumed by the turn resolution of that dispatch,
+    /// or by the server when the request's handler ends).
+    dispatch: std::sync::atomic::AtomicBool,
 }
 impl LiveRequestVerifier for RequestAuthority {
     fn verify_live(&self, record: &CapabilityRecord, now: u64) -> Result<(), VerificationError> {
@@ -377,12 +421,17 @@ impl LiveRequestVerifier for RequestAuthority {
         if snapshot.state != State::Active(self.nonce) || &snapshot.record != record {
             return Err(VerificationError::Revoked);
         }
+        let started = std::time::Instant::now();
         let live = boundary.check_live(&snapshot, now);
         let mut entries = boundary.entries.lock().map_err(|_| VerificationError::Unavailable)?;
         let entry = entries.get_mut(&self.id.0).ok_or(VerificationError::Revoked)?;
         if entry.state != snapshot.state { return Err(VerificationError::Revoked); }
         if let Err(error) = live { entry.revoke(); return Err(error); }
+        entry.checked_at(started);
         Ok(())
+    }
+    fn take_dispatch_proof(&self) -> bool {
+        self.dispatch.swap(false, std::sync::atomic::Ordering::AcqRel)
     }
 }
 
@@ -394,6 +443,10 @@ pub struct Connection {
     nonce: [u8; 16],
     #[cfg(target_os = "linux")]
     pub(crate) socket: Option<std::os::unix::net::UnixStream>,
+    /// R8z-7: the live watch period of this connection's session
+    /// ([`WATCH_PERIOD`]; tests lengthen it to count reads exactly).
+    #[cfg(target_os = "linux")]
+    pub(crate) watch_period: std::time::Duration,
 }
 impl Connection {
     #[cfg(any(target_os = "linux", test))]
@@ -409,7 +462,10 @@ impl Connection {
     #[cfg(target_os = "linux")]
     pub(crate) fn verifier(&self) -> ConnectionVerifier {
         ConnectionVerifier { boundary: self.boundary.clone(), id: self.id, nonce: self.nonce,
-            serial: Arc::new(tokio::sync::Semaphore::new(1)) }
+            serial: Arc::new(tokio::sync::Semaphore::new(1)),
+            // As before R8z-7, the watch's first read is one period after the
+            // session starts (or after admission's read, if that is later).
+            completed: Mutex::new(tokio::time::Instant::now()), period: self.watch_period }
     }
     pub fn agent_slug(&self) -> Result<String, VerificationError> {
         let entries = self.boundary.entries.lock().map_err(|_| VerificationError::Unavailable)?;
@@ -425,11 +481,12 @@ impl Connection {
 
 fn verified_context(boundary: &Arc<Boundary>, id: CapabilityId, nonce: [u8; 16], now: u64)
     -> Result<RequestContext, VerificationError> {
-    verified_context_checked(boundary, id, nonce, now).map_err(|(_, error)| error)
+    verified_context_checked(boundary, id, nonce, now, false).map_err(|(_, error)| error)
 }
 
 /// R8z-5: [`verified_context`] with the fixed check that refused.
-fn verified_context_checked(boundary: &Arc<Boundary>, id: CapabilityId, nonce: [u8; 16], now: u64)
+/// R8z-7: `dispatch` as for [`Boundary::verify_checked`].
+fn verified_context_checked(boundary: &Arc<Boundary>, id: CapabilityId, nonce: [u8; 16], now: u64, dispatch: bool)
     -> Result<RequestContext, (ContextStep, VerificationError)> {
         let (record, mac) = {
             let entries = boundary.entries.lock().map_err(|_| (ContextStep::StateLock, VerificationError::Unavailable))?;
@@ -441,7 +498,7 @@ fn verified_context_checked(boundary: &Arc<Boundary>, id: CapabilityId, nonce: [
         };
         let binding = ConnectionBinding { capability: record.id, employee: record.employee,
             run: record.run, gateway_epoch: record.gateway_epoch };
-        boundary.verify_checked(&record, CapabilityProof(&mac), &binding, now)
+        boundary.verify_checked(&record, CapabilityProof(&mac), &binding, now, dispatch)
 }
 
 /// Blocking authority I/O shares one bounded pool. Cancellation or timeout
@@ -461,11 +518,27 @@ where T: Send + 'static, F: FnOnce() -> Result<T, VerificationError> + Send + 's
         .map_err(|_| VerificationError::Unavailable)?.map_err(|_| VerificationError::Unavailable)?
 }
 
+/// One full live verification of a served connection at a time (`serial`).
+///
+/// R8z-7: every read of the session — admission, a request's pre-dispatch
+/// read, the read after its handler, and the live watch — is a FULL
+/// verification that starts after the caller asked for it; none reuses a
+/// result. The only sharing is in the watch's direction: the watch needs "a
+/// full verification at most [`WATCH_PERIOD`] after the previous one
+/// completed", and a request's read is one, so the watch waits a period from
+/// the latest completed read of ANY kind instead of running its own right
+/// before or after a request's (before R8z-7 it ran back to back with them,
+/// holding `serial` while the request's read queued behind it).
 #[cfg(target_os = "linux")]
 pub(crate) struct ConnectionVerifier {
     boundary: Arc<Boundary>, id: CapabilityId, nonce: [u8; 16],
     serial: Arc<tokio::sync::Semaphore>,
+    /// R8z-7: when this connection's latest SUCCESSFUL read completed.
+    completed: Mutex<tokio::time::Instant>,
+    period: std::time::Duration,
 }
+#[cfg(target_os = "linux")]
+type Permit = tokio::sync::OwnedSemaphorePermit;
 #[cfg(target_os = "linux")]
 impl ConnectionVerifier {
     #[cfg(test)]
@@ -478,16 +551,58 @@ impl ConnectionVerifier {
     /// blocking job returns its step as a value (`Ok(Err(..))`), an `Err` is
     /// only ever the blocking-pool wrapper's.
     pub(crate) async fn context_checked(&self) -> Result<RequestContext, (ContextStep, VerificationError)> {
+        let permit = self.acquire().await?;
+        self.verify_with(permit, false).await
+    }
+
+    /// R8z-7: [`Self::context_checked`] for the request about to be
+    /// dispatched (call it only after that request's frame was read). Same
+    /// checks and errors; the returned context also carries the single-use
+    /// dispatch proof, so the dispatch's own turn resolution does not repeat
+    /// this full verification (`RequestContext::take_dispatch_proof`).
+    pub(crate) async fn dispatch_context_checked(&self) -> Result<RequestContext, (ContextStep, VerificationError)> {
+        let permit = self.acquire().await?;
+        self.verify_with(permit, true).await
+    }
+
+    /// R8z-7: one step of the live watch. Resolves after the next full
+    /// verification the watch itself ran (`Err` exactly as
+    /// [`Self::context_checked`]); never runs one sooner than a period after
+    /// the latest completed read. The due time is checked again once the
+    /// connection's slot is held: a read that completed while the watch
+    /// waited for the slot moves the next watch read a period later.
+    pub(crate) async fn watch_checked(&self) -> Result<(), (ContextStep, VerificationError)> {
+        loop {
+            tokio::time::sleep_until(self.due()?).await;
+            let permit = self.acquire().await?;
+            if tokio::time::Instant::now() < self.due()? {
+                drop(permit);
+                continue;
+            }
+            return self.verify_with(permit, false).await.map(|_| ());
+        }
+    }
+
+    fn due(&self) -> Result<tokio::time::Instant, (ContextStep, VerificationError)> {
+        let completed = self.completed.lock().map_err(|_| (ContextStep::StateLock, VerificationError::Unavailable))?;
+        Ok(*completed + self.period)
+    }
+
+    async fn acquire(&self) -> Result<Permit, (ContextStep, VerificationError)> {
         use ContextStep as S;
-        let permit = tokio::time::timeout(std::time::Duration::from_secs(2), self.serial.clone().acquire_owned())
+        tokio::time::timeout(std::time::Duration::from_secs(2), self.serial.clone().acquire_owned())
             .await.map_err(|_| (S::SerialWait, VerificationError::Unavailable))?
-            .map_err(|_| (S::SerialWait, VerificationError::Unavailable))?;
+            .map_err(|_| (S::SerialWait, VerificationError::Unavailable))
+    }
+
+    async fn verify_with(&self, permit: Permit, dispatch: bool) -> Result<RequestContext, (ContextStep, VerificationError)> {
+        use ContextStep as S;
         let (boundary, id, nonce) = (self.boundary.clone(), self.id, self.nonce);
         let checked = verify_blocking(move || {
             let _permit = permit;
             Ok((|| -> Result<RequestContext, (ContextStep, VerificationError)> {
                 let now = now_seconds().map_err(|error| (S::Clock, error))?;
-                let context = verified_context_checked(&boundary, id, nonce, now)?;
+                let context = verified_context_checked(&boundary, id, nonce, now, dispatch)?;
                 // Root readback may have consumed the remaining capability TTL.
                 let now = now_seconds().map_err(|error| (S::Clock, error))?;
                 if now < context.record().not_before || now >= context.record().expires_at {
@@ -496,10 +611,17 @@ impl ConnectionVerifier {
                 Ok(context)
             })())
         }).await;
-        match checked {
+        let result = match checked {
             Ok(result) => result,
             Err(error) => Err((S::Blocking, error)),
+        };
+        if result.is_ok() {
+            // Only paces the watch; a poisoned lock fails its next step.
+            if let Ok(mut completed) = self.completed.lock() {
+                *completed = (*completed).max(tokio::time::Instant::now());
+            }
         }
+        result
     }
 }
 impl Drop for Connection {
@@ -517,3 +639,8 @@ mod tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "authority_async_tests.rs"]
 mod async_tests;
+
+/// R8z-7: how many full live verifications each request and the watch run.
+#[cfg(test)]
+#[path = "authority_pacing_tests.rs"]
+mod pacing_tests;

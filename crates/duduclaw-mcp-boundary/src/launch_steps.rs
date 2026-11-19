@@ -523,8 +523,9 @@ pub const fn verification_class(error: VerificationError) -> &'static str {
 }
 
 /// R8z-5: the check of a live session's request context that refused
-/// (`ConnectionVerifier::context_checked`: admission, every request, after
-/// every handler, and the 100 ms live watch).
+/// (`ConnectionVerifier`: admission, every request, after every handler
+/// that has a response to publish, and the live watch — at most 100 ms after
+/// the session's previous read completed).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContextStep {
     /// The connection's own authority read stayed busy for 2 s (one read of a
