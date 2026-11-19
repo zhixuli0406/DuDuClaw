@@ -252,16 +252,25 @@ impl RootPolicy {
         Ok(Self { runtimes, employees, launchers: BTreeMap::new(), turn_caps })
     }
     pub fn derive(&self, employee: EmployeeId, request: &RuntimeKind, pty: bool) -> Result<(&PublishedRuntime, LaunchPolicy)> {
-        let profiles = self.employees.get(&employee).ok_or(ErrorCode::RuntimeDenied)?;
+        self.derive_labelled(employee, request, pty).map_err(crate::start_refusal::Refusal::code)
+    }
+    /// R8y: [`Self::derive`] with the step that refused (same code,
+    /// `runtime_denied`, for every exit).
+    pub fn derive_labelled(&self, employee: EmployeeId, request: &RuntimeKind, pty: bool)
+        -> crate::start_refusal::Labelled<(&PublishedRuntime, LaunchPolicy)> {
+        use crate::start_refusal::{at, StartStep};
+        let denied = |step| at(step)(ErrorCode::RuntimeDenied);
+        let profiles = self.employees.get(&employee).ok_or_else(|| denied(StartStep::EntitlementMissing))?;
         let mut matching = self.runtimes.iter().filter(|runtime| runtime.runtime == *request && profiles.contains(&runtime.profile));
-        let runtime = matching.next().ok_or(ErrorCode::RuntimeDenied)?;
+        let runtime = matching.next().ok_or_else(|| denied(StartStep::RuntimeNotEntitled))?;
         // Ambiguous publications cannot silently select a weaker profile.
-        if matching.next().is_some() || (pty && !runtime.pty_allowed) { return Err(ErrorCode::RuntimeDenied); }
+        if matching.next().is_some() { return Err(denied(StartStep::RuntimeAmbiguous)); }
+        if pty && !runtime.pty_allowed { return Err(denied(StartStep::PtyNotAllowed)); }
         let policy = LaunchPolicy { queue_class: runtime.queue_class, queue_ms: runtime.timeouts.queue_ms,
             startup_ms: runtime.timeouts.startup_ms, runtime_ms: runtime.timeouts.runtime_ms,
-            pty_idle_ms: if pty { Some(runtime.timeouts.pty_idle_ms.ok_or(ErrorCode::RuntimeDenied)?) } else { None },
+            pty_idle_ms: if pty { Some(runtime.timeouts.pty_idle_ms.ok_or_else(|| denied(StartStep::LaunchPolicy))?) } else { None },
             ptys: runtime.resources.ptys, pty_size: pty.then_some(duduclaw_isolation::execution::PtySize { rows: 24, columns: 80 }), delivery: IoDelivery { mcp: runtime.mcp, pty } };
-        policy.validate()?;
+        policy.validate().map_err(at(StartStep::LaunchPolicy))?;
         Ok((runtime, policy))
     }
 }
@@ -324,6 +333,29 @@ mod tests {
         let policy = RootPolicy::from_verified_publication(vec![first.clone(), second.clone()], vec![EmployeeEntitlement {
             employee, profiles: vec![first.profile, second.profile], max_turns: None }]).unwrap();
         assert!(policy.derive(employee, &RuntimeKind::Codex, false).is_err());
+    }
+    /// R8y: every derive refusal names its step; the code stays `runtime_denied`.
+    #[test]
+    fn derive_refusals_are_labelled_with_the_same_code() {
+        let employee = EmployeeId([1; 16]);
+        let (first, second) = (runtime(1), runtime(2));
+        let label = |policy: &RootPolicy, employee, kind: RuntimeKind, pty| {
+            let refusal = policy.derive_labelled(employee, &kind, pty).err().unwrap();
+            assert_eq!(refusal.code(), ErrorCode::RuntimeDenied);
+            refusal.step.to_string()
+        };
+        let single = RootPolicy::from_verified_publication(vec![first.clone()], vec![EmployeeEntitlement {
+            employee, profiles: vec![first.profile], max_turns: None }]).unwrap();
+        assert_eq!(label(&single, EmployeeId([2; 16]), RuntimeKind::Codex, false), "entitlement_missing");
+        assert_eq!(label(&single, employee, RuntimeKind::OpenAiCompat, false), "runtime_not_entitled");
+        assert_eq!(label(&single, employee, RuntimeKind::Codex, true), "pty_not_allowed");
+        let doubled = RootPolicy::from_verified_publication(vec![first.clone(), second.clone()], vec![EmployeeEntitlement {
+            employee, profiles: vec![first.profile, second.profile], max_turns: None }]).unwrap();
+        assert_eq!(label(&doubled, employee, RuntimeKind::Codex, false), "runtime_ambiguous");
+        let mut pty = runtime(3); pty.pty_allowed = true;
+        let no_idle = RootPolicy::from_verified_publication(vec![pty.clone()], vec![EmployeeEntitlement {
+            employee, profiles: vec![pty.profile], max_turns: None }]).unwrap();
+        assert_eq!(label(&no_idle, employee, RuntimeKind::Codex, true), "launch_policy");
     }
 
     /// A v3-shaped Claude record: the canonical signed arguments without

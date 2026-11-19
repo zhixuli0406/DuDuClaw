@@ -304,6 +304,122 @@ fn queue(coordinator: &mut Coordinator<FakeHost>, n: u8, emp: u8, runtime: Runti
     coordinator.start(conn(), request(n, emp, runtime), (), 100).unwrap();
 }
 
+/// R8y: every coordinator refusal of a start is recorded exactly once with
+/// its step, and the wire code is the pre-R8y code. (The labelled functions
+/// cannot return an unlabelled refusal at all: `Refusal` has no
+/// `From<ErrorCode>`; this pins the step each exit names.)
+#[test]
+fn r8y_coordinator_start_refusals_are_recorded_with_their_step() {
+    let fresh = || Coordinator::new(FakeHost::default(), Limits::default()).unwrap();
+    let mut c = fresh();
+    assert_eq!(c.start(conn(), request(1, 1, RuntimeKind::Codex), (), 100).unwrap_err(), ErrorCode::NotFound);
+    assert_eq!(c.take_refusals(), vec![StartStep::NotReserved]);
+    c.reserve(conn(), employee(1), run(1), 100).unwrap();
+    assert!(c.take_refusals().is_empty(), "a success records nothing");
+    assert_eq!(c.start(conn(), request(1, 2, RuntimeKind::Codex), (), 100).unwrap_err(), ErrorCode::InvalidRequest);
+    assert_eq!(c.take_refusals(), vec![StartStep::Reservation]);
+    assert_eq!(c.reserve(conn(), employee(1), run(2), 99).unwrap_err(), ErrorCode::IsolationUnavailable);
+    assert_eq!(c.take_refusals(), vec![StartStep::Clock]);
+    // A terminal size bound to the reservation, then a start without PTY.
+    c.resize(run(1), conn(), PtySize { rows: 24, columns: 80 }).unwrap();
+    let plain = c.start(conn(), request(1, 1, RuntimeKind::Codex), (), 100).unwrap_err();
+    assert_eq!((plain, c.take_refusals()), (ErrorCode::InvalidRequest, vec![StartStep::Pty]));
+    // The update drain barrier.
+    let mut c = fresh();
+    c.reserve(conn(), employee(1), run(1), 100).unwrap();
+    let barrier = DrainBarrier::default();
+    assert!(barrier.close(DrainClosure::Unreadable).is_some());
+    c.set_drain_barrier(barrier);
+    assert_eq!(c.start(conn(), request(1, 1, RuntimeKind::Codex), (), 100).unwrap_err(), ErrorCode::NotReady);
+    assert_eq!(c.take_refusals(), vec![StartStep::UpdateDrain]);
+    // A full employee queue, and a stop in progress.
+    let mut c = Coordinator::new(FakeHost::default(), Limits { employee_queue: 1, ..Limits::default() }).unwrap();
+    c.reserve(conn(), employee(1), run(1), 100).unwrap();
+    assert_eq!(c.reserve(conn(), employee(1), run(2), 100).unwrap_err(), ErrorCode::QueueFull);
+    assert_eq!(c.take_refusals(), vec![StartStep::QueueFull]);
+    c.stop_employee_runs(employee(3), 100).unwrap();
+    assert_eq!(c.reserve(conn(), employee(3), run(3), 100).unwrap_err(), ErrorCode::NotReady);
+    assert_eq!(c.take_refusals(), vec![StartStep::Stopping]);
+    // A synchronous host start refusal (adapter default label), once.
+    let mut c = fresh();
+    c.host.fail_start = true;
+    queue(&mut c, 1, 1, RuntimeKind::Codex);
+    c.tick(100).unwrap();
+    assert_eq!(c.take_refusals(), vec![StartStep::HostStart]);
+    c.tick(101).unwrap();
+    assert!(c.take_refusals().is_empty(), "printed once");
+    // A queued run held back until it expires names what held it.
+    let mut c = fresh();
+    c.host.proof = INCOMPLETE;
+    queue(&mut c, 1, 1, RuntimeKind::Codex);
+    c.tick(100).unwrap();
+    assert!(c.take_refusals().is_empty(), "held back is not refused yet");
+    c.tick(10_100).unwrap();
+    assert_eq!(c.status(run(1), conn()).unwrap(), RunStatus::Ended(RunOutcome::QueueTimeout));
+    assert_eq!(c.take_refusals(), vec![StartStep::QueueTimeout(Blocker::CleanupIncomplete)]);
+    assert_eq!(StartStep::QueueTimeout(Blocker::CleanupIncomplete).line(), "start refused: step=queue_timeout(cleanup_incomplete)");
+    // ...or is cancelled by the gateway while held.
+    let mut c = fresh();
+    c.host.proof = INCOMPLETE;
+    queue(&mut c, 1, 1, RuntimeKind::Codex);
+    c.tick(100).unwrap();
+    c.cancel(run(1), conn(), 101).unwrap();
+    assert_eq!(c.take_refusals(), vec![StartStep::QueueCancelled(Blocker::CleanupIncomplete)]);
+    // A run that never reaches Running within its startup budget.
+    let mut c = fresh();
+    c.host.pending_poll = true;
+    queue(&mut c, 1, 1, RuntimeKind::Codex);
+    c.tick(100).unwrap();
+    assert_eq!(c.status(run(1), conn()).unwrap(), RunStatus::Starting);
+    c.tick(1_100).unwrap();
+    assert_eq!(c.take_refusals(), vec![StartStep::StartupTimeout]);
+    // R8y review round 1 (F2): the pending list is one (step, count) per
+    // label, so a burst beyond the old 256-entry buffer loses nothing.
+    let mut c = fresh();
+    for _ in 0..1_000 { c.note_refusal(StartStep::Peer); }
+    c.note_refusal(StartStep::Fds);
+    c.note_refusal(StartStep::Peer);
+    assert_eq!(c.take_refusal_counts(), vec![(StartStep::Peer, 1_001), (StartStep::Fds, 1)]);
+    assert!(c.take_refusal_counts().is_empty());
+    // The coordinator's tally through the server's limiter: every refusal is
+    // accounted for (printed or in the window's `suppressed=` count).
+    let t0 = std::time::Instant::now();
+    let mut limiter = crate::start_refusal::LineLimiter::new("start refused", crate::start_refusal::label_bound());
+    for _ in 0..1_000 { c.note_refusal(StartStep::QueueTimeout(Blocker::HostRuns)); }
+    let mut lines = Vec::new();
+    for (step, count) in c.take_refusal_counts() { lines.extend(limiter.note(step.line(), count, t0)); }
+    lines.extend(limiter.flush(t0 + crate::start_refusal::LINE_WINDOW));
+    assert_eq!(lines.len(), 6, "{lines:?}");
+    assert_eq!(lines[5], "start refused: step=queue_timeout(host_runs) suppressed=995");
+}
+
+/// R8y review round 1 (F3): with the host run slots full, EVERY queued run
+/// (not only the first examined) is held by `host_runs`, so each one's
+/// timeout and a cancel name it.
+#[test]
+fn r8y_every_queued_run_behind_full_host_slots_is_held_by_host_runs() {
+    let setup = || {
+        let mut c = Coordinator::new(FakeHost::default(), Limits { host_runs: 1, ..Limits::default() }).unwrap();
+        for n in 1..=4 { queue(&mut c, n, n, RuntimeKind::Codex); }
+        c.tick(100).unwrap();
+        assert_eq!(c.host.starts, vec![run(1)], "one slot, taken by run 1");
+        assert!(c.take_refusals().is_empty());
+        c
+    };
+    // Three queued runs time out: each line names the host run limit.
+    let mut c = setup();
+    c.tick(10_100).unwrap();
+    for n in 2..=4 { assert_eq!(c.status(run(n), conn()).unwrap(), RunStatus::Ended(RunOutcome::QueueTimeout)); }
+    let timeouts: Vec<StartStep> = c.take_refusals().into_iter().filter(|step| matches!(step, StartStep::QueueTimeout(_))).collect();
+    assert_eq!(timeouts, vec![StartStep::QueueTimeout(Blocker::HostRuns); 3]);
+    assert_eq!(timeouts[0].line(), "start refused: step=queue_timeout(host_runs)");
+    // A cancelled one (the last queued) prints `queue_cancelled(host_runs)`.
+    let mut c = setup();
+    c.cancel(run(4), conn(), 101).unwrap();
+    assert_eq!(c.take_refusals(), vec![StartStep::QueueCancelled(Blocker::HostRuns)]);
+    assert_eq!(StartStep::QueueCancelled(Blocker::HostRuns).line(), "start refused: step=queue_cancelled(host_runs)");
+}
+
 #[test]
 fn d8_holds_lease_until_all_three_readbacks_and_revocation() {
     for bits in 0..8 {

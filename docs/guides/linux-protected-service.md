@@ -274,7 +274,7 @@ duduclaw-spawnd: employee account verification failed: step=<label> account=<dud
 duduclaw-spawnd: allocation failed: step=<label>
 ```
 
-The first line comes from the host-wide account check. It checks every `duduclaw-emp-*` account in the employee range, including retired (tombstoned) ones. `account=-` means a host-level step. The second line is printed once for each failed employee allocation. A pending SSH probe or the pending-reservation limit is not a failure and is not logged. The label is a fixed identifier: neither line contains file contents or error text. The readiness output and `readiness.json` keep their check names.
+The first line comes from the host-wide account check. It checks every `duduclaw-emp-*` account in the employee range, including retired (tombstoned) ones. `account=-` means a host-level step. The second line is printed once for each failed employee allocation, at most 5 times per label in 10 seconds; further failures with that label are counted and reported when the 10 seconds end as one `duduclaw-spawnd: allocation failed: step=<label> suppressed=<count>` line. A pending SSH probe or the pending-reservation limit is not a failure and is not logged. The label is a fixed identifier: neither line contains file contents or error text. The readiness output and `readiness.json` keep their check names.
 
 | Label | What failed |
 | --- | --- |
@@ -296,6 +296,41 @@ The first line comes from the host-wide account check. It checks every `duduclaw
 | `unlabelled` | An error outside spawnd's labelled checks. Allocation never produces it. |
 
 The `at` package may stay installed: spawnd reads its spool as root and never runs `/usr/bin/at`. Do not edit deny files, spools or accounts by hand to clear a line. Fix the cause; the next refresh then prints `evidence complete`. A failed allocation retires its uid permanently and leaves the proposal Failed. After the cause is fixed, retry the failed item's compensation in Migration review. A new proposal then receives the next uid.
+
+### Start refusal lines in the spawnd journal
+
+When the gateway logs `isolated run not started` (for example `site="spawn.backend.unavailable"`), spawnd's journal has one line for that refused start:
+
+```text
+duduclaw-spawnd: start refused: step=<label>
+```
+
+The line has no employee id, run id, path or request content. The wire code sent to the gateway is unchanged. Labels from the admission gate can come from `ReserveRun`, `StartRun` or the queued run's admission.
+
+The line is rate limited per label: within 10 seconds the first 5 refusals with a label are printed. Further refusals with that label are counted, and when the 10 seconds end spawnd prints one line with the count instead:
+
+```text
+duduclaw-spawnd: start refused: step=<label> suppressed=<count>
+```
+
+Every refusal is either printed or included in a `suppressed=` count. The printed lines plus the counts add up to the number of refused starts.
+
+| Label | What refused the start |
+| --- | --- |
+| `frame`, `peer`, `request`, `fds`, `run_id` | Control socket: an undecodable frame, a peer that is not the gateway, a request that fails its own validation, descriptors that do not match it, or no random run id. |
+| `clock`, `update_drain`, `stopping`, `not_reserved`, `reservation`, `pty`, `queue_full`, `launch_policy`, `input_bytes`, `input_fds`, `internal` | Admission: the clock went back, an update drain is closed, a stop of this employee is running, no or a wrong/expired reservation, a PTY mismatch, a full queue, an invalid launch policy, or no room in the input budgets. |
+| `employee_not_admitted` | The employee is not a Ready row in spawnd's registry. |
+| `not_ready(<check>)`, `report_stale`, `report_invalid`, `pty_budget`, `landlock_evidence`, `protocol`, `boot_clock`, `policy_missing`, `poisoned` | Host readiness: the named readiness.json check is false, the evidence report is older than 1 s or of another boot, there is no PTY budget or Landlock evidence, no verified policy is loaded, or spawnd needs a restart. |
+| `scan_stale`, `scan_failed`, `scan_busy`, `intruder`, `view_busy` | The UID monitor's scan is old, failed or locked, it saw a process of this employee outside a run, or the admission view was locked. |
+| `account_unknown`, `ssh_pending`, `account(<step>)` | The employee has no registry row, its SSH denial probe has no result yet, or its account verification failed at `<step>` (the labels of the table above). |
+| `entitlement_missing`, `runtime_not_entitled`, `runtime_ambiguous`, `pty_not_allowed`, `turn_limit` | Entitlement: no entitlement for the employee, no or two entitled profiles of the requested runtime, PTY not allowed, or the step limit is outside the signed range. |
+| `queue_timeout(<blocker>)`, `queue_cancelled(<blocker>)` | A queued run expired, or the gateway cancelled it, while `<blocker>` held it back: an admission label, `host_runs`, `employee_busy`, `host_ptys`, `cleanup` or `cleanup_incomplete`. |
+| `uid_monitor_register`, `worker_mailbox`, `run_fence`, `cleanup`, `cleanup_incomplete`, `storage_usage`, `disk_quota`, `run_journal`, `storage_attach`, `storage_receipt`, `workspace` | Start, before any unit: monitor registration, the lifecycle mailbox, a cancelled run, the cleanup readback, storage usage or quota, the run journal, the image attach or its receipt, or the workspace. |
+| `mcp_channel`, `egress_channel`, `egress_register`, `output_relay`, `stdin_pipe`, `supervisor_identity`, `nonce`, `bootstrap_plan`, `uid_monitor`, `mcp_projection`, `anchors`, `mounts`, `mcp_record`, `native_profile`, `helper_mounts`, `seal`, `trampoline_prepare`, `bootstrap_invalid`, `unit_policy` | Start, before any unit: a channel or pipe, the egress service's registration (unknown profile or no egress control connection), the bootstrap plan, the MCP projection, the publication anchors, the mounts, the native profile, the trampoline or the unit policy. |
+| `unit_start`, `unit_cgroup`, `bind_unit`, `launch_poll`, `startup_timeout` | systemd refused the unit, the unit's cgroup or the trampoline binding failed, the launch failed before Running, or Running was not reached within the startup budget. |
+| `host_gate`, `host_policy`, `host_start` | Test adapters only. |
+
+An `employee_not_admitted` for an employee that is Ready in the allocation journal was a defect before this release: spawnd read its admitted employees only at start, so an employee allocated after spawnd started was refused until spawnd restarted. spawnd now publishes its admitted employees before it answers an allocation, entitlement, disable or retire. A `ReserveRun` sent after an allocation or entitlement reply is checked against the updated employees and entitlement. After a disable or retire reply, the employee is refused.
 
 Container engines and hardware-dependent features remain unavailable through the protected employee environment. Every required component must pass its own checks before work resumes; neither a successful package test nor this guide is production acceptance.
 
