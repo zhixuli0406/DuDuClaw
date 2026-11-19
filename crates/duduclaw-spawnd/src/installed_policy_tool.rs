@@ -1,5 +1,7 @@
 //! R7d isolation policy generator: `duduclaw-isolation-policy build|verify`
-//! (feature `policy-tool`; README "Isolation policy generator").
+//! (feature `policy-tool`; README "Isolation policy generator"), and R8r-4's
+//! MCP acceptance harness `accept` / `verify --evidence-dir` ([`accept`],
+//! README "MCP acceptance harness").
 //!
 //! `build` turns a small human-authored SOURCE document into a signed-policy
 //! v4 document (the `runtime-isolation-policy-v1` artifact): every digest is
@@ -41,7 +43,14 @@ const USAGE: &str = "usage:
   duduclaw-isolation-policy build  --source <policy-source.json> --artifacts-dir <dir> --arch <x86_64|aarch64>
                                    --out <new policy.json> [--manifest <manifest.json>]
   duduclaw-isolation-policy verify --policy <policy.json> --artifacts-dir <dir>
-                                   [--manifest <manifest.json>] [--arch <x86_64|aarch64>]";
+                                   [--manifest <manifest.json>] [--arch <x86_64|aarch64>]
+                                   [--evidence-dir <dir> (requires --manifest) [--harness-sha256 <hex>]]
+  sudo env DUDUCLAW_ISO_DISPOSABLE=1 duduclaw-isolation-policy accept
+                                   --source <policy-source.json> --artifacts-dir <dir> --arch <x86_64|aarch64>
+                                   --label <runtime label> --trampoline <duduclaw-run>
+                                   --trampoline-sha256 <hex of the duduclaw-run the release manifest names>
+                                   --evidence-dir <new empty dir> --out-source <new file>
+                                   (root, disposable host without an isolation installation only)";
 
 // ── source document ─────────────────────────────────────────────────────
 
@@ -610,7 +619,15 @@ fn options(args: &[String], allowed: &[&str]) -> std::result::Result<BTreeMap<St
 /// Read, generate and check (no output written).
 fn build_policy(source_path: &Path, artifacts: &Path, arch: Arch, manifest: Option<&Path>) -> Checked<(Generated, SignedPolicy)> {
     let raw = read_limited(source_path, MAX_SOURCE_BYTES, "policy source")?;
-    let source: PolicySource = serde_json::from_slice(&raw).map_err(|e| format!("policy source {}: {e}", source_path.display()))?;
+    build_policy_bytes(&raw, source_path, artifacts, arch, manifest)
+}
+
+/// [`build_policy`] on source bytes already read; relative syscall-list paths
+/// resolve against `source_path`'s directory (R8r-4: `accept` reads the source
+/// once and checks its output source before writing it).
+fn build_policy_bytes(raw: &[u8], source_path: &Path, artifacts: &Path, arch: Arch, manifest: Option<&Path>)
+    -> Checked<(Generated, SignedPolicy)> {
+    let source: PolicySource = serde_json::from_slice(raw).map_err(|e| format!("policy source {}: {e}", source_path.display()))?;
     let base = source_path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
     let generated = generate(source, &base, artifacts, arch)?;
     let manifest = load_manifest(artifacts, manifest, arch, false)?;
@@ -656,10 +673,22 @@ pub fn run(args: &[String]) -> std::result::Result<String, (i32, String)> {
             Ok(text + &summary(&policy, &generated.bytes, arch))
         }
         "verify" => {
-            let values = options(rest, &["--policy", "--artifacts-dir", "--manifest", "--arch"]).map_err(usage)?;
+            let values = options(rest, &["--policy", "--artifacts-dir", "--manifest", "--arch", "--evidence-dir", "--harness-sha256"])
+                .map_err(usage)?;
             let get = |key: &str| values.get(key).ok_or_else(|| usage(format!("verify needs {key}")));
             let (policy_path, artifacts) = (get("--policy")?, get("--artifacts-dir")?);
             let manifest = values.get("--manifest").map(Path::new);
+            // R8r-4 review F1: evidence is only ever checked against a release
+            // manifest (its trampoline, runtime and bridge entries).
+            if values.contains_key("--evidence-dir") && manifest.is_none() {
+                return Err((1, accept::EVIDENCE_NEEDS_MANIFEST.to_owned()));
+            }
+            let harness_pin = match values.get("--harness-sha256") {
+                Some(_) if !values.contains_key("--evidence-dir") => return Err(usage("--harness-sha256 needs --evidence-dir".into())),
+                Some(text) => Some(accept::parse_digest_hex(text)
+                    .ok_or_else(|| usage("--harness-sha256 must be 64 lowercase hex characters".into()))?),
+                None => None,
+            };
             let arch = match values.get("--arch") {
                 Some(value) => parse_arch(value).map_err(usage)?,
                 None => match manifest {
@@ -674,8 +703,16 @@ pub fn run(args: &[String]) -> std::result::Result<String, (i32, String)> {
             let bytes = read_limited(Path::new(policy_path), MAX_POLICY_BYTES, "--policy").map_err(refused)?;
             let manifest_document = load_manifest(Path::new(artifacts), manifest, arch, true).map_err(refused)?;
             let policy = check_policy(&bytes, &manifest_document, arch, true, manifest.is_some()).map_err(refused)?;
-            Ok(format!("OK: every production check passed\n{}", summary(&policy, &bytes, arch)))
+            // R8r-4: with --evidence-dir, every acceptance record must be backed by
+            // the harness evidence it names. Without the flag nothing changes.
+            let evidence = match values.get("--evidence-dir") {
+                Some(directory) => accept::verify_evidence(&policy, &manifest_document, arch, Path::new(directory), harness_pin)
+                    .map_err(|message| (1, message))?,
+                None => String::new(),
+            };
+            Ok(format!("OK: every production check passed\n{}{evidence}", summary(&policy, &bytes, arch)))
         }
+        "accept" => accept::command(rest, &accept::HostFacts::current()),
         "-h" | "--help" | "help" => Ok(format!("{USAGE}\n")),
         other => Err(usage(format!("unknown command {other:?}"))),
     }
@@ -692,6 +729,10 @@ pub fn main(args: &[OsString]) -> i32 {
         Err((code, message)) => { eprintln!("duduclaw-isolation-policy: {message}"); code }
     }
 }
+
+/// R8r-4: the MCP acceptance harness (`accept`) and `verify --evidence-dir`.
+#[path = "installed_policy_tool_accept.rs"]
+mod accept;
 
 #[cfg(test)]
 #[path = "installed_policy_tool_tests.rs"]

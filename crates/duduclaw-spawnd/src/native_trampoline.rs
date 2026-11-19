@@ -174,6 +174,17 @@ impl NativeTrampoline {
     pub fn new(installation: Box<dyn Installation>) -> Self { Self { installation, runs: BTreeMap::new() } }
 }
 impl Default for NativeTrampoline { fn default() -> Self { Self::new(Box::new(MissingInstallation)) } }
+/// R8r-4 MCP acceptance harness only (feature `policy-tool`, never a release
+/// build): the root end of a prepared run's bootstrap/status socket, so the
+/// harness's failure diagnosis can PEEK a status record that `poll` reduces to
+/// `IsolationUnavailable` (`StatusRecord::Error`), and read what is left once
+/// the run has failed. Borrowed, read-only access; `poll` is unchanged.
+#[cfg(any(test, feature = "policy-tool"))]
+impl NativeTrampoline {
+    pub(crate) fn acceptance_status_socket(&self, run: RunHandle) -> Option<std::os::fd::BorrowedFd<'_>> {
+        self.runs.get(&run.0).map(|pending| pending.socket.as_fd())
+    }
+}
 impl Trampoline for NativeTrampoline {
     fn readiness(&mut self) -> Result<TrampolineReadiness> {
         let result = self.installation.readback()?;

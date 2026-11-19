@@ -6,7 +6,7 @@
 #   scripts/isolation-test-keys.sh bundle  --keys <keys dir> --archive <duduclaw-linux-<arch>.tar.gz>
 #                                          --target <triple> [--gateway <TEST duduclaw>]
 #                                          [--policy-source <file>] [--policy-tool <path>]
-#                                          [--out <new dir>] [--signer <path>]
+#                                          [--out <new dir>] [--signer <path>] [--accept-mcp]
 #   scripts/isolation-test-keys.sh license --keys <keys dir> --fingerprint <value> --out <new file>
 #                                          [--tier <tier>] [--days N] [--max-agents N] [--signer <path>]
 #   scripts/isolation-test-keys.sh --help
@@ -41,6 +41,16 @@
 # signs with the TEST template fixtures/manifest-template-test.json (the shipped
 # template plus the policy and api-worker-v1 entries) and --runtime-artifacts-dir,
 # then re-verifies the policy against the signed manifest.
+# --accept-mcp (default off; R8r-4) first runs every open_ai_compat runtime of the
+# source through `duduclaw-isolation-policy accept` (as root via `sudo -n`, with
+# DUDUCLAW_ISO_DISPOSABLE=1: only on a disposable Linux host of the target
+# architecture WITHOUT an isolation installation; `sudo -n` on a tool built by the
+# invoking user is acceptable ONLY on such a TEST VM), bound to the archive
+# snapshot's trampoline digest (--trampoline-sha256), builds from the accepted
+# source, verifies against the signed manifest with --evidence-dir (the evidence's
+# trampoline/runtime/bridge must be the manifest's entries) and --harness-sha256
+# (the tool that ran accept), and copies the evidence to <out>/TEST-runtime/
+# acceptance-evidence/ (after packaging; never signed or packaged).
 #
 # `license` signs a TEST license.json (0600) for the installer's licence rule
 # (self-host binding, not a Personal edition): --tier self_host_pro (default),
@@ -129,18 +139,62 @@ ensure_policy_tool() {
 # The release archive's policy-generator inputs (runtime entries of the TEST template,
 # egress forwarder, MCP bridge) under their generation names in the new directory $4,
 # through the packager's own archive check and staging (snapshot_release_archive,
-# stage_policy_inputs).
+# stage_policy_inputs). With a non-empty $5 (R8r-4 --accept-mcp) the same snapshot's
+# trampoline (duduclaw-run, packager.INSTALL_BINARIES["trampoline"], the file the
+# packager signs as the manifest's trampoline artifact) is also copied to the new
+# file $5 for `accept --trampoline`, and its SHA-256 (hashed while it is copied from
+# the snapshot, then re-checked on the copy) is written to the new file $5.sha256 for
+# `accept --trampoline-sha256`. The final `verify --manifest ... --evidence-dir`
+# proves that digest equals the signed manifest's trampoline entry.
 stage_policy_inputs() {
-    python3 -I -B -c 'import importlib.util, sys, tempfile
+    python3 -I -B -c 'import hashlib, importlib.util, sys, tempfile
 from pathlib import Path
-script, archive, target, template, destination = sys.argv[1:6]
+script, archive, target, template, destination, trampoline = sys.argv[1:7]
 spec = importlib.util.spec_from_file_location("packager", script)
 packager = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(packager)
 with tempfile.TemporaryDirectory(prefix="snapshot-", dir=str(Path(destination).parent)) as snapshot:
     packager.snapshot_release_archive(archive, target, Path(snapshot), test_archive=True)
     for name in packager.stage_policy_inputs(Path(snapshot), Path(template), Path(destination)):
-        print("  policy input " + name)' "$ROOT/scripts/package-linux-release.py" "$1" "$2" "$3" "$4"
+        print("  policy input " + name)
+    if trampoline:
+        source = Path(snapshot) / packager.INSTALL_BINARIES["trampoline"]
+        packager.validate_binary(source)
+        digest = hashlib.sha256()
+        with source.open("rb") as reader, Path(trampoline).open("xb") as writer:
+            for chunk in iter(lambda: reader.read(1 << 20), b""):
+                digest.update(chunk)
+                writer.write(chunk)
+        Path(trampoline).chmod(0o755)
+        copied = hashlib.sha256()
+        with Path(trampoline).open("rb") as reader:
+            for chunk in iter(lambda: reader.read(1 << 20), b""):
+                copied.update(chunk)
+        if copied.hexdigest() != digest.hexdigest():
+            sys.exit("isolation-test-keys: the staged trampoline copy differs from the archive snapshot")
+        with open(trampoline + ".sha256", "x", encoding="ascii") as sidecar:
+            sidecar.write(digest.hexdigest() + "\n")
+        print("  trampoline " + trampoline + " sha256 " + digest.hexdigest())' "$ROOT/scripts/package-linux-release.py" "$1" "$2" "$3" "$4" "${5:-}"
+}
+
+# R8r-4: the labels of the open_ai_compat runtimes of policy source $1, one per line.
+api_worker_labels() {
+    python3 -I -B -c 'import json, sys
+with open(sys.argv[1], "rb") as source:
+    document = json.load(source)
+for runtime in document.get("runtimes", []):
+    if isinstance(runtime, dict) and runtime.get("runtime") == {"kind": "open_ai_compat"}:
+        print(runtime["label"])' "$1"
+}
+
+# R8r-4: `duduclaw-isolation-policy accept` as root (sudo -n unless already root),
+# with the disposable-host marker the root tests use.
+run_accept() {
+    if [[ "$(id -u)" -eq 0 ]]; then
+        env DUDUCLAW_ISO_DISPOSABLE=1 "$POLICY_TOOL" accept "$@"
+    else
+        sudo -n env DUDUCLAW_ISO_DISPOSABLE=1 "$POLICY_TOOL" accept "$@"
+    fi
 }
 
 file_sha256() {
@@ -257,9 +311,10 @@ print(copy)' "$1" "$2" "$3" "$ROOT/scripts/refuse-test-license-build.py"
 }
 
 cmd_bundle() {
-    local keys="" archive="" target="" gateway="" policy_source="$TEST_FIXTURES/policy-source-test.json"
+    local keys="" archive="" target="" gateway="" policy_source="$TEST_FIXTURES/policy-source-test.json" accept_mcp=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --accept-mcp) accept_mcp=1; shift ;;
             --keys) keys="${2:?--keys needs a value}"; shift 2 ;;
             --archive) archive="${2:?--archive needs a value}"; shift 2 ;;
             --target) target="${2:?--target needs a value}"; shift 2 ;;
@@ -301,21 +356,64 @@ print(packager.version_text(packager.workspace_version()))' "$ROOT/scripts/packa
     # spawnd's readers before it is written; the packager signs it as a runtime entry.
     POLICY_WORK="$(mktemp -d "${TMPDIR:-/tmp}/duduclaw-isolation-TEST-policy.XXXXXX")"
     chmod 0700 -- "$POLICY_WORK"
-    stage_policy_inputs "$archive" "$target" "$template" "$POLICY_WORK/artifacts"
+    local build_source="$policy_source" trampoline="" trampoline_sha256="" harness_sha256=""
+    local -a evidence_args=()
+    if [[ "$accept_mcp" -eq 1 ]]; then trampoline="$POLICY_WORK/duduclaw-run"; fi
+    stage_policy_inputs "$archive" "$target" "$template" "$POLICY_WORK/artifacts" "$trampoline"
+    if [[ "$accept_mcp" -eq 1 ]]; then
+        # R8r-4: run every open_ai_compat runtime of the source through the MCP
+        # acceptance harness (root, disposable host only), chaining the accepted
+        # sources, and build from the last one. The signed manifest cannot exist
+        # yet (it signs the policy these runs produce), so accept is bound to the
+        # snapshot's trampoline digest and the final verify (--manifest, below)
+        # proves it is the manifest's trampoline entry.
+        trampoline_sha256="$(cat -- "$trampoline.sha256")"
+        [[ "$trampoline_sha256" =~ ^[0-9a-f]{64}$ ]] || fail "the staged trampoline digest is malformed"
+        # The tool that runs accept; the final verify pins the evidence to it.
+        harness_sha256="$(file_sha256 "$POLICY_TOOL")"
+        local label current next
+        local -a labels=()
+        while IFS= read -r label; do labels+=("$label"); done < <(api_worker_labels "$policy_source")
+        [[ "${#labels[@]}" -gt 0 ]] || fail "--accept-mcp: the policy source has no open_ai_compat runtime"
+        mkdir -m 0700 -- "$POLICY_WORK/acceptance"
+        current="$policy_source"
+        for label in "${labels[@]}"; do
+            next="$POLICY_WORK/policy-source.accepted.$label.json"
+            run_accept --source "$current" --artifacts-dir "$POLICY_WORK/artifacts" --arch "$arch" --label "$label" \
+                --trampoline "$trampoline" --trampoline-sha256 "$trampoline_sha256" \
+                --evidence-dir "$POLICY_WORK/acceptance/$label" --out-source "$next"
+            current="$next"
+        done
+        # The harness writes its evidence root-owned (0700/0600); hand it back so the
+        # checks below can read it and the cleanup can remove it.
+        if [[ "$(id -u)" -ne 0 ]]; then
+            sudo -n chown -R -- "$(id -u):$(id -g)" "$POLICY_WORK/acceptance"
+        fi
+        build_source="$current"
+        evidence_args=(--evidence-dir "$POLICY_WORK/acceptance" --harness-sha256 "$harness_sha256")
+    fi
     runtime_dir="$out/TEST-runtime"
     mkdir -m 0700 -- "$runtime_dir"
     policy="$runtime_dir/runtime-isolation-policy-v1"
-    "$POLICY_TOOL" build --source "$policy_source" --artifacts-dir "$POLICY_WORK/artifacts" --arch "$arch" --out "$policy"
-    echo "TEST-ONLY isolation policy (from $policy_source): $policy"
+    "$POLICY_TOOL" build --source "$build_source" --artifacts-dir "$POLICY_WORK/artifacts" --arch "$arch" --out "$policy"
+    echo "TEST-ONLY isolation policy (from $build_source): $policy"
     python3 "$ROOT/scripts/package-linux-release.py" --target "$target" --from-release-archive "$archive" \
         --manifest-template "$template" --manifest-valid-days 30 \
         --runtime-artifacts-dir "$runtime_dir" \
         --signing-key "$keys/target" --test-signer "$SIGNER" \
         --bootstrap-root "$keys/root.json" --bootstrap-root-signatures "$keys/root.json.signatures.json" \
         --output-dir "$out"
-    # The same checks again, now against the signed manifest (it must bind these policy bytes).
+    # The same checks again, now against the signed manifest (it must bind these policy bytes;
+    # with --accept-mcp also: the evidence's trampoline, runtime and bridge are its entries).
     "$POLICY_TOOL" verify --policy "$policy" --artifacts-dir "$POLICY_WORK/artifacts" \
-        --manifest "$out/isolated-linux-$arch-manifest.json"
+        --manifest "$out/isolated-linux-$arch-manifest.json" "${evidence_args[@]+"${evidence_args[@]}"}"
+    if [[ "$accept_mcp" -eq 1 ]]; then
+        # Next to the bundle output, after packaging: the packager reads only the
+        # runtime-<registry_id> files of TEST-runtime and the migration bundle packs
+        # only the bootstrap inbox, so this copy is never signed or packaged.
+        cp -R -- "$POLICY_WORK/acceptance" "$runtime_dir/acceptance-evidence"
+        echo "TEST-ONLY MCP acceptance evidence: $runtime_dir/acceptance-evidence"
+    fi
     python3 "$ROOT/scripts/package-linux-release.py" --target "$target" \
         --migration-bundle-from "$out/isolated-linux-$arch-bootstrap-inbox" --output-dir "$out"
     tar_name="duduclaw-isolated-linux-$arch-$version.tar"

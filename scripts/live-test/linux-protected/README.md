@@ -52,10 +52,70 @@ What it can prove: the generation installs (S5 finds a valid signed policy and w
 `/etc/duduclaw/egress.json` for the `test-egress` profile), spawnd loads the policy and
 publishes it, and readiness (including the DNS probe of `example.com`) can be evaluated.
 What it cannot prove: any employee run. spawnd refuses every MCP run of a runtime without
-MCP acceptance at MCP preparation, so no OpenAI-compatible turn can start; Claude, Codex
+MCP acceptance at MCP preparation, so no OpenAI-compatible turn can start (unless the
+bundle was made with `--accept-mcp`, below); Claude, Codex
 and Grok are not in the TEST policy; the syscall lists say nothing about a production
 seccomp policy. The production policy content is a later, owner-reviewed step
 (`release/isolation/README.md`).
+
+### `--accept-mcp`: MCP acceptance of the api worker (v1.83 R8r-4)
+
+`bundle --accept-mcp` (default off) adds a step between 1 and 2. The
+snapshot's `duduclaw-run` (the file the packager later signs as the manifest's
+trampoline entry) is also copied to the policy work directory. Its SHA-256 is
+hashed during the copy and re-checked on the copy. The signed manifest cannot
+exist yet, because it signs the policy these runs produce. Every
+`open_ai_compat` runtime of the source then goes through
+`duduclaw-isolation-policy accept --trampoline <copy> --trampoline-sha256
+<that digest>` (`sudo -n env DUDUCLAW_ISO_DISPOSABLE=1 …`, without sudo when
+already root). Each run produces
+`<work>/acceptance/<label>/{transcript.jsonl,acceptance-manifest.json}` and the
+next accepted source (chained, one per label). Step 2 then builds from the last
+accepted source. Step 4 adds `--evidence-dir <work>/acceptance --harness-sha256
+<sha256 of the policy tool that ran accept>` to the verify against the signed
+manifest. That verify parses the evidence strictly, replays the transcript and
+re-runs the decision. It also proves that the evidence's trampoline, runtime
+and bridge are the signed manifest's entries. After step 4 the evidence is
+copied to `<out>/TEST-runtime/acceptance-evidence/<label>/`.
+That copy happens after packaging: the packager reads only the
+`runtime-<registry_id>` files of `TEST-runtime`, and the migration bundle packs only
+the bootstrap inbox, so the evidence is never signed or packaged product content.
+
+Run it **only on a disposable Linux host of the target architecture as a user with
+passwordless sudo (or as root) and WITHOUT any DuDuClaw isolation installation or
+protected-mode marker**; it needs systemd as PID 1, cgroup v2, `/usr/sbin/mkfs.ext4`
+and a `/var/lib` on a block device (the harness creates a temporary loop image, a
+transient unit and slice, and `/var/lib/duduclaw-acceptance-<random>`, removes all of
+them and fails if anything is left). The harness launches the real api worker and
+bridge once with no network (provider `https://acceptance.invalid/v1`); see
+`crates/duduclaw-spawnd/README.md` "MCP acceptance harness" for what is observed and
+what the signed record then states. With the record, spawnd no longer refuses the
+fixture runtime at MCP preparation; the TEST syscall lists still say nothing about a
+production seccomp policy. Any change of the runtime binary, version, arguments,
+resource limits or syscall lists requires running `--accept-mcp` again.
+
+The harness signals only processes inside its own run cgroup and employee slice.
+A process with the temporary uid anywhere else is never touched and fails the run
+(`foreign_uid_process`). Any process in the run cgroup that is not the trampoline,
+forwarder, runtime or bridge in its documented place fails the run, and so does
+any observation it could not complete (`crates/duduclaw-spawnd/README.md`, MCP
+acceptance harness, "Completeness"). That README section also lists how the
+harness launch differs from a production launch.
+
+**`sudo -n` on a tool built by the invoking user is acceptable only on this
+disposable TEST VM.** That user, or anyone who can write the build tree or its
+parent directories, effectively has root there and could shape the evidence. The
+release signing ceremony does not use this script's build. It builds the tool
+from a clean checkout of a pinned source archive, installs it root-owned and
+records its digest, runs `accept` only from root-owned directories (never under a
+parent writable by an untrusted user), stores the evidence separately, and
+verifies it with `verify --manifest <signed manifest> --evidence-dir <dir>
+--harness-sha256 <recorded digest>`.
+
+After any change to the harness, trampoline, api worker, bridge, unit properties
+or the trampoline's process structure, re-run `bundle --accept-mcp` on a real
+disposable host. That run ends with the signed-manifest verify. Unit tests do
+not replace it.
 
 ## Connector acceptance (`connectors-acceptance.sh`)
 

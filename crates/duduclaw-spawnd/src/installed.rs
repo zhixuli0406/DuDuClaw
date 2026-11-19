@@ -156,13 +156,19 @@ pub struct McpAcceptance {
 }
 impl McpAcceptance {
     fn validate_launch(&self, runtime: &RuntimeRecord, native: &NativeRecord) -> io::Result<()> {
+        if self.launch_policy_digest != Self::launch_policy_digest(runtime, native)? { return Err(denied()); }
+        Ok(())
+    }
+    /// The digest [`Self::validate_launch`] compares (R8r-4: the policy
+    /// tool's acceptance harness computes a record's value with this same
+    /// function, never a copy of it).
+    fn launch_policy_digest(runtime: &RuntimeRecord, native: &NativeRecord) -> io::Result<Sha256Digest> {
         let mut runtime = runtime.clone();
         runtime.mcp_acceptance = None;
         let bytes = serde_json::to_vec(&serde_json::json!({
             "domain": "duduclaw-runtime-mcp-acceptance-launch-v1", "runtime": runtime, "native": native,
         })).map_err(|_| denied())?;
-        if self.launch_policy_digest != Sha256Digest(Sha256::digest(bytes).into()) { return Err(denied()); }
-        Ok(())
+        Ok(Sha256Digest(Sha256::digest(bytes).into()))
     }
     pub fn validate(&self, projection: &duduclaw_mcp_boundary::config::RuntimeProjection) -> io::Result<()> {
         let r = &projection.registration;
