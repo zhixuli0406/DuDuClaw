@@ -78,10 +78,11 @@ pub(super) async fn spawn_claude_cli_with_env(
 
     let protected = duduclaw_core::execution_gate::isolation_required();
     if protected {
+        // R8x: a refused protected turn's one log line (`preflight.claude_options`).
         if !env_vars.is_empty() || claude_session_id.is_some() || effort.is_some() {
-            return Err(crate::claude_runner::protected_claude_options_refusal());
+            return Err(crate::claude_runner::protected_options_refused(work_dir).await);
         }
-        work_dir.ok_or_else(crate::claude_runner::protected_claude_options_refusal)?;
+        if work_dir.is_none() { return Err(crate::claude_runner::protected_options_refused(None).await); }
     }
 
     // Find claude binary
@@ -108,10 +109,19 @@ pub(super) async fn spawn_claude_cli_with_env(
         if purpose == crate::runtime_dispatch::SpawnPurpose::EmployeeTurn
             && crate::runtime_dispatch::allows_employee_step_budget() { resolved } else { resolved.min(50) }
     };
-    let max_turns = if protected {
+    // R8x: protected, `desired` is only the request. On Linux the root-confirmed
+    // limit replaces it at the spawn below, where the protected step-limit
+    // lookup and the spawn run in ONE observed scope (`start_claude`); the
+    // protected command assembled in between is never executed and nothing
+    // in between can refuse. Without native isolation the lookup refuses here.
+    #[cfg(not(target_os = "linux"))]
+    if protected {
         crate::claude_runner::protected_max_turns(
-            work_dir.ok_or_else(crate::claude_runner::protected_claude_options_refusal)?, desired).await?
-    } else { desired };
+            work_dir.ok_or_else(crate::claude_runner::protected_claude_options_refusal)?, desired).await?;
+    }
+    let max_turns = desired;
+    #[cfg(target_os = "linux")]
+    let raw_system_prompt = system_prompt;
     let budget_prompt = duduclaw_core::turn_limits::budget_prompt(system_prompt, max_turns);
     let system_prompt = budget_prompt.as_str();
     let mut cmd = duduclaw_core::platform::async_command_for(&claude_path);
@@ -439,12 +449,19 @@ pub(super) async fn spawn_claude_cli_with_env(
     }
     #[cfg(target_os = "linux")]
     let mut prompt_writer = None;
+    #[cfg(target_os = "linux")]
+    let mut confirmed_max_turns = None;
     let mut child = if protected {
         #[cfg(target_os = "linux")]
         {
-            let (child, writer) = crate::isolation_mcp::runtime::spawn_claude(
-                work_dir.ok_or_else(crate::claude_runner::protected_claude_options_refusal)?,
-                user_message, system_prompt, model, max_turns).await?;
+            // R6/R8x: lookup then spawn in one observed scope; the step-budget
+            // sentence and the max-turn classification use exactly the limit
+            // root confirmed (the plan refuses the run otherwise).
+            let (confirmed, child, writer) = crate::isolation_mcp::runtime::start_claude(
+                work_dir.ok_or_else(crate::claude_runner::protected_claude_options_refusal)?, desired,
+                user_message, |limit| crate::claude_runner::protected_system_prompt(raw_system_prompt, u64::from(limit)),
+                model).await?;
+            confirmed_max_turns = Some(u64::from(confirmed));
             prompt_writer = Some(writer);
             child
         }
@@ -462,6 +479,9 @@ pub(super) async fn spawn_claude_cli_with_env(
         drop(admission);
         child
     };
+    // R6: a protected run classifies with exactly the limit root confirmed.
+    #[cfg(target_os = "linux")]
+    let max_turns = confirmed_max_turns.unwrap_or(max_turns);
     let stdout = child.child().stdout.take().ok_or("failed to capture stdout")?;
     let mut reader = BufReader::new(stdout).lines();
 

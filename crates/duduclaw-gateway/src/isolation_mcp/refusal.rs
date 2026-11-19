@@ -171,9 +171,11 @@ pub(crate) fn runtime_label(runtime: &duduclaw_isolation::execution::RuntimeKind
 }
 
 /// The single `isolated run refused` warning. Only fixed strings, the agent
-/// label the neighbouring warnings use, the exit and the stderr *length*.
+/// label the neighbouring warnings use ([`agent_label`]: an invalid id is
+/// replaced, never logged), the exit and the stderr *length*.
 pub(crate) fn log_refused(runtime: &'static str, agent: &str, reason: Option<&'static str>, exit: RunExit,
     stderr_len: usize) {
+    let agent = agent_label(agent);
     let class = reason.and_then(class_of).map_or("unrecognised", RefusalClass::as_str);
     tracing::warn!(runtime, agent, reason = reason.unwrap_or("unrecognised"), class, exit = %exit, stderr_len,
         "isolated run refused");
@@ -190,13 +192,15 @@ pub(crate) const UNLABELLED_SITE: &str = "unlabelled";
 /// protected MCP launch context), `spawn.*` (asking spawnd to start the run;
 /// `spawn.backend.*` is spawnd's or the transport's fixed refusal class),
 /// `run.*` (the run started and then failed) and `output.*` (the run exited
-/// successfully but its result was unusable). Closed set: tests require that
-/// every label used in the source is listed here.
+/// successfully but its result was unusable). Closed set, enforced by the
+/// compiler: a site exists only as a [`RefusalSite`], whose sole builder
+/// ([`site!`]) rejects at compile time any literal not listed here.
 pub(crate) const SITES: &[&str] = &[
     UNLABELLED_SITE,
     // Coarse gates (no authority taken or issued yet).
     "preflight.model", "preflight.runtime_policy", "preflight.model_policy", "preflight.redaction",
-    "preflight.interceptor",
+    "preflight.interceptor", "preflight.mcp_isolation", "preflight.explore_lane", "preflight.utility_call",
+    "preflight.claude_options",
     "authorize.agent_dir_missing", "authorize.effort", "authorize.utility_call", "authorize.work_dir_override",
     "authorize.agent_dir", "authorize.capabilities_policy", "authorize.native_gate", "authorize.runtime_kind",
     "authorize.explore_lane", "authorize.tool_restrictions", "authorize.codex_home", "authorize.product_policy",
@@ -245,24 +249,107 @@ pub(crate) const SITES: &[&str] = &[
     "output.parse", "output.empty", "output.utf8",
 ];
 
+/// R8x (F3): one entry of [`SITES`], as a type. Every site recorder
+/// (`runtime::refuse`/`keep`/`note_site`, [`Sited`], the boot/ingress step
+/// labels) takes this, never a string. Built only by [`site!`], which checks
+/// the literal at compile time: a label missing from [`SITES`] — or
+/// `unlabelled`, which only the logging point itself may use
+/// ([`RefusalSite::UNLABELLED`]) — does not compile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RefusalSite(&'static str);
+
+impl RefusalSite {
+    /// The logging point's own fallback when a refused turn recorded no site.
+    pub(crate) const UNLABELLED: Self = Self(UNLABELLED_SITE);
+
+    /// Only for [`site!`] (evaluated in a `const`, so a failure is a compile
+    /// error there). Panics on a label outside [`SITES`] or on `unlabelled`.
+    #[doc(hidden)]
+    pub(crate) const fn checked(label: &'static str) -> Self {
+        if const_str_eq(label, UNLABELLED_SITE) { panic!("`unlabelled` is not a refusal site"); }
+        let mut index = 0;
+        while index < SITES.len() {
+            if const_str_eq(SITES[index], label) { return Self(label); }
+            index += 1;
+        }
+        panic!("unknown refusal site: list the label in isolation_mcp::refusal::SITES")
+    }
+
+    /// The fixed `site` log value.
+    pub(crate) const fn as_str(self) -> &'static str { self.0 }
+}
+
+const fn const_str_eq(left: &str, right: &str) -> bool {
+    let (left, right) = (left.as_bytes(), right.as_bytes());
+    if left.len() != right.len() { return false; }
+    let mut index = 0;
+    while index < left.len() {
+        if left[index] != right[index] { return false; }
+        index += 1;
+    }
+    true
+}
+
+/// R8x (F3): the only way to name a refusal site: `site!("plan.readiness")`.
+/// The label is checked against [`SITES`] in a `const`, so an unknown label is
+/// a compile error, never a run-time `unlabelled`.
+macro_rules! site {
+    ($label:literal) => {{
+        const SITE: $crate::isolation_mcp::refusal::RefusalSite =
+            $crate::isolation_mcp::refusal::RefusalSite::checked($label);
+        SITE
+    }};
+}
+pub(crate) use site;
+
+/// R8x (F3): a protected helper's refusal — its error together with the site
+/// that refused. There is deliberately no `From` conversion from a bare error:
+/// a new `?`/`Err(..)` exit in a helper returning `Sited` does not compile
+/// without a [`RefusalSite`]. Building one records the site for the current
+/// protected turn (first recorded wins; no-op outside a turn).
+/// (The protected callers map every refusal to their fixed sentence, so the
+/// fields are read only through `Debug` and by tests.)
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct Sited<E> { site: RefusalSite, error: E }
+
+impl<E> Sited<E> {
+    pub(crate) fn new(site: RefusalSite, error: E) -> Self {
+        #[cfg(target_os = "linux")]
+        super::runtime::note_site(site);
+        Self { site, error }
+    }
+    #[cfg(test)]
+    pub(crate) fn site(&self) -> RefusalSite { self.site }
+}
+
 /// The `agent` log value: the employee label when it is a valid agent id,
 /// otherwise a fixed placeholder (never arbitrary caller text).
 pub(crate) fn agent_label(agent: &str) -> &str {
     if duduclaw_core::is_valid_agent_id(agent) { agent } else { "invalid" }
 }
 
+// Log volume (R8x review note): this module's three warnings (`log_refused`
+// above, the two below) are, together, written at most once per protected
+// turn, so their rate is the rate of protected turns the gateway accepted;
+// there is deliberately no limiter here. Turns that
+// reach a start pass spawn admission (`crate::autonomous_runtime::admit_current`,
+// src/autonomous_runtime.rs:302 — the autonomy pause gate, not a rate limit);
+// refusals before it are bounded only by the per-ingress admission of turns
+// (channel/WebChat/API/scheduler), which is not centralised in one place.
+
 /// R8x: the single warning for a refused protected turn that never reached a
 /// started run. Fixed fields only: runtime label, employee label, site label.
-pub(crate) fn log_not_started(runtime: &'static str, agent: &str, site: &'static str) {
+pub(crate) fn log_not_started(runtime: &'static str, agent: &str, site: RefusalSite) {
     let agent = agent_label(agent);
-    tracing::warn!(runtime, agent, site, "isolated run not started");
+    tracing::warn!(runtime, agent, site = site.as_str(), "isolated run not started");
 }
 
 /// R8x: the single warning for a run that started but was refused without the
 /// R8t line (its pipes were missing, or it exited 0 with unusable output).
-pub(crate) fn log_refused_after_start(runtime: &'static str, agent: &str, site: &'static str) {
+pub(crate) fn log_refused_after_start(runtime: &'static str, agent: &str, site: RefusalSite) {
     let agent = agent_label(agent);
-    tracing::warn!(runtime, agent, site, "isolated run refused after start");
+    tracing::warn!(runtime, agent, site = site.as_str(), "isolated run refused after start");
 }
 
 #[cfg(test)]
@@ -431,9 +518,9 @@ mod tests {
                 let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
                     .with_max_level(tracing::Level::WARN).with_writer(move || writer.clone()).finish();
                 tracing::subscriber::with_default(subscriber, || if after_start {
-                    log_refused_after_start("openai_compat", agent, "output.empty")
+                    log_refused_after_start("openai_compat", agent, site!("output.empty"))
                 } else {
-                    log_not_started("openai_compat", agent, "plan.root_publication")
+                    log_not_started("openai_compat", agent, site!("plan.root_publication"))
                 });
                 let logs = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
                 assert_eq!(logs.lines().count(), 1, "{logs}");
@@ -445,6 +532,44 @@ mod tests {
                 assert!(SITES.contains(&site));
             }
         }
+    }
+
+    /// R8x F2: the R8t line applies the same agent label rule as the R8x
+    /// lines: an id that is not a valid agent id is logged as `invalid`.
+    #[test]
+    fn the_refused_line_never_logs_an_invalid_agent_label() {
+        const AGENT: &str = "R8X-F2 agent\nforged=\"line\"";
+        let log = LogCapture(Default::default());
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
+            .with_max_level(tracing::Level::WARN).with_writer(move || writer.clone()).finish();
+        tracing::subscriber::with_default(subscriber, ||
+            log_refused("registered", AGENT, None, RunExit::Code(1), 0));
+        let logs = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(logs.lines().count(), 1, "{logs}");
+        assert!(logs.contains("isolated run refused") && logs.contains("agent=\"invalid\""), "{logs}");
+        for part in ["R8X-F2", "forged", "agent\\n", "\nforged"] {
+            assert!(!logs.contains(part), "{part}: {logs}");
+        }
+        assert_eq!(agent_label(AGENT), "invalid");
+        assert_eq!(agent_label("alice"), "alice");
+    }
+
+    /// R8x F3: the site type is closed. `site!` with an unlisted label (or
+    /// `unlabelled`) is a compile error — that is the primary guard and has no
+    /// run-time test; here the same checker is exercised outside a `const`,
+    /// where it panics instead, and every listed label round-trips.
+    #[test]
+    fn refusal_sites_are_a_closed_type() {
+        for label in SITES.iter().copied().filter(|label| *label != UNLABELLED_SITE) {
+            assert_eq!(RefusalSite::checked(label).as_str(), label);
+        }
+        for label in ["plan.not_a_site", "", UNLABELLED_SITE, "plan.readiness ", "Plan.readiness"] {
+            assert!(std::panic::catch_unwind(|| RefusalSite::checked(label)).is_err(), "{label:?}");
+        }
+        assert_eq!(RefusalSite::UNLABELLED.as_str(), UNLABELLED_SITE);
+        assert_eq!(site!("spawn.admission").as_str(), "spawn.admission");
+        assert_eq!(Sited::new(site!("launch.binding"), ()).site(), site!("launch.binding"));
     }
 
     #[test]

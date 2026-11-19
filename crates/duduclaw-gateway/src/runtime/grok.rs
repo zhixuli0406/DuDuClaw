@@ -384,19 +384,28 @@ impl AgentRuntime for GrokRuntime {
         super::isolation_gate::require_integrated(super::isolation_gate::PendingRuntime::Grok)?;
         #[cfg(target_os = "linux")]
         if duduclaw_core::execution_gate::isolation_required() {
-            crate::explore_lane::refuse_unsupported_runtime("grok")?;
-            // RM-103 S3: the employee's native write/shell restrictions hold in
-            // protected mode too — refused before the isolated route.
-            super::protected_coarse_native_gate(context.capabilities.as_ref(), "grok", &context.agent_id)?;
-            let payload = build_prompt(context, prompt);
-            let out = crate::isolation_mcp::runtime::execute_native(
-                duduclaw_isolation::execution::RuntimeKind::Grok, payload.clone(), context).await?;
-            let stdout = std::str::from_utf8(&out).map_err(|_| "invalid isolated Grok output")?;
-            let content = salvage_pty_stdout(stdout, &[payload.clone()])?;
-            return Ok(RuntimeResponse { partial_timeout_secs: None,
-                input_tokens: crate::prompt_compression::estimate_tokens(&payload),
-                output_tokens: crate::prompt_compression::estimate_tokens(&content), content,
-                cache_read_tokens: 0, model_used: context.model.clone(), runtime_name: "grok".into() });
+            use crate::isolation_mcp::{refusal::site, runtime::keep};
+            use duduclaw_isolation::execution::RuntimeKind;
+            // R8x: the whole protected turn — this preflight, the S3 gate, the
+            // isolated run (whose own scope joins this one) and the output
+            // checks — is one observed scope: one log line per refused turn.
+            return crate::isolation_mcp::runtime::observed(
+                crate::isolation_mcp::refusal::runtime_label(&RuntimeKind::Grok), &context.agent_id, async {
+                crate::explore_lane::refuse_unsupported_runtime("grok").map_err(keep(site!("preflight.explore_lane")))?;
+                // RM-103 S3: the employee's native write/shell restrictions hold in
+                // protected mode too — refused before the isolated route.
+                super::protected_coarse_native_gate(context.capabilities.as_ref(), "grok", &context.agent_id)
+                    .map_err(keep(site!("authorize.native_gate")))?;
+                let payload = build_prompt(context, prompt);
+                let out = crate::isolation_mcp::runtime::execute_native(RuntimeKind::Grok, payload.clone(), context).await?;
+                let stdout = std::str::from_utf8(&out).map_err(|_| String::from("invalid isolated Grok output"))
+                    .map_err(keep(site!("output.utf8")))?;
+                let content = salvage_pty_stdout(stdout, &[payload.clone()]).map_err(keep(site!("output.parse")))?;
+                Ok::<_, String>(RuntimeResponse { partial_timeout_secs: None,
+                    input_tokens: crate::prompt_compression::estimate_tokens(&payload),
+                    output_tokens: crate::prompt_compression::estimate_tokens(&content), content,
+                    cache_read_tokens: 0, model_used: context.model.clone(), runtime_name: "grok".into() })
+            }).await;
         }
         if crate::runtime_dispatch::in_utility_call() {
             return Err("Grok utility calls refused: no verified tool-free mode".into());

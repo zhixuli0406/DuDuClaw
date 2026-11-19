@@ -41,25 +41,27 @@ impl OpenAiCompatRuntime {
 
     #[cfg(target_os = "linux")]
     async fn protected_turn(prompt: &str, context: &RuntimeContext) -> Result<RuntimeResponse, String> {
-        use crate::isolation_mcp::runtime::{keep, note_site};
+        use crate::isolation_mcp::{refusal::{site, RefusalSite}, runtime::{keep, note_site}};
         // Same sentence as before R8x; the site is recorded for the log line.
-        let refused = |site: &'static str| {
+        let refused = |site: RefusalSite| {
             note_site(site);
             duduclaw_agent::mcp_spawn_gate::spawn_gate_error(
                 "所選隔離執行設定尚未支援這次工作，請由管理員確認服務與資料保護設定。")
         };
         // R8r-1: these refusals need no authority and run before it is taken
         // or issued, so they never consume a one-time background record.
-        validate_model(&context.model).map_err(keep("preflight.model"))?;
-        crate::product_policy::require_runtime(&context.home_dir, "openai_compat").map_err(keep("preflight.runtime_policy"))?;
+        validate_model(&context.model).map_err(keep(site!("preflight.model")))?;
+        crate::product_policy::require_runtime(&context.home_dir, "openai_compat")
+            .map_err(keep(site!("preflight.runtime_policy")))?;
         crate::product_policy::require_model(crate::product_policy::load(&context.home_dir)
-            .map_err(keep("preflight.model_policy"))?, &context.model).map_err(keep("preflight.model_policy"))?;
+            .map_err(keep(site!("preflight.model_policy")))?, &context.model)
+            .map_err(keep(site!("preflight.model_policy")))?;
         // No silent loss of host interceptors or disclosure leases. These modes
         // need a separate typed worker adapter before protected API execution.
         if crate::ccr_runtime::for_agent(&context.home_dir, &context.agent_id).is_some()
             || crate::redaction_proxy::try_build_interceptor(&context.home_dir, &context.agent_id,
-                &crate::redaction_proxy::current_session_id()).map_err(|_| refused("preflight.redaction"))?.is_some() {
-            return Err(refused("preflight.interceptor"));
+                &crate::redaction_proxy::current_session_id()).map_err(|_| refused(site!("preflight.redaction")))?.is_some() {
+            return Err(refused(site!("preflight.interceptor")));
         }
         // The principal context stays registered until the worker run returns.
         let (authorization, _principal_context) = crate::isolation_mcp::runtime::authorize_api(context).await?;

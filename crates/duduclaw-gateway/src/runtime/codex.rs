@@ -1520,24 +1520,37 @@ impl AgentRuntime for CodexRuntime {
         prompt: &str,
         context: &RuntimeContext,
     ) -> Result<RuntimeResponse, String> {
+        #[cfg(target_os = "linux")]
+        if duduclaw_core::execution_gate::isolation_required() {
+            use crate::isolation_mcp::{refusal::site, runtime::keep};
+            use duduclaw_isolation::execution::RuntimeKind;
+            // R8x: the whole protected turn — this preflight, the S3 gate, the
+            // isolated run (whose own scope joins this one) and the output
+            // checks — is one observed scope: one log line per refused turn.
+            return crate::isolation_mcp::runtime::observed(
+                crate::isolation_mcp::refusal::runtime_label(&RuntimeKind::Codex), &context.agent_id, async {
+                // Check unmanaged layers before preparing files or collecting output.
+                require_mcp_isolation().map_err(keep(site!("preflight.mcp_isolation")))?;
+                // RM-103 S3: the employee's native write/shell restrictions hold in
+                // protected mode too — refused before the isolated route.
+                super::protected_coarse_native_gate(context.capabilities.as_ref(), "codex", &context.agent_id)
+                    .map_err(keep(site!("authorize.native_gate")))?;
+                let payload = super::generic_cli::build_prompt(context, prompt, "codex");
+                let out = crate::isolation_mcp::runtime::execute_native(RuntimeKind::Codex, payload, context).await?;
+                let stdout = std::str::from_utf8(&out).map_err(|_| String::from("invalid isolated Codex output"))
+                    .map_err(keep(site!("output.utf8")))?;
+                let (content, input_tokens, output_tokens, _) = parse_codex_stdout(stdout);
+                if content.trim().is_empty() {
+                    return Err(keep(site!("output.empty"))("isolated Codex returned no answer".into()));
+                }
+                Ok::<_, String>(RuntimeResponse { partial_timeout_secs: None, content, input_tokens, output_tokens,
+                    cache_read_tokens: 0, model_used: context.model.clone(), runtime_name: "codex".into() })
+            }).await;
+        }
         // Check unmanaged layers before preparing files or collecting output.
         require_mcp_isolation()?;
         #[cfg(not(target_os = "linux"))]
         super::isolation_gate::require_integrated(super::isolation_gate::PendingRuntime::Codex)?;
-        #[cfg(target_os = "linux")]
-        if duduclaw_core::execution_gate::isolation_required() {
-            // RM-103 S3: the employee's native write/shell restrictions hold in
-            // protected mode too — refused before the isolated route.
-            super::protected_coarse_native_gate(context.capabilities.as_ref(), "codex", &context.agent_id)?;
-            let payload = super::generic_cli::build_prompt(context, prompt, "codex");
-            let out = crate::isolation_mcp::runtime::execute_native(
-                duduclaw_isolation::execution::RuntimeKind::Codex, payload, context).await?;
-            let stdout = std::str::from_utf8(&out).map_err(|_| "invalid isolated Codex output")?;
-            let (content, input_tokens, output_tokens, _) = parse_codex_stdout(stdout);
-            if content.trim().is_empty() { return Err("isolated Codex returned no answer".into()); }
-            return Ok(RuntimeResponse { partial_timeout_secs: None, content, input_tokens, output_tokens,
-                cache_read_tokens: 0, model_used: context.model.clone(), runtime_name: "codex".into() });
-        }
         if crate::runtime_dispatch::in_utility_call() {
             let (mut cmd, _work_dir, _schema_file) = self.prepare_utility_command(prompt, context)?;
             let payload = utility_stdin_payload(prompt, &context.system_prompt);
