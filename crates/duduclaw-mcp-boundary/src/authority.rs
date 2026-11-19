@@ -5,7 +5,7 @@ use hmac::{Hmac, Mac};
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
-pub use crate::launch_steps::{BoundaryActivateStep, EncodeCheck, IssueStep};
+pub use crate::launch_steps::{BoundaryActivateStep, ContextStep, EncodeCheck, IssueStep};
 
 type HmacSha256 = Hmac<Sha256>;
 const MAX_RECORDS: usize = 4096;
@@ -64,6 +64,10 @@ struct Entry {
     agent_slug: String,
     state: State,
     revoked: tokio::sync::watch::Sender<bool>,
+    /// R8z-5: the live check of a request-context read that revoked this
+    /// entry (diagnosis only; first cause wins). `None` for every other
+    /// revocation (release, sweep, control loss, connection drop).
+    cause: Option<ContextStep>,
 }
 impl Entry {
     fn revoke(&mut self) {
@@ -178,7 +182,8 @@ impl Boundary {
             return Err((IssueStep::Duplicate, VerificationError::Invalid));
         }
         entries.insert(id.0, Entry { record, mac, control: reservation.control,
-            agent_slug: snapshot.agent_slug, state: State::Pending, revoked: tokio::sync::watch::channel(false).0 });
+            agent_slug: snapshot.agent_slug, state: State::Pending, revoked: tokio::sync::watch::channel(false).0,
+            cause: None });
         Ok(id)
     }
 
@@ -302,34 +307,58 @@ impl Boundary {
     }
 }
 
-impl CapabilityVerifier for Boundary {
-    fn verify(&self, record: &CapabilityRecord, proof: CapabilityProof<'_>, binding: &ConnectionBinding,
-        now: u64) -> Result<RequestContext, VerificationError> {
-        let bytes = record.canonical_bytes().map_err(|_| VerificationError::Invalid)?;
-        let mut verifier = HmacSha256::new_from_slice(self.key.as_ref()).map_err(|_| VerificationError::Unavailable)?;
+impl Boundary {
+    /// R8z-5: [`CapabilityVerifier::verify`] with the fixed check that
+    /// refused (same checks, order, errors and revocation as `verify`).
+    fn verify_checked(&self, record: &CapabilityRecord, proof: CapabilityProof<'_>, binding: &ConnectionBinding,
+        now: u64) -> Result<RequestContext, (ContextStep, VerificationError)> {
+        use ContextStep as S;
+        let revoked = (S::Revoked, VerificationError::Revoked);
+        let bytes = record.canonical_bytes().map_err(|_| (S::Proof, VerificationError::Invalid))?;
+        let mut verifier = HmacSha256::new_from_slice(self.key.as_ref())
+            .map_err(|_| (S::Proof, VerificationError::Unavailable))?;
         verifier.update(&bytes);
-        verifier.verify_slice(proof.0).map_err(|_| VerificationError::Invalid)?;
+        verifier.verify_slice(proof.0).map_err(|_| (S::Proof, VerificationError::Invalid))?;
         if record.gateway_epoch != self.epoch || binding.gateway_epoch != self.epoch
             || binding.capability != record.id || binding.employee != record.employee || binding.run != record.run {
-            return Err(VerificationError::BindingMismatch);
+            return Err((S::Proof, VerificationError::BindingMismatch));
         }
-        let snapshot = self.entries.lock().map_err(|_| VerificationError::Unavailable)?
-            .get(&record.id.0).cloned().ok_or(VerificationError::Revoked)?;
+        let snapshot = self.entries.lock().map_err(|_| (S::StateLock, VerificationError::Unavailable))?
+            .get(&record.id.0).cloned().ok_or(revoked)?;
         if !matches!(snapshot.state, State::Active(_)) || &snapshot.record != record {
-            return Err(VerificationError::Revoked);
+            return Err(revoked);
         }
-        let live = self.check_live(&snapshot, now);
-        let mut entries = self.entries.lock().map_err(|_| VerificationError::Unavailable)?;
-        let entry = entries.get_mut(&record.id.0).ok_or(VerificationError::Revoked)?;
-        if entry.state != snapshot.state { return Err(VerificationError::Revoked); }
-        if let Err(error) = live { entry.revoke(); return Err(error); }
-        let State::Active(nonce) = entry.state else { return Err(VerificationError::Revoked); };
+        let live = self.check_live_checked(&snapshot, now);
+        let mut entries = self.entries.lock().map_err(|_| (S::StateLock, VerificationError::Unavailable))?;
+        let entry = entries.get_mut(&record.id.0).ok_or(revoked)?;
+        if entry.state != snapshot.state { return Err(revoked); }
+        if let Err((step, error)) = live {
+            // `check_live_checked` refuses only at these three checks.
+            let step = match step {
+                BoundaryActivateStep::Time => S::Time,
+                BoundaryActivateStep::LiveSnapshot => S::LiveSnapshot,
+                _ => S::LiveMismatch,
+            };
+            // Recorded under the lock before the revocation is signalled, so
+            // a session woken by that signal reads it (diagnosis only).
+            if entry.cause.is_none() { entry.cause = Some(step); }
+            entry.revoke();
+            return Err((step, error));
+        }
+        let State::Active(nonce) = entry.state else { return Err(revoked); };
         // HX5 [F7]: this context came from the run's own activated MCP
         // connection; the binding's run (== record.run, checked above) is the
         // transport run that in-run helper calls must target.
         Ok(RequestContext::with_transport(record.clone(), Arc::new(RequestAuthority {
             boundary: self.weak.clone(), id: record.id, nonce,
         }), binding.run))
+    }
+}
+
+impl CapabilityVerifier for Boundary {
+    fn verify(&self, record: &CapabilityRecord, proof: CapabilityProof<'_>, binding: &ConnectionBinding,
+        now: u64) -> Result<RequestContext, VerificationError> {
+        self.verify_checked(record, proof, binding, now).map_err(|(_, error)| error)
     }
 }
 
@@ -386,21 +415,33 @@ impl Connection {
         let entries = self.boundary.entries.lock().map_err(|_| VerificationError::Unavailable)?;
         Ok(entries.get(&self.id.0).ok_or(VerificationError::Revoked)?.agent_slug.clone())
     }
+    /// R8z-5: the live check that revoked this connection's capability during
+    /// a request-context read, if one did (diagnosis only; never authority).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn revocation_cause(&self) -> Option<ContextStep> {
+        self.boundary.entries.lock().ok()?.get(&self.id.0)?.cause
+    }
 }
 
 fn verified_context(boundary: &Arc<Boundary>, id: CapabilityId, nonce: [u8; 16], now: u64)
     -> Result<RequestContext, VerificationError> {
+    verified_context_checked(boundary, id, nonce, now).map_err(|(_, error)| error)
+}
+
+/// R8z-5: [`verified_context`] with the fixed check that refused.
+fn verified_context_checked(boundary: &Arc<Boundary>, id: CapabilityId, nonce: [u8; 16], now: u64)
+    -> Result<RequestContext, (ContextStep, VerificationError)> {
         let (record, mac) = {
-            let entries = boundary.entries.lock().map_err(|_| VerificationError::Unavailable)?;
-            let entry = entries.get(&id.0).ok_or(VerificationError::Revoked)?;
+            let entries = boundary.entries.lock().map_err(|_| (ContextStep::StateLock, VerificationError::Unavailable))?;
+            let entry = entries.get(&id.0).ok_or((ContextStep::Revoked, VerificationError::Revoked))?;
             if !matches!(entry.state, State::Active(current) if current == nonce) {
-                return Err(VerificationError::Revoked);
+                return Err((ContextStep::Revoked, VerificationError::Revoked));
             }
             (entry.record.clone(), entry.mac)
         };
         let binding = ConnectionBinding { capability: record.id, employee: record.employee,
             run: record.run, gateway_epoch: record.gateway_epoch };
-        boundary.verify(&record, CapabilityProof(&mac), &binding, now)
+        boundary.verify_checked(&record, CapabilityProof(&mac), &binding, now)
 }
 
 /// Blocking authority I/O shares one bounded pool. Cancellation or timeout
@@ -427,20 +468,38 @@ pub(crate) struct ConnectionVerifier {
 }
 #[cfg(target_os = "linux")]
 impl ConnectionVerifier {
+    #[cfg(test)]
     pub(crate) async fn context(&self) -> Result<RequestContext, VerificationError> {
+        self.context_checked().await.map_err(|(_, error)| error)
+    }
+
+    /// R8z-5: the request context with the fixed check that refused. The
+    /// checks, their order and every error are the former `context`'s; the
+    /// blocking job returns its step as a value (`Ok(Err(..))`), an `Err` is
+    /// only ever the blocking-pool wrapper's.
+    pub(crate) async fn context_checked(&self) -> Result<RequestContext, (ContextStep, VerificationError)> {
+        use ContextStep as S;
         let permit = tokio::time::timeout(std::time::Duration::from_secs(2), self.serial.clone().acquire_owned())
-            .await.map_err(|_| VerificationError::Unavailable)?.map_err(|_| VerificationError::Unavailable)?;
+            .await.map_err(|_| (S::SerialWait, VerificationError::Unavailable))?
+            .map_err(|_| (S::SerialWait, VerificationError::Unavailable))?;
         let (boundary, id, nonce) = (self.boundary.clone(), self.id, self.nonce);
-        verify_blocking(move || {
+        let checked = verify_blocking(move || {
             let _permit = permit;
-            let context = verified_context(&boundary, id, nonce, now_seconds()?)?;
-            // Root readback may have consumed the remaining capability TTL.
-            let now = now_seconds()?;
-            if now < context.record().not_before || now >= context.record().expires_at {
-                return Err(VerificationError::InvalidTime);
-            }
-            Ok(context)
-        }).await
+            Ok((|| -> Result<RequestContext, (ContextStep, VerificationError)> {
+                let now = now_seconds().map_err(|error| (S::Clock, error))?;
+                let context = verified_context_checked(&boundary, id, nonce, now)?;
+                // Root readback may have consumed the remaining capability TTL.
+                let now = now_seconds().map_err(|error| (S::Clock, error))?;
+                if now < context.record().not_before || now >= context.record().expires_at {
+                    return Err((S::ExpiredAfter, VerificationError::InvalidTime));
+                }
+                Ok(context)
+            })())
+        }).await;
+        match checked {
+            Ok(result) => result,
+            Err(error) => Err((S::Blocking, error)),
+        }
     }
 }
 impl Drop for Connection {

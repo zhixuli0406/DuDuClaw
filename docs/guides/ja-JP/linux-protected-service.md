@@ -252,7 +252,7 @@ sudo journalctl -u duduclaw-gateway.service --no-pager | grep -E 'isolated (spaw
 | 予約後、開始前 | `launch_prepare`、`policy_binding`、`task_binding`、`pty_size` | 保護された起動コンテキストが拒否した（ゲートウェイによるこの実行の権限の再確認、またはツール境界による実行用権限の発行。準備状態、社員の所属、ランタイムの MCP 登録を確認）。準備した計画が予約した実行と一致しない。予約の終了後にタスクを結び付けた。端末サイズが無効。 |
 | 開始の依頼の作成 | `admission`、`workspace_delivery`、`workspace`、`entry`、`reservation_state`、`resource_limits`、`inputs`、`attachments`、`request_invalid`、`connection_state`、`live_check`、`fd_plan` | 準備状態が変わった。ワークスペースの証明が一致しない。計画が社員自身以外のワークスペースを指定している。実行が不明、別の社員のもの、開始済み、または 30 秒の予約が期限切れ。ランタイムの記録で出力または入力の上限が 0。入力が上限を超えた。添付が多すぎる。依頼が無効（例：ステップ上限が 1〜1000 の範囲外）。制御接続が閉じている。権限の即時確認が拒否した。記述子の構成が一致しない。 |
 | 送信後 | `admission_after_send`、`start_reply` | 開始の依頼の送信中に準備状態が変わった（実行は取り消されます）。想定外の応答。 |
-| 開始後、ツールの提供前 | `launch_activate` | 保護された起動コンテキストがこの実行の MCP エンドポイントを拒否した（下の `isolated launch activation refused` を参照）。開始済みの実行は取り消され、実行用権限も無効化されます。 |
+| 開始後、ツールの提供前 | `take_io`、`take_mcp`、`launch_activate` | 開始済みの実行が待機・起動時間内に標準ストリーム（または端末）を渡さなかった、またはその受け渡しから MCP エンドポイントを取り出せなかった（このときエンドポイントは有効化されません）；保護された起動コンテキストがこの実行の MCP エンドポイントを拒否した（下の `isolated launch activation refused` を参照）。開始済みの実行は取り消され、実行用権限も無効化されます。 |
 | その他の制御依頼 | `cancel_state`、`live_status_reservation`、`work_op`、`helper_op` | 取り消しが中断済み、または既に拒否された。状態の応答が別の予約を指している。その経路では許可されていない操作。 |
 
 `step` が `launch_prepare` のとき、ゲートウェイはその直前にもう 1 件、警告 `isolated launch preparation refused` を記録します。フィールドは拒否した確認を示す固定の `step` だけです（識別子、パス、内容は含みません）。そのターンの `isolated run not started` の行には `spawn.backend.denied` ではなく `site="launch.bind.<step>"` が表示されます。
@@ -308,6 +308,27 @@ sudo journalctl -u duduclaw-gateway.service --no-pager | grep -E 'isolated (laun
 | `inner_activate.boundary_activate.live_mismatch`、`.live_snapshot`、`.time` | エンドポイントが届いた時点で実行がもう動作中でない、その人の権限が変わった、即時確認が失敗した、または実行用権限が期限切れ。 |
 | `inner_activate.delivery`、`.receipt_control`、`.boundary_activate.delivery`、`.boundary_activate.unknown`、`.boundary_activate.binding`、`.boundary_activate.revoked`、`inner_activate.pending_missing`、`.revoked_after`、`.active_duplicate` | エンドポイントがこの実行の予約のものではない、または途中で実行が取り消された。それ以外は不具合。 |
 | `inner_activate.boundary_activate.random`、`.boundary_activate.state_lock`、`inner_activate.state_lock`、`.clock`、`.verify_blocking` | OS の乱数源、システム時計、ブロッキング確認のプールの失敗、または不具合。 |
+
+有効化の後、ゲートウェイは実行が解放されるまでその MCP エンドポイントを提供します。その前にセッションが異常終了すると、ゲートウェイは警告 `isolated MCP session ended` を 1 件記録します。フィールドは固定の `step` のみです（識別子・パス・内容は含みません）。正常に終わった実行（ランタイムがリクエストの合間に MCP を閉じ、その後実行が解放される）は何も記録しません。この行はセッション自身のタスクから出るため、ターンの `isolated run refused` の行はこれを site として持ちません。2 行を突き合わせて読んでください。API ワーカーのターンが `reason="MCP disconnected"` または `"MCP authority changed"` で拒否された場合、たいていこの行で原因が分かります。
+
+```sh
+sudo journalctl -u duduclaw-gateway.service --no-pager | grep -E 'isolated (MCP session ended|run refused)'
+```
+
+| `step` | 確認すること |
+| --- | --- |
+| `second_request` | ランタイムが前のリクエストへの応答前に次のリクエストを送った（そのリクエストの取り消し通知以外）。このリリースより前は、`notifications/initialized` の直後に送られる `tools/list` によって、保護された API ワーカーの実行はすべてこの形で終了していました。再発した場合は報告してください。 |
+| `peer_closed_before_request` | ランタイム側から何も届かなかった：ランタイムが MCP の開始前に失敗した、`/runtime/duduclaw-mcp-bridge` を起動できなかった、またはディスクリプタ 3 が引き継がれなかった。ターンの `isolated run refused` の行（`reason`、`exit`）がランタイム側の状況を示します。 |
+| `peer_closed_in_request` | リクエストの処理中または応答中にランタイムが閉じた：終了した、取り消し・タイムアウトになった、またはブリッジが呼び出しの途中で終了した。 |
+| `revoked` | この実行の実行用権限が、1 秒ごとの巡回（実行の即時確認が失敗）、制御接続の喪失、またはゲートウェイのツール境界の停止によって無効化された。実行自身の解放ではこの行は記録されません。 |
+| `context.live_mismatch`、`context.live_snapshot`、`context.time`、`context.expired_after`、`context.revoked` | 実行の権限の即時再確認（リクエストごと、および 100 ミリ秒ごと）が拒否した：隔離サービスがもう実行中と報告しない、その人の権限・社員の所属・ポリシーが変わった（上の `recheck.*` と同じ原因）、状態の取得が失敗したか 250 ミリ秒を超えた、または実行用権限の有効期間が終わった。 |
+| `context.serial_wait`、`context.blocking`、`context.clock` | 即時再確認が 2 秒を超えた、ブロッキング確認のプールが 2 秒間空かなかったか確認が 10 秒を超えた（`users.db`／`apply.db`、root の読み戻し、状態応答が遅い）、またはシステム時計の失敗。ホストの負荷と `duduclaw-spawnd` のジャーナルを確認してください。 |
+| `admission_timeout`、`readiness` | 最初の即時確認がリクエストの上限（305 秒）を超えた；社員のツールサービスがこの実行の実行用権限に対して揃っていない。 |
+| `frame_invalid`、`frame_too_large`、`frame_partial`、`window_limit` | ランタイムが 1 行 1 件の JSON-RPC 2.0 メッセージ以外を送った、1 行が 256 KiB を超えた、行が途中で切れた、または 60 秒間に 120 件を超えた。 |
+| `dispatcher.<class>`（`invalid`、`invalid_time`、`revoked`、`binding_mismatch`、`unavailable`） | ツールディスパッチャーがメッセージを拒否した（例：ツール引数の形式誤り、未対応の通知、実行のターンをもう解決できない）。末尾はその分類です。 |
+| `request_timeout` | 1 回のツール呼び出し（承認待ちを含む）が 305 秒を超えた。 |
+| `response_encode`、`write_timeout`、`write_failed`、`read_failed` | 応答が 4 MiB を超えた、ランタイムが 5 秒間応答を読まなかった、またはソケットの失敗。 |
+| `socket_missing`、`socket_setup`、`agent_slug`、`subscribe` | セッションを開始できなかった（その間に実行が無効化された）、または不具合。 |
 
 保護モードでは、拒否された作業の原因を文面から判定できない場合、末尾の理由コードは `unknown` ではなく `safety_gate` になります。
 

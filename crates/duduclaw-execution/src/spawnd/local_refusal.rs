@@ -34,6 +34,13 @@ pub(crate) enum Step {
     /// or the caller's memory ceiling.
     PolicyBinding,
     // command::spawn / spawn_pty, after StartRun and the stdio/PTY handoff.
+    /// R8z-5: the started run's stdio/PTY handoff (TakeIo) failed or did not
+    /// arrive within the queue + startup budget; `activate` is never reached
+    /// and the started run is cancelled.
+    TakeIo,
+    /// R8z-5: the started run's MCP endpoint could not be taken from its
+    /// TakeIo reply; `activate` is never reached and the run is cancelled.
+    TakeMcp,
     /// R8z-3: the protected launch context (`ProtectedLaunch::activate`)
     /// refused the run's MCP endpoint; the started run is then cancelled.
     LaunchActivate,
@@ -94,7 +101,8 @@ pub(crate) enum Step {
 impl Step {
     /// Every step, in declaration order (for tests and documentation).
     pub(crate) const ALL: &'static [Step] = &[Step::Admission, Step::TrackedRuns, Step::ReservationReply,
-        Step::ReservationQueue, Step::LaunchPrepare, Step::PolicyBinding, Step::LaunchActivate, Step::TaskBinding, Step::PtySize,
+        Step::ReservationQueue, Step::LaunchPrepare, Step::PolicyBinding, Step::TakeIo, Step::TakeMcp,
+        Step::LaunchActivate, Step::TaskBinding, Step::PtySize,
         Step::WorkspaceDelivery, Step::Workspace, Step::Entry, Step::ReservationState, Step::ResourceLimits,
         Step::Inputs, Step::Attachments, Step::RequestInvalid, Step::AdmissionAfterSend, Step::StartReply,
         Step::EndpointDirectory, Step::EndpointSocket, Step::EndpointConnect, Step::PeerIdentity,
@@ -110,6 +118,8 @@ impl Step {
             Step::ReservationQueue => "reservation_queue",
             Step::LaunchPrepare => "launch_prepare",
             Step::PolicyBinding => "policy_binding",
+            Step::TakeIo => "take_io",
+            Step::TakeMcp => "take_mcp",
             Step::LaunchActivate => "launch_activate",
             Step::TaskBinding => "task_binding",
             Step::PtySize => "pty_size",

@@ -2,7 +2,7 @@
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use duduclaw_execution::command::{NativeCommandSnapshot, ProtectedLaunch};
 use duduclaw_isolation::{bounded::Text, execution::*, ids::EmployeeId};
-use duduclaw_mcp_boundary::launch_steps::{ActivateStep, PrepareStep};
+use duduclaw_mcp_boundary::launch_steps::{ActivateStep, PrepareStep, SessionStep};
 use super::{ProtectedMcpLaunch, authority::{BindStep, GatewayAuthority, PreparedAuthority}};
 use super::refusal::{site, RefusalSite};
 
@@ -119,6 +119,16 @@ fn activation_refused(step: ActivationStep, error: BackendError) -> BackendError
     error
 }
 
+/// R8z-5: the one line for a run's MCP session that ended abnormally before
+/// the run was released (fixed `step` only: `SessionStep::as_str`). The
+/// boundary calls this from the session's own detached task, once; a normal
+/// end or the run's release logs nothing. The turn's trace (task-local to
+/// the turn's task) is not reachable from that task, so no site is recorded;
+/// the turn still logs its own `isolated run refused` line.
+pub(super) fn log_session_ended(step: SessionStep) {
+    tracing::warn!(step = step.as_str(), "isolated MCP session ended");
+}
+
 pub(super) struct AuthorizedLaunch {
     inner: Arc<ProtectedMcpLaunch>,
     authority: Arc<GatewayAuthority>,
@@ -189,6 +199,9 @@ impl ProtectedLaunch for AuthorizedLaunch {
     fn revoke(&self, run: RunHandle) -> BackendFuture<'_, ()> {
         Box::pin(async move {
             self.revoked.store(true, Ordering::Release);
+            // R8z-5: dropping the association below fails the session's next
+            // live check; that is the release, not an abnormal session end.
+            self.inner.mark_released(run);
             self.authority.revoke_run(run);
             self.inner.revoke(run).await
         })
@@ -198,6 +211,7 @@ impl Drop for AuthorizedLaunch {
     fn drop(&mut self) {
         self.revoked.store(true, Ordering::Release);
         if let Some(run) = self.run.get_mut().unwrap_or_else(|error| error.into_inner()).take() {
+            self.inner.mark_released(run);
             self.authority.revoke_run(run);
         }
     }
@@ -271,6 +285,26 @@ mod tests {
             assert_eq!(logs.lines().count(), 1, "{logs}");
             assert!(logs.contains("WARN") && logs.contains("isolated launch activation refused"), "{logs}");
             assert!(logs.trim_end().ends_with(&format!("refused step=\"{}\"", step.as_str())), "{logs}");
+            assert_eq!(logs.matches('=').count(), 1, "{logs}");
+        }
+    }
+
+    /// R8z-5: one session-end line per abnormal end, fixed `step` field only,
+    /// for every session step (a distinct literal each).
+    #[test]
+    fn r8z5_the_session_ended_line_has_the_fixed_step_field_only() {
+        let mut seen = std::collections::BTreeSet::new();
+        for step in SessionStep::every() {
+            assert!(seen.insert(step.as_str()), "duplicate step {}", step.as_str());
+            let log = LogCapture(Default::default());
+            let writer = log.clone();
+            let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false).with_target(false)
+                .with_max_level(tracing::Level::WARN).with_writer(move || writer.clone()).finish();
+            tracing::subscriber::with_default(subscriber, || log_session_ended(step));
+            let logs = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+            assert_eq!(logs.lines().count(), 1, "{logs}");
+            assert!(logs.contains("WARN") && logs.contains("isolated MCP session ended"), "{logs}");
+            assert!(logs.trim_end().ends_with(&format!("ended step=\"{}\"", step.as_str())), "{logs}");
             assert_eq!(logs.matches('=').count(), 1, "{logs}");
         }
     }

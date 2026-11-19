@@ -1,6 +1,7 @@
 use std::{future::Future, pin::Pin};
 use serde_json::Value;
 use crate::{RequestContext, VerificationError};
+pub use crate::launch_steps::{ContextStep, SessionStep};
 
 pub const MAX_REQUEST_BYTES: usize = 256 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
@@ -40,16 +41,24 @@ pub fn decode(line: &[u8]) -> Result<Value, VerificationError> {
 /// Fixed-size chunk reads; no unbounded read_line allocation. Partial EOF fails.
 pub async fn read_frame<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R)
     -> Result<Option<Vec<u8>>, VerificationError> {
+    read_frame_checked(reader).await.map_err(|(_, error)| error)
+}
+
+/// R8z-5: [`read_frame`] with the fixed step that refused.
+async fn read_frame_checked<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R)
+    -> Result<Option<Vec<u8>>, (SessionStep, VerificationError)> {
     use tokio::io::AsyncBufReadExt;
     let mut frame = Vec::new();
     loop {
-        let bytes = reader.fill_buf().await.map_err(|_| VerificationError::Unavailable)?;
+        let bytes = reader.fill_buf().await.map_err(|_| (SessionStep::ReadFailed, VerificationError::Unavailable))?;
         if bytes.is_empty() {
-            return if frame.is_empty() { Ok(None) } else { Err(VerificationError::Invalid) };
+            return if frame.is_empty() { Ok(None) } else { Err((SessionStep::FramePartial, VerificationError::Invalid)) };
         }
         let end = bytes.iter().position(|byte| *byte == b'\n');
         let count = end.unwrap_or(bytes.len());
-        if count > MAX_REQUEST_BYTES.saturating_sub(frame.len()) { return Err(VerificationError::Invalid); }
+        if count > MAX_REQUEST_BYTES.saturating_sub(frame.len()) {
+            return Err((SessionStep::FrameTooLarge, VerificationError::Invalid));
+        }
         frame.extend_from_slice(&bytes[..count]);
         reader.consume(count + usize::from(end.is_some()));
         if end.is_some() { return Ok(Some(frame)); }
@@ -61,9 +70,20 @@ pub async fn read_frame<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R)
 /// request deadline includes approvals. EOF cancels the handler future; a
 /// disconnected call cannot publish a later result. No pathname listener exists.
 #[cfg(target_os = "linux")]
-pub async fn serve(mut connection: crate::Connection, dispatcher: &dyn Dispatcher)
+pub async fn serve(connection: crate::Connection, dispatcher: &dyn Dispatcher)
     -> Result<(), VerificationError> {
-    serve_with_deadline(&mut connection, dispatcher,
+    serve_checked(connection, dispatcher).await.map(|_| ()).map_err(|(_, error)| error)
+}
+
+/// R8z-5: [`serve`] with the fixed step at which the session ended. `Err`
+/// carries exactly `serve`'s error; `Ok(Some(step))` is an `Ok(())` end of
+/// `serve` that is still abnormal (the peer closed before any frame, or
+/// while a request was being handled); `Ok(None)` is the normal end (the
+/// peer closed between requests). Nothing here logs: the owner observes it.
+#[cfg(target_os = "linux")]
+pub async fn serve_checked(mut connection: crate::Connection, dispatcher: &dyn Dispatcher)
+    -> Result<Option<SessionStep>, (SessionStep, VerificationError)> {
+    serve_with_deadline_checked(&mut connection, dispatcher,
         std::time::Duration::from_millis(crate::config::CLI_TOOL_TIMEOUT_MS)).await
 }
 
@@ -79,72 +99,117 @@ pub fn cancels_request(frame: &Value, id: &Value) -> bool {
             .is_some_and(|request| !id.is_null() && request == id)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", test))]
 pub(crate) async fn serve_with_deadline(connection: &mut crate::Connection, dispatcher: &dyn Dispatcher,
     request_timeout: std::time::Duration) -> Result<(), VerificationError> {
+    serve_with_deadline_checked(connection, dispatcher, request_timeout).await
+        .map(|_| ()).map_err(|(_, error)| error)
+}
+
+/// R8z-5: the outcome of [`serve_checked`].
+#[cfg(target_os = "linux")]
+pub(crate) type SessionOutcome = Result<Option<SessionStep>, (SessionStep, VerificationError)>;
+
+#[cfg(target_os = "linux")]
+fn at(step: SessionStep) -> impl Fn(VerificationError) -> (SessionStep, VerificationError) {
+    move |error| (step, error)
+}
+
+#[cfg(target_os = "linux")]
+fn context_step((step, error): (ContextStep, VerificationError)) -> (SessionStep, VerificationError) {
+    (SessionStep::Context(step), error)
+}
+
+#[cfg(target_os = "linux")]
+fn dispatch_step(error: VerificationError) -> (SessionStep, VerificationError) {
+    (SessionStep::Dispatcher(error), error)
+}
+
+/// The serving loop. Every exit is unchanged from before R8z-5 except one
+/// (the R8z-5 fix below): each `Err` now also names its [`SessionStep`].
+#[cfg(target_os = "linux")]
+pub(crate) async fn serve_with_deadline_checked(connection: &mut crate::Connection, dispatcher: &dyn Dispatcher,
+    request_timeout: std::time::Duration) -> SessionOutcome {
     use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-    let socket = connection.socket.take().ok_or(VerificationError::Invalid)?;
-    socket.set_nonblocking(true).map_err(|_| VerificationError::Unavailable)?;
-    let socket = tokio::net::UnixStream::from_std(socket).map_err(|_| VerificationError::Unavailable)?;
+    use SessionStep as S;
+    let expired = (S::RequestTimeout, VerificationError::Unavailable);
+    let socket = connection.socket.take().ok_or((S::SocketMissing, VerificationError::Invalid))?;
+    socket.set_nonblocking(true).map_err(|_| (S::SocketSetup, VerificationError::Unavailable))?;
+    let socket = tokio::net::UnixStream::from_std(socket).map_err(|_| (S::SocketSetup, VerificationError::Unavailable))?;
     let (reader, mut writer) = socket.into_split();
     let mut reader = tokio::io::BufReader::new(reader);
-    let agent_slug = connection.agent_slug()?;
+    let agent_slug = connection.agent_slug().map_err(at(S::AgentSlug))?;
     let verifier = connection.verifier();
-    let mut revoked = connection.revocation()?;
+    let mut revoked = connection.revocation().map_err(at(S::Subscribe))?;
+    // The error stays `serve`'s `Revoked`. The step names this connection's
+    // own live check when one of its context reads revoked the capability
+    // (that read signals the revocation before it returns); any other
+    // revocation (release, sweep, control loss) is `revoked`.
+    let revocation = || (connection.revocation_cause().map_or(S::Revoked, S::Context), VerificationError::Revoked);
     // This future is polled alongside the handler/deadline, never awaited in
     // a selected branch. Slow authority I/O cannot monopolize the reactor.
     let watch = async {
         loop {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            verifier.context().await?;
+            verifier.context_checked().await.map_err(context_step)?;
         }
         #[allow(unreachable_code)]
-        Ok::<(), VerificationError>(())
+        Ok::<Option<SessionStep>, (SessionStep, VerificationError)>(None)
     };
     tokio::pin!(watch);
     // Admission uses the same bounded, cancellable authority read as requests.
     let context = tokio::select! {
         biased;
-        _ = wait_revoked(&mut revoked) => return Err(VerificationError::Revoked),
+        _ = wait_revoked(&mut revoked) => return Err(revocation()),
         result = &mut watch => return result,
-        result = peer_eof(&mut reader) => return result,
-        result = tokio::time::timeout(request_timeout, verifier.context()) =>
-            result.map_err(|_| VerificationError::Unavailable)??,
+        result = peer_eof(&mut reader) => return result.map(|()| Some(S::PeerClosedBeforeRequest)),
+        result = tokio::time::timeout(request_timeout, verifier.context_checked()) =>
+            result.map_err(|_| (S::AdmissionTimeout, VerificationError::Unavailable))?.map_err(context_step)?,
     };
-    dispatcher.require_context_services(&context)?;
+    dispatcher.require_context_services(&context).map_err(at(S::Readiness))?;
     let mut window = tokio::time::Instant::now();
     let mut requests = 0u16;
+    let mut received = false;
     loop {
         let frame = {
-            let read = read_frame(&mut reader);
+            let read = read_frame_checked(&mut reader);
             tokio::pin!(read);
             loop {
                 tokio::select! {
                     biased;
-                    _ = wait_revoked(&mut revoked) => return Err(VerificationError::Revoked),
+                    _ = wait_revoked(&mut revoked) => return Err(revocation()),
                     result = &mut read => break result?,
                     result = &mut watch => return result,
                 }
             }
         };
-        let Some(frame) = frame else { return Ok(()); };
+        // The peer closed between requests: the normal end, unless it never
+        // sent anything.
+        let Some(frame) = frame else { return Ok((!received).then_some(S::PeerClosedBeforeRequest)); };
+        received = true;
         if window.elapsed() >= Duration::from_secs(60) {
             window = tokio::time::Instant::now();
             requests = 0;
         }
-        if requests == 120 { return Err(VerificationError::Unavailable); }
+        if requests == 120 { return Err((S::WindowLimit, VerificationError::Unavailable)); }
         requests += 1;
-        let request = decode(&frame)?;
+        let request = decode(&frame).map_err(at(S::FrameInvalid))?;
+        // A notification (no id) is never answered; the peer does not wait
+        // for it and may send its next request at once.
+        let notification = request.get("id").is_none();
+        // A peer that closes while a request is handled or answered loses
+        // that answer; a notification has none to lose.
+        let in_request = (!notification).then_some(S::PeerClosedInRequest);
         let deadline = tokio::time::sleep(request_timeout);
         tokio::pin!(deadline);
         let context = tokio::select! {
             biased;
-            _ = wait_revoked(&mut revoked) => return Err(VerificationError::Revoked),
-            result = verifier.context() => result?,
+            _ = wait_revoked(&mut revoked) => return Err(revocation()),
+            result = verifier.context_checked() => result.map_err(context_step)?,
             result = &mut watch => return result,
-            result = peer_eof(&mut reader) => return result,
-            _ = &mut deadline => return Err(VerificationError::Unavailable),
+            result = peer_eof(&mut reader) => return result.map(|()| in_request),
+            _ = &mut deadline => return Err(expired),
         };
         let request_id = request.get("id").cloned().unwrap_or(Value::Null);
         let call = dispatcher.dispatch(context, &agent_slug, request);
@@ -153,73 +218,93 @@ pub(crate) async fn serve_with_deadline(connection: &mut crate::Connection, disp
         // that actually yields can conflict with a second in-flight request.
         let immediate = tokio::select! {
             biased;
-            _ = wait_revoked(&mut revoked) => return Err(VerificationError::Revoked),
+            _ = wait_revoked(&mut revoked) => return Err(revocation()),
             result = std::future::poll_fn(|cx| match call.as_mut().poll(cx) {
                 std::task::Poll::Ready(value) => std::task::Poll::Ready(Some(value)),
                 std::task::Poll::Pending => std::task::Poll::Ready(None),
             }) => result,
         };
-        let response = if let Some(result) = immediate { result? } else {
+        let response = if let Some(result) = immediate { result.map_err(dispatch_step)? } else if notification {
+            // R8z-5: a yielding notification handler (every handler of the
+            // production dispatcher yields: it resolves the run's turn in
+            // the blocking pool) is not a request in flight. The peer's next
+            // frame — `tools/list` right after `notifications/initialized` —
+            // stays buffered and is read after this handler, never refused
+            // as a second in-flight request. Still one handler at a time.
+            tokio::select! {
+                biased;
+                _ = wait_revoked(&mut revoked) => return Err(revocation()),
+                result = &mut watch => return result,
+                result = &mut call => result.map_err(dispatch_step)?,
+                result = peer_eof(&mut reader) => return result.map(|()| in_request),
+                _ = &mut deadline => return Err(expired),
+            }
+        } else {
             let in_flight = tokio::select! {
                 biased;
-                _ = wait_revoked(&mut revoked) => return Err(VerificationError::Revoked),
+                _ = wait_revoked(&mut revoked) => return Err(revocation()),
                 result = &mut watch => return result,
-                result = &mut call => Some(result?),
+                result = &mut call => Some(result.map_err(dispatch_step)?),
                 next = reader.fill_buf() => {
                     // EOF = connection closed mid-call: dropping the call
                     // future cancels it (in-run helpers: `HelperCancel`).
-                    if next.map_err(|_| VerificationError::Unavailable)?.is_empty() { return Ok(()); }
+                    if next.map_err(|_| (S::ReadFailed, VerificationError::Unavailable))?.is_empty() {
+                        return Ok(in_request);
+                    }
                     None
                 }
-                _ = &mut deadline => return Err(VerificationError::Unavailable),
+                _ = &mut deadline => return Err(expired),
             };
             match in_flight {
                 Some(response) => response,
                 None => {
                     let next = tokio::select! {
                         biased;
-                        _ = wait_revoked(&mut revoked) => return Err(VerificationError::Revoked),
-                        result = read_frame(&mut reader) => result?,
-                        _ = &mut deadline => return Err(VerificationError::Unavailable),
+                        _ = wait_revoked(&mut revoked) => return Err(revocation()),
+                        result = read_frame_checked(&mut reader) => result?,
+                        _ = &mut deadline => return Err(expired),
                     };
-                    let Some(next) = next else { return Ok(()); };
+                    let Some(next) = next else { return Ok(in_request); };
                     // HX5 (Q5): `notifications/cancelled` for this request
                     // drops the call (its cancel path runs) and keeps the
                     // connection; MCP answers no cancelled request.
-                    if cancels_request(&decode(&next)?, &request_id) { continue; }
-                    return Err(VerificationError::Invalid);
+                    if cancels_request(&decode(&next).map_err(at(S::FrameInvalid))?, &request_id) { continue; }
+                    return Err((S::SecondRequest, VerificationError::Invalid));
                 }
             }
         };
         tokio::select! {
             biased;
-            _ = wait_revoked(&mut revoked) => return Err(VerificationError::Revoked),
-            result = verifier.context() => { result?; },
+            _ = wait_revoked(&mut revoked) => return Err(revocation()),
+            result = verifier.context_checked() => { result.map_err(context_step)?; },
             result = &mut watch => return result,
-            result = peer_eof(&mut reader) => return result,
-            _ = &mut deadline => return Err(VerificationError::Unavailable),
+            result = peer_eof(&mut reader) => return result.map(|()| in_request),
+            _ = &mut deadline => return Err(expired),
         }
         if let Some(response) = response {
-            let bytes = encode_response(&response)?;
+            let bytes = encode_response(&response).map_err(at(S::ResponseEncode))?;
             let write = tokio::time::timeout(Duration::from_secs(5), writer.write_all(&bytes));
             tokio::pin!(write);
             tokio::select! {
                 biased;
-                _ = wait_revoked(&mut revoked) => return Err(VerificationError::Revoked),
+                _ = wait_revoked(&mut revoked) => return Err(revocation()),
                     result = &mut watch => return result,
                     result = &mut write => {
-                        result.map_err(|_| VerificationError::Unavailable)?
-                            .map_err(|_| VerificationError::Unavailable)?;
+                        result.map_err(|_| (S::WriteTimeout, VerificationError::Unavailable))?
+                            .map_err(|_| (S::WriteFailed, VerificationError::Unavailable))?;
                     }
             }
         }
     }
 }
 
+/// Resolves `Ok(())` at EOF; a read error is `read_failed`.
 #[cfg(target_os = "linux")]
-async fn peer_eof<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> Result<(), VerificationError> {
+async fn peer_eof<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> Result<(), (SessionStep, VerificationError)> {
     use tokio::io::AsyncBufReadExt;
-    if reader.fill_buf().await.map_err(|_| VerificationError::Unavailable)?.is_empty() { return Ok(()); }
+    if reader.fill_buf().await.map_err(|_| (SessionStep::ReadFailed, VerificationError::Unavailable))?.is_empty() {
+        return Ok(());
+    }
     // A buffered next protocol message is not EOF. Preserve it for the normal
     // dispatch stage, which applies the one-in-flight-request rule.
     std::future::pending().await

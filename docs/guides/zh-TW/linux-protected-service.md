@@ -252,7 +252,7 @@ sudo journalctl -u duduclaw-gateway.service --no-pager | grep -E 'isolated (spaw
 | 預約之後、開始之前 | `launch_prepare`、`policy_binding`、`task_binding`、`pty_size` | 受保護的啟動環境拒絕（閘道為這次執行重新檢查此人的授權，或工具邊界發出這次執行的能力憑證：就緒狀態、員工的歸屬、執行環境的 MCP 註冊）；準備好的計畫與預約的執行不符；預約結束後才綁定任務；終端機大小無效。 |
 | 組成開始要求 | `admission`、`workspace_delivery`、`workspace`、`entry`、`reservation_state`、`resource_limits`、`inputs`、`attachments`、`request_invalid`、`connection_state`、`live_check`、`fd_plan` | 就緒狀態改變；工作區證明不符；計畫指定的不是員工自己的工作區；執行不存在、屬於其他員工、已經開始，或 30 秒的預約已過期；執行環境紀錄的輸出或輸入額度為零；請求超過輸入額度；附件太多；要求無效（例如步數上限不在 1–1000）；控制連線已關閉；即時授權檢查拒絕；描述子配置不符。 |
 | 送出之後 | `admission_after_send`、`start_reply` | 開始要求送出期間就緒狀態改變（這次執行會被取消）；非預期的回覆。 |
-| 開始之後、提供工具之前 | `launch_activate` | 受保護的啟動環境拒絕了這次執行的 MCP 端點（見下方 `isolated launch activation refused`）。已開始的執行會被取消，能力憑證也會撤銷。 |
+| 開始之後、提供工具之前 | `take_io`、`take_mcp`、`launch_activate` | 已開始的執行沒有在排隊與啟動時間內交出標準串流（或終端機），或無法從該交接取得它的 MCP 端點——這時端點根本不會啟用；受保護的啟動環境拒絕了這次執行的 MCP 端點（見下方 `isolated launch activation refused`）。已開始的執行會被取消，能力憑證也會撤銷。 |
 | 其他控制要求 | `cancel_state`、`live_status_reservation`、`work_op`、`helper_op` | 取消已放棄或已被拒絕；狀態回覆指向另一個預約；該路徑不允許的操作。 |
 
 `step` 為 `launch_prepare` 時，閘道會在它之前再記一筆警告 `isolated launch preparation refused`，只有一個固定欄位 `step`，指出是哪一項檢查拒絕（不含識別資訊、路徑或內容）。這一輪的 `isolated run not started` 那一行則會顯示 `site="launch.bind.<step>"`，而不是 `spawn.backend.denied`。
@@ -308,6 +308,27 @@ sudo journalctl -u duduclaw-gateway.service --no-pager | grep -E 'isolated (laun
 | `inner_activate.boundary_activate.live_mismatch`、`.live_snapshot`、`.time` | 端點送達時執行已不在進行中、此人的授權已改變、即時檢查失敗，或能力憑證已過期。 |
 | `inner_activate.delivery`、`.receipt_control`、`.boundary_activate.delivery`、`.boundary_activate.unknown`、`.boundary_activate.binding`、`.boundary_activate.revoked`、`inner_activate.pending_missing`、`.revoked_after`、`.active_duplicate` | 端點不屬於這次執行的預約，或期間執行被取消；否則是缺陷。 |
 | `inner_activate.boundary_activate.random`、`.boundary_activate.state_lock`、`inner_activate.state_lock`、`.clock`、`.verify_blocking` | 作業系統亂數來源、系統時鐘或阻塞檢查工作池失敗，或是缺陷。 |
+
+端點啟用後，閘道會持續服務這次執行的 MCP 端點，直到執行被釋放。若工作階段在那之前異常結束，閘道會記一筆警告 `isolated MCP session ended`，只有一個固定欄位 `step`（不含識別資訊、路徑或內容）。正常結束的執行（執行環境在兩個請求之間關閉 MCP，之後執行被釋放）不會記錄。這一行來自工作階段自己的工作，所以這一輪的 `isolated run refused` 那一行不會把它當成 site：請把兩行對照著看。API 工作程序以 `reason="MCP disconnected"` 或 `"MCP authority changed"` 被拒的那一輪，通常可由這一行說明原因。
+
+```sh
+sudo journalctl -u duduclaw-gateway.service --no-pager | grep -E 'isolated (MCP session ended|run refused)'
+```
+
+| `step` | 要檢查什麼 |
+| --- | --- |
+| `second_request` | 執行環境在前一個請求尚未回覆時又送出請求（不是取消該請求的通知）。本版之前，緊接在 `notifications/initialized` 之後送出的 `tools/list` 會讓每一次受保護的 API 工作程序執行都這樣結束；若再次出現請回報。 |
+| `peer_closed_before_request` | 執行環境那一端什麼都沒送：執行環境在啟動 MCP 前就失敗、`/runtime/duduclaw-mcp-bridge` 無法啟動，或沒有繼承描述子 3。這一輪的 `isolated run refused` 那一行（`reason`、`exit`）會指出執行環境那端的情況。 |
+| `peer_closed_in_request` | 執行環境在請求處理或回覆期間關閉：它結束了、被取消或逾時，或它的橋接程式在呼叫途中終止。 |
+| `revoked` | 這次執行的能力憑證被每秒一次的巡檢（這次執行的即時檢查失敗）、控制連線中斷，或閘道的工具邊界停止而撤銷。執行本身的釋放不會記這一行。 |
+| `context.live_mismatch`、`context.live_snapshot`、`context.time`、`context.expired_after`、`context.revoked` | 對這次執行授權的即時重新檢查（每個請求及每 100 毫秒）拒絕：隔離服務已不再回報這次執行正在進行、此人的授權、員工的歸屬或政策有變動（原因同上方的 `recheck.*`）、狀態查詢失敗或超過 250 毫秒，或能力憑證的有效期已結束。 |
+| `context.serial_wait`、`context.blocking`、`context.clock` | 某次即時重新檢查超過 2 秒、阻塞檢查工作池忙碌超過 2 秒或檢查超過 10 秒（`users.db`／`apply.db`、root 讀回或狀態回覆太慢），或系統時鐘失敗。請檢查主機負載與 `duduclaw-spawnd` 日誌。 |
+| `admission_timeout`、`readiness` | 第一次即時檢查超過請求時限（305 秒）；員工的工具服務對這次執行的能力憑證不完整。 |
+| `frame_invalid`、`frame_too_large`、`frame_partial`、`window_limit` | 執行環境送出的不是每行一則 JSON-RPC 2.0 訊息、單行超過 256 KiB、行被截斷，或 60 秒內超過 120 則訊息。 |
+| `dispatcher.<class>`（`invalid`、`invalid_time`、`revoked`、`binding_mismatch`、`unavailable`） | 工具分派器拒絕了某則訊息（例如工具參數格式錯誤、不支援的通知，或這次執行的工作輪次已無法解析），後綴為其類別。 |
+| `request_timeout` | 單一工具呼叫（含等待核准）超過 305 秒。 |
+| `response_encode`、`write_timeout`、`write_failed`、`read_failed` | 回覆超過 4 MiB、執行環境 5 秒內沒有讀取回覆，或 socket 失敗。 |
+| `socket_missing`、`socket_setup`、`agent_slug`、`subscribe` | 工作階段無法開始（期間執行已被撤銷），或是缺陷。 |
 
 在受保護模式下，若被拒絕的工作無法從文字判斷原因，結尾的原因代碼會是 `safety_gate`，不再是 `unknown`。
 

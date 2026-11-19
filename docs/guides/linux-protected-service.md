@@ -252,7 +252,7 @@ sudo journalctl -u duduclaw-gateway.service --no-pager | grep -E 'isolated (spaw
 | Between reservation and start | `launch_prepare`, `policy_binding`, `task_binding`, `pty_size` | The protected launch context refused (the gateway re-checking the person's authority for this run, or the tool boundary issuing the run's capability: readiness, the employee's binding, the runtime's MCP registration); the prepared plan does not match the reserved run; the task was bound after the reservation ended; an invalid terminal size. |
 | Building the start request | `admission`, `workspace_delivery`, `workspace`, `entry`, `reservation_state`, `resource_limits`, `inputs`, `attachments`, `request_invalid`, `connection_state`, `live_check`, `fd_plan` | Readiness changed; the workspace proof does not match; the plan names a workspace other than the employee's own; the run is unknown, belongs to another employee, was already started or its 30-second reservation expired; the runtime record has a zero output or input budget; the request exceeds the input budget; too many attachments; the request is invalid (for example a step limit outside 1–1000); the control connection is closed; the live authority check refused; the descriptor plan does not match. |
 | After sending it | `admission_after_send`, `start_reply` | Readiness changed while the start was in flight (the run is cancelled); an unexpected reply. |
-| After start, before the run's tools are served | `launch_activate` | The protected launch context refused the run's MCP endpoint (see `isolated launch activation refused`, below). The started run is cancelled and its capability revoked. |
+| After start, before the run's tools are served | `take_io`, `take_mcp`, `launch_activate` | The started run's standard streams (or terminal) were not handed over within the queue and startup time, or its MCP endpoint could not be taken from that handoff — the endpoint is then never activated; the protected launch context refused the run's MCP endpoint (see `isolated launch activation refused`, below). The started run is cancelled and its capability revoked. |
 | Other control requests | `cancel_state`, `live_status_reservation`, `work_op`, `helper_op` | A cancel abandoned or already refused; a status reply naming another reservation; an operation not allowed on that path. |
 
 When the step is `launch_prepare`, the gateway logs one more warning just before it, `isolated launch preparation refused`, with one fixed field `step` naming the check that refused (no identifiers, paths or content). The turn's `isolated run not started` line then shows `site="launch.bind.<step>"` instead of `spawn.backend.denied`.
@@ -308,6 +308,27 @@ After the run has started, the tool boundary activates its MCP endpoint. A refus
 | `inner_activate.boundary_activate.live_mismatch`, `.live_snapshot`, `.time` | When the endpoint arrived the run was no longer running, the person's authority had changed, the live check failed, or the capability had expired. |
 | `inner_activate.delivery`, `.receipt_control`, `.boundary_activate.delivery`, `.boundary_activate.unknown`, `.boundary_activate.binding`, `.boundary_activate.revoked`, `inner_activate.pending_missing`, `.revoked_after`, `.active_duplicate` | The endpoint does not belong to this run's reservation, or the run was cancelled meanwhile; otherwise a defect. |
 | `inner_activate.boundary_activate.random`, `.boundary_activate.state_lock`, `inner_activate.state_lock`, `.clock`, `.verify_blocking` | The OS random source, the wall clock or the blocking-check pool failed, or a defect. |
+
+Once activated, the gateway serves the run's MCP endpoint until the run is released. If that session ends abnormally first, the gateway logs one warning `isolated MCP session ended` with one fixed field `step` (no identifiers, paths or content). A run that ends normally (its runtime closes MCP between requests, then the run is released) logs nothing. The line comes from the session's own task, so the turn's `isolated run refused` line does not carry its step as a site: read the two lines together. An API-worker turn refused with `reason="MCP disconnected"` or `"MCP authority changed"` is usually explained by this line.
+
+```sh
+sudo journalctl -u duduclaw-gateway.service --no-pager | grep -E 'isolated (MCP session ended|run refused)'
+```
+
+| `step` | What to check |
+| --- | --- |
+| `second_request` | The runtime sent a request while another one was still unanswered (other than that request's cancel). Before this release, `tools/list` sent right after `notifications/initialized` ended every protected API-worker run this way; if it recurs, report it. |
+| `peer_closed_before_request` | The runtime side never sent anything: the runtime failed before starting MCP, `/runtime/duduclaw-mcp-bridge` could not start, or descriptor 3 was not inherited. The turn's `isolated run refused` line (`reason`, `exit`) names the runtime's side. |
+| `peer_closed_in_request` | The runtime closed while a request was being handled or answered: it exited, was cancelled or timed out, or its bridge died mid-call. |
+| `revoked` | The run's capability was revoked by the 1-second sweep (the run's live check failed), the loss of the run's control connection, or the gateway's boundary stopping. The run's own release never logs this line. |
+| `context.live_mismatch`, `context.live_snapshot`, `context.time`, `context.expired_after`, `context.revoked` | The live re-check of the run's authority (at every request and every 100 ms) refused: the isolation service no longer reports the run as running, the person's authority, the employee's binding or the policy changed (the same causes as `recheck.*` above), the status read failed or took over 250 ms, or the capability's window ended. |
+| `context.serial_wait`, `context.blocking`, `context.clock` | One live re-check took over 2 s, the blocking-check pool stayed busy for 2 s or a check took over 10 s (slow `users.db`/`apply.db`, root read-back or status reply), or the wall clock failed. Check host load and the `duduclaw-spawnd` journal. |
+| `admission_timeout`, `readiness` | The first live check took longer than the request limit (305 s); the employee's tool services are incomplete for this run's capability. |
+| `frame_invalid`, `frame_too_large`, `frame_partial`, `window_limit` | The runtime sent something other than one JSON-RPC 2.0 message per line, a line over 256 KiB, a cut-off line, or more than 120 messages within 60 s. |
+| `dispatcher.<class>` (`invalid`, `invalid_time`, `revoked`, `binding_mismatch`, `unavailable`) | The tool dispatcher refused a message (for example malformed tool arguments, an unsupported notification, or the run's turn no longer resolving), with its class. |
+| `request_timeout` | One tool call, including waiting for its approval, took longer than 305 s. |
+| `response_encode`, `write_timeout`, `write_failed`, `read_failed` | A response over 4 MiB, the runtime not reading its responses for 5 s, or the socket failed. |
+| `socket_missing`, `socket_setup`, `agent_slug`, `subscribe` | The session could not start (the run was revoked meanwhile), or a defect. |
 
 In protected mode, a refused turn whose cause the text classifier cannot name ends with the reason code `safety_gate` instead of `unknown`.
 
