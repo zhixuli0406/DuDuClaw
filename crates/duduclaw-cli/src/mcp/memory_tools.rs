@@ -69,10 +69,24 @@ pub(crate) async fn handle_memory_search_by_layer(
     }
 }
 
+/// v1.83.0: on a channel conversation turn only rows visible under the
+/// conversation scope are returned; the scope applies before the limit, and
+/// an unknown conversation gets nothing.
 pub(crate) async fn handle_memory_successful_conversations(
     params: &Value,
     memory: &SqliteMemoryEngine,
     agent_id: &str,
+) -> Value {
+    let scope = crate::mcp_memory_handlers::mcp_read_scope(agent_id);
+    handle_memory_successful_conversations_in(params, memory, agent_id, &scope).await
+}
+
+/// [`handle_memory_successful_conversations`] with an explicit scope.
+pub(crate) async fn handle_memory_successful_conversations_in(
+    params: &Value,
+    memory: &SqliteMemoryEngine,
+    agent_id: &str,
+    scope: &crate::mcp_memory_handlers::ReadScope,
 ) -> Value {
     let topic = params.get("topic").and_then(|v| v.as_str()).unwrap_or("");
     if topic.is_empty() {
@@ -83,10 +97,31 @@ pub(crate) async fn handle_memory_successful_conversations(
     }
     let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
 
-    match memory
-        .search_successful_conversations(agent_id, topic, limit)
-        .await
-    {
+    let found = match scope {
+        crate::mcp_memory_handlers::ReadScope::Employee => {
+            memory.search_successful_conversations(agent_id, topic, limit).await
+        }
+        crate::mcp_memory_handlers::ReadScope::Conversation(None) => Ok(Vec::new()),
+        // Every match (newest first), other conversations' rows dropped, then the limit.
+        crate::mcp_memory_handlers::ReadScope::Conversation(Some(session)) => {
+            match memory.search_successful_conversation_rows(agent_id, topic, None).await {
+                Ok(rows) => {
+                    let ids: Vec<String> = rows.iter().map(|(id, _)| id.clone()).collect();
+                    match memory.ids_hidden_from_conversation(agent_id, &ids, Some(session.as_str())).await {
+                        Ok(hidden) => Ok(rows
+                            .into_iter()
+                            .filter(|(id, _)| !hidden.contains(id))
+                            .map(|(_, content)| content)
+                            .take(limit)
+                            .collect()),
+                        Err(e) => Err(e),
+                    }
+                }
+                Err(e) => Err(e),
+            }
+        }
+    };
+    match found {
         Ok(contents) => {
             if contents.is_empty() {
                 serde_json::json!({
@@ -106,11 +141,27 @@ pub(crate) async fn handle_memory_successful_conversations(
     }
 }
 
+/// v1.83.0: employee-wide maintenance statistic; refused on a channel
+/// conversation turn ([`crate::mcp_memory_handlers::CHANNEL_TURN_REFUSED`]).
 pub(crate) async fn handle_memory_episodic_pressure(
     params: &Value,
     memory: &SqliteMemoryEngine,
     agent_id: &str,
 ) -> Value {
+    let scope = crate::mcp_memory_handlers::mcp_read_scope(agent_id);
+    handle_memory_episodic_pressure_in(params, memory, agent_id, &scope).await
+}
+
+/// [`handle_memory_episodic_pressure`] with an explicit scope.
+pub(crate) async fn handle_memory_episodic_pressure_in(
+    params: &Value,
+    memory: &SqliteMemoryEngine,
+    agent_id: &str,
+    scope: &crate::mcp_memory_handlers::ReadScope,
+) -> Value {
+    if let Some(refused) = crate::mcp_memory_handlers::refused_on_channel_turn(scope) {
+        return refused;
+    }
     let hours_ago = params
         .get("hours_ago")
         .and_then(|v| v.as_u64())
@@ -129,7 +180,22 @@ pub(crate) async fn handle_memory_episodic_pressure(
     })
 }
 
+/// v1.83.0: employee-wide maintenance statistic; refused on a channel
+/// conversation turn ([`crate::mcp_memory_handlers::CHANNEL_TURN_REFUSED`]).
 pub(crate) async fn handle_memory_consolidation_status(memory: &SqliteMemoryEngine, agent_id: &str) -> Value {
+    let scope = crate::mcp_memory_handlers::mcp_read_scope(agent_id);
+    handle_memory_consolidation_status_in(memory, agent_id, &scope).await
+}
+
+/// [`handle_memory_consolidation_status`] with an explicit scope.
+pub(crate) async fn handle_memory_consolidation_status_in(
+    memory: &SqliteMemoryEngine,
+    agent_id: &str,
+    scope: &crate::mcp_memory_handlers::ReadScope,
+) -> Value {
+    if let Some(refused) = crate::mcp_memory_handlers::refused_on_channel_turn(scope) {
+        return refused;
+    }
     let conflict_count = memory.semantic_conflict_count(agent_id).await;
 
     serde_json::json!({
@@ -241,6 +307,102 @@ pub(crate) fn maybe_with_semantic_embedder(
     engine.retrieval_weights =
         duduclaw_gateway::memory_factory::retrieval_weights_from_config(home_dir);
     engine
+}
+
+#[cfg(test)]
+mod conversation_scope_tests {
+    use super::*;
+    use crate::mcp_memory_handlers::{ReadScope, CHANNEL_TURN_REFUSED};
+
+    fn in_session(s: &str) -> ReadScope {
+        ReadScope::Conversation(Some(s.to_string()))
+    }
+
+    fn text(v: &Value) -> String {
+        v["content"][0]["text"].as_str().unwrap_or("").to_string()
+    }
+
+    /// An episodic, important row of conversation `session`, `minutes_ago` old.
+    async fn episode(mem: &SqliteMemoryEngine, content: &str, session: &str, minutes_ago: i64) -> String {
+        let entry = duduclaw_core::types::MemoryEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            agent_id: "a1".into(),
+            content: content.into(),
+            timestamp: chrono::Utc::now() - chrono::Duration::minutes(minutes_ago),
+            tags: vec![],
+            embedding: None,
+            layer: duduclaw_core::types::MemoryLayer::Episodic,
+            importance: 8.0,
+            access_count: 0,
+            last_accessed: None,
+            source_event: "prediction_episodic".into(),
+        };
+        let prov = duduclaw_memory::lineage::Provenance::source(
+            duduclaw_memory::SourceRef::channel_message(session, 1, chrono::Utc::now(), None),
+        );
+        mem.store_temporal("a1", entry, duduclaw_memory::TemporalMeta::default(), prov)
+            .await
+            .unwrap()
+    }
+
+    async fn successful(mem: &SqliteMemoryEngine, limit: u64, scope: &ReadScope) -> Value {
+        handle_memory_successful_conversations_in(
+            &serde_json::json!({ "topic": "narwhalgrove", "limit": limit }),
+            mem,
+            "a1",
+            scope,
+        )
+        .await
+    }
+
+    /// (a) a turn in B gets none of A's rows; (b) a turn in A gets its own,
+    /// and the scope applies before the limit (B's row is the newest match);
+    /// an unknown conversation gets nothing; (c) a non-channel caller still
+    /// gets every row.
+    #[tokio::test]
+    async fn successful_conversations_follow_the_conversation_scope() {
+        let mem = SqliteMemoryEngine::in_memory().unwrap();
+        episode(&mem, "narwhalgrove beta secret", "telegram:B", 0).await;
+        episode(&mem, "narwhalgrove alpha newer", "telegram:A", 10).await;
+        episode(&mem, "narwhalgrove alpha older", "telegram:A", 20).await;
+
+        let in_b = text(&successful(&mem, 10, &in_session("telegram:B")).await);
+        assert!(in_b.contains("beta secret") && !in_b.contains("alpha"), "{in_b}");
+
+        let in_a = text(&successful(&mem, 1, &in_session("telegram:A")).await);
+        assert_eq!(in_a, "narwhalgrove alpha newer");
+
+        let unknown = text(&successful(&mem, 10, &ReadScope::Conversation(None)).await);
+        assert_eq!(unknown, "No successful conversations found for this topic.");
+
+        let employee = text(&successful(&mem, 10, &ReadScope::Employee).await);
+        for row in ["beta secret", "alpha newer", "alpha older"] {
+            assert!(employee.contains(row), "{employee}");
+        }
+        assert_eq!(text(&successful(&mem, 1, &ReadScope::Employee).await), "narwhalgrove beta secret");
+    }
+
+    /// (a) every channel turn (known or unknown conversation) is refused with
+    /// the fixed error; (c) a non-channel caller gets the statistics as before.
+    #[tokio::test]
+    async fn maintenance_statistics_refused_on_channel_turns() {
+        let mem = SqliteMemoryEngine::in_memory().unwrap();
+        episode(&mem, "narwhalgrove alpha", "telegram:A", 0).await;
+        for scope in [in_session("telegram:A"), in_session("telegram:B"), ReadScope::Conversation(None)] {
+            let pressure = handle_memory_episodic_pressure_in(&serde_json::json!({}), &mem, "a1", &scope).await;
+            assert_eq!(pressure["isError"], true, "{scope:?}");
+            assert_eq!(text(&pressure), CHANNEL_TURN_REFUSED, "{scope:?}");
+            let status = handle_memory_consolidation_status_in(&mem, "a1", &scope).await;
+            assert_eq!(status["isError"], true, "{scope:?}");
+            assert_eq!(text(&status), CHANNEL_TURN_REFUSED, "{scope:?}");
+        }
+        let pressure = handle_memory_episodic_pressure_in(&serde_json::json!({}), &mem, "a1", &ReadScope::Employee).await;
+        assert!(pressure.get("isError").is_none(), "{pressure}");
+        assert!(text(&pressure).starts_with("Episodic pressure (last 24h):"), "{pressure}");
+        let status = handle_memory_consolidation_status_in(&mem, "a1", &ReadScope::Employee).await;
+        assert!(status.get("isError").is_none(), "{status}");
+        assert!(text(&status).starts_with("Semantic conflict count:"), "{status}");
+    }
 }
 
 #[cfg(test)]

@@ -110,8 +110,19 @@ pub(super) async fn handle(args: &Value, home: &Path, caller: &str, default_agen
 }
 
 pub(super) async fn handle_for_employee(args: &Value, home: &Path, employee: &str) -> Value {
-    let result = read_authorized(args, home, employee).await
-        .and_then(|messages| scanned_history(&messages).map(|block| (messages.len(), block)));
+    let scope = crate::mcp_memory_handlers::mcp_read_scope(employee);
+    handle_for_employee_in(args, home, employee, &scope).await
+}
+
+/// [`handle_for_employee`] with an explicit turn scope.
+async fn handle_for_employee_in(args: &Value, home: &Path, employee: &str,
+    scope: &crate::mcp_memory_handlers::ReadScope) -> Value
+{
+    let result = if in_current_conversation(args, scope) {
+        read_authorized(args, home, employee).await
+    } else {
+        Err(())
+    }.and_then(|messages| scanned_history(&messages).map(|block| (messages.len(), block)));
     let count = result.as_ref().map_or(0, |(count, _)| *count);
     audit(home, employee, args, count, result.is_ok());
     match result {
@@ -150,6 +161,50 @@ fn audit(home: &Path, employee: &str, args: &Value, count: usize, success: bool)
             ("count", json!(count)),
         ],
     );
+}
+
+/// v1.83.0: on a channel conversation turn only the group (and thread) the
+/// current conversation belongs to may be read. Not a channel turn: allowed
+/// (the binding checks still apply); unknown own identity: refused.
+fn in_current_conversation(args: &Value, scope: &crate::mcp_memory_handlers::ReadScope) -> bool {
+    use crate::mcp_memory_handlers::ReadScope;
+    let session = match scope {
+        ReadScope::Employee => return true,
+        ReadScope::Conversation(None) => return false,
+        ReadScope::Conversation(Some(session)) => session,
+    };
+    let (Some(channel), Some(group)) = (args.get("channel").and_then(Value::as_str),
+        args.get("group_id").and_then(Value::as_str)) else { return false };
+    let thread = match args.get("thread_id") {
+        None => None,
+        Some(Value::String(value)) if !value.is_empty() => Some(value.as_str()),
+        _ => return false,
+    };
+    session_is_target(session, channel, group, thread)
+}
+
+/// Whether the host-set `session` id (employee bucket stripped) is the
+/// conversation of `(channel, group, thread)`, in the shapes the adapters
+/// build. A one-to-one chat's session never names a group, so it matches none.
+fn session_is_target(session: &str, channel: &str, group: &str, thread: Option<&str>) -> bool {
+    if group.is_empty() { return false; }
+    let conversation = duduclaw_core::session_conversation(session.trim());
+    match (channel, thread) {
+        // A thread is its own conversation (`discord:thread:<id>`); rows are
+        // keyed by its one verified parent, so the thread id decides.
+        ("discord", Some(thread)) => conversation == format!("discord:thread:{thread}"),
+        ("discord", None) => conversation == format!("discord:{group}"),
+        // Forum topic: `telegram:<chat>:<topic>`. Ids never contain ':'.
+        ("telegram", _) if group.contains(':') || thread.is_some_and(|t| t.contains(':')) => false,
+        ("telegram", Some(thread)) => conversation == format!("telegram:{group}:{thread}"),
+        ("telegram", None) => conversation == format!("telegram:{group}"),
+        // One session per channel / space; its threads are the same conversation.
+        ("slack", _) => conversation == format!("slack:group:{group}"),
+        ("googlechat", _) => conversation == format!("googlechat:{group}"),
+        // No thread coordinates are captured on these channels.
+        ("line" | "dingtalk" | "teams" | "feishu", None) => conversation == format!("{channel}:{group}"),
+        _ => false,
+    }
 }
 
 async fn read_authorized(args: &Value, home: &Path, employee: &str)
@@ -422,6 +477,85 @@ mod tests {
         std::fs::create_dir(&path).unwrap();
         assert!(!available_for_employee(home.path(), "alice").await);
         assert!(read_authorized(&args, home.path(), "alice").await.is_err());
+    }
+
+    // ── v1.83.0: a channel turn reads only its own conversation's group ──
+
+    fn in_session(s: &str) -> crate::mcp_memory_handlers::ReadScope {
+        crate::mcp_memory_handlers::ReadScope::Conversation(Some(s.to_string()))
+    }
+
+    /// alice is bound to both g1 and g2; g1 has history. (a) a turn in g2,
+    /// a one-to-one chat, and an unknown conversation are refused with the
+    /// uniform answer; (b) a turn in g1 reads g1; (c) a non-channel caller
+    /// reads g1 as before.
+    #[tokio::test]
+    async fn group_history_channel_turn_reads_only_its_own_group() {
+        use crate::mcp_memory_handlers::ReadScope;
+        let home = tempfile::tempdir().unwrap();
+        agent(home.path(), "alice", false, Some(("channel", "g1")));
+        let path = home.path().join("agents/alice/agent.toml");
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str("\n[[channels.discord.bindings]]\nkind = \"channel\"\nid = \"g2\"\n");
+        std::fs::write(&path, text).unwrap();
+        enabled(home.path());
+        duduclaw_gateway::group_context::set(home.path(), &duduclaw_gateway::group_context::GroupConfig {
+            channel: "discord".into(), group_id: "g2".into(), scope_id: "guild1".into(),
+            max_messages: 50, max_age_hours: 24,
+        }).unwrap();
+        capture_history(home.path(), &[("Alice", "selkiemoor launch plan")]).await;
+        let g1 = json!({"channel":"discord","group_id":"g1"});
+        let g2 = json!({"channel":"discord","group_id":"g2"});
+        let refused = super::super::tool_error(NOT_AVAILABLE);
+
+        // The same employee may read g2 from g2, but not g1.
+        assert!(handle_for_employee_in(&g2, home.path(), "alice", &in_session("discord:g2")).await.get("isError").is_none());
+        for scope in [
+            in_session("discord:g2"),
+            in_session("discord:g2#agent:alice"),
+            in_session("discord:555000111"),
+            in_session("telegram:12345"),
+            ReadScope::Conversation(None),
+        ] {
+            let result = handle_for_employee_in(&g1, home.path(), "alice", &scope).await;
+            assert_eq!(result, refused, "{scope:?}");
+            assert!(!result.to_string().contains("selkiemoor"), "{scope:?}");
+        }
+        // Refused exactly like a group that does not exist.
+        assert_eq!(handle_for_employee_in(&json!({"channel":"discord","group_id":"absent"}), home.path(), "alice",
+            &in_session("discord:g2")).await, refused);
+
+        for scope in [in_session("discord:g1"), in_session("discord:g1#agent:alice"), ReadScope::Employee] {
+            let result = handle_for_employee_in(&g1, home.path(), "alice", &scope).await;
+            assert!(result["content"][0]["text"].as_str().unwrap().contains("selkiemoor launch plan"), "{scope:?}: {result}");
+        }
+    }
+
+    /// The session shapes of every channel that captures group context.
+    #[test]
+    fn group_history_session_is_target_per_channel() {
+        assert!(session_is_target("discord:g1", "discord", "g1", None));
+        assert!(!session_is_target("discord:g1", "discord", "g1", Some("t1")));
+        assert!(session_is_target("discord:thread:t1", "discord", "g1", Some("t1")));
+        assert!(!session_is_target("discord:thread:t1", "discord", "g1", None));
+        assert!(!session_is_target("discord:thread:t1", "discord", "g1", Some("t2")));
+        assert!(session_is_target("telegram:-100:7", "telegram", "-100", Some("7")));
+        assert!(session_is_target("telegram:-100#agent:hr", "telegram", "-100", None));
+        assert!(!session_is_target("telegram:-100:7", "telegram", "-100", None));
+        assert!(!session_is_target("telegram:-100:7", "telegram", "-100:7", None));
+        assert!(!session_is_target("telegram:42", "telegram", "-100", None));
+        assert!(session_is_target("slack:group:C1", "slack", "C1", Some("169.1")));
+        assert!(!session_is_target("slack:U1", "slack", "C1", None));
+        assert!(session_is_target("googlechat:spaces/A", "googlechat", "spaces/A", Some("spaces/A/threads/x")));
+        assert!(session_is_target("teams:19:abc@thread.tacv2", "teams", "19:abc@thread.tacv2", None));
+        assert!(!session_is_target("teams:19:abc@thread.tacv2", "teams", "19:abc@thread.tacv2", Some("x")));
+        for channel in ["line", "dingtalk", "feishu"] {
+            assert!(session_is_target(&format!("{channel}:G1"), channel, "G1", None), "{channel}");
+            assert!(!session_is_target(&format!("{channel}:U1"), channel, "G1", None), "{channel}");
+        }
+        assert!(!session_is_target("discord:g1", "telegram", "g1", None));
+        assert!(!session_is_target("discord:", "discord", "", None));
+        assert!(!session_is_target("webchat:u#agent:a#conv:c", "webchat", "u", None));
     }
 
     #[test]

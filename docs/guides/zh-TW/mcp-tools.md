@@ -400,7 +400,7 @@ AI 員工只能調整自己或下屬的設定，採用與 `agent_update` 相同�
 
 ### `memory_search`／`memory_read`／`decision_*`：聊天對話的讀取範圍（v1.83.0）
 
-員工行程在處理聊天對話的一輪時，`memory_search`、`memory_read`、`memory_fetch_batch`、`memory_search_by_layer`、`memory_get_history`、`memory_get_at` 與 `memory_improve` 只會回傳員工自己明確存下的記憶、管理員匯入或從舊系統移轉進來的記憶、以及系統從同一段對話整理出來的記憶。系統從其他對話自動整理出的記憶（重點事實、使用者偏好與其摘要、對話摘要、彙整後的記憶、記錄的待決事項）都不會回傳，沒有記錄來源的自動整理記憶也不會回傳；用 `memory_read` 讀取它的編號時，回答和編號不存在時相同。`user_profile_get` 與 `user_code_profile` 照同樣的規則：剩下的資料都來自其他對話時，回答和查無這位使用者的資料時相同。`decision_list` 與 `decision_resolve` 也只看得到這段對話記錄的待決事項，其他對話的待決事項編號會得到「找不到」；排程與交辦工作、外部 MCP 用戶端的行為不變。
+員工行程在處理聊天對話的一輪時，`memory_search`、`memory_read`、`memory_fetch_batch`、`memory_search_by_layer`、`memory_get_history`、`memory_get_at` 與 `memory_improve` 只會回傳員工自己明確存下的記憶、管理員匯入或從舊系統移轉進來的記憶、以及系統從同一段對話整理出來的記憶。系統從其他對話自動整理出的記憶（重點事實、使用者偏好與其摘要、對話摘要、彙整後的記憶、記錄的待決事項）都不會回傳，沒有記錄來源的自動整理記憶也不會回傳；用 `memory_read` 讀取它的編號時，回答和編號不存在時相同。`user_profile_get` 與 `user_code_profile` 照同樣的規則：剩下的資料都來自其他對話時，回答和查無這位使用者的資料時相同。`decision_list` 與 `decision_resolve` 也只看得到這段對話記錄的待決事項，其他對話的待決事項編號會得到「找不到」。`memory_successful_conversations` 只回傳依同樣規則看得到的紀錄（先套用規則再取 `limit` 筆，對話不明時不回傳任何紀錄），`group_history_read` 只能讀取這段對話所屬的群組或討論串（一對一私人對話不能讀取任何群組，其他目標一律得到一般的「無法使用」回答），`memory_invalidate_by_origin`、`memory_episodic_pressure` 與 `memory_consolidation_status` 涵蓋員工的所有對話，會以固定的錯誤訊息拒絕。排程與交辦工作、外部 MCP 用戶端的行為不變。
 
 ### `knowledge_*`：文件知識庫
 

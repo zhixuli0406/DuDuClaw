@@ -439,6 +439,20 @@ pub(crate) async fn scope_entries(
     Ok(entries.into_iter().filter(|e| !hidden.contains(&e.id)).collect())
 }
 
+/// The fixed answer of the employee-wide maintenance tools on a channel
+/// conversation turn (v1.83.0): `memory_invalidate_by_origin`,
+/// `memory_episodic_pressure`, `memory_consolidation_status`.
+pub(crate) const CHANNEL_TURN_REFUSED: &str =
+    "Not available from a conversation: bulk memory invalidation and memory maintenance \
+     statistics cover every conversation of this employee, so they cannot be used on a \
+     chat turn. Ask an administrator.";
+
+/// `Some(error)` when `scope` is a channel conversation turn (known or not):
+/// an employee-wide maintenance tool refuses and changes nothing.
+pub(crate) fn refused_on_channel_turn(scope: &ReadScope) -> Option<Value> {
+    matches!(scope, ReadScope::Conversation(_)).then(|| mcp_error(CHANNEL_TURN_REFUSED))
+}
+
 /// The tool error for a write refused by the source fence (and its audit).
 pub(crate) fn mcp_fenced_error(
     namespace: &str,
@@ -1074,6 +1088,10 @@ pub fn ai_employee_caller(
 /// user, import, agent-derived, profile, unattributed, unknown strings — is
 /// refused and audited as `memory_invalidate_refused`. An operator using an
 /// admin key with no agent identity (`None`) is unaffected.
+///
+/// v1.83.0: on a channel conversation turn ([`mcp_read_scope`]) the call is
+/// refused with [`CHANNEL_TURN_REFUSED`] and nothing changes: the rows it
+/// would expire (and the count it returns) span every conversation.
 pub async fn handle_memory_invalidate_by_origin(
     params: &Value,
     memory: &SqliteMemoryEngine,
@@ -1081,6 +1099,23 @@ pub async fn handle_memory_invalidate_by_origin(
     acting_agent: Option<&str>,
     home_dir: &std::path::Path,
 ) -> Value {
+    let scope = mcp_read_scope(&ns_ctx.write_namespace);
+    handle_memory_invalidate_by_origin_in(params, memory, ns_ctx, acting_agent, home_dir, &scope)
+        .await
+}
+
+/// [`handle_memory_invalidate_by_origin`] with an explicit [`ReadScope`].
+pub(crate) async fn handle_memory_invalidate_by_origin_in(
+    params: &Value,
+    memory: &SqliteMemoryEngine,
+    ns_ctx: &NamespaceContext,
+    acting_agent: Option<&str>,
+    home_dir: &std::path::Path,
+    scope: &ReadScope,
+) -> Value {
+    if let Some(refused) = refused_on_channel_turn(scope) {
+        return refused;
+    }
     let origin = match params.get("origin").and_then(|v| v.as_str()) {
         Some(o) if !o.trim().is_empty() => o.trim(),
         _ => return mcp_error("Missing required parameter: origin"),
@@ -3055,5 +3090,69 @@ mod tests {
                 "{scope:?}"
             );
         }
+    }
+
+    // ── v1.83.0: memory_invalidate_by_origin on a channel turn ───────────────
+
+    /// (a) a channel turn in B (and in A, and in an unknown conversation) is
+    /// refused with the fixed error, and A's rows stay valid; (c) a dispatch
+    /// run and a process with no turn identity invalidate as before.
+    #[tokio::test]
+    async fn invalidate_by_origin_refused_on_channel_turns() {
+        let mem = SqliteMemoryEngine::in_memory().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let ns = internal_ns("a1");
+        for subject in ["s1", "s2"] {
+            mem.store_temporal(
+                "internal/a1",
+                MemoryEntry { id: uuid::Uuid::new_v4().to_string(), ..mk_entry(&format!("{subject} from A"), &[]) },
+                duduclaw_memory::TemporalMeta {
+                    subject: Some(subject.into()),
+                    predicate: Some("p".into()),
+                    object: Some("A".into()),
+                    origin: Some("channel".into()),
+                    ..Default::default()
+                },
+                duduclaw_memory::lineage::Provenance::source(
+                    duduclaw_memory::SourceRef::channel_message("telegram:A", 1, chrono::Utc::now(), None),
+                ),
+            )
+            .await
+            .unwrap();
+        }
+        async fn valid(mem: &SqliteMemoryEngine, subject: &str) -> bool {
+            mem.get_history("internal/a1", subject, "p").await.unwrap()[0].valid_until.is_none()
+        }
+        async fn call(
+            mem: &SqliteMemoryEngine,
+            ns: &NamespaceContext,
+            home: &std::path::Path,
+            scope: &ReadScope,
+        ) -> Value {
+            handle_memory_invalidate_by_origin_in(
+                &serde_json::json!({"origin": "channel"}),
+                mem,
+                ns,
+                Some("a1"),
+                home,
+                scope,
+            )
+            .await
+        }
+
+        for scope in [channel_turn("telegram:B"), channel_turn("telegram:A"), ReadScope::Conversation(None)] {
+            let r = call(&mem, &ns, home.path(), &scope).await;
+            assert_eq!(r, mcp_error(CHANNEL_TURN_REFUSED), "{scope:?}");
+            assert!(!text_of(&r).contains("expired"), "{scope:?}");
+            assert!(valid(&mem, "s1").await && valid(&mem, "s2").await, "{scope:?}");
+        }
+
+        let r = call(&mem, &ns, home.path(), &dispatch_run("telegram:B")).await;
+        assert!(!is_err(&r), "{r}");
+        let payload: Value = serde_json::from_str(&text_of(&r)).unwrap();
+        assert_eq!(payload["expired"], 2, "{payload}");
+        assert!(!valid(&mem, "s1").await && !valid(&mem, "s2").await);
+        let r = call(&mem, &ns, home.path(), &read_scope_with("internal/a1", &McpTurnEnv::default())).await;
+        assert!(!is_err(&r), "{r}");
     }
 }

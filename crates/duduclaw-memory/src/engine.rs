@@ -4252,6 +4252,23 @@ impl SqliteMemoryEngine {
         topic: &str,
         limit: usize,
     ) -> Result<Vec<String>> {
+        Ok(self
+            .search_successful_conversation_rows(agent_id, topic, Some(limit))
+            .await?
+            .into_iter()
+            .map(|(_, content)| content)
+            .collect())
+    }
+
+    /// [`Self::search_successful_conversations`] as `(id, content)`, newest
+    /// first. `limit = None` returns every match (v1.83.0: a reader serving
+    /// one conversation drops other conversations' rows before it limits).
+    pub async fn search_successful_conversation_rows(
+        &self,
+        agent_id: &str,
+        topic: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<(String, String)>> {
         let conn = self.conn.lock().await;
         crate::isolation_io::verify()?;
 
@@ -4265,7 +4282,7 @@ impl SqliteMemoryEngine {
         }
         let sanitized_query = format!("\"{}\"", cleaned.replace('"', ""));
 
-        let sql = "SELECT m.content
+        let sql = "SELECT m.id, m.content
              FROM memories_fts AS f
              JOIN memories AS m ON m.id = f.memory_id
              WHERE f.memories_fts MATCH ?1
@@ -4280,9 +4297,11 @@ impl SqliteMemoryEngine {
             .prepare(sql)
             .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
 
+        // SQLite: a negative LIMIT means no limit.
+        let limit = limit.map_or(-1, |n| n as i64);
         let rows = stmt
-            .query_map(params![sanitized_query, agent_id, limit as i64], |row| {
-                row.get::<_, String>(0)
+            .query_map(params![sanitized_query, agent_id, limit], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
             .map_err(|e| {
                 tracing::warn!("FTS5 synthesis search error: {e}");
