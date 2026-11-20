@@ -182,7 +182,7 @@ mod tests {
     fn scoped_cron_fixed_offset_zones_allowed_dst_zones_refused() {
         use chrono::TimeZone;
         let now = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
-        for zone in ["Asia/Taipei", "Asia/Tokyo", "Asia/Kolkata", "UTC"] {
+        for zone in ["Asia/Taipei", "Asia/Tokyo", "Asia/Kolkata", "UTC", "Asia/Calcutta", "Etc/GMT-14", "Australia/Eucla"] {
             assert!(fixed_offset_zone(duduclaw_core::parse_timezone(zone).unwrap(), now), "{zone}");
             assert!(scoped_timezone_allowed_at(Some(zone), now), "{zone}");
         }

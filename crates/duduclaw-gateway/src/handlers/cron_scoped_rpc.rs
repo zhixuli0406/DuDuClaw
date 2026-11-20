@@ -242,4 +242,31 @@ mod tests {
         assert!(member["skip_reason"].is_null());
         assert!(member.get("last_error").is_none());
     }
+
+    #[tokio::test]
+    async fn member_row_skip_reason_clears_on_allowed_timezone_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::cron_store::CronStore::open(dir.path()).unwrap();
+        let mut row = CronTaskRow::new("id".into(), "Morning".into(), "agent".into(),
+            "0 9 * * *".into(), "report".into());
+        row.on_behalf_of = Some("user:member".into());
+        store.insert(&row).await.unwrap();
+        store.record_scoped_schedule_skip(&row.id, crate::cron_scheduler::SCOPED_SCHEDULE_SKIPPED).await.unwrap();
+        let skipped = store.get(&row.id).await.unwrap().unwrap();
+        assert_eq!(member_cron_row(&skipped, false, false, false)["skip_reason"], "timezone_or_interval");
+        store.update_cron_timezone(&row.id, Some("Asia/Taipei")).await.unwrap();
+        let cleared = store.get(&row.id).await.unwrap().unwrap();
+        let member = member_cron_row(&cleared, false, false, false);
+        assert!(member["last_status"].is_null());
+        assert!(member["skip_reason"].is_null());
+        assert!(cleared.last_error.is_none());
+        assert_eq!(cleared.last_run_at, skipped.last_run_at);
+        assert_eq!((cleared.run_count, cleared.failure_count), (skipped.run_count, skipped.failure_count));
+
+        store.record_scoped_schedule_skip(&row.id, "another skip reason").await.unwrap();
+        store.update_cron_timezone(&row.id, Some("UTC")).await.unwrap();
+        let other = store.get(&row.id).await.unwrap().unwrap();
+        assert_eq!(other.last_status.as_deref(), Some("skipped"));
+        assert_eq!(other.last_error.as_deref(), Some("another skip reason"));
+    }
 }
