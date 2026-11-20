@@ -64,6 +64,23 @@ fn scoped_schedule_allowed(row: &CronTaskRow) -> bool {
     true
 }
 
+/// Fixed reason stored on a refused human-origin row; shown to its owner/admin.
+pub(crate) const SCOPED_SCHEDULE_SKIPPED: &str = "schedule skipped: its timezone has daylight-saving changes, \
+    or the interval is under 15 minutes; an administrator must edit it";
+
+/// [`scoped_schedule_allowed`], and on refusal record the fixed reason on the
+/// row (`last_status`/`last_error`) so the refusal is visible. Written only
+/// when the stored value differs, so the row is not rewritten every tick.
+async fn scoped_schedule_admitted(store: &CronStore, row: &CronTaskRow) -> bool {
+    if scoped_schedule_allowed(row) { return true; }
+    if row.last_status.as_deref() != Some("skipped") || row.last_error.as_deref() != Some(SCOPED_SCHEDULE_SKIPPED) {
+        if store.record_scoped_schedule_skip(&row.id, SCOPED_SCHEDULE_SKIPPED).await.is_err() {
+            warn!(count = 1u64, "scoped cron refusal not recorded");
+        }
+    }
+    false
+}
+
 /// v1.81 P1g: the people a cron fire is for — manual-run principal,
 /// `on_behalf_of`, last editor, creator (each may be absent).
 pub(crate) fn cron_fire_principals(task: &CronTaskRow, scoped_principal: Option<&str>) -> [Option<String>; 4] {
@@ -218,7 +235,7 @@ impl CronScheduler {
         let mut runs = Vec::new();
         let mut errors = Vec::new();
         for row in self.store.list_enabled().await? {
-            if !scoped_schedule_allowed(&row) { continue; }
+            if !scoped_schedule_admitted(&self.store, &row).await { continue; }
             let Some((_, material_hash)) = self.store.workflow_binding(&row.id).await? else { continue };
             let outcome: Result<Option<String>, String> = async {
                 let mut cursor = self.store.routine_cursor(&row.id, &material_hash).await?;
@@ -403,7 +420,7 @@ impl CronScheduler {
 
         let mut new_live = Vec::with_capacity(raw_tasks.len());
         for task in raw_tasks {
-            if !scoped_schedule_allowed(&task) { continue; }
+            if !scoped_schedule_admitted(&self.store, &task).await { continue; }
             // Typed routines use the durable occurrence cursor in tick_at, not
             // legacy last_run_at (which manual executions also modify).
             match self.store.workflow_binding(&task.id).await {
@@ -628,7 +645,7 @@ async fn enqueue_routine_trigger(
 ) -> Result<String, String> {
     let task = store.get(task_id).await?.ok_or("workflow cron missing")?;
     if !task.enabled { return Err("workflow cron disabled".into()); }
-    if !scoped_schedule_allowed(&task) { return Err("Automation schedule refused".into()); }
+    if !scoped_schedule_admitted(store, &task).await { return Err("Automation schedule refused".into()); }
     // v1.81 P1g: fire-time Personal ownership check.
     if let Some(reason) = cron_fire_time_refusal(home_dir, &task, None).await {
         return Err(reason.into());
@@ -740,7 +757,7 @@ async fn dispatch_cron_task_checked(
         task.on_behalf_of = Some(principal.into());
         task.scoped_by_user_id = principal.strip_prefix("user:").map(str::to_string);
     }
-    if !scoped_schedule_allowed(&task) { return; }
+    if !scoped_schedule_admitted(store, &task).await { return; }
     // v1.81 P1g: fire-time Personal ownership check (covers rows created
     // before the upgrade and ownership changes since).
     if let Some(reason) = cron_fire_time_refusal(home_dir, &task, scoped_principal).await {
@@ -2380,6 +2397,50 @@ mod tests {
         assert!(refused.to_string().starts_with("origin_identity_unbound"));
         let failed = CronDeliveryError::from(ScheduledRefusal::Other("policy unreadable".into()));
         assert!(matches!(failed, CronDeliveryError::Failed(_)));
+    }
+
+    /// v1.79.3 stored the host zone with `on_behalf_of` for member schedules.
+    /// A fixed-offset zone runs again; a DST zone is skipped with a visible
+    /// reason that is written once, not on every reload.
+    #[tokio::test]
+    async fn scoped_schedule_legacy_fixed_zone_runs_and_dst_refusal_is_recorded_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(CronStore::open(dir.path()).unwrap());
+        let mut legacy = CronTaskRow::new("legacy-taipei".into(), "Morning".into(), "agnes".into(),
+            "0 9 * * *".into(), "report".into());
+        legacy.on_behalf_of = Some("user:member".into());
+        legacy.cron_timezone = Some("Asia/Taipei".into());
+        assert!(scoped_schedule_allowed(&legacy));
+        store.insert(&legacy).await.unwrap();
+        let mut dst = legacy.clone();
+        dst.id = "legacy-new-york".into();
+        dst.cron_timezone = None;
+        store.insert(&dst).await.unwrap();
+        // Simulate an older writer: the store now refuses this zone itself.
+        rusqlite::Connection::open(dir.path().join("cron_tasks.db")).unwrap()
+            .execute("UPDATE cron_tasks SET cron_timezone='America/New_York' WHERE id='legacy-new-york'", [])
+            .unwrap();
+        let stale = store.get("legacy-new-york").await.unwrap().unwrap();
+        assert!(!scoped_schedule_allowed(&stale));
+
+        let registry = Arc::new(RwLock::new(AgentRegistry::new(dir.path().join("agents"))));
+        let scheduler = CronScheduler::new(dir.path().to_path_buf(), store.clone(), registry);
+        scheduler.reload().await;
+        let live: Vec<String> = scheduler.tasks.read().await.iter().map(|t| t.task.id.clone()).collect();
+        assert_eq!(live, vec!["legacy-taipei".to_string()]);
+        assert!(store.get("legacy-taipei").await.unwrap().unwrap().last_status.is_none());
+        let recorded = store.get("legacy-new-york").await.unwrap().unwrap();
+        assert_eq!(recorded.last_status.as_deref(), Some("skipped"));
+        assert_eq!(recorded.last_error.as_deref(), Some(SCOPED_SCHEDULE_SKIPPED));
+        assert!(recorded.last_run_at.is_none(), "nothing ran");
+        assert!(recorded.enabled);
+
+        // Neither a fresh reload nor a caller holding the stale row rewrites it.
+        scheduler.reload().await;
+        assert!(!scoped_schedule_admitted(&store, &stale).await);
+        assert!(!store.record_scoped_schedule_skip(&stale.id, SCOPED_SCHEDULE_SKIPPED).await.unwrap());
+        let again = store.get("legacy-new-york").await.unwrap().unwrap();
+        assert_eq!(again.updated_at, recorded.updated_at, "reason written once");
     }
 
 }

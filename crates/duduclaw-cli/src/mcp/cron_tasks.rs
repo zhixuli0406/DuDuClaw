@@ -119,6 +119,10 @@ pub(crate) async fn handle_schedule_task_for_actor(
     //
     // Explicit opt-out: pass `cron_timezone = "UTC"` to force UTC
     // evaluation. Explicit any-other-IANA-name still wins (below).
+    //
+    // Member (human-origin) schedules never auto-detect: they default to UTC.
+    // The store admits an explicit zone for them only when its UTC offset
+    // never changes (e.g. Asia/Taipei); DST zones are refused there.
     let cron_timezone = params
         .get("cron_timezone")
         .and_then(|v| v.as_str())
@@ -126,7 +130,7 @@ pub(crate) async fn handle_schedule_task_for_actor(
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .or_else(|| {
-            // Human-origin rows share the store's UTC cadence contract.
+            // Human-origin rows default to UTC, never the host zone.
             if principal.is_some() { return Some("UTC".into()); }
             let detected = detect_local_timezone();
             if let Some(ref tz) = detected {

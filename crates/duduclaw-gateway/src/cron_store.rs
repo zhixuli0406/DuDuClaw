@@ -769,6 +769,22 @@ impl CronStore {
         Ok(())
     }
 
+    /// A human-origin row the scheduler refuses to run (timezone or cadence
+    /// outside the member rules). Writes only when the stored status/reason
+    /// differ, so a refused row is written once, not on every tick.
+    /// `last_run_at` is left alone: nothing ran. Returns whether it wrote.
+    pub(crate) async fn record_scoped_schedule_skip(&self, id: &str, reason: &str) -> Result<bool, String> {
+        let mut guard = self.conn.lock().await;
+        let conn = begin_write(&mut guard)?;
+        let changed = conn.execute(
+            "UPDATE cron_tasks SET last_status='skipped',last_error=?2,updated_at=?3
+             WHERE id=?1 AND (last_status IS NOT 'skipped' OR last_error IS NOT ?2)",
+            params![id, reason, Utc::now().to_rfc3339()],
+        ).map_err(|e| format!("record_scoped_schedule_skip: {e}"))?;
+        commit_write(conn)?;
+        Ok(changed > 0)
+    }
+
     /// Record the outcome of a firing. Bumps `run_count` and (on failure) `failure_count`.
     pub async fn record_run(
         &self,
