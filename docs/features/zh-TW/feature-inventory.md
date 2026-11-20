@@ -304,7 +304,7 @@ WordPress 小工具（外掛 0.1.1）會在標題列顯示連線狀態。斷線�
 | 向量 re-rank 訊號 | 內建字元 n-gram 雜湊 embedder（`NgramHashEmbedder`，以 `DUDUCLAW_SEMANTIC_VECTORS=1` 開啟）；它比對的是表面片段，不是語意。ONNX embedder 需要非預設的 `onnx` 建置 feature，release binary 不含 |
 | 記憶衰減排程 | 每日背景執行：低重要度 + 30 天以上歸檔，歸檔 + 90 天以上永久刪除 |
 | 認知記憶 MCP 工具 | `memory_search_by_layer` / `memory_successful_conversations` / `memory_episodic_pressure` / `memory_consolidation_status` |
-| Key-Fact Accumulator | `key_facts` + FTS5：跨 session 輕量記憶（見 Session 記憶堆疊） |
+| Key-Fact Accumulator | `key_facts` + FTS5：輕量記憶，只注入產生它的那段對話（v1.83.0；見 Session 記憶堆疊） |
 | Temporal Memory（v1.19.0） | `memories` 經冪等遷移新增時序／知識圖譜欄位（`valid_from`/`valid_until`/`superseded_by`/`supersedes`/`subject`/`predicate`/`object`/`confidence`/`metadata`）；`store_temporal()` 對同一 `(agent, subject, predicate)` 自動衝突解析並串接 supersession chain（v1.67.1 起，寫入可信度不低於目前事實時才取代）；`search()` 預設只回傳現行有效列；`get_history()` / `get_at()` 提供鏈與時間點查詢 |
 | Reflexion Loop（F2，v1.19.0） | 橋接既有 `MistakeNotebook`：F2a 將近期未解決錯誤注入作答 prompt（`## Past Mistakes to Avoid`，CJK-safe 比對 + recency fallback）；F2b 將 ≥3 則同 `MistakeCategory` 錯誤整併為一條語意記憶規則（`reflexion.rs`）後標記來源已解決。觸發訊號 = `ErrorCategory` Significant/Critical（MetaCognition 自適應） |
 | `memory_fetch_batch`（F3，v1.19.0） | MCP 工具 + `get_by_ids` 一次以 ID 取回 ≤100 筆（命名空間／擁有權強制，部分命中 → `missing_ids`） |

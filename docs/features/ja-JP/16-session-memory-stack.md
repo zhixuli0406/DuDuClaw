@@ -98,7 +98,7 @@ U字型の注意の末尾効果と組み合わせることで、追加のLLMラ�
 
 ## レイヤー3：P2 Key-Fact Accumulator（v1.8.6）
 
-一部の事実は一つのsessionに固有ではなく——時間をまたいでユーザーやプロジェクトを記述します。例：
+一部の事実は1ターンを超えて役立ちます。会話の中のユーザーやプロジェクトを記述するものです。v1.83.0以降、キーファクトはそれを生んだ会話（チャネル、チャット、session）に属し、同じ会話にだけ注入されます。同じAI社員と別の人との会話からは見えません。例：
 
 - 「ユーザーのデプロイ先はCloudflare Workers」
 - 「好みのテストライブラリはjestではなくvitest」
@@ -126,7 +126,8 @@ Stored in: key_facts table (FTS5 indexed)
      v
 Next turn's system prompt assembly:
   SELECT content FROM key_facts
-  WHERE agent_id = ?
+  WHERE agent_id = ? AND channel = ? AND chat_id = ?
+    AND source_session = ?          -- this conversation only
   ORDER BY fts5_rank(relevance) DESC
   LIMIT 3
      |

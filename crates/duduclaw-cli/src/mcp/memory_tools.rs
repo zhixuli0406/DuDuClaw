@@ -22,7 +22,23 @@ pub(crate) async fn handle_memory_search_by_layer(
     let layer = duduclaw_core::types::MemoryLayer::parse(layer_str);
     let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
 
-    match memory.search_layer(agent_id, query, &layer, limit).await {
+    // v1.83.0: conversation scope (host-generated rows of other conversations),
+    // applied before the limit: a scoped read over-fetches like memory_search.
+    let scope = crate::mcp_memory_handlers::mcp_read_scope(agent_id);
+    let fetch = match scope {
+        crate::mcp_memory_handlers::ReadScope::Employee => limit,
+        crate::mcp_memory_handlers::ReadScope::Conversation(_) => limit.saturating_mul(4),
+    };
+    let found = match memory.search_layer(agent_id, query, &layer, fetch).await {
+        Ok(entries) => crate::mcp_memory_handlers::scope_entries(memory, agent_id, entries, &scope)
+            .await
+            .map(|mut kept| {
+                kept.truncate(limit);
+                kept
+            }),
+        Err(e) => Err(e),
+    };
+    match found {
         Ok(entries) => {
             if entries.is_empty() {
                 serde_json::json!({

@@ -1223,7 +1223,7 @@ async fn build_reply_with_session_inner_impl(
 
     // Clarification accumulation: if agent asked a question last turn and user
     // is now answering, append the answer to pinned instructions.
-    // v1.82.1: private sessions only — in a group any member could append.
+    // v1.83.0: private sessions only — in a group any member could append.
     if should_append_clarification(is_private, has_history, !pinned.is_empty()) {
         if let Some(last_assistant) = conversation_history
             .iter()
@@ -1456,7 +1456,7 @@ async fn build_reply_with_session_inner_impl(
         // later "用方案 C" resolves from durable state, not conversation memory.
         // Tail placement (near pinned, U-shaped peak attention). Own opt-in
         // flag (`[memory] decision_continuity`). !Send → spawn_blocking.
-        // v1.82.1: only decisions recorded in this same conversation.
+        // v1.83.0: only decisions recorded in this same conversation.
         if agent_dir
             .as_deref()
             .map(crate::runtime_config::decision_continuity_enabled)
@@ -2652,7 +2652,7 @@ async fn build_reply_with_session_inner_impl(
                             }
                         };
                         let rt = tokio::runtime::Handle::current();
-                        // v1.82.1: only this conversation's decisions can be
+                        // v1.83.0: only this conversation's decisions can be
                         // referenced and resolved from a channel reply.
                         let open = rt
                             .block_on(engine.list_open_decisions_in_session(
@@ -2795,7 +2795,7 @@ async fn build_reply_with_session_inner_impl(
         // Asynchronously extract core task instructions from the first user
         // message using the agent's utility runtime (same as compression).
         // Pinned instructions persist across turns and survive compression.
-        // v1.82.1: only in a 1:1 private session; existing group pins are left as-is (no migration).
+        // v1.83.0: only in a 1:1 private session; existing group pins are left as-is (no migration).
         if should_extract_first_turn_pin(is_private, has_history) {
             let sm = ctx.session_manager.clone();
             let sid = session_id.to_string();
@@ -2803,7 +2803,7 @@ async fn build_reply_with_session_inner_impl(
             let home = ctx.home_dir.clone();
             let agent_dir_for_pin = agent_dir.clone();
             let agent_for_pin = agent_id.clone();
-            // v1.82.1: bind the write to the incarnation this turn ran in
+            // v1.83.0: bind the write to the incarnation this turn ran in
             // (`created_at`); a `/new` meanwhile makes the result stale.
             // No generation (`None`) ⇒ "" never matches ⇒ not written.
             let pin_generation = turn_generation.clone().unwrap_or_default();
@@ -4644,7 +4644,7 @@ mod released_repro_source_tests {
     fn released_repro_2_private_facts_agent_only_source() {
         let source = shipped_source();
         assert!(source.contains("cognitive_memory_db.clone().filter(|_| is_private)"));
-        // v1.82.1: no agent-wide key-fact search remains in the reply pipeline.
+        // v1.83.0: no agent-wide key-fact search remains in the reply pipeline.
         assert!(!source.contains("engine.search_facts("));
         // Read: scoped to this conversation's (channel, chat_id, session id).
         let call = source.lines().find(|line| line.contains("engine.search_facts_in_chat(&aid")).unwrap().trim();
@@ -4658,7 +4658,7 @@ mod released_repro_source_tests {
         assert!(source.contains(r#"prompt = format!("{prompt}\n\n## Key Facts About This User\n{ft}");"#));
     }
 
-    // Rendering of pinned instructions is unchanged in the v1.82.1 hotfix.
+    // Rendering of pinned instructions is unchanged in v1.83.0.
     #[test]
     fn released_repro_3a_pinned_must_follow_source() {
         assert!(shipped_source().contains(r#"if !pinned.is_empty() {
@@ -4670,7 +4670,7 @@ mod released_repro_source_tests {
         }"#));
     }
 
-    // Rendering of pinned instructions is unchanged in the v1.82.1 hotfix.
+    // Rendering of pinned instructions is unchanged in v1.83.0.
     #[test]
     fn released_repro_3b_unescaped_recap_source() {
         assert!(shipped_source().contains(r#"let effective_message = if pinned.is_empty() || !has_history {
@@ -4682,7 +4682,7 @@ mod released_repro_source_tests {
 
     #[test]
     fn released_repro_3c_clarification_append_source() {
-        // v1.82.1 regression: behavioural check of the guard — a group/shared
+        // v1.83.0 regression: behavioural check of the guard — a group/shared
         // session never appends, whatever the other conditions.
         use super::should_append_clarification as allow;
         assert!(allow(true, true, true), "private session with history + pins may append");

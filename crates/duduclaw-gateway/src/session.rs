@@ -2729,7 +2729,7 @@ mod tests {
         assert_ne!(new_generation, old_generation, "a re-created row is a new incarnation");
         assert!(mgr.get_pinned(sid).await.unwrap().is_empty());
         mgr.set_pinned(sid, "newer state").await.unwrap();
-        // Regression (v1.82.1): the stale async result is rejected...
+        // Regression (v1.83.0): the stale async result is rejected...
         assert!(!mgr.set_pinned_if_unchanged(sid, &stale, &old_generation).await.unwrap());
         assert_eq!(mgr.get_pinned(sid).await.unwrap(), "newer state");
         assert_eq!(mgr.get_pinned(&archived).await.unwrap(), "old");

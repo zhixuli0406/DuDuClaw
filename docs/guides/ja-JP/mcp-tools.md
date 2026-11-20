@@ -417,6 +417,10 @@ root が必要な `os_*` ツール（電源、更新の状態、sysd が再検�
 
 継続タスクを作成・変更・再開・再有効化するツールはなく、指示を送るツールもありません。
 
+### `memory_search`／`memory_read`／`decision_*`：チャット会話での読み取り範囲（v1.83.0）
+
+社員プロセスがチャット会話の1ターンを処理しているとき、`memory_search`、`memory_read`、`memory_fetch_batch`、`memory_search_by_layer`、`memory_get_history`、`memory_get_at`、`memory_improve` が返す自動整理された記憶（会話の整理、ユーザーの好みとその要約、PC の利用記録）は、記録された出所が同じ会話のものだけです。他の会話のもの、出所が記録されていないものは返さず、その ID を `memory_read` で読むと、存在しない ID と同じ応答になります。社員が `memory_store` で自分で保存した記憶は影響を受けません。`decision_list` と `decision_resolve` もこの会話で記録された未決事項だけを扱い、他の会話の未決事項 ID には「見つからない」と応答します。スケジュール実行・依頼による実行と外部 MCP クライアントの動作は変わりません。
+
 ### `knowledge_*`：ドキュメントナレッジベース
 
 `knowledge_search`、`knowledge_get_passage`、`knowledge_list_collections` は[ドキュメントナレッジベース](../../features/ja-JP/63-knowledge-base.md)を読みます。スコープは `knowledge:read` で、外部 MCP キーには付与できません。呼び出しはすべて署名付きローカルルート `POST /api/internal/knowledge` でゲートウェイに渡され、ゲートウェイが読めるコレクション（社員本人と部門への付与を `agent.toml [knowledge] collections` で絞り込み、ターンの相手と機密度ルールとの共通部分）を決め、アクセスログを 1 行書きます。ゲートウェイが動いていないときはその旨を返し、データベースを直接読むことはありません。

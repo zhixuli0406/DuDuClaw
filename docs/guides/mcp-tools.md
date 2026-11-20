@@ -834,6 +834,8 @@ A write that is derived from other memories and names a parent memory that does 
 
 `wiki_write` (both scopes) adds a `host_sources` key to the page's frontmatter with the sources of that write, keeping the newest 20 across rewrites. A `host_sources` value the employee writes itself is dropped. The key is only read by forget by source, which lists such pages for human review and never deletes them. No MCP tool performs a forget: it is an operator command, refused in an employee's session.
 
+**Reads on a chat turn (v1.83.0).** When the employee process serves a channel conversation turn, `memory_search`, `memory_read`, `memory_fetch_batch`, `memory_search_by_layer`, `memory_get_history`, `memory_get_at` and `memory_improve` return a memory the system organised automatically (conversation distillation, user-profile traits and their summary, OS footprint) only when its recorded source is this same conversation; any other such memory, including one with no recorded source, is left out, and `memory_read` of its id answers exactly like an id that does not exist. Memories the employee stored with `memory_store` are unaffected. `decision_list` and `decision_resolve` likewise see only the open decisions recorded in this conversation, and another conversation's decision id gets the not-found answer; scheduled and dispatched runs and external MCP clients behave as before.
+
 ### `knowledge_*` — document knowledge base
 
 `knowledge_search`, `knowledge_get_passage` and `knowledge_list_collections` read the

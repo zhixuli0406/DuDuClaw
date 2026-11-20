@@ -98,7 +98,7 @@ Actual user turn: "what about the proxy config?"
 
 ## 第 3 層：P2 Key-Fact Accumulator（v1.8.6）
 
-有些事實並不專屬於某一個 session。它們描述的是跨越時間的使用者或專案，例如：
+有些事實在一輪結束後仍然有用，它們描述的是這段對話中的使用者或專案。從 v1.83.0 起，重點事實屬於產生它的那段對話（頻道、聊天室與 session），只會注入同一段對話；同一位 AI 員工和其他人的對話看不到。例如：
 
 - 「使用者的部署目標是 Cloudflare Workers」
 - 「偏好的測試函式庫是 vitest，不是 jest」
@@ -126,7 +126,8 @@ Stored in: key_facts table (FTS5 indexed)
      v
 Next turn's system prompt assembly:
   SELECT content FROM key_facts
-  WHERE agent_id = ?
+  WHERE agent_id = ? AND channel = ? AND chat_id = ?
+    AND source_session = ?          -- this conversation only
   ORDER BY fts5_rank(relevance) DESC
   LIMIT 3
      |

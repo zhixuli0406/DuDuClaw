@@ -303,7 +303,7 @@ WordPress ウィジェット（プラグイン 0.1.1）はヘッダーに接続�
 | ベクトル re-rank シグナル | 組み込みの文字 n-gram ハッシュ embedder（`NgramHashEmbedder`、`DUDUCLAW_SEMANTIC_VECTORS=1` でオプトイン）。意味ではなく表層の断片で照合する。ONNX embedder はデフォルト外の `onnx` ビルド feature が必要で、リリースバイナリには含まれない |
 | メモリ減衰スケジューラ | 日次バックグラウンド — 低重要度 + 30 日以上アーカイブ、アーカイブ + 90 日以上完全削除 |
 | 認知メモリ MCP ツール | `memory_search_by_layer` / `memory_successful_conversations` / `memory_episodic_pressure` / `memory_consolidation_status` |
-| Key-Fact Accumulator | `key_facts` + FTS5 — セッション横断の軽量メモリ（セッションメモリスタック参照） |
+| Key-Fact Accumulator | `key_facts` + FTS5 — 軽量メモリ。それを生んだ会話にだけ注入されます（v1.83.0、セッションメモリスタック参照） |
 | Temporal Memory（v1.19.0）| `memories` に冪等マイグレーションで時系列/ナレッジグラフ列（`valid_from`/`valid_until`/`superseded_by`/`supersedes`/`subject`/`predicate`/`object`/`confidence`/`metadata`）を追加；`store_temporal()` が同一 `(agent, subject, predicate)` を自動コンフリクト解決し supersession chain を連結（v1.67.1 から、書き込みの信頼度が現在の事実以上の場合のみ置き換え）；`search()` はデフォルトで現行有効行のみフィルタ；`get_history()` / `get_at()` がチェーンとポイントインタイムを提供 |
 | Reflexion Loop（F2、v1.19.0）| 既存 `MistakeNotebook` をブリッジ — F2a は未解決の最近のミスを回答プロンプトに注入（`## Past Mistakes to Avoid`、CJK セーフ照合 + recency フォールバック）；F2b は同一 `MistakeCategory` のミス ≥3 件を 1 つの意味メモリルールに統合（`reflexion.rs`）し元を解決済みに。トリガー = `ErrorCategory` Significant/Critical（MetaCognition 適応） |
 | `memory_fetch_batch`（F3、v1.19.0）| MCP ツール + `get_by_ids` が ≤100 件を ID で一括取得（名前空間/所有権を強制、部分ヒット → `missing_ids`） |

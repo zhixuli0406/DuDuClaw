@@ -343,7 +343,7 @@ fn strip_leading_sep(s: &str) -> &str {
 ///
 /// `ctx_meta.session_id` names the conversation the decision belongs to; it is
 /// stored in each row's `metadata` and is what scopes listing and resolution
-/// (v1.82.1). Without it the decision is never surfaced in any conversation.
+/// (v1.83.0). Without it the decision is never surfaced in any conversation.
 pub async fn persist_decision(
     engine: &SqliteMemoryEngine,
     agent_id: &str,
@@ -443,7 +443,7 @@ async fn write_triple(
 /// Render the still-open decisions recorded in conversation `session_id` as a
 /// system-prompt section (RFC-24 §4.3).
 ///
-/// v1.82.1: a decision belongs to the conversation that recorded it
+/// v1.83.0: a decision belongs to the conversation that recorded it
 /// (`metadata.session_id`); another user's conversation with the same agent
 /// never sees it, and a decision with no recorded session is never listed.
 ///
@@ -727,7 +727,7 @@ mod tests {
             serde_json::json!({"channel": "telegram"}),
             duduclaw_memory::lineage::Provenance::test_only()).await.unwrap();
 
-        // v1.82.1 regression: session B (same agent) neither sees nor can resolve A's decision.
+        // v1.83.0 regression: session B (same agent) neither sees nor can resolve A's decision.
         // These are the same session-scoped calls the reply pipeline makes.
         let open_for_b = engine.list_open_decisions_in_session(agent, "session-b", 20).await.unwrap();
         assert!(open_for_b.is_empty());

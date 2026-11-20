@@ -47,7 +47,7 @@ pub use engine::{
     is_system_signal, DecisionResolveOutcome, DecisionView, KeyFact, MigrationDisposition,
     NamespaceRow, OnRefused, SqliteMemoryEngine, SubjectFact, SubjectTripleForgetReport,
     TemporalMeta, TemporalRecord, word_jaccard, PREDICTION_CONTENT_PREFIX,
-    SYSTEM_SIGNAL_SOURCE_EVENTS,
+    SYSTEM_SIGNAL_SOURCE_EVENTS, is_host_generated, HOST_GENERATED_SOURCE_EVENTS,
 };
 pub use feedback::{CitationTracker, DrainOnDrop, TrustSignal, WikiCitation};
 pub use gdpr::{gdpr_erase, gdpr_export, validate_contact as gdpr_validate_contact, GdprEraseSummary};

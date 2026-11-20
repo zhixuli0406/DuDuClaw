@@ -98,7 +98,7 @@ Combined with the U-shaped attention tail effect, it means the model "sees" the 
 
 ## Layer 3: P2 Key-Fact Accumulator (v1.8.6)
 
-Some facts aren't specific to one session — they describe the user or the project across time. Examples:
+Some facts outlive a single turn — they describe the user or the project over the course of a conversation. Since v1.83.0 a key fact belongs to the conversation (channel, chat and session) that produced it and is only injected there; another person's conversation with the same employee never sees it. Examples:
 
 - "User's deployment target is Cloudflare Workers"
 - "Preferred testing library is vitest, not jest"
@@ -126,7 +126,8 @@ Stored in: key_facts table (FTS5 indexed)
      v
 Next turn's system prompt assembly:
   SELECT content FROM key_facts
-  WHERE agent_id = ?
+  WHERE agent_id = ? AND channel = ? AND chat_id = ?
+    AND source_session = ?          -- this conversation only
   ORDER BY fts5_rank(relevance) DESC
   LIMIT 3
      |

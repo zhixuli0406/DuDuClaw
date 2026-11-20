@@ -398,6 +398,10 @@ AI 員工只能調整自己或下屬的設定，採用與 `agent_update` 相同�
 
 沒有建立、修改、恢復或重新啟用持續任務的工具，也沒有送指示的工具。
 
+### `memory_search`／`memory_read`／`decision_*`：聊天對話的讀取範圍（v1.83.0）
+
+員工行程在處理聊天對話的一輪時，`memory_search`、`memory_read`、`memory_fetch_batch`、`memory_search_by_layer`、`memory_get_history`、`memory_get_at` 與 `memory_improve` 只會回傳來源記錄為同一段對話的自動整理記憶（對話整理、使用者偏好與其摘要、電腦使用紀錄）；其他對話的、以及沒有記錄來源的自動整理記憶都不會回傳，用 `memory_read` 讀取它的編號時，回答和編號不存在時相同。員工用 `memory_store` 自己存的記憶不受影響。`decision_list` 與 `decision_resolve` 也只看得到這段對話記錄的待決事項，其他對話的待決事項編號會得到「找不到」；排程與交辦工作、外部 MCP 用戶端的行為不變。
+
 ### `knowledge_*`：文件知識庫
 
 `knowledge_search`、`knowledge_get_passage`、`knowledge_list_collections` 讀取[文件知識庫](../../features/zh-TW/63-knowledge-base.md)。scope 是 `knowledge:read`，不能授權給外部 MCP 金鑰。每次呼叫都透過簽章本機路由 `POST /api/internal/knowledge` 交給 gateway；gateway 算出這次呼叫能讀哪些集合（授權給員工本人與其部門的集合，依 `agent.toml [knowledge] collections` 縮小，再與這個 turn 所服務的人、敏感度規則取交集），並寫一筆存取紀錄。gateway 沒在執行時工具會直接說明，不會自己讀資料庫。

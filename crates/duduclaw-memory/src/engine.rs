@@ -3804,6 +3804,38 @@ impl SqliteMemoryEngine {
         self.open_decisions(agent_id, Some(session_id), limit).await
     }
 
+    /// Whether `decision_id` (without the `decision:` prefix) is an open
+    /// decision recorded in conversation `session_id`: the same rule as
+    /// [`list_open_decisions_in_session`](Self::list_open_decisions_in_session),
+    /// for one id (v1.83.0, MCP `decision_resolve`). Fail-closed: an empty
+    /// `session_id` never matches.
+    pub async fn is_open_decision_in_session(
+        &self,
+        agent_id: &str,
+        decision_id: &str,
+        session_id: &str,
+    ) -> Result<bool> {
+        if session_id.is_empty() {
+            return Ok(false);
+        }
+        let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
+        let subject = format!("decision:{decision_id}");
+        conn.query_row(
+            "SELECT 1 FROM memories
+             WHERE agent_id = ?1 AND subject = ?2 AND predicate = 'status' AND object = 'open'
+               AND valid_until IS NULL
+               AND (CASE WHEN json_valid(metadata)
+                    THEN json_extract(metadata, '$.session_id') END) = ?3
+             LIMIT 1",
+            params![agent_id, subject, session_id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|hit| hit.is_some())
+        .map_err(|e| DuDuClawError::Memory(e.to_string()))
+    }
+
     async fn open_decisions(
         &self,
         agent_id: &str,
@@ -5383,6 +5415,9 @@ pub mod forget_source;
 pub mod subject_listing;
 pub use subject_listing::{SubjectFact, SubjectTripleForgetReport};
 
+pub mod conversation_scope;
+pub use conversation_scope::{is_host_generated, HOST_GENERATED_SOURCE_EVENTS};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5406,7 +5441,7 @@ mod tests {
             engine.store_fact("shared-agent", "Unscoped orchard fact", ch, cid, sess,
                 crate::lineage::Provenance::test_only()).await.unwrap();
         }
-        // Regression (v1.82.1): Bob's private turn — no FTS match, so the
+        // Regression (v1.83.0): Bob's private turn — no FTS match, so the
         // recency fallback runs, but only inside Bob's own conversation.
         let hits = engine.search_facts_in_chat("shared-agent", "telegram", "private-bob",
             "session-bob", "Bob unmatchedquartz", 3).await.unwrap();
@@ -5442,7 +5477,7 @@ mod tests {
             crate::lineage::Provenance::test_only()).await.unwrap();
         // A recency fallback with limit 1 would return the unrelated fact instead.
         assert_ne!(engine.get_recent_facts("shared-agent", 1).await.unwrap()[0].id, id);
-        // Regression (v1.82.1): a matching query from Bob's conversation gets nothing.
+        // Regression (v1.83.0): a matching query from Bob's conversation gets nothing.
         let hits = engine.search_facts_in_chat("shared-agent", "telegram", "private-bob",
             "session-bob", "uniqueorchid", 1).await.unwrap();
         assert!(hits.is_empty(), "Alice's fact leaked into Bob's conversation: {hits:?}");
