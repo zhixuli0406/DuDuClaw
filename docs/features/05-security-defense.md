@@ -2,7 +2,7 @@
 
 ## Native Linux isolation integration (planned for a later release)
 
-> **Not available in v1.82.0.** The code for the per-employee Linux isolation architecture has been included since v1.81.0, but it cannot be installed or enabled on a customer host. The protected service still installs, updates and runs employees as in v1.80 (`sudo duduclaw service install --protected-linux`, `sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux`). The paragraphs in this section, and the sections marked "planned for a later release" below, describe the development state of that planned release.
+> **Not available in v1.83.0.** The code for the per-employee Linux isolation architecture has been included since v1.81.0, but it cannot be installed or enabled on a customer host. The protected service still installs, updates and runs employees as in v1.80 (`sudo duduclaw service install --protected-linux`, `sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux`). The paragraphs in this section, and the sections marked "planned for a later release" below, describe the development state of that planned release.
 
 The protected ingress preserves the original verified WebChat/channel user and credential epoch, and rechecks live access before launch. Scheduled work, reminders, heartbeat and goal work now require the record owner's identity, the exact stored work and a persisted Admin dashboard approval: decisions are due within 24 hours and authorization lasts at most 30 days. Pending work is deferred without consuming retries. Schedulers never refresh the original credential epoch; only an authenticated heartbeat settings save can request a new approval for stale authority. Delegation derives authority from the original live, verified run and refuses missing identity.
 
@@ -774,7 +774,7 @@ This protection does not hide a filled field from JavaScript on the same origin.
 
 ## Administrator setup and migration review (planned for a later release)
 
-These parts belong to the native Linux isolation migration and are not available in v1.82.0. First-administrator setup links are issued only by that migration (the loopback page `/api/migration/setup`); ordinary installations do not use setup links, so the rules below do not change them.
+These parts belong to the native Linux isolation migration and are not available in v1.83.0. First-administrator setup links are issued only by that migration (the loopback page `/api/migration/setup`); ordinary installations do not use setup links, so the rules below do not change them.
 
 Administrator setup links expire after 30 minutes. Issuing a new link invalidates previous links. Claiming a first-administrator link, checking that no user exists, creating the account and consuming all setup links now share one SQLite transaction. Recovery links remain a separate, explicitly issued purpose. Claims are limited to five per minute; twenty failed attempts invalidate the current link. Existing setup links without a purpose binding are invalidated when the authentication database is upgraded.
 

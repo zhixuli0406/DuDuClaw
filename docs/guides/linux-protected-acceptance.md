@@ -2,7 +2,7 @@
 
 [繁體中文](zh-TW/linux-protected-acceptance.md) · [日本語](ja-JP/linux-protected-acceptance.md)
 
-> **Status: planned for a later release, not available in v1.82.0.** The per-employee Linux isolation this runbook accepts cannot be installed on a customer host in v1.82.0. The protected service still installs, updates and runs employees as in v1.80.
+> **Status: planned for a later release, not available in v1.83.0.** The per-employee Linux isolation this runbook accepts cannot be installed on a customer host in v1.83.0. The protected service still installs, updates and runs employees as in v1.80.
 
 This runbook is for release maintainers. It lists what you need, which commands to run, and how to read the results for the native Linux isolation acceptance planned for a later release: Personal and Shared employees, connectors, and the Package H tools.
 

@@ -1,6 +1,6 @@
 # 原生 Linux 受保護模式（預計在之後的版本提供）
 
-> **狀態：預計在之後的版本提供。v1.82.0 無法使用。** 程式碼自 v1.81.0 起已包含在內，但客戶主機還無法安裝或啟用。
+> **狀態：預計在之後的版本提供。v1.83.0 無法使用。** 程式碼自 v1.81.0 起已包含在內，但客戶主機還無法安裝或啟用。
 >
 > 目前版本的做法：`sudo duduclaw service install --protected-linux` 照 v1.80 的方式安裝單一執行檔的受保護服務，`sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux` 負責更新。AI 員工的建立與執行都和 v1.80 相同。詳見[單一執行檔受保護服務](../../guides/zh-TW/linux-protected-service.md)。
 >
@@ -12,7 +12,7 @@
 
 ## 如何開啟（預計在之後的版本提供）
 
-以下步驟要等隔離元件可以安裝後才適用。在 v1.82.0 會停在第 1 步：安裝程式只裝單一執行檔的受保護服務，就緒檢查不會回報隔離已就緒，管理頁也不會出現。
+以下步驟要等隔離元件可以安裝後才適用。在 v1.83.0 會停在第 1 步：安裝程式只裝單一執行檔的受保護服務，就緒檢查不會回報隔離已就緒，管理頁也不會出現。
 
 1. 在支援的主機（Ubuntu 22.04、Ubuntu 24.04 或 Debian 12；x86_64 或 ARM64）執行 `sudo duduclaw service install --protected-linux` 安裝受保護服務，步驟見[受保護服務指南](../../guides/zh-TW/linux-protected-service.md)。
 2. 執行 `sudo duduclaw service readiness --protected-linux`。儀表板的就緒橫幅會說明什麼擋住了受保護工作（帳號或連線設定未完成、授權被撤銷、服務暫時無法使用），並附支援參考編號。
