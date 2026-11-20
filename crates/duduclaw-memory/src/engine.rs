@@ -3784,22 +3784,51 @@ impl SqliteMemoryEngine {
         agent_id: &str,
         limit: usize,
     ) -> Result<Vec<DecisionView>> {
+        self.open_decisions(agent_id, None, limit).await
+    }
+
+    /// Like [`list_open_decisions`](Self::list_open_decisions), but only the
+    /// decisions recorded in conversation `session_id`: the status row's
+    /// `metadata.session_id` (written by the decision-capture layer) must equal
+    /// it. Fail-closed: a row without a recorded session, and an empty
+    /// `session_id`, never match.
+    pub async fn list_open_decisions_in_session(
+        &self,
+        agent_id: &str,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<DecisionView>> {
+        if session_id.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.open_decisions(agent_id, Some(session_id), limit).await
+    }
+
+    async fn open_decisions(
+        &self,
+        agent_id: &str,
+        session_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<DecisionView>> {
         let conn = self.conn.lock().await;
         crate::isolation_io::verify()?;
 
         // Subjects with a currently-valid status=open row, newest first.
+        // `?3 IS NULL` = agent-wide listing; otherwise same conversation only.
         let subjects: Vec<(String, Option<String>)> = {
             let mut stmt = conn
                 .prepare(
                     "SELECT subject, valid_from FROM memories
                      WHERE agent_id = ?1 AND predicate = 'status' AND object = 'open'
                        AND valid_until IS NULL AND subject LIKE 'decision:%'
+                       AND (?3 IS NULL OR (CASE WHEN json_valid(metadata)
+                            THEN json_extract(metadata, '$.session_id') END) = ?3)
                      ORDER BY COALESCE(valid_from, timestamp) DESC, created_at DESC
                      LIMIT ?2",
                 )
                 .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
             let rows = stmt
-                .query_map(params![agent_id, limit as i64], |r| {
+                .query_map(params![agent_id, limit as i64, session_id], |r| {
                     Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
                 })
                 .map_err(|e| DuDuClawError::Memory(e.to_string()))?;

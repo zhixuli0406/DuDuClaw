@@ -38,7 +38,7 @@ DuDuClawは**マルチランタイム AI エージェントプラットフォー
 - **ターントリミング**（800文字超 → 先頭300 + 末尾200 + `[trimmed N chars]`、CJK対応）。
 - **Direct APIのpromptキャッシュ**（"system_and_3" ブレークポイント戦略。測定済みのヒット率は公表していません）。
 - **圧縮サマリー**は50kトークンの閾値でsystem prompt（会話ターンではなく）に注入されます。
-- **Instruction Pinning**（v1.8.6 P0）— ユーザーの最初のターン → 解決された補助モデル（Codex の制限モード、または Claude／API のツールなしモード）（社員ランタイムが非対応ならグローバル設定）が非同期でコアタスクを抽出 → `sessions.pinned_instructions` に保存 → system promptの末尾に注入（U字型の注意分布を利用）。明確化の回答は蓄積されます（≤1000文字）。
+- **Instruction Pinning**（v1.8.6 P0）— 1 対 1 の個人チャットでのユーザーの最初のターン（グループチャットでは行わない） → 解決された補助モデル（Codex の制限モード、または Claude／API のツールなしモード）（社員ランタイムが非対応ならグローバル設定）が非同期でコアタスクを抽出 → `sessions.pinned_instructions` に保存 → system promptの末尾に注入（U字型の注意分布を利用）。明確化の回答は蓄積されます（≤1000文字）。
 - **Snowball Recap**（v1.8.6 P0）— 各ターンでユーザーメッセージの前に `<task_recap>` を付加。LLMコストはゼロ。
 - **P2 Key-Fact Accumulator**（v1.8.6）— 実質的な内容のあるターンごとに、解決された補助モデル（Codex の制限モード、または Claude／API のツールなしモード）（社員ランタイムが非対応ならグローバル設定）が2〜4件の重要事実を抽出 → FTS5付きの `key_facts` テーブルに保存 → 最も関連性の高い上位3件をsystem promptに注入。約100〜150トークンで、MemGPTの6,500トークン（−87%）と比較して大幅に削減。
 - **CLI軽量パス**— `call_claude_cli_lightweight()` に `--effort medium --max-turns 1 --no-session-persistence --tools ""` を付与し、メタデータタスクに使用。コストを25〜40%削減。

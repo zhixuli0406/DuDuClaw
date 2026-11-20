@@ -51,7 +51,7 @@ Stored in: sessions.pinned_instructions (SQLite column)
 Injected at: system prompt tail (high-attention U-shape position)
 ```
 
-萃取以非同步方式執行，不會阻塞第一個回應。背景決策確認、指令擷取、事實擷取與對話壓縮，Claude、Codex 與 OpenAI 相容 API 員工沿用自己的後端。明確填寫且非空白的 `[model] utility` 優先；否則 Claude 使用 `claude-haiku-4-5`，Codex 與 OpenAI 相容 API 沿用 `[model] preferred`。兩者都空白時，Codex 省略 `-m`、使用 CLI 預設模型；OpenAI 相容 API 則拒絕呼叫。Grok 與通用 CLI 員工改用全域背景設定。明確指定的輔助模型與後端屬於不同廠商家族時，儀表板會顯示警告。
+萃取以非同步方式執行，不會阻塞第一個回應，而且只在一對一私人對話中進行；群組對話不會從第一則訊息建立固定指示。背景決策確認、指令擷取、事實擷取與對話壓縮，Claude、Codex 與 OpenAI 相容 API 員工沿用自己的後端。明確填寫且非空白的 `[model] utility` 優先；否則 Claude 使用 `claude-haiku-4-5`，Codex 與 OpenAI 相容 API 沿用 `[model] preferred`。兩者都空白時，Codex 省略 `-m`、使用 CLI 預設模型；OpenAI 相容 API 則拒絕呼叫。Grok 與通用 CLI 員工改用全域背景設定。明確指定的輔助模型與後端屬於不同廠商家族時，儀表板會顯示警告。
 
 Claude 輔助呼叫使用 CLI 可用憑證走輕量路徑，不進入帳號輪替；一般對話仍保留原有帳號輪替。
 
@@ -61,7 +61,7 @@ Claude 輔助呼叫使用 CLI 可用憑證走輕量路徑，不進入帳號輪�
 
 ### 澄清累積
 
-當 Agent 提出澄清問題（「我該保留 service worker 嗎？」）而使用者回答時，那個答案會附加到 pinned instructions（上限 1,000 字元以防止漂移）。
+在一對一私人對話中，當 Agent 提出澄清問題（「我該保留 service worker 嗎？」）而使用者回答時，那個答案會附加到 pinned instructions（上限 1,000 字元以防止漂移）。
 
 ```
 Pinned instructions grow with clarifications:

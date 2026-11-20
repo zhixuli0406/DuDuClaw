@@ -1456,6 +1456,7 @@ async fn build_reply_with_session_inner_impl(
         // later "用方案 C" resolves from durable state, not conversation memory.
         // Tail placement (near pinned, U-shaped peak attention). Own opt-in
         // flag (`[memory] decision_continuity`). !Send → spawn_blocking.
+        // v1.82.1: only decisions recorded in this same conversation.
         if agent_dir
             .as_deref()
             .map(crate::runtime_config::decision_continuity_enabled)
@@ -1463,6 +1464,7 @@ async fn build_reply_with_session_inner_impl(
         {
             if let Some(db_path) = ctx.memory_db_path.clone() {
                 let aid = agent_id.clone();
+                let sid_for_decisions = session_id.to_string();
                 let home_for_decisions = ctx.home_dir.clone();
                 if let Ok(section) = tokio::task::spawn_blocking(move || {
                     // H4: single construction point (`[memory] novelty_gate` + `w_vec`).
@@ -1471,7 +1473,7 @@ async fn build_reply_with_session_inner_impl(
                             .ok()?;
                     let rt = tokio::runtime::Handle::current();
                     let s = rt.block_on(crate::decision_capture::build_open_decisions_section(
-                        &engine, &aid,
+                        &engine, &aid, &sid_for_decisions,
                     ));
                     if s.is_empty() { None } else { Some(s) }
                 })
@@ -2650,8 +2652,14 @@ async fn build_reply_with_session_inner_impl(
                             }
                         };
                         let rt = tokio::runtime::Handle::current();
+                        // v1.82.1: only this conversation's decisions can be
+                        // referenced and resolved from a channel reply.
                         let open = rt
-                            .block_on(engine.list_open_decisions(&agent_for_res, 20))
+                            .block_on(engine.list_open_decisions_in_session(
+                                &agent_for_res,
+                                &session_for_res,
+                                20,
+                            ))
                             .unwrap_or_default();
 
                         if let Some((id, key)) =
@@ -2787,7 +2795,8 @@ async fn build_reply_with_session_inner_impl(
         // Asynchronously extract core task instructions from the first user
         // message using the agent's utility runtime (same as compression).
         // Pinned instructions persist across turns and survive compression.
-        if !has_history {
+        // v1.82.1: only in a 1:1 private session; existing group pins are left as-is (no migration).
+        if should_extract_first_turn_pin(is_private, has_history) {
             let sm = ctx.session_manager.clone();
             let sid = session_id.to_string();
             let user_text = duduclaw_security::credential_detect::mask(&sanitized_text);
@@ -4617,6 +4626,13 @@ fn should_append_clarification(is_private: bool, has_history: bool, has_pinned: 
     is_private && has_history && has_pinned
 }
 
+/// Whether the first message of a session may be distilled into its pinned
+/// instructions. Only in a 1:1 private session (`is_private_session`) with no
+/// history yet; a group/shared session never extracts a pin.
+fn should_extract_first_turn_pin(is_private: bool, has_history: bool) -> bool {
+    is_private && !has_history
+}
+
 #[cfg(test)]
 mod released_repro_source_tests {
     // Only inspect the shipped implementation, never these assertions themselves.
@@ -4697,5 +4713,34 @@ mod released_repro_source_tests {
             }
         }
     }"#);
+    }
+
+    #[test]
+    fn first_turn_pin_extraction_private_only_truth_table() {
+        use super::should_extract_first_turn_pin as allow;
+        assert!(allow(true, false), "private session, first turn: extract");
+        assert!(!allow(true, true), "private session with history: no extraction");
+        assert!(!allow(false, false), "group session, first turn: never extract");
+        assert!(!allow(false, true), "group session with history: never extract");
+    }
+
+    #[test]
+    fn first_turn_pin_extraction_source_guarded() {
+        let source = shipped_source();
+        // The old history-only guard is gone.
+        assert!(!source.contains("        if !has_history {\n            let sm = ctx.session_manager.clone();"));
+        // Exactly one detached pin extraction, and it sits under the predicate.
+        assert_eq!(source.matches("Extract the core task instructions from this user message.").count(), 1);
+        assert_eq!(source.matches("sm.set_pinned_if_unchanged(").count(), 1);
+        let guard = "        if should_extract_first_turn_pin(is_private, has_history) {\n";
+        assert_eq!(source.matches(guard).count(), 1);
+        let start = source.find(guard).unwrap();
+        let end = start + source[start..].find("\n\n        // ── P2 Key-Fact Accumulator").unwrap();
+        let block = &source[start..end];
+        assert!(block.starts_with(&format!("{guard}            let sm = ctx.session_manager.clone();\n")));
+        assert!(block.contains("            tokio::spawn(async move {"));
+        assert!(block.contains("Extract the core task instructions from this user message."));
+        assert!(block.contains("sm.set_pinned_if_unchanged(&sid, &extracted, &pin_generation)"));
+        assert!(block.ends_with("            });\n        }"));
     }
 }

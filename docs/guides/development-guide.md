@@ -37,12 +37,14 @@ There is no separate `duduclaw dev` mode. The server:
 ### 1.3 Decision continuity (RFC-24)
 
 When an agent presents the user with enumerated options ("Option A/B/C", "Option 1/2"),
-the user may reply later — even across a session restart or after compression — with
-something like "go with C". By default, the option text may already be gone if it
-fell out of conversation memory during compression. With this feature enabled, the
-system stores each option in a semantic memory layer independent of conversation
-history at send time, and injects a "pending decision" note into later turns so the
-agent can resolve the reference correctly.
+the user may reply later in the same conversation — even after a gateway restart or
+after compression — with something like "go with C". By default, the option text may
+already be gone if it fell out of conversation memory during compression. With this
+feature enabled, the system stores each option in a semantic memory layer independent
+of conversation history at send time, and injects a "pending decision" note into later
+turns of that conversation so the agent can resolve the reference correctly. Other
+conversations with the same agent never see the note and cannot resolve it; pending
+decisions with no recorded conversation are not shown.
 
 Enable it in `agent.toml` (off by default, opt-in per agent):
 

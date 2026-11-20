@@ -51,7 +51,7 @@ Stored in: sessions.pinned_instructions (SQLite column)
 Injected at: system prompt tail (high-attention U-shape position)
 ```
 
-抽出は非同期で実行し、最初の応答をブロックしません。バックグラウンドの決定確認、指示抽出、事実抽出、会話圧縮が社員自身のランタイムを使うのは Claude、Codex、OpenAI 互換 API の場合です。空白ではない `[model] utility` が優先し、未設定なら Claude は `claude-haiku-4-5`、Codex と OpenAI 互換 API は `[model] preferred` を使います。両方が空白なら Codex は CLI の既定モデルを使い、API は呼び出しを拒否します。Grok、汎用 CLI の社員はグローバルのバックグラウンド設定を使います。明示した補助モデルとランタイムのベンダー系統が異なる場合はダッシュボードに警告します。
+抽出は非同期で実行し、最初の応答をブロックしません。抽出するのは 1 対 1 の個人チャットだけで、グループチャットでは最初のメッセージから固定指示を作りません。バックグラウンドの決定確認、指示抽出、事実抽出、会話圧縮が社員自身のランタイムを使うのは Claude、Codex、OpenAI 互換 API の場合です。空白ではない `[model] utility` が優先し、未設定なら Claude は `claude-haiku-4-5`、Codex と OpenAI 互換 API は `[model] preferred` を使います。両方が空白なら Codex は CLI の既定モデルを使い、API は呼び出しを拒否します。Grok、汎用 CLI の社員はグローバルのバックグラウンド設定を使います。明示した補助モデルとランタイムのベンダー系統が異なる場合はダッシュボードに警告します。
 
 Claude の補助呼び出しは CLI が使える認証情報で軽量パスを実行し、アカウントローテーションには入りません。通常の会話は既存のローテーションを維持します。
 
@@ -61,7 +61,7 @@ Claude の補助呼び出しは CLI が使える認証情報で軽量パスを�
 
 ### 明確化の蓄積
 
-エージェントが明確化の質問（「service workerは保持すべきですか？」）をしてユーザーが答えると、その回答はpinned instructionsに追記されます——ドリフトを防ぐため1,000文字に上限が設けられています。
+1 対 1 の個人チャットでエージェントが明確化の質問（「service workerは保持すべきですか？」）をしてユーザーが答えると、その回答はpinned instructionsに追記されます——ドリフトを防ぐため1,000文字に上限が設けられています。
 
 ```
 Pinned instructions grow with clarifications:
