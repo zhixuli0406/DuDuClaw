@@ -4636,8 +4636,9 @@ fn should_extract_first_turn_pin(is_private: bool, has_history: bool) -> bool {
 #[cfg(test)]
 mod released_repro_source_tests {
     // Only inspect the shipped implementation, never these assertions themselves.
-    fn shipped_source() -> &'static str {
-        include_str!("inner.rs").split("\n#[cfg(test)]\nmod released_repro_source_tests {").next().unwrap()
+    fn shipped_source() -> String {
+        // Windows CRLF checkout: rustc normalizes literals, but include_str! does not.
+        include_str!("inner.rs").replace("\r\n", "\n").split("\n#[cfg(test)]\nmod released_repro_source_tests {").next().unwrap().to_string()
     }
 
     #[test]
