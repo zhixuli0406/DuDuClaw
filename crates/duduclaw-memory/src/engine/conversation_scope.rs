@@ -6,14 +6,15 @@
 //! added later. An employee serves many people, so a read made for one
 //! conversation (the employee's MCP tools on a channel turn) must not return
 //! such a row from another conversation. This is an allow-list: only the
-//! explicitly stored rows of [`EXPLICIT_SOURCE_EVENTS`] skip the check; every
-//! other `source_event` (empty and unknown ones included) must come from this
-//! conversation (fail closed).
+//! explicitly stored rows of [`EXPLICIT_SOURCE_EVENTS`] skip the check. Every
+//! other row needs recorded origins: each must be an operator import item or
+//! come from this conversation (fail closed), regardless of `source_event`.
 //!
 //! The source conversation of a row is what the P2-B lineage recorded for it:
 //! `memory_origins.source_session` of its `direct` and `inherited` rows
-//! (`memory_store = 'memories'`, keyed by `memory_id` + `agent_id`). A
-//! `reaffirm` row only says another write repeated the fact; it is not where
+//! (`memory_store = 'memories'`, keyed by `memory_id` + `agent_id`).
+//! `source_kind` identifies import items via [`crate::lineage::SourceKind::ImportItem`].
+//! A `reaffirm` row only says another write repeated the fact; it is not where
 //! the content came from, and lineage inheritance ignores it too
 //! (`lineage::db::resolve`). No schema change: the table already exists.
 
@@ -21,15 +22,23 @@ use super::*;
 
 /// `source_event` of the rows whose content was stored by an explicit act of
 /// the employee or an operator, not derived by the host from conversation
-/// content. Only these skip the same-conversation check:
+/// content. These skip the lineage check by name:
 ///
 /// | event          | writer                                              | why exempt |
 /// |----------------|-----------------------------------------------------|------------|
 /// | `mcp_internal` | `duduclaw-cli/src/mcp_memory_handlers.rs` (`handle_memory_store`) | the employee's own `memory_store` call |
-/// | `import`       | `duduclaw-memory/src/import.rs` (`build_memory_entry`, run by `duduclaw-cli/src/wizard.rs`) | operator file import |
+/// | `import`       | `duduclaw-memory/src/import.rs` (`build_memory_entry`, run by `duduclaw-cli/src/wizard.rs`) | operator file import; also records import-item lineage |
 ///
-/// Every other `source_event` is checked. The ones the code writes today, and
-/// why each is not exempt:
+/// Varying import event names are visible through their import-item lineage:
+///
+/// | event                     | writer | why visible |
+/// |---------------------------|--------|-------------|
+/// | `migrate-from-<platform>` | `duduclaw-cli/src/migrate_from/apply.rs` | operator platform migration with import-item origins |
+/// | `agent-import-<format>`   | `duduclaw-cli/src/expert/agent_config/slots.rs` | operator agent import with import-item origins |
+/// | `<migration id>`          | `duduclaw-gateway/src/migration_import.rs` | legacy migration with import-item origins |
+///
+/// Every other `source_event` is checked too. The remaining writers today,
+/// and why their rows need same-conversation origins:
 ///
 /// | event                           | writer | why not exempt |
 /// |---------------------------------|--------|----------------|
@@ -49,11 +58,8 @@ use super::*;
 /// | `task_forward_induction`        | `duduclaw-gateway/src/prediction/task_rule_induce.rs` | host-induced task rules |
 /// | `footprint_distill`             | `duduclaw-gateway/src/footprint_distill.rs` | host round-up, no conversation of this turn |
 /// | `mcp_external`                  | `duduclaw-cli/src/mcp_memory_handlers.rs` (`handle_memory_store`) | external client rows live in `external/` namespaces, which never read with a conversation scope |
-/// | `migrate-from-<platform>`       | `duduclaw-cli/src/migrate_from/apply.rs` | dynamic name; migrated content may hold other people's conversations |
-/// | `agent-import-<format>`         | `duduclaw-cli/src/expert/agent_config/slots.rs` | dynamic name; imported agent memory may hold other people's conversations |
-/// | `<migration id>`                | `duduclaw-gateway/src/migration_import.rs` | dynamic name; legacy import archive |
-/// | `agent_mood`, `curated`, `fact` | no production writer (tests / older rows only) | not enumerated by a writer, so fail closed |
-/// | empty / any other value         | — | unknown, so fail closed |
+/// | `agent_mood`, `curated`, `fact` | no production writer (tests / older rows only) | require import-item or same-conversation origins |
+/// | empty / any other value         | — | require import-item or same-conversation origins |
 pub const EXPLICIT_SOURCE_EVENTS: &[&str] = &["mcp_internal", "import"];
 
 /// Whether `source_event` names an explicitly stored row
@@ -66,16 +72,15 @@ impl SqliteMemoryEngine {
     /// Of `ids` (rows of `agent_id`), the ones a reader serving conversation
     /// `session` may NOT see: every row that is not explicitly stored
     /// ([`EXPLICIT_SOURCE_EVENTS`]) unless it has at least one `direct` /
-    /// `inherited` lineage row and every such row has
+    /// `inherited` lineage row and every such row is an import item or has
     /// `source_session = session`. Explicitly stored rows are never hidden.
     ///
     /// Fail closed:
     /// * `session = None` or empty (the conversation is unknown) hides every
-    ///   row that is not explicitly stored;
-    /// * such a row with an empty or unknown `source_event`, no lineage
-    ///   (written before P2-B), or a source outside this conversation
-    ///   (another session, a dispatch run, `system:` / `untracked`), is
-    ///   hidden;
+    ///   non-explicit row with any non-import origin;
+    /// * a non-explicit row with no lineage (written before P2-B), or a
+    ///   non-import source outside this conversation (another session, a
+    ///   dispatch run, `system:` / `untracked`), is hidden;
     /// * an id that is not a row of `agent_id` is hidden (callers only pass
     ///   ids they just read, so this only matters for a concurrent delete).
     pub async fn ids_hidden_from_conversation(
@@ -92,10 +97,12 @@ impl SqliteMemoryEngine {
             .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
         let mut origin_stmt = conn
             .prepare_cached(
-                "SELECT COUNT(*), COALESCE(SUM(source_session != ?3), 0)
+                "SELECT COUNT(*), COALESCE(SUM(
+                     source_kind != ?4 AND (?3 IS NULL OR source_session != ?3)
+                 ), 0)
                  FROM memory_origins
                  WHERE memory_store = 'memories' AND memory_id = ?2 AND agent_id = ?1
-                   AND role != 'reaffirm'",
+                   AND role IN ('direct', 'inherited')",
             )
             .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
         let mut hidden = std::collections::HashSet::new();
@@ -111,12 +118,11 @@ impl SqliteMemoryEngine {
             if is_explicitly_stored(event.as_deref().unwrap_or("")) {
                 continue;
             }
-            let Some(session) = session else {
-                hidden.insert(id.clone());
-                continue;
-            };
             let (total, foreign): (i64, i64) = origin_stmt
-                .query_row(params![agent_id, id, session], |r| Ok((r.get(0)?, r.get(1)?)))
+                .query_row(
+                    params![agent_id, id, session, crate::lineage::SourceKind::ImportItem.as_str()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
                 .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
             if total == 0 || foreign > 0 {
                 hidden.insert(id.clone());
@@ -184,11 +190,73 @@ mod tests {
         assert!(in_a.contains(&system), "a non-conversation source is not this conversation");
         assert!(in_a.contains("missing"));
 
-        // Unknown conversation: every row that is not explicitly stored is hidden.
+        // Unknown conversation: non-explicit conversation rows are hidden.
         for unknown in [None, Some(""), Some("  ")] {
             let hidden = engine.ids_hidden_from_conversation("a1", &ids, unknown).await.unwrap();
             assert!(hidden.contains(&a) && hidden.contains(&b), "{unknown:?}");
             assert!(!hidden.contains(&stored) && !hidden.contains(&imported), "{unknown:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn operator_import_lineage_is_visible_in_any_conversation() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        for event in ["migrate-from-openclaw", "agent-import-x", "migration-20261120-42"] {
+            let imported = put(
+                &engine,
+                event,
+                event,
+                Provenance::source(SourceRef::import_item("archive", event.as_bytes(), Utc::now())),
+            )
+            .await;
+            let inherited = put(&engine, &format!("inherited {event}"), event, Provenance::derived(vec![imported.clone()])).await;
+            for session in [Some("telegram:A"), Some("telegram:B"), None, Some(""), Some("  ")] {
+                let hidden = engine.ids_hidden_from_conversation("a1", &[imported.clone(), inherited.clone()], session).await.unwrap();
+                assert!(hidden.is_empty(), "{event:?} {session:?}: {hidden:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_event_without_origins_is_hidden() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let row = put(&engine, "untracked import", "unknown_event", Provenance::test_only()).await;
+        {
+            let conn = engine.conn_for_maintenance().await;
+            conn.execute("DELETE FROM memory_origins WHERE memory_id = ?1", params![row])
+                .unwrap();
+        }
+        for session in [Some("telegram:A"), Some("telegram:B"), None] {
+            let hidden = engine.ids_hidden_from_conversation("a1", &[row.clone()], session).await.unwrap();
+            assert!(hidden.contains(&row), "{session:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_import_and_conversation_origins_stay_in_their_conversation() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let imported = put(
+            &engine,
+            "imported policy",
+            "migrate-from-openclaw",
+            Provenance::source(SourceRef::import_item("archive", b"policy", Utc::now())),
+        )
+        .await;
+        let conversation = put(&engine, "conversation fact", "conversation_distill", from_session("telegram:A", 1)).await;
+        let mixed = put(
+            &engine,
+            "combined policy",
+            "unknown_event",
+            Provenance::derived(vec![imported, conversation.clone()]),
+        )
+        .await;
+        let ids = vec![mixed.clone(), conversation.clone()];
+        let in_a = engine.ids_hidden_from_conversation("a1", &ids, Some("telegram:A")).await.unwrap();
+        assert!(in_a.is_empty());
+        for session in [Some("telegram:B"), None] {
+            let hidden = engine.ids_hidden_from_conversation("a1", &ids, session).await.unwrap();
+            assert!(hidden.contains(&mixed), "{session:?}");
+            assert!(hidden.contains(&conversation), "{session:?}");
         }
     }
 

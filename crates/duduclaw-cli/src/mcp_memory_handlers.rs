@@ -2807,8 +2807,35 @@ mod tests {
         assert_eq!(record["id"], a_row.as_str());
     }
 
+    #[tokio::test]
+    async fn search_returns_import_lineage_on_another_channel_turn() {
+        let mem = SqliteMemoryEngine::in_memory().unwrap();
+        let content = "tamarinvale imported policy";
+        let entry = MemoryEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            agent_id: "internal/a1".into(),
+            content: content.into(),
+            timestamp: chrono::Utc::now(),
+            tags: vec![],
+            embedding: None,
+            layer: duduclaw_core::types::MemoryLayer::Semantic,
+            importance: 5.0,
+            access_count: 0,
+            last_accessed: None,
+            source_event: "migrate-from-openclaw".into(),
+        };
+        let prov = duduclaw_memory::lineage::Provenance::source(
+            duduclaw_memory::SourceRef::import_item("archive", content.as_bytes(), chrono::Utc::now()),
+        );
+        let imported = mem.store_temporal("internal/a1", entry, duduclaw_memory::TemporalMeta::default(), prov)
+            .await
+            .unwrap();
+        let found = search_ids(&mem, "tamarinvale", &channel_turn("telegram:B")).await;
+        assert!(found.contains(&imported), "{found:?}");
+    }
+
     /// (4) a row that is not explicitly stored and whose source conversation is not recorded
-    /// (no lineage, or a non-conversation source) is not returned on any
+    /// (no lineage, or a non-import, non-conversation source) is not returned on any
     /// channel turn, nor when the own identity is malformed; (5) a dispatch
     /// run and a process without identity read as before.
     #[tokio::test]
