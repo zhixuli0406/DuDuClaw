@@ -468,11 +468,17 @@ fn launch(plan: TrustedRun, fds: Vec<OwnedFd>, ready: probe::Readiness, mut mach
     let write = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
     let failure = FailurePage::new()?;
     super::checked(unsafe { libc::unshare(libc::CLONE_NEWPID) }, Error::Namespace)?;
-    let mut pidfd = -1;
-    let mut args = CloneArgs::default(); args.flags = libc::CLONE_PIDFD as u64;
-    args.pidfd = (&mut pidfd as *mut i32) as u64; args.exit_signal = libc::SIGCHLD as u64;
-    let child = unsafe { libc::syscall(libc::SYS_clone3, &args, std::mem::size_of_val(&args)) };
-    if child < 0 { return Err(Error::Process); }
+    // Legacy clone(CLONE_PIDFD | SIGCHLD), not clone3: systemd's RestrictNamespaces=
+    // on the run unit returns ENOSYS for clone3. The PID namespace comes from the unshare above.
+    let (child, pidfd) = match unsafe { super::process::clone_with_pidfd() } {
+        Ok(super::process::Cloned::Child) => (0, -1),
+        Ok(super::process::Cloned::Parent { pid, pidfd }) => (pid, pidfd.into_raw_fd()),
+        Err(super::process::CloneError::Failed) => return Err(Error::Process),
+        Err(super::process::CloneError::NoPidfd(pid)) => {
+            unsafe { libc::kill(pid, libc::SIGKILL); libc::waitpid(pid, std::ptr::null_mut(), 0); }
+            return Err(Error::Process);
+        }
+    };
     machine.advance(Stage::PidNamespace)?;
     if child > 0 {
         let status = read.into_raw_fd();
@@ -493,13 +499,6 @@ fn launch(plan: TrustedRun, fds: Vec<OwnedFd>, ready: probe::Readiness, mut mach
         if let Err(error) = result { failure.record(error); write_status(status, bootstrap::error_status(error)); }
         exit_now(125)
     }
-}
-
-#[repr(C)]
-#[derive(Default)]
-struct CloneArgs {
-    flags: u64, pidfd: u64, child_tid: u64, parent_tid: u64, exit_signal: u64,
-    stack: u64, stack_size: u64, tls: u64, set_tid: u64, set_tid_size: u64, cgroup: u64,
 }
 
 /// A fixed error word bridges the interval after the exact fd sweep and before
@@ -817,7 +816,10 @@ fn arm_drain_alarm(ms: u64) {
     unsafe { libc::setitimer(libc::ITIMER_REAL, &timer, std::ptr::null_mut()); }
 }
 
-fn restrict_filesystem(abi: u32) -> Result<()> {
+/// The runtime's Landlock domain over [`crate::helper_policy::RUNTIME_LANDLOCK`],
+/// resolved in the caller's (pivoted) root. Public only so that the R7a
+/// self-test binary applies exactly this function, not a copy of it.
+pub fn restrict_filesystem(abi: u32) -> Result<()> {
     let policy = Policy::for_abi(abi).map_err(|_| Error::Landlock)?;
     let mut roots = Vec::new();
     // One table: HX publication check 6 is computed against exactly this list.

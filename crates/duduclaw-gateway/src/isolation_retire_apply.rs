@@ -125,7 +125,7 @@ impl RetireBackend {
             self.notifier.notify(&self.home, "isolation.employee_retire_approved", v.checked.owner.as_deref(), &details);
         }
         let request = Request { schema: allocation::SCHEMA_V2, nonce: nonce(), action: Action::Retire, item: item.clone(),
-            approver: Some(v.approver.clone()) };
+            approver: Some(v.approver.clone()), entitlement: None };
         let inconsistent = |reason: &str| -> Result<(), RetireError> {
             audit(&self.home, "isolation.employee_root_inconsistent", &v.spec.label, true,
                 json!({"employee": hex, "proposal_id": key, "stage": "retire_apply", "reason": reason}));
@@ -133,14 +133,17 @@ impl RetireBackend {
             Err(RetireError::RootInconsistent)
         };
         match self.root.exchange(&request) {
-            Err(()) | Ok(Answer::Refused(Root::IsolationUnavailable)) => Err(RetireError::RootUnavailable),
+            // Pending/PendingLimit: schema 3 (Allocate) only, never a retire answer.
+            Err(()) | Ok(Answer::Refused(Root::IsolationUnavailable | Root::Pending | Root::PendingLimit)) => Err(RetireError::RootUnavailable),
             Ok(Answer::Refused(Root::NotReady)) => {
                 self.host_busy(&v)?;
                 Err(RetireError::HostBusy)
             }
             Ok(Answer::Refused(Root::NotFound)) => inconsistent("not_found"),
             Ok(Answer::Refused(Root::Inconsistent)) => inconsistent("inconsistent"),
-            Ok(Answer::Refused(Root::InvalidRequest)) => inconsistent("invalid_request"),
+            // R8d: the entitlement codes are schema 4 only (refused in a schema-2 reply).
+            Ok(Answer::Refused(Root::InvalidRequest | Root::NotAllocated | Root::NotSigned | Root::InvalidEntitlement
+                | Root::Capacity)) => inconsistent("invalid_request"),
             Ok(Answer::Reply(reply)) => {
                 let (r, root) = (&reply.receipt, &v.checked.root.receipt);
                 if reply.phase != Phase::Retired || !r.disabled || r.binding != v.checked.root.item.binding

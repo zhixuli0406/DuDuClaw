@@ -13,6 +13,16 @@ pub trait RunTurnResolver: Send + Sync {
             principal_context: self.principal_context(context)?, utility_runner: self.utility_runner() })
     }
 
+    /// R8z-7: the resolution [`scope`] performs when a request is dispatched.
+    /// The default is [`Self::resolve_run`]. A registry may skip repeating
+    /// the full live verification only when `context.take_dispatch_proof()`
+    /// is `true` (the MCP server ran that verification for this very
+    /// dispatch, after the request was read); without the proof it must do
+    /// everything `resolve_run` does.
+    fn resolve_dispatch(&self, context: &RequestContext) -> Result<ResolvedRunTurn, VerificationError> {
+        self.resolve_run(context)
+    }
+
     fn resolve(&self, context: &RequestContext) -> Result<RunTurnIdentity, VerificationError>;
 
     /// Host-minted execution alias, distinct from the original conversation
@@ -25,8 +35,10 @@ pub trait RunTurnResolver: Send + Sync {
     fn metadata(&self, _context: &RequestContext) -> Result<Option<RunMetadata>, VerificationError> {
         Ok(None)
     }
-    /// Host execution adapter for utility judges. Some CLI utilities retain
-    /// read-capable tools, so they must not run under the gateway uid.
+    /// Host execution adapter for utility judges. A utility call must never
+    /// run under the gateway uid with gateway-held credentials. Production
+    /// (`isolation_mcp::authority`) supplies [`in_run_judge_runner`], which
+    /// refuses by design; `None` refuses too ([`run_utility`]).
     fn utility_runner(&self) -> Option<std::sync::Arc<dyn UtilityRunner>> { None }
 
     /// Existing host runtime context retained by A for this exact run. This
@@ -126,6 +138,58 @@ pub trait UtilityRunner: Send + Sync {
         -> std::pin::Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>;
 }
 
+/// B0: the fixed error of [`InRunJudgeRefusal`]. Callers only see a failed
+/// utility call (the same `Err(String)` as before) and take their existing
+/// fallback; the text carries no request content.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) const IN_RUN_JUDGE_REFUSAL: &str =
+    "isolated utility call refused: a judge of an employee's own action is not run in protected mode";
+
+/// B0: the production [`UtilityRunner`] of an isolated MCP request. Its only
+/// behaviour is to refuse, with the fixed reason [`IN_RUN_JUDGE_REFUSAL`] and
+/// the fixed site `utility.in_run_judge` (logged as a by-design background
+/// refusal: DEBUG plus at most one INFO per employee, never a WARN).
+///
+/// Why refuse rather than execute (design review): the utility calls made on
+/// this path are approval/safety classifiers that judge the CALLING
+/// employee's own action — the OS-intent router (`os_intent::resolve_l2`), the
+/// situation classifier (`situation_classifier::classify_llm`) and the action
+/// review (`decide::decide_for_agent` via `action_review::review`, called from
+/// `computer_use_sessions::gates::action_review`).
+/// * Running them in that same employee's sandbox, with its own credentials,
+///   would let a compromised employee decide its own verdict.
+/// * A second run of the same employee, waited on from inside its own run,
+///   cannot be admitted anyway: spawnd refuses it as `WouldDeadlock`
+///   (`duduclaw-spawnd` admission; `duduclaw-execution`'s protected spawn).
+/// * Running them in the gateway process with gateway-held credentials is
+///   what the [`UtilityRunner`] contract forbids.
+///
+/// Every caller already treats a failed utility call as "no verdict" and
+/// takes its non-model fallback (Chat / `anomaly` → escalate to a person /
+/// `ask` a person under `enforce`); this runner only makes that refusal
+/// explicit and logged.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) struct InRunJudgeRefusal;
+
+impl UtilityRunner for InRunJudgeRefusal {
+    fn run<'a>(&'a self, _context: &'a RequestContext, request: UtilityRequest<'a>)
+        -> std::pin::Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        // The log's employee label is the verified call's own employee (never
+        // a caller-chosen operation label), when the call scope is present.
+        let agent = CALL.try_with(|call| call.agent.clone()).unwrap_or_else(|_| request.agent.to_owned());
+        crate::isolation_mcp::refusal::note_utility_refusal(
+            crate::isolation_mcp::refusal::provider_label(request.provider), &agent,
+            crate::isolation_mcp::refusal::site!("utility.in_run_judge"));
+        Box::pin(std::future::ready(Err(IN_RUN_JUDGE_REFUSAL.to_owned())))
+    }
+}
+
+/// B0: the utility runner every production resolved turn carries.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn in_run_judge_runner() -> Arc<dyn UtilityRunner> {
+    Arc::new(InRunJudgeRefusal)
+}
+
 pub(crate) async fn run_utility(request: UtilityRequest<'_>) -> Option<Result<String, String>> {
     let call = CALL.try_with(Clone::clone).ok()?;
     if call.home != request.home { return Some(Err("isolated utility home mismatch".into())); }
@@ -162,7 +226,7 @@ pub async fn scope<F: Future>(home: &Path, agent: &str, context: &RequestContext
     let ResolvedRunTurn { identity, egress_turn, metadata, principal_context: registered, utility_runner } = match resolver {
         Some(resolver) => {
             let context = context.clone();
-            duduclaw_mcp_boundary::authority::verify_blocking(move || resolver.resolve_run(&context)).await?
+            duduclaw_mcp_boundary::authority::verify_blocking(move || resolver.resolve_dispatch(&context)).await?
         }
         // Never register this as a fresh clean turn. Unknown lineage is tainted.
         None => ResolvedRunTurn { identity: RunTurnIdentity {
@@ -273,6 +337,49 @@ pub(crate) fn current(home: &Path, agent: &str) -> Option<Result<CallIdentity, S
     }).ok()
 }
 
+/// B0 test fixture: run a future as an isolated MCP request whose resolved
+/// turn carries the PRODUCTION utility runner ([`in_run_judge_runner`], what
+/// `isolation_mcp::authority` installs), for the in-run judge callers' tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use duduclaw_isolation::{bounded::{List, Text}, capability::{CapabilityId, CapabilityRecord,
+        EmployeeBinding, Lane, Principal}, ids::{EmployeeId, RunId, Sha256Digest}};
+
+    struct ProductionRunner;
+    impl RunTurnResolver for ProductionRunner {
+        fn resolve(&self, _: &RequestContext) -> Result<RunTurnIdentity, VerificationError> {
+            Ok(RunTurnIdentity { turn: uuid::Uuid::new_v4().to_string(), approval_session: None })
+        }
+        fn utility_runner(&self) -> Option<Arc<dyn UtilityRunner>> { Some(in_run_judge_runner()) }
+    }
+
+    fn request_context() -> RequestContext {
+        RequestContext::from_verified_record(CapabilityRecord {
+            id: CapabilityId(Sha256Digest([1; 32])), employee: EmployeeId([2; 16]), run: RunId([3; 16]),
+            task: None, principal: Principal::Human { user_id: Text::new("owner".into()).unwrap(), generation: 1 },
+            employee_binding: EmployeeBinding::Personal(Text::new("owner".into()).unwrap()), lane: Lane::Standard,
+            tools: List::new(vec![]).unwrap(), resources: List::new(vec![]).unwrap(), policy_revision: 1,
+            gateway_epoch: [4; 16], issued_at: 1, not_before: 1, expires_at: 2, nonce: [5; 32], jti: [6; 16],
+        })
+    }
+
+    /// An employee directory `<home>/agents/<agent>` with a minimal
+    /// `agent.toml` (default Claude runtime, default utility model).
+    pub(crate) fn employee(home: &Path, agent: &str) -> PathBuf {
+        let dir = home.join("agents").join(agent);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"), format!("[agent]\nname = \"{agent}\"\nstatus = \"active\"\n")).unwrap();
+        dir
+    }
+
+    /// `future` inside an isolated MCP request of `agent`.
+    pub(crate) async fn in_mcp_request<F: Future>(home: &Path, agent: &str, future: F) -> F::Output {
+        scope(home, agent, &request_context(), Some(Arc::new(ProductionRunner)), future).await
+            .expect("isolated request scope")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,6 +440,37 @@ mod tests {
             assert_eq!(run_metadata(), Some(RunMetadata::root()));
         }).await.unwrap();
         assert_eq!(resolver.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    /// R8z-7: a dispatch resolves the run's turn through `resolve_dispatch`
+    /// exactly once (the registry decides there whether the server's
+    /// dispatch proof lets it skip its own full verification); a record-only
+    /// context carries no proof.
+    #[tokio::test(flavor = "current_thread")]
+    async fn r8z7_scope_resolves_the_dispatch_once_through_resolve_dispatch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Dispatch { dispatch: AtomicUsize, proofs: AtomicUsize }
+        impl RunTurnResolver for Dispatch {
+            fn resolve(&self, _: &RequestContext) -> Result<RunTurnIdentity, VerificationError> {
+                panic!("scope must use the dispatch resolution")
+            }
+            fn resolve_run(&self, _: &RequestContext) -> Result<ResolvedRunTurn, VerificationError> {
+                panic!("scope must use the dispatch resolution")
+            }
+            fn resolve_dispatch(&self, context: &RequestContext) -> Result<ResolvedRunTurn, VerificationError> {
+                self.dispatch.fetch_add(1, Ordering::Relaxed);
+                if context.take_dispatch_proof() { self.proofs.fetch_add(1, Ordering::Relaxed); }
+                Ok(ResolvedRunTurn { identity: RunTurnIdentity { turn: "host-turn".into(), approval_session: None },
+                    egress_turn: None, metadata: Some(RunMetadata::root()), principal_context: None, utility_runner: None })
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        let resolver = Arc::new(Dispatch { dispatch: AtomicUsize::new(0), proofs: AtomicUsize::new(0) });
+        scope(home.path(), "main", &context(), Some(resolver.clone()), async {
+            assert_eq!(resolved_identity(), Some(("host-turn".into(), None)));
+        }).await.unwrap();
+        assert_eq!(resolver.dispatch.load(Ordering::Relaxed), 1);
+        assert_eq!(resolver.proofs.load(Ordering::Relaxed), 0, "a record-only context has no dispatch proof");
     }
 
     #[tokio::test]
@@ -533,5 +671,35 @@ mod tests {
                 crate::runtime_dispatch::run_utility_prompt(home.path(), None, "main", "system", "prompt", 1)).await;
             assert_eq!(actual, expected);
         }).await.unwrap();
+    }
+
+    /// B0 item 1: the production runner's only behaviour is to refuse, with
+    /// the fixed reason and site, logged as a by-design background refusal
+    /// (DEBUG/INFO, never a WARN), whatever the request.
+    #[test]
+    fn b0_in_run_judge_runner_refuses_with_its_fixed_reason_and_site() {
+        use crate::isolation_mcp::refusal::{site, test_support as logs};
+        let home = tempfile::tempdir().unwrap();
+        for provider in [duduclaw_core::types::RuntimeType::Claude, duduclaw_core::types::RuntimeType::OpenAiCompat] {
+            let (result, logs_text) = logs::run_capturing_logs(async {
+                let request = UtilityRequest { home: home.path(), agent_dir: None, agent: "b0-judge",
+                    system_prompt: "B0-SYSTEM-MARKER", prompt: "B0-PROMPT-MARKER", max_tokens: 1, hint: None,
+                    provider, model: "test-model" };
+                let (runner, context) = (in_run_judge_runner(), context());
+                runner.run(&context, request).await
+            });
+            assert_eq!(result, Err(IN_RUN_JUDGE_REFUSAL.to_owned()));
+            logs::assert_utility_refusal_logged(&logs_text, site!("utility.in_run_judge"));
+            assert!(!logs_text.contains("B0-PROMPT-MARKER") && !logs_text.contains("B0-SYSTEM-MARKER"), "{logs_text}");
+        }
+        // Through the production resolution: the call identity's employee is
+        // the logged label, and `run_utility` returns the refusal.
+        let (result, logs_text) = logs::run_capturing_logs(super::test_support::in_mcp_request(home.path(), "worker",
+            run_utility(UtilityRequest { home: home.path(), agent_dir: None, agent: "os-intent-router",
+                system_prompt: "", prompt: "p", max_tokens: 1, hint: None,
+                provider: duduclaw_core::types::RuntimeType::Claude, model: "test-model" })));
+        assert_eq!(result, Some(Err(IN_RUN_JUDGE_REFUSAL.to_owned())));
+        logs::assert_utility_refusal_logged(&logs_text, site!("utility.in_run_judge"));
+        assert!(logs_text.contains("agent=\"worker\""), "{logs_text}");
     }
 }

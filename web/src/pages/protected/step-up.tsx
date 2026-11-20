@@ -75,7 +75,7 @@ export function useStepUp(): StepUpController {
 }
 
 /** Runs one state-changing action behind the step-up. */
-export function useStepUpAction() {
+export function useStepUpAction(errorMessage: (error: unknown) => string = refusalMessage) {
   const t = useT();
   const controller = useStepUp();
   const [password, setPassword] = useState('');
@@ -96,14 +96,14 @@ export function useStepUpAction() {
         try {
           csrf = await controller.verify(password, code);
         } catch (e) {
-          setError(e instanceof StepUpUnavailable ? t('stepUp.notVerified') : refusalMessage(e));
+          setError(e instanceof StepUpUnavailable ? t('stepUp.notVerified') : errorMessage(e));
           return false;
         }
       }
       await action(csrf);
       return true;
     } catch (e) {
-      setError(refusalMessage(e));
+      setError(errorMessage(e));
       // The refusal may be an expired proof; re-read so the fields come back.
       void controller.refresh().catch(() => {});
       return false;
@@ -113,7 +113,7 @@ export function useStepUpAction() {
       setCode('');
       setBusy(false);
     }
-  }, [busy, mfaMissing, controller, password, code, t]);
+  }, [busy, mfaMissing, controller, password, code, t, errorMessage]);
 
   const reset = useCallback(() => {
     setPassword('');
@@ -192,6 +192,8 @@ export function StepUpDialog({
   disabled = false,
   onConfirm,
   idPrefix,
+  errorMessage,
+  onAttempt,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -205,9 +207,13 @@ export function StepUpDialog({
   disabled?: boolean;
   onConfirm: (csrf: number[]) => Promise<void>;
   idPrefix: string;
+  /** Optional code-based copy for RPCs whose messages must never be displayed. */
+  errorMessage?: (error: unknown) => string;
+  /** Clear caller-owned secrets on every submit, including failed verification. */
+  onAttempt?: () => void;
 }) {
   const t = useT();
-  const action = useStepUpAction();
+  const action = useStepUpAction(errorMessage);
   const close = (next: boolean) => {
     if (!next) action.reset();
     onOpenChange(next);
@@ -215,6 +221,7 @@ export function StepUpDialog({
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     if (disabled || !action.canSubmit) return;
+    onAttempt?.();
     if (await action.run(onConfirm)) close(false);
   };
   return (

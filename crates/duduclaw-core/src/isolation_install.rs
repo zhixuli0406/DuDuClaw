@@ -18,7 +18,7 @@
 //! durable migration import manifest and the fixed-path isolation binaries.
 //! Paths a v1.80 single-binary install also writes are never facts
 //! ([`SINGLE_BINARY_LAYOUT`]). Every fact lives below a root-owned directory that the
-//! gateway's service account cannot write (`/run`, `/var/lib`, `/var/log`, `/etc`,
+//! gateway's service account cannot write (`/run`, `/var/lib`, `/etc`,
 //! `/etc/systemd/system`, `/opt`, `/opt/duduclaw-isolated`, `/opt/duduclaw/bin`,
 //! `/usr/lib`, `/usr/libexec`), so an employee running as that account can
 //! neither create one (which could only narrow: isolation required and
@@ -47,7 +47,8 @@ pub const DURABLE_IMPORT_MANIFEST: &str = "/etc/duduclaw/migration-import.json";
 
 /// The root-owned facts of an isolation install. Every isolation-only entry of
 /// the installer layout (`protected_linux_layout::{BINARIES, UNITS,
-/// DIRECTORIES}`) is included (tested in duduclaw-cli). Layout entries that a
+/// DIRECTORIES}`) is included or covered by its parent (tested in duduclaw-cli).
+/// The audit directory is covered by `/var/lib/duduclaw-spawnd`. Layout entries that a
 /// v1.80-style single-binary install also creates or uses are deliberately
 /// NOT facts: `/etc/duduclaw` (the protected-mode marker's directory) and the
 /// `duduclaw.slice` / `duduclaw-tcb.slice` units (the single-binary gateway
@@ -56,9 +57,14 @@ pub const DURABLE_IMPORT_MANIFEST: &str = "/etc/duduclaw/migration-import.json";
 /// `/var/lib/duduclaw-protected` and `duduclaw-gateway.service`.
 pub const FACTS: &[&str] = &[
     duduclaw_isolation::ids::SPAWND_SOCKET,
+    "/run/duduclaw-parse",
+    "/usr/lib/tmpfiles.d/duduclaw-parse.conf",
     // Isolation units (layout::UNITS minus the two slices above).
     "/etc/systemd/system/duduclaw-spawnd.socket",
     "/etc/systemd/system/duduclaw-spawnd.service",
+    "/etc/systemd/system/duduclaw-isolation-ready.service",
+    "/etc/systemd/system/duduclaw-isolation-selftest.service",
+    "/etc/systemd/system/duduclaw-isolation-probe@.service",
     "/etc/systemd/system/duduclaw-employees.slice",
     "/etc/systemd/system/duduclaw-egress.socket",
     "/etc/systemd/system/duduclaw-egress.service",
@@ -70,13 +76,14 @@ pub const FACTS: &[&str] = &[
     "/etc/systemd/system/duduclaw-import@.service",
     "/etc/systemd/system/duduclaw-migrate-expire@.service",
     "/etc/systemd/system/duduclaw-migrate-expire@.timer",
-    // Isolation-only directories (layout::DIRECTORIES minus /etc/duduclaw).
+    // Isolation-only directories (layout::DIRECTORIES minus /etc/duduclaw and audit, covered by its parent).
     "/usr/lib/duduclaw",
     "/usr/lib/duduclaw/parse-root",
     "/usr/lib/duduclaw/parse-root-tree",
+    "/usr/lib/duduclaw/current",
+    "/usr/libexec/duduclaw",
     "/var/lib/duduclaw-spawnd",
     "/var/lib/duduclaw-spawnd/etc",
-    "/var/log/duduclaw-spawnd",
     "/etc/duduclaw-updated",
     "/var/lib/duduclaw-updated",
     "/opt/duduclaw-isolated",
@@ -92,11 +99,14 @@ pub const FACTS: &[&str] = &[
     // Fixed-path isolation binaries (layout::BINARIES).
     "/usr/lib/duduclaw/duduclaw-spawnd",
     "/usr/lib/duduclaw/duduclaw-run",
+    "/usr/lib/duduclaw/duduclaw-run-selftest",
+    "/usr/lib/duduclaw/duduclaw-isolation-probe",
     "/opt/duduclaw/bin/duduclaw-egress",
     "/usr/libexec/duduclaw/duduclaw-parse-worker",
     "/usr/lib/duduclaw/current/duduclaw-import",
     "/usr/lib/duduclaw/current/duduclaw-migrate",
     "/usr/lib/duduclaw/current/duduclaw-mcp-bridge",
+    "/usr/lib/duduclaw/current/duduclaw",
     "/usr/libexec/duduclaw-updated-launch",
 ];
 
@@ -284,6 +294,35 @@ mod tests {
         }
         assert!(FACTS.contains(&"/run/duduclaw-spawnd/control.sock"));
         assert!(FACTS.contains(&DURABLE_IMPORT_MANIFEST));
+    }
+
+    #[test]
+    fn isolation_install_facts_equal_bootstrap_verifier_mirror() {
+        // duduclaw-bootstrap refuses while a fact of another generation exists;
+        // it cannot link this crate, so it reads the duduclaw-isolation copy.
+        assert_eq!(FACTS, duduclaw_isolation::update::ISOLATION_FACTS);
+    }
+
+    /// Review F9: the VM acceptance script's leftover check consumes the
+    /// authoritative list. Its `FACTS='…'` block (one path per line) must equal
+    /// [`FACTS`] as a set, with no duplicate and nothing extra.
+    #[test]
+    fn isolation_install_acceptance_script_lists_every_fact() {
+        let script = include_str!("../../../scripts/live-test/linux-protected/install-acceptance.sh");
+        let mut lines = script.lines().skip_while(|line| *line != "FACTS='");
+        assert_eq!(lines.next(), Some("FACTS='"), "the script must open the list with a FACTS=' line");
+        let mut listed: Vec<&str> = Vec::new();
+        let mut closed = false;
+        for line in lines {
+            if line == "'" { closed = true; break; }
+            assert!(!line.contains('\'') && !line.trim().is_empty(), "malformed FACTS line: {line:?}");
+            listed.push(line.trim());
+        }
+        assert!(closed, "the FACTS list must end with a line holding only '");
+        let unique: std::collections::BTreeSet<&str> = listed.iter().copied().collect();
+        assert_eq!(unique.len(), listed.len(), "duplicate path in the script's FACTS");
+        let production: std::collections::BTreeSet<&str> = FACTS.iter().copied().collect();
+        assert_eq!(unique, production, "install-acceptance.sh FACTS differs from isolation_install::FACTS");
     }
 
     #[test]

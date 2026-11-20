@@ -2,15 +2,61 @@
 Description=DuDuClaw root employee launch agent
 Requires=duduclaw-spawnd.socket
 After=duduclaw-spawnd.socket dbus.service
+# The employees slice (the aggregate ceiling of every run unit) exists whenever
+# spawnd runs: nothing else starts it before the first run unit (first install:
+# loaded, inactive, no cgroup, so `resources_verified` stayed false). Wants=
+# starts it at install and on every boot; After= realises its cgroup before
+# PID 1 builds this unit's mount namespace, so the `-`-prefixed ReadWritePaths=
+# entry below is bound instead of silently skipped. An active slice stays active
+# with no member units. Wants=, not Requires=: a stopped slice never stops
+# spawnd; admission stays closed (`employees_slice_cgroup`) until it is back.
+Wants=duduclaw-employees.slice
+After=duduclaw-employees.slice
+# R6 consistency gate: every start of this unit (boot, manual, Restart=) also
+# starts the gate, which is BindsTo=/PartOf=/After= this unit, so it drops with
+# every stop or restart and is re-armed only by the new process. A [Unit]
+# dependency, not [Install]: nothing has to be enabled for it.
+Wants=duduclaw-isolation-ready.service
+# Crash loops stay rate-limited: every automatic restart (failure, exit 83,
+# and the exit-82 restart after a repair) counts. Deliberate restarts by
+# duduclaw-updated (it restarts spawnd after every Apply, including every
+# repairing one) run `systemctl reset-failed` first, so legitimate repairs in a
+# row cannot exhaust the budget. Limit hit: see README (`reset-failed`).
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
-Type=simple
+# R6: every start re-verifies the installed set (publication journal or the
+# `current` generation) before binding anything. READY=1 then means only that
+# the root update endpoint (update.sock) is bound: it is sent whether or not the
+# set is consistent, so duduclaw-updated can always repair the host. Consistency
+# is duduclaw-isolation-ready.service's job (gateway and egress depend on it).
+# Not consistent: nothing but update.sock opens. See `systemctl status` (STATUS=)
+# and /run/duduclaw-spawnd/update-status.json.
+Type=notify
+NotifyAccess=main
+# Bounds the verification that precedes READY=1 (hashing two generations).
+# Start and stop budgets are duduclaw-updated's restart deadline inputs
+# (duduclaw_updated::linux::activation::SPAWND_START_TIMEOUT_SECS and
+# SPAWND_STOP_TIMEOUT_SECS; pinned by spawnd's unit-file test).
+TimeoutStartSec=300
+TimeoutStopSec=90
 User=root
 Group=root
 ExecStart=/usr/lib/duduclaw/duduclaw-spawnd
 Sockets=duduclaw-spawnd.socket
 Restart=on-failure
 RestartSec=3
+# 82: an Apply repaired a set this process found not consistent; it exits so
+# the fresh start verifies everything before opening (update_control.rs
+# RESTART_AFTER_REPAIR_EXIT). Restarted, result "success".
+RestartForceExitStatus=82
+SuccessExitStatus=82
+# 83 (update_control.rs EXIT_SET_INCONSISTENT): a fully open spawnd whose set
+# became inconsistent (failed or partial Apply) closed admission, replied,
+# wrote its status and audit, and exited. A failure: Restart=on-failure
+# restarts it and the start-up recovery completes or rolls back the
+# publication. Deliberately not in SuccessExitStatus=/RestartPreventExitStatus=.
 KillMode=control-group
 UMask=0077
 LimitCORE=0
@@ -22,23 +68,38 @@ CPUQuota=100%
 Slice=duduclaw-tcb.slice
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=/var/lib/duduclaw-spawnd /var/log/duduclaw-spawnd /run/duduclaw-spawnd /etc -/var/lib/systemd/linger
+ReadWritePaths=/var/lib/duduclaw-spawnd /run/duduclaw-spawnd /etc -/var/lib/systemd/linger
 # /etc is writable only for root account/ACL quarantine after interrupted provisioning.
 # Normal provisioning still requires G's approved installation operation.
 # HX helper slots: spawnd creates rt-init/rt-runtime/hx leaves inside delegated run
 # units only. The rest of /sys/fs/cgroup stays read-only (ProtectControlGroups=yes).
 ReadWritePaths=-/sys/fs/cgroup/duduclaw.slice/duduclaw-employees.slice
+# R6 update Apply (update.sock, root peers only) republishes the verified
+# generation's root components at these fixed paths: file.next + fsync + rename.
+# Atomic replacement creates file.next in, and renames within, each directory, so
+# the whole directory must be writable (broader than the nine fixed files).
+# Narrowing this needs a separate narrow publisher helper (known residual, R6).
+ReadWritePaths=-/usr/lib/duduclaw -/usr/libexec/duduclaw -/opt/duduclaw/bin
 ProtectHome=yes
+# The image anchor must be private; employee images mount only in spawnd's namespace.
+MountFlags=private
 PrivateTmp=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
 ProtectControlGroups=yes
-RestrictSUIDSGID=yes
+# No RestrictSUIDSGID= (R7g): under it systemd's seccomp filter answers ENOSYS
+# for every openat2, and spawnd needs openat2's RESOLVE_* guarantees (work
+# broker, storage, cgroup leaves, bootstrap mounts, the trusted-file reader of
+# its signed manifests and state). Still holds: a root service that creates no
+# set-ID files; NoNewPrivileges=yes stays.
 LockPersonality=yes
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_NETLINK
 RestrictNamespaces=mnt
 CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_KILL CAP_CHOWN CAP_FOWNER CAP_AUDIT_WRITE
 StandardOutput=null
-StandardError=null
+# Fixed-vocabulary diagnostics (update status lines, startup failures) only.
+StandardError=journal
+LogRateLimitIntervalSec=60
+LogRateLimitBurst=100

@@ -41,6 +41,10 @@ pub(super) fn minimum_role(method: &str) -> Option<UserRole> {
     if method.strip_prefix("isolation.").is_some_and(|rest| rest.starts_with("connector_")) {
         return Some(UserRole::Admin);
     }
+    // R8r-3a model connection documents: Admin, plus step-up in its handler.
+    if method.strip_prefix("isolation.").is_some_and(|rest| rest.starts_with("provider_")) {
+        return Some(UserRole::Admin);
+    }
     if namespace == "org" {
         return Some(UserRole::Admin);
     }
@@ -65,7 +69,8 @@ mod tests {
         }
         for method in ["cron", "cron.future", "cron.add.future", "reminders.future",
             "assign_schedules.future", "agents.org_chart.future", "skills.recent.future",
-            "isolation.connector_list", "isolation.connector_provision", "isolation.connector_future"] {
+            "isolation.connector_list", "isolation.connector_provision", "isolation.connector_future",
+            "isolation.provider_status", "isolation.provider_set", "isolation.provider_clear", "isolation.provider_future"] {
             assert_eq!(minimum_role(method), Some(UserRole::Admin), "{method}");
         }
         for method in ["ping", "agents.list", "skills.list", "cronish.list", "isolation.recording_status", "organization.list"] {

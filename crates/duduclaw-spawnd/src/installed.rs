@@ -1,14 +1,19 @@
-//! Consumers of F's signed policy artifact and root installer's measured receipts.
-//! Neither gateway IPC nor employee files can publish these inputs.
-use std::{ffi::CString, fs::{self, File}, io, os::fd::AsFd, os::unix::fs::MetadataExt, path::Path, sync::{Arc, Mutex}};
+//! Consumers of F's signed policy artifact and the root publications derived
+//! from it. Neither gateway IPC nor employee files can publish these inputs.
+//! R7c: no installer receipt is read any more (SSH denial: `crate::ssh_evidence`;
+//! external NSS: refused, `crate::accounts::nss_supported`).
+use std::{ffi::CString, fs::{self, File}, io, os::fd::AsFd, path::Path, sync::{Arc, Mutex}};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use duduclaw_isolation::{bounded::Text, egress::ProfileId, execution::{RunHandle, DiskQuota, NetworkPolicy, ResourceLimits, RunTimeouts, RuntimeKind},
-    ids::{EmployeeId, Sha256Digest, UidRange}, ipc::{ErrorCode, QueueClass}, update::{InstallTarget, ReleaseManifest}};
+use duduclaw_isolation::{bounded::Text, egress::{DnsRoute, EgressProfile, ProfileId}, execution::{RunHandle, DiskQuota, NetworkPolicy, ResourceLimits, RunTimeouts, RuntimeKind},
+    ids::{EmployeeId, Sha256Digest}, ipc::{ErrorCode, QueueClass}, update::{InstallTarget, ReleaseManifest}};
 use duduclaw_updated::linux::{files::Directory, service::{artifact_name, verified_committed_generation}, INSTALL_ROOT};
-use crate::{Result, policy::{EmployeeEntitlement, Executable, PublishedRuntime, RootPolicy}};
+use crate::{Result, policy::{EmployeeEntitlement, Executable, PublishedRuntime, RootPolicy, TurnLimit}};
 const ROOT: &str = "/var/lib/duduclaw-spawnd";
-const RECEIPTS: &str = "/run/duduclaw-isolation-evidence";
+/// Per-run /etc projection state (the etc-state parent of `RootPublicationAnchors`).
+pub const ETC_STATE_DIRECTORY: &str = "/var/lib/duduclaw-spawnd/etc-state";
+/// Per-employee MCP projection files (the projection root of `RootPublicationAnchors`).
+pub const PROJECTIONS_DIRECTORY: &str = "/var/lib/duduclaw-spawnd/projections";
 pub const GATEWAY_PUBLICATION: &str = "/run/duduclaw-spawnd/publication.json";
 const POLICY_ID: &str = "isolation-policy-v1";
 fn denied() -> io::Error { io::Error::new(io::ErrorKind::PermissionDenied, "installed isolation publication unavailable") }
@@ -38,7 +43,8 @@ fn live_generation() -> io::Result<duduclaw_updated::readiness::GenerationEviden
 /// Cache only the expensive verification of immutable root generation artifacts.
 /// Every use requires F's authenticated live nonce probe; a failed probe discards
 /// the cache. Executable descriptors still receive their normal per-run hashes.
-fn committed_generation() -> io::Result<(Sha256Digest, ReleaseManifest)> {
+/// Also the generation input of the R7a self-test key (`crate::selftest`).
+pub(crate) fn committed_generation() -> io::Result<(Sha256Digest, ReleaseManifest)> {
     let started = crate::host_state::boottime_ms()?;
     let mut slot = VERIFIED_GENERATION.lock().map_err(|_| denied())?;
     let live = match live_generation() {
@@ -107,6 +113,13 @@ pub struct RuntimeRecord {
     pub network: NetworkPolicy, pub mcp: bool, pub pty_allowed: bool,
     pub queue_class: QueueClass,
     pub mcp_acceptance: Option<McpAcceptance>,
+    /// R6 policy v3 only. Omitted when absent, so v1/v2 records (and their
+    /// MCP launch-policy digests) are byte-identical to before; a ranged v3
+    /// record's digest covers the range, so its acceptance is regenerated.
+    /// In a signed policy the key's presence is checked on the raw bytes
+    /// (`turn_limit_keys`): refused before v3, and `null` refused in v3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_limit: Option<TurnLimit>,
 }
 impl RuntimeRecord {
     pub fn to_runtime(&self) -> PublishedRuntime {
@@ -117,12 +130,19 @@ impl RuntimeRecord {
         };
         PublishedRuntime { runtime: self.runtime.clone(), profile: self.profile, executable, pinned_version: self.pinned_version.clone(),
             fixed_args: self.fixed_args.clone(), resources: self.resources.clone(), timeouts: self.timeouts.clone(), network: self.network.clone(),
-            mcp: self.mcp, pty_allowed: self.pty_allowed, queue_class: self.queue_class }
+            mcp: self.mcp, pty_allowed: self.pty_allowed, queue_class: self.queue_class, turn_limit: self.turn_limit }
     }
 }
-#[derive(Clone, Serialize, Deserialize)]
+/// Root-owned host entitlement. `max_turns` (R6) can only narrow the signed
+/// step range; it is omitted when absent so existing files keep their shape.
+/// It is written only by root: R8d's `Entitle` (and the removal by `Disable`
+/// / `Retire`) on the allocation worker, and the generation rollover of
+/// [`InstalledPublication::load`] (`crate::entitlement`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct EntitlementRecord { pub employee: EmployeeId, pub profiles: Vec<ProfileId> }
+pub struct EntitlementRecord { pub employee: EmployeeId, pub profiles: Vec<ProfileId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<u16> }
 /// Signed exact-runtime acceptance, produced by exercising the CLI's own MCP
 /// child launch. A direct bridge invocation cannot produce this acceptance.
 #[derive(Clone, Serialize, Deserialize)]
@@ -136,20 +156,40 @@ pub struct McpAcceptance {
 }
 impl McpAcceptance {
     fn validate_launch(&self, runtime: &RuntimeRecord, native: &NativeRecord) -> io::Result<()> {
+        if self.launch_policy_digest != Self::launch_policy_digest(runtime, native)? { return Err(denied()); }
+        Ok(())
+    }
+    /// The digest [`Self::validate_launch`] compares (R8r-4: the policy
+    /// tool's acceptance harness computes a record's value with this same
+    /// function, never a copy of it).
+    fn launch_policy_digest(runtime: &RuntimeRecord, native: &NativeRecord) -> io::Result<Sha256Digest> {
         let mut runtime = runtime.clone();
         runtime.mcp_acceptance = None;
         let bytes = serde_json::to_vec(&serde_json::json!({
             "domain": "duduclaw-runtime-mcp-acceptance-launch-v1", "runtime": runtime, "native": native,
         })).map_err(|_| denied())?;
-        if self.launch_policy_digest != Sha256Digest(Sha256::digest(bytes).into()) { return Err(denied()); }
-        Ok(())
+        Ok(Sha256Digest(Sha256::digest(bytes).into()))
     }
     pub fn validate(&self, projection: &duduclaw_mcp_boundary::config::RuntimeProjection) -> io::Result<()> {
+        self.validate_check(projection).map_err(|_| denied())
+    }
+    /// R8z-3: [`Self::validate`] naming the first check that refused (the
+    /// former single condition chain, in its order).
+    pub fn validate_check(&self, projection: &duduclaw_mcp_boundary::config::RuntimeProjection)
+        -> std::result::Result<(), duduclaw_mcp_boundary::config::AcceptanceCheck> {
+        use duduclaw_mcp_boundary::config::AcceptanceCheck as C;
         let r = &projection.registration;
-        if self.runtime != r.runtime || self.version != r.version || self.runtime_digest != r.runtime_digest
-            || self.bridge_digest != r.bridge_digest || self.projection_digest != projection.digest()
-            || self.inherited_fd != 3 || self.initialize_exit != 0 || self.parent_exec_exit != 0
-            || self.mcp_child_exec_exit != 0 || self.exclusive_config_exit != 0 || !nonzero(self.transcript_digest) { return Err(denied()); }
+        if self.runtime != r.runtime { return Err(C::Runtime); }
+        if self.version != r.version { return Err(C::Version); }
+        if self.runtime_digest != r.runtime_digest { return Err(C::RuntimeDigest); }
+        if self.bridge_digest != r.bridge_digest { return Err(C::BridgeDigest); }
+        if self.projection_digest != projection.digest() { return Err(C::ProjectionDigest); }
+        if self.inherited_fd != 3 { return Err(C::InheritedFd); }
+        if self.initialize_exit != 0 { return Err(C::InitializeExit); }
+        if self.parent_exec_exit != 0 { return Err(C::ParentExecExit); }
+        if self.mcp_child_exec_exit != 0 { return Err(C::McpChildExecExit); }
+        if self.exclusive_config_exit != 0 { return Err(C::ExclusiveConfigExit); }
+        if !nonzero(self.transcript_digest) { return Err(C::TranscriptDigest); }
         Ok(())
     }
 }
@@ -179,9 +219,14 @@ impl McpRunReceipt {
         Ok(receipt)
     }
 }
-#[derive(Deserialize)]
+/// `/var/lib/duduclaw-spawnd/publication.json` (root:root 0600). The
+/// installer writes it once with no entitlement; afterwards only root writes
+/// it (R8d, `crate::entitlement`), always through [`write_host`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct HostPublication { version: u16, generation: Sha256Digest, entitlements: Vec<EntitlementRecord> }
+pub struct HostPublication { pub(crate) version: u16, pub(crate) generation: Sha256Digest,
+    pub(crate) entitlements: Vec<EntitlementRecord> }
+const HOST_PUBLICATION: &str = "publication.json";
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NativeRecord {
@@ -199,7 +244,8 @@ struct NativeRecord {
 struct ForwarderRecord { entry: String, executable_digest: Sha256Digest, argv: Vec<String>,
     seccomp: duduclaw_run::seccomp::RuntimeProfile, seccomp_digest: Sha256Digest }
 /// Verified in-memory policy; `version` records which signed schema produced it.
-struct SignedPolicy { version: u16, runtimes: Vec<RuntimeRecord>, native: Vec<NativeRecord> }
+/// `dns_probe_name` (R7b) exists from v4 on; `None` for v1–v3.
+struct SignedPolicy { version: u16, runtimes: Vec<RuntimeRecord>, native: Vec<NativeRecord>, dns_probe_name: Option<String> }
 /// Exact v1 document. A v2 document always carries `domain`, so this strict
 /// reader (and every deployed v1 reader) refuses it instead of reinterpreting it.
 #[derive(Deserialize)]
@@ -211,31 +257,173 @@ struct SignedPolicyV1 { version: u16, runtimes: Vec<RuntimeRecord>, native: Vec<
 #[serde(deny_unknown_fields)]
 struct SignedPolicyV2 { domain: String, version: u16, runtimes: Vec<RuntimeRecord>, native: Vec<NativeRecord> }
 const POLICY_DOMAIN_V2: &str = "duduclaw-isolation-policy-v2";
+/// v3 (R6): the v2 shape under its own signed domain; runtime records may carry
+/// `turn_limit`. v1/v2 documents carrying `turn_limit` are refused.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SignedPolicyV3 { domain: String, version: u16, runtimes: Vec<RuntimeRecord>, native: Vec<NativeRecord> }
+const POLICY_DOMAIN_V3: &str = "duduclaw-isolation-policy-v3";
+/// v4 (R7b): the v3 shape under its own signed domain plus the required
+/// `dns_probe_name` (`duduclaw_isolation::egress::validate_dns_probe_name`):
+/// a hostname AI employees need anyway, chosen by the vendor at signing time,
+/// that spawnd asks egress to resolve as its DNS route evidence.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SignedPolicyV4 { domain: String, version: u16, runtimes: Vec<RuntimeRecord>, native: Vec<NativeRecord>, dns_probe_name: String }
+const POLICY_DOMAIN_V4: &str = "duduclaw-isolation-policy-v4";
 #[derive(Deserialize)]
 struct PolicyVersion { version: u16 }
-/// v2 reader. A v1 document is accepted as "no launcher" (helper tools then
-/// report `helper_launcher_unavailable`); a v1 document naming a launcher, a v2
-/// document without its domain, or any other version is refused.
+/// v4 reader. A v1 document is accepted as "no launcher" (helper tools then
+/// report `helper_launcher_unavailable`); a v1 document naming a launcher, a
+/// v2, v3 or v4 document without its own domain, a v1/v2 document with a step
+/// range, a v1–v3 document with a `dns_probe_name`, a v4 document without a
+/// valid one, a v3/v4 document with any invalid step range (the whole
+/// policy), or any other version is refused.
 fn parse_policy(bytes: &[u8]) -> io::Result<SignedPolicy> {
     let probe: PolicyVersion = serde_json::from_slice(bytes).map_err(|_| denied())?;
-    match probe.version {
+    let policy = match probe.version {
         1 => {
             let v1: SignedPolicyV1 = serde_json::from_slice(bytes).map_err(|_| denied())?;
             if v1.version != 1 || v1.native.iter().any(|n| n.launcher.is_some()) { return Err(denied()); }
-            Ok(SignedPolicy { version: 1, runtimes: v1.runtimes, native: v1.native })
+            SignedPolicy { version: 1, runtimes: v1.runtimes, native: v1.native, dns_probe_name: None }
         }
         2 => {
             let v2: SignedPolicyV2 = serde_json::from_slice(bytes).map_err(|_| denied())?;
             if v2.version != 2 || v2.domain != POLICY_DOMAIN_V2 { return Err(denied()); }
-            Ok(SignedPolicy { version: 2, runtimes: v2.runtimes, native: v2.native })
+            SignedPolicy { version: 2, runtimes: v2.runtimes, native: v2.native, dns_probe_name: None }
         }
-        _ => Err(denied()),
+        3 => {
+            let v3: SignedPolicyV3 = serde_json::from_slice(bytes).map_err(|_| denied())?;
+            if v3.version != 3 || v3.domain != POLICY_DOMAIN_V3 { return Err(denied()); }
+            SignedPolicy { version: 3, runtimes: v3.runtimes, native: v3.native, dns_probe_name: None }
+        }
+        4 => {
+            let v4: SignedPolicyV4 = serde_json::from_slice(bytes).map_err(|_| denied())?;
+            if v4.version != 4 || v4.domain != POLICY_DOMAIN_V4 { return Err(denied()); }
+            duduclaw_isolation::egress::validate_dns_probe_name(&v4.dns_probe_name).map_err(|_| denied())?;
+            SignedPolicy { version: 4, runtimes: v4.runtimes, native: v4.native, dns_probe_name: Some(v4.dns_probe_name) }
+        }
+        _ => return Err(denied()),
+    };
+    dns_probe_name_key(bytes, policy.version)?;
+    turn_limit_keys(bytes, policy.version)?;
+    validate_turn_limits(&policy)?;
+    Ok(policy)
+}
+/// R7b, decided on the raw document like `turn_limit_keys`: the key (also as
+/// an explicit `null`) is refused before v4. The strict v1–v3 readers refuse
+/// it as an unknown field too; this keeps the rule explicit.
+fn dns_probe_name_key(bytes: &[u8], version: u16) -> io::Result<()> {
+    let document: serde_json::Value = serde_json::from_slice(bytes).map_err(|_| denied())?;
+    if version < 4 && document.get("dns_probe_name").is_some() { return Err(denied()); }
+    Ok(())
+}
+/// A signed policy document through spawnd's strict reader plus the
+/// runtime/native pairing `bundle` requires (installer-side readers).
+fn signed_policy(bytes: &[u8]) -> io::Result<SignedPolicy> {
+    if bytes.len() > 1024 * 1024 { return Err(denied()); }
+    let policy = parse_policy(bytes)?;
+    if policy.native.len() != policy.runtimes.len() { return Err(denied()); }
+    for runtime in &policy.runtimes {
+        if !policy.native.iter().any(|native| native.profile == runtime.profile) { return Err(denied()); }
     }
+    Ok(policy)
+}
+/// The egress profile ids the signed isolation policy names (`network:
+/// {kind: egress, profile}` of each runtime record), in first-seen order and
+/// without duplicates, read through the same strict reader spawnd uses at
+/// start (`parse_policy`: version/domain, step ranges, canonical Claude+MCP
+/// argument shapes) plus the runtime/native pairing `bundle` requires. The
+/// root installer (R3 S5) writes `/etc/duduclaw/egress.json` from exactly
+/// these ids; a policy spawnd would refuse is refused here as well.
+pub fn signed_policy_egress_profiles(bytes: &[u8]) -> io::Result<Vec<ProfileId>> {
+    let policy = signed_policy(bytes)?;
+    let mut profiles = Vec::new();
+    for runtime in &policy.runtimes {
+        if let NetworkPolicy::Egress(profile) = &runtime.network {
+            if !profiles.contains(profile) { profiles.push(*profile); }
+        }
+    }
+    Ok(profiles)
+}
+/// R7b: the signed policy's `dns_probe_name` through the same strict reader;
+/// `None` for a policy older than v4 (spawnd then never reports the DNS route
+/// as verified).
+pub fn signed_policy_dns_probe_name(bytes: &[u8]) -> io::Result<Option<String>> {
+    Ok(signed_policy(bytes)?.dns_probe_name)
+}
+/// R8d (installer re-check): whether `entitlements` — the records of an
+/// existing host publication, as untyped JSON — are records spawnd reads
+/// (strict `EntitlementRecord`) and pass the production publication check
+/// (`RootPolicy::from_verified_publication`: one record per employee, 1..=128
+/// distinct profiles each in this signed policy, `max_turns` 1..=1000) against
+/// the policy behind `bytes`, read through the same strict reader as above.
+pub fn signed_policy_admits_entitlements(bytes: &[u8], entitlements: &[serde_json::Value]) -> io::Result<()> {
+    let policy = signed_policy(bytes)?;
+    let records = entitlements.iter().map(|value| EntitlementRecord::deserialize(value).map_err(|_| denied()))
+        .collect::<io::Result<Vec<_>>>()?;
+    io(crate::entitlement::admitted(&policy.runtimes, &records)).map(|_| ())
+}
+/// R7b: the probe name of the committed generation's verified policy (the
+/// full `bundle` checks). Blocking (updater probe): DNS evidence worker only.
+pub(crate) fn installed_dns_probe_name() -> io::Result<Option<String>> {
+    Ok(bundle()?.policy.dns_probe_name)
+}
+/// R7b: spawnd's view of the installer's `/etc/duduclaw/egress.json` (the
+/// document egress reads): the profiles, each in its strict shape. The other
+/// members are egress's to validate; egress refuses to start on them.
+#[derive(Deserialize)]
+struct EgressConfiguration { profiles: Vec<EgressProfile> }
+const EGRESS_CONFIGURATION_DIRECTORY: &str = "/etc/duduclaw";
+/// The DNS route this host is configured for: the one route of every profile
+/// in the root-owned egress configuration (read with the same root
+/// ownership, no-symlink and single-link checks as the other installed
+/// documents). The installer writes it from the signed policy's profile ids
+/// and the route it selected; spawnd has no other source for the route.
+pub(crate) fn configured_dns_route() -> io::Result<DnsRoute> {
+    let configuration: EgressConfiguration = read(EGRESS_CONFIGURATION_DIRECTORY, "egress.json")?;
+    single_route(&configuration.profiles)
+}
+fn single_route(profiles: &[EgressProfile]) -> io::Result<DnsRoute> {
+    let first = profiles.first().ok_or_else(denied)?;
+    if profiles.iter().any(|profile| profile.validate().is_err() || profile.dns_route != first.dns_route) { return Err(denied()); }
+    Ok(first.dns_route)
+}
+/// R6 review round, finding 3: decided on the raw document, because the typed
+/// record reads both an absent key and `"turn_limit": null` as `None`. A
+/// v1/v2 runtime record must not carry the key at all; a v3 record either
+/// omits it (no range: the fixed `--max-turns 50` shape) or carries a range
+/// object. An explicit `null` is refused in every version.
+fn turn_limit_keys(bytes: &[u8], version: u16) -> io::Result<()> {
+    let document: serde_json::Value = serde_json::from_slice(bytes).map_err(|_| denied())?;
+    let runtimes = document.get("runtimes").and_then(serde_json::Value::as_array).ok_or_else(denied)?;
+    for record in runtimes {
+        let record = record.as_object().ok_or_else(denied)?;
+        if record.get("turn_limit").is_some_and(|limit| version < 3 || limit.is_null()) { return Err(denied()); }
+    }
+    Ok(())
+}
+/// R6: no step range before v3; every v3 range valid; every Claude MCP record
+/// with exactly the canonical fixed-50 or ranged argument shape. Otherwise
+/// the policy is refused as a whole.
+fn validate_turn_limits(policy: &SignedPolicy) -> io::Result<()> {
+    for record in &policy.runtimes {
+        if record.turn_limit.is_some() && policy.version < 3 { return Err(denied()); }
+        io(crate::policy::validate_turn_limit(&record.to_runtime()))?;
+    }
+    Ok(())
 }
 /// HX publication checks 1–7 against the verified runtime set (§2.3), plus the
 /// `/helper-tmp` budget, which must fit inside the parent's tmpfs budget.
+/// For the native architecture (the unit tests' entry; `bundle` calls
+/// `validate_launchers_for` through `verified_policy`).
+#[cfg(test)]
 fn validate_launchers(policy: &SignedPolicy) -> io::Result<()> {
-    let arch = io(duduclaw_run::seccomp::Architecture::native())?;
+    validate_launchers_for(policy, io(duduclaw_run::seccomp::Architecture::native())?)
+}
+/// `validate_launchers` for an explicit architecture (spawnd: the native one;
+/// the R7d policy tool: the generation's `--arch`).
+fn validate_launchers_for(policy: &SignedPolicy, arch: duduclaw_run::seccomp::Architecture) -> io::Result<()> {
     let runtimes: Vec<_> = policy.runtimes.iter().map(RuntimeRecord::to_runtime).collect();
     for native in &policy.native {
         let Some(launcher) = &native.launcher else { continue };
@@ -261,7 +449,8 @@ pub struct GatewayPublication {
 impl GatewayPublication {
     pub fn policy(&self) -> Result<RootPolicy> {
         RootPolicy::from_verified_publication(self.runtimes.iter().map(RuntimeRecord::to_runtime).collect(),
-            self.entitlements.iter().map(|e| EmployeeEntitlement { employee: e.employee, profiles: e.profiles.clone() }).collect())
+            self.entitlements.iter().map(|e| EmployeeEntitlement { employee: e.employee, profiles: e.profiles.clone(),
+                max_turns: e.max_turns }).collect())
     }
     pub fn read(gateway_gid: u32) -> io::Result<Self> {
         // The gateway projection uses a dedicated group, not F's root-only reader.
@@ -280,27 +469,57 @@ impl GatewayPublication {
 struct Bundle { generation: Sha256Digest, manifest: ReleaseManifest, directory: std::path::PathBuf,
     host: HostPublication, policy: SignedPolicy }
 fn bundle() -> io::Result<Bundle> {
+    let bundle = unchecked_bundle()?;
+    if bundle.host.generation != bundle.generation { return Err(denied()); }
+    Ok(bundle)
+}
+/// Every check of [`bundle`] except that the host publication names the
+/// committed generation (it must still parse strictly and be version 1).
+/// Only [`InstalledPublication::load`] uses it directly, to roll a host
+/// publication of another generation over (R8d B).
+fn unchecked_bundle() -> io::Result<Bundle> {
     let (generation, manifest) = committed_generation()?;
-    let host: HostPublication = read(ROOT, "publication.json")?;
-    if host.version != 1 || host.generation != generation { return Err(denied()); }
+    let host: HostPublication = read(ROOT, HOST_PUBLICATION)?;
+    if host.version != 1 { return Err(denied()); }
     let target = InstallTarget::RuntimeEntry { registry_id: POLICY_ID.into() };
-    let artifact = manifest.artifacts.iter().find(|a| a.install_target == target).ok_or_else(denied)?;
-    if artifact.size_bytes > 1024 * 1024 || artifact.mode != 0o444 { return Err(denied()); }
+    let artifact = policy_artifact(&manifest)?;
     let hex: String = generation.0.iter().map(|byte| format!("{byte:02x}")).collect();
     let directory = Path::new(INSTALL_ROOT).join("generations").join(hex);
     let bytes = io(io(Directory::open(&directory))?.bytes(&io(artifact_name(&target))?, 1024 * 1024))?;
-    if bytes.len() as u64 != artifact.size_bytes || Sha256Digest(Sha256::digest(&bytes).into()) != artifact.sha256 { return Err(denied()); }
-    let policy = parse_policy(&bytes)?;
+    policy_bytes_match(artifact, &bytes)?;
+    let policy = verified_policy(&bytes, &manifest, io(duduclaw_run::seccomp::Architecture::native())?)?;
+    Ok(Bundle { generation, manifest, directory, host, policy })
+}
+/// The signed policy artifact of a generation manifest: the one
+/// `isolation-policy-v1` runtime entry, mode 0444, at most 1 MiB.
+fn policy_artifact(manifest: &ReleaseManifest) -> io::Result<&duduclaw_isolation::update::ReleaseArtifact> {
+    let target = InstallTarget::RuntimeEntry { registry_id: POLICY_ID.into() };
+    let artifact = manifest.artifacts.iter().find(|a| a.install_target == target).ok_or_else(denied)?;
+    if artifact.size_bytes > 1024 * 1024 || artifact.mode != 0o444 { return Err(denied()); }
+    Ok(artifact)
+}
+/// The policy bytes are exactly the ones the manifest binds (size and sha256).
+fn policy_bytes_match(artifact: &duduclaw_isolation::update::ReleaseArtifact, bytes: &[u8]) -> io::Result<()> {
+    if bytes.len() as u64 != artifact.size_bytes || Sha256Digest(Sha256::digest(bytes).into()) != artifact.sha256 { return Err(denied()); }
+    Ok(())
+}
+/// Every check `bundle` applies to the policy bytes of a generation, against
+/// that generation's manifest, for `arch` (spawnd: the native architecture;
+/// the R7d policy tool runs exactly this on its own output for `--arch`):
+/// the strict reader, one native record per runtime, the runtime artifact
+/// cross-check, unique native profiles each with its runtime, each runtime
+/// seccomp filter against its signed digest, and the helper launchers.
+fn verified_policy(bytes: &[u8], manifest: &ReleaseManifest, arch: duduclaw_run::seccomp::Architecture) -> io::Result<SignedPolicy> {
+    let policy = parse_policy(bytes)?;
     if policy.native.len() != policy.runtimes.len() { return Err(denied()); }
-    validate_runtime_artifacts(&policy, &manifest)?;
+    validate_runtime_artifacts(&policy, manifest)?;
     let mut ids = std::collections::BTreeSet::new();
     for profile in &policy.native {
         if !ids.insert((profile.profile.0).0) || !policy.runtimes.iter().any(|r| r.profile == profile.profile) { return Err(denied()); }
-        let arch = io(duduclaw_run::seccomp::Architecture::native())?;
         io(duduclaw_run::seccomp::runtime(arch, &profile.runtime, profile.runtime_digest))?;
     }
-    validate_launchers(&policy)?;
-    Ok(Bundle { generation, manifest, directory, host, policy })
+    validate_launchers_for(&policy, arch)?;
+    Ok(policy)
 }
 /// A native acceptance binds the exact vendor ELF as part of its launch-policy
 /// digest. Replacing either adapter or vendor requires new signed acceptance.
@@ -326,6 +545,13 @@ fn validate_runtime_artifacts(policy: &SignedPolicy, manifest: &ReleaseManifest)
     }
     Ok(())
 }
+/// A signed forwarder record names the generation's egress forwarder by its
+/// generation entry and digest, with 1–128 arguments (`native_profile`).
+fn forwarder_artifact_matches(manifest: &ReleaseManifest, f: &ForwarderRecord) -> bool {
+    !f.argv.is_empty() && f.argv.len() <= 128 && manifest.artifacts.iter().any(|a|
+        a.install_target == InstallTarget::EgressForwarder && a.sha256 == f.executable_digest
+        && artifact_name(&a.install_target).is_ok_and(|name| name == f.entry))
+}
 
 #[derive(Default)]
 pub struct InstalledPublication { generation: Option<Sha256Digest> }
@@ -337,13 +563,58 @@ impl InstalledPublication {
         self.generation = Some(generation);
         Ok(())
     }
-    fn checked_bundle(&mut self) -> Result<Bundle> {
-        let bundle = os(bundle())?;
+    fn checked_bundle(&mut self) -> Result<Bundle> { self.pinned(os(bundle())?) }
+    fn pinned(&mut self, bundle: Bundle) -> Result<Bundle> {
         // A verified policy/native artifact is immutable within a generation.
         // Never mix old plans or detached mounts with a later generation. F's
         // activation restarts B1; live policy swapping is deliberately refused.
         self.check_generation(bundle.generation)?;
         Ok(bundle)
+    }
+    /// R8d B, the one place a host publication is migrated: `load` (root's
+    /// lifecycle thread only; never the gateway-side reader). A publication
+    /// of another generation is rolled over to the pinned committed one
+    /// (`entitlement::rolled_over`), fitted to the same in-force check as
+    /// `Entitle` (trailing records dropped while only capacity fails;
+    /// anything else refuses) and written atomically before use; a
+    /// failed write refuses (fail closed). Structural garbage never gets
+    /// here: [`unchecked_bundle`] refuses it like [`bundle`] does.
+    fn rolled_bundle(&mut self) -> Result<Bundle> {
+        let mut bundle = self.pinned(os(unchecked_bundle())?)?;
+        if bundle.host.generation != bundle.generation {
+            bundle.host = crate::entitlement::roll_over(&mut InstalledEntitlements, &bundle.host, bundle.generation,
+                &bundle.policy.runtimes).map_err(|_| ErrorCode::IsolationUnavailable)?;
+        }
+        Ok(bundle)
+    }
+}
+/// The only writer of the host publication after install (R8d): the existing
+/// root writer (`host_state::atomic_json`: root:root 0600, temp file, fsync,
+/// rename, directory fsync). A failure is `Unavailable` only when a re-read
+/// proves `previous` is still in force; otherwise the on-disk state is
+/// unknown (`Unknown`, the allocation journal's poison rule).
+fn write_host(previous: &HostPublication, next: &HostPublication) -> std::result::Result<(), crate::entitlement::Refusal> {
+    use crate::entitlement::Refusal;
+    match crate::host_state::atomic_json(&Path::new(ROOT).join(HOST_PUBLICATION), next, 0, 0o600) {
+        Ok(()) => Ok(()),
+        Err(_) => match read::<HostPublication>(ROOT, HOST_PUBLICATION) {
+            Ok(current) if current == *previous => Err(Refusal::Unavailable),
+            _ => Err(Refusal::Unknown),
+        },
+    }
+}
+/// R8d: the allocation worker's view of the installed host publication.
+pub(crate) struct InstalledEntitlements;
+impl crate::entitlement::Entitlements for InstalledEntitlements {
+    /// The committed generation's verified signed runtimes (every `bundle`
+    /// check; a host publication not yet rolled over refuses).
+    fn signed(&mut self) -> io::Result<(Sha256Digest, Vec<RuntimeRecord>)> {
+        let bundle = bundle()?;
+        Ok((bundle.generation, bundle.policy.runtimes))
+    }
+    fn read(&mut self) -> io::Result<HostPublication> { read(ROOT, HOST_PUBLICATION) }
+    fn write(&mut self, previous: &HostPublication, next: &HostPublication) -> std::result::Result<(), crate::entitlement::Refusal> {
+        write_host(previous, next)
     }
 }
 fn checked_runtime<'a>(records: &'a [RuntimeRecord], runtime: &PublishedRuntime) -> Result<&'a RuntimeRecord> {
@@ -352,16 +623,20 @@ fn checked_runtime<'a>(records: &'a [RuntimeRecord], runtime: &PublishedRuntime)
     if matching.next().is_some() || record.to_runtime() != *runtime { return Err(ErrorCode::RuntimeDenied); }
     Ok(record)
 }
+/// Recompute the plan from the signed record. `from_runtime` re-checks the
+/// step limit against the record's signed range (R6 item 4); the employee's
+/// entitlement narrowing was applied by `RootPolicy::max_turns` at start.
 fn check_plan_runtime(plan: &crate::bootstrap::BootstrapPlan, runtime: &PublishedRuntime) -> Result<()> {
     let expected = crate::bootstrap::BootstrapPlan::from_runtime(plan.run, plan.employee, plan.uid, plan.gid,
-        plan.supervisor_uid, plan.supervisor_gid, plan.nonce, runtime, plan.pty, plan.prompt_bytes, &plan.input_fds, plan.proxy_port)?;
+        plan.supervisor_uid, plan.supervisor_gid, plan.nonce, runtime, plan.pty, plan.prompt_bytes, &plan.input_fds, plan.proxy_port,
+        plan.max_turns)?;
     if expected.encode()? != plan.encode()? { return Err(ErrorCode::RuntimeDenied); }
     Ok(())
 }
 impl crate::host::Publication for InstalledPublication {
     fn load(&mut self) -> Result<RootPolicy> {
         let started = os(crate::host_state::boottime_ms())?;
-        let b = self.checked_bundle()?;
+        let b = self.rolled_bundle()?;
         let launchers = launchers(&b.policy);
         let report = GatewayPublication { version: 1, generation: b.generation,
             boot_id: os(fs::read_to_string("/proc/sys/kernel/random/boot_id"))?.trim().into(), checked_boottime_ms: started, valid_for_ms: 1000,
@@ -382,7 +657,7 @@ impl crate::host::Publication for InstalledPublication {
     fn supervisor_identity(&mut self) -> Result<(u32, u32)> { os(crate::server::named_identity(c"duduclaw-runsup")) }
     fn anchors(&mut self) -> Result<crate::bootstrap_mounts::RootPublicationAnchors> {
         let b = self.checked_bundle()?;
-        os(crate::bootstrap_mounts::RootPublicationAnchors::new(b.directory, Path::new(ROOT).join("etc-state"), Path::new(ROOT).join("projections")))
+        os(crate::bootstrap_mounts::RootPublicationAnchors::new(b.directory, Path::new(ETC_STATE_DIRECTORY).into(), Path::new(PROJECTIONS_DIRECTORY).into()))
     }
     fn prepare_mcp_projection(&mut self, plan: &crate::bootstrap::BootstrapPlan, runtime: &PublishedRuntime) -> Result<()> {
         use std::io::Write;
@@ -402,7 +677,7 @@ impl crate::host::Publication for InstalledPublication {
         os(acceptance.validate(&projection))?;
         let native = b.policy.native.iter().find(|n| n.profile == runtime.profile).ok_or(ErrorCode::RuntimeDenied)?;
         os(acceptance.validate_launch(record, native))?;
-        let anchor = Path::new(ROOT).join("projections");
+        let anchor = Path::new(PROJECTIONS_DIRECTORY).to_path_buf();
         os(crate::registry::root_path(&anchor, true))?;
         let hex: String = plan.employee.0.iter().map(|byte| format!("{byte:02x}")).collect();
         let path = anchor.join(hex);
@@ -497,9 +772,7 @@ impl crate::host::Publication for InstalledPublication {
         let (uid, _) = os(crate::server::gateway_identity())?;
         let snapshot = self.snapshot_authority(uid)?;
         let forwarder = native.forwarder.map(|f| -> Result<_> {
-            if f.argv.is_empty() || f.argv.len() > 128 || !b.manifest.artifacts.iter().any(|a|
-                a.install_target == InstallTarget::EgressForwarder && a.sha256 == f.executable_digest
-                && artifact_name(&a.install_target).is_ok_and(|name| name == f.entry)) { return Err(ErrorCode::RuntimeDenied); }
+            if !forwarder_artifact_matches(&b.manifest, &f) { return Err(ErrorCode::RuntimeDenied); }
             let argv = f.argv.into_iter().map(|arg| os(CString::new(arg))).collect::<Result<Vec<_>>>()?;
             Ok(crate::native_trampoline::ForwarderProfile { entry: f.entry, executable_digest: f.executable_digest,
                 argv, seccomp: f.seccomp, seccomp_digest: f.seccomp_digest })
@@ -511,101 +784,20 @@ impl crate::host::Publication for InstalledPublication {
     }
 }
 
-/// Root harness receipt. Passes require an actual positive control plus denied
-/// public-key login/forwarding, not a stored "ready" switch. Its producer remains
-/// responsible for performing the observations and atomically renewing it.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct InstallReceipt {
-    version: u16, generation: Sha256Digest, boot_id: String, checked_boottime_ms: u64, valid_for_ms: u64,
-    external_nss_range: Option<UidRange>, iam_reservation_digest: Option<Sha256Digest>,
-    unowned_uids: Vec<u32>, owner_inventory_digest: Sha256Digest, ssh: Vec<SshReceipt>,
-    trampoline: TrampolineReceipt,
-    dns: DnsReceipt,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SshReceipt { account: String, control_exit: i32, public_key_exit: i32, forwarding_exit: i32, transcript_digest: Sha256Digest }
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TrampolineReceipt { executable_digest: Sha256Digest, landlock_exit: i32, namespace_exit: i32,
-    detected_abi: u32, selected_abi: u32, transcript_digest: Sha256Digest }
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DnsReceipt {
-    query: Text<253>, expected_answer: Sha256Digest, observed_answer: Sha256Digest,
-    route: DnsRoute, ip_address_allow: Vec<String>, second_layer: crate::readiness::EgressSecondLayer,
-    transcript_digest: Sha256Digest,
-}
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum DnsRoute { ResolvedVarlink, DedicatedBroker }
-fn receipt() -> io::Result<InstallReceipt> {
-    let (generation, manifest) = committed_generation()?;
-    let receipt: InstallReceipt = read(RECEIPTS, "installation.json")?;
-    // Verify the exact executable PID 1 will start, not merely an unused copy
-    // under the signed generation directory.
-    let artifact = manifest.artifacts.iter().find(|a| a.install_target == InstallTarget::Trampoline).ok_or_else(denied)?;
-    let installed = io(io(Directory::open(Path::new("/usr/lib/duduclaw")))?.read("duduclaw-run"))?;
-    if installed.metadata()?.mode() & 0o7777 != u32::from(artifact.mode) { return Err(denied()); }
-    io(duduclaw_updated::linux::files::verify_fd(installed, artifact.size_bytes, artifact.sha256))?;
-    let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
-    let now = crate::host_state::boottime_ms()?;
-    if receipt.version != 1 || receipt.generation != generation || receipt.boot_id != boot.trim()
-        || receipt.valid_for_ms == 0 || receipt.valid_for_ms > 60_000 || now < receipt.checked_boottime_ms
-        || now - receipt.checked_boottime_ms >= receipt.valid_for_ms || receipt.ssh.len() > 30_000
-        || receipt.unowned_uids.len() > 30_000 || !manifest.artifacts.iter().any(|a|
-            a.install_target == InstallTarget::Trampoline && a.sha256 == receipt.trampoline.executable_digest) { return Err(denied()); }
-    Ok(receipt)
-}
-pub struct InstalledEvidence;
-impl crate::accounts::InstallationEvidence for InstalledEvidence {
-    fn external_nss_range_reserved_and_enumerable(&self, range: UidRange) -> io::Result<()> {
-        let r = receipt()?;
-        if r.external_nss_range != Some(range) || !r.iam_reservation_digest.is_some_and(nonzero) { return Err(denied()); }
-        Ok(())
-    }
-    fn no_existing_file_owner(&self, uid: u32) -> io::Result<()> {
-        let r = receipt()?;
-        if !nonzero(r.owner_inventory_digest) || !r.unowned_uids.contains(&uid) { return Err(denied()); }
-        Ok(())
-    }
-    fn ssh_public_key_and_forwarding_denied(&self, account: &str) -> io::Result<()> {
-        let r = receipt()?;
-        let rows: Vec<_> = r.ssh.iter().filter(|s| s.account == account).collect();
-        if rows.len() != 1 || rows[0].control_exit != 0 || rows[0].public_key_exit != 255
-            || rows[0].forwarding_exit != 255 || !nonzero(rows[0].transcript_digest) { return Err(denied()); }
-        Ok(())
-    }
-}
-impl crate::native_trampoline::Installation for InstalledEvidence {
-    fn readback(&mut self) -> Result<crate::bootstrap::TrampolineReadiness> {
-        let r = os(receipt())?.trampoline;
-        let actual = os(duduclaw_run::linux::probe::probe())?;
-        if r.landlock_exit != 0 || r.namespace_exit != 0 || !nonzero(r.transcript_digest)
-            || r.detected_abi != actual.landlock_abi || r.selected_abi != actual.landlock_ruleset_abi { return Err(ErrorCode::IsolationUnavailable); }
-        let evidence = crate::bootstrap::TrampolineReadiness { version: 1, executable_verified: true,
-            landlock_self_test: true, namespace_self_test: true, detected_landlock_abi: r.detected_abi, selected_landlock_abi: r.selected_abi };
-        evidence.check()?;
-        Ok(evidence)
-    }
-}
-impl crate::host::DnsEvidence for InstalledEvidence {
-    fn verify(&mut self) -> Result<crate::readiness::EgressSecondLayer> {
-        let r = os(receipt())?.dns;
-        if r.query.as_str().is_empty() || !nonzero(r.expected_answer) || r.expected_answer != r.observed_answer
-            || !nonzero(r.transcript_digest) { return Err(ErrorCode::IsolationUnavailable); }
-        crate::readiness::validate_egress_ip_allow(&r.ip_address_allow)?;
-        // The root harness probes the configured Unix route, including broker
-        // restrictions, and binds both query and answer to this short receipt.
-        match r.route { DnsRoute::ResolvedVarlink | DnsRoute::DedicatedBroker => Ok(r.second_layer) }
-    }
-}
 pub fn install(components: &mut crate::host::Components) {
     components.publication = Box::new(InstalledPublication::default());
-    components.installation = Arc::new(InstalledEvidence);
-    components.egress = Box::new(crate::host::LinuxEgress::new(Box::new(InstalledEvidence)));
-    components.trampoline = Box::new(crate::native_trampoline::NativeTrampoline::new(Box::new(InstalledEvidence)));
+    // R7c: SSH denial from spawnd's own probe unit through PID 1, not a receipt.
+    components.ssh = Arc::new(crate::ssh_evidence::installed());
+    // R7b: DNS route evidence from spawnd's own probe through egress, over the
+    // same (single) control connection the run registrations use.
+    let client = crate::host::SharedEgressClient::default();
+    // The second layer from PID 1's own view of the egress unit's IP rules.
+    components.egress = Box::new(crate::host::LinuxEgress::with_client(
+        Box::new(crate::dns_evidence::installed(client.clone())), client)
+        .with_second_layer(Box::new(crate::egress_layer::installed())));
+    // R7a: trampoline readiness comes from spawnd's own self-test, not the receipt.
+    components.trampoline = Box::new(crate::native_trampoline::NativeTrampoline::new(
+        Box::new(crate::selftest::SelfTestInstallation::default())));
 }
 
 #[cfg(test)]
@@ -614,13 +806,16 @@ mod tests {
     fn runtime_record() -> RuntimeRecord {
         RuntimeRecord { runtime: RuntimeKind::Claude, profile: ProfileId(Sha256Digest([1; 32])),
             executable: ExecutableRecord::Elf { entry: Text::new("claude".into()).unwrap(), digest: Sha256Digest([2; 32]) },
-            pinned_version: Text::new("2.0.0".into()).unwrap(), fixed_args: vec![],
+            pinned_version: Text::new("2.0.0".into()).unwrap(),
+            // The canonical v1/v2 Claude MCP shape (fixed `--max-turns 50`).
+            fixed_args: crate::gateway_plan::claude_arguments("model").unwrap().into_iter().map(|arg| Text::new(arg).unwrap()).collect(),
             resources: ResourceLimits { memory_bytes: 1024 * 1024, cpu_quota_percent: 100, tasks: 16,
                 open_files: 4096, ptys: 16, disk: DiskQuota::LoopFilesystem { bytes: 1024, inodes: 32 },
                 io_read_bytes_per_sec: 1024, io_write_bytes_per_sec: 1024, io_read_ops_per_sec: 10,
                 io_write_ops_per_sec: 10, output_buffer_bytes: 4096, output_total_bytes: 4096, memfd_total_bytes: 4096 },
             timeouts: RunTimeouts { queue_ms: 1000, startup_ms: 1000, runtime_ms: 1000, pty_idle_ms: None, termination_grace_ms: 100 },
-            network: NetworkPolicy::Offline, mcp: true, pty_allowed: false, queue_class: QueueClass::Background, mcp_acceptance: None }
+            network: NetworkPolicy::Offline, mcp: true, pty_allowed: false, queue_class: QueueClass::Background, mcp_acceptance: None,
+            turn_limit: None }
     }
     #[test]
     fn native_runtime_publication_requires_signed_adapter_and_matching_vendor_digest() {
@@ -637,7 +832,7 @@ mod tests {
                 vendor_digest: Some(Sha256Digest([3;32])), profile: record.profile,
                 runtime: duduclaw_run::seccomp::RuntimeProfile { allowed_syscalls: vec![0] },
                 runtime_digest: Sha256Digest([4;32]), forwarder: None, tmpfs_bytes: 4096,
-                tmpfs_inodes: 32, proc_subset_pid: true, launcher: None }] };
+                tmpfs_inodes: 32, proc_subset_pid: true, launcher: None }], dns_probe_name: None };
             let mut manifest = ReleaseManifest { schema_version: 1, product: Product::Duduclaw, version,
                 channel: ReleaseChannel::Stable, os: OperatingSystem::Linux, arch: Architecture::X86_64,
                 minimum_version: version, serial: 1, created_at_unix: 1, expires_at_unix: 2,
@@ -690,12 +885,42 @@ mod tests {
     fn bootstrap_plan_must_match_the_exact_signed_runtime() {
         let runtime = runtime_record().to_runtime();
         let mut plan = crate::bootstrap::BootstrapPlan::from_runtime(RunHandle(duduclaw_isolation::ids::RunId([1; 16])),
-            EmployeeId([2; 16]), 70000, 70000, 400, 400, [3; 32], &runtime, false, 0, &[], None).unwrap();
+            EmployeeId([2; 16]), 70000, 70000, 400, 400, [3; 32], &runtime, false, 0, &[], None, None).unwrap();
         assert!(check_plan_runtime(&plan, &runtime).is_ok());
         plan.argv.push("--other-config".into());
         assert!(check_plan_runtime(&plan, &runtime).is_err());
         plan.argv.pop(); plan.open_files += 1;
         assert!(check_plan_runtime(&plan, &runtime).is_err());
+        // An unranged record never accepts a step limit.
+        plan.open_files -= 1; plan.max_turns = Some(50);
+        assert!(check_plan_runtime(&plan, &runtime).is_err());
+    }
+    #[test]
+    fn ranged_plan_recheck_binds_the_limit_and_its_argv_position() {
+        let record = ranged_record();
+        let runtime = record.to_runtime();
+        let build = |max_turns| crate::bootstrap::BootstrapPlan::from_runtime(RunHandle(duduclaw_isolation::ids::RunId([1; 16])),
+            EmployeeId([2; 16]), 70000, 70000, 400, 400, [3; 32], &runtime, false, 0, &[], None, max_turns);
+        let plan = build(Some(80)).unwrap();
+        assert!(check_plan_runtime(&plan, &runtime).is_ok());
+        // Changing the value in argv only, or in the field only, is refused.
+        let mut changed = plan.clone();
+        let index = changed.argv.iter().position(|arg| arg == "--max-turns").unwrap();
+        changed.argv[index + 1] = "200".into();
+        assert!(check_plan_runtime(&changed, &runtime).is_err());
+        let mut changed = plan.clone(); changed.max_turns = Some(200);
+        assert!(check_plan_runtime(&changed, &runtime).is_err());
+        // A value outside the signed range can never be re-derived.
+        let mut changed = plan.clone(); changed.max_turns = Some(201);
+        assert!(check_plan_runtime(&changed, &runtime).is_err());
+        let mut changed = plan; changed.max_turns = None;
+        assert!(check_plan_runtime(&changed, &runtime).is_err());
+        // The MCP suffix check of `record_mcp_projection` is unchanged: the
+        // signed arguments still end with the projection's exact suffix.
+        let arguments: Vec<_> = record.fixed_args.iter().map(|arg| arg.as_str()).collect();
+        let expected = duduclaw_mcp_boundary::config::claude_mcp_arguments();
+        let expected: Vec<_> = expected.iter().map(String::as_str).collect();
+        assert!(arguments.ends_with(&expected));
     }
     #[test]
     fn generation_cache_requires_same_live_signed_identity_and_protocols() {
@@ -735,7 +960,29 @@ mod tests {
         assert!(serde_json::from_value::<HostPublication>(value.clone()).is_ok());
         value.as_object_mut().unwrap().insert("ready".into(), true.into());
         assert!(serde_json::from_value::<HostPublication>(value).is_err());
-        assert!(serde_json::from_str::<InstallReceipt>(r#"{"ready":true}"#).is_err());
+    }
+    /// R8d C: the installer's re-check of an existing publication accepts
+    /// exactly the entitlements the production check admits for this policy.
+    #[test]
+    fn installer_entitlement_check_is_the_production_check() {
+        let bytes = serde_json::to_vec(&v1_document()).unwrap();
+        let profile = runtime_record().profile;
+        let employee = EmployeeId([5; 16]);
+        let good = serde_json::json!({ "employee": employee, "profiles": [profile] });
+        assert!(signed_policy_admits_entitlements(&bytes, &[]).is_ok());
+        assert!(signed_policy_admits_entitlements(&bytes, &[good.clone()]).is_ok());
+        for bad in [
+            serde_json::json!({ "employee": employee, "profiles": [ProfileId(Sha256Digest([9; 32]))] }),
+            serde_json::json!({ "employee": employee, "profiles": [] }),
+            serde_json::json!({ "employee": employee, "profiles": [profile, profile] }),
+            serde_json::json!({ "employee": employee, "profiles": [profile], "max_turns": 0 }),
+            serde_json::json!({ "employee": employee, "profiles": [profile], "ready": true }),
+            serde_json::json!({ "employee": "00".repeat(16), "profiles": [profile] }),
+        ] {
+            assert!(signed_policy_admits_entitlements(&bytes, &[bad.clone()]).is_err(), "{bad}");
+        }
+        assert!(signed_policy_admits_entitlements(&bytes, &[good.clone(), good]).is_err(), "one record per employee");
+        assert!(signed_policy_admits_entitlements(b"{}", &[]).is_err(), "an unreadable policy admits nothing");
     }
     #[test]
     fn mcp_acceptance_binds_exact_runtime_projection_and_child_exec() {
@@ -752,6 +999,52 @@ mod tests {
         acceptance.mcp_child_exec_exit = 1; assert!(acceptance.validate(&projection).is_err());
         acceptance.mcp_child_exec_exit = 0; acceptance.inherited_fd = 4; assert!(acceptance.validate(&projection).is_err());
         acceptance.inherited_fd = 3; acceptance.bridge_digest = Sha256Digest([8; 32]); assert!(acceptance.validate(&projection).is_err());
+    }
+    /// R8z-3: each acceptance check that refuses is named, in the order of
+    /// the former condition chain; `validate` refuses exactly then.
+    #[test]
+    fn r8z3_mcp_acceptance_names_the_first_refusing_check() {
+        use duduclaw_mcp_boundary::config::AcceptanceCheck as C;
+        let registration = duduclaw_mcp_boundary::config::RuntimeRegistration { runtime: RuntimeKind::OpenAiCompat,
+            version: "api-worker-v1".into(), runtime_digest: Sha256Digest([1; 32]), bridge_digest: Sha256Digest([2; 32]),
+            bridge_executable: "/runtime/duduclaw-mcp-bridge".into() };
+        let projection = duduclaw_mcp_boundary::config::runtime_projection(registration).unwrap();
+        let good = McpAcceptance { runtime: RuntimeKind::OpenAiCompat, version: "api-worker-v1".into(),
+            runtime_digest: Sha256Digest([1; 32]), bridge_digest: Sha256Digest([2; 32]),
+            projection_digest: projection.digest(), launch_policy_digest: Sha256Digest([4; 32]), inherited_fd: 3,
+            initialize_exit: 0, parent_exec_exit: 0, mcp_child_exec_exit: 0, exclusive_config_exit: 0,
+            transcript_digest: Sha256Digest([3; 32]) };
+        assert_eq!(good.validate_check(&projection), Ok(()));
+        let edits: [(C, fn(&mut McpAcceptance)); 11] = [
+            (C::Runtime, |a| a.runtime = RuntimeKind::Claude),
+            (C::Version, |a| a.version = "v-api-worker-v1".into()),
+            (C::RuntimeDigest, |a| a.runtime_digest = Sha256Digest([9; 32])),
+            (C::BridgeDigest, |a| a.bridge_digest = Sha256Digest([9; 32])),
+            (C::ProjectionDigest, |a| a.projection_digest = Sha256Digest([9; 32])),
+            (C::InheritedFd, |a| a.inherited_fd = 4),
+            (C::InitializeExit, |a| a.initialize_exit = 1),
+            (C::ParentExecExit, |a| a.parent_exec_exit = 1),
+            (C::McpChildExecExit, |a| a.mcp_child_exec_exit = 1),
+            (C::ExclusiveConfigExit, |a| a.exclusive_config_exit = 1),
+            (C::TranscriptDigest, |a| a.transcript_digest = Sha256Digest([0; 32])),
+        ];
+        for (check, edit) in edits {
+            let mut bad = good.clone();
+            edit(&mut bad);
+            assert_eq!(bad.validate_check(&projection), Err(check), "{check:?}");
+            assert!(bad.validate(&projection).is_err(), "{check:?}");
+        }
+        // The launch-policy digest is `validate_launch`'s, not `validate`'s.
+        let mut other = good.clone();
+        other.launch_policy_digest = Sha256Digest([9; 32]);
+        assert_eq!(other.validate_check(&projection), Ok(()));
+        // Every adjacent pair reports the earlier check when both fail.
+        for pair in edits.windows(2) {
+            let mut both = good.clone();
+            (pair[0].1)(&mut both);
+            (pair[1].1)(&mut both);
+            assert_eq!(both.validate_check(&projection), Err(pair[0].0), "{:?} before {:?}", pair[0].0, pair[1].0);
+        }
     }
     #[test]
     #[ignore = "iso_root_: disposable Linux VM; verifies root receipt ownership and mode"]
@@ -799,7 +1092,7 @@ mod tests {
         assert!(parse_policy(&serde_json::to_vec(&smuggled).unwrap()).is_err());
         let mut relabelled = v1_document(); relabelled["domain"] = POLICY_DOMAIN_V2.into();
         assert!(parse_policy(&serde_json::to_vec(&relabelled).unwrap()).is_err());
-        for version in [0, 3, 65535] {
+        for version in [0, 3, 4, 65535] {
             let mut other = v1_document(); other["version"] = version.into();
             assert!(parse_policy(&serde_json::to_vec(&other).unwrap()).is_err());
         }
@@ -811,7 +1104,7 @@ mod tests {
         let record = runtime_record();
         let employee = EmployeeId([5; 16]);
         let root = RootPolicy::from_verified_publication(vec![record.to_runtime()],
-            vec![EmployeeEntitlement { employee, profiles: vec![record.profile] }]).unwrap()
+            vec![EmployeeEntitlement { employee, profiles: vec![record.profile], max_turns: None }]).unwrap()
             .with_launchers(duduclaw_run::seccomp::Architecture::native().unwrap(), launchers(&policy)).unwrap();
         // No launcher: the helper table is empty, so every helper call is refused.
         assert!(root.helper_table(employee, &record.to_runtime()).is_empty());
@@ -848,6 +1141,311 @@ mod tests {
         assert!(validate_launchers(&policy).is_err());
     }
 
+    /// A v3 Claude record: signed arguments without `--max-turns`, the fixed
+    /// MCP suffix last, and the Q12 working-default range (pending owner).
+    fn ranged_record() -> RuntimeRecord {
+        let mut record = runtime_record();
+        record.fixed_args = crate::gateway_plan::claude_ranged_arguments("model").unwrap().into_iter()
+            .map(|arg| Text::new(arg).unwrap()).collect();
+        record.turn_limit = Some(crate::policy::WORKING_DEFAULT_TURN_LIMIT);
+        record
+    }
+    fn v3_document() -> serde_json::Value {
+        let record = ranged_record();
+        serde_json::json!({ "domain": POLICY_DOMAIN_V3, "version": 3, "runtimes": [record.clone()],
+            "native": [native_record(&record)] })
+    }
+    #[test]
+    fn policy_v3_carries_the_signed_range_under_its_own_domain() {
+        let policy = parse_policy(&serde_json::to_vec(&v3_document()).unwrap()).unwrap();
+        assert_eq!(policy.version, 3);
+        assert_eq!(policy.runtimes[0].turn_limit, Some(crate::policy::WORKING_DEFAULT_TURN_LIMIT));
+        validate_launchers(&policy).unwrap();
+        // The range reaches the gateway projection and the root policy unchanged.
+        let report = GatewayPublication { version: 1, generation: Sha256Digest([1; 32]), boot_id: "boot".into(),
+            checked_boottime_ms: 50, valid_for_ms: 1000, runtimes: policy.runtimes,
+            entitlements: vec![EntitlementRecord { employee: EmployeeId([5; 16]), profiles: vec![ProfileId(Sha256Digest([1; 32]))],
+                max_turns: Some(30) }] };
+        let projected: GatewayPublication = serde_json::from_slice(&serde_json::to_vec(&report).unwrap()).unwrap();
+        let root = projected.policy().unwrap();
+        assert_eq!(root.turn_cap(EmployeeId([5; 16])), Some(30));
+        // v3 needs its exact domain; relabelling as v1/v2 is refused.
+        for (version, domain) in [(3, serde_json::Value::Null), (3, POLICY_DOMAIN_V2.into()), (2, POLICY_DOMAIN_V3.into()),
+            (1, POLICY_DOMAIN_V3.into())] {
+            let mut value = v3_document();
+            value["version"] = version.into();
+            if domain.is_null() { value.as_object_mut().unwrap().remove("domain"); } else { value["domain"] = domain; }
+            assert!(parse_policy(&serde_json::to_vec(&value).unwrap()).is_err(), "{version}");
+        }
+        // The deployed v1 and v2 readers refuse v3 bytes outright.
+        let bytes = serde_json::to_vec(&v3_document()).unwrap();
+        assert!(serde_json::from_slice::<SignedPolicyV1>(&bytes).is_err());
+        // An unknown field inside the range is refused.
+        let mut value = v3_document(); value["runtimes"][0]["turn_limit"]["step"] = 1.into();
+        assert!(parse_policy(&serde_json::to_vec(&value).unwrap()).is_err());
+    }
+    #[test]
+    fn policy_v3_with_any_invalid_range_is_refused_as_a_whole() {
+        // A second, valid record does not rescue the document.
+        let mut second = runtime_record();
+        second.runtime = RuntimeKind::Codex; second.profile = ProfileId(Sha256Digest([9; 32]));
+        let bads: Vec<serde_json::Value> = vec![
+            serde_json::json!({"min": 0, "max": 200, "default": 50}),
+            serde_json::json!({"min": 60, "max": 200, "default": 50}),
+            serde_json::json!({"min": 1, "max": 40, "default": 50}),
+            serde_json::json!({"min": 1, "max": 1001, "default": 50}),
+            serde_json::json!({"min": 1, "max": 200}),
+            serde_json::json!({"min": -1, "max": 200, "default": 50}),
+            serde_json::json!({"min": 1, "max": 70000, "default": 50}),
+            serde_json::json!("1..200"),
+        ];
+        for bad in bads {
+            let mut value = v3_document();
+            value["runtimes"][0]["turn_limit"] = bad.clone();
+            value["runtimes"].as_array_mut().unwrap().push(serde_json::to_value(&second).unwrap());
+            value["native"].as_array_mut().unwrap().push(serde_json::to_value(native_record(&second)).unwrap());
+            assert!(parse_policy(&serde_json::to_vec(&value).unwrap()).is_err(), "{bad}");
+        }
+        // A ranged record must not also carry a fixed `--max-turns`.
+        let mut value = v3_document();
+        let arguments = value["runtimes"][0]["fixed_args"].as_array_mut().unwrap();
+        arguments.insert(0, serde_json::Value::from("500"));
+        arguments.insert(0, serde_json::Value::from("--max-turns"));
+        assert!(parse_policy(&serde_json::to_vec(&value).unwrap()).is_err());
+        // A range on a record that is not a Claude MCP runtime.
+        let mut value = v3_document(); value["runtimes"][0]["runtime"] = serde_json::to_value(RuntimeKind::Codex).unwrap();
+        assert!(parse_policy(&serde_json::to_vec(&value).unwrap()).is_err());
+    }
+    #[test]
+    fn policy_v1_v2_unaffected_and_cannot_carry_a_range() {
+        // v1/v2 keep parsing exactly as before; no record has a range.
+        let v1 = parse_policy(&serde_json::to_vec(&v1_document()).unwrap()).unwrap();
+        assert!(v1.runtimes.iter().all(|record| record.turn_limit.is_none()));
+        let record = runtime_record();
+        let v2 = SignedPolicyV2 { domain: POLICY_DOMAIN_V2.into(), version: 2, runtimes: vec![record.clone()],
+            native: vec![native_record(&record)] };
+        let v2_bytes = serde_json::to_vec(&v2).unwrap();
+        assert!(parse_policy(&v2_bytes).unwrap().runtimes.iter().all(|record| record.turn_limit.is_none()));
+        // The serialized record (input of the MCP launch-policy digest) has no
+        // new key, so deployed v1/v2 acceptances keep their digests.
+        assert!(serde_json::to_value(&record).unwrap().get("turn_limit").is_none());
+        // A range in a v1 or v2 document is refused as a whole.
+        let range = serde_json::to_value(crate::policy::WORKING_DEFAULT_TURN_LIMIT).unwrap();
+        let mut value = v1_document(); value["runtimes"][0]["turn_limit"] = range.clone();
+        assert!(parse_policy(&serde_json::to_vec(&value).unwrap()).is_err());
+        let mut value: serde_json::Value = serde_json::from_slice(&v2_bytes).unwrap();
+        value["runtimes"][0]["turn_limit"] = range;
+        assert!(parse_policy(&serde_json::to_vec(&value).unwrap()).is_err());
+        // R6 review round, finding 3: the key itself is refused before v3,
+        // also as an explicit `null` (which the typed record reads as absent).
+        let mut value = v1_document(); value["runtimes"][0]["turn_limit"] = serde_json::Value::Null;
+        assert!(serde_json::from_slice::<SignedPolicyV1>(&serde_json::to_vec(&value).unwrap()).unwrap().runtimes[0].turn_limit.is_none());
+        assert!(parse_policy(&serde_json::to_vec(&value).unwrap()).is_err(), "v1 null");
+        let mut value: serde_json::Value = serde_json::from_slice(&v2_bytes).unwrap();
+        value["runtimes"][0]["turn_limit"] = serde_json::Value::Null;
+        assert!(parse_policy(&serde_json::to_vec(&value).unwrap()).is_err(), "v2 null");
+        // Host entitlements without `max_turns` keep their exact shape.
+        let entitlement: EntitlementRecord = serde_json::from_value(serde_json::json!({
+            "employee": EmployeeId([1; 16]), "profiles": [] })).unwrap();
+        assert!(entitlement.max_turns.is_none());
+        assert!(serde_json::to_value(&entitlement).unwrap().get("max_turns").is_none());
+        assert!(serde_json::from_value::<EntitlementRecord>(serde_json::json!({
+            "employee": EmployeeId([1; 16]), "profiles": [], "max_turns": 30, "ready": true })).is_err());
+    }
+
+    /// R6 review round, findings 1–3: every signed Claude MCP record carries
+    /// exactly one enforceable step limit, in every policy version; a v3
+    /// `"turn_limit": null` is refused (absent is the only "no range").
+    #[test]
+    fn policy_claude_mcp_step_limit_shape_is_refused_as_a_whole() {
+        let mut second = runtime_record();
+        second.runtime = RuntimeKind::Codex; second.profile = ProfileId(Sha256Digest([9; 32])); second.fixed_args.clear();
+        let parses = |mut value: serde_json::Value| {
+            value["runtimes"].as_array_mut().unwrap().push(serde_json::to_value(&second).unwrap());
+            value["native"].as_array_mut().unwrap().push(serde_json::to_value(native_record(&second)).unwrap());
+            parse_policy(&serde_json::to_vec(&value).unwrap()).is_ok()
+        };
+        let legacy = serde_json::to_value(crate::gateway_plan::claude_arguments("model").unwrap()).unwrap();
+        let ranged = serde_json::to_value(crate::gateway_plan::claude_ranged_arguments("model").unwrap()).unwrap();
+        let unranged = |mut value: serde_json::Value| {
+            value["runtimes"][0].as_object_mut().unwrap().remove("turn_limit");
+            value
+        };
+        assert!(parses(v3_document()));
+        assert!(parses(v1_document()));
+        // v3 without a range keeps the canonical fixed 50.
+        let mut value = unranged(v3_document()); value["runtimes"][0]["fixed_args"] = legacy.clone();
+        assert!(parses(value));
+        // v3: an explicit null is not "no range".
+        let mut value = v3_document(); value["runtimes"][0]["turn_limit"] = serde_json::Value::Null;
+        assert!(!parses(value), "v3 null");
+        // Neither a range nor the fixed flag (would launch with no step limit).
+        assert!(!parses(unranged(v3_document())), "v3 neither");
+        let mut value = v1_document(); value["runtimes"][0]["fixed_args"] = ranged.clone();
+        assert!(!parses(value), "v1 neither");
+        // Both.
+        let mut value = v3_document(); value["runtimes"][0]["fixed_args"] = legacy.clone();
+        assert!(!parses(value), "v3 both");
+        // The fixed flag with another value, duplicated or in `=` spelling.
+        let position = crate::policy::CLAUDE_FIXED_PREFIX.len();
+        for (index, replacement) in [(position + 1, "500"), (position, "--max-turns=50")] {
+            let mut value = v1_document(); value["runtimes"][0]["fixed_args"][index] = replacement.into();
+            assert!(!parses(value), "{replacement}");
+        }
+        let mut value = v1_document();
+        let arguments = value["runtimes"][0]["fixed_args"].as_array_mut().unwrap();
+        arguments.insert(position, "50".into()); arguments.insert(position, "--max-turns".into());
+        assert!(!parses(value), "duplicated");
+        // A bare `--` before the suffix, or the insertion point after a
+        // value-taking option.
+        for (index, smuggled) in [(14, "--"), (1, "--"), (14, "--model")] {
+            let mut value = v3_document();
+            value["runtimes"][0]["fixed_args"].as_array_mut().unwrap().insert(index, smuggled.into());
+            assert!(!parses(value), "{index} {smuggled}");
+        }
+    }
+
+    /// R7b: v4 = the v3 shape under its own domain plus `dns_probe_name`.
+    fn v4_document() -> serde_json::Value {
+        let mut value = v3_document();
+        value["domain"] = POLICY_DOMAIN_V4.into();
+        value["version"] = 4.into();
+        value["dns_probe_name"] = "api.example.com".into();
+        value
+    }
+    fn parses(value: &serde_json::Value) -> bool { parse_policy(&serde_json::to_vec(value).unwrap()).is_ok() }
+    #[test]
+    fn policy_v4_carries_the_probe_name_and_older_versions_have_none() {
+        let bytes = serde_json::to_vec(&v4_document()).unwrap();
+        let policy = parse_policy(&bytes).unwrap();
+        assert_eq!((policy.version, policy.dns_probe_name.as_deref()), (4, Some("api.example.com")));
+        // Everything v3 carries still reaches the policy.
+        assert_eq!(policy.runtimes[0].turn_limit, Some(crate::policy::WORKING_DEFAULT_TURN_LIMIT));
+        validate_launchers(&policy).unwrap();
+        assert_eq!(signed_policy_dns_probe_name(&bytes).unwrap().as_deref(), Some("api.example.com"));
+        assert_eq!(signed_policy_egress_profiles(&bytes).unwrap(), Vec::<ProfileId>::new());
+        // v1–v3: no probe name (spawnd then never reports the DNS route as verified).
+        let record = runtime_record();
+        let v2 = serde_json::to_value(SignedPolicyV2 { domain: POLICY_DOMAIN_V2.into(), version: 2,
+            runtimes: vec![record.clone()], native: vec![native_record(&record)] }).unwrap();
+        for older in [v1_document(), v2, v3_document()] {
+            let bytes = serde_json::to_vec(&older).unwrap();
+            assert_eq!(parse_policy(&bytes).unwrap().dns_probe_name, None);
+            assert_eq!(signed_policy_dns_probe_name(&bytes).unwrap(), None);
+        }
+        // The deployed v1–v3 readers refuse v4 bytes outright.
+        assert!(serde_json::from_slice::<SignedPolicyV1>(&bytes).is_err());
+        assert!(serde_json::from_slice::<SignedPolicyV3>(&bytes).is_err());
+    }
+    #[test]
+    fn policy_v4_refusals() {
+        // Missing, null or non-string probe name.
+        let mut value = v4_document(); value.as_object_mut().unwrap().remove("dns_probe_name");
+        assert!(!parses(&value), "missing");
+        for bad in [serde_json::Value::Null, 7.into(), serde_json::json!(["api.example.com"])] {
+            let mut value = v4_document(); value["dns_probe_name"] = bad.clone();
+            assert!(!parses(&value), "{bad}");
+        }
+        // Each part of the name rule.
+        let long_label = format!("{}.com", "a".repeat(64));
+        let long_name = format!("{}.com", vec!["a".repeat(60); 5].join("."));
+        for name in ["", "com", "localhost", "API.example.com", "api.example.com.", "-api.example.com", "api-.example.com",
+            "api_x.example.com", "api..example.com", "192.0.2.1", "printer.local", "db.internal", "app.localhost",
+            "\u{e4}pi.example.com", long_label.as_str(), long_name.as_str()] {
+            let mut value = v4_document(); value["dns_probe_name"] = name.into();
+            assert!(!parses(&value), "{name}");
+        }
+        // v4 needs its exact domain; relabelling either way is refused.
+        for (version, domain) in [(4, serde_json::Value::Null), (4, POLICY_DOMAIN_V3.into()), (3, POLICY_DOMAIN_V4.into())] {
+            let mut value = v4_document(); value["version"] = version.into();
+            if domain.is_null() { value.as_object_mut().unwrap().remove("domain"); } else { value["domain"] = domain; }
+            assert!(!parses(&value), "{version}");
+        }
+        // An unknown top-level member is refused as before.
+        let mut value = v4_document(); value["dns_route"] = "resolved_varlink".into();
+        assert!(!parses(&value));
+        // v1–v3 refuse the key, also as an explicit null.
+        let record = runtime_record();
+        let v2 = serde_json::to_value(SignedPolicyV2 { domain: POLICY_DOMAIN_V2.into(), version: 2,
+            runtimes: vec![record.clone()], native: vec![native_record(&record)] }).unwrap();
+        for older in [v1_document(), v2, v3_document()] {
+            assert!(parses(&older));
+            for key in [serde_json::Value::from("api.example.com"), serde_json::Value::Null] {
+                let mut value = older.clone(); value["dns_probe_name"] = key.clone();
+                assert!(!parses(&value), "{} {key}", older["version"]);
+            }
+        }
+        // The v3 turn-limit rules still apply to v4 as a whole.
+        let mut value = v4_document(); value["runtimes"][0]["turn_limit"] = serde_json::Value::Null;
+        assert!(!parses(&value));
+    }
+    #[test]
+    fn configured_dns_route_is_the_single_route_of_valid_profiles() {
+        use std::num::{NonZeroU16, NonZeroU32};
+        let limits = duduclaw_isolation::egress::EgressLimits { max_frame_bytes: NonZeroU32::new(65536).unwrap(),
+            max_tunnels: NonZeroU16::new(16).unwrap(), frames_per_second: NonZeroU32::new(100).unwrap(),
+            bytes_per_second: NonZeroU32::new(1024).unwrap(), connect_timeout_ms: NonZeroU32::new(5000).unwrap(),
+            idle_timeout_ms: NonZeroU32::new(30000).unwrap(), max_header_bytes: NonZeroU32::new(8192).unwrap(),
+            max_headers: NonZeroU16::new(32).unwrap() };
+        let profile = |seed: u8, dns_route| EgressProfile { id: ProfileId(Sha256Digest([seed; 32])),
+            allowed_connect_ports: duduclaw_isolation::bounded::List::new(vec![NonZeroU16::new(443).unwrap()]).unwrap(),
+            dns_route, limits: limits.clone() };
+        assert_eq!(single_route(&[profile(1, DnsRoute::DedicatedDnsBroker), profile(2, DnsRoute::DedicatedDnsBroker)]).unwrap(),
+            DnsRoute::DedicatedDnsBroker);
+        assert!(single_route(&[]).is_err());
+        assert!(single_route(&[profile(1, DnsRoute::ResolvedVarlink), profile(2, DnsRoute::DedicatedDnsBroker)]).is_err());
+        let mut invalid = profile(1, DnsRoute::ResolvedVarlink);
+        invalid.allowed_connect_ports = duduclaw_isolation::bounded::List::new(vec![]).unwrap();
+        assert!(single_route(&[invalid]).is_err());
+        // The installer's document shape: extra top-level members are egress's;
+        // a profile's shape is strict, and the route spelling is the product's.
+        let document = serde_json::json!({ "profiles": [profile(1, DnsRoute::DedicatedDnsBroker)], "run_caps": {}, "max_runs": 1 });
+        assert_eq!(document["profiles"][0]["dns_route"], "dedicated_dns_broker");
+        let configuration: EgressConfiguration = serde_json::from_value(document.clone()).unwrap();
+        assert_eq!(single_route(&configuration.profiles).unwrap(), DnsRoute::DedicatedDnsBroker);
+        let mut legacy = document.clone(); legacy["profiles"][0]["dns_route"] = "dedicated_broker".into();
+        assert!(serde_json::from_value::<EgressConfiguration>(legacy).is_err());
+        let mut extra = document; extra["profiles"][0]["ready"] = true.into();
+        assert!(serde_json::from_value::<EgressConfiguration>(extra).is_err());
+    }
+
+    /// R6 on a real installed host: for every employee entitled to a ranged
+    /// (policy v3) Claude runtime in the live root publication, nothing the
+    /// gateway can ask for exceeds the signed maximum or the employee's root
+    /// ceiling, and a request above either is refused rather than clamped.
+    /// The real run chain (`tests/claude_chain.rs`) passes the same value.
+    #[test]
+    #[ignore = "requires root native Linux installed protected host with a policy v3 Claude runtime"]
+    fn iso_root_e2e_max_turns_entitlement_narrows_only() {
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        let (_, gid) = crate::server::gateway_identity().unwrap();
+        let publication = GatewayPublication::read(gid).expect("fresh installed signed root publication");
+        let policy = publication.policy().unwrap();
+        let mut checked = 0;
+        for entitlement in &publication.entitlements {
+            let Ok((claude, _)) = policy.derive(entitlement.employee, &RuntimeKind::Claude, false) else { continue };
+            let Some(limit) = claude.turn_limit else { continue };
+            let employee = entitlement.employee;
+            let cap = entitlement.max_turns.unwrap_or(limit.max).min(limit.max);
+            for desired in [u64::MAX, u64::from(limit.max) + 1, u64::from(limit.default), 50] {
+                let request = crate::policy::narrowed_request(limit, entitlement.max_turns, desired);
+                match policy.max_turns(employee, claude, Some(request)) {
+                    Ok(value) => assert!(value == Some(request) && request <= cap),
+                    Err(_) => assert!(request < limit.min),
+                }
+            }
+            assert!(policy.max_turns(employee, claude, Some(limit.max.saturating_add(1))).is_err());
+            if cap < limit.max { assert!(policy.max_turns(employee, claude, Some(cap + 1)).is_err()); }
+            match policy.max_turns(employee, claude, None) {
+                Ok(Some(value)) => assert!(limit.min <= value && value <= cap),
+                Ok(None) => panic!("a ranged record always yields a value"),
+                Err(_) => assert!(cap < limit.min),
+            }
+            checked += 1;
+        }
+        assert!(checked > 0, "no employee is entitled to a policy v3 ranged Claude runtime on this host");
+    }
+
 }
 
 #[cfg(test)]
@@ -857,3 +1455,10 @@ mod root_acceptance;
 #[cfg(test)]
 #[path = "installed_account_root_tests.rs"]
 mod account_root_acceptance;
+
+/// R7d: the isolation policy generator behind `duduclaw-isolation-policy`
+/// (feature `policy-tool`, never a release binary). A child module so it runs
+/// this module's own readers and checks on its output, never copies of them.
+#[cfg(any(feature = "policy-tool", test))]
+#[path = "installed_policy_tool.rs"]
+pub mod policy_tool;

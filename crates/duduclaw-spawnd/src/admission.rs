@@ -5,6 +5,7 @@ use duduclaw_isolation::{bounded::List, execution::{RunHandle, RunOutcome, Runti
         QueueStatus, RunReservation, RunStatus, SpawnRequest, SpawnResponse, WorkAnchorIdentity, WorkFileMetadata,
         WorkPath, DEFAULT_QUEUE_LENGTH, MAX_STOPPED_RUNS, HelperCallId, SpawndFeatures}};
 use crate::Result;
+use crate::start_refusal::{self, at, Blocker, Gate, Labelled, StartStep};
 
 #[path = "admission_helpers.rs"]
 mod helpers;
@@ -60,6 +61,87 @@ pub struct BrokerOutcome { pub response: SpawnResponse, pub file: Option<std::fs
 impl BrokerOutcome {
     fn error(code: ErrorCode) -> Self { Self { response: SpawnResponse::Error { code }, file: None, detail: None } }
     fn reply(response: SpawnResponse) -> Self { Self { response, file: None, detail: None } }
+}
+
+/// R6 per-generation update drain barrier, shared by the root update endpoint
+/// (`update_control`) and the single-owner admission loop. While closed, every
+/// new `StartRun` is refused; runs admitted before the closure (queued or
+/// running) are kept and run to completion. Only `update_control` closes or
+/// lifts it, and only after the durable record (`drain.json`) says the same:
+/// closed after the record is written, lifted only by `Resume` of the recorded
+/// generation after the record is removed. A record that cannot be read at
+/// start closes it as [`DrainClosure::Unreadable`], which no `Resume` lifts.
+#[derive(Clone, Default)]
+pub struct DrainBarrier(std::sync::Arc<(std::sync::Mutex<BarrierState>, std::sync::Condvar)>);
+#[derive(Default)]
+struct BarrierState { closed: Option<DrainClosure>, epoch: u64, observed: Option<DrainObservation> }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrainClosure {
+    Generation(duduclaw_isolation::ids::Sha256Digest),
+    /// A record exists but could not be read or parsed: closed, generation unknown.
+    Unreadable,
+    /// The publication journal (`publish.json`) could not be completed or read at
+    /// start: the installed components may be a mixed set. Like `Unreadable`, no
+    /// `Resume` lifts it; a `Drain` re-keys it, and `Resume` then still requires a
+    /// consistent journal.
+    Recovery,
+}
+/// What the admission loop saw in one full iteration that began at `epoch`.
+#[derive(Clone, Copy, Debug)]
+pub struct DrainObservation {
+    pub epoch: u64,
+    /// Admitted runs: queued, starting, running or draining.
+    pub admitted_runs: usize,
+    /// The iteration's admission tick succeeded (process scan and host checks).
+    pub healthy: bool,
+    pub at: std::time::Instant,
+}
+impl DrainBarrier {
+    /// A poisoned lock is treated as closed with an unknown generation.
+    pub fn closure(&self) -> Option<DrainClosure> {
+        match self.0.0.lock() { Ok(state) => state.closed, Err(_) => Some(DrainClosure::Unreadable) }
+    }
+    pub fn is_closed(&self) -> bool { self.closure().is_some() }
+    /// Close (or re-key) the barrier; returns the new epoch. `None`: the state
+    /// is unusable, and the caller must not report the barrier as closed.
+    pub fn close(&self, closure: DrainClosure) -> Option<u64> {
+        let mut state = self.0.0.lock().ok()?;
+        state.epoch = state.epoch.checked_add(1)?;
+        state.closed = Some(closure);
+        Some(state.epoch)
+    }
+    /// Lift a barrier closed for exactly `generation`; an open barrier stays open.
+    /// An unreadable closure or another generation's closure is never lifted.
+    pub fn open(&self, generation: duduclaw_isolation::ids::Sha256Digest) -> bool {
+        let Ok(mut state) = self.0.0.lock() else { return false };
+        match state.closed {
+            None => true,
+            Some(DrainClosure::Generation(closed)) if closed == generation => { state.closed = None; true }
+            Some(_) => false,
+        }
+    }
+    /// The epoch the admission loop records at the start of an iteration.
+    pub fn epoch(&self) -> u64 { self.0.0.lock().map(|state| state.epoch).unwrap_or(u64::MAX) }
+    /// Called by the admission loop once per iteration, after its admissions.
+    pub fn observe(&self, epoch: u64, admitted_runs: usize, healthy: bool) {
+        let Ok(mut state) = self.0.0.lock() else { return };
+        if state.observed.is_some_and(|previous| previous.epoch > epoch) { return; }
+        state.observed = Some(DrainObservation { epoch, admitted_runs, healthy, at: std::time::Instant::now() });
+        self.0.1.notify_all();
+    }
+    pub fn last_observation(&self) -> Option<DrainObservation> { self.0.0.lock().ok()?.observed }
+    /// Wait (bounded) for an iteration that began at or after `epoch` and was
+    /// recorded at or after `after`. `None` on timeout or an unusable state.
+    pub fn wait_observation(&self, epoch: u64, after: std::time::Instant, timeout: std::time::Duration)
+        -> Option<DrainObservation> {
+        let deadline = std::time::Instant::now().checked_add(timeout)?;
+        let mut state = self.0.0.lock().ok()?;
+        loop {
+            if let Some(observed) = state.observed.filter(|o| o.epoch >= epoch && o.at >= after) { return Some(observed); }
+            let remaining = deadline.checked_duration_since(std::time::Instant::now()).filter(|r| !r.is_zero())?;
+            state = self.0.1.wait_timeout(state, remaining).ok()?.0;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -122,6 +204,23 @@ pub trait Host {
     fn detect_intruders(&mut self) -> Result<Vec<EmployeeId>>;
     /// Drop retained I/O and release systemd references after cleanup/expiry.
     fn forget(&mut self, run: RunHandle) -> Result<()>;
+    /// R8y: [`Self::ready`] with the gate that refused. The default labels
+    /// every refusal `host_gate`; the production adapter (`LinuxHost`)
+    /// overrides it with its own gates and derives `ready` from it.
+    fn ready_step(&mut self, employee: EmployeeId) -> Labelled<()> {
+        self.ready(employee).map_err(start_refusal::gate(Gate::Host))
+    }
+    /// R8y: [`Self::policy`] with the step that refused (default `host_policy`).
+    fn policy_step(&mut self, employee: EmployeeId, runtime: &RuntimeKind, pty: bool) -> Labelled<LaunchPolicy> {
+        self.policy(employee, runtime, pty).map_err(start_refusal::at(StartStep::HostPolicy))
+    }
+    /// R8y: [`Self::start`]'s synchronous refusal with its step (default
+    /// `host_start`). Refusals inside an asynchronous start are labelled and
+    /// printed by the adapter that runs it (`Core::start`).
+    fn start_step(&mut self, run: RunHandle, employee: EmployeeId, request: &SpawnRequest,
+        policy: &LaunchPolicy, inputs: Self::Inputs) -> Labelled<()> {
+        self.start(run, employee, request, policy, inputs).map_err(start_refusal::at(StartStep::HostStart))
+    }
     /// Adapter background work; never called on the control socket thread.
     fn maintenance(&mut self) -> Result<()> { Ok(()) }
     /// Confirmed allocation, compensation, read-back and retire (F6l). The
@@ -129,6 +228,19 @@ pub trait Host {
     fn allocation(&mut self, _: &duduclaw_migration::allocation::Request)
         -> std::result::Result<duduclaw_migration::allocation::Reply, duduclaw_migration::allocation::ErrorCode> {
         Err(duduclaw_migration::allocation::ErrorCode::IsolationUnavailable)
+    }
+    /// R8y review round 1 (F1): publish the admission view (the same full
+    /// refresh the periodic path runs: registry, policy reload, report) on
+    /// the lifecycle thread, AFTER an allocation action and BEFORE its reply
+    /// is sent (`WorkerHost`'s lifecycle loop; `publishes_view`). An adapter
+    /// without a published view has nothing to do.
+    fn publish_view(&mut self) {}
+    /// R8r-2: a schema-5 `provision_providers` (gateway or host root), on the
+    /// same lifecycle worker. The request is owned: its payload is wiped
+    /// when it is dropped. Missing implementation ⇒ refuse.
+    fn providers(&mut self, _: Box<duduclaw_migration::allocation::providers::ProviderRequest>)
+        -> std::result::Result<duduclaw_migration::allocation::providers::Provisioned, duduclaw_migration::allocation::providers::ProviderErrorCode> {
+        Err(duduclaw_migration::allocation::providers::ProviderErrorCode::IsolationUnavailable)
     }
     /// H4 synchronous broker step. Called only on an adapter's own lifecycle
     /// thread, never on the control socket thread. Missing broker ⇒ refuse.
@@ -229,6 +341,8 @@ struct Entry<I> {
     io_taken: bool,
     pty_activity_ms: u64,
     initial_pty_size: Option<PtySize>,
+    /// R8y: what last held this queued run back (journal label only).
+    blocked: Blocker,
 }
 impl<I> Entry<I> {
     fn active(&self) -> bool {
@@ -259,6 +373,22 @@ pub struct Coordinator<H: Host> {
     stopping: BTreeMap<EmployeeId, usize>,
     /// HX4 per-run helper calls (FIFO, call ids, outcomes); never an admission entry.
     helpers: BTreeMap<RunId, helpers::RunHelpers<H::Inputs>>,
+    /// R6 update drain barrier (`None`: no update endpoint, e.g. unit tests).
+    drain: Option<DrainBarrier>,
+    /// R8y: start refusals not yet printed (the server drains them every
+    /// iteration, `take_refusal_counts`, into its rate limiter). R8y review
+    /// round 1 (F2): aggregated as (step, count) in first-seen order, so a
+    /// burst is never dropped; at most one entry per label of the closed set
+    /// (`start_refusal::label_bound`).
+    refusals: Vec<(StartStep, u64)>,
+}
+/// R8y review round 1 (F2): one more `step` in the pending tally (a free
+/// function so a field borrow of `entries` may be live at the call).
+fn tally_refusal(refusals: &mut Vec<(StartStep, u64)>, step: StartStep) {
+    match refusals.iter_mut().find(|(pending, _)| *pending == step) {
+        Some((_, count)) => *count = count.saturating_add(1),
+        None => refusals.push((step, 1)),
+    }
 }
 impl<H: Host> Coordinator<H> {
     pub fn new(host: H, limits: Limits) -> Result<Self> {
@@ -270,7 +400,31 @@ impl<H: Host> Coordinator<H> {
         }
         Ok(Self { host, limits, entries: BTreeMap::new(), sequence: 0,
             last_now: 0, last_scan: None, scan_ok: false,
-            tickets: BTreeMap::new(), next_ticket: 0, stopping: BTreeMap::new(), helpers: BTreeMap::new() })
+            tickets: BTreeMap::new(), next_ticket: 0, stopping: BTreeMap::new(), helpers: BTreeMap::new(), drain: None,
+            refusals: Vec::new() })
+    }
+    /// R8y: record one refused start (printed by the server as
+    /// `start refused: step=<label>`, rate limited). Never dropped (F2).
+    pub fn note_refusal(&mut self, step: StartStep) { tally_refusal(&mut self.refusals, step); }
+    /// R8y: the refused starts recorded since the last call, one (step,
+    /// count) per label, in first-seen order.
+    pub fn take_refusal_counts(&mut self) -> Vec<(StartStep, u64)> { std::mem::take(&mut self.refusals) }
+    /// Tests: [`Self::take_refusal_counts`] with every occurrence listed.
+    #[cfg(test)]
+    pub fn take_refusals(&mut self) -> Vec<StartStep> {
+        self.take_refusal_counts().into_iter().flat_map(|(step, count)| std::iter::repeat_n(step, count as usize)).collect()
+    }
+    fn refused<T>(&mut self, result: Labelled<T>) -> Result<T> {
+        result.map_err(|refusal| { self.note_refusal(refusal.step); refusal.code() })
+    }
+    /// R6: refuse new `StartRun` admissions while the update barrier is closed.
+    pub fn set_drain_barrier(&mut self, barrier: DrainBarrier) { self.drain = Some(barrier); }
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn host_mut_for_test(&mut self) -> &mut H { &mut self.host }
+    /// R6: runs the drain must wait for (queued, starting, running, draining).
+    /// Reservations without a `StartRun` are not runs.
+    pub fn admitted_runs(&self) -> usize {
+        self.entries.values().filter(|entry| entry.state == AdmissionState::Queued || entry.active()).count()
     }
     fn host_ticket(&mut self) -> Result<Ticket> {
         self.next_ticket = self.next_ticket.checked_add(1).ok_or(ErrorCode::ResourceLimit)?;
@@ -456,43 +610,63 @@ impl<H: Host> Coordinator<H> {
     fn owned(&self, run: RunHandle, connection: ControlConnectionId) -> Result<&Entry<H::Inputs>> {
         self.entries.get(&run.0).filter(|entry| entry.connection == connection).ok_or(ErrorCode::NotFound)
     }
+    /// A refusal is recorded (`note_refusal`) with its step; the wire code is
+    /// the one the exit returned before R8y.
     pub fn reserve(&mut self, connection: ControlConnectionId, employee: EmployeeId,
         random_run: RunHandle, now: u64) -> Result<SpawnResponse> {
-        self.time(now)?;
+        let result = self.reserve_labelled(connection, employee, random_run, now);
+        self.refused(result)
+    }
+    fn reserve_labelled(&mut self, connection: ControlConnectionId, employee: EmployeeId,
+        random_run: RunHandle, now: u64) -> Labelled<SpawnResponse> {
+        self.time(now).map_err(at(StartStep::Clock))?;
         // H4: no new run for an employee whose runs are being stopped (F6 S13).
-        if self.stopping.contains_key(&employee) { return Err(ErrorCode::NotReady); }
-        self.host.ready(employee)?;
+        if self.stopping.contains_key(&employee) { return Err(at(StartStep::Stopping)(ErrorCode::NotReady)); }
+        self.host.ready_step(employee)?;
         // The random id is generated by the daemon, never copied from a frame.
-        if self.entries.contains_key(&random_run.0) { return Err(ErrorCode::Internal); }
+        if self.entries.contains_key(&random_run.0) { return Err(at(StartStep::Reservation)(ErrorCode::Internal)); }
         if self.entries.len() >= self.limits.host_requests || self.entries.values()
             .filter(|entry| entry.employee == employee && !entry.terminal()).count() >= self.limits.employee_queue as usize {
-            return Err(ErrorCode::QueueFull);
+            return Err(at(StartStep::QueueFull)(ErrorCode::QueueFull));
         }
-        let reservation = RunReservation::new(random_run, employee, connection, now).map_err(|_| ErrorCode::Internal)?;
+        let reservation = RunReservation::new(random_run, employee, connection, now)
+            .map_err(|_| at(StartStep::Reservation)(ErrorCode::Internal))?;
         let expires = reservation.expires_at_unix_ms();
-        self.sequence = self.sequence.checked_add(1).ok_or(ErrorCode::ResourceLimit)?;
+        self.sequence = self.sequence.checked_add(1).ok_or(at(StartStep::Reservation)(ErrorCode::ResourceLimit))?;
         self.entries.insert(random_run.0, Entry { employee, connection, reservation, state: AdmissionState::Reserved,
             request: None, policy: None, inputs: None, input_bytes: 0, input_descriptors: 0, sequence: self.sequence,
-            deadline: expires, started: 0, terminal_at: 0, outcome: None, io_taken: false, pty_activity_ms: 0, initial_pty_size: None });
+            deadline: expires, started: 0, terminal_at: 0, outcome: None, io_taken: false, pty_activity_ms: 0, initial_pty_size: None,
+            blocked: Blocker::Unexamined });
         // [F17, H4] the same feature set the readiness report carries.
         Ok(SpawnResponse::Reserved { run: random_run, expires_at_unix_ms: expires, features: self.host.features() })
     }
+    /// A refusal is recorded (`note_refusal`) with its step; the wire code is
+    /// the one the exit returned before R8y.
     pub fn start(&mut self, connection: ControlConnectionId, request: SpawnRequest, inputs: H::Inputs,
         now: u64) -> Result<SpawnResponse> {
-        self.time(now)?;
-        request.validate().map_err(|_| ErrorCode::InvalidRequest)?;
+        let result = self.start_labelled(connection, request, inputs, now);
+        self.refused(result)
+    }
+    fn start_labelled(&mut self, connection: ControlConnectionId, request: SpawnRequest, inputs: H::Inputs,
+        now: u64) -> Labelled<SpawnResponse> {
+        self.time(now).map_err(at(StartStep::Clock))?;
+        // R6 review round, finding 4: a step limit outside the wire bound is
+        // the closed `StepLimitDenied`; every other refusal `InvalidRequest`.
+        request.validation_code().map_err(at(StartStep::Request))?;
+        // R6: validation wins over the closed update barrier; queued runs stay.
+        if self.drain.as_ref().is_some_and(DrainBarrier::is_closed) { return Err(at(StartStep::UpdateDrain)(ErrorCode::NotReady)); }
         let SpawnRequest::StartRun { run, employee_id, ref runtime_request, prompt_bytes, ref input_fds, pty, .. } = request
-            else { return Err(ErrorCode::InvalidRequest); };
-        let entry = self.owned(run, connection)?;
+            else { return Err(at(StartStep::Request)(ErrorCode::InvalidRequest)); };
+        let entry = self.owned(run, connection).map_err(at(StartStep::NotReserved))?;
         if entry.employee != employee_id || entry.state != AdmissionState::Reserved || now >= entry.deadline {
-            return Err(ErrorCode::InvalidRequest);
+            return Err(at(StartStep::Reservation)(ErrorCode::InvalidRequest));
         }
         let initial_size = entry.initial_pty_size;
-        if !pty && initial_size.is_some() { return Err(ErrorCode::InvalidRequest); }
-        let mut policy = self.host.policy(employee_id, runtime_request, pty)?;
+        if !pty && initial_size.is_some() { return Err(at(StartStep::Pty)(ErrorCode::InvalidRequest)); }
+        let mut policy = self.host.policy_step(employee_id, runtime_request, pty)?;
         if let Some(size) = initial_size { policy.pty_size = Some(size); }
-        policy.validate()?;
-        if policy.delivery.pty != pty { return Err(ErrorCode::RuntimeDenied); }
+        policy.validate().map_err(at(StartStep::LaunchPolicy))?;
+        if policy.delivery.pty != pty { return Err(at(StartStep::Pty)(ErrorCode::RuntimeDenied)); }
         let input_bytes = input_fds.as_slice().iter().fold(prompt_bytes, |sum, input| sum + match input {
             duduclaw_isolation::ipc::InputFd::SealedMemfd { bytes }
             | duduclaw_isolation::ipc::InputFd::ReadOnlySnapshot { bytes } => *bytes,
@@ -500,14 +674,16 @@ impl<H: Host> Coordinator<H> {
         // HX4: queued/starting helper memfds share these budgets.
         let (helper_bytes, helper_fds) = self.helper_held();
         let pending: u64 = self.entries.values().map(|entry| entry.input_bytes).sum::<u64>().saturating_add(helper_bytes);
-        if input_bytes > self.limits.pending_input_bytes.saturating_sub(pending) { return Err(ErrorCode::ResourceLimit); }
-        let descriptors = request.fd_plan().map_err(|_| ErrorCode::InvalidRequest)?.len();
+        if input_bytes > self.limits.pending_input_bytes.saturating_sub(pending) {
+            return Err(at(StartStep::InputBytes)(ErrorCode::ResourceLimit));
+        }
+        let descriptors = request.fd_plan().map_err(|_| at(StartStep::Request)(ErrorCode::InvalidRequest))?.len();
         let held: usize = self.entries.values().map(|entry| entry.input_descriptors).sum::<usize>() + helper_fds;
-        if descriptors > self.limits.input_descriptors.saturating_sub(held) { return Err(ErrorCode::ResourceLimit); }
-        let deadline = now.checked_add(policy.queue_ms).ok_or(ErrorCode::InvalidRequest)?;
-        let entry = self.entries.get_mut(&run.0).ok_or(ErrorCode::NotFound)?;
-        entry.reservation.consume(employee_id, connection, now).map_err(|_| ErrorCode::InvalidRequest)?;
-        entry.transition(AdmissionState::Queued, None)?;
+        if descriptors > self.limits.input_descriptors.saturating_sub(held) { return Err(at(StartStep::InputFds)(ErrorCode::ResourceLimit)); }
+        let deadline = now.checked_add(policy.queue_ms).ok_or(at(StartStep::LaunchPolicy)(ErrorCode::InvalidRequest))?;
+        let entry = self.entries.get_mut(&run.0).ok_or(at(StartStep::NotReserved)(ErrorCode::NotFound))?;
+        entry.reservation.consume(employee_id, connection, now).map_err(|_| at(StartStep::Reservation)(ErrorCode::InvalidRequest))?;
+        entry.transition(AdmissionState::Queued, None).map_err(at(StartStep::Internal))?;
         entry.deadline = deadline;
         entry.policy = Some(policy);
         entry.inputs = Some(inputs);
@@ -515,7 +691,7 @@ impl<H: Host> Coordinator<H> {
         entry.input_descriptors = descriptors;
         entry.request = Some(request);
         // Always return an asynchronous handle; tick performs admission separately.
-        Ok(SpawnResponse::Accepted { run, status: self.status(run, connection)? })
+        Ok(SpawnResponse::Accepted { run, status: self.status(run, connection).map_err(at(StartStep::Internal))? })
     }
     pub fn status(&self, run: RunHandle, connection: ControlConnectionId) -> Result<RunStatus> {
         let entry = self.owned(run, connection)?;
@@ -615,7 +791,11 @@ impl<H: Host> Coordinator<H> {
         if entry.terminal() { return Ok(()); }
         if entry.active() { return self.drain(run, RunOutcome::Cancelled); }
         let entry = self.entries.get_mut(&run.0).ok_or(ErrorCode::NotFound)?;
+        // R8y: a queued run spawnd was holding back is reported with its blocker.
+        let held = (entry.state == AdmissionState::Queued && entry.blocked != Blocker::Unexamined).then_some(entry.blocked);
         entry.transition(AdmissionState::Cancelled, None)?;
+        if let Some(blocker) = held { self.note_refusal(StartStep::QueueCancelled(blocker)); }
+        let entry = self.entries.get_mut(&run.0).ok_or(ErrorCode::NotFound)?;
         entry.inputs = None;
         entry.input_bytes = 0;
         entry.input_descriptors = 0;
@@ -657,14 +837,22 @@ impl<H: Host> Coordinator<H> {
             let entry = self.entries.get_mut(&id).ok_or(ErrorCode::Internal)?;
             match entry.state {
                 AdmissionState::Reserved | AdmissionState::Queued if now >= entry.deadline => {
+                    // R8y: a queued run that never started is a refused start.
+                    let refused = (entry.state == AdmissionState::Queued).then_some(StartStep::QueueTimeout(entry.blocked));
                     entry.transition(AdmissionState::Expired, None)?;
                     entry.inputs = None; entry.input_bytes = 0; entry.input_descriptors = 0; entry.terminal_at = now;
                     entry.outcome = Some(RunOutcome::QueueTimeout);
+                    if let Some(step) = refused { self.note_refusal(step); }
                 }
                 AdmissionState::Starting | AdmissionState::Running => {
                     let policy = entry.policy.as_ref().ok_or(ErrorCode::Internal)?;
                     let budget = if entry.state == AdmissionState::Starting { policy.startup_ms } else { policy.runtime_ms };
                     let expired = now.saturating_sub(entry.started) >= budget;
+                    // R8y: Running never reached within the startup budget.
+                    // (A field borrow: `entry` and `policy` borrow `self.entries`.)
+                    if expired && entry.state == AdmissionState::Starting {
+                        tally_refusal(&mut self.refusals, StartStep::StartupTimeout);
+                    }
                     let progress = self.host.poll(run);
                     let reason = if expired { Some(RunOutcome::RuntimeTimeout) } else { match progress {
                         Ok(HostProgress::Starting) if entry.state == AdmissionState::Starting => None,
@@ -702,31 +890,54 @@ impl<H: Host> Coordinator<H> {
         }
         // HX4: host events, drops for runs that left Running, then the queues.
         self.tick_helpers(now);
-        if !self.scan_ok { return Err(ErrorCode::IsolationUnavailable); }
+        if !self.scan_ok {
+            // R8y: what holds every queued run back this tick.
+            for entry in self.entries.values_mut().filter(|e| e.state == AdmissionState::Queued) {
+                entry.blocked = Blocker::Gate(Gate::ScanFailed);
+            }
+            return Err(ErrorCode::IsolationUnavailable);
+        }
         let mut candidates: Vec<_> = self.entries.iter().filter(|(_, e)| e.state == AdmissionState::Queued)
             .map(|(id, e)| (Self::priority(e), *id)).collect();
         candidates.sort();
-        for (_, id) in candidates {
-            if self.entries.values().filter(|e| e.active()).count() >= self.limits.host_runs { break; }
+        // R8y: each `continue`/`break` records what held the run back
+        // (`Entry::blocked`); it is printed only if the run then expires or
+        // is cancelled while queued (`queue_timeout(..)`/`queue_cancelled(..)`).
+        for (index, &(_, id)) in candidates.iter().enumerate() {
+            if self.entries.values().filter(|e| e.active()).count() >= self.limits.host_runs {
+                // R8y review round 1 (F3): this run AND every run still queued
+                // behind it are held by the host run limit (not a stale blocker).
+                for &(_, held) in &candidates[index..] { self.block(held, Blocker::HostRuns); }
+                break;
+            }
             let entry = self.entries.get(&id).ok_or(ErrorCode::Internal)?;
-            if self.entries.values().any(|e| e.employee == entry.employee && e.active()) { continue; }
+            let employee = entry.employee;
+            if self.entries.values().any(|e| e.employee == employee && e.active()) { self.block(id, Blocker::EmployeeBusy); continue; }
             let ptys: u32 = self.entries.values().filter(|e| e.active()).filter_map(|e| e.policy.as_ref()).map(|p| p.ptys as u32).sum();
             let policy = entry.policy.as_ref().ok_or(ErrorCode::Internal)?;
-            if policy.ptys as u32 > self.limits.host_ptys.saturating_sub(ptys) { continue; }
+            if policy.ptys as u32 > self.limits.host_ptys.saturating_sub(ptys) { self.block(id, Blocker::HostPtys); continue; }
             // Fresh /proc/lockdown/storage checks for EVERY admission, not just the periodic scan.
-            if self.host.ready(entry.employee).is_err() { continue; }
-            let Ok(proof) = self.host.cleanup(entry.employee, None) else { continue; };
-            if !proof.complete() { continue; }
+            if let Err(refusal) = self.host.ready_step(employee) { self.block(id, Blocker::Gate(refusal.gate())); continue; }
+            let proof = match self.host.cleanup(employee, None) {
+                Ok(proof) => proof,
+                Err(_) => { self.block(id, Blocker::Cleanup); continue; }
+            };
+            if !proof.complete() { self.block(id, Blocker::CleanupIncomplete); continue; }
             let entry = self.entries.get_mut(&id).ok_or(ErrorCode::Internal)?;
             entry.transition(AdmissionState::Starting, Some(proof))?;
             entry.started = now;
             let inputs = entry.inputs.take().ok_or(ErrorCode::Internal)?;
-            if self.host.start(RunHandle(id), entry.employee, entry.request.as_ref().ok_or(ErrorCode::Internal)?,
-                entry.policy.as_ref().ok_or(ErrorCode::Internal)?, inputs).is_err() {
+            let started = self.host.start_step(RunHandle(id), entry.employee, entry.request.as_ref().ok_or(ErrorCode::Internal)?,
+                entry.policy.as_ref().ok_or(ErrorCode::Internal)?, inputs);
+            if let Err(refusal) = started {
+                self.note_refusal(refusal.step);
                 let _ = self.drain(RunHandle(id), RunOutcome::IsolationFailure);
             }
         }
         Ok(())
+    }
+    fn block(&mut self, id: RunId, blocker: Blocker) {
+        if let Some(entry) = self.entries.get_mut(&id) { entry.blocked = blocker; }
     }
 }
 

@@ -360,7 +360,11 @@ export type IsolationComponentState = 'ready' | 'unavailable' | 'pending_integra
 export type IsolationReasonCode = 'binding_evidence_missing' | 'connector_setup_required' |
   'personal_binding_conflict' | 'revoked' | 'service_unavailable' |
   'workspace_broker_unavailable' | 'helper_launcher_unavailable' | 'helper_runtime_missing' |
-  'helper_recording_unsupported';
+  'helper_recording_unsupported' |
+  /** v1.83: a data migration waits for administrator confirmation (action required). */
+  'migration_pending' |
+  /** v1.83: the kernel's Landlock ABI was clamped to the highest known one (notice only). */
+  'landlock_abi_clamped';
 export interface IsolationReason {
   code: IsolationReasonCode;
   /** Connector provider family (only for `connector_setup_required`). */
@@ -382,6 +386,15 @@ export interface IsolationReadiness {
   employees?: Array<{ label: string; ready: boolean; reasons: IsolationReason[] }>;
   /** Informational host-wide reasons no protected employee's tools need now. */
   notices?: IsolationReason[];
+  /** v1.83 R8m: the gateway's boot assembly's missing producers (fixed snake_case
+   *  names, e.g. `connector_providers`); the same list `duduclaw service readiness
+   *  --protected-linux` prints. Absent on older gateways. */
+  assembly_missing?: string[];
+  /** v1.83 R8n-1: each not-ready component's fixed reason name (e.g.
+   *  `parse_worker: 'socket_not_listening'`, `mcp_boundary: 'pending_integration'`),
+   *  as in the root CLI's view. Ready components are absent. Absent on older gateways. */
+  component_reasons?: Partial<Record<'launch_service' | 'sandbox' | 'network' | 'storage' |
+    'parse_worker' | 'update_service' | 'mcp_boundary' | 'runtime_adapters', string>>;
   correlation_id?: string;
   components: Record<'launch_service' | 'sandbox' | 'network' | 'storage' |
     'parse_worker' | 'update_service' | 'mcp_boundary' | 'runtime_adapters', IsolationComponentState>;
@@ -6385,6 +6398,36 @@ export interface ProtectedConnectorList extends ProtectedStepUpState {
   routes: ProtectedConnectorRoute[];
   next: string | null;
 }
+/** Model provider documents: status contains only dashboard-recorded metadata. */
+export type ProtectedProviderProtocol = 'chat_completions' | 'responses' | 'anthropic' | 'gemini';
+export interface ProtectedProviderInput {
+  name: string;
+  base_url: string;
+  api_key: string;
+  protocol?: ProtectedProviderProtocol;
+}
+export interface ProtectedProviderEmployee {
+  employee_id: string;
+  label: string;
+  kind: 'personal' | 'shared';
+  provisioned: boolean;
+  providers: { name: string; protocol: ProtectedProviderProtocol; origin: string }[];
+  source?: 'dashboard';
+  updated_unix?: number;
+}
+export interface ProtectedProviderStatus extends ProtectedStepUpState {
+  employees: ProtectedProviderEmployee[];
+  next: string | null;
+  hidden_personal: number | null;
+  personal_revealed: boolean;
+  visibility: 'dashboard_changes_only';
+}
+export interface ProtectedProviderResult {
+  provisioned: boolean;
+  updated_unix: number;
+  result: 'recorded' | 'not_recorded';
+  audit?: 'incomplete';
+}
 /** Reference-only details: there is no field for a token, password or URL. */
 export interface ProtectedConnectorDetails {
   employee: string;
@@ -10094,6 +10137,12 @@ export const api = {
       client.call('isolation.employee_purge_requests', { csrf_token: csrf }) as Promise<{ purged: number; index_rows_removed: number }>,
     connectorList: (after?: string) =>
       client.call('isolation.connector_list', after ? { after } : {}) as Promise<ProtectedConnectorList>,
+    providerStatus: (params: { employee_id?: string; after?: string; step_up_csrf?: number[] } = {}) =>
+      client.call('isolation.provider_status', params) as Promise<ProtectedProviderStatus>,
+    providerSet: (employeeId: string, providers: ProtectedProviderInput[], csrf: number[]) =>
+      client.call('isolation.provider_set', { employee_id: employeeId, providers, step_up_csrf: csrf }) as Promise<ProtectedProviderResult>,
+    providerClear: (employeeId: string, csrf: number[]) =>
+      client.call('isolation.provider_clear', { employee_id: employeeId, step_up_csrf: csrf }) as Promise<ProtectedProviderResult>,
     provision: (input: ProtectedConnectorProvisionInput, csrf: number[]) =>
       client.call('isolation.connector_provision', { ...input, csrf_token: csrf }) as Promise<{
         account: string;

@@ -18,6 +18,17 @@ pub enum ConfirmationError {
     /// started cannot be rejected; it stays where it was and `retry`
     /// resumes the same retire operation (UI: `RETIRE_FORWARD_ONLY`).
     #[error("retire is forward only")] ForwardOnly,
+    /// R7d: the stage effect is still pending at the root (an employee
+    /// allocation whose SSH refusal is not verified yet). `apply_next` keeps
+    /// the item `Applying` with no receipt and no compensation; the next
+    /// `apply_next` runs the same stage again. Any other step reporting it
+    /// is a failure.
+    #[error("proposal effect still pending")] Pending,
+    /// R7d round 1: [`Self::Pending`] that the caller must not wait for in
+    /// process (the root's pending-reservation cap refused a new employee;
+    /// the retry belongs to the operator / the next apply). `apply_next`
+    /// treats it exactly as `Pending` and answers `Pending`.
+    #[error("proposal effect pending at the root limit")] PendingLimit,
 }
 type Result<T> = std::result::Result<T, ConfirmationError>;
 const MAX_CONFIRMATIONS: u64 = 2048;
@@ -75,6 +86,41 @@ pub trait ProposalApplier {
     fn publish(&mut self, item: &ConfirmationItem) -> Result<()>;
     fn read_back(&mut self, item: &ConfirmationItem) -> Result<()>;
     fn disable_and_read_back(&mut self, item: &ConfirmationItem) -> Result<()>;
+}
+
+/// R7d round 4: decides whether an external effect (an adapter call) may
+/// start, and registers it as started, in ONE operation. `enter` answers
+/// `None` once the gate is closed — the effect must not start — and
+/// otherwise a permit that marks the effect in progress until it drops.
+/// Never a separate "check, then start": an implementation must test
+/// "closed" and register the effect atomically (the gateway's
+/// `ShutdownGate` does both under one lock).
+pub trait EffectGate {
+    fn enter(&self) -> Option<EffectPermit<'_>>;
+    /// A cheap peek, an optimisation only (stop before writing anything):
+    /// correctness comes from [`Self::enter`].
+    fn is_closed(&self) -> bool;
+}
+
+/// One registered effect; dropping it (after the adapter call returns, or
+/// while unwinding) marks the effect finished.
+pub struct EffectPermit<'a>(Option<Box<dyn FnOnce() + Send + 'a>>);
+impl<'a> EffectPermit<'a> {
+    /// `finished` runs once, when the permit drops.
+    pub fn new(finished: impl FnOnce() + Send + 'a) -> Self { Self(Some(Box::new(finished))) }
+    /// A permit nobody tracks ([`OpenGate`], test gates).
+    pub fn untracked() -> Self { Self(None) }
+}
+impl Drop for EffectPermit<'_> {
+    fn drop(&mut self) { if let Some(finished) = self.0.take() { finished() } }
+}
+
+/// A gate that never closes: the never-stopping [`ConfirmationStore::apply_next`],
+/// [`ConfirmationStore::retry`] and [`ConfirmationStore::reject`], and tests.
+pub struct OpenGate;
+impl EffectGate for OpenGate {
+    fn enter(&self) -> Option<EffectPermit<'_>> { Some(EffectPermit::untracked()) }
+    fn is_closed(&self) -> bool { false }
 }
 
 /// HMAC prevents low-entropy credentials being recovered from proposal digests.
@@ -333,13 +379,35 @@ impl ConfirmationStore {
     /// proposals remain writable throughout an external call.
     pub fn apply_next(&mut self, binding: &ProposalBinding,
         adapter: &mut dyn ProposalApplier) -> Result<ConfirmationItem> {
+        self.apply_next_until(binding, adapter, &OpenGate)
+    }
+
+    /// [`Self::apply_next`] that starts no new external effect once `gate`
+    /// is closed (R7d round 2–4: gateway shutdown). One call performs up to
+    /// two effects — the step (stage / publish / read back) and, when it
+    /// fails, the compensation (`disable_and_read_back`). Each adapter call
+    /// runs only inside a permit from [`EffectGate::enter`], taken after the
+    /// lock, the transaction and the intent commit; the permit drops right
+    /// after the call returns. Closed before any write (`is_closed` peek):
+    /// nothing is written. Refused by `enter`: the intent is consumed, the
+    /// item is written back exactly as this call found it (never `Failed`),
+    /// `apply_interrupted` is audited. Closed after a failed step: no
+    /// receipt, the item stays `Applying`, no compensation. Every stop
+    /// answers `Err(Pending)` and the next apply re-runs the same idempotent
+    /// step (what process death right before / after it would leave). A
+    /// successful step is still recorded.
+    pub fn apply_next_until(&mut self, binding: &ProposalBinding,
+        adapter: &mut dyn ProposalApplier, gate: &dyn EffectGate) -> Result<ConfirmationItem> {
         let _guard = effects::lock(&self.conn, binding)?;
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut item = required(&tx, binding)?;
         if item.status == ConfirmationStatus::Applied { return Ok(item); }
+        let found = item.clone();
         if item.status == ConfirmationStatus::Approved {
             item.transition(ConfirmationStatus::Applying).map_err(|_| ConfirmationError::Denied)?;
         } else if item.status != ConfirmationStatus::Applying { return Err(ConfirmationError::Denied); }
+        // Dropping `tx` rolls back: the journal is exactly as it was.
+        if gate.is_closed() { return Err(ConfirmationError::Pending); }
         let next = match step(&tx, binding)? {
             None | Some(3) => 0, Some(0) => 1, Some(1) => 2,
             _ => return Err(ConfirmationError::Stale),
@@ -347,18 +415,47 @@ impl ConfirmationStore {
         save(&tx, &item)?;
         let intent = effects::intent(&tx, &item, next)?;
         tx.commit()?;
+        // Effect gate: deciding and registering the effect is one operation.
+        let Some(running) = gate.enter() else {
+            return Err(interrupted(&mut self.conn, &item, next, &intent, &found, "apply_interrupted", None));
+        };
         let result = match next {
             0 => adapter.stage(&item), 1 => adapter.publish(&item), _ => adapter.read_back(&item),
         };
+        drop(running);
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         effects::consume(&tx, &item, next, &intent)?;
+        if next == 0 && matches!(result, Err(ConfirmationError::Pending | ConfirmationError::PendingLimit)) {
+            // R7d: attempted, still pending. No receipt (the step stays 0, so
+            // the next apply_next resumes the same stage with the same
+            // binding), not Failed, no compensation.
+            audit(&tx, &item, "apply_pending", None)?;
+            tx.commit()?;
+            return Err(ConfirmationError::Pending);
+        }
+        if result.is_err() && gate.is_closed() {
+            // R7d round 2: a failure seen after shutdown began. Compensation
+            // is a new effect and does not start; the item stays Applying
+            // with no receipt (the next apply re-runs this step, sees the
+            // failure again and compensates then).
+            audit(&tx, &item, "apply_interrupted", None)?;
+            tx.commit()?;
+            return Err(ConfirmationError::Pending);
+        }
         if result.is_err() {
             item.transition(ConfirmationStatus::Failed).map_err(|_| ConfirmationError::Invalid)?;
             save(&tx, &item)?;
             audit(&tx, &item, "failed_compensation_pending", None)?;
             let intent = effects::intent(&tx, &item, 3)?;
             tx.commit()?;
+            // Effect gate refused (shutdown began meanwhile): no compensation;
+            // the item goes back to how this call found it, with no receipt
+            // for the failed step (the next apply re-runs it, as above).
+            let Some(running) = gate.enter() else {
+                return Err(interrupted(&mut self.conn, &item, 3, &intent, &found, "apply_interrupted", None));
+            };
             let disabled = adapter.disable_and_read_back(&item).is_ok();
+            drop(running);
             let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             effects::consume(&tx, &item, 3, &intent)?;
             if disabled {
@@ -381,11 +478,27 @@ impl ConfirmationStore {
     pub fn retry(&mut self, binding: &ProposalBinding, session: &ApprovalSession,
         csrf: [u8; 32], now: u64, adapter: &mut dyn ProposalApplier,
         validator: &dyn ProposalValidator) -> Result<()> {
+        self.retry_until(binding, session, csrf, now, adapter, validator, &OpenGate)
+    }
+
+    /// [`Self::retry`] with the effect gate of [`Self::apply_next_until`]:
+    /// once `gate` is closed the compensation (`disable_and_read_back`)
+    /// does not start. Closed before any write: nothing is written. Refused
+    /// by `enter` (right before the adapter call, after the lock, the
+    /// transaction and the intent commit): the intent is consumed and
+    /// `retry_interrupted` audited. Either way the item stays `Failed` and
+    /// the answer is `Err(Pending)`; the same retry can simply be repeated.
+    #[allow(clippy::too_many_arguments)]
+    pub fn retry_until(&mut self, binding: &ProposalBinding, session: &ApprovalSession,
+        csrf: [u8; 32], now: u64, adapter: &mut dyn ProposalApplier,
+        validator: &dyn ProposalValidator, gate: &dyn EffectGate) -> Result<()> {
         session.check(&csrf, now)?;
         let _guard = effects::lock(&self.conn, binding)?;
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut item = required(&tx, binding)?;
         if item.status != ConfirmationStatus::Failed { return Err(ConfirmationError::Denied); }
+        // Dropping `tx` rolls back: the journal is exactly as it was.
+        if gate.is_closed() { return Err(ConfirmationError::Pending); }
         let intent = effects::intent(&tx, &item, 3)?;
         tx.commit()?;
         // F6 §3.12 (R14): a retire is forward only. Its compensation is a
@@ -393,7 +506,13 @@ impl ConfirmationStore {
         // retry never depends on it: the same retire operation resumes
         // (spawnd replays it idempotently from the recorded phase).
         if item.category != ConfirmationCategory::EmployeeRetire {
-            adapter.disable_and_read_back(&item).map_err(|_| ConfirmationError::Compensation)?;
+            // Effect gate: deciding and registering the effect is one operation.
+            let Some(running) = gate.enter() else {
+                return Err(interrupted(&mut self.conn, &item, 3, &intent, &item, "retry_interrupted", Some(session.actor)));
+            };
+            let disabled = adapter.disable_and_read_back(&item);
+            drop(running);
+            disabled.map_err(|_| ConfirmationError::Compensation)?;
         }
         // Disable before absence validation. Both calls are outside the writer.
         // A validation failure leaves Failed and can safely repeat compensation.
@@ -410,11 +529,28 @@ impl ConfirmationStore {
 
     pub fn reject(&mut self, binding: &ProposalBinding, session: &ApprovalSession,
         csrf: [u8; 32], now: u64, adapter: &mut dyn ProposalApplier) -> Result<()> {
+        self.reject_until(binding, session, csrf, now, adapter, &OpenGate)
+    }
+
+    /// [`Self::reject`] with the effect gate of [`Self::apply_next_until`]:
+    /// once `gate` is closed the compensation (`disable_and_read_back`)
+    /// does not start. A `Pending` item needs no effect and is rejected as
+    /// usual. Otherwise, closed before any write: nothing is written;
+    /// refused by `enter` (right before the adapter call, after the lock,
+    /// the transaction and the intent commit): the intent is consumed, the
+    /// item is written back exactly as this call found it (never `Failed`,
+    /// `Rejecting` or `Rejected` unless it already was) and
+    /// `reject_interrupted` audited. Either way the answer is `Err(Pending)`;
+    /// the same reject can simply be repeated.
+    pub fn reject_until(&mut self, binding: &ProposalBinding, session: &ApprovalSession,
+        csrf: [u8; 32], now: u64, adapter: &mut dyn ProposalApplier, gate: &dyn EffectGate) -> Result<()> {
         session.check(&csrf, now)?;
         let _guard = effects::lock(&self.conn, binding)?;
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut item = required(&tx, binding)?;
         if item.status == ConfirmationStatus::Rejected { return Ok(()); }
+        // Dropping `tx` rolls back: the journal is exactly as it was.
+        if item.status != ConfirmationStatus::Pending && gate.is_closed() { return Err(ConfirmationError::Pending); }
         // Forward only (F6 §3.12, R14): past Pending, an EmployeeRetire item
         // is rejected only when its compensation read-back says the root
         // entry is still Ready (no root effect yet); otherwise nothing moves.
@@ -434,7 +570,13 @@ impl ConfirmationStore {
         if item.status == ConfirmationStatus::Rejected { tx.commit()?; return Ok(()); }
         let intent = effects::intent(&tx, &item, 3)?;
         tx.commit()?;
-        if let Err(error) = adapter.disable_and_read_back(&item) {
+        // Effect gate: deciding and registering the effect is one operation.
+        let Some(running) = gate.enter() else {
+            return Err(interrupted(&mut self.conn, &item, 3, &intent, &before, "reject_interrupted", Some(session.actor)));
+        };
+        let disabled = adapter.disable_and_read_back(&item);
+        drop(running);
+        if let Err(error) = disabled {
             if !forward_only { return Err(ConfirmationError::Compensation); }
             let _ = error;
             // Nothing sticks in Rejecting: restore the prior state. A crash
@@ -593,6 +735,11 @@ impl ConfirmationStore {
         }
     }
 
+    /// The current status of this exact binding (`Stale` when unknown).
+    pub fn status(&self, binding: &ProposalBinding) -> Result<ConfirmationStatus> {
+        Ok(required(&self.conn, binding)?.status)
+    }
+
     pub fn apply_receipt(&self, binding: &ProposalBinding) -> Result<Option<ProposalApplyReceipt>> {
         let item = required(&self.conn, binding)?;
         let Some(value) = step(&self.conn, binding)? else { return Ok(None); };
@@ -647,6 +794,24 @@ fn step(conn: &Connection, binding: &ProposalBinding) -> Result<Option<i64>> {
         Some((digest, step)) if digest == binding.proposal_digest.0 => Ok(Some(step)),
         Some(_) => Err(ConfirmationError::Stale), None => Ok(None),
     }
+}
+/// The effect gate refused `enter` after the intent of `action` committed:
+/// the effect did not start. Consumes that intent, writes `restore` (the
+/// item as the interrupted call found it) back and audits `event`; answers
+/// the retry-safe `Pending`. Process death before this commit leaves the
+/// committed intent, the same journal as death during the effect, which the
+/// next apply / retry / reject overwrites and repeats idempotently.
+fn interrupted(conn: &mut Connection, current: &ConfirmationItem, action: i64, intent: &[u8; 16],
+    restore: &ConfirmationItem, event: &str, actor: Option<RequestId>) -> ConfirmationError {
+    let write = |conn: &mut Connection| -> Result<()> {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        effects::consume(&tx, current, action, intent)?;
+        save(&tx, restore)?;
+        audit(&tx, restore, event, actor)?;
+        tx.commit()?;
+        Ok(())
+    };
+    match write(conn) { Ok(()) => ConfirmationError::Pending, Err(error) => error }
 }
 fn receipt(conn: &Connection, item: &ConfirmationItem, step: i64) -> Result<()> {
     conn.execute("INSERT INTO migration_apply VALUES(?1,?2,?3,?4)

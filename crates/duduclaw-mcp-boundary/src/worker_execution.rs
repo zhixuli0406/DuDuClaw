@@ -37,7 +37,14 @@ pub struct WorkerReply {
 /// audience and approval gates. `finish` must apply the authorized resources at
 /// use time, and may never execute instructions or paths returned by a parser.
 pub trait WorkerPlanFactory: Send + Sync {
+    /// Usable now, for this factory's employee (and roots): tools/list and the
+    /// dispatch gate use this, so listing and calling stay exact.
     fn supports(&self, tool: &str) -> bool;
+    /// R8n-2: a producer for `tool` is installed in this process, independent
+    /// of any employee. Only the boot-time/probe producer verification uses
+    /// this (an employee-less boot factory cannot be "usable now" for an
+    /// employee-bound tool). Default: `supports`.
+    fn provides(&self, tool: &str) -> bool { self.supports(tool) }
     fn authorize_handler<'a>(&'a self, call: &'a AuthorizedToolCall) -> PolicyFuture<'a, ()>;
     fn prepare<'a>(&'a self, call: &'a AuthorizedToolCall) -> PolicyFuture<'a, WorkerPlan>;
     fn finish<'a>(&'a self, call: &'a AuthorizedToolCall, reply: WorkerReply) -> PolicyFuture<'a, Value>;
@@ -184,6 +191,8 @@ impl CompositeWorkerPlans {
 }
 impl WorkerPlanFactory for CompositeWorkerPlans {
     fn supports(&self, name: &str) -> bool { self.select(name).is_ok() }
+    /// Any member provides it (dispatch still selects by `supports`).
+    fn provides(&self, name: &str) -> bool { self.factories.iter().any(|factory| factory.provides(name)) }
     fn authorize_handler<'a>(&'a self, call: &'a AuthorizedToolCall) -> PolicyFuture<'a, ()> {
         Box::pin(async move { self.select(call.name())?.authorize_handler(call).await })
     }

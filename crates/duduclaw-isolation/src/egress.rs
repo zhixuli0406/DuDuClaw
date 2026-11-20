@@ -102,11 +102,50 @@ impl EgressProfile {
 /// connections/tunnels. Reject truncated ancillary data, unexpected cmsgs and
 /// incorrect counts, closing all received fds. Registration is one-shot for
 /// the received connection; data frames cannot replace its binding.
+///
+/// R7b: ProbeDns carries zero fds. Egress validates `name` with
+/// [`validate_dns_probe_name`], performs at most one real lookup per
+/// rate-limit window through its configured route and answers `DnsProbed`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum EgressControl {
     Register { run_id: RunId, profile_id: ProfileId },
     Unregister { run_id: RunId },
+    ProbeDns { name: String },
+}
+
+/// R7b: the one rule for the signed policy's `dns_probe_name` (policy v4),
+/// shared by spawnd's policy reader and egress's `ProbeDns` handler, and
+/// mirrored by `scripts/sign-isolation-manifest.py`: ASCII lower case,
+/// 1–253 bytes, at least two labels, each 1–63 bytes of `[a-z0-9-]` not
+/// starting or ending with `-`, no trailing dot, a last label that is not all
+/// digits (no IPv4 literal), and neither `localhost` nor a name ending in
+/// `.local`, `.internal` or `.localhost`.
+pub fn validate_dns_probe_name(name: &str) -> Result<(), ContractError> {
+    let invalid = ContractError::InvalidValue("DNS probe name");
+    if name.is_empty() || name.len() > 253 || !name.is_ascii() {
+        return Err(invalid);
+    }
+    let labels: Vec<&str> = name.split('.').collect();
+    if labels.len() < 2 {
+        return Err(invalid);
+    }
+    for label in &labels {
+        let bytes = label.as_bytes();
+        if bytes.is_empty() || bytes.len() > 63
+            || bytes.first() == Some(&b'-') || bytes.last() == Some(&b'-')
+            || !bytes.iter().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+        {
+            return Err(invalid);
+        }
+    }
+    if labels.last().is_none_or(|last| last.bytes().all(|b| b.is_ascii_digit())) {
+        return Err(invalid);
+    }
+    if name == "localhost" || [".local", ".internal", ".localhost"].iter().any(|suffix| name.ends_with(suffix)) {
+        return Err(invalid);
+    }
+    Ok(())
 }
 
 /// Root-only control framing (§4.3): exactly ipc::Envelope<EgressControl> with
@@ -117,19 +156,24 @@ pub type EgressControlFrame = crate::ipc::Envelope<EgressControl>;
 
 /// Control acknowledgement on the same versioned envelope, carrying no fds (§4.3).
 /// B must receive Registered before releasing the forwarder; a timeout denies.
+/// R7b `DnsProbed`: `route` is the route egress actually used, `resolved` that
+/// the lookup returned answers before the deadline, and `public_addresses`
+/// how many of them pass the run-time public-address filter. A failed or
+/// timed-out lookup is `resolved: false, public_addresses: 0`, not a refusal.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
 pub enum EgressControlResponse {
     Registered,
     Unregistered,
     Refused { code: EgressError },
+    DnsProbed { route: DnsRoute, resolved: bool, public_addresses: u32 },
 }
 
 impl EgressControl {
     pub const fn expected_fd_count(&self) -> usize {
         match self {
             Self::Register { .. } => 1,
-            Self::Unregister { .. } => 0,
+            Self::Unregister { .. } | Self::ProbeDns { .. } => 0,
         }
     }
 }
@@ -291,6 +335,63 @@ mod tests {
             },
         };
         assert_eq!(EgressFrame::decode_payload(&serde_json::to_vec(&frame).unwrap(), &limits()).unwrap(), frame);
+    }
+
+    /// R7b: the probe request and its answer round-trip through the control
+    /// envelope; neither carries descriptors; unknown variants and fields are refused.
+    #[test]
+    fn egress_dns_probe_round_trip_and_unknown_variants_refused() {
+        let request = EgressControl::ProbeDns { name: "api.example.com".into() };
+        assert_eq!(request.expected_fd_count(), 0);
+        let frame = EgressControlFrame { version: crate::ipc::PROTOCOL_VERSION, request_id: crate::ids::RequestId([4; 16]),
+            message: request.clone() };
+        assert_eq!(crate::ipc::decode::<EgressControl>(&crate::ipc::encode(&frame).unwrap()).unwrap(), frame);
+        assert_eq!(serde_json::to_value(&request).unwrap(), serde_json::json!({"type": "probe_dns", "name": "api.example.com"}));
+        for response in [
+            EgressControlResponse::DnsProbed { route: DnsRoute::ResolvedVarlink, resolved: true, public_addresses: 3 },
+            EgressControlResponse::DnsProbed { route: DnsRoute::DedicatedDnsBroker, resolved: false, public_addresses: 0 },
+            EgressControlResponse::Refused { code: EgressError::InvalidRequest },
+        ] {
+            let frame = crate::ipc::Envelope { version: crate::ipc::PROTOCOL_VERSION, request_id: crate::ids::RequestId([5; 16]),
+                message: response };
+            assert_eq!(crate::ipc::decode::<EgressControlResponse>(&crate::ipc::encode(&frame).unwrap()).unwrap(), frame);
+        }
+        assert_eq!(serde_json::to_value(EgressControlResponse::DnsProbed { route: DnsRoute::DedicatedDnsBroker,
+            resolved: true, public_addresses: 1 }).unwrap(),
+            serde_json::json!({"result": "dns_probed", "route": "dedicated_dns_broker", "resolved": true, "public_addresses": 1}));
+        for json in [
+            r#"{"type":"probe_dns"}"#,
+            r#"{"type":"probe_dns","name":"example.com","route":"resolved_varlink"}"#,
+            r#"{"type":"probe_dns","name":"example.com","server":"8.8.8.8"}"#,
+            r#"{"type":"resolve","name":"example.com"}"#,
+        ] {
+            assert!(serde_json::from_str::<EgressControl>(json).is_err(), "{json}");
+        }
+        for json in [
+            r#"{"result":"dns_probed","route":"dedicated_broker","resolved":true,"public_addresses":1}"#,
+            r#"{"result":"dns_probed","route":"resolved_varlink","resolved":true}"#,
+            r#"{"result":"dns_probed","route":"resolved_varlink","resolved":true,"public_addresses":1,"answers":[]}"#,
+            r#"{"result":"dns_probed","route":"resolved_varlink","resolved":true,"public_addresses":-1}"#,
+            r#"{"result":"resolved","route":"resolved_varlink"}"#,
+        ] {
+            assert!(serde_json::from_str::<EgressControlResponse>(json).is_err(), "{json}");
+        }
+    }
+
+    #[test]
+    fn dns_probe_name_rule() {
+        let longest_label = format!("{}.com", "a".repeat(63));
+        for good in ["example.com", "api.anthropic.com", "a.b", "x-1.example.org", "1.example.com", longest_label.as_str()] {
+            assert!(validate_dns_probe_name(good).is_ok(), "{good}");
+        }
+        let long = format!("{}.com", vec!["a".repeat(60); 5].join("."));
+        assert!(long.len() > 253);
+        let long_label = format!("{}.com", "a".repeat(64));
+        for bad in ["", "com", "localhost", "Example.com", "example.com.", ".example.com", "example..com",
+            "-a.example.com", "a-.example.com", "a_b.example.com", "exa mple.com", "1.2.3.4", "10.0.0.1",
+            "printer.local", "db.internal", "app.localhost", "ex\u{e4}mple.com", long_label.as_str(), long.as_str()] {
+            assert!(validate_dns_probe_name(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

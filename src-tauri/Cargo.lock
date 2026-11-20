@@ -1163,6 +1163,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
+ "tracing",
  "url",
  "uuid",
  "windows-sys 0.59.0",
@@ -1172,6 +1173,7 @@ dependencies = [
 name = "duduclaw-isolation"
 version = "1.82.0"
 dependencies = [
+ "libc",
  "serde",
  "serde_json",
  "thiserror 2.0.21",

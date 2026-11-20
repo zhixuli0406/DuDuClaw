@@ -71,6 +71,7 @@ struct RootedPlans {
 }
 impl ExecutionPlanFactory for RootedPlans {
     fn supports(&self, name: &str) -> bool { self.plans.supports(name) }
+    fn offers(&self, name: &str) -> bool { self.plans.offers(name) }
     fn collects_results(&self, name: &str) -> bool { self.plans.collects_results(name) }
     fn cooperative_stop(&self, name: &str) -> bool { self.plans.cooperative_stop(name) }
     fn decode_result(&self, name: &str, stdout: &[u8], stderr: &[u8], outcome: &duduclaw_isolation::execution::RunOutcome)

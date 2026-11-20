@@ -27,10 +27,10 @@ class CiWorkflowTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         # BaseLoader preserves GitHub's `on` key instead of YAML 1.1's boolean.
-        cls.workflow = yaml.load(
+        cls.workflow_data = yaml.load(
             (ROOT / ".github/workflows/ci.yml").read_text(), Loader=yaml.BaseLoader
         )
-        cls.jobs = cls.workflow["jobs"]
+        cls.jobs = cls.workflow_data["jobs"]
 
     def commands(self, job):
         return [
@@ -41,9 +41,43 @@ class CiWorkflowTests(unittest.TestCase):
         ]
 
     def test_ci_permissions_are_read_only(self):
-        self.assertEqual(self.workflow["permissions"], {"contents": "read"})
+        self.assertEqual(self.workflow_data["permissions"], {"contents": "read"})
         for job in self.jobs.values():
             self.assertNotIn("permissions", job)
+
+    SMOKE_TEST_PIN = "7e57" * 16
+    PIN_FILE_ARGUMENT = " --bootstrap-root-pin-file release/bootstrap-root.sha256"
+    # Steps of the shipping Linux packaging path that the PR smoke mirrors.
+    LINUX_STEP_NAMES = {
+        "Add swap (Linux)", "Install cross (Linux)", "Build frontend",
+        "Package Linux binaries and check glibc baseline",
+        "Verify packaged duduclaw-bootstrap against the pin file",
+        "Export cross-built aarch64 binaries for native arm64 packaging",
+        "Hand aarch64 binaries to the native arm64 packaging job",
+        "Package Linux arm64 binaries natively and check glibc baseline",
+    }
+
+    @staticmethod
+    def load_workflow(name):
+        return yaml.load((ROOT / f".github/workflows/{name}.yml").read_text(), Loader=yaml.BaseLoader)
+
+    def linux_steps(self, job):
+        prefixes = ("actions/setup-node@", "dtolnay/rust-toolchain@", "Swatinem/rust-cache@")
+        commands = ("python3 scripts/package-linux-release.py ", "cross build --release")
+        return [s for s in job["steps"]
+                if s.get("uses", "").startswith(prefixes)
+                or s.get("name") in self.LINUX_STEP_NAMES
+                or s.get("run", "").startswith(commands)]
+
+    def without_production_pin(self, steps):
+        """The only differences the smoke may have: no production pin file, smoke-* hand-off name."""
+        normalized = json.loads(json.dumps(steps))
+        for step in normalized:
+            if "run" in step:
+                step["run"] = step["run"].replace(self.PIN_FILE_ARGUMENT, "")
+            if step.get("with", {}).get("name") == "linux-arm64-binaries":
+                step["with"]["name"] = "smoke-linux-arm64-binaries"
+        return normalized
 
     def test_linux_release_smoke_trigger_and_safety_contract(self):
         text = (ROOT / ".github/workflows/linux-release-smoke.yml").read_text()
@@ -55,20 +89,30 @@ class CiWorkflowTests(unittest.TestCase):
             "scripts/check_glibc.py", "scripts/package-linux-release.py",
             "crates/duduclaw-cli/assets/native-protected-launcher.sh",
             "crates/duduclaw-cli/src/service/**", "crates/duduclaw-core/src/root_key*.rs",
+            "crates/duduclaw-updated/src/**", "release/**",
+            "crates/duduclaw-gateway/src/license_runtime.rs", "crates/duduclaw-gateway/src/bin/**",
+            "scripts/refuse-test-license-build.py",
         ]})
         self.assertEqual(smoke["permissions"], {"contents": "read"})
         self.assertNotRegex(text, r"(?i)secrets\s*(?:\.|\[|\}\})")
-        self.assertEqual(set(smoke["jobs"]), {"build"})
-        job = smoke["jobs"]["build"]
-        self.assertNotIn("permissions", job)
+        # A PR build never produces a PRODUCTION-pinned verifier: no pin file or pin argument.
+        for needle in ("release/bootstrap-root.sha256", "--bootstrap-root-pin-file", "--bootstrap-root-sha256",
+                       "--signing-key", "--test-signer"):
+            self.assertNotIn(needle, text)
+        # PRODUCTION only as the licence identity the marker probe expects, never `PRODUCTION <pin>`.
+        self.assertNotRegex(text, r"PRODUCTION(?!-LICENSE)")
+        self.assertEqual(set(smoke["jobs"]), {"build", "package-arm64", "license-marker-probe"})
         self.assertNotIn("env", smoke)
-        self.assertNotIn("env", job)
+        for job in smoke["jobs"].values():
+            self.assertNotIn("permissions", job)
+            self.assertNotIn("env", job)
+        job = smoke["jobs"]["build"]
         self.assertEqual(job["runs-on"], "ubuntu-latest")
         self.assertEqual(job["strategy"], {"fail-fast": "false", "matrix": {"target": [
             "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu",
         ]}})
-        upload = next(s for s in job["steps"]
-                      if s.get("uses", "").startswith("actions/upload-artifact@"))
+        upload = next(s for s in job["steps"] if s.get("uses", "").startswith("actions/upload-artifact@")
+                      and s["with"]["name"] == "duduclaw-${{ matrix.target }}-smoke")
         self.assertEqual(upload["with"], {
             "name": "duduclaw-${{ matrix.target }}-smoke",
             "path": "target/${{ matrix.target }}/release/duduclaw",
@@ -77,55 +121,218 @@ class CiWorkflowTests(unittest.TestCase):
         start = next(s for s in job["steps"] if s.get("name", "").startswith("Start x86_64"))
         self.assertEqual(start["if"], "matrix.target == 'x86_64-unknown-linux-gnu'")
         self.assertEqual(start["run"], 'docker run --rm -v "$PWD/target/x86_64-unknown-linux-gnu/release:/b:ro" ubuntu:22.04 /b/duduclaw --version')
+        # TEST-root verifier (plan §3.3): own target dir, fixed fake pin, never packaged.
+        build = next(s for s in job["steps"] if s.get("name") == "Build TEST-root verifier (smoke only, never packaged)")
+        self.assertEqual(build["env"]["SMOKE_TEST_PIN"], self.SMOKE_TEST_PIN)
+        self.assertIn("CARGO_TARGET_DIR=target/smoke-test-root RUSTFLAGS='--cfg duduclaw_test_root'", build["run"])
+        self.assertNotIn("package-linux-release.py", build["run"])
+        pins = [s["env"]["SMOKE_TEST_PIN"] for j in smoke["jobs"].values() for s in j["steps"]
+                if "SMOKE_TEST_PIN" in s.get("env", {})]
+        self.assertEqual(pins, [self.SMOKE_TEST_PIN] * 3)
+        checks = [s for j in smoke["jobs"].values() for s in j["steps"]
+                  if s.get("name") == "Execute TEST-root verifier natively and check the packager refuses it"]
+        self.assertEqual(len(checks), 2)
+        for check in checks:
+            self.assertIn('[[ "$actual" == "TEST $SMOKE_TEST_PIN" ]]', check["run"])
+            self.assertIn("packager.check_bootstrap_file(", check["run"])
+            self.assertIn('sys.exit("production packager accepted a TEST-root verifier")', check["run"])
+        arm = smoke["jobs"]["package-arm64"]
+        self.assertEqual(arm["runs-on"], "ubuntu-24.04-arm")
+        self.assertEqual(arm["needs"], "build")
+        handoff = next(s for s in arm["steps"] if s.get("name", "").startswith("Execute TEST-root"))
+        self.assertEqual(handoff["env"]["VERIFIER_SHA256"], "${{ needs.build.outputs.arm64_test_verifier_sha256 }}")
+        self.assertIn('[[ "${actual%% *}" == "$VERIFIER_SHA256" ]]', handoff["run"])
+
+    def test_every_release_path_refuses_a_test_license_build(self):
+        refuser = "scripts/refuse-test-license-build.py"
+
+        def names(steps):
+            return [s.get("name", s.get("uses", "")) for s in steps]
+
+        def first(steps, needle):
+            return next(i for i, s in enumerate(steps) if needle in s.get("run", ""))
+
+        # release.yml build job: the environment at job start, the built gateway before
+        # anything signs, notarises, packages or uploads it.
+        release = self.load_workflow("release")
+        steps = release["jobs"]["build"]["steps"]
+        listed = names(steps)
+        checks = [i for i, s in enumerate(steps) if refuser + " --check-environment" in s.get("run", "")]
+        self.assertEqual([steps[i]["if"] for i in checks], ["runner.os != 'Windows'", "runner.os == 'Windows'"])
+        self.assertLess(max(checks), min(first(steps, "cargo build"), first(steps, "package-linux-release.py")))
+        mac = listed.index("Refuse a TEST-licence gateway (macOS)")
+        win = listed.index("Refuse a TEST-licence gateway (Windows)")
+        self.assertEqual(steps[mac]["if"], "runner.os == 'macOS'")
+        self.assertEqual(steps[win]["if"], "runner.os == 'Windows'")
+        self.assertIn(refuser + " target/${{ matrix.target }}/release/duduclaw\n", steps[mac]["run"] + "\n")
+        self.assertIn(refuser + " target/${{ matrix.target }}/release/duduclaw.exe", steps[win]["run"])
+        self.assertIn("if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }", steps[win]["run"])
+        build = listed.index("Build binary (macOS/Windows — with desktop feature)")
+        self.assertEqual(mac, build + 1)
+        self.assertEqual(win, build + 2)
+        for later in ("Import macOS gateway signing certificate", "Build, sign and notarize macOS gateway",
+                      "Package (macOS)", "Package (Windows)", "Preserve unsigned archives and checksums"):
+            self.assertLess(win, listed.index(later))
+        publish = release["jobs"]["release"]["steps"]
+        guard = names(publish).index("Refuse TEST-licence gateways in the release archives")
+        self.assertIn(refuser + ' "${archives[@]}"', publish[guard]["run"])
+        self.assertIn("set -euo pipefail", publish[guard]["run"])
+        self.assertLess(guard, names(publish).index("Sign release assets with minisign (Ed25519)"))
+        # desktop-release.yml: the environment before any Cargo run, the staged sidecar before tauri-action.
+        desktop = self.load_workflow("desktop-release")["jobs"]["build"]["steps"]
+        checks = [i for i, s in enumerate(desktop) if refuser + " --check-environment" in s.get("run", "")]
+        self.assertEqual(len(checks), 2)
+        self.assertLess(max(checks), first(desktop, "cargo "))
+        stage = names(desktop).index("Build & stage gateway sidecar")
+        sidecar = names(desktop).index("Refuse a TEST-licence gateway sidecar")
+        self.assertEqual(sidecar, stage + 1)
+        self.assertIn(refuser + ' "src-tauri/binaries/duduclaw-$TARGET$EXT"', desktop[sidecar]["run"])
+        tauri = next(i for i, s in enumerate(desktop) if s.get("uses", "").startswith("tauri-apps/tauri-action@"))
+        self.assertLess(sidecar, tauri)
+        # Dockerfile.server: scanned in the build stage, before the runtime copies it.
+        docker = (ROOT / "container/Dockerfile.server").read_text()
+        scan = docker.index('grep -c -a -F -f "$marker_file" target/release/duduclaw')
+        self.assertLess(docker.index("cargo build --release"), scan)
+        self.assertLess(scan, docker.index("FROM python:3.12-slim AS cli-tools"))
+        self.assertLess(scan, docker.index("COPY --from=rust-builder /build/target/release/duduclaw"))
+        # npm publisher: every extracted binary before the first publish.
+        npm = (ROOT / "npm/scripts/publish.sh").read_text()
+        self.assertLess(npm.index(refuser), npm.index("already_published() {"))
+        # release.sh: the environment before any source change, the Pro binary before signing/upload.
+        script = (ROOT / "scripts/release.sh").read_text()
+        self.assertLess(script.index('refuse-test-license-build.py" --check-environment'),
+                        script.index("# --- Enterprise release preflight"))
+        function = script[script.index("package_and_upload_pro_bin() {"):]
+        check = function.index(refuser + ' "$staged_dir/$plat/duduclaw-pro" || exit 1')
+        for later in ("build-gateway-bundle.py", "sign-gateway.sh", "minisign -S", "gcloud storage cp"):
+            self.assertLess(check, function.index(later))
+        # The marker probe: release profile, stripped, refused exactly in the test-root build.
+        probe = self.load_workflow("linux-release-smoke")["jobs"]["license-marker-probe"]
+        self.assertEqual(probe["strategy"]["matrix"]["variant"], ["production", "test-root"])
+        run = probe["steps"][-1]["run"]
+        for needle in ("CARGO_TARGET_DIR=target/license-marker-probe-test-root RUSTFLAGS='--cfg duduclaw_test_root'",
+                       "unset DUDUCLAW_TEST_LICENSE_ISSUER_PUBKEY", "cargo build --locked --release",
+                       "--bin duduclaw-license-marker-probe", "duduclaw-gateway/marker-probe", "strip --strip-all",
+                       "python3 -I -B " + refuser, '[[ "$identity" == "TEST-LICENSE none" ]]',
+                       '[[ "$identity" =~ ^PRODUCTION-LICENSE\\ [0-9a-f]{16}$ ]]'):
+            self.assertIn(needle, run)
+        # The Python job runs the refuser's and the release packaging tests.
+        python = "\n".join(s.get("run", "") for s in self.jobs["python"]["steps"])
+        for test in ("test_refuse_test_license_build.py", "test_package_linux_release.py",
+                     "test_sign_isolation_manifest.py"):
+            self.assertIn(f"python3 -m unittest discover -s scripts/tests -p '{test}' -v", python)
 
     def test_linux_release_smoke_matches_release_build_steps(self):
-        def build_job(name):
-            return yaml.load((ROOT / f".github/workflows/{name}.yml").read_text(),
-                             Loader=yaml.BaseLoader)["jobs"]["build"]
-
-        release = build_job("release")
-        smoke = build_job("linux-release-smoke")
+        release = self.load_workflow("release")
+        smoke = self.load_workflow("linux-release-smoke")
         # Compare full ordered steps: action pins/options, commands, features,
         # conditions, and environment must all follow the shipping Linux path.
-        prefixes = ("actions/setup-node@", "dtolnay/rust-toolchain@", "Swatinem/rust-cache@")
-        names = {"Add swap (Linux)", "Install cross (Linux)", "Build frontend",
-                 "Package Linux binaries and check glibc baseline"}
-        commands = ("python3 scripts/package-linux-release.py ", "cross build --release")
-        def linux_steps(job):
-            return [s for s in job["steps"]
-                    if s.get("uses", "").startswith(prefixes)
-                    or s.get("name") in names
-                    or s.get("run", "").startswith(commands)]
-
-        expected = linux_steps(release)
+        expected = self.linux_steps(release["jobs"]["build"])
         # swap, setup-node, rust-toolchain, rust-cache, install cross, frontend,
-        # packager --build-only, packager --skip-build (glibc baseline check).
-        self.assertEqual(len(expected), 8)
+        # packager --build-only, x86_64 packaging (glibc baseline check), x86_64
+        # archive verification, aarch64 export and its hand-off.
+        self.assertEqual(len(expected), 11)
         runs = [s.get("run", "") for s in expected]
-        self.assertIn("python3 scripts/package-linux-release.py --target ${{ matrix.target }} --build-only", runs)
+        self.assertIn("python3 scripts/package-linux-release.py --target ${{ matrix.target }} --build-only"
+                      + self.PIN_FILE_ARGUMENT + " ${{ matrix.target == 'aarch64-unknown-linux-gnu' && "
+                      "'--defer-bootstrap-probe' || '' }}", runs)
         self.assertIn("python3 scripts/package-linux-release.py --target ${{ matrix.target }} "
-                      "--skip-build --output-dir .", runs)
-        # The shared packager step stays unprivileged: no offline signing key
-        # or bootstrap metadata (the packager also refuses keys under CI).
-        self.assertFalse(any("--signing-key" in run or "--bootstrap-root" in run for run in runs))
-        self.assertEqual(linux_steps(smoke), expected)
-        cache = next(s for s in smoke["steps"]
+                      "--skip-build --output-dir ." + self.PIN_FILE_ARGUMENT, runs)
+        # The shared packager steps stay unprivileged: no offline signing key,
+        # no bootstrap metadata, no literal pin and no test signer.
+        for run in runs:
+            for needle in ("--signing-key", "--bootstrap-root ", "--bootstrap-root-signatures",
+                           "--bootstrap-root-sha256", "--test-signer"):
+                self.assertNotIn(needle, run)
+        self.assertEqual(self.linux_steps(smoke["jobs"]["build"]), self.without_production_pin(expected))
+        native = self.linux_steps(release["jobs"]["package-linux-arm64"])
+        self.assertEqual([s["name"] for s in native], [
+            "Package Linux arm64 binaries natively and check glibc baseline",
+            "Verify packaged duduclaw-bootstrap against the pin file"])
+        self.assertEqual(self.linux_steps(smoke["jobs"]["package-arm64"]), self.without_production_pin(native))
+        verify = [s for job in ("build", "package-linux-arm64") for s in release["jobs"][job]["steps"]
+                  if s.get("name") == "Verify packaged duduclaw-bootstrap against the pin file"]
+        smoke_verify = [s for job in ("build", "package-arm64") for s in smoke["jobs"][job]["steps"]
+                        if s.get("name") == "Verify packaged duduclaw-bootstrap against the pin file"]
+        self.assertEqual(len(verify), 2)
+        self.assertEqual(smoke_verify, self.without_production_pin(verify))
+        cache = next(s for s in smoke["jobs"]["build"]["steps"]
                      if s.get("uses", "").startswith("Swatinem/rust-cache@"))
         self.assertEqual(cache["with"]["save-if"], "false")
         # An exact step allowlist also prevents publishing/signing or hidden
         # cache writers from being introduced into this unprivileged PR build.
-        self.assertEqual(smoke["steps"][1:-2], expected)
-        for prefix in ("actions/checkout@", "actions/upload-artifact@"):
-            def action(job):
-                return next(s["uses"] for s in job["steps"]
-                            if s.get("uses", "").startswith(prefix))
-            self.assertEqual(action(smoke), action(release))
-        checkout = next(s["uses"] for s in release["steps"]
+        steps = smoke["jobs"]["build"]["steps"]
+        shared = self.linux_steps(smoke["jobs"]["build"])
+        extra = [s.get("name", s.get("uses")) for s in steps[1:] if s not in shared]
+        self.assertEqual(extra[:-1], ["Build TEST-root verifier (smoke only, never packaged)",
+                                      "Execute TEST-root verifier natively and check the packager refuses it",
+                                      "Hand TEST-root verifier to the native arm64 job",
+                                      "Start x86_64 binary on Ubuntu 22.04 (glibc 2.35)"])
+        self.assertTrue(extra[-1].startswith("actions/upload-artifact@"))
+        self.assertEqual([s.get("name", s.get("uses", "").split("@")[0]) for s in smoke["jobs"]["package-arm64"]["steps"]], [
+            "actions/checkout", "actions/download-artifact",
+            "Package Linux arm64 binaries natively and check glibc baseline",
+            "Verify packaged duduclaw-bootstrap against the pin file",
+            "actions/download-artifact",
+            "Execute TEST-root verifier natively and check the packager refuses it"])
+        for prefix in ("actions/checkout@", "actions/upload-artifact@", "actions/download-artifact@"):
+            def actions(workflow):
+                return {s["uses"] for job in workflow["jobs"].values() for s in job.get("steps", [])
+                        if s.get("uses", "").startswith(prefix)}
+            self.assertEqual(actions(smoke), actions(release))
+        checkout = next(s["uses"] for s in release["jobs"]["build"]["steps"]
                         if s.get("uses", "").startswith("actions/checkout@"))
-        self.assertEqual(smoke["steps"][0], {"uses": checkout})
+        self.assertEqual(steps[0], {"uses": checkout})
+
+    def test_release_packages_aarch64_natively_from_a_hash_checked_handoff(self):
+        release = self.load_workflow("release")
+        build, arm = release["jobs"]["build"], release["jobs"]["package-linux-arm64"]
+        # Both Linux targets are still cross-built on the x86_64 runner (glibc floor unchanged).
+        linux = [m for m in build["strategy"]["matrix"]["include"] if "linux" in m["target"]]
+        self.assertEqual([(m["target"], m["os"]) for m in linux], [
+            ("x86_64-unknown-linux-gnu", "ubuntu-latest"), ("aarch64-unknown-linux-gnu", "ubuntu-latest")])
+        self.assertEqual(build["outputs"], {"arm64_inputs_sha256": "${{ steps.arm64_inputs.outputs.sha256 }}"})
+        export = next(s for s in build["steps"] if s.get("id") == "arm64_inputs")
+        self.assertEqual(export["if"], "matrix.target == 'aarch64-unknown-linux-gnu'")
+        self.assertEqual(export["shell"], "bash")
+        self.assertIn("set -euo pipefail", export["run"])
+        self.assertIn('--export-binaries "$RUNNER_TEMP/linux-arm64-binaries"', export["run"])
+        self.assertIn('sha256sum "$RUNNER_TEMP/linux-arm64-binaries/SHA256SUMS"', export["run"])
+        archive = next(s for s in build["steps"] if s.get("name") == "Preserve unsigned archives and checksums")
+        self.assertEqual(archive["if"], "matrix.target != 'aarch64-unknown-linux-gnu'")
+        package = next(s for s in build["steps"] if s.get("name") == "Package Linux binaries and check glibc baseline")
+        self.assertEqual(package["if"], "matrix.target == 'x86_64-unknown-linux-gnu'")
+        # Native arm64 packaging: only read access, no secrets, digest from job outputs.
+        self.assertEqual(arm["runs-on"], "ubuntu-24.04-arm")
+        self.assertEqual(arm["needs"], ["build", "delivery-gate"])
+        self.assertEqual(arm["permissions"], {"contents": "read"})
+        self.assertNotIn("secrets", json.dumps(arm))
+        checkout = next(s for s in arm["steps"] if s.get("uses", "").startswith("actions/checkout@"))
+        self.assertEqual(checkout["with"], {"ref": "${{ needs.delivery-gate.outputs.commit }}",
+                                            "persist-credentials": "false"})
+        native = next(s for s in arm["steps"] if s.get("name") == "Package Linux arm64 binaries natively and check glibc baseline")
+        self.assertEqual(native["env"], {"INPUTS_SHA256": "${{ needs.build.outputs.arm64_inputs_sha256 }}"})
+        self.assertIn('--binary-sums-sha256 "$INPUTS_SHA256"', native["run"])
+        self.assertIn(self.PIN_FILE_ARGUMENT, native["run"])
+        unsigned = next(s for s in arm["steps"] if s.get("uses", "").startswith("actions/upload-artifact@"))
+        self.assertEqual(unsigned["with"]["name"], "unsigned-duduclaw-linux-arm64")
+        self.assertEqual(release["jobs"]["sign"]["needs"], ["build", "package-linux-arm64"])
+        # Every release packager invocation takes the pin only from the public file.
+        for job in release["jobs"].values():
+            for step in job.get("steps", []):
+                if "package-linux-release.py" in step.get("run", ""):
+                    self.assertIn(self.PIN_FILE_ARGUMENT, step["run"])
+                    self.assertNotIn("--bootstrap-root-sha256", step["run"])
+                    self.assertNotIn("DUDUCLAW_BOOTSTRAP_ROOT_SHA256", json.dumps(step))
+        summaries = [s for job in release["jobs"].values() for s in job.get("steps", [])
+                     if "--verify-archive" in s.get("run", "")]
+        self.assertEqual(len(summaries), 2)
+        for step in summaries:
+            self.assertIn('>> "$GITHUB_STEP_SUMMARY"', step["run"])
+            self.assertIn("set -euo pipefail", step["run"])
 
     def test_latest_runs_do_not_cancel_other_prs_or_main(self):
-        concurrency = self.workflow["concurrency"]
+        concurrency = self.workflow_data["concurrency"]
         group = concurrency["group"]
         for context in ("github.workflow", "github.event_name",
                         "github.event.pull_request.number", "github.ref"):
@@ -134,10 +341,10 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertEqual(concurrency["cancel-in-progress"],
                          "${{ github.event_name == 'pull_request' }}")
         for event in ("push", "pull_request"):
-            trigger = self.workflow["on"][event]
+            trigger = self.workflow_data["on"][event]
             self.assertEqual(trigger["branches"], ["main"])
             self.assertFalse({"paths", "paths-ignore"} & trigger.keys())
-        self.assertIn("workflow_dispatch", self.workflow["on"])
+        self.assertIn("workflow_dispatch", self.workflow_data["on"])
 
     def test_required_jobs_run_even_if_settle_fails(self):
         for job, name in (("rust",
@@ -175,14 +382,14 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertEqual(json.loads(expression[1]), [{"os": "ubuntu-latest", "shard": 1}])
         for event in ("push", "schedule", "workflow_dispatch"):
             with self.subTest(event=event):
-                self.assertIn(event, self.workflow["on"])
+                self.assertIn(event, self.workflow_data["on"])
                 self.assertEqual(json.loads(expression[2]),
                                  [{"os": "ubuntu-latest", "shard": 1}] + [
                                      {"os": os_name, "shard": shard}
                                      for os_name in ("macos-latest", "windows-latest")
                                      for shard in range(1, 4)
                                  ])
-        self.assertEqual(self.workflow["on"]["schedule"], [{"cron": "0 18 * * *"}])
+        self.assertEqual(self.workflow_data["on"]["schedule"], [{"cron": "0 18 * * *"}])
 
     def test_every_native_shard_partitions_both_nextest_suites(self):
         suites = [s for s in self.jobs["rust"]["steps"]
@@ -310,6 +517,8 @@ class CiWorkflowTests(unittest.TestCase):
                 for step_name in ("Install cross (Linux)", "Build frontend"):
                     self.assertIn(next(s for s in steps if s.get("name") == step_name), warm_steps)
 
+    RUST_TOOLCHAIN_ACTION = "dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca"
+
     def test_release_toolchain_pin_is_desktop_only(self):
         workflows = {
             name: yaml.load((ROOT / f".github/workflows/{name}.yml").read_text(),
@@ -321,7 +530,8 @@ class CiWorkflowTests(unittest.TestCase):
             steps = [s for s in workflows[name]["jobs"][job]["steps"]
                      if s.get("uses", "").startswith("dtolnay/rust-toolchain@")]
             self.assertEqual(len(steps), 1)
-            self.assertEqual(steps[0]["uses"], "dtolnay/rust-toolchain@stable")
+            # The reviewed commit, never the mutable `stable` branch of the action.
+            self.assertEqual(steps[0]["uses"], self.RUST_TOOLCHAIN_ACTION)
             return steps[0]
 
         desktop = toolchain("desktop-release", "build")
@@ -329,10 +539,80 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertEqual(desktop["with"]["toolchain"], "1.99.1")
         self.assertEqual(warmed["with"]["toolchain"], "1.99.1")
         self.assertEqual(desktop, warmed)
+        # A SHA pin of the action no longer encodes the channel: it is an explicit input.
         for name, job in (("release", "build"), ("linux-release-smoke", "build"),
                           ("release-cache-warm", "release")):
             with self.subTest(workflow=name, job=job):
-                self.assertNotIn("toolchain", toolchain(name, job).get("with", {}))
+                self.assertEqual(toolchain(name, job)["with"]["toolchain"], "stable")
+        for name in workflows:
+            text = (ROOT / f".github/workflows/{name}.yml").read_text()
+            self.assertNotIn("dtolnay/rust-toolchain@stable", text)
+            for line in text.splitlines():
+                if "dtolnay/rust-toolchain@" in line:
+                    self.assertTrue(line.endswith(self.RUST_TOOLCHAIN_ACTION + "  # stable"), line)
+
+    def test_release_producer_job_is_read_only_and_every_action_is_commit_pinned(self):
+        text = (ROOT / ".github/workflows/release.yml").read_text()
+        release = yaml.load(text, Loader=yaml.BaseLoader)
+        # Every third-party action is a 40-hex commit, also inside the local reusable
+        # workflows release.yml calls (those are the only non-commit `uses`).
+        steps = []
+        for name, job in release["jobs"].items():
+            if "uses" in job:
+                self.assertTrue(job["uses"].startswith("./.github/workflows/"), name)
+                called = yaml.load((ROOT / job["uses"]).read_text(), Loader=yaml.BaseLoader)
+                steps += [(name, step) for inner in called["jobs"].values() for step in inner.get("steps", [])]
+            steps += [(name, step) for step in job.get("steps", [])]
+        for name, step in steps:
+            if uses := step.get("uses"):
+                with self.subTest(job=name, uses=uses):
+                    self.assertRegex(uses, r"^[\w.-]+/[\w.-]+(/[\w.-]+)*@[0-9a-f]{40}$")
+        # The producer of every archive and of the arm64 hand-off needs no write access:
+        # nothing in it uploads a release asset or pushes (the release job publishes).
+        build, arm = release["jobs"]["build"], release["jobs"]["package-linux-arm64"]
+        self.assertEqual(build["permissions"], {"contents": "read"})
+        self.assertEqual(arm["permissions"], {"contents": "read"})
+        for job in (build, arm):
+            for step in job["steps"]:
+                run = step.get("run", "")
+                for needle in ("gh release", "git push", "--clobber", "contents: write"):
+                    self.assertNotIn(needle, run)
+                self.assertFalse(step.get("uses", "").startswith("softprops/action-gh-release@"))
+            checkouts = [s for s in job["steps"] if s.get("uses", "").startswith("actions/checkout@")]
+            self.assertEqual(len(checkouts), 1)
+            self.assertEqual(checkouts[0]["with"]["persist-credentials"], "false")
+        # The one authenticated git fetch passes its token through env-scoped config, not argv.
+        fetch = next(s for s in build["steps"]
+                     if s.get("name") == "Use workflow revision of the gateway verify script (macOS)")
+        self.assertEqual(fetch["env"]["FETCH_TOKEN"], "${{ github.token }}")
+        self.assertIn('GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth"', fetch["run"])
+        self.assertNotIn("${{", fetch["run"])
+        # The token (and the header built from it) is gone before anything else runs. There is
+        # no checkout (a .gitattributes/local-config smudge filter could run with side effects):
+        # the blob is written by cat-file to a new temporary file, size-checked, made
+        # executable and renamed into place, with no hook, fsmonitor or system/global config.
+        run = fetch["run"]
+        unset = run.index("unset FETCH_TOKEN auth")
+        self.assertLess(run.index("git fetch --no-tags --depth=1"), unset)
+        self.assertEqual(run.count("FETCH_TOKEN"), 2)  # the header construction and the unset
+        self.assertEqual(run.count("$auth"), 1)
+        self.assertNotIn("git checkout", run)
+        self.assertNotRegex(run, r"(?m)^\s*checkout\b|\bcheckout FETCH_HEAD\b|\bgit\b[^\n]*\brestore\b")
+        staged = run.index('staged="$(mktemp "${script%/*}/.verify-gateway-signature.XXXXXX")"')
+        blob = run.index('cat-file blob "FETCH_HEAD:$script" > "$staged"')
+        self.assertLess(unset, staged)
+        self.assertLess(staged, blob)
+        command = run[run.rindex("GIT_CONFIG_NOSYSTEM=1", 0, blob):blob]
+        for needle in ("GIT_CONFIG_GLOBAL=/dev/null", "-c core.hooksPath=/dev/null", "-c core.fsmonitor=",
+                       "-c core.attributesFile=/dev/null"):
+            self.assertIn(needle, command)
+        size = run.index("(( size == 0 || size > 1048576 ))")
+        chmod = run.index('chmod 0755 "$staged"')
+        move = run.index('mv -f -- "$staged" "$script"')
+        self.assertLess(blob, size)
+        self.assertLess(size, chmod)
+        self.assertLess(chmod, move)
+        self.assertEqual(run.count('"$script"'), 1)  # written only by the atomic rename
 
     def test_release_linux_swap_immediately_follows_checkout_and_precedes_builds(self):
         for name, job in (("release", "build"), ("linux-release-smoke", "build"),
@@ -391,7 +671,7 @@ class CiWorkflowTests(unittest.TestCase):
                 self.assertNotIn("tauri-apps/tauri-action", step.get("uses", ""))
 
     def test_build_profiles_keep_debug_assertions(self):
-        env = self.workflow["env"]
+        env = self.workflow_data["env"]
         for profile in ("DEV", "TEST"):
             self.assertEqual(env[f"CARGO_PROFILE_{profile}_DEBUG"], "0")
         self.assertFalse(any("ASSERTIONS" in key or "OPT_LEVEL" in key
@@ -621,8 +901,7 @@ class CiWorkflowTests(unittest.TestCase):
             for job in workflow["jobs"].values():
                 for step in job.get("steps", []):
                     if uses := step.get("uses"):
-                        if uses != "dtolnay/rust-toolchain@stable":
-                            self.assertRegex(uses, r"^[\w-]+/[\w-]+@[a-f0-9]{40}$")
+                        self.assertRegex(uses, r"^[\w-]+/[\w-]+@[a-f0-9]{40}$")
             if name in {"desktop-release", "release-cache-warm"}:
                 installs = [shlex.split(line) for job in workflow["jobs"].values()
                             for step in job.get("steps", [])

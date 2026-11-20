@@ -20,7 +20,9 @@ pub const REFER: u64 = 1 << 13;
 pub const TRUNCATE: u64 = 1 << 14;
 pub const IOCTL_DEV: u64 = 1 << 15;
 pub const MIN_ABI: u32 = 1;
-pub const MAX_KNOWN_ABI: u32 = 7;
+/// The shared contract constant (`duduclaw_isolation::LANDLOCK_HIGHEST_KNOWN_ABI`);
+/// spawnd, the gateway and the installer compare evidence against the same value.
+pub const MAX_KNOWN_ABI: u32 = duduclaw_isolation::LANDLOCK_HIGHEST_KNOWN_ABI;
 /// The only rights `landlock_add_rule` accepts on a non-directory (HX helper
 /// rules on `/helpers/<file>`, `/dev/null`, `/dev/urandom`).
 pub const FILE_RIGHTS: u64 = EXECUTE | WRITE_FILE | READ_FILE | TRUNCATE | IOCTL_DEV;
@@ -192,6 +194,15 @@ mod tests {
             assert_eq!(Policy::for_abi(abi).unwrap().handled,handled);
         }
         assert!(Policy::for_abi(0).is_err());
+    }
+    /// v1.83 R4: the clamp uses the shared contract constant, and that ABI has
+    /// a rule set here (spawnd, the gateway and the installer compare against it).
+    #[test]
+    fn landlock_clamp_uses_the_shared_highest_known_abi() {
+        assert_eq!(MAX_KNOWN_ABI, duduclaw_isolation::LANDLOCK_HIGHEST_KNOWN_ABI);
+        let policy = Policy::for_abi(duduclaw_isolation::LANDLOCK_HIGHEST_KNOWN_ABI).unwrap();
+        assert_eq!(policy.abi(), duduclaw_isolation::LANDLOCK_HIGHEST_KNOWN_ABI);
+        assert_eq!(Policy::for_abi(duduclaw_isolation::LANDLOCK_HIGHEST_KNOWN_ABI + 1).unwrap(), policy);
     }
     #[test]
     fn landlock_newer_kernel_uses_exact_abi_seven_policy() {

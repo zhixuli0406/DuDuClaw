@@ -216,6 +216,8 @@ fn p1h_lifecycle_allowlist_equals_the_dispatch_table() {
     // two recording methods.
     let mut routed: BTreeSet<String> = BTreeSet::new();
     routed.extend(super::super::isolation_connectors_rpc::METHODS.iter().map(|m| m.to_string()));
+    // R8r-3a: the model connection document handler's method table.
+    routed.extend(super::super::isolation_providers_rpc::METHODS.iter().map(|m| m.to_string()));
     // Merge P1h × F6: the employee handler also serves the F6 restore /
     // adoption / Shared-restore / quarantine-purge methods.
     routed.extend(super::super::isolation_employee_rpc::routed_methods().into_iter().map(str::to_owned));
@@ -233,12 +235,14 @@ fn p1h_lifecycle_allowlist_equals_the_dispatch_table() {
     assert_eq!(frozen, routed, "LIFECYCLE_ALLOWLIST must equal the dispatched lifecycle methods");
     for method in &routed {
         assert!(super::super::isolation_connectors_rpc::owns(method) || super::super::isolation_employee_rpc::owns(method)
+            || super::super::isolation_providers_rpc::owns(method)
             || super::super::migration_confirmations_rpc::known_method(method)
             || matches!(method.as_str(), "isolation.recording_status" | "isolation.recording_stop"), "{method}");
     }
     // The namespaces dispatch hands to those handlers are exactly these.
     for needle in ["method.split('.').take(2).eq([\"migration\", \"confirmations\"])",
-        "if isolation_connectors_rpc::owns(method)", "if isolation_employee_rpc::owns(method)"] {
+        "if isolation_connectors_rpc::owns(method)", "if isolation_employee_rpc::owns(method)",
+        "if isolation_providers_rpc::owns(method)"] {
         assert!(dispatch.contains(needle), "{needle}");
     }
     // No dispatch arm elsewhere names another lifecycle-looking method.

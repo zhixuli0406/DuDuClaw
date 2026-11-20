@@ -96,6 +96,10 @@ fn helper_id(runtime: &RuntimeKind) -> Option<&str> {
             && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_'));
     (matches!(name, "duduclaw-program-v1" | "duduclaw-code-map-v1" | RECORDING_RUNTIME) || office).then_some(name)
 }
+/// Whether `runtime` is an in-run helper kind (the launcher's helper set).
+/// The policy generator refuses a helper kind signed twice: the launcher
+/// rule refuses duplicate kinds and the gateway refuses the whole helper set.
+pub fn is_helper_kind(runtime: &RuntimeKind) -> bool { helper_id(runtime).is_some() }
 pub fn executable_fds(runtime: &PublishedRuntime) -> usize {
     let files = recording_files(runtime).map_or(0, |files| files.len());
     files + match runtime.executable { Executable::Elf { .. } => 1, Executable::Script { .. } => 2 }
@@ -249,7 +253,7 @@ mod tests {
                 output_total_bytes: 1 << 20, memfd_total_bytes: 1 << 20 },
             timeouts: RunTimeouts { queue_ms: 1000, startup_ms: 1000, runtime_ms: 3_600_000, pty_idle_ms: None,
                 termination_grace_ms: 15_000 },
-            network, mcp: false, pty_allowed: false, queue_class: QueueClass::Background }
+            network, mcp: false, pty_allowed: false, queue_class: QueueClass::Background, turn_limit: None }
     }
     fn registered(name: &str) -> RuntimeKind { RuntimeKind::Registered(Text::new(name.into()).unwrap()) }
     fn egress() -> NetworkPolicy { NetworkPolicy::Egress(ProfileId(Sha256Digest([7; 32]))) }

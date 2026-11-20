@@ -1,16 +1,24 @@
 [Unit]
 Description=Verify and activate signed protected DuDuClaw updates
 After=network-online.target
-After=duduclaw-gateway.service duduclaw-spawnd.service duduclaw-egress.service
 Wants=network-online.target
+# R6: only spawnd's start, whose READY=1 means its root update endpoint is
+# bound (also on an inconsistent set, so this service can repair the host).
+# Not ordered after gateway or egress: their readback sockets are read with
+# timeouts and retries during an activation. Wants=, not Requires=: this
+# service restarts spawnd itself during an activation, and Requires= would
+# propagate that restart to this service.
+Wants=duduclaw-spawnd.service
+After=duduclaw-spawnd.service
 StartLimitIntervalSec=60
 StartLimitBurst=3
 
 [Service]
 Slice=duduclaw-tcb.slice
 Type=simple
-User=root
-Group=root
+# No User=/Group= (R7g): root is the default. An explicit User=root together
+# with NoNewPrivileges= and a seccomp-based directive makes systemd 255 drop
+# CAP_SETUID, which the downloader needs to drop its child to duduclaw-dl.
 ExecStart=/usr/libexec/duduclaw-updated-launch --launch
 Restart=on-failure
 RestartSec=2
@@ -27,7 +35,10 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
 ProtectControlGroups=yes
-RestrictSUIDSGID=yes
+# No RestrictSUIDSGID= (R7g): under it systemd's seccomp filter answers ENOSYS
+# for every openat2, and the updater reads and writes its signed manifests,
+# state and receipts through openat2 with RESOLVE_* guarantees. Still holds: a
+# root service that creates no set-ID files; NoNewPrivileges=yes stays.
 LockPersonality=yes
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK

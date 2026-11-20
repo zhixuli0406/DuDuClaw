@@ -2,12 +2,21 @@ use super::*;
 use std::{fs, io::Write, os::unix::{fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt}, io::AsRawFd}, path::Path, process::{Command, Output}};
 #[path = "protected_linux_readiness.rs"]
 mod readiness;
+#[path = "protected_linux_parse_lease.rs"]
+mod parse_lease;
 #[path = "protected_linux_uninstall.rs"]
 mod removal;
 #[path = "protected_linux_fresh.rs"]
 mod fresh;
 #[path = "protected_linux_upgrade.rs"]
 mod in_place;
+#[path = "protected_linux_bootstrap.rs"]
+mod bootstrap;
+#[path = "protected_linux_rollback.rs"]
+mod rollback;
+#[path = "protected_linux_ledger.rs"]
+mod ledger;
+pub(super) use bootstrap::ContinueOptions;
 
 fn gate() -> Result<()> {
     if unsafe { libc::getuid() } != 0 || unsafe { libc::geteuid() } != 0 {
@@ -42,62 +51,170 @@ fn mkdir(path: &str, mode: u32) -> Result<()> {
     let path = Path::new(path);
     parents(path)?;
     // Do not briefly expose a writable directory when the invoking umask is 0.
-    match fs::DirBuilder::new().mode(mode).create(path) {
-        Ok(()) => (),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => trusted(path, true)?,
+    let created = match fs::DirBuilder::new().mode(mode).create(path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => { trusted(path, true)?; false }
         Err(error) => return Err(error.into()),
-    }
+    };
     let directory = fs::OpenOptions::new().read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(path)?;
     if unsafe { libc::fchown(directory.as_raw_fd(), 0, 0) } != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
     directory.set_permissions(fs::Permissions::from_mode(mode))?;
-    Ok(())
+    // R3 review item 4: only a directory this call's mkdir created is proven
+    // (identity from the no-follow descriptor); one it found never is.
+    if created { ledger::prove_created(path, &directory) } else { ledger::reprove(path, &directory) }
+}
+
+/// The child deadline of every system command (and the cap of `command_within`).
+const COMMAND_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Review round 5 item 6: after SIGKILL, how long the control path waits for the reap, and in which steps.
+const REAP_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+const REAP_STEP: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// A spawned child as the bounded reaper sees it (test seam).
+trait Reapable: Send + 'static {
+    fn try_reap(&mut self) -> std::io::Result<Option<std::process::ExitStatus>>;
+    /// SIGKILL.
+    fn kill(&mut self) -> std::io::Result<()>;
+    /// Blocks until the child is reaped.
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus>;
+}
+
+impl Reapable for std::process::Child {
+    fn try_reap(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> { self.try_wait() }
+    fn kill(&mut self) -> std::io::Result<()> { std::process::Child::kill(self) }
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> { std::process::Child::wait(self) }
+}
+
+/// Review round 5 item 6: a child not yet reaped is sent SIGKILL and polled
+/// (`try_wait`) for at most `bound` in `step`s. One still not reaped then is
+/// handed to a detached thread that only `wait()`s for it (so no zombie
+/// remains once it exits) and the caller stops blocking. True: reaped here.
+///
+/// Review round 6 item 2: only `Ok(Some(_))` means reaped. A failing
+/// `try_wait` (`Err`) proves nothing about the child — it may still run — so
+/// it is handled exactly like `Ok(None)`: SIGKILL, the bounded reap, then the
+/// detached reaper.
+///
+/// Security review: `ECHILD` is the one error that does prove something —
+/// there is no child left to wait for (already reaped elsewhere, `SIGCHLD`
+/// ignored, `SA_NOCLDWAIT`). Its pid may already be reused, so it is treated
+/// as reaped: no signal is sent and nothing is handed to the reaper. SIGKILL
+/// is sent at most once, and never after an outcome saying the child is gone.
+fn kill_and_reap<C: Reapable>(mut child: C, bound: std::time::Duration, step: std::time::Duration) -> bool {
+    use std::time::Instant;
+    /// `true`: the child is gone (reaped now, or `ECHILD`: nothing left to reap).
+    fn gone<C: Reapable>(child: &mut C) -> bool {
+        match child.try_reap() {
+            Ok(Some(_)) => true,
+            Err(error) if error.raw_os_error() == Some(libc::ECHILD) => true,
+            Ok(None) | Err(_) => false,
+        }
+    }
+    if gone(&mut child) { return true; }
+    let _ = child.kill();
+    let until = Instant::now() + bound;
+    loop {
+        if gone(&mut child) { return true; }
+        let now = Instant::now();
+        if now >= until { break; }
+        std::thread::sleep(step.min(until - now));
+    }
+    // A thread, not a process: it only reaps the child already spawned. If no
+    // thread can be created, the child is left unreaped rather than blocking.
+    let reaper = std::thread::Builder::new().name("command-reaper".into());
+    let _ = std::thread::Builder::spawn(reaper, move || { let _ = child.wait(); });
+    false
+}
+
+/// Review round 5 item 6: up to `limit + 1` bytes of `reader`, in chunks,
+/// stopping (refused) once `now()` reaches `deadline`.
+fn read_until(mut reader: impl std::io::Read, limit: u64, deadline: std::time::Instant,
+    mut now: impl FnMut() -> std::time::Instant) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        if now() >= deadline { return Err(refused("system command exceeded its time or output limit")); }
+        let room = usize::try_from((limit + 1).saturating_sub(out.len() as u64)).unwrap_or(usize::MAX).min(chunk.len());
+        if room == 0 { return Ok(out); }
+        let count = match reader.read(&mut chunk[..room]) {
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if count == 0 { return Ok(out); }
+        out.extend_from_slice(&chunk[..count]);
+    }
 }
 
 fn command(name: &str, args: &[&str]) -> Result<Output> {
+    command_within(name, args, std::time::Instant::now() + COMMAND_LIMIT)
+}
+
+/// `command` bounded by the caller's ABSOLUTE `deadline` (R3 review item 6,
+/// R4 item 4): checked on entry, again immediately before the spawn and right
+/// after it; the child is given `min(deadline, spawn + 30 s)`. Nothing is
+/// spawned or read once the deadline has passed (refused). Review round 5
+/// item 6: a child still running then is killed and reaped within
+/// [`REAP_BOUND`] or left to a detached reaper ([`kill_and_reap`]), and the
+/// output is read in chunks that stop at the deadline ([`read_until`]): the
+/// caller never blocks past the deadline plus that bound.
+fn command_within(name: &str, args: &[&str], deadline: std::time::Instant) -> Result<Output> {
+    let expired = || refused("system command exceeded its time or output limit");
+    if std::time::Instant::now() >= deadline { return Err(expired()); }
     let executable = ["/usr/sbin", "/usr/bin", "/sbin", "/bin"].iter()
         .map(|dir| Path::new(dir).join(name)).find(|path| path.exists())
         .ok_or_else(|| refused(format!("required command missing: {name}")))?;
     let executable = fs::canonicalize(executable)?;
     parents(&executable)?;
     trusted(&executable, false)?;
-    use std::{io::Read, process::Stdio, time::{Duration, Instant}};
-    struct ReapOnError(std::process::Child);
+    use std::{process::Stdio, time::{Duration, Instant}};
+    struct ReapOnError(Option<std::process::Child>);
     impl Drop for ReapOnError {
         fn drop(&mut self) {
-            if !matches!(self.0.try_wait(), Ok(Some(_))) {
-                let _ = self.0.kill(); let _ = self.0.wait();
-            }
+            if let Some(child) = self.0.take() { kill_and_reap(child, REAP_BOUND, REAP_STEP); }
         }
     }
     trusted(Path::new("/run"), true)?;
     let mut stdout = tempfile::NamedTempFile::new_in("/run")?;
     let mut stderr = tempfile::NamedTempFile::new_in("/run")?;
+    let (stdout_handle, stderr_handle) = (stdout.reopen()?, stderr.reopen()?);
+    // Preparation may have used up the caller's time: nothing is spawned then.
+    if Instant::now() >= deadline { return Err(expired()); }
     // Fixed cwd, PATH and HOME (origin/main) inside the bounded, reaped spawn (isolation).
-    let mut child = ReapOnError(Command::new(executable).args(args).current_dir("/").env_clear()
+    let mut child = ReapOnError(Some(Command::new(executable).args(args).current_dir("/").env_clear()
         .env("PATH", super::runtime::SERVICE_PATH).env("HOME", "/var/lib/duduclaw").env("LC_ALL", "C")
-        .stdin(Stdio::null()).stdout(stdout.reopen()?).stderr(stderr.reopen()?).spawn()?);
-    let deadline = Instant::now() + Duration::from_secs(30);
+        .stdin(Stdio::null()).stdout(stdout_handle).stderr(stderr_handle).spawn()?));
+    let spawned = Instant::now();
+    // Expired during the spawn: the child is killed and reaped within the bound (`ReapOnError`), nothing is read.
+    if spawned >= deadline { return Err(expired()); }
+    let deadline = deadline.min(spawned + COMMAND_LIMIT);
     let limit = 4 * 1024 * 1024;
     let status = loop {
         if stdout.as_file().metadata()?.len() > limit || stderr.as_file().metadata()?.len() > limit
             || Instant::now() >= deadline {
             return Err(refused("system command exceeded its time or output limit"));
         }
-        if let Some(status) = child.0.try_wait()? { break status; }
+        let Some(running) = child.0.as_mut() else { return Err(expired()) };
+        if let Some(status) = running.try_wait()? { break status; }
         std::thread::sleep(Duration::from_millis(10));
     };
-    let mut out = Vec::new(); let mut err = Vec::new();
-    stdout.as_file_mut().take(limit + 1).read_to_end(&mut out)?;
-    stderr.as_file_mut().take(limit + 1).read_to_end(&mut err)?;
+    // An answer that arrives at or after the deadline is not read (fail closed).
+    if Instant::now() >= deadline { return Err(expired()); }
+    let out = read_until(stdout.as_file_mut(), limit, deadline, Instant::now)?;
+    let err = read_until(stderr.as_file_mut(), limit, deadline, Instant::now)?;
     if out.len() as u64 > limit || err.len() as u64 > limit { return Err(refused("system command output exceeded limit")); }
     Ok(Output { status, stdout: out, stderr: err })
 }
 
 fn checked(name: &str, args: &[&str]) -> Result<Output> {
-    let output = command(name, args)?;
+    checked_with(name, args, &mut command)
+}
+
+fn checked_with(name: &str, args: &[&str], run: &mut impl FnMut(&str, &[&str]) -> Result<Output>) -> Result<Output> {
+    let output = run(name, args)?;
     if !output.status.success() {
         return Err(refused(format!("{name} failed: {}", String::from_utf8_lossy(&output.stderr).trim())));
     }
@@ -134,16 +251,33 @@ fn account() -> Result<(u32, u32)> {
     let home = Path::new("/var/lib/duduclaw");
     parents(home)?;
     let metadata = fs::symlink_metadata(home)?;
-    if !metadata.is_dir() || metadata.uid() != uid || metadata.gid() != gid || metadata.mode() & 0o022 != 0 {
+    // The single-binary layout (home owned by the account) or the v1.83
+    // isolated layout (root:root 0711 home around a private 0700 data
+    // directory, `layout::migrated_home_is_private`, which R4 requires).
+    let single_binary = metadata.is_dir() && !metadata.file_type().is_symlink() && metadata.uid() == uid
+        && metadata.gid() == gid && metadata.mode() & 0o022 == 0;
+    if !single_binary && !layout::migrated_home_is_private(home, 0, 0, uid, gid)? {
         return Err(refused("service home must be a real directory owned by duduclaw, not group/other writable"));
     }
     Ok((uid, gid))
 }
 
 fn atomic_install(path: &str, mode: u32, write: impl FnOnce(&mut fs::File) -> Result<()>) -> Result<()> {
+    atomic_write(path, mode, true, write)
+}
+
+/// Review R8q F1: like [`atomic_install`], but only where nothing is: an
+/// object at `path` (also one appearing after the caller found the path
+/// absent) refuses instead of being renamed over (`persist_noclobber`).
+fn atomic_create(path: &str, mode: u32, write: impl FnOnce(&mut fs::File) -> Result<()>) -> Result<()> {
+    atomic_write(path, mode, false, write)
+}
+
+fn atomic_write(path: &str, mode: u32, replace: bool, write: impl FnOnce(&mut fs::File) -> Result<()>) -> Result<()> {
     let path = Path::new(path);
     parents(path)?;
     match fs::symlink_metadata(path) {
+        Ok(_) if !replace => return Err(refused(format!("{} 已存在，未覆蓋。", path.display()))),
         Ok(_) => trusted(path, false)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
         Err(error) => return Err(error.into()),
@@ -154,14 +288,19 @@ fn atomic_install(path: &str, mode: u32, write: impl FnOnce(&mut fs::File) -> Re
     if unsafe { libc::fchown(temp.as_raw_fd(), 0, 0) } != 0 { return Err(std::io::Error::last_os_error().into()); }
     temp.as_file().set_permissions(fs::Permissions::from_mode(mode))?;
     temp.as_file().sync_all()?;
-    temp.persist(path).map_err(|error| error.error)?;
+    let persisted = if replace { temp.persist(path) } else { temp.persist_noclobber(path) };
+    let file = persisted.map_err(|error| error.error)?;
     fs::File::open(parent)?.sync_all()?;
-    Ok(())
+    // R3 review item 4: what this call created (the O_EXCL temporary, now at
+    // `path`), proven by its own descriptor for an active creation ledger record.
+    ledger::prove_created(path, &file)
 }
 
 const PARSE_RUNTIME_TREE: &str = "/usr/lib/duduclaw/parse-root-tree";
 const PARSE_WORKER: &str = "/usr/libexec/duduclaw/duduclaw-parse-worker";
 const PARSE_RUNTIME_BUILDER: &str = include_str!("../../../duduclaw-parse-worker/scripts/build-runtime-tree.py");
+
+fn needs_update_lock(install: bool) -> bool { install }
 
 // The published worker's own digest cannot establish trust. Read the current
 // generation through F's root-owned state and authenticate its recorded signed
@@ -171,9 +310,14 @@ fn parse_runtime_tree(install: bool) -> Result<()> {
     use duduclaw_isolation::update::InstallTarget;
     let state_root = Directory::open(Path::new(duduclaw_updated::linux::STATE_ROOT))
         .map_err(|_| refused("缺少已驗證的隔離安裝狀態，未建立解析執行環境。"))?;
-    let _update_lock = state_root.lock().map_err(|_| refused("隔離更新進行中，稍後再準備解析執行環境。"))?;
-    let state: duduclaw_updated::state::State = state_root.json("state.json").map_err(refused)?;
-    state.validate().map_err(refused)?;
+    let _update_lock = if needs_update_lock(install) {
+        Some(state_root.lock().map_err(|_| refused("隔離更新進行中，稍後再準備解析執行環境。"))?)
+    } else { None };
+    // atomic_json publishes by rename; this single descriptor read is one
+    // committed snapshot. Never re-read state during a lock-free verification.
+    let state: duduclaw_updated::state::State = state_root.json("state.json")
+        .map_err(|_| refused("隔離更新狀態無法完整讀取，未驗證解析執行環境。"))?;
+    state.validate().map_err(|_| refused("隔離更新狀態無效，未驗證解析執行環境。"))?;
     let current = activation::read_current().map_err(refused)?;
     if state.pending.is_some() || current != state.effective_digest() {
         return Err(refused("隔離世代尚未完成更新，未變更解析執行環境。"));
@@ -260,6 +404,14 @@ fn invalidate_recovery_bound() -> Result<()> {
 }
 
 fn reload_and_certify_recovery() -> Result<()> {
+    reload_and_certify_recovery_text(&unit_text())
+}
+
+/// `text` is the gateway unit just installed: the single-binary
+/// `unit_text()` or, on an isolated host, `isolated_unit_text()`. The
+/// recovery bound must hold the same canonical text
+/// (`duduclaw_core::root_key::recovery` compares both files).
+fn reload_and_certify_recovery_text(text: &str) -> Result<()> {
     checked("systemctl", &["daemon-reload"])?;
     let output = checked("systemctl", &["show", UNIT, "-p", "StartLimitIntervalUSec",
         "-p", "StartLimitBurst", "-p", "RestartForceExitStatus"])?;
@@ -267,7 +419,7 @@ fn reload_and_certify_recovery() -> Result<()> {
     if !duduclaw_core::root_key::recovery::protected_properties_bounded(properties) {
         return Err(refused("effective unit restart bounds differ; remove conflicting systemd overrides before upgrading"));
     }
-    atomic_install(RECOVERY_BOUND, 0o644, |file| { file.write_all(unit_text().as_bytes())?; Ok(()) })
+    atomic_install(RECOVERY_BOUND, 0o644, |file| { file.write_all(text.as_bytes())?; Ok(()) })
 }
 
 const VERSION_FLOOR: &str = "/var/lib/duduclaw-protected/version-floor";
@@ -286,7 +438,23 @@ fn install_isolation_support_if_published() -> Result<()> {
     // Validate explicit host ranges before useradd can allocate anything.
     layout::system_id_limit(&defs, "SYS_UID_MAX").map_err(refused)?;
     layout::system_id_limit(&defs, "SYS_GID_MAX").map_err(refused)?;
-    let (uid, gid) = account()?;
+    let gateway = account()?;
+    // No DNS decision here: the broker unit stays as shipped (deny-all).
+    install_isolation_support_for(gateway, &defs, None)
+}
+
+/// The accounts, directories and unit files of the isolation layout, for an
+/// already resolved gateway identity (the v1.83 bootstrap resolves its own:
+/// its service home is the root-owned 0711 parent of a private data
+/// directory, which `account()` does not accept). Never enables anything.
+/// `broker_upstream` is the install's DNS broker upstream (`None` on the
+/// resolved route): the broker unit is written with its allow line.
+fn install_isolation_support_for((uid, gid): (u32, u32), defs: &str, broker_upstream: Option<std::net::SocketAddr>) -> Result<()> {
+    let defs = defs.to_owned();
+    // Every unit text first, so a refused upstream changes nothing.
+    let units = layout::UNITS.iter()
+        .map(|(name, shipped)| layout::installed_unit_text(name, shipped, broker_upstream).map(|text| (*name, text)))
+        .collect::<std::result::Result<Vec<_>, _>>().map_err(refused)?;
     layout::validate_system_ids(uid, gid, &defs).map_err(refused)?;
     let mut identities = vec![(uid, gid)];
     for name in layout::ACCOUNTS {
@@ -303,30 +471,42 @@ fn install_isolation_support_if_published() -> Result<()> {
             return Err(refused("parse worker roots contain unexpected content; stop workers and inspect the directory"));
         }
     }
-    for (name, text) in layout::UNITS {
+    for (name, text) in &units {
         atomic_install(&format!("/etc/systemd/system/{name}"), 0o644,
             |file| { file.write_all(text.as_bytes())?; Ok(()) })?;
     }
+    parse_lease::install(gid)?;
     println!("隔離服務的帳號、目錄與單元已備妥，尚未啟用。簽章世代、DNS 政策、遷移與完整就緒檢查仍須由已驗證的安裝流程完成。");
     Ok(())
 }
 
 fn isolation_account(name: &str, defs: &str) -> Result<(u32, u32)> {
-    let query = command("getent", &["passwd", name])?;
+    let (uid, gid) = isolation_account_with(name, defs, command)?;
+    checked("loginctl", &["disable-linger", name])?;
+    match fs::symlink_metadata(format!("/var/lib/systemd/linger/{name}")) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        _ => return Err(refused("isolation service linger remains enabled")),
+    }
+    Ok((uid, gid))
+}
+
+fn isolation_account_with(name: &str, defs: &str,
+    mut run: impl FnMut(&str, &[&str]) -> Result<Output>) -> Result<(u32, u32)> {
+    let query = run("getent", &["passwd", name])?;
     match query.status.code() {
         Some(2) => {
             let uid_max = format!("SYS_UID_MAX={}", layout::system_id_limit(defs, "SYS_UID_MAX").map_err(refused)? - 1);
             let gid_max = format!("SYS_GID_MAX={}", layout::system_id_limit(defs, "SYS_GID_MAX").map_err(refused)? - 1);
-            checked("useradd", &["--system", "--user-group", "--no-create-home", "--no-log-init",
+            checked_with("useradd", &["--system", "--user-group", "--no-create-home", "--no-log-init",
                 "--key", "SUB_UID_COUNT=0", "--key", "SUB_GID_COUNT=0",
                 "--key", &uid_max, "--key", &gid_max,
                 "--home-dir", "/nonexistent", "--shell", "/usr/sbin/nologin",
-                "--password", "!*", "--expiredate", "1970-01-02", name])?;
+                "--password", "!*", "--expiredate", "1970-01-02", name], &mut run)?;
         }
         Some(0) => (),
         _ => return Err(refused("cannot query isolation service account")),
     }
-    let passwd = checked("getent", &["passwd", name])?;
+    let passwd = checked_with("getent", &["passwd", name], &mut run)?;
     let passwd = String::from_utf8(passwd.stdout).map_err(|_| refused("invalid service account"))?;
     let fields: Vec<_> = passwd.trim_end_matches('\n').split(':').collect();
     if fields.len() != 7 || fields[0] != name || fields[5] != "/nonexistent"
@@ -334,23 +514,139 @@ fn isolation_account(name: &str, defs: &str) -> Result<(u32, u32)> {
     let uid: u32 = fields[2].parse().map_err(|_| refused("invalid service uid"))?;
     let gid: u32 = fields[3].parse().map_err(|_| refused("invalid service gid"))?;
     layout::validate_system_ids(uid, gid, defs).map_err(refused)?;
-    let groups = checked("id", &["-G", name])?;
+    let groups = checked_with("id", &["-G", name], &mut run)?;
     let groups = String::from_utf8(groups.stdout).map_err(|_| refused("invalid service groups"))?;
     if groups.split_whitespace().collect::<Vec<_>>() != vec![fields[3]] {
         return Err(refused("isolation service has supplementary groups"));
     }
-    let shadow = checked("getent", &["shadow", name])?;
+    // shadow's useradd --system ignores --expiredate. Reapply after identity
+    // validation on both creation and resume, then prove the effective shadow.
+    checked_with("usermod", &["--expiredate", "1970-01-02", name], &mut run)
+        .map_err(|error| refused(format!("cannot expire isolation service account with usermod: {error}")))?;
+    let shadow = checked_with("getent", &["shadow", name], &mut run)?;
     let shadow = String::from_utf8(shadow.stdout).map_err(|_| refused("invalid service lockdown"))?;
     let shadow: Vec<_> = shadow.trim_end_matches('\n').split(':').collect();
     if shadow.len() != 9 || shadow[0] != name || shadow[1] != "!*" || shadow[7] != "1" {
         return Err(refused("isolation service account lockdown mismatch"));
     }
-    checked("loginctl", &["disable-linger", name])?;
-    match fs::symlink_metadata(format!("/var/lib/systemd/linger/{name}")) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
-        _ => return Err(refused("isolation service linger remains enabled")),
-    }
     Ok((uid, gid))
+}
+
+#[cfg(test)]
+mod isolation_account_tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    const NAME: &str = "duduclaw-runsup";
+    const DEFS: &str = "SYS_UID_MAX 999\nSYS_GID_MAX 999\n";
+    const PASSWD: &str = "duduclaw-runsup:x:900:900::/nonexistent:/usr/sbin/nologin\n";
+
+    struct AccountCommands {
+        exists: bool,
+        passwd: String,
+        groups: String,
+        expiry: String,
+        usermod_failure: bool,
+        usermod_missing: bool,
+        calls: Vec<(String, Vec<String>)>,
+    }
+
+    impl AccountCommands {
+        fn new(exists: bool) -> Self {
+            Self { exists, passwd: PASSWD.into(), groups: "900\n".into(), expiry: String::new(),
+                usermod_failure: false, usermod_missing: false, calls: Vec::new() }
+        }
+
+        fn run(&mut self, name: &str, args: &[&str]) -> Result<Output> {
+            self.calls.push((name.into(), args.iter().map(|arg| (*arg).to_owned()).collect()));
+            let (code, text) = match (name, args) {
+                ("getent", ["passwd", NAME]) if !self.exists => (2, String::new()),
+                ("useradd", _) => { self.exists = true; (0, String::new()) }
+                ("getent", ["passwd", NAME]) => (0, self.passwd.clone()),
+                ("id", ["-G", NAME]) => (0, self.groups.clone()),
+                ("usermod", ["--expiredate", "1970-01-02", NAME]) => {
+                    if self.usermod_missing {
+                        return Err(std::io::Error::from(std::io::ErrorKind::NotFound).into());
+                    }
+                    if self.usermod_failure { (1, String::new()) }
+                    else { self.expiry = "1".into(); (0, String::new()) }
+                }
+                ("getent", ["shadow", NAME]) => (0, format!("{NAME}:!*:20775:::::{}:\n", self.expiry)),
+                _ => panic!("unexpected command: {name} {args:?}"),
+            };
+            Ok(Output { status: std::process::ExitStatus::from_raw(code << 8),
+                stdout: text.into_bytes(), stderr: Vec::new() })
+        }
+
+        fn assert_order(&self, expected: &[(&str, &[&str])]) {
+            let expected: Vec<_> = expected.iter().map(|(name, args)|
+                ((*name).to_owned(), args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>())).collect();
+            assert_eq!(self.calls, expected);
+        }
+    }
+
+    #[test]
+    fn isolation_account_new_expires_after_identity_validation_before_shadow() {
+        let mut host = AccountCommands::new(false);
+        assert_eq!(isolation_account_with(NAME, DEFS, |name, args| host.run(name, args)).unwrap(), (900, 900));
+        host.assert_order(&[
+            ("getent", &["passwd", NAME]),
+            ("useradd", &["--system", "--user-group", "--no-create-home", "--no-log-init",
+                "--key", "SUB_UID_COUNT=0", "--key", "SUB_GID_COUNT=0",
+                "--key", "SYS_UID_MAX=998", "--key", "SYS_GID_MAX=998",
+                "--home-dir", "/nonexistent", "--shell", "/usr/sbin/nologin",
+                "--password", "!*", "--expiredate", "1970-01-02", NAME]),
+            ("getent", &["passwd", NAME]), ("id", &["-G", NAME]),
+            ("usermod", &["--expiredate", "1970-01-02", NAME]), ("getent", &["shadow", NAME]),
+        ]);
+    }
+
+    #[test]
+    fn isolation_account_existing_empty_expiry_converges_and_is_idempotent() {
+        let mut host = AccountCommands::new(true);
+        assert!(host.expiry.is_empty());
+        for _ in 0..2 {
+            host.calls.clear();
+            assert_eq!(isolation_account_with(NAME, DEFS, |name, args| host.run(name, args)).unwrap(), (900, 900));
+            assert_eq!(host.expiry, "1");
+            host.assert_order(&[
+                ("getent", &["passwd", NAME]), ("getent", &["passwd", NAME]), ("id", &["-G", NAME]),
+                ("usermod", &["--expiredate", "1970-01-02", NAME]), ("getent", &["shadow", NAME]),
+            ]);
+        }
+    }
+
+    #[test]
+    fn isolation_account_unsafe_identity_refuses_before_usermod() {
+        for passwd in [PASSWD.replace(NAME, "foreign"), PASSWD.replace("/nonexistent", "/home/foreign"),
+            PASSWD.replace("/usr/sbin/nologin", "/bin/sh"), PASSWD.replace(":900:900:", ":0:900:"),
+            PASSWD.replace(":900:900:", ":999:900:"), PASSWD.replace(":900:900:", ":900:999:")] {
+            let mut host = AccountCommands::new(true);
+            host.passwd = passwd;
+            assert!(isolation_account_with(NAME, DEFS, |name, args| host.run(name, args)).is_err());
+            host.assert_order(&[("getent", &["passwd", NAME]), ("getent", &["passwd", NAME])]);
+        }
+        let mut host = AccountCommands::new(true);
+        host.groups = "900 901\n".into();
+        assert!(isolation_account_with(NAME, DEFS, |name, args| host.run(name, args)).is_err());
+        host.assert_order(&[("getent", &["passwd", NAME]), ("getent", &["passwd", NAME]), ("id", &["-G", NAME])]);
+    }
+
+    #[test]
+    fn isolation_account_usermod_failure_or_missing_refuses_before_shadow() {
+        for missing in [false, true] {
+            let mut host = AccountCommands::new(true);
+            host.usermod_failure = !missing;
+            host.usermod_missing = missing;
+            let error = isolation_account_with(NAME, DEFS, |name, args| host.run(name, args)).unwrap_err().to_string();
+            assert!(error.contains("usermod"), "{error}");
+            assert!(host.expiry.is_empty());
+            host.assert_order(&[
+                ("getent", &["passwd", NAME]), ("getent", &["passwd", NAME]), ("id", &["-G", NAME]),
+                ("usermod", &["--expiredate", "1970-01-02", NAME]),
+            ]);
+        }
+    }
 }
 
 // Serialize binary and floor changes across install, upgrade and uninstall.
@@ -539,26 +835,43 @@ fn write_mode_marker() -> Result<()> {
 }
 
 pub(super) fn install(options: InstallOptions) -> Result<()> {
+    // v1.83 (owner decision Q7): `--migrate-from` would carry unreviewed
+    // single-binary data straight into the new trusted computing base, so it
+    // is refused for every protected install, before any lock or side effect.
+    if options.migrate_from.is_some() || options.force_migrate {
+        return Err(refused(bootstrap::MIGRATE_FROM_REFUSED));
+    }
     gate()?;
     let _lock = version_lock()?;
+    // An isolation bootstrap in progress owns this host until it is committed
+    // or rolled back; nothing here may write the floor or the program.
+    bootstrap::refuse_if_in_progress()?;
+    // v1.83 (Q7): a fresh protected install goes only through the independently
+    // verified `duduclaw-bootstrap install`. Decided before the mode marker.
+    if !managed_install()? && fresh::host_is_fresh() {
+        bootstrap::print_fresh_install_instructions();
+        return Err(refused(bootstrap::FRESH_INSTALL_REFUSED));
+    }
     write_mode_marker()?;
     let version = duduclaw_gateway::updater::current_version();
     if managed_install()? {
         // The invoking CLI's templates may be older than F's committed
         // generation. A reinstall cannot replace signed service policy.
         parse_runtime_tree(true)?;
-        return readiness::check(&mut readiness::MissingComposite);
+        return readiness::check_platform_all(&mut readiness::InstalledComposite);
     }
     // The single authoritative probe, under the lock so no concurrent install,
     // upgrade or uninstall can change the answer. The lock file and the mode
-    // marker are not residue, so creating them above never changes it. It also
-    // continues an interrupted fresh install from its strictly validated marker.
+    // marker are not residue, so creating them above never changes it. Since
+    // v1.83 (Q7) a fresh host (including an interrupted pre-v1.83 fresh install
+    // with a valid marker) was refused above, so this is false here and only an
+    // existing single-binary host is reinstalled below.
     let fresh_host = fresh::host_is_fresh();
     let floor = read_version_file(VERSION_FLOOR)?;
     // A fresh host has no earlier data, so there is nothing for G to migrate:
     // continue with the v1.80 gateway-only protected install.
     if !fresh_host && native_migration::run_if_required(floor.as_deref(), version)? {
-        return readiness::check(&mut readiness::MissingComposite);
+        return readiness::check_platform_all(&mut readiness::InstalledComposite);
     }
     check_floor(version, false, fresh_host)?;
     let executable = fs::canonicalize("/proc/self/exe")?;
@@ -567,13 +880,6 @@ pub(super) fn install(options: InstallOptions) -> Result<()> {
         if !options.i_verified_this_binary {
             return Err(refused("請先驗證執行檔；確認後才可使用 --i-verified-this-binary"));
         }
-    }
-    // The common migration refusals (a source that changes while it is being
-    // read, links, foreign owners, an existing target) happen here, before any
-    // side effect. Preflight does not detect a running source gateway as such.
-    // copy() repeats every check against the live tree.
-    if let Some(source) = options.migrate_from.as_deref() {
-        super::migrate::preflight(source, options.force_migrate)?;
     }
     // From here on a failure leaves the account and data behind. The marker
     // lets a retry continue this fresh install; record_floor removes it.
@@ -590,11 +896,6 @@ pub(super) fn install(options: InstallOptions) -> Result<()> {
         Some(3 | 4) => false,
         _ => return Err(refused("cannot determine system service state")),
     };
-    if options.migrate_from.is_some() && was_active { checked("systemctl", &["stop", UNIT])?; }
-    if let Some(source) = options.migrate_from {
-        super::migrate::copy(&source, uid, gid, options.force_migrate)?;
-        println!("個人連線使用不同的金鑰，搬移後必須重新連結。請先停止來源 Gateway，避免資料在複製時變動。");
-    }
     install_isolation_support_if_published()?;
     invalidate_recovery_bound()?;
     prepare_version(version)?;
@@ -618,6 +919,8 @@ pub(super) fn install(options: InstallOptions) -> Result<()> {
 pub(super) fn uninstall() -> Result<()> {
     gate()?;
     let _lock = version_lock()?;
+    // An uncommitted isolation bootstrap is undone only by its rollback.
+    bootstrap::refuse_if_in_progress()?;
     // The fresh-install marker goes first, on both the coordinated-removal and
     // the plain path: once a floor or key may be removed, a later install must
     // not continue an earlier fresh install over retained data. Removing it
@@ -661,9 +964,26 @@ pub(super) fn uninstall() -> Result<()> {
     Ok(())
 }
 
-pub(super) fn readiness() -> Result<()> {
+/// R8m 30b: `--platform-only` reports the platform result alone; without it
+/// the command also requires the gateway's own fresh "ready" view.
+pub(super) fn readiness(platform_only: bool) -> Result<()> {
     gate()?;
-    readiness::check(&mut readiness::MissingComposite)
+    if platform_only { return readiness::check_platform_all(&mut readiness::InstalledComposite); }
+    readiness::check(&mut readiness::InstalledComposite)
+}
+
+/// `service bootstrap-continue --protected-linux` (hidden): entered only by
+/// `duduclaw-bootstrap` after it verified and staged the generation.
+pub(super) fn bootstrap_continue(options: ContinueOptions) -> Result<()> {
+    gate()?;
+    bootstrap::continue_run(options)
+}
+
+/// `service bootstrap-rollback --protected-linux` (hidden): the same rollback
+/// without re-verifying the bundle (e.g. when the inbox was already cleared).
+pub(super) fn bootstrap_rollback() -> Result<()> {
+    gate()?;
+    rollback::run_standalone()
 }
 
 // The route is decided from installed state, under the version lock, before
@@ -716,13 +1036,14 @@ pub(super) async fn upgrade(version: Option<&str>, allow_missing_runtime: bool) 
     }
     gate()?;
     let _lock = version_lock()?;
+    bootstrap::refuse_if_in_progress()?;
     let managed = managed_install()?;
     let floor = if managed { None } else { read_version_file(VERSION_FLOOR)? };
     let route = upgrade_route(managed, floor.as_deref(), version)?;
     if route == in_place::Route::Migration {
         if let Some(requested) = version {
             if native_migration::run_if_required(floor.as_deref(), requested)? {
-                return readiness::check(&mut readiness::MissingComposite);
+                return readiness::check_platform_all(&mut readiness::InstalledComposite);
             }
         }
         return Err(refused("無法確認這個安裝的版本下限，未執行升級。"));
@@ -773,14 +1094,61 @@ mod spawnd_install_tests {
         let service = lookup("duduclaw-spawnd.service");
         assert!(service.lines().any(|line| line == format!("ExecStart={SPAWND_BINARY}")));
         assert!(service.lines().any(|line| line == "StandardOutput=null"));
-        assert!(service.lines().any(|line| line == "StandardError=null"));
+        // R6: fixed-vocabulary update status lines reach the journal.
+        assert!(service.lines().any(|line| line == "StandardError=journal"));
+        assert!(!service.lines().any(|line| line == "StandardError=null"));
+        let ready = lookup("duduclaw-isolation-ready.service");
+        assert!(ready.lines().any(|line| line == format!("ExecStart={SPAWND_BINARY} wait-consistent")));
+        assert!(lookup("duduclaw-egress.service").contains(duduclaw_isolation::ids::ISOLATED_GATEWAY_UNIT_DEPENDENCIES));
         assert!(service.lines().any(|line| line == "Slice=duduclaw-tcb.slice"));
-        assert!(service.lines().any(|line| line == "ReadWritePaths=/var/lib/duduclaw-spawnd /var/log/duduclaw-spawnd /run/duduclaw-spawnd /etc -/var/lib/systemd/linger"));
+        assert!(service.lines().any(|line| line == "ReadWritePaths=/var/lib/duduclaw-spawnd /run/duduclaw-spawnd /etc -/var/lib/systemd/linger"));
         // HX: cgroupfs is writable only beneath the employees slice; the rest stays protected.
         assert!(service.lines().any(|line| line == "ReadWritePaths=-/sys/fs/cgroup/duduclaw.slice/duduclaw-employees.slice"));
         assert!(service.lines().any(|line| line == "ProtectControlGroups=yes"));
+        // The slice is started with spawnd and realised before its namespace.
+        assert!(service.lines().any(|line| line == "Wants=duduclaw-employees.slice"));
+        assert!(service.lines().any(|line| line == "After=duduclaw-employees.slice"));
         assert!(lookup("duduclaw-employees.slice").lines().any(|line| line == "TasksMax=1024"));
         assert!(lookup("duduclaw.slice").lines().any(|line| line == "MemoryMin=512M"));
+    }
+
+    /// R7a: the installer writes exactly the bytes spawnd requires at
+    /// /etc/systemd/system/duduclaw-isolation-selftest.service (root 0644, like
+    /// every layout unit), for the name spawnd starts, running the published
+    /// self-test binary; it never enables or starts it.
+    #[test]
+    fn selftest_unit_is_installed_as_spawnd_requires_and_never_enabled() {
+        use duduclaw_isolation::ids::ISOLATION_SELFTEST_UNIT;
+        let text = layout::UNITS.iter().find(|(unit, _)| *unit == ISOLATION_SELFTEST_UNIT).unwrap().1;
+        assert_eq!(text, duduclaw_spawnd::systemd::ISOLATION_SELFTEST_UNIT_TEXT);
+        assert!(duduclaw_spawnd::systemd::fixed_unit_file_valid(text.as_bytes()));
+        assert_eq!(layout::UNITS.iter().filter(|(unit, _)| *unit == ISOLATION_SELFTEST_UNIT).count(), 1);
+        let exec = format!("ExecStart={}", duduclaw_spawnd::systemd::SELFTEST_EXECUTABLE);
+        assert!(text.lines().any(|line| line == exec));
+        assert!(layout::BINARIES.contains(&duduclaw_spawnd::systemd::SELFTEST_EXECUTABLE));
+        assert!(!text.lines().any(|line| line.trim() == "[Install]" || line.starts_with("WantedBy=")));
+        // The staging step writes unit files only; enabling and starting belong to S6.
+        let source = include_str!("protected_linux_install.rs");
+        let staging = source.split("fn install_isolation_support_for(").nth(1).unwrap()
+            .split("\nfn isolation_account(").next().unwrap();
+        assert!(staging.contains("atomic_install(&format!(\"/etc/systemd/system/{name}\"), 0o644"));
+        for effect in ["\"enable\"", "\"start\"", "\"--now\""] { assert!(!staging.contains(effect), "{effect}"); }
+    }
+
+    /// R7c: the SSH denial probe template is written like every layout unit
+    /// (root 0644, exactly spawnd's embedded bytes), runs the published probe
+    /// binary with the instance name, and is never enabled or started here.
+    #[test]
+    fn probe_template_unit_is_installed_as_spawnd_requires_and_never_enabled() {
+        use duduclaw_isolation::ids::ISOLATION_PROBE_UNIT_TEMPLATE;
+        let units: Vec<_> = layout::UNITS.iter().filter(|(unit, _)| *unit == ISOLATION_PROBE_UNIT_TEMPLATE).collect();
+        assert_eq!(units.len(), 1);
+        let text = units[0].1;
+        assert_eq!(text, duduclaw_spawnd::systemd::ISOLATION_PROBE_UNIT_TEXT);
+        let exec = format!("ExecStart={} %i", duduclaw_spawnd::systemd::PROBE_EXECUTABLE);
+        assert!(text.lines().any(|line| line == exec));
+        assert!(layout::BINARIES.contains(&duduclaw_spawnd::systemd::PROBE_EXECUTABLE));
+        assert!(!text.lines().any(|line| line.trim() == "[Install]" || line.starts_with("WantedBy=")));
     }
 }
 

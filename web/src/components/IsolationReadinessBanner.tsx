@@ -28,6 +28,8 @@ const NEXT_STEPS: Record<IsolationReasonCode, { hint: string; to: string }> = {
   helper_launcher_unavailable: { hint: 'isolationReadiness.hint.temporary', to: '/app/system/security' },
   helper_runtime_missing: { hint: 'isolationReadiness.hint.temporary', to: '/app/system/security' },
   helper_recording_unsupported: { hint: 'isolationReadiness.hint.temporary', to: '/app/system/security' },
+  migration_pending: { hint: 'isolationReadiness.hint.migration', to: '/app/system/migration' },
+  landlock_abi_clamped: { hint: 'isolationReadiness.hint.temporary', to: '/app/system/security' },
 };
 
 // Only known helper runtime ids may become user-facing feature names.
@@ -79,6 +81,11 @@ function describeReason(intl: IntlShape, reason: IsolationReason, overrides?: Is
     case 'helper_recording_unsupported':
       // W1 plain-language text (admin egress statement: `recordingEgress` below).
       return { key: reason.code, step, message: intl.formatMessage({ id: 'isolationReadiness.reason.helperRecording' }) };
+    case 'migration_pending':
+      return { key: reason.code, step, message: intl.formatMessage({ id: 'isolationReadiness.reason.migrationPending' }) };
+    case 'landlock_abi_clamped':
+      // Informational only (`notices`); never shown as an action item.
+      return { key: reason.code, step, message: intl.formatMessage({ id: 'isolationReadiness.reason.landlockClamped' }) };
     default:
       return { key: 'unknown', message: intl.formatMessage({ id: 'isolationReadiness.reason.setup' }) };
   }
@@ -88,6 +95,29 @@ function unique(views: ReasonView[]): ReasonView[] {
   const byKey = new Map<string, ReasonView>();
   for (const view of views) if (!byKey.has(view.key)) byKey.set(view.key, view);
   return [...byKey.values()];
+}
+
+/**
+ * v1.83: informational host notices (`notices`, e.g. `landlock_abi_clamped`)
+ * for administrators. A status line, never an alert: notices do not pause
+ * work and never make the banner appear on their own. Unknown codes are not shown.
+ */
+export function IsolationReadinessNotices() {
+  const intl = useIntl();
+  const readiness = useSystemStore(s => s.status?.isolation_readiness);
+  const admin = useAuthStore(s => s.user?.role === 'admin');
+  if (!admin || !readiness?.required) return null;
+  const notices = unique((readiness.notices ?? []).map(reason => describeReason(intl, reason)))
+    .filter(notice => notice.key !== 'unknown');
+  if (notices.length === 0) return null;
+  return (
+    <div role="status" className="rounded-lg border border-border px-4 py-3 text-sm text-muted-foreground">
+      <p className="font-medium text-foreground">{intl.formatMessage({ id: 'isolationReadiness.noticesTitle' })}</p>
+      <ul className="list-disc space-y-1 pl-5">
+        {notices.map(notice => <li key={notice.key}>{notice.message}</li>)}
+      </ul>
+    </div>
+  );
 }
 
 /** Readiness diagnosis only; this component does not authorize execution. */

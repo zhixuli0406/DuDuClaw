@@ -3,6 +3,8 @@
 //! rather than allowing a late reply to be mistaken for a later transaction.
 
 mod transport;
+/// R8z: fixed step names of the client's local refusals (one warning each).
+pub(crate) mod local_refusal;
 mod fd_io;
 mod work_file;
 mod helper_call;
@@ -16,6 +18,7 @@ use duduclaw_isolation::{bounded::{List, Text}, execution::*, ids::{EmployeeId, 
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 use transport::{Connection, Packet};
+use local_refusal::{refuse, refused, Step};
 use crate::workspace::{RootWorkspaceBridge, RootWorkspaceRequest, WorkspaceGuard, checked_wait};
 
 const MAX_TRACKED_RUNS: usize = 1024;
@@ -178,18 +181,20 @@ impl SpawndBackend {
     /// Bind gateway-verified task context before StartRun. Package D supplies this
     /// value from its immutable request context, never from employee arguments.
     pub async fn bind_task(&self, run: RunHandle, task: Option<Text<128>>) -> Result<(), BackendError> {
-        let entry = self.entry(run)?;
+        let entry = self.entry(run).map_err(refused(Step::Entry))?;
         let mut state = entry.state.lock().await;
-        bind_task(&mut state, task)
+        bind_task(&mut state, task).map_err(refused(Step::TaskBinding))
     }
 
     /// Bind terminal dimensions while the reservation is still unused. Root
     /// validates them and applies them inside B2 before forking the runtime.
     pub async fn configure_pty(&self, run: RunHandle, size: PtySize) -> Result<(), BackendError> {
-        size.validate().map_err(|_| BackendError::Denied)?;
-        let entry = self.entry(run)?;
+        size.validate().map_err(|_| refuse(Step::PtySize, BackendError::Denied))?;
+        let entry = self.entry(run).map_err(refused(Step::Entry))?;
         let state = entry.state.lock().await;
-        if state.started || state.outcome.is_some() || state.expires <= Instant::now() { return Err(BackendError::Denied); }
+        if state.started || state.outcome.is_some() || state.expires <= Instant::now() {
+            return Err(refuse(Step::ReservationState, BackendError::Denied));
+        }
         entry.connection.request(SpawnRequest::Resize { run, size }, &[]).await?;
         Ok(())
     }
@@ -262,26 +267,32 @@ impl SpawndBackend {
         Self::receive_io(&entry, run, &mut state).await?;
         state.mcp_fd.take().ok_or(BackendError::Denied)
     }
+    /// R8z: every local refusal below writes one `isolated spawn refused
+    /// locally` warning with its fixed `step` ([`local_refusal::Step`]) at the
+    /// refusal point; the error values are unchanged. Refusals of the
+    /// transport (before sending) are logged there; a root `Error` reply is
+    /// root's refusal and is not logged here (spawnd's audit has it).
     async fn spawn_inner(&self, policy: SpawnPolicy, workspace: Option<Arc<WorkspaceGuard>>) -> Result<RunHandle, BackendError> {
-        self.check_admission()?;
+        self.check_admission().map_err(refused(Step::Admission))?;
         // Only D's retained directory proof may request an H workspace mount.
         let selection = match &policy.workspace_delivery {
             Some(delivery) if delivery.employee == policy.employee && delivery.run == policy.run.0
-                && delivery.policy == policy.workspace => Some(delivery.selection()?),
-            Some(_) => return Err(BackendError::Denied),
+                && delivery.policy == policy.workspace =>
+                Some(delivery.selection().map_err(refused(Step::WorkspaceDelivery))?),
+            Some(_) => return Err(refuse(Step::WorkspaceDelivery, BackendError::Denied)),
             None => {
-                if workspace.is_none() { validate_workspace(&policy.workspace)?; }
+                if workspace.is_none() { validate_workspace(&policy.workspace).map_err(refused(Step::Workspace))?; }
                 None
             },
         };
-        let entry = self.entry(policy.run)?;
+        let entry = self.entry(policy.run).map_err(refused(Step::Entry))?;
         let mut state = entry.state.lock().await;
         if entry.employee != policy.employee || state.started || state.expires <= Instant::now() {
-            return Err(BackendError::Denied);
+            return Err(refuse(Step::ReservationState, BackendError::Denied));
         }
         if policy.resources.output_total_bytes == 0 || policy.resources.output_buffer_bytes == 0
             || policy.resources.memfd_total_bytes == 0 {
-            return Err(BackendError::Denied);
+            return Err(refuse(Step::ResourceLimits, BackendError::Denied));
         }
         // Preparation cannot outlive the server reservation or hold a local
         // reservation indefinitely through an adversarial input stream.
@@ -291,27 +302,38 @@ impl SpawndBackend {
             tokio::time::timeout_at(expires, prepare_inputs(policy.inputs, budget))
                 .await.map_err(|_| BackendError::Timeout)?
         };
+        // `inputs`: sealing failed (count, size, budget, reservation deadline)
+        // or, with a workspace guard, its live check refused while sealing.
         let mut prepared = match &workspace {
-            Some(workspace) => workspace.checked(prepare).await?,
-            None => prepare.await?,
-        };
+            Some(workspace) => workspace.checked(prepare).await,
+            None => prepare.await,
+        }.map_err(refused(Step::Inputs))?;
         if let Some(delivery) = &policy.workspace_delivery {
-            prepared.fds.push(delivery.directory.try_clone().map_err(|_| BackendError::Io)?.into());
+            prepared.fds.push(delivery.directory.try_clone()
+                .map_err(|_| refuse(Step::WorkspaceDelivery, BackendError::Io))?.into());
         }
         let request = SpawnRequest::StartRun { run: policy.run, employee_id: policy.employee,
             runtime_request: policy.runtime, workspace: selection, task_ref: state.task_ref.clone(), prompt_bytes: prepared.prompt_bytes,
-            input_fds: List::new(prepared.attachments).map_err(|_| BackendError::Denied)?, pty: policy.pty };
-        request.validate().map_err(|_| BackendError::Denied)?;
+            input_fds: List::new(prepared.attachments).map_err(|_| refuse(Step::Attachments, BackendError::Denied))?,
+            pty: policy.pty, requested_max_turns: policy.requested_max_turns };
+        request.validate().map_err(|_| refuse(Step::RequestInvalid, BackendError::Denied))?;
         if let Err(error) = self.check_admission() {
+            let error = refuse(Step::Admission, error);
             entry.connection.close().await;
             return Err(error);
         }
+        // Same `Unavailable` the transport returns for a closed control (its
+        // own check stays silent: other callers retry on it).
+        if entry.connection.is_closed() { return Err(refuse(Step::ConnectionState, BackendError::Unavailable)); }
         let packet = request_checked(&entry, request, &prepared.fds, workspace.as_ref()).await?;
         if let Err(error) = self.check_admission() {
+            let error = refuse(Step::AdmissionAfterSend, error);
             entry.connection.close().await;
             return Err(error);
         }
-        let SpawnResponse::Accepted { status, .. } = packet.response else { return Err(BackendError::Protocol); };
+        let SpawnResponse::Accepted { status, .. } = packet.response else {
+            return Err(refuse(Step::StartReply, BackendError::Protocol));
+        };
         state.workspace = workspace.clone();
         state.started = true;
         state.pty = policy.pty;
@@ -332,35 +354,41 @@ impl SpawndBackend {
 impl ExecutionBackend for SpawndBackend {
     fn reserve(&self, employee: EmployeeId) -> BackendFuture<'_, RunHandle> {
         Box::pin(async move {
-            self.check_admission()?;
-            self.prune_reservations()?;
-            let permit = self.slots.clone().try_acquire_owned().map_err(|_| BackendError::Unavailable)?;
-            let connection = transport::connect()?;
+            self.check_admission().map_err(refused(Step::Admission))?;
+            self.prune_reservations().map_err(refused(Step::TrackedRuns))?;
+            let permit = self.slots.clone().try_acquire_owned()
+                .map_err(|_| refuse(Step::TrackedRuns, BackendError::Unavailable))?;
+            // R8z: the endpoint steps are logged for a run's connection only
+            // (not for the boot probe in `connect`).
+            let connection = transport::connect_checked().map_err(|(step, error)| refuse(step, error))?;
             let packet = connection.request(SpawnRequest::ReserveRun { employee_id: employee }, &[]).await?;
             if let Err(error) = self.check_admission() {
+                let error = refuse(Step::Admission, error);
                 connection.close().await;
                 return Err(error);
             }
             // `features` [F17] is read (`connection_features`) before any
             // work or helper op is sent on this connection.
-            let SpawnResponse::Reserved { run, expires_at_unix_ms, features } = packet.response else { return Err(BackendError::Protocol); };
+            let SpawnResponse::Reserved { run, expires_at_unix_ms, features } = packet.response else {
+                return Err(refuse(Step::ReservationReply, BackendError::Protocol));
+            };
             let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                .map_err(|_| BackendError::Unavailable)?.as_millis();
+                .map_err(|_| refuse(Step::ReservationReply, BackendError::Unavailable))?.as_millis();
             let remaining = (expires_at_unix_ms as u128).checked_sub(now_ms)
                 .filter(|ms| *ms > 0 && *ms <= ipc::RESERVATION_TIMEOUT_MS as u128)
-                .ok_or(BackendError::Protocol)?;
+                .ok_or_else(|| refuse(Step::ReservationReply, BackendError::Protocol))?;
             let entry = Arc::new(Entry { employee, reservation_expiry: expires_at_unix_ms, features,
                 connection: Arc::new(connection), _permit: permit, state: Mutex::new(State {
                 expires: Instant::now() + Duration::from_millis(remaining as u64), started: false, task_ref: None,
                 pty: false, mcp: false, output_bytes: 0, output_buffer: 0,
                 io_received: false, stdio: None, terminal: None, mcp_fd: None, io_receipt: None, outcome: None, terminal_at: None, workspace: None,
             }) });
-            let mut runs = self.runs.lock().map_err(|_| BackendError::Unavailable)?;
+            let mut runs = self.runs.lock().map_err(|_| refuse(Step::TrackedRuns, BackendError::Unavailable))?;
             if runs.contains_key(&run.0)
                 || runs.values().filter(|entry| entry.employee == employee
                     && entry.state.try_lock().map_or(true, |state| state.outcome.is_none())).count()
                     >= ipc::DEFAULT_QUEUE_LENGTH as usize {
-                return Err(BackendError::Denied);
+                return Err(refuse(Step::ReservationQueue, BackendError::Denied));
             }
             runs.insert(run.0, entry);
             Ok(run)
@@ -379,16 +407,16 @@ impl ExecutionBackend for SpawndBackend {
             authority.verify_live()?;
             if let Some(delivery) = &policy.workspace_delivery {
                 if delivery.employee != policy.employee || delivery.run != policy.run.0
-                    || delivery.policy != policy.workspace { return Err(BackendError::Denied); }
+                    || delivery.policy != policy.workspace { return Err(refuse(Step::WorkspaceDelivery, BackendError::Denied)); }
                 authority.verify_workspace(delivery.policy.workspace.as_str(), &delivery.directory)?;
             }
             let bridge = self.workspace_bridge.as_ref().ok_or(BackendError::Unavailable)?;
             let request = RootWorkspaceRequest::from_policy(&policy)?;
-            let entry = self.entry(policy.run)?;
+            let entry = self.entry(policy.run).map_err(refused(Step::Entry))?;
             let expires = {
                 let state = entry.state.lock().await;
                 if entry.employee != policy.employee || state.started || state.expires <= Instant::now() {
-                    return Err(BackendError::Denied);
+                    return Err(refuse(Step::ReservationState, BackendError::Denied));
                 }
                 state.expires
             };
@@ -911,3 +939,7 @@ mod tests {
 #[cfg(test)]
 #[path = "spawnd/authorized_tests.rs"]
 mod authorized_tests;
+
+#[cfg(test)]
+#[path = "spawnd/local_refusal_tests.rs"]
+mod local_refusal_tests;

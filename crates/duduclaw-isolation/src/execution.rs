@@ -122,6 +122,10 @@ pub struct SpawnPolicy {
     pub capabilities: CapabilityHandover,
     pub timeouts: RunTimeouts,
     pub inputs: RunInputs,
+    /// R6: copied verbatim into `StartRun.requested_max_turns`. Only the
+    /// protected Claude main-run plan sets it (to the value it derived from the
+    /// root publication); root refuses the run unless it enforces exactly it.
+    pub requested_max_turns: Option<u16>,
 }
 
 /// Owned input stream plus a hard byte budget (§4 fd matrix). The backend copies

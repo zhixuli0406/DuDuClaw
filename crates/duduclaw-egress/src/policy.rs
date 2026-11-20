@@ -87,6 +87,29 @@ pub fn authorize_answers(target: &ConnectTarget, profile: &EgressProfile, answer
     }
 }
 
+/// R7b: the own-address set [`authorize_answers`] uses (interface addresses
+/// plus the configured NAT addresses), for the DNS probe's count.
+pub fn own_addresses() -> Result<BTreeSet<IpAddr>, EgressError> {
+    let own = host_addresses().current(std::time::Instant::now())?;
+    Ok(match CONFIGURED_HOST_ADDRESSES.get().filter(|configured| !configured.is_empty()) {
+        Some(configured) => with_configured(&own, configured),
+        None => (*own).clone(),
+    })
+}
+
+/// The per-answer rule of [`authorize_answers_with`]: public and not one of
+/// the host's own addresses.
+fn answer_permitted(ip: IpAddr, own: &BTreeSet<IpAddr>) -> bool {
+    is_public_ip(ip) && !own.contains(&canonical(ip))
+}
+
+/// R7b: how many answers a run would be allowed to connect to (the same
+/// per-answer rule as [`authorize_answers_with`]), for the DNS probe.
+pub fn public_answer_count(answers: &[IpAddr], own: &BTreeSet<IpAddr>) -> u32 {
+    let count = answers.iter().filter(|ip| answer_permitted(**ip, own)).count();
+    u32::try_from(count).unwrap_or(u32::MAX)
+}
+
 // ── SR5 round 3 N7b: host public addresses that are on no interface ─────
 //
 // A cloud host behind 1:1 NAT (elastic / floating IP) has a public address
@@ -140,7 +163,7 @@ pub fn authorize_answers_with(target: &ConnectTarget, profile: &EgressProfile, a
     target.validate().map_err(|_| EgressError::InvalidRequest)?;
     if !profile.allowed_connect_ports.as_slice().contains(&target.port) { return Err(EgressError::PortDenied); }
     if answers.is_empty() || answers.len() > 64 { return Err(EgressError::Unavailable); }
-    if answers.iter().any(|ip| !is_public_ip(*ip) || own.contains(&canonical(*ip))) {
+    if answers.iter().any(|ip| !answer_permitted(*ip, own)) {
         return Err(EgressError::DestinationDenied);
     }
     let mut pinned: Vec<_> = answers.into_iter().map(|ip| SocketAddr::new(ip, target.port.get())).collect();

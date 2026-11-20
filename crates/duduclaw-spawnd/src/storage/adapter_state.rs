@@ -19,6 +19,16 @@ pub(super) struct Operation { pub id: RequestId, pub digest: Sha256Digest }
 #[serde(deny_unknown_fields)]
 pub(super) struct Lease { pub run: RunId, pub token: RequestId }
 
+/// R8r-2: a provider-document maintenance of a Ready, unleased employee, saved
+/// before the temporary attach and cleared only after the detach. It carries
+/// no secret: only the name of the temporary file the write may leave in
+/// `home/.duduclaw-api` (fixed prefix + 16 hex). While it is present the
+/// employee is neither attached for a run nor maintained again until it is
+/// finished (`LoopStorage::recover_maintenance` at start-up).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Maintenance { pub temp: String }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Employee {
@@ -30,6 +40,9 @@ pub(super) struct Employee {
     pub phase: Phase,
     /// Persisted before H attach, including operations whose reply was lost.
     pub lease: Option<Lease>,
+    /// R8r-2 (omitted when `None`, so earlier ledgers read and write unchanged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance: Option<Maintenance>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,7 +64,9 @@ impl Journal {
                 || entry.destroy.as_ref().is_some_and(|op| !operations.insert(op.id))
                 || matches!(entry.phase, Phase::Destroying | Phase::Destroyed) != entry.destroy.is_some()
                 || (entry.phase != Phase::Ready && entry.lease.is_some())
-                || entry.lease.as_ref().is_some_and(|lease| !runs.insert(lease.run)) {
+                || entry.lease.as_ref().is_some_and(|lease| !runs.insert(lease.run))
+                || entry.maintenance.as_ref().is_some_and(|maintenance| entry.phase != Phase::Ready || entry.lease.is_some()
+                    || !crate::storage::valid_providers_temp(&maintenance.temp)) {
                 return Err(ErrorCode::IsolationUnavailable);
             }
         }
@@ -65,6 +80,8 @@ impl Journal {
     }
     /// Unknown images are never reconstructed as authorized employees. An
     /// absent Ready image is also a loss of evidence, not an empty allocation.
+    /// R8r-2: a Ready image may be mounted under a lease or a maintenance
+    /// marker (left over by a crash; finished at start-up), never otherwise.
     pub fn reconcile(&self, images: &[ImageStatus]) -> Result<()> {
         self.validate()?;
         let mut seen = std::collections::BTreeSet::new();
@@ -72,7 +89,7 @@ impl Journal {
             let entry = self.entry(image.employee).map_err(|_| ErrorCode::IsolationUnavailable)?;
             if !seen.insert(image.employee) || entry.uid != image.uid || entry.quota != image.quota
                 || entry.phase == Phase::Destroyed
-                || (entry.phase == Phase::Ready && entry.lease.is_none() && image.mounted_device.is_some()) {
+                || (entry.phase == Phase::Ready && entry.lease.is_none() && entry.maintenance.is_none() && image.mounted_device.is_some()) {
                 return Err(ErrorCode::IsolationUnavailable);
             }
         }
@@ -91,7 +108,7 @@ mod tests {
         Employee { employee: EmployeeId([1; 16]), uid: 70_000,
             quota: Quota { bytes: 64 * 1024 * 1024, inodes: 1024 },
             provision: Operation { id: RequestId([2; 16]), digest: Sha256Digest([3; 32]) },
-            destroy: None, phase: Phase::Ready, lease: None }
+            destroy: None, phase: Phase::Ready, lease: None, maintenance: None }
     }
     fn image(entry: &Employee) -> ImageStatus {
         ImageStatus { employee: entry.employee, uid: entry.uid, quota: entry.quota,
@@ -134,5 +151,31 @@ mod tests {
         assert!(Journal { version: 1, employees: vec![entry] }.validate().is_err());
         let mut json = serde_json::to_value(Journal::empty()).unwrap(); json["extra"] = true.into();
         assert!(serde_json::from_value::<Journal>(json).is_err());
+    }
+    /// R8r-2: the maintenance marker survives a restart, carries the temp
+    /// name only, lets a left-over mount pass inventory (so start-up can
+    /// detach it), and exists only on a Ready, unleased entry.
+    #[test]
+    fn storage_adapter_maintenance_marker_is_durable_and_scoped() {
+        let plain = Journal { version: 1, employees: vec![entry()] };
+        assert!(!serde_json::to_string(&plain).unwrap().contains("maintenance"), "earlier ledgers are byte-identical");
+        let mut marked = entry();
+        marked.maintenance = Some(Maintenance { temp: crate::storage::providers_temp_name([0x5a; 8]) });
+        let journal = Journal { version: 1, employees: vec![marked.clone()] };
+        let text = serde_json::to_string(&journal).unwrap();
+        assert!(text.contains(r#""maintenance":{"temp":".providers.json.tmp-5a5a5a5a5a5a5a5a"}"#), "{text}");
+        let restored: Journal = serde_json::from_str(&text).unwrap();
+        assert_eq!(restored.entry(marked.employee).unwrap().maintenance, marked.maintenance);
+        let mut mounted = image(&marked);
+        mounted.mounted_device = Some(duduclaw_isolation_storage::device::DeviceId { major: 7, minor: 4 });
+        assert!(restored.reconcile(std::slice::from_ref(&mounted)).is_ok(), "a left-over maintenance mount is recoverable");
+        assert!(plain.reconcile(&[mounted]).is_err(), "an unmarked unleased mount is not");
+        let mut leased = marked.clone(); leased.lease = Some(Lease { run: RunId([4; 16]), token: RequestId([5; 16]) });
+        let mut destroying = marked.clone(); destroying.phase = Phase::Destroying;
+        destroying.destroy = Some(Operation { id: RequestId([6; 16]), digest: Sha256Digest([7; 32]) });
+        let mut bad_name = marked; bad_name.maintenance = Some(Maintenance { temp: "providers.json".into() });
+        for bad in [leased, destroying, bad_name] {
+            assert!(Journal { version: 1, employees: vec![bad] }.validate().is_err());
+        }
     }
 }

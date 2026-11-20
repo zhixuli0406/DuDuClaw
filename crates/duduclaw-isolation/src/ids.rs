@@ -41,6 +41,88 @@ pub const IMPORT_UNIT_PATTERN: &str = "duduclaw-import-<request-id>.service";
 pub const EMPLOYEES_SLICE: &str = "duduclaw-employees.slice";
 pub const EMPLOYEE_SLICE_PATTERN: &str = "duduclaw-employees-<immutable-id>.slice";
 pub const UPDATED_UNIT: &str = "duduclaw-updated.service";
+/// R6 (plan addendum "啟動順序與「一致」的判定", points 3 and 6): the oneshot
+/// unit that completes only once spawnd reports the isolated component set
+/// verified and consistent (`duduclaw-spawnd wait-consistent`). It is bound to
+/// spawnd (`BindsTo=`/`PartOf=`/`After=`), so it drops whenever spawnd stops,
+/// crashes or restarts, and spawnd pulls it in again (`Wants=`) on every start.
+pub const ISOLATION_READY_UNIT: &str = "duduclaw-isolation-ready.service";
+/// The two `[Unit]` lines the isolated-install gateway unit (written by the
+/// installer package, R3) must carry, exactly as `duduclaw-egress.service`
+/// does, so the gateway never starts on an unverified or mixed set and is
+/// stopped whenever the gate drops (`BindsTo=`, not only `Requires=`). The
+/// single-binary gateway unit (no spawnd on those hosts) must not carry them.
+pub const ISOLATED_GATEWAY_UNIT_DEPENDENCIES: &str =
+    "BindsTo=duduclaw-isolation-ready.service\nAfter=duduclaw-isolation-ready.service\n";
+/// The egress service (bound to [`ISOLATION_READY_UNIT`]) and the socket that
+/// activates it, and the isolated-install gateway unit (bound to it as well).
+pub const EGRESS_UNIT: &str = "duduclaw-egress.service";
+pub const EGRESS_SOCKET_UNIT: &str = "duduclaw-egress.socket";
+pub const ISOLATED_GATEWAY_UNIT: &str = "duduclaw-gateway.service";
+/// R6 `Apply` precondition: the consistency gate, every unit bound to it and
+/// the socket that could start one of them again. The updater stops and checks
+/// exactly these before `Apply`; spawnd refuses `Apply` unless PID 1 reports
+/// each of them inactive with no pending job.
+pub const ISOLATION_GATED_UNITS: [&str; 4] = [ISOLATION_READY_UNIT, EGRESS_SOCKET_UNIT, EGRESS_UNIT, ISOLATED_GATEWAY_UNIT];
+/// R7a: the dedicated, non-login account `duduclaw-run-selftest` drops to. It
+/// owns no data, is never an employee and never a service identity.
+pub const SELFTEST_USER: &str = "duduclaw-selftest";
+/// R7a: the fixed, pre-installed oneshot unit that runs the isolation self-test.
+/// One of the fixed units spawnd starts by name (`Systemd::run_fixed_unit`,
+/// with the R7c probe instances below); its name is
+/// deliberately not of the run-unit shape (`duduclaw-run-<hex>.service`), so no
+/// run inventory, census or reconciliation ever counts it as an employee run.
+pub const ISOLATION_SELFTEST_UNIT: &str = "duduclaw-isolation-selftest.service";
+/// R7c: the pre-installed template unit (root:root 0644, no `[Install]`) that
+/// runs the one-shot SSH denial probe for one employee account on one sshd
+/// port. Instances are `duduclaw-isolation-probe@<account>.<port>.service`
+/// ([`probe_instance`]); never the run-unit shape.
+pub const ISOLATION_PROBE_UNIT_TEMPLATE: &str = "duduclaw-isolation-probe@.service";
+/// R7c: name prefix of every probe instance (followed by the instance
+/// `<account>.<port>` and `.service`).
+pub const ISOLATION_PROBE_UNIT_PREFIX: &str = "duduclaw-isolation-probe@";
+/// R7c: the supplementary group the (unprivileged) probe unit runs with, so it
+/// can read sshd's journal records.
+pub const PROBE_JOURNAL_GROUP: &str = "systemd-journal";
+
+/// R7c: the probe instance string `<account>.<port>` (also the probe's single
+/// argument, systemd's `%i`): exactly one `.`, the account passes
+/// [`employee_account_name_valid`] (which admits no `.`), the port is
+/// 1..=65535 in canonical decimal ([`crate::ssh_config::port_number`]: no sign,
+/// no leading zero). `None` for anything else.
+pub fn probe_instance(instance: &str) -> Option<(&str, u16)> {
+    let (account, port) = instance.split_once('.')?;
+    if port.contains('.') || !employee_account_name_valid(account) { return None; }
+    Some((account, crate::ssh_config::port_number(port)?))
+}
+/// The inverse of [`probe_instance`]; `None` unless the account passes the
+/// name rule and the port is non-zero.
+pub fn probe_instance_text(account: &str, port: u16) -> Option<String> {
+    (employee_account_name_valid(account) && port != 0).then(|| format!("{account}.{port}"))
+}
+/// The literal prefix of every employee account name (`EMPLOYEE_USER_PATTERN`).
+pub const EMPLOYEE_ACCOUNT_PREFIX: &str = "duduclaw-emp-";
+
+/// R7c: the single account-name rule the SSH denial probe enforces,
+/// `^duduclaw-emp-[a-z0-9-]{1,48}$`. Every name spawnd allocates
+/// (`duduclaw-emp-<uid decimal>`) satisfies it.
+pub fn employee_account_name_valid(name: &str) -> bool {
+    name.strip_prefix(EMPLOYEE_ACCOUNT_PREFIX).is_some_and(|rest| (1..=48).contains(&rest.len())
+        && rest.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'))
+}
+/// Service accounts the self-test identity must never coincide with.
+pub const SERVICE_USERS: [&str; 6] = [GATEWAY_USER, SUPERVISOR_USER, PARSE_WORKER_USER,
+    IMPORT_WORKER_USER, EGRESS_USER, DOWNLOAD_USER];
+
+/// R7a: the resolved self-test identity is acceptable only if it is neither
+/// root nor in the employee range, and neither its uid nor its gid equals any
+/// resolved service account's (`services`: `(uid, gid)` of each [`SERVICE_USERS`]
+/// entry that exists on the host).
+pub fn selftest_identity_allowed(uid: u32, gid: u32, services: &[(u32, u32)]) -> bool {
+    let employee = |id: u32| (EMPLOYEE_UID_MIN..=EMPLOYEE_UID_MAX).contains(&id);
+    uid != 0 && gid != 0 && uid != u32::MAX && gid != u32::MAX && !employee(uid) && !employee(gid)
+        && !services.iter().any(|(service_uid, service_gid)| *service_uid == uid || *service_gid == gid)
+}
 
 /// Inclusive numeric interval, checked before allocation (§5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +185,75 @@ impl UidPolicy<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn isolated_gateway_unit_dependencies_are_pinned() {
+        assert_eq!(ISOLATION_READY_UNIT, "duduclaw-isolation-ready.service");
+        assert_eq!(ISOLATED_GATEWAY_UNIT_DEPENDENCIES,
+            "BindsTo=duduclaw-isolation-ready.service\nAfter=duduclaw-isolation-ready.service\n");
+        let lines: Vec<&str> = ISOLATED_GATEWAY_UNIT_DEPENDENCIES.lines().collect();
+        assert_eq!(lines, [format!("BindsTo={ISOLATION_READY_UNIT}"), format!("After={ISOLATION_READY_UNIT}")]);
+        // Requires= alone would leave the gateway running after the gate drops.
+        assert!(!ISOLATED_GATEWAY_UNIT_DEPENDENCIES.contains("Requires="));
+        assert_eq!(ISOLATION_GATED_UNITS, ["duduclaw-isolation-ready.service", "duduclaw-egress.socket",
+            "duduclaw-egress.service", "duduclaw-gateway.service"]);
+    }
+    #[test]
+    fn selftest_unit_and_identity_are_pinned_and_refuse_privileged_or_employee_ids() {
+        assert_eq!(SELFTEST_USER, "duduclaw-selftest");
+        assert_eq!(ISOLATION_SELFTEST_UNIT, "duduclaw-isolation-selftest.service");
+        // Never the run-unit shape (duduclaw-run-<32 hex>.service).
+        assert!(!ISOLATION_SELFTEST_UNIT.starts_with("duduclaw-run-"));
+        assert!(!SERVICE_USERS.contains(&SELFTEST_USER));
+        let services = [(990, 990), (991, 989)];
+        assert!(selftest_identity_allowed(995, 995, &services));
+        for (uid, gid) in [(0, 995), (995, 0), (990, 995), (995, 989), (70000, 995), (995, 99999),
+            (u32::MAX, 995), (995, u32::MAX)] {
+            assert!(!selftest_identity_allowed(uid, gid, &services), "{uid}:{gid}");
+        }
+    }
+    #[test]
+    fn probe_unit_names_and_employee_account_rule_are_pinned() {
+        assert_eq!(ISOLATION_PROBE_UNIT_TEMPLATE, "duduclaw-isolation-probe@.service");
+        assert_eq!(ISOLATION_PROBE_UNIT_PREFIX, "duduclaw-isolation-probe@");
+        assert!(ISOLATION_PROBE_UNIT_TEMPLATE.starts_with(ISOLATION_PROBE_UNIT_PREFIX));
+        assert!(!ISOLATION_PROBE_UNIT_PREFIX.starts_with("duduclaw-run-"));
+        assert_eq!(EMPLOYEE_ACCOUNT_PREFIX, "duduclaw-emp-");
+        assert!(EMPLOYEE_USER_PATTERN.starts_with(EMPLOYEE_ACCOUNT_PREFIX));
+        let longest = format!("duduclaw-emp-{}", "a".repeat(48));
+        let too_long = format!("duduclaw-emp-{}", "a".repeat(49));
+        for good in ["duduclaw-emp-70000", "duduclaw-emp-probetest", "duduclaw-emp-a", "duduclaw-emp--", longest.as_str()] {
+            assert!(employee_account_name_valid(good), "{good}");
+        }
+        for bad in ["duduclaw-emp-", "duduclaw-emp-A", "duduclaw-emp-a_b", "duduclaw-emp-a.b", "duduclaw-emp-a b",
+            "Duduclaw-emp-1", "xduduclaw-emp-1", "duduclaw-emp-1\n", "duduclaw-emp-é", "duduclaw-runsup", "root", "",
+            too_long.as_str()] {
+            assert!(!employee_account_name_valid(bad), "{bad:?}");
+        }
+    }
+    /// R7c: the probe instance `<account>.<port>` (unit `%i` and probe argv):
+    /// one `.`, the account rule, a canonical decimal port.
+    #[test]
+    fn probe_instance_parses_account_and_port_strictly() {
+        assert_eq!(PROBE_JOURNAL_GROUP, "systemd-journal");
+        assert_eq!(probe_instance("duduclaw-emp-ab12.22"), Some(("duduclaw-emp-ab12", 22)));
+        assert_eq!(probe_instance("duduclaw-emp-70000.65535"), Some(("duduclaw-emp-70000", 65535)));
+        assert_eq!(probe_instance("duduclaw-emp-70000.1"), Some(("duduclaw-emp-70000", 1)));
+        assert_eq!(probe_instance_text("duduclaw-emp-ab12", 22).as_deref(), Some("duduclaw-emp-ab12.22"));
+        for port in [1u16, 22, 2222, 65535] {
+            let text = probe_instance_text("duduclaw-emp-70000", port).unwrap();
+            assert_eq!(probe_instance(&text), Some(("duduclaw-emp-70000", port)));
+        }
+        assert_eq!(probe_instance_text("duduclaw-emp-70000", 0), None);
+        assert_eq!(probe_instance_text("root", 22), None);
+        assert_eq!(probe_instance_text("duduclaw-emp-a.b", 22), None);
+        for bad in ["duduclaw-emp-70000", "duduclaw-emp-70000.", "duduclaw-emp-70000.0", "duduclaw-emp-70000.022",
+            "duduclaw-emp-70000.65536", "duduclaw-emp-70000.+22", "duduclaw-emp-70000.-1", "duduclaw-emp-70000.22.22",
+            "duduclaw-emp-70000.2 2", "duduclaw-emp-70000. 22", "duduclaw-emp-70000.22\n", "duduclaw-emp-70000.1e3",
+            "duduclaw-emp-70000.ssh", ".22", "root.22", "duduclaw-emp-A.22", "duduclaw-emp-a.b.22",
+            "duduclaw-emp-70000..22", "duduclaw-emp-70000.99999999", ""] {
+            assert_eq!(probe_instance(bad), None, "{bad:?}");
+        }
+    }
     #[test]
     fn uid_range_checks_fail_closed() {
         let mut policy = UidPolicy {

@@ -411,7 +411,8 @@ pub const EMPLOYEE_TREE_GONE: &str =
 ///
 /// SR5 round 3 follow-up R3-2: the write is descriptor-relative and never
 /// follows a link (Unix, via [`safe_dir::SafeDir`]): `agents/<label>` is
-/// opened `O_DIRECTORY|O_NOFOLLOW` (every ancestor too), `SKILLS` is
+/// opened `O_DIRECTORY|O_NOFOLLOW` (every ancestor too, search-only: Linux
+/// `O_PATH`, so a root-owned 0711 parent of the home is traversable), `SKILLS` is
 /// `mkdirat`/`openat`ed with `O_NOFOLLOW`, the content goes to a fresh temp
 /// file (`O_CREAT|O_EXCL|O_NOFOLLOW`) that is fsynced and `renameat`ed over
 /// `<name>.md`. A symlink pre-planted at `SKILLS/<name>.md` is replaced as an

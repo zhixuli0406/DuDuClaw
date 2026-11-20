@@ -783,6 +783,24 @@ impl GenericCliRuntime {
     }
 }
 
+/// The checks every turn of a registered CLI passes first, in both modes and
+/// in this order, with the same errors as before R8x. A refusal also names
+/// its fixed R8x site (used only by the protected branch's log line).
+fn preflight(id: &str, context: &RuntimeContext)
+    -> Result<(), (crate::isolation_mcp::refusal::RefusalSite, String)> {
+    use crate::isolation_mcp::refusal::site;
+    if crate::runtime_dispatch::in_utility_call() {
+        return Err((site!("preflight.utility_call"),
+            "generic CLI utility calls refused: no verified tool-free mode".into()));
+    }
+    // P5: this runtime cannot carry the read-only explore lane.
+    crate::explore_lane::refuse_unsupported_runtime("generic CLI")
+        .map_err(|error| (site!("preflight.explore_lane"), error))?;
+    crate::product_policy::require_runtime(&context.home_dir, id)
+        .map_err(|error| (site!("preflight.runtime_policy"), error))?;
+    Ok(())
+}
+
 #[async_trait]
 impl AgentRuntime for GenericCliRuntime {
     fn name(&self) -> &str {
@@ -794,20 +812,29 @@ impl AgentRuntime for GenericCliRuntime {
         prompt: &str,
         context: &RuntimeContext,
     ) -> Result<RuntimeResponse, String> {
-        if crate::runtime_dispatch::in_utility_call() {
-            return Err("generic CLI utility calls refused: no verified tool-free mode".into());
+        #[cfg(target_os = "linux")]
+        if duduclaw_core::execution_gate::isolation_required() {
+            use crate::isolation_mcp::{refusal::site, runtime::keep};
+            // R8x: the whole protected turn — the shared preflight (same order
+            // and errors), the S3 gate and the isolated run (whose own scope
+            // joins this one) — is one observed scope: one line per refused turn.
+            return crate::isolation_mcp::runtime::observed(crate::isolation_mcp::runtime::REGISTERED_LABEL,
+                &context.agent_id, async {
+                preflight(self.spec.id, context).map_err(|(site, error)| keep(site)(error))?;
+                // RM-103 S3: the employee's native write/shell restrictions hold in
+                // protected mode too — refused before the isolated route.
+                super::protected_coarse_native_gate(context.capabilities.as_ref(), self.spec.id, &context.agent_id)
+                    .map_err(keep(site!("authorize.native_gate")))?;
+                crate::isolation_mcp::runtime::execute_registered_cli(
+                    self.spec.id, prompt, context, self.spec.headless.output).await
+            }).await;
         }
-        // P5: this runtime cannot carry the read-only explore lane.
-        crate::explore_lane::refuse_unsupported_runtime("generic CLI")?;
-        crate::product_policy::require_runtime(&context.home_dir, self.spec.id)?;
+        preflight(self.spec.id, context).map_err(|(_, error)| error)?;
+        #[cfg(not(target_os = "linux"))]
         if duduclaw_core::execution_gate::isolation_required() {
             // RM-103 S3: the employee's native write/shell restrictions hold in
             // protected mode too — refused before the isolated route.
             super::protected_coarse_native_gate(context.capabilities.as_ref(), self.spec.id, &context.agent_id)?;
-            #[cfg(target_os = "linux")]
-            return crate::isolation_mcp::runtime::execute_registered_cli(
-                self.spec.id, prompt, context, self.spec.headless.output).await;
-            #[cfg(not(target_os = "linux"))]
             return super::isolation_gate::require_integrated(super::isolation_gate::PendingRuntime::GenericCli)
                 .and_then(|_| Err("protected runtime unavailable on this platform".into()));
         }

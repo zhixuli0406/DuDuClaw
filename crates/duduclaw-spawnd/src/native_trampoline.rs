@@ -56,6 +56,9 @@ pub enum HelperState {
     /// Readiness / per-call reason, e.g. `helper_cgroup_unavailable`.
     Unavailable(&'static str),
 }
+/// The only `argv[0]` a signed forwarder may carry: its entry in the verified
+/// runtime mount (checked in `prepare`; the R7d policy tool generates it).
+pub(crate) fn forwarder_argv0(entry: &str) -> String { format!("/runtime/{entry}") }
 pub struct ForwarderProfile {
     pub entry: String,
     pub executable_digest: Sha256Digest,
@@ -63,8 +66,9 @@ pub struct ForwarderProfile {
     pub seccomp: RuntimeProfile,
     pub seccomp_digest: Sha256Digest,
 }
-/// Supplied by the installer only after binary digest and isolated namespace /
-/// Landlock self-tests have been read back. Kernel ABI probing alone is not it.
+/// Readback of the binary digests and the isolated namespace / Landlock
+/// self-test (R7a: `crate::selftest::SelfTestInstallation`, measured by spawnd
+/// through PID 1, not an installer receipt). Kernel ABI probing alone is not it.
 pub trait Installation: Send { fn readback(&mut self) -> Result<TrampolineReadiness>; }
 pub struct MissingInstallation;
 impl Installation for MissingInstallation { fn readback(&mut self) -> Result<TrampolineReadiness> { Err(unavailable()) } }
@@ -170,6 +174,17 @@ impl NativeTrampoline {
     pub fn new(installation: Box<dyn Installation>) -> Self { Self { installation, runs: BTreeMap::new() } }
 }
 impl Default for NativeTrampoline { fn default() -> Self { Self::new(Box::new(MissingInstallation)) } }
+/// R8r-4 MCP acceptance harness only (feature `policy-tool`, never a release
+/// build): the root end of a prepared run's bootstrap/status socket, so the
+/// harness's failure diagnosis can PEEK a status record that `poll` reduces to
+/// `IsolationUnavailable` (`StatusRecord::Error`), and read what is left once
+/// the run has failed. Borrowed, read-only access; `poll` is unchanged.
+#[cfg(any(test, feature = "policy-tool"))]
+impl NativeTrampoline {
+    pub(crate) fn acceptance_status_socket(&self, run: RunHandle) -> Option<std::os::fd::BorrowedFd<'_>> {
+        self.runs.get(&run.0).map(|pending| pending.socket.as_fd())
+    }
+}
 impl Trampoline for NativeTrampoline {
     fn readiness(&mut self) -> Result<TrampolineReadiness> {
         let result = self.installation.readback()?;
@@ -209,7 +224,7 @@ impl Trampoline for NativeTrampoline {
         let forwarder = if let Some(value) = profile.forwarder {
             let verified = checked(crate::bootstrap_mounts::open_verified(runtime.as_fd(), &value.entry,
                 value.executable_digest, true, std::time::Instant::now() + std::time::Duration::from_secs(15)))?;
-            if value.argv.first().map(|arg| arg.as_bytes()) != Some(format!("/runtime/{}", value.entry).as_bytes()) {
+            if value.argv.first().map(|arg| arg.as_bytes()) != Some(forwarder_argv0(&value.entry).as_bytes()) {
                 return Err(unavailable());
             }
             Some((Program { identity: checked(fd::observe(verified.fd.as_raw_fd()))?.identity,

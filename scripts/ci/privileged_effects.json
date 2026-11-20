@@ -4,6 +4,19 @@
   "identity_semantics": "identity records current execution domain; target_identity is a pending migration destination. test/operator/host_service are inventory-only domains outside the native wire contract",
   "entries": [
     {
+      "symbol": "crates/duduclaw-import/src/capture_tests.rs::filesystem::capture_creates_no_files_in_home_tmpdir_or_cwd",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_status": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Re-executes only this regression test with isolated TMPDIR and cwd to verify in-memory capture creates no files, without changing the concurrent test runner environment."
+    },
+    {
       "symbol": "crates/duduclaw-gateway/src/claude_runner/work_outcome_tests.rs::background_idle_stops_pending_tool_and_keepalive_does_not_reset_it",
       "apis": {
         "command_constructor": 1
@@ -99,6 +112,19 @@
         "process_spawn"
       ],
       "rationale": "Typed ExecutionBackend handoff; original native Command/PTY builder retained by LocalBackend. Protected launch requires trusted immutable policy/input/capability context and uses daemon run handles; missing context is refused without gateway execution."
+    },
+    {
+      "symbol": "crates/duduclaw-agent/src/registry.rs::load_skills_tests::iso_root_skill_layer_loads_below_a_root_0711_parent",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_status": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Ignored root-VM test re-runs one copy of this test binary as uid/gid 65534 (an exact test filter) to seed and load skill layers below a root:root 0711 parent; not a production spawn path."
     },
     {
       "symbol": "crates/duduclaw-agent/src/runner.rs::call_claude_streaming",
@@ -1052,7 +1078,7 @@
       "rationale": "Operator installation/service-lifecycle helper; runs service-manager commands under the invoking administrator or gateway identity, not employee content."
     },
     {
-      "symbol": "crates/duduclaw-cli/src/service/protected_linux_install.rs::command",
+      "symbol": "crates/duduclaw-cli/src/service/protected_linux_install.rs::command_within",
       "apis": {
         "command_constructor": 1,
         "terminal_spawn": 1
@@ -1062,7 +1088,7 @@
       ],
       "identity": "gateway",
       "migration": "gateway_exception",
-      "rationale": "Operator-only protected Linux installer invokes root-trusted OS utilities with fixed caller-built argv, cleared environment and null stdin. Temporary-file capture is capped at 4 MiB per stream with a 30-second child deadline; no employee prompt, shell text or backend workload runs here."
+      "rationale": "Operator-only protected Linux installer invokes root-trusted OS utilities with fixed caller-built argv, cleared environment and null stdin. Temporary-file capture is capped at 4 MiB per stream with a child deadline of at most 30 seconds. The helper takes an ABSOLUTE deadline (`command` passes now + 30 s; the shared resume/rollback quiesce and its full process scan, including every `getent passwd` lookup of protected_linux_uninstall.rs::processes_clear_until, pass their one quiesce deadline): it is checked on entry, immediately before and right after the spawn, the child gets min(deadline, spawn + 30 s), and nothing is spawned or read once it has passed. No employee prompt, shell text or backend workload runs here. v1.83 R3: the isolation bootstrap, its rollback and its creation ledger (protected_linux_bootstrap.rs, protected_linux_rollback.rs, protected_linux_ledger.rs) run every tool only through this helper (systemctl — including the quiesce's fixed `list-units --all --no-legend --plain --no-pager duduclaw-* duduclaw.slice`, `list-jobs --no-legend --plain --no-pager duduclaw-* duduclaw.slice`, `show <unit> --property=…`, `stop <unit>` and, for spawnd's transient run units and employee slices only, `kill --signal=SIGKILL <unit>` on validated unit names — useradd, getent including the full `getent passwd` / `getent group` enumeration of the service-identity alias check, id, loginctl, `dmsetup table --major M --minor m` for the read-only storage-chain check and, via parse_runtime_tree, python3 -I; the root-only #[ignore] test iso_root_install_rollback_refuses_bind_mount_inside_tree also runs `mount --bind` / `umount` on fixed test paths of a disposable VM); their output is parsed, never printed, and those files add no other process spawn. Their privileged file effects (unlinkat/rmdir of ledgered objects only, after a statx STATX_MNT_ID identity match) are filesystem operations, not process effects."
     },
     {
       "symbol": "crates/duduclaw-container/src/apple.rs::AppleContainerRuntime::is_available",
@@ -1735,7 +1761,7 @@
       "rationale": "Desktop/OS host integration outside native Linux employee isolation; needs its own capability boundary. Not a protected-mode execution exemption."
     },
     {
-      "symbol": "crates/duduclaw-egress/src/daemon.rs::serve_control",
+      "symbol": "crates/duduclaw-egress/src/daemon.rs::serve_control_with_probe",
       "apis": {
         "terminal_spawn": 1
       },
@@ -1745,6 +1771,18 @@
       "identity": "egress",
       "migration": "not_process",
       "rationale": "JoinSet::spawn creates a Tokio task for a registered run tunnel in the existing egress process; no native child is launched."
+    },
+    {
+      "symbol": "crates/duduclaw-egress/src/dns_probe.rs::post_lookup_worker",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "task_or_thread"
+      ],
+      "identity": "egress",
+      "migration": "not_process",
+      "rationale": "One named std thread in the existing egress process handles the DNS probe's post-lookup work before the seccomp filter is installed (with TSYNC, so the thread is filtered too); no native child is launched."
     },
     {
       "symbol": "crates/duduclaw-egress/src/forwarder.rs::forward_loop",
@@ -4663,6 +4701,18 @@
       "rationale": "Test fixture or test helper; compiled/run only for regression verification, not a production employee execution entry point."
     },
     {
+      "symbol": "crates/duduclaw-gateway/src/update_readback.rs::linux::start",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "thread_spawn"
+      ],
+      "identity": "gateway",
+      "migration": "not_process",
+      "rationale": "R6: std::thread::Builder::spawn starts the one bounded Rust thread serving the root-only update readback socket (one frame per connection, 5 s timeouts); no OS child process is launched."
+    },
+    {
       "symbol": "crates/duduclaw-gateway/src/updater.rs::apply_update_inner",
       "apis": {
         "command_constructor": 1,
@@ -4727,56 +4777,16 @@
       "rationale": "Test fixture or test helper; compiled/run only for regression verification, not a production employee execution entry point."
     },
     {
-      "symbol": "crates/duduclaw-inference/src/hardware.rs::detect_amd",
-      "apis": {
-        "command_constructor": 1,
-        "terminal_output": 1
-      },
-      "effects": [
-        "process_spawn"
-      ],
-      "identity": "gateway",
-      "migration": "gateway_exception",
-      "rationale": "Read-only host GPU/RAM/CPU capability probe using fixed platform tools; no employee prompt is executed."
-    },
-    {
       "symbol": "crates/duduclaw-inference/src/hardware.rs::detect_apple_chip",
       "apis": {
-        "command_constructor": 1,
-        "terminal_output": 1
+        "command_constructor": 1
       },
       "effects": [
         "process_spawn"
       ],
       "identity": "gateway",
       "migration": "gateway_exception",
-      "rationale": "Read-only host GPU/RAM/CPU capability probe using fixed platform tools; no employee prompt is executed."
-    },
-    {
-      "symbol": "crates/duduclaw-inference/src/hardware.rs::detect_nvidia",
-      "apis": {
-        "command_constructor": 1,
-        "terminal_output": 1
-      },
-      "effects": [
-        "process_spawn"
-      ],
-      "identity": "gateway",
-      "migration": "gateway_exception",
-      "rationale": "Read-only host GPU/RAM/CPU capability probe using fixed platform tools; no employee prompt is executed."
-    },
-    {
-      "symbol": "crates/duduclaw-inference/src/hardware.rs::detect_nvidia_vram",
-      "apis": {
-        "command_constructor": 1,
-        "terminal_output": 1
-      },
-      "effects": [
-        "process_spawn"
-      ],
-      "identity": "gateway",
-      "migration": "gateway_exception",
-      "rationale": "Read-only host GPU/RAM/CPU capability probe using fixed platform tools; no employee prompt is executed."
+      "rationale": "Read-only host GPU/RAM/CPU capability probe using fixed platform tools; no employee prompt is executed. Run through run_bounded (hard deadline, killed and reaped on expiry)."
     },
     {
       "symbol": "crates/duduclaw-inference/src/hardware.rs::detect_ram_macos",
@@ -4803,6 +4813,115 @@
       "identity": "gateway",
       "migration": "gateway_exception",
       "rationale": "Read-only host GPU/RAM/CPU capability probe using fixed platform tools; no employee prompt is executed."
+    },
+    {
+      "symbol": "crates/duduclaw-inference/src/hardware.rs::guarded_command",
+      "apis": {
+        "command_constructor": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "gateway",
+      "migration": "gateway_exception",
+      "rationale": "Read-only host GPU capability probe (fixed tools nvidia-smi / rocm-smi under the namespace guard); no employee prompt is executed. Run through run_bounded (hard deadline, killed and reaped on expiry)."
+    },
+    {
+      "symbol": "crates/duduclaw-inference/src/hardware.rs::run_bounded",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "gateway",
+      "migration": "gateway_exception",
+      "rationale": "Starts one read-only hardware probe command built by guarded_command / detect_apple_chip, bounded by PROBE_COMMAND_TIMEOUT; on expiry the child is killed and reaped. No employee prompt is executed."
+    },
+    {
+      "symbol": "crates/duduclaw-inference/src/hardware.rs::tests::answer",
+      "apis": {
+        "command_constructor": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test fixture or test helper; compiled/run only for regression verification, not a production employee execution entry point."
+    },
+    {
+      "symbol": "crates/duduclaw-inference/src/hardware.rs::tests::cancelled_probe_kills_the_whole_group",
+      "apis": {
+        "command_constructor": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test fixture or test helper; compiled/run only for regression verification, not a production employee execution entry point."
+    },
+    {
+      "symbol": "crates/duduclaw-inference/src/hardware.rs::tests::exited_leader_with_stdout_helper_is_killed_before_reaping",
+      "apis": {
+        "command_constructor": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test fixture or test helper; compiled/run only for regression verification, not a production employee execution entry point."
+    },
+    {
+      "symbol": "crates/duduclaw-inference/src/hardware.rs::tests::exists",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_status": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test fixture or test helper; compiled/run only for regression verification, not a production employee execution entry point."
+    },
+    {
+      "symbol": "crates/duduclaw-inference/src/hardware.rs::tests::hang",
+      "apis": {
+        "command_constructor": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test fixture or test helper; compiled/run only for regression verification, not a production employee execution entry point."
+    },
+    {
+      "symbol": "crates/duduclaw-inference/src/hardware.rs::tests::hung_probe_with_forked_helper_kills_the_whole_group",
+      "apis": {
+        "command_constructor": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test fixture or test helper; compiled/run only for regression verification, not a production employee execution entry point."
+    },
+    {
+      "symbol": "crates/duduclaw-inference/src/hardware.rs::tests::spawn_hanging_guard",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test fixture or test helper; compiled/run only for regression verification, not a production employee execution entry point."
     },
     {
       "symbol": "crates/duduclaw-inference/src/llamafile.rs::LlamafileManager::start",
@@ -5467,6 +5586,31 @@
       "rationale": "Root acceptance fixture forks isolated syscall/namespace test children; root-test-fixture feature is required and release builds are forbidden."
     },
     {
+      "symbol": "crates/duduclaw-run/src/bin/selftest.rs::linux::main",
+      "apis": {
+        "raw_fork": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "trampoline",
+      "migration": "privileged_service",
+      "rationale": "R7a shipped isolation self-test (duduclaw-run-selftest), started only by PID 1 through the fixed root unit duduclaw-isolation-selftest.service with the trampoline's capability bounding set. Refuses any argument, reads no environment or stdin, closes every fd above 2. After the trampoline library's namespace entry, build_root/pivot and loopback it unshares a PID namespace and forks exactly one child that becomes that namespace's init, mounts its own /proc, drops to the dedicated non-login duduclaw-selftest account, applies runner::restrict_filesystem and the common seccomp filter, runs fixed filesystem assertions and _exits. No exec, no employee or gateway input; the parent only waits with a deadline."
+    },
+    {
+      "symbol": "crates/duduclaw-isolation/src/bin/probe.rs::linux::run_tool",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "spawn_daemon",
+      "migration": "privileged_service",
+      "rationale": "R7c shipped SSH denial probe (duduclaw-isolation-probe), started only by PID 1 through the template unit duduclaw-isolation-probe@<account>.<port>.service, unprivileged as the isolation test account duduclaw-selftest with the systemd-journal supplementary group, an empty capability bounding set and loopback-only IP access; it refuses to run as root. Its only process creation: the fixed absolute host tools /usr/bin/ssh-keygen (key generation and fingerprint), /usr/bin/ssh and /usr/bin/journalctl (each fstat-verified root-owned, not group/other writable; no sshd: spawnd runs sshd -T itself), fixed argv built from the validated employee account name and numeric ports, empty environment plus LC_ALL=C, cwd /, stdin /dev/null, output to 0600 files in a private 0700 directory, own process group, waited with a timer and group-killed on expiry. ssh runs this same binary as its ProxyCommand (--relay, numeric loopback ports only). No employee or gateway input."
+    },
+    {
       "symbol": "crates/duduclaw-run/src/bin/root-fixture/launch.rs::run",
       "apis": {
         "raw_fork": 1
@@ -5662,7 +5806,7 @@
       ],
       "identity": "spawn_daemon",
       "migration": "privileged_service",
-      "rationale": "B1 root account authority invokes trusted fixed OS utilities for NSS allocation, SSH/cron/at readback, locked-account setup and session cleanup; bounded argv/output/time and cleared environment. These host prerequisites cannot execute under employee identities."
+      "rationale": "B1 root account authority invokes trusted fixed root-owned OS utilities for NSS allocation, SSH readback, locked-account setup and session cleanup; bounded argv/output/time and cleared environment. These host prerequisites cannot execute under employee identities. R8w: at jobs are read from the spool directly; at is never executed."
     },
     {
       "symbol": "crates/duduclaw-spawnd/src/accounts.rs::tests::iso_root_intruder_is_signalled_through_pidfd",
@@ -5712,6 +5856,18 @@
       "identity": "spawn_daemon",
       "migration": "not_process",
       "rationale": "Two std::thread::Builder::spawn calls inside spawnd: the bounded lifecycle command queue and (H4) the spawnd-work-broker snapshot-copy worker fed by a bounded sync_channel, which answers on the same completion channel. Both are Rust threads of the reviewed lifecycle worker; neither launches executable content. Actual host process creation is inventoried at its native launch sites."
+    },
+    {
+      "symbol": "crates/duduclaw-spawnd/src/ssh_evidence.rs::linux::start_worker",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "task_or_thread"
+      ],
+      "identity": "spawn_daemon",
+      "migration": "not_process",
+      "rationale": "R7c: one std::thread::Builder::spawn of the duduclaw-ssh-probe worker thread inside spawnd, started once on the first SSH evidence lookup. It measures the probe inputs (committed generation, signed probe binary, template unit, and the live sshd listener identity read from PID 1) and starts the fixed template unit duduclaw-isolation-probe@<valid employee account>.<port>.service through PID 1 over its own D-Bus connection, one at a time, bounded by the unit deadline (allocation and admission only queue requests and never wait for it). It launches no executable content itself; the probe process is created by PID 1 (inventoried at crates/duduclaw-isolation/src/bin/probe.rs)."
     },
     {
       "symbol": "crates/duduclaw-sysd/src/dispatch.rs::bless_boot",
@@ -6146,7 +6302,7 @@
       "rationale": "Test fixture or test helper; compiled/run only for regression verification, not a production employee execution entry point."
     },
     {
-      "symbol": "crates/duduclaw-updated/src/linux/activation.rs::systemctl",
+      "symbol": "crates/duduclaw-updated/src/linux/activation.rs::systemctl_within",
       "apis": {
         "command_constructor": 1,
         "terminal_spawn": 1
@@ -6156,7 +6312,7 @@
       ],
       "identity": "updater",
       "migration": "privileged_service",
-      "rationale": "F root updater invokes trusted /usr/bin/systemctl with fixed internal activation/readback argv, cleared environment and bounded output/time. Controlling the signed service generation is root maintenance, not employee code execution."
+      "rationale": "F root updater invokes trusted /usr/bin/systemctl with fixed internal activation/readback argv, cleared environment and bounded output/time. Controlling the signed service generation is root maintenance, not employee code execution. R6: unit restarts use the fixed argv `restart <fixed unit>` (blocking: the client waits for exactly the job it enqueued and exits non-zero unless that job is done) for duduclaw-spawnd.service, then duduclaw-egress.service, then duduclaw-gateway.service, preceded by `reset-failed duduclaw-spawnd.service`, then `show --property=Job --value` / `show --property=InvocationID --value` / `is-active --quiet` polling, all against one absolute deadline (RESTART_DEADLINE). Before Apply: `stop duduclaw-isolation-ready.service`, `stop duduclaw-egress.socket`, `stop duduclaw-egress.service`, `stop duduclaw-gateway.service`, then `show --property=ActiveState --value <unit>` and `show --property=Job --value <unit>` for those four fixed units (one absolute QUIESCE_DEADLINE). Every client is killed at its absolute deadline (a restart: the caller's deadline; every other call: min(60 s from its start, the caller's deadline)) and is not spawned once that deadline has passed; `systemctl` is the 60 s wrapper. Single spawn site (/usr/bin/systemctl, fixed argv)."
     },
     {
       "symbol": "crates/duduclaw-updated/src/linux/download.rs::Downloader::url",
@@ -6188,6 +6344,7 @@
       "symbol": "crates/duduclaw-updated/src/linux/files.rs::tests::iso_root_same_verified_fd_exec_survives_path_replacement",
       "apis": {
         "command_constructor": 1,
+        "raw_execveat": 1,
         "terminal_status": 1
       },
       "effects": [
@@ -6195,7 +6352,106 @@
       ],
       "identity": "test",
       "migration": "test_only",
-      "rationale": "Ignored root test executes only a copied trusted true fixture through the verified-fd adapter after replacing its pathname; not downloaded production code."
+      "rationale": "Ignored root test executes only a copied trusted true fixture through the verified-fd adapter after replacing its pathname; the raw syscall(SYS_execveat) runs in its own pre_exec child of /usr/bin/false. Not downloaded production code."
+    },
+    {
+      "symbol": "crates/duduclaw-updated/src/linux/bootstrap_verify.rs::exec_sealed",
+      "apis": {
+        "raw_execveat": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "updater",
+      "migration": "privileged_service",
+      "rationale": "R1 root bootstrap verifier (duduclaw-bootstrap install|upgrade|rollback, run by the root administrator after the published SHA-256 comparison; production root exec). Trust precondition: reached only from run() after harden + real/effective uid 0, the compiled PRODUCTION root pin, 2-of-3 root threshold on root.json, the root-threshold BundleAuthorization, the legacy release minisign signature, the target-signed manifest, the per-mode anti-rollback check (upgrade requires the single-binary version floor; an equal version only as the exact recorded bundle; serial never below the recorded high-water mark) with the bootstrap high-water record {version, serial, digest, bundle_sha256} durably written (temp + fsync + renameat2 + directory fsync) before staging, and the re-verified stage; the staged gateway artifact is copied into a fresh memfd, sealed (SEAL|SHRINK|GROW|WRITE read back) and re-hashed against the signed manifest (sealed_executable). Then close_range(3..) CLOEXEC and execveat(AT_EMPTY_PATH) of that sealed fd with fixed argv `duduclaw service bootstrap-continue --protected-linux --mode <install|upgrade|rollback> --generation <hex>` and fixed env PATH/LANG; fd 0/1/2 kept for R3/R5's terminal. No pathname reopen and no fallback on failure. Runs as root by design (R3 continuation); no employee input."
+    },
+    {
+      "symbol": "crates/duduclaw-updated/src/linux/launcher.rs::launch",
+      "apis": {
+        "raw_execveat": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "updater",
+      "migration": "privileged_service",
+      "rationale": "Pre-existing frozen F launcher (duduclaw-updated --launch as the root service ExecStart; behaviour unchanged, newly visible after the inventory learned raw syscall(SYS_execveat)). Trust precondition: harden, update.lock held, state.json validated, the selected A/B slot fd hashed by verified_slot against the target-signed manifest accepted in the trust ledger and bound to the root-owned state selector; the durable boot attempt is saved before exec. execveat(AT_EMPTY_PATH) of that same verified fd with fixed argv `duduclaw-updated --serve-slot <a|b>` and fixed env PATH/LANG; no pathname reopen."
+    },
+    {
+      "symbol": "crates/duduclaw-run/src/linux/launcher.rs::Child<'_>::prepare",
+      "apis": {
+        "raw_execveat": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "trampoline",
+      "migration": "privileged_service",
+      "rationale": "Pre-existing HX helper child inside the duduclaw-run trampoline's isolated run (the child of Launcher::spawn's raw clone; behaviour unchanged, newly visible after the inventory learned raw syscall(SYS_execveat)). Applies stacked Landlock, the exact fd plan with every other descriptor closed and read back, hard=soft rlimits and the helper seccomp filter, then execveat(AT_EMPTY_PATH) of the root-verified signed helper executable fd with argv from the signed helper policy; no gateway invocation or local fallback."
+    },
+    {
+      "symbol": "crates/duduclaw-run/src/linux/runner.rs::execute_raw",
+      "apis": {
+        "raw_execveat": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "trampoline",
+      "migration": "privileged_service",
+      "rationale": "Pre-existing final exec of the duduclaw-run trampoline (behaviour unchanged, newly visible after the inventory learned raw syscall(SYS_execveat)): reached from execute_runtime (employee runtime after the rt-runtime cgroup move, setsid and exact fd plan) and execute_forwarder (egress forwarder). Resets signal handlers, installs the run's seccomp filter, then execveat(AT_EMPTY_PATH) of the root-verified executable fd with the verified Program argv/environment; on failure records the error page and _exit(126), no fallback."
+    },
+    {
+      "symbol": "crates/duduclaw-updated/src/linux/activation.rs::tests::shell",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only helper starts a fixed /bin/sh child to verify systemctl client child reaping and deadline handling; never compiled into the daemon."
+    },
+    {
+      "symbol": "crates/duduclaw-updated/src/linux/bootstrap_verify.rs::tests::exec_probe",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_status": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Ignored root test helper (R1 bootstrap verifier): forks once with a private pty on fd 0/1/2 and execveats a sealed memfd copy of the trusted /usr/bin/test through the production exec_sealed adapter; no downloaded code, no network."
+    },
+    {
+      "symbol": "crates/duduclaw-updated/src/linux/bootstrap_verify.rs::tests::iso_root_bootstrap_execveat_memfd_keeps_tty",
+      "apis": {
+        "pty_openpty": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Ignored root test (R1 bootstrap verifier) opens one private pty whose slave becomes the probe's fd 0/1/2, proving the sealed-memfd execveat keeps the terminal and closes every other descriptor."
+    },
+    {
+      "symbol": "crates/duduclaw-updated/src/linux/trust_init.rs::tests::iso_root_bootstrap_launcher_boots_slot_a",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Ignored disposable-VM root test (R1 trust initialisation) starts the operator-built duduclaw-updated --launch once with a cleared environment and null stdio, waits for the slot-A self-test marker, then kills it; never linked into production."
     },
     {
       "symbol": "crates/duduclaw-spawnd/src/installed_account_root_tests.rs::Harness::run",
@@ -6211,6 +6467,19 @@
       "rationale": "Ignored disposable-root installed-account acceptance only: bounded real SSH/su/user-manager/crontab/at attempts with positive controls and cleanup; never linked into production."
     },
     {
+      "symbol": "crates/duduclaw-spawnd/src/installed_policy_tool_accept_tests.rs::iso_root_policy_accept_api_worker_end_to_end",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_status": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "R8r-4 ignored disposable-root test only: runs the operator-built duduclaw-isolation-policy (feature policy-tool, never a release binary) once as `accept` with a cleared environment (the harness needs its own single-threaded process for its private mount namespace), then checks build/verify --evidence-dir in-process; never linked into production."
+    },
+    {
       "symbol": "crates/duduclaw-execution/src/spawnd/transport.rs::tests::live_status_waits_for_existing_transaction_and_reads_its_own_reply",
       "apis": {
         "terminal_spawn": 1
@@ -6223,7 +6492,7 @@
       "rationale": "Round 3 regression creates one scoped Rust thread to verify status-query transaction ordering; no OS process is launched."
     },
     {
-      "symbol": "crates/duduclaw-parse-worker/src/retirement.rs::DropforSession::drop",
+      "symbol": "crates/duduclaw-parse-worker/src/retirement.rs::Session::retire",
       "apis": {
         "terminal_spawn": 1
       },
@@ -6232,7 +6501,7 @@
       ],
       "identity": "gateway",
       "migration": "not_process",
-      "rationale": "Production worker-session teardown starts one bounded 40-second Rust thread to poll exact systemd retirement and retain the durable input lease until proven empty; no OS process is launched."
+      "rationale": "Production worker-session retirement (idempotent; called from Drop for Session and on a failed live-authority exchange) starts one bounded 40-second Rust thread to poll exact systemd retirement and retain the durable input lease until proven empty; no OS process is launched."
     },
     {
       "symbol": "crates/duduclaw-gateway/src/isolation_readiness.rs::start_update_probe",
@@ -6282,6 +6551,18 @@
         "process_spawn"
       ],
       "rationale": "One-shot host authorization and fresh root publication prepare an isolated main run; SpawndBackend owns execution and teardown. The native marker has no authority and cannot run on the gateway uid."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/isolation_mcp/boot_retry.rs::tests::boot_permit_descheduled_across_close_installs_nothing",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "task_or_thread"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only scoped std::thread pauses inside enter while the shutdown gate closes, then verifies no boot attempt installs anything; no OS process is launched."
     },
     {
       "symbol": "crates/duduclaw-spawnd/src/bin/d8-fixture.rs::main",
@@ -6721,6 +7002,54 @@
       "rationale": "Test-only Tokio JoinSet tasks race concurrent uploads; no OS process is launched."
     },
     {
+      "symbol": "crates/duduclaw-gateway/src/handlers/migration_authority_bridge.rs::tests::shutdown_gate_wait_idle_ends_at_last_permit_or_deadline",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "task_or_thread"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only scoped std::thread exercises ShutdownGate::wait_idle while permits are held and released; no OS process is launched."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/handlers/migration_authority_bridge.rs::tests::shutdown_gate_close_racing_enter_admits_nothing_after_close_returns",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "task_or_thread"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only scoped std::threads race ShutdownGate::close against enter and verify no permit is admitted after close returns; no OS process is launched."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/handlers/migration_authority_bridge.rs::tests::pending_wait_attempt_descheduled_across_close_never_runs",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "task_or_thread"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only scoped std::thread pauses a pending wait before gate registration, then verifies close prevents the attempt from running; no OS process is launched."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/handlers/migration_confirmations_rpc.rs::<module>",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "task_or_thread"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only descheduled! macro creates a scoped std::thread to pause confirmation effects across ShutdownGate::close; no OS process is launched."
+    },
+    {
       "symbol": "crates/duduclaw-gateway/src/isolation_connector_stack.rs::EmployeeConnectorProviders::schedule_refresh",
       "apis": {
         "terminal_spawn": 1
@@ -6830,6 +7159,19 @@
       "identity": "test",
       "migration": "test_only",
       "rationale": "Test-only fork child issues only async-signal-safe fcntl(F_GETLK) and _exit to observe process-wide POSIX locks; not a production spawn path."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/fs_safe/sqlite.rs::tests::iso_root_private_db_opens_below_a_root_0711_parent",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_status": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Ignored root-VM test re-runs one copy of this test binary as uid/gid 65534 (an exact test filter) to open a private database below a root:root 0711 parent; not a production spawn path."
     },
     {
       "symbol": "crates/duduclaw-gateway/src/installation_identity/tests.rs::unix::extended_acl_on_the_key_is_refused_and_not_regenerated",
@@ -7083,6 +7425,30 @@
       "rationale": "spawnd starts one fresh Rust thread that unshares CLONE_FS|CLONE_NEWNS to compose the native home mount in a disposable namespace and returns a detached clone; no employee process or OS child is started."
     },
     {
+      "symbol": "crates/duduclaw-spawnd/src/update_control.rs::Measurer::start",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "task_or_thread"
+      ],
+      "identity": "spawn_daemon",
+      "migration": "not_process",
+      "rationale": "R6 readback: std::thread::Builder::spawn starts the one spawnd-update-measure thread, owned by the update-control state and started by the first Readback, that opens (trusted reader), fstats and hashes the measured component files so the update endpoint's Readback only waits on its results with a hard 2 s timeout; at most one exists (never replaced, even if stuck in a syscall) and it stops when the state is dropped. It only reads files; no OS child process is launched."
+    },
+    {
+      "symbol": "crates/duduclaw-spawnd/src/update_control.rs::Recovered::serve",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "task_or_thread"
+      ],
+      "identity": "spawn_daemon",
+      "migration": "not_process",
+      "rationale": "R6: std::thread::Builder::spawn starts the one root update-control thread serving update.sock (uid 0 peers only); its Apply republishes verified generation files at fixed root paths. On a set not consistent at start it is the only endpoint, and after a repairing Apply it exits the process (status 82) so systemd restarts spawnd for a full re-verification; when a request leaves an opened set inconsistent it closes admission, replies, writes status and an acknowledged audit record, and exits (status 83). No OS child process is launched; the workload census and duduclaw-isolation-ready.service's `duduclaw-spawnd wait-consistent` read cgroupfs/the status file and query PID 1 over the system bus (zbus, read-only), spawning nothing."
+    },
+    {
       "symbol": "crates/duduclaw-spawnd/src/work_anchor.rs::tests::iso_root_work_anchor_not_writable_by_employee",
       "apis": {
         "raw_fork": 1
@@ -7105,6 +7471,57 @@
       "identity": "test",
       "migration": "test_only",
       "rationale": "Ignored root Linux acceptance test forks a child into a private mount namespace to check the /etc protected-mode projection, then _exits; not a production spawn path."
+    },
+    {
+      "symbol": "crates/duduclaw-spawnd/src/bootstrap_mounts.rs::tests::iso_root_etc_projection_attaches_through_build_root",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Ignored root Linux acceptance test (DUDUCLAW_ISO_DISPOSABLE=1) re-executes only itself (current test binary, --exact) so the production /etc projection is attached by build_root in a fresh process's private namespaces instead of a fork of the harness; not a production spawn path."
+    },
+    {
+      "symbol": "crates/duduclaw-spawnd/src/bootstrap_mounts.rs::tests::iso_root_etc_projection_refuses_mounted_ca_chain",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Ignored root Linux acceptance test re-executes only itself in a fresh process to verify that a mounted CA chain is refused in a private mount namespace; not a production spawn path."
+    },
+    {
+      "symbol": "crates/duduclaw-spawnd/src/owner_inventory.rs::tests::iso_root_uid_inventory_finds_foreign_owned_files_and_skips_mounts",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Ignored root Linux acceptance test (DUDUCLAW_ISO_DISPOSABLE=1) re-executes only itself (current test binary, --exact) so its bind mount over a fixture subdirectory lives in a fresh process's private mount namespace while the UID allocation's file-owner inventory is checked not to enter it; not a production spawn path."
+    },
+    {
+      "symbol": "crates/duduclaw-spawnd/src/transport.rs::tests::root_tests::iso_root_egress_control_identity_over_socket_activation",
+      "apis": {
+        "raw_fork": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Ignored root Linux test forks a child that drops to a temporary system account and answers one socket frame to verify egress credential checks; not a production spawn path."
     },
     {
       "symbol": "crates/duduclaw-spawnd/src/allocation_retire_tests.rs::iso_root_retire_gid_match_counts_as_live",
@@ -7228,7 +7645,7 @@
       ],
       "identity": "trampoline",
       "migration": "privileged_service",
-      "rationale": "HX in-run helper launcher (D8 revision 2.1/2.4/2.5) inside the duduclaw-run trampoline: raw clone with CLONE_PIDFD, then Child::exec of a root-verified signed helper fd (execveat) after setsid/PDEATHSIG, slot cgroup, exact fds, stacked Landlock, hard=soft rlimits and seccomp. Runs only inside the isolated run, holds no capability, prompt, stdin, MCP channel or egress socket; no gateway invocation or local fallback."
+      "rationale": "HX in-run helper launcher (D8 revision 2.1/2.4/2.5) inside the duduclaw-run trampoline: raw legacy clone(CLONE_PIDFD | SIGCHLD) via linux::process::clone_with_pidfd (shared with namespace-init creation; never clone3), then Child::exec of a root-verified signed helper fd (execveat) after setsid/PDEATHSIG, slot cgroup, exact fds, stacked Landlock, hard=soft rlimits and seccomp. Runs only inside the isolated run, holds no capability, prompt, stdin, MCP channel or egress socket; no gateway invocation or local fallback."
     },
     {
       "symbol": "crates/duduclaw-run/src/linux/runner.rs::tests::launcher_ready_before_all_isolated",

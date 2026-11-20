@@ -11,7 +11,14 @@ const MAX_QUERY_SECONDS: u64 = 30;
 pub(crate) type SchemaRow = (String, String, String, Option<String>);
 
 pub(crate) fn copy_bounded(mut input: impl Read, path: &Path) -> Result<()> {
-    let mut output = OpenOptions::new().write(true).create_new(true).open(path)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
+    }
+    let mut output = options.open(path)?;
     let count = std::io::copy(&mut input.by_ref().take(MAX_SOURCE_BYTES + 1), &mut output)?;
     if count > MAX_SOURCE_BYTES { return Err(Error::Limit); }
     output.sync_all()?;
@@ -30,11 +37,20 @@ pub(crate) fn schema(conn: &Connection) -> Result<Vec<SchemaRow>> {
 }
 
 pub(crate) fn harden(conn: &mut Connection) -> Result<()> {
+    harden_with_heap_limit(conn, 64 * 1024 * 1024)
+}
+
+pub(crate) fn harden_capture(conn: &mut Connection) -> Result<()> {
+    // Capture is a separate operator process: one image plus the existing working margin.
+    harden_with_heap_limit(conn, (MAX_SOURCE_BYTES + 64 * 1024 * 1024) as i64)
+}
+
+fn harden_with_heap_limit(conn: &mut Connection, ceiling: i64) -> Result<()> {
     // SAFETY: importer is a dedicated process; the SQLite process-wide ceiling
     // is only narrowed. -1 queries the current ceiling without changing it.
     unsafe {
         let old = rusqlite::ffi::sqlite3_hard_heap_limit64(-1);
-        let limit = if old > 0 { old.min(64 * 1024 * 1024) } else { 64 * 1024 * 1024 };
+        let limit = if old > 0 { old.min(ceiling) } else { ceiling };
         rusqlite::ffi::sqlite3_hard_heap_limit64(limit);
         let actual = rusqlite::ffi::sqlite3_hard_heap_limit64(-1);
         if actual <= 0 || actual > limit { return Err(Error::Isolation); }
@@ -397,7 +413,7 @@ mod memory_tests {
         assert!(out.is_empty());
         let refusal=catalog::take_schema_refusal().expect("refusal report");
         assert_eq!((refusal.store,refusal.closest),(Store::Memory,SchemaVersion::V180));
-        assert_eq!(refusal.differences,vec![catalog::Difference::Unexpected{object:"index".into(),name:"planted_idx".into()}]);
+        assert_eq!(refusal.differences,vec![catalog::Difference::Unexpected{object:"index".into(),ordinal:1,name_sha256:catalog::name_digest("planted_idx")}]);
     }
     #[test]
     fn memory_import_rejects_planted_table_view_and_trigger() {

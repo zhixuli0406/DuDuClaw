@@ -3959,6 +3959,10 @@ fn claude_tool_result_content_text(content: &serde_json::Value) -> Option<String
 /// and tool-use progress (used by channel reply; cron/dispatch pass `None`).
 ///
 /// Extracts `TokenUsage` from the `result` event's `usage` field when available.
+///
+/// `protected_input` (protected mode): `(agent_dir, prompt, system prompt
+/// without the step-budget sentence, model)`; `max_turns` is then only the
+/// requested limit, replaced by the one root confirms (R6/R8x).
 async fn call_claude_streaming(
     cmd: &mut tokio::process::Command,
     on_progress: Option<&crate::channel_reply::ProgressCallback>,
@@ -3986,10 +3990,18 @@ async fn call_claude_streaming(
 
     #[cfg(target_os = "linux")]
     let mut prompt_writer = None;
+    #[cfg(target_os = "linux")]
+    let mut confirmed_max_turns = None;
     let mut child = if let Some((agent_dir, prompt, system_prompt, model)) = protected_input {
         #[cfg(target_os = "linux")]
         {
-            let (child, writer) = Box::pin(crate::isolation_mcp::runtime::spawn_claude(agent_dir, prompt, system_prompt, model)).await?;
+            // R6/R8x: `max_turns` is the request here. The protected lookup and
+            // the spawn run in ONE observed scope; the step-budget sentence and
+            // the max-turn classification use exactly the value root confirmed,
+            // and the plan refuses the run unless root enforces exactly that.
+            let (confirmed, child, writer) = Box::pin(crate::isolation_mcp::runtime::start_claude(agent_dir, max_turns,
+                prompt, |limit| protected_system_prompt(system_prompt, u64::from(limit)), model)).await?;
+            confirmed_max_turns = Some(u64::from(confirmed));
             prompt_writer = Some(writer);
             child
         }
@@ -4010,6 +4022,9 @@ async fn call_claude_streaming(
         drop(admission);
         child
     };
+    // R6: a protected run classifies with exactly the limit root confirmed.
+    #[cfg(target_os = "linux")]
+    let max_turns = confirmed_max_turns.unwrap_or(max_turns);
     let stdout = child.child().stdout.take().ok_or("failed to capture stdout")?;
     let mut reader = BufReader::new(stdout).lines();
 
@@ -4557,10 +4572,7 @@ fn prepare_claude_cmd(
     // Identity-scoped config directory. Defaults to the cwd — which IS the
     // agent directory for every caller but a team role member.
     let config_dir = identity.config_dir.or(work_dir);
-    let resolved = duduclaw_core::turn_limits::max_turns(home_dir, config_dir);
-    let max_turns = if identity.work_turn { resolved } else {
-        resolved.min(duduclaw_core::turn_limits::DEFAULT_MAX_TURNS)
-    };
+    let max_turns = requested_max_turns(home_dir, config_dir, identity.work_turn);
     let budget_prompt = duduclaw_core::turn_limits::budget_prompt(system_prompt, max_turns);
     let system_prompt = budget_prompt.as_str();
     let git_env_granted = duduclaw_core::apply_agent_cli_env_allowlist_for(&mut cmd, capabilities);
@@ -5117,15 +5129,20 @@ async fn call_claude_with_env(
     let hard_max_timeout_secs = crate::runtime_config::claude_timeout_secs(&home, identity.config_dir.or(work_dir));
     if duduclaw_core::execution_gate::isolation_required() {
         if !env_vars.is_empty() || effort.is_some() || identity.mcp_config.is_some() {
-            return Err(protected_claude_options_refusal());
+            return Err(protected_options_refused(identity.config_dir.or(work_dir)).await);
         }
-        let agent_dir = identity.config_dir.or(work_dir).ok_or_else(protected_claude_options_refusal)?;
-        // The root-owned plan always enforces `--max-turns 50` (it carries no
-        // range yet): the prompt sentence and the classification must say 50.
-        let system_prompt = duduclaw_core::turn_limits::budget_prompt(system_prompt, 50)
-            .replace(crate::direct_api::CACHE_SPLIT_MARKER, "");
+        let Some(agent_dir) = identity.config_dir.or(work_dir) else {
+            return Err(protected_options_refused(None).await);
+        };
+        // R6: root enforces the step limit from its signed policy (v1/v2: the
+        // fixed 50; v3: a range the company setting can only lower). Ask for
+        // the same value an unprotected run would use and show/classify with
+        // exactly the value root confirms for this run. R8x: `desired` is only
+        // the request; `call_claude_streaming` looks the limit up and spawns in
+        // ONE observed scope (`isolation_mcp::runtime::start_claude`).
+        let desired = requested_max_turns(&duduclaw_core::platform::duduclaw_home(), Some(agent_dir), identity.work_turn);
         let mut marker = tokio::process::Command::new("root-selected-claude");
-        return call_claude_streaming(&mut marker, None, Some((agent_dir, prompt, &system_prompt, model)), hard_max_timeout_secs, crate::runtime_config::idle_timeout_secs(&home, identity.config_dir.or(work_dir)), 50, Some((&home, &observer_agent))).await;
+        return call_claude_streaming(&mut marker, None, Some((agent_dir, prompt, system_prompt, model)), hard_max_timeout_secs, crate::runtime_config::idle_timeout_secs(&home, identity.config_dir.or(work_dir)), desired, Some((&home, &observer_agent))).await;
     }
     let claude = duduclaw_core::which_claude().ok_or("Claude CLI not found")?;
     // `_cmd_guards` holds the `--system-prompt-file` and (RFC-23 §13.6)
@@ -5165,6 +5182,47 @@ async fn call_claude_with_env(
         .filter(|n| *n > 0).ok_or("Claude command has no valid applied step budget")?;
     call_claude_streaming(&mut cmd, None, None, hard_max_timeout_secs,
         crate::runtime_config::idle_timeout_secs(&home, identity.config_dir.or(work_dir)), applied_max_turns, Some((&home, &observer_agent))).await
+}
+
+/// The step budget a Claude CLI call asks for: the wave-1 resolution for an
+/// employee's own work turn, at most 50 for anything else (utility calls).
+/// Outside protected mode this is the applied value; in protected mode it is
+/// only the request, which root can narrow or refuse ([`protected_max_turns`]).
+pub(crate) fn requested_max_turns(home: &Path, config_dir: Option<&Path>, work_turn: bool) -> u64 {
+    let resolved = duduclaw_core::turn_limits::max_turns(home, config_dir);
+    if work_turn { resolved } else { resolved.min(duduclaw_core::turn_limits::DEFAULT_MAX_TURNS) }
+}
+
+/// R6: the step limit root will enforce for this protected Claude run.
+/// Without native isolation (non-Linux) it is always refused (spawn-gate
+/// error), at the point the lookup would run. On Linux the lookup is part of
+/// `isolation_mcp::runtime::start_claude` (R8x: lookup and spawn in one
+/// observed scope); there is no separate entry for it.
+#[cfg(not(target_os = "linux"))]
+pub(crate) async fn protected_max_turns(agent_dir: &Path, desired: u64) -> Result<u64, String> {
+    let _ = (agent_dir, desired);
+    Err(duduclaw_agent::mcp_spawn_gate::spawn_gate_error("此平台尚未提供原生隔離執行。"))
+}
+
+/// R6/R8x: the protected Claude system prompt — the step-budget sentence with
+/// exactly the limit root confirmed, the Direct-API layering marker stripped.
+#[cfg(target_os = "linux")]
+pub(crate) fn protected_system_prompt(system_prompt: &str, max_turns: u64) -> String {
+    duduclaw_core::turn_limits::budget_prompt(system_prompt, max_turns)
+        .replace(crate::direct_api::CACHE_SPLIT_MARKER, "")
+}
+
+/// R8x: [`protected_claude_options_refusal`] for a protected Claude turn
+/// refused before its start; on Linux it is also the turn's one
+/// `isolated run not started` line (`preflight.claude_options`).
+pub(crate) async fn protected_options_refused(agent_dir: Option<&Path>) -> String {
+    #[cfg(target_os = "linux")]
+    { crate::isolation_mcp::runtime::refuse_claude_options(agent_dir, protected_claude_options_refusal()).await }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = agent_dir;
+        protected_claude_options_refusal()
+    }
 }
 
 pub(crate) fn protected_claude_options_refusal() -> String {
@@ -6703,5 +6761,26 @@ mod turn_budget_tests {
             let text = std::fs::read_to_string(guards.prompt.as_ref().unwrap()).unwrap();
             assert!(text.contains("Step budget for this turn: 88"));
         }
+    }
+    /// R6: the protected request uses the same resolution as an unprotected
+    /// run; a utility call never asks root for more than 50 steps.
+    #[test]
+    fn protected_request_matches_unprotected_resolution_and_utility_stays_at_most_fifty() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("agents/anna");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(home.path().join("config.toml"), "[runtime]\nmax_turns_limit=500\n").unwrap();
+        for (configured, work, utility) in [(120u64, 120u64, 50u64), (30, 30, 30), (1000, 500, 50)] {
+            std::fs::write(dir.join("agent.toml"), format!("[runtime]\nmax_turns={configured}\n")).unwrap();
+            assert_eq!(requested_max_turns(home.path(), Some(&dir), true), work);
+            assert_eq!(requested_max_turns(home.path(), Some(&dir), false), utility);
+            assert!(requested_max_turns(home.path(), Some(&dir), false) <= duduclaw_core::turn_limits::DEFAULT_MAX_TURNS);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn protected_step_limit_refuses_without_native_isolation() {
+        let error = protected_max_turns(Path::new("/trusted-home/agents/anna"), 50).await.unwrap_err();
+        assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error));
     }
 }

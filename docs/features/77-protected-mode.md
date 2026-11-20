@@ -10,6 +10,19 @@ Protected mode runs every AI employee under its own account in its own execution
 
 The feature is off by default and only available in the Enterprise edition. Installations that do not use it behave as before. It has not yet been accepted on real Linux hosts (see [What still needs a real host](#what-still-needs-a-real-host)).
 
+## Auxiliary model functions in protected mode
+
+In this version, employees in protected mode do not run the following auxiliary model functions on any runtime:
+
+- Remembering key facts from a conversation and pinning a session's instructions.
+- Cloud-based conversation distill and automatic wiki filing; the local heuristic still runs.
+- Session compression and summaries; older history is truncated without a summary.
+- Automatic conversation titles; the first message is used instead.
+- Decision-continuity confirmation and post-turn self-evolution.
+- Model-based judges and classifiers for goal planning, dispatch review, action review and proactive checks; these fall back to their non-model behaviour, such as asking a human.
+
+These calls would run outside the employee's sandbox, so they are refused until an isolated backend exists. Their refusal does not mean that the user's chat turn failed.
+
 ## Turning it on (planned for a later release)
 
 These steps apply once the isolation components can be installed. On v1.83.0 they stop at step 1: the installer sets up only the single-binary protected service, readiness does not report the isolation as ready, and the management page does not appear.

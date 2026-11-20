@@ -4,6 +4,8 @@
 use std::sync::{Mutex, OnceLock};
 use zeroize::{Zeroize, Zeroizing};
 
+pub const KEY_MODE: u32 = 0o400;
+pub const KEY_BYTES: u64 = 32;
 pub const KEY_PATH: &str = "/var/lib/duduclaw-protected/root.key";
 /// EX_TEMPFAIL: systemd must run the root launcher for a fresh intake.
 pub const RECOVERY_RESTART_EXIT_CODE: i32 = 75;
@@ -28,7 +30,8 @@ mod native;
 #[path = "root_key_version.rs"]
 mod version;
 pub use version::check_protected_version;
-pub use native::{CgroupState, ExecutableState, NativeInputs, initial_user_namespace_map};
+pub use native::{CgroupState, ExecutableState, NativeInputs, initial_user_namespace_map,
+    GATEWAY_CGROUP_SYSTEM_SLICE, GATEWAY_CGROUP_TCB_SLICE};
 #[cfg(target_os = "linux")]
 pub use native::native_host_check;
 
@@ -351,9 +354,9 @@ mod linux {
         let stat = unsafe { stat.assume_init() };
         if stat.st_mode & libc::S_IFMT != libc::S_IFREG { return Err("fd_type".into()); }
         if stat.st_uid != 0 { return Err("fd_owner".into()); }
-        if stat.st_mode & 0o7777 != 0o400 { return Err("fd_mode".into()); }
+        if stat.st_mode & 0o7777 != KEY_MODE { return Err("fd_mode".into()); }
         if stat.st_nlink != 1 { return Err("fd_links".into()); }
-        if stat.st_size != 32 { return Err("fd_size".into()); }
+        if stat.st_size != KEY_BYTES as libc::off_t { return Err("fd_size".into()); }
         // Allocate before reading: no non-zeroizing temporary copy of the key.
         let mut key = Box::new(Zeroizing::new([0u8; 32]));
         let mut read = 0;

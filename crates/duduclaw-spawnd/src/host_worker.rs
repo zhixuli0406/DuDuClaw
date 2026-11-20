@@ -30,9 +30,30 @@ pub trait Scan: Send {
     fn register(&mut self, run: RunHandle, employee: EmployeeId, startup_ms: u64) -> Result<()>;
     fn cancel(&mut self, run: RunHandle) -> Result<()>;
 }
-/// One allocation request and its reply slot (schema-2 codes, F6l).
-pub(crate) type AllocationWork = (duduclaw_migration::allocation::Request,
-    SyncSender<std::result::Result<duduclaw_migration::allocation::Reply, duduclaw_migration::allocation::ErrorCode>>);
+/// One allocation request and its reply slot (schema-2 codes, F6l), or
+/// R8r-2: one schema-5 `provision_providers`, moved (never cloned) so its
+/// payload is wiped wherever it is dropped.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) enum AllocationWork {
+    Allocation(duduclaw_migration::allocation::Request,
+        SyncSender<std::result::Result<duduclaw_migration::allocation::Reply, duduclaw_migration::allocation::ErrorCode>>),
+    Providers(Box<duduclaw_migration::allocation::providers::ProviderRequest>,
+        SyncSender<std::result::Result<duduclaw_migration::allocation::providers::Provisioned,
+            duduclaw_migration::allocation::providers::ProviderErrorCode>>),
+}
+/// R8y review round 1 (F1): the allocation actions whose effect admission
+/// reads (the registry's Ready rows, the host entitlement in the root
+/// publication): their reply waits for `Host::publish_view`. Even a FAILED
+/// one may have changed either (a durable reservation, a revoked
+/// entitlement, a tombstoned row), so the result does not matter. ReadBack
+/// changes nothing.
+fn publishes_view(action: duduclaw_migration::allocation::Action) -> bool {
+    use duduclaw_migration::allocation::Action;
+    match action {
+        Action::Allocate | Action::Entitle | Action::Disable | Action::Retire => true,
+        Action::ReadBack => false,
+    }
+}
 pub struct WorkerHost {
     allocation_sender: SyncSender<AllocationWork>,
     sender: SyncSender<(Key, Work)>, receiver: Receiver<Completed>, slots: BTreeMap<Key, Slot>,
@@ -63,8 +84,20 @@ impl WorkerHost {
                 let _ = host.maintenance();
                 // HX4: helper ends/drains/closes, decided root-side during maintenance.
                 for event in host.helper_events() { let _ = helper_sender.send(event); }
-                if let Ok((request, reply)) = allocation_commands.try_recv() {
-                    let _ = reply.send(host.allocation(&request));
+                match allocation_commands.try_recv() {
+                    Ok(AllocationWork::Allocation(request, reply)) => {
+                        let result = host.allocation(&request);
+                        // R8y review round 1 (F1): the gateway acts on this
+                        // reply at once (ReserveRun after Allocate/Entitle;
+                        // nothing after Disable/Retire), so the view it is
+                        // admitted against is published first, on this
+                        // thread. The reply is the action's own result.
+                        if publishes_view(request.action) { host.publish_view(); }
+                        let _ = reply.send(result);
+                    },
+                    // Provider provisioning changes nothing admission reads.
+                    Ok(AllocationWork::Providers(request, reply)) => { let _ = reply.send(host.providers(request)); },
+                    Err(_) => {},
                 }
                 match commands.recv_timeout(Duration::from_millis(25)) {
                     Ok((key, Work::Broker(job))) => {
@@ -169,9 +202,16 @@ impl Host for WorkerHost {
         match self.take(&key)? { Value::Cleanup(v) => Ok(v), _ => Err(ErrorCode::Internal) }
     }
     fn start(&mut self, r: RunHandle, e: EmployeeId, q: &SpawnRequest, p: &LaunchPolicy, f: Self::Inputs) -> Result<()> {
+        self.start_step(r, e, q, p, f).map_err(crate::start_refusal::Refusal::code)
+    }
+    /// R8y: the synchronous half of a start, labelled (codes unchanged). The
+    /// lifecycle worker's own start labels and prints its refusals.
+    fn start_step(&mut self, r: RunHandle, e: EmployeeId, q: &SpawnRequest, p: &LaunchPolicy, f: Self::Inputs)
+        -> crate::start_refusal::Labelled<()> {
+        use crate::start_refusal::{at, StartStep};
         self.slots.remove(&Key::Cleanup(e, None));
-        self.scanner.register(r, e, p.startup_ms)?;
-        self.request(Key::Start(r.0), Work::Start(r, e, q.clone(), p.clone(), f))
+        self.scanner.register(r, e, p.startup_ms).map_err(at(StartStep::UidMonitorRegister))?;
+        self.request(Key::Start(r.0), Work::Start(r, e, q.clone(), p.clone(), f)).map_err(at(StartStep::WorkerMailbox))
     }
     fn poll(&mut self, r: RunHandle) -> Result<HostProgress> {
         self.receive();

@@ -224,8 +224,10 @@ impl Session {
     fn runtime_and_launcher(&self) -> (i32, i32) {
         let runtime_leaf = self.cgroups.procs("rt-runtime");
         let kids = children(self.init());
-        let runtime = *kids.iter().find(|pid| runtime_leaf.contains(pid)).expect("runtime moved into rt-runtime");
-        let launcher: Vec<_> = kids.into_iter().filter(|pid| *pid != runtime).collect();
+        // Namespace PIDs are allocated before any daemonized descendants.
+        let runtime = *kids.iter().filter(|pid| runtime_leaf.contains(pid)).min_by_key(|pid| namespace_pid(**pid))
+            .expect("runtime moved into rt-runtime");
+        let launcher: Vec<_> = kids.into_iter().filter(|pid| !runtime_leaf.contains(pid)).collect();
         assert_eq!(launcher.len(), 1, "exactly one launcher beside the runtime");
         (runtime, launcher[0])
     }
@@ -376,8 +378,9 @@ pub(super) fn run(root: &Path, scenario: &str) {
         }
         "helper-descendants" => {
             session.wait_ready();
-            session.command("D");
             let (runtime, _) = session.runtime_and_launcher();
+            session.command("D");
+            assert_eq!(session.runtime_and_launcher().0, runtime, "direct runtime unchanged after daemonization");
             let daemons: Vec<_> = session.cgroups.procs("rt-runtime").into_iter().filter(|pid| *pid != runtime).collect();
             assert!(!daemons.is_empty(), "daemonized runtime descendant in rt-runtime");
             let daemons: Vec<_> = daemons.into_iter().map(pidfd).collect();
@@ -398,7 +401,27 @@ pub(super) fn run(root: &Path, scenario: &str) {
         "helper-sigterm" => {
             session.wait_ready();
             let (_, launcher) = session.runtime_and_launcher();
+            // Init reaps the launcher immediately. Observe its exit status at
+            // a ptrace exit stop before init can consume it.
+            assert_eq!(unsafe { libc::ptrace(libc::PTRACE_SEIZE, launcher, 0, libc::PTRACE_O_TRACEEXIT) }, 0);
+            let launcher_fd = pidfd(launcher);
+            let deadline = Session::deadline();
+            assert!(children(launcher).is_empty());
+            for leaf in ["hx/fg", "hx/rec"] { assert!(session.cgroups.procs(leaf).is_empty()); }
             assert_eq!(unsafe { libc::kill(launcher, libc::SIGTERM) }, 0);
+            loop {
+                assert!(Instant::now() < deadline, "launcher SIGTERM delivery timed out");
+                let mut status = 0;
+                let waited = unsafe { libc::waitpid(launcher, &mut status, libc::WNOHANG | libc::__WALL) };
+                assert!(waited >= 0);
+                if waited == launcher {
+                    assert!(libc::WIFSTOPPED(status));
+                    assert_eq!(libc::WSTOPSIG(status), libc::SIGTERM);
+                    assert_eq!(unsafe { libc::ptrace(libc::PTRACE_CONT, launcher, 0, libc::SIGTERM) }, 0);
+                    break;
+                }
+                session.pump(10);
+            }
             assert_eq!(session.event(), SpawndEvent::Draining);
             // spawnd's own table refuses too; send the frame directly to prove the launcher does.
             let frame = ToLauncher::Start(Start { call: call(3), helper: 0, slot: HelperSlot::Foreground, timeout_ms: 30_000 })
@@ -406,12 +429,41 @@ pub(super) fn run(root: &Path, scenario: &str) {
             let input = memfd(HELPER_INPUT);
             let (_stdout, stdout_write) = pipe();
             let (_stderr, stderr_write) = pipe();
-            helper_wire::linux::send(session.control.as_fd(), &frame, &[input.as_fd(), stdout_write.as_fd(), stderr_write.as_fd()]).unwrap();
-            let (bytes, receipt) = session.raw_frame().expect("refusal frame");
-            assert_eq!(helper_wire::decode_from_launcher(&bytes, receipt).unwrap(),
-                FromLauncher::Ended { call: call(3), end: End::StartFailed(LauncherError::Draining) });
-            // Idle and draining: the launcher exits; the run continues.
-            assert!(session.raw_frame().is_none(), "launcher closes the control channel");
+            match helper_wire::linux::send(session.control.as_fd(), &frame,
+                &[input.as_fd(), stdout_write.as_fd(), stderr_write.as_fd()]) {
+                Ok(()) => {},
+                Err(error) => assert!(matches!(error.raw_os_error(),
+                    Some(libc::EPIPE | libc::ECONNRESET | libc::ENOTCONN)), "send Start: {error}"),
+            }
+            loop {
+                assert!(Instant::now() < deadline, "launcher exit timed out");
+                for leaf in ["hx/fg", "hx/rec"] { assert!(session.cgroups.procs(leaf).is_empty(), "helper started after SIGTERM"); }
+                assert!(children(launcher).is_empty(), "launcher started a child after SIGTERM");
+                let mut status = 0;
+                let waited = unsafe { libc::waitpid(launcher, &mut status, libc::WNOHANG | libc::__WALL) };
+                assert!(waited >= 0, "wait for launcher exit stop");
+                if waited == launcher {
+                    assert_eq!(status >> 16, libc::PTRACE_EVENT_EXIT);
+                    let mut exit: libc::c_ulong = 0;
+                    assert_eq!(unsafe { libc::ptrace(libc::PTRACE_GETEVENTMSG, launcher, 0, &mut exit as *mut libc::c_ulong) }, 0);
+                    assert_eq!(exit, 0, "launcher exits with status zero");
+                    assert_eq!(unsafe { libc::ptrace(libc::PTRACE_DETACH, launcher, 0, 0) }, 0);
+                    break;
+                }
+                session.pump(10);
+            }
+            assert!(readable(launcher_fd.as_raw_fd(), deadline.saturating_duration_since(Instant::now()).as_millis() as i32),
+                "launcher did not exit");
+            for leaf in ["hx/fg", "hx/rec"] { assert!(session.cgroups.procs(leaf).is_empty(), "helper survived launcher exit"); }
+            match helper_wire::linux::recv(session.control.as_fd(), 0, true) {
+                Ok(Some((bytes, fds, receipt))) => {
+                    assert!(fds.is_empty());
+                    assert_eq!(helper_wire::decode_from_launcher(&bytes, receipt).unwrap(),
+                        FromLauncher::Ended { call: call(3), end: End::StartFailed(LauncherError::Draining) });
+                }
+                Ok(None) => {},
+                Err(error) => assert_eq!(error.raw_os_error(), Some(libc::ECONNRESET), "launcher refusal: {error}"),
+            }
         }
         "helper-stopped" => {
             session.wait_ready();

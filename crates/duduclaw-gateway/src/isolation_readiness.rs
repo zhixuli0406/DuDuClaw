@@ -13,6 +13,10 @@ pub use integration::{IntegrationComponent, IntegrationProbe, ProbeError, PtyReq
 pub(crate) mod reasons;
 pub use reasons::{EmployeeReadiness, Overall, Reason, record_connector_build};
 
+/// R8m 30b: the gateway's readiness view published for the root CLI.
+#[path = "isolation_readiness/published.rs"]
+pub mod published;
+
 static REQUIRED: AtomicBool = AtomicBool::new(false);
 /// A TEAM edition was resolved on Linux by [`initialize`] (boot or a live
 /// promotion). Only then can isolation become required for this composite.
@@ -23,7 +27,8 @@ static TEAM_SEEN: AtomicBool = AtomicBool::new(false);
 /// sets [`REQUIRED`] instead; the late check then no longer applies (it only
 /// covers an uninitialised readiness), and admission falls to the normal
 /// readiness gate, which is still fail closed: no isolation backend is
-/// connected after boot ([`connect_backend`] runs only at trusted boot).
+/// connected unless isolation was required at trusted boot ([`connect_backend`]
+/// and its background retry start only there).
 static LATE_REQUIRED: AtomicBool = AtomicBool::new(false);
 
 const NOT_READY: &str = "ISOLATION_NOT_READY: 受保護團隊的隔離服務尚未就緒，請由管理員檢查服務狀態。";
@@ -51,7 +56,9 @@ impl Components {
             self.runtime_adapters].into_iter().all(|state| state == ComponentState::Ready)
     }
 
-    fn current(host_was_verified: bool) -> Self {
+    fn current(host_was_verified: bool) -> Self { Self::current_with_reasons(host_was_verified).0 }
+
+    fn current_with_reasons(host_was_verified: bool) -> (Self, ComponentReasons) {
         let generation = current_generation();
         let mut integration = integration::current(generation);
         // A generation rotation during a probe cannot combine old adapters
@@ -60,16 +67,35 @@ impl Components {
         if current != generation { integration.invalidate(); }
         // Integration probes can consume B1's sub-second receipt lifetime.
         // Re-read at final admission instead of retaining an earlier bool.
-        let host = if host_was_verified && spawnd_verified() { ComponentState::Ready }
-            else { ComponentState::Unavailable };
-        Self { launch_service: host, sandbox: host, network: host, storage: host,
-            parse_worker: combined_worker_state(integration.parse_worker, parse_worker_state()),
-            update_service: if generation.is_some() && current == generation {
-                ComponentState::Ready
-            } else { ComponentState::Unavailable },
-            mcp_boundary: integration.mcp_boundary,
-            runtime_adapters: combined_worker_state(integration.runtime_adapters, runtime_adapters_state()) }
+        compose(host_was_verified && spawnd_verified(), generation.is_some() && current == generation,
+            integration, parse_worker_state(), runtime_adapters_state())
     }
+}
+
+/// R8n-1: the fixed reasons of the two probe-backed components (a refused
+/// ParseWorker / RuntimeAdapters probe), beside [`Components`]; published as
+/// `component(reason)` in the root CLI's view, and (review F3) in
+/// `system.status`'s separate `component_reasons` map ([`report`]). Never
+/// serialized in the component map, whose shape is unchanged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ComponentReasons {
+    pub parse_worker: Option<&'static str>,
+    pub runtime_adapters: Option<&'static str>,
+}
+
+/// The composite from its sources. An absent probe leaves its component
+/// `PendingIntegration` (never ready); missing producers make it unavailable.
+fn compose(host: bool, update: bool, integration: integration::States, parse_producers: ComponentState,
+    runtime_producers: ComponentState) -> (Components, ComponentReasons) {
+    let host = if host { ComponentState::Ready } else { ComponentState::Unavailable };
+    let parse_worker = combined_worker_state(integration.parse_worker, parse_producers);
+    let runtime_adapters = combined_worker_state(integration.runtime_adapters, runtime_producers);
+    let reason = |state: ComponentState, reason: Option<&'static str>| reason.filter(|_| state == ComponentState::Unavailable);
+    (Components { launch_service: host, sandbox: host, network: host, storage: host, parse_worker,
+        update_service: if update { ComponentState::Ready } else { ComponentState::Unavailable },
+        mcp_boundary: integration.mcp_boundary, runtime_adapters },
+     ComponentReasons { parse_worker: reason(parse_worker, integration.parse_worker_reason),
+        runtime_adapters: reason(runtime_adapters, integration.runtime_adapters_reason) })
 }
 
 fn runtime_adapters_state() -> ComponentState {
@@ -98,6 +124,22 @@ pub struct Readiness {
     /// now. Informational: they never make `status` `action_required`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notices: Option<Vec<Reason>>,
+    /// R8m 30b, set only by [`report`]: the boot assembly's missing producers
+    /// by fixed name (`published::ASSEMBLY`), the same list the root CLI reads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assembly_missing: Option<Vec<&'static str>>,
+    /// R8n-1, set only by [`report`]: the helper tool families this host does
+    /// not offer (`published::TOOL_FAMILIES` names; empty until assembled).
+    /// Informational: never part of `ready` or `status`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools_unavailable: Option<Vec<&'static str>>,
+    /// R8n-1 review F3, set only by [`report`]: each NOT-ready component's
+    /// fixed reason name, exactly as the published view gives it
+    /// (`published::component_reasons`: a probe reason from
+    /// `published::PARSE_WORKER_REASONS` / `RUNTIME_ADAPTER_REASONS`, else
+    /// `unavailable` / `pending_integration`). Ready components are absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub component_reasons: Option<std::collections::BTreeMap<&'static str, &'static str>>,
 }
 
 fn applies(linux: bool, protected: bool, team: bool) -> bool { linux && protected && team }
@@ -135,12 +177,10 @@ static UPDATE_OBSERVATION: std::sync::Mutex<Option<UpdateObservation>> = std::sy
 fn update_fresh(observed: Option<Instant>, now: Instant) -> bool {
     observed.and_then(|at| now.checked_duration_since(at)).is_some_and(|age| age <= Duration::from_secs(2))
 }
+/// The shared rule (`duduclaw_updated::readiness::compatible_update`, also used
+/// by the installer's composite readiness check) for this gateway's release.
 fn compatible_update(evidence: &duduclaw_updated::readiness::GenerationEvidence) -> bool {
-    let p = &evidence.protocols;
-    evidence.generation.0 != [0; 32]
-        && duduclaw_updated::parse_version(env!("CARGO_PKG_VERSION")).is_ok_and(|v| v == evidence.version)
-        && [p.gateway, p.spawnd, p.trampoline, p.egress, p.updated, p.mcp_bridge, p.parse_worker, p.importer]
-            .into_iter().all(|version| version == 1)
+    duduclaw_updated::readiness::compatible_update(evidence, env!("CARGO_PKG_VERSION"))
 }
 /// Authenticated F observation, usable by boot consumers only while fresh.
 #[cfg(target_os = "linux")]
@@ -160,7 +200,7 @@ fn combined_worker_state(integration: ComponentState, producers: ComponentState)
 }
 
 fn parse_worker_state() -> ComponentState {
-    #[cfg(all(target_os = "linux", feature = "isolation-worker-integration"))]
+    #[cfg(target_os = "linux")]
     if duduclaw_parse_worker::client::launcher_installed()
         && crate::isolation_mcp::boot_status().constructed
         && update_service_state() == ComponentState::Ready {
@@ -198,19 +238,103 @@ fn start_update_probe() {}
 
 /// Connect at trusted boot even if another component is still unavailable. The
 /// installed backend rechecks the composite gate before every reservation.
+/// One attempt inline; when spawnd's control socket is not reachable yet, the
+/// same attempt is retried in the background (`isolation_mcp::spawn_backend_retry`:
+/// bounded schedule, ends at the first success or at shutdown). The first
+/// success marks the gateway-local readiness step `Backend`
+/// (`update_readback::LocalStep`).
+///
+/// R8j round 3 F1, total over every case ([`backend_step`]): on an isolated
+/// install ([`isolated_install`]) the step is marked ONLY by a real installed
+/// spawnd backend, whatever the edition or licence state (verified TEAM,
+/// verified non-team, missing, unreadable or invalid). Only the TEAM path
+/// (isolation required, which on Linux implies the isolated install) attempts
+/// the connection; an isolated install whose edition does not take that path
+/// does NOT attempt it (installing the protected backend there would change
+/// how a non-team host executes, and marking the step would report it as
+/// healthy): the step is never marked, the update read-back stays not ready
+/// and one fixed ERROR line says so. Marked at once only without the isolated
+/// install (no spawnd backend is used there).
 pub async fn connect_backend() {
-    if !REQUIRED.load(Ordering::Acquire) { return; }
-    #[cfg(target_os = "linux")]
-    {
-        let result = match duduclaw_execution::SpawndBackend::connect_with_admission(backend_admission).await {
-            // W1: spawnd's checked readiness bits narrow every run's own
-            // `Reserved.features`; without this source no work op is sent.
-            Ok(backend) => duduclaw_execution::selection::install_protected_backend(std::sync::Arc::new(
-                backend.with_feature_source(crate::isolation_mcp::readiness_feature_source())), backend_admission),
-            Err(error) => Err(error),
-        };
-        if result.is_err() { tracing::error!("受保護團隊無法連接隔離執行服務，員工執行維持暫停。"); }
+    match mark_backend_step(REQUIRED.load(Ordering::Acquire), isolated_install, &crate::update_readback::LOCAL) {
+        BackendStep::NotApplicable => {}
+        BackendStep::Withheld => {
+            tracing::error!("此主機已安裝隔離架構，但閘道未以團隊授權執行；不連接隔離執行服務，閘道的更新回讀維持未就緒，請由管理員檢查授權。");
+        }
+        BackendStep::NeedsBackend => {
+            #[cfg(target_os = "linux")]
+            {
+                if !mark_after_backend(connect_backend_once, &crate::update_readback::LOCAL).await {
+                    tracing::error!("受保護團隊暫時無法連接隔離執行服務，員工執行維持暫停；閘道會在背景持續重試連線。");
+                    crate::isolation_mcp::spawn_backend_retry();
+                }
+            }
+        }
     }
+}
+
+/// The inline attempt of the TEAM path: `latch`'s `Backend` step is marked
+/// only when `connect` answers that a real backend is installed. `false`
+/// otherwise (the caller starts the background retry, which marks it at its
+/// first success).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+async fn mark_after_backend<F: std::future::Future<Output = bool>>(connect: impl FnOnce() -> F,
+    latch: &crate::update_readback::LocalReadiness) -> bool {
+    if !connect().await { return false; }
+    latch.mark(crate::update_readback::LocalStep::Backend);
+    true
+}
+
+/// The isolated-install fact, from durable root-owned host facts that do not
+/// depend on the licence: the protected-mode marker AND the isolation install
+/// facts (`duduclaw_core::isolation_install`), the same pair [`initialize`]
+/// and [`check_execution`] use. Never true off Linux.
+fn isolated_install() -> bool {
+    cfg!(target_os = "linux") && duduclaw_core::protected_mode::active() && duduclaw_core::isolation_install::installed()
+}
+
+/// What [`connect_backend`] does with the `Backend` step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BackendStep {
+    /// Isolation is required: only a real spawnd backend marks the step.
+    NeedsBackend,
+    /// No isolated install: no spawnd backend is used, marked at once.
+    NotApplicable,
+    /// Isolated install whose edition does not take the TEAM path (whatever
+    /// the licence state): never marked, no connection attempted.
+    Withheld,
+}
+/// R8j round 3 F1. `required`: isolation is required (TEAM path; only set
+/// on an isolated install). `isolated` is consulted only when it is not.
+/// `NotApplicable` exists only when `isolated` answered false.
+fn backend_step(required: bool, isolated: impl FnOnce() -> bool) -> BackendStep {
+    if required { return BackendStep::NeedsBackend; }
+    if isolated() { BackendStep::Withheld } else { BackendStep::NotApplicable }
+}
+/// [`backend_step`], marking `latch` when the step does not apply.
+fn mark_backend_step(required: bool, isolated: impl FnOnce() -> bool,
+    latch: &crate::update_readback::LocalReadiness) -> BackendStep {
+    let step = backend_step(required, isolated);
+    if step == BackendStep::NotApplicable { latch.mark(crate::update_readback::LocalStep::Backend); }
+    step
+}
+
+/// One connection attempt to spawnd's control socket. Needs only that socket
+/// (root-owned, `SO_PEERCRED` uid/gid 0; no frame is exchanged at connect),
+/// never the updater's answer or spawnd's complete evidence. `true` once a
+/// backend is installed, by this attempt or an earlier one; an installed
+/// backend is never replaced (`install_protected_backend` is set-once).
+#[cfg(target_os = "linux")]
+pub(crate) async fn connect_backend_once() -> bool {
+    use duduclaw_execution::selection::{install_protected_backend, protected_backend_for_boot};
+    if protected_backend_for_boot().is_ok() { return true; }
+    if let Ok(backend) = duduclaw_execution::SpawndBackend::connect_with_admission(backend_admission).await {
+        // W1: spawnd's checked readiness bits narrow every run's own
+        // `Reserved.features`; without this source no work op is sent.
+        let _ = install_protected_backend(std::sync::Arc::new(
+            backend.with_feature_source(crate::isolation_mcp::readiness_feature_source())), backend_admission);
+    }
+    protected_backend_for_boot().is_ok()
 }
 
 fn admit(required: bool, components: Option<Components>) -> Result<(), String> {
@@ -226,7 +350,7 @@ fn admit(required: bool, components: Option<Components>) -> Result<(), String> {
 /// never cleared, but a later live TEAM promotion (`initialize(true)`) sets
 /// the readiness latch, after which this check no longer applies; admission
 /// then goes through the normal readiness gate, still fail closed because no
-/// backend is connected after boot.
+/// backend is connected when isolation was not required at boot.
 /// `initialised`: the readiness latch is set (normal path, nothing to do).
 /// `team_seen`: a Linux TEAM edition was resolved. `applies_now` is consulted
 /// only when the answer is not already decided.
@@ -260,33 +384,57 @@ fn backend_admission() -> Result<(), duduclaw_isolation::execution::BackendError
 
 /// Every read uses fresh, authenticated B1 evidence. This result contains no
 /// paths, process IDs, key material, raw service errors or caller-supplied flags.
-pub fn status() -> Option<Readiness> {
+pub fn status() -> Option<Readiness> { status_with_reasons().map(|(readiness, _)| readiness) }
+
+/// [`status`] with the probe-backed components' fixed reasons (the published view).
+pub(crate) fn status_with_reasons() -> Option<(Readiness, ComponentReasons)> {
     if !REQUIRED.load(Ordering::Acquire) { return None; }
-    let components = Components::current(spawnd_verified());
-    Some(Readiness { required: true, ready: components.all_ready(), components,
-        status: None, reasons: None, employees: None, notices: None })
+    let (components, reasons) = Components::current_with_reasons(spawnd_verified());
+    Some((Readiness { required: true, ready: components.all_ready(), components,
+        status: None, reasons: None, employees: None, notices: None, assembly_missing: None, tools_unavailable: None,
+        component_reasons: None },
+        reasons))
 }
 
 /// [`status`] plus the F3 reasons, for the dashboard. Blocking (SQLite and
 /// root ReadBack per employee): call on the blocking pool. Diagnosis only;
 /// it never admits anything. Employee labels are included for admins only.
+/// R8n-1 review F3: the same source as the published view
+/// ([`status_with_reasons`]), so each not-ready component keeps its reason.
 pub fn report(home: &std::path::Path, admin: bool) -> Option<Readiness> {
-    let readiness = status()?;
+    let (readiness, component_reasons) = status_with_reasons()?;
+    let component_reasons = published::component_reasons(&readiness, component_reasons);
     let assessment = reasons::assess_installed(home);
     // W1: host-wide work-broker / in-run helper reasons (live feature view),
     // action-required only for tools some protected employee is configured with.
     let needs = reasons::installed_tool_needs(home,
         assessment.employees.iter().map(|employee| employee.label.as_str()));
-    Some(with_features(readiness, assessment, reasons::installed_feature_reasons(), needs, admin))
+    // v1.83 R4: migration pending confirmation (action) and the Landlock
+    // clamp (notice only), from sources the gateway verifies itself.
+    let host = reasons::installed_host_reasons(home);
+    let mut readiness = with_features(readiness, assessment, reasons::installed_feature_reasons(), needs, host, admin);
+    // R8m 30b: the same fixed list the root CLI reads from the published view.
+    readiness.assembly_missing = Some(published::assembly_missing());
+    readiness.tools_unavailable = Some(published::tools_unavailable());
+    readiness.component_reasons = Some(component_reasons);
+    Some(readiness)
 }
 
 /// [`with_assessment`] after splitting the host-wide feature reasons by
 /// `needs`: the concerned ones join the reasons, the rest become notices.
+/// `host` action reasons join the reasons; `host` notices stay notices.
 fn with_features(readiness: Readiness, mut assessment: reasons::Assessment, features: Vec<Reason>,
-    needs: reasons::ToolNeeds, admin: bool) -> Readiness {
-    let (action, notices) = needs.split(features);
+    needs: reasons::ToolNeeds, host: reasons::HostReasons, admin: bool) -> Readiness {
+    let (action, mut notices) = needs.split(features);
     assessment.reasons.extend(action);
+    assessment.reasons.extend(host.action);
+    notices.extend(host.notices);
     let mut readiness = with_assessment(readiness, assessment, admin);
+    // A notice-only reason that reached the assessment is moved, never kept
+    // as action-required (see `with_assessment`).
+    if let Some(moved) = readiness.notices.take() { notices.extend(moved); }
+    notices.sort();
+    notices.dedup();
     readiness.notices = (!notices.is_empty()).then_some(notices);
     readiness
 }
@@ -294,11 +442,21 @@ fn with_features(readiness: Readiness, mut assessment: reasons::Assessment, feat
 /// The assessment itself could not run (blocking task failed): fail closed.
 pub fn report_failed() -> Option<Readiness> {
     let failed = reasons::Assessment { reasons: [Reason::ServiceUnavailable].into(), employees: Vec::new() };
-    status().map(|readiness| with_assessment(readiness, failed, false))
+    status_with_reasons().map(|(readiness, component_reasons)| {
+        let component_reasons = published::component_reasons(&readiness, component_reasons);
+        let mut readiness = with_assessment(readiness, failed, false);
+        readiness.assembly_missing = Some(published::assembly_missing());
+        readiness.tools_unavailable = Some(published::tools_unavailable());
+        readiness.component_reasons = Some(component_reasons);
+        readiness
+    })
 }
 
 fn with_assessment(mut readiness: Readiness, assessment: reasons::Assessment, admin: bool) -> Readiness {
-    let mut all = assessment.reasons;
+    // Notice-only reasons never count as action required, whatever path
+    // delivered them; they are reported under `notices`.
+    let (notices, mut all): (std::collections::BTreeSet<Reason>, std::collections::BTreeSet<Reason>) =
+        assessment.reasons.into_iter().partition(Reason::notice_only);
     // spawnd unreachable / receipt unreadable: the host evidence components.
     if readiness.components.launch_service == ComponentState::Unavailable {
         all.insert(Reason::ServiceUnavailable);
@@ -306,7 +464,11 @@ fn with_assessment(mut readiness: Readiness, assessment: reasons::Assessment, ad
     readiness.status = Some(if all.contains(&Reason::ServiceUnavailable) { Overall::ServiceUnavailable }
         else if readiness.ready && all.is_empty() { Overall::Ready } else { Overall::ActionRequired });
     readiness.reasons = Some(all.into_iter().collect());
-    readiness.employees = admin.then_some(assessment.employees);
+    readiness.notices = (!notices.is_empty()).then(|| notices.into_iter().collect());
+    readiness.employees = admin.then_some(assessment.employees.into_iter().map(|mut employee| {
+        employee.reasons.retain(|reason| !reason.notice_only());
+        employee
+    }).collect());
     readiness
 }
 
@@ -330,6 +492,73 @@ mod tests {
                 for team in [false, true] {
                     assert_eq!(applies(linux, protected, team), linux && protected && team);
                 }
+            }
+        }
+    }
+
+    /// R8j round 2 B1 / round 3 F1: the update read-back's `Backend` step on
+    /// each host kind.
+    fn latch_with_other_steps() -> crate::update_readback::LocalReadiness {
+        let latch = crate::update_readback::LocalReadiness::new();
+        latch.mark(crate::update_readback::LocalStep::Stores);
+        latch.mark(crate::update_readback::LocalStep::Service);
+        latch
+    }
+
+    /// Isolated install, verified TEAM licence: `initialize(true)` set
+    /// REQUIRED. Not marked by the decision; marked only once the (fake)
+    /// backend connection answers that a real backend is installed.
+    #[tokio::test]
+    async fn backend_step_isolated_verified_team_is_marked_only_after_the_backend() {
+        let latch = latch_with_other_steps();
+        assert_eq!(mark_backend_step(true, || panic!("not consulted"), &latch), BackendStep::NeedsBackend);
+        assert!(!latch.ready(), "only a connected spawnd backend marks the step");
+        // spawnd not reachable: the inline attempt fails, still not ready.
+        assert!(!mark_after_backend(|| async { false }, &latch).await);
+        assert!(!latch.ready());
+        // The real backend is installed: marked.
+        assert!(mark_after_backend(|| async { true }, &latch).await);
+        assert!(latch.ready());
+        // Isolated or not, a required isolation always needs the backend.
+        assert_eq!(backend_step(true, || true), BackendStep::NeedsBackend);
+        assert_eq!(backend_step(true, || false), BackendStep::NeedsBackend);
+    }
+
+    /// Isolated install, verified Personal (non-team) licence: the edition
+    /// does not take the TEAM path (REQUIRED unset), so no connection is
+    /// attempted and the step is never marked.
+    #[test]
+    fn backend_step_isolated_verified_personal_is_not_marked_without_a_backend() {
+        let latch = latch_with_other_steps();
+        assert_eq!(mark_backend_step(false, || true, &latch), BackendStep::Withheld);
+        assert!(!latch.ready(), "a non-team isolated host never reports ready");
+        assert_eq!(mark_backend_step(false, || true, &latch), BackendStep::Withheld);
+        assert!(!latch.ready());
+    }
+
+    /// Isolated install, licence missing / unreadable / invalid: the edition
+    /// degraded to Personal/OpenSource (REQUIRED unset): the same decision,
+    /// never marked, however often it is made.
+    #[test]
+    fn backend_step_isolated_unverifiable_licence_is_never_marked() {
+        let latch = latch_with_other_steps();
+        for _ in 0..3 {
+            assert_eq!(mark_backend_step(false, || true, &latch), BackendStep::Withheld);
+            assert!(!latch.ready(), "read-back must not answer ready");
+        }
+    }
+
+    /// No isolated install (any edition, any licence state): no spawnd
+    /// backend is used, marked at once. The only `NotApplicable` case.
+    #[test]
+    fn backend_step_non_isolated_host_is_marked_at_once() {
+        let latch = latch_with_other_steps();
+        assert_eq!(mark_backend_step(false, || false, &latch), BackendStep::NotApplicable);
+        assert!(latch.ready());
+        for required in [false, true] {
+            for isolated in [false, true] {
+                let step = backend_step(required, || isolated);
+                assert_eq!(step == BackendStep::NotApplicable, !required && !isolated, "{required} {isolated}");
             }
         }
     }
@@ -436,11 +665,71 @@ mod tests {
         assert!(admit(true, Some(stale)).is_err());
     }
 
+    /// A faked probe: refuses with `reason` when given, otherwise ready with a
+    /// fresh runtime observation that needs no PTY.
+    struct FakeProbe(Option<&'static str>);
+    impl IntegrationProbe for FakeProbe {
+        fn verify_producers(&self) -> Result<(), ProbeError> { self.0.map_or(Ok(()), |reason| Err(ProbeError::Refused(reason))) }
+        fn verify_service(&self, generation: duduclaw_isolation::ids::Sha256Digest) -> Result<ServiceObservation, ProbeError> {
+            Ok(ServiceObservation::checked_runtime(generation, Instant::now(), PtyRequirement::NotRequired))
+        }
+    }
+
+    /// R8n-1 2.x, over the admission decision `check_execution` makes
+    /// (`admit` of the composite): a fully faked ready host (host evidence,
+    /// update service, producers and all three probes) is admitted; without
+    /// the ParseWorker / RuntimeAdapters probe it stays pending (no "no probe
+    /// ⇒ ready"); a refused probe is unavailable with its fixed reason.
+    #[test]
+    fn r8n_probes_decide_parse_worker_and_runtime_adapters_admission() {
+        use std::sync::Arc;
+        let generation = Some(duduclaw_isolation::ids::Sha256Digest([7; 32]));
+        let probe = |reason: Option<&'static str>| -> Arc<dyn IntegrationProbe> { Arc::new(FakeProbe(reason)) };
+        let host = |probes: Vec<(IntegrationComponent, Arc<dyn IntegrationProbe>)>|
+            compose(true, true, integration::states_with(probes, generation), ComponentState::Ready, ComponentState::Ready);
+        // Every probe installed and passing: ready, admitted, no reasons.
+        let (components, reasons) = host(vec![(IntegrationComponent::ParseWorker, probe(None)),
+            (IntegrationComponent::McpBoundary, probe(None)), (IntegrationComponent::RuntimeAdapters, probe(None))]);
+        assert!(components.all_ready(), "{components:?}");
+        assert!(admit(true, Some(components)).is_ok());
+        assert_eq!(reasons, ComponentReasons::default());
+        // Only the MCP boundary probe (the state before R8n-1): never ready.
+        let (components, reasons) = host(vec![(IntegrationComponent::McpBoundary, probe(None))]);
+        assert_eq!(components.parse_worker, ComponentState::PendingIntegration);
+        assert_eq!(components.runtime_adapters, ComponentState::PendingIntegration);
+        assert_eq!(reasons, ComponentReasons::default());
+        assert!(admit(true, Some(components)).is_err());
+        // Each probe's own refusal: unavailable with its fixed reason.
+        let (components, reasons) = host(vec![(IntegrationComponent::ParseWorker, probe(Some("socket_not_listening"))),
+            (IntegrationComponent::McpBoundary, probe(None)), (IntegrationComponent::RuntimeAdapters, probe(None))]);
+        assert_eq!((components.parse_worker, reasons.parse_worker), (ComponentState::Unavailable, Some("socket_not_listening")));
+        assert_eq!(components.runtime_adapters, ComponentState::Ready);
+        assert!(admit(true, Some(components)).is_err());
+        let (components, reasons) = host(vec![(IntegrationComponent::ParseWorker, probe(None)),
+            (IntegrationComponent::McpBoundary, probe(None)), (IntegrationComponent::RuntimeAdapters, probe(Some("no_main_runtime")))]);
+        assert_eq!((components.runtime_adapters, reasons.runtime_adapters), (ComponentState::Unavailable, Some("no_main_runtime")));
+        assert_eq!(reasons.parse_worker, None);
+        assert!(admit(true, Some(components)).is_err());
+        // Passing probes never override missing producers or host evidence.
+        let all = || vec![(IntegrationComponent::ParseWorker, probe(None)),
+            (IntegrationComponent::McpBoundary, probe(None)), (IntegrationComponent::RuntimeAdapters, probe(None))];
+        let (components, _) = compose(true, true, integration::states_with(all(), generation),
+            ComponentState::Unavailable, ComponentState::Ready);
+        assert_eq!(components.parse_worker, ComponentState::Unavailable);
+        let (components, _) = compose(true, true, integration::states_with(all(), generation),
+            ComponentState::Ready, ComponentState::PendingIntegration);
+        assert_eq!(components.runtime_adapters, ComponentState::Unavailable);
+        let (components, _) = compose(false, true, integration::states_with(all(), generation),
+            ComponentState::Ready, ComponentState::Ready);
+        assert!(admit(true, Some(components)).is_err());
+    }
+
     #[test]
     fn operator_payload_has_fixed_component_states_only() {
         let components = Components::current(false);
         let value = serde_json::to_value(Readiness { required: true, ready: false, components,
-            status: None, reasons: None, employees: None, notices: None }).unwrap();
+            status: None, reasons: None, employees: None, notices: None, assembly_missing: None,
+            tools_unavailable: None, component_reasons: None }).unwrap();
         assert_eq!(value["required"], true);
         assert_eq!(value["ready"], false);
         assert_eq!(value["components"].as_object().unwrap().len(), 8);
@@ -459,7 +748,7 @@ mod tests {
 
     fn base(components: Components) -> Readiness {
         Readiness { required: true, ready: components.all_ready(), components, status: None, reasons: None,
-            employees: None, notices: None }
+            employees: None, notices: None, assembly_missing: None, tools_unavailable: None, component_reasons: None }
     }
 
     /// W1 follow-up: a host that publishes no helpers (and whose spawnd lacks
@@ -470,7 +759,7 @@ mod tests {
     #[test]
     fn w1_helper_reasons_informational_when_no_employee_uses_helper_tools() {
         use duduclaw_isolation::ipc::SpawndFeatures;
-        use reasons::{feature_reasons, Assessment, ToolNeeds};
+        use reasons::{feature_reasons, Assessment, HostReasons, ToolNeeds};
         let features = || feature_reasons(Some(SpawndFeatures::NONE), true, Some(&[] as &[&str]));
         let strings = |names: &[&str]| names.iter().map(|name| (*name).to_owned()).collect::<Vec<_>>();
         assert_eq!(features().len(), 5, "broker + launcher + three runtimes");
@@ -480,7 +769,7 @@ mod tests {
         for needs in [ToolNeeds::default(), ToolNeeds::from_lists(&[], &[]),
             ToolNeeds::from_lists(&[], &strings(&["web_search", "send_message"])),
             ToolNeeds::from_lists(&strings(&["file_read", "execute_program"]), &strings(&["file_read", "execute_program"]))] {
-            let readiness = with_features(base(all_ready()), Assessment::default(), features(), needs, true);
+            let readiness = with_features(base(all_ready()), Assessment::default(), features(), needs, HostReasons::default(), true);
             assert_eq!(readiness.status, Some(Overall::Ready), "{needs:?}");
             assert_eq!(readiness.reasons, Some(vec![]));
             assert_eq!(readiness.notices.as_ref().map(Vec::len), Some(5));
@@ -492,7 +781,7 @@ mod tests {
         // One employee configured with `execute_program`: the broker, the
         // launcher and the program runtime need action; the others stay notices.
         let needs = ToolNeeds::default().union(ToolNeeds::from_lists(&[], &strings(&["execute_program"])));
-        let readiness = with_features(base(all_ready()), Assessment::default(), features(), needs, true);
+        let readiness = with_features(base(all_ready()), Assessment::default(), features(), needs, HostReasons::default(), true);
         assert_eq!(readiness.status, Some(Overall::ActionRequired));
         let action = readiness.reasons.unwrap();
         assert!(action.contains(&Reason::WorkspaceBrokerUnavailable));
@@ -509,11 +798,72 @@ mod tests {
         let needs = ToolNeeds::from_lists(&[], &strings(&["browser_record_start"]));
         assert_eq!(needs.split(features()).0, vec![Reason::HelperLauncherUnavailable { reason: "spawnd_feature_missing" }]);
         // Fail closed: an unreadable profile counts as needing everything.
-        let readiness = with_features(base(all_ready()), Assessment::default(), features(), ToolNeeds::ALL, true);
+        let readiness = with_features(base(all_ready()), Assessment::default(), features(), ToolNeeds::ALL, HostReasons::default(), true);
         assert_eq!(readiness.status, Some(Overall::ActionRequired));
         assert!(readiness.notices.is_none());
         // Non-feature reasons are never demoted.
         assert!(ToolNeeds::default().concerns(&Reason::Revoked));
+    }
+
+    /// v1.83 R4: the dashboard report carries both host reasons with their
+    /// severity: a migration waiting for confirmation is action-required, the
+    /// Landlock clamp is only a notice under every tool need and every path.
+    #[test]
+    fn r4_report_carries_migration_pending_action_and_landlock_notice() {
+        use reasons::{host_reasons, Assessment, HostReasons, ToolNeeds};
+        for needs in [ToolNeeds::default(), ToolNeeds::ALL] {
+            let readiness = with_features(base(all_ready()), Assessment::default(), Vec::new(), needs,
+                host_reasons(Some((8, 7)), Ok(true)), true);
+            assert_eq!(readiness.status, Some(Overall::ActionRequired), "{needs:?}");
+            assert_eq!(readiness.reasons, Some(vec![Reason::MigrationPending]));
+            assert_eq!(readiness.notices, Some(vec![Reason::LandlockAbiClamped]));
+            let value = serde_json::to_value(&readiness).unwrap();
+            assert_eq!(value["reasons"], serde_json::json!([{"code": "migration_pending"}]));
+            assert_eq!(value["notices"], serde_json::json!([{"code": "landlock_abi_clamped"}]));
+        }
+        // The clamp alone never makes the host action-required.
+        let readiness = with_features(base(all_ready()), Assessment::default(), Vec::new(), ToolNeeds::ALL,
+            host_reasons(Some((9, 7)), Ok(false)), true);
+        assert_eq!(readiness.status, Some(Overall::Ready));
+        assert_eq!(readiness.reasons, Some(vec![]));
+        assert_eq!(readiness.notices, Some(vec![Reason::LandlockAbiClamped]));
+        // Even if a notice-only reason reached the assessment, it is moved.
+        let assessment = Assessment { reasons: [Reason::LandlockAbiClamped].into(), employees: Vec::new() };
+        let readiness = with_features(base(all_ready()), assessment, Vec::new(), ToolNeeds::ALL,
+            HostReasons::default(), true);
+        assert_eq!(readiness.status, Some(Overall::Ready));
+        assert_eq!(readiness.notices, Some(vec![Reason::LandlockAbiClamped]));
+        // No clamp, no migration: nothing. A store that cannot be read is
+        // diagnostic only: no reason at all, the status is unchanged.
+        assert_eq!(host_reasons(Some((7, 7)), Ok(false)), HostReasons::default());
+        let readiness = with_features(base(all_ready()), Assessment::default(), Vec::new(), ToolNeeds::default(),
+            host_reasons(None, Err(())), true);
+        assert_eq!(readiness.status, Some(Overall::Ready));
+        assert_eq!(readiness.reasons, Some(vec![]));
+        // No wildcard escalation: the split and `concerns` keep the clamp a notice.
+        assert!(!ToolNeeds::ALL.concerns(&Reason::LandlockAbiClamped));
+        assert!(ToolNeeds::default().concerns(&Reason::MigrationPending));
+        assert_eq!(ToolNeeds::ALL.split(vec![Reason::LandlockAbiClamped]), (vec![], vec![Reason::LandlockAbiClamped]));
+        assert!(Reason::LandlockAbiClamped.notice_only() && !Reason::MigrationPending.notice_only());
+    }
+
+    /// Item 8: the gateway's update admission is the shared updater rule (the
+    /// installer's composite check calls the same function).
+    #[test]
+    fn update_admission_uses_the_shared_compatibility_rule() {
+        use duduclaw_isolation::{ids::Sha256Digest, update::{Product, ProtocolCompatibility}};
+        use duduclaw_updated::readiness::GenerationEvidence;
+        let one = ProtocolCompatibility { gateway: 1, spawnd: 1, trampoline: 1, egress: 1, updated: 1,
+            mcp_bridge: 1, parse_worker: 1, importer: 1 };
+        let good = GenerationEvidence { generation: Sha256Digest([3; 32]), product: Product::Duduclaw,
+            version: duduclaw_updated::parse_version(env!("CARGO_PKG_VERSION")).unwrap(), protocols: one };
+        let mut zero = good.clone(); zero.generation = Sha256Digest([0; 32]);
+        let mut newer = good.clone(); newer.version.patch += 1;
+        let mut protocol = good.clone(); protocol.protocols.parse_worker = 2;
+        for (evidence, expected) in [(good, true), (zero, false), (newer, false), (protocol, false)] {
+            assert_eq!(compatible_update(&evidence), expected);
+            assert_eq!(duduclaw_updated::readiness::compatible_update(&evidence, env!("CARGO_PKG_VERSION")), expected);
+        }
     }
 
     #[test]

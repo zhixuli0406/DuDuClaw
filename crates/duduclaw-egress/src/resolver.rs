@@ -50,8 +50,8 @@ impl Resolver for HostResolver {
     }
 }
 
-async fn trusted_socket(route: DnsRoute) -> Result<UnixStream, EgressError> {
-    use std::{os::unix::fs::{MetadataExt, FileTypeExt}, path::Path};
+/// The service account of `route`'s socket and its non-root uid.
+fn route_socket(route: DnsRoute) -> Result<(&'static str, u32), EgressError> {
     let (path, user) = match route {
         DnsRoute::ResolvedVarlink => (RESOLVED_SOCKET, "systemd-resolve"),
         DnsRoute::DedicatedDnsBroker => (DNS_BROKER_SOCKET, "duduclaw-dns"),
@@ -59,12 +59,25 @@ async fn trusted_socket(route: DnsRoute) -> Result<UnixStream, EgressError> {
     let uid = nix::unistd::User::from_name(user).map_err(|_| EgressError::Unavailable)?
         .ok_or(EgressError::Unavailable)?.uid.as_raw();
     if uid == 0 { return Err(EgressError::Unavailable); }
+    Ok((path, uid))
+}
+
+/// Every ancestor is a root/`uid`-owned, non-symlink directory not writable by
+/// group or other, and `path` itself is a socket.
+fn socket_path_trusted(path: &str, uid: u32) -> Result<(), EgressError> {
+    use std::{os::unix::fs::{MetadataExt, FileTypeExt}, path::Path};
     for ancestor in Path::new(path).ancestors() {
         let meta = std::fs::symlink_metadata(ancestor).map_err(|_| EgressError::Unavailable)?;
         if meta.file_type().is_symlink() || (meta.uid() != 0 && meta.uid() != uid)
             || (ancestor != Path::new(path) && (!meta.is_dir() || meta.mode() & 0o022 != 0))
             || (ancestor == Path::new(path) && !meta.file_type().is_socket()) { return Err(EgressError::Unavailable); }
     }
+    Ok(())
+}
+
+async fn trusted_socket(route: DnsRoute) -> Result<UnixStream, EgressError> {
+    let (path, uid) = route_socket(route)?;
+    socket_path_trusted(path, uid)?;
     let socket = UnixStream::connect(path).await.map_err(|_| EgressError::Unavailable)?;
     let peer = socket.peer_cred().map_err(|_| EgressError::Unavailable)?;
     // systemd socket activation captures root credentials at listen time.
@@ -160,8 +173,8 @@ async fn write_json<T: Serialize>(socket: &mut UnixStream, value: &T) -> Result<
 pub async fn serve_dns_broker(listener: UnixListener, upstream: SocketAddr, allowed_uid: u32)
     -> Result<(), EgressError> {
     let broker_uid = nix::unistd::geteuid().as_raw();
-    if upstream.port() != 53 || upstream.ip().is_unspecified() || upstream.ip().is_multicast()
-        || allowed_uid == 0 || broker_uid == 0 || broker_uid == allowed_uid {
+    validate_broker_upstream(upstream)?;
+    if allowed_uid == 0 || broker_uid == 0 || broker_uid == allowed_uid {
         return Err(EgressError::InvalidRequest);
     }
     let mut tasks = JoinSet::new();
@@ -170,14 +183,150 @@ pub async fn serve_dns_broker(listener: UnixListener, upstream: SocketAddr, allo
             accepted = listener.accept() => {
                 let (socket, _) = accepted.map_err(|_| EgressError::Unavailable)?;
                 let peer = socket.peer_cred().map_err(|_| EgressError::Unavailable)?;
-                if peer.uid() != allowed_uid || tasks.len() >= 32 { continue; }
+                // Root (the installer's readiness check) may only send the
+                // fixed health request; every name query comes from egress.
+                let health = peer.uid() == 0;
+                if (!health && peer.uid() != allowed_uid) || tasks.len() >= 32 { continue; }
                 tasks.spawn(async move {
-                    let _ = tokio::time::timeout(DNS_TIMEOUT, broker_request(socket, upstream)).await;
+                    if health {
+                        let _ = tokio::time::timeout(BROKER_HEALTH_TIMEOUT, broker_health(socket, upstream)).await;
+                    } else {
+                        let _ = tokio::time::timeout(DNS_TIMEOUT, broker_request(socket, upstream)).await;
+                    }
                 });
             }
             _ = tasks.join_next(), if !tasks.is_empty() => {}
         }
     }
+}
+
+/// The broker's single upstream rule (the broker refuses to start otherwise,
+/// and the installer's readiness check uses this same function through
+/// `daemon::BrokerConfig::validate`): TCP port 53 on a unicast address that
+/// is neither unspecified, multicast nor the IPv4 limited broadcast address.
+pub fn validate_broker_upstream(upstream: SocketAddr) -> Result<(), EgressError> {
+    let broadcast = matches!(upstream.ip(), IpAddr::V4(ip) if ip.is_broadcast());
+    if upstream.port() != 53 || upstream.ip().is_unspecified() || upstream.ip().is_multicast() || broadcast {
+        return Err(EgressError::InvalidRequest);
+    }
+    Ok(())
+}
+
+/// The one request a root peer may send the broker (readiness health probe),
+/// byte-exact, and the broker's only answer to it. The broker answers only
+/// after it reached its configured upstream over TCP within
+/// [`BROKER_HEALTH_UPSTREAM_TIMEOUT`]; otherwise it closes the connection.
+/// No name, query type, destination or port is accepted from the caller.
+pub const BROKER_HEALTH_REQUEST: &[u8] = br#"{"method":"io.duduclaw.DnsBroker.Health"}"#;
+const BROKER_HEALTH_REPLY: &[u8] = br#"{"healthy":true}"#;
+const BROKER_HEALTH_UPSTREAM_TIMEOUT: Duration = Duration::from_millis(1500);
+const BROKER_HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
+
+async fn broker_health(mut socket: UnixStream, upstream: SocketAddr) -> Result<(), EgressError> {
+    let bytes = read_json(&mut socket, BROKER_HEALTH_REQUEST.len()).await?;
+    if bytes != BROKER_HEALTH_REQUEST { return Err(EgressError::InvalidRequest); }
+    // Connect only; no query is sent and the stream is dropped at once.
+    tokio::time::timeout(BROKER_HEALTH_UPSTREAM_TIMEOUT, TcpStream::connect(upstream)).await
+        .map_err(|_| EgressError::Timeout)?.map_err(|_| EgressError::Unavailable)?;
+    let mut reply = BROKER_HEALTH_REPLY.to_vec();
+    reply.push(0);
+    socket.write_all(&reply).await.map_err(|_| EgressError::Unavailable)
+}
+
+/// Bounded, blocking health probe of the dedicated DNS broker, for the root
+/// installer's readiness check: the broker socket's path is root/broker
+/// owned (as for egress), the peer is root (systemd's listener) or the broker
+/// account, and the broker answers [`BROKER_HEALTH_REQUEST`] with its fixed
+/// reply before `timeout` (the whole exchange, connect included). Anything
+/// else (missing socket, wrong peer, early close, other bytes, deadline) is an
+/// error; never a partial "healthy".
+pub fn probe_dns_broker_health(timeout: Duration) -> Result<(), EgressError> {
+    let deadline = std::time::Instant::now() + timeout;
+    let (path, uid) = route_socket(DnsRoute::DedicatedDnsBroker)?;
+    socket_path_trusted(path, uid)?;
+    let mut stream = connect_before(path, deadline)?;
+    let peer = nix::sys::socket::getsockopt(&stream, nix::sys::socket::sockopt::PeerCredentials)
+        .map_err(|_| EgressError::Unavailable)?;
+    if peer.uid() != 0 && peer.uid() != uid { return Err(EgressError::Unavailable); }
+    health_exchange(&mut stream, deadline)
+}
+
+/// Retry interval of [`connect_before`] while the listen backlog is full.
+const CONNECT_RETRY: Duration = Duration::from_millis(10);
+
+/// Connect to the AF_UNIX stream socket `path` before `deadline`. A blocking
+/// `connect` waits without bound while the listener's backlog is full, so the
+/// socket is non-blocking during connect: Linux then reports a full backlog as
+/// `EAGAIN` at once, and the connect is retried until `deadline`
+/// ([`EgressError::Timeout`]). The returned stream is blocking again; the
+/// exchange bounds every read and write by the same deadline.
+#[allow(clippy::unnecessary_cast)] // `c_char` is `u8` on some architectures.
+fn connect_before(path: &str, deadline: std::time::Instant) -> Result<std::os::unix::net::UnixStream, EgressError> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let remaining = || deadline.checked_duration_since(std::time::Instant::now())
+        .filter(|left| !left.is_zero()).ok_or(EgressError::Timeout);
+    // SAFETY: an all-zero `sockaddr_un` is a valid value of the C struct.
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let bytes = path.as_bytes();
+    // Room for the terminating NUL; no interior NUL.
+    if bytes.is_empty() || bytes.contains(&0) || bytes.len() >= address.sun_path.len() {
+        return Err(EgressError::Unavailable);
+    }
+    for (slot, byte) in address.sun_path.iter_mut().zip(bytes) { *slot = *byte as libc::c_char; }
+    let length = libc::socklen_t::try_from(std::mem::size_of::<libc::sa_family_t>() + bytes.len() + 1)
+        .map_err(|_| EgressError::Unavailable)?;
+    // SAFETY: plain socket(2) call; the result is checked and owned at once.
+    let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0) };
+    if raw < 0 { return Err(EgressError::Unavailable); }
+    // SAFETY: `raw` is a fresh, valid descriptor that nothing else owns.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    loop {
+        remaining()?;
+        // SAFETY: `address` is an initialized `sockaddr_un`; `length` is within it.
+        let rc = unsafe { libc::connect(fd.as_raw_fd(), (&address as *const libc::sockaddr_un).cast(), length) };
+        if rc == 0 { break; }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EINTR) => {}
+            // Linux AF_UNIX: the listener's backlog is full. Retry until the deadline.
+            Some(libc::EAGAIN) => std::thread::sleep(remaining()?.min(CONNECT_RETRY)),
+            // Anything else, including an (unexpected for AF_UNIX) EINPROGRESS: fail closed.
+            _ => return Err(EgressError::Unavailable),
+        }
+    }
+    let stream = std::os::unix::net::UnixStream::from(fd);
+    stream.set_nonblocking(false).map_err(|_| EgressError::Unavailable)?;
+    Ok(stream)
+}
+
+/// Send the fixed request and expect exactly the fixed NUL-terminated reply
+/// before `deadline`. Every read/write is bounded by the remaining time.
+fn health_exchange(stream: &mut std::os::unix::net::UnixStream, deadline: std::time::Instant)
+    -> Result<(), EgressError> {
+    use std::io::{Read, Write};
+    let remaining = || deadline.checked_duration_since(std::time::Instant::now())
+        .filter(|left| !left.is_zero()).ok_or(EgressError::Timeout);
+    let timed_out = |error: std::io::Error| match error.kind() {
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => EgressError::Timeout,
+        _ => EgressError::Unavailable,
+    };
+    stream.set_write_timeout(Some(remaining()?)).map_err(|_| EgressError::Unavailable)?;
+    let mut request = BROKER_HEALTH_REQUEST.to_vec();
+    request.push(0);
+    stream.write_all(&request).map_err(timed_out)?;
+    let mut reply = Vec::with_capacity(BROKER_HEALTH_REPLY.len() + 1);
+    let mut byte = [0u8; 1];
+    loop {
+        stream.set_read_timeout(Some(remaining()?)).map_err(|_| EgressError::Unavailable)?;
+        match stream.read(&mut byte).map_err(timed_out)? {
+            0 => return Err(EgressError::Unavailable),
+            _ if byte[0] == 0 => break,
+            _ if reply.len() == BROKER_HEALTH_REPLY.len() => return Err(EgressError::ResourceLimit),
+            _ => reply.push(byte[0]),
+        }
+    }
+    if reply != BROKER_HEALTH_REPLY { return Err(EgressError::Unavailable); }
+    Ok(())
 }
 
 async fn broker_request(mut socket: UnixStream, upstream: SocketAddr) -> Result<(), EgressError> {
@@ -332,6 +481,121 @@ mod tests {
         assert_eq!(tokio::time::timeout(Duration::from_secs(2),broker_request(server,address)).await.unwrap(),Err(EgressError::Unavailable));
         dns.await.unwrap();
         assert_eq!(client.read_u8().await.unwrap_err().kind(),std::io::ErrorKind::UnexpectedEof);
+    }
+
+    /// v1.83 R4: the exported config type and its one validator are what the
+    /// broker enforces at start; the installer's readiness check reuses them.
+    #[test]
+    fn broker_config_single_validator_refuses_what_the_broker_refuses() {
+        use crate::daemon::BrokerConfig;
+        for good in ["8.8.8.8:53", "[2001:4860:4860::8888]:53", "10.0.0.2:53"] {
+            let config: BrokerConfig = serde_json::from_str(&format!(r#"{{"upstream":"{good}"}}"#)).unwrap();
+            assert_eq!(config.validate(), Ok(()), "{good}");
+        }
+        for bad in ["224.0.0.1:53", "8.8.8.8:5353", "0.0.0.0:53", "[::]:53", "[ff02::1]:53",
+            "255.255.255.255:53", "8.8.8.8:0"] {
+            let config: BrokerConfig = serde_json::from_str(&format!(r#"{{"upstream":"{bad}"}}"#)).unwrap();
+            assert_eq!(config.validate(), Err(EgressError::InvalidRequest), "{bad}");
+            assert_eq!(validate_broker_upstream(bad.parse().unwrap()), Err(EgressError::InvalidRequest), "{bad}");
+        }
+        for malformed in [r#"{"upstream":"8.8.8.8:53","extra":1}"#, r#"{"upstream":"8.8.8.8"}"#, r#"{}"#] {
+            assert!(serde_json::from_str::<BrokerConfig>(malformed).is_err(), "{malformed}");
+        }
+    }
+
+    #[tokio::test]
+    async fn broker_health_answers_only_the_fixed_request_after_reaching_upstream() {
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = upstream.local_addr().unwrap();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let mut request = BROKER_HEALTH_REQUEST.to_vec(); request.push(0);
+        client.write_all(&request).await.unwrap();
+        assert_eq!(broker_health(server, address).await, Ok(()));
+        assert_eq!(read_json(&mut client, 64).await.unwrap(), BROKER_HEALTH_REPLY);
+        // Any other request, including a name query, is refused without a reply.
+        let others: [&[u8]; 2] = [br#"{"method":"io.duduclaw.DnsBroker.Health","x":1}"#, br#"{"method":"x"}"#];
+        for other in others {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let mut bytes = other.to_vec(); bytes.push(0);
+            client.write_all(&bytes).await.unwrap();
+            assert!(broker_health(server, address).await.is_err());
+            assert!(matches!(client.read_u8().await.unwrap_err().kind(),
+                std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset));
+        }
+        // Unreachable upstream: no reply.
+        drop(upstream);
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(&request).await.unwrap();
+        assert!(broker_health(server, address).await.is_err());
+        assert!(matches!(client.read_u8().await.unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset));
+    }
+
+    /// The client side is bounded by its deadline and accepts only the exact reply.
+    #[test]
+    fn broker_health_probe_times_out_and_refuses_other_replies() {
+        use std::io::{Read, Write};
+        use std::time::Instant;
+        let (mut client, _server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let started = Instant::now();
+        assert_eq!(health_exchange(&mut client, started + Duration::from_millis(200)), Err(EgressError::Timeout));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        // An already expired deadline never blocks.
+        let (mut client, _server) = std::os::unix::net::UnixStream::pair().unwrap();
+        assert_eq!(health_exchange(&mut client, Instant::now()), Err(EgressError::Timeout));
+        let cases: [(&[u8], Result<(), EgressError>); 4] = [(b"{\"healthy\":true}\0", Ok(())),
+            (b"{\"healthy\":false}\0", Err(EgressError::ResourceLimit)),
+            (b"{\"healthy\":tru}\0", Err(EgressError::Unavailable)), (b"{\"healthy\":true}", Err(EgressError::Unavailable))];
+        for (reply, expected) in cases {
+            let (mut client, mut server) = std::os::unix::net::UnixStream::pair().unwrap();
+            server.write_all(reply).unwrap();
+            if !reply.ends_with(&[0]) { server.shutdown(std::net::Shutdown::Write).unwrap(); }
+            assert_eq!(health_exchange(&mut client, Instant::now() + Duration::from_secs(2)), expected,
+                "{}", String::from_utf8_lossy(reply));
+            let mut sent = vec![0; BROKER_HEALTH_REQUEST.len() + 1];
+            server.read_exact(&mut sent).unwrap();
+            assert_eq!(&sent[..BROKER_HEALTH_REQUEST.len()], BROKER_HEALTH_REQUEST);
+        }
+    }
+
+    /// The local connect is bounded too: a listener that never accepts, then
+    /// the same listener with a full backlog (where a blocking connect would
+    /// wait forever), both end in `Timeout` by the deadline.
+    #[test]
+    fn broker_health_probe_connect_is_bounded_by_the_deadline() {
+        use std::os::fd::AsRawFd;
+        use std::time::Instant;
+        let path = std::env::temp_dir().join(format!("duduclaw-egress-probe-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        // SAFETY: listen(2) again on a listening socket only resets its backlog
+        // (Linux); 0 admits one queued connection, so the second one is refused.
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+        let path_text = path.to_str().unwrap();
+        // Never accepted, never answered: the exchange hits the deadline.
+        let mut first = connect_before(path_text, Instant::now() + Duration::from_secs(2)).unwrap();
+        let started = Instant::now();
+        assert_eq!(health_exchange(&mut first, started + Duration::from_millis(200)), Err(EgressError::Timeout));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        // Fill the backlog.
+        let mut queued = vec![first];
+        let full = loop {
+            assert!(queued.len() < 4096, "the backlog never filled");
+            match connect_before(path_text, Instant::now() + Duration::from_millis(50)) {
+                Ok(stream) => queued.push(stream),
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(full, EgressError::Timeout);
+        let started = Instant::now();
+        assert_eq!(connect_before(path_text, started + Duration::from_millis(300)).err(), Some(EgressError::Timeout));
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(300) && elapsed < Duration::from_secs(2), "{elapsed:?}");
+        // An expired deadline never connects; a missing socket is unavailable.
+        assert_eq!(connect_before(path_text, Instant::now()).err(), Some(EgressError::Timeout));
+        drop((queued, listener));
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(connect_before(path_text, Instant::now() + Duration::from_secs(1)).err(), Some(EgressError::Unavailable));
     }
 
     #[tokio::test]

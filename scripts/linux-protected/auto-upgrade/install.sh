@@ -1,4 +1,8 @@
 #!/bin/sh
+# Installs the nightly protected update request and ENABLES its timer (owner
+# decision Q11: automatic updates are on by default after an isolated install).
+# The helper only asks the update service to Apply the latest release, with no
+# arguments; drain, publication and readback belong to the update service.
 set -eu
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH

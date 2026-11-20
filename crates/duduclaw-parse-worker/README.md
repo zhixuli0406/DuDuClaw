@@ -66,6 +66,17 @@ base directories that systemd 249 creates in a bare `RootDirectory`. The staging
 root must be root-owned with non-writable ancestors. Only empty mountpoints may
 be added by systemd; never put configuration, user data, homes or sockets there.
 
+Because the tree is bound at the worker's `/`, systemd creates every missing
+mount point of the unit's later mounts inside `parse-root-tree` itself. Those
+mount points are therefore part of the tree: the builder creates them (empty,
+root:root 0755) and the verifier requires each of them, exactly `.tmp`, `dev`,
+`proc`, `run`, `sys`, `tmp`, `var` and `var/tmp` (`MOUNT_POINTS` in
+`scripts/build-runtime-tree.py`), so starting a worker creates nothing there.
+A missing, non-empty, linked or differently owned/moded mount point, or any
+other entry, still refuses the tree. A unit change that needs another mount
+point fails the CLI's layout test, which derives the list from the unit's
+directives.
+
 `DynamicUser` forces `ProtectSystem=strict` and `PrivateTmp` in systemd 249.
 Its read-only `/` rule overrides a tmpfs at `/`, and its private `/tmp` rule
 overrides a tmpfs at `/tmp`. The unit therefore mounts the bounded tmpfs at
@@ -148,10 +159,17 @@ Linux VM; it has not been run on macOS.
 through `install_launcher`. Protected gateway installation requires
 `supports_live_authority()`, and protected calls use `exchange_checked`; its
 default implementation refuses rather than invoking a legacy unchecked session.
-The fixed socket session rechecks the retained caller authority after poll and
-immediately before sending or receiving descriptors. Silent peers are polled in
-at most 50 ms intervals so revocation also ends blocked transport waits. Legacy
-unprotected calls retain their original exchange API.
+Both launchers support live authority: `RetiringLauncher` (the production
+launcher the protected gateway boot installs, with host-wide retirement) and the
+fixed `SocketActivatedLauncher`. Their sessions run one shared checked sequence
+(`transport::exchange_checked`): the retained caller authority is rechecked after
+each poll and immediately before sending or receiving descriptors, and once more
+after the reply is received and before it is decoded; any failed check returns an
+error and no reply. A retiring session is exchanged at most once, and every
+failure of its checked exchange (including a revoked check) closes the worker
+socket and hands the unit to the same lease-holding retirement as Drop. Silent
+peers are polled in at most 50 ms intervals so revocation also ends blocked
+transport waits. Legacy unprotected calls retain their original exchange API.
 
 The default fixed socket launcher has process-local admission and failure
 quarantine, but does not provide host-wide cancellation receipts. Closing a

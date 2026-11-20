@@ -36,32 +36,49 @@ impl Service {
     }
 }
 pub fn run(slot: UpdateSlot) -> Result<()> {
+    use crate::stage::{phase, step};
+    // Every step names itself before it runs (`crate::stage`): `main` prints
+    // the last one with a start-up failure.
+    phase("start-up");
+    step("hardening");
     super::harden()?;
+    step("state directory");
     let mut disk = Directory::open(Path::new(STATE_ROOT))?;
+    step("lock");
     let _lock = disk.lock()?;
+    step("state");
     let mut state: State = disk.json("state.json")?;
     state.validate()?;
     let host_arch = if cfg!(target_arch = "x86_64") { Architecture::X86_64 }
         else if cfg!(target_arch = "aarch64") { Architecture::Aarch64 } else { return Err(Error::Incompatible); };
     if state.arch != host_arch { return Err(Error::Incompatible); }
+    step("trust");
     let root = load_trust()?;
+    step("executing slot");
     super::launcher::verify_executing_slot(&state, slot, &root)?;
     // The real first root run checks trust, signed known manifest, writable
     // journal and dir fsync before marking health; no version floor moves here.
+    step("self-test record");
     disk.atomic_json("self-test.json", &serde_json::json!({"event":"updater_self_test"}))?;
+    step("accounts");
     let (gateway_uid, gateway_gid, _) = accounts()?;
+    step("socket");
     let listener = transport::bind(gateway_gid)?;
+    step("state save");
     if state.selector.trial_slot == Some(slot) { state.mark_healthy(slot)?; }
     state.interrupted_requests();
     use state::DurableState;
     disk.save(&state)?;
     let mut disk = state::FailClosedDisk::new(disk);
+    step("emergency reconcile");
     super::emergency::reconcile(&mut state, &mut disk)?;
+    step("recovery request");
     let recovery = state.recovery_request()?;
     let shared = Arc::new(Mutex::new(Service { state, disk, working: recovery.is_some() }));
     // The launcher already verified the executing updater. Reconcile the product
     // selector before accepting work, even when the journal has no pending row.
     recover_committed(&shared)?;
+    phase("serving");
     if let Some((id, version)) = recovery { start_worker(Arc::clone(&shared), id, version); }
     loop {
         let fd = match transport::accept(&listener, gateway_uid, gateway_gid) { Ok(fd) => fd, Err(_) => continue };
@@ -199,12 +216,15 @@ fn verified_state_generation(state: &State, verify_all_artifacts: bool) -> Resul
     Ok((digest, manifest))
 }
 fn recover_committed(shared: &Arc<Mutex<Service>>) -> Result<()> {
+    use crate::stage::{phase, step};
+    phase("committed");
     let (committed, pending, resume) = {
         let service = shared.lock().map_err(|_| Error::Maintenance)?;
         (service.state.effective_digest(), service.state.pending.as_ref().map(|p| p.digest), service.state.resume_required)
     };
     let mut activator = super::activation::LinuxGenerationActivator::new(committed);
     if pending.is_some() {
+        step("pending selector");
         match super::activation::read_current() {
             Ok(current) if current == committed || Some(current) == pending => return Ok(()),
             _ => { let _ = activator.close_admission(committed); return Err(Error::Maintenance); }
@@ -213,16 +233,22 @@ fn recover_committed(shared: &Arc<Mutex<Service>>) -> Result<()> {
     // Every clean boot checks the actual running services. A matching symlink
     // alone cannot establish a consistent generation. Leave admission closed if
     // any bytes, trust, identity or live readback cannot be checked.
+    // (`drain`, `unit identities`, `generation`, `selector`, `processes`,
+    // `read-back`, `resume`: named by the activation steps themselves.)
     activator.close_admission(committed)?;
+    step("manifest");
     let (generation, bytes, signature) = installed_generation(committed)?;
     let manifest = super::trust_admin::verify_recorded(&bytes, &signature)?;
+    step("artifacts");
     verify_artifacts(&generation, &manifest)?;
     {
+        step("emergency");
         let service = shared.lock().map_err(|_| Error::Maintenance)?;
         super::emergency::complete_committed(&service.state)?;
     }
     activator.verify_committed(&manifest, committed)?;
     if resume {
+        step("finish resume");
         shared.lock().map_err(|_| Error::Maintenance)?.mutate(|state| state.finish_resume())?;
     }
     Ok(())
@@ -359,6 +385,10 @@ fn cleanup_generations(shared: &Arc<Mutex<Service>>, root: &Directory, generatio
             Err(e) => return Err(e),
         }
     }
+    // spawnd's publication journal: the generation being published and its
+    // roll-back target stay until spawnd removes the journal (at the Resume that
+    // follows the commit or the roll-back). An unreadable journal stops pruning.
+    keep.extend(publication_journal_generations()?.into_iter().map(|digest| hex::encode(digest.0)));
     let current = hex::encode(super::activation::read_current()?.0);
     if !keep.iter().any(|entry| entry == &current) { return Err(Error::Maintenance); }
     for entry in generations.entries(64)? {
@@ -366,6 +396,21 @@ fn cleanup_generations(shared: &Arc<Mutex<Service>>, root: &Directory, generatio
         if !keep.iter().any(|name| name == &entry) { generations.remove_artifact_directory(&entry)?; }
     }
     Ok(())
+}
+/// Generations named by `/var/lib/duduclaw-spawnd/publish.json` (none when
+/// spawnd's state directory or the journal does not exist).
+fn publication_journal_generations() -> Result<Vec<Sha256Digest>> {
+    use crate::publish_journal::{PublishJournal, JOURNAL_DIRECTORY, JOURNAL_FILE, MAX_JOURNAL_BYTES};
+    let directory = match Directory::open(Path::new(JOURNAL_DIRECTORY)) {
+        Ok(directory) => directory,
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(e),
+    };
+    match directory.bytes(JOURNAL_FILE, MAX_JOURNAL_BYTES) {
+        Ok(bytes) => Ok(PublishJournal::parse(&bytes)?.retained().collect()),
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(vec![]),
+        Err(e) => Err(e),
+    }
 }
 pub fn artifact_name(target: &InstallTarget) -> Result<String> {
     crate::publication::artifact_name(target)

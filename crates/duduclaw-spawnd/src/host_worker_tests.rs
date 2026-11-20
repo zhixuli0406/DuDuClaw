@@ -1,6 +1,7 @@
 use super::*;
-use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+use std::{collections::BTreeSet, sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}}};
 use duduclaw_isolation::{bounded::List, ipc::{IoDelivery, QueueClass}};
+use duduclaw_migration::allocation::{self as wire, Action};
 
 #[derive(Default)]
 struct Counters {
@@ -10,7 +11,18 @@ struct Counters {
     cleanup: AtomicUsize,
     io: AtomicUsize,
     forgotten: AtomicUsize,
+    published: AtomicUsize,
 }
+/// R8y review round 1 (F1): what admission reads — the Ready employees and
+/// the entitled ones (`LinuxHost`'s `PublishedView`: registry Ready rows and
+/// the loaded root policy).
+#[derive(Clone, Default)]
+struct Admitted { employees: BTreeSet<EmployeeId>, entitled: BTreeSet<EmployeeId> }
+/// The allocation side of the fake: `state` is what an action changed (the
+/// registry, the root publication); `view` is what admission reads, shared
+/// with the test. Only `publish_view` copies one to the other (after a
+/// deliberately slow "refresh"); `maintenance` never does here.
+struct Admin { state: Admitted, view: Arc<Mutex<Admitted>>, publish_delay: Duration }
 struct FakeScan(Arc<Counters>);
 impl Scan for FakeScan {
     fn scan(&mut self) -> Result<Vec<EmployeeId>> {
@@ -42,10 +54,11 @@ fn barrier() -> (Barrier, Receiver<()>, SyncSender<()>) {
 struct FakeHost {
     counters: Arc<Counters>, start_barrier: Option<Barrier>, poll_barrier: Option<Barrier>,
     start_error: Option<ErrorCode>, io_taken: bool, copy_barrier: Option<Barrier>,
+    admin: Option<Admin>,
 }
 impl FakeHost {
     fn new(counters: Arc<Counters>) -> Self {
-        Self { counters, start_barrier: None, poll_barrier: None, start_error: None, io_taken: false, copy_barrier: None }
+        Self { counters, start_barrier: None, poll_barrier: None, start_error: None, io_taken: false, copy_barrier: None, admin: None }
     }
 }
 impl Host for FakeHost {
@@ -93,6 +106,121 @@ impl Host for FakeHost {
             BrokerJob::EmployeeIdle { .. } => Err(ErrorCode::NotFound),
         }
     }
+    fn allocation(&mut self, request: &wire::Request) -> std::result::Result<wire::Reply, wire::ErrorCode> {
+        let admin = self.admin.as_mut().ok_or(wire::ErrorCode::IsolationUnavailable)?;
+        match request.action {
+            Action::Allocate => { admin.state.employees.insert(employee()); }
+            Action::Entitle => { admin.state.entitled.insert(employee()); }
+            Action::Disable | Action::Retire => {
+                admin.state.employees.remove(&employee());
+                admin.state.entitled.remove(&employee());
+            }
+            Action::ReadBack => {}
+        }
+        Ok(allocation_reply())
+    }
+    fn publish_view(&mut self) {
+        self.counters.published.fetch_add(1, Ordering::SeqCst);
+        if let Some(admin) = &self.admin {
+            // A slow refresh: a reply sent before it finished would observe the old view.
+            std::thread::sleep(admin.publish_delay);
+            *admin.view.lock().unwrap() = admin.state.clone();
+        }
+    }
+}
+
+fn allocation_binding() -> duduclaw_isolation::migration::ProposalBinding {
+    use duduclaw_isolation::{ids::{RequestId, Sha256Digest}, migration::{ProposalBinding, ProposalOperationId}};
+    ProposalBinding { operation_id: ProposalOperationId { proposal_id: RequestId([1; 16]), revision: 1 }, proposal_digest: Sha256Digest([2; 32]) }
+}
+fn allocation_request(action: Action) -> wire::Request {
+    use duduclaw_isolation::{ids::RequestId, migration::{ConfirmationCategory, ConfirmationItem, ConfirmationStatus}};
+    wire::Request { schema: 1, nonce: RequestId([2; 16]), action, approver: None, entitlement: None,
+        item: ConfirmationItem { binding: allocation_binding(), category: ConfirmationCategory::Employee,
+            status: ConfirmationStatus::Applying, high_risk: true, fields: vec![] } }
+}
+fn allocation_reply() -> wire::Reply {
+    wire::Reply { receipt: wire::Receipt { binding: allocation_binding(), label: "sales".into(), employee: employee(), uid: 70_003,
+        bytes: 1, inodes: 1, disabled: false, principal_binding: None }, phase: wire::Phase::Ready, idle: None, entitlement: None }
+}
+/// A fake whose allocation actions change `state` only; `view` is published
+/// by `publish_view` alone.
+fn admin_host(counters: Arc<Counters>) -> (FakeHost, Arc<Mutex<Admitted>>) {
+    let view = Arc::new(Mutex::new(Admitted::default()));
+    let mut fake = FakeHost::new(counters);
+    fake.admin = Some(Admin { state: Admitted::default(), view: view.clone(), publish_delay: Duration::from_millis(50) });
+    (fake, view)
+}
+/// Sends one allocation action as `allocation::serve` does and returns the
+/// view exactly when its reply arrives (no sleep): what a ReserveRun sent
+/// right after the reply is admitted against.
+fn reply_and_view(worker: &WorkerHost, view: &Arc<Mutex<Admitted>>, action: Action) -> Admitted {
+    let (reply, receive) = mpsc::sync_channel(1);
+    assert!(worker.allocation_sender().try_send(AllocationWork::Allocation(allocation_request(action), reply)).is_ok());
+    let result = receive.recv_timeout(Duration::from_secs(5)).unwrap();
+    let seen = view.lock().unwrap().clone();
+    assert!(matches!(result, Ok(ref reply) if reply.receipt.employee == employee()), "the reply is the action's own result");
+    seen
+}
+
+/// R8y review round 1 (F1): the reply of an Allocate is sent only after the
+/// view containing the new employee is published.
+#[test]
+fn allocation_reply_observes_a_view_that_already_admits_the_employee() {
+    let counters = Arc::new(Counters::default());
+    let (fake, view) = admin_host(counters.clone());
+    let worker = host(fake, counters.clone());
+    assert!(view.lock().unwrap().employees.is_empty());
+    let seen = reply_and_view(&worker, &view, Action::Allocate);
+    assert!(seen.employees.contains(&employee()), "admitted at reply time");
+    assert_eq!(counters.published.load(Ordering::SeqCst), 1);
+    // ReadBack changes nothing admission reads: no publish before its reply.
+    reply_and_view(&worker, &view, Action::ReadBack);
+    assert_eq!(counters.published.load(Ordering::SeqCst), 1);
+}
+/// R8y review round 1 (F1): the same with a lifecycle command queued (and
+/// running) ahead of the allocation.
+#[test]
+fn allocation_reply_behind_a_queued_lifecycle_command_still_observes_the_published_view() {
+    let counters = Arc::new(Counters::default());
+    let (mut fake, view) = admin_host(counters.clone());
+    let (block, entered, release) = barrier();
+    fake.start_barrier = Some(block);
+    let mut worker = host(fake, counters.clone());
+    worker.start(run(1), employee(), &request(), &policy(), vec![]).unwrap();
+    entered.recv_timeout(Duration::from_secs(2)).unwrap();
+    // Queued behind the blocked start; released only after the allocation is sent.
+    let (releaser_ready, go) = mpsc::sync_channel::<()>(1);
+    let releaser = std::thread::spawn(move || {
+        go.recv_timeout(Duration::from_secs(5)).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        release.send(()).unwrap();
+    });
+    let (reply, receive) = mpsc::sync_channel(1);
+    assert!(worker.allocation_sender().try_send(AllocationWork::Allocation(allocation_request(Action::Allocate), reply)).is_ok());
+    releaser_ready.send(()).unwrap();
+    let result = receive.recv_timeout(Duration::from_secs(5)).unwrap();
+    let seen = view.lock().unwrap().clone();
+    assert!(result.is_ok());
+    assert!(seen.employees.contains(&employee()), "admitted at reply time");
+    releaser.join().unwrap();
+}
+/// R8y review round 1 (F1): Entitle's reply waits for the view with the
+/// entitlement; Disable's and Retire's for the view without the employee.
+#[test]
+fn entitle_disable_and_retire_replies_observe_their_published_effect() {
+    let counters = Arc::new(Counters::default());
+    let (fake, view) = admin_host(counters.clone());
+    let worker = host(fake, counters.clone());
+    assert!(reply_and_view(&worker, &view, Action::Allocate).employees.contains(&employee()));
+    let seen = reply_and_view(&worker, &view, Action::Entitle);
+    assert!(seen.employees.contains(&employee()) && seen.entitled.contains(&employee()), "entitled at reply time");
+    let seen = reply_and_view(&worker, &view, Action::Disable);
+    assert!(!seen.employees.contains(&employee()) && !seen.entitled.contains(&employee()), "not admitted at reply time");
+    assert!(reply_and_view(&worker, &view, Action::Allocate).employees.contains(&employee()));
+    let seen = reply_and_view(&worker, &view, Action::Retire);
+    assert!(!seen.employees.contains(&employee()), "not admitted at reply time");
+    assert_eq!(counters.published.load(Ordering::SeqCst), 5);
 }
 
 fn poll_broker(worker: &mut WorkerHost, ticket: Ticket) -> Result<BrokerReply> {
@@ -136,7 +264,8 @@ fn policy() -> LaunchPolicy {
 }
 fn request() -> SpawnRequest {
     SpawnRequest::StartRun { run: run(1), employee_id: employee(), runtime_request: RuntimeKind::Codex,
-        task_ref: None, workspace: None, prompt_bytes: 1, input_fds: List::new(vec![]).unwrap(), pty: false }
+        task_ref: None, workspace: None, prompt_bytes: 1, input_fds: List::new(vec![]).unwrap(), pty: false,
+        requested_max_turns: None }
 }
 fn proof() -> CleanupReadback {
     CleanupReadback { unit_inactive: true, cgroup_empty: true, employee_uid_absent: true }

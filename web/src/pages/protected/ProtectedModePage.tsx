@@ -5,11 +5,12 @@ import { api } from '@/lib/api';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useSystemStore } from '@/stores/system-store';
 import { useProtectedMode } from '@/hooks/useProtectedMode';
-import { IsolationReadinessBanner, type IsolationNextSteps } from '@/components/IsolationReadinessBanner';
+import { IsolationReadinessBanner, IsolationReadinessNotices, type IsolationNextSteps } from '@/components/IsolationReadinessBanner';
 import { Empty, Tabs, TabsList, TabsPanel, TabsTab } from '@/components/mds';
 import { StepUpProvider } from './step-up';
 import { EmployeesTab } from './EmployeesTab';
 import { ConnectorsTab } from './ConnectorsTab';
+import { ProvidersTab } from './ProvidersTab';
 import { TenantSourceTab } from './TenantSourceTab';
 import { AuditTab } from './AuditTab';
 import {
@@ -99,6 +100,7 @@ export function ProtectedModePage() {
         <ProtectedPageProvider value={context}>
           <StepUpProvider>
             <IsolationReadinessBanner nextSteps={NEXT_STEPS} />
+            <IsolationReadinessNotices />
             <Tabs value={tab} onValueChange={(value) => { if (isTab(value as string)) setTab(value as ProtectedTab); }} variant="line">
               <div className="overflow-x-auto pb-1.5">
                 <TabsList aria-label={t('tabs.label')}>
@@ -111,6 +113,7 @@ export function ProtectedModePage() {
               <TabsPanel value="connectors" className="pt-4">
                 <ConnectorsTab wizardPreset={wizardPreset} onWizardPresetUsed={clearPreset} />
               </TabsPanel>
+              <TabsPanel value="providers" className="pt-4"><ProvidersTab /></TabsPanel>
               <TabsPanel value="tenant" className="pt-4"><TenantSourceTab /></TabsPanel>
               <TabsPanel value="audit" className="pt-4"><AuditTab /></TabsPanel>
             </Tabs>

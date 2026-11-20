@@ -102,29 +102,51 @@ pub fn activated_listener(path: &str, kind: i32) -> Result<OwnedFd, EgressError>
 }
 
 pub async fn host_main() -> Result<(), EgressError> {
+    // R8j round 3 F4: first, before identity, configuration or any socket:
+    // the bootstrap filter (sets/reads back NNP itself, then narrows the
+    // unit's clone/clone3 to thread creation and refuses fork/vfork/exec).
+    // Nothing below execs. The final filter (`seccomp::install`) stacks on it.
+    crate::seccomp::install_bootstrap()?;
     harden(EGRESS_USER)?;
     let config: Config = read_root_config(CONFIG_PATH)?;
     config.validate()?;
     let resolver = HostResolver::new();
     for profile in config.profiles.as_slice() { resolver.probe(profile.dns_route).await?; }
     let listener = CheckedSocket::new(activated_listener(EGRESS_CONTROL_SOCKET, libc::SOCK_SEQPACKET)?).map_err(io_error)?;
+    // R6: hash the running image and bind the update readback endpoint before
+    // seccomp. Without it the updater's readback fails closed; egress still runs.
+    let identity = crate::update_readback::Identity::observe();
+    let readback = crate::update_readback::bind("/run");
+    if readback.is_err() { eprintln!("egress update readback unavailable"); }
     // SR5 item 7: the host's own interface addresses, before seccomp; they
     // are refreshed on use (`policy::host_addresses`). SR5 round 3 N7b: plus
     // the configured NAT public addresses.
     crate::policy::configure_host_public_addresses(&config.host_public_addresses)?;
     crate::policy::init_host_addresses()?;
+    // The probe worker must exist before seccomp denies thread creation (the
+    // bootstrap filter admits only this thread-flag clone). Without
+    // it no lookup can ever count: refuse to start, loudly (defect 28).
+    let Some(probe) = crate::dns_probe::DnsProbe::start() else {
+        eprintln!("{}", crate::dns_probe::WORKER_UNAVAILABLE);
+        std::process::exit(1);
+    };
     crate::seccomp::install()?;
+    if let Ok(readback) = readback { crate::update_readback::start(readback, identity); }
     loop {
         let fd = listener.accept().await.map_err(io_error)?;
         if socket_info(&fd, libc::SOCK_SEQPACKET, true, false).is_err() { continue; }
         // One authenticated spawnd controller owns all registrations. Losing it
         // drops JoinSet, cancelling all runs and their nested tunnel tasks.
         let control = CheckedSocket::new(fd).map_err(io_error)?;
-        return serve_control(control, &config).await;
+        return serve_control_with_probe(control, &config, probe).await;
     }
 }
 
 pub async fn serve_control(control: CheckedSocket, config: &Config) -> Result<(), EgressError> {
+    serve_control_with_probe(control, config, crate::dns_probe::DnsProbe::default()).await
+}
+
+async fn serve_control_with_probe(control: CheckedSocket, config: &Config, mut probe: crate::dns_probe::DnsProbe) -> Result<(), EgressError> {
     control.validate(libc::SOCK_SEQPACKET, true, false).map_err(io_error)?;
     config.validate()?;
     let mut tasks = JoinSet::new();
@@ -137,6 +159,8 @@ pub async fn serve_control(control: CheckedSocket, config: &Config) -> Result<()
     let mut budget = RunBudget::new(&limits, RunCaps { total_bytes: 1, total_connections: 10000 }, Instant::now())?;
     // Remember run IDs for the control lifetime so re-registration cannot reset budgets.
     let mut seen = std::collections::BTreeSet::new();
+    // R7b: the route runs use (one for every profile) and the probe's rate limit.
+    let route = crate::dns_probe::configured_route(config.profiles.as_slice());
     let result = async { loop {
         let received = tokio::select! {
             received = control.receive(&mut packets) => received.map_err(io_error)?,
@@ -150,6 +174,8 @@ pub async fn serve_control(control: CheckedSocket, config: &Config) -> Result<()
                 continue;
             }
         };
+        let taken = Instant::now();
+        let probe_deadline = probe.deadline_at(taken);
         let (size, mut fds) = received;
         if size == 0 { return Err(EgressError::Unavailable); }
         budget.frame(Instant::now())?;
@@ -188,6 +214,21 @@ pub async fn serve_control(control: CheckedSocket, config: &Config) -> Result<()
                 }
                 EgressControlResponse::Unregistered
             }
+            // Serial control is held for at most PROBE_DEADLINE +
+            // PROBE_REPLY_GRACE (3 s + 250 ms), including reply send. Blocking
+            // refresh/count/log work runs on the pre-seccomp worker; late
+            // results are discarded. Register/Unregister keep their own bounds.
+            EgressControl::ProbeDns { name } => {
+                probe.answer_and_send(&name, route, &*resolver, taken, probe_deadline, crate::policy::own_addresses, |reply| {
+                    let control = &control;
+                    let request_id = request.request_id;
+                    async move {
+                        let packet = ipc::encode(&Envelope { version: ipc::PROTOCOL_VERSION, request_id, message: reply }).map_err(io_error)?;
+                        control.send_packet(&packet).await.map_err(io_error)
+                    }
+                }).await?;
+                continue;
+            }
         };
         let packet = ipc::encode(&Envelope { version: ipc::PROTOCOL_VERSION, request_id: request.request_id, message: reply }).map_err(io_error)?;
         tokio::time::timeout(Duration::from_millis(ipc::CONTROL_TIMEOUT_MS), control.send_packet(&packet)).await.map_err(|_| EgressError::Timeout)?.map_err(io_error)?;
@@ -206,12 +247,23 @@ fn emit_audit(audit: &crate::session::AuditRecord) {
     if let Ok(line) = serde_json::to_string(audit) { eprintln!("{line}"); }
 }
 
-#[derive(Deserialize)]
+/// The dedicated DNS broker's root configuration ([`BROKER_CONFIG_PATH`], read
+/// with [`read_root_config`]). Public, with [`BrokerConfig::validate`], so the
+/// installer's readiness check accepts exactly what the broker accepts at
+/// start; there is no second copy of these rules.
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BrokerConfig { upstream: std::net::SocketAddr }
+pub struct BrokerConfig { pub upstream: std::net::SocketAddr }
+impl BrokerConfig {
+    /// The broker's single upstream rule
+    /// ([`crate::resolver::validate_broker_upstream`]), also enforced again by
+    /// `serve_dns_broker` itself.
+    pub fn validate(&self) -> Result<(), EgressError> { crate::resolver::validate_broker_upstream(self.upstream) }
+}
 pub async fn broker_main() -> Result<(), EgressError> {
     harden("duduclaw-dns")?;
     let config: BrokerConfig = read_root_config(BROKER_CONFIG_PATH)?;
+    config.validate()?;
     let egress = nix::unistd::User::from_name(EGRESS_USER).map_err(io_error)?.ok_or(EgressError::Unavailable)?;
     let fd = activated_listener(DNS_BROKER_SOCKET, libc::SOCK_STREAM)?;
     let socket = std::os::unix::net::UnixListener::from(fd);

@@ -132,12 +132,21 @@ mod run_broker;
 #[cfg(target_os = "linux")]
 pub(crate) use run_broker::{readiness_feature_source, readiness_features, work_broker_installed};
 #[cfg(target_os = "linux")]
-pub(crate) use boot::a_producers_ready;
+pub(crate) use boot::{a_producers_ready, spawn_backend_retry, tools_unavailable};
 #[cfg(target_os = "linux")]
 pub(crate) use boot::control_recording;
+/// R8t: recognises the API worker's fixed refusal reason (allow-list only)
+/// and selects the operator log fields and message. Pure; built everywhere.
+#[path = "isolation_mcp/refusal.rs"]
+pub(crate) mod refusal;
 #[cfg(target_os = "linux")]
 #[path = "isolation_mcp/runtime.rs"]
 pub(crate) mod runtime;
+/// R8z: the API worker path's step-limit rule, pinned against spawnd's own
+/// rule functions for the published `open_ai_compat` record.
+#[cfg(all(test, target_os = "linux"))]
+#[path = "isolation_mcp/api_step_limit_tests.rs"]
+mod api_step_limit_tests;
 #[cfg(target_os = "linux")]
 pub use runtime::{RuntimeAuthorization, with_runtime_authorization};
 #[cfg(target_os = "linux")]

@@ -64,6 +64,8 @@ authors = ["DuDuClaw Contributors"]
 
 [workspace.lints.rust]
 unsafe_code = "warn"
+# duduclaw-updated: test-key bootstrap verifier builds (plan §3.3).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(duduclaw_test_root)'] }
 
 [workspace.dependencies]
 # Async runtime

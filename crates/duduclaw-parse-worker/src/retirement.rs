@@ -51,6 +51,10 @@ impl Lease {
 /// Protected boot must install this launcher, not SocketActivatedLauncher.
 pub struct RetiringLauncher;
 impl WorkerLauncher for RetiringLauncher {
+    /// Its session runs the shared checked exchange (transport::exchange_checked)
+    /// and retires the worker on every failure of it.
+    fn supports_live_authority(&self) -> bool { true }
+
     fn launch(&self, request: &ParseRequest, input_reservation_bytes: u64)
         -> Result<Box<dyn WorkerSession>, ParseError> {
         crate::policy::validate(request)?;
@@ -172,9 +176,30 @@ impl WorkerSession for Session {
         if !rights.is_empty() { return Err(ParseError::InvalidContent); }
         ParseResponse::decode_payload(&payload, request).map_err(|_| ParseError::InvalidContent)
     }
+    /// Live authority: the same one-shot guard as `exchange`, then the shared
+    /// checked sequence. Any failure (guard, revoked/expired verify, transport,
+    /// decode) hands the worker to retirement at once; the lease stays dirty
+    /// until readback proves the unit gone, exactly as on Drop.
+    fn exchange_checked(&mut self, request: &ParseRequest, files: &[File],
+        verify: &dyn Fn() -> Result<(), ParseError>) -> Result<ParseResponse, ParseError> {
+        let result = self.exchange_checked_once(request, files, verify);
+        if result.is_err() { self.retire(); }
+        result
+    }
 }
-impl Drop for Session {
-    fn drop(&mut self) {
+impl Session {
+    fn exchange_checked_once(&mut self, request: &ParseRequest, files: &[File],
+        verify: &dyn Fn() -> Result<(), ParseError>) -> Result<ParseResponse, ParseError> {
+        if self.exchanged { return Err(ParseError::Unavailable); }
+        self.exchanged = true;
+        let fd = self.fd.as_ref().ok_or(ParseError::Unavailable)?;
+        crate::transport::exchange_checked(fd, request, files, self.deadline, verify)
+    }
+    /// Idempotent: closes the socket (EOF starts worker teardown) and moves the
+    /// owner + dirty lease to the named "parse-retirement" thread, which
+    /// releases the lease only on exact readback. Without an identified owner
+    /// the lease is never released (it stays dirty when dropped).
+    fn retire(&mut self) {
         self.fd.take(); // EOF starts teardown even if snapshot/exchange failed.
         let Some(owner) = self.owner.take() else { return; };
         let Some(lease) = self.lease.take() else { return; };
@@ -193,6 +218,9 @@ impl Drop for Session {
             }
         });
     }
+}
+impl Drop for Session {
+    fn drop(&mut self) { self.retire(); }
 }
 
 #[cfg(test)]
@@ -230,6 +258,129 @@ mod tests {
         for name in ["evil-duduclaw-parse@3.service", "duduclaw-parse@.service", "duduclaw-parse@../x.service"] { assert!(!unit_name(name)); }
         for path in ["/system.slice/../x", "/system.slice.evil/x", "relative", "/system.slice/other.service"] {
             assert!(cgroup_path(path, name).is_err());
+        }
+    }
+
+    // --- live authority (R8n-2 A) -------------------------------------------
+    // A real WorkerOwner needs PID 1 over the system bus, so these sessions
+    // carry no owner: retirement then closes the socket (EOF to the worker)
+    // and the dirty lease is dropped unreleased, the fail-closed branch of
+    // `retire`. The readback-then-release thread itself needs systemd.
+    use std::cell::RefCell;
+    use duduclaw_isolation::{bounded::{List, Text}, worker::{ContentFormat, ParseOperation,
+        ParseResult, ParsedItem, WORKER_PROTOCOL_VERSION}};
+    use nix::sys::socket::{recv, socketpair, AddressFamily, MsgFlags, SockFlag, SockType};
+    use std::os::fd::RawFd;
+
+    fn session_with_lease() -> (Session, OwnedFd, tempfile::NamedTempFile) {
+        let (local, peer) = socketpair(AddressFamily::Unix, SockType::SeqPacket, None,
+            SockFlag::SOCK_CLOEXEC).unwrap();
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"clean\n").unwrap();
+        let mut lease = Lease(file.reopen().unwrap());
+        lease.write(b"dirty\n").unwrap();
+        (Session { fd: Some(local), owner: None, lease: Some(lease),
+            deadline: Instant::now() + Duration::from_secs(2), exchanged: false }, peer, file)
+    }
+    fn request_and_reply() -> (ParseRequest, Vec<u8>) {
+        let request = crate::client::request(ParseOperation::ExtractDocument, ContentFormat::Text, 0);
+        let response = ParseResponse { version: WORKER_PROTOCOL_VERSION, request_id: request.request_id,
+            result: ParseResult::Complete { items: List::new(vec![ParsedItem::Text {
+                input_slot: 0, page: None, text: Text::new("ok".into()).unwrap() }]).unwrap() } };
+        let reply = crate::response::encode(&response, &request).unwrap();
+        (request, reply)
+    }
+    fn pending(fd: RawFd) -> bool {
+        let mut byte = [0u8; 1];
+        matches!(recv(fd, &mut byte, MsgFlags::MSG_PEEK | MsgFlags::MSG_DONTWAIT), Ok(n) if n > 0)
+    }
+    /// Records (request sent to the worker?, reply still unreceived?) at each
+    /// verify; fails the `fail_at`-th call (1-based).
+    fn recording(calls: &RefCell<Vec<(bool, bool)>>, local: RawFd, peer: RawFd, fail_at: Option<usize>)
+        -> impl Fn() -> Result<(), ParseError> + '_ {
+        move || {
+            let mut calls = calls.borrow_mut();
+            calls.push((pending(peer), pending(local)));
+            if Some(calls.len()) == fail_at { Err(ParseError::Unavailable) } else { Ok(()) }
+        }
+    }
+    /// Packet sizes the worker end received until EOF. Closing a seqpacket
+    /// socket with an unread reply sets ECONNRESET on its peer once; skip it.
+    fn drained(peer: &OwnedFd) -> Vec<usize> {
+        let mut buffer = vec![0u8; 64 * 1024];
+        let mut packets = Vec::new();
+        loop {
+            match recv(peer.as_raw_fd(), &mut buffer, MsgFlags::MSG_DONTWAIT) {
+                Ok(0) => return packets,
+                Ok(n) => packets.push(n),
+                Err(nix::errno::Errno::ECONNRESET) => continue,
+                Err(error) => panic!("worker end: {error}"),
+            }
+        }
+    }
+    fn expected_sequence() -> Vec<(bool, bool)> {
+        // 3 before the send (wait start, after POLLOUT, before sendmsg), 3
+        // before the receive (wait start, after POLLIN, before recvmsg), and
+        // one after the reply is received, before it is decoded.
+        [vec![(false, true); 3], vec![(true, true); 3], vec![(true, false)]].concat()
+    }
+
+    #[test]
+    fn retiring_launcher_reports_live_authority() {
+        assert!(RetiringLauncher.supports_live_authority());
+    }
+
+    #[test]
+    fn checked_exchange_verifies_before_send_before_receive_and_after_reply() {
+        let (mut session, peer, lease_file) = session_with_lease();
+        let (request, reply) = request_and_reply();
+        crate::transport::send(&peer, &reply, &[], Instant::now() + Duration::from_secs(2)).unwrap();
+        let local = session.fd.as_ref().unwrap().as_raw_fd();
+        let calls = RefCell::new(Vec::new());
+        let response = session.exchange_checked(&request, &[],
+            &recording(&calls, local, peer.as_raw_fd(), None)).unwrap();
+        assert_eq!(response.request_id, request.request_id);
+        assert_eq!(*calls.borrow(), expected_sequence());
+        assert!(session.fd.is_some() && session.lease.is_some(), "success retires on Drop, not before");
+
+        // One-shot guard: a second exchange is refused without any verify or
+        // I/O, and the refusal itself hands the worker to retirement.
+        let before = calls.borrow().len();
+        assert!(matches!(session.exchange_checked(&request, &[],
+            &recording(&calls, local, peer.as_raw_fd(), None)), Err(ParseError::Unavailable)));
+        assert_eq!(calls.borrow().len(), before);
+        assert!(session.fd.is_none(), "refused exchange closes the worker socket");
+        drop(session);
+        assert_eq!(std::fs::read(lease_file.path()).unwrap(), b"dirty\n");
+    }
+
+    #[test]
+    fn checked_exchange_failing_verify_sends_or_accepts_nothing_and_retires() {
+        for fail_at in 1..=expected_sequence().len() {
+            let (mut session, peer, lease_file) = session_with_lease();
+            let (request, reply) = request_and_reply();
+            crate::transport::send(&peer, &reply, &[], Instant::now() + Duration::from_secs(2)).unwrap();
+            let input = crate::transport::snapshot(&mut &b"private input"[..]).unwrap();
+            let local = session.fd.as_ref().unwrap().as_raw_fd();
+            let calls = RefCell::new(Vec::new());
+            let result = session.exchange_checked(&request, std::slice::from_ref(&input),
+                &recording(&calls, local, peer.as_raw_fd(), Some(fail_at)));
+            // Fails closed with the socket session's error kind; no reply is returned.
+            assert!(matches!(result, Err(ParseError::Unavailable)), "fail_at={fail_at}");
+            assert_eq!(*calls.borrow(), expected_sequence()[..fail_at], "fail_at={fail_at}");
+            // Retirement ran inside exchange_checked: the worker socket is closed
+            // now, so the worker end reaches EOF without waiting for a Drop.
+            assert!(session.fd.is_none(), "fail_at={fail_at}");
+            let received = drained(&peer);
+            if fail_at <= 3 {
+                // Revoked before sendmsg: neither the request nor the input fd left.
+                assert!(received.is_empty(), "fail_at={fail_at}: {received:?}");
+            } else {
+                assert_eq!(received.len(), 1, "fail_at={fail_at}: the request was sent before revocation");
+            }
+            drop(session);
+            // No owner readback ⇒ the reservation is never released.
+            assert_eq!(std::fs::read(lease_file.path()).unwrap(), b"dirty\n", "fail_at={fail_at}");
         }
     }
 }

@@ -25,14 +25,21 @@ jobs:
     needs: delivery-gate
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    outputs:
+      # SHA-256 of the aarch64 hand-off SHA256SUMS, set only by the aarch64 leg.
+      # It travels through job outputs, not the artifact store it authenticates.
+      arm64_inputs_sha256: ${{ steps.arm64_inputs.outputs.sha256 }}
     env:
       # MSVC symbols live in separate PDBs; retain the existing Windows output.
       CARGO_PROFILE_RELEASE_STRIP: ${{ startsWith(matrix.os, 'windows') && 'none' || 'symbols' }}
       # opt-level / codegen-units come from [profile.release] ("s" / 16) on every
       # platform; do not override via CARGO_PROFILE_RELEASE_* (<=1.79.2 updaters reject
       # a binary >= 200 MiB; Linux opt-level 3 measured ~226 MB).
+    # Read only: no step of this job publishes a release asset or pushes anything.
+    # Its outputs leave only as workflow artifacts (actions/upload-artifact uses the
+    # runtime token, not GITHUB_TOKEN); the GitHub Release is created by `release`.
     permissions:
-      contents: write
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -63,6 +70,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
           ref: ${{ needs.delivery-gate.outputs.commit }}
+          persist-credentials: false
 
       - name: Add swap (Linux)
         # Release-mode rustc for duduclaw-gateway exceeds the 16 GB runner (SIGKILL).
@@ -74,12 +82,27 @@ jobs:
           sudo chmod 600 /mnt/duduclaw-swap && sudo mkswap /mnt/duduclaw-swap && sudo swapon /mnt/duduclaw-swap
           free -h
 
+      # No release build next to TEST-licence settings: test-root rustc flags, the
+      # TEST issuer/key variables, rustc wrappers or Cargo configuration naming the
+      # cfg (scripts/refuse-test-license-build.py; the Linux packager applies the
+      # same rules again on every build/package run).
+      - name: Refuse test-root build settings
+        if: runner.os != 'Windows'
+        run: python3 -I -B scripts/refuse-test-license-build.py --check-environment
+
+      - name: Refuse test-root build settings (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          python -I -B scripts/refuse-test-license-build.py --check-environment
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7
         with:
           node-version: "22"
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca  # stable
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
@@ -98,9 +121,15 @@ jobs:
       - name: Build frontend
         run: cd web && npm ci --legacy-peer-deps && npm run build
 
+      # The production bootstrap root pin comes only from the public file
+      # release/bootstrap-root.sha256 (added after the key ceremony). While it is
+      # absent no duduclaw-bootstrap is built or shipped (fail closed). Both
+      # Linux targets are still cross-built here, so the glibc floor is unchanged;
+      # the aarch64 verifier cannot run on this x86_64 runner, so its execution
+      # is deferred to the native arm64 packaging job (package-linux-arm64).
       - name: Build binary (cross-compile — skip desktop feature, Wayland unavailable in cross)
         if: runner.os == 'Linux'
-        run: python3 scripts/package-linux-release.py --target ${{ matrix.target }} --build-only
+        run: python3 scripts/package-linux-release.py --target ${{ matrix.target }} --build-only --bootstrap-root-pin-file release/bootstrap-root.sha256 ${{ matrix.target == 'aarch64-unknown-linux-gnu' && '--defer-bootstrap-probe' || '' }}
         env:
           PKG_CONFIG_ALLOW_CROSS: 1
 
@@ -111,6 +140,18 @@ jobs:
         # NASM (Windows MSVC); all are preinstalled on GitHub-hosted runners, and the
         # Windows build already vendored OpenSSL via duduclaw-auth, so no extra env.
         run: cargo build --release --target ${{ matrix.target }} -p duduclaw-cli -p duduclaw-gateway --features duduclaw-gateway/dashboard,duduclaw-gateway/desktop,duduclaw-cli/dashboard,duduclaw-gateway/vendored-openssl
+
+      # Before anything signs, notarises, packages or uploads it: the built gateway
+      # must not be a TEST-licence build (static marker check, nothing executed).
+      - name: Refuse a TEST-licence gateway (macOS)
+        if: runner.os == 'macOS'
+        run: python3 -I -B scripts/refuse-test-license-build.py target/${{ matrix.target }}/release/duduclaw
+
+      - name: Refuse a TEST-licence gateway (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          python -I -B scripts/refuse-test-license-build.py target/${{ matrix.target }}/release/duduclaw.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Check binary is portable (macOS)
         if: runner.os == 'macOS'
@@ -150,14 +191,44 @@ jobs:
         env:
           WORKFLOW_SHA: ${{ github.sha }}
           TAG_COMMIT: ${{ needs.delivery-gate.outputs.commit }}
+          # The checkout does not persist credentials: this one read-only fetch gets
+          # the (contents: read) token through environment-scoped git config only,
+          # never argv and never .git/config.
+          FETCH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if [[ ! "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]; then
             echo "::error::workflow SHA is not a 40-char lowercase hex commit"
             exit 1
           fi
-          git fetch --no-tags --depth=1 origin "$WORKFLOW_SHA"
-          git checkout FETCH_HEAD -- scripts/macos/verify-gateway-signature.sh
+          auth="$(printf 'x-access-token:%s' "$FETCH_TOKEN" | base64 | tr -d '\n')"
+          GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" \
+            GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
+            git fetch --no-tags --depth=1 origin "$WORKFLOW_SHA"
+          # The token is needed for the fetch only: nothing after it can see it.
+          unset FETCH_TOKEN auth
+          # No working-tree update at all: that could run a .gitattributes or local-config
+          # smudge filter whose side effects no later comparison can undo. The blob is
+          # written by cat-file (never filtered) to a new temporary file next to the
+          # target, checked, made executable and renamed into place atomically. These git
+          # calls still run without hooks, fsmonitor or system/global config.
+          script=scripts/macos/verify-gateway-signature.sh
+          staged="$(mktemp "${script%/*}/.verify-gateway-signature.XXXXXX")"
+          if ! GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+            git -c core.hooksPath=/dev/null -c core.fsmonitor= -c core.attributesFile=/dev/null \
+            cat-file blob "FETCH_HEAD:$script" > "$staged"; then
+            rm -f -- "$staged"
+            echo "::error::$script is not a blob at $WORKFLOW_SHA"
+            exit 1
+          fi
+          size="$(wc -c < "$staged" | tr -d '[:space:]')"
+          if [[ ! "$size" =~ ^[0-9]+$ ]] || (( size == 0 || size > 1048576 )); then
+            rm -f -- "$staged"
+            echo "::error::$script at $WORKFLOW_SHA is empty or larger than 1 MiB"
+            exit 1
+          fi
+          chmod 0755 "$staged"
+          mv -f -- "$staged" "$script"
           echo "verify-gateway-signature.sh taken from workflow revision $WORKFLOW_SHA (build source commit: $TAG_COMMIT)"
 
       - name: Build, sign and notarize macOS gateway
@@ -183,10 +254,40 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Package Linux binaries and check glibc baseline
-        if: runner.os == 'Linux'
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
         # Offline isolation target keys are never CI secrets. This explicitly
         # skips F metadata signing; the release operator signs it offline.
-        run: python3 scripts/package-linux-release.py --target ${{ matrix.target }} --skip-build --output-dir .
+        # With a pin, the packager executes the verifier (native x86_64 here).
+        run: python3 scripts/package-linux-release.py --target ${{ matrix.target }} --skip-build --output-dir . --bootstrap-root-pin-file release/bootstrap-root.sha256
+
+      - name: Verify packaged duduclaw-bootstrap against the pin file
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        # Re-executes the verifier inside the finished archive (PRODUCTION <pin>
+        # and this version), or proves it is absent when no pin is configured.
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/package-linux-release.py --target ${{ matrix.target }} --verify-archive duduclaw-linux-x64.tar.gz --bootstrap-root-pin-file release/bootstrap-root.sha256 > "$RUNNER_TEMP/bootstrap-summary.txt"
+          { echo "### Linux bootstrap verifier"; cat "$RUNNER_TEMP/bootstrap-summary.txt"; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Export cross-built aarch64 binaries for native arm64 packaging
+        id: arm64_inputs
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/package-linux-release.py --target ${{ matrix.target }} --skip-build --bootstrap-root-pin-file release/bootstrap-root.sha256 --export-binaries "$RUNNER_TEMP/linux-arm64-binaries"
+          sums="$(sha256sum "$RUNNER_TEMP/linux-arm64-binaries/SHA256SUMS")"
+          echo "sha256=${sums%% *}" >> "$GITHUB_OUTPUT"
+
+      - name: Hand aarch64 binaries to the native arm64 packaging job
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
+        with:
+          name: linux-arm64-binaries
+          path: ${{ runner.temp }}/linux-arm64-binaries/
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Package (macOS)
         if: runner.os == 'macOS'
@@ -218,6 +319,8 @@ jobs:
           Remove-Item -Recurse -Force _pkg
 
       - name: Preserve unsigned archives and checksums
+        # aarch64 is archived by package-linux-arm64 on a native arm64 runner.
+        if: matrix.target != 'aarch64-unknown-linux-gnu'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
         with:
           name: unsigned-${{ matrix.artifact }}
@@ -227,12 +330,64 @@ jobs:
             duduclaw-*.zip
             duduclaw-*.sha256
 
+  # The aarch64 binaries are cross-built on x86_64 above (unchanged glibc floor)
+  # but packaged here: scripts/package-linux-release.py only ships
+  # duduclaw-bootstrap after executing those exact bytes on a host of the target
+  # architecture. The hand-off is authenticated by the SHA256SUMS digest from
+  # the build job's outputs; every packaged byte is re-hashed against it.
+  package-linux-arm64:
+    needs: [build, delivery-gate]
+    name: Package duduclaw-linux-arm64 (native arm64)
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+    steps:
+      - name: Validate publish tag family
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          ref: ${{ needs.delivery-gate.outputs.commit }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8
+        with:
+          name: linux-arm64-binaries
+          path: ${{ runner.temp }}/linux-arm64-binaries
+
+      - name: Package Linux arm64 binaries natively and check glibc baseline
+        shell: bash
+        env:
+          INPUTS_SHA256: ${{ needs.build.outputs.arm64_inputs_sha256 }}
+        run: |
+          set -euo pipefail
+          python3 scripts/package-linux-release.py --target aarch64-unknown-linux-gnu --skip-build --output-dir . --bootstrap-root-pin-file release/bootstrap-root.sha256 --binary-dir "$RUNNER_TEMP/linux-arm64-binaries" --binary-sums-sha256 "$INPUTS_SHA256"
+
+      - name: Verify packaged duduclaw-bootstrap against the pin file
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/package-linux-release.py --target aarch64-unknown-linux-gnu --verify-archive duduclaw-linux-arm64.tar.gz --bootstrap-root-pin-file release/bootstrap-root.sha256 > "$RUNNER_TEMP/bootstrap-summary.txt"
+          { echo "### Linux bootstrap verifier"; cat "$RUNNER_TEMP/bootstrap-summary.txt"; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Preserve unsigned archives and checksums
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
+        with:
+          name: unsigned-duduclaw-linux-arm64
+          if-no-files-found: error
+          path: |
+            duduclaw-linux-arm64.tar.gz
+            duduclaw-linux-arm64.tar.gz.sha256
+
   # Rekor/Fulcio failures must not discard hours of compilation. Unsigned build
   # artifacts remain available after failure; rerun only the failed signing job
   # with `gh run rerun RUN_ID --job SIGN_JOB_ID` (and its downstream dependents).
   # The macOS gateway bundle (.app.zip) is signed here too.
   sign:
-    needs: build
+    needs: [build, package-linux-arm64]
     name: Sign ${{ matrix.artifact }}
     runs-on: ubuntu-latest
     permissions:
@@ -334,6 +489,20 @@ jobs:
         with:
           pattern: duduclaw-*
           merge-multiple: true
+
+      # Every archive about to be minisigned and published: no duduclaw* member may
+      # be a TEST-licence build (scripts/refuse-test-license-build.py).
+      - name: Refuse TEST-licence gateways in the release archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          archives=(duduclaw-*.tar.gz duduclaw-*.zip)
+          if (( ${#archives[@]} == 0 )); then
+            echo "::error::no release archives to check"
+            exit 1
+          fi
+          python3 -I -B scripts/refuse-test-license-build.py "${archives[@]}"
 
       # The in-app updater (crates/duduclaw-gateway/src/updater.rs) REQUIRES a
       # valid .minisig for every archive — an unsigned release cannot be

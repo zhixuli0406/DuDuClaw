@@ -8,6 +8,7 @@ pub(crate) mod launcher;
 pub mod mounts;
 pub mod privileges;
 pub mod probe;
+pub(crate) mod process;
 pub mod runner;
 /// Raw-syscall wrappers for glibc functions newer than the release baseline;
 /// the same source as `duduclaw_execution::linux_syscalls` (no extra dependency).

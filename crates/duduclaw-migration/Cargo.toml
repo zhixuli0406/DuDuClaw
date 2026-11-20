@@ -9,13 +9,18 @@ duduclaw-isolation.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-rusqlite.workspace = true
+# `hooks` (progress handler) and `limits` (sqlite3_limit) bound the read-only
+# journal verification (`root_host::readiness`). Features only; no new package.
+rusqlite = { workspace = true, features = ["hooks", "limits"] }
 sha2 = "0.10"
 hmac = "0.12"
 chacha20poly1305 = "0.10"
 rand = "0.8"
 tempfile = "3"
 chrono.workspace = true
+# R8r-2: the schema-5 provider payload (an employee API key) lives in a
+# zeroizing buffer from decode to write (already in the workspace).
+zeroize.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { version = "1.1", features = ["fs", "process"] }

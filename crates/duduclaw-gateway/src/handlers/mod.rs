@@ -248,6 +248,8 @@ mod channel_ingress_rpc;
 mod computer_workspaces_rpc;
 mod isolation_recording_rpc;
 mod isolation_connectors_rpc;
+// R8r-3a: isolated employees' model connection documents (dashboard path).
+mod isolation_providers_rpc;
 mod isolation_employee_rpc;
 // F6g: the v2 employee-dir digest and marker rules for the adoption engine.
 pub(crate) use isolation_employee_rpc::employee_dirs;
@@ -511,6 +513,14 @@ impl MethodHandler {
         let credential_request = if method.split('.').next() == Some("transcription_credentials") {
             Some(transcription_credentials_rpc::Request::take(method, params.take()))
         } else { None };
+        // R8r-3a: model connection keys leave the params here, before any
+        // gate, plugin or log can see them: each `api_key` is moved into a
+        // zeroizing owner and every string left in the params is overwritten.
+        let provider_call = if isolation_providers_rpc::owns(method) {
+            // Boxed: keeps the shared dispatcher future small (only the
+            // zeroizing owners' handles move, never the key bytes).
+            Some(Box::new(isolation_providers_rpc::ProviderCall::take_from(method, &mut params)))
+        } else { None };
         if method == "system.update_config"
             && transcription_credentials_rpc::reject_generic_credentials(&mut params) {
             return WsFrame::error_response("", "請使用專用的會議轉錄憑證設定操作。");
@@ -625,6 +635,11 @@ impl MethodHandler {
                 return WsFrame::error_response("", &error);
             }
             return boxed_frame(|| self.handle_isolation_connectors(method, params, ctx)).await;
+        }
+        // Model connection documents are isolation authority too; the keys
+        // were taken out of the params above, no extension sees the namespace.
+        if let Some(call) = provider_call {
+            return boxed_frame(|| self.route_isolation_providers(*call, ctx)).await;
         }
         // Protected employee proposals are isolation authority too: the
         // handler applies the per-method role (self-service or Admin + step-up).
@@ -803,5 +818,16 @@ pub(crate) use migration_authority::employee::resolve_confirmed_employee;
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use migration_authority::employee::{save_confirmed_receipt, save_confirmed_receipt_gated};
 pub(crate) use migration_authority::stage_import_proposals;
+pub(crate) use migration_authority::begin_shutdown as begin_migration_apply_shutdown;
+#[cfg(target_os = "linux")]
+pub(crate) use migration_authority::entitlement::spawn_startup_reconcile as spawn_entitlement_reconcile;
+/// DEFECT 26: the isolation boot retry ends once this gate has closed.
+#[cfg(target_os = "linux")]
+pub(crate) use migration_authority::shutdown_gate as migration_shutdown_gate;
+/// R8j round 3 F3: the boot permit tests use the real gate and its
+/// descheduling test double.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use migration_authority::{Descheduled as MigrationDescheduledGate, ShutdownGate as MigrationShutdownGate};
+pub(crate) use migration_confirmations_rpc::wait_for_apply_loops as wait_migration_apply_loops;
 mod session_policy_rpc;
 mod a2a_rpc;

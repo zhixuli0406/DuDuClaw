@@ -82,10 +82,23 @@ jobs:
           sudo chmod 600 /mnt/duduclaw-swap && sudo mkswap /mnt/duduclaw-swap && sudo swapon /mnt/duduclaw-swap
           free -h
 
+      # The gateway sidecar is never built next to TEST-licence settings: test-root
+      # rustc flags, the TEST issuer/key variables, rustc wrappers or Cargo
+      # configuration naming the cfg (scripts/refuse-test-license-build.py).
+      - name: Refuse test-root build settings
+        if: runner.os != 'Windows'
+        run: python3 -I -B scripts/refuse-test-license-build.py --check-environment
+
+      - name: Refuse test-root build settings (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          python -I -B scripts/refuse-test-license-build.py --check-environment
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       # Cargo 1.100's build-directory layout breaks ort-sys 2.0.0-rc.12
       # copy_dylibs on Windows (DirectML.dll); remove when ort is upgraded past rc.12.
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca  # stable
         with:
           toolchain: "1.99.1"
           targets: ${{ matrix.target }}
@@ -152,6 +165,20 @@ jobs:
           EXT=""; [[ "${{ matrix.target }}" == *windows* ]] && EXT=".exe"
           cp "$SIDECAR_TARGET_DIR/${{ matrix.target }}/release/duduclaw${EXT}" \
              "src-tauri/binaries/duduclaw-${{ matrix.target }}${EXT}"
+
+      # tauri-action below bundles, signs and publishes the staged sidecar: it must
+      # not be a TEST-licence gateway (static marker check, nothing executed).
+      - name: Refuse a TEST-licence gateway sidecar
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          EXT=""
+          if [[ "$TARGET" == *windows* ]]; then EXT=".exe"; fi
+          PYTHON=python3
+          if [[ "$RUNNER_OS" == Windows ]]; then PYTHON=python; fi
+          "$PYTHON" -I -B scripts/refuse-test-license-build.py "src-tauri/binaries/duduclaw-$TARGET$EXT"
 
       - name: Import Apple certificate
         if: matrix.os == 'macos-latest'

@@ -465,7 +465,6 @@ pub trait SearchProviderSource: Send + Sync {
     fn search(&self, employee: EmployeeId, account: ProductConnectorAccount)
         -> Result<Arc<SearchConnectorProvider>, VerificationError>;
 }
-#[cfg(feature = "isolation-worker-integration")]
 impl SearchProviderSource for crate::isolation_execution::InstalledWorkerServices {
     fn search(&self, employee: EmployeeId, account: ProductConnectorAccount)
         -> Result<Arc<SearchConnectorProvider>, VerificationError> {

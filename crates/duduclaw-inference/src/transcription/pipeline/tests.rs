@@ -257,6 +257,86 @@ fn transcription_output_directory_symlink_is_refused() {
     assert_eq!(std::fs::read_dir(target).unwrap().count(), 0);
 }
 
+/// Puts a fixture directory back to 0700 so the temp dir can be removed.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+struct RestoreMode(PathBuf);
+#[cfg(any(target_os = "linux", target_os = "android"))]
+impl Drop for RestoreMode {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
+/// R8v-2: on the installed layout the gateway has only search permission on
+/// its home's root:root 0711 parent. A 0o311 (-wx--x--x) ancestor reproduces
+/// that without root: a read open of it fails with EACCES, as the old walk's
+/// per-ancestor `O_RDONLY` did. Attachments, staging output and cleanup below
+/// it now work; the search-only directory itself as the target still fails.
+#[test]
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn transcription_walk_reaches_private_directories_below_a_search_only_ancestor() {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let parent = root.join("parent");
+    let agent = parent.join("home/agents/alice");
+    let staging = parent.join("home/meeting-staging");
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(agent.join("attachments")).unwrap();
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&staging).unwrap();
+    std::fs::write(agent.join("attachments/meeting.m4a"), b"audio").unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o311)).unwrap();
+    let _restore = RestoreMode(parent.clone());
+    // Root bypasses DAC, so the premise is only checked unprivileged.
+    let unprivileged = unsafe { libc::geteuid() } != 0;
+    if unprivileged {
+        let error = File::open(&parent).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EACCES), "{error}");
+    }
+    assert_eq!(read_attachment(&agent, Path::new("meeting.m4a"), 100).unwrap(), b"audio");
+    preflight_output(&staging).unwrap();
+    let paths = save_outputs(&staging, "例會", "gemini", 1000, &sample()).unwrap();
+    assert!(paths.json.starts_with(&staging) && paths.markdown.starts_with(&staging));
+    assert!(std::fs::read_to_string(&paths.markdown).unwrap().contains("例會"));
+    remove_attachment(&agent, &agent.join("attachments/meeting.m4a")).unwrap();
+    assert!(std::fs::symlink_metadata(agent.join("attachments/meeting.m4a")).is_err());
+    if unprivileged {
+        // Only ancestors relax: the search-only directory as the target
+        // still needs read permission.
+        assert!(directory_handle(&parent).is_err());
+        assert!(preflight_output(&parent).is_err());
+    }
+}
+
+/// The search-only walk keeps every no-follow refusal: a symlinked target
+/// below the search-only ancestor, a symlinked ancestor below it, and a
+/// symlinked ancestor above it.
+#[test]
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn transcription_walk_below_a_search_only_ancestor_keeps_symlink_refusals() {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt, symlink};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let parent = root.join("parent");
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent.join("home/real")).unwrap();
+    std::fs::write(parent.join("home/real/meeting.m4a"), b"audio").unwrap();
+    symlink("real", parent.join("home/linked")).unwrap();
+    symlink("home", parent.join("linked-home")).unwrap();
+    symlink(&parent, root.join("alias")).unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o311)).unwrap();
+    let _restore = RestoreMode(parent.clone());
+    assert!(directory_handle(&parent.join("home/real")).is_ok());
+    assert!(open_read(&parent.join("home/real/meeting.m4a")).is_ok());
+    for refused in [
+        parent.join("home/linked"),
+        parent.join("linked-home/real"),
+        root.join("alias/home/real"),
+    ] {
+        assert!(directory_handle(&refused).is_err(), "{}", refused.display());
+        assert!(open_read(&refused.join("meeting.m4a")).is_err(), "{}", refused.display());
+    }
+}
+
 #[test]
 fn transcription_output_preflight_refuses_missing_directory_and_leaves_no_probe() {
     let dir = tempfile::tempdir().unwrap();

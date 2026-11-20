@@ -12,6 +12,7 @@ impl AccountHost for Accounts{
     fn policy(&mut self)->io::Result<HostUidPolicy>{Ok(HostUidPolicy{system:UidRange{first:100,last:999},login:UidRange{first:1000,last:60000},subuids:vec![],subgids:vec![],systemd:vec![]})}
     fn verify_namespace(&mut self,_:&Registry)->io::Result<()>{Ok(())}
     fn uid_available(&mut self,_:u32)->io::Result<bool>{Ok(true)}
+    fn occupied_ids(&mut self,_:UidRange)->io::Result<std::collections::BTreeSet<u32>>{Ok(Default::default())}
     fn create_locked(&mut self,_:&EmployeeAccount)->io::Result<()>{self.created+=1;if self.create_fail{Err(io::Error::other("injected useradd failure"))}else{Ok(())}}
     fn verify_locked(&mut self,_:&EmployeeAccount)->io::Result<()>{Ok(())}
     fn recover_locked(&mut self,_:&EmployeeAccount)->io::Result<()>{
@@ -23,9 +24,16 @@ impl AccountHost for Accounts{
 /// Storage double: images and quotas per employee, injected failures.
 pub(super) struct Disk{pub(super) fail_ready:bool,pub(super) images:Vec<(EmployeeId,DiskQuota)>,pub(super) provisions:usize,pub(super) destroys:usize,
     pub(super) destroy_fail:usize,pub(super) leases:Vec<Attachment>,pub(super) traces_fail:bool,pub(super) extra_traces:Vec<EmployeeId>,
-    pub(super) provision_fail:bool}
+    pub(super) provision_fail:bool,
+    /// R8r-2: the provider document per employee (what the image's home would hold),
+    /// every write/clear in order, and an injected failure.
+    pub(super) documents:std::collections::BTreeMap<EmployeeId,Vec<u8>>,pub(super) provider_calls:Vec<(EmployeeId,u32,bool)>,
+    pub(super) provider_fail:Option<ProvidersFailure>,
+    /// R8r-2 F1: when set, every provider call first records the allocation
+    /// journal as persisted at that moment (the order of save and unlink).
+    pub(super) journal_at:Option<PathBuf>,pub(super) journal_seen:Vec<String>}
 impl Disk{pub(super) fn new()->Self{Self{fail_ready:false,images:vec![],provisions:0,destroys:0,destroy_fail:0,leases:vec![],traces_fail:false,
-    extra_traces:vec![],provision_fail:false}}
+    extra_traces:vec![],provision_fail:false,documents:Default::default(),provider_calls:vec![],provider_fail:None,journal_at:None,journal_seen:vec![]}}
     pub(super) fn present(&self,e:EmployeeId)->bool{self.images.iter().any(|(i,_)|*i==e)}}
 impl Storage for Disk{
     fn readiness(&mut self)->Result<()>{if self.fail_ready{Err(unavailable())}else{Ok(())}}
@@ -51,6 +59,18 @@ impl Storage for Disk{
         if self.traces_fail{return Err(unavailable())}
         Ok(self.images.iter().map(|(e,_)|*e).chain(self.extra_traces.iter().copied()).collect())
     }
+    fn write_providers(&mut self,e:EmployeeId,uid:u32,change:ProvidersChange<'_>)->std::result::Result<(),ProvidersFailure>{
+        self.provider_calls.push((e,uid,matches!(change,ProvidersChange::Write(_))));
+        if let Some(path)=&self.journal_at{self.journal_seen.push(fs::read_to_string(path).unwrap_or_default());}
+        if let Some(failure)=self.provider_fail{return Err(failure)}
+        if self.leases.iter().any(|a|a.employee==e){return Err(ProvidersFailure::Busy)}
+        if !self.present(e){return Err(ProvidersFailure::Unavailable)}
+        match change{
+            ProvidersChange::Write(bytes)=>{self.documents.insert(e,bytes.to_vec());},
+            ProvidersChange::Clear=>{self.documents.remove(&e);},
+        }
+        Ok(())
+    }
 }
 /// In-memory registry with the root store's rules (UIDs never reused).
 pub(super) struct FakeRegistry(pub(super) Registry);
@@ -75,12 +95,21 @@ impl RegistryOps for FakeRegistry{
 pub(super) fn quiet()->EmployeeIdleReport{EmployeeIdleReport{runs:0,attachments:0,processes:0,units:0}}
 /// One allocator + registry + hosts, portable (tempdir) or root (`/run`).
 pub(super) struct Fx{pub(super) dir:PathBuf,pub(super) registry:Box<dyn RegistryOps>,pub(super) accounts:Accounts,pub(super) disk:Disk,
-    pub(super) allocator:Allocator,pub(super) root:bool,_temp:Option<tempfile::TempDir>}
+    pub(super) allocator:Allocator,pub(super) root:bool,_temp:Option<tempfile::TempDir>,
+    /// R8d: the host publication (in memory; counts writes).
+    pub(super) entitlements:crate::entitlement::Memory}
+/// R8d: the signed runtimes of the fixture host (profiles 1 and 2).
+fn signed_runtimes()->crate::entitlement::Memory{
+    use crate::entitlement::fixture::runtime;
+    use duduclaw_isolation::execution::RuntimeKind;
+    crate::entitlement::Memory::new(vec![runtime(1,RuntimeKind::Codex),runtime(2,RuntimeKind::OpenAiCompat)])
+}
 impl Fx{
     pub(super) fn portable()->Self{
         let temp=tempfile::tempdir().unwrap();let dir=temp.path().to_path_buf();
         let allocator=Allocator{directory:dir.clone(),journal:Journal{schema:JOURNAL_SCHEMA,entries:vec![]},poisoned:false,events:vec![],traces_verified:true};
-        Self{dir,registry:Box::new(FakeRegistry(Registry::default())),accounts:Accounts::new(),disk:Disk::new(),allocator,root:false,_temp:Some(temp)}
+        Self{dir,registry:Box::new(FakeRegistry(Registry::default())),accounts:Accounts::new(),disk:Disk::new(),allocator,root:false,_temp:Some(temp),
+            entitlements:signed_runtimes()}
     }
     pub(super) fn root(name:&str)->Self{
         use std::os::unix::fs::DirBuilderExt;
@@ -89,13 +118,14 @@ impl Fx{
         fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
         let registry=RegistryStore::open_at(&dir).unwrap();let mut disk=Disk::new();
         let allocator=Allocator::open_at(&dir,RegistryOps::registry(&registry),&mut disk).unwrap();
-        Self{dir,registry:Box::new(registry),accounts:Accounts::new(),disk,allocator,root:true,_temp:None}
+        Self{dir,registry:Box::new(registry),accounts:Accounts::new(),disk,allocator,root:true,_temp:None,entitlements:signed_runtimes()}
     }
     pub(super) fn handle(&mut self,request:&Request)->Answer<Reply>{self.handle_with(request,false,None)}
     /// `idle: None` = a quiet readback for the request's subject, as the host would read it.
     pub(super) fn handle_with(&mut self,request:&Request,host_busy:bool,idle:Option<Result<EmployeeIdleReport>>)->Answer<Reply>{
         let idle=idle.or_else(||self.allocator.subject(request).map(|_|Ok(quiet())));
-        self.allocator.handle(request,Env{registry:self.registry.as_mut(),accounts:&mut self.accounts,storage:&mut self.disk,host_busy,idle,now_unix:1_000})
+        self.allocator.handle(request,Env{registry:self.registry.as_mut(),accounts:&mut self.accounts,storage:&mut self.disk,host_busy,idle,now_unix:1_000,
+            entitlements:&mut self.entitlements})
     }
     /// A daemon restart of the allocator (the journal is re-read from disk).
     pub(super) fn reopen(&mut self){
@@ -119,10 +149,30 @@ pub(super) fn employee_request(id:u8,label:&str,status:ConfirmationStatus,extra:
     let mut fields:Vec<ProposalField>=[("disk_bytes","67108864"),("employee_id",label)].iter().chain(extra)
         .map(|(n,v)|ProposalField{name:(*n).into(),value:ProposalValue::Text{value:(*v).into()}}).collect();
     fields.sort_by(|a,b|a.name.cmp(&b.name));
-    Request{schema:1,nonce:RequestId([2;16]),action:Action::Allocate,approver:None,item:ConfirmationItem{binding:ProposalBinding{operation_id:ProposalOperationId{proposal_id:RequestId([id;16]),revision:1},
+    Request{schema:1,nonce:RequestId([2;16]),action:Action::Allocate,approver:None,entitlement:None,item:ConfirmationItem{binding:ProposalBinding{operation_id:ProposalOperationId{proposal_id:RequestId([id;16]),revision:1},
         proposal_digest:digest_of(ConfirmationCategory::Employee,&fields)},category:ConfirmationCategory::Employee,status,high_risk:true,fields}}
 }
 fn request_with(status:ConfirmationStatus,extra:&[(&str,&str)])->Request{employee_request(1,"sales",status,extra)}
+/// R7c (F6) / R7d: a registry allocation still waiting for the SSH denial
+/// probe is `Pending`, one refused by the pending-reservation cap is
+/// `PendingLimit` (both "retry later"; a schema-2 reply reads `NotReady`);
+/// a proven-reachable account and every other failure stay `IsolationUnavailable`.
+#[test]
+fn allocation_probe_pending_and_pending_cap_answer_not_ready(){
+    use crate::accounts::SshRefusal;
+    for error in [SshRefusal::Pending.error(),SshRefusal::Inconclusive("login_unverified (exit 18)".into()).error()]{
+        assert_eq!(registry_code(error),wire::ErrorCode::Pending);
+    }
+    assert_eq!(registry_code(crate::registry::PendingLimit.error()),wire::ErrorCode::PendingLimit);
+    for code in [wire::ErrorCode::Pending,wire::ErrorCode::PendingLimit]{
+        assert_eq!(code.for_schema(wire::SCHEMA_V2),wire::ErrorCode::NotReady);
+        assert_eq!(code.for_schema(wire::SCHEMA_V3),code);
+    }
+    for error in [SshRefusal::Reachable("login_not_denied (exit 10)".into()).error(),io::Error::other("create"),
+        io::Error::new(io::ErrorKind::WouldBlock,"busy")]{
+        assert_eq!(registry_code(error),wire::ErrorCode::IsolationUnavailable);
+    }
+}
 /// Allocate `label` and return the Ready receipt.
 pub(super) fn allocate(fx:&mut Fx,id:u8,label:&str)->Receipt{
     let request=employee_request(id,label,ConfirmationStatus::Applying,ALICE);
@@ -135,7 +185,7 @@ pub(super) fn retire_spec(receipt:&Receipt)->RetireSpec{
 }
 pub(super) fn retire_request_for(spec:&RetireSpec,id:u8)->Request{
     let fields=wire::retire_fields(spec);
-    Request{schema:wire::SCHEMA_V2,nonce:RequestId([2;16]),action:Action::Retire,approver:Some("admin-b".into()),
+    Request{schema:wire::SCHEMA_V2,nonce:RequestId([2;16]),action:Action::Retire,approver:Some("admin-b".into()),entitlement:None,
         item:ConfirmationItem{binding:ProposalBinding{operation_id:ProposalOperationId{proposal_id:RequestId([id;16]),revision:1},
             proposal_digest:digest_of(ConfirmationCategory::EmployeeRetire,&fields)},category:ConfirmationCategory::EmployeeRetire,
             status:ConfirmationStatus::Applying,high_risk:true,fields}}
@@ -145,7 +195,7 @@ fn entry(request:&Request,phase:Phase)->Entry{
     let spec=request.validate().unwrap();
     let (retire,retired_at)=match phase{Phase::Retiring=>(Some(retire_binding(0x40)),None),Phase::Retired=>(Some(retire_binding(0x40)),Some(5)),_=>(None,None)};
     Entry{receipt:Receipt{binding:request.item.binding,label:spec.label,employee:EmployeeId([7;16]),uid:70001,bytes:spec.bytes,inodes:spec.inodes,
-        disabled:matches!(phase,Phase::Disabled|Phase::Retired),principal_binding:spec.binding},phase,retire,retired_at}
+        disabled:matches!(phase,Phase::Disabled|Phase::Retired),principal_binding:spec.binding},phase,retire,retired_at,providers:None}
 }
 fn retire_binding(id:u8)->ProposalBinding{ProposalBinding{operation_id:ProposalOperationId{proposal_id:RequestId([id;16]),revision:1},proposal_digest:Sha256Digest([id;32])}}
 fn saved(journal:Journal)->Journal{
@@ -362,6 +412,127 @@ fn f6fb_empty_open_with_unreadable_storage_refuses_allocate_until_traces_read(){
     assert!(fx.allocator.traces_verified);
     fx.disk.traces_fail=true;
     assert_eq!(allocate(&mut fx,2,"ops").label,"ops","verified once is enough");
+}
+// ---- R8d: Entitle, and the removal by Disable / Retire ----
+fn entitle_request(id:u8,label:&str,profiles:&[u8])->Request{
+    let mut request=employee_request(id,label,ConfirmationStatus::Applied,ALICE);
+    request.schema=wire::SCHEMA_V4;request.action=Action::Entitle;
+    request.entitlement=Some(wire::Entitlement{profiles:profiles.iter().map(|byte|crate::entitlement::fixture::profile(*byte)).collect(),max_turns:None});
+    request
+}
+fn disable_request(id:u8,label:&str)->Request{
+    let mut request=employee_request(id,label,ConfirmationStatus::Failed,ALICE);request.action=Action::Disable;request
+}
+#[test]
+fn entitle_ready_employee_writes_one_record_and_replies_what_is_in_force(){
+    let mut fx=Fx::portable();
+    let receipt=allocate(&mut fx,1,"sales");
+    let reply=fx.handle(&entitle_request(1,"sales",&[1])).unwrap();
+    assert_eq!((reply.phase,reply.receipt.employee),(Phase::Ready,receipt.employee));
+    assert_eq!(reply.entitlement.unwrap().profiles,vec![crate::entitlement::fixture::profile(1)]);
+    assert_eq!((fx.entitlements.writes,fx.entitlements.publication.entitlements.len()),(1,1));
+    assert!(fx.entitlements.held(receipt.employee).is_some());
+    // Identical: no write; the wire reply passes the gateway's check.
+    let request=entitle_request(1,"sales",&[1]);
+    let response=wire::Response::for_request(&request,fx.handle(&request));
+    assert!(matches!(wire::check_response(&request,response),Ok(wire::Answer::Reply(reply)) if reply.entitlement.is_some()));
+    assert_eq!(fx.entitlements.writes,1,"identical record: no write");
+}
+#[test]
+fn entitle_refuses_unknown_pending_and_disabled_employees_without_writing(){
+    let mut fx=Fx::portable();
+    assert_eq!(fx.handle(&entitle_request(1,"sales",&[1])).unwrap_err(),wire::ErrorCode::NotAllocated,"unknown");
+    fx.accounts.create_fail=true;
+    assert!(fx.handle(&employee_request(2,"planned",ConfirmationStatus::Applying,ALICE)).is_err());
+    assert_eq!(fx.handle(&entitle_request(2,"planned",&[1])).unwrap_err(),wire::ErrorCode::NotAllocated,"planned");
+    fx.accounts.create_fail=false;
+    let receipt=allocate(&mut fx,3,"gone");
+    assert_eq!(fx.handle(&disable_request(3,"gone")).unwrap().phase,Phase::Disabled);
+    assert_eq!(fx.handle(&entitle_request(3,"gone",&[1])).unwrap_err(),wire::ErrorCode::NotAllocated,"disabled");
+    assert!(fx.entitlements.held(receipt.employee).is_none());
+    // Not in the signed policy, or an invalid shape: distinct codes.
+    allocate(&mut fx,4,"live");
+    assert_eq!(fx.handle(&entitle_request(4,"live",&[9])).unwrap_err(),wire::ErrorCode::NotSigned);
+    assert_eq!(fx.handle(&entitle_request(4,"live",&[])).unwrap_err(),wire::ErrorCode::InvalidEntitlement);
+    assert_eq!(fx.handle(&entitle_request(4,"live",&[1,1])).unwrap_err(),wire::ErrorCode::InvalidEntitlement);
+    assert_eq!(fx.entitlements.writes,0,"no refusal writes anything");
+}
+#[test]
+fn entitle_refuses_when_the_registry_disagrees_with_a_ready_journal_entry(){
+    // Journal Ready, registry row Tombstone.
+    let mut fx=Fx::portable();
+    let receipt=allocate(&mut fx,1,"sales");
+    assert_eq!(fx.account(receipt.employee).uid,receipt.uid,"the happy-path fixture carries a matching Ready row");
+    fx.registry.retire(receipt.employee).unwrap();
+    let before=fx.entitlements.publication.clone();
+    assert_eq!(fx.handle(&entitle_request(1,"sales",&[1])).unwrap_err(),wire::ErrorCode::NotAllocated,"tombstone");
+    assert_eq!((fx.entitlements.writes,&fx.entitlements.publication),(0,&before));
+    // Journal Ready, registry Ready row with another UID.
+    let mut fx=Fx::portable();
+    let receipt=allocate(&mut fx,1,"sales");
+    let mut registry=fx.registry.registry().clone();
+    let row=registry.employees.iter_mut().find(|a|a.employee==receipt.employee).unwrap();
+    row.uid+=1;row.gid+=1;
+    fx.registry=Box::new(FakeRegistry(registry));
+    assert_eq!(fx.handle(&entitle_request(1,"sales",&[1])).unwrap_err(),wire::ErrorCode::NotAllocated,"other uid");
+    // Journal Ready, no registry row at all.
+    fx.registry=Box::new(FakeRegistry(Registry::default()));
+    assert_eq!(fx.handle(&entitle_request(1,"sales",&[1])).unwrap_err(),wire::ErrorCode::NotAllocated,"missing");
+    assert_eq!(fx.entitlements.writes,0,"no refusal writes anything");
+}
+#[test]
+fn older_schemas_cannot_entitle(){
+    let mut fx=Fx::portable();
+    allocate(&mut fx,1,"sales");
+    for schema in [1,wire::SCHEMA_V2,wire::SCHEMA_V3]{
+        let mut request=entitle_request(1,"sales",&[1]);request.schema=schema;
+        assert!(request.check().is_err(),"serve drops it: schema {schema}");
+        assert_eq!(fx.handle(&request).unwrap_err(),wire::ErrorCode::InvalidRequest,"schema {schema}");
+    }
+    assert_eq!(fx.entitlements.writes,0);
+}
+#[test]
+fn disable_removes_the_entitlement_first_and_idempotently(){
+    let mut fx=Fx::portable();
+    let receipt=allocate(&mut fx,1,"sales");
+    fx.handle(&entitle_request(1,"sales",&[1,2])).unwrap();
+    // A removal that cannot be written refuses the Disable before its state change.
+    fx.entitlements.fail=Some(crate::entitlement::Refusal::Unavailable);
+    assert_eq!(fx.handle(&disable_request(1,"sales")).unwrap_err(),wire::ErrorCode::IsolationUnavailable);
+    assert_eq!(fx.phase(receipt.employee),Phase::Ready);
+    assert!(fx.entitlements.held(receipt.employee).is_some());
+    fx.entitlements.fail=None;
+    assert_eq!(fx.handle(&disable_request(1,"sales")).unwrap().phase,Phase::Disabled);
+    assert!(fx.entitlements.held(receipt.employee).is_none());
+    let writes=fx.entitlements.writes;
+    assert_eq!(fx.handle(&disable_request(1,"sales")).unwrap().phase,Phase::Disabled,"replay");
+    assert_eq!(fx.entitlements.writes,writes,"already gone: no write");
+}
+#[test]
+fn retire_removes_the_entitlement_first_and_resumes_after_a_crash(){
+    let mut fx=Fx::portable();
+    let receipt=allocate(&mut fx,1,"sales");
+    fx.handle(&entitle_request(1,"sales",&[1])).unwrap();
+    let request=retire_request(&receipt,0x41);
+    // Crash after the removal and the Retiring save (the account step fails).
+    fx.accounts.recover_fail=1;
+    assert_eq!(fx.handle(&request).unwrap_err(),wire::ErrorCode::IsolationUnavailable);
+    assert_eq!(fx.phase(receipt.employee),Phase::Retiring);
+    assert!(fx.entitlements.held(receipt.employee).is_none(),"removed before Retiring");
+    let writes=fx.entitlements.writes;
+    fx.reopen();
+    assert_eq!(fx.handle(&request).unwrap().phase,Phase::Retired);
+    assert_eq!(fx.entitlements.writes,writes,"resume: already gone, no write");
+    assert_eq!(fx.handle(&request).unwrap().phase,Phase::Retired,"replay");
+}
+#[test]
+fn entitlement_write_of_unknown_outcome_poisons_the_allocator(){
+    let mut fx=Fx::portable();
+    allocate(&mut fx,1,"sales");
+    fx.entitlements.fail=Some(crate::entitlement::Refusal::Unknown);
+    assert_eq!(fx.handle(&entitle_request(1,"sales",&[1])).unwrap_err(),wire::ErrorCode::IsolationUnavailable);
+    fx.entitlements.fail=None;
+    assert_eq!(fx.handle(&entitle_request(1,"sales",&[1])).unwrap_err(),wire::ErrorCode::IsolationUnavailable,"poisoned until restart");
 }
 #[test]
 fn retire_scenarios_with_in_memory_registry(){

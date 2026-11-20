@@ -538,6 +538,23 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// B0 item 1: inside an isolated MCP request the Layer-2 utility call
+    /// reaches the production in-run judge runner, which refuses (site
+    /// `utility.in_run_judge`, DEBUG/INFO log). The classifier keeps its
+    /// existing fallback for a failed call: `anomaly` (escalate to a human),
+    /// source `llm_error`.
+    #[test]
+    fn b0_in_mcp_classifier_refusal_keeps_the_anomaly_fallback() {
+        use crate::isolation_mcp::refusal::{site, test_support};
+        let home = tempfile::tempdir().unwrap();
+        let agent = crate::isolation_egress::test_support::employee(home.path(), "worker");
+        let (result, logs) = test_support::run_capturing_logs(
+            crate::isolation_egress::test_support::in_mcp_request(home.path(), "worker",
+                classify_llm(home.path(), &agent, "device_reboot", &json!({}))));
+        assert_eq!(result, ClassificationResult { class: SituationClass::Anomaly, source: ClassSource::LlmError });
+        test_support::assert_utility_refusal_logged(&logs, site!("utility.in_run_judge"));
+    }
+
     // ── is_os_action_tool ───────────────────────────────────────────────────
 
     #[test]

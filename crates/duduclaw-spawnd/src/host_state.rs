@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use duduclaw_isolation::{ids::{EmployeeId, RunId}, ipc::ErrorCode};
 use crate::{registry::{root_path, REGISTRY_DIRECTORY}, readiness::Readiness};
 pub const READINESS_PATH: &str = "/run/duduclaw-spawnd/readiness.json";
-const MAX_BYTES: u64 = 64 * 1024;
+/// Size cap of every document written by [`atomic_json`] or read by
+/// [`read_json`] (R8d: the gateway projection's capacity bound).
+pub(crate) const MAX_BYTES: u64 = 64 * 1024;
 fn invalid() -> io::Error { io::Error::other("invalid spawnd state") }
 
 pub fn atomic_json<T: Serialize>(path: &Path, value: &T, gid: u32, mode: u32) -> io::Result<()> {
@@ -68,7 +70,12 @@ impl RunJournal {
 #[serde(deny_unknown_fields)]
 pub struct LandlockEvidence { pub detected_abi: u32, pub selected_abi: u32 }
 impl LandlockEvidence {
-    fn valid(&self) -> bool { self.detected_abi > 0 && self.selected_abi == self.detected_abi.min(7) }
+    /// The trampoline's clamp: `min(detected, LANDLOCK_HIGHEST_KNOWN_ABI)`, the
+    /// one shared constant (`duduclaw_isolation`).
+    fn valid(&self) -> bool {
+        self.detected_abi > 0
+            && self.selected_abi == self.detected_abi.min(duduclaw_isolation::LANDLOCK_HIGHEST_KNOWN_ABI)
+    }
 }
 /// The one protocol feature set (`ipc::SpawndFeatures`, a u32 bitset:
 /// `helper_calls` = bit 0, `work_broker` = bit 1). The readiness report and
@@ -158,19 +165,33 @@ impl EvidenceReport {
         self.helper_calls() && self.features.contains(SpawndFeatures::HELPER_RECORDING) && self.recording_probe_passed()
     }
     pub fn check_at(&self, boot_id: &str, now: u64) -> crate::Result<()> {
-        if self.version != 1 || self.boot_id != boot_id || self.valid_for_ms == 0 || self.valid_for_ms > 1_000
-            || now < self.checked_boottime_ms || now - self.checked_boottime_ms >= self.valid_for_ms
-            || self.host_pty_budget == 0
-            || (self.checks.trampoline_verified && !self.landlock.as_ref().is_some_and(LandlockEvidence::valid)) { return Err(ErrorCode::IsolationUnavailable); }
-        self.checks.check()
+        self.check_at_labelled(boot_id, now).map_err(crate::start_refusal::Refusal::code)
+    }
+    /// R8y: [`Self::check_at`] with the gate that refused (same codes, same
+    /// conditions): `report_invalid`, `report_stale`, `pty_budget`,
+    /// `landlock_evidence`, then `Readiness::check_labelled`.
+    pub fn check_at_labelled(&self, boot_id: &str, now: u64) -> crate::start_refusal::Labelled<()> {
+        use crate::start_refusal::{gate, Gate};
+        let refuse = |which| gate(which)(ErrorCode::IsolationUnavailable);
+        if self.version != 1 || self.boot_id != boot_id || self.valid_for_ms == 0 || self.valid_for_ms > 1_000 {
+            return Err(refuse(Gate::ReportInvalid));
+        }
+        if now < self.checked_boottime_ms || now - self.checked_boottime_ms >= self.valid_for_ms { return Err(refuse(Gate::ReportStale)); }
+        if self.host_pty_budget == 0 { return Err(refuse(Gate::PtyBudget)); }
+        if self.checks.trampoline_verified && !self.landlock.as_ref().is_some_and(LandlockEvidence::valid) {
+            return Err(refuse(Gate::LandlockEvidence));
+        }
+        self.checks.check_labelled()
+    }
+    pub fn check_labelled(&self) -> crate::start_refusal::Labelled<()> {
+        use crate::start_refusal::{gate, Gate};
+        let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").map_err(|_| gate(Gate::BootClock)(ErrorCode::IsolationUnavailable))?;
+        self.check_at_labelled(boot.trim(), boottime_ms().map_err(|_| gate(Gate::BootClock)(ErrorCode::IsolationUnavailable))?)
     }
     pub fn publish(&self, gateway_gid: u32) -> io::Result<()> { atomic_json(Path::new(READINESS_PATH), self, gateway_gid, 0o640) }
     /// A may read this file or invoke --check. No booleans are accepted over IPC.
     pub fn read(gateway_gid: u32) -> io::Result<Self> { read_json(Path::new(READINESS_PATH), gateway_gid, 0o640) }
-    pub fn check(&self) -> crate::Result<()> {
-        let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").map_err(|_| ErrorCode::IsolationUnavailable)?;
-        self.check_at(boot.trim(), boottime_ms().map_err(|_| ErrorCode::IsolationUnavailable)?)
-    }
+    pub fn check(&self) -> crate::Result<()> { self.check_labelled().map_err(crate::start_refusal::Refusal::code) }
 }
 pub fn boottime_ms() -> io::Result<u64> {
     let mut value = libc::timespec { tv_sec: 0, tv_nsec: 0 };
@@ -199,6 +220,20 @@ mod tests {
         invalid_abi.landlock = Some(LandlockEvidence { detected_abi: 8, selected_abi: 8 });
         assert!(invalid_abi.check_at("boot", 100).is_err());
         for (boot, now) in [("other", 101), ("boot", 99), ("boot", 1100)] { assert!(report.check_at(boot, now).is_err()); }
+        // R8y: each refusal names its gate; the wire code is unchanged.
+        let label = |report: &EvidenceReport, boot: &str, now: u64| {
+            let refusal = report.check_at_labelled(boot, now).unwrap_err();
+            assert_eq!(refusal.code(), ErrorCode::IsolationUnavailable);
+            refusal.step.to_string()
+        };
+        assert_eq!(label(&report, "other", 101), "report_invalid");
+        assert_eq!(label(&report, "boot", 99), "report_stale");
+        assert_eq!(label(&report, "boot", 1100), "report_stale");
+        assert_eq!(label(&missing_abi, "boot", 100), "landlock_evidence");
+        let mut no_ptys = report.clone(); no_ptys.host_pty_budget = 0;
+        assert_eq!(label(&no_ptys, "boot", 100), "pty_budget");
+        let mut no_dns = report.clone(); no_dns.checks.dns_route_verified = false;
+        assert_eq!(label(&no_dns, "boot", 100), "not_ready(dns_route_verified)");
     }
     #[test]
     fn h4_feature_bits_advertised() {

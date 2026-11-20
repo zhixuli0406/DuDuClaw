@@ -1,5 +1,6 @@
 [package]
 name = "duduclaw-import"
+default-run = "duduclaw-import"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,7 +15,7 @@ duduclaw-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-rusqlite = { workspace = true, features = ["hooks", "limits", "modern_sqlite"] }
+rusqlite = { workspace = true, features = ["hooks", "limits", "modern_sqlite", "serialize"] }
 tempfile = "3"
 rustix = { version = "1", features = ["fs", "process", "thread"] }
 

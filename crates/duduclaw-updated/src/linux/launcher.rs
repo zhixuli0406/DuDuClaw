@@ -81,9 +81,8 @@ pub fn launch() -> Result<()> {
 /// This verifies root metadata only; G must also verify BOTH migration signatures
 /// and preserve the same package fd through extraction/execution before provisioning.
 pub fn verify_bootstrap_root(bytes: &[u8], signatures: &[String], now: u64) -> Result<TrustBundle> {
-    let pin = option_env!("DUDUCLAW_BOOTSTRAP_ROOT_SHA256").ok_or(Error::Maintenance)?;
-    let raw = hex::decode(pin).map_err(|_| Error::Maintenance)?;
-    let digest = Sha256Digest(raw.try_into().map_err(|_| Error::Maintenance)?);
+    // Single pin source (plan R1): the compiled constant, test-key or production by cfg.
+    let (digest, _) = super::bootstrap_verify::pinned_root()?;
     crate::trust::verify_root(bytes, signatures, digest, now)?;
     Ok(TrustBundle { root: String::from_utf8(bytes.to_vec()).map_err(|_| Error::Invalid)?, signatures: signatures.to_vec(), pin: digest })
 }

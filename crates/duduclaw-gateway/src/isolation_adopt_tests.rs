@@ -27,7 +27,8 @@ impl RetireRoot for FakeRoot {
             RootAnswer::NotFound => Ok(Answer::Refused(Code::NotFound)),
             RootAnswer::Inconsistent => Ok(Answer::Refused(Code::Inconsistent)),
             RootAnswer::Unavailable => Err(()),
-            RootAnswer::Ready(receipt) => Ok(Answer::Reply(Reply { receipt: receipt.clone(), phase: RootPhase2::Ready, idle: Some(true) })),
+            RootAnswer::Ready(receipt) => Ok(Answer::Reply(Reply { receipt: receipt.clone(), phase: RootPhase2::Ready, idle: Some(true),
+                entitlement: None })),
         }
     }
 }

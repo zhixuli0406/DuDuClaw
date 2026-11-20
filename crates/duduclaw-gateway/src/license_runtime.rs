@@ -170,7 +170,113 @@ const PROD_ISSUER_KEY_ID: &str = "v2";
 const PROD_ISSUER_PUBKEY_HEX: &str =
     "942d6abae25dcd782c0586132143940003a10b1efd11e0a0b2f5a86d303476d0";
 
-/// Build the trusted-issuer registry for a normal gateway boot.
+/// Key id of the TEST licence issuer (plan §3.3 test builds, owner decision
+/// 2026-11-18: "a TEST build accepts a test issuer"). Only a
+/// `cfg(duduclaw_test_root)` build registers it ([`production_registry`]); a
+/// production build compiles none of this, so the id gets no special treatment
+/// there. It is never [`PROD_ISSUER_KEY_ID`].
+#[cfg(any(test, duduclaw_test_root))]
+pub const TEST_ISSUER_KEY_ID: &str = "test-root";
+
+/// The TEST issuer public key compiled into a test-root build
+/// (`DUDUCLAW_TEST_LICENSE_ISSUER_PUBKEY`, 64 lower-case hex; scripts/isolation-test-keys.sh).
+#[cfg(duduclaw_test_root)]
+const TEST_ISSUER_PUBKEY: Option<&str> = option_env!("DUDUCLAW_TEST_LICENSE_ISSUER_PUBKEY");
+
+/// Constant bytes only a test-root build contains, so release tooling
+/// (scripts/package-linux-release.py) detects a test-licence gateway without
+/// executing it (cross-built archives). `#[used]`, and read through
+/// `black_box` on every registry build, so neither compiler nor linker drops it.
+#[cfg(duduclaw_test_root)]
+#[used]
+static TEST_LICENSE_BUILD_MARKER: &[u8] = b"DUDUCLAW-TEST-LICENSE-ISSUER-BUILD";
+
+/// Exactly 64 lower-case hex digits ⇒ the 32 key bytes; anything else ⇒ `None`.
+#[cfg(any(test, duduclaw_test_root))]
+fn test_issuer_key(text: &str) -> Option<[u8; 32]> {
+    if text.len() != 64 || !text.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        return None;
+    }
+    hex::decode(text).ok()?.try_into().ok()
+}
+
+/// `registry` plus the TEST issuer named by `compiled` (the compile-time
+/// `DUDUCLAW_TEST_LICENSE_ISSUER_PUBKEY` of a test-root build) under
+/// [`TEST_ISSUER_KEY_ID`]. `None` or a malformed value registers nothing; an
+/// issuer already registered under that id is not shadowed. Pure, so the default
+/// test build covers it while the cfg gate stays on the call site.
+#[cfg(any(test, duduclaw_test_root))]
+fn with_test_issuer(registry: PublicKeyRegistry, compiled: Option<&str>) -> PublicKeyRegistry {
+    let Some(key) = compiled.and_then(test_issuer_key) else { return registry };
+    if registry.get(TEST_ISSUER_KEY_ID).is_some() {
+        return registry;
+    }
+    registry.with_key(TEST_ISSUER_KEY_ID, key.to_vec())
+}
+
+/// The complete issuer registry of a `cfg(duduclaw_test_root)` build (R8u review
+/// F1, owner rule "a TEST build accepts only TEST licences"): EXACTLY the
+/// validated compiled TEST issuer under [`TEST_ISSUER_KEY_ID`], built from an
+/// empty registry — no baked production issuer and no
+/// `DUDUCLAW_LICENSE_PUBKEY_<ID>` environment issuer. `None` / malformed ⇒ an
+/// empty registry, so no licence at all verifies. Pure; reads no environment.
+#[cfg(any(test, duduclaw_test_root))]
+fn test_root_registry(compiled: Option<&str>) -> PublicKeyRegistry {
+    with_test_issuer(PublicKeyRegistry::new(), compiled)
+}
+
+/// Build the trusted-issuer registry every licence consumer uses (gateway boot,
+/// `duduclaw license …`, edition/seat resolution, licence seeding, distributor
+/// artifacts). A normal build: [`baked_registry`] (env issuers + baked
+/// production issuer). A `cfg(duduclaw_test_root)` build: ONLY its compiled
+/// TEST issuer ([`test_root_registry`]) — a production or environment-provided
+/// issuer is never trusted there, so a TEST binary on a customer host runs
+/// OpenSource with the customer's production licence. Every other licence rule
+/// (fingerprint binding, tier/edition, expiry, grace) is unchanged.
+pub fn production_registry() -> PublicKeyRegistry {
+    #[cfg(not(duduclaw_test_root))]
+    {
+        baked_registry()
+    }
+    #[cfg(duduclaw_test_root)]
+    {
+        let _ = std::hint::black_box(TEST_LICENSE_BUILD_MARKER);
+        test_root_registry(TEST_ISSUER_PUBKEY)
+    }
+}
+
+/// The one-line licence build identity (cf. `duduclaw-bootstrap --print-root-pin`),
+/// printed by the hidden `duduclaw print-license-issuer`:
+/// `PRODUCTION-LICENSE <first 16 hex of SHA-256 of the baked production issuer
+/// key bytes>` in a normal build, `TEST-LICENSE <test issuer key hex | none>` in
+/// a `cfg(duduclaw_test_root)` build. Reads only compiled constants.
+pub fn license_build_identity() -> String {
+    #[cfg(not(duduclaw_test_root))]
+    {
+        production_license_identity(PROD_ISSUER_PUBKEY_HEX)
+    }
+    #[cfg(duduclaw_test_root)]
+    {
+        let _ = std::hint::black_box(TEST_LICENSE_BUILD_MARKER);
+        let key = TEST_ISSUER_PUBKEY.and_then(test_issuer_key);
+        format!("TEST-LICENSE {}", key.map(hex::encode).unwrap_or_else(|| "none".to_owned()))
+    }
+}
+
+/// `PRODUCTION-LICENSE <16 hex>`; `none` when the baked constant is not a 32-byte key.
+#[cfg_attr(duduclaw_test_root, allow(dead_code))]
+fn production_license_identity(baked_hex: &str) -> String {
+    use sha2::{Digest, Sha256};
+    match hex::decode(baked_hex) {
+        Ok(bytes) if bytes.len() == 32 => {
+            let digest = hex::encode(Sha256::digest(&bytes));
+            format!("PRODUCTION-LICENSE {}", &digest[..16])
+        }
+        _ => "PRODUCTION-LICENSE none".to_owned(),
+    }
+}
+
+/// The trusted-issuer registry of every build.
 ///
 /// Precedence: `DUDUCLAW_LICENSE_PUBKEY_<ID>` env vars are collected first and
 /// win on id collision (self-hosters / self-issuers / emergency key rotation
@@ -180,7 +286,10 @@ const PROD_ISSUER_PUBKEY_HEX: &str =
 /// Fail-safe: an empty or malformed baked constant yields an env-only registry
 /// (OpenSource unless an env key is supplied) rather than panicking. The worst
 /// case is "no baked key" ⇒ OpenSource, never a crash of the Apache-2.0 core.
-pub fn production_registry() -> PublicKeyRegistry {
+///
+/// Never called by a `cfg(duduclaw_test_root)` build ([`production_registry`]).
+#[cfg_attr(duduclaw_test_root, allow(dead_code))]
+fn baked_registry() -> PublicKeyRegistry {
     let registry = embedded_registry_from_env();
     if registry.get(PROD_ISSUER_KEY_ID).is_some() {
         // An operator-supplied key for this id takes precedence; don't shadow it.
@@ -343,7 +452,7 @@ impl LicenseRuntime {
             // added to `duduclaw-license/src/key.rs` for this to be exact; until
             // then we fall back to the env-derived count (the only construction
             // path that carries multiple keys in practice).
-            registry_keys = count_embedded_issuer_keys(),
+            registry_keys = logged_registry_keys(&registry),
             "license runtime initialised"
         );
 
@@ -490,6 +599,15 @@ impl LicenseRuntime {
         snapshot.installed |= snapshot.validation_warning.is_some();
         if snapshot.validation_warning.is_some() { snapshot.mode = "opensource"; }
         snapshot
+    }
+
+    /// R8j round 2 B1: a licence was read AND verified (any tier). False when
+    /// none is installed, it could not be read, or it fails verification
+    /// (including expiry / grace period): the edition then silently degraded
+    /// to OpenSource/Personal and says nothing about the host.
+    pub async fn licence_verified(&self) -> bool {
+        let snapshot = self.snapshot().await;
+        snapshot.installed && snapshot.validation_warning.is_none()
     }
 
     /// Verify a candidate license against this runtime's issuer registry +
@@ -732,6 +850,7 @@ pub fn embedded_registry_from_env() -> PublicKeyRegistry {
 /// Mirrors the validation in [`embedded_registry_from_env`] (suffix present +
 /// 32-byte hex) so the logged count matches what was actually registered. This
 /// exists because `PublicKeyRegistry` does not yet expose a `len()` accessor.
+#[cfg_attr(duduclaw_test_root, allow(dead_code))]
 fn count_embedded_issuer_keys() -> usize {
     std::env::vars()
         .filter(|(k, v)| {
@@ -740,6 +859,22 @@ fn count_embedded_issuer_keys() -> usize {
                 && matches!(hex::decode(v.trim()), Ok(b) if b.len() == 32)
         })
         .count()
+}
+
+/// The `registry_keys` value of the bootstrap log line. A normal build keeps the
+/// historical env-derived count; a `cfg(duduclaw_test_root)` build ignores
+/// environment issuers, so it reports what it trusts: 1 with a compiled TEST
+/// issuer, 0 without.
+fn logged_registry_keys(registry: &PublicKeyRegistry) -> usize {
+    #[cfg(not(duduclaw_test_root))]
+    {
+        let _ = registry;
+        count_embedded_issuer_keys()
+    }
+    #[cfg(duduclaw_test_root)]
+    {
+        usize::from(!registry.is_empty())
+    }
 }
 
 // ── Bootstrap helpers ─────────────────────────────────────────
@@ -2725,6 +2860,9 @@ pub(crate) mod tests {
         assert_eq!(bytes.len(), 32, "Ed25519 public key must be 32 bytes");
     }
 
+    /// Normal configuration only: a `cfg(duduclaw_test_root)` registry holds no
+    /// production issuer at all (`test_issuer_tests`).
+    #[cfg(not(duduclaw_test_root))]
     #[test]
     fn production_registry_matches_baked_state() {
         // With no env override for the active key id, the registry reflects the
@@ -2734,7 +2872,10 @@ pub(crate) mod tests {
             "DUDUCLAW_LICENSE_PUBKEY_{}",
             PROD_ISSUER_KEY_ID.to_ascii_uppercase()
         );
-        if std::env::var(&env_var).is_ok() {
+        if std::env::var(&env_var).is_ok()
+            || std::env::vars().any(|(name, _)| name.strip_prefix(PUBKEY_ENV_PREFIX)
+                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(PROD_ISSUER_KEY_ID)))
+        {
             return;
         }
         let reg = production_registry();
@@ -2745,6 +2886,21 @@ pub(crate) mod tests {
             );
         } else {
             assert_eq!(reg.get(PROD_ISSUER_KEY_ID).map(|k| k.len()), Some(32));
+        }
+        // R8u F1: the normal registry is unchanged — the baked v2 issuer exactly,
+        // plus one entry per valid environment issuer, and nothing else (no
+        // retired v1, no TEST issuer).
+        assert_eq!(PROD_ISSUER_KEY_ID, "v2");
+        if !PROD_ISSUER_PUBKEY_HEX.is_empty() {
+            let baked = hex::decode(PROD_ISSUER_PUBKEY_HEX).unwrap();
+            assert_eq!(reg.get(PROD_ISSUER_KEY_ID), Some(baked.as_slice()));
+        }
+        let env_keys = count_embedded_issuer_keys();
+        assert_eq!(reg.len(), env_keys + usize::from(!PROD_ISSUER_PUBKEY_HEX.is_empty()));
+        if env_keys == 0 {
+            assert_eq!(reg.len(), 1, "a stock host trusts exactly the baked production issuer");
+            assert!(reg.get("v1").is_none(), "v1 is retired");
+            assert!(reg.get(TEST_ISSUER_KEY_ID).is_none());
         }
     }
 
@@ -2770,5 +2926,206 @@ pub(crate) mod tests {
         let read = read_last_seen_crl(dir.path()).expect("persisted timestamp");
         // RFC3339 round-trip preserves to (at least) second precision.
         assert_eq!(read.timestamp(), ts.timestamp());
+    }
+}
+
+/// TEST licence issuer (owner decision 2026-11-18): only a `cfg(duduclaw_test_root)`
+/// build trusts it; the registration rule is a pure function tested here.
+#[cfg(test)]
+mod test_issuer_tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    fn signed(issuer: &SigningKey, key_id: &str) -> License {
+        let mut license = License::new("sub_test_root", "cus_test_root", LicenseTier::SelfHostPro, "fp-here",
+            chrono::Duration::days(30), key_id);
+        license.signature = issuer.sign(&license.canonical_payload().unwrap()).to_bytes().to_vec();
+        license
+    }
+
+    /// An operator-supplied `DUDUCLAW_LICENSE_PUBKEY_TEST-ROOT` (existing env path) would
+    /// legitimately register the id; such a host cannot run the registry assertions.
+    /// (A test-root build ignores the environment, so only the normal build uses it.)
+    #[cfg_attr(duduclaw_test_root, allow(dead_code))]
+    fn env_names_test_root() -> bool {
+        std::env::vars().any(|(name, _)| name.strip_prefix(PUBKEY_ENV_PREFIX)
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(TEST_ISSUER_KEY_ID)))
+    }
+
+    #[test]
+    fn test_issuer_id_never_collides_with_the_production_id() {
+        assert_ne!(TEST_ISSUER_KEY_ID, PROD_ISSUER_KEY_ID);
+        assert!(!TEST_ISSUER_KEY_ID.eq_ignore_ascii_case(PROD_ISSUER_KEY_ID));
+    }
+
+    #[cfg(not(duduclaw_test_root))]
+    #[test]
+    fn default_build_has_no_test_issuer_and_refuses_a_test_root_licence() {
+        if env_names_test_root() {
+            return;
+        }
+        let registry = production_registry();
+        assert!(registry.get(TEST_ISSUER_KEY_ID).is_none());
+        let license = signed(&SigningKey::from_bytes(&[7; 32]), TEST_ISSUER_KEY_ID);
+        assert!(matches!(registry.verify(&license),
+            Err(LicenseError::UnknownPublicKeyId(id)) if id == TEST_ISSUER_KEY_ID));
+    }
+
+    #[cfg(not(duduclaw_test_root))]
+    #[test]
+    fn default_build_announces_the_production_issuer() {
+        use sha2::{Digest, Sha256};
+        let baked = hex::decode(PROD_ISSUER_PUBKEY_HEX).unwrap();
+        let digest = hex::encode(Sha256::digest(&baked));
+        assert_eq!(license_build_identity(), format!("PRODUCTION-LICENSE {}", &digest[..16]));
+        assert!(!license_build_identity().contains('\n'));
+        assert_eq!(production_license_identity(""), "PRODUCTION-LICENSE none");
+        assert_eq!(production_license_identity("abcd"), "PRODUCTION-LICENSE none");
+    }
+
+    #[test]
+    fn test_issuer_registration_takes_exactly_64_lowercase_hex() {
+        let issuer = SigningKey::from_bytes(&[9; 32]);
+        let public = issuer.verifying_key().to_bytes();
+        let text = hex::encode(public);
+        let registry = with_test_issuer(PublicKeyRegistry::new(), Some(text.as_str()));
+        assert_eq!(registry.get(TEST_ISSUER_KEY_ID), Some(public.as_slice()));
+        registry.verify(&signed(&issuer, TEST_ISSUER_KEY_ID)).unwrap();
+        // Another key, or the right key under another id, does not verify.
+        assert!(matches!(registry.verify(&signed(&SigningKey::from_bytes(&[7; 32]), TEST_ISSUER_KEY_ID)),
+            Err(LicenseError::InvalidSignature)));
+        assert!(registry.verify(&signed(&issuer, PROD_ISSUER_KEY_ID)).is_err());
+
+        assert!(with_test_issuer(PublicKeyRegistry::new(), None).is_empty());
+        let malformed = [String::new(), text[..62].to_owned(), "AB".repeat(32), format!("{text}00"),
+            format!(" {}", &text[1..]), "zz".repeat(32), format!("{text}\n")];
+        for bad in &malformed {
+            assert!(with_test_issuer(PublicKeyRegistry::new(), Some(bad.as_str())).is_empty(), "{bad:?}");
+        }
+        // An issuer already registered under the id is not shadowed.
+        let other = vec![1u8; 32];
+        let kept = with_test_issuer(PublicKeyRegistry::new().with_key(TEST_ISSUER_KEY_ID, other.clone()), Some(text.as_str()));
+        assert_eq!(kept.get(TEST_ISSUER_KEY_ID), Some(other.as_slice()));
+    }
+
+    #[test]
+    fn a_test_issuer_licence_passes_exactly_the_production_checks() {
+        let issuer = SigningKey::from_bytes(&[9; 32]);
+        let text = hex::encode(issuer.verifying_key().to_bytes());
+        let registry = with_test_issuer(PublicKeyRegistry::new(), Some(text.as_str()));
+        let gate = FeatureGate::from_str(EMBEDDED_FEATURES_TOML).unwrap();
+        let license = signed(&issuer, TEST_ISSUER_KEY_ID);
+        registry.verify(&license).unwrap();
+        let (interval, grace) = (gate.phone_home_interval_days(license.tier), gate.grace_period_days(license.tier));
+        let here = [FingerprintCandidate::for_test("fp-here", duduclaw_license::FingerprintStrength::Hardware)];
+        let elsewhere = [FingerprintCandidate::for_test("fp-elsewhere", duduclaw_license::FingerprintStrength::Hardware)];
+        license.validate_any(&here, interval, grace).unwrap();
+        assert!(matches!(license.validate_any(&elsewhere, interval, grace), Err(LicenseError::InvalidFingerprint)));
+        let mut expired = license.clone();
+        expired.expires_at = Utc::now() - chrono::Duration::days(1);
+        expired.signature = issuer.sign(&expired.canonical_payload().unwrap()).to_bytes().to_vec();
+        registry.verify(&expired).unwrap();
+        assert!(matches!(expired.validate_any(&here, interval, grace), Err(LicenseError::Expired)));
+    }
+
+    /// R8u F1 (pure, every build): the test-root registry is exactly the compiled
+    /// TEST issuer — its licence verifies, a production-id or any other id does
+    /// not — and no / a malformed compiled key yields an empty registry.
+    #[test]
+    fn test_root_registry_is_exactly_the_compiled_test_issuer() {
+        let issuer = SigningKey::from_bytes(&[9; 32]);
+        let text = hex::encode(issuer.verifying_key().to_bytes());
+        let registry = test_root_registry(Some(text.as_str()));
+        assert_eq!(registry.len(), 1);
+        registry.verify(&signed(&issuer, TEST_ISSUER_KEY_ID)).unwrap();
+        // The same issuer key, claimed under the production id or an env-style id, is unknown.
+        for other_id in [PROD_ISSUER_KEY_ID, "v1", "ok"] {
+            assert!(matches!(registry.verify(&signed(&issuer, other_id)),
+                Err(LicenseError::UnknownPublicKeyId(id)) if id == other_id), "{other_id}");
+        }
+        let upper = "AB".repeat(32);
+        for compiled in [None, Some(""), Some(upper.as_str())] {
+            let empty = test_root_registry(compiled);
+            assert!(empty.is_empty(), "{compiled:?}");
+            assert!(empty.verify(&signed(&issuer, TEST_ISSUER_KEY_ID)).is_err());
+        }
+    }
+
+    #[cfg(duduclaw_test_root)]
+    #[test]
+    fn test_root_build_registers_and_announces_exactly_its_compiled_issuer() {
+        let expected = TEST_ISSUER_PUBKEY.and_then(test_issuer_key);
+        assert_eq!(license_build_identity(),
+            format!("TEST-LICENSE {}", expected.map(hex::encode).unwrap_or_else(|| "none".to_owned())));
+        // R8u F1: the environment is never consulted, so no env guard is needed.
+        let registry = production_registry();
+        assert_eq!(registry.get(TEST_ISSUER_KEY_ID), expected.as_ref().map(|key| key.as_slice()));
+        assert_eq!(registry.len(), usize::from(expected.is_some()));
+    }
+
+    /// R8u F1: a test-root build never trusts the baked production issuer, so a
+    /// licence claiming the production id (the customer's licence) is unknown.
+    #[cfg(duduclaw_test_root)]
+    #[test]
+    fn test_root_build_refuses_a_production_issuer_licence() {
+        let registry = production_registry();
+        assert!(registry.get(PROD_ISSUER_KEY_ID).is_none());
+        assert!(registry.get("v1").is_none());
+        let license = signed(&SigningKey::from_bytes(&[7; 32]), PROD_ISSUER_KEY_ID);
+        assert!(matches!(registry.verify(&license),
+            Err(LicenseError::UnknownPublicKeyId(id)) if id == PROD_ISSUER_KEY_ID));
+    }
+
+    /// R8u F1: `DUDUCLAW_LICENSE_PUBKEY_<ID>` issuers (including one named like the
+    /// production id or the TEST id) are ignored by a test-root build.
+    #[cfg(duduclaw_test_root)]
+    #[test]
+    fn test_root_build_ignores_environment_issuers() {
+        let env_issuer = SigningKey::from_bytes(&[11; 32]);
+        let env_hex = hex::encode(env_issuer.verifying_key().to_bytes());
+        let names = ["DUDUCLAW_LICENSE_PUBKEY_R8UENVPROBE", "DUDUCLAW_LICENSE_PUBKEY_V2", "DUDUCLAW_LICENSE_PUBKEY_TEST-ROOT"];
+        let saved: Vec<_> = names.iter().map(|name| std::env::var_os(name)).collect();
+        // SAFETY: test-only; these names are read by no other test of a test-root build
+        // (the production registry ignores the environment) and are restored below.
+        for name in names {
+            unsafe { std::env::set_var(name, &env_hex) };
+        }
+        let registry = production_registry();
+        for (name, value) in names.iter().zip(saved) {
+            match value {
+                Some(value) => unsafe { std::env::set_var(name, value) },
+                None => unsafe { std::env::remove_var(name) },
+            }
+        }
+        let expected = TEST_ISSUER_PUBKEY.and_then(test_issuer_key);
+        assert_eq!(registry.len(), usize::from(expected.is_some()));
+        assert!(registry.get("r8uenvprobe").is_none());
+        assert!(registry.get(PROD_ISSUER_KEY_ID).is_none());
+        assert_eq!(registry.get(TEST_ISSUER_KEY_ID), expected.as_ref().map(|key| key.as_slice()));
+        for id in ["r8uenvprobe", PROD_ISSUER_KEY_ID] {
+            assert!(matches!(registry.verify(&signed(&env_issuer, id)),
+                Err(LicenseError::UnknownPublicKeyId(_))), "{id}");
+        }
+        // Signed by the env key under the TEST id: unknown (TEST-LICENSE none) or a bad signature.
+        assert!(registry.verify(&signed(&env_issuer, TEST_ISSUER_KEY_ID)).is_err());
+    }
+
+    /// R8u F1: a test-root build without a compiled TEST issuer
+    /// (`TEST-LICENSE none`) accepts no licence at all.
+    #[cfg(duduclaw_test_root)]
+    #[test]
+    fn test_root_build_without_a_test_issuer_accepts_nothing() {
+        if TEST_ISSUER_PUBKEY.and_then(test_issuer_key).is_some() {
+            // Covered for this configuration by the pure
+            // `test_root_registry_is_exactly_the_compiled_test_issuer`.
+            return;
+        }
+        assert_eq!(license_build_identity(), "TEST-LICENSE none");
+        let registry = production_registry();
+        assert!(registry.is_empty());
+        let issuer = SigningKey::from_bytes(&[9; 32]);
+        for id in [TEST_ISSUER_KEY_ID, PROD_ISSUER_KEY_ID] {
+            assert!(registry.verify(&signed(&issuer, id)).is_err(), "{id}");
+        }
     }
 }

@@ -36,6 +36,10 @@ mod departments;
 mod config_receipt;
 #[path = "migration_authority_employee.rs"]
 pub(crate) mod employee;
+// R8d D3: the start-up entitlement reconcile (spawned by the protected boot).
+#[path = "migration_authority_entitlement.rs"]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) mod entitlement;
 // F6l: `EmployeeRetire` proposals (F6 design r5 §3.12); wired into the
 // confirmation RPC by F6d.
 #[path = "migration_authority_retire.rs"]
@@ -78,7 +82,17 @@ pub(crate) struct GatewayAuthority {
     runtime: Option<std::sync::Arc<dyn MigrationConfigReadback>>,
     live: Option<std::sync::Arc<LiveAuthority>>,
     connector_env: connectors::ConnectorEnv,
+    /// R7d: the bounded re-run of a stage the root answered "pending".
+    pending: bridge::PendingWait,
 }
+/// R7d round 4: closes the process-wide effect gate (gateway shutdown): no
+/// new migration effect starts, every pending-allocation wait stops.
+pub(crate) fn begin_shutdown() { bridge::begin_shutdown() }
+/// R7d round 4: the process-wide effect gate of the confirmation flow.
+pub(crate) fn shutdown_gate() -> &'static ShutdownGate { &bridge::SHUTDOWN_GATE }
+pub(crate) use bridge::ShutdownGate;
+#[cfg(test)]
+pub(crate) use bridge::Descheduled;
 #[derive(Serialize, Deserialize)]
 #[serde(tag="kind", deny_unknown_fields)]
 enum Plan {
@@ -113,8 +127,11 @@ impl GatewayAuthority {
             CREATE TABLE IF NOT EXISTS secrets (operation TEXT PRIMARY KEY, digest BLOB NOT NULL, value BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS config_publications (operation TEXT NOT NULL, digest BLOB NOT NULL,
                 phase TEXT NOT NULL, identity BLOB NOT NULL, PRIMARY KEY(operation,phase));").map_err(|_| Error::Storage)?;
-        Ok(Self { home, db, key, backend: None, runtime: None, live: None, connector_env: connectors::ConnectorEnv::default() })
+        Ok(Self { home, db, key, backend: None, runtime: None, live: None, connector_env: connectors::ConnectorEnv::default(),
+            pending: bridge::PendingWait::default() })
     }
+    #[cfg(test)]
+    pub(crate) fn with_pending_wait(mut self, pending: bridge::PendingWait) -> Self { self.pending = pending; self }
     pub(crate) fn with_live(mut self,live:std::sync::Arc<LiveAuthority>)->Self {self.live=Some(live);self}
     /// Root allocator / audit actor used by the Connector category (tests inject fixtures).
     #[cfg_attr(not(test), allow(dead_code))]
@@ -366,8 +383,9 @@ impl ProposalValidator for GatewayAuthority {
         })
     }
 }
-impl ProposalApplier for GatewayAuthority {
-    fn stage(&mut self, item: &ConfirmationItem) -> Result<()> {
+impl GatewayAuthority {
+    /// One stage attempt (one bounded adapter operation).
+    fn stage_once(&mut self, item: &ConfirmationItem) -> Result<()> {
         bridge::operation(|| {
         self.validate_fresh(item)?;
         if self.plan(item)?.is_some() { return Ok(()); }
@@ -394,6 +412,16 @@ impl ProposalApplier for GatewayAuthority {
         };
         self.save_plan(item,&plan)
         })
+    }
+}
+impl ProposalApplier for GatewayAuthority {
+    /// R7d: a stage the root answers "pending" (only the Employee backend
+    /// does) is re-run, fully re-validated, on the bounded schedule of
+    /// [`bridge::PendingWait`]; still pending: `Err(Pending)`, which
+    /// `apply_next` keeps `Applying` without compensation.
+    fn stage(&mut self, item: &ConfirmationItem) -> Result<()> {
+        let pending = self.pending.clone();
+        pending.run(|| self.stage_once(item))
     }
     fn publish(&mut self, item: &ConfirmationItem) -> Result<()> {
         bridge::operation(|| {
@@ -589,6 +617,9 @@ fn key_file(path: &Path) -> Result<[u8;32]> {
     Ok(key)
 }
 
+#[cfg(test)]
+#[path = "migration_authority_pending_tests.rs"]
+mod pending_tests;
 #[cfg(test)]
 mod tests {
     use super::*;

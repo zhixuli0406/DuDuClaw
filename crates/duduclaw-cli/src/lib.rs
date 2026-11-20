@@ -2049,6 +2049,12 @@ enum ToolingCommands {
         max_chars: usize,
     },
 
+    /// (internal) Print this build's licence issuer identity as one line
+    /// (`PRODUCTION-LICENSE <16 hex>` or `TEST-LICENSE <hex|none>`) and exit.
+    /// Reads only compiled constants: no configuration, home directory or network.
+    #[command(hide = true, name = "print-license-issuer")]
+    PrintLicenseIssuer,
+
     /// Document knowledge base tools.
     #[command(subcommand)]
     Knowledge(KnowledgeCommands),
@@ -3305,6 +3311,18 @@ mod agent_interactive_deprecation_tests {
             assert!(agent.get_subcommands().any(|command| command.get_name() == "run"));
         });
     }
+
+    #[test]
+    fn print_license_issuer_is_a_hidden_argument_free_leaf() {
+        run_on_big_stack(|| {
+            let cli = Cli::try_parse_from(["duduclaw", "print-license-issuer"]).unwrap();
+            assert!(matches!(cli.command, Commands::Tooling(ToolingCommands::PrintLicenseIssuer)));
+            assert!(Cli::try_parse_from(["duduclaw", "print-license-issuer", "x"]).is_err());
+            let root = Cli::command();
+            let leaf = root.find_subcommand("print-license-issuer").expect("print-license-issuer");
+            assert!(leaf.is_hide_set());
+        });
+    }
 }
 
 /// H10 (2026-09 feature audit): `duduclaw hook data-file-guard` exists as a
@@ -3673,11 +3691,19 @@ enum ServiceCommands {
     Readiness {
         #[arg(long, required = true)]
         protected_linux: bool,
+        /// Report the platform checks only (no claim that employees can run)
+        #[arg(long, requires = "protected_linux")]
+        platform_only: bool,
     },
     /// Read or change root-managed native Linux protection policies
     ProtectedLinux {
         #[command(subcommand)]
         command: service::protected_linux::policy::ProtectedLinuxCommand,
+    },
+    /// Set or remove an isolated employee's model connection document (protected Linux, root)
+    Provider {
+        #[command(subcommand)]
+        command: service::protected_linux::provider::ProviderCommand,
     },
     /// Install DuDuClaw as a system service
     Install {
@@ -3690,10 +3716,11 @@ enum ServiceCommands {
         /// Enable and start the protected system service
         #[arg(long, requires = "protected_linux")]
         enable_now: bool,
-        /// Copy an existing .duduclaw data directory into the service account
+        /// Refused from v1.83.0: protected installs no longer copy an existing
+        /// .duduclaw data directory (use the official migration flow)
         #[arg(long, requires = "protected_linux")]
         migrate_from: Option<std::path::PathBuf>,
-        /// Preserve the existing destination as a backup and replace it
+        /// Refused from v1.83.0 together with --migrate-from
         #[arg(long, requires = "migrate_from")]
         force_migrate: bool,
         /// Keep installation successful even if a configured AI CLI is missing
@@ -3713,6 +3740,36 @@ enum ServiceCommands {
         /// Keep upgrade successful even if a configured AI CLI is missing
         #[arg(long, requires = "protected_linux")]
         allow_missing_runtime: bool,
+    },
+
+    /// Internal: continue a verified isolation install. Run only by
+    /// `duduclaw-bootstrap` (which verified and staged the generation).
+    #[command(hide = true)]
+    BootstrapContinue {
+        #[arg(long, required = true)]
+        protected_linux: bool,
+        /// install | upgrade | rollback
+        #[arg(long, value_parser = ["install", "upgrade", "rollback"])]
+        mode: String,
+        /// Staged generation (64 lowercase hex digits)
+        #[arg(long)]
+        generation: String,
+        /// Single upstream of the dedicated DNS broker (hosts without systemd-resolved)
+        #[arg(long)]
+        dns_upstream: Option<std::net::SocketAddr>,
+        /// Public address of this host that is on no interface (cloud 1:1 NAT); repeatable
+        #[arg(long)]
+        host_public_address: Vec<std::net::IpAddr>,
+        /// Accepted for compatibility; no effect (the install always leaves the gateway running)
+        #[arg(long)]
+        enable_now: bool,
+    },
+
+    /// Internal: roll back an uncommitted isolation install
+    #[command(hide = true)]
+    BootstrapRollback {
+        #[arg(long, required = true)]
+        protected_linux: bool,
     },
 
     /// Start the background service
@@ -4219,6 +4276,11 @@ pub async fn entry_point() {
     if import_requested && (!matches!(&cli.command, Commands::Run { .. }) || cli.force_disable_redaction) {
         eprintln!("Error: migration import startup refused");
         std::process::exit(1);
+    }
+    if matches!(&cli.command, Commands::Tooling(ToolingCommands::PrintLicenseIssuer)) {
+        // Build identity only: before logging, TLS, the home directory or anything else.
+        println!("{}", duduclaw_gateway::license_runtime::license_build_identity());
+        return;
     }
     if matches!(&cli.command, Commands::Run { .. }) {
         match duduclaw_gateway::migration_startup::maybe_run(&duduclaw_home()).await {
@@ -5661,9 +5723,12 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             },
         },
         Commands::Ops(OpsCommands::Service { command }) => match command {
-            ServiceCommands::Readiness { protected_linux: _ } => service::protected_linux::readiness(),
+            ServiceCommands::Readiness { protected_linux: _, platform_only } => service::protected_linux::readiness(platform_only),
             ServiceCommands::ProtectedLinux { command } => {
                 service::protected_linux::policy::handle(command)
+            }
+            ServiceCommands::Provider { command } => {
+                service::protected_linux::provider::handle(command)
             }
             ServiceCommands::Install { protected_linux, enable_now, migrate_from, force_migrate, i_verified_this_binary, allow_missing_runtime } => {
                 if protected_linux {
@@ -5676,6 +5741,15 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             }
             ServiceCommands::Upgrade { protected_linux: _, version, allow_missing_runtime } => {
                 service::protected_linux::upgrade(version.as_deref(), allow_missing_runtime).await
+            }
+            ServiceCommands::BootstrapContinue { protected_linux: _, mode, generation, dns_upstream,
+                host_public_address, enable_now } => {
+                service::protected_linux::bootstrap_continue(service::protected_linux::BootstrapContinueArgs {
+                    mode, generation, dns_upstream, host_public_address, enable_now,
+                })
+            }
+            ServiceCommands::BootstrapRollback { protected_linux: _ } => {
+                service::protected_linux::bootstrap_rollback()
             }
             ServiceCommands::Start => service::handle_service(service::ServiceAction::Start).await,
             ServiceCommands::Stop => service::handle_service(service::ServiceAction::Stop).await,
@@ -5788,6 +5862,10 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         Commands::Tooling(ToolingCommands::McpServer) => cmd_mcp_server().await,
         Commands::Tooling(ToolingCommands::KnowledgeExtract { format, input, max_chars }) => {
             knowledge_extract_cmd::run(&format, &input, max_chars)
+        }
+        Commands::Tooling(ToolingCommands::PrintLicenseIssuer) => {
+            println!("{}", duduclaw_gateway::license_runtime::license_build_identity());
+            Ok(())
         }
         Commands::Tooling(ToolingCommands::Knowledge(KnowledgeCommands::Eval {
             docs,

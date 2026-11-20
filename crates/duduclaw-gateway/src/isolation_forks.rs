@@ -47,7 +47,8 @@ impl InstalledForkSnapshots {
             resources: runtime.resources.clone(), network: NetworkPolicy::Offline, pty: false,
             capabilities: CapabilityHandover { mcp_bridge: false, egress_forwarder: false },
             timeouts: runtime.timeouts.clone(), inputs: RunInputs { prompt: RunInput {
-                max_bytes: bytes.len() as u64, reader: Box::new(Input(std::io::Cursor::new(bytes))) }, attachments: vec![] } })
+                max_bytes: bytes.len() as u64, reader: Box::new(Input(std::io::Cursor::new(bytes))) }, attachments: vec![] },
+            requested_max_turns: None })
     }
 
     /// Call only from a detached host orchestrator, after responding to the
@@ -144,7 +145,7 @@ mod tests {
                 output_total_bytes: fork_helper::MAX_RESULT as u64, memfd_total_bytes: fork_helper::MAX_REQUEST as u64 },
             timeouts: RunTimeouts { queue_ms: 1000, startup_ms: 1000, runtime_ms: 60_000,
                 pty_idle_ms: None, termination_grace_ms: 100 },
-            network: NetworkPolicy::Offline, mcp: false, pty_allowed: false, queue_class: QueueClass::Background }
+            network: NetworkPolicy::Offline, mcp: false, pty_allowed: false, queue_class: QueueClass::Background, turn_limit: None }
     }
     #[test]
     fn fork_snapshot_plans_require_exact_offline_bounded_protocol() {

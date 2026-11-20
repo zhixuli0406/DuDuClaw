@@ -44,7 +44,8 @@ const SCOPE_SIGNAL: u64 = 1 << 1;
 const RULE_PATH_BENEATH: u32 = 1;
 const RULE_NET_PORT: u32 = 2;
 /// Newest ABI whose rights this module names; newer kernels get this set.
-const MAX_KNOWN_ABI: u32 = 7;
+/// The shared contract constant, so the clamp matches spawnd's evidence check.
+const MAX_KNOWN_ABI: u32 = duduclaw_isolation::LANDLOCK_HIGHEST_KNOWN_ABI;
 
 /// Filesystem rights the kernel of `abi` handles (all of them, so nothing the
 /// rules do not grant stays possible), as in `duduclaw_run::landlock`.

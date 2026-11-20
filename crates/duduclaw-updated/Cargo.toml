@@ -4,6 +4,26 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+# Root bootstrap verifier (plan R1). A test-key build sets `--cfg duduclaw_test_root`
+# and prints `TEST <pin>`; a production build prints `PRODUCTION <pin>`.
+[[bin]]
+name = "duduclaw-bootstrap"
+path = "src/bin/duduclaw-bootstrap.rs"
+
+# TEST-ONLY signer for the isolation test root key set (plan §3.3, R2 §4.2).
+# Built only with `--features test-signer` (scripts/isolation-test-keys.sh); it is
+# never in scripts/package-linux-release.py BIN_PACKAGES, and that script refuses
+# any build command naming this feature or binary.
+[[bin]]
+name = "duduclaw-isolation-test-signer"
+path = "src/bin/duduclaw-isolation-test-signer.rs"
+required-features = ["test-signer"]
+
+[features]
+# Software-simulated root/target/minisign test keys and the TEST licence issuer.
+# Never enabled by a release build.
+test-signer = ["dep:blake2", "dep:duduclaw-license", "dep:chrono"]
+
 [dependencies]
 duduclaw-isolation.workspace = true
 serde.workspace = true
@@ -13,6 +33,16 @@ base64.workspace = true
 sha2 = "0.10"
 ed25519-dalek = "2.2"
 hex = "0.4"
+# Legacy release signature of the migration bundle (same crate as duduclaw-gateway).
+minisign-verify = "0.2"
+# Only for the `test-signer` feature (prehashed minisign test signatures); already
+# in Cargo.lock as this crate's dev-dependency.
+blake2 = { version = "0.10", optional = true }
+# Only for the `test-signer` feature: TEST licences are built and signed with the
+# license crate's own types and canonical payload (workspace crate; chrono is
+# already in Cargo.lock).
+duduclaw-license = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
@@ -20,6 +50,11 @@ nix = { version = "0.29", features = ["socket", "uio", "user", "fs"] }
 
 [dev-dependencies]
 tempfile = "3"
+# Test-only minisign signer (prehashed BLAKE2b-512); already in Cargo.lock.
+blake2 = "0.10"
+# Unit tests of the TEST licence issuer (test_signer.rs).
+duduclaw-license = { workspace = true }
+chrono = { workspace = true }
 
 [lints]
 workspace = true

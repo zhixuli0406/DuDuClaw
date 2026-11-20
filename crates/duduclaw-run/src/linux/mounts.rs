@@ -38,7 +38,8 @@ pub struct DetachedMount {
 }
 
 /// Ordered, fixed-purpose mount inputs. `etc` must be the minimal projection,
-/// including an empty ssl/certs directory, never a clone of host /etc.
+/// including spawnd's empty root-owned [`crate::ETC_PROJECTION_DIRECTORIES`]
+/// (the CA mount point), never a clone of host /etc.
 pub struct MountInputs {
     pub home: DetachedMount,
     pub work: DetachedMount,
@@ -326,6 +327,9 @@ pub fn build_root(inputs: MountInputs, config: &RootConfig) -> Result<PreparedRo
     attach_input(inputs.projection, root.as_raw_fd(), c"config", readonly | MOUNT_NOEXEC)?;
     let runtime_mount_id = attach_input(inputs.runtime, root.as_raw_fd(), c"runtime", readonly)?;
     attach_input(inputs.etc, root.as_raw_fd(), c"etc", readonly | MOUNT_NOEXEC)?;
+    // The mount point is spawnd's empty root-owned 0755 directory from the shared
+    // list; it is never created here (the projection is read-only and spawnd's).
+    let ca_mount_point = CString::new(crate::ETC_CA_MOUNT_POINT).map_err(|_| MountError::InvalidPolicy)?;
     // Only this public certificate directory is borrowed from host /etc.
     let ca = clone_tree(c"/etc/ssl/certs", true)?;
     set_private(ca.as_raw_fd(), true)?;
@@ -333,10 +337,10 @@ pub fn build_root(inputs: MountInputs, config: &RootConfig) -> Result<PreparedRo
     // authority projections, CA certificates must not set NOSYMFOLLOW.
     set_attributes(ca.as_raw_fd(), MOUNT_RDONLY | MOUNT_NOSUID | MOUNT_NODEV, true)?;
     let etc = open_dir(root.as_raw_fd(), c"etc")?;
-    let ca_target = open_dir(etc.as_raw_fd(), c"ssl/certs")?;
+    let ca_target = open_dir(etc.as_raw_fd(), &ca_mount_point)?;
     drop(ca_target);
-    move_mount(ca, etc.as_raw_fd(), c"ssl/certs")?;
-    let ca_readback = open_dir(etc.as_raw_fd(), c"ssl/certs")?;
+    move_mount(ca, etc.as_raw_fd(), &ca_mount_point)?;
+    let ca_readback = open_dir(etc.as_raw_fd(), &ca_mount_point)?;
     verify_flags(ca_readback.as_raw_fd(), MOUNT_RDONLY | MOUNT_NOSUID | MOUNT_NODEV)?;
     drop(ca_readback);
     drop(etc);
@@ -387,7 +391,7 @@ fn native_project(root: RawFd, run: RawFd) -> Result<(), MountError> {
     Ok(())
 }
 
-/// PID 1 calls this after clone3 and before dropping privileges (§4 step 8a).
+/// PID 1 calls this after clone(CLONE_PIDFD) and before dropping privileges (§4 step 8a).
 /// `subset_pid=false` requires an explicit root-published runtime compatibility
 /// exception; this boolean must never come from gateway/employee arguments.
 pub fn mount_proc(subset_pid: bool) -> Result<(), MountError> {
@@ -534,6 +538,16 @@ fn allocate_pty(dev: RawFd, uid: u32, mount_id: u64) -> Result<PtyPair, MountErr
     Ok(PtyPair { master, slave, mount_id })
 }
 
+/// TEST FIXTURE ONLY: `attach_input` for the debug root fixture's R7f DAC-less
+/// acceptance scenario. Compiled only with `root-test-fixture` (never in a
+/// production build); the implementation itself stays module-private.
+#[cfg(feature = "root-test-fixture")]
+pub fn attach_input_for_root_fixture(input: DetachedMount, root: RawFd, name: &CStr, attrs: u64) -> Result<u64, MountError> {
+    attach_input(input, root, name, attrs)
+}
+
+/// Attach one spawnd-provided detached mount at `root`/`name` and read it back.
+/// Callers: `build_root` and `attach_helpers` (and the fixture-only wrapper above).
 fn attach_input(input: DetachedMount, root: RawFd, name: &CStr, attrs: u64) -> Result<u64, MountError> {
     if input.expected_mount_id == 0 { return Err(MountError::Identity); }
     // Do not turn a normal directory into a source mount: move_mount requires
@@ -544,7 +558,10 @@ fn attach_input(input: DetachedMount, root: RawFd, name: &CStr, attrs: u64) -> R
     set_private(input.fd.as_raw_fd(), true)?;
     set_attributes(input.fd.as_raw_fd(), attrs, true)?;
     move_mount(input.fd, root, name)?;
-    let target = open_dir(root, name)?;
+    // R7f: O_PATH readback. The home/work roots are employee-owned 0700 and the
+    // run unit has no CAP_DAC_OVERRIDE/CAP_DAC_READ_SEARCH, so O_RDONLY is EACCES.
+    // verify_mount only uses statx(AT_EMPTY_PATH) and fstatfs64 on this fd.
+    let target = open_dir_path(root, name)?;
     verify_mount(target.as_raw_fd(), Some(input.expected_mount_id), input.expected_fs_type, attrs)
 }
 
@@ -611,6 +628,17 @@ struct OpenHow { flags: u64, mode: u64, resolve: u64 }
 fn open_dir(parent: RawFd, name: &CStr) -> Result<OwnedFd, MountError> {
     // RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS; relative opens also BENEATH.
     let how = OpenHow { flags: (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+        mode: 0, resolve: 0x02 | 0x04 | if parent == libc::AT_FDCWD { 0 } else { 0x08 } };
+    // SAFETY: initialized open_how v0 and valid C string.
+    owned(unsafe { libc::syscall(libc::SYS_openat2, parent, name.as_ptr(), &how, size_of::<OpenHow>()) },
+        MountError::Directory)
+}
+
+/// `open_dir` as an O_PATH descriptor (same resolve flags): needs search on the
+/// ancestors only, no permission on the directory itself. Valid for statx
+/// (AT_EMPTY_PATH) and fstatfs; never for getdents, *at creation or fchdir.
+fn open_dir_path(parent: RawFd, name: &CStr) -> Result<OwnedFd, MountError> {
+    let how = OpenHow { flags: (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
         mode: 0, resolve: 0x02 | 0x04 | if parent == libc::AT_FDCWD { 0 } else { 0x08 } };
     // SAFETY: initialized open_how v0 and valid C string.
     owned(unsafe { libc::syscall(libc::SYS_openat2, parent, name.as_ptr(), &how, size_of::<OpenHow>()) },
@@ -790,4 +818,49 @@ mod tests {
         assert_eq!(request.link.ifi_change, 0);
         assert_eq!(read_header(&[]).err(), Some(MountError::Loopback));
     }
+
+    struct TempTree(std::path::PathBuf);
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(self.0.join("link"));
+            let _ = std::fs::remove_dir(self.0.join("locked"));
+            let _ = std::fs::remove_dir(&self.0);
+        }
+    }
+
+    #[test]
+    fn open_dir_path_reads_back_a_directory_the_caller_cannot_open() {
+        let tree = TempTree(std::env::temp_dir().join(format!("duduclaw-run-o-path-{}", std::process::id())));
+        std::fs::create_dir(&tree.0).unwrap();
+        let parent = std::fs::File::open(&tree.0).unwrap();
+        let parent = parent.as_raw_fd();
+        // SAFETY: fixed names beneath the owned test directory.
+        unsafe {
+            assert_eq!(libc::mkdirat(parent, c"locked".as_ptr(), 0o700), 0);
+            assert_eq!(libc::fchmodat(parent, c"locked".as_ptr(), 0, 0), 0);
+            assert_eq!(libc::symlinkat(c"locked".as_ptr(), parent, c"link".as_ptr()), 0);
+        }
+        if unsafe { libc::geteuid() } != 0 {
+            // The pre-R7f readback, as root without DAC capabilities on an employee 0700 root.
+            assert_eq!(open_dir(parent, c"locked").err(), Some(MountError::Directory));
+        }
+        let fd = open_dir_path(parent, c"locked").expect("O_PATH needs no permission on the directory");
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0 && flags & libc::O_PATH != 0);
+        let stat = statx(fd.as_raw_fd()).expect("statx(AT_EMPTY_PATH) on an O_PATH descriptor");
+        assert_eq!(u32::from(stat.stx_mode) & libc::S_IFMT, libc::S_IFDIR);
+        assert_eq!(stat.stx_mode & 0o7777, 0);
+        // SAFETY: initialized statfs buffer and live descriptor.
+        let mut fs: libc::statfs64 = unsafe { zeroed() };
+        assert_eq!(unsafe { libc::fstatfs64(fd.as_raw_fd(), &mut fs) }, 0, "fstatfs on an O_PATH descriptor");
+        // The production readback, against the temp directory's own filesystem.
+        assert_eq!(verify_mount(fd.as_raw_fd(), Some(stat.stx_mnt_id), fs.f_type as i64, 0), Ok(stat.stx_mnt_id));
+        assert_eq!(verify_mount(fd.as_raw_fd(), Some(stat.stx_mnt_id + 1), fs.f_type as i64, 0), Err(MountError::Identity));
+        // Same resolution refusals as open_dir: no symlink, no escape.
+        assert_eq!(open_dir_path(parent, c"link").err(), Some(MountError::Directory));
+        assert_eq!(open_dir_path(parent, c"../locked").err(), Some(MountError::Directory));
+    }
+    // The DAC-less `attach_input` acceptance runs in the single-threaded root
+    // fixture (`DUDUCLAW_ROOT_TEST=attach-input-no-dac`, tests/root.rs), never
+    // forked from this multi-threaded harness.
 }

@@ -38,6 +38,62 @@ pub enum Event { Refused, Reserved, Queued, Started, Ended, Revoked, Intruder, O
     /// F6l (§3.12 step 8): an employee's root allocation was retired
     /// (detail: `retired`).
     Retired,
+    /// R6: spawnd started with its update drain barrier closed from
+    /// `drain.json` (detail: `update_barrier`).
+    UpdateBarrierRestored,
+    /// R6: spawnd found a publication journal at start (detail: `publication_recovery`).
+    PublicationRecovery,
+    /// R6: an update request left the set of a fully open spawnd not consistent
+    /// (failed or partial `Apply`, unreadable journal). Admission is closed and
+    /// spawnd exits for start-up recovery (detail: `publication_recovery`, the
+    /// journal as found; action `incomplete` or `journal_unreadable`).
+    UpdateSetInconsistent,
+}
+/// R6: how spawnd verified the installed set at start (publication journal
+/// `publish.json`, or the `current` selector when there is no journal). Every
+/// start re-verifies against the trust ledger, including its revocations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationRecovery {
+    /// No journal: the generation `current` names verified (signature against
+    /// the trust ledger, every artifact) and all eight destinations hold its bytes.
+    NoJournal,
+    /// The journal said `published`: its generation was re-verified and every
+    /// destination re-published idempotently (an altered file is repaired).
+    Reverified,
+    /// `publishing`: the generation was re-verified and its publication completed.
+    RolledForward,
+    /// The journal's generation is missing or no longer verifies (e.g. its
+    /// signer was revoked): the previous generation was re-verified and published.
+    RolledBack,
+    /// Neither could be completed: not consistent (nothing but the update endpoint opens).
+    Incomplete,
+    /// The journal is unreadable, has an unknown schema or field: not consistent.
+    JournalUnreadable,
+    /// No journal and no `current` selector: not consistent.
+    SelectorAbsent,
+    /// No journal and the selector cannot be read: not consistent.
+    SelectorUnreadable,
+    /// No journal and the selected generation does not verify, or a destination
+    /// does not hold its bytes: not consistent (an `Apply` repairs it).
+    SelectedUnverified,
+}
+impl PublicationRecovery {
+    /// After this outcome every fixed component holds one verified generation's bytes.
+    pub fn consistent(self) -> bool {
+        matches!(self, Self::NoJournal | Self::Reverified | Self::RolledForward | Self::RolledBack)
+    }
+    /// The fixed closed-reason code of a non-consistent outcome (status file, `STATUS=`).
+    pub fn closed_reason(self) -> Option<&'static str> {
+        match self {
+            Self::NoJournal | Self::Reverified | Self::RolledForward | Self::RolledBack => None,
+            Self::Incomplete => Some("publication_incomplete"),
+            Self::JournalUnreadable => Some("journal_unreadable"),
+            Self::SelectorAbsent => Some("selector_absent"),
+            Self::SelectorUnreadable => Some("selector_unreadable"),
+            Self::SelectedUnverified => Some("selected_unverified"),
+        }
+    }
 }
 /// HX6 round 3: what one probe call decided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -149,6 +205,12 @@ pub enum Detail {
     /// Every text value was validated by `allocation::retire_specification`.
     Retired { uid: u32, label: String, used_bytes: Option<u64>, used_inodes: Option<u64>, quota_bytes: u64, quota_inodes: u64,
         quarantine_digest_prefix: String, requested_by: String, approved_by: String, early: bool },
+    /// R6: the drain record's generation; `None`: the record was unreadable.
+    UpdateBarrier { generation: Option<duduclaw_isolation::ids::Sha256Digest> },
+    /// R6: the start-up journal outcome and the journal's generations (as
+    /// found; `None` when the journal was unreadable).
+    PublicationRecovery { action: PublicationRecovery, generation: Option<duduclaw_isolation::ids::Sha256Digest>,
+        previous: Option<duduclaw_isolation::ids::Sha256Digest> },
 }
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -233,23 +295,55 @@ fn first_record_time(reader: impl std::io::Read) -> std::io::Result<Option<u64>>
     Ok(Some(first.at_unix_ms))
 }
 
+/// One queued record; with an acknowledgement, the worker reports whether it
+/// was durably written (file and directory synced).
+#[cfg(any(target_os = "linux", test))]
+type Queued = (u8, Record, Option<std::sync::mpsc::SyncSender<bool>>);
 #[cfg(any(target_os = "linux", test))]
 #[derive(Clone)]
 struct AuditQueue {
-    sender: std::sync::mpsc::SyncSender<(u8, Record)>,
+    sender: std::sync::mpsc::SyncSender<Queued>,
     dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 #[cfg(any(target_os = "linux", test))]
 impl AuditQueue {
     fn emit(&self, source: u8, record: Record) -> bool {
-        if self.sender.try_send((source, record)).is_ok() { return true; }
-        let _ = self.dropped.fetch_update(std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed, |count| Some(count.saturating_add(1)));
+        if self.sender.try_send((source, record, None)).is_ok() { return true; }
+        self.count_dropped();
         false
     }
+    /// Queue `record` (never blocking on a full queue) and wait at most
+    /// `timeout` for the worker's report. `true` only when the worker wrote it;
+    /// the queue is FIFO, so every record queued earlier was handled first.
+    fn emit_acknowledged(&self, source: u8, record: Record, timeout: std::time::Duration) -> bool {
+        let (acknowledge, acknowledged) = std::sync::mpsc::sync_channel(1);
+        if self.sender.try_send((source, record, Some(acknowledge))).is_err() {
+            self.count_dropped();
+            return false;
+        }
+        acknowledged.recv_timeout(timeout).unwrap_or(false)
+    }
+    fn count_dropped(&self) {
+        let _ = self.dropped.fetch_update(std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed, |count| Some(count.saturating_add(1)));
+    }
 }
+/// The worker's rate-limit decision for one record: `Some(suppressed)` writes
+/// it, `None` suppresses it (not written). An acknowledged record bypasses the
+/// limit (and is not counted against it): those are the few security-relevant
+/// records whose caller reports whether they landed, so suppression would let
+/// a record that was never written be acknowledged as written.
 #[cfg(any(target_os = "linux", test))]
-fn audit_channel() -> (AuditQueue, std::sync::mpsc::Receiver<(u8, Record)>) {
+fn admit_record(budget: &mut AuditBudget, source: u8, at_unix_ms: u64, acknowledged: bool) -> Option<u64> {
+    if acknowledged { return Some(0); }
+    budget.admit(source, at_unix_ms)
+}
+/// The acknowledgement for a write result: only `Ok(true)` (written and
+/// synced) is `true`; a suppressed (`Ok(false)`) or failed write is not.
+#[cfg(any(target_os = "linux", test))]
+fn acknowledgement(result: &std::io::Result<bool>) -> bool { matches!(result, Ok(true)) }
+#[cfg(any(target_os = "linux", test))]
+fn audit_channel() -> (AuditQueue, std::sync::mpsc::Receiver<Queued>) {
     let (sender, receiver) = std::sync::mpsc::sync_channel(QUEUE_LENGTH);
     (AuditQueue { sender, dropped: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)) }, receiver)
 }
@@ -260,8 +354,13 @@ pub mod disk {
     use std::{fs::{self, File, OpenOptions}, io::{self, Write}, os::unix::fs::{MetadataExt, OpenOptionsExt}, path::{Path, PathBuf}, sync::{atomic::Ordering, mpsc::RecvTimeoutError}, time::{Duration, SystemTime, UNIX_EPOCH}};
     use fs2::FileExt;
     use crate::registry::root_path;
-    const DIRECTORY: &str = "/var/log/duduclaw-spawnd";
+    const DIRECTORY: &str = "/var/lib/duduclaw-spawnd/audit";
     const SLOTS: usize = 4;
+
+    #[test]
+    fn audit_directory_is_in_installer_owned_state_tree() {
+        assert_eq!(DIRECTORY, "/var/lib/duduclaw-spawnd/audit");
+    }
 
     /// The server only calls try_send. Disk, lock and fsync latency never delay
     /// its two-second intrusion scan; dropping this handle never joins a worker.
@@ -279,9 +378,10 @@ pub mod disk {
                 let _ = log.sweep(now_ms());
                 loop {
                     match receiver.recv_timeout(Duration::from_secs(60)) {
-                        Ok((source, mut record)) => {
+                        Ok((source, mut record, acknowledge)) => {
                             record.suppressed = record.suppressed.saturating_add(dropped.swap(0, Ordering::Relaxed));
-                            let _ = log.write(source, record);
+                            let written = log.write(source, record, acknowledge.is_some());
+                            if let Some(acknowledge) = acknowledge { let _ = acknowledge.try_send(acknowledgement(&written)); }
                         }
                         Err(RecvTimeoutError::Timeout) => { let _ = log.sweep(now_ms()); }
                         Err(RecvTimeoutError::Disconnected) => {
@@ -296,12 +396,22 @@ pub mod disk {
         /// False means a full/disconnected queue. The next admitted event reports
         /// the dropped count; callers must not retry synchronously or block.
         pub fn emit(&self, source: u8, record: Record) -> bool { self.queue.emit(source, record) }
+        /// For the few security-relevant records whose loss must be visible (R6
+        /// start-up records, the inconsistent-set exit): waits at most `timeout`
+        /// until the worker reports the record written and synced. `false`:
+        /// dropped (full queue), failed to write, or no report in time. Also
+        /// flushes: everything queued earlier was handled first. Never call it
+        /// from the admission loop.
+        pub fn emit_acknowledged(&self, source: u8, record: Record, timeout: Duration) -> bool {
+            self.queue.emit_acknowledged(source, record, timeout)
+        }
     }
 
     fn now_ms() -> u64 {
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis().min(u64::MAX as u128) as u64
     }
     fn checked_directory() -> io::Result<&'static Path> {
+        // The installer creates this directory; a missing directory must refuse.
         let directory = Path::new(DIRECTORY);
         root_path(directory, true)?;
         if fs::metadata(directory)?.mode() & 0o077 != 0 { return Err(io::ErrorKind::PermissionDenied.into()); }
@@ -312,10 +422,12 @@ pub mod disk {
     impl Default for AuditLog { fn default() -> Self { Self { budget: AuditBudget::new(60), pending_suppressed: 0 } } }
     impl AuditLog {
         /// Called only by the dedicated worker. No free-form diagnostics or
-        /// secret-bearing values can enter this schema.
-        pub fn write(&mut self, source: u8, mut record: Record) -> io::Result<()> {
+        /// secret-bearing values can enter this schema. `Ok(true)`: written and
+        /// synced; `Ok(false)`: suppressed by the rate limit, NOT written (never
+        /// for an `acknowledged` record, which bypasses the limit).
+        pub fn write(&mut self, source: u8, mut record: Record, acknowledged: bool) -> io::Result<bool> {
             self.pending_suppressed = self.pending_suppressed.saturating_add(record.suppressed);
-            let Some(suppressed) = self.budget.admit(source, record.at_unix_ms) else { return Ok(()); };
+            let Some(suppressed) = admit_record(&mut self.budget, source, record.at_unix_ms, acknowledged) else { return Ok(false); };
             self.pending_suppressed = self.pending_suppressed.saturating_add(suppressed);
             record.suppressed = self.pending_suppressed;
             let mut bytes = serde_json::to_vec(&record).map_err(io::Error::other)?;
@@ -339,7 +451,7 @@ pub mod disk {
                 File::open(directory)?.sync_all()
             });
             if result.is_ok() { self.pending_suppressed = 0; }
-            result
+            result.map(|()| true)
         }
         /// Runs also on recv_timeout, so an idle daemon expires its oldest logs.
         pub fn sweep(&mut self, now: u64) -> io::Result<()> {
@@ -461,6 +573,52 @@ mod tests {
         assert_eq!(queue.dropped.load(std::sync::atomic::Ordering::Relaxed), 1);
         drop(receiver);
         assert!(!queue.emit(1, record()));
+    }
+    #[test]
+    fn acknowledged_audit_reports_the_write_result_and_is_bounded() {
+        use std::time::{Duration, Instant};
+        fn record() -> Record {
+            Record { at_unix_ms: 0, event: Event::PublicationRecovery, employee: None, run: None, suppressed: 0, detail: None }
+        }
+        // The worker's result reaches the caller: written, then a failed write.
+        let (queue, receiver) = audit_channel();
+        let worker = std::thread::spawn(move || {
+            for (index, (_, _, acknowledge)) in receiver.iter().enumerate() {
+                if let Some(acknowledge) = acknowledge { let _ = acknowledge.try_send(index == 0); }
+            }
+        });
+        assert!(queue.emit_acknowledged(2, record(), Duration::from_secs(5)));
+        assert!(!queue.emit_acknowledged(2, record(), Duration::from_secs(5)));
+        drop(queue);
+        worker.join().unwrap();
+        // No worker answers: `false` after the bound, never an indefinite wait.
+        let (queue, receiver) = audit_channel();
+        let started = Instant::now();
+        assert!(!queue.emit_acknowledged(2, record(), Duration::from_millis(50)));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // A full queue: `false` at once and counted as dropped.
+        for _ in 1..QUEUE_LENGTH { assert!(queue.emit(2, record())); }
+        let started = Instant::now();
+        assert!(!queue.emit_acknowledged(2, record(), Duration::from_secs(30)));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(queue.dropped.load(std::sync::atomic::Ordering::Relaxed), 1);
+        drop(receiver);
+    }
+    #[test]
+    fn acknowledged_record_bypasses_an_exhausted_rate_limit() {
+        // The worker's default budget (60/min/source), exhausted on source 2.
+        let mut budget = AuditBudget::new(60);
+        for at in 0..60 { assert_eq!(admit_record(&mut budget, 2, at, false), Some(0)); }
+        assert_eq!(admit_record(&mut budget, 2, 61, false), None);
+        // An acknowledged record is still written, and not counted against the window.
+        for at in 62..70 { assert_eq!(admit_record(&mut budget, 2, at, true), Some(0)); }
+        assert_eq!(admit_record(&mut budget, 2, 70, false), None);
+        // The next window reports only the records the limit actually suppressed.
+        assert_eq!(admit_record(&mut budget, 2, 60_000, false), Some(2));
+        // A suppressed or failed write is never acknowledged as written.
+        assert!(acknowledgement(&Ok(true)));
+        assert!(!acknowledgement(&Ok(false)));
+        assert!(!acknowledgement(&Err(std::io::ErrorKind::PermissionDenied.into())));
     }
     #[test]
     fn bounded_output_and_event_rate() {
@@ -597,7 +755,7 @@ mod tests {
         assert_eq!(queue.dropped.load(std::sync::atomic::Ordering::Relaxed), 1);
         // The worker's admission (the default `AuditLog` budget: 60/min/source).
         let mut budget = AuditBudget::new(60);
-        let admitted = receiver.try_iter().filter(|(source, record)| {
+        let admitted = receiver.try_iter().filter(|(source, record, _)| {
             assert_eq!(*source, 0);
             budget.admit(*source, record.at_unix_ms).is_some()
         }).count();

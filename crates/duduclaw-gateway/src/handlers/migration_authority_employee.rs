@@ -1,15 +1,132 @@
 //! Confirmed allocation for a freshly configured employee. Imported settings
 //! alone never create an enabled product employee or bypass normal product writes.
 use super::*;
-use duduclaw_migration::allocation::{self, Action, Receipt, Request};
+use duduclaw_migration::allocation::{self, Action, Answer, Entitlement, ErrorCode as Code, Receipt, Request, Response};
+use duduclaw_migration::confirmation::EffectGate;
 use duduclaw_migration::ids::RequestId;
+use crate::isolation_entitlement::{Desired, DesiredError};
 use duduclaw_isolation::capability::EmployeeBinding;
 use crate::isolation_lifecycle::{self as lifecycle, LifecycleError};
 use std::sync::Arc;
 
-pub(crate) struct EmployeeAuthority { home:PathBuf, live:Arc<LiveAuthority>, agent_cap:usize, step_up_verified_at:Option<u64> }
+/// The root end of the schema-3 `Allocate` (R7d): the raw reply, which
+/// [`allocate_with`] checks. Tests inject a fake.
+pub(crate) trait AllocationRoot: Send + Sync {
+    fn round_trip(&self, request:&Request)->std::result::Result<Response,()>;
+}
+/// Production: spawnd's allocation socket.
+pub(crate) struct SpawndAllocationRoot;
+impl AllocationRoot for SpawndAllocationRoot {
+    fn round_trip(&self, request:&Request)->std::result::Result<Response,()> {
+        #[cfg(target_os="linux")]{ allocation::transport::round_trip(request).map_err(|_|()) }
+        #[cfg(not(target_os="linux"))]{ let _=request; Err(()) }
+    }
+}
+/// R7d: one `Allocate` (schema 3) of `item`. Ready (a receipt checked by
+/// `check_response`): the receipt. `Pending`: the root keeps the reservation
+/// resumable, so the SAME request must be sent again later: `Err(Pending)`,
+/// which never compensates and is waited for (bounded). `PendingLimit`
+/// (nothing reserved): `Err(PendingLimit)`, the same retry-safe outcome but
+/// never waited for in process. `NotReady` (round 1): spawnd answers it to a
+/// schema-3 `Allocate` only before any journal entry or registry row is
+/// created or changed — start-up reconciliation not latched
+/// (`spawnd::host::Core::allocation`) or a run live on the host
+/// (`spawnd::allocation::Allocator::handle`, the host gate) — and it clears
+/// within seconds: `Err(Pending)`, waited for like `pending`. Everything else
+/// — an older-schema or garbled reply, an unknown kind, a transport failure,
+/// any other refusal (a tombstoned employee's included) — is the existing
+/// hard failure. Only the stage step calls this; `NotReady` from
+/// ReadBack/Disable/Retire (`exchange`, schema 1) keeps its meaning.
+pub(crate) fn allocate_with(root:&dyn AllocationRoot,item:&ConfirmationItem)->Result<Receipt> {
+    let request=Request{schema:allocation::SCHEMA_V3,nonce:RequestId(*uuid::Uuid::new_v4().as_bytes()),action:Action::Allocate,item:item.clone(),approver:None,
+        entitlement:None};
+    let response=root.round_trip(&request).map_err(|_|Error::Apply)?;
+    match allocation::check_response(&request,response).map_err(|_|Error::Apply)? {
+        Answer::Reply(reply)=>Ok(reply.receipt),
+        Answer::Refused(Code::Pending|Code::NotReady)=>Err(Error::Pending),
+        Answer::Refused(Code::PendingLimit)=>Err(Error::PendingLimit),
+        Answer::Refused(_)=>Err(Error::Apply),
+    }
+}
+
+/// R8d D2: one `Entitle` (schema 4) of `item`'s Ready employee with
+/// `desired`, started only inside a permit of `gate` (closed ⇒ nothing is
+/// sent: `Err(Pending)`, the step stays resumable). Success requires root's
+/// answer to equal `desired` exactly. A transient root answer
+/// (`isolation_unavailable` / `not_ready`, e.g. a publication not rolled over
+/// yet) or a transport failure is `Err(Pending)`: the allocation already
+/// exists, so a retry repeats Allocate (replayed) and Entitle (idempotent)
+/// rather than compensating. Every other refusal or a mismatch is a failure.
+pub(crate) fn entitle_with(root:&dyn AllocationRoot,gate:&dyn EffectGate,item:&ConfirmationItem,desired:&Entitlement)->Result<()> {
+    let Some(_running)=gate.enter() else { return Err(Error::Pending); };
+    let request=Request{schema:allocation::SCHEMA_V4,nonce:RequestId(*uuid::Uuid::new_v4().as_bytes()),action:Action::Entitle,item:item.clone(),
+        approver:None,entitlement:Some(desired.clone())};
+    let response=root.round_trip(&request).map_err(|_|Error::Pending)?;
+    match allocation::check_response(&request,response).map_err(|_|Error::Apply)? {
+        Answer::Reply(reply) if reply.entitlement.as_ref()==Some(desired)=>Ok(()),
+        Answer::Reply(_)=>Err(Error::Apply),
+        Answer::Refused(Code::IsolationUnavailable|Code::NotReady)=>Err(Error::Pending),
+        Answer::Refused(_)=>Err(Error::Apply),
+    }
+}
+
+/// R8d D1: the entitlement an approved settings document needs, against the
+/// fresh signed runtimes. Tests inject a fake.
+pub(crate) trait EntitlementPlanner: Send + Sync {
+    fn desired(&self,settings:&serde_json::Value)->std::result::Result<Desired,DesiredError>;
+}
+/// Production: the gateway projection spawnd republishes every second.
+pub(crate) struct InstalledPlanner;
+impl EntitlementPlanner for InstalledPlanner {
+    fn desired(&self,settings:&serde_json::Value)->std::result::Result<Desired,DesiredError> {
+        #[cfg(target_os="linux")]{
+            let publication=duduclaw_spawnd::installed::GatewayPublication::read(nix::unistd::getegid().as_raw())
+                .map_err(|_|DesiredError::Unavailable)?;
+            let runtimes:Vec<_>=publication.runtimes.iter().map(duduclaw_spawnd::installed::RuntimeRecord::to_runtime).collect();
+            crate::isolation_entitlement::desired(&runtimes,settings)
+        }
+        #[cfg(not(target_os="linux"))]{ let _=settings; Err(DesiredError::Unavailable) }
+    }
+}
+/// R8d D1: the desired entitlement of `item`'s APPROVED settings. A primary
+/// runtime without a signed profile fails the item (`Denied`, logged with the
+/// stable code `runtime_not_available_in_isolation`) before anything is
+/// allocated; an unreadable projection is retry-safe (`Pending`).
+pub(crate) fn planned(planner:&dyn EntitlementPlanner,item:&ConfirmationItem)->Result<Desired> {
+    let settings:serde_json::Value=serde_json::from_str(text(item,"settings")?).map_err(|_|Error::Invalid)?;
+    let label=allocation::specification(item).map(|spec|spec.label).unwrap_or_default();
+    match planner.desired(&settings) {
+        Ok(desired)=>{
+            if !desired.skipped_fallbacks.is_empty() {
+                tracing::warn!(label=%label,skipped=?desired.skipped_fallbacks,
+                    "fallback runtime has no signed isolation profile; skipped (not fatal), the employee runs its primary runtime only");
+            }
+            Ok(desired)
+        }
+        Err(DesiredError::RuntimeNotInIsolation{runtime})=>{
+            tracing::error!(label=%label,runtime=%runtime,code=crate::isolation_entitlement::RUNTIME_NOT_IN_ISOLATION,
+                "the employee's runtime is not available in isolation mode (no signed profile); item failed before any account was created \
+                 (fallback runtimes without a signed profile are skipped, not fatal)");
+            Err(Error::Denied)
+        }
+        Err(DesiredError::Unavailable)=>Err(Error::Pending),
+    }
+}
+/// R8d D1–D2, the stage's root effects: the desired set first (no account
+/// for an unavailable runtime), then Allocate, then Entitle of the Ready
+/// employee. A crash anywhere repeats both idempotently on resume.
+pub(crate) fn allocate_entitled(root:&dyn AllocationRoot,planner:&dyn EntitlementPlanner,gate:&dyn EffectGate,item:&ConfirmationItem)->Result<Receipt> {
+    let desired=planned(planner,item)?;
+    let receipt=allocate_with(root,item)?;
+    entitle_with(root,gate,item,&desired.entitlement)?;
+    Ok(receipt)
+}
+
+pub(crate) struct EmployeeAuthority { home:PathBuf, live:Arc<LiveAuthority>, agent_cap:usize, step_up_verified_at:Option<u64>, root:Arc<dyn AllocationRoot>,
+    planner:Arc<dyn EntitlementPlanner> }
 impl EmployeeAuthority {
-    pub(crate) fn new(home:PathBuf,live:Arc<LiveAuthority>)->Self{Self{home,live,agent_cap:0,step_up_verified_at:None}}
+    pub(crate) fn new(home:PathBuf,live:Arc<LiveAuthority>)->Self{Self{home,live,agent_cap:0,step_up_verified_at:None,root:Arc::new(SpawndAllocationRoot),
+        planner:Arc::new(InstalledPlanner)}}
     /// F6fb item 8: the licence agent cap (`MethodHandler::effective_agent_cap`,
     /// 0 = unlimited) that an adoption's approval and apply enforce.
     pub(crate) fn with_agent_cap(mut self,agent_cap:usize)->Self{self.agent_cap=agent_cap;self}
@@ -161,7 +278,8 @@ fn lifecycle_error(e:LifecycleError)->Error {
 }
 fn exchange(item:&ConfirmationItem,action:Action)->Result<Receipt>{
     #[cfg(target_os="linux")]{
-        allocation::transport::request(&Request{schema:1,nonce:RequestId(*uuid::Uuid::new_v4().as_bytes()),action,item:item.clone(),approver:None}).map_err(|_|Error::Apply)
+        allocation::transport::request(&Request{schema:1,nonce:RequestId(*uuid::Uuid::new_v4().as_bytes()),action,item:item.clone(),approver:None,
+            entitlement:None}).map_err(|_|Error::Apply)
     }
     #[cfg(not(target_os="linux"))]{let _=(item,action);Err(Error::Denied)}
 }
@@ -170,7 +288,11 @@ impl MigrationAuthorityBackend for EmployeeAuthority {
     fn validate(&self,item:&ConfirmationItem)->Result<()>{if !self.supports(item.category){return Err(Error::Denied)}self.validate_current(item)}
     fn stage(&self,item:&ConfirmationItem)->Result<()>{
         self.validate(item)?;
-        let receipt=self.exchange(item,Action::Allocate)?;
+        // R7d: `Err(Pending)` leaves the step resumable (GatewayAuthority
+        // re-runs this stage; the root resumes the same reservation).
+        // R8d: the desired entitlement before any account, Entitle after the
+        // Ready receipt and before anything is saved.
+        let receipt=allocate_entitled(self.root.as_ref(),self.planner.as_ref(),super::shutdown_gate(),item)?;
         if crate::isolation_adopt::proposal_ref(item).map_err(|_|Error::Invalid)?.is_some() {
             // F6g §3.10 steps 4–5: transform, re-key, marker, confirmed row, commit.
             let approver=self.approver(item)?;

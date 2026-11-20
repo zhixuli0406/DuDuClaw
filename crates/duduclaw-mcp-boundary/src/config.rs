@@ -3,6 +3,7 @@ use std::path::{Component, Path, PathBuf};
 use duduclaw_isolation::{execution::{RunHandle, RuntimeKind}, ids::{EmployeeId, Sha256Digest}};
 use sha2::{Digest, Sha256};
 use crate::VerificationError;
+pub use crate::launch_steps::{AcceptanceCheck, BridgeStep, PublishStep, ReceiptCheck, RegistrationStep};
 
 pub const MCP_FD: i32 = 3;
 
@@ -23,6 +24,12 @@ pub fn projected_tool_timeout_ms(runtime: &RuntimeKind) -> Option<u64> {
         RuntimeKind::Claude | RuntimeKind::Codex | RuntimeKind::Grok => Some(CLI_TOOL_TIMEOUT_MS),
         RuntimeKind::OpenAiCompat | RuntimeKind::Registered(_) => None,
     }
+}
+
+/// Fixed MCP suffix of every Claude runtime record. In a policy v3 ranged
+/// record spawnd inserts `--max-turns <effective>` immediately before it.
+pub fn claude_mcp_arguments() -> Vec<String> {
+    ["--strict-mcp-config", "--mcp-config", "/config/mcp.json"].into_iter().map(str::to_owned).collect()
 }
 
 pub fn api_worker_arguments() -> Vec<String> {
@@ -173,6 +180,20 @@ pub trait RuntimeBridgeRegistry: Send + Sync {
     fn registration(&self, runtime: &RuntimeKind) -> Result<RuntimeRegistration, VerificationError>;
     fn publish_for_run(&self, run: RunHandle, employee: EmployeeId,
         projection: &RuntimeProjection) -> Result<ProjectionReceipt, VerificationError>;
+    /// R8z-3: [`Self::registration`] with the fixed check that refused. An
+    /// override must return exactly the error `registration` returns (same
+    /// value, same reads); this default reports no finer step.
+    fn registration_checked(&self, runtime: &RuntimeKind)
+        -> Result<RuntimeRegistration, (RegistrationStep, VerificationError)> {
+        self.registration(runtime).map_err(|error| (RegistrationStep::Unreported, error))
+    }
+    /// R8z-3: [`Self::publish_for_run`] with the fixed check that refused
+    /// (same contract as [`Self::registration_checked`]).
+    fn publish_for_run_checked(&self, run: RunHandle, employee: EmployeeId, projection: &RuntimeProjection)
+        -> Result<ProjectionReceipt, (PublishStep, VerificationError)> {
+        self.publish_for_run(run, employee, projection)
+            .map_err(|error| (PublishStep::Registration(RegistrationStep::Unreported), error))
+    }
 }
 
 /// Prepared value has no public constructor: only a fully matched post-start
@@ -185,16 +206,31 @@ impl PreparedRuntimeBridge {
 
 pub fn prepare_runtime_bridge(registry: &dyn RuntimeBridgeRegistry, runtime: &RuntimeKind,
     run: RunHandle, employee: EmployeeId) -> Result<PreparedRuntimeBridge, VerificationError> {
-    if !cfg!(target_os = "linux") { return Err(VerificationError::Unavailable); }
-    prepare(registry, runtime, run, employee)
+    prepare_runtime_bridge_checked(registry, runtime, run, employee).map_err(|(_, error)| error)
 }
 
+/// R8z-3: [`prepare_runtime_bridge`] with the fixed check that refused (the
+/// error, its order and every registry read are unchanged).
+pub fn prepare_runtime_bridge_checked(registry: &dyn RuntimeBridgeRegistry, runtime: &RuntimeKind,
+    run: RunHandle, employee: EmployeeId) -> Result<PreparedRuntimeBridge, (BridgeStep, VerificationError)> {
+    if !cfg!(target_os = "linux") { return Err((BridgeStep::Platform, VerificationError::Unavailable)); }
+    prepare_checked(registry, runtime, run, employee)
+}
+
+#[cfg(test)]
 fn prepare(registry: &dyn RuntimeBridgeRegistry, runtime: &RuntimeKind,
     run: RunHandle, employee: EmployeeId) -> Result<PreparedRuntimeBridge, VerificationError> {
-    let registration = registry.registration(runtime)?;
-    if &registration.runtime != runtime { return Err(VerificationError::BindingMismatch); }
-    let projection = runtime_projection(registration)?;
-    let receipt = registry.publish_for_run(run, employee, &projection)?;
+    prepare_checked(registry, runtime, run, employee).map_err(|(_, error)| error)
+}
+
+fn prepare_checked(registry: &dyn RuntimeBridgeRegistry, runtime: &RuntimeKind,
+    run: RunHandle, employee: EmployeeId) -> Result<PreparedRuntimeBridge, (BridgeStep, VerificationError)> {
+    let registration = registry.registration_checked(runtime)
+        .map_err(|(step, error)| (BridgeStep::Registry(step), error))?;
+    if &registration.runtime != runtime { return Err((BridgeStep::RegistrationRuntime, VerificationError::BindingMismatch)); }
+    let projection = runtime_projection(registration).map_err(|error| (BridgeStep::Projection, error))?;
+    let receipt = registry.publish_for_run_checked(run, employee, &projection)
+        .map_err(|(step, error)| (BridgeStep::Publish(step), error))?;
     let inheritance = &receipt.inheritance;
     if receipt.run != run || receipt.employee != employee
         || receipt.projection_digest != projection.digest()
@@ -204,7 +240,7 @@ fn prepare(registry: &dyn RuntimeBridgeRegistry, runtime: &RuntimeKind,
         || inheritance.inherited_fd != MCP_FD || !inheritance.initializes_mcp
         || !inheritance.survives_parent_exec || !inheritance.survives_mcp_child_exec
         || !inheritance.config_is_exclusive {
-        return Err(VerificationError::BindingMismatch);
+        return Err((BridgeStep::ReceiptBinding, VerificationError::BindingMismatch));
     }
     Ok(PreparedRuntimeBridge { projection, receipt })
 }
@@ -231,8 +267,7 @@ pub fn runtime_projection(registration: RuntimeRegistration) -> Result<RuntimePr
             destination: ConfigDestination::RunConfig, relative_target: "mcp.json",
             contents: serde_json::json!({"mcpServers": {"duduclaw": {"command": server["command"],
                 "args": server["args"], "timeout": tool_timeout_ms}}}).to_string(),
-        }], vec!["--strict-mcp-config".into(), "--mcp-config".into(),
-            "/config/mcp.json".into()]),
+        }], claude_mcp_arguments()),
         // Codex default is 60 s (`tool_timeout_sec`).
         RuntimeKind::Codex => (vec![ProjectionFile {
             destination: ConfigDestination::RuntimeHome, relative_target: ".codex/config.toml",

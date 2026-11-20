@@ -1,10 +1,15 @@
 //! Concrete A/D run lifecycle. Construction is restricted to host-owned plans;
 //! no argv/environment from the native command builder is elevated into policy.
-use std::{collections::BTreeMap, os::{fd::OwnedFd, unix::net::UnixStream}, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}};
+use std::{collections::BTreeMap, os::{fd::OwnedFd, unix::net::UnixStream}, sync::{Arc, Mutex, OnceLock, atomic::{AtomicBool, Ordering}}};
 use duduclaw_execution::{command::{NativeCommandSnapshot, ProtectedLaunch}, SpawndBackend};
 use duduclaw_isolation::{bounded::Text, capability::CapabilityId, execution::*, ids::{EmployeeId, RunId}};
-use crate::{Boundary, GrantPolicy, Reservation, config::{prepare_runtime_bridge, runtime_projection, RuntimeBridgeRegistry},
+use crate::{Boundary, GrantPolicy, Reservation, VerificationError, config::{prepare_runtime_bridge_checked, runtime_projection, RuntimeBridgeRegistry},
     server::Dispatcher, socket::McpDelivery};
+pub use crate::launch_steps::{ActivateStep, PrepareStep, SessionStep};
+
+/// R8z-5: called once, with its fixed step, when a run's MCP session ends
+/// abnormally before the run is released (see [`ProtectedMcpLaunch::observe_sessions`]).
+pub type SessionObserver = Arc<dyn Fn(SessionStep) + Send + Sync>;
 
 struct Pending {
     reservation: Reservation,
@@ -19,7 +24,27 @@ impl Drop for Pending {
         if self.armed { let _ = self.boundary.revoke_run(self.reservation.run); }
     }
 }
-struct Active { task: tokio::task::JoinHandle<Result<(), crate::VerificationError>> }
+struct Active {
+    task: tokio::task::JoinHandle<Result<(), crate::VerificationError>>,
+    /// R8z-5: set before the run's release revokes it; the session's end is
+    /// then the release, not an abnormal end.
+    released: Arc<AtomicBool>,
+}
+
+/// R8z-5: the serve task's body. `serve` is awaited unchanged and its
+/// result returned as before; when it ended abnormally (an `Err`, or an
+/// abnormal close) and the run was not released meanwhile, the observer is
+/// called exactly once with the step. A normal end, or a release (which also
+/// aborts this task), calls nothing.
+async fn observed_session(session: impl std::future::Future<Output = crate::server::SessionOutcome>,
+    released: Arc<AtomicBool>, observer: Option<SessionObserver>) -> Result<(), VerificationError> {
+    let outcome = session.await;
+    let step = match &outcome { Ok(step) => *step, Err((step, _)) => Some(*step) };
+    if let (Some(step), Some(observer)) = (step, observer) {
+        if !released.load(Ordering::Acquire) { observer(step); }
+    }
+    outcome.map(|_| ()).map_err(|(_, error)| error)
+}
 
 /// One host-authorized invocation, including its bounded input streams. The
 /// `plan.run` placeholder is replaced only with A's authenticated reservation.
@@ -39,8 +64,23 @@ pub struct ProtectedMcpLaunch {
     revoked: AtomicBool,
     pending: Mutex<BTreeMap<RunId, Pending>>,
     active: Mutex<BTreeMap<RunId, Active>>,
+    sessions: OnceLock<SessionObserver>,
 }
 impl ProtectedMcpLaunch {
+    /// R8z-5: install the observer of this launch's MCP session ends (once;
+    /// `false` if one is already installed). Sessions activated before it is
+    /// installed are not observed. Nothing in this crate logs.
+    pub fn observe_sessions(&self, observer: SessionObserver) -> bool { self.sessions.set(observer).is_ok() }
+
+    /// R8z-5: the run is being released. A session end from here on (the
+    /// release's own revocation, a live check failing because the owner
+    /// dropped the run's authority first) is not reported. Idempotent; does
+    /// not revoke anything itself.
+    pub fn mark_released(&self, run: RunHandle) {
+        let active = self.active.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(session) = active.get(&run.0) { session.released.store(true, Ordering::Release); }
+    }
+
     /// The gateway supplies policy and grants from its live authenticated
     /// principal/binding/approval stores. Neither value may come from MCP data,
     /// process environment, or runtime-generated command arguments.
@@ -56,7 +96,109 @@ impl ProtectedMcpLaunch {
         }
         Ok(Arc::new(Self { employee: plan.employee, task: grant.task.clone(), backend,
             boundary, registry, dispatcher, origin, caller, prepared: Mutex::new(Some((plan, grant))), revoked: AtomicBool::new(false),
-            pending: Mutex::new(BTreeMap::new()), active: Mutex::new(BTreeMap::new()) }))
+            pending: Mutex::new(BTreeMap::new()), active: Mutex::new(BTreeMap::new()), sessions: OnceLock::new() }))
+    }
+
+    /// R8z-3: [`ProtectedLaunch::prepare`] with the fixed check that refused.
+    /// Every check, its order, its side effects (the one-shot plan is taken,
+    /// a dropped pending guard revokes) and the returned `BackendError` are
+    /// exactly `prepare`'s; `prepare` is this with the step dropped. The
+    /// blocking job returns its step as a value (`Ok(Err(step))`); an `Err`
+    /// is only ever the blocking-pool wrapper's. Nothing here logs.
+    pub async fn prepare_checked(&self, run: RunHandle, class: ExecutionClass, runtime: RuntimeKind, pty: bool)
+        -> Result<SpawnPolicy, (PrepareStep, BackendError)> {
+        use PrepareStep as S;
+        let denied = |step: PrepareStep| (step, BackendError::Denied);
+        if self.revoked.load(Ordering::Acquire) { return Err(denied(S::Revoked)); }
+        let metadata = self.backend.reservation(run).await.map_err(|error| (S::Reservation(error), error))?;
+        if metadata.employee != self.employee { return Err(denied(S::EmployeeMismatch)); }
+        let (mut plan, grant) = self.prepared.lock().map_err(|_| (S::StateLock, BackendError::Unavailable))?
+            .take().ok_or(denied(S::PreparedMissing))?;
+        if plan.class != class { return Err(denied(S::PlanClass)); }
+        if plan.runtime != runtime { return Err(denied(S::PlanRuntime)); }
+        if plan.pty != pty { return Err(denied(S::PlanPty)); }
+        let registry = self.registry.clone();
+        let boundary = self.boundary.clone();
+        let bound = crate::authority::verify_blocking(move || Ok((|| -> Result<(SpawnPolicy, Pending), PrepareStep> {
+            // Root publication and current gateway authority may perform
+            // blocking I/O. Never hold an async launch/map lock here.
+            let registration = registry.registration_checked(&runtime).map_err(|(step, _)| S::Registry(step))?;
+            if registration.runtime != runtime { return Err(S::RegistrationRuntime); }
+            let bridge = runtime_projection(registration).map_err(|_| S::Projection)?;
+            // Only fixed D-owned arguments from the verified projection may
+            // be added. StartRun carries no native argv or environment.
+            for argument in &bridge.arguments {
+                plan.argv_allowlist.push(Text::new(argument.clone()).map_err(|_| S::Argv)?);
+            }
+            plan.run = run;
+            let reservation = Reservation { run, employee: metadata.employee,
+                control: metadata.control, expires_at_unix_ms: metadata.expires_at_unix_ms };
+            let now = crate::authority::now_seconds().map_err(|_| S::Clock)?;
+            let capability = boundary.issue_checked(&reservation, grant, now).map_err(|(step, _)| S::Issue(step))?;
+            // Retain ownership across detached blocking completion and the
+            // async handoff. Dropping either future/result revokes the run.
+            let guard = Pending { reservation, capability, runtime, projection_digest: bridge.digest(),
+                boundary, armed: true };
+            Ok((plan, guard))
+        })())).await;
+        let (plan, guard) = match bound {
+            Ok(Ok(value)) => value,
+            Ok(Err(step)) => return Err(denied(step)),
+            Err(_) => return Err(denied(S::VerifyBlocking)),
+        };
+        let mut pending = self.pending.lock().map_err(|_| (S::StateLock, BackendError::Unavailable))?;
+        if self.revoked.load(Ordering::Acquire) { return Err(denied(S::RevokedAfter)); }
+        if pending.contains_key(&run.0) { return Err(denied(S::PendingDuplicate)); }
+        pending.insert(run.0, guard);
+        Ok(plan)
+    }
+
+    /// R8z-3: [`ProtectedLaunch::activate`] with the fixed check that refused
+    /// (same contract as [`Self::prepare_checked`]). A refusal after the
+    /// pending capability was taken drops its armed guard, which revokes it.
+    pub async fn activate_checked(&self, run: RunHandle, mcp: Option<OwnedFd>) -> Result<(), (ActivateStep, BackendError)> {
+        use ActivateStep as S;
+        let denied = |step: ActivateStep| (step, BackendError::Denied);
+        let fd = mcp.ok_or(denied(S::McpFdMissing))?;
+        let receipt = self.backend.mcp_receipt(run).await.map_err(|error| (S::McpReceipt(error), error))?;
+        let pending = self.pending.lock().map_err(|_| (S::StateLock, BackendError::Unavailable))?
+            .remove(&run.0).ok_or(denied(S::PendingMissing))?;
+        let registry = self.registry.clone();
+        let boundary = self.boundary.clone();
+        let employee = self.employee;
+        let bound = crate::authority::verify_blocking(move || Ok((|| -> Result<(crate::Connection, Pending), ActivateStep> {
+            if receipt.control != pending.reservation.control { return Err(S::ReceiptControl); }
+            let bridge = prepare_runtime_bridge_checked(registry.as_ref(), &pending.runtime, run, employee)
+                .map_err(|(step, _)| S::Bridge(step))?;
+            if bridge.projection().digest() != pending.projection_digest { return Err(S::ProjectionDigest); }
+            let delivery = McpDelivery::from_take_io(&receipt.response, receipt.control, UnixStream::from(fd))
+                .map_err(|_| S::Delivery)?;
+            let now = crate::authority::now_seconds().map_err(|_| S::Clock)?;
+            let connection = boundary.activate_checked(pending.capability, &pending.reservation, delivery, now)
+                .map_err(|(step, _)| S::BoundaryActivate(step))?;
+            Ok((connection, pending))
+        })())).await;
+        let (connection, mut guard) = match bound {
+            Ok(Ok(value)) => value,
+            Ok(Err(step)) => return Err(denied(step)),
+            Err(_) => return Err(denied(S::VerifyBlocking)),
+        };
+        let mut active = self.active.lock().map_err(|_| (S::StateLock, BackendError::Unavailable))?;
+        if self.revoked.load(Ordering::Acquire) { return Err(denied(S::RevokedAfter)); }
+        if active.contains_key(&run.0) { return Err(denied(S::ActiveDuplicate)); }
+        let dispatcher = self.dispatcher.clone();
+        let released = Arc::new(AtomicBool::new(false));
+        let (ended, observer) = (released.clone(), self.sessions.get().cloned());
+        // R8z-5: `serve` itself is unchanged (`serve` = `serve_checked`
+        // without the step); the wrapper only reports how it ended.
+        let task = tokio::spawn(async move {
+            observed_session(crate::server::serve_checked(connection, dispatcher.as_ref()), ended, observer).await
+        });
+        active.insert(run.0, Active { task, released });
+        // The active connection/task now owns revocation. Until this exact
+        // point every failure/cancellation drops the still-armed guard.
+        guard.armed = false;
+        Ok(())
     }
 }
 impl ProtectedLaunch for ProtectedMcpLaunch {
@@ -66,76 +208,16 @@ impl ProtectedLaunch for ProtectedMcpLaunch {
     fn caller_employee(&self) -> Option<EmployeeId> { self.caller }
     fn prepare<'a>(&'a self, run: RunHandle, class: ExecutionClass, runtime: RuntimeKind,
         _native: &'a NativeCommandSnapshot, pty: bool) -> BackendFuture<'a, SpawnPolicy> {
-        Box::pin(async move {
-            if self.revoked.load(Ordering::Acquire) { return Err(BackendError::Denied); }
-            let metadata = self.backend.reservation(run).await?;
-            if metadata.employee != self.employee { return Err(BackendError::Denied); }
-            let (mut plan, grant) = self.prepared.lock().map_err(|_| BackendError::Unavailable)?
-                .take().ok_or(BackendError::Denied)?;
-            if plan.class != class || plan.runtime != runtime || plan.pty != pty {
-                return Err(BackendError::Denied);
-            }
-            let registry = self.registry.clone();
-            let boundary = self.boundary.clone();
-            let (plan, guard) = crate::authority::verify_blocking(move || {
-                // Root publication and current gateway authority may perform
-                // blocking I/O. Never hold an async launch/map lock here.
-                let registration = registry.registration(&runtime)?;
-                if registration.runtime != runtime { return Err(crate::VerificationError::BindingMismatch); }
-                let bridge = runtime_projection(registration)?;
-                // Only fixed D-owned arguments from the verified projection may
-                // be added. StartRun carries no native argv or environment.
-                for argument in &bridge.arguments {
-                    plan.argv_allowlist.push(Text::new(argument.clone()).map_err(|_| crate::VerificationError::Invalid)?);
-                }
-                plan.run = run;
-                let reservation = Reservation { run, employee: metadata.employee,
-                    control: metadata.control, expires_at_unix_ms: metadata.expires_at_unix_ms };
-                let capability = boundary.issue(&reservation, grant, crate::authority::now_seconds()?)?;
-                // Retain ownership across detached blocking completion and the
-                // async handoff. Dropping either future/result revokes the run.
-                let guard = Pending { reservation, capability, runtime, projection_digest: bridge.digest(),
-                    boundary, armed: true };
-                Ok((plan, guard))
-            }).await.map_err(|_| BackendError::Denied)?;
-            let mut pending = self.pending.lock().map_err(|_| BackendError::Unavailable)?;
-            if self.revoked.load(Ordering::Acquire) || pending.contains_key(&run.0) { return Err(BackendError::Denied); }
-            pending.insert(run.0, guard);
-            Ok(plan)
-        })
+        Box::pin(async move { self.prepare_checked(run, class, runtime, pty).await.map_err(|(_, error)| error) })
     }
     fn activate(&self, run: RunHandle, mcp: Option<OwnedFd>) -> BackendFuture<'_, ()> {
-        Box::pin(async move {
-            let fd = mcp.ok_or(BackendError::Denied)?;
-            let receipt = self.backend.mcp_receipt(run).await?;
-            let pending = self.pending.lock().map_err(|_| BackendError::Unavailable)?
-                .remove(&run.0).ok_or(BackendError::Denied)?;
-            let registry = self.registry.clone();
-            let boundary = self.boundary.clone();
-            let employee = self.employee;
-            let (connection, mut guard) = crate::authority::verify_blocking(move || {
-                if receipt.control != pending.reservation.control { return Err(crate::VerificationError::BindingMismatch); }
-                let bridge = prepare_runtime_bridge(registry.as_ref(), &pending.runtime, run, employee)?;
-                if bridge.projection().digest() != pending.projection_digest { return Err(crate::VerificationError::BindingMismatch); }
-                let delivery = McpDelivery::from_take_io(&receipt.response, receipt.control, UnixStream::from(fd))?;
-                let connection = boundary.activate(pending.capability, &pending.reservation, delivery,
-                    crate::authority::now_seconds()?)?;
-                Ok((connection, pending))
-            }).await.map_err(|_| BackendError::Denied)?;
-            let mut active = self.active.lock().map_err(|_| BackendError::Unavailable)?;
-            if self.revoked.load(Ordering::Acquire) || active.contains_key(&run.0) { return Err(BackendError::Denied); }
-            let dispatcher = self.dispatcher.clone();
-            let task = tokio::spawn(async move { crate::server::serve(connection, dispatcher.as_ref()).await });
-            active.insert(run.0, Active { task });
-            // The active connection/task now owns revocation. Until this exact
-            // point every failure/cancellation drops the still-armed guard.
-            guard.armed = false;
-            Ok(())
-        })
+        Box::pin(async move { self.activate_checked(run, mcp).await.map_err(|(_, error)| error) })
     }
     fn revoke(&self, run: RunHandle) -> BackendFuture<'_, ()> {
         Box::pin(async move {
             self.revoked.store(true, Ordering::Release);
+            // R8z-5: before the revocation the session would observe.
+            self.mark_released(run);
             let mut revoked = self.boundary.revoke_run(run).map_err(|_| BackendError::Unavailable);
             let mut pending = self.pending.lock().unwrap_or_else(|error| {
                 revoked = Err(BackendError::Unavailable);
@@ -159,6 +241,7 @@ impl Drop for ProtectedMcpLaunch {
         let pending = self.pending.get_mut().unwrap_or_else(|error| error.into_inner());
         for run in pending.keys() { let _ = self.boundary.revoke_run(RunHandle(*run)); }
         let active = self.active.get_mut().unwrap_or_else(|error| error.into_inner());
+        for session in active.values() { session.released.store(true, Ordering::Release); }
         for (run, session) in active.iter() {
             let _ = self.boundary.revoke_run(RunHandle(*run));
             session.task.abort();
@@ -206,6 +289,39 @@ mod tests {
         let delivery = McpDelivery { run: reservation.run, control: reservation.control, socket };
         assert!(boundary.activate(capability, reservation, delivery, crate::authority::now_seconds().unwrap()).is_err());
     }
+    /// R8z-5: the session wrapper returns `serve`'s result unchanged and calls
+    /// the observer exactly once on an abnormal end, never on the normal end
+    /// or after the run was released.
+    #[tokio::test(flavor = "current_thread")]
+    async fn r8z5_the_session_observer_is_called_once_on_an_abnormal_end_only() {
+        let seen = Arc::new(Mutex::new(Vec::<SessionStep>::new()));
+        let observer = || -> Option<SessionObserver> {
+            let seen = seen.clone();
+            let observer: SessionObserver = Arc::new(move |step: SessionStep| seen.lock().unwrap().push(step));
+            Some(observer)
+        };
+        let end = |outcome: crate::server::SessionOutcome| std::future::ready(outcome);
+        let live = || Arc::new(AtomicBool::new(false));
+        // `serve` returned an error.
+        let refused = Err((SessionStep::SecondRequest, VerificationError::Invalid));
+        assert_eq!(observed_session(end(refused), live(), observer()).await, Err(VerificationError::Invalid));
+        assert_eq!(*seen.lock().unwrap(), vec![SessionStep::SecondRequest]);
+        // `serve` returned `Ok(())`, but the peer closed in a request.
+        let closed = Ok(Some(SessionStep::PeerClosedInRequest));
+        assert_eq!(observed_session(end(closed), live(), observer()).await, Ok(()));
+        assert_eq!(*seen.lock().unwrap(), vec![SessionStep::SecondRequest, SessionStep::PeerClosedInRequest]);
+        // The normal end: nothing.
+        assert_eq!(observed_session(end(Ok(None)), live(), observer()).await, Ok(()));
+        // Released before the end (the release's own revocation): nothing.
+        let released = Arc::new(AtomicBool::new(true));
+        let revoked = Err((SessionStep::Revoked, VerificationError::Revoked));
+        assert_eq!(observed_session(end(revoked), released, observer()).await, Err(VerificationError::Revoked));
+        // No observer installed: the result alone.
+        let refused = Err((SessionStep::FrameInvalid, VerificationError::Invalid));
+        assert_eq!(observed_session(end(refused), live(), None).await, Err(VerificationError::Invalid));
+        assert_eq!(seen.lock().unwrap().len(), 2, "exactly one call per abnormal end");
+    }
+
     #[test]
     fn pending_guard_drop_revokes_issued_capability() {
         let (boundary, live, guard) = pending();

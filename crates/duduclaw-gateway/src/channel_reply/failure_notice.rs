@@ -177,6 +177,20 @@ pub(super) async fn observe_turn<F: std::future::Future>(ctx: &ReplyContext, wor
     else { FAILURE_SESSION.scope(std::sync::Arc::new(std::sync::Mutex::new(None)), run).await }
 }
 
+/// R8x: the reason code a failed turn shows (suffix, stored notice and audit
+/// `reason_code`). In protected mode a gate refusal (a spawn-gate prefixed
+/// error: isolation refused the run, so no rotation or fallback ran) that the
+/// text classifier cannot name shows the existing `safety_gate` code —
+/// the same [`TurnFailureReason::SafetyGate`] that `notice_reason` already
+/// selects for it — instead of `unknown`. Every other failure keeps its code.
+pub(super) fn displayed_code(reason: FailureReason, gate_refused: bool, protected: bool) -> &'static str {
+    if protected && gate_refused && reason == FailureReason::Unknown {
+        TurnFailureReason::SafetyGate.code()
+    } else {
+        reason.as_str()
+    }
+}
+
 pub(crate) fn notice_suffix(language: Option<&str>, code: Option<&str>, reference: &str) -> String {
     let id = duduclaw_core::truncate_chars(reference, 8);
     let (reason, reference) = match language.unwrap_or("zh-TW") {
@@ -251,6 +265,18 @@ fn timeout_duration(seconds: u64, lang: &str) -> String {
 #[cfg(test)]
 mod work_notice_tests {
     use super::*;
+
+    /// R8x: only an unclassified protected gate refusal changes code; it uses
+    /// the existing `safety_gate` member, never a new code.
+    #[test]
+    fn protected_gate_refusal_shows_safety_gate_not_unknown() {
+        assert_eq!(displayed_code(FailureReason::Unknown, true, true), TurnFailureReason::SafetyGate.code());
+        assert_eq!(displayed_code(FailureReason::Unknown, true, true), "safety_gate");
+        assert_eq!(displayed_code(FailureReason::Unknown, true, false), "unknown");
+        assert_eq!(displayed_code(FailureReason::Unknown, false, true), "unknown");
+        assert_eq!(displayed_code(FailureReason::MaxTurns, true, true), "max_turns");
+        assert_eq!(displayed_code(FailureReason::SpawnError, false, true), "spawn_error");
+    }
 
     #[test]
     fn total_timeout_notice_names_applied_duration_or_uses_zero_fallback() {

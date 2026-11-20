@@ -6,6 +6,17 @@ pub mod state;
 pub mod activation_contract;
 pub mod trust_store;
 pub mod publication;
+pub mod bundle;
+pub mod bootstrap_cli;
+/// `duduclaw-updated` argv: mode classification and the AI-session guard.
+pub mod updated_cli;
+/// Fixed start-up stage names printed with a start-up failure.
+pub mod stage;
+/// TEST-ONLY software signer (plan §3.3, R2 §4.2): unit tests and feature `test-signer` only.
+#[cfg(any(test, feature = "test-signer"))]
+pub mod test_signer;
+/// spawnd's publication journal format (shared so the updater's pruning reads it).
+pub mod publish_journal;
 #[cfg(target_os = "linux")]
 pub mod linux;
 #[cfg(target_os = "linux")]

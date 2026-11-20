@@ -4,9 +4,11 @@
 This is a conservative lexical guard, not a Rust type checker or authorization
 mechanism. It scans every crates/*/src/**/*.rs, including cfg(test) and platform
 branches. Literal/comment contents do not count. Constructors, known platform
-factories, PTY launches, raw exec/fork calls and process terminal methods are
-counted per enclosing function. An entry records the current identity separately
-from the intended isolation migration; a pending entry is not an exemption.
+factories, PTY launches, raw exec/fork calls (including exec through the raw
+`syscall(SYS_execveat, ...)` / `syscall(libc::SYS_execveat, ...)` form) and
+process terminal methods are counted per enclosing function. An entry records the
+current identity separately from the intended isolation migration; a pending
+entry is not an exemption.
 """
 from __future__ import annotations
 
@@ -25,6 +27,9 @@ CHAR_LITERAL = re.compile(r"'(?:\\(?:u\{[0-9a-fA-F_]+\}|x[0-9a-fA-F]{2}|.)|[^'\\
 TOKEN = re.compile(r"[A-Za-z_][A-Za-z_0-9]*|::|->|[^\s]", re.ASCII)
 FACTORIES = {"command_for", "async_command_for"}
 RAW = {"fork", "vfork", "execve", "execveat", "execv", "execvp", "execl", "posix_spawn", "posix_spawnp", "clone", "clone3", "forkpty", "system", "popen"}
+# Raw syscall numbers that replace the process image, counted as the matching RAW
+# effect when they are the first argument of a `syscall(` call (any path prefix).
+RAW_SYSCALLS = {"SYS_execveat": "execveat", "SYS_execve": "execve"}
 
 
 def mask_literals(source: str) -> str:
@@ -191,6 +196,13 @@ def scan_text(source: str, path: str) -> list[Site]:
                     effects["raw_" + token] += 1
             elif token in raw_aliases and tokens[i + 1:i + 2] == ["("] and tokens[i - 1:i] != ["fn"]:
                 effects["raw_" + raw_aliases[token]] += 1
+            elif token == "syscall" and tokens[i + 1:i + 2] == ["("] and tokens[i - 1:i] != ["fn"]:
+                # First argument: an optional `a::b::` path, then the syscall name.
+                j = i + 2
+                while j + 1 < len(tokens) and tokens[j + 1] == "::":
+                    j += 2
+                if j < len(tokens) and tokens[j] in RAW_SYSCALLS:
+                    effects["raw_" + RAW_SYSCALLS[tokens[j]]] += 1
             elif i > 0 and tokens[i - 1] == "." and tokens[i + 1:i + 2] == ["("]:
                 if token in {"spawn", "spawn_authorized", "spawn_command", "exec"}:
                     effects["terminal_" + token] += 1

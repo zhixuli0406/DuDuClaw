@@ -4,7 +4,174 @@
 |---|---|
 | `connectors-acceptance.sh` (+ `connectors_rpc.py`, `fixtures/`) | **Current.** v1.81 Personal-binding / connector acceptance, matrix items 1-15 (see below). |
 | `package-h-acceptance.sh` (+ `fixtures/public_origin.py`) | **Current.** v1.81 Package H acceptance (H15, matrix additions 16-27) and the G2 lifecycle chain: installs the service, records host facts, runs the prebuilt `iso_package_h_chain` / `iso_personal_chain` test binaries (`crates/duduclaw-gateway/tests/`), prints a PASS/FAIL/SKIP table. Runbook: `docs/guides/linux-protected-acceptance.md`. |
+| `install-acceptance.sh` | **v1.83 (not yet run on a VM).** Fresh isolated install through `duduclaw-bootstrap install` with test root keys, rollback, and the `iso_root_install_` root tests one per fresh snapshot (usage in the script header). The team licence it needs is a **TEST licence**, never a production one: `scripts/isolation-test-keys.sh keys` prints the TEST-licence `duduclaw` build (`--cfg duduclaw_test_root` + `DUDUCLAW_TEST_LICENSE_ISSUER_PUBKEY`), `bundle --gateway <that duduclaw>` ships it in the TEST bundle, and `license --keys <dir> --fingerprint <line 1 of 'duduclaw license fingerprint' run as root on the VM> --out <file>` signs `/root/duduclaw-migrate/license.json` (tier `self_host_pro` by default; `partner` and `oem` also pass the installer's rule). Only the TEST build accepts it; the script checks `duduclaw print-license-issuer` prints `TEST-LICENSE <key>`. |
+| `fixtures/policy-source-test.json`, `fixtures/policy-syscalls-test-{x86_64,aarch64}.txt`, `fixtures/manifest-template-test.json` | **v1.83 R7d, TEST-only.** Inputs of the TEST isolation policy that `scripts/isolation-test-keys.sh bundle` now puts into every TEST generation (see "TEST isolation policy" below). |
 | `acceptance.sh` + `rpc_probe.py` | **Superseded for v1.81.** `acceptance.sh` asserts the removed `container_root_key` backend (`security.credential_protection` ⇒ `backend=container_root_key`), so it cannot pass on a v1.81 build. It is kept unchanged for the historical record (see "Legacy" at the end). `rpc_probe.py` is still used: `connectors_rpc.py` imports its WebSocket client. |
+
+The installer creates `/var/lib/duduclaw-spawnd/audit` as root:root 0700 for
+spawnd audit logs; spawnd refuses a missing directory. Audit logs stay outside
+`/var/log` because Ubuntu uses root:syslog 0775 there, which fails the root-managed
+path checks.
+
+Storage prerequisites for the isolated installer: install `e2fsprogs` for the
+root-managed `/usr/sbin/mkfs.ext4`, load the kernel loop module (`modprobe loop`)
+and verify `/dev/loop-control` is character device 10:237. The filesystem holding
+`/var/lib` needs free space of at least max(20 GiB, 10% of total capacity, rounded
+up), as well as passing the existing 2× package size + 1 GiB check. Device-mapper
+backing also needs `dmsetup` (`dmsetup` / `lvm2` packages). The installer creates
+`images` and `storage` below `/var/lib/duduclaw-spawnd` as root:root 0700;
+`duduclaw-spawnd.service` uses `MountFlags=private` on every start. Employee images
+are mounted only inside that namespace; the installer creates no host mount.
+
+## TEST isolation policy (v1.83 R7d)
+
+Every generation must contain a signed isolation policy (`runtime-isolation-policy-v1`);
+the installer's S5 and spawnd refuse one without it. `scripts/isolation-test-keys.sh
+bundle` therefore (Linux host only, or pass a prebuilt `--policy-tool`):
+
+1. extracts the archive's `duduclaw-api-worker`, `duduclaw-egress` (forwarder) and
+   `duduclaw-mcp-bridge` through the packager's own archive check into a private
+   temporary directory, under their generation names (`stage_policy_inputs`);
+2. builds `duduclaw-isolation-policy` (`cargo build --locked --release -p duduclaw-spawnd
+   --features policy-tool`, own target directory `target/isolation-policy-tool`) and runs
+   `build` with `--policy-source` (default `fixtures/policy-source-test.json`), writing
+   `<out>/TEST-runtime/runtime-isolation-policy-v1` only after spawnd's own checks pass;
+3. signs with `fixtures/manifest-template-test.json` (the shipped template plus
+   `isolation-policy-v1` and `api-worker-v1`) and `--runtime-artifacts-dir <out>/TEST-runtime`;
+4. runs `verify` against the signed manifest (it must bind exactly these policy bytes).
+
+The fixture is one OpenAI-compatible runtime (`api-worker-v1`, `fixed_args` the
+gateway's `--duduclaw-protocol openai-compat-v1 --mcp-config /config/mcp.json`),
+`network: egress` (profile label `test-egress`, forwarder on port 18080), `mcp: true`,
+conservative resources (1 GiB memory, 1 CPU, 256 tasks, 4096 open files, 8 MiB memfd,
+10 min runtime), `dns_probe_name` `example.com`, and **no MCP acceptance**. The syscall
+lists are permissive **TEST lists** (every syscall number in use on the architecture;
+duduclaw-run's fixed common refusals still apply on top), not reviewed production lists.
+
+What it can prove: the generation installs (S5 finds a valid signed policy and writes
+`/etc/duduclaw/egress.json` for the `test-egress` profile), spawnd loads the policy and
+publishes it, and readiness (including the DNS probe of `example.com`) can be evaluated.
+What it cannot prove: any employee run. spawnd refuses every MCP run of a runtime without
+MCP acceptance at MCP preparation, so no OpenAI-compatible turn can start (unless the
+bundle was made with `--accept-mcp`, below); Claude, Codex
+and Grok are not in the TEST policy; the syscall lists say nothing about a production
+seccomp policy. The production policy content is a later, owner-reviewed step
+(`release/isolation/README.md`).
+
+### `--accept-mcp`: MCP acceptance of the api worker (v1.83 R8r-4)
+
+`bundle --accept-mcp` (default off) adds a step between 1 and 2. The
+snapshot's `duduclaw-run` (the file the packager later signs as the manifest's
+trampoline entry) is also copied to the policy work directory. Its SHA-256 is
+hashed during the copy and re-checked on the copy. The signed manifest cannot
+exist yet, because it signs the policy these runs produce. Every
+`open_ai_compat` runtime of the source then goes through
+`duduclaw-isolation-policy accept --trampoline <copy> --trampoline-sha256
+<that digest>` (`sudo -n env DUDUCLAW_ISO_DISPOSABLE=1 …`, without sudo when
+already root). Each run produces
+`<work>/acceptance/<label>/{transcript.jsonl,acceptance-manifest.json}` and the
+next accepted source (chained, one per label). Step 2 then builds from the last
+accepted source. Step 4 adds `--evidence-dir <work>/acceptance --harness-sha256
+<sha256 of the policy tool that ran accept>` to the verify against the signed
+manifest. That verify parses the evidence strictly, replays the transcript and
+re-runs the decision. It also proves that the evidence's trampoline, runtime
+and bridge are the signed manifest's entries. After step 4 the evidence is
+copied to `<out>/TEST-runtime/acceptance-evidence/<label>/`.
+That copy happens after packaging: the packager reads only the
+`runtime-<registry_id>` files of `TEST-runtime`, and the migration bundle packs only
+the bootstrap inbox, so the evidence is never signed or packaged product content.
+
+Run it **only on a disposable Linux host of the target architecture as a user with
+passwordless sudo (or as root) and WITHOUT any DuDuClaw isolation installation or
+protected-mode marker**; it needs systemd as PID 1, cgroup v2, `/usr/sbin/mkfs.ext4`
+and a `/var/lib` on a block device (the harness creates a temporary loop image, a
+transient unit and slice, and `/var/lib/duduclaw-acceptance-<random>`, removes all of
+them and fails if anything is left). The harness launches the real api worker and
+bridge once with no network (provider `https://acceptance.invalid/v1`); see
+`crates/duduclaw-spawnd/README.md` "MCP acceptance harness" for what is observed and
+what the signed record then states. With the record, spawnd no longer refuses the
+fixture runtime at MCP preparation; the TEST syscall lists still say nothing about a
+production seccomp policy. Any change of the runtime binary, version, arguments,
+resource limits or syscall lists requires running `--accept-mcp` again.
+
+The harness signals only processes inside its own run cgroup and employee slice.
+A process with the temporary uid anywhere else is never touched and fails the run
+(`foreign_uid_process`). Any process in the run cgroup that is not the trampoline,
+forwarder, runtime or bridge in its documented place fails the run, and so does
+any observation it could not complete (`crates/duduclaw-spawnd/README.md`, MCP
+acceptance harness, "Completeness"). That README section also lists how the
+harness launch differs from a production launch.
+
+**`sudo -n` on a tool built by the invoking user is acceptable only on this
+disposable TEST VM.** That user, or anyone who can write the build tree or its
+parent directories, effectively has root there and could shape the evidence. The
+release signing ceremony does not use this script's build. It builds the tool
+from a clean checkout of a pinned source archive, installs it root-owned and
+records its digest, runs `accept` only from root-owned directories (never under a
+parent writable by an untrusted user), stores the evidence separately, and
+verifies it with `verify --manifest <signed manifest> --evidence-dir <dir>
+--harness-sha256 <recorded digest>`.
+
+After any change to the harness, trampoline, api worker, bridge, unit properties
+or the trampoline's process structure, re-run `bundle --accept-mcp` on a real
+disposable host. That run ends with the signed-manifest verify. Unit tests do
+not replace it.
+
+## TEST-only first-run setup code (v1.83 R8u, owner decision E10)
+
+A fresh team-edition home enforces two-factor sign-in: the first Administrator's
+login returns `{mfa_enrollment_required, enrollment_token, setup_code_required}`, and
+the setup code normally comes only from `duduclaw ops users mfa-setup-code` on an
+interactive terminal. For unattended acceptance a TEST-key `duduclaw` (built with
+`--cfg duduclaw_test_root`, `scripts/isolation-test-keys.sh keys`) has one more
+sub-command that **exists only in such builds** (a release build has no such
+variant, help text or string, and `scripts/refuse-test-license-build.py`, the
+packager and `container/Dockerfile.server` refuse any gateway binary containing
+`mfa-setup-code-test` or its fixed stderr line; it is never in a release):
+
+```sh
+sudo env DUDUCLAW_ISO_DISPOSABLE=1 DUDUCLAW_HOME=/var/lib/duduclaw/.duduclaw \
+  duduclaw ops users mfa-setup-code-test --out /root/<private dir>/setup-code
+```
+
+It runs only on Linux as root, only when the binary reports `TEST-LICENSE <key>`
+(the licence build identity; `TEST-LICENSE none` is refused) and only with
+`DUDUCLAW_ISO_DISPOSABLE=1`. It does not refuse AI-session markers and needs no
+terminal. `DUDUCLAW_HOME` selects the home exactly as for the other `ops users`
+commands (default `~/.duduclaw`, so the protected service home must be named). The
+code is issued like the host command's (same 30-minute, single-use, replaces an
+outstanding one) with the audit actor `測試建置的自動驗收（身分未驗證）`, and is written
+only to `--out`: a new file (must not exist; never follows a symlink) created 0600 and
+owned by root, in a directory owned by root and not writable by group or other.
+stdout stays empty; stderr gets `TEST BUILD ONLY: issuing a first-run setup code for
+automated acceptance` and one fixed result line. Exit status: `0` written, `3`
+nothing to issue (policy not enforced, no single first Administrator, or the first
+Administrator has already finished two-factor setup — from then on it never issues a
+code again, like the host command; no file is left), `1` refused or failed (a closed
+reason label on stderr; no file is left, and a refused `--out` never mints a code).
+If the unused `--out` file cannot be removed (read-only remount, I/O error) it is
+truncated to empty and the run exits `1` with the label `cleanup`.
+
+Then complete the enforced first-run enrolment with the acceptance client (loopback,
+Python standard library):
+
+```sh
+python3 connectors_rpc.py --state <private dir>/admin.json --data-home /var/lib/duduclaw/.duduclaw \
+  enroll-mfa-bootstrap --setup-code-file /root/<private dir>/setup-code [--email E --password P]
+```
+
+`POST /api/login` → `POST /api/mfa/enroll/bootstrap {enrollment_token, setup_code}` →
+`POST /api/mfa/enroll/begin {enrollment_token}` → `POST /api/mfa/enroll/confirm
+{enrollment_token, code}` (TOTP from the returned secret) → a normal login answered on
+`POST /api/mfa/verify {challenge_id, code}`. The state file (0600) ends with a usable
+session and the TOTP secret, so `call … --stepup` works and later logins answer the
+TOTP challenge themselves. The setup code is never printed; delete the file afterwards.
+Every HTTP request of `connectors_rpc.py` goes through one opener that refuses any
+redirect (a fixed error, nothing is followed) and ignores proxy environment variables;
+the WebSocket connects only to `ws://127.0.0.1:<port>/ws` (port from the data home's
+`config.toml` or `DUDUCLAW_PORT`).
+Unit tests of the sub-command's gates run only in a test-root build:
+`RUSTFLAGS='--cfg duduclaw_test_root' CARGO_TARGET_DIR=target/test-root cargo test -p duduclaw-cli --lib users_mfa_cmd`.
 
 ## Connector acceptance (`connectors-acceptance.sh`)
 
@@ -14,13 +181,13 @@ Source of truth for the matrix: `wiki/duduclaw-kb/architecture/native-linux-isol
 
 ### Prerequisites per distro
 
-Common: run as root on the host (not in a container: the installer refuses containers); systemd as PID 1; unified cgroup v2 (`stat -f -c %T /sys/fs/cgroup` = `cgroup2fs`); initial user namespace; explicit `SYS_UID_MAX`/`SYS_GID_MAX` in `/etc/login.defs` (stock on all three distros); outbound network is **not** required for the local checks; a candidate `duduclaw` binary verified by you beforehand (the script passes `--i-verified-this-binary` and `--allow-missing-runtime`, so no AI CLI has to be installed); about 2 GB free under `/var` and `/opt`; the scripts need `python3` ≥ 3.10, `setpriv` (util-linux), `getent`/`useradd`/`userdel`/`groupdel` (passwd), `journalctl`, `sha256sum`, GNU `date` and `openssl` (optional: without it the HTTPS canary origin is disabled).
+Common: run as root on the host (not in a container: the installer refuses containers); systemd as PID 1; unified cgroup v2 (`stat -f -c %T /sys/fs/cgroup` = `cgroup2fs`); initial user namespace; `SYS_UID_MAX`/`SYS_GID_MAX` in `/etc/login.defs` may be omitted (stock files on all three distros comment them out); as shadow `useradd -r`/`groupadd -r` do, the installer derives each absent maximum from `UID_MIN`/`GID_MIN` minus one (default minimum 1000, giving 999), while rejecting malformed, duplicate or unsafe values; outbound network is **not** required for the local checks; a candidate `duduclaw` binary verified by you beforehand (the script passes `--i-verified-this-binary` and `--allow-missing-runtime`, so no AI CLI has to be installed); the isolated-storage reserve above plus the package space check under `/var/lib`, `/opt` and `/usr`; the scripts need `systemd-tmpfiles` (systemd), `python3` ≥ 3.10, `setpriv` (util-linux), `getent`/`useradd`/`userdel`/`groupdel` (passwd), `journalctl`, `sha256sum`, GNU `date` and `openssl` (optional: without it the HTTPS canary origin is disabled).
 
 | Distro | Packages to install first | Notes |
 |---|---|---|
-| Ubuntu 22.04 | `apt-get install -y python3 util-linux passwd openssl coreutils` (python3 = 3.10, the minimum) | Reference host (192.168.0.45). Run all 15 items. |
+| Ubuntu 22.04 | `apt-get install -y python3 util-linux passwd openssl coreutils e2fsprogs` (python3 = 3.10, the minimum) | Reference host (192.168.0.45). Run all 15 items. |
 | Ubuntu 24.04 | same (python3 = 3.12) | † items 2, 4, 6, 10, 12 must pass here too. |
-| Debian 12 | `apt-get install -y python3 util-linux passwd openssl coreutils procps sudo` (python3 = 3.11) | † items 2, 4, 6, 10, 12 must pass here too. Debian minimal images lack `sudo`/`procps`; log in as root instead. |
+| Debian 12 | `apt-get install -y python3 util-linux passwd openssl coreutils e2fsprogs procps sudo` (python3 = 3.11) | † items 2, 4, 6, 10, 12 must pass here too. Debian minimal images lack `sudo`/`procps`; log in as root instead. |
 
 The rest of the v1.81 acceptance (outside this script) is unchanged: `DUDUCLAW_ISO_DISPOSABLE=1 cargo test -p duduclaw-spawnd -- --ignored iso_root_ --test-threads=1` and `... cargo test -p duduclaw-gateway --test iso_personal_chain -- --ignored iso_root_e2e_ --test-threads=1 --nocapture`.
 
@@ -107,10 +274,47 @@ Environment given to the driver: `DUDUCLAW_ISO_DATA` (service home), `DUDUCLAW_I
 
 * Written against the v1.81 RPC surface and the F3 readiness reason names (`personal_binding_conflict`, `connector_setup_required`, `revoked`, `binding_evidence_missing`, `service_unavailable`). On a build without F3, 2c and 12a FAIL by design. **The script was written without a shell or a Linux host available: it has been read through but neither executed nor run through `bash -n` / `shellcheck` / `python3 -m py_compile`. Do those three first, then expect a first-run shakedown.**
 * Response shapes the harness assumes and searches for (and reports as FAIL/SKIP with evidence if they differ): `isolation.employee_list` nodes carry `label`, `employee_id` and a status/usable field; the staff request response carries a request id; `migration.confirmations.list` items carry `category`, `status`, `binding`; `system.status` exposes `isolation_readiness`.
-* Admin MFA: the harness enrols TOTP for the first-run admin through `mfa.enroll_begin`/`confirm`. If the build enforces an independent enrolment proof (`proof_required`), automation stops with a clear `FAIL setup`; enrol by hand (`--pause-after-setup` is too late for that) or run on a build/policy where the admin can enrol directly. Login of alice/bob/carol/dave must return a session without MFA for the same reason.
+* Admin MFA: the harness enrols TOTP for the first-run admin through `mfa.enroll_begin`/`confirm`, which needs a session, i.e. a policy that does not enforce two-factor sign-in. Under an enforced policy (fresh team-edition home) that path stops with a clear `FAIL setup`; on a TEST-key build use the first-run flow of "TEST-only first-run setup code" above instead (`mfa-setup-code-test` then `connectors_rpc.py enroll-mfa-bootstrap`); a release build has no unattended way, so enrol by hand there. The harness script itself has not been switched to that flow. Login of alice/bob/carol/dave must return a session without MFA (each would need its own enrolment proof under enforcement).
 * 2c and 5 tamper with `users.db` as the service account (they drop and re-create `isolation_personal_binding_insert` / overwrite `auth_meta.isolation_tenant_id`) and restore it afterwards. This simulates a database-level attacker or an A3 trigger bypass; if the product opens `users.db` differently the check reports `SKIP` with the database error.
 * 6b may legitimately FAIL while spawnd keeps the UID/storage of a tombstoned Personal employee and refuses a new live allocation with the same label (A2 open item 1).
 * The sqlite stand-in proves binding/lifecycle/refusal behaviour, not a Google/Notion/GitHub/Odoo request path; those only count when their provider checks PASS.
+
+## 第一個員工回合的假模型端點
+
+`fake-model-endpoint/` 提供第一個隔離員工回合驗收用的固定回覆服務，文字固定為
+`DUDUCLAW-ACCEPTANCE-OK`，沒有工具呼叫；僅供驗收，驗收後必須刪除。
+容器以 HTTP 監聽 `0.0.0.0:$PORT`（預設 8080），HTTPS 由 Cloud Run 終止。
+`ENDPOINT_TOKEN` 啟動時必填，至少 32 字元；請使用隨機 ASCII token。
+唯一免認證路徑為 `GET /healthz`；完成請求須帶 Bearer token、
+`Content-Type: application/json`、`Content-Length`，JSON 物件最多 1 MiB，不接受 chunked。
+
+worker 的 `endpoint()` 在 base URL 後加上 `/chat/completions`
+（`crates/duduclaw-api-worker/src/vendor.rs:19–22`）；本服務只接受
+`POST /v1/chat/completions`，所以交給員工的 `providers.json` 如下。
+以 Cloud Run 的 HTTPS 服務網址替換 `<service-url>`（不含尾端斜線），
+以同一 token 替換 `<token>`；網址不可含 query、fragment 或使用者資訊。
+省略 `protocol` 即採預設 `ChatCompletions`，模型名稱不影響固定回覆。
+
+```json
+{
+  "providers": [{
+    "name": "acceptance-only",
+    "base_url": "<service-url>/v1",
+    "api_key": "<token>"
+  }]
+}
+```
+
+由維護者替換佔位符後部署與刪除（此處指令尚未實際部署驗證）：
+
+```sh
+gcloud run deploy <service> --source scripts/live-test/linux-protected/fake-model-endpoint --region asia-east1 --allow-unauthenticated --set-env-vars ENDPOINT_TOKEN=<token> --max-instances 1
+gcloud run services delete <service> --region asia-east1
+```
+
+本機測試：在 `fake-model-endpoint/` 執行 `python3 -m unittest -v`。
+服務僅記錄方法、去除 query 的路徑、狀態與請求／回覆本文位元組數，不保存本文，
+不記錄標頭或 token；每個連線的 socket timeout 為 15 秒。
 
 ## Legacy: `acceptance.sh` (superseded, kept for the record)
 
@@ -118,7 +322,7 @@ Environment given to the driver: `DUDUCLAW_ISO_DATA` (service home), `DUDUCLAW_I
 
 在可丟棄的 Ubuntu 22.04 實體機／VM 上，驗收候選版的 systemd 安裝、資料搬移、憑證 RPC、程序隔離、拒絕條件、升級與 dashboard 更新限制。這套工具會修改系統、建立／移除服務帳號和資料，請使用專用主機及專用 sudo 使用者。
 
-需要 systemd 為 PID 1、cgroup v2、初始 user namespace、Python 3.10+、util-linux `setpriv`、GNU coreutils、passwd/group 管理工具及 sudo 權限。升級與 dashboard 更新檢查需要連到官方 GitHub release。候選 binary 必須事先由操作者驗證；腳本將它放到 root 管理的 staging 路徑，這不等同驗證發行簽章。不得在容器或 AI 員工執行環境執行。
+需要 systemd 為 PID 1、`systemd-tmpfiles`、cgroup v2、初始 user namespace、Python 3.10+、util-linux `setpriv`、GNU coreutils、passwd/group 管理工具及 sudo 權限。升級與 dashboard 更新檢查需要連到官方 GitHub release。候選 binary 必須事先由操作者驗證；腳本將它放到 root 管理的 staging 路徑，這不等同驗證發行簽章。不得在容器或 AI 員工執行環境執行。
 
 將候選 binary 與工具資料夾放在同一個目錄：
 

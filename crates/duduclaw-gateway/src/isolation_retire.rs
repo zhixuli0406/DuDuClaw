@@ -378,7 +378,7 @@ fn spec_for(checked: &Checked, employee: EmployeeId, requested_by: &str) -> Resu
 fn nonce() -> RequestId { RequestId(*uuid::Uuid::new_v4().as_bytes()) }
 
 fn readback_request(item: &ConfirmationItem) -> Request {
-    Request { schema: allocation::SCHEMA_V2, nonce: nonce(), action: Action::ReadBack, item: item.clone(), approver: None }
+    Request { schema: allocation::SCHEMA_V2, nonce: nonce(), action: Action::ReadBack, item: item.clone(), approver: None, entitlement: None }
 }
 
 /// R5/S4/S5 class of a schema-2 ReadBack of the stored allocation, with the
@@ -388,8 +388,12 @@ pub(crate) fn classify_readback(expected: &Receipt, answer: Result<Answer, ()>) 
     match answer {
         Err(()) => (RootClass::Unavailable, None),
         Ok(Answer::Refused(Root::NotFound)) => (RootClass::Gone, None),
-        Ok(Answer::Refused(Root::NotReady | Root::IsolationUnavailable)) => (RootClass::Unavailable, None),
-        Ok(Answer::Refused(Root::Inconsistent | Root::InvalidRequest)) => (RootClass::Inconsistent, None),
+        // Pending/PendingLimit: schema 3 only (refused in a schema-2 reply).
+        Ok(Answer::Refused(Root::NotReady | Root::IsolationUnavailable | Root::Pending | Root::PendingLimit)) => (RootClass::Unavailable, None),
+        // R8d: the four entitlement codes are schema 4 (Entitle) only and
+        // refused in a schema-2 reply by `check_response`; listed, never wildcarded.
+        Ok(Answer::Refused(Root::Inconsistent | Root::InvalidRequest | Root::NotAllocated | Root::NotSigned
+            | Root::InvalidEntitlement | Root::Capacity)) => (RootClass::Inconsistent, None),
         Ok(Answer::Reply(reply)) => {
             let r = &reply.receipt;
             if r.employee != expected.employee || r.uid != expected.uid || r.label != expected.label || r.binding != expected.binding

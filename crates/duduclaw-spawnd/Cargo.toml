@@ -37,6 +37,15 @@ tokio.workspace = true
 
 [features]
 root-test-fixture = []
+# R7d: the offline isolation policy generator `duduclaw-isolation-policy`
+# (README "Isolation policy generator"). Never part of a release build:
+# scripts/package-linux-release.py refuses this feature and the binary name.
+policy-tool = []
+
+[[bin]]
+name = "duduclaw-isolation-policy"
+path = "src/bin/isolation-policy.rs"
+required-features = ["policy-tool"]
 
 [[bin]]
 name = "duduclaw-spawnd-d8-fixture"

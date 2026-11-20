@@ -61,6 +61,56 @@ impl ProposalApplier for Adapter {
     fn disable_and_read_back(&mut self, item: &ConfirmationItem) -> Result<()> { self.effect(item, 3) }
 }
 
+/// R7d: a stage answering `Pending` (root allocation still verifying) keeps
+/// the item `Applying` with no receipt, no Failed and no compensation; the
+/// next `apply_next` re-runs the same stage and the apply resumes. One
+/// intent row per proposal throughout; `Pending` from a later step fails.
+#[test]
+fn pending_stage_stays_applying_without_compensation_and_resumes() {
+    #[derive(Default)]
+    struct Root { pending: usize, stages: usize, disables: usize, publish_pending: bool }
+    impl ProposalApplier for Root {
+        fn stage(&mut self, _: &ConfirmationItem) -> Result<()> {
+            self.stages += 1;
+            // The last pending answer is `PendingLimit`: the same outcome.
+            if self.pending > 0 { self.pending -= 1;
+                return Err(if self.pending == 0 { ConfirmationError::PendingLimit } else { ConfirmationError::Pending }); }
+            Ok(())
+        }
+        fn publish(&mut self, _: &ConfirmationItem) -> Result<()> {
+            if self.publish_pending { Err(ConfirmationError::Pending) } else { Ok(()) }
+        }
+        fn read_back(&mut self, _: &ConfirmationItem) -> Result<()> { Ok(()) }
+        fn disable_and_read_back(&mut self, _: &ConfirmationItem) -> Result<()> { self.disables += 1; Ok(()) }
+    }
+    let status = |store: &ConfirmationStore, binding: &ProposalBinding|
+        store.list().unwrap().into_iter().find(|i| i.binding == *binding).unwrap().status;
+    let count = |store: &ConfirmationStore, sql: &str| store.conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
+    let mut store = store();
+    let item = stage(&mut store, 1, ConfirmationCategory::Employee);
+    approve(&mut store, &item);
+    let mut root = Root { pending: 2, ..Root::default() };
+    for attempt in 1..=2 {
+        assert!(matches!(store.apply_next(&item.binding, &mut root), Err(ConfirmationError::Pending)));
+        assert_eq!(status(&store, &item.binding), ConfirmationStatus::Applying);
+        assert_eq!((root.stages, root.disables), (attempt, 0), "no compensation while pending");
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM migration_apply"), 0, "no receipt for a pending stage");
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM migration_effect_intents"), 0, "the intent is consumed");
+    }
+    assert_eq!(count(&store, "SELECT COUNT(*) FROM migration_confirmation_audit WHERE event='apply_pending'"), 2);
+    for _ in 0..3 { store.apply_next(&item.binding, &mut root).unwrap(); }
+    assert_eq!(status(&store, &item.binding), ConfirmationStatus::Applied);
+    assert_eq!((root.stages, root.disables), (3, 0), "the same stage resumed once more, nothing compensated");
+    assert_eq!(count(&store, "SELECT COUNT(*) FROM migration_apply"), 1);
+    // Only the stage may be pending: a later step reporting it fails and compensates.
+    let other = stage(&mut store, 2, ConfirmationCategory::Employee);
+    approve(&mut store, &other);
+    let mut late = Root { publish_pending: true, ..Root::default() };
+    store.apply_next(&other.binding, &mut late).unwrap();
+    assert!(matches!(store.apply_next(&other.binding, &mut late), Err(ConfirmationError::Apply)));
+    assert_eq!((status(&store, &other.binding), late.disables), (ConfirmationStatus::Failed, 1));
+}
+
 #[test]
 fn planted_admin_mcp_and_employees_remain_inert_until_approved() {
     let mut store = store(); let mut adapter = Adapter::default();
@@ -468,6 +518,212 @@ fn active_effect_blocks_same_proposal_compensation_but_not_other_decisions() {
     let other = stage(&mut store, 2, ConfirmationCategory::Department);
     store.apply_next(&item.binding, &mut Concurrent {path,other:other.binding}).unwrap();
     assert_eq!(required(&store.conn, &other.binding).unwrap().status, ConfirmationStatus::Approved);
+}
+
+/// Records every adapter call in order (0 stage, 1 publish, 2 read back,
+/// 3 disable_and_read_back); `fail` makes that call answer `Apply`.
+#[derive(Default)]
+struct Calls { calls: Vec<u8>, fail: Option<u8> }
+impl Calls {
+    fn call(&mut self, step: u8) -> Result<()> {
+        self.calls.push(step);
+        if self.fail == Some(step) { Err(ConfirmationError::Apply) } else { Ok(()) }
+    }
+}
+impl ProposalApplier for Calls {
+    fn stage(&mut self, _: &ConfirmationItem) -> Result<()> { self.call(0) }
+    fn publish(&mut self, _: &ConfirmationItem) -> Result<()> { self.call(1) }
+    fn read_back(&mut self, _: &ConfirmationItem) -> Result<()> { self.call(2) }
+    fn disable_and_read_back(&mut self, _: &ConfirmationItem) -> Result<()> { self.call(3) }
+}
+/// A gate closed from its `from`-th use on (1-based; an `is_closed` peek and
+/// an `enter` each count as one use); `calls` counts them.
+struct ClosedFrom<'a> { calls: &'a std::cell::Cell<usize>, from: usize }
+impl EffectGate for ClosedFrom<'_> {
+    fn enter(&self) -> Option<EffectPermit<'_>> { (!self.is_closed()).then(EffectPermit::untracked) }
+    fn is_closed(&self) -> bool { self.calls.set(self.calls.get() + 1); self.calls.get() >= self.from }
+}
+fn stop_from(calls: &std::cell::Cell<usize>, from: usize) -> ClosedFrom<'_> { ClosedFrom { calls, from } }
+/// A gate closed from the start.
+struct Closed;
+impl EffectGate for Closed {
+    fn enter(&self) -> Option<EffectPermit<'_>> { None }
+    fn is_closed(&self) -> bool { true }
+}
+fn state(store: &ConfirmationStore, binding: &ProposalBinding) -> (ConfirmationStatus, Option<i64>) {
+    (required(&store.conn, binding).unwrap().status, step(&store.conn, binding).unwrap())
+}
+fn intents(store: &ConfirmationStore) -> i64 {
+    store.conn.query_row("SELECT COUNT(*) FROM migration_effect_intents", [], |r| r.get(0)).unwrap()
+}
+fn events(store: &ConfirmationStore, event: &str) -> i64 {
+    store.conn.query_row("SELECT COUNT(*) FROM migration_confirmation_audit WHERE event=?1", [event], |r| r.get(0)).unwrap()
+}
+
+/// R7d round 3: `stop` turning true at the gate right before each apply
+/// step (stage, publish, read back): the step is not called, the item is
+/// exactly as before (Approved stays Approved, never Failed), the intent is
+/// consumed, and the same apply without stop completes.
+#[test]
+fn apply_effect_gate_skips_each_step_and_the_same_apply_completes() {
+    for effect in 0..3u8 {
+        let mut store = store(); let item = stage(&mut store, 1, ConfirmationCategory::Department);
+        approve(&mut store, &item);
+        let mut adapter = Calls::default();
+        for _ in 0..effect { store.apply_next(&item.binding, &mut adapter).unwrap(); }
+        let before = state(&store, &item.binding);
+        let calls = std::cell::Cell::new(0);
+        // Call 1 precedes every write; call 2 is the gate right before the step.
+        let result = store.apply_next_until(&item.binding, &mut adapter, &stop_from(&calls, 2));
+        assert!(matches!(result, Err(ConfirmationError::Pending)), "step {effect}");
+        assert_eq!(calls.get(), 2);
+        assert_eq!(adapter.calls.len(), effect as usize, "step {effect} not called");
+        assert_eq!(state(&store, &item.binding), before);
+        assert!(matches!(before.0, ConfirmationStatus::Approved | ConfirmationStatus::Applying));
+        assert_eq!((intents(&store), events(&store, "apply_interrupted")), (0, 1));
+        for _ in effect..3 { store.apply_next(&item.binding, &mut adapter).unwrap(); }
+        assert_eq!(state(&store, &item.binding).0, ConfirmationStatus::Applied);
+        assert_eq!(adapter.calls, vec![0, 1, 2]);
+    }
+}
+
+/// R7d round 3: a step fails and `stop` turns true at the gate right before
+/// its compensation: no Disable, the item goes back to how the call found
+/// it (not Failed), no receipt for the failed step; the same apply without
+/// stop re-runs the step and compensates.
+#[test]
+fn apply_effect_gate_skips_compensation_and_never_marks_failed() {
+    for failing in 0..3u8 {
+        let mut store = store(); let item = stage(&mut store, 1, ConfirmationCategory::Department);
+        approve(&mut store, &item);
+        let mut adapter = Calls { fail: Some(failing), ..Calls::default() };
+        for _ in 0..failing { store.apply_next(&item.binding, &mut adapter).unwrap(); }
+        let before = state(&store, &item.binding);
+        let calls = std::cell::Cell::new(0);
+        // 1: before any write; 2: gate before the step; 3: after the failed
+        // step; 4: gate right before the Disable.
+        let result = store.apply_next_until(&item.binding, &mut adapter, &stop_from(&calls, 4));
+        assert!(matches!(result, Err(ConfirmationError::Pending)), "step {failing}");
+        assert_eq!(calls.get(), 4);
+        assert_eq!(adapter.calls, (0..=failing).collect::<Vec<u8>>(), "the step ran, no Disable");
+        assert_eq!(state(&store, &item.binding), before);
+        assert_ne!(before.0, ConfirmationStatus::Failed);
+        assert_eq!((intents(&store), events(&store, "apply_interrupted")), (0, 1));
+        assert!(matches!(store.apply_next(&item.binding, &mut adapter), Err(ConfirmationError::Apply)));
+        assert_eq!(adapter.calls.last(), Some(&3));
+        assert_eq!(state(&store, &item.binding), (ConfirmationStatus::Failed, Some(3)));
+    }
+}
+
+/// R7d round 3: a Failed-item retry with `stop` true before any write or at
+/// the gate right before its Disable: no Disable, the item stays Failed,
+/// no intent left; the same retry without stop compensates and resumes.
+#[test]
+fn retry_effect_gate_sends_no_disable_keeps_failed_and_the_same_retry_completes() {
+    let mut store = store(); let item = stage(&mut store, 1, ConfirmationCategory::Department);
+    approve(&mut store, &item);
+    let mut adapter = Calls { fail: Some(0), ..Calls::default() };
+    assert!(matches!(store.apply_next(&item.binding, &mut adapter), Err(ConfirmationError::Apply)));
+    assert_eq!(adapter.calls, vec![0, 3]);
+    adapter.fail = None;
+    let failed = state(&store, &item.binding);
+    assert_eq!(failed, (ConfirmationStatus::Failed, Some(3)));
+    for from in [1, 2] {
+        let calls = std::cell::Cell::new(0);
+        let result = store.retry_until(&item.binding, &session(), [7; 32], 101, &mut adapter, &Valid,
+            &stop_from(&calls, from));
+        assert!(matches!(result, Err(ConfirmationError::Pending)), "stop from {from}");
+        assert_eq!(calls.get(), from);
+        assert_eq!(adapter.calls, vec![0, 3], "no Disable (stop from {from})");
+        assert_eq!(state(&store, &item.binding), failed);
+        assert_eq!(intents(&store), 0);
+    }
+    assert_eq!(events(&store, "retry_interrupted"), 1);
+    store.retry_until(&item.binding, &session(), [7; 32], 101, &mut adapter, &Valid, &OpenGate).unwrap();
+    assert_eq!(adapter.calls, vec![0, 3, 3]);
+    assert_eq!(state(&store, &item.binding).0, ConfirmationStatus::Applying);
+    for _ in 0..3 { store.apply_next(&item.binding, &mut adapter).unwrap(); }
+    assert_eq!(state(&store, &item.binding).0, ConfirmationStatus::Applied);
+}
+
+/// R7d round 3: reject of an Applying (staged) and of a Failed item with
+/// `stop` true before any write or at the gate right before the Disable: no
+/// Disable, the item keeps its state (not Rejecting / Rejected, an Applying
+/// one not Failed), no intent left; the same reject without stop completes.
+/// A Pending item needs no effect and is rejected even while stopping.
+#[test]
+fn reject_effect_gate_sends_no_disable_keeps_state_and_the_same_reject_completes() {
+    for failed in [false, true] {
+        let mut store = store(); let item = stage(&mut store, 1, ConfirmationCategory::Department);
+        approve(&mut store, &item);
+        let mut adapter = Calls { fail: failed.then_some(0), ..Calls::default() };
+        let staged = store.apply_next(&item.binding, &mut adapter);
+        assert_eq!(staged.is_err(), failed);
+        adapter.fail = None;
+        let before = state(&store, &item.binding);
+        assert_eq!(before.0, if failed { ConfirmationStatus::Failed } else { ConfirmationStatus::Applying });
+        let made = adapter.calls.clone();
+        for from in [1, 2] {
+            let calls = std::cell::Cell::new(0);
+            let result = store.reject_until(&item.binding, &session(), [7; 32], 101, &mut adapter, &stop_from(&calls, from));
+            assert!(matches!(result, Err(ConfirmationError::Pending)), "stop from {from}");
+            assert_eq!(calls.get(), from);
+            assert_eq!(adapter.calls, made, "no Disable (stop from {from})");
+            assert_eq!(state(&store, &item.binding), before);
+            assert_eq!(intents(&store), 0);
+        }
+        assert_eq!(events(&store, "reject_interrupted"), 1);
+        store.reject_until(&item.binding, &session(), [7; 32], 101, &mut adapter, &OpenGate).unwrap();
+        assert_eq!(adapter.calls.last(), Some(&3));
+        assert_eq!(state(&store, &item.binding).0, ConfirmationStatus::Rejected);
+    }
+    let mut store = store(); let item = stage(&mut store, 1, ConfirmationCategory::Department);
+    let mut adapter = Calls::default();
+    store.reject_until(&item.binding, &session(), [7; 32], 101, &mut adapter, &Closed).unwrap();
+    assert!(adapter.calls.is_empty());
+    assert_eq!(state(&store, &item.binding).0, ConfirmationStatus::Rejected);
+}
+
+/// R7d round 3, the review scenario: a Failed-item retry waits behind
+/// another SQLite writer (its transaction set-up, after the proposal lock)
+/// while shutdown begins; when it proceeds it sends no Disable, the item
+/// stays Failed and no intent is left.
+#[test]
+fn retry_waiting_for_the_writer_while_shutdown_begins_sends_no_disable() {
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    let dir = tempfile::tempdir().unwrap(); let path = dir.path().join("confirmations.db");
+    let conn = Connection::open(&path).unwrap();
+    conn.busy_timeout(std::time::Duration::from_secs(10)).unwrap();
+    let mut store = ConfirmationStore::from_connection(conn).unwrap();
+    let item = stage(&mut store, 1, ConfirmationCategory::Department); approve(&mut store, &item);
+    let mut adapter = Calls { fail: Some(0), ..Calls::default() };
+    assert!(store.apply_next(&item.binding, &mut adapter).is_err());
+    assert_eq!(adapter.calls, vec![0, 3]);
+    let blocker = Connection::open(&path).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let stopping = Arc::new(AtomicBool::new(false));
+    let flag = stopping.clone();
+    let binding = item.binding;
+    /// Closed once the flag is set (a test stand-in for the gateway's gate).
+    struct Flag(Arc<AtomicBool>);
+    impl EffectGate for Flag {
+        fn enter(&self) -> Option<EffectPermit<'_>> { (!self.is_closed()).then(EffectPermit::untracked) }
+        fn is_closed(&self) -> bool { self.0.load(Ordering::SeqCst) }
+    }
+    let worker = std::thread::spawn(move || {
+        let mut adapter = Calls::default();
+        let result = store.retry_until(&binding, &session(), [7; 32], 101, &mut adapter, &Valid, &Flag(flag));
+        (store, adapter.calls, result)
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(!worker.is_finished(), "the retry waits behind the writer");
+    stopping.store(true, Ordering::SeqCst);
+    blocker.execute_batch("COMMIT").unwrap();
+    let (store, calls, result) = worker.join().unwrap();
+    assert!(matches!(result, Err(ConfirmationError::Pending)));
+    assert!(calls.is_empty(), "no Disable once shutdown began");
+    assert_eq!(state(&store, &binding), (ConfirmationStatus::Failed, Some(3)));
+    assert_eq!(intents(&store), 0);
 }
 
 #[test]

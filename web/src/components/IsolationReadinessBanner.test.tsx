@@ -5,7 +5,7 @@ import { renderWithProviders } from '@/test/render';
 import { useAuthStore } from '@/stores/auth-store';
 import { useSystemStore } from '@/stores/system-store';
 import type { IsolationReadiness, SystemStatus } from '@/lib/api';
-import { IsolationReadinessBanner } from './IsolationReadinessBanner';
+import { IsolationReadinessBanner, IsolationReadinessNotices } from './IsolationReadinessBanner';
 
 const refresh = vi.fn(async () => {});
 const originalRefresh = useSystemStore.getState().fetchStatus;
@@ -228,6 +228,30 @@ describe('IsolationReadinessBanner', () => {
       notices: [{ code: 'workspace_broker_unavailable' }, { code: 'helper_runtime_missing', runtime: 'duduclaw-code-map-v1' }] });
     const { container } = renderWithProviders(<IsolationReadinessBanner />);
     expect(container).toBeEmptyDOMElement();
+  });
+
+  it('explains a migration waiting for confirmation as an admin action', () => {
+    setReadiness({ ...readiness(), ready: true, status: 'action_required', reasons: [{ code: 'migration_pending' }] });
+    renderWithProviders(<IsolationReadinessBanner />);
+    expect(screen.getByText(/a data migration is waiting for an administrator to confirm it/, { selector: 'li' }))
+      .toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Review migration confirmations' }))
+      .toHaveAttribute('href', '/app/system/migration');
+  });
+
+  it('shows the Landlock clamp only as an admin notice, never as an alert', () => {
+    const clamped = 'This computer’s file access protection is newer than this version knows, so the newest protection rules this version knows are applied.';
+    setReadiness({ ...readiness(), ready: true, status: 'ready', reasons: [], notices: [{ code: 'landlock_abi_clamped' }] });
+    const { container, unmount } = renderWithProviders(<IsolationReadinessBanner />);
+    expect(container).toBeEmptyDOMElement();
+    unmount();
+    const notices = renderWithProviders(<IsolationReadinessNotices />);
+    expect(screen.getByRole('status')).toHaveTextContent(clamped);
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    notices.unmount();
+    useAuthStore.setState({ user: { ...useAuthStore.getState().user!, role: 'employee' } });
+    const hidden = renderWithProviders(<IsolationReadinessNotices />);
+    expect(hidden.container).toBeEmptyDOMElement();
   });
 
   it('preserves the legacy description when reasons are absent', () => {

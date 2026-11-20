@@ -3,6 +3,9 @@
 //! does NOT bypass or claim acceptance of production gateway boot/CLI factories.
 #![cfg(target_os = "linux")]
 
+#[path = "support/run_cleanup.rs"]
+mod run_cleanup;
+
 use std::{ffi::OsString, fs, io::{Read, Write}, os::{fd::{AsRawFd, FromRawFd},
     unix::{fs::MetadataExt, net::UnixStream, process::CommandExt}}, path::{Path, PathBuf},
     process::{Child, Command, Stdio}, sync::{Arc, Mutex}, time::{Duration, Instant}};
@@ -114,12 +117,14 @@ impl Drop for Cleanup {
         if self.child.try_wait().ok().flatten().is_none() {
             eprintln!("gateway test child did not retire after SIGKILL");
         }
-        if !self.finished {
+        {
             if let Some(run) = self.run {
                 if let Ok(systemd) = duduclaw_spawnd::systemd::linux::Systemd::connect() {
-                    let _ = systemd.kill_run(run.0);
                     if let Ok(unit) = systemd.inspect_run(run.0) {
                         if !unit.cgroup.as_os_str().is_empty() { self.cgroup = Some(unit.cgroup); }
+                    }
+                    if let Err(error) = run_cleanup::cleanup_run(&systemd, run.0) {
+                        eprintln!("Claude test-owned run cleanup failed: {error}");
                     }
                 }
             }
@@ -289,6 +294,17 @@ impl LiveAuthority for TestAuthority {
 }
 struct Echo { setup: Arc<Setup>, observer: Arc<Mutex<UnixStream>>, calls: Mutex<u32> }
 impl Dispatcher for Echo {
+    fn require_context_services(&self, context: &RequestContext) -> Result<(), VerificationError> {
+        let record = context.record();
+        // This fixture serves only its finite echo grant, not employee-scope services.
+        if record.employee != self.setup.employee || record.principal != principal()
+            || record.employee_binding != binding() || record.employee_scope()
+            || record.tools.as_slice().iter().map(|name| name.as_str()).collect::<Vec<_>>() != vec![TOOL]
+            || !record.resources.as_slice().is_empty() {
+            return Err(VerificationError::BindingMismatch);
+        }
+        Ok(())
+    }
     fn dispatch<'a>(&'a self, context: RequestContext, agent: &'a str, request: Value)
         -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<Value>, VerificationError>> + Send + 'a>> {
         Box::pin(async move {
@@ -374,8 +390,10 @@ async fn run_gateway(setup: Arc<Setup>, observer: Arc<Mutex<UnixStream>>) {
     let backend = Arc::new(SpawndBackend::connect().await.expect("real root spawnd endpoint"));
     let prompt = format!("Call the duduclaw MCP tool {TOOL} exactly once with challenge \"{}\" and the system_challenge from your system instructions. Return its text verbatim. Do not use other tools.\n", setup.challenge);
     let factory = duduclaw_spawnd::gateway_plan::InstalledMainPlanFactory::new(setup.generation, gid).unwrap();
+    // R6: the value root enforces (fixed 50 for v1/v2, the ranged default for v3).
+    let max_turns = factory.claude_max_turns(setup.employee, 50).unwrap();
     let plan = factory.claude(setup.employee, ExecutionClass::EmployeeMain, prompt.as_bytes().to_vec(),
-        format!("This is isolated transport acceptance. The system_challenge is {}. Supply it as the system_challenge tool argument when the user asks; follow that tool request exactly.", setup.system_challenge).into_bytes(), &setup.model).unwrap();
+        format!("This is isolated transport acceptance. The system_challenge is {}. Supply it as the system_challenge tool argument when the user asks; follow that tool request exactly.", setup.system_challenge).into_bytes(), &setup.model, max_turns).unwrap();
     let now = duduclaw_mcp_boundary::authority::now_seconds().unwrap();
     let grant = GrantPolicy { task: None, principal: principal(), binding: binding(), lane: Lane::Standard,
         tools: List::new(vec![Text::new(TOOL.into()).unwrap()]).unwrap(), resources: List::new(vec![]).unwrap(),

@@ -43,6 +43,10 @@ tracing-appender = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 duduclaw-gateway = { workspace = true }
+# R8r-2: `service provider set` validates the providers document with the
+# employee runtime's own rules (`Credential::validate`). Already in this
+# build through duduclaw-gateway (same default features): no new crate.
+duduclaw-api-worker = { path = "../duduclaw-api-worker" }
 bollard = { workspace = true }
 duduclaw-memory = { workspace = true }
 duduclaw-identity = { workspace = true }
@@ -109,6 +113,11 @@ unicode-normalization = "0.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 duduclaw-migration = { path = "../duduclaw-migration" }
+# v1.83 R4 composite readiness: spawnd's host evidence reader and egress's
+# root config reader/validator (both already in the Linux tree via the gateway
+# and the shipped isolation binaries; no new third-party crate).
+duduclaw-spawnd = { path = "../duduclaw-spawnd" }
+duduclaw-egress = { path = "../duduclaw-egress" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
@@ -132,8 +141,8 @@ http-body-util = "0.1"
 axum = { workspace = true }
 
 [features]
-# Protected MCP boot must explicitly install the checked E worker.
-isolation-worker-integration = ["duduclaw-gateway/isolation-worker-integration"]
+# inert since v1.83: the worker integration is always compiled; kept so existing --features invocations resolve
+isolation-worker-integration = []
 # Explicit non-shipping subprocess fault-injection build; never enabled by default.
 workflow-test-checkpoints = []
 # Aligned with `duduclaw-gateway/default = ["dashboard", "desktop"]` so that
@@ -156,3 +165,9 @@ live-test-mocks = ["duduclaw-gateway/live-test-mocks"]
 # `--features app-compat`; main-repo CI keeps one `cargo check` on it so the
 # OS-only surface cannot bit-rot.
 app-compat = ["duduclaw-core/app-compat"]
+
+# users_mfa_test_build.rs (E10): the TEST-only first-run setup-code issuer
+# exists only in a `--cfg duduclaw_test_root` build (same cfg as the gateway's
+# TEST licence issuer and the duduclaw-updated test-key verifier).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(duduclaw_test_root)'] }

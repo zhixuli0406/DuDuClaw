@@ -3,9 +3,27 @@ use std::{fs::{self, File, OpenOptions}, io::{Read, Write}, os::{fd::{AsRawFd, F
     unix::{ffi::OsStrExt, fs::{MetadataExt, OpenOptionsExt}}}, path::{Path, PathBuf}};
 use duduclaw_isolation::{execution::{DiskQuota, RunHandle}, ids::{EmployeeId, RequestId, Sha256Digest}, ipc::ErrorCode};
 use duduclaw_isolation_storage::{EmployeeStorage, ImageStatus, Quota};
-use super::{adapter_state::{Employee, Journal, Lease, Operation, Phase, MAX_BYTES}, *};
+use super::{adapter_state::{Employee, Journal, Lease, Maintenance, Operation, Phase, MAX_BYTES}, *};
 
 fn unavailable<T>(_: T) -> ErrorCode { ErrorCode::IsolationUnavailable }
+
+/// Root-local diagnostics only; never crosses the IPC boundary.
+pub(crate) fn storage_open_reason(error: duduclaw_isolation_storage::Error) -> &'static str {
+    use duduclaw_isolation_storage::Error;
+    match error {
+        Error::Unsupported => "unsupported host",
+        Error::Invalid => "invalid storage",
+        Error::Capacity => "capacity reserve",
+        // H uses the same error for the device graph and mount propagation.
+        Error::UnsafeBacking => "backing not supported or mount not private",
+        Error::RecoveryRequired => "recovery required",
+        Error::Busy => "busy",
+        Error::NotFound => "image not found",
+        Error::Quarantined => "quarantined",
+        Error::ResizeUnsupported => "resize not supported",
+        Error::Io => "storage I/O",
+    }
+}
 
 /// Construct after root installation has created both directories. The adapter
 /// never allocates accounts or authorizes a migration proposal. B1 retains its
@@ -21,6 +39,15 @@ impl LoopStorage {
     pub fn open(storage_directory: &Path, journal_directory: &Path) -> Result<Self> {
         let provider = duduclaw_isolation_storage::Storage::open(storage_directory).map_err(unavailable)?;
         Self::with_provider(Box::new(provider), journal_directory)
+    }
+    pub(crate) fn open_diagnosed(storage_directory: &Path, journal_directory: &Path) -> std::result::Result<Self, &'static str> {
+        let directory_ok = |path: &Path| crate::registry::root_path(path, true).is_ok()
+            && fs::symlink_metadata(path).is_ok_and(|meta|
+                meta.is_dir() && meta.uid() == 0 && meta.gid() == 0 && meta.mode() & 0o7777 == 0o700);
+        if !directory_ok(storage_directory) { return Err("image directory"); }
+        let provider = duduclaw_isolation_storage::Storage::open(storage_directory).map_err(storage_open_reason)?;
+        if !directory_ok(journal_directory) { return Err("journal directory"); }
+        Self::with_provider(Box::new(provider), journal_directory).map_err(|_| "journal unavailable")
     }
     fn with_provider(provider: Box<dyn EmployeeStorage>, directory: &Path) -> Result<Self> {
         if unsafe { libc::geteuid() } != 0 { return Err(ErrorCode::IsolationUnavailable); }
@@ -106,11 +133,53 @@ impl LoopStorage {
     fn image(&self, employee: EmployeeId) -> Result<ImageStatus> {
         self.inventory()?.into_iter().find(|image| image.employee == employee).ok_or(ErrorCode::NotFound)
     }
+    /// R8r-2: finish a left-over maintenance of `employee` (attach, remove the
+    /// recorded temp file from `.duduclaw-api`, detach, clear the marker).
+    fn recover_one(&mut self, employee: EmployeeId) -> std::result::Result<(), ProvidersFailure> {
+        let entry = self.journal.entry(employee).map_err(|_| ProvidersFailure::Unavailable)?;
+        let Some(Maintenance { temp }) = entry.maintenance.clone() else { return Ok(()) };
+        let uid = entry.uid;
+        let owner = duduclaw_migration::import_blobs::Owner { uid, gid: uid };
+        let mut steps = MaintenanceAdapter { storage: self, employee, uid };
+        super::recover(&mut steps, |home| crate::providers_file::remove_temp(home, owner, &temp))
+    }
+}
+
+/// R8r-2: `LoopStorage`'s steps of one provider-document maintenance; the
+/// order is [`super::maintain`] / [`super::recover`]'s.
+struct MaintenanceAdapter<'a> { storage: &'a mut LoopStorage, employee: EmployeeId, uid: u32 }
+impl super::MaintenanceSteps for MaintenanceAdapter<'_> {
+    type Home = OwnedFd;
+    fn mark(&mut self, temp: &str) -> std::result::Result<(), ProvidersFailure> {
+        let mut candidate = self.storage.journal.clone();
+        candidate.entry_mut(self.employee).map_err(|_| ProvidersFailure::Unavailable)?.maintenance = Some(Maintenance { temp: temp.into() });
+        self.storage.publish_candidate(candidate).map_err(|_| ProvidersFailure::Unavailable)
+    }
+    /// Exactly like `provision`'s temporary attach (noexec, never handed to a
+    /// runtime); then the `home` directory verified beneath the root anchor:
+    /// uid:uid, 0700, on the image's device.
+    fn attach(&mut self) -> std::result::Result<OwnedFd, ProvidersFailure> {
+        let anchor = self.storage.provider.attach(self.employee, true).map_err(|_| ProvidersFailure::Unavailable)?;
+        if !anchor.noexec { return Err(ProvidersFailure::Unavailable); }
+        let image = self.storage.image(self.employee).map_err(|_| ProvidersFailure::Unavailable)?;
+        let device = image.mounted_device.ok_or(ProvidersFailure::Unavailable)?;
+        let root = anchor_root(&anchor.path, device).map_err(|_| ProvidersFailure::Unavailable)?;
+        verified_child(&root, c"home", self.uid, device).map_err(|_| ProvidersFailure::Unavailable)
+    }
+    fn detach(&mut self) -> std::result::Result<(), ProvidersFailure> {
+        self.storage.provider.detach(self.employee).map_err(|_| ProvidersFailure::Unavailable)
+    }
+    fn unmark(&mut self) -> std::result::Result<(), ProvidersFailure> {
+        self.storage.journal.entry_mut(self.employee).map_err(|_| ProvidersFailure::Unavailable)?.maintenance = None;
+        self.storage.save().map_err(|_| ProvidersFailure::Unavailable)
+    }
 }
 impl Storage for LoopStorage {
     fn readiness(&mut self) -> Result<()> {
         self.inventory()?;
-        if self.journal.employees.iter().any(|entry| matches!(entry.phase, Phase::Provisioning | Phase::Destroying)) {
+        // R8r-2: an unfinished provider maintenance (a failed detach) holds
+        // readiness like an unfinished provision until it is recovered.
+        if self.journal.employees.iter().any(|entry| matches!(entry.phase, Phase::Provisioning | Phase::Destroying) || entry.maintenance.is_some()) {
             return Err(ErrorCode::IsolationUnavailable);
         }
         self.provider.readiness().map_err(unavailable)
@@ -126,10 +195,12 @@ impl Storage for LoopStorage {
                 return Err(ErrorCode::InvalidRequest);
             }
             if entry.lease.is_some() { return self.live_usage(request.employee); }
+            // R8r-2: never over an unfinished provider maintenance.
+            if entry.maintenance.is_some() { return Err(ErrorCode::IsolationUnavailable); }
             candidate.entry_mut(request.employee)?.phase = Phase::Provisioning;
         } else {
             candidate.employees.push(Employee { employee: request.employee, uid: request.uid,
-                quota, provision: operation, destroy: None, phase: Phase::Provisioning, lease: None });
+                quota, provision: operation, destroy: None, phase: Phase::Provisioning, lease: None, maintenance: None });
         }
         self.publish_candidate(candidate)?;
         // This temporary mount can never be handed to a runtime. A crash leaves
@@ -153,7 +224,8 @@ impl Storage for LoopStorage {
         self.readiness()?;
         let expected = Quota::try_from(quota).map_err(unavailable)?;
         let entry = self.journal.entry(employee)?;
-        if entry.phase != Phase::Ready || entry.uid != uid || entry.quota != expected || entry.lease.is_some() {
+        // R8r-2: a run never attaches over an unfinished provider maintenance.
+        if entry.phase != Phase::Ready || entry.uid != uid || entry.quota != expected || entry.lease.is_some() || entry.maintenance.is_some() {
             return Err(ErrorCode::InvalidRequest);
         }
         let mut token = [0u8; 16];
@@ -203,7 +275,9 @@ impl Storage for LoopStorage {
             return Err(ErrorCode::InvalidRequest);
         }
         if entry.phase == Phase::Destroyed { return Ok(()); }
-        entry.destroy = Some(requested); entry.phase = Phase::Destroying;
+        // R8r-2: a left-over maintenance ends with the image (its mount is
+        // detached below and any temp file is destroyed with it).
+        entry.destroy = Some(requested); entry.phase = Phase::Destroying; entry.maintenance = None;
         self.publish_candidate(candidate)?;
         if let Some(image) = self.inventory()?.into_iter().find(|image| image.employee == employee) {
             if image.mounted_device.is_some() { self.provider.detach(employee).map_err(unavailable)?; }
@@ -245,6 +319,37 @@ impl Storage for LoopStorage {
                     device_major: device.major, device_minor: device.minor })
             }).collect()
     }
+    /// R8r-2: a Ready, unleased employee only. A left-over maintenance of the
+    /// same employee is finished first. Then marker → temporary noexec attach
+    /// → the write/removal beneath the verified home descriptor → detach →
+    /// marker cleared ([`super::maintain`]).
+    fn write_providers(&mut self, employee: EmployeeId, uid: u32, change: ProvidersChange<'_>) -> std::result::Result<(), ProvidersFailure> {
+        self.inventory().map_err(|_| ProvidersFailure::Unavailable)?;
+        let entry = self.journal.entry(employee).map_err(|_| ProvidersFailure::Unavailable)?;
+        if entry.phase != Phase::Ready || entry.uid != uid { return Err(ProvidersFailure::Unavailable); }
+        if entry.lease.is_some() { return Err(ProvidersFailure::Busy); }
+        if entry.maintenance.is_some() { self.recover_one(employee)?; }
+        let mut random = [0u8; 8];
+        if duduclaw_run::linux::syscalls::getrandom(&mut random, 0).ok() != Some(random.len()) {
+            return Err(ProvidersFailure::Unavailable);
+        }
+        let temp = super::providers_temp_name(random);
+        let owner = duduclaw_migration::import_blobs::Owner { uid, gid: uid };
+        let mut steps = MaintenanceAdapter { storage: self, employee, uid };
+        super::maintain(&mut steps, &temp, |home| match change {
+            ProvidersChange::Write(bytes) => crate::providers_file::write(home, owner, &temp, bytes),
+            ProvidersChange::Clear => crate::providers_file::clear(home, owner),
+        })
+    }
+    /// R8r-2 start-up: every marker left by a crash or a failed detach is
+    /// finished (left-over mount detached, left-over temp file removed)
+    /// before any run or maintenance of that employee.
+    fn recover_maintenance(&mut self) -> Result<()> {
+        self.inventory()?;
+        let pending: Vec<EmployeeId> = self.journal.employees.iter().filter(|entry| entry.maintenance.is_some()).map(|entry| entry.employee).collect();
+        for employee in pending { self.recover_one(employee).map_err(|_| ErrorCode::IsolationUnavailable)?; }
+        Ok(())
+    }
 }
 
 fn check_file(file: &File) -> Result<()> {
@@ -258,27 +363,9 @@ fn check_file(file: &File) -> Result<()> {
 /// H returns only a verified root mount anchor. Resolve home/work beneath its
 /// descriptor, never through employee symlinks, then clone private/noexec trees.
 fn mounts(path: &Path, uid: u32, device: duduclaw_isolation_storage::device::DeviceId) -> Result<(OwnedFd, OwnedFd)> {
-    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(unavailable)?;
-    let raw = unsafe { libc::open(name.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
-    if raw < 0 { return Err(ErrorCode::IsolationUnavailable); }
-    let root = unsafe { OwnedFd::from_raw_fd(raw) };
-    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(root.as_raw_fd(), &mut stat) } != 0 || stat.st_uid != 0
-        || stat.st_mode & 0o022 != 0 || libc::major(stat.st_dev) != device.major || libc::minor(stat.st_dev) != device.minor {
-        return Err(ErrorCode::IsolationUnavailable);
-    }
+    let root = anchor_root(path, device)?;
     let clone = |name: &std::ffi::CStr| -> Result<OwnedFd> {
-        #[repr(C)] struct OpenHow { flags: u64, mode: u64, resolve: u64 }
-        let how = OpenHow { flags: (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64,
-            mode: 0, resolve: 0x08 | 0x04 | 0x02 | 0x01 };
-        let raw = unsafe { libc::syscall(libc::SYS_openat2, root.as_raw_fd(), name.as_ptr(), &how, std::mem::size_of::<OpenHow>()) };
-        if raw < 0 { return Err(ErrorCode::IsolationUnavailable); }
-        let child = unsafe { OwnedFd::from_raw_fd(raw as i32) };
-        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstat(child.as_raw_fd(), &mut stat) } != 0 || stat.st_uid != uid || stat.st_gid != uid
-            || stat.st_mode & 0o7777 != 0o700 || libc::major(stat.st_dev) != device.major || libc::minor(stat.st_dev) != device.minor {
-            return Err(ErrorCode::IsolationUnavailable);
-        }
+        let child = verified_child(&root, name, uid, device)?;
         let raw = unsafe { libc::syscall(libc::SYS_open_tree, child.as_raw_fd(), c"".as_ptr(),
             1u32 | libc::O_CLOEXEC as u32 | 0x8000u32 | libc::AT_EMPTY_PATH as u32) };
         if raw < 0 { return Err(ErrorCode::IsolationUnavailable); }
@@ -294,6 +381,36 @@ fn mounts(path: &Path, uid: u32, device: duduclaw_isolation_storage::device::Dev
         Ok(mount)
     };
     Ok((clone(c"home")?, clone(c"work")?))
+}
+/// H's verified root mount anchor: root-owned, not group/world writable, on
+/// the image's device (shared by `mounts` and the R8r-2 maintenance).
+fn anchor_root(path: &Path, device: duduclaw_isolation_storage::device::DeviceId) -> Result<OwnedFd> {
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(unavailable)?;
+    let raw = unsafe { libc::open(name.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    if raw < 0 { return Err(ErrorCode::IsolationUnavailable); }
+    let root = unsafe { OwnedFd::from_raw_fd(raw) };
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(root.as_raw_fd(), &mut stat) } != 0 || stat.st_uid != 0
+        || stat.st_mode & 0o022 != 0 || libc::major(stat.st_dev) != device.major || libc::minor(stat.st_dev) != device.minor {
+        return Err(ErrorCode::IsolationUnavailable);
+    }
+    Ok(root)
+}
+/// `home` or `work` beneath the anchor (openat2: beneath, no symlinks, no
+/// magic links, no mount crossing), verified uid:uid, mode 0700, same device.
+fn verified_child(root: &OwnedFd, name: &std::ffi::CStr, uid: u32, device: duduclaw_isolation_storage::device::DeviceId) -> Result<OwnedFd> {
+    #[repr(C)] struct OpenHow { flags: u64, mode: u64, resolve: u64 }
+    let how = OpenHow { flags: (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64,
+        mode: 0, resolve: 0x08 | 0x04 | 0x02 | 0x01 };
+    let raw = unsafe { libc::syscall(libc::SYS_openat2, root.as_raw_fd(), name.as_ptr(), &how, std::mem::size_of::<OpenHow>()) };
+    if raw < 0 { return Err(ErrorCode::IsolationUnavailable); }
+    let child = unsafe { OwnedFd::from_raw_fd(raw as i32) };
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(child.as_raw_fd(), &mut stat) } != 0 || stat.st_uid != uid || stat.st_gid != uid
+        || stat.st_mode & 0o7777 != 0o700 || libc::major(stat.st_dev) != device.major || libc::minor(stat.st_dev) != device.minor {
+        return Err(ErrorCode::IsolationUnavailable);
+    }
+    Ok(child)
 }
 
 #[cfg(test)]
@@ -349,5 +466,21 @@ mod tests {
         for name in ["storage.lock", "state.json"] { fs::remove_file(images.join(name)).unwrap(); }
         for name in ["storage-adapter.lock", "storage-adapter.json"] { fs::remove_file(journal.join(name)).unwrap(); }
         fs::remove_dir(images).unwrap(); fs::remove_dir(journal).unwrap(); fs::remove_dir(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod open_reason_tests {
+    use super::*;
+    #[test]
+    fn storage_open_reasons_cover_every_variant() {
+        use duduclaw_isolation_storage::Error::*;
+        for (error, expected) in [(Unsupported, "unsupported host"), (Invalid, "invalid storage"),
+            (Capacity, "capacity reserve"), (UnsafeBacking, "backing not supported or mount not private"),
+            (RecoveryRequired, "recovery required"), (Busy, "busy"), (NotFound, "image not found"),
+            (Quarantined, "quarantined"), (ResizeUnsupported, "resize not supported"), (Io, "storage I/O")] {
+            assert_eq!(storage_open_reason(error), expected);
+            assert!(!expected.is_empty());
+        }
     }
 }

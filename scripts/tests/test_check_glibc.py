@@ -37,17 +37,29 @@ class GlibcBaselineTests(unittest.TestCase):
                          if step.get('run', '').startswith(packager) and '--build-only' in step['run'])
             self.assertEqual(build['if'], "runner.os == 'Linux'")
             if workflow == 'release.yml':
-                # The packager runs the glibc guard itself (--skip-build step).
+                # The packager runs the glibc guard itself (--skip-build step):
+                # x86_64 packages on the build runner, aarch64 exports the same
+                # checked snapshot for native arm64 packaging, which re-checks it.
                 guard = next(step for step in steps
                              if step.get('run', '').startswith(packager) and '--skip-build' in step['run'])
                 self.assertEqual(guard['name'], 'Package Linux binaries and check glibc baseline')
-                self.assertIn('check_glibc',
-                              (root / 'scripts/package-linux-release.py').read_text())
+                self.assertEqual(guard['if'], "matrix.target == 'x86_64-unknown-linux-gnu'")
+                export = next(step for step in steps if step.get('id') == 'arm64_inputs')
+                self.assertEqual(export['if'], "matrix.target == 'aarch64-unknown-linux-gnu'")
+                self.assertIn('--skip-build', export['run'])
+                self.assertGreater(steps.index(export), steps.index(build))
+                native = next(step for step in document['jobs']['package-linux-arm64']['steps']
+                              if step.get('name') == 'Package Linux arm64 binaries natively and check glibc baseline')
+                self.assertIn('--target aarch64-unknown-linux-gnu --skip-build', native['run'])
+                source = (root / 'scripts/package-linux-release.py').read_text()
+                self.assertIn('check_glibc', source)
+                # The glibc guard runs for every staged binary, including handed-off ones.
+                self.assertIn('require_executable=transfer is None', source)
             else:
                 guard = next(step for step in steps if step.get('name') == 'Check Linux glibc baseline')
                 self.assertIn('scripts/check_glibc.py', guard['run'])
                 self.assertIn('${{ matrix.target }}', guard['run'])
-            self.assertEqual(guard['if'], "runner.os == 'Linux'")
+                self.assertEqual(guard['if'], "runner.os == 'Linux'")
             self.assertGreater(steps.index(guard), steps.index(build))
             self.assertIn('${{ matrix.target }}', guard['run'])
 

@@ -11,6 +11,9 @@ pub mod transport;
 pub mod resolver;
 #[cfg(target_os = "linux")]
 pub mod daemon;
+/// R7b: the `ProbeDns` control request (one bounded, rate-limited lookup).
+#[cfg(target_os = "linux")]
+pub mod dns_probe;
 #[cfg(target_os = "linux")]
 pub mod forwarder;
 
@@ -22,3 +25,6 @@ pub mod seccomp;
 
 #[cfg(target_os = "linux")]
 pub mod controller;
+
+/// R6 update readback endpoint (`/run/duduclaw-egress-update/readback.sock`).
+pub mod update_readback;

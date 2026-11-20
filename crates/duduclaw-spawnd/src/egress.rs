@@ -2,31 +2,45 @@
 use std::{io, os::fd::{BorrowedFd, AsFd, OwnedFd}};
 use duduclaw_isolation::{egress::{EgressControl, EgressControlResponse, ProfileId},
     ids::{RunId, RequestId}, ipc::{self, Envelope}};
-use crate::transport::Seqpacket;
+use crate::transport::{EgressSeqpacket, Seqpacket};
 
 fn unavailable() -> io::Error { io::Error::other("egress unavailable") }
-pub struct EgressControlClient { socket: Seqpacket }
+/// Every response frame is read through `EgressSeqpacket::recv`, which requires
+/// the egress account's kernel-attached sender credentials (§8 R7e).
+pub struct EgressControlClient { socket: EgressSeqpacket }
 impl EgressControlClient {
     pub fn connect(uid: u32, gid: u32) -> io::Result<Self> {
         Ok(Self { socket: Seqpacket::connect_fixed_egress(uid, gid)? })
     }
     pub fn register(&mut self, request: RequestId, run: RunId, profile: ProfileId, fd: BorrowedFd<'_>) -> io::Result<()> {
-        self.exchange(request, EgressControl::Register { run_id: run, profile_id: profile }, &[fd], true)
+        match self.exchange(request, EgressControl::Register { run_id: run, profile_id: profile }, &[fd])? {
+            EgressControlResponse::Registered => Ok(()),
+            _ => Err(unavailable()),
+        }
     }
     pub fn unregister(&mut self, request: RequestId, run: RunId) -> io::Result<()> {
-        self.exchange(request, EgressControl::Unregister { run_id: run }, &[], false)
+        match self.exchange(request, EgressControl::Unregister { run_id: run }, &[])? {
+            EgressControlResponse::Unregistered => Ok(()),
+            _ => Err(unavailable()),
+        }
     }
-    fn exchange(&mut self, request_id: RequestId, message: EgressControl, descriptors: &[BorrowedFd<'_>], register: bool) -> io::Result<()> {
+    /// R7b: one `ProbeDns` exchange. Only `DnsProbed` or `Refused` answer it;
+    /// the caller decides whether the answer is evidence. Egress answers within
+    /// its 3 s probe deadline, inside the 5 s control receive timeout.
+    pub fn probe_dns(&mut self, request: RequestId, name: &str) -> io::Result<EgressControlResponse> {
+        match self.exchange(request, EgressControl::ProbeDns { name: name.to_owned() }, &[])? {
+            response @ (EgressControlResponse::DnsProbed { .. } | EgressControlResponse::Refused { .. }) => Ok(response),
+            _ => Err(unavailable()),
+        }
+    }
+    fn exchange(&mut self, request_id: RequestId, message: EgressControl, descriptors: &[BorrowedFd<'_>]) -> io::Result<EgressControlResponse> {
         let bytes = ipc::encode(&Envelope { version: ipc::PROTOCOL_VERSION, request_id, message }).map_err(|_| unavailable())?;
         self.socket.send(&bytes, descriptors)?;
         let packet = self.socket.recv()?;
         if !packet.fds.is_empty() { return Err(unavailable()); }
         let response = ipc::decode::<EgressControlResponse>(&packet.bytes).map_err(|_| unavailable())?;
         if response.request_id != request_id { return Err(unavailable()); }
-        match (register, response.message) {
-            (true, EgressControlResponse::Registered) | (false, EgressControlResponse::Unregistered) => Ok(()),
-            _ => Err(unavailable()),
-        }
+        Ok(response.message)
     }
     pub fn register_owned(&mut self, request: RequestId, run: RunId, profile: ProfileId, fd: OwnedFd) -> io::Result<()> {
         self.register(request, run, profile, fd.as_fd())
@@ -64,7 +78,7 @@ mod tests {
                 request_id: request.request_id, message: EgressControlResponse::Unregistered }).unwrap(), &[]).unwrap();
         });
         let pair = crate::channels::RevocablePair::new().unwrap();
-        let mut client = EgressControlClient { socket: client };
+        let mut client = own_account(client);
         client.register_owned(RequestId([3; 16]), run, profile, pair.gateway).unwrap();
         client.unregister(RequestId([4; 16]), run).unwrap();
         peer.join().unwrap();
@@ -86,9 +100,69 @@ mod tests {
                 let descriptors = if case == 2 { vec![extra.gateway.as_fd()] } else { vec![] };
                 server.send(&ipc::encode(&response).unwrap(), &descriptors).unwrap();
             });
-            let mut client = EgressControlClient { socket: client };
+            let mut client = own_account(client);
             assert!(client.unregister(RequestId([4; 16]), RunId([1; 16])).is_err());
             peer.join().unwrap();
+        }
+    }
+
+    /// R7b: `ProbeDns` carries no descriptor, and only a correlated
+    /// `DnsProbed`/`Refused` without descriptors answers it.
+    #[test]
+    fn probe_dns_sends_the_name_and_returns_only_probe_answers() {
+        use duduclaw_isolation::egress::{DnsRoute, EgressError};
+        let probed = EgressControlResponse::DnsProbed { route: DnsRoute::ResolvedVarlink, resolved: true, public_addresses: 2 };
+        let refused = EgressControlResponse::Refused { code: EgressError::ResourceLimit };
+        for (case, answer) in [probed.clone(), refused.clone(), EgressControlResponse::Registered,
+            EgressControlResponse::Unregistered, probed.clone(), probed.clone()].into_iter().enumerate() {
+            let (client, server) = Seqpacket::pair().unwrap();
+            let peer = std::thread::spawn(move || {
+                let packet = server.recv().unwrap();
+                assert!(packet.fds.is_empty());
+                let request = ipc::decode::<EgressControl>(&packet.bytes).unwrap();
+                assert_eq!(request.message, EgressControl::ProbeDns { name: "api.example.com".into() });
+                let request_id = if case == 4 { RequestId([9; 16]) } else { request.request_id };
+                let extra = crate::channels::RevocablePair::new().unwrap();
+                let descriptors = if case == 5 { vec![extra.gateway.as_fd()] } else { vec![] };
+                server.send(&ipc::encode(&Envelope { version: ipc::PROTOCOL_VERSION, request_id, message: answer }).unwrap(),
+                    &descriptors).unwrap();
+            });
+            let mut client = own_account(client);
+            let result = client.probe_dns(RequestId([6; 16]), "api.example.com");
+            peer.join().unwrap();
+            match case {
+                0 => assert_eq!(result.unwrap(), probed),
+                1 => assert_eq!(result.unwrap(), refused),
+                _ => assert!(result.is_err(), "case {case}"),
+            }
+        }
+    }
+
+    /// The test process stands in for the egress account: its real uid/gid are
+    /// what the kernel attaches to frames the peer thread sends.
+    fn own_account(socket: Seqpacket) -> EgressControlClient {
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        EgressControlClient { socket: EgressSeqpacket::with_passcred(socket, uid, gid).unwrap() }
+    }
+
+    #[test]
+    fn acknowledgement_from_another_account_refuses_egress_lifecycle() {
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        for (expected_uid, expected_gid) in [(uid.wrapping_add(1), gid), (uid, gid.wrapping_add(1))] {
+            let (client, server) = Seqpacket::pair().unwrap();
+            let peer = std::thread::spawn(move || {
+                let packet = server.recv().unwrap();
+                let request = ipc::decode::<EgressControl>(&packet.bytes).unwrap();
+                server.send(&ipc::encode(&Envelope { version: ipc::PROTOCOL_VERSION,
+                    request_id: request.request_id, message: EgressControlResponse::Unregistered }).unwrap(), &[]).unwrap();
+            });
+            let mut client = EgressControlClient {
+                socket: EgressSeqpacket::with_passcred(client, expected_uid, expected_gid).unwrap() };
+            // A correct acknowledgement from the wrong sender is still refused.
+            assert!(client.unregister(RequestId([4; 16]), RunId([1; 16])).is_err());
+            peer.join().unwrap();
+            // The connection was shut down; it cannot be reused.
+            assert!(client.unregister(RequestId([5; 16]), RunId([1; 16])).is_err());
         }
     }
 }

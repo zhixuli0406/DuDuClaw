@@ -1,8 +1,10 @@
 //! Run only on disposable root-capable Linux acceptance VMs. No installer here.
+//! Exception: `iso_bootstrap_filter_refuses_fork_and_admits_the_probe_thread`
+//! is unprivileged and runs everywhere on Linux (in its own child process).
 #![cfg(target_os = "linux")]
 #![allow(unsafe_code)]
 use std::{net::SocketAddr, time::Duration};
-use duduclaw_egress::{controller::{EgressController, RootEgressController}, resolver::{HostResolver, Resolver}, session::{read_frame, write_frame}, transport::CheckedSocket};
+use duduclaw_egress::{controller::{EgressController, RootEgressController}, resolver::{HostResolver, Resolver}, session::{JournalTerminalCode, read_frame, write_frame}, transport::CheckedSocket};
 use duduclaw_isolation::{bounded::{List, Text}, egress::*, ids::RunId};
 
 #[test]
@@ -40,6 +42,42 @@ fn iso_root_seccomp_real_syscalls() {
         assert!(client.is_ok()); assert!(server.is_ok());
         tokio::time::sleep(Duration::from_millis(1)).await;
     });
+}
+
+/// R8j round 3 F4: the daemon's first start-up step (the bootstrap filter),
+/// then what start-up does under it. Unprivileged (seccomp under
+/// NoNewPrivileges needs no root), so not ignored: any Linux run executes it.
+/// The filtered actions run only in a child process (this test binary
+/// re-executed for this one test), never in the harness itself.
+#[test]
+fn iso_bootstrap_filter_refuses_fork_and_admits_the_probe_thread() {
+    if std::env::var_os("ISO_F4_BOOTSTRAP_CHILD").is_none() {
+        let status=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","iso_bootstrap_filter_refuses_fork_and_admits_the_probe_thread","--nocapture","--test-threads=1"])
+            .env("ISO_F4_BOOTSTRAP_CHILD","1").status().unwrap();
+        assert!(status.success(),"bootstrap filter subprocess failed: {status}");
+        return;
+    }
+    let errno=|| std::io::Error::last_os_error().raw_os_error();
+    duduclaw_egress::seccomp::install_bootstrap().unwrap();
+    // fork (glibc: clone without CLONE_THREAD) ⇒ EPERM, nothing created.
+    let pid=unsafe {libc::fork()};
+    if pid==0 { unsafe {libc::_exit(0)} }
+    assert_eq!(pid,-1,"fork must fail under the bootstrap filter");
+    assert_eq!(errno(),Some(libc::EPERM));
+    // clone3 ⇒ ENOSYS (before the kernel looks at its arguments).
+    assert_eq!(unsafe {libc::syscall(libc::SYS_clone3,std::ptr::null::<u8>(),0usize)},-1);
+    assert_eq!(errno(),Some(libc::ENOSYS));
+    // exec ⇒ EPERM (before any path lookup).
+    let path=c"/bin/false";
+    let argv=[path.as_ptr(),std::ptr::null()];
+    let envp:[*const libc::c_char;1]=[std::ptr::null()];
+    assert_eq!(unsafe {libc::execve(path.as_ptr(),argv.as_ptr(),envp.as_ptr())},-1);
+    assert_eq!(errno(),Some(libc::EPERM));
+    assert!(std::process::Command::new("/bin/true").status().is_err(),"no child process can be spawned");
+    // Threads can be created: a plain one and the daemon's DNS probe worker.
+    assert_eq!(std::thread::spawn(|| 7).join().unwrap(),7);
+    assert!(duduclaw_egress::dns_probe::DnsProbe::start().is_some(),"the probe worker starts under the bootstrap filter");
 }
 
 #[tokio::test]
@@ -155,7 +193,8 @@ async fn iso_root_concurrent_live_tunnels_and_byte_cap() {
         write_frame(&mut client,EgressMessage::Data{tunnel_id:TunnelId(1),bytes:List::new(vec![9;513]).unwrap()},&limits).await.unwrap();
         let audit=task.await.unwrap();
         assert_eq!(audit.bytes,512);assert_eq!(audit.connection_attempts,2);
-        assert_eq!(audit.terminal_code,EgressError::ResourceLimit);
+        assert_eq!(audit.terminal_code,JournalTerminalCode::Error(EgressError::ResourceLimit));
+        assert_eq!(audit.terminal_detail,duduclaw_egress::budget::TerminalDetail::TotalBytes);
         assert!(read_frame(&mut client,&limits).await.is_err());
     }).await.unwrap();
 }

@@ -16,7 +16,8 @@ static RUNTIME: OnceLock<Mutex<Runtime>> = OnceLock::new();
 use super::state_files::StateDir;
 #[path = "root_key_recovery_unit.rs"]
 mod unit;
-pub use unit::{protected_content_differs, protected_unit_text, protected_properties_bounded};
+pub use unit::{isolated_unit_text, protected_content_differs, protected_unit_text, protected_properties_bounded,
+    ISOLATED_GATEWAY_UNIT_DEPENDENCIES};
 
 macro_rules! diagnostic_enum {
     ($name:ident { $($variant:ident => $code:literal),+ $(,)? }) => {

@@ -40,7 +40,20 @@ describe('migration confirmation', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Approve selected' }));
     await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('migration.confirmations.approve', {
       bindings: [item(false, 2).binding], csrf_token: Array(32).fill(9),
-    }));
+    }, false, 240000));
+  });
+  it('explains an employee allocation whose account check is unfinished and keeps it retryable', async () => {
+    let approved = false;
+    const employee = (status: ConfirmationItem['status']) => ({ ...item(true, 1), category: 'employee', status });
+    mockWsClient.call.mockImplementation(async (method: string) => {
+      if (method === 'migration.confirmations.approve') { approved = true; return { readback_required: true, failed: 0, allocation_pending: 1 }; }
+      return response([employee(approved ? 'applying' : 'pending')]);
+    });
+    renderWithProviders(<MigrationConfirmationsPage />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Approve this item' }));
+    await screen.findByText("The account's security check is not finished yet. Please retry in a moment.");
+    expect(screen.getByRole('button', { name: 'Retry application' })).toBeTruthy();
+    expect(screen.queryByText('Could not read the latest state. Refresh before taking action.')).toBeNull();
   });
   it('keeps confirmation disabled when the authenticated adapter is unavailable', async () => {
     mockWsClient.call.mockResolvedValue({ ...response(), mutations_available: false, csrf_token: null });

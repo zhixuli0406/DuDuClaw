@@ -754,7 +754,16 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     ).await;
     info!("edition_profile={}", boot_edition.as_str());
     crate::isolation_readiness::initialize(!boot_edition.is_personal());
+    // R6: the update service's gateway readback endpoint (isolated hosts only).
+    // Its `ready` stays false until this process's local latch is set (stores
+    // open, listener bound, spawnd backend connected: `update_readback::LocalStep`).
+    crate::update_readback::start();
+    // R8j round 3 F1: on an isolated install only a real spawnd backend marks
+    // the read-back's `Backend` step, whatever the edition or licence state.
     crate::isolation_readiness::connect_backend().await;
+    // R8m 30b: publish the gateway's readiness view for the root CLI
+    // (protected Linux TEAM only; one background task, ends at shutdown).
+    crate::isolation_readiness::published::spawn();
     // Allow an old store with no MFA tables; refuse a partial MFA schema or
     // unreadable policy before schema initialization can hide the failure.
     precheck_identity_policy(&home_dir, boot_edition.is_personal())
@@ -1914,6 +1923,9 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         duduclaw_core::error::DuDuClawError::Gateway(format!("Failed to open cron store: {e}"))
     })?);
     handler.set_cron_store(cron_store.clone()).await;
+    // Update read-back local latch, step 1: every store whose opening is fatal
+    // to start-up is open (users.db, the MCP identity key, the cron store).
+    crate::update_readback::mark_local(crate::update_readback::LocalStep::Stores);
 
     // Initialize task board store (SQLite tasks.db + activity feed)
     let task_store_opt: Option<Arc<crate::task_store::TaskStore>> =
@@ -3648,6 +3660,10 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .map_err(|e| duduclaw_core::error::DuDuClawError::Gateway(e.to_string()))?;
+    // Update read-back local latch, step 2: the service entry is bound (the
+    // kernel accepts connections from here; the same point as READY=1). Step 3
+    // (spawnd backend) is marked by `isolation_readiness::connect_backend`.
+    crate::update_readback::mark_local(crate::update_readback::LocalStep::Service);
 
     // WP-B: systemd sd_notify — tell systemd startup is complete, and start
     // watchdog pings if this unit is `Type=notify` with `WatchdogSec=` set.
@@ -3743,6 +3759,14 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             } => {},
         }
         info!("Shutdown signal received, flushing state...");
+        // R7d round 4: close the migration effect gate. Once this returns no
+        // new migration effect can start (enforced by the gate's lock); a
+        // pending employee-allocation wait stops (the item stays Applying,
+        // nothing is compensated).
+        crate::handlers::begin_migration_apply_shutdown();
+        // Best-effort wait (blocking pool, up to APPLY_SHUTDOWN_WAIT = 40 s,
+        // warn on expiry) for effects registered before the gate closed.
+        crate::handlers::wait_migration_apply_loops().await;
         // sd_notify STOPPING=1 — best-effort, no-op off-systemd.
         let _ = crate::watchdog::notify_stopping();
         // Withdraw the LAN advertisement first so peers stop offering a

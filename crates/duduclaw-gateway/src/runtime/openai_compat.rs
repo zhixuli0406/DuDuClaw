@@ -28,21 +28,43 @@ use super::{AgentRuntime, RuntimeContext, RuntimeResponse};
 pub struct OpenAiCompatRuntime;
 
 impl OpenAiCompatRuntime {
+    /// R8x: the single logging point of a protected API turn. A failed turn
+    /// logs exactly one line: the R8t `isolated run refused` (written while
+    /// collecting a started run), `isolated run refused after start`, or
+    /// `isolated run not started` with the fixed site that refused.
     #[cfg(target_os = "linux")]
     async fn execute_protected(&self, prompt: &str, context: &RuntimeContext) -> Result<RuntimeResponse, String> {
-        let authorization = crate::isolation_mcp::runtime::authorize_api(context)?;
-        let refusal = || duduclaw_agent::mcp_spawn_gate::spawn_gate_error(
-            "所選隔離執行設定尚未支援這次工作，請由管理員確認服務與資料保護設定。");
-        validate_model(&context.model)?;
-        crate::product_policy::require_runtime(&context.home_dir, "openai_compat")?;
-        crate::product_policy::require_model(crate::product_policy::load(&context.home_dir)?, &context.model)?;
+        let runtime = crate::isolation_mcp::refusal::runtime_label(
+            &duduclaw_isolation::execution::RuntimeKind::OpenAiCompat);
+        crate::isolation_mcp::runtime::observed(runtime, &context.agent_id, Self::protected_turn(prompt, context)).await
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn protected_turn(prompt: &str, context: &RuntimeContext) -> Result<RuntimeResponse, String> {
+        use crate::isolation_mcp::{refusal::{site, RefusalSite}, runtime::{keep, note_site}};
+        // Same sentence as before R8x; the site is recorded for the log line.
+        let refused = |site: RefusalSite| {
+            note_site(site);
+            duduclaw_agent::mcp_spawn_gate::spawn_gate_error(
+                "所選隔離執行設定尚未支援這次工作，請由管理員確認服務與資料保護設定。")
+        };
+        // R8r-1: these refusals need no authority and run before it is taken
+        // or issued, so they never consume a one-time background record.
+        validate_model(&context.model).map_err(keep(site!("preflight.model")))?;
+        crate::product_policy::require_runtime(&context.home_dir, "openai_compat")
+            .map_err(keep(site!("preflight.runtime_policy")))?;
+        crate::product_policy::require_model(crate::product_policy::load(&context.home_dir)
+            .map_err(keep(site!("preflight.model_policy")))?, &context.model)
+            .map_err(keep(site!("preflight.model_policy")))?;
         // No silent loss of host interceptors or disclosure leases. These modes
         // need a separate typed worker adapter before protected API execution.
         if crate::ccr_runtime::for_agent(&context.home_dir, &context.agent_id).is_some()
             || crate::redaction_proxy::try_build_interceptor(&context.home_dir, &context.agent_id,
-                &crate::redaction_proxy::current_session_id()).map_err(|_| refusal())?.is_some() {
-            return Err(refusal());
+                &crate::redaction_proxy::current_session_id()).map_err(|_| refused(site!("preflight.redaction")))?.is_some() {
+            return Err(refused(site!("preflight.interceptor")));
         }
+        // The principal context stays registered until the worker run returns.
+        let (authorization, _principal_context) = crate::isolation_mcp::runtime::authorize_api(context).await?;
         let mut messages = vec![duduclaw_api_worker::Message { role: "system".into(), content: context.system_prompt.clone() }];
         messages.extend(super::cap_conversation_history(&context.conversation_history).iter().map(|turn| duduclaw_api_worker::Message {
             role: turn.role.clone(), content: turn.content.clone() }));
@@ -1970,5 +1992,32 @@ mod product_policy_tests {
             let error = super::resolve_provider_config(home.path(), "test", Some(id)).await.unwrap_err();
             assert!(error.contains("Product profile"), "{error}");
         }
+    }
+}
+
+/// Stack bound of the protected API turn (same bound and rationale as
+/// `isolation_mcp::runtime::tests::PROTECTED_FUTURE_BOUND`): constructed,
+/// never polled, the turn's futures stay small because the run lives on the
+/// heap behind `observed` and the boxed plan/collect steps.
+#[cfg(all(test, target_os = "linux"))]
+mod protected_future_size_tests {
+    const BOUND: usize = 16 * 1024;
+
+    #[test]
+    fn the_protected_api_turn_future_has_a_bounded_size() {
+        let context = crate::runtime::RuntimeContext { agent_dir: Some("/trusted-home/agents/alice".into()),
+            system_prompt: "system".into(), model: "model".into(), max_tokens: 100,
+            home_dir: "/trusted-home".into(), agent_id: "alice".into(), preferred_provider: None,
+            conversation_history: vec![], capabilities: None, account_pool: vec![], effort: None,
+            allow_cross_family_failover: true };
+        let runtime = super::OpenAiCompatRuntime::new();
+        let future = runtime.execute_protected("prompt", &context);
+        let size = std::mem::size_of_val(&future);
+        assert!(size <= BOUND, "execute_protected: {size} bytes > {BOUND}");
+        drop(future);
+        let future = super::OpenAiCompatRuntime::protected_turn("prompt", &context);
+        let size = std::mem::size_of_val(&future);
+        assert!(size <= BOUND, "protected_turn: {size} bytes > {BOUND}");
+        drop(future);
     }
 }

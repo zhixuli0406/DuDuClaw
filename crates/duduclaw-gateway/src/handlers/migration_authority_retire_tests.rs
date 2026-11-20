@@ -38,7 +38,7 @@ impl FakeRoot {
     fn reply(&self, phase: Phase) -> Answer {
         let mut receipt = self.receipt.clone();
         receipt.disabled = matches!(phase, Phase::Disabled | Phase::Retired);
-        Answer::Reply(Reply { receipt, phase, idle: (phase == Phase::Ready).then_some(true) })
+        Answer::Reply(Reply { receipt, phase, idle: (phase == Phase::Ready).then_some(true), entitlement: None })
     }
 }
 impl RetireRoot for FakeRoot {
@@ -493,7 +493,7 @@ fn retire_inconsistent_keeps_label_blocked() {
     for change in 0..4 {
         let mut other = expected.clone();
         match change { 0 => other.uid += 1, 1 => other.label = "other".into(), 2 => other.bytes += 1, _ => other.principal_binding = None }
-        let answer = Ok(Answer::Reply(Reply { receipt: other, phase: Phase::Ready, idle: Some(true) }));
+        let answer = Ok(Answer::Reply(Reply { receipt: other, phase: Phase::Ready, idle: Some(true), entitlement: None }));
         assert_eq!(classify_readback(&expected, answer).0, RootClass::Inconsistent, "change {change}");
     }
     for refused in [Root::NotReady, Root::IsolationUnavailable] {

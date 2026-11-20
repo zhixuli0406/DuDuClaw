@@ -9,6 +9,8 @@ duduclaw-isolation.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 serde_json.workspace = true
+# R8z: one fixed-field warning per local spawn refusal (workspace dependency).
+tracing.workspace = true
 sha2 = "0.10"
 url = "2"
 portable-pty = "0.9"
@@ -24,6 +26,8 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_
 
 [dev-dependencies]
 tempfile = "3"
+# R8z: capture the local refusal warnings in tests (workspace dependency).
+tracing-subscriber.workspace = true
 
 # HX6 security fix round (finding 5): the recording root tests stack the real
 # launcher / helper Landlock and F_L ∩ F_H (duduclaw-run) under the browser layer.

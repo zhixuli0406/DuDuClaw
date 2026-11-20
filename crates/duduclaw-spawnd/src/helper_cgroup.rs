@@ -330,6 +330,7 @@ pub mod linux {
             let run = duduclaw_isolation::ids::RunId(nonce);
             let (input, _writer) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).unwrap();
             let null = std::fs::OpenOptions::new().write(true).open("/dev/null").unwrap();
+            let cleanup = crate::systemd::linux::TestRunCleanup(&systemd, run);
             let unit = systemd.start_test_delegated(run, input.as_fd(), null.as_fd()).unwrap();
             let result = (|| {
                 let mut tree = UnitTree::open(&unit).map_err(|_| CgroupUnavailable::NoDelegation)?;
@@ -344,7 +345,8 @@ pub mod linux {
                     None => outcome,
                 }
             })();
-            let _ = systemd.kill_run(run);
+            systemd.cleanup_test_run(run).unwrap();
+            drop(cleanup);
             result.unwrap();
         }
     }

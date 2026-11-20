@@ -21,6 +21,12 @@ workspace = true
 [features]
 root-test-fixture = []
 
+# R7a: the shipped isolation self-test, built with the trampoline (release
+# included). Not a mode of `duduclaw-run`; it accepts no argument at all.
+[[bin]]
+name = "duduclaw-run-selftest"
+path = "src/bin/selftest.rs"
+
 [[bin]]
 name = "duduclaw-run-root-fixture"
 path = "src/bin/root-fixture.rs"

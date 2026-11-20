@@ -283,6 +283,7 @@ fn local_policy(run: RunHandle, class: ExecutionClass, pty: bool) -> SpawnPolicy
         capabilities: CapabilityHandover { mcp_bridge: false, egress_forwarder: false },
         timeouts: RunTimeouts { queue_ms: 30000, startup_ms: 0, runtime_ms: 0, pty_idle_ms: None, termination_grace_ms: 0 },
         inputs: RunInputs { prompt: RunInput { reader: Box::new(crate::io::Reader(tokio::io::empty())), max_bytes: 0 }, attachments: vec![] },
+        requested_max_turns: None,
     }
 }
 
@@ -305,7 +306,12 @@ pub async fn spawn(command: &mut Command, class: ExecutionClass, required: bool)
             let (backend, run, lifecycle) = (prepared.backend.clone(), prepared.run, prepared.lifecycle.clone());
             let streams = match prepared.stdio().await {
                 Ok(streams) => streams,
-                Err(reason) => { rollback(backend.as_ref(), run, lifecycle.as_ref()).await; return Err(error(reason)); },
+                Err(reason) => {
+                    // R8z-5: the run started, but `activate` is never reached.
+                    let reason = crate::spawnd::local_refusal::refuse(crate::spawnd::local_refusal::Step::TakeIo, reason);
+                    rollback(backend.as_ref(), run, lifecycle.as_ref()).await;
+                    return Err(error(reason));
+                },
             };
             activate(&backend, run, lifecycle.as_ref(), prepared.mcp).await?;
             prepared.armed = false;
@@ -340,7 +346,12 @@ pub async fn spawn_pty(command: portable_pty::CommandBuilder, size: PtySize,
             let (backend, run, lifecycle) = (prepared.backend.clone(), prepared.run, prepared.lifecycle.clone());
             let streams = match prepared.pty().await {
                 Ok(streams) => streams,
-                Err(reason) => { rollback(backend.as_ref(), run, lifecycle.as_ref()).await; return Err(error(reason)); },
+                Err(reason) => {
+                    // R8z-5: the run started, but `activate` is never reached.
+                    let reason = crate::spawnd::local_refusal::refuse(crate::spawnd::local_refusal::Step::TakeIo, reason);
+                    rollback(backend.as_ref(), run, lifecycle.as_ref()).await;
+                    return Err(error(reason));
+                },
             };
             activate(&backend, run, lifecycle.as_ref(), prepared.mcp).await?;
             prepared.armed = false;
@@ -429,13 +440,22 @@ async fn protected(native: NativeCommandSnapshot, class: ExecutionClass, pty: bo
     let run = backend.reserve(employee).await.map_err(error)?;
     let mut prepared = Prepared { backend: backend.clone(), run, lifecycle: lifecycle.clone(), mcp: false, armed: true, io_deadline: tokio::time::Instant::now() };
     let runtime = capture_runtime();
+    // R8z: the launch context's refusals (D's capability issuance, the
+    // gateway's run binding) are collapsed into one `BackendError` by the
+    // context; this names the step before the rollback's own traffic.
+    use crate::spawnd::local_refusal::{refuse, Step};
     let policy = match lifecycle.prepare(run, class, runtime.clone(), &native, pty).await {
         Ok(policy) => policy,
-        Err(reason) => { rollback(&backend, run, lifecycle.as_ref()).await; return Err(error(reason)); },
+        Err(reason) => {
+            let reason = refuse(Step::LaunchPrepare, reason);
+            rollback(&backend, run, lifecycle.as_ref()).await;
+            return Err(error(reason));
+        },
     };
     if !valid_policy_binding(&policy, run, employee, class, &runtime, pty, capture_memory_limit()) {
+        let reason = refuse(Step::PolicyBinding, BackendError::Denied);
         rollback(&backend, run, lifecycle.as_ref()).await;
-        return Err(error(BackendError::Denied));
+        return Err(error(reason));
     }
     if let Err(reason) = backend.bind_task(run, lifecycle.task()).await {
         rollback(&backend, run, lifecycle.as_ref()).await;
@@ -466,8 +486,16 @@ fn valid_policy_binding(policy: &SpawnPolicy, run: RunHandle, employee: Employee
 
 #[cfg(target_os = "linux")]
 async fn activate(backend: &crate::SpawndBackend, run: RunHandle, lifecycle: &dyn ProtectedLaunch, mcp_requested: bool) -> io::Result<()> {
-    let mcp = if mcp_requested { Some(backend.take_mcp(run).await.map_err(error)?) } else { None };
-    lifecycle.activate(run, mcp).await.map_err(error)
+    use crate::spawnd::local_refusal::{refuse, Step};
+    // R8z-5: a run that started but whose MCP endpoint cannot be taken never
+    // reaches `activate`; name that step too (same error as before).
+    let mcp = if mcp_requested {
+        Some(backend.take_mcp(run).await.map_err(|reason| error(refuse(Step::TakeMcp, reason)))?)
+    } else { None };
+    // R8z-3: like `launch_prepare`, the context collapses its refusals into
+    // one `BackendError`; this names the step. The caller's still-armed
+    // `Prepared` then cancels the started run and revokes the launch.
+    lifecycle.activate(run, mcp).await.map_err(|reason| error(refuse(Step::LaunchActivate, reason)))
 }
 
 #[cfg(test)]

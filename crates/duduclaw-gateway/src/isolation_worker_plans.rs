@@ -237,10 +237,32 @@ impl GatewayWorkerPlans {
         Ok((plan, state))
     }
 }
+/// R8n-2: what a producer of this factory needs before it can build a plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlanRequirement { Always, NeedsEmployee, NeedsEmployeeAndRoots }
+
+/// The ONE tool table of this factory: `provides` = a requirement exists,
+/// `supports` = it is met. A tool absent here is neither.
+pub(crate) fn plan_requirement(tool: &str) -> Option<PlanRequirement> {
+    match tool {
+        "web_extract" | "transcribe_audio" | "synthesize_speech" => Some(PlanRequirement::Always),
+        "skill_security_scan" | "shared_skill_adopt" | "skill_graduate" => Some(PlanRequirement::NeedsEmployee),
+        "skill_extract" => Some(PlanRequirement::NeedsEmployeeAndRoots),
+        _ => None,
+    }
+}
+
 impl WorkerPlanFactory for GatewayWorkerPlans {
-    fn supports(&self, tool: &str) -> bool { matches!(tool, "web_extract" | "transcribe_audio" | "synthesize_speech")
-        || (matches!(tool, "skill_security_scan" | "shared_skill_adopt" | "skill_graduate") && self.employee.is_some())
-        || (tool == "skill_extract" && self.employee.is_some() && self.roots.is_some()) }
+    fn supports(&self, tool: &str) -> bool {
+        match plan_requirement(tool) {
+            Some(PlanRequirement::Always) => true,
+            Some(PlanRequirement::NeedsEmployee) => self.employee.is_some(),
+            Some(PlanRequirement::NeedsEmployeeAndRoots) => self.employee.is_some() && self.roots.is_some(),
+            None => false,
+        }
+    }
+    /// Employee-independent: installed even in the employee-less boot factory.
+    fn provides(&self, tool: &str) -> bool { plan_requirement(tool).is_some() }
     fn authorize_handler<'a>(&'a self, call: &'a AuthorizedToolCall) -> PolicyFuture<'a, ()> {
         Box::pin(async move {
             if !self.supports(call.name()) { return Err(VerificationError::Unavailable); }
@@ -445,8 +467,15 @@ fn read_host_file_limit(home: &std::path::Path, directories: &[&str], filename: 
     let mut components = directories.to_vec(); components.push(filename);
     for (index, component) in components.iter().enumerate() {
         let directory = index + 1 != components.len();
-        let flags = OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK
-            | OFlag::O_NOCTTY | if directory { OFlag::O_DIRECTORY } else { OFlag::empty() };
+        // Directories are only traversed (used as openat dirfds): O_PATH needs
+        // search permission alone, so an absolute snapshot below the installed
+        // home's root-owned 0711 parent works. O_PATH|O_NOFOLLOW|O_DIRECTORY
+        // refuses a symlinked component (ENOTDIR). The file keeps O_RDONLY.
+        let flags = if directory {
+            OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_DIRECTORY
+        } else {
+            OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_NOCTTY
+        };
         let fd = match openat(Some(root.as_raw_fd()), *component, flags, Mode::empty()) {
             Ok(fd) => fd,
             Err(nix::errno::Errno::ENOENT) => return Ok(None),
