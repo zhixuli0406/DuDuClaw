@@ -20,6 +20,17 @@ fn prompt_only(row: &CronTaskRow) -> bool {
         && row.notify_channel.is_none() && row.notify_chat_id.is_none() && row.notify_thread_id.is_none()
 }
 
+fn member_cron_row(row: &CronTaskRow, writable: bool, can_edit: bool, can_activate: bool) -> Value {
+    json!({ "id": row.id, "name": row.name, "agent_id": row.agent_id,
+        "cron": row.cron, "schedule": row.cron, "task": row.task, "enabled": row.enabled,
+        "last_run_at": row.last_run_at, "last_status": row.last_status,
+        "skip_reason": row.skip_reason(),
+        "last_delivery_status": row.last_delivery_status,
+        "last_delivery_reason": row.last_delivery_reason,
+        "can_manage": writable, "can_edit": can_edit, "can_resume": can_activate,
+        "can_run": can_activate })
+}
+
 impl MethodHandler {
     fn cron_task_input_blocked(&self, agent: &str, name: &str, task: &str) -> bool {
         // Name is also interpolated into the model prompt, so scan the exact
@@ -91,13 +102,7 @@ impl MethodHandler {
                     && ctx.has_agent_access(&row.agent_id, AccessLevel::Operator);
                 let can_activate = can_edit && crate::cron_store::validate_scoped_schedule(&row).is_ok();
                 // Script bodies and notification destinations remain operator-only configuration.
-                tasks.push(json!({ "id": row.id, "name": row.name, "agent_id": row.agent_id,
-                    "cron": row.cron, "schedule": row.cron, "task": row.task, "enabled": row.enabled,
-                    "last_run_at": row.last_run_at, "last_status": row.last_status,
-            "last_delivery_status": row.last_delivery_status,
-            "last_delivery_reason": row.last_delivery_reason,
-                    "can_manage": writable, "can_edit": can_edit, "can_resume": can_activate,
-                    "can_run": can_activate }));
+                tasks.push(member_cron_row(&row, writable, can_edit, can_activate));
             }
             return WsFrame::ok_response("", json!({ "tasks": tasks }));
         }
@@ -215,5 +220,26 @@ impl MethodHandler {
             Ok(false) => WsFrame::error_response("", "Automation changed; refresh and retry"),
             Err(error) => WsFrame::error_response("", &error),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn member_row_only_exposes_the_fixed_skip_reason() {
+        let mut row = CronTaskRow::new("id".into(), "Morning".into(), "agent".into(),
+            "0 9 * * *".into(), "report".into());
+        row.last_status = Some("skipped".into());
+        row.last_error = Some(crate::cron_scheduler::SCOPED_SCHEDULE_SKIPPED.into());
+        let member = member_cron_row(&row, false, false, false);
+        assert_eq!(member["skip_reason"], "timezone_or_interval");
+        assert!(member.get("last_error").is_none());
+
+        row.last_error = Some("internal detail".into());
+        let member = member_cron_row(&row, false, false, false);
+        assert!(member["skip_reason"].is_null());
+        assert!(member.get("last_error").is_none());
     }
 }

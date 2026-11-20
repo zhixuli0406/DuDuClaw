@@ -71,11 +71,28 @@ pub(crate) const SCOPED_SCHEDULE_SKIPPED: &str = "schedule skipped: its timezone
 /// [`scoped_schedule_allowed`], and on refusal record the fixed reason on the
 /// row (`last_status`/`last_error`) so the refusal is visible. Written only
 /// when the stored value differs, so the row is not rewritten every tick.
-async fn scoped_schedule_admitted(store: &CronStore, row: &CronTaskRow) -> bool {
+async fn scoped_schedule_admitted(home_dir: &Path, store: &CronStore, row: &CronTaskRow) -> bool {
     if scoped_schedule_allowed(row) { return true; }
     if row.last_status.as_deref() != Some("skipped") || row.last_error.as_deref() != Some(SCOPED_SCHEDULE_SKIPPED) {
-        if store.record_scoped_schedule_skip(&row.id, SCOPED_SCHEDULE_SKIPPED).await.is_err() {
-            warn!(count = 1u64, "scoped cron refusal not recorded");
+        match store.record_scoped_schedule_skip(&row.id, SCOPED_SCHEDULE_SKIPPED).await {
+            Ok(true) => {
+                let home = home_dir.to_path_buf();
+                let body = format!("排程「{}」已被略過：它的時區有夏令時間，或間隔少於 15 分鐘。請到「自動化」頁修改。", row.name);
+                // Only the first write sends a notice; channel latency never blocks scheduling.
+                tokio::spawn(async move {
+                    use crate::maintenance::notify::{AdminNotifier, UserDbAdminNotifier};
+                    let Ok(Some(db)) = crate::decision_notify::open_user_db(&home) else {
+                        warn!("scoped cron skip notice unavailable");
+                        return;
+                    };
+                    let notifier = UserDbAdminNotifier::new(home, Arc::new(db));
+                    if notifier.notify_admins(&body).await == 0 {
+                        warn!("scoped cron skip notice not delivered");
+                    }
+                });
+            }
+            Ok(false) => (),
+            Err(_) => warn!(count = 1u64, "scoped cron refusal not recorded"),
         }
     }
     false
@@ -235,7 +252,7 @@ impl CronScheduler {
         let mut runs = Vec::new();
         let mut errors = Vec::new();
         for row in self.store.list_enabled().await? {
-            if !scoped_schedule_admitted(&self.store, &row).await { continue; }
+            if !scoped_schedule_admitted(&self.home_dir, &self.store, &row).await { continue; }
             let Some((_, material_hash)) = self.store.workflow_binding(&row.id).await? else { continue };
             let outcome: Result<Option<String>, String> = async {
                 let mut cursor = self.store.routine_cursor(&row.id, &material_hash).await?;
@@ -420,7 +437,7 @@ impl CronScheduler {
 
         let mut new_live = Vec::with_capacity(raw_tasks.len());
         for task in raw_tasks {
-            if !scoped_schedule_admitted(&self.store, &task).await { continue; }
+            if !scoped_schedule_admitted(&self.home_dir, &self.store, &task).await { continue; }
             // Typed routines use the durable occurrence cursor in tick_at, not
             // legacy last_run_at (which manual executions also modify).
             match self.store.workflow_binding(&task.id).await {
@@ -645,7 +662,7 @@ async fn enqueue_routine_trigger(
 ) -> Result<String, String> {
     let task = store.get(task_id).await?.ok_or("workflow cron missing")?;
     if !task.enabled { return Err("workflow cron disabled".into()); }
-    if !scoped_schedule_admitted(store, &task).await { return Err("Automation schedule refused".into()); }
+    if !scoped_schedule_admitted(home_dir, store, &task).await { return Err("Automation schedule refused".into()); }
     // v1.81 P1g: fire-time Personal ownership check.
     if let Some(reason) = cron_fire_time_refusal(home_dir, &task, None).await {
         return Err(reason.into());
@@ -757,7 +774,7 @@ async fn dispatch_cron_task_checked(
         task.on_behalf_of = Some(principal.into());
         task.scoped_by_user_id = principal.strip_prefix("user:").map(str::to_string);
     }
-    if !scoped_schedule_admitted(store, &task).await { return; }
+    if !scoped_schedule_admitted(home_dir, store, &task).await { return; }
     // v1.81 P1g: fire-time Personal ownership check (covers rows created
     // before the upgrade and ownership changes since).
     if let Some(reason) = cron_fire_time_refusal(home_dir, &task, scoped_principal).await {
@@ -2437,7 +2454,7 @@ mod tests {
 
         // Neither a fresh reload nor a caller holding the stale row rewrites it.
         scheduler.reload().await;
-        assert!(!scoped_schedule_admitted(&store, &stale).await);
+        assert!(!scoped_schedule_admitted(dir.path(), &store, &stale).await);
         assert!(!store.record_scoped_schedule_skip(&stale.id, SCOPED_SCHEDULE_SKIPPED).await.unwrap());
         let again = store.get("legacy-new-york").await.unwrap().unwrap();
         assert_eq!(again.updated_at, recorded.updated_at, "reason written once");

@@ -11578,6 +11578,8 @@
   "users.primary.missing": "{count} 人のメンバーにメイン AI がありません",
   "users.primary.repair": "最初の AI に設定",
   "users.primary.confirm": "以下のメンバーのメイン AI を、最も早く紐付けたオーナーまたは操作権限の AI に設定しますか？",
+  "routines.skipped.label": "スキップ済み",
+  "routines.skipped.explanation": "この予定は、タイムゾーンに夏時間があるか、実行間隔が15分未満のため実行されませんでした。管理者に UTC または夏時間のないタイムゾーンへの変更を依頼してください。",
   "routines.delivery.delivered": "配信済み",
   "routines.delivery.failed": "配信失敗",
   "routines.delivery.refused": "配信拒否",

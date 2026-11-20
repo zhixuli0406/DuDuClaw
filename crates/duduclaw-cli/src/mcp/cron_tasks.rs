@@ -655,8 +655,11 @@ pub(crate) fn render_cron_tasks(tasks: &[duduclaw_gateway::cron_store::CronTaskR
         let status_icon = if t.enabled { "▶" } else { "⏸" };
         let last_run = t.last_run_at.as_deref().unwrap_or("never");
         let last_status = t.last_status.as_deref().unwrap_or("-");
+        let skip_reason = if t.skip_reason().is_some() {
+            " (timezone has daylight-saving changes or interval is under 15 minutes)"
+        } else { "" };
         lines.push(format!(
-            "{status_icon} [{id}] {name}\n  cron: {cron} | agent: {agent} | runs: {runs} (fail: {fail})\n  last_run: {last_run} | last_status: {last_status}\n  delivery: {delivery} | reason: {reason}\n  task: {task}\n",
+            "{status_icon} [{id}] {name}\n  cron: {cron} | agent: {agent} | runs: {runs} (fail: {fail})\n  last_run: {last_run} | last_status: {last_status}{skip_reason}\n  delivery: {delivery} | reason: {reason}\n  task: {task}\n",
             id = truncate_bytes(&t.id, 8),
             name = t.name,
             cron = t.cron,

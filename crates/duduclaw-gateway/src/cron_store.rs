@@ -115,6 +115,12 @@ fn default_trigger_kind() -> String {
 }
 
 impl CronTaskRow {
+    /// Safe, stable reason for display outside the Admin-only error details.
+    pub fn skip_reason(&self) -> Option<&'static str> {
+        (self.last_error.as_deref() == Some(crate::cron_scheduler::SCOPED_SCHEDULE_SKIPPED))
+            .then_some("timezone_or_interval")
+    }
+
     /// Build a fresh row with sensible defaults and `created_at`/`updated_at` set to now.
     pub fn new(id: String, name: String, agent_id: String, cron: String, task: String) -> Self {
         let now = Utc::now().to_rfc3339();

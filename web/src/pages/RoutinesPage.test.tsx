@@ -30,6 +30,26 @@ describe('RoutinesPage', () => {
     expect(screen.getAllByText('New automation').length).toBeGreaterThan(0);
   });
 
+  it.each([true, false])('shows the skip status only for a skipped row (%s)', async (skipped) => {
+    useConnectionStore.setState({ state: 'authenticated' });
+    mockWsClient.call.mockImplementation((method: string) => Promise.resolve(method === 'cron.list' ? {
+      tasks: [{ id: 'schedule', name: 'Morning report', agent_id: 'sales', cron: '0 9 * * *', enabled: true,
+        last_status: skipped ? 'skipped' : 'success', skip_reason: skipped ? 'timezone_or_interval' : null,
+        last_delivery_status: 'delivered' }],
+    } : {}));
+    renderWithProviders(<RoutinesPage />);
+    await screen.findByText('Morning report');
+    if (skipped) {
+      expect(screen.getByText('Skipped')).toBeInTheDocument();
+      expect(screen.getByText(/This schedule did not run because/)).toBeInTheDocument();
+      expect(screen.queryByText('Delivered')).not.toBeInTheDocument();
+    } else {
+      expect(screen.queryByText('Skipped')).not.toBeInTheDocument();
+      expect(screen.queryByText(/This schedule did not run because/)).not.toBeInTheDocument();
+      expect(screen.getByText('Delivered')).toBeInTheDocument();
+    }
+  });
+
   // ── WP6: channel-action → dashboard live feedback ──────────────────────
 
   it('subscribes to cron.changed once authenticated', async () => {
