@@ -1950,6 +1950,33 @@ impl SessionManager {
         Ok(())
     }
 
+    /// [`Self::set_pinned`] only while `session_id` still names the same
+    /// incarnation of the row: its `created_at` (the
+    /// [`Self::turn_generation`] captured when the work started) must equal
+    /// `expected_created_at`. A clear moves the row away and a re-created row
+    /// gets a new `created_at`, so a stale async result is not written.
+    /// The check and the write are one UPDATE. `Ok(false)`: not written.
+    pub async fn set_pinned_if_unchanged(
+        &self,
+        session_id: &str,
+        instructions: &str,
+        expected_created_at: &str,
+    ) -> Result<bool> {
+        let conn = self.acquire().await;
+        crate::isolation_label_stores::check_session_writable(&conn, session_id).map_err(DuDuClawError::Gateway)?; // F6fb
+        let changed = conn
+            .execute(
+                "UPDATE sessions SET pinned_instructions = ?1 WHERE id = ?2 AND created_at = ?3",
+                params![
+                    duduclaw_security::credential_detect::mask(instructions),
+                    session_id,
+                    expected_created_at
+                ],
+            )
+            .map_err(|e| DuDuClawError::Gateway(format!("set_pinned_if_unchanged: {e}")))?;
+        Ok(changed == 1)
+    }
+
     /// Read the cached summary of older turns for this session (#13).
     ///
     /// Returns `(summary_text, summarized_through_turn)`. When no
@@ -2685,6 +2712,32 @@ mod tests {
             ON sessions BEGIN SELECT RAISE(ABORT, 'reset blocked'); END;").unwrap();
         assert!(mgr.restore_message("atomic", id).await.is_err());
         assert!(mgr.get_messages("atomic").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn released_repro_4_stale_pin_after_new() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+        let sid = "telegram:private-repro";
+        // The detached pin extraction captures the incarnation it runs for.
+        let old_generation = mgr.get_or_create(sid, "agent").await.unwrap().created_at;
+        assert_eq!(mgr.turn_generation(sid).await.unwrap().as_deref(), Some(old_generation.as_str()));
+        mgr.set_pinned(sid, "old").await.unwrap();
+        let stale = mgr.get_pinned(sid).await.unwrap();
+        let archived = mgr.clear_for_user(sid).await.unwrap().expect("old row moved");
+        let new_generation = mgr.get_or_create(sid, "agent").await.unwrap().created_at;
+        assert_ne!(new_generation, old_generation, "a re-created row is a new incarnation");
+        assert!(mgr.get_pinned(sid).await.unwrap().is_empty());
+        mgr.set_pinned(sid, "newer state").await.unwrap();
+        // Regression (v1.83.0): the stale async result is rejected...
+        assert!(!mgr.set_pinned_if_unchanged(sid, &stale, &old_generation).await.unwrap());
+        assert_eq!(mgr.get_pinned(sid).await.unwrap(), "newer state");
+        assert_eq!(mgr.get_pinned(&archived).await.unwrap(), "old");
+        // ...a missing marker never matches...
+        assert!(!mgr.set_pinned_if_unchanged(sid, "unbound", "").await.unwrap());
+        // ...and a fresh write bound to the current incarnation succeeds.
+        assert!(mgr.set_pinned_if_unchanged(sid, "fresh pin", &new_generation).await.unwrap());
+        assert_eq!(mgr.get_pinned(sid).await.unwrap(), "fresh pin");
     }
 
     #[tokio::test]

@@ -340,6 +340,10 @@ fn strip_leading_sep(s: &str) -> &str {
 /// Writes the question, each option, then the `status = open` row. Re-persisting
 /// the same `(agent_id, decision_id)` is idempotent: each row's `(subject,
 /// predicate)` supersedes its prior version via `store_temporal`.
+///
+/// `ctx_meta.session_id` names the conversation the decision belongs to; it is
+/// stored in each row's `metadata` and is what scopes listing and resolution
+/// (v1.83.0). Without it the decision is never surfaced in any conversation.
 pub async fn persist_decision(
     engine: &SqliteMemoryEngine,
     agent_id: &str,
@@ -436,14 +440,23 @@ async fn write_triple(
 
 // ── P1.4 Injection ──────────────────────────────────────────────────────────
 
-/// Render the agent's still-open decisions as a system-prompt section (RFC-24 §4.3).
+/// Render the still-open decisions recorded in conversation `session_id` as a
+/// system-prompt section (RFC-24 §4.3).
+///
+/// v1.83.0: a decision belongs to the conversation that recorded it
+/// (`metadata.session_id`); another user's conversation with the same agent
+/// never sees it, and a decision with no recorded session is never listed.
 ///
 /// Empty string when there are none (caller skips injection). Caps at
 /// [`MAX_INJECTED_DECISIONS`]. Placed at the tail of the prompt (U-shaped
 /// attention), not in the cached prefix.
-pub async fn build_open_decisions_section(engine: &SqliteMemoryEngine, agent_id: &str) -> String {
+pub async fn build_open_decisions_section(
+    engine: &SqliteMemoryEngine,
+    agent_id: &str,
+    session_id: &str,
+) -> String {
     let decisions = match engine
-        .list_open_decisions(agent_id, MAX_INJECTED_DECISIONS)
+        .list_open_decisions_in_session(agent_id, session_id, MAX_INJECTED_DECISIONS)
         .await
     {
         Ok(d) => d,
@@ -686,6 +699,82 @@ pub fn parse_extracted_decision(reply: &str) -> Option<DecisionDraft> {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn released_repro_7_cross_session_list_render_resolve() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = super::SqliteMemoryEngine::new(&dir.path().join("memory.db")).unwrap();
+        let agent = "shared-agent";
+        let id = super::decision_id(agent, "session-a-message");
+        let draft = super::DecisionDraft {
+            question: "Alice private deployment choice".into(),
+            options: vec![("A".into(), "Deploy Alice project".into()), ("B".into(), "Wait".into())],
+        };
+        super::persist_decision(&engine, agent, &id, &draft,
+            serde_json::json!({"session_id": "session-a", "chat_id": "private-alice"}),
+            duduclaw_memory::lineage::Provenance::source(
+                duduclaw_memory::lineage::SourceRef::channel_message(
+                    "session-a", 1, "2026-01-01T00:00:00Z".parse().unwrap(), None,
+                ),
+            )).await.unwrap();
+        // A decision whose metadata carries no session id: never listed (fail closed).
+        let legacy_id = super::decision_id(agent, "legacy-message");
+        let legacy = super::DecisionDraft {
+            question: "Legacy unscoped choice".into(),
+            options: vec![("A".into(), "Legacy A".into()), ("B".into(), "Legacy B".into())],
+        };
+        super::persist_decision(&engine, agent, &legacy_id, &legacy,
+            serde_json::json!({"channel": "telegram"}),
+            duduclaw_memory::lineage::Provenance::test_only()).await.unwrap();
+
+        // v1.83.0 regression: session B (same agent) neither sees nor can resolve A's decision.
+        // These are the same session-scoped calls the reply pipeline makes.
+        let open_for_b = engine.list_open_decisions_in_session(agent, "session-b", 20).await.unwrap();
+        assert!(open_for_b.is_empty());
+        let section_for_b = super::build_open_decisions_section(&engine, agent, "session-b").await;
+        assert!(section_for_b.is_empty());
+        assert!(!section_for_b.contains("Alice private deployment choice"));
+        assert_eq!(super::detect_decision_reference("用方案 A", &open_for_b), None);
+        assert_eq!(engine.decision_status(agent, &id).await.unwrap().as_deref(), Some("open"));
+        // An empty session id never matches anything.
+        assert!(engine.list_open_decisions_in_session(agent, "", 20).await.unwrap().is_empty());
+
+        // Session A still sees its own decision (and only that one) and resolves it.
+        let open_for_a = engine.list_open_decisions_in_session(agent, "session-a", 20).await.unwrap();
+        assert_eq!(open_for_a.len(), 1);
+        assert_eq!(open_for_a[0].id, id);
+        let section_for_a = super::build_open_decisions_section(&engine, agent, "session-a").await;
+        assert!(section_for_a.contains("Alice private deployment choice"));
+        assert!(section_for_a.contains("A：Deploy Alice project"));
+        assert!(!section_for_a.contains("Legacy unscoped choice"));
+        let (target, key) = super::detect_decision_reference("用方案 A", &open_for_a).unwrap();
+        assert_eq!(target, id);
+        let outcome = engine.resolve_decision(agent, &target, &key,
+            duduclaw_memory::lineage::Provenance::source(
+                duduclaw_memory::lineage::SourceRef::channel_message(
+                    "session-a", 2, "2026-01-02T00:00:00Z".parse().unwrap(), None,
+                ),
+            )).await.unwrap();
+        assert!(matches!(outcome, duduclaw_memory::DecisionResolveOutcome::Resolved { .. }));
+        assert_eq!(engine.decision_status(agent, &id).await.unwrap().as_deref(), Some("resolved:A"));
+        assert!(engine.list_open_decisions_in_session(agent, "session-a", 20).await.unwrap().is_empty());
+
+        // The legacy decision is never listed in any conversation and stays open.
+        for sid in ["session-a", "session-b"] {
+            assert!(engine.list_open_decisions_in_session(agent, sid, 20).await.unwrap().is_empty());
+        }
+        assert_eq!(engine.decision_status(agent, &legacy_id).await.unwrap().as_deref(), Some("open"));
+    }
+
+    #[test]
+    fn released_repro_7_decision_continuity_default_off() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!crate::runtime_config::decision_continuity_enabled(dir.path()));
+        std::fs::write(dir.path().join("agent.toml"), "[memory]\n").unwrap();
+        assert!(!crate::runtime_config::decision_continuity_enabled(dir.path()));
+        std::fs::write(dir.path().join("agent.toml"), "[memory]\ndecision_continuity = true\n").unwrap();
+        assert!(crate::runtime_config::decision_continuity_enabled(dir.path()));
+    }
     use super::*;
     use duduclaw_core::traits::MemoryEngine;
     use tempfile::TempDir;
@@ -847,11 +936,11 @@ mod tests {
             ],
         };
         let id = decision_id("agent-b", "m1");
-        persist_decision(&engine, "agent-b", &id, &draft, serde_json::json!({}), duduclaw_memory::lineage::Provenance::test_only())
+        persist_decision(&engine, "agent-b", &id, &draft, serde_json::json!({"session_id": "discord:s1"}), duduclaw_memory::lineage::Provenance::test_only())
             .await
             .unwrap();
 
-        let section = build_open_decisions_section(&engine, "agent-b").await;
+        let section = build_open_decisions_section(&engine, "agent-b", "discord:s1").await;
         assert!(section.contains("待決事項"));
         assert!(
             section.contains("私有 Ethereum PoA"),
@@ -860,7 +949,7 @@ mod tests {
         assert!(section.contains(&format!("[decision:{id}]")));
 
         // No open decisions for an unrelated agent → empty.
-        let empty = build_open_decisions_section(&engine, "agent-z").await;
+        let empty = build_open_decisions_section(&engine, "agent-z", "discord:s1").await;
         assert!(empty.is_empty());
     }
 
@@ -941,7 +1030,7 @@ mod tests {
             agent,
             &id,
             &draft,
-            serde_json::json!({"channel":"discord"}), duduclaw_memory::lineage::Provenance::test_only(),
+            serde_json::json!({"channel":"discord", "session_id": sid}), duduclaw_memory::lineage::Provenance::test_only(),
         )
         .await
         .unwrap();
@@ -967,7 +1056,7 @@ mod tests {
         assert_eq!(open[0].options[2], ("C".into(), "私有 Ethereum PoA".into()));
 
         // 4. … and would be injected into the next (post-compression) turn.
-        let section = build_open_decisions_section(&engine, agent).await;
+        let section = build_open_decisions_section(&engine, agent, sid).await;
         assert!(
             section.contains("私有 Ethereum PoA"),
             "next-turn prompt re-surfaces the option Agnes had lost"

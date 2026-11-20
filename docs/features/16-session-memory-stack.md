@@ -51,7 +51,7 @@ Stored in: sessions.pinned_instructions (SQLite column)
 Injected at: system prompt tail (high-attention U-shape position)
 ```
 
-Extraction runs asynchronously without blocking the first response. Background decision checks, instruction pinning, fact extraction and conversation compression use the employee's runtime for Claude, Codex and OpenAI-compatible APIs. A non-blank `[model] utility` wins; otherwise Claude uses `claude-haiku-4-5`, while Codex and OpenAI-compatible APIs use `[model] preferred`. If both are blank, Codex omits `-m` and uses its CLI default; OpenAI-compatible APIs refuse the call. Grok and generic CLI employees use the global background settings. The dashboard warns when an explicit utility model belongs to a different vendor family.
+Extraction runs asynchronously without blocking the first response, and only in one-to-one private chats; a group chat never pins instructions from its first message. Background decision checks, instruction pinning, fact extraction and conversation compression use the employee's runtime for Claude, Codex and OpenAI-compatible APIs. A non-blank `[model] utility` wins; otherwise Claude uses `claude-haiku-4-5`, while Codex and OpenAI-compatible APIs use `[model] preferred`. If both are blank, Codex omits `-m` and uses its CLI default; OpenAI-compatible APIs refuse the call. Grok and generic CLI employees use the global background settings. The dashboard warns when an explicit utility model belongs to a different vendor family.
 
 Claude utility calls use the lightweight lane with the CLI's available credentials and do not enter account rotation. Normal chat retains its existing account rotation.
 
@@ -61,7 +61,7 @@ The scheduled session summarizer and auto-titler apply the same utility provider
 
 ### Clarification Accumulation
 
-When the agent asks a clarifying question ("should I preserve the service worker?") and the user answers, that answer is appended to the pinned instructions — capped at 1,000 chars to prevent drift.
+In a one-to-one private chat, when the agent asks a clarifying question ("should I preserve the service worker?") and the user answers, that answer is appended to the pinned instructions — capped at 1,000 chars to prevent drift.
 
 ```
 Pinned instructions grow with clarifications:
@@ -98,7 +98,7 @@ Combined with the U-shaped attention tail effect, it means the model "sees" the 
 
 ## Layer 3: P2 Key-Fact Accumulator (v1.8.6)
 
-Some facts aren't specific to one session — they describe the user or the project across time. Examples:
+Some facts outlive a single turn — they describe the user or the project over the course of a conversation. Since v1.83.0 a key fact belongs to the conversation (channel, chat and session) that produced it and is only injected there; another person's conversation with the same employee never sees it. Examples:
 
 - "User's deployment target is Cloudflare Workers"
 - "Preferred testing library is vitest, not jest"
@@ -126,7 +126,8 @@ Stored in: key_facts table (FTS5 indexed)
      v
 Next turn's system prompt assembly:
   SELECT content FROM key_facts
-  WHERE agent_id = ?
+  WHERE agent_id = ? AND channel = ? AND chat_id = ?
+    AND source_session = ?          -- this conversation only
   ORDER BY fts5_rank(relevance) DESC
   LIMIT 3
      |

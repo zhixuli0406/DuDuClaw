@@ -324,6 +324,135 @@ fn turn_user_message(session: &str, env: &McpTurnEnv) -> Option<duduclaw_memory:
     s.validate().is_ok().then_some(s)
 }
 
+// ── v1.83.0: conversation scope of MCP reads ─────────────────────────────────
+
+/// Which conversation an MCP memory read serves (v1.83.0).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReadScope {
+    /// Not a channel conversation turn: a dispatch / cron / goal run, an
+    /// `external/` client, or a process with no turn identity at all.
+    /// Reads are unchanged.
+    Employee,
+    /// A channel conversation turn. Every row that is not explicitly stored
+    /// (`duduclaw_memory::EXPLICIT_SOURCE_EVENTS`) is returned only when its
+    /// lineage says it comes from this session; `None` = the process's own
+    /// turn identity is malformed, so only explicitly stored rows are
+    /// returned.
+    Conversation(Option<String>),
+}
+
+/// [`ReadScope`] of this process: the turn identity the host put into its
+/// env. A variable that is set but not valid UTF-8 counts as blank
+/// (malformed), never as absent.
+pub(crate) fn mcp_read_scope(namespace: &str) -> ReadScope {
+    let env = |k: &str| match crate::mcp_isolation_identity::var(k) {
+        Ok(v) => Some(v),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => Some(String::new()),
+    };
+    read_scope_with(
+        namespace,
+        &McpTurnEnv {
+            session: env(duduclaw_core::ENV_TRUST_SESSION_ID),
+            turn: env(duduclaw_core::ENV_TRUST_TURN_ID),
+            user_seq: env(duduclaw_core::ENV_TURN_USER_MESSAGE_SEQ),
+            user_at: env(duduclaw_core::ENV_TURN_USER_MESSAGE_AT),
+            run_session: env(duduclaw_core::ENV_DISPATCH_SESSION),
+            run: env(duduclaw_core::ENV_DISPATCH_RUN_ID),
+            upstream_unknown: env(duduclaw_core::ENV_UPSTREAM_UNKNOWN),
+        },
+    )
+}
+
+/// [`mcp_read_scope`] from an explicit env (pure, testable). Same reading of
+/// the own identity as [`mcp_write_sources_with`]:
+///
+/// * an `external/` namespace, or a valid dispatch run (its turn / session
+///   are the upstream's, not its own) → [`ReadScope::Employee`];
+/// * no turn identity at all → [`ReadScope::Employee`];
+/// * an own session (with or without its turn id; the local-first inference
+///   loop has only the session) → that conversation;
+/// * anything malformed (blank or half own identity, a turn without its
+///   session, a key the source validator refuses) → a conversation that is
+///   unknown (fail closed).
+pub(crate) fn read_scope_with(namespace: &str, env: &McpTurnEnv) -> ReadScope {
+    if namespace.starts_with("external/") {
+        return ReadScope::Employee;
+    }
+    if check_own_identity(env).is_err() {
+        return ReadScope::Conversation(None);
+    }
+    if present(&env.run).is_some() {
+        return ReadScope::Employee;
+    }
+    let now = chrono::Utc::now();
+    match (present(&env.turn), present(&env.session)) {
+        (None, None) => ReadScope::Employee,
+        (Some(turn), Some(session)) => match own_turn(turn, session, now) {
+            Ok(_) => ReadScope::Conversation(Some(session.trim().to_string())),
+            Err(_) => ReadScope::Conversation(None),
+        },
+        (None, Some(session)) => match own_turn("-", session, now) {
+            Ok(_) => ReadScope::Conversation(Some(session.trim().to_string())),
+            Err(_) => ReadScope::Conversation(None),
+        },
+        (Some(_), None) => ReadScope::Conversation(None),
+    }
+}
+
+/// The ids of `ids` (rows of `namespace`) this read may not return. Empty
+/// for [`ReadScope::Employee`].
+async fn hidden_ids(
+    memory: &SqliteMemoryEngine,
+    namespace: &str,
+    ids: &[String],
+    scope: &ReadScope,
+) -> duduclaw_core::error::Result<std::collections::HashSet<String>> {
+    match scope {
+        ReadScope::Employee => Ok(Default::default()),
+        ReadScope::Conversation(_) if ids.is_empty() => Ok(Default::default()),
+        ReadScope::Conversation(session) => {
+            memory
+                .ids_hidden_from_conversation(namespace, ids, session.as_deref())
+                .await
+        }
+    }
+}
+
+/// `entries` without the ones this read may not return (order kept). Every
+/// row that is not explicitly stored is looked up.
+pub(crate) async fn scope_entries(
+    memory: &SqliteMemoryEngine,
+    namespace: &str,
+    entries: Vec<MemoryEntry>,
+    scope: &ReadScope,
+) -> duduclaw_core::error::Result<Vec<MemoryEntry>> {
+    if *scope == ReadScope::Employee {
+        return Ok(entries);
+    }
+    let candidates: Vec<String> = entries
+        .iter()
+        .filter(|e| !duduclaw_memory::is_explicitly_stored(&e.source_event))
+        .map(|e| e.id.clone())
+        .collect();
+    let hidden = hidden_ids(memory, namespace, &candidates, scope).await?;
+    Ok(entries.into_iter().filter(|e| !hidden.contains(&e.id)).collect())
+}
+
+/// The fixed answer of the employee-wide maintenance tools on a channel
+/// conversation turn (v1.83.0): `memory_invalidate_by_origin`,
+/// `memory_episodic_pressure`, `memory_consolidation_status`.
+pub(crate) const CHANNEL_TURN_REFUSED: &str =
+    "Not available from a conversation: bulk memory invalidation and memory maintenance \
+     statistics cover every conversation of this employee, so they cannot be used on a \
+     chat turn. Ask an administrator.";
+
+/// `Some(error)` when `scope` is a channel conversation turn (known or not):
+/// an employee-wide maintenance tool refuses and changes nothing.
+pub(crate) fn refused_on_channel_turn(scope: &ReadScope) -> Option<Value> {
+    matches!(scope, ReadScope::Conversation(_)).then(|| mcp_error(CHANNEL_TURN_REFUSED))
+}
+
 /// The tool error for a write refused by the source fence (and its audit).
 pub(crate) fn mcp_fenced_error(
     namespace: &str,
@@ -537,10 +666,25 @@ pub async fn handle_memory_store(
 /// ```json
 /// { "results": [ { "id": ..., "content": ..., ... } ], "total": N }
 /// ```
+///
+/// v1.83.0: on a channel conversation turn ([`mcp_read_scope`]) a row that
+/// is not explicitly stored and does not come from this conversation is
+/// dropped before the limit.
 pub async fn handle_memory_search(
     params: &Value,
     memory: &SqliteMemoryEngine,
     ns_ctx: &NamespaceContext,
+) -> Value {
+    let scope = mcp_read_scope(&ns_ctx.write_namespace);
+    handle_memory_search_in(params, memory, ns_ctx, &scope).await
+}
+
+/// [`handle_memory_search`] with an explicit [`ReadScope`].
+pub(crate) async fn handle_memory_search_in(
+    params: &Value,
+    memory: &SqliteMemoryEngine,
+    ns_ctx: &NamespaceContext,
+    scope: &ReadScope,
 ) -> Value {
     let query = match params.get("query").and_then(|v| v.as_str()) {
         Some(q) if !q.trim().is_empty() => q,
@@ -558,6 +702,11 @@ pub async fn handle_memory_search(
 
     match memory.search(namespace, query, limit * 4).await {
         Ok(entries) => {
+            // v1.83.0: conversation scope first, before the limit.
+            let entries = match scope_entries(memory, namespace, entries, scope).await {
+                Ok(entries) => entries,
+                Err(e) => return mcp_error(&format!("Error searching memory: {e}")),
+            };
             // Post-filter by tags (engine search doesn't support tag filter natively).
             let mut results: Vec<Value> = entries
                 .into_iter()
@@ -613,10 +762,25 @@ pub async fn handle_memory_search(
 ///
 /// # Returns
 /// Complete memory record on success; 403 on access denial.
+///
+/// v1.83.0: on a channel conversation turn a row that is not explicitly
+/// stored and does not come from this conversation answers exactly like an
+/// id that does not exist.
 pub async fn handle_memory_read(
     params: &Value,
     memory: &SqliteMemoryEngine,
     ns_ctx: &NamespaceContext,
+) -> Value {
+    let scope = mcp_read_scope(&ns_ctx.write_namespace);
+    handle_memory_read_in(params, memory, ns_ctx, &scope).await
+}
+
+/// [`handle_memory_read`] with an explicit [`ReadScope`].
+pub(crate) async fn handle_memory_read_in(
+    params: &Value,
+    memory: &SqliteMemoryEngine,
+    ns_ctx: &NamespaceContext,
+    scope: &ReadScope,
 ) -> Value {
     // Accept both "id" (M1 spec) and "memory_id" (legacy tool definition name)
     // for backward compatibility with existing MCP clients.
@@ -632,7 +796,15 @@ pub async fn handle_memory_read(
     // Caller's namespace is the lookup key — get_by_id enforces ownership.
     let namespace = &ns_ctx.write_namespace;
 
-    match memory.get_by_id(namespace, memory_id).await {
+    let found = match memory.get_by_id(namespace, memory_id).await {
+        // v1.83.0: out of this conversation's scope ⇒ the "not found" answer.
+        Ok(Some(entry)) => match scope_entries(memory, namespace, vec![entry], scope).await {
+            Ok(mut kept) => Ok(kept.pop()),
+            Err(e) => Err(e),
+        },
+        other => other,
+    };
+    match found {
         Ok(Some(entry)) => {
             // Belt-and-suspenders: even though get_by_id already filters by
             // agent_id, verify the stored agent_id matches exactly.
@@ -678,10 +850,25 @@ pub async fn handle_memory_read(
 /// { "memories": [...], "missing_ids": [...], "total_found": N, "total_missing": M }
 /// ```
 /// Partial hits are NOT an error — found entries plus a `missing_ids` list.
+///
+/// v1.83.0: on a channel conversation turn a row that is not explicitly
+/// stored and does not come from this conversation lands in `missing_ids`
+/// too.
 pub async fn handle_memory_fetch_batch(
     params: &Value,
     memory: &SqliteMemoryEngine,
     ns_ctx: &NamespaceContext,
+) -> Value {
+    let scope = mcp_read_scope(&ns_ctx.write_namespace);
+    handle_memory_fetch_batch_in(params, memory, ns_ctx, &scope).await
+}
+
+/// [`handle_memory_fetch_batch`] with an explicit [`ReadScope`].
+pub(crate) async fn handle_memory_fetch_batch_in(
+    params: &Value,
+    memory: &SqliteMemoryEngine,
+    ns_ctx: &NamespaceContext,
+    scope: &ReadScope,
 ) -> Value {
     let ids: Vec<String> = match crate::mcp_args::arg_string_list(params, "ids") {
         Some(ids) => ids,
@@ -699,7 +886,11 @@ pub async fn handle_memory_fetch_batch(
 
     let namespace = &ns_ctx.write_namespace;
 
-    match memory.get_by_ids(namespace, &ids).await {
+    let fetched = match memory.get_by_ids(namespace, &ids).await {
+        Ok(entries) => scope_entries(memory, namespace, entries, scope).await,
+        Err(e) => Err(e),
+    };
+    match fetched {
         Ok(entries) => {
             let found_ids: std::collections::HashSet<&str> =
                 entries.iter().map(|e| e.id.as_str()).collect();
@@ -766,9 +957,17 @@ pub async fn handle_memory_get_history(
         _ => return mcp_error("Missing required parameter: predicate"),
     };
     let namespace = &ns_ctx.write_namespace;
+    let scope = mcp_read_scope(namespace);
 
     match memory.get_history(namespace, subject, predicate).await {
         Ok(records) => {
+            // v1.83.0: conversation scope (rows not explicitly stored, of other conversations).
+            let ids: Vec<String> = records.iter().map(|r| r.id.clone()).collect();
+            let hidden = match hidden_ids(memory, namespace, &ids, &scope).await {
+                Ok(h) => h,
+                Err(e) => return mcp_error(&format!("Error reading history: {e}")),
+            };
+            let records: Vec<_> = records.into_iter().filter(|r| !hidden.contains(&r.id)).collect();
             let total = records.len();
             let payload = serde_json::json!({
                 "subject": subject,
@@ -805,8 +1004,20 @@ pub async fn handle_memory_get_at(
         _ => return mcp_error("Missing required parameter: at (RFC3339 timestamp)"),
     };
     let namespace = &ns_ctx.write_namespace;
+    let scope = mcp_read_scope(namespace);
 
-    match memory.get_at(namespace, subject, predicate, at).await {
+    let found = match memory.get_at(namespace, subject, predicate, at).await {
+        // v1.83.0: out of this conversation's scope ⇒ the "not found" answer.
+        Ok(Some(record)) => {
+            match hidden_ids(memory, namespace, std::slice::from_ref(&record.id), &scope).await {
+                Ok(hidden) if hidden.contains(&record.id) => Ok(None),
+                Ok(_) => Ok(Some(record)),
+                Err(e) => Err(e),
+            }
+        }
+        other => other,
+    };
+    match found {
         Ok(Some(record)) => {
             let payload = serde_json::json!({
                 "subject": subject,
@@ -877,6 +1088,10 @@ pub fn ai_employee_caller(
 /// user, import, agent-derived, profile, unattributed, unknown strings — is
 /// refused and audited as `memory_invalidate_refused`. An operator using an
 /// admin key with no agent identity (`None`) is unaffected.
+///
+/// v1.83.0: on a channel conversation turn ([`mcp_read_scope`]) the call is
+/// refused with [`CHANNEL_TURN_REFUSED`] and nothing changes: the rows it
+/// would expire (and the count it returns) span every conversation.
 pub async fn handle_memory_invalidate_by_origin(
     params: &Value,
     memory: &SqliteMemoryEngine,
@@ -884,6 +1099,23 @@ pub async fn handle_memory_invalidate_by_origin(
     acting_agent: Option<&str>,
     home_dir: &std::path::Path,
 ) -> Value {
+    let scope = mcp_read_scope(&ns_ctx.write_namespace);
+    handle_memory_invalidate_by_origin_in(params, memory, ns_ctx, acting_agent, home_dir, &scope)
+        .await
+}
+
+/// [`handle_memory_invalidate_by_origin`] with an explicit [`ReadScope`].
+pub(crate) async fn handle_memory_invalidate_by_origin_in(
+    params: &Value,
+    memory: &SqliteMemoryEngine,
+    ns_ctx: &NamespaceContext,
+    acting_agent: Option<&str>,
+    home_dir: &std::path::Path,
+    scope: &ReadScope,
+) -> Value {
+    if let Some(refused) = refused_on_channel_turn(scope) {
+        return refused;
+    }
     let origin = match params.get("origin").and_then(|v| v.as_str()) {
         Some(o) if !o.trim().is_empty() => o.trim(),
         _ => return mcp_error("Missing required parameter: origin"),
@@ -1038,6 +1270,11 @@ pub async fn handle_memory_improve(
     let namespace = &ns_ctx.write_namespace;
 
     let entries = match memory.search(namespace, topic, limit).await {
+        Ok(e) => e,
+        Err(e) => return mcp_error(&format!("Error gathering memories: {e}")),
+    };
+    // v1.83.0: conversation scope (rows not explicitly stored, of other conversations).
+    let entries = match scope_entries(memory, namespace, entries, &mcp_read_scope(namespace)).await {
         Ok(e) => e,
         Err(e) => return mcp_error(&format!("Error gathering memories: {e}")),
     };
@@ -1343,17 +1580,53 @@ pub async fn handle_user_profile_record(
 /// `## About This User` block (the same bytes injected into the reply prompt).
 ///
 /// Params: `user_id` (required). Agent = the server-injected namespace.
+///
+/// v1.83.0: on a channel conversation turn ([`mcp_read_scope`]) only the
+/// trait rows that pass the same-conversation check are used; nothing left
+/// answers exactly like a user with no profile.
 pub async fn handle_user_profile_get(
     params: &Value,
     memory: &SqliteMemoryEngine,
     ns_ctx: &NamespaceContext,
+) -> Value {
+    let scope = mcp_read_scope(&ns_ctx.write_namespace);
+    handle_user_profile_get_in(params, memory, ns_ctx, &scope).await
+}
+
+/// [`handle_user_profile_get`] with an explicit [`ReadScope`].
+pub(crate) async fn handle_user_profile_get_in(
+    params: &Value,
+    memory: &SqliteMemoryEngine,
+    ns_ctx: &NamespaceContext,
+    scope: &ReadScope,
 ) -> Value {
     let user_id = match params.get("user_id").and_then(|v| v.as_str()) {
         Some(s) if !s.trim().is_empty() => s,
         _ => return mcp_error("Missing required parameter: user_id"),
     };
     let namespace = ns_ctx.write_namespace.clone();
-    match duduclaw_memory::user_profile::profile_traits(memory, &namespace, user_id).await {
+    let traits = match scope {
+        ReadScope::Employee => {
+            duduclaw_memory::user_profile::profile_traits(memory, &namespace, user_id).await
+        }
+        ReadScope::Conversation(_) => {
+            match duduclaw_memory::user_profile::profile_trait_rows(memory, &namespace, user_id)
+                .await
+            {
+                Ok(rows) => {
+                    let ids: Vec<String> = rows.iter().map(|(id, _)| id.clone()).collect();
+                    match hidden_ids(memory, &namespace, &ids, scope).await {
+                        Ok(hidden) => Ok(duduclaw_memory::user_profile::newest_per_predicate(
+                            rows.into_iter().filter(|(id, _)| !hidden.contains(id)).collect(),
+                        )),
+                        Err(e) => Err(e),
+                    }
+                }
+                Err(e) => Err(e),
+            }
+        }
+    };
+    match traits {
         Ok(traits) => {
             let items: Vec<Value> = traits
                 .iter()
@@ -1375,11 +1648,37 @@ pub async fn handle_user_profile_get(
 /// `user-profile`-tagged entries), unresolved conflicts, and the count of
 /// rows the parsers could not type. Read-only; the agent is the
 /// server-injected write namespace (never client-supplied). No parameters.
+///
+/// v1.83.0: on a channel conversation turn ([`mcp_read_scope`]) only the rows
+/// that pass the same-conversation check are compiled; nothing left answers
+/// exactly like an agent with no user facts.
 pub async fn handle_user_code_profile(
     memory: &SqliteMemoryEngine,
     ns_ctx: &NamespaceContext,
 ) -> Value {
-    match duduclaw_memory::compile_user_profile(&ns_ctx.write_namespace, memory).await {
+    let scope = mcp_read_scope(&ns_ctx.write_namespace);
+    handle_user_code_profile_in(memory, ns_ctx, &scope).await
+}
+
+/// [`handle_user_code_profile`] with an explicit [`ReadScope`].
+pub(crate) async fn handle_user_code_profile_in(
+    memory: &SqliteMemoryEngine,
+    ns_ctx: &NamespaceContext,
+    scope: &ReadScope,
+) -> Value {
+    let namespace = &ns_ctx.write_namespace;
+    let compiled = match scope {
+        ReadScope::Employee => duduclaw_memory::compile_user_profile(namespace, memory).await,
+        ReadScope::Conversation(session) => {
+            duduclaw_memory::compile_user_profile_in_conversation(
+                namespace,
+                memory,
+                session.as_deref(),
+            )
+            .await
+        }
+    };
+    match compiled {
         Ok(profile) => match serde_json::to_value(&profile) {
             Ok(v) => mcp_text(v),
             Err(e) => mcp_error(&format!("user_code_profile serialization failed: {e}")),
@@ -2388,5 +2687,472 @@ mod tests {
         assert!(!is_err(&op_call), "{op_call}");
         assert!(memory.get_history("internal/a1", "s", "p").await.unwrap()
             .iter().find(|r| r.id == op).unwrap().valid_until.is_some());
+    }
+
+    // ── v1.83.0: conversation scope of memory_search / memory_read ────────
+
+    /// The scope of a channel turn in `session` (the env the gateway sets).
+    fn channel_turn(session: &str) -> ReadScope {
+        read_scope_with(
+            "internal/a1",
+            &McpTurnEnv {
+                session: Some(session.into()),
+                turn: Some("t-1".into()),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// The scope of a dispatch run whose upstream turn was in `session`.
+    fn dispatch_run(session: &str) -> ReadScope {
+        read_scope_with(
+            "internal/a1",
+            &McpTurnEnv {
+                session: Some(session.into()),
+                turn: Some("t-1".into()),
+                run_session: Some("dispatch:a1".into()),
+                run: Some("r1".into()),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Store a host-written row (`source_event`) of conversation `session`
+    /// (`None`: no conversation, system provenance).
+    async fn host_row(mem: &SqliteMemoryEngine, content: &str, event: &str, session: Option<&str>) -> String {
+        let entry = MemoryEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            agent_id: "internal/a1".into(),
+            content: content.into(),
+            timestamp: chrono::Utc::now(),
+            tags: vec![],
+            embedding: None,
+            layer: duduclaw_core::types::MemoryLayer::Semantic,
+            importance: 5.0,
+            access_count: 0,
+            last_accessed: None,
+            source_event: event.into(),
+        };
+        let prov = match session {
+            Some(s) => duduclaw_memory::lineage::Provenance::source(
+                duduclaw_memory::SourceRef::channel_message(s, 1, chrono::Utc::now(), None),
+            ),
+            None => duduclaw_memory::lineage::Provenance::test_only(),
+        };
+        mem.store_temporal("internal/a1", entry, duduclaw_memory::TemporalMeta::default(), prov)
+            .await
+            .unwrap()
+    }
+
+    async fn search_ids(mem: &SqliteMemoryEngine, query: &str, scope: &ReadScope) -> Vec<String> {
+        let resp = handle_memory_search_in(
+            &serde_json::json!({ "query": query }),
+            mem,
+            &internal_ns("a1"),
+            scope,
+        )
+        .await;
+        assert!(!is_error(&resp), "{resp}");
+        let payload: Value = serde_json::from_str(&text_of(&resp)).unwrap();
+        payload["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    async fn read(mem: &SqliteMemoryEngine, id: &str, scope: &ReadScope) -> Value {
+        handle_memory_read_in(&serde_json::json!({ "id": id }), mem, &internal_ns("a1"), scope).await
+    }
+
+    /// The answer `memory_read` gives for an id that does not exist.
+    fn not_found(id: &str) -> Value {
+        mcp_forbidden(&format!("memory not found or access denied: {id}"))
+    }
+
+    #[test]
+    fn read_scope_follows_the_own_turn_identity() {
+        let conv = |s: &str| ReadScope::Conversation(Some(s.to_string()));
+        assert_eq!(channel_turn("telegram:A"), conv("telegram:A"));
+        // Session only (local-first inference loop): still that conversation.
+        let session_only = McpTurnEnv { session: Some(" telegram:A ".into()), ..Default::default() };
+        assert_eq!(read_scope_with("internal/a1", &session_only), conv("telegram:A"));
+        // Not a channel turn: dispatch run (its turn is the upstream's), no
+        // identity at all, an external client.
+        assert_eq!(dispatch_run("telegram:A"), ReadScope::Employee);
+        assert_eq!(read_scope_with("internal/a1", &McpTurnEnv::default()), ReadScope::Employee);
+        let external = McpTurnEnv { session: Some("telegram:A".into()), turn: Some("t".into()), ..Default::default() };
+        assert_eq!(read_scope_with("external/claude-desktop", &external), ReadScope::Employee);
+        // Malformed own identity: a conversation that is unknown.
+        let at = duduclaw_memory::format_ts(chrono::Utc::now());
+        for env in [
+            McpTurnEnv { turn: Some("t".into()), ..Default::default() },
+            McpTurnEnv { session: Some("".into()), turn: Some("t".into()), ..Default::default() },
+            McpTurnEnv { session: Some("system:x".into()), ..Default::default() },
+            McpTurnEnv { user_seq: Some("1".into()), user_at: Some(at), ..Default::default() },
+            McpTurnEnv { run: Some(" ".into()), run_session: Some("dispatch:a1".into()), ..Default::default() },
+            McpTurnEnv { run_session: Some("dispatch:a1".into()), ..Default::default() },
+        ] {
+            assert_eq!(read_scope_with("internal/a1", &env), ReadScope::Conversation(None), "{env:?}");
+        }
+    }
+
+    /// (1) session B gets neither A's distilled row from `memory_search` nor
+    /// from `memory_read` (same answer as a missing id) nor from
+    /// `memory_fetch_batch`; (2) session A gets its own; (3) an explicit
+    /// `memory_store` row is returned in both.
+    #[tokio::test]
+    async fn distilled_rows_stay_in_their_conversation() {
+        let mem = SqliteMemoryEngine::in_memory().unwrap();
+        let quota = DailyQuota::with_limit(100);
+        let a_row = host_row(&mem, "zebrafjord refund policy is thirty days", "conversation_distill", Some("telegram:A")).await;
+        let stored = handle_memory_store(
+            &serde_json::json!({ "content": "zebrafjord explicit note" }),
+            &mem,
+            &internal_ns("a1"),
+            &quota,
+        )
+        .await;
+        let stored: Value = serde_json::from_str(&text_of(&stored)).unwrap();
+        let stored = stored["id"].as_str().unwrap().to_string();
+
+        let b = channel_turn("telegram:B");
+        let found = search_ids(&mem, "zebrafjord", &b).await;
+        assert!(!found.contains(&a_row), "{found:?}");
+        assert!(found.contains(&stored), "{found:?}");
+        assert_eq!(read(&mem, &a_row, &b).await, not_found(&a_row));
+        assert_eq!(read(&mem, "no-such-id", &b).await, not_found("no-such-id"));
+        assert!(!is_error(&read(&mem, &stored, &b).await));
+        let batch = handle_memory_fetch_batch_in(
+            &serde_json::json!({ "ids": [a_row, stored] }),
+            &mem,
+            &internal_ns("a1"),
+            &b,
+        )
+        .await;
+        let batch: Value = serde_json::from_str(&text_of(&batch)).unwrap();
+        assert_eq!(batch["total_found"], 1, "{batch}");
+        assert_eq!(batch["missing_ids"][0], a_row.as_str(), "{batch}");
+
+        let a = channel_turn("telegram:A");
+        let found = search_ids(&mem, "zebrafjord", &a).await;
+        assert!(found.contains(&a_row) && found.contains(&stored), "{found:?}");
+        let record: Value = serde_json::from_str(&text_of(&read(&mem, &a_row, &a).await)).unwrap();
+        assert_eq!(record["id"], a_row.as_str());
+    }
+
+    #[tokio::test]
+    async fn search_returns_import_lineage_on_another_channel_turn() {
+        let mem = SqliteMemoryEngine::in_memory().unwrap();
+        let content = "tamarinvale imported policy";
+        let entry = MemoryEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            agent_id: "internal/a1".into(),
+            content: content.into(),
+            timestamp: chrono::Utc::now(),
+            tags: vec![],
+            embedding: None,
+            layer: duduclaw_core::types::MemoryLayer::Semantic,
+            importance: 5.0,
+            access_count: 0,
+            last_accessed: None,
+            source_event: "migrate-from-openclaw".into(),
+        };
+        let prov = duduclaw_memory::lineage::Provenance::source(
+            duduclaw_memory::SourceRef::import_item("archive", content.as_bytes(), chrono::Utc::now()),
+        );
+        let imported = mem.store_temporal("internal/a1", entry, duduclaw_memory::TemporalMeta::default(), prov)
+            .await
+            .unwrap();
+        let found = search_ids(&mem, "tamarinvale", &channel_turn("telegram:B")).await;
+        assert!(found.contains(&imported), "{found:?}");
+    }
+
+    /// (4) a row that is not explicitly stored and whose source conversation is not recorded
+    /// (no lineage, or a non-import, non-conversation source) is not returned on any
+    /// channel turn, nor when the own identity is malformed; (5) a dispatch
+    /// run and a process without identity read as before.
+    #[tokio::test]
+    async fn unknown_source_hidden_on_channel_turns_and_non_channel_unchanged() {
+        let mem = SqliteMemoryEngine::in_memory().unwrap();
+        let a_row = host_row(&mem, "quokkaline fact from A", "conversation_distill", Some("telegram:A")).await;
+        let old = host_row(&mem, "quokkaline legacy fact", "conversation_distill", Some("telegram:A")).await;
+        {
+            let conn = mem.conn_for_maintenance().await;
+            conn.execute("DELETE FROM memory_origins WHERE memory_id = ?1", rusqlite::params![old])
+                .unwrap();
+        }
+        let system = host_row(&mem, "quokkaline footprint day", "footprint_distill", None).await;
+
+        for scope in [channel_turn("telegram:A"), channel_turn("telegram:B"), ReadScope::Conversation(None)] {
+            let found = search_ids(&mem, "quokkaline", &scope).await;
+            assert!(!found.contains(&old) && !found.contains(&system), "{scope:?}: {found:?}");
+            assert_eq!(read(&mem, &old, &scope).await, not_found(&old), "{scope:?}");
+            assert_eq!(read(&mem, &system, &scope).await, not_found(&system), "{scope:?}");
+        }
+        assert!(search_ids(&mem, "quokkaline", &ReadScope::Conversation(None)).await.is_empty());
+
+        for scope in [dispatch_run("telegram:B"), read_scope_with("internal/a1", &McpTurnEnv::default())] {
+            let found = search_ids(&mem, "quokkaline", &scope).await;
+            for id in [&a_row, &old, &system] {
+                assert!(found.contains(id), "{scope:?}: {found:?}");
+                assert!(!is_error(&read(&mem, id, &scope).await), "{scope:?}");
+            }
+        }
+    }
+
+    /// (6) user-profile traits (and their summary) are scoped rows too.
+    #[tokio::test]
+    async fn user_profile_rows_stay_in_their_conversation() {
+        let mem = SqliteMemoryEngine::in_memory().unwrap();
+        let from_a = duduclaw_memory::lineage::Provenance::source(
+            duduclaw_memory::SourceRef::channel_message("telegram:A", 7, chrono::Utc::now(), None),
+        );
+        let t = duduclaw_memory::user_profile::record_trait(
+            &mem, "internal/a1", "alice", "prefers", "wombatberry tea", 1.0, from_a,
+        )
+        .await
+        .unwrap();
+        let summary = host_row(&mem, "User profile — wombatberry", "user_profile_consolidation", Some("telegram:A")).await;
+
+        let b = channel_turn("telegram:B");
+        let found = search_ids(&mem, "wombatberry", &b).await;
+        assert!(found.is_empty(), "{found:?}");
+        assert_eq!(read(&mem, &t, &b).await, not_found(&t));
+        assert_eq!(read(&mem, &summary, &b).await, not_found(&summary));
+
+        let found = search_ids(&mem, "wombatberry", &channel_turn("telegram:A")).await;
+        assert!(found.contains(&t) && found.contains(&summary), "{found:?}");
+    }
+
+    /// The allow-list holds only explicitly stored events; the gateway's own
+    /// source events and anything unknown are scoped.
+    #[test]
+    fn explicit_family_matches_the_writers() {
+        for ev in ["mcp_internal", "import"] {
+            assert!(duduclaw_memory::is_explicitly_stored(ev), "{ev}");
+        }
+        for ev in [
+            duduclaw_gateway::wiki_ingest::DISTILL_SOURCE_EVENT,
+            duduclaw_gateway::footprint_distill::FOOTPRINT_SOURCE_EVENT,
+            "user_profile",
+            "user_profile_consolidation",
+            "decision_capture",
+            "decision_resolve",
+            "conversation_summary",
+            "reflexion_consolidation",
+            "night_consolidation",
+            "mcp_external",
+            "curated",
+            "",
+            "some_future_event",
+        ] {
+            assert!(!duduclaw_memory::is_explicitly_stored(ev), "{ev}");
+        }
+    }
+
+    /// (a) a recorded decision and a conversation summary of conversation A
+    /// are returned by neither `memory_search` nor `memory_read` in B (nor in
+    /// an unknown conversation), and are returned in A.
+    #[tokio::test]
+    async fn decisions_and_summaries_stay_in_their_conversation() {
+        let mem = SqliteMemoryEngine::in_memory().unwrap();
+        let id = duduclaw_gateway::decision_capture::decision_id("internal/a1", "telegram:A-msg");
+        let draft = duduclaw_gateway::decision_capture::DecisionDraft {
+            question: "kumquatvale deployment choice".into(),
+            options: vec![("A".into(), "kumquatvale now".into()), ("B".into(), "kumquatvale later".into())],
+        };
+        duduclaw_gateway::decision_capture::persist_decision(
+            &mem,
+            "internal/a1",
+            &id,
+            &draft,
+            serde_json::json!({"session_id": "telegram:A"}),
+            duduclaw_memory::lineage::Provenance::source(
+                duduclaw_memory::SourceRef::channel_message("telegram:A", 1, chrono::Utc::now(), None),
+            ),
+        )
+        .await
+        .unwrap();
+        let summary =
+            host_row(&mem, "kumquatvale conversation summary", "conversation_summary", Some("telegram:A")).await;
+
+        let in_a = search_ids(&mem, "kumquatvale", &channel_turn("telegram:A")).await;
+        assert!(in_a.contains(&summary), "{in_a:?}");
+        let decision_rows: Vec<String> = in_a.iter().filter(|r| **r != summary).cloned().collect();
+        assert!(!decision_rows.is_empty(), "{in_a:?}");
+        for row in &decision_rows {
+            let record: Value =
+                serde_json::from_str(&text_of(&read(&mem, row, &channel_turn("telegram:A")).await)).unwrap();
+            assert_eq!(record["source_event"], "decision_capture", "{record}");
+        }
+
+        for scope in [channel_turn("telegram:B"), ReadScope::Conversation(None)] {
+            let found = search_ids(&mem, "kumquatvale", &scope).await;
+            assert!(found.is_empty(), "{scope:?}: {found:?}");
+            for row in decision_rows.iter().chain([&summary]) {
+                assert_eq!(read(&mem, row, &scope).await, not_found(row), "{scope:?}");
+            }
+        }
+    }
+
+    /// (b) a row whose `source_event` was never enumerated (or is empty) is
+    /// hidden on a channel turn of another or an unknown conversation.
+    #[tokio::test]
+    async fn unknown_source_events_are_hidden_on_channel_turns() {
+        let mem = SqliteMemoryEngine::in_memory().unwrap();
+        let unknown = host_row(&mem, "ptarmigix future row", "some_future_event", Some("telegram:A")).await;
+        let empty = host_row(&mem, "ptarmigix empty row", "", Some("telegram:A")).await;
+        for scope in [channel_turn("telegram:B"), ReadScope::Conversation(None)] {
+            assert!(search_ids(&mem, "ptarmigix", &scope).await.is_empty(), "{scope:?}");
+            assert_eq!(read(&mem, &unknown, &scope).await, not_found(&unknown), "{scope:?}");
+            assert_eq!(read(&mem, &empty, &scope).await, not_found(&empty), "{scope:?}");
+        }
+        let in_a = search_ids(&mem, "ptarmigix", &channel_turn("telegram:A")).await;
+        assert!(in_a.contains(&unknown) && in_a.contains(&empty), "{in_a:?}");
+    }
+
+    /// (c) the employee's own `memory_store` row (`mcp_internal`) and an
+    /// operator import (`import`) are returned in any conversation. `curated`
+    /// has no production writer, so it is not on the allow-list and a
+    /// `curated` row of another conversation is hidden like any other.
+    #[tokio::test]
+    async fn explicit_rows_are_returned_in_any_conversation() {
+        let mem = SqliteMemoryEngine::in_memory().unwrap();
+        let quota = DailyQuota::with_limit(100);
+        let stored = handle_memory_store(
+            &serde_json::json!({ "content": "lorikeetish explicit note" }),
+            &mem,
+            &internal_ns("a1"),
+            &quota,
+        )
+        .await;
+        let stored: Value = serde_json::from_str(&text_of(&stored)).unwrap();
+        let stored = stored["id"].as_str().unwrap().to_string();
+        let imported = host_row(&mem, "lorikeetish imported faq", "import", None).await;
+        let curated = host_row(&mem, "lorikeetish curated row", "curated", Some("telegram:A")).await;
+
+        for scope in [channel_turn("telegram:A"), channel_turn("telegram:B"), ReadScope::Conversation(None)] {
+            let found = search_ids(&mem, "lorikeetish", &scope).await;
+            assert!(found.contains(&stored) && found.contains(&imported), "{scope:?}: {found:?}");
+            assert!(!is_error(&read(&mem, &stored, &scope).await), "{scope:?}");
+            assert!(!is_error(&read(&mem, &imported, &scope).await), "{scope:?}");
+        }
+        let in_b = search_ids(&mem, "lorikeetish", &channel_turn("telegram:B")).await;
+        assert!(!in_b.contains(&curated), "{in_b:?}");
+    }
+
+    // ── v1.83.0: conversation scope of user_profile_get / user_code_profile ──
+
+    async fn profile_get(mem: &SqliteMemoryEngine, user: &str, scope: &ReadScope) -> Value {
+        handle_user_profile_get_in(&serde_json::json!({ "user_id": user }), mem, &internal_ns("a1"), scope)
+            .await
+    }
+
+    /// A profile built from conversation A is returned in A and by a
+    /// dispatch run; in B and in an unknown conversation both profile tools
+    /// answer exactly as for a user with no profile.
+    #[tokio::test]
+    async fn profile_tools_follow_the_conversation_scope() {
+        let mem = SqliteMemoryEngine::in_memory().unwrap();
+        let empty = SqliteMemoryEngine::in_memory().unwrap();
+        let from_a = duduclaw_memory::lineage::Provenance::source(
+            duduclaw_memory::SourceRef::channel_message("telegram:A", 7, chrono::Utc::now(), None),
+        );
+        duduclaw_memory::user_profile::record_trait(
+            &mem, "internal/a1", "alice", "prefers", "wombatberry tea", 1.0, from_a,
+        )
+        .await
+        .unwrap();
+        duduclaw_memory::user_profile::consolidate_profile(&mem, "internal/a1", "alice", 1)
+            .await
+            .unwrap();
+
+        for scope in [channel_turn("telegram:A"), dispatch_run("telegram:B")] {
+            let got: Value = serde_json::from_str(&text_of(&profile_get(&mem, "alice", &scope).await)).unwrap();
+            assert_eq!(got["traits"][0]["value"], "wombatberry tea", "{scope:?}: {got}");
+            assert!(got["block"].as_str().unwrap().contains("wombatberry"), "{scope:?}");
+            let code = handle_user_code_profile_in(&mem, &internal_ns("a1"), &scope).await;
+            let code: Value = serde_json::from_str(&text_of(&code)).unwrap();
+            assert!(!code["rules"].as_array().unwrap().is_empty(), "{scope:?}: {code}");
+        }
+
+        for scope in [channel_turn("telegram:B"), ReadScope::Conversation(None)] {
+            assert_eq!(
+                profile_get(&mem, "alice", &scope).await,
+                profile_get(&empty, "alice", &ReadScope::Employee).await,
+                "{scope:?}"
+            );
+            assert_eq!(
+                handle_user_code_profile_in(&mem, &internal_ns("a1"), &scope).await,
+                handle_user_code_profile_in(&empty, &internal_ns("a1"), &ReadScope::Employee).await,
+                "{scope:?}"
+            );
+        }
+    }
+
+    // ── v1.83.0: memory_invalidate_by_origin on a channel turn ───────────────
+
+    /// (a) a channel turn in B (and in A, and in an unknown conversation) is
+    /// refused with the fixed error, and A's rows stay valid; (c) a dispatch
+    /// run and a process with no turn identity invalidate as before.
+    #[tokio::test]
+    async fn invalidate_by_origin_refused_on_channel_turns() {
+        let mem = SqliteMemoryEngine::in_memory().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let ns = internal_ns("a1");
+        for subject in ["s1", "s2"] {
+            mem.store_temporal(
+                "internal/a1",
+                MemoryEntry { id: uuid::Uuid::new_v4().to_string(), ..mk_entry(&format!("{subject} from A"), &[]) },
+                duduclaw_memory::TemporalMeta {
+                    subject: Some(subject.into()),
+                    predicate: Some("p".into()),
+                    object: Some("A".into()),
+                    origin: Some("channel".into()),
+                    ..Default::default()
+                },
+                duduclaw_memory::lineage::Provenance::source(
+                    duduclaw_memory::SourceRef::channel_message("telegram:A", 1, chrono::Utc::now(), None),
+                ),
+            )
+            .await
+            .unwrap();
+        }
+        async fn valid(mem: &SqliteMemoryEngine, subject: &str) -> bool {
+            mem.get_history("internal/a1", subject, "p").await.unwrap()[0].valid_until.is_none()
+        }
+        async fn call(
+            mem: &SqliteMemoryEngine,
+            ns: &NamespaceContext,
+            home: &std::path::Path,
+            scope: &ReadScope,
+        ) -> Value {
+            handle_memory_invalidate_by_origin_in(
+                &serde_json::json!({"origin": "channel"}),
+                mem,
+                ns,
+                Some("a1"),
+                home,
+                scope,
+            )
+            .await
+        }
+
+        for scope in [channel_turn("telegram:B"), channel_turn("telegram:A"), ReadScope::Conversation(None)] {
+            let r = call(&mem, &ns, home.path(), &scope).await;
+            assert_eq!(r, mcp_error(CHANNEL_TURN_REFUSED), "{scope:?}");
+            assert!(!text_of(&r).contains("expired"), "{scope:?}");
+            assert!(valid(&mem, "s1").await && valid(&mem, "s2").await, "{scope:?}");
+        }
+
+        let r = call(&mem, &ns, home.path(), &dispatch_run("telegram:B")).await;
+        assert!(!is_err(&r), "{r}");
+        let payload: Value = serde_json::from_str(&text_of(&r)).unwrap();
+        assert_eq!(payload["expired"], 2, "{payload}");
+        assert!(!valid(&mem, "s1").await && !valid(&mem, "s2").await);
+        let r = call(&mem, &ns, home.path(), &read_scope_with("internal/a1", &McpTurnEnv::default())).await;
+        assert!(!is_err(&r), "{r}");
     }
 }

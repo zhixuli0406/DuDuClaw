@@ -417,6 +417,10 @@ root が必要な `os_*` ツール（電源、更新の状態、sysd が再検�
 
 継続タスクを作成・変更・再開・再有効化するツールはなく、指示を送るツールもありません。
 
+### `memory_search`／`memory_read`／`decision_*`：チャット会話での読み取り範囲（v1.83.0）
+
+社員プロセスがチャット会話の1ターンを処理しているとき、`memory_search`、`memory_read`、`memory_fetch_batch`、`memory_search_by_layer`、`memory_get_history`、`memory_get_at`、`memory_improve` が返すのは、社員自身が明示的に保存した記憶、管理者がインポートした記憶や旧システムから移行した記憶、およびシステムが同じ会話から整理した記憶（記録された出所で判定）だけです。システムが他の会話から自動整理した記憶（重要な事実、ユーザーの好みとその要約、会話の要約、統合された記憶、記録された未決事項）は返さず、出所が記録されていない自動整理の記憶も返しません。その ID を `memory_read` で読むと、存在しない ID と同じ応答になります。`user_profile_get` と `user_code_profile` も同じ規則に従い、残るデータがすべて他の会話のものなら、プロフィールのないユーザーと同じ応答になります。`decision_list` と `decision_resolve` もこの会話で記録された未決事項だけを扱い、他の会話の未決事項 ID には「見つからない」と応答します。`memory_successful_conversations` は同じ規則で見える記録だけを返し（規則を適用してから `limit` 件を取り、会話が不明なら何も返しません）、`group_history_read` はこの会話が属するグループまたはスレッドだけを読め（1対1のチャットはどのグループも読めず、ほかの対象には通常の「利用できません」の応答を返します）、`memory_invalidate_by_origin`、`memory_episodic_pressure`、`memory_consolidation_status` は社員のすべての会話にまたがるため固定のエラーで拒否されます。スケジュール実行・依頼による実行と外部 MCP クライアントの動作は変わりません。
+
 ### `knowledge_*`：ドキュメントナレッジベース
 
 `knowledge_search`、`knowledge_get_passage`、`knowledge_list_collections` は[ドキュメントナレッジベース](../../features/ja-JP/63-knowledge-base.md)を読みます。スコープは `knowledge:read` で、外部 MCP キーには付与できません。呼び出しはすべて署名付きローカルルート `POST /api/internal/knowledge` でゲートウェイに渡され、ゲートウェイが読めるコレクション（社員本人と部門への付与を `agent.toml [knowledge] collections` で絞り込み、ターンの相手と機密度ルールとの共通部分）を決め、アクセスログを 1 行書きます。ゲートウェイが動いていないときはその旨を返し、データベースを直接読むことはありません。

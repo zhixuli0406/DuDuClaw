@@ -380,6 +380,23 @@ mod tests {
     use duduclaw_core::types::{MemoryEntry, MemoryLayer};
     use duduclaw_memory::TemporalMeta;
 
+    #[tokio::test]
+    async fn released_repro_8_unmatched_rules_injected() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let id = store_playbook_entry(&engine, "agent-repro", "Slack-only instruction",
+            vec!["channel:slack".into()], 1, false).await;
+        let turn = TurnSignals::new().with_mistake_category("capability");
+        let selected = select_playbook(&engine, "agent-repro", &turn).await;
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, id);
+        assert!(!selected[0].signal_matched);
+        let budget = InjectionBudget::default_budget();
+        assert_eq!((budget.max_entries, budget.max_chars), (6, 1200));
+        let (section, ids) = render_section(&selected, &budget).unwrap();
+        assert_eq!(ids, vec![id]);
+        assert!(section.contains("Slack-only instruction"));
+    }
+
     async fn store_playbook_entry(
         engine: &SqliteMemoryEngine,
         agent: &str,

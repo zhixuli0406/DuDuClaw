@@ -47,7 +47,7 @@ pub use engine::{
     is_system_signal, DecisionResolveOutcome, DecisionView, KeyFact, MigrationDisposition,
     NamespaceRow, OnRefused, SqliteMemoryEngine, SubjectFact, SubjectTripleForgetReport,
     TemporalMeta, TemporalRecord, word_jaccard, PREDICTION_CONTENT_PREFIX,
-    SYSTEM_SIGNAL_SOURCE_EVENTS,
+    SYSTEM_SIGNAL_SOURCE_EVENTS, is_explicitly_stored, EXPLICIT_SOURCE_EVENTS,
 };
 pub use feedback::{CitationTracker, DrainOnDrop, TrustSignal, WikiCitation};
 pub use gdpr::{gdpr_erase, gdpr_export, validate_contact as gdpr_validate_contact, GdprEraseSummary};
@@ -76,8 +76,8 @@ pub use sensitivity::{
 };
 pub use trust_store::{TrustUpdateOutcome, UpsertResult, WikiTrustSnapshot, WikiTrustStore};
 pub use user_code::{
-    compile_user_profile, ActionDescriptor, Condition, Conflict, Polarity, Provenance, RuleHit,
-    UserProfile, UserRule,
+    compile_user_profile, compile_user_profile_in_conversation, ActionDescriptor, Condition,
+    Conflict, Polarity, Provenance, RuleHit, UserProfile, UserRule,
 };
 pub use user_profile::{
     consolidate_profile, profile_block, profile_traits, record_trait, ProfileTrait,

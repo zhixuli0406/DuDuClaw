@@ -152,9 +152,9 @@
 | Turn trimming | >800 chars → 首 300 + 尾 200 + `[trimmed N chars]`，CJK-safe 字元切片 |
 | Prompt Cache 策略 | Direct API「system_and_3」斷點配置（未公布實測命中率） |
 | 壓縮摘要注入 | 壓縮摘要（role=system）注入 system prompt，不放進對話輪次 |
-| Instruction Pinning | 首則使用者訊息 → 非同步以解析後的輔助模型（Codex 受限模式或 Claude／API 無工具模式）（員工後端不支援時改用全域設定）擷取 → `sessions.pinned_instructions` → 注入 system prompt 尾端 |
+| Instruction Pinning | 一對一私人對話的首則使用者訊息（群組對話不會） → 非同步以解析後的輔助模型（Codex 受限模式或 Claude／API 無工具模式）（員工後端不支援時改用全域設定）擷取 → `sessions.pinned_instructions` → 注入 system prompt 尾端 |
 | Snowball Recap | 每輪 user message 前置 `<task_recap>`，零 LLM 成本、U-shape 注意力尾端 |
-| Clarification 累積 | Agent 提問 + 使用者回答追加至 pinned instructions（≤1000 字元） |
+| Clarification 累積 | Agent 提問 + 使用者回答追加至 pinned instructions，只在一對一私人對話（≤1000 字元） |
 | P2 Key-Fact Accumulator | 每輪實質對話 2-4 則事實 → `key_facts` FTS5 表 → 注入 top-3（約 100-150 tokens vs MemGPT 6,500，−87%） |
 | CLI 輕量路徑 | `call_claude_cli_lightweight()`：`--effort medium --max-turns 1 --no-session-persistence --tools ""`，降低 25-40% 成本 |
 | 穩定化旗標 | `--strict-mcp-config` + `--exclude-dynamic-system-prompt-sections`（節省 10-15% token）；`--bare` 於 v1.8.11 移除（破壞 OAuth keychain） |
@@ -304,7 +304,7 @@ WordPress 小工具（外掛 0.1.1）會在標題列顯示連線狀態。斷線�
 | 向量 re-rank 訊號 | 內建字元 n-gram 雜湊 embedder（`NgramHashEmbedder`，以 `DUDUCLAW_SEMANTIC_VECTORS=1` 開啟）；它比對的是表面片段，不是語意。ONNX embedder 需要非預設的 `onnx` 建置 feature，release binary 不含 |
 | 記憶衰減排程 | 每日背景執行：低重要度 + 30 天以上歸檔，歸檔 + 90 天以上永久刪除 |
 | 認知記憶 MCP 工具 | `memory_search_by_layer` / `memory_successful_conversations` / `memory_episodic_pressure` / `memory_consolidation_status` |
-| Key-Fact Accumulator | `key_facts` + FTS5：跨 session 輕量記憶（見 Session 記憶堆疊） |
+| Key-Fact Accumulator | `key_facts` + FTS5：輕量記憶，只注入產生它的那段對話（v1.83.0；見 Session 記憶堆疊） |
 | Temporal Memory（v1.19.0） | `memories` 經冪等遷移新增時序／知識圖譜欄位（`valid_from`/`valid_until`/`superseded_by`/`supersedes`/`subject`/`predicate`/`object`/`confidence`/`metadata`）；`store_temporal()` 對同一 `(agent, subject, predicate)` 自動衝突解析並串接 supersession chain（v1.67.1 起，寫入可信度不低於目前事實時才取代）；`search()` 預設只回傳現行有效列；`get_history()` / `get_at()` 提供鏈與時間點查詢 |
 | Reflexion Loop（F2，v1.19.0） | 橋接既有 `MistakeNotebook`：F2a 將近期未解決錯誤注入作答 prompt（`## Past Mistakes to Avoid`，CJK-safe 比對 + recency fallback）；F2b 將 ≥3 則同 `MistakeCategory` 錯誤整併為一條語意記憶規則（`reflexion.rs`）後標記來源已解決。觸發訊號 = `ErrorCategory` Significant/Critical（MetaCognition 自適應） |
 | `memory_fetch_batch`（F3，v1.19.0） | MCP 工具 + `get_by_ids` 一次以 ID 取回 ≤100 筆（命名空間／擁有權強制，部分命中 → `missing_ids`） |
@@ -315,7 +315,7 @@ WordPress 小工具（外掛 0.1.1）會在標題列顯示連線狀態。斷線�
 | 依來源忘記記憶（v1.70.0） | 每筆記憶寫入都記下來源（通道訊息、排程或派工執行、MCP 回合、匯入檔案）。`duduclaw memory forget-source {list,plan,show,apply,resume}`（只能在操作者終端機執行）硬刪由該來源直接或間接產生的記憶，寫下封鎖紀錄使同一來源不會再被學進去，並執行 `memory.db` 以外的後續步驟。`apply` 需要管理員在儀表板核准。不會刪除對話原文、已送出的訊息或備份。見[忘記對話、排程執行或匯入檔案](../../guides/zh-TW/memory-and-knowledge.md#45-忘記對話排程執行或匯入檔案) |
 | 圖檢索演進（D3） | HippoRAG-lite graph 獲得四項 fail-safe 改良（未啟用時逐位元組相同）：**(1)** per-agent 持久化圖快取（`RwLock`），由每筆更動三元組寫入遞增的 per-agent 世代計數器失效，僅在超過 `GRAPH_CACHE_MIN_TRIPLES = 500` 時啟用；**(2)** 透過 `entity_alias(agent_id, canonical, alias)` 的實體別名合併：在建圖＋seeding 前把表面形式收斂到同一節點，正規化＋鏈攤平；**(3)** 附掛到邊上的述詞邊標籤（PPR 不變），餵給 `engine.export_graph(agent, limit)` → 可序列化 `{nodes, edges}` 快照（隔離事實加註旗標）供 D6 策展 UI；**(4)** 可選的 embedding seeding（`graph_embed_seed`）：PPR seed ＝ whole-word FTS ∪ query embedding 最鄰近實體向量（同模型 cosine，top-k，惰性 `entity_embedding` 快取），預設關閉 |
 | `memory_alias_add` / `memory_alias_list`（D3） | 管理實體別名的 MCP 工具：add 把 `alias` 收斂到某 `canonical` 實體（scope `memory:write`），list 回傳 `(canonical, alias)` 配對（scope `memory:read`）；命名空間隔離 |
-| Decision Continuity（RFC-24，v1.23.0） | 當 agent 提出列舉式選項（方案 A/B/C），每個選項固化進 Temporal Memory 的 **semantic** 層（獨立於對話壓縮），待決事項每回合重新注入；稍後「用方案 C」（跨回合／session／程序）從持久狀態解析，不靠猜測。偵測確定性、零 LLM；`decision_resolve` / `decision_list` MCP 工具 + Dashboard 面板 + Prometheus 計數器；per-agent opt-in `[memory] decision_continuity = true`（TTL `decision_ttl_days`，預設 7） |
+| Decision Continuity（RFC-24，v1.23.0） | 當 agent 提出列舉式選項（方案 A/B/C），每個選項固化進 Temporal Memory 的 **semantic** 層（獨立於對話壓縮），待決事項在記錄它的那段對話中每回合重新注入；稍後在同一段對話回覆「用方案 C」（跨回合／程序）從持久狀態解析，不靠猜測。同一位 agent 的其他對話看不到、也無法回覆；沒有對話紀錄的待決事項不會顯示。偵測確定性、零 LLM；`decision_resolve` / `decision_list` MCP 工具 + Dashboard 面板 + Prometheus 計數器；per-agent opt-in `[memory] decision_continuity = true`（TTL `decision_ttl_days`，預設 7） |
 
 ## 帳號與成本管理
 

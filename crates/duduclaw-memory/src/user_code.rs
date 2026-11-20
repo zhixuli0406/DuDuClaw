@@ -526,6 +526,34 @@ pub async fn compile_user_profile(
     agent_id: &str,
     engine: &SqliteMemoryEngine,
 ) -> Result<UserProfile> {
+    Ok(compile_rows(agent_id, profile_rows(agent_id, engine).await?))
+}
+
+/// v1.83.0: [`compile_user_profile`] for a reader serving ONE conversation
+/// (`session`; `None` = unknown): the rows behind the profile pass
+/// [`SqliteMemoryEngine::ids_hidden_from_conversation`] first, and a hidden
+/// row is left out as if it did not exist (not counted as unparsed). The ids
+/// checked are the ids of the rows compiled (one read), so a row written in
+/// between is never compiled unchecked. Nothing left = the profile of a user
+/// with no facts.
+pub async fn compile_user_profile_in_conversation(
+    agent_id: &str,
+    engine: &SqliteMemoryEngine,
+    session: Option<&str>,
+) -> Result<UserProfile> {
+    let rows = profile_rows(agent_id, engine).await?;
+    let ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+    let hidden = if ids.is_empty() {
+        Default::default()
+    } else {
+        engine.ids_hidden_from_conversation(agent_id, &ids, session).await?
+    };
+    let rows = rows.into_iter().filter(|r| !hidden.contains(&r.id)).collect();
+    Ok(compile_rows(agent_id, rows))
+}
+
+/// The rows [`compile_user_profile`] compiles (READ-ONLY).
+async fn profile_rows(agent_id: &str, engine: &SqliteMemoryEngine) -> Result<Vec<RawRow>> {
     let rows: Vec<RawRow> = {
         let conn = engine.conn_for_maintenance().await;
         let mut stmt = conn
@@ -566,7 +594,11 @@ pub async fn compile_user_profile(
         }
         v
     };
+    Ok(rows)
+}
 
+/// Compile the rows of [`profile_rows`] (pure).
+fn compile_rows(agent_id: &str, rows: Vec<RawRow>) -> UserProfile {
     let mut typed: Vec<UserRule> = Vec::new();
     let mut unparsed_count = 0usize;
 
@@ -623,12 +655,12 @@ pub async fn compile_user_profile(
         }
     }
 
-    Ok(UserProfile {
+    UserProfile {
         agent_id: agent_id.to_string(),
         rules,
         conflicts,
         unparsed_count,
-    })
+    }
 }
 
 enum Resolution {

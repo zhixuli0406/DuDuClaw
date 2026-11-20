@@ -3784,22 +3784,83 @@ impl SqliteMemoryEngine {
         agent_id: &str,
         limit: usize,
     ) -> Result<Vec<DecisionView>> {
+        self.open_decisions(agent_id, None, limit).await
+    }
+
+    /// Like [`list_open_decisions`](Self::list_open_decisions), but only the
+    /// decisions recorded in conversation `session_id`: the status row's
+    /// `metadata.session_id` (written by the decision-capture layer) must equal
+    /// it. Fail-closed: a row without a recorded session, and an empty
+    /// `session_id`, never match.
+    pub async fn list_open_decisions_in_session(
+        &self,
+        agent_id: &str,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<DecisionView>> {
+        if session_id.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.open_decisions(agent_id, Some(session_id), limit).await
+    }
+
+    /// Whether `decision_id` (without the `decision:` prefix) is an open
+    /// decision recorded in conversation `session_id`: the same rule as
+    /// [`list_open_decisions_in_session`](Self::list_open_decisions_in_session),
+    /// for one id (v1.83.0, MCP `decision_resolve`). Fail-closed: an empty
+    /// `session_id` never matches.
+    pub async fn is_open_decision_in_session(
+        &self,
+        agent_id: &str,
+        decision_id: &str,
+        session_id: &str,
+    ) -> Result<bool> {
+        if session_id.is_empty() {
+            return Ok(false);
+        }
+        let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
+        let subject = format!("decision:{decision_id}");
+        conn.query_row(
+            "SELECT 1 FROM memories
+             WHERE agent_id = ?1 AND subject = ?2 AND predicate = 'status' AND object = 'open'
+               AND valid_until IS NULL
+               AND (CASE WHEN json_valid(metadata)
+                    THEN json_extract(metadata, '$.session_id') END) = ?3
+             LIMIT 1",
+            params![agent_id, subject, session_id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|hit| hit.is_some())
+        .map_err(|e| DuDuClawError::Memory(e.to_string()))
+    }
+
+    async fn open_decisions(
+        &self,
+        agent_id: &str,
+        session_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<DecisionView>> {
         let conn = self.conn.lock().await;
         crate::isolation_io::verify()?;
 
         // Subjects with a currently-valid status=open row, newest first.
+        // `?3 IS NULL` = agent-wide listing; otherwise same conversation only.
         let subjects: Vec<(String, Option<String>)> = {
             let mut stmt = conn
                 .prepare(
                     "SELECT subject, valid_from FROM memories
                      WHERE agent_id = ?1 AND predicate = 'status' AND object = 'open'
                        AND valid_until IS NULL AND subject LIKE 'decision:%'
+                       AND (?3 IS NULL OR (CASE WHEN json_valid(metadata)
+                            THEN json_extract(metadata, '$.session_id') END) = ?3)
                      ORDER BY COALESCE(valid_from, timestamp) DESC, created_at DESC
                      LIMIT ?2",
                 )
                 .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
             let rows = stmt
-                .query_map(params![agent_id, limit as i64], |r| {
+                .query_map(params![agent_id, limit as i64, session_id], |r| {
                     Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
                 })
                 .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
@@ -4191,6 +4252,23 @@ impl SqliteMemoryEngine {
         topic: &str,
         limit: usize,
     ) -> Result<Vec<String>> {
+        Ok(self
+            .search_successful_conversation_rows(agent_id, topic, Some(limit))
+            .await?
+            .into_iter()
+            .map(|(_, content)| content)
+            .collect())
+    }
+
+    /// [`Self::search_successful_conversations`] as `(id, content)`, newest
+    /// first. `limit = None` returns every match (v1.83.0: a reader serving
+    /// one conversation drops other conversations' rows before it limits).
+    pub async fn search_successful_conversation_rows(
+        &self,
+        agent_id: &str,
+        topic: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<(String, String)>> {
         let conn = self.conn.lock().await;
         crate::isolation_io::verify()?;
 
@@ -4204,7 +4282,7 @@ impl SqliteMemoryEngine {
         }
         let sanitized_query = format!("\"{}\"", cleaned.replace('"', ""));
 
-        let sql = "SELECT m.content
+        let sql = "SELECT m.id, m.content
              FROM memories_fts AS f
              JOIN memories AS m ON m.id = f.memory_id
              WHERE f.memories_fts MATCH ?1
@@ -4219,9 +4297,11 @@ impl SqliteMemoryEngine {
             .prepare(sql)
             .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
 
+        // SQLite: a negative LIMIT means no limit.
+        let limit = limit.map_or(-1, |n| n as i64);
         let rows = stmt
-            .query_map(params![sanitized_query, agent_id, limit as i64], |row| {
-                row.get::<_, String>(0)
+            .query_map(params![sanitized_query, agent_id, limit], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
             .map_err(|e| {
                 tracing::warn!("FTS5 synthesis search error: {e}");
@@ -5209,6 +5289,84 @@ impl SqliteMemoryEngine {
         Ok(facts)
     }
 
+    /// [`search_facts`](Self::search_facts) limited to ONE conversation: only
+    /// rows whose `channel`, `chat_id` and `source_session` all equal the
+    /// given (non-empty) values — in the full-text path AND the recency
+    /// fallback. Fail-closed: an empty scope value returns nothing, and a row
+    /// with an empty/NULL `channel`, `chat_id` or `source_session` never
+    /// matches.
+    pub async fn search_facts_in_chat(
+        &self,
+        agent_id: &str,
+        channel: &str,
+        chat_id: &str,
+        source_session: &str,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<KeyFact>> {
+        if channel.is_empty() || chat_id.is_empty() || source_session.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Same FTS5 sanitization as `search_facts` (HC8).
+        let cleaned: String = query
+            .chars()
+            .filter(|c| !matches!(c, '"' | '\'' | ':' | '^' | '{' | '}' | '*' | '(' | ')'))
+            .take(500)
+            .collect();
+        let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
+        let read = |sql: &str, p: &[&dyn rusqlite::ToSql]| -> Result<Vec<KeyFact>> {
+            let mut stmt = conn
+                .prepare(sql)
+                .map_err(|e| DuDuClawError::Memory(format!("search_facts_in_chat prepare: {e}")))?;
+            let rows = stmt
+                .query_map(p, |row| {
+                    Ok(KeyFact {
+                        id: row.get(0)?,
+                        agent_id: row.get(1)?,
+                        fact: row.get(2)?,
+                        channel: row.get(3)?,
+                        chat_id: row.get(4)?,
+                        source_session: row.get(5)?,
+                        timestamp: row.get(6)?,
+                        access_count: row.get(7)?,
+                    })
+                })
+                .map_err(|e| DuDuClawError::Memory(format!("search_facts_in_chat query: {e}")))?;
+            let mut facts = Vec::new();
+            for row in rows {
+                facts.push(row.map_err(|e| DuDuClawError::Memory(e.to_string()))?);
+            }
+            Ok(facts)
+        };
+        let mut facts = Vec::new();
+        if !cleaned.trim().is_empty() {
+            let sanitized_query = format!("\"{}\"", cleaned.replace('"', ""));
+            facts = read(
+                "SELECT k.id, k.agent_id, k.fact, k.channel, k.chat_id, k.source_session, k.timestamp, k.access_count
+                 FROM key_facts k
+                 JOIN key_facts_fts f ON f.rowid = k.rowid
+                 WHERE k.agent_id = ?1 AND k.channel = ?2 AND k.chat_id = ?3 AND k.source_session = ?4
+                   AND key_facts_fts MATCH ?5
+                 ORDER BY rank
+                 LIMIT ?6",
+                params![agent_id, channel, chat_id, source_session, sanitized_query, limit],
+            )?;
+        }
+        // Recency fallback — within the same conversation only.
+        if facts.is_empty() {
+            facts = read(
+                "SELECT k.id, k.agent_id, k.fact, k.channel, k.chat_id, k.source_session, k.timestamp, k.access_count
+                 FROM key_facts k
+                 WHERE k.agent_id = ?1 AND k.channel = ?2 AND k.chat_id = ?3 AND k.source_session = ?4
+                 ORDER BY k.timestamp DESC
+                 LIMIT ?5",
+                params![agent_id, channel, chat_id, source_session, limit],
+            )?;
+        }
+        Ok(facts)
+    }
+
     /// Count total key facts for an agent.
     pub async fn count_facts(&self, agent_id: &str) -> Result<u64> {
         let conn = self.conn.lock().await;
@@ -5276,9 +5434,84 @@ pub mod forget_source;
 pub mod subject_listing;
 pub use subject_listing::{SubjectFact, SubjectTripleForgetReport};
 
+pub mod conversation_scope;
+pub use conversation_scope::{is_explicitly_stored, EXPLICIT_SOURCE_EVENTS};
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn released_repro_1_cross_chat_fallback() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        for i in 0..4 {
+            let id = engine.store_fact(
+                "shared-agent", &format!("Alice orchard fact {i}"), "telegram",
+                "private-alice", "session-alice", crate::lineage::Provenance::test_only(),
+            ).await.unwrap();
+            // Explicit timestamps make the recency cutoff independent of clock resolution.
+            engine.conn.lock().await.execute(
+                "UPDATE key_facts SET timestamp = ?1 WHERE id = ?2",
+                params![format!("2026-01-0{}T00:00:00Z", i + 1), id],
+            ).unwrap();
+        }
+        // A legacy / unscoped row (no conversation identity) must never be returned.
+        for (ch, cid, sess) in [("", "", ""), ("", "private-bob", "session-bob"), ("telegram", "", "session-bob")] {
+            engine.store_fact("shared-agent", "Unscoped orchard fact", ch, cid, sess,
+                crate::lineage::Provenance::test_only()).await.unwrap();
+        }
+        // Regression (v1.83.0): Bob's private turn — no FTS match, so the
+        // recency fallback runs, but only inside Bob's own conversation.
+        let hits = engine.search_facts_in_chat("shared-agent", "telegram", "private-bob",
+            "session-bob", "Bob unmatchedquartz", 3).await.unwrap();
+        assert!(hits.is_empty(), "Alice's facts leaked into Bob's conversation: {hits:?}");
+        let hits = engine.search_facts_in_chat("shared-agent", "telegram", "private-bob",
+            "session-bob", "orchard", 3).await.unwrap();
+        assert!(hits.is_empty(), "matching query leaked across conversations: {hits:?}");
+        // An empty scope fails closed.
+        assert!(engine.search_facts_in_chat("shared-agent", "", "", "", "orchard", 3).await.unwrap().is_empty());
+        // Alice's own conversation still gets her newest facts via the fallback.
+        let hits = engine.search_facts_in_chat("shared-agent", "telegram", "private-alice",
+            "session-alice", "Alice unmatchedquartz", 3).await.unwrap();
+        assert_eq!(hits.iter().map(|f| f.fact.as_str()).collect::<Vec<_>>(),
+            vec!["Alice orchard fact 3", "Alice orchard fact 2", "Alice orchard fact 1"]);
+        assert!(hits.iter().all(|f| f.chat_id == "private-alice" && f.source_session == "session-alice"));
+    }
+
+    #[tokio::test]
+    async fn released_repro_1_cross_chat_fts_match() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let id = engine.store_fact(
+            "shared-agent", "Alice uniqueorchid preference", "telegram", "private-alice",
+            "session-alice", crate::lineage::Provenance::test_only(),
+        ).await.unwrap();
+        engine.conn.lock().await.execute(
+            "UPDATE key_facts SET timestamp = '2000-01-01T00:00:00Z' WHERE id = ?1",
+            params![id],
+        ).unwrap();
+        engine.store_fact("shared-agent", "Unrelated newest fact", "telegram", "private-alice",
+            "session-alice", crate::lineage::Provenance::test_only()).await.unwrap();
+        // A row with no conversation identity that also matches the query.
+        engine.store_fact("shared-agent", "Legacy uniqueorchid note", "", "", "",
+            crate::lineage::Provenance::test_only()).await.unwrap();
+        // A recency fallback with limit 1 would return the unrelated fact instead.
+        assert_ne!(engine.get_recent_facts("shared-agent", 1).await.unwrap()[0].id, id);
+        // Regression (v1.83.0): a matching query from Bob's conversation gets nothing.
+        let hits = engine.search_facts_in_chat("shared-agent", "telegram", "private-bob",
+            "session-bob", "uniqueorchid", 1).await.unwrap();
+        assert!(hits.is_empty(), "Alice's fact leaked into Bob's conversation: {hits:?}");
+        // Alice's own conversation still gets the FTS match (not the newer unrelated fact,
+        // not the unscoped legacy row).
+        let hits = engine.search_facts_in_chat("shared-agent", "telegram", "private-alice",
+            "session-alice", "uniqueorchid", 3).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, id);
+        assert_eq!(hits[0].fact, "Alice uniqueorchid preference");
+        assert_eq!(hits[0].chat_id, "private-alice");
+        assert_eq!(hits[0].source_session, "session-alice");
+        assert!(engine.search_facts_in_chat("other-agent", "telegram", "private-alice",
+            "session-alice", "uniqueorchid", 3).await.unwrap().is_empty());
+    }
 
     /// Regression: two `duduclaw mcp-server` children opening one fresh
     /// `memory.db` at once — one died with "database is locked" because the

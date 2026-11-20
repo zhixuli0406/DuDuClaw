@@ -75,7 +75,7 @@ build_system_prompt(agent_id) assembles:
   ├─ CONTRACT.toml (must_not / must_always)
   ├─ ## Your Team (sub-agent roster)
   ├─ Pinned instructions (session-scoped)
-  ├─ Top-3 key facts (cross-session)
+  ├─ Top-3 key facts (this conversation only)
   └─ WIKI_CONTEXT module:
        └─ Collect all pages WHERE layer IN (identity, core)
        └─ Budget-aware truncation by priority

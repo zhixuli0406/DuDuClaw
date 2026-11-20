@@ -272,11 +272,25 @@ pub async fn profile_traits(
     agent_id: &str,
     user_id: &str,
 ) -> Result<Vec<ProfileTrait>> {
+    Ok(newest_per_predicate(
+        profile_trait_rows(engine, agent_id, user_id).await?,
+    ))
+}
+
+/// v1.83.0: every currently-valid trait row [`profile_traits`] reads, with its
+/// memory id, before the one-per-predicate pick (predicate ascending, newest
+/// first within a predicate). A reader serving one conversation drops the
+/// rows it may not return, then picks with [`newest_per_predicate`].
+pub async fn profile_trait_rows(
+    engine: &SqliteMemoryEngine,
+    agent_id: &str,
+    user_id: &str,
+) -> Result<Vec<(String, ProfileTrait)>> {
     let subject = user_subject(user_id);
     let conn = engine.conn_for_maintenance().await;
     let mut stmt = conn
         .prepare(
-            "SELECT predicate, object, content
+            "SELECT id, predicate, object, content
              FROM memories
              WHERE agent_id = ?1 AND subject = ?2 AND valid_until IS NULL
                AND predicate IS NOT NULL AND predicate != ?3
@@ -287,27 +301,33 @@ pub async fn profile_traits(
         .query_map(
             rusqlite::params![agent_id, subject, SUMMARY_PREDICATE],
             |r| {
-                let predicate: String = r.get(0)?;
-                let object: Option<String> = r.get(1)?;
-                let content: String = r.get(2)?;
-                Ok((predicate, object, content))
+                let id: String = r.get(0)?;
+                let predicate: String = r.get(1)?;
+                let object: Option<String> = r.get(2)?;
+                let content: String = r.get(3)?;
+                Ok((id, predicate, object, content))
             },
         )
         .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
-
-    // One trait per predicate (the newest valid row wins — first seen given the
-    // DESC recency order). Deterministic dedup keyed by predicate.
-    let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for row in rows {
-        let (predicate, object, content) = row.map_err(|e| DuDuClawError::Memory(e.to_string()))?;
-        if !seen.insert(predicate.clone()) {
-            continue;
-        }
+        let (id, predicate, object, content) =
+            row.map_err(|e| DuDuClawError::Memory(e.to_string()))?;
         let value = object.unwrap_or(content);
-        out.push(ProfileTrait { predicate, value });
+        out.push((id, ProfileTrait { predicate, value }));
     }
     Ok(out)
+}
+
+/// One trait per predicate from [`profile_trait_rows`] (the newest valid row
+/// wins — first seen given the DESC recency order). Deterministic dedup keyed
+/// by predicate.
+pub fn newest_per_predicate(rows: Vec<(String, ProfileTrait)>) -> Vec<ProfileTrait> {
+    let mut seen = std::collections::HashSet::new();
+    rows.into_iter()
+        .filter(|(_, t)| seen.insert(t.predicate.clone()))
+        .map(|(_, t)| t)
+        .collect()
 }
 
 /// Render the injectable `## About This User` block from a trait set, or `None`

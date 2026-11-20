@@ -150,9 +150,9 @@
 | ターントリミング（Turn Trimming） | >800 chars → 先頭 300 + 末尾 200 + `[trimmed N chars]`、CJK セーフ文字スライス |
 | プロンプトキャッシュ戦略 | Direct API "system_and_3" ブレークポイント配置（実測ヒット率は公開していない） |
 | 圧縮サマリー注入 | 圧縮後サマリー（role=system）を system prompt に注入、会話ターンではない |
-| Instruction Pinning | 最初のユーザーメッセージ → 解決された補助モデル（Codex の制限モード、または Claude／API のツールなしモード）（社員ランタイムが非対応ならグローバル設定）による非同期抽出 → `sessions.pinned_instructions` → system prompt 末尾に注入 |
+| Instruction Pinning | 1 対 1 の個人チャットの最初のユーザーメッセージ（グループチャットでは行わない） → 解決された補助モデル（Codex の制限モード、または Claude／API のツールなしモード）（社員ランタイムが非対応ならグローバル設定）による非同期抽出 → `sessions.pinned_instructions` → system prompt 末尾に注入 |
 | Snowball Recap | 各ターンの user message 先頭に `<task_recap>` を付加、LLM コストゼロ、U 字型注意の末尾 |
-| Clarification 累積 | エージェントの質問 + ユーザー回答 → pinned instructions に追加（≤1000 文字） |
+| Clarification 累積 | エージェントの質問 + ユーザー回答 → pinned instructions に追加、1 対 1 の個人チャットのみ（≤1000 文字） |
 | P2 Key-Fact Accumulator | 実質的なターン毎に 2-4 事実 → `key_facts` FTS5 テーブル → top-3 注入（~100-150 tokens vs MemGPT 6,500、−87%） |
 | CLI 軽量パス | `call_claude_cli_lightweight()` — `--effort medium --max-turns 1 --no-session-persistence --tools ""`、25-40% コスト削減 |
 | 安定化フラグ | `--strict-mcp-config` + `--exclude-dynamic-system-prompt-sections`（10-15% token 削減）；`--bare` は v1.8.11 で削除（OAuth キーチェーンを破壊） |
@@ -303,7 +303,7 @@ WordPress ウィジェット（プラグイン 0.1.1）はヘッダーに接続�
 | ベクトル re-rank シグナル | 組み込みの文字 n-gram ハッシュ embedder（`NgramHashEmbedder`、`DUDUCLAW_SEMANTIC_VECTORS=1` でオプトイン）。意味ではなく表層の断片で照合する。ONNX embedder はデフォルト外の `onnx` ビルド feature が必要で、リリースバイナリには含まれない |
 | メモリ減衰スケジューラ | 日次バックグラウンド — 低重要度 + 30 日以上アーカイブ、アーカイブ + 90 日以上完全削除 |
 | 認知メモリ MCP ツール | `memory_search_by_layer` / `memory_successful_conversations` / `memory_episodic_pressure` / `memory_consolidation_status` |
-| Key-Fact Accumulator | `key_facts` + FTS5 — セッション横断の軽量メモリ（セッションメモリスタック参照） |
+| Key-Fact Accumulator | `key_facts` + FTS5 — 軽量メモリ。それを生んだ会話にだけ注入されます（v1.83.0、セッションメモリスタック参照） |
 | Temporal Memory（v1.19.0）| `memories` に冪等マイグレーションで時系列/ナレッジグラフ列（`valid_from`/`valid_until`/`superseded_by`/`supersedes`/`subject`/`predicate`/`object`/`confidence`/`metadata`）を追加；`store_temporal()` が同一 `(agent, subject, predicate)` を自動コンフリクト解決し supersession chain を連結（v1.67.1 から、書き込みの信頼度が現在の事実以上の場合のみ置き換え）；`search()` はデフォルトで現行有効行のみフィルタ；`get_history()` / `get_at()` がチェーンとポイントインタイムを提供 |
 | Reflexion Loop（F2、v1.19.0）| 既存 `MistakeNotebook` をブリッジ — F2a は未解決の最近のミスを回答プロンプトに注入（`## Past Mistakes to Avoid`、CJK セーフ照合 + recency フォールバック）；F2b は同一 `MistakeCategory` のミス ≥3 件を 1 つの意味メモリルールに統合（`reflexion.rs`）し元を解決済みに。トリガー = `ErrorCategory` Significant/Critical（MetaCognition 適応） |
 | `memory_fetch_batch`（F3、v1.19.0）| MCP ツール + `get_by_ids` が ≤100 件を ID で一括取得（名前空間/所有権を強制、部分ヒット → `missing_ids`） |
@@ -314,7 +314,7 @@ WordPress ウィジェット（プラグイン 0.1.1）はヘッダーに接続�
 | 出典単位のメモリ忘却（v1.70.0） | メモリの書き込みはすべて出典（チャネルメッセージ、スケジュールまたはディスパッチの実行、MCP ターン、インポートファイル）を記録します。`duduclaw memory forget-source {list,plan,show,apply,resume}`（オペレーターのターミナルのみ）は、出典から直接または派生で生まれたメモリを物理削除し、同じ出典から再び学習されないようブロック記録を書き、`memory.db` の外の後続ステップを実行します。`apply` にはダッシュボードでの管理者の承認が必要です。会話の原文、送信済みメッセージ、バックアップは削除しません。[会話・スケジュール実行・インポートファイルを忘れる](../../guides/ja-JP/memory-and-knowledge.md#45-会話スケジュール実行インポートファイルを忘れる) |
 | グラフ検索の進化（D3）| HippoRAG-lite graph が4つの fail-safe な改良を獲得（未使用時はバイト単位で同一）：**(1)** per-agent 永続グラフキャッシュ（`RwLock`）、トリプル変更書き込みごとに加算される per-agent 世代カウンタで無効化、`GRAPH_CACHE_MIN_TRIPLES = 500` 超のみ有効；**(2)** `entity_alias(agent_id, canonical, alias)` によるエンティティエイリアス統合 — 構築＋シード前に表層形を1ノードへ畳み込み、正規化＋チェーン平坦化；**(3)** エッジに付帯する述語エッジラベル（PPR 不変）が `engine.export_graph(agent, limit)` → シリアライズ可能な `{nodes, edges}` スナップショット（隔離事実はフラグ付き）に供給し D6 キュレーション UI へ；**(4)** オプトインの embedding seeding（`graph_embed_seed`）— PPR シード ＝ whole-word FTS ∪ クエリ埋め込み最近傍エンティティベクトル（同一モデル cosine、top-k、遅延 `entity_embedding` キャッシュ）、デフォルトオフ |
 | `memory_alias_add` / `memory_alias_list`（D3）| エンティティエイリアスを管理する MCP ツール — add は `alias` を `canonical` エンティティに畳み込む（scope `memory:write`）、list は `(canonical, alias)` ペアを返す（scope `memory:read`）；名前空間分離 |
-| Decision Continuity（RFC-24、v1.23.0）| エージェントが列挙式の選択肢（案 A/B/C）を提示した際、各選択肢を Temporal Memory の **semantic** 層に永続化（会話圧縮から独立）し、未決事項をターンごとに再注入；後から「案 C で」（別ターン / セッション / プロセス）と言われても推測ではなく永続状態から解決。検出は決定論的でゼロ LLM；`decision_resolve` / `decision_list` MCP ツール + ダッシュボードパネル + Prometheus カウンタ；`[memory] decision_continuity = true` でエージェント単位の opt-in（TTL `decision_ttl_days`、既定 7）|
+| Decision Continuity（RFC-24、v1.23.0）| エージェントが列挙式の選択肢（案 A/B/C）を提示した際、各選択肢を Temporal Memory の **semantic** 層に永続化（会話圧縮から独立）し、未決事項を記録した会話のターンごとに再注入；その会話で後から「案 C で」（別ターン / プロセス）と言われても推測ではなく永続状態から解決。同じエージェントの別の会話には表示されず、そこからは解決できない。会話の記録がない未決事項は表示しない。検出は決定論的でゼロ LLM；`decision_resolve` / `decision_list` MCP ツール + ダッシュボードパネル + Prometheus カウンタ；`[memory] decision_continuity = true` でエージェント単位の opt-in（TTL `decision_ttl_days`、既定 7）|
 
 ## アカウントとコスト管理
 

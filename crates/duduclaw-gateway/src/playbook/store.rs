@@ -247,6 +247,30 @@ mod tests {
     use crate::playbook::entry::PlaybookCategory;
     use crate::playbook::gene::EvalCaseRef;
 
+    #[tokio::test]
+    async fn released_repro_9_failed_store_still_reported_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory.db");
+        let engine = SqliteMemoryEngine::new(&path).unwrap();
+        let evals = temp_eval_root();
+        // A fixture-local SQLite fault, with no production hooks or engine changes.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER repro_reject_one_add BEFORE INSERT ON memories
+             WHEN NEW.content = 'entry for channel:slack'
+             BEGIN SELECT RAISE(ABORT, 'released repro write failure'); END;"
+        ).unwrap();
+        drop(conn);
+        let outcome = apply_deltas(&engine, "agent-repro",
+            vec![gated_add("channel:slack"), gated_add("mistake:capability")],
+            &[], evals.path(), "2026-01-01T00:00:00Z".parse().unwrap()).await;
+        assert_eq!(outcome.applied.len(), 2, "failed storage is still reported as applied");
+        assert!(outcome.rejected.is_empty());
+        let stored = list_active(&engine, "agent-repro").await;
+        assert_eq!(stored.len(), 1, "the successful Add is not rolled back");
+        assert_eq!(stored[0].0.content, "entry for mistake:capability");
+    }
+
     fn temp_eval_root() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let suite = dir.path().join("s");

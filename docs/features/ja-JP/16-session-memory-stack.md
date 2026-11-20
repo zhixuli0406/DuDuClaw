@@ -51,7 +51,7 @@ Stored in: sessions.pinned_instructions (SQLite column)
 Injected at: system prompt tail (high-attention U-shape position)
 ```
 
-抽出は非同期で実行し、最初の応答をブロックしません。バックグラウンドの決定確認、指示抽出、事実抽出、会話圧縮が社員自身のランタイムを使うのは Claude、Codex、OpenAI 互換 API の場合です。空白ではない `[model] utility` が優先し、未設定なら Claude は `claude-haiku-4-5`、Codex と OpenAI 互換 API は `[model] preferred` を使います。両方が空白なら Codex は CLI の既定モデルを使い、API は呼び出しを拒否します。Grok、汎用 CLI の社員はグローバルのバックグラウンド設定を使います。明示した補助モデルとランタイムのベンダー系統が異なる場合はダッシュボードに警告します。
+抽出は非同期で実行し、最初の応答をブロックしません。抽出するのは 1 対 1 の個人チャットだけで、グループチャットでは最初のメッセージから固定指示を作りません。バックグラウンドの決定確認、指示抽出、事実抽出、会話圧縮が社員自身のランタイムを使うのは Claude、Codex、OpenAI 互換 API の場合です。空白ではない `[model] utility` が優先し、未設定なら Claude は `claude-haiku-4-5`、Codex と OpenAI 互換 API は `[model] preferred` を使います。両方が空白なら Codex は CLI の既定モデルを使い、API は呼び出しを拒否します。Grok、汎用 CLI の社員はグローバルのバックグラウンド設定を使います。明示した補助モデルとランタイムのベンダー系統が異なる場合はダッシュボードに警告します。
 
 Claude の補助呼び出しは CLI が使える認証情報で軽量パスを実行し、アカウントローテーションには入りません。通常の会話は既存のローテーションを維持します。
 
@@ -61,7 +61,7 @@ Claude の補助呼び出しは CLI が使える認証情報で軽量パスを�
 
 ### 明確化の蓄積
 
-エージェントが明確化の質問（「service workerは保持すべきですか？」）をしてユーザーが答えると、その回答はpinned instructionsに追記されます——ドリフトを防ぐため1,000文字に上限が設けられています。
+1 対 1 の個人チャットでエージェントが明確化の質問（「service workerは保持すべきですか？」）をしてユーザーが答えると、その回答はpinned instructionsに追記されます——ドリフトを防ぐため1,000文字に上限が設けられています。
 
 ```
 Pinned instructions grow with clarifications:
@@ -98,7 +98,7 @@ U字型の注意の末尾効果と組み合わせることで、追加のLLMラ�
 
 ## レイヤー3：P2 Key-Fact Accumulator（v1.8.6）
 
-一部の事実は一つのsessionに固有ではなく——時間をまたいでユーザーやプロジェクトを記述します。例：
+一部の事実は1ターンを超えて役立ちます。会話の中のユーザーやプロジェクトを記述するものです。v1.83.0以降、キーファクトはそれを生んだ会話（チャネル、チャット、session）に属し、同じ会話にだけ注入されます。同じAI社員と別の人との会話からは見えません。例：
 
 - 「ユーザーのデプロイ先はCloudflare Workers」
 - 「好みのテストライブラリはjestではなくvitest」
@@ -126,7 +126,8 @@ Stored in: key_facts table (FTS5 indexed)
      v
 Next turn's system prompt assembly:
   SELECT content FROM key_facts
-  WHERE agent_id = ?
+  WHERE agent_id = ? AND channel = ? AND chat_id = ?
+    AND source_session = ?          -- this conversation only
   ORDER BY fts5_rank(relevance) DESC
   LIMIT 3
      |

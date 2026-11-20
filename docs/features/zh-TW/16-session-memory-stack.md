@@ -51,7 +51,7 @@ Stored in: sessions.pinned_instructions (SQLite column)
 Injected at: system prompt tail (high-attention U-shape position)
 ```
 
-萃取以非同步方式執行，不會阻塞第一個回應。背景決策確認、指令擷取、事實擷取與對話壓縮，Claude、Codex 與 OpenAI 相容 API 員工沿用自己的後端。明確填寫且非空白的 `[model] utility` 優先；否則 Claude 使用 `claude-haiku-4-5`，Codex 與 OpenAI 相容 API 沿用 `[model] preferred`。兩者都空白時，Codex 省略 `-m`、使用 CLI 預設模型；OpenAI 相容 API 則拒絕呼叫。Grok 與通用 CLI 員工改用全域背景設定。明確指定的輔助模型與後端屬於不同廠商家族時，儀表板會顯示警告。
+萃取以非同步方式執行，不會阻塞第一個回應，而且只在一對一私人對話中進行；群組對話不會從第一則訊息建立固定指示。背景決策確認、指令擷取、事實擷取與對話壓縮，Claude、Codex 與 OpenAI 相容 API 員工沿用自己的後端。明確填寫且非空白的 `[model] utility` 優先；否則 Claude 使用 `claude-haiku-4-5`，Codex 與 OpenAI 相容 API 沿用 `[model] preferred`。兩者都空白時，Codex 省略 `-m`、使用 CLI 預設模型；OpenAI 相容 API 則拒絕呼叫。Grok 與通用 CLI 員工改用全域背景設定。明確指定的輔助模型與後端屬於不同廠商家族時，儀表板會顯示警告。
 
 Claude 輔助呼叫使用 CLI 可用憑證走輕量路徑，不進入帳號輪替；一般對話仍保留原有帳號輪替。
 
@@ -61,7 +61,7 @@ Claude 輔助呼叫使用 CLI 可用憑證走輕量路徑，不進入帳號輪�
 
 ### 澄清累積
 
-當 Agent 提出澄清問題（「我該保留 service worker 嗎？」）而使用者回答時，那個答案會附加到 pinned instructions（上限 1,000 字元以防止漂移）。
+在一對一私人對話中，當 Agent 提出澄清問題（「我該保留 service worker 嗎？」）而使用者回答時，那個答案會附加到 pinned instructions（上限 1,000 字元以防止漂移）。
 
 ```
 Pinned instructions grow with clarifications:
@@ -98,7 +98,7 @@ Actual user turn: "what about the proxy config?"
 
 ## 第 3 層：P2 Key-Fact Accumulator（v1.8.6）
 
-有些事實並不專屬於某一個 session。它們描述的是跨越時間的使用者或專案，例如：
+有些事實在一輪結束後仍然有用，它們描述的是這段對話中的使用者或專案。從 v1.83.0 起，重點事實屬於產生它的那段對話（頻道、聊天室與 session），只會注入同一段對話；同一位 AI 員工和其他人的對話看不到。例如：
 
 - 「使用者的部署目標是 Cloudflare Workers」
 - 「偏好的測試函式庫是 vitest，不是 jest」
@@ -126,7 +126,8 @@ Stored in: key_facts table (FTS5 indexed)
      v
 Next turn's system prompt assembly:
   SELECT content FROM key_facts
-  WHERE agent_id = ?
+  WHERE agent_id = ? AND channel = ? AND chat_id = ?
+    AND source_session = ?          -- this conversation only
   ORDER BY fts5_rank(relevance) DESC
   LIMIT 3
      |
