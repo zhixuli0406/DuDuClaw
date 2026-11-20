@@ -1223,7 +1223,8 @@ async fn build_reply_with_session_inner_impl(
 
     // Clarification accumulation: if agent asked a question last turn and user
     // is now answering, append the answer to pinned instructions.
-    if has_history && !pinned.is_empty() {
+    // v1.82.1: private sessions only — in a group any member could append.
+    if should_append_clarification(is_private, has_history, !pinned.is_empty()) {
         if let Some(last_assistant) = conversation_history
             .iter()
             .rev()
@@ -1274,13 +1275,18 @@ async fn build_reply_with_session_inner_impl(
         if let Some(db_path) = cognitive_memory_db.clone().filter(|_| is_private) {
             let aid = agent_id.clone();
             let query = sanitized_text.clone();
+            // Scope to THIS conversation — the same (channel, chat_id,
+            // source_session) triple the key-fact writer below stores.
+            let (fact_ch, fact_cid) = parse_session_id_parts(session_id);
+            let (fact_ch, fact_cid, fact_sid) =
+                (fact_ch.to_string(), fact_cid.to_string(), session_id.to_string());
             let home_for_facts = ctx.home_dir.clone();
             if let Ok(facts) = tokio::task::spawn_blocking(move || {
                 // H4: single construction point (`[memory] novelty_gate` + `w_vec`).
                 let engine =
                     crate::memory_factory::build_memory_engine(&db_path, &home_for_facts).ok()?;
                 let rt = tokio::runtime::Handle::current();
-                let facts = rt.block_on(engine.search_facts(&aid, &query, 3)).ok()?;
+                let facts = rt.block_on(engine.search_facts_in_chat(&aid, &fact_ch, &fact_cid, &fact_sid, &query, 3)).ok()?;
                 if facts.is_empty() {
                     return None;
                 }
@@ -2788,6 +2794,10 @@ async fn build_reply_with_session_inner_impl(
             let home = ctx.home_dir.clone();
             let agent_dir_for_pin = agent_dir.clone();
             let agent_for_pin = agent_id.clone();
+            // v1.82.1: bind the write to the incarnation this turn ran in
+            // (`created_at`); a `/new` meanwhile makes the result stale.
+            // No generation (`None`) ⇒ "" never matches ⇒ not written.
+            let pin_generation = turn_generation.clone().unwrap_or_default();
             tokio::spawn(async move {
                 let prompt = format!(
                     "Extract the core task instructions from this user message. \
@@ -2804,10 +2814,16 @@ async fn build_reply_with_session_inner_impl(
                 .await
                 {
                     Ok(extracted) => {
-                        if let Err(e) = sm.set_pinned(&sid, &extracted).await {
-                            warn!(session_id = %sid, error = %e, "Failed to save pinned instructions");
-                        } else {
-                            info!(session_id = %sid, "Pinned task instructions extracted ({} chars)", extracted.len());
+                        match sm.set_pinned_if_unchanged(&sid, &extracted, &pin_generation).await {
+                            Err(e) => {
+                                warn!(session_id = %sid, error = %e, "Failed to save pinned instructions");
+                            }
+                            Ok(false) => {
+                                info!(session_id = %sid, "Pinned instructions discarded: the conversation was cleared or restarted");
+                            }
+                            Ok(true) => {
+                                info!(session_id = %sid, "Pinned task instructions extracted ({} chars)", extracted.len());
+                            }
                         }
                     }
                     Err(e) => {
@@ -2888,7 +2904,10 @@ async fn build_reply_with_session_inner_impl(
                             let fact = line.trim_start_matches(&['-', '•', '*', ' '][..]).trim();
                             if fact.len() < 10 { continue; }
                             // Dedup: check if similar fact already exists
-                            if let Ok(existing) = rt.block_on(engine.search_facts(&agent_id_for_facts, fact, 1)) {
+                            if let Ok(existing) = rt.block_on(engine.search_facts_in_chat(
+                                &agent_id_for_facts, &channel_for_facts, &chat_id_for_facts,
+                                &session_for_facts, fact, 1,
+                            )) {
                                 if existing.first().map_or(false, |e| duduclaw_memory::word_jaccard(&e.fact, fact) > 0.8) {
                                     let _ = rt.block_on(engine.bump_fact_access(&existing[0].id));
                                     continue;
@@ -4591,6 +4610,12 @@ pub(crate) async fn resolve_fallback_agent_in<'r>(
     }
 }
 
+/// Whether the current message may be appended to the session's pinned
+/// instructions as a clarification answer. Only in a 1:1 private session
+/// (`is_private_session`); a group/shared session never appends.
+fn should_append_clarification(is_private: bool, has_history: bool, has_pinned: bool) -> bool {
+    is_private && has_history && has_pinned
+}
 
 #[cfg(test)]
 mod released_repro_source_tests {
@@ -4603,12 +4628,21 @@ mod released_repro_source_tests {
     fn released_repro_2_private_facts_agent_only_source() {
         let source = shipped_source();
         assert!(source.contains("cognitive_memory_db.clone().filter(|_| is_private)"));
-        let call = source.lines().find(|line| line.contains("engine.search_facts(")).unwrap().trim();
-        assert_eq!(call, "let facts = rt.block_on(engine.search_facts(&aid, &query, 3)).ok()?;");
-        assert!(source.contains("let aid = agent_id.clone();\n            let query = sanitized_text.clone();"));
+        // v1.82.1: no agent-wide key-fact search remains in the reply pipeline.
+        assert!(!source.contains("engine.search_facts("));
+        // Read: scoped to this conversation's (channel, chat_id, session id).
+        let call = source.lines().find(|line| line.contains("engine.search_facts_in_chat(&aid")).unwrap().trim();
+        assert_eq!(call, "let facts = rt.block_on(engine.search_facts_in_chat(&aid, &fact_ch, &fact_cid, &fact_sid, &query, 3)).ok()?;");
+        assert!(source.contains("let (fact_ch, fact_cid) = parse_session_id_parts(session_id);"));
+        assert!(source.contains("(fact_ch.to_string(), fact_cid.to_string(), session_id.to_string());"));
+        // Dedup: the same triple the writer stores.
+        assert!(source.contains("rt.block_on(engine.search_facts_in_chat(\n                                &agent_id_for_facts, &channel_for_facts, &chat_id_for_facts,\n                                &session_for_facts, fact, 1,"));
+        assert!(source.contains("let (ch, cid) = parse_session_id_parts(session_id);"));
+        assert!(source.contains("let session_for_facts = session_id.to_string();"));
         assert!(source.contains(r#"prompt = format!("{prompt}\n\n## Key Facts About This User\n{ft}");"#));
     }
 
+    // Rendering of pinned instructions is unchanged in the v1.82.1 hotfix.
     #[test]
     fn released_repro_3a_pinned_must_follow_source() {
         assert!(shipped_source().contains(r#"if !pinned.is_empty() {
@@ -4620,6 +4654,7 @@ mod released_repro_source_tests {
         }"#));
     }
 
+    // Rendering of pinned instructions is unchanged in the v1.82.1 hotfix.
     #[test]
     fn released_repro_3b_unescaped_recap_source() {
         assert!(shipped_source().contains(r#"let effective_message = if pinned.is_empty() || !has_history {
@@ -4631,12 +4666,21 @@ mod released_repro_source_tests {
 
     #[test]
     fn released_repro_3c_clarification_append_source() {
+        // v1.82.1 regression: behavioural check of the guard — a group/shared
+        // session never appends, whatever the other conditions.
+        use super::should_append_clarification as allow;
+        assert!(allow(true, true, true), "private session with history + pins may append");
+        for (history, pinned) in [(true, true), (true, false), (false, true), (false, false)] {
+            assert!(!allow(false, history, pinned), "group session must never append");
+        }
+        assert!(!allow(true, false, true));
+        assert!(!allow(true, true, false));
+        // And the shipped branch is gated by it (body otherwise unchanged).
         let source = shipped_source();
-        let start = source.find("    if has_history && !pinned.is_empty() {").unwrap();
+        let start = source.find("    if should_append_clarification(is_private, has_history, !pinned.is_empty()) {").unwrap();
         let block = &source[start..source[start..].find("\n\n    // Inject key facts").unwrap() + start];
-        // Exact full branch: no sender comparison or private-session condition;
-        // credentials are masked and the current sanitized message is truncated.
-        assert_eq!(block, r#"    if has_history && !pinned.is_empty() {
+        assert!(!source.contains("    if has_history && !pinned.is_empty() {"));
+        assert_eq!(block, r#"    if should_append_clarification(is_private, has_history, !pinned.is_empty()) {
         if let Some(last_assistant) = conversation_history
             .iter()
             .rev()

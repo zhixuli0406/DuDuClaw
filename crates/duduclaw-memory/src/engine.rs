@@ -5209,6 +5209,84 @@ impl SqliteMemoryEngine {
         Ok(facts)
     }
 
+    /// [`search_facts`](Self::search_facts) limited to ONE conversation: only
+    /// rows whose `channel`, `chat_id` and `source_session` all equal the
+    /// given (non-empty) values — in the full-text path AND the recency
+    /// fallback. Fail-closed: an empty scope value returns nothing, and a row
+    /// with an empty/NULL `channel`, `chat_id` or `source_session` never
+    /// matches.
+    pub async fn search_facts_in_chat(
+        &self,
+        agent_id: &str,
+        channel: &str,
+        chat_id: &str,
+        source_session: &str,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<KeyFact>> {
+        if channel.is_empty() || chat_id.is_empty() || source_session.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Same FTS5 sanitization as `search_facts` (HC8).
+        let cleaned: String = query
+            .chars()
+            .filter(|c| !matches!(c, '"' | '\'' | ':' | '^' | '{' | '}' | '*' | '(' | ')'))
+            .take(500)
+            .collect();
+        let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
+        let read = |sql: &str, p: &[&dyn rusqlite::ToSql]| -> Result<Vec<KeyFact>> {
+            let mut stmt = conn
+                .prepare(sql)
+                .map_err(|e| DuDuClawError::Memory(format!("search_facts_in_chat prepare: {e}")))?;
+            let rows = stmt
+                .query_map(p, |row| {
+                    Ok(KeyFact {
+                        id: row.get(0)?,
+                        agent_id: row.get(1)?,
+                        fact: row.get(2)?,
+                        channel: row.get(3)?,
+                        chat_id: row.get(4)?,
+                        source_session: row.get(5)?,
+                        timestamp: row.get(6)?,
+                        access_count: row.get(7)?,
+                    })
+                })
+                .map_err(|e| DuDuClawError::Memory(format!("search_facts_in_chat query: {e}")))?;
+            let mut facts = Vec::new();
+            for row in rows {
+                facts.push(row.map_err(|e| DuDuClawError::Memory(e.to_string()))?);
+            }
+            Ok(facts)
+        };
+        let mut facts = Vec::new();
+        if !cleaned.trim().is_empty() {
+            let sanitized_query = format!("\"{}\"", cleaned.replace('"', ""));
+            facts = read(
+                "SELECT k.id, k.agent_id, k.fact, k.channel, k.chat_id, k.source_session, k.timestamp, k.access_count
+                 FROM key_facts k
+                 JOIN key_facts_fts f ON f.rowid = k.rowid
+                 WHERE k.agent_id = ?1 AND k.channel = ?2 AND k.chat_id = ?3 AND k.source_session = ?4
+                   AND key_facts_fts MATCH ?5
+                 ORDER BY rank
+                 LIMIT ?6",
+                params![agent_id, channel, chat_id, source_session, sanitized_query, limit],
+            )?;
+        }
+        // Recency fallback — within the same conversation only.
+        if facts.is_empty() {
+            facts = read(
+                "SELECT k.id, k.agent_id, k.fact, k.channel, k.chat_id, k.source_session, k.timestamp, k.access_count
+                 FROM key_facts k
+                 WHERE k.agent_id = ?1 AND k.channel = ?2 AND k.chat_id = ?3 AND k.source_session = ?4
+                 ORDER BY k.timestamp DESC
+                 LIMIT ?5",
+                params![agent_id, channel, chat_id, source_session, limit],
+            )?;
+        }
+        Ok(facts)
+    }
+
     /// Count total key facts for an agent.
     pub async fn count_facts(&self, agent_id: &str) -> Result<u64> {
         let conn = self.conn.lock().await;
@@ -5294,8 +5372,24 @@ mod tests {
                 params![format!("2026-01-0{}T00:00:00Z", i + 1), id],
             ).unwrap();
         }
-        // Bob's private turn: the public search API takes no chat/session/principal.
-        let hits = engine.search_facts("shared-agent", "Bob unmatchedquartz", 3).await.unwrap();
+        // A legacy / unscoped row (no conversation identity) must never be returned.
+        for (ch, cid, sess) in [("", "", ""), ("", "private-bob", "session-bob"), ("telegram", "", "session-bob")] {
+            engine.store_fact("shared-agent", "Unscoped orchard fact", ch, cid, sess,
+                crate::lineage::Provenance::test_only()).await.unwrap();
+        }
+        // Regression (v1.82.1): Bob's private turn — no FTS match, so the
+        // recency fallback runs, but only inside Bob's own conversation.
+        let hits = engine.search_facts_in_chat("shared-agent", "telegram", "private-bob",
+            "session-bob", "Bob unmatchedquartz", 3).await.unwrap();
+        assert!(hits.is_empty(), "Alice's facts leaked into Bob's conversation: {hits:?}");
+        let hits = engine.search_facts_in_chat("shared-agent", "telegram", "private-bob",
+            "session-bob", "orchard", 3).await.unwrap();
+        assert!(hits.is_empty(), "matching query leaked across conversations: {hits:?}");
+        // An empty scope fails closed.
+        assert!(engine.search_facts_in_chat("shared-agent", "", "", "", "orchard", 3).await.unwrap().is_empty());
+        // Alice's own conversation still gets her newest facts via the fallback.
+        let hits = engine.search_facts_in_chat("shared-agent", "telegram", "private-alice",
+            "session-alice", "Alice unmatchedquartz", 3).await.unwrap();
         assert_eq!(hits.iter().map(|f| f.fact.as_str()).collect::<Vec<_>>(),
             vec!["Alice orchard fact 3", "Alice orchard fact 2", "Alice orchard fact 1"]);
         assert!(hits.iter().all(|f| f.chat_id == "private-alice" && f.source_session == "session-alice"));
@@ -5314,16 +5408,26 @@ mod tests {
         ).unwrap();
         engine.store_fact("shared-agent", "Unrelated newest fact", "telegram", "private-alice",
             "session-alice", crate::lineage::Provenance::test_only()).await.unwrap();
+        // A row with no conversation identity that also matches the query.
+        engine.store_fact("shared-agent", "Legacy uniqueorchid note", "", "", "",
+            crate::lineage::Provenance::test_only()).await.unwrap();
         // A recency fallback with limit 1 would return the unrelated fact instead.
         assert_ne!(engine.get_recent_facts("shared-agent", 1).await.unwrap()[0].id, id);
-        // A matching query from Bob has the same agent-only API as Alice's query.
-        let hits = engine.search_facts("shared-agent", "uniqueorchid", 1).await.unwrap();
+        // Regression (v1.82.1): a matching query from Bob's conversation gets nothing.
+        let hits = engine.search_facts_in_chat("shared-agent", "telegram", "private-bob",
+            "session-bob", "uniqueorchid", 1).await.unwrap();
+        assert!(hits.is_empty(), "Alice's fact leaked into Bob's conversation: {hits:?}");
+        // Alice's own conversation still gets the FTS match (not the newer unrelated fact,
+        // not the unscoped legacy row).
+        let hits = engine.search_facts_in_chat("shared-agent", "telegram", "private-alice",
+            "session-alice", "uniqueorchid", 3).await.unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, id);
         assert_eq!(hits[0].fact, "Alice uniqueorchid preference");
         assert_eq!(hits[0].chat_id, "private-alice");
         assert_eq!(hits[0].source_session, "session-alice");
-        assert!(engine.search_facts("other-agent", "uniqueorchid", 3).await.unwrap().is_empty());
+        assert!(engine.search_facts_in_chat("other-agent", "telegram", "private-alice",
+            "session-alice", "uniqueorchid", 3).await.unwrap().is_empty());
     }
 
     /// Regression: two `duduclaw mcp-server` children opening one fresh
