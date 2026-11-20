@@ -20,6 +20,7 @@ import {
   ErrorState,
   useErrorMessage,
   Button,
+  Badge,
   Switch,
   Input,
   Textarea,
@@ -64,6 +65,7 @@ interface Routine {
   can_run?: boolean;
   last_run_at?: string | null;
   last_status?: string | null;
+  skip_reason?: 'timezone_or_interval' | null;
   last_delivery_status?: string | null;
   last_delivery_reason?: string | null;
 }
@@ -328,15 +330,28 @@ function RoutineRow({
         <span className="text-xs text-muted-foreground">
           {routine.last_run_at ? timeAgo(routine.last_run_at) : '—'}
         </span>
-        <span className={`text-xs ${routine.last_delivery_status === 'delivery_failed' || routine.last_delivery_status === 'delivery_refused' ? 'text-destructive' : 'text-muted-foreground'}`}>
-          {intl.formatMessage({ id: `routines.delivery.${routine.last_delivery_status === 'delivered' ? 'delivered' : routine.last_delivery_status === 'delivery_failed' ? 'failed' : routine.last_delivery_status === 'delivery_refused' ? 'refused' : 'none'}` })}
-        </span>
-        {(routine.last_delivery_status === 'delivery_failed' || routine.last_delivery_status === 'delivery_refused') && (
-          <span className="text-xs text-muted-foreground">
-            {intl.formatMessage({ id: routine.last_delivery_reason === 'notification_delivery_failed'
-              ? 'routines.delivery.notificationFailed'
-              : routine.last_delivery_status === 'delivery_refused' ? 'routines.delivery.accessChanged' : 'routines.delivery.unknownReason' })}
-          </span>
+        {routine.skip_reason === 'timezone_or_interval' ? (
+          <>
+            <Badge variant="secondary" className="bg-warning/15 text-warning">
+              {intl.formatMessage({ id: 'routines.skipped.label' })}
+            </Badge>
+            <span className="whitespace-normal text-xs text-muted-foreground">
+              {intl.formatMessage({ id: 'routines.skipped.explanation' })}
+            </span>
+          </>
+        ) : (
+          <>
+            <span className={`text-xs ${routine.last_delivery_status === 'delivery_failed' || routine.last_delivery_status === 'delivery_refused' ? 'text-destructive' : 'text-muted-foreground'}`}>
+              {intl.formatMessage({ id: `routines.delivery.${routine.last_delivery_status === 'delivered' ? 'delivered' : routine.last_delivery_status === 'delivery_failed' ? 'failed' : routine.last_delivery_status === 'delivery_refused' ? 'refused' : 'none'}` })}
+            </span>
+            {(routine.last_delivery_status === 'delivery_failed' || routine.last_delivery_status === 'delivery_refused') && (
+              <span className="text-xs text-muted-foreground">
+                {intl.formatMessage({ id: routine.last_delivery_reason === 'notification_delivery_failed'
+                  ? 'routines.delivery.notificationFailed'
+                  : routine.last_delivery_status === 'delivery_refused' ? 'routines.delivery.accessChanged' : 'routines.delivery.unknownReason' })}
+              </span>
+            )}
+          </>
         )}
       </ListGridCell>
       <ListGridCell className="justify-end">

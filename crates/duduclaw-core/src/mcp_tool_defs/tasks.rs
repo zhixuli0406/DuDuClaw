@@ -96,7 +96,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
             },
             ParamDef {
                 name: "cron_timezone",
-                description: "With a cron schedule: IANA timezone the expression is evaluated in (e.g. 'Asia/Taipei'). Omit to auto-detect the host timezone.",
+                description: "IANA timezone for a cron. Member schedules: UTC if omitted; no-DST zones (e.g. 'Asia/Taipei') allowed, DST zones refused. Others: host timezone if omitted.",
                 required: false,
             },
             ParamDef {

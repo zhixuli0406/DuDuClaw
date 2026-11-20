@@ -8347,6 +8347,7 @@ export const api = {
           enabled: boolean;
           last_run_at?: string | null;
           last_status?: string | null;
+          skip_reason?: 'timezone_or_interval' | null;
           last_delivery_status?: string | null;
           last_delivery_reason?: string | null;
         }>;

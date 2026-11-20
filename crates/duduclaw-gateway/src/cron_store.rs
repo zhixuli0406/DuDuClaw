@@ -115,6 +115,12 @@ fn default_trigger_kind() -> String {
 }
 
 impl CronTaskRow {
+    /// Safe, stable reason for display outside the Admin-only error details.
+    pub fn skip_reason(&self) -> Option<&'static str> {
+        (self.last_error.as_deref() == Some(crate::cron_scheduler::SCOPED_SCHEDULE_SKIPPED))
+            .then_some("timezone_or_interval")
+    }
+
     /// Build a fresh row with sensible defaults and `created_at`/`updated_at` set to now.
     pub fn new(id: String, name: String, agent_id: String, cron: String, task: String) -> Self {
         let now = Utc::now().to_rfc3339();
@@ -571,6 +577,7 @@ impl CronStore {
             tx.execute("UPDATE cron_tasks SET name=?2,cron=?3,task=?4,enabled=?5,on_behalf_of=?6,updated_at=?7,scoped_by_user_id=?8 WHERE id=?1",
                 params![expected.id,row.name,row.cron,row.task,row.enabled,row.on_behalf_of,Utc::now().to_rfc3339(),row.scoped_by_user_id])
                 .map_err(|e| e.to_string())?;
+            if !scoped::requires_admission(row) || scoped::validate_scoped_schedule(row).is_ok() { Self::clear_scoped_schedule_skip_in_transaction(&tx, &row.id)?; }
         } else {
             tx.execute("DELETE FROM cron_tasks WHERE id=?1", params![expected.id]).map_err(|e| e.to_string())?;
         }
@@ -598,6 +605,7 @@ impl CronStore {
                 row.notify_chat_id,row.notify_thread_id,row.cron_timezone,row.trigger_kind,
                 row.condition_script,row.watch_command,row.on_behalf_of,Utc::now().to_rfc3339()],
         ).map_err(|e| e.to_string())?;
+        if !scoped::requires_admission(row) || scoped::validate_scoped_schedule(row).is_ok() { Self::clear_scoped_schedule_skip_in_transaction(conn, &row.id)?; }
         Ok(())
     }
 
@@ -767,6 +775,40 @@ impl CronStore {
         ).map_err(|e| format!("record_autonomy_skip: {e}"))?;
         commit_write(conn)?;
         Ok(())
+    }
+
+    /// A human-origin row the scheduler refuses to run (timezone or cadence
+    /// outside the member rules). Writes only when the stored status/reason
+    /// differ, so a refused row is written once, not on every tick.
+    /// `last_run_at` is left alone: nothing ran. Returns whether it wrote.
+    pub(crate) async fn record_scoped_schedule_skip(&self, id: &str, reason: &str) -> Result<bool, String> {
+        let mut guard = self.conn.lock().await;
+        let conn = begin_write(&mut guard)?;
+        let changed = conn.execute(
+            "UPDATE cron_tasks SET last_status='skipped',last_error=?2,updated_at=?3
+             WHERE id=?1 AND (last_status IS NOT 'skipped' OR last_error IS NOT ?2)",
+            params![id, reason, Utc::now().to_rfc3339()],
+        ).map_err(|e| format!("record_scoped_schedule_skip: {e}"))?;
+        commit_write(conn)?;
+        Ok(changed > 0)
+    }
+
+    /// Clear only our admission sentinel; preserve run history and other skip reasons.
+    fn clear_scoped_schedule_skip_in_transaction(conn: &Connection, id: &str) -> Result<bool, String> {
+        let changed = conn.execute(
+            "UPDATE cron_tasks SET last_status=NULL,last_error=NULL
+             WHERE id=?1 AND last_status='skipped' AND last_error=?2",
+            params![id, crate::cron_scheduler::SCOPED_SCHEDULE_SKIPPED],
+        ).map_err(|e| format!("clear_scoped_schedule_skip: {e}"))?;
+        Ok(changed > 0)
+    }
+
+    pub(crate) async fn clear_scoped_schedule_skip(&self, id: &str) -> Result<bool, String> {
+        let mut guard = self.conn.lock().await;
+        let conn = begin_write(&mut guard)?;
+        let changed = Self::clear_scoped_schedule_skip_in_transaction(&conn, id)?;
+        commit_write(conn)?;
+        Ok(changed)
     }
 
     /// Record the outcome of a firing. Bumps `run_count` and (on failure) `failure_count`.

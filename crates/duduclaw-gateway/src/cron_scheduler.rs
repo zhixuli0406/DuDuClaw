@@ -64,6 +64,50 @@ fn scoped_schedule_allowed(row: &CronTaskRow) -> bool {
     true
 }
 
+/// Fixed reason stored on a refused human-origin row; shown to its owner/admin.
+pub(crate) const SCOPED_SCHEDULE_SKIPPED: &str = "schedule skipped: its timezone has daylight-saving changes, \
+    or the interval is under 15 minutes; an administrator must edit it";
+
+fn scoped_schedule_skip_notice() -> &'static str {
+    "有一筆成員排程已被略過：它的時區有夏令時間，或間隔少於 15 分鐘。請到「自動化」頁查看標示「已略過」的排程。"
+}
+
+/// [`scoped_schedule_allowed`], and on refusal record the fixed reason on the
+/// row (`last_status`/`last_error`) so the refusal is visible. Written only
+/// when the stored value differs, so the row is not rewritten every tick.
+async fn scoped_schedule_admitted(home_dir: &Path, store: &CronStore, row: &CronTaskRow) -> bool {
+    if scoped_schedule_allowed(row) {
+        if row.last_status.as_deref() == Some("skipped") && row.last_error.as_deref() == Some(SCOPED_SCHEDULE_SKIPPED) {
+            if store.clear_scoped_schedule_skip(&row.id).await.is_err() {
+                warn!(count = 1u64, "scoped cron skip marker not cleared");
+            }
+        }
+        return true;
+    }
+    if row.last_status.as_deref() != Some("skipped") || row.last_error.as_deref() != Some(SCOPED_SCHEDULE_SKIPPED) {
+        match store.record_scoped_schedule_skip(&row.id, SCOPED_SCHEDULE_SKIPPED).await {
+            Ok(true) => {
+                let home = home_dir.to_path_buf();
+                // Only the first write sends a notice; channel latency never blocks scheduling.
+                tokio::spawn(async move {
+                    use crate::maintenance::notify::{AdminNotifier, UserDbAdminNotifier};
+                    let Ok(Some(db)) = crate::decision_notify::open_user_db(&home) else {
+                        warn!("scoped cron skip notice unavailable");
+                        return;
+                    };
+                    let notifier = UserDbAdminNotifier::new(home, Arc::new(db));
+                    if notifier.notify_admins(scoped_schedule_skip_notice()).await == 0 {
+                        warn!("scoped cron skip notice not delivered");
+                    }
+                });
+            }
+            Ok(false) => (),
+            Err(_) => warn!(count = 1u64, "scoped cron refusal not recorded"),
+        }
+    }
+    false
+}
+
 /// v1.81 P1g: the people a cron fire is for — manual-run principal,
 /// `on_behalf_of`, last editor, creator (each may be absent).
 pub(crate) fn cron_fire_principals(task: &CronTaskRow, scoped_principal: Option<&str>) -> [Option<String>; 4] {
@@ -218,7 +262,7 @@ impl CronScheduler {
         let mut runs = Vec::new();
         let mut errors = Vec::new();
         for row in self.store.list_enabled().await? {
-            if !scoped_schedule_allowed(&row) { continue; }
+            if !scoped_schedule_admitted(&self.home_dir, &self.store, &row).await { continue; }
             let Some((_, material_hash)) = self.store.workflow_binding(&row.id).await? else { continue };
             let outcome: Result<Option<String>, String> = async {
                 let mut cursor = self.store.routine_cursor(&row.id, &material_hash).await?;
@@ -403,7 +447,7 @@ impl CronScheduler {
 
         let mut new_live = Vec::with_capacity(raw_tasks.len());
         for task in raw_tasks {
-            if !scoped_schedule_allowed(&task) { continue; }
+            if !scoped_schedule_admitted(&self.home_dir, &self.store, &task).await { continue; }
             // Typed routines use the durable occurrence cursor in tick_at, not
             // legacy last_run_at (which manual executions also modify).
             match self.store.workflow_binding(&task.id).await {
@@ -628,7 +672,7 @@ async fn enqueue_routine_trigger(
 ) -> Result<String, String> {
     let task = store.get(task_id).await?.ok_or("workflow cron missing")?;
     if !task.enabled { return Err("workflow cron disabled".into()); }
-    if !scoped_schedule_allowed(&task) { return Err("Automation schedule refused".into()); }
+    if !scoped_schedule_admitted(home_dir, store, &task).await { return Err("Automation schedule refused".into()); }
     // v1.81 P1g: fire-time Personal ownership check.
     if let Some(reason) = cron_fire_time_refusal(home_dir, &task, None).await {
         return Err(reason.into());
@@ -740,7 +784,7 @@ async fn dispatch_cron_task_checked(
         task.on_behalf_of = Some(principal.into());
         task.scoped_by_user_id = principal.strip_prefix("user:").map(str::to_string);
     }
-    if !scoped_schedule_allowed(&task) { return; }
+    if !scoped_schedule_admitted(home_dir, store, &task).await { return; }
     // v1.81 P1g: fire-time Personal ownership check (covers rows created
     // before the upgrade and ownership changes since).
     if let Some(reason) = cron_fire_time_refusal(home_dir, &task, scoped_principal).await {
@@ -2380,6 +2424,86 @@ mod tests {
         assert!(refused.to_string().starts_with("origin_identity_unbound"));
         let failed = CronDeliveryError::from(ScheduledRefusal::Other("policy unreadable".into()));
         assert!(matches!(failed, CronDeliveryError::Failed(_)));
+    }
+
+    #[test]
+    fn scoped_schedule_skip_notice_is_fixed_and_row_independent() {
+        // No row or member-controlled text can be passed to the notice builder.
+        let notice: fn() -> &'static str = scoped_schedule_skip_notice;
+        assert_eq!(notice(), "有一筆成員排程已被略過：它的時區有夏令時間，或間隔少於 15 分鐘。請到「自動化」頁查看標示「已略過」的排程。");
+    }
+
+    /// v1.79.3 stored the host zone with `on_behalf_of` for member schedules.
+    /// A fixed-offset zone runs again; a DST zone is skipped with a visible
+    /// reason that is written once, not on every reload.
+    #[tokio::test]
+    async fn scoped_schedule_legacy_fixed_zone_runs_and_dst_refusal_is_recorded_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(CronStore::open(dir.path()).unwrap());
+        let mut legacy = CronTaskRow::new("legacy-taipei".into(), "Morning".into(), "agnes".into(),
+            "0 9 * * *".into(), "report".into());
+        legacy.on_behalf_of = Some("user:member".into());
+        legacy.cron_timezone = Some("Asia/Taipei".into());
+        assert!(scoped_schedule_allowed(&legacy));
+        store.insert(&legacy).await.unwrap();
+        let mut dst = legacy.clone();
+        dst.id = "legacy-new-york".into();
+        dst.cron_timezone = None;
+        store.insert(&dst).await.unwrap();
+        // Simulate an older writer: the store now refuses this zone itself.
+        rusqlite::Connection::open(dir.path().join("cron_tasks.db")).unwrap()
+            .execute("UPDATE cron_tasks SET cron_timezone='America/New_York' WHERE id='legacy-new-york'", [])
+            .unwrap();
+        let stale = store.get("legacy-new-york").await.unwrap().unwrap();
+        assert!(!scoped_schedule_allowed(&stale));
+
+        let registry = Arc::new(RwLock::new(AgentRegistry::new(dir.path().join("agents"))));
+        let scheduler = CronScheduler::new(dir.path().to_path_buf(), store.clone(), registry);
+        scheduler.reload().await;
+        let live: Vec<String> = scheduler.tasks.read().await.iter().map(|t| t.task.id.clone()).collect();
+        assert_eq!(live, vec!["legacy-taipei".to_string()]);
+        assert!(store.get("legacy-taipei").await.unwrap().unwrap().last_status.is_none());
+        let recorded = store.get("legacy-new-york").await.unwrap().unwrap();
+        assert_eq!(recorded.last_status.as_deref(), Some("skipped"));
+        assert_eq!(recorded.last_error.as_deref(), Some(SCOPED_SCHEDULE_SKIPPED));
+        assert!(recorded.last_run_at.is_none(), "nothing ran");
+        assert!(recorded.enabled);
+
+        // Neither a fresh reload nor a caller holding the stale row rewrites it.
+        scheduler.reload().await;
+        assert!(!scoped_schedule_admitted(dir.path(), &store, &stale).await);
+        assert!(!store.record_scoped_schedule_skip(&stale.id, SCOPED_SCHEDULE_SKIPPED).await.unwrap());
+        let again = store.get("legacy-new-york").await.unwrap().unwrap();
+        assert_eq!(again.updated_at, recorded.updated_at, "reason written once");
+
+        // An external/admin repair is picked up by the next admission, before a run.
+        let conn = rusqlite::Connection::open(dir.path().join("cron_tasks.db")).unwrap();
+        conn.execute("UPDATE cron_tasks SET cron_timezone='Asia/Taipei',last_run_at='2026-06-01T00:00:00Z',run_count=4,failure_count=2 WHERE id='legacy-new-york'", []).unwrap();
+        conn.execute_batch("CREATE TABLE status_writes (count INTEGER NOT NULL);
+            INSERT INTO status_writes VALUES (0);
+            CREATE TRIGGER count_status_writes AFTER UPDATE OF last_status,last_error ON cron_tasks
+            BEGIN UPDATE status_writes SET count=count+1; END;").unwrap();
+        let repaired = store.get(&stale.id).await.unwrap().unwrap();
+        assert!(scoped_schedule_admitted(dir.path(), &store, &repaired).await);
+        let cleared = store.get(&stale.id).await.unwrap().unwrap();
+        assert!(cleared.last_status.is_none());
+        assert!(cleared.last_error.is_none());
+        assert!(cleared.skip_reason().is_none());
+        assert_eq!(cleared.last_run_at, repaired.last_run_at);
+        assert_eq!((cleared.run_count, cleared.failure_count), (4, 2));
+        assert_eq!(cleared.updated_at, repaired.updated_at);
+        // Even a stale sentinel snapshot cannot write a second time.
+        assert!(scoped_schedule_admitted(dir.path(), &store, &repaired).await);
+        assert!(!store.clear_scoped_schedule_skip(&stale.id).await.unwrap());
+        assert_eq!(conn.query_row("SELECT count FROM status_writes", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+
+        conn.execute("UPDATE cron_tasks SET last_status='skipped',last_error='another skip reason' WHERE id='legacy-new-york'", []).unwrap();
+        let other = store.get(&stale.id).await.unwrap().unwrap();
+        assert!(scoped_schedule_admitted(dir.path(), &store, &other).await);
+        assert!(!store.clear_scoped_schedule_skip(&other.id).await.unwrap());
+        let unchanged = store.get(&other.id).await.unwrap().unwrap();
+        assert_eq!(serde_json::to_value(&unchanged).unwrap(), serde_json::to_value(&other).unwrap());
+        assert_eq!(conn.query_row("SELECT count FROM status_writes", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
     }
 
 }

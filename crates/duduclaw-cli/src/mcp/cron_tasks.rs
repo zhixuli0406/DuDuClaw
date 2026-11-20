@@ -119,6 +119,10 @@ pub(crate) async fn handle_schedule_task_for_actor(
     //
     // Explicit opt-out: pass `cron_timezone = "UTC"` to force UTC
     // evaluation. Explicit any-other-IANA-name still wins (below).
+    //
+    // Member (human-origin) schedules never auto-detect: they default to UTC.
+    // The store admits an explicit zone for them only when its UTC offset
+    // never changes (e.g. Asia/Taipei); DST zones are refused there.
     let cron_timezone = params
         .get("cron_timezone")
         .and_then(|v| v.as_str())
@@ -126,7 +130,7 @@ pub(crate) async fn handle_schedule_task_for_actor(
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .or_else(|| {
-            // Human-origin rows share the store's UTC cadence contract.
+            // Human-origin rows default to UTC, never the host zone.
             if principal.is_some() { return Some("UTC".into()); }
             let detected = detect_local_timezone();
             if let Some(ref tz) = detected {
@@ -651,8 +655,11 @@ pub(crate) fn render_cron_tasks(tasks: &[duduclaw_gateway::cron_store::CronTaskR
         let status_icon = if t.enabled { "▶" } else { "⏸" };
         let last_run = t.last_run_at.as_deref().unwrap_or("never");
         let last_status = t.last_status.as_deref().unwrap_or("-");
+        let skip_reason = if t.skip_reason().is_some() {
+            " (timezone has daylight-saving changes or interval is under 15 minutes)"
+        } else { "" };
         lines.push(format!(
-            "{status_icon} [{id}] {name}\n  cron: {cron} | agent: {agent} | runs: {runs} (fail: {fail})\n  last_run: {last_run} | last_status: {last_status}\n  delivery: {delivery} | reason: {reason}\n  task: {task}\n",
+            "{status_icon} [{id}] {name}\n  cron: {cron} | agent: {agent} | runs: {runs} (fail: {fail})\n  last_run: {last_run} | last_status: {last_status}{skip_reason}\n  delivery: {delivery} | reason: {reason}\n  task: {task}\n",
             id = truncate_bytes(&t.id, 8),
             name = t.name,
             cron = t.cron,

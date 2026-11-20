@@ -878,12 +878,12 @@ Dashboard RPC 最低角色由專屬角色表在 extension 分派之前執行，�
 
 最近技能只保存帳號、目標 AI 員工與技能名稱，每帳號最多保留一百筆，不保存訊息或技能內容。紀錄在送出受理後產生，點標籤不會紀錄，也不代表執行成功。組織圖的結構可見性不會放寬對話與設定存取。員工自動化編輯不開放 shell 指令、條件腳本、任意通知目的地或工作流程管理。舊紀錄若沒有可驗證的建立者，只透過既有綁定授權。
 
-Cron admission 是所有帶 `on_behalf_of`、`created_by_user_id` 或 `scoped_by_user_id` 紀錄的共用 store 限制，包含 MCP 新增、更新與恢復。檢查和寫入在同一個 `BEGIN IMMEDIATE` 交易內：每個歸屬人最多 20 筆啟用排程，每位 AI 員工最多 50 筆（包含既有 Admin 排程），Dashboard 與 MCP 紀錄合併計數。每人滾動一小時最多建立或新接管 20 筆，receipt 不受刪除排程或重啟影響；一般修改不再消耗建立次數。單純暫停與刪除仍可執行。沒有來源標記的 Admin 排程維持原行為；MCP 帶人類來源時，即使該帳號是 Admin 仍受限制。最低間隔 15 分鐘，以一天內所有時點及跨午夜間距驗證，保守視選定日期為連續日。Scheduler 載入與執行前重讀都會跳過不合規紀錄，日誌只記錄數量。
+Cron admission 是所有帶 `on_behalf_of`、`created_by_user_id` 或 `scoped_by_user_id` 紀錄的共用 store 限制，包含 MCP 新增、更新與恢復。檢查和寫入在同一個 `BEGIN IMMEDIATE` 交易內：每個歸屬人最多 20 筆啟用排程，每位 AI 員工最多 50 筆（包含既有 Admin 排程），Dashboard 與 MCP 紀錄合併計數。每人滾動一小時最多建立或新接管 20 筆，receipt 不受刪除排程或重啟影響；一般修改不再消耗建立次數。單純暫停與刪除仍可執行。沒有來源標記的 Admin 排程維持原行為；MCP 帶人類來源時，即使該帳號是 Admin 仍受限制。最低間隔 15 分鐘，以一天內所有時點及跨午夜間距驗證，保守視選定日期為連續日。Scheduler 載入與執行前重讀都會跳過不合規紀錄，日誌只記錄數量；該排程會記下 `last_status = skipped`，`last_error` 填入固定原因，只寫一次，不會每次檢查都寫入。
 
 員工 `cron.run_now` 在 spawn 前檢查：滑動 10 分鐘內每筆排程最多 3 次、每人最多 10 次受理；每人最多 2 件、全域最多 4 件未完成工作。Semaphore 無可用席位就回覆忙碌，不建立排隊 task。拒絕不消耗次數；已受理但後續失敗仍計次，完成、取消與 panic 都會釋放 outstanding。Admission 資料有容量上限，保存在程序記憶體，gateway 重啟會重置；鎖不可用時拒絕執行。員工 cron 表達式在正規化與解析前限制 256 bytes，store／runtime 驗證也適用。
 
 非 Admin 新增／更新會對完整結果 name＋task 模型提示呼叫 `scan_input_with_audit`，使用對話相同門檻；命中時不寫排程，並寫入 `security_audit.jsonl`。恢復／手動執行也掃描舊 task，不允許更換 agent_id。H2 採限制主機執行對象：員工只能對存在且 `[container] sandbox_enabled = false` 的代理新增、編輯、恢復或手動執行；registry 與磁碟上的有效型別設定都須允許，無法讀取設定則拒絕。執行時依保存的 `created_by_user_id`／`scoped_by_user_id` 及手動呼叫人重新檢查，呼叫 runtime 前再次檢查；目標啟用任務沙箱或不可用時暫停排程並記錄 skipped。既有 host runner 保留代理的 runtime、capabilities 與 native sandbox 設定，本次未實作容器化 cron；未帶員工標記的既有 Admin 排程仍在 host 執行。與一般 runtime 設定載入相同，設定讀取並非涵蓋程序啟動的原子鎖。
 
-員工 cron 僅支援 UTC（含零時差 UTC／GMT 別名）。舊紀錄若指定其他時區，編輯、恢復與手動執行會拒絕，避免日光節約時間縮短實際間隔；仍可讀取，有權限者仍可暫停／刪除，時區排程由 Admin 管理。
+員工 cron 支援 UTC（含零時差 UTC／GMT 別名），以及未來兩年內 UTC 時差不變的 IANA 時區，例如 `Asia/Taipei`；時差固定時，時鐘間隔等於實際經過時間，15 分鐘的檢查仍然成立。有夏令時間或其他時差變更的時區，新增、編輯、恢復與手動執行會拒絕，排程器也會略過，避免夏令時間縮短實際間隔；仍可讀取，有權限者仍可暫停／刪除。其他時區的排程由 Admin 管理，被略過的排程需由 Admin 改成 UTC 或沒有夏令時間的時區。
 
-帶人類來源的 MCP 新增排程預設 UTC；未帶來源標記的 Admin／背景排程保留本地時區偵測。
+帶人類來源的 MCP 新增排程預設 UTC，也可明確指定沒有夏令時間的時區；未帶來源標記的 Admin／背景排程保留本地時區偵測。

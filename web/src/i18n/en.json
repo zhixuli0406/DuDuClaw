@@ -11578,6 +11578,8 @@
   "users.primary.missing": "{count} members have no primary AI",
   "users.primary.repair": "Set to their first AI",
   "users.primary.confirm": "Set the listed members’ primary AI to their earliest Owner or Operator binding?",
+  "routines.skipped.label": "Skipped",
+  "routines.skipped.explanation": "This schedule did not run because its timezone observes daylight saving time or its interval is less than 15 minutes. Ask an administrator to change it to UTC or a timezone without daylight saving time.",
   "routines.delivery.delivered": "Delivered",
   "routines.delivery.failed": "Delivery failed",
   "routines.delivery.refused": "Delivery refused",

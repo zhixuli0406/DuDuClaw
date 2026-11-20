@@ -36,16 +36,50 @@ pub(crate) fn validate_cadence(expression: &str) -> Result<(), String> {
     }
 }
 
-/// Scoped creation does not expose timezone selection. Refuse adopting zoned
-/// legacy jobs: a DST forward jump can compress otherwise-valid clock slots
-/// below 15 elapsed minutes. Admin retains the timezone-capable API.
+/// Daily samples over two years (731 days covers a leap year). A zone's UTC
+/// offset changes only at a transition and then holds for the whole period
+/// until the next one; every real period is far longer than one day (the
+/// shortest current one, Africa/Casablanca's Ramadan change, lasts weeks), so
+/// any transition inside the window changes at least one daily sample.
+const FIXED_OFFSET_SAMPLE_DAYS: i64 = 731;
+
+/// Human-origin schedules run in UTC or in an IANA zone whose UTC offset is
+/// constant from now through the next two years (no DST, no announced offset
+/// change), e.g. `Asia/Taipei`, which versions up to v1.79.3 stored from the
+/// host. `validate_cadence` proves the 15-minute minimum on clock slots; when
+/// the offset never changes, the gap between two clock slots equals the
+/// elapsed time, so that proof holds. Zones with any transition stay refused:
+/// a DST forward jump can compress otherwise-valid clock slots below 15
+/// elapsed minutes. Unknown names fail closed. Admin retains the
+/// timezone-capable API.
+///
+/// Not cached: a fixed zone costs ~732 offset lookups (binary searches over
+/// the compiled transition table, tens of microseconds in total) and a DST
+/// zone stops at its first change. The scheduler calls this about twice per
+/// enabled human-origin row per 30-second tick, plus once per fire; a
+/// process-lifetime cache would also freeze a window that must slide.
 pub(crate) fn scoped_cron_timezone_allowed(row: &CronTaskRow) -> bool {
-    matches!(row.cron_timezone.as_deref(), None | Some("") | Some("UTC") | Some("Etc/UTC") | Some("Etc/GMT") | Some("GMT"))
+    scoped_timezone_allowed_at(row.cron_timezone.as_deref(), Utc::now())
+}
+
+fn scoped_timezone_allowed_at(name: Option<&str>, now: chrono::DateTime<Utc>) -> bool {
+    match name {
+        None | Some("") | Some("UTC") | Some("Etc/UTC") | Some("Etc/GMT") | Some("GMT") => true,
+        Some(name) => duduclaw_core::parse_timezone(name).is_some_and(|tz| fixed_offset_zone(tz, now)),
+    }
+}
+
+/// Same total UTC offset at `now` and at every daily sample up to two years ahead.
+fn fixed_offset_zone(tz: chrono_tz::Tz, now: chrono::DateTime<Utc>) -> bool {
+    use chrono::{Offset, TimeZone};
+    let offset = |day: i64| tz.offset_from_utc_datetime(&(now + chrono::Duration::days(day)).naive_utc()).fix();
+    let first = offset(0);
+    (1..=FIXED_OFFSET_SAMPLE_DAYS).all(|day| offset(day) == first)
 }
 
 pub(crate) fn validate_scoped_schedule(row: &CronTaskRow) -> Result<(), String> {
     if !scoped_cron_timezone_allowed(row) {
-        return Err("Employee automations require UTC schedules; ask an administrator to manage timezones".into());
+        return Err("Member schedules need UTC or a timezone without daylight-saving changes; ask an administrator to manage other timezones".into());
     }
     validate_cadence(&row.cron)
 }
@@ -142,6 +176,49 @@ mod tests {
             "0 0,59 0,23 * * *", "*/30 0 9 1 1 * 2090", "invalid"] {
             assert!(validate_cadence(expression).is_err(), "{expression}");
         }
+    }
+
+    #[test]
+    fn scoped_cron_fixed_offset_zones_allowed_dst_zones_refused() {
+        use chrono::TimeZone;
+        let now = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+        for zone in ["Asia/Taipei", "Asia/Tokyo", "Asia/Kolkata", "UTC", "Asia/Calcutta", "Etc/GMT-14", "Australia/Eucla"] {
+            assert!(fixed_offset_zone(duduclaw_core::parse_timezone(zone).unwrap(), now), "{zone}");
+            assert!(scoped_timezone_allowed_at(Some(zone), now), "{zone}");
+        }
+        for zone in ["America/New_York", "Europe/London", "Australia/Sydney"] {
+            assert!(!fixed_offset_zone(duduclaw_core::parse_timezone(zone).unwrap(), now), "{zone}");
+            assert!(!scoped_timezone_allowed_at(Some(zone), now), "{zone}");
+        }
+        // Unknown and non-empty garbage names fail closed; None/"" remain UTC.
+        for zone in ["Mars/Olympus", "   ", "UTC+8", "not a zone"] {
+            assert!(!scoped_timezone_allowed_at(Some(zone), now), "{zone:?}");
+        }
+        assert!(scoped_timezone_allowed_at(None, now));
+        assert!(scoped_timezone_allowed_at(Some(""), now));
+        // A transition just inside the window is seen: New York falls back on
+        // 2026-11-01, one day after this `now`.
+        let before_fall_back = Utc.with_ymd_and_hms(2026, 10, 31, 12, 0, 0).unwrap();
+        assert!(!scoped_timezone_allowed_at(Some("America/New_York"), before_fall_back));
+        // Not only DST: a one-off offset change inside the window is refused
+        // (Pyongyang moved from +09:00 to +08:30 on 2015-08-15).
+        let before_change = Utc.with_ymd_and_hms(2015, 1, 1, 0, 0, 0).unwrap();
+        assert!(!scoped_timezone_allowed_at(Some("Asia/Pyongyang"), before_change));
+    }
+
+    #[test]
+    fn scoped_cron_validate_accepts_fixed_offset_zone_and_keeps_cadence_rule() {
+        let mut task = CronTaskRow::new("tz".into(), "tz".into(), "agent".into(), "0 9 * * *".into(), "work".into());
+        task.on_behalf_of = Some("user:human".into());
+        task.cron_timezone = Some("Asia/Taipei".into());
+        assert!(requires_admission(&task));
+        assert!(validate_scoped_schedule(&task).is_ok());
+        task.cron_timezone = Some("America/New_York".into());
+        let error = validate_scoped_schedule(&task).unwrap_err();
+        assert!(error.contains("UTC or a timezone without daylight-saving changes"), "{error}");
+        task.cron_timezone = Some("Asia/Taipei".into());
+        task.cron = "*/10 * * * *".into();
+        assert!(validate_scoped_schedule(&task).unwrap_err().contains("15 minutes"));
     }
 
     #[tokio::test]

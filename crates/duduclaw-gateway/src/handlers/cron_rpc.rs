@@ -34,6 +34,7 @@ impl MethodHandler {
             "last_run_at": row.last_run_at,
             "next_run": crate::cron_scheduler::next_run(row, Utc::now()).map(|at| at.to_rfc3339()),
             "last_status": row.last_status,
+            "skip_reason": row.skip_reason(),
             "last_delivery_status": row.last_delivery_status,
             "last_delivery_reason": row.last_delivery_reason,
             "last_error": row.last_error,
