@@ -5416,7 +5416,7 @@ pub mod subject_listing;
 pub use subject_listing::{SubjectFact, SubjectTripleForgetReport};
 
 pub mod conversation_scope;
-pub use conversation_scope::{is_host_generated, HOST_GENERATED_SOURCE_EVENTS};
+pub use conversation_scope::{is_explicitly_stored, EXPLICIT_SOURCE_EVENTS};
 
 #[cfg(test)]
 mod tests {

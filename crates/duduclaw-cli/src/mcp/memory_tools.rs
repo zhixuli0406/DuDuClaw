@@ -22,7 +22,7 @@ pub(crate) async fn handle_memory_search_by_layer(
     let layer = duduclaw_core::types::MemoryLayer::parse(layer_str);
     let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
 
-    // v1.83.0: conversation scope (host-generated rows of other conversations),
+    // v1.83.0: conversation scope (rows not explicitly stored, of other conversations),
     // applied before the limit: a scoped read over-fetches like memory_search.
     let scope = crate::mcp_memory_handlers::mcp_read_scope(agent_id);
     let fetch = match scope {

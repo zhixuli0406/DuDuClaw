@@ -128,6 +128,13 @@ pub(crate) async fn handle_decision_resolve_in(
 ///
 /// v1.83.0: on a channel conversation turn only the decisions recorded in the
 /// current session (none when the session is unknown).
+///
+/// The decision tools read through `list_open_decisions_in_session` /
+/// `is_open_decision_in_session` (the session recorded with the decision),
+/// NOT through the memory tools' lineage filter
+/// (`ids_hidden_from_conversation`). That filter hides `decision_capture` /
+/// `decision_resolve` rows from `memory_search` / `memory_read` in other
+/// conversations; it does not decide what these tools list or resolve.
 pub(crate) async fn handle_decision_list(
     params: &Value,
     memory: &SqliteMemoryEngine,
@@ -265,11 +272,15 @@ mod conversation_scope_tests {
     }
 
     /// Session A lists and resolves its own decision; a non-channel caller
-    /// (dispatch run, cron) still lists employee-wide.
+    /// (dispatch run, cron) still lists employee-wide. The decision rows are
+    /// not explicitly stored (so the memory tools scope them), which does not
+    /// change what these tools list or resolve.
     #[tokio::test]
     async fn own_session_lists_and_resolves() {
         let (_dir, engine, id) = engine_with_a_decision().await;
         let agent = "shared-agent";
+        assert!(!duduclaw_memory::is_explicitly_stored("decision_capture"));
+        assert!(!duduclaw_memory::is_explicitly_stored("decision_resolve"));
         let employee =
             handle_decision_list_in(&serde_json::json!({}), &engine, agent, &ReadScope::Employee).await;
         assert_eq!(listed_ids(&employee), vec![id.clone()]);

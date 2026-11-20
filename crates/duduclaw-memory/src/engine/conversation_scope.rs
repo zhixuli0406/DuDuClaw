@@ -1,10 +1,14 @@
 //! v1.83.0: which memory rows a reader serving ONE conversation may see.
 //!
-//! The host writes some rows on its own from a conversation: distilled facts,
-//! user-profile traits and their summary, OS footprint round-ups
-//! ([`HOST_GENERATED_SOURCE_EVENTS`]). An employee serves many people, so a
-//! read made for one conversation (the employee's MCP tools on a channel
-//! turn) must not return such a row distilled from another conversation.
+//! The host writes many rows on its own, most of them from conversations:
+//! distilled facts, user-profile traits and their summary, conversation
+//! summaries, consolidated rules, recorded decisions, and any source event
+//! added later. An employee serves many people, so a read made for one
+//! conversation (the employee's MCP tools on a channel turn) must not return
+//! such a row from another conversation. This is an allow-list: only the
+//! explicitly stored rows of [`EXPLICIT_SOURCE_EVENTS`] skip the check; every
+//! other `source_event` (empty and unknown ones included) must come from this
+//! conversation (fail closed).
 //!
 //! The source conversation of a row is what the P2-B lineage recorded for it:
 //! `memory_origins.source_session` of its `direct` and `inherited` rows
@@ -15,40 +19,63 @@
 
 use super::*;
 
-/// `source_event` of the rows the host generates on its own from a
-/// conversation (same family as `footprint_distill::FOOTPRINT_SOURCE_EVENT`
-/// names): conversation distillation (`wiki_ingest::DISTILL_SOURCE_EVENT`,
-/// also its wiki pointer rows), user-profile traits, the profile summary and
-/// the OS footprint round-up. Rows the employee stored explicitly
-/// (`mcp_internal` / `mcp_external`) and every other source event are not in
-/// it.
-pub const HOST_GENERATED_SOURCE_EVENTS: &[&str] = &[
-    "conversation_distill",
-    "user_profile",
-    "user_profile_consolidation",
-    "footprint_distill",
-];
+/// `source_event` of the rows whose content was stored by an explicit act of
+/// the employee or an operator, not derived by the host from conversation
+/// content. Only these skip the same-conversation check:
+///
+/// | event          | writer                                              | why exempt |
+/// |----------------|-----------------------------------------------------|------------|
+/// | `mcp_internal` | `duduclaw-cli/src/mcp_memory_handlers.rs` (`handle_memory_store`) | the employee's own `memory_store` call |
+/// | `import`       | `duduclaw-memory/src/import.rs` (`build_memory_entry`, run by `duduclaw-cli/src/wizard.rs`) | operator file import |
+///
+/// Every other `source_event` is checked. The ones the code writes today, and
+/// why each is not exempt:
+///
+/// | event                           | writer | why not exempt |
+/// |---------------------------------|--------|----------------|
+/// | `conversation_distill`          | `duduclaw-gateway/src/wiki_ingest.rs` | facts the host distils from a conversation |
+/// | `user_profile`                  | `duduclaw-memory/src/user_profile.rs` (`trait_write`) | traits about a person, distilled or recorded during their conversation |
+/// | `user_profile_consolidation`    | `duduclaw-memory/src/user_profile.rs` (`consolidate_profile`) | summary of those traits |
+/// | `conversation_summary`          | `duduclaw-gateway/src/skill_synthesis_pipeline/pipeline.rs` (tests only; older rows) | a conversation summary |
+/// | `decision_capture`              | `duduclaw-gateway/src/decision_capture.rs` | another person's question and options (the decision tools read through `list_open_decisions_in_session`, not this filter) |
+/// | `decision_resolve`              | `duduclaw-memory/src/engine.rs` (`decision_artifact_entry`) | decision rows and their outcome |
+/// | `reflexion_consolidation`       | `duduclaw-gateway/src/reflexion.rs` | rules consolidated from conversation mistakes |
+/// | `night_consolidation`           | `duduclaw-memory/src/night.rs` | consolidation of episodic (conversation) rows |
+/// | `night_schema_induction`        | `duduclaw-memory/src/night.rs` | schemas induced from episodic rows |
+/// | `prediction_episodic`           | `duduclaw-gateway/src/channel_reply/inner.rs` | per-turn record of a channel reply |
+/// | `playbook_entry`                | `duduclaw-gateway/src/playbook/store.rs` | host-written playbook from conversation signals |
+/// | `persona_suppression_induction` | `duduclaw-gateway/src/persona_induction.rs` | host inference from operational history |
+/// | `task_transition`               | `duduclaw-gateway/src/prediction/transition.rs` | host-derived task pointers |
+/// | `task_forward_induction`        | `duduclaw-gateway/src/prediction/task_rule_induce.rs` | host-induced task rules |
+/// | `footprint_distill`             | `duduclaw-gateway/src/footprint_distill.rs` | host round-up, no conversation of this turn |
+/// | `mcp_external`                  | `duduclaw-cli/src/mcp_memory_handlers.rs` (`handle_memory_store`) | external client rows live in `external/` namespaces, which never read with a conversation scope |
+/// | `migrate-from-<platform>`       | `duduclaw-cli/src/migrate_from/apply.rs` | dynamic name; migrated content may hold other people's conversations |
+/// | `agent-import-<format>`         | `duduclaw-cli/src/expert/agent_config/slots.rs` | dynamic name; imported agent memory may hold other people's conversations |
+/// | `<migration id>`                | `duduclaw-gateway/src/migration_import.rs` | dynamic name; legacy import archive |
+/// | `agent_mood`, `curated`, `fact` | no production writer (tests / older rows only) | not enumerated by a writer, so fail closed |
+/// | empty / any other value         | — | unknown, so fail closed |
+pub const EXPLICIT_SOURCE_EVENTS: &[&str] = &["mcp_internal", "import"];
 
-/// Whether `source_event` names a host-generated row
-/// ([`HOST_GENERATED_SOURCE_EVENTS`]).
-pub fn is_host_generated(source_event: &str) -> bool {
-    HOST_GENERATED_SOURCE_EVENTS.contains(&source_event.trim())
+/// Whether `source_event` names an explicitly stored row
+/// ([`EXPLICIT_SOURCE_EVENTS`]), exempt from the same-conversation check.
+pub fn is_explicitly_stored(source_event: &str) -> bool {
+    EXPLICIT_SOURCE_EVENTS.contains(&source_event.trim())
 }
 
 impl SqliteMemoryEngine {
     /// Of `ids` (rows of `agent_id`), the ones a reader serving conversation
-    /// `session` may NOT see: a host-generated row
-    /// ([`HOST_GENERATED_SOURCE_EVENTS`]) unless it has at least one
-    /// `direct` / `inherited` lineage row and every such row has
-    /// `source_session = session`. Rows with any other `source_event` are
-    /// never hidden.
+    /// `session` may NOT see: every row that is not explicitly stored
+    /// ([`EXPLICIT_SOURCE_EVENTS`]) unless it has at least one `direct` /
+    /// `inherited` lineage row and every such row has
+    /// `source_session = session`. Explicitly stored rows are never hidden.
     ///
     /// Fail closed:
     /// * `session = None` or empty (the conversation is unknown) hides every
-    ///   host-generated row;
-    /// * a host-generated row with no lineage (written before P2-B), or with
-    ///   a source outside this conversation (another session, a dispatch run,
-    ///   `system:` / `untracked`), is hidden;
+    ///   row that is not explicitly stored;
+    /// * such a row with an empty or unknown `source_event`, no lineage
+    ///   (written before P2-B), or a source outside this conversation
+    ///   (another session, a dispatch run, `system:` / `untracked`), is
+    ///   hidden;
     /// * an id that is not a row of `agent_id` is hidden (callers only pass
     ///   ids they just read, so this only matters for a concurrent delete).
     pub async fn ids_hidden_from_conversation(
@@ -81,7 +108,7 @@ impl SqliteMemoryEngine {
                 hidden.insert(id.clone());
                 continue;
             };
-            if !is_host_generated(event.as_deref().unwrap_or("")) {
+            if is_explicitly_stored(event.as_deref().unwrap_or("")) {
                 continue;
             }
             let Some(session) = session else {
@@ -133,30 +160,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn host_generated_rows_are_scoped_to_their_conversation() {
+    async fn non_explicit_rows_are_scoped_to_their_conversation() {
         let engine = SqliteMemoryEngine::in_memory().unwrap();
         let a = put(&engine, "alpha fact", "conversation_distill", from_session("telegram:A", 1)).await;
         let b = put(&engine, "beta fact", "conversation_distill", from_session("telegram:B", 2)).await;
-        let stored = put(&engine, "explicit", "mcp_internal", from_session("telegram:A", 3)).await;
+        let stored = put(&engine, "explicit", "mcp_internal", from_session("telegram:B", 3)).await;
+        let imported = put(&engine, "imported", "import", Provenance::test_only()).await;
         let system = put(&engine, "system", "footprint_distill", Provenance::test_only()).await;
-        let ids = vec![a.clone(), b.clone(), stored.clone(), system.clone(), "missing".to_string()];
+        let ids = vec![
+            a.clone(),
+            b.clone(),
+            stored.clone(),
+            imported.clone(),
+            system.clone(),
+            "missing".to_string(),
+        ];
 
         let in_a = engine.ids_hidden_from_conversation("a1", &ids, Some("telegram:A")).await.unwrap();
         assert!(!in_a.contains(&a));
         assert!(in_a.contains(&b));
         assert!(!in_a.contains(&stored), "explicit rows are never hidden");
+        assert!(!in_a.contains(&imported), "operator imports are never hidden");
         assert!(in_a.contains(&system), "a non-conversation source is not this conversation");
         assert!(in_a.contains("missing"));
 
-        // Unknown conversation: every host-generated row is hidden.
+        // Unknown conversation: every row that is not explicitly stored is hidden.
         for unknown in [None, Some(""), Some("  ")] {
             let hidden = engine.ids_hidden_from_conversation("a1", &ids, unknown).await.unwrap();
             assert!(hidden.contains(&a) && hidden.contains(&b), "{unknown:?}");
-            assert!(!hidden.contains(&stored), "{unknown:?}");
+            assert!(!hidden.contains(&stored) && !hidden.contains(&imported), "{unknown:?}");
         }
     }
 
-    /// A host-generated row without lineage (written before P2-B) is hidden;
+    /// Allow-list, not deny-list: an empty, unknown or never-enumerated
+    /// `source_event` from another conversation is hidden; from this
+    /// conversation it is returned like any other row.
+    #[tokio::test]
+    async fn unenumerated_source_events_fail_closed() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        for event in ["", "never_enumerated_event", "decision_capture", "conversation_summary", "curated"] {
+            let row = put(&engine, "row", event, from_session("telegram:A", 1)).await;
+            let in_b = engine.ids_hidden_from_conversation("a1", &[row.clone()], Some("telegram:B")).await.unwrap();
+            assert!(in_b.contains(&row), "{event:?}");
+            let in_a = engine.ids_hidden_from_conversation("a1", &[row.clone()], Some("telegram:A")).await.unwrap();
+            assert!(in_a.is_empty(), "{event:?}");
+        }
+        assert_eq!(EXPLICIT_SOURCE_EVENTS, &["mcp_internal", "import"]);
+        assert!(is_explicitly_stored(" mcp_internal "));
+        for event in ["", "mcp_external", "curated", "user_profile", "Import"] {
+            assert!(!is_explicitly_stored(event), "{event:?}");
+        }
+    }
+
+    /// A row without lineage (written before P2-B) is hidden;
     /// a row derived from two conversations is visible in neither; a
     /// reaffirmation from another conversation does not change the answer.
     #[tokio::test]
