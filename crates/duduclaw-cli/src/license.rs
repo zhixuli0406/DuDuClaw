@@ -148,6 +148,25 @@ mod gateway_home_check_tests {
     use super::*;
 
     #[test]
+    fn container_hint_uses_generic_names_and_current_executable() {
+        for name in ["duduclaw", "duduclaw-pro"] {
+            let message = gateway_home_hint(std::path::Path::new("/data"),
+                Some(&std::path::Path::new("/usr/local/bin").join(name)));
+            assert!(message.contains("docker exec <容器名稱> <執行檔> license"));
+            assert!(message.contains("docker compose exec <服務名稱> <執行檔> license"));
+            assert!(!message.contains("docker compose exec duduclaw"));
+            assert!(!message.contains("docker compose exec gateway"));
+            assert!(message.contains(&format!("You just ran `{name}`")));
+            assert!(message.contains("docker ps"));
+        }
+        let current = std::env::current_exe().unwrap();
+        let message = gateway_home_hint(std::path::Path::new("/data"), Some(&current));
+        let known = matches!(current.file_name().and_then(|n| n.to_str()), Some("duduclaw" | "duduclaw-pro"));
+        assert_eq!(message.contains("You just ran"), known);
+        assert!(!gateway_home_hint(std::path::Path::new("/data"), None).contains("You just ran"));
+    }
+
+    #[test]
     fn missing_or_unlocked_gateway_home_is_not_in_use() {
         let home = tempfile::tempdir().unwrap();
         assert_eq!(gateway_home_check(home.path()), GatewayHomeStatus::NotHeld);
@@ -176,6 +195,20 @@ mod gateway_home_check_tests {
     }
 }
 
+fn gateway_home_hint(home: &std::path::Path, executable: Option<&std::path::Path>) -> String {
+    let name = executable.and_then(|path| path.file_name()).and_then(|name| name.to_str());
+    let likely = match name {
+        Some(name @ ("duduclaw" | "duduclaw-pro")) => format!(
+            "\n   您剛執行的是 `{name}`，容器內的執行檔可能也是 `{name}`。\n   You just ran `{name}`; this is also the likely executable inside the container."
+        ),
+        _ => String::new(),
+    };
+    format!(
+        "⚠️ 此資料目錄目前沒有執行中的 gateway：{}。容器版的資料存放在 Docker volume，授權指令必須在實際提供這套安裝服務的容器內執行。請用 `docker ps` 查詢容器名稱，再執行 `docker exec <容器名稱> <執行檔> license …` 或 `docker compose exec <服務名稱> <執行檔> license …`。執行檔請使用容器啟動時的程式：`duduclaw`，企業版映像則是 `duduclaw-pro`。\n   This data directory has no running gateway. Container installs keep data in a Docker volume; run the license command inside the container actually serving this installation. Find its name with `docker ps`, then use `docker exec <container-name> <executable> license …` or `docker compose exec <service-name> <executable> license …`. Use the executable the container was started with: `duduclaw`, or `duduclaw-pro` in the enterprise image.{likely}",
+        home.display()
+    )
+}
+
 fn check_gateway_home(strict: bool) -> Result<()> {
     let home = storage::license_dir().map_err(|e| DuDuClawError::License(format!("license directory: {e}")))?;
     match gateway_home_check(&home) {
@@ -186,10 +219,8 @@ fn check_gateway_home(strict: bool) -> Result<()> {
         }
         GatewayHomeStatus::NotHeld => {}
     }
-    let message = format!(
-        "⚠️ 此資料目錄目前沒有執行中的 gateway：{}。容器版的資料存放在 Docker volume，請在容器內更新授權：`docker compose exec duduclaw duduclaw license <activate|import|refresh|deactivate|rebind>`。\n   This data directory has no running gateway. Container installs keep data in the Docker volume; run the license command inside the container.",
-        home.display()
-    );
+    let executable = std::env::current_exe().ok();
+    let message = gateway_home_hint(&home, executable.as_deref());
     if strict {
         return Err(DuDuClawError::License(message));
     }

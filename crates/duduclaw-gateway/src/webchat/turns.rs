@@ -419,7 +419,7 @@ pub(super) fn configured_limit(home: &std::path::Path) -> usize {
     configured_bound(home, "max_in_flight_turns", 3)
 }
 
-pub(super) fn configured_global_limit(home: &std::path::Path) -> usize {
+pub(crate) fn configured_global_limit(home: &std::path::Path) -> usize {
     configured_bound(home, "max_global_turns", 10)
 }
 
