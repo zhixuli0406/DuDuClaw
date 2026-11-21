@@ -255,7 +255,110 @@ fn convert_script_cli_requires_one_selector_and_supports_preview_and_yes() {
     assert!(Args::try_parse_from(["memory", "convert-script"]).is_err());
     assert!(Args::try_parse_from(["memory", "convert-script", "--all", "--agent", "a"]).is_err());
     let args = Args::try_parse_from(["memory", "convert-script", "--agent", "a", "--dry-run"]).unwrap();
-    assert!(matches!(args.command, MemoryCommands::ConvertScript { agent: Some(_), all: false, dry_run: true, yes: false }));
+    assert!(matches!(args.command, MemoryCommands::ConvertScript { agent: Some(_), all: false, dry_run: true, yes: false, .. }));
     let args = Args::try_parse_from(["memory", "convert-script", "--all", "--yes"]).unwrap();
-    assert!(matches!(args.command, MemoryCommands::ConvertScript { agent: None, all: true, dry_run: false, yes: true }));
+    assert!(matches!(args.command, MemoryCommands::ConvertScript { agent: None, all: true, dry_run: false, yes: true, .. }));
+}
+
+#[test]
+fn script_language_policy_filters_all_and_requires_explicit_override() {
+    assert!(script_language_policy(true, true, Some("zh-TW"), false).is_ok());
+    for language in [Some("zh-CN"), Some("ja-JP"), Some("en"), None] {
+        assert!(script_language_policy(true, true, language, false).is_err());
+    }
+    assert!(script_language_policy(true, false, Some("zh-TW"), false).is_err());
+    for language in [Some("zh-CN"), Some("ja-JP")] {
+        assert!(script_language_policy(false, true, language, false).is_err());
+        assert!(script_language_policy(false, true, language, true).is_ok());
+    }
+    assert!(script_language_policy(false, false, None, false).is_ok());
+}
+
+#[test]
+fn convert_script_restore_and_force_flags_are_exclusive() {
+    use clap::Parser;
+    #[derive(Parser)]
+    struct Args { #[command(subcommand)] command: MemoryCommands }
+    assert!(Args::try_parse_from(["memory", "convert-script", "--restore", "backup.jsonl"]).is_ok());
+    for conflicting in ["--all", "--dry-run", "--yes", "--force-language-mismatch"] {
+        assert!(Args::try_parse_from(["memory", "convert-script", "--restore", "backup.jsonl", conflicting]).is_err());
+    }
+    assert!(Args::try_parse_from(["memory", "convert-script", "--all", "--force-language-mismatch"]).is_err());
+    assert!(Args::try_parse_from(["memory", "convert-script", "--agent", "a", "--force-language-mismatch"]).is_ok());
+}
+
+async fn script_db(home: &Path, agents: &[&str]) {
+    let engine = SqliteMemoryEngine::new(&home.join("memory.db")).unwrap();
+    drop(engine);
+    let conn = rusqlite::Connection::open(home.join("memory.db")).unwrap();
+    for id in agents {
+        conn.execute("INSERT INTO memories(id, agent_id, content, timestamp) VALUES (?1, ?1, '用户记忆', '2026-11-21')", [id]).unwrap();
+        conn.execute("INSERT INTO memories_fts(content, agent_id, memory_id) VALUES ('用户记忆', ?1, ?1)", [id]).unwrap();
+    }
+}
+
+fn script_text(home: &Path, id: &str) -> String {
+    rusqlite::Connection::open(home.join("memory.db")).unwrap()
+        .query_row("SELECT content FROM memories WHERE id = ?1", [id], |r| r.get(0)).unwrap()
+}
+
+#[tokio::test]
+async fn convert_script_all_filters_languages_and_orphans_from_home_config() {
+    let _operator = crate::ai_session_guard::test_session(&[]);
+    let home = home_with(&["tw", "cn", "jp", "en", "auto"]);
+    std::fs::write(home.path().join("config.toml"), "[general]\ndefault_language = 'zh-TW'").unwrap();
+    for (id, setting) in [("tw", "[memory]\nlanguage = 'zh-TW'"), ("cn", "[memory]\nlanguage = 'zh-CN'"),
+        ("jp", "[prompt]\nreply_language = 'ja-JP'"), ("en", "[prompt]\nreply_language = 'en'"), ("auto", "[prompt]\nreply_language = 'auto'")] {
+        std::fs::write(home.path().join("agents").join(id).join("agent.toml"), setting).unwrap();
+    }
+    script_db(home.path(), &["tw", "cn", "jp", "en", "auto", "orphan"]).await;
+    convert_script(home.path(), None, true, false, None, false).await.unwrap();
+    assert_eq!(script_text(home.path(), "tw"), "用戶記憶");
+    for id in ["cn", "jp", "en", "auto", "orphan"] { assert_eq!(script_text(home.path(), id), "用户记忆"); }
+    let backups = std::fs::read_dir(home.path().join("backups")).unwrap().collect::<Vec<_>>();
+    assert_eq!(backups.len(), 1);
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(home.path().join("backups")).unwrap().permissions().mode() & 0o777, 0o700);
+    }
+}
+
+#[tokio::test]
+async fn convert_script_explicit_mismatch_refuses_until_forced_and_restore_works() {
+    let _operator = crate::ai_session_guard::test_session(&[]);
+    let home = home_with(&["cn"]);
+    std::fs::write(home.path().join("agents/cn/agent.toml"), "[memory]\nlanguage = 'zh-CN'").unwrap();
+    script_db(home.path(), &["cn"]).await;
+    assert!(convert_script(home.path(), Some("cn".into()), false, false, None, false).await.is_err());
+    assert_eq!(script_text(home.path(), "cn"), "用户记忆");
+    convert_script(home.path(), Some("cn".into()), false, false, None, true).await.unwrap();
+    assert_eq!(script_text(home.path(), "cn"), "用戶記憶");
+    let backup = std::fs::read_dir(home.path().join("backups")).unwrap().next().unwrap().unwrap().path();
+    convert_script(home.path(), None, false, true, Some(backup), false).await.unwrap();
+    assert_eq!(script_text(home.path(), "cn"), "用户记忆");
+}
+
+#[tokio::test]
+async fn convert_script_all_continues_after_failure_and_returns_error() {
+    let _operator = crate::ai_session_guard::test_session(&[]);
+    let home = home_with(&["a-broken", "z-good"]);
+    std::fs::write(home.path().join("config.toml"), "[memory]\nlanguage = 'zh-TW'").unwrap();
+    script_db(home.path(), &["a-broken", "z-good"]).await;
+    let conn = rusqlite::Connection::open(home.path().join("memory.db")).unwrap();
+    conn.execute_batch("CREATE TRIGGER reject_one BEFORE UPDATE OF content ON memories WHEN OLD.agent_id = 'a-broken' BEGIN SELECT RAISE(ABORT, 'test failure'); END;").unwrap();
+    drop(conn);
+    assert!(convert_script(home.path(), None, true, false, None, false).await.is_err());
+    assert_eq!(script_text(home.path(), "a-broken"), "用户记忆");
+    assert_eq!(script_text(home.path(), "z-good"), "用戶記憶");
+}
+
+#[tokio::test]
+async fn convert_script_ai_session_refusal_is_audited_before_opening_db() {
+    let home = home_with(&[]);
+    let _employee = crate::ai_session_guard::test_session(&[(duduclaw_core::ENV_AGENT_ID, "alice")]);
+    let error = convert_script(home.path(), Some("alice".into()), false, false, None, false).await.unwrap_err();
+    assert!(error.to_string().contains("AI employee session"));
+    let audit = std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap();
+    assert!(audit.contains("memory_script_conversion_refused"));
+    assert!(!home.path().join("memory.db").exists());
 }

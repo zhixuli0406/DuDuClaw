@@ -520,3 +520,17 @@ fn an_employee_cannot_turn_its_own_workspace_switch_on() {
         GuardDecision::BlockedProtectedField { .. }
     ));
 }
+
+#[test]
+fn memory_language_is_frozen_but_siblings_stay_editable() {
+    for (before, after) in [
+        ("[memory]\ndecision_ttl_days = 7", "[memory]\ndecision_ttl_days = 7\nlanguage = 'en'"),
+        ("[memory]\nlanguage = 'en'", "[memory]\nlanguage = 'zh-TW'"),
+        ("[memory]\nlanguage = 'en'", "[memory]"),
+    ] {
+        let d = as_agent(&with(before), &with(after));
+        assert!(matches!(d, GuardDecision::BlockedAgentSecuritySection { .. }), "{d:?}");
+    }
+    assert_eq!(as_agent(&with("[memory]\nlanguage = 'en'\ndecision_ttl_days = 7\ndecision_continuity = false"),
+        &with("[memory]\nlanguage = 'en'\ndecision_ttl_days = 14\ndecision_continuity = true")), GuardDecision::AllowedAgentWrite);
+}

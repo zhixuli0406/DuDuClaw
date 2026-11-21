@@ -271,3 +271,104 @@ mod tests {
         assert!(!contains_simplified(s));
     }
 }
+
+/// Kana marks Japanese text, including half-width Katakana.
+pub fn contains_kana(text: &str) -> bool {
+    text.chars().any(|c| matches!(c, '\u{3040}'..='\u{30ff}' | '\u{ff66}'..='\u{ff9f}'))
+}
+
+/// Convert prose while preserving code spans, fenced blocks and URLs.
+pub fn to_traditional_preserving_literals(text: &str) -> String {
+    let mut output = String::new();
+    let mut fence: Option<(char, usize)> = None;
+    let mut inline = 0;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        let marker = trimmed.chars().next().unwrap_or(' ');
+        let run = trimmed.chars().take_while(|c| *c == marker).count();
+        if let Some((open, length)) = fence {
+            output.push_str(line);
+            if marker == open && run >= length && trimmed.chars().skip(run).all(char::is_whitespace) {
+                fence = None;
+            }
+            continue;
+        }
+        if inline == 0 && matches!(marker, '`' | '~') && run >= 3 {
+            fence = Some((marker, run));
+            output.push_str(line);
+            continue;
+        }
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = 0;
+        let mut prose = String::new();
+        while i < chars.len() {
+            if chars[i] == '`' {
+                output.push_str(&to_traditional(&prose));
+                prose.clear();
+                let count = chars.iter().skip(i).take_while(|c| **c == '`').count();
+                if inline == 0 { inline = count; } else if inline == count { inline = 0; }
+                output.extend(std::iter::repeat_n('`', count));
+                i += count;
+            } else if inline > 0 {
+                output.push(chars[i]);
+                i += 1;
+            } else if chars[i] == '(' && i > 0 && chars[i - 1] == ']' {
+                // Markdown destinations can also be relative URLs with CJK paths.
+                output.push_str(&to_traditional(&prose));
+                prose.clear();
+                let mut depth = 0usize;
+                let mut escaped = false;
+                while i < chars.len() {
+                    let c = chars[i];
+                    output.push(c);
+                    i += 1;
+                    if !escaped {
+                        if c == '(' { depth += 1; }
+                        if c == ')' { depth = depth.saturating_sub(1); }
+                    }
+                    escaped = c == '\\' && !escaped;
+                    if depth == 0 { break; }
+                }
+            } else {
+                let boundary = i == 0 || !chars[i - 1].is_ascii_alphanumeric();
+                let scheme_len = if boundary && chars[i].is_ascii_alphabetic() {
+                    chars.iter().skip(i).take_while(|c| c.is_ascii_alphanumeric() || matches!(**c, '+' | '-' | '.')).count()
+                } else { 0 };
+                let scheme_url = scheme_len > 0 && chars.iter().skip(i + scheme_len).copied().take(3).eq("://".chars());
+                let other_url = ["mailto:", "www."].iter().any(|prefix| {
+                    chars.len() - i >= prefix.len() && chars.iter().skip(i).zip(prefix.chars())
+                        .all(|(left, right)| left.eq_ignore_ascii_case(&right))
+                });
+                if scheme_url || other_url {
+                    output.push_str(&to_traditional(&prose));
+                    prose.clear();
+                    while i < chars.len() && !chars[i].is_whitespace() {
+                        output.push(chars[i]);
+                        i += 1;
+                    }
+                } else {
+                    prose.push(chars[i]);
+                    i += 1;
+                }
+            }
+        }
+        output.push_str(&to_traditional(&prose));
+    }
+    output
+}
+
+#[cfg(test)]
+mod literal_tests {
+    use super::*;
+    #[test]
+    fn preserves_urls_code_and_fences() {
+        let text = "用户 https://站/用户 `用户`\n```\n用户\n```\n记忆";
+        assert_eq!(to_traditional_preserving_literals(text), "用戶 https://站/用户 `用户`\n```\n用户\n```\n記憶");
+        assert_eq!(to_traditional_preserving_literals("用户 http://站/用户<档案 用户"), "用戶 http://站/用户<档案 用戶");
+    }
+    #[test]
+    fn detects_full_and_half_width_kana() {
+        for text in ["会います", "カタカナ", "ｶﾀｶﾅ"] { assert!(contains_kana(text)); }
+        assert!(!contains_kana("用戶"));
+    }
+}

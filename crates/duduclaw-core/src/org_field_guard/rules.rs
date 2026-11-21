@@ -196,12 +196,14 @@ pub const AGENT_EDITABLE_SECTIONS: &[&str] = &[
 /// - `[prompt] cli_bare_mode` — adds `--bare`, which makes the Claude CLI skip
 ///   hooks (this one included).
 /// - `[prompt] reply_language` — administrator-set reply language.
+/// - `[memory] language` — administrator-set memory language.
 /// - `[model] account_pool` — which rotator accounts (whose credentials and
 ///   quota) the agent may spend.
 pub const AGENT_SECURITY_KEYS: &[(&str, &[&str])] = &[
     ("agent", &["role", "status"]),
     ("prompt", &["cli_bare_mode", "reply_language"]),
     ("model", &["account_pool"]),
+    ("memory", &["language"]),
 ];
 
 /// Top-level directories under `<home>` that an agent caller may still write
@@ -521,6 +523,15 @@ pub(super) const FROZEN_FIELDS: &[FrozenField] = &[
         verdict: FrozenVerdict::AgentSecuritySection,
         callers: FrozenCallers::AgentsOnly,
     },
+    FrozenField {
+        kind: ProtectedTomlKind::AgentToml,
+        shape: FrozenShape::ValueKeys {
+            section: AGENT_SECURITY_KEYS[3].0,
+            keys: AGENT_SECURITY_KEYS[3].1,
+        },
+        verdict: FrozenVerdict::AgentSecuritySection,
+        callers: FrozenCallers::AgentsOnly,
+    },
 ];
 
 /// The `agent.toml` table the org fields live under.
@@ -531,7 +542,7 @@ pub(super) const AGENT_SECTION: &str = "agent";
 /// out of sync with the constant other code imports.
 const _: () = assert!(CONFIG_PROTECTED_SECTIONS.len() == 2);
 
-const _: () = assert!(AGENT_SECURITY_KEYS.len() == 3);
+const _: () = assert!(AGENT_SECURITY_KEYS.len() == 4);
 
 /// Every frozen entry that applies to `kind` for **every** caller, in table
 /// order — the pre-G1 contract of [`super::check_protected_toml_write`].

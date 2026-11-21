@@ -127,17 +127,16 @@ fn valid_memory_language(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|v| *v != "auto" && duduclaw_core::profile_sections::is_valid_reply_language(v))
 }
 
-/// Employee memory override, global memory override, then effective fixed-message language.
+/// Employee memory override, global memory override, then effective reply language.
 pub async fn resolve_memory_language(home: &Path, agent: &duduclaw_core::types::AgentConfig) -> Option<String> {
-    let global = read_memory_language(home).await;
-    valid_memory_language(agent.memory.language.as_deref()).map(str::to_string)
-        .or(global).or(resolve_fixed_message_language(home, agent).await.filter(|v| valid_memory_language(Some(v)).is_some()))
-}
-
-async fn read_memory_language(home: &Path) -> Option<String> {
-    let text = tokio::fs::read_to_string(home.join("config.toml")).await.ok()?;
-    let table: toml::Table = text.parse().ok()?;
-    valid_memory_language(table.get("memory")?.get("language")?.as_str()).map(str::to_string)
+    let global = tokio::fs::read_to_string(home.join("config.toml")).await.ok()
+        .and_then(|s| s.parse::<toml::Table>().ok());
+    duduclaw_core::profile_sections::resolve_memory_language_setting(
+        agent.memory.language.as_deref(),
+        global.as_ref().and_then(|t| t.get("memory")?.get("language")?.as_str()),
+        agent.prompt.reply_language.as_deref(),
+        global.as_ref().and_then(|t| t.get("general")?.get("default_language")?.as_str()),
+    )
 }
 
 pub async fn resolve_memory_language_for_id(home: &Path, id: &str) -> Option<String> {
@@ -145,18 +144,18 @@ pub async fn resolve_memory_language_for_id(home: &Path, id: &str) -> Option<Str
     let employee = if safe {
         tokio::fs::read_to_string(home.join("agents").join(id).join("agent.toml")).await.ok()
             .and_then(|s| s.parse::<toml::Table>().ok())
-            .and_then(|t| t.get("memory")?.get("language")?.as_str().map(str::to_string))
     } else { None };
-    valid_memory_language(employee.as_deref()).map(str::to_string)
-        .or(read_memory_language(home).await)
-        .or(resolve_fixed_message_language_for_id(home, id).await.filter(|v| valid_memory_language(Some(v)).is_some()))
+    let global = tokio::fs::read_to_string(home.join("config.toml")).await.ok()
+        .and_then(|s| s.parse::<toml::Table>().ok());
+    duduclaw_core::profile_sections::resolve_memory_language_tables(employee.as_ref(), global.as_ref())
 }
 
 /// Unconfigured utilities follow the conversation, pinning Traditional script when detected.
 pub fn memory_prompt_language(language: Option<&str>, input: &str) -> &'static str {
     let language = valid_memory_language(language);
     let code = language.or_else(|| {
-        (duduclaw_core::dominant_variant(input) == duduclaw_core::ChineseVariant::Traditional).then_some("zh-TW")
+        (!duduclaw_core::zh_variant::contains_kana(input)
+            && duduclaw_core::dominant_variant(input) == duduclaw_core::ChineseVariant::Traditional).then_some("zh-TW")
     });
     code.map(duduclaw_core::profile_sections::memory_language_instruction)
         .unwrap_or("Same language as input. Use the main language of the conversation.")
@@ -166,6 +165,7 @@ pub fn memory_prompt_language(language: Option<&str>, input: &str) -> &'static s
 pub fn align_memory_script(output: &str, language: Option<&str>, input: &str) -> String {
     if valid_memory_language(language) == Some("zh-TW")
         || (valid_memory_language(language).is_none()
+            && !duduclaw_core::zh_variant::contains_kana(input)
             && duduclaw_core::dominant_variant(input) == duduclaw_core::ChineseVariant::Traditional) {
         duduclaw_core::to_traditional(output)
     } else { output.to_string() }
@@ -175,6 +175,14 @@ pub fn align_memory_script(output: &str, language: Option<&str>, input: &str) ->
 mod tests {
     use super::*;
 
+    #[test]
+    fn unresolved_japanese_never_pins_or_converts_chinese_script() {
+        for input in ["会社の会議です", "ユーザーの国", "ｶﾀｶﾅ 用户"] {
+            assert!(!memory_prompt_language(None, input).contains("Traditional Chinese"));
+            assert_eq!(align_memory_script("用户会话", None, input), "用户会话");
+        }
+    }
+
     #[tokio::test]
     async fn memory_language_resolution_order_table() {
         for (employee, global, reply, default, expected) in [
@@ -182,7 +190,8 @@ mod tests {
             (Some("auto"), Some("en"), Some("ja-JP"), None, Some("en")),
             (Some("invalid"), Some("en"), None, None, Some("en")),
             (None, Some("auto"), Some("ja-JP"), Some("en"), Some("ja-JP")),
-            (None, Some("invalid"), Some("auto"), Some("en"), Some("en")),
+            (None, Some("invalid"), Some("auto"), Some("en"), None),
+            (None, None, Some("auto"), Some("zh-TW"), None),
             (None, None, None, None, None),
             (Some("auto"), Some("auto"), Some("auto"), None, None),
         ] {
@@ -414,82 +423,7 @@ pub fn with_channel_reply_language_reminder(message: String, language: Option<&s
 /// Preserve code (including variable-length fences/spans) and URL bytes verbatim.
 pub(crate) fn normalize_channel_reply(text: &str, language: Option<&str>) -> String {
     if language != Some("zh-TW") { return text.to_string(); }
-    let mut output = String::new();
-    let mut fence: Option<(char, usize)> = None;
-    let mut inline = 0;
-    for line in text.split_inclusive('\n') {
-        let trimmed = line.trim_start();
-        let marker = trimmed.chars().next().unwrap_or(' ');
-        let run = trimmed.chars().take_while(|c| *c == marker).count();
-        if let Some((open, length)) = fence {
-            output.push_str(line);
-            if marker == open && run >= length && trimmed.chars().skip(run).all(char::is_whitespace) {
-                fence = None;
-            }
-            continue;
-        }
-        if inline == 0 && matches!(marker, '`' | '~') && run >= 3 {
-            fence = Some((marker, run));
-            output.push_str(line);
-            continue;
-        }
-        let chars: Vec<char> = line.chars().collect();
-        let mut i = 0;
-        let mut prose = String::new();
-        while i < chars.len() {
-            if chars[i] == '`' {
-                output.push_str(&duduclaw_core::zh_variant::to_traditional(&prose));
-                prose.clear();
-                let count = chars.iter().skip(i).take_while(|c| **c == '`').count();
-                if inline == 0 { inline = count; } else if inline == count { inline = 0; }
-                output.extend(std::iter::repeat_n('`', count));
-                i += count;
-            } else if inline > 0 {
-                output.push(chars[i]);
-                i += 1;
-            } else if chars[i] == '(' && i > 0 && chars[i - 1] == ']' {
-                // Markdown destinations can also be relative URLs with CJK paths.
-                output.push_str(&duduclaw_core::zh_variant::to_traditional(&prose));
-                prose.clear();
-                let mut depth = 0usize;
-                let mut escaped = false;
-                while i < chars.len() {
-                    let c = chars[i];
-                    output.push(c);
-                    i += 1;
-                    if !escaped {
-                        if c == '(' { depth += 1; }
-                        if c == ')' { depth = depth.saturating_sub(1); }
-                    }
-                    escaped = c == '\\' && !escaped;
-                    if depth == 0 { break; }
-                }
-            } else {
-                let boundary = i == 0 || !chars[i - 1].is_ascii_alphanumeric();
-                let scheme_len = if boundary && chars[i].is_ascii_alphabetic() {
-                    chars.iter().skip(i).take_while(|c| c.is_ascii_alphanumeric() || matches!(**c, '+' | '-' | '.')).count()
-                } else { 0 };
-                let scheme_url = scheme_len > 0 && chars.iter().skip(i + scheme_len).copied().take(3).eq("://".chars());
-                let other_url = ["mailto:", "www."].iter().any(|prefix| {
-                    chars.len() - i >= prefix.len() && chars.iter().skip(i).zip(prefix.chars())
-                        .all(|(left, right)| left.eq_ignore_ascii_case(&right))
-                });
-                if scheme_url || other_url {
-                    output.push_str(&duduclaw_core::zh_variant::to_traditional(&prose));
-                    prose.clear();
-                    while i < chars.len() && !chars[i].is_whitespace() && !matches!(chars[i], '<' | '>' | '`') {
-                        output.push(chars[i]);
-                        i += 1;
-                    }
-                } else {
-                    prose.push(chars[i]);
-                    i += 1;
-                }
-            }
-        }
-        output.push_str(&duduclaw_core::zh_variant::to_traditional(&prose));
-    }
-    output
+    duduclaw_core::zh_variant::to_traditional_preserving_literals(text)
 }
 
 #[cfg(test)]

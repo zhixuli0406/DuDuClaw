@@ -726,7 +726,7 @@ pub fn build_cloud_ingest_prompt_with_privacy_and_language(
     language: Option<&str>,
 ) -> String {
     let input = format!("{user_text}\n{assistant_reply}");
-    let language_rule = crate::prompt_identity::memory_prompt_language(language, &input);
+    let language_rule = json_memory_language_instruction(language, &input);
     // Case-insensitive XML tag escape to prevent prompt injection
     // Handles Unicode case folding; see `crate::xml_fence`.
     use crate::xml_fence::escape_xml_tag;
@@ -931,7 +931,7 @@ pub fn build_cloud_ingest_prompt_with_knowledge_and_privacy_and_language(
     language: Option<&str>,
 ) -> String {
     let input = format!("{user_text}\n{assistant_reply}");
-    let language_rule = crate::prompt_identity::memory_prompt_language(language, &input);
+    let language_rule = json_memory_language_instruction(language, &input);
     use crate::xml_fence::escape_xml_tag;
     let safe_user = escape_xml_tag(user_text, "user");
     let safe_assistant = escape_xml_tag(assistant_reply, "assistant");
@@ -1761,7 +1761,7 @@ async fn run_ingest_inner(
 
     let tier = classify_for_ingest(user_text, assistant_reply);
 
-    let facts = match tier {
+    let (facts, model_produced) = match tier {
         IngestTier::Skip => {
             info!(
                 agent = agent_id,
@@ -1771,7 +1771,7 @@ async fn run_ingest_inner(
         }
         IngestTier::Local => {
             info!(agent = agent_id, "Conversation distill: local extraction");
-            extract_local_facts_with_language(user_text, assistant_reply, memory_language.as_deref())
+            (extract_local_facts_with_language(user_text, assistant_reply, memory_language.as_deref()), false)
         }
         IngestTier::Cloud => {
             info!(agent = agent_id, "Conversation distill: cloud extraction");
@@ -1800,14 +1800,14 @@ async fn run_ingest_inner(
                 .map_err(|e| e.to_string()),
             };
             match dispatched {
-                Ok(response) => cloud_reply_facts(agent_id, &response),
+                Ok(response) => (cloud_reply_facts(agent_id, &response), true),
                 Err(e) => {
                     warn!(
                         agent = agent_id,
                         "Conversation distill: cloud extraction failed: {e}"
                     );
                     // Fallback to local extraction
-                    extract_local_facts_with_language(user_text, assistant_reply, memory_language.as_deref())
+                    (extract_local_facts_with_language(user_text, assistant_reply, memory_language.as_deref()), false)
                 }
             }
         }
@@ -1818,7 +1818,8 @@ async fn run_ingest_inner(
         return;
     }
 
-    persist_facts(agent_id, home_dir, memory_db, align_distilled_facts(facts, memory_language.as_deref(), &language_input), sources).await;
+    let facts = if model_produced { align_distilled_facts(facts, memory_language.as_deref(), &language_input) } else { facts };
+    persist_facts(agent_id, home_dir, memory_db, facts, sources).await;
 }
 
 fn align_distilled_facts(mut facts: Vec<DistilledFact>, language: Option<&str>, input: &str) -> Vec<DistilledFact> {
@@ -5593,4 +5594,9 @@ mod tests {
             .any(|v| v["event_type"] == AUDIT_SUPERSESSION_REFUSED
                 && v["details"]["not_held_reason"] == "too_long"));
     }
+}
+
+fn json_memory_language_instruction(language: Option<&str>, input: &str) -> String {
+    let rule = crate::prompt_identity::memory_prompt_language(language, input).replace("the output", "these natural-language values");
+    format!("For natural-language VALUES only (content, page_title and summary where present): {rule} Keep every JSON key and subject, predicate, object identifier-style values, doc_type and page_slug exactly as specified. ASCII identifiers stay ASCII.")
 }

@@ -236,6 +236,7 @@ impl MethodHandler {
                             "deny_phrases": cfg.guardrails.deny_phrases,
                         },
                         "memory": {
+                            "language": cfg.memory.language,
                             "decision_continuity": cfg.memory.decision_continuity,
                             "decision_ttl_days": cfg.memory.decision_ttl_days,
                         },
