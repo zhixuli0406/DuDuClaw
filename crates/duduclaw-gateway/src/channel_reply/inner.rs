@@ -458,9 +458,10 @@ async fn build_reply_with_session_inner_impl(
     // snapshot, and never parse defaults for an unreadable file). A read
     // failure is refused by the gate below, before anything else runs.
     let initial_runtime_settings = agent
-        .map(|a| crate::runtime_config::load_runtime_settings_strict(&a.dir));
+        .map(|a| crate::runtime_config::load_runtime_settings_strict(&a.dir)
+            .and_then(|settings| settings.preferred_or_default().map(|model| (settings, model))));
     let model = match initial_runtime_settings.as_ref() {
-        Some(Ok(settings)) => settings.preferred_or_default(),
+        Some(Ok((_, model))) => model.clone(),
         // Refused at the gate; this value is never used for a call.
         Some(Err(_)) => String::new(),
         None => duduclaw_core::types::DEFAULT_PREFERRED_MODEL.to_string(),
@@ -512,10 +513,14 @@ async fn build_reply_with_session_inner_impl(
     // call re-checks a re-read pair.
     if let Some(dir) = agent_dir.as_deref() {
         let refusal = match initial_runtime_settings.as_ref() {
-            Some(Ok(settings)) => super::model_alignment_gate(
+            Some(Ok((settings, _))) => super::model_alignment_gate(
                 ctx, session_id, &agent_id, &turn_id, &model, settings.provider, None,
             ).await.err(),
-            Some(Err(error)) => {
+            Some(Err(error @ (crate::runtime_config::RuntimeSettingsError::Missing
+                | crate::runtime_config::RuntimeSettingsError::Unreadable
+                | crate::runtime_config::RuntimeSettingsError::Malformed
+                | crate::runtime_config::RuntimeSettingsError::UnknownProvider
+                | crate::runtime_config::RuntimeSettingsError::MissingModel))) => {
                 warn!(agent = %agent_id, kind = error.as_str(), dir = %dir.display(),
                     "employee runtime settings unreadable — turn refused before any side effect");
                 Some(super::agent_config_refusal(ctx, &agent_id, &turn_id).await)
