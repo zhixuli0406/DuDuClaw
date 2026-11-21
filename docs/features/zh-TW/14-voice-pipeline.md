@@ -54,7 +54,7 @@ stt_command   = "whisper-cli -m /models/ggml-base.bin -f {audio} --output-txt --
 
 `command` 供應商會執行 Admin 設定的外部程式；DuDuClaw 不附帶合成程式。透過「設定 → 語音」設定 `tts_provider = "command"` 與 `tts_command = "/path/to/my-tts --in {input} --out {output}"`。指令字串以空白切分為 argv，不經 shell；`{input}`、`{output}` 會各自替換成一個 argv 項目。文字寫入私有暫存目錄的 `input.txt`，程式須將音訊位元組寫入 `output.audio`。指令逾時為 60 秒，且只接收 `PATH`、`HOME`、`USERPROFILE`、`TEMP`、`TMP`、`SYSTEMROOT` 環境變數。`auto` 會在其他既有供應商之後才嘗試此供應商。
 
-從 **設定 → 語音** 下載 Kokoro（約 134 MB，Apache-2.0）。安裝會驗證檔案與共用 ONNX Runtime，下載中斷後可續傳；模型權重不內含於執行檔。模型位於 `<home>/models/kokoro-zh/`。預設聲音為 `zf_001`，另提供 `zm_010` 與純英文用的 `af_maple`。中文帶有中國大陸口音，多音字可能誤讀。繁體字與數字會正規化，但發音規則無法涵蓋所有詞語。輸入上限 2,000 字，每段最多 500 tokens，段落間加入 150 ms 靜音。Kokoro 輸出 24 kHz WAV；Telegram 透過 `sendAudio` 收到 `reply.wav`。
+從 **設定 → 語音** 下載 Kokoro（約 134 MB，Apache-2.0）。安裝會驗證檔案與共用 ONNX Runtime，下載中斷或取消後，下次會重新下載；模型權重不內含於執行檔。模型位於 `<home>/models/kokoro-zh/`。預設聲音為 `zf_001`，另提供 `zm_010` 與純英文用的 `af_maple`。中文帶有中國大陸口音，多音字可能誤讀。繁體字與數字會正規化，但發音規則無法涵蓋所有詞語。輸入上限 2,000 字，每段最多 500 tokens，段落間加入 150 ms 靜音。Kokoro 輸出 24 kHz WAV；Telegram 透過 `sendAudio` 收到 `reply.wav`。
 
 Azure 會將文字傳送至 Microsoft。請在 gateway 環境設定 `AZURE_SPEECH_KEY` 與 `AZURE_SPEECH_REGION`。預設中文聲音為 `zh-TW-HsiaoChenNeural`，英文為 `en-US-AriaNeural`，輸出 MP3。`tts_voice` 可指定該供應商支援的聲音。
 

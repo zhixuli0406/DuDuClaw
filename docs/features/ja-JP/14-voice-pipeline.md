@@ -54,7 +54,7 @@ stt_command   = "whisper-cli -m /models/ggml-base.bin -f {audio} --output-txt --
 
 `command` プロバイダーは Admin が設定した外部プログラムを実行します。DuDuClaw に合成プログラムは同梱されません。「設定 → 音声」で `tts_provider = "command"` と `tts_command = "/path/to/my-tts --in {input} --out {output}"` を設定してください。コマンド文字列は空白で argv に分割し、shell は使いません。`{input}` と `{output}` はそれぞれ1つの argv 項目としてパスに置換されます。テキストはプライベートな一時ディレクトリの `input.txt` に書き込まれ、プログラムは音声バイト列を `output.audio` に書き込みます。タイムアウトは60秒で、環境変数は `PATH`、`HOME`、`USERPROFILE`、`TEMP`、`TMP`、`SYSTEMROOT` のみです。`auto` では既存の他プロバイダーの後に試します。
 
-**設定 → 音声** から Kokoro をダウンロードします（約 134 MB、Apache-2.0）。インストール時にファイルと共有 ONNX Runtime を検証し、中断したダウンロードは再開できます。モデルの重みはバイナリに含まれません。保存先は `<home>/models/kokoro-zh/`。既定音声は `zf_001`、ほかに `zm_010` と英語専用の `af_maple` を選べます。中国語は中国大陸のアクセントで、多音字を誤読する場合があります。繁体字と数値を正規化しますが、すべての単語の発音を網羅するものではありません。入力上限は 2,000 文字、各チャンクは最大 500 tokens、間に 150 ms の無音を追加します。Kokoro は 24 kHz WAV を出力し、Telegram には `sendAudio` で `reply.wav` を送ります。
+**設定 → 音声** から Kokoro をダウンロードします（約 134 MB、Apache-2.0）。インストール時にファイルと共有 ONNX Runtime を検証し、中断またはキャンセルしたダウンロードは、次回最初からやり直します。モデルの重みはバイナリに含まれません。保存先は `<home>/models/kokoro-zh/`。既定音声は `zf_001`、ほかに `zm_010` と英語専用の `af_maple` を選べます。中国語は中国大陸のアクセントで、多音字を誤読する場合があります。繁体字と数値を正規化しますが、すべての単語の発音を網羅するものではありません。入力上限は 2,000 文字、各チャンクは最大 500 tokens、間に 150 ms の無音を追加します。Kokoro は 24 kHz WAV を出力し、Telegram には `sendAudio` で `reply.wav` を送ります。
 
 Azure はテキストを Microsoft に送信します。gateway 環境に `AZURE_SPEECH_KEY` と `AZURE_SPEECH_REGION` を設定してください。中国語の既定音声は `zh-TW-HsiaoChenNeural`、英語は `en-US-AriaNeural` で、MP3 を返します。`tts_voice` でプロバイダーの対応音声を指定できます。
 

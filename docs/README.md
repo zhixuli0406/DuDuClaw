@@ -173,6 +173,7 @@ New: [Add teammates and first login](guides/user-management-and-first-login.md) 
 |----------|-------------|--------|
 | [guides/tui.md](guides/tui.md) | Terminal control room with decision cards and streaming inbox; password or OTP login, SSH, security limits, settings and keys ([zh-TW](guides/zh-TW/tui.md), [ja-JP](guides/ja-JP/tui.md)) | Current |
 | [guides/memory-and-knowledge.md](guides/memory-and-knowledge.md) | 記憶與知識庫完整使用說明（兩者差異、知識庫寫入/分類/L0–L3 層級、自動帶入 vs 主動搜尋、記憶刪除、FAQ） | Current |
+| [guides/memory-convert-script.md](guides/memory-convert-script.md) | Converting existing Simplified-Chinese memories to Traditional Chinese with `duduclaw memory convert-script` (v1.84.0): preview, `--yes`, `--agent`/`--all`, restore file and `--restore`, what is and is not converted ([zh-TW](guides/zh-TW/memory-convert-script.md), [ja-JP](guides/ja-JP/memory-convert-script.md)) | Current |
 | [guides/memory-vs-knowledge.html](guides/memory-vs-knowledge.html) | 記憶 vs 知識庫（終端使用者版，自包含 HTML，可直接寄給客戶；WP5c 全自動分流上線後改寫） | Current |
 | [guides/goal-loop.md](guides/goal-loop.md) | 自主目標迴圈（`/goal` 入口、AutonomyLevel 五級、`[goal_loop]`/`[dispatch]`/`[dispatch_guard]` 設定、needs_human 按鈕） | Current |
 | [guides/reviewable-workflow-drafts.md](guides/reviewable-workflow-drafts.md) | 審查證據與工作流程草稿（擷取快照、接受最新快照、五種試跑與負面案例規則、送審與管理者核准、私有任務的可見對象與通知、啟用後的執行與暫停；另有 [zh-TW](guides/zh-TW/reviewable-workflow-drafts.md)、[ja-JP](guides/ja-JP/reviewable-workflow-drafts.md)） | Current |
@@ -185,7 +186,7 @@ New: [Add teammates and first login](guides/user-management-and-first-login.md) 
 | [guides/hardware-requirements.md](guides/hardware-requirements.md) | DuDuClaw OS 硬體需求與相容性指南（硬性條件 x86-64+AVX2／UEFI／SSD、最低/建議/舒適配置表、自組 PC 相容性檢查清單、x86 筆電評估、推薦迷你主機 N100/N305/8845HS、驅動缺口 MT7927/RTL8125、樹莓派/Arduino/ESP32 為何跑不了 OS＋作為 resident sensing 感測端點的接入方式、兩層總矩陣、為何不能用 ARM/Mac 模擬、燒 USB 而非光碟） | Current |
 | [guides/remote-gpu-host.md](guides/remote-gpu-host.md) | 遠端 GPU 主機準備指南（Ubuntu + CUDA 驅動、venv 安裝 LLaMA-Factory、工作目錄、選用 llama.cpp 轉 GGUF、SSH 金鑰授權與 `BatchMode` 驗證、表單欄位對照、先跑乾跑、template 對照表、故障排除） | Current |
 | guides/app-compat.md | 已移至 DuDuClaw-OS repo `docs/guides/app-compat.md`（2026-09-29） | Moved |
-| [guides/deprecations.md](guides/deprecations.md) | 棄用與移除總表（v1.69.0 已移除：`shared_wiki_*`→`wiki_* scope`、`schedule_task`→`tasks_create schedule`、`skill_bank_search`→`skill_search source`、舊 CLI 拼法與 `expert install`、`[dispatch] judge` 的 `evaluator_only`／`human_only`；Gemini CLI runtime 已移除；仍在棄用期：板模舊格式（未訂版號）） | Current |
+| [guides/deprecations.md](guides/deprecations.md) | 棄用與移除總表（v1.69.0 已移除：`shared_wiki_*`→`wiki_* scope`、`schedule_task`→`tasks_create schedule`、`skill_bank_search`→`skill_search source`、舊 CLI 拼法與 `expert install`、`[dispatch] judge` 的 `evaluator_only`／`human_only`；Gemini CLI runtime 已移除；仍在棄用期：板模舊格式（未訂版號）；v1.84.0 沒有棄用期的行為變更：Grok／CLI 員工背景工作不再自動交給 Claude、逾時不再換引擎） | Current |
 | [guides/desktop-build.md](guides/desktop-build.md) | Desktop app — local build guide (Tauri 2 shell running the gateway as a sidecar) | Current |
 | [guides/desktop-release.md](guides/desktop-release.md) | Desktop app — release, signing and auto-update pipeline | Current |
 | [guides/desktop-unblock.md](guides/desktop-unblock.md) | Desktop app — what the remaining blocked items need (toolchain, credentials, a second machine) | Current |

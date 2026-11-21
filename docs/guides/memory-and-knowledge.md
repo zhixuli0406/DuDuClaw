@@ -79,6 +79,8 @@ You paste a document, the AI replies "got it, saved," and until now nothing else
 
 **Where auto-filed pages go**: inside this AI employee's own knowledge base, under `auto/`, split into five folders by type — charter `auto/charter/`, SOP `auto/sop/`, spec `auto/spec/`, policy `auto/policy/`, other `auto/reference/`. Your manually organized directories (`entities/`, `concepts/`, `sources/`, `synthesis/`) are never touched by auto-filing.
 
+**Who sees an auto-filed page (v1.84.0)**: in chat, an auto-filed page is visible only in the conversation it came from. If another conversation files the same topic, it gets its own page with a short suffix; the two are never merged. A page a Manager or Admin confirmed in the curation station (**Confirm as official knowledge**) is visible in every conversation. A page the system has no matching record for (every page filed before v1.84.0, including ones confirmed earlier, and any page edited outside DuDuClaw) is hidden from conversations until a Manager or Admin confirms it; the system check **Pre-upgrade automatic notes** counts them per employee. AI employees cannot write or share pages under `auto/` at all, in chat or in scheduled work. Sharing an auto page to the shared wiki needs a Manager or Admin and works only for a confirmed page.
+
 **How an auto-filed page differs from a confirmed one**:
 
 - The page opens with a notice stating it was auto-organized and hasn't been confirmed by a person.
