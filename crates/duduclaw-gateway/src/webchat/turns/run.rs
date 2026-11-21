@@ -791,11 +791,14 @@ async fn send_terminal(
         sink.identity_unavailable(validity, false).await;
         return Err(Undelivered::Silent);
     }
-    let content = match &frame {
-        Message::Text(text) => serde_json::from_str::<serde_json::Value>(text).ok()
-            .and_then(|value| value.get("content").and_then(|v| v.as_str()).map(str::to_owned)),
+    let terminal = match &frame {
+        Message::Text(text) => serde_json::from_str::<serde_json::Value>(text).ok(),
         _ => None,
     };
+    let content = terminal.as_ref().and_then(|value| value.get("content"))
+        .and_then(|v| v.as_str()).map(str::to_owned);
+    let actual_model = terminal.as_ref().filter(|value| value["type"] == "assistant_done")
+        .and_then(|value| value.get("model")).and_then(|v| v.as_str());
     let has_reply = content.is_some();
     if let Some(content) = content {
         if guarded.persist_webchat(&state.ctx.session_manager, sid, &content).await.is_err() {
@@ -813,6 +816,7 @@ async fn send_terminal(
     // A frame the writer withheld for an exhausted wait budget latches this
     // turn's source as refused, so the row is not published without it.
     let mut denied = false;
+    let mut delivered = Vec::new();
     let mut destinations = state.subscriptions.sinks(auth_user, sid, &sink.msg_id, answering_agent, credential,
         guarded.delivery_fence().for_turn(cancel)).into_iter();
     while let Some(destination) = destinations.next() {
@@ -831,8 +835,10 @@ async fn send_terminal(
         // this destination's own withheld frame marks it as withheld.
         let source = guarded.delivery_fence().for_turn(cancel);
         let mut attempt = destination.clone().with_source(source.clone());
-        if attempt.send(frame.clone()).await.is_err() && source.was_contended() {
-            withheld.push(destination);
+        match attempt.send(frame.clone()).await {
+            Ok(()) => delivered.push(attempt),
+            Err(()) if source.was_contended() => withheld.push(destination),
+            Err(()) => {}
         }
     }
     let users = state.user_db.clone();
@@ -852,6 +858,113 @@ async fn send_terminal(
         _ => { guarded.refuse_delivery(); Err(()) }
     };
     if published.is_err() { rollback_owned_webchat_archives(owned_archives).await; }
-    if published.is_ok() && has_reply { sink.complete(); }
+    if published.is_ok() {
+        if has_reply { sink.complete(); }
+        if let Some(model) = actual_model {
+            let mut info = access::user_session_info(state, sid, answering_agent, auth_user).await;
+            apply_executed_model(&mut info, model);
+            if let Ok(json) = serde_json::to_string(&info) {
+                // Only destinations that acknowledged the terminal get its
+                // metadata. Reuse their fenced sender, including cancellation,
+                // source lease, current ACL and credential checks at the writer.
+                for mut destination in delivered {
+                    let _ = destination.send(Message::Text(json.clone().into())).await;
+                }
+            }
+        }
+    }
     published.map_err(|()| Undelivered::Notice)
+}
+
+/// Refresh metadata with the actual primary/fallback model reported by the turn.
+fn apply_executed_model(info: &mut ChatMessage, actual: &str) {
+    if let ChatMessage::SessionInfo { model, refresh, supports_vision, .. } = info {
+        *model = actual.to_string();
+        *refresh = true;
+        let bare = actual.strip_suffix("（備援）").unwrap_or(actual);
+        if let Some(provider) = crate::runtime_config::infer_provider_for_model(bare) {
+            *supports_vision = crate::model_capabilities::supports_vision(provider, bare);
+        }
+    }
+}
+
+#[cfg(test)]
+mod model_frame_tests {
+    use super::*;
+
+    /// Exercise the real terminal sender and its subscription acknowledgements.
+    async fn delivered_frames(actual: &str, refused: bool, acknowledge: bool) -> Vec<serde_json::Value> {
+        let home = tempfile::tempdir().unwrap();
+        crate::team_edition::record(home.path(), duduclaw_core::EditionProfile::Enterprise);
+        std::fs::create_dir_all(home.path().join("agents")).unwrap();
+        std::fs::write(home.path().join("config.toml"), "").unwrap();
+        crate::mfa::reload_policy(home.path());
+        let users = Arc::new(UserDb::new(&home.path().join("users.db")).unwrap());
+        let admin = users.create_user("model-frame@test.invalid", "Admin", "Test-Password-12345",
+            duduclaw_auth::UserRole::Admin).unwrap();
+        let state = Arc::new(WebChatState::new(
+            crate::agent_channels::e2e_tests::reply_ctx(home.path()).await,
+            Arc::new(JwtConfig::new(b"model-frame-test-key")), users,
+        ));
+        let sid = "webchat:model-frame";
+        let guarded = crate::channel_reply::build_guarded_reply_with_session(
+            "hello", &state.ctx, sid, &admin.id, None,
+        ).await;
+        assert!(guarded.no_responder_notice());
+        if refused { guarded.refuse_delivery(); }
+        let (tx, mut rx) = outbound_channel();
+        let subscription = state.subscriptions.register(&admin.id, tx.clone());
+        subscription.subscribe(sid, None);
+        let mut sink = TurnSink::new(tx, sid, None, "model-frame");
+        let frame = Message::Text(serde_json::json!({
+            "type": "assistant_done", "content": guarded.text, "model": actual,
+        }).to_string().into());
+        let task = tokio::spawn(async move {
+            let result = send_terminal(&state, &admin.id, None, sid, &CancellationToken::new(),
+                None, &mut sink, &guarded, &[], frame, &mut Vec::new()).await;
+            if refused { assert!(result.is_err()); } else { assert!(result.is_ok()); }
+        });
+        tokio::pin!(task);
+        let mut frames = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                tokio::select! {
+                    biased;
+                    output = rx.recv() => {
+                        let output = output.expect("subscription remains open");
+                        assert!(output.route.is_some(), "metadata must use the fenced subscription");
+                        if let Message::Text(text) = &output.message {
+                            frames.push(serde_json::from_str::<serde_json::Value>(text).unwrap());
+                        }
+                        if let Some(ack) = output.ack { let _ = ack.send(acknowledge); }
+                    }
+                    result = &mut task => { result.unwrap(); break; }
+                }
+            }
+        }).await.expect("terminal sender did not finish");
+        frames
+    }
+
+    #[tokio::test]
+    async fn per_turn_metadata_reports_executed_primary_and_fallback_models() {
+        for actual in ["gpt-5.6-sol", "claude-opus-4-6（備援）"] {
+            let frames = delivered_frames(actual, false, true).await;
+            assert_eq!(frames.len(), 2, "{frames:?}");
+            assert_eq!(frames[0]["type"], "assistant_done");
+            assert_eq!(frames[0]["model"], actual);
+            assert_eq!(frames[1]["type"], "session_info");
+            assert_eq!(frames[1]["model"], actual);
+            assert_eq!(frames[1]["refresh"], true);
+        }
+    }
+
+    #[tokio::test]
+    async fn no_session_info_update_when_terminal_delivery_is_refused() {
+        assert!(delivered_frames("gpt-5.6-sol", true, true).await.is_empty());
+        // Publication may succeed despite transport loss; that socket still
+        // must not receive metadata for a terminal it did not acknowledge.
+        let frames = delivered_frames("gpt-5.6-sol", false, false).await;
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        assert_eq!(frames[0]["type"], "assistant_done");
+    }
 }

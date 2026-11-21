@@ -638,8 +638,11 @@ pub(crate) async fn record_discarded_runtime_usage(context: &RuntimeContext, res
 }
 
 pub(crate) async fn validate_runtime_response(
-    response: RuntimeResponse, context: &RuntimeContext,
+    mut response: RuntimeResponse, context: &RuntimeContext,
 ) -> Result<RuntimeResponse, String> {
+    // This context belongs to the executed leg, including a resolved fallback.
+    // Validate before attribution/display can lose that leg's requested model.
+    response.model_used = accepted_reported_model(&response.model_used, &context.model).to_string();
     if !allows_partial_reply() {
         if let Some(seconds) = response.partial_timeout_secs {
             record_discarded_runtime_usage(context, &response).await;
@@ -891,6 +894,65 @@ pub(crate) fn is_claude_utility_call() -> bool {
 pub(crate) fn is_observed_claude_model(model: &str) -> bool {
     let model = model.trim();
     !model.is_empty() && model != "<synthetic>"
+}
+
+/// Longest model id accepted from external (CLI / runtime) output.
+pub(crate) const MAX_REPORTED_MODEL_BYTES: usize = 128;
+
+/// Is `model` a plausible model id: 1..=128 bytes of `[A-Za-z0-9._:/@+-[]]`?
+/// Covers every catalog id (`claude-opus-4-6`, `gpt-5.6-sol`,
+/// `kimi-code/kimi-for-coding`), the openai-compat presets
+/// (`meta-llama/Llama-3.3-70B-Instruct-Turbo`), Ollama tags (`qwen2.5:7b`),
+/// `@`-scoped ids and Claude's `[1m]` context suffix. No whitespace, control,
+/// bidi or markup character can pass.
+pub(crate) fn is_valid_reported_model_id(model: &str) -> bool {
+    (1..=MAX_REPORTED_MODEL_BYTES).contains(&model.len())
+        && model.bytes().all(|b| b.is_ascii_alphanumeric() || b"._:/@+-[]".contains(&b))
+}
+
+/// The ONE place a model name reported by external output (a CLI's stream
+/// `message.model`, a runtime's `model_used`) is accepted for display and
+/// metadata (`ProgressEvent::ModelInfo` → `SessionInfo.model`,
+/// `assistant_done.model`). A string that is not a valid model id is never
+/// used; the model id the gateway itself requested for that call is shown
+/// instead. Callers append their own decorations (「（備援）」) afterwards.
+pub(crate) fn accepted_reported_model<'a>(reported: &'a str, requested: &'a str) -> &'a str {
+    if is_valid_reported_model_id(reported) {
+        reported
+    } else {
+        tracing::warn!(
+            reported_bytes = reported.len(),
+            requested = %duduclaw_core::truncate_chars(requested, 64),
+            "CLI-reported model name rejected; showing the requested model"
+        );
+        requested
+    }
+}
+
+#[cfg(test)]
+mod reported_model_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn invalid_runtime_model_uses_each_executed_legs_requested_model() {
+        let home = tempfile::tempdir().unwrap();
+        // The failover manager validates each response with that leg's context.
+        for requested in ["gpt-5.6-sol", "claude-opus-4-6"] {
+            let context = RuntimeContext {
+                agent_dir: None, system_prompt: String::new(), model: requested.into(),
+                max_tokens: 16, home_dir: home.path().to_owned(), agent_id: "test".into(),
+                preferred_provider: None, conversation_history: vec![], capabilities: None,
+                account_pool: vec![], effort: None, allow_cross_family_failover: true,
+            };
+            let response = RuntimeResponse {
+                content: "answer".into(), model_used: "<img src=x>\n".into(),
+                ..Default::default()
+            };
+            let accepted = validate_runtime_response(response, &context).await.unwrap();
+            assert_eq!(accepted.model_used, requested);
+            assert_eq!(accepted.content, "answer");
+        }
+    }
 }
 
 /// Persist canonical CLI result usage synchronously, including cache tokens

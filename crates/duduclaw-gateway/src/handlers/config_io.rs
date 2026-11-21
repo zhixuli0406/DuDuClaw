@@ -91,7 +91,7 @@ impl MethodHandler {
         let config_exists = self.home_dir.join("config.toml").exists();
 
         // The spawning probes run concurrently — worst case the RPC
-        // costs max(docker, grok ping 15s+version 5s, mcp cold-start 10s),
+        // costs max(docker, grok version 5s, mcp cold-start 10s),
         // not the sum. The dashboard passes an extended per-call timeout.
         let (docker, mcp, grok, codex_sandbox) = tokio::join!(
             check_docker(),
@@ -180,36 +180,30 @@ impl MethodHandler {
             }));
         }
 
-        // Grok CLI live probe — only when grok is installed (mirrors the CLI
+        // Grok CLI version probe — only when grok is installed (mirrors the CLI
         // doctor: absence is not a failure, the card is simply omitted).
         if let Some(g) = grok {
             use crate::doctor_probes::GrokProbeOutcome as O;
             let ver = g.version.as_deref().unwrap_or("?");
             let (status, message) = match &g.outcome {
-                O::Ok { stdout_chars } => (
+                O::Ok { .. } => (
                     "pass",
-                    format!("grok -p 活體試跑正常（版本 {ver}，回應 {stdout_chars} 字元）。"),
-                ),
-                O::AuthFailed { stderr_tail } => (
-                    "fail",
-                    format!(
-                        "grok 未登入或憑證失效 — 請在主機執行 `grok login --device-auth`（Docker 部署用 dashboard 的 Grok 登入）。stderr：{stderr_tail}"
-                    ),
+                    format!("Grok CLI 已安裝（版本 {ver}；僅檢查版本，未呼叫模型或驗證登入）。"),
                 ),
                 O::EmptyExit0 => (
                     "warn",
-                    "grok -p 回傳空輸出（exit 0）— headless 管道問題，runtime 會自動以 PTY 重試；若對話持續空回覆請執行 `duduclaw doctor` 取得完整證據包。".to_string(),
+                    "grok --version 未回傳版本資訊。".to_string(),
                 ),
                 O::Failed { exit, stderr_tail } => (
                     "fail",
                     format!(
-                        "grok -p 執行失敗（exit={}）。stderr：{}",
+                        "grok --version 執行失敗（exit={}）。stderr：{}",
                         exit.map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
                         if stderr_tail.is_empty() { "(空)" } else { stderr_tail }
                     ),
                 ),
                 O::SpawnFailed(e) => ("fail", format!("grok 無法啟動：{e}")),
-                O::Timeout => ("warn", "grok -p 15 秒內無回應（逾時）。".to_string()),
+                O::Timeout => ("warn", "grok --version 5 秒內無回應（逾時）。".to_string()),
             };
             checks.push(json!({
                 "name": "grok_cli",

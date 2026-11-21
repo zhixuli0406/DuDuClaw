@@ -298,7 +298,7 @@ pub(super) fn format_fallback_message_with_timeout(
              請於 Anthropic Console 儲值，或在儀表板切換到其他有效帳號。"
         ),
         FailureReason::TimeoutTotal if timeout_secs > 0 => format!(
-            "已達 {duration} 的時間上限，尚未產生最終答案。已完成的部分已保留，回覆『繼續』可以接著做。\n\
+            "已達 {duration}的時間上限，尚未產生最終答案。已完成的部分已保留，回覆『繼續』可以接著做。\n\
              需要延長上限時，請洽管理員。"
         ),
         FailureReason::MaxTurns | FailureReason::TimeoutTotal | FailureReason::TimeoutNoProgress => super::TurnFailureReason::from(reason).text(None).to_string(),

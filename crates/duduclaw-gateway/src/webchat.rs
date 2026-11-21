@@ -266,7 +266,7 @@ pub enum ChatMessage {
         /// uses this to label the upload control and warn before sending an image
         /// to a text-only model. Documents are readable regardless.
         supports_vision: bool,
-        /// The agent's preferred model id (for display next to the upload control).
+        /// Effective model id; refreshed with the executed model after a turn.
         model: String,
         /// `true` when this frame is a server-initiated refresh after an
         /// agent-config change (not a connect/resume announcement). The client
@@ -1666,7 +1666,11 @@ async fn build_session_info_frame(
                 a.config.agent.display_name.clone(),
                 a.config.agent.icon.clone(),
                 a.config.agent.name.clone(),
-                a.config.model.preferred.clone(),
+                {
+                    let settings = crate::runtime_config::load_runtime_settings(&a.dir);
+                    let preferred = settings.preferred_model.as_deref().unwrap_or(&a.config.model.preferred);
+                    crate::runtime_config::runnable_model(&a.config.agent.name, preferred, settings.provider).into_owned()
+                },
             ),
             None => (
                 "DuDuClaw".to_string(),

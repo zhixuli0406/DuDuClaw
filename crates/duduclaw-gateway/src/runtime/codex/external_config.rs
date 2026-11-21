@@ -15,41 +15,57 @@ tokio::task_local! {
 /// employee's `.mcp.json`; it carries the engine-local marker so only the
 /// explicit runtime-fallback rule can tell the two apart (RM-181).
 fn refusal(path: &Path, reason: &str) -> String {
-    duduclaw_agent::mcp_spawn_gate::engine_local_spawn_gate_error(&format!(
-        "Codex 外部設定 {}：{reason}；拒絕啟動。請由管理者移除原生 MCP 設定，改用 DuDuClaw 的代理設定。", path.display()))
+    refusal_at_layer(path, reason, "主機層")
 }
 
-fn check_value(path: &Path, value: &toml::Value) -> Result<(), String> {
+fn refusal_at_layer(path: &Path, reason: &str, layer: &str) -> String {
+    // Paths are diagnostics, never channel text. Redacting after interpolation
+    // could match an interior /home/ and leak the entire preceding prefix.
+    tracing::warn!(path = %path.display(), layer, reason, "Codex external configuration refused");
+    let filename = path.file_name().and_then(|name| name.to_str()).unwrap_or("config.toml");
+    duduclaw_agent::mcp_spawn_gate::engine_local_spawn_gate_error(&format!(
+        "Codex 外部設定（{layer}）{filename}：{reason}；拒絕啟動。請由管理者移除原生 MCP 設定，改用 DuDuClaw 的代理設定。"))
+}
+
+fn check_value(path: &Path, value: &toml::Value, layer: &str) -> Result<(), String> {
     match value {
         toml::Value::Table(table) => {
             if let Some(servers) = table.get("mcp_servers") {
                 if !servers.as_table().is_some_and(|servers| servers.is_empty()) {
-                    return Err(refusal(path, "定義了 mcp_servers"));
+                    return Err(refusal_at_layer(path, "定義了 mcp_servers", layer));
                 }
             }
             // Includes legacy [profiles.<name>.mcp_servers] and profile files.
-            for value in table.values() { check_value(path, value)?; }
+            for value in table.values() { check_value(path, value, layer)?; }
         }
-        toml::Value::Array(values) => for value in values { check_value(path, value)?; },
+        toml::Value::Array(values) => for value in values { check_value(path, value, layer)?; },
         _ => {}
     }
     Ok(())
 }
 
 fn check_text(path: &Path, text: &str) -> Result<(), String> {
-    let value = text.parse::<toml::Value>().map_err(|_| refusal(path, "無法解析 TOML"))?;
-    check_value(path, &value)
+    check_text_in_layer(path, text, "主機層")
+}
+
+fn check_text_in_layer(path: &Path, text: &str, layer: &str) -> Result<(), String> {
+    let value = text.parse::<toml::Value>().map_err(|_| refusal_at_layer(path, "無法解析 TOML", layer))?;
+    check_value(path, &value, layer)
 }
 
 fn check_file(path: &Path) -> Result<(), String> {
+    check_file_in_layer(path, "主機層")
+}
+
+fn check_file_in_layer(path: &Path, layer: &str) -> Result<(), String> {
     // symlink_metadata distinguishes a dangling link from an absent layer.
     match std::fs::symlink_metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(_) => return Err(refusal(path, "無法檢查設定檔")),
+        Err(_) => return Err(refusal_at_layer(path, "無法檢查設定檔", layer)),
         Ok(_) => {}
     }
-    let text = std::fs::read_to_string(path).map_err(|_| refusal(path, "無法讀取設定檔"))?;
-    check_text(path, &text)
+    let text = std::fs::read_to_string(path).map_err(|_| refusal_at_layer(path, "無法讀取設定檔", layer))?;
+    check_text_in_layer(path, &text, layer)
 }
 
 fn check_profiles(home: &Path) -> Result<(), String> {
@@ -129,7 +145,7 @@ fn has_git_marker(dir: &Path) -> Result<bool, String> {
     match std::fs::symlink_metadata(&marker) {
         Ok(_) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(_) => Err(refusal(&marker, "無法檢查專案範圍")),
+        Err(_) => Err(refusal_at_layer(&marker, "無法檢查專案範圍", "專案層")),
     }
 }
 
@@ -154,12 +170,16 @@ fn project_layer_dirs(root: &Path) -> Result<Vec<PathBuf>, String> {
 }
 
 pub(super) fn check_project_layers(root: &Path, owned_config: Option<&Path>) -> Result<(), String> {
-    let root = std::fs::canonicalize(root).map_err(|_| refusal(root, "無法檢查專案設定"))?;
-    let owned_config = owned_config.map(std::fs::canonicalize).transpose()
-        .map_err(|_| refusal(&root, "無法檢查代理設定檔"))?;
+    let root = std::fs::canonicalize(root).map_err(|_| refusal_at_layer(root, "無法檢查專案設定", "專案層"))?;
+    let owned_config = owned_config.map(|path| std::fs::canonicalize(path)
+        .map_err(|_| refusal_at_layer(path, "無法檢查代理設定檔", "員工資料夾"))).transpose()?;
     for parent in project_layer_dirs(&root)? {
         let file = parent.join(".codex/config.toml");
-        if Some(file.as_path()) != owned_config.as_deref() { check_file(&file)?; }
+        if Some(file.as_path()) != owned_config.as_deref() {
+            let employee_dir = owned_config.as_deref().and_then(Path::parent).and_then(Path::parent);
+            let layer = if employee_dir == Some(parent.as_path()) { "員工資料夾" } else { "專案層" };
+            check_file_in_layer(&file, layer)?;
+        }
     }
     Ok(())
 }
@@ -215,6 +235,49 @@ pub(crate) fn require_mcp_isolation() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn refusal_never_exposes_host_paths_even_with_spaces_unicode_or_tilde() {
+        for path in ["/private/tmp/測試 空間/home/agents/worker/.codex/config.toml",
+            "/Users/測試 者/.codex/config.toml", "~/.codex/config.toml"] {
+            let error = refusal(Path::new(path), "定義了 mcp_servers");
+            let shown = duduclaw_agent::mcp_spawn_gate::spawn_gate_user_message(&error).unwrap();
+            assert!(shown.contains("config.toml"), "{shown}");
+            assert!(shown.contains("主機層"), "{shown}");
+            assert!(!shown.contains(path), "{shown}");
+            assert!(!shown.contains("/"), "{shown}");
+        }
+    }
+
+    #[test]
+    fn sibling_config_refusals_keep_layer_filename_and_reason_without_paths() {
+        for layer in ["專案層", "員工資料夾"] {
+            for reason in ["定義了 mcp_servers", "無法解析 TOML", "無法讀取設定檔", "無法檢查設定檔"] {
+                let error = refusal_at_layer(Path::new("/private/tmp/空 間/.codex/config.toml"), reason, layer);
+                let shown = duduclaw_agent::mcp_spawn_gate::spawn_gate_user_message(&error).unwrap();
+                assert!(shown.contains(layer) && shown.contains("config.toml") && shown.contains(reason), "{shown}");
+                assert!(!shown.contains("/"), "{shown}");
+            }
+        }
+    }
+
+    #[test]
+    fn project_and_employee_checks_report_the_correct_layer() {
+        let root = tempfile::tempdir().unwrap();
+        let employee = root.path().join("員工 空間");
+        std::fs::create_dir_all(&employee).unwrap();
+        let owned = employee.join(".codex/config.toml");
+        let missing = check_project_layers(&employee, Some(&owned)).unwrap_err();
+        assert!(missing.contains("員工資料夾") && missing.contains("config.toml"), "{missing}");
+        native_layer(root.path());
+        std::fs::write(root.path().join(".git"), "gitdir: fixture").unwrap();
+        native_layer(&employee);
+        let project = check_project_layers(&employee, Some(&owned)).unwrap_err();
+        assert!(project.contains("專案層") && project.contains("config.toml"), "{project}");
+        for error in [missing, project] {
+            assert!(!error.contains(&root.path().display().to_string()), "{error}");
+        }
+    }
+
     #[test]
     fn absent_and_empty_layers_allow_codex() {
         let dir = tempfile::tempdir().unwrap();
@@ -294,7 +357,7 @@ mod tests {
             let git = home.path().join(".git");
             if marker_is_dir { std::fs::create_dir(&git).unwrap(); } else { std::fs::write(&git, "gitdir: x").unwrap(); }
             let error = check_project_layers(&employee, None).unwrap_err();
-            assert!(error.contains(".codex") && error.contains("config.toml"), "{error}");
+            assert!(error.contains("專案層") && error.contains("config.toml"), "{error}");
             assert!(duduclaw_agent::mcp_spawn_gate::is_engine_local_spawn_gate_error(&error));
         }
     }
@@ -438,7 +501,7 @@ mod tests {
     fn managed_preferences_api_can_inspect_this_host() {
         // Read only: do not create or mutate preferences on the operator host.
         // A refusal is valid on managed machines and must name its source.
-        if let Err(error) = check_managed_preferences() { assert!(error.contains("com.openai.codex/")); }
+        if let Err(error) = check_managed_preferences() { assert!(error.contains("主機層")); }
     }
     #[cfg(unix)]
     #[test]

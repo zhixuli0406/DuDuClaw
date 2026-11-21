@@ -28,6 +28,10 @@ pub(crate) enum TurnFailureReason {
     TimeoutTotal,
     TimeoutNoProgress,
     Unavailable,
+    ModelProviderMismatch,
+    /// The employee's `agent.toml` could not be read or parsed for this
+    /// turn's provider/model pair (`runtime_config::RuntimeSettingsError`).
+    AgentConfigUnreadable,
     Quota,
     Cancelled,
     SafetyGate,
@@ -74,6 +78,11 @@ impl TurnFailureReason {
             (_, Self::TimeoutNoProgress) => "這次回覆長時間沒有進展，已先停止。已完成的部分已保留，回覆『繼續』可以接著做。",
 
             ("en", Self::Timeout) => "This turn received no reply because the response timed out.",
+            ("en", Self::ModelProviderMismatch) => "The model and runtime settings are incompatible. Ask an administrator to select a model supported by this engine.",
+            ("en", Self::AgentConfigUnreadable) => "This employee's settings could not be read, so this turn was not run. Please ask an administrator to check the employee's settings.",
+            ("ja-JP", Self::AgentConfigUnreadable) => "この従業員の設定を読み取れなかったため、今回は実行しませんでした。管理者に設定の確認を依頼してください。",
+            ("zh-CN", Self::AgentConfigUnreadable) => "无法读取这位员工的设置，本次未执行。请联系管理员检查这位员工的设置。",
+            (_, Self::AgentConfigUnreadable) => "無法讀取這位員工的設定，本次未執行。請聯絡管理者檢查這位員工的設定。",
             ("en", Self::Unavailable) => "This turn received no reply because the model or account is unavailable.",
             ("en", Self::Quota) => "This turn received no reply because the usage limit or available credit was exhausted.",
             ("en", Self::Cancelled) => "This turn received no reply because the user cancelled it.",
@@ -81,6 +90,7 @@ impl TurnFailureReason {
             ("en", Self::Internal) => "This turn received no reply because an internal error occurred.",
             ("en", Self::Unknown) => "This turn received no reply. Please try again later.",
             ("ja-JP", Self::Timeout) => "応答がタイムアウトしたため、このメッセージへの返信はありません。",
+            ("ja-JP", Self::ModelProviderMismatch) => "モデルと実行エンジンの設定が一致しません。管理者に対応するモデルの選択を依頼してください。",
             ("ja-JP", Self::Unavailable) => "モデルまたはアカウントを利用できないため、このメッセージへの返信はありません。",
             ("ja-JP", Self::Quota) => "利用上限または残高が不足したため、このメッセージへの返信はありません。",
             ("ja-JP", Self::Cancelled) => "キャンセルされたため、このメッセージへの返信はありません。",
@@ -88,6 +98,7 @@ impl TurnFailureReason {
             ("ja-JP", Self::Internal) => "内部エラーが発生したため、このメッセージへの返信はありません。",
             ("ja-JP", Self::Unknown) => "このメッセージへの返信はありません。しばらくしてからもう一度お試しください。",
             ("zh-CN", Self::Timeout) => "本次未收到回复，因为响应超时。",
+            ("zh-CN", Self::ModelProviderMismatch) => "模型与执行引擎设置不兼容，请管理员选择这个引擎支持的模型后重试。",
             ("zh-CN", Self::Unavailable) => "本次未收到回复，因为模型或账号目前无法使用。",
             ("zh-CN", Self::Quota) => "本次未收到回复，因为使用量或可用额度已达上限。",
             ("zh-CN", Self::Cancelled) => "本次未收到回复，因为用户已取消这次请求。",
@@ -95,6 +106,7 @@ impl TurnFailureReason {
             ("zh-CN", Self::Internal) => "本次未收到回复，因为发生内部错误。",
             ("zh-CN", Self::Unknown) => "本次未收到回复，请稍后重试。",
             (_, Self::Timeout) => "本次未收到回覆，因為回應逾時。",
+            (_, Self::ModelProviderMismatch) => "模型與執行引擎設定不相容，請管理者選擇這個引擎支援的模型後再試。",
             (_, Self::Unavailable) => "本次未收到回覆，因為模型或帳號目前無法使用。",
             (_, Self::Quota) => "本次未收到回覆，因為使用量或可用額度已達上限。",
             (_, Self::Cancelled) => "本次未收到回覆，因為使用者已取消這次請求。",
@@ -128,8 +140,8 @@ pub(super) async fn persist_failure_notice(
     }
 }
 
-/// Alignment errors keep their existing transport reply; only a post-persist
-/// error can add a display notice.
+/// Alignment refusals carry a fixed, specific code on the live transport and
+/// in the stored notice. Only a post-persist error can add that notice.
 pub(super) async fn model_alignment_gate(
     ctx: &ReplyContext, sid: &str, agent: &str, turn: &str,
     model: &str, provider: duduclaw_core::types::RuntimeType, generation: Option<&str>,
@@ -140,10 +152,28 @@ pub(super) async fn model_alignment_gate(
     let result = crate::runtime_config::ensure_model_provider(&runnable, provider);
     if result.is_err() {
         if generation.is_some() {
-            persist_failure_notice(ctx, sid, agent, turn, TurnFailureReason::Unavailable, generation).await;
+            persist_failure_notice(ctx, sid, agent, turn, TurnFailureReason::ModelProviderMismatch, generation).await;
         }
     }
-    result
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            tracing::warn!(agent, %error, "model/provider alignment refused");
+            let language = crate::prompt_identity::resolve_fixed_message_language_for_id(&ctx.home_dir, agent).await;
+            let reason = TurnFailureReason::ModelProviderMismatch;
+            Err(format!("{}\n{}", reason.text(language.as_deref()), notice_suffix(language.as_deref(), Some(reason.code()), turn)))
+        }
+    }
+}
+
+/// The turn's refusal when the employee's provider/model pair could not be
+/// read strictly (`runtime_config::load_runtime_settings_strict`). Fixed
+/// sentence + specific code only; the path and parser text are already in the
+/// gateway log. Runs before any session row exists, so nothing is persisted.
+pub(super) async fn agent_config_refusal(ctx: &ReplyContext, agent: &str, turn: &str) -> String {
+    let language = crate::prompt_identity::resolve_fixed_message_language_for_id(&ctx.home_dir, agent).await;
+    let reason = TurnFailureReason::AgentConfigUnreadable;
+    format!("{}\n{}", reason.text(language.as_deref()), notice_suffix(language.as_deref(), Some(reason.code()), turn))
 }
 
 pub(super) async fn active_provider_gate(
@@ -200,6 +230,8 @@ impl TurnFailureReason {
         Self::TimeoutNoProgress => "timeout_no_progress", Self::Unavailable => "unavailable",
         Self::Quota => "quota", Self::Cancelled => "cancelled", Self::SafetyGate => "safety_gate",
         Self::Internal => "internal", Self::Unknown => "unknown",
+        Self::ModelProviderMismatch => "model_provider_mismatch",
+        Self::AgentConfigUnreadable => "agent_config_unreadable",
     } }
     pub(crate) fn render(self, language: Option<&str>, reference: &str, visitor: bool) -> String {
         let reason = if visitor { Self::Unknown } else { self };
@@ -225,9 +257,9 @@ pub(crate) fn work_notice(outcome: &crate::work_outcome::WorkOutcome, language: 
             let duration = timeout_duration(*seconds, lang);
             match lang {
                 "en" => format!("No final answer was produced within the {duration} time limit. Completed work has been kept; reply “continue” to carry on."),
-                "ja" | "ja-JP" => format!("{duration} の制限時間内に最終回答が生成されませんでした。完了した作業は保持されています。「続けて」と返信すると再開できます。"),
-                "zh-CN" | "zh_CN" => format!("已达 {duration} 的时间上限，尚未生成最终答复。已完成的部分已保留，回复「继续」可以接着做。"),
-                _ => format!("已達 {duration} 的時間上限，尚未產生最終答案。已完成的部分已保留，回覆『繼續』可以接著做。"),
+                "ja" | "ja-JP" => format!("{duration}の制限時間内に最終回答が生成されませんでした。完了した作業は保持されています。「続けて」と返信すると再開できます。"),
+                "zh-CN" | "zh_CN" => format!("已达 {duration}的时间上限，尚未生成最终答复。已完成的部分已保留，回复「继续」可以接着做。"),
+                _ => format!("已達 {duration}的時間上限，尚未產生最終答案。已完成的部分已保留，回覆『繼續』可以接著做。"),
             }
         }
         WorkOutcome::TimeoutNoProgress { seconds, tool, .. } => {
@@ -261,6 +293,15 @@ mod work_notice_tests {
     use super::*;
 
     #[test]
+    fn localized_time_limits_do_not_insert_a_space_before_the_particle() {
+        let outcome = crate::work_outcome::WorkOutcome::TimeoutTotal { seconds: 30, partial: String::new() };
+        for (lang, expected) in [("zh-TW", "30 秒的時間上限"), ("zh-CN", "30 秒的时间上限"),
+            ("ja-JP", "30 秒の制限時間"), ("en", "30 seconds time limit")] {
+            assert!(work_notice(&outcome, Some(lang)).contains(expected));
+        }
+    }
+
+    #[test]
     fn total_timeout_notice_names_applied_duration_or_uses_zero_fallback() {
         for (language, expected) in [
             ("zh-TW", [(600, "10 分鐘"), (95, "95 秒"), (60, "1 分鐘"), (1, "1 秒")]),
@@ -271,7 +312,7 @@ mod work_notice_tests {
                 let expected = if language == "en" {
                     format!("No final answer was produced within the {duration} time limit. Completed work has been kept; reply “continue” to carry on.")
                 } else {
-                    format!("已達 {duration} 的時間上限，尚未產生最終答案。已完成的部分已保留，回覆『繼續』可以接著做。")
+                    format!("已達 {duration}的時間上限，尚未產生最終答案。已完成的部分已保留，回覆『繼續』可以接著做。")
                 };
                 assert_eq!(work_notice(&outcome, Some(language)), expected);
             }
