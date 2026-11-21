@@ -1,6 +1,6 @@
 # Memory and knowledge base guide
 
-Your AI employee remembers things on its own, and it can also organize knowledge into pages the way you ask it to. Both live on the same "Memory & Knowledge" (記憶與知識) page in the dashboard, but underneath they are two different systems with different behavior and different timing. This guide covers both in full.
+Your AI employee remembers things on its own, and it can also organize knowledge into pages the way you ask it to. Both live on the same "Memory" (記憶) page in the dashboard, but underneath they are two different systems with different behavior and different timing. This guide covers both in full.
 
 The one-line distinction:
 
@@ -90,13 +90,13 @@ You paste a document, the AI replies "got it, saved," and until now nothing else
 
 **Pasting the same document a second time** updates the same page rather than creating a duplicate, and the revision log at the bottom gains one more line.
 
-**Where to manage it**: dashboard → "Memory & Knowledge" (記憶與知識) → "Curation Station" (策展台) → "Auto-filed" (自動建檔). Each page supports:
+**Where to manage it**: dashboard sidebar → "Memory" (記憶) → "Personal" (個人知識庫; "Knowledge base" in the personal edition) → "Curation" (策展台) → "Auto-filed" (自動建檔). Each page supports:
 
 | Action | Effect |
 |---|---|
 | "View" (檢視) | See the full page content and revision log |
 | "Confirm" (確認) | Promotes the page to content you've approved, so it starts auto-injecting every conversation. The tab marks each page as needing confirmation (待確認) or confirmed (已確認) |
-| "Share to shared knowledge base" (分享到共用知識庫) | Copies the page to the shared area so other AI employees can read it too. Offered only for a confirmed page; an unconfirmed page shows "Confirm this page before sharing." |
+| "Share to shared knowledge base" (分享到共享知識庫) | Copies the page to the shared area so other AI employees can read it too. Offered only for a confirmed page; an unconfirmed page shows "Confirm this page before sharing." |
 | "Remove" (移除) | Drops the page from the knowledge base; it moves to the archive and can be restored |
 
 To turn auto-filing off entirely: drop a `.scope.toml` in that AI employee's knowledge base directory declaring `[namespaces.auto] mode = "operator_only"`. After that, only manual writes go through.
