@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+ferrous-opencc = { workspace = true }
 duduclaw-isolation.workspace = true
 duduclaw-execution.workspace = true
 portable-pty = "0.9"

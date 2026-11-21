@@ -130,11 +130,9 @@ pub(crate) fn sanitize_title(raw: &str) -> Option<String> {
     Some(duduclaw_core::truncate_chars(stripped, TITLE_MAX_CHARS))
 }
 
-/// WP11-C safety net behind the prompt: if the conversation is Traditional
-/// Chinese but the model answered with Simplified characters, rewrite the
-/// unambiguous ones. Characters whose Traditional counterpart is ambiguous are
-/// left alone and reported via the `bool` so the caller can log honestly
-/// instead of shipping a guess.
+/// WP11-C safety net: convert Simplified prose with phrase context when the
+/// conversation is Traditional Chinese. The bool reports remaining Simplified
+/// characters (for example when only the incomplete fallback is available).
 ///
 /// Returns `(title, still_has_simplified)`.
 pub(crate) fn align_title_script(title: &str, transcript: &str) -> (String, bool) {
@@ -144,7 +142,7 @@ pub(crate) fn align_title_script(title: &str, transcript: &str) -> (String, bool
     if !duduclaw_core::contains_simplified(title) {
         return (title.to_string(), false);
     }
-    let converted = duduclaw_core::to_traditional(title);
+    let converted = duduclaw_core::truncate_chars(&duduclaw_core::to_traditional(title), TITLE_MAX_CHARS);
     let leftover = duduclaw_core::contains_simplified(&converted);
     (converted, leftover)
 }
@@ -286,8 +284,7 @@ async fn title_one(
         warn!(
             session_id = %c.session_id,
             %title,
-            "titler: title still contains Simplified characters with no unambiguous \
-             Traditional mapping — stored as-is"
+            "titler: title still contains Simplified characters after conversion — stored as-is"
         );
     }
     session_manager
@@ -512,7 +509,7 @@ mod tests {
     fn simplified_title_on_a_zh_tw_conversation_is_realigned() {
         let transcript = "user: 我想知道我的個人檔案裡有哪些資訊\nassistant: 我幫你查詢個人檔案。";
         let (fixed, leftover) = align_title_script("了解用户个人档案信息", transcript);
-        assert_eq!(fixed, "了解用戶個人檔案信息");
+        assert_eq!(fixed, "瞭解用戶個人檔案信息");
         assert!(!leftover);
         // Character-level assertion on the classic Simplified/Traditional pairs.
         for simplified in ['户', '档', '义', '个'] {

@@ -167,7 +167,7 @@ pub fn align_memory_script(output: &str, language: Option<&str>, input: &str) ->
         || (valid_memory_language(language).is_none()
             && !duduclaw_core::zh_variant::contains_kana(input)
             && duduclaw_core::dominant_variant(input) == duduclaw_core::ChineseVariant::Traditional) {
-        duduclaw_core::to_traditional(output)
+        duduclaw_core::zh_variant::to_traditional_preserving_literals(output)
     } else { output.to_string() }
 }
 
@@ -180,6 +180,7 @@ mod tests {
         for input in ["会社の会議です", "ユーザーの国", "ｶﾀｶﾅ 用户"] {
             assert!(!memory_prompt_language(None, input).contains("Traditional Chinese"));
             assert_eq!(align_memory_script("用户会话", None, input), "用户会话");
+            assert_eq!(align_memory_script(input, None, input), input);
         }
     }
 
@@ -215,6 +216,8 @@ mod tests {
         let traditional = "用戶記憶與檔案";
         assert_eq!(align_memory_script(simplified, Some("zh-TW"), "input"), traditional);
         assert_eq!(align_memory_script(simplified, None, traditional), traditional);
+        assert_eq!(align_memory_script("用户 `头发` https://站/预算 /tmp/预算.txt", Some("zh-TW"), "input"),
+            "用戶 `头发` https://站/预算 /tmp/预算.txt");
         for code in ["zh-CN", "en", "ja-JP"] {
             assert_eq!(align_memory_script(simplified, Some(code), traditional), simplified);
         }
@@ -419,7 +422,7 @@ pub fn with_channel_reply_language_reminder(message: String, language: Option<&s
     }
 }
 
-/// Only an explicitly resolved zh-TW reply gets the conservative character safety net.
+/// Only an explicitly resolved zh-TW reply gets phrase-aware script conversion.
 /// Preserve code (including variable-length fences/spans) and URL bytes verbatim.
 pub(crate) fn normalize_channel_reply(text: &str, language: Option<&str>) -> String {
     if language != Some("zh-TW") { return text.to_string(); }
