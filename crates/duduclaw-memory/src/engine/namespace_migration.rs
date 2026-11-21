@@ -398,7 +398,7 @@ impl SqliteMemoryEngine {
             }
         };
 
-        let active = Self::load_active_triple(conn, to, &subj, &pred)?;
+        let active = Self::load_active_triple(conn, to, &subj, &pred, RowScope::All)?;
         let clean: Vec<&ActiveTriple> = active.iter().filter(|r| !r.quarantined).collect();
         let origin_name = row
             .origin

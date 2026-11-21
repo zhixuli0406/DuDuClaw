@@ -1459,17 +1459,21 @@ async fn build_reply_with_session_inner_impl(
                 "P3-2 context-collapse: withholding persona '## About This User' from a shared session"
             );
         }
-        if let Some(db_path) = cognitive_memory_db.clone().filter(|_| is_private) {
+        // v1.84.0: keyed `user:<channel>:<id>` (channel from this session id,
+        // never from the model) and only this conversation's traits.
+        let profile_key = crate::profile_distill::profile_key_for_session(session_id, user_id);
+        if let Some((db_path, key)) = cognitive_memory_db.clone().filter(|_| is_private).zip(profile_key) {
             let aid = agent_id.clone();
-            let uid = user_id.to_string();
+            let sid_for_profile = session_id.to_string();
             let home_for_profile = ctx.home_dir.clone();
             if let Ok(Some(section)) = tokio::task::spawn_blocking(move || {
                 // H4: single construction point (`[memory] novelty_gate` + `w_vec`).
                 let engine =
                     crate::memory_factory::build_memory_engine(&db_path, &home_for_profile).ok()?;
                 let rt = tokio::runtime::Handle::current();
-                rt.block_on(duduclaw_memory::user_profile::profile_block(
-                    &engine, &aid, &uid,
+                let scope = duduclaw_memory::RowScope::conversation(Some(sid_for_profile.as_str()));
+                rt.block_on(duduclaw_memory::user_profile::profile_block_for(
+                    &engine, &aid, &key, scope,
                 ))
                 .ok()
                 .flatten()

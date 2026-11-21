@@ -470,7 +470,11 @@ pub fn would_change(store: &WikiStore, req: &AutoPageRequest) -> bool {
     let Some(slug) = crate::knowledge_route::validate_slug(&req.slug) else {
         return false;
     };
-    let path = auto_page_path(req.doc_type, &slug);
+    // v1.84.0: the page this write would land on (never another
+    // conversation's page); a refused target changes nothing.
+    let Ok(path) = target_path(store, req, &slug) else {
+        return false;
+    };
     match store.read_page(&path) {
         Ok(page) => {
             let (old_content, _) = split_body(&page.body);
@@ -501,10 +505,14 @@ pub fn write_auto_page(
     if req.original.trim().is_empty() {
         return Err(AutoPageError::Invalid("empty original text".into()));
     }
-    let path = auto_page_path(req.doc_type, &slug);
 
     // ── 2. Scope policy ───────────────────────────────────────────────────
     check_auto_scope(store.wiki_dir()).map_err(AutoPageError::ScopeDenied)?;
+
+    // v1.84.0: never merge into another conversation's page — a write from a
+    // conversation other than the one(s) on the slug's page goes to that
+    // conversation's own page (`<slug>-<session digest>`).
+    let path = target_path(store, req, &slug)?;
 
     // ── 3. Rendered-text injection scan (defence 1 of §8.3) ───────────────
     let content_part = render_content_part(req);
@@ -659,6 +667,157 @@ pub fn list_auto_pages(store: &WikiStore) -> Result<Vec<AutoPageRow>, String> {
     Ok(rows)
 }
 
+// ---------------------------------------------------------------------------
+// v1.84.0: conversation scope of auto pages (RM-200 item 1)
+// ---------------------------------------------------------------------------
+
+/// The conversation a page `sources` entry records, as far as the entry can
+/// tell (see `memory_provenance::wiki_source_entry` for the three forms).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EntryConversation {
+    /// `conversation:<session>:<prefix>:<token>` — the session itself.
+    Session(String),
+    /// `conversation-digest:<digest(session)>:<prefix>:<token>` — only the
+    /// session's digest (a long session id).
+    SessionDigest(String),
+}
+
+/// Parse one `sources` entry. `None` = it cannot be attributed to a
+/// conversation (the whole-entry digest form, a legacy or foreign shape, a
+/// truncated value): such a page is treated as another conversation's.
+fn entry_conversation(entry: &str) -> Option<EntryConversation> {
+    use crate::memory_provenance::WIKI_SOURCE_DIGEST_PREFIX;
+    // The message key is `<prefix>:<token>` (exactly one `:`), read from the right.
+    fn split_message(rest: &str) -> Option<&str> {
+        let (left, token) = rest.rsplit_once(':')?;
+        let (head, prefix) = left.rsplit_once(':')?;
+        (!token.is_empty() && !prefix.is_empty() && !head.is_empty()).then_some(head)
+    }
+    if let Some(rest) = entry.strip_prefix(WIKI_SOURCE_DIGEST_PREFIX) {
+        let digest = split_message(rest)?;
+        let is_digest = digest.len() == 32 && digest.bytes().all(|b| b.is_ascii_hexdigit());
+        return is_digest.then(|| EntryConversation::SessionDigest(digest.to_ascii_lowercase()));
+    }
+    let rest = entry.strip_prefix("conversation:")?;
+    split_message(rest).map(|session| EntryConversation::Session(session.to_string()))
+}
+
+/// The digest that identifies an entry's conversation (both forms reduce to
+/// `short_digest(session)`), or `None` when it cannot be attributed.
+fn entry_conversation_digest(entry: &str) -> Option<String> {
+    match entry_conversation(entry)? {
+        EntryConversation::Session(s) => Some(crate::memory_provenance::short_digest(&s)),
+        EntryConversation::SessionDigest(d) => Some(d),
+    }
+}
+
+/// Whether the `sources` entry was recorded by conversation `session`. The
+/// digest form is decided by comparing against the digest of the current
+/// session; an entry that cannot be attributed belongs to nobody.
+pub fn source_belongs_to(entry: &str, session: &str) -> bool {
+    let session = session.trim();
+    if session.is_empty() {
+        return false;
+    }
+    match entry_conversation(entry) {
+        Some(EntryConversation::Session(s)) => s == session,
+        Some(EntryConversation::SessionDigest(d)) => {
+            d == crate::memory_provenance::short_digest(session)
+        }
+        None => false,
+    }
+}
+
+/// Whether the page at `path` is an auto-written page whose visibility
+/// follows the conversation it came from: anything under `auto/` except a
+/// page a human promoted ([`promote_page`]: author no longer the
+/// auto-distiller AND moved out of the `context` layer). Fail closed: a page
+/// under `auto/` that cannot be parsed is scoped.
+pub fn is_conversation_scoped_page(path: &str, page: Option<&WikiPage>) -> bool {
+    if !is_auto_path(path) {
+        return false;
+    }
+    match page {
+        Some(p) => {
+            let promoted = p.author.as_deref() != Some(AUTO_PAGE_AUTHOR) && p.layer != WikiLayer::Context;
+            !promoted
+        }
+        None => true,
+    }
+}
+
+/// v1.84.0: may a reader serving conversation `session` see the page at
+/// `path`? Pages outside `auto/` and promoted pages: always. An auto page:
+/// only when it has at least one source and EVERY source belongs to
+/// `session` (another conversation's source, an unattributable digest, or no
+/// sources at all hide it). `session = None` (unknown conversation) sees no
+/// auto page. `page = None` (unparsable) under `auto/` is hidden.
+pub fn page_visible_in_conversation(path: &str, page: Option<&WikiPage>, session: Option<&str>) -> bool {
+    if !is_conversation_scoped_page(path, page) {
+        return true;
+    }
+    let (Some(page), Some(session)) = (page, session.map(str::trim).filter(|s| !s.is_empty())) else {
+        return false;
+    };
+    !page.sources.is_empty() && page.sources.iter().all(|s| source_belongs_to(s, session))
+}
+
+/// Whether every source of an existing page records the same conversation
+/// as `entry` (the entry a new write would add). Identical entries always
+/// match; a page without sources matches nothing.
+fn page_is_of_entry_conversation(sources: &[String], entry: &str) -> bool {
+    let writer = entry_conversation_digest(entry);
+    !sources.is_empty()
+        && sources.iter().all(|s| {
+            s == entry
+                || matches!((&writer, entry_conversation_digest(s)), (Some(w), Some(d)) if *w == d)
+        })
+}
+
+/// Length of the per-conversation slug suffix (hex chars of the session digest).
+const CONVERSATION_SUFFIX_CHARS: usize = 8;
+
+/// `<slug>-<first 8 hex of short_digest(session)>`, the base slug shortened
+/// so the result still passes `validate_slug`. The raw session id never
+/// reaches the filename.
+fn conversation_slug(slug: &str, conversation_digest: &str) -> Option<String> {
+    let suffix: String = conversation_digest.chars().take(CONVERSATION_SUFFIX_CHARS).collect();
+    if suffix.chars().count() != CONVERSATION_SUFFIX_CHARS {
+        return None;
+    }
+    // 64 = the slug bound; one byte for the `-`.
+    let base = truncate_bytes(slug, 64 - 1 - CONVERSATION_SUFFIX_CHARS).trim_end_matches('-');
+    crate::knowledge_route::validate_slug(&format!("{base}-{suffix}"))
+}
+
+/// The page a write of `req` lands on (v1.84.0): its slug's page when that
+/// page does not exist yet or all of its sources are of the writing
+/// conversation; otherwise the writing conversation's own page
+/// ([`conversation_slug`]) — never a merge into another conversation's page.
+/// A writer whose conversation cannot be attributed, or a per-conversation
+/// page that is not that conversation's, is refused.
+fn target_path(store: &WikiStore, req: &AutoPageRequest, slug: &str) -> Result<String, AutoPageError> {
+    let base = auto_page_path(req.doc_type, slug);
+    let entry = sanitize_inline(&req.source_id);
+    let base_page = store.read_page(&base).ok();
+    let Some(existing) = base_page else {
+        return Ok(base);
+    };
+    if page_is_of_entry_conversation(&existing.sources, &entry) {
+        return Ok(base);
+    }
+    let not_mergeable =
+        || AutoPageError::Invalid("the page for this slug belongs to another conversation".into());
+    let digest = entry_conversation_digest(&entry).ok_or_else(not_mergeable)?;
+    let own_slug = conversation_slug(slug, &digest).ok_or_else(not_mergeable)?;
+    let own = auto_page_path(req.doc_type, &own_slug);
+    match store.read_page(&own) {
+        Err(_) => Ok(own),
+        Ok(page) if page_is_of_entry_conversation(&page.sources, &entry) => Ok(own),
+        Ok(_) => Err(not_mergeable()),
+    }
+}
+
 /// Whether a wiki-relative path lives in the auto namespace.
 pub fn is_auto_path(path: &str) -> bool {
     // Exact first-segment equality — never `starts_with("auto")`, which would
@@ -744,7 +903,7 @@ mod tests {
             summary: "公司章程摘要".to_string(),
             original: original.to_string(),
             source_label: "Telegram 對話".to_string(),
-            source_id: "conversation:telegram:12345".to_string(),
+            source_id: "conversation:telegram:12345:m:1".to_string(),
         }
     }
 
@@ -932,8 +1091,11 @@ mod tests {
         )
         .unwrap();
 
+        // v1.84.0: a later message of the same conversation (another
+        // conversation gets its own page, see
+        // `another_conversation_gets_its_own_page`).
         let mut r2 = req("公司章程", "第一條 新版，修訂了盈餘分派規則。");
-        r2.source_id = "conversation:telegram:99999".into();
+        r2.source_id = "conversation:telegram:12345:m:2".into();
         let out = write_auto_page(&store, tmp.path(), "agnes", &r2).unwrap();
         assert_eq!(
             out,
@@ -1203,5 +1365,104 @@ mod tests {
         let hits = store.search("ZEBRAFISH", 10).unwrap();
         assert_eq!(hits.len(), 1, "auto pages must stay findable");
         assert_eq!(hits[0].path, "auto/charter/company-charter.md");
+    }
+
+    // ── v1.84.0: conversation scope (RM-200 item 1) ──────────────────────
+
+    /// A same-slug write from conversation B does not merge into A's page:
+    /// it creates B's own page (suffix = session digest, never the raw id),
+    /// A's page is byte-identical, and a later write of B updates B's page.
+    #[test]
+    fn another_conversation_gets_its_own_page() {
+        let tmp = TempDir::new().unwrap();
+        let store = store_in(&tmp);
+        let a = write_auto_page(&store, tmp.path(), "agnes", &req("公司章程", "第一條 A 版。")).unwrap();
+        let a_path = a.path().to_string();
+        let a_before = std::fs::read_to_string(store.wiki_dir().join(&a_path)).unwrap();
+
+        let mut b = req("公司章程", "第一條 B 版，另一位客戶的內容。");
+        b.source_id = "conversation:telegram:67890:m:7".into();
+        assert!(would_change(&store, &b));
+        let out = write_auto_page(&store, tmp.path(), "agnes", &b).unwrap();
+        assert!(matches!(out, AutoPageOutcome::Created { .. }), "{out:?}");
+        let b_path = out.path().to_string();
+        assert_ne!(b_path, a_path);
+        let digest = crate::memory_provenance::short_digest("telegram:67890");
+        assert_eq!(
+            b_path,
+            format!("auto/charter/company-charter-{}.md", digest.chars().take(8).collect::<String>())
+        );
+        assert!(!b_path.contains("67890"), "no raw session id in a filename");
+        assert_eq!(std::fs::read_to_string(store.wiki_dir().join(&a_path)).unwrap(), a_before, "A untouched");
+        assert_eq!(store.read_page(&b_path).unwrap().sources, vec![b.source_id.clone()]);
+
+        let mut b2 = req("公司章程", "第一條 B 版第二次修訂。");
+        b2.source_id = "conversation:telegram:67890:m:8".into();
+        let out = write_auto_page(&store, tmp.path(), "agnes", &b2).unwrap();
+        assert_eq!(out.path(), b_path, "B's later write updates B's page");
+        assert!(matches!(out, AutoPageOutcome::Updated { revisions: 2, .. }), "{out:?}");
+
+        // A writer whose conversation cannot be attributed is not merged either.
+        let mut unknown = req("公司章程", "第一條 來源不明。");
+        unknown.source_id = "conversation-digest:0123456789abcdef0123456789abcdef".into();
+        assert!(matches!(
+            write_auto_page(&store, tmp.path(), "agnes", &unknown),
+            Err(AutoPageError::Invalid(_))
+        ));
+    }
+
+    /// Visibility of auto pages to one conversation: all sources of this
+    /// session (plain or session-digest form) → visible; any other source,
+    /// the whole-entry digest form, or no sources → hidden; outside `auto/`
+    /// and promoted pages → always visible; unknown session → no auto page.
+    #[test]
+    fn auto_page_visibility_follows_its_sources() {
+        let page = |path: &str, sources: Vec<String>| WikiPage {
+            path: path.into(),
+            title: "t".into(),
+            created: Utc::now(),
+            updated: Utc::now(),
+            tags: vec![],
+            related: vec![],
+            sources,
+            author: Some(AUTO_PAGE_AUTHOR.into()),
+            layer: WikiLayer::Context,
+            trust: AUTO_PAGE_TRUST,
+            source_type: SourceType::RawDialogue,
+            last_verified: None,
+            citation_count: 0,
+            error_signal_count: 0,
+            success_signal_count: 0,
+            do_not_inject: false,
+            body: String::new(),
+        };
+        let long_session = format!("telegram:{}", "9".repeat(140));
+        let long_entry = crate::memory_provenance::wiki_source_entry(&long_session, "m:3");
+        assert!(long_entry.starts_with(crate::memory_provenance::WIKI_SOURCE_DIGEST_PREFIX), "{long_entry}");
+        let p = "auto/sop/x.md";
+        let own = page(p, vec!["conversation:telegram:A:m:1".into(), "conversation:telegram:A:turn:t9".into()]);
+        assert!(page_visible_in_conversation(p, Some(&own), Some("telegram:A")));
+        assert!(!page_visible_in_conversation(p, Some(&own), Some("telegram:B")));
+        assert!(!page_visible_in_conversation(p, Some(&own), None));
+        let mixed = page(p, vec!["conversation:telegram:A:m:1".into(), "conversation:telegram:B:m:2".into()]);
+        assert!(!page_visible_in_conversation(p, Some(&mixed), Some("telegram:A")));
+        let digest = page(p, vec![long_entry.clone()]);
+        assert!(page_visible_in_conversation(p, Some(&digest), Some(&long_session)), "session digest decided");
+        assert!(!page_visible_in_conversation(p, Some(&digest), Some("telegram:A")));
+        let whole = page(p, vec!["conversation-digest:0123456789abcdef0123456789abcdef".into()]);
+        assert!(!page_visible_in_conversation(p, Some(&whole), Some("telegram:A")), "unattributable");
+        assert!(!page_visible_in_conversation(p, Some(&page(p, vec![])), Some("telegram:A")), "no sources");
+        assert!(!page_visible_in_conversation(p, None, Some("telegram:A")), "unparsable");
+        let legacy = page(p, vec!["conversation:telegram:12345".into()]);
+        assert!(!page_visible_in_conversation(p, Some(&legacy), Some("telegram:12345")));
+        // Outside auto/ and promoted pages are not scoped.
+        assert!(page_visible_in_conversation("entities/x.md", Some(&mixed), Some("telegram:A")));
+        let mut promoted = mixed.clone();
+        promoted.author = Some("operator".into());
+        promoted.layer = WikiLayer::Core;
+        assert!(page_visible_in_conversation(p, Some(&promoted), Some("telegram:A")));
+        assert!(page_visible_in_conversation(p, Some(&promoted), None));
+        // `automation/` is not `auto/`.
+        assert!(page_visible_in_conversation("automation/x.md", Some(&mixed), None));
     }
 }

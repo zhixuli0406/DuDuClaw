@@ -48,6 +48,7 @@ pub use engine::{
     NamespaceRow, OnRefused, SqliteMemoryEngine, SubjectFact, SubjectTripleForgetReport,
     TemporalMeta, TemporalRecord, word_jaccard, PREDICTION_CONTENT_PREFIX,
     SYSTEM_SIGNAL_SOURCE_EVENTS, is_explicitly_stored, EXPLICIT_SOURCE_EVENTS,
+    conversation_key, provenance_conversation, visible_to_conversation_sql, RowScope,
 };
 pub use feedback::{CitationTracker, DrainOnDrop, TrustSignal, WikiCitation};
 pub use gdpr::{gdpr_erase, gdpr_export, validate_contact as gdpr_validate_contact, GdprEraseSummary};
@@ -63,7 +64,7 @@ pub use engine::forget_source::{
     connector_plan_is_subset, ApplyOutcome, ApplyReport, ExternalInputs, ForgetPlan, ForgetSelector, ForgetStep,
     PlanDocument, PlanOptions, PlanOutcome, SessionMessageRef, StaleReason, WikiPageRef,
 };
-pub use novelty_gate::{NoveltyGateConfig, NoveltyRejection};
+pub use novelty_gate::{is_novelty_rejection, NoveltyGateConfig, NoveltyRejection};
 pub use origin::{trust_ceiling, OriginClass};
 pub use supersession_guard::{
     claim_digest, HeldClaim, HeldClaimView, PromotionReport, ReleaseHeld, ReleaseReport,
@@ -80,7 +81,8 @@ pub use user_code::{
     Conflict, Polarity, Provenance, RuleHit, UserProfile, UserRule,
 };
 pub use user_profile::{
-    consolidate_profile, profile_block, profile_traits, record_trait, ProfileTrait,
+    consolidate_profile, profile_block, profile_subject, profile_traits, record_trait,
+    ProfileKey, ProfileTrait,
 };
 pub use wiki::{serialize_page, SourceType, WikiFts, WikiLayer, WikiPage, WikiStore};
 pub use wiki_fence::{

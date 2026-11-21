@@ -649,7 +649,7 @@ pub(crate) async fn store_profile_traits_reported(
     let (written, held, _) = store_profile_traits_capped(
         engine,
         agent_id,
-        user_id,
+        &duduclaw_memory::ProfileKey::legacy(user_id),
         traits,
         None,
         &duduclaw_memory::lineage::Provenance::test_only(),
@@ -664,7 +664,7 @@ pub(crate) async fn store_profile_traits_reported(
 pub(crate) async fn store_profile_traits_capped(
     engine: &SqliteMemoryEngine,
     agent_id: &str,
-    user_id: &str,
+    key: &duduclaw_memory::ProfileKey,
     traits: &[ProfileTraitCandidate],
     home_dir: Option<&Path>,
     provenance: &duduclaw_memory::lineage::Provenance,
@@ -684,10 +684,10 @@ pub(crate) async fn store_profile_traits_capped(
                 continue;
             }
         }
-        match duduclaw_memory::user_profile::record_trait_outcome(
+        match duduclaw_memory::user_profile::record_trait_outcome_for(
             engine,
             agent_id,
-            user_id,
+            key,
             &t.predicate,
             &t.value,
             PROFILE_DISTILL_ORIGIN,
@@ -722,10 +722,10 @@ pub(crate) async fn store_profile_traits_capped(
                 }
                 let mut admitter = home_dir.map(|h| crate::wiki_ingest::held_claim_admitter(h, agent_id));
                 let mut admit = || admitter.as_mut().is_none_or(|a| a.admit());
-                let outcome = duduclaw_memory::user_profile::hold_trait_gated(
+                let outcome = duduclaw_memory::user_profile::hold_trait_gated_for(
                     engine,
                     agent_id,
-                    user_id,
+                    key,
                     &t.predicate,
                     &t.value,
                     PROFILE_DISTILL_ORIGIN,
@@ -795,11 +795,10 @@ pub(crate) async fn store_profile_traits_capped(
 fn filter_private_traits(
     home_dir: &Path,
     agent_id: &str,
-    user_id: &str,
+    subject: &str,
     traits: Vec<ProfileTraitCandidate>,
 ) -> Vec<ProfileTraitCandidate> {
     let gate = crate::memory_privacy::PrivacyGate::for_home(home_dir);
-    let subject = duduclaw_memory::user_profile::user_subject(user_id);
     let mut report = crate::memory_privacy::FilterReport::default();
     let kept: Vec<ProfileTraitCandidate> = traits
         .into_iter()
@@ -807,7 +806,7 @@ fn filter_private_traits(
             let content = format!("{}: {}", t.predicate, t.value);
             report.record(gate.check(&crate::memory_privacy::FactParts {
                 content: &content,
-                subject: Some(&subject),
+                subject: Some(subject),
                 predicate: Some(&t.predicate),
                 object: Some(&t.value),
             }))
@@ -815,6 +814,39 @@ fn filter_private_traits(
         .collect();
     report.log(agent_id, "profile_distill");
     kept
+}
+
+/// v1.84.0: the profile key of `user_id` on `channel`
+/// ([`duduclaw_memory::user_profile::profile_subject`]). The bare pre-v1.84
+/// `user:<id>` rows are readable as a fallback only when the platform's ids
+/// are globally unique ([`crate::memory_privacy::channel_id_is_globally_unique`]);
+/// on every other platform a bare row could be someone else's and is ignored.
+/// `channel` must come from the trusted turn / session context, never from
+/// model-supplied arguments. `None` for an invalid channel or blank id.
+pub fn profile_key(channel: &str, user_id: &str) -> Option<duduclaw_memory::ProfileKey> {
+    let legacy_readable =
+        crate::memory_privacy::channel_id_is_globally_unique(channel, user_id.trim());
+    duduclaw_memory::ProfileKey::for_channel(channel, user_id, legacy_readable)
+}
+
+/// [`profile_key`] for a conversation key `<channel>:<chat>…` (the session
+/// id the host put on the turn).
+pub fn profile_key_for_session(session: &str, user_id: &str) -> Option<duduclaw_memory::ProfileKey> {
+    let channel = duduclaw_memory::user_profile::channel_of_session(session)?;
+    profile_key(&channel, user_id)
+}
+
+/// [`profile_key`] for the channel of the one conversation the turn's own
+/// host-generated `sources` belong to (`None` when they name no single
+/// channel conversation).
+fn profile_key_for_sources(
+    user_id: &str,
+    sources: &[duduclaw_memory::SourceRef],
+) -> Option<duduclaw_memory::ProfileKey> {
+    let session = duduclaw_memory::provenance_conversation(
+        &duduclaw_memory::lineage::Provenance::Sources(sources.to_vec()),
+    )?;
+    profile_key_for_session(&session, user_id)
 }
 
 /// First stage of the distillation pipeline: capture the user's self-stated
@@ -841,9 +873,17 @@ pub async fn run_profile_distill(
     if traits.is_empty() {
         return;
     }
+    // v1.84.0: the profile subject carries the platform (`user:<channel>:<id>`),
+    // taken from the turn's own host-generated sources — never from the text.
+    // A turn that does not belong to exactly one channel conversation has no
+    // platform to key by: nothing is recorded (fail closed).
+    let Some(key) = profile_key_for_sources(user_id, sources) else {
+        debug!(agent = agent_id, "profile distill: turn has no channel conversation, nothing stored");
+        return;
+    };
     // RM-039: a self-statement about an excluded personal topic ("我喜歡跟老婆
     // 去爬山") or a trait this user deleted from "my memory" is not recorded.
-    let traits = filter_private_traits(home_dir, agent_id, user_id, traits);
+    let traits = filter_private_traits(home_dir, agent_id, &key.subject, traits);
     if traits.is_empty() {
         return;
     }
@@ -863,7 +903,6 @@ pub async fn run_profile_distill(
     let db = memory_db.to_path_buf();
     let home = home_dir.to_path_buf();
     let agent = agent_id.to_string();
-    let user = user_id.to_string();
     let result = tokio::task::spawn_blocking(move || {
         // rusqlite is !Send — the engine lives entirely inside this closure.
         // H4: built through `memory_factory` so `[memory] novelty_gate` applies
@@ -876,7 +915,7 @@ pub async fn run_profile_distill(
             rt.block_on(store_profile_traits_capped(
                 &engine,
                 &agent,
-                &user,
+                &key,
                 &traits,
                 Some(home.as_path()),
                 &provenance,

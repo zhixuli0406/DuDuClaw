@@ -17,6 +17,12 @@ use crate::mcp_namespace::{
 };
 
 const USER: &str = "tg-424242";
+/// v1.84.0: the distiller keys the person of a `test:` conversation as
+/// `user:test:<id>`; an employee-wide tool caller names that profile by the
+/// channel-qualified id.
+const PROFILE_USER: &str = "test:tg-424242";
+/// The conversation every distilled turn below comes from.
+const SESSION: &str = "test:s";
 
 fn home_with(agents: &[&str]) -> tempfile::TempDir {
     let tmp = tempfile::tempdir().unwrap();
@@ -65,7 +71,7 @@ fn is_error(v: &Value) -> bool {
 }
 
 async fn profile_value(mem: &SqliteMemoryEngine, ns: &NamespaceContext, predicate: &str) -> Option<String> {
-    let got = h::handle_user_profile_get(&json!({ "user_id": USER }), mem, ns).await;
+    let got = h::handle_user_profile_get(&json!({ "user_id": PROFILE_USER }), mem, ns).await;
     let payload: Value = serde_json::from_str(&text(&got)).unwrap();
     payload["traits"]
         .as_array()
@@ -81,7 +87,7 @@ async fn distill(home: &Path, agent: &str, said: &str) {
         agent,
         USER,
         &home.join("memory.db"),
-        home, &[duduclaw_memory::SourceRef::channel_message("test:s", 1, chrono::Utc::now(), None)],
+        home, &[duduclaw_memory::SourceRef::channel_message(SESSION, 1, chrono::Utc::now(), None)],
     )
     .await;
 }
@@ -136,7 +142,7 @@ async fn ai_record_and_distilled_trait_correct_each_other() {
     let mem = engine(home.path());
 
     let rec = h::handle_user_profile_record(
-        &json!({ "user_id": USER, "predicate": "preferred_name", "value": "Samuel" }),
+        &json!({ "user_id": PROFILE_USER, "predicate": "preferred_name", "value": "Samuel" }),
         &mem,
         &ns,
     )
@@ -147,7 +153,7 @@ async fn ai_record_and_distilled_trait_correct_each_other() {
     assert_eq!(profile_value(&mem, &ns, "preferred_name").await.as_deref(), Some("Sammy"));
     // And the AI can correct the distilled value back.
     let rec = h::handle_user_profile_record(
-        &json!({ "user_id": USER, "predicate": "preferred_name", "value": "Sam" }),
+        &json!({ "user_id": PROFILE_USER, "predicate": "preferred_name", "value": "Sam" }),
         &mem,
         &ns,
     )
@@ -161,20 +167,28 @@ async fn operator_approved_value_is_protected_from_both_sides() {
     let home = home_with(&["agnes"]);
     let ns = employee_ns(home.path(), "agnes");
     let mem = engine(home.path());
+    // v1.84.0: an operator-approved value protects the conversation it is
+    // visible to (here: approved from the same `SESSION`).
     duduclaw_memory::user_profile::record_trait_with_origin(
         &mem,
         "agnes",
-        USER,
+        PROFILE_USER,
         "preferred_name",
         "Mr. Lee",
         duduclaw_memory::origin::OPERATOR.name,
-        1.0, duduclaw_memory::lineage::Provenance::test_only(),
+        1.0,
+        duduclaw_memory::lineage::Provenance::source(duduclaw_memory::SourceRef::channel_message(
+            SESSION,
+            0,
+            chrono::Utc::now(),
+            None,
+        )),
     )
     .await
     .unwrap();
 
     let rec = h::handle_user_profile_record(
-        &json!({ "user_id": USER, "predicate": "preferred_name", "value": "Sam" }),
+        &json!({ "user_id": PROFILE_USER, "predicate": "preferred_name", "value": "Sam" }),
         &mem,
         &ns,
     )
@@ -297,7 +311,7 @@ async fn explicit_remember_is_exempt_from_privacy_categories() {
     assert_eq!(row.metadata["explicit"], true, "{:?}", row.metadata);
 
     let rec = h::handle_user_profile_record(
-        &json!({ "user_id": USER, "predicate": "prefers", "value": "週末陪老婆小孩" }),
+        &json!({ "user_id": PROFILE_USER, "predicate": "prefers", "value": "週末陪老婆小孩" }),
         &mem,
         &ns,
     )
