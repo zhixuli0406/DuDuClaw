@@ -284,7 +284,11 @@ fn convert_script_restore_and_force_flags_are_exclusive() {
         assert!(Args::try_parse_from(["memory", "convert-script", "--restore", "backup.jsonl", conflicting]).is_err());
     }
     assert!(Args::try_parse_from(["memory", "convert-script", "--all", "--force-language-mismatch"]).is_err());
+    assert!(Args::try_parse_from(["memory", "convert-script", "--restore", "f", "--agent", "a"]).is_err());
+    assert!(Args::try_parse_from(["memory", "convert-script", "--restore", "f", "--all"]).is_err());
     assert!(Args::try_parse_from(["memory", "convert-script", "--agent", "a", "--force-language-mismatch"]).is_ok());
+    assert!(Args::try_parse_from(["memory", "convert-script"]).is_err());
+    assert!(Args::try_parse_from(["memory", "convert-script", "--agent", "a", "--all"]).is_err());
 }
 
 async fn script_db(home: &Path, agents: &[&str]) {
