@@ -5,6 +5,10 @@ tokio::task_local! {
     pub(crate) static FAILURE_TURN: String;
     pub(crate) static FAILURE_DETAILS: (&'static str, Option<crate::work_outcome::WorkOutcome>);
     pub(crate) static FAILURE_SESSION: std::sync::Arc<std::sync::Mutex<Option<(String, String, String)>>>;
+    /// v1.84.0: the operator/member-facing sentence shown live for a
+    /// start-up check refusal, stored instead of the generic line (never for
+    /// visitors).
+    pub(crate) static FAILURE_SHOWN_TEXT: String;
 }
 
 pub(crate) fn bind_failure_session(sid: &str, generation: &str, agent: &str) {
@@ -130,7 +134,10 @@ pub(super) async fn model_alignment_gate(
     ctx: &ReplyContext, sid: &str, agent: &str, turn: &str,
     model: &str, provider: duduclaw_core::types::RuntimeType, generation: Option<&str>,
 ) -> Result<(), String> {
-    let result = crate::runtime_config::ensure_model_provider(model, provider);
+    // v1.84.0: a bare Claude alias on a prefixed non-Claude engine runs with
+    // that engine's default (the runtime layer substitutes it the same way).
+    let runnable = crate::runtime_config::runnable_model(agent, model, provider);
+    let result = crate::runtime_config::ensure_model_provider(&runnable, provider);
     if result.is_err() {
         if generation.is_some() {
             persist_failure_notice(ctx, sid, agent, turn, TurnFailureReason::Unavailable, generation).await;
@@ -197,7 +204,8 @@ impl TurnFailureReason {
     pub(crate) fn render(self, language: Option<&str>, reference: &str, visitor: bool) -> String {
         let reason = if visitor { Self::Unknown } else { self };
         let details = FAILURE_DETAILS.try_with(Clone::clone).ok();
-        let text = if visitor { reason.text(language).into() } else { details.as_ref().and_then(|(_, outcome)| outcome.as_ref()).map(|o| work_notice(o, language)).unwrap_or_else(|| reason.text(language).into()) };
+        let shown = if visitor { None } else { FAILURE_SHOWN_TEXT.try_with(Clone::clone).ok() };
+        let text = if visitor { reason.text(language).into() } else if let Some(shown) = shown { shown } else { details.as_ref().and_then(|(_, outcome)| outcome.as_ref()).map(|o| work_notice(o, language)).unwrap_or_else(|| reason.text(language).into()) };
         let code = details.as_ref().map(|(code, _)| *code).unwrap_or(self.code());
         format!("{text}\n{}", notice_suffix(language, (!visitor).then_some(code), reference))
     }

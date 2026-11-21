@@ -1068,6 +1068,9 @@ enum KnowledgeBranch {
     /// P2-B: the turn's source was forgotten (or could not be checked).
     /// Nothing may be written from this turn — neither page nor facts.
     Fenced,
+    /// RM-205: no service may run this employee's background work. A clean
+    /// skip: nothing is written from this turn.
+    Unavailable,
 }
 
 /// Run the WP5c knowledge route for one turn.
@@ -1140,6 +1143,10 @@ async fn run_knowledge_branch(
             .map_err(|e| e.to_string())
         }
     };
+
+    if response.as_ref().err().is_some_and(|e| crate::runtime_config::is_utility_unavailable(e)) {
+        return KnowledgeBranch::Unavailable;
+    }
 
     // ── Two independent parses (P3 = A hard requirement) ──────────────────
     let (facts, knowledge) = match &response {
@@ -1736,7 +1743,7 @@ async fn run_ingest_inner(
         )
         .await
         {
-            KnowledgeBranch::Filed | KnowledgeBranch::Fenced => return,
+            KnowledgeBranch::Filed | KnowledgeBranch::Fenced | KnowledgeBranch::Unavailable => return,
             KnowledgeBranch::Fallback(facts) => pre_extracted = facts,
         }
     }
@@ -1801,6 +1808,9 @@ async fn run_ingest_inner(
             };
             match dispatched {
                 Ok(response) => (cloud_reply_facts(agent_id, &response), true),
+                // RM-205: no service for background work ⇒ clean skip (no
+                // local fallback write either).
+                Err(e) if crate::runtime_config::is_utility_unavailable(&e) => return,
                 Err(e) => {
                     warn!(
                         agent = agent_id,

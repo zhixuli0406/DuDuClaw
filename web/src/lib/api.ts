@@ -181,6 +181,8 @@ export interface AgentDetail extends AgentInfo {
   runtime?: {
     provider?: string;
     fallback?: string;
+    /** v1.84 (RM-205): the employee's own background-work service. */
+    utility_provider?: string;
     timeout_secs?: number | null;
     idle_timeout_secs?: number | null;
     max_turns?: number | null;
@@ -3648,6 +3650,15 @@ export interface AgentRuntime {
   fallback?: string;
   /** v1.68 W1 — `[runtime] minimal_context` (精簡啟動內容). Default true. */
   minimal_context?: boolean;
+  /** v1.84 (RM-205) — service for background work when the engine has no
+   *  utility support. '' clears it. Admin-only. */
+  utility_provider?: string;
+}
+
+/** v1.84 (RM-205) — where an employee's background work actually runs. */
+export interface AgentUtilityRoute {
+  provider: string | null;
+  source: 'employee_engine' | 'employee_setting' | 'global_setting' | 'unavailable';
 }
 
 // ── BEGIN v1.68 W1: AI-employee edit page (agents.update / agents.inspect) ──
@@ -3741,6 +3752,11 @@ export interface AgentDetailV168 {
     error: string | null;
   };
   runtime?: { minimal_context?: boolean };
+  /** v1.84 (RM-205). Older gateways omit it. */
+  utility_route?: AgentUtilityRoute;
+  /** v1.84: zh-TW notice when the engine ran with its own default model
+   *  because the saved one is a Claude alias it cannot run. */
+  engine_model_notice?: string | null;
   fork?: { enabled?: boolean };
   team?: AgentTeamSection & {
     roles?: Partial<Record<AgentTeamRoleKey | 'synthesizer', AgentTeamRoleSpec>>;

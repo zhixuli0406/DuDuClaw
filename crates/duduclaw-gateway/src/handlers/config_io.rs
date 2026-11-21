@@ -226,6 +226,35 @@ impl MethodHandler {
             }));
         }
 
+        // v1.84.0: employees whose saved model is a Claude alias their engine
+        // cannot run; the engine's default model was used instead.
+        let substitutions = crate::runtime_config::model_substitution_notices();
+        if !substitutions.is_empty() {
+            let lines: Vec<String> = substitutions
+                .iter()
+                .map(|(agent, notice)| format!("{agent}：{notice}"))
+                .collect();
+            checks.push(json!({
+                "name": "employee_engine_model",
+                "status": "warn",
+                "message": lines.join("\n"),
+                "can_repair": false,
+            }));
+        }
+        let employees: Vec<(String, std::path::PathBuf)> = reg
+            .list()
+            .iter()
+            .map(|a| (a.config.agent.name.clone(), a.dir.clone()))
+            .collect();
+        if let Some(line) = crate::runtime_config::utility_skipped_doctor_line(&self.home_dir, &employees) {
+            checks.push(json!({
+                "name": "background_work_skipped",
+                "status": "warn",
+                "message": line,
+                "can_repair": false,
+            }));
+        }
+
         if let Some(message) = duduclaw_core::config::home_permissions_warning(&self.home_dir) {
             checks.push(json!({
                 "name": "home_permissions",

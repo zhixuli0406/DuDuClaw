@@ -86,6 +86,7 @@ import {
 import {
   RUNTIME_PROVIDERS,
   GENERIC_CLI_RUNTIMES,
+  UTILITY_CAPABLE_RUNTIMES,
   EFFORT_LEVELS,
   TEAM_ROLE_KEYS,
   DEFAULT_V168,
@@ -664,6 +665,7 @@ function EditAgentPageContent() {
     setRuntime({
       provider: (rt?.provider as RuntimeProvider) ?? DEFAULT_RUNTIME.provider,
       fallback: rt?.fallback ?? DEFAULT_RUNTIME.fallback,
+      utility_provider: rt?.utility_provider ?? DEFAULT_RUNTIME.utility_provider,
       max_turns: rt?.max_turns ?? null,
       idle_timeout_secs: rt?.idle_timeout_secs ?? null,
       timeout_secs: effectiveRuntimeTimeout(rt?.timeout_secs, agent.effective_timeout_secs ?? DEFAULT_RUN_TIMEOUT_SECS, agent.max_timeout_secs ?? 3600),
@@ -1246,6 +1248,21 @@ function EditAgentPageContent() {
     { value: '', label: intl.formatMessage({ id: 'agents.runtime.fallback.none' }), raw: '' },
     ...providerOptions,
   ], runtime.fallback);
+  // RM-205: background work (key facts, summaries, titles). Only engines with a
+  // utility lane can take it; '' = 不使用其他服務.
+  const utilityProviderOptions: SelectOption[] = [
+    { value: '', label: intl.formatMessage({ id: 'agents.runtime.utility.none' }), raw: '' },
+    ...providerOptions.filter((o) => UTILITY_CAPABLE_RUNTIMES.has(o.value)),
+  ];
+  const utilityRoute = agent?.utility_route;
+  const utilityRouteText = utilityRoute
+    ? (utilityRoute.source === 'unavailable' || !utilityRoute.provider
+      ? intl.formatMessage({ id: 'agents.runtime.utility.skipped' })
+      : intl.formatMessage({ id: 'agents.runtime.utility.using' }, {
+        service: intl.formatMessage({ id: `agents.runtime.provider.${utilityRoute.provider}` }),
+      }))
+    : null;
+  const showUtilitySelect = !UTILITY_CAPABLE_RUNTIMES.has(runtime.provider) || runtime.utility_provider !== '';
   // v1.68 W1 — 推理力度 ('' = not set, the runtime's own default).
   const effortOptions: SelectOption[] = [
     { value: '', label: intl.formatMessage({ id: 'agents.v168.effort.unset' }), raw: '' },
@@ -1967,6 +1984,15 @@ function EditAgentPageContent() {
             <SettingsCard>
               <RowSelect label={t('agents.runtime.provider')} description={t('agents.runtime.provider.hint')} value={runtime.provider} disabled={locked('runtime.provider')} onChange={(v) => updateRuntime('provider', v as RuntimeProvider)} options={providerPickerOptions} />
               <RowSelect label={t('agents.runtime.fallback')} description={t('agents.runtime.fallback.hint')} value={runtime.fallback} disabled={locked('runtime.fallback')} onChange={(v) => updateRuntime('fallback', v)} options={fallbackProviderOptions} />
+              {utilityRouteText && (
+                <p className="px-3 py-2 text-xs text-muted-foreground" data-testid="utility-route">{utilityRouteText}</p>
+              )}
+              {showUtilitySelect && (
+                <RowSelect label={t('agents.runtime.utility.label')} description={t('agents.runtime.utility.hint')} value={runtime.utility_provider} disabled={locked('runtime.utility_provider')} onChange={(v) => updateRuntime('utility_provider', v)} options={utilityProviderOptions} />
+              )}
+              {agent?.engine_model_notice && (
+                <p role="status" className="px-3 py-2 text-xs text-warning">{agent.engine_model_notice}</p>
+              )}
               <RowNumber label={t('agents.runtime.timeout')} description={<><span>{t(isAdmin ? 'agents.runtime.timeout.hint' : 'agents.runtime.timeout.lowerOnly')}</span> {intl.formatMessage({ id: isAdmin ? 'agents.runtime.timeout.effective' : 'agents.runtime.timeout.ownerCeiling' }, { value: runtimeEffectiveTimeout, max: runtimeMaxTimeout, ceiling: Math.min(savedRuntimeTimeout, runtimeMaxTimeout) })}</>} value={runtime.timeout_secs} min={30} max={isAdmin ? runtimeMaxTimeout : Math.min(savedRuntimeTimeout, runtimeMaxTimeout)} step={1} onChange={(v) => updateRuntime('timeout_secs', v)} />
               <SettingsRow label={t('agents.runtime.idleTimeout')} description={t('agents.runtime.idleTimeout.hint')} tier="text">
                 <Input type="number" min={0} max={runtimeMaxTimeout} step={1}

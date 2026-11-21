@@ -134,7 +134,13 @@ pub(crate) async fn tick_once(
                 );
             }
             Err(e) => {
+                // Unavailable backs off like a failure (no tight loop) but is
+                // not reported as one (RM-205).
                 crate::session_summarizer::summary_attempt_finished_async(home_dir, &session_id, "async", Some(e)).await;
+                if e == crate::session_summarizer::SummaryFailure::Unavailable {
+                    debug!(session_id = %session_id, "summarizer: background work unavailable for this employee; skipped");
+                    continue;
+                }
                 warn!(
                 session_id = %session_id,
                 through_turn,
@@ -202,7 +208,10 @@ async fn summarize_one(
         )
         .await
         .map(|summary| crate::prompt_identity::align_memory_script(&summary, memory_language.as_deref(), &transcript))
-        .map_err(|_| SummaryFailure::Utility)?
+        .map_err(|error| if crate::runtime_config::is_utility_unavailable(&error) {
+            // RM-205: no service may run this employee's background work.
+            SummaryFailure::Unavailable
+        } else { SummaryFailure::Utility })?
     } else {
         String::new()
     };
@@ -461,6 +470,35 @@ mod tests {
             summarize_one(&sm, home.path(), "fallback-owner", 2, 1),
         ).await.unwrap();
         assert_eq!(sm.get_summary("fallback-owner").await.unwrap().0, "Session utility result");
+    }
+
+    /// RM-205: a Grok employee with no explicit utility service is a clean
+    /// skip: no call (the registry is empty and the Claude lane is never
+    /// entered), summary and history untouched, and a quiet back-off so the
+    /// next tick does not retry immediately.
+    #[tokio::test]
+    async fn unsupported_owner_without_explicit_service_skips_and_backs_off() {
+        let (sm, home) = make_session_manager();
+        let dir = home.path().join("agents/utility-worker");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"), "[agent]\nname='utility-worker'\nstatus='active'\n[runtime]\nprovider='grok'\n[model]\npreferred='grok-3'\n").unwrap();
+        let _registry = crate::runtime_dispatch::testing::RegistryGuard::install(
+            home.path(), crate::runtime::RuntimeRegistry::with_runtimes(std::collections::HashMap::new()),
+        ).await;
+        sm.get_or_create("skipped", "utility-worker").await.unwrap();
+        sm.append_message("skipped", "user", "Summarize this session", 4).await.unwrap();
+        sm.append_message("skipped", "assistant", "Here is the discussion", 4).await.unwrap();
+        for _ in 0..3 { sm.append_message("skipped", "user", "raw tail", 1).await.unwrap(); }
+        let ids = sm.get_message_ids("skipped").await.unwrap();
+        let result = crate::autonomous_runtime::scope(home.path(), "utility-worker", &[],
+            summarize_one(&sm, home.path(), "skipped", 2, 1)).await;
+        assert_eq!(result, Err(crate::session_summarizer::SummaryFailure::Unavailable));
+        assert_eq!(sm.get_summary("skipped").await.unwrap(), (String::new(), 0));
+        assert_eq!(sm.get_message_ids("skipped").await.unwrap(), ids);
+        crate::session_summarizer::summary_attempt_finished_async(home.path(), "skipped", "async",
+            Some(crate::session_summarizer::SummaryFailure::Unavailable)).await;
+        assert!(!crate::session_summarizer::summary_retry_ready_async(home.path(), "skipped", "async").await,
+            "backs off: no tight retry loop");
     }
 
     #[tokio::test]

@@ -39,10 +39,6 @@ use duduclaw_core::runtime_catalog::{OutputFormat, PROMPT_PLACEHOLDER, RuntimeSp
 use super::{AgentRuntime, RuntimeContext, RuntimeResponse};
 
 
-/// Cap the system prompt embedded into the prompt payload (ARG_MAX safety).
-/// Matches `runtime/grok.rs`.
-const MAX_SYSTEM_PROMPT_BYTES: usize = 65536;
-
 /// Bytes of stderr echoed back in an error message. Enough to diagnose, small
 /// enough that a runaway CLI can't blow up a channel reply.
 const STDERR_TAIL_BYTES: usize = 300;
@@ -417,40 +413,13 @@ pub fn parse_output(stdout: &str, format: OutputFormat) -> Option<String> {
 /// and several *replace* their own agent scaffolding when given one. Embedding
 /// the instructions in the payload delivers them everywhere, identically.
 /// Pure, so it is unit-testable without spawning.
+///
+/// RM-204: the whole payload is one argv element, so it is kept under
+/// [`super::prompt_budget::SINGLE_ARGUMENT_PAYLOAD_BUDGET`] by the
+/// section-aware reduction there (the v1.83.0 64 KB tail cut dropped the
+/// summaries and pinned instructions). Byte-identical below the budget.
 pub fn build_prompt(context: &RuntimeContext, user_prompt: &str, runtime: &str) -> String {
-    let system_prompt: &str = if context.system_prompt.len() > MAX_SYSTEM_PROMPT_BYTES {
-        warn!(
-            runtime,
-            agent = %context.agent_id,
-            original_len = context.system_prompt.len(),
-            "system_prompt truncated to 64KB"
-        );
-        duduclaw_core::truncate_bytes(&context.system_prompt, MAX_SYSTEM_PROMPT_BYTES)
-    } else {
-        &context.system_prompt
-    };
-
-    // Argument injection guard: a prompt starting with '-' would be parsed as
-    // a flag by every one of these CLIs.
-    let safe_prompt = if user_prompt.starts_with('-') {
-        format!(" {user_prompt}")
-    } else {
-        user_prompt.to_string()
-    };
-
-    let with_history = if context.conversation_history.is_empty() {
-        safe_prompt
-    } else {
-        super::format_history_as_prompt(&context.conversation_history, &safe_prompt)
-    };
-
-    if system_prompt.is_empty() {
-        with_history
-    } else {
-        let safe_system =
-            system_prompt.replace("</system_instructions>", "&lt;/system_instructions&gt;");
-        format!("<system_instructions>\n{safe_system}\n</system_instructions>\n\n{with_history}")
-    }
+    super::prompt_budget::single_argument_payload(context, user_prompt, runtime)
 }
 
 /// Expand the catalog's argv template: [`PROMPT_PLACEHOLDER`] becomes the
@@ -1142,6 +1111,39 @@ mod tests {
         assert_eq!(resp.content, "the plain answer");
         assert_eq!(resp.runtime_name, "copilot");
         assert!(resp.input_tokens > 0, "tokens are estimated, not zero");
+    }
+
+    /// RM-206: what the vendor process really receives on turn 2 — one argv
+    /// element carrying turn 1 and the summary / pinned blocks; with a
+    /// > 64 KB system prompt it stays under the single-argument budget and
+    /// keeps those blocks (RM-204).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn vendor_process_argv_carries_history_summary_and_pinned_under_budget() {
+        use crate::runtime::prompt_budget::{tests::layered_prompt, with_layout, SINGLE_ARGUMENT_PAYLOAD_BUDGET};
+        let dir = tempfile::tempdir().unwrap();
+        let dump = dir.path().join("argv");
+        // Copilot's `-s` mode prints plain stdout; the script records its argv.
+        let bin = fake_bin(dir.path(), "copilot", &format!(
+            "for a in \"$@\"; do printf '%s\\0' \"$a\" >> '{}'; done\necho answer", dump.display()));
+        let rt = GenericCliRuntime::with_program(spec_for("copilot").unwrap(), bin.to_string_lossy());
+        let (prompt, layout) = layered_prompt(90_000, 30_000);
+        let mut context = ctx(dir.path());
+        context.system_prompt = prompt;
+        context.conversation_history = vec![
+            super::super::ConversationTurn { role: "user".into(), content: "TURN-ONE-USER".into() },
+            super::super::ConversationTurn { role: "assistant".into(), content: "TURN-ONE-REPLY".into() },
+        ];
+        let resp = with_layout(layout, rt.execute("TURN-TWO", &context)).await.unwrap();
+        assert_eq!(resp.content, "answer");
+        let raw = std::fs::read(&dump).unwrap();
+        let args: Vec<String> = raw.split(|b| *b == 0).filter(|a| !a.is_empty())
+            .map(|a| String::from_utf8(a.to_vec()).unwrap()).collect();
+        let payload = args.iter().find(|a| a.contains("TURN-TWO")).expect("payload argument");
+        assert!(payload.len() <= SINGLE_ARGUMENT_PAYLOAD_BUDGET, "{}", payload.len());
+        for marker in ["TURN-ONE-USER", "TURN-ONE-REPLY", "SUMMARY-MARKER", "PINNED-MARKER", "KNOWLEDGE-RULES-MARKER"] {
+            assert!(payload.contains(marker), "{marker} missing from the vendor argv");
+        }
     }
 
     #[tokio::test]

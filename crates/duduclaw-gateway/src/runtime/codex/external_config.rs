@@ -122,11 +122,42 @@ fn check_managed_preferences() -> Result<(), String> {
     Ok(())
 }
 
+/// Does `dir` contain a `.git` entry (directory, or the file a worktree or
+/// submodule uses)? Fail closed: an entry that cannot be inspected refuses.
+fn has_git_marker(dir: &Path) -> Result<bool, String> {
+    let marker = dir.join(".git");
+    match std::fs::symlink_metadata(&marker) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(refusal(&marker, "無法檢查專案範圍")),
+    }
+}
+
+/// RM-181: the project layers Codex itself would consider. Codex searches
+/// for project `.codex/config.toml` layers from the working directory upward
+/// and stops at the git root (the directory containing `.git`, inclusive);
+/// with no git root it considers the working directory only. Walking every
+/// ancestor up to `/` used to inspect the OS user's personal
+/// `~/.codex/config.toml` whenever the data directory lives under the home
+/// directory, refusing every Codex employee for a file Codex never loads as
+/// a project layer. A home directory that IS the git root above the employee
+/// directory is still in range and still refused.
+fn project_layer_dirs(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut walked = Vec::new();
+    for dir in root.ancestors() {
+        walked.push(dir.to_path_buf());
+        if has_git_marker(dir)? {
+            return Ok(walked);
+        }
+    }
+    Ok(vec![root.to_path_buf()])
+}
+
 pub(super) fn check_project_layers(root: &Path, owned_config: Option<&Path>) -> Result<(), String> {
     let root = std::fs::canonicalize(root).map_err(|_| refusal(root, "無法檢查專案設定"))?;
     let owned_config = owned_config.map(std::fs::canonicalize).transpose()
         .map_err(|_| refusal(&root, "無法檢查代理設定檔"))?;
-    for parent in root.ancestors() {
+    for parent in project_layer_dirs(&root)? {
         let file = parent.join(".codex/config.toml");
         if Some(file.as_path()) != owned_config.as_deref() { check_file(&file)?; }
     }
@@ -226,6 +257,79 @@ mod tests {
         std::fs::write(&file, "[mcp_servers.native]\ncommand='unsafe'").unwrap();
         assert!(check_project_layers(root.path(), None).unwrap_err().contains("config.toml"));
         check_project_layers(root.path(), Some(&file)).unwrap();
+        // RM-181: the owned exemption is exact — another file in range still refuses.
+        let employee = root.path().join("agents/worker");
+        std::fs::create_dir_all(employee.join(".codex")).unwrap();
+        std::fs::write(employee.join(".git"), "gitdir: elsewhere").unwrap();
+        let owned = employee.join(".codex/config.toml");
+        std::fs::write(&owned, "[mcp_servers.duduclaw]\ncommand='/owned'").unwrap();
+        check_project_layers(&employee, Some(&owned)).unwrap();
+    }
+
+    fn native_layer(dir: &Path) {
+        std::fs::create_dir_all(dir.join(".codex")).unwrap();
+        std::fs::write(dir.join(".codex/config.toml"), "[mcp_servers.native]\ncommand='unsafe'").unwrap();
+    }
+
+    /// The installed layout: `<home>/.duduclaw/agents/<id>` under a home that
+    /// has the OS user's own `~/.codex/config.toml`.
+    fn installed_layout() -> (tempfile::TempDir, PathBuf) {
+        let home = tempfile::tempdir().unwrap();
+        native_layer(home.path());
+        let employee = home.path().join(".duduclaw/agents/worker");
+        std::fs::create_dir_all(&employee).unwrap();
+        (home, employee)
+    }
+
+    #[test]
+    fn home_codex_config_above_a_non_git_employee_directory_is_not_a_project_layer() {
+        let (_home, employee) = installed_layout();
+        check_project_layers(&employee, None).unwrap();
+    }
+
+    #[test]
+    fn home_codex_config_is_in_range_when_the_home_is_the_git_root() {
+        for marker_is_dir in [true, false] {
+            let (home, employee) = installed_layout();
+            let git = home.path().join(".git");
+            if marker_is_dir { std::fs::create_dir(&git).unwrap(); } else { std::fs::write(&git, "gitdir: x").unwrap(); }
+            let error = check_project_layers(&employee, None).unwrap_err();
+            assert!(error.contains(".codex") && error.contains("config.toml"), "{error}");
+            assert!(duduclaw_agent::mcp_spawn_gate::is_engine_local_spawn_gate_error(&error));
+        }
+    }
+
+    #[test]
+    fn layers_in_the_employee_directory_or_up_to_the_git_root_refuse() {
+        // In the employee directory itself (no git anywhere).
+        let (_home, employee) = installed_layout();
+        native_layer(&employee);
+        assert!(check_project_layers(&employee, None).is_err());
+        // Between the employee directory and the git root.
+        let (home, employee) = installed_layout();
+        std::fs::remove_file(home.path().join(".codex/config.toml")).unwrap();
+        std::fs::create_dir(home.path().join(".duduclaw/.git")).unwrap();
+        native_layer(&home.path().join(".duduclaw/agents"));
+        assert!(check_project_layers(&employee, None).is_err());
+        // Above the git root: out of range.
+        let (home, employee) = installed_layout();
+        std::fs::create_dir(home.path().join(".duduclaw/.git")).unwrap();
+        check_project_layers(&employee, None).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_uninspectable_git_marker_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        let (home, employee) = installed_layout();
+        let locked = home.path().join(".duduclaw/agents");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Running as root bypasses permission bits; only assert when it bites.
+        let blocked = std::fs::symlink_metadata(locked.join(".git")).is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound);
+        let result = has_git_marker(&locked);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if blocked { assert!(result.is_err()); }
+        let _ = employee;
     }
     #[test]
     fn refusals_are_typed_engine_local_spawn_gate_errors() {

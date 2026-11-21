@@ -29,17 +29,18 @@ fn channel(chat: &str, sender: &str, bound: Option<&str>) -> RequesterIdentity {
         chat: chat.into(),
         sender: sender.into(),
         user_id: bound.map(str::to_string),
+        attested_private: false,
     }
 }
 
 /// `(case, requester, public, own WebChat conversation, one-to-one, expected)`.
-#[test]
-fn trust_truth_table() {
+#[tokio::test]
+async fn trust_truth_table() {
     let widget = RequesterIdentity::ChannelUser {
-        channel: "widget".into(), chat: "v1".into(), sender: String::new(), user_id: None,
+        channel: "widget".into(), chat: "v1".into(), sender: String::new(), user_id: None, attested_private: false,
     };
     let livechat = RequesterIdentity::ChannelUser {
-        channel: "odoolivechat".into(), chat: "42".into(), sender: String::new(), user_id: None,
+        channel: "odoolivechat".into(), chat: "42".into(), sender: String::new(), user_id: None, attested_private: false,
     };
     let system = RequesterIdentity::System { kind: "internal".into(), on_behalf_of: None };
     let cases = [
@@ -61,6 +62,20 @@ fn trust_truth_table() {
     ];
     for (case, requester, public, own, one_to_one, expected) in cases {
         assert_eq!(inbound_guard_trust(&requester, public, own, one_to_one), expected, "{case}");
+    }
+    let googlechat = RequesterIdentity::ChannelUser {
+        channel: "googlechat".into(), chat: "spaces/DM1".into(), sender: "users/123".into(),
+        user_id: Some("u-1".into()), attested_private: false,
+    };
+    let cases = [
+        ("bound Google Chat sender, matching attestation",
+            Some(crate::ccr_runtime::OneToOneAttestation::googlechat_dm("spaces/DM1", "users/123").unwrap()), Relaxed),
+        ("bound Google Chat sender, no attestation", None, Strict),
+    ];
+    for (case, attestation, expected) in cases {
+        let trust = crate::ccr_runtime::ATTESTED_ONE_TO_ONE.scope(attestation,
+            scoped(None, googlechat.clone(), "googlechat:spaces/DM1", "users/123")).await;
+        assert_eq!(trust, expected, "{case}");
     }
 }
 
@@ -96,7 +111,7 @@ async fn signed_in_member_in_own_webchat_is_relaxed_through_real_signals() {
     // A widget visitor is a public session.
     let visitor = "widget-visitor:7f1c2a90-0000-4000-8000-0000000000aa";
     let widget = RequesterIdentity::ChannelUser {
-        channel: "widget".into(), chat: "7f1c".into(), sender: String::new(), user_id: None,
+        channel: "widget".into(), chat: "7f1c".into(), sender: String::new(), user_id: None, attested_private: false,
     };
     assert_eq!(scoped(Some(visitor), widget, "webchat:widget-chat", visitor).await, Strict);
 }

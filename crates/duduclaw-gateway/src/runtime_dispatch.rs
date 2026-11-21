@@ -315,10 +315,15 @@ async fn run_agent_prompt_inner(
         }
     };
     let provider = req.provider_override.unwrap_or(settings.provider);
-    crate::runtime_config::ensure_model_provider(req.model, provider).map_err(|error|RuntimeDispatchFailure::preflight(Some(provider),req.model,RuntimePreflightKind::Config,error))?;
-    crate::product_policy::require_runtime(req.home_dir, provider.as_str()).map_err(|error|RuntimeDispatchFailure::preflight(Some(provider),req.model,RuntimePreflightKind::Policy,error))?;
+    // v1.84.0: a bare Claude alias saved on a prefixed non-Claude engine runs
+    // with that engine's catalog default (warned once per agent) instead of
+    // being refused; every other mismatch keeps the refusal below.
+    let runnable_model = crate::runtime_config::runnable_model(req.agent_id, req.model, provider);
+    let model: &str = &runnable_model;
+    crate::runtime_config::ensure_model_provider(model, provider).map_err(|error|RuntimeDispatchFailure::preflight(Some(provider),model,RuntimePreflightKind::Config,error))?;
+    crate::product_policy::require_runtime(req.home_dir, provider.as_str()).map_err(|error|RuntimeDispatchFailure::preflight(Some(provider),model,RuntimePreflightKind::Policy,error))?;
     if in_utility_call() && !crate::runtime_config::utility_profile_supported(provider) {
-        return Err(RuntimeDispatchFailure::preflight(Some(provider), req.model,
+        return Err(RuntimeDispatchFailure::preflight(Some(provider), model,
             RuntimePreflightKind::Config, crate::runtime_config::utility_profile_refusal(provider)));
     }
     let fallback = if in_utility_call() { None } else { settings.fallback };
@@ -328,7 +333,7 @@ async fn run_agent_prompt_inner(
     // when no `[budget]` cap is set or `hard_stop = false`; unavailable data
     // follows the employee policy. Calls without an employee are exempt.
     crate::budget::gate_before_spawn(req.home_dir, req.agent_dir, req.agent_id, "runtime_dispatch")
-        .await.map_err(|e| RuntimeDispatchFailure::preflight(Some(provider), req.model, RuntimePreflightKind::Budget, e.to_string()))?;
+        .await.map_err(|e| RuntimeDispatchFailure::preflight(Some(provider), model, RuntimePreflightKind::Budget, e.to_string()))?;
 
     let mut reg = registry(req.home_dir).await;
     // RM-181: a runtime this employee is configured to use (primary or
@@ -341,7 +346,7 @@ async fn run_agent_prompt_inner(
     let ctx = RuntimeContext {
         agent_dir: req.agent_dir.map(PathBuf::from),
         system_prompt: req.system_prompt.to_string(),
-        model: req.model.to_string(),
+        model: model.to_string(),
         max_tokens: req.max_tokens,
         home_dir: req.home_dir.to_path_buf(),
         agent_id: req.agent_id.to_string(),
@@ -951,9 +956,12 @@ pub async fn run_utility_prompt_with_hint(
         None => crate::runtime_config::ensure_active_utility_provider(home_dir)?,
     }
     let base = crate::runtime_config::resolve_utility(home_dir, agent_dir);
-    let spec = crate::runtime_config::resolve_utility_profile(
+    let mut spec = crate::runtime_config::resolve_utility_profile(
         home_dir, agent_dir, apply_utility_hint(base, hint)?, has_explicit_utility_hint(hint),
     )?;
+    // v1.84.0: same bare-Claude-alias substitution as the conversational
+    // preflight, so the isolated and the in-process lane agree.
+    spec.model = crate::runtime_config::runnable_model(agent_id, &spec.model, spec.provider).into_owned();
     crate::product_policy::require_runtime(home_dir, spec.provider.as_str())?;
     crate::product_policy::require_model(crate::product_policy::load(home_dir)?, &spec.model)?;
     #[cfg(test)]
@@ -1040,6 +1048,10 @@ fn has_explicit_utility_hint(hint: Option<&UtilityModelHint>) -> bool {
 #[cfg(test)]
 #[path = "runtime_dispatch_attended_tests.rs"]
 mod attended_entry_tests;
+
+#[cfg(test)]
+#[path = "runtime_dispatch_model_substitution_tests.rs"]
+mod model_substitution_tests;
 
 #[cfg(test)]
 mod hint_tests {
@@ -1821,6 +1833,41 @@ mod utility_policy_tests {
             run_utility_prompt(home.path(), Some(&agent), "worker", "", "Summarize this", 16),
         )).await.unwrap_err();
         assert_eq!(error, denied);
+    }
+
+    /// RM-205: a Grok employee with nothing configured never reaches ANY
+    /// execution lane (Claude CLI or registry runtime): the typed
+    /// "unavailable" result is returned before `DENY_EXECUTION`, which sits
+    /// in front of both lanes. Only an explicit choice reaches execution.
+    #[tokio::test]
+    async fn grok_employee_without_explicit_service_makes_no_utility_call() {
+        let home = tempfile::tempdir().unwrap();
+        let agent = home.path().join("agents/worker");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(agent.join("agent.toml"), "[agent]\nname='worker'\nstatus='active'\n[runtime]\nprovider='grok'\n[model]\npreferred='grok-3'\n").unwrap();
+        let _registry = testing::RegistryGuard::install(home.path(), RuntimeRegistry::with_runtimes(HashMap::new())).await;
+        let call = |home: &Path, agent: &Path| {
+            let (home, agent) = (home.to_path_buf(), agent.to_path_buf());
+            async move {
+                DENY_EXECUTION.scope((), with_utility_context(&home,
+                    UtilityContext::Autonomous { target: "worker", callers: &[] },
+                    run_utility_prompt(&home, Some(&agent), "worker", "", "Summarize this", 16),
+                )).await.unwrap_err()
+            }
+        };
+        // No config.toml, then a config.toml without the key (built-in default only).
+        for config in [None, Some("[runtime]\nutility_model='claude-haiku-4-5'\n")] {
+            if let Some(config) = config { std::fs::write(home.path().join("config.toml"), config).unwrap(); }
+            let error = call(home.path(), &agent).await;
+            assert!(crate::runtime_config::is_utility_unavailable(&error), "{error}");
+        }
+        // An explicit global choice is honoured (reaches the execution gate).
+        std::fs::write(home.path().join("config.toml"), "[runtime]\nutility_provider='claude'\n").unwrap();
+        assert_eq!(call(home.path(), &agent).await, "test forbids utility execution");
+        // So is the employee's own setting.
+        std::fs::remove_file(home.path().join("config.toml")).unwrap();
+        std::fs::write(agent.join("agent.toml"), "[agent]\nname='worker'\nstatus='active'\n[runtime]\nprovider='grok'\nutility_provider='openai_compat'\n[model]\npreferred='grok-3'\nutility='gpt-5.4-mini'\n").unwrap();
+        assert_eq!(call(home.path(), &agent).await, "test forbids utility execution");
     }
 }
 

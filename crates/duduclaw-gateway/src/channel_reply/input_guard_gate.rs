@@ -22,7 +22,7 @@ const LEGACY_SYSTEM_PRINCIPAL: &str = "system";
 ///
 /// Anything else — unknown or system requesters, visitors, unbound senders,
 /// group chats, calls outside a guarded reply — is [`ScanTrust::Strict`].
-/// A later change will OR-in an attested Google Chat DM signal here.
+/// Google Chat DMs require an adapter attestation for this exact turn.
 pub(super) fn inbound_guard_trust(
     requester: &RequesterIdentity,
     public: bool,
@@ -60,7 +60,7 @@ pub(super) fn inbound_guard_trust_for_turn(session_id: &str, user_id: &str, agen
         &requester,
         super::assembly::public_session(session_id),
         !crate::scheduled_webchat::turn_origin(session_id, agent_id).is_empty(),
-        same_sender && duduclaw_core::is_private_session(session_id, user_id),
+        same_sender && crate::ccr_runtime::conversation_is_one_to_one(session_id, user_id),
     )
 }
 

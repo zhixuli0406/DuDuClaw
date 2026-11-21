@@ -1,6 +1,7 @@
 use super::*;
 
 mod ccr_guarded_reply;
+mod continuity;
 mod fallback;
 mod fixed_notice_pipeline;
 mod future_size;
