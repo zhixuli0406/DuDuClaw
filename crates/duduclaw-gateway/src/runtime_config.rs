@@ -596,6 +596,13 @@ fn raw_agent_timeout_secs(agent_dir: &Path) -> Option<i64> {
         .and_then(|text| agent_toml::parse(&text).runtime.timeout_secs)
 }
 
+/// Raw `agent.toml [runtime] utility_provider` string, if written.
+fn raw_agent_utility_provider(agent_dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(agent_dir.join("agent.toml")).ok()?;
+    let table: toml::Table = text.parse().ok()?;
+    table.get("runtime")?.get("utility_provider")?.as_str().map(str::to_string)
+}
+
 /// Resolve the typed per-agent timeout, tolerating old or malformed settings.
 pub fn agent_timeout_secs(agent_dir: &Path) -> u64 {
     resolve_timeout(Some(agent_dir), timeout_policy(agent_dir), DEFAULT_RUN_TIMEOUT_SECS, false)
@@ -710,6 +717,10 @@ pub fn read_runtime_json(agent_dir: &Path) -> serde_json::Value {
     }
     if let Some(s) = rt.fallback {
         obj.insert("fallback".into(), serde_json::Value::String(s));
+    }
+    // RM-205: the employee's own value as written (per-agent authority field).
+    if let Some(s) = raw_agent_utility_provider(agent_dir) {
+        obj.insert("utility_provider".into(), serde_json::Value::String(s));
     }
     if let Some(secs) = raw_agent_timeout_secs(agent_dir) {
         obj.insert("timeout_secs".into(), serde_json::Value::from(secs));
@@ -1130,8 +1141,162 @@ pub(crate) fn utility_profile_refusal(provider: RuntimeType) -> String {
     format!("utility runtime {} has no supported utility profile", provider.as_str())
 }
 
-/// Resolve execution, keeping explicit judge hints fail-closed. Only an
-/// employee's unsupported runtime may fall back to the global utility spec.
+// ── RM-205: background work follows the employee's engine ───────────────
+//
+// An employee whose engine has no utility profile (Grok, generic CLIs) used
+// to send its background work — pinned-instruction extraction, key facts,
+// summaries, titles, classifiers — to the GLOBAL utility provider, which
+// defaults to Claude: the user's messages reached another vendor than the
+// one configured for the employee. The rule now:
+//   1. the employee's engine supports utility calls → use it (unchanged);
+//   2. otherwise another service only when an administrator chose one: the
+//      employee's `agent.toml [runtime] utility_provider`, or the global
+//      `config.toml [runtime] utility_provider` when that KEY IS PRESENT
+//      (the built-in Claude default does not count);
+//   3. otherwise the call is unavailable: a typed, clean skip.
+
+/// Marker at the start of the error a utility call returns when no service
+/// may run it ([`is_utility_unavailable`]). Callers skip cleanly: nothing is
+/// written, nothing is shown, no health penalty.
+pub const UTILITY_UNAVAILABLE_PREFIX: &str = "[utility_unavailable] ";
+
+/// The typed "unavailable" result of a utility call.
+pub fn utility_unavailable_error() -> String {
+    format!("{UTILITY_UNAVAILABLE_PREFIX}background work skipped: this employee's engine has no utility profile and no other service is configured")
+}
+
+/// Anchored check for [`utility_unavailable_error`].
+pub fn is_utility_unavailable(error: &str) -> bool {
+    error.starts_with(UTILITY_UNAVAILABLE_PREFIX)
+}
+
+/// Where an employee's background work runs, for the dashboard and doctor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UtilityRouteSource {
+    EmployeeEngine,
+    EmployeeSetting,
+    GlobalSetting,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UtilityRoute {
+    pub provider: Option<RuntimeType>,
+    pub source: UtilityRouteSource,
+}
+
+impl UtilityRoute {
+    pub fn to_json(self) -> serde_json::Value {
+        serde_json::json!({
+            "provider": self.provider.map(|p| p.as_str()),
+            "source": self.source,
+        })
+    }
+}
+
+/// `claude|codex|openai_compat` for messages (the utility-capable runtimes).
+pub(crate) fn utility_capable_providers_display() -> String {
+    RuntimeType::ALL.iter().copied().filter(|rt| utility_profile_supported(*rt))
+        .map(|rt| rt.as_str()).collect::<Vec<_>>().join("|")
+}
+
+/// The employee's own `agent.toml [runtime] utility_provider` (per-agent
+/// authority field: preset artifacts are ignored). An unknown, removed or
+/// utility-incapable value is treated as UNSET, never as "use a default".
+pub(crate) fn employee_utility_provider(agent_dir: &Path) -> Option<RuntimeType> {
+    let text = std::fs::read_to_string(agent_dir.join("agent.toml")).ok()?;
+    let table: toml::Table = text.parse().ok()?;
+    let raw = table.get("runtime")?.get("utility_provider")?;
+    let parsed = raw.as_str()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .and_then(RuntimeType::from_id)
+        .filter(|rt| utility_profile_supported(*rt));
+    if parsed.is_none() {
+        static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>> = std::sync::OnceLock::new();
+        if WARNED.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner()).insert(agent_dir.to_path_buf()) {
+            tracing::warn!(agent_dir = %agent_dir.display(),
+                "[runtime] utility_provider is not a runtime with a utility profile — ignored (treated as unset)");
+        }
+    }
+    parsed
+}
+
+/// The global `config.toml [runtime] utility_provider` ONLY when the key is
+/// present (an explicit administrator choice). `None` when absent;
+/// `Some(None)` when present but unusable (unknown, removed or without a
+/// utility profile), which is treated as unset.
+pub(crate) fn explicit_global_utility_provider(home_dir: &Path) -> Option<Option<RuntimeType>> {
+    let cfg = read_global_config(home_dir)?;
+    let raw = cfg.get("runtime")?.get("utility_provider")?;
+    Some(raw.as_str()
+        .and_then(RuntimeType::parse)
+        .filter(|rt| utility_profile_supported(*rt)))
+}
+
+/// Which service runs `agent_dir`'s background work (no call is made).
+pub fn utility_route(home_dir: &Path, agent_dir: &Path) -> UtilityRoute {
+    let engine = load_runtime_settings(agent_dir).provider;
+    if utility_profile_supported(engine) {
+        return UtilityRoute { provider: Some(engine), source: UtilityRouteSource::EmployeeEngine };
+    }
+    if let Some(provider) = employee_utility_provider(agent_dir) {
+        return UtilityRoute { provider: Some(provider), source: UtilityRouteSource::EmployeeSetting };
+    }
+    match explicit_global_utility_provider(home_dir) {
+        Some(Some(provider)) => UtilityRoute { provider: Some(provider), source: UtilityRouteSource::GlobalSetting },
+        _ => UtilityRoute { provider: None, source: UtilityRouteSource::Unavailable },
+    }
+}
+
+/// Utility model for an employee-selected utility service: the employee's
+/// `[model] utility` when it belongs to that service, else the global
+/// utility model when the global setting names the same service, else the
+/// service default.
+fn employee_utility_model(home_dir: &Path, agent_dir: &Path, provider: RuntimeType) -> String {
+    let sections = read_sections(agent_dir);
+    if let Some(model) = sections.model.utility.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+        let familyless = provider.spec().model_prefixes.is_empty();
+        if model_matches_provider(model, provider)
+            && (familyless || model_family(model) == Some(provider.spec().id)) {
+            return model.to_string();
+        }
+    }
+    let global = global_utility_spec(home_dir);
+    if global.provider == provider && !global.model.trim().is_empty() {
+        return global.model;
+    }
+    if provider == RuntimeType::Claude { DEFAULT_UTILITY_MODEL.to_string() } else { String::new() }
+}
+
+/// One info line per employee per process about where its background work
+/// goes when its own engine cannot run it.
+fn note_utility_route_once(agent_dir: &Path, engine: RuntimeType, route: UtilityRoute) {
+    static NOTED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>> = std::sync::OnceLock::new();
+    if NOTED.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner()).insert(agent_dir.to_path_buf()) {
+        tracing::info!(agent = %agent_dir.display(), runtime = engine.as_str(),
+            utility_runtime = route.provider.map(|p| p.as_str()).unwrap_or("none"),
+            source = ?route.source,
+            "employee runtime has no utility profile; background work routed by explicit setting or skipped");
+    }
+}
+
+/// System doctor line naming the employees whose background work is skipped.
+pub(crate) fn utility_skipped_doctor_line(home_dir: &Path, employees: &[(String, std::path::PathBuf)]) -> Option<String> {
+    let skipped: Vec<&str> = employees.iter()
+        .filter(|(_, dir)| utility_route(home_dir, dir).source == UtilityRouteSource::Unavailable)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    (!skipped.is_empty()).then(|| format!(
+        "以下 AI 員工的執行引擎不支援背景整理工作（重點事實、摘要、標題），目前已略過：{}。可在員工設定指定要改用的服務。",
+        skipped.join("、")
+    ))
+}
+
+/// Resolve execution, keeping explicit judge hints fail-closed. An
+/// employee's unsupported runtime uses another service only when an
+/// administrator configured one (RM-205); otherwise the call is unavailable.
 pub(crate) fn resolve_utility_profile(
     home: &Path,
     agent: Option<&Path>,
@@ -1154,25 +1319,32 @@ pub(crate) fn resolve_utility_profile(
         None => validate_utility_config(&home.join("config.toml"), "utility_provider", true)?,
     }
     if utility_profile_supported(spec.provider) { return Ok(spec); }
-    if explicit_hint || agent.is_none() {
+    let Some(dir) = agent.filter(|_| !explicit_hint) else {
         return Err(utility_profile_refusal(spec.provider));
+    };
+    // (2a) the employee's own explicit choice.
+    if let Some(provider) = employee_utility_provider(dir) {
+        let route = UtilityRoute { provider: Some(provider), source: UtilityRouteSource::EmployeeSetting };
+        note_utility_route_once(dir, spec.provider, route);
+        return Ok(UtilitySpec { provider, model: employee_utility_model(home, dir, provider) });
     }
+    // (2b) the global setting, only when the key is present. A malformed
+    // config or a removed runtime still refuses (fail closed).
     validate_utility_config(&home.join("config.toml"), "utility_provider", true)?;
-    ensure_active_utility_provider(home)?;
-    let fallback = global_utility_spec(home);
-    // Warn once per employee/runtime, including when the global setting is
-    // itself unsupported. No silent retry through the conversational runtime.
-    static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(std::path::PathBuf, RuntimeType)>>> = std::sync::OnceLock::new();
-    let key = (agent.unwrap().to_path_buf(), spec.provider);
-    if WARNED.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner()).insert(key) {
-        tracing::warn!(agent = %agent.unwrap().display(), runtime = spec.provider.as_str(),
-            global_runtime = fallback.provider.as_str(),
-            "utility runtime has no supported utility profile; using global background settings only if a utility profile is supported");
+    if let Some(Some(provider)) = explicit_global_utility_provider(home) {
+        ensure_active_utility_provider(home)?;
+        let global = global_utility_spec(home);
+        if global.provider == provider {
+            note_utility_route_once(dir, spec.provider,
+                UtilityRoute { provider: Some(provider), source: UtilityRouteSource::GlobalSetting });
+            return Ok(global);
+        }
     }
-    if !utility_profile_supported(fallback.provider) {
-        return Err(utility_profile_refusal(fallback.provider));
-    }
-    Ok(fallback)
+    // (3) nobody chose a service: a clean, typed skip. Never the built-in
+    // Claude default — the user's text must not reach another vendor.
+    note_utility_route_once(dir, spec.provider,
+        UtilityRoute { provider: None, source: UtilityRouteSource::Unavailable });
+    Err(utility_unavailable_error())
 }
 
 #[cfg(test)]
@@ -1221,8 +1393,10 @@ mod tests {
         }
     }
 
+    /// RM-205: an unsupported engine never falls back to the BUILT-IN
+    /// default; only an explicit global key or employee setting routes it.
     #[test]
-    fn utility_profiles_fallback_only_to_a_verified_global_runtime() {
+    fn utility_profiles_fallback_only_to_an_explicit_verified_runtime() {
         let home = TempDir::new().unwrap();
         let agent = TempDir::new().unwrap();
         std::fs::write(agent.path().join("agent.toml"), "").unwrap();
@@ -1231,19 +1405,71 @@ mod tests {
             if utility_profile_supported(provider) {
                 assert_eq!(resolve_utility_profile(home.path(), Some(agent.path()), spec.clone(), false).unwrap(), spec);
             } else {
-                assert_eq!(resolve_utility_profile(home.path(), Some(agent.path()), spec.clone(), false).unwrap(),
-                    UtilitySpec { provider: RuntimeType::Claude, model: DEFAULT_UTILITY_MODEL.into() });
+                let error = resolve_utility_profile(home.path(), Some(agent.path()), spec.clone(), false).unwrap_err();
+                assert!(is_utility_unavailable(&error), "{provider:?}: {error}");
                 assert!(resolve_utility_profile(home.path(), None, spec.clone(), false).is_err());
-                assert!(resolve_utility_profile(home.path(), Some(agent.path()), spec.clone(), true).is_err());
+                let hinted = resolve_utility_profile(home.path(), Some(agent.path()), spec.clone(), true).unwrap_err();
+                assert!(!is_utility_unavailable(&hinted), "explicit hints keep their refusal");
             }
         }
+        // An explicit global value without a utility profile is unusable ⇒ unavailable.
         std::fs::write(home.path().join("config.toml"), "[runtime]\nutility_provider='grok'\n").unwrap();
-        assert!(resolve_utility_profile(home.path(), Some(agent.path()),
-            UtilitySpec { provider: RuntimeType::Grok, model: "gemini".into() }, false).is_err());
+        assert!(is_utility_unavailable(&resolve_utility_profile(home.path(), Some(agent.path()),
+            UtilitySpec { provider: RuntimeType::Grok, model: "gemini".into() }, false).unwrap_err()));
         std::fs::write(home.path().join("config.toml"), "[runtime]\nutility_provider='openai_compat'\nutility_model='fixture-model'\n").unwrap();
         assert_eq!(resolve_utility_profile(home.path(), Some(agent.path()),
             UtilitySpec { provider: RuntimeType::Grok, model: "grok".into() }, false).unwrap(),
             UtilitySpec { provider: RuntimeType::OpenAiCompat, model: "fixture-model".into() });
+    }
+
+    /// RM-205 resolution table (the dashboard's `utility_route`).
+    #[test]
+    fn utility_route_resolution_table() {
+        let route = |home: &Path, agent: &Path| utility_route(home, agent);
+        let fixture = |agent_toml: &str, config: Option<&str>| {
+            let home = TempDir::new().unwrap();
+            let agent = home.path().join("agents/worker");
+            std::fs::create_dir_all(&agent).unwrap();
+            std::fs::write(agent.join("agent.toml"), agent_toml).unwrap();
+            if let Some(config) = config { std::fs::write(home.path().join("config.toml"), config).unwrap(); }
+            (home, agent)
+        };
+        // Supported engine → its own engine, whatever else is configured.
+        let (home, agent) = fixture("[runtime]\nprovider='codex'\nutility_provider='claude'\n", Some("[runtime]\nutility_provider='claude'\n"));
+        assert_eq!(route(home.path(), &agent), UtilityRoute { provider: Some(RuntimeType::Codex), source: UtilityRouteSource::EmployeeEngine });
+        // Unsupported + employee setting.
+        let (home, agent) = fixture("[runtime]\nprovider='grok'\nutility_provider='openai_compat'\n", None);
+        assert_eq!(route(home.path(), &agent), UtilityRoute { provider: Some(RuntimeType::OpenAiCompat), source: UtilityRouteSource::EmployeeSetting });
+        let spec = resolve_utility(home.path(), Some(&agent));
+        assert_eq!(resolve_utility_profile(home.path(), Some(&agent), spec, false).unwrap().provider, RuntimeType::OpenAiCompat);
+        // Unsupported + explicit global.
+        let (home, agent) = fixture("[runtime]\nprovider='grok'\n", Some("[runtime]\nutility_provider='claude'\n"));
+        assert_eq!(route(home.path(), &agent), UtilityRoute { provider: Some(RuntimeType::Claude), source: UtilityRouteSource::GlobalSetting });
+        let spec = resolve_utility(home.path(), Some(&agent));
+        assert_eq!(resolve_utility_profile(home.path(), Some(&agent), spec, false).unwrap(),
+            UtilitySpec { provider: RuntimeType::Claude, model: DEFAULT_UTILITY_MODEL.into() });
+        // Unsupported + only the built-in default (no key, or a config without it) → unavailable.
+        for config in [None, Some("[runtime]\nutility_model='claude-haiku-4-5'\n")] {
+            let (home, agent) = fixture("[runtime]\nprovider='grok'\n", config);
+            assert_eq!(route(home.path(), &agent), UtilityRoute { provider: None, source: UtilityRouteSource::Unavailable });
+            let spec = resolve_utility(home.path(), Some(&agent));
+            assert!(is_utility_unavailable(&resolve_utility_profile(home.path(), Some(&agent), spec, false).unwrap_err()));
+            assert!(utility_skipped_doctor_line(home.path(), &[("worker".into(), agent.clone())]).unwrap().contains("worker"));
+        }
+        // Invalid / unknown / utility-incapable employee values are ignored (treated as unset).
+        for bad in ["'nonsense'", "'grok'", "1", "''"] {
+            let (home, agent) = fixture(&format!("[runtime]\nprovider='grok'\nutility_provider={bad}\n"), None);
+            assert_eq!(employee_utility_provider(&agent), None, "{bad}");
+            assert_eq!(route(home.path(), &agent).source, UtilityRouteSource::Unavailable, "{bad}");
+            let (home, agent) = fixture(&format!("[runtime]\nprovider='grok'\nutility_provider={bad}\n"), Some("[runtime]\nutility_provider='claude'\n"));
+            assert_eq!(route(home.path(), &agent).source, UtilityRouteSource::GlobalSetting, "{bad}");
+        }
+        // Presence, not the default: distinguishes an explicit value.
+        let home = TempDir::new().unwrap();
+        assert_eq!(explicit_global_utility_provider(home.path()), None);
+        std::fs::write(home.path().join("config.toml"), "[runtime]\nutility_provider='claude'\n").unwrap();
+        assert_eq!(explicit_global_utility_provider(home.path()), Some(Some(RuntimeType::Claude)));
+        assert_eq!(route(home.path(), home.path()).to_json(), serde_json::json!({"provider": "claude", "source": "employee_engine"}));
     }
 
     #[test]
@@ -2387,6 +2613,9 @@ mod tests {
 #[path = "runtime_config/alignment.rs"]
 mod alignment;
 pub(crate) use alignment::{ModelRuntimeAlignment, align_model_runtime, ensure_model_provider};
+pub(crate) use alignment::{model_substitution_notice, model_substitution_notices, runnable_model};
+#[cfg(test)]
+pub(crate) use alignment::bare_claude_alias_substitute;
 #[cfg(test)]
 pub(crate) use alignment::testing;
 

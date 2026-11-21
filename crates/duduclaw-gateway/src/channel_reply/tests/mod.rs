@@ -1,6 +1,7 @@
 use super::*;
 
 mod ccr_guarded_reply;
+mod continuity;
 mod fallback;
 mod future_size;
 mod googlechat_no_responder;

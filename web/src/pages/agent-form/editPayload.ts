@@ -194,6 +194,7 @@ export const ADMIN_ONLY_FORM_PATHS_FALLBACK: ReadonlyArray<string> = [
   'odoo.',
   'runtime.provider',
   'runtime.fallback',
+  'runtime.utility_provider',
   'form.reply_language',
   'osWatch.',
   'adv.account_pool',
@@ -365,6 +366,8 @@ export function buildUpdatePayload(
   const rt: Record<string, unknown> = {};
   if (has(dirty, 'runtime.provider')) rt.provider = s.runtime.provider;
   if (has(dirty, 'runtime.fallback')) rt.fallback = s.runtime.fallback;
+  // RM-205: '' clears it ("不使用其他服務").
+  if (has(dirty, 'runtime.utility_provider')) rt.utility_provider = s.runtime.utility_provider;
   if (has(dirty, 'runtime.idle_timeout_secs')) rt.idle_timeout_secs = s.runtime.idle_timeout_secs;
   if (has(dirty, 'runtime.timeout_secs')) rt.timeout_secs = s.runtime.timeout_secs;
   if (has(dirty, 'runtime.max_turns')) rt.max_turns = s.runtime.max_turns;

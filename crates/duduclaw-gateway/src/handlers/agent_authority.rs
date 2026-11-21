@@ -101,6 +101,9 @@ pub(crate) const AUTHORITY: &[AuthorityKey] = &[
     // The runtime decides the sandbox and the tool semantics.
     key("runtime.provider", &["runtime.provider"], Change),
     key("runtime.fallback", &["runtime.fallback"], Change),
+    // RM-205: which outside service receives the employee's conversation
+    // text for background work.
+    key("runtime.utility_provider", &["runtime.utility_provider"], Change),
     key("runtime.idle_timeout_secs", &["runtime.idle_timeout_secs"], Loosen),
     key("runtime.timeout_secs", &["runtime.timeout_secs"], Loosen),
     key("runtime.max_turns", &["runtime.max_turns"], Loosen),
@@ -129,7 +132,8 @@ fn effective(table: &toml::Table, key: &str) -> Value {
     let raw = toml_at_json(table, key);
     let or = |v: Value| if raw.is_null() { v } else { raw.clone() };
     match key {
-        "agent.reports_to" | "agent.department" | "agent.name" | "agent.role" | "runtime.fallback" => {
+        "agent.reports_to" | "agent.department" | "agent.name" | "agent.role" | "runtime.fallback"
+        | "runtime.utility_provider" => {
             or(Value::String(String::new()))
         }
         "runtime.idle_timeout_secs" => json!(raw.as_i64().filter(|n| *n >= 0).unwrap_or(900)),

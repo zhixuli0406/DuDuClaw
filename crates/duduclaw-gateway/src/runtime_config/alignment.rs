@@ -115,6 +115,90 @@ pub(crate) fn ensure_model_provider(model: &str, provider: RuntimeType) -> Resul
         ))
     }
 }
+/// v1.84.0 compatibility for employees saved before the bare Claude CLI
+/// aliases became the Claude family: a non-Claude engine that declares model
+/// prefixes (Codex, Grok, Qwen, …) and is configured with EXACTLY one of
+/// [`duduclaw_core::runtime_catalog::CLAUDE_CLI_MODEL_ALIASES`] runs with its
+/// own catalog default (the same source `failover::resolve_fallback_model`
+/// uses for `catalog_default`) instead of being refused at preflight.
+/// Full `claude-*` names, Claude itself and familyless runtimes
+/// (`openai_compat`, multi-vendor shells) are untouched: `None`.
+pub(crate) fn bare_claude_alias_substitute(model: &str, provider: RuntimeType) -> Option<&'static str> {
+    if provider == RuntimeType::Claude || !duduclaw_core::runtime_catalog::is_claude_cli_model_alias(model) {
+        return None;
+    }
+    let spec = provider.spec();
+    if spec.model_prefixes.is_empty() {
+        return None;
+    }
+    spec.fallback_models.first().map(|(id, _label)| *id)
+}
+
+/// Plain engine name for the substitution notice.
+fn engine_plain_name(provider: RuntimeType) -> &'static str {
+    match provider {
+        RuntimeType::Codex => "ChatGPT",
+        other => other.spec().display_name,
+    }
+}
+
+/// The zh-TW notice shown once in the employee's diagnostics and doctor.
+pub(crate) fn model_substitution_notice_zh(model: &str, provider: RuntimeType) -> String {
+    format!(
+        "這位 AI 員工設定的模型（{}）不屬於它的執行引擎（{}），已改用該引擎的預設模型。請到員工設定重新選擇模型。",
+        duduclaw_core::truncate_chars(model.trim(), 40),
+        engine_plain_name(provider)
+    )
+}
+
+type SubstitutionLog = std::sync::Mutex<std::collections::BTreeMap<String, (String, RuntimeType)>>;
+fn substitution_log() -> &'static SubstitutionLog {
+    static LOG: std::sync::OnceLock<SubstitutionLog> = std::sync::OnceLock::new();
+    LOG.get_or_init(Default::default)
+}
+
+/// The model the runtime layer actually starts `provider` with. Applies
+/// [`bare_claude_alias_substitute`] and records it (one warning per agent per
+/// process; the notice is kept for diagnostics). Anything else is returned
+/// unchanged and still goes through [`ensure_model_provider`].
+pub(crate) fn runnable_model<'a>(agent: &str, model: &'a str, provider: RuntimeType) -> std::borrow::Cow<'a, str> {
+    let Some(substitute) = bare_claude_alias_substitute(model, provider) else {
+        return std::borrow::Cow::Borrowed(model);
+    };
+    let key = if agent.is_empty() { "-".to_string() } else { agent.to_string() };
+    let first = substitution_log()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, (model.trim().to_string(), provider))
+        .is_none();
+    if first {
+        tracing::warn!(agent, configured_model = %duduclaw_core::truncate_chars(model.trim(), 40),
+            runtime = provider.as_str(), substitute,
+            "configured model is a Claude alias that this runtime cannot run; using the runtime's default model");
+    }
+    std::borrow::Cow::Owned(substitute.to_string())
+}
+
+/// The substitution notice recorded for `agent` in this process, if any.
+pub(crate) fn model_substitution_notice(agent: &str) -> Option<String> {
+    substitution_log()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(agent)
+        .map(|(model, provider)| model_substitution_notice_zh(model, *provider))
+}
+
+/// Every recorded substitution, `(agent, notice)`, for the system doctor.
+pub(crate) fn model_substitution_notices() -> Vec<(String, String)> {
+    substitution_log()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|(agent, _)| agent.as_str() != "-")
+        .map(|(agent, (model, provider))| (agent.clone(), model_substitution_notice_zh(model, *provider)))
+        .collect()
+}
+
 #[cfg(test)]
 pub(crate) mod testing {
     use std::collections::HashMap;

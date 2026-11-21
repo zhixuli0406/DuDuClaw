@@ -9,6 +9,7 @@ pub mod codex_sandbox;
 pub mod generic_cli;
 pub mod grok;
 pub mod openai_compat;
+pub mod prompt_budget;
 mod isolation_gate;
 pub(crate) mod third_party_mcp;
 

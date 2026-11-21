@@ -1256,8 +1256,13 @@ async fn build_reply_with_session_inner_impl(
         crate::prediction::task_forward_store::TaskForwardModelConfig::from_home(&ctx.home_dir)
             .held_out_gate_enabled;
     let mut armed_shadow = crate::playbook::ArmedShadow::default();
+    // RM-204: section boundaries for the single-argument budget (Grok,
+    // generic CLIs). Records lengths only; the text is unchanged.
+    use crate::runtime::prompt_budget::PromptSection as Ps;
+    let mut prompt_layout = crate::runtime::prompt_budget::PromptLayout::default();
     let full_system_prompt = {
         let mut prompt = system_prompt;
+        prompt_layout.mark(Ps::Base, &prompt);
 
         // P2 Key-Fact Accumulator: inject cross-session facts (middle position —
         // stable reference data that doesn't need U-shaped peak attention).
@@ -1316,6 +1321,7 @@ async fn build_reply_with_session_inner_impl(
                 }
             }
         }
+        prompt_layout.mark(Ps::Reducible("key facts"), &prompt);
 
         // WP1.3: turn-signal assembly for playbook injection below.
         // `channel:` from the session id's leading segment (established
@@ -1362,6 +1368,7 @@ async fn build_reply_with_session_inner_impl(
                 prompt = format!("{prompt}\n\n## Past Mistakes to Avoid\n{section}");
             }
         }
+        prompt_layout.mark(Ps::Reducible("past mistakes"), &prompt);
 
         // F2a extension (ACE/ExpeL rule lifecycle) → WP1.3 playbook
         // injection: signal-matched entries (built from `turn_signals` above)
@@ -1414,6 +1421,7 @@ async fn build_reply_with_session_inner_impl(
                 armed_shadow = armed;
             }
         }
+        prompt_layout.mark(Ps::Reducible("playbook"), &prompt);
 
         // B3 cross-session user profile: inject a session-stable
         // `## About This User` block of the sender's accumulated preference
@@ -1451,6 +1459,7 @@ async fn build_reply_with_session_inner_impl(
                 prompt = format!("{prompt}\n\n{section}");
             }
         }
+        prompt_layout.mark(Ps::Reducible("user profile"), &prompt);
 
         // RFC-24 (F1 injection): surface this agent's still-open decisions so a
         // later "用方案 C" resolves from durable state, not conversation memory.
@@ -1485,6 +1494,7 @@ async fn build_reply_with_session_inner_impl(
                 }
             }
         }
+        prompt_layout.mark(Ps::Reducible("open decisions"), &prompt);
 
         // WP-6F (agent presets P1): the agent-visible preset line — placed
         // BEFORE working_state (design §3.2: "preset 行接在它前面即可"). Tail
@@ -1501,6 +1511,7 @@ async fn build_reply_with_session_inner_impl(
                 prompt = format!("{prompt}\n\n{section}");
             }
         }
+        prompt_layout.mark(Ps::Reducible("preset"), &prompt);
 
         // Cross-wake working state: the agent's authoritative key-value
         // posture + handoff note (working_state.rs, D3 ghost-memory fix).
@@ -1517,6 +1528,7 @@ async fn build_reply_with_session_inner_impl(
                 prompt = format!("{prompt}\n\n{section}");
             }
         }
+        prompt_layout.mark(Ps::Reducible("working state"), &prompt);
 
         // Cross-invocation continuity: recent self-action feed from the
         // audit log — the channel run opens aware of what this agent already
@@ -1534,6 +1546,7 @@ async fn build_reply_with_session_inner_impl(
                 prompt = format!("{prompt}\n\n{section}");
             }
         }
+        prompt_layout.mark(Ps::Reducible("recent actions"), &prompt);
 
         // Goal intent router (P0) — L2-B grey-band instruction. Only present
         // when THIS turn's own L0/L1 score landed in the grey band
@@ -1562,6 +1575,8 @@ async fn build_reply_with_session_inner_impl(
         if let Some(hint) = &operator_guide_hint {
             prompt = format!("{prompt}\n\n{hint}");
         }
+        // Goal-intent / Google Chat / operator lines: short per-turn instructions.
+        prompt_layout.mark(Ps::Instruction, &prompt);
 
         for summary in [&compression_summary, &async_summary] {
             if !summary.trim().is_empty() {
@@ -1569,6 +1584,7 @@ async fn build_reply_with_session_inner_impl(
                 prompt.push_str(&crate::session_summarizer::summary_system_context(summary));
             }
         }
+        prompt_layout.mark(Ps::Summary, &prompt);
         if !pinned.is_empty() {
             prompt = format!(
                 "{prompt}\n\n## Pinned Task Instructions\n\
@@ -1576,6 +1592,7 @@ async fn build_reply_with_session_inner_impl(
                  {pinned}"
             );
         }
+        prompt_layout.mark(Ps::Pinned, &prompt);
         prompt
     };
     #[cfg(test)]
@@ -1596,6 +1613,7 @@ async fn build_reply_with_session_inner_impl(
         Some(note) => format!("{full_system_prompt}\n\n{note}"),
         None => full_system_prompt,
     };
+    prompt_layout.mark(Ps::HistoricalNote, &full_system_prompt);
     // RFC-23 `[redaction.sources] system_prompt` (v1.68.0): default
     // `selective` — only rules marked `apply_to_system_prompt` fire. Fail
     // closed like the user-input pass above.
@@ -1608,7 +1626,11 @@ async fn build_reply_with_session_inner_impl(
             component: "channel_reply".to_string(),
         },
     ) {
-        Ok(p) => p,
+        Ok(p) => {
+            // A rewrite moves the recorded boundaries: no layout this turn.
+            if p != full_system_prompt { prompt_layout.invalidate(); }
+            p
+        }
         Err(e) => {
             warn!(session_id, error = %e, "redaction of system prompt failed — turn stopped");
             super::health::receive(ctx, &agent_id, session_id).await;
@@ -1709,6 +1731,7 @@ async fn build_reply_with_session_inner_impl(
     }
     let full_system_prompt =
         crate::knowledge::auto_retrieve::with_rules(full_system_prompt, turn_knowledge.rules);
+    prompt_layout.mark(Ps::KnowledgeRules, &full_system_prompt);
     // Group history follows the same user-side reference path as retrieved
     // passages, outside the system prompt and durable conversation history.
     let group_context = super::group_buffer::prompt(ctx).await;
@@ -1757,6 +1780,9 @@ async fn build_reply_with_session_inner_impl(
         session_id,
     ))
     .await;
+    // A bisect summary may have been appended as system context.
+    prompt_layout.mark(Ps::Summary, &full_system_prompt);
+    let prompt_layout = prompt_layout.finish(&full_system_prompt);
 
     // RFC-25 Phase 1 (L8): provider-agnostic routing via the centralized
     // decision predicate. When the agent's `[runtime] provider` is not Claude,
@@ -1860,6 +1886,7 @@ async fn build_reply_with_session_inner_impl(
         let hb_model = model.as_str();
         let hb_history = conversation_history.as_slice();
         let hb_settings = runtime_settings.as_ref();
+        let hb_layout = prompt_layout.clone();
         // Observability fix (2026-07-23 distributor incident): a silent
         // failover — the configured provider's CLI missing/unavailable so
         // `execute_with_failover` fell through to Claude — used to be
@@ -1891,6 +1918,8 @@ async fn build_reply_with_session_inner_impl(
                     purpose: crate::runtime_dispatch::SpawnPurpose::EmployeeTurn,
                 }));
             let work = crate::runtime_dispatch::CHANNEL_REPLY_PARTIAL.scope((), work);
+            // RM-204: section boundaries for single-argument runtimes.
+            let work = crate::runtime::prompt_budget::with_layout(hb_layout, work);
             tokio::pin!(work);
             let mut ticker =
                 tokio::time::interval(std::time::Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
@@ -2565,6 +2594,8 @@ async fn build_reply_with_session_inner_impl(
                                         None => return, // Utility said not a decision
                                     }
                                 }
+                                // RM-205: no service for background work ⇒ clean skip.
+                                Err(e) if crate::runtime_config::is_utility_unavailable(&e) => return,
                                 Err(e) => {
                                     tracing::warn!(error = %e, "decision capture: utility second-pass failed");
                                     return;
@@ -2838,6 +2869,8 @@ async fn build_reply_with_session_inner_impl(
                             }
                         }
                     }
+                    // RM-205: no service for background work ⇒ clean skip.
+                    Err(e) if crate::runtime_config::is_utility_unavailable(&e) => {}
                     Err(e) => {
                         warn!(session_id = %sid, error = %e, "Instruction extraction failed (best-effort, non-blocking)");
                     }
@@ -2886,6 +2919,8 @@ async fn build_reply_with_session_inner_impl(
                     .await
                     {
                         Ok(t) => t,
+                        // RM-205: no service for background work ⇒ clean skip.
+                        Err(e) if crate::runtime_config::is_utility_unavailable(&e) => return,
                         Err(e) => {
                             warn!(agent = %agent_id_for_facts, error = %e, "Key-fact extraction failed (best-effort)");
                             return;
@@ -4081,6 +4116,13 @@ async fn build_reply_with_session_inner_impl(
                         return;
                     }
                     Ok(s) => s,
+                    // RM-205: no service for background work — the conversation
+                    // stays intact (history is still capped by the 48 KB rule);
+                    // backs off quietly instead of retrying every turn.
+                    Err(e) if crate::runtime_config::is_utility_unavailable(&e) => {
+                        summary_attempt_finished_async(&home_for_compress, &sid, "compression", Some(SummaryFailure::Unavailable)).await;
+                        return;
+                    }
                     Err(_) => {
                         summary_attempt_finished_async(&home_for_compress, &sid, "compression", Some(SummaryFailure::Utility)).await;
                         return;
@@ -4153,8 +4195,23 @@ async fn build_reply_with_session_inner_impl(
             super::failure_notice::persist_work_partial(ctx, session_id, &agent_id, &partial, turn_generation.as_deref()).await
         } else { false }
     } else { false };
-    super::failure_notice::FAILURE_DETAILS.scope((reason.as_str(), crate::work_outcome::WorkOutcome::decode(&failure)),
-        super::persist_failure_notice(ctx, session_id, &agent_id, &turn_id, notice_reason, turn_generation.as_deref())).await;
+    let reason_code = failure.reason_code();
+    // v1.84.0: a start-up check refusal is stored with the sentence the
+    // operator/member sees below, not the generic safety-gate line.
+    let shown_gate_text = (!super::assembly::public_session(session_id)
+        && operator_diagnostics_allowed(&ctx.home_dir, session_id))
+        .then(|| failure.spawn_gate_message().map(|message| crate::dispatcher::sanitize_for_channel(
+            &match failure.engine_summary() {
+                Some(summary) => format!("{message}\n\n{summary}"),
+                None => message.to_string(),
+            })))
+        .flatten();
+    let persist = super::failure_notice::FAILURE_DETAILS.scope((reason_code, crate::work_outcome::WorkOutcome::decode(&failure)),
+        super::persist_failure_notice(ctx, session_id, &agent_id, &turn_id, notice_reason, turn_generation.as_deref()));
+    match shown_gate_text {
+        Some(text) => super::failure_notice::FAILURE_SHOWN_TEXT.scope(text, persist).await,
+        None => persist.await,
+    }
     if partial_saved {
         let _ = super::ccr_delivery::CCR_TURN_DELIVERY.try_with(|delivery| {
             delivery.failure_notice_only.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -4226,7 +4283,7 @@ async fn build_reply_with_session_inner_impl(
         "doc_url": doc_url,
         "timestamp": chrono::Utc::now().to_rfc3339(),
     });
-    super::failure_notice::attach_failure_reference(&mut audit, reason.as_str(), &turn_id);
+    super::failure_notice::attach_failure_reference(&mut audit, reason_code, &turn_id);
     // Shared JSONL appends must use the existing cross-process file lock.
     // Await off-thread I/O, then preserve the same best-effort reply path.
     let audit_home = ctx.home_dir.clone();
@@ -4246,7 +4303,7 @@ async fn build_reply_with_session_inner_impl(
 
     let language = crate::prompt_identity::resolve_fixed_message_language_for_id(&ctx.home_dir, &agent_id).await;
     let visitor = super::assembly::public_session(session_id);
-    let reference = super::failure_notice::notice_suffix(language.as_deref(), (!visitor).then_some(reason.as_str()), &turn_id);
+    let reference = super::failure_notice::notice_suffix(language.as_deref(), (!visitor).then_some(reason_code), &turn_id);
     // RM-181: operators and members are told which engines were tried, in
     // order, and why a configured fallback engine was not used. Public
     // visitors keep the generic text.

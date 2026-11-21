@@ -210,6 +210,9 @@ async fn compress_history_with_budget(
                                 .err().unwrap_or(crate::session_summarizer::SummaryFailure::Budget);
                             crate::session_summarizer::summary_attempt_finished_async(&home, session_id, "bisect", Some(reason)).await;
                         }
+                        // RM-205: unavailable is a quiet skip (byte-capped history kept).
+                        Err(error) if crate::runtime_config::is_utility_unavailable(&error) => crate::session_summarizer::summary_attempt_finished_async(
+                            &home, session_id, "bisect", Some(crate::session_summarizer::SummaryFailure::Unavailable)).await,
                         Err(_error) => crate::session_summarizer::summary_attempt_finished_async(
                             &home, session_id, "bisect", Some(crate::session_summarizer::SummaryFailure::Utility)).await,
                     }

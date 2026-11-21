@@ -219,6 +219,11 @@ pub(crate) async fn tick_once(
             Ok(title) => {
                 info!(session_id = %c.session_id, title = %title, "titler: persisted title")
             }
+            // RM-205: no service for this employee's background work.
+            Err(e) if crate::runtime_config::is_utility_unavailable(&e) => debug!(
+                session_id = %c.session_id,
+                "titler: background work unavailable for this employee; skipped"
+            ),
             Err(e) => warn!(
                 session_id = %c.session_id,
                 error = %e,
@@ -271,7 +276,8 @@ async fn title_one(
         crate::runtime_dispatch::UTILITY_MAX_TOKENS,
     )
     .await
-    .map_err(|e| format!("utility title: {e}"))?;
+    // RM-205: keep the typed "unavailable" marker anchored for the caller.
+    .map_err(|e| if crate::runtime_config::is_utility_unavailable(&e) { e } else { format!("utility title: {e}") })?;
 
     let title = sanitize_title(&raw).ok_or("titler returned empty response")?;
     // WP11-C: keep the stored title in the conversation's own script.

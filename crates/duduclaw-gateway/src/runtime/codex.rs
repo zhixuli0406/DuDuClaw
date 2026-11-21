@@ -1243,6 +1243,23 @@ async fn collect_codex_output_with_input(
 ) -> Result<CodexOutput, String> {
     #[cfg(test)]
     if let Ok(capture) = tests::COMMAND_CAPTURE.try_with(std::sync::Arc::clone) {
+        // RM-204: also what the process would have read on stdin and the
+        // owned CODEX_HOME's instructions file (removed when the call returns).
+        if let Ok(extra) = tests::INPUT_CAPTURE.try_with(std::sync::Arc::clone) {
+            let codex_home = cmd.as_std().get_envs().find(|(key, _)| *key == "CODEX_HOME")
+                .and_then(|(_, value)| value).map(std::path::PathBuf::from);
+            let mut extra = extra.lock().unwrap();
+            extra.stdin = input.map(<[u8]>::to_vec);
+            extra.agents_md = codex_home.as_ref().and_then(|home| std::fs::read(home.join("AGENTS.md")).ok());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                extra.agents_md_mode = codex_home.as_ref()
+                    .and_then(|home| std::fs::metadata(home.join("AGENTS.md")).ok())
+                    .map(|meta| meta.permissions().mode() & 0o777);
+            }
+            extra.codex_home = codex_home;
+        }
         *capture.lock().unwrap() = Some(std::mem::replace(cmd, tokio::process::Command::new("captured-command")));
         return Err("codex command captured before backend execution".into());
     }
@@ -1491,6 +1508,8 @@ impl CodexRuntime {
         cmd.current_dir(work_dir.path()).arg("--cd").arg(work_dir.path());
         let caps = utility_native_caps(context.capabilities.as_ref());
         super::apply_native_sandbox(&mut cmd, Some(&caps), Some(work_dir.path()), "codex")?;
+        // RM-181 defence in depth, as for employee launches.
+        refuse_project_trust_override(&cmd, None)?;
         Ok((cmd, work_dir, schema_file))
     }
 }
@@ -1502,9 +1521,83 @@ fn employee_base_command(codex_path: &str, model: &str) -> tokio::process::Comma
     apply_codex_auth_env(&mut cmd);
     cmd.env_remove("CLAUDE_CODE_MESSAGING_TOKEN");
     cmd.args(["exec", "--json", "--skip-git-repo-check", "--ignore-user-config",
-        "-c", "mcp_servers={}"]);
+        "-c", "mcp_servers={}",
+        // RM-204: no working-directory / ancestor AGENTS.md is merged in; the
+        // instructions come from the owned `<CODEX_HOME>/AGENTS.md` only.
+        "-c", "project_doc_max_bytes=0"]);
     if !model.is_empty() { cmd.arg("-m").arg(model); }
     cmd
+}
+
+/// RM-204: write the employee's system prompt to `<owned CODEX_HOME>/AGENTS.md`
+/// (owner-only, 0600). The directory is this call's private temp home, so the
+/// file is removed with it. Fail closed: a prompt that cannot be written is
+/// never silently dropped.
+fn write_owned_instructions(codex_home: &std::path::Path, system_prompt: &str) -> Result<(), String> {
+    use std::io::Write;
+    let path = codex_home.join("AGENTS.md");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path)
+        .map_err(|e| format!("cannot write Codex instructions: {e}"))?;
+    file.write_all(system_prompt.as_bytes())
+        .and_then(|()| file.flush())
+        .map_err(|e| format!("cannot write Codex instructions: {e}"))
+}
+
+/// Is `key` (the part of a `-c key=value` override before `=`) the Codex
+/// `projects` trust table or one of its entries? Exact segment match.
+fn is_projects_key(key: &str) -> bool {
+    let key = key.trim().trim_matches('"');
+    key == "projects" || key.starts_with("projects.") || key.starts_with("projects[")
+}
+
+/// RM-181 defence in depth: Codex loads a project-layer `.codex/config.toml`
+/// only for projects marked trusted (`[projects]` in the config home or a
+/// `-c projects…` override). DuDuClaw never grants trust; refuse a launch
+/// whose argv or owned config would.
+fn refuse_project_trust_override(
+    cmd: &tokio::process::Command,
+    owned_config: Option<&std::path::Path>,
+) -> Result<(), String> {
+    let refusal = || duduclaw_agent::mcp_spawn_gate::spawn_gate_error(
+        "Codex launch refused: a project trust override must never be passed");
+    let args: Vec<String> = cmd.as_std().get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        let value = if arg == "-c" || arg == "--config" {
+            index += 1;
+            args.get(index).map(String::as_str)
+        } else {
+            arg.strip_prefix("--config=")
+        };
+        if let Some(value) = value {
+            let key = value.split_once('=').map_or(value, |(key, _)| key);
+            if is_projects_key(key) {
+                return Err(refusal());
+            }
+        }
+        index += 1;
+    }
+    if let Some(path) = owned_config {
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                let table: toml::Table = text.parse().map_err(|_| refusal())?;
+                if table.contains_key("projects") {
+                    return Err(refusal());
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(refusal()),
+        }
+    }
+    Ok(())
 }
 
 // ── AgentRuntime impl ───────────────────────────────────────────
@@ -1548,27 +1641,10 @@ impl AgentRuntime for CodexRuntime {
         let explore = crate::explore_lane::in_explore();
         info!(agent = %context.agent_id, "CodexRuntime: executing via codex exec --json");
 
-        // Limit system_prompt to 64KB to avoid ARG_MAX issues.
-        // Char-boundary-safe truncation (never raw byte-index slicing on
-        // potentially CJK/emoji content — 2026-06 review convention #1).
-        const MAX_SYSTEM_PROMPT_BYTES: usize = 65536;
-        let system_prompt: &str = if context.system_prompt.len() > MAX_SYSTEM_PROMPT_BYTES {
-            tracing::warn!(
-                agent = %context.agent_id,
-                original_len = context.system_prompt.len(),
-                "system_prompt truncated to 64KB"
-            );
-            duduclaw_core::truncate_bytes(&context.system_prompt, MAX_SYSTEM_PROMPT_BYTES)
-        } else {
-            &context.system_prompt
-        };
-
-        // Prevent argument injection: prompts starting with '-' would be parsed as flags
-        let safe_prompt = if prompt.starts_with('-') {
-            format!(" {prompt}")
-        } else {
-            prompt.to_string()
-        };
+        // RM-204: the system prompt goes to the per-call owned
+        // `CODEX_HOME/AGENTS.md` (below), which Codex loads whole — no argv,
+        // no 32 KiB project-doc cap — so it is not truncated here any more.
+        let system_prompt: &str = &context.system_prompt;
 
         // W1 (capability enforcement): derive sandbox/approval flags from the
         // agent's capabilities instead of the former blanket `--full-auto`.
@@ -1644,13 +1720,11 @@ impl AgentRuntime for CodexRuntime {
         // affected: the `-c mcp_servers.duduclaw.env.DUDUCLAW_AGENT_ID`
         // override carries the member id independently of cwd.
         //
-        // Resolved ONCE (it used to be read twice, so a `work_dir` that failed
-        // validation could still have flipped `cwd_overridden`), through the
-        // shared [`super::resolve_spawn_work_dir`] which validates the override
-        // is a real directory and otherwise warns and falls back.
+        // Resolved ONCE through the shared [`super::resolve_spawn_work_dir`]
+        // which validates the override is a real directory and otherwise
+        // warns and falls back.
         let work_root: Option<std::path::PathBuf> =
             super::resolve_spawn_work_dir(context.agent_dir.as_deref(), &context.agent_id);
-        let cwd_overridden = work_root.is_some() && work_root != context.agent_dir;
         let owned_config = context.agent_dir.as_ref().map(|dir| dir.join(".codex/config.toml"));
         let project_root = work_root.clone().or_else(|| std::env::current_dir().ok())
             .ok_or("cannot resolve Codex project root")?;
@@ -1659,8 +1733,18 @@ impl AgentRuntime for CodexRuntime {
         let config_root = tempfile::Builder::new().prefix("duduclaw-codex-config-").tempdir()
             .map_err(|e| format!("cannot create Codex config directory: {e}"))?;
         let codex_home = prepare_owned_codex_home(config_root.path())?;
+        // RM-204: the employee's instructions live in this call's own
+        // CODEX_HOME (removed with `config_root`), never in the employee
+        // directory: Codex always loads `<CODEX_HOME>/AGENTS.md` (also under
+        // `--ignore-user-config`, without the project-doc size cap), and
+        // concurrent conversations of one employee no longer overwrite each
+        // other. `-c project_doc_max_bytes=0` (employee_base_command) keeps
+        // any working-directory / ancestor AGENTS.md out of the request.
+        if !system_prompt.is_empty() {
+            write_owned_instructions(&codex_home, system_prompt)?;
+        }
         let mut cmd = employee_base_command(&self.codex_path, &context.model);
-        cmd.env("CODEX_HOME", codex_home);
+        cmd.env("CODEX_HOME", &codex_home);
         let egress_mode = duduclaw_core::egress_guard::effective_mode(&context.home_dir, context.agent_dir.as_deref());
         let effective_caps = egress_sandbox_caps(caps, egress_mode);
         if employee_needs_namespace_guard(effective_caps, explore) {
@@ -1757,56 +1841,32 @@ impl AgentRuntime for CodexRuntime {
             duduclaw_core::ns_guard::is_active(),
         ));
 
-        // Pass system prompt via AGENTS.md in the working root.
-        // Codex exec has no --instructions/--system-prompt flag (verified on
-        // 0.156.1: `codex exec --help` lists neither); AGENTS.md at the
-        // working root is the only file channel.
-        //
-        // With an overridden cwd that channel is unusable: writing the
-        // member's system prompt to the employee's `AGENTS.md` would clobber
-        // the employee's own file (and two concurrent members would race over
-        // it). So when — and only when — the cwd is overridden, the system
-        // prompt travels inside the prompt as an XML-delimited block instead.
-        // Weaker placement than a real system prompt, and said out loud here
-        // rather than silently dropping the member's instructions.
-        let mut prompt_prefix = String::new();
-        if !system_prompt.is_empty() {
-            if cwd_overridden {
-                prompt_prefix = format!(
-                    "<role_system_prompt>\n{}\n</role_system_prompt>\n\n",
-                    system_prompt.replace("</role_system_prompt>", "&lt;/role_system_prompt&gt;")
-                );
-            } else if let Some(ref dir) = context.agent_dir {
-                let agents_md = dir.join("AGENTS.md");
-                let _ = std::fs::write(&agents_md, system_prompt);
-            }
-        }
+        // The system prompt was written to the owned CODEX_HOME above, for an
+        // overridden working root too (it used to travel inline there so the
+        // employee's own AGENTS.md was not clobbered; the owned home has no
+        // such conflict). An override only moves `--cd` now.
 
         // Prepend conversation history to prompt (Codex exec has no native multi-turn)
         let augmented_prompt = if context.conversation_history.is_empty() {
-            safe_prompt
+            prompt.to_string()
         } else {
-            super::format_history_as_prompt(&context.conversation_history, &safe_prompt)
-        };
-        let augmented_prompt = if prompt_prefix.is_empty() {
-            augmented_prompt
-        } else {
-            format!("{prompt_prefix}{augmented_prompt}")
+            super::format_history_as_prompt(&context.conversation_history, prompt)
         };
 
-        cmd.arg(&augmented_prompt);
+        // RM-204: `-` makes `codex exec` read the prompt from stdin, byte-exact
+        // (history + recap + message can exceed the Linux 128 KiB
+        // single-argument limit). No conversation bytes enter argv, so a
+        // prompt starting with '-' can no longer be parsed as a flag either.
+        cmd.arg("-");
 
         // Set working directory
         if let Some(ref dir) = work_root {
             cmd.arg("--cd").arg(dir);
         }
 
-        // Codex reads "additional input from stdin" whenever stdin is not a
-        // TTY and concatenates it to the prompt; an inherited open pipe would
-        // stall the run until EOF. The prompt is passed as an argument, so
-        // stdin is deliberately closed.
-        cmd.stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
+        // stdin carries the prompt and is closed after it (the collector
+        // pipes it); an inherited open pipe would stall the run until EOF.
+        cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
         // Native OS sandbox (opt-in). Layered on top of the CLI `--sandbox`
@@ -1816,7 +1876,11 @@ impl AgentRuntime for CodexRuntime {
         // the writes the override exists to allow).
         super::apply_native_sandbox(&mut cmd, caps, work_root.as_deref(), "codex")?;
 
-        execute_codex_command(&mut cmd, context).await
+        // RM-181 defence in depth: Codex loads project-layer configuration
+        // only for trusted projects; DuDuClaw never grants trust.
+        refuse_project_trust_override(&cmd, owned_config.as_deref())?;
+
+        execute_codex_command_with_input(&mut cmd, context, Some(augmented_prompt.as_bytes())).await
     }
 
     async fn is_available(&self) -> bool {
@@ -1832,6 +1896,7 @@ impl AgentRuntime for CodexRuntime {
 
 // Shared by conversational and utility calls: retain bounded incremental output,
 // process-group cleanup, timeout partials, usage and native-event reporting.
+#[cfg(test)]
 async fn execute_codex_command(
     cmd: &mut tokio::process::Command,
     context: &RuntimeContext,
@@ -2048,7 +2113,7 @@ pub(crate) mod third_party;
 // ── Tests ───────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -2135,9 +2200,19 @@ mod tests {
     }
 
     type CollectProbe = Box<dyn Fn(&tokio::process::Command) -> Result<CodexOutput, String> + Send + Sync>;
+    /// What a captured launch would have received besides argv/env.
+    #[derive(Debug, Default, Clone)]
+    pub(crate) struct InputCapture {
+        pub(crate) stdin: Option<Vec<u8>>,
+        pub(crate) codex_home: Option<std::path::PathBuf>,
+        pub(crate) agents_md: Option<Vec<u8>>,
+        pub(crate) agents_md_mode: Option<u32>,
+    }
     tokio::task_local! {
         pub(super) static COLLECT_PROBE: CollectProbe;
-        pub(super) static COMMAND_CAPTURE: std::sync::Arc<std::sync::Mutex<Option<tokio::process::Command>>>;
+        pub(crate) static COMMAND_CAPTURE: std::sync::Arc<std::sync::Mutex<Option<tokio::process::Command>>>;
+        /// Only read inside a [`COMMAND_CAPTURE`] scope.
+        pub(crate) static INPUT_CAPTURE: std::sync::Arc<std::sync::Mutex<InputCapture>>;
     }
 
     fn utility_context(home: &std::path::Path) -> RuntimeContext {
@@ -2255,10 +2330,12 @@ mod tests {
         cached_codex_support(bin, || async { Some("codex-cli 0.164.0".into()) }).await;
         let runtime = CodexRuntime { codex_path: bin.into() };
         let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let input = std::sync::Arc::new(std::sync::Mutex::new(InputCapture::default()));
         // No unmanaged host Codex layers participate in this fixture.
-        let error = MCP_CONFIG_TEST_PATHS.scope(vec![],
-            COMMAND_CAPTURE.scope(captured.clone(), runtime.execute("繁體中文 $HOME;\nnext", &context))).await.unwrap_err();
+        let error = MCP_CONFIG_TEST_PATHS.scope(vec![], INPUT_CAPTURE.scope(input.clone(),
+            COMMAND_CAPTURE.scope(captured.clone(), runtime.execute("繁體中文 $HOME;\nnext", &context)))).await.unwrap_err();
         assert_eq!(error, "codex command captured before backend execution");
+        let input = input.lock().unwrap().clone();
         let command = captured.lock().unwrap().take().unwrap();
         let before = duduclaw_core::execution_gate::command_snapshot(&command);
         let captured_env = |key: &str| command.as_std().get_envs().find(|(name, _)| *name == key)
@@ -2270,7 +2347,7 @@ mod tests {
         expected.env("CODEX_HOME", &codex_home);
         expected.env_remove("CLAUDE_CODE_MESSAGING_TOKEN");
         expected.args(["exec", "--json", "--skip-git-repo-check", "--ignore-user-config",
-            "-c", "mcp_servers={}", "-m", "gpt-5.4-mini"]);
+            "-c", "mcp_servers={}", "-c", "project_doc_max_bytes=0", "-m", "gpt-5.4-mini"]);
         expected.args(["--approve-for-me",
             "-c", "approval_policy=never", "-c", "sandbox_mode=\"workspace-write\""]);
         #[cfg(unix)]
@@ -2285,12 +2362,109 @@ mod tests {
         if let Some(value) = captured_env(delegation) { expected.env(delegation, value); }
         expected.args(turn_source_override_args_with_namespace_guard(&[],
             duduclaw_core::ns_guard::is_active()));
-        expected.args(["繁體中文 $HOME;\nnext", "--cd"]).arg(home.path());
+        // RM-204: the prompt is read from stdin (`-`), never argv.
+        expected.args(["-", "--cd"]).arg(home.path());
         // Conversational Codex selects the root using --cd, leaving the process cwd inherited.
         assert_eq!(before.cwd, None);
-        assert_eq!(std::fs::read_to_string(home.path().join("AGENTS.md")).unwrap(), "system </role_system_prompt>");
+        // RM-204: the instructions live in the owned CODEX_HOME, owner-only,
+        // and nothing is written into the employee directory.
+        assert!(!home.path().join("AGENTS.md").exists());
+        assert_eq!(input.codex_home.as_deref().map(std::path::Path::as_os_str), Some(codex_home.as_os_str()));
+        assert_eq!(input.agents_md.as_deref(), Some("system </role_system_prompt>".as_bytes()));
+        #[cfg(unix)]
+        assert_eq!(input.agents_md_mode, Some(0o600));
+        assert_eq!(input.stdin.as_deref(), Some("繁體中文 $HOME;\nnext".as_bytes()));
+        assert!(!std::path::Path::new(&codex_home).exists(), "owned home removed with the call");
         assert_eq!(before, duduclaw_core::execution_gate::command_snapshot(&expected));
         assert_eq!(duduclaw_core::execution_gate::local_command_roundtrip(command).await.unwrap(), before);
+    }
+
+    /// Run the real conversational Codex path up to the spawn and return the
+    /// captured argv, stdin and owned-home instructions.
+    pub(crate) async fn capture_conversation(context: &RuntimeContext, prompt: &str)
+        -> (Vec<String>, InputCapture) {
+        let bin = "/nonexistent/codex-capture";
+        cached_codex_support(bin, || async { Some("codex-cli 0.164.0".into()) }).await;
+        let runtime = CodexRuntime { codex_path: bin.into() };
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let input = std::sync::Arc::new(std::sync::Mutex::new(InputCapture::default()));
+        let error = MCP_CONFIG_TEST_PATHS.scope(vec![], INPUT_CAPTURE.scope(input.clone(),
+            COMMAND_CAPTURE.scope(captured.clone(), runtime.execute(prompt, context)))).await.unwrap_err();
+        assert_eq!(error, "codex command captured before backend execution");
+        let command = captured.lock().unwrap().take().unwrap();
+        let args = command.as_std().get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let input = input.lock().unwrap().clone();
+        (args, input)
+    }
+
+    #[tokio::test]
+    async fn large_system_prompt_reaches_the_owned_home_whole_and_prompt_rides_stdin() {
+        let home = tempfile::tempdir().unwrap();
+        let mut context = utility_context(home.path());
+        context.capabilities = None;
+        // > 64 KiB (the old cut) and > 32 KiB (Codex's project-doc cap), with
+        // the summary / pinned blocks at the tail where truncation hit.
+        let tail = "<pinned_instructions>永遠用繁體中文</pinned_instructions>\nTAIL-MARKER-🙂";
+        context.system_prompt = format!("{}{tail}", "基本提示 ".repeat(12_000));
+        assert!(context.system_prompt.len() > 128 * 1024);
+        context.conversation_history = vec![
+            crate::runtime::ConversationTurn { role: "user".into(), content: "第一輪 TURN1-USER".into() },
+            crate::runtime::ConversationTurn { role: "assistant".into(), content: "TURN1-REPLY".into() },
+        ];
+        let message = format!("-starts-with-dash {}", "長訊息".repeat(50_000));
+        let (args, input) = capture_conversation(&context, &message).await;
+        assert!(args.windows(2).any(|pair| pair == ["-c", "project_doc_max_bytes=0"]), "{args:?}");
+        assert!(args.iter().any(|a| a == "--ignore-user-config"));
+        assert!(args.iter().any(|a| a == "-"), "prompt selected from stdin");
+        assert!(args.iter().all(|a| !a.contains("TURN1-USER") && !a.contains("長訊息")), "no conversation bytes in argv");
+        assert!(args.iter().all(|a| a.len() < 128 * 1024));
+        let agents_md = String::from_utf8(input.agents_md.expect("owned AGENTS.md")).unwrap();
+        assert_eq!(agents_md, context.system_prompt, "full prompt, byte-exact");
+        assert!(agents_md.ends_with("TAIL-MARKER-🙂"));
+        let stdin = String::from_utf8(input.stdin.expect("stdin payload")).unwrap();
+        assert_eq!(stdin, crate::runtime::format_history_as_prompt(&context.conversation_history, &message));
+        assert!(stdin.contains("TURN1-USER") && stdin.contains("TURN1-REPLY") && stdin.ends_with(&message));
+        assert!(!home.path().join("AGENTS.md").exists(), "nothing written to the employee directory");
+    }
+
+    #[tokio::test]
+    async fn an_existing_employee_agents_md_is_left_alone() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("AGENTS.md"), "scaffold").unwrap();
+        let mut context = utility_context(home.path());
+        context.capabilities = None;
+        let (_args, input) = capture_conversation(&context, "hi").await;
+        assert_eq!(std::fs::read_to_string(home.path().join("AGENTS.md")).unwrap(), "scaffold");
+        assert_eq!(input.agents_md.as_deref(), Some(context.system_prompt.as_bytes()));
+    }
+
+    #[test]
+    fn project_trust_overrides_are_refused_in_argv_and_owned_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let mut cmd = employee_base_command("fixture-never-spawned", "gpt-5.4-mini");
+        cmd.arg("-");
+        assert!(refuse_project_trust_override(&cmd, None).is_ok());
+        assert!(refuse_project_trust_override(&cmd, Some(&config)).is_ok(), "absent owned config");
+        for bad in ["projects={}", "projects.\"/tmp/x\".trust_level=\"trusted\"", " projects = {}"] {
+            let mut cmd = employee_base_command("fixture-never-spawned", "");
+            cmd.args(["-c", bad]);
+            let error = refuse_project_trust_override(&cmd, None).unwrap_err();
+            assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error), "{bad}");
+            let mut cmd = employee_base_command("fixture-never-spawned", "");
+            cmd.arg(format!("--config={bad}"));
+            assert!(refuse_project_trust_override(&cmd, None).is_err(), "{bad}");
+        }
+        // A key that merely starts with the letters is not the trust table.
+        let mut cmd = employee_base_command("fixture-never-spawned", "");
+        cmd.args(["-c", "projects_note=1"]);
+        assert!(refuse_project_trust_override(&cmd, None).is_ok());
+        std::fs::write(&config, "[projects.\"/tmp/x\"]\ntrust_level = \"trusted\"\n").unwrap();
+        assert!(refuse_project_trust_override(&cmd, Some(&config)).is_err());
+        std::fs::write(&config, "[broken").unwrap();
+        assert!(refuse_project_trust_override(&cmd, Some(&config)).is_err(), "fail closed");
+        std::fs::write(&config, "[mcp_servers.duduclaw]\ncommand = \"/x\"\n").unwrap();
+        assert!(refuse_project_trust_override(&cmd, Some(&config)).is_ok());
     }
 
     #[test]

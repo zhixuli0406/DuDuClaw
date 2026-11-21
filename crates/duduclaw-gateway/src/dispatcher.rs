@@ -3749,8 +3749,12 @@ pub(crate) fn sanitize_for_channel(text: &str) -> String {
                 let mut result = line.to_string();
                 for prefix in &["/Users/", "/home/"] {
                     while let Some(start) = result.find(prefix) {
+                        // A path also ends at full-width punctuation, so a
+                        // zh-TW sentence after it survives (v1.84.0: the Codex
+                        // refusal 「…config.toml：定義了 mcp_servers」 lost
+                        // 「：定義了」 into the redaction).
                         let end = result[start..]
-                            .find(|c: char| c.is_whitespace() || c == '\'' || c == '"' || c == ')')
+                            .find(|c: char| c.is_whitespace() || is_path_terminator(c))
                             .map(|e| start + e)
                             .unwrap_or(result.len());
                         result.replace_range(start..end, "[path]");
@@ -3763,6 +3767,11 @@ pub(crate) fn sanitize_for_channel(text: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Characters that end a redacted absolute path in [`sanitize_for_channel`].
+fn is_path_terminator(c: char) -> bool {
+    matches!(c, '\'' | '"' | ')' | '：' | '，' | '。' | '；' | '、' | '）' | '」' | '』' | '！' | '？')
 }
 
 /// Validate that a channel_id contains only safe characters (alphanumeric, hyphen, underscore).
@@ -6624,6 +6633,19 @@ mod budget_refusal_tests {
         let reply = super::dispatch_failure_reply(&error);
         assert!(reply.contains("402.00") && reply.contains("花費達上限"));
         assert!(!reply.contains("請稍後再試"));
+    }
+}
+
+#[cfg(test)]
+mod path_redaction_tests {
+    #[test]
+    fn codex_refusal_sentence_survives_path_redaction() {
+        let shown = "Codex 外部設定 /Users/sam/.codex/work.config.toml：定義了 mcp_servers；拒絕啟動。請由管理者移除原生 MCP 設定，改用 DuDuClaw 的代理設定。";
+        let sanitized = super::sanitize_for_channel(shown);
+        assert_eq!(sanitized, "Codex 外部設定 [path]：定義了 mcp_servers；拒絕啟動。請由管理者移除原生 MCP 設定，改用 DuDuClaw 的代理設定。");
+        // ASCII terminators keep their v1.83.0 behaviour.
+        assert_eq!(super::sanitize_for_channel("see /home/a/b.txt) now"), "see [path]) now");
+        assert_eq!(super::sanitize_for_channel("at '/Users/a/b c'"), "at '[path] c'");
     }
 }
 

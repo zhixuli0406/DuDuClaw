@@ -53,6 +53,10 @@ impl ReplyAttempt {
         Self { text, origin }
     }
 }
+/// Reason code of an engine host-configuration refusal (see
+/// [`ReplyFailure::reason_code`]); snake_case like the v1.83.0 codes.
+pub(super) const ENGINE_CONFIG_REFUSED_CODE: &str = "engine_config_refused";
+
 #[derive(Clone)]
 pub(super) struct ReplyFailure {
     pub(super) origin: ReplyOrigin,
@@ -126,6 +130,23 @@ impl ReplyFailure {
         } else {
             duduclaw_agent::mcp_spawn_gate::spawn_gate_user_message(&self.summary)
         }
+    }
+    /// The user-visible reason code. A refusal of an ENGINE's own host
+    /// configuration (Codex external configuration layers, Grok global MCP
+    /// sources) has its own code instead of `unknown` (v1.84.0).
+    pub(super) fn reason_code(&self) -> &'static str {
+        let gate_error = match &self.runtime {
+            Some(runtime) => runtime.steps.iter().find_map(|step| match &step.outcome {
+                RuntimeStepOutcome::ExecutionError(error)
+                    if duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(error) => Some(error.as_str()),
+                _ => None,
+            }),
+            None => duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&self.summary).then_some(self.summary.as_str()),
+        };
+        if gate_error.is_some_and(duduclaw_agent::mcp_spawn_gate::is_engine_local_spawn_gate_error) {
+            return ENGINE_CONFIG_REFUSED_CODE;
+        }
+        self.reason().as_str()
     }
     pub(super) fn claude_auth_error(&self) -> Option<&str> {
         if let Some(runtime) = &self.runtime {
@@ -636,6 +657,45 @@ mod engine_summary_tests {
         let summary = ReplyFailure::runtime(failure).engine_summary().unwrap();
         assert!(summary.contains("沒有通過啟動前檢查"), "{summary}");
         assert!(!summary.contains("config.toml") && !summary.contains("[engine_local_config]"), "{summary}");
+    }
+
+    /// v1.84.0: an engine host-configuration refusal has its own reason code
+    /// (it used to show `unknown`); the employee `.mcp.json` gate and every
+    /// other failure keep their v1.83.0 code.
+    #[test]
+    fn engine_host_config_refusal_has_its_own_reason_code() {
+        let gate = duduclaw_agent::mcp_spawn_gate::engine_local_spawn_gate_error(
+            "Codex 外部設定 /home/u/.codex/config.toml：定義了 mcp_servers；拒絕啟動。");
+        let mut failure = RuntimeDispatchFailure::new(RuntimeType::Codex, "gpt-5.4");
+        failure.push(RuntimeStepRole::Primary, RuntimeType::Codex, Some("gpt-5.4"), RuntimeStepOutcome::ExecutionError(gate.clone()));
+        assert_eq!(ReplyFailure::runtime(failure).reason_code(), ENGINE_CONFIG_REFUSED_CODE);
+        assert_eq!(ReplyFailure::simple(ReplyOrigin::Runtime(RuntimeType::Codex), gate).reason_code(), ENGINE_CONFIG_REFUSED_CODE);
+        let employee = duduclaw_agent::mcp_spawn_gate::spawn_gate_error("worker .mcp.json refused");
+        let employee = ReplyFailure::simple(ReplyOrigin::Runtime(RuntimeType::Codex), employee);
+        assert_eq!(employee.reason_code(), employee.reason().as_str());
+        let plain = ReplyFailure::simple(ReplyOrigin::Runtime(RuntimeType::Codex), "Codex CLI exited with 1".into());
+        assert_eq!(plain.reason_code(), plain.reason().as_str());
+    }
+
+    /// v1.84.0: the stored notice is the sentence shown live (sanitized the
+    /// same way), with the same reason code; visitors keep the generic line.
+    #[test]
+    fn stored_refusal_notice_is_the_sentence_shown_live() {
+        use super::super::failure_notice::{FAILURE_DETAILS, FAILURE_SHOWN_TEXT, notice_suffix};
+        let shown = crate::dispatcher::sanitize_for_channel(
+            "Codex 外部設定 /Users/sam/.codex/work.config.toml：定義了 mcp_servers；拒絕啟動。");
+        assert!(shown.contains("：定義了 mcp_servers；拒絕啟動"), "{shown}");
+        let render = |visitor: bool| FAILURE_SHOWN_TEXT.sync_scope(shown.clone(), || {
+            FAILURE_DETAILS.sync_scope((ENGINE_CONFIG_REFUSED_CODE, None), || {
+                TurnFailureReason::SafetyGate.render(Some("zh-TW"), "12345678abcdef", visitor)
+            })
+        });
+        assert_eq!(render(false), format!("{shown}\n{}",
+            notice_suffix(Some("zh-TW"), Some(ENGINE_CONFIG_REFUSED_CODE), "12345678abcdef")));
+        let visitor = render(true);
+        assert!(!visitor.contains("mcp_servers") && !visitor.contains(ENGINE_CONFIG_REFUSED_CODE), "{visitor}");
+        // Without the scope the generic line is unchanged.
+        assert!(TurnFailureReason::SafetyGate.render(Some("zh-TW"), "1", false).starts_with("本次未收到回覆，因為安全檢查已停止這次請求。"));
     }
 }
 

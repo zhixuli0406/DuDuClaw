@@ -502,6 +502,15 @@ pub async fn classify_llm(
                 },
             }
         }
+        // RM-205: no service for background work. Still fail-closed to
+        // `anomaly` (a human decides), but not reported as a call failure.
+        Err(e) if crate::runtime_config::is_utility_unavailable(&e) => {
+            tracing::debug!(tool = %tool_name, "situation classifier unavailable for this employee — classifying anomaly (fail-closed)");
+            ClassificationResult {
+                class: SituationClass::Anomaly,
+                source: ClassSource::LlmError,
+            }
+        }
         Err(e) => {
             warn!(
                 tool = %tool_name,

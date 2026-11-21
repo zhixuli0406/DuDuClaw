@@ -241,11 +241,16 @@ pub enum SummaryFailure {
     Utility,
     Store,
     Budget,
+    /// RM-205: no service may run this employee's background work. A clean
+    /// skip: backs off like a failure (no tight retry loop) but is not
+    /// reported as one.
+    Unavailable,
 }
 
 impl SummaryFailure {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Unavailable => "unavailable",
             Self::EmptyOutput => "empty_output",
             Self::OversizeOutput => "oversize_output",
             Self::RefusalOrMeta => "refusal_or_meta",
@@ -424,8 +429,13 @@ pub fn summary_attempt_finished(home: &std::path::Path, session: &str, lane: &st
             let state = states.entry(key).or_default();
             state.failures = state.failures.saturating_add(1);
             state.next_retry_at = chrono::Utc::now().timestamp() + summary_retry_delay(state.failures);
-            tracing::warn!(session_id = session, lane, reason = reason.as_str(),
-                failures = state.failures, next_retry_at = state.next_retry_at, "conversation summary failed; history retained");
+            if reason == SummaryFailure::Unavailable {
+                tracing::debug!(session_id = session, lane, next_retry_at = state.next_retry_at,
+                    "conversation summary skipped: background work unavailable for this employee; history retained");
+            } else {
+                tracing::warn!(session_id = session, lane, reason = reason.as_str(),
+                    failures = state.failures, next_retry_at = state.next_retry_at, "conversation summary failed; history retained");
+            }
         } else { states.remove(&key); }
     });
     if let Err(error) = result {
