@@ -491,6 +491,22 @@ pub fn contains_kana(text: &str) -> bool {
     text.chars().any(|c| matches!(c, '\u{3040}'..='\u{30ff}' | '\u{ff66}'..='\u{ff9f}'))
 }
 
+fn literal_closing_delimiter(opener: char) -> Option<char> {
+    Some(match opener {
+        '(' => ')', '[' => ']', '{' => '}', '<' => '>', '"' => '"', '\'' => '\'',
+        '（' => '）', '「' => '」', '『' => '』', '【' => '】', '《' => '》',
+        '〈' => '〉', '〔' => '〕', '〖' => '〗', '〘' => '〙', '〚' => '〛',
+        '［' => '］', '｛' => '｝', '〝' => '〞', '“' => '”', '‘' => '’',
+        _ => return None,
+    })
+}
+
+fn is_literal_terminator(c: char) -> bool {
+    c.is_whitespace() || matches!(c,
+        '，' | '。' | '；' | '：' | '、' | '！' | '？' | '）' | '」' | '』' | '】'
+        | '》' | '…' | '〉' | '〕' | '〗' | '〙' | '〛' | '］' | '｝' | '〞' | '〟' | '”' | '’')
+}
+
 /// Convert prose while preserving code spans, fenced blocks, URLs and explicit paths.
 pub fn to_traditional_preserving_literals(text: &str) -> String {
     let mut output = String::new();
@@ -554,8 +570,10 @@ pub fn to_traditional_preserving_literals(text: &str) -> String {
                         .all(|(left, right)| left.eq_ignore_ascii_case(&right))
                 });
                 // Explicit filesystem paths are literals too, including CJK components.
+                let closing_delimiter = i.checked_sub(1)
+                    .and_then(|previous| literal_closing_delimiter(chars[previous]));
                 let path_boundary = i == 0 || chars[i - 1].is_whitespace()
-                    || matches!(chars[i - 1], '(' | '[' | '"' | '\'');
+                    || closing_delimiter.is_some();
                 let explicit_path = path_boundary && (chars[i] == '/'
                     || ["./", "../", "~/", "\\\\"].iter().any(|prefix| {
                         chars.iter().skip(i).copied().take(prefix.chars().count()).eq(prefix.chars())
@@ -565,7 +583,9 @@ pub fn to_traditional_preserving_literals(text: &str) -> String {
                 if scheme_url || other_url || explicit_path {
                     output.push_str(&to_traditional_with_input(&prose, text));
                     prose.clear();
-                    while i < chars.len() && !chars[i].is_whitespace() {
+                    // Leave prose punctuation (and an enclosing delimiter) for conversion.
+                    while i < chars.len() && !is_literal_terminator(chars[i])
+                        && Some(chars[i]) != closing_delimiter {
                         output.push(chars[i]);
                         i += 1;
                     }
@@ -583,6 +603,40 @@ pub fn to_traditional_preserving_literals(text: &str) -> String {
 #[cfg(test)]
 mod literal_tests {
     use super::*;
+    #[test]
+    fn prose_punctuation_ends_literals() {
+        for (input, expected) in [
+            ("设定档在 /etc/用户/这个.conf，这个项目的负责人是张经理。", "設定檔在 /etc/用户/这个.conf，這個項目的負責人是張經理。"),
+            ("请看https://example.com/文档/说明。然后回复我。", "請看https://example.com/文档/说明。然後回覆我。"),
+            ("路径是「/tmp/预算.txt」；预算三万元。", "路徑是「/tmp/预算.txt」；預算三萬元。"),
+            (r"(见 C:\资料\预算.txt)，负责人是张经理", r"(見 C:\资料\预算.txt)，負責人是張經理"),
+            ("用户预算三万元 https://站/预算 `回复` /tmp/预算.txt C:\\资料\\预算.txt memory_budget 開始", "用戶預算三萬元 https://站/预算 `回复` /tmp/预算.txt C:\\资料\\预算.txt memory_budget 開始"),
+            ("請看 https://example.com/文档，然後回覆我。", "請看 https://example.com/文档，然後回覆我。"),
+            ("(https://x.y/预算)然后回复", "(https://x.y/预算)然後回覆"),
+            ("[www.example.com/预算]然后回复", "[www.example.com/预算]然後回覆"),
+            ("\"/tmp/预算.txt\"然后回复", "\"/tmp/预算.txt\"然後回覆"),
+            ("'/tmp/预算.txt'然后回复", "'/tmp/预算.txt'然後回覆"),
+            ("mailto:用户@example.com；然后回复", "mailto:用户@example.com；然後回覆"),
+            ("memory_budget，用户@example.com；@用户！然后回复", "memory_budget，用戶@example.com；@用戶！然後回覆"),
+            ("`/tmp/预算.txt，回复`然后回复", "`/tmp/预算.txt，回复`然後回覆"),
+        ] {
+            let actual = to_traditional_preserving_literals(input);
+            assert_eq!(actual, expected, "input: {input}");
+            assert_eq!(to_traditional_preserving_literals(&actual), actual,
+                "idempotence: {input}");
+        }
+        for terminator in "，。；：、！？）」』】》…〉〕〗〙〛］｝〞〟”’".chars() {
+            for literal in ["https://站/预算", "/tmp/预算.txt", r"C:\资料\预算.txt",
+                "mailto:用户@example.com", "www.example.com/预算"] {
+                let input = format!("用户 {literal}{terminator}然后回复");
+                let expected = format!("用戶 {literal}{terminator}然後回覆");
+                let actual = to_traditional_preserving_literals(&input);
+                assert_eq!(actual, expected, "input: {input}");
+                assert_eq!(to_traditional_preserving_literals(&actual), actual,
+                    "idempotence: {input}");
+            }
+        }
+    }
     #[test]
     fn preserves_urls_code_and_fences() {
         let text = "用户 https://站/用户 `用户`\n```\n用户\n```\n记忆";
