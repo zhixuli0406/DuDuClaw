@@ -29,9 +29,14 @@ impl MethodHandler {
         let mut flags = serde_json::Map::new();
         let mut rows: Vec<Value> = Vec::new();
         let mut claude_bin: Option<String> = None;
+        // M1: the same shape as `runtime::host_detection` (installed id → path).
+        let mut detected = std::collections::BTreeMap::new();
         for spec in duduclaw_core::runtime_catalog::cli_specs_for_profile(policy) {
             if policy.require_runtime(spec.id).is_err() { continue; }
             let found = crate::runtime_readiness::detect_runtime(spec.id, &user_home);
+            if let Some(path) = found.as_ref() {
+                detected.insert(spec.id.to_string(), path.clone());
+            }
             if spec.id == "claude" {
                 claude_bin = found.clone();
             }
@@ -82,9 +87,11 @@ impl MethodHandler {
         );
         flags.insert("runtimes".to_string(), Value::Array(rows));
 
-        // RM-181: what this page shows as installed is what dispatch uses —
-        // the next dispatch re-probes instead of a registry built earlier.
-        crate::runtime_dispatch::invalidate_all_registries().await;
+        // RM-181: what this page shows as installed is what dispatch uses.
+        // M1: any signed-in user may call this, so it only drops THIS home's
+        // registry, only when the detection differs from what that registry
+        // was built from, and at most once a minute per home.
+        crate::runtime_dispatch::note_runtime_detection(&self.home_dir, &detected);
 
         WsFrame::ok_response("", Value::Object(flags))
     }

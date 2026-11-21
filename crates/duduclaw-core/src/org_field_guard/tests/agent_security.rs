@@ -183,6 +183,41 @@ fn public_web_switch_is_admin_only_field() {
     assert!(crate::types::IsolationSection::default().is_default());
 }
 
+/// RM-205 / security review: `[runtime] utility_provider` (which outside
+/// service receives the employee's conversation text for background work) is
+/// covered because the whole `[runtime]` table is frozen for the employee —
+/// adding, changing and removing the key are all refused, as is adding a
+/// `[runtime]` table that only carries it. The operator path is unchanged.
+#[test]
+fn runtime_utility_provider_is_frozen_with_the_whole_runtime_table() {
+    assert!(AGENT_SECURITY_SECTIONS.contains(&"runtime"));
+    assert!(!AGENT_EDITABLE_SECTIONS.contains(&"runtime"));
+    let plain = with("[runtime]\nprovider = \"codex\"");
+    let set = with("[runtime]\nprovider = \"codex\"\nutility_provider = \"openai_compat\"");
+    let replaced = with("[runtime]\nprovider = \"codex\"\nutility_provider = \"claude\"");
+    let only = with("[runtime]\nutility_provider = \"openai_compat\"");
+    for (before, after) in [
+        (plain.as_str(), set.as_str()),
+        (set.as_str(), replaced.as_str()),
+        (set.as_str(), plain.as_str()),
+        (BASE, only.as_str()),
+    ] {
+        match as_agent(before, after) {
+            GuardDecision::BlockedAgentSecuritySection { changed, .. } => assert!(
+                changed.iter().any(|c| c.starts_with("runtime.") || c.starts_with("[runtime]")),
+                "{changed:?}"
+            ),
+            other => panic!("expected BlockedAgentSecuritySection, got {other:?}"),
+        }
+    }
+    let untrusted = HookCaller::Untrusted("agnes".into());
+    assert!(!check_protected_toml_write_as(&agent_path(), &home(), &untrusted, Some(&plain), &set).is_allowed());
+    assert_eq!(
+        check_protected_toml_write_as(&agent_path(), &home(), &HookCaller::Absent, Some(&plain), &set),
+        GuardDecision::AllowedAgentWrite
+    );
+}
+
 #[test]
 fn every_security_section_change_is_refused_for_an_agent() {
     for (section, before, after) in SECTION_CASES {

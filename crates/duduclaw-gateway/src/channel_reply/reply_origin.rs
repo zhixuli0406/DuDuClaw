@@ -347,6 +347,16 @@ impl ReplyFailure {
         }
         (!text.is_empty()).then_some(text)
     }
+    /// [`Self::engine_summary`] for the audience of `session_id`: never for a
+    /// public visitor (website live chat, widget visitor), whatever the
+    /// failure. Every reply path that may append the summary goes through
+    /// this one gate.
+    pub(super) fn engine_summary_for_session(&self, session_id: &str) -> Option<String> {
+        if super::assembly::public_session(session_id) {
+            return None;
+        }
+        self.engine_summary()
+    }
     pub(super) fn local_notice(&self) -> String {
         let origin = if let Some(runtime) = &self.runtime {
             if runtime.steps.len() == 2 {
@@ -645,6 +655,40 @@ mod engine_summary_tests {
         assert!(message.contains("原選執行環境") && message.contains("明確備援"), "{message}");
         // A Claude-path failure has no engine list to add.
         assert!(ReplyFailure::simple(ReplyOrigin::Runtime(RuntimeType::Claude), "boom".into()).engine_summary().is_none());
+    }
+
+    /// Visitor sessions never receive the engine summary, for any failure
+    /// shape (both legs failed, a skipped fallback, a start-up refusal, a
+    /// prompt too large); members and operators do.
+    #[test]
+    fn visitor_sessions_never_receive_the_engine_summary() {
+        let gate = duduclaw_agent::mcp_spawn_gate::engine_local_spawn_gate_error("Codex 外部設定 /etc/codex/config.toml：x");
+        let too_large = crate::runtime::prompt_budget::prompt_too_large_error("grok");
+        let failures = || {
+            let mut both = RuntimeDispatchFailure::new(RuntimeType::Codex, "gpt-5.4");
+            both.push(RuntimeStepRole::Primary, RuntimeType::Codex, Some("gpt-5.4"),
+                RuntimeStepOutcome::ExecutionError("500 internal server error".into()));
+            both.push(RuntimeStepRole::Fallback, RuntimeType::Grok, Some("grok-build-0.1"), RuntimeStepOutcome::Empty);
+            let mut skipped = RuntimeDispatchFailure::new(RuntimeType::Grok, "grok-4");
+            skipped.push(RuntimeStepRole::Primary, RuntimeType::Grok, Some("grok-4"),
+                RuntimeStepOutcome::ExecutionError(too_large.clone()));
+            skipped.fallback_skipped = Some(FallbackSkip { runtime: RuntimeType::Qwen, reason: FallbackRefusal::PromptTooLarge });
+            let mut refused = RuntimeDispatchFailure::new(RuntimeType::Codex, "gpt-5.4");
+            refused.push(RuntimeStepRole::Primary, RuntimeType::Codex, Some("gpt-5.4"), RuntimeStepOutcome::ExecutionError(gate.clone()));
+            [both, skipped, refused].map(ReplyFailure::runtime)
+        };
+        for session in ["widget-visitor:abc", "odoolivechat:site:visitor"] {
+            assert!(super::super::assembly::public_session(session), "{session} is a visitor session");
+            for failure in failures() {
+                assert!(failure.engine_summary().is_some(), "fixture has a summary");
+                assert_eq!(failure.engine_summary_for_session(session), None, "{session}");
+            }
+        }
+        for session in ["discord:member", "webchat:owner", "line:owner"] {
+            for failure in failures() {
+                assert_eq!(failure.engine_summary_for_session(session), failure.engine_summary(), "{session}");
+            }
+        }
     }
 
     #[test]

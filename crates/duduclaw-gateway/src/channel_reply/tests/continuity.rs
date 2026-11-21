@@ -212,22 +212,32 @@ async fn fallback_engine_receives_the_same_conversation_as_the_primary() {
 
 /// (4) A > 64 KB system prompt: the summary and pinned instructions still
 /// reach Grok inside the single-argument budget, built from the section
-/// layout `inner.rs` hands over.
+/// layout `inner.rs` hands over — with the recent rows while the base prompt
+/// fits beside them, and without them once the base prompt itself has to be
+/// cut (security review: conversation history is dropped before any base
+/// prompt text, so a cut base prompt never sits next to it).
 #[tokio::test(flavor = "current_thread")]
 async fn oversized_prompt_keeps_summary_and_pinned_in_the_grok_argument() {
-    let soul = format!("# Soul\n{}", "這是一段很長的員工設定。".repeat(4_500));
-    assert!(soul.len() > 128 * 1024);
-    let f = fixture(RuntimeType::Grok, None, false, Some(&soul)).await;
-    let sid = "discord:continuity-oversized";
-    seed_compacted(&f, sid).await;
-    turn(&f, sid, "TURN-NOW").await;
-    let seen = f.log.of(RuntimeType::Grok);
-    assert_eq!(seen.len(), 1);
-    assert!(seen[0].system_prompt.len() > 64 * 1024, "fixture must exceed the old cut");
-    let payload = seen[0].payload.as_ref().unwrap();
-    assert!(payload.len() <= crate::runtime::prompt_budget::SINGLE_ARGUMENT_PAYLOAD_BUDGET, "{}", payload.len());
-    for marker in ["ROLLING-SUMMARY-MARKER", "PINNED-MARKER", "OLD-ROW-6", "OLD-ROW-7", "OLD-ROW-8", "TURN-NOW"] {
-        assert!(payload.contains(marker), "{marker} lost from the Grok argument");
+    for (repeat, rows_kept) in [(2_000, true), (4_500, false)] {
+        let soul = format!("# Soul\n{}", "這是一段很長的員工設定。".repeat(repeat));
+        if !rows_kept {
+            assert!(soul.len() > 128 * 1024);
+        }
+        let f = fixture(RuntimeType::Grok, None, false, Some(&soul)).await;
+        let sid = "discord:continuity-oversized";
+        seed_compacted(&f, sid).await;
+        turn(&f, sid, "TURN-NOW").await;
+        let seen = f.log.of(RuntimeType::Grok);
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].system_prompt.len() > 64 * 1024, "fixture must exceed the old cut");
+        let payload = seen[0].payload.as_ref().unwrap();
+        assert!(payload.len() <= crate::runtime::prompt_budget::SINGLE_ARGUMENT_PAYLOAD_BUDGET, "{}", payload.len());
+        for marker in ["ROLLING-SUMMARY-MARKER", "PINNED-MARKER", "TURN-NOW"] {
+            assert!(payload.contains(marker), "{marker} lost from the Grok argument (repeat={repeat})");
+        }
+        for row in ["OLD-ROW-6", "OLD-ROW-7", "OLD-ROW-8"] {
+            assert_eq!(payload.contains(row), rows_kept, "{row} (repeat={repeat})");
+        }
     }
 }
 

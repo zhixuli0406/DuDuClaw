@@ -3749,14 +3749,7 @@ pub(crate) fn sanitize_for_channel(text: &str) -> String {
                 let mut result = line.to_string();
                 for prefix in &["/Users/", "/home/"] {
                     while let Some(start) = result.find(prefix) {
-                        // A path also ends at full-width punctuation, so a
-                        // zh-TW sentence after it survives (v1.84.0: the Codex
-                        // refusal 「…config.toml：定義了 mcp_servers」 lost
-                        // 「：定義了」 into the redaction).
-                        let end = result[start..]
-                            .find(|c: char| c.is_whitespace() || is_path_terminator(c))
-                            .map(|e| start + e)
-                            .unwrap_or(result.len());
+                        let end = redacted_path_end(&result, start);
                         result.replace_range(start..end, "[path]");
                     }
                 }
@@ -3769,9 +3762,47 @@ pub(crate) fn sanitize_for_channel(text: &str) -> String {
         .join("\n")
 }
 
-/// Characters that end a redacted absolute path in [`sanitize_for_channel`].
-fn is_path_terminator(c: char) -> bool {
-    matches!(c, '\'' | '"' | ')' | '：' | '，' | '。' | '；' | '、' | '）' | '」' | '』' | '！' | '？')
+/// Where the absolute path starting at `start` ends, for [`sanitize_for_channel`].
+///
+/// Whitespace and the ASCII closers `'` `"` `)` always end it (v1.83.0).
+/// Full-width punctuation ends it only when what follows is prose: v1.84.0
+/// made it a terminator so a zh-TW sentence after a path survives (the Codex
+/// refusal 「…config.toml：定義了 mcp_servers」 lost 「：定義了」), but a file
+/// name may itself contain such punctuation (`/Users/a/private：finance/keys.txt`)
+/// and the suffix must not reach a public channel (L1). So the text after the
+/// punctuation, up to the next whitespace, end or closing quote/bracket, is
+/// inspected: a `/` or `\` there means the path continues; otherwise the path
+/// ends at the punctuation. Erring toward over-redaction is deliberate.
+fn redacted_path_end(text: &str, start: usize) -> usize {
+    for (offset, c) in text[start..].char_indices() {
+        let at = start + offset;
+        if c.is_whitespace() || is_ascii_path_closer(c) {
+            return at;
+        }
+        if is_full_width_path_punctuation(c) && !continues_as_path(&text[at + c.len_utf8()..]) {
+            return at;
+        }
+    }
+    text.len()
+}
+
+/// ASCII characters that always end a redacted path (v1.83.0).
+fn is_ascii_path_closer(c: char) -> bool {
+    matches!(c, '\'' | '"' | ')')
+}
+
+/// Full-width punctuation that ends a redacted path when prose follows.
+fn is_full_width_path_punctuation(c: char) -> bool {
+    matches!(c, '：' | '，' | '。' | '；' | '、' | '）' | '」' | '』' | '！' | '？')
+}
+
+/// Does the text right after a full-width punctuation mark still look like
+/// part of a path? Looks up to the next whitespace, end, or closing
+/// quote/bracket.
+fn continues_as_path(rest: &str) -> bool {
+    rest.chars()
+        .take_while(|c| !c.is_whitespace() && !is_ascii_path_closer(*c) && !matches!(c, '）' | '」' | '』'))
+        .any(|c| c == '/' || c == '\\')
 }
 
 /// Validate that a channel_id contains only safe characters (alphanumeric, hyphen, underscore).
@@ -6646,6 +6677,49 @@ mod path_redaction_tests {
         // ASCII terminators keep their v1.83.0 behaviour.
         assert_eq!(super::sanitize_for_channel("see /home/a/b.txt) now"), "see [path]) now");
         assert_eq!(super::sanitize_for_channel("at '/Users/a/b c'"), "at '[path] c'");
+    }
+
+    /// L1: full-width punctuation inside a file name does not end the path.
+    #[test]
+    fn full_width_punctuation_inside_a_file_name_is_redacted_through() {
+        for (shown, expected) in [
+            ("/Users/alice/private：finance/keys.txt", "[path]"),
+            ("看 /Users/alice/private：finance/keys.txt 這個", "看 [path] 這個"),
+            ("/home/bob/報表，第二季/草稿。docx/x.txt。", "[path]。"),
+            ("C:\\x /Users/a/b、c\\d.txt", "C:\\x [path]"),
+        ] {
+            let sanitized = super::sanitize_for_channel(shown);
+            assert_eq!(sanitized, expected, "{shown}");
+            assert!(!sanitized.contains("finance") && !sanitized.contains("keys"), "{sanitized}");
+        }
+    }
+
+    /// L1: a path followed by full-width punctuation and plain prose keeps the prose.
+    #[test]
+    fn prose_after_full_width_punctuation_survives() {
+        assert_eq!(super::sanitize_for_channel("檔案在 /Users/a/b.txt，請確認。"), "檔案在 [path]，請確認。");
+        assert_eq!(super::sanitize_for_channel("「/home/a/b.toml」無法讀取"), "「[path]」無法讀取");
+        assert_eq!(super::sanitize_for_channel("/Users/a/b：定義了"), "[path]：定義了");
+        assert_eq!(super::sanitize_for_channel("（/Users/a/b）見 a/b"), "（[path]）見 a/b");
+        // The look-ahead stops at a closing bracket: a slash after it is not the path's.
+        assert_eq!(super::sanitize_for_channel("（/Users/a/b：x）a/b"), "（[path]：x）a/b");
+    }
+
+    /// L1: several paths in one sentence, mixing both cases.
+    #[test]
+    fn mixed_paths_in_one_sentence() {
+        assert_eq!(
+            super::sanitize_for_channel("比較 /Users/a/x.txt，與 /home/b/私人：帳本/k.txt；然後回報。"),
+            "比較 [path]，與 [path]；然後回報。",
+        );
+        assert_eq!(
+            super::sanitize_for_channel("/Users/a/one：two/three、/home/b/c。完成"),
+            "[path]。完成",
+        );
+        assert_eq!(
+            super::sanitize_for_channel("Codex 外部設定 /Users/s/.codex/config.toml：定義了 mcp_servers；拒絕啟動。另見 /home/t/a：b/c.toml"),
+            "Codex 外部設定 [path]：定義了 mcp_servers；拒絕啟動。另見 [path]",
+        );
     }
 }
 

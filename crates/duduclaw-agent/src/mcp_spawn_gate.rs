@@ -22,8 +22,18 @@ use std::path::{Path, PathBuf};
 pub const SPAWN_GATE_ERROR_PREFIX: &str = "[mcp_config_unverified] ";
 
 /// Wrap a gate refusal message in [`SPAWN_GATE_ERROR_PREFIX`].
+///
+/// A message may start with text the employee controls (a file path, an MCP
+/// server name). One that happens to start with
+/// [`ENGINE_LOCAL_REFUSAL_MARKER`] gets a leading space, so an employee-gate
+/// refusal can never carry the engine-local marker at its anchored position;
+/// only [`engine_local_spawn_gate_error`] places it there.
 pub fn spawn_gate_error(message: &str) -> String {
-    format!("{SPAWN_GATE_ERROR_PREFIX}{message}")
+    if message.starts_with(ENGINE_LOCAL_REFUSAL_MARKER) {
+        format!("{SPAWN_GATE_ERROR_PREFIX} {message}")
+    } else {
+        format!("{SPAWN_GATE_ERROR_PREFIX}{message}")
+    }
 }
 
 /// Second marker, directly after [`SPAWN_GATE_ERROR_PREFIX`], on a refusal
@@ -119,6 +129,24 @@ mod tests {
         assert!(!is_engine_local_spawn_gate_error(&format!("x {e}")));
         assert!(!is_engine_local_spawn_gate_error(&spawn_gate_error("note [engine_local_config] x")));
         assert!(!is_engine_local_spawn_gate_error("[engine_local_config] x"));
+    }
+
+    /// An employee-gate message that itself starts with the engine-local
+    /// marker (an employee-chosen server name or path) never yields it.
+    #[test]
+    fn an_employee_gate_message_cannot_forge_the_engine_local_marker() {
+        for message in [
+            format!("{ENGINE_LOCAL_REFUSAL_MARKER}crm：定義了 mcp_servers"),
+            format!("{ENGINE_LOCAL_REFUSAL_MARKER}/Users/a/.mcp.json"),
+            ENGINE_LOCAL_REFUSAL_MARKER.to_string(),
+        ] {
+            let error = spawn_gate_error(&message);
+            assert!(is_spawn_gate_error(&error));
+            assert!(!is_engine_local_spawn_gate_error(&error), "{error}");
+            assert_eq!(spawn_gate_user_message(&error).map(str::trim_start), Some(message.as_str()));
+        }
+        // Ordinary messages are unchanged.
+        assert_eq!(spawn_gate_error("x"), format!("{SPAWN_GATE_ERROR_PREFIX}x"));
     }
 
     #[test]

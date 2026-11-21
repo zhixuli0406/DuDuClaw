@@ -12,8 +12,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use tokio::sync::Mutex;
-
 use duduclaw_core::types::RuntimeType;
 
 use crate::cost_telemetry::{RequestType, TokenUsage};
@@ -30,10 +28,69 @@ use crate::runtime_config::RuntimeSettings;
 /// RM-181 (v1.84.0): an entry is REPLACEABLE. It used to be leaked once and
 /// never refreshed, so a runtime installed after the first dispatch stayed
 /// "not registered" until a restart. [`invalidate_all_registries`] (after a
-/// successful install and after `runtime.detect`) drops the cached entries;
+/// successful install) drops the cached entries, [`note_runtime_detection`]
+/// (after `runtime.detect`) drops one home's entry when its detection changed;
 /// a dispatch that finds a configured runtime missing re-probes at most once
 /// per [`REGISTRY_REPROBE_INTERVAL`]. A call keeps the `Arc` it started with.
-static REGISTRIES: OnceLock<Mutex<HashMap<PathBuf, std::sync::Arc<RuntimeRegistry>>>> = OnceLock::new();
+///
+/// M1 (v1.84 security review): the process-wide map is a synchronous mutex
+/// held only to look up, insert or drop one home's cell — never across the
+/// CLI probes. Each home's build runs inside its own `OnceCell`, outside that
+/// lock: concurrent first calls for one home share one build, and a rebuild
+/// of one home never delays a dispatch on another. Invalidation drops the
+/// cell (a build still running on it completes for its own waiters only).
+static REGISTRIES: OnceLock<std::sync::Mutex<HashMap<PathBuf, RegistryCell>>> = OnceLock::new();
+
+type RegistryCell = std::sync::Arc<tokio::sync::OnceCell<std::sync::Arc<RuntimeRegistry>>>;
+
+fn registry_cells() -> std::sync::MutexGuard<'static, HashMap<PathBuf, RegistryCell>> {
+    REGISTRIES.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The registry currently cached for `home_dir`, without building one.
+fn cached_registry(home_dir: &Path) -> Option<std::sync::Arc<RuntimeRegistry>> {
+    registry_cells().get(home_dir).and_then(|cell| cell.get().cloned())
+}
+
+/// Per-home minimum time between two registry invalidations triggered by
+/// `runtime.detect` (M1), whatever the detection result.
+pub(crate) const DETECT_INVALIDATION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// When `runtime.detect` last invalidated each home's registry.
+static DETECT_INVALIDATIONS: OnceLock<std::sync::Mutex<HashMap<PathBuf, std::time::Instant>>> = OnceLock::new();
+
+/// M1: `runtime.detect` reports what it found; only THIS home's registry is
+/// dropped, and only when the detection (installed runtimes and their
+/// resolved paths) differs from what the cached registry was built from, at
+/// most once per [`DETECT_INVALIDATION_INTERVAL`] per home. Any signed-in
+/// caller may run `runtime.detect`, so repeated calls must never defeat the
+/// re-probe rate limit or touch other homes. Returns whether it invalidated.
+pub(crate) fn note_runtime_detection(
+    home_dir: &Path,
+    detected: &std::collections::BTreeMap<String, String>,
+) -> bool {
+    // Nothing cached: the next dispatch builds from a fresh probe anyway.
+    let Some(current) = cached_registry(home_dir) else { return false };
+    if current.detection() == detected {
+        return false;
+    }
+    let now = std::time::Instant::now();
+    {
+        let mut last = DETECT_INVALIDATIONS.get_or_init(Default::default).lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match last.get(home_dir) {
+            Some(at) if now.duration_since(*at) < DETECT_INVALIDATION_INTERVAL => return false,
+            _ => { last.insert(home_dir.to_path_buf(), now); }
+        }
+    }
+    tracing::info!("runtime.detect found a different set of installed runtimes — the next dispatch re-probes this home");
+    drop_registry_cell(home_dir);
+    true
+}
+
+fn drop_registry_cell(home_dir: &Path) {
+    registry_cells().remove(home_dir);
+}
 
 /// Rate limit of the "configured runtime not registered" re-probe, per home.
 pub(crate) const REGISTRY_REPROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
@@ -75,17 +132,13 @@ pub async fn registry(home_dir: &Path) -> std::sync::Arc<RuntimeRegistry> {
     if let Some(registry) = testing::owned_registry(home_dir) {
         return registry;
     }
-    let map = REGISTRIES.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = map.lock().await;
-    if let Some(reg) = guard.get(home_dir) {
-        return reg.clone();
-    }
-    // Build while holding the lock so a concurrent first-call for the same home
-    // waits rather than double-building (CLI probing is async). Distinct homes
-    // serialize here only on a (re)build.
-    let built = std::sync::Arc::new(build_registry(home_dir).await);
-    guard.insert(home_dir.to_path_buf(), built.clone());
-    built
+    // The map lock is released before any probing (the guard is a temporary
+    // of this statement); a concurrent first call for the same home waits on
+    // the same cell rather than double-building.
+    let cell = registry_cells().entry(home_dir.to_path_buf()).or_default().clone();
+    cell.get_or_init(|| async { std::sync::Arc::new(build_registry(home_dir).await) })
+        .await
+        .clone()
 }
 
 async fn build_registry(home_dir: &Path) -> RuntimeRegistry {
@@ -99,17 +152,14 @@ async fn build_registry(home_dir: &Path) -> RuntimeRegistry {
 /// Drop `home_dir`'s cached registry: the next dispatch probes the host
 /// again (same probes as the first build). In-flight calls keep theirs.
 pub async fn invalidate_registry(home_dir: &Path) {
-    if let Some(map) = REGISTRIES.get() {
-        map.lock().await.remove(home_dir);
-    }
+    drop_registry_cell(home_dir);
 }
 
 /// Drop every home's cached registry. An installed or removed CLI is a host
-/// fact, not a per-home one, so install/detect refresh all homes.
+/// fact, not a per-home one, so a successful admin install refreshes all
+/// homes. `runtime.detect` does NOT use this (see [`note_runtime_detection`]).
 pub async fn invalidate_all_registries() {
-    if let Some(map) = REGISTRIES.get() {
-        map.lock().await.clear();
-    }
+    registry_cells().clear();
 }
 
 /// A configured runtime is not in `current`: re-probe once, rate limited to
@@ -1576,7 +1626,128 @@ pub(crate) mod testing {
             if let Ok(mut reprobes) = REGISTRY_REPROBES.get_or_init(Default::default).lock() {
                 reprobes.remove(&self.home);
             }
+            if let Ok(mut detects) = DETECT_INVALIDATIONS.get_or_init(Default::default).lock() {
+                detects.remove(&self.home);
+            }
         }
+    }
+
+    type Detection = std::collections::BTreeMap<String, String>;
+
+    fn detection(pairs: &[(&str, &str)]) -> Detection {
+        pairs.iter().map(|(id, path)| (id.to_string(), path.to_string())).collect()
+    }
+
+    /// A fake host whose builds record `host` as their detection.
+    fn fake_detecting_host(home: &Path, host: Detection)
+        -> (BuilderGuard, Arc<std::sync::Mutex<Detection>>, Arc<std::sync::atomic::AtomicUsize>) {
+        let host = Arc::new(std::sync::Mutex::new(host));
+        let builds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (seen, count) = (host.clone(), builds.clone());
+        let guard = BuilderGuard::install(home, move || {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            RuntimeRegistry::with_runtimes(HashMap::new()).with_detection(seen.lock().unwrap().clone())
+        });
+        (guard, host, builds)
+    }
+
+    /// M1: repeated `runtime.detect` calls (any signed-in role reaches
+    /// `note_runtime_detection`; nothing else in the handler touches the
+    /// registry) rebuild nothing while the detection is unchanged, exactly
+    /// once when it changes, and at most once per interval per home.
+    #[tokio::test]
+    async fn runtime_detect_rebuilds_only_on_change_and_at_most_once_per_interval() {
+        use std::sync::atomic::Ordering;
+        let home = tempfile::tempdir().unwrap();
+        let before = detection(&[("claude", "/bin/claude"), ("codex", "/bin/codex")]);
+        let (_host, host, builds) = fake_detecting_host(home.path(), before.clone());
+        let first = super::registry(home.path()).await;
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+        // Unchanged detection, called in a loop: no invalidation, no rebuild.
+        for _ in 0..20 {
+            assert!(!super::note_runtime_detection(home.path(), &before));
+        }
+        assert!(Arc::ptr_eq(&first, &super::registry(home.path()).await));
+        assert_eq!(builds.load(Ordering::SeqCst), 1, "unchanged detection rebuilds nothing");
+        // A changed detection (new runtime, or a moved path): exactly one.
+        let after = detection(&[("claude", "/bin/claude"), ("codex", "/opt/codex"), ("grok", "/bin/grok")]);
+        *host.lock().unwrap() = after.clone();
+        assert!(super::note_runtime_detection(home.path(), &after));
+        let rebuilt = super::registry(home.path()).await;
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+        assert_eq!(rebuilt.detection(), &after);
+        for _ in 0..20 {
+            assert!(!super::note_runtime_detection(home.path(), &after));
+            let _ = super::registry(home.path()).await;
+        }
+        assert_eq!(builds.load(Ordering::SeqCst), 2, "changed detection rebuilds exactly once");
+        // Still different from the registry, but inside the window: refused.
+        let flapping = detection(&[("claude", "/bin/claude")]);
+        for _ in 0..20 {
+            assert!(!super::note_runtime_detection(home.path(), &flapping));
+            let _ = super::registry(home.path()).await;
+        }
+        assert_eq!(builds.load(Ordering::SeqCst), 2, "at most one rebuild per interval");
+        // Once the window has passed, the next difference invalidates again.
+        let Some(past) = std::time::Instant::now().checked_sub(DETECT_INVALIDATION_INTERVAL) else {
+            super::invalidate_registry(home.path()).await;
+            return; // monotonic clock younger than the window on this host
+        };
+        DETECT_INVALIDATIONS.get().unwrap().lock().unwrap().insert(home.path().to_owned(), past);
+        assert!(super::note_runtime_detection(home.path(), &flapping));
+        let _ = super::registry(home.path()).await;
+        assert_eq!(builds.load(Ordering::SeqCst), 3);
+        super::invalidate_registry(home.path()).await;
+    }
+
+    /// M1: `runtime.detect` on one home never invalidates another, and with
+    /// nothing cached it has nothing to drop.
+    #[tokio::test]
+    async fn runtime_detect_never_invalidates_other_homes() {
+        use std::sync::atomic::Ordering;
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let host = detection(&[("claude", "/bin/claude")]);
+        let (_ha, _, builds_a) = fake_detecting_host(a.path(), host.clone());
+        let (_hb, _, builds_b) = fake_detecting_host(b.path(), host.clone());
+        assert!(!super::note_runtime_detection(a.path(), &detection(&[])), "nothing cached yet");
+        let registry_b = super::registry(b.path()).await;
+        let _ = super::registry(a.path()).await;
+        assert!(super::note_runtime_detection(a.path(), &detection(&[("grok", "/bin/grok")])));
+        assert!(Arc::ptr_eq(&registry_b, &super::registry(b.path()).await), "home B untouched");
+        assert_eq!(builds_b.load(Ordering::SeqCst), 1);
+        let _ = super::registry(a.path()).await;
+        assert_eq!(builds_a.load(Ordering::SeqCst), 2);
+        super::invalidate_registry(a.path()).await;
+        super::invalidate_registry(b.path()).await;
+    }
+
+    /// M1: the process-wide map is not held across a build. A build of home A
+    /// that never finishes (a hung CLI probe) does not delay home B.
+    #[tokio::test]
+    async fn a_hung_rebuild_of_one_home_does_not_block_another() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let (_hb, _, _) = fake_detecting_host(b.path(), detection(&[]));
+        // Occupy A's build slot the way a slow probe would.
+        let cell = registry_cells().entry(a.path().to_path_buf()).or_default().clone();
+        let (started, running) = tokio::sync::oneshot::channel();
+        let hung = tokio::spawn(async move {
+            cell.get_or_init(|| async move {
+                let _ = started.send(());
+                std::future::pending::<std::sync::Arc<RuntimeRegistry>>().await
+            }).await;
+        });
+        running.await.unwrap();
+        let registry_b = tokio::time::timeout(std::time::Duration::from_secs(5), super::registry(b.path()))
+            .await.expect("home B is served while home A is still building");
+        assert!(registry_b.available().is_empty());
+        // Invalidation of A does not wait for A's build either.
+        tokio::time::timeout(std::time::Duration::from_secs(5), super::invalidate_registry(a.path()))
+            .await.expect("invalidation never waits on a build");
+        hung.abort();
+        let _ = hung.await;
+        super::invalidate_registry(b.path()).await;
     }
 
     struct Answers;
@@ -1706,10 +1877,9 @@ pub(crate) mod testing {
         let second_registry = second_guard.registry.clone();
         assert!(!Arc::ptr_eq(&first_registry, &second_registry));
 
-        // Hold the actual shared cache lock, as another home's startup can.
-        // Neither owned lookup nor either Drop may acquire this Tokio mutex.
-        let production_cache = REGISTRIES.get_or_init(|| Mutex::new(HashMap::new()));
-        let production_guard = production_cache.lock().await;
+        // Hold the actual shared cache lock. Neither owned lookup nor either
+        // Drop may acquire this mutex.
+        let production_guard = registry_cells();
         let production_entries = production_guard.len();
         drop(first_guard);
         assert!(owned_registry(first.path()).is_none());

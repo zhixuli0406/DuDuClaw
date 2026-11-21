@@ -107,7 +107,26 @@ pub fn require_model(policy: ProductProfile, model: &str) -> Result<(), String> 
     if let Some(id) = provider {
         policy.require_provider(id)?;
     }
+    // A model the pricing table does not list (a newer catalog default such
+    // as the Codex or Grok fallback model substituted for a bare Claude
+    // alias) is still attributed to its vendor by its catalog family, so a
+    // substitution can never step around a provider block.
+    if let Some(vendor) = family_provider(rest) {
+        policy.require_provider(vendor)?;
+    }
     Ok(())
+}
+
+/// The provider id (as the pricing table names it) of a model's confidently
+/// recognised catalog family; `None` for anything else.
+fn family_provider(model: &str) -> Option<&'static str> {
+    match crate::runtime_config::model_family(model)? {
+        "claude" => Some("anthropic"),
+        "codex" => Some("openai"),
+        "grok" => Some("xai"),
+        "gemini" => Some("gemini"),
+        _ => None,
+    }
 }
 
 /// Called before any dashboard write, including the raw editor and import paths.
@@ -181,6 +200,19 @@ mod tests {
             &"[model]\nprovider='anthropic'".parse().unwrap()
         )
         .is_ok());
+    }
+    /// A catalog default the pricing table does not list is still attributed
+    /// to its vendor (the restricted test policy blocks provider `openai`).
+    #[test]
+    fn unlisted_catalog_default_is_attributed_to_its_vendor() {
+        let codex_default = duduclaw_core::types::RuntimeType::Codex.spec().fallback_models[0].0;
+        assert!(crate::cost_telemetry::model_registry().get(codex_default).is_none(), "fixture: not in the pricing table");
+        assert_eq!(family_provider(codex_default), Some("openai"));
+        assert!(require_model(ProductProfile::Restricted, codex_default).is_err());
+        assert!(require_model(ProductProfile::Standard, codex_default).is_ok());
+        let grok_default = duduclaw_core::types::RuntimeType::Grok.spec().fallback_models[0].0;
+        assert!(require_model(ProductProfile::Restricted, grok_default).is_ok(), "xai is not blocked by the test policy");
+        assert_eq!(family_provider("house-model-v1"), None);
     }
     #[test]
     fn malformed_installation_never_returns_unrestricted_policy() {

@@ -33,6 +33,7 @@ use tracing::{info, warn};
 
 pub mod model;
 mod failure;
+pub(crate) mod failure_kind;
 mod fallback_rule;
 pub use failure::{FallbackSkip,RuntimeDispatchFailure,RuntimePreflightFailure,RuntimePreflightKind,RuntimeStep,RuntimeStepOutcome,RuntimeStepRole};
 pub use fallback_rule::{FallbackRefusal,FallbackTrigger,WorkLimitKind};
@@ -198,13 +199,15 @@ impl FailoverManager {
             failure.push(Primary,*primary,Some(&context.model),Outcome::Cooldown);
             classify_primary_failure(PrimaryFailure::Cooldown)
         } else if let Some(runtime)=registry.get(primary) {
-            match {
-                #[cfg(test)] crate::model_call_probe::record("failover_execute");
-                match runtime.execute(prompt,context).await {
-                    Ok(response) => crate::runtime_dispatch::validate_runtime_response(response,context).await,
-                    Err(error) => Err(error),
-                }
-            } {
+            // L2: what the runtime recorded about its failure, bound to the
+            // exact error string it returned (see `failure_kind`).
+            #[cfg(test)] crate::model_call_probe::record("failover_execute");
+            let (result,recorded)=failure_kind::capture(runtime.execute(prompt,context)).await;
+            let result=match result {
+                Ok(response) => crate::runtime_dispatch::validate_runtime_response(response,context).await,
+                Err(error) => Err(error),
+            };
+            match result {
                 Ok(response) if !response.content.trim().is_empty()=>{
                     self.record_success(primary).await;
                     record_successful_response(primary,context,&response);
@@ -222,16 +225,18 @@ impl FailoverManager {
                     }
                     let decision=classify_primary_failure(PrimaryFailure::Error{
                         error:&error, autonomy_denied:crate::autonomous_runtime::was_denied(),
+                        kind:failure_kind::kind_for(recorded.as_ref(),&error),
                     });
                     failure.push(Primary,*primary,Some(&context.model),Outcome::ExecutionError(error));
                     // Only a provider failure counts against the primary's health:
                     // a refusal (autonomy pause, work result, gate) never cools it
-                    // down, nor does an engine-local configuration refusal, which
-                    // is re-checked on every call.
-                    if matches!(decision,FallbackDecision::Eligible(trigger) if trigger!=FallbackTrigger::EngineLocalConfig) {
+                    // down, nor does an engine-local configuration refusal or a
+                    // prompt that does not fit, which are re-checked on every call.
+                    if matches!(decision,FallbackDecision::Eligible(trigger)
+                        if trigger!=FallbackTrigger::EngineLocalConfig && trigger!=FallbackTrigger::PromptTooLarge) {
                         self.record_failure(primary).await;
                     }
-                    decision
+                    fallback_rule::apply_fallback_engine_limits(decision,fallback)
                 }
             }
         } else {
@@ -446,7 +451,7 @@ mod tests {
     fn legacy_non_retryable_rows_keep_their_runtime_fallback_decision() {
         // The rows the removed `is_non_retryable` test pinned, through the rule
         // that replaced it (the full table lives in `fallback_rule::tests`).
-        let decide = |error: &str| classify_primary_failure(PrimaryFailure::Error { error, autonomy_denied: false });
+        let decide = |error: &str| classify_primary_failure(PrimaryFailure::Error { error, autonomy_denied: false, kind: None });
         assert!(matches!(decide("400 bad request: invalid JSON"), FallbackDecision::Refused(_)));
         assert!(matches!(decide("Content policy violation"), FallbackDecision::Refused(_)));
         assert!(matches!(decide("429 rate limited"), FallbackDecision::Eligible(_)));
@@ -1192,7 +1197,7 @@ mod work_limit_tests {
             WorkOutcome::TimeoutTotal { seconds:60, partial:String::new() },
             WorkOutcome::TimeoutNoProgress { seconds:60, tool:None, partial:String::new() }] {
             let error = outcome.encode();
-            assert!(matches!(classify_primary_failure(PrimaryFailure::Error { error: &error, autonomy_denied: false }),
+            assert!(matches!(classify_primary_failure(PrimaryFailure::Error { error: &error, autonomy_denied: false, kind: None }),
                 FallbackDecision::Refused(FallbackRefusal::WorkLimit(_))));
             assert!(FailoverManager::model_fallback_for("claude-opus-4-6", "claude-sonnet-4-6", &error).is_none());
         }

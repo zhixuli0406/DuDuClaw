@@ -508,3 +508,153 @@ async fn dispatch_claude_fallback_receives_the_conversation_history() {
         (RuntimeType::Claude, 2, expected),
     ]);
 }
+
+/// A bare Claude alias is replaced by the fallback engine's catalog default;
+/// the product model policy is applied to that SUBSTITUTED model, so the
+/// substitution never bypasses it. (The restricted test policy blocks the
+/// provider `openai`; the Codex default is an OpenAI model the pricing table
+/// does not list.)
+#[tokio::test]
+async fn substituted_catalog_default_is_refused_by_a_restrictive_model_policy() {
+    let codex_default = RuntimeType::Codex.spec().fallback_models[0].0;
+    for (config, allowed) in [("[product]\nprofile='restricted'\n", false), ("", true)] {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), config).unwrap();
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let mut map: HashMap<RuntimeType, Box<dyn crate::runtime::AgentRuntime>> = HashMap::new();
+        map.insert(RuntimeType::Grok, Box::new(Counted { id: RuntimeType::Grok, result: Err("Grok CLI exited with 1: boom"), calls: primary_calls.clone() }));
+        map.insert(RuntimeType::Codex, Box::new(Counted { id: RuntimeType::Codex, result: Ok("codex answer"), calls: fallback_calls.clone() }));
+        let reg = RuntimeRegistry::with_runtimes(map);
+        let mut context = ctx(home.path());
+        context.model = "opus".into();
+        let result = FailoverManager::new(60)
+            .execute_with_failover_detailed(&reg, &RuntimeType::Grok, Some(&RuntimeType::Codex), "hi", &context, &[])
+            .await;
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        if allowed {
+            let response = result.expect("standard policy: the substituted model runs");
+            assert_eq!(response.model_used, codex_default);
+            assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+        } else {
+            let failure = result.unwrap_err();
+            assert_eq!(fallback_calls.load(Ordering::SeqCst), 0, "the substituted model must not run");
+            let step = failure.steps.last().unwrap();
+            assert_eq!(step.runtime, RuntimeType::Codex);
+            assert_eq!(step.model.as_deref(), Some(codex_default));
+            assert!(matches!(&step.outcome, RuntimeStepOutcome::PolicyRefused(e) if e.contains("Product profile")), "{:?}", step.outcome);
+        }
+    }
+}
+
+/// A runtime that fails with `message` and records `kind` for it (or for a
+/// different string, to prove a stale kind is never borrowed).
+struct TypedFailure {
+    id: RuntimeType,
+    message: &'static str,
+    kind: super::failure_kind::FailureKind,
+    record_for_other_text: bool,
+    calls: Arc<AtomicUsize>,
+}
+#[async_trait::async_trait]
+impl crate::runtime::AgentRuntime for TypedFailure {
+    fn name(&self) -> &str { self.id.as_str() }
+    async fn execute(&self, _: &str, _: &RuntimeContext) -> Result<RuntimeResponse, String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.record_for_other_text {
+            let _ = super::failure_kind::typed(self.kind, format!("{} (earlier attempt)", self.message));
+            return Err(self.message.to_string());
+        }
+        Err(super::failure_kind::typed(self.kind, self.message.to_string()))
+    }
+    async fn is_available(&self) -> bool { true }
+}
+
+fn typed_registry(primary: TypedFailure, fallback: RuntimeType) -> (RuntimeRegistry, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut map: HashMap<RuntimeType, Box<dyn crate::runtime::AgentRuntime>> = HashMap::new();
+    let id = primary.id;
+    map.insert(id, Box::new(primary));
+    map.insert(fallback, Box::new(Counted { id: fallback, result: Ok("fallback answer"), calls: calls.clone() }));
+    (RuntimeRegistry::with_runtimes(map), calls)
+}
+
+/// L2 through the real failover manager: the kind the runtime recorded for
+/// exactly its error decides, whatever the text says; a kind recorded for
+/// another string is ignored.
+#[tokio::test]
+async fn the_recorded_failure_kind_decides_and_a_stale_kind_is_ignored() {
+    use super::failure_kind::FailureKind;
+    let home = tempfile::tempdir().unwrap();
+    // Text alone would be an eligible process error; the typed kind refuses.
+    let primary_calls = Arc::new(AtomicUsize::new(0));
+    let (reg, fallback_calls) = typed_registry(TypedFailure {
+        id: RuntimeType::Codex, message: "API error (500 Internal Server Error): invalid model 401 overloaded",
+        kind: FailureKind::ContentPolicy, record_for_other_text: false, calls: primary_calls.clone(),
+    }, RuntimeType::Claude);
+    let failure = FailoverManager::new(60)
+        .execute_with_failover_detailed(&reg, &RuntimeType::Codex, Some(&RuntimeType::Claude), "hi", &ctx(home.path()), &[])
+        .await.unwrap_err();
+    assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(failure.fallback_skipped.map(|s| s.reason), Some(FallbackRefusal::ContentPolicy));
+    // Text alone would be refused (a 4xx body that names a model); the typed kind falls back.
+    let (reg, fallback_calls) = typed_registry(TypedFailure {
+        id: RuntimeType::Codex, message: "API error (400 Bad Request): content policy violation billing_hard_limit",
+        kind: FailureKind::Server, record_for_other_text: false, calls: primary_calls.clone(),
+    }, RuntimeType::Claude);
+    let response = FailoverManager::new(60)
+        .execute_with_failover_detailed(&reg, &RuntimeType::Codex, Some(&RuntimeType::Claude), "hi", &ctx(home.path()), &[])
+        .await.expect("eligible by kind");
+    assert_eq!(response.content, "fallback answer");
+    assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    // A kind recorded for a different string does not apply: the anchored status decides.
+    let (reg, fallback_calls) = typed_registry(TypedFailure {
+        id: RuntimeType::Codex, message: "API error (400 Bad Request): x",
+        kind: FailureKind::Server, record_for_other_text: true, calls: primary_calls,
+    }, RuntimeType::Claude);
+    let failure = FailoverManager::new(60)
+        .execute_with_failover_detailed(&reg, &RuntimeType::Codex, Some(&RuntimeType::Claude), "hi", &ctx(home.path()), &[])
+        .await.unwrap_err();
+    assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(failure.fallback_skipped.map(|s| s.reason), Some(FallbackRefusal::RequestRejected));
+}
+
+/// RM-204: a Grok prompt whose required context does not fit one argument
+/// falls back to Claude (no argument limit) but not to another
+/// single-argument engine, and never cools the primary down.
+#[tokio::test]
+async fn prompt_too_large_falls_back_only_to_an_engine_without_the_argument_limit() {
+    let home = tempfile::tempdir().unwrap();
+    let error: &'static str = Box::leak(crate::runtime::prompt_budget::prompt_too_large_error("grok").into_boxed_str());
+    let grok = |calls: &Arc<AtomicUsize>| Counted { id: RuntimeType::Grok, result: Err(error), calls: calls.clone() };
+    let primary_calls = Arc::new(AtomicUsize::new(0));
+    for (fallback, eligible) in [(RuntimeType::Claude, true), (RuntimeType::Qwen, false)] {
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let mut map: HashMap<RuntimeType, Box<dyn crate::runtime::AgentRuntime>> = HashMap::new();
+        map.insert(RuntimeType::Grok, Box::new(grok(&primary_calls)));
+        map.insert(fallback, Box::new(Counted { id: fallback, result: Ok("fallback answer"), calls: fallback_calls.clone() }));
+        let reg = RuntimeRegistry::with_runtimes(map);
+        let mgr = FailoverManager::new(60);
+        let mut context = ctx(home.path());
+        context.model = "grok-4".into();
+        let result = mgr
+            .execute_with_failover_detailed(&reg, &RuntimeType::Grok, Some(&fallback), "hi", &context, &[])
+            .await;
+        if eligible {
+            assert_eq!(result.expect("Claude has no argument limit").content, "fallback answer");
+            assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+        } else {
+            let failure = result.unwrap_err();
+            assert_eq!(fallback_calls.load(Ordering::SeqCst), 0, "{fallback:?} shares the limit");
+            assert_eq!(failure.fallback_skipped.map(|s| s.reason), Some(FallbackRefusal::PromptTooLarge));
+            // The person sees the plain zh-TW explanation.
+            let shown = failure.steps.iter().find_map(|step| match &step.outcome {
+                RuntimeStepOutcome::ExecutionError(e) => duduclaw_agent::mcp_spawn_gate::spawn_gate_user_message(e),
+                _ => None,
+            }).unwrap();
+            assert!(shown.starts_with(crate::runtime::prompt_budget::PROMPT_TOO_LARGE_PREFIX) && shown.contains("新的對話"), "{shown}");
+        }
+        let grok_health = mgr.health_summary().await.into_iter().find(|h| h.runtime_type == RuntimeType::Grok).unwrap();
+        assert_eq!(grok_health.consecutive_failures, 0);
+    }
+}

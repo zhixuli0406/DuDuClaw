@@ -331,9 +331,18 @@ fn resolve_grok_path() -> String {
 /// [`super::prompt_budget::SINGLE_ARGUMENT_PAYLOAD_BUDGET`] by the
 /// section-aware reduction (summaries, pinned instructions, the historical
 /// note and the knowledge rules are never dropped). Byte-identical to the
-/// v1.83.0 framing below the budget.
+/// v1.83.0 framing below the budget. Spawns use [`checked_payload`].
+#[cfg(test)]
 fn build_prompt(context: &RuntimeContext, user_prompt: &str) -> String {
     super::prompt_budget::single_argument_payload(context, user_prompt, "grok")
+}
+
+/// The `-p` payload for a spawn: refused with the plain-language
+/// prompt-too-large error when the conversation's required context does not
+/// fit one argument (instead of an opaque `execve` failure).
+fn checked_payload(context: &RuntimeContext, user_prompt: &str) -> Result<String, String> {
+    super::prompt_budget::try_single_argument_payload(context, user_prompt, "grok")
+        .map_err(|_| super::prompt_budget::prompt_too_large_error("grok"))
 }
 
 // ── AgentRuntime impl ───────────────────────────────────────────
@@ -357,7 +366,7 @@ impl AgentRuntime for GrokRuntime {
             // RM-103 S3: the employee's native write/shell restrictions hold in
             // protected mode too — refused before the isolated route.
             super::protected_coarse_native_gate(context.capabilities.as_ref(), "grok", &context.agent_id)?;
-            let payload = build_prompt(context, prompt);
+            let payload = checked_payload(context, prompt)?;
             let out = crate::isolation_mcp::runtime::execute_native(
                 duduclaw_isolation::execution::RuntimeKind::Grok, payload.clone(), context).await?;
             let stdout = std::str::from_utf8(&out).map_err(|_| "invalid isolated Grok output")?;
@@ -462,7 +471,7 @@ impl AgentRuntime for GrokRuntime {
             }
         }
 
-        let payload = build_prompt(context, prompt);
+        let payload = checked_payload(context, prompt)?;
 
         // Build the argument vector ONCE so the tokio spawn and the PTY retry run
         // a byte-identical command.

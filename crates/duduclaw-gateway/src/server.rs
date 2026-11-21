@@ -2071,6 +2071,12 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         if swept > 0 {
             info!(count = swept, "Removed stale MCP proxy env files");
         }
+        // H1: per-call Codex homes (`<home>/run/codex/call-*`, `utility-*`)
+        // a crashed gateway left behind hold full system prompts.
+        let swept = crate::runtime::codex::owned_home::sweep_stale(&home_dir);
+        if swept > 0 {
+            info!(count = swept, "Removed stale Codex call directories");
+        }
     }
 
     // Initialize SQLite message queue (Phase 3 Hybrid TaskPipeline)
