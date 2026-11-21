@@ -217,6 +217,7 @@ mod next_step_tests {
             chat: chat.into(),
             sender: "users/1234567890".into(),
             user_id: user_id.map(str::to_string),
+            attested_private: false,
         }
     }
 

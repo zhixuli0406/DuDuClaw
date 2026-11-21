@@ -348,7 +348,7 @@ mod recipient_tests {
         let _turn = register("source-bot", "source-turn", "telegram:42:topic#agent:source-bot").unwrap();
         assert_eq!(source_conversation_for("source-bot", "source-turn"), None);
         let _requester = crate::knowledge::turn_requesters::register("source-bot", "source-turn",
-            RequesterIdentity::ChannelUser {channel: "telegram".into(), chat: "42".into(), sender: "person".into(), user_id: Some("verified-user".into())}).unwrap();
+            RequesterIdentity::ChannelUser {channel: "telegram".into(), chat: "42".into(), sender: "person".into(), user_id: Some("verified-user".into()), attested_private: false}).unwrap();
         assert_eq!(source_conversation_for("source-bot", "source-turn").as_deref(), Some("telegram:42"));
         assert_eq!(source_conversation_for("other-bot", "source-turn"), None);
         assert_eq!(source_conversation_for("source-bot", "unknown"), None);
@@ -365,7 +365,7 @@ mod recipient_tests {
             let reply = format!("{channel}:visitor");
             let _turn = register(&agent, "visitor-turn", &reply).unwrap();
             let _requester = crate::knowledge::turn_requesters::register(&agent, "visitor-turn",
-                RequesterIdentity::ChannelUser {channel: channel.into(), chat: "visitor".into(), sender: "visitor".into(), user_id: None}).unwrap();
+                RequesterIdentity::ChannelUser {channel: channel.into(), chat: "visitor".into(), sender: "visitor".into(), user_id: None, attested_private: false}).unwrap();
             assert_eq!(source_conversation_for(&agent, "visitor-turn"), None);
             assert_eq!(reply_channel_for(&agent, "visitor-turn").as_deref(), Some(reply.as_str()));
             assert_eq!(duduclaw_core::recipient_policy::evaluate(
@@ -388,7 +388,7 @@ mod recipient_tests {
         assert_eq!(source_conversation_for("forged-bot", "unknown"), None);
         let _turn = register("forged-bot", "real-turn", "line:real").unwrap();
         let _requester = crate::knowledge::turn_requesters::register("forged-bot", "real-turn",
-            RequesterIdentity::ChannelUser {channel: "line".into(), chat: "real".into(), sender: "person".into(), user_id: Some("verified-user".into())}).unwrap();
+            RequesterIdentity::ChannelUser {channel: "line".into(), chat: "real".into(), sender: "person".into(), user_id: Some("verified-user".into()), attested_private: false}).unwrap();
         assert_eq!(source_conversation_for("forged-bot", "real-turn").as_deref(), Some("line:real"));
     }
 }

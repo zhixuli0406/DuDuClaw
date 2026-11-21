@@ -13,8 +13,10 @@
 //!
 //! ## Base URL resolution (in priority order)
 //!
-//! 1. `config.toml [dashboard] public_url` — an operator-declared externally
-//!    reachable address (reverse proxy, tailnet hostname, custom domain).
+//! 1. `config.toml [dashboard] public_url`, else `[general] public_url`, else
+//!    `[gateway] public_url` (first non-blank wins) — an operator-declared
+//!    externally reachable address (reverse proxy, tailnet hostname, custom
+//!    domain).
 //! 2. `config.toml [gateway] port` — falls back to `http://localhost:<port>`,
 //!    which is only correct when the channel recipient is on the same machine
 //!    as the gateway, but is still strictly better than no link at all for the
@@ -25,6 +27,10 @@
 //!    the current plain-text behavior unchanged" — never emit a dangling or
 //!    empty URL (project convention: security/UX gates fail closed, and here
 //!    that means fail-quiet rather than fail-ugly).
+//!
+//! [`public_deep_link`] uses step 1 only (an http(s) URL with a host): for
+//! text sent to a chat channel, where a localhost link cannot be opened by
+//! the reader.
 //!
 //! ## Object routes
 //!
@@ -75,22 +81,49 @@ pub enum DeepLinkKind {
     Autopilot,
 }
 
+/// The `config.toml` sections whose `public_url` names the dashboard's
+/// externally reachable address, in priority order. `[dashboard]` is what
+/// the dashboard's settings page writes; `[general]` and `[gateway]` are
+/// accepted as aliases (operators set them by hand, and account invitations
+/// historically read `[gateway]`).
+pub(crate) const PUBLIC_URL_SECTIONS: [&str; 3] = ["dashboard", "general", "gateway"];
+
+/// One `public_url` entry as written, in [`PUBLIC_URL_SECTIONS`] order.
+/// Blank strings are omitted; a non-string value is `Err(())`.
+pub(crate) fn public_url_entries(table: &toml::Table) -> Vec<(&'static str, Result<&str, ()>)> {
+    PUBLIC_URL_SECTIONS
+        .iter()
+        .filter_map(|section| {
+            let value = table.get(*section)?.as_table()?.get("public_url")?;
+            match value.as_str() {
+                Some(raw) if raw.trim().is_empty() => None,
+                Some(raw) => Some((*section, Ok(raw.trim()))),
+                None => Some((*section, Err(()))),
+            }
+        })
+        .collect()
+}
+
+/// The first non-blank string `public_url` (see [`PUBLIC_URL_SECTIONS`]),
+/// trailing slashes trimmed. Not validated, exactly as `[dashboard]
+/// public_url` was read before the aliases existed.
+fn configured_public_url(table: &toml::Table) -> Option<String> {
+    public_url_entries(table)
+        .into_iter()
+        .find_map(|(_, value)| value.ok())
+        .map(|raw| raw.trim_end_matches('/').to_string())
+}
+
 /// Resolve the dashboard's externally-reachable base URL (no trailing slash),
-/// or `None` when neither `[dashboard] public_url` nor `[gateway] port` is
-/// present/parseable in `config.toml`. See module docs for the priority order.
+/// or `None` when neither a `public_url` ([`PUBLIC_URL_SECTIONS`]) nor
+/// `[gateway] port` is present/parseable in `config.toml`. See module docs
+/// for the priority order.
 pub(crate) fn dashboard_base_url(home_dir: &Path) -> Option<String> {
     let content = std::fs::read_to_string(home_dir.join("config.toml")).ok()?;
     let table: toml::Table = content.parse().ok()?;
 
-    if let Some(url) = table
-        .get("dashboard")
-        .and_then(|v| v.as_table())
-        .and_then(|d| d.get("public_url"))
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        return Some(url.trim_end_matches('/').to_string());
+    if let Some(url) = configured_public_url(&table) {
+        return Some(url);
     }
 
     let port = table
@@ -102,6 +135,29 @@ pub(crate) fn dashboard_base_url(home_dir: &Path) -> Option<String> {
         return None;
     }
     Some(format!("http://localhost:{port}"))
+}
+
+/// The operator-configured public base only (no trailing slash): the same
+/// [`PUBLIC_URL_SECTIONS`] order as [`dashboard_base_url`], but never the
+/// `http://localhost:<port>` fallback, and only a plain http(s) URL with a
+/// host. For links put into messages sent to chat channels, where a
+/// localhost address is unreachable for the reader. `None` = no link; the
+/// caller keeps its "open the dashboard" sentence without one.
+pub(crate) fn public_dashboard_base_url(home_dir: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(home_dir.join("config.toml")).ok()?;
+    let table: toml::Table = content.parse().ok()?;
+    let base = configured_public_url(&table)?;
+    if base.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return None;
+    }
+    let url = url::Url::parse(&base).ok()?;
+    (matches!(url.scheme(), "http" | "https")
+        && url.host().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none())
+    .then_some(base)
 }
 
 /// Why [`dashboard_public_base`] refused to produce a base. Both variants fail
@@ -247,6 +303,17 @@ pub(crate) fn valid_oauth_public_base(raw: &str) -> Option<(String, String)> {
 /// an empty/dangling link.
 pub fn deep_link(home_dir: &Path, kind: DeepLinkKind, id: &str) -> Option<String> {
     let base = dashboard_base_url(home_dir)?;
+    with_route(base, kind, id)
+}
+
+/// [`deep_link`] on [`public_dashboard_base_url`]: `None` unless an operator
+/// configured a public address — never a localhost link in a chat message.
+pub fn public_deep_link(home_dir: &Path, kind: DeepLinkKind, id: &str) -> Option<String> {
+    let base = public_dashboard_base_url(home_dir)?;
+    with_route(base, kind, id)
+}
+
+fn with_route(base: String, kind: DeepLinkKind, id: &str) -> Option<String> {
     let path: String = match kind {
         DeepLinkKind::ComputerSession => {
             if !duduclaw_core::is_valid_agent_id(id) { return None; }
@@ -501,6 +568,63 @@ mod tests {
     fn deep_link_none_when_no_base_url_resolvable() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(deep_link(dir.path(), DeepLinkKind::Task, "abc123"), None);
+    }
+
+    #[test]
+    fn base_url_reads_public_url_aliases_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases = [
+            (
+                "[dashboard]\npublic_url = \"https://dash.example\"\n[general]\npublic_url = \"https://general.example\"\n[gateway]\npublic_url = \"https://gw.example\"\nport = 18889\n",
+                "https://dash.example",
+            ),
+            (
+                "[dashboard]\npublic_url = \"  \"\n[general]\npublic_url = \"https://general.example/\"\n[gateway]\npublic_url = \"https://gw.example\"\nport = 18889\n",
+                "https://general.example",
+            ),
+            (
+                "[general]\nlog_level = \"info\"\n[gateway]\npublic_url = \"https://gw.example\"\nport = 18889\n",
+                "https://gw.example",
+            ),
+            // A non-string value is skipped like an absent one.
+            (
+                "[dashboard]\npublic_url = 42\n[general]\npublic_url = \"https://general.example\"\n",
+                "https://general.example",
+            ),
+        ];
+        for (config, want) in cases {
+            write_config(dir.path(), config);
+            assert_eq!(dashboard_base_url(dir.path()).as_deref(), Some(want), "{config}");
+            assert_eq!(public_dashboard_base_url(dir.path()).as_deref(), Some(want), "{config}");
+        }
+        // An unvalidated [dashboard] value that worked before keeps working.
+        write_config(dir.path(), "[dashboard]\npublic_url = \"ai.example.com\"\n");
+        assert_eq!(dashboard_base_url(dir.path()).as_deref(), Some("ai.example.com"));
+    }
+
+    #[test]
+    fn public_only_base_never_falls_back_to_localhost() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(public_dashboard_base_url(dir.path()), None);
+        write_config(dir.path(), "[gateway]\nport = 18889\n");
+        assert_eq!(dashboard_base_url(dir.path()).as_deref(), Some("http://localhost:18889"));
+        assert_eq!(public_dashboard_base_url(dir.path()), None);
+        assert_eq!(public_deep_link(dir.path(), DeepLinkKind::Task, "t-1"), None);
+        assert_eq!(
+            deep_link(dir.path(), DeepLinkKind::Task, "t-1").as_deref(),
+            Some("http://localhost:18889/tasks/t-1"),
+            "the shared resolver keeps its fallback"
+        );
+        // Not a clickable http(s) address → no link at all.
+        for bad in ["ai.example.com", "javascript:alert(1)", "https://u:p@x.example", "https://x.example/?a=1"] {
+            write_config(dir.path(), &format!("[dashboard]\npublic_url = {bad:?}\n[gateway]\nport = 18889\n"));
+            assert_eq!(public_dashboard_base_url(dir.path()), None, "{bad}");
+        }
+        write_config(dir.path(), "[general]\npublic_url = \"https://ai.example.com/agents/\"\n[gateway]\nport = 18889\n");
+        assert_eq!(
+            public_deep_link(dir.path(), DeepLinkKind::Task, "t-9").as_deref(),
+            Some("https://ai.example.com/agents/tasks/t-9")
+        );
     }
 
     #[test]

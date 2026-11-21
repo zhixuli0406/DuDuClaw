@@ -649,7 +649,9 @@ async fn build_reply_with_session_inner_impl(
     // must be stripped)? Computed once per turn, fail-closed — anything not
     // provably 1:1 is treated as shared. Drives both the persona-block gate
     // below and the sensitivity-aware wiki injection inside build_system_prompt.
-    let is_private = duduclaw_core::is_private_session(session_id, user_id);
+    // A Google Chat 1:1 DM is proven by the adapter's attestation for this
+    // exact space and sender, not by the session id's shape.
+    let is_private = crate::ccr_runtime::conversation_is_one_to_one(session_id, user_id);
 
     // Effective reply language: the employee's `[prompt] reply_language`,
     // else the global config.toml [general] default_language; `None` ⇒ follow

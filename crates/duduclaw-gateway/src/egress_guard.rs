@@ -1973,11 +1973,11 @@ mod tests {
         let token = duduclaw_core::mint_identity_token(&identity, agent);
         let _turn = crate::turn_context::register(agent, "live", "line:source#agent:recipient-route-bot").unwrap();
         let _requester = crate::knowledge::turn_requesters::register(agent, "live",
-            RequesterIdentity::ChannelUser {channel:"line".into(),chat:"source".into(),sender:"person".into(),user_id:Some("verified-person".into())}).unwrap();
+            RequesterIdentity::ChannelUser {channel:"line".into(),chat:"source".into(),sender:"person".into(),user_id:Some("verified-person".into()),attested_private:false}).unwrap();
         let _guest_turn = crate::turn_context::register(agent, "guest", "line:guest").unwrap();
         let _guest = crate::knowledge::turn_requesters::register(agent, "guest",
             RequesterIdentity::ChannelUser { channel: "line".into(), chat: "guest".into(),
-                sender: "guest".into(), user_id: None }).unwrap();
+                sender: "guest".into(), user_id: None, attested_private: false }).unwrap();
         for (turn, forged_source, expected) in [("live", false, Some("line:source")), ("guest", false, None), ("unknown", false, None), ("", false, None), ("live", true, None)] {
             let mut request = serde_json::json!({"op":"recipients", "turn_id":turn});
             if forged_source { request["source"] = serde_json::json!("line:forged"); }

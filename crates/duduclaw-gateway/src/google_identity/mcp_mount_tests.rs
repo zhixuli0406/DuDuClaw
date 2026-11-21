@@ -108,6 +108,7 @@ async fn reused_google_mount_checks_each_real_requester_and_preserves_task_local
             chat: "visitor".into(),
             sender: "v".into(),
             user_id: None,
+            attested_private: false,
         };
         let value = CURRENT_REQUESTER
             .scope(
@@ -273,6 +274,7 @@ async fn production_mount_loader_resolves_the_employee_and_skips_only_google_on_
         chat: "v".into(),
         sender: "v".into(),
         user_id: None,
+        attested_private: false,
     };
     let servers = CURRENT_REQUESTER
         .scope(

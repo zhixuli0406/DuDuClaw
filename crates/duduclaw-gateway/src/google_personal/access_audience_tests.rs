@@ -13,6 +13,7 @@ fn member(user_id: Option<&str>) -> RequesterIdentity {
         chat: "spaces/A".into(),
         sender: "users/1".into(),
         user_id: user_id.map(str::to_string),
+        attested_private: false,
     }
 }
 

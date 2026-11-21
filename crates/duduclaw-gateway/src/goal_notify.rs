@@ -273,8 +273,10 @@ pub enum GoalProgress {
     Rejected { iter: u32, cap: u32 },
     /// The goal reached `done` (judge-accepted or human-marked).
     Done,
-    /// The goal parked `needs_human` (a buttoned approval was pushed separately).
-    NeedsHuman,
+    /// The goal parked `needs_human`. `buttons_elsewhere`: a card with
+    /// decision buttons was actually sent to another conversation than this
+    /// line goes to — the only case the line may say so.
+    NeedsHuman { buttons_elsewhere: bool },
     /// The goal is waiting on a kickoff approval before its first dispatch.
     Kickoff,
     /// H22: the task has been running for `minutes` with no observable
@@ -556,12 +558,18 @@ fn progress_body(task: &TaskRow, progress: &GoalProgress) -> String {
                 duduclaw_core::truncate_chars(sum, 300)
             )
         }
-        GoalProgress::NeedsHuman => {
+        GoalProgress::NeedsHuman { buttons_elsewhere } => {
             // H11: name the class here too — this mirror line is often the
             // only thing a person reads in the launching conversation.
             let pause = crate::pause_reason::PauseReason::from_stored(task.pause_reason.as_deref())
                 .label_zh();
-            format!("🧭 目標 #{short} 卡住了（{pause}），需要你的決定（已另外推送審批按鈕）。")
+            // RM-192 B5: claim buttons only when a buttoned card really went
+            // to another conversation.
+            if *buttons_elsewhere {
+                format!("🧭 目標 #{short} 卡住了（{pause}），需要你的決定（已另外推送審批按鈕）。")
+            } else {
+                format!("🧭 目標 #{short} 卡住了（{pause}），需要你的決定，請至儀表板的待辦決定頁處理。")
+            }
         }
         GoalProgress::Kickoff => {
             format!("⏳ 目標 #{short} 需先核准才會開始自主執行：{title}")
@@ -626,10 +634,10 @@ pub async fn notify_goal_progress(
 /// abort/take-over pair — which every other button-capable channel offers as
 /// a second row/overflow menu — is dropped from the LINE quick reply
 /// entirely (see [`crate::channel_format::line_goal_quick_reply`]) and named
-/// here as plain text instead, pointing at the dashboard deep link the
-/// shared delivery path already appends after this body.
+/// here as plain text instead, pointing at the dashboard (the delivery path
+/// appends a link only when a public dashboard address is configured).
 const LINE_SECONDARY_ACTIONS_HINT: &str =
-    "（放棄／交給我：此通道無法顯示這兩個按鈕，請至下方連結的儀表板頁面處理。）";
+    "（放棄／交給我：此通道無法顯示這兩個按鈕，請至儀表板的待辦決定頁處理。）";
 
 /// Render the zh-TW needs_human approval body for a goal task. `trajectory`
 /// is the optional D2 forward-trajectory line (see
@@ -878,6 +886,25 @@ fn render_trajectory_reply(raw: &str) -> Option<String> {
     Some(out)
 }
 
+/// What [`notify_goal_needs_human_detailed`] did, for the driver's progress
+/// mirror (RM-192 B5): whether a card with decision buttons was sent (or
+/// queued) and where.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NeedsHumanNotice {
+    pub outcome: NotifyOutcome,
+    /// The `(channel, chat)` the card or notice was sent or queued to;
+    /// `None` when nothing was attempted.
+    pub destination: Option<(String, String)>,
+    /// The card at `destination` carries decision buttons.
+    pub buttons: bool,
+}
+
+impl NeedsHumanNotice {
+    fn nothing(outcome: NotifyOutcome) -> Self {
+        Self { outcome, destination: None, buttons: false }
+    }
+}
+
 /// Push the needs_human approval (with buttons where supported, else plain text
 /// with a dashboard hint) to the agent's default channel. Best-effort.
 ///
@@ -885,34 +912,71 @@ fn render_trajectory_reply(raw: &str) -> Option<String> {
 /// destination" config gap (mark notified, no point retrying) from a
 /// transient send failure (worth retrying next tick).
 pub async fn notify_goal_needs_human(home_dir: &Path, task: &TaskRow) -> NotifyOutcome {
+    notify_goal_needs_human_detailed(home_dir, task).await.outcome
+}
+
+/// [`notify_goal_needs_human`], also reporting where the card went and
+/// whether it carries buttons.
+///
+/// Links in these chat messages come from [`crate::deep_link::public_deep_link`]:
+/// without an operator-configured public address there is no link (never a
+/// `http://localhost…` one), and the text keeps telling the reader to open
+/// the dashboard's pending-decisions page.
+pub async fn notify_goal_needs_human_detailed(home_dir: &Path, task: &TaskRow) -> NeedsHumanNotice {
     // H3: same source gate as every other goal push; a refusal never falls
     // back to the [proactive] destination.
     let (channel, chat_id, proof) = match goal_target(home_dir, task) {
         GoalTarget::Send { channel, chat_id, proof } => (channel, chat_id, proof),
-        GoalTarget::Refused(_) => return NotifyOutcome::NoTarget,
+        GoalTarget::Refused(_) => return NeedsHumanNotice::nothing(NotifyOutcome::NoTarget),
         GoalTarget::Nothing => {
             info!(task = %task.id, agent = %task.assigned_to,
                   "goal-notify: agent has no [proactive] notify destination; skipping push");
-            return NotifyOutcome::NoTarget;
+            return NeedsHumanNotice::nothing(NotifyOutcome::NoTarget);
         }
     };
+    let destination = Some((channel.clone(), chat_id.clone()));
     // V-M-10: limited task ⇒ no buttons, no reason, no trajectory (which
     // would cost a model call over the private work); decide on the dashboard.
     if !crate::goal_notify_private::channel_may_carry(home_dir, &task.id, &channel) {
-        let link =
-            crate::deep_link::deep_link(home_dir, crate::deep_link::DeepLinkKind::Task, &task.id);
+        let link = crate::deep_link::public_deep_link(
+            home_dir,
+            crate::deep_link::DeepLinkKind::Task,
+            &task.id,
+        );
         let text = crate::goal_notify_private::private_decision_notice(task, link.as_deref());
-        return send_private_notice(home_dir, task, &channel, &chat_id, "goal.needs_human", &text, proof.as_deref())
+        let outcome = send_private_notice(home_dir, task, &channel, &chat_id, "goal.needs_human", &text, proof.as_deref())
             .await;
+        return NeedsHumanNotice { outcome, destination, buttons: false };
     }
+    // Whether this destination shows the card's buttons (Google Chat: only
+    // when the sending app takes clicks over HTTP). The same decision the
+    // delivery path makes, so the hint and the mirror line stay truthful.
+    let buttons = crate::decision_notify::card_shows_buttons(
+        home_dir,
+        &channel,
+        &chat_id,
+        Some(task.assigned_to.as_str()),
+        DecisionSource::Goal,
+        &task.id,
+    )
+    .await;
     // W3-1 D5: checked BEFORE the trajectory LLM call — a card that is going
     // to be held back must not also cost a model call to render.
     const NEEDS_HUMAN_NO_BUTTON_HINT: &str =
         "此通道無法顯示按鈕，請至儀表板的待辦決定頁處理這件事。";
+    let delivered = |outcome: NotifyOutcome| NeedsHumanNotice {
+        outcome,
+        destination: destination.clone(),
+        buttons: buttons
+            && matches!(outcome, NotifyOutcome::Sent | NotifyOutcome::Deferred),
+    };
     if crate::takeover::is_target_paused(home_dir, &channel, &chat_id) {
         let body = needs_human_body(task, None, &channel);
-        let link =
-            crate::deep_link::deep_link(home_dir, crate::deep_link::DeepLinkKind::Task, &task.id);
+        let link = crate::deep_link::public_deep_link(
+            home_dir,
+            crate::deep_link::DeepLinkKind::Task,
+            &task.id,
+        );
         if let Some(out) = takeover_defer_proven(
             home_dir,
             &task.assigned_to,
@@ -929,7 +993,7 @@ pub async fn notify_goal_needs_human(home_dir: &Path, task: &TaskRow) -> NotifyO
             )),
             proof.as_deref(),
         ) {
-            return out;
+            return delivered(out);
         }
     }
     // Probe the token before paying for the trajectory LLM call below: a
@@ -940,17 +1004,20 @@ pub async fn notify_goal_needs_human(home_dir: &Path, task: &TaskRow) -> NotifyO
         .is_none()
     {
         info!(task = %task.id, %channel, "goal-notify: no bot token; skipping push");
-        return NotifyOutcome::NoTarget;
+        return NeedsHumanNotice::nothing(NotifyOutcome::NoTarget);
     }
     let trajectory = build_needs_human_trajectory(home_dir, task).await;
     let body = needs_human_body(task, trajectory.as_deref(), &channel);
     // A clickable deep link straight to this task's detail page — the
     // page that actually shows it (`/tasks/<id>`), never the homepage. `None`
-    // when no dashboard base URL is configured/derivable — the message text
-    // then stays exactly as it was before this feature (never
-    // emit a dangling/empty link).
-    let link =
-        crate::deep_link::deep_link(home_dir, crate::deep_link::DeepLinkKind::Task, &task.id);
+    // when no public dashboard address is configured — the message then
+    // carries no link (never a localhost one a phone cannot open); without
+    // buttons the hint still points at the dashboard's pending-decisions page.
+    let link = crate::deep_link::public_deep_link(
+        home_dir,
+        crate::deep_link::DeepLinkKind::Task,
+        &task.id,
+    );
     let card = DecisionCard {
         source: DecisionSource::Goal,
         decision_id: &task.id,
@@ -961,9 +1028,9 @@ pub async fn notify_goal_needs_human(home_dir: &Path, task: &TaskRow) -> NotifyO
     // The trajectory model call above can take a while: re-prove a
     // turn-origin destination immediately before the actual send.
     if proof.is_some() && !matches!(goal_target(home_dir, task), GoalTarget::Send { .. }) {
-        return NotifyOutcome::NoTarget;
+        return NeedsHumanNotice::nothing(NotifyOutcome::NoTarget);
     }
-    push_goal_card(
+    let outcome = push_goal_card(
         home_dir,
         &card,
         &task.assigned_to,
@@ -971,7 +1038,11 @@ pub async fn notify_goal_needs_human(home_dir: &Path, task: &TaskRow) -> NotifyO
         chat_id,
         proof.as_deref(),
     )
-    .await
+    .await;
+    if outcome == NotifyOutcome::NoTarget {
+        return NeedsHumanNotice::nothing(outcome);
+    }
+    delivered(outcome)
 }
 
 /// A content-free plain notice (V-M-10), with the same takeover deferral as
@@ -1282,23 +1353,81 @@ fn delivered_targets(home_dir: &Path, agent_id: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Where a goal's needs_human card is sent: the same destination
+/// [`goal_target`] picks (the admitted source conversation, else the
+/// `[proactive]` destination), without the refusal audit `goal_target`
+/// writes. `None` when no card can have been sent anywhere. Also where the
+/// needs_human progress mirror goes (`notify_goal_progress` uses
+/// [`goal_target`] too), so the driver can tell when the two would land in
+/// the same conversation.
+pub(crate) fn goal_card_target(home_dir: &Path, task: &TaskRow) -> Option<(String, String)> {
+    match task_source_target(task) {
+        Some((channel, chat_id)) => source_admission(home_dir, task, &channel, &chat_id)
+            .is_ok()
+            .then_some((channel, chat_id)),
+        None => agent_notify_target(home_dir, &task.assigned_to),
+    }
+}
+
+/// RM-192 B3: the destination rule of [`authorize_press`] for a Google Chat
+/// press. A Chat card is addressed to a space, and a presser is a
+/// `users/<digits>` member, so the generic "the presser is the account the
+/// card was sent to" comparison can never hold there. On Google Chat the
+/// destination matches ONLY when all of these hold:
+///
+/// - (a) the click arrived in the space the card was sent to (`card_target`);
+/// - (b) that space is a 1:1 DM per the trusted classifier
+///   (`googlechat_space_kind::is_one_to_one`) — carried by `attestation`,
+///   which the authenticated `CARD_CLICKED` handler creates only for such a
+///   space, never inferred from the ids' shape;
+/// - (c) the presser is the human member of that DM (the attestation names
+///   the HUMAN `users/<digits>` sender of that click).
+///
+/// No attestation (shared space, unknown or failed classification, any other
+/// transport) → `false`. It feeds the same matrix as every channel: a mapped
+/// dashboard user still decides by role, and the destination only counts in
+/// a deployment with no channel-reachable approver identity.
+pub(crate) fn googlechat_press_destination_matches(
+    card_target: Option<&(String, String)>,
+    attestation: Option<&crate::ccr_runtime::OneToOneAttestation>,
+    presser: &str,
+) -> bool {
+    let (Some((channel, space)), Some(attestation)) = (card_target, attestation) else {
+        return false;
+    };
+    channel == crate::googlechat_identity::CHANNEL
+        && attestation.matches(crate::googlechat_identity::CHANNEL, space, presser)
+}
+
 /// Authorize a press against the goal card's delivery destination, or return
 /// the zh-TW refusal to show. `subject` names the action for the message.
+/// `card_target` is where this decision's card was sent (Google Chat only
+/// consults it; see [`googlechat_press_destination_matches`]).
 fn authorize_goal_press(
     home_dir: &Path,
     agent_id: &str,
+    card_target: Option<&(String, String)>,
     channel: &str,
     channel_user_id: &str,
     subject: &str,
 ) -> Result<(), String> {
-    let auth = authorize_press(
-        mapped_role(home_dir, channel, channel_user_id),
-        has_recognisable_approver_identity(home_dir),
+    let destination_match = if channel == crate::googlechat_identity::CHANNEL {
+        googlechat_press_destination_matches(
+            card_target,
+            crate::ccr_runtime::current_one_to_one_attestation().as_ref(),
+            channel_user_id,
+        )
+    } else {
         destination_matches_any(
             &delivered_targets(home_dir, agent_id),
             channel,
             channel_user_id,
-        ),
+        )
+    };
+    let auth = authorize_press(
+        mapped_role(home_dir, channel, channel_user_id),
+        has_recognisable_approver_identity(home_dir),
+        destination_match,
     );
     // v1.81 P1c: a Personal employee's kickoff / needs-human card: its owner only.
     if let Some(refusal) = crate::personal_decision::channel_agent_refusal(home_dir, agent_id, channel, channel_user_id) { return Err(refusal.into()); }
@@ -1365,6 +1494,7 @@ pub(crate) async fn apply_needs_human(
     authorize_goal_press(
         home_dir,
         &task.assigned_to,
+        goal_card_target(home_dir, &task).as_ref(),
         channel,
         channel_user_id,
         "決定這件事",
@@ -1733,7 +1863,8 @@ pub(crate) async fn apply_kickoff(
     if agent.is_empty() {
         return Err("找不到這筆核可（可能已過期並被清除）".into());
     }
-    authorize_goal_press(home_dir, &agent, channel, channel_user_id, "核准")?;
+    // Kickoff cards have no Google Chat button shape: no card target.
+    authorize_goal_press(home_dir, &agent, None, channel, channel_user_id, "核准")?;
 
     let card_verb = crate::decision_notify::settled_verb(
         DecisionSource::Kickoff,
@@ -2612,7 +2743,7 @@ mod tests {
     fn progress_body_renders_pause_class_and_no_progress_report() {
         let mut t = mk_task("abcdef0123456789");
         t.pause_reason = Some("blocked_needs_decision".into());
-        let stuck = progress_body(&t, &GoalProgress::NeedsHuman);
+        let stuck = progress_body(&t, &GoalProgress::NeedsHuman { buttons_elsewhere: false });
         assert!(stuck.contains("等你決策"), "{stuck}");
         assert!(stuck.contains("#abcdef01"));
 
@@ -2623,6 +2754,90 @@ mod tests {
             report.contains("仍在執行中"),
             "a report must not read as a failure: {report}"
         );
+    }
+
+    /// RM-192 B5: the mirror line claims "buttons were pushed elsewhere"
+    /// only when that is true.
+    #[test]
+    fn needs_human_progress_line_claims_buttons_only_when_sent_elsewhere() {
+        let t = mk_task("abcdef0123456789");
+        let with = progress_body(&t, &GoalProgress::NeedsHuman { buttons_elsewhere: true });
+        assert!(with.contains("已另外推送審批按鈕"), "{with}");
+        let without = progress_body(&t, &GoalProgress::NeedsHuman { buttons_elsewhere: false });
+        assert!(!without.contains("按鈕"), "{without}");
+        assert!(without.contains("儀表板的待辦決定頁"), "{without}");
+        assert!(without.contains("#abcdef01"));
+    }
+
+    /// RM-192 B3: the Google Chat destination rule, as a table.
+    #[test]
+    fn googlechat_press_destination_rule_table() {
+        use crate::ccr_runtime::OneToOneAttestation as A;
+        let dm = ("googlechat".to_string(), "spaces/DM1".to_string());
+        let shared = ("googlechat".to_string(), "spaces/TEAM".to_string());
+        let human = "users/111";
+        let dm_click = A::googlechat_dm("spaces/DM1", human);
+        // DM + same space as the card + the human member of the DM → match.
+        assert!(googlechat_press_destination_matches(Some(&dm), dm_click.as_ref(), human));
+        // Shared space: the click handler never attests it → no match.
+        assert!(!googlechat_press_destination_matches(Some(&shared), None, human));
+        // A DM, but not the space the card went to.
+        let other_dm_click = A::googlechat_dm("spaces/DM2", human);
+        assert!(!googlechat_press_destination_matches(Some(&dm), other_dm_click.as_ref(), human));
+        // The card went to a shared space; a press from someone's own DM
+        // with the app does not count for it.
+        assert!(!googlechat_press_destination_matches(Some(&shared), dm_click.as_ref(), human));
+        // Classifier unknown / failed → no attestation → no match.
+        assert!(!googlechat_press_destination_matches(Some(&dm), None, human));
+        // Someone else than the attested member.
+        assert!(!googlechat_press_destination_matches(Some(&dm), dm_click.as_ref(), "users/222"));
+        // No card target at all, or a target on another channel.
+        assert!(!googlechat_press_destination_matches(None, dm_click.as_ref(), human));
+        let tg = ("telegram".to_string(), "spaces/DM1".to_string());
+        assert!(!googlechat_press_destination_matches(Some(&tg), dm_click.as_ref(), human));
+
+        // Fed into the shared matrix (unchanged): the DM rule counts in a
+        // deployment without channel-reachable approver identities ...
+        let allow = |role, identity_active, dest| authorize_press(role, identity_active, dest);
+        assert_eq!(allow(None, false, true), PressAuth::Allow, "DM human, solo deployment");
+        // ... a shared-space ordinary member is refused either way ...
+        assert_eq!(
+            allow(Some(duduclaw_auth::UserRole::Employee), true, false),
+            PressAuth::DenyNotApprover
+        );
+        assert_eq!(allow(None, true, false), PressAuth::DenyUnknown);
+        assert_eq!(allow(None, false, false), PressAuth::DenyUnknown, "unknown classifier");
+        // ... and a verified Admin decides in a shared space (existing rule).
+        assert_eq!(allow(Some(duduclaw_auth::UserRole::Admin), true, false), PressAuth::Allow);
+    }
+
+    /// The task-local reaches `authorize_goal_press` for Google Chat only;
+    /// other channels keep their `[proactive]` destination comparison.
+    #[tokio::test]
+    async fn authorize_goal_press_uses_the_attested_dm_on_google_chat_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        // No users.db ⇒ no approver identity ⇒ the destination branch decides.
+        let agent_dir = home.join("agents").join("bot");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("agent.toml"),
+            "[agent]\nname = \"bot\"\n[proactive]\nnotify_channel = \"telegram\"\nnotify_chat_id = \"555\"\n",
+        )
+        .unwrap();
+        let card = ("googlechat".to_string(), "spaces/DM1".to_string());
+        let attested = crate::ccr_runtime::OneToOneAttestation::googlechat_dm("spaces/DM1", "users/111");
+        let in_dm = crate::ccr_runtime::ATTESTED_ONE_TO_ONE
+            .scope(attested, async {
+                authorize_goal_press(home, "bot", Some(&card), "googlechat", "users/111", "x")
+            })
+            .await;
+        assert!(in_dm.is_ok(), "{in_dm:?}");
+        let unattested = authorize_goal_press(home, "bot", Some(&card), "googlechat", "users/111", "x");
+        assert!(unattested.is_err());
+        // Telegram: unchanged exact match against the [proactive] chat.
+        assert!(authorize_goal_press(home, "bot", None, "telegram", "555", "x").is_ok());
+        assert!(authorize_goal_press(home, "bot", None, "telegram", "556", "x").is_err());
     }
 
     #[test]

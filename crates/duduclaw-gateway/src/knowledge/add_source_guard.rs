@@ -148,6 +148,7 @@ mod tests {
             chat: "c".into(),
             sender: "s".into(),
             user_id: user.map(str::to_string),
+            attested_private: false,
         };
         assert!(requester_may_propose(&ch("line", Some("u"))).is_ok());
         assert!(requester_may_propose(&ch("line", None)).is_err());

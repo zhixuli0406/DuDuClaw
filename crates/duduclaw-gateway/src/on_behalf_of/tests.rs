@@ -75,6 +75,7 @@ fn a_turn_names_its_account_or_a_keyed_digest_never_the_raw_id() {
         chat: "C1".into(),
         sender: "U_emp1".into(),
         user_id: Some("u-2".into()),
+        attested_private: false,
     };
     assert_eq!(principal_for_requester(h, &bound).as_deref(), Some("user:u-2"));
     let unbound = RequesterIdentity::ChannelUser {
@@ -82,6 +83,7 @@ fn a_turn_names_its_account_or_a_keyed_digest_never_the_raw_id() {
         chat: "C1".into(),
         sender: "U_stranger".into(),
         user_id: None,
+        attested_private: false,
     };
     let p = principal_for_requester(h, &unbound).unwrap();
     assert!(p.starts_with("unmapped:line:"), "{p}");
@@ -93,6 +95,7 @@ fn a_turn_names_its_account_or_a_keyed_digest_never_the_raw_id() {
         chat: "v-9".into(),
         sender: String::new(),
         user_id: None,
+        attested_private: false,
     };
     assert!(principal_for_requester(h, &visitor).unwrap().starts_with("unmapped:widget:"));
     let delegated = RequesterIdentity::System { kind: "dispatch".into(), on_behalf_of: Some("u-3".into()) };

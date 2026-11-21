@@ -43,7 +43,7 @@ pub(crate) fn private_progress_body(task: &TaskRow, progress: &GoalProgress) -> 
             format!("↩️ 目標 #{short} 第 {iter}/{cap} 輪未通過，修正後重試。")
         }
         GoalProgress::Done => format!("✅ 目標 #{short} 已完成。"),
-        GoalProgress::NeedsHuman => format!("🧭 目標 #{short} 需要你的決定。"),
+        GoalProgress::NeedsHuman { .. } => format!("🧭 目標 #{short} 需要你的決定。"),
         GoalProgress::Kickoff => format!("⏳ 目標 #{short} 需先核准才會開始。"),
         GoalProgress::NoProgressReport { minutes } => {
             format!("⏱️ 目標 #{short} 已執行 {minutes} 分鐘未回報進度。")
@@ -92,7 +92,7 @@ mod tests {
             },
             GoalProgress::Rejected { iter: 1, cap: 5 },
             GoalProgress::Done,
-            GoalProgress::NeedsHuman,
+            GoalProgress::NeedsHuman { buttons_elsewhere: false },
             GoalProgress::Kickoff,
             GoalProgress::NoProgressReport { minutes: 10 },
         ] {

@@ -7,6 +7,7 @@
 //! | WebChat public widget visitor (`widget-visitor:…`) | `ChannelUser` of channel `widget`, unbound |
 //! | Odoo website Live Chat visitor (`odoolivechat:…`) | `ChannelUser` of channel `odoolivechat`, unbound |
 //! | messaging app (LINE, Telegram, …) | `ChannelUser`; `user_id` only from a **verified** `channel_identities` binding of an active account |
+//! | Google Chat 1:1 DM | as above, plus `attested_private` when the adapter's `ATTESTED_ONE_TO_ONE` names exactly this space and sender |
 //! | gateway-internal sessions (`cron:`, `dispatch:`, `heartbeat:` …, [`INTERNAL_SESSION_PREFIXES`]) | `System`, on behalf of nobody |
 //! | anything else | `Unknown` (reads nothing) |
 //!
@@ -33,6 +34,20 @@ pub fn map_requester(
     session_id: &str,
     sender: &str,
     webchat_principal: Option<&str>,
+    verified: impl Fn(&str, &str) -> Option<String>,
+) -> RequesterIdentity {
+    map_requester_attested(session_id, sender, webchat_principal, None, verified)
+}
+
+/// [`map_requester`] with the authenticated adapter's 1:1 attestation (the
+/// `ATTESTED_ONE_TO_ONE` task-local). It counts only when it names exactly
+/// this conversation's channel and chat and this sender; it never adds a
+/// binding or a grant.
+pub fn map_requester_attested(
+    session_id: &str,
+    sender: &str,
+    webchat_principal: Option<&str>,
+    attestation: Option<&crate::ccr_runtime::OneToOneAttestation>,
     verified: impl Fn(&str, &str) -> Option<String>,
 ) -> RequesterIdentity {
     if let Some(p) = webchat_principal.map(str::trim) {
@@ -70,11 +85,13 @@ pub fn map_requester(
     let user_id = (!sender.is_empty())
         .then(|| verified(channel, sender))
         .flatten();
+    let attested_private = attestation.is_some_and(|a| a.matches(channel, chat, sender));
     RequesterIdentity::ChannelUser {
         channel: channel.to_string(),
         chat: chat.to_string(),
         sender: sender.to_string(),
         user_id,
+        attested_private,
     }
 }
 
@@ -102,6 +119,7 @@ fn unbound(channel: &str, chat: &str, sender: &str) -> RequesterIdentity {
             sender.to_string()
         },
         user_id: None,
+        attested_private: false,
     }
 }
 
@@ -119,15 +137,23 @@ pub async fn requester_for_reply(home: &Path, session_id: &str, sender: &str) ->
     let principal = crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL
         .try_with(Clone::clone)
         .ok();
+    // Read on the turn's task too: task-locals do not reach the blocking pool.
+    let attestation = crate::ccr_runtime::current_one_to_one_attestation();
     let (home, session, sender) = (
         home.to_path_buf(),
         session_id.to_string(),
         sender.to_string(),
     );
     tokio::task::spawn_blocking(move || {
-        map_requester(&session, &sender, principal.as_deref(), |channel, id| {
-            crate::trigger_route::access::verified_user_for_channel_sender(&home, channel, id)
-        })
+        map_requester_attested(
+            &session,
+            &sender,
+            principal.as_deref(),
+            attestation.as_ref(),
+            |channel, id| {
+                crate::trigger_route::access::verified_user_for_channel_sender(&home, channel, id)
+            },
+        )
     })
     .await
     .unwrap_or(RequesterIdentity::Unknown)
@@ -251,5 +277,123 @@ mod tests {
         assert_eq!(h.channel_chat.as_deref(), Some("line:Ubound"));
         let r = map_requester("line:Cgroup1#agent:hr-bot", "Ubound", None, bound);
         assert!(!human_ctx(&r, &Dir).is_private);
+    }
+
+    fn gchat_bound(channel: &str, id: &str) -> Option<String> {
+        (channel == "googlechat" && id == "users/111").then(|| "u-hr".to_string())
+    }
+
+    fn dm_attestation(space: &str, sender: &str) -> crate::ccr_runtime::OneToOneAttestation {
+        crate::ccr_runtime::OneToOneAttestation::googlechat_dm(space, sender).unwrap()
+    }
+
+    fn attested(r: &RequesterIdentity) -> bool {
+        matches!(r, RequesterIdentity::ChannelUser { attested_private: true, .. })
+    }
+
+    #[test]
+    fn attested_googlechat_dm_of_a_bound_sender_is_one_to_one() {
+        let a = dm_attestation("spaces/DM1", "users/111");
+        let r = map_requester_attested("googlechat:spaces/DM1", "users/111", None, Some(&a), gchat_bound);
+        assert_eq!(
+            r,
+            RequesterIdentity::ChannelUser {
+                channel: "googlechat".into(),
+                chat: "spaces/DM1".into(),
+                sender: "users/111".into(),
+                user_id: Some("u-hr".into()),
+                attested_private: true,
+            }
+        );
+        let h = human_ctx(&r, &Dir);
+        assert_eq!(h.mode, HumanMode::Full);
+        assert!(h.is_private);
+        // A called employee's bucket of the same DM.
+        let r = map_requester_attested(
+            "googlechat:spaces/DM1#agent:hr-bot",
+            "users/111",
+            None,
+            Some(&a),
+            gchat_bound,
+        );
+        assert!(attested(&r) && human_ctx(&r, &Dir).is_private);
+    }
+
+    #[test]
+    fn googlechat_attestation_must_name_this_space_and_sender() {
+        // Same sender in a shared space: no attestation for it.
+        let r = map_requester_attested("googlechat:spaces/TEAM", "users/111", None, None, gchat_bound);
+        assert!(!attested(&r));
+        assert!(!human_ctx(&r, &Dir).is_private);
+        // An attestation for another space.
+        let other_space = dm_attestation("spaces/DM1", "users/111");
+        let r = map_requester_attested(
+            "googlechat:spaces/TEAM",
+            "users/111",
+            None,
+            Some(&other_space),
+            gchat_bound,
+        );
+        assert!(!attested(&r) && !human_ctx(&r, &Dir).is_private);
+        // An attestation for another sender in the same space.
+        let other_sender = dm_attestation("spaces/DM1", "users/222");
+        let r = map_requester_attested(
+            "googlechat:spaces/DM1",
+            "users/111",
+            None,
+            Some(&other_sender),
+            gchat_bound,
+        );
+        assert!(!attested(&r) && !human_ctx(&r, &Dir).is_private);
+        // No attestation at all: the session id shape alone never proves it.
+        let r = map_requester("googlechat:spaces/DM1", "users/111", None, gchat_bound);
+        assert!(!attested(&r) && !human_ctx(&r, &Dir).is_private);
+        // A Google Chat attestation does not carry over to another channel.
+        let r = map_requester_attested("line:spaces/DM1", "users/111", None, Some(&other_space), bound);
+        assert!(!attested(&r));
+        // WebChat and visitors ignore it.
+        let r = map_requester_attested("webchat:t:x", "v", Some("widget-visitor:1"), Some(&other_space), bound);
+        assert!(!attested(&r) && !human_ctx(&r, &Dir).is_private);
+    }
+
+    #[test]
+    fn attestation_only_accepts_a_well_formed_space_and_human_user() {
+        use crate::ccr_runtime::OneToOneAttestation as A;
+        assert!(A::googlechat_dm("spaces/DM1", "users/111").is_some());
+        for (space, sender) in [
+            ("spaces/DM1", ""),
+            ("spaces/DM1", "111"),
+            ("spaces/DM1", "users/app"),
+            ("spaces/DM1", "users/a@example.com"),
+            ("spaces/DM1", "unknown"),
+            ("", "users/111"),
+            ("spaces/../x", "users/111"),
+            ("users/111", "users/111"),
+        ] {
+            assert!(A::googlechat_dm(space, sender).is_none(), "{space} {sender}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_task_local_attestation_reaches_conversation_is_one_to_one() {
+        use crate::ccr_runtime::{ATTESTED_ONE_TO_ONE, conversation_is_one_to_one};
+        assert!(!conversation_is_one_to_one("googlechat:spaces/DM1", "users/111"));
+        let a = dm_attestation("spaces/DM1", "users/111");
+        let (dm, other_space, other_sender) = ATTESTED_ONE_TO_ONE
+            .scope(Some(a), async {
+                (
+                    conversation_is_one_to_one("googlechat:spaces/DM1", "users/111"),
+                    conversation_is_one_to_one("googlechat:spaces/TEAM", "users/111"),
+                    conversation_is_one_to_one("googlechat:spaces/DM1", "users/222"),
+                )
+            })
+            .await;
+        assert!(dm && !other_space && !other_sender);
+        let none = ATTESTED_ONE_TO_ONE
+            .scope(None, async { conversation_is_one_to_one("googlechat:spaces/DM1", "users/111") })
+            .await;
+        assert!(!none);
+        // LINE keeps its session-shape rule.
+        assert!(conversation_is_one_to_one("line:Ubound", "Ubound"));
     }
 }

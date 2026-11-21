@@ -982,6 +982,7 @@ pub(crate) mod tests {
         assert!(mint(h, "mint-sales", turn, RECIPIENT).is_none(), "no requester registered");
         let bound = crate::knowledge::turn_requesters::register("mint-sales", turn, RequesterIdentity::ChannelUser {
             channel: "googlechat".into(), chat: "spaces/ORIGIN".into(), sender: SENDER.into(), user_id: Some(f.user.clone()),
+            attested_private: false,
         }).unwrap();
         let id = mint(h, "mint-sales", turn, RECIPIENT).expect("bound live turn");
         assert!(valid_id(&id) && id != f.proof, "a fresh opaque id per mint");
@@ -993,6 +994,7 @@ pub(crate) mod tests {
         drop(bound);
         let _unbound = crate::knowledge::turn_requesters::register("mint-sales", turn, RequesterIdentity::ChannelUser {
             channel: "googlechat".into(), chat: "spaces/ORIGIN".into(), sender: SENDER.into(), user_id: None,
+            attested_private: false,
         }).unwrap();
         assert!(mint(h, "mint-sales", turn, RECIPIENT).is_none(), "unbound sender");
     }

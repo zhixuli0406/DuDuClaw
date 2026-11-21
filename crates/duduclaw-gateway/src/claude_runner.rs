@@ -1918,7 +1918,7 @@ mod delegation_context_tests {
         for (requester, origin) in [
             (RequesterIdentity::DashboardUser { user_id: "operator".into() }, "dashboard"),
             (RequesterIdentity::ChannelUser { channel: "telegram".into(), chat: "123".into(),
-                sender: "person".into(), user_id: None }, "webhook"),
+                sender: "person".into(), user_id: None, attested_private: false }, "webhook"),
         ] {
             let (args, _guard) = crate::knowledge::turn_requesters::CURRENT_REQUESTER.scope(requester, async {
                 signed_mcp_config_cli_args(home.path(), Some(&dir), Some(&dir), None).unwrap().unwrap()

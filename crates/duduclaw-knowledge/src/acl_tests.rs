@@ -54,6 +54,7 @@ fn unbound(channel: &str, chat: &str) -> HumanCtx {
             chat: chat.into(),
             sender: "Uxyz".into(),
             user_id: None,
+            attested_private: false,
         },
         &users(&[]),
     )
@@ -287,6 +288,7 @@ fn group_sessions_and_system_exclude_personal_and_restricted() {
             chat: "Uxyz".into(),
             sender: "Uxyz".into(),
             user_id: None,
+            attested_private: false,
         },
         &users(&[]),
     );
@@ -494,6 +496,7 @@ fn requester_resolution_fails_closed() {
             chat: "Ualice".into(),
             sender: "Ualice".into(),
             user_id: Some("alice".into()),
+            attested_private: false,
         },
         &dir,
     );
@@ -599,6 +602,8 @@ fn public_visitors_read_only_public_collections() {
                 sender: "v1".into(),
                 // A forged user id on a visitor channel is ignored.
                 user_id: Some("owner".into()),
+                // Nor can an attestation make a visitor's chat 1:1.
+                attested_private: true,
             },
             &users(&[("owner", None, true)]),
         );

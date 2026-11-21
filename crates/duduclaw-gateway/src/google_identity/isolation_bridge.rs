@@ -100,7 +100,7 @@ impl GoogleIsolationBridge {
                         if mapped != user_id { return Err(VerificationError::Revoked); }
                         RequesterIdentity::ChannelUser { channel: channel.clone(),
                             chat: metadata.reply_channel.clone().unwrap_or_default(),
-                            sender: sender.clone(), user_id: Some(mapped) }
+                            sender: sender.clone(), user_id: Some(mapped), attested_private: false }
                     }
                 };
                 Ok(Requester::Human { user_id: user_id.into(), identity })
