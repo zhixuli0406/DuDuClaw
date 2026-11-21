@@ -496,7 +496,7 @@ async fn notify_breaker_transition(
     }
     let name = agent_display_name(agent_dir, agent_id);
     let link =
-        crate::deep_link::deep_link(home_dir, crate::deep_link::DeepLinkKind::Billing, agent_id)
+        crate::deep_link::public_deep_link(home_dir, crate::deep_link::DeepLinkKind::Billing, agent_id)
             .map(|url| format!("\n👉 {url}"))
             .unwrap_or_default();
     let text = if is_open {

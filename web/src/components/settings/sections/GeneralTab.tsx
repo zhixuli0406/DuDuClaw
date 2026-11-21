@@ -27,6 +27,7 @@ export function GeneralTab() {
   const startTour = useTourStore((s) => s.start);
   const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
   const [defaultLanguage, setDefaultLanguage] = useState('');
+  const [memoryLanguage, setMemoryLanguage] = useState('auto');
   // RM-129: `[dashboard] public_url` — the externally reachable dashboard
   // address (sub-path included) used for OAuth callbacks and return links.
   const [publicUrl, setPublicUrl] = useState('');
@@ -59,9 +60,11 @@ export function GeneralTab() {
         const tables = parseTomlSubset(raw);
         const language = tomlStr(tables, 'general', 'default_language', '');
         const publicUrlValue = tomlStr(tables, 'dashboard', 'public_url', '');
+        const memoryLanguageValue = tomlStr(tables, 'memory', 'language', 'auto');
+        setMemoryLanguage(memoryLanguageValue);
         setDefaultLanguage(language);
         setPublicUrl(publicUrlValue);
-        initialRef.current = { default_language: language, 'dashboard.public_url': publicUrlValue };
+        initialRef.current = { 'memory.language': memoryLanguageValue, default_language: language, 'dashboard.public_url': publicUrlValue };
       }
     }).catch((e) => {
       console.warn("[api]", e);
@@ -99,6 +102,7 @@ export function GeneralTab() {
   const handleSave = async () => {
     const current: FlatValues = {
       default_language: defaultLanguage,
+      'memory.language': memoryLanguage,
       ...(isAdmin ? { 'dashboard.public_url': publicUrl.trim() } : {}),
     };
     if (isAdmin && !publicUrlValid) {
@@ -173,6 +177,18 @@ export function GeneralTab() {
             value={defaultLanguage}
             onChange={setDefaultLanguage}
             options={languageOptions}
+          />
+          <RowSelect
+            disabled={!isAdmin}
+            label={intl.formatMessage({ id: 'settings.general.memoryLanguage' })}
+            description={intl.formatMessage({ id: 'settings.general.memoryLanguage.help' })}
+            value={memoryLanguage}
+            onChange={setMemoryLanguage}
+            options={['auto', 'zh-TW', 'zh-CN', 'en', 'ja-JP'].map((code) => ({
+              value: code,
+              label: intl.formatMessage({ id: code === 'auto' ? 'settings.general.memoryLanguage.auto' : `settings.general.defaultLanguage.${code}` }),
+              raw: code,
+            }))}
           />
           {/* RM-129: dashboard public URL (admin only; validated again by the gateway) */}
           {isAdmin && (

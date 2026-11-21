@@ -1083,6 +1083,142 @@ fn rm166b_identity_transition_record_is_refused_on_both_lanes() {
     }
 }
 
+// ── v1.84.0 (RM-200): own `wiki/auto/**` and `.auto-pages*` ────
+
+/// Write / edit / create (Write/Edit lane — one path rule for all three),
+/// under every spelling a file system opens as `auto/`, plus the directory
+/// itself and the legacy in-wiki lock / sidecars.
+#[test]
+fn own_auto_wiki_write_edit_and_create_are_blocked() {
+    let h = home();
+    for rel in [
+        "wiki/auto/sop/refunds.md",
+        "wiki/auto/charter/brand-new.md",
+        "wiki/auto",
+        "wiki/AUTO/sop/x.md",
+        "WIKI/Auto/sop/x.md",
+        "wiki/auto./sop/x.md",
+        "wiki/auto /sop/x.md",
+        "wiki/au\u{200d}to/sop/x.md",
+        "wiki/\u{feff}auto/sop/x.md",
+        "wiki/./auto/sop/x.md",
+        "wiki/concepts/../auto/sop/x.md",
+        "wiki/.auto-pages.lock",
+        "wiki/.AUTO-PAGES.lock",
+        "wiki/.auto-pages",
+        "wiki/.auto-pages.lock.tmp",
+    ] {
+        let p = h.join("agents/sales-rep").join(rel);
+        match check_own_auto_wiki_write(&p, &h, &agent("sales-rep")) {
+            GuardDecision::BlockedOwnAutoWikiWrite { caller, .. } => assert_eq!(caller, "sales-rep"),
+            other => panic!("{rel:?}: expected BlockedOwnAutoWikiWrite, got {other:?}"),
+        }
+    }
+    // Ephemeral scaffold: same rule for its own wiki.
+    let eph = h.join("agents/.ephemeral/tmp-1/wiki/auto/sop/x.md");
+    assert!(matches!(
+        check_own_auto_wiki_write(&eph, &h, &agent("tmp-1")),
+        GuardDecision::BlockedOwnAutoWikiWrite { .. }
+    ));
+    let msg = check_own_auto_wiki_write(&h.join("agents/sales-rep/wiki/auto/x.md"), &h, &agent("sales-rep"))
+        .block_message()
+        .unwrap();
+    assert!(msg.contains("auto/") && msg.contains("策展台"), "{msg}");
+}
+
+#[test]
+fn own_auto_wiki_rule_leaves_other_paths_operators_and_foreign_dirs_alone() {
+    let h = home();
+    for rel in [
+        "wiki/concepts/notes.md",
+        "wiki/automation/x.md",
+        "wiki/entities/auto/x.md",
+        "wiki/auto.md",
+        "wiki/_index.md",
+        "auto/sop/x.md",
+        "notes/wiki/auto/x.md",
+    ] {
+        let p = h.join("agents/sales-rep").join(rel);
+        assert_eq!(check_own_auto_wiki_write(&p, &h, &agent("sales-rep")), GuardDecision::NotAgentFile, "{rel}");
+    }
+    let own = h.join("agents/sales-rep/wiki/auto/sop/x.md");
+    assert_eq!(check_own_auto_wiki_write(&own, &h, &HookCaller::Absent), GuardDecision::NotAgentFile);
+    // Foreign: Stage 0 owns that refusal.
+    let foreign = h.join("agents/ceo/wiki/auto/sop/x.md");
+    assert_eq!(check_own_auto_wiki_write(&foreign, &h, &agent("sales-rep")), GuardDecision::NotAgentFile);
+    assert!(matches!(
+        check_caller_scope(&foreign, &h, &agent("sales-rep")),
+        GuardDecision::BlockedForeignAgentDir { .. }
+    ));
+    // A project file outside `<home>`.
+    let project = PathBuf::from("/Users/alice/Project/app/wiki/auto/x.md");
+    assert_eq!(check_own_auto_wiki_write(&project, &h, &agent("sales-rep")), GuardDecision::NotAgentFile);
+}
+
+/// The gateway-owned auto-page registry (`<home>/state/wiki-auto/<id>.json`)
+/// and lock (`<home>/locks/wiki-auto/<id>.lock`) sit outside every employee
+/// directory and are refused by the `<home>`-state rule on both lanes.
+#[test]
+fn auto_page_registry_and_lock_are_home_state() {
+    let h = home();
+    for rel in ["state/wiki-auto/sales-rep.json", "state/wiki-auto/sales-rep.json.lock", "locks/wiki-auto/sales-rep.lock"] {
+        let p = h.join(rel);
+        assert!(
+            matches!(check_caller_scope(&p, &h, &agent("sales-rep")), GuardDecision::BlockedHomeStateWrite { .. }),
+            "{rel}"
+        );
+        let cmd = format!("echo '{{}}' > /Users/alice/.duduclaw/{rel}");
+        assert!(!check_bash_protected_write(&cmd, &h, &agent("sales-rep")).is_allowed(), "{cmd}");
+    }
+}
+
+/// Rename into / delete / overwrite through Bash (a speed bump, like the
+/// other own-file rules); reads stay allowed.
+#[test]
+fn bash_own_auto_wiki_rename_into_and_delete_are_blocked() {
+    for cmd in [
+        "echo forged > wiki/auto/sop/refunds.md",
+        "mv /tmp/forged.md wiki/auto/sop/refunds.md",
+        "mv notes.md ./wiki/Auto/sop/notes.md",
+        "cp x.md /Users/alice/.duduclaw/agents/sales-rep/wiki/auto/sop/x.md",
+        "rm wiki/auto/sop/refunds.md",
+        "rm -rf wiki/auto",
+        "mv wiki/auto wiki/old-auto",
+        "rm wiki/.auto-pages.lock",
+        "touch wiki/.auto-pages.lock",
+    ] {
+        assert!(
+            matches!(
+                check_bash_protected_write(cmd, &home(), &agent("sales-rep")),
+                GuardDecision::BlockedOwnAutoWikiWrite { .. }
+            ),
+            "not blocked: {cmd}"
+        );
+    }
+    for cmd in [
+        "cat wiki/auto/sop/refunds.md",
+        "ls wiki/auto",
+        "echo x > wiki/concepts/notes.md",
+        "echo x > wiki/automation/x.md",
+        "echo x > /Users/alice/myagents/sales-rep/wiki/auto/x.md",
+    ] {
+        assert_eq!(check_bash_protected_write(cmd, &home(), &agent("sales-rep")), GuardDecision::NotAgentFile, "{cmd}");
+    }
+    assert_eq!(
+        check_bash_protected_write("rm wiki/auto/sop/x.md", &home(), &HookCaller::Absent),
+        GuardDecision::NotAgentFile
+    );
+    // Another employee's auto pages take the cross-agent rule.
+    assert!(matches!(
+        check_bash_protected_write(
+            "rm /Users/alice/.duduclaw/agents/ceo/wiki/auto/sop/x.md",
+            &home(),
+            &agent("sales-rep")
+        ),
+        GuardDecision::BlockedForeignAgentDir { .. }
+    ));
+}
+
 #[test]
 fn user_and_identity_are_operator_owned_even_in_own_directory() {
     for name in ["USER.md", "IDENTITY.md", "user.md", "identity.md"] {

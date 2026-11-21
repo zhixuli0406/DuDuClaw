@@ -114,6 +114,32 @@ pub(crate) fn agent_uses_pubsub(home: &Path, agent_id: &str) -> bool {
     googlechat_section(home, agent_id).and_then(|s| s.get("connection").and_then(|v| v.as_str()).map(str::to_string)).as_deref() == Some("pubsub")
 }
 
+/// Whether the employee's own Chat app receives events over the HTTP
+/// transport (the endpoint `googlechat_agents::handle` serves, which
+/// verifies every request's JWT): `connection` absent or `"http"` and no
+/// Pub/Sub subscription. Anything else, including a malformed value or no
+/// section at all, is `false` (fail closed). No credentials are resolved.
+pub(crate) fn agent_uses_http(home: &Path, agent_id: &str) -> bool {
+    let Some(section) = googlechat_section(home, agent_id) else {
+        return false;
+    };
+    let connection = match section.get("connection") {
+        None => "http",
+        Some(value) => match value.as_str() {
+            Some(value) => value,
+            None => return false,
+        },
+    };
+    let subscription = match section.get("pubsub_subscription") {
+        None => "",
+        Some(value) => match value.as_str() {
+            Some(value) => value,
+            None => return false,
+        },
+    };
+    connection == "http" && subscription.trim().is_empty()
+}
+
 /// Whether the employee's `agent.toml` has a `[channels.googlechat]` section
 /// at all (configured, even if its key cannot be resolved right now).
 pub fn agent_has_googlechat_section(home: &Path, agent_id: &str) -> bool {

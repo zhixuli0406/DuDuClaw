@@ -336,7 +336,11 @@ Auto-ingested content defaults:
 
 **記憶只留指標，不留全文**：一列 `subject = wiki:auto/<doc_type>/<slug>`、`predicate = documented_in`，`store_temporal` 會自動接替舊指標，策展台移除時也能精準讓這一頁的指標失效。
 
-**管理介面**：儀表板 → 記憶與知識 → 策展台 → 自動建檔（檢視／確認為正式知識／分享到共享知識庫／移除）。
+**管理介面**：儀表板側欄 → 記憶 → 個人知識庫（個人版為「知識庫」）→ 策展台 → 自動建檔（檢視／確認為正式知識／分享到共享知識庫／移除）。
+
+**對話範圍（v1.84.0）。** 在通道對話中，自動頁面只有產生它的那段對話看得到，而且閘道自己的登記檔 `<home>/state/wiki-auto/<agent>.json`（只有擁有者能讀寫）必須有這一頁的紀錄，記下的 SHA-256 也要和檔案內容（閘道寫入時的原樣）完全相符。紀錄裡存有頁面的來源（`host_sources`）與是否經人確認（`host_promoted`）；頁面裡的同名欄位要和紀錄一致才算數，`author`、`sources`、`layer` 不提供任何權限。未確認的頁面，只有在每一筆來源都是這段對話時才會顯示；主管或管理員在策展台確認過的頁面，每段對話都看得到。沒有相符紀錄的頁面，任何對話都看不到：包括 v1.84.0 以前建立的頁面（含先前已確認的）、早期 v1.84.0 建置留下的頁面，以及在 DuDuClaw 之外被改過的頁面。登記檔不存在或讀不到時，所有自動頁面都會隱藏。另一段對話整理出同一個 slug 時，會另建 `auto/<type>/<slug>-<8 位十六進位>.md`，後綴取自對話的雜湊值（不會放對話代號），不同對話的頁面不會合併。建檔、確認與維護時的改寫共用鎖檔 `<home>/locks/wiki-auto/<agent>.lock`，不再建立 `<wiki>/.auto-pages.lock`。要讓隱藏的頁面重新出現，請用 `wiki.promote` 確認（需要主管角色或管理員，加上該員工的 Owner 權限）；確認會記下目前的內容，沒有可用紀錄的頁面則記下 `host_sources: ["legacy:human-confirmed"]`，內容與其他欄位不變。儀表板的系統檢查 `legacy_auto_wiki` 會列出每位員工有多少頁沒有登記紀錄（訊息目前只有繁體中文）。從儀表板把自動頁面分享到共享知識庫（`wiki.share`）同樣需要主管加上 Owner 權限，而且只能分享已確認的頁面；共享副本的來源取自登記紀錄。任何 AI 工具範圍都不能寫入或分享 `auto/`：聊天回合、排程與交辦工作的 `wiki_write`、`wiki_share` 一律拒絕（包括 `AUTO/`、`auto./` 這類變形），員工檔案守衛也會擋下對自己 `wiki/auto/**` 的 Write／Edit（Bash 規則只是減速帶）。在通道對話中，`wiki_export` 直接拒絕，`wiki_read` 讀看不到的頁面時回覆和頁面不存在相同，`wiki_ls`、`wiki_search`（在排序前過濾）、`wiki_lint`、`wiki_stats` 都不包含看不到的頁面，`_index.md` 與 `_log.md` 裡提到 `auto/` 的行也會移除，包括這段對話自己的頁面（這些頁面仍可用 `wiki_ls`、`wiki_search` 找到）。已知缺口：`wiki_dedup`、`wiki_graph`、`wiki_rebuild_fts`、`wiki_trust_audit`、`wiki_trust_history` 尚未套用這項可見範圍規則。
+
+**頁面名稱（v1.84.0）。** 新頁面的路徑中，任何一段都不能以句點或空白結尾、不能是 Windows 裝置名稱（`CON`、`PRN`、`AUX`、`NUL`、`COM0`～`COM9`、`LPT0`～`LPT9` 等，以第一個句點之前的部分判斷），也不能含控制字元；`:` 只在 Windows 上拒絕。已經存在的這類頁面在 macOS 與 Linux 上仍可讀取、列出與搜尋，但不能寫入、分享或確認為正式知識。
 
 ---
 

@@ -22,7 +22,8 @@
 //! health state, and `claude_runner` has no manager instance to borrow.
 //!
 //! Tracks provider health and routes to fallback runtime on failure.
-//! Non-retryable errors (4xx, content policy) do NOT trigger failover.
+//! Whether a primary failure may use the configured fallback runtime is
+//! decided by ONE rule, `fallback_rule::classify_primary_failure` (RM-181).
 
 use std::collections::HashMap;
 
@@ -32,7 +33,11 @@ use tracing::{info, warn};
 
 pub mod model;
 mod failure;
-pub use failure::{RuntimeDispatchFailure,RuntimePreflightFailure,RuntimePreflightKind,RuntimeStep,RuntimeStepOutcome,RuntimeStepRole};
+pub(crate) mod failure_kind;
+mod fallback_rule;
+pub use failure::{FallbackSkip,RuntimeDispatchFailure,RuntimePreflightFailure,RuntimePreflightKind,RuntimeStep,RuntimeStepOutcome,RuntimeStepRole};
+pub use fallback_rule::{FallbackRefusal,FallbackTrigger,WorkLimitKind};
+use fallback_rule::{FallbackDecision,PrimaryFailure,classify_primary_failure};
 
 use crate::runtime::{RuntimeContext, RuntimeRegistry, RuntimeResponse, RuntimeType};
 
@@ -182,22 +187,27 @@ impl FailoverManager {
             Ok::<_,String>(())
         })();
         if let Err(error)=primary_policy {
-            return Err(RuntimeDispatchFailure::preflight(Some(*primary),&context.model,RuntimePreflightKind::Policy,error));
+            return Err(RuntimeDispatchFailure::preflight(Some(*primary),&context.model,RuntimePreflightKind::Policy,error)
+                .skip_fallback(fallback,FallbackRefusal::Policy));
         }
         let primary_available={
             let mut health=self.health.write().await;
             health.entry(*primary).or_insert_with(||ProviderHealth::new(*primary)).check_cooldown()
         };
-        if !primary_available {
+        // RM-181: every primary outcome goes through the one fallback rule.
+        let decision=if !primary_available {
             failure.push(Primary,*primary,Some(&context.model),Outcome::Cooldown);
+            classify_primary_failure(PrimaryFailure::Cooldown)
         } else if let Some(runtime)=registry.get(primary) {
-            match {
-                #[cfg(test)] crate::model_call_probe::record("failover_execute");
-                match runtime.execute(prompt,context).await {
-                    Ok(response) => crate::runtime_dispatch::validate_runtime_response(response,context).await,
-                    Err(error) => Err(error),
-                }
-            } {
+            // L2: what the runtime recorded about its failure, bound to the
+            // exact error string it returned (see `failure_kind`).
+            #[cfg(test)] crate::model_call_probe::record("failover_execute");
+            let (result,recorded)=failure_kind::capture(runtime.execute(prompt,context)).await;
+            let result=match result {
+                Ok(response) => crate::runtime_dispatch::validate_runtime_response(response,context).await,
+                Err(error) => Err(error),
+            };
+            match result {
                 Ok(response) if !response.content.trim().is_empty()=>{
                     self.record_success(primary).await;
                     record_successful_response(primary,context,&response);
@@ -206,26 +216,41 @@ impl FailoverManager {
                 Ok(_)=>{
                     failure.push(Primary,*primary,Some(&context.model),Outcome::Empty);
                     self.record_failure(primary).await;
-                    crate::metrics::global_metrics().record_failover();
+                    classify_primary_failure(PrimaryFailure::Empty)
                 }
                 Err(error)=>{
                     if let Some(message) = crate::budget::budget_refusal_message(&error) {
                         return Err(RuntimeDispatchFailure::preflight(Some(*primary), &context.model,
-                            RuntimePreflightKind::Budget, message.to_owned()));
+                            RuntimePreflightKind::Budget, message.to_owned()).skip_fallback(fallback,FallbackRefusal::Budget));
                     }
-                    // An autonomy pause refusal is not a provider failure: it must
-                    // not put the runtime into cooldown for human chat.
-                    let stop=is_non_retryable(&error) || duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error)
-                        || crate::autonomous_runtime::was_denied();
+                    let decision=classify_primary_failure(PrimaryFailure::Error{
+                        error:&error, autonomy_denied:crate::autonomous_runtime::was_denied(),
+                        kind:failure_kind::kind_for(recorded.as_ref(),&error),
+                    });
                     failure.push(Primary,*primary,Some(&context.model),Outcome::ExecutionError(error));
-                    if stop {return Err(failure);}
-                    self.record_failure(primary).await;
-                    crate::metrics::global_metrics().record_failover();
+                    // Only a provider failure counts against the primary's health:
+                    // a refusal (autonomy pause, work result, gate) never cools it
+                    // down, nor does an engine-local configuration refusal or a
+                    // prompt that does not fit, which are re-checked on every call.
+                    if matches!(decision,FallbackDecision::Eligible(trigger)
+                        if trigger!=FallbackTrigger::EngineLocalConfig && trigger!=FallbackTrigger::PromptTooLarge) {
+                        self.record_failure(primary).await;
+                    }
+                    fallback_rule::apply_fallback_engine_limits(decision,fallback)
                 }
             }
         } else {
             failure.push(Primary,*primary,Some(&context.model),Outcome::NotRegistered);
-            crate::metrics::global_metrics().record_failover();
+            classify_primary_failure(PrimaryFailure::NotRegistered)
+        };
+        match decision {
+            FallbackDecision::Refused(reason)=>return Err(failure.skip_fallback(fallback,reason)),
+            FallbackDecision::Eligible(trigger)=>{
+                if trigger!=FallbackTrigger::Cooldown { crate::metrics::global_metrics().record_failover(); }
+                if let Some(fb)=fallback {
+                    info!(agent=%context.agent_id,from_runtime=?primary,to_runtime=?fb,trigger=?trigger,"Primary runtime failed — explicit runtime fallback is eligible");
+                }
+            }
         }
         let Some(fb)=fallback else { return Err(failure); };
         if let Err(error)=policy.require_runtime(fb.as_str()) {
@@ -241,7 +266,14 @@ impl FailoverManager {
             self.record_failure(fb).await;
             failure.push(Fallback,*fb,None,Outcome::NoCompatibleModel);return Err(failure);
         };
-        if let Err(error)=crate::product_policy::require_model(policy,&fb_model) {
+        // F5: a `catalog_default` model is one DuDuClaw substituted, attributed
+        // to the fallback runtime's vendor; any other source keeps the v1.83.0 rule.
+        let fb_model_policy=if model_source=="catalog_default" {
+            crate::product_policy::require_substituted_catalog_model(policy,*fb,&fb_model)
+        } else {
+            crate::product_policy::require_model(policy,&fb_model)
+        };
+        if let Err(error)=fb_model_policy {
             failure.push(Fallback,*fb,Some(&fb_model),Outcome::PolicyRefused(error));return Err(failure);
         }
         let family_known=crate::runtime_config::model_family(&context.model).is_some();
@@ -323,11 +355,13 @@ impl FailoverManager {
 ///    is unqualified with [`duduclaw_llm::split_model_id`] — the same dialect
 ///    the Direct-API chain uses (`claude_runner::provider_and_bare`), so this
 ///    introduces no second parsing convention.
-/// 2. **Keep `context.model`** when it already matches `to`. Uses
-///    `model_matches_provider` unchanged, so an *unknown* family stays
-///    permitted (repo doctrine: only confident mismatches are flagged) — that
-///    covers `openai_compat`, which declares no family and legitimately proxies
-///    arbitrary model ids.
+/// 2. **Keep `context.model`** only when `to` can run it. A target that
+///    declares model prefixes (Claude, Codex, Grok, …) keeps it only when it
+///    is CONFIDENTLY that target's model — an unknown-family name is not kept
+///    (v1.84.0: a Codex agent's `opus` used to be handed to Grok verbatim).
+///    A target with no declared family (`openai_compat`, multi-vendor
+///    shells) keeps the lenient `model_matches_provider` rule, because it
+///    legitimately proxies arbitrary model ids.
 /// 3. **Catalog default** — the first entry of the runtime's
 ///    [`RuntimeSpec::fallback_models`], i.e. the same static list the dashboard
 ///    offers when live model discovery fails.
@@ -358,7 +392,7 @@ fn resolve_fallback_model(
 
     // (2) the requested model is already one this runtime serves
     let current = current_model.trim();
-    if !current.is_empty() && crate::runtime_config::model_matches_provider(current, *to) {
+    if !current.is_empty() && fallback_keeps_current_model(current, *to) {
         return Some((current.to_string(), "context_model"));
     }
 
@@ -371,6 +405,15 @@ fn resolve_fallback_model(
     None
 }
 
+/// Branch (2) of [`resolve_fallback_model`].
+fn fallback_keeps_current_model(model: &str, to: RuntimeType) -> bool {
+    if to.spec().model_prefixes.is_empty() {
+        return crate::runtime_config::model_matches_provider(model, to);
+    }
+    duduclaw_core::runtime_catalog::runtime_for_model(model).is_some()
+        && crate::runtime_config::model_matches_provider(model, to)
+}
+
 fn record_successful_response(runtime:&RuntimeType,context:&RuntimeContext,response:&RuntimeResponse) {
     crate::runtime::record_runtime_outcome(*runtime,&context.model);
     if response.input_tokens>0 || response.output_tokens>0 {
@@ -380,28 +423,8 @@ fn record_successful_response(runtime:&RuntimeType,context:&RuntimeContext,respo
     }
 }
 
-/// Determine if an error is non-retryable (should NOT trigger failover).
-///
-/// Checks for HTTP 4xx status codes and specific API error codes.
-/// Avoids broad substring matches like "safety" or "content policy" that
-/// could unintentionally match legitimate error descriptions.
-fn is_non_retryable(error: &str) -> bool {
-    if crate::work_outcome::is_work_result(error) { return true; }
-    if error.starts_with("AUTONOMY_PAUSED:") { return true; }
-    let lower = error.to_lowercase();
-    // 4xx client errors (except 429 rate limit which is retryable)
-    lower.contains("400 ") || lower.contains("401 ") || lower.contains("403 ")
-        || lower.contains("404 ") || lower.contains("422 ")
-        // Structured API error codes (more specific than free-form message matching)
-        || lower.contains("content_policy_violation")
-        || lower.contains("content policy violation") // free-form variant (full phrase — avoid matching transient "content policy filter" errors)
-        || lower.contains("invalid_api_key")
-        || lower.contains("billing_hard_limit")
-        // Legacy formatted messages kept for compatibility
-        || lower.contains("400 bad request")
-        || lower.contains("401 unauthorized")
-        || lower.contains("403 forbidden")
-}
+// RM-181 (v1.84.0): `is_non_retryable` (written for account/model rotation)
+// no longer decides layer 3; see `fallback_rule::classify_primary_failure`.
 
 // ── Tests ───────────────────────────────────────────────────────
 
@@ -432,12 +455,15 @@ mod tests {
     }
 
     #[test]
-    fn test_is_non_retryable() {
-        assert!(is_non_retryable("400 bad request: invalid JSON"));
-        assert!(is_non_retryable("Content policy violation"));
-        assert!(!is_non_retryable("429 rate limited"));
-        assert!(!is_non_retryable("500 internal server error"));
-        assert!(!is_non_retryable("connection refused"));
+    fn legacy_non_retryable_rows_keep_their_runtime_fallback_decision() {
+        // The rows the removed `is_non_retryable` test pinned, through the rule
+        // that replaced it (the full table lives in `fallback_rule::tests`).
+        let decide = |error: &str| classify_primary_failure(PrimaryFailure::Error { error, autonomy_denied: false, kind: None });
+        assert!(matches!(decide("400 bad request: invalid JSON"), FallbackDecision::Refused(_)));
+        assert!(matches!(decide("Content policy violation"), FallbackDecision::Refused(_)));
+        assert!(matches!(decide("429 rate limited"), FallbackDecision::Eligible(_)));
+        assert!(matches!(decide("500 internal server error"), FallbackDecision::Eligible(_)));
+        assert!(matches!(decide("connection refused"), FallbackDecision::Eligible(_)));
     }
 
     // ── Empty-response failover (2026-07-22 distributor bug) ─────────
@@ -514,8 +540,13 @@ mod tests {
         }
     }
 
+    /// RM-181 (v1.84.0) — this test used to pin that ANY untyped timeout
+    /// (including Grok's "Grok CLI hard timeout after Ns") falls back. Grok,
+    /// generic CLI and OpenAI-compatible run-limit timeouts are now the same
+    /// typed work result as Codex/Claude, so only a network timeout still
+    /// hands over; the engine's own run limit does not.
     #[tokio::test]
-    async fn untyped_timeout_still_uses_runtime_fallback() {
+    async fn network_timeout_still_uses_runtime_fallback_but_a_run_limit_does_not() {
         let mgr = FailoverManager::new(300);
         let mut runtimes: HashMap<RuntimeType, Box<dyn crate::runtime::AgentRuntime>> = HashMap::new();
         runtimes.insert(RuntimeType::Grok, Box::new(WorkOutcomeRuntime("connection timed out".into())));
@@ -527,6 +558,68 @@ mod tests {
         let primary = mgr.health_summary().await.into_iter()
             .find(|health| health.runtime_type == RuntimeType::Grok).unwrap();
         assert_eq!(primary.consecutive_failures, 1);
+
+        let run_limit = crate::work_outcome::WorkOutcome::TimeoutTotal { seconds: 1800, partial: String::new() }.encode();
+        let mgr = FailoverManager::new(300);
+        let mut runtimes: HashMap<RuntimeType, Box<dyn crate::runtime::AgentRuntime>> = HashMap::new();
+        runtimes.insert(RuntimeType::Grok, Box::new(WorkOutcomeRuntime(run_limit.clone())));
+        runtimes.insert(RuntimeType::Claude, Box::new(StubRuntime { content:"must not answer" }));
+        let registry = RuntimeRegistry::with_runtimes(runtimes);
+        let failure = mgr.execute_with_failover_detailed(&registry, &RuntimeType::Grok, Some(&RuntimeType::Claude),
+            "task", &stub_context(), &strings(&["claude-sonnet-4-6"])).await.unwrap_err();
+        assert_eq!(failure.steps.len(), 1);
+        assert_eq!(failure.fallback_skipped, Some(FallbackSkip { runtime: RuntimeType::Claude,
+            reason: FallbackRefusal::WorkLimit(WorkLimitKind::TimeoutTotal) }));
+        assert_eq!(failure.legacy_message(), run_limit);
+        assert!(mgr.health_summary().await.iter().all(|h| h.consecutive_failures == 0));
+    }
+
+    // ── RM-203: the fallback leg receives the conversation ──────────────
+
+    /// Records the history each call saw, then answers (or fails).
+    struct HistoryRecorder {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<Vec<(String, String)>>>>,
+        result: Result<&'static str, &'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::runtime::AgentRuntime for HistoryRecorder {
+        fn name(&self) -> &str { "history-recorder" }
+        async fn execute(&self, _: &str, context: &RuntimeContext) -> Result<RuntimeResponse, String> {
+            self.seen.lock().unwrap().push(context.conversation_history.iter()
+                .map(|t| (t.role.clone(), t.content.clone())).collect());
+            self.result.map(|content| RuntimeResponse {
+                content: content.into(), model_used: context.model.clone(),
+                runtime_name: "claude".into(), ..Default::default()
+            }).map_err(str::to_owned)
+        }
+        async fn is_available(&self) -> bool { true }
+    }
+
+    #[tokio::test]
+    async fn claude_fallback_leg_sees_the_same_conversation_history() {
+        let primary_seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fallback_seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut map: HashMap<RuntimeType, Box<dyn crate::runtime::AgentRuntime>> = HashMap::new();
+        map.insert(RuntimeType::Grok, Box::new(HistoryRecorder { seen: primary_seen.clone(), result: Err("500 internal server error") }));
+        map.insert(RuntimeType::Claude, Box::new(HistoryRecorder { seen: fallback_seen.clone(), result: Ok("代號是藍鯨") }));
+        let reg = RuntimeRegistry::with_runtimes(map);
+        let ctx = RuntimeContext {
+            conversation_history: vec![
+                crate::runtime::ConversationTurn { role: "user".into(), content: "請記住代號是藍鯨".into() },
+                crate::runtime::ConversationTurn { role: "assistant".into(), content: "好的。".into() },
+            ],
+            ..stub_context()
+        };
+        let res = FailoverManager::new(300)
+            .execute_with_failover(&reg, &RuntimeType::Grok, Some(&RuntimeType::Claude), "代號是什麼？", &ctx, &[])
+            .await
+            .expect("fallback answers");
+        assert_eq!(res.content, "代號是藍鯨");
+        let expected: Vec<(String, String)> = ctx.conversation_history.iter()
+            .map(|t| (t.role.clone(), t.content.clone())).collect();
+        assert_eq!(primary_seen.lock().unwrap().as_slice(), &[expected.clone()]);
+        assert_eq!(fallback_seen.lock().unwrap().as_slice(), &[expected], "the fallback leg lost the conversation");
     }
 
     fn stub_context() -> RuntimeContext {
@@ -772,6 +865,46 @@ mod tests {
             resolve_fallback_model(&RuntimeType::OpenAiCompat, "gpt-5.4", &[]).expect("kept");
         assert_eq!(model, "gpt-5.4");
         assert_eq!(source, "context_model");
+    }
+
+    // ── v1.84.0 distributor report: Codex→Grok fallback kept `opus` ─────
+
+    #[test]
+    fn fallback_model_claude_alias_is_never_handed_to_another_engine() {
+        let grok_default = RuntimeType::Grok.spec().fallback_models[0].0;
+        for alias in ["opus", "sonnet", "haiku", "fable", "Opus"] {
+            let (model, source) = resolve_fallback_model(&RuntimeType::Grok, alias, &[]).expect("grok default");
+            assert_eq!((model.as_str(), source), (grok_default, "catalog_default"), "{alias}");
+            let (model, source) = resolve_fallback_model(&RuntimeType::Codex, alias, &[]).expect("codex default");
+            assert_eq!((model.as_str(), source), (RuntimeType::Codex.spec().fallback_models[0].0, "catalog_default"));
+            // Claude itself serves its CLI aliases.
+            let (model, source) = resolve_fallback_model(&RuntimeType::Claude, alias, &[]).expect("kept");
+            assert_eq!((model.as_str(), source), (alias, "context_model"));
+        }
+        // An unknown-family name is not kept by a target that declares a family…
+        let (model, source) = resolve_fallback_model(&RuntimeType::Grok, "house-model-v1", &[]).unwrap();
+        assert_eq!((model.as_str(), source), (grok_default, "catalog_default"));
+        // …but a familyless target still proxies anything (branch 4 tests).
+        let (model, source) = resolve_fallback_model(&RuntimeType::OpenAiCompat, "house-model-v1", &[]).unwrap();
+        assert_eq!((model.as_str(), source), ("house-model-v1", "context_model"));
+        // Unchanged: a Codex model on a Codex→Claude fallback.
+        let (model, source) = resolve_fallback_model(&RuntimeType::Claude, "gpt-5.4", &[]).unwrap();
+        assert_eq!((model.as_str(), source), (RuntimeType::Claude.spec().fallback_models[0].0, "catalog_default"));
+    }
+
+    #[tokio::test]
+    async fn codex_to_grok_fallback_with_opus_runs_grok_with_its_own_model() {
+        let mut map: HashMap<RuntimeType, Box<dyn crate::runtime::AgentRuntime>> = HashMap::new();
+        map.insert(RuntimeType::Codex, Box::new(StubRuntime { content: "" }));
+        map.insert(RuntimeType::Grok, Box::new(EchoModelRuntime));
+        let reg = RuntimeRegistry::with_runtimes(map);
+        let ctx = RuntimeContext { model: "opus".into(), ..stub_context() };
+        let res = FailoverManager::new(300)
+            .execute_with_failover(&reg, &RuntimeType::Codex, Some(&RuntimeType::Grok), "hi", &ctx, &[])
+            .await
+            .expect("grok answers");
+        assert_eq!(res.model_used, RuntimeType::Grok.spec().fallback_models[0].0);
+        assert_ne!(res.model_used, "opus");
     }
 
     /// Stub that reports back the model it was actually invoked with, so the
@@ -1071,7 +1204,8 @@ mod work_limit_tests {
             WorkOutcome::TimeoutTotal { seconds:60, partial:String::new() },
             WorkOutcome::TimeoutNoProgress { seconds:60, tool:None, partial:String::new() }] {
             let error = outcome.encode();
-            assert!(is_non_retryable(&error));
+            assert!(matches!(classify_primary_failure(PrimaryFailure::Error { error: &error, autonomy_denied: false, kind: None }),
+                FallbackDecision::Refused(FallbackRefusal::WorkLimit(_))));
             assert!(FailoverManager::model_fallback_for("claude-opus-4-6", "claude-sonnet-4-6", &error).is_none());
         }
     }

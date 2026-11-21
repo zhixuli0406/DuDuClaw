@@ -86,6 +86,7 @@ import {
 import {
   RUNTIME_PROVIDERS,
   GENERIC_CLI_RUNTIMES,
+  UTILITY_CAPABLE_RUNTIMES,
   EFFORT_LEVELS,
   TEAM_ROLE_KEYS,
   DEFAULT_V168,
@@ -109,6 +110,7 @@ import {
   utilityModelMismatchesRuntime,
   effectiveRuntimeTimeout,
   runtimeTimeoutNeedsAdmin,
+  DEFAULT_RUN_TIMEOUT_SECS,
   type OdooFormState,
   clampInt,
   permissionFormValues,
@@ -482,7 +484,7 @@ function EditAgentPageContent() {
   const savedRuntimeIdleRef = useRef(900);
   const [runtimeDefaultIdle, setRuntimeDefaultIdle] = useState(900);
   const [runtimeTimeoutError, setRuntimeTimeoutError] = useState(false);
-  const [runtimeEffectiveTimeout, setRuntimeEffectiveTimeout] = useState(300);
+  const [runtimeEffectiveTimeout, setRuntimeEffectiveTimeout] = useState(DEFAULT_RUN_TIMEOUT_SECS);
   const [runtimeMaxTimeout, setRuntimeMaxTimeout] = useState(3600);
   const [runtimeTurnsLimit, setRuntimeTurnsLimit] = useState(200);
   const [runtimeDefaultTurns, setRuntimeDefaultTurns] = useState(50);
@@ -585,6 +587,7 @@ function EditAgentPageContent() {
       // '' = no per-employee override (inherit the global reply language).
       reply_language:
         typeof agent.prompt?.reply_language === 'string' ? agent.prompt.reply_language : '',
+      memory_language: agent.memory?.language ?? 'auto',
       monthly_limit_cents: agent.budget?.monthly_limit_cents ?? 5000,
       warn_threshold_percent: agent.budget?.warn_threshold_percent ?? 80,
       hard_stop: agent.budget?.hard_stop ?? true,
@@ -654,7 +657,7 @@ function EditAgentPageContent() {
     savedRuntimeTimeoutRef.current = agent.timeout_authorization_ceiling_secs
       ?? effectiveRuntimeTimeout(rt?.timeout_secs, 300, agent.max_timeout_secs ?? 3600);
     setRuntimeEffectiveTimeout(agent.effective_timeout_secs
-      ?? effectiveRuntimeTimeout(rt?.timeout_secs, rt?.provider === 'claude' || !rt?.provider ? 1800 : 300, agent.max_timeout_secs ?? 3600));
+      ?? effectiveRuntimeTimeout(rt?.timeout_secs, DEFAULT_RUN_TIMEOUT_SECS, agent.max_timeout_secs ?? 3600));
     setRuntimeMaxTimeout(agent.max_timeout_secs ?? 3600);
     setRuntimeDefaultIdle(agent.default_idle_timeout_secs ?? 900);
     savedRuntimeIdleRef.current = rt?.idle_timeout_secs ?? agent.default_idle_timeout_secs ?? 900;
@@ -662,9 +665,10 @@ function EditAgentPageContent() {
     setRuntime({
       provider: (rt?.provider as RuntimeProvider) ?? DEFAULT_RUNTIME.provider,
       fallback: rt?.fallback ?? DEFAULT_RUNTIME.fallback,
+      utility_provider: rt?.utility_provider ?? DEFAULT_RUNTIME.utility_provider,
       max_turns: rt?.max_turns ?? null,
       idle_timeout_secs: rt?.idle_timeout_secs ?? null,
-      timeout_secs: effectiveRuntimeTimeout(rt?.timeout_secs, agent.effective_timeout_secs ?? (rt?.provider === 'claude' || !rt?.provider ? 1800 : 300), agent.max_timeout_secs ?? 3600),
+      timeout_secs: effectiveRuntimeTimeout(rt?.timeout_secs, agent.effective_timeout_secs ?? DEFAULT_RUN_TIMEOUT_SECS, agent.max_timeout_secs ?? 3600),
     });
 
     const ef = ev?.external_factors ?? {};
@@ -992,7 +996,7 @@ function EditAgentPageContent() {
             savedRuntimeTurnsRef.current = detail.runtime?.max_turns ?? detail.default_max_turns ?? 50;
             const max = detail.max_timeout_secs ?? 3600;
             const effective = detail.effective_timeout_secs
-              ?? effectiveRuntimeTimeout(sentTimeout ?? detail.runtime?.timeout_secs, detail.runtime?.provider === 'claude' || !detail.runtime?.provider ? 1800 : 300, max);
+              ?? effectiveRuntimeTimeout(sentTimeout ?? detail.runtime?.timeout_secs, DEFAULT_RUN_TIMEOUT_SECS, max);
             savedRuntimeTimeoutRef.current = detail.timeout_authorization_ceiling_secs
               ?? effectiveRuntimeTimeout(sentTimeout ?? detail.runtime?.timeout_secs, 300, max);
             setSavedRuntimeTimeout(savedRuntimeTimeoutRef.current);
@@ -1227,6 +1231,11 @@ function EditAgentPageContent() {
     }),
     raw: code,
   }));
+  const memoryLanguageOptions: SelectOption[] = ['auto', 'zh-TW', 'zh-CN', 'en', 'ja-JP'].map((code) => ({
+    value: code,
+    label: intl.formatMessage({ id: code === 'auto' ? 'settings.general.memoryLanguage.auto' : `settings.general.defaultLanguage.${code}` }),
+    raw: code,
+  }));
   const providerOptions: SelectOption[] = RUNTIME_PROVIDERS.filter(p => policy.allows('runtimes', p)).map((p) => ({ value: p, label: intl.formatMessage({ id: `agents.runtime.provider.${p}` }), raw: p }));
   const usesGenericCli = GENERIC_CLI_RUNTIMES.has(runtime.provider) || GENERIC_CLI_RUNTIMES.has(runtime.fallback);
   // Show an old saved runtime for migration without offering it as a new choice.
@@ -1239,6 +1248,21 @@ function EditAgentPageContent() {
     { value: '', label: intl.formatMessage({ id: 'agents.runtime.fallback.none' }), raw: '' },
     ...providerOptions,
   ], runtime.fallback);
+  // RM-205: background work (key facts, summaries, titles). Only engines with a
+  // utility lane can take it; '' = 不使用其他服務.
+  const utilityProviderOptions: SelectOption[] = [
+    { value: '', label: intl.formatMessage({ id: 'agents.runtime.utility.none' }), raw: '' },
+    ...providerOptions.filter((o) => UTILITY_CAPABLE_RUNTIMES.has(o.value)),
+  ];
+  const utilityRoute = agent?.utility_route;
+  const utilityRouteText = utilityRoute
+    ? (utilityRoute.source === 'unavailable' || !utilityRoute.provider
+      ? intl.formatMessage({ id: 'agents.runtime.utility.skipped' })
+      : intl.formatMessage({ id: 'agents.runtime.utility.using' }, {
+        service: intl.formatMessage({ id: `agents.runtime.provider.${utilityRoute.provider}` }),
+      }))
+    : null;
+  const showUtilitySelect = !UTILITY_CAPABLE_RUNTIMES.has(runtime.provider) || runtime.utility_provider !== '';
   // v1.68 W1 — 推理力度 ('' = not set, the runtime's own default).
   const effortOptions: SelectOption[] = [
     { value: '', label: intl.formatMessage({ id: 'agents.v168.effort.unset' }), raw: '' },
@@ -1930,6 +1954,7 @@ function EditAgentPageContent() {
                 </SettingsRow>
               )}
               <RowSelect disabled={!isAdmin} label={t('agents.edit.replyLanguage')} description={t('agents.edit.replyLanguage.help')} value={form.reply_language ?? ''} onChange={(v) => updateField('reply_language', v)} options={replyLanguageOptions} />
+              <RowSelect disabled={!isAdmin} label={t('settings.general.memoryLanguage')} description={t('settings.general.memoryLanguage.help')} value={form.memory_language ?? 'auto'} onChange={(v) => updateField('memory_language', v)} options={memoryLanguageOptions} />
               <RowSelect label={t('agents.adv.statusField')} value={form.status ?? 'active'} onChange={(v) => updateField('status', v)} options={statusOptions} />
             </SettingsCard>
             {adminHint}
@@ -1959,6 +1984,15 @@ function EditAgentPageContent() {
             <SettingsCard>
               <RowSelect label={t('agents.runtime.provider')} description={t('agents.runtime.provider.hint')} value={runtime.provider} disabled={locked('runtime.provider')} onChange={(v) => updateRuntime('provider', v as RuntimeProvider)} options={providerPickerOptions} />
               <RowSelect label={t('agents.runtime.fallback')} description={t('agents.runtime.fallback.hint')} value={runtime.fallback} disabled={locked('runtime.fallback')} onChange={(v) => updateRuntime('fallback', v)} options={fallbackProviderOptions} />
+              {utilityRouteText && (
+                <p className="px-3 py-2 text-xs text-muted-foreground" data-testid="utility-route">{utilityRouteText}</p>
+              )}
+              {showUtilitySelect && (
+                <RowSelect label={t('agents.runtime.utility.label')} description={t('agents.runtime.utility.hint')} value={runtime.utility_provider} disabled={locked('runtime.utility_provider')} onChange={(v) => updateRuntime('utility_provider', v)} options={utilityProviderOptions} />
+              )}
+              {agent?.engine_model_notice && (
+                <p role="status" className="px-3 py-2 text-xs text-warning">{agent.engine_model_notice}</p>
+              )}
               <RowNumber label={t('agents.runtime.timeout')} description={<><span>{t(isAdmin ? 'agents.runtime.timeout.hint' : 'agents.runtime.timeout.lowerOnly')}</span> {intl.formatMessage({ id: isAdmin ? 'agents.runtime.timeout.effective' : 'agents.runtime.timeout.ownerCeiling' }, { value: runtimeEffectiveTimeout, max: runtimeMaxTimeout, ceiling: Math.min(savedRuntimeTimeout, runtimeMaxTimeout) })}</>} value={runtime.timeout_secs} min={30} max={isAdmin ? runtimeMaxTimeout : Math.min(savedRuntimeTimeout, runtimeMaxTimeout)} step={1} onChange={(v) => updateRuntime('timeout_secs', v)} />
               <SettingsRow label={t('agents.runtime.idleTimeout')} description={t('agents.runtime.idleTimeout.hint')} tier="text">
                 <Input type="number" min={0} max={runtimeMaxTimeout} step={1}

@@ -1147,6 +1147,18 @@ pub fn cli_specs() -> impl Iterator<Item = &'static RuntimeSpec> {
     CATALOG.iter().filter(|s| !s.binary.is_empty())
 }
 
+/// The Claude CLI's bare `--model` family aliases (the dashboard offers them
+/// for Claude employees). Matched by EXACT, case-insensitive equality on an
+/// unqualified id — never as prefixes — so another vendor's `opus-foo` or a
+/// qualified `vendor/opus` is not claimed for Claude.
+pub const CLAUDE_CLI_MODEL_ALIASES: [&str; 4] = ["fable", "opus", "sonnet", "haiku"];
+
+/// Is `model` one of [`CLAUDE_CLI_MODEL_ALIASES`] (exact, case-insensitive)?
+pub fn is_claude_cli_model_alias(model: &str) -> bool {
+    let model = model.trim();
+    CLAUDE_CLI_MODEL_ALIASES.iter().any(|alias| model.eq_ignore_ascii_case(alias))
+}
+
 /// Best-effort model-family → runtime, by the longest matching prefix in
 /// [`RuntimeSpec::model_prefixes`]. `None` for an unknown family — never a
 /// guess.
@@ -1157,7 +1169,13 @@ pub fn cli_specs() -> impl Iterator<Item = &'static RuntimeSpec> {
 ///     broad one.
 ///   * **On an equal-length tie, the FIRST catalog entry wins.** Catalog order
 ///     is preference order for any future overlap.
+///
+/// The bare Claude CLI aliases ([`CLAUDE_CLI_MODEL_ALIASES`]) belong to the
+/// Claude family by exact equality, checked before any prefix.
 pub fn runtime_for_model(model: &str) -> Option<&'static RuntimeSpec> {
+    if is_claude_cli_model_alias(model) {
+        return CATALOG.iter().find(|spec| spec.id == "claude");
+    }
     let lower = model.trim().to_ascii_lowercase();
     // Accept the qualified `provider/model` form — take the model part.
     let m = lower.rsplit('/').next().unwrap_or(&lower);
@@ -1424,6 +1442,19 @@ mod tests {
         );
         assert!(runtime_for_model("deepseek-v3.2").is_none());
         assert!(runtime_for_model("").is_none());
+    }
+
+    #[test]
+    fn bare_claude_cli_aliases_belong_to_claude_by_exact_equality_only() {
+        for alias in ["opus", "sonnet", "haiku", "fable", "OPUS", " Sonnet "] {
+            assert_eq!(runtime_for_model(alias).unwrap().id, "claude", "{alias}");
+            assert!(is_claude_cli_model_alias(alias), "{alias}");
+        }
+        // Never a prefix: another vendor's names stay unknown.
+        for other in ["opus-foo", "sonnet2", "haikus", "fable-x", "my-opus", "vendor/opus", "opus[1m]", ""] {
+            assert!(!is_claude_cli_model_alias(other), "{other}");
+            assert!(runtime_for_model(other).is_none(), "{other}");
+        }
     }
 
     #[test]

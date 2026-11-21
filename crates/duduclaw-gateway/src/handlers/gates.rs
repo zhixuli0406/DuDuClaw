@@ -74,6 +74,8 @@ pub const ENTERPRISE_ONLY_ERROR_CODE: &str = "enterprise_edition_required";
 /// - `license.*` — 授權管理 is `personalHidden` in the UI, but `license.activate`
 ///   is the authorized license installation path. Blocking it in Personal
 ///   would make Enterprise unreachable (edition is derived from license tier).
+///   `license.sync` (RM-175, Admin only) is the same upgrade path: it fetches
+///   the vendor's current signed license.
 /// - `delegation.get` / `delegation.set` — §1.6 marks 委派權限 ✅ Personal:
 ///   it governs which *agent* may hand work to which agent, not which person.
 /// - `billing.usage` — one RPC serves both the Personal 預算與超支 view (✅) and

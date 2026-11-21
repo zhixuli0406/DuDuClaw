@@ -151,7 +151,7 @@ async fn codex_detected_config_is_refused_before_container_or_file_preparation()
         run(&fx.home, &SandboxSettings::default(), &task(&fx, RuntimeType::Codex),
             Err("accounts must not be needed".into()))).await.unwrap_err();
     assert!(matches!(&err, SandboxError::Unavailable(Unavailable::CodexMcpIsolation(reason))
-        if reason.contains(layer.to_str().unwrap())));
+        if reason.contains("主機層") && reason.contains("system-codex.toml") && !reason.contains(layer.to_str().unwrap())));
     assert!(!fx.home.join("sandbox").exists());
     for name in ["calls", "create.args", "keys", "stdin", "rm"] {
         assert!(!fx.tools.join(name).exists(), "unexpected side effect: {name}");

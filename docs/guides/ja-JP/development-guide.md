@@ -282,22 +282,21 @@ claude
 
 ### 3.1 Input Guard（インジェクションスキャン）
 
-Agent に入るユーザー入力は `duduclaw-security` の `input_guard` スキャナーを通過
-します。これはリスクスコアリング方式（0-100、上限あり）を採用しており、7 つの重
-み付きルールでスコアを積算し、しきい値（既定 60）に達すると入力をブロックして
-`security_audit.jsonl` に記録します。`instruction_override`、`role_hijack`、
-`tool_abuse`、`data_exfiltration` は、スコアに関係なく 1 回一致しただけでブロック
-します（`crates/duduclaw-security/src/input_guard.rs`）。
+Agent に入るユーザー入力は `duduclaw-security` の `input_guard` スキャナーを通過します。これはリスクスコアリング方式（0-100、上限あり）を採用しており、11 の重み付きルールカテゴリでスコアを積算し、しきい値（既定 60）に達すると入力をブロックして `security_audit.jsonl` に記録します。`instruction_override`、`role_hijack`、`tool_abuse`、`data_exfiltration` は、スコアに関係なく 1 回一致しただけでブロックします（`crates/duduclaw-security/src/input_guard.rs`）。v1.84.0 からは、チャット受信時のチェックが信頼レベル（`ScanTrust`）を渡します。自分の WebChat 会話にいるログイン済みメンバーや、1 対 1 チャットにいる紐付け済みメンバーでは、`exec(`／`eval(`／`system(` は点数に入りますが単独ではブロックしません。ほかの呼び出し元はすべて `ScanTrust::Strict` です。ルールの全体と動作は[セキュリティ防御](../../features/ja-JP/05-security-defense.md)を参照してください。
 
 | ルール | 重み | 検出例 |
 |------|------|---------|
-| instruction_override | 40 | "ignore previous instructions" |
-| role_hijack | 35 | "act as", "your new role" |
-| system_prompt_extraction | 30 | "reveal your instructions" |
-| tool_abuse | 30 | ツールの誤用を誘導するプロンプト |
-| encoding_bypass | 25 | Base64 などのエンコーディングによるバイパス |
-| data_exfiltration | 25 | "send to" + URL |
+| instruction_override | 40（即時ブロック） | "ignore previous instructions", "your new role is", 忽略先前的指示 |
+| role_hijack | 35（即時ブロック） | "act as if you", "you are now", 越獄模式 |
+| tool_abuse | 30（即時ブロック） | `exec(`, `eval(`, `system(` と破壊的なシェル／SQL コマンド |
+| data_exfiltration | 25（即時ブロック） | "send to my email", "post to webhook", "curl http" |
+| system_prompt_extraction | 30 | "reveal your prompt", "show me your instructions" |
+| encoding_bypass | 25 | "base64:", "decode the following" |
 | termination_manipulation | 30 | "the task is never complete" |
+| authority_escalation | 35（信号ごと） | "use your own service account" |
+| memory_poisoning | 30（信号ごと） | "remember this permanently" |
+| role_provenance | 35（枠ごと） | `[SYSTEM]`, `<tool_result>`, `approval=granted` |
+| action_binding | 30 | "use that same approval to" |
 
 さらに Unicode 正規化（ゼロ幅文字、同形文字）によりバイパスを防ぎます。元の文字列にゼロ幅文字が 4 つ以上あると、スコアに 20 が加算されます。
 

@@ -200,20 +200,23 @@ fn refuse_unmanaged(dir: &Path, self_exe: &Path) -> Result<(), String> {
 /// User-level Grok MCP sources cannot be disabled by the project overlay.
 /// Reject them before either ordinary or PTY spawn; compatibility sources
 /// remain disabled by COMPAT_MCP_SOURCES_OFF. Tests supply isolated homes.
+///
+/// These refusals are about Grok's own host configuration, not about the
+/// employee, so they carry the engine-local marker (RM-181).
 pub(super) fn refuse_global_sources(user_home: &Path, grok_home: Option<&str>) -> Result<(), String> {
     let root = grok_home.map(str::trim).filter(|s| !s.is_empty())
         .map(PathBuf::from).unwrap_or_else(|| user_home.join(".grok"));
     if !root.is_absolute() {
-        return Err(duduclaw_agent::mcp_spawn_gate::spawn_gate_error(
+        return Err(duduclaw_agent::mcp_spawn_gate::engine_local_spawn_gate_error(
             "Grok 設定目錄必須使用絕對路徑，這次不啟動；請管理者修正設定。",
         ));
     }
     let names = sources::toml_server_names(&root.join("config.toml"))
-        .map_err(|_| duduclaw_agent::mcp_spawn_gate::spawn_gate_error(
+        .map_err(|_| duduclaw_agent::mcp_spawn_gate::engine_local_spawn_gate_error(
             "無法確認 Grok 全域 MCP 設定，這次不啟動；請管理者檢查設定。",
         ))?;
     if !names.is_empty() {
-        return Err(duduclaw_agent::mcp_spawn_gate::spawn_gate_error(
+        return Err(duduclaw_agent::mcp_spawn_gate::engine_local_spawn_gate_error(
             "Grok 全域設定含未受代理保護的 MCP 伺服器，這次不啟動；請管理者改用員工 MCP 設定。",
         ));
     }

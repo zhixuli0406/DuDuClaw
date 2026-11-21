@@ -118,8 +118,9 @@ fn employee_egress_sandbox_args(
     agent_dir: Option<&std::path::Path>,
     work_root: Option<&std::path::Path>,
     supports_permissions: bool,
+    private_roots: &[std::path::PathBuf],
 ) -> Result<Vec<String>, String> {
-    let mut args = employee_sandbox_args(egress_sandbox_caps(caps, mode), explore, agent_dir, work_root, supports_permissions)?;
+    let mut args = employee_sandbox_args(egress_sandbox_caps(caps, mode), explore, agent_dir, work_root, supports_permissions, private_roots)?;
     args.extend(egress_network_args(mode));
     Ok(args)
 }
@@ -172,8 +173,21 @@ fn sandbox_args(caps: Option<&CapabilitiesConfig>) -> Vec<String> {
 const EMPLOYEE_PERMISSION_PROFILE: &str = "duduclaw-employee";
 
 /// Absolute exclusions keep protecting the employee when the spawn cwd is overridden.
+///
+/// `private_roots` (H1, v1.84 security review): `<DUDUCLAW_HOME>/run`
+/// itself (re-review F4: its directory entry must not be renamable), the
+/// gateway-private per-call Codex home parent (`<DUDUCLAW_HOME>/run/codex`)
+/// and the host credential store directory. They get the same `"read"` entry as the control paths —
+/// the only per-path override this profile has been verified with — so tools
+/// cannot write there even when a write root (an overridden working root,
+/// `:tmpdir`, `/tmp`) contains them. The profile has no verified "no access"
+/// value, so `:root = "read"` still lets tools READ them.
 #[cfg(unix)]
-pub(super) fn employee_permission_args(agent_dir: &std::path::Path, work_root: Option<&std::path::Path>) -> Result<Vec<String>, String> {
+pub(super) fn employee_permission_args(
+    agent_dir: &std::path::Path,
+    work_root: Option<&std::path::Path>,
+    private_roots: &[std::path::PathBuf],
+) -> Result<Vec<String>, String> {
     let mut entries = vec![
         format!("{}={}", toml_string_literal(":root"), toml_string_literal("read")),
         format!("{}={}", toml_string_literal(":tmpdir"), toml_string_literal("write")),
@@ -196,6 +210,14 @@ pub(super) fn employee_permission_args(agent_dir: &std::path::Path, work_root: O
             }
         }
     }
+    for root in private_roots {
+        let Some(text) = root.to_str().filter(|_| root.is_absolute()) else {
+            return Err("Codex employee permissions require absolute UTF-8 private directories — refusing to spawn".into());
+        };
+        if protected.insert(root.clone()) {
+            entries.push(format!("{}={}", toml_string_literal(text), toml_string_literal("read")));
+        }
+    }
     let profile = EMPLOYEE_PERMISSION_PROFILE;
     Ok(vec![
         "-c".into(), format!("default_permissions={}", toml_string_literal(profile)),
@@ -210,6 +232,7 @@ fn employee_sandbox_args(
     agent_dir: Option<&std::path::Path>,
     work_root: Option<&std::path::Path>,
     supports_permissions: bool,
+    private_roots: &[std::path::PathBuf],
 ) -> Result<Vec<String>, String> {
     let mut args = sandbox_args_for(caps, explore);
     if !explore && sandbox_level_for(caps) == duduclaw_core::types::SandboxLevel::WorkspaceWrite {
@@ -219,7 +242,7 @@ fn employee_sandbox_args(
         if !supports_permissions {
             return Err("Codex 員工控制檔保護需要 Codex CLI 0.164.0 以上；版本過舊或無法確認。請到儀表板首頁按「更新 Codex CLI」，或在終端機執行 `npm install -g @openai/codex@latest`。".into());
         }
-        args.extend(employee_permission_args(dir, work_root)?);
+        args.extend(employee_permission_args(dir, work_root, private_roots)?);
     }
     Ok(args)
 }
@@ -233,44 +256,63 @@ fn employee_sandbox_args(
 /// does not reliably, and does not need to — `codex exec --output-schema
 /// <FILE>` takes a JSON Schema file and constrains the reply itself.
 ///
-/// Returns `(args, tempfile)`. The `NamedTempFile` is returned rather than
-/// dropped so the file outlives the spawn — dropping it here would delete the
-/// schema before codex opened it. `None` schema ⇒ empty argv, byte-identical
-/// to before this existed. A write failure degrades to "no flag" with a
-/// `warn!`: an adjudication must never fail because the schema could not be
-/// staged (the parser is still fail-closed downstream, so the worst case is
-/// the pre-round-8 behavior, not a wrong verdict).
+/// `call_dir` is this call's [`owned_home::OwnedCallDir`] (v1.84 security
+/// re-review F1). The schema file used to be a `NamedTempFile` in the system
+/// temp directory, which the employee permission profile grants
+/// `:tmpdir`/`/tmp` write to: another employee's tools could unlink and
+/// recreate `duduclaw-codex-schema-*` before Codex opened it and force a fixed
+/// judge verdict. It is now `<call_dir>/output-schema.json`, created
+/// exclusively (`create_new`, 0600 on Unix) inside the 0700 gateway-private
+/// directory that the profile marks read-only for tools, and it is removed
+/// with that directory (success, error, timeout, cancellation).
+///
+/// `None` schema ⇒ empty argv, byte-identical to before this existed. A write
+/// failure degrades to "no flag" with a `warn!`: an adjudication must never
+/// fail because the schema could not be staged (the parser is still
+/// fail-closed downstream, so the worst case is the pre-round-8 behavior, not
+/// a wrong verdict).
 fn output_schema_args(
     schema: Option<&serde_json::Value>,
-) -> (Vec<String>, Option<tempfile::NamedTempFile>) {
+    call_dir: &std::path::Path,
+) -> Vec<String> {
     let Some(schema) = schema else {
-        return (Vec::new(), None);
+        return Vec::new();
     };
-    let mut file = match tempfile::Builder::new()
-        .prefix("duduclaw-codex-schema-")
-        .suffix(".json")
-        .tempfile()
-    {
-        Ok(f) => f,
-        Err(e) => {
-            warn!(runtime = "codex", error = %e, "could not stage --output-schema file — continuing without structured output");
-            return (Vec::new(), None);
-        }
-    };
-    use std::io::Write;
     let rendered = match serde_json::to_vec_pretty(schema) {
         Ok(b) => b,
         Err(e) => {
             warn!(runtime = "codex", error = %e, "output_schema is not serializable — continuing without structured output");
-            return (Vec::new(), None);
+            return Vec::new();
         }
     };
-    if let Err(e) = file.write_all(&rendered).and_then(|_| file.flush()) {
+    let path = call_dir.join(OUTPUT_SCHEMA_FILE);
+    let Some(text) = path.to_str().map(str::to_owned) else {
+        warn!(runtime = "codex", "Codex call directory is not UTF-8 — continuing without structured output");
+        return Vec::new();
+    };
+    if let Err(e) = write_new_owner_only(&path, &rendered) {
         warn!(runtime = "codex", error = %e, "could not write --output-schema file — continuing without structured output");
-        return (Vec::new(), None);
+        return Vec::new();
     }
-    let path = file.path().to_string_lossy().to_string();
-    (vec!["--output-schema".to_string(), path], Some(file))
+    vec!["--output-schema".to_string(), text]
+}
+
+/// File name of the `--output-schema` file inside a call directory.
+const OUTPUT_SCHEMA_FILE: &str = "output-schema.json";
+
+/// Create `path` exclusively (never reusing an entry or following a planted
+/// link) with mode 0600 on Unix before the first byte, and write `bytes`.
+fn write_new_owner_only(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(bytes).and_then(|()| file.flush())
 }
 
 /// `-c model_reasoning_effort=<level>` for one invocation (P1/WP-3).
@@ -1243,6 +1285,23 @@ async fn collect_codex_output_with_input(
 ) -> Result<CodexOutput, String> {
     #[cfg(test)]
     if let Ok(capture) = tests::COMMAND_CAPTURE.try_with(std::sync::Arc::clone) {
+        // RM-204: also what the process would have read on stdin and the
+        // owned CODEX_HOME's instructions file (removed when the call returns).
+        if let Ok(extra) = tests::INPUT_CAPTURE.try_with(std::sync::Arc::clone) {
+            let codex_home = cmd.as_std().get_envs().find(|(key, _)| *key == "CODEX_HOME")
+                .and_then(|(_, value)| value).map(std::path::PathBuf::from);
+            let mut extra = extra.lock().unwrap();
+            extra.stdin = input.map(<[u8]>::to_vec);
+            extra.agents_md = codex_home.as_ref().and_then(|home| std::fs::read(home.join("AGENTS.md")).ok());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                extra.agents_md_mode = codex_home.as_ref()
+                    .and_then(|home| std::fs::metadata(home.join("AGENTS.md")).ok())
+                    .map(|meta| meta.permissions().mode() & 0o777);
+            }
+            extra.codex_home = codex_home;
+        }
         *capture.lock().unwrap() = Some(std::mem::replace(cmd, tokio::process::Command::new("captured-command")));
         return Err("codex command captured before backend execution".into());
     }
@@ -1383,11 +1442,32 @@ pub(crate) use external_config::require_mcp_isolation;
 #[cfg(test)]
 pub(crate) use external_config::MCP_CONFIG_TEST_PATHS;
 
+#[path = "codex/owned_home.rs"]
+pub(crate) mod owned_home;
+
 /// Each launch gets a private config root. Only the auth file is shared;
 /// native user, project and profile MCP configuration is never copied.
+///
+/// `root` is this call's [`owned_home::OwnedCallDir`] under the
+/// gateway-private `<DUDUCLAW_HOME>/run/codex/` (H1): not in the temp
+/// directory, `/tmp` or a working root, and marked read-only for tools in the
+/// employee permission profile, so another employee's tools cannot replace
+/// this call's `AGENTS.md` or swap the `auth.json` link.
+///
+/// **Remaining exposure, stated precisely.** `auth.json` here is a symbolic
+/// link to the host credential store (`$CODEX_HOME/auth.json` of the gateway
+/// process, or `~/.codex/auth.json`), never a copy: the token is not
+/// duplicated into the per-call directory. Any process running as the same
+/// OS user that may read files can read that host store — directly, or
+/// through this link — and that includes every AI employee's tools, because
+/// the employee profile grants `:root = "read"` and has no verified
+/// "no access" entry (the protected-root entries only deny writes). The
+/// same applies to the `AGENTS.md` next to it while the call runs: readable
+/// by same-UID readers, no longer writable by employee tools. Removing that
+/// read exposure needs a credential broker (the token outside every
+/// employee-readable path), which this change does not add.
 fn prepare_owned_codex_home(root: &std::path::Path) -> Result<std::path::PathBuf, String> {
-    let host = std::env::var_os("CODEX_HOME").map(std::path::PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")));
+    let host = owned_home::host_codex_home();
     prepare_owned_codex_home_with_auth(root, host.as_deref())
 }
 
@@ -1459,17 +1539,11 @@ impl CodexRuntime {
         &self,
         prompt: &str,
         context: &RuntimeContext,
-    ) -> Result<(tokio::process::Command, tempfile::TempDir, Option<tempfile::NamedTempFile>), String> {
-        // TempDir owns cleanup on success, spawn failure, timeout and cancellation.
-        // tempfile creates private directories (0700 on Unix); set explicitly too.
-        let work_dir = tempfile::Builder::new().prefix("duduclaw-codex-utility-")
-            .tempdir().map_err(|e| format!("cannot create Codex utility directory: {e}"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(work_dir.path(), std::fs::Permissions::from_mode(0o700))
-                .map_err(|e| format!("cannot secure Codex utility directory: {e}"))?;
-        }
+    ) -> Result<(tokio::process::Command, owned_home::OwnedCallDir), String> {
+        // H1: a fresh 0700 `utility-<random>` directory under the
+        // gateway-private `<home>/run/codex`, never the temp directory. The
+        // guard owns cleanup on success, spawn failure, timeout and cancellation.
+        let work_dir = owned_home::OwnedCallDir::create(&context.home_dir, owned_home::UTILITY_PREFIX)?;
         let mut cmd = tokio::process::Command::new(&self.codex_path);
         duduclaw_core::spawn_env::apply_agent_cli_env_allowlist(&mut cmd);
         // Share the real auth file, preserving refresh writes across launches.
@@ -1479,19 +1553,23 @@ impl CodexRuntime {
         if let Some(key) = std::env::var_os("OPENAI_API_KEY") { cmd.env("OPENAI_API_KEY", key); }
         cmd.args(utility_args());
         cmd.args(effort_args(context.effort));
-        let (schema_args, schema_file) =
-            output_schema_args(crate::runtime_dispatch::output_schema_override().as_ref());
-        cmd.args(schema_args);
+        // F1: the schema lives in this call's private directory, removed with it.
+        cmd.args(output_schema_args(crate::runtime_dispatch::output_schema_override().as_ref(), work_dir.path()));
         // `-` selects stdin; no conversation bytes enter argv on any OS.
         let _ = prompt;
         cmd.arg("-");
         if !context.model.is_empty() { cmd.arg("-m").arg(&context.model); }
         // Both process cwd and Codex's working root exclude employee/project files.
         external_config::check_project_layers(work_dir.path(), None)?;
+        // F4: the same working-root rule as employee calls (the private
+        // utility directory lies inside `<home>/run/codex`, so it passes).
+        owned_home::check_work_root(&context.home_dir, work_dir.path())?;
         cmd.current_dir(work_dir.path()).arg("--cd").arg(work_dir.path());
         let caps = utility_native_caps(context.capabilities.as_ref());
         super::apply_native_sandbox(&mut cmd, Some(&caps), Some(work_dir.path()), "codex")?;
-        Ok((cmd, work_dir, schema_file))
+        // RM-181 defence in depth, as for employee launches.
+        refuse_project_trust_override(&cmd, None)?;
+        Ok((cmd, work_dir))
     }
 }
 
@@ -1502,9 +1580,81 @@ fn employee_base_command(codex_path: &str, model: &str) -> tokio::process::Comma
     apply_codex_auth_env(&mut cmd);
     cmd.env_remove("CLAUDE_CODE_MESSAGING_TOKEN");
     cmd.args(["exec", "--json", "--skip-git-repo-check", "--ignore-user-config",
-        "-c", "mcp_servers={}"]);
+        "-c", "mcp_servers={}",
+        // RM-204: no working-directory / ancestor AGENTS.md is merged in; the
+        // instructions come from the owned `<CODEX_HOME>/AGENTS.md` only.
+        "-c", "project_doc_max_bytes=0",
+        // H1 item 3 (defence in depth): the commands Codex runs for the
+        // employee do not inherit the variable naming this call's owned home.
+        "-c", EXCLUDE_CODEX_HOME_FROM_TOOLS]);
     if !model.is_empty() { cmd.arg("-m").arg(model); }
     cmd
+}
+
+/// `shell_environment_policy.exclude` (Codex config reference: patterns
+/// removed from the environment of the commands Codex spawns, applied after
+/// `inherit` and the default `*KEY*`/`*SECRET*`/`*TOKEN*` excludes). Only the
+/// owned-home variable is named; `PATH` and everything else keep their
+/// current inheritance.
+const EXCLUDE_CODEX_HOME_FROM_TOOLS: &str = "shell_environment_policy.exclude=[\"CODEX_HOME\"]";
+
+/// RM-204: write the employee's system prompt to `<owned CODEX_HOME>/AGENTS.md`
+/// (owner-only, 0600). The directory is this call's private home under
+/// `<DUDUCLAW_HOME>/run/codex` (H1), so the file is removed with it. Fail
+/// closed: a prompt that cannot be written is never silently dropped.
+fn write_owned_instructions(codex_home: &std::path::Path, system_prompt: &str) -> Result<(), String> {
+    write_new_owner_only(&codex_home.join("AGENTS.md"), system_prompt.as_bytes())
+        .map_err(|e| format!("cannot write Codex instructions: {e}"))
+}
+
+/// Is `key` (the part of a `-c key=value` override before `=`) the Codex
+/// `projects` trust table or one of its entries? Exact segment match.
+fn is_projects_key(key: &str) -> bool {
+    let key = key.trim().trim_matches('"');
+    key == "projects" || key.starts_with("projects.") || key.starts_with("projects[")
+}
+
+/// RM-181 defence in depth: Codex loads a project-layer `.codex/config.toml`
+/// only for projects marked trusted (`[projects]` in the config home or a
+/// `-c projects…` override). DuDuClaw never grants trust; refuse a launch
+/// whose argv or owned config would.
+fn refuse_project_trust_override(
+    cmd: &tokio::process::Command,
+    owned_config: Option<&std::path::Path>,
+) -> Result<(), String> {
+    let refusal = || duduclaw_agent::mcp_spawn_gate::spawn_gate_error(
+        "Codex launch refused: a project trust override must never be passed");
+    let args: Vec<String> = cmd.as_std().get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        let value = if arg == "-c" || arg == "--config" {
+            index += 1;
+            args.get(index).map(String::as_str)
+        } else {
+            arg.strip_prefix("--config=")
+        };
+        if let Some(value) = value {
+            let key = value.split_once('=').map_or(value, |(key, _)| key);
+            if is_projects_key(key) {
+                return Err(refusal());
+            }
+        }
+        index += 1;
+    }
+    if let Some(path) = owned_config {
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                let table: toml::Table = text.parse().map_err(|_| refusal())?;
+                if table.contains_key("projects") {
+                    return Err(refusal());
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(refusal()),
+        }
+    }
+    Ok(())
 }
 
 // ── AgentRuntime impl ───────────────────────────────────────────
@@ -1539,7 +1689,7 @@ impl AgentRuntime for CodexRuntime {
                 cache_read_tokens: 0, model_used: context.model.clone(), runtime_name: "codex".into() });
         }
         if crate::runtime_dispatch::in_utility_call() {
-            let (mut cmd, _work_dir, _schema_file) = self.prepare_utility_command(prompt, context)?;
+            let (mut cmd, _work_dir) = self.prepare_utility_command(prompt, context)?;
             let payload = utility_stdin_payload(prompt, &context.system_prompt);
             return execute_codex_command_with_input(&mut cmd, context, Some(payload.as_bytes())).await;
         }
@@ -1548,27 +1698,10 @@ impl AgentRuntime for CodexRuntime {
         let explore = crate::explore_lane::in_explore();
         info!(agent = %context.agent_id, "CodexRuntime: executing via codex exec --json");
 
-        // Limit system_prompt to 64KB to avoid ARG_MAX issues.
-        // Char-boundary-safe truncation (never raw byte-index slicing on
-        // potentially CJK/emoji content — 2026-06 review convention #1).
-        const MAX_SYSTEM_PROMPT_BYTES: usize = 65536;
-        let system_prompt: &str = if context.system_prompt.len() > MAX_SYSTEM_PROMPT_BYTES {
-            tracing::warn!(
-                agent = %context.agent_id,
-                original_len = context.system_prompt.len(),
-                "system_prompt truncated to 64KB"
-            );
-            duduclaw_core::truncate_bytes(&context.system_prompt, MAX_SYSTEM_PROMPT_BYTES)
-        } else {
-            &context.system_prompt
-        };
-
-        // Prevent argument injection: prompts starting with '-' would be parsed as flags
-        let safe_prompt = if prompt.starts_with('-') {
-            format!(" {prompt}")
-        } else {
-            prompt.to_string()
-        };
+        // RM-204: the system prompt goes to the per-call owned
+        // `CODEX_HOME/AGENTS.md` (below), which Codex loads whole — no argv,
+        // no 32 KiB project-doc cap — so it is not truncated here any more.
+        let system_prompt: &str = &context.system_prompt;
 
         // W1 (capability enforcement): derive sandbox/approval flags from the
         // agent's capabilities instead of the former blanket `--full-auto`.
@@ -1644,23 +1777,42 @@ impl AgentRuntime for CodexRuntime {
         // affected: the `-c mcp_servers.duduclaw.env.DUDUCLAW_AGENT_ID`
         // override carries the member id independently of cwd.
         //
-        // Resolved ONCE (it used to be read twice, so a `work_dir` that failed
-        // validation could still have flipped `cwd_overridden`), through the
-        // shared [`super::resolve_spawn_work_dir`] which validates the override
-        // is a real directory and otherwise warns and falls back.
+        // Resolved ONCE through the shared [`super::resolve_spawn_work_dir`]
+        // which validates the override is a real directory and otherwise
+        // warns and falls back.
         let work_root: Option<std::path::PathBuf> =
             super::resolve_spawn_work_dir(context.agent_dir.as_deref(), &context.agent_id);
-        let cwd_overridden = work_root.is_some() && work_root != context.agent_dir;
         let owned_config = context.agent_dir.as_ref().map(|dir| dir.join(".codex/config.toml"));
         let project_root = work_root.clone().or_else(|| std::env::current_dir().ok())
             .ok_or("cannot resolve Codex project root")?;
         external_config::check_project_layers(&project_root, owned_config.as_deref())?;
+        // F4 (v1.84 security re-review): a working root that is `<home>`, an
+        // ancestor of it or otherwise contains `<home>/run` would let the
+        // employee's tools rename `<home>/run` under `:project_roots = write`.
+        // Refused (typed engine-local) before anything is prepared. Without a
+        // working root no `--cd` is passed, and the workspace-write profile
+        // already refuses a spawn without an agent directory.
+        if let Some(root) = work_root.as_deref() {
+            owned_home::check_work_root(&context.home_dir, root)?;
+        }
 
-        let config_root = tempfile::Builder::new().prefix("duduclaw-codex-config-").tempdir()
-            .map_err(|e| format!("cannot create Codex config directory: {e}"))?;
+        // H1: `<home>/run/codex/call-<random>` (0700, gateway-private, read-only
+        // for tools via the profile below), removed when `config_root` drops —
+        // success, error, timeout or cancellation.
+        let config_root = owned_home::OwnedCallDir::create(&context.home_dir, owned_home::CALL_PREFIX)?;
         let codex_home = prepare_owned_codex_home(config_root.path())?;
+        // RM-204: the employee's instructions live in this call's own
+        // CODEX_HOME (removed with `config_root`), never in the employee
+        // directory: Codex always loads `<CODEX_HOME>/AGENTS.md` (also under
+        // `--ignore-user-config`, without the project-doc size cap), and
+        // concurrent conversations of one employee no longer overwrite each
+        // other. `-c project_doc_max_bytes=0` (employee_base_command) keeps
+        // any working-directory / ancestor AGENTS.md out of the request.
+        if !system_prompt.is_empty() {
+            write_owned_instructions(&codex_home, system_prompt)?;
+        }
         let mut cmd = employee_base_command(&self.codex_path, &context.model);
-        cmd.env("CODEX_HOME", codex_home);
+        cmd.env("CODEX_HOME", &codex_home);
         let egress_mode = duduclaw_core::egress_guard::effective_mode(&context.home_dir, context.agent_dir.as_deref());
         let effective_caps = egress_sandbox_caps(caps, egress_mode);
         if employee_needs_namespace_guard(effective_caps, explore) {
@@ -1672,7 +1824,8 @@ impl AgentRuntime for CodexRuntime {
                 && sandbox_level_for(effective_caps) == duduclaw_core::types::SandboxLevel::WorkspaceWrite;
             let supports_permissions = needs_permissions
                 && codex_supports_employee_permissions(&self.codex_path).await;
-            let args = employee_egress_sandbox_args(caps, explore, egress_mode, context.agent_dir.as_deref(), work_root.as_deref(), supports_permissions)
+            let private_roots = owned_home::protected_roots(&context.home_dir);
+            let args = employee_egress_sandbox_args(caps, explore, egress_mode, context.agent_dir.as_deref(), work_root.as_deref(), supports_permissions, &private_roots)
                 .map_err(|error| duduclaw_agent::mcp_spawn_gate::spawn_gate_error(&error))?;
             cmd.args(args);
         }
@@ -1687,10 +1840,10 @@ impl AgentRuntime for CodexRuntime {
             &crate::thinking::policy(),
         ));
         // Live round 8: a caller-required reply schema, when one is scoped.
-        // `_schema_file` is held to the end of this function on purpose — the
-        // temp file must outlive the spawn.
-        let (schema_args, _schema_file) =
-            output_schema_args(crate::runtime_dispatch::output_schema_override().as_ref());
+        // F1: written into `config_root` (this call's private directory),
+        // which is held to the end of this function and removes it on drop.
+        let schema_args =
+            output_schema_args(crate::runtime_dispatch::output_schema_override().as_ref(), config_root.path());
         if !schema_args.is_empty() {
             info!(
                 agent = %context.agent_id,
@@ -1757,56 +1910,32 @@ impl AgentRuntime for CodexRuntime {
             duduclaw_core::ns_guard::is_active(),
         ));
 
-        // Pass system prompt via AGENTS.md in the working root.
-        // Codex exec has no --instructions/--system-prompt flag (verified on
-        // 0.156.1: `codex exec --help` lists neither); AGENTS.md at the
-        // working root is the only file channel.
-        //
-        // With an overridden cwd that channel is unusable: writing the
-        // member's system prompt to the employee's `AGENTS.md` would clobber
-        // the employee's own file (and two concurrent members would race over
-        // it). So when — and only when — the cwd is overridden, the system
-        // prompt travels inside the prompt as an XML-delimited block instead.
-        // Weaker placement than a real system prompt, and said out loud here
-        // rather than silently dropping the member's instructions.
-        let mut prompt_prefix = String::new();
-        if !system_prompt.is_empty() {
-            if cwd_overridden {
-                prompt_prefix = format!(
-                    "<role_system_prompt>\n{}\n</role_system_prompt>\n\n",
-                    system_prompt.replace("</role_system_prompt>", "&lt;/role_system_prompt&gt;")
-                );
-            } else if let Some(ref dir) = context.agent_dir {
-                let agents_md = dir.join("AGENTS.md");
-                let _ = std::fs::write(&agents_md, system_prompt);
-            }
-        }
+        // The system prompt was written to the owned CODEX_HOME above, for an
+        // overridden working root too (it used to travel inline there so the
+        // employee's own AGENTS.md was not clobbered; the owned home has no
+        // such conflict). An override only moves `--cd` now.
 
         // Prepend conversation history to prompt (Codex exec has no native multi-turn)
         let augmented_prompt = if context.conversation_history.is_empty() {
-            safe_prompt
+            prompt.to_string()
         } else {
-            super::format_history_as_prompt(&context.conversation_history, &safe_prompt)
-        };
-        let augmented_prompt = if prompt_prefix.is_empty() {
-            augmented_prompt
-        } else {
-            format!("{prompt_prefix}{augmented_prompt}")
+            super::format_history_as_prompt(&context.conversation_history, prompt)
         };
 
-        cmd.arg(&augmented_prompt);
+        // RM-204: `-` makes `codex exec` read the prompt from stdin, byte-exact
+        // (history + recap + message can exceed the Linux 128 KiB
+        // single-argument limit). No conversation bytes enter argv, so a
+        // prompt starting with '-' can no longer be parsed as a flag either.
+        cmd.arg("-");
 
         // Set working directory
         if let Some(ref dir) = work_root {
             cmd.arg("--cd").arg(dir);
         }
 
-        // Codex reads "additional input from stdin" whenever stdin is not a
-        // TTY and concatenates it to the prompt; an inherited open pipe would
-        // stall the run until EOF. The prompt is passed as an argument, so
-        // stdin is deliberately closed.
-        cmd.stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
+        // stdin carries the prompt and is closed after it (the collector
+        // pipes it); an inherited open pipe would stall the run until EOF.
+        cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
         // Native OS sandbox (opt-in). Layered on top of the CLI `--sandbox`
@@ -1816,7 +1945,11 @@ impl AgentRuntime for CodexRuntime {
         // the writes the override exists to allow).
         super::apply_native_sandbox(&mut cmd, caps, work_root.as_deref(), "codex")?;
 
-        execute_codex_command(&mut cmd, context).await
+        // RM-181 defence in depth: Codex loads project-layer configuration
+        // only for trusted projects; DuDuClaw never grants trust.
+        refuse_project_trust_override(&cmd, owned_config.as_deref())?;
+
+        execute_codex_command_with_input(&mut cmd, context, Some(augmented_prompt.as_bytes())).await
     }
 
     async fn is_available(&self) -> bool {
@@ -1832,6 +1965,7 @@ impl AgentRuntime for CodexRuntime {
 
 // Shared by conversational and utility calls: retain bounded incremental output,
 // process-group cleanup, timeout partials, usage and native-event reporting.
+#[cfg(test)]
 async fn execute_codex_command(
     cmd: &mut tokio::process::Command,
     context: &RuntimeContext,
@@ -2048,7 +2182,7 @@ pub(crate) mod third_party;
 // ── Tests ───────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -2135,14 +2269,32 @@ mod tests {
     }
 
     type CollectProbe = Box<dyn Fn(&tokio::process::Command) -> Result<CodexOutput, String> + Send + Sync>;
+    /// What a captured launch would have received besides argv/env.
+    #[derive(Debug, Default, Clone)]
+    pub(crate) struct InputCapture {
+        pub(crate) stdin: Option<Vec<u8>>,
+        pub(crate) codex_home: Option<std::path::PathBuf>,
+        pub(crate) agents_md: Option<Vec<u8>>,
+        pub(crate) agents_md_mode: Option<u32>,
+    }
     tokio::task_local! {
         pub(super) static COLLECT_PROBE: CollectProbe;
-        pub(super) static COMMAND_CAPTURE: std::sync::Arc<std::sync::Mutex<Option<tokio::process::Command>>>;
+        pub(crate) static COMMAND_CAPTURE: std::sync::Arc<std::sync::Mutex<Option<tokio::process::Command>>>;
+        /// Only read inside a [`COMMAND_CAPTURE`] scope.
+        pub(crate) static INPUT_CAPTURE: std::sync::Arc<std::sync::Mutex<InputCapture>>;
+    }
+
+    /// The fixture employee directory `<home>/agents/tester` (created). It
+    /// used to be `<home>` itself, which F4 now refuses as a working root.
+    fn fixture_agent_dir(home: &std::path::Path) -> std::path::PathBuf {
+        let dir = home.join("agents").join("tester");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     fn utility_context(home: &std::path::Path) -> RuntimeContext {
         RuntimeContext {
-            agent_dir: Some(home.to_path_buf()), system_prompt: "system </role_system_prompt>".into(),
+            agent_dir: Some(fixture_agent_dir(home)), system_prompt: "system </role_system_prompt>".into(),
             model: "gpt-5.4-mini".into(), max_tokens: 64, home_dir: home.to_path_buf(),
             agent_id: "tester".into(), preferred_provider: None, conversation_history: vec![],
             capabilities: Some(CapabilitiesConfig { computer_use: true, ..Default::default() }),
@@ -2176,12 +2328,17 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let runtime = CodexRuntime { codex_path: "codex-fixture".into() };
         let context = utility_context(home.path());
-        let (command, _directory, _schema) = runtime.prepare_utility_command("繁體中文 $HOME;\nnext", &context).unwrap();
+        let (command, _directory) = runtime.prepare_utility_command("繁體中文 $HOME;\nnext", &context).unwrap();
         let before = duduclaw_core::execution_gate::command_snapshot(&command);
         let cwd = command.as_std().get_current_dir().unwrap().to_path_buf();
+        // H1: the utility cwd is a private `utility-<random>` directory under
+        // `<home>/run/codex`, not the temp directory.
+        assert_eq!(cwd.parent(), Some(owned_home::run_parent(home.path()).as_path()));
+        let name = cwd.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with(owned_home::UTILITY_PREFIX) && owned_home::matches_scheme(name), "{name}");
         let mut expected = tokio::process::Command::new("codex-fixture");
         duduclaw_core::apply_agent_cli_env_allowlist(&mut expected);
-        // The utility launch owns a private CODEX_HOME inside its temporary cwd.
+        // The utility launch owns a private CODEX_HOME inside its private cwd.
         expected.env("CODEX_HOME", cwd.join("codex-home"));
         if let Some(value) = std::env::var_os("OPENAI_API_KEY") { expected.env("OPENAI_API_KEY", value); }
         expected.args([
@@ -2242,7 +2399,7 @@ mod tests {
                 crate::runtime_dispatch::CHANNEL_REPLY_PARTIAL.scope((), crate::runtime_dispatch::UTILITY_CALL.scope((), call)).await.unwrap_err()
             } else { crate::runtime_dispatch::CHANNEL_REPLY_PARTIAL.scope((), call).await.unwrap_err() };
             assert_eq!(crate::work_outcome::WorkOutcome::decode(&error), Some(crate::work_outcome::WorkOutcome::TimeoutTotal {
-                seconds:300, partial:"PASS".into() }));
+                seconds: crate::runtime_config::DEFAULT_RUN_TIMEOUT_SECS, partial:"PASS".into() }));
         }
     }
 
@@ -2255,10 +2412,12 @@ mod tests {
         cached_codex_support(bin, || async { Some("codex-cli 0.164.0".into()) }).await;
         let runtime = CodexRuntime { codex_path: bin.into() };
         let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let input = std::sync::Arc::new(std::sync::Mutex::new(InputCapture::default()));
         // No unmanaged host Codex layers participate in this fixture.
-        let error = MCP_CONFIG_TEST_PATHS.scope(vec![],
-            COMMAND_CAPTURE.scope(captured.clone(), runtime.execute("繁體中文 $HOME;\nnext", &context))).await.unwrap_err();
+        let error = MCP_CONFIG_TEST_PATHS.scope(vec![], INPUT_CAPTURE.scope(input.clone(),
+            COMMAND_CAPTURE.scope(captured.clone(), runtime.execute("繁體中文 $HOME;\nnext", &context)))).await.unwrap_err();
         assert_eq!(error, "codex command captured before backend execution");
+        let input = input.lock().unwrap().clone();
         let command = captured.lock().unwrap().take().unwrap();
         let before = duduclaw_core::execution_gate::command_snapshot(&command);
         let captured_env = |key: &str| command.as_std().get_envs().find(|(name, _)| *name == key)
@@ -2270,11 +2429,14 @@ mod tests {
         expected.env("CODEX_HOME", &codex_home);
         expected.env_remove("CLAUDE_CODE_MESSAGING_TOKEN");
         expected.args(["exec", "--json", "--skip-git-repo-check", "--ignore-user-config",
-            "-c", "mcp_servers={}", "-m", "gpt-5.4-mini"]);
+            "-c", "mcp_servers={}", "-c", "project_doc_max_bytes=0",
+            "-c", "shell_environment_policy.exclude=[\"CODEX_HOME\"]", "-m", "gpt-5.4-mini"]);
         expected.args(["--approve-for-me",
             "-c", "approval_policy=never", "-c", "sandbox_mode=\"workspace-write\""]);
+        let agent = fixture_agent_dir(home.path());
         #[cfg(unix)]
-        expected.args(employee_permission_args(home.path(), Some(home.path())).unwrap());
+        expected.args(employee_permission_args(&agent, Some(agent.as_path()),
+            &owned_home::protected_roots(home.path())).unwrap());
         // Resolve the dynamic MCP registration independently of the captured command.
         let delegation_env = crate::claude_runner::delegation_context_env(home.path(), "tester",
             crate::runtime_config::call_timeout_secs(context.agent_dir.as_deref()));
@@ -2285,12 +2447,145 @@ mod tests {
         if let Some(value) = captured_env(delegation) { expected.env(delegation, value); }
         expected.args(turn_source_override_args_with_namespace_guard(&[],
             duduclaw_core::ns_guard::is_active()));
-        expected.args(["繁體中文 $HOME;\nnext", "--cd"]).arg(home.path());
+        // RM-204: the prompt is read from stdin (`-`), never argv.
+        expected.args(["-", "--cd"]).arg(&agent);
         // Conversational Codex selects the root using --cd, leaving the process cwd inherited.
         assert_eq!(before.cwd, None);
-        assert_eq!(std::fs::read_to_string(home.path().join("AGENTS.md")).unwrap(), "system </role_system_prompt>");
+        // RM-204: the instructions live in the owned CODEX_HOME, owner-only,
+        // and nothing is written into the employee directory.
+        assert!(!agent.join("AGENTS.md").exists());
+        assert_eq!(input.codex_home.as_deref().map(std::path::Path::as_os_str), Some(codex_home.as_os_str()));
+        assert_eq!(input.agents_md.as_deref(), Some("system </role_system_prompt>".as_bytes()));
+        #[cfg(unix)]
+        assert_eq!(input.agents_md_mode, Some(0o600));
+        assert_eq!(input.stdin.as_deref(), Some("繁體中文 $HOME;\nnext".as_bytes()));
+        // H1: `<home>/run/codex/call-<random>/codex-home`, removed after an error too.
+        let call_dir = std::path::Path::new(&codex_home).parent().unwrap();
+        assert_eq!(call_dir.parent(), Some(owned_home::run_parent(home.path()).as_path()));
+        let name = call_dir.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with(owned_home::CALL_PREFIX) && owned_home::matches_scheme(name), "{name}");
+        assert!(!std::path::Path::new(&codex_home).exists(), "owned home removed with the call");
+        assert!(!call_dir.exists(), "call directory removed with the call");
         assert_eq!(before, duduclaw_core::execution_gate::command_snapshot(&expected));
         assert_eq!(duduclaw_core::execution_gate::local_command_roundtrip(command).await.unwrap(), before);
+    }
+
+    /// Run the real conversational Codex path up to the spawn and return the
+    /// captured argv, stdin and owned-home instructions.
+    pub(crate) async fn capture_conversation(context: &RuntimeContext, prompt: &str)
+        -> (Vec<String>, InputCapture) {
+        let bin = "/nonexistent/codex-capture";
+        cached_codex_support(bin, || async { Some("codex-cli 0.164.0".into()) }).await;
+        let runtime = CodexRuntime { codex_path: bin.into() };
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let input = std::sync::Arc::new(std::sync::Mutex::new(InputCapture::default()));
+        let error = MCP_CONFIG_TEST_PATHS.scope(vec![], INPUT_CAPTURE.scope(input.clone(),
+            COMMAND_CAPTURE.scope(captured.clone(), runtime.execute(prompt, context)))).await.unwrap_err();
+        assert_eq!(error, "codex command captured before backend execution");
+        let command = captured.lock().unwrap().take().unwrap();
+        let args = command.as_std().get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let input = input.lock().unwrap().clone();
+        (args, input)
+    }
+
+    #[tokio::test]
+    async fn large_system_prompt_reaches_the_owned_home_whole_and_prompt_rides_stdin() {
+        let home = tempfile::tempdir().unwrap();
+        let mut context = utility_context(home.path());
+        context.capabilities = None;
+        // > 64 KiB (the old cut) and > 32 KiB (Codex's project-doc cap), with
+        // the summary / pinned blocks at the tail where truncation hit.
+        let tail = "<pinned_instructions>永遠用繁體中文</pinned_instructions>\nTAIL-MARKER-🙂";
+        context.system_prompt = format!("{}{tail}", "基本提示 ".repeat(12_000));
+        assert!(context.system_prompt.len() > 128 * 1024);
+        context.conversation_history = vec![
+            crate::runtime::ConversationTurn { role: "user".into(), content: "第一輪 TURN1-USER".into() },
+            crate::runtime::ConversationTurn { role: "assistant".into(), content: "TURN1-REPLY".into() },
+        ];
+        let message = format!("-starts-with-dash {}", "長訊息".repeat(50_000));
+        let (args, input) = capture_conversation(&context, &message).await;
+        assert!(args.windows(2).any(|pair| pair == ["-c", "project_doc_max_bytes=0"]), "{args:?}");
+        assert!(args.iter().any(|a| a == "--ignore-user-config"));
+        assert!(args.iter().any(|a| a == "-"), "prompt selected from stdin");
+        assert!(args.iter().all(|a| !a.contains("TURN1-USER") && !a.contains("長訊息")), "no conversation bytes in argv");
+        assert!(args.iter().all(|a| a.len() < 128 * 1024));
+        let agents_md = String::from_utf8(input.agents_md.expect("owned AGENTS.md")).unwrap();
+        assert_eq!(agents_md, context.system_prompt, "full prompt, byte-exact");
+        assert!(agents_md.ends_with("TAIL-MARKER-🙂"));
+        let stdin = String::from_utf8(input.stdin.expect("stdin payload")).unwrap();
+        assert_eq!(stdin, crate::runtime::format_history_as_prompt(&context.conversation_history, &message));
+        assert!(stdin.contains("TURN1-USER") && stdin.contains("TURN1-REPLY") && stdin.ends_with(&message));
+        assert!(!fixture_agent_dir(home.path()).join("AGENTS.md").exists(), "nothing written to the employee directory");
+    }
+
+    #[tokio::test]
+    async fn an_existing_employee_agents_md_is_left_alone() {
+        let home = tempfile::tempdir().unwrap();
+        let mut context = utility_context(home.path());
+        context.capabilities = None;
+        let agent = fixture_agent_dir(home.path());
+        std::fs::write(agent.join("AGENTS.md"), "scaffold").unwrap();
+        let (_args, input) = capture_conversation(&context, "hi").await;
+        assert_eq!(std::fs::read_to_string(agent.join("AGENTS.md")).unwrap(), "scaffold");
+        assert_eq!(input.agents_md.as_deref(), Some(context.system_prompt.as_bytes()));
+    }
+
+    /// F4 (v1.84 security re-review): an employee whose working root is the
+    /// system data folder (or contains it) is refused with a typed
+    /// engine-local refusal before any call directory is prepared.
+    #[tokio::test]
+    async fn employee_working_root_containing_the_system_folder_is_refused_before_preparation() {
+        let base = tempfile::tempdir().unwrap();
+        let home = base.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let mut context = utility_context(&home);
+        context.capabilities = None;
+        let bin = "/nonexistent/codex-work-root-refusal";
+        cached_codex_support(bin, || async { Some("codex-cli 0.164.0".into()) }).await;
+        let runtime = CodexRuntime { codex_path: bin.into() };
+        // The home itself and an ancestor of it.
+        for root in [home.clone(), base.path().to_path_buf()] {
+            context.agent_dir = Some(root.clone());
+            let probe: CollectProbe = Box::new(|_| panic!("a refused Codex call must not run"));
+            let error = MCP_CONFIG_TEST_PATHS.scope(vec![],
+                COLLECT_PROBE.scope(probe, runtime.execute("hi", &context))).await.unwrap_err();
+            assert!(duduclaw_agent::mcp_spawn_gate::is_engine_local_spawn_gate_error(&error), "{root:?}: {error}");
+            assert!(error.contains(owned_home::WORK_ROOT_CONTAINS_HOME), "{error}");
+            assert!(!owned_home::run_parent(&home).exists(), "nothing prepared");
+        }
+        // The same employee in its own directory reaches the spawn.
+        context.agent_dir = Some(fixture_agent_dir(&home));
+        let (args, _input) = capture_conversation(&context, "hi").await;
+        assert!(args.iter().any(|a| a == "--cd"));
+    }
+
+    #[test]
+    fn project_trust_overrides_are_refused_in_argv_and_owned_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let mut cmd = employee_base_command("fixture-never-spawned", "gpt-5.4-mini");
+        cmd.arg("-");
+        assert!(refuse_project_trust_override(&cmd, None).is_ok());
+        assert!(refuse_project_trust_override(&cmd, Some(&config)).is_ok(), "absent owned config");
+        for bad in ["projects={}", "projects.\"/tmp/x\".trust_level=\"trusted\"", " projects = {}"] {
+            let mut cmd = employee_base_command("fixture-never-spawned", "");
+            cmd.args(["-c", bad]);
+            let error = refuse_project_trust_override(&cmd, None).unwrap_err();
+            assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error), "{bad}");
+            let mut cmd = employee_base_command("fixture-never-spawned", "");
+            cmd.arg(format!("--config={bad}"));
+            assert!(refuse_project_trust_override(&cmd, None).is_err(), "{bad}");
+        }
+        // A key that merely starts with the letters is not the trust table.
+        let mut cmd = employee_base_command("fixture-never-spawned", "");
+        cmd.args(["-c", "projects_note=1"]);
+        assert!(refuse_project_trust_override(&cmd, None).is_ok());
+        std::fs::write(&config, "[projects.\"/tmp/x\"]\ntrust_level = \"trusted\"\n").unwrap();
+        assert!(refuse_project_trust_override(&cmd, Some(&config)).is_err());
+        std::fs::write(&config, "[broken").unwrap();
+        assert!(refuse_project_trust_override(&cmd, Some(&config)).is_err(), "fail closed");
+        std::fs::write(&config, "[mcp_servers.duduclaw]\ncommand = \"/x\"\n").unwrap();
+        assert!(refuse_project_trust_override(&cmd, Some(&config)).is_ok());
     }
 
     #[test]
@@ -2332,7 +2627,9 @@ mod tests {
             }).await.unwrap_err();
             assert!(error.contains("system-config.toml"), "{error}");
             assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error));
-            assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 1);
+            // The layer file and the fixture's `agents/` directory: nothing prepared.
+            assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 2);
+            assert!(!home.path().join("run").exists());
         }
     }
 
@@ -2341,11 +2638,14 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let runtime = CodexRuntime { codex_path: "/never-spawn-fixture".into() };
         let context = utility_context(home.path());
-        let probe: CollectProbe = Box::new(|cmd| {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None::<std::path::PathBuf>));
+        let seen_in_probe = seen.clone();
+        let probe: CollectProbe = Box::new(move |cmd| {
             let owned = cmd.as_std().get_envs().find(|(key, _)| *key == "CODEX_HOME")
                 .and_then(|(_, value)| value).unwrap();
             assert!(std::path::Path::new(owned).is_dir());
             assert!(!std::path::Path::new(owned).join("config.toml").exists());
+            *seen_in_probe.lock().unwrap() = Some(std::path::PathBuf::from(owned));
             let mut output = collected_fixture("{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"PASS\"}}\n");
             output.status = Some(std::process::ExitStatus::default());
             Ok(output)
@@ -2354,6 +2654,139 @@ mod tests {
             COLLECT_PROBE.scope(probe, crate::runtime_dispatch::UTILITY_CALL.scope((),
                 runtime.execute("fixture", &context)))).await.unwrap();
         assert_eq!(response.content, "PASS");
+        // H1: under `<home>/run/codex`, and removed after a successful call.
+        let owned = seen.lock().unwrap().clone().expect("probe saw the owned home");
+        let call_dir = owned.parent().unwrap();
+        assert_eq!(call_dir.parent(), Some(owned_home::run_parent(home.path()).as_path()));
+        assert!(!call_dir.exists(), "utility directory removed after success");
+    }
+
+    /// H1: the same for an employee call that succeeds, and for one that is
+    /// cancelled while Codex would be running.
+    #[tokio::test]
+    async fn employee_call_directory_is_removed_after_success_and_after_cancellation() {
+        let home = tempfile::tempdir().unwrap();
+        let mut context = utility_context(home.path());
+        context.capabilities = None;
+        let bin = "/nonexistent/codex-owned-home-lifetime";
+        cached_codex_support(bin, || async { Some("codex-cli 0.164.0".into()) }).await;
+        let runtime = CodexRuntime { codex_path: bin.into() };
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None::<std::path::PathBuf>));
+        let seen_in_probe = seen.clone();
+        let probe: CollectProbe = Box::new(move |cmd| {
+            let owned = cmd.as_std().get_envs().find(|(key, _)| *key == "CODEX_HOME")
+                .and_then(|(_, value)| value).unwrap();
+            *seen_in_probe.lock().unwrap() = Some(std::path::PathBuf::from(owned));
+            let mut output = collected_fixture("{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"PASS\"}}\n");
+            output.status = Some(std::process::ExitStatus::default());
+            Ok(output)
+        });
+        let response = MCP_CONFIG_TEST_PATHS.scope(vec![],
+            COLLECT_PROBE.scope(probe, runtime.execute("fixture", &context))).await.unwrap();
+        assert_eq!(response.content, "PASS");
+        let owned = seen.lock().unwrap().take().expect("probe saw the owned home");
+        assert_eq!(owned.parent().unwrap().parent(), Some(owned_home::run_parent(home.path()).as_path()));
+        assert!(!owned.parent().unwrap().exists(), "call directory removed after success");
+        // Cancellation: the call future is dropped while it holds the guard.
+        let parent = owned_home::run_parent(home.path());
+        let listed = |dir: &std::path::Path| std::fs::read_dir(dir).unwrap()
+            .filter_map(|e| e.ok()).map(|e| e.path()).collect::<Vec<_>>();
+        let (sender, receiver) = tokio::sync::oneshot::channel::<std::path::PathBuf>();
+        let task = tokio::spawn({
+            let home = home.path().to_path_buf();
+            async move {
+                let dir = owned_home::OwnedCallDir::create(&home, owned_home::CALL_PREFIX).unwrap();
+                prepare_owned_codex_home_with_auth(dir.path(), None).unwrap();
+                sender.send(dir.path().to_path_buf()).unwrap();
+                std::future::pending::<()>().await;
+                drop(dir);
+            }
+        });
+        let path = receiver.await.unwrap();
+        assert_eq!(listed(&parent), vec![path.clone()]);
+        task.abort();
+        let _ = task.await;
+        assert!(listed(&parent).is_empty(), "cancelled call left nothing behind");
+    }
+
+    /// H1 item 1: with the gateway's own data directory outside the temp
+    /// directory (the installed layout), the owned-home parent is outside
+    /// every write root the employee profile grants, and item 2: the profile
+    /// explicitly marks it and the host credential store read-only, which
+    /// keeps it unwritable even when an overridden working root contains it.
+    #[cfg(unix)]
+    #[test]
+    fn owned_home_parent_is_outside_every_profile_write_root_and_marked_read_only() {
+        let home = std::path::Path::new("/Users/operator/.duduclaw");
+        let agent = home.join("agents/worker");
+        let host_store = std::path::PathBuf::from("/Users/operator/.codex");
+        let parent = owned_home::run_parent(home);
+        let private = vec![parent.clone(), host_store.clone()];
+        for work_root in [agent.clone(), home.to_path_buf(), std::path::PathBuf::from("/Users/operator")] {
+            let args = employee_permission_args(&agent, Some(work_root.as_path()), &private).unwrap();
+            let (_, value) = args.last().unwrap().split_once('=').unwrap();
+            let parsed: toml::Value = format!("value={value}").parse().unwrap();
+            let fs = parsed["value"].as_table().unwrap();
+            for root in &private {
+                assert_eq!(fs[root.to_str().unwrap()].as_str(), Some("read"), "{root:?}");
+            }
+            // Every write grant of the profile, resolved.
+            let mut write_roots = Vec::new();
+            for (key, access) in fs {
+                match (key.as_str(), access) {
+                    (":tmpdir", a) if a.as_str() == Some("write") => {
+                        write_roots.push(std::env::temp_dir());
+                        if let Ok(c) = std::fs::canonicalize(std::env::temp_dir()) { write_roots.push(c); }
+                    }
+                    (":project_roots", toml::Value::Table(t)) => {
+                        assert_eq!(t.len(), 1);
+                        assert_eq!(t["."].as_str(), Some("write"));
+                        // `.` is the spawn's working root. An overridden root that
+                        // contains the parent is covered by the explicit "read"
+                        // entry asserted above (the more specific path wins, as
+                        // for the control files).
+                        if work_root == agent { write_roots.push(work_root.clone()); }
+                    }
+                    (path, a) if a.as_str() == Some("write") => write_roots.push(path.into()),
+                    (_, a) => assert_eq!(a.as_str(), Some("read"), "{key}"),
+                }
+            }
+            assert!(write_roots.contains(&std::path::PathBuf::from("/tmp")));
+            for root in &write_roots {
+                assert!(!parent.starts_with(root), "{parent:?} under write root {root:?}");
+            }
+        }
+        // Not absolute / not UTF-8 private roots fail closed.
+        assert!(employee_permission_args(&agent, None, &[std::path::PathBuf::from("run/codex")]).is_err());
+        use std::os::unix::ffi::OsStrExt;
+        let invalid = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(b"/run/\xff"));
+        assert!(employee_permission_args(&agent, None, &[invalid]).is_err());
+    }
+
+    /// H1 items 2–3 on the real employee argv: the protected roots of this
+    /// home are in the profile and tools do not inherit `CODEX_HOME`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn employee_argv_protects_private_roots_and_hides_codex_home_from_tools() {
+        let home = tempfile::tempdir().unwrap();
+        let mut context = utility_context(home.path());
+        context.capabilities = None;
+        let (args, _input) = capture_conversation(&context, "hi").await;
+        assert!(args.windows(2).any(|pair| pair == ["-c", "shell_environment_policy.exclude=[\"CODEX_HOME\"]"]), "{args:?}");
+        let profile = args.iter().find(|a| a.starts_with("permissions.duduclaw-employee.filesystem=")).unwrap();
+        let (_, value) = profile.split_once('=').unwrap();
+        let parsed: toml::Value = format!("value={value}").parse().unwrap();
+        let fs = parsed["value"].as_table().unwrap();
+        let parent = owned_home::run_parent(home.path());
+        assert_eq!(fs[parent.to_str().unwrap()].as_str(), Some("read"));
+        // F4 (b): `<home>/run` itself, literal and canonical.
+        let run = home.path().join("run");
+        assert_eq!(fs[run.to_str().unwrap()].as_str(), Some("read"), "{fs:?}");
+        let canonical = std::fs::canonicalize(&run).unwrap();
+        assert_eq!(fs[canonical.to_str().unwrap()].as_str(), Some("read"), "{fs:?}");
+        if let Some(host) = owned_home::host_codex_home().filter(|h| h.is_absolute()) {
+            assert_eq!(fs[host.to_str().unwrap()].as_str(), Some("read"));
+        }
     }
 
     #[test]
@@ -2757,20 +3190,21 @@ mod tests {
         let root = std::path::Path::new("/agents/parent");
         for mode in [Mode::Ask, Mode::Block] {
             for caps in [None, Some(&full)] {
-                let args = employee_egress_sandbox_args(caps, false, mode, Some(agent), Some(root), true).unwrap();
+                let private = [std::path::PathBuf::from("/home/run/codex")];
+                let args = employee_egress_sandbox_args(caps, false, mode, Some(agent), Some(root), true, &private).unwrap();
                 let mut expected = sandbox_args(None);
-                expected.extend(employee_permission_args(agent, Some(root)).unwrap());
+                expected.extend(employee_permission_args(agent, Some(root), &private).unwrap());
                 expected.extend(egress_network_args(mode));
                 assert_eq!(args, expected);
                 assert!(!args.iter().any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox" || arg == "-s"));
-                assert!(employee_egress_sandbox_args(caps, false, mode, Some(agent), Some(root), false).unwrap_err().contains("0.164.0"));
-                assert!(employee_egress_sandbox_args(caps, false, mode, None, Some(root), true).is_err());
+                assert!(employee_egress_sandbox_args(caps, false, mode, Some(agent), Some(root), false, &[]).unwrap_err().contains("0.164.0"));
+                assert!(employee_egress_sandbox_args(caps, false, mode, None, Some(root), true, &[]).is_err());
             }
-            assert_eq!(employee_egress_sandbox_args(Some(&read_only), false, mode, None, None, false).unwrap(), egress_sandbox_args(Some(&read_only), false, mode));
-            assert_eq!(employee_egress_sandbox_args(Some(&full), true, mode, None, None, false).unwrap(), egress_sandbox_args(Some(&full), true, mode));
+            assert_eq!(employee_egress_sandbox_args(Some(&read_only), false, mode, None, None, false, &[]).unwrap(), egress_sandbox_args(Some(&read_only), false, mode));
+            assert_eq!(employee_egress_sandbox_args(Some(&full), true, mode, None, None, false, &[]).unwrap(), egress_sandbox_args(Some(&full), true, mode));
         }
         for mode in [Mode::Off, Mode::Shadow] {
-            assert_eq!(employee_egress_sandbox_args(Some(&full), false, mode, None, None, false).unwrap(), sandbox_args(Some(&full)));
+            assert_eq!(employee_egress_sandbox_args(Some(&full), false, mode, None, None, false, &[]).unwrap(), sandbox_args(Some(&full)));
         }
     }
 
@@ -3052,12 +3486,14 @@ mod tests {
 
     #[test]
     fn no_output_schema_means_no_flag() {
-        let (args, file) = output_schema_args(None);
+        let home = tempfile::tempdir().unwrap();
+        let call = owned_home::OwnedCallDir::create(home.path(), owned_home::CALL_PREFIX).unwrap();
+        let args = output_schema_args(None, call.path());
         assert!(
             args.is_empty(),
             "argv must be byte-identical without a schema"
         );
-        assert!(file.is_none());
+        assert!(!call.path().join(OUTPUT_SCHEMA_FILE).exists());
     }
 
     #[test]
@@ -3067,16 +3503,51 @@ mod tests {
             "properties": { "decision": { "type": "string", "enum": ["continue"] } },
             "required": ["decision"],
         });
-        let (args, file) = output_schema_args(Some(&schema));
+        let home = tempfile::tempdir().unwrap();
+        let call = owned_home::OwnedCallDir::create(home.path(), owned_home::CALL_PREFIX).unwrap();
+        let args = output_schema_args(Some(&schema), call.path());
         assert_eq!(args.len(), 2);
         assert_eq!(args[0], "--output-schema");
-        // The temp file is returned, not dropped — dropping it here would
-        // delete the schema before codex ever opened it.
-        let handle = file.expect("the schema file must outlive this call");
-        assert_eq!(handle.path().to_string_lossy(), args[1]);
         let written: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&args[1]).unwrap()).unwrap();
         assert_eq!(written, schema, "the file must carry the schema verbatim");
+    }
+
+    /// F1 (v1.84 security re-review): the schema is created inside the
+    /// call's private directory — never in the shared system temp directory
+    /// an employee's tools may write — owner-only, and removed with the call
+    /// directory.
+    #[test]
+    fn output_schema_file_lives_in_the_call_directory_not_the_temp_dir() {
+        let home = tempfile::tempdir().unwrap();
+        let call = owned_home::OwnedCallDir::create(home.path(), owned_home::UTILITY_PREFIX).unwrap();
+        let args = output_schema_args(Some(&serde_json::json!({"type": "object"})), call.path());
+        let path = std::path::PathBuf::from(&args[1]);
+        assert_eq!(path.parent(), Some(call.path()), "{path:?}");
+        assert!(path.starts_with(owned_home::run_parent(home.path())));
+        let temp = std::env::temp_dir();
+        let temp_canonical = std::fs::canonicalize(&temp).unwrap_or(temp.clone());
+        // The fixture home itself is a temp directory, so "not under the temp
+        // dir" means: not a direct child of it, the old `duduclaw-codex-schema-*` spot.
+        for temp in [&temp, &temp_canonical] {
+            assert_ne!(path.parent(), Some(temp.as_path()), "{path:?}");
+            assert_ne!(std::fs::canonicalize(&path).unwrap().parent(), Some(temp.as_path()), "{path:?}");
+        }
+        assert!(!path.file_name().unwrap().to_str().unwrap().starts_with("duduclaw-codex-schema-"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::symlink_metadata(&path).unwrap();
+            assert!(meta.file_type().is_file());
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        }
+        // An entry already there (a planted file or link) is never reused.
+        let again = output_schema_args(Some(&serde_json::json!({"type": "string"})), call.path());
+        assert!(again.is_empty(), "create_new refuses an existing entry");
+        let written: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written, serde_json::json!({"type": "object"}));
+        drop(call);
+        assert!(!path.exists(), "removed with the call directory");
     }
 
     /// The flag has to coexist with the rest of the 0.156.1 argv — it is added
@@ -3085,7 +3556,9 @@ mod tests {
     #[test]
     fn output_schema_composes_with_the_sandbox_and_effort_flags() {
         let schema = serde_json::json!({"type": "object"});
-        let (schema_args, _file) = output_schema_args(Some(&schema));
+        let home = tempfile::tempdir().unwrap();
+        let call = owned_home::OwnedCallDir::create(home.path(), owned_home::CALL_PREFIX).unwrap();
+        let schema_args = output_schema_args(Some(&schema), call.path());
         let mut argv: Vec<String> = vec![
             "exec".into(),
             "--json".into(),
@@ -3833,9 +4306,9 @@ mod tests {
     #[test]
     fn employee_permissions_lock_every_control_path_with_valid_toml() {
         let dir = std::path::Path::new("/agents/space and \"quote員工");
-        let args = employee_sandbox_args(None, false, Some(dir), Some(dir), true).unwrap();
+        let args = employee_sandbox_args(None, false, Some(dir), Some(dir), true, &[]).unwrap();
         let mut expected = sandbox_args(None);
-        expected.extend(employee_permission_args(dir, Some(dir)).unwrap());
+        expected.extend(employee_permission_args(dir, Some(dir), &[]).unwrap());
         assert_eq!(args, expected);
         assert_eq!(args.len(), sandbox_args(None).len() + 4);
         let overrides = &args[sandbox_args(None).len()..];
@@ -3870,7 +4343,7 @@ mod tests {
         let dir = home.path().join("employee");
         std::fs::create_dir(&dir).unwrap();
         for path in ["IDENTITY.md", "USER.md"] { assert!(!dir.join(path).exists()); }
-        let args = employee_permission_args(&dir, None).unwrap();
+        let args = employee_permission_args(&dir, None, &[]).unwrap();
         let (_, value) = args.last().unwrap().split_once('=').unwrap();
         let parsed: toml::Value = format!("value={value}").parse().unwrap();
         for path in ["IDENTITY.md", "USER.md"] {
@@ -3884,7 +4357,7 @@ mod tests {
     fn employee_permissions_protect_the_member_and_parent_work_root() {
         let agent = std::path::Path::new("/agents/member");
         let root = std::path::Path::new("/agents/parent");
-        let args = employee_sandbox_args(None, false, Some(agent), Some(root), true).unwrap();
+        let args = employee_sandbox_args(None, false, Some(agent), Some(root), true, &[]).unwrap();
         let (_, value) = args.last().unwrap().split_once('=').unwrap();
         let parsed: toml::Value = format!("value={value}").parse().unwrap();
         let fs = parsed["value"].as_table().unwrap();
@@ -3897,11 +4370,11 @@ mod tests {
                 assert!(!fs.contains_key(dir.join(writable).to_str().unwrap()));
             }
         }
-        assert!(employee_sandbox_args(None, false, Some(agent), Some(std::path::Path::new("relative/root")), true).is_err());
+        assert!(employee_sandbox_args(None, false, Some(agent), Some(std::path::Path::new("relative/root")), true, &[]).is_err());
         use std::os::unix::ffi::OsStrExt;
         let invalid = std::path::Path::new(std::ffi::OsStr::from_bytes(b"/agents/\xff"));
-        assert!(employee_permission_args(agent, Some(invalid)).is_err());
-        assert!(employee_permission_args(invalid, Some(root)).is_err());
+        assert!(employee_permission_args(agent, Some(invalid), &[]).is_err());
+        assert!(employee_permission_args(invalid, Some(root), &[]).is_err());
     }
 
     #[cfg(unix)]
@@ -3913,10 +4386,10 @@ mod tests {
         let full_access = CapabilitiesConfig { computer_use: true, ..Default::default() };
         assert_eq!(sandbox_level_for(Some(&read_only)), duduclaw_core::types::SandboxLevel::ReadOnly);
         for caps in [Some(&read_only), Some(&full_access)] {
-            assert_eq!(employee_sandbox_args(caps, false, None, None, false).unwrap(), sandbox_args(caps));
+            assert_eq!(employee_sandbox_args(caps, false, None, None, false, &[]).unwrap(), sandbox_args(caps));
         }
         for caps in [None, Some(&read_only), Some(&full_access)] {
-            assert_eq!(employee_sandbox_args(caps, true, None, None, false).unwrap(), sandbox_args_for(caps, true));
+            assert_eq!(employee_sandbox_args(caps, true, None, None, false, &[]).unwrap(), sandbox_args_for(caps, true));
         }
     }
 
@@ -3928,17 +4401,17 @@ mod tests {
             ("unparseable", false)] {
             let supported = version_supports_employee_permissions(version);
             assert_eq!(supported, accepted);
-            let result = employee_sandbox_args(None, false, Some(std::path::Path::new("/private/agent")), None, supported);
+            let result = employee_sandbox_args(None, false, Some(std::path::Path::new("/private/agent")), None, supported, &[]);
             assert_eq!(result.is_ok(), accepted);
             if let Err(error) = result {
                 assert!(error.contains("Codex CLI 0.164.0"));
                 assert!(!error.contains("/private/agent"));
             }
         }
-        let error = employee_sandbox_args(None, false, None, None, true).unwrap_err();
+        let error = employee_sandbox_args(None, false, None, None, true, &[]).unwrap_err();
         assert!(error.contains("no agent directory"));
         assert!(error.contains("refusing to spawn"));
-        assert!(employee_permission_args(std::path::Path::new("relative/agent"), None).is_err());
+        assert!(employee_permission_args(std::path::Path::new("relative/agent"), None, &[]).is_err());
     }
 
     #[cfg(unix)]
@@ -3948,9 +4421,9 @@ mod tests {
         assert!(cached_env_vars_support(bin, || async { Some("codex-cli 0.164.0".into()) }).await);
         assert!(cached_codex_support(bin, || async { panic!("version probe repeated") }).await.employee_permissions);
         assert!(!codex_supports_employee_permissions("/nonexistent/codex-employee-permissions-failed-test").await);
-        let error = employee_sandbox_args(None, false, Some(std::path::Path::new("/agent")), None, false).unwrap_err();
+        let error = employee_sandbox_args(None, false, Some(std::path::Path::new("/agent")), None, false, &[]).unwrap_err();
         assert!(error.contains("Codex CLI 0.164.0"));
-        let error = employee_sandbox_args(None, false, None, None, true).unwrap_err();
+        let error = employee_sandbox_args(None, false, None, None, true, &[]).unwrap_err();
         assert!(error.contains("no agent directory"));
     }
 

@@ -43,6 +43,7 @@ async fn in_turn<F: std::future::Future>(home: &Path, reply: Option<&str>, futur
     let _requester = duduclaw_gateway::knowledge::turn_requesters::register("sales", &turn,
         duduclaw_knowledge::requester::RequesterIdentity::ChannelUser {
             channel: "googlechat".into(), chat: "spaces/ORIGIN".into(), sender: SENDER.into(), user_id: Some(user),
+            attested_private: false,
         });
     let context = RequestContext::from_verified_record(CapabilityRecord {
         id: CapabilityId(Sha256Digest([1; 32])), employee: EmployeeId([2; 16]), run: RunId([3; 16]),

@@ -982,6 +982,13 @@ fn store_pending(session_id: &str, agent_id: &str, description: &str, ttl_minute
         .insert(session_id.to_string(), entry);
 }
 
+/// Test hook: leave a live goal suggestion for `session_id`, as a previous
+/// turn's [`finalize`] would.
+#[cfg(test)]
+pub(crate) fn store_pending_for_test(session_id: &str, agent_id: &str, description: &str) {
+    store_pending(session_id, agent_id, description, 10);
+}
+
 fn take_pending(session_id: &str) -> Option<PendingSuggest> {
     pending_store()
         .lock()

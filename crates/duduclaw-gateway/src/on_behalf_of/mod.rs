@@ -121,6 +121,7 @@ pub fn principal_for_requester(home: &Path, who: &RequesterIdentity) -> Option<S
             chat,
             sender,
             user_id: None,
+            ..
         } => {
             // Public visitors carry no sender; their conversation id names
             // them instead.

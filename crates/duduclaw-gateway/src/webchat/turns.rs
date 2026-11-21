@@ -19,6 +19,8 @@ pub(super) use identity::IdentityUnavailable;
 mod tests;
 #[cfg(test)]
 mod no_responder_tests;
+#[cfg(test)]
+mod injection_block_tests;
 pub(super) use run::TurnInput;
 
 tokio::task_local! {
@@ -419,7 +421,7 @@ pub(super) fn configured_limit(home: &std::path::Path) -> usize {
     configured_bound(home, "max_in_flight_turns", 3)
 }
 
-pub(super) fn configured_global_limit(home: &std::path::Path) -> usize {
+pub(crate) fn configured_global_limit(home: &std::path::Path) -> usize {
     configured_bound(home, "max_global_turns", 10)
 }
 

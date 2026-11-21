@@ -11,20 +11,36 @@
 //! object**, never on the homepage — a link that drops someone on the
 //! homepage is a failed handoff.
 //!
-//! ## Base URL resolution (in priority order)
+//! ## Two resolvers — pick by who reads the link
 //!
-//! 1. `config.toml [dashboard] public_url` — an operator-declared externally
-//!    reachable address (reverse proxy, tailnet hostname, custom domain).
-//! 2. `config.toml [gateway] port` — falls back to `http://localhost:<port>`,
-//!    which is only correct when the channel recipient is on the same machine
-//!    as the gateway, but is still strictly better than no link at all for the
-//!    common single-operator deployment. `[gateway] port` is written by
-//!    `duduclaw_core::write_minimal_config` on first boot (`config.rs`) so it
-//!    is present on every install that has ever started via `duduclaw run`.
-//! 3. Neither present/parseable → `None`. Callers MUST treat `None` as "keep
-//!    the current plain-text behavior unchanged" — never emit a dangling or
-//!    empty URL (project convention: security/UX gates fail closed, and here
-//!    that means fail-quiet rather than fail-ugly).
+//! **Links in a message delivered to a chat channel** (approvals, goal
+//! notices including kickoff / observer / progress, install notices,
+//! digests, budget / cost / channel alerts, reply-failure notices,
+//! computer-watch links, Mini App buttons …) use ONLY
+//! [`public_dashboard_base_url`] / [`public_deep_link`]:
+//!
+//! 1. `config.toml [dashboard] public_url`, else `[general] public_url`, else
+//!    `[gateway] public_url` — **first valid wins**. Valid
+//!    ([`channel_link_base`]): scheme `https` or `http` (plain http is
+//!    allowed: on-premises installs are commonly reached by a LAN address),
+//!    a host that is not `localhost` (any case, with or without a trailing
+//!    dot, or a `*.localhost` name) nor a loopback / unspecified IP, and no
+//!    user info, query or fragment. Anything else (`javascript:`, `data:`,
+//!    `file:`, a bare host name …) is skipped with one warning log and the
+//!    next section is tried.
+//! 2. None valid and the gateway is containerized → `None`: the message
+//!    carries **no link** and keeps its "open the dashboard" sentence.
+//! 3. None valid on a native host → `http://localhost:<[gateway] port>`
+//!    for single-machine installs. Missing or invalid ports yield `None`.
+//!
+//! **Links shown to a user on the same machine** (the dashboard's own system
+//! status and failure logs) use [`local_dashboard_base_url`]: `[dashboard]
+//! public_url` HTTP(S) values retain their original spelling and components, then
+//! `http://localhost:<[gateway] port>`. It must never be used for a chat
+//! message (a source-level test pins the notification modules).
+//!
+//! OAuth / MCP callback URLs use [`configured_public_base`] (HTTPS-only with
+//! a loopback exception); neither resolver above is used for them.
 //!
 //! ## Object routes
 //!
@@ -75,24 +91,147 @@ pub enum DeepLinkKind {
     Autopilot,
 }
 
-/// Resolve the dashboard's externally-reachable base URL (no trailing slash),
-/// or `None` when neither `[dashboard] public_url` nor `[gateway] port` is
-/// present/parseable in `config.toml`. See module docs for the priority order.
-pub(crate) fn dashboard_base_url(home_dir: &Path) -> Option<String> {
-    let content = std::fs::read_to_string(home_dir.join("config.toml")).ok()?;
-    let table: toml::Table = content.parse().ok()?;
+/// The `config.toml` sections whose `public_url` names the dashboard's
+/// externally reachable address, in priority order. `[dashboard]` is what
+/// the dashboard's settings page writes; `[general]` and `[gateway]` are
+/// accepted as aliases (operators set them by hand, and account invitations
+/// historically read `[gateway]`).
+pub(crate) const PUBLIC_URL_SECTIONS: [&str; 3] = ["dashboard", "general", "gateway"];
 
-    if let Some(url) = table
-        .get("dashboard")
+/// One `public_url` entry as written, in [`PUBLIC_URL_SECTIONS`] order.
+/// Blank strings are omitted; a non-string value is `Err(())`.
+pub(crate) fn public_url_entries(table: &toml::Table) -> Vec<(&'static str, Result<&str, ()>)> {
+    PUBLIC_URL_SECTIONS
+        .iter()
+        .filter_map(|section| {
+            let value = table.get(*section)?.as_table()?.get("public_url")?;
+            match value.as_str() {
+                Some(raw) if raw.trim().is_empty() => None,
+                Some(raw) => Some((*section, Ok(raw.trim()))),
+                None => Some((*section, Err(()))),
+            }
+        })
+        .collect()
+}
+
+/// A plain `http(s)://host[:port][/prefix]` base: no user info (not even an
+/// empty `@`), query or fragment, no whitespace / control characters or
+/// backslashes. Returns the parsed URL; the host is not judged here.
+fn plain_http_base(raw: &str) -> Option<url::Url> {
+    let raw = raw.trim();
+    if raw.is_empty()
+        || raw.chars().any(|c| c.is_control() || c.is_whitespace())
+        || raw.contains('\\')
+    {
+        return None;
+    }
+    // `scheme://` must be written out (`http:host` is not accepted), and an
+    // `@` in the authority is user info even when the parser drops it.
+    let (_, rest) = raw.split_once("://")?;
+    let authority_end = rest.find(|c| matches!(c, '/' | '?' | '#')).unwrap_or(rest.len());
+    if rest[..authority_end].contains('@') {
+        return None;
+    }
+    let url = url::Url::parse(raw).ok()?;
+    (matches!(url.scheme(), "http" | "https")
+        && url.host().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none())
+    .then_some(url)
+}
+
+/// Whether `host` can be reached by someone who is not on the gateway's own
+/// machine: not `localhost` / `*.localhost` (any case, trailing dot or not),
+/// not a loopback or unspecified IPv4 / IPv6 address (IPv4-mapped included).
+fn host_is_off_machine(host: url::Host<&str>) -> bool {
+    match host {
+        url::Host::Domain(name) => {
+            let name = name.trim_end_matches('.').to_ascii_lowercase();
+            !name.is_empty() && name != "localhost" && !name.ends_with(".localhost")
+        }
+        url::Host::Ipv4(ip) => !ip.is_loopback() && !ip.is_unspecified(),
+        url::Host::Ipv6(ip) => {
+            !ip.is_loopback()
+                && !ip.is_unspecified()
+                && ip.to_ipv4().is_none_or(|v4| !v4.is_loopback() && !v4.is_unspecified())
+        }
+    }
+}
+
+/// The base (no trailing slash, path prefix kept) a configured `public_url`
+/// gives a link that is put into a **chat-channel message**, or `None` when
+/// the value is not acceptable there: see the module docs (`http`/`https`
+/// only, an off-machine host, no user info / query / fragment).
+pub(crate) fn channel_link_base(raw: &str) -> Option<String> {
+    let url = plain_http_base(raw)?;
+    if !host_is_off_machine(url.host()?) {
+        return None;
+    }
+    Some(url.as_str().trim_end_matches('/').to_string())
+}
+
+/// Preserve legacy diagnostic HTTP(S) output, rejecting dangerous schemes.
+/// Chat-channel validation remains exclusively in [`channel_link_base`].
+fn local_link_base(raw: &str) -> Option<String> {
+    let (scheme, _) = raw.split_once("://")?;
+    (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+        .then(|| raw.trim_end_matches('/').to_string())
+}
+
+/// The first `public_url` (in [`PUBLIC_URL_SECTIONS`] order) that `accept`
+/// takes. A present but rejected value is skipped; with `warn`, it is logged
+/// once per section per process (never the value: it may hold credentials).
+fn first_valid_public_url(
+    table: &toml::Table,
+    accept: fn(&str) -> Option<String>,
+    warn: bool,
+) -> Option<String> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: [AtomicBool; 3] =
+        [AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false)];
+    for (section, value) in public_url_entries(table) {
+        if let Some(base) = value.ok().and_then(accept) {
+            return Some(base);
+        }
+        let index = PUBLIC_URL_SECTIONS.iter().position(|s| *s == section).unwrap_or(0);
+        if warn && !WARNED[index].swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                section,
+                "public_url is not usable in a chat-channel link (needs http(s), a host other than localhost/loopback, no user name, query or fragment); trying the next section"
+            );
+        }
+    }
+    None
+}
+
+fn read_config_table(home_dir: &Path) -> Option<toml::Table> {
+    let content = std::fs::read_to_string(home_dir.join("config.toml")).ok()?;
+    content.parse().ok()
+}
+
+/// **For a link shown on the gateway's own machine only** (the dashboard's
+/// system status and failure logs). For chat-channel messages, use
+/// [`public_dashboard_base_url`] instead.
+///
+/// The legacy `[dashboard] public_url` when HTTP(S), preserving
+/// legacy diagnostic output (including loopback and URL components), else
+/// `http://localhost:<[gateway] port>`, else `None`. No trailing slash.
+pub(crate) fn local_dashboard_base_url(home_dir: &Path) -> Option<String> {
+    let table = read_config_table(home_dir)?;
+    if let Some(url) = table.get("dashboard")
         .and_then(|v| v.as_table())
         .and_then(|d| d.get("public_url"))
         .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
+        .and_then(|raw| local_link_base(raw.trim()))
     {
-        return Some(url.trim_end_matches('/').to_string());
+        return Some(url);
     }
+    localhost_base(&table)
+}
 
+fn localhost_base(table: &toml::Table) -> Option<String> {
     let port = table
         .get("gateway")
         .and_then(|v| v.as_table())
@@ -102,6 +241,32 @@ pub(crate) fn dashboard_base_url(home_dir: &Path) -> Option<String> {
         return None;
     }
     Some(format!("http://localhost:{port}"))
+}
+
+/// **The one resolver for every link put into a message delivered to a chat
+/// channel.** The first `public_url` in [`PUBLIC_URL_SECTIONS`] order that
+/// [`channel_link_base`] accepts (no trailing slash, path prefix kept); an
+/// invalid higher-priority value is skipped with a one-time warning. With no
+/// valid public URL, containers get `None`; native hosts fall back to
+/// `http://localhost:<[gateway] port>` when the port is valid. `None` = no
+/// link; the caller keeps its "open the dashboard" sentence without one.
+pub(crate) fn public_dashboard_base_url(home_dir: &Path) -> Option<String> {
+    public_dashboard_base_url_with_container(home_dir, duduclaw_core::ns_guard::is_containerized)
+}
+
+fn public_dashboard_base_url_with_container(
+    home_dir: &Path,
+    is_containerized: impl FnOnce() -> bool,
+) -> Option<String> {
+    let table = read_config_table(home_dir)?;
+    first_valid_public_url(&table, channel_link_base, true)
+        .or_else(|| if is_containerized() { None } else { localhost_base(&table) })
+}
+
+/// A diagnostic deep link for dashboard-side failure logs; preserves the
+/// legacy local resolver independently of the chat recipient's environment.
+pub(crate) fn local_dashboard_deep_link(home_dir: &Path, kind: DeepLinkKind, id: &str) -> Option<String> {
+    with_route(local_dashboard_base_url(home_dir)?, kind, id)
 }
 
 /// Why [`dashboard_public_base`] refused to produce a base. Both variants fail
@@ -241,12 +406,17 @@ pub(crate) fn valid_oauth_public_base(raw: &str) -> Option<(String, String)> {
     Some((url.origin().ascii_serialization(), url.as_str().trim_end_matches('/').into()))
 }
 
-/// Build a full, clickable deep link landing on the page that shows `id`, or
-/// `None` when no dashboard base URL is resolvable — callers must keep their
-/// existing link-less text unchanged in that case, never emit
-/// an empty/dangling link.
-pub fn deep_link(home_dir: &Path, kind: DeepLinkKind, id: &str) -> Option<String> {
-    let base = dashboard_base_url(home_dir)?;
+/// A full, clickable deep link for a **chat-channel message**, landing on the
+/// page that shows `id`, built on [`public_dashboard_base_url`]: a valid
+/// configured public URL in either environment, otherwise no link in a
+/// container or a localhost link with the configured gateway port on a native
+/// host. Callers keep their link-less text when no base is resolvable.
+pub fn public_deep_link(home_dir: &Path, kind: DeepLinkKind, id: &str) -> Option<String> {
+    let base = public_dashboard_base_url(home_dir)?;
+    with_route(base, kind, id)
+}
+
+fn with_route(base: String, kind: DeepLinkKind, id: &str) -> Option<String> {
     let path: String = match kind {
         DeepLinkKind::ComputerSession => {
             if !duduclaw_core::is_valid_agent_id(id) { return None; }
@@ -373,44 +543,87 @@ mod tests {
         }
     }
 
+    fn chat_base(home: &Path, containerized: bool) -> Option<String> {
+        public_dashboard_base_url_with_container(home, || containerized)
+    }
+
+    fn chat_link(home: &Path, kind: DeepLinkKind, id: &str, containerized: bool) -> Option<String> {
+        with_route(chat_base(home, containerized)?, kind, id)
+    }
+
+    /// A config with a valid public address and the usual gateway port.
+    const PUBLIC: &str = "[dashboard]\npublic_url = \"https://ai.example.com/\"\n\n[gateway]\nport = 18889\n";
+
     #[test]
-    fn base_url_prefers_public_url_over_port() {
+    fn local_base_prefers_public_url_over_port() {
         let dir = tempfile::tempdir().unwrap();
-        write_config(
-            dir.path(),
-            "[dashboard]\npublic_url = \"https://ai.example.com/\"\n\n[gateway]\nport = 18889\n",
-        );
+        write_config(dir.path(), PUBLIC);
         assert_eq!(
-            dashboard_base_url(dir.path()),
+            local_dashboard_base_url(dir.path()),
             Some("https://ai.example.com".to_string()),
             "trailing slash must be trimmed"
         );
     }
 
     #[test]
-    fn base_url_falls_back_to_localhost_port() {
+    fn local_base_falls_back_to_localhost_port() {
         let dir = tempfile::tempdir().unwrap();
         write_config(
             dir.path(),
             "[gateway]\nbind = \"127.0.0.1\"\nport = 18889\n",
         );
         assert_eq!(
-            dashboard_base_url(dir.path()),
+            local_dashboard_base_url(dir.path()),
             Some("http://localhost:18889".to_string())
         );
+        // A loopback public_url is fine for a same-machine link.
+        write_config(dir.path(), "[dashboard]\npublic_url = \"http://127.0.0.1:18889/\"\n");
+        assert_eq!(local_dashboard_base_url(dir.path()).as_deref(), Some("http://127.0.0.1:18889"));
+    }
+
+    #[test]
+    fn local_base_rejects_dangerous_schemes() {
+        let dir = tempfile::tempdir().unwrap();
+        for bad in ["javascript:alert(1)", "ai.example.com", "data:text/html,x", "file:///etc/passwd", "ftp://x.example"] {
+            write_config(dir.path(), &format!("[dashboard]\npublic_url = {bad:?}\n[gateway]\nport = 18889\n"));
+            assert_eq!(local_dashboard_base_url(dir.path()).as_deref(), Some("http://localhost:18889"), "{bad}");
+        }
+    }
+
+    #[test]
+    fn local_diagnostic_links_preserve_legacy_http_output() {
+        let dir = tempfile::tempdir().unwrap();
+        for raw in [
+            "http://localhost:9999/", "http://127.0.0.1:9999/base/",
+            "https://u:p@x.example/base?x=1#frag", "https://x.example:443/base/",
+        ] {
+            write_config(dir.path(), &format!("[dashboard]\npublic_url = {raw:?}\n[gateway]\nport = 9999\n"));
+            let base = raw.trim_end_matches('/');
+            assert_eq!(local_dashboard_base_url(dir.path()).as_deref(), Some(base));
+            for kind in [DeepLinkKind::Billing, DeepLinkKind::System] {
+                let route = if kind == DeepLinkKind::Billing { "/manage/billing" } else { "/manage/logs" };
+                assert_eq!(local_dashboard_deep_link(dir.path(), kind, ""), Some(format!("{base}{route}")));
+            }
+        }
+        write_config(dir.path(), "[general]\npublic_url = \"https://general.example\"\n[gateway]\npublic_url = \"https://gw.example\"\nport = 9999\n");
+        assert_eq!(local_dashboard_base_url(dir.path()).as_deref(), Some("http://localhost:9999"));
+        write_config(dir.path(), "[dashboard]\npublic_url = \"javascript:alert(1)\"\n[gateway]\nport = 9999\n");
+        assert_eq!(local_dashboard_deep_link(dir.path(), DeepLinkKind::System, "").as_deref(), Some("http://localhost:9999/manage/logs"));
     }
 
     #[test]
     fn base_url_none_when_config_missing() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(dashboard_base_url(dir.path()), None);
+        assert_eq!(local_dashboard_base_url(dir.path()), None);
+        assert_eq!(public_dashboard_base_url(dir.path()), None);
     }
 
     #[test]
     fn base_url_none_when_neither_section_present() {
         let dir = tempfile::tempdir().unwrap();
         write_config(dir.path(), "[general]\nlog_level = \"info\"\n");
-        assert_eq!(dashboard_base_url(dir.path()), None);
+        assert_eq!(local_dashboard_base_url(dir.path()), None);
+        assert_eq!(public_dashboard_base_url(dir.path()), None);
     }
 
     #[test]
@@ -421,86 +634,292 @@ mod tests {
             "[dashboard]\npublic_url = \"   \"\n\n[gateway]\nport = 9999\n",
         );
         assert_eq!(
-            dashboard_base_url(dir.path()),
+            local_dashboard_base_url(dir.path()),
             Some("http://localhost:9999".to_string())
         );
+        assert_eq!(chat_base(dir.path(), true), None);
+        assert_eq!(chat_base(dir.path(), false).as_deref(), Some("http://localhost:9999"));
     }
 
     #[test]
     fn base_url_none_on_out_of_range_port() {
         let dir = tempfile::tempdir().unwrap();
         write_config(dir.path(), "[gateway]\nport = 0\n");
-        assert_eq!(dashboard_base_url(dir.path()), None);
+        assert_eq!(local_dashboard_base_url(dir.path()), None);
         let dir2 = tempfile::tempdir().unwrap();
         write_config(dir2.path(), "[gateway]\nport = 70000\n");
-        assert_eq!(dashboard_base_url(dir2.path()), None);
+        assert_eq!(local_dashboard_base_url(dir2.path()), None);
     }
 
     #[test]
     fn base_url_none_on_malformed_toml() {
         let dir = tempfile::tempdir().unwrap();
         write_config(dir.path(), "this is not [ valid toml");
-        assert_eq!(dashboard_base_url(dir.path()), None);
+        assert_eq!(local_dashboard_base_url(dir.path()), None);
+        assert_eq!(public_dashboard_base_url(dir.path()), None);
     }
 
     #[test]
     fn deep_link_task_lands_on_the_task_detail_route() {
         let dir = tempfile::tempdir().unwrap();
-        write_config(dir.path(), "[gateway]\nport = 18889\n");
+        write_config(dir.path(), PUBLIC);
         assert_eq!(
-            deep_link(dir.path(), DeepLinkKind::Task, "abc123"),
-            Some("http://localhost:18889/tasks/abc123".to_string())
+            public_deep_link(dir.path(), DeepLinkKind::Task, "abc123"),
+            Some("https://ai.example.com/tasks/abc123".to_string())
         );
     }
 
     #[test]
     fn deep_link_approval_lands_on_inbox_with_item_query() {
         let dir = tempfile::tempdir().unwrap();
-        write_config(dir.path(), "[gateway]\nport = 18889\n");
+        write_config(dir.path(), PUBLIC);
         assert_eq!(
-            deep_link(dir.path(), DeepLinkKind::Approval, "ap-1"),
-            Some("http://localhost:18889/inbox?item=ap-1".to_string())
+            public_deep_link(dir.path(), DeepLinkKind::Approval, "ap-1"),
+            Some("https://ai.example.com/inbox?item=ap-1".to_string())
         );
     }
 
     #[test]
     fn deep_link_channels_and_billing_land_on_manage_subpages() {
         let dir = tempfile::tempdir().unwrap();
-        write_config(dir.path(), "[gateway]\nport = 18889\n");
+        write_config(dir.path(), PUBLIC);
         assert_eq!(
-            deep_link(dir.path(), DeepLinkKind::Channels, ""),
-            Some("http://localhost:18889/manage/channels".to_string())
+            public_deep_link(dir.path(), DeepLinkKind::Channels, ""),
+            Some("https://ai.example.com/manage/channels".to_string())
         );
         assert_eq!(
-            deep_link(dir.path(), DeepLinkKind::Billing, ""),
-            Some("http://localhost:18889/manage/billing".to_string())
+            public_deep_link(dir.path(), DeepLinkKind::Billing, ""),
+            Some("https://ai.example.com/manage/billing".to_string())
         );
     }
 
     #[test]
     fn deep_link_system_lands_on_manage_logs() {
         let dir = tempfile::tempdir().unwrap();
-        write_config(dir.path(), "[gateway]\nport = 18889\n");
+        write_config(dir.path(), PUBLIC);
         assert_eq!(
-            deep_link(dir.path(), DeepLinkKind::System, ""),
-            Some("http://localhost:18889/manage/logs".to_string())
+            public_deep_link(dir.path(), DeepLinkKind::System, ""),
+            Some("https://ai.example.com/manage/logs".to_string())
         );
     }
 
     #[test]
     fn deep_link_autopilot_lands_on_the_autopilot_settings_tab() {
         let dir = tempfile::tempdir().unwrap();
-        write_config(dir.path(), "[gateway]\nport = 18889\n");
+        write_config(dir.path(), PUBLIC);
         assert_eq!(
-            deep_link(dir.path(), DeepLinkKind::Autopilot, "rule-1"),
-            Some("http://localhost:18889/manage/system?tab=autopilot".to_string())
+            public_deep_link(dir.path(), DeepLinkKind::Autopilot, "rule-1"),
+            Some("https://ai.example.com/manage/system?tab=autopilot".to_string())
         );
     }
 
     #[test]
     fn deep_link_none_when_no_base_url_resolvable() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(deep_link(dir.path(), DeepLinkKind::Task, "abc123"), None);
+        assert_eq!(public_deep_link(dir.path(), DeepLinkKind::Task, "abc123"), None);
+        write_config(dir.path(), "[gateway]\nport = 18889\n");
+        assert_eq!(chat_link(dir.path(), DeepLinkKind::Task, "abc123", true), None);
+        assert_eq!(chat_link(dir.path(), DeepLinkKind::Task, "abc123", false).as_deref(), Some("http://localhost:18889/tasks/abc123"));
+    }
+
+    /// Finding 2 matrix: every rule, for each of the three sections alone.
+    #[test]
+    fn channel_link_base_rules_apply_to_every_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let rejected = [
+            "javascript:alert(1)",
+            "JavaScript:alert(1)",
+            "data:text/html,<b>x</b>",
+            "file:///etc/passwd",
+            "ftp://files.example.com",
+            "ai.example.com",
+            "http:ai.example.com",
+            "http://localhost",
+            "http://localhost:18889",
+            "http://LOCALHOST:18889/",
+            "http://localhost.:18889",
+            "http://app.localhost:18889",
+            "https://localhost/base",
+            "http://127.0.0.1",
+            "http://127.0.0.1:18889/",
+            "http://127.9.8.7",
+            "http://0.0.0.0:18889",
+            "http://[::1]",
+            "http://[::1]:18889/base",
+            "http://[::]:18889",
+            "http://[::ffff:127.0.0.1]:18889",
+            "https://user:secret@example.com/base",
+            "https://user@example.com",
+            "https://@example.com",
+            "https://example.com/base?x=1",
+            "https://example.com/base?",
+            "https://example.com/base#frag",
+            "https://example.com/base#",
+            "https://exa mple.com",
+            "http://127.1/",
+            "http://2130706433/",
+            "http://0x7f.1/",
+            "http://0177.0.0.1/",
+            "http://[::ffff:127.0.0.1]/",
+            "http://0.0.0.0/",
+            "http://[::]/",
+            "http://example.com@localhost/",
+            "http://localhost@example.com/",
+            "http://example.com\\path",
+            "http://example.com/line\nbreak",
+            "http://example.com/line\u{0001}break",
+            "http://localhost./",
+        ];
+        let accepted = [
+            ("http://192.168.1.10:18889", "http://192.168.1.10:18889"),
+            ("http://192.168.1.10:18889/", "http://192.168.1.10:18889"),
+            ("https://example.com/base/", "https://example.com/base"),
+            ("https://example.com/base", "https://example.com/base"),
+            ("https://example.com", "https://example.com"),
+            ("http://dashboard.lan:8080/duduclaw/", "http://dashboard.lan:8080/duduclaw"),
+            ("HTTPS://Example.com", "https://example.com"),
+            ("https://例え.テスト/", "https://xn--r8jz45g.xn--zckzah"),
+            ("https://example.com/a/../b/", "https://example.com/b"),
+        ];
+        for section in PUBLIC_URL_SECTIONS {
+            // Invalid configured values fall through to the environment-specific fallback.
+            let port = if section == "gateway" { "port = 18889\n" } else { "[gateway]\nport = 18889\n" };
+            for bad in rejected {
+                assert_eq!(channel_link_base(bad), None, "{bad}");
+                let value = toml::Value::String(bad.to_string());
+                write_config(dir.path(), &format!("[{section}]\npublic_url = {value}\n{port}"));
+                assert_eq!(chat_base(dir.path(), true), None, "[{section}] {bad}");
+                assert_eq!(chat_link(dir.path(), DeepLinkKind::Task, "t", true), None, "[{section}] {bad}");
+                assert_eq!(chat_base(dir.path(), false).as_deref(), Some("http://localhost:18889"), "[{section}] {bad}");
+                assert_eq!(chat_link(dir.path(), DeepLinkKind::Task, "t", false).as_deref(), Some("http://localhost:18889/tasks/t"), "[{section}] {bad}");
+            }
+            for (good, base) in accepted {
+                write_config(dir.path(), &format!("[{section}]\npublic_url = {good:?}\n{port}"));
+                for containerized in [false, true] {
+                    assert_eq!(chat_base(dir.path(), containerized).as_deref(), Some(base), "[{section}] {good}");
+                    assert_eq!(
+                        chat_link(dir.path(), DeepLinkKind::Task, "t-1", containerized),
+                        Some(format!("{base}/tasks/t-1")),
+                        "[{section}] {good}: the path prefix is preserved"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_invalid_higher_priority_public_url_falls_through_to_a_valid_lower_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases = [
+            ("[dashboard]\npublic_url = \"javascript:alert(1)\"\n[general]\npublic_url = \"https://general.example\"\n", "https://general.example"),
+            ("[dashboard]\npublic_url = \"http://localhost:18889\"\n[gateway]\npublic_url = \"http://192.168.1.10:18889\"\n", "http://192.168.1.10:18889"),
+            ("[dashboard]\npublic_url = \"http://127.0.0.1\"\n[general]\npublic_url = \"https://u:p@x.example\"\n[gateway]\npublic_url = \"https://gw.example/base/\"\n", "https://gw.example/base"),
+            ("[general]\npublic_url = \"http://[::1]\"\n[gateway]\npublic_url = \"https://gw.example\"\n", "https://gw.example"),
+        ];
+        for (config, want) in cases {
+            write_config(dir.path(), config);
+            for containerized in [false, true] {
+                assert_eq!(chat_base(dir.path(), containerized).as_deref(), Some(want), "{config}");
+            }
+        }
+        // Nothing valid anywhere → container suppression or native localhost.
+        write_config(
+            dir.path(),
+            "[dashboard]\npublic_url = \"http://localhost:18889\"\n[general]\npublic_url = \"javascript:alert(1)\"\n[gateway]\npublic_url = \"http://[::1]\"\nport = 18889\n",
+        );
+        assert_eq!(chat_base(dir.path(), true), None);
+        assert_eq!(chat_base(dir.path(), false).as_deref(), Some("http://localhost:18889"));
+    }
+
+    /// The diagnostic resolver never feeds a chat-channel message:
+    /// none of the modules that build channel notifications names it.
+    #[test]
+    fn channel_notification_modules_do_not_use_the_local_resolver() {
+        let sources = [
+            ("approval_notify.rs", include_str!("approval_notify.rs")),
+            ("goal_notify.rs", include_str!("goal_notify.rs")),
+            ("goal_notify_private.rs", include_str!("goal_notify_private.rs")),
+            ("install_notify.rs", include_str!("install_notify.rs")),
+            ("decision_notify.rs", include_str!("decision_notify.rs")),
+            ("notify_push.rs", include_str!("notify_push.rs")),
+            ("notify_digest.rs", include_str!("notify_digest.rs")),
+            ("digest.rs", include_str!("digest.rs")),
+            ("autopilot_approval.rs", include_str!("autopilot_approval.rs")),
+            ("autopilot_notify.rs", include_str!("autopilot_notify.rs")),
+            ("budget.rs", include_str!("budget.rs")),
+            ("cost_anomaly.rs", include_str!("cost_anomaly.rs")),
+            ("channel_alerts.rs", include_str!("channel_alerts.rs")),
+            ("macos_folder_access.rs", include_str!("macos_folder_access.rs")),
+            ("miniapp.rs", include_str!("miniapp.rs")),
+            ("responsibility/notify.rs", include_str!("responsibility/notify.rs")),
+            ("channel_reply/failure_message.rs", include_str!("channel_reply/failure_message.rs")),
+            ("computer_watch_links/delivery.rs", include_str!("computer_watch_links/delivery.rs")),
+        ];
+        let local_base = ["local_", "dashboard_base_url("].concat();
+        let local_deep = ["local_", "dashboard_deep_link("].concat();
+        for (name, src) in sources {
+            assert!(!src.contains(&local_base), "{name} must use public_dashboard_base_url / public_deep_link");
+            assert!(!src.contains(&local_deep), "{name} must use public_dashboard_base_url / public_deep_link");
+        }
+        // The dashboard status uses the diagnostic resolver directly.
+        let status = include_str!("handlers/system_status.rs");
+        assert!(status.contains(&format!("crate::deep_link::{local_base}")));
+    }
+
+    #[test]
+    fn base_url_reads_public_url_aliases_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases = [
+            (
+                "[dashboard]\npublic_url = \"https://dash.example\"\n[general]\npublic_url = \"https://general.example\"\n[gateway]\npublic_url = \"https://gw.example\"\nport = 18889\n",
+                "https://dash.example",
+            ),
+            (
+                "[dashboard]\npublic_url = \"  \"\n[general]\npublic_url = \"https://general.example/\"\n[gateway]\npublic_url = \"https://gw.example\"\nport = 18889\n",
+                "https://general.example",
+            ),
+            (
+                "[general]\nlog_level = \"info\"\n[gateway]\npublic_url = \"https://gw.example\"\nport = 18889\n",
+                "https://gw.example",
+            ),
+            // A non-string value is skipped like an absent one.
+            (
+                "[dashboard]\npublic_url = 42\n[general]\npublic_url = \"https://general.example\"\n",
+                "https://general.example",
+            ),
+        ];
+        for (config, want) in cases {
+            write_config(dir.path(), config);
+            for containerized in [false, true] {
+                assert_eq!(chat_base(dir.path(), containerized).as_deref(), Some(want), "{config}");
+            }
+        }
+        // A value without a scheme is no longer passed through by either
+        // resolver (it was never a clickable link).
+        write_config(dir.path(), "[dashboard]\npublic_url = \"ai.example.com\"\n");
+        assert_eq!(local_dashboard_base_url(dir.path()), None);
+        assert_eq!(public_dashboard_base_url(dir.path()), None);
+    }
+
+    #[test]
+    fn chat_base_fallback_depends_on_containerization() {
+        let dir = tempfile::tempdir().unwrap();
+        for containerized in [false, true] {
+            assert_eq!(chat_base(dir.path(), containerized), None);
+        }
+        for port in [18889, 9999] {
+            write_config(dir.path(), &format!("[gateway]\nport = {port}\n"));
+            assert_eq!(chat_base(dir.path(), true), None);
+            assert_eq!(chat_link(dir.path(), DeepLinkKind::Task, "t-1", true), None);
+            assert_eq!(chat_base(dir.path(), false), Some(format!("http://localhost:{port}")));
+            assert_eq!(chat_link(dir.path(), DeepLinkKind::Task, "t-1", false), Some(format!("http://localhost:{port}/tasks/t-1")));
+        }
+        for config in ["[gateway]\nport = 0\n", "[gateway]\nport = 70000\n", "bad [ toml", "[general]\nlog_level = \"info\"\n"] {
+            write_config(dir.path(), config);
+            for containerized in [false, true] {
+                assert_eq!(chat_base(dir.path(), containerized), None);
+            }
+        }
     }
 
     #[test]
@@ -511,7 +930,7 @@ mod tests {
             "[dashboard]\npublic_url = \"https://ai.example.com\"\n",
         );
         assert_eq!(
-            deep_link(dir.path(), DeepLinkKind::Task, "t-9"),
+            public_deep_link(dir.path(), DeepLinkKind::Task, "t-9"),
             Some("https://ai.example.com/tasks/t-9".to_string())
         );
     }

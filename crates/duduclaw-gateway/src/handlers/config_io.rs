@@ -87,11 +87,13 @@ impl MethodHandler {
     pub(crate) async fn run_doctor_checks(&self) -> Vec<Value> {
         let reg = self.registry.read().await;
         let has_agents = !reg.list().is_empty();
+        let active_agents = reg.list().iter()
+            .filter(|agent| agent.config.agent.status.is_operational()).count();
         let has_key = self.has_api_key().await;
         let config_exists = self.home_dir.join("config.toml").exists();
 
         // The spawning probes run concurrently — worst case the RPC
-        // costs max(docker, grok ping 15s+version 5s, mcp cold-start 10s),
+        // costs max(docker, grok version 5s, mcp cold-start 10s),
         // not the sum. The dashboard passes an extended per-call timeout.
         let (docker, mcp, grok, codex_sandbox) = tokio::join!(
             check_docker(),
@@ -106,6 +108,11 @@ impl MethodHandler {
         // two projections (`can_repair` is dashboard-only).
         let mut checks = crate::os_ops::doctor_base_checks(config_exists, has_agents, has_key, true);
         checks.extend(crate::runtime_readiness::configured_checks(&self.home_dir));
+        checks.push(container_memory_check(
+            duduclaw_core::ns_guard::cgroup_memory_limit(std::path::Path::new("/sys/fs/cgroup")),
+            active_agents,
+            crate::webchat::configured_global_limit(&self.home_dir),
+        ));
         checks.push(json!({
             "name": "skill_default_layers",
             "status": "pass",
@@ -180,41 +187,64 @@ impl MethodHandler {
             }));
         }
 
-        // Grok CLI live probe — only when grok is installed (mirrors the CLI
+        // Grok CLI version probe — only when grok is installed (mirrors the CLI
         // doctor: absence is not a failure, the card is simply omitted).
         if let Some(g) = grok {
             use crate::doctor_probes::GrokProbeOutcome as O;
             let ver = g.version.as_deref().unwrap_or("?");
             let (status, message) = match &g.outcome {
-                O::Ok { stdout_chars } => (
+                O::Ok { .. } => (
                     "pass",
-                    format!("grok -p 活體試跑正常（版本 {ver}，回應 {stdout_chars} 字元）。"),
-                ),
-                O::AuthFailed { stderr_tail } => (
-                    "fail",
-                    format!(
-                        "grok 未登入或憑證失效 — 請在主機執行 `grok login --device-auth`（Docker 部署用 dashboard 的 Grok 登入）。stderr：{stderr_tail}"
-                    ),
+                    format!("Grok CLI 已安裝（版本 {ver}；僅檢查版本，未呼叫模型或驗證登入）。"),
                 ),
                 O::EmptyExit0 => (
                     "warn",
-                    "grok -p 回傳空輸出（exit 0）— headless 管道問題，runtime 會自動以 PTY 重試；若對話持續空回覆請執行 `duduclaw doctor` 取得完整證據包。".to_string(),
+                    "grok --version 未回傳版本資訊。".to_string(),
                 ),
                 O::Failed { exit, stderr_tail } => (
                     "fail",
                     format!(
-                        "grok -p 執行失敗（exit={}）。stderr：{}",
+                        "grok --version 執行失敗（exit={}）。stderr：{}",
                         exit.map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
                         if stderr_tail.is_empty() { "(空)" } else { stderr_tail }
                     ),
                 ),
                 O::SpawnFailed(e) => ("fail", format!("grok 無法啟動：{e}")),
-                O::Timeout => ("warn", "grok -p 15 秒內無回應（逾時）。".to_string()),
+                O::Timeout => ("warn", "grok --version 5 秒內無回應（逾時）。".to_string()),
             };
             checks.push(json!({
                 "name": "grok_cli",
                 "status": status,
                 "message": message,
+                "can_repair": false,
+            }));
+        }
+
+        // v1.84.0: employees whose saved model is a Claude alias their engine
+        // cannot run; the engine's default model was used instead.
+        let substitutions = crate::runtime_config::model_substitution_notices();
+        if !substitutions.is_empty() {
+            let lines: Vec<String> = substitutions
+                .iter()
+                .map(|(agent, notice)| format!("{agent}：{notice}"))
+                .collect();
+            checks.push(json!({
+                "name": "employee_engine_model",
+                "status": "warn",
+                "message": lines.join("\n"),
+                "can_repair": false,
+            }));
+        }
+        let employees: Vec<(String, std::path::PathBuf)> = reg
+            .list()
+            .iter()
+            .map(|a| (a.config.agent.name.clone(), a.dir.clone()))
+            .collect();
+        if let Some(line) = crate::runtime_config::utility_skipped_doctor_line(&self.home_dir, &employees) {
+            checks.push(json!({
+                "name": "background_work_skipped",
+                "status": "warn",
+                "message": line,
                 "can_repair": false,
             }));
         }
@@ -250,6 +280,7 @@ impl MethodHandler {
             }));
         }
 
+        checks.extend(super::doctor_util::legacy_wiki_checks(&self.home_dir));
         checks
     }
 }
@@ -265,5 +296,101 @@ pub(crate) async fn refuse_overwriting_unparsable(path: &std::path::Path) -> std
             ),
         )),
         _ => Ok(()),
+    }
+}
+
+// Use the same binary units as Docker's memory limits. The UI uses familiar
+// GB/MB labels because these are approximate planning figures.
+const MEMORY_BASE_BYTES: u64 = 1024 * 1024 * 1024;
+const MEMORY_PER_REPLY_BYTES: u64 = 400 * 1024 * 1024;
+
+fn container_memory_check(limit: Option<u64>, active_agents: usize, global_turns: usize) -> Value {
+    let concurrent = active_agents.min(global_turns) as u64;
+    let estimate = MEMORY_BASE_BYTES.saturating_add(MEMORY_PER_REPLY_BYTES.saturating_mul(concurrent));
+    let (status, message) = match limit {
+        Some(limit) if limit < estimate => {
+            let gb = limit as f64 / MEMORY_BASE_BYTES as f64;
+            let capacity = limit.saturating_sub(MEMORY_BASE_BYTES) / MEMORY_PER_REPLY_BYTES;
+            let recommended = estimate.div_ceil(MEMORY_BASE_BYTES);
+            ("warn", format!(
+                "容器記憶體上限為 {gb:.2} GB。每位同時回覆的 AI 員工約需 400 MB，目前的上限大約只夠 {capacity} 位同時回覆；超過時系統會強制結束正在回覆的工作。建議把上限調到至少 {recommended} GB，或取消上限。"
+            ))
+        }
+        Some(limit) => {
+            let gb = limit as f64 / MEMORY_BASE_BYTES as f64;
+            ("pass", format!("容器記憶體上限為 {gb:.2} GB，足以支應目前預估的 {concurrent} 位 AI 員工同時回覆。"))
+        }
+        None => ("pass", "容器記憶體：未設定上限（未偵測到有限的記憶體上限）。".to_string()),
+    };
+    json!({
+        "name": "container_memory",
+        "status": status,
+        "message": message,
+        "can_repair": false,
+    })
+}
+
+#[cfg(test)]
+mod container_memory_tests {
+    use super::*;
+
+    #[test]
+    fn below_estimate_warns_with_capacity_and_rounded_recommendation() {
+        let estimate = MEMORY_BASE_BYTES + 5 * MEMORY_PER_REPLY_BYTES;
+        let check = container_memory_check(Some(estimate - 1), 5, 10);
+        assert_eq!(check["status"], "warn");
+        assert!(check["message"].as_str().unwrap().contains("4 位同時回覆"));
+        assert!(check["message"].as_str().unwrap().contains("至少 3 GB"));
+        assert_eq!(check["can_repair"], false);
+    }
+
+    #[test]
+    fn equal_estimate_passes() {
+        let estimate = MEMORY_BASE_BYTES + 5 * MEMORY_PER_REPLY_BYTES;
+        assert_eq!(container_memory_check(Some(estimate), 5, 10)["status"], "pass");
+    }
+
+    #[test]
+    fn above_estimate_passes() {
+        let estimate = MEMORY_BASE_BYTES + 5 * MEMORY_PER_REPLY_BYTES;
+        assert_eq!(container_memory_check(Some(estimate + 1), 5, 10)["status"], "pass");
+    }
+
+    #[test]
+    fn no_limit_passes() {
+        let check = container_memory_check(None, 20, 10);
+        assert_eq!(check["status"], "pass");
+        assert!(check["message"].as_str().unwrap().contains("未設定上限"));
+    }
+
+    #[test]
+    fn estimate_caps_concurrency_at_global_turns() {
+        let estimate = MEMORY_BASE_BYTES + 2 * MEMORY_PER_REPLY_BYTES;
+        assert_eq!(container_memory_check(Some(estimate), 20, 2)["status"], "pass");
+        assert_eq!(container_memory_check(Some(estimate - 1), 20, 2)["status"], "warn");
+        assert_eq!(container_memory_check(Some(MEMORY_BASE_BYTES), 0, 10)["status"], "pass");
+        assert_eq!(container_memory_check(Some(MEMORY_BASE_BYTES), 10, 0)["status"], "pass");
+    }
+
+    #[test]
+    fn below_base_has_zero_capacity() {
+        for limit in [0, MEMORY_BASE_BYTES - 1, MEMORY_BASE_BYTES] {
+            let check = container_memory_check(Some(limit), 5, 10);
+            assert_eq!(check["status"], "warn");
+            assert!(check["message"].as_str().unwrap().contains("0 位同時回覆"));
+        }
+    }
+
+    #[test]
+    fn estimate_uses_configured_global_limit_and_default() {
+        let home = tempfile::tempdir().unwrap();
+        let limit = MEMORY_BASE_BYTES + 10 * MEMORY_PER_REPLY_BYTES;
+        assert_eq!(container_memory_check(Some(limit), 20,
+            crate::webchat::configured_global_limit(home.path()))["status"], "pass");
+        assert_eq!(container_memory_check(Some(limit - 1), 20,
+            crate::webchat::configured_global_limit(home.path()))["status"], "warn");
+        std::fs::write(home.path().join("config.toml"), "[webchat]\nmax_global_turns = 2\n").unwrap();
+        assert_eq!(container_memory_check(Some(MEMORY_BASE_BYTES + 2 * MEMORY_PER_REPLY_BYTES), 20,
+            crate::webchat::configured_global_limit(home.path()))["status"], "pass");
     }
 }

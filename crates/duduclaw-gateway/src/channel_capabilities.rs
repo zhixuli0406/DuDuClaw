@@ -121,7 +121,8 @@ const DEFAULT_PROGRESS_THROTTLE_SECS: u64 = 30;
 ///   `send_document`/`send_photo` override vs. the trait defaults.
 /// - interactive_buttons: `channel_format.rs:679` `decision_markup` +
 ///   `channel_sender.rs` `send_with_markup` (both cover exactly
-///   telegram/discord/slack/line, confirmed to agree).
+///   telegram/discord/slack/line, confirmed to agree), plus Google Chat goal
+///   cards sent by `decision_notify::deliver_now_as` (HTTP transport only).
 /// - edit_in_place: union of `decision_card.rs:142` `channel_editable`
 ///   (telegram/slack/discord) and the progress-board edit loops in
 ///   telegram.rs/discord.rs/slack.rs/googlechat.rs/msteams.rs (adds
@@ -223,7 +224,11 @@ const TABLE: &[ChannelCapabilities] = &[
         // send_photo is a hand-rolled fallback that always sends a text
         // notice — no image-upload call exists.
         photo_upload: false,
-        interactive_buttons: false,
+        // Goal decision cards (`cardsV2`, `decision_markup` goal arm) with the
+        // `CARD_CLICKED` handler. Runtime exception kept at send time in
+        // `decision_notify::deliver_now_as`: an app receiving events over
+        // Pub/Sub gets no trusted click, so its cards stay plain text.
+        interactive_buttons: true,
         // Progress board edits its placeholder message via `update_message`
         // (PATCH) — real edit-in-place, even though `channel_editable`
         // (a narrower, decision-card-only allowlist) excludes it.
@@ -454,16 +459,21 @@ mod tests {
     // -- interactive_buttons: matches decision_markup / send_with_markup --
     #[test]
     fn interactive_buttons_matches_decision_markup_coverage() {
-        for ch in ["telegram", "discord", "slack", "line"] {
+        use crate::decision_action::DecisionSource;
+        for ch in ["telegram", "discord", "slack", "line", "googlechat"] {
             assert!(
                 supports(ch, Capability::InteractiveButtons),
                 "{ch} should support buttons"
+            );
+            // Every button channel renders at least the goal card.
+            assert!(
+                crate::channel_format::decision_markup(ch, DecisionSource::Goal, "t1").is_some(),
+                "{ch}: capability says buttons but decision_markup has no goal shape"
             );
         }
         for ch in [
             "whatsapp",
             "feishu",
-            "googlechat",
             "teams",
             "wecom",
             "dingtalk",
@@ -472,6 +482,10 @@ mod tests {
             assert!(
                 !supports(ch, Capability::InteractiveButtons),
                 "{ch} should NOT support buttons"
+            );
+            assert!(
+                crate::channel_format::decision_markup(ch, DecisionSource::Goal, "t1").is_none(),
+                "{ch}"
             );
         }
     }

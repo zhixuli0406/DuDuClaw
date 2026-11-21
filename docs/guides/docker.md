@@ -38,6 +38,7 @@ The final image ships with:
 | Docker Compose | v2.20+ | Bundled with modern Docker; the command is `docker compose`, not the legacy `docker-compose` |
 | Git | any | For cloning the source |
 | Disk space | ≥ 4 GB | The build consumes ~3 GB temporarily; the final image is roughly ~1.2 GB |
+| Memory | ≥ 4 GB recommended for up to 5 AI employees | About 1 GB for the service plus about 400 MB per AI employee replying at the same time |
 | Port | `18789` | Default gateway port, changeable |
 
 If you want channel webhooks (LINE, WhatsApp, Feishu and the other webhook channels) to receive external messages, you also need a **publicly reachable HTTPS URL**. The simplest options are
@@ -435,12 +436,15 @@ duduclaw service uninstall
 docker compose up -d
 ```
 
-The Compose service is `duduclaw`. Its application data, including `license.json`, lives in the `duduclaw-data` volume mounted at `/home/duduclaw/.duduclaw` inside the container. A leftover host `~/.duduclaw` is not mounted and is not used by this gateway. Check the licence against the container volume; to enter or replace a licence key, use the dashboard's License page:
+The supplied Compose example uses the `duduclaw-data` volume mounted at `/home/duduclaw/.duduclaw` for application data, including `license.json`. A leftover host `~/.duduclaw` is not mounted and is not used by this gateway. Run licence commands inside the container actually serving this installation. Use `docker ps` to find its container name, or use your Compose service name. Replace the placeholders below with those names and the executable the container was started with: `duduclaw`, or `duduclaw-pro` in the enterprise image. To enter or replace a licence key, use the dashboard's License page.
 
-```bash
-docker compose exec duduclaw duduclaw license status
+```text
+docker ps
+docker exec <container-name> <executable> license status
+docker compose exec <service-name> <executable> license status
 # Import a licence file already available inside the container:
-docker compose exec duduclaw duduclaw license import /path/in/container/license.json
+docker exec <container-name> <executable> license import /path/in/container/license.json
+docker compose exec <service-name> <executable> license import /path/in/container/license.json
 ```
 
 Back up or migrate any host data you still need before retiring it. Do not assume a host-side licence update changes the container's licence.
@@ -449,13 +453,28 @@ Back up or migrate any host data you still need before retiring it. Do not assum
 
 Field measurements reported by a customer are approximately 300–400 MB per employee while replying. This is an approximate observation, not a guaranteed ceiling. For planning, use **base gateway memory + concurrent replying employees × about 400 MB**; measure your own workload before setting a hard limit.
 
+For the base gateway allowance, plan on about **1 GB**. For up to 5 employees replying at the same time, **at least 4 GB is recommended**.
+
 | Concurrent replying employees | Approximate employee allowance (400 MB each) |
 |---:|---:|
 | 5 | 2 GB + base gateway memory |
 | 10 | 4 GB + base gateway memory |
 | 20 | 8 GB + base gateway memory |
 
-The example Compose file sets no memory limit by default.
+The default example Compose files set no memory, CPU or process limit. To add limits, uncomment and adjust these fields under the service that runs the gateway. This starting point allows 4 GB for up to 5 simultaneous replies; CPU and process needs also depend on your workload.
+
+```yaml
+services:
+  duduclaw:
+    # Optional starting point for up to 5 simultaneous replies; measure your workload.
+    # mem_limit: 4g
+    # cpus: "2.0"
+    # pids_limit: 512
+```
+
+**A memory limit that is too low causes the system to kill in-flight replies when memory runs out (out-of-memory).** Measure actual usage before tightening the limits.
+
+In **Settings → Health Diagnostics**, the system check (doctor) now reports the detected memory limit and whether it is sufficient. It estimates 1 GB for the service plus 400 MB per simultaneous reply, using the smaller of the active AI employee count and the configured global WebChat turn limit (default 10). This is a planning estimate; replies from other channels and other work can use more memory. The check only reports a warning and does not change your limits.
 
 ## 8. Health checks and observability
 

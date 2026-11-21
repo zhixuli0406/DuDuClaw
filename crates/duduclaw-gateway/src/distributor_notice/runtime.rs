@@ -220,21 +220,8 @@ pub async fn fetch_once(
     if !status.is_success() {
         return Err(format!("control-plane returned HTTP {status}"));
     }
-    if response
-        .content_length()
-        .is_some_and(|len| len > MAX_RESPONSE_BYTES as u64)
-    {
-        return Err("response too large".into());
-    }
-    let mut response = response;
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
-        if bytes.len() + chunk.len() > MAX_RESPONSE_BYTES {
-            return Err("response too large".into());
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    let body: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    let body: serde_json::Value =
+        crate::license_transport::read_bounded_json(response, MAX_RESPONSE_BYTES).await?;
     let previous = current_accepted();
     let (outcome, doc) = interpret(registry, subscription_id, &nonce, &body, previous.as_ref())?;
     match (outcome, doc) {

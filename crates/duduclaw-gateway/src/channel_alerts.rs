@@ -414,7 +414,7 @@ impl ChannelAlertMonitor {
         );
 
         let latest = latest_for_channel(failures, channel);
-        let link = crate::deep_link::deep_link(
+        let link = crate::deep_link::public_deep_link(
             &self.home_dir,
             crate::deep_link::DeepLinkKind::Channels,
             "",

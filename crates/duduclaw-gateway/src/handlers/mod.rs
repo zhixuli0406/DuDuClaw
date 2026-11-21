@@ -318,6 +318,8 @@ pub struct MethodHandler {
     pending_update: RwLock<Option<PendingUpdate>>,
     /// User database for multi-user auth (injected after gateway start).
     user_db: RwLock<Option<Arc<UserDb>>>,
+    /// License service captured for this handler; standalone callers may inject an owned runtime.
+    license_runtime: Option<crate::license_runtime::LicenseRuntime>,
     /// JWT configuration for token issuance (injected after gateway start).
     jwt_config: RwLock<Option<Arc<JwtConfig>>>,
     /// Plugin extension point (NullExtension by default).

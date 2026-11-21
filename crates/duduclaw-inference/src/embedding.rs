@@ -90,7 +90,7 @@ mod onnx_impl {
     /// Performs mean pooling over token embeddings with attention mask weighting,
     /// then L2-normalizes the result.
     pub struct OnnxEmbeddingProvider {
-        // ort 2.0.0-rc.12: `Session::run` takes `&mut self`; the trait exposes `&self`.
+        // ort 2.0.0-rc.15: `Session::run` takes `&mut self`; the trait exposes `&self`.
         session: std::sync::Mutex<Session>,
         tokenizer: Tokenizer,
         dimension: usize,
@@ -108,8 +108,7 @@ mod onnx_impl {
         ///     tokenizer.json
         /// ```
         pub fn load(model_dir: &Path, model_name: &str) -> Result<Self, InferenceError> {
-            // This legacy provider has no explicit, pinned runtime init path.
-            // Never let Session::builder implicitly load ORT beside a root key.
+            // Refuse in-process models beside a protected root key.
             if duduclaw_core::root_key::is_held() {
                 return Err(InferenceError::Other(
                     "獨立金鑰模式不允許未經安全初始化的 ONNX 向量模型".into(),
@@ -153,7 +152,11 @@ mod onnx_impl {
                 .unwrap_or(2);
 
             // Load ONNX session
-            let session = Session::builder()
+            let ort_root = duduclaw_onnx::manifest::ort_lib_root_under_home(&duduclaw_core::duduclaw_home());
+            let lib_path = duduclaw_onnx::manifest::ort_lib_path(&ort_root)
+                .ok_or_else(|| "這個平台沒有可用的 ONNX Runtime".to_string()).map_err(InferenceError::Other)?;
+            duduclaw_onnx::runtime::init_ort(&lib_path).map_err(InferenceError::Other)?;
+            let session = duduclaw_onnx::runtime::session_builder()
                 .map_err(|e| InferenceError::Other(format!("ONNX session builder error: {e}")))?
                 .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
                 .map_err(|e| InferenceError::Other(format!("ONNX optimization error: {e}")))?

@@ -76,9 +76,11 @@ mod bash_lane;
 mod bash_parse;
 mod matcher;
 mod operator_cmd;
+mod own_auto_wiki;
 mod real_path;
 
 pub use bash_egress::{approvable_egress_command, bash_egress_command};
+pub use own_auto_wiki::check_own_auto_wiki_write;
 
 pub use operator_cmd::{
     bash_invokes_operator_command, bash_operator_command_decision, OperatorCommand,

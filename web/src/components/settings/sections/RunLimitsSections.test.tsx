@@ -53,6 +53,15 @@ describe('Run limit settings cards', () => {
     await waitFor(() => expect(update).toHaveBeenCalledWith({ goal_defaults: { assign_schedule_min_interval_minutes: 120 } }));
   });
 
+  it('shows the one 1800-second run default for every engine when the global default is blank', async () => {
+    config.mockResolvedValue({ config: '[runtime]\nmax_timeout_secs=7200\n' });
+    renderWithProviders(<RunLimitsSections />);
+    const field = await screen.findByRole('spinbutton', { name: 'Default run limit (seconds)' });
+    await waitFor(() => expect(screen.getByRole('spinbutton', { name: 'Run limit ceiling (seconds)' })).toHaveValue(7200));
+    expect(field).toHaveAttribute('placeholder', '1800');
+    expect(screen.queryByText(/300 seconds/)).not.toBeInTheDocument();
+  });
+
   it('clears the optional global default without changing the ceiling', async () => {
     renderWithProviders(<RunLimitsSections />);
     const field = await screen.findByRole('spinbutton', { name: 'Default run limit (seconds)' });

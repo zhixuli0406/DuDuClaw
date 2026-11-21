@@ -362,8 +362,13 @@ pub struct GoalLoopDriver {
     kickoff: Mutex<HashMap<String, ApprovalId>>,
     /// needs_human goal tasks already pushed to a channel this process life, so
     /// the reconciler does not re-notify every tick. Pruned to the live
-    /// needs_human set each pass.
+    /// needs_human set each pass. RM-192 B6: backed by persistent
+    /// per-episode markers in the activity table (`goal_loop/escalate.rs`),
+    /// so a restart does not re-notify a still-pending task.
     notified_needs_human: Mutex<HashSet<String>>,
+    /// RM-192 B6: whether this driver life already closed the markers of
+    /// tasks that left `needs_human` while no driver was watching.
+    needs_human_swept: std::sync::atomic::AtomicBool,
     /// Operator-level goal tasks already announced as skipped (dedup).
     operator_skipped: Mutex<HashSet<String>>,
     /// P5 outer progress board dedup: task_id → last progress phase key pushed

@@ -28,6 +28,11 @@
 # KB_BUNDLE_CACHE=<dir> keeps downloads between runs (default: a temp dir).
 set -euo pipefail
 
+# Keep these source-specific sets in sync with crates/duduclaw-onnx/src/manifest.rs.
+GITHUB_REDIRECT_HOSTS='github.com objects.githubusercontent.com release-assets.githubusercontent.com'
+NUGET_REDIRECT_HOSTS='api.nuget.org'
+MODEL_REDIRECT_HOSTS='huggingface.co cdn-lfs.huggingface.co cdn-lfs-us-1.huggingface.co cdn-lfs-eu-1.huggingface.co cas-bridge.xethub.hf.co'
+
 if [ $# -ne 3 ]; then
   sed -n '2,26p' "$0" >&2
   exit 2
@@ -60,20 +65,142 @@ for f in m["files"]:
     url = f"https://huggingface.co/{m['repo']}/resolve/{m['revision']}/{f['path']}"
     print(f"{url}\tmodels/embedding/{m['id']}/{f['path']}\t{f['size']}\t{f['sha256']}")
 v = o["ort_version"]
-print(f"{arch['url']}\tlib/onnxruntime/{v}/onnxruntime-{v}.{arch['kind']}\t{arch['size']}\t{arch['sha256']}")
+# Bundles retain the original GitHub archive for older gateway importers.
+source = arch["sources"][0]
+print(f"{source['url']}\tlib/onnxruntime/{v}/onnxruntime-{v}.{source['kind']}\t{source['size']}\t{source['sha256']}")
 PY
 )"
 
 CACHE="${KB_BUNDLE_CACHE:-$(mktemp -d)}"
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"; [ -n "${KB_BUNDLE_CACHE:-}" ] || rm -rf "$CACHE"' EXIT
-mkdir -p "$OUT"
+mkdir -p "$OUT" "$CACHE"
+NAME="duduclaw-kb-model-${MODEL}-${TARGET}.tar"
+
+# Only recover the original, pinned upstream archive; never substitute the
+# NuGet package inside a bundle consumed by an older gateway.
+recover_ort_archive() {
+  local dest="$1" output="$2" repo tags tag recovery
+  if ! command -v gh >/dev/null 2>&1 || ! gh auth status >/dev/null 2>&1; then
+    echo "ORT upstream unavailable for $TARGET; authenticated gh is required to recover $NAME" >&2
+    return 1
+  fi
+  repo="${GH_REPO:-${GITHUB_REPOSITORY:-}}"
+  if [ -z "$repo" ]; then
+    repo="$(cd "$ROOT" && gh repo view --json nameWithOwner --jq .nameWithOwner)" || return 1
+  fi
+  # gh stops at the end of the release list. Sort by publication time (not
+  # creation time), including published prereleases but excluding drafts.
+  tags="$(gh release list --repo "$repo" --exclude-drafts --limit 1000000 \
+    --json tagName,publishedAt --jq 'sort_by(.publishedAt) | reverse | .[].tagName')" || return 1
+  recovery="$STAGE/recovery"
+  mkdir -p "$recovery"
+  while IFS= read -r tag; do
+    [ -n "$tag" ] || continue
+    if gh release download "$tag" --repo "$repo" --pattern "$NAME" --dir "$recovery" \
+        >"$recovery/download.log" 2>&1; then
+      echo "recover $dest from $repo release $tag ($NAME)" >&2
+      if ! tar -xOf "$recovery/$NAME" "$dest" > "$output"; then
+        echo "cannot extract pinned ORT archive $dest from $tag/$NAME for $TARGET" >&2
+        return 1
+      fi
+      # The caller verifies BOTH size and SHA-256 before caching or bundling.
+      rm -f "$recovery/$NAME"
+      return 0
+    fi
+    rm -f "$recovery/$NAME"
+  done <<< "$tags"
+  echo "no published release of $repo contains $NAME; cannot build $TARGET" >&2
+  return 1
+}
+
+# Python is already required for the manifest. Use its URL parser so authority
+# boundaries, credentials and ports cannot bypass an exact host comparison.
+resolve_download_url() {
+  python3 -I - "$1" "$2" "$3" <<'PYURL'
+import sys
+from urllib.parse import urlsplit, urljoin
+current, location, allowed = sys.argv[1:]
+try:
+    if not location or any(ord(c) <= 32 or ord(c) == 127 for c in location) or "\\" in location:
+        raise ValueError()
+    parsed = urlsplit(location)
+    if not parsed.scheme:
+        # Relative locations are rooted at the current origin, never a new
+        # authority or the current request's directory. Refuse network paths.
+        if parsed.netloc or location.startswith("//"):
+            raise ValueError()
+        base = urlsplit(current)
+        location = urljoin(f"{base.scheme}://{base.netloc}/", location)
+        parsed = urlsplit(location)
+    if (parsed.scheme != "https" or parsed.hostname not in allowed.split()
+            or parsed.username is not None or parsed.password is not None
+            or parsed.port not in (None, 443)):
+        raise ValueError()
+except ValueError:
+    sys.exit("download redirect refused: HTTPS URL with an allowed host and port 443 required")
+print(location)
+PYURL
+}
+
+download_with_redirects() {
+  local current="$1" output="$2" size="$3" allowed headers status location hop
+  case "$current" in
+    https://github.com/*) allowed="$GITHUB_REDIRECT_HOSTS" ;;
+    https://api.nuget.org/*) allowed="$NUGET_REDIRECT_HOSTS" ;;
+    https://huggingface.co/*) allowed="$MODEL_REDIRECT_HOSTS" ;;
+    *) echo "download refused: unknown source host" >&2; return 1 ;;
+  esac
+  current="$(resolve_download_url "$current" "$current" "$allowed")" || return 1
+  headers="$(mktemp "$STAGE/headers.XXXXXX")" || return 1
+  for ((hop = 0; hop <= 5; hop++)); do
+    # No automatic redirects: validate every next URL before requesting it.
+    status="$(curl -q -fsS --proto '=https' --max-redirs 0 --retry 3 \
+      --connect-timeout 30 --max-time 1800 --max-filesize "$size" \
+      -o "$output" -D "$headers" -w '%{http_code}' "$current")" || return 1
+    case "$status" in
+      2??) rm -f "$headers"; return 0 ;;
+      301|302|303|307|308)
+        if [ "$hop" -eq 5 ]; then
+          echo "download redirect refused: more than five hops" >&2
+          return 1
+        fi
+        location="$(python3 -I - "$headers" <<'PYHEADER'
+import sys
+locations = []
+with open(sys.argv[1], encoding="iso-8859-1") as headers:
+    for line in headers:
+        # Ignore proxy CONNECT, interim responses and earlier retry headers.
+        if line.startswith("HTTP/"):
+            locations = []
+        elif line.lower().startswith("location:"):
+            locations.append(line.split(":", 1)[1].strip())
+if len(locations) != 1:
+    sys.exit("download redirect refused: missing or ambiguous Location header")
+print(locations[0])
+PYHEADER
+)" || return 1
+        current="$(resolve_download_url "$current" "$location" "$allowed")" || return 1
+        ;;
+      *) echo "download refused: unexpected HTTP status $status" >&2; return 1 ;;
+    esac
+  done
+  return 1
+}
 
 while IFS=$'\t' read -r url dest size sum; do
   cached="$CACHE/$sum"
   if [ ! -f "$cached" ] || [ "$(sha256 "$cached")" != "$sum" ]; then
     echo "download $(basename "$dest") ($size bytes)"
-    curl -fSL --retry 3 -o "$cached.part" "$url"
+    if ! download_with_redirects "$url" "$cached.part" "$size"; then
+      case "$dest" in
+        lib/onnxruntime/*) recover_ort_archive "$dest" "$cached.part" ;;
+        *) echo "download failed for $dest ($TARGET)" >&2; exit 1 ;;
+      esac
+    fi
+    got="$(wc -c < "$cached.part" | tr -d ' ')"
+    [ "$got" = "$size" ] || { echo "size mismatch for $dest ($TARGET): $got != $size" >&2; exit 1; }
+    [ "$(sha256 "$cached.part")" = "$sum" ] || { echo "sha256 mismatch for $dest ($TARGET)" >&2; exit 1; }
     mv "$cached.part" "$cached"
   fi
   got="$(wc -c < "$cached" | tr -d ' ')"
@@ -93,7 +220,6 @@ for f in files:
 json.dump({"model": model, "target": target, "files": files}, open(path, "w"), indent=2)
 PY
 
-NAME="duduclaw-kb-model-${MODEL}-${TARGET}.tar"
 # Only the two trees: no "./" entry, so unpacking never touches the
 # permissions of the home directory itself.
 # COPYFILE_DISABLE: macOS tar would add AppleDouble "._*" entries, which

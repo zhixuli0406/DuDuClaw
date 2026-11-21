@@ -204,6 +204,19 @@ describe('new controls round-trip from inspect to payload', () => {
     expect(timeout).toHaveValue(300);
   });
 
+  it('shows the same 1800-second default for a non-Claude engine without an effective value from the gateway', async () => {
+    mockWsClient.call.mockResolvedValue({
+      ...FULL,
+      runtime: { provider: 'codex' },
+      model: { preferred: 'gpt-5.4', utility: null },
+      effective_timeout_secs: undefined,
+    });
+    renderAt('/agents/my-bot/edit?tab=brain');
+    const timeout = await screen.findByRole('spinbutton', { name: 'Execution time limit' });
+    await waitFor(() => expect(timeout).toHaveValue(1800));
+    expect(updateAgent).not.toHaveBeenCalled();
+  });
+
   it('shows the 1800-second Claude default without writing it on an unrelated edit', async () => {
     const user = userEvent.setup();
     renderAt('/agents/my-bot/edit?tab=brain');
@@ -270,6 +283,16 @@ describe('new controls round-trip from inspect to payload', () => {
     await user.click(fork);
     await waitFor(() => expect(updateAgent).toHaveBeenCalled(), { timeout: 3000 });
     expect(lastPayload()).toEqual({ fork: { enabled: false } });
+  });
+
+  it('prefills the saved memory language from inspect', async () => {
+    mockWsClient.call.mockResolvedValue({ ...FULL, memory: { ...FULL.memory, language: 'ja-JP' } });
+    renderAt('/agents/my-bot/edit');
+    const language = await screen.findByRole('combobox', { name: 'Memory language' });
+    await waitFor(() => expect(language).toHaveTextContent(en['settings.general.defaultLanguage.ja-JP']));
+    await userEvent.setup().click(language);
+    expect(await screen.findByRole('option', { name: en['settings.general.memoryLanguage.auto'] })).toBeInTheDocument();
+    expect(updateAgent).not.toHaveBeenCalled();
   });
 
   it('prefills memory + night engine and sends the edited memory key only', async () => {

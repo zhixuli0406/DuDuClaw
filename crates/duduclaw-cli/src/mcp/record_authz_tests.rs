@@ -1027,6 +1027,7 @@ async fn agent_update_refuses_self_authority_changes() {
         ("max_turns", serde_json::json!(100)),
         ("timeout_secs", serde_json::json!(600)),
         ("reply_language", serde_json::json!("en")),
+        ("memory_language", serde_json::json!("zh-TW")),
         ("db_sources_add", serde_json::json!("crm")),
         ("role", serde_json::json!("main")),
         ("reports_to", serde_json::json!("ceo")),
@@ -1044,6 +1045,7 @@ async fn agent_update_refuses_self_authority_changes() {
         &fs::read_to_string(h.join("agents/sales-rep/agent.toml")).unwrap(),
     ).unwrap();
     assert_eq!(config.prompt.reply_language, None);
+    assert_eq!(config.memory.language, None);
     let rows = audit_rows(h, "agent_authority_refused");
     // `reports_to` to a non-subtree parent may be refused by the placement
     // gate first; the other four always reach the self-authority guard.
@@ -1076,6 +1078,32 @@ async fn agent_update_refuses_self_authority_changes() {
     .await;
     assert!(!is_error(&out), "{out}");
     assert_eq!(budget_of(h, "sales-rep"), 3000);
+}
+
+/// RM-205 / security review: `[runtime] utility_provider` decides which
+/// outside service receives the employee's conversation text for background
+/// work. Through MCP `agent_update` an employee cannot set it on itself (the
+/// whole `runtime` parameter is a self-authority key), and no caller can set
+/// it at all: `agent_update` has no `[runtime]` write path.
+#[tokio::test]
+async fn agent_update_never_writes_runtime_utility_provider() {
+    let home = Home::new();
+    let h = home.path();
+    let path = h.join("agents/sales-rep/agent.toml");
+    let before = fs::read_to_string(&path).unwrap();
+    let params = serde_json::json!({ "agent_id": "sales-rep", "runtime": { "utility_provider": "openai_compat" } });
+    let out = handle_agent_update(&params, h, A("sales-rep")).await;
+    assert!(is_error(&out), "self: {out}");
+    assert!(text(&out).contains("runtime"), "{out}");
+    assert_eq!(fs::read_to_string(&path).unwrap(), before, "self: file unchanged");
+    let rows = audit_rows(h, "agent_authority_refused");
+    assert!(rows.iter().any(|r| r["keys"].as_array().is_some_and(|k| k.iter().any(|k| k == "runtime"))), "{rows:?}");
+    // A manager or an operator through MCP cannot write it either.
+    for actor in [A("sales-lead"), RecordActor::Operator("sales-rep")] {
+        let _ = handle_agent_update(&params, h, actor).await;
+        let table: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
+        assert!(table.get("runtime").and_then(|r| r.get("utility_provider")).is_none(), "{table:?}");
+    }
 }
 
 #[tokio::test]

@@ -123,9 +123,108 @@ pub async fn resolve_fixed_message_language_for_id(home_dir: &Path, agent_id: &s
     resolve_reply_language_for_id(home_dir, agent_id).await.or(read_default_language(home_dir).await)
 }
 
+fn valid_memory_language(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|v| *v != "auto" && duduclaw_core::profile_sections::is_valid_reply_language(v))
+}
+
+/// Employee memory override, global memory override, then effective reply language.
+pub async fn resolve_memory_language(home: &Path, agent: &duduclaw_core::types::AgentConfig) -> Option<String> {
+    let global = tokio::fs::read_to_string(home.join("config.toml")).await.ok()
+        .and_then(|s| s.parse::<toml::Table>().ok());
+    duduclaw_core::profile_sections::resolve_memory_language_setting(
+        agent.memory.language.as_deref(),
+        global.as_ref().and_then(|t| t.get("memory")?.get("language")?.as_str()),
+        agent.prompt.reply_language.as_deref(),
+        global.as_ref().and_then(|t| t.get("general")?.get("default_language")?.as_str()),
+    )
+}
+
+pub async fn resolve_memory_language_for_id(home: &Path, id: &str) -> Option<String> {
+    let safe = !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    let employee = if safe {
+        tokio::fs::read_to_string(home.join("agents").join(id).join("agent.toml")).await.ok()
+            .and_then(|s| s.parse::<toml::Table>().ok())
+    } else { None };
+    let global = tokio::fs::read_to_string(home.join("config.toml")).await.ok()
+        .and_then(|s| s.parse::<toml::Table>().ok());
+    duduclaw_core::profile_sections::resolve_memory_language_tables(employee.as_ref(), global.as_ref())
+}
+
+/// Unconfigured utilities follow the conversation, pinning Traditional script when detected.
+pub fn memory_prompt_language(language: Option<&str>, input: &str) -> &'static str {
+    let language = valid_memory_language(language);
+    let code = language.or_else(|| {
+        (!duduclaw_core::zh_variant::contains_kana(input)
+            && duduclaw_core::dominant_variant(input) == duduclaw_core::ChineseVariant::Traditional).then_some("zh-TW")
+    });
+    code.map(duduclaw_core::profile_sections::memory_language_instruction)
+        .unwrap_or("Same language as input. Use the main language of the conversation.")
+}
+
+/// Apply only to generated prose, never to structured keys or verbatim source sections.
+pub fn align_memory_script(output: &str, language: Option<&str>, input: &str) -> String {
+    if valid_memory_language(language) == Some("zh-TW")
+        || (valid_memory_language(language).is_none()
+            && !duduclaw_core::zh_variant::contains_kana(input)
+            && duduclaw_core::dominant_variant(input) == duduclaw_core::ChineseVariant::Traditional) {
+        duduclaw_core::zh_variant::to_traditional_preserving_literals(output)
+    } else { output.to_string() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unresolved_japanese_never_pins_or_converts_chinese_script() {
+        for input in ["会社の会議です", "ユーザーの国", "ｶﾀｶﾅ 用户"] {
+            assert!(!memory_prompt_language(None, input).contains("Traditional Chinese"));
+            assert_eq!(align_memory_script("用户会话", None, input), "用户会话");
+            assert_eq!(align_memory_script(input, None, input), input);
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_language_resolution_order_table() {
+        for (employee, global, reply, default, expected) in [
+            (Some("zh-TW"), Some("en"), Some("ja-JP"), Some("zh-CN"), Some("zh-TW")),
+            (Some("auto"), Some("en"), Some("ja-JP"), None, Some("en")),
+            (Some("invalid"), Some("en"), None, None, Some("en")),
+            (None, Some("auto"), Some("ja-JP"), Some("en"), Some("ja-JP")),
+            (None, Some("invalid"), Some("auto"), Some("en"), None),
+            (None, None, Some("auto"), Some("zh-TW"), None),
+            (None, None, None, None, None),
+            (Some("auto"), Some("auto"), Some("auto"), None, None),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut global_table = toml::Table::new();
+            if let Some(v) = global { global_table.insert("memory".into(), toml::Value::Table([("language".into(), toml::Value::String(v.into()))].into_iter().collect())); }
+            if let Some(v) = default { global_table.insert("general".into(), toml::Value::Table([("default_language".into(), toml::Value::String(v.into()))].into_iter().collect())); }
+            std::fs::write(dir.path().join("config.toml"), toml::to_string(&global_table).unwrap()).unwrap();
+            let mut cfg: duduclaw_core::types::AgentConfig = toml::from_str(MIN_AGENT_TOML).unwrap();
+            cfg.memory.language = employee.map(str::to_string);
+            cfg.prompt.reply_language = reply.map(str::to_string);
+            write_agent(dir.path(), "a1", &toml::to_string(&cfg).unwrap());
+            assert_eq!(resolve_memory_language(dir.path(), &cfg).await.as_deref(), expected);
+            assert_eq!(resolve_memory_language_for_id(dir.path(), "a1").await.as_deref(), expected);
+        }
+    }
+
+    #[test]
+    fn memory_script_alignment_respects_explicit_language() {
+        let simplified = "用户记忆与档案";
+        let traditional = "用戶記憶與檔案";
+        assert_eq!(align_memory_script(simplified, Some("zh-TW"), "input"), traditional);
+        assert_eq!(align_memory_script(simplified, None, traditional), traditional);
+        assert_eq!(align_memory_script("用户 `头发` https://站/预算 /tmp/预算.txt", Some("zh-TW"), "input"),
+            "用戶 `头发` https://站/预算 /tmp/预算.txt");
+        for code in ["zh-CN", "en", "ja-JP"] {
+            assert_eq!(align_memory_script(simplified, Some(code), traditional), simplified);
+        }
+        assert_eq!(align_memory_script(simplified, None, "English"), simplified);
+        assert!(memory_prompt_language(None, "English").contains("Same language as input."));
+        assert!(memory_prompt_language(None, traditional).contains("Never use Simplified"));
+    }
 
     fn write_global(dir: &Path, lang: &str) {
         std::fs::write(
@@ -323,86 +422,11 @@ pub fn with_channel_reply_language_reminder(message: String, language: Option<&s
     }
 }
 
-/// Only an explicitly resolved zh-TW reply gets the conservative character safety net.
+/// Only an explicitly resolved zh-TW reply gets phrase-aware script conversion.
 /// Preserve code (including variable-length fences/spans) and URL bytes verbatim.
 pub(crate) fn normalize_channel_reply(text: &str, language: Option<&str>) -> String {
     if language != Some("zh-TW") { return text.to_string(); }
-    let mut output = String::new();
-    let mut fence: Option<(char, usize)> = None;
-    let mut inline = 0;
-    for line in text.split_inclusive('\n') {
-        let trimmed = line.trim_start();
-        let marker = trimmed.chars().next().unwrap_or(' ');
-        let run = trimmed.chars().take_while(|c| *c == marker).count();
-        if let Some((open, length)) = fence {
-            output.push_str(line);
-            if marker == open && run >= length && trimmed.chars().skip(run).all(char::is_whitespace) {
-                fence = None;
-            }
-            continue;
-        }
-        if inline == 0 && matches!(marker, '`' | '~') && run >= 3 {
-            fence = Some((marker, run));
-            output.push_str(line);
-            continue;
-        }
-        let chars: Vec<char> = line.chars().collect();
-        let mut i = 0;
-        let mut prose = String::new();
-        while i < chars.len() {
-            if chars[i] == '`' {
-                output.push_str(&duduclaw_core::zh_variant::to_traditional(&prose));
-                prose.clear();
-                let count = chars.iter().skip(i).take_while(|c| **c == '`').count();
-                if inline == 0 { inline = count; } else if inline == count { inline = 0; }
-                output.extend(std::iter::repeat_n('`', count));
-                i += count;
-            } else if inline > 0 {
-                output.push(chars[i]);
-                i += 1;
-            } else if chars[i] == '(' && i > 0 && chars[i - 1] == ']' {
-                // Markdown destinations can also be relative URLs with CJK paths.
-                output.push_str(&duduclaw_core::zh_variant::to_traditional(&prose));
-                prose.clear();
-                let mut depth = 0usize;
-                let mut escaped = false;
-                while i < chars.len() {
-                    let c = chars[i];
-                    output.push(c);
-                    i += 1;
-                    if !escaped {
-                        if c == '(' { depth += 1; }
-                        if c == ')' { depth = depth.saturating_sub(1); }
-                    }
-                    escaped = c == '\\' && !escaped;
-                    if depth == 0 { break; }
-                }
-            } else {
-                let boundary = i == 0 || !chars[i - 1].is_ascii_alphanumeric();
-                let scheme_len = if boundary && chars[i].is_ascii_alphabetic() {
-                    chars.iter().skip(i).take_while(|c| c.is_ascii_alphanumeric() || matches!(**c, '+' | '-' | '.')).count()
-                } else { 0 };
-                let scheme_url = scheme_len > 0 && chars.iter().skip(i + scheme_len).copied().take(3).eq("://".chars());
-                let other_url = ["mailto:", "www."].iter().any(|prefix| {
-                    chars.len() - i >= prefix.len() && chars.iter().skip(i).zip(prefix.chars())
-                        .all(|(left, right)| left.eq_ignore_ascii_case(&right))
-                });
-                if scheme_url || other_url {
-                    output.push_str(&duduclaw_core::zh_variant::to_traditional(&prose));
-                    prose.clear();
-                    while i < chars.len() && !chars[i].is_whitespace() && !matches!(chars[i], '<' | '>' | '`') {
-                        output.push(chars[i]);
-                        i += 1;
-                    }
-                } else {
-                    prose.push(chars[i]);
-                    i += 1;
-                }
-            }
-        }
-        output.push_str(&duduclaw_core::zh_variant::to_traditional(&prose));
-    }
-    output
+    duduclaw_core::zh_variant::to_traditional_preserving_literals(text)
 }
 
 #[cfg(test)]

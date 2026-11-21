@@ -39,6 +39,7 @@ DuDuClawのDockerイメージは `container/Dockerfile.server` で構築され�
 | Docker Compose | v2.20+ | 最近のDockerには標準搭載。コマンドは `docker compose` で、旧来の `docker-compose` ではない |
 | Git | 任意 | ソースコードのclone用 |
 | ディスク容量 | ≥ 4 GB | ビルド中は一時的に約3 GB使用。完成イメージは約1.2 GB |
+| メモリ | AI 社員5人までなら4 GB以上を推奨 | サービスの基本使用量は約1 GB、同時に返信するAI 社員1人につき約400 MBを追加 |
 | Port | `18789` | デフォルトのgateway port、変更可能 |
 
 channel webhook（LINE、WhatsApp、Feishu など webhook を使うチャネル）で外部からのメッセージを受信するには、
@@ -449,12 +450,15 @@ duduclaw service uninstall
 docker compose up -d
 ```
 
-Composeサービス名は `duduclaw` です。コンテナ版のアプリケーションデータ（`license.json` を含む）は `duduclaw-data` volumeにあり、コンテナ内の `/home/duduclaw/.duduclaw` にマウントされます。ホストに残った `~/.duduclaw` はマウントされず、このgatewayでは使われません。ライセンスの状態はコンテナ内で確認してください。ライセンスキーの入力や変更は、ダッシュボードの「ライセンス管理」ページで行います。
+付属のComposeサンプルでは、アプリケーションデータ（`license.json` を含む）を `duduclaw-data` volumeに保存し、コンテナ内の `/home/duduclaw/.duduclaw` にマウントします。ホストに残った `~/.duduclaw` はマウントされず、このgatewayでは使われません。ライセンスコマンドは、この環境のサービスを実際に提供しているコンテナ内で実行してください。`docker ps` でコンテナ名を確認するか、使用中のComposeサービス名を指定します。以下のプレースホルダーを実際の名前に置き換えてください。実行ファイルには、コンテナの起動に使った `duduclaw`、エンタープライズ版イメージでは `duduclaw-pro` を指定します。ライセンスキーの入力や変更は、ダッシュボードの「ライセンス管理」ページで行います。
 
-```bash
-docker compose exec duduclaw duduclaw license status
+```text
+docker ps
+docker exec <コンテナ名> <実行ファイル> license status
+docker compose exec <サービス名> <実行ファイル> license status
 # コンテナから読めるファイルをインポートする場合：
-docker compose exec duduclaw duduclaw license import /path/in/container/license.json
+docker exec <コンテナ名> <実行ファイル> license import /path/in/container/license.json
+docker compose exec <サービス名> <実行ファイル> license import /path/in/container/license.json
 ```
 
 必要なホストデータは先にバックアップまたは移行してください。ホスト上で更新しても、コンテナ版のライセンスは変わりません。
@@ -463,13 +467,28 @@ docker compose exec duduclaw duduclaw license import /path/in/container/license.
 
 顧客から報告された現場測定では、返信中の社員1人あたり約300～400 MBです。概算であり、保証された上限ではありません。計画時は **gatewayの基本使用量 + 同時に返信する社員数 × 約400 MB** を目安にし、上限を設定する前に実際の負荷を測定してください。
 
+gatewayの基本使用量は **約1 GB** を見込んでください。同時に返信する社員が5人までなら、**4 GB以上を推奨します**。
+
 | 同時に返信する社員 | 社員分の概算（1人約400 MB） |
 |---:|---:|
 | 5 | 2 GB + gateway基本使用量 |
 | 10 | 4 GB + gateway基本使用量 |
 | 20 | 8 GB + gateway基本使用量 |
 
-サンプルComposeファイルはデフォルトでメモリ上限を設定していません。
+デフォルトのComposeサンプルには、メモリ、CPU、プロセス数の上限が設定されていません。制限を加える場合は、gatewayを実行するサービスに以下の項目を追加し、コメントを外して実際の使用量に合わせて調整してください。同時返信5人までにメモリ4 GBを割り当てる例です。CPUとプロセス数の必要量も処理内容によって変わります。
+
+```yaml
+services:
+  duduclaw:
+    # Optional starting point for up to 5 simultaneous replies; measure your workload.
+    # mem_limit: 4g
+    # cpus: "2.0"
+    # pids_limit: 512
+```
+
+**メモリ上限が低すぎると、メモリ不足（out-of-memory）によって返信中の処理が強制終了されます。** 制限を厳しくする前に、実際の使用量を測定してください。
+
+「**設定 → ヘルス診断**」のシステムチェック（doctor）で、検出されたメモリ上限が十分か確認できるようになりました。サービスの基本使用量1 GBに、同時返信1人あたり400 MBを加えて見積もります。同時返信人数には、有効なAI 社員数とWebChatの全体上限（デフォルト10）の小さい方を使います。あくまで計画用の目安で、ほかのチャネルでの返信や別の処理により、さらにメモリを使う場合があります。診断は警告を表示するだけで、上限は変更しません。
 
 ## 8. ヘルスチェックと可観測性
 

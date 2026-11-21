@@ -101,12 +101,16 @@ pub(crate) const AUTHORITY: &[AuthorityKey] = &[
     // The runtime decides the sandbox and the tool semantics.
     key("runtime.provider", &["runtime.provider"], Change),
     key("runtime.fallback", &["runtime.fallback"], Change),
+    // RM-205: which outside service receives the employee's conversation
+    // text for background work.
+    key("runtime.utility_provider", &["runtime.utility_provider"], Change),
     key("runtime.idle_timeout_secs", &["runtime.idle_timeout_secs"], Loosen),
     key("runtime.timeout_secs", &["runtime.timeout_secs"], Loosen),
     key("runtime.max_turns", &["runtime.max_turns"], Loosen),
     // `--bare` skips the hooks, the employee file guard included.
     key("prompt.cli_bare_mode", &[], Change),
     key("prompt.reply_language", &["form.reply_language"], Change),
+    key("memory.language", &["form.memory_language", "memory.language"], Change),
     // Widens what the employee watches on the machine.
     key("os_watch", &["osWatch."], Change),
     // Which accounts' quota the employee spends.
@@ -129,7 +133,8 @@ fn effective(table: &toml::Table, key: &str) -> Value {
     let raw = toml_at_json(table, key);
     let or = |v: Value| if raw.is_null() { v } else { raw.clone() };
     match key {
-        "agent.reports_to" | "agent.department" | "agent.name" | "agent.role" | "runtime.fallback" => {
+        "agent.reports_to" | "agent.department" | "agent.name" | "agent.role" | "runtime.fallback"
+        | "runtime.utility_provider" => {
             or(Value::String(String::new()))
         }
         "runtime.idle_timeout_secs" => json!(raw.as_i64().filter(|n| *n >= 0).unwrap_or(900)),
@@ -346,6 +351,7 @@ mod tests {
             ("[odoo]\nallowed_models=['res.partner']\n", "odoo"),
             ("[runtime]\nprovider='codex'\n", "runtime.provider"),
             ("[runtime]\nfallback='claude'\n", "runtime.fallback"),
+            ("[runtime]\nutility_provider='openai_compat'\n", "runtime.utility_provider"),
             ("[prompt]\ncli_bare_mode=true\n", "prompt.cli_bare_mode"),
             ("[prompt]\nreply_language='en'\n", "prompt.reply_language"),
             ("[container]\nreadonly_project=false\n", "container.readonly_project"),

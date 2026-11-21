@@ -841,7 +841,7 @@ pub(crate) async fn notify_admins(home: &Path, report: &PassReport) {
         return;
     }
     let id = uuid::Uuid::new_v4().to_string();
-    let link = crate::deep_link::deep_link(home, crate::deep_link::DeepLinkKind::System, "");
+    let link = crate::deep_link::public_deep_link(home, crate::deep_link::DeepLinkKind::System, "");
     let card = crate::notify_push::NotifyCard {
         source: crate::decision_action::DecisionSource::FolderAccess,
         decision_id: &id,

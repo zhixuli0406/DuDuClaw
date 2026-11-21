@@ -1,6 +1,6 @@
 //! Local Kokoro-82M v1.1-zh, with a short-lived ONNX session per request.
 use std::path::{Path, PathBuf};
-use ort::{session::Session, value::Tensor};
+use ort::value::Tensor;
 use crate::tts::TtsProvider;
 pub mod manifest;
 pub mod install;
@@ -68,7 +68,7 @@ fn synthesize_local(dir: &Path, lib: &Path, text: &str, voice: &str) -> Result<V
     let style = parse_voice(&std::fs::read(dir.join(format!("voices/{voice}.bin"))).map_err(|e| e.to_string())?)?;
     #[cfg(test)]
     tests::ORT_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let mut session = Session::builder().map_err(|e| e.to_string())?
+    let mut session = duduclaw_onnx::runtime::session_builder().map_err(|e| e.to_string())?
         .with_intra_threads(4).map_err(|e| e.to_string())?
         .commit_from_file(dir.join("onnx/model_uint8.onnx")).map_err(|e| format!("Kokoro session：{e}"))?;
     let names: Vec<_> = session.inputs().iter().map(|i| i.name().to_string()).collect();

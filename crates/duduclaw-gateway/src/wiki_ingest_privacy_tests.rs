@@ -279,3 +279,46 @@ fn ingest_prompts_carry_the_privacy_instruction() {
         kplain
     );
 }
+
+#[test]
+fn ingest_prompts_pin_memory_language_and_align_content_only() {
+    let rule = duduclaw_core::profile_sections::memory_language_instruction("zh-TW").replace("the output", "these natural-language values");
+    for prompt in [
+        build_cloud_ingest_prompt_with_privacy_and_language("input", "reply", None, Some("zh-TW")),
+        build_cloud_ingest_prompt_with_knowledge_and_privacy_and_language("input", "reply", None, Some("zh-TW")),
+    ] {
+        assert!(prompt.contains(&rule));
+        assert!(prompt.contains("content, page_title and summary"));
+        assert!(prompt.contains("Keep every JSON key and subject, predicate, object identifier-style values, doc_type and page_slug exactly as specified"));
+        assert!(prompt.contains("ASCII identifiers stay ASCII"));
+        assert!(!prompt.contains("Write the output"));
+    }
+    for prompt in [build_cloud_ingest_prompt("input", "reply"), build_cloud_ingest_prompt_with_knowledge("input", "reply")] {
+        assert!(prompt.contains("Same language as input."));
+    }
+    let facts = parse_cloud_ingest_response(r#"{"facts":[{"content":"用户记忆","subject":"用户","predicate":"记忆","object":"档案"}]}"#).unwrap();
+    let aligned = align_distilled_facts(facts, Some("zh-TW"), "input");
+    assert_eq!(aligned[0].content, "用戶記憶");
+    assert_eq!(aligned[0].predicate.as_deref(), Some("记忆"));
+    assert_eq!(aligned[0].subject.as_deref(), Some("用户"));
+    assert_eq!(aligned[0].object.as_deref(), Some("档案"));
+}
+
+#[test]
+fn local_distill_template_follows_memory_language() {
+    let input = "張大明先生今天來討論專案，決定下週交付。";
+    let traditional = extract_local_facts_with_language(input, "", Some("zh-TW"));
+    let default = extract_local_facts(input, "");
+    assert!(!traditional.is_empty());
+    assert!(traditional.iter().all(|f| f.content.contains("的對話提到")));
+    assert!(default.iter().all(|f| f.content.contains("was mentioned in a conversation")));
+}
+
+#[test]
+fn local_distill_preserves_verbatim_simplified_user_snippet() {
+    let input = "張大明先生今天讨论用户档案，决定下周交付。";
+    let facts = extract_local_facts_with_language(input, "", Some("zh-TW"));
+    assert!(!facts.is_empty());
+    assert!(facts.iter().all(|f| f.content.contains(input)));
+    assert!(facts.iter().all(|f| f.content.contains("的對話提到")));
+}

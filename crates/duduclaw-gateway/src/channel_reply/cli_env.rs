@@ -921,10 +921,14 @@ pub(super) async fn spawn_claude_cli_with_env(
                                     // Surface the model the CLI ACTUALLY used —
                                     // may differ from the requested `--model`
                                     // (tier substitution, alias resolution).
+                                    // FIX: the CLI-reported name passes the one
+                                    // validation choke point; an invalid one is
+                                    // replaced by the requested `model`.
                                     if let Some(m) = event
                                         .pointer("/message/model")
                                         .and_then(|v| v.as_str())
-                                        .filter(|m| crate::runtime_dispatch::is_observed_claude_model(m))
+                                        .filter(|m| *m != "<synthetic>")
+                                        .map(|m| crate::runtime_dispatch::accepted_reported_model(m, model))
                                     {
                                         if reported_model.as_deref() != Some(m) {
                                             reported_model = Some(m.to_string());

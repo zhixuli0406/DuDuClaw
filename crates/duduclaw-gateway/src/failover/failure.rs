@@ -34,12 +34,31 @@ pub struct RuntimePreflightFailure {
     pub kind: RuntimePreflightKind,
     pub error: String,
 }
+/// RM-181: a fallback engine was configured but deliberately not used,
+/// and why (see [`super::fallback_rule`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FallbackSkip {
+    pub runtime: RuntimeType,
+    pub reason: super::fallback_rule::FallbackRefusal,
+}
+impl FallbackSkip {
+    /// 「已設定備援引擎 X，但…。」 — plain words, no internal names.
+    pub(crate) fn sentence(&self) -> String {
+        let label = match self.runtime {
+            RuntimeType::OpenAiCompat => "所選 API 後端",
+            runtime => runtime.spec().display_name,
+        };
+        format!("已設定備援引擎 {label}，但{}。", self.reason.zh_tw())
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeDispatchFailure {
     pub requested: Option<RuntimeType>,
     pub requested_model: String,
     pub preflight: Option<RuntimePreflightFailure>,
     pub steps: Vec<RuntimeStep>,
+    /// Set when a fallback engine is configured and the rule refused it.
+    pub fallback_skipped: Option<FallbackSkip>,
 }
 impl RuntimeDispatchFailure {
     pub(crate) fn new(runtime: RuntimeType, model: &str) -> Self {
@@ -48,7 +67,17 @@ impl RuntimeDispatchFailure {
             requested_model: model.into(),
             preflight: None,
             steps: vec![],
+            fallback_skipped: None,
         }
+    }
+    /// Record that the configured `fallback` was not used for `reason`.
+    pub(crate) fn skip_fallback(
+        mut self,
+        fallback: Option<&RuntimeType>,
+        reason: super::fallback_rule::FallbackRefusal,
+    ) -> Self {
+        self.fallback_skipped = fallback.map(|runtime| FallbackSkip { runtime: *runtime, reason });
+        self
     }
     pub(crate) fn preflight(
         runtime: Option<RuntimeType>,
@@ -61,6 +90,7 @@ impl RuntimeDispatchFailure {
             requested_model: model.into(),
             preflight: Some(RuntimePreflightFailure { kind, error }),
             steps: vec![],
+            fallback_skipped: None,
         }
     }
     pub(crate) fn push(
@@ -163,6 +193,9 @@ impl std::fmt::Display for RuntimeDispatchFailure {
         }
         if self.steps.len() == 1 {
             write!(f, "; no fallback attempted")?;
+        }
+        if let Some(skip) = &self.fallback_skipped {
+            write!(f, " (configured fallback {} not used: {})", skip.runtime.as_str(), skip.reason.token())?;
         }
         Ok(())
     }

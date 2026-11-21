@@ -98,6 +98,7 @@ impl MethodHandler {
             pending_update: RwLock::new(None),
             user_db: RwLock::new(None),
             jwt_config: RwLock::new(None),
+            license_runtime: crate::license_runtime::global().cloned(),
             extension,
             edition_override: RwLock::new(None),
             #[cfg(test)]

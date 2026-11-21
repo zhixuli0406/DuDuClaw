@@ -73,10 +73,6 @@ fn sandbox_profile(
 /// writable (the built-ins kill the MCP sidecar's SQLite state).
 const SANDBOX_PROFILE_WW: &str = "duduclaw-ww";
 const SANDBOX_PROFILE_RO: &str = "duduclaw-ro";
-/// Availability-probe timeout — a bare `grok` starts the interactive TUI, so the
-/// probe must never be able to hang the registry.
-/// Cap the system prompt embedded into the prompt argument (ARG_MAX safety).
-const MAX_SYSTEM_PROMPT_BYTES: usize = 65536;
 /// Spawn env turning off Grok's Claude- and Cursor-compat MCP scanning
 /// (`[compat.claude] mcps` / `[compat.cursor] mcps`, both on by default;
 /// env names from Grok 1.0.62's `26-config-reference.md`). Without them Grok
@@ -330,41 +326,23 @@ fn resolve_grok_path() -> String {
 /// Grok's own agent scaffolding wholesale; embedding the system prompt in the
 /// payload (as the other CLI backends do) delivers it without clobbering that
 /// scaffolding.
+///
+/// RM-204: the payload is the single `-p` argv element, so it is kept under
+/// [`super::prompt_budget::SINGLE_ARGUMENT_PAYLOAD_BUDGET`] by the
+/// section-aware reduction (summaries, pinned instructions, the historical
+/// note and the knowledge rules are never dropped). Byte-identical to the
+/// v1.83.0 framing below the budget. Spawns use [`checked_payload`].
+#[cfg(test)]
 fn build_prompt(context: &RuntimeContext, user_prompt: &str) -> String {
-    // Limit system_prompt to 64KB to avoid ARG_MAX issues. Char-boundary-safe
-    // truncation (never raw byte-index slicing — 2026-06 review convention #1).
-    let system_prompt: &str = if context.system_prompt.len() > MAX_SYSTEM_PROMPT_BYTES {
-        warn!(
-            agent = %context.agent_id,
-            original_len = context.system_prompt.len(),
-            "system_prompt truncated to 64KB"
-        );
-        duduclaw_core::truncate_bytes(&context.system_prompt, MAX_SYSTEM_PROMPT_BYTES)
-    } else {
-        &context.system_prompt
-    };
+    super::prompt_budget::single_argument_payload(context, user_prompt, "grok")
+}
 
-    // Prevent argument injection: a prompt starting with '-' would be parsed as a flag.
-    let safe_prompt = if user_prompt.starts_with('-') {
-        format!(" {user_prompt}")
-    } else {
-        user_prompt.to_string()
-    };
-
-    let with_history = if context.conversation_history.is_empty() {
-        safe_prompt
-    } else {
-        super::format_history_as_prompt(&context.conversation_history, &safe_prompt)
-    };
-
-    if system_prompt.is_empty() {
-        with_history
-    } else {
-        // Escape closing tag in the system prompt to keep the XML frame intact.
-        let safe_system =
-            system_prompt.replace("</system_instructions>", "&lt;/system_instructions&gt;");
-        format!("<system_instructions>\n{safe_system}\n</system_instructions>\n\n{with_history}")
-    }
+/// The `-p` payload for a spawn: refused with the plain-language
+/// prompt-too-large error when the conversation's required context does not
+/// fit one argument (instead of an opaque `execve` failure).
+fn checked_payload(context: &RuntimeContext, user_prompt: &str) -> Result<String, String> {
+    super::prompt_budget::try_single_argument_payload(context, user_prompt, "grok")
+        .map_err(|_| super::prompt_budget::prompt_too_large_error("grok"))
 }
 
 // ── AgentRuntime impl ───────────────────────────────────────────
@@ -388,7 +366,7 @@ impl AgentRuntime for GrokRuntime {
             // RM-103 S3: the employee's native write/shell restrictions hold in
             // protected mode too — refused before the isolated route.
             super::protected_coarse_native_gate(context.capabilities.as_ref(), "grok", &context.agent_id)?;
-            let payload = build_prompt(context, prompt);
+            let payload = checked_payload(context, prompt)?;
             let out = crate::isolation_mcp::runtime::execute_native(
                 duduclaw_isolation::execution::RuntimeKind::Grok, payload.clone(), context).await?;
             let stdout = std::str::from_utf8(&out).map_err(|_| "invalid isolated Grok output")?;
@@ -493,7 +471,7 @@ impl AgentRuntime for GrokRuntime {
             }
         }
 
-        let payload = build_prompt(context, prompt);
+        let payload = checked_payload(context, prompt)?;
 
         // Build the argument vector ONCE so the tokio spawn and the PTY retry run
         // a byte-identical command.
@@ -684,7 +662,7 @@ impl AgentRuntime for GrokRuntime {
             crate::process_group::output_for_model(
             &mut cmd, None, deadline.saturating_duration_since(tokio::time::Instant::now()),
         )).await.map_err(|e| match e {
-            crate::process_group::OutputError::Timeout => format!("Grok CLI hard timeout after {timeout_secs}s"),
+            crate::process_group::OutputError::Timeout => grok_hard_timeout(timeout_secs),
             crate::process_group::OutputError::Io(e) => crate::process_group::backend_error(e, "Failed to run grok"),
         })?;
 
@@ -778,7 +756,7 @@ impl AgentRuntime for GrokRuntime {
                         pty_retry = false,
                         "grok PTY retry still returned empty output"
                     ),
-                    Err(e) if e.starts_with("Grok CLI hard timeout after ") => return Err(e),
+                    Err(e) if is_grok_hard_timeout(&e) => return Err(e),
                     Err(e) => warn!(
                         runtime = "grok",
                         agent = %context.agent_id,
@@ -1010,7 +988,7 @@ impl GrokRuntime {
         // The PTY adapter admits at native spawn and releases at handoff.
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return Err(format!("Grok CLI hard timeout after {timeout_secs}s"));
+            return Err(grok_hard_timeout(timeout_secs));
         }
         let out = duduclaw_core::execution_gate::with_runtime(
             duduclaw_core::execution_gate::RuntimeKind::Grok,
@@ -1038,11 +1016,24 @@ impl GrokRuntime {
 fn grok_pty_error(error: duduclaw_cli_runtime::PtyError, timeout_secs: u64) -> String {
     match error {
         duduclaw_cli_runtime::PtyError::ReadTimeout(_)
-        | duduclaw_cli_runtime::PtyError::WriteTimeout(_) => {
-            format!("Grok CLI hard timeout after {timeout_secs}s")
-        }
+        | duduclaw_cli_runtime::PtyError::WriteTimeout(_) => grok_hard_timeout(timeout_secs),
         error => format!("grok PTY retry invoke failed: {error}"),
     }
+}
+
+/// RM-181 (v1.84.0): reaching the run's time limit is a result of the work
+/// itself, so Grok reports it as the same typed work result the Codex path
+/// produces — the same notice for the person, and no re-run on the fallback
+/// engine. Reverting this one function to the v1.83.0 string
+/// (`format!("Grok CLI hard timeout after {timeout_secs}s")`) restores the
+/// old behaviour; [`is_grok_hard_timeout`] accepts both forms.
+fn grok_hard_timeout(timeout_secs: u64) -> String {
+    crate::work_outcome::WorkOutcome::TimeoutTotal { seconds: timeout_secs, partial: String::new() }.encode()
+}
+
+fn is_grok_hard_timeout(error: &str) -> bool {
+    matches!(crate::work_outcome::WorkOutcome::decode(error), Some(crate::work_outcome::WorkOutcome::TimeoutTotal { .. }))
+        || error.starts_with("Grok CLI hard timeout after ")
 }
 
 /// Clean a PTY one-shot's raw stdout into a user-safe answer.
@@ -1299,8 +1290,13 @@ mod tests {
         let error = super::grok_pty_error(
             duduclaw_cli_runtime::PtyError::ReadTimeout(std::time::Duration::from_secs(600)), 600,
         );
-        assert_eq!(error, "Grok CLI hard timeout after 600s");
+        // RM-181 (v1.84.0): the same typed work result as the Codex path.
+        assert_eq!(crate::work_outcome::WorkOutcome::decode(&error),
+            Some(crate::work_outcome::WorkOutcome::TimeoutTotal { seconds: 600, partial: String::new() }));
         assert_eq!(crate::channel_reply::classify_cli_failure(&error), crate::channel_reply::FailureReason::TimeoutTotal);
+        assert!(super::is_grok_hard_timeout(&error));
+        assert!(super::is_grok_hard_timeout("Grok CLI hard timeout after 600s"), "the v1.83.0 form still stops the retry");
+        assert!(!super::is_grok_hard_timeout("grok PTY retry invoke failed: x"));
     }
 
     use super::*;
@@ -1586,6 +1582,30 @@ mod tests {
         let out = build_prompt(&c, "x");
         assert!(out.is_char_boundary(out.len()));
         assert!(out.contains("x"));
+    }
+
+    /// RM-204/RM-206: the `-p` argument keeps the summary, the pinned
+    /// instructions, the historical note, the knowledge rules and the most
+    /// recent turns when the prompt is far over the single-argument limit,
+    /// and stays under it. Below the limit the v1.83.0 bytes are unchanged.
+    #[tokio::test]
+    async fn oversized_grok_argument_keeps_conversation_sections_under_budget() {
+        use crate::runtime::prompt_budget::{tests::layered_prompt, with_layout, SINGLE_ARGUMENT_PAYLOAD_BUDGET};
+        let (prompt, layout) = layered_prompt(90_000, 30_000);
+        let mut c = ctx(&prompt, "grok-4");
+        c.conversation_history = (0..30).map(|i| super::super::ConversationTurn {
+            role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
+            content: format!("GROK-TURN-{i}:{}", "內容".repeat(400)),
+        }).collect();
+        let out = with_layout(layout, async { build_prompt(&c, "GROK-NOW") }).await;
+        assert!(out.len() <= SINGLE_ARGUMENT_PAYLOAD_BUDGET, "{}", out.len());
+        for marker in ["SUMMARY-MARKER", "PINNED-MARKER", "HISTORICAL-NOTE-MARKER", "KNOWLEDGE-RULES-MARKER",
+            "GROK-TURN-27:", "GROK-TURN-28:", "GROK-TURN-29:", "GROK-NOW"] {
+            assert!(out.contains(marker), "{marker} lost");
+        }
+        // Small prompt: byte-identical framing.
+        let small = ctx("sys", "");
+        assert_eq!(build_prompt(&small, "hi"), "<system_instructions>\nsys\n</system_instructions>\n\nhi");
     }
 
     #[test]

@@ -34,11 +34,12 @@
 //! no-op (`Ok(None)` / `None` — proceed with the write). An engine that never
 //! opts into the semantic embedder is completely unaffected by this module.
 
-use rusqlite::{params, Connection};
+use rusqlite::Connection;
 
 use duduclaw_core::error::{DuDuClawError, Result};
 
 use crate::embedding::cosine_similarity;
+use crate::engine::conversation_scope::RowScope;
 use crate::vector::{decode_vec, EmbeddingProvider};
 
 /// Config for the B1 gate.
@@ -82,6 +83,24 @@ pub struct NoveltyRejection {
     pub threshold: f32,
 }
 
+/// Start of the error message of a write the engine refused through this
+/// gate (`"<prefix>: <rejection>"`; the rejection names the matched id and
+/// the cosine, which belong in server logs only).
+pub const NOVELTY_REJECTED_PREFIX: &str = "novelty gate rejected write";
+
+/// v1.84.0: whether `err` is the engine's novelty-gate refusal (an anchored
+/// match on the whole prefix plus its `": "` separator, never a substring),
+/// so a caller answering a conversation can replace its text with one that
+/// names no memory id or similarity.
+pub fn is_novelty_rejection(err: &DuDuClawError) -> bool {
+    match err {
+        DuDuClawError::Memory(msg) => msg
+            .strip_prefix(NOVELTY_REJECTED_PREFIX)
+            .is_some_and(|rest| rest.starts_with(": ")),
+        _ => false,
+    }
+}
+
 impl std::fmt::Display for NoveltyRejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -96,28 +115,42 @@ impl std::fmt::Display for NoveltyRejection {
 /// candidate vectors, capped at `MAX_KNN_SCAN` rows (mirrors
 /// `vector::vector_knn`'s scan cap — personal-scale memory DBs never come
 /// close to it; a cap protects pathological agents from an unbounded scan).
+///
+/// v1.84.0: with a [`RowScope::Conversation`] only the rows a reader serving
+/// that conversation may see are candidates (the visibility rule is part of
+/// the SQL, so the scan cap counts visible rows only): a row hidden from the
+/// writing conversation can neither block its write nor be named in a
+/// rejection.
 fn same_layer_candidates(
     conn: &Connection,
     agent_id: &str,
     layer: &str,
     model_id: &str,
     now_rfc: &str,
+    scope: RowScope<'_>,
 ) -> Result<Vec<(String, Vec<f32>)>> {
+    let sql = format!(
+        "SELECT id, embedding FROM memories
+         WHERE agent_id = ?1 AND layer = ?2 AND embedding IS NOT NULL
+           AND embedding_model = ?3
+           AND (valid_until IS NULL OR valid_until > ?4)
+           AND quarantined = 0{visible}
+         LIMIT ?5",
+        visible = scope.and_visible("memories", "?6"),
+    );
     let mut stmt = conn
-        .prepare(
-            "SELECT id, embedding FROM memories
-             WHERE agent_id = ?1 AND layer = ?2 AND embedding IS NOT NULL
-               AND embedding_model = ?3
-               AND (valid_until IS NULL OR valid_until > ?4)
-               AND quarantined = 0
-             LIMIT ?5",
-        )
+        .prepare(&sql)
         .map_err(|e| DuDuClawError::Memory(format!("novelty gate prepare: {e}")))?;
+    let scan = crate::vector::MAX_KNN_SCAN as i64;
+    let session = scope.session();
+    let mut bound: Vec<&dyn rusqlite::ToSql> = vec![&agent_id, &layer, &model_id, &now_rfc, &scan];
+    if scope.is_scoped() {
+        bound.push(&session);
+    }
     let rows = stmt
-        .query_map(
-            params![agent_id, layer, model_id, now_rfc, crate::vector::MAX_KNN_SCAN as i64],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?)),
-        )
+        .query_map(bound.as_slice(), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })
         .map_err(|e| DuDuClawError::Memory(format!("novelty gate query: {e}")))?;
 
     let mut out = Vec::new();
@@ -150,6 +183,23 @@ pub fn check_novelty(
     config: &NoveltyGateConfig,
     now_rfc: &str,
 ) -> Result<Option<NoveltyRejection>> {
+    check_novelty_scoped(conn, agent_id, layer, content, embedder, config, now_rfc, RowScope::All)
+}
+
+/// [`check_novelty`] over the candidates of `scope` only (v1.84.0): a write
+/// made for one conversation is compared against the rows that conversation
+/// may see, never against another conversation's.
+#[allow(clippy::too_many_arguments)]
+pub fn check_novelty_scoped(
+    conn: &Connection,
+    agent_id: &str,
+    layer: &str,
+    content: &str,
+    embedder: &dyn EmbeddingProvider,
+    config: &NoveltyGateConfig,
+    now_rfc: &str,
+    scope: RowScope<'_>,
+) -> Result<Option<NoveltyRejection>> {
     if !config.enabled {
         return Ok(None);
     }
@@ -159,7 +209,7 @@ pub fn check_novelty(
         // vector) — nothing meaningful to compare, never block.
         return Ok(None);
     }
-    let candidates = same_layer_candidates(conn, agent_id, layer, embedder.id(), now_rfc)?;
+    let candidates = same_layer_candidates(conn, agent_id, layer, embedder.id(), now_rfc, scope)?;
     if candidates.is_empty() {
         return Ok(None);
     }
@@ -194,7 +244,7 @@ pub fn check_novelty(
 mod tests {
     use super::*;
     use crate::vector::{store_embedding, NgramHashEmbedder};
-    use rusqlite::Connection;
+    use rusqlite::{params, Connection};
 
     /// Minimal `memories` table for these unit tests — only the columns
     /// `check_novelty` actually touches. The real schema (engine.rs) has

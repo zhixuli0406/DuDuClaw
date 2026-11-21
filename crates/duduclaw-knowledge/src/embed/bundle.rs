@@ -115,15 +115,15 @@ pub fn verify_and_unpack(
     unpack_from(f, spec, home)
 }
 
-/// Relative path inside the tar → (destination, pinned size), for
+/// Relative path inside the tar → (destination, pinned size, SHA-256), for
 /// everything a bundle of `spec` may contain on this platform.
-fn expected_entries(spec: &ModelSpec, home: &Path) -> HashMap<String, (PathBuf, u64)> {
+fn expected_entries(spec: &ModelSpec, home: &Path) -> HashMap<String, (PathBuf, u64, String)> {
     let mut map = HashMap::new();
     let dir = spec.install_dir(home);
     for f in &spec.files {
         map.insert(
             format!("models/embedding/{}/{}", spec.id, f.path),
-            (ModelSpec::dest(&dir, f), f.size),
+            (ModelSpec::dest(&dir, f), f.size, f.sha256.clone()),
         );
     }
     if let Some(a) = ort_manifest::ort_archive_for_current_platform() {
@@ -134,7 +134,7 @@ fn expected_entries(spec: &ModelSpec, home: &Path) -> HashMap<String, (PathBuf, 
                 v = ort_manifest::ORT_VERSION,
                 ext = a.kind.extension()
             ),
-            (duduclaw_onnx::install::ort_archive_path(&root, a), a.size),
+            (duduclaw_onnx::install::ort_archive_path(&root, a), a.size, a.sha256.to_string()),
         );
     }
     map
@@ -146,27 +146,20 @@ pub fn unpack(tar: &Path, spec: &ModelSpec, home: &Path) -> Result<usize, String
     unpack_from(f, spec, home)
 }
 
-/// Write one entry to `<dest>.part` (at most `size` bytes), then rename. The
-/// `.part` file is removed on any failure.
-fn write_entry(entry: &mut impl Read, dest: &Path, size: u64, path: &str) -> Result<(), String> {
+/// Write into a random exclusive temporary, verify the held handle, then rename.
+/// The temporary is removed on any failure; legacy `<dest>.part` is never opened.
+fn write_entry(entry: &mut impl Read, dest: &Path, size: u64, sha: &str, path: &str) -> Result<(), String> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let part = duduclaw_onnx::install::part_path(dest);
-    let result = (|| -> Result<(), String> {
-        let mut out = std::fs::File::create(&part).map_err(|e| e.to_string())?;
-        let copied = std::io::copy(&mut entry.take(size + 1), &mut out)
-            .map_err(|e| format!("解開安裝包失敗：{e}"))?;
-        if copied > size {
-            return Err(format!("安裝包內的 {path} 比預期大，已拒絕"));
-        }
-        drop(out);
-        std::fs::rename(&part, dest).map_err(|e| e.to_string())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&part);
+    let mut out = duduclaw_onnx::install::new_temp(dest).map_err(|e| e.to_string())?;
+    let limit = size.checked_add(1).ok_or("安裝包大小紀錄錯誤")?;
+    let copied = std::io::copy(&mut entry.take(limit), &mut out)
+        .map_err(|e| format!("解開安裝包失敗：{e}"))?;
+    if copied > size {
+        return Err(format!("安裝包內的 {path} 比預期大，已拒絕"));
     }
-    result
+    duduclaw_onnx::install::finish_download(out, dest, size, sha).map_err(|e| e.to_string())
 }
 
 /// Unpack a verified bundle: only the expected regular files, each capped at
@@ -205,10 +198,10 @@ fn unpack_from_with_isolation(reader: impl Read, spec: &ModelSpec, home: &Path, 
         if path == manifest {
             continue;
         }
-        let Some((dest, size)) = expected.get(&path) else {
+        let Some((dest, size, sha)) = expected.get(&path) else {
             return Err(format!("安裝包內有預期以外的檔案：{path}"));
         };
-        write_entry(&mut entry, dest, *size, &path)?;
+        write_entry(&mut entry, dest, *size, sha, &path)?;
         written += 1;
     }
     Ok(written)
@@ -260,9 +253,66 @@ mod tests {
         s.files = vec![super::super::catalog::ModelFile {
             path: "onnx/m.onnx".into(),
             size: 5,
-            sha256: "0".repeat(64),
+            sha256: {
+                use sha2::{Digest, Sha256};
+                format!("{:x}", Sha256::digest(b"model"))
+            },
         }];
         s
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn import_ignores_precreated_part_symlink() {
+        let home = tempfile::tempdir().unwrap();
+        let s = spec();
+        let tar = home.path().join("ok.tar");
+        tar_with(&[("models/embedding/tiny/onnx/m.onnx", b"model")], &tar);
+        let dest = s.install_dir(home.path()).join("onnx/m.onnx");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        let victim = home.path().join("victim");
+        std::fs::write(&victim, b"untouched").unwrap();
+        let legacy = duduclaw_onnx::install::part_path(&dest);
+        std::os::unix::fs::symlink(&victim, &legacy).unwrap();
+        assert_eq!(unpack(&tar, &s, home.path()).unwrap(), 1);
+        assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+        assert!(std::fs::symlink_metadata(legacy).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(dest).unwrap(), b"model");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ort_archive_import_does_not_follow_legacy_part_symlink() {
+        let Some(archive) = ort_manifest::ort_archive_for_current_platform() else { return; };
+        let home = tempfile::tempdir().unwrap();
+        let dest = duduclaw_onnx::install::ort_archive_path(&super::super::install::ort_root(home.path()), archive);
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        let victim = home.path().join("victim");
+        std::fs::write(&victim, b"untouched").unwrap();
+        let legacy = duduclaw_onnx::install::part_path(&dest);
+        std::os::unix::fs::symlink(&victim, &legacy).unwrap();
+        let entry = format!("lib/onnxruntime/{v}/onnxruntime-{v}.{ext}",
+            v = ort_manifest::ORT_VERSION, ext = archive.kind.extension());
+        let tar = home.path().join("bad-ort.tar");
+        tar_with(&[(&entry, b"not the pinned archive")], &tar);
+        // Cleanly refuse an unpinned archive without opening the legacy partial.
+        assert!(unpack(&tar, &spec(), home.path()).is_err());
+        assert_eq!(std::fs::read(victim).unwrap(), b"untouched");
+        assert!(std::fs::symlink_metadata(legacy).unwrap().file_type().is_symlink());
+        assert!(!dest.exists());
+        assert_eq!(std::fs::read_dir(dest.parent().unwrap()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn import_refuses_wrong_digest_before_publishing() {
+        let home = tempfile::tempdir().unwrap();
+        let tar = home.path().join("bad.tar");
+        let s = spec();
+        tar_with(&[("models/embedding/tiny/onnx/m.onnx", b"wrong")], &tar);
+        assert!(unpack(&tar, &s, home.path()).unwrap_err().contains("sha256"));
+        let dest = s.install_dir(home.path()).join("onnx/m.onnx");
+        assert!(!dest.exists());
+        assert_eq!(std::fs::read_dir(dest.parent().unwrap()).unwrap().count(), 0);
     }
 
     #[test]

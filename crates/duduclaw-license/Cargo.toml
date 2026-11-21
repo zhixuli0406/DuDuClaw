@@ -38,10 +38,17 @@ mac_address = "1"
 # Error handling
 thiserror = { workspace = true }
 
+# Logging (fixed messages only, never licence content)
+tracing = { workspace = true }
+
 # Filesystem
 dirs = "5"
 fs2 = "0.4"
 tempfile = "3"
+
+# No-follow / non-blocking open of the licence store files.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["iphlpapi", "iptypes", "ws2def", "winerror"] }

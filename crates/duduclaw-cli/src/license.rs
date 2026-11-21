@@ -148,6 +148,25 @@ mod gateway_home_check_tests {
     use super::*;
 
     #[test]
+    fn container_hint_uses_generic_names_and_current_executable() {
+        for name in ["duduclaw", "duduclaw-pro"] {
+            let message = gateway_home_hint(std::path::Path::new("/data"),
+                Some(&std::path::Path::new("/usr/local/bin").join(name)));
+            assert!(message.contains("docker exec <容器名稱> <執行檔> license"));
+            assert!(message.contains("docker compose exec <服務名稱> <執行檔> license"));
+            assert!(!message.contains("docker compose exec duduclaw"));
+            assert!(!message.contains("docker compose exec gateway"));
+            assert!(message.contains(&format!("You just ran `{name}`")));
+            assert!(message.contains("docker ps"));
+        }
+        let current = std::env::current_exe().unwrap();
+        let message = gateway_home_hint(std::path::Path::new("/data"), Some(&current));
+        let known = matches!(current.file_name().and_then(|n| n.to_str()), Some("duduclaw" | "duduclaw-pro"));
+        assert_eq!(message.contains("You just ran"), known);
+        assert!(!gateway_home_hint(std::path::Path::new("/data"), None).contains("You just ran"));
+    }
+
+    #[test]
     fn missing_or_unlocked_gateway_home_is_not_in_use() {
         let home = tempfile::tempdir().unwrap();
         assert_eq!(gateway_home_check(home.path()), GatewayHomeStatus::NotHeld);
@@ -176,6 +195,20 @@ mod gateway_home_check_tests {
     }
 }
 
+fn gateway_home_hint(home: &std::path::Path, executable: Option<&std::path::Path>) -> String {
+    let name = executable.and_then(|path| path.file_name()).and_then(|name| name.to_str());
+    let likely = match name {
+        Some(name @ ("duduclaw" | "duduclaw-pro")) => format!(
+            "\n   您剛執行的是 `{name}`，容器內的執行檔可能也是 `{name}`。\n   You just ran `{name}`; this is also the likely executable inside the container."
+        ),
+        _ => String::new(),
+    };
+    format!(
+        "⚠️ 此資料目錄目前沒有執行中的 gateway：{}。容器版的資料存放在 Docker volume，授權指令必須在實際提供這套安裝服務的容器內執行。請用 `docker ps` 查詢容器名稱，再執行 `docker exec <容器名稱> <執行檔> license …` 或 `docker compose exec <服務名稱> <執行檔> license …`。執行檔請使用容器啟動時的程式：`duduclaw`，企業版映像則是 `duduclaw-pro`。\n   This data directory has no running gateway. Container installs keep data in a Docker volume; run the license command inside the container actually serving this installation. Find its name with `docker ps`, then use `docker exec <container-name> <executable> license …` or `docker compose exec <service-name> <executable> license …`. Use the executable the container was started with: `duduclaw`, or `duduclaw-pro` in the enterprise image.{likely}",
+        home.display()
+    )
+}
+
 fn check_gateway_home(strict: bool) -> Result<()> {
     let home = storage::license_dir().map_err(|e| DuDuClawError::License(format!("license directory: {e}")))?;
     match gateway_home_check(&home) {
@@ -186,10 +219,8 @@ fn check_gateway_home(strict: bool) -> Result<()> {
         }
         GatewayHomeStatus::NotHeld => {}
     }
-    let message = format!(
-        "⚠️ 此資料目錄目前沒有執行中的 gateway：{}。容器版的資料存放在 Docker volume，請在容器內更新授權：`docker compose exec duduclaw duduclaw license <activate|import|refresh|deactivate|rebind>`。\n   This data directory has no running gateway. Container installs keep data in the Docker volume; run the license command inside the container.",
-        home.display()
-    );
+    let executable = std::env::current_exe().ok();
+    let message = gateway_home_hint(&home, executable.as_deref());
     if strict {
         return Err(DuDuClawError::License(message));
     }
@@ -441,19 +472,19 @@ fn binding_label(binding: &Binding) -> &'static str {
     }
 }
 
-/// Read a control-plane error body into a friendly message.
+/// Read a control-plane error body (bounded) into a friendly message.
 async fn control_error(resp: reqwest::Response) -> DuDuClawError {
     let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    let msg = serde_json::from_str::<serde_json::Value>(&body)
-        .ok()
-        .and_then(|v| {
-            v.get("message")
-                .and_then(|m| m.as_str())
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| body.chars().take(200).collect());
+    let msg = duduclaw_gateway::license_transport::error_excerpt(resp).await;
     DuDuClawError::License(format!("control-plane returned HTTP {status}: {msg}"))
+}
+
+/// Every control-plane answer is read through the gateway's bounded reader
+/// (256 KiB) before it is parsed or verified.
+async fn control_json(resp: reqwest::Response, what: &str) -> Result<serde_json::Value> {
+    duduclaw_gateway::license_transport::read_bounded_json(
+        resp, duduclaw_gateway::license_transport::MAX_LICENSE_RESPONSE_BYTES,
+    ).await.map_err(|e| DuDuClawError::License(format!("parse {what} response: {e}")))
 }
 
 // ── rebind (move to this machine) ─────────────────────────────
@@ -518,10 +549,7 @@ async fn cmd_rebind() -> Result<()> {
     }
 
     let status = resp.status();
-    let envelope: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| DuDuClawError::License(format!("parse rebind response: {e}")))?;
+    let envelope = control_json(resp, "rebind").await?;
     if response_pending(status, &envelope) {
         validate_status_response(&envelope, "pending", &installed, &new_fp, &nonce)?;
         println!("{REBIND_PENDING_MESSAGE}");
@@ -568,10 +596,7 @@ async fn cmd_subscriptions() -> Result<()> {
         return Err(control_error(resp).await);
     }
 
-    let s: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| DuDuClawError::License(format!("parse status response: {e}")))?;
+    let s = control_json(resp, "status").await?;
 
     let get = |k: &str| s.get(k).and_then(|v| v.as_str()).unwrap_or("?").to_string();
     println!("Subscription:     {}", get("subscription_id"));
@@ -589,6 +614,10 @@ async fn cmd_subscriptions() -> Result<()> {
 }
 
 // ── activate ──────────────────────────────────────────────────
+
+/// RM-175: printed after a licence is saved. A running gateway on this data
+/// directory picks the file up from its 60-second watcher; no IPC.
+const LIVE_APPLY_NOTE: &str = "  執行中的服務約一分鐘內自動套用新授權，不需重新啟動 (a running service on this data directory applies it within about a minute; no restart needed).";
 
 async fn cmd_activate(key_input: &str) -> Result<()> {
     let license = parse_license_input(key_input)?;
@@ -651,6 +680,7 @@ async fn cmd_activate(key_input: &str) -> Result<()> {
     if let Some(sas) = local_pubkey.as_deref().and_then(duduclaw_gateway::installation_identity::sas_for_hex) {
         println!("  Relay key:      {sas} ({})", relay_key_line(&license, local_pubkey.as_deref()));
     }
+    println!("{LIVE_APPLY_NOTE}");
 
     Ok(())
 }
@@ -958,16 +988,10 @@ async fn cmd_refresh() -> Result<()> {
 
     let status = response.status();
     if !status.is_success() {
-        let body_text = response.text().await.unwrap_or_else(|_| "<no body>".into());
-        return Err(DuDuClawError::License(format!(
-            "control-plane returned HTTP {status}: {body_text}"
-        )));
+        return Err(control_error(response).await);
     }
 
-    let envelope: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| DuDuClawError::License(format!("parse refresh response: {e}")))?;
+    let envelope = control_json(response, "refresh").await?;
 
     if response_pending(status, &envelope) {
         validate_status_response(&envelope, "pending", &license, &proposed_fingerprint, &nonce)?;
@@ -998,6 +1022,7 @@ async fn cmd_refresh() -> Result<()> {
             if let Some(sas) = local_pubkey.as_deref().and_then(duduclaw_gateway::installation_identity::sas_for_hex) {
                 println!("  Relay key:      {sas} ({})", relay_key_line(&new_license, local_pubkey.as_deref()));
             }
+            println!("{LIVE_APPLY_NOTE}");
 
             if let Some(warnings) = envelope.get("warnings").and_then(|v| v.as_array()) {
                 if !warnings.is_empty() {

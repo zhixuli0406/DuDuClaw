@@ -190,6 +190,17 @@ pub enum GuardDecision {
         caller: String,
         attempted_path: PathBuf,
     },
+    /// v1.84.0 (RM-200): an agent-identified caller tried to write, create,
+    /// move into or delete something under its OWN `wiki/auto/` (any spelling
+    /// a file system opens as `auto/`), or the legacy `wiki/.auto-pages*`
+    /// lock / sidecar. Auto pages are filed by the gateway from conversation
+    /// content and their conversation visibility depends on host-owned
+    /// records; only the gateway and the dashboard's human actions change
+    /// them. See [`crate::org_field_guard::check_own_auto_wiki_write`].
+    BlockedOwnAutoWikiWrite {
+        caller: String,
+        attempted_path: PathBuf,
+    },
     /// Removed-name reservation (`crate::agent_trash`): an agent-identified
     /// caller tried to write, move or delete something under
     /// `<home>/agents/_trash/`, where removed employees are kept. Emptying an
@@ -377,6 +388,14 @@ impl GuardDecision {
                  檔案：{}\n\
                  你的身分：{}\n\
                  如果需要調整工作規則，請告知管理者，由管理者處理。",
+                attempted_path.display(),
+                caller
+            )),
+            Self::BlockedOwnAutoWikiWrite { caller, attempted_path } => Some(format!(
+                "已封鎖：知識庫的 auto/（自動建檔）由系統從對話自動整理，AI 員工不可直接新增、改寫、移入或刪除（即使是自己的知識庫）。\n\
+                 檔案：{}\n\
+                 你的身分：{}\n\
+                 請把筆記寫在 auto/ 以外的路徑；自動建檔頁面請由管理者在「記憶與知識 → 策展台」確認、分享或移除。",
                 attempted_path.display(),
                 caller
             )),

@@ -3,7 +3,7 @@
 > **Release status:** Personal bindings and the production connectors described
 > here belong to the per-employee Linux isolation architecture, which is planned
 > for a later release. Its code has been included since v1.81.0 but cannot be
-> installed or enabled on a customer host; v1.82.0 runs the single-binary
+> installed or enabled on a customer host; the current release runs the single-binary
 > protected service as in v1.80, and no installation has Personal employees or
 > employee-specific connector accounts yet.
 

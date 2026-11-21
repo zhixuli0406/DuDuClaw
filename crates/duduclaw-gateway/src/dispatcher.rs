@@ -3743,26 +3743,145 @@ pub(crate) fn prepare_channel_text(text: &str) -> String {
 pub(crate) fn sanitize_for_channel(text: &str) -> String {
     text.lines()
         .filter(|line| !line.contains("[DUDUCLAW_SYSTEM:"))
-        .map(|line| {
-            // Redact absolute paths like /Users/xxx/... or /home/xxx/...
-            if line.contains("/Users/") || line.contains("/home/") {
-                let mut result = line.to_string();
-                for prefix in &["/Users/", "/home/"] {
-                    while let Some(start) = result.find(prefix) {
-                        let end = result[start..]
-                            .find(|c: char| c.is_whitespace() || c == '\'' || c == '"' || c == ')')
-                            .map(|e| start + e)
-                            .unwrap_or(result.len());
-                        result.replace_range(start..end, "[path]");
-                    }
-                }
-                result
-            } else {
-                line.to_string()
-            }
-        })
+        .map(redact_channel_paths)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Mask only home-directory tokens, retaining the v1.83 scope rather than
+/// treating every slash command, route, or rooted path as private information.
+/// Unix `Users`/`home` must be the first segment, or follow one of the explicit
+/// filesystem roots below: this hides temporary/mounted home prefixes without
+/// mistaking `/api/Users/list` for a home. A nonempty following segment is required.
+/// Drive paths also accept case-insensitive `Users` and backslash separators.
+/// `file://` authorities are skipped before applying the same path rules; HTTP(S),
+/// UNC and tilde paths are not candidates. Unix segment matching is case-sensitive.
+/// Scan left to right once, truncating already copied prefixes on qualification
+/// so the whole token is hidden. Only qualified paths consume quoted/bracketed
+/// spaces through the matching closer; full-width prose punctuation always ends
+/// a path. All offsets come from char_indices, including output truncation points.
+///
+/// As a v1.83.0 privacy floor for paths containing spaces, an otherwise unmasked
+/// mid-token `/Users/` or `/home/` with a nonempty name hides that suffix through
+/// the next whitespace, closer, or full-width punctuation. HTTP(S) URLs up to
+/// their end, UNC paths, tilde paths, and slash-rooted tokens whose first segment
+/// is unlisted remain exempt; this floor does not extend to Windows backslash paths.
+fn redact_channel_paths(line: &str) -> String {
+    let mut output = String::with_capacity(line.len());
+    let mut chars = line.char_indices().peekable();
+    let mut closers = Vec::new();
+    let mut boundary = true;
+    let mut floor_exempt = false;
+    while let Some((at, c)) = chars.next() {
+        let rest = line.get(at..).unwrap_or_default();
+        if boundary {
+            floor_exempt = c == '~' || c == '\\';
+        }
+        if boundary && (rest.starts_with("https://") || rest.starts_with("http://")) {
+            output.push(c);
+            while let Some(&(_, next)) = chars.peek() {
+                if next.is_whitespace() || is_path_closer(next) || is_full_width_path_punctuation(next) { break; }
+                output.push(next);
+                chars.next();
+            }
+            boundary = false;
+            continue;
+        }
+        let bytes = rest.as_bytes();
+        let drive = c.is_ascii_alphabetic() && bytes.get(1) == Some(&b':')
+            && matches!(bytes.get(2), Some(b'/' | b'\\'));
+        let file = rest.starts_with("file://");
+        if boundary && (c == '/' || drive || file) {
+            let output_start = output.len();
+            output.push(c);
+            // Consume only the fixed introducer, never scan the token twice.
+            let prefix_len = if file { 7 } else if drive { 3 } else { 1 };
+            for _ in 1..prefix_len {
+                if let Some((_, next)) = chars.next() { output.push(next); }
+            }
+            let mut authority = file;
+            let mut segment_start = at + prefix_len;
+            let mut first = true;
+            let mut filesystem_root = false;
+            let mut awaiting_name = false;
+            let mut qualified = false;
+            let closer = closers.last().copied();
+            while let Some(&(pos, next)) = chars.peek() {
+                if is_full_width_path_punctuation(next) || closer == Some(next)
+                    || ((!qualified || closer.is_none()) && (next.is_whitespace() || is_path_closer(next))) {
+                    break;
+                }
+                let separator = next == '/' || (drive && next == '\\');
+                if authority {
+                    if separator {
+                        authority = false;
+                        segment_start = pos + next.len_utf8();
+                    }
+                } else if separator {
+                    let segment = line.get(segment_start..pos).unwrap_or_default();
+                    if first {
+                        filesystem_root = matches!(segment, "private" | "var" | "tmp" | "Volumes"
+                            | "mnt" | "media" | "data" | "srv" | "opt" | "root" | "System" | "Library");
+                    }
+                    awaiting_name = (first || filesystem_root)
+                        && (segment == "home" || segment == "Users"
+                            || (drive && segment.eq_ignore_ascii_case("Users")));
+                    first = false;
+                    segment_start = pos + next.len_utf8();
+                } else if awaiting_name && !qualified {
+                    qualified = true;
+                    output.truncate(output_start);
+                    output.push_str("[path]");
+                }
+                if !qualified { output.push(next); }
+                chars.next();
+            }
+            boundary = false;
+            continue;
+        }
+        let home_prefix_len = if rest.starts_with("/Users/") { 7 }
+            else if rest.starts_with("/home/") { 6 } else { 0 };
+        if !boundary && !floor_exempt && home_prefix_len != 0
+            && rest.get(home_prefix_len..).and_then(|name| name.chars().next())
+                .is_some_and(|name| !name.is_whitespace() && !is_path_closer(name)
+                    && !is_full_width_path_punctuation(name)) {
+            output.push_str("[path]");
+            while let Some(&(_, next)) = chars.peek() {
+                if next.is_whitespace() || is_path_closer(next) || is_full_width_path_punctuation(next) { break; }
+                chars.next();
+            }
+            boundary = false;
+            continue;
+        }
+        output.push(c);
+        if closers.last() == Some(&c) {
+            closers.pop();
+        } else if let Some(closer) = path_matching_closer(c) {
+            closers.push(closer);
+        }
+        boundary = c.is_whitespace() || path_matching_closer(c).is_some()
+            || is_path_closer(c) || is_full_width_path_punctuation(c)
+            || matches!(c, ':' | '=' | ',' | ';');
+    }
+    output
+}
+
+fn path_matching_closer(c: char) -> Option<char> {
+    match c {
+        '\'' | '"' | '`' => Some(c),
+        '(' => Some(')'), '[' => Some(']'), '{' => Some('}'),
+        '（' => Some('）'), '「' => Some('」'), '『' => Some('』'),
+        '【' => Some('】'),
+        _ => None,
+    }
+}
+
+fn is_path_closer(c: char) -> bool {
+    matches!(c, '\'' | '"' | '`' | ')' | ']' | '}' | '）' | '」' | '』' | '】')
+}
+
+fn is_full_width_path_punctuation(c: char) -> bool {
+    matches!(c, '：' | '，' | '。' | '；' | '、' | '！' | '？')
 }
 
 /// Validate that a channel_id contains only safe characters (alphanumeric, hyphen, underscore).
@@ -6624,6 +6743,116 @@ mod budget_refusal_tests {
         let reply = super::dispatch_failure_reply(&error);
         assert!(reply.contains("402.00") && reply.contains("花費達上限"));
         assert!(!reply.contains("請稍後再試"));
+    }
+}
+
+#[cfg(test)]
+mod path_redaction_tests {
+    #[test]
+    fn only_home_path_tokens_are_masked() {
+        for (input, expected) in [
+            ("/Users/a/x.txt", "[path]"),
+            ("/home/b/私人/k.txt", "[path]"),
+            ("/private/tmp/claude/live184/v3/home/.codex/config.toml", "[path]"),
+            ("/Volumes/Data/Users/bob/k.txt", "[path]"),
+            ("/Volumes/My Disk/Users/bob/k.txt", "/Volumes/My Disk[path]"),
+            ("'/private/tmp/測試 空間/home/.codex/config.toml'", "'/private/tmp/測試 空間[path]'"),
+            ("回到/home/畫面", "回到[path]"),
+            ("/srv/live184/home/agents/probe/.codex/config.toml", "[path]"),
+            (r"C:\Users\secret\file.txt", "[path]"),
+            ("\"c:/users/Secret/a b.txt\"", "\"[path]\""),
+            ("file:///Users/a/private.txt", "[path]"),
+            ("file://localhost/home/a/private.txt", "[path]"),
+            ("'/Users/a/secret folder/x'", "'[path]'"),
+            ("（/home/a/secret folder/file）", "（[path]）"),
+            ("at [prefix /home/a/secret folder/x] now", "at [prefix [path]] now"),
+            ("/Users/a/one：two", "[path]：two"),
+            ("https://host/a b/home/report", "https://host/a b[path]"), // URL ends at the space; `b/home/report` is a separate token and v1.83.0 masked it too.
+            ("保留\n[DUDUCLAW_SYSTEM: secret /home/a/x]\n結束", "保留\n結束"),
+        ] {
+            assert_eq!(super::sanitize_for_channel(input), expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn non_home_content_is_byte_identical() {
+        for input in [
+            "/goal 幫我整理報表", "請輸入 /交辦 或 /takeover", "/model opus", "/stop",
+            "設定檔在 /etc/hosts 與 /var/log/nginx/error.log", "編輯 ~/.zshrc",
+            "GET /api/v1/users/42", "/api/Users/list", "<div>內容</div>", "</b>",
+            "s/foo/bar/g", "本月預算 US$5.00 / 上限 US$10.00", "1/2 的進度", "11/21 開會",
+            "https://host/home/report", "https://example.com/Users/x?y=1",
+            r"\\server\share\file.txt", "請到 /home 頁面", "/tmp/build/output.log",
+            "```sh\ncd /usr/local/bin && ls\n```",
+            "請先確認資料，再整理報表。若有疑問：請提出；我們會逐項核對、回覆。",
+            "/Users/", "/home//", "/users/a", "/api/home/a",
+            "'/tmp/secret folder/x'", "（/srv/secret folder/file）", "file:///tmp/private.txt",
+            "http://host/home/report，/tmp/private", "'/tmp/secret：拒絕'",
+            r"C:\x", r"\\server\home\a", "~/home/a", "/opt/x", "/root/x",
+            "'/tmp/no-home /goal'", "GET /api/v1/home/feed",
+            r"D:\My Docs\Users\bob\a.txt",
+        ] {
+            assert_eq!(super::sanitize_for_channel(input), input, "{input}");
+        }
+        assert_eq!(super::sanitize_for_channel("and/home/a/x"), "and[path]");
+    }
+
+    #[test]
+    fn twenty_thousand_path_tokens_are_redacted() {
+        let input = vec!["/Users/a/x"; 20_000].join(" ");
+        assert_eq!(super::sanitize_for_channel(&input), vec!["[path]"; 20_000].join(" "));
+    }
+
+    #[test]
+    fn codex_refusal_sentence_survives_path_redaction() {
+        let shown = "Codex 外部設定 /Users/sam/.codex/work.config.toml：定義了 mcp_servers；拒絕啟動。請由管理者移除原生 MCP 設定，改用 DuDuClaw 的代理設定。";
+        let sanitized = super::sanitize_for_channel(shown);
+        assert_eq!(sanitized, "Codex 外部設定 [path]：定義了 mcp_servers；拒絕啟動。請由管理者移除原生 MCP 設定，改用 DuDuClaw 的代理設定。");
+        // Closers preserve prose; quoted whitespace remains part of the path.
+        assert_eq!(super::sanitize_for_channel("see /home/a/b.txt) now"), "see [path]) now");
+        assert_eq!(super::sanitize_for_channel("at '/Users/a/b c'"), "at '[path]'");
+    }
+
+    /// Full-width punctuation terminates paths, including ambiguous filenames.
+    #[test]
+    fn full_width_punctuation_always_terminates_the_path() {
+        for (shown, expected) in [
+            ("/Users/alice/private：finance/keys.txt", "[path]：finance/keys.txt"),
+            ("看 /Users/alice/private：finance/keys.txt 這個", "看 [path]：finance/keys.txt 這個"),
+            ("/home/bob/報表，第二季/草稿。docx/x.txt。", "[path]，第二季/草稿。docx/x.txt。"),
+            ("C:\\x /Users/a/b、c\\d.txt", "C:\\x [path]、c\\d.txt"),
+        ] {
+            let sanitized = super::sanitize_for_channel(shown);
+            assert_eq!(sanitized, expected, "{shown}");
+        }
+    }
+
+    /// L1: a path followed by full-width punctuation and plain prose keeps the prose.
+    #[test]
+    fn prose_after_full_width_punctuation_survives() {
+        assert_eq!(super::sanitize_for_channel("檔案在 /Users/a/b.txt，請確認。"), "檔案在 [path]，請確認。");
+        assert_eq!(super::sanitize_for_channel("「/home/a/b.toml」無法讀取"), "「[path]」無法讀取");
+        assert_eq!(super::sanitize_for_channel("/Users/a/b：定義了"), "[path]：定義了");
+        assert_eq!(super::sanitize_for_channel("（/Users/a/b）見 a/b"), "（[path]）見 a/b");
+        // Preserve the matching closer and the prose after the full-width colon.
+        assert_eq!(super::sanitize_for_channel("（/Users/a/b：x）a/b"), "（[path]：x）a/b");
+    }
+
+    /// L1: several paths in one sentence, mixing both cases.
+    #[test]
+    fn mixed_paths_in_one_sentence() {
+        assert_eq!(
+            super::sanitize_for_channel("比較 /Users/a/x.txt，與 /home/b/私人：帳本/k.txt；然後回報。"),
+            "比較 [path]，與 [path]：帳本/k.txt；然後回報。",
+        );
+        assert_eq!(
+            super::sanitize_for_channel("/Users/a/one：two/three、/home/b/c。完成"),
+            "[path]：two/three、[path]。完成",
+        );
+        assert_eq!(
+            super::sanitize_for_channel("Codex 外部設定 /Users/s/.codex/config.toml：定義了 mcp_servers；拒絕啟動。另見 /home/t/a：b/c.toml"),
+            "Codex 外部設定 [path]：定義了 mcp_servers；拒絕啟動。另見 [path]：b/c.toml",
+        );
     }
 }
 

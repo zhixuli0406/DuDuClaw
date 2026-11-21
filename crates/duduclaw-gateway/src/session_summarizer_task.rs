@@ -16,7 +16,7 @@ use tracing::{debug, info, warn};
 use crate::prompt_compression::{partition_turns_for_summary};
 use crate::session::SessionManager;
 use crate::session_summarizer::{
-    SummarizeDecision, SummarizeParams, decide_summarization, format_summarization_prompt,
+    SummarizeDecision, SummarizeParams, decide_summarization,
 };
 
 /// How often the task wakes up.
@@ -134,7 +134,13 @@ pub(crate) async fn tick_once(
                 );
             }
             Err(e) => {
+                // Unavailable backs off like a failure (no tight loop) but is
+                // not reported as one (RM-205).
                 crate::session_summarizer::summary_attempt_finished_async(home_dir, &session_id, "async", Some(e)).await;
+                if e == crate::session_summarizer::SummaryFailure::Unavailable {
+                    debug!(session_id = %session_id, "summarizer: background work unavailable for this employee; skipped");
+                    continue;
+                }
                 warn!(
                 session_id = %session_id,
                 through_turn,
@@ -184,9 +190,10 @@ async fn summarize_one(
     }
 
     let summary = if has_unprotected_text {
-        let prompt = format_summarization_prompt(&transcript);
         let agent_id = session_manager.session_agent(session_id).await
             .map_err(|_| SummaryFailure::ReadState)?;
+        let memory_language = crate::prompt_identity::resolve_memory_language_for_id(home_dir, agent_id.as_deref().unwrap_or("")).await;
+        let prompt = crate::session_summarizer::format_summarization_prompt_with_language(&transcript, memory_language.as_deref());
         let agent_dir = crate::runtime_config::session_agent_dir(home_dir, agent_id.as_deref())
             .map_err(|_| SummaryFailure::ReadState)?;
         let agent_id = agent_dir.as_ref().and(agent_id.as_deref()).unwrap_or("");
@@ -200,7 +207,11 @@ async fn summarize_one(
             crate::runtime_dispatch::UTILITY_MAX_TOKENS,
         )
         .await
-        .map_err(|_| SummaryFailure::Utility)?
+        .map(|summary| crate::prompt_identity::align_memory_script(&summary, memory_language.as_deref(), &transcript))
+        .map_err(|error| if crate::runtime_config::is_utility_unavailable(&error) {
+            // RM-205: no service may run this employee's background work.
+            SummaryFailure::Unavailable
+        } else { SummaryFailure::Utility })?
     } else {
         String::new()
     };
@@ -461,6 +472,35 @@ mod tests {
         assert_eq!(sm.get_summary("fallback-owner").await.unwrap().0, "Session utility result");
     }
 
+    /// RM-205: a Grok employee with no explicit utility service is a clean
+    /// skip: no call (the registry is empty and the Claude lane is never
+    /// entered), summary and history untouched, and a quiet back-off so the
+    /// next tick does not retry immediately.
+    #[tokio::test]
+    async fn unsupported_owner_without_explicit_service_skips_and_backs_off() {
+        let (sm, home) = make_session_manager();
+        let dir = home.path().join("agents/utility-worker");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"), "[agent]\nname='utility-worker'\nstatus='active'\n[runtime]\nprovider='grok'\n[model]\npreferred='grok-3'\n").unwrap();
+        let _registry = crate::runtime_dispatch::testing::RegistryGuard::install(
+            home.path(), crate::runtime::RuntimeRegistry::with_runtimes(std::collections::HashMap::new()),
+        ).await;
+        sm.get_or_create("skipped", "utility-worker").await.unwrap();
+        sm.append_message("skipped", "user", "Summarize this session", 4).await.unwrap();
+        sm.append_message("skipped", "assistant", "Here is the discussion", 4).await.unwrap();
+        for _ in 0..3 { sm.append_message("skipped", "user", "raw tail", 1).await.unwrap(); }
+        let ids = sm.get_message_ids("skipped").await.unwrap();
+        let result = crate::autonomous_runtime::scope(home.path(), "utility-worker", &[],
+            summarize_one(&sm, home.path(), "skipped", 2, 1)).await;
+        assert_eq!(result, Err(crate::session_summarizer::SummaryFailure::Unavailable));
+        assert_eq!(sm.get_summary("skipped").await.unwrap(), (String::new(), 0));
+        assert_eq!(sm.get_message_ids("skipped").await.unwrap(), ids);
+        crate::session_summarizer::summary_attempt_finished_async(home.path(), "skipped", "async",
+            Some(crate::session_summarizer::SummaryFailure::Unavailable)).await;
+        assert!(!crate::session_summarizer::summary_retry_ready_async(home.path(), "skipped", "async").await,
+            "backs off: no tight retry loop");
+    }
+
     #[tokio::test]
     async fn invalid_stored_owner_never_reaches_global_utility() {
         let (sm, home) = make_session_manager();
@@ -550,7 +590,7 @@ mod tests {
         assert!(has_visible);
         assert!(transcript.contains("user: Question before"));
         assert!(transcript.contains("assistant: A separate reply"));
-        let prompt = format_summarization_prompt(&transcript);
+        let prompt = crate::session_summarizer::format_summarization_prompt(&transcript);
         assert!(!prompt.contains("secret constraint"));
         assert!(!prompt.contains("private audience"));
         assert!(protected.contains(&format!("## 約束\n{m}\n- secret constraint\n")));
@@ -602,6 +642,23 @@ mod tests {
         assert_eq!(through, 2);
         assert!(summary.contains(&format!("## 約束\n{m}\n- keep exact")));
         assert!(summary.contains(&format!("## 受眾\n{m}\n- only operator")));
+    }
+
+    #[tokio::test]
+    async fn protected_only_summary_does_not_read_unreadable_session_agent() {
+        let (sm, home) = make_session_manager();
+        let sid = "protected-unreadable-owner";
+        sm.get_or_create(sid, "test-agent").await.unwrap();
+        let text = format!("## 約束\n{}\n- keep 用户 verbatim", marker());
+        for _ in 0..5 { sm.append_message(sid, "user", &text, 1).await.unwrap(); }
+        let conn = rusqlite::Connection::open(home.path().join("sessions.db")).unwrap();
+        conn.execute("UPDATE sessions SET agent_id = X'80' WHERE id = ?1", [sid]).unwrap();
+        drop(conn);
+        assert!(sm.session_agent(sid).await.is_err(), "fixture must fail the owner read");
+        assert!(summarize_one(&sm, home.path(), sid, 2, 1).await.unwrap().is_some());
+        let (summary, through) = sm.get_summary(sid).await.unwrap();
+        assert_eq!(through, 2);
+        assert!(summary.contains("keep 用户 verbatim"));
     }
 
     /// W2-E regression (review finding 4, third leg). A user message whose
