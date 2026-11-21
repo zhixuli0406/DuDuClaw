@@ -68,13 +68,30 @@ async fn share_copies_a_promoted_auto_page_into_the_shared_wiki() {
         .await;
     assert!(frame_ok(&frame), "{}", frame_error_text(&frame));
 
+    match &frame {
+        WsFrame::Response { payload: Some(payload), .. } => {
+            assert_eq!(payload["pages"][0]["path"], path);
+            assert_eq!(payload["pages"][0]["state"], "needs_confirmation");
+        }
+        _ => panic!("expected auto-page listing"),
+    }
+
     // Unpromoted: one conversation's page — refused, nothing published.
     let frame = handler.handle_wiki_share(params.clone()).await;
     assert!(!frame_ok(&frame));
     assert!(frame_error_text(&frame).contains("Confirm (promote) it"), "{}", frame_error_text(&frame));
     assert!(!home.path().join("shared/wiki/sources").exists());
 
-    crate::auto_wiki_page::promote_page(&store, path).unwrap();
+    let frame = handler.handle_wiki_promote(params.clone()).await;
+    assert!(frame_ok(&frame), "{}", frame_error_text(&frame));
+    let frame = handler.handle_wiki_auto_pages(json!({ "agent_id": "agnes" })).await;
+    match &frame {
+        WsFrame::Response { payload: Some(payload), .. } => {
+            assert_eq!(payload["pages"][0]["path"], path);
+            assert_eq!(payload["pages"][0]["state"], "confirmed");
+        }
+        _ => panic!("expected confirmed page to remain listed"),
+    }
     let frame = handler.handle_wiki_share(params).await;
     assert!(frame_ok(&frame), "{}", frame_error_text(&frame));
     let shared = std::fs::read_to_string(home.path().join("shared/wiki/sources/agnes--company-charter.md"))
@@ -225,7 +242,9 @@ async fn dashboard_repromotes_legacy_pages_without_changing_content() {
         // This is exactly the listing used by KnowledgeCuration's promote UI.
         let frame = handler.handle_wiki_auto_pages(json!({ "agent_id": "agnes" })).await;
         assert!(frame_ok(&frame));
-        assert!(crate::auto_wiki_page::list_auto_pages(&store).unwrap().iter().any(|p| p.path == path));
+        assert!(crate::auto_wiki_page::list_auto_pages(&store).unwrap().iter().any(|p|
+            p.path == path && p.state == crate::auto_wiki_page::AutoPageState::NeedsConfirmation
+        ));
         let frame = handler.handle("wiki.promote", json!({
             "agent_id": "agnes", "page_path": path,
         }), &ctx).await;
@@ -240,7 +259,9 @@ async fn dashboard_repromotes_legacy_pages_without_changing_content() {
         for session in [Some("telegram:A"), Some("telegram:B"), None] {
             assert!(crate::auto_wiki_page::page_visible_in_conversation(&path, Some(&after), session, &reg));
         }
-        assert!(!crate::auto_wiki_page::list_auto_pages(&store).unwrap().iter().any(|p| p.path == path));
+        assert!(crate::auto_wiki_page::list_auto_pages(&store).unwrap().iter().any(|p|
+            p.path == path && p.state == crate::auto_wiki_page::AutoPageState::Confirmed
+        ));
         // The actual host stamp used by MCP wiki_write always drops promotion.
         let rewritten = crate::wiki_host_sources::stamp_host_sources(&after, Some(&after), &[]);
         assert!(!crate::wiki_host_sources::page_host_promoted(&rewritten));
