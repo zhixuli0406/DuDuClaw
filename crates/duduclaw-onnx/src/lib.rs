@@ -3,7 +3,7 @@
 //! | module | role |
 //! |---|---|
 //! | [`manifest`] | pinned ONNX Runtime release archives (URL / size / sha256) |
-//! | [`install`] | verified, resumable downloads; ORT archive extraction (feature `install`) |
+//! | [`install`] | verified downloads with exclusive temporary files; ORT archive extraction (feature `install`) |
 //! | [`runtime`] | `init_ort`, once per process (feature `runtime`) |
 //!
 //! Extracted from `duduclaw-redaction` so the redaction NER model and the
