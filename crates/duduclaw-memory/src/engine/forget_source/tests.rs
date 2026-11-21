@@ -275,8 +275,8 @@ async fn reaffirmed_fact(e: &SqliteMemoryEngine) -> String {
         confidence: Some(0.5),
         ..triple("user:u1", "name", "Ada")
     };
-    let id = put(e, "user is called Ada", base, src(msg(S2, 1))).await;
-    // Re-observed in the chat being forgotten, from an independent origin
+    let id = put(e, "user is called Ada", base, src(msg(S, 1))).await;
+    // Re-observed in the same chat, from an independent origin
     // class: a reaffirmation that raises confidence.
     let again = TemporalMeta {
         origin: Some("operator".into()),
@@ -392,6 +392,56 @@ async fn b2_rule4_forgotten_source_cannot_reaffirm() {
     );
 }
 
+/// The B.2 rules only reaffirm within a conversation for host-derived rows.
+#[tokio::test]
+async fn b2_cross_conversation_sources_keep_independent_rows() {
+    let e = SqliteMemoryEngine::in_memory().unwrap();
+    let a = put(
+        &e,
+        "user is called Ada",
+        triple("user:u1", "name", "Ada"),
+        src(msg(S, 10)),
+    )
+    .await;
+    let b = put(
+        &e,
+        "user is called Ada",
+        triple("user:u1", "name", "Ada"),
+        src(msg(S2, 1)),
+    )
+    .await;
+    assert_ne!(a, b);
+    for (id, session, message) in [(&a, S, "m:10"), (&b, S2, "m:1")] {
+        assert_eq!(count(&e, &format!(
+            "SELECT COUNT(*) FROM memory_origins WHERE memory_id = '{id}'"
+        )).await, 1);
+        assert_eq!(count(&e, &format!(
+            "SELECT COUNT(*) FROM memory_origins WHERE memory_id = '{id}'
+             AND source_session = '{session}' AND source_message = '{message}' AND role = 'direct'"
+        )).await, 1);
+    }
+    let p = plan(&e, &by_message(S, &["m:10"])).await;
+    assert_eq!(target_ids(&p), [a.clone()].into_iter().collect());
+    assert!(p.document.body.reaffirm_only.is_empty());
+    let before = confidence(&e, &b).await;
+    let r = apply(&e, &p.plan_id).await;
+    assert_eq!((r.memories_deleted, r.reaffirm_lineage_removed), (1, 0));
+    assert!(!exists(&e, &a).await);
+    assert!(exists(&e, &b).await);
+    assert_eq!(confidence(&e, &b).await, before);
+    assert_eq!(count(&e, &format!(
+        "SELECT COUNT(*) FROM memory_origins WHERE memory_id = '{b}' AND role = 'direct'"
+    )).await, 1);
+    let o = try_put(
+        &e,
+        "user is called Ada",
+        triple("user:u1", "name", "Ada"),
+        src(msg(S, 10)),
+    ).await;
+    assert!(is_fenced(&o, FenceReason::SourceForgotten), "{o:?}");
+    assert!(exists(&e, &b).await);
+}
+
 // ── supersession chain and archive copies ──────────────────────────────────
 
 #[tokio::test]
@@ -401,7 +451,7 @@ async fn chain_cut_leaves_predecessor_closed_and_clears_pointers() {
         &e,
         "city is Taipei",
         triple("user:u1", "city", "Taipei"),
-        src(msg(S2, 1)),
+        src(msg(S, 1)),
     )
     .await;
     let x_id = put(
@@ -415,7 +465,7 @@ async fn chain_cut_leaves_predecessor_closed_and_clears_pointers() {
         &e,
         "city is Hsinchu",
         triple("user:u1", "city", "Hsinchu"),
-        src(msg(S2, 2)),
+        src(msg(S, 11)),
     )
     .await;
     let plan_doc = plan(&e, &by_message(S, &["m:10"])).await;
@@ -443,6 +493,39 @@ async fn chain_cut_leaves_predecessor_closed_and_clears_pointers() {
     assert_eq!((sup, vu_n), (None, None));
     drop(conn);
     assert!(!exists(&e, &x_id).await);
+}
+
+#[tokio::test]
+async fn chain_cut_does_not_link_different_conversations() {
+    let e = SqliteMemoryEngine::in_memory().unwrap();
+    let a = put(&e, "city is Taipei", triple("user:u1", "city", "Taipei"), src(msg(S, 1))).await;
+    let b = put(&e, "city is Tainan", triple("user:u1", "city", "Tainan"), src(msg(S2, 10))).await;
+    let history = e.get_history(AGENT, "user:u1", "city").await.unwrap();
+    assert_eq!(history.len(), 2);
+    for row in &history {
+        assert!(row.valid_until.is_none());
+        assert!(row.supersedes.is_none() && row.superseded_by.is_none());
+    }
+    for (id, session) in [(&a, S), (&b, S2)] {
+        assert_eq!(count(&e, &format!(
+            "SELECT COUNT(*) FROM memory_origins WHERE memory_id = '{id}'"
+        )).await, 1);
+        assert_eq!(count(&e, &format!(
+            "SELECT COUNT(*) FROM memory_origins WHERE memory_id = '{id}' AND source_session = '{session}' AND role = 'direct'"
+        )).await, 1);
+    }
+    let p = plan(&e, &by_message(S, &["m:1"])).await;
+    assert!(p.document.body.supersession_cuts.is_empty());
+    assert_eq!(apply(&e, &p.plan_id).await.supersession_links_cut, 0);
+    assert!(!exists(&e, &a).await);
+    let kept = e.get_history(AGENT, "user:u1", "city").await.unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].id, b);
+    assert!(kept[0].valid_until.is_none());
+    assert!(kept[0].supersedes.is_none() && kept[0].superseded_by.is_none());
+    assert_eq!(count(&e, &format!(
+        "SELECT COUNT(*) FROM memory_origins WHERE memory_id = '{b}' AND source_session = '{S2}' AND role = 'direct'"
+    )).await, 1);
 }
 
 #[tokio::test]

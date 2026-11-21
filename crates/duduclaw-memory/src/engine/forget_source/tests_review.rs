@@ -72,7 +72,7 @@ async fn m2_a_reaffirming_source_is_not_inherited() {
         confidence: Some(0.5),
         ..triple("user:u9", "name", "Bo")
     };
-    let id = put(&e, "user is Bo", base, src(msg("telegram:other", 1))).await;
+    let id = put(&e, "user is Bo", base, src(msg(S, 1))).await;
     let again = TemporalMeta {
         origin: Some("operator".into()),
         ..triple("user:u9", "name", "Bo")
@@ -88,20 +88,54 @@ async fn m2_a_reaffirming_source_is_not_inherited() {
         Provenance::derived(vec![id.clone()]),
     )
     .await;
+    // Both messages now share a session; distinguish the reaffirming message.
     assert_eq!(
         count(
             &e,
             &format!(
-                "SELECT COUNT(*) FROM memory_origins WHERE memory_id = '{child}' AND source_session = '{S}'"
+                "SELECT COUNT(*) FROM memory_origins WHERE memory_id = '{child}' AND source_session = '{S}' AND source_message = 'm:10'"
             )
         )
         .await,
         0,
         "the reaffirmation is not inherited"
     );
+    assert_eq!(count(&e, &format!(
+        "SELECT COUNT(*) FROM memory_origins WHERE memory_id = '{child}' AND source_session = '{S}' AND source_message = 'm:1' AND role = 'inherited'"
+    )).await, 1, "the original source is inherited");
     forget(&e, &by_message(S, &["m:10"])).await;
     assert!(exists(&e, &child).await);
     assert!(exists(&e, &id).await, "reaffirm only: the row stays");
+}
+
+#[tokio::test]
+async fn m2_cross_conversation_repeat_has_independent_descendants() {
+    let e = SqliteMemoryEngine::in_memory().unwrap();
+    let a = put(&e, "user is Bo", triple("user:u9", "name", "Bo"), src(msg(S, 1))).await;
+    let other = "telegram:other";
+    let b = put(&e, "user is Bo", triple("user:u9", "name", "Bo"), src(msg(other, 10))).await;
+    assert_ne!(a, b);
+    let child = put(
+        &e,
+        "summary about Bo",
+        TemporalMeta::default(),
+        Provenance::derived(vec![b.clone()]),
+    ).await;
+    for (id, session, role) in [(&a, S, "direct"), (&b, other, "direct"), (&child, other, "inherited")] {
+        assert_eq!(count(&e, &format!(
+            "SELECT COUNT(*) FROM memory_origins WHERE memory_id = '{id}'"
+        )).await, 1);
+        assert_eq!(count(&e, &format!(
+            "SELECT COUNT(*) FROM memory_origins WHERE memory_id = '{id}' AND source_session = '{session}' AND role = '{role}'"
+        )).await, 1);
+    }
+    forget(&e, &by_message(S, &["m:1"])).await;
+    assert!(!exists(&e, &a).await);
+    assert!(exists(&e, &b).await);
+    assert!(exists(&e, &child).await);
+    assert_eq!(count(&e, &format!(
+        "SELECT COUNT(*) FROM memory_origins WHERE memory_id IN ('{b}', '{child}') AND source_session = '{other}'"
+    )).await, 2);
 }
 
 #[tokio::test]
