@@ -227,6 +227,8 @@ impl ReplyFailure {
             "origin":self.origin.label(),"reason":format!("{:?}",self.reason()),
             "preflight":self.runtime.as_ref().and_then(|f|f.preflight.as_ref()).map(|p|format!("{:?}",p.kind)),
             "steps":steps,
+            "fallback_skipped":self.runtime.as_ref().and_then(|f|f.fallback_skipped.as_ref())
+                .map(|s|serde_json::json!({"runtime":s.runtime.as_str(),"reason":s.reason.token()})),
             "secondary":self.secondary.as_ref().map(|(origin,error)|serde_json::json!({"origin":origin.label(),"reason":format!("{:?}",classify_origin_reason(*origin,error))})),
         })
     }
@@ -301,6 +303,29 @@ impl ReplyFailure {
             primary
         }
     }
+    /// RM-181: which engines were tried, in order, with each outcome in plain
+    /// words, and — when a fallback engine is configured but the rule did
+    /// not use it — that and why. No provider text, file names or accounts,
+    /// so it is safe for operators and members (never for public visitors).
+    /// `None` outside the multi-runtime dispatch path (nothing to list).
+    pub(super) fn engine_summary(&self) -> Option<String> {
+        let runtime = self.runtime.as_ref()?;
+        let mut text = String::new();
+        if !runtime.steps.is_empty() {
+            let legs: Vec<String> = runtime.steps.iter().map(|step| {
+                let role = match step.role {
+                    crate::failover::RuntimeStepRole::Primary => "原選",
+                    crate::failover::RuntimeStepRole::Fallback => "備援",
+                };
+                format!("{}（{role}）：{}", ReplyOrigin::Runtime(step.runtime).label(), plain_step_outcome(step))
+            }).collect();
+            text.push_str(&format!("已嘗試的引擎依序為 {}。", legs.join("；")));
+        }
+        if let Some(skip) = &runtime.fallback_skipped {
+            text.push_str(&skip.sentence());
+        }
+        (!text.is_empty()).then_some(text)
+    }
     pub(super) fn local_notice(&self) -> String {
         let origin = if let Some(runtime) = &self.runtime {
             if runtime.steps.len() == 2 {
@@ -316,6 +341,33 @@ impl ReplyFailure {
             format!("{} 本次未能回應", self.origin.label())
         };
         format!("⚠️ {origin}，改由已設定的本地模型代為回應。\n\n")
+    }
+}
+/// One leg's outcome in plain words (no provider text).
+fn plain_step_outcome(step: &crate::failover::RuntimeStep) -> &'static str {
+    match &step.outcome {
+        RuntimeStepOutcome::ExecutionError(error) => {
+            if duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(error) {
+                return "沒有通過啟動前檢查";
+            }
+            match classify_origin_reason(ReplyOrigin::Runtime(step.runtime), error) {
+                FailureReason::AuthFailed => "登入或憑證失效",
+                FailureReason::Timeout | FailureReason::TimeoutTotal => "達到執行時間上限",
+                FailureReason::TimeoutNoProgress => "長時間沒有進展而停止",
+                FailureReason::MaxTurns => "達到步驟上限",
+                FailureReason::RateLimited => "使用量已達限制",
+                FailureReason::Billing => "帳務或額度不足",
+                FailureReason::EmptyResponse => "回傳空白內容",
+                FailureReason::BinaryMissing | FailureReason::SpawnError => "無法啟動",
+                _ => "執行失敗",
+            }
+        }
+        RuntimeStepOutcome::Empty => "回傳空白內容",
+        RuntimeStepOutcome::NotRegistered => "尚未安裝或無法使用，沒有呼叫",
+        RuntimeStepOutcome::Cooldown => "正在冷卻，沒有呼叫",
+        RuntimeStepOutcome::PolicyRefused(_) => "產品政策不允許，沒有呼叫",
+        RuntimeStepOutcome::NoCompatibleModel => "沒有可用的相容模型，沒有呼叫",
+        RuntimeStepOutcome::CrossFamilyRefused => "此工作不允許換到其他模型家族，沒有呼叫",
     }
 }
 fn classify_origin_reason(origin: ReplyOrigin, error: &str) -> FailureReason {
@@ -524,6 +576,66 @@ mod timeout_tests {
         assert!(!other.contains("macOS"), "{other}");
         let elsewhere = origin_message("worker", claude, FailureReason::Timeout, Path::new("/nonexistent"));
         assert!(elsewhere.contains("30 分鐘安全上限"));
+    }
+}
+
+#[cfg(test)]
+mod engine_summary_tests {
+    use super::*;
+    use crate::failover::{FallbackRefusal, FallbackSkip, RuntimeStepRole, WorkLimitKind};
+
+    #[test]
+    fn fallback_configured_but_skipped_says_so_and_why() {
+        let outcome = crate::work_outcome::WorkOutcome::TimeoutTotal { seconds: 1800, partial: String::new() }.encode();
+        let mut failure = RuntimeDispatchFailure::new(RuntimeType::Codex, "gpt-5.4");
+        failure.push(RuntimeStepRole::Primary, RuntimeType::Codex, Some("gpt-5.4"),
+            RuntimeStepOutcome::ExecutionError(outcome));
+        failure.fallback_skipped = Some(FallbackSkip { runtime: RuntimeType::Grok,
+            reason: FallbackRefusal::WorkLimit(WorkLimitKind::TimeoutTotal) });
+        let failure = ReplyFailure::runtime(failure);
+        let summary = failure.engine_summary().expect("summary");
+        let codex = ReplyOrigin::Runtime(RuntimeType::Codex).label();
+        let grok = ReplyOrigin::Runtime(RuntimeType::Grok).label();
+        assert!(summary.starts_with(&format!("已嘗試的引擎依序為 {codex}（原選）：達到執行時間上限。")), "{summary}");
+        assert!(summary.ends_with(&format!("已設定備援引擎 {grok}，但這次的失敗屬於任務本身的時間上限，不會換引擎重跑。")), "{summary}");
+        assert_eq!(failure.audit()["fallback_skipped"]["reason"], "work_timeout_total");
+        // A fallback that was never configured is never mentioned.
+        let mut plain = RuntimeDispatchFailure::new(RuntimeType::Codex, "gpt-5.4");
+        plain.push(RuntimeStepRole::Primary, RuntimeType::Codex, Some("gpt-5.4"),
+            RuntimeStepOutcome::ExecutionError("500 secret provider body".into()));
+        let summary = ReplyFailure::runtime(plain).engine_summary().unwrap();
+        assert!(!summary.contains("備援") && !summary.contains("secret"), "{summary}");
+    }
+
+    #[test]
+    fn both_legs_failed_lists_each_engine_in_order_in_plain_words() {
+        let mut failure = RuntimeDispatchFailure::new(RuntimeType::Codex, "gpt-5.4");
+        failure.push(RuntimeStepRole::Primary, RuntimeType::Codex, Some("gpt-5.4"),
+            RuntimeStepOutcome::ExecutionError("401 invalid bearer token; secret body".into()));
+        failure.push(RuntimeStepRole::Fallback, RuntimeType::Grok, Some("grok-build-0.1"), RuntimeStepOutcome::Empty);
+        let failure = ReplyFailure::runtime(failure);
+        let summary = failure.engine_summary().unwrap();
+        let codex = ReplyOrigin::Runtime(RuntimeType::Codex).label();
+        let grok = ReplyOrigin::Runtime(RuntimeType::Grok).label();
+        assert_eq!(summary, format!("已嘗試的引擎依序為 {codex}（原選）：登入或憑證失效；{grok}（備援）：回傳空白內容。"));
+        assert!(!summary.contains("secret") && !summary.contains("401"));
+        // The operator text still carries each leg's own advice.
+        let message = failure.message("Worker", Path::new("/nonexistent"));
+        assert!(message.contains("原選執行環境") && message.contains("明確備援"), "{message}");
+        // A Claude-path failure has no engine list to add.
+        assert!(ReplyFailure::simple(ReplyOrigin::Runtime(RuntimeType::Claude), "boom".into()).engine_summary().is_none());
+    }
+
+    #[test]
+    fn a_spawn_gate_leg_is_named_without_its_text() {
+        let gate = duduclaw_agent::mcp_spawn_gate::engine_local_spawn_gate_error("Codex 外部設定 /etc/codex/config.toml：x");
+        let mut failure = RuntimeDispatchFailure::new(RuntimeType::Codex, "gpt-5.4");
+        failure.push(RuntimeStepRole::Primary, RuntimeType::Codex, Some("gpt-5.4"), RuntimeStepOutcome::ExecutionError(gate));
+        failure.push(RuntimeStepRole::Fallback, RuntimeType::Claude, Some("claude-opus-4-6"),
+            RuntimeStepOutcome::ExecutionError("503 service unavailable".into()));
+        let summary = ReplyFailure::runtime(failure).engine_summary().unwrap();
+        assert!(summary.contains("沒有通過啟動前檢查"), "{summary}");
+        assert!(!summary.contains("config.toml") && !summary.contains("[engine_local_config]"), "{summary}");
     }
 }
 

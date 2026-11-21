@@ -3,6 +3,7 @@ import { Button, ErrorState, Input, SettingsCard, SettingsRow, SettingsSection }
 import { RowNumber } from '@/pages/agent-form/form-rows';
 import { type TomlTables } from '@/lib/config-toml';
 import { useConfigForm, vNum } from '../useConfigForm';
+import { DEFAULT_RUN_TIMEOUT_SECS } from '@/pages/agent-form/editPayload';
 
 const GROUPS = [
   { id: 'runtime', fields: [
@@ -46,6 +47,7 @@ function LimitsCard({ group }: { group: (typeof GROUPS)[number] }) {
         {group.id === 'runtime' && (
           <SettingsRow label={t('default_timeout_secs')} description={t('default_timeout_secs.help')} tier="text">
             <Input type="number" aria-label={t('default_timeout_secs')} min={30} max={max} step={1}
+              placeholder={String(Math.min(DEFAULT_RUN_TIMEOUT_SECS, max))}
               value={typeof form.values['runtime.default_timeout_secs'] === 'number' ? String(form.values['runtime.default_timeout_secs']) : ''}
               onChange={(e) => form.set('runtime.default_timeout_secs', e.target.value === '' ? null : Number(e.target.value))} />
           </SettingsRow>

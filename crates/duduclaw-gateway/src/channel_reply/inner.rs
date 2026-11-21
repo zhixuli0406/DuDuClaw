@@ -2259,12 +2259,15 @@ async fn build_reply_with_session_inner_impl(
             } else if let Some(text) = operator_tool_reply.ok().filter(|text| !text.trim().is_empty()) {
                 Some(text)
             } else {
+                let (direct_message, direct_history) = direct_api_fallback_input(
+                    &pinned, has_history, &sanitized_text, &conversation_history,
+                );
                 match reply_assembly.text(ReplyOrigin::AnthropicApi, || async { crate::direct_api::call_direct_api(
                     key,
                     &model,
                     &full_system_prompt,
-                    &sanitized_text,
-                    &[],
+                    &direct_message,
+                    &direct_history,
                 )
                 .await.map(|resp| resp.text) }).await
                 {
@@ -4280,9 +4283,14 @@ async fn build_reply_with_session_inner_impl(
     let language = crate::prompt_identity::resolve_fixed_message_language_for_id(&ctx.home_dir, &agent_id).await;
     let visitor = super::assembly::public_session(session_id);
     let reference = super::failure_notice::notice_suffix(language.as_deref(), (!visitor).then_some(reason.as_str()), &turn_id);
+    // RM-181: operators and members are told which engines were tried, in
+    // order, and why a configured fallback engine was not used. Public
+    // visitors keep the generic text.
+    let engine_summary = if visitor { None } else { failure.engine_summary() };
     if let Some(outcome) = crate::work_outcome::WorkOutcome::decode(&failure) {
         if visitor { return format!("{}\n{reference}", crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE); }
         let notice = super::failure_notice::work_notice(&outcome, language.as_deref());
+        let notice = match &engine_summary { Some(summary) => format!("{notice}\n{summary}"), None => notice };
         let partial = duduclaw_core::think_tags::strip_reasoning_prefix(outcome.partial());
         return if partial.trim().is_empty() { format!("{notice}\n{reference}") }
             else { format!("{partial}\n\n{notice}\n{reference}") };
@@ -4319,7 +4327,10 @@ async fn build_reply_with_session_inner_impl(
     }
     failure.message(&name, &ctx.home_dir)
     }.await;
-    format!("{message}\n{reference}")
+    match engine_summary {
+        Some(summary) => format!("{message}\n\n{summary}\n{reference}"),
+        None => format!("{message}\n{reference}"),
+    }
 }
 
 /// Render operational status at the audience boundary, never in model text.
@@ -4667,6 +4678,48 @@ fn should_append_clarification(is_private: bool, has_history: bool, has_pinned: 
 /// history yet; a group/shared session never extracts a pin.
 fn should_extract_first_turn_pin(is_private: bool, has_history: bool) -> bool {
     is_private && !has_history
+}
+
+/// RM-203: what a Claude employee's Direct-API fallback sends. The same
+/// capped conversation the CLI path folds into its prompt goes as native
+/// turns, and when there is history the pinned instructions lead the
+/// person's message in the same `<task_recap>` block the CLI path uses.
+fn direct_api_fallback_input(
+    pinned: &str,
+    has_history: bool,
+    message: &str,
+    history: &[crate::runtime::ConversationTurn],
+) -> (String, Vec<(String, String)>) {
+    let message = if pinned.is_empty() || !has_history {
+        message.to_string()
+    } else {
+        format!("<task_recap>\n{pinned}\n</task_recap>\n\n{message}")
+    };
+    let history = history.iter().map(|turn| (turn.role.clone(), turn.content.clone())).collect();
+    (message, history)
+}
+
+#[cfg(test)]
+mod direct_api_fallback_input_tests {
+    use super::*;
+    use crate::runtime::ConversationTurn;
+
+    #[test]
+    fn carries_history_and_the_task_recap_only_when_there_is_history() {
+        let history = vec![
+            ConversationTurn { role: "user".into(), content: "第一輪".into() },
+            ConversationTurn { role: "assistant".into(), content: "第一輪回答".into() },
+        ];
+        let (message, turns) = direct_api_fallback_input("- 用繁體中文", true, "第二輪", &history);
+        assert_eq!(message, "<task_recap>\n- 用繁體中文\n</task_recap>\n\n第二輪");
+        assert_eq!(turns, vec![("user".to_string(), "第一輪".to_string()),
+            ("assistant".to_string(), "第一輪回答".to_string())]);
+        let (message, turns) = direct_api_fallback_input("- 用繁體中文", false, "第一輪", &[]);
+        assert_eq!(message, "第一輪");
+        assert!(turns.is_empty());
+        let (message, _) = direct_api_fallback_input("", true, "第二輪", &history);
+        assert_eq!(message, "第二輪");
+    }
 }
 
 #[cfg(test)]

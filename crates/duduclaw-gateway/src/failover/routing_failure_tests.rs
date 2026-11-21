@@ -122,12 +122,15 @@ async fn explicit_two_leg_failure_keeps_each_origin_model_and_original_error() {
     assert!(error.to_string().contains("first-source"));
     assert!(error.to_string().contains("second-source"));
 }
+/// RM-181 (v1.84.0): an authentication failure of the PRIMARY engine is a
+/// reason to try the configured fallback engine (it used to stop as a 4xx).
+/// The primary's auth failure stays attributed to the primary leg.
 #[tokio::test]
-async fn nonretryable_primary_auth_error_never_attributes_a_claude_attempt() {
+async fn primary_auth_error_uses_the_explicit_fallback_and_stays_attributed_to_the_primary() {
     let home = tempfile::tempdir().unwrap();
     let (reg, a, b) = registry(
         Err("401 invalid bearer token; misleading claude /login"),
-        Ok("wrong"),
+        Err("500 fallback also down"),
     );
     let error = FailoverManager::new(60)
         .execute_with_failover_detailed(
@@ -141,9 +144,12 @@ async fn nonretryable_primary_auth_error_never_attributes_a_claude_attempt() {
         .await
         .unwrap_err();
     assert_eq!(a.load(Ordering::SeqCst), 1);
-    assert_eq!(b.load(Ordering::SeqCst), 0);
-    assert_eq!(error.steps.len(), 1);
+    assert_eq!(b.load(Ordering::SeqCst), 1);
+    assert_eq!(error.steps.len(), 2);
     assert_eq!(error.steps[0].runtime, RuntimeType::Codex);
+    assert!(matches!(&error.steps[0].outcome, RuntimeStepOutcome::ExecutionError(e) if e.starts_with("401 invalid bearer token")));
+    assert_eq!(error.steps[1].runtime, RuntimeType::Claude);
+    assert!(error.fallback_skipped.is_none());
 }
 #[tokio::test]
 async fn unavailable_and_refused_fallbacks_keep_primary_and_report_real_skip() {
@@ -390,4 +396,115 @@ async fn spawn_gate_error_refuses_even_explicit_runtime_fallback_and_preserves_l
         .unwrap_err();
     assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error));
     assert_eq!((a.load(Ordering::SeqCst), b.load(Ordering::SeqCst)), (1, 0));
+    // The typed record says the configured fallback was refused, and why.
+    let (reg, _, b) = registry(
+        Err(Box::leak(duduclaw_agent::mcp_spawn_gate::spawn_gate_error("owned worker MCP configuration refused").into_boxed_str())),
+        Ok("unsafe fallback"),
+    );
+    let failure = FailoverManager::new(60)
+        .execute_with_failover_detailed(&reg, &RuntimeType::Codex, Some(&RuntimeType::Claude), "hi", &ctx(home.path()), &[])
+        .await
+        .unwrap_err();
+    assert_eq!(b.load(Ordering::SeqCst), 0);
+    assert_eq!(failure.fallback_skipped.map(|s| s.reason), Some(FallbackRefusal::EmployeeToolConfig));
+}
+
+/// Sibling of the test above (RM-181, owner decision pending): a refusal of
+/// the ENGINE's own host configuration carries the engine-local marker and —
+/// while `ENGINE_LOCAL_CONFIG_REFUSAL_FALLS_BACK` is on — hands over to the
+/// configured fallback, whose own `execute` runs its own gates.
+#[tokio::test]
+async fn engine_local_config_refusal_uses_explicit_runtime_fallback_and_keeps_the_gate_marker() {
+    let home = tempfile::tempdir().unwrap();
+    let error = Box::leak(
+        duduclaw_agent::mcp_spawn_gate::engine_local_spawn_gate_error("Codex 外部設定 /etc/codex/config.toml：定義了 mcp_servers")
+            .into_boxed_str(),
+    );
+    let (reg, a, b) = registry(Err(error), Ok("fallback answer"));
+    let mgr = FailoverManager::new(60);
+    let result = mgr
+        .execute_with_failover_detailed(&reg, &RuntimeType::Codex, Some(&RuntimeType::Claude), "hi", &ctx(home.path()), &[])
+        .await;
+    if super::fallback_rule::ENGINE_LOCAL_CONFIG_REFUSAL_FALLS_BACK {
+        let response = result.expect("the fallback engine answers");
+        assert_eq!(response.content, "fallback answer");
+        assert_eq!((a.load(Ordering::SeqCst), b.load(Ordering::SeqCst)), (1, 1));
+        // Re-checked every call: an engine-local refusal never cools the primary down.
+        let codex = mgr.health_summary().await.into_iter().find(|h| h.runtime_type == RuntimeType::Codex).unwrap();
+        assert_eq!(codex.consecutive_failures, 0);
+    } else {
+        let failure = result.unwrap_err();
+        assert_eq!(b.load(Ordering::SeqCst), 0);
+        assert_eq!(failure.fallback_skipped.map(|s| s.reason), Some(FallbackRefusal::EngineLocalConfig));
+    }
+    // With no fallback configured it is still a spawn-gate refusal for every
+    // String caller (rotation, implicit fallbacks stop on it).
+    let (reg, _, _) = registry(Err(error), Ok("unused"));
+    let legacy = FailoverManager::new(60)
+        .execute_with_failover(&reg, &RuntimeType::Codex, None, "hi", &ctx(home.path()), &[])
+        .await
+        .unwrap_err();
+    assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&legacy));
+    assert!(duduclaw_agent::mcp_spawn_gate::is_engine_local_spawn_gate_error(&legacy));
+}
+
+/// RM-203 through the real dispatch choke-point: a Codex employee whose
+/// primary fails hands the same capped conversation to its Claude fallback.
+#[tokio::test]
+async fn dispatch_claude_fallback_receives_the_conversation_history() {
+    let home = tempfile::tempdir().unwrap();
+    let agent = home.path().join("agents/worker");
+    std::fs::create_dir_all(&agent).unwrap();
+    std::fs::write(agent.join("agent.toml"), "[runtime]\nprovider='codex'\nfallback='claude'\n").unwrap();
+    let seen: Arc<std::sync::Mutex<Vec<(RuntimeType, usize, Vec<String>)>>> = Arc::default();
+    struct Recorder {
+        id: RuntimeType,
+        result: Result<&'static str, &'static str>,
+        seen: Arc<std::sync::Mutex<Vec<(RuntimeType, usize, Vec<String>)>>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::runtime::AgentRuntime for Recorder {
+        fn name(&self) -> &str { self.id.as_str() }
+        async fn execute(&self, _: &str, ctx: &RuntimeContext) -> Result<RuntimeResponse, String> {
+            self.seen.lock().unwrap().push((self.id, ctx.conversation_history.len(),
+                ctx.conversation_history.iter().map(|t| format!("{}:{}", t.role, t.content)).collect()));
+            self.result.map(|content| RuntimeResponse {
+                content: content.into(), model_used: ctx.model.clone(),
+                runtime_name: self.id.as_str().into(), ..Default::default()
+            }).map_err(str::to_owned)
+        }
+        async fn is_available(&self) -> bool { true }
+    }
+    let mut map: HashMap<RuntimeType, Box<dyn crate::runtime::AgentRuntime>> = HashMap::new();
+    map.insert(RuntimeType::Codex, Box::new(Recorder { id: RuntimeType::Codex, result: Err("503 service unavailable"), seen: seen.clone() }));
+    map.insert(RuntimeType::Claude, Box::new(Recorder { id: RuntimeType::Claude, result: Ok("答案"), seen: seen.clone() }));
+    let _owned = crate::runtime_dispatch::testing::RegistryGuard::install(home.path(), RuntimeRegistry::with_runtimes(map)).await;
+    let history = vec![
+        crate::runtime::ConversationTurn { role: "user".into(), content: "第一輪".into() },
+        crate::runtime::ConversationTurn { role: "assistant".into(), content: "第一輪回答".into() },
+    ];
+    let response = crate::runtime_dispatch::run_agent_prompt_detailed(crate::runtime_dispatch::AgentPrompt {
+        agent_dir: Some(&agent),
+        home_dir: home.path(),
+        agent_id: "worker",
+        prompt: "第二輪",
+        system_prompt: "",
+        model: "gpt-5.4",
+        max_tokens: 8,
+        provider_override: None,
+        conversation_history: &history,
+        request_type: crate::cost_telemetry::RequestType::Chat,
+        runtime_settings: None,
+        effort: None,
+        allow_cross_family_failover: true,
+        purpose: crate::runtime_dispatch::SpawnPurpose::EmployeeTurn,
+    })
+    .await
+    .expect("the Claude fallback answers");
+    assert_eq!(response.content, "答案");
+    let expected = vec!["user:第一輪".to_string(), "assistant:第一輪回答".to_string()];
+    assert_eq!(*seen.lock().unwrap(), vec![
+        (RuntimeType::Codex, 2, expected.clone()),
+        (RuntimeType::Claude, 2, expected),
+    ]);
 }

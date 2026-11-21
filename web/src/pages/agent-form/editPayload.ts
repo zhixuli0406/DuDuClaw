@@ -257,7 +257,13 @@ export function permissionFormValues(agent: PermissionSource): Record<GatedPermi
   return out;
 }
 
-/** Match the gateway's effective timeout (unset/wrong type = 300). */
+/** The gateway's run-limit default for every engine when neither the
+ *  employee nor the global settings set one (since v1.84.0; non-Claude
+ *  engines used 300). */
+export const DEFAULT_RUN_TIMEOUT_SECS = 1800;
+
+/** Match the gateway's effective timeout. The default fallback (300) is the
+ *  authorization baseline for owner edits, not the run-limit default. */
 export function effectiveRuntimeTimeout(value: unknown, fallback = 300, ceiling = 14400): number {
   return typeof value === 'number' && Number.isInteger(value)
     ? Math.min(ceiling, Math.max(30, value)) : fallback;

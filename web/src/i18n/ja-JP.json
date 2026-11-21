@@ -16,7 +16,7 @@
   "settings.limits.runtime": "1 回の実行時間上限",
   "settings.limits.runtime.help": "個別設定のない社員に既定値を適用します。最大上限を上げると、長時間の実行で利用枠を多く消費することがあります。",
   "settings.limits.default_timeout_secs": "既定の実行上限（秒）",
-  "settings.limits.default_timeout_secs.help": "省略可能。30 秒から最大上限まで。空欄の場合、Claude は 1800 秒、他のランタイムは 300 秒です。",
+  "settings.limits.default_timeout_secs.help": "省略可能。30 秒から最大上限まで。空欄の場合、すべてのランタイムで 1800 秒です（最大上限を超えません）。",
   "settings.limits.max_timeout_secs": "実行時間の最大上限（秒）",
   "settings.limits.max_timeout_secs.help": "60〜14400 秒。既定値は 3600 秒。社員の設定が超過した場合、実行時に補正し、保存時には拒否します。",
   "settings.limits.goal_defaults": "割り当てスケジュールの制限",

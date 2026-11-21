@@ -10,8 +10,12 @@ tokio::task_local! {
     pub(crate) static MCP_CONFIG_TEST_PATHS: Vec<PathBuf>;
 }
 
+/// Every refusal here is about Codex's own configuration layers on this host
+/// (system, managed, profile, project-tree and MDM sources), not about the
+/// employee's `.mcp.json`; it carries the engine-local marker so only the
+/// explicit runtime-fallback rule can tell the two apart (RM-181).
 fn refusal(path: &Path, reason: &str) -> String {
-    duduclaw_agent::mcp_spawn_gate::spawn_gate_error(&format!(
+    duduclaw_agent::mcp_spawn_gate::engine_local_spawn_gate_error(&format!(
         "Codex 外部設定 {}：{reason}；拒絕啟動。請由管理者移除原生 MCP 設定，改用 DuDuClaw 的代理設定。", path.display()))
 }
 
@@ -222,6 +226,17 @@ mod tests {
         std::fs::write(&file, "[mcp_servers.native]\ncommand='unsafe'").unwrap();
         assert!(check_project_layers(root.path(), None).unwrap_err().contains("config.toml"));
         check_project_layers(root.path(), Some(&file)).unwrap();
+    }
+    #[test]
+    fn refusals_are_typed_engine_local_spawn_gate_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        std::fs::write(&file, "[mcp_servers.native]\ncommand='unsafe'").unwrap();
+        let error = check_file(&file).unwrap_err();
+        assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error));
+        assert!(duduclaw_agent::mcp_spawn_gate::is_engine_local_spawn_gate_error(&error));
+        let shown = duduclaw_agent::mcp_spawn_gate::spawn_gate_user_message(&error).unwrap();
+        assert!(shown.starts_with("Codex 外部設定"), "{shown}");
     }
     #[test]
     fn cloud_cache_fragments_are_checked_and_unparseable_cache_refuses() {

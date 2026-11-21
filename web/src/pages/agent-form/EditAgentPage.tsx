@@ -109,6 +109,7 @@ import {
   utilityModelMismatchesRuntime,
   effectiveRuntimeTimeout,
   runtimeTimeoutNeedsAdmin,
+  DEFAULT_RUN_TIMEOUT_SECS,
   type OdooFormState,
   clampInt,
   permissionFormValues,
@@ -482,7 +483,7 @@ function EditAgentPageContent() {
   const savedRuntimeIdleRef = useRef(900);
   const [runtimeDefaultIdle, setRuntimeDefaultIdle] = useState(900);
   const [runtimeTimeoutError, setRuntimeTimeoutError] = useState(false);
-  const [runtimeEffectiveTimeout, setRuntimeEffectiveTimeout] = useState(300);
+  const [runtimeEffectiveTimeout, setRuntimeEffectiveTimeout] = useState(DEFAULT_RUN_TIMEOUT_SECS);
   const [runtimeMaxTimeout, setRuntimeMaxTimeout] = useState(3600);
   const [runtimeTurnsLimit, setRuntimeTurnsLimit] = useState(200);
   const [runtimeDefaultTurns, setRuntimeDefaultTurns] = useState(50);
@@ -655,7 +656,7 @@ function EditAgentPageContent() {
     savedRuntimeTimeoutRef.current = agent.timeout_authorization_ceiling_secs
       ?? effectiveRuntimeTimeout(rt?.timeout_secs, 300, agent.max_timeout_secs ?? 3600);
     setRuntimeEffectiveTimeout(agent.effective_timeout_secs
-      ?? effectiveRuntimeTimeout(rt?.timeout_secs, rt?.provider === 'claude' || !rt?.provider ? 1800 : 300, agent.max_timeout_secs ?? 3600));
+      ?? effectiveRuntimeTimeout(rt?.timeout_secs, DEFAULT_RUN_TIMEOUT_SECS, agent.max_timeout_secs ?? 3600));
     setRuntimeMaxTimeout(agent.max_timeout_secs ?? 3600);
     setRuntimeDefaultIdle(agent.default_idle_timeout_secs ?? 900);
     savedRuntimeIdleRef.current = rt?.idle_timeout_secs ?? agent.default_idle_timeout_secs ?? 900;
@@ -665,7 +666,7 @@ function EditAgentPageContent() {
       fallback: rt?.fallback ?? DEFAULT_RUNTIME.fallback,
       max_turns: rt?.max_turns ?? null,
       idle_timeout_secs: rt?.idle_timeout_secs ?? null,
-      timeout_secs: effectiveRuntimeTimeout(rt?.timeout_secs, agent.effective_timeout_secs ?? (rt?.provider === 'claude' || !rt?.provider ? 1800 : 300), agent.max_timeout_secs ?? 3600),
+      timeout_secs: effectiveRuntimeTimeout(rt?.timeout_secs, agent.effective_timeout_secs ?? DEFAULT_RUN_TIMEOUT_SECS, agent.max_timeout_secs ?? 3600),
     });
 
     const ef = ev?.external_factors ?? {};
@@ -993,7 +994,7 @@ function EditAgentPageContent() {
             savedRuntimeTurnsRef.current = detail.runtime?.max_turns ?? detail.default_max_turns ?? 50;
             const max = detail.max_timeout_secs ?? 3600;
             const effective = detail.effective_timeout_secs
-              ?? effectiveRuntimeTimeout(sentTimeout ?? detail.runtime?.timeout_secs, detail.runtime?.provider === 'claude' || !detail.runtime?.provider ? 1800 : 300, max);
+              ?? effectiveRuntimeTimeout(sentTimeout ?? detail.runtime?.timeout_secs, DEFAULT_RUN_TIMEOUT_SECS, max);
             savedRuntimeTimeoutRef.current = detail.timeout_authorization_ceiling_secs
               ?? effectiveRuntimeTimeout(sentTimeout ?? detail.runtime?.timeout_secs, 300, max);
             setSavedRuntimeTimeout(savedRuntimeTimeoutRef.current);

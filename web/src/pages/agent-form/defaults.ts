@@ -60,7 +60,8 @@ export const AUTONOMY_LEVELS: ReadonlyArray<AutonomyLevel> = [
 export const DEFAULT_RUNTIME: Required<Pick<AgentRuntime, 'provider'>> & { fallback: string; timeout_secs: number; idle_timeout_secs: number | null; max_turns: number | null } = {
   provider: 'claude',
   fallback: '',
-  timeout_secs: 300,
+  // One run-limit default for every engine (gateway DEFAULT_RUN_TIMEOUT_SECS).
+  timeout_secs: 1800,
   idle_timeout_secs: null,
   max_turns: null,
 };

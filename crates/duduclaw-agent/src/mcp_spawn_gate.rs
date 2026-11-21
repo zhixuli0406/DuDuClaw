@@ -26,15 +26,39 @@ pub fn spawn_gate_error(message: &str) -> String {
     format!("{SPAWN_GATE_ERROR_PREFIX}{message}")
 }
 
+/// Second marker, directly after [`SPAWN_GATE_ERROR_PREFIX`], on a refusal
+/// that is about an ENGINE's own host configuration (e.g. Codex external
+/// configuration layers, Grok's global MCP sources) rather than about the
+/// employee. Such a refusal is still a spawn-gate refusal everywhere
+/// ([`is_spawn_gate_error`] is `true`: no account rotation, no implicit
+/// fallbacks); only the gateway's explicit runtime-fallback rule may treat it
+/// differently. Set at the place the refusal is created, never inferred from
+/// message text.
+pub const ENGINE_LOCAL_REFUSAL_MARKER: &str = "[engine_local_config] ";
+
+/// Wrap an engine-local host configuration refusal: a spawn-gate refusal
+/// carrying [`ENGINE_LOCAL_REFUSAL_MARKER`].
+pub fn engine_local_spawn_gate_error(message: &str) -> String {
+    format!("{SPAWN_GATE_ERROR_PREFIX}{ENGINE_LOCAL_REFUSAL_MARKER}{message}")
+}
+
 /// Whether `err` is a spawn-gate refusal (anchored prefix match).
 pub fn is_spawn_gate_error(err: &str) -> bool {
     err.starts_with(SPAWN_GATE_ERROR_PREFIX)
 }
 
+/// Whether `err` is an engine-local spawn-gate refusal (both markers,
+/// anchored at the start).
+pub fn is_engine_local_spawn_gate_error(err: &str) -> bool {
+    err.strip_prefix(SPAWN_GATE_ERROR_PREFIX)
+        .is_some_and(|rest| rest.starts_with(ENGINE_LOCAL_REFUSAL_MARKER))
+}
+
 /// The message to show a person for a spawn-gate refusal (the text after the
-/// marker), or `None` when `err` is not one.
+/// marker(s)), or `None` when `err` is not one.
 pub fn spawn_gate_user_message(err: &str) -> Option<&str> {
     err.strip_prefix(SPAWN_GATE_ERROR_PREFIX)
+        .map(|rest| rest.strip_prefix(ENGINE_LOCAL_REFUSAL_MARKER).unwrap_or(rest))
 }
 
 /// What the spawn gate did for one working directory.
@@ -82,6 +106,19 @@ mod tests {
         );
         assert!(!is_spawn_gate_error("rate limit [mcp_config_unverified] "));
         assert_eq!(spawn_gate_user_message("plain"), None);
+        assert!(!is_engine_local_spawn_gate_error(&e));
+    }
+
+    #[test]
+    fn the_engine_local_marker_is_a_spawn_gate_refusal_with_a_clean_message() {
+        let e = engine_local_spawn_gate_error("引擎設定被拒絕");
+        assert!(is_spawn_gate_error(&e), "still stops rotation and implicit fallbacks");
+        assert!(is_engine_local_spawn_gate_error(&e));
+        assert_eq!(spawn_gate_user_message(&e), Some("引擎設定被拒絕"));
+        // Only directly after the gate prefix, never elsewhere in the text.
+        assert!(!is_engine_local_spawn_gate_error(&format!("x {e}")));
+        assert!(!is_engine_local_spawn_gate_error(&spawn_gate_error("note [engine_local_config] x")));
+        assert!(!is_engine_local_spawn_gate_error("[engine_local_config] x"));
     }
 
     #[test]
