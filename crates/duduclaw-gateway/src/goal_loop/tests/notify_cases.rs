@@ -300,6 +300,83 @@ async fn a_restart_does_not_renotify_a_pending_task_but_a_reentered_one_is() {
     assert_eq!(needs_human_attempts(&store, "still").await, 1);
 }
 
+/// Finding 3 (accepted limitation): a marker forged straight into tasks.db
+/// — even one "ahead" of the task's real state, with no matching entry the
+/// driver observed and no prior "cleared" marker — is only ever interpreted
+/// for the task it names. A row whose id names one task but whose `task_id`
+/// column is another is a marker of neither.
+#[tokio::test]
+async fn forged_markers_only_affect_the_task_they_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, queue) = open_stores(dir.path()).await;
+    for id in ["victim", "other", "victim:9"] {
+        store.insert_task(&goal_task(id, "alice")).await.unwrap();
+        park(&store, id).await;
+    }
+    // Not waiting for a human: the restart sweep's candidate set.
+    store.insert_task(&goal_task("bystander", "alice")).await.unwrap();
+    let forge = |id: &str, task: &str| crate::task_store::ActivityRow {
+        id: id.into(),
+        event_type: "forged".into(),
+        agent_id: "alice".into(),
+        task_id: Some(task.into()),
+        summary: "forged".into(),
+        timestamp: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+        metadata: None,
+    };
+    for (id, task) in [
+        // Id names "victim", column says "other" (and the reverse).
+        ("goal_needs_human_notified:victim:7", "other"),
+        ("goal_needs_human_mirrored:other:5", "victim"),
+        // Id names "victim", column says "bystander" (not needs_human).
+        ("goal_needs_human_notified:victim:3", "bystander"),
+        ("goal_needs_human_cleared:victim:30", "bystander"),
+        // The task "victim:9"'s marker is not "victim"'s episode 9.
+        ("goal_needs_human_notified:victim:9:1", "victim:9"),
+        // A well-formed "notified" marker far ahead of victim's real state
+        // (no entry observed, no cleared episode 41).
+        ("goal_needs_human_notified:victim:42", "victim"),
+    ] {
+        store.append_activity(&forge(id, task)).await.unwrap();
+    }
+
+    let d = GoalLoopDriver::new(store.clone(), queue.clone(), small_cfg())
+        .with_home_dir(dir.path().to_path_buf());
+    let victim = d.needs_human_episode("victim").await.unwrap();
+    assert_eq!((victim.seq, victim.notified, victim.mirrored), (42, true, false));
+    let other = d.needs_human_episode("other").await.unwrap();
+    assert_eq!((other.seq, other.notified, other.mirrored), (1, false, false));
+    let nine = d.needs_human_episode("victim:9").await.unwrap();
+    assert_eq!((nine.seq, nine.notified), (1, true), "its own episode 1, nothing else");
+    let bystander = d.needs_human_episode("bystander").await.unwrap();
+    assert_eq!((bystander.seq, bystander.notified, bystander.mirrored), (1, false, false));
+
+    // The sweep never picks a task through a row that names another task.
+    let open = store
+        .tasks_with_open_markers(
+            ["goal_needs_human_notified:", "goal_needs_human_mirrored:"],
+            "goal_needs_human_cleared:",
+        )
+        .await
+        .unwrap();
+    assert!(open.is_empty(), "{open:?}");
+
+    // One pass: the forged "ahead" marker suppresses victim's card (the
+    // accepted limitation) and nothing else; the other parked task is
+    // notified as usual, and no task gains a "cleared" marker.
+    d.reconcile_needs_human().await;
+    assert_eq!(needs_human_attempts(&store, "victim").await, 0);
+    assert_eq!(needs_human_attempts(&store, "other").await, 1);
+    for task in ["victim", "other", "victim:9", "bystander"] {
+        let cleared = store
+            .activity_ids_with_prefix(task, &format!("goal_needs_human_cleared:{task}:"))
+            .await
+            .unwrap();
+        assert!(cleared.is_empty(), "{task}: {cleared:?}");
+    }
+    assert_eq!(d.needs_human_episode("other").await.unwrap().seq, 1);
+}
+
 // ── H22: no-progress timeout report ─────────────────────────────────
 
 #[test]

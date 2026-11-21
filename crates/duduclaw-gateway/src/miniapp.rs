@@ -202,11 +202,12 @@ pub fn enabled_from_toml(content: &str) -> bool {
 }
 
 /// The dashboard base URL **only when it is https** — Telegram refuses a
-/// `WebAppInfo.url` that is not. `None` covers both "no public_url configured"
-/// (the `http://localhost:<port>` fallback) and "configured but plain http",
-/// and both mean the same thing to the caller: no Mini App button.
+/// `WebAppInfo.url` that is not. Built on the chat-channel resolver
+/// (`deep_link::public_dashboard_base_url`: the button is sent to a chat).
+/// `None` covers "no valid public_url configured" and "configured but plain
+/// http", and both mean the same thing to the caller: no Mini App button.
 pub(crate) fn https_base_url(home_dir: &Path) -> Option<String> {
-    let base = crate::deep_link::dashboard_base_url(home_dir)?;
+    let base = crate::deep_link::public_dashboard_base_url(home_dir)?;
     https_base(&base)
 }
 

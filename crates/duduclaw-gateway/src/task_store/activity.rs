@@ -60,8 +60,10 @@ impl TaskStore {
 
     /// RM-192 B6 restart sweep: existing tasks that are no longer
     /// `needs_human` but have a marker row whose id begins with one of
-    /// `open_prefixes` and no row at or after it whose id begins with
-    /// `closed_prefix` (all anchored, exact comparisons).
+    /// `open_prefixes` followed by **that row's own** `task_id` and `:`, and
+    /// no row at or after it whose id begins with `closed_prefix` + the same
+    /// task id + `:` (all anchored, exact comparisons). A row whose id names
+    /// another task than its `task_id` column is never a marker of either.
     pub(crate) async fn tasks_with_open_markers(
         &self,
         open_prefixes: [&str; 2],
@@ -71,12 +73,13 @@ impl TaskStore {
         let mut stmt = conn
             .prepare(
                 "SELECT DISTINCT a.task_id FROM activity a JOIN tasks t ON t.id = a.task_id
-                  WHERE (substr(a.id, 1, length(?1)) = ?1 OR substr(a.id, 1, length(?2)) = ?2)
+                  WHERE (substr(a.id, 1, length(?1) + length(a.task_id) + 1) = ?1 || a.task_id || ':'
+                         OR substr(a.id, 1, length(?2) + length(a.task_id) + 1) = ?2 || a.task_id || ':')
                     AND t.status <> 'needs_human'
                     AND NOT EXISTS (
                         SELECT 1 FROM activity c
                          WHERE c.task_id = a.task_id
-                           AND substr(c.id, 1, length(?3)) = ?3
+                           AND substr(c.id, 1, length(?3) + length(a.task_id) + 1) = ?3 || a.task_id || ':'
                            AND c.timestamp >= a.timestamp)",
             )
             .map_err(|e| format!("prepare open markers: {e}"))?;

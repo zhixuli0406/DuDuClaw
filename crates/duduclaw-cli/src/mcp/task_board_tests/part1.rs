@@ -619,3 +619,42 @@ async fn activity_post_then_list() {
     let items = parse_ok(&list)["activities"].as_array().unwrap().clone();
     assert_eq!(items.len(), 1);
 }
+
+/// RM-192 B6 trust boundary: the goal loop's persistent needs_human
+/// markers are activity rows identified by their row id
+/// (`goal_needs_human_{notified,mirrored,cleared}:<task>:<n>`).
+/// `activity_post` never takes a row id from its caller, so an employee
+/// cannot write (and so cannot forge) a marker through it.
+#[tokio::test(flavor = "current_thread")]
+async fn activity_post_cannot_choose_the_row_id() {
+    let tmp = TempDir::new();
+    for forged in [
+        "goal_needs_human_notified:t1:1",
+        "goal_needs_human_mirrored:t1:1",
+        "goal_needs_human_cleared:t1:1",
+    ] {
+        let post = handle_activity_post(
+            &serde_json::json!({
+                "summary": "looks like a marker",
+                "event_type": "goal_loop.needs_human_notified",
+                "id": forged,
+                "row_id": forged,
+                "activity_id": forged,
+            }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        let posted = parse_ok(&post);
+        let id = posted["activity"]["id"].as_str().unwrap();
+        assert_ne!(id, forged);
+        assert!(uuid::Uuid::parse_str(id).is_ok(), "{id}");
+        for prefix in [
+            "goal_needs_human_notified:",
+            "goal_needs_human_mirrored:",
+            "goal_needs_human_cleared:",
+        ] {
+            assert!(!id.starts_with(prefix), "{id}");
+        }
+    }
+}
