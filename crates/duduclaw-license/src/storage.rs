@@ -854,23 +854,25 @@ mod tests {
     fn symlinked_regular_license_is_read_and_save_replaces_link() {
         let tmp = TempDir::new().unwrap();
         let real = tmp.path().join("elsewhere.json");
-        save_to(&fixture_license(), &real).unwrap();
+        // Reuse one fixture: License::new timestamps each newly created licence.
+        let original = fixture_license();
+        save_to(&original, &real).unwrap();
+        let before = fs::read(&real).unwrap();
         let path = tmp.path().join("license.json");
         std::os::unix::fs::symlink(&real, &path).unwrap();
-        assert_eq!(load_from(&path).unwrap().subscription_id, fixture_license().subscription_id);
-        assert!(LockedLicenseStore::acquire(&path).unwrap().read_contents().unwrap()
-            .same_license(&fixture_license()).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let store = LockedLicenseStore::acquire(&path).unwrap();
+        assert!(store.read_contents().unwrap().same_license(&original).unwrap());
         let backup = tmp.path().join(BACKUP_LICENSE_FILENAME);
-        std::os::unix::fs::symlink(&real, &backup).unwrap();
-        assert!(read_store_file(&backup).unwrap().is_some());
         // Replacing the link installs a real file and never writes through it.
-        let before = fs::read(&real).unwrap();
-        let mut replacement = fixture_license();
+        let mut replacement = original.clone();
         replacement.subscription_id = "replacement".into();
-        save_to(&replacement, &path).unwrap();
-        assert!(!fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
-        assert_eq!(load_from(&path).unwrap().subscription_id, "replacement");
+        store.save(&replacement).unwrap();
+        assert!(fs::symlink_metadata(&path).unwrap().file_type().is_file());
+        assert!(store.read_contents().unwrap().same_license(&replacement).unwrap());
+        assert!(!store.read_contents().unwrap().same_license(&original).unwrap());
         assert_eq!(fs::read(&real).unwrap(), before);
+        assert_eq!(fs::symlink_metadata(&backup).unwrap_err().kind(), io::ErrorKind::NotFound);
     }
 
     /// M1: a `license.json` link pointing at a file the gateway can read is
