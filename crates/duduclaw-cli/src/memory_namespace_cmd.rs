@@ -31,8 +31,9 @@ const ATTRIBUTING_TOOLS: &[&str] = &["memory_store", "memory_alias_add", "user_p
 
 #[derive(Subcommand, Debug)]
 pub enum MemoryCommands {
-    /// Convert Simplified memory text to Traditional with a character-level map (no model).
-    /// Ambiguous characters are left unchanged. Matching local embeddings are rebuilt.
+    /// Convert Simplified Chinese memory rows to Traditional Chinese (Taiwan) with the bundled phrase dictionary (no model call).
+    /// Vocabulary is not replaced; URLs, code and file paths are preserved. Rows containing Japanese kana are skipped.
+    /// Matching local embeddings are rebuilt.
     #[command(group(ArgGroup::new("script_selector").required(true).multiple(false).args(["agent", "all", "restore"])))]
     ConvertScript {
         /// Only this agent's rows in memory.db
@@ -837,7 +838,7 @@ async fn convert_script(home: &Path, agent: Option<String>, all: bool, preview: 
             failed = true;
         }
     }
-    println!("Character-level prose conversion; ambiguous characters, URLs and code are preserved.");
+    println!("Phrase-dictionary conversion; vocabulary, URLs, code and file paths are preserved.");
     if preview { println!("Apply with --yes."); }
     if failed { Err(DuDuClawError::Memory("one or more namespaces failed".into())) } else { Ok(()) }
 }

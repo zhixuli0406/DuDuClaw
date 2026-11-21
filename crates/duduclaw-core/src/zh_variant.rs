@@ -8,7 +8,7 @@
 //! Mixed-script text can have shared characters reinterpreted by phrase context,
 //! e.g. 了解 → 瞭解; a wrong phrase guess remains possible.
 //!
-//! TAIWAN_VARIANTS normalizes 臺 → 台 and 賬 → 帳 after conversion, but only
+//! TAIWAN_VARIANTS normalizes 臺 → 台, 賬 → 帳 and 溼 → 濕 after conversion, but only
 //! when the original input did not contain that source character: user-typed
 //! forms are retained throughout the input. The converter is initialized once;
 //! initialization failure logs once and falls back to the incomplete legacy
