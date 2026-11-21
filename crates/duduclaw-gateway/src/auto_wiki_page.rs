@@ -714,6 +714,16 @@ fn write_auto_page_locked(
 // Curation-station operations
 // ---------------------------------------------------------------------------
 
+/// Maximum rows returned by the curation tab, with pending decisions first.
+const MAX_AUTO_PAGE_ROWS: usize = 200;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoPageState {
+    NeedsConfirmation,
+    Confirmed,
+}
+
 /// One row of the "自動建檔" audit tab.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AutoPageRow {
@@ -725,13 +735,14 @@ pub struct AutoPageRow {
     pub sources: Vec<String>,
     pub revision_count: usize,
     pub trust: f32,
+    pub state: AutoPageState,
 }
 
-/// List the pages under `auto/` that still need a human decision: every one
-/// except a page the registry records, as it is now, as promoted. That
-/// includes this writer's unpromoted pages and every page needing
-/// re-confirmation (filed before v1.84.0, by an earlier v1.84.0 build, or
-/// changed on disk outside the gateway), so each stays actionable.
+/// List auto pages for human curation, including confirmed pages so they can
+/// be shared or archived. Confirmation requires the same current registry
+/// record and host mark as sharing; legacy or edited pages need confirmation.
+/// Return at most 200 rows: pending decisions first, then newest updated first
+/// within each state, with path as a deterministic tie-breaker.
 pub fn list_auto_pages(store: &WikiStore) -> Result<Vec<AutoPageRow>, String> {
     let metas = store.list_pages().map_err(|e| e.to_string())?;
     let registry = registry_of(store);
@@ -744,9 +755,11 @@ pub fn list_auto_pages(store: &WikiStore) -> Result<Vec<AutoPageRow>, String> {
             Ok(page) => page,
             Err(_) => continue,
         };
-        if registered_promoted(&meta.path, &raw, &registry) {
-            continue;
-        }
+        let state = if registered_promoted(&meta.path, &raw, &registry) {
+            AutoPageState::Confirmed
+        } else {
+            AutoPageState::NeedsConfirmation
+        };
         let (_, revs) = split_body(&page.body);
         let revision_count = revs.len().max(1);
         let sources = page.sources;
@@ -760,8 +773,15 @@ pub fn list_auto_pages(store: &WikiStore) -> Result<Vec<AutoPageRow>, String> {
             sources,
             revision_count,
             trust: meta.trust,
+            state,
         });
     }
+    rows.sort_by(|a, b| {
+        a.state.cmp(&b.state)
+            .then_with(|| b.updated.cmp(&a.updated))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    rows.truncate(MAX_AUTO_PAGE_ROWS);
     Ok(rows)
 }
 
@@ -1033,8 +1053,8 @@ pub fn doc_type_of_path(path: &str) -> DocType {
 ///
 /// trust 0.3 → 0.8, `raw_dialogue` → `user_statement`, `context` → `core`
 /// (starts participating in injection), `auto-distilled` → `curated`, author
-/// → `operator`. One-way: nothing in the automatic path can undo it, and the
-/// page stops matching [`list_auto_pages`] afterwards.
+/// → `operator`. The page stays in [`list_auto_pages`] as confirmed so a
+/// human can share or archive it afterwards.
 ///
 /// v1.84.0 (review H1): the page stays under `auto/`, so promotion is
 /// recorded with the host-owned mark `host_promoted: true`
@@ -1460,7 +1480,7 @@ mod tests {
     /// v1.84.0: the audit tab lists every page under `auto/` that still needs
     /// a human decision — this writer's unpromoted page, an unstamped legacy
     /// page, and a stamped page the registry did not record (written by an
-    /// earlier build or on disk) — and drops a page once it is re-confirmed.
+    /// earlier build or on disk) — and keeps confirmed pages for sharing.
     #[test]
     fn list_auto_pages_lists_every_page_needing_a_decision() {
         let tmp = TempDir::new().unwrap();
@@ -1491,17 +1511,18 @@ mod tests {
         let rows = list_auto_pages(&store).unwrap();
         assert_eq!(rows.len(), 3, "{rows:?}");
         for path in ["auto/charter/handmade.md", "auto/charter/stamped.md"] {
-            assert!(rows.iter().any(|p| p.path == path), "{path}");
+            assert!(rows.iter().any(|p| p.path == path && p.state == AutoPageState::NeedsConfirmation), "{path}");
         }
         let row = rows.iter().find(|p| p.path == "auto/charter/company-charter.md").unwrap();
+        assert_eq!(row.state, AutoPageState::NeedsConfirmation);
         assert_eq!(row.doc_type, "charter");
         assert_eq!(row.doc_type_label, "章程");
         assert_eq!(row.revision_count, 1);
         assert_eq!(row.sources.len(), 1);
 
         // Re-confirming the unrecorded stamped page keeps its content, drops
-        // its unverifiable host sources for the legacy marker, and takes it
-        // off the list.
+        // its unverifiable host sources for the legacy marker, and keeps it
+        // on the list as confirmed, after pages needing a decision.
         promote_page(&store, "auto/charter/stamped.md").unwrap();
         let raw = store.read_raw("auto/charter/stamped.md").unwrap();
         assert_eq!(
@@ -1509,11 +1530,16 @@ mod tests {
             vec![crate::wiki_host_sources::LEGACY_PROMOTION_SOURCE.to_string()]
         );
         assert!(raw.contains("title: Stamped"));
-        assert_eq!(list_auto_pages(&store).unwrap().len(), 2);
+        let rows = list_auto_pages(&store).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows[..2].iter().all(|p| p.state == AutoPageState::NeedsConfirmation));
+        assert_eq!(rows[2].path, "auto/charter/stamped.md");
+        assert_eq!(rows[2].state, AutoPageState::Confirmed);
+        assert_eq!(serde_json::to_value(&rows[2]).unwrap()["state"], "confirmed");
     }
 
     #[test]
-    fn promote_raises_trust_and_leaves_the_audit_list() {
+    fn promote_raises_trust_and_stays_confirmed_in_the_audit_list() {
         let tmp = TempDir::new().unwrap();
         let store = store_in(&tmp);
         let out =
@@ -1527,7 +1553,34 @@ mod tests {
         assert_eq!(page.author.as_deref(), Some("operator"));
         assert!(!page.tags.contains(&AUTO_PAGE_TAG.to_string()));
         assert!(page.tags.contains(&"curated".to_string()));
-        assert!(list_auto_pages(&store).unwrap().is_empty());
+        let rows = list_auto_pages(&store).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, out.path());
+        assert_eq!(rows[0].state, AutoPageState::Confirmed);
+        // A file edit invalidates confirmation, even with its host mark intact.
+        let raw = store.read_raw(out.path()).unwrap();
+        std::fs::write(store.wiki_dir().join(out.path()), format!("{raw}\nEdited")).unwrap();
+        assert_eq!(list_auto_pages(&store).unwrap()[0].state, AutoPageState::NeedsConfirmation);
+    }
+
+    #[test]
+    fn list_auto_pages_is_bounded_and_orders_newest_decisions_first() {
+        let tmp = TempDir::new().unwrap();
+        let store = store_in(&tmp);
+        for i in 0..=MAX_AUTO_PAGE_ROWS {
+            store.write_page(
+                &format!("auto/sop/page-{i:03}.md"),
+                "---\ntitle: Legacy\nupdated: 2026-01-01T00:00:00Z\n---\n\nbody",
+            ).unwrap();
+        }
+        store.write_page(
+            "auto/sop/newest.md",
+            "---\ntitle: Newest\nupdated: 2026-11-21T00:00:00Z\n---\n\nbody",
+        ).unwrap();
+        let rows = list_auto_pages(&store).unwrap();
+        assert_eq!(rows.len(), MAX_AUTO_PAGE_ROWS);
+        assert_eq!(rows[0].path, "auto/sop/newest.md");
+        assert_eq!(rows[1].path, "auto/sop/page-000.md");
     }
 
     #[test]

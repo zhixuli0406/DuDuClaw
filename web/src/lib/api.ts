@@ -592,6 +592,8 @@ export interface WikiSearchHit {
  * the page; `revision_count` mirrors the page's in-body revision log.
  */
 export interface AutoWikiPage {
+  /** Missing on older gateways; treat as needing confirmation. */
+  state?: 'needs_confirmation' | 'confirmed';
   path: string;
   title: string;
   updated: string;
