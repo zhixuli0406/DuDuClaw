@@ -277,7 +277,10 @@ pub fn ort_lib_path(ort_lib_root: &Path) -> Option<PathBuf> {
 mod tests {
     #[test]
     fn bundle_script_redirect_allowlists_match_manifest() {
-        let script = include_str!("../../../scripts/kb-model-bundle.sh");
+        let script_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/kb-model-bundle.sh");
+        let script = std::fs::read_to_string(&script_path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", script_path.display()));
         for (name, hosts) in [
             ("GITHUB_REDIRECT_HOSTS", GITHUB_REDIRECT_HOSTS),
             ("NUGET_REDIRECT_HOSTS", NUGET_REDIRECT_HOSTS),
