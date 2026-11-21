@@ -411,12 +411,6 @@ impl SyncGate {
     fn last_outcome(&self) -> Option<SyncOutcome> {
         self.last.lock().ok().and_then(|last| last.clone())
     }
-
-    fn rejected_reason(&self) -> Option<&'static str> {
-        self.rejected.lock().ok().and_then(|rejected| {
-            rejected.as_ref().filter(|entry| entry.at.elapsed() < REJECTED_RETRY).map(|_| "unreadable")
-        })
-    }
 }
 
 /// Cheap identity of the files a CLI writer changes: type, length,
@@ -1744,7 +1738,7 @@ impl LicenseRuntime {
             // A store that is no licence at all (FIFO, oversized) is
             // reconciled like an unreadable file, as before.
             Err(StoreReadError::Rejected(_)) => {
-                self.install_reconciled(&mut inner, Err("unreadable"));
+                self.install_unreadable(&mut inner);
                 return Err(PhoneHomeError::NoLicense);
             }
             // Busy / transient: the in-memory licence is left untouched.
@@ -1797,6 +1791,21 @@ impl LicenseRuntime {
         crate::distributor_brand::runtime::reset(&self.home_dir);
     }
 
+    /// Publish the same closed state as bootstrap while retaining the refusal
+    /// memo. Do not cache the rejected stamp as successfully reconciled: the
+    /// memo's retry deadline must still work, and a return to an earlier disk
+    /// state (including absence) must not be skipped.
+    fn install_unreadable(&self, inner: &mut LicenseRuntimeInner) -> bool {
+        if let Ok(mut last) = self.sync.disk_stamp.lock() {
+            *last = None;
+        }
+        let changed = inner.license.is_some() || inner.validation_warning != Some("unreadable");
+        if changed {
+            self.install_reconciled(inner, Err("unreadable"));
+        }
+        changed
+    }
+
     /// RM-175: apply a `license.json` rewritten by another writer (the CLI's
     /// `duduclaw license refresh|activate|deactivate`) without a restart.
     ///
@@ -1808,9 +1817,10 @@ impl LicenseRuntime {
     /// when the licence in effect (or its validation state) changed.
     ///
     /// Fail closed: a lock, metadata or read error — including a file that is
-    /// unreadable right now — leaves the in-memory licence untouched and is
-    /// retried on the next call. All file and lock work runs on a blocking
-    /// thread; a lock held elsewhere gives up after [`LICENSE_LOCK_DEADLINE`].
+    /// temporarily unreadable right now — leaves the in-memory licence untouched
+    /// and is retried on the next call. A refused file drops to OpenSource
+    /// with the same closed warning as bootstrap. All file and lock work runs
+    /// on a blocking thread; a lock held elsewhere gives up after [`LICENSE_LOCK_DEADLINE`].
     /// A file refused as unusable (symbolic link, FIFO or other non-regular
     /// file, over 64 KiB, malformed JSON) is remembered by its stamp (plus
     /// the digest of the bytes read for malformed content), logged once and
@@ -1867,7 +1877,7 @@ impl LicenseRuntime {
                 // FIFO, oversized, non-regular: metadata-only identity.
                 Err(StoreReadError::Rejected(reason)) => {
                     self.remember_rejected(stamp, None, reason);
-                    return false;
+                    return self.install_unreadable(&mut inner);
                 }
                 Err(error) => {
                     // Busy or transient: keep the licence in effect, retry
@@ -1881,7 +1891,7 @@ impl LicenseRuntime {
                     Ok(same) => same,
                     Err(_) => {
                         self.remember_rejected(stamp, contents.license_digest(), "malformed");
-                        return false;
+                        return self.install_unreadable(&mut inner);
                     }
                 },
                 None => false,
@@ -1894,7 +1904,7 @@ impl LicenseRuntime {
                     // Only a malformed document gets here (I/O failures
                     // returned above): refused until the file changes.
                     self.remember_rejected(stamp, contents.license_digest(), "malformed");
-                    return false;
+                    return self.install_unreadable(&mut inner);
                 }
                 let unchanged = match &validated {
                     Ok(license) => inner.validation_warning.is_none()
@@ -1940,8 +1950,8 @@ impl LicenseRuntime {
     /// takes that sync's outcome. Vendor calls of either kind are at least
     /// [`SYNC_MIN_SPACING`] apart; inside that window the answer is `Busy`
     /// and no request is sent. A licence the CLI wrote is reconciled first,
-    /// so the request carries the identity actually installed. Every error
-    /// leaves the installed licence untouched.
+    /// so the request carries the identity actually installed. An absent or
+    /// unusable file first drops the runtime to the bootstrap-equivalent state.
     pub async fn sync_now(&self) -> SyncOutcome {
         self.sync_gated(move || async move {
             let result = self.do_phone_home_once().await;
@@ -1996,7 +2006,7 @@ impl LicenseRuntime {
         self.reconcile_with_disk(true).await;
         if self.notice_identity().await.is_none() {
             let warning = self.state.read().await.validation_warning;
-            if let Some(reason) = self.sync.rejected_reason().or(warning) {
+            if let Some(reason) = warning {
                 return self.sync.finish(SyncOutcome::UnreadableLicenseFile { reason });
             }
             return self.sync.finish(SyncOutcome::NoLicense);
@@ -2023,7 +2033,14 @@ impl LicenseRuntime {
             }
         }
         *flight = Some(now);
-        let outcome = sync_outcome(call().await);
+        let mut outcome = sync_outcome(call().await);
+        // The file may also have become unusable during refresh_snapshot(),
+        // after the initial reconciliation. Report that published state too.
+        if outcome == SyncOutcome::NoLicense {
+            if let Some(reason) = self.state.read().await.validation_warning {
+                outcome = SyncOutcome::UnreadableLicenseFile { reason };
+            }
+        }
         self.sync.finish(outcome)
     }
 
@@ -2036,10 +2053,10 @@ impl LicenseRuntime {
     /// Remember a refused store so the watcher does not read it again until
     /// it changes or [`REJECTED_RETRY`] passes; logged once per distinct file
     /// state (stamp plus, for a content refusal, the digest of the bytes
-    /// read). The in-memory licence is kept.
+    /// read). The caller also publishes the unlicensed, unreadable state.
     fn remember_rejected(&self, stamp: Option<DiskStamp>, digest: Option<[u8; 32]>, reason: &'static str) {
         let Some(stamp) = stamp else {
-            debug!(reason, "license file refused; keeping the license in effect");
+            debug!(reason, "license file refused; running unlicensed");
             return;
         };
         let Ok(mut rejected) = self.sync.rejected.lock() else { return };
@@ -2048,7 +2065,7 @@ impl LicenseRuntime {
         let known = rejected.as_ref().is_some_and(|known|
             known.digest == digest && (digest.is_some() || known.stamp == stamp));
         if !known {
-            warn!(reason, "license file on disk refused (not re-read until it changes); keeping the license in effect");
+            warn!(reason, "license file on disk refused (not re-read until it changes); running unlicensed");
         }
         // A re-read of the same refused state restarts the retry period.
         *rejected = Some(RejectedStore { stamp, digest, at: tokio::time::Instant::now() });
@@ -3786,6 +3803,149 @@ pub(crate) mod tests {
         }).await;
     }
 
+    // These tests own their runtime; the process-global RPC runtime is not
+    // isolated per handler on this branch. RPCs serialize snapshot() after sync.
+    #[tokio::test]
+    async fn sync_now_new_invalid_file_updates_outcome_and_status_snapshot() {
+        with_hardware_fixture(async {
+            let _fingerprint_guard = FINGERPRINT_TEST_LOCK.lock().await;
+            let home = tempfile::tempdir().unwrap();
+            let runtime = LicenseRuntime::bootstrap(home.path().to_path_buf(), PublicKeyRegistry::new()).await;
+            assert!(!runtime.snapshot().await.installed);
+            std::fs::write(home.path().join("license.json"), "{invalid json").unwrap();
+
+            let outcome = runtime.sync_now().await;
+            assert_eq!(outcome, SyncOutcome::UnreadableLicenseFile { reason: "unreadable" });
+            let snapshot = runtime.snapshot().await;
+            assert!(snapshot.installed);
+            assert_eq!(snapshot.validation_warning, Some("unreadable"));
+            assert_eq!(snapshot.tier, LicenseTier::OpenSource);
+            let response = json!({ "sync": outcome.to_json(), "status": snapshot });
+            assert_eq!(response["sync"]["outcome"], "unreadable_license_file");
+            let status = serde_json::to_value(runtime.snapshot().await).unwrap();
+            assert_eq!(response["status"], status);
+            assert_eq!(status["installed"], true);
+            assert_eq!(status["validation_warning"], "unreadable");
+        }).await;
+    }
+
+    #[tokio::test]
+    async fn sync_now_removed_invalid_file_clears_warning_and_status_snapshot() {
+        with_hardware_fixture(async {
+            let _fingerprint_guard = FINGERPRINT_TEST_LOCK.lock().await;
+            let home = tempfile::tempdir().unwrap();
+            let path = home.path().join("license.json");
+            std::fs::write(&path, "{invalid json").unwrap();
+            let runtime = LicenseRuntime::bootstrap(home.path().to_path_buf(), PublicKeyRegistry::new()).await;
+            assert_eq!(runtime.snapshot().await.validation_warning, Some("unreadable"));
+            // Populate the rejected memo as well as the startup warning.
+            assert_eq!(runtime.sync_now().await, SyncOutcome::UnreadableLicenseFile { reason: "unreadable" });
+            std::fs::remove_file(path).unwrap();
+
+            let outcome = runtime.sync_now().await;
+            assert_eq!(outcome, SyncOutcome::NoLicense);
+            let snapshot = runtime.snapshot().await;
+            assert!(!snapshot.installed);
+            assert_eq!(snapshot.validation_warning, None);
+            let response = json!({ "sync": outcome.to_json(), "status": snapshot });
+            assert_eq!(response["sync"]["outcome"], "no_license");
+            let status = serde_json::to_value(runtime.snapshot().await).unwrap();
+            assert_eq!(response["status"], status);
+            assert_eq!(status["installed"], false);
+            assert!(status["validation_warning"].is_null());
+        }).await;
+    }
+
+    #[tokio::test]
+    async fn sync_reports_refusal_discovered_during_refresh_snapshot() {
+        with_hardware_fixture(async {
+            let _fingerprint_guard = FINGERPRINT_TEST_LOCK.lock().await;
+            let home = tempfile::tempdir().unwrap();
+            let (runtime, _, _) = licensed_runtime(home.path()).await;
+            let outcome = runtime.sync_gated(|| async {
+                // Change after sync's first reconciliation, before the request
+                // snapshot is captured. No transport is invoked by this test.
+                std::fs::write(home.path().join("license.json"), "{invalid json").unwrap();
+                runtime.refresh_snapshot().await?;
+                panic!("an unusable licence must not reach transport");
+            }).await;
+            assert_eq!(outcome, SyncOutcome::UnreadableLicenseFile { reason: "unreadable" });
+            let snapshot = runtime.snapshot().await;
+            assert!(snapshot.installed);
+            assert_eq!(snapshot.validation_warning, Some("unreadable"));
+            assert_eq!(snapshot.tier, LicenseTier::OpenSource);
+            assert_eq!(snapshot.max_agents, None);
+        }).await;
+    }
+
+    #[tokio::test]
+    async fn watcher_clears_startup_unreadable_warning_after_removal() {
+        with_hardware_fixture(async {
+            let _fingerprint_guard = FINGERPRINT_TEST_LOCK.lock().await;
+            let home = tempfile::tempdir().unwrap();
+            let path = home.path().join("license.json");
+            std::fs::write(&path, "{invalid json").unwrap();
+            let runtime = LicenseRuntime::bootstrap(home.path().to_path_buf(), PublicKeyRegistry::new()).await;
+            assert_eq!(runtime.snapshot().await.validation_warning, Some("unreadable"));
+            std::fs::remove_file(path).unwrap();
+            assert!(runtime.reload_from_disk_if_changed().await);
+            assert!(!runtime.snapshot().await.installed);
+            assert_eq!(runtime.snapshot().await.validation_warning, None);
+            assert!(!runtime.reload_from_disk_if_changed().await);
+        }).await;
+    }
+
+    #[tokio::test]
+    async fn watcher_applies_appearance_refusal_recovery_and_removal_without_sleeping() {
+        with_hardware_fixture(async {
+            let _fingerprint_guard = FINGERPRINT_TEST_LOCK.lock().await;
+            let home = tempfile::tempdir().unwrap();
+            let path = home.path().join("license.json");
+            let (kp, pubkey) = gen_issuer_keypair();
+            let registry = PublicKeyRegistry::new().with_key("v1", pubkey);
+            let runtime = LicenseRuntime::bootstrap(home.path().to_path_buf(), registry).await;
+            assert!(!runtime.reload_from_disk_if_changed().await);
+
+            std::fs::write(&path, "{invalid json").unwrap();
+            assert!(runtime.reload_from_disk_if_changed().await);
+            assert!(runtime.snapshot().await.installed);
+            assert_eq!(runtime.snapshot().await.validation_warning, Some("unreadable"));
+            assert!(!runtime.reload_from_disk_if_changed().await);
+            // Return to the original absent stamp must not be skipped.
+            std::fs::remove_file(&path).unwrap();
+            assert!(runtime.reload_from_disk_if_changed().await);
+            assert!(!runtime.snapshot().await.installed);
+            assert_eq!(runtime.snapshot().await.validation_warning, None);
+
+            let mut license = valid_license_for(TEST_HARDWARE_FINGERPRINT);
+            sign_license(&mut license, &kp);
+            storage::save_to(&license, &path).unwrap();
+            assert!(runtime.reload_from_disk_if_changed().await);
+            assert_eq!(runtime.snapshot().await.tier, LicenseTier::SelfHostPro);
+            std::fs::write(&path, "{broken again").unwrap();
+            assert!(runtime.reload_from_disk_if_changed().await);
+            assert_eq!(runtime.snapshot().await.tier, LicenseTier::OpenSource);
+            assert_eq!(runtime.snapshot().await.max_agents, None);
+            assert_eq!(runtime.snapshot().await.validation_warning, Some("unreadable"));
+            // Recovery uses full signature verification, never just parsing.
+            let mut forged = license.clone();
+            forged.max_agents = Some(99);
+            storage::save_to(&forged, &path).unwrap();
+            assert!(runtime.reload_from_disk_if_changed().await);
+            assert_eq!(runtime.snapshot().await.validation_warning, Some("invalid_signature"));
+            assert_eq!(runtime.snapshot().await.tier, LicenseTier::OpenSource);
+            storage::save_to(&license, &path).unwrap();
+            assert!(runtime.reload_from_disk_if_changed().await);
+            assert_eq!(runtime.snapshot().await.tier, LicenseTier::SelfHostPro);
+            assert_eq!(runtime.snapshot().await.validation_warning, None);
+            std::fs::remove_file(&path).unwrap();
+            assert!(runtime.reload_from_disk_if_changed().await);
+            assert!(!runtime.snapshot().await.installed);
+            assert_eq!(runtime.snapshot().await.tier, LicenseTier::OpenSource);
+            assert_eq!(runtime.snapshot().await.validation_warning, None);
+        }).await;
+    }
+
     #[tokio::test]
     async fn sync_now_first_applies_a_license_the_cli_wrote() {
         with_hardware_fixture(async {
@@ -3840,11 +4000,12 @@ pub(crate) mod tests {
             assert!(runtime.reload_from_disk_if_changed().await);
             assert_eq!(runtime.snapshot().await.tier, LicenseTier::SelfHostPro);
 
-            // A file that cannot be read right now leaves the license in effect.
+            // Malformed content drops all entitlements, just as on restart.
             std::fs::write(&path, b"{ half written").unwrap();
+            assert!(runtime.reload_from_disk_if_changed().await);
             assert!(!runtime.reload_from_disk_if_changed().await);
-            assert!(!runtime.reload_from_disk_if_changed().await);
-            assert_eq!(runtime.snapshot().await.max_agents, Some(7));
+            assert_eq!(runtime.snapshot().await.max_agents, None);
+            assert_eq!(runtime.snapshot().await.validation_warning, Some("unreadable"));
 
             // Deactivation from the CLI applies too.
             std::fs::remove_file(&path).unwrap();
@@ -3993,10 +4154,10 @@ pub(crate) mod tests {
     }
 
     /// F2(a)/(c): a FIFO at `license.json` returns promptly and is not
-    /// re-read until it changes; the licence in effect is kept.
+    /// re-read until it changes; the runtime drops to OpenSource.
     #[cfg(unix)]
     #[tokio::test]
-    async fn fifo_at_the_license_path_returns_promptly_and_keeps_the_license() {
+    async fn fifo_at_the_license_path_returns_promptly_and_drops_entitlements() {
         with_hardware_fixture(async {
             let _fingerprint_guard = FINGERPRINT_TEST_LOCK.lock().await;
             let home = tempfile::tempdir().unwrap();
@@ -4004,19 +4165,19 @@ pub(crate) mod tests {
             let (runtime, license, kp) = licensed_runtime(home.path()).await;
             std::fs::remove_file(&path).unwrap();
             nix::unistd::mkfifo(path.as_path(), nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR).unwrap();
-            for _ in 0..3 {
+            for attempt in 0..3 {
                 let changed = tokio::time::timeout(StdDuration::from_secs(3), runtime.reload_from_disk_if_changed())
                     .await.expect("a FIFO licence path must not block the watcher");
-                assert!(!changed);
+                assert_eq!(changed, attempt == 0);
             }
             // Forced (sync) path too, without blocking or calling the vendor.
             let outcome = tokio::time::timeout(StdDuration::from_secs(3),
                 runtime.sync_gated(|| async { Ok(PhoneHomeOk::Refreshed { changed: false }) })).await
                 .expect("sync returns promptly");
-            assert_eq!(outcome, SyncOutcome::Unchanged);
+            assert_eq!(outcome, SyncOutcome::UnreadableLicenseFile { reason: "unreadable" });
             assert!(rejected_stamp(&runtime).is_some());
-            assert_eq!(runtime.snapshot().await.tier, LicenseTier::SelfHostPro);
-            assert_eq!(runtime.state.read().await.revision, 0);
+            assert_eq!(runtime.snapshot().await.tier, LicenseTier::OpenSource);
+            assert_eq!(runtime.state.read().await.revision, 1);
 
             // Replaced by a real licence: the new stamp is read and applied.
             std::fs::remove_file(&path).unwrap();
@@ -4071,7 +4232,7 @@ pub(crate) mod tests {
             let path = home.path().join("license.json");
             let (runtime, license, kp) = licensed_runtime(home.path()).await;
             std::fs::write(&path, vec![b' '; storage::MAX_LICENSE_FILE_BYTES as usize + 1]).unwrap();
-            assert!(!runtime.reload_from_disk_if_changed().await);
+            assert!(runtime.reload_from_disk_if_changed().await);
             let remembered = rejected_stamp(&runtime);
             assert!(remembered.is_some());
             // Same stamp: skipped before any lock or read — even with the
@@ -4082,8 +4243,8 @@ pub(crate) mod tests {
             assert!(started.elapsed() < LICENSE_LOCK_DEADLINE, "re-read a refused file: {:?}", started.elapsed());
             drop(held);
             assert_eq!(rejected_stamp(&runtime), remembered);
-            assert_eq!(runtime.snapshot().await.tier, LicenseTier::SelfHostPro);
-            assert_eq!(runtime.state.read().await.revision, 0);
+            assert_eq!(runtime.snapshot().await.tier, LicenseTier::OpenSource);
+            assert_eq!(runtime.state.read().await.revision, 1);
 
             // Changed: read again and applied.
             let mut more = license.clone();
@@ -4109,7 +4270,7 @@ pub(crate) mod tests {
             std::fs::remove_file(&path).unwrap();
             std::os::unix::fs::symlink(&target, &path).unwrap();
             std::fs::write(&target, vec![b' '; storage::MAX_LICENSE_FILE_BYTES as usize + 1]).unwrap();
-            assert!(!runtime.reload_from_disk_if_changed().await);
+            assert!(runtime.reload_from_disk_if_changed().await);
             let remembered = rejected_stamp(&runtime);
             assert!(remembered.is_some());
             // Same stamp: skipped before any lock or read — even with the
@@ -4120,8 +4281,8 @@ pub(crate) mod tests {
             assert!(started.elapsed() < LICENSE_LOCK_DEADLINE, "re-read a refused file: {:?}", started.elapsed());
             drop(held);
             assert_eq!(rejected_stamp(&runtime), remembered);
-            assert_eq!(runtime.snapshot().await.tier, LicenseTier::SelfHostPro);
-            assert_eq!(runtime.state.read().await.revision, 0);
+            assert_eq!(runtime.snapshot().await.tier, LicenseTier::OpenSource);
+            assert_eq!(runtime.state.read().await.revision, 1);
 
             // Changed: read again and applied.
             let mut more = license.clone();
@@ -4266,7 +4427,7 @@ pub(crate) mod tests {
             malformed.push(b' ');
 
             std::fs::write(&path, &malformed).unwrap();
-            assert!(!runtime.reload_from_disk_if_changed().await);
+            assert!(runtime.reload_from_disk_if_changed().await);
             let refused = runtime.sync.rejected.lock().unwrap().clone().expect("refused");
             let malformed_digest: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(&malformed).into();
             assert_eq!(refused.digest, Some(malformed_digest));
@@ -4303,7 +4464,7 @@ pub(crate) mod tests {
             let submitted = || ops.spawned.load(Ordering::SeqCst);
 
             std::fs::write(&path, b"{ not a licence").unwrap();
-            assert!(!runtime.reload_from_disk_if_changed().await);
+            assert!(runtime.reload_from_disk_if_changed().await);
             let refused = runtime.sync.rejected.lock().unwrap().clone().expect("refused");
             assert!(refused.digest.is_some());
 
@@ -4328,10 +4489,10 @@ pub(crate) mod tests {
             // A forced sync ignores the refusal and reads once.
             let before = submitted();
             let outcome = runtime.sync_gated(|| async { Ok(PhoneHomeOk::Refreshed { changed: false }) }).await;
-            assert_eq!(outcome, SyncOutcome::Unchanged);
+            assert_eq!(outcome, SyncOutcome::UnreadableLicenseFile { reason: "unreadable" });
             assert_eq!(submitted(), before + 2, "a forced sync must read the store");
-            assert_eq!(runtime.snapshot().await.tier, LicenseTier::SelfHostPro);
-            assert_eq!(runtime.state.read().await.revision, 0);
+            assert_eq!(runtime.snapshot().await.tier, LicenseTier::OpenSource);
+            assert_eq!(runtime.state.read().await.revision, 1);
         }).await;
     }
 
