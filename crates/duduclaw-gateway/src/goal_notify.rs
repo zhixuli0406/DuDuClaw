@@ -1125,7 +1125,7 @@ pub async fn notify_goal_observer(home_dir: &Path, task: &TaskRow, resolution: &
     };
     if !crate::goal_notify_private::channel_may_carry(home_dir, &task.id, &channel) {
         let link =
-            crate::deep_link::deep_link(home_dir, crate::deep_link::DeepLinkKind::Task, &task.id);
+            crate::deep_link::public_deep_link(home_dir, crate::deep_link::DeepLinkKind::Task, &task.id);
         let text = crate::goal_notify_private::private_decision_notice(task, link.as_deref());
         return send_private_notice(home_dir, task, &channel, &chat_id, "goal.observer", &text, proof.as_deref())
             .await
@@ -1324,7 +1324,7 @@ pub async fn notify_goal_kickoff(
     // object the link should land on is the unified inbox, same as
     // `approval_notify`/`install_notify` — not `/tasks/<id>` (the task hasn't
     // started yet and this function only has `approval_id`, not the task row).
-    let link = crate::deep_link::deep_link(
+    let link = crate::deep_link::public_deep_link(
         home_dir,
         crate::deep_link::DeepLinkKind::Approval,
         approval_id,

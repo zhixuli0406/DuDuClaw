@@ -350,17 +350,31 @@ mod fallback_tests {
     #[test]
     fn format_fallback_message_appends_console_link_when_dashboard_resolvable() {
         let dir = tempfile::tempdir().unwrap();
+        // With no public URL, only native hosts get the legacy localhost link.
+        // The resolver's injected-environment matrix lives in deep_link tests.
         std::fs::write(dir.path().join("config.toml"), "[gateway]\nport = 18889\n").unwrap();
+        let local_only = format_fallback_message("Agnes", FailureReason::RateLimited, dir.path());
+        if duduclaw_core::ns_guard::is_containerized() {
+            assert!(!local_only.contains("🔎"), "{local_only}");
+            assert!(!local_only.contains("localhost"), "{local_only}");
+        } else {
+            assert!(local_only.contains("🔎 詳情：http://localhost:18889/manage/billing"), "{local_only}");
+        }
 
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[dashboard]\npublic_url = \"http://192.168.1.10:18889\"\n[gateway]\nport = 18889\n",
+        )
+        .unwrap();
         let billing_msg = format_fallback_message("Agnes", FailureReason::RateLimited, dir.path());
         assert!(
-            billing_msg.contains("🔎 詳情：http://localhost:18889/manage/billing"),
+            billing_msg.contains("🔎 詳情：http://192.168.1.10:18889/manage/billing"),
             "billing-group failure must link to /manage/billing: {billing_msg}"
         );
 
         let system_msg = format_fallback_message("Agnes", FailureReason::Timeout, dir.path());
         assert!(
-            system_msg.contains("🔎 詳情：http://localhost:18889/manage/logs"),
+            system_msg.contains("🔎 詳情：http://192.168.1.10:18889/manage/logs"),
             "CLI-side failure must link to /manage/logs: {system_msg}"
         );
 

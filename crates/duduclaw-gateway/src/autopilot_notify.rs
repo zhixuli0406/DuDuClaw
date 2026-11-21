@@ -182,7 +182,7 @@ pub async fn notify_circuit_open(
         return;
     };
     let body = circuit_open_body(&rule.name, max_fires, cooldown_secs);
-    let link = crate::deep_link::deep_link(
+    let link = crate::deep_link::public_deep_link(
         home_dir,
         crate::deep_link::DeepLinkKind::Autopilot,
         &rule.id,

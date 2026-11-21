@@ -59,7 +59,9 @@ impl MethodHandler {
             "uptime_seconds": uptime,
             "agents_count": reg.list().len(),
             "channels_connected": channels_connected,
-            "gateway_address": crate::deep_link::dashboard_base_url(&self.home_dir)
+            // Shown on the dashboard itself (same machine): the localhost
+            // fallback is fine here regardless of containerization.
+            "gateway_address": crate::deep_link::local_dashboard_base_url(&self.home_dir)
                 .and_then(|url| url.strip_prefix("http://").or_else(|| url.strip_prefix("https://")).map(str::to_string))
                 .unwrap_or_else(|| "localhost:18889".to_string()),
             // Product form-factor (personal|enterprise). Orthogonal to the

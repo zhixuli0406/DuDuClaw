@@ -4245,12 +4245,12 @@ async fn build_reply_with_session_inner_impl(
         ..Default::default()
     });
     // Stripe error-object pattern: attach "where to go look" alongside the
-    // classification itself — console_url is the dashboard deep link (same
-    // one the message text below surfaces), doc_url is the public docs page
+    // classification itself — console_url retains the local diagnostic link;
+    // the chat message uses the container-aware resolver. doc_url is the public docs page
     // when one actually exists (`failure_doc_url` never invents a URL).
     // `json!` serializes `Option<String>`/`Option<&str>` as `null` when
     // `None`, so this stays fail-quiet the same way `deep_link` itself does.
-    let console_url = if failure.display_origin().is_claude_cli() {failure_console_url(&ctx.home_dir, reason)} else {None};
+    let console_url = if failure.display_origin().is_claude_cli() {crate::deep_link::local_dashboard_deep_link(&ctx.home_dir, failure_console_link_kind(reason), "")} else {None};
     let doc_url = failure.display_origin().is_claude_cli().then(||failure_doc_url(reason)).flatten();
     let mut audit = serde_json::json!({
         "event": "channel_reply_fallback",

@@ -616,6 +616,12 @@ pub(crate) fn parse_card_press(event: &serde_json::Value) -> Option<CardPress> {
             return None;
         }
     }
+    // The two space objects must not contradict each other (RM-192 review):
+    // a press whose `message.space` and `space` disagree is refused, so it
+    // can never reach the DM destination match on a mixed proof.
+    if crate::googlechat_space_kind::carried_spaces_conflict(space, &event["message"], event) {
+        return None;
+    }
     let functions: Vec<&str> = ["/common/invokedFunction", "/action/actionMethodName"]
         .iter()
         .filter_map(|p| event.pointer(p).and_then(Value::as_str))
@@ -821,7 +827,10 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
         warn!("Google Chat: MESSAGE event without space name");
         return;
     }
-    let is_dm = crate::googlechat_space_kind::is_one_to_one(&state.creds, &space, &message, event).await;
+    // A `space.name` that differs from `message.space.name` (or any
+    // contradiction between the two objects) makes the turn shared here:
+    // `carried_kind` never combines fields across the two objects.
+    let is_dm =crate::googlechat_space_kind::is_one_to_one(&state.creds, &space, &message, event).await;
     let thread = reply_thread(state, event, is_dm).await;
     let sender = message
         .pointer("/sender/displayName")
@@ -2248,10 +2257,10 @@ mod access_notice_tests {
 
     #[test]
     fn only_a_single_user_dm_is_one_to_one() {
-        use crate::googlechat_space_kind::{SpaceKind, carried_space, classify_space};
+        use crate::googlechat_space_kind::{SpaceKind, carried_kind};
         let msg = |space: serde_json::Value| json!({ "space": space });
         let none = json!({});
-        let kind = |m: &serde_json::Value, e: &serde_json::Value| classify_space(&carried_space(m, e));
+        let kind = |m: &serde_json::Value, e: &serde_json::Value| carried_kind("spaces/A", m, e);
         assert_eq!(kind(&msg(json!({"type":"DM","singleUserBotDm":true})), &none), SpaceKind::OneToOneDm);
         // The event-level space is consulted when the message lacks it.
         assert_eq!(
@@ -2436,6 +2445,59 @@ mod card_click_tests {
         assert_eq!(parse_card_press(&click("not-a-decision")), None);
         let approve = encode(DecisionSource::Approval, DecisionAct::Approve, "a1");
         assert_eq!(parse_card_press(&click(&approve)), None);
+    }
+
+    #[test]
+    fn a_press_with_mismatched_or_conflicting_spaces_is_refused() {
+        let r = encode(DecisionSource::Goal, DecisionAct::Retry, "t1");
+        let r = r.as_str();
+        // Mismatched names, in either direction of who is complete.
+        assert_eq!(
+            mutated(r, |e| e["message"]["space"] = json!({"name":"spaces/DM2","spaceType":"DIRECT_MESSAGE","singleUserBotDm":true})),
+            None
+        );
+        assert_eq!(mutated(r, |e| e["message"]["space"]["name"] = json!(7)), None);
+        assert_eq!(mutated(r, |e| e["message"]["space"] = json!("spaces/DM1")), None);
+        // The event-level space is a complete DM proof; message.space says
+        // shared → refused, not merged.
+        for shared in [
+            json!({"name":"spaces/DM1","spaceType":"SPACE"}),
+            json!({"name":"spaces/DM1","spaceType":"GROUP_CHAT"}),
+            json!({"name":"spaces/DM1","type":"ROOM"}),
+            json!({"name":"spaces/DM1","singleUserBotDm":false}),
+        ] {
+            assert_eq!(mutated(r, |e| e["message"]["space"] = shared.clone()), None, "{shared}");
+            // And the other way round.
+            assert_eq!(
+                mutated(r, |e| {
+                    e["message"]["space"] = json!({"name":"spaces/DM1","spaceType":"DIRECT_MESSAGE","singleUserBotDm":true});
+                    e["space"] = shared.clone();
+                }),
+                None,
+                "{shared}"
+            );
+        }
+        // A split proof (type in one object, flag in the other) is not a
+        // conflict: the press is read, and the resolver treats it as unknown
+        // (lookup, else shared) — never as a DM proof.
+        let split = mutated(r, |e| {
+            e["space"] = json!({"name":"spaces/DM1","singleUserBotDm":true});
+            e["message"]["space"] = json!({"name":"spaces/DM1","spaceType":"DIRECT_MESSAGE"});
+        });
+        assert!(split.is_some());
+        let mut event = click(r);
+        event["space"] = json!({"name":"spaces/DM1","singleUserBotDm":true});
+        event["message"]["space"] = json!({"name":"spaces/DM1","spaceType":"DIRECT_MESSAGE"});
+        assert_eq!(
+            crate::googlechat_space_kind::carried_kind("spaces/DM1", &event["message"], &event),
+            crate::googlechat_space_kind::SpaceKind::Unknown
+        );
+        // Agreeing objects are still read.
+        assert!(mutated(r, |e| {
+            let top = e["space"].clone();
+            e["message"]["space"] = top;
+        })
+        .is_some());
     }
 
     #[tokio::test]

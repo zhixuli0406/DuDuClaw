@@ -322,7 +322,23 @@ impl GoalLoopDriver {
 // moves only when the driver observes an exit: every pass for the tasks it
 // tracks, plus one sweep per driver life for tasks that left while no
 // driver was watching.
+//
+// Trust boundary (accepted limitation, v1.84 security review finding 3):
+// the markers live in tasks.db next to the task itself. They are written only
+// by this driver (`append_marker`, deterministic ids); no MCP / RPC path lets
+// a caller choose an activity row id — `activity_post` and every other
+// writer mint a UUID or use their own fixed prefix (pinned by the cli test
+// `activity_post_cannot_choose_the_row_id`) — so an employee cannot forge one
+// through the tools. A process with direct write access to tasks.db can
+// forge one (e.g. a "notified" marker for an episode ahead of the task's
+// real state, which suppresses that task's card). That process can already
+// rewrite the task itself, so this is not defended here. What is guaranteed:
+// a marker is only ever read for the task it names — its id must be exactly
+// `<kind><task id>:<digits>` AND its `task_id` column must be that task
+// (`activity_ids_with_prefix`, `max_marker_seq`, `tasks_with_open_markers`)
+// — so a forged or malformed row never affects another task.
 
+/// Marker row id prefixes — see the trust boundary above.
 const NOTIFIED_MARKER: &str = "goal_needs_human_notified:";
 const MIRRORED_MARKER: &str = "goal_needs_human_mirrored:";
 const CLEARED_MARKER: &str = "goal_needs_human_cleared:";
