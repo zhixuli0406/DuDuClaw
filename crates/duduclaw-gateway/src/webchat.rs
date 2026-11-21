@@ -1653,7 +1653,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
 /// its header. Falls back to the fixed product name when no agent is
 /// loaded — mirrors the connect-time computation.
 async fn build_session_info_frame(
-    state: &Arc<WebChatState>,
+    state: &WebChatState,
     session_id: &str,
     agent: Option<&str>,
 ) -> ChatMessage {

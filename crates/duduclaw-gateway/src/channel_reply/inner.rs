@@ -525,7 +525,7 @@ async fn build_reply_with_session_inner_impl(
         if let Some(error) = refusal {
             super::health::receive(ctx, &agent_id, session_id).await;
             super::health::mark(&agent_id, Some("other"));
-            return if public_visitor { crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE.into() } else { format!("⚠️ {error}") };
+            return if public_visitor { crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE.into() } else { live_only_notice(format!("⚠️ {error}")) };
         }
     }
 

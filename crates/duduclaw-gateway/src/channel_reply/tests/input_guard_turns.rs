@@ -130,6 +130,44 @@ struct Seen {
     live_only: Option<String>,
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn model_alignment_refusal_is_live_only_when_new_and_stored_when_existing() {
+    let (home, ctx, _registry, calls) = probe_home(None, None).await;
+    let spy = NoImplicitCloud::at(home.path());
+    let path = home.path().join("agents/worker/agent.toml");
+    let config = std::fs::read_to_string(&path).unwrap().replace("provider='codex'", "provider='grok'");
+    std::fs::write(path, config).unwrap();
+    for existing in [false, true] {
+        let sid = if existing { "webchat:alignment-existing" } else { "webchat:alignment-new" };
+        if existing {
+            ctx.session_manager.get_or_create(sid, "worker").await.unwrap();
+        }
+        let (text, cleanup) = with_delivery_cleanup(async {
+            let reply = build_guarded_reply_for_agent("普通訊息", &ctx, "worker", sid, "member", None).await;
+            assert!(reply.text.contains("model_provider_mismatch"), "{}", reply.text);
+            assert!(reply.text.contains("模型與執行引擎設定不相容"), "{}", reply.text);
+            assert_eq!(reply.rollback.as_ref().unwrap().delivery.live_only_text().as_deref(),
+                Some(reply.text.as_str()), "bound to the final client text");
+            reply.persist_webchat(&ctx.session_manager, sid, &reply.text).await.unwrap();
+            let users = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+            reply.publish_webchat(&ctx.session_manager, sid, &users, users.acl_generation().unwrap(),
+                &crate::webchat::access::TargetPolicy::test_admin(),
+                &tokio_util::sync::CancellationToken::new()).await.expect("specific refusal delivered to WebChat");
+            reply.text.clone()
+        }).await;
+        cleanup.unwrap();
+        assert_eq!(ctx.session_manager.turn_generation(sid).await.unwrap().is_some(), existing,
+            "a new refusal must not create a session");
+        let conn = rusqlite::Connection::open(home.path().join("sessions.db")).unwrap();
+        let mut stmt = conn.prepare("SELECT content FROM session_messages WHERE session_id = ?1").unwrap();
+        let stored = stmt.query_map([sid], |row| row.get::<_, String>(0)).unwrap()
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(stored, if existing { vec![text] } else { vec![] }, "only an existing session stores the refusal");
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "no runtime call");
+    assert_eq!(spy.counts(), [0, 0], "no implicit model call");
+}
+
 /// One explicit-agent turn (the WebChat / AG-UI / Odoo Live Chat entry),
 /// optionally as an authenticated WebChat principal.
 async fn turn_as(ctx: &ReplyContext, principal: Option<&str>, sid: &str, user: &str, text: &str) -> Seen {

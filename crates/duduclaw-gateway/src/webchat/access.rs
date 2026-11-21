@@ -292,7 +292,7 @@ fn target_allowed(sender: &SenderAccess, loaded: &duduclaw_agent::registry::Load
 }
 
 pub(super) async fn user_session_info(
-    state: &Arc<WebChatState>, sid: &str, agent: Option<&str>, user: &str,
+    state: &WebChatState, sid: &str, agent: Option<&str>, user: &str,
 ) -> ChatMessage {
     if is_widget_visitor(user)
         || matches!(state.acl_snapshot(user).await, Ok(s) if s.role() == duduclaw_auth::UserRole::Admin) {

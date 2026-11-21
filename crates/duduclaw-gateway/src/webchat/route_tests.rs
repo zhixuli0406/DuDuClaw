@@ -2,6 +2,7 @@
 //! bound main agents, queued commands and stored conversations.
 
 use super::*;
+use crate::webchat::build_session_info_frame;
 use crate::trigger_route::tests::write_agent;
 use duduclaw_auth::{AccessLevel, UserRole, UserStatus};
 use std::sync::Arc;
