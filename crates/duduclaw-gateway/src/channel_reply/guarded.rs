@@ -622,14 +622,14 @@ fn sanitize_delivery_reply(text: &str) -> String {
 #[cfg(test)]
 mod delivery_sanitizing_tests {
     #[test]
-    fn document_instructions_survive_while_visible_paths_are_redacted() {
+    fn document_instructions_and_non_home_visible_paths_survive() {
         let text = "報告在 /private/employee/report.docx\n📎DELIVER:/private/employee/report.docx";
         let sanitized = super::sanitize_delivery_reply(text);
         let (visible, paths) = crate::office_docs::parse_deliverables(&sanitized);
-        assert_eq!(visible, "報告在 [path]");
+        assert_eq!(visible, "報告在 /private/employee/report.docx");
         assert_eq!(paths, ["/private/employee/report.docx"]);
         assert_eq!(crate::dispatcher::sanitize_for_channel("US$5.00 / 上限 US$5.00"),
             "US$5.00 / 上限 US$5.00");
-        assert_eq!(crate::dispatcher::sanitize_for_channel("(/private/report.docx)"), "([path])");
+        assert_eq!(crate::dispatcher::sanitize_for_channel("(/private/report.docx)"), "(/private/report.docx)");
     }
 }
