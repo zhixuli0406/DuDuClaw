@@ -366,10 +366,27 @@ pub(crate) async fn handle_shared_wiki_lint(home_dir: &Path, caller_agent: &str)
 }
 
 pub(crate) async fn handle_wiki_share(args: &Value, home_dir: &Path, caller_agent: &str) -> Value {
+    let scope = crate::mcp_memory_handlers::mcp_read_scope(caller_agent);
+    handle_wiki_share_in(args, home_dir, caller_agent, &scope).await
+}
+
+/// [`handle_wiki_share`] with an explicit read scope (v1.84.0: on a channel
+/// turn no page under `auto/` is published).
+pub(crate) async fn handle_wiki_share_in(
+    args: &Value,
+    home_dir: &Path,
+    caller_agent: &str,
+    scope: &crate::mcp_memory_handlers::ReadScope,
+) -> Value {
     let page_path = match args.get("page_path").and_then(|v| v.as_str()) {
         Some(p) => p,
         None => return tool_error("Missing required parameter: page_path"),
     };
+    // v1.84.0 (review H1): the source is inside `auto/` — one fixed answer,
+    // before any file-system access, whether or not the page exists.
+    if auto_namespace_mutation_refused(page_path, scope) {
+        return tool_error(WIKI_AUTO_NAMESPACE_CHANNEL_TURN_REFUSED);
+    }
     let custom_summary = args.get("summary").and_then(|v| v.as_str());
 
     // Read source page from caller's wiki
@@ -396,9 +413,9 @@ pub(crate) async fn handle_wiki_share(args: &Value, home_dir: &Path, caller_agen
             Err(e) => return tool_error(&wiki_read_error(page_path, &e)),
         };
     // v1.84.0: another conversation's auto page cannot be published from a
-    // channel turn; it answers exactly like a missing page.
-    let scope = crate::mcp_memory_handlers::mcp_read_scope(caller_agent);
-    if auto_page_hidden(&wiki_dir, page_path, &scope) {
+    // channel turn; it answers exactly like a missing page. (Defence in
+    // depth: on a channel turn an `auto/` source is already refused above.)
+    if auto_page_hidden(&wiki_dir, page_path, scope) {
         return tool_error(&format!("Page not found in your wiki: {}", page_path));
     }
     // Publishing must not bypass what `wiki_read` withholds (quarantined,

@@ -3,6 +3,41 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// Upgrade visibility notice, one warning per employee; never a failure.
+pub(crate) fn legacy_wiki_checks(home_dir: &Path) -> Vec<Value> {
+    let mut checks = Vec::new();
+    let Ok(agents) = std::fs::read_dir(home_dir.join("agents")) else {
+        return checks;
+    };
+    for entry in agents.flatten() {
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let agent_id = entry.file_name().to_string_lossy().to_string();
+        if !is_valid_agent_id(&agent_id) {
+            continue;
+        }
+        let store = duduclaw_memory::WikiStore::new(entry.path().join("wiki"));
+        let Ok((promoted, unpromoted)) = crate::auto_wiki_page::legacy_auto_page_counts(&store) else {
+            continue;
+        };
+        let total = promoted + unpromoted;
+        if total > 0 {
+            checks.push(json!({
+                "name": "legacy_auto_wiki",
+                "status": "warn",
+                "agent_id": agent_id,
+                "previously_promoted": promoted,
+                "not_promoted": unpromoted,
+                "message": format!("有 {total} 個升級前由系統自動建立的筆記頁目前不會出現在對話中，其中 {promoted} 個先前已由人員提升。請到知識整理頁重新確認要保留的頁面。"),
+                "can_repair": false,
+            }));
+        }
+    }
+    checks.sort_by(|a, b| a["agent_id"].as_str().cmp(&b["agent_id"].as_str()));
+    checks
+}
+
 /// Check if an API key is available (env var, `config.toml [api]`, or a
 /// non-empty `accounts` array). Pure function of `home_dir` — extracted from
 /// `MethodHandler::has_api_key` (now a thin delegate to this) so the O-0

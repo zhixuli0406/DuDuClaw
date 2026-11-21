@@ -5102,6 +5102,7 @@
   "settings.redaction.desc": "AI に渡す前に機密データを自動マスクします。",
   "settings.doctor.desc": "システム設定を一括点検し、よくある問題を自動修復します。",
   "settings.doctor.check.config_file": "設定ファイル",
+  "settings.doctor.check.legacy_auto_wiki": "アップグレード前の自動メモ",
   "settings.doctor.check.agents": "AI 社員",
   "settings.doctor.check.api_key": "API キー",
   "settings.doctor.check.container_process_isolation": "コンテナのプロセス分離",

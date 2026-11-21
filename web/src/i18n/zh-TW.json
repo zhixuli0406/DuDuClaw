@@ -5102,6 +5102,7 @@
   "settings.redaction.desc": "在傳給 AI 之前，自動遮蔽訊息中的機敏資料（如電話、信箱）。",
   "settings.doctor.desc": "一鍵檢查系統各項設定是否正常，並可自動修復常見問題。",
   "settings.doctor.check.config_file": "設定檔",
+  "settings.doctor.check.legacy_auto_wiki": "升級前的自動筆記",
   "settings.doctor.check.agents": "AI 員工",
   "settings.doctor.check.api_key": "API 金鑰",
   "settings.doctor.check.container_process_isolation": "容器行程隔離",

@@ -425,16 +425,36 @@ pub(crate) fn load_agent_graph_triples(
     agent_id: &str,
     now_rfc: &str,
 ) -> Result<Vec<GraphTriple>> {
+    load_agent_graph_triples_scoped(conn, agent_id, now_rfc, crate::RowScope::All)
+}
+
+/// [`load_agent_graph_triples`] over the rows of `scope` only (v1.84.0): in
+/// a conversation the visibility rule is part of the query, so a graph built
+/// from the result has no node or edge that only another conversation's row
+/// supplies ([`crate::RowScope::All`] = every row, exactly as before).
+pub(crate) fn load_agent_graph_triples_scoped(
+    conn: &Connection,
+    agent_id: &str,
+    now_rfc: &str,
+    scope: crate::RowScope<'_>,
+) -> Result<Vec<GraphTriple>> {
+    let sql = format!(
+        "SELECT id, subject, predicate, object, origin_trust FROM memories
+         WHERE agent_id = ?1 AND subject IS NOT NULL
+           AND (valid_until IS NULL OR valid_until > ?2)
+           AND quarantined = 0{visible}",
+        visible = scope.and_visible("memories", "?3"),
+    );
     let mut stmt = conn
-        .prepare(
-            "SELECT id, subject, predicate, object, origin_trust FROM memories
-             WHERE agent_id = ?1 AND subject IS NOT NULL
-               AND (valid_until IS NULL OR valid_until > ?2)
-               AND quarantined = 0",
-        )
+        .prepare(&sql)
         .map_err(|e| DuDuClawError::Memory(format!("graph triple load: {e}")))?;
+    let session = scope.session();
+    let mut bound: Vec<&dyn rusqlite::ToSql> = vec![&agent_id, &now_rfc];
+    if scope.is_scoped() {
+        bound.push(&session);
+    }
     let rows = stmt
-        .query_map(params![agent_id, now_rfc], |r| {
+        .query_map(bound.as_slice(), |r| {
             Ok(GraphTriple {
                 memory_id: r.get::<_, String>(0)?,
                 subject: r.get::<_, String>(1)?,

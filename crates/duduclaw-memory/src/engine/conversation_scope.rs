@@ -772,6 +772,121 @@ mod tests {
         )));
     }
 
+    /// Review L2: in a conversation the graph ranking is built from the
+    /// triples that conversation may see. A hidden triple of B that links the
+    /// query's seed entity to A's second row (which would hand it PPR mass
+    /// and re-order A's two rows employee-wide) changes neither A's graph
+    /// scores (bit for bit) nor the order of A's results; employee-wide the
+    /// hidden row is part of the graph.
+    #[tokio::test]
+    async fn scoped_graph_ranking_ignores_hidden_triples() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let put_row = |content: &'static str, meta: TemporalMeta, session: &'static str, seq: i64| {
+            let engine = &engine;
+            async move {
+                stored(
+                    engine
+                        .store_temporal_outcome("a1", entry(content, "user_profile"), meta, from_session(session, seq))
+                        .await
+                        .unwrap(),
+                )
+            }
+        };
+        let x = put_row("zephyr note likes tea", triple("zephyr", "likes", "tea", "user_profile"), "telegram:A", 1).await;
+        let y = put_row(
+            "zephyr note kumquat orchard",
+            triple("kumquat", "grows_in", "orchard", "user_profile"),
+            "telegram:A",
+            2,
+        )
+        .await;
+        let in_a = RowScope::conversation(Some("telegram:A"));
+        let graph_bits = |scope: RowScope<'static>| {
+            let engine = &engine;
+            async move {
+                let conn = engine.conn_for_maintenance().await;
+                let now = Utc::now().to_rfc3339();
+                let ranked = engine.graph_rank_scoped(&conn, "a1", "zephyr note", &now, scope).unwrap();
+                let bits: Vec<(String, u64)> =
+                    ranked.unwrap_or_default().into_iter().map(|(id, s)| (id, s.to_bits())).collect();
+                bits
+            }
+        };
+        let order = || {
+            let engine = &engine;
+            async move {
+                let got = engine.search_scoped("a1", "zephyr note", 2, in_a).await.unwrap();
+                got.into_iter().map(|e| e.id).collect::<Vec<_>>()
+            }
+        };
+        let graph_before = graph_bits(in_a).await;
+        assert!(graph_before.iter().any(|(id, _)| *id == x), "the seed reaches A's row: {graph_before:?}");
+        let order_before = order().await;
+        assert_eq!(order_before.len(), 2);
+        assert!(order_before.contains(&x) && order_before.contains(&y));
+
+        let hidden =
+            put_row("unrelated text", triple("zephyr", "owns", "kumquat", "user_profile"), "telegram:B", 3).await;
+        assert_eq!(graph_bits(in_a).await, graph_before, "a hidden triple changes no scoped graph score");
+        assert_eq!(order().await, order_before, "a hidden triple does not re-order A's rows");
+        let employee = graph_bits(RowScope::All).await;
+        assert!(employee.iter().any(|(id, _)| *id == hidden), "employee-wide the triple is in the graph");
+    }
+
+    /// Review M2: a held claim of conversation B does not fold into
+    /// conversation A's pending held claim for the same triple — two held
+    /// rows, each with its own conversation's lineage; a repeat inside A
+    /// still dedups against A's own row; an explicit claim dedups
+    /// employee-wide as before.
+    #[tokio::test]
+    async fn pending_held_claim_dedup_stays_in_its_conversation() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let s = "policy:refund";
+        let hold = |session: &'static str, seq: i64, event: &'static str| {
+            let engine = &engine;
+            async move {
+                engine
+                    .hold_refused_claim_outcome(
+                        "a1",
+                        entry("window: forever", event),
+                        triple(s, "window", "forever", "channel"),
+                        from_session(session, seq),
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let a = hold("telegram:A", 1, "conversation_distill").await;
+        let b = hold("telegram:B", 2, "conversation_distill").await;
+        assert!(a.newly_held && b.newly_held, "{a:?} {b:?}");
+        assert_ne!(a.id, b.id, "B must not receive A's held id");
+        let again = hold("telegram:A", 3, "conversation_distill").await;
+        assert_eq!((again.id.clone(), again.newly_held), (a.id.clone(), false));
+
+        let sessions = |id: String| {
+            let engine = &engine;
+            async move {
+                let conn = engine.conn_for_maintenance().await;
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT DISTINCT source_session FROM memory_origins
+                         WHERE memory_store = 'memories' AND memory_id = ?1
+                           AND role IN ('direct', 'inherited')",
+                    )
+                    .unwrap();
+                let rows = stmt.query_map(params![id], |r| r.get::<_, String>(0)).unwrap();
+                let got: Vec<String> = rows.map(|r| r.unwrap()).collect();
+                got
+            }
+        };
+        assert_eq!(sessions(a.id.clone()).await, vec!["telegram:A".to_string()]);
+        assert_eq!(sessions(b.id.clone()).await, vec!["telegram:B".to_string()]);
+
+        // Explicitly stored claims keep the employee-wide dedup.
+        let explicit = hold("telegram:C", 4, "mcp_internal").await;
+        assert_eq!((explicit.id, explicit.newly_held), (a.id, false));
+    }
+
     #[test]
     fn write_conversation_follows_the_lineage() {
         let row = |kind: &str, session: &str, role: crate::lineage::db::Role| crate::lineage::db::OriginRow {

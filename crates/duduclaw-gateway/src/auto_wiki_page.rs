@@ -24,6 +24,18 @@
 //!    reply. `do_not_inject` is deliberately NOT set: it would also hide the
 //!    page from `WikiStore::search`, and P1 = A keeps auto pages searchable.
 //!
+//! ## Conversation scope (v1.84.0)
+//!
+//! Which conversation may see an auto page is decided from host-owned
+//! frontmatter only: `host_sources` (written here from the request's source
+//! id, and by the MCP host stamp) and `host_promoted` (written only by
+//! [`promote_page`]). Every MCP wiki write drops writer-supplied values of
+//! both keys (`wiki_host_sources::stamp_host_sources`), and on a channel turn
+//! MCP tools cannot write under `auto/` at all. `sources`, `author` and
+//! `layer` are content and grant nothing. A page without host provenance
+//! (filed before v1.84.0) is hidden from every conversation and never merged
+//! into.
+//!
 //! ## Deliberate deviation from the shared-wiki fail-safe (§8.4, approved)
 //!
 //! `WikiScopePolicy` treats a malformed `.scope.toml` as "no policy" and lets
@@ -484,6 +496,10 @@ pub fn would_change(store: &WikiStore, req: &AutoPageRequest) -> bool {
     }
 }
 
+/// Sidecar key of the per-wiki auto-page write lock (v1.84.0, review M1):
+/// `with_file_lock` locks `<wiki>/.auto-pages.lock`.
+const AUTO_WRITE_LOCK: &str = ".auto-pages";
+
 /// File (or update) one auto page in `store`.
 ///
 /// Ordering matters and is part of the contract:
@@ -493,6 +509,13 @@ pub fn would_change(store: &WikiStore, req: &AutoPageRequest) -> bool {
 /// 4. idempotency check (identical content → `Unchanged`, no quota spend),
 /// 5. daily circuit breaker,
 /// 6. atomic write through `WikiStore::write_page`.
+///
+/// v1.84.0 (review M1): steps 2-6 — target selection, existing-page
+/// validation, content assembly and publish — run under ONE exclusive
+/// per-wiki file lock (cross-process: gateway, CLI and sidecars share it),
+/// and the target is chosen only after the lock is held. Two conversations
+/// filing the same slug at once therefore cannot both pick the slug's page:
+/// the second sees the first's page and gets its own.
 pub fn write_auto_page(
     store: &WikiStore,
     home_dir: &Path,
@@ -506,13 +529,29 @@ pub fn write_auto_page(
         return Err(AutoPageError::Invalid("empty original text".into()));
     }
 
+    let lock_key = store.wiki_dir().join(AUTO_WRITE_LOCK);
+    with_file_lock(&lock_key, || {
+        Ok(write_auto_page_locked(store, home_dir, agent_id, req, &slug))
+    })
+    .map_err(|e| AutoPageError::Write(format!("auto page lock unavailable: {e}")))?
+}
+
+/// Steps 2-6 of [`write_auto_page`]; the caller holds the per-wiki lock.
+fn write_auto_page_locked(
+    store: &WikiStore,
+    home_dir: &Path,
+    agent_id: &str,
+    req: &AutoPageRequest,
+    slug: &str,
+) -> Result<AutoPageOutcome, AutoPageError> {
     // ── 2. Scope policy ───────────────────────────────────────────────────
     check_auto_scope(store.wiki_dir()).map_err(AutoPageError::ScopeDenied)?;
 
     // v1.84.0: never merge into another conversation's page — a write from a
     // conversation other than the one(s) on the slug's page goes to that
-    // conversation's own page (`<slug>-<session digest>`).
-    let path = target_path(store, req, &slug)?;
+    // conversation's own page (`<slug>-<session digest>`). Chosen under the
+    // lock, from the pages as they are now.
+    let path = target_path(store, req, slug)?;
 
     // ── 3. Rendered-text injection scan (defence 1 of §8.3) ───────────────
     let content_part = render_content_part(req);
@@ -522,7 +561,8 @@ pub fn write_auto_page(
     }
 
     // ── 4. Idempotency + existing state ───────────────────────────────────
-    let existing = store.read_page(&path).ok();
+    let existing_raw = existing_raw_page(store, &path).ok().flatten();
+    let existing = existing_raw.as_ref().and_then(|_| store.read_page(&path).ok());
     let now = Utc::now();
 
     let (mut revisions, created, mut sources) = match &existing {
@@ -550,6 +590,23 @@ pub fn write_auto_page(
     let revision_count = revisions.len();
 
     let source_id = sanitize_inline(&req.source_id);
+    // v1.84.0 (review H1): the host-owned provenance that decides which
+    // conversation may see the page (`page_visible_in_conversation`). Only
+    // this writer and the promotion path set it; an MCP write cannot (its
+    // stamp drops a supplied value). `target_path` only lands here when the
+    // page's existing host entries are all of this conversation.
+    let mut host_entries: Vec<String> = existing_raw
+        .as_deref()
+        .map(crate::wiki_host_sources::page_host_sources)
+        .unwrap_or_default();
+    if !source_id.is_empty() {
+        host_entries.retain(|s| s != &source_id);
+        host_entries.push(source_id.clone());
+    }
+    if host_entries.len() > crate::wiki_host_sources::HOST_SOURCES_MAX {
+        let drop = host_entries.len() - crate::wiki_host_sources::HOST_SOURCES_MAX;
+        host_entries.drain(0..drop);
+    }
     if !source_id.is_empty() && !sources.iter().any(|s| s == &source_id) {
         sources.push(source_id);
     }
@@ -599,6 +656,8 @@ pub fn write_auto_page(
     }
     let serialized = duduclaw_security::credential_detect::mask_document(&serialized)
         .map_err(|_| AutoPageError::Write("credential detection unavailable".into()))?;
+    // Unreviewed content: never carries the promotion mark.
+    let serialized = crate::wiki_host_sources::set_host_fields(&serialized, &host_entries, false);
     store
         .write_page(&path, &serialized)
         .map_err(|e| AutoPageError::Write(e.to_string()))?;
@@ -630,11 +689,8 @@ pub struct AutoPageRow {
     pub trust: f32,
 }
 
-/// List every page under `auto/` authored by the auto-distiller.
-///
-/// Filters on BOTH `author == "auto-distill"` and the `auto/` prefix, so a
-/// human page that happens to sit under `auto/` (or an auto-authored page a
-/// human moved elsewhere) never appears with rollback actions attached.
+/// List auto-distilled pages and unstamped legacy pages under `auto/`.
+/// Legacy pages already promoted before host stamps must remain actionable.
 pub fn list_auto_pages(store: &WikiStore) -> Result<Vec<AutoPageRow>, String> {
     let metas = store.list_pages().map_err(|e| e.to_string())?;
     let mut rows = Vec::new();
@@ -642,16 +698,19 @@ pub fn list_auto_pages(store: &WikiStore) -> Result<Vec<AutoPageRow>, String> {
         if !is_auto_path(&meta.path) {
             continue;
         }
-        if meta.author.as_deref() != Some(AUTO_PAGE_AUTHOR) {
+        let (page, raw) = match store.read_page_with_raw(&meta.path) {
+            Ok(page) => page,
+            Err(_) => continue,
+        };
+        if crate::wiki_host_sources::page_host_promoted(&raw)
+            || (meta.author.as_deref() != Some(AUTO_PAGE_AUTHOR)
+                && crate::wiki_host_sources::page_has_host_stamp(&raw))
+        {
             continue;
         }
-        let (sources, revision_count) = match store.read_page(&meta.path) {
-            Ok(page) => {
-                let (_, revs) = split_body(&page.body);
-                (page.sources, revs.len().max(1))
-            }
-            Err(_) => (Vec::new(), 1),
-        };
+        let (_, revs) = split_body(&page.body);
+        let revision_count = revs.len().max(1);
+        let sources = page.sources;
         let doc_type = doc_type_of_path(&meta.path);
         rows.push(AutoPageRow {
             path: meta.path,
@@ -665,6 +724,28 @@ pub fn list_auto_pages(store: &WikiStore) -> Result<Vec<AutoPageRow>, String> {
         });
     }
     Ok(rows)
+}
+
+/// Unstamped auto pages: (previously promoted, not promoted). This is an
+/// operator hint only; these metadata fields never grant conversation access.
+pub fn legacy_auto_page_counts(store: &WikiStore) -> Result<(usize, usize), String> {
+    let mut promoted = 0;
+    let mut unpromoted = 0;
+    for meta in store.list_pages().map_err(|e| e.to_string())? {
+        if !is_auto_path(&meta.path) {
+            continue;
+        }
+        let raw = store.read_raw(&meta.path).map_err(|e| e.to_string())?;
+        if crate::wiki_host_sources::page_has_host_stamp(&raw) {
+            continue;
+        }
+        if meta.layer != WikiLayer::Context || meta.author.as_deref() != Some(AUTO_PAGE_AUTHOR) {
+            promoted += 1;
+        } else {
+            unpromoted += 1;
+        }
+    }
+    Ok((promoted, unpromoted))
 }
 
 // ---------------------------------------------------------------------------
@@ -728,38 +809,61 @@ pub fn source_belongs_to(entry: &str, session: &str) -> bool {
     }
 }
 
-/// Whether the page at `path` is an auto-written page whose visibility
-/// follows the conversation it came from: anything under `auto/` except a
-/// page a human promoted ([`promote_page`]: author no longer the
-/// auto-distiller AND moved out of the `context` layer). Fail closed: a page
-/// under `auto/` that cannot be parsed is scoped.
-pub fn is_conversation_scoped_page(path: &str, page: Option<&WikiPage>) -> bool {
-    if !is_auto_path(path) {
-        return false;
-    }
-    match page {
-        Some(p) => {
-            let promoted = p.author.as_deref() != Some(AUTO_PAGE_AUTHOR) && p.layer != WikiLayer::Context;
-            !promoted
-        }
-        None => true,
-    }
+/// Whether the page at `path` (raw file content `raw`) is an auto-written
+/// page whose visibility follows the conversation it came from: anything
+/// under `auto/` except a page a human promoted ([`promote_page`]).
+///
+/// v1.84.0 (review H1): decided only from data an MCP writer cannot forge —
+/// the path and the host-owned promotion mark
+/// (`wiki_host_sources::HOST_PROMOTED_KEY`). `author`, `layer` and `sources`
+/// are page content any writer controls and play no part. Fail closed: a
+/// page under `auto/` that cannot be read (`raw = None`) is scoped.
+pub fn is_conversation_scoped_page(path: &str, raw: Option<&str>) -> bool {
+    is_auto_path(path) && !raw.is_some_and(crate::wiki_host_sources::page_host_promoted)
 }
 
 /// v1.84.0: may a reader serving conversation `session` see the page at
-/// `path`? Pages outside `auto/` and promoted pages: always. An auto page:
-/// only when it has at least one source and EVERY source belongs to
-/// `session` (another conversation's source, an unattributable digest, or no
-/// sources at all hide it). `session = None` (unknown conversation) sees no
-/// auto page. `page = None` (unparsable) under `auto/` is hidden.
-pub fn page_visible_in_conversation(path: &str, page: Option<&WikiPage>, session: Option<&str>) -> bool {
-    if !is_conversation_scoped_page(path, page) {
+/// `path`, whose raw file content is `raw`? Pages outside `auto/` and
+/// promoted pages: always. An auto page: only when it has at least one
+/// host-recorded source (`host_sources`, set by [`write_auto_page`] or the
+/// MCP host stamp — never by the page's writer) and EVERY such source
+/// belongs to `session`. Another conversation's source, an unattributable
+/// digest, or no host sources at all (a page written before v1.84.0, or one
+/// whose host provenance was removed) hide it — from every conversation.
+/// The page's own `sources` list is content, not provenance, and is ignored.
+/// `session = None` (unknown conversation) sees no auto page; `raw = None`
+/// (unreadable) under `auto/` is hidden.
+pub fn page_visible_in_conversation(path: &str, raw: Option<&str>, session: Option<&str>) -> bool {
+    if !is_conversation_scoped_page(path, raw) {
         return true;
     }
-    let (Some(page), Some(session)) = (page, session.map(str::trim).filter(|s| !s.is_empty())) else {
+    let (Some(raw), Some(session)) = (raw, session.map(str::trim).filter(|s| !s.is_empty())) else {
         return false;
     };
-    !page.sources.is_empty() && page.sources.iter().all(|s| source_belongs_to(s, session))
+    let host = crate::wiki_host_sources::page_host_sources(raw);
+    !host.is_empty() && host.iter().all(|s| source_belongs_to(s, session))
+}
+
+/// Unicode characters some file systems ignore in a name (HFS+ drops them
+/// when comparing names), so `au\u{200d}to/x.md` can open `auto/x.md`.
+fn is_ignorable_in_names(c: char) -> bool {
+    matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}')
+}
+
+/// v1.84.0 (review H2): whether one path segment names the auto namespace
+/// the way a file system may open it — Unicode case-folded (case-insensitive
+/// file systems open `AUTO/` too), without characters a file system may
+/// ignore, and without the trailing dots / spaces Win32 normalisation strips
+/// (`auto./` and `auto /` open `auto/` on Windows). Errs towards "yes":
+/// callers use it to hide pages and refuse writes.
+pub fn is_auto_namespace_segment(segment: &str) -> bool {
+    let folded: String = segment
+        .chars()
+        .filter(|c| !is_ignorable_in_names(*c))
+        .collect::<String>()
+        .trim_end_matches(['.', ' '])
+        .to_lowercase();
+    folded == AUTO_NAMESPACE
 }
 
 /// Whether every source of an existing page records the same conversation
@@ -790,31 +894,47 @@ fn conversation_slug(slug: &str, conversation_digest: &str) -> Option<String> {
     crate::knowledge_route::validate_slug(&format!("{base}-{suffix}"))
 }
 
+/// The raw file at `path` of `store`: `Ok(None)` when there is no such file,
+/// `Err` when one is there but cannot be read (fail closed for the callers:
+/// a page that cannot be attributed is somebody else's).
+fn existing_raw_page(store: &WikiStore, path: &str) -> Result<Option<String>, ()> {
+    match duduclaw_memory::wiki_path::read_wiki_file_nofollow(store.wiki_dir(), path) {
+        Ok(raw) => Ok(Some(raw)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(()),
+    }
+}
+
+/// Whether the existing page `raw` was filed by `entry`'s conversation, judged
+/// from its host-recorded sources only (review H1: `sources` is content).
+fn raw_is_of_entry_conversation(raw: &str, entry: &str) -> bool {
+    page_is_of_entry_conversation(&crate::wiki_host_sources::page_host_sources(raw), entry)
+}
+
 /// The page a write of `req` lands on (v1.84.0): its slug's page when that
-/// page does not exist yet or all of its sources are of the writing
-/// conversation; otherwise the writing conversation's own page
+/// page does not exist yet or all of its host-recorded sources are of the
+/// writing conversation; otherwise the writing conversation's own page
 /// ([`conversation_slug`]) — never a merge into another conversation's page.
 /// A writer whose conversation cannot be attributed, or a per-conversation
-/// page that is not that conversation's, is refused.
+/// page that is not that conversation's, is refused. A page without host
+/// provenance (written before v1.84.0) is nobody's: it is never merged into.
 fn target_path(store: &WikiStore, req: &AutoPageRequest, slug: &str) -> Result<String, AutoPageError> {
     let base = auto_page_path(req.doc_type, slug);
     let entry = sanitize_inline(&req.source_id);
-    let base_page = store.read_page(&base).ok();
-    let Some(existing) = base_page else {
-        return Ok(base);
-    };
-    if page_is_of_entry_conversation(&existing.sources, &entry) {
-        return Ok(base);
+    match existing_raw_page(store, &base) {
+        Ok(None) => return Ok(base),
+        Ok(Some(raw)) if raw_is_of_entry_conversation(&raw, &entry) => return Ok(base),
+        Ok(Some(_)) | Err(()) => {}
     }
     let not_mergeable =
         || AutoPageError::Invalid("the page for this slug belongs to another conversation".into());
     let digest = entry_conversation_digest(&entry).ok_or_else(not_mergeable)?;
     let own_slug = conversation_slug(slug, &digest).ok_or_else(not_mergeable)?;
     let own = auto_page_path(req.doc_type, &own_slug);
-    match store.read_page(&own) {
-        Err(_) => Ok(own),
-        Ok(page) if page_is_of_entry_conversation(&page.sources, &entry) => Ok(own),
-        Ok(_) => Err(not_mergeable()),
+    match existing_raw_page(store, &own) {
+        Ok(None) => Ok(own),
+        Ok(Some(raw)) if raw_is_of_entry_conversation(&raw, &entry) => Ok(own),
+        Ok(Some(_)) | Err(()) => Err(not_mergeable()),
     }
 }
 
@@ -839,14 +959,31 @@ pub fn doc_type_of_path(path: &str) -> DocType {
 /// (starts participating in injection), `auto-distilled` → `curated`, author
 /// → `operator`. One-way: nothing in the automatic path can undo it, and the
 /// page stops matching [`list_auto_pages`] afterwards.
+///
+/// v1.84.0 (review H1): the page stays under `auto/`, so promotion is
+/// recorded with the host-owned mark `host_promoted: true`
+/// (`wiki_host_sources::set_host_fields`), which no MCP writer can set; the
+/// page's host-recorded sources are kept. That mark — not `author` / `layer`
+/// — is what makes the page visible to every conversation. Unstamped legacy
+/// pages may also be re-confirmed: only host fields change, with a fixed
+/// non-conversation legacy source marker.
 pub fn promote_page(store: &WikiStore, path: &str) -> Result<(), String> {
+    duduclaw_memory::wiki_path::validate_relative_wiki_path(path)?;
     if !is_auto_path(path) {
         return Err("only auto-filed pages can be promoted".into());
     }
-    let mut page = store.read_page(path).map_err(|e| e.to_string())?;
+    let (mut page, raw) = store.read_page_with_raw(path).map_err(|e| e.to_string())?;
+    if !crate::wiki_host_sources::page_has_host_stamp(&raw) {
+        // A human is re-confirming unverifiable pre-upgrade knowledge. Keep
+        // all existing content/metadata; only the host records that decision.
+        let entries = vec![crate::wiki_host_sources::LEGACY_PROMOTION_SOURCE.to_string()];
+        let content = crate::wiki_host_sources::set_host_fields(&raw, &entries, true);
+        return store.write_page(path, &content).map_err(|e| e.to_string());
+    }
     if page.author.as_deref() != Some(AUTO_PAGE_AUTHOR) {
         return Err("page is not auto-filed".into());
     }
+    let host_entries = crate::wiki_host_sources::page_host_sources(&raw);
     page.trust = 0.8;
     page.source_type = SourceType::UserStatement;
     page.layer = WikiLayer::Core;
@@ -857,8 +994,9 @@ pub fn promote_page(store: &WikiStore, path: &str) -> Result<(), String> {
     page.author = Some("operator".to_string());
     page.updated = Utc::now();
     page.last_verified = Some(Utc::now());
+    let content = crate::wiki_host_sources::set_host_fields(&serialize_page(&page), &host_entries, true);
     store
-        .write_page(path, &serialize_page(&page))
+        .write_page(path, &content)
         .map_err(|e| e.to_string())
 }
 
@@ -1217,13 +1355,13 @@ mod tests {
     // ── Curation-station operations ──────────────────────────────────────
 
     #[test]
-    fn list_auto_pages_filters_by_author_and_namespace() {
+    fn list_auto_pages_includes_unstamped_legacy_and_filters_stamped_pages() {
         let tmp = TempDir::new().unwrap();
         let store = store_in(&tmp);
         write_auto_page(&store, tmp.path(), "agnes", &req("公司章程", "第一條 …")).unwrap();
 
-        // A human page elsewhere, and a human page inside auto/ — neither may
-        // appear in the audit list.
+        // A human page outside auto/ stays out. An unstamped page inside
+        // auto/ is indistinguishable from a previously promoted legacy page.
         store
             .write_page(
                 "entities/wang.md",
@@ -1237,13 +1375,21 @@ mod tests {
             )
             .unwrap();
 
+        let stamped = crate::wiki_host_sources::set_host_fields(
+            "---\ntitle: Stamped\nauthor: operator\nlayer: core\n---\n\nbody",
+            &["conversation:telegram:A:m:1".into()],
+            false,
+        );
+        store.write_page("auto/charter/stamped.md", &stamped).unwrap();
+        assert!(promote_page(&store, "auto/charter/stamped.md").is_err());
         let rows = list_auto_pages(&store).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].path, "auto/charter/company-charter.md");
-        assert_eq!(rows[0].doc_type, "charter");
-        assert_eq!(rows[0].doc_type_label, "章程");
-        assert_eq!(rows[0].revision_count, 1);
-        assert_eq!(rows[0].sources.len(), 1);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|p| p.path == "auto/charter/handmade.md"));
+        let row = rows.iter().find(|p| p.path == "auto/charter/company-charter.md").unwrap();
+        assert_eq!(row.doc_type, "charter");
+        assert_eq!(row.doc_type_label, "章程");
+        assert_eq!(row.revision_count, 1);
+        assert_eq!(row.sources.len(), 1);
     }
 
     #[test]
@@ -1411,58 +1557,153 @@ mod tests {
         ));
     }
 
-    /// Visibility of auto pages to one conversation: all sources of this
-    /// session (plain or session-digest form) → visible; any other source,
-    /// the whole-entry digest form, or no sources → hidden; outside `auto/`
-    /// and promoted pages → always visible; unknown session → no auto page.
+    /// Raw page content with the given `sources` (content) and host-owned
+    /// fields, the way the writers lay a page out.
+    fn raw_page(sources: &[&str], host: &[&str], promoted: bool, author: &str, layer: &str) -> String {
+        let sources: Vec<String> = sources.iter().map(|s| s.to_string()).collect();
+        let host: Vec<String> = host.iter().map(|s| s.to_string()).collect();
+        let fm = format!(
+            "---\ntitle: \"t\"\nauthor: \"{author}\"\nlayer: {layer}\nsources: {}\n---\n\nbody\n",
+            serde_json::to_string(&sources).unwrap()
+        );
+        crate::wiki_host_sources::set_host_fields(&fm, &host, promoted)
+    }
+
+    /// Visibility of auto pages to one conversation, from the HOST-recorded
+    /// sources: all of this session (plain or session-digest form) →
+    /// visible; any other, the whole-entry digest form, or none → hidden;
+    /// outside `auto/` and pages with the host promotion mark → always
+    /// visible; unknown session → no auto page.
     #[test]
     fn auto_page_visibility_follows_its_sources() {
-        let page = |path: &str, sources: Vec<String>| WikiPage {
-            path: path.into(),
-            title: "t".into(),
-            created: Utc::now(),
-            updated: Utc::now(),
-            tags: vec![],
-            related: vec![],
-            sources,
-            author: Some(AUTO_PAGE_AUTHOR.into()),
-            layer: WikiLayer::Context,
-            trust: AUTO_PAGE_TRUST,
-            source_type: SourceType::RawDialogue,
-            last_verified: None,
-            citation_count: 0,
-            error_signal_count: 0,
-            success_signal_count: 0,
-            do_not_inject: false,
-            body: String::new(),
-        };
+        let auto = |host: &[&str]| raw_page(host, host, false, AUTO_PAGE_AUTHOR, "context");
         let long_session = format!("telegram:{}", "9".repeat(140));
         let long_entry = crate::memory_provenance::wiki_source_entry(&long_session, "m:3");
         assert!(long_entry.starts_with(crate::memory_provenance::WIKI_SOURCE_DIGEST_PREFIX), "{long_entry}");
         let p = "auto/sop/x.md";
-        let own = page(p, vec!["conversation:telegram:A:m:1".into(), "conversation:telegram:A:turn:t9".into()]);
+        let own = auto(&["conversation:telegram:A:m:1", "conversation:telegram:A:turn:t9"]);
         assert!(page_visible_in_conversation(p, Some(&own), Some("telegram:A")));
         assert!(!page_visible_in_conversation(p, Some(&own), Some("telegram:B")));
         assert!(!page_visible_in_conversation(p, Some(&own), None));
-        let mixed = page(p, vec!["conversation:telegram:A:m:1".into(), "conversation:telegram:B:m:2".into()]);
+        let mixed = auto(&["conversation:telegram:A:m:1", "conversation:telegram:B:m:2"]);
         assert!(!page_visible_in_conversation(p, Some(&mixed), Some("telegram:A")));
-        let digest = page(p, vec![long_entry.clone()]);
+        let digest = auto(&[long_entry.as_str()]);
         assert!(page_visible_in_conversation(p, Some(&digest), Some(&long_session)), "session digest decided");
         assert!(!page_visible_in_conversation(p, Some(&digest), Some("telegram:A")));
-        let whole = page(p, vec!["conversation-digest:0123456789abcdef0123456789abcdef".into()]);
+        let whole = auto(&["conversation-digest:0123456789abcdef0123456789abcdef"]);
         assert!(!page_visible_in_conversation(p, Some(&whole), Some("telegram:A")), "unattributable");
-        assert!(!page_visible_in_conversation(p, Some(&page(p, vec![])), Some("telegram:A")), "no sources");
-        assert!(!page_visible_in_conversation(p, None, Some("telegram:A")), "unparsable");
-        let legacy = page(p, vec!["conversation:telegram:12345".into()]);
+        assert!(!page_visible_in_conversation(p, Some(&auto(&[])), Some("telegram:A")), "no sources");
+        assert!(!page_visible_in_conversation(p, None, Some("telegram:A")), "unreadable");
+        let legacy = auto(&["conversation:telegram:12345"]);
         assert!(!page_visible_in_conversation(p, Some(&legacy), Some("telegram:12345")));
-        // Outside auto/ and promoted pages are not scoped.
+        // Outside auto/ and host-promoted pages are not scoped.
         assert!(page_visible_in_conversation("entities/x.md", Some(&mixed), Some("telegram:A")));
-        let mut promoted = mixed.clone();
-        promoted.author = Some("operator".into());
-        promoted.layer = WikiLayer::Core;
-        assert!(page_visible_in_conversation(p, Some(&promoted), Some("telegram:A")));
+        let promoted = raw_page(&[], &["conversation:telegram:A:m:1"], true, "operator", "core");
+        assert!(page_visible_in_conversation(p, Some(&promoted), Some("telegram:B")));
         assert!(page_visible_in_conversation(p, Some(&promoted), None));
         // `automation/` is not `auto/`.
         assert!(page_visible_in_conversation("automation/x.md", Some(&mixed), None));
+    }
+
+    /// Review H1: content fields any writer controls decide nothing. A page
+    /// whose `sources` name B's session but whose host provenance is A's (or
+    /// missing) is not visible to B; `author != auto-distill` plus `layer:
+    /// core` without the host mark is not promoted; a page filed before
+    /// v1.84.0 (sources only, no host provenance) is hidden from every
+    /// conversation.
+    #[test]
+    fn forged_content_fields_grant_no_visibility() {
+        let p = "auto/sop/x.md";
+        let b = "conversation:telegram:B:m:2";
+        let forged_sources = raw_page(&[b], &["conversation:telegram:A:m:1"], false, AUTO_PAGE_AUTHOR, "context");
+        assert!(!page_visible_in_conversation(p, Some(&forged_sources), Some("telegram:B")));
+        let no_host = raw_page(&[b], &[], false, AUTO_PAGE_AUTHOR, "context");
+        assert!(!page_visible_in_conversation(p, Some(&no_host), Some("telegram:B")), "v1.83.0 page");
+        let forged_promotion = raw_page(&[b], &[], false, "operator", "core");
+        assert!(is_conversation_scoped_page(p, Some(&forged_promotion)));
+        for session in [Some("telegram:A"), Some("telegram:B"), None] {
+            assert!(!page_visible_in_conversation(p, Some(&forged_promotion), session), "{session:?}");
+        }
+        // A host mark written into the content by hand is stripped by the
+        // MCP stamp every MCP write passes through.
+        let typed = "---\ntitle: x\nhost_promoted: true\nhost_sources: [\"conversation:telegram:B:m:2\"]\n---\n\nb\n";
+        let stamped = crate::wiki_host_sources::stamp_host_sources(typed, None, &[]);
+        assert!(!page_visible_in_conversation(p, Some(&stamped), Some("telegram:B")), "{stamped}");
+    }
+
+    /// Review H1: promotion is recognised by the host mark `promote_page`
+    /// sets — the promoted page is visible in every conversation and keeps
+    /// its host provenance — and a later auto write never carries the mark.
+    #[test]
+    fn promoted_page_is_visible_everywhere() {
+        let tmp = TempDir::new().unwrap();
+        let store = store_in(&tmp);
+        let out = write_auto_page(&store, tmp.path(), "agnes", &req("公司章程", "第一條 …")).unwrap();
+        let raw = std::fs::read_to_string(store.wiki_dir().join(out.path())).unwrap();
+        assert_eq!(
+            crate::wiki_host_sources::page_host_sources(&raw),
+            vec!["conversation:telegram:12345:m:1".to_string()]
+        );
+        assert!(page_visible_in_conversation(out.path(), Some(&raw), Some("telegram:12345")));
+        assert!(!page_visible_in_conversation(out.path(), Some(&raw), Some("telegram:B")));
+
+        promote_page(&store, out.path()).unwrap();
+        let raw = std::fs::read_to_string(store.wiki_dir().join(out.path())).unwrap();
+        assert!(crate::wiki_host_sources::page_host_promoted(&raw), "{raw}");
+        assert_eq!(
+            crate::wiki_host_sources::page_host_sources(&raw),
+            vec!["conversation:telegram:12345:m:1".to_string()]
+        );
+        for session in [Some("telegram:12345"), Some("telegram:B"), None] {
+            assert!(page_visible_in_conversation(out.path(), Some(&raw), session), "{session:?}");
+        }
+    }
+
+    /// Review M1: two conversations filing the same slug at the same time
+    /// end with two pages, each holding only its own conversation's content
+    /// and host provenance (target selection runs under the per-wiki lock).
+    #[test]
+    fn concurrent_writers_of_one_slug_get_their_own_pages() {
+        let tmp = TempDir::new().unwrap();
+        let store = store_in(&tmp);
+        let home = tmp.path().to_path_buf();
+        let wiki = store.wiki_dir().to_path_buf();
+        for round in 0..8 {
+            let slug = format!("race-{round}");
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let writers: Vec<_> = [("telegram:A", "A 版內容"), ("telegram:B", "B 版內容")]
+                .into_iter()
+                .map(|(session, text)| {
+                    let (barrier, home, wiki, slug) = (barrier.clone(), home.clone(), wiki.clone(), slug.clone());
+                    std::thread::spawn(move || {
+                        let mut r = req("公司章程", &format!("第一條 {text}"));
+                        r.slug = slug;
+                        r.source_id = format!("conversation:{session}:m:{round}");
+                        barrier.wait();
+                        write_auto_page(&WikiStore::new(wiki), &home, "agnes", &r).unwrap().path().to_string()
+                    })
+                })
+                .collect();
+            let paths: Vec<String> = writers.into_iter().map(|w| w.join().unwrap()).collect();
+            assert_ne!(paths[0], paths[1], "round {round}: one page overwrote the other");
+            for (path, (session, own, other)) in
+                paths.iter().zip([("telegram:A", "A 版", "B 版"), ("telegram:B", "B 版", "A 版")])
+            {
+                let raw = std::fs::read_to_string(wiki.join(path)).unwrap();
+                assert!(raw.contains(own) && !raw.contains(other), "round {round} {path}: {raw}");
+                assert!(page_visible_in_conversation(path, Some(&raw), Some(session)), "round {round} {path}");
+            }
+        }
+    }
+
+    /// Review H2: the namespace segment as a file system may open it.
+    #[test]
+    fn auto_namespace_segment_is_judged_as_opened() {
+        for seg in ["auto", "AUTO", "Auto", "auto.", "auto ", "auto. .", "au\u{200d}to", "\u{feff}auto"] {
+            assert!(is_auto_namespace_segment(seg), "{seg:?}");
+        }
+        for seg in ["automation", "autos", "auto.md", "_auto", "ａｕｔｏ", ""] {
+            assert!(!is_auto_namespace_segment(seg), "{seg:?}");
+        }
     }
 }

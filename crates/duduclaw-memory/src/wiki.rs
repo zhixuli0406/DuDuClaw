@@ -326,6 +326,12 @@ const MAX_RECURSION_DEPTH: usize = 20;
 /// clamps its `depth` argument to the same value.
 pub const MAX_GRAPH_DEPTH: usize = 10;
 
+/// Hard cap on the matching pages a visibility-filtered search
+/// (`WikiStore::search_filtered_visible`) judges before it stops; reaching
+/// it is logged. Bounds the work of one scoped `wiki_search` on a very large
+/// wiki, far above any wiki a conversation's results could be crowded in.
+pub const MAX_VISIBLE_SEARCH_SCAN: usize = 50_000;
+
 // ---------------------------------------------------------------------------
 // WikiStore
 // ---------------------------------------------------------------------------
@@ -432,7 +438,7 @@ impl WikiStore {
     /// Read one exact file version for consumers that must bind parsed page
     /// content to its raw on-disk digest.
     pub fn read_page_with_raw(&self, path: &str) -> Result<(WikiPage, String)> {
-        self.validate_page_path(path)?;
+        self.validate_read_page_path(path)?;
         // No-follow read: a page swapped for a symlink after the check is
         // refused instead of followed (check/read TOCTOU).
         let content = crate::wiki_path::read_wiki_file_nofollow(&self.wiki_dir, path)
@@ -445,7 +451,7 @@ impl WikiStore {
     /// timestamps use the same file handle's mtime, never a moving `now()`.
     pub fn read_export_page(&self, path: &str, max_bytes: u64) -> Result<(WikiPage, String)> {
         use std::io::Read;
-        self.validate_page_path(path)?;
+        self.validate_read_page_path(path)?;
         let _lease = self.delivery_fence().try_shared()?;
         let full = self.wiki_dir.join(path);
         let metadata = std::fs::symlink_metadata(&full)
@@ -492,7 +498,7 @@ impl WikiStore {
     /// the wiki directory, and be a regular file opened without following a
     /// symlink.
     pub fn read_raw(&self, path: &str) -> Result<String> {
-        crate::wiki_path::validate_relative_wiki_path(path)
+        crate::wiki_path::validate_relative_wiki_read_path(path)
             .map_err(|e| DuDuClawError::Memory(format!("invalid page path: {e}")))?;
         if !path.ends_with(".md") {
             return Err(DuDuClawError::Memory("page path must end with .md".into()));
@@ -755,11 +761,11 @@ impl WikiStore {
         self.validate_page_path(path)?;
         let _fence = self.delivery_fence().exclusive_for_write()?;
         crate::isolation_io::verify()?;
-        let mut page = self.read_page(path)?;
+        let (mut page, raw) = self.read_page_with_raw(path)?;
         page.trust = new_trust;
         page.do_not_inject = new_do_not_inject;
         page.updated = Utc::now();
-        let content = serialize_page(&page);
+        let content = carry_host_owned_lines(&raw, &serialize_page(&page));
         self.write_page_under_fence(path, &content)
     }
 
@@ -832,6 +838,20 @@ impl WikiStore {
     /// otherwise falls back to the frontmatter snapshot.
     /// Pages whose live state has `do_not_inject = true` are silently dropped.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
+        self.search_matching(query, limit, None)
+    }
+
+    /// [`search`](Self::search); with `visible`, a matching page is a hit only
+    /// when `visible(rel_path, raw_content)` holds — judged BEFORE the ranking
+    /// cut-off, so pages the caller may not return never take a slot of
+    /// `limit`. At most [`MAX_VISIBLE_SEARCH_SCAN`] matching pages are judged;
+    /// reaching the cap is logged and ends the scan.
+    fn search_matching(
+        &self,
+        query: &str,
+        limit: usize,
+        visible: Option<&dyn Fn(&str, &str) -> bool>,
+    ) -> Result<Vec<SearchHit>> {
         let terms: Vec<String> = query.split_whitespace().map(|t| t.to_lowercase()).collect();
         if terms.is_empty() {
             return Ok(Vec::new());
@@ -857,6 +877,7 @@ impl WikiStore {
             }
         };
 
+        let mut judged = 0usize;
         for rel in &md_files {
             let full = self.wiki_dir.join(rel);
             let content = match std::fs::read_to_string(&full) {
@@ -869,9 +890,23 @@ impl WikiStore {
                 continue;
             }
 
+            let rel_str = rel.to_string_lossy().to_string();
+            if let Some(visible) = visible {
+                if judged >= MAX_VISIBLE_SEARCH_SCAN {
+                    warn!(
+                        wiki = %self.wiki_dir.display(),
+                        cap = MAX_VISIBLE_SEARCH_SCAN,
+                        "visibility-filtered wiki search hit its scan cap; later pages not searched"
+                    );
+                    break;
+                }
+                judged += 1;
+                if !visible(&rel_str, &content) {
+                    continue;
+                }
+            }
             let title = extract_title(&content)
                 .unwrap_or_else(|| rel.to_string_lossy().to_string());
-            let rel_str = rel.to_string_lossy().to_string();
             let frontmatter_trust = extract_field(&content, "trust")
                 .and_then(|v| v.parse::<f32>().ok())
                 .unwrap_or(default_trust());
@@ -983,7 +1018,36 @@ impl WikiStore {
         layer_filter: Option<WikiLayer>,
         expand: bool,
     ) -> Result<Vec<SearchHit>> {
-        let mut hits = self.search(query, limit * 2)?; // over-fetch for filtering
+        self.search_filtered_inner(query, limit, min_trust, layer_filter, expand, None)
+    }
+
+    /// [`search_filtered`](Self::search_filtered) returning only pages for
+    /// which `visible(rel_path, raw_content)` holds (v1.84.0). The predicate
+    /// runs inside the scan, before the ranking cut-off, for direct hits and
+    /// expanded neighbours alike, so `limit` counts visible pages only and
+    /// any number of better-ranked invisible pages cannot crowd them out.
+    pub fn search_filtered_visible(
+        &self,
+        query: &str,
+        limit: usize,
+        min_trust: Option<f32>,
+        layer_filter: Option<WikiLayer>,
+        expand: bool,
+        visible: &dyn Fn(&str, &str) -> bool,
+    ) -> Result<Vec<SearchHit>> {
+        self.search_filtered_inner(query, limit, min_trust, layer_filter, expand, Some(visible))
+    }
+
+    fn search_filtered_inner(
+        &self,
+        query: &str,
+        limit: usize,
+        min_trust: Option<f32>,
+        layer_filter: Option<WikiLayer>,
+        expand: bool,
+        visible: Option<&dyn Fn(&str, &str) -> bool>,
+    ) -> Result<Vec<SearchHit>> {
+        let mut hits = self.search_matching(query, limit * 2, visible)?; // over-fetch for filtering
 
         // Apply filters
         if let Some(mt) = min_trust {
@@ -1027,6 +1091,9 @@ impl WikiStore {
                     Some(c) => c,
                     None => continue,
                 };
+                if visible.is_some_and(|v| !v(&exp_path, &content)) {
+                    continue;
+                }
                 let title = extract_title(&content).unwrap_or_else(|| exp_path.clone());
                 let trust = extract_field(&content, "trust")
                     .and_then(|v| v.parse::<f32>().ok())
@@ -1629,17 +1696,30 @@ impl WikiStore {
     /// search hit). Same rules as a caller-supplied path: shared validator,
     /// `.md` only, inside the wiki, no symlink. `None` on any refusal.
     fn read_linked_page(&self, rel: &str) -> Option<String> {
-        if crate::wiki_path::validate_relative_wiki_path(rel).is_err() || !rel.ends_with(".md") {
+        if crate::wiki_path::validate_relative_wiki_read_path(rel).is_err() || !rel.ends_with(".md") {
             return None;
         }
         crate::wiki_path::read_wiki_file_nofollow(&self.wiki_dir, rel).ok()
     }
 
+    pub(crate) fn validate_read_page_path(&self, path: &str) -> Result<()> {
+        self.validate_page_path_mode(path, true)
+    }
+
     pub(crate) fn validate_page_path(&self, path: &str) -> Result<()> {
+        self.validate_page_path_mode(path, false)
+    }
+
+    fn validate_page_path_mode(&self, path: &str, read: bool) -> Result<()> {
         // String-level checks shared with every MCP wiki tool: relative only,
         // no NUL / `..` / encoded separators / drive prefix / Prefix, RootDir
         // or ParentDir component.
-        crate::wiki_path::validate_relative_wiki_path(path)
+        let validate = if read {
+            crate::wiki_path::validate_relative_wiki_read_path
+        } else {
+            crate::wiki_path::validate_relative_wiki_path
+        };
+        validate(path)
             .map_err(|e| DuDuClawError::Memory(format!("invalid page path: {e}")))?;
         if !path.ends_with(".md") {
             return Err(DuDuClawError::Memory("page path must end with .md".into()));
@@ -1930,6 +2010,49 @@ pub fn parse_wiki_page(path: &str, content: &str) -> Result<WikiPage> {
         do_not_inject,
         body,
     })
+}
+
+/// Frontmatter keys the host owns (`duduclaw_gateway::wiki_host_sources`:
+/// `host_sources`, `host_promoted`). `WikiPage` has no field for them, so a
+/// `serialize_page` round-trip drops them.
+const HOST_OWNED_KEYS: [&str; 2] = ["host_sources", "host_promoted"];
+
+/// v1.84.0: `new_content` (a [`serialize_page`] rewrite of the page whose raw
+/// file was `old_raw`) with the host-owned frontmatter lines of `old_raw`
+/// carried over. For host maintenance rewrites (trust sync, the janitor's
+/// correction note), which must not strip the provenance that decides which
+/// conversation may see an auto page. Unchanged when `old_raw` has none.
+pub(crate) fn carry_host_owned_lines(old_raw: &str, new_content: &str) -> String {
+    let is_host = |l: &str| {
+        HOST_OWNED_KEYS
+            .iter()
+            .any(|k| l.strip_prefix(k).is_some_and(|r| r.trim_start().starts_with(':')))
+    };
+    // (start, end) of the frontmatter block: after the opening `---` line,
+    // up to the `\n---` that closes it.
+    let block = |c: &str| -> Option<(usize, usize)> {
+        let start = if c.starts_with("---\n") {
+            4
+        } else if c.starts_with("---\r\n") {
+            5
+        } else {
+            return None;
+        };
+        c[start..].find("\n---").map(|end| (start, start + end))
+    };
+    let Some((old_start, old_end)) = block(old_raw) else {
+        return new_content.to_string();
+    };
+    let carried: Vec<&str> = old_raw[old_start..old_end].lines().filter(|l| is_host(l)).collect();
+    if carried.is_empty() {
+        return new_content.to_string();
+    }
+    let Some((start, end)) = block(new_content) else {
+        return new_content.to_string();
+    };
+    let mut lines: Vec<&str> = new_content[start..end].lines().filter(|l| !is_host(l)).collect();
+    lines.extend(carried);
+    format!("---\n{}{}", lines.join("\n"), &new_content[end..])
 }
 
 /// Re-serialise a `WikiPage` back to markdown — preserves all frontmatter
@@ -2372,7 +2495,9 @@ fn collect_md_files_inner(base: &Path, dir: &Path, depth: usize) -> Vec<PathBuf>
                         .collect::<Vec<_>>()
                         .join("/")
                         .into();
-                    result.push(id);
+                    if crate::wiki_path::validate_relative_wiki_read_path(&id.to_string_lossy()).is_ok() {
+                        result.push(id);
+                    }
                 }
         }
         // Symlinks are silently skipped (neither is_dir nor is_file on DirEntry::file_type)
@@ -2875,6 +3000,51 @@ impl WikiStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(windows))]
+    #[test]
+    fn existing_unix_names_remain_readable_listable_and_searchable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki = tmp.path().join("wiki");
+        let store = WikiStore::new(wiki.clone());
+        store.ensure_scaffold().unwrap();
+        let paths = [
+            "時間:10.md",
+            "2026-11-21 10:30 會議.md",
+            "v1./page.md",
+            "aux.md",
+            "space /page.md",
+            "auto./page.md",
+            "auto /page.md",
+        ];
+        let content = "---\ntitle: Legacy\nlayer: core\ntrust: 0.8\n---\n\ncompatibilityneedle\n";
+        for path in paths {
+            let full = wiki.join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, content).unwrap();
+            assert_eq!(store.read_raw(path).unwrap(), content);
+            assert!(store.read_page(path).unwrap().body.contains("compatibilityneedle"));
+            assert!(store.read_export_page(path, 4096).is_ok());
+            if path.contains(':') {
+                store.write_page(path, content).unwrap();
+            } else {
+                assert!(store.write_page(path, content).is_err(), "write {path}");
+            }
+        }
+        let pages = store.list_pages().unwrap();
+        let hits = store.search("compatibilityneedle", 20).unwrap();
+        for path in paths {
+            assert!(pages.iter().any(|p| p.path == path), "list {path}");
+            assert!(hits.iter().any(|p| p.path == path), "search {path}");
+        }
+        assert_eq!(store.lint().unwrap().total_pages, paths.len());
+        let fts = WikiFts::open(&wiki).unwrap();
+        assert_eq!(fts.rebuild(&wiki).unwrap(), paths.len());
+        let hits = fts.search("compatibilityneedle", 20).unwrap();
+        for path in paths {
+            assert!(hits.iter().any(|p| p.path == path), "fts {path}");
+        }
+    }
 
     #[test]
     #[cfg(unix)]
@@ -3895,6 +4065,30 @@ This is the body of the page.
             "gamma".to_string(),
             "delta\\back".to_string(),
         ]);
+    }
+
+    /// v1.84.0: host maintenance rewrites keep the host-owned provenance
+    /// lines a `serialize_page` round-trip drops (trust sync included).
+    #[test]
+    fn host_owned_lines_survive_maintenance_rewrites() {
+        let raw = "---\ntitle: \"x\"\nlayer: context\ntrust: 0.300\n\
+                   host_sources: [\"conversation:telegram:A:m:1\"]\nhost_promoted: true\n---\n\nbody\n";
+        let page = parse_wiki_page("auto/sop/x.md", raw).unwrap();
+        let rewritten = serialize_page(&page);
+        assert!(!rewritten.contains("host_sources"), "the round-trip drops them: {rewritten}");
+        let carried = carry_host_owned_lines(raw, &rewritten);
+        assert!(carried.contains("\nhost_sources: [\"conversation:telegram:A:m:1\"]\n"), "{carried}");
+        assert!(carried.contains("\nhost_promoted: true\n"), "{carried}");
+        assert_eq!(parse_wiki_page("auto/sop/x.md", &carried).unwrap().body, page.body);
+        assert_eq!(carry_host_owned_lines("---\ntitle: y\n---\nb\n", &rewritten), rewritten);
+
+        let tmp = TempDir::new().unwrap();
+        let store = WikiStore::new(tmp.path().join("wiki"));
+        store.write_page("auto/sop/x.md", raw).unwrap();
+        store.update_frontmatter_trust("auto/sop/x.md", 0.25, false).unwrap();
+        let after = std::fs::read_to_string(tmp.path().join("wiki/auto/sop/x.md")).unwrap();
+        assert!(after.contains("host_sources: [\"conversation:telegram:A:m:1\"]"), "{after}");
+        assert!(after.contains("host_promoted: true"), "{after}");
     }
 
     #[test]

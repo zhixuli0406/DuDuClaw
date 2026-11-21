@@ -218,7 +218,7 @@ impl WikiJanitor {
         page_path: &str,
         recent_negative_count: u32,
     ) -> Result<bool> {
-        let page = wiki.read_page(page_path)?;
+        let (page, raw) = wiki.read_page_with_raw(page_path)?;
 
         // If `corrected` already in tags, only re-tag after cooldown — handled
         // by SQL `last_correction_at` filter; here we just ensure idempotency.
@@ -240,7 +240,11 @@ impl WikiJanitor {
             neg = recent_negative_count,
         );
 
-        let new_content = rewrite_page_with_tags_and_suffix(&page, &new_tags, &suffix);
+        // v1.84.0: keep the host-owned provenance lines `serialize_page` drops.
+        let new_content = crate::wiki::carry_host_owned_lines(
+            &raw,
+            &rewrite_page_with_tags_and_suffix(&page, &new_tags, &suffix),
+        );
         wiki.write_page(page_path, &new_content)?;
 
         // Record audit so we know when this happened (cooldown).

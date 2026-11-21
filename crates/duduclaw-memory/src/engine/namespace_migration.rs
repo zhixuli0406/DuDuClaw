@@ -494,6 +494,7 @@ impl SqliteMemoryEngine {
                     &subj,
                     &pred,
                     row.object.as_deref(),
+                    RowScope::All,
                 )? {
                     let meta = with_migration_marker(&row.metadata, from, to, now, &[]);
                     Self::rekey_locked(conn, from, to, id, &meta)?;

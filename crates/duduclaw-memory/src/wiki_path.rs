@@ -5,11 +5,12 @@
 //! surface that does that join goes through this module so the rules live in
 //! one place:
 //!
-//! - [`validate_relative_wiki_path`] is the string-level gate: the path must
-//!   be relative, with no NUL, no `..`, no percent-encoded separators, no
-//!   Windows drive prefix (`C:\x`, `C:x.md`) and no `Prefix` / `RootDir` /
-//!   `ParentDir` component. It does not look at the disk, so it runs first
-//!   and an invalid path never reaches `stat`/`exists`.
+//! - [`validate_relative_wiki_path`] is the strict gate for writes: relative
+//!   paths only, no control characters, traversal or encoded separators, no
+//!   drive prefixes, trailing dots/spaces or Windows device names. Colons
+//!   are refused on Windows (NTFS alternate data streams).
+//! - [`validate_relative_wiki_read_path`] also accepts existing Unix names
+//!   with trailing dots/spaces or device names. Windows stays strict.
 //! - [`ensure_within_wiki_dir`] canonicalizes the nearest existing ancestor
 //!   of the target (the target itself when it exists) and refuses anything
 //!   that resolves outside the canonical wiki directory. Every failure to
@@ -48,6 +49,16 @@ fn denied(msg: &str) -> io::Error {
 /// Does not check the `.md` suffix or reserved names (callers differ: reads
 /// may open `_index.md`, writes may not). Never touches the filesystem.
 pub fn validate_relative_wiki_path(path: &str) -> std::result::Result<(), String> {
+    validate_relative_wiki_path_mode(path, true)
+}
+
+/// Read-only compatibility for existing names that have no aliases on Unix.
+/// Windows uses the same strict component rules in both modes.
+pub fn validate_relative_wiki_read_path(path: &str) -> std::result::Result<(), String> {
+    validate_relative_wiki_path_mode(path, cfg!(windows))
+}
+
+fn validate_relative_wiki_path_mode(path: &str, strict: bool) -> std::result::Result<(), String> {
     if path.is_empty() {
         return Err("page_path is required".to_string());
     }
@@ -72,19 +83,59 @@ pub fn validate_relative_wiki_path(path: &str) -> std::result::Result<(), String
     if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
         return Err("Drive-prefixed paths are not allowed".to_string());
     }
-    // On Windows a `:` anywhere names an NTFS alternate data stream.
+    // Colons name alternate data streams only on Windows.
     if cfg!(windows) && path.contains(':') {
         return Err("':' is not allowed in page_path".to_string());
     }
+    if path.chars().any(char::is_control) {
+        return Err("Control characters are not allowed in page_path".to_string());
+    }
     for component in Path::new(path).components() {
-        if matches!(
-            component,
-            Component::Prefix(_) | Component::RootDir | Component::ParentDir
-        ) {
-            return Err("Path must stay inside the wiki directory".to_string());
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::ParentDir => {
+                return Err("Path must stay inside the wiki directory".to_string());
+            }
+            Component::CurDir => {}
+            Component::Normal(name) => {
+                let Some(name) = name.to_str() else {
+                    return Err("page_path must be valid UTF-8".to_string());
+                };
+                if strict {
+                    check_component(name)?;
+                }
+            }
         }
     }
     Ok(())
+}
+
+/// Strict write rules keep newly created pages portable; Windows reads
+/// also need them because Win32 aliases these names.
+fn check_component(name: &str) -> std::result::Result<(), String> {
+    if name.ends_with('.') || name.ends_with(' ') {
+        return Err("A path component may not end with '.' or a space".to_string());
+    }
+    if is_windows_device_name(name) {
+        return Err("Windows reserved device names are not allowed in page_path".to_string());
+    }
+    Ok(())
+}
+
+/// Whether `name` (one path component) is a Windows reserved device name:
+/// the part before the first `.` (trailing spaces ignored, as Windows does),
+/// compared without regard to case. Public so writers that build page names
+/// (e.g. the auto-page slug check) refuse the same names this validator does.
+pub fn is_windows_device_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name).trim_end_matches(' ');
+    let upper = stem.to_uppercase();
+    if matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$") {
+        return true;
+    }
+    let mut chars = upper.chars();
+    let head: String = chars.by_ref().take(3).collect();
+    let digit: Vec<char> = chars.collect();
+    (head == "COM" || head == "LPT")
+        && matches!(digit.as_slice(), [d] if d.is_ascii_digit() || matches!(d, '¹' | '²' | '³'))
 }
 
 /// Refuse `full` (a path under `wiki_dir`) when its nearest existing
@@ -151,13 +202,13 @@ fn open_nofollow(full: &Path) -> io::Result<std::fs::File> {
 
 /// Read one wiki file as UTF-8 without following symlinks.
 ///
-/// `rel` must pass [`validate_relative_wiki_path`] (checked here again). The
+/// `rel` must pass [`validate_relative_wiki_read_path`] (checked here again). The
 /// file must be a regular file (not a link, directory or device) both before
 /// and after opening, and must stay inside the wiki directory. A missing
 /// file returns `NotFound` so callers can say "page not found".
 pub fn read_wiki_file_nofollow(wiki_dir: &Path, rel: &str) -> io::Result<String> {
     use std::io::Read;
-    validate_relative_wiki_path(rel).map_err(|e| invalid(&e))?;
+    validate_relative_wiki_read_path(rel).map_err(|e| invalid(&e))?;
     let full = wiki_dir.join(rel);
     let meta = std::fs::symlink_metadata(&full)?;
     if meta.file_type().is_symlink() || !meta.is_file() {
@@ -311,6 +362,80 @@ mod tests {
     fn windows_drive_forms_are_refused_on_every_platform() {
         for bad in ["C:\\x.md", "C:x.md", "c:/x.md", "z:", "D:sub\\x.md"] {
             assert!(validate_relative_wiki_path(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// New writes refuse nonportable alias/device names on every platform.
+    #[test]
+    fn windows_alias_forms_are_refused_for_writes_on_every_platform() {
+        let trailing = [
+            "auto./sop/x.md",
+            "auto /sop/x.md",
+            "auto/sop./x.md",
+            "auto/sop /x.md",
+            "auto/sop/x.md.",
+            "auto/sop/x.md ",
+            "auto. ./x.md",
+            "a.md...",
+        ];
+        let devices = [
+            "con.md",
+            "CON",
+            "entities/Aux.md",
+            "nul.tar.md",
+            "prn .md",
+            "auto/COM1.md",
+            "com9.md",
+            "lpt1/x.md",
+            "LPT9.md",
+            "com\u{b9}.md",
+            "conin$.md",
+            "CONOUT$.md",
+        ];
+        let streams = ["a.md:stream", "auto/x.md::$DATA", "dir:x/a.md", "時間:10.md"];
+        let controls = ["a\u{1}b.md", "auto\t/x.md", "a/b\n.md", "a\u{7f}.md", "a\u{85}.md"];
+        for bad in trailing.iter().chain(&devices).chain(&controls) {
+            assert!(validate_relative_wiki_path(bad).is_err(), "{bad:?}");
+        }
+        for path in streams {
+            assert_eq!(validate_relative_wiki_path(path).is_err(), cfg!(windows), "{path}");
+        }
+        for bad in controls {
+            assert!(validate_relative_wiki_read_path(bad).is_err(), "{bad:?}");
+        }
+        // Names that only resemble the refused forms stay valid.
+        for ok in [
+            "concepts/a.md",
+            "console.md",
+            "auxiliary/x.md",
+            "com10.md",
+            "lpt.md",
+            "comma.md",
+            "nul-hypothesis.md",
+            "a. b.md",
+            ".hidden/x.md",
+            "./auto/x.md",
+            "auto/sop/x-y.md",
+            "實體/王先生.md",
+        ] {
+            assert!(validate_relative_wiki_path(ok).is_ok(), "{ok:?}");
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn read_mode_accepts_existing_nonportable_names() {
+        for path in ["時間:10.md", "v1./page.md", "aux.md", "auto /page.md", "auto./page.md"] {
+            assert!(validate_relative_wiki_read_path(path).is_ok(), "{path}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn both_modes_refuse_windows_aliases_and_streams() {
+        for path in ["時間:10.md", "v1./page.md", "aux.md", "auto /page.md", "auto./page.md"] {
+            assert!(validate_relative_wiki_path(path).is_err(), "{path}");
+            assert!(validate_relative_wiki_read_path(path).is_err(), "{path}");
         }
     }
 

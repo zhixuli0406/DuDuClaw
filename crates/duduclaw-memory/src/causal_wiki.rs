@@ -88,7 +88,7 @@ fn live_shared_page(home: &Path, page_path: &str) -> Option<LiveWikiPage> {
     // tree (a file-existence/size oracle), even though the read itself is
     // refused.
     let store = WikiStore::new_shared(home);
-    store.validate_page_path(page_path).ok()?;
+    store.validate_read_page_path(page_path).ok()?;
     if std::fs::metadata(wiki_dir.join(page_path)).ok()?.len() > MAX_BODY_BYTES as u64 {
         return None;
     }
@@ -194,7 +194,7 @@ fn live_page(
     }
     // Validate BEFORE the size probe — see `live_shared_page`.
     let store = WikiStore::new(wiki_dir.clone());
-    store.validate_page_path(page_path).ok()?;
+    store.validate_read_page_path(page_path).ok()?;
     if std::fs::metadata(wiki_dir.join(page_path)).ok()?.len() > MAX_BODY_BYTES as u64 {
         return None;
     }

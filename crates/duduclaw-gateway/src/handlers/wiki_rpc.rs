@@ -184,6 +184,11 @@ impl MethodHandler {
         if !crate::auto_wiki_page::is_auto_path(page_path) {
             return WsFrame::error_response("", "Only auto-filed pages can be shared here");
         }
+        // Sharing is a mutation: keep portable write rules on its source
+        // even though ordinary page reads accept existing Unix names.
+        if let Err(e) = duduclaw_memory::wiki_path::validate_relative_wiki_path(page_path) {
+            return WsFrame::error_response("", &format!("Invalid page path: {e}"));
+        }
         let store = duduclaw_memory::WikiStore::new(wiki_dir);
         let page = match store.read_page(page_path) {
             Ok(p) => p,

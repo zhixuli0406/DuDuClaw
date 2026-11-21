@@ -20,6 +20,12 @@ use crate::memory_forget_steps::{SelectorView, page_source_matches};
 
 /// Frontmatter key of the host-recorded sources.
 pub const HOST_SOURCES_KEY: &str = "host_sources";
+/// v1.84.0: frontmatter key set (`host_promoted: true`) only by the human
+/// promotion path (`auto_wiki_page::promote_page`). Like [`HOST_SOURCES_KEY`]
+/// it is owned by the host: every MCP wiki write passes through
+/// [`stamp_host_sources`], which drops a value the writer supplied and never
+/// adds one, so a page rewritten over MCP is no longer promoted.
+pub const HOST_PROMOTED_KEY: &str = "host_promoted";
 /// Most entries kept on one page.
 pub const HOST_SOURCES_MAX: usize = 20;
 
@@ -53,9 +59,28 @@ fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
     Some((fm, body))
 }
 
-fn is_host_line(line: &str) -> bool {
-    line.strip_prefix(HOST_SOURCES_KEY)
+fn is_key_line(line: &str, key: &str) -> bool {
+    line.strip_prefix(key)
         .is_some_and(|r| r.trim_start().starts_with(':'))
+}
+
+fn is_host_line(line: &str) -> bool {
+    is_key_line(line, HOST_SOURCES_KEY)
+}
+
+/// A frontmatter line of a key the host owns ([`HOST_SOURCES_KEY`],
+/// [`HOST_PROMOTED_KEY`]).
+fn is_host_owned_line(line: &str) -> bool {
+    is_host_line(line) || is_key_line(line, HOST_PROMOTED_KEY)
+}
+
+/// A legacy promotion marker, deliberately outside every conversation format.
+pub const LEGACY_PROMOTION_SOURCE: &str = "legacy:human-confirmed";
+
+/// Presence, not parsed value: malformed/empty stamps must not make a page
+/// eligible for the legacy promotion exception.
+pub fn page_has_host_stamp(content: &str) -> bool {
+    split_frontmatter(content).is_some_and(|(fm, _)| fm.lines().any(is_host_owned_line))
 }
 
 /// The host-recorded sources of a page (empty when none or unreadable).
@@ -70,9 +95,49 @@ pub fn page_host_sources(content: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// v1.84.0: whether the page carries the host's promotion mark
+/// (`host_promoted: true` in its frontmatter, see [`HOST_PROMOTED_KEY`]).
+pub fn page_host_promoted(content: &str) -> bool {
+    let Some((fm, _)) = split_frontmatter(content) else {
+        return false;
+    };
+    fm.lines()
+        .find(|l| is_key_line(l, HOST_PROMOTED_KEY))
+        .and_then(|l| l.split_once(':'))
+        .is_some_and(|(_, v)| v.trim() == "true")
+}
+
+/// `content` with exactly the given host-owned frontmatter: `host_sources`
+/// set to `entries` (no line when empty) and `host_promoted: true` when
+/// `promoted`. Every host-owned line already in `content` is dropped first,
+/// so the result never carries a value the content's writer supplied.
+pub fn set_host_fields(content: &str, entries: &[String], promoted: bool) -> String {
+    let mut host_lines: Vec<String> = Vec::new();
+    if !entries.is_empty() {
+        host_lines.push(format!(
+            "{HOST_SOURCES_KEY}: {}",
+            serde_json::to_string(entries).unwrap_or_else(|_| "[]".into())
+        ));
+    }
+    if promoted {
+        host_lines.push(format!("{HOST_PROMOTED_KEY}: true"));
+    }
+    match split_frontmatter(content) {
+        Some((fm, body)) => {
+            let mut lines: Vec<&str> = fm.lines().filter(|l| !is_host_owned_line(l)).collect();
+            lines.extend(host_lines.iter().map(String::as_str));
+            format!("---\n{}\n---\n{body}", lines.join("\n"))
+        }
+        None if host_lines.is_empty() => content.to_string(),
+        None => format!("---\n{}\n---\n\n{content}", host_lines.join("\n")),
+    }
+}
+
 /// `new_content` with its `host_sources` set to the page's previous entries
 /// (from `old_content`) plus `entries`. Unchanged when there is nothing to
-/// record.
+/// record. A writer-supplied host-owned key (`host_sources`,
+/// `host_promoted`) is always dropped, and the promotion mark is never
+/// carried over: content rewritten by this path is not what a human promoted.
 pub fn stamp_host_sources(
     new_content: &str,
     old_content: Option<&str>,
@@ -87,31 +152,11 @@ pub fn stamp_host_sources(
         all.drain(..all.len() - HOST_SOURCES_MAX);
     }
     let supplied =
-        split_frontmatter(new_content).is_some_and(|(fm, _)| fm.lines().any(is_host_line));
+        split_frontmatter(new_content).is_some_and(|(fm, _)| fm.lines().any(is_host_owned_line));
     if all.is_empty() && !supplied {
         return new_content.to_string();
     }
-    let line = if all.is_empty() {
-        None
-    } else {
-        Some(format!(
-            "{HOST_SOURCES_KEY}: {}",
-            serde_json::to_string(&all).unwrap_or_else(|_| "[]".into())
-        ))
-    };
-    match split_frontmatter(new_content) {
-        Some((fm, body)) => {
-            let mut lines: Vec<&str> = fm.lines().filter(|l| !is_host_line(l)).collect();
-            if let Some(l) = &line {
-                lines.push(l);
-            }
-            format!("---\n{}\n---\n{body}", lines.join("\n"))
-        }
-        None => match line {
-            Some(l) => format!("---\n{l}\n---\n\n{new_content}"),
-            None => new_content.to_string(),
-        },
-    }
+    set_host_fields(new_content, &all, false)
 }
 
 /// Employee-written pages (any page of the employee's wiki outside `auto/`,

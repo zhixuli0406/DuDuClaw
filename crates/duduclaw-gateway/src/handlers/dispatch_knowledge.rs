@@ -320,6 +320,7 @@ impl MethodHandler {
                 boxed_frame(|| self.handle_wiki_auto_pages(params)).await
             }
             "wiki.promote" => {
+                require_manager!();
                 let _ = check_agent!(AccessLevel::Owner);
                 boxed_frame(|| self.handle_wiki_promote(params)).await
             }
