@@ -217,6 +217,8 @@ async fn owner_cannot_change_authority_keys_through_agents_update() {
         (json!({ "odoo": { "allowed_models": ["res.partner"] } }), "odoo"),
         (json!({ "runtime": { "provider": "openai_compat" } }), "runtime.provider"),
         (json!({ "runtime": { "fallback": "codex" } }), "runtime.fallback"),
+        // RM-205: which outside service receives the conversation for background work.
+        (json!({ "runtime": { "utility_provider": "claude" } }), "runtime.utility_provider"),
         (json!({ "advanced_kv": [{ "section": "prompt", "key": "cli_bare_mode", "value": true, "type": "boolean" }] }), "prompt"),
         (json!({ "prompt": { "cli_bare_mode": true } }), "prompt.cli_bare_mode"),
         (json!({ "os_watch": { "paths": ["/"] } }), "os_watch"),

@@ -100,9 +100,9 @@ pub async fn probe(bin: &str) -> SandboxProbe {
 }
 
 #[cfg(any(target_os = "linux", all(test, unix)))]
-fn probe_args(agent_dir: &std::path::Path) -> Result<Vec<String>, String> {
+fn probe_args(agent_dir: &std::path::Path, private_roots: &[std::path::PathBuf]) -> Result<Vec<String>, String> {
     let mut args = vec!["sandbox".into()];
-    args.extend(super::codex::employee_permission_args(agent_dir, None)?);
+    args.extend(super::codex::employee_permission_args(agent_dir, None, private_roots)?);
     args.extend(["-c".into(), "sandbox_mode=\"workspace-write\"".into(), "--".into(), "/bin/true".into()]);
     Ok(args)
 }
@@ -140,7 +140,9 @@ async fn run_probe(bin: &str) -> SandboxProbe {
         cmd.env("HOME", &home).env("CODEX_HOME", &codex_home)
             .env("XDG_CONFIG_HOME", &home).env("XDG_DATA_HOME", &home)
             .env("XDG_CACHE_HOME", &home).env("XDG_STATE_HOME", &home)
-            .env("TMPDIR", &root).current_dir(&agent).args(probe_args(&agent)?);
+            // The isolated `.codex` stands in for the private roots production
+            // marks read-only (H1), so the probe exercises the same profile shape.
+            .env("TMPDIR", &root).current_dir(&agent).args(probe_args(&agent, std::slice::from_ref(&codex_home))?);
         let out = crate::process_group::output(&mut cmd, None, std::time::Duration::from_secs(20))
             .await.map_err(|e| format!("{e:?}"))?;
         Ok::<_, String>(if out.status.success() {
@@ -246,7 +248,7 @@ exit 1
     #[cfg(unix)]
     #[test]
     fn codex_sandbox_probe_never_downgrades() {
-        let args = probe_args(std::path::Path::new("/tmp/probe/agent")).unwrap();
+        let args = probe_args(std::path::Path::new("/tmp/probe/agent"), &[std::path::PathBuf::from("/tmp/probe/home/.codex")]).unwrap();
         assert_eq!(args.first().map(String::as_str), Some("sandbox"));
         assert!(args.iter().any(|a| a == "default_permissions=\"duduclaw-employee\""));
         assert!(args.iter().any(|a| a == "sandbox_mode=\"workspace-write\""));

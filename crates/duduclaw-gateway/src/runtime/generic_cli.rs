@@ -610,7 +610,10 @@ impl GenericCliRuntime {
                 &[("egress_guard", serde_json::json!("would_refuse_unsupported_runtime"))],
             );
         }
-        let payload = build_prompt(context, prompt, id);
+        // RM-204: a required context that does not fit one argument is a
+        // plain-language refusal, not an opaque `execve` failure.
+        let payload = super::prompt_budget::try_single_argument_payload(context, prompt, id)
+            .map_err(|_| GenericCliError::Spawn { runtime: id, error: super::prompt_budget::prompt_too_large_error(id) })?;
         let args = build_args(self.spec, &payload, &context.model);
 
         // Capability honesty (see the module doc): this runtime has no per-CLI

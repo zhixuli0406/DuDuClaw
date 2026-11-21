@@ -317,6 +317,73 @@ mod tests {
         check_project_layers(&employee, None).unwrap();
     }
 
+    /// A project `.codex/config.toml` that is a symbolic link is inspected
+    /// through the link (what Codex would read), and a dangling one refuses.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_project_config_is_checked_through_the_link() {
+        let (_home, employee) = installed_layout();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(employee.join(".codex")).unwrap();
+        let link = employee.join(".codex/config.toml");
+        let native = elsewhere.path().join("native.toml");
+        std::fs::write(&native, "[mcp_servers.native]\ncommand='unsafe'").unwrap();
+        std::os::unix::fs::symlink(&native, &link).unwrap();
+        let error = check_project_layers(&employee, None).unwrap_err();
+        assert!(error.contains("config.toml"), "{error}");
+        std::fs::write(&native, "model='fixture'").unwrap();
+        check_project_layers(&employee, None).unwrap();
+        std::fs::remove_file(&native).unwrap();
+        assert!(check_project_layers(&employee, None).is_err(), "dangling link is not an absent layer");
+    }
+
+    /// A working directory that is itself a symbolic link is walked from its
+    /// real location: the link's own parents never hide or add a layer.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_working_directory_is_walked_from_its_real_location() {
+        let (home, employee) = installed_layout();
+        std::fs::create_dir(home.path().join(".git")).unwrap();
+        let links = tempfile::tempdir().unwrap();
+        let link = links.path().join("worker-link");
+        std::os::unix::fs::symlink(&employee, &link).unwrap();
+        // The real ancestors reach the git root that holds a native layer.
+        assert!(check_project_layers(&link, None).is_err());
+        // A link placed inside a repository with a native layer, pointing at
+        // a clean directory outside it, is judged by the target.
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".git")).unwrap();
+        native_layer(repo.path());
+        let clean = tempfile::tempdir().unwrap();
+        let inner = repo.path().join("inner-link");
+        std::os::unix::fs::symlink(clean.path(), &inner).unwrap();
+        check_project_layers(&inner, None).unwrap();
+        // The owned-config exemption compares real paths too.
+        let owned = employee.join(".codex/config.toml");
+        std::fs::create_dir_all(employee.join(".codex")).unwrap();
+        std::fs::write(&owned, "[mcp_servers.duduclaw]\ncommand='/owned'").unwrap();
+        std::fs::remove_file(home.path().join(".codex/config.toml")).unwrap();
+        check_project_layers(&link, Some(&link.join(".codex/config.toml"))).unwrap();
+    }
+
+    /// A `.git` FILE (worktree / submodule) marks the git root where it
+    /// stands; its `gitdir:` content is never followed, so it cannot move the
+    /// walk to another directory or past the employee directory.
+    #[test]
+    fn a_git_file_marks_the_root_and_its_content_never_moves_the_walk() {
+        let (home, employee) = installed_layout();
+        let elsewhere = tempfile::tempdir().unwrap();
+        native_layer(elsewhere.path());
+        for target in [elsewhere.path().to_path_buf(), home.path().to_path_buf(), PathBuf::from("/")] {
+            std::fs::write(employee.join(".git"), format!("gitdir: {}\n", target.display())).unwrap();
+            assert_eq!(project_layer_dirs(&std::fs::canonicalize(&employee).unwrap()).unwrap().len(), 1);
+            check_project_layers(&employee, None).unwrap();
+        }
+        // A layer in the employee directory itself is still in range.
+        native_layer(&employee);
+        assert!(check_project_layers(&employee, None).is_err());
+    }
+
     #[cfg(unix)]
     #[test]
     fn an_uninspectable_git_marker_fails_closed() {

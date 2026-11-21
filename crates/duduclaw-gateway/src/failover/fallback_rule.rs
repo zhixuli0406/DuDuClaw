@@ -8,9 +8,21 @@
 //! Refusals are checked FIRST (fail closed): a failure that is a result of
 //! the work itself, a budget/policy/autonomy decision, or a refusal of the
 //! employee's own tool configuration stops here. Only then are the eligible
-//! kinds recognised. A string the table cannot type keeps the v1.83.0
-//! behaviour for that string (the legacy 4xx rule refuses; anything else
-//! falls back) and is reported as [`FallbackTrigger::Unclassified`].
+//! kinds recognised.
+//!
+//! The error text of a provider failure can echo attacker-chosen text, so
+//! (v1.84 security review L2) nothing below the typed markers searches it:
+//!
+//! 1. a [`FailureKind`] the runtime recorded for exactly this error (HTTP
+//!    status, the provider's error code identifier, a duduclaw-llm error
+//!    variant) decides on its own;
+//! 2. otherwise only the anchored message shapes DuDuClaw's own runtimes
+//!    format are recognised (`API error (<status> …`, `<Engine> CLI exited
+//!    with `, `Empty response from `, …) — the text after that prefix, which
+//!    may carry model or provider output, is never read;
+//! 3. a string neither typed nor DuDuClaw-formatted keeps its v1.83.0 outcome
+//!    (content policy, billing hard limit and the 4xx substrings refuse;
+//!    anything else falls back, reported as [`FallbackTrigger::Unclassified`]).
 //!
 //! The fallback leg always runs its own full gates: `execute_with_failover`
 //! re-checks product policy and the budget for the fallback runtime and model,
@@ -18,6 +30,7 @@
 //! (`prepare_mcp_config_for_spawn`) exactly as a primary call would.
 
 use crate::work_outcome::WorkOutcome;
+use super::failure_kind::FailureKind;
 
 /// Owner decision pending (RM-181): a spawn-gate style refusal that is about
 /// the ENGINE's own host configuration (Codex external configuration layers,
@@ -36,8 +49,10 @@ pub(crate) enum PrimaryFailure<'a> {
     Cooldown,
     Empty,
     /// The runtime returned an error. `autonomy_denied` is
-    /// `crate::autonomous_runtime::was_denied()` sampled for this call.
-    Error { error: &'a str, autonomy_denied: bool },
+    /// `crate::autonomous_runtime::was_denied()` sampled for this call;
+    /// `kind` is what the runtime recorded for exactly this error
+    /// ([`super::failure_kind::kind_for`]).
+    Error { error: &'a str, autonomy_denied: bool, kind: Option<FailureKind> },
 }
 
 /// Why the configured fallback engine runs.
@@ -53,6 +68,10 @@ pub enum FallbackTrigger {
     /// Engine-local host configuration refusal, while
     /// [`ENGINE_LOCAL_CONFIG_REFUSAL_FALLS_BACK`] is `true`.
     EngineLocalConfig,
+    /// The conversation's required context does not fit this engine's single
+    /// command-line argument. Eligible only when the fallback engine has no
+    /// such limit ([`apply_fallback_engine_limits`]).
+    PromptTooLarge,
     /// Not typed by this table; v1.83.0 also fell back on it.
     Unclassified,
 }
@@ -84,6 +103,9 @@ pub enum FallbackRefusal {
     /// A 4xx request rejection that names no model and no credential — the
     /// v1.83.0 rule for these strings, kept.
     RequestRejected,
+    /// The conversation's required context is too large for the primary AND
+    /// the fallback engine (both pass the prompt as one command-line argument).
+    PromptTooLarge,
 }
 
 impl FallbackRefusal {
@@ -100,6 +122,7 @@ impl FallbackRefusal {
             Self::ContentPolicy => "content_policy",
             Self::BillingHardLimit => "billing_hard_limit",
             Self::RequestRejected => "request_rejected",
+            Self::PromptTooLarge => "prompt_too_large",
         }
     }
 
@@ -117,6 +140,7 @@ impl FallbackRefusal {
             Self::ContentPolicy => "這次的內容被服務的內容政策拒絕，不會換引擎重跑",
             Self::BillingHardLimit => "原選引擎的帳務已達硬性上限，依規則不會換引擎重跑",
             Self::RequestRejected => "原選引擎拒絕了這次的請求內容，換引擎重送通常也會被拒，所以沒有改用",
+            Self::PromptTooLarge => "這段對話必要的內容超過備援引擎一次能送出的大小，換引擎也送不出去，所以沒有改用",
         }
     }
 }
@@ -131,11 +155,11 @@ pub(crate) enum FallbackDecision {
 /// decoder; the autonomy state is passed in.
 pub(crate) fn classify_primary_failure(failure: PrimaryFailure<'_>) -> FallbackDecision {
     use FallbackDecision::{Eligible, Refused};
-    let (error, autonomy_denied) = match failure {
+    let (error, autonomy_denied, kind) = match failure {
         PrimaryFailure::NotRegistered => return Eligible(FallbackTrigger::NotRegistered),
         PrimaryFailure::Cooldown => return Eligible(FallbackTrigger::Cooldown),
         PrimaryFailure::Empty => return Eligible(FallbackTrigger::EmptyReply),
-        PrimaryFailure::Error { error, autonomy_denied } => (error, autonomy_denied),
+        PrimaryFailure::Error { error, autonomy_denied, kind } => (error, autonomy_denied, kind),
     };
 
     // ── Refusals (checked first; fail closed) ──────────────────────────
@@ -153,6 +177,10 @@ pub(crate) fn classify_primary_failure(failure: PrimaryFailure<'_>) -> FallbackD
         }));
     }
     if duduclaw_agent::mcp_spawn_gate::is_engine_local_spawn_gate_error(error) {
+        // DuDuClaw's own wording at the anchored position after both markers.
+        if crate::runtime::prompt_budget::is_prompt_too_large_error(error) {
+            return Eligible(FallbackTrigger::PromptTooLarge);
+        }
         return if engine_local_config_refusal_falls_back() {
             Eligible(FallbackTrigger::EngineLocalConfig)
         } else {
@@ -162,36 +190,39 @@ pub(crate) fn classify_primary_failure(failure: PrimaryFailure<'_>) -> FallbackD
     if duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(error) {
         return Refused(FallbackRefusal::EmployeeToolConfig);
     }
-    let lower = error.to_lowercase();
-    // `duduclaw_core::product_profile` refusals raised inside a runtime.
-    if lower.contains("product profile does not allow") {
+    // `duduclaw_core::product_profile` refusals raised inside a runtime are
+    // returned as-is (`?`), so their wording starts the string.
+    if starts_with_ignore_ascii_case(error, "product profile does not allow") {
         return Refused(FallbackRefusal::Policy);
     }
-    if lower.contains("content_policy_violation") || lower.contains("content policy violation") {
-        return Refused(FallbackRefusal::ContentPolicy);
-    }
-    if lower.contains("billing_hard_limit") {
-        return Refused(FallbackRefusal::BillingHardLimit);
-    }
 
-    // ── Eligible kinds ─────────────────────────────────────────────────
-    if is_auth_failure(&lower) {
-        return Eligible(FallbackTrigger::AuthFailure);
+    // 1. The runtime's typed kind for exactly this error decides alone.
+    if let Some(kind) = kind {
+        return decide_kind(kind);
     }
-    if is_model_unavailable(&lower) {
-        return Eligible(FallbackTrigger::ModelUnavailable);
+    // 2. An anchored message shape DuDuClaw's runtimes format.
+    if let Some(decision) = anchored_engine_message(error) {
+        return decision;
     }
-    if is_server_or_rate_limit(error, &lower) {
-        return Eligible(FallbackTrigger::ServerOrRateLimit);
+    // 3. Neither typed nor DuDuClaw-formatted: the v1.83.0 outcome.
+    untyped_v183_outcome(error)
+}
+
+/// RM-204: a prompt-too-large refusal may hand over only to an engine without
+/// the single-argument limit (Claude, Codex, the API runtime). When the
+/// configured fallback has the same limit, it would refuse the same way.
+pub(crate) fn apply_fallback_engine_limits(
+    decision: FallbackDecision,
+    fallback: Option<&crate::runtime::RuntimeType>,
+) -> FallbackDecision {
+    match decision {
+        FallbackDecision::Eligible(FallbackTrigger::PromptTooLarge)
+            if fallback.is_none_or(|fb| crate::runtime::prompt_budget::runtime_has_single_argument_limit(*fb)) =>
+        {
+            FallbackDecision::Refused(FallbackRefusal::PromptTooLarge)
+        }
+        other => other,
     }
-    // v1.83.0 refused these 4xx strings; no new rule types them.
-    if legacy_request_rejected(&lower) {
-        return Refused(FallbackRefusal::RequestRejected);
-    }
-    if is_process_error(&lower) {
-        return Eligible(FallbackTrigger::ProcessError);
-    }
-    Eligible(FallbackTrigger::Unclassified)
 }
 
 /// One switch, so the pending owner decision is a one-line change.
@@ -199,105 +230,124 @@ fn engine_local_config_refusal_falls_back() -> bool {
     ENGINE_LOCAL_CONFIG_REFUSAL_FALLS_BACK
 }
 
-/// `"401 "`-style status mention (not inside a longer number, followed by a
-/// space, `)`, `:` or `,`), as the runtimes format them
-/// (`API error (401 Unauthorized)`, `HTTP 403 …`). Char-based, no slicing.
-fn has_status(lower: &str, codes: &[&str]) -> bool {
-    let chars: Vec<char> = lower.chars().collect();
-    codes.iter().any(|code| {
-        let code: Vec<char> = code.chars().collect();
-        chars.windows(code.len()).enumerate().any(|(at, window)| {
-            window == code.as_slice()
-                && (at == 0 || !chars[at - 1].is_ascii_digit())
-                && matches!(chars.get(at + code.len()).copied(), Some(' ' | ')' | ':' | ','))
-        })
+fn starts_with_ignore_ascii_case(text: &str, prefix: &str) -> bool {
+    text.get(..prefix.len()).is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
+/// 1. The decision for a typed kind. The error text is not read.
+fn decide_kind(kind: FailureKind) -> FallbackDecision {
+    use FallbackDecision::{Eligible, Refused};
+    match kind {
+        FailureKind::Auth => Eligible(FallbackTrigger::AuthFailure),
+        FailureKind::RateLimited | FailureKind::Server => Eligible(FallbackTrigger::ServerOrRateLimit),
+        FailureKind::ModelUnavailable => Eligible(FallbackTrigger::ModelUnavailable),
+        FailureKind::RequestRejected => Refused(FallbackRefusal::RequestRejected),
+        FailureKind::ContentPolicy => Refused(FallbackRefusal::ContentPolicy),
+        FailureKind::BillingHardLimit => Refused(FallbackRefusal::BillingHardLimit),
+        // This account, this window or this connection — not the request;
+        // v1.83.0 fell back on these strings too.
+        FailureKind::Billing | FailureKind::ContextWindow | FailureKind::Network | FailureKind::Parse => {
+            Eligible(FallbackTrigger::Unclassified)
+        }
+        FailureKind::OtherStatus(status) => decide_status(status),
+    }
+}
+
+/// An HTTP status alone. 400 / 404 / 422 keep the v1.83.0 refusal: a model
+/// that does not exist is recognised only from the provider's typed code.
+fn decide_status(status: u16) -> FallbackDecision {
+    use FallbackDecision::{Eligible, Refused};
+    match status {
+        401 | 403 => Eligible(FallbackTrigger::AuthFailure),
+        429 | 500..=599 => Eligible(FallbackTrigger::ServerOrRateLimit),
+        400 | 404 | 422 => Refused(FallbackRefusal::RequestRejected),
+        _ => Eligible(FallbackTrigger::Unclassified),
+    }
+}
+
+/// Prefixes DuDuClaw's runtimes write before an HTTP status
+/// (`openai_compat`: `API error (<status>)…`, `SSE error (<status>)…`;
+/// `direct_api`: `Anthropic API error (<status>)…`).
+const HTTP_STATUS_PREFIXES: &[&str] = &["API error (", "SSE error (", "Anthropic API error ("];
+
+/// Process-level failures as DuDuClaw's runtimes word them, at the start of
+/// the string (`Empty response from <engine> …`, the generic CLI's spawn
+/// error, `process_group::backend_error` operations).
+const PROCESS_PREFIXES: &[&str] = &[
+    "Empty response from ",
+    "spawn error: failed to start ",
+    "Failed to spawn ",
+    "Failed to run ",
+    "Failed to read codex output: ",
+    "claude CLI spawn error: ",
+];
+
+/// `grok.rs::grok_auth_error`.
+const GROK_AUTH_PREFIX: &str = "Grok CLI authentication failure (";
+
+/// `<engine> CLI exited with …` (Codex, Grok, the generic CLIs).
+const EXITED_MARKER: &str = " CLI exited with ";
+
+/// `generic_cli::GenericCliError::AuthRequired`.
+const NOT_LOGGED_IN_MARKER: &str = " CLI is not logged in (authentication required): ";
+
+/// 2. An anchored, DuDuClaw-formatted engine message. Only the prefix is
+/// matched; everything after it (stderr, provider body) is never read.
+fn anchored_engine_message(error: &str) -> Option<FallbackDecision> {
+    use FallbackDecision::Eligible;
+    if let Some(status) = anchored_http_status(error) {
+        return Some(decide_status(status));
+    }
+    if error.starts_with(GROK_AUTH_PREFIX) || engine_label_before(error, NOT_LOGGED_IN_MARKER) {
+        return Some(Eligible(FallbackTrigger::AuthFailure));
+    }
+    if engine_label_before(error, EXITED_MARKER) || PROCESS_PREFIXES.iter().any(|p| error.starts_with(p)) {
+        return Some(Eligible(FallbackTrigger::ProcessError));
+    }
+    None
+}
+
+/// The three status digits right after an [`HTTP_STATUS_PREFIXES`] prefix.
+fn anchored_http_status(error: &str) -> Option<u16> {
+    let rest = HTTP_STATUS_PREFIXES.iter().find_map(|prefix| error.strip_prefix(prefix))?;
+    let digits = rest.get(..3)?;
+    if !digits.bytes().all(|b| b.is_ascii_digit()) || rest[3..].starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// `marker` with only an engine label before it (`Codex`, `Grok`, `kimi`):
+/// the string starts with `<label><marker>`.
+fn engine_label_before(error: &str, marker: &str) -> bool {
+    error.split_once(marker).is_some_and(|(head, _)| {
+        !head.is_empty() && head.len() <= 32
+            && head.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
     })
 }
 
+/// 3. A string no runtime typed and DuDuClaw did not format keeps the v1.83.0
+/// outcome: its `is_non_retryable` text rule (content policy, billing hard
+/// limit and the 4xx substrings refuse; anything else falls back).
+fn untyped_v183_outcome(error: &str) -> FallbackDecision {
+    use FallbackDecision::{Eligible, Refused};
+    let lower = error.to_lowercase();
+    if lower.contains("content_policy_violation") || lower.contains("content policy violation") {
+        Refused(FallbackRefusal::ContentPolicy)
+    } else if lower.contains("billing_hard_limit") {
+        Refused(FallbackRefusal::BillingHardLimit)
+    } else if legacy_request_rejected(&lower) {
+        Refused(FallbackRefusal::RequestRejected)
+    } else {
+        Eligible(FallbackTrigger::Unclassified)
+    }
+}
+
 /// The v1.83.0 `is_non_retryable` 4xx substrings, kept verbatim for strings
-/// no new rule types.
+/// no rule types.
 fn legacy_request_rejected(lower: &str) -> bool {
     lower.contains("400 ") || lower.contains("404 ") || lower.contains("422 ")
         || lower.contains("400 bad request")
-}
-
-fn is_auth_failure(lower: &str) -> bool {
-    has_status(lower, &["401", "403"])
-        || [
-            "unauthorized",
-            "forbidden",
-            "invalid_api_key",
-            "invalid api key",
-            "incorrect api key",
-            "invalid bearer token",
-            "not logged in",
-            "not signed in",
-            "not authenticated",
-            "unauthenticated",
-            "authentication failed",
-            "authentication failure",
-            "authentication required",
-            "authentication_failed",
-            "login required",
-            "login expired",
-            "session expired",
-            "oauth access token is invalid",
-        ]
-        .iter()
-        .any(|needle| lower.contains(needle))
-}
-
-fn is_model_unavailable(lower: &str) -> bool {
-    [
-        "model_not_found",
-        "model not found",
-        "no such model",
-        "unknown model",
-        "invalid model",
-        "unsupported model",
-        "model is not supported",
-        "model does not exist",
-        "model is not available",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
-        || (has_status(lower, &["400", "404", "422"]) && lower.contains("model"))
-}
-
-fn is_server_or_rate_limit(error: &str, lower: &str) -> bool {
-    has_status(lower, &["429", "500", "502", "503", "504", "529"])
-        || crate::claude_runner::is_rate_limit_error(error)
-        || [
-            "internal server error",
-            "bad gateway",
-            "service unavailable",
-            "gateway timeout",
-            "overloaded",
-        ]
-        .iter()
-        .any(|needle| lower.contains(needle))
-}
-
-fn is_process_error(lower: &str) -> bool {
-    [
-        "empty response",
-        "exited with",
-        "exit code",
-        "exit status",
-        "non-zero exit",
-        "spawn error",
-        "failed to run",
-        "failed to start",
-        "no such file",
-        "killed by signal",
-        "terminated by signal",
-        "crashed",
-        "panicked",
-        "broken pipe",
-        "read error",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
 }
 
 #[cfg(test)]
@@ -306,7 +356,11 @@ mod tests {
     use FallbackDecision::{Eligible, Refused};
 
     fn err(error: &str) -> FallbackDecision {
-        classify_primary_failure(PrimaryFailure::Error { error, autonomy_denied: false })
+        classify_primary_failure(PrimaryFailure::Error { error, autonomy_denied: false, kind: None })
+    }
+
+    fn typed(error: &str, kind: FailureKind) -> FallbackDecision {
+        classify_primary_failure(PrimaryFailure::Error { error, autonomy_denied: false, kind: Some(kind) })
     }
 
     #[test]
@@ -326,46 +380,144 @@ mod tests {
             (idle.as_str(), Refused(FallbackRefusal::WorkLimit(WorkLimitKind::TimeoutNoProgress))),
             (employee_gate.as_str(), Refused(FallbackRefusal::EmployeeToolConfig)),
             ("Product profile does not allow runtime 'grok'", Refused(FallbackRefusal::Policy)),
-            ("API error (400 Bad Request): content_policy_violation", Refused(FallbackRefusal::ContentPolicy)),
+            // Anchored DuDuClaw shape: the status decides, the body is not read
+            // (in production `openai_compat` also records the provider's code;
+            // see `typed_rows` below).
+            ("API error (400 Bad Request): content_policy_violation", Refused(FallbackRefusal::RequestRejected)),
+            // Untyped, not DuDuClaw-formatted: the v1.83.0 outcome.
             ("Content policy violation detected", Refused(FallbackRefusal::ContentPolicy)),
-            ("API error (429 Too Many Requests): billing_hard_limit_reached", Refused(FallbackRefusal::BillingHardLimit)),
             ("400 bad request: invalid JSON", Refused(FallbackRefusal::RequestRejected)),
             ("API error (422 Unprocessable Entity): messages too long", Refused(FallbackRefusal::RequestRejected)),
+            // L2: without the provider's typed code, a model name in a 4xx body
+            // no longer turns the v1.83.0 refusal into a fallback.
+            ("API error (404 Not Found): The model `opus` does not exist", Refused(FallbackRefusal::RequestRejected)),
+            ("API error (400 Bad Request): invalid model 'opus'", Refused(FallbackRefusal::RequestRejected)),
+            ("API error (422 Unprocessable Entity): unknown model grok-x", Refused(FallbackRefusal::RequestRejected)),
             // ── Eligible ──
             (engine_local.as_str(), Eligible(FallbackTrigger::EngineLocalConfig)),
             ("Empty response from Codex CLI (exit 0); stderr tail: ", Eligible(FallbackTrigger::ProcessError)),
             ("Grok CLI exited with 1: boom", Eligible(FallbackTrigger::ProcessError)),
             ("spawn error: failed to start kimi CLI: No such file or directory", Eligible(FallbackTrigger::ProcessError)),
             ("Codex CLI exited with code 101: thread 'main' panicked", Eligible(FallbackTrigger::ProcessError)),
-            ("401 invalid bearer token; misleading claude /login", Eligible(FallbackTrigger::AuthFailure)),
             ("API error (403 Forbidden): access denied", Eligible(FallbackTrigger::AuthFailure)),
-            ("invalid_api_key: Incorrect API key provided", Eligible(FallbackTrigger::AuthFailure)),
             ("Grok CLI authentication failure (not logged in / 憑證失效): stderr tail: x", Eligible(FallbackTrigger::AuthFailure)),
             ("kimi CLI is not logged in (authentication required): run login", Eligible(FallbackTrigger::AuthFailure)),
-            ("codex: your login expired, please sign in again", Eligible(FallbackTrigger::AuthFailure)),
-            ("API error (404 Not Found): The model `opus` does not exist", Eligible(FallbackTrigger::ModelUnavailable)),
-            ("API error (400 Bad Request): invalid model 'opus'", Eligible(FallbackTrigger::ModelUnavailable)),
-            ("API error (422 Unprocessable Entity): unknown model grok-x", Eligible(FallbackTrigger::ModelUnavailable)),
-            ("error: model_not_found", Eligible(FallbackTrigger::ModelUnavailable)),
-            ("500 internal server error", Eligible(FallbackTrigger::ServerOrRateLimit)),
             ("API error (503 Service Unavailable): overloaded", Eligible(FallbackTrigger::ServerOrRateLimit)),
-            ("429 rate limited", Eligible(FallbackTrigger::ServerOrRateLimit)),
             ("SSE error (502 Bad Gateway): upstream", Eligible(FallbackTrigger::ServerOrRateLimit)),
-            // Untyped: keeps the v1.83.0 behaviour (falls back).
+            ("API error (429 Too Many Requests): billing_hard_limit_reached", Eligible(FallbackTrigger::ServerOrRateLimit)),
+            ("Anthropic API error (401 Unauthorized): x", Eligible(FallbackTrigger::AuthFailure)),
+            // Untyped and not DuDuClaw-formatted: the v1.83.0 outcome (falls back).
+            ("401 invalid bearer token; misleading claude /login", Eligible(FallbackTrigger::Unclassified)),
+            ("invalid_api_key: Incorrect API key provided", Eligible(FallbackTrigger::Unclassified)),
+            ("codex: your login expired, please sign in again", Eligible(FallbackTrigger::Unclassified)),
+            ("error: model_not_found", Eligible(FallbackTrigger::Unclassified)),
+            ("500 internal server error", Eligible(FallbackTrigger::Unclassified)),
+            ("429 rate limited", Eligible(FallbackTrigger::Unclassified)),
             ("connection refused", Eligible(FallbackTrigger::Unclassified)),
             ("connection timed out", Eligible(FallbackTrigger::Unclassified)),
         ];
         for (error, expected) in rows {
             assert_eq!(err(error), expected, "{error}");
         }
+        // The kinds production runtimes record decide those same strings.
+        let typed_rows = [
+            ("API error (400 Bad Request): content_policy_violation", FailureKind::ContentPolicy, Refused(FallbackRefusal::ContentPolicy)),
+            ("API error (429 Too Many Requests): billing_hard_limit_reached", FailureKind::BillingHardLimit, Refused(FallbackRefusal::BillingHardLimit)),
+            ("API error (404 Not Found): The model `opus` does not exist", FailureKind::ModelUnavailable, Eligible(FallbackTrigger::ModelUnavailable)),
+            ("openai-compat tool loop error: authentication failed", FailureKind::Auth, Eligible(FallbackTrigger::AuthFailure)),
+            ("openai-compat tool loop error: invalid request: x", FailureKind::RequestRejected, Refused(FallbackRefusal::RequestRejected)),
+            ("HTTP request: error sending request", FailureKind::Network, Eligible(FallbackTrigger::Unclassified)),
+            ("API error (409 Conflict): x", FailureKind::OtherStatus(409), Eligible(FallbackTrigger::Unclassified)),
+        ];
+        for (error, kind, expected) in typed_rows {
+            assert_eq!(typed(error, kind), expected, "{error}");
+        }
         assert_eq!(classify_primary_failure(PrimaryFailure::NotRegistered), Eligible(FallbackTrigger::NotRegistered));
         assert_eq!(classify_primary_failure(PrimaryFailure::Cooldown), Eligible(FallbackTrigger::Cooldown));
         assert_eq!(classify_primary_failure(PrimaryFailure::Empty), Eligible(FallbackTrigger::EmptyReply));
         // The autonomy gate's task-local verdict refuses whatever the text says.
         assert_eq!(
-            classify_primary_failure(PrimaryFailure::Error { error: "Failed to run stub: paused", autonomy_denied: true }),
+            classify_primary_failure(PrimaryFailure::Error { error: "Failed to run stub: paused", autonomy_denied: true, kind: Some(FailureKind::Server) }),
             Refused(FallbackRefusal::AutonomyPaused)
         );
+    }
+
+    /// L2: a body that echoes "invalid model", "401 ", "content policy
+    /// violation" or "billing_hard_limit" is decided by the structured kind.
+    #[test]
+    fn echoed_body_text_never_overrides_the_structured_kind() {
+        for body in ["invalid model 'x'", "401 unauthorized", "content policy violation", "billing_hard_limit_reached",
+            "model_not_found 500 internal server error not logged in"] {
+            let error = format!("API error (400 Bad Request): {body}");
+            assert_eq!(typed(&error, FailureKind::RequestRejected), Refused(FallbackRefusal::RequestRejected), "{body}");
+            assert_eq!(err(&error), Refused(FallbackRefusal::RequestRejected), "anchored status, {body}");
+            let error = format!("API error (500 Internal Server Error): {body}");
+            assert_eq!(typed(&error, FailureKind::Server), Eligible(FallbackTrigger::ServerOrRateLimit), "{body}");
+            assert_eq!(err(&error), Eligible(FallbackTrigger::ServerOrRateLimit), "anchored status, {body}");
+            let error = format!("openai-compat tool loop error: invalid request: {body}");
+            assert_eq!(typed(&error, FailureKind::RequestRejected), Refused(FallbackRefusal::RequestRejected), "{body}");
+            let error = format!("openai-compat tool loop error: rate limited: {body}");
+            assert_eq!(typed(&error, FailureKind::RateLimited), Eligible(FallbackTrigger::ServerOrRateLimit), "{body}");
+            // A CLI's stderr after DuDuClaw's prefix is never read either.
+            for prefix in ["Codex CLI exited with exit status: 1: ", "Grok CLI exited with 1: ", "Empty response from Grok CLI (exit 0); stderr tail: "] {
+                let error = format!("{prefix}{body}");
+                assert_eq!(err(&error), Eligible(FallbackTrigger::ProcessError), "{error}");
+            }
+        }
+        // Refusals still win over any kind.
+        let gate = duduclaw_agent::mcp_spawn_gate::spawn_gate_error("x");
+        assert_eq!(typed(&gate, FailureKind::Server), Refused(FallbackRefusal::EmployeeToolConfig));
+        let work = WorkOutcome::TimeoutTotal { seconds: 1, partial: String::new() }.encode();
+        assert_eq!(typed(&work, FailureKind::Auth), Refused(FallbackRefusal::WorkLimit(WorkLimitKind::TimeoutTotal)));
+        assert_eq!(typed("Product profile does not allow model 'x'", FailureKind::Server), Refused(FallbackRefusal::Policy));
+        // The policy wording counts only at the start of the string.
+        assert_eq!(err("Grok CLI exited with 1: Product profile does not allow"), Eligible(FallbackTrigger::ProcessError));
+        // A label with spaces before the marker is not DuDuClaw's prefix.
+        assert_eq!(err("the model said Codex CLI exited with 1 and 400 bad"), Refused(FallbackRefusal::RequestRejected));
+    }
+
+    /// RM-204: a prompt that does not fit one argument falls back only to an
+    /// engine without that limit.
+    #[test]
+    fn prompt_too_large_is_eligible_only_for_an_engine_without_the_argument_limit() {
+        use crate::runtime::RuntimeType;
+        let error = crate::runtime::prompt_budget::prompt_too_large_error("grok");
+        let decision = err(&error);
+        assert_eq!(decision, Eligible(FallbackTrigger::PromptTooLarge));
+        for fallback in [RuntimeType::Claude, RuntimeType::Codex, RuntimeType::OpenAiCompat] {
+            assert_eq!(apply_fallback_engine_limits(decision, Some(&fallback)), decision, "{fallback:?}");
+        }
+        assert_eq!(apply_fallback_engine_limits(decision, Some(&RuntimeType::Grok)), Refused(FallbackRefusal::PromptTooLarge));
+        assert_eq!(apply_fallback_engine_limits(decision, None), Refused(FallbackRefusal::PromptTooLarge));
+        // Any other decision passes through unchanged.
+        let other = Eligible(FallbackTrigger::ProcessError);
+        assert_eq!(apply_fallback_engine_limits(other, Some(&RuntimeType::Grok)), other);
+        // An ordinary engine-local refusal is not mistaken for it.
+        let engine_local = duduclaw_agent::mcp_spawn_gate::engine_local_spawn_gate_error("Codex 外部設定 x");
+        assert_eq!(err(&engine_local), Eligible(FallbackTrigger::EngineLocalConfig));
+    }
+
+    /// The engine-local marker sits right after the spawn-gate prefix. An
+    /// employee-controlled string at the start of an EMPLOYEE-gate refusal
+    /// (a file path, a server name) can never place it there.
+    #[test]
+    fn employee_controlled_text_cannot_forge_the_engine_local_marker() {
+        use duduclaw_agent::mcp_spawn_gate::{ENGINE_LOCAL_REFUSAL_MARKER, SPAWN_GATE_ERROR_PREFIX, spawn_gate_error};
+        let forged_names = [
+            format!("{ENGINE_LOCAL_REFUSAL_MARKER}crm"),
+            format!("{ENGINE_LOCAL_REFUSAL_MARKER}/Users/a/.mcp.json"),
+            format!("{SPAWN_GATE_ERROR_PREFIX}{ENGINE_LOCAL_REFUSAL_MARKER}x"),
+            ENGINE_LOCAL_REFUSAL_MARKER.to_string(),
+            ENGINE_LOCAL_REFUSAL_MARKER.trim_end().to_string(),
+        ];
+        for name in &forged_names {
+            for message in [name.clone(), format!("{name}: 定義了 mcp_servers"), format!("{name} 無法讀取")] {
+                let error = spawn_gate_error(&message);
+                assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error));
+                assert!(!duduclaw_agent::mcp_spawn_gate::is_engine_local_spawn_gate_error(&error), "{error}");
+                assert_eq!(err(&error), Refused(FallbackRefusal::EmployeeToolConfig), "{error}");
+            }
+        }
     }
 
     #[test]
@@ -389,7 +541,7 @@ mod tests {
             FallbackRefusal::WorkLimit(WorkLimitKind::MaxTurns), FallbackRefusal::WorkLimit(WorkLimitKind::TimeoutTotal),
             FallbackRefusal::WorkLimit(WorkLimitKind::TimeoutNoProgress), FallbackRefusal::EmployeeToolConfig,
             FallbackRefusal::EngineLocalConfig, FallbackRefusal::ContentPolicy, FallbackRefusal::BillingHardLimit,
-            FallbackRefusal::RequestRejected,
+            FallbackRefusal::RequestRejected, FallbackRefusal::PromptTooLarge,
         ] {
             let text = refusal.zh_tw();
             assert!(!text.is_empty() && !text.contains(".json") && !text.contains("mcp"), "{refusal:?}");

@@ -1078,6 +1078,32 @@ async fn agent_update_refuses_self_authority_changes() {
     assert_eq!(budget_of(h, "sales-rep"), 3000);
 }
 
+/// RM-205 / security review: `[runtime] utility_provider` decides which
+/// outside service receives the employee's conversation text for background
+/// work. Through MCP `agent_update` an employee cannot set it on itself (the
+/// whole `runtime` parameter is a self-authority key), and no caller can set
+/// it at all: `agent_update` has no `[runtime]` write path.
+#[tokio::test]
+async fn agent_update_never_writes_runtime_utility_provider() {
+    let home = Home::new();
+    let h = home.path();
+    let path = h.join("agents/sales-rep/agent.toml");
+    let before = fs::read_to_string(&path).unwrap();
+    let params = serde_json::json!({ "agent_id": "sales-rep", "runtime": { "utility_provider": "openai_compat" } });
+    let out = handle_agent_update(&params, h, A("sales-rep")).await;
+    assert!(is_error(&out), "self: {out}");
+    assert!(text(&out).contains("runtime"), "{out}");
+    assert_eq!(fs::read_to_string(&path).unwrap(), before, "self: file unchanged");
+    let rows = audit_rows(h, "agent_authority_refused");
+    assert!(rows.iter().any(|r| r["keys"].as_array().is_some_and(|k| k.iter().any(|k| k == "runtime"))), "{rows:?}");
+    // A manager or an operator through MCP cannot write it either.
+    for actor in [A("sales-lead"), RecordActor::Operator("sales-rep")] {
+        let _ = handle_agent_update(&params, h, actor).await;
+        let table: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
+        assert!(table.get("runtime").and_then(|r| r.get("utility_provider")).is_none(), "{table:?}");
+    }
+}
+
 #[tokio::test]
 async fn agent_update_unproven_internal_caller_cannot_edit_the_default_agent() {
     // Internal key with no DUDUCLAW_AGENT_ID: the actor is the internal

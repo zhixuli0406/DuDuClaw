@@ -4201,7 +4201,7 @@ async fn build_reply_with_session_inner_impl(
     let shown_gate_text = (!super::assembly::public_session(session_id)
         && operator_diagnostics_allowed(&ctx.home_dir, session_id))
         .then(|| failure.spawn_gate_message().map(|message| crate::dispatcher::sanitize_for_channel(
-            &match failure.engine_summary() {
+            &match failure.engine_summary_for_session(session_id) {
                 Some(summary) => format!("{message}\n\n{summary}"),
                 None => message.to_string(),
             })))
@@ -4307,7 +4307,7 @@ async fn build_reply_with_session_inner_impl(
     // RM-181: operators and members are told which engines were tried, in
     // order, and why a configured fallback engine was not used. Public
     // visitors keep the generic text.
-    let engine_summary = if visitor { None } else { failure.engine_summary() };
+    let engine_summary = failure.engine_summary_for_session(session_id);
     if let Some(outcome) = crate::work_outcome::WorkOutcome::decode(&failure) {
         if visitor { return format!("{}\n{reference}", crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE); }
         let notice = super::failure_notice::work_notice(&outcome, language.as_deref());

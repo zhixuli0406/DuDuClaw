@@ -350,6 +350,7 @@ mod tests {
             ("[odoo]\nallowed_models=['res.partner']\n", "odoo"),
             ("[runtime]\nprovider='codex'\n", "runtime.provider"),
             ("[runtime]\nfallback='claude'\n", "runtime.fallback"),
+            ("[runtime]\nutility_provider='openai_compat'\n", "runtime.utility_provider"),
             ("[prompt]\ncli_bare_mode=true\n", "prompt.cli_bare_mode"),
             ("[prompt]\nreply_language='en'\n", "prompt.reply_language"),
             ("[container]\nreadonly_project=false\n", "container.readonly_project"),

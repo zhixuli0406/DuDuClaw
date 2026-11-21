@@ -146,11 +146,28 @@ fn completion_request(url: &str, context: &RuntimeContext) -> reqwest::RequestBu
 }
 
 fn transport_error(phase: &str, error: reqwest::Error) -> String {
+    use crate::failover::failure_kind::{FailureKind, typed};
     // reqwest's Display omits the source timeout; do not classify its text.
+    // L2: no response arrived, so the fallback rule gets a typed kind.
     if error.is_timeout() {
-        format!("{phase} timed out")
+        typed(FailureKind::Network, format!("{phase} timed out"))
     } else {
-        format!("{phase}: {error}")
+        typed(FailureKind::Network, format!("{phase}: {error}"))
+    }
+}
+
+/// L2: an HTTP failure as text plus its typed kind (status and the
+/// provider's error code identifier; the body's free text is never searched).
+fn http_status_error(status: reqwest::StatusCode, body: &str, message: String) -> String {
+    use crate::failover::failure_kind::{from_http, typed};
+    typed(from_http(status.as_u16(), body), message)
+}
+
+/// L2: a duduclaw-llm error as text plus its typed kind.
+fn llm_error_text(error: &LlmError, message: String) -> String {
+    match crate::failover::failure_kind::from_llm(error) {
+        Some(kind) => crate::failover::failure_kind::typed(kind, message),
+        None => message,
     }
 }
 
@@ -339,13 +356,14 @@ impl OpenAiCompatRuntime {
         if !status.is_success() {
             if let Ok(err) = serde_json::from_str::<ApiErrorResponse>(&response_text) {
                 if let Some(detail) = err.error {
-                    return Err(format!("API error ({status}): {}", detail.message));
+                    return Err(http_status_error(status, &response_text,
+                        format!("API error ({status}): {}", detail.message)));
                 }
             }
-            return Err(format!(
+            return Err(http_status_error(status, &response_text, format!(
                 "API error ({status}): {}",
                 truncate_bytes(&response_text, 300)
-            ));
+            )));
         }
 
         let parsed: ChatCompletionResponse = serde_json::from_str(&response_text)
@@ -555,7 +573,7 @@ impl OpenAiCompatRuntime {
         let loop_outcome =
             loop_result.map_err(|e| match e {
                 LlmError::MaxTurns { limit } => crate::work_outcome::WorkOutcome::MaxTurns { limit: limit as u64, partial: String::new() }.encode(),
-                other => format!("openai-compat tool loop error: {other}"),
+                other => llm_error_text(&other, format!("openai-compat tool loop error: {other}")),
             })?;
         // R1: `LoopToolCall` already carries masked+capped result/input text
         // (masking happens inside `duduclaw-llm::tool_loop`, which already
@@ -617,7 +635,7 @@ async fn execute_utility_completion(
         compose_model_id(provider_name, &context.model));
     request.response_format = crate::runtime_dispatch::output_schema_override();
     let response = duduclaw_llm::complete_without_tools(provider, request).await
-        .map_err(|error| format!("openai-compat utility completion error: {error}"))?;
+        .map_err(|error| llm_error_text(&error, format!("openai-compat utility completion error: {error}")))?;
     Ok(RuntimeResponse {
         partial_timeout_secs: None,
         content: classify_final_text(&response, &context.model)?,
@@ -1065,10 +1083,10 @@ impl OpenAiCompatRuntime {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.map_err(|e| completion_transport_error("SSE error body", e, context, ""))?;
-            return Err(format!(
+            return Err(http_status_error(status, &body, format!(
                 "SSE error ({status}): {}",
                 body.chars().take(300).collect::<String>()
-            ));
+            )));
         }
 
         Self::collect_sse(response.bytes_stream(), context, total_deadline).await
