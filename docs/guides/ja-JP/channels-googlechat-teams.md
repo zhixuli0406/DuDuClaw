@@ -137,7 +137,7 @@ gateway は [`spaces.messages.get`](https://developers.google.com/workspace/chat
 
 **ゴール判断カードのボタン。** アプリが HTTP でイベントを受け取る場合、ゴールの「人的対応が必要」カードに「再試行」「完了にする」「諦める」「自分で対応」のボタンが付きます（表示は繁体字中国語）。Pub/Sub でイベントを受け取るアプリは信頼できるクリックを受け取れないため、テキストのカードのままとし、ダッシュボードの未処理の判断ページで対応するよう案内します。HTTP か Pub/Sub かは、共有アプリでは `[channels] googlechat_connection` と `googlechat_pubsub_subscription`、社員専用アプリではその社員の `[channels.googlechat] connection` と `pubsub_subscription` で判断し、はっきりしない場合はボタンを付けません。誰が押せるか、押した後どうなるかは[ゴールループ](goal-loop.md)を参照してください。
 
-**チャットメッセージ内のダッシュボードへのリンク。** 通知や判断カードのダッシュボードへのリンクには、`[dashboard]`、`[general]`、`[gateway]` の順で最初に有効な `public_url` を使います。有効な値は http または https で、ホストが localhost やループバックアドレスではなく、ユーザー名、クエリ、フラグメントを含まないものです。無効な値はスキップし、セクションごとに 1 回警告を記録します。どれも有効でない場合、コンテナ内で動く gateway（`/.dockerenv` がある、または `DUDUCLAW_IN_CONTAINER` を設定）はリンクを付けず、通常のマシン上の gateway は `http://localhost:<port>` のリンクを残します。招待リンクも同じ順序を使いますが、引き続き https が必要です。
+**チャットメッセージ内のダッシュボードへのリンク。** 通知や判断カードのダッシュボードへのリンクには、`[dashboard]`、`[general]`、`[gateway]` の順で最初に有効な `public_url` を使います。有効な値は http または https で、ホストが localhost やループバックアドレスではなく、ユーザー名、クエリ、フラグメントを含まないものです。無効な値はスキップし、セクションごとに 1 回警告を記録します。どれも有効でない場合、コンテナ内で動く gateway（`/.dockerenv` がある、または `DUDUCLAW_IN_CONTAINER` の値がちょうど `1`、`true`、`yes` のいずれか）はリンクを付けず、通常のマシン上の gateway は `http://localhost:<port>` のリンクを残します。招待リンクも同じ順序を使いますが、引き続き https が必要です。
 
 ### 制限
 

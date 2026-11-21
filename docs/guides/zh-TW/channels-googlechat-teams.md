@@ -135,7 +135,7 @@ Cloud Shell 執行 `bash scripts/googlechat/bootstrap.sh --connection pubsub`，
 
 **目標決定卡片的按鈕。** 應用程式以 HTTP 接收事件時，目標「需人工決定」卡片會帶「重試」「標記完成」「放棄」「交給我」四個按鈕（文字為繁體中文）。以 Pub/Sub 接收事件的應用程式收不到可信任的按鈕事件，維持文字卡片，並提示到儀表板的待辦決定頁處理。是 HTTP 還是 Pub/Sub，共用應用程式看 `[channels] googlechat_connection` 與 `googlechat_pubsub_subscription`，員工自己的應用程式看該員工的 `[channels.googlechat] connection` 與 `pubsub_subscription`；只要判斷不明確就不送按鈕。誰可以按、按了之後會怎樣，見[目標迴圈](goal-loop.md#按鈕)。
 
-**聊天訊息裡的儀表板連結。** 通知與決定卡片裡的儀表板連結，依序採用 `[dashboard]`、`[general]`、`[gateway]` 中第一個有效的 `public_url`。有效的值必須是 http 或 https、主機不是 localhost 或本機迴路位址，而且不含帳號、查詢字串或片段；無效的值會被略過，每個區塊記錄一次警告。都無效時，在容器裡執行的閘道（有 `/.dockerenv` 或設定了 `DUDUCLAW_IN_CONTAINER`）不附連結，一般主機上的閘道則保留 `http://localhost:<port>` 連結。邀請連結採用相同順序，但仍須是 https。
+**聊天訊息裡的儀表板連結。** 通知與決定卡片裡的儀表板連結，依序採用 `[dashboard]`、`[general]`、`[gateway]` 中第一個有效的 `public_url`。有效的值必須是 http 或 https、主機不是 localhost 或本機迴路位址，而且不含帳號、查詢字串或片段；無效的值會被略過，每個區塊記錄一次警告。都無效時，在容器裡執行的閘道（有 `/.dockerenv`，或 `DUDUCLAW_IN_CONTAINER` 的值正好是 `1`、`true` 或 `yes`）不附連結，一般主機上的閘道則保留 `http://localhost:<port>` 連結。邀請連結採用相同順序，但仍須是 https。
 
 ### 限制
 

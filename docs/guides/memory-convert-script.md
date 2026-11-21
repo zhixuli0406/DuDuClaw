@@ -10,7 +10,7 @@ The command is meant for an operator on the machine that runs DuDuClaw. It is no
 - The conversion is character by character from a fixed table of Simplified-only characters. No model is called and nothing is translated: English or Japanese memories stay in their language, and characters whose Traditional form depends on context are left unchanged.
 - An entry that contains Japanese kana is skipped entirely and counted as `skipped_japanese`.
 - URLs (`scheme://…`, `mailto:`, `www.`), Markdown link targets, inline code and fenced code blocks are kept exactly as they are.
-- Memories whose search vector came from the built-in local embedder get a new vector. Vectors produced by another model are cleared; those memories take no part in similarity checks until they are embedded again (the output says so when it happens).
+- Only vectors produced by the built-in n-gram hash embedder are rebuilt. Vectors produced by any other embedding model are cleared; those memories take no part in similarity checks until they are embedded again (the output says so when it happens).
 
 ## Which employees are converted
 
