@@ -333,6 +333,14 @@ async fn forged_markers_only_affect_the_task_they_name() {
         ("goal_needs_human_cleared:victim:30", "bystander"),
         // The task "victim:9"'s marker is not "victim"'s episode 9.
         ("goal_needs_human_notified:victim:9:1", "victim:9"),
+        // A task-id prefix ending in a colon is not a complete marker suffix.
+        ("goal_needs_human_notified:victim:9:1", "victim"),
+        ("goal_needs_human_cleared:victim:9:1", "victim"),
+        ("goal_needs_human_notified:victim:1x", "victim"),
+        ("goal_needs_human_notified:victim:", "victim"),
+        // A real task id containing a colon still owns its decimal suffix.
+        ("goal_needs_human_notified:victim:9:1", "victim:9"),
+        ("goal_needs_human_notified:victim:3", "victim"),
         // A well-formed "notified" marker far ahead of victim's real state
         // (no entry observed, no cleared episode 41).
         ("goal_needs_human_notified:victim:42", "victim"),

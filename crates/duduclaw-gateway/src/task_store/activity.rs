@@ -73,13 +73,19 @@ impl TaskStore {
         let mut stmt = conn
             .prepare(
                 "SELECT DISTINCT a.task_id FROM activity a JOIN tasks t ON t.id = a.task_id
-                  WHERE (substr(a.id, 1, length(?1) + length(a.task_id) + 1) = ?1 || a.task_id || ':'
-                         OR substr(a.id, 1, length(?2) + length(a.task_id) + 1) = ?2 || a.task_id || ':')
+                  WHERE ((substr(a.id, 1, length(?1) + length(a.task_id) + 1) = ?1 || a.task_id || ':'
+                          AND substr(a.id, length(?1) + length(a.task_id) + 2) <> ''
+                          AND substr(a.id, length(?1) + length(a.task_id) + 2) NOT GLOB '*[^0-9]*')
+                         OR (substr(a.id, 1, length(?2) + length(a.task_id) + 1) = ?2 || a.task_id || ':'
+                          AND substr(a.id, length(?2) + length(a.task_id) + 2) <> ''
+                          AND substr(a.id, length(?2) + length(a.task_id) + 2) NOT GLOB '*[^0-9]*'))
                     AND t.status <> 'needs_human'
                     AND NOT EXISTS (
                         SELECT 1 FROM activity c
                          WHERE c.task_id = a.task_id
                            AND substr(c.id, 1, length(?3) + length(a.task_id) + 1) = ?3 || a.task_id || ':'
+                           AND substr(c.id, length(?3) + length(a.task_id) + 2) <> ''
+                           AND substr(c.id, length(?3) + length(a.task_id) + 2) NOT GLOB '*[^0-9]*'
                            AND c.timestamp >= a.timestamp)",
             )
             .map_err(|e| format!("prepare open markers: {e}"))?;
