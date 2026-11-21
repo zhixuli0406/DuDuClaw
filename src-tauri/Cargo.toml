@@ -45,9 +45,9 @@ mdns-sd = "0.20"
 url = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # Photo → desktop-pet pack format + local background removal (WP-P2/P3). The
-# `onnx` pulls the ort/onnxruntime path (BiRefNet/silueta local background
-# removal). ort-sys 2.0.0-rc.12 ships prebuilt onnxruntime ONLY for
-# aarch64-macos and windows — the v1.46.0 desktop CI failed on
+# `onnx` uses the shared, verified runtime under the DuDuClaw home for
+# BiRefNet/silueta background removal. Preserve the existing target gate:
+# the v1.46.0 desktop CI failed on
 # x86_64-apple-darwin and x86_64-linux with "ort does not provide prebuilt
 # binaries for the target". Target-gate the feature: those platforms build
 # without `onnx` and pet generation degrades to the passthrough remover
@@ -64,7 +64,7 @@ tokio = { version = "1", features = ["time"] }
 # tauri ships a cookie that targets the new API. Remove once that lands.
 time = "=0.3.51"
 
-# ONNX-backed background removal only where ort-sys has prebuilt onnxruntime
+# ONNX-backed background removal on the existing supported desktop targets
 # (see the duduclaw-pets comment above). Same path + extra feature is a legal
 # Cargo pattern: features unify on matching targets.
 [target.'cfg(any(all(target_os = "macos", target_arch = "aarch64"), target_os = "windows"))'.dependencies]

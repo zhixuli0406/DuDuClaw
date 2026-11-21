@@ -29,8 +29,8 @@ fn missing_files(home: &Path) -> Vec<&'static str> {
 }
 fn ort_available(home: &Path) -> bool {
     let Some(path) = duduclaw_onnx::manifest::ort_lib_path(&ort_root(home)) else { return false; };
-    let Some((size, _)) = duduclaw_onnx::manifest::ort_lib_pin(duduclaw_onnx::manifest::current_target()) else { return false; };
-    std::fs::symlink_metadata(path).map(|m| m.is_file() && m.len() == size).unwrap_or(false)
+    let Some(pins) = duduclaw_onnx::manifest::ort_lib_pins(duduclaw_onnx::manifest::current_target()) else { return false; };
+    std::fs::symlink_metadata(path).map(|m| m.is_file() && pins.iter().any(|&(size, _)| m.len() == size)).unwrap_or(false)
 }
 pub fn is_installed(home: &Path) -> bool {
     missing_files(home).is_empty() && ort_available(home)

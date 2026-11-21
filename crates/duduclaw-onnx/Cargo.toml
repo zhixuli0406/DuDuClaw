@@ -30,7 +30,7 @@ workspace = true
 duduclaw-core = { workspace = true }
 thiserror = { workspace = true }
 
-ort = { version = "2.0.0-rc.12", optional = true, default-features = false, features = ["load-dynamic", "ndarray", "tracing", "api-24"] }
+ort = { version = "=2.0.0-rc.15", optional = true, default-features = false, features = ["load-dynamic", "ndarray", "tracing", "api-24"] }
 
 reqwest = { version = "0.12", optional = true, features = ["json", "stream"] }
 futures-util = { workspace = true, optional = true }

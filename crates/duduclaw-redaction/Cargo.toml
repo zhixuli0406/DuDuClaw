@@ -64,7 +64,7 @@ uuid = { workspace = true }
 # runtime from `~/.duduclaw/lib/onnxruntime/<ver>/`. Keeps the default build
 # free of the ORT toolchain and keeps cross-compilation honest.
 # ---------------------------------------------------------------------------
-ort = { version = "2.0.0-rc.12", optional = true, default-features = false, features = ["load-dynamic", "ndarray", "tracing", "api-24"] }
+ort = { version = "=2.0.0-rc.15", optional = true, default-features = false, features = ["load-dynamic", "ndarray", "tracing", "api-24"] }
 # Pure-Rust regex backend (no `onig` C dependency) so the tokenizer
 # cross-compiles to the mingw target like the rest of the workspace.
 tokenizers = { version = "0.21", optional = true, default-features = false, features = ["fancy-regex"] }
