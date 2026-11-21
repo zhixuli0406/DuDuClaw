@@ -92,33 +92,24 @@ pub async fn fetch_rev(control_url: &str, subscription_id: &str, machine_fingerp
         }))
         .send()
         .await;
-    let Ok(mut response) = response else {
+    let Ok(response) = response else {
         return RevAnswer::Transient("network");
     };
+    read_rev_response(response).await
+}
+
+/// Status + body of a probe answer, the body read through the shared
+/// bounded reader with the 4 KiB cap (declared or chunked).
+async fn read_rev_response(response: reqwest::Response) -> RevAnswer {
     let status = response.status().as_u16();
     if status != 200 {
         return parse_rev_response(status, &[]);
     }
-    if response
-        .content_length()
-        .is_some_and(|len| len > MAX_RESPONSE_BYTES as u64)
-    {
-        return RevAnswer::Transient("malformed");
+    match crate::license_transport::read_bounded(response, MAX_RESPONSE_BYTES).await {
+        Ok(bytes) => parse_rev_response(status, &bytes),
+        Err(crate::license_transport::BodyError::TooLarge) => RevAnswer::Transient("malformed"),
+        Err(crate::license_transport::BodyError::Read) => RevAnswer::Transient("network"),
     }
-    let mut bytes = Vec::new();
-    loop {
-        match response.chunk().await {
-            Ok(Some(chunk)) => {
-                if bytes.len() + chunk.len() > MAX_RESPONSE_BYTES {
-                    return RevAnswer::Transient("malformed");
-                }
-                bytes.extend_from_slice(&chunk);
-            }
-            Ok(None) => break,
-            Err(_) => return RevAnswer::Transient("network"),
-        }
-    }
-    parse_rev_response(status, &bytes)
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -131,12 +122,11 @@ struct StoredRev {
 /// another subscription, oversized, malformed or holding an invalid rev is
 /// ignored (= no rev, so the next probe syncs).
 pub fn read_stored_rev(home: &Path, subscription_id: &str) -> Option<String> {
-    let path = home.join(REV_FILENAME);
-    let meta = std::fs::metadata(&path).ok()?;
-    if !meta.is_file() || meta.len() > MAX_REV_FILE_BYTES {
+    // Internal state stays no-follow, regular-file-only and bounded.
+    let raw = duduclaw_license::storage::read_store_file_no_follow(&home.join(REV_FILENAME)).ok()??;
+    if raw.len() as u64 > MAX_REV_FILE_BYTES {
         return None;
     }
-    let raw = std::fs::read(&path).ok()?;
     let stored: StoredRev = serde_json::from_slice(&raw).ok()?;
     (stored.subscription_id == subscription_id && valid_rev(&stored.rev)).then_some(stored.rev)
 }
@@ -145,6 +135,19 @@ pub fn read_stored_rev(home: &Path, subscription_id: &str) -> Option<String> {
 /// fsync, owner-only (0600 on Unix), atomic rename — the same write style as
 /// `duduclaw_license::storage`. Only the instance-lock holder writes it.
 pub fn write_stored_rev(home: &Path, subscription_id: &str, rev: &str) -> std::io::Result<()> {
+    write_stored_rev_with(home, subscription_id, rev, |temporary, target| {
+        temporary.persist(target).map(drop).map_err(|e| e.error)
+    })
+}
+
+/// [`write_stored_rev`] with the final rename injected, so a crash between
+/// the temp write and the rename can be simulated. Until `persist` succeeds
+/// the previous file is untouched; a failed rename drops (deletes) only this
+/// writer's temporary file.
+fn write_stored_rev_with<P>(home: &Path, subscription_id: &str, rev: &str, persist: P) -> std::io::Result<()>
+where
+    P: FnOnce(tempfile::NamedTempFile, &Path) -> std::io::Result<()>,
+{
     use std::io::Write as _;
     let body = serde_json::to_vec(&StoredRev {
         subscription_id: subscription_id.to_string(),
@@ -159,7 +162,10 @@ pub fn write_stored_rev(home: &Path, subscription_id: &str, rev: &str) -> std::i
     }
     temporary.write_all(&body)?;
     temporary.as_file().sync_all()?;
-    temporary.persist(home.join(REV_FILENAME)).map_err(|e| e.error)?;
+    persist(temporary, &home.join(REV_FILENAME))?;
+    // Make the rename itself durable (best effort, as for the licence file).
+    #[cfg(unix)]
+    let _ = std::fs::File::open(home).and_then(|dir| dir.sync_all());
     Ok(())
 }
 
@@ -251,6 +257,13 @@ impl RevProbeState {
         match outcome {
             SyncOutcome::Updated | SyncOutcome::Unchanged | SyncOutcome::Revoked | SyncOutcome::PendingRebind => {
                 info!(outcome = outcome.as_str(), "license change probe triggered a license sync");
+                // Server-side assumption: once an account holder approves a
+                // pending rebind (or the licence otherwise changes), the
+                // control plane answers a NEW rev. Persisting the rev seen
+                // with `PendingRebind` relies on that. If a control plane
+                // kept the same rev across the approval, this probe would
+                // stay quiet and the approved licence would arrive only with
+                // the scheduled refresh (phone-home cadence), not sooner.
                 if let Err(error) = write_stored_rev(home, subscription_id, &rev) {
                     debug!(%error, "could not persist the license change marker; the next probe syncs again");
                 }
@@ -525,6 +538,85 @@ mod tests {
         assert_eq!(syncs.load(Ordering::SeqCst), 1);
         assert!(!state.is_unsupported());
         assert_eq!(read_stored_rev(home.path(), "sub_b").as_deref(), Some("rev-1"));
+        assert_eq!(read_stored_rev(home.path(), "sub_a"), None);
+    }
+
+    /// `fetch_rev`'s body handling (the pinned transport itself refuses
+    /// loopback, so the response is produced by a local plain-HTTP server).
+    #[tokio::test]
+    async fn rev_body_is_capped_at_four_kib_whatever_the_framing() {
+        use crate::license_transport::test_http::{chunked, get, serve_once, with_length};
+        let ok = br#"{"rev":"abc"}"#;
+        // Well-formed, both framings.
+        let url = serve_once(with_length(ok.len(), ok)).await;
+        assert_eq!(read_rev_response(get(&url).await).await, RevAnswer::Rev("abc".into()));
+        let url = serve_once(chunked(ok, 4)).await;
+        assert_eq!(read_rev_response(get(&url).await).await, RevAnswer::Rev("abc".into()));
+
+        // A valid JSON body padded to exactly the cap is still read.
+        let mut padded = br#"{"rev":"abc"}"#.to_vec();
+        padded.resize(MAX_RESPONSE_BYTES, b' ');
+        let url = serve_once(chunked(&padded, 512)).await;
+        assert_eq!(read_rev_response(get(&url).await).await, RevAnswer::Rev("abc".into()));
+
+        // Chunked past the cap: refused, never parsed.
+        let mut over = padded.clone();
+        over.push(b' ');
+        for chunk in [1, 512, MAX_RESPONSE_BYTES, 64 * 1024] {
+            let url = serve_once(chunked(&over, chunk)).await;
+            assert_eq!(read_rev_response(get(&url).await).await, RevAnswer::Transient("malformed"), "{chunk}");
+        }
+
+        // Wrong Content-Length: declared above the cap (body not even sent) …
+        let url = serve_once(with_length(MAX_RESPONSE_BYTES + 1, b"")).await;
+        assert_eq!(read_rev_response(get(&url).await).await, RevAnswer::Transient("malformed"));
+        // … declared longer than what is sent before the close …
+        let url = serve_once(with_length(ok.len() + 10, ok)).await;
+        assert_eq!(read_rev_response(get(&url).await).await, RevAnswer::Transient("network"));
+        // … declared shorter: only the declared bytes count, so a truncated
+        // document is malformed, and trailing bytes cannot pass the cap.
+        let mut trailing = ok.to_vec();
+        trailing.extend(vec![b'x'; 2 * MAX_RESPONSE_BYTES]);
+        let url = serve_once(with_length(ok.len() - 1, &trailing)).await;
+        assert_eq!(read_rev_response(get(&url).await).await, RevAnswer::Transient("malformed"));
+
+        // Non-200 statuses are classified without reading the body.
+        let url = serve_once(b"HTTP/1.1 404 Not Found\r\nContent-Length: 999999\r\n\r\n".to_vec()).await;
+        assert_eq!(read_rev_response(get(&url).await).await, RevAnswer::Unsupported);
+    }
+
+    /// The rev file is replaced atomically: a crash between the temp write
+    /// and the rename (simulated by a failing rename) leaves the old file
+    /// byte-for-byte intact and no temporary file behind.
+    #[test]
+    fn failed_rename_leaves_the_previous_rev_file_intact() {
+        let home = tempfile::tempdir().unwrap();
+        write_stored_rev(home.path(), "sub_a", "rev-1").unwrap();
+        let before = std::fs::read(home.path().join(REV_FILENAME)).unwrap();
+        let entries = std::fs::read_dir(home.path()).unwrap().count();
+        let error = write_stored_rev_with(home.path(), "sub_a", "rev-2", |temporary, _target| {
+            // The new content was fully written and flushed before the rename.
+            let written = std::fs::read(temporary.path()).unwrap();
+            assert!(String::from_utf8_lossy(&written).contains("rev-2"));
+            Err(std::io::Error::other("simulated crash before rename"))
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "simulated crash before rename");
+        assert_eq!(std::fs::read(home.path().join(REV_FILENAME)).unwrap(), before);
+        assert_eq!(read_stored_rev(home.path(), "sub_a").as_deref(), Some("rev-1"));
+        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), entries, "temporary file left behind");
+        // The real rename then replaces it.
+        write_stored_rev(home.path(), "sub_a", "rev-2").unwrap();
+        assert_eq!(read_stored_rev(home.path(), "sub_a").as_deref(), Some("rev-2"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_rev_file_is_ignored() {
+        let home = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        write_stored_rev(elsewhere.path(), "sub_a", "rev-1").unwrap();
+        std::os::unix::fs::symlink(elsewhere.path().join(REV_FILENAME), home.path().join(REV_FILENAME)).unwrap();
         assert_eq!(read_stored_rev(home.path(), "sub_a"), None);
     }
 
