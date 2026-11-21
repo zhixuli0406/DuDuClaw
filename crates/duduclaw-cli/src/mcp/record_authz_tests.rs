@@ -1027,6 +1027,7 @@ async fn agent_update_refuses_self_authority_changes() {
         ("max_turns", serde_json::json!(100)),
         ("timeout_secs", serde_json::json!(600)),
         ("reply_language", serde_json::json!("en")),
+        ("memory_language", serde_json::json!("zh-TW")),
         ("db_sources_add", serde_json::json!("crm")),
         ("role", serde_json::json!("main")),
         ("reports_to", serde_json::json!("ceo")),
@@ -1044,6 +1045,7 @@ async fn agent_update_refuses_self_authority_changes() {
         &fs::read_to_string(h.join("agents/sales-rep/agent.toml")).unwrap(),
     ).unwrap();
     assert_eq!(config.prompt.reply_language, None);
+    assert_eq!(config.memory.language, None);
     let rows = audit_rows(h, "agent_authority_refused");
     // `reports_to` to a non-subtree parent may be refused by the placement
     // gate first; the other four always reach the self-authority guard.

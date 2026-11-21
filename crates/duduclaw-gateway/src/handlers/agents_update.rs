@@ -1107,6 +1107,11 @@ impl MethodHandler {
                     .ok_or_else(|| "Invalid [prompt] section".to_string())?;
                 apply_reply_language(st, v, &mut changes)?;
             }
+            if let Some(v) = params_clone.get("memory_language").or_else(|| params_clone.get("memory").and_then(|m| m.get("language"))) {
+                let st = table.entry("memory").or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                    .as_table_mut().ok_or_else(|| "Invalid [memory] section".to_string())?;
+                apply_memory_language(st, v, &mut changes)?;
+            }
             for sect in &["prompt"] {
                 if let Some(obj) = params_clone.get(*sect).and_then(|v| v.as_object()) {
                     if obj.is_empty() {
@@ -1482,6 +1487,30 @@ fn apply_reply_language(
     Ok(())
 }
 
+fn apply_memory_language(
+    memory: &mut toml::map::Map<String, toml::Value>,
+    value: &Value,
+    changes: &mut Vec<String>,
+) -> Result<(), String> {
+    let s = value
+        .as_str()
+        .map(str::trim)
+        .ok_or_else(|| "language must be a string".to_string())?;
+    if s.is_empty() {
+        memory.remove("language");
+        changes.push("memory.language cleared".into());
+    } else if duduclaw_core::profile_sections::is_valid_reply_language(s) {
+        memory.insert("language".into(), toml::Value::String(s.into()));
+        changes.push(format!("memory.language = \"{s}\""));
+    } else {
+        return Err(format!(
+            "Invalid language '{s}'. Valid: {} (empty = inherit the global setting)",
+            duduclaw_core::profile_sections::REPLY_LANGUAGE_CHOICES.join(", ")
+        ));
+    }
+    Ok(())
+}
+
 impl MethodHandler {
     /// Rename sync for one profile file through the writer (source
     /// `rename`, no AI review). `Ok(false)` when the file is absent or the
@@ -1534,4 +1563,23 @@ fn requested_org_mirror(before: &duduclaw_core::OrgEntry, params: &Value) -> dud
         params.get("reports_to").and_then(Value::as_str).unwrap_or(before.reports_to.as_str()),
         params.get("department").and_then(Value::as_str).unwrap_or(before.department.as_str()),
     )
+}
+
+#[cfg(test)]
+mod memory_language_writer_tests {
+    use super::*;
+    #[test]
+    fn employee_memory_language_writer_validates_choices() {
+        let mut table = toml::Table::new();
+        let mut changes = Vec::new();
+        for code in duduclaw_core::profile_sections::REPLY_LANGUAGE_CHOICES {
+            apply_memory_language(&mut table, &json!(code), &mut changes).unwrap();
+            assert_eq!(table.get("language").and_then(|v| v.as_str()), Some(*code));
+        }
+        for value in [json!("invalid"), json!(42), json!({})] {
+            assert!(apply_memory_language(&mut table, &value, &mut changes).is_err());
+        }
+        apply_memory_language(&mut table, &json!(""), &mut changes).unwrap();
+        assert!(!table.contains_key("language"));
+    }
 }

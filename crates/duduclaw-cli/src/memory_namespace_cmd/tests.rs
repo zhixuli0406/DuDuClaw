@@ -243,3 +243,19 @@ async fn assign_skips_rows_the_injection_scan_flags() {
         .unwrap();
     assert!(forced.contains("仍搬移"), "{forced}");
 }
+
+#[test]
+fn convert_script_cli_requires_one_selector_and_supports_preview_and_yes() {
+    use clap::Parser;
+    #[derive(Parser)]
+    struct Args {
+        #[command(subcommand)]
+        command: MemoryCommands,
+    }
+    assert!(Args::try_parse_from(["memory", "convert-script"]).is_err());
+    assert!(Args::try_parse_from(["memory", "convert-script", "--all", "--agent", "a"]).is_err());
+    let args = Args::try_parse_from(["memory", "convert-script", "--agent", "a", "--dry-run"]).unwrap();
+    assert!(matches!(args.command, MemoryCommands::ConvertScript { agent: Some(_), all: false, dry_run: true, yes: false }));
+    let args = Args::try_parse_from(["memory", "convert-script", "--all", "--yes"]).unwrap();
+    assert!(matches!(args.command, MemoryCommands::ConvertScript { agent: None, all: true, dry_run: false, yes: true }));
+}

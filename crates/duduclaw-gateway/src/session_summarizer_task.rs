@@ -16,7 +16,7 @@ use tracing::{debug, info, warn};
 use crate::prompt_compression::{partition_turns_for_summary};
 use crate::session::SessionManager;
 use crate::session_summarizer::{
-    SummarizeDecision, SummarizeParams, decide_summarization, format_summarization_prompt,
+    SummarizeDecision, SummarizeParams, decide_summarization,
 };
 
 /// How often the task wakes up.
@@ -183,10 +183,11 @@ async fn summarize_one(
         return Err(SummaryFailure::EmptyInput);
     }
 
+    let agent_id = session_manager.session_agent(session_id).await
+        .map_err(|_| SummaryFailure::ReadState)?;
+    let memory_language = crate::prompt_identity::resolve_memory_language_for_id(home_dir, agent_id.as_deref().unwrap_or("")).await;
     let summary = if has_unprotected_text {
-        let prompt = format_summarization_prompt(&transcript);
-        let agent_id = session_manager.session_agent(session_id).await
-            .map_err(|_| SummaryFailure::ReadState)?;
+        let prompt = crate::session_summarizer::format_summarization_prompt_with_language(&transcript, memory_language.as_deref());
         let agent_dir = crate::runtime_config::session_agent_dir(home_dir, agent_id.as_deref())
             .map_err(|_| SummaryFailure::ReadState)?;
         let agent_id = agent_dir.as_ref().and(agent_id.as_deref()).unwrap_or("");
@@ -205,6 +206,7 @@ async fn summarize_one(
         String::new()
     };
 
+    let summary = crate::prompt_identity::align_memory_script(&summary, memory_language.as_deref(), &transcript);
     let trimmed = if has_unprotected_text {
         crate::session_summarizer::validate_summary_output(&summary)?
     } else { "" };
@@ -550,7 +552,7 @@ mod tests {
         assert!(has_visible);
         assert!(transcript.contains("user: Question before"));
         assert!(transcript.contains("assistant: A separate reply"));
-        let prompt = format_summarization_prompt(&transcript);
+        let prompt = crate::session_summarizer::format_summarization_prompt(&transcript);
         assert!(!prompt.contains("secret constraint"));
         assert!(!prompt.contains("private audience"));
         assert!(protected.contains(&format!("## 約束\n{m}\n- secret constraint\n")));

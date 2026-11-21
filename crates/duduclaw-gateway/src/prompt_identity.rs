@@ -123,9 +123,96 @@ pub async fn resolve_fixed_message_language_for_id(home_dir: &Path, agent_id: &s
     resolve_reply_language_for_id(home_dir, agent_id).await.or(read_default_language(home_dir).await)
 }
 
+fn valid_memory_language(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|v| *v != "auto" && duduclaw_core::profile_sections::is_valid_reply_language(v))
+}
+
+/// Employee memory override, global memory override, then effective fixed-message language.
+pub async fn resolve_memory_language(home: &Path, agent: &duduclaw_core::types::AgentConfig) -> Option<String> {
+    let global = read_memory_language(home).await;
+    valid_memory_language(agent.memory.language.as_deref()).map(str::to_string)
+        .or(global).or(resolve_fixed_message_language(home, agent).await.filter(|v| valid_memory_language(Some(v)).is_some()))
+}
+
+async fn read_memory_language(home: &Path) -> Option<String> {
+    let text = tokio::fs::read_to_string(home.join("config.toml")).await.ok()?;
+    let table: toml::Table = text.parse().ok()?;
+    valid_memory_language(table.get("memory")?.get("language")?.as_str()).map(str::to_string)
+}
+
+pub async fn resolve_memory_language_for_id(home: &Path, id: &str) -> Option<String> {
+    let safe = !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    let employee = if safe {
+        tokio::fs::read_to_string(home.join("agents").join(id).join("agent.toml")).await.ok()
+            .and_then(|s| s.parse::<toml::Table>().ok())
+            .and_then(|t| t.get("memory")?.get("language")?.as_str().map(str::to_string))
+    } else { None };
+    valid_memory_language(employee.as_deref()).map(str::to_string)
+        .or(read_memory_language(home).await)
+        .or(resolve_fixed_message_language_for_id(home, id).await.filter(|v| valid_memory_language(Some(v)).is_some()))
+}
+
+/// Unconfigured utilities follow the conversation, pinning Traditional script when detected.
+pub fn memory_prompt_language(language: Option<&str>, input: &str) -> &'static str {
+    let language = valid_memory_language(language);
+    let code = language.or_else(|| {
+        (duduclaw_core::dominant_variant(input) == duduclaw_core::ChineseVariant::Traditional).then_some("zh-TW")
+    });
+    code.map(duduclaw_core::profile_sections::memory_language_instruction)
+        .unwrap_or("Same language as input. Use the main language of the conversation.")
+}
+
+/// Apply only to generated prose, never to structured keys or verbatim source sections.
+pub fn align_memory_script(output: &str, language: Option<&str>, input: &str) -> String {
+    if valid_memory_language(language) == Some("zh-TW")
+        || (valid_memory_language(language).is_none()
+            && duduclaw_core::dominant_variant(input) == duduclaw_core::ChineseVariant::Traditional) {
+        duduclaw_core::to_traditional(output)
+    } else { output.to_string() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn memory_language_resolution_order_table() {
+        for (employee, global, reply, default, expected) in [
+            (Some("zh-TW"), Some("en"), Some("ja-JP"), Some("zh-CN"), Some("zh-TW")),
+            (Some("auto"), Some("en"), Some("ja-JP"), None, Some("en")),
+            (Some("invalid"), Some("en"), None, None, Some("en")),
+            (None, Some("auto"), Some("ja-JP"), Some("en"), Some("ja-JP")),
+            (None, Some("invalid"), Some("auto"), Some("en"), Some("en")),
+            (None, None, None, None, None),
+            (Some("auto"), Some("auto"), Some("auto"), None, None),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut global_table = toml::Table::new();
+            if let Some(v) = global { global_table.insert("memory".into(), toml::Value::Table([("language".into(), toml::Value::String(v.into()))].into_iter().collect())); }
+            if let Some(v) = default { global_table.insert("general".into(), toml::Value::Table([("default_language".into(), toml::Value::String(v.into()))].into_iter().collect())); }
+            std::fs::write(dir.path().join("config.toml"), toml::to_string(&global_table).unwrap()).unwrap();
+            let mut cfg: duduclaw_core::types::AgentConfig = toml::from_str(MIN_AGENT_TOML).unwrap();
+            cfg.memory.language = employee.map(str::to_string);
+            cfg.prompt.reply_language = reply.map(str::to_string);
+            write_agent(dir.path(), "a1", &toml::to_string(&cfg).unwrap());
+            assert_eq!(resolve_memory_language(dir.path(), &cfg).await.as_deref(), expected);
+            assert_eq!(resolve_memory_language_for_id(dir.path(), "a1").await.as_deref(), expected);
+        }
+    }
+
+    #[test]
+    fn memory_script_alignment_respects_explicit_language() {
+        let simplified = "用户记忆与档案";
+        let traditional = "用戶記憶與檔案";
+        assert_eq!(align_memory_script(simplified, Some("zh-TW"), "input"), traditional);
+        assert_eq!(align_memory_script(simplified, None, traditional), traditional);
+        for code in ["zh-CN", "en", "ja-JP"] {
+            assert_eq!(align_memory_script(simplified, Some(code), traditional), simplified);
+        }
+        assert_eq!(align_memory_script(simplified, None, "English"), simplified);
+        assert!(memory_prompt_language(None, "English").contains("Same language as input."));
+        assert!(memory_prompt_language(None, traditional).contains("Never use Simplified"));
+    }
 
     fn write_global(dir: &Path, lang: &str) {
         std::fs::write(

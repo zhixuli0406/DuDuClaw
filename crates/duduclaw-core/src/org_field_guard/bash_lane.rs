@@ -277,10 +277,10 @@ pub(super) fn bash_name_rules(normalized: &str, home: &Path, caller: &HookCaller
 
 /// Operator-only memory subcommands (P2-B C-1): an employee must not run
 /// them through Bash, not even the read-only `list`.
-const OPERATOR_MEMORY_SUBCOMMANDS: &[&str] = &["forget-source", "migrate-namespace"];
+const OPERATOR_MEMORY_SUBCOMMANDS: &[&str] = &["forget-source", "migrate-namespace", "convert-script"];
 
 /// Refuses `duduclaw` / `duduclaw-pro` `memory forget-source …` and
-/// `memory migrate-namespace …` for agent and untrusted callers. `normalized`
+/// `memory migrate-namespace …` / `memory convert-script …` for agent and untrusted callers. `normalized`
 /// is the lower-cased command. A speed bump like the rest of the lane (a
 /// renamed binary or a computed command word evades it); the dashboard
 /// approval in front of `apply` is the real gate.

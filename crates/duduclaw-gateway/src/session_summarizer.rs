@@ -442,6 +442,11 @@ pub fn summary_attempt_finished(home: &std::path::Path, session: &str, lane: &st
 /// Protected text is partitioned by the caller; ordinary transcript text is
 /// escaped and explicitly wrapped as untrusted data.
 pub fn format_summarization_prompt(turns_text: &str) -> String {
+    format_summarization_prompt_with_language(turns_text, None)
+}
+
+pub fn format_summarization_prompt_with_language(turns_text: &str, language: Option<&str>) -> String {
+    let language_rule = crate::prompt_identity::memory_prompt_language(language, turns_text);
     let escaped = turns_text.replace('<', "&lt;").replace('>', "&gt;");
     let turns_text = cap_summary_input(&escaped, SUMMARY_INPUT_MAX_BYTES - 1024);
     format!(
@@ -457,6 +462,7 @@ pub fn format_summarization_prompt(turns_text: &str) -> String {
          Do not invent details. Be terse — aim for under 500 characters. \
          Output format: dash-prefixed bullets only, no preamble or epilogue.\n\
          \n\
+         {language_rule}\n\
          === TRANSCRIPT ===\n<transcript_data>\n{turns_text}\n</transcript_data>\n=== END ===\n\
          \n\
          Bullets:"
@@ -851,6 +857,9 @@ mod tests {
 
     #[test]
     fn summarization_prompt_includes_required_anchors() {
+        let pinned = format_summarization_prompt_with_language("input", Some("zh-TW"));
+        assert!(pinned.contains(duduclaw_core::profile_sections::memory_language_instruction("zh-TW")));
+        assert!(format_summarization_prompt("English").contains("Same language as input."));
         let prompt = format_summarization_prompt("user: hi\nassistant: hello");
         assert!(prompt.contains("Bullets:"));
         assert!(prompt.contains("=== TRANSCRIPT ==="));

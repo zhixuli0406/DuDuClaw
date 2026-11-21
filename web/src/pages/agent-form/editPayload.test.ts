@@ -88,6 +88,18 @@ describe('buildUpdatePayload — only dirty fields are sent', () => {
     }
   });
 
+  it('sends memory language only when edited and requires admin', () => {
+    const s = state({ form: { memory_language: 'zh-TW' } });
+    expect(buildUpdatePayload(s, new Set(), CTX).payload).toEqual({});
+    expect(buildUpdatePayload(s, new Set(['form.memory_language']), CTX).payload).toEqual({ memory_language: 'zh-TW' });
+    expect(isAdminOnlyPath('form.memory_language')).toBe(true);
+    for (const locale of [en, zhTW, jaJP]) {
+      for (const key of ['settings.general.memoryLanguage', 'settings.general.memoryLanguage.help', 'settings.general.memoryLanguage.auto']) {
+        expect((locale as Record<string, string>)[key]).toBeTruthy();
+      }
+    }
+  });
+
   it('sends the per-employee reply language only when edited ("" clears = inherit global)', () => {
     const s = state({ form: { reply_language: 'zh-TW' } });
     expect(buildUpdatePayload(s, new Set(), CTX).payload).toEqual({});

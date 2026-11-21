@@ -4678,6 +4678,9 @@ impl Default for PromptConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
 pub struct MemoryConfig {
+    /// Language for automatically generated memories; auto inherits the next level.
+    #[serde(default, deserialize_with = "crate::lenient::opt", skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
     // ── Formerly-untyped `[memory]` keys (R2 unification) ───────────────
     //
     // These ARE consumed at runtime (RFC-24 decision continuity); they were
@@ -4700,6 +4703,7 @@ pub struct MemoryConfig {
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
+            language: None,
             decision_continuity: None,
             decision_ttl_days: None,
         }

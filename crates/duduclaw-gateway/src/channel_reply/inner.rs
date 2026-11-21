@@ -2808,10 +2808,12 @@ async fn build_reply_with_session_inner_impl(
             // No generation (`None`) ⇒ "" never matches ⇒ not written.
             let pin_generation = turn_generation.clone().unwrap_or_default();
             tokio::spawn(async move {
+                let memory_language = crate::prompt_identity::resolve_memory_language_for_id(&home, &agent_for_pin).await;
+                let language_rule = crate::prompt_identity::memory_prompt_language(memory_language.as_deref(), &user_text);
                 let prompt = format!(
                     "Extract the core task instructions from this user message. \
                      Output a concise bullet list of: goals, constraints, parameters, \
-                     and deliverables. Max 200 words. Use the same language as the input.\n\n\
+                     and deliverables. Max 200 words. {language_rule}\n\n\
                      {user_text}"
                 );
                 match crate::autonomous_runtime::scope(
@@ -2823,6 +2825,7 @@ async fn build_reply_with_session_inner_impl(
                 .await
                 {
                     Ok(extracted) => {
+                        let extracted = crate::prompt_identity::align_memory_script(&extracted, memory_language.as_deref(), &user_text);
                         match sm.set_pinned_if_unchanged(&sid, &extracted, &pin_generation).await {
                             Err(e) => {
                                 warn!(session_id = %sid, error = %e, "Failed to save pinned instructions");
@@ -2865,12 +2868,15 @@ async fn build_reply_with_session_inner_impl(
                         debug!("key-fact extraction skipped: turn has no recorded source");
                         return;
                     };
+                    let memory_language = crate::prompt_identity::resolve_memory_language_for_id(&home_for_facts, &agent_id_for_facts).await;
+                    let language_input = format!("{user_text_for_facts}\n{reply_snippet}");
+                    let language_rule = crate::prompt_identity::memory_prompt_language(memory_language.as_deref(), &language_input);
                     let prompt = format!(
                         "Extract 2-4 key factual insights from this conversation turn \
                          that would be useful in FUTURE conversations with this user. \
                          Focus on: user preferences, confirmed decisions, domain rules, \
                          technical constraints. Output bullet points only. Max 100 words. \
-                         Same language as input.\n\n\
+                         {language_rule}\n\n\
                          User: {user_text_for_facts}\n\
                          Assistant: {reply_snippet}"
                     );
@@ -2889,6 +2895,7 @@ async fn build_reply_with_session_inner_impl(
                         }
                     };
 
+                    let facts_text = crate::prompt_identity::align_memory_script(&facts_text, memory_language.as_deref(), &language_input);
                     // Store facts in spawn_blocking (SqliteMemoryEngine is !Send)
                     let agent_for_activity = agent_id_for_facts.clone();
                     let home_for_fact_store = home_for_facts.clone();
@@ -4057,7 +4064,8 @@ async fn build_reply_with_session_inner_impl(
                     &sid, &snapshot.messages, &snapshot.rolling_summary, snapshot.summarized_through_turn);
                 let (transcript, protected, has_unprotected) =
                     crate::prompt_compression::partition_turns_for_summary(&turns);
-                let prompt = crate::session_summarizer::format_summarization_prompt(&transcript);
+                let memory_language = crate::prompt_identity::resolve_memory_language_for_id(&home_for_compress, &agent_for_compress).await;
+                let prompt = crate::session_summarizer::format_summarization_prompt_with_language(&transcript, memory_language.as_deref());
                 // Read the denial flag inside the scope: non-Claude runtimes
                 // wrap the refusal text, so the prefix alone can miss a pause
                 // that lands between the context check and spawn/send.
@@ -4089,6 +4097,7 @@ async fn build_reply_with_session_inner_impl(
                         return;
                     }
                 }
+                let summary = crate::prompt_identity::align_memory_script(&summary, memory_language.as_deref(), &transcript);
                 let protected = crate::session_summarizer_task::cap_protected_for_summary(&protected);
                 let summary = if protected.is_empty() { summary } else {
                     format!("{summary}\n[verbatim protected sections]\n{protected}")
@@ -4714,6 +4723,16 @@ mod released_repro_source_tests {
             }
         }
     }"#);
+    }
+
+    #[test]
+    fn auto_memory_prompts_use_resolved_language_rule() {
+        let source = shipped_source();
+        assert!(source.contains("Max 200 words. {language_rule}"));
+        assert!(source.contains("                         {language_rule}\\n\\n\\"));
+        let rule = crate::prompt_identity::memory_prompt_language(Some("zh-TW"), "input");
+        assert!(rule.contains("Traditional Chinese as used in Taiwan"));
+        assert!(crate::prompt_identity::memory_prompt_language(None, "input").contains("Same language as input."));
     }
 
     #[test]

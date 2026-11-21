@@ -11611,5 +11611,8 @@
   "mcp.runtime.inProcess": "In-process tool loop",
   "mcp.agentTomlNote": "Read-only. Claude, Codex and Grok do not use this configuration.",
   "mcp.probe.saved": "Saved {server} for {agent}. Start probe:",
-  "mcp.probe.tools": "{count} tools"
+  "mcp.probe.tools": "{count} tools",
+  "settings.general.memoryLanguage": "Memory language",
+  "settings.general.memoryLanguage.help": "Automatically extracted facts, conversation memories and summaries use this language. Select “Follow reply language” to use the reply language above.",
+  "settings.general.memoryLanguage.auto": "Follow reply language"
 }

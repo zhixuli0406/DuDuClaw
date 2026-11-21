@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { screen, fireEvent, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { renderWithProviders } from '@/test/render';
 
 const configMock = vi.fn();
@@ -69,5 +70,26 @@ describe('<GeneralTab> v1.68', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Save' }));
     await new Promise((r) => setTimeout(r, 20));
     expect(updateConfigMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('<GeneralTab> memory language (RM-178)', () => {
+  it('loads the memory language and saves only the changed memory key', async () => {
+    const user = userEvent.setup();
+    useAuthStore.setState({ user: { id: 'admin', role: 'admin' } } as never);
+    configMock.mockResolvedValue({ config: '[general]\ndefault_language = "en"\n[memory]\nlanguage = "zh-TW"\n' });
+    renderWithProviders(<GeneralTab />);
+    const select = await screen.findByRole('combobox', { name: 'Memory language' });
+    await waitFor(() => expect(select).toHaveTextContent('Traditional Chinese'));
+    await user.click(select);
+    await user.click(await screen.findByRole('option', { name: 'Follow reply language' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(updateConfigMock).toHaveBeenCalledWith({ memory: { language: 'auto' } }));
+  });
+
+  it('disables memory language for non-admins', async () => {
+    configMock.mockResolvedValue({ config: '' });
+    renderWithProviders(<GeneralTab />);
+    expect(await screen.findByRole('combobox', { name: 'Memory language' })).toBeDisabled();
   });
 });

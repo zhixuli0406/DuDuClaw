@@ -675,7 +675,11 @@ fn extract_entities_heuristic(text: &str) -> Vec<(String, String)> {
 /// Only entity mentions become facts — general conversational content is left
 /// to the P2 Key-Fact Accumulator and the session store, so the Local tier
 /// never re-creates a conversation log inside semantic memory.
-pub fn extract_local_facts(user_text: &str, _assistant_reply: &str) -> Vec<DistilledFact> {
+pub fn extract_local_facts(user_text: &str, assistant_reply: &str) -> Vec<DistilledFact> {
+    extract_local_facts_with_language(user_text, assistant_reply, None)
+}
+
+pub fn extract_local_facts_with_language(user_text: &str, _assistant_reply: &str, language: Option<&str>) -> Vec<DistilledFact> {
     let date = Utc::now().format("%Y-%m-%d").to_string();
     let snippet = truncate_chars(user_text.trim(), 120);
 
@@ -685,9 +689,11 @@ pub fn extract_local_facts(user_text: &str, _assistant_reply: &str) -> Vec<Disti
             subject: Some(format!("{entity_type}:{entity_name}")),
             predicate: Some("mentioned_in_conversation".to_string()),
             object: Some(date.clone()),
-            content: format!(
-                "{entity_name} ({entity_type}) was mentioned in a conversation on {date}: {snippet}"
-            ),
+            content: if language == Some("zh-TW") {
+                format!("{date} 的對話提到 {entity_name}（{entity_type}）：{snippet}")
+            } else {
+                format!("{entity_name} ({entity_type}) was mentioned in a conversation on {date}: {snippet}")
+            },
             confidence: Some(0.4),
         })
         .collect()
@@ -710,6 +716,17 @@ pub fn build_cloud_ingest_prompt_with_privacy(
     assistant_reply: &str,
     privacy_line: Option<&str>,
 ) -> String {
+    build_cloud_ingest_prompt_with_privacy_and_language(user_text, assistant_reply, privacy_line, None)
+}
+
+pub fn build_cloud_ingest_prompt_with_privacy_and_language(
+    user_text: &str,
+    assistant_reply: &str,
+    privacy_line: Option<&str>,
+    language: Option<&str>,
+) -> String {
+    let input = format!("{user_text}\n{assistant_reply}");
+    let language_rule = crate::prompt_identity::memory_prompt_language(language, &input);
     // Case-insensitive XML tag escape to prevent prompt injection
     // Handles Unicode case folding; see `crate::xml_fence`.
     use crate::xml_fence::escape_xml_tag;
@@ -728,6 +745,7 @@ pub fn build_cloud_ingest_prompt_with_privacy(
          Extract only knowledge that stays true beyond this conversation \
          (preferences, decisions, domain rules, entity attributes). Skip \
          small talk, one-off details, and anything already restated verbatim.\n\n\
+         {language_rule}\n\n\
          {privacy}For each fact:\n\
          - content (required): one standalone sentence stating the fact.\n\
          - subject / predicate / object (optional): include ALL THREE only when \
@@ -903,6 +921,17 @@ pub fn build_cloud_ingest_prompt_with_knowledge_and_privacy(
     assistant_reply: &str,
     privacy_line: Option<&str>,
 ) -> String {
+    build_cloud_ingest_prompt_with_knowledge_and_privacy_and_language(user_text, assistant_reply, privacy_line, None)
+}
+
+pub fn build_cloud_ingest_prompt_with_knowledge_and_privacy_and_language(
+    user_text: &str,
+    assistant_reply: &str,
+    privacy_line: Option<&str>,
+    language: Option<&str>,
+) -> String {
+    let input = format!("{user_text}\n{assistant_reply}");
+    let language_rule = crate::prompt_identity::memory_prompt_language(language, &input);
     use crate::xml_fence::escape_xml_tag;
     let safe_user = escape_xml_tag(user_text, "user");
     let safe_assistant = escape_xml_tag(assistant_reply, "assistant");
@@ -920,6 +949,7 @@ pub fn build_cloud_ingest_prompt_with_knowledge_and_privacy(
          Extract only knowledge that stays true beyond this conversation \
          (preferences, decisions, domain rules, entity attributes). Skip \
          small talk, one-off details, and anything already restated verbatim.\n\
+         {language_rule}\n\n\
          {privacy}For each fact:\n\
          - content (required): one standalone sentence stating the fact.\n\
          - subject / predicate / object (optional): include ALL THREE only when \
@@ -933,7 +963,7 @@ pub fn build_cloud_ingest_prompt_with_knowledge_and_privacy(
          personal preferences and time-bound requests are NOT.\n\
          - knowledge_grade: true / false.\n\
          - doc_type: one of charter | sop | spec | policy | reference.\n\
-         - page_title: a short human title in the document's own language \
+         - page_title: a short human title in the output language \
          (<= 40 characters, no punctuation-only titles).\n\
          - page_slug: lowercase ASCII, digits and hyphens only, \
          <= 64 characters, must start with a letter or digit \
@@ -1085,14 +1115,17 @@ async fn run_knowledge_branch(
         return KnowledgeBranch::Fallback(None);
     }
 
+    let memory_language = crate::prompt_identity::resolve_memory_language_for_id(home_dir, agent_id).await;
+    let language_input = format!("{user_text}\n{assistant_reply}");
     let response = match utility_override {
         Some(r) => r,
         None => {
             let privacy = crate::memory_privacy::prompt_line(home_dir);
-            let prompt = build_cloud_ingest_prompt_with_knowledge_and_privacy(
+            let prompt = build_cloud_ingest_prompt_with_knowledge_and_privacy_and_language(
                 user_text,
                 assistant_reply,
                 privacy.as_deref(),
+                memory_language.as_deref(),
             );
             let agent_dir = home_dir.join("agents").join(agent_id);
             crate::runtime_dispatch::run_utility_prompt(
@@ -1182,12 +1215,14 @@ async fn run_knowledge_branch(
         .page_title
         .clone()
         .unwrap_or_else(|| kr::derive_title_from_text(user_text));
+    let title = crate::prompt_identity::align_memory_script(&title, memory_language.as_deref(), &language_input);
     let slug = kr::resolve_slug(doc_type, k.page_slug.as_deref(), &title);
     let summary = k
         .summary
         .clone()
         .unwrap_or_else(|| truncate_chars(user_text.trim(), 200));
 
+    let summary = crate::prompt_identity::align_memory_script(&summary, memory_language.as_deref(), &language_input);
     let req = AutoPageRequest {
         doc_type,
         title: title.clone(),
@@ -1706,6 +1741,8 @@ async fn run_ingest_inner(
         }
     }
 
+    let memory_language = crate::prompt_identity::resolve_memory_language_for_id(home_dir, agent_id).await;
+    let language_input = format!("{user_text}\n{assistant_reply}");
     // Reuse the facts the knowledge branch already paid for, rather than
     // making a second utility call for the same turn.
     if let Some(facts) = pre_extracted {
@@ -1718,7 +1755,7 @@ async fn run_ingest_inner(
             );
             return;
         }
-        persist_facts(agent_id, home_dir, memory_db, facts, sources).await;
+        persist_facts(agent_id, home_dir, memory_db, align_distilled_facts(facts, memory_language.as_deref(), &language_input), sources).await;
         return;
     }
 
@@ -1734,15 +1771,16 @@ async fn run_ingest_inner(
         }
         IngestTier::Local => {
             info!(agent = agent_id, "Conversation distill: local extraction");
-            extract_local_facts(user_text, assistant_reply)
+            extract_local_facts_with_language(user_text, assistant_reply, memory_language.as_deref())
         }
         IngestTier::Cloud => {
             info!(agent = agent_id, "Conversation distill: cloud extraction");
             let privacy = crate::memory_privacy::prompt_line(home_dir);
-            let prompt = build_cloud_ingest_prompt_with_privacy(
+            let prompt = build_cloud_ingest_prompt_with_privacy_and_language(
                 user_text,
                 assistant_reply,
                 privacy.as_deref(),
+                memory_language.as_deref(),
             );
 
             // Utility dispatch (RFC-25 N2): this agent's `[runtime] provider` +
@@ -1769,7 +1807,7 @@ async fn run_ingest_inner(
                         "Conversation distill: cloud extraction failed: {e}"
                     );
                     // Fallback to local extraction
-                    extract_local_facts(user_text, assistant_reply)
+                    extract_local_facts_with_language(user_text, assistant_reply, memory_language.as_deref())
                 }
             }
         }
@@ -1780,7 +1818,14 @@ async fn run_ingest_inner(
         return;
     }
 
-    persist_facts(agent_id, home_dir, memory_db, facts, sources).await;
+    persist_facts(agent_id, home_dir, memory_db, align_distilled_facts(facts, memory_language.as_deref(), &language_input), sources).await;
+}
+
+fn align_distilled_facts(mut facts: Vec<DistilledFact>, language: Option<&str>, input: &str) -> Vec<DistilledFact> {
+    for fact in &mut facts {
+        fact.content = crate::prompt_identity::align_memory_script(&fact.content, language, input);
+    }
+    facts
 }
 
 /// D2: what the write-side guard did to one `(origin, subject)` group.

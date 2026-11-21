@@ -11611,5 +11611,8 @@
   "mcp.runtime.inProcess": "內建工具迴圈",
   "mcp.agentTomlNote": "唯讀。Claude、Codex 與 Grok 不使用這份設定。",
   "mcp.probe.saved": "已為 {agent} 儲存 {server}。啟動檢查：",
-  "mcp.probe.tools": "{count} 個工具"
+  "mcp.probe.tools": "{count} 個工具",
+  "settings.general.memoryLanguage": "記憶語言",
+  "settings.general.memoryLanguage.help": "系統自動整理的重點事實、對話記憶與摘要會用這個語言書寫。選『跟隨回覆語言』時沿用上方的回覆語言。",
+  "settings.general.memoryLanguage.auto": "跟隨回覆語言"
 }
