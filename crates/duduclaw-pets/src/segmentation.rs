@@ -186,7 +186,7 @@ mod onnx_impl {
 
     /// Local ONNX-based background remover.
     pub struct OnnxRemover {
-        // ort 2.0.0-rc.12's `Session::run` takes `&mut self`; the
+        // ort 2.0.0-rc.15's `Session::run` takes `&mut self`; the
         // `BackgroundRemover` trait is `&self`, so guard with a Mutex.
         session: std::sync::Mutex<Session>,
         input_size: u32,
@@ -197,8 +197,7 @@ mod onnx_impl {
         /// Load a model from `~/.duduclaw/models/`. Errors (with the download URL)
         /// when the file is missing so the caller can prompt/download.
         pub fn load(spec: &ModelSpec) -> Result<Self> {
-            // This desktop-only loader has no pinned runtime init path. Refuse
-            // before any ort API can fall back to ORT_DYLIB_PATH or dlopen search.
+            // Refuse in-process models beside a protected root key.
             if duduclaw_core::root_key::is_held() {
                 return Err(PetError::Inference(
                     "獨立金鑰模式不允許未經安全初始化的 ONNX 去背模型".into(),
@@ -216,7 +215,11 @@ mod onnx_impl {
             let threads = std::thread::available_parallelism()
                 .map(|n| n.get().min(4))
                 .unwrap_or(2);
-            let session = Session::builder()
+            let ort_root = duduclaw_onnx::manifest::ort_lib_root_under_home(&duduclaw_core::duduclaw_home());
+            let lib_path = duduclaw_onnx::manifest::ort_lib_path(&ort_root)
+                .ok_or_else(|| "這個平台沒有可用的 ONNX Runtime".to_string()).map_err(PetError::Inference)?;
+            duduclaw_onnx::runtime::init_ort(&lib_path).map_err(PetError::Inference)?;
+            let session = duduclaw_onnx::runtime::session_builder()
                 .map_err(|e| PetError::Inference(format!("session builder: {e}")))?
                 .with_optimization_level(GraphOptimizationLevel::Level3)
                 .map_err(|e| PetError::Inference(format!("optimization: {e}")))?

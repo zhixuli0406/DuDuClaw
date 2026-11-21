@@ -4,7 +4,7 @@
 //! SHA-256. There is no "latest" resolution at runtime: a version bump is a
 //! code change that goes through review.
 //!
-//! The version matches what `ort-sys 2.0.0-rc.12` targets (1.24.2). We
+//! The native version remains 1.24.2 with the binding's `api-24` feature. We
 //! extract exactly one member (the versioned shared library) out of each
 //! Microsoft release archive.
 //!
@@ -13,10 +13,8 @@
 
 use std::path::{Path, PathBuf};
 
-/// ONNX Runtime version. Must match what `ort-sys 2.0.0-rc.12` targets —
-/// its own crate description says "ONNX Runtime 1.24" and its bundled
-/// `dist.txt` pins `ms@1.24.2`. Loading a mismatched major/minor through
-/// `load-dynamic` is how you get an ABI crash instead of an error.
+/// ONNX Runtime version, retained for existing installations and offline bundles.
+/// The rc.15 binding uses the compatible `api-24` interface.
 pub const ORT_VERSION: &str = "1.24.2";
 
 /// Archive container format.
@@ -38,7 +36,18 @@ impl ArchiveKind {
     }
 }
 
-/// A pinned ONNX Runtime release archive plus the one member we keep.
+/// A pinned download source and the single member allowed to be extracted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrtSource {
+    pub url: &'static str,
+    pub size: u64,
+    pub sha256: &'static str,
+    pub kind: ArchiveKind,
+    pub member: &'static str,
+}
+
+/// A target's primary archive plus official fallback sources.
+/// Primary fields retain the offline bundle format used by older importers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OrtArchive {
     /// Rust target triple this archive serves.
@@ -58,6 +67,17 @@ pub struct OrtArchive {
     /// File name written under `<home>/lib/onnxruntime/<ver>/`. This is what
     /// `ort::init_from` is pointed at.
     pub lib_file: &'static str,
+    pub fallbacks: &'static [OrtSource],
+}
+
+impl OrtArchive {
+    /// Ordered sources: the smaller GitHub archive, then the official NuGet package.
+    pub fn sources(&self) -> impl Iterator<Item = OrtSource> + '_ {
+        std::iter::once(OrtSource {
+            url: self.url, size: self.size, sha256: self.sha256,
+            kind: self.kind, member: self.member,
+        }).chain(self.fallbacks.iter().copied())
+    }
 }
 
 /// Every platform we can install ONNX Runtime for.
@@ -76,6 +96,13 @@ pub const ORT_ARCHIVES: &[OrtArchive] = &[
         kind: ArchiveKind::TarGz,
         member: "onnxruntime-osx-arm64-1.24.2/lib/libonnxruntime.1.24.2.dylib",
         lib_file: "libonnxruntime.dylib",
+        fallbacks: &[OrtSource {
+            url: "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.24.2/microsoft.ml.onnxruntime.1.24.2.nupkg",
+            size: 124_756_536,
+            sha256: "782564d3d68e87269ea1812cc94710ad06fe014faf093f01a6f89d0bd58719d3",
+            kind: ArchiveKind::Zip,
+            member: "runtimes/osx-arm64/native/libonnxruntime.dylib",
+        }],
     },
     OrtArchive {
         target: "x86_64-unknown-linux-gnu",
@@ -85,6 +112,13 @@ pub const ORT_ARCHIVES: &[OrtArchive] = &[
         kind: ArchiveKind::TarGz,
         member: "onnxruntime-linux-x64-1.24.2/lib/libonnxruntime.so.1.24.2",
         lib_file: "libonnxruntime.so",
+        fallbacks: &[OrtSource {
+            url: "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.24.2/microsoft.ml.onnxruntime.1.24.2.nupkg",
+            size: 124_756_536,
+            sha256: "782564d3d68e87269ea1812cc94710ad06fe014faf093f01a6f89d0bd58719d3",
+            kind: ArchiveKind::Zip,
+            member: "runtimes/linux-x64/native/libonnxruntime.so",
+        }],
     },
     OrtArchive {
         target: "aarch64-unknown-linux-gnu",
@@ -94,6 +128,13 @@ pub const ORT_ARCHIVES: &[OrtArchive] = &[
         kind: ArchiveKind::TarGz,
         member: "onnxruntime-linux-aarch64-1.24.2/lib/libonnxruntime.so.1.24.2",
         lib_file: "libonnxruntime.so",
+        fallbacks: &[OrtSource {
+            url: "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.24.2/microsoft.ml.onnxruntime.1.24.2.nupkg",
+            size: 124_756_536,
+            sha256: "782564d3d68e87269ea1812cc94710ad06fe014faf093f01a6f89d0bd58719d3",
+            kind: ArchiveKind::Zip,
+            member: "runtimes/linux-arm64/native/libonnxruntime.so",
+        }],
     },
     OrtArchive {
         target: "x86_64-pc-windows-msvc",
@@ -103,6 +144,13 @@ pub const ORT_ARCHIVES: &[OrtArchive] = &[
         kind: ArchiveKind::Zip,
         member: "onnxruntime-win-x64-1.24.2/lib/onnxruntime.dll",
         lib_file: "onnxruntime.dll",
+        fallbacks: &[OrtSource {
+            url: "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.24.2/microsoft.ml.onnxruntime.1.24.2.nupkg",
+            size: 124_756_536,
+            sha256: "782564d3d68e87269ea1812cc94710ad06fe014faf093f01a6f89d0bd58719d3",
+            kind: ArchiveKind::Zip,
+            member: "runtimes/win-x64/native/onnxruntime.dll",
+        }],
     },
     OrtArchive {
         target: "aarch64-pc-windows-msvc",
@@ -112,6 +160,13 @@ pub const ORT_ARCHIVES: &[OrtArchive] = &[
         kind: ArchiveKind::Zip,
         member: "onnxruntime-win-arm64-1.24.2/lib/onnxruntime.dll",
         lib_file: "onnxruntime.dll",
+        fallbacks: &[OrtSource {
+            url: "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.24.2/microsoft.ml.onnxruntime.1.24.2.nupkg",
+            size: 124_756_536,
+            sha256: "782564d3d68e87269ea1812cc94710ad06fe014faf093f01a6f89d0bd58719d3",
+            kind: ArchiveKind::Zip,
+            member: "runtimes/win-arm64/native/onnxruntime.dll",
+        }],
     },
 ];
 
@@ -119,40 +174,40 @@ pub const ORT_ARCHIVES: &[OrtArchive] = &[
 /// to, so an installed library is checked before it is loaded (a library
 /// that was dropped into place by hand, or swapped later, is refused).
 /// Hashed from the pinned archives on 2026-10-22.
-pub const ORT_LIB_PINS: &[(&str, u64, &str)] = &[
+pub const ORT_LIB_PINS: &[(&str, &[(u64, &str)])] = &[
     (
         "aarch64-apple-darwin",
-        35_361_512,
-        "87df6f94dd559ea958748adc80fd4c46d91c52bc025771f513291d155539590a",
+        &[
+            (35_361_512, "87df6f94dd559ea958748adc80fd4c46d91c52bc025771f513291d155539590a"),
+            (35_394_544, "8e88284d3b4395b1e532831ac05eb0ffa3673a62df32349e1b0fd64542cb827d"),
+        ],
     ),
     (
         "x86_64-unknown-linux-gnu",
-        22_065_056,
-        "ffc84d48e845cf0b562ba4ea5ca32aaafc0d4069019fef4f63095b307d0270ad",
+        &[(22_065_056, "ffc84d48e845cf0b562ba4ea5ca32aaafc0d4069019fef4f63095b307d0270ad")],
     ),
     (
         "aarch64-unknown-linux-gnu",
-        18_559_840,
-        "e18fe095919d8613ead3a31ff78212bde4fad929418a9b48f49d61c829ed5c82",
+        &[(18_559_840, "e18fe095919d8613ead3a31ff78212bde4fad929418a9b48f49d61c829ed5c82")],
     ),
     (
         "x86_64-pc-windows-msvc",
-        14_148_680,
-        "114947d633e6844ce3c4b51ef6678f776628571d08a5763859c61642c8dcca9c",
+        &[(14_148_680, "114947d633e6844ce3c4b51ef6678f776628571d08a5763859c61642c8dcca9c")],
     ),
     (
         "aarch64-pc-windows-msvc",
-        14_161_952,
-        "d4c4d939c8bd1e93a86bc5a45b37a1fdd08dce34d8231db014a7e4a023923f5a",
+        &[(14_161_952, "d4c4d939c8bd1e93a86bc5a45b37a1fdd08dce34d8231db014a7e4a023923f5a")],
     ),
 ];
 
-/// `(size, sha256)` of the extracted library for `target`.
-pub fn ort_lib_pin(target: &str) -> Option<(u64, &'static str)> {
-    ORT_LIB_PINS
-        .iter()
-        .find(|(t, _, _)| *t == target)
-        .map(|(_, size, sha)| (*size, *sha))
+/// Accepted `(size, sha256)` pairs of the extracted library for `target`.
+pub fn ort_lib_pins(target: &str) -> Option<&'static [(u64, &'static str)]> {
+    ORT_LIB_PINS.iter().find(|(t, _)| *t == target).map(|(_, pins)| *pins)
+}
+
+/// Accept only a complete size/hash pair; never mix fields from different builds.
+pub fn matches_lib_pin(pins: &[(u64, &str)], size: u64, sha256: &str) -> bool {
+    pins.iter().any(|&(n, hash)| n == size && hash == sha256)
 }
 
 /// The Rust target triple this binary was built for, as the manifest spells
@@ -228,17 +283,38 @@ mod tests {
             );
             assert!(a.member.contains(ORT_VERSION) || a.member.ends_with(".dll"));
             assert!(a.size > 1_000_000);
+            assert_eq!(a.sources().count(), 2);
+            let nuget = a.fallbacks[0];
+            assert!(nuget.url.starts_with("https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/"));
+            assert!(nuget.url.contains(ORT_VERSION));
+            assert_eq!(nuget.kind, ArchiveKind::Zip);
+            assert_eq!(nuget.size, 124_756_536);
+            assert_eq!(nuget.sha256.len(), 64);
+            assert!(nuget.member.starts_with("runtimes/") && nuget.member.ends_with(a.lib_file));
         }
+    }
+
+    #[test]
+    fn macos_accepts_both_signed_builds_but_no_third_hash() {
+        let pins = ort_lib_pins("aarch64-apple-darwin").unwrap();
+        assert_eq!(pins.len(), 2);
+        for &(size, hash) in pins {
+            assert!(matches_lib_pin(pins, size, hash));
+            assert!(!matches_lib_pin(pins, size, &"0".repeat(64)));
+        }
+        assert!(!matches_lib_pin(pins, pins[0].0, pins[1].1));
+        assert!(!matches_lib_pin(pins, pins[1].0, pins[0].1));
     }
 
     #[test]
     fn every_archive_has_a_library_pin() {
         assert_eq!(ORT_LIB_PINS.len(), ORT_ARCHIVES.len());
         for a in ORT_ARCHIVES {
-            let (size, sha) = ort_lib_pin(a.target).unwrap();
-            assert!(size > 1_000_000 && sha.len() == 64, "{}", a.target);
+            for &(size, sha) in ort_lib_pins(a.target).unwrap() {
+                assert!(size > 1_000_000 && sha.len() == 64, "{}", a.target);
+            }
         }
-        assert!(ort_lib_pin("x86_64-apple-darwin").is_none());
+        assert!(ort_lib_pins("x86_64-apple-darwin").is_none());
     }
 
     #[test]
@@ -272,6 +348,22 @@ mod tests {
             assert_eq!(j["kind"], a.kind.extension());
             assert_eq!(j["member"], a.member);
             assert_eq!(j["lib_file"], a.lib_file);
+            let sources = j["sources"].as_array().unwrap();
+            assert_eq!(sources.len(), a.sources().count());
+            for (source, pin) in sources.iter().zip(a.sources()) {
+                assert_eq!(source["url"], pin.url);
+                assert_eq!(source["size"], pin.size);
+                assert_eq!(source["sha256"], pin.sha256);
+                assert_eq!(source["kind"], pin.kind.extension());
+                assert_eq!(source["member"], pin.member);
+            }
+            let pins = j["lib_pins"].as_array().unwrap();
+            let rust_pins = ort_lib_pins(a.target).unwrap();
+            assert_eq!(pins.len(), rust_pins.len());
+            for (pin, &(size, sha)) in pins.iter().zip(rust_pins) {
+                assert_eq!(pin["size"], size);
+                assert_eq!(pin["sha256"], sha);
+            }
         }
     }
 }

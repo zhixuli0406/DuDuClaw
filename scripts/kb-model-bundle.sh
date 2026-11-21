@@ -60,20 +60,68 @@ for f in m["files"]:
     url = f"https://huggingface.co/{m['repo']}/resolve/{m['revision']}/{f['path']}"
     print(f"{url}\tmodels/embedding/{m['id']}/{f['path']}\t{f['size']}\t{f['sha256']}")
 v = o["ort_version"]
-print(f"{arch['url']}\tlib/onnxruntime/{v}/onnxruntime-{v}.{arch['kind']}\t{arch['size']}\t{arch['sha256']}")
+# Bundles retain the original GitHub archive for older gateway importers.
+source = arch["sources"][0]
+print(f"{source['url']}\tlib/onnxruntime/{v}/onnxruntime-{v}.{source['kind']}\t{source['size']}\t{source['sha256']}")
 PY
 )"
 
 CACHE="${KB_BUNDLE_CACHE:-$(mktemp -d)}"
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"; [ -n "${KB_BUNDLE_CACHE:-}" ] || rm -rf "$CACHE"' EXIT
-mkdir -p "$OUT"
+mkdir -p "$OUT" "$CACHE"
+NAME="duduclaw-kb-model-${MODEL}-${TARGET}.tar"
+
+# Only recover the original, pinned upstream archive; never substitute the
+# NuGet package inside a bundle consumed by an older gateway.
+recover_ort_archive() {
+  local dest="$1" output="$2" repo tags tag recovery
+  if ! command -v gh >/dev/null 2>&1 || ! gh auth status >/dev/null 2>&1; then
+    echo "ORT upstream unavailable for $TARGET; authenticated gh is required to recover $NAME" >&2
+    return 1
+  fi
+  repo="${GH_REPO:-${GITHUB_REPOSITORY:-}}"
+  if [ -z "$repo" ]; then
+    repo="$(cd "$ROOT" && gh repo view --json nameWithOwner --jq .nameWithOwner)" || return 1
+  fi
+  # gh stops at the end of the release list. Sort by publication time (not
+  # creation time), including published prereleases but excluding drafts.
+  tags="$(gh release list --repo "$repo" --exclude-drafts --limit 1000000 \
+    --json tagName,publishedAt --jq 'sort_by(.publishedAt) | reverse | .[].tagName')" || return 1
+  recovery="$STAGE/recovery"
+  mkdir -p "$recovery"
+  while IFS= read -r tag; do
+    [ -n "$tag" ] || continue
+    if gh release download "$tag" --repo "$repo" --pattern "$NAME" --dir "$recovery" \
+        >"$recovery/download.log" 2>&1; then
+      echo "recover $dest from $repo release $tag ($NAME)" >&2
+      if ! tar -xOf "$recovery/$NAME" "$dest" > "$output"; then
+        echo "cannot extract pinned ORT archive $dest from $tag/$NAME for $TARGET" >&2
+        return 1
+      fi
+      # The caller verifies BOTH size and SHA-256 before caching or bundling.
+      rm -f "$recovery/$NAME"
+      return 0
+    fi
+    rm -f "$recovery/$NAME"
+  done <<< "$tags"
+  echo "no published release of $repo contains $NAME; cannot build $TARGET" >&2
+  return 1
+}
 
 while IFS=$'\t' read -r url dest size sum; do
   cached="$CACHE/$sum"
   if [ ! -f "$cached" ] || [ "$(sha256 "$cached")" != "$sum" ]; then
     echo "download $(basename "$dest") ($size bytes)"
-    curl -fSL --retry 3 -o "$cached.part" "$url"
+    if ! curl -fSL --retry 3 --connect-timeout 30 --max-time 1800 --max-filesize "$size" -o "$cached.part" "$url"; then
+      case "$dest" in
+        lib/onnxruntime/*) recover_ort_archive "$dest" "$cached.part" ;;
+        *) echo "download failed for $dest ($TARGET)" >&2; exit 1 ;;
+      esac
+    fi
+    got="$(wc -c < "$cached.part" | tr -d ' ')"
+    [ "$got" = "$size" ] || { echo "size mismatch for $dest ($TARGET): $got != $size" >&2; exit 1; }
+    [ "$(sha256 "$cached.part")" = "$sum" ] || { echo "sha256 mismatch for $dest ($TARGET)" >&2; exit 1; }
     mv "$cached.part" "$cached"
   fi
   got="$(wc -c < "$cached" | tr -d ' ')"
@@ -93,7 +141,6 @@ for f in files:
 json.dump({"model": model, "target": target, "files": files}, open(path, "w"), indent=2)
 PY
 
-NAME="duduclaw-kb-model-${MODEL}-${TARGET}.tar"
 # Only the two trees: no "./" entry, so unpacking never touches the
 # permissions of the home directory itself.
 # COPYFILE_DISABLE: macOS tar would add AppleDouble "._*" entries, which

@@ -104,7 +104,7 @@ impl LocalOnnxEmbedder {
         let build = || -> Result<Session, String> {
             #[cfg(test)]
             tests::ORT_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let b = Session::builder().map_err(|e| e.to_string())?;
+            let b = duduclaw_onnx::runtime::session_builder().map_err(|e| e.to_string())?;
             let b = b
                 .with_optimization_level(GraphOptimizationLevel::Level3)
                 .map_err(|e| e.to_string())?;

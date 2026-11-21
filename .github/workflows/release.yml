@@ -390,6 +390,8 @@ jobs:
       - name: Build and upload offline embedding-model bundles
         env:
           GH_TOKEN: ${{ github.token }}
+          # Authenticated recovery of pinned ORT archives from published bundles.
+          GH_REPO: ${{ github.repository }}
           KB_BUNDLE_CACHE: ${{ runner.temp }}/kb-cache
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
           # Through env, never interpolated into the script text.

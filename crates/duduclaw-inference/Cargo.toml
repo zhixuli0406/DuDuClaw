@@ -39,7 +39,9 @@ hex = "0.4"
 ucci = { git = "https://github.com/varunkotte6/ucci", rev = "80cd2319cc2b41e3a5c35a64acd6b5dcbf5c217b" }
 
 # ONNX Runtime for Embedding (prediction engine semantic similarity)
-ort = { version = "2.0.0-rc.12", optional = true }
+duduclaw-onnx = { workspace = true, optional = true, features = ["runtime"] }
+# Preserve rc.12 defaults explicitly: rc.15 defaults select api-31.
+ort = { version = "=2.0.0-rc.15", optional = true, default-features = false, features = ["std", "ndarray", "tracing", "download-binaries", "tls-native", "copy-dylibs", "api-24"] }
 ndarray = { version = "0.17", optional = true }
 
 # Tokenizer for embedding models (BERT WordPiece, etc.)
@@ -59,7 +61,7 @@ whisper-rs = { version = "0.13", optional = true }
 [features]
 default = ["cpu"]
 cpu = []
-onnx = ["dep:ort", "dep:ndarray", "dep:tokenizers"]
+onnx = ["dep:duduclaw-onnx", "dep:ort", "dep:ndarray", "dep:tokenizers"]
 whisper = ["dep:whisper-rs"]
 
 [target.'cfg(windows)'.dependencies]
