@@ -28,6 +28,11 @@
 # KB_BUNDLE_CACHE=<dir> keeps downloads between runs (default: a temp dir).
 set -euo pipefail
 
+# Keep these source-specific sets in sync with crates/duduclaw-onnx/src/manifest.rs.
+GITHUB_REDIRECT_HOSTS='github.com objects.githubusercontent.com release-assets.githubusercontent.com'
+NUGET_REDIRECT_HOSTS='api.nuget.org'
+MODEL_REDIRECT_HOSTS='huggingface.co cdn-lfs.huggingface.co cdn-lfs-us-1.huggingface.co cdn-lfs-eu-1.huggingface.co cas-bridge.xethub.hf.co'
+
 if [ $# -ne 3 ]; then
   sed -n '2,26p' "$0" >&2
   exit 2
@@ -109,11 +114,85 @@ recover_ort_archive() {
   return 1
 }
 
+# Python is already required for the manifest. Use its URL parser so authority
+# boundaries, credentials and ports cannot bypass an exact host comparison.
+resolve_download_url() {
+  python3 -I - "$1" "$2" "$3" <<'PYURL'
+import sys
+from urllib.parse import urlsplit, urljoin
+current, location, allowed = sys.argv[1:]
+try:
+    if not location or any(ord(c) <= 32 or ord(c) == 127 for c in location) or "\\" in location:
+        raise ValueError()
+    parsed = urlsplit(location)
+    if not parsed.scheme:
+        # Relative locations are rooted at the current origin, never a new
+        # authority or the current request's directory. Refuse network paths.
+        if parsed.netloc or location.startswith("//"):
+            raise ValueError()
+        base = urlsplit(current)
+        location = urljoin(f"{base.scheme}://{base.netloc}/", location)
+        parsed = urlsplit(location)
+    if (parsed.scheme != "https" or parsed.hostname not in allowed.split()
+            or parsed.username is not None or parsed.password is not None
+            or parsed.port not in (None, 443)):
+        raise ValueError()
+except ValueError:
+    sys.exit("download redirect refused: HTTPS URL with an allowed host and port 443 required")
+print(location)
+PYURL
+}
+
+download_with_redirects() {
+  local current="$1" output="$2" size="$3" allowed headers status location hop
+  case "$current" in
+    https://github.com/*) allowed="$GITHUB_REDIRECT_HOSTS" ;;
+    https://api.nuget.org/*) allowed="$NUGET_REDIRECT_HOSTS" ;;
+    https://huggingface.co/*) allowed="$MODEL_REDIRECT_HOSTS" ;;
+    *) echo "download refused: unknown source host" >&2; return 1 ;;
+  esac
+  current="$(resolve_download_url "$current" "$current" "$allowed")" || return 1
+  headers="$(mktemp "$STAGE/headers.XXXXXX")" || return 1
+  for ((hop = 0; hop <= 5; hop++)); do
+    # No automatic redirects: validate every next URL before requesting it.
+    status="$(curl -q -fsS --proto '=https' --max-redirs 0 --retry 3 \
+      --connect-timeout 30 --max-time 1800 --max-filesize "$size" \
+      -o "$output" -D "$headers" -w '%{http_code}' "$current")" || return 1
+    case "$status" in
+      2??) rm -f "$headers"; return 0 ;;
+      301|302|303|307|308)
+        if [ "$hop" -eq 5 ]; then
+          echo "download redirect refused: more than five hops" >&2
+          return 1
+        fi
+        location="$(python3 -I - "$headers" <<'PYHEADER'
+import sys
+locations = []
+with open(sys.argv[1], encoding="iso-8859-1") as headers:
+    for line in headers:
+        # Ignore proxy CONNECT, interim responses and earlier retry headers.
+        if line.startswith("HTTP/"):
+            locations = []
+        elif line.lower().startswith("location:"):
+            locations.append(line.split(":", 1)[1].strip())
+if len(locations) != 1:
+    sys.exit("download redirect refused: missing or ambiguous Location header")
+print(locations[0])
+PYHEADER
+)" || return 1
+        current="$(resolve_download_url "$current" "$location" "$allowed")" || return 1
+        ;;
+      *) echo "download refused: unexpected HTTP status $status" >&2; return 1 ;;
+    esac
+  done
+  return 1
+}
+
 while IFS=$'\t' read -r url dest size sum; do
   cached="$CACHE/$sum"
   if [ ! -f "$cached" ] || [ "$(sha256 "$cached")" != "$sum" ]; then
     echo "download $(basename "$dest") ($size bytes)"
-    if ! curl -fSL --proto '=https' --proto-redir '=https' --max-redirs 5 --retry 3 --connect-timeout 30 --max-time 1800 --max-filesize "$size" -o "$cached.part" "$url"; then
+    if ! download_with_redirects "$url" "$cached.part" "$size"; then
       case "$dest" in
         lib/onnxruntime/*) recover_ort_archive "$dest" "$cached.part" ;;
         *) echo "download failed for $dest ($TARGET)" >&2; exit 1 ;;

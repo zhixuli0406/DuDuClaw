@@ -123,8 +123,8 @@ fn write_marker(spec: &ModelSpec, home: &Path, via: &str) -> Result<(), String> 
 }
 
 /// Download and install `spec` (and ORT when missing). Idempotent: a file
-/// already at its pinned size is kept; a partial one resumes. `cancel`
-/// stops between chunks and keeps the partial files for the next attempt.
+/// already verified against its pin is kept. `cancel` stops between chunks
+/// and removes the current temporary file; the next attempt restarts.
 pub async fn install(
     spec: &ModelSpec,
     home: &Path,

@@ -52,11 +52,18 @@ pub fn init_ort(lib_path: &Path) -> Result<(), String> {
     }
     let _ = INIT.get_or_init(|| {
         let result: Result<_, String> = (|| {
+            // SECURITY: Path-based loading cannot prevent a same-user process
+            // from replacing the file between verification and the dynamic loader
+            // opening it. ctime + post-load re-hash detect it and block all sessions,
+            // but native initialisers of a replaced library would already have run.
+            // The mitigation boundary is that employee processes must not have write
+            // access to <home>/lib (enforced by the owner/mode rule and employee
+            // sandbox); protected Linux installs load from a sealed memfd.
             let loaded = ort::init_from(&load_path);
             // Check immediately on return, including failed loads. The handle
             // remains retained even when this check or environment creation fails.
             if let Some(verified) = VERIFIED.get() {
-                verified.check_path(lib_path)?;
+                verified.check_after_load(lib_path)?;
             }
             let builder = loaded
                 .map_err(|e| format!("載入 ONNX Runtime 失敗（{}）：{e}", lib_path.display()))?;

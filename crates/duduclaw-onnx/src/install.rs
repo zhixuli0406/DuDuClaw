@@ -155,7 +155,8 @@ fn exclusive_temp(path: &Path) -> std::io::Result<std::fs::File> {
     options.open(path)
 }
 
-fn new_temp(dest: &Path) -> OnnxResult<tempfile::NamedTempFile> {
+/// Create a random, exclusive, no-follow temporary beside the destination.
+pub fn new_temp(dest: &Path) -> OnnxResult<tempfile::NamedTempFile> {
     let parent = dest.parent().ok_or_else(|| OnnxError::msg("目的地沒有父目錄"))?;
     let prefix = format!(".{}.dudu-", dest.file_name().unwrap_or_default().to_string_lossy());
     // tempfile retries random collisions; the callback never truncates or follows links.
@@ -256,7 +257,8 @@ fn verify_temp(part: &mut tempfile::NamedTempFile, size: u64, sha: &str) -> Onnx
     Ok(())
 }
 
-fn finish_download(mut part: tempfile::NamedTempFile, dest: &Path, size: u64, sha: &str) -> OnnxResult<()> {
+/// Verify size and digest through the held handle, then atomically rename.
+pub fn finish_download(mut part: tempfile::NamedTempFile, dest: &Path, size: u64, sha: &str) -> OnnxResult<()> {
     verify_temp(&mut part, size, sha)?;
     part.persist(dest).map_err(|e| OnnxError::Io(e.error))?;
     Ok(())
@@ -376,6 +378,38 @@ fn verify_lib_at(lib: &Path, pins: &[(u64, &str)]) -> Result<(), String> {
     verified_file::verify_for_load(lib, pins).map(|_| ())
 }
 
+#[cfg(unix)]
+const MANAGED_DIRECTORY: &str = "ONNX Runtime 目錄由其他使用者管理；請由該使用者更新元件";
+
+#[cfg(unix)]
+fn managed_directory_result(
+    owner: u32, current_uid: u32, verify: impl FnOnce() -> Result<(), String>,
+) -> OnnxResult<bool> {
+    if owner == current_uid { return Ok(false); }
+    verify().map_err(|_| OnnxError::msg(MANAGED_DIRECTORY))?;
+    Ok(true)
+}
+
+/// Never repair, lock, or clean up a version directory managed by another uid.
+fn use_managed_library(dir: &Path, lib: &Path, pins: &[(u64, &str)]) -> OnnxResult<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = match std::fs::symlink_metadata(dir) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        // SAFETY: geteuid has no memory preconditions.
+        managed_directory_result(meta.uid(), unsafe { libc::geteuid() }, || verify_lib_at(lib, pins))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (dir, lib, pins);
+        Ok(false)
+    }
+}
+
 fn prepare_lib_dir(dir: &Path) -> OnnxResult<()> {
     std::fs::create_dir_all(dir)?;
     #[cfg(unix)]
@@ -386,7 +420,7 @@ fn prepare_lib_dir(dir: &Path) -> OnnxResult<()> {
         use std::os::unix::fs::MetadataExt;
         // SAFETY: geteuid has no memory preconditions.
         if file.metadata()?.uid() != unsafe { libc::geteuid() } {
-            return Err(OnnxError::msg("ONNX Runtime 目錄擁有者不符；請重新安裝元件"));
+            return Err(OnnxError::msg(MANAGED_DIRECTORY));
         }
         file.set_permissions(std::fs::Permissions::from_mode(0o700))?;
     }
@@ -416,7 +450,7 @@ pub async fn install_ort(
     let pin = lib_pin(archive)?;
     let lib_dir = manifest::ort_lib_dir(ort_lib_root);
     let lib_path = lib_dir.join(archive.lib_file);
-    if verify_lib_at(&lib_path, pin).is_ok() {
+    if use_managed_library(&lib_dir, &lib_path, pin)? || verify_lib_at(&lib_path, pin).is_ok() {
         on_bytes(archive.size);
         return Ok(());
     }
@@ -504,6 +538,9 @@ fn install_ort_from_local_archive_with(
 ) -> OnnxResult<()> {
     let lib_dir = manifest::ort_lib_dir(ort_lib_root);
     let lib_path = lib_dir.join(archive.lib_file);
+    if use_managed_library(&lib_dir, &lib_path, pin)? {
+        return Ok(());
+    }
     let path = ort_archive_path(ort_lib_root, archive);
     let archive_present = path.exists();
     if verify_lib_at(&lib_path, pin).is_ok() && !archive_present {
@@ -573,6 +610,20 @@ impl Drop for InstallLock {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_directory_uses_verified_library_or_requires_its_owner() {
+        assert!(managed_directory_result(0, 1000, || Ok(())).unwrap());
+        for owner in [0, 1234] {
+            let error = managed_directory_result(owner, 1000, || Err("unverified".into()))
+                .unwrap_err().to_string();
+            assert!(error.contains("由其他使用者管理"));
+            assert!(error.contains("由該使用者更新"));
+        }
+        assert!(!managed_directory_result(1000, 1000, || panic!("self-owned directory can be repaired"))
+            .unwrap());
+    }
 
     #[test]
     fn sha256_file_matches_a_known_digest() {

@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 /// The rc.15 binding uses the compatible `api-24` interface.
 pub const ORT_VERSION: &str = "1.24.2";
 
+// Keep these sets in sync with scripts/kb-model-bundle.sh.
 // Redirect hosts for the pinned sources below. Unexpected hosts fail closed;
 // the pinned SHA-256 still protects the content on every allowed host.
 pub const GITHUB_REDIRECT_HOSTS: &[&str] = &[
@@ -274,6 +275,21 @@ pub fn ort_lib_path(ort_lib_root: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bundle_script_redirect_allowlists_match_manifest() {
+        let script = include_str!("../../../scripts/kb-model-bundle.sh");
+        for (name, hosts) in [
+            ("GITHUB_REDIRECT_HOSTS", GITHUB_REDIRECT_HOSTS),
+            ("NUGET_REDIRECT_HOSTS", NUGET_REDIRECT_HOSTS),
+            ("MODEL_REDIRECT_HOSTS", MODEL_REDIRECT_HOSTS),
+        ] {
+            let prefix = format!("{name}='");
+            let value = script.lines().find_map(|line|
+                line.strip_prefix(&prefix).and_then(|line| line.strip_suffix("'"))).unwrap();
+            assert_eq!(value.split_whitespace().collect::<Vec<_>>(), hosts, "{name}");
+        }
+    }
+
     #[test]
     fn workspace_ort_manifests_never_download_or_copy_binaries() {
         use std::collections::HashSet;
