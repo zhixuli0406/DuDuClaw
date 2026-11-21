@@ -1,6 +1,97 @@
 use super::*;
 
+use crate::mcp_memory_handlers::ReadScope;
+
+// ---------------------------------------------------------------------------
+// v1.84.0 (RM-200 item 1): conversation scope of auto-written pages
+// ---------------------------------------------------------------------------
+
+/// The read scope of this process's wiki tools (same turn identity as the
+/// memory tools; an agent id is never an `external/` namespace).
+fn wiki_read_scope(agent: &str) -> ReadScope {
+    crate::mcp_memory_handlers::mcp_read_scope(agent)
+}
+
+/// Whether the page `page_path` of `wiki_dir` must look like a page that does
+/// not exist to this read: on a channel turn, every auto-written page under
+/// `auto/` whose sources are not all of this conversation
+/// (`auto_wiki_page::page_visible_in_conversation`). Employee-wide reads see
+/// everything, as before.
+///
+/// The path is judged by its normal components (`./auto/x.md` and
+/// `auto//x.md` are `auto/x.md`) and the namespace segment case-insensitively
+/// (a case-insensitive file system opens `AUTO/x.md` too). Fail closed: an
+/// unusable component hides the page.
+pub(crate) fn auto_page_hidden(wiki_dir: &Path, page_path: &str, scope: &ReadScope) -> bool {
+    let ReadScope::Conversation(session) = scope else {
+        return false;
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for component in Path::new(page_path).components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(s) => match s.to_str() {
+                Some(s) => parts.push(s),
+                None => return true,
+            },
+            _ => return true,
+        }
+    }
+    let namespace = duduclaw_gateway::auto_wiki_page::AUTO_NAMESPACE;
+    match parts.first() {
+        Some(first) if parts.len() > 1 && first.eq_ignore_ascii_case(namespace) => {}
+        _ => return false,
+    }
+    let page = duduclaw_memory::WikiStore::new(wiki_dir.to_path_buf())
+        .read_page(&parts.join("/"))
+        .ok();
+    let scoped_path = format!("{namespace}/{}", parts[1..].join("/"));
+    !duduclaw_gateway::auto_wiki_page::page_visible_in_conversation(
+        &scoped_path,
+        page.as_ref(),
+        session.as_deref(),
+    )
+}
+
+/// The fixed `wiki_export` answer on a channel conversation turn (v1.84.0).
+pub(crate) const WIKI_EXPORT_CHANNEL_TURN_REFUSED: &str =
+    "Not available from a conversation: a wiki export covers the pages of every conversation \
+     of this employee, so it cannot be used on a chat turn. Ask an administrator.";
+
+/// On a channel turn, `_index.md` / `_log.md` without the lines that name a
+/// page of the auto namespace (they carry the titles and paths of other
+/// conversations' pages). Fail closed: every such line is dropped, this
+/// conversation's own auto pages included (they stay reachable through
+/// `wiki_ls` / `wiki_search`).
+fn redact_reserved_listing(content: &str, scope: &ReadScope) -> String {
+    if *scope == ReadScope::Employee {
+        return content.to_string();
+    }
+    let marker = format!("{}/", duduclaw_gateway::auto_wiki_page::AUTO_NAMESPACE);
+    let mut out: String = content
+        .lines()
+        .filter(|line| !line.to_ascii_lowercase().contains(&marker))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if content.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
 pub(crate) async fn handle_wiki_ls(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    let scope = wiki_read_scope(default_agent);
+    handle_wiki_ls_in(args, home_dir, default_agent, &scope).await
+}
+
+/// [`handle_wiki_ls`] with an explicit [`ReadScope`] (v1.84.0: hidden auto
+/// pages are not listed nor counted).
+pub(crate) async fn handle_wiki_ls_in(
+    args: &Value,
+    home_dir: &Path,
+    default_agent: &str,
+    scope: &ReadScope,
+) -> Value {
     let agent_id = args
         .get("agent_id")
         .and_then(|v| v.as_str())
@@ -32,7 +123,10 @@ pub(crate) async fn handle_wiki_ls(args: &Value, home_dir: &Path, default_agent:
         ));
     }
 
-    let pages = collect_md_files(&wiki_dir, &wiki_dir);
+    let pages: Vec<std::path::PathBuf> = collect_md_files(&wiki_dir, &wiki_dir)
+        .into_iter()
+        .filter(|rel| !auto_page_hidden(&wiki_dir, &rel.to_string_lossy(), scope))
+        .collect();
     if pages.is_empty() {
         return tool_text("Wiki directory exists but contains no pages.");
     }
@@ -62,6 +156,18 @@ pub(crate) async fn handle_wiki_ls(args: &Value, home_dir: &Path, default_agent:
 }
 
 pub(crate) async fn handle_wiki_read(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    let scope = wiki_read_scope(default_agent);
+    handle_wiki_read_in(args, home_dir, default_agent, &scope).await
+}
+
+/// [`handle_wiki_read`] with an explicit [`ReadScope`] (v1.84.0: a hidden
+/// auto page answers exactly like a missing page).
+pub(crate) async fn handle_wiki_read_in(
+    args: &Value,
+    home_dir: &Path,
+    default_agent: &str,
+    scope: &ReadScope,
+) -> Value {
     let agent_id = args
         .get("agent_id")
         .and_then(|v| v.as_str())
@@ -118,9 +224,16 @@ pub(crate) async fn handle_wiki_read(args: &Value, home_dir: &Path, default_agen
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("");
-    if !WIKI_RESERVED.contains(&file_name)
-        && let Some(reason) = wiki_page_withheld(home_dir, &wiki_dir, agent_id, page_path, &content)
-    {
+    // v1.84.0: another conversation's auto page is "not found" — the same
+    // text a missing page gets, before any other check can tell them apart.
+    if auto_page_hidden(&wiki_dir, page_path, scope) {
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        return tool_error(&wiki_read_error(page_path, &missing));
+    }
+    if WIKI_RESERVED.contains(&file_name) {
+        return tool_text(&redact_reserved_listing(&content, scope));
+    }
+    if let Some(reason) = wiki_page_withheld(home_dir, &wiki_dir, agent_id, page_path, &content) {
         return tool_error(reason);
     }
     tool_text(&content)
@@ -348,6 +461,22 @@ pub(crate) async fn handle_wiki_write(args: &Value, home_dir: &Path, default_age
 }
 
 pub(crate) async fn handle_wiki_search(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    let scope = wiki_read_scope(default_agent);
+    handle_wiki_search_in(args, home_dir, default_agent, &scope).await
+}
+
+/// Candidate pages a scoped `wiki_search` scans before dropping hidden auto
+/// pages, so they cannot crowd this conversation's results out.
+const SCOPED_WIKI_SEARCH_FETCH: usize = 2_000;
+
+/// [`handle_wiki_search`] with an explicit [`ReadScope`] (v1.84.0: hidden
+/// auto pages are neither returned nor counted, and do not use up `limit`).
+pub(crate) async fn handle_wiki_search_in(
+    args: &Value,
+    home_dir: &Path,
+    default_agent: &str,
+    scope: &ReadScope,
+) -> Value {
     let agent_id = args
         .get("agent_id")
         .and_then(|v| v.as_str())
@@ -390,10 +519,26 @@ pub(crate) async fn handle_wiki_search(args: &Value, home_dir: &Path, default_ag
         return tool_text("No wiki found. Use wiki_write to create the first page.");
     }
 
-    let store = duduclaw_memory::WikiStore::new(wiki_dir);
-    let hits = match store.search_filtered(query, limit, min_trust, layer_filter, expand) {
+    let store = duduclaw_memory::WikiStore::new(wiki_dir.clone());
+    let fetch = match scope {
+        ReadScope::Employee => limit,
+        ReadScope::Conversation(_) => SCOPED_WIKI_SEARCH_FETCH.max(limit),
+    };
+    let hits = match store.search_filtered(query, fetch, min_trust, layer_filter, expand) {
         Ok(h) => h,
         Err(e) => return tool_error(&format!("Wiki search failed: {e}")),
+    };
+    let hits: Vec<_> = match scope {
+        ReadScope::Employee => hits,
+        // Hidden pages dropped first, then the limit on the direct hits
+        // (expanded neighbours, score 0, follow as before).
+        ReadScope::Conversation(_) => {
+            let (direct, expanded): (Vec<_>, Vec<_>) = hits
+                .into_iter()
+                .filter(|h| !auto_page_hidden(&wiki_dir, &h.path, scope))
+                .partition(|h| h.score != 0);
+            direct.into_iter().take(limit).chain(expanded).collect()
+        }
     };
 
     if hits.is_empty() {
@@ -431,9 +576,28 @@ pub(crate) async fn handle_wiki_lint(args: &Value, home_dir: &Path, default_agen
         return tool_text("No wiki found. Use wiki_write to create the first page.");
     }
 
-    let store = duduclaw_memory::WikiStore::new(wiki_dir);
+    let store = duduclaw_memory::WikiStore::new(wiki_dir.clone());
+    // v1.84.0: on a channel turn other conversations' auto pages are neither
+    // listed nor counted.
+    let scope = wiki_read_scope(default_agent);
     match store.lint() {
-        Ok(report) => {
+        Ok(mut report) => {
+            if scope != ReadScope::Employee {
+                let hidden = |p: &str| auto_page_hidden(&wiki_dir, p, &scope);
+                let hidden_total = collect_md_files(&wiki_dir, &wiki_dir)
+                    .iter()
+                    .filter(|rel| hidden(rel.to_string_lossy().as_ref()))
+                    .count();
+                report.total_pages = report.total_pages.saturating_sub(hidden_total);
+                report.orphan_pages.retain(|p| !hidden(p.as_str()));
+                report.stale_pages.retain(|p| !hidden(p.as_str()));
+                report.broken_links.retain(|(from, _)| !hidden(from.as_str()));
+                let index = std::fs::read_to_string(wiki_dir.join("_index.md")).unwrap_or_default();
+                report.index_entries = redact_reserved_listing(&index, &scope)
+                    .lines()
+                    .filter(|l| l.starts_with("- ["))
+                    .count();
+            }
             let mut output = format!("Wiki Lint Report for '{}'\n\n", agent_id);
             output.push_str(&format!("Total pages: {}\n", report.total_pages));
             output.push_str(&format!("Index entries: {}\n\n", report.index_entries));
@@ -492,19 +656,31 @@ pub(crate) async fn handle_wiki_stats(args: &Value, home_dir: &Path, default_age
         return tool_text(&format!("No wiki found for agent '{}'.", agent_id));
     }
 
+    // v1.84.0: on a channel turn other conversations' auto pages are neither
+    // counted nor named (pages, index and log lines alike).
+    let scope = wiki_read_scope(default_agent);
     let store = duduclaw_memory::WikiStore::new(wiki_dir.clone());
     let pages = match store.list_pages() {
-        Ok(p) => p,
+        Ok(p) => p
+            .into_iter()
+            .filter(|p| !auto_page_hidden(&wiki_dir, &p.path, &scope))
+            .collect::<Vec<_>>(),
         Err(e) => return tool_error(&format!("Failed to list pages: {e}")),
     };
 
-    let index_content = std::fs::read_to_string(wiki_dir.join("_index.md")).unwrap_or_default();
+    let index_content = redact_reserved_listing(
+        &std::fs::read_to_string(wiki_dir.join("_index.md")).unwrap_or_default(),
+        &scope,
+    );
     let index_entries = index_content
         .lines()
         .filter(|l| l.starts_with("- ["))
         .count();
 
-    let log_content = std::fs::read_to_string(wiki_dir.join("_log.md")).unwrap_or_default();
+    let log_content = redact_reserved_listing(
+        &std::fs::read_to_string(wiki_dir.join("_log.md")).unwrap_or_default(),
+        &scope,
+    );
     let log_entries = log_content
         .lines()
         .filter(|l| l.starts_with("## ["))
@@ -551,6 +727,12 @@ pub(crate) async fn handle_wiki_export(args: &Value, home_dir: &Path, default_ag
         .get("format")
         .and_then(|v| v.as_str())
         .unwrap_or("html");
+
+    // v1.84.0: an export copies (and counts) every conversation's auto pages,
+    // so it is not available on a channel conversation turn.
+    if wiki_read_scope(default_agent) != ReadScope::Employee {
+        return tool_error(WIKI_EXPORT_CHANNEL_TURN_REFUSED);
+    }
 
     // Visibility check for cross-agent access
     if agent_id != default_agent {
@@ -620,6 +802,96 @@ pub(crate) async fn handle_wiki_export(args: &Value, home_dir: &Path, default_ag
             "Unknown format '{}'. Use 'obsidian' or 'html'.",
             format
         )),
+    }
+}
+
+#[cfg(test)]
+mod conversation_scope_tests {
+    use super::*;
+
+    fn text(v: &Value) -> String {
+        v["content"][0]["text"].as_str().unwrap_or("").to_string()
+    }
+
+    /// File an auto page the way the knowledge route does.
+    fn file_page(home: &Path, slug: &str, original: &str, source_id: &str) -> String {
+        let store = duduclaw_memory::WikiStore::new(home.join("agents").join("alice").join("wiki"));
+        duduclaw_gateway::auto_wiki_page::write_auto_page(
+            &store,
+            home,
+            "alice",
+            &duduclaw_gateway::auto_wiki_page::AutoPageRequest {
+                doc_type: duduclaw_gateway::knowledge_route::DocType::Sop,
+                title: "退款流程".into(),
+                slug: slug.into(),
+                summary: "退款流程摘要".into(),
+                original: original.into(),
+                source_label: "Telegram 對話".into(),
+                source_id: source_id.into(),
+            },
+        )
+        .unwrap()
+        .path()
+        .to_string()
+    }
+
+    /// RM-200 item 1: on a channel turn in A, conversation B's auto page —
+    /// filed under the same slug, which now gives B its own page — reads
+    /// exactly like a missing page, is not listed, counted or found, and its
+    /// title is not in `_index.md`; A's own auto page and a curated page stay
+    /// visible; an unknown conversation sees no auto page; an employee-wide
+    /// read sees everything.
+    #[tokio::test]
+    async fn other_conversations_auto_pages_look_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let agent_dir = home.join("agents").join("alice");
+        std::fs::create_dir_all(agent_dir.join("wiki")).unwrap();
+        std::fs::write(agent_dir.join("agent.toml"), "[agent]\nname = \"alice\"\n").unwrap();
+        let a_page = file_page(home, "refunds", "kestrelmoor 退款流程：A 客戶的版本。", "conversation:telegram:A:m:1");
+        let b_page = file_page(home, "refunds", "kestrelmoor 退款流程：B 客戶的秘密版本。", "conversation:telegram:B:m:2");
+        assert_ne!(a_page, b_page, "no cross-conversation merge");
+        duduclaw_memory::WikiStore::new(agent_dir.join("wiki"))
+            .write_page(
+                "concepts/policy.md",
+                "---\ntitle: \"公開政策\"\nauthor: \"operator\"\nlayer: core\ntrust: 0.900\n---\n\nkestrelmoor 公開政策。",
+            )
+            .unwrap();
+
+        let in_a = ReadScope::Conversation(Some("telegram:A".into()));
+        let read = |path: String, scope: ReadScope| async move {
+            handle_wiki_read_in(&serde_json::json!({ "page_path": path }), home, "alice", &scope).await
+        };
+        let hidden = read(b_page.clone(), in_a.clone()).await;
+        let missing = read("auto/sop/no-such-page.md".into(), in_a.clone()).await;
+        assert_eq!(hidden["isError"], true, "{hidden}");
+        assert_eq!(text(&hidden), format!("Page not found: {b_page}"));
+        assert_eq!(text(&missing), "Page not found: auto/sop/no-such-page.md");
+        assert_eq!(hidden.as_object().map(|o| o.len()), missing.as_object().map(|o| o.len()));
+        for alias in [format!("./{b_page}"), b_page.replacen("auto/", "AUTO/", 1)] {
+            let r = read(alias.clone(), in_a.clone()).await;
+            assert!(!text(&r).contains("秘密"), "{alias}: {r}");
+        }
+        assert!(text(&read(a_page.clone(), in_a.clone()).await).contains("A 客戶"));
+        assert!(text(&read("concepts/policy.md".into(), in_a.clone()).await).contains("公開政策"));
+        let index = text(&read("_index.md".into(), in_a.clone()).await);
+        assert!(!index.contains(&b_page), "{index}");
+
+        let ls = text(&handle_wiki_ls_in(&serde_json::json!({}), home, "alice", &in_a).await);
+        assert!(ls.contains("(2 pages)") && ls.contains(&a_page) && !ls.contains(&b_page), "{ls}");
+        let found = text(&handle_wiki_search_in(&serde_json::json!({ "query": "kestrelmoor" }), home, "alice", &in_a).await);
+        assert!(!found.contains(&b_page) && !found.contains("秘密"), "{found}");
+        assert!(found.starts_with("Found 2 matching pages"), "{found}");
+
+        let unknown = ReadScope::Conversation(None);
+        let r = read(a_page.clone(), unknown.clone()).await;
+        assert_eq!(text(&r), format!("Page not found: {a_page}"));
+        let ls = text(&handle_wiki_ls_in(&serde_json::json!({}), home, "alice", &unknown).await);
+        assert!(ls.contains("(1 pages)"), "{ls}");
+
+        let ls = text(&handle_wiki_ls_in(&serde_json::json!({}), home, "alice", &ReadScope::Employee).await);
+        assert!(ls.contains("(3 pages)") && ls.contains(&b_page), "{ls}");
+        assert!(text(&read(b_page.clone(), ReadScope::Employee).await).contains("秘密"));
     }
 }
 

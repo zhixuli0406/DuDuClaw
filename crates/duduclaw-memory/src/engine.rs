@@ -14,6 +14,8 @@ use duduclaw_core::error::{DuDuClawError, Result};
 use duduclaw_core::traits::MemoryEngine;
 use duduclaw_core::types::{MemoryEntry, TimeWindow};
 
+use crate::novelty_gate::NOVELTY_REJECTED_PREFIX;
+
 /// A lightweight cross-session key fact (P2 Key-Fact Accumulator).
 ///
 /// Replaces MemGPT's 6,500-token Core Memory with <200 tokens of key facts.
@@ -828,22 +830,26 @@ impl SqliteMemoryEngine {
         content: &str,
     ) -> Option<crate::novelty_gate::NoveltyRejection> {
         let conn = self.conn.lock().await;
-        self.check_novelty_with_conn(&conn, agent_id, layer, content)
+        self.check_novelty_with_conn(&conn, agent_id, layer, content, RowScope::All)
     }
 
     /// Synchronous variant used internally by write paths that already hold
     /// the connection lock (`store` / `store_temporal`) — avoids a
     /// self-deadlock on the same `tokio::sync::Mutex`.
+    ///
+    /// v1.84.0: `scope` limits the candidates to the rows the writing
+    /// conversation may see ([`RowScope::All`] = every row, as before).
     fn check_novelty_with_conn(
         &self,
         conn: &Connection,
         agent_id: &str,
         layer: duduclaw_core::types::MemoryLayer,
         content: &str,
+        scope: RowScope<'_>,
     ) -> Option<crate::novelty_gate::NoveltyRejection> {
         let embedder = self.embedder.as_ref()?;
         let now_rfc = Utc::now().to_rfc3339();
-        match crate::novelty_gate::check_novelty(
+        match crate::novelty_gate::check_novelty_scoped(
             conn,
             agent_id,
             layer.as_str(),
@@ -851,6 +857,7 @@ impl SqliteMemoryEngine {
             embedder.as_ref(),
             &self.novelty_gate,
             &now_rfc,
+            scope,
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -1466,25 +1473,34 @@ impl SqliteMemoryEngine {
     /// Fetch one row by id with the same agent-isolation + temporal-validity
     /// filters as `search()`. Used to materialize graph-only candidates
     /// (HippoRAG-lite) while the caller already holds the connection lock.
+    ///
+    /// v1.84.0: `scope` also applies the conversation visibility rule.
     fn fetch_valid_entry(
         conn: &Connection,
         agent_id: &str,
         memory_id: &str,
         now_rfc: &str,
+        scope: RowScope<'_>,
     ) -> Result<Option<MemoryEntry>> {
         let sql = format!(
             "SELECT {cols} FROM memories AS m
              WHERE m.id = ?1 AND m.agent_id = ?2
                AND (m.valid_until IS NULL OR m.valid_until > ?3)
-               AND m.quarantined = 0
+               AND m.quarantined = 0{visible}
              LIMIT 1",
-            cols = Self::SELECT_COLS
+            cols = Self::SELECT_COLS,
+            visible = scope.and_visible("m", "?4"),
         );
         let mut stmt = conn
             .prepare(&sql)
             .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        let session = scope.session();
+        let mut bound: Vec<&dyn rusqlite::ToSql> = vec![&memory_id, &agent_id, &now_rfc];
+        if scope.is_scoped() {
+            bound.push(&session);
+        }
         let mut rows = stmt
-            .query_map(params![memory_id, agent_id, now_rfc], Self::row_to_entry)
+            .query_map(bound.as_slice(), Self::row_to_entry)
             .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
         match rows.next() {
             Some(row) => Ok(Some(row.map_err(|e| DuDuClawError::Memory(e.to_string()))?)),
@@ -1704,6 +1720,20 @@ impl SqliteMemoryEngine {
         source_event: &str,
         limit: usize,
     ) -> Result<Vec<(MemoryEntry, serde_json::Value)>> {
+        self.list_valid_by_source_event_scoped(agent_id, source_event, limit, RowScope::All)
+            .await
+    }
+
+    /// [`list_valid_by_source_event`](Self::list_valid_by_source_event) over
+    /// the rows of `scope` only (v1.84.0; the rule is part of the query, so
+    /// `limit` counts visible rows).
+    pub async fn list_valid_by_source_event_scoped(
+        &self,
+        agent_id: &str,
+        source_event: &str,
+        limit: usize,
+        scope: RowScope<'_>,
+    ) -> Result<Vec<(MemoryEntry, serde_json::Value)>> {
         let conn = self.conn.lock().await;
         crate::isolation_io::verify()?;
         let now_rfc = Utc::now().to_rfc3339();
@@ -1711,16 +1741,24 @@ impl SqliteMemoryEngine {
             "SELECT {cols}, m.metadata FROM memories AS m
              WHERE m.agent_id = ?1 AND m.source_event = ?2
                AND (m.valid_until IS NULL OR m.valid_until > ?3)
-               AND m.quarantined = 0
+               AND m.quarantined = 0{visible}
              ORDER BY m.timestamp DESC LIMIT ?4",
-            cols = Self::SELECT_COLS
+            cols = Self::SELECT_COLS,
+            visible = scope.and_visible("m", "?5"),
         );
         let mut stmt = conn
             .prepare(&sql)
             .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        let limit_i64 = limit as i64;
+        let session = scope.session();
+        let mut bound: Vec<&dyn rusqlite::ToSql> =
+            vec![&agent_id, &source_event, &now_rfc, &limit_i64];
+        if scope.is_scoped() {
+            bound.push(&session);
+        }
         let rows = stmt
             .query_map(
-                params![agent_id, source_event, now_rfc, limit as i64],
+                bound.as_slice(),
                 |row| {
                     let entry = Self::row_to_entry(row)?;
                     let raw: String = row.get(10)?;
@@ -2028,6 +2066,46 @@ impl SqliteMemoryEngine {
         provenance: crate::lineage::Provenance,
         verify: impl Fn() -> Result<()>,
     ) -> Result<crate::supersession_guard::TemporalWriteOutcome> {
+        self.store_temporal_outcome_checked_for(agent_id, entry, meta, provenance, None, verify)
+            .await
+    }
+
+    /// v1.84.0: [`store_temporal_outcome`](Self::store_temporal_outcome) made
+    /// for a reader of `reader` (the caller's own read scope, e.g. an MCP
+    /// tool on a channel turn). `None` = judge the write's conversation from
+    /// its lineage (every other caller). With `Some(scope)` the near-duplicate
+    /// gate, and for a write that is not explicitly stored also supersession,
+    /// reaffirmation and the trust guard, only consider rows of `scope`.
+    pub async fn store_temporal_outcome_for(
+        &self,
+        agent_id: &str,
+        entry: MemoryEntry,
+        meta: TemporalMeta,
+        provenance: crate::lineage::Provenance,
+        reader: Option<RowScope<'_>>,
+    ) -> Result<crate::supersession_guard::TemporalWriteOutcome> {
+        self.store_temporal_outcome_checked_for(
+            agent_id,
+            entry,
+            meta,
+            provenance,
+            reader,
+            crate::isolation_io::verify,
+        )
+        .await
+    }
+
+    /// [`store_temporal_outcome_checked`](Self::store_temporal_outcome_checked)
+    /// with the reader scope of [`store_temporal_outcome_for`](Self::store_temporal_outcome_for).
+    pub async fn store_temporal_outcome_checked_for(
+        &self,
+        agent_id: &str,
+        entry: MemoryEntry,
+        meta: TemporalMeta,
+        provenance: crate::lineage::Provenance,
+        reader: Option<RowScope<'_>>,
+        verify: impl Fn() -> Result<()>,
+    ) -> Result<crate::supersession_guard::TemporalWriteOutcome> {
         self.hooks.fire_publish(crate::lineage::HookPoint::BeforeTxn);
         let conn = self.conn.lock().await;
         crate::isolation_io::verify()?;
@@ -2035,7 +2113,8 @@ impl SqliteMemoryEngine {
         verify()?;
         Self::in_immediate_txn(&conn, || {
             verify()?;
-            let outcome = self.store_temporal_locked(&conn, agent_id, entry, meta, &provenance)?;
+            let outcome =
+                self.store_temporal_locked_for(&conn, agent_id, entry, meta, &provenance, reader)?;
             verify()?;
             Ok(outcome)
         })
@@ -2118,25 +2197,38 @@ impl SqliteMemoryEngine {
     /// Load the currently valid rows (`valid_until IS NULL`) for one triple,
     /// newest world-time first — quarantined rows included (flagged), held
     /// claims never (they carry no triple).
+    ///
+    /// v1.84.0: `scope` keeps only the rows the writing conversation may see
+    /// ([`RowScope::All`] = every row): a host-derived write of one
+    /// conversation neither expires, reaffirms nor is refused by another
+    /// conversation's row.
     fn load_active_triple(
         conn: &Connection,
         agent_id: &str,
         subject: &str,
         predicate: &str,
+        scope: RowScope<'_>,
     ) -> Result<Vec<ActiveTriple>> {
+        let sql = format!(
+            "SELECT id, object, content, metadata, access_count,
+                    COALESCE(valid_from, timestamp), origin, origin_trust,
+                    quarantined
+             FROM memories
+             WHERE agent_id = ?1 AND subject = ?2 AND predicate = ?3
+               AND valid_until IS NULL{visible}
+             ORDER BY COALESCE(valid_from, timestamp) DESC, created_at DESC, id DESC",
+            visible = scope.and_visible("memories", "?4"),
+        );
         let mut stmt = conn
-            .prepare(
-                "SELECT id, object, content, metadata, access_count,
-                        COALESCE(valid_from, timestamp), origin, origin_trust,
-                        quarantined
-                 FROM memories
-                 WHERE agent_id = ?1 AND subject = ?2 AND predicate = ?3
-                   AND valid_until IS NULL
-                 ORDER BY COALESCE(valid_from, timestamp) DESC, created_at DESC, id DESC",
-            )
+            .prepare(&sql)
             .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        let session = scope.session();
+        let mut bound: Vec<&dyn rusqlite::ToSql> = vec![&agent_id, &subject, &predicate];
+        if scope.is_scoped() {
+            bound.push(&session);
+        }
         let rows = stmt
-            .query_map(params![agent_id, subject, predicate], |r| {
+            .query_map(bound.as_slice(), |r| {
                 Ok(ActiveTriple {
                     id: r.get(0)?,
                     object: r.get(1)?,
@@ -2208,6 +2300,20 @@ impl SqliteMemoryEngine {
         meta: TemporalMeta,
         provenance: &crate::lineage::Provenance,
     ) -> Result<crate::supersession_guard::TemporalWriteOutcome> {
+        self.store_temporal_locked_for(conn, agent_id, entry, meta, provenance, None)
+    }
+
+    /// [`store_temporal_locked`](Self::store_temporal_locked) with the
+    /// reader scope of [`store_temporal_outcome_for`](Self::store_temporal_outcome_for).
+    fn store_temporal_locked_for(
+        &self,
+        conn: &Connection,
+        agent_id: &str,
+        entry: MemoryEntry,
+        meta: TemporalMeta,
+        provenance: &crate::lineage::Provenance,
+        reader: Option<RowScope<'_>>,
+    ) -> Result<crate::supersession_guard::TemporalWriteOutcome> {
         use crate::supersession_guard::TemporalWriteOutcome;
         let entry = mask_memory_entry(entry);
         let meta = mask_temporal_meta(meta);
@@ -2222,6 +2328,27 @@ impl SqliteMemoryEngine {
             Err(refusal) => return Ok(TemporalWriteOutcome::Fenced(refusal)),
         };
         self.hooks.fire_publish(crate::lineage::HookPoint::AfterFenceCheck);
+
+        // ── v1.84.0: the conversation this write belongs to ────────────────
+        // Judged from its own lineage exactly as a reader judges a row. The
+        // near-duplicate gate only compares against rows that conversation
+        // may see; a host-derived (not explicitly stored) write also only
+        // supersedes / reaffirms / is refused by such rows, so a write of
+        // conversation A never expires conversation B's value. Explicitly
+        // stored writes ([`EXPLICIT_SOURCE_EVENTS`]) and writes without one
+        // conversation (system producers, dispatch runs, imports, rows
+        // derived from several conversations) keep employee-wide semantics.
+        // A caller that knows its own read scope (`reader`) decides instead.
+        let write_conversation = conversation_scope::conversation_of_lineage(&lineage);
+        let novelty_scope = reader.unwrap_or(match write_conversation.as_deref() {
+            Some(session) => RowScope::Conversation(Some(session)),
+            None => RowScope::All,
+        });
+        let supersede_scope = if is_explicitly_stored(&entry.source_event) {
+            RowScope::All
+        } else {
+            novelty_scope
+        };
 
         let now = Utc::now();
         let now_str = now.to_rfc3339();
@@ -2304,7 +2431,7 @@ impl SqliteMemoryEngine {
             // access_count + world-time start), newest world-time first. We need
             // object/content to decide reaffirm-vs-supersede and valid_from to
             // decide the out-of-order (historical) insert.
-            let active = Self::load_active_triple(conn, agent_id, subj, pred)?;
+            let active = Self::load_active_triple(conn, agent_id, subj, pred, supersede_scope)?;
 
             if meta.quarantined {
                 if self.supersession_trust_guard {
@@ -2496,9 +2623,13 @@ impl SqliteMemoryEngine {
             && entry.layer == duduclaw_core::types::MemoryLayer::Semantic
             && (meta.subject.is_none() || meta.predicate.is_none())
         {
-            if let Some(rejection) =
-                self.check_novelty_with_conn(&conn, agent_id, entry.layer.clone(), &entry.content)
-            {
+            if let Some(rejection) = self.check_novelty_with_conn(
+                conn,
+                agent_id,
+                entry.layer.clone(),
+                &entry.content,
+                novelty_scope,
+            ) {
                 self.novelty_rejections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 warn!(
                     agent_id,
@@ -2509,7 +2640,7 @@ impl SqliteMemoryEngine {
                     "B1 novelty gate rejected temporal write: {rejection}"
                 );
                 return Err(DuDuClawError::Memory(format!(
-                    "novelty gate rejected write: {rejection}"
+                    "{NOVELTY_REJECTED_PREFIX}: {rejection}"
                 )));
             }
         }
@@ -2733,7 +2864,7 @@ impl SqliteMemoryEngine {
             return Ok(());
         };
 
-        let active = Self::load_active_triple(conn, agent_id, &subj, &pred)?;
+        let active = Self::load_active_triple(conn, agent_id, &subj, &pred, RowScope::All)?;
         let clean: Vec<&ActiveTriple> = active.iter().filter(|r| !r.quarantined).collect();
 
         // Already current with the same value → reaffirm it.
@@ -3012,7 +3143,22 @@ impl SqliteMemoryEngine {
                 );
                 return Ok(Some(crate::supersession_guard::HeldClaim { id, newly_held: false }));
             }
-            let active = Self::load_active_triple(conn, agent_id, subject, predicate)?;
+            // v1.84.0: the fact a held claim conflicts with is one the
+            // writing conversation may see — the same rows the write it
+            // replaces was refused by (`store_temporal_locked`).
+            let derived = meta.derived_from.clone().unwrap_or_default();
+            let lineage = crate::lineage::db::resolve(conn, agent_id, provenance, &derived)?;
+            let write_conversation = match &lineage {
+                Ok(rows) if !is_explicitly_stored(&entry.source_event) => {
+                    conversation_scope::conversation_of_lineage(rows)
+                }
+                _ => None,
+            };
+            let scope = match write_conversation.as_deref() {
+                Some(session) => RowScope::Conversation(Some(session)),
+                None => RowScope::All,
+            };
+            let active = Self::load_active_triple(conn, agent_id, subject, predicate, scope)?;
             conflicts_with = Self::strongest_clean_id(&active);
         }
         // L3: a claim the source fence refuses must not use a review slot.
@@ -3329,7 +3475,8 @@ impl SqliteMemoryEngine {
         let still_current = digest_matches && match claim.get("conflicts_with") {
             None => false,
             Some(v) => {
-                let active = Self::load_active_triple(conn, agent_id, &subject, &predicate)?;
+                let active =
+                    Self::load_active_triple(conn, agent_id, &subject, &predicate, RowScope::All)?;
                 match v.as_str() {
                     Some(id) => active.iter().any(|r| !r.quarantined && r.id == id),
                     None => v.is_null() && active.iter().all(|r| r.quarantined),
@@ -3527,24 +3674,47 @@ impl SqliteMemoryEngine {
         predicate: &str,
         at: DateTime<Utc>,
     ) -> Result<Option<TemporalRecord>> {
+        self.get_at_scoped(agent_id, subject, predicate, at, RowScope::All).await
+    }
+
+    /// [`get_at`](Self::get_at) over the rows of `scope` only (v1.84.0): in a
+    /// conversation, the newest value valid at `at` among the rows that
+    /// conversation may see — another conversation's newer row neither masks
+    /// it nor is returned. The visibility rule is part of the query, so
+    /// `LIMIT 1` picks among visible rows.
+    pub async fn get_at_scoped(
+        &self,
+        agent_id: &str,
+        subject: &str,
+        predicate: &str,
+        at: DateTime<Utc>,
+        scope: RowScope<'_>,
+    ) -> Result<Option<TemporalRecord>> {
         let conn = self.conn.lock().await;
         crate::isolation_io::verify()?;
         let at_str = at.to_rfc3339();
+        let sql = format!(
+            "SELECT id, content, valid_from, valid_until, superseded_by, supersedes, confidence,
+                    COALESCE(ingested_at, created_at, timestamp),
+                    invalidated_by_event, invalidated_at, metadata
+             FROM memories
+             WHERE agent_id = ?1 AND subject = ?2 AND predicate = ?3
+               AND COALESCE(valid_from, timestamp) <= ?4
+               AND (valid_until IS NULL OR valid_until > ?4){visible}
+             ORDER BY COALESCE(valid_from, timestamp) DESC
+             LIMIT 1",
+            visible = scope.and_visible("memories", "?5"),
+        );
         let mut stmt = conn
-            .prepare(
-                "SELECT id, content, valid_from, valid_until, superseded_by, supersedes, confidence,
-                        COALESCE(ingested_at, created_at, timestamp),
-                        invalidated_by_event, invalidated_at, metadata
-                 FROM memories
-                 WHERE agent_id = ?1 AND subject = ?2 AND predicate = ?3
-                   AND COALESCE(valid_from, timestamp) <= ?4
-                   AND (valid_until IS NULL OR valid_until > ?4)
-                 ORDER BY COALESCE(valid_from, timestamp) DESC
-                 LIMIT 1",
-            )
+            .prepare(&sql)
             .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        let session = scope.session();
+        let mut bound: Vec<&dyn rusqlite::ToSql> = vec![&agent_id, &subject, &predicate, &at_str];
+        if scope.is_scoped() {
+            bound.push(&session);
+        }
         let mut rows = stmt
-            .query_map(params![agent_id, subject, predicate, at_str], map_temporal_record)
+            .query_map(bound.as_slice(), map_temporal_record)
             .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
         match rows.next() {
             Some(r) => Ok(Some(r.map_err(|e| DuDuClawError::Memory(e.to_string()))?)),
@@ -4185,6 +4355,250 @@ impl SqliteMemoryEngine {
         }))
     }
 
+    /// `MemoryEngine::search` over the rows of `scope` only (v1.84.0).
+    ///
+    /// With [`RowScope::All`] this is exactly the trait's `search`. With a
+    /// conversation the visibility rule is part of the FTS query (so the
+    /// candidate `LIMIT` counts rows this conversation may see — other
+    /// conversations' rows can no longer crowd its own out), and every
+    /// graph / vector append is fetched through the same rule; appends stop
+    /// at `MAX_GRAPH_APPENDS` visible rows. Graph and vector *scores* are
+    /// still computed over the agent's whole graph / embedding space (they
+    /// only re-order visible rows; see the v1.84.0 report).
+    pub async fn search_scoped(
+        &self,
+        agent_id: &str,
+        query: &str,
+        limit: usize,
+        scope: RowScope<'_>,
+    ) -> Result<Vec<MemoryEntry>> {
+        let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
+
+        // Sanitize FTS5 query: strip ALL special characters and operators (BE-H2).
+        // Then wrap as a phrase query to prevent boolean operators (AND/OR/NOT/NEAR).
+        let cleaned: String = query
+            .chars()
+            .filter(|c| !matches!(c, '"' | '\'' | ':' | '^' | '{' | '}' | '*' | '(' | ')'))
+            .take(500)
+            .collect();
+        let sanitized_query = format!("\"{}\"", cleaned.replace('"', ""));
+        if cleaned.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Use FTS5 MATCH to find relevant memory ids, then join back for full rows.
+        // Retrieve more candidates than needed for post-retrieval re-ranking by importance.
+        let fetch_limit = (limit * 4).max(20);
+        // RFC3339 "now" bound as a param (see search_layer for rationale): default
+        // search returns only currently-valid memories (F1 temporal filter).
+        let now_rfc = Utc::now().to_rfc3339();
+        let sql = format!(
+            "SELECT {cols}
+             FROM memories_fts AS f
+             JOIN memories AS m ON m.id = f.memory_id
+             WHERE f.memories_fts MATCH ?1
+               AND f.agent_id = ?2
+               AND (m.valid_until IS NULL OR m.valid_until > ?3)
+               AND m.quarantined = 0{visible}
+             ORDER BY rank
+             LIMIT ?4",
+            cols = Self::SELECT_COLS,
+            visible = scope.and_visible("m", "?5"),
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+
+        let fetch_i64 = fetch_limit as i64;
+        let session = scope.session();
+        let mut bound: Vec<&dyn rusqlite::ToSql> =
+            vec![&sanitized_query, &agent_id, &now_rfc, &fetch_i64];
+        if scope.is_scoped() {
+            bound.push(&session);
+        }
+        let rows = stmt
+            .query_map(bound.as_slice(), Self::row_to_entry)
+            .map_err(|e| {
+                // Don't leak schema details — return generic error (BE-H2)
+                tracing::warn!("FTS5 search error: {e}");
+                DuDuClawError::Memory("Search query error — please simplify your query".to_string())
+            })?;
+
+        let mut candidates = Vec::new();
+        for row in rows {
+            let entry = row.map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+            candidates.push(entry);
+        }
+
+        // An append is attempted for at most MAX_GRAPH_APPENDS candidates
+        // employee-wide (unchanged); in a conversation the cap counts the
+        // rows actually appended, so hidden candidates cannot use it up.
+        let append_cap = crate::graph_rank::MAX_GRAPH_APPENDS;
+        let keep_trying = |tried: usize, added: usize| {
+            added < append_cap && (scope.is_scoped() || tried < append_cap)
+        };
+
+        // ── HippoRAG-lite graph ranking (arXiv:2405.14831, zero LLM cost) ──
+        // Fail-safe: zero triples (cheap COUNT gate), a query seeding no graph
+        // entity, or any error all yield `None`, leaving the FTS-only result
+        // byte-identical to before.
+        let graph_ranked = match self.graph_rank_cached(&conn, agent_id, query, &now_rfc) {
+            Ok(ranked) => ranked,
+            Err(e) => {
+                tracing::warn!("graph ranking skipped: {e}");
+                None
+            }
+        };
+
+        // Post-retrieval re-ranking by recency + importance + FTS position.
+        // Generative Agents (arXiv 2304.03442) three-dimensional weighting.
+        let now = Utc::now();
+        let w = &self.retrieval_weights;
+        let mut scored: Vec<(f64, MemoryEntry)> = candidates
+            .into_iter()
+            .enumerate()
+            .map(|(rank_pos, entry)| {
+                let fts_rank = 1.0 / (1.0 + rank_pos as f64);
+                let score = Self::base_relevance_score(&entry, now, w) + w.w_fts * fts_rank;
+                (score, entry)
+            })
+            .collect();
+
+        // Blend graph mass into FTS candidates and append graph-only hits.
+        if let Some(ranked) = &graph_ranked {
+            let ppr: std::collections::HashMap<&str, f64> =
+                ranked.iter().map(|(id, s)| (id.as_str(), *s)).collect();
+            let fts_ids: std::collections::HashSet<String> =
+                scored.iter().map(|(_, e)| e.id.clone()).collect();
+
+            for (score, entry) in scored.iter_mut() {
+                if let Some(g) = ppr.get(entry.id.as_str()) {
+                    *score += w.w_graph * g;
+                }
+            }
+
+            // Up to MAX_GRAPH_APPENDS memories FTS missed but PPR ranked in
+            // its top TOP_GRAPH_CANDIDATES — fetched with the same agent
+            // isolation + temporal validity (+ conversation) filters as the
+            // FTS query.
+            let appends = ranked
+                .iter()
+                .take(crate::graph_rank::TOP_GRAPH_CANDIDATES)
+                .filter(|(id, _)| !fts_ids.contains(id));
+            let (mut tried, mut added) = (0usize, 0usize);
+            for (id, g) in appends {
+                if !keep_trying(tried, added) {
+                    break;
+                }
+                tried += 1;
+                if let Some(entry) = Self::fetch_valid_entry(&conn, agent_id, id, &now_rfc, scope)? {
+                    let score = Self::base_relevance_score(&entry, now, w) + w.w_graph * g;
+                    scored.push((score, entry));
+                    added += 1;
+                }
+            }
+        }
+
+        // ── Semantic vector signal (w_vec) ──
+        // Fail-safe identical to the graph path: no embedder attached, no
+        // matching embedded rows, or an empty query embedding all yield `None`,
+        // leaving the FTS/graph ranking byte-identical. Cosine is computed ONLY
+        // against same-model vectors (vector_knn enforces `embedding_model`), so
+        // switching embedders never mixes incompatible spaces.
+        if let Some(embedder) = &self.embedder {
+            if let Ok(qvec) = embedder.embed(query) {
+                let knn = crate::vector::vector_knn(
+                    &conn,
+                    agent_id,
+                    &qvec,
+                    embedder.id(),
+                    &now_rfc,
+                    fetch_limit,
+                )
+                .unwrap_or(None);
+                if let Some(hits) = knn {
+                    let vmap: std::collections::HashMap<&str, f32> =
+                        hits.iter().map(|(id, s)| (id.as_str(), *s)).collect();
+                    let present: std::collections::HashSet<String> =
+                        scored.iter().map(|(_, e)| e.id.clone()).collect();
+                    // Blend into existing candidates.
+                    for (score, entry) in scored.iter_mut() {
+                        if let Some(sim) = vmap.get(entry.id.as_str()) {
+                            *score += w.w_vec * (*sim as f64);
+                        }
+                    }
+                    // Append up to MAX_GRAPH_APPENDS vector-only recall hits FTS
+                    // (and graph) missed — same agent/temporal (+ conversation)
+                    // isolation as the KNN query.
+                    let appends = hits.iter().filter(|(id, _)| !present.contains(id));
+                    let (mut tried, mut added) = (0usize, 0usize);
+                    for (id, sim) in appends {
+                        if !keep_trying(tried, added) {
+                            break;
+                        }
+                        tried += 1;
+                        if let Some(entry) =
+                            Self::fetch_valid_entry(&conn, agent_id, id, &now_rfc, scope)?
+                        {
+                            let score = Self::base_relevance_score(&entry, now, w)
+                                + w.w_vec * (*sim as f64);
+                            scored.push((score, entry));
+                            added += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // P2-1 / D2: let origin-trust participate in the ranking (I8,
+        // PoisonedRAG 2402.07867). Each score is multiplied by
+        // `(1 - w_trust) + w_trust * origin_trust`, a soft weighting rather than
+        // the old full multiply — a fully-trusted fact (`origin_trust = 1.0`,
+        // the default for every existing row) is unchanged, so behaviour
+        // degrades to the pre-D2 path for legacy data; only distilled/channel
+        // facts with trust < 1.0 are gently pushed down. A multiplier, not a
+        // filter, so nothing is silently hidden — a low-trust fact can still
+        // surface if little else competes.
+        let w_trust = w.w_trust.clamp(0.0, 1.0);
+        for (score, entry) in scored.iter_mut() {
+            let trust: f64 = conn
+                .query_row(
+                    "SELECT origin_trust FROM memories WHERE id = ?1 AND agent_id = ?2 LIMIT 1",
+                    params![entry.id, agent_id],
+                    |r| r.get::<_, f64>(0),
+                )
+                .optional()
+                .ok()
+                .flatten()
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0);
+            *score *= (1.0 - w_trust) + w_trust * trust;
+        }
+
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let results: Vec<MemoryEntry> = scored.into_iter().take(limit).map(|(_, e)| e).collect();
+
+        // Update access_count for returned results (within same lock, but after stmt is dropped)
+        let result_ids: Vec<String> = results.iter().map(|e| e.id.clone()).collect();
+        let now_str = now.to_rfc3339();
+        // stmt is already dropped here (it went out of scope after query_map)
+        if !result_ids.is_empty() {
+            Self::in_immediate_txn(&conn, || {
+                for id in &result_ids {
+                    crate::isolation_io::verify()?;
+                    conn.execute(
+                        "UPDATE memories SET access_count = access_count + 1, last_accessed = ?1 WHERE id = ?2",
+                        params![now_str, id],
+                    ).map_err(|e| DuDuClawError::Memory(format!("update memory access: {e}")))?;
+                }
+                Ok(())
+            })?;
+        }
+
+        Ok(results)
+    }
+
     /// Search memories filtered by cognitive layer.
     ///
     /// Same as `search()` but restricted to a specific layer (episodic/semantic).
@@ -4194,6 +4608,20 @@ impl SqliteMemoryEngine {
         query: &str,
         layer: &duduclaw_core::types::MemoryLayer,
         limit: usize,
+    ) -> Result<Vec<MemoryEntry>> {
+        self.search_layer_scoped(agent_id, query, layer, limit, RowScope::All).await
+    }
+
+    /// [`search_layer`](Self::search_layer) over the rows of `scope` only
+    /// (v1.84.0): the visibility rule is part of the query, so `limit` counts
+    /// rows this conversation may see.
+    pub async fn search_layer_scoped(
+        &self,
+        agent_id: &str,
+        query: &str,
+        layer: &duduclaw_core::types::MemoryLayer,
+        limit: usize,
+        scope: RowScope<'_>,
     ) -> Result<Vec<MemoryEntry>> {
         let conn = self.conn.lock().await;
         crate::isolation_io::verify()?;
@@ -4219,17 +4647,26 @@ impl SqliteMemoryEngine {
                AND f.agent_id = ?2
                AND m.layer = ?3
                AND (m.valid_until IS NULL OR m.valid_until > ?4)
-               AND m.quarantined = 0
+               AND m.quarantined = 0{visible}
              ORDER BY rank
              LIMIT ?5",
-            cols = Self::SELECT_COLS
+            cols = Self::SELECT_COLS,
+            visible = scope.and_visible("m", "?6"),
         );
         let mut stmt = conn
             .prepare(&sql)
             .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
 
+        let layer_str = layer.as_str();
+        let limit_i64 = limit as i64;
+        let session = scope.session();
+        let mut bound: Vec<&dyn rusqlite::ToSql> =
+            vec![&sanitized_query, &agent_id, &layer_str, &now_rfc, &limit_i64];
+        if scope.is_scoped() {
+            bound.push(&session);
+        }
         let rows = stmt
-            .query_map(params![sanitized_query, agent_id, layer.as_str(), now_rfc, limit as i64], Self::row_to_entry)
+            .query_map(bound.as_slice(), Self::row_to_entry)
             .map_err(|e| {
                 tracing::warn!("FTS5 layer search error: {e}");
                 DuDuClawError::Memory("Search query error".to_string())
@@ -4624,6 +5061,10 @@ impl SqliteMemoryEngine {
         // ── P2-B source lineage, tombstones, forget plans (2026-10) ──────────
         crate::lineage::db::init_schema(conn)?;
 
+        // ── v1.84.0: channel-qualified profile subjects (one-time, flagged
+        // in `memory_meta`, inside this schema transaction) ──────────────────
+        profile_subjects::migrate(conn)?;
+
         Ok(())
     }
 
@@ -4700,9 +5141,13 @@ impl MemoryEngine for SqliteMemoryEngine {
         // never be blocked here. No-op (see `check_novelty_with_conn`) when
         // no embedder is attached or the gate is disabled.
         if entry.layer == duduclaw_core::types::MemoryLayer::Semantic {
-            if let Some(rejection) =
-                self.check_novelty_with_conn(&conn, agent_id, entry.layer.clone(), &entry.content)
-            {
+            if let Some(rejection) = self.check_novelty_with_conn(
+                &conn,
+                agent_id,
+                entry.layer.clone(),
+                &entry.content,
+                RowScope::All,
+            ) {
                 self.novelty_rejections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 warn!(
                     agent_id,
@@ -4713,7 +5158,7 @@ impl MemoryEngine for SqliteMemoryEngine {
                     "B1 novelty gate rejected write: {rejection}"
                 );
                 return Err(DuDuClawError::Memory(format!(
-                    "novelty gate rejected write: {rejection}"
+                    "{NOVELTY_REJECTED_PREFIX}: {rejection}"
                 )));
             }
         }
@@ -4771,204 +5216,7 @@ impl MemoryEngine for SqliteMemoryEngine {
         query: &str,
         limit: usize,
     ) -> Result<Vec<MemoryEntry>> {
-        let conn = self.conn.lock().await;
-        crate::isolation_io::verify()?;
-
-        // Sanitize FTS5 query: strip ALL special characters and operators (BE-H2).
-        // Then wrap as a phrase query to prevent boolean operators (AND/OR/NOT/NEAR).
-        let cleaned: String = query
-            .chars()
-            .filter(|c| !matches!(c, '"' | '\'' | ':' | '^' | '{' | '}' | '*' | '(' | ')'))
-            .take(500)
-            .collect();
-        let sanitized_query = format!("\"{}\"", cleaned.replace('"', ""));
-        if cleaned.trim().is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Use FTS5 MATCH to find relevant memory ids, then join back for full rows.
-        // Retrieve more candidates than needed for post-retrieval re-ranking by importance.
-        let fetch_limit = (limit * 4).max(20);
-        // RFC3339 "now" bound as a param (see search_layer for rationale): default
-        // search returns only currently-valid memories (F1 temporal filter).
-        let now_rfc = Utc::now().to_rfc3339();
-        let sql = format!(
-            "SELECT {cols}
-             FROM memories_fts AS f
-             JOIN memories AS m ON m.id = f.memory_id
-             WHERE f.memories_fts MATCH ?1
-               AND f.agent_id = ?2
-               AND (m.valid_until IS NULL OR m.valid_until > ?3)
-               AND m.quarantined = 0
-             ORDER BY rank
-             LIMIT ?4",
-            cols = Self::SELECT_COLS
-        );
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
-
-        let rows = stmt
-            .query_map(params![sanitized_query, agent_id, now_rfc, fetch_limit as i64], Self::row_to_entry)
-            .map_err(|e| {
-                // Don't leak schema details — return generic error (BE-H2)
-                tracing::warn!("FTS5 search error: {e}");
-                DuDuClawError::Memory("Search query error — please simplify your query".to_string())
-            })?;
-
-        let mut candidates = Vec::new();
-        for row in rows {
-            let entry = row.map_err(|e| DuDuClawError::Memory(e.to_string()))?;
-            candidates.push(entry);
-        }
-
-        // ── HippoRAG-lite graph ranking (arXiv:2405.14831, zero LLM cost) ──
-        // Fail-safe: zero triples (cheap COUNT gate), a query seeding no graph
-        // entity, or any error all yield `None`, leaving the FTS-only result
-        // byte-identical to before.
-        let graph_ranked = match self.graph_rank_cached(&conn, agent_id, query, &now_rfc) {
-            Ok(ranked) => ranked,
-            Err(e) => {
-                tracing::warn!("graph ranking skipped: {e}");
-                None
-            }
-        };
-
-        // Post-retrieval re-ranking by recency + importance + FTS position.
-        // Generative Agents (arXiv 2304.03442) three-dimensional weighting.
-        let now = Utc::now();
-        let w = &self.retrieval_weights;
-        let mut scored: Vec<(f64, MemoryEntry)> = candidates
-            .into_iter()
-            .enumerate()
-            .map(|(rank_pos, entry)| {
-                let fts_rank = 1.0 / (1.0 + rank_pos as f64);
-                let score = Self::base_relevance_score(&entry, now, w) + w.w_fts * fts_rank;
-                (score, entry)
-            })
-            .collect();
-
-        // Blend graph mass into FTS candidates and append graph-only hits.
-        if let Some(ranked) = &graph_ranked {
-            let ppr: std::collections::HashMap<&str, f64> =
-                ranked.iter().map(|(id, s)| (id.as_str(), *s)).collect();
-            let fts_ids: std::collections::HashSet<String> =
-                scored.iter().map(|(_, e)| e.id.clone()).collect();
-
-            for (score, entry) in scored.iter_mut() {
-                if let Some(g) = ppr.get(entry.id.as_str()) {
-                    *score += w.w_graph * g;
-                }
-            }
-
-            // Up to MAX_GRAPH_APPENDS memories FTS missed but PPR ranked in
-            // its top TOP_GRAPH_CANDIDATES — fetched with the same agent
-            // isolation + temporal validity filters as the FTS query.
-            let appends = ranked
-                .iter()
-                .take(crate::graph_rank::TOP_GRAPH_CANDIDATES)
-                .filter(|(id, _)| !fts_ids.contains(id))
-                .take(crate::graph_rank::MAX_GRAPH_APPENDS);
-            for (id, g) in appends {
-                if let Some(entry) = Self::fetch_valid_entry(&conn, agent_id, id, &now_rfc)? {
-                    let score = Self::base_relevance_score(&entry, now, w) + w.w_graph * g;
-                    scored.push((score, entry));
-                }
-            }
-        }
-
-        // ── Semantic vector signal (w_vec) ──
-        // Fail-safe identical to the graph path: no embedder attached, no
-        // matching embedded rows, or an empty query embedding all yield `None`,
-        // leaving the FTS/graph ranking byte-identical. Cosine is computed ONLY
-        // against same-model vectors (vector_knn enforces `embedding_model`), so
-        // switching embedders never mixes incompatible spaces.
-        if let Some(embedder) = &self.embedder {
-            if let Ok(qvec) = embedder.embed(query) {
-                let knn = crate::vector::vector_knn(
-                    &conn,
-                    agent_id,
-                    &qvec,
-                    embedder.id(),
-                    &now_rfc,
-                    fetch_limit,
-                )
-                .unwrap_or(None);
-                if let Some(hits) = knn {
-                    let vmap: std::collections::HashMap<&str, f32> =
-                        hits.iter().map(|(id, s)| (id.as_str(), *s)).collect();
-                    let present: std::collections::HashSet<String> =
-                        scored.iter().map(|(_, e)| e.id.clone()).collect();
-                    // Blend into existing candidates.
-                    for (score, entry) in scored.iter_mut() {
-                        if let Some(sim) = vmap.get(entry.id.as_str()) {
-                            *score += w.w_vec * (*sim as f64);
-                        }
-                    }
-                    // Append up to MAX_GRAPH_APPENDS vector-only recall hits FTS
-                    // (and graph) missed — same agent/temporal isolation as the
-                    // KNN query.
-                    let appends = hits
-                        .iter()
-                        .filter(|(id, _)| !present.contains(id))
-                        .take(crate::graph_rank::MAX_GRAPH_APPENDS);
-                    for (id, sim) in appends {
-                        if let Some(entry) = Self::fetch_valid_entry(&conn, agent_id, id, &now_rfc)? {
-                            let score = Self::base_relevance_score(&entry, now, w)
-                                + w.w_vec * (*sim as f64);
-                            scored.push((score, entry));
-                        }
-                    }
-                }
-            }
-        }
-
-        // P2-1 / D2: let origin-trust participate in the ranking (I8,
-        // PoisonedRAG 2402.07867). Each score is multiplied by
-        // `(1 - w_trust) + w_trust * origin_trust`, a soft weighting rather than
-        // the old full multiply — a fully-trusted fact (`origin_trust = 1.0`,
-        // the default for every existing row) is unchanged, so behaviour
-        // degrades to the pre-D2 path for legacy data; only distilled/channel
-        // facts with trust < 1.0 are gently pushed down. A multiplier, not a
-        // filter, so nothing is silently hidden — a low-trust fact can still
-        // surface if little else competes.
-        let w_trust = w.w_trust.clamp(0.0, 1.0);
-        for (score, entry) in scored.iter_mut() {
-            let trust: f64 = conn
-                .query_row(
-                    "SELECT origin_trust FROM memories WHERE id = ?1 AND agent_id = ?2 LIMIT 1",
-                    params![entry.id, agent_id],
-                    |r| r.get::<_, f64>(0),
-                )
-                .optional()
-                .ok()
-                .flatten()
-                .unwrap_or(1.0)
-                .clamp(0.0, 1.0);
-            *score *= (1.0 - w_trust) + w_trust * trust;
-        }
-
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        let results: Vec<MemoryEntry> = scored.into_iter().take(limit).map(|(_, e)| e).collect();
-
-        // Update access_count for returned results (within same lock, but after stmt is dropped)
-        let result_ids: Vec<String> = results.iter().map(|e| e.id.clone()).collect();
-        let now_str = now.to_rfc3339();
-        // stmt is already dropped here (it went out of scope after query_map)
-        if !result_ids.is_empty() {
-            Self::in_immediate_txn(&conn, || {
-                for id in &result_ids {
-                    crate::isolation_io::verify()?;
-                    conn.execute(
-                        "UPDATE memories SET access_count = access_count + 1, last_accessed = ?1 WHERE id = ?2",
-                        params![now_str, id],
-                    ).map_err(|e| DuDuClawError::Memory(format!("update memory access: {e}")))?;
-                }
-                Ok(())
-            })?;
-        }
-
-        Ok(results)
+        self.search_scoped(agent_id, query, limit, RowScope::All).await
     }
 
     async fn summarize(&self, agent_id: &str, window: TimeWindow) -> Result<String> {
@@ -5434,8 +5682,13 @@ pub mod forget_source;
 pub mod subject_listing;
 pub use subject_listing::{SubjectFact, SubjectTripleForgetReport};
 
+mod profile_subjects;
+
 pub mod conversation_scope;
-pub use conversation_scope::{is_explicitly_stored, EXPLICIT_SOURCE_EVENTS};
+pub use conversation_scope::{
+    conversation_key, is_explicitly_stored, provenance_conversation, visible_to_conversation_sql,
+    RowScope, EXPLICIT_SOURCE_EVENTS,
+};
 
 #[cfg(test)]
 mod tests {

@@ -105,6 +105,31 @@ async fn distilled_facts_are_fenced_and_later_messages_pass() {
     assert_eq!(r.stored, 1);
 }
 
+/// v1.84.0 (RM-200 item 2): the distill dedup only compares against rows the
+/// turn's own conversation may see — conversation B's identical fact is not
+/// silently dropped because conversation A already holds it; inside A the
+/// repeat is still a duplicate.
+#[tokio::test(flavor = "multi_thread")]
+async fn distill_dedup_stays_in_its_conversation() {
+    let home = tempfile::tempdir().unwrap();
+    let db = home.path().join("memory.db");
+    let engine = engine_at(&db);
+    let from = |session: &str, seq: i64| duduclaw_memory::lineage::Provenance::source(test_msg(session, seq));
+    let said = || [fact("the customer pays invoices on the 25th")];
+    let r = store_facts_protected(&engine, AGENT, &said(), home.path(), &from("telegram:dedupA", 1))
+        .await
+        .unwrap();
+    assert_eq!(r.stored, 1);
+    let r = store_facts_protected(&engine, AGENT, &said(), home.path(), &from("telegram:dedupB", 2))
+        .await
+        .unwrap();
+    assert_eq!((r.stored, r.skipped), (1, 0), "A's row must not suppress B's fact");
+    let r = store_facts_protected(&engine, AGENT, &said(), home.path(), &from("telegram:dedupA", 3))
+        .await
+        .unwrap();
+    assert_eq!((r.stored, r.skipped), (0, 1), "a repeat inside A is still a duplicate");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn wiki_pointer_is_fenced_and_later_messages_pass() {
     let home = tempfile::tempdir().unwrap();
@@ -276,10 +301,11 @@ async fn profile_traits_are_fenced_and_later_messages_pass() {
     let home = tempfile::tempdir().unwrap();
     let db = home.path().join("memory.db");
     forget_msg(&db, AGENT, 10).await;
+    // v1.84.0: traits of a Telegram turn are keyed `user:telegram:u1`.
     let traits = |db: &Path| {
         let db = db.to_path_buf();
         async move {
-            duduclaw_memory::user_profile::profile_traits(&engine_at(&db), AGENT, "u1")
+            duduclaw_memory::user_profile::profile_traits(&engine_at(&db), AGENT, "telegram:u1")
                 .await
                 .unwrap()
                 .len()

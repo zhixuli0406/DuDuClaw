@@ -2469,9 +2469,16 @@ async fn store_facts_protected(
     }).collect();
 
     // Dedup guard: currently-valid distilled contents (quarantined rows are
-    // already excluded by `list_valid_by_source_event`).
+    // already excluded by `list_valid_by_source_event`). v1.84.0: for a turn
+    // of one conversation only the rows that conversation may see — another
+    // conversation's identical fact neither suppresses this one nor shows.
+    let dedup_conversation = duduclaw_memory::provenance_conversation(provenance);
+    let dedup_scope = match dedup_conversation.as_deref() {
+        Some(session) => duduclaw_memory::RowScope::Conversation(Some(session)),
+        None => duduclaw_memory::RowScope::All,
+    };
     let mut seen: HashSet<String> = engine
-        .list_valid_by_source_event(agent_id, DISTILL_SOURCE_EVENT, DEDUP_SCAN_LIMIT)
+        .list_valid_by_source_event_scoped(agent_id, DISTILL_SOURCE_EVENT, DEDUP_SCAN_LIMIT, dedup_scope)
         .await
         .map_err(|e| format!("dedup scan: {e}"))?
         .into_iter()

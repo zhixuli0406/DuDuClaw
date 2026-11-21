@@ -22,15 +22,25 @@ pub(crate) async fn handle_memory_search_by_layer(
     let layer = duduclaw_core::types::MemoryLayer::parse(layer_str);
     let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
 
-    // v1.83.0: conversation scope (rows not explicitly stored, of other conversations),
-    // applied before the limit: a scoped read over-fetches like memory_search.
     let scope = crate::mcp_memory_handlers::mcp_read_scope(agent_id);
-    let fetch = match scope {
-        crate::mcp_memory_handlers::ReadScope::Employee => limit,
-        crate::mcp_memory_handlers::ReadScope::Conversation(_) => limit.saturating_mul(4),
-    };
-    let found = match memory.search_layer(agent_id, query, &layer, fetch).await {
-        Ok(entries) => crate::mcp_memory_handlers::scope_entries(memory, agent_id, entries, &scope)
+    handle_memory_search_by_layer_in(query, layer_str, layer, limit, memory, agent_id, &scope).await
+}
+
+/// [`handle_memory_search_by_layer`] after argument parsing, with an explicit scope.
+pub(crate) async fn handle_memory_search_by_layer_in(
+    query: &str,
+    layer_str: &str,
+    layer: duduclaw_core::types::MemoryLayer,
+    limit: usize,
+    memory: &SqliteMemoryEngine,
+    agent_id: &str,
+    scope: &crate::mcp_memory_handlers::ReadScope,
+) -> Value {
+    // v1.84.0: the conversation scope (rows not explicitly stored, of other
+    // conversations) is part of the engine query, so `limit` counts only rows
+    // this turn may see; the v1.83.0 post-check stays as a second guard.
+    let found = match memory.search_layer_scoped(agent_id, query, &layer, limit, scope.rows()).await {
+        Ok(entries) => crate::mcp_memory_handlers::scope_entries(memory, agent_id, entries, scope)
             .await
             .map(|mut kept| {
                 kept.truncate(limit);
