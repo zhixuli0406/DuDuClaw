@@ -322,6 +322,8 @@ pub(crate) mod ag_ui;
 mod liveness;
 mod turns;
 
+pub(crate) use turns::configured_global_limit;
+
 pub(crate) fn current_turn_id() -> Option<String> {
     turns::TURN_ID.try_with(Clone::clone).ok()
 }
