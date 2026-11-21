@@ -268,6 +268,55 @@ pub fn log_injection_detected(
     append_audit_event(home_dir, &event);
 }
 
+/// Where a scanned inbound message came from (RM-191): the conversation,
+/// the turn and the channel (the session id's prefix). Host-chosen ids, not
+/// message text.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InjectionAuditContext<'a> {
+    pub session_id: &'a str,
+    pub turn_id: &'a str,
+    pub channel: &'a str,
+}
+
+/// Longest context id kept in an injection record (chars).
+const INJECTION_CONTEXT_MAX_CHARS: usize = 256;
+
+/// [`log_injection_detected`] with the conversation it happened in: the same
+/// `prompt_injection` event (same severity rule) whose `details` also carry
+/// `session_id`, `turn_id`, `channel` and `relaxed_rules` — the matched rules
+/// that were relaxed for a verified member and so did not block on their own.
+pub fn log_injection_detected_in(
+    home_dir: &Path,
+    agent_id: &str,
+    risk_score: u32,
+    matched_rules: &[String],
+    relaxed_rules: &[String],
+    blocked: bool,
+    context: &InjectionAuditContext<'_>,
+) {
+    let severity = if blocked {
+        Severity::Critical
+    } else {
+        Severity::Warning
+    };
+    let id = |value: &str| duduclaw_core::truncate_chars(value, INJECTION_CONTEXT_MAX_CHARS);
+    let event = AuditEvent::new(
+        "prompt_injection",
+        agent_id,
+        severity,
+        serde_json::json!({
+            "risk_score": risk_score,
+            "matched_rules": matched_rules,
+            "blocked": blocked,
+            "relaxed_rules": relaxed_rules,
+            "session_id": id(context.session_id),
+            "turn_id": id(context.turn_id),
+            "channel": id(context.channel),
+        }),
+    );
+    append_audit_event(home_dir, &event);
+}
+
 /// Log a CONTRACT.toml `must_not` violation that blocked an outgoing reply (P2-3).
 pub fn log_contract_violation(home_dir: &Path, agent_id: &str, violated_rules: &[String]) {
     let event = AuditEvent::new(
@@ -2361,6 +2410,75 @@ mod credential_declaration_sink_tests {
         assert!(rows.iter().all(|row| row["arguments_redacted"] == true));
         assert_eq!(rows[0]["success"], true);
         assert_eq!(rows[1]["success"], false);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod injection_context_tests {
+    use super::*;
+
+    fn records(home: &Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(home.join("security_audit.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    // RM-191; not run (owner forbids builds).
+    #[test]
+    fn context_record_carries_session_turn_channel_and_relaxed_rules() {
+        let home = super::tests::fresh_home();
+        let context = InjectionAuditContext {
+            session_id: "webchat:webchat:0123456789ab:c1",
+            turn_id: "turn-7",
+            channel: "webchat",
+        };
+        let matched = vec!["tool_abuse".to_string()];
+        log_injection_detected_in(&home, "agent-x", 30, &matched, &matched, false, &context);
+        let rows = records(&home);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row["event_type"], "prompt_injection");
+        assert_eq!(row["agent_id"], "agent-x");
+        assert_eq!(row["severity"], "warning", "a relaxed, unblocked match is a warning");
+        let details = &row["details"];
+        assert_eq!(details["session_id"], "webchat:webchat:0123456789ab:c1");
+        assert_eq!(details["turn_id"], "turn-7");
+        assert_eq!(details["channel"], "webchat");
+        assert_eq!(details["relaxed_rules"], serde_json::json!(["tool_abuse"]));
+        assert_eq!(details["matched_rules"], serde_json::json!(["tool_abuse"]));
+        assert_eq!(details["risk_score"], 30);
+        assert_eq!(details["blocked"], false);
+        assert!(crate::audit_chain::verify_chain(&home.join("security_audit.jsonl")).unwrap().is_intact());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn blocked_context_record_is_critical() {
+        let home = super::tests::fresh_home();
+        let matched = vec!["instruction_override".to_string()];
+        log_injection_detected_in(&home, "agent-x", 40, &matched, &[], true, &InjectionAuditContext::default());
+        let rows = records(&home);
+        assert_eq!(rows[0]["severity"], "critical");
+        assert_eq!(rows[0]["details"]["relaxed_rules"], serde_json::json!([]));
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    /// The pre-RM-191 writer keeps its exact `details` shape.
+    #[test]
+    fn legacy_record_is_unchanged() {
+        let home = super::tests::fresh_home();
+        log_injection_detected(&home, "agent-x", 40, &["instruction_override".to_string()], true);
+        let rows = records(&home);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["event_type"], "prompt_injection");
+        assert_eq!(rows[0]["severity"], "critical");
+        assert_eq!(
+            rows[0]["details"],
+            serde_json::json!({"risk_score": 40, "matched_rules": ["instruction_override"], "blocked": true})
+        );
         std::fs::remove_dir_all(home).unwrap();
     }
 }

@@ -19,6 +19,8 @@ pub(super) use identity::IdentityUnavailable;
 mod tests;
 #[cfg(test)]
 mod no_responder_tests;
+#[cfg(test)]
+mod injection_block_tests;
 pub(super) use run::TurnInput;
 
 tokio::task_local! {

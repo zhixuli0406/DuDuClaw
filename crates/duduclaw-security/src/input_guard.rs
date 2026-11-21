@@ -22,6 +22,24 @@ pub struct InputScanResult {
     pub matched_rules: Vec<String>,
     /// Human-readable summary.
     pub summary: String,
+    /// Rules (also in `matched_rules`) that matched only through patterns
+    /// relaxed for the scan's [`ScanTrust`]: they added their weight but did
+    /// not force an instant block. Always empty for [`ScanTrust::Strict`].
+    #[serde(default)]
+    pub relaxed_rules: Vec<String>,
+}
+
+/// How far the caller has proven who wrote the text (RM-191). Every caller
+/// is [`ScanTrust::Strict`] unless it can prove the narrower case below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScanTrust {
+    /// Unknown, public or third-party origin: every rule as written.
+    #[default]
+    Strict,
+    /// A verified member writing in their own conversation (decided by the
+    /// gateway's inbound channel-reply gate only). Code-call syntax pasted
+    /// by them (`eval(` …) still scores but no longer blocks on its own.
+    VerifiedMemberOwnConversation,
 }
 
 struct Rule {
@@ -30,6 +48,11 @@ struct Rule {
     /// If true, matching this rule alone is enough to block.
     instant_block: bool,
     patterns: &'static [&'static str],
+    /// Subset of `patterns` that, under
+    /// [`ScanTrust::VerifiedMemberOwnConversation`], adds the weight without
+    /// forcing an instant block. A hit on any other pattern of the rule
+    /// still blocks instantly.
+    relaxable: &'static [&'static str],
 }
 
 const RULES: &[Rule] = &[
@@ -55,6 +78,7 @@ const RULES: &[Rule] = &[
             "忘記你的指示",
             "無視先前的指示",
         ],
+        relaxable: &[],
     },
     Rule {
         name: "system_prompt_extraction",
@@ -70,6 +94,7 @@ const RULES: &[Rule] = &[
             "display your rules",
             "show your soul",
         ],
+        relaxable: &[],
     },
     Rule {
         name: "role_hijack",
@@ -101,6 +126,7 @@ const RULES: &[Rule] = &[
             "越獄模式",
             "越狱模式",
         ],
+        relaxable: &[],
     },
     Rule {
         name: "encoding_bypass",
@@ -113,6 +139,7 @@ const RULES: &[Rule] = &[
             "hex encode",
             "in pig latin",
         ],
+        relaxable: &[],
     },
     Rule {
         name: "tool_abuse",
@@ -128,6 +155,10 @@ const RULES: &[Rule] = &[
             "eval(",
             "system(",
         ],
+        // RM-191: ordinary code a member pastes (`regex.exec(`, `eval(`,
+        // `system(`). The destructive commands above stay instant for
+        // everyone.
+        relaxable: &["exec(", "eval(", "system("],
     },
     Rule {
         name: "data_exfiltration",
@@ -141,6 +172,7 @@ const RULES: &[Rule] = &[
             "wget http",
             "exfiltrate",
         ],
+        relaxable: &[],
     },
     // LoopTrap termination poisoning (arXiv:2605.05846): text that tries to
     // disable the outer loop's stop condition so an autonomous goal never
@@ -182,6 +214,7 @@ const RULES: &[Rule] = &[
             "在任何情況下都不要停止",
             "在任何情況下都不要終止",
         ],
+        relaxable: &[],
     },
     // ── WP-G3 sentence-shape families (red-team v2 techniques) ──
     //
@@ -196,24 +229,28 @@ const RULES: &[Rule] = &[
         weight: 35,
         instant_block: false,
         patterns: &[],
+        relaxable: &[],
     },
     Rule {
         name: "memory_poisoning",
         weight: 30,
         instant_block: false,
         patterns: &[],
+        relaxable: &[],
     },
     Rule {
         name: "role_provenance",
         weight: 35,
         instant_block: false,
         patterns: &[],
+        relaxable: &[],
     },
     Rule {
         name: "action_binding",
         weight: 30,
         instant_block: false,
         patterns: &[],
+        relaxable: &[],
     },
 ];
 
@@ -561,30 +598,54 @@ fn zh_prompt_extraction(t: &[char]) -> bool {
 /// result SHOULD use [`scan_input_with_audit`] so the block is recorded to the
 /// security audit log (M14).
 pub fn scan_input(text: &str, block_threshold: u32) -> InputScanResult {
+    scan_input_in_context(text, block_threshold, ScanTrust::Strict)
+}
+
+/// Whether `pattern` occurs in the lowercased text or the de-obfuscated
+/// form. The pattern is normalized so multi-space patterns still compare.
+fn pattern_hits(pattern: &str, lower: &str, normalized: &str) -> bool {
+    lower.contains(pattern) || normalized.contains(&normalize_for_matching(pattern))
+}
+
+/// How one fixed-phrase rule matched: `None` (no hit), `Some(false)` (only
+/// through its `relaxable` patterns) or `Some(true)` (through any other).
+fn phrase_rule_hit(rule: &Rule, lower: &str, normalized: &str) -> Option<bool> {
+    let hits = |p: &str| pattern_hits(p, lower, normalized);
+    if rule.patterns.iter().any(|p| !rule.relaxable.contains(p) && hits(*p)) {
+        Some(true)
+    } else if rule.relaxable.iter().any(|p| hits(*p)) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// [`scan_input`] for a caller that knows how far the writer is trusted
+/// (RM-191). [`ScanTrust::Strict`] is exactly [`scan_input`]. Under
+/// [`ScanTrust::VerifiedMemberOwnConversation`] a rule matched only through
+/// its `relaxable` patterns still adds its weight (so it stacks with other
+/// rules up to the threshold) but does not force an instant block; the rule
+/// is listed in both `matched_rules` and `relaxed_rules`.
+pub fn scan_input_in_context(text: &str, block_threshold: u32, trust: ScanTrust) -> InputScanResult {
     let sanitized = sanitize_unicode(text);
     let lower = sanitized.to_lowercase();
     // De-obfuscated form for separator-insertion bypass detection.
     let normalized = normalize_for_matching(&sanitized);
     let mut total_score: u32 = 0;
     let mut matched = Vec::new();
+    let mut relaxed = Vec::new();
     let mut force_block = false;
 
+    // One match per rule is enough.
     for rule in RULES {
-        for pattern in rule.patterns {
-            // Match against the lowercased text first, then the de-obfuscated
-            // form. The pattern itself is normalized so that multi-space
-            // patterns still compare correctly.
-            let norm_pattern = normalize_for_matching(pattern);
-            if lower.contains(pattern) || normalized.contains(&norm_pattern) {
-                if !matched.contains(&rule.name.to_string()) {
-                    matched.push(rule.name.to_string());
-                    total_score = total_score.saturating_add(rule.weight);
-                    if rule.instant_block {
-                        force_block = true;
-                    }
-                }
-                break; // One match per rule is enough
-            }
+        let Some(strict_hit) = phrase_rule_hit(rule, &lower, &normalized) else { continue };
+        matched.push(rule.name.to_string());
+        total_score = total_score.saturating_add(rule.weight);
+        let relax = rule.instant_block && !strict_hit && trust == ScanTrust::VerifiedMemberOwnConversation;
+        if relax {
+            relaxed.push(rule.name.to_string());
+        } else if rule.instant_block {
+            force_block = true;
         }
     }
 
@@ -666,6 +727,7 @@ pub fn scan_input(text: &str, block_threshold: u32) -> InputScanResult {
         blocked,
         matched_rules: matched,
         summary,
+        relaxed_rules: relaxed,
     }
 }
 
@@ -696,6 +758,39 @@ pub fn scan_input_with_audit(
     }
     result
 }
+
+pub use crate::audit::InjectionAuditContext;
+
+/// [`scan_input_with_audit`] for a caller that knows the conversation (RM-191):
+/// scans with `trust` ([`scan_input_in_context`]) and records any match —
+/// relaxed ones included, at warning level — with the session, turn, channel
+/// and `relaxed_rules` ([`crate::audit::log_injection_detected_in`]).
+pub fn scan_input_with_audit_in(
+    text: &str,
+    block_threshold: u32,
+    home_dir: &Path,
+    agent_id: &str,
+    trust: ScanTrust,
+    context: &InjectionAuditContext<'_>,
+) -> InputScanResult {
+    let result = scan_input_in_context(text, block_threshold, trust);
+    if !result.matched_rules.is_empty() {
+        crate::audit::log_injection_detected_in(
+            home_dir,
+            agent_id,
+            result.risk_score,
+            &result.matched_rules,
+            &result.relaxed_rules,
+            result.blocked,
+            context,
+        );
+    }
+    result
+}
+
+#[cfg(test)]
+#[path = "input_guard_trust_tests.rs"]
+mod trust_tests;
 
 #[cfg(test)]
 mod tests {

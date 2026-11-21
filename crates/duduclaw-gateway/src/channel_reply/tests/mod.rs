@@ -4,6 +4,7 @@ mod ccr_guarded_reply;
 mod fallback;
 mod future_size;
 mod googlechat_no_responder;
+mod live_only_notice;
 mod misc;
 mod no_responder_all_channels;
 mod operator_direct_api;
