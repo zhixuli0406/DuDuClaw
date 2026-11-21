@@ -169,10 +169,10 @@ pub fn total_install_bytes() -> u64 {
 }
 
 /// Install everything. Idempotent: an already-verified file is skipped, a
-/// partially downloaded one resumes.
+/// partially downloaded one restarts.
 ///
-/// `cancel` is polled between chunks; cancelling leaves the `.part` files in
-/// place so a later install resumes rather than restarts.
+/// `cancel` is polled between chunks; cancelling removes the current temporary
+/// file so a later install restarts.
 pub async fn install(
     dirs: &InstallDirs,
     progress: ProgressFn,
