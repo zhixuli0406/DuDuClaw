@@ -93,7 +93,9 @@ pub fn installed_problem(spec: &ModelSpec, home: &Path) -> Option<String> {
 /// Bytes an online install moves on this platform (model + ORT if missing).
 pub fn total_install_bytes(spec: &ModelSpec, home: &Path) -> u64 {
     let ort = match ort_manifest::ort_archive_for_current_platform() {
-        Some(a) if !onnx_install::ort_installed(&ort_root(home)) => a.size,
+        Some(a) if !onnx_install::ort_installed(&ort_root(home)) => {
+            onnx_install::max_source_size(a)
+        }
         _ => 0,
     };
     spec.total_bytes() + ort

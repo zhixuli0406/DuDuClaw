@@ -109,6 +109,76 @@ async fn fallback_case(first_error: Option<&str>, corrupt_first: bool) {
 }
 
 #[tokio::test]
+async fn fallback_progress_uses_second_source_size_and_logs_success() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let lib_dir = manifest::ort_lib_dir(root);
+    std::fs::create_dir_all(&lib_dir).unwrap();
+    let first_bytes = zip_bytes(&[("lib.so", b"good")]);
+    let second_bytes = zip_bytes(&[("lib.so", b"good"), ("padding", &[0u8; 96])]);
+    let first = source(&first_bytes, "lib.so", "https://github.com/first?token=secret");
+    let second = source(&second_bytes, "lib.so", "https://api.nuget.org/second?token=secret");
+    let spec = archive(first, second);
+    let pins = [(4, hex_lower(&Sha256::digest(b"good")))];
+    let pins = [(pins[0].0, pins[0].1.as_str())];
+    let cancel = Arc::new(AtomicBool::new(false));
+    // Exercise the same source loop with the existing fake-fetcher seam.
+    let mut reports = Vec::new();
+    let reserved = max_source_size(&spec);
+    install_from_sources(root, &spec, &pins, &cancel, |src, dest| {
+        let data = if src.url == first.url { None } else { Some(second_bytes.clone()) };
+        reports.push(0);
+        let result = if let Some(data) = data {
+            let mut part = new_temp(&dest).unwrap();
+            part.write_all(&data).unwrap();
+            reports.push(((data.len() as u128 * reserved as u128) / src.size as u128) as u64);
+            Ok(part)
+        } else {
+            Err(OnnxError::msg("HTTP 404"))
+        };
+        std::future::ready(result)
+    }).await.unwrap();
+
+    assert_eq!(reserved, second.size);
+    reports.push(reserved);
+    assert!(reports.iter().all(|value| *value <= reserved));
+    assert_eq!(reports.last(), Some(&reserved));
+    assert_eq!(std::fs::read(lib_dir.join("lib.so")).unwrap(), b"good");
+    // install_from_sources' success record is asserted through its pure
+    // formatting helper so the test does not depend on global stderr capture.
+    let record = super::success_record(spec.sources().nth(1).unwrap());
+    assert_eq!(record, "ONNX Runtime 來源成功：kind=Zip host=api.nuget.org");
+    assert!(!record.contains("secret"));
+}
+
+#[tokio::test]
+async fn first_smaller_source_success_fills_reserved_progress_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let lib_dir = manifest::ort_lib_dir(root);
+    std::fs::create_dir_all(&lib_dir).unwrap();
+    let small_bytes = zip_bytes(&[("lib.so", b"good")]);
+    let large_bytes = zip_bytes(&[("lib.so", b"good"), ("padding", &[0u8; 96])]);
+    let first = source(&small_bytes, "lib.so", "small");
+    let second = source(&large_bytes, "lib.so", "large");
+    let spec = archive(first, second);
+    let pins = [(4, hex_lower(&Sha256::digest(b"good")))];
+    let pins = [(pins[0].0, pins[0].1.as_str())];
+    let cancel = Arc::new(AtomicBool::new(false));
+    let reserved = max_source_size(&spec);
+    let mut reports = vec![0, ((first.size as u128 * reserved as u128) / first.size as u128) as u64];
+    install_from_sources(root, &spec, &pins, &cancel, |src, dest| {
+        let mut part = new_temp(&dest).unwrap();
+        part.write_all(&small_bytes).unwrap();
+        assert_eq!(src.url, "small");
+        std::future::ready(Ok(part))
+    }).await.unwrap();
+    reports.push(reserved);
+    assert!(reports.iter().all(|value| *value <= reserved));
+    assert_eq!(reports.last(), Some(&reserved));
+}
+
+#[tokio::test]
 async fn source_404_falls_back_in_order() {
     fallback_case(Some("HTTP 404"), false).await;
 }
