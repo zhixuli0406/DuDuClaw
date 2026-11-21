@@ -38,6 +38,9 @@ mac_address = "1"
 # Error handling
 thiserror = { workspace = true }
 
+# Logging (fixed messages only, never licence content)
+tracing = { workspace = true }
+
 # Filesystem
 dirs = "5"
 fs2 = "0.4"

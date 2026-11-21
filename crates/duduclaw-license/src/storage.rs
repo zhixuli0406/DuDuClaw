@@ -155,6 +155,68 @@ fn parse_license(bytes: &[u8]) -> Result<License> {
         .map_err(|e| LicenseError::ParseError(format!("invalid license JSON: {e}")))
 }
 
+/// The previous `license.json` worth keeping as the backup, read only when
+/// the final component is the regular directory entry itself: never through
+/// a symbolic link (an operator-managed link may point at a file this process
+/// can read and the link's owner cannot), and only when the descriptor opened
+/// is that same entry (device + inode) and the content parses as a licence
+/// document. `Ok(None)` = write no backup; `Err` = an I/O failure that aborts
+/// the save, as before.
+fn backup_candidate(path: &Path) -> std::result::Result<Option<Vec<u8>>, StoreError> {
+    let entry = match fs::symlink_metadata(path) {
+        Ok(entry) => entry,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(StoreError::Io(error)),
+    };
+    if !entry.file_type().is_file() {
+        // A link (followed for reads, never copied), FIFO, directory, …
+        tracing::debug!("previous license file is not a regular directory entry; no backup written");
+        return Ok(None);
+    }
+    let file = match open_no_follow(fs::OpenOptions::new().read(true), path) {
+        Ok(file) => file,
+        Err(StoreError::Io(error)) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(StoreError::Refused(_)) => {
+            tracing::debug!("previous license file changed type while opening; no backup written");
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let opened = file.metadata().map_err(StoreError::Io)?;
+    if !same_entry(&entry, &opened) {
+        tracing::debug!("previous license file was replaced while opening; no backup written");
+        return Ok(None);
+    }
+    let previous = match read_opened_store_file(Ok(file)) {
+        Ok(Some(previous)) => previous,
+        Ok(None) | Err(StoreError::Refused(_)) => {
+            tracing::debug!("previous license file is not a usable regular file; no backup written");
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    // Shape only: whether the old licence was valid does not matter here.
+    if parse_license(&previous).is_err() {
+        tracing::debug!("previous license file is not a license document; no backup written");
+        return Ok(None);
+    }
+    Ok(Some(previous))
+}
+
+/// The opened descriptor is the directory entry examined before opening.
+#[cfg(unix)]
+fn same_entry(entry: &fs::Metadata, opened: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    entry.dev() == opened.dev() && entry.ino() == opened.ino()
+}
+
+/// No stable file identity in std; the reparse-point open plus the
+/// regular-file check already refuse a link.
+#[cfg(not(unix))]
+fn same_entry(_entry: &fs::Metadata, _opened: &fs::Metadata) -> bool {
+    true
+}
+
 /// Backup filename kept after a successful overwrite (for self-serve transfer).
 pub const BACKUP_LICENSE_FILENAME: &str = "license.json.bak";
 
@@ -204,7 +266,8 @@ pub fn load_from(path: &Path) -> Result<License> {
 /// Save a license to the default path atomically.
 ///
 /// Writes to a temp file in the same directory, then renames over the target.
-/// If a previous license existed, it is preserved as `license.json.bak`.
+/// If a previous license existed as a regular file (not a link), it is
+/// preserved as `license.json.bak`.
 /// On Unix, the saved file is `chmod 0600`.
 pub fn save_default(license: &License) -> Result<PathBuf> {
     let path = default_license_path()?;
@@ -246,6 +309,12 @@ impl StoreContents {
     /// The installed licence, `None` when there is no licence file.
     pub fn license(&self) -> Result<Option<License>> {
         self.license.as_deref().map(parse_license).transpose()
+    }
+
+    /// SHA-256 of the licence bytes read (at most [`MAX_LICENSE_FILE_BYTES`]),
+    /// `None` when there is no licence file.
+    pub fn license_digest(&self) -> Option<[u8; 32]> {
+        self.license.as_deref().map(|bytes| Sha256::digest(bytes).into())
     }
 
     pub fn snapshot(&self) -> LicenseSnapshot {
@@ -325,14 +394,15 @@ impl LockedLicenseStore {
     pub fn save(&self, license: &License) -> Result<()> {
         // Preserve the previous complete file. Backup failure must not lose it
         // through a partial truncate, even though backup remains best effort.
-        // A refused file (FIFO, oversized) is no licence: replaced
-        // (the rename swaps the directory entry, it never writes through a
-        // link) without a backup.
-        match read_store_file(&self.path) {
+        // Only a regular `license.json` holding a licence document is backed
+        // up; a link, FIFO, oversized or non-licence file is replaced (the
+        // rename swaps the directory entry, it never writes through a link)
+        // without a backup.
+        match backup_candidate(&self.path) {
             Ok(Some(previous)) => {
                 let _ = atomic_write(&self.path.with_file_name(BACKUP_LICENSE_FILENAME), &previous);
             }
-            Ok(None) | Err(StoreError::Refused(_)) => {}
+            Ok(None) => {}
             Err(error) => return Err(storage_error(error)),
         }
         let json = serde_json::to_vec_pretty(license).map_err(storage_error)?;
@@ -801,6 +871,52 @@ mod tests {
         assert!(!fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
         assert_eq!(load_from(&path).unwrap().subscription_id, "replacement");
         assert_eq!(fs::read(&real).unwrap(), before);
+    }
+
+    /// M1: a `license.json` link pointing at a file the gateway can read is
+    /// never copied into the DuDuClaw home as the backup.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_license_to_a_sensitive_file_writes_no_backup() {
+        let tmp = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        let sensitive = elsewhere.path().join("sensitive.txt");
+        fs::write(&sensitive, b"not for the link owner\n").unwrap();
+        let path = tmp.path().join("license.json");
+        std::os::unix::fs::symlink(&sensitive, &path).unwrap();
+        save_to(&fixture_license(), &path).unwrap();
+        assert!(!tmp.path().join(BACKUP_LICENSE_FILENAME).exists());
+        assert_eq!(fs::read(&sensitive).unwrap(), b"not for the link owner\n");
+        assert!(!fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+        assert_eq!(load_from(&path).unwrap().subscription_id, fixture_license().subscription_id);
+
+        // A link to a real licence is not backed up either.
+        let real = elsewhere.path().join("license.json");
+        save_to(&fixture_license(), &real).unwrap();
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&real, &path).unwrap();
+        save_to(&fixture_license(), &path).unwrap();
+        assert!(!tmp.path().join(BACKUP_LICENSE_FILENAME).exists());
+    }
+
+    #[test]
+    fn regular_license_backup_is_the_previous_bytes_and_garbage_is_not_backed_up() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("license.json");
+        let backup = tmp.path().join(BACKUP_LICENSE_FILENAME);
+        save_to(&fixture_license(), &path).unwrap();
+        let previous = fs::read(&path).unwrap();
+        let mut replacement = fixture_license();
+        replacement.subscription_id = "replacement".into();
+        save_to(&replacement, &path).unwrap();
+        assert_eq!(fs::read(&backup).unwrap(), previous);
+
+        let garbage = TempDir::new().unwrap();
+        let path = garbage.path().join("license.json");
+        fs::write(&path, b"{\"not\": \"a licence\"}").unwrap();
+        save_to(&replacement, &path).unwrap();
+        assert!(!garbage.path().join(BACKUP_LICENSE_FILENAME).exists());
+        assert_eq!(load_from(&path).unwrap().subscription_id, "replacement");
     }
 
     #[cfg(unix)]

@@ -267,6 +267,9 @@ pub struct LicenseRuntime {
     /// RM-175: single-flight / spacing for [`Self::sync_now`] and the cheap
     /// disk stamp for [`Self::reload_from_disk_if_changed`].
     sync: Arc<SyncGate>,
+    /// Permits for blocking licence store operations: the process-wide
+    /// [`STORE_OPS`] (tests substitute their own).
+    store_ops: Arc<StoreOps>,
 }
 
 /// Minimum spacing between control-plane refreshes, scheduled or on demand
@@ -280,9 +283,65 @@ const LICENSE_LOCK_DEADLINE: StdDuration = StdDuration::from_secs(5);
 /// Boot waits longer so a slow CLI write does not select OpenSource at startup.
 const BOOT_LICENSE_LOCK_DEADLINE: StdDuration = StdDuration::from_secs(30);
 
-/// Upper bound for one locked store operation run on a blocking thread
-/// (lock wait plus reading / writing two files of at most 64 KiB).
+/// Overall bound of the boot-time licence load (lock wait plus reading two
+/// files of at most 64 KiB). Past it the gateway starts as for an unreadable
+/// licence and the 60-second watcher applies the licence later.
+const BOOT_LOAD_DEADLINE: StdDuration = StdDuration::from_secs(45);
+
+/// How long a caller waits for one store operation run on a blocking thread
+/// (lock wait plus reading / writing two files of at most 64 KiB). Past it
+/// the caller gives up; the operation keeps its permit until it really ends.
 const STORE_OP_DEADLINE: StdDuration = StdDuration::from_secs(10);
+
+/// Licence store operations that may run on blocking threads at once,
+/// process-wide. Blocking file I/O cannot be cancelled: on a hung mount at
+/// most this many threads are ever stuck, later callers get `Busy` at once.
+const STORE_OP_PERMITS: usize = 2;
+
+/// A store refused as unusable is not read again until its stamp changes or
+/// this long has passed, whichever comes first.
+const REJECTED_RETRY: StdDuration = StdDuration::from_secs(15 * 60);
+
+/// Next scheduled phone-home attempt after a cycle that adopted no verified
+/// answer (the sync that had just run was offline / failed): one hour, not
+/// the day floor of [`LicenseRuntime::next_phone_home_sleep`].
+const SCHEDULED_RETRY: StdDuration = StdDuration::from_secs(60 * 60);
+
+/// Permits for blocking licence store operations ([`run_store_op`]).
+struct StoreOps {
+    permits: Arc<tokio::sync::Semaphore>,
+    /// Blocking closures submitted through these permits.
+    #[cfg(test)]
+    spawned: std::sync::atomic::AtomicUsize,
+}
+
+impl StoreOps {
+    /// A private set with the production limit (tests of the limit).
+    #[cfg(test)]
+    fn new() -> Self {
+        Self::with_permits(STORE_OP_PERMITS)
+    }
+
+    fn with_permits(permits: usize) -> Self {
+        Self {
+            permits: Arc::new(tokio::sync::Semaphore::new(permits)),
+            #[cfg(test)]
+            spawned: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+/// The one process-wide set of store permits, shared by every runtime and by
+/// the boot-time load.
+static STORE_OPS: std::sync::LazyLock<Arc<StoreOps>> = std::sync::LazyLock::new(|| {
+    // Unit tests run in parallel in one process and some hold a permit for
+    // a whole lock deadline; tests of the limit use their own `StoreOps::new()`.
+    #[cfg(test)]
+    let permits = 64;
+    #[cfg(not(test))]
+    let permits = STORE_OP_PERMITS;
+    Arc::new(StoreOps::with_permits(permits))
+});
 
 /// How long a caller waits for a sync already in flight before skipping.
 /// A flight holder is bounded by: DNS + request (each at most
@@ -316,9 +375,28 @@ struct SyncGate {
     last: std::sync::Mutex<Option<SyncOutcome>>,
     /// `license.json` + revocation marker as last reconciled with memory.
     disk_stamp: std::sync::Mutex<Option<DiskStamp>>,
-    /// Stamp of a store refused as unusable (FIFO, oversized,
-    /// malformed). Not read again until the stamp changes.
-    rejected_stamp: std::sync::Mutex<Option<DiskStamp>>,
+    /// A store refused as unusable (FIFO, oversized, malformed). Not read
+    /// again by the watcher until the stamp changes or [`REJECTED_RETRY`]
+    /// has passed; a forced sync ignores it.
+    rejected: std::sync::Mutex<Option<RejectedStore>>,
+}
+
+/// Identity of a refused store, and when it was refused.
+#[derive(Debug, Clone)]
+struct RejectedStore {
+    stamp: DiskStamp,
+    /// SHA-256 of the licence bytes read, for a regular file within the
+    /// size cap refused for its content; `None` for metadata-only refusals
+    /// (FIFO, oversized, non-regular).
+    digest: Option<[u8; 32]>,
+    at: tokio::time::Instant,
+}
+
+impl RejectedStore {
+    /// Still suppresses a re-read of a store with `stamp`.
+    fn covers(&self, stamp: &DiskStamp) -> bool {
+        self.stamp == *stamp && self.at.elapsed() < REJECTED_RETRY
+    }
 }
 
 impl SyncGate {
@@ -336,8 +414,11 @@ impl SyncGate {
 }
 
 /// Cheap identity of the files a CLI writer changes: type, length,
-/// modification time and (Unix) device + inode of `license.json` and of the
-/// revocation marker. Licence links are resolved so target replacement is noticed.
+/// modification time and (Unix) status-change time and device + inode of
+/// `license.json` and of the revocation marker. Licence links are resolved so
+/// target replacement is noticed. The status-change time cannot be set back
+/// by a writer, so an in-place rewrite that restores length and mtime still
+/// changes the stamp.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DiskStamp {
     license: Option<FileStamp>,
@@ -349,6 +430,8 @@ struct FileStamp {
     regular: bool,
     len: u64,
     modified: Option<std::time::SystemTime>,
+    /// Unix ctime (seconds, nanoseconds); `(0, 0)` elsewhere.
+    changed: (i64, i64),
     device: u64,
     inode: u64,
 }
@@ -372,12 +455,15 @@ fn file_stamp(path: &Path, follow: bool) -> Option<Option<FileStamp>> {
         Ok(meta) => {
             #[cfg(unix)]
             let (device, inode) = (std::os::unix::fs::MetadataExt::dev(&meta), std::os::unix::fs::MetadataExt::ino(&meta));
+            #[cfg(unix)]
+            let changed = (std::os::unix::fs::MetadataExt::ctime(&meta), std::os::unix::fs::MetadataExt::ctime_nsec(&meta));
             #[cfg(not(unix))]
-            let (device, inode) = (0, 0);
+            let (device, inode, changed) = (0, 0, (0, 0));
             Some(Some(FileStamp {
                 regular: meta.file_type().is_file(),
                 len: meta.len(),
                 modified: meta.modified().ok(),
+                changed,
                 device,
                 inode,
             }))
@@ -390,8 +476,9 @@ fn file_stamp(path: &Path, follow: bool) -> Option<Option<FileStamp>> {
 /// Why the locked store could not be read this time.
 #[derive(Debug)]
 enum StoreReadError {
-    /// `license.json.lock` held past [`LICENSE_LOCK_DEADLINE`] (or the
-    /// whole operation past [`STORE_OP_DEADLINE`]).
+    /// `license.json.lock` held past [`LICENSE_LOCK_DEADLINE`], the whole
+    /// operation past [`STORE_OP_DEADLINE`], or every store permit taken
+    /// by operations still running.
     Busy,
     /// A store file is not regular, oversized, malformed, or an internal link:
     /// pointless to retry until it changes.
@@ -421,15 +508,37 @@ impl From<storage::StoreError> for StoreReadError {
 }
 
 /// Run a store operation on a blocking thread: the lock is tried for at most
-/// [`LICENSE_LOCK_DEADLINE`] and the whole operation is abandoned after
-/// [`STORE_OP_DEADLINE`] (the thread finishes on its own and releases the
-/// lock when it does). Never blocks an async worker.
-async fn run_store_op<T, F>(op: F) -> Result<T, StoreReadError>
+/// [`LICENSE_LOCK_DEADLINE`] and the caller stops waiting after
+/// [`STORE_OP_DEADLINE`]. Never blocks an async worker.
+async fn run_store_op<T, F>(ops: &StoreOps, op: F) -> Result<T, StoreReadError>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T, StoreReadError> + Send + 'static,
 {
-    match tokio::time::timeout(STORE_OP_DEADLINE, tokio::task::spawn_blocking(op)).await {
+    run_store_op_within(ops, STORE_OP_DEADLINE, op).await
+}
+
+/// [`run_store_op`] with its own wait bound. A permit of `ops` is taken
+/// before anything is submitted and moves into the blocking closure, so it is
+/// released only when the operation really ends (a read on a hung mount may
+/// never end). Without a free permit the answer is `Busy` at once and no
+/// blocking work is submitted.
+async fn run_store_op_within<T, F>(ops: &StoreOps, deadline: StdDuration, op: F) -> Result<T, StoreReadError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, StoreReadError> + Send + 'static,
+{
+    let Ok(permit) = ops.permits.clone().try_acquire_owned() else {
+        debug!("license store operations still running; skipped this time");
+        return Err(StoreReadError::Busy);
+    };
+    #[cfg(test)]
+    ops.spawned.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let task = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        op()
+    });
+    match tokio::time::timeout(deadline, task).await {
         Ok(Ok(result)) => result,
         Ok(Err(_)) => Err(StoreReadError::Io("license store task failed".into())),
         Err(_) => Err(StoreReadError::Busy),
@@ -437,8 +546,8 @@ where
 }
 
 /// Lock the store at `path` (bounded) and read it once.
-async fn lock_and_read(path: PathBuf) -> Result<(storage::LockedLicenseStore, storage::StoreContents), StoreReadError> {
-    run_store_op(move || {
+async fn lock_and_read(ops: &StoreOps, path: PathBuf) -> Result<(storage::LockedLicenseStore, storage::StoreContents), StoreReadError> {
+    run_store_op(ops, move || {
         let store = storage::LockedLicenseStore::acquire_within(&path, LICENSE_LOCK_DEADLINE)?;
         let contents = store.read_contents()?;
         Ok((store, contents))
@@ -482,6 +591,12 @@ impl SyncOutcome {
             Self::Failed { .. } => "failed",
             Self::Busy { .. } => "busy",
         }
+    }
+
+    /// The control plane gave a verified answer (refreshed, pending rebind or
+    /// revoked). Only such a result counts as a scheduled cycle's refresh.
+    fn is_verified_answer(&self) -> bool {
+        matches!(self, Self::Updated | Self::Unchanged | Self::PendingRebind | Self::Revoked)
     }
 
     /// Operator-facing zh-TW sentence (the dashboard localizes by `as_str`).
@@ -645,6 +760,7 @@ impl LicenseRuntime {
             home_dir,
             control_url,
             sync: Arc::default(),
+            store_ops: STORE_OPS.clone(),
         }
     }
 
@@ -813,7 +929,7 @@ impl LicenseRuntime {
         // Lock, write and re-read off the async workers, the lock bounded.
         let path = self.home_dir.join(storage::DEFAULT_LICENSE_FILENAME);
         let to_save = license.clone();
-        let (store, contents) = run_store_op(move || {
+        let (store, contents) = run_store_op(&self.store_ops, move || {
             let store = storage::LockedLicenseStore::acquire_within(&path, LICENSE_LOCK_DEADLINE)?;
             store.save(&to_save).map_err(|e| StoreReadError::Io(e.to_string()))?;
             let contents = store.read_contents();
@@ -1163,24 +1279,45 @@ fn refreshed_relay_key_reason(license: &License, local_pubkey: Option<&str>) -> 
     }
 }
 
+/// The boot-time disk read: `None` when neither the licence nor the
+/// revocation marker exists.
+fn boot_read_store(path: &Path) -> Result<Option<storage::StoreContents>, StoreReadError> {
+    if !path.try_exists().map_err(|e| StoreReadError::Io(e.to_string()))?
+        && !path.with_file_name(REVOKED_FILENAME).try_exists().map_err(|e| StoreReadError::Io(e.to_string()))? {
+        return Ok(None);
+    }
+    let store = storage::LockedLicenseStore::acquire_within(path, BOOT_LICENSE_LOCK_DEADLINE)?;
+    Ok(Some(store.read_contents()?))
+}
+
 async fn load_and_validate(home_dir: &Path, registry: &PublicKeyRegistry, gate: &FeatureGate) -> (Option<License>, Option<&'static str>) {
     let path = home_dir.join(storage::DEFAULT_LICENSE_FILENAME);
+    load_and_validate_from(registry, gate, &STORE_OPS, BOOT_LOAD_DEADLINE, move || boot_read_store(&path)).await
+}
+
+/// [`load_and_validate`] with the disk read, its permits and its overall
+/// bound injected (tests).
+async fn load_and_validate_from<F>(registry: &PublicKeyRegistry, gate: &FeatureGate, ops: &StoreOps,
+    deadline: StdDuration, read: F) -> (Option<License>, Option<&'static str>)
+where
+    F: FnOnce() -> Result<Option<storage::StoreContents>, StoreReadError> + Send + 'static,
+{
     // Only disk work waits on a blocking thread; validation keeps the caller's
-    // fingerprint context. Boot has its own bound, not the running 5 s / 10 s bounds.
-    let contents = tokio::task::spawn_blocking(move || {
-        if !path.try_exists().map_err(storage::StoreError::Io)?
-            && !path.with_file_name(REVOKED_FILENAME).try_exists().map_err(storage::StoreError::Io)? {
-            return Ok(None);
-        }
-        let store = storage::LockedLicenseStore::acquire_within(&path, BOOT_LICENSE_LOCK_DEADLINE)?;
-        store.read_contents().map(Some)
-    }).await;
+    // fingerprint context. The whole boot read (lock wait included) has its
+    // own bound, not the running 5 s / 10 s bounds; past it the read keeps
+    // its permit until it really ends and the watcher applies the licence.
+    let contents = run_store_op_within(ops, deadline, read).await;
     let validated = match contents {
-        Ok(Ok(Some(contents))) => validate_store_contents(registry, gate, &contents),
-        Ok(Ok(None)) => Ok(None),
-        _ => Err("unreadable"),
+        Ok(Some(contents)) => validate_store_contents(registry, gate, &contents),
+        Ok(None) => Ok(None),
+        Err(StoreReadError::Busy) => {
+            clear_effective_fingerprint();
+            warn!("license file not readable within the boot deadline; running in OpenSource mode until the license watcher can read it");
+            return (None, Some("unreadable"));
+        }
+        Err(_) => Err("unreadable"),
     };
-    // The existing warning below is emitted once, including on boot lock timeout.
+    // One warning per boot: the deadline / lock timeout above, or the one below.
     match validated {
         Ok(Some(license)) => {
             let matched = license.validate_any(cached_candidates(), gate.phone_home_interval_days(license.tier),
@@ -1405,24 +1542,17 @@ pub async fn agent_cap_from_disk(home_dir: &std::path::Path) -> AgentCap {
 // ── Phone-home loop ───────────────────────────────────────────
 
 async fn phone_home_loop(runtime: LicenseRuntime) {
+    let mut next_sleep = runtime.cadence_sleep().await;
     loop {
-        let next_sleep = match runtime.next_phone_home_sleep().await {
-            Some(d) => d,
-            None => {
-                // No license or OpenSource — wait a day and re-check
-                // (operator may install one mid-flight).
-                StdDuration::from_secs(24 * 60 * 60)
-            }
-        };
-
         tokio::time::sleep(next_sleep).await;
 
-        // Same flight and 30 s spacing as `sync_now`: a dashboard / probe
-        // sync that just ran counts as this cycle's refresh, and a flight
-        // held for too long skips this cycle. Either way the next sleep is
-        // re-computed from the stored `last_phone_home`, so a refresh that
-        // is still due is retried on the normal cadence.
-        runtime.scheduled_phone_home(|| async {
+        // Same flight and 30 s spacing as `sync_now`: a verified dashboard /
+        // probe sync that just ran counts as this cycle's refresh and the
+        // next sleep is re-computed from the stored `last_phone_home`. A
+        // cycle that made no vendor call and adopted no verified answer
+        // (offline / failed sync just before, flight held too long) retries
+        // in about an hour.
+        next_sleep = runtime.scheduled_cycle(|| async {
             let result = runtime.do_phone_home_once().await;
             if let Err(e) = &result {
                 // Non-fatal, re-evaluated next cycle, but logged at warn: a
@@ -1437,6 +1567,28 @@ async fn phone_home_loop(runtime: LicenseRuntime) {
 }
 
 impl LicenseRuntime {
+    /// One scheduled phone-home; returns how long the loop sleeps next.
+    async fn scheduled_cycle<F, Fut>(&self, call: F) -> StdDuration
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<PhoneHomeOk, PhoneHomeError>>,
+    {
+        match self.scheduled_phone_home(call).await {
+            SyncOutcome::Busy { .. } => {
+                crate::license_rev::jittered(SCHEDULED_RETRY, crate::license_rev::PROBE_JITTER)
+            }
+            _ => self.cadence_sleep().await,
+        }
+    }
+
+    /// The normal cadence: until the next refresh is due (at least a day,
+    /// see [`Self::next_phone_home_sleep`]), or a day without a licence.
+    async fn cadence_sleep(&self) -> StdDuration {
+        // No license or OpenSource — wait a day and re-check (operator may
+        // install one mid-flight).
+        self.next_phone_home_sleep().await.unwrap_or(StdDuration::from_secs(24 * 60 * 60))
+    }
+
     /// One scheduled phone-home through the shared flight
     /// ([`SyncCaller::Scheduled`]).
     async fn scheduled_phone_home<F, Fut>(&self, call: F) -> SyncOutcome
@@ -1461,13 +1613,14 @@ impl LicenseRuntime {
     }
 
     async fn do_phone_home_once(&self) -> Result<PhoneHomeOk, PhoneHomeError> {
+        // The store first: when it is busy (every store permit taken by
+        // operations still running) no other blocking work is submitted.
+        let mut request = self.refresh_snapshot().await?;
         // Generated only when absent; any other key-store failure omits the
         // field (the refresh still renews the tier, the relay stays unbound).
         let key_home = self.home_dir.clone();
-        let installation_pubkey = tokio::task::spawn_blocking(move ||
+        request.installation_pubkey = tokio::task::spawn_blocking(move ||
             crate::installation_identity::ensure_public_key_hex(&key_home)).await.ok().flatten();
-        let mut request = self.refresh_snapshot().await?;
-        request.installation_pubkey = installation_pubkey;
         request.proposed_fingerprint = duduclaw_license::fingerprint::refresh_fingerprint(&request.machine_fingerprint)
             .map_err(|e| PhoneHomeError::Rejected(e.to_string()))?;
         let subscription_id = &request.subscription_id;
@@ -1649,27 +1802,37 @@ impl LicenseRuntime {
     /// retried on the next call. All file and lock work runs on a blocking
     /// thread; a lock held elsewhere gives up after [`LICENSE_LOCK_DEADLINE`].
     /// A file refused as unusable (symbolic link, FIFO or other non-regular
-    /// file, over 64 KiB, malformed JSON) is remembered by its stamp, logged
-    /// once and not read again until the stamp changes.
+    /// file, over 64 KiB, malformed JSON) is remembered by its stamp (plus
+    /// the digest of the bytes read for malformed content), logged once and
+    /// not read again until the stamp changes or [`REJECTED_RETRY`] passes.
+    /// With every store permit taken by operations still running, nothing is
+    /// submitted and the call returns `false` at once.
     pub async fn reload_from_disk_if_changed(&self) -> bool {
         self.reconcile_with_disk(false).await
     }
 
     async fn reconcile_with_disk(&self, force: bool) -> bool {
         let home = self.home_dir.clone();
-        let stamp = run_store_op(move || Ok(DiskStamp::read(&home))).await.ok().flatten();
+        let stamp = match run_store_op(&self.store_ops, move || Ok(DiskStamp::read(&home))).await {
+            Ok(stamp) => stamp,
+            // Every store permit is taken (or the stamp read itself hung):
+            // nothing else is submitted this time.
+            Err(StoreReadError::Busy) => return false,
+            Err(_) => None,
+        };
         if !force {
             if let (Some(stamp), Ok(last)) = (stamp.as_ref(), self.sync.disk_stamp.lock()) {
                 if last.as_ref() == Some(stamp) {
                     return false;
                 }
             }
-        }
-        // A store refused before is not read again until it changes (forced
-        // syncs included): no 60-second re-read of a hostile file.
-        if let (Some(stamp), Ok(rejected)) = (stamp.as_ref(), self.sync.rejected_stamp.lock()) {
-            if rejected.as_ref() == Some(stamp) {
-                return false;
+            // A store refused before is not read again by the watcher until
+            // it changes or `REJECTED_RETRY` passes: no 60-second re-read of
+            // a hostile file. A forced (admin) sync always reads once.
+            if let (Some(stamp), Ok(rejected)) = (stamp.as_ref(), self.sync.rejected.lock()) {
+                if rejected.as_ref().is_some_and(|rejected| rejected.covers(stamp)) {
+                    return false;
+                }
             }
         }
         if let Some(empty) = stamp.as_ref().filter(|s| s.license.is_none() && s.marker.is_none()) {
@@ -1691,8 +1854,9 @@ impl LicenseRuntime {
             // The disk lock (`_store`) is held to the end of this block.
             let (_store, contents) = match self.locked_store().await {
                 Ok(locked) => locked,
+                // FIFO, oversized, non-regular: metadata-only identity.
                 Err(StoreReadError::Rejected(reason)) => {
-                    self.remember_rejected(stamp, reason);
+                    self.remember_rejected(stamp, None, reason);
                     return false;
                 }
                 Err(error) => {
@@ -1706,7 +1870,7 @@ impl LicenseRuntime {
                 Some(license) => match contents.same_license(license) {
                     Ok(same) => same,
                     Err(_) => {
-                        self.remember_rejected(stamp, "malformed");
+                        self.remember_rejected(stamp, contents.license_digest(), "malformed");
                         return false;
                     }
                 },
@@ -1719,7 +1883,7 @@ impl LicenseRuntime {
                 if matches!(validated, Err("unreadable")) {
                     // Only a malformed document gets here (I/O failures
                     // returned above): refused until the file changes.
-                    self.remember_rejected(stamp, "malformed");
+                    self.remember_rejected(stamp, contents.license_digest(), "malformed");
                     return false;
                 }
                 let unchanged = match &validated {
@@ -1740,7 +1904,7 @@ impl LicenseRuntime {
         if let (Some(stamp), Ok(mut last)) = (stamp, self.sync.disk_stamp.lock()) {
             *last = Some(stamp);
         }
-        if let Ok(mut rejected) = self.sync.rejected_stamp.lock() {
+        if let Ok(mut rejected) = self.sync.rejected.lock() {
             *rejected = None;
         }
         if changed {
@@ -1802,17 +1966,21 @@ impl LicenseRuntime {
                 Ok(guard) => guard,
                 Err(_) => {
                     // The holder is stuck past every transport / lock bound
-                    // it should have hit. Skip; scheduled callers retry on
-                    // their normal cadence.
+                    // it should have hit. Skip; scheduled callers retry in
+                    // about an hour.
                     warn!(caller = ?caller, "license sync skipped: another sync is still in flight");
                     return SyncOutcome::Busy { retry_after_secs: SYNC_MIN_SPACING.as_secs() };
                 }
             },
         };
         if self.sync.generation.load(Ordering::Acquire) != seen {
-            // A sync (of either kind) finished while this caller waited.
+            // A sync (of either kind) finished while this caller waited. A
+            // scheduled caller takes only a verified answer; otherwise the
+            // spacing check below answers `Busy` (retry in about an hour).
             if let Some(outcome) = self.sync.last_outcome() {
-                return outcome;
+                if caller == SyncCaller::OnDemand || outcome.is_verified_answer() {
+                    return outcome;
+                }
             }
         }
         self.reconcile_with_disk(true).await;
@@ -1824,10 +1992,13 @@ impl LicenseRuntime {
             let elapsed = now.saturating_duration_since(last);
             if elapsed < SYNC_MIN_SPACING {
                 if caller == SyncCaller::Scheduled {
-                    // The sync that just ran was a refresh: it is this
-                    // cycle's. The loop re-computes its next sleep from the
+                    // A verified answer from the sync that just ran is this
+                    // cycle's: the loop re-computes its next sleep from the
                     // stored `last_phone_home`, so nothing due is skipped.
-                    if let Some(outcome) = self.sync.last_outcome() {
+                    // An offline / failed one is not adopted: no second
+                    // vendor call inside the window, and the `Busy` below
+                    // makes the loop retry in about an hour.
+                    if let Some(outcome) = self.sync.last_outcome().filter(SyncOutcome::is_verified_answer) {
                         debug!(outcome = outcome.as_str(), "scheduled phone-home: a sync just ran; using its result");
                         return outcome;
                     }
@@ -1845,21 +2016,28 @@ impl LicenseRuntime {
     /// Lock `license.json.lock` (bounded) and read the store, off the async
     /// workers.
     async fn locked_store(&self) -> Result<(storage::LockedLicenseStore, storage::StoreContents), StoreReadError> {
-        lock_and_read(self.home_dir.join(storage::DEFAULT_LICENSE_FILENAME)).await
+        lock_and_read(&self.store_ops, self.home_dir.join(storage::DEFAULT_LICENSE_FILENAME)).await
     }
 
-    /// Remember a refused store so it is not read again until it changes;
-    /// logged once per distinct file state. The in-memory licence is kept.
-    fn remember_rejected(&self, stamp: Option<DiskStamp>, reason: &'static str) {
+    /// Remember a refused store so the watcher does not read it again until
+    /// it changes or [`REJECTED_RETRY`] passes; logged once per distinct file
+    /// state (stamp plus, for a content refusal, the digest of the bytes
+    /// read). The in-memory licence is kept.
+    fn remember_rejected(&self, stamp: Option<DiskStamp>, digest: Option<[u8; 32]>, reason: &'static str) {
         let Some(stamp) = stamp else {
             debug!(reason, "license file refused; keeping the license in effect");
             return;
         };
-        let Ok(mut rejected) = self.sync.rejected_stamp.lock() else { return };
-        if rejected.as_ref() != Some(&stamp) {
+        let Ok(mut rejected) = self.sync.rejected.lock() else { return };
+        // Same bytes refused again (only re-stamped, or retried after the
+        // period): no second warning.
+        let known = rejected.as_ref().is_some_and(|known|
+            known.digest == digest && (digest.is_some() || known.stamp == stamp));
+        if !known {
             warn!(reason, "license file on disk refused (not re-read until it changes); keeping the license in effect");
-            *rejected = Some(stamp);
         }
+        // A re-read of the same refused state restarts the retry period.
+        *rejected = Some(RejectedStore { stamp, digest, at: tokio::time::Instant::now() });
     }
 
     fn verify_status_response(&self, request: &RefreshSnapshot, nonce: &str,
@@ -1880,7 +2058,7 @@ impl LicenseRuntime {
             return Err(PhoneHomeError::StaleResponse);
         }
         let to_save = license.clone();
-        let _store = run_store_op(move || {
+        let _store = run_store_op(&self.store_ops, move || {
             store.save(&to_save).map_err(|e| StoreReadError::Io(e.to_string()))?;
             Ok(store)
         }).await.map_err(PhoneHomeError::from_store)?;
@@ -1909,13 +2087,14 @@ impl LicenseRuntime {
         }
         // A persisted marker fences restart even if removing the artifact fails.
         let reason = reason.to_string();
-        let revoked = run_store_op(move || {
+        let revoked = run_store_op(&self.store_ops, move || {
             let persisted = store.revoke(&reason).map_err(|e| e.to_string());
             Ok((store, persisted))
         }).await;
         let (_store, persisted) = match revoked {
             Ok((store, persisted)) => (Some(store), persisted),
-            // Abandoned past the deadline (the write may still complete):
+            // Abandoned past the deadline (the write may still complete), or
+            // no store permit free (the lock guard is dropped unwritten):
             // memory is revoked anyway, fail closed, and the error reported.
             Err(error) => (None, Err(error.to_string())),
         };
@@ -2392,7 +2571,7 @@ pub(crate) mod tests {
                 gate: Arc::new(FeatureGate::from_str(EMBEDDED_FEATURES_TOML).unwrap()),
                 registry: Arc::new(PublicKeyRegistry::new()),
                 home_dir: home.path().into(), control_url: "https://control.invalid".into(),
-                sync: Arc::default(),
+                sync: Arc::default(), store_ops: STORE_OPS.clone(),
             };
             let edition = runtime.boot_edition(None, None).await;
             assert_eq!(edition.is_personal(), personal, "{tier:?}");
@@ -2452,6 +2631,7 @@ pub(crate) mod tests {
             home_dir: home.path().into(),
             control_url: "https://control.invalid".into(),
             sync: Arc::default(),
+            store_ops: STORE_OPS.clone(),
         };
         let accepted = crate::distributor_brand::runtime::Accepted {
             subscription_id: "sub_test".into(),
@@ -3820,7 +4000,7 @@ pub(crate) mod tests {
                 runtime.sync_gated(|| async { Ok(PhoneHomeOk::Refreshed { changed: false }) })).await
                 .expect("sync returns promptly");
             assert_eq!(outcome, SyncOutcome::Unchanged);
-            assert!(runtime.sync.rejected_stamp.lock().unwrap().is_some());
+            assert!(rejected_stamp(&runtime).is_some());
             assert_eq!(runtime.snapshot().await.tier, LicenseTier::SelfHostPro);
             assert_eq!(runtime.state.read().await.revision, 0);
 
@@ -3832,7 +4012,7 @@ pub(crate) mod tests {
             storage::save_to(&more, &path).unwrap();
             assert!(runtime.reload_from_disk_if_changed().await);
             assert_eq!(runtime.snapshot().await.max_agents, Some(5));
-            assert!(runtime.sync.rejected_stamp.lock().unwrap().is_none());
+            assert!(rejected_stamp(&runtime).is_none());
         }).await;
     }
 
@@ -3863,7 +4043,7 @@ pub(crate) mod tests {
             assert!(runtime.reload_from_disk_if_changed().await);
             assert_eq!(runtime.snapshot().await.max_agents, Some(51));
             assert!(std::fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
-            assert!(runtime.sync.rejected_stamp.lock().unwrap().is_none());
+            assert!(rejected_stamp(&runtime).is_none());
         }).await;
     }
 
@@ -3878,7 +4058,7 @@ pub(crate) mod tests {
             let (runtime, license, kp) = licensed_runtime(home.path()).await;
             std::fs::write(&path, vec![b' '; storage::MAX_LICENSE_FILE_BYTES as usize + 1]).unwrap();
             assert!(!runtime.reload_from_disk_if_changed().await);
-            let remembered = runtime.sync.rejected_stamp.lock().unwrap().clone();
+            let remembered = rejected_stamp(&runtime);
             assert!(remembered.is_some());
             // Same stamp: skipped before any lock or read — even with the
             // lock held by someone else, the call returns at once.
@@ -3887,7 +4067,7 @@ pub(crate) mod tests {
             assert!(!runtime.reload_from_disk_if_changed().await);
             assert!(started.elapsed() < LICENSE_LOCK_DEADLINE, "re-read a refused file: {:?}", started.elapsed());
             drop(held);
-            assert_eq!(*runtime.sync.rejected_stamp.lock().unwrap(), remembered);
+            assert_eq!(rejected_stamp(&runtime), remembered);
             assert_eq!(runtime.snapshot().await.tier, LicenseTier::SelfHostPro);
             assert_eq!(runtime.state.read().await.revision, 0);
 
@@ -3916,7 +4096,7 @@ pub(crate) mod tests {
             std::os::unix::fs::symlink(&target, &path).unwrap();
             std::fs::write(&target, vec![b' '; storage::MAX_LICENSE_FILE_BYTES as usize + 1]).unwrap();
             assert!(!runtime.reload_from_disk_if_changed().await);
-            let remembered = runtime.sync.rejected_stamp.lock().unwrap().clone();
+            let remembered = rejected_stamp(&runtime);
             assert!(remembered.is_some());
             // Same stamp: skipped before any lock or read — even with the
             // lock held by someone else, the call returns at once.
@@ -3925,7 +4105,7 @@ pub(crate) mod tests {
             assert!(!runtime.reload_from_disk_if_changed().await);
             assert!(started.elapsed() < LICENSE_LOCK_DEADLINE, "re-read a refused file: {:?}", started.elapsed());
             drop(held);
-            assert_eq!(*runtime.sync.rejected_stamp.lock().unwrap(), remembered);
+            assert_eq!(rejected_stamp(&runtime), remembered);
             assert_eq!(runtime.snapshot().await.tier, LicenseTier::SelfHostPro);
             assert_eq!(runtime.state.read().await.revision, 0);
 
@@ -3937,6 +4117,246 @@ pub(crate) mod tests {
             assert!(std::fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
             assert!(runtime.reload_from_disk_if_changed().await);
             assert_eq!(runtime.snapshot().await.max_agents, Some(3));
+        }).await;
+    }
+
+    fn rejected_stamp(runtime: &LicenseRuntime) -> Option<DiskStamp> {
+        runtime.sync.rejected.lock().unwrap().as_ref().map(|rejected| rejected.stamp.clone())
+    }
+
+    /// Wait (real time, bounded) until every permit of `ops` is free again.
+    async fn wait_for_free_permits(ops: &StoreOps) {
+        let until = std::time::Instant::now() + StdDuration::from_secs(5);
+        while ops.permits.available_permits() < STORE_OP_PERMITS {
+            assert!(std::time::Instant::now() < until, "store permits not released");
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+    }
+
+    /// Take every permit of `ops` with operations that only end when the
+    /// returned senders are dropped or sent to (a hung mount).
+    async fn hold_every_store_permit(ops: &StoreOps) -> Vec<std::sync::mpsc::Sender<()>> {
+        let mut releases = Vec::new();
+        for _ in 0..STORE_OP_PERMITS {
+            let (release, wait) = std::sync::mpsc::channel::<()>();
+            let held = run_store_op_within(ops, StdDuration::from_millis(1), move || {
+                let _ = wait.recv();
+                Ok(())
+            }).await;
+            assert!(matches!(held, Err(StoreReadError::Busy) | Ok(())));
+            releases.push(release);
+        }
+        releases
+    }
+
+    /// M2: with both store permits held by operations that never finish,
+    /// the watcher, `sync_now` and the CRL path answer Busy at once, submit
+    /// no blocking work and leave the licence in memory untouched.
+    #[tokio::test]
+    async fn exhausted_store_permits_answer_busy_at_once_and_submit_nothing() {
+        use std::sync::atomic::Ordering;
+        with_hardware_fixture(async {
+            let _fingerprint_guard = FINGERPRINT_TEST_LOCK.lock().await;
+            let home = tempfile::tempdir().unwrap();
+            let path = home.path().join("license.json");
+            let (mut runtime, license, kp) = licensed_runtime(home.path()).await;
+            let ops = Arc::new(StoreOps::new());
+            runtime.store_ops = ops.clone();
+            let releases = hold_every_store_permit(&ops).await;
+            assert_eq!(ops.permits.available_permits(), 0);
+            let submitted = ops.spawned.load(Ordering::SeqCst);
+            assert_eq!(submitted, STORE_OP_PERMITS);
+
+            // Written by the CLI meanwhile: not read while the store is busy.
+            let mut more = license.clone();
+            more.max_agents = Some(9);
+            sign_license(&mut more, &kp);
+            storage::save_to(&more, &path).unwrap();
+
+            let bound = StdDuration::from_secs(2);
+            for _ in 0..3 {
+                let changed = tokio::time::timeout(bound, runtime.reload_from_disk_if_changed()).await
+                    .expect("the watcher answers at once");
+                assert!(!changed);
+            }
+            let outcome = tokio::time::timeout(bound, runtime.sync_now()).await.expect("sync answers at once");
+            assert_eq!(outcome, SyncOutcome::Failed { reason: "license_file_busy" });
+            let crl = tokio::time::timeout(bound, runtime.do_crl_fetch_once()).await.expect("CRL answers at once");
+            assert!(matches!(crl, Err(PhoneHomeError::Busy)), "{crl:?}");
+            assert_eq!(ops.spawned.load(Ordering::SeqCst), submitted, "no further blocking work submitted");
+            assert_eq!(ops.permits.available_permits(), 0);
+            {
+                let inner = runtime.state.read().await;
+                assert_eq!(inner.revision, 0, "memory untouched");
+                assert_eq!(inner.license.as_ref().unwrap().max_agents, license.max_agents);
+                assert!(inner.validation_warning.is_none());
+            }
+
+            // The permits come back only when the operations really end;
+            // the next watcher cycle then applies the licence.
+            for release in releases {
+                release.send(()).unwrap();
+            }
+            wait_for_free_permits(&ops).await;
+            assert!(runtime.reload_from_disk_if_changed().await);
+            assert_eq!(runtime.snapshot().await.max_agents, Some(9));
+        }).await;
+    }
+
+    /// M2: boot does not wait for a read that never completes; it starts as
+    /// for an unreadable licence within the overall deadline.
+    #[tokio::test]
+    async fn boot_load_returns_within_its_deadline_when_the_read_never_completes() {
+        let _fingerprint_guard = FINGERPRINT_TEST_LOCK.lock().await;
+        let registry = PublicKeyRegistry::new();
+        let gate = FeatureGate::from_str(EMBEDDED_FEATURES_TOML).unwrap();
+        let ops = StoreOps::new();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let deadline = StdDuration::from_millis(200);
+        let started = std::time::Instant::now();
+        let loaded = tokio::time::timeout(StdDuration::from_secs(5),
+            load_and_validate_from(&registry, &gate, &ops, deadline, move || {
+                let _ = wait.recv();
+                Ok(None)
+            })).await.expect("boot must not wait for a read that never completes");
+        assert!(started.elapsed() >= deadline, "{:?}", started.elapsed());
+        assert!(loaded.0.is_none());
+        assert_eq!(loaded.1, Some("unreadable"));
+        // The abandoned read keeps its permit until it really ends.
+        assert_eq!(ops.permits.available_permits(), STORE_OP_PERMITS - 1);
+        release.send(()).unwrap();
+        wait_for_free_permits(&ops).await;
+        // The production bound covers the boot lock wait with a margin.
+        assert!(BOOT_LOAD_DEADLINE >= BOOT_LICENSE_LOCK_DEADLINE + StdDuration::from_secs(10));
+    }
+
+    /// L1: a malformed file rewritten in place with a valid licence of the
+    /// same length, the modification time restored, is read again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn in_place_rewrite_restoring_length_and_mtime_is_reread() {
+        use std::io::Write as _;
+        use std::os::unix::fs::MetadataExt as _;
+        with_hardware_fixture(async {
+            let _fingerprint_guard = FINGERPRINT_TEST_LOCK.lock().await;
+            let home = tempfile::tempdir().unwrap();
+            let path = home.path().join("license.json");
+            let (runtime, license, kp) = licensed_runtime(home.path()).await;
+            let mut more = license.clone();
+            more.max_agents = Some(6);
+            sign_license(&mut more, &kp);
+            let valid = serde_json::to_vec_pretty(&more).unwrap();
+            let mut malformed = valid.clone();
+            // Unterminated JSON of exactly the same length.
+            assert_eq!(malformed.pop(), Some(b'}'));
+            malformed.push(b' ');
+
+            std::fs::write(&path, &malformed).unwrap();
+            assert!(!runtime.reload_from_disk_if_changed().await);
+            let refused = runtime.sync.rejected.lock().unwrap().clone().expect("refused");
+            let malformed_digest: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(&malformed).into();
+            assert_eq!(refused.digest, Some(malformed_digest));
+            let before = std::fs::metadata(&path).unwrap();
+
+            // Past the coarse kernel clock tick, so the status-change time moves.
+            std::thread::sleep(StdDuration::from_millis(50));
+            let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.write_all(&valid).unwrap();
+            file.set_modified(before.modified().unwrap()).unwrap();
+            drop(file);
+            let after = std::fs::metadata(&path).unwrap();
+            assert_eq!((after.dev(), after.ino(), after.len()), (before.dev(), before.ino(), before.len()));
+            assert_eq!(after.modified().unwrap(), before.modified().unwrap());
+
+            assert!(runtime.reload_from_disk_if_changed().await, "the rewritten licence must be read again");
+            assert_eq!(runtime.snapshot().await.max_agents, Some(6));
+            assert!(runtime.sync.rejected.lock().unwrap().is_none());
+        }).await;
+    }
+
+    /// L1: refused content with an unchanged stamp is not read again until
+    /// the retry period passes; a forced (admin) sync always reads it once.
+    #[tokio::test(start_paused = true)]
+    async fn refused_content_is_retried_after_the_period_and_by_a_forced_sync() {
+        use std::sync::atomic::Ordering;
+        with_hardware_fixture(async {
+            let _fingerprint_guard = FINGERPRINT_TEST_LOCK.lock().await;
+            let home = tempfile::tempdir().unwrap();
+            let path = home.path().join("license.json");
+            let (mut runtime, _, _) = licensed_runtime(home.path()).await;
+            let ops = Arc::new(StoreOps::new());
+            runtime.store_ops = ops.clone();
+            let submitted = || ops.spawned.load(Ordering::SeqCst);
+
+            std::fs::write(&path, b"{ not a licence").unwrap();
+            assert!(!runtime.reload_from_disk_if_changed().await);
+            let refused = runtime.sync.rejected.lock().unwrap().clone().expect("refused");
+            assert!(refused.digest.is_some());
+
+            // Identical bytes, unchanged stamp: only the stamp is read.
+            let before = submitted();
+            assert!(!runtime.reload_from_disk_if_changed().await);
+            assert_eq!(submitted(), before + 1, "a refused file was read again");
+
+            // After the retry period: read once more (stamp + locked read),
+            // still refused, and skipped again afterwards.
+            tokio::time::advance(REJECTED_RETRY).await;
+            let before = submitted();
+            assert!(!runtime.reload_from_disk_if_changed().await);
+            assert_eq!(submitted(), before + 2, "an expired refusal must be read again");
+            let again = runtime.sync.rejected.lock().unwrap().clone().expect("still refused");
+            assert_eq!(again.digest, refused.digest);
+            assert!(again.at > refused.at);
+            let before = submitted();
+            assert!(!runtime.reload_from_disk_if_changed().await);
+            assert_eq!(submitted(), before + 1);
+
+            // A forced sync ignores the refusal and reads once.
+            let before = submitted();
+            let outcome = runtime.sync_gated(|| async { Ok(PhoneHomeOk::Refreshed { changed: false }) }).await;
+            assert_eq!(outcome, SyncOutcome::Unchanged);
+            assert_eq!(submitted(), before + 2, "a forced sync must read the store");
+            assert_eq!(runtime.snapshot().await.tier, LicenseTier::SelfHostPro);
+            assert_eq!(runtime.state.read().await.revision, 0);
+        }).await;
+    }
+
+    /// L2: an offline on-demand sync just before a due scheduled run is not
+    /// adopted: one vendor call in the window, next attempt in about an hour.
+    /// An adopted verified result keeps the normal cadence.
+    #[tokio::test(start_paused = true)]
+    async fn scheduled_cycle_after_an_offline_sync_retries_in_an_hour_not_a_day() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        with_hardware_fixture(async {
+            let _fingerprint_guard = FINGERPRINT_TEST_LOCK.lock().await;
+            let home = tempfile::tempdir().unwrap();
+            let (runtime, _, _) = licensed_runtime(home.path()).await;
+            let calls_counter = AtomicUsize::new(0);
+            let calls = &calls_counter;
+            let refreshed = move || async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, PhoneHomeError>(PhoneHomeOk::Refreshed { changed: false })
+            };
+
+            let offline = runtime.sync_gated(move || async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(PhoneHomeError::Http("connection refused".into()))
+            }).await;
+            assert_eq!(offline, SyncOutcome::Offline { reason: "network" });
+            tokio::time::advance(StdDuration::from_secs(5)).await;
+            let next = runtime.scheduled_cycle(refreshed).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "no second vendor call inside the window");
+            let jitter = crate::license_rev::PROBE_JITTER;
+            assert!(next >= SCHEDULED_RETRY - jitter && next <= SCHEDULED_RETRY + jitter, "{next:?}");
+
+            // A verified result just before is adopted: normal cadence.
+            tokio::time::advance(SYNC_MIN_SPACING).await;
+            assert_eq!(runtime.sync_gated(refreshed).await, SyncOutcome::Unchanged);
+            tokio::time::advance(StdDuration::from_secs(5)).await;
+            let next = runtime.scheduled_cycle(refreshed).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            assert_eq!(next, runtime.cadence_sleep().await);
+            assert!(next >= StdDuration::from_secs(24 * 60 * 60), "{next:?}");
         }).await;
     }
 

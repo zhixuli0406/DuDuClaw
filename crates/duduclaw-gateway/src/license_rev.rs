@@ -169,8 +169,8 @@ where
     Ok(())
 }
 
-/// `base` ± `jitter`, uniformly.
-fn jittered(base: Duration, jitter: Duration) -> Duration {
+/// `base` ± `jitter`, uniformly. Also spaces the phone-home loop's retry.
+pub(crate) fn jittered(base: Duration, jitter: Duration) -> Duration {
     use rand::Rng as _;
     let spread = jitter.as_secs().saturating_mul(2);
     let offset = rand::thread_rng().gen_range(0..=spread);
