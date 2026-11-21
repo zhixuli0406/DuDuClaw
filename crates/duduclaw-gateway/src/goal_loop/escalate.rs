@@ -365,6 +365,7 @@ fn max_marker_seq(ids: &[String], prefix: &str) -> u64 {
         .filter_map(|id| id.strip_prefix(prefix))
         .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
         .filter_map(|n| n.parse::<u64>().ok())
+        .filter(|n| *n > 0)
         .max()
         .unwrap_or(0)
 }
@@ -380,6 +381,7 @@ mod marker_tests {
         let ids: Vec<String> = [
             format!("{prefix}1"),
             format!("{prefix}12"),
+            format!("{prefix}0"),
             // Another task whose id starts with "t1:" — never this task's.
             format!("{prefix}9:4"),
             format!("{prefix}+7"),

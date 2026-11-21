@@ -756,6 +756,19 @@ mod tests {
             "https://example.com/base#frag",
             "https://example.com/base#",
             "https://exa mple.com",
+            "http://127.1/",
+            "http://2130706433/",
+            "http://0x7f.1/",
+            "http://0177.0.0.1/",
+            "http://[::ffff:127.0.0.1]/",
+            "http://0.0.0.0/",
+            "http://[::]/",
+            "http://example.com@localhost/",
+            "http://localhost@example.com/",
+            "http://example.com\\path",
+            "http://example.com/line\nbreak",
+            "http://example.com/line\u{0001}break",
+            "http://localhost./",
         ];
         let accepted = [
             ("http://192.168.1.10:18889", "http://192.168.1.10:18889"),
@@ -764,6 +777,9 @@ mod tests {
             ("https://example.com/base", "https://example.com/base"),
             ("https://example.com", "https://example.com"),
             ("http://dashboard.lan:8080/duduclaw/", "http://dashboard.lan:8080/duduclaw"),
+            ("HTTPS://Example.com", "https://example.com"),
+            ("https://例え.テスト/", "https://xn--r8jz45g.xn--zckzah"),
+            ("https://example.com/a/../b/", "https://example.com/b"),
         ];
         for section in PUBLIC_URL_SECTIONS {
             // Invalid configured values fall through to the environment-specific fallback.
@@ -838,13 +854,15 @@ mod tests {
             ("channel_reply/failure_message.rs", include_str!("channel_reply/failure_message.rs")),
             ("computer_watch_links/delivery.rs", include_str!("computer_watch_links/delivery.rs")),
         ];
-        let local = ["local_", "dashboard_base_url("].concat();
+        let local_base = ["local_", "dashboard_base_url("].concat();
+        let local_deep = ["local_", "dashboard_deep_link("].concat();
         for (name, src) in sources {
-            assert!(!src.contains(&local), "{name} must use public_dashboard_base_url / public_deep_link");
+            assert!(!src.contains(&local_base), "{name} must use public_dashboard_base_url / public_deep_link");
+            assert!(!src.contains(&local_deep), "{name} must use public_dashboard_base_url / public_deep_link");
         }
         // The dashboard status uses the diagnostic resolver directly.
         let status = include_str!("handlers/system_status.rs");
-        assert!(status.contains(&format!("crate::deep_link::{local}")));
+        assert!(status.contains(&format!("crate::deep_link::{local_base}")));
     }
 
     #[test]
