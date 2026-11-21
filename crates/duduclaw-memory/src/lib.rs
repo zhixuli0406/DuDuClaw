@@ -37,6 +37,7 @@ pub mod user_code;
 pub mod user_profile;
 pub mod vector;
 pub mod wiki;
+pub mod wiki_auto_registry;
 pub mod wiki_fence;
 pub mod wiki_path;
 

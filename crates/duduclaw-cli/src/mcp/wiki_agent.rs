@@ -47,15 +47,36 @@ fn auto_namespace_of(page_path: &str) -> AutoNamespace<'_> {
     }
 }
 
+/// The auto-page registry a read in `scope` of `agent_id`'s wiki judges
+/// against, loaded ONCE per tool call (review H1 item 3). Employee-wide
+/// reads do not consult it (empty).
+pub(crate) fn auto_registry_for(
+    home_dir: &Path,
+    agent_id: &str,
+    scope: &ReadScope,
+) -> duduclaw_gateway::auto_wiki_page::AutoPageRegistry {
+    match scope {
+        ReadScope::Employee => Default::default(),
+        ReadScope::Conversation(_) => duduclaw_gateway::auto_wiki_page::load_registry(home_dir, agent_id),
+    }
+}
+
 /// Whether the page `page_path` of `wiki_dir` must look like a page that does
 /// not exist to this read: on a channel turn, every page under `auto/` that
 /// `auto_wiki_page::page_visible_in_conversation` does not grant this
 /// conversation — judged from the host-recorded provenance and the host
-/// promotion mark only, never from `sources` / `author` / `layer`.
-/// Employee-wide reads see everything, as before. Fail closed: an unusable
-/// component or an unreadable page hides it.
-pub(crate) fn auto_page_hidden(wiki_dir: &Path, page_path: &str, scope: &ReadScope) -> bool {
-    auto_page_hidden_with(page_path, scope, |rel| {
+/// promotion mark, and only when `registry` (the gateway's record, see
+/// [`auto_registry_for`]) holds exactly the page's current bytes; never from
+/// `sources` / `author` / `layer`. Employee-wide reads see everything, as
+/// before. Fail closed: an unusable component, an unreadable page or a page
+/// the registry did not record hides it.
+pub(crate) fn auto_page_hidden(
+    wiki_dir: &Path,
+    page_path: &str,
+    scope: &ReadScope,
+    registry: &duduclaw_gateway::auto_wiki_page::AutoPageRegistry,
+) -> bool {
+    auto_page_hidden_with(page_path, scope, registry, |rel| {
         duduclaw_memory::wiki_path::read_wiki_file_nofollow(wiki_dir, rel).ok()
     })
 }
@@ -66,6 +87,7 @@ pub(crate) fn auto_page_hidden(wiki_dir: &Path, page_path: &str, scope: &ReadSco
 pub(crate) fn auto_page_hidden_with(
     page_path: &str,
     scope: &ReadScope,
+    registry: &duduclaw_gateway::auto_wiki_page::AutoPageRegistry,
     read: impl FnOnce(&str) -> Option<String>,
 ) -> bool {
     let ReadScope::Conversation(session) = scope else {
@@ -78,31 +100,37 @@ pub(crate) fn auto_page_hidden_with(
     };
     let raw = read(&parts.join("/"));
     let namespace = duduclaw_gateway::auto_wiki_page::AUTO_NAMESPACE;
+    // An alias spelling (`AUTO/`, `auto./`) is looked up under the
+    // canonical name; the registry records only the gateway's own paths, so
+    // a differently spelled file name finds no record and stays hidden.
     let scoped_path = format!("{namespace}/{}", parts[1..].join("/"));
     !duduclaw_gateway::auto_wiki_page::page_visible_in_conversation(
         &scoped_path,
         raw.as_deref(),
         session.as_deref(),
+        registry,
     )
 }
 
-/// The one answer every MCP wiki mutation gives on a channel conversation
-/// turn when its source or destination is inside `auto/` (v1.84.0, review
-/// H1). Fixed text, decided from the path string before any file-system
-/// access, so it is the same whether or not the page exists.
-pub(crate) const WIKI_AUTO_NAMESPACE_CHANNEL_TURN_REFUSED: &str =
-    "Not available from a conversation: pages under auto/ are filed automatically and are \
-     changed only from the curation station. Use a path outside auto/, or ask an administrator.";
+/// The one answer every MCP wiki mutation gives when its source or
+/// destination is inside `auto/` (v1.84.0, review H1), for every AI-callable
+/// scope — a channel conversation turn and an employee-wide call alike.
+/// Fixed text, decided from the path string before any file-system access,
+/// so it is the same whether or not the page exists.
+pub(crate) const WIKI_AUTO_NAMESPACE_REFUSED: &str =
+    "Not available to AI tools: pages under auto/ are filed automatically from conversations and \
+     are changed only from the curation station. Use a path outside auto/, or ask an administrator.";
 
 /// Whether an MCP wiki mutation of `page_path` (its source or destination)
-/// must be refused with [`WIKI_AUTO_NAMESPACE_CHANNEL_TURN_REFUSED`]: on a
-/// channel turn, any path inside `auto/` of any agent's wiki (an unusable
-/// path counts as inside). Employee-wide callers keep today's behaviour.
-/// Only the gateway's auto writer (`auto_wiki_page::write_auto_page`) and
-/// the human promotion path write there.
-pub(crate) fn auto_namespace_mutation_refused(page_path: &str, scope: &ReadScope) -> bool {
-    matches!(scope, ReadScope::Conversation(_))
-        && !matches!(auto_namespace_of(page_path), AutoNamespace::Outside)
+/// must be refused with [`WIKI_AUTO_NAMESPACE_REFUSED`]: any path inside
+/// `auto/` of any agent's wiki (an unusable path counts as inside), whatever
+/// the read scope — the employee-wide scope included (review H1 round 2: an
+/// employee-wide `wiki_write` could otherwise overwrite a conversation's
+/// page). Only the gateway's auto writer (`auto_wiki_page::write_auto_page`)
+/// and the dashboard's human actions (promote, archive, share-out) write
+/// there.
+pub(crate) fn auto_namespace_mutation_refused(page_path: &str) -> bool {
+    !matches!(auto_namespace_of(page_path), AutoNamespace::Outside)
 }
 
 /// The fixed `wiki_export` answer on a channel conversation turn (v1.84.0).
@@ -175,9 +203,10 @@ pub(crate) async fn handle_wiki_ls_in(
         ));
     }
 
+    let registry = auto_registry_for(home_dir, agent_id, scope);
     let pages: Vec<std::path::PathBuf> = collect_md_files(&wiki_dir, &wiki_dir)
         .into_iter()
-        .filter(|rel| !auto_page_hidden(&wiki_dir, &rel.to_string_lossy(), scope))
+        .filter(|rel| !auto_page_hidden(&wiki_dir, &rel.to_string_lossy(), scope, &registry))
         .collect();
     if pages.is_empty() {
         return tool_text("Wiki directory exists but contains no pages.");
@@ -278,7 +307,8 @@ pub(crate) async fn handle_wiki_read_in(
         .unwrap_or("");
     // v1.84.0: another conversation's auto page is "not found" — the same
     // text a missing page gets, before any other check can tell them apart.
-    if auto_page_hidden(&wiki_dir, page_path, scope) {
+    let registry = auto_registry_for(home_dir, agent_id, scope);
+    if auto_page_hidden(&wiki_dir, page_path, scope, &registry) {
         let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
         return tool_error(&wiki_read_error(page_path, &missing));
     }
@@ -379,13 +409,14 @@ pub(crate) async fn handle_wiki_write(args: &Value, home_dir: &Path, default_age
     handle_wiki_write_in(args, home_dir, default_agent, &scope).await
 }
 
-/// [`handle_wiki_write`] with an explicit [`ReadScope`] (v1.84.0: on a
-/// channel turn nothing under `auto/` is written).
+/// [`handle_wiki_write`] with an explicit [`ReadScope`] (v1.84.0: nothing
+/// under `auto/` is written, in any scope — review H1 round 2; the scope is
+/// kept in the signature for the callers and tests that pass one).
 pub(crate) async fn handle_wiki_write_in(
     args: &Value,
     home_dir: &Path,
     default_agent: &str,
-    scope: &ReadScope,
+    _scope: &ReadScope,
 ) -> Value {
     if let Err(error) = duduclaw_mcp_boundary::io_authority::verify_before_io() {
         return tool_error(&error.to_string());
@@ -400,9 +431,9 @@ pub(crate) async fn handle_wiki_write_in(
     };
     // v1.84.0 (review H1): before any file-system access, one fixed answer
     // whether or not the page exists (no existence oracle, no overwrite or
-    // forgery of a conversation's auto page).
-    if auto_namespace_mutation_refused(page_path, scope) {
-        return tool_error(WIKI_AUTO_NAMESPACE_CHANNEL_TURN_REFUSED);
+    // forgery of a conversation's auto page), for every scope.
+    if auto_namespace_mutation_refused(page_path) {
+        return tool_error(WIKI_AUTO_NAMESPACE_REFUSED);
     }
     let content = match args.get("content").and_then(|v| v.as_str()) {
         Some(c) => c,
@@ -596,10 +627,11 @@ pub(crate) async fn handle_wiki_search_in(
         ReadScope::Employee => store.search_filtered(query, limit, min_trust, layer_filter, expand),
         // Hidden pages are dropped inside the search, before its ranking
         // cut-off (direct hits and expanded neighbours alike), judged on the
-        // content the search itself read.
+        // content the search itself read and the registry loaded once here.
         ReadScope::Conversation(_) => {
+            let registry = auto_registry_for(home_dir, agent_id, scope);
             let visible = |rel: &str, raw: &str| {
-                !auto_page_hidden_with(rel, scope, |_| Some(raw.to_string()))
+                !auto_page_hidden_with(rel, scope, &registry, |_| Some(raw.to_string()))
             };
             store.search_filtered_visible(query, limit, min_trust, layer_filter, expand, &visible)
         }
@@ -651,7 +683,8 @@ pub(crate) async fn handle_wiki_lint(args: &Value, home_dir: &Path, default_agen
     match store.lint() {
         Ok(mut report) => {
             if scope != ReadScope::Employee {
-                let hidden = |p: &str| auto_page_hidden(&wiki_dir, p, &scope);
+                let registry = auto_registry_for(home_dir, agent_id, &scope);
+                let hidden = |p: &str| auto_page_hidden(&wiki_dir, p, &scope, &registry);
                 let hidden_total = collect_md_files(&wiki_dir, &wiki_dir)
                     .iter()
                     .filter(|rel| hidden(rel.to_string_lossy().as_ref()))
@@ -727,11 +760,12 @@ pub(crate) async fn handle_wiki_stats(args: &Value, home_dir: &Path, default_age
     // v1.84.0: on a channel turn other conversations' auto pages are neither
     // counted nor named (pages, index and log lines alike).
     let scope = wiki_read_scope(default_agent);
+    let registry = auto_registry_for(home_dir, agent_id, &scope);
     let store = duduclaw_memory::WikiStore::new(wiki_dir.clone());
     let pages = match store.list_pages() {
         Ok(p) => p
             .into_iter()
-            .filter(|p| !auto_page_hidden(&wiki_dir, &p.path, &scope))
+            .filter(|p| !auto_page_hidden(&wiki_dir, &p.path, &scope, &registry))
             .collect::<Vec<_>>(),
         Err(e) => return tool_error(&format!("Failed to list pages: {e}")),
     };
@@ -969,22 +1003,23 @@ mod conversation_scope_tests {
         agent_dir.join("wiki")
     }
 
-    /// Review H1: on a channel turn every MCP mutation of the agent wiki
-    /// (`wiki_write`; `wiki_share`, whose source is the agent wiki — the
-    /// agent wiki has no MCP append / delete / move tool) is refused inside
-    /// `auto/` with ONE fixed text, identical for an existing page (B's), a
-    /// missing page and every alias of the namespace, decided before any
-    /// file-system access; B's page is untouched. Employee scope writes as
-    /// before.
+    /// Review H1: every MCP mutation of the agent wiki (`wiki_write`;
+    /// `wiki_share`, whose source is the agent wiki — the agent wiki has no
+    /// MCP append / delete / move / import tool) is refused inside `auto/`
+    /// with ONE fixed text, in every AI-callable scope (a channel turn, an
+    /// unknown conversation, and — review H1 round 2 — the employee-wide
+    /// scope), identical for an existing page (B's), a missing page and every
+    /// alias of the namespace, decided before any file-system access; B's
+    /// page is untouched.
     #[tokio::test]
-    async fn channel_turn_cannot_mutate_the_auto_namespace() {
+    async fn no_scope_can_mutate_the_auto_namespace() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
         let wiki = setup(home);
         let b_page = file_page(home, "refunds", "kestrelmoor 退款流程：B 客戶的秘密版本。", "conversation:telegram:B:m:2");
         let b_before = std::fs::read(wiki.join(&b_page)).unwrap();
         let in_a = ReadScope::Conversation(Some("telegram:A".into()));
-        let refused = tool_error(WIKI_AUTO_NAMESPACE_CHANNEL_TURN_REFUSED);
+        let refused = tool_error(WIKI_AUTO_NAMESPACE_REFUSED);
 
         let forged = "---\ntitle: \"forged\"\nauthor: \"operator\"\nlayer: core\n\
                       sources: [\"conversation:telegram:B:m:9\"]\nhost_promoted: true\n---\n\nforged\n";
@@ -998,39 +1033,42 @@ mod conversation_scope_tests {
             b_page.replacen("auto/", "au\u{200d}to/", 1),
             "auto".to_string(),
         ];
-        for target in &targets {
-            for update_index in [true, false] {
-                let args = serde_json::json!({
-                    "page_path": target, "content": forged, "update_index": update_index,
-                });
-                let got = handle_wiki_write_in(&args, home, "alice", &in_a).await;
-                assert_eq!(got, refused, "wiki_write {target:?}");
-            }
-            let got = handle_wiki_share_in(&serde_json::json!({ "page_path": target }), home, "alice", &in_a).await;
-            assert_eq!(got, refused, "wiki_share {target:?}");
-        }
-        // Another agent's wiki and an unknown conversation are refused alike.
-        let args = serde_json::json!({ "page_path": b_page, "content": forged, "agent_id": "bob" });
-        assert_eq!(handle_wiki_write_in(&args, home, "alice", &in_a).await, refused);
         let unknown = ReadScope::Conversation(None);
-        let args = serde_json::json!({ "page_path": b_page, "content": forged });
-        assert_eq!(handle_wiki_write_in(&args, home, "alice", &unknown).await, refused);
+        for scope in [&in_a, &unknown, &ReadScope::Employee] {
+            for target in &targets {
+                for update_index in [true, false] {
+                    let args = serde_json::json!({
+                        "page_path": target, "content": forged, "update_index": update_index,
+                    });
+                    let got = handle_wiki_write_in(&args, home, "alice", scope).await;
+                    assert_eq!(got, refused, "wiki_write {target:?} {scope:?}");
+                }
+                let got = handle_wiki_share_in(&serde_json::json!({ "page_path": target }), home, "alice", scope).await;
+                assert_eq!(got, refused, "wiki_share {target:?} {scope:?}");
+            }
+            // Another agent's wiki is refused alike.
+            let args = serde_json::json!({ "page_path": b_page, "content": forged, "agent_id": "bob" });
+            assert_eq!(handle_wiki_write_in(&args, home, "alice", scope).await, refused, "{scope:?}");
+        }
 
         assert_eq!(std::fs::read(wiki.join(&b_page)).unwrap(), b_before, "B's page untouched");
-        assert!(!wiki.join("auto/sop/no-such-page.md").exists());
+        for missing in ["auto/sop/no-such-page.md", "auto/sop/manual.md"] {
+            assert!(!wiki.join(missing).exists(), "{missing}");
+        }
         let index = std::fs::read_to_string(wiki.join("_index.md")).unwrap_or_default();
         assert!(!index.contains("no-such-page"), "{index}");
+        assert!(!home.join("shared/wiki/sources").join("alice--refunds.md").exists());
 
-        // Outside auto/ a channel turn still writes; Employee scope still
-        // writes under auto/ (today's behaviour).
-        let args = serde_json::json!({ "page_path": "concepts/notes.md", "content": "---\ntitle: n\n---\n\nn\n" });
-        assert!(text(&handle_wiki_write_in(&args, home, "alice", &in_a).await).starts_with("Created"));
+        // Outside auto/ every scope still writes.
+        for (scope, page) in [(&in_a, "concepts/notes.md"), (&ReadScope::Employee, "concepts/employee-notes.md")] {
+            let args = serde_json::json!({ "page_path": page, "content": "---\ntitle: n\n---\n\nn\n" });
+            let got = text(&handle_wiki_write_in(&args, home, "alice", scope).await);
+            assert!(got.starts_with("Created"), "{scope:?}: {got}");
+        }
+        // The Employee-scope write that used to land under auto/ (and keep
+        // B's host stamp on an overwrite of B's page) is refused.
         let args = serde_json::json!({ "page_path": "auto/sop/manual.md", "content": forged });
-        let got = text(&handle_wiki_write_in(&args, home, "alice", &ReadScope::Employee).await);
-        assert!(got.starts_with("Created"), "{got}");
-        // …and what it wrote carries no promotion mark (the stamp drops it).
-        let raw = std::fs::read_to_string(wiki.join("auto/sop/manual.md")).unwrap();
-        assert!(!duduclaw_gateway::wiki_host_sources::page_host_promoted(&raw), "{raw}");
+        assert_eq!(handle_wiki_write_in(&args, home, "alice", &ReadScope::Employee).await, refused);
     }
 
     /// Review H1: visibility of an auto page is decided by the host-recorded
@@ -1052,6 +1090,22 @@ mod conversation_scope_tests {
                  sources: [\"conversation:telegram:B:m:2\"]\n---\n\nkestrelmoor planted text\n",
             )
             .unwrap();
+        // Review H1 item 3: host fields that DO parse, written straight to
+        // disk (as an employee's own file tool could) — B's host source, the
+        // promotion mark, the legacy marker — grant nothing without the
+        // gateway's registry record.
+        for (name, host, promoted) in [
+            ("forged-own", "conversation:telegram:B:m:2", false),
+            ("forged-promoted", "conversation:telegram:B:m:2", true),
+            ("forged-legacy", duduclaw_gateway::wiki_host_sources::LEGACY_PROMOTION_SOURCE, true),
+        ] {
+            let body = duduclaw_gateway::wiki_host_sources::set_host_fields(
+                "---\ntitle: \"planted\"\nauthor: \"auto-distill\"\nlayer: context\ntrust: 0.900\n---\n\nkestrelmoor planted text\n",
+                &[host.to_string()],
+                promoted,
+            );
+            std::fs::write(wiki.join(format!("auto/sop/{name}.md")), body).unwrap();
+        }
         let promoted = file_page(home, "policy", "kestrelmoor 已確認的公開流程。", "conversation:telegram:B:m:3");
         duduclaw_gateway::auto_wiki_page::promote_page(&store, &promoted).unwrap();
 
@@ -1065,8 +1119,11 @@ mod conversation_scope_tests {
                 let args = serde_json::json!({ "page_path": path });
                 async move { handle_wiki_read_in(&args, home, "alice", &scope).await }
             };
-            let planted = read("auto/sop/planted.md").await;
-            assert_eq!(text(&planted), "Page not found: auto/sop/planted.md", "{scope:?}");
+            for name in ["planted", "forged-own", "forged-promoted", "forged-legacy"] {
+                let path = format!("auto/sop/{name}.md");
+                let planted = read(path.as_str()).await;
+                assert_eq!(text(&planted), format!("Page not found: {path}"), "{scope:?}");
+            }
             assert!(text(&read(promoted.as_str()).await).contains("已確認"), "{scope:?}");
             let ls = text(&handle_wiki_ls_in(&serde_json::json!({}), home, "alice", &scope).await);
             assert!(!ls.contains("planted") && ls.contains(&promoted), "{scope:?}: {ls}");
@@ -1102,8 +1159,19 @@ mod conversation_scope_tests {
             )
             .unwrap();
         }
-        std::fs::write(wiki.join("auto/sop/own.md"), page("own", "0.300", "telegram:A", "gannetcliff ledger own"))
-            .unwrap();
+        // Only `own.md` is recorded by the gateway's registry (as the auto
+        // writer would); the hidden pages are B's and unrecorded alike.
+        let own = page("own", "0.300", "telegram:A", "gannetcliff ledger own");
+        std::fs::write(wiki.join("auto/sop/own.md"), &own).unwrap();
+        duduclaw_memory::wiki_auto_registry::record_page(
+            home,
+            "alice",
+            "auto/sop/own.md",
+            &own,
+            &["conversation:telegram:A:m:1".to_string()],
+            false,
+        )
+        .unwrap();
 
         let in_a = ReadScope::Conversation(Some("telegram:A".into()));
         let args = serde_json::json!({ "query": "gannetcliff ledger", "limit": 1 });

@@ -270,6 +270,18 @@ pub(super) fn bash_name_rules(normalized: &str, home: &Path, caller: &HookCaller
                 attempted_path: home.join("agents").join(caller_id).join("INSTRUCTIONS.md"),
             };
         }
+
+        // v1.84.0 (RM-200): own `wiki/auto/**` and `wiki/.auto-pages*`. Same
+        // speed bump as the three rules above (see `own_auto_wiki`); the
+        // gateway hides any auto page its own registry did not record.
+        if super::own_auto_wiki::mentions_own_auto_wiki(normalized, caller_id)
+            && write_verb(normalized).is_some()
+        {
+            return GuardDecision::BlockedOwnAutoWikiWrite {
+                caller: caller_id.clone(),
+                attempted_path: home.join("agents").join(caller_id).join("wiki").join("auto"),
+            };
+        }
     }
 
     GuardDecision::NotAgentFile

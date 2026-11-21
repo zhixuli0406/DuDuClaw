@@ -370,8 +370,8 @@ pub(crate) async fn handle_wiki_share(args: &Value, home_dir: &Path, caller_agen
     handle_wiki_share_in(args, home_dir, caller_agent, &scope).await
 }
 
-/// [`handle_wiki_share`] with an explicit read scope (v1.84.0: on a channel
-/// turn no page under `auto/` is published).
+/// [`handle_wiki_share`] with an explicit read scope (v1.84.0: no page under
+/// `auto/` is published over MCP, in any scope).
 pub(crate) async fn handle_wiki_share_in(
     args: &Value,
     home_dir: &Path,
@@ -383,9 +383,13 @@ pub(crate) async fn handle_wiki_share_in(
         None => return tool_error("Missing required parameter: page_path"),
     };
     // v1.84.0 (review H1): the source is inside `auto/` — one fixed answer,
-    // before any file-system access, whether or not the page exists.
-    if auto_namespace_mutation_refused(page_path, scope) {
-        return tool_error(WIKI_AUTO_NAMESPACE_CHANNEL_TURN_REFUSED);
+    // before any file-system access, whether or not the page exists, in
+    // every scope (employee-wide included). Auto pages reach the shared wiki
+    // only through the dashboard's `wiki.share` (promoted pages only). The
+    // destination is always `sources/<caller>--<stem>.md` of the shared
+    // wiki, never an employee's `auto/`.
+    if auto_namespace_mutation_refused(page_path) {
+        return tool_error(WIKI_AUTO_NAMESPACE_REFUSED);
     }
     let custom_summary = args.get("summary").and_then(|v| v.as_str());
 
@@ -414,8 +418,8 @@ pub(crate) async fn handle_wiki_share_in(
         };
     // v1.84.0: another conversation's auto page cannot be published from a
     // channel turn; it answers exactly like a missing page. (Defence in
-    // depth: on a channel turn an `auto/` source is already refused above.)
-    if auto_page_hidden(&wiki_dir, page_path, scope) {
+    // depth: an `auto/` source is already refused above, in every scope.)
+    if auto_page_hidden(&wiki_dir, page_path, scope, &auto_registry_for(home_dir, caller_agent, scope)) {
         return tool_error(&format!("Page not found in your wiki: {}", page_path));
     }
     // Publishing must not bypass what `wiki_read` withholds (quarantined,

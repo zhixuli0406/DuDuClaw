@@ -25,6 +25,11 @@ pub const HOST_SOURCES_KEY: &str = "host_sources";
 /// it is owned by the host: every MCP wiki write passes through
 /// [`stamp_host_sources`], which drops a value the writer supplied and never
 /// adds one, so a page rewritten over MCP is no longer promoted.
+///
+/// v1.84.0 (review H1 item 3): for an auto page neither key is trusted on
+/// its own — a file in the employee's directory can carry any text. They
+/// count only when the gateway's registry
+/// (`duduclaw_memory::wiki_auto_registry`) records the page's exact bytes.
 pub const HOST_PROMOTED_KEY: &str = "host_promoted";
 /// Most entries kept on one page.
 pub const HOST_SOURCES_MAX: usize = 20;

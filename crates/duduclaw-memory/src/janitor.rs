@@ -218,6 +218,11 @@ impl WikiJanitor {
         page_path: &str,
         recent_negative_count: u32,
     ) -> Result<bool> {
+        // v1.84.0: an auto page is rewritten under the auto-page lock, and
+        // its registry entry follows the rewrite only when it matched `raw`
+        // (`WikiStore::rerecord_auto_page`), so a legitimate page stays
+        // visible to its conversation and a planted one stays hidden.
+        let _auto_lock = wiki.auto_page_lock(page_path)?;
         let (page, raw) = wiki.read_page_with_raw(page_path)?;
 
         // If `corrected` already in tags, only re-tag after cooldown — handled
@@ -245,7 +250,8 @@ impl WikiJanitor {
             &raw,
             &rewrite_page_with_tags_and_suffix(&page, &new_tags, &suffix),
         );
-        wiki.write_page(page_path, &new_content)?;
+        let written = wiki.write_page_returning(page_path, &new_content)?;
+        wiki.rerecord_auto_page(page_path, &raw, &written);
 
         // Record audit so we know when this happened (cooldown).
         let agent_id = wiki
@@ -478,6 +484,68 @@ mod tests {
 
         let page = wiki.read_page("concepts/sync.md").unwrap();
         assert!((page.trust - 0.85).abs() < 0.01);
+    }
+
+    /// v1.84.0 (RM-200): the auto-correct tagging and the trust snapshot
+    /// sync move a recorded auto page's registry entry with their rewrite
+    /// (the page stays current), while a page the registry never recorded —
+    /// or one edited on disk since — stays unrecorded after the rewrite.
+    #[test]
+    fn maintenance_rewrites_follow_the_auto_page_registry() {
+        use crate::wiki_auto_registry::{record_page, AutoPageRegistry};
+        let (tmp, wiki) = setup_wiki();
+        let home = tmp.path();
+        let host = vec!["conversation:telegram:A:m:1".to_string()];
+        let mut written = std::collections::HashMap::new();
+        for name in ["tagged", "synced", "edited"] {
+            let path = format!("auto/sop/{name}.md");
+            let bytes = wiki.write_page_returning(&path, &make_page(name, "Body.", 0.5)).unwrap();
+            record_page(home, "agnes", &path, &bytes, &host, false).unwrap();
+            written.insert(name, bytes);
+        }
+        // Planted on disk, never recorded; and a recorded page edited by hand.
+        std::fs::write(wiki.wiki_dir().join("auto/sop/planted.md"), make_page("planted", "Body.", 0.5)).unwrap();
+        std::fs::write(wiki.wiki_dir().join("auto/sop/edited.md"), make_page("edited", "Forged.", 0.5)).unwrap();
+
+        let store = Arc::new(WikiTrustStore::in_memory().unwrap());
+        for page in ["auto/sop/tagged.md", "auto/sop/planted.md"] {
+            for i in 0..3 {
+                let _ = store.upsert_signal(
+                    page,
+                    "agnes",
+                    crate::feedback::TrustSignal::Negative { magnitude: 0.05 },
+                    Some(&format!("c{i}")),
+                    Some(0.8),
+                );
+            }
+        }
+        for page in ["auto/sop/synced.md", "auto/sop/edited.md"] {
+            store.manual_set(page, "agnes", 0.85, false, None, None).unwrap();
+        }
+        let report = WikiJanitor::new(store).run_once(wiki.wiki_dir(), "agnes");
+        assert!(report.corrected_pages.contains(&"auto/sop/tagged.md".to_string()), "{report:?}");
+        assert!(report.snapshot_synced >= 2, "{report:?}");
+
+        let reg = AutoPageRegistry::load(home, "agnes");
+        for name in ["tagged", "synced"] {
+            let path = format!("auto/sop/{name}.md");
+            let now = std::fs::read_to_string(wiki.wiki_dir().join(&path)).unwrap();
+            assert_ne!(&now, &written[name], "{name} was rewritten");
+            let rec = reg.current(&path, &now).unwrap_or_else(|| panic!("{name}: registry not moved"));
+            assert_eq!(rec.host_sources, host);
+        }
+        for name in ["planted", "edited"] {
+            let path = format!("auto/sop/{name}.md");
+            let now = std::fs::read_to_string(wiki.wiki_dir().join(&path)).unwrap();
+            assert!(reg.current(&path, &now).is_none(), "{name} must stay unrecorded");
+        }
+        // The lock lives under `<home>/locks/`, not in the wiki.
+        assert!(home.join("locks/wiki-auto/agnes.lock").exists());
+        assert!(!wiki.wiki_dir().join(".auto-pages.lock").exists());
+
+        // Archiving a recorded page drops its entry.
+        assert!(wiki.archive_page("auto/sop/synced.md").unwrap());
+        assert!(AutoPageRegistry::load(home, "agnes").record("auto/sop/synced.md").is_none());
     }
 }
 

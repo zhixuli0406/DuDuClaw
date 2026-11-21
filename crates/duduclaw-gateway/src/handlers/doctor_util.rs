@@ -4,6 +4,9 @@
 use super::*;
 
 /// Upgrade visibility notice, one warning per employee; never a failure.
+/// v1.84.0: counts every auto page that needs re-confirmation — filed
+/// before the upgrade, by an earlier v1.84.0 build, or changed on disk
+/// outside DuDuClaw (`auto_wiki_page::legacy_auto_page_counts`).
 pub(crate) fn legacy_wiki_checks(home_dir: &Path) -> Vec<Value> {
     let mut checks = Vec::new();
     let Ok(agents) = std::fs::read_dir(home_dir.join("agents")) else {
@@ -29,7 +32,7 @@ pub(crate) fn legacy_wiki_checks(home_dir: &Path) -> Vec<Value> {
                 "agent_id": agent_id,
                 "previously_promoted": promoted,
                 "not_promoted": unpromoted,
-                "message": format!("有 {total} 個升級前由系統自動建立的筆記頁目前不會出現在對話中，其中 {promoted} 個先前已由人員提升。請到知識整理頁重新確認要保留的頁面。"),
+                "message": format!("有 {total} 個系統自動建立的筆記頁需要重新確認（升級前建立，或檔案曾在 DuDuClaw 之外被改動），目前不會出現在對話中，其中 {promoted} 個先前已由人員提升。請到知識整理頁重新確認要保留的頁面。"),
                 "can_repair": false,
             }));
         }

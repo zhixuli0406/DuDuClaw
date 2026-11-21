@@ -6800,12 +6800,20 @@ fn agent_file_guard_decision(
                 // Instructions lock — INSTRUCTIONS.md likewise, no opt-in.
                 let own_instructions =
                     duduclaw_core::check_own_instructions_write(&file_path, &home, caller);
+                // v1.84.0 (RM-200) — own `wiki/auto/**` and the legacy
+                // `wiki/.auto-pages*` lock: gateway / dashboard only, no
+                // opt-in. (The Bash lane stays a speed bump, as for the
+                // files above.)
+                let own_auto_wiki =
+                    duduclaw_core::check_own_auto_wiki_write(&file_path, &home, caller);
                 if !own_soul.is_allowed() {
                     own_soul
                 } else if !own_contract.is_allowed() {
                     own_contract
                 } else if !own_instructions.is_allowed() {
                     own_instructions
+                } else if !own_auto_wiki.is_allowed() {
+                    own_auto_wiki
                 } else {
                     // Stages 1–3 on the literal path, then — when a link
                     // makes the real target a different file — on the real
@@ -14984,6 +14992,76 @@ mod contract_lock_hook_tests {
         // The operator's own terminal is unaffected.
         let d = decide("Write", &file_envelope("Write", &path), &HookCaller::Absent);
         assert!(d.is_allowed(), "{d:?}");
+    }
+
+    /// v1.84.0 (RM-200, review H1): the employee's own `wiki/auto/**` and the
+    /// legacy `wiki/.auto-pages*` lock are not writable through the hook —
+    /// write, create (a new file), edit, rename into, delete — under every
+    /// spelling a file system opens as `auto/`. Reads and the rest of the
+    /// wiki stay writable; the operator is unaffected.
+    #[test]
+    fn own_auto_wiki_write_is_blocked_on_every_lane() {
+        let wiki = home().join("agents/sales-rep/wiki");
+        let blocked = |d: &GuardDecision| {
+            matches!(d, GuardDecision::BlockedOwnAutoWikiWrite { caller, .. } if caller == "sales-rep")
+        };
+        for rel in [
+            "auto/sop/refunds.md",
+            "auto/sop/brand-new.md",
+            "AUTO/sop/refunds.md",
+            "Auto/charter/x.md",
+            "auto./sop/x.md",
+            "auto /sop/x.md",
+            "au\u{200d}to/sop/x.md",
+            ".auto-pages.lock",
+            ".AUTO-PAGES.lock",
+            ".auto-pages",
+        ] {
+            let path = wiki.join(rel);
+            for tool in ["Write", "Edit", "MultiEdit"] {
+                let d = decide(tool, &file_envelope(tool, &path), &agent("sales-rep"));
+                assert!(blocked(&d), "{tool} {rel:?}: {d:?}");
+            }
+            let env = json!({"tool_name": "NotebookEdit", "tool_input": {"notebook_path": path.to_string_lossy()}});
+            assert!(blocked(&decide("NotebookEdit", &env, &agent("sales-rep"))), "NotebookEdit {rel:?}");
+            assert!(decide("Write", &file_envelope("Write", &path), &HookCaller::Absent).is_allowed(), "{rel:?}");
+        }
+        let d = decide("Write", &file_envelope("Write", &wiki.join("auto/sop/x.md")), &agent("sales-rep"));
+        assert!(d.block_message().unwrap().contains("auto/"), "{d:?}");
+        // Relative to the envelope's working directory (the employee's own).
+        let env = json!({"tool_name": "Write", "cwd": home().join("agents/sales-rep").to_string_lossy(),
+            "tool_input": {"file_path": "wiki/auto/sop/x.md", "content": "x"}});
+        assert!(blocked(&decide("Write", &env, &agent("sales-rep"))));
+        for cmd in [
+            "echo forged > wiki/auto/sop/refunds.md",
+            "cat x > ./wiki/AUTO/sop/refunds.md",
+            "sed -i '' 's/a/b/' wiki/auto/sop/refunds.md",
+            "mv /tmp/forged.md wiki/auto/sop/refunds.md",
+            "cp notes.md /Users/alice/.duduclaw/agents/sales-rep/wiki/auto/sop/x.md",
+            "rm wiki/auto/sop/refunds.md",
+            "rm -rf wiki/auto",
+            "rm wiki/.auto-pages.lock",
+            "ln -s /tmp/x wiki/.auto-pages.lock",
+        ] {
+            let env = json!({"tool_name": "Bash", "tool_input": {"command": cmd}});
+            let d = decide("Bash", &env, &agent("sales-rep"));
+            assert!(blocked(&d), "{cmd}: {d:?}");
+        }
+        // Reads, other wiki directories and look-alikes stay allowed.
+        for cmd in ["cat wiki/auto/sop/refunds.md", "echo x > wiki/concepts/notes.md", "echo x > wiki/automation/x.md"] {
+            let env = json!({"tool_name": "Bash", "tool_input": {"command": cmd}});
+            assert!(decide("Bash", &env, &agent("sales-rep")).is_allowed(), "{cmd}");
+        }
+        for rel in ["concepts/notes.md", "automation/x.md", "entities/auto/x.md", "auto.md"] {
+            let d = decide("Write", &file_envelope("Write", &wiki.join(rel)), &agent("sales-rep"));
+            assert!(d.is_allowed(), "{rel}: {d:?}");
+        }
+        let env = json!({"tool_name": "Read", "tool_input": {"file_path": wiki.join("auto/sop/refunds.md").to_string_lossy()}});
+        assert!(decide("Read", &env, &agent("sales-rep")).is_allowed());
+        // Another employee's auto pages: the cross-agent rule answers first.
+        let foreign = home().join("agents/ceo/wiki/auto/sop/x.md");
+        let d = decide("Write", &file_envelope("Write", &foreign), &agent("sales-rep"));
+        assert!(matches!(d, GuardDecision::BlockedForeignAgentDir { .. }), "{d:?}");
     }
 
     #[test]

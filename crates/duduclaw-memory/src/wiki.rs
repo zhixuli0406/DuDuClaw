@@ -572,10 +572,69 @@ impl WikiStore {
         }
         let _fence = self.delivery_fence().exclusive_for_write()?;
         crate::isolation_io::verify()?;
+        self.write_page_under_fence(path, content).map(|_| ())
+    }
+
+    /// [`Self::write_page`], returning the exact content written to disk
+    /// (after credential masking). v1.84.0: the auto-page registry
+    /// (`crate::wiki_auto_registry`) records the digest of these bytes, never
+    /// of a re-read, so a file swapped in after the write is not recorded.
+    pub fn write_page_returning(&self, path: &str, content: &str) -> Result<String> {
+        if content.len() > MAX_PAGE_SIZE {
+            return Err(DuDuClawError::Memory(format!(
+                "page too large: {} bytes (max {})",
+                content.len(),
+                MAX_PAGE_SIZE
+            )));
+        }
+        let _fence = self.delivery_fence().exclusive_for_write()?;
+        crate::isolation_io::verify()?;
         self.write_page_under_fence(path, content)
     }
 
-    fn write_page_under_fence(&self, path: &str, content: &str) -> Result<()> {
+    /// v1.84.0: the auto-page write lock (`<home>/locks/wiki-auto/<id>.lock`)
+    /// for a rewrite of `path`, when this is an employee wiki and `path` an
+    /// auto page; `None` otherwise. Taken before the delivery fence, the
+    /// same order as the gateway's auto writer. Fail closed: a lock that
+    /// cannot be taken stops the rewrite.
+    pub fn auto_page_lock(&self, path: &str) -> Result<Option<duduclaw_core::fs_lock::FileLockGuard>> {
+        if self.shared || !crate::wiki_auto_registry::is_auto_rel(path) {
+            return Ok(None);
+        }
+        let Some((home, agent)) = crate::wiki_auto_registry::owner_of_wiki(&self.wiki_dir) else {
+            return Ok(None);
+        };
+        crate::wiki_auto_registry::lock_auto_pages(&home, &agent)
+            .map(Some)
+            .map_err(|e| DuDuClawError::Memory(format!("auto page lock unavailable: {e}")))
+    }
+
+    /// v1.84.0: after a maintenance rewrite of `path` from `old_raw` to
+    /// `written`, move its auto-page registry entry when the entry matched
+    /// `old_raw` (`wiki_auto_registry::rerecord_if_current`). Best effort: a
+    /// failure leaves the page hidden from conversations (fail closed).
+    pub(crate) fn rerecord_auto_page(&self, path: &str, old_raw: &str, written: &str) {
+        if self.shared {
+            return;
+        }
+        if let Err(e) = crate::wiki_auto_registry::rerecord_in_wiki(&self.wiki_dir, path, old_raw, written) {
+            warn!(page = path, "auto page registry not updated after rewrite: {e}");
+        }
+    }
+
+    /// v1.84.0: drop the auto-page registry entry of a page that left the
+    /// live tree (deleted or archived). Best effort; a stale entry only
+    /// matches the exact bytes the gateway wrote at that path.
+    fn forget_auto_page(&self, path: &str) {
+        if self.shared {
+            return;
+        }
+        if let Err(e) = crate::wiki_auto_registry::forget_in_wiki(&self.wiki_dir, path) {
+            warn!(page = path, "auto page registry entry not dropped: {e}");
+        }
+    }
+
+    fn write_page_under_fence(&self, path: &str, content: &str) -> Result<String> {
         if duduclaw_security::credential_detect::mask(path) != path {
             return Err(DuDuClawError::Memory("credentials are not accepted in wiki paths".into()));
         }
@@ -638,7 +697,7 @@ impl WikiStore {
         self.fts_sync_upsert(path, content);
 
         info!(page = path, action, "Wiki page written");
-        Ok(())
+        Ok(masked_content)
     }
 
     /// Move a quarantined page into `_archive/<original_path>`.
@@ -697,6 +756,9 @@ impl WikiStore {
             warn!("Failed to log archive {path}: {e}");
         }
         self.fts_sync_remove(path);
+        // v1.84.0: an archived auto page is no longer recorded; restored, it
+        // needs re-confirmation before a conversation sees it again.
+        self.forget_auto_page(path);
 
         info!(page = path, "Wiki page archived");
         Ok(true)
@@ -759,6 +821,9 @@ impl WikiStore {
         new_do_not_inject: bool,
     ) -> Result<()> {
         self.validate_page_path(path)?;
+        // v1.84.0: an auto page is rewritten under the auto-page lock and its
+        // registry entry follows the rewrite (only when it matched `raw`).
+        let _auto_lock = self.auto_page_lock(path)?;
         let _fence = self.delivery_fence().exclusive_for_write()?;
         crate::isolation_io::verify()?;
         let (mut page, raw) = self.read_page_with_raw(path)?;
@@ -766,7 +831,9 @@ impl WikiStore {
         page.do_not_inject = new_do_not_inject;
         page.updated = Utc::now();
         let content = carry_host_owned_lines(&raw, &serialize_page(&page));
-        self.write_page_under_fence(path, &content)
+        let written = self.write_page_under_fence(path, &content)?;
+        self.rerecord_auto_page(path, &raw, &written);
+        Ok(())
     }
 
     /// Delete a page from disk.
@@ -787,6 +854,7 @@ impl WikiStore {
             }
             // Best-effort FTS sync
             self.fts_sync_remove(path);
+            self.forget_auto_page(path);
             info!(page = path, "Wiki page deleted");
         }
         Ok(())
@@ -820,6 +888,7 @@ impl WikiStore {
             })?;
         }
         self.fts_sync_remove(path);
+        self.forget_auto_page(path);
         if existed {
             if let Err(e) = self.append_log("delete", path) {
                 warn!("Failed to log delete {path}: {e}");
