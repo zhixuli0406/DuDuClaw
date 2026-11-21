@@ -4,6 +4,28 @@ use tokio::io::AsyncReadExt;
 
 type Seen = Arc<StdMutex<Vec<(Value, HashMap<String, String>)>>>;
 
+// Return an unnegotiated client only after Python has finished starting. In
+// particular, the fixed two-second discovery probe must not time the macOS
+// system-Python shim. Keep this entirely in tests; production deadlines stand.
+#[cfg(unix)]
+pub(super) async fn ready_python_client(python: &str, args: &[String]) -> McpClient {
+    let mut command = stdio_command(python, args, &[], std::process::Stdio::inherit(), false).unwrap();
+    let mut child = ManagedChild::spawn(&mut command).await.unwrap();
+    let stdin = child.child().stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.child().stdout.take().unwrap());
+    let ready = tokio::time::timeout(Duration::from_secs(60), protocol::read_stdio_frame(&mut stdout))
+        .await.expect("Python fixture did not become ready").unwrap();
+    assert_eq!(ready.as_deref(), Some("ready"));
+    McpClient {
+        transport: McpTransport::Stdio { child, stdin, stdout },
+        next_id: AtomicI64::new(1), timeout: Duration::from_secs(60),
+        label: python.into(), workflow_version: None,
+        builtin_tool_timeouts: false, protocol_version: protocol::MODERN,
+        requires_reconnect: false, last_http_status: None,
+        tool_schemas: HashMap::new(), input_handler: None,
+    }
+}
+
 struct Mock {
     url: String,
     seen: Seen,
@@ -195,6 +217,8 @@ async fn stdio_generations_fallback_errors_timeout_and_mrtr() {
 import json, sys
 version, mode = sys.argv[1:3]
 seen_ids = set()
+discoveries = 0
+print('ready', flush=True)
 for line in sys.stdin:
     req = json.loads(line)
     if 'id' not in req: continue
@@ -202,6 +226,7 @@ for line in sys.stdin:
     seen_ids.add(req['id'])
     method = req['method']
     if method == 'server/discover':
+        discoveries += 1
         if version == '2026-07-28':
             result = {'resultType':'complete','supportedVersions':[version],'capabilities':{}}
         elif mode == 'timeout': continue
@@ -211,6 +236,7 @@ for line in sys.stdin:
             continue
     elif method == 'initialize':
         assert version != '2026-07-28'
+        assert discoveries == (2 if mode == 'timeout' else 1)
         result = {'protocolVersion':version,'capabilities':{}}
     elif method == 'tools/list':
         result = {'tools':[{'name':'echo','inputSchema':{'type':'object'}}]}
@@ -237,9 +263,21 @@ for line in sys.stdin:
         ("2025-06-18", "params"), ("2025-06-18", "mismatch"),
         ("2025-06-18", "timeout"),
     ] {
-        let mut client = McpClient::connect("/usr/bin/python3", &[
+        let mut client = ready_python_client("/usr/bin/python3", &[
             "-u".into(), "-c".into(), script.into(), version.into(), mode.into(),
-        ], &[], Duration::from_secs(5)).await.unwrap();
+        ]).await;
+        if mode == "timeout" {
+            // Prove the ready peer actually ignores discovery, rather than
+            // accidentally testing interpreter startup or a different error.
+            client.timeout = Duration::from_millis(100);
+            let id = client.alloc_id();
+            assert!(matches!(client.request(make_request(id, "server/discover", json!({})), id).await,
+                Err(McpError::Timeout)));
+            client.timeout = Duration::from_secs(60);
+        }
+        // The timeout case also exercises handshake's own bounded discovery
+        // probe and its documented fallback to legacy initialize.
+        client.handshake().await.unwrap();
         assert_eq!(client.protocol_version(), version);
         client.set_input_handler(Arc::new(Decline));
         assert_eq!(client.list_tools().await.unwrap().len(), 1);
