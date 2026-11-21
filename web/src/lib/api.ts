@@ -2548,6 +2548,38 @@ export interface LicenseSnapshot {
    * must remain visible as the anti-resale watermark.
    */
   nfr?: boolean;
+  /** Signed per-license AI employee quota; `null` = the tier default applies. */
+  max_agents?: number | null;
+  /**
+   * AI employee cap actually enforced on this gateway. `null` when uncapped
+   * (then `seat_unlimited` is `true`); absent on older gateways.
+   */
+  seat_limit?: number | null;
+  /** `true` only when the gateway enforces no AI employee cap. */
+  seat_unlimited?: boolean;
+  /** Employees holding a seat (archived included); `null` when uncountable. */
+  seats_used?: number | null;
+}
+
+/** Result of `license.sync`: the refreshed snapshot plus what happened. */
+export interface LicenseSyncResult extends LicenseSnapshot {
+  sync: {
+    outcome:
+      | 'updated'
+      | 'unchanged'
+      | 'revoked'
+      | 'pending_rebind'
+      | 'no_license'
+      | 'offline'
+      | 'failed'
+      | 'busy';
+    /** zh-TW sentence from the gateway (fallback when no translation). */
+    message: string;
+    reason?: string;
+    retry_after_secs?: number;
+  };
+  /** The plan now resolves a different edition than the one the service booted with. */
+  restart_recommended: boolean;
 }
 
 // ── User management types ────────────────────────────────────
@@ -8645,6 +8677,19 @@ export const api = {
      */
     status: (): Promise<LicenseSnapshot> =>
       client.call('license.status') as Promise<LicenseSnapshot>,
+    /**
+     * Admin-only: refresh the license from the vendor now (signed refresh,
+     * rate-limited and single-flight on the gateway), then return the
+     * snapshot plus the outcome. Seat limit and expiry apply immediately.
+     */
+    sync: async (): Promise<LicenseSyncResult> => {
+      const result = await client.call('license.sync', {}) as LicenseSyncResult;
+      if (result?.sync?.outcome === 'updated' || result?.sync?.outcome === 'revoked') {
+        useBrandStore.getState().setBrand(null);
+        await loadPublicBrand();
+      }
+      return result;
+    },
     /** Machine fingerprint provided to the general distributor for licensing. */
     fingerprint: () =>
       client.call('license.fingerprint', {}) as Promise<{ fingerprint: string }>,

@@ -5,7 +5,7 @@ import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useAgentsStore } from '@/stores/agents-store';
-import { api, type LicenseSnapshot } from '@/lib/api';
+import { api, type LicenseSnapshot, type LicenseSyncResult } from '@/lib/api';
 import { TIER_LABELS } from '@/lib/license-labels';
 import { useCommercialContact } from '@/lib/commercial-contact';
 import { cn } from '@/lib/utils';
@@ -110,6 +110,44 @@ function StatTile({
   );
 }
 
+type SyncOutcome = LicenseSyncResult['sync']['outcome'];
+
+/** `license.sync` outcome → plain-words message id (static ids, no templating). */
+const SYNC_OUTCOME_MESSAGE: Record<SyncOutcome, string> = {
+  updated: 'license.sync.outcome.updated',
+  unchanged: 'license.sync.outcome.unchanged',
+  revoked: 'license.sync.outcome.revoked',
+  pending_rebind: 'license.sync.outcome.pendingRebind',
+  no_license: 'license.sync.outcome.noLicense',
+  offline: 'license.sync.outcome.offline',
+  failed: 'license.sync.outcome.failed',
+  busy: 'license.sync.outcome.busy',
+};
+
+const SYNC_OUTCOME_TEXT: Record<SyncOutcome, string> = {
+  updated: 'text-success',
+  unchanged: 'text-success',
+  revoked: 'text-destructive',
+  pending_rebind: 'text-warning',
+  no_license: 'text-muted-foreground',
+  offline: 'text-warning',
+  failed: 'text-warning',
+  busy: 'text-muted-foreground',
+};
+
+/**
+ * The AI employee cap row: the enforced number, 「不限」 only when the gateway
+ * says it is uncapped, nothing when the gateway did not say (older gateway
+ * or a failed lookup) — never a made-up number.
+ */
+export function seatLimitLabel(
+  snapshot: Pick<LicenseSnapshot, 'seat_limit' | 'seat_unlimited'>,
+): { kind: 'number'; value: number } | { kind: 'unlimited' } | null {
+  if (typeof snapshot.seat_limit === 'number') return { kind: 'number', value: snapshot.seat_limit };
+  if (snapshot.seat_limit === null && snapshot.seat_unlimited === true) return { kind: 'unlimited' };
+  return null;
+}
+
 function PhoneHomeIndicator({
   daysSincePhoneHome,
 }: {
@@ -148,6 +186,9 @@ export function LicensePage() {
   // below are false — the page went blank under its own header and the only
   // clue was a toast that had already disappeared.
   const [loadError, setLoadError] = useState<unknown>(null);
+  // Admin "重新整理" really syncs with the vendor (license.sync).
+  const [syncResult, setSyncResult] = useState<LicenseSyncResult['sync'] | null>(null);
+  const [restartRecommended, setRestartRecommended] = useState(false);
 
   const load = useMemo(
     () => async () => {
@@ -172,7 +213,25 @@ export function LicensePage() {
     void load();
   }, [connectionState, load]);
 
+  const sync = async () => {
+    setRefreshing(true);
+    setSyncResult(null);
+    try {
+      const result = await api.license.sync();
+      setLoadError(null);
+      setSnapshot(result);
+      setSyncResult(result.sync ?? null);
+      setRestartRecommended(result.restart_recommended === true);
+    } catch (e) {
+      // The licence on screen is still the last one read; only the sync failed.
+      toast.error(formatError(e));
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
   const expiryClassification = classifyExpiry(snapshot?.days_until_expiry);
+  const seatLimit = snapshot ? seatLimitLabel(snapshot) : null;
 
   return (
     <div className="mx-auto w-full max-w-4xl space-y-6">
@@ -189,6 +248,10 @@ export function LicensePage() {
           variant="outline"
           size="sm"
           onClick={() => {
+            if (isAdmin) {
+              void sync();
+              return;
+            }
             setRefreshing(true);
             void load();
           }}
@@ -198,6 +261,24 @@ export function LicensePage() {
           {intl.formatMessage({ id: 'license.refresh' })}
         </Button>
       </div>
+
+      {syncResult && SYNC_OUTCOME_MESSAGE[syncResult.outcome] && (
+        <p role="status" className={cn('text-sm', SYNC_OUTCOME_TEXT[syncResult.outcome])}>
+          {intl.formatMessage(
+            { id: SYNC_OUTCOME_MESSAGE[syncResult.outcome] },
+            { seconds: syncResult.retry_after_secs ?? 30 },
+          )}
+        </p>
+      )}
+
+      {restartRecommended && (
+        <div
+          role="status"
+          className="rounded-xl border border-amber-400/50 bg-amber-50 px-4 py-3 text-sm text-amber-900 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-200"
+        >
+          {intl.formatMessage({ id: 'license.sync.restartRecommended' })}
+        </div>
+      )}
 
       {loading && !snapshot && (
         <Card>
@@ -320,6 +401,22 @@ export function LicensePage() {
                 {snapshot.last_phone_home ? new Date(snapshot.last_phone_home).toLocaleString() : '—'}
               </span>
             </SettingsRow>
+            {seatLimit && (
+              <SettingsRow label={intl.formatMessage({ id: 'license.seats.limit' })}>
+                <span className="text-sm" data-testid="license-seat-limit">
+                  {seatLimit.kind === 'number'
+                    ? intl.formatNumber(seatLimit.value)
+                    : intl.formatMessage({ id: 'license.seats.unlimited' })}
+                </span>
+              </SettingsRow>
+            )}
+            {typeof snapshot.seats_used === 'number' && (
+              <SettingsRow label={intl.formatMessage({ id: 'license.seats.used' })}>
+                <span className="text-sm" data-testid="license-seats-used">
+                  {intl.formatNumber(snapshot.seats_used)}
+                </span>
+              </SettingsRow>
+            )}
             <SettingsRow
               label={
                 <span className="flex items-center gap-1.5">

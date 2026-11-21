@@ -590,6 +590,10 @@ async fn cmd_subscriptions() -> Result<()> {
 
 // ── activate ──────────────────────────────────────────────────
 
+/// RM-175: printed after a licence is saved. A running gateway on this data
+/// directory picks the file up from its 60-second watcher; no IPC.
+const LIVE_APPLY_NOTE: &str = "  執行中的服務約一分鐘內自動套用新授權，不需重新啟動 (a running service on this data directory applies it within about a minute; no restart needed).";
+
 async fn cmd_activate(key_input: &str) -> Result<()> {
     let license = parse_license_input(key_input)?;
 
@@ -651,6 +655,7 @@ async fn cmd_activate(key_input: &str) -> Result<()> {
     if let Some(sas) = local_pubkey.as_deref().and_then(duduclaw_gateway::installation_identity::sas_for_hex) {
         println!("  Relay key:      {sas} ({})", relay_key_line(&license, local_pubkey.as_deref()));
     }
+    println!("{LIVE_APPLY_NOTE}");
 
     Ok(())
 }
@@ -998,6 +1003,7 @@ async fn cmd_refresh() -> Result<()> {
             if let Some(sas) = local_pubkey.as_deref().and_then(duduclaw_gateway::installation_identity::sas_for_hex) {
                 println!("  Relay key:      {sas} ({})", relay_key_line(&new_license, local_pubkey.as_deref()));
             }
+            println!("{LIVE_APPLY_NOTE}");
 
             if let Some(warnings) = envelope.get("warnings").and_then(|v| v.as_array()) {
                 if !warnings.is_empty() {
