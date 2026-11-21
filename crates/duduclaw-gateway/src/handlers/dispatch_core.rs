@@ -589,6 +589,13 @@ impl MethodHandler {
                 require_admin!();
                 boxed_frame(|| self.handle_license_activate(params)).await
             }
+            // RM-175: refresh from the control plane now (rate-limited,
+            // single-flight). Admin-only like activation: it can change what
+            // the whole install is allowed to do.
+            "license.sync" => {
+                require_admin!();
+                boxed_frame(|| self.handle_license_sync()).await
+            }
 
             "accounts.list" => {
                 require_admin!();

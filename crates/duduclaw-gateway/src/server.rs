@@ -2913,6 +2913,10 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // reach open dashboards. `license.activate` broadcasts inline; this 60s
     // poll is the safety net for
     // background transitions, broadcasting only on an actual change.
+    // RM-175: it also applies a `license.json` written by the CLI
+    // (`duduclaw license refresh|activate`) within about a minute — a cheap
+    // size/mtime check, then the usual validation — instead of waiting for
+    // the daily CRL cycle.
     {
         let bg_state = state.clone();
         tokio::spawn(async move {
@@ -2921,6 +2925,10 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             tick.tick().await; // consume the immediate first tick
             loop {
                 tick.tick().await;
+                let reloaded = match crate::license_runtime::global() {
+                    Some(runtime) => runtime.reload_from_disk_if_changed().await,
+                    None => false,
+                };
                 let now = bg_state.handler.resolve_edition_profile().await;
                 if now != last {
                     tracing::info!(
@@ -2930,6 +2938,9 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                     );
                     bg_state.handler.broadcast_system_status().await;
                     last = now;
+                } else if reloaded {
+                    // Same edition, new seats / expiry: refresh open dashboards.
+                    bg_state.handler.broadcast_system_status().await;
                 }
             }
         });

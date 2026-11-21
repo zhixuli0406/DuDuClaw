@@ -92,7 +92,72 @@ impl MethodHandler {
         }
     }
 
+    /// `license.sync` (Admin) — RM-175: refresh the licence from the control
+    /// plane now (signed refresh, same verification as the scheduled one),
+    /// then answer like `license.status` plus `sync: {outcome, message}` and
+    /// `restart_recommended` (the edition resolved now differs from the one
+    /// this gateway booted with). Seat limit and expiry apply immediately.
+    pub(crate) async fn handle_license_sync(&self) -> WsFrame {
+        let Some(runtime) = crate::license_runtime::global() else {
+            return WsFrame::error_response("", "授權服務尚未就緒，請稍後再試");
+        };
+        let outcome = runtime.sync_now().await;
+        info!(outcome = outcome.as_str(), "license sync requested from dashboard");
+        if matches!(
+            outcome,
+            crate::license_runtime::SyncOutcome::Updated | crate::license_runtime::SyncOutcome::Revoked
+        ) {
+            self.broadcast_system_status().await;
+        }
+        self.license_sync_response(&outcome).await
+    }
+
+    /// The `license.sync` answer for an outcome (split out for tests).
+    pub(crate) async fn license_sync_response(&self, outcome: &crate::license_runtime::SyncOutcome) -> WsFrame {
+        let mut payload = match self.license_status_payload(true).await {
+            Ok(payload) => payload,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+        let restart_recommended = match crate::license_runtime::boot_edition_profile() {
+            Some(boot) => self.resolve_edition_profile().await != boot,
+            None => false,
+        };
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("sync".into(), outcome.to_json());
+            object.insert("restart_recommended".into(), json!(restart_recommended));
+        }
+        WsFrame::ok_response("", payload)
+    }
+
+    /// RM-175: `seat_limit` is the cap `agents.create` enforces
+    /// ([`Self::effective_agent_cap`]; `null` when uncapped, then
+    /// `seat_unlimited: true`), `seats_used` the employees holding a seat
+    /// (`duduclaw_core::agent_seats::seat_holders`; `null` when they cannot be
+    /// counted). Never an invented number.
+    async fn add_seat_fields(&self, payload: &mut Value) {
+        let cap = self.effective_agent_cap().await;
+        let home = self.home_dir.clone();
+        let used = tokio::task::spawn_blocking(move || duduclaw_core::agent_seats::seat_holders(&home))
+            .await
+            .ok()
+            .and_then(|scan| scan.ok())
+            .map(|holders| holders.len());
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("seat_limit".into(), if cap == 0 { Value::Null } else { json!(cap) });
+            object.insert("seat_unlimited".into(), json!(cap == 0));
+            object.insert("seats_used".into(), used.map_or(Value::Null, |n| json!(n)));
+        }
+    }
+
     pub(crate) async fn handle_license_status(&self, is_admin: bool) -> WsFrame {
+        match self.license_status_payload(is_admin).await {
+            Ok(payload) => WsFrame::ok_response("", payload),
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
+    /// The `license.status` payload: snapshot plus seat fields.
+    async fn license_status_payload(&self, is_admin: bool) -> Result<Value, String> {
         let snapshot = match crate::license_runtime::global() {
             Some(runtime) => runtime.snapshot().await,
             None => crate::license_runtime::LicenseSnapshot {
@@ -114,13 +179,9 @@ impl MethodHandler {
         };
 
         let snapshot = snapshot.for_admin(is_admin);
-        let payload = match serde_json::to_value(&snapshot) {
-            Ok(v) => v,
-            Err(e) => {
-                return WsFrame::error_response("", &format!("serialize license snapshot: {e}"));
-            }
-        };
-
-        WsFrame::ok_response("", payload)
+        let mut payload = serde_json::to_value(&snapshot)
+            .map_err(|e| format!("serialize license snapshot: {e}"))?;
+        self.add_seat_fields(&mut payload).await;
+        Ok(payload)
     }
 }

@@ -279,6 +279,7 @@ pub mod distributor_notice;
 pub mod distributor_brand;
 pub mod distributor_store;
 mod image_data;
+pub mod license_rev;
 pub mod license_runtime;
 pub mod license_seed;
 pub mod license_serve;

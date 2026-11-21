@@ -17,6 +17,11 @@
 //!   verifies the issuer signature, and downgrades immediately if the
 //!   active subscription appears in the revoked list.
 //!
+//! - **change probe** (RM-175, [`crate::license_rev`]) — every ~30 minutes
+//!   asks the control plane for an unsigned revision hint and, when it
+//!   differs from the last one seen, runs the ordinary signed refresh
+//!   through [`LicenseRuntime::sync_now`].
+//!
 //! Both tasks are completely best-effort: any unhandled error is logged
 //! and the loop continues. We never panic on a license problem — the
 //! Apache 2.0 core must keep running.
@@ -259,6 +264,158 @@ pub struct LicenseRuntime {
     registry: Arc<PublicKeyRegistry>,
     home_dir: PathBuf,
     control_url: String,
+    /// RM-175: single-flight / spacing for [`Self::sync_now`] and the cheap
+    /// disk stamp for [`Self::reload_from_disk_if_changed`].
+    sync: Arc<SyncGate>,
+}
+
+/// Minimum spacing between control-plane refreshes started through
+/// [`LicenseRuntime::sync_now`] (the control plane admits only two refreshes
+/// at a time, globally).
+pub const SYNC_MIN_SPACING: StdDuration = StdDuration::from_secs(30);
+
+/// Serializes [`LicenseRuntime::sync_now`] callers. No licence state lives
+/// here; the licence itself stays in [`LicenseRuntimeInner`].
+#[derive(Default)]
+struct SyncGate {
+    /// Held for the whole of one sync (and of one scheduled phone-home). The
+    /// value is when the last `sync_now` vendor call started.
+    flight: tokio::sync::Mutex<Option<tokio::time::Instant>>,
+    /// Bumped each time a `sync_now` finishes and records its outcome, so a
+    /// caller that waited for an in-flight sync can take its result.
+    generation: std::sync::atomic::AtomicU64,
+    last: std::sync::Mutex<Option<SyncOutcome>>,
+    /// `license.json` + revocation marker as last reconciled with memory.
+    disk_stamp: std::sync::Mutex<Option<DiskStamp>>,
+}
+
+impl SyncGate {
+    fn finish(&self, outcome: SyncOutcome) -> SyncOutcome {
+        if let Ok(mut last) = self.last.lock() {
+            *last = Some(outcome.clone());
+        }
+        self.generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        outcome
+    }
+
+    fn last_outcome(&self) -> Option<SyncOutcome> {
+        self.last.lock().ok().and_then(|last| last.clone())
+    }
+}
+
+/// Cheap identity of the files a CLI writer changes: length, modification
+/// time and (Unix) inode of `license.json` and of the revocation marker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiskStamp {
+    license: Option<FileStamp>,
+    marker: Option<FileStamp>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    inode: u64,
+}
+
+impl DiskStamp {
+    /// `None` when a file exists but its metadata cannot be read (the caller
+    /// then falls back to the full digest comparison).
+    fn read(home_dir: &Path) -> Option<Self> {
+        Some(Self {
+            license: file_stamp(&home_dir.join(storage::DEFAULT_LICENSE_FILENAME))?,
+            marker: file_stamp(&home_dir.join(REVOKED_FILENAME))?,
+        })
+    }
+}
+
+fn file_stamp(path: &Path) -> Option<Option<FileStamp>> {
+    match std::fs::metadata(path) {
+        Ok(meta) => {
+            #[cfg(unix)]
+            let inode = std::os::unix::fs::MetadataExt::ino(&meta);
+            #[cfg(not(unix))]
+            let inode = 0;
+            Some(Some(FileStamp { len: meta.len(), modified: meta.modified().ok(), inode }))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(None),
+        Err(_) => None,
+    }
+}
+
+/// What a dashboard / probe triggered sync ended with. Reason codes are fixed
+/// strings: never response bodies, licence contents or fingerprints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncOutcome {
+    /// A verified refresh changed what the licence grants (seats, expiry,
+    /// tier, binding, …).
+    Updated,
+    /// A verified refresh returned the same entitlement.
+    Unchanged,
+    /// A signed revocation was applied; the gateway runs as OpenSource.
+    Revoked,
+    /// A rebind request awaits account-holder approval; licence unchanged.
+    PendingRebind,
+    /// No licence installed; nothing to sync.
+    NoLicense,
+    /// The control plane could not be reached or gave no acceptable answer;
+    /// the installed licence is unchanged.
+    Offline { reason: &'static str },
+    /// The sync could not finish locally (disk write, or the licence changed
+    /// while it was in flight); the installed licence is unchanged.
+    Failed { reason: &'static str },
+    /// A sync ran less than [`SYNC_MIN_SPACING`] ago; no vendor call made.
+    Busy { retry_after_secs: u64 },
+}
+
+impl SyncOutcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Updated => "updated",
+            Self::Unchanged => "unchanged",
+            Self::Revoked => "revoked",
+            Self::PendingRebind => "pending_rebind",
+            Self::NoLicense => "no_license",
+            Self::Offline { .. } => "offline",
+            Self::Failed { .. } => "failed",
+            Self::Busy { .. } => "busy",
+        }
+    }
+
+    /// Operator-facing zh-TW sentence (the dashboard localizes by `as_str`).
+    pub fn message(&self) -> String {
+        match self {
+            Self::Updated => "已更新：已套用原廠最新的授權內容。".to_string(),
+            Self::Unchanged => "已是最新：授權內容沒有變更。".to_string(),
+            Self::Revoked => "授權已被撤銷，目前以開源模式執行。".to_string(),
+            Self::PendingRebind => "等待原廠核准換機：帳號持有人在控制台核准後才會生效。".to_string(),
+            Self::NoLicense => "尚未安裝商用授權，沒有需要同步的內容。".to_string(),
+            Self::Offline { .. } => "目前連不上原廠，稍後會自動再試。".to_string(),
+            Self::Failed { .. } => "同步沒有完成，稍後會自動再試。".to_string(),
+            Self::Busy { retry_after_secs } => format!("剛剛已同步過，請 {retry_after_secs} 秒後再試。"),
+        }
+    }
+
+    /// `{outcome, message}` plus `reason` / `retry_after_secs` when present.
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut value = json!({ "outcome": self.as_str(), "message": self.message() });
+        match self {
+            Self::Offline { reason } | Self::Failed { reason } => value["reason"] = json!(reason),
+            Self::Busy { retry_after_secs } => value["retry_after_secs"] = json!(retry_after_secs),
+            _ => {}
+        }
+        value
+    }
+}
+
+/// The edition resolved at boot (`bootstrap_with_edition`). Parts of the
+/// gateway are shaped by it until restart, so a licence change that resolves
+/// a different edition recommends a restart.
+static BOOT_EDITION: std::sync::OnceLock<duduclaw_core::EditionProfile> = std::sync::OnceLock::new();
+
+/// The boot edition, when this process booted a gateway.
+pub fn boot_edition_profile() -> Option<duduclaw_core::EditionProfile> {
+    BOOT_EDITION.get().copied()
 }
 
 struct LicenseRuntimeInner {
@@ -291,6 +448,7 @@ impl LicenseRuntime {
         let runtime = Self::bootstrap(home_dir, production_registry()).await;
         let env = std::env::var("DUDUCLAW_EDITION").ok();
         let edition = runtime.boot_edition(env.as_deref(), edition_override).await;
+        let _ = BOOT_EDITION.set(edition);
         (runtime, edition)
     }
 
@@ -375,6 +533,7 @@ impl LicenseRuntime {
             registry: Arc::new(registry),
             home_dir,
             control_url,
+            sync: Arc::default(),
         }
     }
 
@@ -386,7 +545,10 @@ impl LicenseRuntime {
         let crl_poll = tokio::spawn(crl_loop(self.clone()));
         let notice_poll = tokio::spawn(crate::distributor_notice::runtime::poll_loop(self.clone()));
         let brand_poll = tokio::spawn(crate::distributor_brand::runtime::poll_loop(self.clone()));
-        vec![phone_home, crl_poll, notice_poll, brand_poll]
+        // RM-175: idles unless this process holds the gateway instance lock
+        // and a licence is installed (checked on every cycle).
+        let rev_probe = tokio::spawn(crate::license_rev::rev_probe_loop(self.clone()));
+        vec![phone_home, crl_poll, notice_poll, brand_poll, rev_probe]
     }
 
     /// `(subscription_id, machine_fingerprint)` of the installed license, for
@@ -1105,7 +1267,13 @@ async fn phone_home_loop(runtime: LicenseRuntime) {
 
         tokio::time::sleep(next_sleep).await;
 
-        if let Err(e) = runtime.do_phone_home_once().await {
+        // Same flight as `sync_now`, so a dashboard sync and the scheduled
+        // refresh never race each other. The cadence is unchanged.
+        let result = {
+            let _flight = runtime.sync.flight.lock().await;
+            runtime.do_phone_home_once().await
+        };
+        if let Err(e) = result {
             // Non-fatal, re-evaluated next cycle, but logged at warn: a
             // refresh that keeps failing ends in the offline grace period
             // (until 2026-10-22 every refresh failed the nonce check at
@@ -1129,7 +1297,7 @@ impl LicenseRuntime {
         Some(StdDuration::from_secs(secs).max(MIN_PHONE_HOME_SLEEP))
     }
 
-    async fn do_phone_home_once(&self) -> Result<(), PhoneHomeError> {
+    async fn do_phone_home_once(&self) -> Result<PhoneHomeOk, PhoneHomeError> {
         // Generated only when absent; any other key-store failure omits the
         // field (the refresh still renews the tier, the relay stays unbound).
         let key_home = self.home_dir.clone();
@@ -1192,7 +1360,7 @@ impl LicenseRuntime {
             || body.get("status").and_then(|v| v.as_str()) == Some("pending") {
             self.verify_status_response(&request, &nonce, &body, "pending")?;
             info!("license rebind pending account-holder console approval; installed license unchanged");
-            return Ok(());
+            return Ok(PhoneHomeOk::Pending);
         }
         match body.get("status").and_then(|v| v.as_str()) {
             Some("active") => {
@@ -1225,17 +1393,17 @@ impl LicenseRuntime {
                     grace,
                     &request, &nonce, &body,
                 )?;
-                self.apply_refresh(&request, new_license, &accepted.matched).await?;
-                info!("phone-home succeeded; license refreshed");
+                let changed = self.apply_refresh(&request, new_license, &accepted.matched).await?;
+                info!(changed, "phone-home succeeded; license refreshed");
                 if let Some(reason) = accepted.relay_key_reason {
                     info!(reason,
                         "MFA email relay unavailable until the account owner approves this installation key in the license console");
                 }
-                Ok(())
+                Ok(PhoneHomeOk::Refreshed { changed })
             }
             Some("revoked") => {
                 self.apply_revocation_response(&request, &nonce, &body).await?;
-                Ok(())
+                Ok(PhoneHomeOk::Revoked)
             }
             other => Err(PhoneHomeError::Parse(format!(
                 "unexpected refresh response status: {other:?}"
@@ -1254,19 +1422,8 @@ impl LicenseRuntime {
         if !same {
             // A CLI writer cannot update our memory. Reconcile under the same
             // lock before rejecting the old request, including durable denial.
-            let (license, warning) = match read_validated_license_locked(&self.home_dir, &self.registry, &self.gate, &store) {
-                Ok(license) => (license, None),
-                Err(reason) => (None, Some(reason)),
-            };
-            inner.license = license;
-            inner.validation_warning = warning;
-            inner.revision += 1;
-            clear_effective_fingerprint();
-            if let Some(license) = inner.license.as_ref() {
-                set_effective_fingerprint(&license.machine_fingerprint);
-            }
-            crate::distributor_notice::runtime::reset(&self.home_dir);
-            crate::distributor_brand::runtime::reset(&self.home_dir);
+            let validated = read_validated_license_locked(&self.home_dir, &self.registry, &self.gate, &store);
+            self.install_reconciled(&mut inner, validated);
             return Err(if inner.license.is_some() { PhoneHomeError::StaleResponse } else { PhoneHomeError::NoLicense });
         }
         let license = inner.license.as_ref().ok_or(PhoneHomeError::NoLicense)?;
@@ -1281,6 +1438,176 @@ impl LicenseRuntime {
         })
     }
 
+    /// Replace memory with what the disk holds, as validated by
+    /// `read_validated_license_locked` (the bootstrap path). The caller holds
+    /// the state write lock and the disk lock, in that order. This is the
+    /// reconcile the phone-home / CRL loops have always done; it was only
+    /// moved here so [`Self::reload_from_disk_if_changed`] shares it.
+    fn install_reconciled(&self, inner: &mut LicenseRuntimeInner,
+        validated: Result<Option<License>, &'static str>) {
+        let (license, warning) = match validated {
+            Ok(license) => (license, None),
+            Err(reason) => (None, Some(reason)),
+        };
+        inner.license = license;
+        inner.validation_warning = warning;
+        inner.revision += 1;
+        clear_effective_fingerprint();
+        if let Some(license) = inner.license.as_ref() {
+            set_effective_fingerprint(&license.machine_fingerprint);
+        }
+        crate::distributor_notice::runtime::reset(&self.home_dir);
+        crate::distributor_brand::runtime::reset(&self.home_dir);
+    }
+
+    /// RM-175: apply a `license.json` rewritten by another writer (the CLI's
+    /// `duduclaw license refresh|activate|deactivate`) without a restart.
+    ///
+    /// Cheap first: when the length / modification time / inode of the
+    /// licence file and the revocation marker equal the last reconciled
+    /// state, nothing is read. Otherwise the existing digest comparison
+    /// (`same_license`) decides, and a differing file goes through the same
+    /// validation the phone-home / CRL reconcile uses. Returns `true` only
+    /// when the licence in effect (or its validation state) changed.
+    ///
+    /// Fail closed: a lock, metadata or read error — including a file that is
+    /// unreadable right now — leaves the in-memory licence untouched and is
+    /// retried on the next call.
+    pub async fn reload_from_disk_if_changed(&self) -> bool {
+        self.reconcile_with_disk(false).await
+    }
+
+    async fn reconcile_with_disk(&self, force: bool) -> bool {
+        let stamp = DiskStamp::read(&self.home_dir);
+        if !force {
+            if let (Some(stamp), Ok(last)) = (stamp.as_ref(), self.sync.disk_stamp.lock()) {
+                if last.as_ref() == Some(stamp) {
+                    return false;
+                }
+            }
+        }
+        if let Some(empty) = stamp.as_ref().filter(|s| s.license.is_none() && s.marker.is_none()) {
+            // Unlicensed home, nothing on disk: do not create lock files.
+            let unlicensed = {
+                let inner = self.state.read().await;
+                inner.license.is_none() && inner.validation_warning.is_none()
+            };
+            if unlicensed {
+                if let Ok(mut last) = self.sync.disk_stamp.lock() {
+                    *last = Some(empty.clone());
+                }
+                return false;
+            }
+        }
+        let changed = {
+            // Lock order: memory then disk, as everywhere else.
+            let mut inner = self.state.write().await;
+            let Ok(store) = self.lock_store() else { return false; };
+            let same = match inner.license.as_ref() {
+                Some(license) => match store.same_license(license) {
+                    Ok(same) => same,
+                    Err(_) => return false,
+                },
+                None => false,
+            };
+            if same {
+                false
+            } else {
+                let validated = read_validated_license_locked(&self.home_dir, &self.registry, &self.gate, &store);
+                if matches!(validated, Err("unreadable")) {
+                    debug!("license file could not be read; keeping the license in effect");
+                    return false;
+                }
+                let unchanged = match &validated {
+                    Ok(license) => inner.validation_warning.is_none()
+                        && serde_json::to_value(license).ok() == serde_json::to_value(&inner.license).ok(),
+                    Err(reason) => inner.license.is_none() && inner.validation_warning == Some(*reason),
+                };
+                if unchanged {
+                    false
+                } else {
+                    self.install_reconciled(&mut inner, validated);
+                    true
+                }
+            }
+        };
+        // Record what was seen BEFORE the comparison: a write racing with it
+        // changes the stamp again and is reconciled on the next call.
+        if let (Some(stamp), Ok(mut last)) = (stamp, self.sync.disk_stamp.lock()) {
+            *last = Some(stamp);
+        }
+        if changed {
+            let snapshot = self.snapshot().await;
+            info!(tier = %snapshot.tier, installed = snapshot.installed,
+                "license file changed on disk; applied without restart");
+            if snapshot.subscription_id.is_some() {
+                // The reconcile dropped the cached distributor notice / brand
+                // of the previous file; fetch the current ones now.
+                crate::distributor_notice::runtime::spawn_fetch_now(self.clone());
+                crate::distributor_brand::runtime::spawn_fetch_now(self.clone());
+            }
+        }
+        changed
+    }
+
+    /// RM-175: refresh the licence from the control plane now (dashboard
+    /// `license.sync`, change probe). Wraps the scheduled phone-home
+    /// (`do_phone_home_once`) without changing how its answer is verified.
+    ///
+    /// One sync at a time: a caller arriving while one is in flight waits and
+    /// takes that sync's outcome. Vendor calls through here are at least
+    /// [`SYNC_MIN_SPACING`] apart; inside that window the answer is `Busy`
+    /// and no request is sent. A licence the CLI wrote is reconciled first,
+    /// so the request carries the identity actually installed. Every error
+    /// leaves the installed licence untouched.
+    pub async fn sync_now(&self) -> SyncOutcome {
+        self.sync_gated(move || async move {
+            let result = self.do_phone_home_once().await;
+            if let Err(error) = &result {
+                warn!(%error, "license sync failed; the installed license is unchanged");
+            }
+            result
+        }).await
+    }
+
+    async fn sync_gated<F, Fut>(&self, call: F) -> SyncOutcome
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<PhoneHomeOk, PhoneHomeError>>,
+    {
+        use std::sync::atomic::Ordering;
+        let mut flight = match self.sync.flight.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                let seen = self.sync.generation.load(Ordering::Acquire);
+                let guard = self.sync.flight.lock().await;
+                if self.sync.generation.load(Ordering::Acquire) != seen {
+                    if let Some(outcome) = self.sync.last_outcome() {
+                        return outcome;
+                    }
+                }
+                // The holder was the scheduled phone-home (records nothing).
+                guard
+            }
+        };
+        self.reconcile_with_disk(true).await;
+        if self.notice_identity().await.is_none() {
+            return self.sync.finish(SyncOutcome::NoLicense);
+        }
+        let now = tokio::time::Instant::now();
+        if let Some(last) = *flight {
+            let elapsed = now.saturating_duration_since(last);
+            if elapsed < SYNC_MIN_SPACING {
+                let wait = SYNC_MIN_SPACING - elapsed;
+                let retry_after_secs = wait.as_millis().div_ceil(1000).max(1) as u64;
+                return SyncOutcome::Busy { retry_after_secs };
+            }
+        }
+        *flight = Some(now);
+        let outcome = sync_outcome(call().await);
+        self.sync.finish(outcome)
+    }
+
     fn lock_store(&self) -> Result<storage::LockedLicenseStore, PhoneHomeError> {
         storage::LockedLicenseStore::acquire(&self.home_dir.join(storage::DEFAULT_LICENSE_FILENAME))
             .map_err(|e| PhoneHomeError::Save(e.to_string()))
@@ -1293,8 +1620,10 @@ impl LicenseRuntime {
             .map_err(|e| PhoneHomeError::Rejected(e.to_string()))
     }
 
+    /// Returns whether the refreshed licence grants something different from
+    /// the one it replaced ([`entitlement_changed`]).
     async fn apply_refresh(&self, request: &RefreshSnapshot, license: License,
-        matched: &duduclaw_license::FingerprintMatch) -> Result<(), PhoneHomeError> {
+        matched: &duduclaw_license::FingerprintMatch) -> Result<bool, PhoneHomeError> {
         let mut inner = self.state.write().await;
         if !request.matches(&inner) { return Err(PhoneHomeError::StaleResponse); }
         let store = self.lock_store()?;
@@ -1302,12 +1631,13 @@ impl LicenseRuntime {
             return Err(PhoneHomeError::StaleResponse);
         }
         store.save(&license).map_err(|e| PhoneHomeError::Save(e.to_string()))?;
+        let changed = inner.license.as_ref().is_none_or(|old| entitlement_changed(old, &license));
         inner.license = Some(license);
         inner.validation_warning = None;
         inner.revision += 1;
         if matched.legacy { warn_legacy_binding_once(); }
         set_effective_fingerprint(&matched.fingerprint);
-        Ok(())
+        Ok(changed)
     }
 
     async fn apply_revocation_response(&self, request: &RefreshSnapshot, nonce: &str,
@@ -1364,6 +1694,51 @@ enum PhoneHomeError {
     /// untrusted signature, expired, wrong machine, or grace exceeded.
     #[error("refreshed license rejected: {0}")]
     Rejected(String),
+}
+
+/// What a completed (verified) phone-home did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PhoneHomeOk {
+    /// A verified licence was installed; `changed` = it grants something
+    /// different from the previous one.
+    Refreshed { changed: bool },
+    /// A verified revocation was applied.
+    Revoked,
+    /// A verified "rebind pending" answer; nothing installed.
+    Pending,
+}
+
+/// Map a phone-home result onto the outcome a sync caller sees. Pure.
+fn sync_outcome(result: Result<PhoneHomeOk, PhoneHomeError>) -> SyncOutcome {
+    match result {
+        Ok(PhoneHomeOk::Refreshed { changed: true }) => SyncOutcome::Updated,
+        Ok(PhoneHomeOk::Refreshed { changed: false }) => SyncOutcome::Unchanged,
+        Ok(PhoneHomeOk::Revoked) => SyncOutcome::Revoked,
+        Ok(PhoneHomeOk::Pending) => SyncOutcome::PendingRebind,
+        Err(PhoneHomeError::NoLicense) => SyncOutcome::NoLicense,
+        Err(PhoneHomeError::Http(_)) => SyncOutcome::Offline { reason: "network" },
+        Err(PhoneHomeError::Parse(_)) | Err(PhoneHomeError::NonceMismatch) => {
+            SyncOutcome::Offline { reason: "invalid_response" }
+        }
+        Err(PhoneHomeError::Rejected(_)) => SyncOutcome::Offline { reason: "rejected" },
+        Err(PhoneHomeError::Save(_)) => SyncOutcome::Failed { reason: "storage" },
+        Err(PhoneHomeError::StaleResponse) => SyncOutcome::Failed { reason: "changed_during_sync" },
+    }
+}
+
+/// Whether `new` grants something different from `old`. Renewal bookkeeping
+/// (issue time, phone-home stamp, signature) is ignored; every other field —
+/// tier, expiry, seat quota, binding, flags, metadata — counts. A comparison
+/// that cannot be made reports a change.
+fn entitlement_changed(old: &License, new: &License) -> bool {
+    let mut normalized = old.clone();
+    normalized.issued_at = new.issued_at;
+    normalized.last_phone_home = new.last_phone_home;
+    normalized.signature = new.signature.clone();
+    match (serde_json::to_value(&normalized), serde_json::to_value(new)) {
+        (Ok(old), Ok(new)) => old != new,
+        _ => true,
+    }
 }
 
 /// C4.3: pure nonce-echo check. The response is accepted only when it carries a
@@ -1739,6 +2114,7 @@ pub(crate) mod tests {
                 gate: Arc::new(FeatureGate::from_str(EMBEDDED_FEATURES_TOML).unwrap()),
                 registry: Arc::new(PublicKeyRegistry::new()),
                 home_dir: home.path().into(), control_url: "https://control.invalid".into(),
+                sync: Arc::default(),
             };
             let edition = runtime.boot_edition(None, None).await;
             assert_eq!(edition.is_personal(), personal, "{tier:?}");
@@ -1797,6 +2173,7 @@ pub(crate) mod tests {
             registry: Arc::new(PublicKeyRegistry::new()),
             home_dir: home.path().into(),
             control_url: "https://control.invalid".into(),
+            sync: Arc::default(),
         };
         let accepted = crate::distributor_brand::runtime::Accepted {
             subscription_id: "sub_test".into(),
@@ -2758,6 +3135,231 @@ pub(crate) mod tests {
         assert_eq!(classify_expiry_urgency(30), Warning);
         assert_eq!(classify_expiry_urgency(31), Ok);
         assert_eq!(classify_expiry_urgency(365), Ok);
+    }
+
+    // ── RM-175: sync_now / reload_from_disk_if_changed ─────────────────────
+
+    #[test]
+    fn sync_outcome_maps_every_phone_home_result() {
+        use SyncOutcome::*;
+        assert_eq!(sync_outcome(Ok(PhoneHomeOk::Refreshed { changed: true })), Updated);
+        assert_eq!(sync_outcome(Ok(PhoneHomeOk::Refreshed { changed: false })), Unchanged);
+        assert_eq!(sync_outcome(Ok(PhoneHomeOk::Revoked)), Revoked);
+        assert_eq!(sync_outcome(Ok(PhoneHomeOk::Pending)), PendingRebind);
+        assert_eq!(sync_outcome(Err(PhoneHomeError::NoLicense)), NoLicense);
+        assert_eq!(sync_outcome(Err(PhoneHomeError::Http("x".into()))), Offline { reason: "network" });
+        assert_eq!(sync_outcome(Err(PhoneHomeError::Parse("x".into()))), Offline { reason: "invalid_response" });
+        assert_eq!(sync_outcome(Err(PhoneHomeError::NonceMismatch)), Offline { reason: "invalid_response" });
+        assert_eq!(sync_outcome(Err(PhoneHomeError::Rejected("x".into()))), Offline { reason: "rejected" });
+        assert_eq!(sync_outcome(Err(PhoneHomeError::Save("x".into()))), Failed { reason: "storage" });
+        assert_eq!(sync_outcome(Err(PhoneHomeError::StaleResponse)), Failed { reason: "changed_during_sync" });
+        // The wire form carries fixed codes only — never the underlying error text.
+        let offline = sync_outcome(Err(PhoneHomeError::Http("https://secret.example/fp_123".into()))).to_json();
+        assert_eq!(offline["outcome"], "offline");
+        assert_eq!(offline["reason"], "network");
+        assert!(!offline.to_string().contains("fp_123"));
+        assert_eq!(Busy { retry_after_secs: 12 }.to_json()["retry_after_secs"], 12);
+        assert!(Unchanged.to_json().get("reason").is_none());
+    }
+
+    #[test]
+    fn entitlement_change_ignores_renewal_bookkeeping_only() {
+        let (kp, _) = gen_issuer_keypair();
+        let mut old = valid_license_for("fp");
+        sign_license(&mut old, &kp);
+        let mut renewed = old.clone();
+        renewed.last_phone_home = old.last_phone_home + ChronoDuration::hours(1);
+        renewed.issued_at = old.issued_at + ChronoDuration::hours(1);
+        sign_license(&mut renewed, &kp);
+        assert!(!entitlement_changed(&old, &renewed));
+        let mut more_seats = renewed.clone();
+        more_seats.max_agents = Some(9);
+        assert!(entitlement_changed(&old, &more_seats));
+        let mut later = renewed.clone();
+        later.expires_at = old.expires_at + ChronoDuration::days(30);
+        assert!(entitlement_changed(&old, &later));
+        let mut other_tier = renewed;
+        other_tier.tier = LicenseTier::Oem;
+        assert!(entitlement_changed(&old, &other_tier));
+    }
+
+    /// A bootstrapped runtime with a signed, valid license on disk and in memory.
+    async fn licensed_runtime(home: &Path) -> (LicenseRuntime, License, ring::signature::Ed25519KeyPair) {
+        let (kp, pubkey) = gen_issuer_keypair();
+        let registry = PublicKeyRegistry::new().with_key("v1", pubkey);
+        let mut license = valid_license_for(TEST_HARDWARE_FINGERPRINT);
+        sign_license(&mut license, &kp);
+        storage::save_to(&license, &home.join("license.json")).unwrap();
+        let mut runtime = LicenseRuntime::bootstrap(home.to_path_buf(), registry).await;
+        // Never reach a real control plane from tests (transport refuses http).
+        runtime.control_url = "http://127.0.0.1:9".into();
+        assert_eq!(runtime.snapshot().await.tier, LicenseTier::SelfHostPro);
+        (runtime, license, kp)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sync_now_is_single_flight_and_spaced_thirty_seconds() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        with_hardware_fixture(async {
+            let _fingerprint_guard = FINGERPRINT_TEST_LOCK.lock().await;
+            let home = tempfile::tempdir().unwrap();
+            let (runtime, _, _) = licensed_runtime(home.path()).await;
+            let calls_counter = AtomicUsize::new(0);
+            let entered_flag = AtomicBool::new(false);
+            let (calls, entered) = (&calls_counter, &entered_flag);
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+
+            // Two concurrent callers: one vendor call, both see its result.
+            let first = runtime.sync_gated(move || async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                entered.store(true, Ordering::SeqCst);
+                let _ = release_rx.await;
+                Ok(PhoneHomeOk::Refreshed { changed: true })
+            });
+            let second = async {
+                while !entered.load(Ordering::SeqCst) { tokio::task::yield_now().await; }
+                runtime.sync_gated(move || async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(PhoneHomeOk::Refreshed { changed: false })
+                }).await
+            };
+            let release = async {
+                while !entered.load(Ordering::SeqCst) { tokio::task::yield_now().await; }
+                for _ in 0..4 { tokio::task::yield_now().await; }
+                let _ = release_tx.send(());
+            };
+            let (a, b, ()) = tokio::join!(first, second, release);
+            assert_eq!(a, SyncOutcome::Updated);
+            assert_eq!(b, SyncOutcome::Updated, "the waiting caller takes the in-flight result");
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+            // Within 30 s: Busy, no vendor call.
+            tokio::time::advance(StdDuration::from_secs(10)).await;
+            let busy = runtime.sync_gated(move || async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(PhoneHomeOk::Refreshed { changed: false })
+            }).await;
+            assert_eq!(busy, SyncOutcome::Busy { retry_after_secs: 20 });
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+            // After the spacing: a new call; transport errors map to Offline.
+            tokio::time::advance(StdDuration::from_secs(21)).await;
+            let offline = runtime.sync_gated(move || async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(PhoneHomeError::Http("connection refused".into()))
+            }).await;
+            assert_eq!(offline, SyncOutcome::Offline { reason: "network" });
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            assert_eq!(runtime.snapshot().await.tier, LicenseTier::SelfHostPro, "failure leaves the license");
+
+            // A waiter behind the scheduled phone-home (records no outcome)
+            // runs its own sync once the spacing allows it.
+            tokio::time::advance(SYNC_MIN_SPACING).await;
+            let held = runtime.sync.flight.lock().await;
+            let waiter = runtime.sync_gated(move || async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(PhoneHomeOk::Pending)
+            });
+            let unlock = async {
+                for _ in 0..4 { tokio::task::yield_now().await; }
+                drop(held);
+            };
+            let (pending, ()) = tokio::join!(waiter, unlock);
+            assert_eq!(pending, SyncOutcome::PendingRebind);
+            assert_eq!(calls.load(Ordering::SeqCst), 3);
+        }).await;
+    }
+
+    #[tokio::test]
+    async fn sync_now_without_a_license_makes_no_call() {
+        with_hardware_fixture(async {
+            let _fingerprint_guard = FINGERPRINT_TEST_LOCK.lock().await;
+            let home = tempfile::tempdir().unwrap();
+            let mut runtime = LicenseRuntime::bootstrap(home.path().into(), PublicKeyRegistry::new()).await;
+            runtime.control_url = "http://127.0.0.1:9".into();
+            let called_flag = std::sync::atomic::AtomicBool::new(false);
+            let called = &called_flag;
+            for _ in 0..2 {
+                let outcome = runtime.sync_gated(move || async move {
+                    called.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(PhoneHomeOk::Refreshed { changed: true })
+                }).await;
+                // Not Busy on the second call either: no vendor call was made.
+                assert_eq!(outcome, SyncOutcome::NoLicense);
+            }
+            assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(runtime.sync_now().await, SyncOutcome::NoLicense);
+        }).await;
+    }
+
+    #[tokio::test]
+    async fn sync_now_first_applies_a_license_the_cli_wrote() {
+        with_hardware_fixture(async {
+            let _fingerprint_guard = FINGERPRINT_TEST_LOCK.lock().await;
+            let home = tempfile::tempdir().unwrap();
+            let (runtime, license, kp) = licensed_runtime(home.path()).await;
+            let mut cli = license.clone();
+            cli.max_agents = Some(4);
+            sign_license(&mut cli, &kp);
+            storage::save_to(&cli, &home.path().join("license.json")).unwrap();
+            let outcome = runtime.sync_gated(|| async { Ok(PhoneHomeOk::Refreshed { changed: false }) }).await;
+            assert_eq!(outcome, SyncOutcome::Unchanged);
+            assert_eq!(runtime.snapshot().await.max_agents, Some(4));
+        }).await;
+    }
+
+    #[tokio::test]
+    async fn reload_from_disk_picks_up_a_rewritten_license_and_ignores_an_identical_one() {
+        with_hardware_fixture(async {
+            let _fingerprint_guard = FINGERPRINT_TEST_LOCK.lock().await;
+            let home = tempfile::tempdir().unwrap();
+            let path = home.path().join("license.json");
+            let (runtime, license, kp) = licensed_runtime(home.path()).await;
+
+            // Nothing changed / identical bytes rewritten: no reload.
+            assert!(!runtime.reload_from_disk_if_changed().await);
+            storage::save_to(&license, &path).unwrap();
+            assert!(!runtime.reload_from_disk_if_changed().await);
+            assert_eq!(runtime.state.read().await.revision, 0);
+
+            // `duduclaw license refresh` wrote a license with more seats.
+            let mut more = license.clone();
+            more.max_agents = Some(7);
+            sign_license(&mut more, &kp);
+            storage::save_to(&more, &path).unwrap();
+            assert!(runtime.reload_from_disk_if_changed().await);
+            assert_eq!(runtime.snapshot().await.max_agents, Some(7));
+            assert_eq!(runtime.state.read().await.revision, 1);
+            assert!(!runtime.reload_from_disk_if_changed().await, "unchanged stamp is not re-read");
+
+            // Same validation as bootstrap: a tampered seat count is refused.
+            let mut forged = more.clone();
+            forged.max_agents = Some(99);
+            storage::save_to(&forged, &path).unwrap();
+            assert!(runtime.reload_from_disk_if_changed().await);
+            let snapshot = runtime.snapshot().await;
+            assert_eq!(snapshot.tier, LicenseTier::OpenSource);
+            assert_eq!(snapshot.validation_warning, Some("invalid_signature"));
+            assert_eq!(snapshot.max_agents, None);
+
+            storage::save_to(&more, &path).unwrap();
+            assert!(runtime.reload_from_disk_if_changed().await);
+            assert_eq!(runtime.snapshot().await.tier, LicenseTier::SelfHostPro);
+
+            // A file that cannot be read right now leaves the license in effect.
+            std::fs::write(&path, b"{ half written").unwrap();
+            assert!(!runtime.reload_from_disk_if_changed().await);
+            assert!(!runtime.reload_from_disk_if_changed().await);
+            assert_eq!(runtime.snapshot().await.max_agents, Some(7));
+
+            // Deactivation from the CLI applies too.
+            std::fs::remove_file(&path).unwrap();
+            assert!(runtime.reload_from_disk_if_changed().await);
+            let snapshot = runtime.snapshot().await;
+            assert!(!snapshot.installed);
+            assert_eq!(snapshot.tier, LicenseTier::OpenSource);
+            assert!(!runtime.reload_from_disk_if_changed().await);
+        }).await;
     }
 
     #[test]
