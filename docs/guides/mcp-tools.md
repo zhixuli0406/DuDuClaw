@@ -260,7 +260,7 @@ The stdio `mcp-server` writes at most one `mcp_auth_failed` record per process t
 the security audit, and no detail line.
 
 External keys and each employee's own stdio `mcp-server` are not affected. A later
-version will run every tool as the key's employee and lift the refusal; v1.83.0
+version will run every tool as the key's employee and lift the refusal; the current release
 does not change this.
 
 **`config.toml [mcp_keys]` after the upgrade.** At its first v1.82 start the gateway

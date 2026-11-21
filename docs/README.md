@@ -6,9 +6,9 @@
 
 Native Linux personal accounts: [Protected system service](guides/linux-protected-service.md) · [繁體中文](guides/zh-TW/linux-protected-service.md) · [日本語](guides/ja-JP/linux-protected-service.md)
 
-Release maintainers, native Linux isolation (planned for a later release; not available in v1.83.0): [Acceptance runbook (G1, G2, G3, H15)](guides/linux-protected-acceptance.md) · [繁體中文](guides/zh-TW/linux-protected-acceptance.md) · [日本語](guides/ja-JP/linux-protected-acceptance.md)
+Release maintainers, native Linux isolation (planned for a later release; not available in the current release): [Acceptance runbook (G1, G2, G3, H15)](guides/linux-protected-acceptance.md) · [繁體中文](guides/zh-TW/linux-protected-acceptance.md) · [日本語](guides/ja-JP/linux-protected-acceptance.md)
 
-Developer implementation notes: [Native Linux isolation](architecture/native-linux-isolation.md) (planned for a later release; not active product behavior in v1.82.0).
+Developer implementation notes: [Native Linux isolation](architecture/native-linux-isolation.md) (planned for a later release; not active product behavior in the current release).
 
 ## Feature Highlights
 
