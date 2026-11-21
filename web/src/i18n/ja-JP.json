@@ -1721,6 +1721,7 @@
   "license.sync.outcome.revoked": "ライセンスは取り消されました",
   "license.sync.outcome.pendingRebind": "開発元によるマシン変更の承認待ちです",
   "license.sync.outcome.noLicense": "商用ライセンスがインストールされていないため、同期する内容はありません",
+  "license.sync.outcome.unreadableLicenseFile": "このホストにライセンスファイルがありますが、内容を読み取れません。ライセンスを再インポートするか、管理者にファイルの確認を依頼してください。",
   "license.sync.outcome.offline": "現在、開発元に接続できません。後で自動的に再試行します。",
   "license.sync.outcome.failed": "今回の同期は完了しませんでした。後で自動的に再試行します。",
   "license.sync.outcome.busy": "先ほど同期したばかりです。{seconds} 秒後にもう一度お試しください。",

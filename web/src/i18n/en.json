@@ -1722,6 +1722,7 @@
   "license.sync.outcome.revoked": "The license has been revoked",
   "license.sync.outcome.pendingRebind": "Waiting for the vendor to approve the machine change",
   "license.sync.outcome.noLicense": "No commercial license is installed, so there is nothing to sync",
+  "license.sync.outcome.unreadableLicenseFile": "A license file exists on this host, but its contents cannot be read. Re-import the license or ask an administrator to check the file.",
   "license.sync.outcome.offline": "Can't reach the vendor right now. It will retry automatically.",
   "license.sync.outcome.failed": "This sync did not finish. It will retry automatically.",
   "license.sync.outcome.busy": "Synced moments ago. Try again in {seconds} seconds.",
