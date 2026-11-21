@@ -286,6 +286,7 @@ impl MethodHandler {
             }));
         }
 
+        checks.extend(super::doctor_util::legacy_wiki_checks(&self.home_dir));
         checks
     }
 }

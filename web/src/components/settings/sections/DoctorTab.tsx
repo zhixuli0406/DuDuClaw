@@ -90,7 +90,7 @@ export function DoctorTab() {
         <div className="grid gap-3 sm:grid-cols-2">
           {doctorChecks.map((check) => (
             <div
-              key={check.name}
+              key={`${check.name}:${check.agent_id ?? ''}`}
               className={cn(
                 'rounded-xl border p-5',
                 statusBg[check.status] ?? 'border-surface-border bg-surface'
@@ -105,6 +105,7 @@ export function DoctorTab() {
                     {intl.messages[`settings.doctor.check.${check.name}`]
                       ? intl.formatMessage({ id: `settings.doctor.check.${check.name}` })
                       : check.name}
+                    {check.agent_id && ` · ${check.agent_id}`}
                   </h4>
                   <p className="mt-1 text-sm text-muted-foreground">
                     {check.message}

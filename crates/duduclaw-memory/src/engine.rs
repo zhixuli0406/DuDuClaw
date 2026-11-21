@@ -1018,6 +1018,40 @@ impl SqliteMemoryEngine {
         Ok(result)
     }
 
+    /// [`graph_rank_cached`](Self::graph_rank_cached) for the rows of `scope`
+    /// (v1.84.0). [`RowScope::All`] is exactly the cached employee-wide graph.
+    /// In a conversation the graph is built (never cached — the cache holds
+    /// the employee-wide graph) from the triples that conversation may see,
+    /// so seeds, edges and PPR mass come from visible rows only: another
+    /// conversation's triple can neither add a path to a visible row nor
+    /// change the order of two visible rows. The alias map is not row data
+    /// (explicit `add_entity_alias` calls) and is used as before.
+    fn graph_rank_scoped(
+        &self,
+        conn: &Connection,
+        agent_id: &str,
+        query: &str,
+        now_rfc: &str,
+        scope: RowScope<'_>,
+    ) -> Result<Option<Vec<(String, f64)>>> {
+        if !scope.is_scoped() {
+            return self.graph_rank_cached(conn, agent_id, query, now_rfc);
+        }
+        let triples =
+            crate::graph_rank::load_agent_graph_triples_scoped(conn, agent_id, now_rfc, scope)?;
+        if triples.is_empty() {
+            return Ok(None);
+        }
+        let aliases = crate::graph_rank::load_alias_map(conn, agent_id)?;
+        let graph = crate::graph_rank::TripleGraph::from_graph_triples(&triples, &aliases);
+        if self.retrieval_weights.graph_embed_seed {
+            if let Some(embedder) = self.embedder.clone() {
+                self.ensure_entity_embeddings(conn, &graph, agent_id, embedder.as_ref())?;
+            }
+        }
+        self.rank_from_graph(conn, &graph, agent_id, query, now_rfc)
+    }
+
     /// Run seeding + PPR + ranking over an already-built graph (D3.1 shared by
     /// the cache-hit and fresh-build paths — same code, so results match).
     fn rank_from_graph(
@@ -3125,6 +3159,25 @@ impl SqliteMemoryEngine {
     ) -> Result<Option<crate::supersession_guard::HeldClaim>> {
         let entry = mask_memory_entry(entry);
         let meta = mask_temporal_meta(meta);
+        // v1.84.0: the write's lineage and reader scope come first. The
+        // pending-duplicate lookup and the fact a held claim conflicts with
+        // both see only the rows the writing conversation may see — the same
+        // rows the write it replaces was refused by (`store_temporal_locked`).
+        // A non-explicit claim of conversation B therefore never folds into
+        // conversation A's pending held claim (B gets its own held row with
+        // B's lineage, and its own review item).
+        let derived = meta.derived_from.clone().unwrap_or_default();
+        let lineage = crate::lineage::db::resolve(conn, agent_id, provenance, &derived)?;
+        let write_conversation = match &lineage {
+            Ok(rows) if !is_explicitly_stored(&entry.source_event) => {
+                conversation_scope::conversation_of_lineage(rows)
+            }
+            _ => None,
+        };
+        let scope = match write_conversation.as_deref() {
+            Some(session) => RowScope::Conversation(Some(session)),
+            None => RowScope::All,
+        };
         let mut conflicts_with: Option<String> = None;
         if let (Some(subject), Some(predicate)) = (meta.subject.as_deref(), meta.predicate.as_deref()) {
             if let Some(id) = Self::find_pending_held_claim_locked(
@@ -3133,6 +3186,7 @@ impl SqliteMemoryEngine {
                 subject,
                 predicate,
                 meta.object.as_deref(),
+                scope,
             )? {
                 self.held_claim_repeats
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3143,28 +3197,12 @@ impl SqliteMemoryEngine {
                 );
                 return Ok(Some(crate::supersession_guard::HeldClaim { id, newly_held: false }));
             }
-            // v1.84.0: the fact a held claim conflicts with is one the
-            // writing conversation may see — the same rows the write it
-            // replaces was refused by (`store_temporal_locked`).
-            let derived = meta.derived_from.clone().unwrap_or_default();
-            let lineage = crate::lineage::db::resolve(conn, agent_id, provenance, &derived)?;
-            let write_conversation = match &lineage {
-                Ok(rows) if !is_explicitly_stored(&entry.source_event) => {
-                    conversation_scope::conversation_of_lineage(rows)
-                }
-                _ => None,
-            };
-            let scope = match write_conversation.as_deref() {
-                Some(session) => RowScope::Conversation(Some(session)),
-                None => RowScope::All,
-            };
             let active = Self::load_active_triple(conn, agent_id, subject, predicate, scope)?;
             conflicts_with = Self::strongest_clean_id(&active);
         }
         // L3: a claim the source fence refuses must not use a review slot.
         // The fence itself is applied again (and counted) by the write below.
-        let derived = meta.derived_from.clone().unwrap_or_default();
-        let fenced = crate::lineage::db::resolve(conn, agent_id, provenance, &derived)?.is_err();
+        let fenced = lineage.is_err();
         if !fenced && !admit() {
             return Ok(None);
         }
@@ -3228,30 +3266,39 @@ impl SqliteMemoryEngine {
     ) -> Result<Option<String>> {
         let conn = self.conn.lock().await;
         crate::isolation_io::verify()?;
-        Self::find_pending_held_claim_locked(&conn, agent_id, subject, predicate, object)
+        Self::find_pending_held_claim_locked(&conn, agent_id, subject, predicate, object, RowScope::All)
     }
 
+    /// v1.84.0: `scope` keeps only the held rows a reader serving the
+    /// writing conversation may see ([`RowScope::All`] = every held row of
+    /// the employee), with the same SQL predicate as every scoped read.
     fn find_pending_held_claim_locked(
         conn: &Connection,
         agent_id: &str,
         subject: &str,
         predicate: &str,
         object: Option<&str>,
+        scope: RowScope<'_>,
     ) -> Result<Option<String>> {
-        conn.query_row(
+        let sql = format!(
             "SELECT id FROM memories
              WHERE agent_id = ?1 AND quarantined = 1 AND valid_until IS NULL
                AND json_valid(metadata)
                AND json_extract(metadata, '$.held_claim.subject') = ?2
                AND json_extract(metadata, '$.held_claim.predicate') = ?3
-               AND json_extract(metadata, '$.held_claim.object') IS ?4
+               AND json_extract(metadata, '$.held_claim.object') IS ?4{visible}
              ORDER BY timestamp ASC
              LIMIT 1",
-            params![agent_id, subject, predicate, object],
-            |r| r.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(|e| DuDuClawError::Memory(e.to_string()))
+            visible = scope.and_visible("memories", "?5"),
+        );
+        let session = scope.session();
+        let mut bound: Vec<&dyn rusqlite::ToSql> = vec![&agent_id, &subject, &predicate, &object];
+        if scope.is_scoped() {
+            bound.push(&session);
+        }
+        conn.query_row(&sql, bound.as_slice(), |r| r.get::<_, String>(0))
+            .optional()
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))
     }
 
     /// Everything a review card for a held claim shows, read from the held row
@@ -4362,9 +4409,11 @@ impl SqliteMemoryEngine {
     /// candidate `LIMIT` counts rows this conversation may see — other
     /// conversations' rows can no longer crowd its own out), and every
     /// graph / vector append is fetched through the same rule; appends stop
-    /// at `MAX_GRAPH_APPENDS` visible rows. Graph and vector *scores* are
-    /// still computed over the agent's whole graph / embedding space (they
-    /// only re-order visible rows; see the v1.84.0 report).
+    /// at `MAX_GRAPH_APPENDS` visible rows. The graph (seeds, edges, PPR) is
+    /// built from visible triples only ([`graph_rank_scoped`](Self::graph_rank_scoped))
+    /// and the vector KNN candidate set and cut-off count visible rows only
+    /// (`vector::vector_knn_scoped`), so another conversation's rows cannot
+    /// re-order this conversation's results.
     pub async fn search_scoped(
         &self,
         agent_id: &str,
@@ -4443,7 +4492,7 @@ impl SqliteMemoryEngine {
         // Fail-safe: zero triples (cheap COUNT gate), a query seeding no graph
         // entity, or any error all yield `None`, leaving the FTS-only result
         // byte-identical to before.
-        let graph_ranked = match self.graph_rank_cached(&conn, agent_id, query, &now_rfc) {
+        let graph_ranked = match self.graph_rank_scoped(&conn, agent_id, query, &now_rfc, scope) {
             Ok(ranked) => ranked,
             Err(e) => {
                 tracing::warn!("graph ranking skipped: {e}");
@@ -4508,13 +4557,14 @@ impl SqliteMemoryEngine {
         // switching embedders never mixes incompatible spaces.
         if let Some(embedder) = &self.embedder {
             if let Ok(qvec) = embedder.embed(query) {
-                let knn = crate::vector::vector_knn(
+                let knn = crate::vector::vector_knn_scoped(
                     &conn,
                     agent_id,
                     &qvec,
                     embedder.id(),
                     &now_rfc,
                     fetch_limit,
+                    scope,
                 )
                 .unwrap_or(None);
                 if let Some(hits) = knn {

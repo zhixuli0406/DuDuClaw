@@ -141,3 +141,22 @@ fn link_to_own_instructions_is_refused() {
     let d = check_own_instructions_write(&h.root.join("agents/me/rules.md"), &h.root, &me());
     assert!(matches!(d, GuardDecision::BlockedOwnInstructionsWrite { .. }), "{d:?}");
 }
+
+/// v1.84.0 (RM-200): a link in the own directory pointing into the own
+/// `wiki/auto/` (or at the legacy lock) is judged on its target.
+#[test]
+fn link_into_own_auto_wiki_is_refused() {
+    let h = fixture();
+    std::fs::create_dir_all(h.root.join("agents/me/wiki/auto/sop")).unwrap();
+    std::fs::write(h.root.join("agents/me/wiki/auto/sop/x.md"), "page").unwrap();
+    symlink(h.root.join("agents/me/wiki/auto"), h.root.join("agents/me/drafts")).unwrap();
+    symlink(h.root.join("agents/me/wiki/auto/sop/x.md"), h.root.join("agents/me/notes.md")).unwrap();
+    std::fs::write(h.root.join("agents/me/wiki/.auto-pages.lock"), "").unwrap();
+    symlink(h.root.join("agents/me/wiki/.auto-pages.lock"), h.root.join("agents/me/lk")).unwrap();
+    for p in ["agents/me/drafts/sop/new.md", "agents/me/notes.md", "agents/me/lk"] {
+        let d = check_own_auto_wiki_write(&h.root.join(p), &h.root, &me());
+        assert!(matches!(d, GuardDecision::BlockedOwnAutoWikiWrite { .. }), "{p}: {d:?}");
+    }
+    let d = check_own_auto_wiki_write(&h.root.join("agents/me/wiki/concepts/x.md"), &h.root, &me());
+    assert!(d.is_allowed(), "{d:?}");
+}

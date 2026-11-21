@@ -5119,6 +5119,7 @@
   "settings.redaction.desc": "Automatically mask sensitive data (phone, email) before it reaches the AI.",
   "settings.doctor.desc": "One-click health check of your setup, with auto-repair for common issues.",
   "settings.doctor.check.config_file": "Config file",
+  "settings.doctor.check.legacy_auto_wiki": "Pre-upgrade automatic notes",
   "settings.doctor.check.agents": "AI employees",
   "settings.doctor.check.api_key": "API key",
   "settings.doctor.check.container_process_isolation": "Container process isolation",

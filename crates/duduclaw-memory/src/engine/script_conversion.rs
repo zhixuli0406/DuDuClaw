@@ -340,6 +340,56 @@ mod safety_tests {
     }
 
     #[tokio::test]
+    async fn conversion_and_restore_preserve_conversation_lineage_and_visibility() {
+        fn snapshot(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<rusqlite::types::Value>> {
+            let mut stmt = conn.prepare(sql).unwrap();
+            let columns = stmt.column_count();
+            stmt.query_map([], |row| (0..columns).map(|i| row.get(i)).collect())
+                .unwrap().collect::<std::result::Result<Vec<_>, _>>().unwrap()
+        }
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let backup = dir.path().join("restore.jsonl");
+        let ids = vec!["one".to_string(), "two".to_string()];
+        for (id, session) in [("one", "telegram:A"), ("two", "telegram:B")] {
+            seed(&engine, id, "用户记忆", None).await;
+            let conn = engine.conn.lock().await;
+            conn.execute("UPDATE memories SET source_event = 'conversation_distill' WHERE id = ?1", params![id]).unwrap();
+            conn.execute("INSERT INTO key_facts(id, agent_id, fact, timestamp) VALUES (?1, 'a', '用户事实', '2026-11-21')", params![id]).unwrap();
+            conn.execute("INSERT INTO key_facts_fts(rowid, fact) VALUES (last_insert_rowid(), '用户事实')", []).unwrap();
+            for table in ["memories", "key_facts"] {
+                conn.execute("INSERT INTO memory_origins(memory_store, memory_id, agent_id, source_kind, source_session, source_observed_at, role, created_at)
+                    VALUES (?1, ?2, 'a', ?3, ?4, '2026-11-21', 'direct', '2026-11-21')",
+                    params![table, id, crate::lineage::SourceKind::ChannelMessage.as_str(), session]).unwrap();
+            }
+        }
+        let origins_sql = "SELECT * FROM memory_origins ORDER BY memory_store, memory_id, source_session, source_message";
+        let metadata_sql = "SELECT id, agent_id, timestamp, source_event FROM memories ORDER BY id";
+        let (origins, metadata) = {
+            let conn = engine.conn.lock().await;
+            (snapshot(&conn, origins_sql), snapshot(&conn, metadata_sql))
+        };
+        // The operator converts both conversations, retaining each reader's boundary.
+        assert_eq!(engine.convert_memory_script_with_backup("a", false, &backup).await.unwrap().changed, 4);
+        for restored in [false, true] {
+            if restored { assert_eq!(engine.restore_memory_script(&backup).await.unwrap().changed, 4); }
+            {
+                let conn = engine.conn.lock().await;
+                assert_eq!(snapshot(&conn, origins_sql), origins);
+                assert_eq!(snapshot(&conn, metadata_sql), metadata);
+                let expected = if restored { "用户记忆" } else { "用戶記憶" };
+                let count: i64 = conn.query_row("SELECT count(*) FROM memories_fts WHERE content = ?1", params![expected], |r| r.get(0)).unwrap();
+                assert_eq!(count, 2);
+            }
+            for (session, hidden) in [(Some("telegram:A"), vec!["two"]), (Some("telegram:B"), vec!["one"]), (None, vec!["one", "two"])] {
+                let actual = engine.ids_hidden_from_conversation("a", &ids, session).await.unwrap();
+                assert_eq!(actual.len(), hidden.len());
+                for id in hidden { assert!(actual.contains(id)); }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn backup_creation_failure_prevents_any_conversion() {
         let dir = tempfile::tempdir().unwrap();
         let backup = dir.path().join("exists.jsonl");

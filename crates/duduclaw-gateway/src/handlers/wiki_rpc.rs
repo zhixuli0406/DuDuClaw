@@ -184,14 +184,27 @@ impl MethodHandler {
         if !crate::auto_wiki_page::is_auto_path(page_path) {
             return WsFrame::error_response("", "Only auto-filed pages can be shared here");
         }
+        // Sharing is a mutation: keep portable write rules on its source
+        // even though ordinary page reads accept existing Unix names.
+        if let Err(e) = duduclaw_memory::wiki_path::validate_relative_wiki_path(page_path) {
+            return WsFrame::error_response("", &format!("Invalid page path: {e}"));
+        }
         let store = duduclaw_memory::WikiStore::new(wiki_dir);
-        let page = match store.read_page(page_path) {
+        let (page, raw) = match store.read_page_with_raw(page_path) {
             Ok(p) => p,
             Err(e) => return WsFrame::error_response("", &format!("Failed to read page: {e}")),
         };
-        if page.author.as_deref() != Some(crate::auto_wiki_page::AUTO_PAGE_AUTHOR) {
-            return WsFrame::error_response("", "Only auto-filed pages can be shared here");
-        }
+        // v1.84.0 (review H2): only a page a human promoted, as the gateway
+        // recorded it (`auto_wiki_page::promoted_record` — registry entry
+        // matching these bytes, `host_promoted`), is published. An
+        // unpromoted page belongs to one conversation; a legacy page, or one
+        // changed on disk, has not been confirmed. Either way: confirm first.
+        let Some(record) = crate::auto_wiki_page::promoted_record(&store, page_path, &raw) else {
+            return WsFrame::error_response(
+                "",
+                "This page has not been confirmed yet. Confirm (promote) it on the auto-filing tab first, then share it.",
+            );
+        };
 
         // `sources/` is the shared wiki's provenance namespace and derives
         // `SourceType::RawDialogue`, so a shared auto page keeps the same low
@@ -216,7 +229,11 @@ impl MethodHandler {
                 t
             },
             related: Vec::new(),
-            sources: page.sources.clone(),
+            // v1.84.0 (review H2): provenance from the host registry, never
+            // the page's writer-controlled `sources`; `host_*` lines of the
+            // page text are not carried either (a fresh `WikiPage`, host
+            // fields set below from the record only).
+            sources: record.host_sources.clone(),
             author: Some(agent_id.to_string()),
             layer: duduclaw_memory::WikiLayer::Context,
             trust: page.trust,
@@ -235,11 +252,15 @@ impl MethodHandler {
         if let Err(e) = shared_store.ensure_scaffold() {
             return WsFrame::error_response("", &format!("Shared wiki unavailable: {e}"));
         }
-        match shared_store.write_page_with_author(
-            &shared_path,
+        // `set_host_fields` drops every host-owned line first, then records
+        // the registry's sources as the shared page's host provenance (so a
+        // forget by source lists the shared copy for review).
+        let content = crate::wiki_host_sources::set_host_fields(
             &duduclaw_memory::serialize_page(&shared),
-            agent_id,
-        ) {
+            &record.host_sources,
+            false,
+        );
+        match shared_store.write_page_with_author(&shared_path, &content, agent_id) {
             Ok(()) => WsFrame::ok_response("", json!({ "shared": true, "path": shared_path })),
             Err(e) => WsFrame::error_response("", &format!("Share failed: {e}")),
         }

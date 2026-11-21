@@ -318,6 +318,7 @@ pub(crate) fn validate_wiki_frontmatter(content: &str) -> std::result::Result<()
 /// drive prefix / Prefix, RootDir or ParentDir component), plus `.md` and not
 /// a reserved file.
 pub(crate) fn validate_wiki_page_path(page_path: &str) -> std::result::Result<(), String> {
+    duduclaw_memory::wiki_path::validate_relative_wiki_path(page_path)?;
     validate_wiki_read_path(page_path)?;
     // Check reserved filenames
     let filename = std::path::Path::new(page_path)
@@ -337,7 +338,7 @@ pub(crate) fn validate_wiki_page_path(page_path: &str) -> std::result::Result<()
 /// `.md` suffix, but reserved files (`_index.md`, `_schema.md`, `_log.md`)
 /// may be read. Runs before the path touches the disk.
 pub(crate) fn validate_wiki_read_path(page_path: &str) -> std::result::Result<(), String> {
-    duduclaw_memory::wiki_path::validate_relative_wiki_path(page_path)?;
+    duduclaw_memory::wiki_path::validate_relative_wiki_read_path(page_path)?;
     if !page_path.ends_with(".md") {
         return Err("Page path must end with .md".to_string());
     }

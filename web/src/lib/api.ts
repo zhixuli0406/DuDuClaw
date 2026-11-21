@@ -353,6 +353,7 @@ export interface DoctorCheck {
   message: string;
   can_repair: boolean;
   repair_hint?: string;
+  agent_id?: string;
 }
 
 /** Product form-factor, orthogonal to the license `edition` string. */
