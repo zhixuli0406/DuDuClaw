@@ -118,7 +118,7 @@ fn bridge_channel_requester_uses_verified_mapping() {
         ..RunMetadata::root() });
     assert_eq!(channel("tg-alice").requester(&context(human(&alice.id))), Ok(Requester::Human {
         user_id: alice.id.clone(), identity: RequesterIdentity::ChannelUser { channel: "telegram".into(),
-            chat: "telegram:42".into(), sender: "tg-alice".into(), user_id: Some(alice.id.clone()) } }));
+            chat: "telegram:42".into(), sender: "tg-alice".into(), user_id: Some(alice.id.clone()), attested_private: false } }));
     // The live mapping must name the capability's own user.
     assert_eq!(channel("tg-alice").requester(&context(human("bob"))), Err(VerificationError::Revoked));
     assert_eq!(channel("tg-unverified").requester(&context(human(&alice.id))), Err(VerificationError::Revoked));

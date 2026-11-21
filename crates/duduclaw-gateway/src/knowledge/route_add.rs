@@ -291,6 +291,7 @@ mod tests {
                 chat: "v".into(),
                 sender: String::new(),
                 user_id: None,
+                attested_private: false,
             },
         )
         .unwrap();

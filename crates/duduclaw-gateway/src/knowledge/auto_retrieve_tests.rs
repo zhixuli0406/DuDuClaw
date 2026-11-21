@@ -131,6 +131,20 @@ fn line(chat: &str, sender: &str, user: Option<&str>) -> RequesterIdentity {
         chat: chat.into(),
         sender: sender.into(),
         user_id: user.map(str::to_string),
+        attested_private: false,
+    }
+}
+
+/// A Google Chat sender. `attested` is what `requester_for_reply` sets only
+/// when the authenticated adapter classified this exact space as the
+/// sender's one-to-one DM.
+fn googlechat(space: &str, sender: &str, user: Option<&str>, attested: bool) -> RequesterIdentity {
+    RequesterIdentity::ChannelUser {
+        channel: "googlechat".into(),
+        chat: space.into(),
+        sender: sender.into(),
+        user_id: user.map(str::to_string),
+        attested_private: attested,
     }
 }
 
@@ -236,6 +250,48 @@ fn bound_line_sender_reads_their_collections_but_groups_exclude_personal() {
         "group chat: {srcs:?}"
     );
     assert!(!srcs.contains(&"hr-secret.txt".to_string()));
+}
+
+#[test]
+fn bound_googlechat_sender_reads_personal_in_an_attested_dm_but_not_in_a_space() {
+    let h = home();
+    let t = run(
+        &h,
+        "hr-bot",
+        googlechat("spaces/DM1", "users/111", Some(&h.hr_user), true),
+        "特休假",
+        "turn-gc1",
+    );
+    let srcs = sources_in(&t.block.unwrap());
+    assert!(srcs.contains(&"hr-handbook.txt".to_string()), "{srcs:?}");
+    assert!(srcs.contains(&"hr-personal.txt".to_string()), "1:1 DM: {srcs:?}");
+    assert!(!srcs.contains(&"hr-secret.txt".to_string()), "{srcs:?}");
+    let t = run(
+        &h,
+        "hr-bot",
+        googlechat("spaces/TEAM1", "users/111", Some(&h.hr_user), false),
+        "特休假",
+        "turn-gc2",
+    );
+    let srcs = sources_in(&t.block.unwrap());
+    assert!(srcs.contains(&"hr-handbook.txt".to_string()), "{srcs:?}");
+    assert!(
+        !srcs.contains(&"hr-personal.txt".to_string()),
+        "shared space: {srcs:?}"
+    );
+    assert!(!srcs.contains(&"hr-secret.txt".to_string()));
+    // The attestation never adds grants: an unbound sender in an attested
+    // DM still reads nothing granted only to people.
+    let t = run(
+        &h,
+        "hr-bot",
+        googlechat("spaces/DM2", "users/222", None, true),
+        "特休假",
+        "turn-gc3",
+    );
+    let srcs = t.block.as_deref().map(sources_in).unwrap_or_default();
+    assert!(!srcs.contains(&"hr-personal.txt".to_string()), "{srcs:?}");
+    assert!(!srcs.contains(&"hr-handbook.txt".to_string()), "{srcs:?}");
 }
 
 #[test]

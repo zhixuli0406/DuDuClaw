@@ -612,6 +612,7 @@ async fn requester_refusal_never_falls_back() {
         chat: "g1".into(),
         sender: "x".into(),
         user_id: None,
+        attested_private: false,
     };
     assert_eq!(
         code(resolve(&home, "bot", &unbound, &NoPeople).await),
@@ -638,6 +639,7 @@ async fn public_visitors_are_refused_even_for_anyone() {
             chat: "v".into(),
             sender: String::new(),
             user_id: None,
+            attested_private: false,
         };
         assert_eq!(
             code(resolve(&home, "bot", &v, &NoPeople).await),
@@ -755,6 +757,7 @@ fn requester_gate_matrix() {
         chat: "c".into(),
         sender: "s".into(),
         user_id: u.map(str::to_string),
+        attested_private: false,
     };
     let on_behalf = |u: &str| RequesterIdentity::System {
         kind: "dispatch".into(),

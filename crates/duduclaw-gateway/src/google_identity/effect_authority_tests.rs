@@ -741,6 +741,7 @@ async fn public_visitor_requester_is_never_replaced_with_a_cached_owner() {
             chat: "fixture".into(),
             sender: "fixture".into(),
             user_id: Some(f.user.clone()),
+            attested_private: false,
         };
         let context = GoogleCallContext::remote_mcp(
             f.home.path(),
@@ -3069,6 +3070,7 @@ async fn m1_new_requester_is_captured_before_metadata_offload() {
         chat: "owned-chat".into(),
         sender: "owned-visitor".into(),
         user_id: None,
+        attested_private: false,
     };
     let outcome = crate::knowledge::turn_requesters::CURRENT_REQUESTER
         .scope(

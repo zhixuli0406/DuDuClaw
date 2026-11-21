@@ -156,6 +156,8 @@ pub fn delegated(who: RequesterIdentity, kind: &str) -> RequesterIdentity {
             chat,
             sender: String::new(),
             user_id: None,
+            // A delegated run is never the 1:1 conversation it came from.
+            attested_private: false,
         },
         system @ RequesterIdentity::System { .. } => system,
         RequesterIdentity::Unknown => RequesterIdentity::Unknown,
@@ -211,6 +213,7 @@ fn unbound_sender_of(reply: &str) -> Option<RequesterIdentity> {
         chat: chat.to_string(),
         sender: String::new(),
         user_id: None,
+        attested_private: false,
     })
 }
 
@@ -387,6 +390,7 @@ mod tests {
             chat: "Ustranger".into(),
             sender: "Ustranger".into(),
             user_id: None,
+            attested_private: false,
         };
         remember_turn_origin("line:Ustranger#t-del-1", unbound);
         // B runs because A delegated from that turn: channel-only, never 1:1.
@@ -404,6 +408,7 @@ mod tests {
                 chat: "Ustranger".into(),
                 sender: String::new(),
                 user_id: None,
+                attested_private: false,
             }
         );
         let human = duduclaw_knowledge::requester::human_ctx(&who, &super::super::NoUsers);

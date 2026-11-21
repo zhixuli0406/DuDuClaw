@@ -780,7 +780,8 @@ pub fn line_quick_reply() -> Value {
 // circuit-breaker trip — carries buttons whose action id is produced by
 // `decision_action::encode` and decoded by `decision_action::parse`. This
 // module only owns the per-platform *shape* (Telegram inline keyboard /
-// Discord action row / Slack Block Kit actions / LINE quickReply); the wire
+// Discord action row / Slack Block Kit actions / LINE quickReply / Google
+// Chat `cardsV2`, goal cards only); the wire
 // format, its legacy-compatible parser and the legal verb set live in
 // `decision_action`.
 //
@@ -805,6 +806,10 @@ pub fn decision_markup(channel: &str, source: DecisionSource, id: &str) -> Optio
         ("discord", DecisionSource::Goal) => discord_goal_buttons(id),
         ("slack", DecisionSource::Goal) => slack_goal_buttons(id),
         ("line", DecisionSource::Goal) => line_goal_quick_reply(id),
+        // Google Chat: goal cards only, and only when the sending app takes
+        // interactions over HTTP — `decision_notify::deliver_now_as` checks
+        // the transport before using this shape (Pub/Sub stays text).
+        ("googlechat", DecisionSource::Goal) => googlechat_goal_card(id),
 
         ("telegram", DecisionSource::Kickoff) => telegram_goal_kickoff_buttons(id),
         ("discord", DecisionSource::Kickoff) => discord_goal_kickoff_buttons(id),
@@ -967,6 +972,44 @@ pub fn telegram_goal_buttons(task_id: &str) -> Value {
             ]
         ]
     })
+}
+
+/// The Chat-app action every Google Chat decision button invokes. The
+/// `CARD_CLICKED` handler (`googlechat::card_clicked`) reads the decision
+/// from the button's [`GOOGLECHAT_DECISION_PARAM`] parameter, never from
+/// the function name.
+pub const GOOGLECHAT_DECISION_FUNCTION: &str = "duduclaw_decide";
+/// The action parameter carrying `decision_action::encode(..)`.
+pub const GOOGLECHAT_DECISION_PARAM: &str = "decision";
+
+fn googlechat_button(label: &str, primary: bool, action: String) -> Value {
+    json!({
+        "text": label,
+        "type": if primary { "FILLED" } else { "OUTLINED" },
+        "onClick": { "action": {
+            "function": GOOGLECHAT_DECISION_FUNCTION,
+            "parameters": [{ "key": GOOGLECHAT_DECISION_PARAM, "value": action }]
+        } }
+    })
+}
+
+/// Google Chat `cardsV2`: retry / done as filled buttons (primary), abort /
+/// take-over as outlined buttons in a second button list (secondary tier).
+/// Returned as the full `cardsV2` array of the message.
+pub fn googlechat_goal_card(task_id: &str) -> Value {
+    json!([{
+        "cardId": "duduclaw-goal",
+        "card": { "sections": [{ "widgets": [
+            { "buttonList": { "buttons": [
+                googlechat_button("🔄 重試", true, encode(DecisionSource::Goal, DecisionAct::Retry, task_id)),
+                googlechat_button("✅ 標記完成", true, encode(DecisionSource::Goal, DecisionAct::Done, task_id))
+            ] } },
+            { "buttonList": { "buttons": [
+                googlechat_button("🗑 放棄", false, encode(DecisionSource::Goal, DecisionAct::Abort, task_id)),
+                googlechat_button("👤 交給我", false, encode(DecisionSource::Goal, DecisionAct::Takeover, task_id))
+            ] } }
+        ] }] }
+    }])
 }
 
 /// Telegram inline keyboard: approve / deny a kickoff approval (autonomy gate).
@@ -1859,8 +1902,33 @@ mod tests {
                 .iter()
                 .map(|i| i["action"]["data"].as_str().unwrap().to_string())
                 .collect(),
+            "googlechat" => googlechat_card_buttons(markup)
+                .into_iter()
+                .map(|b| googlechat_button_action(b).to_string())
+                .collect(),
             other => panic!("no action-id shape for {other}"),
         }
+    }
+
+    /// Every button of a Google Chat `cardsV2` array, in order.
+    fn googlechat_card_buttons(markup: &Value) -> Vec<&Value> {
+        markup
+            .as_array()
+            .expect("cardsV2 is an array")
+            .iter()
+            .flat_map(|c| c["card"]["sections"].as_array().unwrap().iter())
+            .flat_map(|s| s["widgets"].as_array().unwrap().iter())
+            .flat_map(|w| w["buttonList"]["buttons"].as_array().unwrap().iter())
+            .collect()
+    }
+
+    fn googlechat_button_action(button: &Value) -> &str {
+        let action = &button["onClick"]["action"];
+        assert_eq!(action["function"], GOOGLECHAT_DECISION_FUNCTION);
+        let params = action["parameters"].as_array().unwrap();
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0]["key"], GOOGLECHAT_DECISION_PARAM);
+        params[0]["value"].as_str().unwrap()
     }
 
     #[test]
@@ -1908,13 +1976,51 @@ mod tests {
         for channel in ["whatsapp", "feishu", "googlechat", "teams", "webchat", ""] {
             assert!(decision_markup(channel, DecisionSource::Approval, "a1").is_none());
         }
+        // Google Chat has a shape for goal cards only (its click handler
+        // routes nothing else yet).
+        for source in [
+            DecisionSource::Install,
+            DecisionSource::Kickoff,
+            DecisionSource::Approval,
+            DecisionSource::Autopilot,
+        ] {
+            assert!(decision_markup("googlechat", source, "a1").is_none(), "{source:?}");
+        }
+        for channel in ["whatsapp", "feishu", "teams", "webchat", ""] {
+            assert!(decision_markup(channel, DecisionSource::Goal, "t1").is_none(), "{channel}");
+        }
+        assert!(decision_markup("googlechat", DecisionSource::Goal, "t1").is_some());
+    }
+
+    #[test]
+    fn googlechat_goal_card_decodes_to_the_four_actions_primary_first() {
+        let markup = decision_markup("googlechat", DecisionSource::Goal, "t9").unwrap();
+        assert_eq!(markup, googlechat_goal_card("t9"));
+        let buttons = googlechat_card_buttons(&markup);
+        let decoded: Vec<_> = buttons
+            .iter()
+            .map(|b| parse(googlechat_button_action(b)).expect("decodable"))
+            .collect();
+        assert_eq!(
+            decoded.iter().map(|d| d.act).collect::<Vec<_>>(),
+            vec![DecisionAct::Retry, DecisionAct::Done, DecisionAct::Abort, DecisionAct::Takeover]
+        );
+        for d in &decoded {
+            assert_eq!(d.source, DecisionSource::Goal);
+            assert_eq!(d.id, "t9");
+        }
+        // Retry/done are the primary (filled) pair; abort/take-over secondary.
+        let kinds: Vec<_> = buttons.iter().map(|b| b["type"].as_str().unwrap()).collect();
+        assert_eq!(kinds, vec!["FILLED", "FILLED", "OUTLINED", "OUTLINED"]);
+        let widgets = markup[0]["card"]["sections"][0]["widgets"].as_array().unwrap();
+        assert_eq!(widgets.len(), 2, "primary list + secondary list");
     }
 
     // ── Goal needs_human: primary (≤3) + secondary tier (W1-5) ──────────
 
     #[test]
     fn goal_buttons_primary_pair_is_retry_and_done_everywhere() {
-        for channel in ["telegram", "discord", "slack", "line"] {
+        for channel in ["telegram", "discord", "slack", "line", "googlechat"] {
             let markup = decision_markup(channel, DecisionSource::Goal, "t9").unwrap();
             let ids = action_ids(channel, &markup);
             assert!(
@@ -1933,7 +2039,7 @@ mod tests {
 
     #[test]
     fn goal_buttons_telegram_discord_slack_reach_all_four_acts() {
-        for channel in ["telegram", "discord", "slack"] {
+        for channel in ["telegram", "discord", "slack", "googlechat"] {
             let markup = decision_markup(channel, DecisionSource::Goal, "t9").unwrap();
             let ids = action_ids(channel, &markup);
             let acts: std::collections::HashSet<DecisionAct> =

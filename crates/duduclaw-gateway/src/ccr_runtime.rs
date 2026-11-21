@@ -115,6 +115,79 @@ tokio::task_local! {
     /// checks. The connection suffix in CHANNEL_REPLY_USER_ID is not a durable
     /// principal across authenticated WebChat reconnects.
     pub static AUTHENTICATED_WEBCHAT_PRINCIPAL: String;
+    /// Set only by an authenticated channel adapter whose trusted space
+    /// classification says this conversation is one person's 1:1 chat with
+    /// the app, although its id can never equal the sender's id (Google
+    /// Chat: `googlechat:spaces/X` vs `users/N`). `None` = no attestation.
+    /// Consumers must check it names the turn's exact channel, chat and
+    /// sender ([`OneToOneAttestation::matches`]), never trust it as a bare flag.
+    pub static ATTESTED_ONE_TO_ONE: Option<OneToOneAttestation>;
+}
+
+/// "This chat is `sender`'s one-to-one conversation with the app", as the
+/// authenticated adapter established it. Fields are private: the only
+/// constructor validates the ids, so a value always names a well-formed
+/// Google Chat space and a human `users/<digits>` member.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OneToOneAttestation {
+    channel: &'static str,
+    chat: String,
+    sender: String,
+}
+
+impl OneToOneAttestation {
+    /// A Google Chat 1:1 DM. The caller must have verified the event (JWT on
+    /// the HTTP transport, the authoritative read-back on Pub/Sub), checked
+    /// `sender.type == "HUMAN"`, and classified `space` as a 1:1 DM with
+    /// `googlechat_space_kind::is_one_to_one`. `None` for a malformed space
+    /// or a sender that is not exactly `users/<digits>`.
+    pub(crate) fn googlechat_dm(space: &str, sender: &str) -> Option<Self> {
+        let canonical_sender = crate::googlechat_identity::normalize_user_id(sender);
+        (crate::google_workspace::chat_read::valid_space(space)
+            && canonical_sender.as_deref() == Some(sender)
+            && sender.starts_with("users/"))
+        .then(|| Self {
+            channel: crate::googlechat_identity::CHANNEL,
+            chat: space.to_string(),
+            sender: sender.to_string(),
+        })
+    }
+
+    /// Exact match on all three parts; an empty part never matches.
+    pub fn matches(&self, channel: &str, chat: &str, sender: &str) -> bool {
+        !sender.is_empty()
+            && !chat.is_empty()
+            && self.channel == channel
+            && self.chat == chat
+            && self.sender == sender
+    }
+}
+
+/// The attestation in scope for this task, if any.
+pub fn current_one_to_one_attestation() -> Option<OneToOneAttestation> {
+    ATTESTED_ONE_TO_ONE.try_with(Clone::clone).ok().flatten()
+}
+
+/// Whether the attestation in scope names exactly the conversation
+/// `session_id` (`<channel>:<chat>`, a called employee's
+/// `#agent:<id>` bucket being the same conversation) and `sender`.
+pub fn attests_one_to_one(session_id: &str, sender: &str) -> bool {
+    let Some(attestation) = current_one_to_one_attestation() else {
+        return false;
+    };
+    let base = crate::knowledge::chat_attachments::base_session(session_id);
+    match base.split_once(':') {
+        Some((channel, chat)) => attestation.matches(channel, chat, sender),
+        None => false,
+    }
+}
+
+/// Whether a channel conversation counts as one-to-one: the session id
+/// names the sender (`is_private_session`, unchanged), or the authenticated
+/// adapter attested this exact conversation and sender.
+pub fn conversation_is_one_to_one(session_id: &str, sender: &str) -> bool {
+    duduclaw_core::sensitivity::is_private_session(session_id, sender)
+        || attests_one_to_one(session_id, sender)
 }
 
 /// A native tool loop must not return a source-derived answer unless its

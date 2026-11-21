@@ -563,10 +563,89 @@ pub(crate) async fn deliver_now(
     deliver_now_as(home_dir, http, channel, token, chat_id, card, None).await
 }
 
+/// The Google Chat `cardsV2` for a decision, or `None` when this card stays
+/// plain text there: no Chat shape for the source (only goal cards have
+/// one), or the app that would send to `space` as `sender` does not receive
+/// interactions over the HTTP transport. Pub/Sub delivers no click that can
+/// be verified, so a button there could never be honoured.
+pub(crate) async fn googlechat_card_markup(
+    home_dir: &Path,
+    sender: Option<&str>,
+    space: &str,
+    source: DecisionSource,
+    decision_id: &str,
+) -> Option<serde_json::Value> {
+    let markup = crate::channel_format::decision_markup("googlechat", source, decision_id)?;
+    crate::googlechat::sending_app_takes_http_clicks(home_dir, sender, space)
+        .await
+        .then_some(markup)
+}
+
+/// Whether a decision card sent now to `(channel, chat_id)` as `sender`
+/// carries buttons — the same choice [`deliver_now_as`] makes.
+pub(crate) async fn card_shows_buttons(
+    home_dir: &Path,
+    channel: &str,
+    chat_id: &str,
+    sender: Option<&str>,
+    source: DecisionSource,
+    decision_id: &str,
+) -> bool {
+    if channel == "googlechat" {
+        return googlechat_card_markup(home_dir, sender, chat_id, source, decision_id)
+            .await
+            .is_some();
+    }
+    crate::channel_format::decision_markup(channel, source, decision_id).is_some()
+}
+
+/// Google Chat delivery: a goal card with buttons when the sending app takes
+/// clicks over HTTP, else the text form with the no-button hint.
+async fn deliver_googlechat_now(
+    home_dir: &Path,
+    chat_id: &str,
+    card: &DecisionCard<'_>,
+    sender: Option<&str>,
+) -> bool {
+    if crate::product_policy::require_channel(home_dir, "googlechat").is_err() {
+        return false;
+    }
+    if let Some(cards) =
+        googlechat_card_markup(home_dir, sender, chat_id, card.source, card.decision_id).await
+    {
+        let body = match card.link {
+            Some(url) => format!("{}\n\n👉 {url}", card.body),
+            None => card.body.to_string(),
+        };
+        return match crate::googlechat::send_card_to_space_as(home_dir, sender, chat_id, &body, cards)
+            .await
+        {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(
+                    decision = %card.decision_id, error = %e,
+                    "decision-notify: googlechat card push failed"
+                );
+                false
+            }
+        };
+    }
+    let text = match card.link {
+        Some(url) => format!("{}\n\n{}\n👉 {url}", card.body, card.no_button_hint),
+        None => format!("{}\n\n{}", card.body, card.no_button_hint),
+    };
+    crate::googlechat::send_text_to_space_as(home_dir, sender, chat_id, &text).await.is_ok()
+}
+
 pub(crate) async fn deliver_now_as(
     home_dir: &Path, http: &reqwest::Client, channel: &str, token: &str,
     chat_id: &str, card: &DecisionCard<'_>, sender: Option<&str>,
 ) -> bool {
+    // RM-192: Google Chat sends goal cards with buttons only over the HTTP
+    // transport; every other card (and Pub/Sub) keeps the text form below.
+    if channel == "googlechat" {
+        return deliver_googlechat_now(home_dir, chat_id, card, sender).await;
+    }
     // D-S1: a Telegram private-chat approval card also gets a `web_app`
     // button opening the Mini App detail view. `None` in every other case —
     // feature off, wrong channel/source, group chat, no https public URL —
@@ -658,10 +737,6 @@ pub(crate) async fn deliver_now_as(
                         false
                     }
                 };
-            }
-            if channel == "googlechat" {
-                if crate::product_policy::require_channel(home_dir, channel).is_err() { return false; }
-                return crate::googlechat::send_text_to_space_as(home_dir, sender, chat_id, &text).await.is_ok();
             }
             crate::channel_sender::send_plain_text(home_dir, http, channel, token, chat_id, &text)
                 .await

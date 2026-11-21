@@ -33,15 +33,32 @@ pub(crate) async fn base_from_home(home: &Path, supplied: Option<&str>) -> Resul
         Some(content) => Some(content.parse::<toml::Table>().map_err(|_| "invite_config_unavailable")?),
         None => None,
     };
-    let gateway = match table.as_ref().and_then(|t| t.get("gateway")) {
-        Some(value) => Some(value.as_table().ok_or("invite_config_unavailable")?),
-        None => None,
-    };
-    let configured = match gateway.and_then(|g| g.get("public_url")) {
-        Some(value) => Some(value.as_str().ok_or("invalid_public_url")?),
-        None => None,
-    };
-    public_base_url(configured, supplied)
+    if table.as_ref().and_then(|t| t.get("gateway")).is_some_and(|g| !g.is_table()) {
+        return Err("invite_config_unavailable");
+    }
+    // The dashboard's public address, in the same order the channel deep
+    // links resolve it (`deep_link::PUBLIC_URL_SECTIONS`). The first entry
+    // that is a valid invitation base wins. `[gateway] public_url` keeps its
+    // earlier meaning: when it is set but unusable the invitation is refused
+    // rather than falling back to a supplied address. The `[dashboard]` and
+    // `[general]` aliases are skipped when they cannot serve invitations
+    // (an http loopback address is valid for the dashboard, not for a mailed
+    // invitation), so a setup that worked before never starts failing.
+    if let Some(table) = table.as_ref() {
+        for (section, value) in crate::deep_link::public_url_entries(table) {
+            let legacy = section == "gateway";
+            match value {
+                Ok(raw) => match public_base_url(Some(raw), None) {
+                    Ok(base) => return Ok(base),
+                    Err(e) if legacy => return Err(e),
+                    Err(_) => {}
+                },
+                Err(()) if legacy => return Err("invalid_public_url"),
+                Err(()) => {}
+            }
+        }
+    }
+    public_base_url(None, supplied)
 }
 
 pub(crate) fn delivery_payload(sent: bool, reason: &str, link: &str) -> Value {
@@ -180,6 +197,30 @@ mod tests {
             assert!(public_base_url(None, Some(local)).is_err());
         }
         assert!(public_base_url(Some("invalid"), Some("https://valid.test")).is_err());
+    }
+    #[tokio::test]
+    async fn configured_base_follows_the_deep_link_section_order() {
+        let home = tempfile::tempdir().unwrap();
+        let config = |text: &str| std::fs::write(home.path().join("config.toml"), text).unwrap();
+        let supplied = Some("https://supplied.test");
+        assert_eq!(base_from_home(home.path(), supplied).await, Ok("https://supplied.test".into()));
+        config("[dashboard]\npublic_url = 'https://dash.test/'\n[gateway]\npublic_url = 'https://gw.test'\n");
+        assert_eq!(base_from_home(home.path(), supplied).await, Ok("https://dash.test".into()));
+        config("[general]\npublic_url = 'https://general.test'\n[gateway]\npublic_url = 'https://gw.test'\n");
+        assert_eq!(base_from_home(home.path(), supplied).await, Ok("https://general.test".into()));
+        // A dashboard-only loopback address cannot serve a mailed invitation:
+        // the previously read [gateway] value (or the supplied one) still works.
+        config("[dashboard]\npublic_url = 'http://localhost:18889'\n[gateway]\npublic_url = 'https://gw.test'\n");
+        assert_eq!(base_from_home(home.path(), supplied).await, Ok("https://gw.test".into()));
+        config("[dashboard]\npublic_url = 'http://localhost:18889'\n");
+        assert_eq!(base_from_home(home.path(), supplied).await, Ok("https://supplied.test".into()));
+        // [gateway] public_url keeps its earlier meaning when set but unusable.
+        config("[gateway]\npublic_url = 'http://example.com'\n");
+        assert_eq!(base_from_home(home.path(), supplied).await, Err("invalid_public_url"));
+        config("[gateway]\npublic_url = 7\n");
+        assert_eq!(base_from_home(home.path(), supplied).await, Err("invalid_public_url"));
+        config("gateway = 1\n");
+        assert_eq!(base_from_home(home.path(), supplied).await, Err("invite_config_unavailable"));
     }
     #[test]
     fn public_base_reserves_room_for_the_rendered_invitation_token() {

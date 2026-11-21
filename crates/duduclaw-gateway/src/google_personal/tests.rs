@@ -448,6 +448,7 @@ async fn unknown_external_requester_needs_explicit_anyone_and_personal_consent_b
             chat: "public".into(),
             sender: "visitor".into(),
             user_id: Some(f.alice.id.clone()),
+            attested_private: false,
         };
         assert_eq!(
             access::resolve(&f.home, "bot", &visitor, &people, &anyone, "gmail_read")

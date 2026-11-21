@@ -229,6 +229,77 @@ async fn unclassified_and_legacy_pauses_read_as_needs_human_review() {
     );
 }
 
+// ── RM-192 B6: no re-notify after a restart ─────────────────────────
+
+/// Pushes the reconciler attempted for `id`: every attempt leaves one
+/// `goal_loop.needs_human_notified` feed row (NoTarget here — the test home
+/// has no destination, so nothing leaves the process).
+async fn needs_human_attempts(store: &TaskStore, id: &str) -> usize {
+    store
+        .list_activity_for_task(id, 1000)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|a| a.event_type == "goal_loop.needs_human_notified")
+        .count()
+}
+
+async fn park(store: &TaskStore, id: &str) {
+    assert!(store.mark_needs_human(id, "stuck").await.unwrap());
+}
+
+#[tokio::test]
+async fn a_restart_does_not_renotify_a_pending_task_but_a_reentered_one_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, queue) = open_stores(dir.path()).await;
+    for id in ["still", "again", "away"] {
+        store.insert_task(&goal_task(id, "alice")).await.unwrap();
+        park(&store, id).await;
+    }
+
+    // First driver life: the cards of all three were delivered (simulated
+    // through the same marker the reconciler writes after a Sent push —
+    // the test home has no channel to really send to).
+    let first = GoalLoopDriver::new(store.clone(), queue.clone(), small_cfg())
+        .with_home_dir(dir.path().to_path_buf());
+    for id in ["still", "again", "away"] {
+        let task = store.get_task(id).await.unwrap().unwrap();
+        let ep = first.needs_human_episode(id).await.unwrap();
+        assert_eq!((ep.seq, ep.notified), (1, false));
+        assert!(first.record_needs_human_notified(&task, ep.seq, "已推播需人工審批").await);
+        assert!(first.needs_human_episode(id).await.unwrap().notified);
+    }
+    // "away" is decided while no driver runs (before the next life's
+    // first pass), then parks again later.
+    assert!(store.resolve_needs_human("away", "retry", "").await.unwrap());
+    drop(first);
+
+    // Restart: a new driver over the same store.
+    let second = GoalLoopDriver::new(store.clone(), queue.clone(), small_cfg())
+        .with_home_dir(dir.path().to_path_buf());
+    second.reconcile_needs_human().await;
+    assert_eq!(needs_human_attempts(&store, "still").await, 1, "still pending: not re-notified");
+    assert_eq!(needs_human_attempts(&store, "again").await, 1, "still pending: not re-notified");
+    // The sweep ended "away"'s episode; re-entering starts a new one.
+    park(&store, "away").await;
+    second.reconcile_needs_human().await;
+    assert_eq!(needs_human_attempts(&store, "away").await, 2, "re-entered: notified again");
+    assert_eq!(second.needs_human_episode("away").await.unwrap().seq, 2);
+
+    // Within this life: "again" leaves and re-enters; the exit is observed.
+    assert!(store.resolve_needs_human("again", "retry", "").await.unwrap());
+    second.reconcile_needs_human().await;
+    park(&store, "again").await;
+    second.reconcile_needs_human().await;
+    assert_eq!(needs_human_attempts(&store, "again").await, 2, "re-entered: notified again");
+    // A take-over press keeps the task needs_human: same episode, no push.
+    assert!(store.claim_needs_human("still", "channel:googlechat:users/1").await.unwrap());
+    let third = GoalLoopDriver::new(store.clone(), queue.clone(), small_cfg())
+        .with_home_dir(dir.path().to_path_buf());
+    third.reconcile_needs_human().await;
+    assert_eq!(needs_human_attempts(&store, "still").await, 1);
+}
+
 // ── H22: no-progress timeout report ─────────────────────────────────
 
 #[test]

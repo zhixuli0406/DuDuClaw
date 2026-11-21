@@ -285,7 +285,7 @@ mod tests {
         ).await;
         let _requester = crate::knowledge::turn_requesters::register(&agent, "line-turn",
             RequesterIdentity::ChannelUser { channel:"line".into(), chat:"line-human".into(),
-                sender:"line-human".into(), user_id:Some(user.clone()) }).unwrap();
+                sender:"line-human".into(), user_id:Some(user.clone()), attested_private:false }).unwrap();
         assert_eq!(crate::turn_context::target_for(&agent, "line-turn").unwrap().context, context);
         let id = create(home.path(), &agent, request_for(&agent, "line-turn")).await.unwrap().unwrap();
         // End the registered transport before yielding to the detached notifier:
@@ -310,9 +310,9 @@ mod tests {
         for identity in [RequesterIdentity::Unknown,
             RequesterIdentity::System { kind:"cron".into(), on_behalf_of:Some(user.clone()) },
             RequesterIdentity::ChannelUser { channel:"odoolivechat".into(), chat:"visitor".into(),
-                sender:user.clone(), user_id:Some(user.clone()) },
+                sender:user.clone(), user_id:Some(user.clone()), attested_private:false },
             RequesterIdentity::ChannelUser { channel:"webchat".into(), chat:"visitor".into(),
-                sender:user.clone(), user_id:None },
+                sender:user.clone(), user_id:None, attested_private:false },
             RequesterIdentity::DashboardUser { user_id:"another-user".into() },
         ] {
             let _requester = crate::knowledge::turn_requesters::register(&agent, "live", identity).unwrap();
@@ -333,7 +333,7 @@ mod tests {
         let _turn = register(&agent, "public", &user).await;
         let _requester = crate::knowledge::turn_requesters::register(&agent, "public",
             RequesterIdentity::ChannelUser { channel:"webchat".into(), chat:"visitor".into(),
-                sender:user.clone(), user_id:Some(user) }).unwrap();
+                sender:user.clone(), user_id:Some(user), attested_private:false }).unwrap();
         assert!(create(home.path(), &agent, request_for(&agent, "public")).await.unwrap().is_none());
     }
 
@@ -354,7 +354,7 @@ mod tests {
                 }),
             ).await;
             let _requester = crate::knowledge::turn_requesters::register(&agent, "group-turn",
-                RequesterIdentity::ChannelUser { channel:channel.into(), chat:"group".into(), sender:"human".into(), user_id:Some(user) }).unwrap();
+                RequesterIdentity::ChannelUser { channel:channel.into(), chat:"group".into(), sender:"human".into(), user_id:Some(user), attested_private:false }).unwrap();
             let id = create(home.path(), &agent, request_for(&agent, "group-turn")).await.unwrap().unwrap();
             let broker = ApprovalBroker::open(home.path()).unwrap();
             let row = broker.get(&id).await.unwrap().unwrap();
