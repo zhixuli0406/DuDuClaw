@@ -16,7 +16,7 @@
   "settings.limits.runtime": "單次執行時間上限",
   "settings.limits.runtime.help": "預設值適用於未個別設定的員工。提高最高上限會讓長時間執行的工作消耗更多額度。",
   "settings.limits.default_timeout_secs": "預設執行上限（秒）",
-  "settings.limits.default_timeout_secs.help": "可留空；範圍為 30 秒至最高上限。留空時 Claude 為 1800 秒，其他執行環境為 300 秒。",
+  "settings.limits.default_timeout_secs.help": "可留空；範圍為 30 秒至最高上限。留空時所有執行環境都是 1800 秒（不超過最高上限）。",
   "settings.limits.max_timeout_secs": "最高執行上限（秒）",
   "settings.limits.max_timeout_secs.help": "60～14400 秒，預設 3600 秒。員工設定超出此值時，執行會縮至上限，儲存則會拒絕。",
   "settings.limits.goal_defaults": "排程交辦限制",

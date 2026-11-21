@@ -25,9 +25,21 @@ use crate::runtime_config::RuntimeSettings;
 /// Previously a single `OnceCell` bound the registry to the *first* `home_dir`
 /// ever passed — wrong for multi-home / multi-process-test setups (production
 /// single-home was unaffected). Keyed by home so each home auto-detects its own
-/// runtimes once. Registries live for the process lifetime (the set of distinct
-/// homes is tiny), so each is `Box::leak`ed to hand out a `&'static` ref.
-static REGISTRIES: OnceLock<Mutex<HashMap<PathBuf, &'static RuntimeRegistry>>> = OnceLock::new();
+/// runtimes.
+///
+/// RM-181 (v1.84.0): an entry is REPLACEABLE. It used to be leaked once and
+/// never refreshed, so a runtime installed after the first dispatch stayed
+/// "not registered" until a restart. [`invalidate_all_registries`] (after a
+/// successful install and after `runtime.detect`) drops the cached entries;
+/// a dispatch that finds a configured runtime missing re-probes at most once
+/// per [`REGISTRY_REPROBE_INTERVAL`]. A call keeps the `Arc` it started with.
+static REGISTRIES: OnceLock<Mutex<HashMap<PathBuf, std::sync::Arc<RuntimeRegistry>>>> = OnceLock::new();
+
+/// Rate limit of the "configured runtime not registered" re-probe, per home.
+pub(crate) const REGISTRY_REPROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// When each home last re-probed because a configured runtime was missing.
+static REGISTRY_REPROBES: OnceLock<std::sync::Mutex<HashMap<PathBuf, std::time::Instant>>> = OnceLock::new();
 
 /// Cooldown for a provider that trips its failure threshold (RFC-25 R1).
 const FAILOVER_COOLDOWN_SECS: i64 = 60;
@@ -58,7 +70,7 @@ fn failover(home_dir: &Path) -> &'static crate::failover::FailoverManager {
 }
 
 /// Get (or lazily build) the runtime registry for `home_dir`.
-pub async fn registry(home_dir: &Path) -> &'static RuntimeRegistry {
+pub async fn registry(home_dir: &Path) -> std::sync::Arc<RuntimeRegistry> {
     #[cfg(test)]
     if let Some(registry) = testing::owned_registry(home_dir) {
         return registry;
@@ -66,14 +78,70 @@ pub async fn registry(home_dir: &Path) -> &'static RuntimeRegistry {
     let map = REGISTRIES.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = map.lock().await;
     if let Some(reg) = guard.get(home_dir) {
-        return reg;
+        return reg.clone();
     }
     // Build while holding the lock so a concurrent first-call for the same home
     // waits rather than double-building (CLI probing is async). Distinct homes
-    // serialize here only on their very first access.
-    let built: &'static RuntimeRegistry = Box::leak(Box::new(RuntimeRegistry::new(home_dir).await));
-    guard.insert(home_dir.to_path_buf(), built);
+    // serialize here only on a (re)build.
+    let built = std::sync::Arc::new(build_registry(home_dir).await);
+    guard.insert(home_dir.to_path_buf(), built.clone());
     built
+}
+
+async fn build_registry(home_dir: &Path) -> RuntimeRegistry {
+    #[cfg(test)]
+    if let Some(build) = testing::registry_builder(home_dir) {
+        return build();
+    }
+    RuntimeRegistry::new(home_dir).await
+}
+
+/// Drop `home_dir`'s cached registry: the next dispatch probes the host
+/// again (same probes as the first build). In-flight calls keep theirs.
+pub async fn invalidate_registry(home_dir: &Path) {
+    if let Some(map) = REGISTRIES.get() {
+        map.lock().await.remove(home_dir);
+    }
+}
+
+/// Drop every home's cached registry. An installed or removed CLI is a host
+/// fact, not a per-home one, so install/detect refresh all homes.
+pub async fn invalidate_all_registries() {
+    if let Some(map) = REGISTRIES.get() {
+        map.lock().await.clear();
+    }
+}
+
+/// A configured runtime is not in `current`: re-probe once, rate limited to
+/// one rebuild per [`REGISTRY_REPROBE_INTERVAL`] per home. Returns the
+/// registry to use for this call (the fresh one, or `current` when the
+/// window has not elapsed).
+async fn reprobe_for_missing_runtime(
+    home_dir: &Path,
+    current: std::sync::Arc<RuntimeRegistry>,
+    missing: RuntimeType,
+) -> std::sync::Arc<RuntimeRegistry> {
+    #[cfg(test)]
+    if testing::owned_registry(home_dir).is_some() {
+        return current;
+    }
+    let now = std::time::Instant::now();
+    let due = {
+        let mut last = REGISTRY_REPROBES.get_or_init(Default::default).lock().unwrap();
+        match last.get(home_dir) {
+            Some(at) if now.duration_since(*at) < REGISTRY_REPROBE_INTERVAL => false,
+            _ => {
+                last.insert(home_dir.to_path_buf(), now);
+                true
+            }
+        }
+    };
+    if !due {
+        return current;
+    }
+    tracing::info!(runtime = missing.as_str(), "configured runtime not registered — re-probing installed runtimes");
+    invalidate_registry(home_dir).await;
+    registry(home_dir).await
 }
 
 /// Why a model runs, stated by every caller of the two spawn choke points
@@ -262,7 +330,13 @@ async fn run_agent_prompt_inner(
     crate::budget::gate_before_spawn(req.home_dir, req.agent_dir, req.agent_id, "runtime_dispatch")
         .await.map_err(|e| RuntimeDispatchFailure::preflight(Some(provider), req.model, RuntimePreflightKind::Budget, e.to_string()))?;
 
-    let reg = registry(req.home_dir).await;
+    let mut reg = registry(req.home_dir).await;
+    // RM-181: a runtime this employee is configured to use (primary or
+    // fallback) may have been installed after the registry was built.
+    let missing = std::iter::once(provider).chain(fallback).find(|rt| reg.get(rt).is_none());
+    if let Some(missing) = missing {
+        reg = reprobe_for_missing_runtime(req.home_dir, reg, missing).await;
+    }
 
     let ctx = RuntimeContext {
         agent_dir: req.agent_dir.map(PathBuf::from),
@@ -319,7 +393,7 @@ async fn run_agent_prompt_inner(
         .scope(
             usage_estimated.clone(),
             RUNTIME_USAGE_REQUEST_TYPE.scope(req.request_type, failover(req.home_dir).execute_with_failover_detailed(
-                reg,
+                &reg,
                 &provider,
                 fallback.as_ref(),
                 req.prompt,
@@ -1417,31 +1491,33 @@ mod hint_tests {
 pub(crate) mod testing {
     use super::*;
 
+    use std::sync::Arc;
+
     // Owned injection must not share the async auto-detection cache lock.
     // Every synchronous critical section only copies/inserts/removes a pointer.
     static OWNED_REGISTRIES: OnceLock<
-        std::sync::Mutex<HashMap<PathBuf, &'static RuntimeRegistry>>,
+        std::sync::Mutex<HashMap<PathBuf, Arc<RuntimeRegistry>>>,
     > = OnceLock::new();
 
-    pub(super) fn owned_registry(home: &Path) -> Option<&'static RuntimeRegistry> {
+    pub(super) fn owned_registry(home: &Path) -> Option<Arc<RuntimeRegistry>> {
         OWNED_REGISTRIES
             .get()
-            .and_then(|map| map.lock().unwrap().get(home).copied())
+            .and_then(|map| map.lock().unwrap().get(home).cloned())
     }
 
     pub(crate) struct RegistryGuard {
         home: PathBuf,
-        registry: &'static RuntimeRegistry,
+        registry: Arc<RuntimeRegistry>,
     }
     impl RegistryGuard {
         pub(crate) async fn install(home: &Path, registry: RuntimeRegistry) -> Self {
             assert!(home.is_dir());
-            let registry: &'static RuntimeRegistry = Box::leak(Box::new(registry));
+            let registry = Arc::new(registry);
             let mut map = OWNED_REGISTRIES
                 .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
                 .lock()
                 .unwrap();
-            assert!(map.insert(home.to_owned(), registry).is_none());
+            assert!(map.insert(home.to_owned(), registry.clone()).is_none());
             Self {
                 home: home.to_owned(),
                 registry,
@@ -1453,10 +1529,149 @@ pub(crate) mod testing {
             let mut map = OWNED_REGISTRIES.get().unwrap().lock().unwrap();
             assert!(
                 map.get(&self.home)
-                    .is_some_and(|actual| std::ptr::eq(*actual, self.registry))
+                    .is_some_and(|actual| Arc::ptr_eq(actual, &self.registry))
             );
             map.remove(&self.home);
         }
+    }
+
+    // ── RM-181: a test-owned builder for the PRODUCTION cache ──────────
+    //
+    // Unlike `RegistryGuard` (which bypasses the cache), this replaces only
+    // the host probe for one owned home, so caching, invalidation and the
+    // re-probe rate limit are exercised as shipped.
+    type Builder = Arc<dyn Fn() -> RuntimeRegistry + Send + Sync>;
+    static BUILDERS: OnceLock<std::sync::Mutex<HashMap<PathBuf, Builder>>> = OnceLock::new();
+
+    pub(super) fn registry_builder(home: &Path) -> Option<Builder> {
+        BUILDERS.get().and_then(|map| map.lock().unwrap().get(home).cloned())
+    }
+
+    pub(crate) struct BuilderGuard {
+        home: PathBuf,
+    }
+    impl BuilderGuard {
+        pub(crate) fn install(home: &Path, build: impl Fn() -> RuntimeRegistry + Send + Sync + 'static) -> Self {
+            assert!(home.is_dir());
+            let mut map = BUILDERS.get_or_init(Default::default).lock().unwrap();
+            assert!(map.insert(home.to_owned(), Arc::new(build)).is_none());
+            Self { home: home.to_owned() }
+        }
+    }
+    impl Drop for BuilderGuard {
+        fn drop(&mut self) {
+            BUILDERS.get().unwrap().lock().unwrap().remove(&self.home);
+            if let Ok(mut reprobes) = REGISTRY_REPROBES.get_or_init(Default::default).lock() {
+                reprobes.remove(&self.home);
+            }
+        }
+    }
+
+    struct Answers;
+    #[async_trait::async_trait]
+    impl crate::runtime::AgentRuntime for Answers {
+        fn name(&self) -> &str { "answers" }
+        async fn execute(&self, _: &str, context: &RuntimeContext) -> Result<RuntimeResponse, String> {
+            Ok(RuntimeResponse { content: "ok".into(), model_used: context.model.clone(),
+                runtime_name: "grok".into(), ..Default::default() })
+        }
+        async fn is_available(&self) -> bool { true }
+    }
+
+    /// The fake host: `installed` decides whether Grok is "on PATH".
+    fn fake_host(home: &Path) -> (BuilderGuard, Arc<std::sync::atomic::AtomicBool>, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::Ordering;
+        let installed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let builds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (flag, count) = (installed.clone(), builds.clone());
+        let guard = BuilderGuard::install(home, move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            let mut map: HashMap<RuntimeType, Box<dyn crate::runtime::AgentRuntime>> = HashMap::new();
+            if flag.load(Ordering::SeqCst) {
+                map.insert(RuntimeType::Grok, Box::new(Answers));
+            }
+            RuntimeRegistry::with_runtimes(map)
+        });
+        (guard, installed, builds)
+    }
+
+    #[tokio::test]
+    async fn invalidate_makes_the_next_dispatch_see_a_newly_installed_runtime() {
+        use std::sync::atomic::Ordering;
+        let home = tempfile::tempdir().unwrap();
+        let (_host, installed, builds) = fake_host(home.path());
+        let before = super::registry(home.path()).await;
+        assert!(before.get(&RuntimeType::Grok).is_none());
+        assert!(Arc::ptr_eq(&before, &super::registry(home.path()).await), "cached until invalidated");
+        installed.store(true, Ordering::SeqCst);
+        // An in-flight call keeps the registry it started with.
+        let in_flight = before.clone();
+        super::invalidate_registry(home.path()).await;
+        let after = super::registry(home.path()).await;
+        assert!(after.get(&RuntimeType::Grok).is_some());
+        assert!(in_flight.get(&RuntimeType::Grok).is_none());
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+        super::invalidate_registry(home.path()).await;
+    }
+
+    #[tokio::test]
+    async fn missing_configured_runtime_reprobes_at_most_once_per_interval() {
+        use std::sync::atomic::Ordering;
+        let home = tempfile::tempdir().unwrap();
+        let (_host, installed, builds) = fake_host(home.path());
+        let first = super::registry(home.path()).await;
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+        // Still not installed: the re-probe runs once and finds nothing.
+        let again = super::reprobe_for_missing_runtime(home.path(), first.clone(), RuntimeType::Grok).await;
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+        assert!(again.get(&RuntimeType::Grok).is_none());
+        // Installed now, but inside the window: no second probe.
+        installed.store(true, Ordering::SeqCst);
+        let limited = super::reprobe_for_missing_runtime(home.path(), again.clone(), RuntimeType::Grok).await;
+        assert_eq!(builds.load(Ordering::SeqCst), 2, "rate limit honoured");
+        assert!(Arc::ptr_eq(&limited, &again));
+        // Once the window has passed, the next miss re-probes and finds it.
+        let Some(past) = std::time::Instant::now().checked_sub(REGISTRY_REPROBE_INTERVAL) else {
+            super::invalidate_registry(home.path()).await;
+            return; // monotonic clock younger than the window on this host
+        };
+        REGISTRY_REPROBES.get().unwrap().lock().unwrap().insert(home.path().to_owned(), past);
+        let fresh = super::reprobe_for_missing_runtime(home.path(), limited, RuntimeType::Grok).await;
+        assert_eq!(builds.load(Ordering::SeqCst), 3);
+        assert!(fresh.get(&RuntimeType::Grok).is_some());
+        super::invalidate_registry(home.path()).await;
+    }
+
+    #[tokio::test]
+    async fn dispatch_to_a_runtime_installed_after_the_first_build_needs_no_restart() {
+        use std::sync::atomic::Ordering;
+        let home = tempfile::tempdir().unwrap();
+        let agent = home.path().join("agents/worker");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(agent.join("agent.toml"), "[runtime]\nprovider='grok'\n").unwrap();
+        let (_host, installed, _builds) = fake_host(home.path());
+        let _ = super::registry(home.path()).await; // first build: Grok absent
+        installed.store(true, Ordering::SeqCst);
+        let response = super::run_agent_prompt_detailed(super::AgentPrompt {
+            agent_dir: Some(&agent),
+            home_dir: home.path(),
+            agent_id: "worker",
+            prompt: "hi",
+            system_prompt: "",
+            model: "grok-4",
+            max_tokens: 8,
+            provider_override: None,
+            conversation_history: &[],
+            request_type: crate::cost_telemetry::RequestType::Chat,
+            runtime_settings: None,
+            effort: None,
+            allow_cross_family_failover: true,
+            purpose: super::SpawnPurpose::EmployeeTurn,
+        })
+        .await
+        .expect("the configured runtime is found by the re-probe");
+        assert_eq!(response.content, "ok");
+        super::invalidate_registry(home.path()).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1475,9 +1690,9 @@ pub(crate) mod testing {
             RuntimeRegistry::with_runtimes(HashMap::new()),
         )
         .await;
-        let first_registry = first_guard.registry;
-        let second_registry = second_guard.registry;
-        assert!(!std::ptr::eq(first_registry, second_registry));
+        let first_registry = first_guard.registry.clone();
+        let second_registry = second_guard.registry.clone();
+        assert!(!Arc::ptr_eq(&first_registry, &second_registry));
 
         // Hold the actual shared cache lock, as another home's startup can.
         // Neither owned lookup nor either Drop may acquire this Tokio mutex.
@@ -1486,9 +1701,9 @@ pub(crate) mod testing {
         let production_entries = production_guard.len();
         drop(first_guard);
         assert!(owned_registry(first.path()).is_none());
-        assert!(std::ptr::eq(
-            owned_registry(second.path()).unwrap(),
-            second_registry
+        assert!(Arc::ptr_eq(
+            &owned_registry(second.path()).unwrap(),
+            &second_registry
         ));
         let second_lookup = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -1496,7 +1711,7 @@ pub(crate) mod testing {
         )
         .await
         .expect("owned lookup must bypass the held production cache lock");
-        assert!(std::ptr::eq(second_lookup, second_registry));
+        assert!(Arc::ptr_eq(&second_lookup, &second_registry));
         // The exact injected empty registry cannot call any CLI or provider.
         assert!(second_registry.available().is_empty());
         drop(second_guard);

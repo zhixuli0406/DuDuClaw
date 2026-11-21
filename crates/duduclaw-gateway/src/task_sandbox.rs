@@ -104,7 +104,11 @@ impl Unavailable {
             Self::UnsupportedRuntime(runtime) => format!(
                 "runtime `{runtime}` cannot run in the task sandbox (supported: claude, codex, grok, openai_compat)"
             ),
-            Self::CodexMcpIsolation(reason) => reason.clone(),
+            // The engine-local marker (v1.84.0) is routing data only; keep the
+            // v1.83.0 text here.
+            Self::CodexMcpIsolation(reason) => {
+                reason.replacen(duduclaw_agent::mcp_spawn_gate::ENGINE_LOCAL_REFUSAL_MARKER, "", 1)
+            }
             Self::NetworkDisabled => {
                 "the AI inside the sandbox must reach its model provider, but this agent has \
                 [container] network_access = false; set network_access = true to use the sandbox"

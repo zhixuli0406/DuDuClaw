@@ -392,8 +392,15 @@ pub fn warn_once_if_deprecated_runtime_for(
     }
 }
 
-/// Default CLI run / OpenAI-compatible request limit, including agent-less calls.
+/// Historical 300-second baseline. Since v1.84.0 it is only the AUTHORIZATION
+/// baseline (who may widen an unset limit, a non-Admin's task ceiling); the
+/// run limit default is [`DEFAULT_RUN_TIMEOUT_SECS`].
 pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
+/// RM-181 (v1.84.0): the one run-limit default for every engine — Claude,
+/// Codex, Grok, generic CLIs and OpenAI-compatible requests, including
+/// agent-less calls — when neither `[runtime] timeout_secs` nor the global
+/// `[runtime] default_timeout_secs` is set. (Non-Claude engines used 300.)
+pub const DEFAULT_RUN_TIMEOUT_SECS: u64 = 1800;
 /// Bounds of `[runtime] timeout_secs` and of a task's own `timeout_secs`.
 pub const MIN_TIMEOUT_SECS: u64 = 30;
 pub const MAX_TIMEOUT_SECS: u64 = 3600;
@@ -445,11 +452,11 @@ fn timeout_policy(agent_dir: &Path) -> TimeoutPolicy {
     TimeoutPolicy::load(&home)
 }
 
-/// Resolve stored provider names exactly as the runtime loader does.
-pub(crate) fn runtime_default_timeout(provider: Option<&str>, policy: TimeoutPolicy) -> u64 {
-    let provider = provider.and_then(RuntimeType::parse).unwrap_or_default();
-    let fallback = if provider == RuntimeType::Claude { 1800 } else { DEFAULT_TIMEOUT_SECS };
-    policy.default_secs.unwrap_or(fallback).clamp(MIN_TIMEOUT_SECS, policy.max_secs)
+/// The run limit an unset `[runtime] timeout_secs` resolves to. Since
+/// v1.84.0 it is the same for every provider (the parameter is kept so
+/// callers keep naming the provider the limit applies to).
+pub(crate) fn runtime_default_timeout(_provider: Option<&str>, policy: TimeoutPolicy) -> u64 {
+    policy.default_secs.unwrap_or(DEFAULT_RUN_TIMEOUT_SECS).clamp(MIN_TIMEOUT_SECS, policy.max_secs)
 }
 
 /// Historical authorization baseline; global defaults may narrow the unset baseline.
@@ -459,7 +466,8 @@ pub(crate) fn timeout_authorization_baseline(raw: Option<i64>, policy: TimeoutPo
         .unwrap_or(policy.default_secs.unwrap_or(DEFAULT_TIMEOUT_SECS).min(DEFAULT_TIMEOUT_SECS))
 }
 
-/// Claude keeps its historical 1800-second default, including utility calls.
+/// Claude's run limit (default [`DEFAULT_RUN_TIMEOUT_SECS`], as every engine),
+/// including utility calls.
 pub fn claude_timeout_secs(home: &Path, agent_dir: Option<&Path>) -> u64 {
     let policy = TimeoutPolicy::load(home);
     resolve_timeout(agent_dir, policy, runtime_default_timeout(Some("claude"), policy), true)
@@ -509,8 +517,8 @@ pub fn scoped_task_timeout_secs(agent_id: &str) -> Option<u64> {
 /// task's own limit when one is scoped for this employee, otherwise the
 /// employee's. An agent-less call never takes a task's limit.
 pub fn call_timeout_secs(agent_dir: Option<&Path>) -> u64 {
-    let Some(dir) = agent_dir else { return resolve_timeout(None, TimeoutPolicy::load(&duduclaw_core::platform::duduclaw_home()), DEFAULT_TIMEOUT_SECS, false) };
-    resolve_timeout(Some(dir), timeout_policy(dir), DEFAULT_TIMEOUT_SECS, true)
+    let Some(dir) = agent_dir else { return resolve_timeout(None, TimeoutPolicy::load(&duduclaw_core::platform::duduclaw_home()), DEFAULT_RUN_TIMEOUT_SECS, false) };
+    resolve_timeout(Some(dir), timeout_policy(dir), DEFAULT_RUN_TIMEOUT_SECS, true)
 }
 
 /// The highest per-task limit a non-Admin (a dashboard Operator, an AI
@@ -590,7 +598,7 @@ fn raw_agent_timeout_secs(agent_dir: &Path) -> Option<i64> {
 
 /// Resolve the typed per-agent timeout, tolerating old or malformed settings.
 pub fn agent_timeout_secs(agent_dir: &Path) -> u64 {
-    resolve_timeout(Some(agent_dir), timeout_policy(agent_dir), DEFAULT_TIMEOUT_SECS, false)
+    resolve_timeout(Some(agent_dir), timeout_policy(agent_dir), DEFAULT_RUN_TIMEOUT_SECS, false)
 }
 
 /// Largest employee setting an owner may set without widening authority.
@@ -1321,7 +1329,7 @@ mod tests {
         assert_eq!(agent_timeout_secs(&dir), 900);
         assert_eq!(read_runtime_json(&dir)["timeout_secs"], serde_json::json!(900));
         write_agent_toml(&dir, "[runtime]\n");
-        assert_eq!(agent_timeout_secs(&dir), 300, "clearing must use the fixed default");
+        assert_eq!(agent_timeout_secs(&dir), DEFAULT_RUN_TIMEOUT_SECS, "clearing must use the fixed default");
         assert!(read_runtime_json(&dir).get("timeout_secs").is_none(), "UI must not expose stale preset limits");
     }
 
@@ -1343,7 +1351,7 @@ mod tests {
             .await;
         assert_eq!(own, 1800);
         assert_eq!(other, 120, "another employee inside the scope keeps its own");
-        assert_eq!(agentless, DEFAULT_TIMEOUT_SECS, "an agent-less call never takes it");
+        assert_eq!(agentless, DEFAULT_RUN_TIMEOUT_SECS, "an agent-less call never takes it");
         let none = TASK_TIMEOUT_SECS.scope(None, async { call_timeout_secs(Some(&anna)) }).await;
         assert_eq!(none, 300, "a task without its own limit keeps the employee's");
         for (stored, expected) in [(5, 30), (99_999, 3600)] {
@@ -1379,9 +1387,9 @@ mod tests {
         let home = TempDir::new().unwrap();
         let dir = home.path().join("agents/worker");
         std::fs::create_dir_all(&dir).unwrap();
-        assert_eq!(agent_timeout_secs(&dir), 300);
+        assert_eq!(agent_timeout_secs(&dir), 1800);
         for (literal, expected) in [("900", 900), ("30", 30), ("3600", 3600),
-            ("-1", 30), ("3601", 3600), ("\"oops\"", 300), ("1.5", 300), ("true", 300)] {
+            ("-1", 30), ("3601", 3600), ("\"oops\"", 1800), ("1.5", 1800), ("true", 1800)] {
             write_agent_toml(&dir, &format!("[runtime]\ntimeout_secs = {literal}\n"));
             assert_eq!(agent_timeout_secs(&dir), expected, "{literal}");
         }
@@ -2035,6 +2043,40 @@ mod tests {
         assert!(model_matches_provider("claude-sonnet-4-6", OpenAiCompat));
     }
 
+    /// v1.84.0: the bare Claude CLI aliases are the Claude family (exact
+    /// equality), so they are handled exactly like a `claude-*` id: a
+    /// confident mismatch on Codex/Grok, a match on Claude and on familyless
+    /// runtimes, and the same preflight refusal / save-time alignment.
+    #[test]
+    fn bare_claude_aliases_are_the_claude_family_everywhere() {
+        use RuntimeType::*;
+        for alias in ["opus", "sonnet", "haiku", "fable", "Opus"] {
+            assert_eq!(model_family(alias), Some("claude"), "{alias}");
+            assert!(model_matches_provider(alias, Claude), "{alias}");
+            for foreign in [Codex, Grok, Qwen] {
+                assert_eq!(model_matches_provider(alias, foreign), model_matches_provider("claude-opus-4-6", foreign));
+                assert!(!model_matches_provider(alias, foreign), "{alias} on {foreign:?}");
+                assert!(ensure_model_provider(alias, foreign).is_err());
+            }
+            assert!(model_matches_provider(alias, OpenAiCompat));
+            assert!(model_matches_provider(alias, Kiro));
+            assert!(same_model_family(alias, "claude-sonnet-4-6"));
+            assert!(!same_model_family(alias, "gpt-5.4"));
+            assert_eq!(infer_provider_for_model(alias), Some(Claude));
+        }
+        // Not prefixes: another vendor's look-alike stays an unknown family.
+        for other in ["opus-foo", "my-sonnet", "haiku2"] {
+            assert_eq!(model_family(other), None, "{other}");
+            assert!(model_matches_provider(other, Codex), "{other}");
+            assert!(ensure_model_provider(other, Grok).is_ok());
+        }
+        // Save-time alignment treats `opus` on Codex exactly like `claude-*`.
+        for model in ["opus", "claude-opus-4-6"] {
+            let mut table: toml::Table = format!("[model]\npreferred = \"{model}\"\n[runtime]\nprovider = \"codex\"\n").parse().unwrap();
+            assert_eq!(align_model_runtime(&mut table).unwrap().aligned_provider(), Some(Claude), "{model}");
+        }
+    }
+
     // ── R5 default-direction locks ──────────────────────────────────────
     //
     // These keys moved from hand-written `toml::Value` walks onto the typed
@@ -2252,10 +2294,12 @@ mod tests {
             assert_eq!(runtime_default_timeout(Some(provider), TimeoutPolicy::default()), 1800);
             assert_eq!(effective_agent_timeout_secs(&dir), 1800, "{provider}");
         }
+        // RM-181 (v1.84.0): one default for every engine (non-Claude used 300).
         for provider in RuntimeType::ALL.iter().filter(|p| **p != RuntimeType::Claude) {
             write_agent_toml(&dir, &format!("[runtime]\nprovider='{}'\n", provider.as_str()));
-            assert_eq!(call_timeout_secs(Some(&dir)), 300, "{provider:?}");
-            assert_eq!(effective_agent_timeout_secs(&dir), 300, "{provider:?}");
+            assert_eq!(call_timeout_secs(Some(&dir)), 1800, "{provider:?}");
+            assert_eq!(effective_agent_timeout_secs(&dir), 1800, "{provider:?}");
+            assert_eq!(runtime_default_timeout(Some(provider.as_str()), TimeoutPolicy::default()), 1800, "{provider:?}");
         }
         write_agent_toml(&dir, "[runtime]\nprovider='claude'\ntimeout_secs=900\n");
         assert_eq!(claude_timeout_secs(home.path(), Some(&dir)), 900);
@@ -2309,11 +2353,11 @@ mod tests {
             std::fs::write(home.path().join("config.toml"), bad).unwrap();
             write_agent_toml(&dir, "[runtime]\nprovider='claude'\n");
             assert_eq!(claude_timeout_secs(home.path(), Some(&dir)), 1800, "{bad}");
-            assert_eq!(call_timeout_secs(Some(&dir)), 300, "{bad}");
+            assert_eq!(call_timeout_secs(Some(&dir)), 1800, "{bad}");
             for provider in RuntimeType::ALL.iter().filter(|p| **p != RuntimeType::Claude) {
                 write_agent_toml(&dir, &format!("[runtime]\nprovider='{}'\n", provider.as_str()));
-                assert_eq!(effective_agent_timeout_secs(&dir), 300, "{bad}: {provider:?}");
-                assert_eq!(call_timeout_secs(Some(&dir)), 300, "{bad}: {provider:?}");
+                assert_eq!(effective_agent_timeout_secs(&dir), 1800, "{bad}: {provider:?}");
+                assert_eq!(call_timeout_secs(Some(&dir)), 1800, "{bad}: {provider:?}");
             }
             write_agent_toml(&dir, "[runtime]\ntimeout_secs=20000\n");
             assert_eq!(claude_timeout_secs(home.path(), Some(&dir)), 3600);

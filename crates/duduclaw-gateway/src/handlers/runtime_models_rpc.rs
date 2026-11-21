@@ -82,6 +82,10 @@ impl MethodHandler {
         );
         flags.insert("runtimes".to_string(), Value::Array(rows));
 
+        // RM-181: what this page shows as installed is what dispatch uses —
+        // the next dispatch re-probes instead of a registry built earlier.
+        crate::runtime_dispatch::invalidate_all_registries().await;
+
         WsFrame::ok_response("", Value::Object(flags))
     }
 

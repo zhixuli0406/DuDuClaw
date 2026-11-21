@@ -754,10 +754,12 @@ fn pl0_grok_refuses_global_mcp_sources_and_honors_home_override() {
     for (user, override_path) in [(home.path(), Some("relative-config")), (Path::new("relative-home"), None)] {
         let error = refuse_global_sources(user, override_path).unwrap_err();
         assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error));
+        assert!(duduclaw_agent::mcp_spawn_gate::is_engine_local_spawn_gate_error(&error));
     }
     let raw = "[mcp_servers.remote]\nurl='https://example.invalid/mcp'\n";
     std::fs::write(home.path().join(".grok/config.toml"), raw).unwrap();
-    assert!(refuse_global_sources(home.path(), None).is_err());
+    let global = refuse_global_sources(home.path(), None).unwrap_err();
+    assert!(duduclaw_agent::mcp_spawn_gate::is_engine_local_spawn_gate_error(&global));
     assert!(refuse_global_sources(home.path(), alt.path().to_str()).is_ok());
     std::fs::write(alt.path().join("config.toml"), raw).unwrap();
     assert!(refuse_global_sources(home.path(), alt.path().to_str()).is_err());

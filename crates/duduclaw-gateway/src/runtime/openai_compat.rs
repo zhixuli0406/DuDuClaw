@@ -154,6 +154,23 @@ fn transport_error(phase: &str, error: reqwest::Error) -> String {
     }
 }
 
+/// RM-181 (v1.84.0): a completion request that reaches the employee's run
+/// time limit (`completion_request`'s per-request timeout) is a result of the
+/// work itself, reported as the same typed work result the Codex path
+/// produces — same notice, no re-run on the fallback engine. A connect
+/// timeout is a network failure and keeps the untyped text. Reverting this
+/// one function to `transport_error(phase, error)` restores v1.83.0.
+fn completion_transport_error(phase: &str, error: reqwest::Error, context: &RuntimeContext, partial: &str) -> String {
+    if error.is_timeout() && !error.is_connect() {
+        return crate::work_outcome::WorkOutcome::TimeoutTotal {
+            seconds: crate::runtime_config::call_timeout_secs(context.agent_dir.as_deref()),
+            partial: partial.to_string(),
+        }
+        .encode();
+    }
+    transport_error(phase, error)
+}
+
 // ── AgentRuntime impl ───────────────────────────────────────────
 
 #[async_trait]
@@ -310,14 +327,14 @@ impl OpenAiCompatRuntime {
             .json(&body)
             .send()
             .await
-            .map_err(|e| transport_error("HTTP request", e))?;
+            .map_err(|e| completion_transport_error("HTTP request", e, context, ""))?;
 
         drop(admission);
         let status = response.status();
         let response_text = response
             .text()
             .await
-            .map_err(|e| transport_error("HTTP response body", e))?;
+            .map_err(|e| completion_transport_error("HTTP response body", e, context, ""))?;
 
         if !status.is_success() {
             if let Ok(err) = serde_json::from_str::<ApiErrorResponse>(&response_text) {
@@ -1042,12 +1059,12 @@ impl OpenAiCompatRuntime {
             .json(&body)
             .send()
             .await
-            .map_err(|e| transport_error("SSE request", e))?;
+            .map_err(|e| completion_transport_error("SSE request", e, context, ""))?;
 
         drop(admission);
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.map_err(|e| transport_error("SSE error body", e))?;
+            let body = response.text().await.map_err(|e| completion_transport_error("SSE error body", e, context, ""))?;
             return Err(format!(
                 "SSE error ({status}): {}",
                 body.chars().take(300).collect::<String>()
@@ -1094,7 +1111,7 @@ impl OpenAiCompatRuntime {
             let chunk = match chunk {
                 Ok(chunk) => chunk,
                 Err(_) if idle.is_terminal() => break,
-                Err(error) => return Err(transport_error("SSE stream", error)),
+                Err(error) => return Err(completion_transport_error("SSE stream", error, context, &content)),
             };
             buf.extend_from_slice(chunk.as_ref());
 
@@ -1338,7 +1355,7 @@ mod tests {
     #[tokio::test]
     async fn real_transport_timeouts_keep_timeout_classification() {
         use tokio::io::AsyncWriteExt;
-        for body_started in [false, true] {
+        for (body_started, typed) in [(false, false), (true, false), (false, true), (true, true)] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let server = tokio::spawn(async move {
@@ -1357,7 +1374,14 @@ mod tests {
             };
             server.abort();
             assert!(error.is_timeout());
-            assert!(transport_error("HTTP fixture", error).contains("timed out"));
+            if typed {
+                // RM-181 (v1.84.0): the request limit is the run limit — a typed work result.
+                let error = completion_transport_error("HTTP fixture", error, &tool_ctx("", "test"), "部分");
+                assert!(matches!(crate::work_outcome::WorkOutcome::decode(&error),
+                    Some(crate::work_outcome::WorkOutcome::TimeoutTotal { ref partial, .. }) if partial == "部分"), "{error}");
+            } else {
+                assert!(transport_error("HTTP fixture", error).contains("timed out"));
+            }
         }
     }
 
@@ -1366,7 +1390,8 @@ mod tests {
         let mut context = tool_ctx("", "test-model");
         let request = completion_request("https://example.invalid/v1/chat/completions", &context)
             .build().unwrap();
-        assert_eq!(request.timeout().copied(), Some(std::time::Duration::from_secs(300)));
+        // RM-181 (v1.84.0): the one run-limit default every engine shares.
+        assert_eq!(request.timeout().copied(), Some(std::time::Duration::from_secs(crate::runtime_config::DEFAULT_RUN_TIMEOUT_SECS)));
         let agent = tempfile::tempdir().unwrap();
         std::fs::write(agent.path().join("agent.toml"), "[runtime]\ntimeout_secs = 900\n").unwrap();
         context.agent_dir = Some(agent.path().to_path_buf());

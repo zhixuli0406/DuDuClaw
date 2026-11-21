@@ -547,6 +547,10 @@ pub async fn start_install(
         let update_required = crate::runtime::codex::required_update(spec.id, detected, version.as_deref());
         let (final_status, reason) = terminal_outcome(status, detected, update_required, version.as_deref());
         drop(claim);
+        // RM-181: dispatch must see the new runtime without a restart.
+        if final_status == "succeeded" {
+            crate::runtime_dispatch::invalidate_all_registries().await;
+        }
 
         audit(
             &home_dir,

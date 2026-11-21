@@ -447,7 +447,9 @@ pub fn parse_anthropic_models_response(json: &serde_json::Value) -> Vec<RuntimeM
 /// shows an "e.g." subset (haiku is routinely omitted), so parsing alone
 /// under-reports; `haiku` verified live 2026-07-11 (`claude -p … --model haiku`
 /// → ok). Any alias parsed from help gets the full set supplemented.
-const CLAUDE_MODEL_ALIASES: [&str; 4] = ["fable", "opus", "sonnet", "haiku"];
+/// One list with the family resolver (`runtime_for_model`), which assigns
+/// exactly these bare names to the Claude family.
+const CLAUDE_MODEL_ALIASES: [&str; 4] = duduclaw_core::runtime_catalog::CLAUDE_CLI_MODEL_ALIASES;
 
 /// Extract the `--model` aliases from `claude --help`. The help text lists a few
 /// aliases (e.g. `'fable'`, `'opus'`, `'sonnet'`) and an example full name

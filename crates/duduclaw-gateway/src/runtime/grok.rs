@@ -684,7 +684,7 @@ impl AgentRuntime for GrokRuntime {
             crate::process_group::output_for_model(
             &mut cmd, None, deadline.saturating_duration_since(tokio::time::Instant::now()),
         )).await.map_err(|e| match e {
-            crate::process_group::OutputError::Timeout => format!("Grok CLI hard timeout after {timeout_secs}s"),
+            crate::process_group::OutputError::Timeout => grok_hard_timeout(timeout_secs),
             crate::process_group::OutputError::Io(e) => crate::process_group::backend_error(e, "Failed to run grok"),
         })?;
 
@@ -778,7 +778,7 @@ impl AgentRuntime for GrokRuntime {
                         pty_retry = false,
                         "grok PTY retry still returned empty output"
                     ),
-                    Err(e) if e.starts_with("Grok CLI hard timeout after ") => return Err(e),
+                    Err(e) if is_grok_hard_timeout(&e) => return Err(e),
                     Err(e) => warn!(
                         runtime = "grok",
                         agent = %context.agent_id,
@@ -1010,7 +1010,7 @@ impl GrokRuntime {
         // The PTY adapter admits at native spawn and releases at handoff.
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return Err(format!("Grok CLI hard timeout after {timeout_secs}s"));
+            return Err(grok_hard_timeout(timeout_secs));
         }
         let out = duduclaw_core::execution_gate::with_runtime(
             duduclaw_core::execution_gate::RuntimeKind::Grok,
@@ -1038,11 +1038,24 @@ impl GrokRuntime {
 fn grok_pty_error(error: duduclaw_cli_runtime::PtyError, timeout_secs: u64) -> String {
     match error {
         duduclaw_cli_runtime::PtyError::ReadTimeout(_)
-        | duduclaw_cli_runtime::PtyError::WriteTimeout(_) => {
-            format!("Grok CLI hard timeout after {timeout_secs}s")
-        }
+        | duduclaw_cli_runtime::PtyError::WriteTimeout(_) => grok_hard_timeout(timeout_secs),
         error => format!("grok PTY retry invoke failed: {error}"),
     }
+}
+
+/// RM-181 (v1.84.0): reaching the run's time limit is a result of the work
+/// itself, so Grok reports it as the same typed work result the Codex path
+/// produces — the same notice for the person, and no re-run on the fallback
+/// engine. Reverting this one function to the v1.83.0 string
+/// (`format!("Grok CLI hard timeout after {timeout_secs}s")`) restores the
+/// old behaviour; [`is_grok_hard_timeout`] accepts both forms.
+fn grok_hard_timeout(timeout_secs: u64) -> String {
+    crate::work_outcome::WorkOutcome::TimeoutTotal { seconds: timeout_secs, partial: String::new() }.encode()
+}
+
+fn is_grok_hard_timeout(error: &str) -> bool {
+    matches!(crate::work_outcome::WorkOutcome::decode(error), Some(crate::work_outcome::WorkOutcome::TimeoutTotal { .. }))
+        || error.starts_with("Grok CLI hard timeout after ")
 }
 
 /// Clean a PTY one-shot's raw stdout into a user-safe answer.
@@ -1299,8 +1312,13 @@ mod tests {
         let error = super::grok_pty_error(
             duduclaw_cli_runtime::PtyError::ReadTimeout(std::time::Duration::from_secs(600)), 600,
         );
-        assert_eq!(error, "Grok CLI hard timeout after 600s");
+        // RM-181 (v1.84.0): the same typed work result as the Codex path.
+        assert_eq!(crate::work_outcome::WorkOutcome::decode(&error),
+            Some(crate::work_outcome::WorkOutcome::TimeoutTotal { seconds: 600, partial: String::new() }));
         assert_eq!(crate::channel_reply::classify_cli_failure(&error), crate::channel_reply::FailureReason::TimeoutTotal);
+        assert!(super::is_grok_hard_timeout(&error));
+        assert!(super::is_grok_hard_timeout("Grok CLI hard timeout after 600s"), "the v1.83.0 form still stops the retry");
+        assert!(!super::is_grok_hard_timeout("grok PTY retry invoke failed: x"));
     }
 
     use super::*;

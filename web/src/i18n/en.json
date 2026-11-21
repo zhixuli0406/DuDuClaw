@@ -16,7 +16,7 @@
   "settings.limits.runtime": "Single-run time limits",
   "settings.limits.runtime.help": "Defaults apply to employees without a time limit. Raising the ceiling allows longer runs to use more quota.",
   "settings.limits.default_timeout_secs": "Default run limit (seconds)",
-  "settings.limits.default_timeout_secs.help": "Optional: 30 seconds up to the ceiling. Leave blank for Claude: 1800 seconds; other runtimes: 300 seconds.",
+  "settings.limits.default_timeout_secs.help": "Optional: 30 seconds up to the ceiling. Leave blank for 1800 seconds on every runtime (never above the ceiling).",
   "settings.limits.max_timeout_secs": "Run limit ceiling (seconds)",
   "settings.limits.max_timeout_secs.help": "60–14400 seconds; default 3600. Employee values above this ceiling are clamped during execution and rejected on save.",
   "settings.limits.goal_defaults": "Assignment schedule limits",

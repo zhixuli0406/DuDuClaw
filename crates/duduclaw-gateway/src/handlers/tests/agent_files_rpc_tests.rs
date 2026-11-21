@@ -288,15 +288,21 @@ async fn runtime_timeout_non_claude_owner_may_clear_only_without_widening() {
     assert_eq!(crate::runtime_config::TimeoutPolicy::load(&f.home).default_secs, None);
     let update = |seconds: Value| json!({"agent_id": "a1", "runtime": {"timeout_secs": seconds}});
     ok(&f.call("agents.update", update(json!(450)), &f.admin).await);
-    ok(&f.call("agents.update", update(Value::Null), &f.owner_a).await);
-    assert_eq!(crate::runtime_config::effective_agent_timeout_secs(path.parent().unwrap()), 300);
+    // RM-181 (v1.84.0): every engine shares the 1800 s default, so clearing
+    // 450 is a raise for Codex too (it used to fall back to 300).
+    let before = std::fs::read(&path).unwrap();
+    let e = err(&f.call("agents.update", update(Value::Null), &f.owner_a).await);
+    assert!(e.contains("runtime.timeout_secs"), "{e}");
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    ok(&f.call("agents.update", update(Value::Null), &f.admin).await);
+    assert_eq!(crate::runtime_config::effective_agent_timeout_secs(path.parent().unwrap()), 1800);
     ok(&f.call("agents.update", update(json!(200)), &f.admin).await);
     let before = std::fs::read(&path).unwrap();
     let e = err(&f.call("agents.update", update(Value::Null), &f.owner_a).await);
     assert!(e.contains("runtime.timeout_secs"), "{e}");
     assert_eq!(std::fs::read(&path).unwrap(), before);
     ok(&f.call("agents.update", update(Value::Null), &f.admin).await);
-    assert_eq!(crate::runtime_config::effective_agent_timeout_secs(path.parent().unwrap()), 300);
+    assert_eq!(crate::runtime_config::effective_agent_timeout_secs(path.parent().unwrap()), 1800);
 }
 
 #[tokio::test]

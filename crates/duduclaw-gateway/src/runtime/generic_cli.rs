@@ -145,8 +145,20 @@ impl std::fmt::Display for GenericCliError {
 
 impl From<GenericCliError> for String {
     fn from(e: GenericCliError) -> Self {
-        e.to_string()
+        match e {
+            GenericCliError::Timeout { secs, .. } => generic_cli_run_limit_reached(secs),
+            e => e.to_string(),
+        }
     }
+}
+
+/// RM-181 (v1.84.0): reaching the run's time limit is a result of the work
+/// itself, reported as the same typed work result the Codex path produces
+/// (same notice, no re-run on the fallback engine). Reverting this one
+/// function to `e.to_string()` (the Display text "… CLI hard timeout after
+/// Ns") restores the v1.83.0 behaviour.
+fn generic_cli_run_limit_reached(secs: u64) -> String {
+    crate::work_outcome::WorkOutcome::TimeoutTotal { seconds: secs, partial: String::new() }.encode()
 }
 
 /// Vendor-neutral "you are not signed in" fingerprints.
@@ -1080,6 +1092,12 @@ mod tests {
         .to_string()
         .to_lowercase();
         assert!(to.contains("hard timeout"), "{to}");
+        // RM-181 (v1.84.0): what the runtime returns is the typed work result.
+        let returned = String::from(GenericCliError::Timeout { runtime: "kimi", secs: 300 });
+        assert_eq!(crate::work_outcome::WorkOutcome::decode(&returned),
+            Some(crate::work_outcome::WorkOutcome::TimeoutTotal { seconds: 300, partial: String::new() }));
+        assert_eq!(crate::channel_reply::classify_cli_failure(&returned),
+            crate::channel_reply::FailureReason::TimeoutTotal);
 
         let empty = GenericCliError::EmptyOutput {
             runtime: "kimi",

@@ -1107,7 +1107,10 @@ fn resolve_role(
         (Some(rt), Some(model)) => {
             let lower = model.to_ascii_lowercase();
             let bare = lower.rsplit('/').next().unwrap_or(&lower).to_string();
-            let serves = rt.model_prefixes.iter().any(|p| bare.starts_with(*p));
+            // The family resolver also owns exact aliases (the bare Claude CLI
+            // names), which no prefix expresses.
+            let serves = rt.model_prefixes.iter().any(|p| bare.starts_with(*p))
+                || crate::runtime_catalog::runtime_for_model(model).is_some_and(|s| s.id == rt.id);
             if !serves {
                 return Err(TeamConfigError::ModelRuntimeMismatch {
                     role,
