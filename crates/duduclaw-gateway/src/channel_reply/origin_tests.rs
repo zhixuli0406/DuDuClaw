@@ -529,3 +529,38 @@ async fn malformed_agent_toml_is_refused_with_a_specific_code_and_no_model_call(
     assert_eq!(reply, crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE);
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn missing_openai_compat_model_is_refused_with_a_specific_code_and_no_model_call() {
+    let model_calls_before = crate::model_call_probe::calls();
+    let (home, ctx, _registry, calls) = owned_channel(RuntimeType::OpenAiCompat).await;
+    // The loaded employee remains in the registry after its preferred model is lost.
+    let path = home.path().join("agents/worker/agent.toml");
+    let original = std::fs::read_to_string(&path).unwrap();
+    let broken = original.replace("preferred='gpt-5.4'\n", "");
+    assert_ne!(broken, original, "fixture must remove the configured model");
+    std::fs::write(&path, &broken).unwrap();
+    assert_eq!(
+        crate::runtime_config::load_runtime_settings_strict(path.parent().unwrap()),
+        Err(crate::runtime_config::RuntimeSettingsError::MissingModel),
+    );
+    let spy = super::reply_origin::testing::NoImplicitCloud::at(home.path());
+    let sid = "discord:missing-model";
+    let reply = build_reply_for_agent("普通訊息", &ctx, "worker", sid, "owned-user", None).await;
+    assert!(reply.contains("agent_config_unreadable"), "{reply}");
+    assert!(reply.contains("無法讀取這位員工的設定"), "{reply}");
+    assert!(!reply.contains("agent.toml"), "no path in the user text: {reply}");
+    assert!(!reply.contains(&home.path().display().to_string()), "{reply}");
+    assert!(!reply.contains("missing_model"), "{reply}");
+    assert!(!reply.contains("preferred"), "{reply}");
+    assert!(!reply.contains("MissingModel"), "{reply}");
+    assert!(!reply.contains("model_provider_mismatch"), "{reply}");
+    assert_eq!(spy.counts(), [0, 0]);
+    assert_refused_before_any_side_effect(&ctx, sid, &calls, model_calls_before).await;
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), broken, "reading never repairs the file");
+    // A public visitor never sees configuration.
+    let visitor = crate::odoo_livechat::session_key("owned", 43);
+    let reply = build_reply_for_agent("hello", &ctx, "worker", &visitor, "owned-visitor", None).await;
+    assert_eq!(reply, crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}

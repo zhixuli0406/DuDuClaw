@@ -644,6 +644,8 @@ pub enum RuntimeSettingsError {
     Malformed,
     /// `[runtime] provider` names no known runtime.
     UnknownProvider,
+    /// No non-blank preferred model and the runtime has no catalog default.
+    MissingModel,
 }
 
 impl RuntimeSettingsError {
@@ -653,37 +655,34 @@ impl RuntimeSettingsError {
             Self::Unreadable => "unreadable",
             Self::Malformed => "malformed",
             Self::UnknownProvider => "unknown_provider",
+            Self::MissingModel => "missing_model",
         }
     }
 }
 
 /// Default `[model] preferred` for `provider` when the file does not set one.
 ///
-/// The registry has no default (its `[model] preferred` is required), so this
-/// is the same default the non-strict reply path produces: Claude runs with
-/// [`duduclaw_core::types::DEFAULT_PREFERRED_MODEL`]; another engine runs with
-/// its catalog default (the model `failover`'s `catalog_default` and
-/// `alignment::bare_claude_alias_substitute` use), falling back to the
-/// Claude default for a familyless engine, which the alignment gate then checks.
-pub fn default_preferred_model(provider: RuntimeType) -> String {
-    if provider != RuntimeType::Claude {
-        if let Some((id, _label)) = provider.spec().fallback_models.first() {
-            return (*id).to_string();
-        }
+/// Claude uses [`duduclaw_core::types::DEFAULT_PREFERRED_MODEL`]; other engines
+/// use their first catalog `fallback_models` entry. Engines without a catalog
+/// default return `None` and require an explicitly configured preferred model.
+pub fn default_preferred_model(provider: RuntimeType) -> Option<String> {
+    if provider == RuntimeType::Claude {
+        return Some(duduclaw_core::types::DEFAULT_PREFERRED_MODEL.to_string());
     }
-    duduclaw_core::types::DEFAULT_PREFERRED_MODEL.to_string()
+    provider.spec().fallback_models.first().map(|(id, _label)| (*id).to_string())
 }
 
 impl RuntimeSettings {
-    /// `[model] preferred` from this same parse, or the provider default when
-    /// the file does not set it (never a value from another snapshot).
-    pub fn preferred_or_default(&self) -> String {
+    /// `[model] preferred` from this same parse, or the provider's own default.
+    /// A runtime without either reports an error, never another engine's model.
+    pub fn preferred_or_default(&self) -> Result<String, RuntimeSettingsError> {
         self.preferred_model
             .as_deref()
             .map(str::trim)
             .filter(|model| !model.is_empty())
             .map(str::to_string)
-            .unwrap_or_else(|| default_preferred_model(self.provider))
+            .or_else(|| default_preferred_model(self.provider))
+            .ok_or(RuntimeSettingsError::MissingModel)
     }
 }
 
@@ -691,7 +690,8 @@ impl RuntimeSettings {
 /// same single read of the same file (the preset-resolved artifact when there
 /// is one, else `agent.toml`) and the same typed parse, but a missing,
 /// unreadable or malformed file, a wrongly typed selector, or an unknown
-/// `[runtime] provider` is reported instead of becoming Claude defaults.
+/// `[runtime] provider` is reported instead of becoming Claude defaults. A
+/// missing preferred model also fails if the runtime has no catalog default.
 /// Callers take provider AND model from the one returned value.
 pub fn load_runtime_settings_strict(agent_dir: &Path) -> Result<RuntimeSettings, RuntimeSettingsError> {
     // Select the effective artifact before reading. An existing but unreadable
@@ -750,7 +750,10 @@ pub fn load_runtime_settings_strict(agent_dir: &Path) -> Result<RuntimeSettings,
             ));
         }
     }
-    Ok(settings_from_sections(agent_dir, sections))
+    let settings = settings_from_sections(agent_dir, sections);
+    settings.preferred_or_default()
+        .map_err(|error| log(error, "[model] preferred is required for this runtime"))?;
+    Ok(settings)
 }
 
 fn settings_from_sections(agent_dir: &Path, s: AgentTomlSections) -> RuntimeSettings {
@@ -2134,7 +2137,7 @@ mod tests {
         let settings = load_runtime_settings_strict(dir.path()).unwrap();
         assert_eq!(settings, load_runtime_settings(dir.path()));
         assert_eq!(settings.provider, RuntimeType::Codex);
-        assert_eq!(settings.preferred_or_default(), "gpt-5.6-sol");
+        assert_eq!(settings.preferred_or_default().unwrap(), "gpt-5.6-sol");
 
         // No `[model] preferred` is not an error: the provider's own default.
         for (provider, runtime) in [("codex", RuntimeType::Codex), ("grok", RuntimeType::Grok), ("claude", RuntimeType::Claude)] {
@@ -2144,15 +2147,52 @@ mod tests {
             assert_eq!(settings.preferred_model, None);
             assert_eq!(settings, load_runtime_settings(dir.path()));
             assert_eq!(settings.preferred_or_default(), load_runtime_settings(dir.path()).preferred_or_default());
-            assert!(ensure_model_provider(&settings.preferred_or_default(), runtime).is_ok(), "{provider}");
+            assert!(ensure_model_provider(&settings.preferred_or_default().unwrap(), runtime).is_ok(), "{provider}");
         }
-        assert_eq!(default_preferred_model(RuntimeType::Claude), duduclaw_core::types::DEFAULT_PREFERRED_MODEL);
+        assert_eq!(default_preferred_model(RuntimeType::Claude).unwrap(), duduclaw_core::types::DEFAULT_PREFERRED_MODEL);
 
         // No `[runtime]` at all: the documented Claude provider, not an error.
         write_agent_toml(dir.path(), "[model]\npreferred = '  '\n");
         let settings = load_runtime_settings_strict(dir.path()).unwrap();
         assert_eq!(settings.provider, RuntimeType::Claude);
-        assert_eq!(settings.preferred_or_default(), duduclaw_core::types::DEFAULT_PREFERRED_MODEL);
+        assert_eq!(settings.preferred_or_default().unwrap(), duduclaw_core::types::DEFAULT_PREFERRED_MODEL);
+    }
+
+    #[test]
+    fn strict_runtime_settings_require_a_model_without_a_catalog_default() {
+        let dir = TempDir::new().unwrap();
+        for provider in ["openai_compat", "kiro"] {
+            let runtime = RuntimeType::parse(provider).unwrap();
+            assert_eq!(default_preferred_model(runtime), None);
+            write_agent_toml(dir.path(), &format!("[runtime]\nprovider='{provider}'\n[model]\npreferred='custom-model'\n"));
+            let settings = load_runtime_settings_strict(dir.path()).unwrap();
+            assert_eq!(settings.provider, runtime);
+            assert_eq!(settings.preferred_or_default(), Ok("custom-model".to_string()));
+            for model in ["", "[model]\npreferred=''\n", "[model]\npreferred='  '\n"] {
+                write_agent_toml(dir.path(), &format!("[runtime]\nprovider='{provider}'\n{model}"));
+                assert_eq!(load_runtime_settings_strict(dir.path()), Err(RuntimeSettingsError::MissingModel));
+                // Even callers of the unchanged lenient loader cannot invent a Claude model.
+                let settings = load_runtime_settings(dir.path());
+                assert_eq!(settings.provider, runtime);
+                assert_eq!(settings.preferred_or_default(), Err(RuntimeSettingsError::MissingModel));
+            }
+        }
+        assert_eq!(RuntimeSettingsError::MissingModel.as_str(), "missing_model");
+    }
+
+    #[test]
+    fn strict_runtime_settings_use_only_the_providers_own_default() {
+        let dir = TempDir::new().unwrap();
+        for (provider, expected) in [
+            (RuntimeType::Codex, RuntimeType::Codex.spec().fallback_models[0].0),
+            (RuntimeType::Claude, duduclaw_core::types::DEFAULT_PREFERRED_MODEL),
+        ] {
+            for model in ["", "[model]\npreferred='  '\n"] {
+                write_agent_toml(dir.path(), &format!("[runtime]\nprovider='{}'\n{model}", provider.as_str()));
+                let settings = load_runtime_settings_strict(dir.path()).unwrap();
+                assert_eq!(settings.preferred_or_default(), Ok(expected.to_string()));
+            }
+        }
     }
 
     #[test]
@@ -2166,7 +2206,7 @@ mod tests {
         std::fs::write(&resolved, "[runtime]\nprovider='grok'\n[model]\npreferred='grok-4'\n").unwrap();
         let settings = load_runtime_settings_strict(&dir).unwrap();
         assert_eq!(settings.provider, RuntimeType::Grok);
-        assert_eq!(settings.preferred_or_default(), "grok-4");
+        assert_eq!(settings.preferred_or_default().unwrap(), "grok-4");
         std::fs::write(&resolved, "[runtime").unwrap();
         assert_eq!(load_runtime_settings_strict(&dir), Err(RuntimeSettingsError::Malformed));
         std::fs::write(&resolved, [0xff]).unwrap();
