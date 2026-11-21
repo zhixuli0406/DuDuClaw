@@ -63,7 +63,7 @@ fn no_responder_requester_is_internal(home: &Path, session_id: &str, user_id: &s
 
 /// The fixed no-responder notices (both wordings, every language). Nothing
 /// else may take the target-less live-only delivery path (other fixed
-/// notices use `live_only_notice`, bound to their exact text).
+/// notices use `live_only_notice`, bound to their exact final text).
 pub(crate) fn is_no_responder_notice(text: &str) -> bool {
     text == NO_RESPONDER_TEXT
         || ["zh-TW", "zh-CN", "en", "ja"]
@@ -71,10 +71,13 @@ pub(crate) fn is_no_responder_notice(text: &str) -> bool {
             .any(|language| text == no_responder_public_text(Some(language)))
 }
 
-/// RM-191: a fixed reply returned before this turn ensured its session. On a
-/// brand-new WebChat conversation it is delivered live, without creating the
-/// session or storing a row (`mark_live_only_notice`); in an existing one it
-/// is stored as before. Blank text (deliberate silence) is left unmarked.
+/// RM-191: a fixed reply returned before this turn ensured its session
+/// (`mark_live_only_notice`). The guarded builders still run it through the
+/// whole output pipeline (CONTRACT.toml, channel sanitising, language; only
+/// secret restore is skipped) and bind the FINAL text: on a brand-new WebChat
+/// conversation that text is delivered live, without creating the session or
+/// storing a row; in an existing one it is stored as before. Blank text
+/// (deliberate silence) is left unmarked.
 fn live_only_notice(text: String) -> String {
     super::mark_live_only_notice(&text);
     text
