@@ -643,3 +643,19 @@ mod tests {
         assert!(ProfileSections::load(dir.path()).is_err());
     }
 }
+
+/// Resolve memory overrides, then reply language (explicit reply `auto` stays unpinned).
+pub fn resolve_memory_language_setting(employee: Option<&str>, global: Option<&str>, reply: Option<&str>, default: Option<&str>) -> Option<String> {
+    let fixed = |value: Option<&str>| value.map(str::trim)
+        .filter(|v| *v != "auto" && is_valid_reply_language(v)).map(str::to_string);
+    fixed(employee).or_else(|| fixed(global)).or_else(|| resolve_reply_language_setting(reply, default))
+}
+
+/// Raw TOML counterpart shared by operator commands and the gateway.
+pub fn resolve_memory_language_tables(employee: Option<&toml::Table>, global: Option<&toml::Table>) -> Option<String> {
+    fn get<'a>(table: Option<&'a toml::Table>, section: &str, key: &str) -> Option<&'a str> {
+        table.and_then(|t| t.get(section)?.get(key)?.as_str())
+    }
+    resolve_memory_language_setting(get(employee, "memory", "language"), get(global, "memory", "language"),
+        get(employee, "prompt", "reply_language"), get(global, "general", "default_language"))
+}

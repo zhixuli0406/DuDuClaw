@@ -285,6 +285,14 @@ describe('new controls round-trip from inspect to payload', () => {
     expect(lastPayload()).toEqual({ fork: { enabled: false } });
   });
 
+  it('prefills the saved memory language from inspect', async () => {
+    mockWsClient.call.mockResolvedValue({ ...FULL, memory: { ...FULL.memory, language: 'ja-JP' } });
+    renderAt('/agents/my-bot/edit');
+    const language = await screen.findByRole('combobox', { name: 'Memory language' });
+    await waitFor(() => expect(language).toHaveTextContent(en['settings.general.defaultLanguage.ja-JP']));
+    expect(updateAgent).not.toHaveBeenCalled();
+  });
+
   it('prefills memory + night engine and sends the edited memory key only', async () => {
     const user = userEvent.setup();
     renderAt('/agents/my-bot/edit?tab=automation');

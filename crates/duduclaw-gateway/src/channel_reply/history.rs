@@ -160,9 +160,7 @@ async fn compress_history_with_budget(
                     crate::prompt_compression::prepare_bisect_summary(&owned, cost_pressure)
                 {
                     let generated = if pending.has_unprotected_text {
-                        let prompt = crate::session_summarizer::format_summarization_prompt(
-                            &pending.transcript,
-                        );
+                        let prompt = bisect_summary_prompt(&home, agent_id, &pending.transcript).await;
                         crate::runtime_dispatch::run_utility_prompt(
                             &home,
                             Some(&agent_dir),
@@ -457,5 +455,25 @@ mod pending_frame_tests {
         let with_pending = crate::pending_items::with_reminder(actual, Some(PENDING_HISTORY_EXCEPTION.into()));
         assert!(with_pending.starts_with(expected));
         assert!(with_pending.ends_with(PENDING_HISTORY_EXCEPTION));
+    }
+}
+
+async fn bisect_summary_prompt(home: &std::path::Path, agent_id: &str, transcript: &str) -> String {
+    let language = crate::prompt_identity::resolve_memory_language_for_id(home, agent_id).await;
+    crate::session_summarizer::format_summarization_prompt_with_language(transcript, language.as_deref())
+}
+
+#[cfg(test)]
+mod bisect_language_tests {
+    use super::*;
+    #[tokio::test]
+    async fn bisect_prompt_uses_resolved_employee_memory_language() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("agents/a")).unwrap();
+        std::fs::write(home.path().join("config.toml"), "[memory]\nlanguage = 'en'").unwrap();
+        std::fs::write(home.path().join("agents/a/agent.toml"), "[memory]\nlanguage = 'ja-JP'").unwrap();
+        let prompt = bisect_summary_prompt(home.path(), "a", "user: discussion").await;
+        assert!(prompt.contains(duduclaw_core::profile_sections::memory_language_instruction("ja-JP")));
+        assert!(!prompt.contains(duduclaw_core::profile_sections::memory_language_instruction("en")));
     }
 }

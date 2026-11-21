@@ -32,13 +32,19 @@ const ATTRIBUTING_TOOLS: &[&str] = &["memory_store", "memory_alias_add", "user_p
 #[derive(Subcommand, Debug)]
 pub enum MemoryCommands {
     /// Convert Simplified memory text to Traditional with a character-level map (no model).
-    /// Ambiguous characters are left unchanged. Changed embeddings are cleared and need rebuilding.
-    #[command(group(ArgGroup::new("script_selector").required(true).args(["agent", "all"])))]
+    /// Ambiguous characters are left unchanged. Matching local embeddings are rebuilt.
+    #[command(group(ArgGroup::new("script_selector").required(true).args(["agent", "all", "restore"])))]
     ConvertScript {
         /// Only this agent's rows in memory.db
         #[arg(long)]
         agent: Option<String>,
-        /// All namespaces present in memory.db
+        /// Restore a previous conversion (checks for intervening edits)
+        #[arg(long, conflicts_with_all = ["dry_run", "yes", "force_language_mismatch"])]
+        restore: Option<PathBuf>,
+        /// Permit explicit --agent conversion despite zh-CN or Japanese language
+        #[arg(long, requires = "agent")]
+        force_language_mismatch: bool,
+        /// All namespaces resolving to Traditional Chinese
         #[arg(long)]
         all: bool,
         /// Print counts and up to ten before/after samples without changing rows
@@ -151,39 +157,8 @@ fn agent_session_refusal(id: &str, token: &str) -> Option<String> {
 pub async fn run(home: &Path, cmd: MemoryCommands) -> Result<()> {
     let command = match cmd {
         MemoryCommands::MigrateNamespace { command } => command,
-        MemoryCommands::ConvertScript { agent, all, dry_run, yes } => {
-            if !crate::ai_session_guard::markers().is_empty() {
-                return Err(DuDuClawError::Agent("memory convert-script cannot run inside an AI employee session; use an operator terminal.".into()));
-            }
-            let db = home.join("memory.db");
-            if !db.is_file() {
-                return Err(DuDuClawError::Memory("memory.db does not exist".into()));
-            }
-            let engine = SqliteMemoryEngine::new(&db)?;
-            let agents = if all { engine.script_conversion_agents().await? }
-                else { vec![agent.ok_or_else(|| DuDuClawError::Memory("--agent or --all is required".into()))?] };
-            let preview = dry_run || !yes;
-            let mut sample_budget = 10usize;
-            for id in agents {
-                let report = engine.convert_memory_script(&id, preview).await?;
-                println!("{id}: key_facts={}, memories={}, changed={}, embeddings_cleared={} ({})",
-                    report.key_facts, report.memories, report.changed, report.embeddings_cleared,
-                    if preview { "dry-run" } else { "applied" });
-                if !preview {
-                    duduclaw_security::audit::append_audit_event(home,
-                        &duduclaw_security::audit::AuditEvent::new(
-                            "memory_script_converted", &id, duduclaw_security::audit::Severity::Info,
-                            serde_json::json!({"key_facts": report.key_facts, "memories": report.memories,
-                                "changed": report.changed, "embeddings_cleared": report.embeddings_cleared}),
-                        ));
-                }
-                for (table, before, after) in report.samples.into_iter().take(sample_budget) {
-                    sample_budget -= 1;
-                    println!("[{table}] before: {before}\nafter: {after}");
-                }
-            }
-            println!("Character-level conversion; ambiguous characters are unchanged. Changed embeddings are cleared and require rebuilding by the configured embedding provider. Apply with --yes.");
-            return Ok(());
+        MemoryCommands::ConvertScript { agent, all, dry_run, yes, restore, force_language_mismatch } => {
+            return convert_script(home, agent, all, dry_run || !yes, restore, force_language_mismatch).await;
         }
         MemoryCommands::ForgetSource { command } => {
             // Refuses AI sessions itself (and audits the refusal).
@@ -760,3 +735,109 @@ pub async fn archive(home: &Path, dry_run: bool) -> Result<String> {
 
 #[cfg(test)]
 mod tests;
+
+fn script_language_policy(all: bool, employee_exists: bool, language: Option<&str>, force: bool) -> std::result::Result<(), String> {
+    if all && !employee_exists { return Err("no employee directory; use explicit --agent".into()); }
+    if all && language != Some("zh-TW") {
+        return Err(format!("resolved memory language: {}", language.unwrap_or("unresolved")));
+    }
+    if !all && !force && matches!(language, Some("zh-CN" | "zh_CN" | "ja" | "ja-JP" | "ja_JP")) {
+        return Err(format!("resolved memory language is {}; use --force-language-mismatch to override", language.unwrap_or_default()));
+    }
+    Ok(())
+}
+
+async fn conversion_config(path: &Path) -> Result<Option<toml::Table>> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(text) => text.parse().map(Some).map_err(|e| DuDuClawError::Memory(format!("{}: {e}", path.display()))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(DuDuClawError::Memory(format!("{}: {e}", path.display()))),
+    }
+}
+
+fn conversion_backup_path(home: &Path, agent: &str) -> Result<PathBuf> {
+    let dir = home.join("backups");
+    #[cfg(unix)] {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder.create(&dir).map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(&dir).map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+    // Namespace ids can contain slashes; filenames must not.
+    let safe: String = agent.bytes().map(|b| if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' { (b as char).to_string() } else { format!("_{b:02x}") }).collect();
+    Ok(dir.join(format!("memory-convert-script-{}-{safe}.jsonl", chrono::Utc::now().format("%Y%m%dT%H%M%S%.9fZ"))))
+}
+
+async fn convert_script(home: &Path, agent: Option<String>, all: bool, preview: bool,
+    restore: Option<PathBuf>, force: bool) -> Result<()> {
+    let markers = crate::ai_session_guard::command_markers();
+    if !markers.is_empty() {
+        duduclaw_security::audit::append_audit_event(home,
+            &duduclaw_security::audit::AuditEvent::new("memory_script_conversion_refused", "", duduclaw_security::audit::Severity::Warning,
+                serde_json::json!({"reason": "AI employee session", "markers": markers})));
+        return Err(DuDuClawError::Agent("memory convert-script cannot run inside an AI employee session; use an operator terminal.".into()));
+    }
+    let db = home.join("memory.db");
+    if !db.is_file() { return Err(DuDuClawError::Memory("memory.db does not exist".into())); }
+    let engine = SqliteMemoryEngine::new(&db)?
+        .with_embedder(std::sync::Arc::new(duduclaw_memory::NgramHashEmbedder::new()));
+    if let Some(path) = restore {
+        let report = engine.restore_memory_script(&path).await?;
+        println!("Restored {} rows; embeddings_cleared={}", report.changed, report.embeddings_cleared);
+        duduclaw_security::audit::append_audit_event(home,
+            &duduclaw_security::audit::AuditEvent::new("memory_script_restored", "", duduclaw_security::audit::Severity::Info,
+                serde_json::json!({"file": path, "changed": report.changed})));
+        if report.embeddings_cleared > 0 { println!("Rows with cleared embeddings do not participate in similarity checks until re-embedded."); }
+        return Ok(());
+    }
+    let agents = if all { engine.script_conversion_agents().await? }
+        else { vec![agent.ok_or_else(|| DuDuClawError::Memory("--agent, --all or --restore is required".into()))?] };
+    let global = conversion_config(&home.join("config.toml")).await;
+    let mut failed = false;
+    let mut sample_budget = 10usize;
+    for id in agents {
+        let result = async {
+            let global = global.as_ref().map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+            let safe = !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+            let dir = home.join("agents").join(&id);
+            let exists = safe && dir.is_dir();
+            if all && !exists {
+                println!("{id}: skipped (no employee directory; use explicit --agent)");
+                return Ok(());
+            }
+            let employee = if exists { conversion_config(&dir.join("agent.toml")).await? } else { None };
+            let language = duduclaw_core::profile_sections::resolve_memory_language_tables(employee.as_ref(), global.as_ref());
+            if let Err(reason) = script_language_policy(all, exists, language.as_deref(), force) {
+                if all { println!("{id}: skipped ({reason})"); return Ok(()); }
+                return Err(DuDuClawError::Memory(reason));
+            }
+            let backup = if preview { PathBuf::new() } else { conversion_backup_path(home, &id)? };
+            let report = engine.convert_memory_script_with_backup(&id, preview, &backup).await?;
+            println!("{id}: {} key_facts={}, memories={}, changed={}, skipped_japanese={}, embeddings_cleared={}",
+                if preview { "preview" } else { "converted" }, report.key_facts, report.memories, report.changed, report.skipped_japanese, report.embeddings_cleared);
+            if !preview {
+                println!("Restore file: {}", backup.display());
+                duduclaw_security::audit::append_audit_event(home,
+                    &duduclaw_security::audit::AuditEvent::new("memory_script_converted", &id, duduclaw_security::audit::Severity::Info,
+                        serde_json::json!({"changed": report.changed, "embeddings_cleared": report.embeddings_cleared, "restore_file": backup})));
+            }
+            if report.embeddings_cleared > 0 { println!("Rows with cleared embeddings do not participate in similarity checks until re-embedded."); }
+            for (table, before, after) in report.samples.into_iter().take(sample_budget) {
+                sample_budget -= 1;
+                println!("[{table}] before: {before}\nafter: {after}");
+            }
+            Ok::<(), DuDuClawError>(())
+        }.await;
+        if let Err(error) = result {
+            println!("{id}: failed ({error})");
+            failed = true;
+        }
+    }
+    println!("Character-level prose conversion; ambiguous characters, URLs and code are preserved.");
+    if preview { println!("Apply with --yes."); }
+    if failed { Err(DuDuClawError::Memory("one or more namespaces failed".into())) } else { Ok(()) }
+}

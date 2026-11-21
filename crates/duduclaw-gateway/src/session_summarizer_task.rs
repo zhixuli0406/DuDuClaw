@@ -183,10 +183,10 @@ async fn summarize_one(
         return Err(SummaryFailure::EmptyInput);
     }
 
-    let agent_id = session_manager.session_agent(session_id).await
-        .map_err(|_| SummaryFailure::ReadState)?;
-    let memory_language = crate::prompt_identity::resolve_memory_language_for_id(home_dir, agent_id.as_deref().unwrap_or("")).await;
     let summary = if has_unprotected_text {
+        let agent_id = session_manager.session_agent(session_id).await
+            .map_err(|_| SummaryFailure::ReadState)?;
+        let memory_language = crate::prompt_identity::resolve_memory_language_for_id(home_dir, agent_id.as_deref().unwrap_or("")).await;
         let prompt = crate::session_summarizer::format_summarization_prompt_with_language(&transcript, memory_language.as_deref());
         let agent_dir = crate::runtime_config::session_agent_dir(home_dir, agent_id.as_deref())
             .map_err(|_| SummaryFailure::ReadState)?;
@@ -201,12 +201,12 @@ async fn summarize_one(
             crate::runtime_dispatch::UTILITY_MAX_TOKENS,
         )
         .await
+        .map(|summary| crate::prompt_identity::align_memory_script(&summary, memory_language.as_deref(), &transcript))
         .map_err(|_| SummaryFailure::Utility)?
     } else {
         String::new()
     };
 
-    let summary = crate::prompt_identity::align_memory_script(&summary, memory_language.as_deref(), &transcript);
     let trimmed = if has_unprotected_text {
         crate::session_summarizer::validate_summary_output(&summary)?
     } else { "" };
@@ -604,6 +604,23 @@ mod tests {
         assert_eq!(through, 2);
         assert!(summary.contains(&format!("## 約束\n{m}\n- keep exact")));
         assert!(summary.contains(&format!("## 受眾\n{m}\n- only operator")));
+    }
+
+    #[tokio::test]
+    async fn protected_only_summary_does_not_read_unreadable_session_agent() {
+        let (sm, home) = make_session_manager();
+        let sid = "protected-unreadable-owner";
+        sm.get_or_create(sid, "test-agent").await.unwrap();
+        let text = format!("## 約束\n{}\n- keep 用户 verbatim", marker());
+        for _ in 0..5 { sm.append_message(sid, "user", &text, 1).await.unwrap(); }
+        let conn = rusqlite::Connection::open(home.path().join("sessions.db")).unwrap();
+        conn.execute("UPDATE sessions SET agent_id = X'80' WHERE id = ?1", [sid]).unwrap();
+        drop(conn);
+        assert!(sm.session_agent(sid).await.is_err(), "fixture must fail the owner read");
+        assert!(summarize_one(&sm, home.path(), sid, 2, 1).await.unwrap().is_some());
+        let (summary, through) = sm.get_summary(sid).await.unwrap();
+        assert_eq!(through, 2);
+        assert!(summary.contains("keep 用户 verbatim"));
     }
 
     /// W2-E regression (review finding 4, third leg). A user message whose
