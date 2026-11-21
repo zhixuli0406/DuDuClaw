@@ -266,7 +266,14 @@ impl FailoverManager {
             self.record_failure(fb).await;
             failure.push(Fallback,*fb,None,Outcome::NoCompatibleModel);return Err(failure);
         };
-        if let Err(error)=crate::product_policy::require_model(policy,&fb_model) {
+        // F5: a `catalog_default` model is one DuDuClaw substituted, attributed
+        // to the fallback runtime's vendor; any other source keeps the v1.83.0 rule.
+        let fb_model_policy=if model_source=="catalog_default" {
+            crate::product_policy::require_substituted_catalog_model(policy,*fb,&fb_model)
+        } else {
+            crate::product_policy::require_model(policy,&fb_model)
+        };
+        if let Err(error)=fb_model_policy {
             failure.push(Fallback,*fb,Some(&fb_model),Outcome::PolicyRefused(error));return Err(failure);
         }
         let family_known=crate::runtime_config::model_family(&context.model).is_some();

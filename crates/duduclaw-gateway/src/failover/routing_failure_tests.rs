@@ -122,14 +122,16 @@ async fn explicit_two_leg_failure_keeps_each_origin_model_and_original_error() {
     assert!(error.to_string().contains("first-source"));
     assert!(error.to_string().contains("second-source"));
 }
-/// RM-181 (v1.84.0): an authentication failure of the PRIMARY engine is a
-/// reason to try the configured fallback engine (it used to stop as a 4xx).
-/// The primary's auth failure stays attributed to the primary leg.
+/// RM-181 (v1.84.0): an authentication failure of the PRIMARY engine that a
+/// DuDuClaw-written prefix identifies (here `API error (401 …)`) is a reason
+/// to try the configured fallback engine. The primary's auth failure stays
+/// attributed to the primary leg. Untyped text such as `401 invalid bearer
+/// token` keeps the v1.83.0 outcome and stops (F2, see the next test).
 #[tokio::test]
 async fn primary_auth_error_uses_the_explicit_fallback_and_stays_attributed_to_the_primary() {
     let home = tempfile::tempdir().unwrap();
     let (reg, a, b) = registry(
-        Err("401 invalid bearer token; misleading claude /login"),
+        Err("API error (401 Unauthorized): invalid bearer token"),
         Err("500 fallback also down"),
     );
     let error = FailoverManager::new(60)
@@ -147,9 +149,33 @@ async fn primary_auth_error_uses_the_explicit_fallback_and_stays_attributed_to_t
     assert_eq!(b.load(Ordering::SeqCst), 1);
     assert_eq!(error.steps.len(), 2);
     assert_eq!(error.steps[0].runtime, RuntimeType::Codex);
-    assert!(matches!(&error.steps[0].outcome, RuntimeStepOutcome::ExecutionError(e) if e.starts_with("401 invalid bearer token")));
+    assert!(matches!(&error.steps[0].outcome, RuntimeStepOutcome::ExecutionError(e) if e.starts_with("API error (401 Unauthorized)")));
     assert_eq!(error.steps[1].runtime, RuntimeType::Claude);
     assert!(error.fallback_skipped.is_none());
+}
+/// F2 (v1.84 security re-review): untyped authentication text that is not
+/// DuDuClaw-formatted gets the v1.83.0 outcome — no fallback leg runs.
+#[tokio::test]
+async fn untyped_auth_text_keeps_the_v183_no_fallback_outcome() {
+    let home = tempfile::tempdir().unwrap();
+    let (reg, a, b) = registry(
+        Err("401 invalid bearer token; misleading claude /login"),
+        Err("500 fallback also down"),
+    );
+    let error = FailoverManager::new(60)
+        .execute_with_failover_detailed(
+            &reg,
+            &RuntimeType::Codex,
+            Some(&RuntimeType::Claude),
+            "hi",
+            &ctx(home.path()),
+            &[],
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(a.load(Ordering::SeqCst), 1);
+    assert_eq!(b.load(Ordering::SeqCst), 0);
+    assert_eq!(error.fallback_skipped.map(|s| s.reason), Some(FallbackRefusal::UntypedAuthFailure));
 }
 #[tokio::test]
 async fn unavailable_and_refused_fallbacks_keep_primary_and_report_real_skip() {

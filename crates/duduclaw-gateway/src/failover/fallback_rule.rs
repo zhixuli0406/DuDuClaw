@@ -20,9 +20,16 @@
 //!    format are recognised (`API error (<status> …`, `<Engine> CLI exited
 //!    with `, `Empty response from `, …) — the text after that prefix, which
 //!    may carry model or provider output, is never read;
-//! 3. a string neither typed nor DuDuClaw-formatted keeps its v1.83.0 outcome
-//!    (content policy, billing hard limit and the 4xx substrings refuse;
-//!    anything else falls back, reported as [`FallbackTrigger::Unclassified`]).
+//! 3. a string neither typed nor DuDuClaw-formatted keeps exactly its v1.83.0
+//!    outcome (the whole `is_non_retryable` list refuses — content policy,
+//!    billing hard limit, the 4xx substrings AND the authentication
+//!    substrings; anything else falls back, reported as
+//!    [`FallbackTrigger::Unclassified`]).
+//!
+//! Design rule (v1.84 security re-review F2): an authentication failure
+//! falls back ONLY when a typed [`FailureKind`] or an anchored,
+//! DuDuClaw-written prefix identifies it. Untyped text that merely mentions
+//! `401 ` or `invalid_api_key` is refused, as in v1.83.0.
 //!
 //! The fallback leg always runs its own full gates: `execute_with_failover`
 //! re-checks product policy and the budget for the fallback runtime and model,
@@ -103,6 +110,11 @@ pub enum FallbackRefusal {
     /// A 4xx request rejection that names no model and no credential — the
     /// v1.83.0 rule for these strings, kept.
     RequestRejected,
+    /// Untyped, not DuDuClaw-formatted text that matches one of the v1.83.0
+    /// authentication substrings (`401 `, `403 `, `invalid_api_key`, …).
+    /// v1.83.0 did not fall back on these; only a typed kind or an anchored
+    /// DuDuClaw prefix makes an authentication failure eligible.
+    UntypedAuthFailure,
     /// The conversation's required context is too large for the primary AND
     /// the fallback engine (both pass the prompt as one command-line argument).
     PromptTooLarge,
@@ -122,6 +134,7 @@ impl FallbackRefusal {
             Self::ContentPolicy => "content_policy",
             Self::BillingHardLimit => "billing_hard_limit",
             Self::RequestRejected => "request_rejected",
+            Self::UntypedAuthFailure => "untyped_auth_failure",
             Self::PromptTooLarge => "prompt_too_large",
         }
     }
@@ -140,6 +153,7 @@ impl FallbackRefusal {
             Self::ContentPolicy => "這次的內容被服務的內容政策拒絕，不會換引擎重跑",
             Self::BillingHardLimit => "原選引擎的帳務已達硬性上限，依規則不會換引擎重跑",
             Self::RequestRejected => "原選引擎拒絕了這次的請求內容，換引擎重送通常也會被拒，所以沒有改用",
+            Self::UntypedAuthFailure => "原選引擎回報了看起來像登入或憑證的錯誤，但無法確認來源，依規則不會換引擎重跑；請先檢查原選引擎的登入狀態",
             Self::PromptTooLarge => "這段對話必要的內容超過備援引擎一次能送出的大小，換引擎也送不出去，所以沒有改用",
         }
     }
@@ -326,9 +340,11 @@ fn engine_label_before(error: &str, marker: &str) -> bool {
     })
 }
 
-/// 3. A string no runtime typed and DuDuClaw did not format keeps the v1.83.0
-/// outcome: its `is_non_retryable` text rule (content policy, billing hard
-/// limit and the 4xx substrings refuse; anything else falls back).
+/// 3. A string no runtime typed and DuDuClaw did not format keeps exactly the
+/// v1.83.0 outcome: its `is_non_retryable` text rule (content policy, billing
+/// hard limit, the 4xx substrings and the authentication substrings refuse;
+/// anything else falls back). Pinned against a copy of the v1.83.0 predicate
+/// by `tests::legacy_branch_matches_the_v183_predicate`.
 fn untyped_v183_outcome(error: &str) -> FallbackDecision {
     use FallbackDecision::{Eligible, Refused};
     let lower = error.to_lowercase();
@@ -336,11 +352,20 @@ fn untyped_v183_outcome(error: &str) -> FallbackDecision {
         Refused(FallbackRefusal::ContentPolicy)
     } else if lower.contains("billing_hard_limit") {
         Refused(FallbackRefusal::BillingHardLimit)
+    } else if legacy_auth_rejected(&lower) {
+        Refused(FallbackRefusal::UntypedAuthFailure)
     } else if legacy_request_rejected(&lower) {
         Refused(FallbackRefusal::RequestRejected)
     } else {
         Eligible(FallbackTrigger::Unclassified)
     }
+}
+
+/// The v1.83.0 `is_non_retryable` authentication substrings, kept verbatim
+/// (lower-cased `contains`) for strings no rule types (F2).
+fn legacy_auth_rejected(lower: &str) -> bool {
+    lower.contains("401 ") || lower.contains("403 ") || lower.contains("invalid_api_key")
+        || lower.contains("401 unauthorized") || lower.contains("403 forbidden")
 }
 
 /// The v1.83.0 `is_non_retryable` 4xx substrings, kept verbatim for strings
@@ -406,9 +431,12 @@ mod tests {
             ("SSE error (502 Bad Gateway): upstream", Eligible(FallbackTrigger::ServerOrRateLimit)),
             ("API error (429 Too Many Requests): billing_hard_limit_reached", Eligible(FallbackTrigger::ServerOrRateLimit)),
             ("Anthropic API error (401 Unauthorized): x", Eligible(FallbackTrigger::AuthFailure)),
+            // F2: untyped, not DuDuClaw-formatted authentication text keeps the
+            // v1.83.0 outcome — it does NOT fall back.
+            ("401 invalid bearer token; misleading claude /login", Refused(FallbackRefusal::UntypedAuthFailure)),
+            ("invalid_api_key: Incorrect API key provided", Refused(FallbackRefusal::UntypedAuthFailure)),
+            ("Error: 403 Forbidden", Refused(FallbackRefusal::UntypedAuthFailure)),
             // Untyped and not DuDuClaw-formatted: the v1.83.0 outcome (falls back).
-            ("401 invalid bearer token; misleading claude /login", Eligible(FallbackTrigger::Unclassified)),
-            ("invalid_api_key: Incorrect API key provided", Eligible(FallbackTrigger::Unclassified)),
             ("codex: your login expired, please sign in again", Eligible(FallbackTrigger::Unclassified)),
             ("error: model_not_found", Eligible(FallbackTrigger::Unclassified)),
             ("500 internal server error", Eligible(FallbackTrigger::Unclassified)),
@@ -476,6 +504,71 @@ mod tests {
         assert_eq!(err("the model said Codex CLI exited with 1 and 400 bad"), Refused(FallbackRefusal::RequestRejected));
     }
 
+    /// Reference oracle: the v1.83.0 `failover::is_non_retryable` text rule
+    /// (lower-cased `contains` on every listed substring), copied here so the
+    /// legacy branch can never drift from it again (F2).
+    fn v183_is_non_retryable(error: &str) -> bool {
+        let lower = error.to_lowercase();
+        lower.contains("400 ")
+            || lower.contains("401 ")
+            || lower.contains("403 ")
+            || lower.contains("404 ")
+            || lower.contains("422 ")
+            || lower.contains("invalid_api_key")
+            || lower.contains("401 unauthorized")
+            || lower.contains("403 forbidden")
+            || lower.contains("400 bad request")
+            || lower.contains("content_policy_violation")
+            || lower.contains("content policy violation")
+            || lower.contains("billing_hard_limit")
+    }
+
+    /// F2: every representative v1.83.0 error string gets exactly the v1.83.0
+    /// outcome from the legacy branch — directly, and through the full rule
+    /// (none of these strings is typed or carries a DuDuClaw prefix).
+    #[test]
+    fn legacy_branch_matches_the_v183_predicate() {
+        let strings = [
+            "401 invalid bearer token; misleading claude /login",
+            "Error: 401 Unauthorized",
+            "HTTP 401 unauthorized: token expired",
+            "403 forbidden: organization disabled",
+            "request failed with status 403 access denied",
+            "invalid_api_key: Incorrect API key provided",
+            "INVALID_API_KEY",
+            "{\"error\":{\"code\":\"invalid_api_key\"}}",
+            "400 bad request: invalid JSON",
+            "status 404 not found",
+            "422 unprocessable entity",
+            "content_policy_violation",
+            "Content policy violation detected",
+            "billing_hard_limit_reached",
+            "500 internal server error",
+            "502 bad gateway",
+            "429 rate limited",
+            "connection refused",
+            "connection timed out",
+            "codex: your login expired, please sign in again",
+            "authentication_error: please log in",
+            "Unauthorized",
+            "error 401",
+            "request id 14012 failed",
+            "token 4013 expired",
+            "error: model_not_found",
+            "",
+        ];
+        for error in strings {
+            let legacy = untyped_v183_outcome(error);
+            assert_eq!(matches!(legacy, Refused(_)), v183_is_non_retryable(error), "legacy branch: {error:?}");
+            assert_eq!(err(error), legacy, "full rule reaches the legacy branch: {error:?}");
+        }
+        // A typed kind or an anchored DuDuClaw prefix is what makes an
+        // authentication failure eligible.
+        assert_eq!(typed("401 invalid bearer token", FailureKind::Auth), Eligible(FallbackTrigger::AuthFailure));
+        assert_eq!(err("API error (401 Unauthorized): invalid bearer token"), Eligible(FallbackTrigger::AuthFailure));
+        assert_eq!(err("Grok CLI authentication failure (not logged in): x"), Eligible(FallbackTrigger::AuthFailure));
+    }
+
     /// RM-204: a prompt that does not fit one argument falls back only to an
     /// engine without that limit.
     #[test]
@@ -541,7 +634,7 @@ mod tests {
             FallbackRefusal::WorkLimit(WorkLimitKind::MaxTurns), FallbackRefusal::WorkLimit(WorkLimitKind::TimeoutTotal),
             FallbackRefusal::WorkLimit(WorkLimitKind::TimeoutNoProgress), FallbackRefusal::EmployeeToolConfig,
             FallbackRefusal::EngineLocalConfig, FallbackRefusal::ContentPolicy, FallbackRefusal::BillingHardLimit,
-            FallbackRefusal::RequestRejected, FallbackRefusal::PromptTooLarge,
+            FallbackRefusal::RequestRejected, FallbackRefusal::UntypedAuthFailure, FallbackRefusal::PromptTooLarge,
         ] {
             let text = refusal.zh_tw();
             assert!(!text.is_empty() && !text.contains(".json") && !text.contains("mcp"), "{refusal:?}");
