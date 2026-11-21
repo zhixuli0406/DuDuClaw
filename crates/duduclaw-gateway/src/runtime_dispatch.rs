@@ -372,6 +372,14 @@ async fn run_agent_prompt_inner(
     let model: &str = &runnable_model;
     crate::runtime_config::ensure_model_provider(model, provider).map_err(|error|RuntimeDispatchFailure::preflight(Some(provider),model,RuntimePreflightKind::Config,error))?;
     crate::product_policy::require_runtime(req.home_dir, provider.as_str()).map_err(|error|RuntimeDispatchFailure::preflight(Some(provider),model,RuntimePreflightKind::Policy,error))?;
+    // F5: only a catalog default DuDuClaw substituted is attributed to its
+    // runtime's vendor; every other model keeps the v1.83.0 selector rule
+    // (checked again by the failover manager for the model it runs).
+    if matches!(runnable_model, std::borrow::Cow::Owned(_)) {
+        crate::product_policy::load(req.home_dir)
+            .and_then(|policy| crate::product_policy::require_substituted_catalog_model(policy, provider, model))
+            .map_err(|error|RuntimeDispatchFailure::preflight(Some(provider),model,RuntimePreflightKind::Policy,error))?;
+    }
     if in_utility_call() && !crate::runtime_config::utility_profile_supported(provider) {
         return Err(RuntimeDispatchFailure::preflight(Some(provider), model,
             RuntimePreflightKind::Config, crate::runtime_config::utility_profile_refusal(provider)));
@@ -1011,9 +1019,17 @@ pub async fn run_utility_prompt_with_hint(
     )?;
     // v1.84.0: same bare-Claude-alias substitution as the conversational
     // preflight, so the isolated and the in-process lane agree.
-    spec.model = crate::runtime_config::runnable_model(agent_id, &spec.model, spec.provider).into_owned();
+    let runnable = crate::runtime_config::runnable_model(agent_id, &spec.model, spec.provider);
+    let substituted = matches!(runnable, std::borrow::Cow::Owned(_));
+    spec.model = runnable.into_owned();
     crate::product_policy::require_runtime(home_dir, spec.provider.as_str())?;
-    crate::product_policy::require_model(crate::product_policy::load(home_dir)?, &spec.model)?;
+    // F5: vendor attribution only for the catalog default substituted above.
+    let policy = crate::product_policy::load(home_dir)?;
+    if substituted {
+        crate::product_policy::require_substituted_catalog_model(policy, spec.provider, &spec.model)?;
+    } else {
+        crate::product_policy::require_model(policy, &spec.model)?;
+    }
     #[cfg(test)]
     if utility_policy_tests::DENY_EXECUTION.try_with(|_| ()).is_ok() {
         return Err("test forbids utility execution".into());

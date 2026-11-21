@@ -98,6 +98,12 @@ fn channel_configured(value: &toml::Value) -> bool {
     }
 }
 
+/// The model selector rule exactly as in v1.83.0: the provider the pricing
+/// table lists for the model and the explicit `provider/` qualifier. The
+/// model NAME is never attributed to a vendor (v1.84 security re-review F5):
+/// a self-hosted OpenAI-compatible endpoint serving `custom/gpt-internal` or
+/// `o3x-foo` is decided by its runtime and configured provider, which the
+/// callers check separately (`require_runtime` / `require_provider`).
 pub fn require_model(policy: ProductProfile, model: &str) -> Result<(), String> {
     let rest = model.trim().strip_prefix("compat:").unwrap_or(model.trim());
     if let Some(info) = crate::cost_telemetry::model_registry().get(rest) {
@@ -107,20 +113,37 @@ pub fn require_model(policy: ProductProfile, model: &str) -> Result<(), String> 
     if let Some(id) = provider {
         policy.require_provider(id)?;
     }
-    // A model the pricing table does not list (a newer catalog default such
-    // as the Codex or Grok fallback model substituted for a bare Claude
-    // alias) is still attributed to its vendor by its catalog family, so a
-    // substitution can never step around a provider block.
-    if let Some(vendor) = family_provider(rest) {
+    Ok(())
+}
+
+/// [`require_model`] for a model DuDuClaw itself substituted from the
+/// runtime catalog — a bare Claude alias on another engine replaced by that
+/// engine's catalog default, or the failover leg's `catalog_default` model —
+/// and only there (F5). When the model is one of `runtime`'s own catalog
+/// entries and no explicit `provider/` qualifier says otherwise, it is
+/// attributed to the vendor of the catalog entry's runtime, so a substitution
+/// can never step around a provider block. The model name is not parsed.
+pub fn require_substituted_catalog_model(
+    policy: ProductProfile,
+    runtime: duduclaw_core::types::RuntimeType,
+    model: &str,
+) -> Result<(), String> {
+    require_model(policy, model)?;
+    let rest = model.trim().strip_prefix("compat:").unwrap_or(model.trim());
+    if duduclaw_llm::split_model_id(rest).0.is_some() {
+        return Ok(());
+    }
+    let catalog_entry = runtime.spec().fallback_models.iter().any(|(id, _label)| *id == rest);
+    if let Some(vendor) = catalog_entry.then(|| runtime_vendor(runtime)).flatten() {
         policy.require_provider(vendor)?;
     }
     Ok(())
 }
 
-/// The provider id (as the pricing table names it) of a model's confidently
-/// recognised catalog family; `None` for anything else.
-fn family_provider(model: &str) -> Option<&'static str> {
-    match crate::runtime_config::model_family(model)? {
+/// The provider id (as the pricing table names it) of the vendor whose models
+/// a catalog runtime's own entries are; `None` for multi-vendor runtimes.
+fn runtime_vendor(runtime: duduclaw_core::types::RuntimeType) -> Option<&'static str> {
+    match runtime.as_str() {
         "claude" => Some("anthropic"),
         "codex" => Some("openai"),
         "grok" => Some("xai"),
@@ -201,18 +224,41 @@ mod tests {
         )
         .is_ok());
     }
-    /// A catalog default the pricing table does not list is still attributed
-    /// to its vendor (the restricted test policy blocks provider `openai`).
+    /// F5: a catalog default DuDuClaw substituted is attributed to the vendor
+    /// of the catalog entry's runtime (the restricted test policy blocks
+    /// provider `openai`); the same name as an ordinary selector keeps the
+    /// v1.83.0 rule.
     #[test]
-    fn unlisted_catalog_default_is_attributed_to_its_vendor() {
-        let codex_default = duduclaw_core::types::RuntimeType::Codex.spec().fallback_models[0].0;
+    fn substituted_catalog_default_is_attributed_to_its_runtime_vendor() {
+        use duduclaw_core::types::RuntimeType;
+        let codex_default = RuntimeType::Codex.spec().fallback_models[0].0;
         assert!(crate::cost_telemetry::model_registry().get(codex_default).is_none(), "fixture: not in the pricing table");
-        assert_eq!(family_provider(codex_default), Some("openai"));
-        assert!(require_model(ProductProfile::Restricted, codex_default).is_err());
-        assert!(require_model(ProductProfile::Standard, codex_default).is_ok());
-        let grok_default = duduclaw_core::types::RuntimeType::Grok.spec().fallback_models[0].0;
-        assert!(require_model(ProductProfile::Restricted, grok_default).is_ok(), "xai is not blocked by the test policy");
-        assert_eq!(family_provider("house-model-v1"), None);
+        assert!(require_substituted_catalog_model(ProductProfile::Restricted, RuntimeType::Codex, codex_default).is_err());
+        assert!(require_substituted_catalog_model(ProductProfile::Standard, RuntimeType::Codex, codex_default).is_ok());
+        let grok_default = RuntimeType::Grok.spec().fallback_models[0].0;
+        assert!(require_substituted_catalog_model(ProductProfile::Restricted, RuntimeType::Grok, grok_default).is_ok(),
+            "xai is not blocked by the test policy");
+        // Not one of that runtime's catalog entries: no attribution.
+        assert!(require_substituted_catalog_model(ProductProfile::Restricted, RuntimeType::Codex, "house-model-v1").is_ok());
+        // An explicit provider qualifier decides on its own.
+        assert!(require_substituted_catalog_model(ProductProfile::Restricted, RuntimeType::Grok, "openai/x").is_err());
+        // The plain selector rule is v1.83.0's: the name alone attributes nothing.
+        assert!(require_model(ProductProfile::Restricted, codex_default).is_ok());
+    }
+
+    /// F5: an OpenAI-compatible endpoint's model names are not attributed to
+    /// a vendor by their prefix — allowed on a restricted install as in
+    /// v1.83.0 (the runtime and configured provider are checked separately).
+    #[test]
+    fn compatible_endpoint_model_names_are_not_attributed_by_prefix() {
+        let policy = ProductProfile::Restricted;
+        assert!(policy.require_runtime("openai_compat").is_ok(), "fixture: the compatible runtime is allowed");
+        for model in ["custom/gpt-internal", "o3x-foo", "codex-custom", "grok-internal", "compat:custom/gpt-internal"] {
+            assert!(require_model(policy, model).is_ok(), "{model}");
+            assert!(require_substituted_catalog_model(policy, duduclaw_core::types::RuntimeType::OpenAiCompat, model).is_ok(), "{model}");
+        }
+        // An explicit blocked provider is still refused.
+        assert!(require_model(policy, "openai/gpt-internal").is_err());
     }
     #[test]
     fn malformed_installation_never_returns_unrestricted_policy() {
