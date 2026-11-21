@@ -288,6 +288,7 @@ mod guarded;
 mod history;
 mod health;
 mod inner;
+mod input_guard_gate;
 pub mod interim;
 mod progress;
 mod prompt_build;

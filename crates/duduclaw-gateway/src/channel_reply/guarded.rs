@@ -332,6 +332,15 @@ async fn build_guarded_reply_for_agent_inner(
         Box::pin(super::health::finish(&ctx.home_dir, health_outcome, true, &reply)).await;
         return reply;
     };
+    // RM-191: a fixed notice returned before the session existed goes out
+    // as it is (see `build_guarded_reply_with_session_inner`).
+    if delivery.fixed_notice() {
+        let reply = attach_turn_rollback(raw, None, guards, delivery, ctx).await
+            .with_answered_by(answered_by);
+        Box::pin(super::health::finish(&ctx.home_dir, health_outcome, false, &reply)).await;
+        build_rollback.disarm();
+        return reply;
+    }
     let (raw, pending_artifact) = strip_operator_pending_marker(&raw);
     let artifact = pending_artifact.or(operator_result_artifact);
     let raw = crate::cli_noise::strip_cli_noise(&raw).text;
@@ -420,12 +429,14 @@ async fn build_guarded_reply_with_session_inner(
         Box::pin(super::health::finish(&ctx.home_dir, health_outcome, true, &reply)).await;
         return reply;
     };
-    // No employee answered: the fixed notice goes out as it is (no restore,
-    // contract or pending operator notice), live only — WebChat delivers it
-    // without a stored row (`GuardedReply::persist_webchat`).
-    if delivery.no_responder_notice.load(std::sync::atomic::Ordering::SeqCst) {
+    // No employee answered, or the turn stopped with a fixed notice before
+    // its session existed (RM-191): the notice goes out as it is (no
+    // restore, contract or pending operator notice) — WebChat delivers it
+    // without a stored row on a new conversation (`GuardedReply::persist_webchat`).
+    if delivery.fixed_notice() {
         let text = append_product_footer(raw, session_id);
-        let reply = attach_turn_rollback(text, None, guards, delivery, ctx).await;
+        let reply = attach_turn_rollback(text, None, guards, delivery, ctx).await
+            .with_answered_by(answered_by);
         Box::pin(super::health::finish(&ctx.home_dir, health_outcome, false, &reply)).await;
         build_rollback.disarm();
         return reply;

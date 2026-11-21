@@ -62,12 +62,22 @@ fn no_responder_requester_is_internal(home: &Path, session_id: &str, user_id: &s
 }
 
 /// The fixed no-responder notices (both wordings, every language). Nothing
-/// else may take the live-only delivery path.
+/// else may take the target-less live-only delivery path (other fixed
+/// notices use `live_only_notice`, bound to their exact text).
 pub(crate) fn is_no_responder_notice(text: &str) -> bool {
     text == NO_RESPONDER_TEXT
         || ["zh-TW", "zh-CN", "en", "ja"]
             .into_iter()
             .any(|language| text == no_responder_public_text(Some(language)))
+}
+
+/// RM-191: a fixed reply returned before this turn ensured its session. On a
+/// brand-new WebChat conversation it is delivered live, without creating the
+/// session or storing a row (`mark_live_only_notice`); in an existing one it
+/// is stored as before. Blank text (deliberate silence) is left unmarked.
+fn live_only_notice(text: String) -> String {
+    super::mark_live_only_notice(&text);
+    text
 }
 
 /// One warn per channel per window: a public widget can be hit repeatedly.
@@ -814,10 +824,10 @@ async fn build_reply_with_session_inner_impl(
                 super::health::receive(ctx, &agent_id, session_id).await;
                 super::health::mark(&agent_id, Some("gate_refused"));
                 // Halted: reply with canned message
-                return failsafe
+                return live_only_notice(failsafe
                     .canned_reply(effective_level)
                     .unwrap_or("Service paused.")
-                    .to_string();
+                    .to_string());
             }
             FailsafeLevel::L3Muted => {
                 super::health::receive(ctx, &agent_id, session_id).await;
@@ -835,10 +845,10 @@ async fn build_reply_with_session_inner_impl(
                 super::health::receive(ctx, &agent_id, session_id).await;
                 super::health::mark(&agent_id, Some("gate_refused"));
                 // Restricted: return canned reply, don't call AI
-                return failsafe
+                return live_only_notice(failsafe
                     .canned_reply(effective_level)
                     .unwrap_or("Service restricted.")
-                    .to_string();
+                    .to_string());
             }
             FailsafeLevel::L1Degraded => {
                 // Degraded: allow through but could prefer local model
@@ -863,8 +873,10 @@ async fn build_reply_with_session_inner_impl(
                     "silent_by_design: rate_limited_after_wait",
                 );
                 return if notify {
-                    super::breaker_wait::refused_text(crate::trigger_route::texts::lang_for(&ctx.home_dir))
-                        .to_string()
+                    live_only_notice(
+                        super::breaker_wait::refused_text(crate::trigger_route::texts::lang_for(&ctx.home_dir))
+                            .to_string(),
+                    )
                 } else {
                     String::new()
                 };
@@ -927,7 +939,7 @@ async fn build_reply_with_session_inner_impl(
         super::health::receive(ctx, &agent_id, session_id).await;
         super::health::mark(&agent_id, Some("gate_refused"));
 
-        return stop;
+        return live_only_notice(stop);
     }
 
     // ── L2.5: Budget circuit breaker (cost enforcement) ──
@@ -942,19 +954,28 @@ async fn build_reply_with_session_inner_impl(
             super::health::receive(ctx, &agent_id, session_id).await;
             super::health::mark(&agent_id, Some("quota"));
 
-            return refusal.to_string();
+            return live_only_notice(refusal.to_string());
         }
     }
 
     // ── L3: Prompt injection scan (existing) ──
     // P0-2: use the audit-emitting variant so a blocked inbound injection
     // leaves a forensic trail in `security_audit.jsonl` (via
-    // `log_injection_detected`) instead of being dropped silently.
-    let scan = duduclaw_security::input_guard::scan_input_with_audit(
+    // `log_injection_detected_in`, with this conversation, turn and channel)
+    // instead of being dropped silently. RM-191: a verified member in their
+    // own conversation may paste code-call syntax (`super::input_guard_gate`);
+    // every other sender is scanned strictly.
+    let scan = duduclaw_security::input_guard::scan_input_with_audit_in(
         text,
         duduclaw_security::input_guard::DEFAULT_BLOCK_THRESHOLD,
         &ctx.home_dir,
         &agent_id,
+        super::input_guard_gate::inbound_guard_trust_for_turn(session_id, user_id, &agent_id),
+        &duduclaw_security::input_guard::InjectionAuditContext {
+            session_id,
+            turn_id: &turn_id,
+            channel: super::input_guard_gate::audit_channel(session_id),
+        },
     );
     if scan.blocked {
         super::health::receive(ctx, &agent_id, session_id).await;
@@ -965,8 +986,11 @@ async fn build_reply_with_session_inner_impl(
             rules = ?scan.matched_rules,
             "Prompt injection detected — blocking message"
         );
-
-        return format!("⚠️ {}", scan.summary);
+        // A fixed, localized notice (never the blocked text, score or rule
+        // names), delivered live on a brand-new conversation.
+        let language = crate::prompt_identity::resolve_fixed_message_language_for_id(&ctx.home_dir, &agent_id).await;
+        let public = super::assembly::public_session(session_id);
+        return live_only_notice(super::input_guard_gate::blocked_notice(&scan.matched_rules, language.as_deref(), public));
     }
 
     crate::line::attach_credential_holder(&ctx.home_dir, &agent_id).await;
@@ -998,7 +1022,7 @@ async fn build_reply_with_session_inner_impl(
             super::health::receive(ctx, &agent_id, session_id).await;
             super::health::mark(&agent_id, Some("gate_refused"));
 
-            return REDACTION_FAILED_REPLY.to_string();
+            return live_only_notice(REDACTION_FAILED_REPLY.to_string());
         }
     };
     let text: &str = &redacted_user_text;
