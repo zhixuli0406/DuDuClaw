@@ -42,7 +42,7 @@ pub enum MemoryCommands {
         #[arg(long, conflicts_with_all = ["agent", "all", "dry_run", "yes", "force_language_mismatch"])]
         restore: Option<PathBuf>,
         /// Permit explicit --agent conversion despite zh-CN or Japanese language
-        #[arg(long, requires = "agent")]
+        #[arg(long, requires = "agent", conflicts_with = "all")]
         force_language_mismatch: bool,
         /// All namespaces resolving to Traditional Chinese
         #[arg(long)]
