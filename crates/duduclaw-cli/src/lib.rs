@@ -10984,58 +10984,45 @@ fn protected_service_runtime_check(home: &std::path::Path) -> (String, CheckStat
     }
 }
 
-/// Verbose Grok CLI runtime diagnostic for `duduclaw doctor`.
+/// Grok CLI diagnostic for `duduclaw doctor`.
 ///
-/// Reproduces the exact headless path `GrokRuntime` uses and dumps the full
-/// evidence bundle for remotely debugging the "grok interactive works but
-/// `grok -p` returns empty" class (which we cannot reproduce locally — no grok
-/// CLI / SuperGrok account on the dev box): binary path + version, a live
-/// `grok -p "ping"` (15s cap) reporting exit / stdout length / stderr tail, an
-/// auth-signature verdict, and — when the pipe run comes back empty on exit 0 —
-/// a one-shot PTY retry result (the same recovery the runtime applies). Output
-/// is zh-TW. Reuses the runtime's own home/env + auth helpers so the diagnostic
-/// can never drift from what actually runs in production.
+/// Health checks never send a prompt or consume model quota: this runs only
+/// the shared version probe ([`duduclaw_gateway::doctor_probes::grok_probe`],
+/// `grok --version`, the same probe the dashboard `system.doctor` card uses)
+/// and prints the home/env the runtime would stamp. It reports that the CLI is
+/// installed and its version; login and model service are verified by a real
+/// turn, never here. Output is zh-TW.
 async fn grok_cli_diagnostic(home: &std::path::Path) {
+    use duduclaw_gateway::doctor_probes::{GrokProbeOutcome as O, grok_probe};
     use duduclaw_gateway::runtime::grok;
-    use std::process::Stdio;
-    use std::time::Duration;
 
     println!();
     println!("Grok CLI 診斷");
     println!("{}", "-".repeat(40));
 
-    let Some(path) =
-        duduclaw_core::which_grok().or_else(|| duduclaw_core::which_grok_in_home(home))
-    else {
+    let Some(report) = grok_probe(home).await else {
         println!("  [skip] grok CLI 未安裝（PATH 與 HOME 皆找不到），略過此段。");
         return;
     };
-    println!("  binary : {path}");
-
-    let mut version_cmd = duduclaw_core::platform::async_command_for(&path);
-    duduclaw_core::spawn_env::apply_agent_cli_env_allowlist(&mut version_cmd);
-    // Version (5s cap).
-    match tokio::time::timeout(
-        Duration::from_secs(5),
-        version_cmd.arg("--version")
-            .stdin(Stdio::null())
-            .output(),
-    )
-    .await
-    {
-        Ok(Ok(out)) => {
-            let v = String::from_utf8_lossy(&out.stdout);
-            let v = v.trim();
-            println!("  version: {}", if v.is_empty() { "(空)" } else { v });
-        }
-        Ok(Err(e)) => println!("  version: [fail] 無法執行：{e}"),
-        Err(_) => println!("  version: [fail] --version 逾時（5s）"),
+    println!("  binary : {}", report.path);
+    match &report.outcome {
+        O::Ok { .. } => println!(
+            "  version: {}",
+            report.version.as_deref().unwrap_or("(空)")
+        ),
+        O::EmptyExit0 => println!("  version: [warn] grok --version 未回傳版本資訊"),
+        O::Failed { exit, stderr_tail } => println!(
+            "  version: [fail] grok --version 執行失敗（exit={}）。stderr：{}",
+            exit.map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
+            if stderr_tail.is_empty() { "(空)" } else { stderr_tail }
+        ),
+        O::SpawnFailed(e) => println!("  version: [fail] 無法執行：{e}"),
+        O::Timeout => println!("  version: [fail] --version 逾時（5s）"),
     }
 
     // Resolve the SAME home/env the runtime stamps (launchd/Docker HOME fix).
     let user_home = grok::resolve_user_home(home, std::env::var("HOME").ok().as_deref());
     let grok_home_override = std::env::var("GROK_HOME").ok();
-    let home_env = grok::build_home_env(&user_home, grok_home_override.as_deref());
     println!(
         "  HOME   : {} （grok 會在此尋找 ~/.grok 憑證）",
         user_home.display()
@@ -11058,106 +11045,12 @@ async fn grok_cli_diagnostic(home: &std::path::Path) {
         }
     );
 
-    // Live `grok -p "ping"` (15s cap) — the exact headless path DuDuClaw uses.
+    // No live prompt and no PTY retry: a health check never submits a prompt.
     println!();
-    println!("  活體試跑：grok -p \"ping\"（15s 上限）");
-    let args = ["-p".to_string(), "ping".to_string()];
-    let mut cmd = duduclaw_core::platform::async_command_for(&path);
-    duduclaw_core::spawn_env::apply_agent_cli_env_allowlist(&mut cmd);
-    if let Ok(key) = std::env::var("XAI_API_KEY") {
-        cmd.env("XAI_API_KEY", key);
+    if matches!(report.outcome, O::Ok { .. }) {
+        println!("  結果 : [ok] Grok CLI 已安裝（僅檢查版本，未呼叫模型、未驗證登入）。");
     }
-    cmd.args(&args).stdin(Stdio::null());
-    for (k, v) in &home_env {
-        cmd.env(k, v);
-    }
-    let run = tokio::time::timeout(Duration::from_secs(15), cmd.output()).await;
-    let (empty_exit0, is_auth) = match run {
-        Ok(Ok(out)) => {
-            let code = out.status.code().unwrap_or(-1);
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let stdout_len = stdout.trim().chars().count();
-            let stderr_tail = duduclaw_core::truncate_bytes(stderr.trim(), 300);
-            let is_auth = grok::looks_like_grok_auth_failure(&stderr);
-            println!("    exit code   : {code}");
-            println!("    stdout 長度 : {stdout_len} 字元");
-            println!(
-                "    stderr tail : {}",
-                if stderr_tail.is_empty() {
-                    "(空)"
-                } else {
-                    &stderr_tail
-                }
-            );
-            println!(
-                "    auth 判定   : {}",
-                if is_auth {
-                    "偵測到未登入/憑證失效 → 請執行 `grok login --device-auth` 重新登入"
-                } else {
-                    "無 auth 失敗跡象"
-                }
-            );
-            let empty_exit0 = out.status.success() && stdout.trim().is_empty();
-            if !empty_exit0 && out.status.success() && stdout_len > 0 {
-                println!("    結果        : [ok] 一般管道即回傳非空回應，headless 正常。");
-            }
-            (empty_exit0, is_auth)
-        }
-        Ok(Err(e)) => {
-            println!("    [fail] 無法啟動 grok：{e}");
-            (false, false)
-        }
-        Err(_) => {
-            println!("    [fail] grok -p 逾時（15s）— 可能卡在互動流程或憑證提示。");
-            (false, false)
-        }
-    };
-
-    // PTY one-shot retry — only for the empty-stdout / exit-0 / non-auth shape,
-    // matching the runtime's own retry gate.
-    if empty_exit0 && !is_auth {
-        println!();
-        println!("  PTY 一次性重試（真 TTY 下重跑 grok -p \"ping\"，30s 上限）");
-        let mut env: std::collections::HashMap<String, String> =
-            duduclaw_core::spawn_env::agent_cli_spawn_env_pairs().into_iter()
-                .map(|(key, value)| (key.to_string(), value)).collect();
-        env.extend(home_env.iter().cloned());
-        if api_key_set {
-            if let Ok(k) = std::env::var("XAI_API_KEY") {
-                env.insert("XAI_API_KEY".to_string(), k);
-            }
-        }
-        match duduclaw_gateway::pty_runtime::invoke_oneshot(
-            path.clone(),
-            args.to_vec(),
-            env,
-            None,
-            Duration::from_secs(30),
-            // Keep the retry on the same allowlisted base as the pipe probe.
-            true,
-        )
-        .await
-        {
-            Ok(out) => {
-                let text = out.stdout.trim();
-                let len = text.chars().count();
-                if len > 0 {
-                    println!(
-                        "    結果 : [ok] PTY 重試回傳 {len} 字元 → 判定為 headless-under-pipe 問題，PTY 重試路徑可救回。"
-                    );
-                } else {
-                    println!(
-                        "    結果 : [warn] PTY 重試仍為空（{} bytes 原始輸出）→ 非單純 TTY 問題，請附上上方 stderr 回報。",
-                        out.bytes
-                    );
-                }
-            }
-            Err(e) => println!("    結果 : [fail] PTY 重試執行失敗：{e}"),
-        }
-    } else if empty_exit0 && is_auth {
-        println!("  → 空輸出且偵測到 auth 失敗，跳過 PTY 重試（重登才有用）。");
-    }
+    println!("  登入與模型是否可用，由實際對話驗證；若對話失敗，請依錯誤訊息執行 `grok login --device-auth`。");
 }
 
 /// Verbose MCP server cold-start diagnostic for `duduclaw doctor`.
@@ -15831,7 +15724,7 @@ skill_security_scan = true
 #[cfg(all(test, unix))]
 mod doctor_probe_env_tests {
     #[tokio::test]
-    async fn grok_pipe_and_pty_probes_drop_ambient_secrets() {
+    async fn grok_doctor_runs_version_only_and_drops_ambient_secrets() {
         if let Ok(home) = std::env::var("DUDUCLAW_TEST_GROK_DIAGNOSTIC_HOME") {
             super::grok_cli_diagnostic(std::path::Path::new(&home)).await;
             return;
@@ -15839,15 +15732,17 @@ mod doctor_probe_env_tests {
         use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
         let script = root.path().join("grok");
+        // Records every invocation; anything but `--version` (a prompt, a PTY
+        // retry) is a failure.
         std::fs::write(&script, r#"#!/bin/sh
+printf '%s\n' "$*" >> "$HOME/calls"
 if [ "${CLAUDE_CODE_MESSAGING_TOKEN+x}" = x ] || [ "${ANTHROPIC_API_KEY+x}" = x ]; then printf 'ambient-secret-leaked' >&2; exit 71; fi
-if [ "$1" = --version ]; then printf 'fixture-version'; exit 0; fi
-if [ "$XAI_API_KEY" != fixture-xai ] || [ "$GROK_HOME" != "$HOME/grok-config" ] || [ "$USERPROFILE" != "$HOME" ]; then printf 'explicit-env-missing' >&2; exit 72; fi
-if [ -t 1 ]; then printf 'pty-probe-ok'; fi
+if [ "$#" = 1 ] && [ "$1" = --version ]; then printf 'fixture-version'; exit 0; fi
+printf 'prompt-invoked'; exit 73
 "#).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "doctor_probe_env_tests::grok_pipe_and_pty_probes_drop_ambient_secrets", "--nocapture"])
+            .args(["--exact", "doctor_probe_env_tests::grok_doctor_runs_version_only_and_drops_ambient_secrets", "--nocapture"])
             .env("DUDUCLAW_TEST_GROK_DIAGNOSTIC_HOME", root.path())
             .env("PATH", format!("{}:/usr/bin:/bin", root.path().display())).env("HOME", root.path())
             .env("GROK_HOME", root.path().join("grok-config"))
@@ -15858,9 +15753,15 @@ if [ -t 1 ]; then printf 'pty-probe-ok'; fi
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(output.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
         assert!(stdout.contains("fixture-version"), "{stdout}");
-        assert!(stdout.contains("PTY 重試回傳"), "{stdout}");
         assert!(!stdout.contains("ambient-secret-leaked"), "{stdout}");
-        assert!(!stdout.contains("explicit-env-missing"), "{stdout}");
+        assert!(!stdout.contains("prompt-invoked"), "{stdout}");
+        assert!(!stdout.contains("PTY"), "{stdout}");
+        // Wording claims installation + version only, never verified login.
+        assert!(stdout.contains("未驗證登入"), "{stdout}");
+        assert!(!stdout.contains("headless 正常"), "{stdout}");
+        let calls = std::fs::read_to_string(root.path().join("calls")).unwrap();
+        assert!(!calls.is_empty());
+        assert!(calls.lines().all(|args| args == "--version"), "{calls}");
     }
 }
 mod users_mfa_cmd;

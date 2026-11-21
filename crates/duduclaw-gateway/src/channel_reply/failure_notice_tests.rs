@@ -77,7 +77,7 @@ async fn late_model_alignment_failure_stays_with_the_stored_user_turn() {
         assert!(model_alignment_gate(&ctx, "slack:late", "worker", "t1", "gpt-5.4", RuntimeType::Claude, Some(&session.created_at)).await.is_err());
     }
     }).await;
-    assert_notice(&ctx, "slack:late", TurnFailureReason::Unavailable, 1).await;
+    assert_notice(&ctx, "slack:late", TurnFailureReason::ModelProviderMismatch, 1).await;
 }
 
 #[tokio::test]
@@ -136,7 +136,8 @@ async fn terminal_notices_are_idempotent_across_managers_and_do_not_enter_model_
 #[test]
 fn closed_vocabulary_covers_every_reason_and_falls_back_to_traditional_chinese() {
     let reasons = [TurnFailureReason::Timeout, TurnFailureReason::Unavailable, TurnFailureReason::Quota,
-        TurnFailureReason::Cancelled, TurnFailureReason::SafetyGate, TurnFailureReason::Internal, TurnFailureReason::Unknown];
+        TurnFailureReason::Cancelled, TurnFailureReason::SafetyGate, TurnFailureReason::Internal, TurnFailureReason::Unknown,
+        TurnFailureReason::ModelProviderMismatch, TurnFailureReason::AgentConfigUnreadable];
     for language in ["zh-TW", "zh-CN", "zh_CN", "en", "en-US", "en_US", "ja", "ja-JP", "ja_JP"] {
         let words: std::collections::HashSet<_> = reasons.iter().map(|reason| reason.text(Some(language))).collect();
         assert_eq!(words.len(), reasons.len());
@@ -383,4 +384,27 @@ async fn work_partial_is_assistant_context_and_budget_notice_is_display_only() {
     let notice = display.iter().find(|r| r.notice_kind.as_deref() == Some("turn_failure")).unwrap();
     assert!(notice.message.content.contains("17"));
     assert!(notice.message.content.ends_with("（原因代碼：max_turns｜參考編號：12345678）"));
+}
+
+#[tokio::test]
+async fn model_alignment_refusal_has_a_specific_live_reason_code() {
+    let (_home, ctx) = fixture();
+    let error = model_alignment_gate(&ctx, "webchat:new", "worker", "turn", "grok-4",
+        RuntimeType::Codex, None).await.unwrap_err();
+    assert!(error.contains("model_provider_mismatch"), "{error}");
+    assert!(error.contains("模型與執行引擎設定不相容"), "{error}");
+    assert!(!error.contains("unknown"));
+}
+
+#[tokio::test]
+async fn unreadable_agent_config_refusal_has_a_specific_code_and_no_detail() {
+    let (_home, ctx) = fixture();
+    let text = agent_config_refusal(&ctx, "worker", "12345678-turn").await;
+    assert_eq!(TurnFailureReason::AgentConfigUnreadable.code(), "agent_config_unreadable");
+    assert!(text.starts_with("無法讀取這位員工的設定"), "{text}");
+    assert!(text.ends_with("（原因代碼：agent_config_unreadable｜參考編號：12345678）"), "{text}");
+    assert!(!text.contains("agent.toml") && !text.contains('/'), "{text}");
+    for language in ["en", "ja-JP", "zh-CN", "zh-TW"] {
+        assert!(!TurnFailureReason::AgentConfigUnreadable.text(Some(language)).is_empty());
+    }
 }

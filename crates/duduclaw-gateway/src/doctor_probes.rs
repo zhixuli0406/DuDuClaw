@@ -9,9 +9,8 @@
 //! "agent has no tools" class — the M6 fail-closed auth gate killing the MCP
 //! server at boot when no `DUDUCLAW_MCP_API_KEY` reaches its env.
 //!
-//! Probe 2 (`grok_probe`): binary + version + live `grok -p "ping"` with the
-//! runtime's own HOME/env stamping and auth-signature verdict. The CLI keeps
-//! its richer evidence bundle (PTY one-shot retry) on top of this.
+//! Probe 2 (`grok_probe`): binary + `--version` only. Health checks never
+//! submit prompts or consume model quota; authentication is verified by turns.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -535,25 +534,12 @@ pub fn credential_audit(home: &Path) -> CredentialAudit {
 
 // ── Grok CLI ────────────────────────────────────────────────────
 
-/// Outcome of the live `grok -p "ping"` run.
+/// Outcome of the non-billable `grok --version` probe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GrokProbeOutcome {
-    /// Non-empty stdout on exit 0 — headless path healthy.
-    Ok {
-        stdout_chars: usize,
-    },
-    /// stderr matched a not-logged-in / expired-credential signature.
-    AuthFailed {
-        stderr_tail: String,
-    },
-    /// Exit 0 but empty stdout — the headless-under-pipe class (the runtime
-    /// applies a PTY one-shot retry for this; the CLI doctor demonstrates it).
+    Ok { stdout_chars: usize },
     EmptyExit0,
-    /// Non-zero exit without an auth signature.
-    Failed {
-        exit: Option<i32>,
-        stderr_tail: String,
-    },
+    Failed { exit: Option<i32>, stderr_tail: String },
     SpawnFailed(String),
     Timeout,
 }
@@ -566,80 +552,34 @@ pub struct GrokProbeReport {
     pub outcome: GrokProbeOutcome,
 }
 
-/// Probe the grok CLI the way `GrokRuntime` drives it (same HOME/env
-/// stamping, same auth-signature helper). Returns `None` when grok is not
-/// installed — callers omit the check instead of reporting a failure.
+/// Check installation with `--version` only. This deliberately makes no claim
+/// about login or model service health. Absence omits the doctor card.
 pub async fn grok_probe(home: &Path) -> Option<GrokProbeReport> {
     let path = duduclaw_core::which_grok().or_else(|| duduclaw_core::which_grok_in_home(home))?;
-
-    let mut version_cmd = duduclaw_core::platform::async_command_for(&path);
-    duduclaw_core::spawn_env::apply_agent_cli_env_allowlist(&mut version_cmd);
-    let version = match tokio::time::timeout(
-        Duration::from_secs(5),
-        version_cmd.arg("--version")
-            .stdin(Stdio::null())
-            .output(),
-    )
-    .await
-    {
-        Ok(Ok(out)) => {
-            let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            (!v.is_empty()).then_some(v)
-        }
-        _ => None,
-    };
-
-    // Same HOME/env stamping as the runtime (launchd/Docker HOME fix).
-    let user_home =
-        crate::runtime::grok::resolve_user_home(home, std::env::var("HOME").ok().as_deref());
-    let grok_home_override = std::env::var("GROK_HOME").ok();
-    let home_env = crate::runtime::grok::build_home_env(&user_home, grok_home_override.as_deref());
-
     let mut cmd = duduclaw_core::platform::async_command_for(&path);
     duduclaw_core::spawn_env::apply_agent_cli_env_allowlist(&mut cmd);
-    if let Ok(key) = std::env::var("XAI_API_KEY") {
-        cmd.env("XAI_API_KEY", key);
-    }
-    cmd.args(["-p", "ping"]).stdin(Stdio::null());
-    for (k, v) in &home_env {
-        cmd.env(k, v);
-    }
-
-    let outcome = match tokio::time::timeout(Duration::from_secs(15), cmd.output()).await {
-        Err(_) => GrokProbeOutcome::Timeout,
-        Ok(Err(e)) => GrokProbeOutcome::SpawnFailed(e.to_string()),
-        Ok(Ok(out)) => {
+    cmd.arg("--version");
+    let mut version = None;
+    let outcome = match crate::process_group::output(&mut cmd, None, Duration::from_secs(5)).await {
+        Err(crate::process_group::OutputError::Timeout) => GrokProbeOutcome::Timeout,
+        Err(crate::process_group::OutputError::Io(error)) => GrokProbeOutcome::SpawnFailed(error.to_string()),
+        Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let stderr_tail = duduclaw_core::truncate_bytes(stderr.trim(), 300).to_string();
-            if crate::runtime::grok::looks_like_grok_auth_failure(&stderr) {
-                GrokProbeOutcome::AuthFailed { stderr_tail }
-            } else if out.status.success() {
-                let chars = stdout.trim().chars().count();
-                if chars == 0 {
-                    GrokProbeOutcome::EmptyExit0
-                } else {
-                    GrokProbeOutcome::Ok {
-                        stdout_chars: chars,
-                    }
-                }
-            } else {
+            if !out.status.success() {
                 GrokProbeOutcome::Failed {
                     exit: out.status.code(),
-                    stderr_tail,
+                    stderr_tail: duduclaw_core::truncate_bytes(String::from_utf8_lossy(&out.stderr).trim(), 300).to_string(),
                 }
+            } else if stdout.trim().is_empty() {
+                GrokProbeOutcome::EmptyExit0
+            } else {
+                version = Some(stdout.trim().to_string());
+                GrokProbeOutcome::Ok { stdout_chars: stdout.trim().chars().count() }
             }
         }
     };
-
-    Some(GrokProbeReport {
-        path,
-        version,
-        outcome,
-    })
+    Some(GrokProbeReport { path, version, outcome })
 }
-
-// ── Tests ───────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -647,11 +587,17 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn grok_probe_drops_ambient_secrets_and_keeps_explicit_env() {
+    async fn grok_doctor_and_detection_never_invoke_a_prompt() {
         if let Ok(home) = std::env::var("DUDUCLAW_TEST_GROK_PROBE_HOME") {
             let report = grok_probe(Path::new(&home)).await.unwrap();
             assert_eq!(report.version.as_deref(), Some("fixture-version"));
             assert!(matches!(report.outcome, GrokProbeOutcome::Ok { .. }), "{report:?}");
+            let runtime = crate::runtime::grok::GrokRuntime::new();
+            use crate::runtime::AgentRuntime;
+            assert!(runtime.is_available().await);
+            let calls = std::fs::read_to_string(Path::new(&home).join("calls")).unwrap();
+            assert!(calls.lines().count() >= 2, "{calls}");
+            assert!(calls.lines().all(|args| args == "--version" || args == "--help"), "{calls}");
             return;
         }
         use std::os::unix::fs::PermissionsExt;
@@ -659,13 +605,13 @@ mod tests {
         let script = root.path().join("grok");
         std::fs::write(&script, r#"#!/bin/sh
 if [ "${CLAUDE_CODE_MESSAGING_TOKEN+x}" = x ] || [ "${ANTHROPIC_API_KEY+x}" = x ]; then exit 71; fi
-if [ "$1" = --version ]; then printf 'fixture-version'; exit 0; fi
-if [ "$XAI_API_KEY" != fixture-xai ] || [ "$GROK_HOME" != "$HOME/grok-config" ] || [ "$USERPROFILE" != "$HOME" ]; then exit 72; fi
-printf 'probe-ok'
+printf '%s\n' "$*" >> "$HOME/calls"
+if [ "$#" = 1 ] && [ "$1" = --version ]; then printf 'fixture-version'; exit 0; fi
+exit 73
 "#).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "doctor_probes::tests::grok_probe_drops_ambient_secrets_and_keeps_explicit_env", "--nocapture"])
+            .args(["--exact", "doctor_probes::tests::grok_doctor_and_detection_never_invoke_a_prompt", "--nocapture"])
             .env("DUDUCLAW_TEST_GROK_PROBE_HOME", root.path())
             .env("PATH", format!("{}:/usr/bin:/bin", root.path().display())).env("HOME", root.path())
             .env("GROK_HOME", root.path().join("grok-config"))
