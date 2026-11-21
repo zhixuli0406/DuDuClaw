@@ -17,6 +17,20 @@ use std::path::{Path, PathBuf};
 /// The rc.15 binding uses the compatible `api-24` interface.
 pub const ORT_VERSION: &str = "1.24.2";
 
+// Redirect hosts for the pinned sources below. Unexpected hosts fail closed;
+// the pinned SHA-256 still protects the content on every allowed host.
+pub const GITHUB_REDIRECT_HOSTS: &[&str] = &[
+    "github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com",
+];
+// The v3 flat-container URL is served by api.nuget.org. Do not speculate about
+// CDN aliases: a new redirect host must be reviewed before adding it here.
+pub const NUGET_REDIRECT_HOSTS: &[&str] = &["api.nuget.org"];
+// The shared installer also serves the pinned Hugging Face model manifests.
+pub const MODEL_REDIRECT_HOSTS: &[&str] = &[
+    "huggingface.co", "cdn-lfs.huggingface.co", "cdn-lfs-us-1.huggingface.co",
+    "cdn-lfs-eu-1.huggingface.co", "cas-bridge.xethub.hf.co",
+];
+
 /// Archive container format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveKind {
@@ -260,6 +274,59 @@ pub fn ort_lib_path(ort_lib_root: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn workspace_ort_manifests_never_download_or_copy_binaries() {
+        use std::collections::HashSet;
+        use std::path::Path;
+        fn inspect(value: &toml::Value, aliases: &mut HashSet<String>, path: &Path) {
+            if let Some(table) = value.as_table() {
+                for (name, child) in table {
+                    if name == "ort" || child.get("package").and_then(toml::Value::as_str) == Some("ort") {
+                        aliases.insert(name.clone());
+                        assert_eq!(child.get("default-features").and_then(toml::Value::as_bool),
+                            Some(false), "ort defaults enabled in {}", path.display());
+                        if let Some(features) = child.get("features").and_then(toml::Value::as_array) {
+                            for feature in features {
+                                assert!(!matches!(feature.as_str(), Some("download-binaries" | "copy-dylibs")),
+                                    "forbidden ort feature in {}: {feature}", path.display());
+                            }
+                        }
+                    }
+                    inspect(child, aliases, path);
+                }
+            }
+        }
+        fn forwarded(value: &toml::Value, aliases: &HashSet<String>, path: &Path) {
+            match value {
+                toml::Value::String(feature) => {
+                    if let Some((name, feature)) = feature.split_once('/') {
+                        assert!(!(aliases.contains(name.trim_end_matches('?'))
+                            && matches!(feature, "download-binaries" | "copy-dylibs")),
+                            "forbidden forwarded ort feature in {}", path.display());
+                    }
+                }
+                toml::Value::Array(values) => for value in values { forwarded(value, aliases, path); },
+                toml::Value::Table(values) => for value in values.values() { forwarded(value, aliases, path); },
+                _ => {}
+            }
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+        let workspace: toml::Value = std::fs::read_to_string(root.join("Cargo.toml")).unwrap().parse().unwrap();
+        let mut paths = vec![root.join("Cargo.toml"), root.join("src-tauri/Cargo.toml")];
+        for member in workspace["workspace"]["members"].as_array().unwrap() {
+            let member = member.as_str().unwrap();
+            // Fail rather than silently skip future globbed workspace members.
+            assert!(!member.contains(['*', '?', '[']), "expand globbed members before checking ort");
+            paths.push(root.join(member).join("Cargo.toml"));
+        }
+        for path in paths {
+            let value: toml::Value = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+            let mut aliases = HashSet::new();
+            inspect(&value, &mut aliases, &path);
+            forwarded(&value, &aliases, &path);
+        }
+    }
+
     use super::*;
 
     #[test]

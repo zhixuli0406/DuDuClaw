@@ -25,7 +25,7 @@ kamadak-exif = "0.6"
 # desktop shell turns it on. Mirrors duduclaw-inference's ort pin exactly.
 duduclaw-onnx = { workspace = true, optional = true, features = ["runtime"] }
 # Preserve rc.12 defaults explicitly: rc.15 defaults select api-31.
-ort = { version = "=2.0.0-rc.15", optional = true, default-features = false, features = ["std", "ndarray", "tracing", "download-binaries", "tls-native", "copy-dylibs", "api-24"] }
+ort = { version = "=2.0.0-rc.15", optional = true, default-features = false, features = ["load-dynamic", "ndarray", "tracing", "api-24"] }
 # Must match ort's ndarray major (ort 2.0.0-rc.15 uses 0.17) or Tensor::from_array
 # sees a foreign ArrayBase type and the OwnedTensorArrayData bound fails.
 ndarray = { version = "0.17", optional = true }

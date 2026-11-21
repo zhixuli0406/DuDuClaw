@@ -30,32 +30,47 @@ pub fn init_ort(lib_path: &Path) -> Result<(), String> {
         return Err(format!("ONNX Runtime 執行庫不存在：{}", lib_path.display()));
     }
     let sealed = duduclaw_core::root_key::is_held();
-    // Verification errors are retryable after reinstall. Only a verified path
-    // reaches ort; memoise the actual load/build outcome once per process.
-    #[cfg(target_os = "linux")]
-    let load_path = if sealed {
-        sealed_runtime::prepare(lib_path)?
-    } else {
-        crate::install::verify_ort_lib_path(lib_path)?;
-        lib_path.to_path_buf()
+    // Pre-load verification errors remain retryable. Once ort is called, any
+    // load/identity failure poisons INIT permanently, before a session can exist.
+    static VERIFIED: OnceLock<crate::install::verified_file::VerifiedLibrary> = OnceLock::new();
+    let verified = if sealed { None } else {
+        let pins = crate::manifest::ort_lib_pins(crate::manifest::current_target())
+            .ok_or_else(|| "這個平台沒有可用的 ONNX Runtime".to_string())?;
+        Some(crate::install::verified_file::verify_for_load(lib_path, pins)?)
     };
+    #[cfg(target_os = "linux")]
+    let load_path = if sealed { sealed_runtime::prepare(lib_path)? } else { lib_path.to_path_buf() };
     #[cfg(not(target_os = "linux"))]
     let load_path = {
         if sealed {
             return Err("這個平台不支援獨立金鑰模式的 ONNX Runtime 安全載入".into());
         }
-        crate::install::verify_ort_lib_path(lib_path)?;
         lib_path.to_path_buf()
     };
+    if let Some(verified) = verified {
+        VERIFIED.set(verified).map_err(|_| "ONNX Runtime 初始化狀態衝突".to_string())?;
+    }
     let _ = INIT.get_or_init(|| {
-        let builder = ort::init_from(&load_path)
-            .map_err(|e| format!("載入 ONNX Runtime 失敗（{}）：{e}", lib_path.display()))?;
-        #[cfg(target_os = "linux")]
-        if sealed {
-            sealed_runtime::verify_loaded(&load_path)?;
+        let result: Result<_, String> = (|| {
+            let loaded = ort::init_from(&load_path);
+            // Check immediately on return, including failed loads. The handle
+            // remains retained even when this check or environment creation fails.
+            if let Some(verified) = VERIFIED.get() {
+                verified.check_path(lib_path)?;
+            }
+            let builder = loaded
+                .map_err(|e| format!("載入 ONNX Runtime 失敗（{}）：{e}", lib_path.display()))?;
+            #[cfg(target_os = "linux")]
+            if sealed {
+                sealed_runtime::verify_loaded()?;
+            }
+            let env = builder.build().map_err(|e| format!("建立 ONNX Runtime 環境失敗：{e}"))?;
+            Ok((env, sealed))
+        })();
+        if let Err(error) = &result {
+            eprintln!("ONNX Runtime 初始化失敗：{}", error.replace(['\n', '\r'], " "));
         }
-        let env = builder.build().map_err(|e| format!("建立 ONNX Runtime 環境失敗：{e}"))?;
-        Ok((env, sealed))
+        result
     });
     environment().map(|_| ())
 }

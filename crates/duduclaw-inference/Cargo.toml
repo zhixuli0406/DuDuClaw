@@ -41,7 +41,7 @@ ucci = { git = "https://github.com/varunkotte6/ucci", rev = "80cd2319cc2b41e3a5c
 # ONNX Runtime for Embedding (prediction engine semantic similarity)
 duduclaw-onnx = { workspace = true, optional = true, features = ["runtime"] }
 # Preserve rc.12 defaults explicitly: rc.15 defaults select api-31.
-ort = { version = "=2.0.0-rc.15", optional = true, default-features = false, features = ["std", "ndarray", "tracing", "download-binaries", "tls-native", "copy-dylibs", "api-24"] }
+ort = { version = "=2.0.0-rc.15", optional = true, default-features = false, features = ["load-dynamic", "ndarray", "tracing", "api-24"] }
 ndarray = { version = "0.17", optional = true }
 
 # Tokenizer for embedding models (BERT WordPiece, etc.)

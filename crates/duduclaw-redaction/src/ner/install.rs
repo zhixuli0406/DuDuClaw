@@ -568,7 +568,7 @@ mod tests {
 
     fn archive_spec(kind: ArchiveKind, member: &'static str) -> OrtArchive {
         OrtArchive {
-            target: "test",
+            target: "x86_64-unknown-linux-gnu",
             url: "https://example.invalid/x",
             size: 1,
             sha256: "00",

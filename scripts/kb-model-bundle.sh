@@ -113,7 +113,7 @@ while IFS=$'\t' read -r url dest size sum; do
   cached="$CACHE/$sum"
   if [ ! -f "$cached" ] || [ "$(sha256 "$cached")" != "$sum" ]; then
     echo "download $(basename "$dest") ($size bytes)"
-    if ! curl -fSL --retry 3 --connect-timeout 30 --max-time 1800 --max-filesize "$size" -o "$cached.part" "$url"; then
+    if ! curl -fSL --proto '=https' --proto-redir '=https' --max-redirs 5 --retry 3 --connect-timeout 30 --max-time 1800 --max-filesize "$size" -o "$cached.part" "$url"; then
       case "$dest" in
         lib/onnxruntime/*) recover_ort_archive "$dest" "$cached.part" ;;
         *) echo "download failed for $dest ($TARGET)" >&2; exit 1 ;;

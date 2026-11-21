@@ -35,7 +35,7 @@ fn zip_extracts_only_the_exact_pinned_member() {
     let path = dir.path().join("package.zip");
     let dest = dir.path().join("lib.so");
     std::fs::write(&path, bytes).unwrap();
-    extract_source_member(&path, &src, &dest).unwrap();
+    extract_source_member(&path, &src, &dest, 4).unwrap().persist(&dest).unwrap();
     assert_eq!(std::fs::read(&dest).unwrap(), b"good");
     assert!(!dir.path().join("other").exists());
     assert!(!dir.path().join("runtimes").exists());
@@ -49,7 +49,7 @@ fn zip_refuses_a_different_member_path() {
     let path = dir.path().join("package.zip");
     let dest = dir.path().join("lib.so");
     std::fs::write(&path, bytes).unwrap();
-    assert!(extract_source_member(&path, &src, &dest).is_err());
+    assert!(extract_source_member(&path, &src, &dest, 4).is_err());
     assert!(!dest.exists());
     assert!(!dest.with_extension("part").exists());
 }
@@ -63,11 +63,11 @@ fn zip_refuses_parent_components_even_in_unselected_entries() {
         let path = dir.path().join("package.zip");
         let dest = dir.path().join("lib.so");
         std::fs::write(&path, bytes).unwrap();
-        assert!(extract_source_member(&path, &src, &dest).is_err(), "{bad}");
+        assert!(extract_source_member(&path, &src, &dest, 4).is_err(), "{bad}");
         assert!(!dest.exists());
         assert!(!dest.with_extension("part").exists());
         let invalid = OrtSource { member: bad, ..src };
-        assert!(extract_source_member(&path, &invalid, &dest).is_err());
+        assert!(extract_source_member(&path, &invalid, &dest, 4).is_err());
     }
 }
 
@@ -96,7 +96,11 @@ async fn fallback_case(first_error: Option<&str>, corrupt_first: bool) {
                 // Same size, different digest. It must never reach the zip reader.
                 data[0] ^= 1;
             }
-            std::fs::write(part_path(&dest), data).map_err(OnnxError::from)
+            (|| {
+                let mut part = new_temp(&dest)?;
+                part.write_all(&data)?;
+                Ok(part)
+            })()
         };
         std::future::ready(result)
     }).await.unwrap();
@@ -128,4 +132,177 @@ async fn all_source_failures_include_each_source_and_reason() {
     assert_eq!(calls, ["first", "second"]);
     assert!(error.contains("first: HTTP 404"), "{error}");
     assert!(error.contains("second: timeout"), "{error}");
+}
+
+fn malicious_archive(kind: ArchiveKind, case: &str) -> Vec<u8> {
+    match kind {
+        ArchiveKind::TarGz => {
+            let enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            let mut tar = tar::Builder::new(enc);
+            let mut header = tar::Header::new_gnu();
+            header.set_mode(0o600);
+            if case == "symlink" || case == "hardlink" || case == "fifo" {
+                header.set_size(0);
+                header.set_entry_type(match case {
+                    "symlink" => tar::EntryType::Symlink,
+                    "hardlink" => tar::EntryType::Link,
+                    _ => tar::EntryType::Fifo,
+                });
+                if case != "fifo" { header.set_link_name("elsewhere").unwrap(); }
+                header.set_cksum();
+                tar.append_data(&mut header, "lib.so", &[][..]).unwrap();
+            } else {
+                let bytes = if case == "oversize" { b"good-extra".as_slice() } else { b"good".as_slice() };
+                header.set_size(bytes.len() as u64);
+                header.set_cksum();
+                tar.append_data(&mut header, "lib.so", bytes).unwrap();
+                if case == "duplicate" {
+                    tar.append_data(&mut header, "lib.so", bytes).unwrap();
+                }
+            }
+            tar.into_inner().unwrap().finish().unwrap()
+        }
+        ArchiveKind::Zip => {
+            if case == "symlink" {
+                let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+                zip.add_symlink("lib.so", "elsewhere", zip::write::SimpleFileOptions::default()).unwrap();
+                return zip.finish().unwrap().into_inner();
+            }
+            if case == "duplicate" {
+                // ZipWriter refuses duplicates itself; rename an equal-length
+                // fixture name in both the local and central headers instead.
+                let mut bytes = zip_bytes(&[("lib.so", b"good"), ("alt.so", b"evil")]);
+                for i in 0..bytes.len().saturating_sub(5) {
+                    if bytes.get(i..i + 6) == Some(b"alt.so") {
+                        bytes[i..i + 6].copy_from_slice(b"lib.so");
+                    }
+                }
+                return bytes;
+            }
+            zip_bytes(&[("lib.so", if case == "oversize" { b"good-extra" } else { b"good" })])
+        }
+    }
+}
+
+fn refused_member_case(case: &str) {
+    for kind in [ArchiveKind::TarGz, ArchiveKind::Zip] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("archive");
+        let dest = dir.path().join("lib.so");
+        let bytes = malicious_archive(kind, case);
+        let src = OrtSource { kind, ..source(&bytes, "lib.so", "fixture") };
+        std::fs::write(&path, bytes).unwrap();
+        // A rejected replacement preserves the previous install and leaves no partial.
+        std::fs::write(&dest, b"old").unwrap();
+        assert!(extract_source_member(&path, &src, &dest, 4).is_err(), "{kind:?}: {case}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"old");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+}
+
+#[test]
+fn tar_and_zip_refuse_oversized_member_and_remove_partial() { refused_member_case("oversize"); }
+
+#[test]
+fn tar_and_zip_refuse_duplicate_member_names() { refused_member_case("duplicate"); }
+
+#[test]
+fn tar_and_zip_refuse_symlink_member() { refused_member_case("symlink"); }
+
+#[test]
+fn tar_refuses_hardlink_and_special_member() {
+    let dir = tempfile::tempdir().unwrap();
+    for case in ["hardlink", "fifo"] {
+        let bytes = malicious_archive(ArchiveKind::TarGz, case);
+        let src = OrtSource { kind: ArchiveKind::TarGz, ..source(&bytes, "lib.so", "fixture") };
+        let path = dir.path().join("archive");
+        std::fs::write(&path, bytes).unwrap();
+        assert!(extract_source_member(&path, &src, &dir.path().join("lib.so"), 4).is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+}
+
+#[test]
+fn bounded_extraction_accepts_exact_limit_for_tar_and_zip() {
+    for kind in [ArchiveKind::TarGz, ArchiveKind::Zip] {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = malicious_archive(kind, "valid");
+        let src = OrtSource { kind, ..source(&bytes, "lib.so", "fixture") };
+        let path = dir.path().join("archive");
+        let dest = dir.path().join("lib.so");
+        std::fs::write(&path, bytes).unwrap();
+        let hash = hex_lower(&Sha256::digest(b"good"));
+        extract_verified(&path, &src, &dest, &[(4, &hash)]).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"good");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn precreated_part_symlinks_are_never_followed_or_cleaned() {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("lib.so");
+    let victim = dir.path().join("victim");
+    std::fs::write(&victim, b"untouched").unwrap();
+    let old = part_path(&dest);
+    let random = dir.path().join(".lib.so.dudu-abcdefghijklmnop.part");
+    for link in [&old, &random] {
+        std::os::unix::fs::symlink(&victim, link).unwrap();
+        assert!(exclusive_temp(link).is_err());
+    }
+    cleanup_stale_temps(&dest);
+    let mut part = new_temp(&dest).unwrap();
+    assert_ne!(part.path(), old);
+    part.write_all(b"good").unwrap();
+    finish_download(part, &dest, 4, &hex_lower(&Sha256::digest(b"good"))).unwrap();
+    assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+    assert!(std::fs::symlink_metadata(old).unwrap().file_type().is_symlink());
+    assert!(std::fs::symlink_metadata(random).unwrap().file_type().is_symlink());
+}
+
+#[cfg(unix)]
+#[test]
+fn stale_cleanup_only_removes_owned_regular_matching_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("lib.so");
+    let stale = dir.path().join(".lib.so.dudu-abcdefghijklmnop.part");
+    let unrelated = dir.path().join("other.part");
+    let fresh = dir.path().join(".lib.so.dudu-qrstuvwxyzABCDEF.part");
+    let directory = dir.path().join(".lib.so.dudu-0123456789abcdef.part");
+    for path in [&stale, &unrelated, &fresh] { std::fs::write(path, b"old").unwrap(); }
+    for path in [&stale, &unrelated] {
+        std::fs::File::options().write(true).open(path).unwrap()
+            .set_modified(std::time::UNIX_EPOCH).unwrap();
+    }
+    std::fs::create_dir(&directory).unwrap();
+    cleanup_stale_temps(&dest);
+    assert!(!stale.exists());
+    assert!(unrelated.exists() && fresh.exists() && directory.is_dir());
+}
+
+#[test]
+fn redirect_policy_allows_only_source_hosts_https_and_five_hops() {
+    let github = reqwest::Url::parse(manifest::ORT_ARCHIVES[0].url).unwrap();
+    let nuget = reqwest::Url::parse(manifest::ORT_ARCHIVES[0].fallbacks[0].url).unwrap();
+    for host in manifest::GITHUB_REDIRECT_HOSTS {
+        let url = reqwest::Url::parse(&format!("https://{host}/asset")).unwrap();
+        assert!(redirect_allowed(&github, &url, 5));
+        assert!(!redirect_allowed(&github, &url, 6));
+        assert!(!redirect_allowed(&nuget, &url, 1));
+    }
+    assert!(redirect_allowed(&nuget, &nuget, 1));
+    for url in ["http://github.com/asset", "https://github.com.evil.test/asset",
+        "https://evil.test/asset", "https://github.com:444/asset", "https://user@github.com/asset",
+        "file:///tmp/asset", "https://api.nuget.org/asset"] {
+        assert!(!redirect_allowed(&github, &reqwest::Url::parse(url).unwrap(), 1), "{url}");
+    }
+    let models = reqwest::Url::parse("https://huggingface.co/model").unwrap();
+    let cdn = reqwest::Url::parse("https://cas-bridge.xethub.hf.co/asset").unwrap();
+    assert!(redirect_allowed(&models, &cdn, 1));
+    assert!(!redirect_allowed(&nuget, &cdn, 1));
 }
