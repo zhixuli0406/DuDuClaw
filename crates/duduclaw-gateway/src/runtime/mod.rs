@@ -906,13 +906,17 @@ pub(crate) fn cap_conversation_history(history: &[ConversationTurn]) -> Vec<Conv
 /// NOTE: The canonical implementation with turn trimming lives in
 /// `channel_reply.rs`. This version is for the AgentRuntime trait path.
 pub fn format_history_as_prompt(history: &[ConversationTurn], current_message: &str) -> String {
-    let history = cap_conversation_history(history);
+    format_history_as_prompt_uncapped(&cap_conversation_history(history), current_message)
+}
+
+/// Frame history whose size is managed by the caller (the prompt budget reducer).
+pub(crate) fn format_history_as_prompt_uncapped(history: &[ConversationTurn], current_message: &str) -> String {
     if history.is_empty() {
         return current_message.to_string();
     }
     let mut buf = String::with_capacity(history.len() * 200 + current_message.len() + 64);
     buf.push_str("<conversation_history>\n");
-    for turn in &history {
+    for turn in history {
         // Escape closing tags in content to prevent XML structure corruption
         let safe_content = turn
             .content

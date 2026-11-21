@@ -786,7 +786,8 @@ mod tests {
             let port = if section == "gateway" { "port = 18889\n" } else { "[gateway]\nport = 18889\n" };
             for bad in rejected {
                 assert_eq!(channel_link_base(bad), None, "{bad}");
-                write_config(dir.path(), &format!("[{section}]\npublic_url = {bad:?}\n{port}"));
+                let value = toml::Value::String(bad.to_string());
+                write_config(dir.path(), &format!("[{section}]\npublic_url = {value}\n{port}"));
                 assert_eq!(chat_base(dir.path(), true), None, "[{section}] {bad}");
                 assert_eq!(chat_link(dir.path(), DeepLinkKind::Task, "t", true), None, "[{section}] {bad}");
                 assert_eq!(chat_base(dir.path(), false).as_deref(), Some("http://localhost:18889"), "[{section}] {bad}");

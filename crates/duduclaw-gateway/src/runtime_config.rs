@@ -664,7 +664,8 @@ impl RuntimeSettingsError {
 ///
 /// Claude uses [`duduclaw_core::types::DEFAULT_PREFERRED_MODEL`]; other engines
 /// use their first catalog `fallback_models` entry. Engines without a catalog
-/// default return `None` and require an explicitly configured preferred model.
+/// default return `None`; Kiro delegates selection to its CLI settings, while
+/// OpenAI-compatible requests require an explicitly configured model.
 pub fn default_preferred_model(provider: RuntimeType) -> Option<String> {
     if provider == RuntimeType::Claude {
         return Some(duduclaw_core::types::DEFAULT_PREFERRED_MODEL.to_string());
@@ -682,6 +683,8 @@ impl RuntimeSettings {
             .filter(|model| !model.is_empty())
             .map(str::to_string)
             .or_else(|| default_preferred_model(self.provider))
+            // Kiro chooses its model through CLI settings, with no per-call model selector.
+            .or_else(|| (self.provider == RuntimeType::Kiro).then(String::new))
             .ok_or(RuntimeSettingsError::MissingModel)
     }
 }
@@ -2159,7 +2162,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_runtime_settings_require_a_model_without_a_catalog_default() {
+    fn strict_runtime_settings_require_a_model_only_when_the_runtime_needs_one() {
         let dir = TempDir::new().unwrap();
         for provider in ["openai_compat", "kiro"] {
             let runtime = RuntimeType::parse(provider).unwrap();
@@ -2170,11 +2173,13 @@ mod tests {
             assert_eq!(settings.preferred_or_default(), Ok("custom-model".to_string()));
             for model in ["", "[model]\npreferred=''\n", "[model]\npreferred='  '\n"] {
                 write_agent_toml(dir.path(), &format!("[runtime]\nprovider='{provider}'\n{model}"));
-                assert_eq!(load_runtime_settings_strict(dir.path()), Err(RuntimeSettingsError::MissingModel));
+                let expected = if runtime == RuntimeType::Kiro { Ok(String::new()) }
+                    else { Err(RuntimeSettingsError::MissingModel) };
+                assert_eq!(load_runtime_settings_strict(dir.path()).and_then(|s| s.preferred_or_default()), expected);
                 // Even callers of the unchanged lenient loader cannot invent a Claude model.
                 let settings = load_runtime_settings(dir.path());
                 assert_eq!(settings.provider, runtime);
-                assert_eq!(settings.preferred_or_default(), Err(RuntimeSettingsError::MissingModel));
+                assert_eq!(settings.preferred_or_default(), expected);
             }
         }
         assert_eq!(RuntimeSettingsError::MissingModel.as_str(), "missing_model");
@@ -2213,6 +2218,52 @@ mod tests {
         assert_eq!(load_runtime_settings_strict(&dir), Err(RuntimeSettingsError::Unreadable));
         // The legacy reader deliberately retains its fallback behavior.
         assert_eq!(load_runtime_settings(&dir).provider, RuntimeType::Claude);
+    }
+
+    #[test]
+    fn strict_reader_accepts_catalog_aliases_and_toml_encodings() {
+        let dir = TempDir::new().unwrap();
+        for spec in duduclaw_core::runtime_catalog::CATALOG {
+            for alias in std::iter::once(spec.id).chain(spec.aliases.iter().copied()) {
+                for provider in [alias.to_string(), format!(" {} ", alias.to_uppercase())] {
+                    for prefix in ["", "\u{feff}"] {
+                        write_agent_toml(dir.path(), &format!("{prefix}[runtime]\r\nprovider={provider:?}\r\n[model]\r\npreferred='custom-model'\r\n[extra]\r\nfuture=true\r\n"));
+                        assert_eq!(load_runtime_settings_strict(dir.path()).unwrap(), load_runtime_settings(dir.path()), "{provider}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_reader_accepts_repository_agent_configs() {
+        fn collect(dir: &Path, files: &mut Vec<std::path::PathBuf>) {
+            if !dir.is_dir() { return; }
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if entry.file_type().unwrap().is_dir() { collect(&path, files); }
+                else if entry.file_name() == "agent.toml" { files.push(path); }
+            }
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+        let mut files = Vec::new();
+        for dir in ["templates", "docs", "tests", "crates", "distribution"] {
+            collect(&root.join(dir), &mut files);
+        }
+        if root.join("agent.toml").is_file() { files.push(root.join("agent.toml")); }
+        assert!(!files.is_empty());
+        let mut accepted = 0;
+        for file in files {
+            let dir = TempDir::new().unwrap();
+            std::fs::copy(&file, dir.path().join("agent.toml")).unwrap();
+            let legacy = load_runtime_settings(dir.path());
+            // Registry rejection is not a strict-reader compatibility regression.
+            if duduclaw_agent::AgentRegistry::load_agent(dir.path()).await.is_err() { continue; }
+            accepted += 1;
+            assert_eq!(load_runtime_settings_strict(dir.path()).unwrap_or_else(|e| panic!("{}: {e:?}", file.display())), legacy, "{}", file.display());
+        }
+        assert!(accepted > 0);
     }
 
     #[test]

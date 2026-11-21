@@ -3770,7 +3770,8 @@ fn redact_channel_paths(line: &str) -> String {
         let bytes = rest.as_bytes();
         let drive = c.is_ascii_alphabetic() && bytes.get(1) == Some(&b':')
             && matches!(bytes.get(2), Some(b'/' | b'\\'));
-        let path = boundary && (c == '/' || rest.starts_with("~/")
+        let slash_path = c == '/' && rest.chars().nth(1).is_some_and(|next| !next.is_whitespace());
+        let path = boundary && (slash_path || rest.starts_with("~/")
             || rest.starts_with("\\\\") || rest.starts_with("file://") || drive);
         if path {
             output.push_str("[path]");

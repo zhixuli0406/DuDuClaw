@@ -40,11 +40,14 @@ async fn gate_home(halted: &str, restricted: &str, must_not: &[&str]) -> (tempfi
     (home, ctx)
 }
 
-/// Make the budget gate refuse: the employee's configuration is unreadable
-/// at turn time (`[budget] when_unavailable` cannot be read ⇒ deny). The
-/// registry already holds the loaded employee.
+/// Make only the budget policy unreadable at turn time. Runtime/model
+/// settings remain valid, so the early runtime gate allows the budget gate
+/// to exercise its own fail-closed refusal. The registry is already loaded.
 fn break_budget_config(home: &std::path::Path) {
-    std::fs::write(home.join("agents/worker/agent.toml"), "not valid [[[").unwrap();
+    let path = home.join("agents/worker/agent.toml");
+    let mut config: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+    config.insert("budget".into(), "unreadable budget policy".into());
+    std::fs::write(path, toml::to_string_pretty(&config).unwrap()).unwrap();
 }
 
 async fn set_level(ctx: &ReplyContext, sid: &str, level: FailsafeLevel) {

@@ -1432,14 +1432,19 @@ mod tests {
         run_profile_distill("以後請稱呼我老李。", "a1", "system", &db, home.path(), &crate::memory_provenance::test_sources()).await;
         run_profile_distill("以後請稱呼我老李。", "a1", "u1", &db, home.path(), &crate::memory_provenance::test_sources()).await;
         let engine = SqliteMemoryEngine::new(&db).unwrap();
-        assert!(duduclaw_memory::user_profile::profile_block(&engine, "a1", "system")
+        let scope = duduclaw_memory::RowScope::conversation(Some("test:session"));
+        assert!(duduclaw_memory::user_profile::profile_block_for(&engine, "a1", &profile_key_for_session("test:session", "system").unwrap(), scope)
             .await
             .unwrap()
             .is_none());
-        assert!(duduclaw_memory::user_profile::profile_block(&engine, "a1", "u1")
+        assert!(duduclaw_memory::user_profile::profile_block_for(&engine, "a1", &profile_key_for_session("test:session", "u1").unwrap(), scope)
             .await
             .unwrap()
             .is_some(), "a real speaker still gets a profile");
+        assert!(duduclaw_memory::user_profile::profile_block_for(
+            &engine, "a1", &profile_key_for_session("test:session", "u1").unwrap(),
+            duduclaw_memory::RowScope::conversation(Some("test:another-session")),
+        ).await.unwrap().is_none(), "a different conversation cannot read the trait");
     }
 
     /// RM-039: a self-statement about an excluded topic is not recorded (the
@@ -1459,7 +1464,8 @@ mod tests {
         )
         .await;
         let engine = SqliteMemoryEngine::new(&db).unwrap();
-        let traits = duduclaw_memory::user_profile::profile_traits(&engine, "a1", "u1")
+        let scope = duduclaw_memory::RowScope::conversation(Some("test:session"));
+        let traits = duduclaw_memory::user_profile::profile_traits_for(&engine, "a1", &profile_key_for_session("test:session", "u1").unwrap(), scope)
             .await
             .unwrap();
         assert!(

@@ -2,6 +2,14 @@
 //! `license.status` / `license.sync`.
 use super::*;
 
+async fn handler_for(home: &std::path::Path) -> MethodHandler {
+    let mut handler = MethodHandler::new(home.to_path_buf()).await;
+    handler.license_runtime = Some(crate::license_runtime::LicenseRuntime::bootstrap(
+        home.to_path_buf(), duduclaw_license::PublicKeyRegistry::new(),
+    ).await);
+    handler
+}
+
 fn ctx(role: UserRole) -> UserContext {
     UserContext {
         credential_epoch: 0,
@@ -44,7 +52,7 @@ fn add_agent(home: &std::path::Path, id: &str, status: &str) {
 #[tokio::test]
 async fn license_sync_refuses_non_admins_before_any_work() {
     let home = tempfile::tempdir().unwrap();
-    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    let handler = handler_for(home.path()).await;
     for role in [UserRole::Manager, UserRole::Employee] {
         let frame = handler.handle("license.sync", json!({}), &ctx(role)).await;
         let text = error_text(&frame);
@@ -66,7 +74,7 @@ async fn license_rpcs_are_refused_on_pre_auth_and_password_change_entry_points()
     use crate::power_local::RpcConnInfo;
     let home = tempfile::tempdir().unwrap();
     std::fs::write(home.path().join("config.toml"), "[auth]\nmfa_enforced=false\n").unwrap();
-    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    let handler = handler_for(home.path()).await;
     let loopback = std::net::SocketAddr::from(([127, 0, 0, 1], 54321));
     for method in ["license.sync", "license.status"] {
         assert!(!crate::power_local::is_pre_auth_allowlisted(method), "{method}");
@@ -176,7 +184,7 @@ async fn license_status_reports_seat_limit_and_use_to_managers() {
     add_agent(home.path(), "seat-a", "active");
     add_agent(home.path(), "seat-b", "archived");
     add_agent(home.path(), "seat-c", "deleted");
-    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    let handler = handler_for(home.path()).await;
     handler.set_agent_cap_fixture(Some(5)).await;
     let data = payload(&handler.handle("license.status", json!({}), &ctx(UserRole::Manager)).await);
     assert_eq!(data["seat_limit"], 5);
@@ -199,7 +207,7 @@ async fn license_status_reports_seat_limit_and_use_to_managers() {
 async fn license_sync_reports_present_unreadable_file_without_vendor_call() {
     let home = tempfile::tempdir().unwrap();
     std::fs::write(home.path().join("license.json"), "{invalid json").unwrap();
-    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    let handler = handler_for(home.path()).await;
     let status = payload(&handler.handle("license.status", json!({}), &UserContext::admin_fallback()).await);
     assert_eq!(status["installed"], true);
     assert_eq!(status["validation_warning"], "unreadable");
@@ -221,7 +229,7 @@ async fn license_sync_reports_fifo_as_unreadable_without_opening_it() {
         home.path().join("license.json").as_path(),
         nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
     ).unwrap();
-    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    let handler = handler_for(home.path()).await;
     let sync = payload(&handler.handle("license.sync", json!({}), &UserContext::admin_fallback()).await);
     assert_eq!(sync["sync"]["outcome"], "unreadable_license_file");
     assert_eq!(sync["sync"]["reason"], "unreadable");
@@ -231,7 +239,7 @@ async fn license_sync_reports_fifo_as_unreadable_without_opening_it() {
 #[tokio::test]
 async fn license_sync_reports_no_license_when_file_is_absent() {
     let home = tempfile::tempdir().unwrap();
-    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    let handler = handler_for(home.path()).await;
     let sync = payload(&handler.handle("license.sync", json!({}), &UserContext::admin_fallback()).await);
     assert_eq!(sync["sync"]["outcome"], "no_license");
     assert_eq!(sync["installed"], false);
@@ -244,7 +252,7 @@ async fn unreadable_seat_count_is_null_not_zero() {
     use std::os::unix::fs::PermissionsExt as _;
     let home = tempfile::tempdir().unwrap();
     add_agent(home.path(), "seat-a", "active");
-    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    let handler = handler_for(home.path()).await;
     handler.set_agent_cap_fixture(Some(3)).await;
     let agents = home.path().join("agents");
     std::fs::set_permissions(&agents, std::fs::Permissions::from_mode(0o000)).unwrap();
@@ -263,7 +271,7 @@ async fn license_sync_response_carries_outcome_seats_and_restart_flag() {
     use crate::license_runtime::SyncOutcome;
     let home = tempfile::tempdir().unwrap();
     add_agent(home.path(), "seat-a", "active");
-    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    let handler = handler_for(home.path()).await;
     handler.set_agent_cap_fixture(Some(4)).await;
     for (outcome, code) in [
         (SyncOutcome::Updated, "updated"),

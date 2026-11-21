@@ -73,7 +73,7 @@ impl MethodHandler {
         if key.chars().count() > 64_000 {
             return WsFrame::error_response("", "授權金鑰內容過長");
         }
-        let Some(runtime) = crate::license_runtime::global() else {
+        let Some(runtime) = self.license_runtime.as_ref().or_else(|| crate::license_runtime::global()) else {
             return WsFrame::error_response("", "授權服務尚未就緒，請稍後再試");
         };
         let license = match crate::license_runtime::parse_license_key(key) {
@@ -98,7 +98,7 @@ impl MethodHandler {
     /// `restart_recommended` (the edition resolved now differs from the one
     /// this gateway booted with). Seat limit and expiry apply immediately.
     pub(crate) async fn handle_license_sync(&self) -> WsFrame {
-        let Some(runtime) = crate::license_runtime::global() else {
+        let Some(runtime) = self.license_runtime.as_ref().or_else(|| crate::license_runtime::global()) else {
             return WsFrame::error_response("", "授權服務尚未就緒，請稍後再試");
         };
         let outcome = runtime.sync_now().await;
@@ -158,7 +158,7 @@ impl MethodHandler {
 
     /// The `license.status` payload: snapshot plus seat fields.
     async fn license_status_payload(&self, is_admin: bool) -> Result<Value, String> {
-        let snapshot = match crate::license_runtime::global() {
+        let snapshot = match self.license_runtime.as_ref().or_else(|| crate::license_runtime::global()) {
             Some(runtime) => runtime.snapshot().await,
             None => crate::license_runtime::LicenseSnapshot {
                 tier: duduclaw_license::LicenseTier::OpenSource,

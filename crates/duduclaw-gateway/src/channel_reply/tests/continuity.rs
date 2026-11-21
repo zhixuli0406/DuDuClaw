@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 struct Seen {
     prompt: String,
     system_prompt: String,
+    model: String,
     history: Vec<(String, String)>,
     /// Grok / generic CLI: the real single-argument payload.
     payload: Option<String>,
@@ -51,6 +52,7 @@ impl AgentRuntime for Recorder {
         self.log.0.lock().unwrap().push((self.id, Seen {
             prompt: prompt.to_string(),
             system_prompt: context.system_prompt.clone(),
+            model: context.model.clone(),
             history: context.conversation_history.iter().map(|t| (t.role.clone(), t.content.clone())).collect(),
             payload,
         }));
@@ -87,15 +89,19 @@ async fn fixture(primary: RuntimeType, fallback: Option<RuntimeType>, primary_fa
     std::fs::write(home.path().join("config.toml"),
         "[general]\ninference_mode='claude'\n[goal_intent]\nenabled=false\nmode='off'\n").unwrap();
     let dir = home.path().join("agents/worker");
-    std::fs::create_dir_all(&dir).unwrap();
-    let fallback_line = fallback.map(|f| format!("fallback='{}'\n", f.as_str())).unwrap_or_default();
-    std::fs::write(dir.join("agent.toml"), format!(
-        "[agent]\nname='worker'\ndisplay_name='Actual Worker'\nrole='specialist'\nstatus='active'\ntrigger='@Worker'\nreports_to=''\nicon='🤖'\n\
-         [model]\npreferred='{}'\nfallback=''\naccount_pool=[]\n[runtime]\nprovider='{}'\n{fallback_line}\
-         [heartbeat]\nenabled=false\ninterval_seconds=3600\nmax_concurrent_runs=1\ncron=''\n\
-         [permissions]\nallowed_channels=['*']\n[goal_intent]\nenabled=false\nmode='off'\n[evolution]\nenabled=false\n",
-        preferred_model(primary), primary.as_str(),
-    )).unwrap();
+    crate::trigger_route::tests::write_agent(&home.path().join("agents"), "worker", "Actual Worker", "@Worker", "specialist", "");
+    let path = dir.join("agent.toml");
+    let mut config: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+    config["model"]["preferred"] = preferred_model(primary).into();
+    config["permissions"]["allowed_channels"] = toml::Value::Array(vec!["*".into()]);
+    let mut runtime = toml::Table::new();
+    runtime.insert("provider".into(), primary.as_str().into());
+    if let Some(fallback) = fallback { runtime.insert("fallback".into(), fallback.as_str().into()); }
+    config.insert("runtime".into(), runtime.into());
+    config.insert("goal_intent".into(), toml::toml! { enabled = false
+mode = "off" }.into());
+    std::fs::write(path, toml::to_string_pretty(&config).unwrap()).unwrap();
+    duduclaw_agent::AgentRegistry::load_agent(&dir).await.unwrap();
     if let Some(soul) = soul {
         std::fs::write(dir.join("SOUL.md"), soul).unwrap();
     }
@@ -258,4 +264,18 @@ async fn claude_employee_turn_carries_history_summary_and_pinned() {
     assert!(prompt.contains("ROLLING-SUMMARY-MARKER") && prompt.contains("PINNED-MARKER"), "{prompt}");
     let history = captured["history"].to_string();
     for k in 6..=8 { assert!(history.contains(&format!("OLD-ROW-{k}")), "{history}"); }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn kiro_without_model_passes_alignment_and_dispatch_without_a_claude_id() {
+    let f = fixture(RuntimeType::Kiro, None, false, None).await;
+    let path = f.ctx.home_dir.join("agents/worker/agent.toml");
+    let mut config: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+    config["model"].as_table_mut().unwrap().remove("preferred");
+    std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+    let reply = turn(&f, "discord:kiro-default", "hello").await;
+    assert!(reply.contains("REPLY-1-FROM-kiro"), "{reply}");
+    let seen = f.log.of(RuntimeType::Kiro);
+    assert_eq!(seen.len(), 1);
+    assert!(seen[0].model.is_empty(), "CLI settings own the model: {:?}", seen[0].model);
 }

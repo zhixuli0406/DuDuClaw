@@ -223,7 +223,7 @@ fn assemble(system_prompt: &str, history: &[ConversationTurn], safe_prompt: &str
     let with_history = if history.is_empty() {
         safe_prompt.to_string()
     } else {
-        super::format_history_as_prompt(history, safe_prompt)
+        super::format_history_as_prompt_uncapped(history, safe_prompt)
     };
     if system_prompt.is_empty() {
         with_history

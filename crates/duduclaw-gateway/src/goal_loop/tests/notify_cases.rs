@@ -334,13 +334,12 @@ async fn forged_markers_only_affect_the_task_they_name() {
         // The task "victim:9"'s marker is not "victim"'s episode 9.
         ("goal_needs_human_notified:victim:9:1", "victim:9"),
         // A task-id prefix ending in a colon is not a complete marker suffix.
-        ("goal_needs_human_notified:victim:9:1", "victim"),
+        ("goal_needs_human_notified:victim:9:2", "victim"),
         ("goal_needs_human_cleared:victim:9:1", "victim"),
         ("goal_needs_human_notified:victim:1x", "victim"),
         ("goal_needs_human_notified:victim:", "victim"),
-        // A real task id containing a colon still owns its decimal suffix.
-        ("goal_needs_human_notified:victim:9:1", "victim:9"),
-        ("goal_needs_human_notified:victim:3", "victim"),
+        // A valid victim marker uses a distinct primary key from the forged bystander row.
+        ("goal_needs_human_notified:victim:4", "victim"),
         // A well-formed "notified" marker far ahead of victim's real state
         // (no entry observed, no cleared episode 41).
         ("goal_needs_human_notified:victim:42", "victim"),
@@ -372,15 +371,24 @@ async fn forged_markers_only_affect_the_task_they_name() {
     // One pass: the forged "ahead" marker suppresses victim's card (the
     // accepted limitation) and nothing else; the other parked task is
     // notified as usual, and no task gains a "cleared" marker.
+    let mut cleared_before = Vec::new();
+    for task in ["victim", "other", "victim:9", "bystander"] {
+        let mut ids = store.activity_ids_with_prefix(task, &format!("goal_needs_human_cleared:{task}:"))
+            .await.unwrap();
+        ids.sort();
+        cleared_before.push((task, ids));
+    }
     d.reconcile_needs_human().await;
     assert_eq!(needs_human_attempts(&store, "victim").await, 0);
     assert_eq!(needs_human_attempts(&store, "other").await, 1);
-    for task in ["victim", "other", "victim:9", "bystander"] {
-        let cleared = store
+    for (task, before) in cleared_before {
+        let mut cleared = store
             .activity_ids_with_prefix(task, &format!("goal_needs_human_cleared:{task}:"))
             .await
             .unwrap();
-        assert!(cleared.is_empty(), "{task}: {cleared:?}");
+        cleared.sort();
+        // The forged rows above remain; reconciliation must add no cleared marker.
+        assert_eq!(cleared, before, "{task}: no new cleared markers");
     }
     assert_eq!(d.needs_human_episode("other").await.unwrap().seq, 1);
 }

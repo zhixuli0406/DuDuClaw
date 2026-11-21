@@ -894,6 +894,8 @@ mod model_frame_tests {
 
     /// Exercise the real terminal sender and its subscription acknowledgements.
     async fn delivered_frames(actual: &str, refused: bool, acknowledge: bool) -> Vec<serde_json::Value> {
+        // The real turn supervisor holds delivery open through terminal publication.
+        let (frames, cleanup) = crate::channel_reply::with_delivery_cleanup(async {
         let home = tempfile::tempdir().unwrap();
         crate::team_edition::record(home.path(), duduclaw_core::EditionProfile::Enterprise);
         std::fs::create_dir_all(home.path().join("agents")).unwrap();
@@ -907,8 +909,10 @@ mod model_frame_tests {
             Arc::new(JwtConfig::new(b"model-frame-test-key")), users,
         ));
         let sid = "webchat:model-frame";
-        let guarded = crate::channel_reply::build_guarded_reply_with_session(
-            "hello", &state.ctx, sid, &admin.id, None,
+        let guarded = crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.scope(
+            admin.id.clone(), crate::channel_reply::build_guarded_reply_with_session(
+                "hello", &state.ctx, sid, &admin.id, None,
+            ),
         ).await;
         assert!(guarded.no_responder_notice());
         if refused { guarded.refuse_delivery(); }
@@ -930,8 +934,7 @@ mod model_frame_tests {
             loop {
                 tokio::select! {
                     biased;
-                    output = rx.recv() => {
-                        let output = output.expect("subscription remains open");
+                    Some(output) = rx.recv() => {
                         assert!(output.route.is_some(), "metadata must use the fenced subscription");
                         if let Message::Text(text) = &output.message {
                             frames.push(serde_json::from_str::<serde_json::Value>(text).unwrap());
@@ -942,6 +945,9 @@ mod model_frame_tests {
                 }
             }
         }).await.expect("terminal sender did not finish");
+        frames
+        }).await;
+        cleanup.unwrap();
         frames
     }
 

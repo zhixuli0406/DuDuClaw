@@ -366,7 +366,7 @@ async fn build_guarded_reply_for_agent_inner(
     let final_text = crate::knowledge::cite_turn::with_footer(final_text, session_id, &cited);
     let language = crate::prompt_identity::resolve_reply_language_for_id(&ctx.home_dir, &agent_id).await;
     let final_text = crate::prompt_identity::normalize_channel_reply(
-        &crate::dispatcher::sanitize_for_channel(&final_text), language.as_deref());
+        &sanitize_delivery_reply(&final_text), language.as_deref());
     if fixed_notice {
         delivery.bind_live_only_notice(&final_text);
     }
@@ -485,7 +485,7 @@ async fn build_guarded_reply_with_session_inner(
     let final_text = append_product_footer(with_sources, session_id);
     let language = crate::prompt_identity::resolve_reply_language_for_id(&ctx.home_dir, &agent_id).await;
     let final_text = crate::prompt_identity::normalize_channel_reply(
-        &crate::dispatcher::sanitize_for_channel(&final_text), language.as_deref());
+        &sanitize_delivery_reply(&final_text), language.as_deref());
     if fixed_notice {
         delivery.bind_live_only_notice(&final_text);
     }
@@ -604,4 +604,32 @@ pub async fn build_guarded_reply_with_session(
     session_id: &str, user_id: &str, on_progress: Option<ProgressCallback>,
 ) -> GuardedReply {
     super::observe_turn(ctx, Box::pin(build_guarded_reply_with_session_inner(text, ctx, session_id, user_id, on_progress))).await
+}
+
+/// DELIVER lines are internal transport instructions, consumed by the document
+/// delivery gate before channel output. Redact visible prose without destroying
+/// the path that that gate must validate and open.
+fn sanitize_delivery_reply(text: &str) -> String {
+    text.lines().filter(|line| !line.contains("[DUDUCLAW_SYSTEM:")).map(|line| {
+        if line.trim().starts_with(crate::office_docs::DELIVER_MARKER) {
+            line.to_string()
+        } else {
+            crate::dispatcher::sanitize_for_channel(line)
+        }
+    }).collect::<Vec<_>>().join("\n")
+}
+
+#[cfg(test)]
+mod delivery_sanitizing_tests {
+    #[test]
+    fn document_instructions_survive_while_visible_paths_are_redacted() {
+        let text = "報告在 /private/employee/report.docx\n📎DELIVER:/private/employee/report.docx";
+        let sanitized = super::sanitize_delivery_reply(text);
+        let (visible, paths) = crate::office_docs::parse_deliverables(&sanitized);
+        assert_eq!(visible, "報告在 [path]");
+        assert_eq!(paths, ["/private/employee/report.docx"]);
+        assert_eq!(crate::dispatcher::sanitize_for_channel("US$5.00 / 上限 US$5.00"),
+            "US$5.00 / 上限 US$5.00");
+        assert_eq!(crate::dispatcher::sanitize_for_channel("(/private/report.docx)"), "([path])");
+    }
 }

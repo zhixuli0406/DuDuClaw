@@ -3564,7 +3564,9 @@ async fn call_with_rotation(
 
     let budget_dir = identity.config_dir.or(work_dir).map(Path::to_path_buf).unwrap_or_else(||
         crate::budget::agent_dir_for_id(home_dir, agent_id));
-    crate::budget::gate_before_spawn(home_dir, Some(&budget_dir), agent_id, "claude_rotation")
+    // The budget gate retains the growing AgentTomlSections across its anomaly
+    // scan await. Keep that configuration out of the rotation future frame.
+    Box::pin(crate::budget::gate_before_spawn(home_dir, Some(&budget_dir), agent_id, "claude_rotation"))
         .await.map_err(|e| e.legacy_message())?;
     let rotator = get_rotator(home_dir).await?;
 
@@ -3636,7 +3638,7 @@ async fn call_with_rotation(
     for attempt in 0..max_attempts {
         let budget_dir = identity.config_dir.or(work_dir).map(Path::to_path_buf).unwrap_or_else(||
             crate::budget::agent_dir_for_id(home_dir, agent_id));
-        crate::budget::gate_before_spawn(home_dir, Some(&budget_dir), agent_id, "claude_rotation_attempt")
+        Box::pin(crate::budget::gate_before_spawn(home_dir, Some(&budget_dir), agent_id, "claude_rotation_attempt"))
             .await.map_err(|e| e.legacy_message())?;
         let selected = match rotator
             .select_with_pool_excluding(account_pool, &tried)

@@ -2399,7 +2399,7 @@ pub(crate) mod tests {
                 crate::runtime_dispatch::CHANNEL_REPLY_PARTIAL.scope((), crate::runtime_dispatch::UTILITY_CALL.scope((), call)).await.unwrap_err()
             } else { crate::runtime_dispatch::CHANNEL_REPLY_PARTIAL.scope((), call).await.unwrap_err() };
             assert_eq!(crate::work_outcome::WorkOutcome::decode(&error), Some(crate::work_outcome::WorkOutcome::TimeoutTotal {
-                seconds:300, partial:"PASS".into() }));
+                seconds: crate::runtime_config::DEFAULT_RUN_TIMEOUT_SECS, partial:"PASS".into() }));
         }
     }
 
