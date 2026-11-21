@@ -2575,6 +2575,7 @@ export interface LicenseSyncResult extends LicenseSnapshot {
       | 'revoked'
       | 'pending_rebind'
       | 'no_license'
+      | 'unreadable_license_file'
       | 'offline'
       | 'failed'
       | 'busy';

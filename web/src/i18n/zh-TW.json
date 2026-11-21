@@ -1721,6 +1721,7 @@
   "license.sync.outcome.revoked": "授權已被撤銷",
   "license.sync.outcome.pendingRebind": "等待原廠核准換機",
   "license.sync.outcome.noLicense": "尚未安裝商用授權，沒有需要同步的內容",
+  "license.sync.outcome.unreadableLicenseFile": "這台主機上有授權檔，但內容無法讀取。請重新匯入授權，或請管理員檢查該檔案。",
   "license.sync.outcome.offline": "目前連不上原廠，稍後會自動再試",
   "license.sync.outcome.failed": "這次同步沒有完成，稍後會自動再試",
   "license.sync.outcome.busy": "剛剛已同步過，請 {seconds} 秒後再試",

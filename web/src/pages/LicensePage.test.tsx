@@ -146,6 +146,7 @@ describe('LicensePage refresh and seats', () => {
     ['revoked', 'The license has been revoked'],
     ['pending_rebind', 'Waiting for the vendor to approve the machine change'],
     ['failed', 'This sync did not finish. It will retry automatically.'],
+    ['unreadable_license_file', 'A license file exists on this host, but its contents cannot be read. Re-import the license or ask an administrator to check the file.'],
   ] as const)('admin sync outcome %s is shown in plain words', async (outcome, text) => {
     const user = userEvent.setup();
     mockGateway(licensed, syncReply(outcome));

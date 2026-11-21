@@ -195,6 +195,49 @@ async fn license_status_reports_seat_limit_and_use_to_managers() {
     assert_eq!(data["seats_used"], 2);
 }
 
+#[tokio::test]
+async fn license_sync_reports_present_unreadable_file_without_vendor_call() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("license.json"), "{invalid json").unwrap();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    let status = payload(&handler.handle("license.status", json!({}), &UserContext::admin_fallback()).await);
+    assert_eq!(status["installed"], true);
+    assert_eq!(status["validation_warning"], "unreadable");
+
+    let sync = payload(&handler.handle("license.sync", json!({}), &UserContext::admin_fallback()).await);
+    assert_eq!(sync["sync"]["outcome"], "unreadable_license_file");
+    assert_eq!(sync["sync"]["reason"], "unreadable");
+    assert!(!sync["sync"]["message"].as_str().unwrap().contains("invalid json"));
+    assert_eq!(sync["installed"], true);
+    assert_eq!(sync["validation_warning"], "unreadable");
+    assert!(home.path().join("license.json").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn license_sync_reports_fifo_as_unreadable_without_opening_it() {
+    let home = tempfile::tempdir().unwrap();
+    nix::unistd::mkfifo(
+        home.path().join("license.json").as_path(),
+        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+    ).unwrap();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    let sync = payload(&handler.handle("license.sync", json!({}), &UserContext::admin_fallback()).await);
+    assert_eq!(sync["sync"]["outcome"], "unreadable_license_file");
+    assert_eq!(sync["sync"]["reason"], "unreadable");
+    assert_eq!(sync["installed"], true);
+}
+
+#[tokio::test]
+async fn license_sync_reports_no_license_when_file_is_absent() {
+    let home = tempfile::tempdir().unwrap();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    let sync = payload(&handler.handle("license.sync", json!({}), &UserContext::admin_fallback()).await);
+    assert_eq!(sync["sync"]["outcome"], "no_license");
+    assert_eq!(sync["installed"], false);
+    assert!(sync["validation_warning"].is_null());
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn unreadable_seat_count_is_null_not_zero() {
@@ -228,6 +271,7 @@ async fn license_sync_response_carries_outcome_seats_and_restart_flag() {
         (SyncOutcome::Revoked, "revoked"),
         (SyncOutcome::PendingRebind, "pending_rebind"),
         (SyncOutcome::NoLicense, "no_license"),
+        (SyncOutcome::UnreadableLicenseFile { reason: "unreadable" }, "unreadable_license_file"),
         (SyncOutcome::Offline { reason: "network" }, "offline"),
         (SyncOutcome::Failed { reason: "storage" }, "failed"),
         (SyncOutcome::Busy { retry_after_secs: 7 }, "busy"),

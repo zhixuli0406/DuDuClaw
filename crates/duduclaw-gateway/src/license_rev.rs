@@ -276,7 +276,7 @@ impl RevProbeState {
             }
             // Another sync ran moments ago; try again on the normal cadence.
             SyncOutcome::Busy { .. } => normal_interval(),
-            SyncOutcome::Offline { reason } | SyncOutcome::Failed { reason } => self.transient(reason),
+            SyncOutcome::Offline { reason } | SyncOutcome::Failed { reason } | SyncOutcome::UnreadableLicenseFile { reason } => self.transient(reason),
         }
     }
 

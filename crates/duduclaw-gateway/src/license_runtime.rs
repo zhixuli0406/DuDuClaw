@@ -411,6 +411,12 @@ impl SyncGate {
     fn last_outcome(&self) -> Option<SyncOutcome> {
         self.last.lock().ok().and_then(|last| last.clone())
     }
+
+    fn rejected_reason(&self) -> Option<&'static str> {
+        self.rejected.lock().ok().and_then(|rejected| {
+            rejected.as_ref().filter(|entry| entry.at.elapsed() < REJECTED_RETRY).map(|_| "unreadable")
+        })
+    }
 }
 
 /// Cheap identity of the files a CLI writer changes: type, length,
@@ -569,6 +575,8 @@ pub enum SyncOutcome {
     PendingRebind,
     /// No licence installed; nothing to sync.
     NoLicense,
+    /// A licence file exists but is unusable; no vendor request was made.
+    UnreadableLicenseFile { reason: &'static str },
     /// The control plane could not be reached or gave no acceptable answer;
     /// the installed licence is unchanged.
     Offline { reason: &'static str },
@@ -587,6 +595,7 @@ impl SyncOutcome {
             Self::Revoked => "revoked",
             Self::PendingRebind => "pending_rebind",
             Self::NoLicense => "no_license",
+            Self::UnreadableLicenseFile { .. } => "unreadable_license_file",
             Self::Offline { .. } => "offline",
             Self::Failed { .. } => "failed",
             Self::Busy { .. } => "busy",
@@ -607,6 +616,7 @@ impl SyncOutcome {
             Self::Revoked => "授權已被撤銷，目前以開源模式執行。".to_string(),
             Self::PendingRebind => "等待原廠核准換機：帳號持有人在控制台核准後才會生效。".to_string(),
             Self::NoLicense => "尚未安裝商用授權，沒有需要同步的內容。".to_string(),
+            Self::UnreadableLicenseFile { .. } => "主機上有授權檔，但內容無法讀取。請重新匯入授權，或請管理員檢查該檔案。".to_string(),
             Self::Offline { .. } => "目前連不上原廠，稍後會自動再試。".to_string(),
             Self::Failed { .. } => "同步沒有完成，稍後會自動再試。".to_string(),
             Self::Busy { retry_after_secs } => format!("剛剛已同步過，請 {retry_after_secs} 秒後再試。"),
@@ -617,7 +627,7 @@ impl SyncOutcome {
     pub fn to_json(&self) -> serde_json::Value {
         let mut value = json!({ "outcome": self.as_str(), "message": self.message() });
         match self {
-            Self::Offline { reason } | Self::Failed { reason } => value["reason"] = json!(reason),
+            Self::Offline { reason } | Self::Failed { reason } | Self::UnreadableLicenseFile { reason } => value["reason"] = json!(reason),
             Self::Busy { retry_after_secs } => value["retry_after_secs"] = json!(retry_after_secs),
             _ => {}
         }
@@ -1985,6 +1995,10 @@ impl LicenseRuntime {
         }
         self.reconcile_with_disk(true).await;
         if self.notice_identity().await.is_none() {
+            let warning = self.state.read().await.validation_warning;
+            if let Some(reason) = self.sync.rejected_reason().or(warning) {
+                return self.sync.finish(SyncOutcome::UnreadableLicenseFile { reason });
+            }
             return self.sync.finish(SyncOutcome::NoLicense);
         }
         let now = tokio::time::Instant::now();
