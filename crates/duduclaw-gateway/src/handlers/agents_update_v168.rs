@@ -212,6 +212,9 @@ pub(crate) fn apply_advanced_kv(table: &mut toml::Table, params: &Value, is_admi
         if KV_DEAD_SECTIONS.contains(&segs[0]) {
             return Err(format!("advanced_kv[{i}]: [{}] is not read by anything and is no longer editable", segs[0]));
         }
+        if section == "memory" && key == "language" {
+            return Err("memory.language has its own validated setting".into());
+        }
         // Spend and safety knobs: admin only.
         let admin_only = matches!(segs[0], "guardrails" | "budget")
             || (segs[0] == "model" && key == "account_pool");
@@ -349,7 +352,7 @@ pub(crate) fn agent_settings_json(raw: &toml::Table) -> Value {
         "fork": pick(raw, "fork", &["enabled"]),
         "team": team,
         "guardrails": pick(raw, "guardrails", &["enabled", "block_secrets", "block_injection_echo", "redact_pii", "deny_phrases"]),
-        "memory": pick(raw, "memory", &["decision_continuity", "decision_ttl_days"]),
+        "memory": pick(raw, "memory", &["language", "decision_continuity", "decision_ttl_days"]),
         "night_engine": pick(raw, "night_engine", &["enabled"]),
         "channels": pick(raw, "channels", &["public_trigger"]),
         "evolution": evolution,

@@ -3542,6 +3542,7 @@ export interface AgentUpdateParams {
   /** `[prompt] reply_language`: `auto` | `zh-TW` | `zh-CN` | `en` | `ja-JP`;
    *  empty string clears the override (inherit the global default). */
   reply_language?: string;
+  memory_language?: string;
 }
 
 // ── WP4: agent handoff (offboard with transfer) ─────────────────
@@ -3650,6 +3651,7 @@ export interface AgentGuardrailsSection {
 }
 
 export interface AgentMemorySection {
+  language?: string;
   decision_continuity?: boolean;
   decision_ttl_days?: number;
 }

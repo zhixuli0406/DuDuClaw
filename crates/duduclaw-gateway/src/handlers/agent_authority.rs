@@ -107,6 +107,7 @@ pub(crate) const AUTHORITY: &[AuthorityKey] = &[
     // `--bare` skips the hooks, the employee file guard included.
     key("prompt.cli_bare_mode", &[], Change),
     key("prompt.reply_language", &["form.reply_language"], Change),
+    key("memory.language", &["form.memory_language", "memory.language"], Change),
     // Widens what the employee watches on the machine.
     key("os_watch", &["osWatch."], Change),
     // Which accounts' quota the employee spends.

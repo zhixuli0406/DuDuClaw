@@ -149,7 +149,7 @@ export function kvRowsFromTable(section: string, table: Record<string, unknown> 
 /** Flat top-level `form.*` keys that map 1:1 onto an `agents.update` param. */
 const FLAT_FORM_KEYS: ReadonlyArray<keyof AgentUpdateParams> = [
   'display_name', 'role', 'status', 'trigger', 'icon', 'reports_to', 'department',
-  'api_mode', 'use_router', 'reply_language',
+  'api_mode', 'use_router', 'reply_language', 'memory_language',
   'monthly_limit_cents', 'warn_threshold_percent', 'hard_stop', 'when_unavailable',
   'heartbeat_enabled', 'heartbeat_interval', 'heartbeat_cron',
   'can_create_agents', 'can_send_cross_agent', 'can_modify_own_skills', 'can_modify_own_soul', 'can_schedule_tasks',
@@ -195,6 +195,8 @@ export const ADMIN_ONLY_FORM_PATHS_FALLBACK: ReadonlyArray<string> = [
   'runtime.provider',
   'runtime.fallback',
   'form.reply_language',
+  'form.memory_language',
+  'memory.language',
   'osWatch.',
   'adv.account_pool',
 ];

@@ -11611,5 +11611,8 @@
   "mcp.runtime.inProcess": "プロセス内ツールループ",
   "mcp.agentTomlNote": "読み取り専用。Claude・Codex・Grok はこの設定を使用しません。",
   "mcp.probe.saved": "{agent} の {server} を保存しました。起動確認：",
-  "mcp.probe.tools": "ツール {count} 件"
+  "mcp.probe.tools": "ツール {count} 件",
+  "settings.general.memoryLanguage": "記憶の言語",
+  "settings.general.memoryLanguage.help": "自動抽出した重要な事実、会話の記憶、要約はこの言語で書かれます。「返信言語に従う」を選ぶと、上の返信言語を使います。",
+  "settings.general.memoryLanguage.auto": "返信言語に従う"
 }

@@ -380,6 +380,17 @@ pub fn reply_language_reminder(setting: Option<&str>) -> Option<String> {
     ))
 }
 
+/// Explicit language rule for generated memory prose. Structured keys stay unchanged.
+pub fn memory_language_instruction(code: &str) -> &'static str {
+    match code {
+        "zh-TW" => "Write the output in Traditional Chinese as used in Taiwan (繁體中文／台灣用語). Never use Simplified Chinese characters, even if the input contains them. Keep proper nouns, code, identifiers and URLs unchanged.",
+        "zh-CN" => "Write the output in Simplified Chinese (简体中文). Keep proper nouns, code, identifiers and URLs unchanged.",
+        "en" => "Write the output in English. Keep proper nouns, code, identifiers and URLs unchanged.",
+        "ja-JP" => "Write the output in Japanese (日本語). Keep proper nouns, code, identifiers and URLs unchanged.",
+        _ => "Same language as input.",
+    }
+}
+
 /// Build the global default-language instruction line, if configured.
 ///
 /// `None` when `default_language` is `None`, empty or `auto` — callers should
@@ -419,6 +430,14 @@ pub fn identity_and_language_section(
 #[cfg(test)]
 mod reply_language_tests {
     use super::*;
+
+    #[test]
+    fn lenient_memory_language_wrong_types_are_unset() {
+        for value in ["true", "42", "[]", "{}"] {
+            let config: crate::types::MemoryConfig = toml::from_str(&format!("language = {value}\n")).unwrap();
+            assert_eq!(config.language, None);
+        }
+    }
 
     #[test]
     fn lenient_reply_language_wrong_types_inherit_global() {

@@ -585,6 +585,7 @@ function EditAgentPageContent() {
       // '' = no per-employee override (inherit the global reply language).
       reply_language:
         typeof agent.prompt?.reply_language === 'string' ? agent.prompt.reply_language : '',
+      memory_language: agent.memory?.language ?? 'auto',
       monthly_limit_cents: agent.budget?.monthly_limit_cents ?? 5000,
       warn_threshold_percent: agent.budget?.warn_threshold_percent ?? 80,
       hard_stop: agent.budget?.hard_stop ?? true,
@@ -1225,6 +1226,11 @@ function EditAgentPageContent() {
         : code === 'auto' ? 'settings.general.defaultLanguage.followInput'
         : `settings.general.defaultLanguage.${code}`,
     }),
+    raw: code,
+  }));
+  const memoryLanguageOptions: SelectOption[] = ['auto', 'zh-TW', 'zh-CN', 'en', 'ja-JP'].map((code) => ({
+    value: code,
+    label: t(code === 'auto' ? 'settings.general.memoryLanguage.auto' : `settings.general.defaultLanguage.${code}`),
     raw: code,
   }));
   const providerOptions: SelectOption[] = RUNTIME_PROVIDERS.filter(p => policy.allows('runtimes', p)).map((p) => ({ value: p, label: intl.formatMessage({ id: `agents.runtime.provider.${p}` }), raw: p }));
@@ -1930,6 +1936,7 @@ function EditAgentPageContent() {
                 </SettingsRow>
               )}
               <RowSelect disabled={!isAdmin} label={t('agents.edit.replyLanguage')} description={t('agents.edit.replyLanguage.help')} value={form.reply_language ?? ''} onChange={(v) => updateField('reply_language', v)} options={replyLanguageOptions} />
+              <RowSelect disabled={!isAdmin} label={t('settings.general.memoryLanguage')} description={t('settings.general.memoryLanguage.help')} value={form.memory_language ?? 'auto'} onChange={(v) => updateField('memory_language', v)} options={memoryLanguageOptions} />
               <RowSelect label={t('agents.adv.statusField')} value={form.status ?? 'active'} onChange={(v) => updateField('status', v)} options={statusOptions} />
             </SettingsCard>
             {adminHint}

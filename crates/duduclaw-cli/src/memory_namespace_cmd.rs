@@ -31,6 +31,23 @@ const ATTRIBUTING_TOOLS: &[&str] = &["memory_store", "memory_alias_add", "user_p
 
 #[derive(Subcommand, Debug)]
 pub enum MemoryCommands {
+    /// Convert Simplified memory text to Traditional with a character-level map (no model).
+    /// Ambiguous characters are left unchanged. Changed embeddings are cleared and need rebuilding.
+    #[command(group(ArgGroup::new("script_selector").required(true).args(["agent", "all"])))]
+    ConvertScript {
+        /// Only this agent's rows in memory.db
+        #[arg(long)]
+        agent: Option<String>,
+        /// All namespaces present in memory.db
+        #[arg(long)]
+        all: bool,
+        /// Print counts and up to ten before/after samples without changing rows
+        #[arg(long)]
+        dry_run: bool,
+        /// Apply the conversion (otherwise preview only)
+        #[arg(long)]
+        yes: bool,
+    },
     /// Inspect or move the pre-v1.68.0 shared memory pool (internal/gateway-internal)
     MigrateNamespace {
         #[command(subcommand)]
@@ -134,6 +151,40 @@ fn agent_session_refusal(id: &str, token: &str) -> Option<String> {
 pub async fn run(home: &Path, cmd: MemoryCommands) -> Result<()> {
     let command = match cmd {
         MemoryCommands::MigrateNamespace { command } => command,
+        MemoryCommands::ConvertScript { agent, all, dry_run, yes } => {
+            if !crate::ai_session_guard::markers().is_empty() {
+                return Err(DuDuClawError::Agent("memory convert-script cannot run inside an AI employee session; use an operator terminal.".into()));
+            }
+            let db = home.join("memory.db");
+            if !db.is_file() {
+                return Err(DuDuClawError::Memory("memory.db does not exist".into()));
+            }
+            let engine = SqliteMemoryEngine::new(&db)?;
+            let agents = if all { engine.script_conversion_agents().await? }
+                else { vec![agent.ok_or_else(|| DuDuClawError::Memory("--agent or --all is required".into()))?] };
+            let preview = dry_run || !yes;
+            let mut sample_budget = 10usize;
+            for id in agents {
+                let report = engine.convert_memory_script(&id, preview).await?;
+                println!("{id}: key_facts={}, memories={}, changed={}, embeddings_cleared={} ({})",
+                    report.key_facts, report.memories, report.changed, report.embeddings_cleared,
+                    if preview { "dry-run" } else { "applied" });
+                if !preview {
+                    duduclaw_security::audit::append_audit_event(home,
+                        &duduclaw_security::audit::AuditEvent::new(
+                            "memory_script_converted", &id, duduclaw_security::audit::Severity::Info,
+                            serde_json::json!({"key_facts": report.key_facts, "memories": report.memories,
+                                "changed": report.changed, "embeddings_cleared": report.embeddings_cleared}),
+                        ));
+                }
+                for (table, before, after) in report.samples.into_iter().take(sample_budget) {
+                    sample_budget -= 1;
+                    println!("[{table}] before: {before}\nafter: {after}");
+                }
+            }
+            println!("Character-level conversion; ambiguous characters are unchanged. Changed embeddings are cleared and require rebuilding by the configured embedding provider. Apply with --yes.");
+            return Ok(());
+        }
         MemoryCommands::ForgetSource { command } => {
             // Refuses AI sessions itself (and audits the refusal).
             let out = crate::memory_forget_cmd::run(home, command).await?;
