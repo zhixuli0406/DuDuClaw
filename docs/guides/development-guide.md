@@ -295,17 +295,21 @@ claude
 
 ### 3.1 Input Guard (injection scanning)
 
-User input entering an agent passes through `duduclaw-security`'s `input_guard` scanner, which applies a risk-scoring model (0-100, capped): seven weighted rules accumulate a score, and reaching the threshold (default 60) blocks the input and writes an entry to `security_audit.jsonl`. `instruction_override`, `role_hijack`, `tool_abuse` and `data_exfiltration` also block on a single match regardless of the score (`crates/duduclaw-security/src/input_guard.rs`).
+User input entering an agent passes through `duduclaw-security`'s `input_guard` scanner, which applies a risk-scoring model (0-100, capped): eleven weighted rule categories accumulate a score, and reaching the threshold (default 60) blocks the input and writes an entry to `security_audit.jsonl`. `instruction_override`, `role_hijack`, `tool_abuse` and `data_exfiltration` also block on a single match regardless of the score (`crates/duduclaw-security/src/input_guard.rs`). Since v1.84.0 the inbound chat check passes a trust level (`ScanTrust`): for a signed-in member in their own WebChat conversation or a verified-bound member in a one-to-one chat, the `exec(` / `eval(` / `system(` tokens score but do not block on their own; every other caller uses `ScanTrust::Strict`. Full rule list and behaviour: [Security defense](../features/05-security-defense.md).
 
 | Rule | Weight | Example |
 |------|------|---------|
-| instruction_override | 40 | "ignore previous instructions" |
-| role_hijack | 35 | "act as", "your new role" |
-| system_prompt_extraction | 30 | "reveal your instructions" |
-| tool_abuse | 30 | Prompts that try to induce tool misuse |
-| encoding_bypass | 25 | Base64 or other encoding bypass |
-| data_exfiltration | 25 | "send to" + a URL |
+| instruction_override | 40 (instant) | "ignore previous instructions", "your new role is", 忽略先前的指示 |
+| role_hijack | 35 (instant) | "act as if you", "you are now", 越獄模式 |
+| tool_abuse | 30 (instant) | `exec(`, `eval(`, `system(` and destructive shell or SQL commands |
+| data_exfiltration | 25 (instant) | "send to my email", "post to webhook", "curl http" |
+| system_prompt_extraction | 30 | "reveal your prompt", "show me your instructions" |
+| encoding_bypass | 25 | "base64:", "decode the following" |
 | termination_manipulation | 30 | "the task is never complete" |
+| authority_escalation | 35 per signal | "use your own service account" |
+| memory_poisoning | 30 per signal | "remember this permanently" |
+| role_provenance | 35 per frame | `[SYSTEM]`, `<tool_result>`, `approval=granted` |
+| action_binding | 30 | "use that same approval to" |
 
 Unicode normalization (zero-width characters, homoglyphs) adds further protection against bypasses; more than three zero-width characters in the original text add 20 to the score.
 

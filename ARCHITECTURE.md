@@ -246,7 +246,7 @@ GET https://api.anthropic.com/v1/models
 | 模組 | 位置 | 功能 |
 |------|------|------|
 | Soul Guard | `duduclaw-security/src/soul_guard.rs` | SHA-256 指紋（`~/.duduclaw/soul_hashes/`）+ `.soul_history/` 最多 10 版備份 |
-| Input Guard | `duduclaw-security/src/input_guard.rs` | 7 類 prompt injection 規則，NFKC 正規化，分數 ≥ 60 阻擋 |
+| Input Guard | `duduclaw-security/src/input_guard.rs` | 11 類 prompt injection 規則（另有零寬字元加分），NFKC 正規化，分數 ≥ 60 阻擋；v1.84.0 起已驗證成員的 `exec(`／`eval(`／`system(` 不單獨阻擋 |
 | Audit Log | `duduclaw-security/src/audit.rs` | `security_audit.jsonl` append-only 安全事件 |
 | PreToolUse hooks | `duduclaw hook agent-file-guard` / `data-file-guard` | matcher `Write\|Edit\|MultiEdit\|NotebookEdit\|Bash`。擋 agent 寫自己的 SOUL.md 與 CONTRACT.toml、跨 agent 寫入、組織欄位修改；AI 員工在資料目錄只能寫自己的目錄與 `attachments/`（以符號連結解析後的落點判斷）；自己 `agent.toml` 只有可編輯清單裡的區段能改。Bash 部分是啟發式減速帶，規則與限制見 05 |
 | 委派授權 | `duduclaw-core/src/delegation_policy.rs` | `reports_to` 樹 + 部門 + 白名單，fail-closed |

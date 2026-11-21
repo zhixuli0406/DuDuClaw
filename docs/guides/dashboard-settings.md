@@ -6,7 +6,7 @@ These three cards are Admin-only and save through the locked configuration write
 
 | Card / field | `config.toml` key | Default / allowed range |
 |---|---|---|
-| Single-run / default seconds | `[runtime] default_timeout_secs` | Optional; 30 up to `max_timeout_secs`. Blank removes the override: Claude keeps 1800 seconds, other runtimes keep 300. |
+| Single-run / default seconds | `[runtime] default_timeout_secs` | Optional; 30 up to `max_timeout_secs`. Blank removes the override: every runtime uses 1800 seconds (never above the ceiling). Before v1.84.0, runtimes other than Claude used 300. |
 | Single-run / ceiling seconds | `[runtime] max_timeout_secs` | 3600; 60–14400 seconds. Raising it allows long runs to consume more quota. |
 | Single-run / default steps | `[runtime] default_max_turns` | 50; 1 up to the step ceiling. More steps can use more quota and time. |
 | Single-run / step ceiling | `[runtime] max_turns_limit` | 200; 1–10000. Administrator only. |
@@ -18,7 +18,7 @@ These three cards are Admin-only and save through the locked configuration write
 | File checks / per person per minute | `[agent_files] checks_per_minute` | 10; 1–1000. |
 | File approvals / pending per person | `[agent_files] max_pending_per_user` | 20; 1–200. |
 
-The employee's existing `[runtime] timeout_secs` now applies to Claude as well. When no employee value is set, a non-Admin owner can only set 300 seconds or less (and must obey any lower global default or ceiling). The employee page shows the effective seconds and ceiling. Values above the ceiling are rejected on save and clamped at execution. An invalid global timeout configuration logs a warning and restores the previous hard defaults (Claude 1800 seconds, others 300, ceiling 3600); it never permits unlimited execution. A valid global default replaces the runtime-specific default only when the employee value is absent. The ceiling also bounds an unset default. Task-specific limits and sandbox limits can still shorten a run; goal-specific limits range from 30 seconds to `min(max_timeout_secs, 3600)` (at most one hour).
+The employee's existing `[runtime] timeout_secs` now applies to Claude as well. When no employee value is set, a non-Admin owner can only set 300 seconds or less (and must obey any lower global default or ceiling). The employee page shows the effective seconds and ceiling. Values above the ceiling are rejected on save and clamped at execution. An invalid global timeout configuration logs a warning and restores the hard defaults (1800 seconds for every runtime, ceiling 3600); it never permits unlimited execution. A valid global default replaces the runtime-specific default only when the employee value is absent. The ceiling also bounds an unset default. Task-specific limits and sandbox limits can still shorten a run; goal-specific limits range from 30 seconds to `min(max_timeout_secs, 3600)` (at most one hour).
 
 Web conversations use the target employee’s effective timeout, bounded by the global ceiling, plus 30 seconds for delivery. Routine constants and role overrides are unchanged. Exhausting a review quota still produces at least a warning (or a block), never skips review. There is no temporary relaxation switch.
 
@@ -192,6 +192,7 @@ When public_url is set, it is used for every OAuth callback and return link, wit
 
 - **Register the new callback URL.** After you set or change public_url, add the new callback URL to each OAuth app you use: Google Cloud Console → Credentials → your OAuth client → Authorized redirect URIs, and the GitHub OAuth App's Authorization callback URL (a GitHub OAuth App has one callback URL, so replace it). Do the same for Notion and Slack apps. The Integrations page shows the exact URL to register. A sign-in that was already in progress finishes with the URL it started with.
 - The browser's own origin is still checked first: a direct redirect is only used when the dashboard is opened on a loopback address or on an https origin listed in `[gateway] allowed_origins`. Otherwise the paste-back flow at `http://127.0.0.1:<port>/…` is used as before (that loopback address never has a prefix). If the dashboard is opened on an allowed origin other than public_url, the redirect still goes to public_url, and the gateway logs a warning once.
+- Links to the dashboard inside chat messages (notices, decision cards) use the first valid `public_url` of `[dashboard]`, `[general]` and `[gateway]` (http or https, not localhost or loopback, no user name, query or fragment). With none valid, a gateway in a container adds no link and a gateway on an ordinary machine links to `http://localhost:<port>` (v1.84.0). See [Google Chat](channels-googlechat-teams.md#private-dms-decision-buttons-and-dashboard-links-v184).
 - Without public_url nothing changes: remote MCP and personal Google sign-ins return to the browser's origin with no path, and the built-in providers use `http://localhost:<port>/api/mcp/oauth/callback`.
 - Reverse proxy: forward `<prefix>/oauth/mcp/callback` and `<prefix>/api/…` to the gateway with the prefix removed.
 - Limitation: the dashboard app itself is built for the root path. It loads `/assets/…`, calls `/api/…` and `/ws`, and its page routes have no base path. Serving it under a sub-path therefore also needs the proxy to send those root paths to the gateway, or the dashboard needs its own host name. public_url fixes the OAuth callback and return addresses; it does not make the dashboard app prefix-aware. When the page has a same-origin `<base href>` (for example injected by the proxy), the dashboard sends that sub-path with OAuth starts and member invitations; the gateway still validates it.
@@ -238,6 +239,24 @@ Fixed failure and machine-operation refusal messages support zh-TW, zh-CN, en an
 Global background tasks without an assigned employee (such as employee selection and redaction-rule creation) default to Claude / `claude-haiku-4-5`. Select a supported provider and enter a compatible model; removed `gemini` and unknown provider values are refused by the server. Clearing the model removes the key: Claude uses `claude-haiku-4-5`; OpenAI-compatible endpoints require an explicit model. Codex is also supported in its restricted utility profile and uses the CLI default when the model is blank. Grok and generic CLI providers are refused at execution even when their settings can be saved. A model from a known different vendor family shows an inline warning for non-Claude providers. Saves require admin access and use the standard config commit path. An inline alert appears when the selected global provider is Claude and no employee uses the Claude runtime; it does not check whether Claude is logged in.
 
 `[general] log_level` (Settings → Advanced → Security and records → Log Level) applies as soon as it is saved, unless the environment variable `RUST_LOG` is set, in which case the save reports a restart. Saving the account rotation strategy or the rate-limit cooldown clears the rotation cache, so the next call uses the new value (before, the change could lag by up to 30 minutes).
+
+### Memory language and background work (v1.84.0)
+
+| Page → control | Key | Takes effect |
+|---|---|---|
+| Settings → General → Memory language (below the default reply language) | `config.toml [memory] language`: `auto` ("Follow reply language"), `zh-TW`, `zh-CN`, `en`, `ja-JP` | Immediately |
+| Edit AI employee → Basics → Memory language (below Reply language) | `agent.toml [memory] language`, same values; `agents.update` `memory_language` (empty clears it) | Immediately |
+| Edit AI employee → Service for background work | `agent.toml [runtime] utility_provider`: `claude`, `codex`, `openai_compat`, or none; `agents.update` `runtime.utility_provider` (empty clears it) | Next background job |
+
+Only administrators can change these three settings; the selectors are disabled for other accounts and the RPCs refuse their changes. An employee cannot change its own memory language through `agent_update` or by editing its `agent.toml`.
+
+**Memory language** decides the language of what the system writes into memory by itself: pinned instructions, key facts, conversation summaries, facts kept from conversation distillation, and the title and summary of automatically filed knowledge pages. The language is taken from the employee's memory language, then the global memory language, then the employee's reply language (or the global default language); if none is set, memories follow the language of the conversation. `auto` passes the decision to the next level, so on the employee page "Follow reply language" uses the global memory language first when one is set. When the result is Traditional Chinese, the text is also converted character by character to Traditional before it is stored, and when nothing is set but the conversation is mostly Traditional Chinese without Japanese kana, Traditional Chinese is used. Memories saved before v1.84.0 are not changed; to convert existing Simplified-Chinese memories, see [Converting Simplified-Chinese memories](memory-convert-script.md).
+
+**Background work** for an employee (key facts, pinned instructions, conversation summaries, titles, conversation distillation and knowledge filing, situation checks) runs on the employee's own engine when that engine is Claude, Codex or OpenAI-compatible. Grok and the other CLI engines cannot run it. For those employees the work uses the service chosen on the employee page; without one, it uses the global `[runtime] utility_provider` only when that key is actually written in `config.toml` and names one of the three services. Otherwise the work is skipped. Before v1.84.0 such employees silently used Claude. The employee page shows which service is used or that the work is skipped, and the system check **Employees whose background work is skipped** lists them. The conversation text is sent to the chosen service. The model is the employee's `[model] utility` when it belongs to that service, else the global `[runtime] utility_model` when the global provider is the same service, else `claude-haiku-4-5` for Claude or the service's own default.
+
+**Model that does not match the engine.** An employee on another engine whose saved model is a bare Claude name (`opus`, `sonnet`, `haiku`, `fable`) now runs on that engine's default model. The employee page and the system check **Employee model and engine** show a notice asking you to choose the model again. The notice appears after the employee has run at least once since the service started.
+
+**New engines.** After an engine is installed from the dashboard, or after the dashboard re-detects engines (`runtime.detect`), employees can use it without restarting the service; when an employee's engine or fallback engine is missing, the list of engines is checked again at most once a minute.
 
 ## Settings → Advanced → Security and records → Memory: personal topics
 
@@ -412,7 +431,7 @@ The page writes the employee's `agent.toml` through `agents.update` and sends on
 
 The per-run time limit is saved separately from the container task timeout. The server rejects values outside 30 seconds to the global ceiling and non-integers. For manually edited files, out-of-range integers are clamped and wrong-typed values use the default, with a warning.  OpenAI-compatible employees require a model in either `utility` or `preferred`; Codex can use its CLI default; Grok and generic CLIs use global background settings. A vendor-family mismatch in the utility model shows an inline warning because background work such as conversation compression and fact extraction will fail.
 
-Increasing the effective `timeout_secs` requires an administrator. An Owner may lower it; clearing the setting restores the global default (or Claude 1800 / other runtimes 300 seconds when no global default is set) and needs an administrator only when that increases the current effective limit.
+Increasing the effective `timeout_secs` requires an administrator. An Owner may lower it; clearing the setting restores the global default (or 1800 seconds for every runtime when no global default is set; for a non-Claude employee whose value is below 1800, clearing it is therefore an increase) and needs an administrator only when that increases the current effective limit.
 
 Claude utility calls use the lightweight lane with the CLI's available credentials and do not enter account rotation. Normal chat retains its existing account rotation.
 
@@ -520,7 +539,7 @@ Admin only (new in 1.76.0). Shows whether the document knowledge base searches b
 | Control | Writes | Effect |
 |---|---|---|
 | Where it is computed: On this computer / OpenAI / Google Gemini / Off | `[knowledge.embedding] provider` (+ `cloud_model`, `cloud_account` for cloud) | Next search. Choosing a cloud provider opens a dialog naming the vendor and host that receive passages; **Use** stays disabled until the box is ticked, and the acknowledgement is stored as `cloud_disclosure_ack`. The dialog warns when redaction is off (nothing is sent then). Choosing anything else removes the acknowledgement. |
-| Install (size) | downloads into `models/embedding/<model>/` and `lib/onnxruntime/` | Background download with progress, resumable after **Cancel**; vectors for every passage are queued when it finishes. |
+| Install (size) | downloads into `models/embedding/<model>/` and `lib/onnxruntime/` | Background download with progress; after **Cancel** the next install starts the interrupted file over; vectors for every passage are queued when it finishes. |
 | Check again (offline install) | — | Checks the signature of the offline bundle (`.tar` + `.tar.minisig`, still packed, in `models/embedding/`) against the release key, then unpacks it, hashes every file and marks the model installed. |
 | Use this model | `local_model` | Switches the local model; passages get vectors for it in the background (vectors of the previous model stay but are not compared). |
 | Remove | deletes the model files | Search becomes keyword-only with that reason shown; the runtime library stays. |
@@ -583,6 +602,18 @@ A gateway still running as a bare binary (standalone or npm) moves into the app 
 - `duduclaw service migrate-bundle` in a terminal. Then run `duduclaw service restart`.
 
 The move installs the app to `~/Applications/` (npm: inside the npm platform package) and replaces the old binary with a link to the app, so existing commands keep working. It also points the login service at the app and restarts the gateway from it. Afterwards macOS asks once for folder access for the new app. The page shows this notice once after the move.
+
+## Manage → Advanced → License: sync and AI employee seats (v1.84.0)
+
+**Refresh.** For an Admin, **Refresh** asks the vendor for the current licence (RPC `license.sync`, Admin only) and shows the outcome under the button: updated, already up to date, the licence has been revoked, waiting for the vendor to approve the machine change, no commercial licence installed, vendor unreachable, or the sync did not finish (the last two retry automatically). Syncs are spaced at least 30 seconds apart, shared by the dashboard and the automatic checks; a press inside that window says how many seconds to wait. If the request itself fails, the page keeps showing the current licence. For Managers the button only reloads what is displayed.
+
+**Seats.** The page shows the **AI employee limit** (a number, or **Unlimited**) and **In use** (archived employees count). A row is hidden when the value cannot be determined; the page never shows an estimated number. Anyone who can open the page (Manager or above) sees these rows.
+
+**Restart notice.** When a sync changes the edition the service started with, an amber note says a restart is needed to apply the plan fully. AI employee seats and the expiry date apply at once.
+
+**How changes arrive.** A licence written by `duduclaw license activate`, `refresh` or `deactivate` on the same data directory is applied by the running service within about a minute, without a restart; the CLI prints a line saying so. The service also asks the vendor whether the licence changed: first 2 to 5 minutes after start, then every 25 to 35 minutes, and it downloads and verifies the licence only when the vendor reports a change. A change the vendor makes (for example to the number of seats) therefore reaches the service within about half an hour. If the vendor's service does not offer this check, the service asks again once a day and keeps the plan's regular refresh interval (up to 7 days). Only the running gateway that holds the instance lock performs the check, and only when a licence is installed.
+
+**Licence file.** `license.json` may be a symbolic link to a regular file, for example a mounted secret. Other special files and files larger than 64 KiB are refused. When the service or the CLI saves a new licence, it replaces the link with a regular file instead of writing through it. Responses from the vendor are limited to 256 KiB.
 
 ## Thinking display
 
@@ -845,7 +876,7 @@ The calling connection now receives new tokens with the successful enrollment/di
 
 `auto` tries installed Piper → installed Kokoro → MiniMax → OpenAI → Azure, subject to product policy. Explicit providers use only that provider; `off` disables synthesis. `duduclaw doctor` lists available providers without making synthesis requests.
 
-Download Kokoro from **Settings → Voice** (about 134 MB, Apache-2.0). Assets and the shared ONNX Runtime are verified during installation; interrupted downloads resume. Weights are not bundled in the binary. The model lives under `<home>/models/kokoro-zh/`. Default voice: `zf_001`; alternatives: `zm_010` and `af_maple` for pure English. Chinese speech has a mainland accent; polyphonic words may be mispronounced. Traditional characters and numbers are normalized, but the pronunciation rules do not cover every word. Input is capped at 2,000 characters and split into chunks of at most 500 tokens, joined with 150 ms silence. Kokoro produces 24 kHz WAV; Telegram receives it as `reply.wav` through `sendAudio`.
+Download Kokoro from **Settings → Voice** (about 134 MB, Apache-2.0). Assets and the shared ONNX Runtime are verified during installation; an interrupted or cancelled download starts over on the next attempt. Weights are not bundled in the binary. The model lives under `<home>/models/kokoro-zh/`. Default voice: `zf_001`; alternatives: `zm_010` and `af_maple` for pure English. Chinese speech has a mainland accent; polyphonic words may be mispronounced. Traditional characters and numbers are normalized, but the pronunciation rules do not cover every word. Input is capped at 2,000 characters and split into chunks of at most 500 tokens, joined with 150 ms silence. Kokoro produces 24 kHz WAV; Telegram receives it as `reply.wav` through `sendAudio`.
 
 Azure sends the text to Microsoft. Set `AZURE_SPEECH_KEY` and `AZURE_SPEECH_REGION` in the gateway environment. Default Chinese voice: `zh-TW-HsiaoChenNeural`; default English voice: `en-US-AriaNeural`. Azure returns MP3. `tts_voice` can select a supported provider voice.
 

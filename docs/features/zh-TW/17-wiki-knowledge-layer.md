@@ -338,6 +338,10 @@ Auto-ingested content defaults:
 
 **管理介面**：儀表板 → 記憶與知識 → 策展台 → 自動建檔（檢視／確認為正式知識／分享到共享知識庫／移除）。
 
+**對話範圍（v1.84.0）。** 在通道對話中，自動頁面只有產生它的那段對話看得到。主機會把來源記在頁面 frontmatter 的 `host_sources`，只有每一筆來源都是這段對話時才會顯示；`author`、`sources`、`layer` 不提供任何權限。主管或管理員在策展台確認過的頁面帶有 `host_promoted: true`（只有主機會寫入），每段對話都看得到；透過 MCP 重寫的頁面會失去這個標記。另一段對話整理出同一個 slug 時，會另建 `auto/<type>/<slug>-<8 位十六進位>.md`，後綴取自對話的雜湊值（不會放對話代號），不同對話的頁面不會合併。選擇、讀取與發布自動頁面共用一個鎖檔 `<wiki>/.auto-pages.lock`。v1.84.0 以前建立的頁面沒有主機紀錄，在透過 `wiki.promote` 確認前，任何對話都看不到；`wiki.promote` 現在需要主管角色（或管理員）加上該員工的 Owner 權限。確認這類頁面只會記下確認的決定（`host_sources: ["legacy:human-confirmed"]`），內容、作者與層級不變。儀表板的系統檢查 `legacy_auto_wiki` 會列出每位員工的頁數（訊息目前只有繁體中文）。在通道對話中，`wiki_write` 與 `wiki_share` 拒絕 `auto/` 底下的任何路徑（包括 `AUTO/`、`auto./` 這類變形），`wiki_export` 直接拒絕，`wiki_read` 讀看不到的頁面時回覆和頁面不存在相同，`wiki_ls`、`wiki_search`（在排序前過濾）、`wiki_lint`、`wiki_stats` 都不包含看不到的頁面，`_index.md` 與 `_log.md` 裡提到 `auto/` 的行也會移除，包括這段對話自己的頁面（這些頁面仍可用 `wiki_ls`、`wiki_search` 找到）。排程與交辦工作仍可以寫入 `auto/`。已知缺口：`wiki_dedup`、`wiki_graph`、`wiki_rebuild_fts`、`wiki_trust_audit`、`wiki_trust_history` 尚未套用這項可見範圍規則。
+
+**頁面名稱（v1.84.0）。** 新頁面的路徑中，任何一段都不能以句點或空白結尾、不能是 Windows 裝置名稱（`CON`、`PRN`、`AUX`、`NUL`、`COM0`～`COM9`、`LPT0`～`LPT9` 等，以第一個句點之前的部分判斷），也不能含控制字元；`:` 只在 Windows 上拒絕。已經存在的這類頁面在 macOS 與 Linux 上仍可讀取、列出與搜尋，但不能寫入、分享或確認為正式知識。
+
 ---
 
 ## CLAUDE_WIKI 範本

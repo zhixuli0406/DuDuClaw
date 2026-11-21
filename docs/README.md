@@ -173,6 +173,7 @@ New: [Add teammates and first login](guides/user-management-and-first-login.md) 
 |----------|-------------|--------|
 | [guides/tui.md](guides/tui.md) | Terminal control room with decision cards and streaming inbox; password or OTP login, SSH, security limits, settings and keys ([zh-TW](guides/zh-TW/tui.md), [ja-JP](guides/ja-JP/tui.md)) | Current |
 | [guides/memory-and-knowledge.md](guides/memory-and-knowledge.md) | 記憶與知識庫完整使用說明（兩者差異、知識庫寫入/分類/L0–L3 層級、自動帶入 vs 主動搜尋、記憶刪除、FAQ） | Current |
+| [guides/memory-convert-script.md](guides/memory-convert-script.md) | Converting existing Simplified-Chinese memories to Traditional Chinese with `duduclaw memory convert-script` (v1.84.0): preview, `--yes`, `--agent`/`--all`, restore file and `--restore`, what is and is not converted ([zh-TW](guides/zh-TW/memory-convert-script.md), [ja-JP](guides/ja-JP/memory-convert-script.md)) | Current |
 | [guides/memory-vs-knowledge.html](guides/memory-vs-knowledge.html) | 記憶 vs 知識庫（終端使用者版，自包含 HTML，可直接寄給客戶；WP5c 全自動分流上線後改寫） | Current |
 | [guides/goal-loop.md](guides/goal-loop.md) | 自主目標迴圈（`/goal` 入口、AutonomyLevel 五級、`[goal_loop]`/`[dispatch]`/`[dispatch_guard]` 設定、needs_human 按鈕） | Current |
 | [guides/reviewable-workflow-drafts.md](guides/reviewable-workflow-drafts.md) | 審查證據與工作流程草稿（擷取快照、接受最新快照、五種試跑與負面案例規則、送審與管理者核准、私有任務的可見對象與通知、啟用後的執行與暫停；另有 [zh-TW](guides/zh-TW/reviewable-workflow-drafts.md)、[ja-JP](guides/ja-JP/reviewable-workflow-drafts.md)） | Current |

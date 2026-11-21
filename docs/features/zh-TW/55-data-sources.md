@@ -335,7 +335,7 @@ release 版的執行檔本身既沒帶模型,也沒帶 ONNX Runtime。第一次�
 | 檔案 | 大小 | 來源 |
 |---|---|---|
 | 模型(6 個檔案) | 約 945 MB,主要是 `onnx/model_q4.onnx_data` | Hugging Face `openai/privacy-filter`,釘死在一個 commit |
-| ONNX Runtime | 依平台 7–75 MB | Microsoft 官方 GitHub release,版本對應 `ort` 目標版本(1.24.2) |
+| ONNX Runtime | 依平台 7–75 MB(改走 NuGet 時約 125 MB) | Microsoft 官方 GitHub release,固定版本 1.24.2;GitHub 下載失敗時改用官方 NuGet 套件 `Microsoft.ML.OnnxRuntime` 1.24.2(所有平台共用一個檔案)。兩種來源都比對固定的大小與 SHA-256 |
 
 每個檔案的 URL、位元組長度、SHA-256 都寫死在執行檔裡。下載會先串流進 `<name>.part`,支援用 HTTP `Range` 標頭續傳,雜湊驗證過了才會 rename 到正式路徑——所以只要檔案出現在最終路徑上,它就一定是驗證過的檔案。雜湊對不上就刪掉下載到一半的檔案,整個安裝算失敗,不存在「裝了大半個模型」這種狀態。`installed.json` 這個標記檔最後才寫,裡面記著版本;所以裝到一半算**未安裝**,不是「壞掉的安裝」。
 
