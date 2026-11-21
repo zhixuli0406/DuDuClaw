@@ -272,12 +272,12 @@ async fn reaffirm_past_the_cap_still_reaffirms_without_recording_lineage() {
     )
     .await;
 
-    // A later conversation corroborates it: still reaffirmed, not refused.
+    // A later message in the same conversation still reaffirms, not refused.
     let o = try_put(
         &e,
         "name is Ann",
         triple("user:u1", "name", "Ann"),
-        src(msg("telegram:c9", 1)),
+        src(msg(S, MAX_LINEAGE_SOURCES as i64)),
     )
     .await;
     assert_eq!(o, TemporalWriteOutcome::Stored(id.clone()), "{o:?}");
@@ -322,6 +322,39 @@ async fn reaffirm_past_the_cap_still_reaffirms_without_recording_lineage() {
     )
     .await;
     assert!(is_fenced(&o, FenceReason::LineageOverflow), "{o:?}");
+}
+
+#[tokio::test]
+async fn reaffirm_cap_does_not_merge_different_conversations() {
+    let e = SqliteMemoryEngine::in_memory().unwrap();
+    let full = (0..MAX_LINEAGE_SOURCES as i64).map(|i| msg(S, i)).collect();
+    let a = put(
+        &e,
+        "name is Ann",
+        triple("user:u1", "name", "Ann"),
+        Provenance::Sources(full),
+    ).await;
+    let other = "telegram:c9";
+    let b = put(&e, "name is Ann", triple("user:u1", "name", "Ann"), src(msg(other, 1))).await;
+    assert_ne!(a, b);
+    for (id, session, expected) in [(&a, S, MAX_LINEAGE_SOURCES as i64), (&b, other, 1)] {
+        assert_eq!(count(&e, &format!(
+            "SELECT COUNT(*) FROM memory_origins WHERE memory_id = '{id}'"
+        )).await, expected);
+        assert_eq!(count(&e, &format!(
+            "SELECT COUNT(*) FROM memory_origins WHERE memory_id = '{id}' AND source_session = '{session}' AND role = 'direct'"
+        )).await, expected);
+    }
+    assert_eq!(count(&e, &format!("SELECT access_count FROM memories WHERE id = '{a}'")).await, 0);
+    assert_eq!(e.reaffirm_lineage_skipped(), 0);
+    assert_eq!(e.fence_refusals(), 0);
+    assert_eq!(count(&e, "SELECT COUNT(*) FROM memories WHERE subject = 'user:u1' AND valid_until IS NULL").await, 2);
+    forget(&e, &by_message(S, &["m:0"])).await;
+    assert!(!exists(&e, &a).await);
+    assert!(exists(&e, &b).await);
+    assert_eq!(count(&e, &format!(
+        "SELECT COUNT(*) FROM memory_origins WHERE memory_id = '{b}' AND source_session = '{other}' AND role = 'direct'"
+    )).await, 1);
 }
 
 #[tokio::test]

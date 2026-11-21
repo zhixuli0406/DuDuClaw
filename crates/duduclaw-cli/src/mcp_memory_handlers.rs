@@ -3435,7 +3435,7 @@ mod tests {
         assert!(employee.contains("4f1c2d9e"), "{employee}");
         // Any other failure keeps its text.
         let other = duduclaw_core::error::DuDuClawError::Memory("disk full".into());
-        assert_eq!(store_error_text(&other, &channel_turn("telegram:A")), "Error storing memory: disk full");
+        assert_eq!(store_error_text(&other, &channel_turn("telegram:A")), "Error storing memory: memory error: disk full");
     }
 
     /// Item 2: B's identical explicit note is not refused because of a
