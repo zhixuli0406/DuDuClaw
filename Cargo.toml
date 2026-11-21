@@ -66,6 +66,7 @@ authors = ["DuDuClaw Contributors"]
 unsafe_code = "warn"
 
 [workspace.dependencies]
+ferrous-opencc = { version = "=0.4.0", default-features = false, features = ["s2t-conversion"] }
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"

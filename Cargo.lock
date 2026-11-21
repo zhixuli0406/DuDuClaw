@@ -1880,6 +1880,7 @@ dependencies = [
  "cron",
  "duduclaw-execution",
  "duduclaw-isolation",
+ "ferrous-opencc",
  "fs2",
  "getrandom 0.3.4",
  "hmac",

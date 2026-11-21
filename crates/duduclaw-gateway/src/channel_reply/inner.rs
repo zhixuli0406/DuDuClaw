@@ -4091,13 +4091,14 @@ async fn build_reply_with_session_inner_impl(
                         return;
                     }
                 };
+                // Validate the persisted prose after phrase conversion, which can change length.
+                let summary = crate::prompt_identity::align_memory_script(&summary, memory_language.as_deref(), &transcript);
                 if has_unprotected {
                     if let Err(reason) = crate::session_summarizer::validate_summary_output(&summary) {
                         summary_attempt_finished_async(&home_for_compress, &sid, "compression", Some(reason)).await;
                         return;
                     }
                 }
-                let summary = crate::prompt_identity::align_memory_script(&summary, memory_language.as_deref(), &transcript);
                 let protected = crate::session_summarizer_task::cap_protected_for_summary(&protected);
                 let summary = if protected.is_empty() { summary } else {
                     format!("{summary}\n[verbatim protected sections]\n{protected}")
