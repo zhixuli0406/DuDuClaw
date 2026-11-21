@@ -1230,7 +1230,7 @@ function EditAgentPageContent() {
   }));
   const memoryLanguageOptions: SelectOption[] = ['auto', 'zh-TW', 'zh-CN', 'en', 'ja-JP'].map((code) => ({
     value: code,
-    label: t(code === 'auto' ? 'settings.general.memoryLanguage.auto' : `settings.general.defaultLanguage.${code}`),
+    label: intl.formatMessage({ id: code === 'auto' ? 'settings.general.memoryLanguage.auto' : `settings.general.defaultLanguage.${code}` }),
     raw: code,
   }));
   const providerOptions: SelectOption[] = RUNTIME_PROVIDERS.filter(p => policy.allows('runtimes', p)).map((p) => ({ value: p, label: intl.formatMessage({ id: `agents.runtime.provider.${p}` }), raw: p }));

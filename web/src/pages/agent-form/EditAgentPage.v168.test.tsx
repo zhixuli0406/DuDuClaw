@@ -277,6 +277,8 @@ describe('new controls round-trip from inspect to payload', () => {
     renderAt('/agents/my-bot/edit');
     const language = await screen.findByRole('combobox', { name: 'Memory language' });
     await waitFor(() => expect(language).toHaveTextContent(en['settings.general.defaultLanguage.ja-JP']));
+    await userEvent.setup().click(language);
+    expect(await screen.findByRole('option', { name: en['settings.general.memoryLanguage.auto'] })).toBeInTheDocument();
     expect(updateAgent).not.toHaveBeenCalled();
   });
 
