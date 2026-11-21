@@ -164,7 +164,7 @@ pub fn installed_problem(dirs: &InstallDirs) -> Option<String> {
 pub fn total_install_bytes() -> u64 {
     manifest::model_total_bytes()
         + manifest::ort_archive_for_current_platform()
-            .map(|a| a.size)
+            .map(duduclaw_onnx::install::max_source_size)
             .unwrap_or(0)
 }
 

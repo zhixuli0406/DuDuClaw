@@ -22,7 +22,8 @@ pub const ASSETS: &[Asset] = &[
 ];
 pub fn total_bytes() -> u64 {
     ASSETS.iter().map(|a| a.size).sum::<u64>()
-        + duduclaw_onnx::manifest::ort_archive_for_current_platform().map_or(0, |a| a.size)
+        + duduclaw_onnx::manifest::ort_archive_for_current_platform()
+            .map_or(0, duduclaw_onnx::install::max_source_size)
 }
 #[cfg(test)]
 mod tests {

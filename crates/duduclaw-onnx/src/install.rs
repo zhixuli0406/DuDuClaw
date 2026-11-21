@@ -436,6 +436,14 @@ fn lib_pin(archive: &OrtArchive) -> OnnxResult<&'static [(u64, &'static str)]> {
     })
 }
 
+pub(crate) fn success_record(source: OrtSource) -> String {
+    let host = reqwest::Url::parse(source.url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .unwrap_or("unknown".to_string());
+    format!("ONNX Runtime 來源成功：kind={:?} host={}", source.kind, host)
+}
+
 /// Download, verify and extract the ORT library for `archive` into
 /// `<ort_lib_root>/<ver>/`. A library already there that matches its pin is
 /// kept; one that does not is replaced. `on_bytes` gets bytes of the archive
@@ -451,14 +459,34 @@ pub async fn install_ort(
     let lib_dir = manifest::ort_lib_dir(ort_lib_root);
     let lib_path = lib_dir.join(archive.lib_file);
     if use_managed_library(&lib_dir, &lib_path, pin)? || verify_lib_at(&lib_path, pin).is_ok() {
-        on_bytes(archive.size);
+        on_bytes(max_source_size(archive));
         return Ok(());
     }
     prepare_lib_dir(&lib_dir)?;
     let _lock = InstallLock::acquire(&lib_dir)?;
+    let reserved = max_source_size(archive);
     install_from_sources(ort_lib_root, archive, pin, cancel, |source, dest| async move {
-        fetch_partial(client, source.url, &dest, source.size, cancel, on_bytes).await
-    }).await
+        // Each source reports an independent byte count; a failed source's
+        // partial bytes are discarded before the next source starts.
+        on_bytes(0);
+        fetch_partial(client, source.url, &dest, source.size, cancel, &|bytes| {
+            let scaled = if source.size == 0 {
+                0
+            } else {
+                ((bytes.min(source.size) as u128 * reserved as u128) / source.size as u128)
+                    .min(reserved as u128) as u64
+            };
+            on_bytes(scaled);
+        }).await
+    }).await?;
+    on_bytes(reserved);
+    Ok(())
+}
+
+/// Maximum transfer size among the ordered sources, for aggregate progress
+/// callers that need to reserve the runtime portion before selecting a source.
+pub fn max_source_size(archive: &OrtArchive) -> u64 {
+    archive.sources().map(|source| source.size).max().unwrap_or(0)
 }
 
 // The fetcher returns an exclusively owned temporary; verification stays here.
@@ -493,7 +521,10 @@ where
         }.await;
         let _ = std::fs::remove_file(&path);
         match result {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                eprintln!("{}", success_record(source));
+                return Ok(());
+            }
             Err(error) => {
                 let why = format!("{}: {error}", source.url).replace(['\n', '\r'], " ");
                 eprintln!("ONNX Runtime 來源失敗：{why}");
