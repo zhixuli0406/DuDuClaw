@@ -2235,6 +2235,7 @@ dependencies = [
  "fs2",
  "gethostname",
  "hex",
+ "libc",
  "mac_address",
  "rand 0.8.6",
  "serde",
@@ -2243,6 +2244,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "toml",
+ "tracing",
  "url",
  "winapi",
 ]

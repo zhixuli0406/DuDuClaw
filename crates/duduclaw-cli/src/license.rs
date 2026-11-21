@@ -472,19 +472,19 @@ fn binding_label(binding: &Binding) -> &'static str {
     }
 }
 
-/// Read a control-plane error body into a friendly message.
+/// Read a control-plane error body (bounded) into a friendly message.
 async fn control_error(resp: reqwest::Response) -> DuDuClawError {
     let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    let msg = serde_json::from_str::<serde_json::Value>(&body)
-        .ok()
-        .and_then(|v| {
-            v.get("message")
-                .and_then(|m| m.as_str())
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| body.chars().take(200).collect());
+    let msg = duduclaw_gateway::license_transport::error_excerpt(resp).await;
     DuDuClawError::License(format!("control-plane returned HTTP {status}: {msg}"))
+}
+
+/// Every control-plane answer is read through the gateway's bounded reader
+/// (256 KiB) before it is parsed or verified.
+async fn control_json(resp: reqwest::Response, what: &str) -> Result<serde_json::Value> {
+    duduclaw_gateway::license_transport::read_bounded_json(
+        resp, duduclaw_gateway::license_transport::MAX_LICENSE_RESPONSE_BYTES,
+    ).await.map_err(|e| DuDuClawError::License(format!("parse {what} response: {e}")))
 }
 
 // ── rebind (move to this machine) ─────────────────────────────
@@ -549,10 +549,7 @@ async fn cmd_rebind() -> Result<()> {
     }
 
     let status = resp.status();
-    let envelope: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| DuDuClawError::License(format!("parse rebind response: {e}")))?;
+    let envelope = control_json(resp, "rebind").await?;
     if response_pending(status, &envelope) {
         validate_status_response(&envelope, "pending", &installed, &new_fp, &nonce)?;
         println!("{REBIND_PENDING_MESSAGE}");
@@ -599,10 +596,7 @@ async fn cmd_subscriptions() -> Result<()> {
         return Err(control_error(resp).await);
     }
 
-    let s: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| DuDuClawError::License(format!("parse status response: {e}")))?;
+    let s = control_json(resp, "status").await?;
 
     let get = |k: &str| s.get(k).and_then(|v| v.as_str()).unwrap_or("?").to_string();
     println!("Subscription:     {}", get("subscription_id"));
@@ -994,16 +988,10 @@ async fn cmd_refresh() -> Result<()> {
 
     let status = response.status();
     if !status.is_success() {
-        let body_text = response.text().await.unwrap_or_else(|_| "<no body>".into());
-        return Err(DuDuClawError::License(format!(
-            "control-plane returned HTTP {status}: {body_text}"
-        )));
+        return Err(control_error(response).await);
     }
 
-    let envelope: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| DuDuClawError::License(format!("parse refresh response: {e}")))?;
+    let envelope = control_json(response, "refresh").await?;
 
     if response_pending(status, &envelope) {
         validate_status_response(&envelope, "pending", &license, &proposed_fingerprint, &nonce)?;

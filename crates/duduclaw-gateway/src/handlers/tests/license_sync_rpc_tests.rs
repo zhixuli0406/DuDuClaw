@@ -58,6 +58,118 @@ async fn license_sync_refuses_non_admins_before_any_work() {
     assert!(!home.path().join("license.json").exists());
 }
 
+/// The pre-auth (lock-screen, loopback) connection and the forced
+/// password-change allowlist refuse both licence RPCs — even for a context
+/// that claims Admin — before any handler runs.
+#[tokio::test]
+async fn license_rpcs_are_refused_on_pre_auth_and_password_change_entry_points() {
+    use crate::power_local::RpcConnInfo;
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("config.toml"), "[auth]\nmfa_enforced=false\n").unwrap();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    let loopback = std::net::SocketAddr::from(([127, 0, 0, 1], 54321));
+    for method in ["license.sync", "license.status"] {
+        assert!(!crate::power_local::is_pre_auth_allowlisted(method), "{method}");
+        assert!(!crate::handlers::gates::is_password_change_allowlisted(method), "{method}");
+        let frame = handler
+            .handle_conn(method, json!({}), &UserContext::admin_fallback(), RpcConnInfo::from_ws(loopback, true))
+            .await;
+        match &frame {
+            WsFrame::Response { ok: false, error: Some(e), .. } => {
+                assert_eq!(e.get("code").and_then(|c| c.as_str()), Some(LOGIN_REQUIRED_ERROR_CODE), "{method}");
+            }
+            other => panic!("{method} reached past the pre-auth gate: {other:?}"),
+        }
+    }
+    assert!(!home.path().join(crate::license_rev::REV_FILENAME).exists());
+}
+
+/// RM-175: `license.sync` and the seat / validation fields of
+/// `license.status` are dashboard RPCs only. No MCP tool (the AI-employee
+/// surface) is defined for them, no MCP module or internal loopback route
+/// names them, and the runtime entry point is called only from the RPC
+/// handler and the change probe.
+#[test]
+fn license_rpcs_are_not_on_the_ai_employee_surface() {
+    // Built at run time so this file never matches its own scan.
+    let sync = ["license", ".sync"].concat();
+    let status = ["license", ".status"].concat();
+    let entry = ["sync", "_now("].concat();
+    let handler_fn = ["handle_license", "_sync"].concat();
+
+    // Registry level: every MCP tool definition.
+    for tool in duduclaw_core::mcp_tool_defs::tools() {
+        assert!(!tool.name.to_ascii_lowercase().contains("license"), "MCP tool {} looks licence-related", tool.name);
+        let texts = std::iter::once(tool.description).chain(tool.params.iter().map(|p| p.description));
+        for text in texts {
+            assert!(!text.contains(&sync) && !text.contains(&status), "MCP tool {} names a licence RPC", tool.name);
+        }
+    }
+
+    fn rust_sources(root: &std::path::Path) -> Vec<(std::path::PathBuf, String)> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                let name = path.file_name().unwrap().to_string_lossy().to_string();
+                if path.is_dir() {
+                    if name != "tests" { stack.push(path); }
+                } else if name.ends_with(".rs") && !name.contains("test") {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    out.push((path, text));
+                }
+            }
+        }
+        out
+    }
+
+    // Source level, gateway: only the RPC arm, its handler, the gate notes,
+    // the runtime and the change probe mention the method or its entry point.
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let src = manifest.join("src");
+    let allowed = |path: &std::path::Path, needle: &str| -> bool {
+        let rel = path.strip_prefix(&src).unwrap().to_string_lossy().replace('\\', "/");
+        let ok: &[&str] = if needle == sync.as_str() {
+            &["handlers/dispatch_core.rs", "handlers/handshake_license.rs", "handlers/gates.rs", "license_runtime.rs", "license_rev.rs"]
+        } else if needle == entry.as_str() {
+            &["handlers/handshake_license.rs", "license_rev.rs", "license_runtime.rs"]
+        } else {
+            &["handlers/dispatch_core.rs", "handlers/handshake_license.rs"]
+        };
+        ok.contains(&rel.as_str())
+    };
+    for (path, text) in rust_sources(&src) {
+        for needle in [&sync, &entry, &handler_fn] {
+            if text.contains(needle.as_str()) {
+                assert!(allowed(&path, needle), "{} reaches `{needle}`", path.display());
+            }
+        }
+        // No internal (loopback) route is a licence route.
+        assert!(!text.contains("/api/internal/license"), "{}", path.display());
+    }
+
+    // Source level, AI-employee side: the MCP server modules and the shared
+    // tool definitions never name either RPC or the runtime entry point.
+    let cli_src = manifest.join("../duduclaw-cli/src");
+    let mut employee_side = rust_sources(&cli_src.join("mcp"));
+    for entry in std::fs::read_dir(&cli_src).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        if path.is_file() && name.starts_with("mcp") && name.ends_with(".rs") && !name.contains("test") {
+            let text = std::fs::read_to_string(&path).unwrap();
+            employee_side.push((path, text));
+        }
+    }
+    employee_side.extend(rust_sources(&manifest.join("../duduclaw-core/src/mcp_tool_defs")));
+    assert!(!employee_side.is_empty());
+    for (path, text) in employee_side {
+        for needle in [&sync, &status, &entry, &handler_fn] {
+            assert!(!text.contains(needle.as_str()), "{} names `{needle}`", path.display());
+        }
+    }
+}
+
 #[tokio::test]
 async fn license_status_reports_seat_limit_and_use_to_managers() {
     let home = tempfile::tempdir().unwrap();
