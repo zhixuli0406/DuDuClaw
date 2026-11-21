@@ -33,13 +33,13 @@ const ATTRIBUTING_TOOLS: &[&str] = &["memory_store", "memory_alias_add", "user_p
 pub enum MemoryCommands {
     /// Convert Simplified memory text to Traditional with a character-level map (no model).
     /// Ambiguous characters are left unchanged. Matching local embeddings are rebuilt.
-    #[command(group(ArgGroup::new("script_selector").required(true).args(["agent", "all", "restore"])))]
+    #[command(group(ArgGroup::new("script_selector").required(true).multiple(false).args(["agent", "all", "restore"])))]
     ConvertScript {
         /// Only this agent's rows in memory.db
         #[arg(long)]
         agent: Option<String>,
         /// Restore a previous conversion (checks for intervening edits)
-        #[arg(long, conflicts_with_all = ["dry_run", "yes", "force_language_mismatch"])]
+        #[arg(long, conflicts_with_all = ["agent", "all", "dry_run", "yes", "force_language_mismatch"])]
         restore: Option<PathBuf>,
         /// Permit explicit --agent conversion despite zh-CN or Japanese language
         #[arg(long, requires = "agent")]
