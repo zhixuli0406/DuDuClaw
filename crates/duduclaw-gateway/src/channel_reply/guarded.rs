@@ -332,15 +332,11 @@ async fn build_guarded_reply_for_agent_inner(
         Box::pin(super::health::finish(&ctx.home_dir, health_outcome, true, &reply)).await;
         return reply;
     };
-    // RM-191: a fixed notice returned before the session existed goes out
-    // as it is (see `build_guarded_reply_with_session_inner`).
-    if delivery.fixed_notice() {
-        let reply = attach_turn_rollback(raw, None, guards, delivery, ctx).await
-            .with_answered_by(answered_by);
-        Box::pin(super::health::finish(&ctx.home_dir, health_outcome, false, &reply)).await;
-        build_rollback.disarm();
-        return reply;
-    }
+    // RM-191: a fixed notice returned before the session existed takes the
+    // whole output pipeline below (contract, sanitising, language); only
+    // secret restore is skipped. Its FINAL text is bound as the live-only
+    // notice at the end (persistence only).
+    let fixed_notice = delivery.marked_fixed_notice(&raw);
     let (raw, pending_artifact) = strip_operator_pending_marker(&raw);
     let artifact = pending_artifact.or(operator_result_artifact);
     let raw = crate::cli_noise::strip_cli_noise(&raw).text;
@@ -348,7 +344,11 @@ async fn build_guarded_reply_for_agent_inner(
         Some(who) => restore_target(who),
         None => (agent_name.to_string(), session_id.to_string()),
     };
-    let restored = restore_for_channel(raw, ctx, &agent_id, &turn_session).await;
+    let restored = if fixed_notice {
+        raw
+    } else {
+        restore_for_channel(raw, ctx, &agent_id, &turn_session).await
+    };
     let (enforced, health_blocked) = enforce_contract_with_status(restored, &ctx.home_dir, &agent_id).await;
     if enforced.trim().is_empty() {
         super::persist_bound_failure(ctx, TurnFailureReason::Internal).await;
@@ -367,6 +367,9 @@ async fn build_guarded_reply_for_agent_inner(
     let language = crate::prompt_identity::resolve_reply_language_for_id(&ctx.home_dir, &agent_id).await;
     let final_text = crate::prompt_identity::normalize_channel_reply(
         &crate::dispatcher::sanitize_for_channel(&final_text), language.as_deref());
+    if fixed_notice {
+        delivery.bind_live_only_notice(&final_text);
+    }
     let reply = attach_turn_rollback(final_text, artifact, guards, delivery, ctx)
         .await
         .with_answered_by(answered_by)
@@ -429,11 +432,11 @@ async fn build_guarded_reply_with_session_inner(
         Box::pin(super::health::finish(&ctx.home_dir, health_outcome, true, &reply)).await;
         return reply;
     };
-    // No employee answered, or the turn stopped with a fixed notice before
-    // its session existed (RM-191): the notice goes out as it is (no
-    // restore, contract or pending operator notice) — WebChat delivers it
-    // without a stored row on a new conversation (`GuardedReply::persist_webchat`).
-    if delivery.fixed_notice() {
+    // No employee answered: the fixed notice goes out as it is (no restore,
+    // contract or pending operator notice — there is no employee to take
+    // them from); WebChat delivers it without a stored row
+    // (`GuardedReply::persist_webchat`).
+    if delivery.no_responder_notice.load(std::sync::atomic::Ordering::SeqCst) {
         let text = append_product_footer(raw, session_id);
         let reply = attach_turn_rollback(text, None, guards, delivery, ctx).await
             .with_answered_by(answered_by);
@@ -441,6 +444,11 @@ async fn build_guarded_reply_with_session_inner(
         build_rollback.disarm();
         return reply;
     }
+    // RM-191: any other fixed notice returned before the session existed
+    // takes the whole output pipeline below (contract, sanitising, footer,
+    // language); only secret restore is skipped. Its FINAL text is bound as
+    // the live-only notice at the end (persistence only).
+    let fixed_notice = delivery.marked_fixed_notice(&raw);
     let (raw, pending_artifact) = strip_operator_pending_marker(&raw);
     let artifact = pending_artifact.or(operator_result_artifact);
     // WP11-A: last-line-of-defence filter for AI-runtime internal messages
@@ -454,7 +462,11 @@ async fn build_guarded_reply_with_session_inner(
         Some(who) => restore_target(who),
         None => (resolve_agent_for_restore(ctx, session_id).await, session_id.to_string()),
     };
-    let restored = restore_for_channel(raw, ctx, &agent_id, &turn_session).await;
+    let restored = if fixed_notice {
+        raw
+    } else {
+        restore_for_channel(raw, ctx, &agent_id, &turn_session).await
+    };
     let (enforced, health_blocked) = enforce_contract_with_status(restored, &ctx.home_dir, &agent_id).await;
     if enforced.trim().is_empty() {
         super::persist_bound_failure(ctx, TurnFailureReason::Internal).await;
@@ -474,6 +486,9 @@ async fn build_guarded_reply_with_session_inner(
     let language = crate::prompt_identity::resolve_reply_language_for_id(&ctx.home_dir, &agent_id).await;
     let final_text = crate::prompt_identity::normalize_channel_reply(
         &crate::dispatcher::sanitize_for_channel(&final_text), language.as_deref());
+    if fixed_notice {
+        delivery.bind_live_only_notice(&final_text);
+    }
     let reply = attach_turn_rollback(final_text, artifact, guards, delivery, ctx)
         .await
         .with_answered_by(answered_by)

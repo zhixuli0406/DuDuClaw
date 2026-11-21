@@ -2,8 +2,10 @@ use super::*;
 
 mod ccr_guarded_reply;
 mod fallback;
+mod fixed_notice_pipeline;
 mod future_size;
 mod googlechat_no_responder;
+mod input_guard_turns;
 mod live_only_notice;
 mod misc;
 mod no_responder_all_channels;

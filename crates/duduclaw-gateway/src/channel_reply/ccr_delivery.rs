@@ -111,10 +111,17 @@ pub(crate) struct CcrTurnDelivery {
     /// No employee answers this turn: its fixed notice is delivered live
     /// only. No session exists and none is created, so nothing is stored.
     pub(super) no_responder_notice: std::sync::atomic::AtomicBool,
-    /// RM-191: the exact fixed notice (injection block, failsafe, breaker,
-    /// killswitch, budget, redaction refusal) the turn returned before it
-    /// ensured its session. WebChat stores it as the assistant row when the
-    /// conversation already exists, and otherwise delivers it live only.
+    /// RM-191: the exact raw fixed notice (injection block, failsafe,
+    /// breaker, killswitch, budget, redaction refusal) the pipeline returned
+    /// before it ensured its session (`mark_live_only_notice`). It still goes
+    /// through the whole output pipeline (contract, sanitising, language);
+    /// it only skips secret restore.
+    fixed_notice_raw: std::sync::Mutex<Option<String>>,
+    /// RM-191: the FINAL text of that notice, after the output pipeline —
+    /// the only text that may be delivered live without a stored row
+    /// (`bind_live_only_notice`). Persistence only: WebChat stores it as
+    /// the assistant row when the conversation already exists, and
+    /// otherwise delivers it live only.
     live_only_notice: std::sync::Mutex<Option<String>>,
     /// Set by `GuardedReply::persist_webchat` when that notice found no
     /// session row: nothing was staged, so publication is live only.
@@ -138,6 +145,7 @@ impl Default for CcrTurnDelivery {
             turn_generation: Default::default(),
             failure_notice_only: Default::default(),
             no_responder_notice: Default::default(),
+            fixed_notice_raw: Default::default(),
             live_only_notice: Default::default(),
             live_only_unstored: Default::default(),
             cleanup: DELIVERY_CLEANUP.try_with(Clone::clone).ok(),
@@ -176,14 +184,29 @@ impl CcrTurnDelivery {
         self.cleanup.is_some()
     }
 
-    /// The turn answers with a fixed notice returned before its session was
-    /// ensured (no-responder or [`mark_live_only_notice`]): it goes out as it
-    /// is, without restore, contract or pending operator notices.
-    pub(super) fn fixed_notice(&self) -> bool {
-        self.no_responder_notice.load(std::sync::atomic::Ordering::SeqCst) || self.live_only_text().is_some()
+    /// RM-191: `raw` is exactly the fixed notice the pipeline marked
+    /// ([`mark_live_only_notice`]) before it ensured its session. Such a
+    /// notice skips secret restore only (it has no placeholders); contract,
+    /// sanitising and language normalisation still apply.
+    pub(super) fn marked_fixed_notice(&self, raw: &str) -> bool {
+        self.fixed_notice_raw.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_deref() == Some(raw)
     }
 
-    fn live_only_text(&self) -> Option<String> {
+    /// RM-191: bind the live-only marker to the FINAL text the output
+    /// pipeline produced for a marked fixed notice (the contract's
+    /// replacement when it blocked the notice). Only this exact text may
+    /// skip storage on a brand-new WebChat conversation. Blank text
+    /// (deliberate silence, an emptied reply) is not bound.
+    pub(super) fn bind_live_only_notice(&self, final_text: &str) {
+        if final_text.trim().is_empty() {
+            return;
+        }
+        *self.live_only_notice.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(final_text.to_owned());
+    }
+
+    pub(super) fn live_only_text(&self) -> Option<String> {
         self.live_only_notice.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
 
@@ -303,19 +326,21 @@ pub(super) fn mark_no_responder_notice() {
     });
 }
 
-/// RM-191, the general form of [`mark_no_responder_notice`]: the turn
-/// answers with this exact fixed `text` before it ensured its session. On a
-/// brand-new WebChat conversation it is delivered live and nothing is stored
-/// (no session row is created for it); in an existing conversation it is
-/// stored as the assistant row, as before. Only that exact text can take
-/// the live-only path. Blank text is not marked. No-op outside a guarded
-/// reply.
+/// RM-191: the pipeline answers with this exact fixed `text` before it
+/// ensured its session. This marks the RAW text only. The guarded builders
+/// still run it through the output pipeline (contract, sanitising, language
+/// normalisation; no secret restore) and then bind the FINAL text
+/// ([`CcrTurnDelivery::bind_live_only_notice`]). That final text is
+/// delivered live with nothing stored on a brand-new WebChat conversation,
+/// and is stored as the assistant row in an existing one, as before. The
+/// marker controls persistence only, never what is delivered. Blank text is
+/// not marked. No-op outside a guarded reply.
 pub(super) fn mark_live_only_notice(text: &str) {
     if text.trim().is_empty() {
         return;
     }
     let _ = CCR_TURN_DELIVERY.try_with(|delivery| {
-        *delivery.live_only_notice.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+        *delivery.fixed_notice_raw.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
             Some(text.to_owned());
     });
 }
