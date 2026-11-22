@@ -268,6 +268,8 @@ visible_to_departments = ["hr", "legal"]   # 讀取：僅限 hr + legal 部門
 
 這一層疊在內建的 `departments/<dept>/` 隔離之上（見下方「部門知識分層」）：`departments/art/*` 無論 `.scope.toml` 怎麼設，永遠只對 `art` 部門可見；而 `visible_to_departments` 讓操作者可以把*任何*命名空間（`hr/`、`finance/` 等）限制給指定部門。`wiki_namespace_status` 會列出目前生效的 `visible_to_departments` 宣告。
 
+**名稱怎麼比對（v1.84.0）。** 頁面路徑與 `.scope.toml` 的命名空間名稱在所有平台上都把 `/` 與 `\` 當成分隔符號、不分大小寫，並忽略結尾的句點與空白，所以 `departments\HR\pay.md` 和 `departments/hr/pay.md` 是同一頁。兩個 `[namespaces."…"]` 依這些規則指向同一個資料夾時（例如 `HR` 與 `hr`），AI 員工一律不能讀取這個資料夾，寫入則連操作者也被拒絕，直到管理員刪掉重複的那一筆；閘道對每個資料夾記錄一次警告。
+
 ### 部門知識與 Skill 分層
 
 知識與 Skill 採**公司 → 部門 → 個人**分層：
