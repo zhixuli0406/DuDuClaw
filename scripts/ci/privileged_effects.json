@@ -7326,6 +7326,19 @@
       "identity": "test",
       "migration": "test_only",
       "rationale": "Fake Codex terminal-result regression verifies cleanup of hung test processes."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/runtime/codex/owned_home.rs::tests::create_test_junction",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_output": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Runs cmd.exe mklink /J to create a junction as a Windows test fixture for work-root verification."
     }
   ]
 }
