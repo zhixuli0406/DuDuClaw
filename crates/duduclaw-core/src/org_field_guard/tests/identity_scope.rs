@@ -1089,6 +1089,15 @@ fn rm166b_identity_transition_record_is_refused_on_both_lanes() {
 /// under every spelling a file system opens as `auto/`, plus the directory
 /// itself and the legacy in-wiki lock / sidecars.
 #[test]
+fn own_auto_wiki_foreign_separators_streams_and_short_names_are_blocked() {
+    let h = home();
+    for rel in [r"wiki\auto\sop\x.md", r"wiki/auto\sop\x.md", r"wiki\.\AUTO\x.md", r"wiki\a\..\auto\x.md", "wiki/auto:stream/x.md", "wiki/AUTO~1/x.md"] {
+        let path = h.join("agents/sales-rep").join(rel);
+        assert!(matches!(check_own_auto_wiki_write(&path, &h, &agent("sales-rep")), GuardDecision::BlockedOwnAutoWikiWrite { .. }), "{rel}");
+    }
+}
+
+#[test]
 fn own_auto_wiki_write_edit_and_create_are_blocked() {
     let h = home();
     for rel in [

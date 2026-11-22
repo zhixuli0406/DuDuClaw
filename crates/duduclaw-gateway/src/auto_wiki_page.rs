@@ -1036,15 +1036,13 @@ fn target_path(
 
 /// Whether a wiki-relative path lives in the auto namespace.
 pub fn is_auto_path(path: &str) -> bool {
-    // Exact first-segment equality — never `starts_with("auto")`, which would
-    // also admit `automation/secret.md` (coding convention #2).
-    matches!(path.split('/').next(), Some(seg) if seg == AUTO_NAMESPACE && seg != path)
+    duduclaw_core::wiki_auto_namespace::is_auto_page_path(path)
 }
 
 /// Recover the `DocType` from an `auto/<dir>/...` path.
 pub fn doc_type_of_path(path: &str) -> DocType {
-    path.split('/')
-        .nth(1)
+    duduclaw_core::wiki_auto_namespace::page_id_components(path)
+        .and_then(|parts| parts.get(1).copied())
         .map(DocType::parse)
         .unwrap_or(DocType::Reference)
 }
@@ -1126,6 +1124,8 @@ pub fn promoted_record(store: &WikiStore, path: &str, raw: &str) -> Option<AutoP
 /// Memory-pointer subject for an auto page — the precise rollback key.
 /// Mirrors `wiki_ingest::pointer_subject`.
 pub fn pointer_subject(page_path: &str) -> String {
+    let canonical = duduclaw_core::wiki_auto_namespace::canonical_page_id(page_path);
+    let page_path = canonical.as_deref().unwrap_or(page_path);
     format!("wiki:{}", page_path.trim_end_matches(".md"))
 }
 
@@ -1740,6 +1740,24 @@ mod tests {
             serde_json::to_string(&sources).unwrap()
         );
         crate::wiki_host_sources::set_host_fields(&fm, &host, promoted)
+    }
+
+    #[test]
+    fn foreign_platform_auto_ids_never_bypass_conversation_visibility() {
+        let raw = raw_page(&[], &["conversation:telegram:A:m:1"], false, AUTO_PAGE_AUTHOR, "context");
+        let mut registry = AutoPageRegistry::default();
+        registry.pages.insert(r"auto\sop\x.md".into(), AutoPageRecord {
+            sha256: duduclaw_memory::wiki_auto_registry::page_digest(&raw),
+            host_sources: vec!["conversation:telegram:A:m:1".into()], host_promoted: false,
+        });
+        for path in [r"auto\sop\x.md", r"auto/sop\x.md", r".\auto\sop\x.md", r"AUTO\x.md", r"auto\\x.md", r"a\..\auto\x.md", "auto:stream/x.md"] {
+            assert!(is_auto_path(path), "{path}");
+            assert!(!page_visible_in_conversation(path, Some(&raw), Some("telegram:B"), &registry), "{path}");
+            assert!(!page_visible_in_conversation(path, Some(&raw), None, &registry), "{path}");
+            assert!(!page_visible_in_conversation(path, Some(&raw), Some("telegram:A"), &AutoPageRegistry::default()), "legacy {path}");
+        }
+        assert!(page_visible_in_conversation("auto/sop/x.md", Some(&raw), Some("telegram:A"), &registry));
+        assert!(!page_visible_in_conversation("AUTO/sop/x.md", Some(&raw), Some("telegram:A"), &registry));
     }
 
     /// Visibility of auto pages to one conversation, from the HOST-recorded

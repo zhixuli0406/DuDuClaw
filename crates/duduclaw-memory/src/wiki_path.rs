@@ -7,8 +7,8 @@
 //!
 //! - [`validate_relative_wiki_path`] is the strict gate for writes: relative
 //!   paths only, no control characters, traversal or encoded separators, no
-//!   drive prefixes, trailing dots/spaces or Windows device names. Colons
-//!   are refused on Windows (NTFS alternate data streams).
+//!   drive prefixes, trailing dots/spaces, Windows device names, backslashes,
+//!   ADS colons or ambiguous DOS short-name tildes on every platform.
 //! - [`validate_relative_wiki_read_path`] also accepts existing Unix names
 //!   with trailing dots/spaces or device names. Windows stays strict.
 //! - [`ensure_within_wiki_dir`] canonicalizes the nearest existing ancestor
@@ -33,6 +33,48 @@
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
+/// The single filesystem-path → page-id boundary used by every wiki walker.
+/// Keep ids as strings; converting back to PathBuf lets later OS operations
+/// reintroduce native separators. Never lossy-decode or drop a component.
+pub fn page_id_from_relative_path(path: &Path) -> Option<String> {
+    let mut parts = Vec::new();
+    for part in path.components() {
+        match part {
+            Component::Normal(name) => {
+                let name = name.to_str()?;
+                // A literal backslash in a Unix filename is not a directory.
+                // Omit it rather than alias another physical page's registry.
+                if name.contains('\\') { return None; }
+                parts.push(name);
+            }
+            Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    let id = parts.join("/");
+    validate_relative_wiki_read_path(&id).ok()?;
+    Some(id)
+}
+
+pub use duduclaw_core::wiki_auto_namespace::canonical_page_id;
+
+/// Persistence compatibility for old Unix-only names. Ambiguous names remain
+/// verbatim data, never registry identities; the namespace classifier hides
+/// them from conversations. No backslash filename is reinterpreted here.
+pub fn persisted_page_id(path: &str) -> Option<String> {
+    canonical_page_id(path).or_else(|| {
+        if path.contains('\\') { return None; }
+        page_id_from_relative_path(Path::new(path))
+    })
+}
+
+/// Compare an index link with a page id across old persisted separator forms.
+pub fn index_line_links_to(line: &str, path: &str) -> bool {
+    let Some(key) = persisted_page_id(path) else { return false; };
+    line.split("](").skip(1).filter_map(|rest| rest.split_once(')'))
+        .any(|(target, _)| persisted_page_id(target).as_ref() == Some(&key))
+}
+
 /// Why a path was refused, as an `io::Error` kind the callers can match:
 /// `InvalidInput` for a malformed path, `PermissionDenied` for a path that
 /// resolves outside the wiki or is not a regular file.
@@ -49,6 +91,9 @@ fn denied(msg: &str) -> io::Error {
 /// Does not check the `.md` suffix or reserved names (callers differ: reads
 /// may open `_index.md`, writes may not). Never touches the filesystem.
 pub fn validate_relative_wiki_path(path: &str) -> std::result::Result<(), String> {
+    if path.contains('\\') {
+        return Err("Use forward slashes in page_path".to_string());
+    }
     validate_relative_wiki_path_mode(path, true)
 }
 
@@ -83,9 +128,9 @@ fn validate_relative_wiki_path_mode(path: &str, strict: bool) -> std::result::Re
     if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
         return Err("Drive-prefixed paths are not allowed".to_string());
     }
-    // Colons name alternate data streams only on Windows.
-    if cfg!(windows) && path.contains(':') {
-        return Err("':' is not allowed in page_path".to_string());
+    // Writes use portable ids on every OS; reads retain existing Unix names.
+    if strict && path.contains([':', '~']) {
+        return Err("Streams and short-name aliases are not allowed in page_path".to_string());
     }
     if path.chars().any(char::is_control) {
         return Err("Control characters are not allowed in page_path".to_string());
@@ -207,6 +252,8 @@ fn open_nofollow(full: &Path) -> io::Result<std::fs::File> {
 /// and after opening, and must stay inside the wiki directory. A missing
 /// file returns `NotFound` so callers can say "page not found".
 pub fn read_wiki_file_nofollow(wiki_dir: &Path, rel: &str) -> io::Result<String> {
+    let canonical = canonical_page_id(rel);
+    let rel = canonical.as_deref().unwrap_or(rel);
     use std::io::Read;
     validate_relative_wiki_read_path(rel).map_err(|e| invalid(&e))?;
     let full = wiki_dir.join(rel);
@@ -305,6 +352,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn strict_writes_refuse_foreign_separators_and_ambiguous_aliases() {
+        for path in [
+            r"auto\sop\x.md", r"auto/sop\x.md", r".\auto\x.md",
+            r"AUTO\x.md", r"auto\\x.md", r"a\..\auto\x.md",
+            r"concepts\x.md", "auto:stream/x.md", "AUTO~1/x.md",
+        ] {
+            assert!(validate_relative_wiki_path(path).is_err(), "{path:?}");
+        }
+        assert_eq!(page_id_from_relative_path(&Path::new("auto").join("sop").join("x.md")).as_deref(), Some("auto/sop/x.md"));
+        assert!(index_line_links_to(r"- [title](.\auto\sop\x.md)", "auto/sop/x.md"));
+    }
+
+    #[test]
     fn revoked_after_staging_sync_does_not_publish_or_leave_staging_file() {
         let dir = tempfile::tempdir().unwrap();
         let page = dir.path().join("page.md");
@@ -398,7 +458,7 @@ mod tests {
             assert!(validate_relative_wiki_path(bad).is_err(), "{bad:?}");
         }
         for path in streams {
-            assert_eq!(validate_relative_wiki_path(path).is_err(), cfg!(windows), "{path}");
+            assert!(validate_relative_wiki_path(path).is_err(), "{path}");
         }
         for bad in controls {
             assert!(validate_relative_wiki_read_path(bad).is_err(), "{bad:?}");

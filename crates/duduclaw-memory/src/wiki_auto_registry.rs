@@ -38,7 +38,8 @@
 //! at `<home>/locks/wiki-auto/<agent-id>.lock` ([`lock_auto_pages`], review
 //! M1), not in the employee's wiki directory.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use duduclaw_core::wiki_auto_namespace::canonical_page_id;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -101,14 +102,29 @@ impl AutoPageRegistry {
 
     /// The record of `path`, whatever the file holds now.
     pub fn record(&self, path: &str) -> Option<&AutoPageRecord> {
-        self.pages.get(path)
+        let key = canonical_page_id(path)?;
+        let mut found = None;
+        for (stored, record) in &self.pages {
+            if canonical_page_id(stored).as_deref() == Some(key.as_str()) {
+                if found.is_some_and(|previous| previous != record) {
+                    return None; // Conflicting aliases never grant visibility.
+                }
+                found = Some(record);
+            }
+        }
+        found
     }
 
     /// The record of `path` when `raw` is exactly the bytes it was recorded
     /// for; `None` for a page the gateway did not write as it is now.
     pub fn current(&self, path: &str, raw: &str) -> Option<&AutoPageRecord> {
-        self.pages.get(path).filter(|r| r.sha256 == page_digest(raw))
+        self.record(path).filter(|r| r.sha256 == page_digest(raw))
     }
+}
+
+fn registry_key(path: &str) -> io::Result<String> {
+    canonical_page_id(path)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "ambiguous wiki page id"))
 }
 
 /// Lowercase hex sha256 of a page's bytes.
@@ -147,9 +163,7 @@ pub fn owner_of_wiki(wiki_dir: &Path) -> Option<(PathBuf, String)> {
 /// Whether a wiki-relative path is in the auto namespace (first segment as a
 /// file system opens it, see `duduclaw_core::wiki_auto_namespace`).
 pub fn is_auto_rel(path: &str) -> bool {
-    let mut parts = path.split(['/', '\\']).filter(|p| !p.is_empty() && *p != ".");
-    matches!(parts.next(), Some(first) if duduclaw_core::wiki_auto_namespace::is_auto_namespace_segment(first))
-        && parts.next().is_some()
+    duduclaw_core::wiki_auto_namespace::is_auto_page_path(path)
 }
 
 /// Record (create or replace) the entry of `rel`: `written` is the exact page
@@ -162,13 +176,14 @@ pub fn record_page(
     host_sources: &[String],
     host_promoted: bool,
 ) -> io::Result<()> {
+    let rel = registry_key(rel)?;
     let record = AutoPageRecord {
         sha256: page_digest(written),
         host_sources: host_sources.to_vec(),
         host_promoted,
     };
     update(home, agent_id, true, |reg| {
-        reg.pages.insert(rel.to_string(), record);
+        reg.pages.insert(rel, record);
         true
     })
     .map(|_| ())
@@ -187,9 +202,10 @@ pub fn rerecord_if_current(
     old_raw: &str,
     new_written: &str,
 ) -> io::Result<bool> {
+    let rel = registry_key(rel)?;
     let old = page_digest(old_raw);
     let new = page_digest(new_written);
-    update(home, agent_id, false, |reg| match reg.pages.get_mut(rel) {
+    update(home, agent_id, false, |reg| match reg.pages.get_mut(&rel) {
         Some(entry) if entry.sha256 == old => {
             entry.sha256 = new;
             true
@@ -201,7 +217,21 @@ pub fn rerecord_if_current(
 /// Drop the entry of `rel` (the page was deleted or archived). No registry
 /// file is created for this.
 pub fn forget_page(home: &Path, agent_id: &str, rel: &str) -> io::Result<()> {
-    update(home, agent_id, false, |reg| reg.pages.remove(rel).is_some()).map(|_| ())
+    let rel = registry_key(rel)?;
+    update(home, agent_id, false, |reg| {
+        let before = reg.pages.len();
+        // Revocation is conservative even for case-insensitive filesystem
+        // aliases. Never leave a lowercase grant behind after deleting via
+        // an uppercase spelling; unlike lookup, removing extra grants is safe.
+        let folded: Vec<String> = rel.split('/')
+            .map(duduclaw_core::wiki_auto_namespace::fold_segment).collect();
+        reg.pages.retain(|path, _| {
+            let key: Vec<String> = path.split('/')
+                .map(duduclaw_core::wiki_auto_namespace::fold_segment).collect();
+            key != folded
+        });
+        reg.pages.len() != before
+    }).map(|_| ())
 }
 
 /// [`rerecord_if_current`] for the wiki at `wiki_dir`, when it is an
@@ -275,7 +305,21 @@ fn read_registry(path: &Path) -> io::Result<AutoPageRegistry> {
     if reg.version != REGISTRY_VERSION {
         return Err(io::Error::new(io::ErrorKind::InvalidData, format!("registry version {}", reg.version)));
     }
-    Ok(reg)
+    // Upgrade old Windows keys in memory before any read or mutation. Drop
+    // every member of a conflicting alias set, never pick a permissive one.
+    let mut pages = BTreeMap::new();
+    let mut conflicts = BTreeSet::new();
+    for (path, record) in reg.pages {
+        let Some(key) = canonical_page_id(&path) else { continue; };
+        if conflicts.contains(&key) { continue; }
+        if pages.get(&key).is_some_and(|old| old != &record) {
+            pages.remove(&key);
+            conflicts.insert(key);
+        } else {
+            pages.insert(key, record);
+        }
+    }
+    Ok(AutoPageRegistry { version: reg.version, pages })
 }
 
 /// Atomic replace (O_EXCL temp file + rename, never through a planted link),
@@ -377,6 +421,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn registry_matches_legacy_separator_keys_and_refuses_conflicts() {
+        let home = tempfile::tempdir().unwrap();
+        let file = registry_path(home.path(), "agnes").unwrap();
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let record = AutoPageRecord {
+            sha256: page_digest("v1"), host_sources: vec!["conversation:telegram:A:m:1".into()], host_promoted: false,
+        };
+        let mut legacy = AutoPageRegistry { version: REGISTRY_VERSION, pages: BTreeMap::new() };
+        legacy.pages.insert(r"auto\sop\x.md".into(), record.clone());
+        for path in ["auto/sop/x.md", r"auto\sop\x.md", r"auto/sop\x.md", r".\auto\sop\x.md", r"auto\\sop\x.md"] {
+            assert_eq!(legacy.current(path, "v1"), Some(&record), "{path}");
+        }
+        for path in [r"a\..\auto\sop\x.md", r"AUTO\sop\x.md", "auto./sop/x.md", "auto:stream/sop/x.md"] {
+            assert!(legacy.current(path, "v1").is_none(), "{path}");
+        }
+        std::fs::write(&file, serde_json::to_string(&legacy).unwrap()).unwrap();
+        assert!(rerecord_if_current(home.path(), "agnes", "auto/sop/x.md", "v1", "v2").unwrap());
+        let reg = AutoPageRegistry::load(home.path(), "agnes");
+        assert!(reg.pages.contains_key("auto/sop/x.md"));
+        assert!(reg.current(r"auto\sop\x.md", "v2").is_some());
+        forget_page(home.path(), "agnes", r"AUTO\SOP\X.MD").unwrap();
+        assert!(AutoPageRegistry::load(home.path(), "agnes").pages.is_empty());
+        let mut conflicting = record.clone();
+        conflicting.host_promoted = true;
+        legacy.pages.insert("auto/sop/x.md".into(), conflicting);
+        assert!(legacy.current("auto/sop/x.md", "v1").is_none());
+        std::fs::write(&file, serde_json::to_string(&legacy).unwrap()).unwrap();
+        assert!(AutoPageRegistry::load(home.path(), "agnes").pages.is_empty());
+    }
+
+    #[test]
     fn registry_lives_outside_every_employee_directory() {
         let home = tempfile::tempdir().unwrap();
         let reg = registry_path(home.path(), "agnes").unwrap();
@@ -456,6 +531,6 @@ mod tests {
             assert_eq!(owner_of_wiki(&home.join(other)), None, "{other}");
         }
         assert!(is_auto_rel("auto/sop/x.md") && is_auto_rel("./AUTO/x.md"));
-        assert!(!is_auto_rel("automation/x.md") && !is_auto_rel("auto") && !is_auto_rel("entities/auto/x.md"));
+        assert!(!is_auto_rel("automation/x.md") && is_auto_rel("auto") && !is_auto_rel("entities/auto/x.md"));
     }
 }
