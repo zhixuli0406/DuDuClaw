@@ -20,7 +20,7 @@ fn frame_error_text(frame: &WsFrame) -> String {
 
 fn frame_error_str(frame: &WsFrame) -> &str {
     match frame {
-        WsFrame::Response { error: Some(e), .. } => e.as_str(),
+        WsFrame::Response { error: Some(e), .. } => e.as_str().unwrap_or(""),
         _ => "",
     }
 }
