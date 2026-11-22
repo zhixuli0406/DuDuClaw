@@ -206,12 +206,12 @@ pub(super) fn employee_permission_args(
         for path in duduclaw_core::agent_guard::employee_control_paths() {
             let absolute = dir.join(path);
             if protected.insert(absolute.clone()) {
-                entries.push(format!("{}={}", toml_string_literal(absolute.to_str().unwrap()), toml_string_literal("read")));
+                entries.push(format!("{}={}", toml_string_literal(duduclaw_core::path_compare::spawn_path(&absolute).to_str().unwrap()), toml_string_literal("read")));
             }
         }
     }
     for root in private_roots {
-        let Some(text) = root.to_str().filter(|_| root.is_absolute()) else {
+        let Some(text) = duduclaw_core::path_compare::spawn_path(root).to_str().filter(|_| root.is_absolute()) else {
             return Err("Codex employee permissions require absolute UTF-8 private directories — refusing to spawn".into());
         };
         if protected.insert(root.clone()) {
@@ -286,7 +286,7 @@ fn output_schema_args(
         }
     };
     let path = call_dir.join(OUTPUT_SCHEMA_FILE);
-    let Some(text) = path.to_str().map(str::to_owned) else {
+    let Some(text) = duduclaw_core::path_compare::spawn_path(&path).to_str().map(str::to_owned) else {
         warn!(runtime = "codex", "Codex call directory is not UTF-8 — continuing without structured output");
         return Vec::new();
     };
@@ -444,7 +444,7 @@ fn mcp_override_base_args(def: &serde_json::Value) -> Vec<String> {
         args.push("-c".to_string());
         args.push(format!(
             "mcp_servers.duduclaw.command={}",
-            toml_string_literal(command)
+            toml_string_literal(duduclaw_core::path_compare::spawn_path(std::path::Path::new(command)).to_str().unwrap())
         ));
     }
     args.push("-c".to_string());
@@ -649,6 +649,10 @@ fn mcp_env_override_args(env: &serde_json::Map<String, serde_json::Value>) -> Ve
         let Some(val) = env_value_as_string(v) else {
             continue;
         };
+        let val = if k == "DUDUCLAW_HOME" {
+            duduclaw_core::path_compare::spawn_path(std::path::Path::new(&val))
+                .to_str().unwrap().to_owned()
+        } else { val };
         args.push("-c".to_string());
         args.push(format!(
             "mcp_servers.duduclaw.env.{k}={}",
@@ -778,7 +782,7 @@ static CODEX_SUPPORT: std::sync::OnceLock<CodexSupportCache> =
 /// Every failure returns `None`: env passthrough falls back, while the
 /// required employee permission profile refuses WorkspaceWrite spawns.
 pub(crate) async fn probe_codex_version_output(bin: &str) -> Option<String> {
-    let mut cmd = tokio::process::Command::new(bin);
+    let mut cmd = tokio::process::Command::new(duduclaw_core::path_compare::spawn_path(std::path::Path::new(bin)));
     duduclaw_core::spawn_env::apply_agent_cli_env_allowlist(&mut cmd);
     cmd.arg("--version");
     let out = crate::process_group::output(
@@ -1437,7 +1441,7 @@ fn extract_mcp_tool_call_output(item: &serde_json::Value) -> Option<String> {
 /// Preserve API authentication before assigning the owned config home.
 /// `--ignore-user-config` does not ignore auth (codex-cli 0.166.0 exec help).
 fn apply_codex_auth_env(cmd: &mut tokio::process::Command) {
-    if let Some(home) = std::env::var_os("CODEX_HOME") { cmd.env("CODEX_HOME", home); }
+    if let Some(home) = std::env::var_os("CODEX_HOME") { cmd.env("CODEX_HOME", duduclaw_core::path_compare::spawn_path(std::path::Path::new(&home))); }
     if let Some(key) = std::env::var_os("OPENAI_API_KEY") { cmd.env("OPENAI_API_KEY", key); }
 }
 
@@ -1549,12 +1553,12 @@ impl CodexRuntime {
         // gateway-private `<home>/run/codex`, never the temp directory. The
         // guard owns cleanup on success, spawn failure, timeout and cancellation.
         let work_dir = owned_home::OwnedCallDir::create(&context.home_dir, owned_home::UTILITY_PREFIX)?;
-        let mut cmd = tokio::process::Command::new(&self.codex_path);
+        let mut cmd = tokio::process::Command::new(duduclaw_core::path_compare::spawn_path(std::path::Path::new(&self.codex_path)));
         duduclaw_core::spawn_env::apply_agent_cli_env_allowlist(&mut cmd);
         // Share the real auth file, preserving refresh writes across launches.
         // CODEX_HOME is an auth location, absent from the generic spawn allowlist.
         let codex_home = prepare_owned_codex_home(work_dir.path())?;
-        cmd.env("CODEX_HOME", codex_home);
+        cmd.env("CODEX_HOME", duduclaw_core::path_compare::spawn_path(&codex_home));
         if let Some(key) = std::env::var_os("OPENAI_API_KEY") { cmd.env("OPENAI_API_KEY", key); }
         cmd.args(utility_args());
         cmd.args(effort_args(context.effort));
@@ -1567,10 +1571,10 @@ impl CodexRuntime {
         // Both process cwd and Codex's working root exclude employee/project files.
         // The utility directory is inside `<home>/run/codex`, so it passes.
         let work_root = owned_home::check_work_root(&context.home_dir, work_dir.path())?;
-        external_config::check_project_layers(work_root.path(), None)?;
+        external_config::check_project_layers(work_root.canonical_path(), None)?;
         work_root.apply_to_command(&mut cmd);
         let caps = utility_native_caps(context.capabilities.as_ref());
-        super::apply_native_sandbox(&mut cmd, Some(&caps), Some(work_root.path()), "codex")?;
+        super::apply_native_sandbox(&mut cmd, Some(&caps), Some(work_root.spawn_path()), "codex")?;
         // RM-181 defence in depth, as for employee launches.
         refuse_project_trust_override(&cmd, None)?;
         Ok((cmd, work_dir, work_root))
@@ -1578,7 +1582,7 @@ impl CodexRuntime {
 }
 
 fn employee_base_command(codex_path: &str, model: &str) -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new(codex_path);
+    let mut cmd = tokio::process::Command::new(duduclaw_core::path_compare::spawn_path(std::path::Path::new(codex_path)));
     // Auth remains in the host store. These arguments
     // express the desired base but are NOT evidence of complete isolation.
     apply_codex_auth_env(&mut cmd);
@@ -1789,7 +1793,7 @@ impl AgentRuntime for CodexRuntime {
             .ok_or("cannot resolve Codex project root")?;
         let work_root = owned_home::check_work_root(&context.home_dir, &work_root)?;
         let owned_config = context.agent_dir.as_ref().map(|dir| dir.join(".codex/config.toml"));
-        external_config::check_project_layers(work_root.path(), owned_config.as_deref())?;
+        external_config::check_project_layers(work_root.canonical_path(), owned_config.as_deref())?;
 
         // H1: `<home>/run/codex/call-<random>` (0700, gateway-private, read-only
         // for tools via the profile below), removed when `config_root` drops —
@@ -1807,7 +1811,7 @@ impl AgentRuntime for CodexRuntime {
             write_owned_instructions(&codex_home, system_prompt)?;
         }
         let mut cmd = employee_base_command(&self.codex_path, &context.model);
-        cmd.env("CODEX_HOME", &codex_home);
+        cmd.env("CODEX_HOME", duduclaw_core::path_compare::spawn_path(&codex_home));
         let egress_mode = duduclaw_core::egress_guard::effective_mode(&context.home_dir, context.agent_dir.as_deref());
         let effective_caps = egress_sandbox_caps(caps, egress_mode);
         if employee_needs_namespace_guard(effective_caps, explore) {
@@ -1820,7 +1824,7 @@ impl AgentRuntime for CodexRuntime {
             let supports_permissions = needs_permissions
                 && codex_supports_employee_permissions(&self.codex_path).await;
             let private_roots = owned_home::protected_roots(&context.home_dir);
-            let args = employee_egress_sandbox_args(caps, explore, egress_mode, context.agent_dir.as_deref(), Some(work_root.path()), supports_permissions, &private_roots)
+            let args = employee_egress_sandbox_args(caps, explore, egress_mode, context.agent_dir.as_deref(), Some(work_root.spawn_path()), supports_permissions, &private_roots)
                 .map_err(|error| duduclaw_agent::mcp_spawn_gate::spawn_gate_error(&error))?;
             cmd.args(args);
         }
@@ -1936,7 +1940,7 @@ impl AgentRuntime for CodexRuntime {
         // working root, so an overridden cwd is the directory that gets
         // write access (a sandbox scoped to the scaffold would forbid exactly
         // the writes the override exists to allow).
-        super::apply_native_sandbox(&mut cmd, caps, Some(work_root.path()), "codex")?;
+        super::apply_native_sandbox(&mut cmd, caps, Some(work_root.spawn_path()), "codex")?;
 
         // RM-181 defence in depth: Codex loads project-layer configuration
         // only for trusted projects; DuDuClaw never grants trust.
