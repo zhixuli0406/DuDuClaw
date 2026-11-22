@@ -1275,14 +1275,16 @@ async fn collect_codex_output(
     cmd: &mut tokio::process::Command,
     timeout: std::time::Duration,
 ) -> Result<CodexOutput, String> {
-    collect_codex_output_with_input(cmd, timeout, None).await
+    collect_codex_output_with_input(cmd, timeout, None, None).await
 }
 
 async fn collect_codex_output_with_input(
     cmd: &mut tokio::process::Command,
     timeout: std::time::Duration,
     input: Option<&[u8]>,
+    work_root: Option<&owned_home::CheckedWorkRoot>,
 ) -> Result<CodexOutput, String> {
+    if let Some(root) = work_root { root.reverify()?; }
     #[cfg(test)]
     if let Ok(capture) = tests::COMMAND_CAPTURE.try_with(std::sync::Arc::clone) {
         // RM-204: also what the process would have read on stdin and the
@@ -1316,6 +1318,9 @@ async fn collect_codex_output_with_input(
     // After the test probe returns. Hold the lease across spawn only; a failed
     // spawn drops it without marking the round handed off.
     let admission = crate::autonomous_runtime::admit_current().await?;
+    // Admission can await. Recheck after it, immediately before the backend
+    // spawn call; retain the checked canonical spelling throughout preparation.
+    if let Some(root) = work_root { root.reverify()?; }
     let mut managed = duduclaw_core::execution_gate::with_runtime(
         duduclaw_core::execution_gate::RuntimeKind::Codex,
         crate::process_group::BackendChild::spawn_class(cmd, crate::process_group::execution_class(
@@ -1539,7 +1544,7 @@ impl CodexRuntime {
         &self,
         prompt: &str,
         context: &RuntimeContext,
-    ) -> Result<(tokio::process::Command, owned_home::OwnedCallDir), String> {
+    ) -> Result<(tokio::process::Command, owned_home::OwnedCallDir, owned_home::CheckedWorkRoot), String> {
         // H1: a fresh 0700 `utility-<random>` directory under the
         // gateway-private `<home>/run/codex`, never the temp directory. The
         // guard owns cleanup on success, spawn failure, timeout and cancellation.
@@ -1560,16 +1565,15 @@ impl CodexRuntime {
         cmd.arg("-");
         if !context.model.is_empty() { cmd.arg("-m").arg(&context.model); }
         // Both process cwd and Codex's working root exclude employee/project files.
-        external_config::check_project_layers(work_dir.path(), None)?;
-        // F4: the same working-root rule as employee calls (the private
-        // utility directory lies inside `<home>/run/codex`, so it passes).
-        owned_home::check_work_root(&context.home_dir, work_dir.path())?;
-        cmd.current_dir(work_dir.path()).arg("--cd").arg(work_dir.path());
+        // The utility directory is inside `<home>/run/codex`, so it passes.
+        let work_root = owned_home::check_work_root(&context.home_dir, work_dir.path())?;
+        external_config::check_project_layers(work_root.path(), None)?;
+        work_root.apply_to_command(&mut cmd);
         let caps = utility_native_caps(context.capabilities.as_ref());
-        super::apply_native_sandbox(&mut cmd, Some(&caps), Some(work_dir.path()), "codex")?;
+        super::apply_native_sandbox(&mut cmd, Some(&caps), Some(work_root.path()), "codex")?;
         // RM-181 defence in depth, as for employee launches.
         refuse_project_trust_override(&cmd, None)?;
-        Ok((cmd, work_dir))
+        Ok((cmd, work_dir, work_root))
     }
 }
 
@@ -1689,9 +1693,9 @@ impl AgentRuntime for CodexRuntime {
                 cache_read_tokens: 0, model_used: context.model.clone(), runtime_name: "codex".into() });
         }
         if crate::runtime_dispatch::in_utility_call() {
-            let (mut cmd, _work_dir) = self.prepare_utility_command(prompt, context)?;
+            let (mut cmd, _work_dir, work_root) = self.prepare_utility_command(prompt, context)?;
             let payload = utility_stdin_payload(prompt, &context.system_prompt);
-            return execute_codex_command_with_input(&mut cmd, context, Some(payload.as_bytes())).await;
+            return execute_codex_command_with_input(&mut cmd, context, Some(payload.as_bytes()), Some(&work_root)).await;
         }
         // Explore lane: `-s read-only` whatever the capability level, and the
         // duduclaw MCP server registered with the lane variable (below).
@@ -1777,24 +1781,15 @@ impl AgentRuntime for CodexRuntime {
         // affected: the `-c mcp_servers.duduclaw.env.DUDUCLAW_AGENT_ID`
         // override carries the member id independently of cwd.
         //
-        // Resolved ONCE through the shared [`super::resolve_spawn_work_dir`]
-        // which validates the override is a real directory and otherwise
-        // warns and falls back.
-        let work_root: Option<std::path::PathBuf> =
-            super::resolve_spawn_work_dir(context.agent_dir.as_deref(), &context.agent_id);
-        let owned_config = context.agent_dir.as_ref().map(|dir| dir.join(".codex/config.toml"));
-        let project_root = work_root.clone().or_else(|| std::env::current_dir().ok())
+        // Select the configured directory once, then discard that spelling.
+        // Even the inherited-cwd case must pass the gate and be pinned to an
+        // absolute canonical path, rather than resolving again in the child.
+        let work_root = super::resolve_spawn_work_dir(context.agent_dir.as_deref(), &context.agent_id)
+            .or_else(|| std::env::current_dir().ok())
             .ok_or("cannot resolve Codex project root")?;
-        external_config::check_project_layers(&project_root, owned_config.as_deref())?;
-        // F4 (v1.84 security re-review): a working root that is `<home>`, an
-        // ancestor of it or otherwise contains `<home>/run` would let the
-        // employee's tools rename `<home>/run` under `:project_roots = write`.
-        // Refused (typed engine-local) before anything is prepared. Without a
-        // working root no `--cd` is passed, and the workspace-write profile
-        // already refuses a spawn without an agent directory.
-        if let Some(root) = work_root.as_deref() {
-            owned_home::check_work_root(&context.home_dir, root)?;
-        }
+        let work_root = owned_home::check_work_root(&context.home_dir, &work_root)?;
+        let owned_config = context.agent_dir.as_ref().map(|dir| dir.join(".codex/config.toml"));
+        external_config::check_project_layers(work_root.path(), owned_config.as_deref())?;
 
         // H1: `<home>/run/codex/call-<random>` (0700, gateway-private, read-only
         // for tools via the profile below), removed when `config_root` drops —
@@ -1825,7 +1820,7 @@ impl AgentRuntime for CodexRuntime {
             let supports_permissions = needs_permissions
                 && codex_supports_employee_permissions(&self.codex_path).await;
             let private_roots = owned_home::protected_roots(&context.home_dir);
-            let args = employee_egress_sandbox_args(caps, explore, egress_mode, context.agent_dir.as_deref(), work_root.as_deref(), supports_permissions, &private_roots)
+            let args = employee_egress_sandbox_args(caps, explore, egress_mode, context.agent_dir.as_deref(), Some(work_root.path()), supports_permissions, &private_roots)
                 .map_err(|error| duduclaw_agent::mcp_spawn_gate::spawn_gate_error(&error))?;
             cmd.args(args);
         }
@@ -1928,10 +1923,8 @@ impl AgentRuntime for CodexRuntime {
         // prompt starting with '-' can no longer be parsed as a flag either.
         cmd.arg("-");
 
-        // Set working directory
-        if let Some(ref dir) = work_root {
-            cmd.arg("--cd").arg(dir);
-        }
+        // One gate result supplies both CLI and OS working directories.
+        work_root.apply_to_command(&mut cmd);
 
         // stdin carries the prompt and is closed after it (the collector
         // pipes it); an inherited open pipe would stall the run until EOF.
@@ -1943,13 +1936,13 @@ impl AgentRuntime for CodexRuntime {
         // working root, so an overridden cwd is the directory that gets
         // write access (a sandbox scoped to the scaffold would forbid exactly
         // the writes the override exists to allow).
-        super::apply_native_sandbox(&mut cmd, caps, work_root.as_deref(), "codex")?;
+        super::apply_native_sandbox(&mut cmd, caps, Some(work_root.path()), "codex")?;
 
         // RM-181 defence in depth: Codex loads project-layer configuration
         // only for trusted projects; DuDuClaw never grants trust.
         refuse_project_trust_override(&cmd, owned_config.as_deref())?;
 
-        execute_codex_command_with_input(&mut cmd, context, Some(augmented_prompt.as_bytes())).await
+        execute_codex_command_with_input(&mut cmd, context, Some(augmented_prompt.as_bytes()), Some(&work_root)).await
     }
 
     async fn is_available(&self) -> bool {
@@ -1970,7 +1963,7 @@ async fn execute_codex_command(
     cmd: &mut tokio::process::Command,
     context: &RuntimeContext,
 ) -> Result<RuntimeResponse, String> {
-    execute_codex_command_with_input(cmd, context, None).await
+    execute_codex_command_with_input(cmd, context, None, None).await
 }
 
 fn utility_stdin_payload(prompt: &str, system: &str) -> String {
@@ -1985,11 +1978,12 @@ async fn execute_codex_command_with_input(
     cmd: &mut tokio::process::Command,
     context: &RuntimeContext,
     input: Option<&[u8]>,
+    work_root: Option<&owned_home::CheckedWorkRoot>,
 ) -> Result<RuntimeResponse, String> {
     let timeout_secs = crate::runtime_config::call_timeout_secs(context.agent_dir.as_deref());
     let idle = crate::runtime_config::idle_timeout_secs(&context.home_dir, context.agent_dir.as_deref());
     let output = CODEX_IDLE_TIMEOUT.scope(idle, collect_codex_output_with_input(
-        cmd, std::time::Duration::from_secs(timeout_secs), input,
+        cmd, std::time::Duration::from_secs(timeout_secs), input, work_root,
     )).await?;
 
     if let Some(status) = output.status {
@@ -2318,7 +2312,7 @@ pub(crate) mod tests {
         cmd.env_clear();
         let prompt = "中文🙂\n".repeat(20_000);
         let output = collect_codex_output_with_input(&mut cmd,
-            std::time::Duration::from_secs(5), Some(prompt.as_bytes())).await.unwrap();
+            std::time::Duration::from_secs(5), Some(prompt.as_bytes()), None).await.unwrap();
         assert!(output.status.unwrap().success());
         assert_eq!(output.stdout, prompt.as_bytes());
     }
@@ -2328,18 +2322,20 @@ pub(crate) mod tests {
         let home = tempfile::tempdir().unwrap();
         let runtime = CodexRuntime { codex_path: "codex-fixture".into() };
         let context = utility_context(home.path());
-        let (command, _directory) = runtime.prepare_utility_command("繁體中文 $HOME;\nnext", &context).unwrap();
+        let (command, directory, work_root) = runtime.prepare_utility_command("繁體中文 $HOME;\nnext", &context).unwrap();
         let before = duduclaw_core::execution_gate::command_snapshot(&command);
         let cwd = command.as_std().get_current_dir().unwrap().to_path_buf();
         // H1: the utility cwd is a private `utility-<random>` directory under
         // `<home>/run/codex`, not the temp directory.
-        assert_eq!(cwd.parent(), Some(owned_home::run_parent(home.path()).as_path()));
+        let parent = duduclaw_core::path_compare::canonicalize(&owned_home::run_parent(home.path())).unwrap();
+        assert_eq!(cwd.parent(), Some(parent.as_path()));
+        assert_eq!(cwd, work_root.path());
         let name = cwd.file_name().unwrap().to_str().unwrap();
         assert!(name.starts_with(owned_home::UTILITY_PREFIX) && owned_home::matches_scheme(name), "{name}");
         let mut expected = tokio::process::Command::new("codex-fixture");
         duduclaw_core::apply_agent_cli_env_allowlist(&mut expected);
         // The utility launch owns a private CODEX_HOME inside its private cwd.
-        expected.env("CODEX_HOME", cwd.join("codex-home"));
+        expected.env("CODEX_HOME", directory.path().join("codex-home"));
         if let Some(value) = std::env::var_os("OPENAI_API_KEY") { expected.env("OPENAI_API_KEY", value); }
         expected.args([
             "exec", "--json", "--skip-git-repo-check", "--sandbox", "read-only",
@@ -2434,8 +2430,9 @@ pub(crate) mod tests {
         expected.args(["--approve-for-me",
             "-c", "approval_policy=never", "-c", "sandbox_mode=\"workspace-write\""]);
         let agent = fixture_agent_dir(home.path());
+        let canonical_agent = duduclaw_core::path_compare::canonicalize(&agent).unwrap();
         #[cfg(unix)]
-        expected.args(employee_permission_args(&agent, Some(agent.as_path()),
+        expected.args(employee_permission_args(&agent, Some(canonical_agent.as_path()),
             &owned_home::protected_roots(home.path())).unwrap());
         // Resolve the dynamic MCP registration independently of the captured command.
         let delegation_env = crate::claude_runner::delegation_context_env(home.path(), "tester",
@@ -2448,9 +2445,8 @@ pub(crate) mod tests {
         expected.args(turn_source_override_args_with_namespace_guard(&[],
             duduclaw_core::ns_guard::is_active()));
         // RM-204: the prompt is read from stdin (`-`), never argv.
-        expected.args(["-", "--cd"]).arg(&agent);
-        // Conversational Codex selects the root using --cd, leaving the process cwd inherited.
-        assert_eq!(before.cwd, None);
+        expected.args(["-", "--cd"]).arg(&canonical_agent).current_dir(&canonical_agent);
+        assert_eq!(before.cwd.as_deref(), Some(canonical_agent.as_path()));
         // RM-204: the instructions live in the owned CODEX_HOME, owner-only,
         // and nothing is written into the employee directory.
         assert!(!agent.join("AGENTS.md").exists());
@@ -2486,6 +2482,57 @@ pub(crate) mod tests {
         let args = command.as_std().get_args().map(|a| a.to_string_lossy().into_owned()).collect();
         let input = input.lock().unwrap().clone();
         (args, input)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_work_root_uses_gate_canonical_path_in_argv_and_cwd() {
+        let home = tempfile::tempdir().unwrap();
+        let mut context = utility_context(home.path());
+        context.capabilities = None;
+        let workspace = tempfile::tempdir().unwrap();
+        let alias = home.path().join("workspace-alias");
+        std::os::unix::fs::symlink(workspace.path(), &alias).unwrap();
+        let expected = owned_home::check_work_root(home.path(), &alias).unwrap();
+        assert_ne!(expected.path(), alias);
+        let bin = "/nonexistent/codex-canonical-work-root";
+        cached_codex_support(bin, || async { Some("codex-cli 0.164.0".into()) }).await;
+        let runtime = CodexRuntime { codex_path: bin.into() };
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let error = super::super::SPAWN_OVERRIDE.scope(
+            super::super::SpawnOverride { work_dir: Some(alias.clone()) },
+            MCP_CONFIG_TEST_PATHS.scope(vec![], COMMAND_CAPTURE.scope(
+                captured.clone(), runtime.execute("hi", &context))),
+        ).await.unwrap_err();
+        assert_eq!(error, "codex command captured before backend execution");
+        let command = captured.lock().unwrap().take().unwrap();
+        let args: Vec<_> = command.as_std().get_args().collect();
+        let cd: Vec<_> = args.windows(2).filter(|pair| pair[0] == "--cd").collect();
+        assert_eq!(cd.len(), 1);
+        assert_eq!(cd[0][1], expected.path().as_os_str());
+        assert_eq!(command.as_std().get_current_dir(), Some(expected.path()));
+        let permissions = employee_permission_args(context.agent_dir.as_deref().unwrap(),
+            Some(expected.path()), &owned_home::protected_roots(home.path())).unwrap();
+        assert!(permissions.iter().all(|arg| args.contains(&std::ffi::OsStr::new(arg))));
+        assert!(!args.iter().any(|arg| arg.to_string_lossy().contains(alias.to_str().unwrap())));
+    }
+
+    #[tokio::test]
+    async fn collector_refuses_a_work_root_replaced_after_command_preparation() {
+        let home = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        let workspace = base.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let checked = owned_home::check_work_root(home.path(), &workspace).unwrap();
+        let mut command = employee_base_command("fixture-never-spawned", "");
+        checked.apply_to_command(&mut command);
+        std::fs::rename(&workspace, base.path().join("original")).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        let probe: CollectProbe = Box::new(|_| panic!("replaced root must not reach spawn"));
+        let error = COLLECT_PROBE.scope(probe, collect_codex_output_with_input(
+            &mut command, std::time::Duration::from_secs(5), None, Some(&checked),
+        )).await.err().expect("replaced root must refuse");
+        assert!(duduclaw_agent::mcp_spawn_gate::is_engine_local_spawn_gate_error(&error));
     }
 
     #[tokio::test]
