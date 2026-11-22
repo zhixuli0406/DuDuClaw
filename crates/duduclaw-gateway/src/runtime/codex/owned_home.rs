@@ -1216,12 +1216,13 @@ mod tests {
         let root = base.path().join("workspace");
         let other = base.path().join("other");
         for path in [&home, &root, &other] { std::fs::create_dir(path).unwrap(); }
+        let canonical_home = duduclaw_core::path_compare::canonicalize(&home).unwrap();
         // `run` is absent: the first existing ancestor opened is `home`.
         let mut calls = 0;
         let error = check_work_root_with_identity(&home, &root, |path| {
             calls += 1;
             if calls == 2 {
-                assert!(duduclaw_core::path_compare::equal(path, &home).unwrap());
+                assert!(duduclaw_core::path_compare::equal(path, &canonical_home).unwrap());
                 std::fs::rename(&home, base.path().join("original-home")).unwrap();
                 create_test_junction(&home, &other);
             }
