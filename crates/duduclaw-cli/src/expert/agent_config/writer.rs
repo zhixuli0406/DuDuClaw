@@ -302,17 +302,8 @@ fn plan_agent(
 
 fn read_plan_file(path: &Path, expected: u64) -> Result<Vec<u8>> {
     use std::io::Read;
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let file = options.open(path).map_err(|e| cfg_err(e.to_string()))?;
-    if !file.metadata().map_err(|e| cfg_err(e.to_string()))?.is_file() {
-        return Err(cfg_err("來源不是一般檔案".into()));
-    }
+    let file = duduclaw_core::fs_safety::open_regular_file_nofollow(path)
+        .map_err(|e| cfg_err(e.to_string()))?;
     let mut bytes = Vec::new();
     file.take(expected.saturating_add(1)).read_to_end(&mut bytes).map_err(|e| cfg_err(e.to_string()))?;
     if bytes.len() as u64 != expected { return Err(cfg_err("來源檔案讀取期間變更".into())); }
@@ -328,6 +319,10 @@ fn snapshot_tree_filtered(root: &Path, skip_private: bool, dropped: &mut Vec<Str
         root: &Path, dir: &Path, files: &mut BTreeMap<String, Vec<u8>>, total: &mut u64,
         skip_private: bool, dropped: &mut Vec<String>,
     ) -> Result<()> {
+        let metadata = std::fs::symlink_metadata(dir).map_err(|e| cfg_err(e.to_string()))?;
+        if !metadata.is_dir() || duduclaw_core::fs_safety::is_link_metadata(&metadata) {
+            return Err(cfg_err("安裝計畫不接受連結或特殊目錄".into()));
+        }
         for entry in std::fs::read_dir(dir).map_err(|e| cfg_err(e.to_string()))? {
             let entry = entry.map_err(|e| cfg_err(e.to_string()))?;
             let name = entry.file_name();
@@ -337,13 +332,16 @@ fn snapshot_tree_filtered(root: &Path, skip_private: bool, dropped: &mut Vec<Str
             let path = entry.path();
             let meta = std::fs::symlink_metadata(&path).map_err(|e| cfg_err(e.to_string()))?;
             let name = name.to_str().ok_or_else(|| cfg_err("安裝計畫檔名不是 UTF-8".into()))?;
-            if skip_private && (meta.file_type().is_symlink() || name.starts_with('.')
+            if skip_private && (duduclaw_core::fs_safety::is_link_metadata(&meta) || name.starts_with('.')
                 || super::adapters::is_secret_file(name)
                 || (meta.is_dir() && super::adapters::is_secret_dir(name))) {
                 let rel = path.strip_prefix(root).map_err(|e| cfg_err(e.to_string()))?.to_str()
                     .ok_or_else(|| cfg_err("安裝計畫路徑不是 UTF-8".into()))?.replace('\\', "/");
                 dropped.push(rel);
                 continue;
+            }
+            if duduclaw_core::fs_safety::is_link_metadata(&meta) {
+                return Err(cfg_err("安裝計畫不接受連結或特殊檔案".into()));
             }
             if meta.is_dir() { walk(root, &path, files, total, skip_private, dropped)?; }
             else if meta.is_file() {
@@ -371,7 +369,7 @@ fn plan_archive(root: &Path, bundle: &ImportBundle) -> Result<BTreeMap<String, V
             if !matches!(part, std::path::Component::Normal(_)) { return Err(cfg_err("原始檔路徑無效".into())); }
             path.push(part);
             match std::fs::symlink_metadata(&path) {
-                Ok(meta) if meta.file_type().is_symlink() => return Err(cfg_err("原始檔不能是連結".into())),
+                Ok(meta) if duduclaw_core::fs_safety::is_link_metadata(&meta) => return Err(cfg_err("原始檔不能是連結".into())),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
                 Err(e) => return Err(cfg_err(e.to_string())),
                 _ => {}

@@ -13,7 +13,7 @@
 //!   commit. Apache-2.0. Six files, ~945 MB, dominated by
 //!   `onnx/model_q4.onnx_data`.
 //! * **ONNX Runtime** — Microsoft's official GitHub release matching the
-//!   version `ort-sys 2.0.0-rc.12` targets (1.24.2), pinned in
+//!   native version used with the binding's `api-24` feature (1.24.2), pinned in
 //!   `duduclaw_onnx::manifest` and re-exported here.
 
 use std::path::{Path, PathBuf};
@@ -166,16 +166,15 @@ mod tests {
     fn ort_archives_are_pinned_and_https() {
         assert_eq!(ORT_ARCHIVES.len(), 5);
         for a in ORT_ARCHIVES {
-            assert!(
-                a.url.starts_with("https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/"),
-                "{} url must be an official Microsoft release asset: {}",
-                a.target,
-                a.url
-            );
-            assert!(a.url.contains(ORT_VERSION), "{} url must carry the pinned version", a.target);
-            assert_eq!(a.sha256.len(), 64);
-            assert!(a.member.contains(ORT_VERSION) || a.member.ends_with(".dll"));
-            assert!(a.size > 1_000_000);
+            let prefix = format!("https://github.com/microsoft/onnxruntime/releases/download/v{ORT_VERSION}/");
+            assert!(a.url.starts_with(&prefix), "{}", a.target);
+            assert_eq!(a.sources().count(), 2);
+            for source in a.sources() {
+                assert!(source.url.contains(ORT_VERSION));
+                assert_eq!(source.sha256.len(), 64);
+                assert!(source.size > 1_000_000);
+            }
+            assert!(a.fallbacks[0].url.starts_with("https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/"));
         }
     }
 

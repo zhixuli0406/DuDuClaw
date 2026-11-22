@@ -771,6 +771,15 @@ impl McpDispatcher {
         if let Some(object) = clean_params.as_object_mut() {
             object.remove(duduclaw_gateway::google_personal::authority::APPROVAL_ACCOUNT_KEY);
         }
+        let wiki_call = clean_params.get("name").and_then(Value::as_str)
+            .is_some_and(|name| name.starts_with("wiki_") || name.starts_with("shared_wiki_"));
+        if wiki_call {
+            if let Some(args) = clean_params.get_mut("arguments") {
+                if duduclaw_memory::wiki_path::canonicalize_wiki_arguments(args).is_err() {
+                    return jsonrpc_error(id, -32602, "Invalid wiki page id");
+                }
+            }
+        }
         let params = &clean_params;
         let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
         let isolation_denied = crate::mcp_isolation::current().is_some()

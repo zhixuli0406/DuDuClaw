@@ -505,7 +505,7 @@
       "rationale": "Account authentication status probe, using the existing explicit vendor account environment."
     },
     {
-      "symbol": "crates/duduclaw-cli/src/lib.rs::doctor_probe_env_tests::grok_pipe_and_pty_probes_drop_ambient_secrets",
+      "symbol": "crates/duduclaw-cli/src/lib.rs::doctor_probe_env_tests::grok_doctor_runs_version_only_and_drops_ambient_secrets",
       "apis": {
         "command_constructor": 1,
         "terminal_output": 1
@@ -515,7 +515,7 @@
       ],
       "identity": "test",
       "migration": "test_only",
-      "rationale": "Test fixture or test helper; compiled/run only for regression verification, not a production employee execution entry point."
+      "rationale": "Test-only self-exec with a generated fake Grok executable verifies the CLI doctor runs only --version, drops ambient secrets and reports login as unverified; no production employee launch."
     },
     {
       "symbol": "crates/duduclaw-cli/src/lib.rs::entry_point",
@@ -541,19 +541,6 @@
       "identity": "gateway",
       "migration": "not_process",
       "rationale": "The lexical spawn match starts a Rust thread or Tokio task/JoinSet worker in this function; it does not create an OS child process."
-    },
-    {
-      "symbol": "crates/duduclaw-cli/src/lib.rs::grok_cli_diagnostic",
-      "apis": {
-        "platform_command_factory": 2,
-        "terminal_output": 2
-      },
-      "effects": [
-        "process_spawn"
-      ],
-      "identity": "gateway",
-      "migration": "gateway_exception",
-      "rationale": "Operator account/model diagnostic; fixed diagnostic CLI invocations, not employee task execution."
     },
     {
       "symbol": "crates/duduclaw-cli/src/lib.rs::test_support::run_on_big_stack",
@@ -3198,15 +3185,14 @@
     {
       "symbol": "crates/duduclaw-gateway/src/doctor_probes.rs::grok_probe",
       "apis": {
-        "platform_command_factory": 2,
-        "terminal_output": 2
+        "platform_command_factory": 1
       },
       "effects": [
         "process_spawn"
       ],
       "identity": "gateway",
       "migration": "gateway_exception",
-      "rationale": "Account/model readiness probe; fixed diagnostic arguments and existing scrubbed environment."
+      "rationale": "Operator installation/version probe; runs only grok --version through process_group::output with an allowlisted environment and a five-second timeout, without a prompt or PTY retry."
     },
     {
       "symbol": "crates/duduclaw-gateway/src/doctor_probes.rs::launchd_restart_warning",
@@ -3235,7 +3221,7 @@
       "rationale": "Operator diagnostic starts the product-owned MCP endpoint for protocol readiness; no arbitrary third-party command."
     },
     {
-      "symbol": "crates/duduclaw-gateway/src/doctor_probes.rs::tests::grok_probe_drops_ambient_secrets_and_keeps_explicit_env",
+      "symbol": "crates/duduclaw-gateway/src/doctor_probes.rs::tests::grok_doctor_and_detection_never_invoke_a_prompt",
       "apis": {
         "command_constructor": 1,
         "terminal_output": 1
@@ -3245,7 +3231,7 @@
       ],
       "identity": "test",
       "migration": "test_only",
-      "rationale": "Test fixture or test helper; compiled/run only for regression verification, not a production employee execution entry point."
+      "rationale": "Test-only self-exec with a generated fake Grok executable verifies the shared doctor probe and runtime detection avoid prompts and drop ambient secrets; no production employee launch."
     },
     {
       "symbol": "crates/duduclaw-gateway/src/document_limits.rs::tests::parse_isolation_public_document_guards_route_by_container",
@@ -7340,6 +7326,31 @@
       "identity": "test",
       "migration": "test_only",
       "rationale": "Fake Codex terminal-result regression verifies cleanup of hung test processes."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/runtime/codex/owned_home.rs::tests::create_test_junction",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_output": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Runs cmd.exe mklink /J to create a junction as a Windows test fixture for work-root verification."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/runtime/codex/owned_home.rs::tests::windows_local_work_root_stores_handle_final_path",
+      "apis": {
+        "command_constructor": 1
+      },
+      "identity": "test",
+      "migration": "test_only",
+      "effects": [
+        "process_spawn"
+      ],
+      "rationale": "Windows regression test inspects the constructed work-root Command cwd and argv without spawning a child."
     }
   ]
 }

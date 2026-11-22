@@ -30,6 +30,15 @@ How each surface signals a deprecation while the window is open:
 
 ---
 
+## Changed without a deprecation window (v1.84.0)
+
+These are behaviour changes with no transition period. Nothing was renamed, so no old name stays accepted.
+
+| Change | Version | What to do |
+|---|---|---|
+| Background work (key facts, summaries, titles, conversation distillation) of employees on Grok or a generic CLI engine is no longer sent to Claude automatically; it is skipped until a service is chosen | v1.84.0 | Choose **Service for background work** on the employee page (`agent.toml [runtime] utility_provider`), or write `[runtime] utility_provider` in `config.toml`. The system check lists affected employees. See [Dashboard settings](dashboard-settings.md#memory-language-and-background-work-v1840). |
+| A run-limit timeout of Grok, a generic CLI engine or an OpenAI-compatible engine no longer switches to the configured fallback engine | v1.84.0 | Raise the employee's time limit (`[runtime] timeout_secs`) if long runs need more time. See [Multi-runtime](../features/13-multi-runtime.md#when-the-fallback-engine-runs-v1840). |
+
 ## Changed without a deprecation window (v1.74.0)
 
 These changes break existing callers and get no two-version window,

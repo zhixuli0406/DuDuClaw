@@ -32,6 +32,7 @@ pub mod department;
 pub mod dispatch_guard;
 pub mod docker_probe;
 pub mod error;
+pub mod fs_safety;
 pub mod fs_lock;
 #[doc(hidden)]
 pub mod owner_lock;
@@ -55,6 +56,7 @@ pub mod isolation_policy;
 pub mod pack;
 pub mod publishers;
 pub mod platform;
+pub mod path_compare;
 pub mod preset;
 pub mod profile_sections;
 pub mod protected_section;
@@ -89,6 +91,7 @@ pub mod toml_merge;
 pub mod traits;
 pub mod types;
 pub mod turn_limits;
+pub mod wiki_auto_namespace;
 pub mod zh_variant;
 /// Raw-syscall helpers for glibc wrappers newer than the Linux release
 /// toolchain's glibc (`memfd_create`, `statx`, `renameat2`, `getrandom`).
@@ -158,7 +161,7 @@ pub use org_field_guard::{
     check_bash_protected_write, check_bash_protected_write_in, check_caller_scope,
     check_identity_surface_write, check_identity_surface_write_as, resolve_real_path,
     bash_invokes_operator_command, bash_operator_command_decision, OperatorCommand,
-    MCP_KEY_COMMANDS, EGRESS_LEASE_COMMANDS, check_own_contract_write, check_own_instructions_write, check_own_soul_write, check_protected_toml_write,
+    MCP_KEY_COMMANDS, EGRESS_LEASE_COMMANDS, check_own_auto_wiki_write, check_own_contract_write, check_own_instructions_write, check_own_soul_write, check_protected_toml_write,
     check_protected_toml_write_as, classify_identity_surface,
     classify_protected_toml, HookCaller, ProtectedSurface, ProtectedTomlKind,
     AGENT_CAPABILITY_SECTION, AGENT_EDITABLE_SECTIONS, AGENT_ORG_FIELDS, AGENT_SECURITY_KEYS,

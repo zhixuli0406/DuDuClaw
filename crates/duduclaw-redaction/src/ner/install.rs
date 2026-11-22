@@ -164,15 +164,15 @@ pub fn installed_problem(dirs: &InstallDirs) -> Option<String> {
 pub fn total_install_bytes() -> u64 {
     manifest::model_total_bytes()
         + manifest::ort_archive_for_current_platform()
-            .map(|a| a.size)
+            .map(duduclaw_onnx::install::max_source_size)
             .unwrap_or(0)
 }
 
 /// Install everything. Idempotent: an already-verified file is skipped, a
-/// partially downloaded one resumes.
+/// partially downloaded one restarts.
 ///
-/// `cancel` is polled between chunks; cancelling leaves the `.part` files in
-/// place so a later install resumes rather than restarts.
+/// `cancel` is polled between chunks; cancelling removes the current temporary
+/// file so a later install restarts.
 pub async fn install(
     dirs: &InstallDirs,
     progress: ProgressFn,
@@ -233,7 +233,10 @@ pub async fn install(
     }
 
     install_ort(&client, dirs, archive, &cancel, total, &mut done, &progress).await?;
-    hashes.insert("onnxruntime".to_string(), archive.sha256.to_string());
+    // Record the installed library, since the archive may come from NuGet.
+    let lib = manifest::ort_lib_path(&dirs.ort_lib_root)
+        .ok_or_else(|| RedactionError::config("這個平台沒有可用的 ONNX Runtime"))?;
+    hashes.insert("onnxruntime".to_string(), sha256_file(&lib)?);
 
     write_marker(&dirs.model_dir, hashes)?;
     progress(Progress {
@@ -565,13 +568,14 @@ mod tests {
 
     fn archive_spec(kind: ArchiveKind, member: &'static str) -> OrtArchive {
         OrtArchive {
-            target: "test",
+            target: "x86_64-unknown-linux-gnu",
             url: "https://example.invalid/x",
             size: 1,
             sha256: "00",
             kind,
             member,
             lib_file: "lib.out",
+            fallbacks: &[],
         }
     }
 

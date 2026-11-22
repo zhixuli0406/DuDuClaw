@@ -628,6 +628,10 @@ function AutoPagesTab({ agentId }: { agentId: string }) {
                 <FileTextIcon className="size-4 shrink-0 text-muted-foreground" />
                 <span className="text-sm font-medium text-foreground">{page.title}</span>
                 <Badge variant="secondary">{page.doc_type_label}</Badge>
+                <Badge variant="secondary">
+                  {intl.formatMessage({ id: page.state === 'confirmed'
+                    ? 'curate.auto.state.confirmed' : 'curate.auto.state.needsConfirmation' })}
+                </Badge>
               </div>
 
               <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
@@ -661,26 +665,34 @@ function AutoPagesTab({ agentId }: { agentId: string }) {
                   <EyeIcon />
                   {intl.formatMessage({ id: 'curate.auto.view' })}
                 </Button>
-                <Button
-                  variant="brand"
-                  size="sm"
-                  disabled={busyPath === page.path}
-                  onClick={() => setPromoteTarget(page)}
-                >
-                  <CheckCircle2Icon />
-                  {intl.formatMessage({ id: 'curate.auto.promote' })}
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  disabled={busyPath === page.path}
-                  onClick={() =>
-                    run(page.path, () => api.wiki.share(agentId, page.path), 'curate.auto.shared')
-                  }
-                >
-                  <Share2Icon />
-                  {intl.formatMessage({ id: 'curate.auto.share' })}
-                </Button>
+                {page.state === 'confirmed' ? (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={busyPath === page.path}
+                    onClick={() =>
+                      run(page.path, () => api.wiki.share(agentId, page.path), 'curate.auto.shared')
+                    }
+                  >
+                    <Share2Icon />
+                    {intl.formatMessage({ id: 'curate.auto.share' })}
+                  </Button>
+                ) : (
+                  <>
+                    <Button
+                      variant="brand"
+                      size="sm"
+                      disabled={busyPath === page.path}
+                      onClick={() => setPromoteTarget(page)}
+                    >
+                      <CheckCircle2Icon />
+                      {intl.formatMessage({ id: 'curate.auto.promote' })}
+                    </Button>
+                    <span className="self-center text-xs text-muted-foreground">
+                      {intl.formatMessage({ id: 'curate.auto.share.needsConfirmation' })}
+                    </span>
+                  </>
+                )}
                 <Button
                   variant="destructive"
                   size="sm"

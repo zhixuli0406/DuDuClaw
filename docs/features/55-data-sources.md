@@ -335,7 +335,7 @@ The release binary carries neither the model nor ONNX Runtime. The first time yo
 | artefact | size | source |
 |---|---|---|
 | model (6 files) | ~945 MB, dominated by `onnx/model_q4.onnx_data` | Hugging Face `openai/privacy-filter`, pinned to one commit |
-| ONNX Runtime | 7–75 MB depending on platform | Microsoft's official GitHub release for the version `ort` targets (1.24.2) |
+| ONNX Runtime | 7–75 MB depending on platform (about 125 MB from NuGet) | Microsoft's official GitHub release of the pinned version 1.24.2; if that download fails, the official NuGet package `Microsoft.ML.OnnxRuntime` 1.24.2 (one file for all platforms). Both are checked against pinned sizes and SHA-256 values |
 
 Every file is pinned with its URL, byte length and SHA-256 in the binary. Downloads stream to `<name>.part`, resume with an HTTP `Range` header, are hashed, and only then renamed into place — so a file at its final path is always a verified file. A hash mismatch deletes the partial download and fails the whole install; there is no "most of the model". An `installed.json` marker is written last and names the revision, so a partial install reads as **not installed** rather than as a broken one.
 

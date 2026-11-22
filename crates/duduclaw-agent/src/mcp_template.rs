@@ -248,7 +248,7 @@ pub fn with_mcp_config_lock<T>(
     path: &Path,
     f: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
-    let lock_base = crate::mcp_spawn_gate::mcp_config_lock_base(path);
+    let lock_base = crate::mcp_spawn_gate::mcp_config_lock_base(path)?;
     let mut inner: Option<Result<T, String>> = None;
     duduclaw_core::with_file_lock(&lock_base, || {
         inner = Some(f());
@@ -276,7 +276,9 @@ pub(crate) fn derive_home_from_agent_dir(agent_dir: &Path) -> std::path::PathBuf
     let Some(parent) = agent_dir.parent() else {
         return duduclaw_core::duduclaw_home();
     };
-    let is_ephemeral = parent.file_name().and_then(|n| n.to_str()) == Some(".ephemeral");
+    let is_ephemeral = parent.file_name().and_then(|n| n.to_str()).is_some_and(|name| {
+        if cfg!(windows) { name.eq_ignore_ascii_case(".ephemeral") } else { name == ".ephemeral" }
+    });
     let levels_up = if is_ephemeral { 3 } else { 2 };
 
     let mut home = agent_dir.to_path_buf();

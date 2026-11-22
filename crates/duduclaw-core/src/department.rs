@@ -44,17 +44,11 @@ pub fn is_valid_department(name: &str) -> bool {
 /// under `departments/`). Callers distinguish the two via
 /// [`department_page_visible`], which fails closed on the malformed case.
 pub fn department_of_page(page_path: &str) -> Option<&str> {
-    let mut segs = page_path.split('/');
-    if segs.next()? != DEPARTMENTS_NAMESPACE {
+    let parts = crate::wiki_auto_namespace::page_id_components(page_path)?;
+    if parts.len() < 3 || !crate::wiki_auto_namespace::segment_opens_as(parts[0], DEPARTMENTS_NAMESPACE) {
         return None;
     }
-    let dept = segs.next()?;
-    // Require a non-empty page component after the department segment.
-    let page = segs.next()?;
-    if dept.is_empty() || page.is_empty() {
-        return None;
-    }
-    Some(dept)
+    Some(parts[1])
 }
 
 /// Whether an agent whose department is `caller_department` may see/touch the
@@ -69,18 +63,21 @@ pub fn department_of_page(page_path: &str) -> Option<&str> {
 ///   `departments/<dept>/<page>` (e.g. a loose `departments/foo.md`) is denied
 ///   for every agent — fail-closed.
 pub fn department_page_visible(page_path: &str, caller_department: Option<&str>) -> bool {
-    let mut segs = page_path.split('/');
-    if segs.next() != Some(DEPARTMENTS_NAMESPACE) {
-        // Company / other namespace — visible to all.
+    let Some(parts) = crate::wiki_auto_namespace::page_id_components(page_path) else { return false; };
+    if !crate::wiki_auto_namespace::segment_opens_as(parts[0], DEPARTMENTS_NAMESPACE) {
         return true;
     }
-    match (segs.next(), segs.next()) {
-        (Some(dept), Some(page)) if !dept.is_empty() && !page.is_empty() => {
-            caller_department == Some(dept)
-        }
-        // departments/foo.md (no dept sub-dir) or departments/<dept>/ (no page).
-        _ => false,
+    if parts[0] != DEPARTMENTS_NAMESPACE {
+        crate::wiki_auto_namespace::warn_denied_alias(caller_department, parts[0]);
+        return false;
     }
+    parts.len() >= 3 && caller_department.is_some_and(|dept| {
+        if dept == parts[1] { return true; }
+        if crate::wiki_auto_namespace::segment_opens_as(dept, parts[1]) {
+            crate::wiki_auto_namespace::warn_denied_alias(caller_department, &parts[..2].join("/"));
+        }
+        false
+    })
 }
 
 /// Extract the top-level namespace (first path segment) from a wiki-relative
@@ -88,8 +85,8 @@ pub fn department_page_visible(page_path: &str, caller_department: Option<&str>)
 /// synthetic empty namespace `""`. Mirrors the CLI-side `top_level_namespace`
 /// so the department read-visibility filter agrees across the gateway and CLI.
 pub fn top_level_namespace(page_path: &str) -> &str {
-    match page_path.split('/').next() {
-        Some(seg) if !seg.is_empty() && seg != page_path => seg,
+    match crate::wiki_auto_namespace::page_id_components(page_path) {
+        Some(parts) if parts.len() > 1 => parts[0],
         _ => "",
     }
 }
@@ -142,6 +139,7 @@ pub fn namespace_department_visible(
 pub struct DepartmentVisibilityPolicy {
     /// namespace → allowed departments. Absent key = visible to all.
     map: std::collections::BTreeMap<String, Vec<String>>,
+    ambiguous: std::collections::BTreeSet<String>,
 }
 
 impl DepartmentVisibilityPolicy {
@@ -189,7 +187,9 @@ impl DepartmentVisibilityPolicy {
     pub fn parse(raw: &str) -> Result<Self, String> {
         let table: toml::Table = raw.parse().map_err(|e: toml::de::Error| e.to_string())?;
         let mut map = std::collections::BTreeMap::new();
+        let mut ambiguous = std::collections::BTreeSet::new();
         if let Some(namespaces) = table.get("namespaces").and_then(|v| v.as_table()) {
+            ambiguous = crate::wiki_auto_namespace::ambiguous_namespace_keys(namespaces.keys().map(String::as_str));
             for (ns, entry) in namespaces {
                 if let Some(arr) = entry.get("visible_to_departments").and_then(|v| v.as_array()) {
                     let depts: Vec<String> = arr
@@ -200,13 +200,17 @@ impl DepartmentVisibilityPolicy {
                 }
             }
         }
-        Ok(Self { map })
+        Ok(Self { map, ambiguous })
     }
 
     /// Departments allowed to read `namespace`, or `None` when the namespace
     /// has no declaration (visible to all).
     pub fn allowed_for(&self, namespace: &str) -> Option<&[String]> {
-        self.map.get(namespace).map(|v| v.as_slice())
+        let folded = crate::wiki_auto_namespace::fold_segment(namespace);
+        if self.ambiguous.contains(&folded) { return Some(&[]); }
+        self.map.iter().find(|(key, _)| {
+            crate::wiki_auto_namespace::fold_segment(key) == folded
+        }).map(|(key, allowed)| if key == namespace { allowed.as_slice() } else { &[] })
     }
 
     /// Whether the namespace filter alone permits `caller_department` to read
@@ -214,6 +218,10 @@ impl DepartmentVisibilityPolicy {
     /// isolation — use [`Self::page_visible`] for the combined decision).
     pub fn namespace_allows(&self, page_path: &str, caller_department: Option<&str>) -> bool {
         let ns = top_level_namespace(page_path);
+        if crate::wiki_auto_namespace::canonical_page_id(page_path).is_none() { return false; }
+        if self.map.keys().any(|key| key != ns && crate::wiki_auto_namespace::segment_opens_as(key, ns)) {
+            crate::wiki_auto_namespace::warn_denied_alias(caller_department, ns);
+        }
         namespace_department_visible(self.allowed_for(ns), caller_department)
     }
 
@@ -227,7 +235,7 @@ impl DepartmentVisibilityPolicy {
 
     /// Whether any namespace declares a `visible_to_departments` filter.
     pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
+        self.map.is_empty() && self.ambiguous.is_empty()
     }
 
     /// namespace → allowed departments, for status surfaces
@@ -240,6 +248,63 @@ impl DepartmentVisibilityPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn namespace_visibility_denies_nfc_nfd_aliases_in_both_directions() {
+        for (key, request) in [("café", "cafe\u{301}"), ("cafe\u{301}", "café")] {
+            let policy = DepartmentVisibilityPolicy::parse(&format!(
+                "[namespaces.\"{key}\"]\nvisible_to_departments = [\"hr\"]\n"
+            )).unwrap();
+            let page = format!("{request}/salary.md");
+            assert!(!policy.page_visible(&page, Some("sales")));
+            assert!(!policy.page_visible(&page, Some("hr")));
+            assert!(policy.page_visible(&format!("{key}/x.md"), Some("hr")));
+            assert_eq!(policy.allowed_for(request), Some(&[][..]));
+            assert!(policy.page_visible("ｃａｆé/salary.md", Some("sales")));
+            assert!(!department_page_visible(&format!("departments/{request}/salary.md"), Some(key)));
+            assert!(department_page_visible(&format!("departments/{key}/x.md"), Some(key)));
+            assert!(!department_page_visible(&format!("departments/{request}/salary.md"), Some("sales")));
+        }
+    }
+
+    #[test]
+    fn ambiguous_namespace_visibility_denies_even_identical_permissions() {
+        for second in ["visible_to_departments = [\"hr\"]", "mode = \"agent_writable\""] {
+            let policy = DepartmentVisibilityPolicy::parse(&format!(
+                "[namespaces.\"café\"]\nvisible_to_departments = [\"hr\"]\n[namespaces.\"cafe\u{301}\"]\n{second}\n"
+            )).unwrap();
+            for name in ["café", "cafe\u{301}", "CAFÉ."] {
+                assert_eq!(policy.allowed_for(name), Some(&[][..]));
+                assert!(!policy.page_visible(&format!("{name}/x.md"), Some("hr")));
+                assert!(!policy.page_visible(&format!("{name}/x.md"), Some("sales")));
+            }
+        }
+        let policy = DepartmentVisibilityPolicy::parse(
+            "[namespaces.HR]\nmode = 'agent_writable'\n[namespaces.hr]\nmode = 'agent_writable'"
+        ).unwrap();
+        assert!(!policy.is_empty());
+        assert!(!policy.page_visible("hr/x.md", Some("hr")));
+    }
+
+
+    #[test]
+    fn department_predicates_fold_portable_path_components() {
+        for path in [r"departments\hr\salary.md", r"departments/hr\salary.md", r".\departments\hr\salary.md"] {
+            assert!(!department_page_visible(path, Some("sales")), "{path}");
+            assert!(department_page_visible(path, Some("hr")), "{path}");
+            assert!(department_of_page(path).is_some());
+        }
+        for path in ["departments/HR/x.md", "departments/hr./x.md", "departments/h\u{200d}r/x.md", r"DEPARTMENTS\HR\salary.md", "departments./hr /salary.md"] {
+            assert!(!department_page_visible(path, Some("hr")), "{path}");
+        }
+        for path in ["../company.md", "departments/hr", r"a\..\departments\hr\salary.md"] {
+            assert!(!department_page_visible(path, Some("sales")), "{path}");
+        }
+        let policy = DepartmentVisibilityPolicy::parse("[namespaces.legal]\nvisible_to_departments = [\"hr\"]\n").unwrap();
+        for path in [r".\legal\x.md", r"LEGAL\x.md", "legal./x.md"] {
+            assert!(!policy.page_visible(path, Some("sales")), "{path}");
+        }
+    }
 
     #[test]
     fn valid_department_allowlist() {
@@ -321,6 +386,10 @@ mod tests {
         assert!(!namespace_department_visible(Some(&allowed), None));
         // Exact match only — no prefix leak.
         assert!(!namespace_department_visible(Some(&allowed), Some("hr-2")));
+        assert!(!namespace_department_visible(Some(&allowed), Some("HR")));
+        let unicode = vec!["café".to_string()];
+        assert!(namespace_department_visible(Some(&unicode), Some("café")));
+        assert!(!namespace_department_visible(Some(&unicode), Some("cafe\u{301}")));
         // Empty list denies everyone.
         assert!(!namespace_department_visible(Some(&[]), Some("hr")));
     }

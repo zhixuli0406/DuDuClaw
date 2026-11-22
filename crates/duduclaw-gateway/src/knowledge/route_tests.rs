@@ -240,6 +240,7 @@ fn unidentified_channel_sender_sees_only_channel_grants() {
         chat: "Cgroup".into(),
         sender: String::new(),
         user_id: None,
+        attested_private: false,
     };
     assert_eq!(
         hits(&serve(&st, "bot", stranger.clone(), search("底價")).unwrap()),
@@ -607,6 +608,7 @@ fn a_run_delegated_from_an_unbound_sender_does_not_see_internal_collections() {
             chat: "Ustranger".into(),
             sender: "Ustranger".into(),
             user_id: None,
+            attested_private: false,
         },
     );
     let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();

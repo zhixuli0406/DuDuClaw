@@ -180,15 +180,8 @@ pub(crate) fn hours_since_month_start() -> u64 {
 /// Mirrors `WikiStore::validate_page_path` for use at the WS RPC boundary
 /// (review H2/M6 — page_path enters audit log + downstream file ops).
 pub(crate) fn is_safe_wiki_page_path(path: &str) -> bool {
-    !path.is_empty()
-        && path.len() <= 512
-        && !path.contains("..")
-        && !path.starts_with('/')
-        && !path.starts_with('\\')
-        && !path.contains('\0')
-        && !path.contains("%2e")
-        && !path.contains("%2E")
-        && !path.contains("%2f")
-        && !path.contains("%2F")
+    path.len() <= 512
         && path.ends_with(".md")
+        && duduclaw_memory::wiki_path::canonical_page_argument(path)
+            .is_ok_and(|id| id == path)
 }

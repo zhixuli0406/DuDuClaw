@@ -99,10 +99,10 @@ impl GatewaySettingSource {
 /// the first (the first run writes them via [`write_minimal_config`], but
 /// nothing ever read them back). A user who hand-edited the port in
 /// `config.toml` still got a gateway bound to the old value — meanwhile
-/// `duduclaw-gateway::deep_link::dashboard_base_url` reads `config.toml
-/// [gateway] port` directly to build dashboard links for channel
-/// notifications, so every 👉 link pointed at a port nothing was listening
-/// on. This lives in `duduclaw-core` (rather than duplicated in
+/// the gateway read `config.toml [gateway] port` directly to build dashboard
+/// links (today only `duduclaw-gateway::deep_link::local_dashboard_base_url`,
+/// for same-machine display), so every 👉 link pointed at a port nothing was
+/// listening on. This lives in `duduclaw-core` (rather than duplicated in
 /// `duduclaw-cli` and `duduclaw-gateway::mcp_oauth`) specifically so the
 /// CLI's actual bind and every other consumer that needs to predict it
 /// (e.g. the MCP OAuth redirect URI) can never disagree by construction.

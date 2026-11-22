@@ -177,10 +177,10 @@ pub async fn notify_install_approvers(home_dir: &Path, db: &UserDb, req: &Instal
         return;
     }
 
-    // A clickable deep link to the unified inbox — `None` when no
-    // dashboard base URL is configured/derivable.
+    // A clickable deep link to the unified inbox — `None` when no valid
+    // public dashboard address is configured (never a localhost link).
     let link =
-        crate::deep_link::deep_link(home_dir, crate::deep_link::DeepLinkKind::Approval, &req.id);
+        crate::deep_link::public_deep_link(home_dir, crate::deep_link::DeepLinkKind::Approval, &req.id);
     let body = notify_body(req);
     let card = DecisionCard {
         source: DecisionSource::Install,

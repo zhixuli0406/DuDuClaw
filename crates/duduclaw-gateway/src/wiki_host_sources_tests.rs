@@ -45,6 +45,35 @@ fn stamping_adds_keeps_and_owns_the_key() {
     assert_eq!(stamp_host_sources("# Hi\n", None, &[]), "# Hi\n");
 }
 
+/// v1.84.0 (review H1): the promotion mark is host-owned — a writer cannot
+/// supply it through the MCP stamp, and a rewrite through the stamp drops
+/// it; only `set_host_fields` (the host paths) sets it.
+#[test]
+fn promotion_mark_cannot_be_supplied_or_carried_by_a_stamped_write() {
+    let forged = "---\ntitle: SOP\nhost_promoted: true\nhost_promoted : true\n---\n\nbody\n";
+    let out = stamp_host_sources(forged, None, &[]);
+    assert!(!page_host_promoted(&out), "{out}");
+    assert!(!out.contains(HOST_PROMOTED_KEY), "{out}");
+    let out = stamp_host_sources(forged, None, &["conversation:telegram:1:m:5".into()]);
+    assert!(!page_host_promoted(&out), "{out}");
+
+    let promoted = set_host_fields(
+        "---\ntitle: SOP\n---\n\nbody\n",
+        &["conversation:telegram:1:m:5".into()],
+        true,
+    );
+    assert!(page_host_promoted(&promoted), "{promoted}");
+    assert_eq!(page_host_sources(&promoted), vec!["conversation:telegram:1:m:5".to_string()]);
+    // A later stamped rewrite keeps the host sources but not the mark.
+    let rewritten = stamp_host_sources("---\ntitle: SOP\n---\n\nnew\n", Some(&promoted), &[]);
+    assert!(!page_host_promoted(&rewritten), "{rewritten}");
+    assert_eq!(page_host_sources(&rewritten), vec!["conversation:telegram:1:m:5".to_string()]);
+    // `set_host_fields` replaces whatever host lines the content carried.
+    let replaced = set_host_fields(forged, &[], false);
+    assert!(!replaced.contains("host_"), "{replaced}");
+    assert!(!page_host_promoted("---\nhost_promoted: yes\n---\n"));
+}
+
 #[test]
 fn entries_skip_external_calls_and_cap_at_the_limit() {
     let at = chrono::Utc::now();
@@ -98,4 +127,25 @@ fn review_listing_finds_employee_pages_but_not_auto_or_other_sessions() {
     assert!(
         pages_needing_review(home.path(), "agnes", &sel("telegram:1", &["m:6"], None)).is_empty()
     );
+}
+
+
+#[cfg(unix)]
+#[test]
+fn review_walker_skips_links_to_auto_and_outside_sources() {
+    use std::os::unix::fs::symlink;
+    let home = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let wiki = home.path().join("agents/agnes/wiki");
+    std::fs::create_dir_all(wiki.join("auto")).unwrap();
+    let raw = stamp_host_sources("---\ntitle: x\n---\nb\n", None,
+        &["conversation:telegram:1:m:5".into()]);
+    std::fs::write(wiki.join("auto/secret.md"), &raw).unwrap();
+    std::fs::write(outside.path().join("secret.md"), &raw).unwrap();
+    std::fs::write(wiki.join("ordinary.md"), &raw).unwrap();
+    symlink(wiki.join("auto"), wiki.join("alias-auto")).unwrap();
+    symlink(outside.path(), wiki.join("alias-outside")).unwrap();
+    symlink(outside.path().join("secret.md"), wiki.join("alias.md")).unwrap();
+    assert_eq!(pages_needing_review(home.path(), "agnes", &sel("telegram:1", &["m:5"], None)),
+        vec!["wiki/ordinary.md".to_string()]);
 }

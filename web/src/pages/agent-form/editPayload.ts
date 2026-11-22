@@ -149,7 +149,7 @@ export function kvRowsFromTable(section: string, table: Record<string, unknown> 
 /** Flat top-level `form.*` keys that map 1:1 onto an `agents.update` param. */
 const FLAT_FORM_KEYS: ReadonlyArray<keyof AgentUpdateParams> = [
   'display_name', 'role', 'status', 'trigger', 'icon', 'reports_to', 'department',
-  'api_mode', 'use_router', 'reply_language',
+  'api_mode', 'use_router', 'reply_language', 'memory_language',
   'monthly_limit_cents', 'warn_threshold_percent', 'hard_stop', 'when_unavailable',
   'heartbeat_enabled', 'heartbeat_interval', 'heartbeat_cron',
   'can_create_agents', 'can_send_cross_agent', 'can_modify_own_skills', 'can_modify_own_soul', 'can_schedule_tasks',
@@ -194,7 +194,10 @@ export const ADMIN_ONLY_FORM_PATHS_FALLBACK: ReadonlyArray<string> = [
   'odoo.',
   'runtime.provider',
   'runtime.fallback',
+  'runtime.utility_provider',
   'form.reply_language',
+  'form.memory_language',
+  'memory.language',
   'osWatch.',
   'adv.account_pool',
 ];
@@ -255,7 +258,13 @@ export function permissionFormValues(agent: PermissionSource): Record<GatedPermi
   return out;
 }
 
-/** Match the gateway's effective timeout (unset/wrong type = 300). */
+/** The gateway's run-limit default for every engine when neither the
+ *  employee nor the global settings set one (since v1.84.0; non-Claude
+ *  engines used 300). */
+export const DEFAULT_RUN_TIMEOUT_SECS = 1800;
+
+/** Match the gateway's effective timeout. The default fallback (300) is the
+ *  authorization baseline for owner edits, not the run-limit default. */
 export function effectiveRuntimeTimeout(value: unknown, fallback = 300, ceiling = 14400): number {
   return typeof value === 'number' && Number.isInteger(value)
     ? Math.min(ceiling, Math.max(30, value)) : fallback;
@@ -359,6 +368,8 @@ export function buildUpdatePayload(
   const rt: Record<string, unknown> = {};
   if (has(dirty, 'runtime.provider')) rt.provider = s.runtime.provider;
   if (has(dirty, 'runtime.fallback')) rt.fallback = s.runtime.fallback;
+  // RM-205: '' clears it ("不使用其他服務").
+  if (has(dirty, 'runtime.utility_provider')) rt.utility_provider = s.runtime.utility_provider;
   if (has(dirty, 'runtime.idle_timeout_secs')) rt.idle_timeout_secs = s.runtime.idle_timeout_secs;
   if (has(dirty, 'runtime.timeout_secs')) rt.timeout_secs = s.runtime.timeout_secs;
   if (has(dirty, 'runtime.max_turns')) rt.max_turns = s.runtime.max_turns;

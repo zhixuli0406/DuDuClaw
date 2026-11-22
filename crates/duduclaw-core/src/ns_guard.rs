@@ -10,6 +10,103 @@ pub fn is_containerized() -> bool {
         std::path::Path::new("/.dockerenv").exists())
 }
 
+/// Memory ceiling in bytes at the current cgroup mount root (normally
+/// `/sys/fs/cgroup` inside a container). Unlimited, unreadable and invalid
+/// values, and non-Linux platforms, return None. Only absent v2 files fall
+/// back to v1; an explicit v2 "max" remains unlimited.
+pub fn cgroup_memory_limit(root: &std::path::Path) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        match std::fs::read_to_string(root.join("memory.max")) {
+            Ok(text) => return text.trim().parse().ok(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+        let text = std::fs::read_to_string(root.join("memory/memory.limit_in_bytes")).ok()?;
+        let limit = text.trim().parse::<u64>().ok()?;
+        (limit < (1_u64 << 60)).then_some(limit)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = root;
+        None
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod cgroup_memory_tests {
+    use super::cgroup_memory_limit;
+
+    fn fixture(v2: Option<&str>, v1: Option<&str>) -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        if let Some(text) = v2 {
+            std::fs::write(root.path().join("memory.max"), text).unwrap();
+        }
+        if let Some(text) = v1 {
+            std::fs::create_dir(root.path().join("memory")).unwrap();
+            std::fs::write(root.path().join("memory/memory.limit_in_bytes"), text).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn v2_number() {
+        let root = fixture(Some("4294967296\n"), Some("123"));
+        assert_eq!(cgroup_memory_limit(root.path()), Some(4294967296));
+    }
+
+    #[test]
+    fn v2_max_is_unlimited_without_v1_fallback() {
+        let root = fixture(Some("max\n"), Some("123"));
+        assert_eq!(cgroup_memory_limit(root.path()), None);
+    }
+
+    #[test]
+    fn v1_number() {
+        let root = fixture(None, Some("2147483648\n"));
+        assert_eq!(cgroup_memory_limit(root.path()), Some(2147483648));
+    }
+
+    #[test]
+    fn v1_huge_is_unlimited() {
+        for limit in [1_u64 << 60, 9223372036854771712, u64::MAX] {
+            let root = fixture(None, Some(&limit.to_string()));
+            assert_eq!(cgroup_memory_limit(root.path()), None);
+        }
+    }
+
+    #[test]
+    fn missing_files() {
+        let root = fixture(None, None);
+        assert_eq!(cgroup_memory_limit(root.path()), None);
+    }
+
+    #[test]
+    fn malformed_content() {
+        for text in ["", "oops", "-1", "18446744073709551616", "123 extra"] {
+            for (v2, v1) in [(Some(text), Some("123")), (None, Some(text))] {
+                let root = fixture(v2, v1);
+                assert_eq!(cgroup_memory_limit(root.path()), None);
+            }
+        }
+    }
+
+    #[test]
+    fn unreadable_file() {
+        let root = fixture(None, Some("123"));
+        std::fs::create_dir(root.path().join("memory.max")).unwrap();
+        assert_eq!(cgroup_memory_limit(root.path()), None);
+    }
+}
+
+#[cfg(all(test, not(target_os = "linux")))]
+#[test]
+fn cgroup_memory_limit_is_none_off_linux() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("memory.max"), "123").unwrap();
+    assert_eq!(cgroup_memory_limit(root.path()), None);
+}
+
 fn container_detected(marker: Option<&str>, dockerenv: bool) -> bool {
     dockerenv || matches!(marker, Some("1" | "true" | "yes"))
 }

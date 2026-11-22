@@ -40,10 +40,21 @@ impl GoalLoopDriver {
         phase_key: &str,
         progress: crate::goal_notify::GoalProgress,
     ) -> bool {
+        self.push_progress_reporting(task, phase_key, progress).await.0
+    }
+
+    /// [`Self::push_progress`], also returning this attempt's outcome
+    /// (`None` when the phase was already handled and nothing was sent).
+    pub(super) async fn push_progress_reporting(
+        &self,
+        task: &TaskRow,
+        phase_key: &str,
+        progress: crate::goal_notify::GoalProgress,
+    ) -> (bool, Option<crate::goal_notify::NotifyOutcome>) {
         {
             let seen = self.progress_seen.lock().await;
             if seen.get(&task.id).map(|s| s == phase_key).unwrap_or(false) {
-                return true; // already delivered (or given up) for this phase
+                return (true, None); // already delivered (or given up) for this phase
             }
         }
         let retry_key = format!("{}::{phase_key}", task.id);
@@ -58,7 +69,7 @@ impl GoalLoopDriver {
             if outcome == crate::goal_notify::NotifyOutcome::NoTarget {
                 debug!(task = %task.id, phase = %phase_key, "goal loop: progress push has no notify target");
             }
-            return true;
+            return (true, Some(outcome));
         }
         // SendFailed — bounded retry.
         let mut retries = self.progress_retry.lock().await;
@@ -73,11 +84,11 @@ impl GoalLoopDriver {
                 .lock()
                 .await
                 .insert(task.id.clone(), phase_key.to_string());
-            true
+            (true, Some(outcome))
         } else {
             warn!(task = %task.id, phase = %phase_key, attempt = *count,
                   "goal loop: progress push failed, will retry next tick");
-            false
+            (false, Some(outcome))
         }
     }
 

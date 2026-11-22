@@ -130,9 +130,11 @@ pub(crate) fn override_args(
             &mut out.args,
             &key,
             "command",
-            &toml_string_literal(&s.command),
+            &toml_string_literal(duduclaw_core::path_compare::spawn_path(Path::new(&s.command)).to_str().unwrap()),
         );
-        let args: Vec<String> = s.args.iter().map(|a| toml_string_literal(a)).collect();
+        let args: Vec<String> = s.args.iter().map(|a| {
+            toml_string_literal(duduclaw_core::path_compare::spawn_path(Path::new(a)).to_str().unwrap())
+        }).collect();
         push(
             &mut out.args,
             &key,
@@ -154,7 +156,7 @@ pub(crate) fn override_args(
             }
             if k == PROXY_UPSTREAM_ENV_VAR {
                 let path = write_env_file(&env_dir, v)?;
-                let rendered = path.to_string_lossy().into_owned();
+                let rendered = duduclaw_core::path_compare::spawn_path(&path).to_string_lossy().into_owned();
                 push_env(&mut out.args, &key, PROXY_UPSTREAM_ENV_FILE_VAR, &rendered);
                 out.temp_files.push(path);
                 continue;
@@ -209,6 +211,9 @@ fn push(args: &mut Vec<String>, server_key: &str, field: &str, value: &str) {
 }
 
 fn push_env(args: &mut Vec<String>, server_key: &str, name: &str, value: &str) {
+    let value = if name == "DUDUCLAW_HOME" || name == PROXY_UPSTREAM_ENV_FILE_VAR {
+        duduclaw_core::path_compare::spawn_path(Path::new(value)).to_str().unwrap()
+    } else { value };
     push(
         args,
         server_key,

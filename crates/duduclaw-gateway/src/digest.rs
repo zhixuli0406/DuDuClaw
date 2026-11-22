@@ -796,7 +796,7 @@ async fn send_digest(
     digest: &Digest,
 ) -> bool {
     use crate::review_evidence::audience::{channel_may_read_task, task_audience};
-    let link = crate::deep_link::dashboard_base_url(home).map(|b| format!("{b}/"));
+    let link = crate::deep_link::public_dashboard_base_url(home).map(|b| format!("{b}/"));
     let refs = button_refs(digest);
     let markup = crate::channel_format::digest_feedback_markup(channel, &refs);
     let visible = |task_id: &str| channel_may_read_task(channel, &task_audience(home, task_id));

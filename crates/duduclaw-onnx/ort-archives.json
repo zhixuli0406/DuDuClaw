@@ -8,7 +8,33 @@
       "sha256": "0af4fa503e8ea285245b47ee42d0a7461b8156a81270857da0c1d4ecf858abde",
       "kind": "tgz",
       "member": "onnxruntime-osx-arm64-1.24.2/lib/libonnxruntime.1.24.2.dylib",
-      "lib_file": "libonnxruntime.dylib"
+      "lib_file": "libonnxruntime.dylib",
+      "sources": [
+        {
+          "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-osx-arm64-1.24.2.tgz",
+          "size": 31604221,
+          "sha256": "0af4fa503e8ea285245b47ee42d0a7461b8156a81270857da0c1d4ecf858abde",
+          "kind": "tgz",
+          "member": "onnxruntime-osx-arm64-1.24.2/lib/libonnxruntime.1.24.2.dylib"
+        },
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.24.2/microsoft.ml.onnxruntime.1.24.2.nupkg",
+          "size": 124756536,
+          "sha256": "782564d3d68e87269ea1812cc94710ad06fe014faf093f01a6f89d0bd58719d3",
+          "kind": "zip",
+          "member": "runtimes/osx-arm64/native/libonnxruntime.dylib"
+        }
+      ],
+      "lib_pins": [
+        {
+          "size": 35361512,
+          "sha256": "87df6f94dd559ea958748adc80fd4c46d91c52bc025771f513291d155539590a"
+        },
+        {
+          "size": 35394544,
+          "sha256": "8e88284d3b4395b1e532831ac05eb0ffa3673a62df32349e1b0fd64542cb827d"
+        }
+      ]
     },
     {
       "target": "x86_64-unknown-linux-gnu",
@@ -17,7 +43,29 @@
       "sha256": "43725474ba5663642e17684717946693850e2005efbd724ac72da278fead25e6",
       "kind": "tgz",
       "member": "onnxruntime-linux-x64-1.24.2/lib/libonnxruntime.so.1.24.2",
-      "lib_file": "libonnxruntime.so"
+      "lib_file": "libonnxruntime.so",
+      "sources": [
+        {
+          "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-linux-x64-1.24.2.tgz",
+          "size": 8123282,
+          "sha256": "43725474ba5663642e17684717946693850e2005efbd724ac72da278fead25e6",
+          "kind": "tgz",
+          "member": "onnxruntime-linux-x64-1.24.2/lib/libonnxruntime.so.1.24.2"
+        },
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.24.2/microsoft.ml.onnxruntime.1.24.2.nupkg",
+          "size": 124756536,
+          "sha256": "782564d3d68e87269ea1812cc94710ad06fe014faf093f01a6f89d0bd58719d3",
+          "kind": "zip",
+          "member": "runtimes/linux-x64/native/libonnxruntime.so"
+        }
+      ],
+      "lib_pins": [
+        {
+          "size": 22065056,
+          "sha256": "ffc84d48e845cf0b562ba4ea5ca32aaafc0d4069019fef4f63095b307d0270ad"
+        }
+      ]
     },
     {
       "target": "aarch64-unknown-linux-gnu",
@@ -26,7 +74,29 @@
       "sha256": "6715b3d19965a2a6981e78ed4ba24f17a8c30d2d26420dbed10aac7ceca0085e",
       "kind": "tgz",
       "member": "onnxruntime-linux-aarch64-1.24.2/lib/libonnxruntime.so.1.24.2",
-      "lib_file": "libonnxruntime.so"
+      "lib_file": "libonnxruntime.so",
+      "sources": [
+        {
+          "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-linux-aarch64-1.24.2.tgz",
+          "size": 7135756,
+          "sha256": "6715b3d19965a2a6981e78ed4ba24f17a8c30d2d26420dbed10aac7ceca0085e",
+          "kind": "tgz",
+          "member": "onnxruntime-linux-aarch64-1.24.2/lib/libonnxruntime.so.1.24.2"
+        },
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.24.2/microsoft.ml.onnxruntime.1.24.2.nupkg",
+          "size": 124756536,
+          "sha256": "782564d3d68e87269ea1812cc94710ad06fe014faf093f01a6f89d0bd58719d3",
+          "kind": "zip",
+          "member": "runtimes/linux-arm64/native/libonnxruntime.so"
+        }
+      ],
+      "lib_pins": [
+        {
+          "size": 18559840,
+          "sha256": "e18fe095919d8613ead3a31ff78212bde4fad929418a9b48f49d61c829ed5c82"
+        }
+      ]
     },
     {
       "target": "x86_64-pc-windows-msvc",
@@ -35,7 +105,29 @@
       "sha256": "8e3e9c826375352e29cb2614fe44f3d7a4b0ff7b8028ad7a456af9d949a7e8b0",
       "kind": "zip",
       "member": "onnxruntime-win-x64-1.24.2/lib/onnxruntime.dll",
-      "lib_file": "onnxruntime.dll"
+      "lib_file": "onnxruntime.dll",
+      "sources": [
+        {
+          "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-win-x64-1.24.2.zip",
+          "size": 74075355,
+          "sha256": "8e3e9c826375352e29cb2614fe44f3d7a4b0ff7b8028ad7a456af9d949a7e8b0",
+          "kind": "zip",
+          "member": "onnxruntime-win-x64-1.24.2/lib/onnxruntime.dll"
+        },
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.24.2/microsoft.ml.onnxruntime.1.24.2.nupkg",
+          "size": 124756536,
+          "sha256": "782564d3d68e87269ea1812cc94710ad06fe014faf093f01a6f89d0bd58719d3",
+          "kind": "zip",
+          "member": "runtimes/win-x64/native/onnxruntime.dll"
+        }
+      ],
+      "lib_pins": [
+        {
+          "size": 14148680,
+          "sha256": "114947d633e6844ce3c4b51ef6678f776628571d08a5763859c61642c8dcca9c"
+        }
+      ]
     },
     {
       "target": "aarch64-pc-windows-msvc",
@@ -44,7 +136,29 @@
       "sha256": "dd8180d98e5a0ead7ead99029acc80b86a8b905b9aba4cc978e388039bb5823b",
       "kind": "zip",
       "member": "onnxruntime-win-arm64-1.24.2/lib/onnxruntime.dll",
-      "lib_file": "onnxruntime.dll"
+      "lib_file": "onnxruntime.dll",
+      "sources": [
+        {
+          "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-win-arm64-1.24.2.zip",
+          "size": 74960464,
+          "sha256": "dd8180d98e5a0ead7ead99029acc80b86a8b905b9aba4cc978e388039bb5823b",
+          "kind": "zip",
+          "member": "onnxruntime-win-arm64-1.24.2/lib/onnxruntime.dll"
+        },
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.24.2/microsoft.ml.onnxruntime.1.24.2.nupkg",
+          "size": 124756536,
+          "sha256": "782564d3d68e87269ea1812cc94710ad06fe014faf093f01a6f89d0bd58719d3",
+          "kind": "zip",
+          "member": "runtimes/win-arm64/native/onnxruntime.dll"
+        }
+      ],
+      "lib_pins": [
+        {
+          "size": 14161952,
+          "sha256": "d4c4d939c8bd1e93a86bc5a45b37a1fdd08dce34d8231db014a7e4a023923f5a"
+        }
+      ]
     }
   ]
 }

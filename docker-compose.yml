@@ -12,6 +12,11 @@ services:
       dockerfile: container/Dockerfile.server
     container_name: duduclaw-server
     restart: unless-stopped
+    # Optional starting point for up to 5 simultaneous replies; measure your workload.
+    # mem_limit: 4g
+    # cpus: "2.0"
+    # pids_limit: 512
+    # Sizing and limits: docs/guides/docker.md section 7.6.
     ports:
       - "18789:18789"
     volumes:

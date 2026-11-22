@@ -208,13 +208,14 @@ pub(super) fn failure_console_link_kind(reason: FailureReason) -> crate::deep_li
 }
 
 /// Resolve the dashboard "console" deep link for a classified failure, or
-/// `None` when no dashboard base URL is resolvable (`deep_link`'s fail-quiet
-/// contract — see `deep_link.rs` module docs). `id` is irrelevant to both
-/// `DeepLinkKind::Billing` and `DeepLinkKind::System` (neither is a per-object
-/// route today), so an empty string is passed, matching the existing
+/// `None` when no dashboard address is usable for this chat recipient
+/// (`public_deep_link`'s container-aware contract — see `deep_link.rs`).
+/// `id` is irrelevant to both `DeepLinkKind::Billing` and
+/// `DeepLinkKind::System` (neither is a per-object route today), so an
+/// empty string is passed, matching the existing
 /// `Channels`/`Billing` call sites in `channel_alerts.rs`/`budget.rs`.
 pub(super) fn failure_console_url(home_dir: &Path, reason: FailureReason) -> Option<String> {
-    crate::deep_link::deep_link(home_dir, failure_console_link_kind(reason), "")
+    crate::deep_link::public_deep_link(home_dir, failure_console_link_kind(reason), "")
 }
 
 /// Public documentation URL for a classified failure, or `None` when no
@@ -250,8 +251,8 @@ pub(super) fn failure_doc_url(reason: FailureReason) -> Option<&'static str> {
 ///
 /// Messages directly tell the user *why* CLI failed (rate limit, billing, etc.)
 /// and whether a local model fallback was used. When a dashboard deep link is
-/// resolvable (`[dashboard] public_url` or `[gateway] port` in
-/// `config.toml` — see `deep_link.rs`), a single "🔎 詳情：<url>" line is
+/// resolvable (a valid public URL, or `[gateway] port` on native hosts — see
+/// `deep_link.rs`), a single "🔎 詳情：<url>" line is
 /// appended so the failure carries a concrete "go look here" destination
 /// (Stripe error-object pattern), not just a category label. Fail-quiet: no
 /// resolvable base URL means no link line, never a dangling/placeholder one.
@@ -298,7 +299,7 @@ pub(super) fn format_fallback_message_with_timeout(
              請於 Anthropic Console 儲值，或在儀表板切換到其他有效帳號。"
         ),
         FailureReason::TimeoutTotal if timeout_secs > 0 => format!(
-            "已達 {duration} 的時間上限，尚未產生最終答案。已完成的部分已保留，回覆『繼續』可以接著做。\n\
+            "已達 {duration}的時間上限，尚未產生最終答案。已完成的部分已保留，回覆『繼續』可以接著做。\n\
              需要延長上限時，請洽管理員。"
         ),
         FailureReason::MaxTurns | FailureReason::TimeoutTotal | FailureReason::TimeoutNoProgress => super::TurnFailureReason::from(reason).text(None).to_string(),

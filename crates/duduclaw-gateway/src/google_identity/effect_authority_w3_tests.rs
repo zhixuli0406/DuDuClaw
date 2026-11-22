@@ -852,6 +852,7 @@ async fn w3_remote_delegate_captures_true_visitor_and_never_home_falls_back() {
         chat: "owned-chat".into(),
         sender: "owned-visitor".into(),
         user_id: None,
+        attested_private: false,
     };
     let outcome = crate::knowledge::turn_requesters::CURRENT_REQUESTER
         .scope(

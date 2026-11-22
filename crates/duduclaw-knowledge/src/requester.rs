@@ -38,6 +38,14 @@ pub enum RequesterIdentity {
         chat: String,
         sender: String,
         user_id: Option<String>,
+        /// The authenticated channel adapter classified this exact
+        /// `channel:chat` as `sender`'s one-to-one conversation (Google Chat:
+        /// a 1:1 DM space, whose id can never equal the sender's id). Only the
+        /// gateway's requester mapping sets it, after checking the adapter's
+        /// attestation names this channel, chat and sender; `false`
+        /// everywhere else. It adds no grants — it only lets a conversation
+        /// count as 1:1 alongside [`duduclaw_core::sensitivity::is_private_session`].
+        attested_private: bool,
     },
     /// No person in the loop, as registered by the gateway (cron,
     /// heartbeat, dispatch).
@@ -131,11 +139,13 @@ pub fn human_ctx(req: &RequesterIdentity, dir: &dyn UserDirectory) -> HumanCtx {
             chat,
             sender,
             user_id,
+            attested_private,
         } => {
             let session = format!("{channel}:{chat}");
             let visitor = is_public_visitor_channel(channel);
-            let private =
-                !visitor && duduclaw_core::sensitivity::is_private_session(&session, sender);
+            let private = !visitor
+                && (duduclaw_core::sensitivity::is_private_session(&session, sender)
+                    || (*attested_private && !sender.is_empty()));
             let user = user_id
                 .as_deref()
                 .filter(|_| !visitor)
@@ -190,6 +200,43 @@ pub fn agent_ctx(
             KnowledgeScope::Only(list) => AgentNarrowing::Only(list.clone()),
             KnowledgeScope::Unreadable => AgentNarrowing::Only(Vec::new()),
         },
+    }
+}
+
+#[cfg(test)]
+mod attested_private_tests {
+    use super::test_support::users;
+    use super::*;
+
+    fn gchat(sender: &str, attested: bool) -> RequesterIdentity {
+        RequesterIdentity::ChannelUser {
+            channel: "googlechat".into(),
+            chat: "spaces/DM1".into(),
+            sender: sender.into(),
+            user_id: Some("alice".into()),
+            attested_private: attested,
+        }
+    }
+
+    #[test]
+    fn attestation_makes_a_channel_chat_one_to_one_and_nothing_else() {
+        let dir = users(&[("alice", Some("人資"), false)]);
+        let h = human_ctx(&gchat("users/1", true), &dir);
+        assert!(h.is_private);
+        assert_eq!(h.mode, HumanMode::Full);
+        assert_eq!(h.user_id.as_deref(), Some("alice"));
+        assert!(!human_ctx(&gchat("users/1", false), &dir).is_private);
+        // An attestation without a sender proves nothing.
+        assert!(!human_ctx(&gchat("", true), &dir).is_private);
+        // The session-shape rule still works on its own.
+        let line = RequesterIdentity::ChannelUser {
+            channel: "line".into(),
+            chat: "U1".into(),
+            sender: "U1".into(),
+            user_id: None,
+            attested_private: false,
+        };
+        assert!(human_ctx(&line, &dir).is_private);
     }
 }
 

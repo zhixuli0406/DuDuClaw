@@ -417,6 +417,14 @@ impl ProactiveGate {
             Err(_) => GateDecision::Suppress {
                 reason: reason::FAIL_CLOSED_TIMEOUT,
             },
+            // RM-205: no service for background work — suppress (fail
+            // closed) without reporting it as a scorer failure.
+            Ok(Err(e)) if crate::runtime_config::is_utility_unavailable(&e) => {
+                debug!(agent = %agent_id, "proactive gate: background work unavailable for this employee → suppress");
+                GateDecision::Suppress {
+                    reason: reason::FAIL_CLOSED_LLM_ERROR,
+                }
+            }
             Ok(Err(e)) => {
                 warn!(agent = %agent_id, error = %e, "proactive gate: LLM scorer failed → suppress");
                 GateDecision::Suppress {

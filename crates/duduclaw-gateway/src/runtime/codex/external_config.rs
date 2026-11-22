@@ -10,42 +10,62 @@ tokio::task_local! {
     pub(crate) static MCP_CONFIG_TEST_PATHS: Vec<PathBuf>;
 }
 
+/// Every refusal here is about Codex's own configuration layers on this host
+/// (system, managed, profile, project-tree and MDM sources), not about the
+/// employee's `.mcp.json`; it carries the engine-local marker so only the
+/// explicit runtime-fallback rule can tell the two apart (RM-181).
 fn refusal(path: &Path, reason: &str) -> String {
-    duduclaw_agent::mcp_spawn_gate::spawn_gate_error(&format!(
-        "Codex 外部設定 {}：{reason}；拒絕啟動。請由管理者移除原生 MCP 設定，改用 DuDuClaw 的代理設定。", path.display()))
+    refusal_at_layer(path, reason, "主機層")
 }
 
-fn check_value(path: &Path, value: &toml::Value) -> Result<(), String> {
+fn refusal_at_layer(path: &Path, reason: &str, layer: &str) -> String {
+    // Paths are diagnostics, never channel text. Redacting after interpolation
+    // could match an interior /home/ and leak the entire preceding prefix.
+    tracing::warn!(path = %path.display(), layer, reason, "Codex external configuration refused");
+    let filename = path.file_name().and_then(|name| name.to_str()).unwrap_or("config.toml");
+    duduclaw_agent::mcp_spawn_gate::engine_local_spawn_gate_error(&format!(
+        "Codex 外部設定（{layer}）{filename}：{reason}；拒絕啟動。請由管理者移除原生 MCP 設定，改用 DuDuClaw 的代理設定。"))
+}
+
+fn check_value(path: &Path, value: &toml::Value, layer: &str) -> Result<(), String> {
     match value {
         toml::Value::Table(table) => {
             if let Some(servers) = table.get("mcp_servers") {
                 if !servers.as_table().is_some_and(|servers| servers.is_empty()) {
-                    return Err(refusal(path, "定義了 mcp_servers"));
+                    return Err(refusal_at_layer(path, "定義了 mcp_servers", layer));
                 }
             }
             // Includes legacy [profiles.<name>.mcp_servers] and profile files.
-            for value in table.values() { check_value(path, value)?; }
+            for value in table.values() { check_value(path, value, layer)?; }
         }
-        toml::Value::Array(values) => for value in values { check_value(path, value)?; },
+        toml::Value::Array(values) => for value in values { check_value(path, value, layer)?; },
         _ => {}
     }
     Ok(())
 }
 
 fn check_text(path: &Path, text: &str) -> Result<(), String> {
-    let value = text.parse::<toml::Value>().map_err(|_| refusal(path, "無法解析 TOML"))?;
-    check_value(path, &value)
+    check_text_in_layer(path, text, "主機層")
+}
+
+fn check_text_in_layer(path: &Path, text: &str, layer: &str) -> Result<(), String> {
+    let value = text.parse::<toml::Value>().map_err(|_| refusal_at_layer(path, "無法解析 TOML", layer))?;
+    check_value(path, &value, layer)
 }
 
 fn check_file(path: &Path) -> Result<(), String> {
+    check_file_in_layer(path, "主機層")
+}
+
+fn check_file_in_layer(path: &Path, layer: &str) -> Result<(), String> {
     // symlink_metadata distinguishes a dangling link from an absent layer.
     match std::fs::symlink_metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(_) => return Err(refusal(path, "無法檢查設定檔")),
+        Err(_) => return Err(refusal_at_layer(path, "無法檢查設定檔", layer)),
         Ok(_) => {}
     }
-    let text = std::fs::read_to_string(path).map_err(|_| refusal(path, "無法讀取設定檔"))?;
-    check_text(path, &text)
+    let text = std::fs::read_to_string(path).map_err(|_| refusal_at_layer(path, "無法讀取設定檔", layer))?;
+    check_text_in_layer(path, &text, layer)
 }
 
 fn check_profiles(home: &Path) -> Result<(), String> {
@@ -118,15 +138,73 @@ fn check_managed_preferences() -> Result<(), String> {
     Ok(())
 }
 
+/// Does `dir` contain a `.git` entry (directory, or the file a worktree or
+/// submodule uses)? Fail closed: an entry that cannot be inspected refuses.
+fn has_git_marker(dir: &Path) -> Result<bool, String> {
+    let marker = dir.join(".git");
+    match std::fs::symlink_metadata(&marker) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(refusal_at_layer(&marker, "無法檢查專案範圍", "專案層")),
+    }
+}
+
+/// RM-181: the project layers Codex itself would consider. Codex searches
+/// for project `.codex/config.toml` layers from the working directory upward
+/// and stops at the git root (the directory containing `.git`, inclusive);
+/// with no git root it considers the working directory only. Walking every
+/// ancestor up to `/` used to inspect the OS user's personal
+/// `~/.codex/config.toml` whenever the data directory lives under the home
+/// directory, refusing every Codex employee for a file Codex never loads as
+/// a project layer. A home directory that IS the git root above the employee
+/// directory is still in range and still refused.
+fn project_layer_dirs(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut walked = Vec::new();
+    for dir in root.ancestors() {
+        walked.push(dir.to_path_buf());
+        if has_git_marker(dir)? {
+            return Ok(walked);
+        }
+    }
+    Ok(vec![root.to_path_buf()])
+}
+
 pub(super) fn check_project_layers(root: &Path, owned_config: Option<&Path>) -> Result<(), String> {
-    let root = std::fs::canonicalize(root).map_err(|_| refusal(root, "無法檢查專案設定"))?;
-    let owned_config = owned_config.map(std::fs::canonicalize).transpose()
-        .map_err(|_| refusal(&root, "無法檢查代理設定檔"))?;
-    for parent in root.ancestors() {
+    use duduclaw_core::path_compare;
+    let root = path_compare::canonicalize(root).map_err(|_| refusal_at_layer(root, "無法檢查專案設定", "專案層"))?;
+    let owned_config = owned_config.map(|path| path_compare::canonicalize(path)
+        .map_err(|_| refusal_at_layer(path, "無法檢查代理設定檔", "員工資料夾"))).transpose()?;
+    for parent in project_layer_dirs(&root)? {
         let file = parent.join(".codex/config.toml");
-        if Some(file.as_path()) != owned_config.as_deref() { check_file(&file)?; }
+        let owned = owned_config.as_deref().map(|owned| is_owned_project_config(&file, owned))
+            .transpose().map_err(|_| refusal_at_layer(&file, "無法檢查代理設定檔", "員工資料夾"))?
+            .unwrap_or(false);
+        if !owned {
+            let employee_dir = owned_config.as_deref().and_then(Path::parent).and_then(Path::parent);
+            let is_employee = employee_dir.map(|dir| path_compare::equal(dir, &parent))
+                .transpose().map_err(|_| refusal_at_layer(&file, "無法檢查專案設定", "專案層"))?
+                .unwrap_or(false);
+            let layer = if is_employee { "員工資料夾" } else { "專案層" };
+            check_file_in_layer(&file, layer)?;
+        }
     }
     Ok(())
+}
+
+fn is_owned_project_config(file: &Path, owned: &Path) -> std::io::Result<bool> {
+    use duduclaw_core::path_compare;
+    let candidate = match path_compare::canonicalize(file) {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if !path_compare::equal(&candidate, owned)? { return Ok(false); }
+    // Case-insensitive comparison is conservative for a denial, but cannot
+    // grant an exemption on a Windows directory with case sensitivity enabled.
+    #[cfg(windows)]
+    { Ok(path_compare::file_identity(&candidate)? == path_compare::file_identity(owned)?) }
+    #[cfg(not(windows))]
+    { Ok(true) }
 }
 
 fn check_cloud_cache(path: &Path) -> Result<(), String> {
@@ -180,6 +258,69 @@ pub(crate) fn require_mcp_isolation() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_owned_config_and_git_walk_accept_equivalent_path_spellings() {
+        let base = tempfile::tempdir().unwrap();
+        let repo = base.path().join("MixedCaseRepo");
+        let employee = repo.join("agents/worker");
+        std::fs::create_dir_all(employee.join(".codex")).unwrap();
+        std::fs::create_dir(repo.join(".git")).unwrap();
+        let owned = employee.join(".codex/config.toml");
+        std::fs::write(&owned, "[mcp_servers.duduclaw]\ncommand='owned'").unwrap();
+        let canonical = std::fs::canonicalize(&employee).unwrap();
+        let upper = PathBuf::from(canonical.to_str().unwrap().to_uppercase());
+        check_project_layers(&upper, Some(&owned)).unwrap();
+        check_project_layers(&employee, Some(&upper.join(".CODEX/CONFIG.TOML"))).unwrap();
+        std::fs::create_dir(repo.join(".codex")).unwrap();
+        std::fs::write(repo.join(".codex/config.toml"), "[mcp_servers.foreign]\ncommand='foreign'").unwrap();
+        assert!(check_project_layers(&upper, Some(&owned)).is_err());
+    }
+
+    #[test]
+    fn refusal_never_exposes_host_paths_even_with_spaces_unicode_or_tilde() {
+        for path in ["/private/tmp/測試 空間/home/agents/worker/.codex/config.toml",
+            "/Users/測試 者/.codex/config.toml", "~/.codex/config.toml"] {
+            let error = refusal(Path::new(path), "定義了 mcp_servers");
+            let shown = duduclaw_agent::mcp_spawn_gate::spawn_gate_user_message(&error).unwrap();
+            assert!(shown.contains("config.toml"), "{shown}");
+            assert!(shown.contains("主機層"), "{shown}");
+            assert!(!shown.contains(path), "{shown}");
+            assert!(!shown.contains("/"), "{shown}");
+        }
+    }
+
+    #[test]
+    fn sibling_config_refusals_keep_layer_filename_and_reason_without_paths() {
+        for layer in ["專案層", "員工資料夾"] {
+            for reason in ["定義了 mcp_servers", "無法解析 TOML", "無法讀取設定檔", "無法檢查設定檔"] {
+                let error = refusal_at_layer(Path::new("/private/tmp/空 間/.codex/config.toml"), reason, layer);
+                let shown = duduclaw_agent::mcp_spawn_gate::spawn_gate_user_message(&error).unwrap();
+                assert!(shown.contains(layer) && shown.contains("config.toml") && shown.contains(reason), "{shown}");
+                assert!(!shown.contains("/"), "{shown}");
+            }
+        }
+    }
+
+    #[test]
+    fn project_and_employee_checks_report_the_correct_layer() {
+        let root = tempfile::tempdir().unwrap();
+        let employee = root.path().join("員工 空間");
+        std::fs::create_dir_all(&employee).unwrap();
+        let owned = employee.join(".codex/config.toml");
+        let missing = check_project_layers(&employee, Some(&owned)).unwrap_err();
+        assert!(missing.contains("員工資料夾") && missing.contains("config.toml"), "{missing}");
+        native_layer(root.path());
+        std::fs::write(root.path().join(".git"), "gitdir: fixture").unwrap();
+        native_layer(&employee);
+        let project = check_project_layers(&employee, Some(&owned)).unwrap_err();
+        assert!(project.contains("專案層") && project.contains("config.toml"), "{project}");
+        for error in [missing, project] {
+            assert!(!error.contains(&root.path().display().to_string()), "{error}");
+        }
+    }
+
     #[test]
     fn absent_and_empty_layers_allow_codex() {
         let dir = tempfile::tempdir().unwrap();
@@ -222,6 +363,157 @@ mod tests {
         std::fs::write(&file, "[mcp_servers.native]\ncommand='unsafe'").unwrap();
         assert!(check_project_layers(root.path(), None).unwrap_err().contains("config.toml"));
         check_project_layers(root.path(), Some(&file)).unwrap();
+        // RM-181: the owned exemption is exact — another file in range still refuses.
+        let employee = root.path().join("agents/worker");
+        std::fs::create_dir_all(employee.join(".codex")).unwrap();
+        std::fs::write(employee.join(".git"), "gitdir: elsewhere").unwrap();
+        let owned = employee.join(".codex/config.toml");
+        std::fs::write(&owned, "[mcp_servers.duduclaw]\ncommand='/owned'").unwrap();
+        check_project_layers(&employee, Some(&owned)).unwrap();
+    }
+
+    fn native_layer(dir: &Path) {
+        std::fs::create_dir_all(dir.join(".codex")).unwrap();
+        std::fs::write(dir.join(".codex/config.toml"), "[mcp_servers.native]\ncommand='unsafe'").unwrap();
+    }
+
+    /// The installed layout: `<home>/.duduclaw/agents/<id>` under a home that
+    /// has the OS user's own `~/.codex/config.toml`.
+    fn installed_layout() -> (tempfile::TempDir, PathBuf) {
+        let home = tempfile::tempdir().unwrap();
+        native_layer(home.path());
+        let employee = home.path().join(".duduclaw/agents/worker");
+        std::fs::create_dir_all(&employee).unwrap();
+        (home, employee)
+    }
+
+    #[test]
+    fn home_codex_config_above_a_non_git_employee_directory_is_not_a_project_layer() {
+        let (_home, employee) = installed_layout();
+        check_project_layers(&employee, None).unwrap();
+    }
+
+    #[test]
+    fn home_codex_config_is_in_range_when_the_home_is_the_git_root() {
+        for marker_is_dir in [true, false] {
+            let (home, employee) = installed_layout();
+            let git = home.path().join(".git");
+            if marker_is_dir { std::fs::create_dir(&git).unwrap(); } else { std::fs::write(&git, "gitdir: x").unwrap(); }
+            let error = check_project_layers(&employee, None).unwrap_err();
+            assert!(error.contains("專案層") && error.contains("config.toml"), "{error}");
+            assert!(duduclaw_agent::mcp_spawn_gate::is_engine_local_spawn_gate_error(&error));
+        }
+    }
+
+    #[test]
+    fn layers_in_the_employee_directory_or_up_to_the_git_root_refuse() {
+        // In the employee directory itself (no git anywhere).
+        let (_home, employee) = installed_layout();
+        native_layer(&employee);
+        assert!(check_project_layers(&employee, None).is_err());
+        // Between the employee directory and the git root.
+        let (home, employee) = installed_layout();
+        std::fs::remove_file(home.path().join(".codex/config.toml")).unwrap();
+        std::fs::create_dir(home.path().join(".duduclaw/.git")).unwrap();
+        native_layer(&home.path().join(".duduclaw/agents"));
+        assert!(check_project_layers(&employee, None).is_err());
+        // Above the git root: out of range.
+        let (home, employee) = installed_layout();
+        std::fs::create_dir(home.path().join(".duduclaw/.git")).unwrap();
+        check_project_layers(&employee, None).unwrap();
+    }
+
+    /// A project `.codex/config.toml` that is a symbolic link is inspected
+    /// through the link (what Codex would read), and a dangling one refuses.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_project_config_is_checked_through_the_link() {
+        let (_home, employee) = installed_layout();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(employee.join(".codex")).unwrap();
+        let link = employee.join(".codex/config.toml");
+        let native = elsewhere.path().join("native.toml");
+        std::fs::write(&native, "[mcp_servers.native]\ncommand='unsafe'").unwrap();
+        std::os::unix::fs::symlink(&native, &link).unwrap();
+        let error = check_project_layers(&employee, None).unwrap_err();
+        assert!(error.contains("config.toml"), "{error}");
+        std::fs::write(&native, "model='fixture'").unwrap();
+        check_project_layers(&employee, None).unwrap();
+        std::fs::remove_file(&native).unwrap();
+        assert!(check_project_layers(&employee, None).is_err(), "dangling link is not an absent layer");
+    }
+
+    /// A working directory that is itself a symbolic link is walked from its
+    /// real location: the link's own parents never hide or add a layer.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_working_directory_is_walked_from_its_real_location() {
+        let (home, employee) = installed_layout();
+        std::fs::create_dir(home.path().join(".git")).unwrap();
+        let links = tempfile::tempdir().unwrap();
+        let link = links.path().join("worker-link");
+        std::os::unix::fs::symlink(&employee, &link).unwrap();
+        // The real ancestors reach the git root that holds a native layer.
+        assert!(check_project_layers(&link, None).is_err());
+        // A link placed inside a repository with a native layer, pointing at
+        // a clean directory outside it, is judged by the target.
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".git")).unwrap();
+        native_layer(repo.path());
+        let clean = tempfile::tempdir().unwrap();
+        let inner = repo.path().join("inner-link");
+        std::os::unix::fs::symlink(clean.path(), &inner).unwrap();
+        check_project_layers(&inner, None).unwrap();
+        // The owned-config exemption compares real paths too.
+        let owned = employee.join(".codex/config.toml");
+        std::fs::create_dir_all(employee.join(".codex")).unwrap();
+        std::fs::write(&owned, "[mcp_servers.duduclaw]\ncommand='/owned'").unwrap();
+        std::fs::remove_file(home.path().join(".codex/config.toml")).unwrap();
+        check_project_layers(&link, Some(&link.join(".codex/config.toml"))).unwrap();
+    }
+
+    /// A `.git` FILE (worktree / submodule) marks the git root where it
+    /// stands; its `gitdir:` content is never followed, so it cannot move the
+    /// walk to another directory or past the employee directory.
+    #[test]
+    fn a_git_file_marks_the_root_and_its_content_never_moves_the_walk() {
+        let (home, employee) = installed_layout();
+        let elsewhere = tempfile::tempdir().unwrap();
+        native_layer(elsewhere.path());
+        for target in [elsewhere.path().to_path_buf(), home.path().to_path_buf(), PathBuf::from("/")] {
+            std::fs::write(employee.join(".git"), format!("gitdir: {}\n", target.display())).unwrap();
+            assert_eq!(project_layer_dirs(&std::fs::canonicalize(&employee).unwrap()).unwrap().len(), 1);
+            check_project_layers(&employee, None).unwrap();
+        }
+        // A layer in the employee directory itself is still in range.
+        native_layer(&employee);
+        assert!(check_project_layers(&employee, None).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_uninspectable_git_marker_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        let (home, employee) = installed_layout();
+        let locked = home.path().join(".duduclaw/agents");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Running as root bypasses permission bits; only assert when it bites.
+        let blocked = std::fs::symlink_metadata(locked.join(".git")).is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound);
+        let result = has_git_marker(&locked);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if blocked { assert!(result.is_err()); }
+        let _ = employee;
+    }
+    #[test]
+    fn refusals_are_typed_engine_local_spawn_gate_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        std::fs::write(&file, "[mcp_servers.native]\ncommand='unsafe'").unwrap();
+        let error = check_file(&file).unwrap_err();
+        assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error));
+        assert!(duduclaw_agent::mcp_spawn_gate::is_engine_local_spawn_gate_error(&error));
+        let shown = duduclaw_agent::mcp_spawn_gate::spawn_gate_user_message(&error).unwrap();
+        assert!(shown.starts_with("Codex 外部設定"), "{shown}");
     }
     #[test]
     fn cloud_cache_fragments_are_checked_and_unparseable_cache_refuses() {
@@ -252,7 +544,7 @@ mod tests {
     fn managed_preferences_api_can_inspect_this_host() {
         // Read only: do not create or mutate preferences on the operator host.
         // A refusal is valid on managed machines and must name its source.
-        if let Err(error) = check_managed_preferences() { assert!(error.contains("com.openai.codex/")); }
+        if let Err(error) = check_managed_preferences() { assert!(error.contains("主機層")); }
     }
     #[cfg(unix)]
     #[test]

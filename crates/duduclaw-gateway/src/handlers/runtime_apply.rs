@@ -187,7 +187,7 @@ pub(crate) fn apply_runtime_with_limits(
         None => return Ok(RuntimeApplyOutcome::default()),
     };
 
-    for field in ["provider", "fallback"] {
+    for field in ["provider", "fallback", "utility_provider"] {
         if let Some(removed) = rt.get(field).and_then(Value::as_str)
             .and_then(duduclaw_core::runtime_catalog::removed_runtime) {
             return Err(removed.refusal(&format!("agent.toml [runtime] {field}")));
@@ -210,6 +210,22 @@ pub(crate) fn apply_runtime_with_limits(
     if let Some(value) = timeout_secs.filter(|v| !v.is_null()) {
         if !value.as_u64().is_some_and(|secs| (30..=max_timeout_secs).contains(&secs)) {
             return Err(format!("單次執行時間上限必須是 30–{max_timeout_secs} 秒的整數（全域上限）"));
+        }
+    }
+    // RM-205: the service an employee's background work may use when its own
+    // engine has no utility profile. `""`/`null` clears it ("不使用其他服務").
+    let utility_provider = rt.get("utility_provider");
+    if let Some(value) = utility_provider.filter(|v| !v.is_null()) {
+        let v = value.as_str().ok_or("runtime.utility_provider must be a string")?.trim();
+        if !v.is_empty() {
+            let supported = duduclaw_core::types::RuntimeType::from_id(v)
+                .is_some_and(crate::runtime_config::utility_profile_supported);
+            if !supported {
+                return Err(format!(
+                    "Invalid runtime.utility_provider '{v}'. Valid: {}",
+                    crate::runtime_config::utility_capable_providers_display()
+                ));
+            }
         }
     }
 
@@ -264,6 +280,19 @@ pub(crate) fn apply_runtime_with_limits(
             changes.push(format!("runtime.fallback = \"{v}\""));
             if introduces(previous, v) {
                 deprecated.extend(DeprecatedRuntimeWrite::for_value("fallback", v));
+            }
+        }
+    }
+    if let Some(value) = utility_provider {
+        match value.as_str().map(str::trim).filter(|v| !v.is_empty()) {
+            None => {
+                if section.remove("utility_provider").is_some() {
+                    changes.push("runtime.utility_provider cleared".to_string());
+                }
+            }
+            Some(v) => {
+                section.insert("utility_provider".into(), toml::Value::String(v.into()));
+                changes.push(format!("runtime.utility_provider = \"{v}\""));
             }
         }
     }

@@ -402,6 +402,7 @@ async fn partial_writes_keep_cron_and_new_keys_round_trip_through_inspect() {
                 "team": { "enabled": true, "roles": { "verifier": { "runtime": "codex" } } },
                 "guardrails": { "enabled": true },
                 "memory": { "decision_ttl_days": 9 },
+                "memory_language": "ja-JP",
                 "night_engine": { "enabled": true },
                 "runtime": { "fallback": "qwen", "minimal_context": false, "timeout_secs": 900 },
                 "utility": "",
@@ -419,6 +420,7 @@ async fn partial_writes_keep_cron_and_new_keys_round_trip_through_inspect() {
     assert_eq!(p["fork"]["enabled"], true);
     assert_eq!(p["team"]["roles"]["verifier"]["runtime"], "codex");
     assert_eq!(p["memory"]["decision_ttl_days"], 9);
+    assert_eq!(p["memory"]["language"], "ja-JP");
     assert_eq!(p["night_engine"]["enabled"], true);
     assert_eq!(p["runtime"]["fallback"], "qwen");
     assert_eq!(p["runtime"]["minimal_context"], false);

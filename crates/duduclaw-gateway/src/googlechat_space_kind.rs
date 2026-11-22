@@ -4,13 +4,18 @@
 //! conversations (`chat_commands::conversation_guard`), so the channel has to
 //! know the space type. Resolution, in order:
 //!
-//! 1. The **trusted** space object the turn already carries — on the HTTP
-//!    path the JWT-verified interaction event (`message.space`, then the
-//!    event's `space`, field by field); on the Pub/Sub path the
-//!    `spaces.messages.get` read-back (`googlechat_pubsub::authoritative_event`
-//!    rebuilds the event from it; the unverified Pub/Sub payload's `space`
-//!    is discarded by `notification_reference` and never consulted).
-//! 2. When that object does not say (the Pub/Sub read-back usually carries
+//! 1. The **trusted** space objects the turn already carries — on the HTTP
+//!    path the JWT-verified interaction event (`message.space` and the
+//!    event's `space`); on the Pub/Sub path the `spaces.messages.get`
+//!    read-back (`googlechat_pubsub::authoritative_event` rebuilds the event
+//!    from it; the unverified Pub/Sub payload's `space` is discarded by
+//!    `notification_reference` and never consulted). See [`carried_kind`]:
+//!    each object is classified **on its own** — fields are never combined
+//!    across objects — a name that differs from the turn's space (or from
+//!    the other object's name) makes the turn shared, any object that says
+//!    "shared" makes it shared, and only an object that is a complete 1:1
+//!    proof by itself makes it a 1:1 DM.
+//! 2. When no carried object says (the Pub/Sub read-back usually carries
 //!    only the space name), `spaces.get` with the app's own credentials,
 //!    after validating the name with `google_workspace::chat_read::valid_space`.
 //!    Definite answers are cached in memory per app + space (bounded, TTL —
@@ -19,8 +24,9 @@
 //!    shared. Fail-closed.
 //!
 //! "1:1 DM" means `spaceType == "DIRECT_MESSAGE"` (legacy `type == "DM"`)
-//! **and** `singleUserBotDm == true`. A group DM (`GROUP_CHAT`, several
-//! humans) and a named space (`SPACE`, legacy `ROOM`) are shared.
+//! **and** `singleUserBotDm == true`, both in the same object. A group DM
+//! (`GROUP_CHAT`, several humans) and a named space (`SPACE`, legacy `ROOM`)
+//! are shared.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -44,40 +50,102 @@ pub(crate) enum SpaceKind {
 }
 
 /// Classify one Chat `Space` object (as returned by `spaces.get`, or the
-/// `space` of an event / message).
+/// `space` of an event / message), using only that object's own fields.
+///
+/// - `Shared` when any field says shared: `spaceType` `SPACE` /
+///   `GROUP_CHAT`, legacy `type` `ROOM` / `SPACE` / `GROUP_CHAT`, or
+///   `singleUserBotDm == false` — whichever field says it.
+/// - `OneToOneDm` only when the object itself states a direct message
+///   (`spaceType == "DIRECT_MESSAGE"`, or, without `spaceType`, legacy
+///   `type == "DM"`) **and** `singleUserBotDm == true`.
+/// - `Unknown` otherwise (not a proof either way).
 pub(crate) fn classify_space(space: &Value) -> SpaceKind {
-    let direct = match space.get("spaceType").and_then(Value::as_str) {
-        Some("DIRECT_MESSAGE") => true,
-        Some("SPACE" | "GROUP_CHAT") => false,
-        // `SPACE_TYPE_UNSPECIFIED` or a value this build does not know.
-        Some(_) => return SpaceKind::Unknown,
-        None => match space.get("type").and_then(Value::as_str) {
-            Some("DM") => true,
-            Some("ROOM" | "SPACE" | "GROUP_CHAT") => false,
-            _ => return SpaceKind::Unknown,
-        },
-    };
-    if !direct {
+    let space_type = space.get("spaceType").filter(|v| !v.is_null());
+    let legacy = space.get("type").and_then(Value::as_str);
+    let single = space.get("singleUserBotDm").and_then(Value::as_bool);
+    if matches!(space_type.and_then(Value::as_str), Some("SPACE" | "GROUP_CHAT"))
+        || matches!(legacy, Some("ROOM" | "SPACE" | "GROUP_CHAT"))
+        || single == Some(false)
+    {
         return SpaceKind::Shared;
     }
-    match space.get("singleUserBotDm").and_then(Value::as_bool) {
-        Some(true) => SpaceKind::OneToOneDm,
-        Some(false) => SpaceKind::Shared,
-        None => SpaceKind::Unknown,
+    let direct = match space_type {
+        Some(v) => v.as_str() == Some("DIRECT_MESSAGE"),
+        // `SPACE_TYPE_UNSPECIFIED`, a value this build does not know, or a
+        // non-string `spaceType` is not a proof (and the legacy field is
+        // not consulted behind it).
+        None => legacy == Some("DM"),
+    };
+    if direct && single == Some(true) {
+        SpaceKind::OneToOneDm
+    } else {
+        SpaceKind::Unknown
     }
 }
 
-/// The space fields a turn carries: each of `spaceType`, `type`,
-/// `singleUserBotDm` from `message.space`, else from the event's `space`.
-pub(crate) fn carried_space(message: &Value, event: &Value) -> Value {
-    let mut out = serde_json::Map::new();
-    for key in ["spaceType", "type", "singleUserBotDm"] {
-        let path = format!("/space/{key}");
-        if let Some(v) = message.pointer(&path).or_else(|| event.pointer(&path)) {
-            out.insert(key.to_string(), v.clone());
+/// The per-object kinds of the space objects a turn carries
+/// (`message.space`, then the event's `space`; absent or `null` ones are
+/// skipped), or `None` when the objects cannot describe the turn's `space`:
+/// an object that is not a JSON object, a non-string name, or a name that
+/// is not exactly `space` (which also means two present names that differ).
+fn carried_kinds(space: &str, message: &Value, event: &Value) -> Option<Vec<SpaceKind>> {
+    let objects: Vec<&Value> = [message.get("space"), event.get("space")]
+        .into_iter()
+        .flatten()
+        .filter(|v| !v.is_null())
+        .collect();
+    let mut names: Vec<&str> = Vec::new();
+    for object in &objects {
+        if !object.is_object() {
+            return None;
+        }
+        if let Some(name) = object.get("name") {
+            names.push(name.as_str()?);
         }
     }
-    Value::Object(out)
+    if names.windows(2).any(|pair| pair[0] != pair[1])
+        || names.iter().any(|name| *name != space)
+    {
+        return None;
+    }
+    Some(objects.into_iter().map(classify_space).collect())
+}
+
+/// What the trusted space objects a turn carries say about `space`. Each
+/// object is classified on its own ([`classify_space`]); fields are never
+/// combined across objects.
+///
+/// - `Shared` when the objects cannot describe `space` (mismatched names,
+///   malformed object — see `carried_kinds`) or any object says shared,
+///   even if the other object is a complete 1:1 proof.
+/// - `OneToOneDm` when at least one object is a complete 1:1 proof and no
+///   object says shared.
+/// - `Unknown` when every present object is silent: the `spaces.get` lookup
+///   decides.
+pub(crate) fn carried_kind(space: &str, message: &Value, event: &Value) -> SpaceKind {
+    let Some(kinds) = carried_kinds(space, message, event) else {
+        return SpaceKind::Shared;
+    };
+    if kinds.contains(&SpaceKind::Shared) {
+        SpaceKind::Shared
+    } else if kinds.contains(&SpaceKind::OneToOneDm) {
+        SpaceKind::OneToOneDm
+    } else {
+        SpaceKind::Unknown
+    }
+}
+
+/// Whether the space objects a turn carries contradict each other or the
+/// turn's `space`: mismatched names, a malformed object, or one object that
+/// is a complete 1:1 proof while another says shared. A decision press
+/// (`CARD_CLICKED`) with such an event is refused outright.
+pub(crate) fn carried_spaces_conflict(space: &str, message: &Value, event: &Value) -> bool {
+    match carried_kinds(space, message, event) {
+        None => true,
+        Some(kinds) => {
+            kinds.contains(&SpaceKind::Shared) && kinds.contains(&SpaceKind::OneToOneDm)
+        }
+    }
 }
 
 /// The kind a successful `spaces.get` body states for `space`. A body that
@@ -135,10 +203,11 @@ fn bounded_insert(
 
 // ── Resolution ──────────────────────────────────────────────────
 
-/// Steps 1–3 with the `spaces.get` call injected. `cache_key` must identify
-/// the app and the space.
+/// Steps 1–3 with the `spaces.get` call injected. `carried` is
+/// [`carried_kind`] of the turn; `cache_key` must identify the app and the
+/// space.
 pub(crate) async fn resolve_one_to_one_with<F, Fut>(
-    carried: &Value,
+    carried: SpaceKind,
     space: &str,
     cache_key: &str,
     fetch: F,
@@ -147,7 +216,7 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<Value, String>>,
 {
-    match classify_space(carried) {
+    match carried {
         SpaceKind::OneToOneDm => return true,
         SpaceKind::Shared => return false,
         SpaceKind::Unknown => {}
@@ -195,7 +264,9 @@ async fn fetch_space(creds: &GoogleChatCreds, space: &str) -> Result<Value, Stri
 }
 
 /// Whether the turn in `space` (with its trusted `message` / `event`) is a
-/// 1:1 DM between one person and the app answering as `creds`.
+/// 1:1 DM between one person and the app answering as `creds`. The single
+/// source of the space kind for every Google Chat path (MESSAGE over HTTP
+/// for the shared and employee-owned apps, the Pub/Sub re-read, CARD_CLICKED).
 pub(crate) async fn is_one_to_one(
     creds: &GoogleChatCreds,
     space: &str,
@@ -203,7 +274,7 @@ pub(crate) async fn is_one_to_one(
     event: &Value,
 ) -> bool {
     let key = serde_json::json!([creds.client_email(), space]).to_string();
-    resolve_one_to_one_with(&carried_space(message, event), space, &key, || {
+    resolve_one_to_one_with(carried_kind(space, message, event), space, &key, || {
         fetch_space(creds, space)
     })
     .await
@@ -259,27 +330,130 @@ mod tests {
             SpaceKind::Unknown
         );
         assert_eq!(classify_space(&json!({"singleUserBotDm":true})), SpaceKind::Unknown);
+        // Any field that says shared wins, whichever field it is.
+        assert_eq!(
+            classify_space(&json!({"spaceType":"DIRECT_MESSAGE","type":"ROOM","singleUserBotDm":true})),
+            SpaceKind::Shared
+        );
+        assert_eq!(
+            classify_space(&json!({"spaceType":"SPACE_TYPE_UNSPECIFIED","singleUserBotDm":false})),
+            SpaceKind::Shared
+        );
+        // A non-string spaceType is not a proof, and the legacy field is not
+        // consulted behind it.
+        assert_eq!(
+            classify_space(&json!({"spaceType":5,"type":"DM","singleUserBotDm":true})),
+            SpaceKind::Unknown
+        );
+    }
+
+    fn with_space(space: Value) -> Value {
+        json!({ "space": space })
     }
 
     #[test]
-    fn carried_space_merges_message_then_event() {
-        let message = json!({"space":{"spaceType":"DIRECT_MESSAGE"}});
-        let event = json!({"space":{"spaceType":"SPACE","singleUserBotDm":true}});
-        let merged = carried_space(&message, &event);
-        assert_eq!(merged["spaceType"], "DIRECT_MESSAGE");
-        assert_eq!(classify_space(&merged), SpaceKind::OneToOneDm);
-        assert_eq!(carried_space(&json!({}), &json!({})), json!({}));
+    fn carried_objects_are_classified_separately_never_merged() {
+        // The former field-by-field merge turned these two objects into a
+        // 1:1 proof. Each is classified on its own now.
+        let message = with_space(json!({"spaceType":"DIRECT_MESSAGE"}));
+        let event = with_space(json!({"spaceType":"SPACE","singleUserBotDm":true}));
+        assert_eq!(carried_kind("spaces/A", &message, &event), SpaceKind::Shared);
+        assert_eq!(carried_kind("spaces/A", &event, &message), SpaceKind::Shared);
+        assert_eq!(carried_kind("spaces/A", &json!({}), &json!({})), SpaceKind::Unknown);
+        // One object complete, the other silent: the complete one decides.
+        let silent = with_space(json!({"name":"spaces/DM1"}));
+        assert_eq!(carried_kind("spaces/DM1", &silent, &with_space(dm())), SpaceKind::OneToOneDm);
+        assert_eq!(carried_kind("spaces/DM1", &with_space(dm()), &silent), SpaceKind::OneToOneDm);
+        assert_eq!(carried_kind("spaces/DM1", &with_space(dm()), &json!({})), SpaceKind::OneToOneDm);
+        // Malformed objects are shared.
+        assert_eq!(carried_kind("spaces/DM1", &with_space(json!("spaces/DM1")), &with_space(dm())), SpaceKind::Shared);
+        assert_eq!(
+            carried_kind("spaces/DM1", &with_space(json!({"name":7})), &with_space(dm())),
+            SpaceKind::Shared
+        );
     }
 
-    async fn resolve(carried: Value, space: &str, lookup: Result<Value, String>) -> (bool, usize) {
+    #[test]
+    fn type_from_one_object_and_single_user_from_the_other_is_not_a_proof() {
+        let type_only = with_space(json!({"name":"spaces/DM1","spaceType":"DIRECT_MESSAGE"}));
+        let flag_only = with_space(json!({"name":"spaces/DM1","singleUserBotDm":true}));
+        assert_eq!(carried_kind("spaces/DM1", &type_only, &flag_only), SpaceKind::Unknown);
+        assert_eq!(carried_kind("spaces/DM1", &flag_only, &type_only), SpaceKind::Unknown);
+        let legacy_only = with_space(json!({"name":"spaces/DM1","type":"DM"}));
+        assert_eq!(carried_kind("spaces/DM1", &legacy_only, &flag_only), SpaceKind::Unknown);
+        assert!(!carried_spaces_conflict("spaces/DM1", &type_only, &flag_only));
+    }
+
+    #[tokio::test]
+    async fn split_proof_falls_to_the_lookup_or_shared() {
+        let type_only = with_space(json!({"name":"spaces/DM1","spaceType":"DIRECT_MESSAGE"}));
+        let flag_only = with_space(json!({"name":"spaces/DM1","singleUserBotDm":true}));
+        let carried = carried_kind("spaces/DM1", &type_only, &flag_only);
+        let group = json!({"name":"spaces/DM1","spaceType":"GROUP_CHAT"});
+        assert_eq!(resolve_kind(carried, "spaces/DM1", Ok(group)).await, (false, 1));
+        assert_eq!(resolve_kind(carried, "spaces/DM1", Err("403".into())).await, (false, 1));
+        // Only the authoritative lookup can make it a 1:1 DM.
+        assert_eq!(resolve_kind(carried, "spaces/DM1", Ok(dm())).await, (true, 1));
+    }
+
+    #[tokio::test]
+    async fn explicit_shared_in_either_object_beats_a_complete_proof() {
+        for shared in [
+            json!({"name":"spaces/DM1","spaceType":"SPACE"}),
+            json!({"name":"spaces/DM1","spaceType":"GROUP_CHAT"}),
+            json!({"name":"spaces/DM1","type":"ROOM"}),
+            json!({"name":"spaces/DM1","singleUserBotDm":false}),
+            json!({"name":"spaces/DM1","spaceType":"DIRECT_MESSAGE","singleUserBotDm":false}),
+        ] {
+            let shared = with_space(shared);
+            let proof = with_space(dm());
+            for (message, event) in [(&shared, &proof), (&proof, &shared)] {
+                let kind = carried_kind("spaces/DM1", message, event);
+                assert_eq!(kind, SpaceKind::Shared, "{message} {event}");
+                assert!(carried_spaces_conflict("spaces/DM1", message, event), "{message} {event}");
+                // Decided without a lookup, even one that would say DM.
+                assert_eq!(resolve_kind(kind, "spaces/DM1", Ok(dm())).await, (false, 0));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_message_with_mismatched_space_names_gets_no_attestation() {
+        // Both objects are complete 1:1 proofs, but they name different
+        // spaces: shared, no lookup, so `handle_message` never builds a
+        // `OneToOneAttestation` (it does so only when `is_one_to_one`).
+        let message = with_space(dm());
+        let event = with_space(json!({"name":"spaces/OTHER","spaceType":"DIRECT_MESSAGE","singleUserBotDm":true}));
+        for space in ["spaces/DM1", "spaces/OTHER"] {
+            for (m, e) in [(&message, &event), (&event, &message)] {
+                let kind = carried_kind(space, m, e);
+                assert_eq!(kind, SpaceKind::Shared);
+                assert!(carried_spaces_conflict(space, m, e));
+                assert_eq!(resolve_kind(kind, space, Ok(dm())).await, (false, 0));
+            }
+        }
+        // A carried name other than the turn's space is shared too.
+        assert_eq!(carried_kind("spaces/DM2", &message, &json!({})), SpaceKind::Shared);
+        // Equal names agree.
+        assert_eq!(carried_kind("spaces/DM1", &message, &message), SpaceKind::OneToOneDm);
+        assert!(!carried_spaces_conflict("spaces/DM1", &message, &message));
+    }
+
+    async fn resolve_kind(carried: SpaceKind, space: &str, lookup: Result<Value, String>) -> (bool, usize) {
         let calls = AtomicUsize::new(0);
         let k = key();
-        let got = resolve_one_to_one_with(&carried, space, &k, || {
+        let got = resolve_one_to_one_with(carried, space, &k, || {
             calls.fetch_add(1, Ordering::SeqCst);
             async move { lookup }
         })
         .await;
         (got, calls.load(Ordering::SeqCst))
+    }
+
+    /// `carried` as the turn's `message.space`, no event-level space.
+    async fn resolve(carried: Value, space: &str, lookup: Result<Value, String>) -> (bool, usize) {
+        let kind = carried_kind(space, &with_space(carried), &json!({}));
+        resolve_kind(kind, space, lookup).await
     }
 
     #[tokio::test]
@@ -293,7 +467,7 @@ mod tests {
     #[tokio::test]
     async fn pubsub_readback_without_type_uses_spaces_get() {
         // The spaces.messages.get read-back carries only the space name.
-        let carried = carried_space(&json!({"space":{"name":"spaces/DM1"}}), &json!({}));
+        let carried = json!({"name":"spaces/DM1"});
         assert_eq!(resolve(carried.clone(), "spaces/DM1", Ok(dm())).await, (true, 1));
         let group = json!({"name":"spaces/DM1","spaceType":"GROUP_CHAT"});
         assert_eq!(resolve(carried.clone(), "spaces/DM1", Ok(group)).await, (false, 1));
@@ -327,10 +501,11 @@ mod tests {
             calls.fetch_add(1, Ordering::SeqCst);
             async move { body }
         };
-        assert!(!resolve_one_to_one_with(&json!({}), "spaces/DM1", &k, || fetch(Err("timeout".into()))).await);
-        assert!(resolve_one_to_one_with(&json!({}), "spaces/DM1", &k, || fetch(Ok(dm()))).await);
+        let unknown = SpaceKind::Unknown;
+        assert!(!resolve_one_to_one_with(unknown, "spaces/DM1", &k, || fetch(Err("timeout".into()))).await);
+        assert!(resolve_one_to_one_with(unknown, "spaces/DM1", &k, || fetch(Ok(dm()))).await);
         // Cached: the next resolution makes no call even if it would fail.
-        assert!(resolve_one_to_one_with(&json!({}), "spaces/DM1", &k, || fetch(Err("x".into()))).await);
+        assert!(resolve_one_to_one_with(unknown, "spaces/DM1", &k, || fetch(Err("x".into()))).await);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 

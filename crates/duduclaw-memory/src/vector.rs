@@ -243,6 +243,23 @@ pub fn vector_knn(
     now_rfc: &str,
     k: usize,
 ) -> Result<Option<Vec<(String, f32)>>> {
+    vector_knn_scoped(conn, agent_id, query_vec, model_id, now_rfc, k, crate::RowScope::All)
+}
+
+/// [`vector_knn`] over the rows of `scope` only (v1.84.0): in a conversation
+/// the visibility rule is part of the scan, so the top-`k` cut-off (and the
+/// scan cap) counts only rows that conversation may see — another
+/// conversation's vectors neither fill the candidate set nor push a visible
+/// row out of it. [`crate::RowScope::All`] = every row, exactly as before.
+pub fn vector_knn_scoped(
+    conn: &Connection,
+    agent_id: &str,
+    query_vec: &[f32],
+    model_id: &str,
+    now_rfc: &str,
+    k: usize,
+    scope: crate::RowScope<'_>,
+) -> Result<Option<Vec<(String, f32)>>> {
     if query_vec.is_empty() || query_vec.iter().all(|x| *x == 0.0) {
         return Ok(None);
     }
@@ -250,21 +267,28 @@ pub fn vector_knn(
         return Ok(None);
     }
 
+    let sql = format!(
+        "SELECT id, embedding FROM memories
+         WHERE agent_id = ?1 AND embedding IS NOT NULL AND embedding_model = ?2
+           AND (valid_until IS NULL OR valid_until > ?3)
+           AND quarantined = 0{visible}
+         LIMIT ?4",
+        visible = scope.and_visible("memories", "?5"),
+    );
     let mut stmt = conn
-        .prepare(
-            "SELECT id, embedding FROM memories
-             WHERE agent_id = ?1 AND embedding IS NOT NULL AND embedding_model = ?2
-               AND (valid_until IS NULL OR valid_until > ?3)
-               AND quarantined = 0
-             LIMIT ?4",
-        )
+        .prepare(&sql)
         .map_err(|e| DuDuClawError::Memory(format!("knn prepare: {e}")))?;
 
+    let scan_cap = MAX_KNN_SCAN as i64;
+    let session = scope.session();
+    let mut bound: Vec<&dyn rusqlite::ToSql> = vec![&agent_id, &model_id, &now_rfc, &scan_cap];
+    if scope.is_scoped() {
+        bound.push(&session);
+    }
     let rows = stmt
-        .query_map(
-            params![agent_id, model_id, now_rfc, MAX_KNN_SCAN as i64],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?)),
-        )
+        .query_map(bound.as_slice(), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })
         .map_err(|e| DuDuClawError::Memory(format!("knn query: {e}")))?;
 
     let mut scored: Vec<(String, f32)> = Vec::new();

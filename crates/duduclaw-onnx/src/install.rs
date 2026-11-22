@@ -1,16 +1,8 @@
 //! Verified downloads and the shared ONNX Runtime install.
 //!
-//! A download is:
-//!
-//! 1. stream the file to `<dest>.part`, resuming with an HTTP `Range`
-//!    header when a partial file is already there;
-//! 2. hash the completed `.part` and compare against the pinned SHA-256;
-//! 3. `rename` it into place — so a file at its final path is always a
-//!    verified file, never a truncated download.
-//!
-//! A mismatch deletes the offending `.part` and fails. Callers write their
-//! own install marker only after every file passed, so a partial install is
-//! indistinguishable from no install.
+//! Each transfer uses a fresh, exclusive random temporary file in the destination
+//! directory. Hash the open file before publishing with a rename. Old partials
+//! are never resumed; cancellation and errors remove this transfer's temporary.
 
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -20,8 +12,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 
-use crate::manifest::{self, ArchiveKind, ORT_VERSION, OrtArchive};
+use crate::manifest::{self, ArchiveKind, ORT_VERSION, OrtArchive, OrtSource};
 use crate::{OnnxError, OnnxResult};
+
+#[path = "verified_file.rs"]
+pub(crate) mod verified_file;
 
 /// Lock sentinel preventing two processes installing into one directory.
 const LOCK_FILE: &str = "install.lock";
@@ -34,6 +29,10 @@ pub type BytesFn<'a> = &'a (dyn Fn(u64) + Send + Sync);
 /// SHA-256 of a file, lowercase hex. Streams — never loads the file.
 pub fn sha256_file(path: &Path) -> OnnxResult<String> {
     let mut f = std::fs::File::open(path)?;
+    sha256_reader(&mut f)
+}
+
+fn sha256_reader(f: &mut impl Read) -> OnnxResult<String> {
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 1024 * 1024];
     loop {
@@ -101,21 +100,102 @@ fn short_url(url: &str) -> String {
     url.split('?').next().unwrap_or(url).to_string()
 }
 
-/// HTTP client for pinned downloads: a connect timeout, no overall timeout
-/// (a large file on a slow link is not an error).
+/// Reject unknown redirect destinations and HTTPS downgrades, at most five hops.
+fn redirect_allowed(initial: &reqwest::Url, next: &reqwest::Url, hops: usize) -> bool {
+    if hops > 5 || initial.scheme() != "https" || next.scheme() != "https"
+        || !next.username().is_empty() || next.password().is_some()
+        || next.port_or_known_default() != Some(443)
+    {
+        return false;
+    }
+    let Some(host) = next.host_str() else { return false; };
+    let allowed = match initial.host_str() {
+        Some("github.com") => manifest::GITHUB_REDIRECT_HOSTS,
+        Some("api.nuget.org") => manifest::NUGET_REDIRECT_HOSTS,
+        // The same client downloads the pinned model manifests, too.
+        Some("huggingface.co") => manifest::MODEL_REDIRECT_HOSTS,
+        _ => return false,
+    };
+    allowed.contains(&host)
+}
+
+/// HTTP client for pinned downloads, with a fail-closed redirect policy.
 pub fn http_client(user_agent: &str) -> OnnxResult<reqwest::Client> {
     reqwest::Client::builder()
+        .https_only(true)
         .connect_timeout(std::time::Duration::from_secs(30))
+        .read_timeout(std::time::Duration::from_secs(60))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().first().is_some_and(|initial|
+                redirect_allowed(initial, attempt.url(), attempt.previous().len()))
+            {
+                attempt.follow()
+            } else {
+                attempt.error("download redirect refused")
+            }
+        }))
         .user_agent(user_agent.to_string())
         .build()
         .map_err(|e| OnnxError::msg(format!("HTTP client: {e}")))
 }
 
-/// Stream `url` into `<dest>.part`, resuming from whatever is already there,
-/// verify the hash, then rename into place.
-///
-/// `cancel` is polled between chunks; cancelling leaves the `.part` file in
-/// place so a later call resumes rather than restarts.
+fn exclusive_temp(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x00200000);
+    }
+    options.open(path)
+}
+
+/// Create a random, exclusive, no-follow temporary beside the destination.
+pub fn new_temp(dest: &Path) -> OnnxResult<tempfile::NamedTempFile> {
+    let parent = dest.parent().ok_or_else(|| OnnxError::msg("目的地沒有父目錄"))?;
+    let prefix = format!(".{}.dudu-", dest.file_name().unwrap_or_default().to_string_lossy());
+    // tempfile retries random collisions; the callback never truncates or follows links.
+    Ok(tempfile::Builder::new().prefix(&prefix).suffix(".part").rand_bytes(16)
+        .make_in(parent, exclusive_temp)?)
+}
+
+/// Remove only old, matching regular files whose ownership can be established.
+/// On Windows std cannot establish ownership, so leave stale files untouched.
+fn cleanup_stale_temps(dest: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Some(parent) = dest.parent() else { return; };
+        let prefix = format!(".{}.dudu-", dest.file_name().unwrap_or_default().to_string_lossy());
+        let Ok(entries) = std::fs::read_dir(parent) else { return; };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let legacy = entry.path() == part_path(dest) || entry.path() == dest.with_extension("verified")
+                || entry.path() == dest.with_extension("part");
+            let random = name.strip_prefix(&prefix).and_then(|s| s.strip_suffix(".part"))
+                .is_some_and(|s| s.len() == 16 && s.bytes().all(|b| b.is_ascii_alphanumeric()));
+            if !legacy && !random { continue; }
+            let Ok(meta) = std::fs::symlink_metadata(entry.path()) else { continue; };
+            // SAFETY: geteuid is a side-effect-free query.
+            if meta.is_file() && meta.uid() == unsafe { libc::geteuid() }
+                && meta.modified().ok().and_then(|t| t.elapsed().ok())
+                    .is_some_and(|age| age.as_secs() > LOCK_STALE_SECS)
+            {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = dest;
+}
+
+/// Download into a fresh exclusive file, verify through its handle, then publish.
 pub async fn fetch_verified(
     client: &reqwest::Client,
     url: &str,
@@ -125,135 +205,144 @@ pub async fn fetch_verified(
     cancel: &Arc<AtomicBool>,
     on_bytes: BytesFn<'_>,
 ) -> OnnxResult<()> {
-    let part = part_path(dest);
-    let mut have = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
-    if have > expect_size {
-        // A stale `.part` from a different revision — start over rather than
-        // resume into a file that can never hash correctly.
-        let _ = std::fs::remove_file(&part);
-        have = 0;
-    }
-
-    if have < expect_size {
-        let mut req = client.get(url);
-        if have > 0 {
-            req = req.header(reqwest::header::RANGE, format!("bytes={have}-"));
-        }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| OnnxError::msg(format!("下載失敗：{e}")))?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(OnnxError::msg(format!(
-                "下載失敗（HTTP {}）：{}",
-                status.as_u16(),
-                short_url(url)
-            )));
-        }
-        // A server that ignored our Range header restarts the file; honour
-        // that rather than appending a second copy onto the first.
-        let resuming = have > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT;
-        let mut file = if resuming {
-            let mut f = std::fs::OpenOptions::new().write(true).open(&part)?;
-            f.seek(SeekFrom::Start(have))?;
-            f
-        } else {
-            have = 0;
-            std::fs::File::create(&part)?
-        };
-
-        let mut written = have;
-        let mut stream = resp.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            if cancel.load(Ordering::Relaxed) {
-                file.flush()?;
-                return Err(OnnxError::msg("下載已取消"));
-            }
-            let chunk = chunk.map_err(|e| OnnxError::msg(format!("下載中斷：{e}")))?;
-            written += chunk.len() as u64;
-            if written > expect_size {
-                drop(file);
-                let _ = std::fs::remove_file(&part);
-                return Err(OnnxError::msg(format!(
-                    "下載檔超過預期大小（{expect_size} 位元組），已刪除"
-                )));
-            }
-            file.write_all(&chunk)?;
-            on_bytes(written);
-        }
-        file.flush()?;
-        drop(file);
-    }
-
-    let got_size = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
-    if got_size != expect_size {
-        let _ = std::fs::remove_file(&part);
-        return Err(OnnxError::msg(format!(
-            "下載檔大小不符（預期 {expect_size} 位元組，實際 {got_size}），已刪除重來"
-        )));
-    }
-    let got = sha256_file(&part)?;
-    if got != expect_sha {
-        let _ = std::fs::remove_file(&part);
-        return Err(OnnxError::msg(
-            "下載檔完整性驗證失敗（sha256 不符），已刪除；請重新下載",
-        ));
-    }
-    std::fs::rename(&part, dest)?;
+    cleanup_stale_temps(dest);
+    let part = fetch_partial(client, url, dest, expect_size, cancel, on_bytes).await?;
+    finish_download(part, dest, expect_size, expect_sha)?;
     on_bytes(expect_size);
+    Ok(())
+}
+
+async fn fetch_partial(
+    client: &reqwest::Client,
+    url: &str,
+    dest: &Path,
+    expect_size: u64,
+    cancel: &Arc<AtomicBool>,
+    on_bytes: BytesFn<'_>,
+) -> OnnxResult<tempfile::NamedTempFile> {
+    let mut part = new_temp(dest)?;
+    let resp = client.get(url).send().await
+        .map_err(|e| OnnxError::msg(format!("下載失敗：{e}")))?;
+    if !resp.status().is_success() {
+        return Err(OnnxError::msg(format!("下載失敗（HTTP {}）：{}",
+            resp.status().as_u16(), short_url(url))));
+    }
+    let mut written = 0u64;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(OnnxError::msg("下載已取消"));
+        }
+        let chunk = chunk.map_err(|e| OnnxError::msg(format!("下載中斷：{e}")))?;
+        written = written.checked_add(chunk.len() as u64)
+            .ok_or_else(|| OnnxError::msg("下載檔大小溢位"))?;
+        if written > expect_size {
+            return Err(OnnxError::msg(format!("下載檔超過預期大小（{expect_size} 位元組），已刪除")));
+        }
+        part.write_all(&chunk)?;
+        on_bytes(written);
+    }
+    part.flush()?;
+    Ok(part)
+}
+
+fn verify_temp(part: &mut tempfile::NamedTempFile, size: u64, sha: &str) -> OnnxResult<()> {
+    if part.as_file().metadata()?.len() != size {
+        return Err(OnnxError::msg("下載檔大小不符，已刪除重來"));
+    }
+    part.seek(SeekFrom::Start(0))?;
+    if sha256_reader(part.as_file_mut())? != sha {
+        return Err(OnnxError::msg("下載檔完整性驗證失敗（sha256 不符），已刪除；請重新下載"));
+    }
+    Ok(())
+}
+
+/// Verify size and digest through the held handle, then atomically rename.
+pub fn finish_download(mut part: tempfile::NamedTempFile, dest: &Path, size: u64, sha: &str) -> OnnxResult<()> {
+    verify_temp(&mut part, size, sha)?;
+    part.persist(dest).map_err(|e| OnnxError::Io(e.error))?;
     Ok(())
 }
 
 /// Pull exactly one member out of the ORT release archive.
 pub fn extract_member(archive_path: &Path, archive: &OrtArchive, dest: &Path) -> OnnxResult<()> {
-    let tmp = dest.with_extension("part");
-    let _ = std::fs::remove_file(&tmp);
-    let found = match archive.kind {
+    let max_size = max_library_size(lib_pin(archive)?)?;
+    let part = extract_source_member(archive_path, &archive.sources().next().unwrap(), dest, max_size)?;
+    part.persist(dest).map_err(|e| OnnxError::Io(e.error))?;
+    Ok(())
+}
+
+fn max_library_size(pins: &[(u64, &str)]) -> OnnxResult<u64> {
+    pins.iter().map(|p| p.0).max().ok_or_else(|| OnnxError::msg("ONNX Runtime 缺少版本紀錄"))
+}
+
+fn safe_member(member: &str) -> bool {
+    !member.is_empty() && !member.contains('\\') && !member.contains(':')
+        && member.split('/').all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
+fn copy_member(reader: impl Read, out: &mut impl Write, max_size: u64) -> OnnxResult<()> {
+    let limit = max_size.checked_add(1).ok_or_else(|| OnnxError::msg("ONNX Runtime 大小紀錄錯誤"))?;
+    if std::io::copy(&mut reader.take(limit), out)? > max_size {
+        return Err(OnnxError::msg("ONNX Runtime 壓縮檔成員超過大小上限"));
+    }
+    Ok(())
+}
+
+fn extract_source_member(
+    archive_path: &Path, source: &OrtSource, dest: &Path, max_size: u64,
+) -> OnnxResult<tempfile::NamedTempFile> {
+    if !safe_member(source.member) {
+        return Err(OnnxError::msg("ONNX Runtime 壓縮檔成員路徑不安全"));
+    }
+    let mut out = new_temp(dest)?;
+    let mut hits = 0;
+    match source.kind {
         ArchiveKind::TarGz => {
             let f = std::fs::File::open(archive_path)?;
             let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(f));
-            let mut hit = false;
             for entry in tar.entries()? {
                 let mut entry = entry?;
-                let path = entry.path()?.to_string_lossy().to_string();
-                if path == archive.member {
-                    let mut out = std::fs::File::create(&tmp)?;
-                    std::io::copy(&mut entry, &mut out)?;
-                    hit = true;
-                    break;
+                if entry.path_bytes().as_ref() == source.member.as_bytes() {
+                    hits += 1;
+                    if hits != 1 || !entry.header().entry_type().is_file() {
+                        return Err(OnnxError::msg("ONNX Runtime 成員重複或不是一般檔案"));
+                    }
+                    copy_member(&mut entry, &mut out, max_size)?;
                 }
             }
-            hit
         }
         ArchiveKind::Zip => {
             let f = std::fs::File::open(archive_path)?;
             let mut zip = zip::ZipArchive::new(f)
                 .map_err(|e| OnnxError::msg(format!("ONNX Runtime zip 無法讀取：{e}")))?;
-            match zip.by_name(archive.member) {
-                Ok(mut entry) => {
-                    let mut out = std::fs::File::create(&tmp)?;
-                    std::io::copy(&mut entry, &mut out)?;
-                    true
+            // ZipArchive indexes names and would otherwise hide duplicate members.
+            zip.validate_header_consistency()
+                .map_err(|e| OnnxError::msg(format!("ONNX Runtime zip 標頭不一致：{e}")))?;
+            for index in 0..zip.len() {
+                let mut entry = zip.by_index(index)
+                    .map_err(|e| OnnxError::msg(format!("ONNX Runtime zip 無法讀取：{e}")))?;
+                let name = entry.name()
+                    .map_err(|e| OnnxError::msg(format!("ONNX Runtime zip 成員名稱無法讀取：{e}")))?;
+                if !safe_member(name.trim_end_matches('/')) {
+                    return Err(OnnxError::msg("ONNX Runtime zip 成員路徑不安全"));
                 }
-                Err(_) => false,
+                if name == source.member {
+                    hits += 1;
+                    let kind = entry.unix_mode().map(|mode| mode & 0o170000);
+                    if hits != 1 || !entry.is_file() || kind.is_some_and(|k| k != 0 && k != 0o100000) {
+                        return Err(OnnxError::msg("ONNX Runtime zip 成員重複或不是一般檔案"));
+                    }
+                    copy_member(&mut entry, &mut out, max_size)?;
+                }
             }
         }
-    };
-    if !found {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(OnnxError::msg(format!(
-            "ONNX Runtime 壓縮檔裡找不到 {}（版本可能已變更）",
-            archive.member
-        )));
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755));
+    if hits != 1 {
+        return Err(OnnxError::msg(format!("ONNX Runtime 壓縮檔裡找不到 {}（版本可能已變更）", source.member)));
     }
-    std::fs::rename(&tmp, dest)?;
-    Ok(())
+    out.flush()?;
+    Ok(out)
 }
 
 /// Where a downloaded (or bundled) ORT archive is kept while it is
@@ -271,70 +360,88 @@ pub fn ort_installed(ort_lib_root: &Path) -> bool {
     manifest::ort_lib_path(ort_lib_root).is_some_and(|p| p.exists())
 }
 
-/// Check the installed library against its pin before anything loads it.
-/// The full hash runs once per (path, size, mtime) per process.
+/// Check installed-library readiness. No successful hash is cached.
 pub fn verify_ort_lib(ort_lib_root: &Path) -> Result<(), String> {
-    let target = manifest::current_target();
-    let (Some(lib), Some(pin)) = (
-        manifest::ort_lib_path(ort_lib_root),
-        manifest::ort_lib_pin(target),
-    ) else {
-        return Err(format!("這個平台（{target}）沒有可用的 ONNX Runtime"));
-    };
-    verify_lib_at(&lib, pin)
+    let lib = manifest::ort_lib_path(ort_lib_root)
+        .ok_or_else(|| "這個平台沒有可用的 ONNX Runtime".to_string())?;
+    verify_ort_lib_path(&lib)
 }
 
-/// [`verify_ort_lib`] for an explicit library path (what the loader is
-/// about to open), against this platform's pin.
+/// Readiness check only; the loader must retain the handle returned by verify_for_load.
 pub fn verify_ort_lib_path(lib: &Path) -> Result<(), String> {
-    let target = manifest::current_target();
-    let pin = manifest::ort_lib_pin(target)
-        .ok_or_else(|| format!("這個平台（{target}）沒有可用的 ONNX Runtime"))?;
-    verify_lib_at(lib, pin)
+    let pins = manifest::ort_lib_pins(manifest::current_target())
+        .ok_or_else(|| "這個平台沒有可用的 ONNX Runtime".to_string())?;
+    verify_lib_at(lib, pins)
 }
 
-fn verify_lib_at(lib: &Path, (size, sha): (u64, &str)) -> Result<(), String> {
-    use std::collections::HashSet;
-    use std::sync::{Mutex, OnceLock};
-    static OK: OnceLock<Mutex<HashSet<(PathBuf, u64, std::time::SystemTime)>>> = OnceLock::new();
-    let meta =
-        std::fs::symlink_metadata(lib).map_err(|_| "ONNX Runtime 執行庫尚未安裝".to_string())?;
-    if meta.file_type().is_symlink() || !meta.is_file() {
-        return Err("ONNX Runtime 執行庫不是一般檔案，拒絕載入".to_string());
-    }
-    let key = (
-        lib.to_path_buf(),
-        meta.len(),
-        meta.modified().unwrap_or(std::time::UNIX_EPOCH),
-    );
-    let cache = OK.get_or_init(Default::default);
-    if cache
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .contains(&key)
+fn verify_lib_at(lib: &Path, pins: &[(u64, &str)]) -> Result<(), String> {
+    verified_file::verify_for_load(lib, pins).map(|_| ())
+}
+
+#[cfg(unix)]
+const MANAGED_DIRECTORY: &str = "ONNX Runtime 目錄由其他使用者管理；請由該使用者更新元件";
+
+#[cfg(unix)]
+fn managed_directory_result(
+    owner: u32, current_uid: u32, verify: impl FnOnce() -> Result<(), String>,
+) -> OnnxResult<bool> {
+    if owner == current_uid { return Ok(false); }
+    verify().map_err(|_| OnnxError::msg(MANAGED_DIRECTORY))?;
+    Ok(true)
+}
+
+/// Never repair, lock, or clean up a version directory managed by another uid.
+fn use_managed_library(dir: &Path, lib: &Path, pins: &[(u64, &str)]) -> OnnxResult<bool> {
+    #[cfg(unix)]
     {
-        return Ok(());
+        use std::os::unix::fs::MetadataExt;
+        let meta = match std::fs::symlink_metadata(dir) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        // SAFETY: geteuid has no memory preconditions.
+        managed_directory_result(meta.uid(), unsafe { libc::geteuid() }, || verify_lib_at(lib, pins))
     }
-    match verify_path(lib, "onnxruntime", size, sha) {
-        FileState::Verified => {
-            cache.lock().unwrap_or_else(|p| p.into_inner()).insert(key);
-            Ok(())
-        }
-        FileState::Missing => Err("ONNX Runtime 執行庫尚未安裝".to_string()),
-        FileState::Corrupt(_) => Err(
-            "ONNX Runtime 執行庫與這個 DuDuClaw 的版本紀錄不符，拒絕載入；請移除後重新安裝"
-                .to_string(),
-        ),
+    #[cfg(not(unix))]
+    {
+        let _ = (dir, lib, pins);
+        Ok(false)
     }
 }
 
-fn lib_pin(archive: &OrtArchive) -> OnnxResult<(u64, &'static str)> {
-    manifest::ort_lib_pin(archive.target).ok_or_else(|| {
+fn prepare_lib_dir(dir: &Path) -> OnnxResult<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let file = std::fs::OpenOptions::new().read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_DIRECTORY).open(dir)?;
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no memory preconditions.
+        if file.metadata()?.uid() != unsafe { libc::geteuid() } {
+            return Err(OnnxError::msg(MANAGED_DIRECTORY));
+        }
+        file.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn lib_pin(archive: &OrtArchive) -> OnnxResult<&'static [(u64, &'static str)]> {
+    manifest::ort_lib_pins(archive.target).ok_or_else(|| {
         OnnxError::msg(format!(
             "{} 沒有 ONNX Runtime 執行庫的版本紀錄",
             archive.target
         ))
     })
+}
+
+pub(crate) fn success_record(source: OrtSource) -> String {
+    let host = reqwest::Url::parse(source.url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .unwrap_or("unknown".to_string());
+    format!("ONNX Runtime 來源成功：kind={:?} host={}", source.kind, host)
 }
 
 /// Download, verify and extract the ORT library for `archive` into
@@ -351,41 +458,98 @@ pub async fn install_ort(
     let pin = lib_pin(archive)?;
     let lib_dir = manifest::ort_lib_dir(ort_lib_root);
     let lib_path = lib_dir.join(archive.lib_file);
-    if verify_lib_at(&lib_path, pin).is_ok() {
-        on_bytes(archive.size);
+    if use_managed_library(&lib_dir, &lib_path, pin)? || verify_lib_at(&lib_path, pin).is_ok() {
+        on_bytes(max_source_size(archive));
         return Ok(());
     }
-    std::fs::create_dir_all(&lib_dir)?;
+    prepare_lib_dir(&lib_dir)?;
     let _lock = InstallLock::acquire(&lib_dir)?;
-    let tmp_archive = ort_archive_path(ort_lib_root, archive);
-    fetch_verified(
-        client,
-        archive.url,
-        &tmp_archive,
-        archive.size,
-        archive.sha256,
-        cancel,
-        on_bytes,
-    )
-    .await?;
-    extract_verified(&tmp_archive, archive, &lib_path, pin)?;
-    let _ = std::fs::remove_file(&tmp_archive);
+    let reserved = max_source_size(archive);
+    install_from_sources(ort_lib_root, archive, pin, cancel, |source, dest| async move {
+        // Each source reports an independent byte count; a failed source's
+        // partial bytes are discarded before the next source starts.
+        on_bytes(0);
+        fetch_partial(client, source.url, &dest, source.size, cancel, &|bytes| {
+            let scaled = if source.size == 0 {
+                0
+            } else {
+                ((bytes.min(source.size) as u128 * reserved as u128) / source.size as u128)
+                    .min(reserved as u128) as u64
+            };
+            on_bytes(scaled);
+        }).await
+    }).await?;
+    on_bytes(reserved);
     Ok(())
 }
 
-/// Extract the member, then check it against its pin (a mismatch removes it).
+/// Maximum transfer size among the ordered sources, for aggregate progress
+/// callers that need to reserve the runtime portion before selecting a source.
+pub fn max_source_size(archive: &OrtArchive) -> u64 {
+    archive.sources().map(|source| source.size).max().unwrap_or(0)
+}
+
+// The fetcher returns an exclusively owned temporary; verification stays here.
+async fn install_from_sources<F, Fut>(
+    ort_lib_root: &Path,
+    archive: &OrtArchive,
+    pins: &[(u64, &str)],
+    cancel: &Arc<AtomicBool>,
+    mut fetch: F,
+) -> OnnxResult<()>
+where
+    F: FnMut(OrtSource, PathBuf) -> Fut,
+    Fut: std::future::Future<Output = OnnxResult<tempfile::NamedTempFile>>,
+{
+    let lib_dir = manifest::ort_lib_dir(ort_lib_root);
+    let lib_path = lib_dir.join(archive.lib_file);
+    let mut failures = Vec::new();
+    for (index, source) in archive.sources().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(OnnxError::msg("下載已取消"));
+        }
+        let path = if index == 0 {
+            ort_archive_path(ort_lib_root, archive)
+        } else {
+            lib_dir.join(format!("onnxruntime-{ORT_VERSION}-source-{index}.{}", source.kind.extension()))
+        };
+        let result = async {
+            cleanup_stale_temps(&path);
+            let part = fetch(source, path.clone()).await?;
+            finish_download(part, &path, source.size, source.sha256)?;
+            extract_verified(&path, &source, &lib_path, pins)
+        }.await;
+        let _ = std::fs::remove_file(&path);
+        match result {
+            Ok(()) => {
+                eprintln!("{}", success_record(source));
+                return Ok(());
+            }
+            Err(error) => {
+                let why = format!("{}: {error}", source.url).replace(['\n', '\r'], " ");
+                eprintln!("ONNX Runtime 來源失敗：{why}");
+                failures.push(why);
+            }
+        }
+    }
+    Err(OnnxError::msg(format!("ONNX Runtime 所有下載來源失敗：{}", failures.join("; "))))
+}
+
+/// Verify the extracted file before the atomic rename to the installed name.
 fn extract_verified(
     archive_path: &Path,
-    archive: &OrtArchive,
+    source: &OrtSource,
     lib_path: &Path,
-    pin: (u64, &str),
+    pins: &[(u64, &str)],
 ) -> OnnxResult<()> {
-    let _ = std::fs::remove_file(lib_path);
-    extract_member(archive_path, archive, lib_path)?;
-    if let Err(e) = verify_lib_at(lib_path, pin) {
-        let _ = std::fs::remove_file(lib_path);
-        return Err(OnnxError::msg(e));
+    cleanup_stale_temps(lib_path);
+    let mut staging = extract_source_member(archive_path, source, lib_path, max_library_size(pins)?)?;
+    let size = staging.as_file().metadata()?.len();
+    staging.seek(SeekFrom::Start(0))?;
+    if !manifest::matches_lib_pin(pins, size, &sha256_reader(staging.as_file_mut())?) {
+        return Err(OnnxError::msg("ONNX Runtime 執行庫大小或雜湊與版本紀錄不符，拒絕安裝"));
     }
+    staging.persist(lib_path).map_err(|e| OnnxError::Io(e.error))?;
     Ok(())
 }
 
@@ -401,10 +565,13 @@ pub fn install_ort_from_local_archive(ort_lib_root: &Path, archive: &OrtArchive)
 fn install_ort_from_local_archive_with(
     ort_lib_root: &Path,
     archive: &OrtArchive,
-    pin: (u64, &str),
+    pin: &[(u64, &str)],
 ) -> OnnxResult<()> {
     let lib_dir = manifest::ort_lib_dir(ort_lib_root);
     let lib_path = lib_dir.join(archive.lib_file);
+    if use_managed_library(&lib_dir, &lib_path, pin)? {
+        return Ok(());
+    }
     let path = ort_archive_path(ort_lib_root, archive);
     let archive_present = path.exists();
     if verify_lib_at(&lib_path, pin).is_ok() && !archive_present {
@@ -424,9 +591,9 @@ fn install_ort_from_local_archive_with(
             )));
         }
     }
-    std::fs::create_dir_all(&lib_dir)?;
+    prepare_lib_dir(&lib_dir)?;
     let _lock = InstallLock::acquire(&lib_dir)?;
-    extract_verified(&path, archive, &lib_path, pin)?;
+    extract_verified(&path, &archive.sources().next().unwrap(), &lib_path, pin)?;
     let _ = std::fs::remove_file(&path);
     Ok(())
 }
@@ -474,6 +641,20 @@ impl Drop for InstallLock {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_directory_uses_verified_library_or_requires_its_owner() {
+        assert!(managed_directory_result(0, 1000, || Ok(())).unwrap());
+        for owner in [0, 1234] {
+            let error = managed_directory_result(owner, 1000, || Err("unverified".into()))
+                .unwrap_err().to_string();
+            assert!(error.contains("由其他使用者管理"));
+            assert!(error.contains("由該使用者更新"));
+        }
+        assert!(!managed_directory_result(1000, 1000, || panic!("self-owned directory can be repaired"))
+            .unwrap());
+    }
 
     #[test]
     fn sha256_file_matches_a_known_digest() {
@@ -542,11 +723,12 @@ mod tests {
             kind: ArchiveKind::TarGz,
             member: "pkg/lib/libx.so",
             lib_file: "libx.so",
+            fallbacks: &[],
         };
-        let pin = (
+        let pin = &[(
             3u64,
             Box::leak(hex_lower(&Sha256::digest(b"ELF")).into_boxed_str()) as &str,
-        );
+        )];
         let lib = manifest::ort_lib_dir(&root).join("libx.so");
         // Missing archive: refused.
         assert!(install_ort_from_local_archive_with(&root, &archive, pin).is_err());
@@ -566,48 +748,30 @@ mod tests {
         assert!(!ort_archive_path(&root, &archive).exists());
         assert!(verify_lib_at(&lib, pin).is_ok());
         // An archive whose member does not match the library pin is refused.
-        let wrong_pin = (3u64, "0".repeat(64).leak() as &str);
+        let wrong_pin = &[(3u64, "0".repeat(64).leak() as &str)];
         std::fs::write(ort_archive_path(&root, &archive), &bytes).unwrap();
         assert!(install_ort_from_local_archive_with(&root, &archive, wrong_pin).is_err());
-        assert!(!lib.exists(), "a mismatching library is removed");
+        assert_eq!(std::fs::read(&lib).unwrap(), b"ELF", "failed replacement preserves the installed library");
     }
 
-    #[tokio::test]
-    async fn fetch_verified_refuses_a_wrong_hash_and_keeps_nothing() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            while let Ok((mut s, _)) = listener.accept().await {
-                let mut buf = [0u8; 1024];
-                let _ = s.read(&mut buf).await;
-                let _ = s
-                    .write_all(
-                        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
-                    )
-                    .await;
-            }
-        });
+    #[test]
+    fn download_verification_refuses_wrong_size_and_hash_and_cleans_temps() {
         let tmp = TempDir::new().unwrap();
         let dest = tmp.path().join("f.bin");
-        let client = http_client("test").unwrap();
-        let cancel = Arc::new(AtomicBool::new(false));
-        let url = format!("http://{addr}/f");
-        // More bytes than announced are refused while streaming.
-        let err = fetch_verified(&client, &url, &dest, 3, &"0".repeat(64), &cancel, &|_| {})
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("超過"), "{err}");
-        let bad = "0".repeat(64);
-        let err = fetch_verified(&client, &url, &dest, 5, &bad, &cancel, &|_| {})
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("sha256"), "{err}");
-        assert!(!dest.exists() && !part_path(&dest).exists());
-        let good = hex_lower(&Sha256::digest(b"hello"));
-        fetch_verified(&client, &url, &dest, 5, &good, &cancel, &|_| {})
-            .await
-            .unwrap();
-        assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+        for (size, sha) in [(3, "0".repeat(64)), (5, "0".repeat(64))] {
+            let mut part = new_temp(&dest).unwrap();
+            part.write_all(b"hello").unwrap();
+            let path = part.path().to_path_buf();
+            assert!(finish_download(part, &dest, size, &sha).is_err());
+            assert!(!path.exists() && !dest.exists());
+        }
+        let mut part = new_temp(&dest).unwrap();
+        part.write_all(b"hello").unwrap();
+        finish_download(part, &dest, 5, &hex_lower(&Sha256::digest(b"hello"))).unwrap();
+        assert_eq!(std::fs::read(dest).unwrap(), b"hello");
     }
 }
+
+#[cfg(test)]
+#[path = "install_source_tests.rs"]
+mod source_tests;

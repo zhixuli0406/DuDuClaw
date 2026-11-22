@@ -11,6 +11,7 @@ edition.workspace = true
 # authoritative identity store.
 
 [dependencies]
+duduclaw-core = { workspace = true }
 # Async trait + runtime
 async-trait = { workspace = true }
 tokio = { workspace = true }

@@ -616,6 +616,12 @@ pub fn validate_slug(slug: &str) -> Option<String> {
     if !chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
         return None;
     }
+    // v1.84.0: the wiki path validator refuses Windows device names (`con`,
+    // `aux`, `nul`, `com1`, …) on every platform; refuse them here so a
+    // proposed slug falls back to the hash slug instead of failing the write.
+    if duduclaw_memory::wiki_path::is_windows_device_name(slug) {
+        return None;
+    }
     Some(slug.to_string())
 }
 
@@ -1050,6 +1056,15 @@ mod tests {
         );
         assert_eq!(validate_slug("a").as_deref(), Some("a"));
         assert_eq!(validate_slug("9lives").as_deref(), Some("9lives"));
+        // v1.84.0: Windows device names fall back to the hash slug.
+        for device in ["con", "aux", "nul", "prn", "com1", "lpt9"] {
+            assert!(validate_slug(device).is_none(), "{device}");
+        }
+        assert_eq!(validate_slug("console").as_deref(), Some("console"));
+        assert_eq!(
+            resolve_slug(DocType::Charter, Some("aux"), "公司章程"),
+            fallback_slug(DocType::Charter, "公司章程")
+        );
     }
 
     #[test]

@@ -466,7 +466,7 @@ async fn push_dashboard_only(
         let who = crate::on_behalf_of::label::display_label(home_dir, p);
         text.push_str(&format!("\n由 {} 交辦", crate::goal_state::xml_escape(&who)));
     }
-    if let Some(url) = crate::deep_link::deep_link(
+    if let Some(url) = crate::deep_link::public_deep_link(
         home_dir,
         crate::deep_link::DeepLinkKind::Approval,
         rec.id.as_str(),
@@ -536,10 +536,10 @@ async fn push(home_dir: &Path, rec: &ApprovalRecord, reminder: bool) -> Option<(
         .as_deref()
         .map(|p| crate::on_behalf_of::label::display_label(home_dir, p));
     let body = approval_body_with(rec, reminder, assigner.as_deref());
-    // A clickable deep link to the unified inbox — `None` when no dashboard
-    // base URL is configured/derivable, in which case the rendered text stays
-    // exactly as it reads without this feature.
-    let link = crate::deep_link::deep_link(
+    // A clickable deep link to the unified inbox — `None` when no valid
+    // public dashboard address is configured (never a localhost link), in
+    // which case the rendered text stays exactly as it reads without it.
+    let link = crate::deep_link::public_deep_link(
         home_dir,
         crate::deep_link::DeepLinkKind::Approval,
         rec.id.as_str(),

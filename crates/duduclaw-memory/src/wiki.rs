@@ -326,6 +326,12 @@ const MAX_RECURSION_DEPTH: usize = 20;
 /// clamps its `depth` argument to the same value.
 pub const MAX_GRAPH_DEPTH: usize = 10;
 
+/// Hard cap on the matching pages a visibility-filtered search
+/// (`WikiStore::search_filtered_visible`) judges before it stops; reaching
+/// it is logged. Bounds the work of one scoped `wiki_search` on a very large
+/// wiki, far above any wiki a conversation's results could be crowded in.
+pub const MAX_VISIBLE_SEARCH_SCAN: usize = 50_000;
+
 // ---------------------------------------------------------------------------
 // WikiStore
 // ---------------------------------------------------------------------------
@@ -432,10 +438,16 @@ impl WikiStore {
     /// Read one exact file version for consumers that must bind parsed page
     /// content to its raw on-disk digest.
     pub fn read_page_with_raw(&self, path: &str) -> Result<(WikiPage, String)> {
-        self.validate_page_path(path)?;
+        let canonical = crate::wiki_path::canonical_page_argument(path)
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        let path = canonical.as_str();
+        self.validate_read_page_path(path)?;
+        let target = crate::wiki_path::resolve_wiki_page(&self.wiki_dir, path, false)
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        let path = target.id.as_str();
         // No-follow read: a page swapped for a symlink after the check is
         // refused instead of followed (check/read TOCTOU).
-        let content = crate::wiki_path::read_wiki_file_nofollow(&self.wiki_dir, path)
+        let content = crate::wiki_path::read_resolved_wiki_file_nofollow(&target)
             .map_err(|e| DuDuClawError::Memory(format!("read {path}: {e}")))?;
         let page = parse_wiki_page(path, &content)?;
         Ok((page, content))
@@ -444,28 +456,19 @@ impl WikiStore {
     /// Read one bounded version for customer exports. Missing frontmatter
     /// timestamps use the same file handle's mtime, never a moving `now()`.
     pub fn read_export_page(&self, path: &str, max_bytes: u64) -> Result<(WikiPage, String)> {
+        let canonical = crate::wiki_path::canonical_page_argument(path)
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        let path = canonical.as_str();
         use std::io::Read;
-        self.validate_page_path(path)?;
+        self.validate_read_page_path(path)?;
         let _lease = self.delivery_fence().try_shared()?;
-        let full = self.wiki_dir.join(path);
-        let metadata = std::fs::symlink_metadata(&full)
-            .map_err(|e| DuDuClawError::Memory(format!("export page metadata: {e}")))?;
-        if !metadata.is_file() || metadata.file_type().is_symlink() {
-            return Err(DuDuClawError::Memory("export page path refused".into()));
-        }
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)] {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-        }
-        let file = options.open(&full)
+        let target = crate::wiki_path::resolve_wiki_page(&self.wiki_dir, path, false)
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        let path = target.id.as_str();
+        let file = crate::wiki_path::open_resolved_wiki_file_nofollow(&target)
             .map_err(|e| DuDuClawError::Memory(format!("export page open: {e}")))?;
         let metadata = file.metadata()
             .map_err(|e| DuDuClawError::Memory(format!("export page metadata: {e}")))?;
-        if !metadata.is_file() {
-            return Err(DuDuClawError::Memory("export page path refused".into()));
-        }
         if metadata.len() > max_bytes {
             return Err(DuDuClawError::Memory("EXPORT_TOO_LARGE".into()));
         }
@@ -492,7 +495,7 @@ impl WikiStore {
     /// the wiki directory, and be a regular file opened without following a
     /// symlink.
     pub fn read_raw(&self, path: &str) -> Result<String> {
-        crate::wiki_path::validate_relative_wiki_path(path)
+        crate::wiki_path::validate_relative_wiki_read_path(path)
             .map_err(|e| DuDuClawError::Memory(format!("invalid page path: {e}")))?;
         if !path.ends_with(".md") {
             return Err(DuDuClawError::Memory("page path must end with .md".into()));
@@ -507,9 +510,8 @@ impl WikiStore {
         let mut pages = Vec::with_capacity(md_files.len());
 
         for rel in md_files {
-            let rel_str = rel.to_string_lossy().to_string();
-            let full = self.wiki_dir.join(&rel);
-            let content = match std::fs::read_to_string(&full) {
+            let rel_str = rel.to_string();
+            let content = match crate::wiki_path::read_wiki_file_nofollow(&self.wiki_dir, &rel) {
                 Ok(c) => c,
                 Err(_) => continue,
             };
@@ -566,10 +568,69 @@ impl WikiStore {
         }
         let _fence = self.delivery_fence().exclusive_for_write()?;
         crate::isolation_io::verify()?;
+        self.write_page_under_fence(path, content).map(|_| ())
+    }
+
+    /// [`Self::write_page`], returning the exact content written to disk
+    /// (after credential masking). v1.84.0: the auto-page registry
+    /// (`crate::wiki_auto_registry`) records the digest of these bytes, never
+    /// of a re-read, so a file swapped in after the write is not recorded.
+    pub fn write_page_returning(&self, path: &str, content: &str) -> Result<String> {
+        if content.len() > MAX_PAGE_SIZE {
+            return Err(DuDuClawError::Memory(format!(
+                "page too large: {} bytes (max {})",
+                content.len(),
+                MAX_PAGE_SIZE
+            )));
+        }
+        let _fence = self.delivery_fence().exclusive_for_write()?;
+        crate::isolation_io::verify()?;
         self.write_page_under_fence(path, content)
     }
 
-    fn write_page_under_fence(&self, path: &str, content: &str) -> Result<()> {
+    /// v1.84.0: the auto-page write lock (`<home>/locks/wiki-auto/<id>.lock`)
+    /// for a rewrite of `path`, when this is an employee wiki and `path` an
+    /// auto page; `None` otherwise. Taken before the delivery fence, the
+    /// same order as the gateway's auto writer. Fail closed: a lock that
+    /// cannot be taken stops the rewrite.
+    pub fn auto_page_lock(&self, path: &str) -> Result<Option<duduclaw_core::fs_lock::FileLockGuard>> {
+        if self.shared || !crate::wiki_auto_registry::is_auto_rel(path) {
+            return Ok(None);
+        }
+        let Some((home, agent)) = crate::wiki_auto_registry::owner_of_wiki(&self.wiki_dir) else {
+            return Ok(None);
+        };
+        crate::wiki_auto_registry::lock_auto_pages(&home, &agent)
+            .map(Some)
+            .map_err(|e| DuDuClawError::Memory(format!("auto page lock unavailable: {e}")))
+    }
+
+    /// v1.84.0: after a maintenance rewrite of `path` from `old_raw` to
+    /// `written`, move its auto-page registry entry when the entry matched
+    /// `old_raw` (`wiki_auto_registry::rerecord_if_current`). Best effort: a
+    /// failure leaves the page hidden from conversations (fail closed).
+    pub(crate) fn rerecord_auto_page(&self, path: &str, old_raw: &str, written: &str) {
+        if self.shared {
+            return;
+        }
+        if let Err(e) = crate::wiki_auto_registry::rerecord_in_wiki(&self.wiki_dir, path, old_raw, written) {
+            warn!(page = path, "auto page registry not updated after rewrite: {e}");
+        }
+    }
+
+    /// v1.84.0: drop the auto-page registry entry of a page that left the
+    /// live tree (deleted or archived). Best effort; a stale entry only
+    /// matches the exact bytes the gateway wrote at that path.
+    fn forget_auto_page(&self, path: &str) {
+        if self.shared {
+            return;
+        }
+        if let Err(e) = crate::wiki_auto_registry::forget_in_wiki(&self.wiki_dir, path) {
+            warn!(page = path, "auto page registry entry not dropped: {e}");
+        }
+    }
+
+    fn write_page_under_fence(&self, path: &str, content: &str) -> Result<String> {
         if duduclaw_security::credential_detect::mask(path) != path {
             return Err(DuDuClawError::Memory("credentials are not accepted in wiki paths".into()));
         }
@@ -590,8 +651,10 @@ impl WikiStore {
 
         // Validate and confine before creating any directory, then write
         // through an O_EXCL temp file (never through a planted link).
-        let full = crate::wiki_path::prepare_wiki_write_target(&self.wiki_dir, path)
+        let target = crate::wiki_path::prepare_wiki_write_page(&self.wiki_dir, path)
             .map_err(|e| DuDuClawError::Memory(format!("page path refused: {e}")))?;
+        let full = &target.full_path;
+        let path = target.id.as_str();
 
         let is_new = std::fs::symlink_metadata(&full).is_err();
 
@@ -632,7 +695,7 @@ impl WikiStore {
         self.fts_sync_upsert(path, content);
 
         info!(page = path, action, "Wiki page written");
-        Ok(())
+        Ok(masked_content)
     }
 
     /// Move a quarantined page into `_archive/<original_path>`.
@@ -647,9 +710,12 @@ impl WikiStore {
     /// pages outside the wiki tree (review H4).
     pub fn archive_page(&self, path: &str) -> Result<bool> {
         self.validate_page_path(path)?;
+        let target = crate::wiki_path::resolve_wiki_page(&self.wiki_dir, path, true)
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        let path = target.id.as_str();
         let _fence = self.delivery_fence().exclusive_for_write()?;
         crate::isolation_io::verify()?;
-        let src = self.wiki_dir.join(path);
+        let src = target.full_path.clone();
         if !src.exists() {
             return Ok(false);
         }
@@ -691,6 +757,9 @@ impl WikiStore {
             warn!("Failed to log archive {path}: {e}");
         }
         self.fts_sync_remove(path);
+        // v1.84.0: an archived auto page is no longer recorded; restored, it
+        // needs re-confirmation before a conversation sees it again.
+        self.forget_auto_page(path);
 
         info!(page = path, "Wiki page archived");
         Ok(true)
@@ -753,22 +822,33 @@ impl WikiStore {
         new_do_not_inject: bool,
     ) -> Result<()> {
         self.validate_page_path(path)?;
+        let target = crate::wiki_path::resolve_wiki_page(&self.wiki_dir, path, false)
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        let path = target.id.as_str();
+        // v1.84.0: an auto page is rewritten under the auto-page lock and its
+        // registry entry follows the rewrite (only when it matched `raw`).
+        let _auto_lock = self.auto_page_lock(path)?;
         let _fence = self.delivery_fence().exclusive_for_write()?;
         crate::isolation_io::verify()?;
-        let mut page = self.read_page(path)?;
+        let (mut page, raw) = self.read_page_with_raw(path)?;
         page.trust = new_trust;
         page.do_not_inject = new_do_not_inject;
         page.updated = Utc::now();
-        let content = serialize_page(&page);
-        self.write_page_under_fence(path, &content)
+        let content = carry_host_owned_lines(&raw, &serialize_page(&page));
+        let written = self.write_page_under_fence(path, &content)?;
+        self.rerecord_auto_page(path, &raw, &written);
+        Ok(())
     }
 
     /// Delete a page from disk.
     pub fn delete_page(&self, path: &str) -> Result<()> {
         self.validate_page_path(path)?;
+        let target = crate::wiki_path::resolve_wiki_page(&self.wiki_dir, path, true)
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        let path = target.id.as_str();
         let _fence = self.delivery_fence().exclusive_for_write()?;
         crate::isolation_io::verify()?;
-        let full = self.wiki_dir.join(path);
+        let full = target.full_path.clone();
         if full.exists() {
             crate::isolation_io::verify()?;
             std::fs::remove_file(&full)
@@ -781,6 +861,7 @@ impl WikiStore {
             }
             // Best-effort FTS sync
             self.fts_sync_remove(path);
+            self.forget_auto_page(path);
             info!(page = path, "Wiki page deleted");
         }
         Ok(())
@@ -792,9 +873,12 @@ impl WikiStore {
     /// source, P2-B L-2).
     pub fn delete_page_checked(&self, path: &str) -> Result<()> {
         self.validate_page_path(path)?;
+        let target = crate::wiki_path::resolve_wiki_page(&self.wiki_dir, path, true)
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        let path = target.id.as_str();
         let _fence = self.delivery_fence().exclusive_for_write()?;
         crate::isolation_io::verify()?;
-        let full = self.wiki_dir.join(path);
+        let full = target.full_path.clone();
         let existed = full.exists();
         if existed {
             crate::isolation_io::verify()?;
@@ -802,7 +886,7 @@ impl WikiStore {
                 .map_err(|e| DuDuClawError::Memory(format!("delete {path}: {e}")))?;
         }
         let indexed = match crate::wiki_path::read_wiki_file_nofollow(&self.wiki_dir, "_index.md") {
-            Ok(t) => t.contains(&format!("]({path})")),
+            Ok(t) => t.lines().any(|line| crate::wiki_path::index_line_links_to(line, path)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
             Err(e) => {
                 return Err(DuDuClawError::Memory(format!("read index for {path}: {e}")));
@@ -814,6 +898,7 @@ impl WikiStore {
             })?;
         }
         self.fts_sync_remove(path);
+        self.forget_auto_page(path);
         if existed {
             if let Err(e) = self.append_log("delete", path) {
                 warn!("Failed to log delete {path}: {e}");
@@ -832,6 +917,20 @@ impl WikiStore {
     /// otherwise falls back to the frontmatter snapshot.
     /// Pages whose live state has `do_not_inject = true` are silently dropped.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
+        self.search_matching(query, limit, None)
+    }
+
+    /// [`search`](Self::search); with `visible`, a matching page is a hit only
+    /// when `visible(rel_path, raw_content)` holds — judged BEFORE the ranking
+    /// cut-off, so pages the caller may not return never take a slot of
+    /// `limit`. At most [`MAX_VISIBLE_SEARCH_SCAN`] matching pages are judged;
+    /// reaching the cap is logged and ends the scan.
+    fn search_matching(
+        &self,
+        query: &str,
+        limit: usize,
+        visible: Option<&dyn Fn(&str, &str) -> bool>,
+    ) -> Result<Vec<SearchHit>> {
         let terms: Vec<String> = query.split_whitespace().map(|t| t.to_lowercase()).collect();
         if terms.is_empty() {
             return Ok(Vec::new());
@@ -849,7 +948,7 @@ impl WikiStore {
                 (Some(aid), Some(s)) => {
                     let all_paths: Vec<String> = md_files
                         .iter()
-                        .map(|p| p.to_string_lossy().to_string())
+                        .map(|p| p.to_string())
                         .collect();
                     s.get_many(aid, &all_paths).ok()
                 }
@@ -857,9 +956,9 @@ impl WikiStore {
             }
         };
 
+        let mut judged = 0usize;
         for rel in &md_files {
-            let full = self.wiki_dir.join(rel);
-            let content = match std::fs::read_to_string(&full) {
+            let content = match crate::wiki_path::read_wiki_file_nofollow(&self.wiki_dir, rel) {
                 Ok(c) => c,
                 Err(_) => continue,
             };
@@ -869,9 +968,23 @@ impl WikiStore {
                 continue;
             }
 
+            let rel_str = rel.to_string();
+            if let Some(visible) = visible {
+                if judged >= MAX_VISIBLE_SEARCH_SCAN {
+                    warn!(
+                        wiki = %self.wiki_dir.display(),
+                        cap = MAX_VISIBLE_SEARCH_SCAN,
+                        "visibility-filtered wiki search hit its scan cap; later pages not searched"
+                    );
+                    break;
+                }
+                judged += 1;
+                if !visible(&rel_str, &content) {
+                    continue;
+                }
+            }
             let title = extract_title(&content)
-                .unwrap_or_else(|| rel.to_string_lossy().to_string());
-            let rel_str = rel.to_string_lossy().to_string();
+                .unwrap_or_else(|| rel.to_string());
             let frontmatter_trust = extract_field(&content, "trust")
                 .and_then(|v| v.parse::<f32>().ok())
                 .unwrap_or(default_trust());
@@ -983,7 +1096,36 @@ impl WikiStore {
         layer_filter: Option<WikiLayer>,
         expand: bool,
     ) -> Result<Vec<SearchHit>> {
-        let mut hits = self.search(query, limit * 2)?; // over-fetch for filtering
+        self.search_filtered_inner(query, limit, min_trust, layer_filter, expand, None)
+    }
+
+    /// [`search_filtered`](Self::search_filtered) returning only pages for
+    /// which `visible(rel_path, raw_content)` holds (v1.84.0). The predicate
+    /// runs inside the scan, before the ranking cut-off, for direct hits and
+    /// expanded neighbours alike, so `limit` counts visible pages only and
+    /// any number of better-ranked invisible pages cannot crowd them out.
+    pub fn search_filtered_visible(
+        &self,
+        query: &str,
+        limit: usize,
+        min_trust: Option<f32>,
+        layer_filter: Option<WikiLayer>,
+        expand: bool,
+        visible: &dyn Fn(&str, &str) -> bool,
+    ) -> Result<Vec<SearchHit>> {
+        self.search_filtered_inner(query, limit, min_trust, layer_filter, expand, Some(visible))
+    }
+
+    fn search_filtered_inner(
+        &self,
+        query: &str,
+        limit: usize,
+        min_trust: Option<f32>,
+        layer_filter: Option<WikiLayer>,
+        expand: bool,
+        visible: Option<&dyn Fn(&str, &str) -> bool>,
+    ) -> Result<Vec<SearchHit>> {
+        let mut hits = self.search_matching(query, limit * 2, visible)?; // over-fetch for filtering
 
         // Apply filters
         if let Some(mt) = min_trust {
@@ -1003,6 +1145,7 @@ impl WikiStore {
                 // Outbound: read the page's `related` field
                 if let Some(content) = self.read_linked_page(&hit.path) {
                     for rel in extract_string_list(&content, "related") {
+                        let Some(rel) = crate::wiki_path::canonical_page_id(&rel) else { continue; };
                         if !direct_paths.contains(&rel) {
                             expanded_paths.insert(rel);
                         }
@@ -1023,10 +1166,21 @@ impl WikiStore {
                 // `related` entries are page content, i.e. caller-supplied:
                 // `related: [../../secret.md]` must not pull an outside file
                 // into the search results.
-                let content = match self.read_linked_page(&exp_path) {
-                    Some(c) => c,
-                    None => continue,
+                let Ok(target) = crate::wiki_path::resolve_wiki_page(&self.wiki_dir, &exp_path, false) else { continue; };
+                // A textual auto alias pointing outwards still requires the
+                // auto gate. No registry identity under auto/ exists for that
+                // target, so filtered expansion conservatively omits it.
+                if visible.is_some() && target.is_auto && !crate::wiki_auto_registry::is_auto_rel(&target.id) {
+                    continue;
+                }
+                let content = match crate::wiki_path::read_resolved_wiki_file_nofollow(&target) {
+                    Ok(content) => content,
+                    Err(_) => continue,
                 };
+                if visible.is_some_and(|v| !v(&target.id, &content)) {
+                    continue;
+                }
+                let exp_path = target.id;
                 let title = extract_title(&content).unwrap_or_else(|| exp_path.clone());
                 let trust = extract_field(&content, "trust")
                     .and_then(|v| v.parse::<f32>().ok())
@@ -1244,7 +1398,7 @@ impl WikiStore {
                 let start = line.find("](")?;
                 let rest = &line[start + 2..];
                 let end = rest.find(')')?;
-                Some(rest[..end].to_string())
+                crate::wiki_path::persisted_page_id(&rest[..end])
             })
             .collect();
 
@@ -1267,6 +1421,7 @@ impl WikiStore {
             if let Ok(content) = std::fs::read_to_string(&full) {
                 let related = extract_string_list(&content, "related");
                 for r in related {
+                    let r = crate::wiki_path::persisted_page_id(&r).unwrap_or(r);
                     if !page_paths.contains(&r) {
                         all_references.push((page.path.clone(), r));
                     }
@@ -1317,12 +1472,14 @@ impl WikiStore {
             if let Ok(content) = std::fs::read_to_string(&full) {
                 let related = extract_string_list(&content, "related");
                 for r in related {
+                    let r = crate::wiki_path::persisted_page_id(&r).unwrap_or(r);
                     if let Some(count) = inbound.get_mut(&r) {
                         *count += 1;
                     }
                 }
                 // Also scan body for markdown links to wiki pages
                 for link in extract_body_links(&content) {
+                    let link = crate::wiki_path::persisted_page_id(&link).unwrap_or(link);
                     if let Some(count) = inbound.get_mut(&link) {
                         *count += 1;
                     }
@@ -1350,8 +1507,7 @@ impl WikiStore {
         let mut backlinks: HashMap<String, Vec<String>> = HashMap::new();
 
         for page in &pages {
-            let full = self.wiki_dir.join(&page.path);
-            let content = match std::fs::read_to_string(&full) {
+            let content = match crate::wiki_path::read_wiki_file_nofollow(&self.wiki_dir, &page.path) {
                 Ok(c) => c,
                 Err(_) => continue,
             };
@@ -1361,6 +1517,9 @@ impl WikiStore {
             let body_links = extract_body_links(&content);
 
             for target in related.into_iter().chain(body_links) {
+                let Some(target) = crate::wiki_path::canonical_page_id(&target) else { continue; };
+                let Ok(resolved) = crate::wiki_path::resolve_wiki_page(&self.wiki_dir, &target, false) else { continue; };
+                let target = resolved.id;
                 if page_paths.contains(&target) && target != page.path {
                     backlinks
                         .entry(target)
@@ -1506,7 +1665,7 @@ impl WikiStore {
                 (Some(aid), Some(s)) => {
                     let all_paths: Vec<String> = md_files
                         .iter()
-                        .map(|p| p.to_string_lossy().to_string())
+                        .map(|p| p.to_string())
                         .collect();
                     s.get_many(aid, &all_paths).ok()
                 }
@@ -1515,8 +1674,7 @@ impl WikiStore {
         };
 
         for rel in &md_files {
-            let full = self.wiki_dir.join(rel);
-            let content = match std::fs::read_to_string(&full) {
+            let content = match crate::wiki_path::read_wiki_file_nofollow(&self.wiki_dir, rel) {
                 Ok(c) => c,
                 Err(_) => continue,
             };
@@ -1526,7 +1684,7 @@ impl WikiStore {
             let frontmatter_no_inject = extract_field(&content, "do_not_inject")
                 .map(|v| matches!(v.trim().to_lowercase().as_str(), "true" | "1" | "yes"))
                 .unwrap_or(false);
-            let rel_str = rel.to_string_lossy().to_string();
+            let rel_str = rel.to_string();
             let live_no_inject = live_state
                 .as_ref()
                 .and_then(|m| m.get(&rel_str))
@@ -1629,17 +1787,32 @@ impl WikiStore {
     /// search hit). Same rules as a caller-supplied path: shared validator,
     /// `.md` only, inside the wiki, no symlink. `None` on any refusal.
     fn read_linked_page(&self, rel: &str) -> Option<String> {
-        if crate::wiki_path::validate_relative_wiki_path(rel).is_err() || !rel.ends_with(".md") {
+        let canonical = crate::wiki_path::canonical_page_argument(rel).ok()?;
+        let rel = canonical.as_str();
+        if crate::wiki_path::validate_relative_wiki_read_path(rel).is_err() || !rel.ends_with(".md") {
             return None;
         }
         crate::wiki_path::read_wiki_file_nofollow(&self.wiki_dir, rel).ok()
     }
 
+    pub(crate) fn validate_read_page_path(&self, path: &str) -> Result<()> {
+        self.validate_page_path_mode(path, true)
+    }
+
     pub(crate) fn validate_page_path(&self, path: &str) -> Result<()> {
+        self.validate_page_path_mode(path, false)
+    }
+
+    fn validate_page_path_mode(&self, path: &str, read: bool) -> Result<()> {
         // String-level checks shared with every MCP wiki tool: relative only,
         // no NUL / `..` / encoded separators / drive prefix / Prefix, RootDir
         // or ParentDir component.
-        crate::wiki_path::validate_relative_wiki_path(path)
+        let validate = if read {
+            crate::wiki_path::validate_relative_wiki_read_path
+        } else {
+            crate::wiki_path::validate_relative_wiki_path
+        };
+        validate(path)
             .map_err(|e| DuDuClawError::Memory(format!("invalid page path: {e}")))?;
         if !path.ends_with(".md") {
             return Err(DuDuClawError::Memory("page path must end with .md".into()));
@@ -1669,6 +1842,9 @@ impl WikiStore {
     fn update_index_checked(
         &self, page_path: &str, title: &str, verify: impl Fn() -> std::result::Result<(), String>,
     ) -> std::result::Result<(), String> {
+        let canonical = crate::wiki_path::canonical_page_id(page_path)
+            .ok_or_else(|| "Invalid wiki page id".to_string())?;
+        let page_path = canonical.as_str();
         let index_path = self.wiki_dir.join("_index.md");
 
         // Use flock for atomicity across concurrent callers
@@ -1689,12 +1865,11 @@ impl WikiStore {
         // Escape title chars that break markdown link syntax
         let safe_title = title.replace('[', "\\[").replace(']', "\\]");
         let entry = format!("- [{}]({}) — updated {}", safe_title, page_path, now);
-        let link_pattern = format!("]({})", page_path);
 
         let mut lines: Vec<String> = existing.lines().map(String::from).collect();
         let mut found = false;
         for line in &mut lines {
-            if line.contains(&link_pattern) {
+            if crate::wiki_path::index_line_links_to(line, page_path) {
                 *line = entry.clone();
                 found = true;
                 break;
@@ -1716,6 +1891,9 @@ impl WikiStore {
     }
 
     fn remove_from_index(&self, page_path: &str) -> std::result::Result<(), String> {
+        let canonical = crate::wiki_path::canonical_page_id(page_path)
+            .ok_or_else(|| "Invalid wiki page id".to_string())?;
+        let page_path = canonical.as_str();
         let index_path = self.wiki_dir.join("_index.md");
 
         let lock_path = self.wiki_dir.join("_index.lock");
@@ -1730,11 +1908,10 @@ impl WikiStore {
 
         crate::isolation_io::verify().map_err(|e| e.to_string())?;
         let existing = self.read_index_nofollow()?;
-        let link_pattern = format!("]({})", page_path);
 
         let lines: Vec<&str> = existing
             .lines()
-            .filter(|line| !line.contains(&link_pattern))
+            .filter(|line| !crate::wiki_path::index_line_links_to(line, page_path))
             .collect();
 
         let content = lines.join("\n") + "\n";
@@ -1767,6 +1944,9 @@ impl WikiStore {
         &self, action: &str, page_path: &str, author: Option<&str>,
         verify: impl Fn() -> std::result::Result<(), String>,
     ) -> std::result::Result<(), String> {
+        let canonical = crate::wiki_path::canonical_page_id(page_path)
+            .ok_or_else(|| "Invalid wiki page id".to_string())?;
+        let page_path = canonical.as_str();
         let log_path = self.wiki_dir.join("_log.md");
         let now = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
         let entry = match author {
@@ -1835,8 +2015,10 @@ impl WikiStore {
         // Validate and confine before creating any directory, then write
         // through an O_EXCL temp file (never through a planted link).
         verify()?;
-        let full = crate::wiki_path::prepare_wiki_write_target(&self.wiki_dir, path)
+        let target = crate::wiki_path::prepare_wiki_write_page(&self.wiki_dir, path)
             .map_err(|e| DuDuClawError::Memory(format!("page path refused: {e}")))?;
+        let full = &target.full_path;
+        let path = target.id.as_str();
 
         let is_new = std::fs::symlink_metadata(&full).is_err();
 
@@ -1880,6 +2062,9 @@ impl WikiStore {
 
 /// Parse a wiki page from raw content.
 pub fn parse_wiki_page(path: &str, content: &str) -> Result<WikiPage> {
+    let canonical = crate::wiki_path::canonical_page_id(path)
+        .ok_or_else(|| DuDuClawError::Memory("Invalid wiki page id".into()))?;
+    let path = canonical.as_str();
     let title = extract_title(content).unwrap_or_else(|| path.to_string());
     let created = extract_datetime_field(content, "created").unwrap_or_else(Utc::now);
     let updated = extract_datetime_field(content, "updated").unwrap_or_else(Utc::now);
@@ -1930,6 +2115,49 @@ pub fn parse_wiki_page(path: &str, content: &str) -> Result<WikiPage> {
         do_not_inject,
         body,
     })
+}
+
+/// Frontmatter keys the host owns (`duduclaw_gateway::wiki_host_sources`:
+/// `host_sources`, `host_promoted`). `WikiPage` has no field for them, so a
+/// `serialize_page` round-trip drops them.
+const HOST_OWNED_KEYS: [&str; 2] = ["host_sources", "host_promoted"];
+
+/// v1.84.0: `new_content` (a [`serialize_page`] rewrite of the page whose raw
+/// file was `old_raw`) with the host-owned frontmatter lines of `old_raw`
+/// carried over. For host maintenance rewrites (trust sync, the janitor's
+/// correction note), which must not strip the provenance that decides which
+/// conversation may see an auto page. Unchanged when `old_raw` has none.
+pub(crate) fn carry_host_owned_lines(old_raw: &str, new_content: &str) -> String {
+    let is_host = |l: &str| {
+        HOST_OWNED_KEYS
+            .iter()
+            .any(|k| l.strip_prefix(k).is_some_and(|r| r.trim_start().starts_with(':')))
+    };
+    // (start, end) of the frontmatter block: after the opening `---` line,
+    // up to the `\n---` that closes it.
+    let block = |c: &str| -> Option<(usize, usize)> {
+        let start = if c.starts_with("---\n") {
+            4
+        } else if c.starts_with("---\r\n") {
+            5
+        } else {
+            return None;
+        };
+        c[start..].find("\n---").map(|end| (start, start + end))
+    };
+    let Some((old_start, old_end)) = block(old_raw) else {
+        return new_content.to_string();
+    };
+    let carried: Vec<&str> = old_raw[old_start..old_end].lines().filter(|l| is_host(l)).collect();
+    if carried.is_empty() {
+        return new_content.to_string();
+    }
+    let Some((start, end)) = block(new_content) else {
+        return new_content.to_string();
+    };
+    let mut lines: Vec<&str> = new_content[start..end].lines().filter(|l| !is_host(l)).collect();
+    lines.extend(carried);
+    format!("---\n{}{}", lines.join("\n"), &new_content[end..])
 }
 
 /// Re-serialise a `WikiPage` back to markdown — preserves all frontmatter
@@ -2080,11 +2308,14 @@ fn yaml_quoted_list(items: &[String]) -> String {
 /// - `concepts/*` or `entities/*` with trust ≥ 0.7 → `VerifiedFact`
 /// - everything else → `Unknown`
 pub fn derive_source_type(path: &str, trust: f32) -> SourceType {
-    let normalised = path.trim_start_matches('/');
-    if normalised.starts_with("sources/") {
+    let Some(parts) = duduclaw_core::wiki_auto_namespace::page_id_components(path) else {
+        return SourceType::Unknown;
+    };
+    if parts.len() < 2 { return SourceType::Unknown; }
+    let namespace = duduclaw_core::wiki_auto_namespace::fold_segment(parts[0]);
+    if namespace == "sources" {
         SourceType::RawDialogue
-    } else if (normalised.starts_with("concepts/") || normalised.starts_with("entities/"))
-        && trust >= 0.7
+    } else if matches!(namespace.as_str(), "concepts" | "entities") && trust >= 0.7
     {
         SourceType::VerifiedFact
     } else {
@@ -2323,11 +2554,11 @@ fn fs_lock(file: &std::fs::File) -> std::io::Result<()> {
 
 /// Collect all `.md` files recursively under `dir`, relative to `base`.
 /// Skips reserved files. Respects depth limit and does not follow symlinks.
-fn collect_md_files_recursive(base: &Path, dir: &Path) -> Vec<PathBuf> {
+fn collect_md_files_recursive(base: &Path, dir: &Path) -> Vec<String> {
     collect_md_files_inner(base, dir, 0)
 }
 
-fn collect_md_files_inner(base: &Path, dir: &Path, depth: usize) -> Vec<PathBuf> {
+fn collect_md_files_inner(base: &Path, dir: &Path, depth: usize) -> Vec<String> {
     if depth > MAX_RECURSION_DEPTH {
         warn!(dir = %dir.display(), depth, "Wiki directory scan exceeded max depth, skipping");
         return Vec::new();
@@ -2344,6 +2575,8 @@ fn collect_md_files_inner(base: &Path, dir: &Path, depth: usize) -> Vec<PathBuf>
             Err(_) => continue,
         };
         let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else { continue; };
+        if crate::wiki_path::is_link_metadata(&meta) { continue; }
         if ftype.is_dir() {
             // Phase 3 archive directory: skip — pages here are quarantined,
             // RAG and listings should not surface them (review M6).
@@ -2358,21 +2591,9 @@ fn collect_md_files_inner(base: &Path, dir: &Path, depth: usize) -> Vec<PathBuf>
             let fname = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
             if !RESERVED_FILES.contains(&fname)
                 && let Ok(rel) = path.strip_prefix(base) {
-                    // Normalize to a forward-slash relative id. Windows `read_dir`
-                    // yields `\` components, but wiki page identifiers are
-                    // `/`-delimited and must be stable across platforms (page ids
-                    // flow into search, citations, backlinks, and mermaid export).
-                    // `/`-form paths still join correctly on Windows for fs reads.
-                    let id: PathBuf = rel
-                        .components()
-                        .filter_map(|c| match c {
-                            std::path::Component::Normal(s) => s.to_str(),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("/")
-                        .into();
-                    result.push(id);
+                    if let Some(id) = crate::wiki_path::page_id_from_relative_path(rel) {
+                        result.push(id);
+                    }
                 }
         }
         // Symlinks are silently skipped (neither is_dir nor is_file on DirEntry::file_type)
@@ -2473,10 +2694,16 @@ impl WikiFts {
 
     /// Insert or update a page in the FTS index.
     pub fn upsert(&self, path: &str, title: &str, body: &str, tags: &[String], layer: WikiLayer, trust: f32) -> Result<()> {
-        self.checked_transaction(|conn| Self::upsert_rows(conn, path, title, body, tags, layer, trust))
+        self.checked_transaction(|conn| {
+            Self::remove_alias_rows(conn, path)?;
+            Self::upsert_rows(conn, path, title, body, tags, layer, trust)
+        })
     }
 
     fn upsert_rows(conn: &rusqlite::Connection, path: &str, title: &str, body: &str, tags: &[String], layer: WikiLayer, trust: f32) -> Result<()> {
+        let path = crate::wiki_path::persisted_page_id(path)
+            .ok_or_else(|| DuDuClawError::Memory("ambiguous FTS page id".into()))?;
+        let path = path.as_str();
         crate::isolation_io::verify()?;
         let tags_str = tags.join(", ");
         let layer_str = layer.to_string();
@@ -2502,20 +2729,36 @@ impl WikiFts {
         Ok(())
     }
 
-    /// Remove a page from the FTS index.
-    pub fn remove(&self, path: &str) -> Result<()> {
-        self.checked_transaction(|conn| {
-        conn.execute(
-            "DELETE FROM wiki_fts WHERE path = ?1",
-            rusqlite::params![path],
-        ).map_err(|e| DuDuClawError::Memory(format!("fts delete: {e}")))?;
-        crate::isolation_io::verify()?;
-        conn.execute(
-            "DELETE FROM wiki_meta WHERE path = ?1",
-            rusqlite::params![path],
-        ).map_err(|e| DuDuClawError::Memory(format!("meta delete: {e}")))?;
+    /// Delete every persisted spelling of an id, including pre-upgrade Windows
+    /// rows. Do this inside the caller's transaction before inserting a new row.
+    fn remove_alias_rows(conn: &rusqlite::Connection, path: &str) -> Result<()> {
+        let key = crate::wiki_path::persisted_page_id(path)
+            .ok_or_else(|| DuDuClawError::Memory("ambiguous FTS page id".into()))?;
+        for table in ["wiki_fts", "wiki_meta"] {
+            let mut stmt = conn.prepare(&format!("SELECT rowid, path FROM {table}"))
+                .map_err(|e| DuDuClawError::Memory(format!("fts aliases: {e}")))?;
+            let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+                .map_err(|e| DuDuClawError::Memory(format!("fts aliases: {e}")))?;
+            let mut ids = Vec::new();
+            for row in rows {
+                let (id, stored) = row.map_err(|e| DuDuClawError::Memory(format!("fts alias: {e}")))?;
+                if crate::wiki_path::persisted_page_id(&stored).as_ref() == Some(&key) {
+                    ids.push(id);
+                }
+            }
+            drop(stmt);
+            for id in ids {
+                crate::isolation_io::verify()?;
+                conn.execute(&format!("DELETE FROM {table} WHERE rowid = ?1"), [id])
+                    .map_err(|e| DuDuClawError::Memory(format!("fts delete: {e}")))?;
+            }
+        }
         Ok(())
-        })
+    }
+
+    /// Remove a page from the FTS index, whatever spelling an old writer used.
+    pub fn remove(&self, path: &str) -> Result<()> {
+        self.checked_transaction(|conn| Self::remove_alias_rows(conn, path))
     }
 
     /// Full-text search using FTS5. Returns (path, title, rank, trust, layer) tuples.
@@ -2538,7 +2781,9 @@ impl WikiFts {
         let hits: Vec<SearchHit> = stmt.query_map(
             rusqlite::params![&safe_query, limit as i64],
             |row| {
-                let path: String = row.get(0)?;
+                let stored: String = row.get(0)?;
+                let path = crate::wiki_path::persisted_page_id(&stored)
+                    .ok_or(rusqlite::Error::InvalidQuery)?;
                 let title: String = row.get(1)?;
                 let fts_rank: f64 = row.get(2)?;
                 let trust: f32 = row.get(3)?;
@@ -2589,7 +2834,7 @@ impl WikiFts {
                 Ok(c) => c,
                 Err(_) => continue,
             };
-            let rel_str = rel.to_string_lossy().to_string();
+            let rel_str = rel.to_string();
             let title = extract_title(&content).unwrap_or_else(|| rel_str.clone());
             let body = extract_body(&content);
             let tags = extract_string_list(&content, "tags");
@@ -2765,14 +3010,16 @@ impl WikiStore {
         // Build adjacency list
         let mut edges: Vec<(String, String)> = Vec::new();
         for page in &pages {
-            let full = self.wiki_dir.join(&page.path);
-            let content = match std::fs::read_to_string(&full) {
+            let content = match crate::wiki_path::read_wiki_file_nofollow(&self.wiki_dir, &page.path) {
                 Ok(c) => c,
                 Err(_) => continue,
             };
             let related = extract_string_list(&content, "related");
             let body_links = extract_body_links(&content);
             for target in related.into_iter().chain(body_links) {
+                let Some(target) = crate::wiki_path::persisted_page_id(&target) else { continue; };
+                let Ok(resolved) = crate::wiki_path::resolve_wiki_page(&self.wiki_dir, &target, false) else { continue; };
+                let target = resolved.id;
                 if page_set.contains(&target) && target != page.path {
                     edges.push((page.path.clone(), target));
                 }
@@ -2875,6 +3122,114 @@ impl WikiStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fts_reads_and_removes_legacy_windows_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fts = WikiFts::open(tmp.path()).unwrap();
+        // Bypass upsert: reproduce bytes persisted by an older Windows writer.
+        for path in [r"auto\sop\x.md", r"auto/sop\x.md"] {
+            fts.conn.execute("INSERT INTO wiki_fts(path,title,body,tags,layer,trust) VALUES (?1,'legacy','separatorneedle','','context',0.3)", [path]).unwrap();
+            fts.conn.execute("INSERT INTO wiki_meta(path,title,layer,trust,updated) VALUES (?1,'legacy','context',0.3,'old')", [path]).unwrap();
+        }
+        let hits = fts.search("separatorneedle", 10).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().all(|h| h.path == "auto/sop/x.md"));
+        std::fs::create_dir_all(tmp.path().join("auto/sop")).unwrap();
+        std::fs::write(tmp.path().join("auto/sop/x.md"), "legacy file content").unwrap();
+        for hit in &hits {
+            assert_eq!(crate::wiki_path::read_wiki_file_nofollow(tmp.path(), &hit.path).unwrap(), "legacy file content");
+        }
+        fts.upsert("auto/sop/x.md", "current", "separatorneedle", &[], WikiLayer::Context, 0.3).unwrap();
+        assert_eq!(fts.search("separatorneedle", 10).unwrap().len(), 1);
+        fts.remove(r".\auto\sop\x.md").unwrap();
+        assert!(fts.search("separatorneedle", 10).unwrap().is_empty());
+        assert_eq!(fts.conn.query_row("SELECT count(*) FROM wiki_meta", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn filesystem_ids_and_backlinks_use_one_portable_form() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WikiStore::new(tmp.path().to_path_buf());
+        store.ensure_scaffold().unwrap();
+        store.write_page("auto/sop/x.md", "---\ntitle: X\n---\n\nseparatorneedle").unwrap();
+        store.write_page("concepts/link.md", "---\ntitle: Link\n---\n\n[x](auto\\sop\\x.md)").unwrap();
+        assert!(store.list_pages().unwrap().iter().any(|p| p.path == "auto/sop/x.md"));
+        assert_eq!(store.read_page(r"auto\sop\x.md").unwrap().path, "auto/sop/x.md");
+        assert_eq!(store.build_backlink_index().unwrap()["auto/sop/x.md"], vec!["concepts/link.md"]);
+        assert!(store.search("separatorneedle", 10).unwrap().iter().all(|p| !p.path.contains('\\')));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_unix_colon_and_tilde_pages_are_readable_but_new_writes_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WikiStore::new(tmp.path().to_path_buf());
+        store.ensure_scaffold().unwrap();
+        let content = "---\ntitle: Legacy\ntrust: 0.8\n---\n\nspecialnameneedle\n";
+        let paths = ["notes/會議 10:30.md", "entities/~draft.md"];
+        for path in paths {
+            let full = tmp.path().join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, content).unwrap();
+            assert!(!duduclaw_core::wiki_auto_namespace::is_auto_page_path(path));
+            assert_eq!(store.read_raw(path).unwrap(), content);
+            assert_eq!(store.read_page(path).unwrap().path, path);
+            assert!(store.list_pages().unwrap().iter().any(|page| page.path == path));
+            assert!(store.search("specialnameneedle", 10).unwrap().iter().any(|hit| hit.path == path));
+        }
+        store.write_page("concepts/link.md", "---\ntitle: Link\n---\n\n[colon](notes/會議 10:30.md)\n[tilde](entities/~draft.md)").unwrap();
+        let backlinks = store.build_backlink_index().unwrap();
+        for path in paths {
+            assert_eq!(backlinks[path], vec!["concepts/link.md"]);
+        }
+        for path in ["notes/new:page.md", "entities/~new.md"] {
+            let error = store.write_page(path, content).unwrap_err();
+            assert!(error.to_string().contains("Streams and short-name aliases are not allowed"), "{error}");
+            assert!(!tmp.path().join(path).exists());
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn existing_unix_names_remain_readable_listable_and_searchable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki = tmp.path().join("wiki");
+        let store = WikiStore::new(wiki.clone());
+        store.ensure_scaffold().unwrap();
+        let paths = [
+            "時間:10.md",
+            "2026-11-21 10:30 會議.md",
+            "v1./page.md",
+            "aux.md",
+            "space /page.md",
+            "auto./page.md",
+            "auto /page.md",
+        ];
+        let content = "---\ntitle: Legacy\nlayer: core\ntrust: 0.8\n---\n\ncompatibilityneedle\n";
+        for path in paths {
+            let full = wiki.join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, content).unwrap();
+            assert_eq!(store.read_raw(path).unwrap(), content);
+            assert!(store.read_page(path).unwrap().body.contains("compatibilityneedle"));
+            assert!(store.read_export_page(path, 4096).is_ok());
+            assert!(store.write_page(path, content).is_err(), "write {path}");
+        }
+        let pages = store.list_pages().unwrap();
+        let hits = store.search("compatibilityneedle", 20).unwrap();
+        for path in paths {
+            assert!(pages.iter().any(|p| p.path == path), "list {path}");
+            assert!(hits.iter().any(|p| p.path == path), "search {path}");
+        }
+        assert_eq!(store.lint().unwrap().total_pages, paths.len());
+        let fts = WikiFts::open(&wiki).unwrap();
+        assert_eq!(fts.rebuild(&wiki).unwrap(), paths.len());
+        let hits = fts.search("compatibilityneedle", 20).unwrap();
+        for path in paths {
+            assert!(hits.iter().any(|p| p.path == path), "fts {path}");
+        }
+    }
 
     #[test]
     #[cfg(unix)]
@@ -3895,6 +4250,30 @@ This is the body of the page.
             "gamma".to_string(),
             "delta\\back".to_string(),
         ]);
+    }
+
+    /// v1.84.0: host maintenance rewrites keep the host-owned provenance
+    /// lines a `serialize_page` round-trip drops (trust sync included).
+    #[test]
+    fn host_owned_lines_survive_maintenance_rewrites() {
+        let raw = "---\ntitle: \"x\"\nlayer: context\ntrust: 0.300\n\
+                   host_sources: [\"conversation:telegram:A:m:1\"]\nhost_promoted: true\n---\n\nbody\n";
+        let page = parse_wiki_page("auto/sop/x.md", raw).unwrap();
+        let rewritten = serialize_page(&page);
+        assert!(!rewritten.contains("host_sources"), "the round-trip drops them: {rewritten}");
+        let carried = carry_host_owned_lines(raw, &rewritten);
+        assert!(carried.contains("\nhost_sources: [\"conversation:telegram:A:m:1\"]\n"), "{carried}");
+        assert!(carried.contains("\nhost_promoted: true\n"), "{carried}");
+        assert_eq!(parse_wiki_page("auto/sop/x.md", &carried).unwrap().body, page.body);
+        assert_eq!(carry_host_owned_lines("---\ntitle: y\n---\nb\n", &rewritten), rewritten);
+
+        let tmp = TempDir::new().unwrap();
+        let store = WikiStore::new(tmp.path().join("wiki"));
+        store.write_page("auto/sop/x.md", raw).unwrap();
+        store.update_frontmatter_trust("auto/sop/x.md", 0.25, false).unwrap();
+        let after = std::fs::read_to_string(tmp.path().join("wiki/auto/sop/x.md")).unwrap();
+        assert!(after.contains("host_sources: [\"conversation:telegram:A:m:1\"]"), "{after}");
+        assert!(after.contains("host_promoted: true"), "{after}");
     }
 
     #[test]

@@ -125,6 +125,7 @@ async fn mapped_channel_accounts_obey_main_gate_unmapped_senders_keep_existing_p
     let mapped = crate::on_behalf_of::principal_for_requester(f.home.path(),
         &duduclaw_knowledge::requester::RequesterIdentity::ChannelUser {
             channel: "line".into(), chat: "chat".into(), sender: "sender".into(), user_id: Some(user_id.into()),
+            attested_private: false,
         });
     for (principal, denied) in [(mapped.as_deref(), true), (Some("unmapped:line:0123456789abcdef"), false)] {
         let outcome = crate::delegation_gate::gate_bus_dispatch(f.home.path(), &f.registry,

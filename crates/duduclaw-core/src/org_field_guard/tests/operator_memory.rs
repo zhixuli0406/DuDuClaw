@@ -81,3 +81,16 @@ fn known_bypasses_are_documented_gaps() {
         );
     }
 }
+
+#[test]
+fn convert_script_is_operator_only_in_bash() {
+    for cmd in [
+        "duduclaw memory convert-script --agent sales-rep --dry-run",
+        "env -u DUDUCLAW_AGENT_ID duduclaw-pro memory convert-script --all --yes",
+    ] {
+        for caller in [agent("sales-rep"), HookCaller::Untrusted("sales-rep".into())] {
+            assert!(matches!(decide(cmd, &caller), GuardDecision::BlockedOperatorMemoryCommand { .. }));
+        }
+        assert!(decide(cmd, &HookCaller::Absent).is_allowed());
+    }
+}

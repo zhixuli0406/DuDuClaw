@@ -214,7 +214,7 @@ impl Notifier<'_> {
     ) -> NoticeOutcome {
         let name = duduclaw_core::truncate_chars(&resp.objective, 40);
         let link = event.task_id().and_then(|t| {
-            crate::deep_link::deep_link(self.home, crate::deep_link::DeepLinkKind::Task, t)
+            crate::deep_link::public_deep_link(self.home, crate::deep_link::DeepLinkKind::Task, t)
         });
         let mut text = format!("持續任務「{name}」：{}", event.state_text());
         if let Some(l) = &link {

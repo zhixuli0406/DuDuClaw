@@ -200,6 +200,7 @@ pub(crate) const SELF_AUTHORITY_PARAMS: &[&str] = &[
     "db_sources_remove",
     "budget_cents",
     "reply_language",
+    "memory_language",
     "runtime",
     "timeout_secs",
     "max_turns",
@@ -531,6 +532,27 @@ pub(crate) async fn handle_agent_update(
             });
         }
     }
+    if let Some(value) = params.get("memory_language") {
+        let Some(v) = value.as_str() else {
+            return serde_json::json!({"content": [{"type":"text", "text":"Error: memory_language must be a string"}], "isError":true});
+        };
+        let v = v.trim();
+        if v.is_empty() {
+            config.memory.language = None;
+            changes.push("memory.language cleared".to_string());
+        } else if duduclaw_core::profile_sections::is_valid_reply_language(v) {
+            config.memory.language = Some(v.to_string());
+            changes.push(format!("memory.language = \"{v}\""));
+        } else {
+            return serde_json::json!({
+                "content": [{"type": "text", "text": format!(
+                    "Error: invalid memory_language '{v}'. Valid: {} (empty string = inherit the global setting)",
+                    duduclaw_core::profile_sections::REPLY_LANGUAGE_CHOICES.join(", ")
+                )}],
+                "isError": true
+            });
+        }
+    }
 
     // -- Budget fields --
     if let Some(v) = params.get("budget_cents").and_then(|v| v.as_u64()) {
@@ -719,7 +741,7 @@ pub(crate) async fn handle_agent_update(
 
     if changes.is_empty() {
         return serde_json::json!({
-            "content": [{"type": "text", "text": "Error: no valid fields to update. Supported fields: display_name, role, status, trigger, icon, reports_to, model, fallback_model, api_mode, reply_language, budget_cents, max_concurrent, heartbeat_enabled, heartbeat_cron, db_sources, db_sources_add, db_sources_remove"}],
+            "content": [{"type": "text", "text": "Error: no valid fields to update. Supported fields: display_name, role, status, trigger, icon, reports_to, model, fallback_model, api_mode, reply_language, memory_language, budget_cents, max_concurrent, heartbeat_enabled, heartbeat_cron, db_sources, db_sources_add, db_sources_remove"}],
             "isError": true
         });
     }

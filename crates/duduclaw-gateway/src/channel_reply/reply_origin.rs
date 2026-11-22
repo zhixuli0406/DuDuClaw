@@ -53,6 +53,10 @@ impl ReplyAttempt {
         Self { text, origin }
     }
 }
+/// Reason code of an engine host-configuration refusal (see
+/// [`ReplyFailure::reason_code`]); snake_case like the v1.83.0 codes.
+pub(super) const ENGINE_CONFIG_REFUSED_CODE: &str = "engine_config_refused";
+
 #[derive(Clone)]
 pub(super) struct ReplyFailure {
     pub(super) origin: ReplyOrigin,
@@ -126,6 +130,23 @@ impl ReplyFailure {
         } else {
             duduclaw_agent::mcp_spawn_gate::spawn_gate_user_message(&self.summary)
         }
+    }
+    /// The user-visible reason code. A refusal of an ENGINE's own host
+    /// configuration (Codex external configuration layers, Grok global MCP
+    /// sources) has its own code instead of `unknown` (v1.84.0).
+    pub(super) fn reason_code(&self) -> &'static str {
+        let gate_error = match &self.runtime {
+            Some(runtime) => runtime.steps.iter().find_map(|step| match &step.outcome {
+                RuntimeStepOutcome::ExecutionError(error)
+                    if duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(error) => Some(error.as_str()),
+                _ => None,
+            }),
+            None => duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&self.summary).then_some(self.summary.as_str()),
+        };
+        if gate_error.is_some_and(duduclaw_agent::mcp_spawn_gate::is_engine_local_spawn_gate_error) {
+            return ENGINE_CONFIG_REFUSED_CODE;
+        }
+        self.reason().as_str()
     }
     pub(super) fn claude_auth_error(&self) -> Option<&str> {
         if let Some(runtime) = &self.runtime {
@@ -227,6 +248,8 @@ impl ReplyFailure {
             "origin":self.origin.label(),"reason":format!("{:?}",self.reason()),
             "preflight":self.runtime.as_ref().and_then(|f|f.preflight.as_ref()).map(|p|format!("{:?}",p.kind)),
             "steps":steps,
+            "fallback_skipped":self.runtime.as_ref().and_then(|f|f.fallback_skipped.as_ref())
+                .map(|s|serde_json::json!({"runtime":s.runtime.as_str(),"reason":s.reason.token()})),
             "secondary":self.secondary.as_ref().map(|(origin,error)|serde_json::json!({"origin":origin.label(),"reason":format!("{:?}",classify_origin_reason(*origin,error))})),
         })
     }
@@ -301,6 +324,39 @@ impl ReplyFailure {
             primary
         }
     }
+    /// RM-181: which engines were tried, in order, with each outcome in plain
+    /// words, and — when a fallback engine is configured but the rule did
+    /// not use it — that and why. No provider text, file names or accounts,
+    /// so it is safe for operators and members (never for public visitors).
+    /// `None` outside the multi-runtime dispatch path (nothing to list).
+    pub(super) fn engine_summary(&self) -> Option<String> {
+        let runtime = self.runtime.as_ref()?;
+        let mut text = String::new();
+        if !runtime.steps.is_empty() {
+            let legs: Vec<String> = runtime.steps.iter().map(|step| {
+                let role = match step.role {
+                    crate::failover::RuntimeStepRole::Primary => "原選",
+                    crate::failover::RuntimeStepRole::Fallback => "備援",
+                };
+                format!("{}（{role}）：{}", ReplyOrigin::Runtime(step.runtime).label(), plain_step_outcome(step))
+            }).collect();
+            text.push_str(&format!("已嘗試的引擎依序為 {}。", legs.join("；")));
+        }
+        if let Some(skip) = &runtime.fallback_skipped {
+            text.push_str(&skip.sentence());
+        }
+        (!text.is_empty()).then_some(text)
+    }
+    /// [`Self::engine_summary`] for the audience of `session_id`: never for a
+    /// public visitor (website live chat, widget visitor), whatever the
+    /// failure. Every reply path that may append the summary goes through
+    /// this one gate.
+    pub(super) fn engine_summary_for_session(&self, session_id: &str) -> Option<String> {
+        if super::assembly::public_session(session_id) {
+            return None;
+        }
+        self.engine_summary()
+    }
     pub(super) fn local_notice(&self) -> String {
         let origin = if let Some(runtime) = &self.runtime {
             if runtime.steps.len() == 2 {
@@ -316,6 +372,33 @@ impl ReplyFailure {
             format!("{} 本次未能回應", self.origin.label())
         };
         format!("⚠️ {origin}，改由已設定的本地模型代為回應。\n\n")
+    }
+}
+/// One leg's outcome in plain words (no provider text).
+fn plain_step_outcome(step: &crate::failover::RuntimeStep) -> &'static str {
+    match &step.outcome {
+        RuntimeStepOutcome::ExecutionError(error) => {
+            if duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(error) {
+                return "沒有通過啟動前檢查";
+            }
+            match classify_origin_reason(ReplyOrigin::Runtime(step.runtime), error) {
+                FailureReason::AuthFailed => "登入或憑證失效",
+                FailureReason::Timeout | FailureReason::TimeoutTotal => "達到執行時間上限",
+                FailureReason::TimeoutNoProgress => "長時間沒有進展而停止",
+                FailureReason::MaxTurns => "達到步驟上限",
+                FailureReason::RateLimited => "使用量已達限制",
+                FailureReason::Billing => "帳務或額度不足",
+                FailureReason::EmptyResponse => "回傳空白內容",
+                FailureReason::BinaryMissing | FailureReason::SpawnError => "無法啟動",
+                _ => "執行失敗",
+            }
+        }
+        RuntimeStepOutcome::Empty => "回傳空白內容",
+        RuntimeStepOutcome::NotRegistered => "尚未安裝或無法使用，沒有呼叫",
+        RuntimeStepOutcome::Cooldown => "正在冷卻，沒有呼叫",
+        RuntimeStepOutcome::PolicyRefused(_) => "產品政策不允許，沒有呼叫",
+        RuntimeStepOutcome::NoCompatibleModel => "沒有可用的相容模型，沒有呼叫",
+        RuntimeStepOutcome::CrossFamilyRefused => "此工作不允許換到其他模型家族，沒有呼叫",
     }
 }
 fn classify_origin_reason(origin: ReplyOrigin, error: &str) -> FailureReason {
@@ -524,6 +607,139 @@ mod timeout_tests {
         assert!(!other.contains("macOS"), "{other}");
         let elsewhere = origin_message("worker", claude, FailureReason::Timeout, Path::new("/nonexistent"));
         assert!(elsewhere.contains("30 分鐘安全上限"));
+    }
+}
+
+#[cfg(test)]
+mod engine_summary_tests {
+    use super::*;
+    use crate::failover::{FallbackRefusal, FallbackSkip, RuntimeStepRole, WorkLimitKind};
+
+    #[test]
+    fn fallback_configured_but_skipped_says_so_and_why() {
+        let outcome = crate::work_outcome::WorkOutcome::TimeoutTotal { seconds: 1800, partial: String::new() }.encode();
+        let mut failure = RuntimeDispatchFailure::new(RuntimeType::Codex, "gpt-5.4");
+        failure.push(RuntimeStepRole::Primary, RuntimeType::Codex, Some("gpt-5.4"),
+            RuntimeStepOutcome::ExecutionError(outcome));
+        failure.fallback_skipped = Some(FallbackSkip { runtime: RuntimeType::Grok,
+            reason: FallbackRefusal::WorkLimit(WorkLimitKind::TimeoutTotal) });
+        let failure = ReplyFailure::runtime(failure);
+        let summary = failure.engine_summary().expect("summary");
+        let codex = ReplyOrigin::Runtime(RuntimeType::Codex).label();
+        let grok = ReplyOrigin::Runtime(RuntimeType::Grok).label();
+        assert!(summary.starts_with(&format!("已嘗試的引擎依序為 {codex}（原選）：達到執行時間上限。")), "{summary}");
+        assert!(summary.ends_with(&format!("已設定備援引擎 {grok}，但這次的失敗屬於任務本身的時間上限，不會換引擎重跑。")), "{summary}");
+        assert_eq!(failure.audit()["fallback_skipped"]["reason"], "work_timeout_total");
+        // A fallback that was never configured is never mentioned.
+        let mut plain = RuntimeDispatchFailure::new(RuntimeType::Codex, "gpt-5.4");
+        plain.push(RuntimeStepRole::Primary, RuntimeType::Codex, Some("gpt-5.4"),
+            RuntimeStepOutcome::ExecutionError("500 secret provider body".into()));
+        let summary = ReplyFailure::runtime(plain).engine_summary().unwrap();
+        assert!(!summary.contains("備援") && !summary.contains("secret"), "{summary}");
+    }
+
+    #[test]
+    fn both_legs_failed_lists_each_engine_in_order_in_plain_words() {
+        let mut failure = RuntimeDispatchFailure::new(RuntimeType::Codex, "gpt-5.4");
+        failure.push(RuntimeStepRole::Primary, RuntimeType::Codex, Some("gpt-5.4"),
+            RuntimeStepOutcome::ExecutionError("401 invalid bearer token; secret body".into()));
+        failure.push(RuntimeStepRole::Fallback, RuntimeType::Grok, Some("grok-build-0.1"), RuntimeStepOutcome::Empty);
+        let failure = ReplyFailure::runtime(failure);
+        let summary = failure.engine_summary().unwrap();
+        let codex = ReplyOrigin::Runtime(RuntimeType::Codex).label();
+        let grok = ReplyOrigin::Runtime(RuntimeType::Grok).label();
+        assert_eq!(summary, format!("已嘗試的引擎依序為 {codex}（原選）：登入或憑證失效；{grok}（備援）：回傳空白內容。"));
+        assert!(!summary.contains("secret") && !summary.contains("401"));
+        // The operator text still carries each leg's own advice.
+        let message = failure.message("Worker", Path::new("/nonexistent"));
+        assert!(message.contains("原選執行環境") && message.contains("明確備援"), "{message}");
+        // A Claude-path failure has no engine list to add.
+        assert!(ReplyFailure::simple(ReplyOrigin::Runtime(RuntimeType::Claude), "boom".into()).engine_summary().is_none());
+    }
+
+    /// Visitor sessions never receive the engine summary, for any failure
+    /// shape (both legs failed, a skipped fallback, a start-up refusal, a
+    /// prompt too large); members and operators do.
+    #[test]
+    fn visitor_sessions_never_receive_the_engine_summary() {
+        let gate = duduclaw_agent::mcp_spawn_gate::engine_local_spawn_gate_error("Codex 外部設定 /etc/codex/config.toml：x");
+        let too_large = crate::runtime::prompt_budget::prompt_too_large_error("grok");
+        let failures = || {
+            let mut both = RuntimeDispatchFailure::new(RuntimeType::Codex, "gpt-5.4");
+            both.push(RuntimeStepRole::Primary, RuntimeType::Codex, Some("gpt-5.4"),
+                RuntimeStepOutcome::ExecutionError("500 internal server error".into()));
+            both.push(RuntimeStepRole::Fallback, RuntimeType::Grok, Some("grok-build-0.1"), RuntimeStepOutcome::Empty);
+            let mut skipped = RuntimeDispatchFailure::new(RuntimeType::Grok, "grok-4");
+            skipped.push(RuntimeStepRole::Primary, RuntimeType::Grok, Some("grok-4"),
+                RuntimeStepOutcome::ExecutionError(too_large.clone()));
+            skipped.fallback_skipped = Some(FallbackSkip { runtime: RuntimeType::Qwen, reason: FallbackRefusal::PromptTooLarge });
+            let mut refused = RuntimeDispatchFailure::new(RuntimeType::Codex, "gpt-5.4");
+            refused.push(RuntimeStepRole::Primary, RuntimeType::Codex, Some("gpt-5.4"), RuntimeStepOutcome::ExecutionError(gate.clone()));
+            [both, skipped, refused].map(ReplyFailure::runtime)
+        };
+        for session in ["widget-visitor:abc", "odoolivechat:site:visitor"] {
+            assert!(super::super::assembly::public_session(session), "{session} is a visitor session");
+            for failure in failures() {
+                assert!(failure.engine_summary().is_some(), "fixture has a summary");
+                assert_eq!(failure.engine_summary_for_session(session), None, "{session}");
+            }
+        }
+        for session in ["discord:member", "webchat:owner", "line:owner"] {
+            for failure in failures() {
+                assert_eq!(failure.engine_summary_for_session(session), failure.engine_summary(), "{session}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_spawn_gate_leg_is_named_without_its_text() {
+        let gate = duduclaw_agent::mcp_spawn_gate::engine_local_spawn_gate_error("Codex 外部設定 /etc/codex/config.toml：x");
+        let mut failure = RuntimeDispatchFailure::new(RuntimeType::Codex, "gpt-5.4");
+        failure.push(RuntimeStepRole::Primary, RuntimeType::Codex, Some("gpt-5.4"), RuntimeStepOutcome::ExecutionError(gate));
+        failure.push(RuntimeStepRole::Fallback, RuntimeType::Claude, Some("claude-opus-4-6"),
+            RuntimeStepOutcome::ExecutionError("503 service unavailable".into()));
+        let summary = ReplyFailure::runtime(failure).engine_summary().unwrap();
+        assert!(summary.contains("沒有通過啟動前檢查"), "{summary}");
+        assert!(!summary.contains("config.toml") && !summary.contains("[engine_local_config]"), "{summary}");
+    }
+
+    /// v1.84.0: an engine host-configuration refusal has its own reason code
+    /// (it used to show `unknown`); the employee `.mcp.json` gate and every
+    /// other failure keep their v1.83.0 code.
+    #[test]
+    fn engine_host_config_refusal_has_its_own_reason_code() {
+        let gate = duduclaw_agent::mcp_spawn_gate::engine_local_spawn_gate_error(
+            "Codex 外部設定 /home/u/.codex/config.toml：定義了 mcp_servers；拒絕啟動。");
+        let mut failure = RuntimeDispatchFailure::new(RuntimeType::Codex, "gpt-5.4");
+        failure.push(RuntimeStepRole::Primary, RuntimeType::Codex, Some("gpt-5.4"), RuntimeStepOutcome::ExecutionError(gate.clone()));
+        assert_eq!(ReplyFailure::runtime(failure).reason_code(), ENGINE_CONFIG_REFUSED_CODE);
+        assert_eq!(ReplyFailure::simple(ReplyOrigin::Runtime(RuntimeType::Codex), gate).reason_code(), ENGINE_CONFIG_REFUSED_CODE);
+        let employee = duduclaw_agent::mcp_spawn_gate::spawn_gate_error("worker .mcp.json refused");
+        let employee = ReplyFailure::simple(ReplyOrigin::Runtime(RuntimeType::Codex), employee);
+        assert_eq!(employee.reason_code(), employee.reason().as_str());
+        let plain = ReplyFailure::simple(ReplyOrigin::Runtime(RuntimeType::Codex), "Codex CLI exited with 1".into());
+        assert_eq!(plain.reason_code(), plain.reason().as_str());
+    }
+
+    /// v1.84.0: the stored notice is the sentence shown live (sanitized the
+    /// same way), with the same reason code; visitors keep the generic line.
+    #[test]
+    fn stored_refusal_notice_is_the_sentence_shown_live() {
+        use super::super::failure_notice::{FAILURE_DETAILS, FAILURE_SHOWN_TEXT, notice_suffix};
+        let shown = crate::dispatcher::sanitize_for_channel(
+            "Codex 外部設定 /Users/sam/.codex/work.config.toml：定義了 mcp_servers；拒絕啟動。");
+        assert!(shown.contains("：定義了 mcp_servers；拒絕啟動"), "{shown}");
+        let render = |visitor: bool| FAILURE_SHOWN_TEXT.sync_scope(shown.clone(), || {
+            FAILURE_DETAILS.sync_scope((ENGINE_CONFIG_REFUSED_CODE, None), || {
+                TurnFailureReason::SafetyGate.render(Some("zh-TW"), "12345678abcdef", visitor)
+            })
+        });
+        assert_eq!(render(false), format!("{shown}\n{}",
+            notice_suffix(Some("zh-TW"), Some(ENGINE_CONFIG_REFUSED_CODE), "12345678abcdef")));
+        let visitor = render(true);
+        assert!(!visitor.contains("mcp_servers") && !visitor.contains(ENGINE_CONFIG_REFUSED_CODE), "{visitor}");
+        // Without the scope the generic line is unchanged.
+        assert!(TurnFailureReason::SafetyGate.render(Some("zh-TW"), "1", false).starts_with("本次未收到回覆，因為安全檢查已停止這次請求。"));
     }
 }
 

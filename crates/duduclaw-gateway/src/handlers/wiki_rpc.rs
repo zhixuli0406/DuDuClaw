@@ -85,12 +85,25 @@ impl MethodHandler {
             .get("page_path")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        let canonical = match duduclaw_memory::wiki_path::canonical_page_argument(page_path) {
+            Ok(id) => id,
+            Err(_) => return WsFrame::error_response("", "Invalid page_path"),
+        };
+        let page_path = canonical.as_str();
         let Some(wiki_dir) = self.agent_wiki_dir(agent_id) else {
             return WsFrame::error_response("", "Missing or invalid 'agent_id' parameter");
         };
         if page_path.is_empty() {
             return WsFrame::error_response("", "Missing 'page_path' parameter");
         }
+        let target = match duduclaw_memory::wiki_path::resolve_wiki_page(&wiki_dir, page_path, false) {
+            Ok(target) if target.is_auto && target.exists => target,
+            Ok(target) if target.exists => return WsFrame::error_response(
+                "", "Promote failed: only auto-filed pages can be promoted",
+            ),
+            _ => return WsFrame::error_response("", "Auto page not found"),
+        };
+        let page_path = target.id.as_str();
         let store = duduclaw_memory::WikiStore::new(wiki_dir);
         match crate::auto_wiki_page::promote_page(&store, page_path) {
             Ok(()) => WsFrame::ok_response("", json!({ "promoted": true, "path": page_path })),
@@ -115,12 +128,25 @@ impl MethodHandler {
             .get("page_path")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        let canonical = match duduclaw_memory::wiki_path::canonical_page_argument(page_path) {
+            Ok(id) => id,
+            Err(_) => return WsFrame::error_response("", "Invalid page_path"),
+        };
+        let page_path = canonical.as_str();
         let Some(wiki_dir) = self.agent_wiki_dir(agent_id) else {
             return WsFrame::error_response("", "Missing or invalid 'agent_id' parameter");
         };
         if page_path.is_empty() {
             return WsFrame::error_response("", "Missing 'page_path' parameter");
         }
+        let target = match duduclaw_memory::wiki_path::resolve_wiki_page(&wiki_dir, page_path, false) {
+            Ok(target) if target.is_auto && target.exists => target,
+            Ok(target) if target.exists => return WsFrame::error_response(
+                "", "Only auto-filed pages can be removed here",
+            ),
+            _ => return WsFrame::error_response("", "Auto page not found"),
+        };
+        let page_path = target.id.as_str();
         if !crate::auto_wiki_page::is_auto_path(page_path) {
             return WsFrame::error_response("", "Only auto-filed pages can be removed here");
         }
@@ -169,12 +195,25 @@ impl MethodHandler {
             .get("page_path")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        let canonical = match duduclaw_memory::wiki_path::canonical_page_argument(page_path) {
+            Ok(id) => id,
+            Err(_) => return WsFrame::error_response("", "Invalid page_path"),
+        };
+        let page_path = canonical.as_str();
         let Some(wiki_dir) = self.agent_wiki_dir(agent_id) else {
             return WsFrame::error_response("", "Missing or invalid 'agent_id' parameter");
         };
         if page_path.is_empty() {
             return WsFrame::error_response("", "Missing 'page_path' parameter");
         }
+        let target = match duduclaw_memory::wiki_path::resolve_wiki_page(&wiki_dir, page_path, false) {
+            Ok(target) if target.is_auto && target.exists => target,
+            Ok(target) if target.exists => return WsFrame::error_response(
+                "", "Only auto-filed pages can be shared here",
+            ),
+            _ => return WsFrame::error_response("", "Auto page not found"),
+        };
+        let page_path = target.id.as_str();
         // Same gate as promote/archive: this button lives on the auto-filing
         // audit tab and its whole contract is "an auto page, its provenance
         // intact". Without the check it would become a general
@@ -184,14 +223,27 @@ impl MethodHandler {
         if !crate::auto_wiki_page::is_auto_path(page_path) {
             return WsFrame::error_response("", "Only auto-filed pages can be shared here");
         }
+        // Sharing is a mutation: keep portable write rules on its source
+        // even though ordinary page reads accept existing Unix names.
+        if let Err(e) = duduclaw_memory::wiki_path::validate_relative_wiki_path(page_path) {
+            return WsFrame::error_response("", &format!("Invalid page path: {e}"));
+        }
         let store = duduclaw_memory::WikiStore::new(wiki_dir);
-        let page = match store.read_page(page_path) {
+        let (page, raw) = match store.read_page_with_raw(page_path) {
             Ok(p) => p,
             Err(e) => return WsFrame::error_response("", &format!("Failed to read page: {e}")),
         };
-        if page.author.as_deref() != Some(crate::auto_wiki_page::AUTO_PAGE_AUTHOR) {
-            return WsFrame::error_response("", "Only auto-filed pages can be shared here");
-        }
+        // v1.84.0 (review H2): only a page a human promoted, as the gateway
+        // recorded it (`auto_wiki_page::promoted_record` — registry entry
+        // matching these bytes, `host_promoted`), is published. An
+        // unpromoted page belongs to one conversation; a legacy page, or one
+        // changed on disk, has not been confirmed. Either way: confirm first.
+        let Some(record) = crate::auto_wiki_page::promoted_record(&store, page_path, &raw) else {
+            return WsFrame::error_response(
+                "",
+                "This page has not been confirmed yet. Confirm (promote) it on the auto-filing tab first, then share it.",
+            );
+        };
 
         // `sources/` is the shared wiki's provenance namespace and derives
         // `SourceType::RawDialogue`, so a shared auto page keeps the same low
@@ -216,7 +268,11 @@ impl MethodHandler {
                 t
             },
             related: Vec::new(),
-            sources: page.sources.clone(),
+            // v1.84.0 (review H2): provenance from the host registry, never
+            // the page's writer-controlled `sources`; `host_*` lines of the
+            // page text are not carried either (a fresh `WikiPage`, host
+            // fields set below from the record only).
+            sources: record.host_sources.clone(),
             author: Some(agent_id.to_string()),
             layer: duduclaw_memory::WikiLayer::Context,
             trust: page.trust,
@@ -235,11 +291,15 @@ impl MethodHandler {
         if let Err(e) = shared_store.ensure_scaffold() {
             return WsFrame::error_response("", &format!("Shared wiki unavailable: {e}"));
         }
-        match shared_store.write_page_with_author(
-            &shared_path,
+        // `set_host_fields` drops every host-owned line first, then records
+        // the registry's sources as the shared page's host provenance (so a
+        // forget by source lists the shared copy for review).
+        let content = crate::wiki_host_sources::set_host_fields(
             &duduclaw_memory::serialize_page(&shared),
-            agent_id,
-        ) {
+            &record.host_sources,
+            false,
+        );
+        match shared_store.write_page_with_author(&shared_path, &content, agent_id) {
             Ok(()) => WsFrame::ok_response("", json!({ "shared": true, "path": shared_path })),
             Err(e) => WsFrame::error_response("", &format!("Share failed: {e}")),
         }
@@ -254,6 +314,11 @@ impl MethodHandler {
             .get("page_path")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        let canonical = match duduclaw_memory::wiki_path::canonical_page_argument(page_path) {
+            Ok(id) => id,
+            Err(_) => return WsFrame::error_response("", "Invalid page_path"),
+        };
+        let page_path = canonical.as_str();
         if agent_id.is_empty() || page_path.is_empty() {
             return WsFrame::error_response("", "Missing 'agent_id' or 'page_path' parameter");
         }
@@ -492,6 +557,11 @@ impl MethodHandler {
             .get("page_path")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        let canonical = match duduclaw_memory::wiki_path::canonical_page_argument(page_path) {
+            Ok(id) => id,
+            Err(_) => return WsFrame::error_response("", "Invalid page_path"),
+        };
+        let page_path = canonical.as_str();
         let trust = params
             .get("trust")
             .and_then(|v| v.as_f64())
@@ -566,6 +636,11 @@ impl MethodHandler {
             .get("page_path")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        let canonical = match duduclaw_memory::wiki_path::canonical_page_argument(page_path) {
+            Ok(id) => id,
+            Err(_) => return WsFrame::error_response("", "Invalid page_path"),
+        };
+        let page_path = canonical.as_str();
         let limit = (params.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize).min(500);
 
         if agent_id.is_empty() || page_path.is_empty() {

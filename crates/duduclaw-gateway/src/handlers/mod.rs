@@ -318,6 +318,8 @@ pub struct MethodHandler {
     pending_update: RwLock<Option<PendingUpdate>>,
     /// User database for multi-user auth (injected after gateway start).
     user_db: RwLock<Option<Arc<UserDb>>>,
+    /// License service captured for this handler; standalone callers may inject an owned runtime.
+    license_runtime: Option<crate::license_runtime::LicenseRuntime>,
     /// JWT configuration for token issuance (injected after gateway start).
     jwt_config: RwLock<Option<Arc<JwtConfig>>>,
     /// Plugin extension point (NullExtension by default).
@@ -508,6 +510,11 @@ impl MethodHandler {
         // Move the credential into a zeroizing owner before any early-return
         // gate. Secret-bearing requests never reach the extension clone.
         let mut params = params;
+        if matches!(method.split('.').next(), Some("wiki" | "shared_wiki"))
+            && duduclaw_memory::wiki_path::canonicalize_wiki_arguments(&mut params).is_err()
+        {
+            return WsFrame::error_response("", "Invalid wiki page id");
+        }
         let credential_request = if method.split('.').next() == Some("transcription_credentials") {
             Some(transcription_credentials_rpc::Request::take(method, params.take()))
         } else { None };

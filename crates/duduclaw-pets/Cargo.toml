@@ -23,8 +23,10 @@ kamadak-exif = "0.6"
 # ONNX-based local background removal (BiRefNet-general-lite / silueta). OFF by
 # default so the workspace builds/tests without the onnxruntime toolchain; the
 # desktop shell turns it on. Mirrors duduclaw-inference's ort pin exactly.
-ort = { version = "2.0.0-rc.12", optional = true, features = ["ndarray"] }
-# Must match ort's ndarray major (ort 2.0.0-rc.12 uses 0.17) or Tensor::from_array
+duduclaw-onnx = { workspace = true, optional = true, features = ["runtime"] }
+# Preserve rc.12 defaults explicitly: rc.15 defaults select api-31.
+ort = { version = "=2.0.0-rc.15", optional = true, default-features = false, features = ["load-dynamic", "ndarray", "tracing", "api-24"] }
+# Must match ort's ndarray major (ort 2.0.0-rc.15 uses 0.17) or Tensor::from_array
 # sees a foreign ArrayBase type and the OwnedTensorArrayData bound fails.
 ndarray = { version = "0.17", optional = true }
 # Model download for the ONNX path.
@@ -33,7 +35,7 @@ reqwest = { version = "0.12", features = ["blocking"], optional = true }
 [features]
 default = []
 # Local ONNX background removal + model download. Enabled by the desktop app.
-onnx = ["dep:ort", "dep:ndarray", "dep:reqwest"]
+onnx = ["dep:duduclaw-onnx", "dep:ort", "dep:ndarray", "dep:reqwest"]
 
 [dev-dependencies]
 tempfile = "3"

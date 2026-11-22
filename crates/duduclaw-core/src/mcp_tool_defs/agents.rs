@@ -225,6 +225,11 @@ pub(super) const TOOLS: &[ToolDef] = &[
                 required: false,
             },
             ParamDef {
+                name: "memory_language",
+                description: "Memory language: auto (follow reply language), zh-TW, zh-CN, en, ja-JP; empty clears the override. Same authority gate as reply_language.",
+                required: false,
+            },
+            ParamDef {
                 name: "budget_cents",
                 description: "Monthly budget limit in cents",
                 required: false,

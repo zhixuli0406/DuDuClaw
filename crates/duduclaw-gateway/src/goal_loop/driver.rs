@@ -17,6 +17,7 @@ impl GoalLoopDriver {
             dispatch_failures: Mutex::new(HashMap::new()),
             kickoff: Mutex::new(HashMap::new()),
             notified_needs_human: Mutex::new(HashSet::new()),
+            needs_human_swept: std::sync::atomic::AtomicBool::new(false),
             operator_skipped: Mutex::new(HashSet::new()),
             progress_seen: Mutex::new(HashMap::new()),
             progress_retry: Mutex::new(HashMap::new()),

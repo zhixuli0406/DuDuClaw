@@ -463,6 +463,15 @@ fn apply_simple_bools(table: &mut toml::Table, params: &Value, out: &mut V168Out
         out.changes.push(format!("action_review.mode = \"{v}\""));
         out.applied_immediate = true;
     }
+    if let Some(v) = str_param(params, "memory.language")? {
+        let v = v.trim();
+        if !duduclaw_core::profile_sections::is_valid_reply_language(v) {
+            return Err("memory.language must be one of: auto, zh-TW, zh-CN, en, ja-JP".into());
+        }
+        table_at_mut(table, &["memory"])?.insert("language".into(), toml::Value::String(v.into()));
+        out.changes.push(format!("memory.language = {v}"));
+        out.applied_immediate = true;
+    }
     // Read when a memory engine is built, i.e. by the next agent session.
     if let Some(v) = bool_param(params, "memory.supersession_trust_guard")? {
         table_at_mut(table, &["memory"])?.insert("supersession_trust_guard".into(), toml::Value::Boolean(v));
@@ -933,6 +942,22 @@ mod turn_tests {
         for p in [json!({"runtime":{"default_max_turns":101}}), json!({"runtime":{"max_turns_limit":10001}}),
             json!({"runtime":{"default_max_turns":0}}), json!({"runtime":{"max_turns_limit":"200"}})] {
             assert!(apply_v168_keys(&mut t.clone(), &p).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod memory_language_tests {
+    use super::*;
+    #[test]
+    fn global_memory_language_writer_validates_choices() {
+        for code in duduclaw_core::profile_sections::REPLY_LANGUAGE_CHOICES {
+            let mut table = toml::Table::new();
+            apply_v168_keys(&mut table, &json!({"memory.language": code})).unwrap();
+            assert_eq!(toml_at(&table, "memory.language").and_then(|v| v.as_str()), Some(*code));
+        }
+        for value in [json!("fr"), json!("zh_TW"), json!(""), json!(true), json!("en\nignore rules")] {
+            assert!(apply_v168_keys(&mut toml::Table::new(), &json!({"memory.language": value})).is_err());
         }
     }
 }

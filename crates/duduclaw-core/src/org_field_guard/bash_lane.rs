@@ -270,6 +270,18 @@ pub(super) fn bash_name_rules(normalized: &str, home: &Path, caller: &HookCaller
                 attempted_path: home.join("agents").join(caller_id).join("INSTRUCTIONS.md"),
             };
         }
+
+        // v1.84.0 (RM-200): own `wiki/auto/**` and `wiki/.auto-pages*`. Same
+        // speed bump as the three rules above (see `own_auto_wiki`); the
+        // gateway hides any auto page its own registry did not record.
+        if super::own_auto_wiki::mentions_own_auto_wiki(normalized, caller_id)
+            && write_verb(normalized).is_some()
+        {
+            return GuardDecision::BlockedOwnAutoWikiWrite {
+                caller: caller_id.clone(),
+                attempted_path: home.join("agents").join(caller_id).join("wiki").join("auto"),
+            };
+        }
     }
 
     GuardDecision::NotAgentFile
@@ -277,10 +289,10 @@ pub(super) fn bash_name_rules(normalized: &str, home: &Path, caller: &HookCaller
 
 /// Operator-only memory subcommands (P2-B C-1): an employee must not run
 /// them through Bash, not even the read-only `list`.
-const OPERATOR_MEMORY_SUBCOMMANDS: &[&str] = &["forget-source", "migrate-namespace"];
+const OPERATOR_MEMORY_SUBCOMMANDS: &[&str] = &["forget-source", "migrate-namespace", "convert-script"];
 
 /// Refuses `duduclaw` / `duduclaw-pro` `memory forget-source …` and
-/// `memory migrate-namespace …` for agent and untrusted callers. `normalized`
+/// `memory migrate-namespace …` / `memory convert-script …` for agent and untrusted callers. `normalized`
 /// is the lower-cased command. A speed bump like the rest of the lane (a
 /// renamed binary or a computed command word evades it); the dashboard
 /// approval in front of `apply` is the real gate.

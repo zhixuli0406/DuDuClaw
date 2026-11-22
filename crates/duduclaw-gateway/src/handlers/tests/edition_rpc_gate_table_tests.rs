@@ -143,6 +143,7 @@ fn personal_surfaces_are_untouched() {
         "license.status",
         "license.fingerprint",
         "license.activate",
+        "license.sync",
         // 審批 / 稽核 / 日誌 / kill switch (D9)
         "approvals.list",
         "approvals.decide",

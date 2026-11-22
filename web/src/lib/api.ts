@@ -181,6 +181,8 @@ export interface AgentDetail extends AgentInfo {
   runtime?: {
     provider?: string;
     fallback?: string;
+    /** v1.84 (RM-205): the employee's own background-work service. */
+    utility_provider?: string;
     timeout_secs?: number | null;
     idle_timeout_secs?: number | null;
     max_turns?: number | null;
@@ -351,6 +353,7 @@ export interface DoctorCheck {
   message: string;
   can_repair: boolean;
   repair_hint?: string;
+  agent_id?: string;
 }
 
 /** Product form-factor, orthogonal to the license `edition` string. */
@@ -589,6 +592,8 @@ export interface WikiSearchHit {
  * the page; `revision_count` mirrors the page's in-body revision log.
  */
 export interface AutoWikiPage {
+  /** Missing on older gateways; treat as needing confirmation. */
+  state?: 'needs_confirmation' | 'confirmed';
   path: string;
   title: string;
   updated: string;
@@ -2548,6 +2553,39 @@ export interface LicenseSnapshot {
    * must remain visible as the anti-resale watermark.
    */
   nfr?: boolean;
+  /** Signed per-license AI employee quota; `null` = the tier default applies. */
+  max_agents?: number | null;
+  /**
+   * AI employee cap actually enforced on this gateway. `null` when uncapped
+   * (then `seat_unlimited` is `true`); absent on older gateways.
+   */
+  seat_limit?: number | null;
+  /** `true` only when the gateway enforces no AI employee cap. */
+  seat_unlimited?: boolean;
+  /** Employees holding a seat (archived included); `null` when uncountable. */
+  seats_used?: number | null;
+}
+
+/** Result of `license.sync`: the refreshed snapshot plus what happened. */
+export interface LicenseSyncResult extends LicenseSnapshot {
+  sync: {
+    outcome:
+      | 'updated'
+      | 'unchanged'
+      | 'revoked'
+      | 'pending_rebind'
+      | 'no_license'
+      | 'unreadable_license_file'
+      | 'offline'
+      | 'failed'
+      | 'busy';
+    /** zh-TW sentence from the gateway (fallback when no translation). */
+    message: string;
+    reason?: string;
+    retry_after_secs?: number;
+  };
+  /** The plan now resolves a different edition than the one the service booted with. */
+  restart_recommended: boolean;
 }
 
 // ── User management types ────────────────────────────────────
@@ -3542,6 +3580,7 @@ export interface AgentUpdateParams {
   /** `[prompt] reply_language`: `auto` | `zh-TW` | `zh-CN` | `en` | `ja-JP`;
    *  empty string clears the override (inherit the global default). */
   reply_language?: string;
+  memory_language?: string;
 }
 
 // ── WP4: agent handoff (offboard with transfer) ─────────────────
@@ -3615,6 +3654,15 @@ export interface AgentRuntime {
   fallback?: string;
   /** v1.68 W1 — `[runtime] minimal_context` (精簡啟動內容). Default true. */
   minimal_context?: boolean;
+  /** v1.84 (RM-205) — service for background work when the engine has no
+   *  utility support. '' clears it. Admin-only. */
+  utility_provider?: string;
+}
+
+/** v1.84 (RM-205) — where an employee's background work actually runs. */
+export interface AgentUtilityRoute {
+  provider: string | null;
+  source: 'employee_engine' | 'employee_setting' | 'global_setting' | 'unavailable';
 }
 
 // ── BEGIN v1.68 W1: AI-employee edit page (agents.update / agents.inspect) ──
@@ -3650,6 +3698,7 @@ export interface AgentGuardrailsSection {
 }
 
 export interface AgentMemorySection {
+  language?: string;
   decision_continuity?: boolean;
   decision_ttl_days?: number;
 }
@@ -3707,6 +3756,11 @@ export interface AgentDetailV168 {
     error: string | null;
   };
   runtime?: { minimal_context?: boolean };
+  /** v1.84 (RM-205). Older gateways omit it. */
+  utility_route?: AgentUtilityRoute;
+  /** v1.84: zh-TW notice when the engine ran with its own default model
+   *  because the saved one is a Claude alias it cannot run. */
+  engine_model_notice?: string | null;
   fork?: { enabled?: boolean };
   team?: AgentTeamSection & {
     roles?: Partial<Record<AgentTeamRoleKey | 'synthesizer', AgentTeamRoleSpec>>;
@@ -8645,6 +8699,19 @@ export const api = {
      */
     status: (): Promise<LicenseSnapshot> =>
       client.call('license.status') as Promise<LicenseSnapshot>,
+    /**
+     * Admin-only: refresh the license from the vendor now (signed refresh,
+     * rate-limited and single-flight on the gateway), then return the
+     * snapshot plus the outcome. Seat limit and expiry apply immediately.
+     */
+    sync: async (): Promise<LicenseSyncResult> => {
+      const result = await client.call('license.sync', {}) as LicenseSyncResult;
+      if (result?.sync?.outcome === 'updated' || result?.sync?.outcome === 'revoked') {
+        useBrandStore.getState().setBrand(null);
+        await loadPublicBrand();
+      }
+      return result;
+    },
     /** Machine fingerprint provided to the general distributor for licensing. */
     fingerprint: () =>
       client.call('license.fingerprint', {}) as Promise<{ fingerprint: string }>,

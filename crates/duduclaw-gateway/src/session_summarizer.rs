@@ -241,11 +241,16 @@ pub enum SummaryFailure {
     Utility,
     Store,
     Budget,
+    /// RM-205: no service may run this employee's background work. A clean
+    /// skip: backs off like a failure (no tight retry loop) but is not
+    /// reported as one.
+    Unavailable,
 }
 
 impl SummaryFailure {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Unavailable => "unavailable",
             Self::EmptyOutput => "empty_output",
             Self::OversizeOutput => "oversize_output",
             Self::RefusalOrMeta => "refusal_or_meta",
@@ -424,8 +429,13 @@ pub fn summary_attempt_finished(home: &std::path::Path, session: &str, lane: &st
             let state = states.entry(key).or_default();
             state.failures = state.failures.saturating_add(1);
             state.next_retry_at = chrono::Utc::now().timestamp() + summary_retry_delay(state.failures);
-            tracing::warn!(session_id = session, lane, reason = reason.as_str(),
-                failures = state.failures, next_retry_at = state.next_retry_at, "conversation summary failed; history retained");
+            if reason == SummaryFailure::Unavailable {
+                tracing::debug!(session_id = session, lane, next_retry_at = state.next_retry_at,
+                    "conversation summary skipped: background work unavailable for this employee; history retained");
+            } else {
+                tracing::warn!(session_id = session, lane, reason = reason.as_str(),
+                    failures = state.failures, next_retry_at = state.next_retry_at, "conversation summary failed; history retained");
+            }
         } else { states.remove(&key); }
     });
     if let Err(error) = result {
@@ -442,6 +452,11 @@ pub fn summary_attempt_finished(home: &std::path::Path, session: &str, lane: &st
 /// Protected text is partitioned by the caller; ordinary transcript text is
 /// escaped and explicitly wrapped as untrusted data.
 pub fn format_summarization_prompt(turns_text: &str) -> String {
+    format_summarization_prompt_with_language(turns_text, None)
+}
+
+pub fn format_summarization_prompt_with_language(turns_text: &str, language: Option<&str>) -> String {
+    let language_rule = crate::prompt_identity::memory_prompt_language(language, turns_text);
     let escaped = turns_text.replace('<', "&lt;").replace('>', "&gt;");
     let turns_text = cap_summary_input(&escaped, SUMMARY_INPUT_MAX_BYTES - 1024);
     format!(
@@ -457,6 +472,7 @@ pub fn format_summarization_prompt(turns_text: &str) -> String {
          Do not invent details. Be terse — aim for under 500 characters. \
          Output format: dash-prefixed bullets only, no preamble or epilogue.\n\
          \n\
+         {language_rule}\n\
          === TRANSCRIPT ===\n<transcript_data>\n{turns_text}\n</transcript_data>\n=== END ===\n\
          \n\
          Bullets:"
@@ -851,6 +867,9 @@ mod tests {
 
     #[test]
     fn summarization_prompt_includes_required_anchors() {
+        let pinned = format_summarization_prompt_with_language("input", Some("zh-TW"));
+        assert!(pinned.contains(duduclaw_core::profile_sections::memory_language_instruction("zh-TW")));
+        assert!(format_summarization_prompt("English").contains("Same language as input."));
         let prompt = format_summarization_prompt("user: hi\nassistant: hello");
         assert!(prompt.contains("Bullets:"));
         assert!(prompt.contains("=== TRANSCRIPT ==="));

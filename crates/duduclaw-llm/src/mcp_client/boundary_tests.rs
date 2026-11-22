@@ -86,6 +86,7 @@ fn python3_interpreter() -> &'static str {
 async fn egress_stdio_transport_terminal_releases_but_timeout_and_abort_retain() {
     let script = r#"
 import json, sys, time
+print('ready', flush=True)
 for line in sys.stdin:
     req = json.loads(line)
     if 'id' not in req: continue
@@ -111,7 +112,8 @@ for line in sys.stdin:
         let home = tempfile::tempdir().unwrap();
         let accepted = home.path().join("accepted");
         let python = python3_interpreter();
-        let mut client = McpClient::connect(python, &["-u".into(), "-c".into(), script.into(), accepted.to_string_lossy().into_owned()], &[], Duration::from_secs(30)).await.unwrap();
+        let mut client = generation_tests::ready_python_client(python, &["-u".into(), "-c".into(), script.into(), accepted.to_string_lossy().into_owned()]).await;
+        client.handshake().await.unwrap();
         client.timeout = if case == "abort" { Duration::from_secs(5) } else { Duration::from_millis(100) };
         let mut registry = ToolRegistry::from_clients_named(vec![("test".into(), client)], vec![]).await.unwrap();
         let boundary = Arc::new(Probe::default());
@@ -163,6 +165,7 @@ impl ClientCallBoundary for DiscoveryProbe {
 async fn discovery_boundary_filters_stdio_before_routing_and_rechecks_calls() {
     let script = r#"
 import json, sys
+print('ready', flush=True)
 for line in sys.stdin:
     req = json.loads(line)
     if 'id' not in req: continue
@@ -178,9 +181,10 @@ for line in sys.stdin:
         result = {'content':[{'type':'text','text':'called'}]}
     print(json.dumps({'jsonrpc':'2.0','id':req['id'],'result':result}), flush=True)
 "#;
-    let client = McpClient::connect(
-        python3_interpreter(), &["-u".into(), "-c".into(), script.into()], &[], Duration::from_secs(10),
-    ).await.unwrap();
+    let mut client = generation_tests::ready_python_client(
+        python3_interpreter(), &["-u".into(), "-c".into(), script.into()],
+    ).await;
+    client.handshake().await.unwrap();
     let boundary = Arc::new(DiscoveryProbe { denied: AtomicBool::new(false), observed: AtomicUsize::new(0) });
     let boundaries: HashMap<usize, Arc<dyn ClientCallBoundary>> = [(0, boundary.clone() as Arc<dyn ClientCallBoundary>)].into();
     let registry = ToolRegistry::from_client_slots_named_with_boundaries(

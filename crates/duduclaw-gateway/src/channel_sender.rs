@@ -502,7 +502,9 @@ pub fn create_sender_for_home(home_dir: &Path, target: &ChannelTarget, http: req
 // in `goal_notify.rs`, which made every other notifier import the goal module
 // to reach them; the capability is a channel transport, so it lives with the
 // channel transports. `channel_capabilities::interactive_buttons` mirrors
-// exactly the set of channels `send_with_markup` has an arm for.
+// the set of channels `send_with_markup` has an arm for, plus Google Chat,
+// whose goal cards are sent by `decision_notify::deliver_now_as` through
+// `googlechat::send_card_to_space_as` (HTTP transport only).
 // ---------------------------------------------------------------------------
 
 /// Send a message carrying inline buttons on one of the four button-capable

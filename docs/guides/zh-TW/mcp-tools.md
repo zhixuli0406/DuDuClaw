@@ -129,7 +129,7 @@ CIMD `private_key_jwt`。
 
 stdio `mcp-server` 每個行程最多在安全稽核寫一筆 `mcp_auth_failed`，不寫明細。
 
-外部金鑰與每位員工自己的 stdio `mcp-server` 不受影響。之後的版本會改成所有工具都以金鑰所屬員工的身分執行，再取消這項限制；v1.83.0 沒有變更這一點。
+外部金鑰與每位員工自己的 stdio `mcp-server` 不受影響。之後的版本會改成所有工具都以金鑰所屬員工的身分執行，再取消這項限制；目前版本沒有變更這一點。
 
 **升級後的 `config.toml [mcp_keys]`。** 閘道第一次以 v1.82 啟動時，會在同一筆交易裡把當下 `config.toml` 的 `[mcp_keys]` 項目指紋記為「待搬移」，再逐把搬進儲存區、寫入稽核紀錄，之後才從 `config.toml` 移除；全部搬完會寫下「搬移完成」標記。搬過來的金鑰保留用戶端、外部旗標與權限範圍，到期時間就是 v1.81 開始拒絕它的那一刻（`created_at` 加 31 天，以秒為單位）。搬過來的內部金鑰只有在用戶端 ID 剛好等於某位現有員工的代號，**而且**每個權限範圍都是員工專用金鑰可用的範圍（不含 `admin`）時才會綁定該員工，否則不綁定（HTTP 伺服器會拒絕它，見上文）。員工的舊金鑰若帶有 `admin` 或其他員工專用金鑰不能用的範圍，會照原樣搬移、範圍不變，但不綁定員工：金鑰頁標示「需要換發：權限範圍不適用於員工專用金鑰」，閘道紀錄也會以提示（`ddc_prod_…3f9a`）寫明。請以員工代號為這位員工建立新金鑰，再刪除舊的。綁定員工的金鑰只會生效員工專用的範圍，`admin` 不能代替其他範圍。`created_at` 比現在晚超過幾分鐘的項目一律不接受、不選用、不搬移（列為已忽略）。所有讀取端（MCP 伺服器、OAuth 同意頁、Google 金鑰檢查）都依下列規則：
 
@@ -226,7 +226,7 @@ Claude CLI 的 `minimal_context` 透過 `--tools` 控制內建 CLI 工具，不�
 - **新任務的上層任務**：閘道會告訴 MCP 伺服器這一輪在處理哪個任務（`DUDUCLAW_TASK_ID`，和核准卡片帶的是同一個值）。這個任務是呼叫者自己的、而且屬於[持續任務](continuous-responsibilities.md)的某一次執行（執行本身或它底下的任務，包括任務看板喚醒的子任務）時，沒給 `parent_task_id` 的 `tasks_create`（含 `kind="goal"`）會掛在它底下，員工自己給的 `parent_task_id` 必須是那個任務或它的子任務，否則拒絕。這個值存在但是空白或格式不對時一律拒絕，不會當成「沒有輪次」。其他情況（一般 goal 輪次、執行之外任務的看板喚醒、沒有輪次資訊）不預設上層任務。這一版對所有呼叫者都新增的規則：給了 `parent_task_id` 需要與上層任務有關係（指派、認領、建立或委派規則），v1.69 原本不檢查；`kind="goal"` 也接受 `parent_task_id`，v1.69 原本忽略；AI 員工在一個任務底下最多建 200 個尚未結束的子任務（`schedule` 建的例行工作與提醒不是子任務）。從 Bash 啟動的伺服器，以及 Grok 執行環境，拿不到輪次資訊；在那裡建立的任務除非員工指定這次執行為上層任務，否則不會掛到執行底下，也不計入它的花費。掛對位置還要靠員工改不了自己 `.mcp.json` 裡的 `duduclaw` 項目，這是另一項平台修補，必須先合併。
 - **例行工作**：`update_cron_task`、`delete_cron_task`、`pause_cron_task`、`run_cron_task` 要求呼叫者就是這筆例行工作的執行員工，或與它有關係。以 `name` 指定時只作用於一筆；多筆同名會被拒絕，並列出候選 id。
 - **提醒**：`create_reminder` 的 `agent_id` 不是呼叫者自己時，要與該員工有關係。
-- **對自己用 `agent_update`**：AI 員工不能對自己送出 `reports_to`、`db_sources`、`db_sources_add`、`db_sources_remove`、`budget_cents` 或 `role`（稽核 `agent_authority_refused`）。修改下屬不變。
+- **對自己用 `agent_update`**：AI 員工不能對自己送出 `reports_to`、`db_sources`、`db_sources_add`、`db_sources_remove`、`budget_cents`、`reply_language`、`memory_language`（v1.84.0）、`runtime`、`timeout_secs`、`max_turns` 或 `role`（稽核 `agent_authority_refused`）。修改下屬不變。
 
 操作者（不對應任何 AI 員工的 MCP 金鑰，且行程不是為某位員工啟動的）不受限。行程沒有員工身分時，內部共用金鑰不擁有任何紀錄，所以碰任何人的紀錄都會被拒絕。身分是系統 sender 名稱（`dashboard`、`cron` 等）的行程會被當成不受信任。每次拒絕都記在 `tool_calls.jsonl`。詳見[任務看板](../../features/zh-TW/24-task-board.md)、[委派隔離](../../features/zh-TW/37-delegation-isolation.md)。
 
@@ -401,6 +401,8 @@ AI 員工只能調整自己或下屬的設定，採用與 `agent_update` 相同�
 ### `memory_search`／`memory_read`／`decision_*`：聊天對話的讀取範圍（v1.83.0）
 
 員工行程在處理聊天對話的一輪時，`memory_search`、`memory_read`、`memory_fetch_batch`、`memory_search_by_layer`、`memory_get_history`、`memory_get_at` 與 `memory_improve` 只會回傳員工自己明確存下的記憶、管理員匯入或從舊系統移轉進來的記憶、以及系統從同一段對話整理出來的記憶。系統從其他對話自動整理出的記憶（重點事實、使用者偏好與其摘要、對話摘要、彙整後的記憶、記錄的待決事項）都不會回傳，沒有記錄來源的自動整理記憶也不會回傳；用 `memory_read` 讀取它的編號時，回答和編號不存在時相同。`user_profile_get` 與 `user_code_profile` 照同樣的規則：剩下的資料都來自其他對話時，回答和查無這位使用者的資料時相同。`decision_list` 與 `decision_resolve` 也只看得到這段對話記錄的待決事項，其他對話的待決事項編號會得到「找不到」。`memory_successful_conversations` 只回傳依同樣規則看得到的紀錄（先套用規則再取 `limit` 筆，對話不明時不回傳任何紀錄），`group_history_read` 只能讀取這段對話所屬的群組或討論串（一對一私人對話不能讀取任何群組，其他目標一律得到一般的「無法使用」回答），`memory_invalidate_by_origin`、`memory_episodic_pressure` 與 `memory_consolidation_status` 涵蓋員工的所有對話，會以固定的錯誤訊息拒絕。排程與交辦工作、外部 MCP 用戶端的行為不變。
+
+**v1.84.0 的聊天回合。** `memory_search`、`memory_search_by_layer`、`memory_get_at` 與 `memory_improve` 現在在搜尋本身就套用對話規則（全文搜尋、關聯排序與向量搜尋都只計算這段對話看得到的資料），其他對話的記憶不會在套用 `limit` 之前把這段對話自己的結果擠掉；`memory_get_at` 即使另一段對話記了較新的值，也會回傳這段對話在該時間點最新的值。`memory_get_history` 維持 v1.83.0 的查詢後過濾。`memory_store` 被拒時不再透露其他對話的資訊：重複檢查只比對這段對話看得到的記憶，回覆 "Not stored: this is already remembered (a near-identical memory exists)."；信任保護回覆 "Not stored: a more trusted value already exists, so it was not changed."；兩者都不帶編號（編號只寫進伺服器紀錄）。員工明確存下的記憶，取代與信任保護仍以整位員工為範圍，所以另一段對話的資料仍可能造成第二種拒絕。使用者輪廓改以平台加使用者代號為鍵（`user:<channel>:<id>`，網頁對話維持 `user:webchat:<owner>`），平台一律取自這一輪對話，不採用參數；無法確認這一輪屬於哪段對話時，`user_profile_record` 會拒絕。一段對話記下的輪廓值，包括員工在聊天回合中自己用 `user_profile_record` 寫入的值，不會再取代另一段對話的值；排程或交辦工作寫入的值以 `user:<id>` 為鍵，以整位員工為範圍判斷。相對地，員工用 `memory_store` 存下的條目，會取代所有對話裡同一件事的舊值。升級後第一次啟動時，來源全部來自同一個平台對話的既有輪廓資料會改寫成新鍵一次；來源混合多個平台、來源不是對話或沒有來源的資料維持 `user:<id>`，只在 LINE 與 Discord、看不到新資料時當作備用讀取，而且代號格式要正確（LINE：`U` 加 32 個十六進位字元；Discord：17 到 20 位數字）。排程、交辦工作與外部 MCP 用戶端仍照傳入的值存取輪廓（要找通道上的輪廓請傳 `telegram:alice` 這種格式）。聊天回合中的 wiki 工具見 [Wiki 知識層](../../features/zh-TW/17-wiki-knowledge-layer.md)。
 
 ### `knowledge_*`：文件知識庫
 

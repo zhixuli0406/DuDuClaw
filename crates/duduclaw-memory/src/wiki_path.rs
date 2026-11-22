@@ -5,11 +5,12 @@
 //! surface that does that join goes through this module so the rules live in
 //! one place:
 //!
-//! - [`validate_relative_wiki_path`] is the string-level gate: the path must
-//!   be relative, with no NUL, no `..`, no percent-encoded separators, no
-//!   Windows drive prefix (`C:\x`, `C:x.md`) and no `Prefix` / `RootDir` /
-//!   `ParentDir` component. It does not look at the disk, so it runs first
-//!   and an invalid path never reaches `stat`/`exists`.
+//! - [`validate_relative_wiki_path`] is the strict gate for writes: relative
+//!   paths only, no control characters, traversal or encoded separators, no
+//!   drive prefixes, trailing dots/spaces, Windows device names, backslashes,
+//!   ADS colons or ambiguous DOS short-name tildes on every platform.
+//! - [`validate_relative_wiki_read_path`] also accepts existing Unix names
+//!   with trailing dots/spaces or device names. Windows stays strict.
 //! - [`ensure_within_wiki_dir`] canonicalizes the nearest existing ancestor
 //!   of the target (the target itself when it exists) and refuses anything
 //!   that resolves outside the canonical wiki directory. Every failure to
@@ -24,13 +25,179 @@
 //!   with `O_EXCL` so a planted `*.md.tmp` symlink is never written through.
 //!
 //! Residual race: a directory component swapped for a symlink after
-//! [`ensure_within_wiki_dir`] and before the open is not caught (only the
-//! last component is opened with `O_NOFOLLOW`). Closing that needs
+//! resolution and the open is not caught if a component of the resolved
+//! parent itself is replaced. The original alias is no longer traversed by
+//! the open; only the final component is opened with `O_NOFOLLOW`. Closing
+//! the remaining window needs
 //! `openat` walking per component; the writer of such a swap already has
 //! write access inside the wiki directory.
 
 use std::io;
 use std::path::{Component, Path, PathBuf};
+
+/// The single filesystem-path → page-id boundary used by every wiki walker.
+/// Keep ids as strings; converting back to PathBuf lets later OS operations
+/// reintroduce native separators. Never lossy-decode or drop a component.
+pub fn page_id_from_relative_path(path: &Path) -> Option<String> {
+    let mut parts = Vec::new();
+    for part in path.components() {
+        match part {
+            Component::Normal(name) => {
+                let name = name.to_str()?;
+                // A literal backslash in a Unix filename is not a directory.
+                // Omit it rather than alias another physical page's registry.
+                if name.contains('\\') { return None; }
+                parts.push(name);
+            }
+            Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    let id = parts.join("/");
+    validate_relative_wiki_read_path(&id).ok()?;
+    Some(id)
+}
+
+pub use duduclaw_core::wiki_auto_namespace::canonical_page_id;
+
+/// Canonicalize untrusted input at the API boundary, before any policy check.
+pub fn canonical_page_argument(path: &str) -> io::Result<String> {
+    let id = canonical_page_id(path).ok_or_else(|| invalid("invalid wiki page id"))?;
+    validate_relative_wiki_read_path(&id).map_err(|e| invalid(&e))?;
+    Ok(id)
+}
+
+/// Normalize page-valued fields before dispatch authorization. Search query
+/// text, namespace names and document content are deliberately not paths.
+pub fn canonicalize_wiki_arguments(args: &mut serde_json::Value) -> io::Result<()> {
+    for field in ["page_path", "center"] {
+        if let Some(value) = args.get_mut(field) {
+            let raw = value.as_str().ok_or_else(|| invalid("page id must be a string"))?;
+            *value = serde_json::Value::String(canonical_page_argument(raw)?);
+        }
+    }
+    Ok(())
+}
+
+/// Low-level I/O accepts identities, never alternate spellings.
+fn require_canonical_id(id: &str) -> io::Result<()> {
+    if canonical_page_id(id).as_deref() != Some(id) {
+        return Err(invalid("non-canonical wiki page id"));
+    }
+    Ok(())
+}
+
+/// Both identities participate in policy; registry/trust keys use `id`.
+#[derive(Debug)]
+pub struct ResolvedWikiPage {
+    pub id: String,
+    pub full_path: PathBuf,
+    pub is_auto: bool,
+    /// Whether the final component existed during resolution; opens recheck it.
+    pub exists: bool,
+}
+
+/// Resolve the parent chain (including Windows junctions) before classifying
+/// a page. A missing final component is accepted for writes and auto policy
+/// checks; ordinary reads return NotFound. Missing parents return NotFound.
+/// Opens use this resolved parent, retaining no-follow protection on the final name.
+pub fn resolve_wiki_page(wiki_dir: &Path, id: &str, write: bool) -> io::Result<ResolvedWikiPage> {
+    require_canonical_id(id)?;
+    validate_relative_wiki_read_path(id).map_err(|e| invalid(&e))?;
+    let root = wiki_dir.canonicalize()?;
+    let lexical = root.join(id);
+    let parent = lexical.parent().ok_or_else(|| invalid("missing page parent"))?.canonicalize()?;
+    if !parent.starts_with(&root) { return Err(denied("resolved parent escapes wiki directory")); }
+    let full_path = parent.join(lexical.file_name().ok_or_else(|| invalid("missing page name"))?);
+    let resolved = page_id_from_relative_path(full_path.strip_prefix(&root)
+        .map_err(|_| denied("resolved path escapes wiki directory"))?)
+        .ok_or_else(|| invalid("invalid resolved wiki page id"))?;
+    require_canonical_id(&resolved)?;
+    let is_auto = duduclaw_core::wiki_auto_namespace::is_auto_page_path(id)
+        || duduclaw_core::wiki_auto_namespace::is_auto_page_path(&resolved);
+    // Classify before checking existence so an auto alias cannot disclose
+    // whether a page exists by bypassing the auto policy on missing files.
+    let exists = match std::fs::symlink_metadata(&full_path) {
+        Ok(meta) => {
+            if is_link_metadata(&meta) || !meta.is_file() {
+                return Err(denied("wiki page is not a regular file"));
+            }
+            true
+        }
+        Err(e) if (write || is_auto) && e.kind() == io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e),
+    };
+    Ok(ResolvedWikiPage { id: resolved, full_path, is_auto, exists })
+}
+
+pub use duduclaw_core::fs_safety::is_link_metadata;
+
+/// Employee writes may create ordinary directories, but must classify every
+/// existing ancestor before creating anything below it. A missing directory
+/// is created explicitly; it is never treated as a successful resolution.
+pub fn prepare_employee_wiki_write(wiki_dir: &Path, id: &str) -> io::Result<ResolvedWikiPage> {
+    prepare_wiki_write_with_policy(wiki_dir, id, |id| {
+        if duduclaw_core::wiki_auto_namespace::is_auto_page_path(id) {
+            Err(denied("auto namespace is host-owned"))
+        } else { Ok(()) }
+    })
+}
+
+/// Authorize the lexical id and each resolved target BEFORE creating missing
+/// parents. Existing but unresolvable parents (including dangling links) deny.
+/// This is separate from `resolve_wiki_page`, which never ignores a missing
+/// parent. Ordinary nested-folder creation remains available to writers.
+pub fn prepare_wiki_write_with_policy(
+    wiki_dir: &Path, id: &str, authorize: impl Fn(&str) -> io::Result<()>,
+) -> io::Result<ResolvedWikiPage> {
+    require_canonical_id(id)?;
+    validate_relative_wiki_path(id).map_err(|e| invalid(&e))?;
+    authorize(id)?;
+    std::fs::create_dir_all(wiki_dir)?;
+    let root = wiki_dir.canonicalize()?;
+    let mut parent = root.clone();
+    let parts: Vec<_> = id.split('/').collect();
+    for (index, part) in parts.iter().take(parts.len() - 1).enumerate() {
+        let next = parent.join(part);
+        let resolved = match std::fs::symlink_metadata(&next) {
+            Ok(_) => next.canonicalize()?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // This full prospective id was authorized at the previous step.
+                authorize(&page_id_from_relative_path(
+                    &next.strip_prefix(&root).map_err(|_| denied("parent escapes wiki"))?
+                        .join(parts[index + 1..].join("/")),
+                ).ok_or_else(|| invalid("invalid parent"))?)?;
+                std::fs::create_dir(&next)?;
+                next.canonicalize()?
+            }
+            Err(e) => return Err(e),
+        };
+        let relative = resolved.strip_prefix(&root)
+            .map_err(|_| denied("resolved parent escapes wiki directory"))?;
+        let prospective = relative.join(parts[index + 1..].join("/"));
+        let resolved_id = page_id_from_relative_path(&prospective)
+            .ok_or_else(|| invalid("invalid resolved page id"))?;
+        authorize(&resolved_id)?;
+        if !resolved.is_dir() { return Err(denied("page parent is not a directory")); }
+        parent = resolved;
+    }
+    let page = resolve_wiki_page(wiki_dir, id, true)?;
+    authorize(&page.id)?;
+    Ok(page)
+}
+
+/// Old persisted separator spellings become canonical identities at the
+/// persistence boundary; malformed ids have no fallback identity.
+pub fn persisted_page_id(path: &str) -> Option<String> {
+    canonical_page_id(path)
+}
+
+/// Compare an index link with a page id across old persisted separator forms.
+pub fn index_line_links_to(line: &str, path: &str) -> bool {
+    let Some(key) = persisted_page_id(path) else { return false; };
+    line.split("](").skip(1).filter_map(|rest| rest.split_once(')'))
+        .any(|(target, _)| persisted_page_id(target).as_ref() == Some(&key))
+}
 
 /// Why a path was refused, as an `io::Error` kind the callers can match:
 /// `InvalidInput` for a malformed path, `PermissionDenied` for a path that
@@ -48,6 +215,19 @@ fn denied(msg: &str) -> io::Error {
 /// Does not check the `.md` suffix or reserved names (callers differ: reads
 /// may open `_index.md`, writes may not). Never touches the filesystem.
 pub fn validate_relative_wiki_path(path: &str) -> std::result::Result<(), String> {
+    if path.contains('\\') {
+        return Err("Use forward slashes in page_path".to_string());
+    }
+    validate_relative_wiki_path_mode(path, true)
+}
+
+/// Read-only compatibility for existing names that have no aliases on Unix.
+/// Windows uses the same strict component rules in both modes.
+pub fn validate_relative_wiki_read_path(path: &str) -> std::result::Result<(), String> {
+    validate_relative_wiki_path_mode(path, cfg!(windows))
+}
+
+fn validate_relative_wiki_path_mode(path: &str, strict: bool) -> std::result::Result<(), String> {
     if path.is_empty() {
         return Err("page_path is required".to_string());
     }
@@ -72,19 +252,59 @@ pub fn validate_relative_wiki_path(path: &str) -> std::result::Result<(), String
     if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
         return Err("Drive-prefixed paths are not allowed".to_string());
     }
-    // On Windows a `:` anywhere names an NTFS alternate data stream.
-    if cfg!(windows) && path.contains(':') {
-        return Err("':' is not allowed in page_path".to_string());
+    // Writes use portable ids on every OS; reads retain existing Unix names.
+    if strict && path.contains([':', '~']) {
+        return Err("Streams and short-name aliases are not allowed in page_path".to_string());
+    }
+    if path.chars().any(char::is_control) {
+        return Err("Control characters are not allowed in page_path".to_string());
     }
     for component in Path::new(path).components() {
-        if matches!(
-            component,
-            Component::Prefix(_) | Component::RootDir | Component::ParentDir
-        ) {
-            return Err("Path must stay inside the wiki directory".to_string());
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::ParentDir => {
+                return Err("Path must stay inside the wiki directory".to_string());
+            }
+            Component::CurDir => {}
+            Component::Normal(name) => {
+                let Some(name) = name.to_str() else {
+                    return Err("page_path must be valid UTF-8".to_string());
+                };
+                if strict {
+                    check_component(name)?;
+                }
+            }
         }
     }
     Ok(())
+}
+
+/// Strict write rules keep newly created pages portable; Windows reads
+/// also need them because Win32 aliases these names.
+fn check_component(name: &str) -> std::result::Result<(), String> {
+    if name.ends_with('.') || name.ends_with(' ') {
+        return Err("A path component may not end with '.' or a space".to_string());
+    }
+    if is_windows_device_name(name) {
+        return Err("Windows reserved device names are not allowed in page_path".to_string());
+    }
+    Ok(())
+}
+
+/// Whether `name` (one path component) is a Windows reserved device name:
+/// the part before the first `.` (trailing spaces ignored, as Windows does),
+/// compared without regard to case. Public so writers that build page names
+/// (e.g. the auto-page slug check) refuse the same names this validator does.
+pub fn is_windows_device_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name).trim_end_matches(' ');
+    let upper = stem.to_uppercase();
+    if matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$") {
+        return true;
+    }
+    let mut chars = upper.chars();
+    let head: String = chars.by_ref().take(3).collect();
+    let digit: Vec<char> = chars.collect();
+    (head == "COM" || head == "LPT")
+        && matches!(digit.as_slice(), [d] if d.is_ascii_digit() || matches!(d, '¹' | '²' | '³'))
 }
 
 /// Refuse `full` (a path under `wiki_dir`) when its nearest existing
@@ -128,56 +348,33 @@ pub fn ensure_within_wiki_dir(wiki_dir: &Path, full: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Open `full` for reading without following a symlink in its last
-/// component. On unix `O_NOFOLLOW` makes the open itself fail on a link; on
-/// Windows `FILE_FLAG_OPEN_REPARSE_POINT` opens the link instead of its
-/// target, which the `fstat` check below then refuses.
-fn open_nofollow(full: &Path) -> io::Result<std::fs::File> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    options.open(full)
-}
-
 /// Read one wiki file as UTF-8 without following symlinks.
 ///
-/// `rel` must pass [`validate_relative_wiki_path`] (checked here again). The
+/// `rel` must pass [`validate_relative_wiki_read_path`] (checked here again). The
 /// file must be a regular file (not a link, directory or device) both before
 /// and after opening, and must stay inside the wiki directory. A missing
 /// file returns `NotFound` so callers can say "page not found".
 pub fn read_wiki_file_nofollow(wiki_dir: &Path, rel: &str) -> io::Result<String> {
+    require_canonical_id(rel)?;
+    validate_relative_wiki_read_path(rel).map_err(|e| invalid(&e))?;
+    let target = resolve_wiki_page(wiki_dir, rel, false)?;
+    read_resolved_wiki_file_nofollow(&target)
+}
+
+/// Open the same resolved target that the caller classified. Never traverse
+/// the original directory alias a second time after authorization.
+pub fn read_resolved_wiki_file_nofollow(target: &ResolvedWikiPage) -> io::Result<String> {
     use std::io::Read;
-    validate_relative_wiki_path(rel).map_err(|e| invalid(&e))?;
-    let full = wiki_dir.join(rel);
-    let meta = std::fs::symlink_metadata(&full)?;
-    if meta.file_type().is_symlink() || !meta.is_file() {
-        return Err(denied("wiki page is not a regular file"));
-    }
-    ensure_within_wiki_dir(wiki_dir, &full)?;
-    let mut file = open_nofollow(&full).map_err(|e| {
-        if e.kind() == io::ErrorKind::NotFound {
-            e
-        } else {
-            denied("wiki page cannot be opened")
-        }
-    })?;
-    let opened = file.metadata()?;
-    if !opened.is_file() || opened.file_type().is_symlink() {
-        return Err(denied("wiki page is not a regular file"));
-    }
+    let mut file = open_resolved_wiki_file_nofollow(target)?;
     let mut content = String::new();
     file.read_to_string(&mut content)?;
     Ok(content)
+}
+
+/// Open a validated target once; callers use this handle for both metadata
+/// and bounded reads, so the size check and bytes refer to the same file.
+pub fn open_resolved_wiki_file_nofollow(target: &ResolvedWikiPage) -> io::Result<std::fs::File> {
+    duduclaw_core::fs_safety::open_regular_file_nofollow(&target.full_path)
 }
 
 /// Validate `rel`, confirm the target stays inside `wiki_dir`, then create
@@ -186,6 +383,12 @@ pub fn read_wiki_file_nofollow(wiki_dir: &Path, rel: &str) -> io::Result<String>
 /// make this create directories outside the wiki. `wiki_dir` itself is
 /// created first (it is operator-controlled, not caller-supplied).
 pub fn prepare_wiki_write_target(wiki_dir: &Path, rel: &str) -> io::Result<PathBuf> {
+    Ok(prepare_wiki_write_page(wiki_dir, rel)?.full_path)
+}
+
+/// Prepare once and return both the I/O path and the identity for metadata.
+pub fn prepare_wiki_write_page(wiki_dir: &Path, rel: &str) -> io::Result<ResolvedWikiPage> {
+    require_canonical_id(rel)?;
     validate_relative_wiki_path(rel).map_err(|e| invalid(&e))?;
     std::fs::create_dir_all(wiki_dir)?;
     let full = wiki_dir.join(rel);
@@ -194,15 +397,15 @@ pub fn prepare_wiki_write_target(wiki_dir: &Path, rel: &str) -> io::Result<PathB
         std::fs::create_dir_all(parent)?;
         ensure_within_wiki_dir(wiki_dir, parent)?;
     }
-    // The page itself, when present, must be a regular file or a link the
-    // rename below replaces (never follows); a directory there is refused.
+    // The resolver below refuses a final symlink/reparse point or directory;
+    // a link swapped in later is replaced by rename, never followed.
     match std::fs::symlink_metadata(&full) {
         Ok(m) if m.is_dir() => return Err(denied("wiki page path is a directory")),
         Ok(_) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    Ok(full)
+    resolve_wiki_page(wiki_dir, rel, true)
 }
 
 /// Write `content` to `full` through a temp file + rename. The temp file is
@@ -252,6 +455,108 @@ pub fn atomic_write_nofollow_checked(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn file_io_refuses_noncanonical_ids_after_boundary_normalization() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("departments/hr")).unwrap();
+        std::fs::write(tmp.path().join("departments/hr/salary.md"), "private salary").unwrap();
+        for id in [r"departments\hr\salary.md", r"departments/hr\salary.md", r".\departments\hr\salary.md", "./departments/hr/salary.md", "departments//hr/salary.md"] {
+            assert_eq!(canonical_page_argument(id).unwrap(), "departments/hr/salary.md");
+            assert_eq!(read_wiki_file_nofollow(tmp.path(), id).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+            assert!(prepare_wiki_write_target(tmp.path(), id).is_err());
+        }
+        assert_eq!(read_wiki_file_nofollow(tmp.path(), "departments/hr/salary.md").unwrap(), "private salary");
+    }
+
+    #[test]
+    fn missing_page_under_ordinary_parent_is_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("notes")).unwrap();
+        let error = resolve_wiki_page(tmp.path(), "notes/none.md", false).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_page_under_auto_alias_is_auto() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("auto")).unwrap();
+        std::os::unix::fs::symlink("auto", tmp.path().join("public-alias")).unwrap();
+        let target = resolve_wiki_page(tmp.path(), "public-alias/none.md", false).unwrap();
+        assert!(target.is_auto);
+        assert!(!target.exists);
+        assert_eq!(target.id, "auto/none.md");
+        assert_eq!(read_resolved_wiki_file_nofollow(&target).unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert!(prepare_employee_wiki_write(tmp.path(), "public-alias/none.md").is_err());
+    }
+
+    #[test]
+    fn missing_page_parent_is_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let error = resolve_wiki_page(tmp.path(), "missing-parent/none.md", false).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn existing_ordinary_page_is_ordinary() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("notes")).unwrap();
+        std::fs::write(tmp.path().join("notes/page.md"), "ordinary").unwrap();
+        let target = resolve_wiki_page(tmp.path(), "notes/page.md", false).unwrap();
+        assert!(!target.is_auto);
+        assert!(target.exists);
+        assert_eq!(target.id, "notes/page.md");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_parent_classifies_auto_and_keeps_ordinary_links_working() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki = tmp.path();
+        std::fs::create_dir_all(wiki.join("auto/sop")).unwrap();
+        std::fs::create_dir_all(wiki.join("ordinary")).unwrap();
+        std::fs::write(wiki.join("auto/sop/secret.md"), "private").unwrap();
+        std::fs::write(wiki.join("ordinary/page.md"), "ordinary").unwrap();
+        symlink("auto", wiki.join("public-alias")).unwrap();
+        symlink("ordinary", wiki.join("ordinary-alias")).unwrap();
+        let target = resolve_wiki_page(wiki, "public-alias/sop/secret.md", false).unwrap();
+        assert!(target.is_auto);
+        assert_eq!(target.id, "auto/sop/secret.md");
+        assert!(prepare_employee_wiki_write(wiki, "public-alias/sop/secret.md").is_err());
+        assert!(prepare_employee_wiki_write(wiki, "public-alias/new/secret.md").is_err());
+        assert!(!wiki.join("auto/new").exists());
+        assert!(resolve_wiki_page(wiki, "ordinary/missing-parent/new.md", true).is_err());
+        let target = prepare_employee_wiki_write(wiki, "ordinary-alias/new/page.md").unwrap();
+        assert!(!target.is_auto);
+        assert_eq!(target.id, "ordinary/new/page.md");
+        atomic_write_nofollow(&target.full_path, "new ordinary").unwrap();
+        assert_eq!(read_wiki_file_nofollow(wiki, "ordinary-alias/new/page.md").unwrap(), "new ordinary");
+        // Either spelling being auto is enough, including an outward alias.
+        symlink("../ordinary", wiki.join("auto/outward")).unwrap();
+        assert!(resolve_wiki_page(wiki, "auto/outward/page.md", false).unwrap().is_auto);
+        symlink("absent", wiki.join("dangling")).unwrap();
+        assert!(resolve_wiki_page(wiki, "dangling/new.md", true).is_err());
+        assert!(prepare_employee_wiki_write(wiki, "dangling/new.md").is_err());
+        symlink("ordinary/page.md", wiki.join("file-link.md")).unwrap();
+        assert!(read_wiki_file_nofollow(wiki, "file-link.md").is_err());
+        assert!(prepare_employee_wiki_write(wiki, "file-link.md").is_err());
+    }
+
+    #[test]
+    fn strict_writes_refuse_foreign_separators_and_ambiguous_aliases() {
+        for path in [
+            r"auto\sop\x.md", r"auto/sop\x.md", r".\auto\x.md",
+            r"AUTO\x.md", r"auto\\x.md", r"a\..\auto\x.md",
+            r"concepts\x.md", "auto:stream/x.md", "AUTO~1/x.md",
+        ] {
+            assert!(validate_relative_wiki_path(path).is_err(), "{path:?}");
+        }
+        assert_eq!(page_id_from_relative_path(&Path::new("auto").join("sop").join("x.md")).as_deref(), Some("auto/sop/x.md"));
+        assert!(index_line_links_to(r"- [title](.\auto\sop\x.md)", "auto/sop/x.md"));
+    }
 
     #[test]
     fn revoked_after_staging_sync_does_not_publish_or_leave_staging_file() {
@@ -311,6 +616,80 @@ mod tests {
     fn windows_drive_forms_are_refused_on_every_platform() {
         for bad in ["C:\\x.md", "C:x.md", "c:/x.md", "z:", "D:sub\\x.md"] {
             assert!(validate_relative_wiki_path(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// New writes refuse nonportable alias/device names on every platform.
+    #[test]
+    fn windows_alias_forms_are_refused_for_writes_on_every_platform() {
+        let trailing = [
+            "auto./sop/x.md",
+            "auto /sop/x.md",
+            "auto/sop./x.md",
+            "auto/sop /x.md",
+            "auto/sop/x.md.",
+            "auto/sop/x.md ",
+            "auto. ./x.md",
+            "a.md...",
+        ];
+        let devices = [
+            "con.md",
+            "CON",
+            "entities/Aux.md",
+            "nul.tar.md",
+            "prn .md",
+            "auto/COM1.md",
+            "com9.md",
+            "lpt1/x.md",
+            "LPT9.md",
+            "com\u{b9}.md",
+            "conin$.md",
+            "CONOUT$.md",
+        ];
+        let streams = ["a.md:stream", "auto/x.md::$DATA", "dir:x/a.md", "時間:10.md"];
+        let controls = ["a\u{1}b.md", "auto\t/x.md", "a/b\n.md", "a\u{7f}.md", "a\u{85}.md"];
+        for bad in trailing.iter().chain(&devices).chain(&controls) {
+            assert!(validate_relative_wiki_path(bad).is_err(), "{bad:?}");
+        }
+        for path in streams {
+            assert!(validate_relative_wiki_path(path).is_err(), "{path}");
+        }
+        for bad in controls {
+            assert!(validate_relative_wiki_read_path(bad).is_err(), "{bad:?}");
+        }
+        // Names that only resemble the refused forms stay valid.
+        for ok in [
+            "concepts/a.md",
+            "console.md",
+            "auxiliary/x.md",
+            "com10.md",
+            "lpt.md",
+            "comma.md",
+            "nul-hypothesis.md",
+            "a. b.md",
+            ".hidden/x.md",
+            "./auto/x.md",
+            "auto/sop/x-y.md",
+            "實體/王先生.md",
+        ] {
+            assert!(validate_relative_wiki_path(ok).is_ok(), "{ok:?}");
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn read_mode_accepts_existing_nonportable_names() {
+        for path in ["時間:10.md", "v1./page.md", "aux.md", "auto /page.md", "auto./page.md"] {
+            assert!(validate_relative_wiki_read_path(path).is_ok(), "{path}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn both_modes_refuse_windows_aliases_and_streams() {
+        for path in ["時間:10.md", "v1./page.md", "aux.md", "auto /page.md", "auto./page.md"] {
+            assert!(validate_relative_wiki_path(path).is_err(), "{path}");
+            assert!(validate_relative_wiki_read_path(path).is_err(), "{path}");
         }
     }
 

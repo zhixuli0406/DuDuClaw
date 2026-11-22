@@ -21,10 +21,26 @@ const MAX_ACTIVE_WIKI_SOURCES: usize = 10_000;
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 
 struct LiveWikiPage {
+    page_id: String,
     body: String,
     raw_sha256: String,
     body_sha256: String,
     updated_at: i64,
+}
+
+// The caller has already canonicalized the API argument. Resolve once and
+// use the exact opened target for size, bytes, parsed identity and provenance.
+fn read_live_page(store: &WikiStore, page_path: &str) -> Option<(crate::wiki::WikiPage, String, bool)> {
+    use std::io::Read;
+    store.validate_read_page_path(page_path).ok()?;
+    let target = crate::wiki_path::resolve_wiki_page(store.wiki_dir(), page_path, false).ok()?;
+    let file = crate::wiki_path::open_resolved_wiki_file_nofollow(&target).ok()?;
+    if file.metadata().ok()?.len() > MAX_BODY_BYTES as u64 { return None; }
+    let mut raw = String::new();
+    file.take(MAX_BODY_BYTES as u64 + 1).read_to_string(&mut raw).ok()?;
+    if raw.len() > MAX_BODY_BYTES { return None; }
+    let page = crate::wiki::parse_wiki_page(&target.id, &raw).ok()?;
+    Some((page, raw, target.is_auto))
 }
 
 fn shared_policy_digest(home: &Path, page_path: &str) -> Option<String> {
@@ -48,15 +64,28 @@ fn shared_policy_digest(home: &Path, page_path: &str) -> Option<String> {
     } else {
         content.parse().ok()?
     };
-    let namespace = page_path.split('/').next()?;
+    let namespace = duduclaw_core::wiki_top_level_namespace(page_path);
     let namespaces = match table.get("namespaces") {
         Some(value) => Some(value.as_table()?),
         None => None,
     };
-    let declared = match namespaces.and_then(|namespaces| namespaces.get(namespace)) {
-        Some(value) => Some(value.as_table()?),
-        None => None,
-    };
+    let declared = if let Some(namespaces) = namespaces {
+        let mut matches = namespaces.iter().filter(|(key, _)| {
+            duduclaw_core::wiki_auto_namespace::fold_segment(key)
+                == duduclaw_core::wiki_auto_namespace::fold_segment(namespace)
+        });
+        let first = matches.next();
+        // Ambiguous filesystem-equivalent declarations cannot attest a source.
+        if matches.next().is_some() { return None; }
+        match first {
+            Some((key, _)) if key != namespace => {
+                duduclaw_core::wiki_auto_namespace::warn_denied_alias(None, namespace);
+                return None;
+            }
+            Some((_, value)) => Some(value.as_table()?),
+            None => None,
+        }
+    } else { None };
     let mode = match declared.and_then(|entry| entry.get("mode")) {
         Some(value) => value.as_str()?,
         None => "agent_writable",
@@ -83,16 +112,8 @@ fn live_shared_page(home: &Path, page_path: &str) -> Option<LiveWikiPage> {
     if wiki_dir.canonicalize().ok()? != canonical_home.join("shared/wiki") {
         return None;
     }
-    // Validate BEFORE touching the filesystem: an unvalidated `page_path`
-    // would otherwise let the size probe below stat a path outside the wiki
-    // tree (a file-existence/size oracle), even though the read itself is
-    // refused.
     let store = WikiStore::new_shared(home);
-    store.validate_page_path(page_path).ok()?;
-    if std::fs::metadata(wiki_dir.join(page_path)).ok()?.len() > MAX_BODY_BYTES as u64 {
-        return None;
-    }
-    let (page, raw) = store.read_page_with_raw(page_path).ok()?;
+    let (page, raw, _) = read_live_page(&store, page_path)?;
     if raw.len() > MAX_BODY_BYTES
         || page.body.is_empty()
         || page.body.len() > MAX_BODY_BYTES
@@ -101,9 +122,10 @@ fn live_shared_page(home: &Path, page_path: &str) -> Option<LiveWikiPage> {
     {
         return None;
     }
-    let policy = shared_policy_digest(home, page_path)?;
+    let policy = shared_policy_digest(home, &page.path)?;
     let raw_sha = format!("{:x}", Sha256::digest(raw.as_bytes()));
     Some(LiveWikiPage {
+        page_id: page.path,
         body_sha256: format!("{:x}", Sha256::digest(page.body.as_bytes())),
         raw_sha256: format!("{raw_sha}:{policy}"),
         body: page.body,
@@ -192,13 +214,16 @@ fn live_page(
     if canonical_wiki != canonical_home.join("agents").join(agent_id).join("wiki") {
         return None;
     }
-    // Validate BEFORE the size probe — see `live_shared_page`.
     let store = WikiStore::new(wiki_dir.clone());
-    store.validate_page_path(page_path).ok()?;
-    if std::fs::metadata(wiki_dir.join(page_path)).ok()?.len() > MAX_BODY_BYTES as u64 {
-        return None;
+    let (page, raw, is_auto) = read_live_page(&store, page_path)?;
+    // Causal evidence has no conversation identity. As with other readers
+    // without a session, only host-attested promoted auto pages may enter it.
+    if is_auto {
+        let registry = crate::wiki_auto_registry::AutoPageRegistry::load(home, agent_id);
+        if !registry.current_promoted(&page.path, &raw) {
+            return None;
+        }
     }
-    let (page, raw) = store.read_page_with_raw(page_path).ok()?;
     if raw.len() > MAX_BODY_BYTES
         || page.do_not_inject
         || page.trust < 0.1
@@ -208,12 +233,13 @@ fn live_page(
         return None;
     }
     if let Some(trust) = trust {
-        let state = trust.get(page_path, agent_id).ok()?;
+        let state = trust.get(&page.path, agent_id).ok()?;
         if state.is_some_and(|state| state.do_not_inject || state.trust < 0.1) {
             return None;
         }
     }
     Some(LiveWikiPage {
+        page_id: page.path,
         raw_sha256: format!("{:x}", Sha256::digest(raw.as_bytes())),
         body_sha256: format!("{:x}", Sha256::digest(page.body.as_bytes())),
         body: page.body,
@@ -342,10 +368,14 @@ impl CausalStore {
         if page_path.trim().is_empty() {
             return Err(CausalStoreError::InvalidInput);
         }
+        let canonical = crate::wiki_path::canonical_page_argument(page_path)
+            .map_err(|_| CausalStoreError::NotFound)?;
+        let page_path = canonical.as_str();
         let home: PathBuf = home_for(self.path())?.into();
         let mut conn = self.open()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let live = live_shared_page(&home, page_path).ok_or(CausalStoreError::NotFound)?;
+        let page_path = live.page_id.as_str();
         let scope = EvidenceScope {
             tenant_id: SHARED_WIKI_TENANT.into(),
             acl: SHARED_WIKI_ACL.into(),
@@ -419,12 +449,16 @@ impl CausalStore {
         if !duduclaw_core::is_valid_agent_id(agent_id) || page_path.trim().is_empty() {
             return Err(CausalStoreError::InvalidInput);
         }
+        let canonical = crate::wiki_path::canonical_page_argument(page_path)
+            .map_err(|_| CausalStoreError::NotFound)?;
+        let page_path = canonical.as_str();
         let home: PathBuf = home_for(self.path())?.into();
         let mut conn = self.open()?;
         let trust = trust_store(&home)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let live = live_page(&home, agent_id, page_path, trust.as_ref())
             .ok_or(CausalStoreError::NotFound)?;
+        let page_path = live.page_id.as_str();
         let scope = EvidenceScope {
             tenant_id: agent_id.into(),
             acl: WIKI_ACL.into(),
@@ -491,6 +525,78 @@ impl CausalStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_policy_digest_denies_namespace_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let wiki = dir.path().join("shared/wiki");
+        std::fs::create_dir_all(&wiki).unwrap();
+        for (key, alias) in [("café", "cafe\u{301}"), ("cafe\u{301}", "café")] {
+            std::fs::write(wiki.join(".scope.toml"), format!(
+                "[namespaces.\"{key}\"]\nmode = 'agent_writable'\n"
+            )).unwrap();
+            assert!(shared_policy_digest(dir.path(), &format!("{alias}/x.md")).is_none());
+            assert!(shared_policy_digest(dir.path(), &format!("{key}/x.md")).is_some());
+        }
+    }
+
+    #[test]
+    fn causal_ingest_canonical_separators_share_agent_and_shared_identity() {
+        let (dir, store, page) = fixture();
+        let shared = dir.path().join("shared/wiki/sources");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::copy(page, shared.join("queue.md")).unwrap();
+        for shared in [false, true] {
+            let import = |path| if shared { store.import_shared_wiki_source(path) }
+                else { store.import_agent_wiki_source("agent-a", path) };
+            let first = import(r"sources\queue.md").unwrap();
+            let second = import("sources/queue.md").unwrap();
+            assert_eq!(first.id, second.id);
+            assert_eq!(first.external_id, "sources/queue.md");
+            assert_eq!(first.lineage_id, "sources/queue.md");
+            for invalid in ["../queue.md", r"sources\..\queue.md", r"C:\sources\queue.md", ""] {
+                assert!(import(invalid).is_err(), "{invalid}");
+            }
+        }
+        let trust = WikiTrustStore::open(dir.path().join("wiki_trust.db")).unwrap();
+        trust.manual_set("sources/queue.md", "agent-a", 0.05, false, Some(true), None).unwrap();
+        drop(trust);
+        assert!(store.import_agent_wiki_source("agent-a", r"sources\queue.md").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn causal_ingest_resolved_alias_uses_target_identity_and_auto_rules() {
+        use std::os::unix::fs::symlink;
+        let (dir, store, page) = fixture();
+        let wiki = page.parent().unwrap().parent().unwrap();
+        symlink(wiki.join("sources"), wiki.join("alias")).unwrap();
+        let canonical = store.import_agent_wiki_source("agent-a", "sources/queue.md").unwrap();
+        let alias = store.import_agent_wiki_source("agent-a", "alias/queue.md").unwrap();
+        assert_eq!(canonical.id, alias.id);
+        assert_eq!(alias.external_id, "sources/queue.md");
+        std::fs::create_dir_all(wiki.join("auto")).unwrap();
+        symlink(wiki.join("auto"), wiki.join("auto-alias")).unwrap();
+        let raw = std::fs::read_to_string(&page).unwrap();
+        std::fs::write(wiki.join("auto/queue.md"), &raw).unwrap();
+        for path in ["auto/queue.md", "auto-alias/queue.md"] {
+            assert!(store.import_agent_wiki_source("agent-a", path).is_err());
+        }
+        crate::wiki_auto_registry::record_page(dir.path(), "agent-a", "auto/queue.md", &raw, &[], false).unwrap();
+        assert!(store.import_agent_wiki_source("agent-a", "auto-alias/queue.md").is_err());
+        crate::wiki_auto_registry::record_page(dir.path(), "agent-a", "auto/queue.md", &raw, &[], true).unwrap();
+        assert!(store.import_agent_wiki_source("agent-a", "auto-alias/queue.md").is_err());
+        let promoted = raw.replacen("title: Queue", "title: Queue\nhost_promoted: true", 1);
+        std::fs::write(wiki.join("auto/queue.md"), &promoted).unwrap();
+        crate::wiki_auto_registry::record_page(dir.path(), "agent-a", "auto/queue.md", &promoted, &[], true).unwrap();
+        let direct = store.import_agent_wiki_source("agent-a", "auto/queue.md").unwrap();
+        let alias = store.import_agent_wiki_source("agent-a", "auto-alias/queue.md").unwrap();
+        assert_eq!(direct.id, alias.id);
+        assert_eq!(alias.external_id, "auto/queue.md");
+        std::fs::write(wiki.join("auto/queue.md"), &raw).unwrap();
+        assert!(store.import_agent_wiki_source("agent-a", "auto-alias/queue.md").is_err());
+    }
+
     use crate::causal::{ClaimModality, EvidenceStance};
 
     fn ccr_acl_revision(scope: &EvidenceScope) -> String {

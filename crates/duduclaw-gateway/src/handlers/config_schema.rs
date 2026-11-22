@@ -100,6 +100,7 @@ pub(crate) const CONFIG_KEY_TYPES: &[(&str, &str, Ty)] = &[
     ("memory", "graph_embed_seed", Bool),
     ("memory", "graph_embed_seed_top_k", UInt),
     ("memory", "supersession_trust_guard", Bool),
+    ("memory", "language", Str),
     ("memory", "recent_actions_enabled", Bool),
     ("memory", "recent_actions_count", UInt),
     ("memory", "working_state_enabled", Bool),

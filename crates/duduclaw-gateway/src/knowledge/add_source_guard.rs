@@ -124,9 +124,9 @@ pub async fn sweep_unreferenced(home: &Path) -> usize {
         if live.contains(&name) {
             continue;
         }
-        let old = e
-            .metadata()
-            .and_then(|m| m.modified())
+        let Ok(meta) = std::fs::symlink_metadata(e.path()) else { continue; };
+        if !meta.is_file() || duduclaw_memory::wiki_path::is_link_metadata(&meta) { continue; }
+        let old = meta.modified()
             .ok()
             .and_then(|t| t.elapsed().ok())
             .is_some_and(|age| age > ORPHAN_GRACE);
@@ -148,6 +148,7 @@ mod tests {
             chat: "c".into(),
             sender: "s".into(),
             user_id: user.map(str::to_string),
+            attested_private: false,
         };
         assert!(requester_may_propose(&ch("line", Some("u"))).is_ok());
         assert!(requester_may_propose(&ch("line", None)).is_err());

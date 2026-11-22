@@ -332,6 +332,11 @@ async fn build_guarded_reply_for_agent_inner(
         Box::pin(super::health::finish(&ctx.home_dir, health_outcome, true, &reply)).await;
         return reply;
     };
+    // RM-191: a fixed notice returned before the session existed takes the
+    // whole output pipeline below (contract, sanitising, language); only
+    // secret restore is skipped. Its FINAL text is bound as the live-only
+    // notice at the end (persistence only).
+    let fixed_notice = delivery.marked_fixed_notice(&raw);
     let (raw, pending_artifact) = strip_operator_pending_marker(&raw);
     let artifact = pending_artifact.or(operator_result_artifact);
     let raw = crate::cli_noise::strip_cli_noise(&raw).text;
@@ -339,7 +344,11 @@ async fn build_guarded_reply_for_agent_inner(
         Some(who) => restore_target(who),
         None => (agent_name.to_string(), session_id.to_string()),
     };
-    let restored = restore_for_channel(raw, ctx, &agent_id, &turn_session).await;
+    let restored = if fixed_notice {
+        raw
+    } else {
+        restore_for_channel(raw, ctx, &agent_id, &turn_session).await
+    };
     let (enforced, health_blocked) = enforce_contract_with_status(restored, &ctx.home_dir, &agent_id).await;
     if enforced.trim().is_empty() {
         super::persist_bound_failure(ctx, TurnFailureReason::Internal).await;
@@ -357,7 +366,10 @@ async fn build_guarded_reply_for_agent_inner(
     let final_text = crate::knowledge::cite_turn::with_footer(final_text, session_id, &cited);
     let language = crate::prompt_identity::resolve_reply_language_for_id(&ctx.home_dir, &agent_id).await;
     let final_text = crate::prompt_identity::normalize_channel_reply(
-        &crate::dispatcher::sanitize_for_channel(&final_text), language.as_deref());
+        &sanitize_delivery_reply(&final_text), language.as_deref());
+    if fixed_notice {
+        delivery.bind_live_only_notice(&final_text);
+    }
     let reply = attach_turn_rollback(final_text, artifact, guards, delivery, ctx)
         .await
         .with_answered_by(answered_by)
@@ -421,15 +433,22 @@ async fn build_guarded_reply_with_session_inner(
         return reply;
     };
     // No employee answered: the fixed notice goes out as it is (no restore,
-    // contract or pending operator notice), live only — WebChat delivers it
-    // without a stored row (`GuardedReply::persist_webchat`).
+    // contract or pending operator notice — there is no employee to take
+    // them from); WebChat delivers it without a stored row
+    // (`GuardedReply::persist_webchat`).
     if delivery.no_responder_notice.load(std::sync::atomic::Ordering::SeqCst) {
         let text = append_product_footer(raw, session_id);
-        let reply = attach_turn_rollback(text, None, guards, delivery, ctx).await;
+        let reply = attach_turn_rollback(text, None, guards, delivery, ctx).await
+            .with_answered_by(answered_by);
         Box::pin(super::health::finish(&ctx.home_dir, health_outcome, false, &reply)).await;
         build_rollback.disarm();
         return reply;
     }
+    // RM-191: any other fixed notice returned before the session existed
+    // takes the whole output pipeline below (contract, sanitising, footer,
+    // language); only secret restore is skipped. Its FINAL text is bound as
+    // the live-only notice at the end (persistence only).
+    let fixed_notice = delivery.marked_fixed_notice(&raw);
     let (raw, pending_artifact) = strip_operator_pending_marker(&raw);
     let artifact = pending_artifact.or(operator_result_artifact);
     // WP11-A: last-line-of-defence filter for AI-runtime internal messages
@@ -443,7 +462,11 @@ async fn build_guarded_reply_with_session_inner(
         Some(who) => restore_target(who),
         None => (resolve_agent_for_restore(ctx, session_id).await, session_id.to_string()),
     };
-    let restored = restore_for_channel(raw, ctx, &agent_id, &turn_session).await;
+    let restored = if fixed_notice {
+        raw
+    } else {
+        restore_for_channel(raw, ctx, &agent_id, &turn_session).await
+    };
     let (enforced, health_blocked) = enforce_contract_with_status(restored, &ctx.home_dir, &agent_id).await;
     if enforced.trim().is_empty() {
         super::persist_bound_failure(ctx, TurnFailureReason::Internal).await;
@@ -462,7 +485,10 @@ async fn build_guarded_reply_with_session_inner(
     let final_text = append_product_footer(with_sources, session_id);
     let language = crate::prompt_identity::resolve_reply_language_for_id(&ctx.home_dir, &agent_id).await;
     let final_text = crate::prompt_identity::normalize_channel_reply(
-        &crate::dispatcher::sanitize_for_channel(&final_text), language.as_deref());
+        &sanitize_delivery_reply(&final_text), language.as_deref());
+    if fixed_notice {
+        delivery.bind_live_only_notice(&final_text);
+    }
     let reply = attach_turn_rollback(final_text, artifact, guards, delivery, ctx)
         .await
         .with_answered_by(answered_by)
@@ -578,4 +604,32 @@ pub async fn build_guarded_reply_with_session(
     session_id: &str, user_id: &str, on_progress: Option<ProgressCallback>,
 ) -> GuardedReply {
     super::observe_turn(ctx, Box::pin(build_guarded_reply_with_session_inner(text, ctx, session_id, user_id, on_progress))).await
+}
+
+/// DELIVER lines are internal transport instructions, consumed by the document
+/// delivery gate before channel output. Redact visible prose without destroying
+/// the path that that gate must validate and open.
+fn sanitize_delivery_reply(text: &str) -> String {
+    text.lines().filter(|line| !line.contains("[DUDUCLAW_SYSTEM:")).map(|line| {
+        if line.trim().starts_with(crate::office_docs::DELIVER_MARKER) {
+            line.to_string()
+        } else {
+            crate::dispatcher::sanitize_for_channel(line)
+        }
+    }).collect::<Vec<_>>().join("\n")
+}
+
+#[cfg(test)]
+mod delivery_sanitizing_tests {
+    #[test]
+    fn document_instructions_and_non_home_visible_paths_survive() {
+        let text = "報告在 /private/employee/report.docx\n📎DELIVER:/private/employee/report.docx";
+        let sanitized = super::sanitize_delivery_reply(text);
+        let (visible, paths) = crate::office_docs::parse_deliverables(&sanitized);
+        assert_eq!(visible, "報告在 /private/employee/report.docx");
+        assert_eq!(paths, ["/private/employee/report.docx"]);
+        assert_eq!(crate::dispatcher::sanitize_for_channel("US$5.00 / 上限 US$5.00"),
+            "US$5.00 / 上限 US$5.00");
+        assert_eq!(crate::dispatcher::sanitize_for_channel("(/private/report.docx)"), "(/private/report.docx)");
+    }
 }

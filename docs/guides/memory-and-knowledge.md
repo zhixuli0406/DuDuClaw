@@ -1,6 +1,6 @@
 # Memory and knowledge base guide
 
-Your AI employee remembers things on its own, and it can also organize knowledge into pages the way you ask it to. Both live on the same "Memory & Knowledge" (記憶與知識) page in the dashboard, but underneath they are two different systems with different behavior and different timing. This guide covers both in full.
+Your AI employee remembers things on its own, and it can also organize knowledge into pages the way you ask it to. Both live on the same "Memory" (記憶) page in the dashboard, but underneath they are two different systems with different behavior and different timing. This guide covers both in full.
 
 The one-line distinction:
 
@@ -79,6 +79,8 @@ You paste a document, the AI replies "got it, saved," and until now nothing else
 
 **Where auto-filed pages go**: inside this AI employee's own knowledge base, under `auto/`, split into five folders by type — charter `auto/charter/`, SOP `auto/sop/`, spec `auto/spec/`, policy `auto/policy/`, other `auto/reference/`. Your manually organized directories (`entities/`, `concepts/`, `sources/`, `synthesis/`) are never touched by auto-filing.
 
+**Who sees an auto-filed page (v1.84.0)**: in chat, an auto-filed page is visible only in the conversation it came from. If another conversation files the same topic, it gets its own page with a short suffix; the two are never merged. A page a Manager or Admin confirmed in the curation station (**Confirm**) is visible in every conversation. A page the system has no matching record for (every page filed before v1.84.0, including ones confirmed earlier, and any page edited outside DuDuClaw) is hidden from conversations until a Manager or Admin confirms it; the system check **Pre-upgrade automatic notes** counts them per employee. AI employees cannot write or share pages under `auto/` at all, in chat or in scheduled work. Sharing an auto page to the shared wiki needs a Manager or Admin and works only for a confirmed page.
+
 **How an auto-filed page differs from a confirmed one**:
 
 - The page opens with a notice stating it was auto-organized and hasn't been confirmed by a person.
@@ -88,13 +90,13 @@ You paste a document, the AI replies "got it, saved," and until now nothing else
 
 **Pasting the same document a second time** updates the same page rather than creating a duplicate, and the revision log at the bottom gains one more line.
 
-**Where to manage it**: dashboard → "Memory & Knowledge" (記憶與知識) → "Curation Station" (策展台) → "Auto-filed" (自動建檔). Each page supports:
+**Where to manage it**: dashboard sidebar → "Memory" (記憶) → "Personal" (個人知識庫; "Knowledge base" in the personal edition) → "Curation" (策展台) → "Auto-filed" (自動建檔). Each page supports:
 
 | Action | Effect |
 |---|---|
 | "View" (檢視) | See the full page content and revision log |
-| "Confirm as official knowledge" (確認為正式知識) | Promotes the page to content you've approved, so it starts auto-injecting every conversation |
-| "Share to shared knowledge base" (分享到共享知識庫) | Copies the page to the shared area so other AI employees can read it too |
+| "Confirm" (確認) | Promotes the page to content you've approved, so it starts auto-injecting every conversation. The tab marks each page as needing confirmation (待確認) or confirmed (已確認) |
+| "Share to shared knowledge base" (分享到共享知識庫) | Copies the page to the shared area so other AI employees can read it too. Offered only for a confirmed page; an unconfirmed page shows "Confirm this page before sharing." |
 | "Remove" (移除) | Drops the page from the knowledge base; it moves to the archive and can be restored |
 
 To turn auto-filing off entirely: drop a `.scope.toml` in that AI employee's knowledge base directory declaring `[namespaces.auto] mode = "operator_only"`. After that, only manual writes go through.

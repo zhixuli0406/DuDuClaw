@@ -362,18 +362,21 @@ mod tests {
                 chat: "c".into(),
                 sender: "s".into(),
                 user_id: Some("report-a".into()),
+                attested_private: false,
             },
             RequesterIdentity::ChannelUser {
                 channel: "odoolivechat".into(),
                 chat: "c".into(),
                 sender: "s".into(),
                 user_id: Some("report-a".into()),
+                attested_private: false,
             },
             RequesterIdentity::ChannelUser {
                 channel: "telegram".into(),
                 chat: "c".into(),
                 sender: "s".into(),
                 user_id: None,
+                attested_private: false,
             },
             RequesterIdentity::DashboardUser {
                 user_id: "system".into(),
@@ -389,6 +392,7 @@ mod tests {
             chat: "c".into(),
             sender: "s".into(),
             user_id: Some("report-a".into()),
+            attested_private: false,
         };
         assert!(SessionOrigin::from_requester(&bound, now).allows(&scope));
     }

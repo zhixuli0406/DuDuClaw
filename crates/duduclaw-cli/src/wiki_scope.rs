@@ -47,6 +47,8 @@ use tracing::warn;
 /// Namespace write-policy mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NamespaceMode {
+    /// Conflicting filesystem-equivalent keys deny every writer, including operators.
+    Ambiguous,
     /// Default — any agent that passes the existing shared-wiki write checks may write.
     AgentWritable,
     /// Only writers whose [`WriterCapability`] matches `synced_from` may write.
@@ -66,6 +68,7 @@ pub enum NamespaceMode {
 impl NamespaceMode {
     pub fn as_str(&self) -> &'static str {
         match self {
+            NamespaceMode::Ambiguous => "ambiguous",
             NamespaceMode::AgentWritable => "agent_writable",
             NamespaceMode::ReadOnly { .. } => "read_only",
             NamespaceMode::OperatorOnly => "operator_only",
@@ -174,30 +177,61 @@ impl WikiScopePolicy {
         }
     }
 
-    /// Whether the operator has an **explicit** entry for `namespace` in
-    /// `.scope.toml`. WP7 uses this to decide precedence: the built-in
-    /// department isolation applies to the `departments/` namespace *unless*
-    /// the operator has explicitly declared it (explicit config wins).
+    /// Whether a filesystem-equivalent namespace has a policy entry.
+    /// This is an identity query, not permission to disable department isolation.
     pub fn has_explicit_namespace(&self, namespace: &str) -> bool {
-        self.namespaces.contains_key(namespace)
+        self.namespaces.keys().any(|key| {
+            duduclaw_core::wiki_auto_namespace::segment_opens_as(key, namespace)
+        })
+    }
+
+    /// Preserve the existing override opt-in: only the literal `departments`
+    /// configuration key can disable built-in department isolation. Folding
+    /// policy identities must never turn another spelling into a new grant.
+    /// Ambiguous declarations cannot grant this capability either.
+    pub fn overrides_department_isolation(&self) -> bool {
+        self.namespaces.contains_key(duduclaw_core::DEPARTMENTS_NAMESPACE)
+            && self.mode_for(duduclaw_core::DEPARTMENTS_NAMESPACE) != NamespaceMode::Ambiguous
     }
 
     /// Mode for a top-level namespace. Unlisted namespaces default to
     /// [`NamespaceMode::AgentWritable`].
     pub fn mode_for(&self, namespace: &str) -> NamespaceMode {
-        self.namespaces
-            .get(namespace)
-            .cloned()
-            .unwrap_or(NamespaceMode::AgentWritable)
+        let mut matches = self.namespaces.iter().filter(|(key, _)| {
+            duduclaw_core::wiki_auto_namespace::segment_opens_as(key, namespace)
+        });
+        let first = matches.next();
+        if matches.next().is_some() { return NamespaceMode::Ambiguous; }
+        first.map(|(key, mode)| {
+            if key == namespace { mode.clone() } else { NamespaceMode::Ambiguous }
+        }).unwrap_or(NamespaceMode::AgentWritable)
     }
 
     /// Resolve the namespace from a wiki-relative `page_path` and check
     /// whether `caller` may write to it.
     pub fn check_write(&self, page_path: &str, caller: &WriterCapability) -> Result<(), ScopeDeny> {
+        if duduclaw_core::wiki_auto_namespace::canonical_page_id(page_path).is_none() {
+            return Err(ScopeDeny { namespace: String::new(), mode: "invalid".into(), reason: "Invalid page id".into() });
+        }
         let namespace = top_level_namespace(page_path);
-        let mode = self.mode_for(&namespace);
+        self.check_namespace_write(&namespace, caller)
+    }
+
+    fn check_namespace_write(&self, namespace: &str, caller: &WriterCapability) -> Result<(), ScopeDeny> {
+        let mode = self.mode_for(namespace);
+        if self.namespaces.keys().any(|key| key != namespace
+            && duduclaw_core::wiki_auto_namespace::segment_opens_as(key, namespace))
+        {
+            duduclaw_core::wiki_auto_namespace::warn_denied_alias(Some(&caller.label()), namespace);
+        }
+        let namespace = namespace.to_string();
 
         match (&mode, caller) {
+            (NamespaceMode::Ambiguous, _) => Err(ScopeDeny {
+                namespace,
+                mode: "ambiguous".into(),
+                reason: "filesystem-equivalent namespace declarations conflict".into(),
+            }),
             // Default and explicit agent_writable: everyone may write
             // (subject to other checks layered on top).
             (NamespaceMode::AgentWritable, _) => Ok(()),
@@ -313,7 +347,7 @@ pub const SCOPE_POLICY_FILENAME: &str = ".scope.toml";
 ///
 /// The operator can override this entirely by declaring the `departments`
 /// namespace in `.scope.toml`; callers gate this check on
-/// [`WikiScopePolicy::has_explicit_namespace`].
+/// [`WikiScopePolicy::overrides_department_isolation`].
 pub fn check_department_access(
     page_path: &str,
     caller_department: Option<&str>,
@@ -347,20 +381,10 @@ pub fn scope_file_path(home_dir: &Path) -> PathBuf {
 /// at the root (no slash) live in the synthetic `""` namespace, which is
 /// always `AgentWritable` unless an operator explicitly lists it.
 pub fn top_level_namespace(page_path: &str) -> String {
-    match page_path.split('/').next() {
-        Some(seg) if !seg.is_empty() && seg != page_path => seg.to_string(),
-        // Either no slash at all (root file) or empty leading segment.
-        _ => String::new(),
-    }
+    duduclaw_core::department::top_level_namespace(page_path).to_string()
 }
 
 // ── TOML parsing (private) ───────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-struct ScopeFile {
-    #[serde(default)]
-    namespaces: BTreeMap<String, NamespaceEntry>,
-}
 
 #[derive(Debug, Deserialize)]
 struct NamespaceEntry {
@@ -372,9 +396,22 @@ struct NamespaceEntry {
 }
 
 fn parse_toml(raw: &str) -> Result<BTreeMap<String, NamespaceMode>, String> {
-    let parsed: ScopeFile = toml::from_str(raw).map_err(|e| e.to_string())?;
+    let mut parsed: toml::Table = toml::from_str(raw).map_err(|e| e.to_string())?;
+    let namespaces = match parsed.remove("namespaces") {
+        None => toml::Table::new(),
+        Some(toml::Value::Table(table)) => table,
+        Some(_) => return Err("namespaces must be a table".into()),
+    };
+    let ambiguous = duduclaw_core::wiki_auto_namespace::ambiguous_namespace_keys(
+        namespaces.keys().map(String::as_str),
+    );
     let mut out = BTreeMap::new();
-    for (name, entry) in parsed.namespaces {
+    for (name, entry) in namespaces {
+        if ambiguous.contains(&duduclaw_core::wiki_auto_namespace::fold_segment(&name)) {
+            out.insert(name, NamespaceMode::Ambiguous);
+            continue;
+        }
+        let entry: NamespaceEntry = entry.try_into().map_err(|e: toml::de::Error| e.to_string())?;
         let mode = match entry.mode.as_str() {
             "agent_writable" => NamespaceMode::AgentWritable,
             "read_only" => {
@@ -412,6 +449,87 @@ fn parse_toml(raw: &str) -> Result<BTreeMap<String, NamespaceMode>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalized_namespace_identity_does_not_grant_department_override() {
+        for key in ["DEPARTMENTS", "departments."] {
+            let policy = WikiScopePolicy {
+                namespaces: BTreeMap::from([(key.into(), NamespaceMode::AgentWritable)]),
+                loaded_from: None,
+            };
+            assert!(policy.has_explicit_namespace("departments"));
+            assert!(!policy.overrides_department_isolation());
+        }
+        let mut policy = WikiScopePolicy {
+            namespaces: BTreeMap::from([("departments".into(), NamespaceMode::AgentWritable)]),
+            loaded_from: None,
+        };
+        assert!(policy.overrides_department_isolation());
+        policy.namespaces.insert("DEPARTMENTS".into(), NamespaceMode::AgentWritable);
+        assert!(!policy.overrides_department_isolation());
+    }
+
+    #[test]
+    fn namespace_write_mode_denies_nfc_nfd_aliases_in_both_directions() {
+        for (key, request) in [("café", "cafe\u{301}"), ("cafe\u{301}", "café")] {
+            let tmp = TempDir::new().unwrap();
+            write_policy(tmp.path(), &format!(
+                "[namespaces.\"{key}\"]\nmode = \"agent_allowlist\"\nagents = [\"hr-agent\"]\nvisible_to_departments = [\"hr\"]\n"
+            ));
+            let policy = WikiScopePolicy::load_for(tmp.path());
+            let visibility = duduclaw_core::DepartmentVisibilityPolicy::load_for_home(tmp.path());
+            let page = format!("{request}/salary.md");
+            assert!(policy.has_explicit_namespace(request));
+            assert_eq!(policy.mode_for(request), NamespaceMode::Ambiguous);
+            assert!(policy.check_write(&page, &WriterCapability::for_agent("sales-agent")).is_err());
+            assert!(!visibility.page_visible(&page, Some("sales")));
+            assert!(policy.check_write(&page, &WriterCapability::for_agent("hr-agent")).is_err());
+            assert!(policy.check_write(&format!("{key}/x.md"), &WriterCapability::for_agent("hr-agent")).is_ok());
+            assert!(policy.check_write(&page, &WriterCapability::Operator).is_err());
+            assert!(!visibility.page_visible(&page, Some("hr")));
+            assert!(policy.check_write("ｃａｆé/x.md", &WriterCapability::for_agent("sales-agent")).is_ok());
+        }
+    }
+
+    #[test]
+    fn namespace_aliases_deny_all_write_capabilities() {
+        for mode in [NamespaceMode::AgentWritable, NamespaceMode::OperatorOnly,
+            NamespaceMode::ReadOnly { synced_from: "sync".into() },
+            NamespaceMode::AgentAllowlist { agents: vec!["hr".into()] }]
+        {
+            let policy = WikiScopePolicy {
+                namespaces: BTreeMap::from([("departments".into(), mode)]),
+                loaded_from: None,
+            };
+            assert!(policy.overrides_department_isolation());
+            for alias in ["DEPARTMENTS", "departments.", "depar\u{200d}tments"] {
+                for caller in [WriterCapability::Operator, WriterCapability::for_agent("hr"),
+                    WriterCapability::Internal { capability: "sync".into() }]
+                {
+                    assert!(policy.check_write(&format!("{alias}/hr/x.md"), &caller).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ambiguous_namespace_modes_deny_every_writer() {
+        for (a, b) in [("café", "cafe\u{301}"), ("HR", "hr. ")] {
+            let tmp = TempDir::new().unwrap();
+            write_policy(tmp.path(), &format!(
+                "[namespaces.\"{a}\"]\nmode = 'agent_writable'\n[namespaces.\"{b}\"]\nvisible_to_departments = ['hr']\n"
+            ));
+            let policy = WikiScopePolicy::load_for(tmp.path());
+            for ns in [a, b] {
+                assert_eq!(policy.mode_for(ns), NamespaceMode::Ambiguous);
+                for caller in [WriterCapability::Operator, WriterCapability::for_agent("hr"),
+                    WriterCapability::Internal { capability: "sync".into() }] {
+                    assert!(policy.check_write(&format!("{ns}/x.md"), &caller).is_err());
+                }
+            }
+        }
+    }
+
     use std::fs;
     use tempfile::TempDir;
 
@@ -528,6 +646,17 @@ mod tests {
         // Policy still enforces operator_only for writes.
         let caller = WriterCapability::for_agent("agnes");
         assert!(p.check_write("departments/art/style.md", &caller).is_err());
+    }
+
+    #[test]
+    fn namespace_write_policy_checks_separator_and_case_aliases() {
+        let policy = WikiScopePolicy {
+            namespaces: BTreeMap::from([("policies".into(), NamespaceMode::OperatorOnly)]),
+            loaded_from: None,
+        };
+        for path in [r"policies\x.md", r".\policies\x.md", r"POLICIES\x.md", "policies./x.md", "../x.md"] {
+            assert!(policy.check_write(path, &WriterCapability::for_agent("alice")).is_err(), "{path}");
+        }
     }
 
     #[test]

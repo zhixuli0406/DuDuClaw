@@ -277,6 +277,7 @@ fn remote_scope_requires_every_scope_and_public_visitors_cannot_borrow_anyone() 
             chat: "unit".into(),
             sender: "unit".into(),
             user_id: None,
+            attested_private: false,
         };
         assert_eq!(
             PersonalSelection::capture(home.path(), "bot", &who, &people, "gmail_read")

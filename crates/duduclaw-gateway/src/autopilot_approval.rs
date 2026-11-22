@@ -555,7 +555,7 @@ pub(crate) async fn push_admin_notice(home: &Path, rule_id: &str, body: &str) ->
         tracing::info!(rule_id, "autopilot approval notice: no Admin with a verified channel; dashboard only");
         return NoticePush::NoTarget;
     }
-    let link = crate::deep_link::deep_link(home, crate::deep_link::DeepLinkKind::Autopilot, rule_id);
+    let link = crate::deep_link::public_deep_link(home, crate::deep_link::DeepLinkKind::Autopilot, rule_id);
     let card = crate::notify_push::NotifyCard {
         source: crate::decision_action::DecisionSource::Autopilot,
         decision_id: rule_id,

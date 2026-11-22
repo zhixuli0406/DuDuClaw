@@ -26,6 +26,79 @@ impl TaskStore {
         self.insert_activity(row, true).await.map(|n| n == 1)
     }
 
+    /// Whether an activity row with exactly this `id` exists.
+    pub async fn activity_exists(&self, id: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().await;
+        conn.query_row("SELECT 1 FROM activity WHERE id = ?1", params![id], |_| Ok(()))
+            .optional()
+            .map(|found| found.is_some())
+            .map_err(|e| format!("activity exists: {e}"))
+    }
+
+    /// Ids of `task_id`'s activity rows whose id begins with exactly
+    /// `prefix` (anchored, exact comparison — no pattern characters). For
+    /// the deterministic marker rows of [`Self::append_activity_once`].
+    pub async fn activity_ids_with_prefix(
+        &self,
+        task_id: &str,
+        prefix: &str,
+    ) -> Result<Vec<String>, String> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id FROM activity
+                  WHERE task_id = ?1 AND substr(id, 1, length(?2)) = ?2",
+            )
+            .map_err(|e| format!("prepare activity ids: {e}"))?;
+        let ids = stmt
+            .query_map(params![task_id, prefix], |r| r.get::<_, String>(0))
+            .map_err(|e| format!("query activity ids: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect activity ids: {e}"))?;
+        Ok(ids)
+    }
+
+    /// RM-192 B6 restart sweep: existing tasks that are no longer
+    /// `needs_human` but have a marker row whose id begins with one of
+    /// `open_prefixes` followed by **that row's own** `task_id` and `:`, and
+    /// no row at or after it whose id begins with `closed_prefix` + the same
+    /// task id + `:` (all anchored, exact comparisons). A row whose id names
+    /// another task than its `task_id` column is never a marker of either.
+    pub(crate) async fn tasks_with_open_markers(
+        &self,
+        open_prefixes: [&str; 2],
+        closed_prefix: &str,
+    ) -> Result<Vec<String>, String> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT a.task_id FROM activity a JOIN tasks t ON t.id = a.task_id
+                  WHERE ((substr(a.id, 1, length(?1) + length(a.task_id) + 1) = ?1 || a.task_id || ':'
+                          AND substr(a.id, length(?1) + length(a.task_id) + 2) <> ''
+                          AND substr(a.id, length(?1) + length(a.task_id) + 2) NOT GLOB '*[^0-9]*')
+                         OR (substr(a.id, 1, length(?2) + length(a.task_id) + 1) = ?2 || a.task_id || ':'
+                          AND substr(a.id, length(?2) + length(a.task_id) + 2) <> ''
+                          AND substr(a.id, length(?2) + length(a.task_id) + 2) NOT GLOB '*[^0-9]*'))
+                    AND t.status <> 'needs_human'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM activity c
+                         WHERE c.task_id = a.task_id
+                           AND substr(c.id, 1, length(?3) + length(a.task_id) + 1) = ?3 || a.task_id || ':'
+                           AND substr(c.id, length(?3) + length(a.task_id) + 2) <> ''
+                           AND substr(c.id, length(?3) + length(a.task_id) + 2) NOT GLOB '*[^0-9]*'
+                           AND c.timestamp >= a.timestamp)",
+            )
+            .map_err(|e| format!("prepare open markers: {e}"))?;
+        let ids = stmt
+            .query_map(params![open_prefixes[0], open_prefixes[1], closed_prefix], |r| {
+                r.get::<_, String>(0)
+            })
+            .map_err(|e| format!("query open markers: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect open markers: {e}"))?;
+        Ok(ids)
+    }
+
     async fn insert_activity(&self, row: &ActivityRow, or_ignore: bool) -> Result<usize, String> {
         let mut conn = self.conn.lock().await;
         let tx = begin_live_write(&mut conn)?;

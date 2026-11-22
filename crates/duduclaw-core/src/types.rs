@@ -1107,7 +1107,10 @@ fn resolve_role(
         (Some(rt), Some(model)) => {
             let lower = model.to_ascii_lowercase();
             let bare = lower.rsplit('/').next().unwrap_or(&lower).to_string();
-            let serves = rt.model_prefixes.iter().any(|p| bare.starts_with(*p));
+            // The family resolver also owns exact aliases (the bare Claude CLI
+            // names), which no prefix expresses.
+            let serves = rt.model_prefixes.iter().any(|p| bare.starts_with(*p))
+                || crate::runtime_catalog::runtime_for_model(model).is_some_and(|s| s.id == rt.id);
             if !serves {
                 return Err(TeamConfigError::ModelRuntimeMismatch {
                     role,
@@ -4678,6 +4681,9 @@ impl Default for PromptConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
 pub struct MemoryConfig {
+    /// Language for automatically generated memories; auto inherits the next level.
+    #[serde(default, deserialize_with = "crate::lenient::opt", skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
     // ── Formerly-untyped `[memory]` keys (R2 unification) ───────────────
     //
     // These ARE consumed at runtime (RFC-24 decision continuity); they were
@@ -4700,6 +4706,7 @@ pub struct MemoryConfig {
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
+            language: None,
             decision_continuity: None,
             decision_ttl_days: None,
         }

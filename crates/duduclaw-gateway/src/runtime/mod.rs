@@ -9,6 +9,7 @@ pub mod codex_sandbox;
 pub mod generic_cli;
 pub mod grok;
 pub mod openai_compat;
+pub mod prompt_budget;
 mod isolation_gate;
 pub(crate) mod third_party_mcp;
 
@@ -532,6 +533,23 @@ pub(crate) const BESPOKE_RUNTIME_IDS: &[&str] = &["claude", "codex", "grok"];
 /// Registry of available runtimes, auto-detected at startup.
 pub struct RuntimeRegistry {
     runtimes: HashMap<RuntimeType, Box<dyn AgentRuntime>>,
+    /// M1: the host detection this registry was built from
+    /// ([`host_detection`]), so `runtime.detect` can tell whether anything
+    /// changed before it asks for a rebuild.
+    detection: std::collections::BTreeMap<String, String>,
+}
+
+/// Every catalog runtime the product policy allows that is installed on this
+/// host, mapped to its resolved path — the same probe `runtime.detect` runs
+/// (`runtime_readiness::detect_runtime` over `cli_specs_for_profile`).
+pub(crate) fn host_detection(
+    policy: duduclaw_core::product_profile::ProductProfile,
+    user_home: &Path,
+) -> std::collections::BTreeMap<String, String> {
+    duduclaw_core::runtime_catalog::cli_specs_for_profile(policy)
+        .filter_map(|spec| crate::runtime_readiness::detect_runtime(spec.id, user_home)
+            .map(|path| (spec.id.to_string(), path)))
+        .collect()
 }
 
 impl RuntimeRegistry {
@@ -543,9 +561,10 @@ impl RuntimeRegistry {
             Ok(p) => p,
             Err(e) => {
                 warn!(error = %e, "Product policy refused runtime registry startup");
-                return Self { runtimes };
+                return Self { runtimes, detection: Default::default() };
             }
         };
+        let detection = host_detection(policy, std::path::Path::new(&duduclaw_core::platform::home_dir()));
         // Claude is always available (it's the core)
         runtimes.insert(
             RuntimeType::Claude,
@@ -610,14 +629,26 @@ impl RuntimeRegistry {
             Box::new(openai_compat::OpenAiCompatRuntime::new()),
         );
 
-        Self { runtimes }
+        Self { runtimes, detection }
     }
 
     /// Test-only constructor: build a registry from explicit stub runtimes so
     /// failover behavior can be exercised without real CLIs/APIs.
     #[cfg(test)]
     pub(crate) fn with_runtimes(runtimes: HashMap<RuntimeType, Box<dyn AgentRuntime>>) -> Self {
-        Self { runtimes }
+        Self { runtimes, detection: Default::default() }
+    }
+
+    /// Test-only: the host detection a fake build "saw".
+    #[cfg(test)]
+    pub(crate) fn with_detection(mut self, detection: std::collections::BTreeMap<String, String>) -> Self {
+        self.detection = detection;
+        self
+    }
+
+    /// The host detection this registry was built from (see [`host_detection`]).
+    pub(crate) fn detection(&self) -> &std::collections::BTreeMap<String, String> {
+        &self.detection
     }
 
     /// Get a runtime by type.
@@ -875,13 +906,17 @@ pub(crate) fn cap_conversation_history(history: &[ConversationTurn]) -> Vec<Conv
 /// NOTE: The canonical implementation with turn trimming lives in
 /// `channel_reply.rs`. This version is for the AgentRuntime trait path.
 pub fn format_history_as_prompt(history: &[ConversationTurn], current_message: &str) -> String {
-    let history = cap_conversation_history(history);
+    format_history_as_prompt_uncapped(&cap_conversation_history(history), current_message)
+}
+
+/// Frame history whose size is managed by the caller (the prompt budget reducer).
+pub(crate) fn format_history_as_prompt_uncapped(history: &[ConversationTurn], current_message: &str) -> String {
     if history.is_empty() {
         return current_message.to_string();
     }
     let mut buf = String::with_capacity(history.len() * 200 + current_message.len() + 64);
     buf.push_str("<conversation_history>\n");
-    for turn in &history {
+    for turn in history {
         // Escape closing tags in content to prevent XML structure corruption
         let safe_content = turn
             .content

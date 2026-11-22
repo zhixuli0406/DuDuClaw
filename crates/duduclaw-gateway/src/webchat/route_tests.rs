@@ -2,6 +2,7 @@
 //! bound main agents, queued commands and stored conversations.
 
 use super::*;
+use crate::webchat::build_session_info_frame;
 use crate::trigger_route::tests::write_agent;
 use duduclaw_auth::{AccessLevel, UserRole, UserStatus};
 use std::sync::Arc;
@@ -725,4 +726,17 @@ async fn edition_downgrade_invalidates_warm_acl_cache_without_generation_change(
         assert!(!personal.edition.is_current());
         assert!(f.state.acl_snapshot(&mgr).await.unwrap().access.may_call("sales-rep"));
     }).await.expect("edition cache test timed out");
+}
+
+#[tokio::test]
+async fn session_info_uses_the_engine_default_for_a_live_edited_claude_alias() {
+    let f = fixture().await;
+    let file = f._dir.path().join("agents/finance/agent.toml");
+    let text = std::fs::read_to_string(&file).unwrap()
+        .replace("preferred = \"claude-haiku-4-5\"", "preferred = \"opus\"");
+    std::fs::write(&file, format!("{text}\n[runtime]\nprovider = 'codex'\n")).unwrap();
+    let state = Arc::new(f.state);
+    let frame = build_session_info_frame(&state, "webchat:model", Some("finance")).await;
+    let json = serde_json::to_value(frame).unwrap();
+    assert_eq!(json["model"], "gpt-5.6-sol");
 }

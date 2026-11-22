@@ -39,6 +39,7 @@ DuDuClaw 的 Docker 映像建置於 `container/Dockerfile.server`，採三階段
 | Docker Compose | v2.20+ | 內建於現代 Docker；指令為 `docker compose`，非舊的 `docker-compose` |
 | Git | 任意 | Clone 原始碼用 |
 | 磁碟空間 | ≥ 4 GB | 建置期間會暫用 ~3 GB；成品映像約 ~1.2 GB |
+| 記憶體 | 5 位以內 AI 員工建議至少 4 GB | 服務基本用量約 1 GB，每位同時回覆的 AI 員工另需約 400 MB |
 | Port | `18789` | 預設 gateway port，可改 |
 
 若要讓 channel webhook（LINE、WhatsApp、Feishu 等走 webhook 的通道）能收到外部訊息，
@@ -453,12 +454,15 @@ duduclaw service uninstall
 docker compose up -d
 ```
 
-Compose 服務名稱是 `duduclaw`。容器版的主程式資料（包含 `license.json`）存放在 `duduclaw-data` volume，掛載於容器內 `/home/duduclaw/.duduclaw`。主機殘留的 `~/.duduclaw` 沒有掛進容器，因此不會被這個 gateway 使用。請在容器內確認授權；啟用或更換授權碼請到儀表板的「授權管理」頁操作：
+隨附的 Compose 範例將主程式資料（包含 `license.json`）存放在 `duduclaw-data` volume，掛載於容器內 `/home/duduclaw/.duduclaw`。主機殘留的 `~/.duduclaw` 沒有掛進容器，因此不會被這個 gateway 使用。授權指令必須在實際提供這套安裝服務的容器內執行。請用 `docker ps` 找到容器名稱，或使用自己的 Compose 服務名稱。將下方佔位文字換成實際名稱；執行檔請使用容器啟動時的程式，一般為 `duduclaw`，企業版映像則是 `duduclaw-pro`。啟用或更換授權碼請到儀表板的「授權管理」頁操作。
 
-```bash
-docker compose exec duduclaw duduclaw license status
+```text
+docker ps
+docker exec <容器名稱> <執行檔> license status
+docker compose exec <服務名稱> <執行檔> license status
 # 匯入容器內可讀到的授權檔：
-docker compose exec duduclaw duduclaw license import /path/in/container/license.json
+docker exec <容器名稱> <執行檔> license import /path/in/container/license.json
+docker compose exec <服務名稱> <執行檔> license import /path/in/container/license.json
 ```
 
 需要保留的主機資料請先備份或遷移；不要假設在主機更新授權會改到容器版的授權。
@@ -467,13 +471,28 @@ docker compose exec duduclaw duduclaw license import /path/in/container/license.
 
 客戶回報的現場量測約為每位正在回覆的員工 300–400 MB。這是約略觀察值，不是保證上限。規劃時可用 **gateway 基本用量 + 同時回覆的員工數 × 約 400 MB**；設定硬上限前，請先量測自己的工作負載。
 
+gateway 基本用量可先抓 **約 1 GB**。若有 5 位以內員工同時回覆，**建議至少準備 4 GB**。
+
 | 同時回覆員工數 | 員工用量估算（每人約 400 MB） |
 |---:|---:|
 | 5 | 2 GB + gateway 基本用量 |
 | 10 | 4 GB + gateway 基本用量 |
 | 20 | 8 GB + gateway 基本用量 |
 
-範例 Compose 檔預設沒有設定記憶體上限。
+預設範例 Compose 檔沒有設定記憶體、CPU 或行程數上限。若要加上限制，請在執行 gateway 的服務下取消這些欄位的註解，再依實際用量調整。以下以最多 5 位同時回覆、4 GB 記憶體為起點；CPU 與行程數需求也會隨工作內容改變。
+
+```yaml
+services:
+  duduclaw:
+    # Optional starting point for up to 5 simultaneous replies; measure your workload.
+    # mem_limit: 4g
+    # cpus: "2.0"
+    # pids_limit: 512
+```
+
+**記憶體上限設得太低，記憶體用盡時，系統會強制結束正在回覆的工作（out-of-memory）。** 請先量測實際用量，再縮小限制。
+
+現在可到「**設定 → 健康診斷**」執行系統檢查（doctor），查看偵測到的記憶體上限是否足夠。估算方式是服務基本用量 1 GB，加上每位同時回覆員工 400 MB；同時回覆人數採啟用中的 AI 員工數與 WebChat 全域回覆上限兩者較小值，後者預設為 10。這是規劃用的估算，其他通訊管道的回覆和其他工作可能需要更多記憶體。檢查只會提出警告，不會更動限制。
 
 ## 8. 健康檢查與觀測
 

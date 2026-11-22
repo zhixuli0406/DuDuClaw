@@ -496,7 +496,7 @@ impl DailyDigestScheduler {
         };
         // The digest's landing spot is the HITL inbox: the pending-decision
         // count is the only line in it a person can act on.
-        let link = crate::deep_link::deep_link(
+        let link = crate::deep_link::public_deep_link(
             &self.home_dir,
             crate::deep_link::DeepLinkKind::Approval,
             "",

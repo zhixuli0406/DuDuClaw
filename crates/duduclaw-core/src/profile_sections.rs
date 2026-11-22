@@ -380,6 +380,17 @@ pub fn reply_language_reminder(setting: Option<&str>) -> Option<String> {
     ))
 }
 
+/// Explicit language rule for generated memory prose. Structured keys stay unchanged.
+pub fn memory_language_instruction(code: &str) -> &'static str {
+    match code {
+        "zh-TW" => "Write the output in Traditional Chinese as used in Taiwan (繁體中文／台灣用語). Never use Simplified Chinese characters, even if the input contains them. Keep proper nouns, code, identifiers and URLs unchanged.",
+        "zh-CN" => "Write the output in Simplified Chinese (简体中文). Keep proper nouns, code, identifiers and URLs unchanged.",
+        "en" => "Write the output in English. Keep proper nouns, code, identifiers and URLs unchanged.",
+        "ja-JP" => "Write the output in Japanese (日本語). Keep proper nouns, code, identifiers and URLs unchanged.",
+        _ => "Same language as input.",
+    }
+}
+
 /// Build the global default-language instruction line, if configured.
 ///
 /// `None` when `default_language` is `None`, empty or `auto` — callers should
@@ -419,6 +430,14 @@ pub fn identity_and_language_section(
 #[cfg(test)]
 mod reply_language_tests {
     use super::*;
+
+    #[test]
+    fn lenient_memory_language_wrong_types_are_unset() {
+        for value in ["true", "42", "[]", "{}"] {
+            let config: crate::types::MemoryConfig = toml::from_str(&format!("language = {value}\n")).unwrap();
+            assert_eq!(config.language, None);
+        }
+    }
 
     #[test]
     fn lenient_reply_language_wrong_types_inherit_global() {
@@ -623,4 +642,20 @@ mod tests {
         std::fs::write(dir.path().join("agent.toml"), " ".repeat(MAX_FILE_BYTES as usize + 1)).unwrap();
         assert!(ProfileSections::load(dir.path()).is_err());
     }
+}
+
+/// Resolve memory overrides, then reply language (explicit reply `auto` stays unpinned).
+pub fn resolve_memory_language_setting(employee: Option<&str>, global: Option<&str>, reply: Option<&str>, default: Option<&str>) -> Option<String> {
+    let fixed = |value: Option<&str>| value.map(str::trim)
+        .filter(|v| *v != "auto" && is_valid_reply_language(v)).map(str::to_string);
+    fixed(employee).or_else(|| fixed(global)).or_else(|| resolve_reply_language_setting(reply, default))
+}
+
+/// Raw TOML counterpart shared by operator commands and the gateway.
+pub fn resolve_memory_language_tables(employee: Option<&toml::Table>, global: Option<&toml::Table>) -> Option<String> {
+    fn get<'a>(table: Option<&'a toml::Table>, section: &str, key: &str) -> Option<&'a str> {
+        table.and_then(|t| t.get(section)?.get(key)?.as_str())
+    }
+    resolve_memory_language_setting(get(employee, "memory", "language"), get(global, "memory", "language"),
+        get(employee, "prompt", "reply_language"), get(global, "general", "default_language"))
 }

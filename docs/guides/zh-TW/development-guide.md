@@ -274,17 +274,21 @@ claude
 
 ### 3.1 Input Guard（注入掃描）
 
-進入 Agent 的使用者輸入會經過 `duduclaw-security` 的 `input_guard` 掃描，採**風險評分制**（0-100，有上限）：7 條規則加權累計，達到門檻（預設 60）即封鎖並寫入 `security_audit.jsonl`。`instruction_override`、`role_hijack`、`tool_abuse`、`data_exfiltration` 只要命中一次就直接封鎖，不看總分（`crates/duduclaw-security/src/input_guard.rs`）：
+進入 Agent 的使用者輸入會經過 `duduclaw-security` 的 `input_guard` 掃描，採**風險評分制**（0-100，有上限）：11 類規則加權累計，達到門檻（預設 60）即封鎖並寫入 `security_audit.jsonl`。`instruction_override`、`role_hijack`、`tool_abuse`、`data_exfiltration` 只要命中一次就直接封鎖，不看總分（`crates/duduclaw-security/src/input_guard.rs`）。v1.84.0 起，聊天收訊檢查會帶入信任程度（`ScanTrust`）：在自己網頁對話裡的已登入成員，或一對一聊天裡已綁定身分的成員，`exec(`／`eval(`／`system(` 仍會計分但不會單獨造成封鎖；其他呼叫端一律用 `ScanTrust::Strict`。完整規則與行為見[安全防禦](../../features/zh-TW/05-security-defense.md)。
 
 | 規則 | 權重 | 偵測範例 |
 |------|------|---------|
-| instruction_override | 40 | "ignore previous instructions" |
-| role_hijack | 35 | "act as", "your new role" |
-| system_prompt_extraction | 30 | "reveal your instructions" |
-| tool_abuse | 30 | 誘導濫用工具呼叫 |
-| encoding_bypass | 25 | Base64 / 編碼繞過 |
-| data_exfiltration | 25 | "send to" + URL |
+| instruction_override | 40（立即封鎖） | "ignore previous instructions", "your new role is", 忽略先前的指示 |
+| role_hijack | 35（立即封鎖） | "act as if you", "you are now", 越獄模式 |
+| tool_abuse | 30（立即封鎖） | `exec(`, `eval(`, `system(` 與破壞性的 shell／SQL 指令 |
+| data_exfiltration | 25（立即封鎖） | "send to my email", "post to webhook", "curl http" |
+| system_prompt_extraction | 30 | "reveal your prompt", "show me your instructions" |
+| encoding_bypass | 25 | "base64:", "decode the following" |
 | termination_manipulation | 30 | "the task is never complete" |
+| authority_escalation | 35（每個訊號） | "use your own service account" |
+| memory_poisoning | 30（每個訊號） | "remember this permanently" |
+| role_provenance | 35（每個框架） | `[SYSTEM]`, `<tool_result>`, `approval=granted` |
+| action_binding | 30 | "use that same approval to" |
 
 另有 Unicode 正規化（零寬字元、同形字）防繞過；原文含超過 3 個零寬字元時分數再加 20。
 

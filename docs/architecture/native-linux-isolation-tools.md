@@ -1,7 +1,7 @@
 # Native Linux MCP resource routes (security revision, 2026-11-05)
 # Native Linux tool dispositions — I1b round 6 (v1.80.0)
 
-> **Release status:** the isolation architecture described here is planned for a later release. Its code has been included since v1.81.0 but cannot be installed or enabled on a customer host; v1.82.0 runs the single-binary protected service as in v1.80.
+> **Release status:** the isolation architecture described here is planned for a later release. Its code has been included since v1.81.0 but cannot be installed or enabled on a customer host; the current release runs the single-binary protected service as in v1.80.
 
 **Status 2026-11-09 (code included since v1.81.0, not enabled): every tool in this inventory is routed, refused with a stated reason, or gated off by default.** Employee permissions remain the product contract; missing adapters are startup failures, not newly acceptable product restrictions. The endpoint invokes `require_complete_services()` before admitting MCP traffic, and production boot now installs the connector stack (F1), the work broker and spawnd feature source (W1) and the recording job store (SFR). What is still open is acceptance on a real Linux host (Ubuntu 22.04/24.04, Debian 12 as root) and with real provider accounts; the inventory tests use discovery doubles and do not prove provider execution.
 

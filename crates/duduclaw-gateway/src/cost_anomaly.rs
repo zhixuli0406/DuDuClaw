@@ -229,7 +229,7 @@ async fn report(home_dir: &Path, agent_dir: Option<&Path>, agent_id: &str, v: &A
     // Channel push — L1 (FYI): this is "look at this", not "act now"; the
     // hard breaker is what escalates to L3.
     let name = crate::budget::agent_display_name(agent_dir, agent_id);
-    let link = crate::deep_link::deep_link(home_dir, crate::deep_link::DeepLinkKind::Billing, agent_id)
+    let link = crate::deep_link::public_deep_link(home_dir, crate::deep_link::DeepLinkKind::Billing, agent_id)
         .map(|url| format!("\n👉 {url}"))
         .unwrap_or_default();
     let text = format!(

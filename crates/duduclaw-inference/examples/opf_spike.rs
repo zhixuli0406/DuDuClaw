@@ -708,14 +708,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ---- session ----
-    // This standalone diagnostic deliberately has no protected runtime loader.
+    // Refuse in-process models beside a protected root key.
     if duduclaw_core::root_key::is_held() {
         return Err("獨立金鑰模式不允許未經安全初始化的 ONNX 測試程式".into());
     }
     let threads = std::thread::available_parallelism().map(|n| n.get().min(4)).unwrap_or(2);
     let rss_before = rss_kb();
     let load_t0 = Instant::now();
-    let mut session = Session::builder()?
+    let ort_root = duduclaw_onnx::manifest::ort_lib_root_under_home(&duduclaw_core::duduclaw_home());
+    let lib_path = duduclaw_onnx::manifest::ort_lib_path(&ort_root)
+        .ok_or_else(|| "這個平台沒有可用的 ONNX Runtime".to_string())?;
+    duduclaw_onnx::runtime::init_ort(&lib_path)?;
+    let mut session = duduclaw_onnx::runtime::session_builder()?
         .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?
         .with_intra_threads(threads)?
         .commit_from_file(&model_path)?;

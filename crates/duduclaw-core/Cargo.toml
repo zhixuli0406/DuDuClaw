@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+ferrous-opencc = { workspace = true }
 duduclaw-isolation.workspace = true
 duduclaw-execution.workspace = true
 portable-pty = "0.9"
@@ -23,6 +24,8 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 zeroize = { workspace = true }
 fs2 = "0.4"
+# Reuse the version already locked for Windows path canonicalization.
+dunce = "1.0.5"
 semver = "1"
 # relay_protocol.rs (WP-E2): base64-encodes/decodes HookFrame.body_b64 — the
 # wire type shared verbatim with duduclaw-relay, which already depends on
@@ -86,6 +89,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security_Authorization",
     "Win32_System_SystemServices",
     "Win32_System_Console",
+    "Win32_System_WindowsProgramming",
     # windows_private_state::write_atomic: NtSetInformationFile(FileRenameInformation)
     # renames relative to the pinned directory handle (Win32 FileRenameInfo rejects it).
     "Wdk_Foundation",

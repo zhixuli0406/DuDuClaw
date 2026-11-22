@@ -320,6 +320,7 @@ impl MethodHandler {
                 boxed_frame(|| self.handle_wiki_auto_pages(params)).await
             }
             "wiki.promote" => {
+                require_manager!();
                 let _ = check_agent!(AccessLevel::Owner);
                 boxed_frame(|| self.handle_wiki_promote(params)).await
             }
@@ -327,7 +328,12 @@ impl MethodHandler {
                 let _ = check_agent!(AccessLevel::Owner);
                 boxed_frame(|| self.handle_wiki_archive(params)).await
             }
+            // v1.84.0 (review H2): sharing publishes a page to every AI
+            // staff member, so it needs the same Manager + Owner bar as the
+            // promotion it requires (`handle_wiki_share` shares promoted
+            // pages only).
             "wiki.share" => {
+                require_manager!();
                 let _ = check_agent!(AccessLevel::Owner);
                 boxed_frame(|| self.handle_wiki_share(params)).await
             }

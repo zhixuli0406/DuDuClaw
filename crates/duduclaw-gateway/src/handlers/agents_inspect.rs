@@ -236,6 +236,7 @@ impl MethodHandler {
                             "deny_phrases": cfg.guardrails.deny_phrases,
                         },
                         "memory": {
+                            "language": cfg.memory.language,
                             "decision_continuity": cfg.memory.decision_continuity,
                             "decision_ttl_days": cfg.memory.decision_ttl_days,
                         },
@@ -288,6 +289,14 @@ impl MethodHandler {
                 // Added after the literal: the object above is already deep
                 // in `json!`'s recursion budget.
                 payload["effective_permissions"] = effective_permissions;
+                // v1.84.0: the engine ran with its own default model because the
+                // saved one is a Claude alias it cannot run (null when not).
+                payload["engine_model_notice"] = json!(crate::runtime_config::model_substitution_notice(&cfg.agent.name));
+                // RM-205: where this employee's background work actually runs
+                // (`source`: employee_engine | employee_setting | global_setting | unavailable).
+                payload["utility_route"] = crate::runtime_config::utility_route(
+                    &self.home_dir, &self.home_dir.join("agents").join(&cfg.agent.name),
+                ).to_json();
                 WsFrame::ok_response("", payload)
             }
             None => WsFrame::error_response("", &format!("Agent not found: {agent_id}")),

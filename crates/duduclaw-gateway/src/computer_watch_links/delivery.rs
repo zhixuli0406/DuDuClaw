@@ -108,7 +108,7 @@ pub(crate) async fn notify_started(home: &Path, agent: &str, turn: Option<&str>,
     let user = mapped_user(agent, turn).filter(|user|
         crate::review_evidence::audience::trusted_dashboard_principal(home, user).is_ok());
     let mapped = user.is_some();
-    let base = crate::deep_link::dashboard_base_url(home);
+    let base = crate::deep_link::public_dashboard_base_url(home);
     let Some(route) = super::notice_route(&channel, mapped, base.as_deref()) else { return; };
     let href = match route {
         super::NoticeRoute::TextOnly => None,

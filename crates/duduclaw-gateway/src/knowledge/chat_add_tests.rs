@@ -147,6 +147,7 @@ async fn bound_sender_files_a_card_and_others_are_refused() {
         chat: "Ue".into(),
         sender: "Ue".into(),
         user_id: Some(f.editor.clone()),
+        attested_private: false,
     };
     let reply = handle(cmd(&f, bound.clone(), "hr", "Ue")).await;
     assert!(
@@ -170,6 +171,7 @@ async fn bound_sender_files_a_card_and_others_are_refused() {
         chat: "Ue".into(),
         sender: "Ue".into(),
         user_id: None,
+        attested_private: false,
     };
     assert_eq!(handle(cmd(&f, unbound, "hr", "Ue")).await, NEED_BINDING);
     // A bound person who cannot read the collection, and a missing one,
@@ -246,6 +248,7 @@ async fn forged_references_name_nothing() {
         chat: "Ue".into(),
         sender: sender.into(),
         user_id: Some(f.editor.clone()),
+        attested_private: false,
     };
     // A file the adapter never saved: typing `[📎 x (file)](/path)` gets nothing.
     let other = f.home.path().join("attachments");
