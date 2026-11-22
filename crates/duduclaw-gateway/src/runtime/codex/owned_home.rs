@@ -123,7 +123,9 @@ impl CheckedWorkRoot {
 
     pub(crate) fn reverify(&self) -> Result<(), String> {
         validate_windows_work_root(&self.path)?;
-        let identity = directory_identity(&self.path).map_err(|_| work_root_refusal())?;
+        let snapshot = directory_identity(&self.path).map_err(directory_identity_refusal)?;
+        validate_directory_snapshot(&self.path, &snapshot)?;
+        let identity = snapshot.identity;
         if !identity.is_strong() || identity != self.identity {
             return Err(work_root_refusal());
         }
@@ -157,11 +159,51 @@ fn validate_windows_work_root(path: &Path) -> Result<(), String> {
 #[cfg(not(windows))]
 fn validate_windows_work_root(_path: &Path) -> Result<(), String> { Ok(()) }
 
-fn directory_identity(path: &Path) -> std::io::Result<duduclaw_core::path_compare::FileIdentity> {
+struct DirectorySnapshot {
+    identity: duduclaw_core::path_compare::FileIdentity,
+    #[cfg(windows)]
+    final_path: PathBuf,
+}
+
+fn directory_identity_refusal(error: std::io::Error) -> String {
+    #[cfg(windows)]
+    if error.kind() == std::io::ErrorKind::Unsupported {
+        return duduclaw_agent::mcp_spawn_gate::engine_local_spawn_gate_error(WORK_ROOT_NETWORK_FOLDER);
+    }
+    let _ = error;
+    work_root_refusal()
+}
+
+fn validate_directory_snapshot(path: &Path, snapshot: &DirectorySnapshot) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use duduclaw_core::path_compare::windows_final_path_matches;
+        let matches = snapshot.final_path.to_str().zip(path.to_str())
+            .and_then(|(final_path, canonical)| windows_final_path_matches(final_path, canonical));
+        match matches {
+            Some(true) => {},
+            Some(false) => return Err(work_root_refusal()),
+            None => return Err(duduclaw_agent::mcp_spawn_gate::engine_local_spawn_gate_error(
+                WORK_ROOT_NETWORK_FOLDER)),
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (path, snapshot);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn directory_identity(path: &Path) -> std::io::Result<DirectorySnapshot> {
+    let (final_path, identity) = duduclaw_core::path_compare::windows_directory_identity(path)?;
+    Ok(DirectorySnapshot { final_path, identity })
+}
+
+#[cfg(not(windows))]
+fn directory_identity(path: &Path) -> std::io::Result<DirectorySnapshot> {
     if !std::fs::metadata(path)?.is_dir() {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a directory"));
     }
-    duduclaw_core::path_compare::file_identity(path)
+    Ok(DirectorySnapshot { identity: duduclaw_core::path_compare::file_identity(path)? })
 }
 
 /// Refuse roots containing `<home>/run`, ambiguous Windows paths, network
@@ -175,15 +217,19 @@ pub(crate) fn check_work_root(home_dir: &Path, work_root: &Path) -> Result<Check
 fn check_work_root_with_identity(
     home_dir: &Path,
     work_root: &Path,
-    mut identify: impl FnMut(&Path) -> std::io::Result<duduclaw_core::path_compare::FileIdentity>,
+    mut identify: impl FnMut(&Path) -> std::io::Result<DirectorySnapshot>,
 ) -> Result<CheckedWorkRoot, String> {
     use duduclaw_core::path_compare::{canonicalize, canonicalize_allow_missing, starts_with};
     validate_windows_work_root(work_root)?;
     let root = canonicalize(work_root).map_err(|_| work_root_refusal())?;
     validate_windows_work_root(&root)?;
     // Never permit NotFound here, including disappearance after canonicalize.
-    let root_id = identify(&root).map_err(|_| work_root_refusal())?;
+    let snapshot = identify(&root).map_err(directory_identity_refusal)?;
+    validate_directory_snapshot(&root, &snapshot)?;
+    let root_id = snapshot.identity;
     if !root_id.is_strong() { return Err(work_root_refusal()); }
+    #[cfg(windows)]
+    let root = snapshot.final_path;
     let home = canonicalize_allow_missing(home_dir).map_err(|_| work_root_refusal())?;
     let runs = [
         std::path::absolute(home_dir).map_err(|_| work_root_refusal())?.join("run"),
@@ -200,11 +246,27 @@ fn check_work_root_with_identity(
             }
         }
         for ancestor in run.ancestors() {
+            // Resolve aliases before opening, then require the handle's final
+            // local path to still match. Only absent protected ancestors may
+            // be skipped, never failures obtaining an opened target's ID.
+            #[cfg(windows)]
+            let resolved = match canonicalize(ancestor) {
+                Ok(path) => path,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(directory_identity_refusal(error)),
+            };
+            #[cfg(windows)]
+            let ancestor = resolved.as_path();
             match identify(ancestor) {
-                Ok(id) if !id.is_strong() || id == root_id => return Err(work_root_refusal()),
-                Ok(_) => {},
+                Ok(snapshot) => {
+                    validate_directory_snapshot(ancestor, &snapshot)?;
+                    if !snapshot.identity.is_strong() || snapshot.identity == root_id {
+                        return Err(work_root_refusal());
+                    }
+                },
+                #[cfg(not(windows))]
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
-                Err(_) => return Err(work_root_refusal()),
+                Err(error) => return Err(directory_identity_refusal(error)),
             }
         }
     }
@@ -1027,6 +1089,132 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn windows_local_work_root_stores_handle_final_path() {
+        let base = tempfile::tempdir().unwrap();
+        let home = base.path().join("home");
+        let root = base.path().join("workspace");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        let checked = check_work_root(&home, &root).unwrap();
+        let (final_path, identity) = duduclaw_core::path_compare::windows_directory_identity(&root).unwrap();
+        assert_eq!(checked.path(), final_path);
+        assert!(checked.path().to_str().unwrap().starts_with(r"\\?\"));
+        assert_eq!(checked.identity, identity);
+        assert!(identity.is_strong());
+        checked.reverify().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_directory_symlink_work_root_checks_final_target() {
+        let base = tempfile::tempdir().unwrap();
+        let home = base.path().join("home");
+        let root = base.path().join("workspace");
+        let link = base.path().join("alias");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        std::os::windows::fs::symlink_dir(&root, &link)
+            .expect("directory symlink test requires Windows Developer Mode or symlink privilege");
+        let checked = check_work_root(&home, &link).unwrap();
+        let (final_path, _) = duduclaw_core::path_compare::windows_directory_identity(&root).unwrap();
+        assert_eq!(checked.path(), final_path);
+        checked.reverify().unwrap();
+        std::fs::remove_dir(&link).unwrap();
+        std::os::windows::fs::symlink_dir(base.path(), &link).unwrap();
+        let error = check_work_root(&home, &link).unwrap_err();
+        assert_eq!(error, work_root_refusal());
+        std::fs::remove_dir(&link).unwrap();
+    }
+
+    #[cfg(windows)]
+    fn create_test_junction(link: &Path, target: &Path) {
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"]).arg(link).arg(target).output().unwrap();
+        assert!(output.status.success(), "mklink /J failed: {} {}",
+            String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_reverify_refuses_junction_to_home_ancestor() {
+        let base = tempfile::tempdir().unwrap();
+        let home = base.path().join("home");
+        let root = base.path().join("workspace");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        let checked = check_work_root(&home, &root).unwrap();
+        std::fs::rename(&root, base.path().join("original")).unwrap();
+        create_test_junction(&root, base.path());
+        assert_eq!(checked.reverify().unwrap_err(), work_root_refusal());
+        std::fs::remove_dir(&root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_reverify_refuses_same_identity_at_changed_final_path() {
+        let base = tempfile::tempdir().unwrap();
+        let home = base.path().join("home");
+        let root = base.path().join("workspace");
+        let moved = base.path().join("moved");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        let checked = check_work_root(&home, &root).unwrap();
+        std::fs::rename(&root, &moved).unwrap();
+        create_test_junction(&root, &moved);
+        let snapshot = directory_identity(&root).unwrap();
+        assert_eq!(snapshot.identity, checked.identity, "identity alone would still accept");
+        assert_eq!(checked.reverify().unwrap_err(), work_root_refusal());
+        std::fs::remove_dir(&root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_work_root_redirected_after_canonicalization_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let home = base.path().join("home");
+        let root = base.path().join("workspace");
+        let other = base.path().join("other");
+        for path in [&home, &root, &other] { std::fs::create_dir(path).unwrap(); }
+        let mut calls = 0;
+        let error = check_work_root_with_identity(&home, &root, |path| {
+            calls += 1;
+            if calls == 1 {
+                std::fs::rename(&root, base.path().join("original")).unwrap();
+                create_test_junction(&root, &other);
+            }
+            directory_identity(path)
+        }).unwrap_err();
+        assert_eq!(calls, 1, "final path mismatch must refuse before ancestor comparison");
+        assert_eq!(error, work_root_refusal());
+        std::fs::remove_dir(&root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_home_ancestor_redirected_after_canonicalization_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let home = base.path().join("home");
+        let root = base.path().join("workspace");
+        let other = base.path().join("other");
+        for path in [&home, &root, &other] { std::fs::create_dir(path).unwrap(); }
+        // `run` is absent: the first existing ancestor opened is `home`.
+        let mut calls = 0;
+        let error = check_work_root_with_identity(&home, &root, |path| {
+            calls += 1;
+            if calls == 2 {
+                assert!(duduclaw_core::path_compare::equal(path, &home).unwrap());
+                std::fs::rename(&home, base.path().join("original-home")).unwrap();
+                create_test_junction(&home, &other);
+            }
+            directory_identity(path)
+        }).unwrap_err();
+        assert_eq!(calls, 2, "ancestor final path mismatch must refuse immediately");
+        assert_eq!(error, work_root_refusal());
+        std::fs::remove_dir(&home).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn windows_drive_relative_and_root_relative_work_roots_are_refused() {
         let home = tempfile::tempdir().unwrap();
         for root in ["C:", r"C:foo", r"\foo", "/foo", "foo", "/", r"\"] {
@@ -1060,8 +1248,9 @@ mod tests {
             let error = check_work_root_with_identity(home.path(), workspace.path(), |path| {
                 let weak = calls == weak_at;
                 calls += 1;
-                if weak { Ok(FileIdentity::WindowsLegacy { volume: 1, index: 2 }) }
-                else { directory_identity(path) }
+                let mut snapshot = directory_identity(path)?;
+                if weak { snapshot.identity = FileIdentity::WindowsLegacy { volume: 1, index: 2 }; }
+                Ok(snapshot)
             }).unwrap_err();
             assert!(duduclaw_agent::mcp_spawn_gate::is_engine_local_spawn_gate_error(&error));
         }
