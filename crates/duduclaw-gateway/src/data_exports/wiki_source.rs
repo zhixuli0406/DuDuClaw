@@ -141,18 +141,10 @@ fn visit(
             {
                 continue;
             }
-            let relative = path
-                .strip_prefix(root)
-                .map_err(|_| "EXPORT_SOURCE_UNAVAILABLE".to_string())?
-                .components()
-                .map(|component| {
-                    component
-                        .as_os_str()
-                        .to_str()
-                        .ok_or_else(|| "EXPORT_INVALID_UTF8".to_string())
-                })
-                .collect::<ExportResult<Vec<_>>>()?
-                .join("/");
+            let rel = path.strip_prefix(root)
+                .map_err(|_| "EXPORT_SOURCE_UNAVAILABLE".to_string())?;
+            let relative = duduclaw_memory::wiki_path::page_id_from_relative_path(rel)
+                .ok_or_else(|| "EXPORT_INVALID_PAGE_ID".to_string())?;
             visitor(&relative)?;
         }
     }

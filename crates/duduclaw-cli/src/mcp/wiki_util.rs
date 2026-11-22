@@ -406,6 +406,8 @@ pub(crate) fn update_wiki_index(
     page_path: &str,
     title: &str,
 ) -> std::result::Result<(), String> {
+    let canonical = duduclaw_memory::wiki_path::persisted_page_id(page_path);
+    let page_path = canonical.as_deref().unwrap_or(page_path);
     let index_path = wiki_dir.join("_index.md");
     let existing = std::fs::read_to_string(&index_path).unwrap_or_default();
 
@@ -414,11 +416,10 @@ pub(crate) fn update_wiki_index(
     let entry_line = format!("- [{}]({}) — updated {}", title, page_path, now);
 
     // Check if this page already has an entry and replace it
-    let link_pattern = format!("]({})", page_path);
     let mut lines: Vec<String> = existing.lines().map(String::from).collect();
     let mut found = false;
     for line in &mut lines {
-        if line.contains(&link_pattern) {
+        if duduclaw_memory::wiki_path::index_line_links_to(line, page_path) {
             *line = entry_line.clone();
             found = true;
             break;
@@ -440,6 +441,8 @@ pub(crate) fn append_wiki_log(
     action: &str,
     page_path: &str,
 ) -> std::result::Result<(), String> {
+    let canonical = duduclaw_memory::wiki_path::persisted_page_id(page_path);
+    let page_path = canonical.as_deref().unwrap_or(page_path);
     let log_path = wiki_dir.join("_log.md");
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
     let entry = format!("## [{}] {} | {}\n", now, action, page_path);
@@ -458,7 +461,7 @@ pub(crate) fn append_wiki_log(
 }
 
 /// Collect all .md files under `dir` recursively (relative to `base`).
-pub(crate) fn collect_md_files(base: &Path, dir: &Path) -> Vec<std::path::PathBuf> {
+pub(crate) fn collect_md_files(base: &Path, dir: &Path) -> Vec<String> {
     let mut result = Vec::new();
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -481,7 +484,9 @@ pub(crate) fn collect_md_files(base: &Path, dir: &Path) -> Vec<std::path::PathBu
             // Skip reserved files
             let fname = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
             if !WIKI_RESERVED.contains(&fname) {
-                result.push(rel.to_path_buf());
+                if let Some(id) = duduclaw_memory::wiki_path::page_id_from_relative_path(rel) {
+                    result.push(id);
+                }
             }
         }
     }

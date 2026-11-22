@@ -109,7 +109,6 @@ pub(crate) fn collect_visible_shared_pages(
     let visibility = DeptVisibility::for_agent(home_dir, caller_agent);
     collect_md_files(wiki_dir, wiki_dir)
         .into_iter()
-        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
         .filter(|rel| visibility.allows(rel))
         .collect()
 }

@@ -802,26 +802,9 @@ impl WikiTrustStore {
     // ── Read ────────────────────────────────────────────────────
 
     pub fn get(&self, page_path: &str, agent_id: &str) -> Result<Option<WikiTrustSnapshot>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| DuDuClawError::Memory("trust db poisoned".into()))?;
-        let row = conn
-            .query_row(
-                "SELECT page_path, agent_id, trust, citation_count, error_signal_count,
-                        success_signal_count, last_signal_at, last_verified, do_not_inject,
-                        locked, updated_at
-                 FROM wiki_trust_state
-                 WHERE page_path = ?1 AND agent_id = ?2",
-                params![page_path, agent_id],
-                Self::row_to_snapshot,
-            )
-            .map(Some);
-        match row {
-            Ok(s) => Ok(s),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(DuDuClawError::Memory(format!("trust get: {e}"))),
-        }
+        let key = crate::wiki_path::persisted_page_id(page_path)
+            .ok_or_else(|| DuDuClawError::Memory("invalid trust page id".into()))?;
+        Ok(self.get_many(agent_id, std::slice::from_ref(&key))?.remove(&key))
     }
 
     /// List all snapshots for a given agent ordered by trust ascending.
@@ -865,78 +848,45 @@ impl WikiTrustStore {
         Ok(out)
     }
 
-    /// Bulk get for multiple page paths — returns a map keyed by page_path.
-    /// Missing entries are simply absent from the map (caller falls back
-    /// to frontmatter trust).
-    ///
-    /// Splits into chunks of `MAX_VARIABLES_PER_QUERY` so wikis with more
-    /// pages than SQLite's per-statement variable limit (default 999 on
-    /// older builds, 32766 on newer) don't silently fail back to "no live
-    /// trust" — review CRITICAL R3-DB#10.
+    /// Read canonical ids across legacy Windows spellings. One agent query
+    /// avoids SQLite's bound-variable limit. Conflicting aliases combine in
+    /// the restrictive direction so normalization never loses a quarantine.
     pub fn get_many(
         &self,
         agent_id: &str,
         page_paths: &[String],
     ) -> Result<std::collections::HashMap<String, WikiTrustSnapshot>> {
-        if page_paths.is_empty() {
-            return Ok(Default::default());
-        }
-        // Conservative bound; one slot is reserved for agent_id (?1).
-        const MAX_VARIABLES_PER_QUERY: usize = 900;
-        let mut out = std::collections::HashMap::with_capacity(page_paths.len());
-        for chunk in page_paths.chunks(MAX_VARIABLES_PER_QUERY) {
-            self.get_many_chunk(agent_id, chunk, &mut out)?;
-        }
-        Ok(out)
-    }
-
-    fn get_many_chunk(
-        &self,
-        agent_id: &str,
-        page_paths: &[String],
-        out: &mut std::collections::HashMap<String, WikiTrustSnapshot>,
-    ) -> Result<()> {
-        if page_paths.is_empty() {
-            return Ok(());
-        }
-        let conn = self
-            .conn
-            .lock()
+        let wanted: std::collections::HashSet<String> = page_paths.iter()
+            .filter_map(|path| crate::wiki_path::persisted_page_id(path)).collect();
+        let mut out: std::collections::HashMap<String, WikiTrustSnapshot> = Default::default();
+        if wanted.is_empty() { return Ok(out); }
+        let conn = self.conn.lock()
             .map_err(|_| DuDuClawError::Memory("trust db poisoned".into()))?;
-        let placeholders = std::iter::repeat("?")
-            .take(page_paths.len())
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!(
+        let mut stmt = conn.prepare(
             "SELECT page_path, agent_id, trust, citation_count, error_signal_count,
                     success_signal_count, last_signal_at, last_verified, do_not_inject,
-                    locked, updated_at
-             FROM wiki_trust_state
-             WHERE agent_id = ?1 AND page_path IN ({placeholders})"
-        );
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| DuDuClawError::Memory(format!("trust get_many prepare: {e}")))?;
-
-        let mut bound: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(page_paths.len() + 1);
-        bound.push(&agent_id);
-        for p in page_paths {
-            bound.push(p);
-        }
-
-        let rows = stmt
-            .query_map(rusqlite::params_from_iter(bound), Self::row_to_snapshot)
+                    locked, updated_at FROM wiki_trust_state WHERE agent_id = ?1",
+        ).map_err(|e| DuDuClawError::Memory(format!("trust get_many prepare: {e}")))?;
+        let rows = stmt.query_map([agent_id], Self::row_to_snapshot)
             .map_err(|e| DuDuClawError::Memory(format!("trust get_many: {e}")))?;
-
-        for r in rows {
-            match r {
-                Ok(s) => {
-                    out.insert(s.page_path.clone(), s);
-                }
-                Err(e) => warn!("skip trust row: {e}"),
+        for row in rows {
+            let mut snapshot = row.map_err(|e| DuDuClawError::Memory(format!("trust row: {e}")))?;
+            let Some(key) = crate::wiki_path::persisted_page_id(&snapshot.page_path) else { continue; };
+            if !wanted.contains(&key) { continue; }
+            snapshot.page_path = key.clone();
+            if !snapshot.trust.is_finite() {
+                snapshot.trust = 0.0;
+                snapshot.do_not_inject = true;
+            }
+            if let Some(previous) = out.get_mut(&key) {
+                previous.trust = previous.trust.min(snapshot.trust);
+                previous.do_not_inject |= snapshot.do_not_inject;
+                previous.locked |= snapshot.locked;
+            } else {
+                out.insert(key, snapshot);
             }
         }
-        Ok(())
+        Ok(out)
     }
 
     // ── Write ───────────────────────────────────────────────────
@@ -2605,6 +2555,18 @@ mod tests {
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].page_path, "low.md");
         assert_eq!(listed[1].page_path, "mid.md");
+    }
+
+    #[test]
+    fn legacy_page_aliases_keep_the_most_restrictive_trust() {
+        let s = store();
+        s.manual_set(r"auto\sop\x.md", "agnes", 0.05, true, Some(true), None).unwrap();
+        s.manual_set("auto/sop/x.md", "agnes", 0.9, false, Some(false), None).unwrap();
+        let snapshot = s.get("auto/sop/x.md", "agnes").unwrap().unwrap();
+        assert!(snapshot.do_not_inject && snapshot.locked);
+        assert!(snapshot.trust < 0.1);
+        let map = s.get_many("agnes", &[r"auto\sop\x.md".into()]).unwrap();
+        assert!(map["auto/sop/x.md"].do_not_inject);
     }
 
     #[test]

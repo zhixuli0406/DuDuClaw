@@ -209,9 +209,11 @@ fn scan(root: &Path, label: &str, skip_auto: bool, sel: &SelectorView, out: &mut
             let Ok(rel) = path.strip_prefix(root) else {
                 continue;
             };
-            let rel = rel.to_string_lossy().replace('\\', "/");
+            let Some(rel) = duduclaw_memory::wiki_path::page_id_from_relative_path(rel) else {
+                continue;
+            };
             if ft.is_dir() {
-                if !(skip_auto && rel == "auto") {
+                if !(skip_auto && duduclaw_core::wiki_auto_namespace::is_auto_page_path(&rel)) {
                     stack.push(path);
                 }
                 continue;

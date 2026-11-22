@@ -28,17 +28,9 @@ enum AutoNamespace<'a> {
 
 /// Classify `page_path` (string only — never touches the file system).
 fn auto_namespace_of(page_path: &str) -> AutoNamespace<'_> {
-    let mut parts: Vec<&str> = Vec::new();
-    for component in Path::new(page_path).components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::Normal(s) => match s.to_str() {
-                Some(s) => parts.push(s),
-                None => return AutoNamespace::Unusable,
-            },
-            _ => return AutoNamespace::Unusable,
-        }
-    }
+    let Some(parts) = duduclaw_core::wiki_auto_namespace::page_id_components(page_path) else {
+        return AutoNamespace::Unusable;
+    };
     match parts.first() {
         Some(first) if duduclaw_gateway::auto_wiki_page::is_auto_namespace_segment(first) => {
             AutoNamespace::Inside(parts)
@@ -99,11 +91,7 @@ pub(crate) fn auto_page_hidden_with(
         AutoNamespace::Inside(parts) => parts,
     };
     let raw = read(&parts.join("/"));
-    let namespace = duduclaw_gateway::auto_wiki_page::AUTO_NAMESPACE;
-    // An alias spelling (`AUTO/`, `auto./`) is looked up under the
-    // canonical name; the registry records only the gateway's own paths, so
-    // a differently spelled file name finds no record and stays hidden.
-    let scoped_path = format!("{namespace}/{}", parts[1..].join("/"));
+    let scoped_path = parts.join("/");
     !duduclaw_gateway::auto_wiki_page::page_visible_in_conversation(
         &scoped_path,
         raw.as_deref(),
@@ -147,16 +135,31 @@ fn redact_reserved_listing(content: &str, scope: &ReadScope) -> String {
     if *scope == ReadScope::Employee {
         return content.to_string();
     }
-    let marker = format!("{}/", duduclaw_gateway::auto_wiki_page::AUTO_NAMESPACE);
     let mut out: String = content
         .lines()
-        .filter(|line| !line.to_ascii_lowercase().contains(&marker))
+        .filter(|line| !line.to_ascii_lowercase().contains("auto/") && !line.split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '`' | '|'))
+            .filter(|token| token.contains(['/', '\\', ':', '~']))
+            .any(duduclaw_core::wiki_auto_namespace::is_auto_page_path))
         .collect::<Vec<_>>()
         .join("\n");
     if content.ends_with('\n') {
         out.push('\n');
     }
     out
+}
+
+/// Also accepts persisted/foreign-platform ids; callers cannot bypass the
+/// visibility boundary by supplying an already constructed page record.
+fn visible_page_ids(
+    pages: impl IntoIterator<Item = String>,
+    wiki_dir: &Path,
+    scope: &ReadScope,
+    registry: &duduclaw_gateway::auto_wiki_page::AutoPageRegistry,
+) -> Vec<String> {
+    pages.into_iter()
+        .filter(|path| !auto_page_hidden(wiki_dir, path, scope, registry))
+        .filter_map(|path| duduclaw_core::wiki_auto_namespace::canonical_page_id(&path))
+        .collect()
 }
 
 pub(crate) async fn handle_wiki_ls(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
@@ -204,10 +207,9 @@ pub(crate) async fn handle_wiki_ls_in(
     }
 
     let registry = auto_registry_for(home_dir, agent_id, scope);
-    let pages: Vec<std::path::PathBuf> = collect_md_files(&wiki_dir, &wiki_dir)
-        .into_iter()
-        .filter(|rel| !auto_page_hidden(&wiki_dir, &rel.to_string_lossy(), scope, &registry))
-        .collect();
+    let pages = visible_page_ids(
+        collect_md_files(&wiki_dir, &wiki_dir), &wiki_dir, scope, &registry,
+    );
     if pages.is_empty() {
         return tool_text("Wiki directory exists but contains no pages.");
     }
@@ -223,11 +225,11 @@ pub(crate) async fn handle_wiki_ls_in(
         let full_path = wiki_dir.join(rel_path);
         let content = std::fs::read_to_string(&full_path).unwrap_or_default();
         let title = extract_frontmatter_title(&content)
-            .unwrap_or_else(|| rel_path.to_string_lossy().to_string());
+            .unwrap_or_else(|| rel_path.to_string());
         let updated = extract_frontmatter_updated(&content).unwrap_or_else(|| "?".to_string());
         lines.push(format!(
             "  {} — {} (updated: {})",
-            rel_path.display(),
+            rel_path,
             title,
             updated
         ));
@@ -257,6 +259,9 @@ pub(crate) async fn handle_wiki_read_in(
         Some(p) => p,
         None => return tool_error("Missing required parameter: page_path"),
     };
+
+    let canonical = duduclaw_core::wiki_auto_namespace::canonical_page_id(page_path);
+    let page_path = canonical.as_deref().unwrap_or(page_path);
 
     // Visibility check for cross-agent access
     if agent_id != default_agent {
@@ -350,13 +355,28 @@ pub(crate) fn wiki_page_withheld(
                 &db,
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
             )?;
-            conn.query_row(
-                "SELECT trust,do_not_inject FROM wiki_trust_state
-                 WHERE page_path=?1 AND agent_id=?2",
-                rusqlite::params![page_path, agent_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
+            let key = duduclaw_memory::wiki_path::persisted_page_id(page_path)
+                .ok_or(rusqlite::Error::InvalidQuery)?;
+            let mut stmt = conn.prepare(
+                "SELECT page_path,trust,do_not_inject FROM wiki_trust_state WHERE agent_id=?1",
+            )?;
+            let rows = stmt.query_map([agent_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?, row.get::<_, i64>(2)?))
+            })?;
+            let mut state: Option<(f64, i64)> = None;
+            for row in rows {
+                let (stored, trust, deny) = row?;
+                if duduclaw_memory::wiki_path::persisted_page_id(&stored).as_ref() == Some(&key) {
+                    // Any quarantined alias wins; canonicalizing the read id
+                    // must never lose an old Windows do_not_inject record.
+                    let trust = if trust.is_finite() { trust } else { 0.0 };
+                    state = Some(match state {
+                        Some((old_trust, old_deny)) => (old_trust.min(trust), old_deny | deny),
+                        None => (trust, deny),
+                    });
+                }
+            }
+            Ok(state)
         })();
         match trust_state {
             Ok(Some((trust, do_not_inject)))
@@ -687,12 +707,12 @@ pub(crate) async fn handle_wiki_lint(args: &Value, home_dir: &Path, default_agen
                 let hidden = |p: &str| auto_page_hidden(&wiki_dir, p, &scope, &registry);
                 let hidden_total = collect_md_files(&wiki_dir, &wiki_dir)
                     .iter()
-                    .filter(|rel| hidden(rel.to_string_lossy().as_ref()))
+                    .filter(|rel| hidden(rel))
                     .count();
                 report.total_pages = report.total_pages.saturating_sub(hidden_total);
                 report.orphan_pages.retain(|p| !hidden(p.as_str()));
                 report.stale_pages.retain(|p| !hidden(p.as_str()));
-                report.broken_links.retain(|(from, _)| !hidden(from.as_str()));
+                report.broken_links.retain(|(from, to)| !hidden(from.as_str()) && !hidden(to.as_str()));
                 let index = std::fs::read_to_string(wiki_dir.join("_index.md")).unwrap_or_default();
                 report.index_entries = redact_reserved_listing(&index, &scope)
                     .lines()
@@ -935,6 +955,64 @@ mod conversation_scope_tests {
         .unwrap()
         .path()
         .to_string()
+    }
+
+    #[test]
+    fn legacy_windows_trust_keys_still_withhold_pages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki = tmp.path().join("agents/alice/wiki");
+        let store = duduclaw_memory::WikiStore::new(wiki.clone());
+        store.ensure_scaffold().unwrap();
+        store.write_page("concepts/x.md", "---\ntitle: X\ntrust: 0.8\n---\n\nprivate").unwrap();
+        let raw = store.read_raw("concepts/x.md").unwrap();
+        let conn = rusqlite::Connection::open(tmp.path().join("wiki_trust.db")).unwrap();
+        conn.execute_batch("CREATE TABLE wiki_trust_state(page_path TEXT, agent_id TEXT, trust REAL, do_not_inject INTEGER);").unwrap();
+        conn.execute("INSERT INTO wiki_trust_state VALUES (?1,'alice',0.8,1)", [r"concepts\x.md"]).unwrap();
+        conn.execute("INSERT INTO wiki_trust_state VALUES (?1,'alice',0.9,0)", ["concepts/x.md"]).unwrap();
+        assert!(wiki_page_withheld(tmp.path(), &wiki, "alice", "concepts/x.md", &raw).is_some());
+    }
+
+    #[tokio::test]
+    async fn foreign_platform_ids_are_hidden_in_list_read_search_and_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let agent = home.join("agents/alice");
+        let wiki = agent.join("wiki");
+        std::fs::create_dir_all(&wiki).unwrap();
+        std::fs::write(agent.join("agent.toml"), "[agent]\nname = \"alice\"\n").unwrap();
+        let path = file_page(home, "x", "separatorneedle private content", "conversation:telegram:A:m:1");
+        let raw = std::fs::read_to_string(wiki.join(&path)).unwrap();
+        let registry = auto_registry_for(home, "alice", &ReadScope::Conversation(None));
+        let in_b = ReadScope::Conversation(Some("telegram:B".into()));
+        let aliases = [r"auto\sop\x.md", r"auto/sop\x.md", r".\auto\sop\x.md", r"AUTO\x.md", r"auto\\x.md", r"a\..\auto\x.md"];
+        // Inject records directly: Unix read_dir cannot produce Windows ids.
+        for alias in aliases {
+            let mut page = duduclaw_memory::wiki::parse_wiki_page(&path, &raw).unwrap();
+            page.path = alias.to_string();
+            assert!(visible_page_ids(vec![page.path.clone()], &wiki, &in_b, &registry).is_empty(), "list {alias}");
+            assert!(auto_page_hidden_with(&page.path, &in_b, &registry, |_| Some(raw.clone())), "search predicate {alias}");
+            assert!(auto_namespace_mutation_refused(alias), "write {alias}");
+            let read = handle_wiki_read_in(&serde_json::json!({"page_path": alias}), home, "alice", &in_b).await;
+            assert_eq!(read["isError"], true, "read {alias}: {}", text(&read));
+            assert!(!text(&read).contains("private content"));
+            let index = format!("- [secret]({alias})\n");
+            assert!(!redact_reserved_listing(&index, &in_b).contains("secret"), "index {alias}");
+        }
+        let store = duduclaw_memory::WikiStore::new(wiki.clone());
+        store.write_page("concepts/public.md", "---\ntitle: Public\nrelated: [auto\\sop\\x.md]\n---\n\nseparatorneedle public").unwrap();
+        let found = handle_wiki_search_in(&serde_json::json!({"query": "separatorneedle", "expand": true}), home, "alice", &in_b).await;
+        assert!(text(&found).contains("concepts/public.md"), "{}", text(&found));
+        assert!(!text(&found).contains("auto/sop/x.md") && !text(&found).contains("private content"), "{}", text(&found));
+        let listed = handle_wiki_ls_in(&serde_json::json!({}), home, "alice", &in_b).await;
+        assert!(text(&listed).contains("concepts/public.md") && !text(&listed).contains("auto"), "{}", text(&listed));
+        let in_a = ReadScope::Conversation(Some("telegram:A".into()));
+        let own = handle_wiki_read_in(&serde_json::json!({"page_path": r"auto\sop\x.md"}), home, "alice", &in_a).await;
+        assert!(text(&own).contains("private content"), "{}", text(&own));
+        // Pre-upgrade files (no external registry) stay hidden even if their
+        // contents claim promotion or a matching conversation.
+        std::fs::remove_file(duduclaw_memory::wiki_auto_registry::registry_path(home, "alice").unwrap()).unwrap();
+        let legacy = handle_wiki_read_in(&serde_json::json!({"page_path": r"auto\sop\x.md"}), home, "alice", &in_a).await;
+        assert_eq!(legacy["isError"], true);
     }
 
     /// RM-200 item 1: on a channel turn in A, conversation B's auto page —

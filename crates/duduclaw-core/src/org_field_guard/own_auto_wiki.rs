@@ -45,7 +45,10 @@ pub fn check_own_auto_wiki_write(file_path: &Path, home: &Path, caller: &HookCal
 }
 
 fn own_auto_wiki_at(file_path: &Path, home: &Path, caller_id: &str) -> GuardDecision {
-    let normalized = lexical_normalize(file_path);
+    // Judge foreign-platform spellings on every host, including literal
+    // backslashes in Unix names. The registry is still the authority.
+    let portable = file_path.to_string_lossy().replace('\\', "/");
+    let normalized = lexical_normalize(Path::new(&portable));
     let Some(owner) = owning_agent_dir(&normalized, home) else {
         return GuardDecision::NotAgentFile;
     };
@@ -96,7 +99,7 @@ pub(super) fn mentions_own_auto_wiki(normalized_command: &str, caller_id: &str) 
                 return false;
             }
             let parts: Vec<String> = token
-                .split('/')
+                .split(['/', '\\'])
                 .filter(|p| !p.is_empty() && *p != ".")
                 .map(str::to_string)
                 .collect();
