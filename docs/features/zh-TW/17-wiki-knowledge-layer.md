@@ -268,7 +268,7 @@ visible_to_departments = ["hr", "legal"]   # 讀取：僅限 hr + legal 部門
 
 這一層疊在內建的 `departments/<dept>/` 隔離之上（見下方「部門知識分層」）：`departments/art/*` 無論 `.scope.toml` 怎麼設，永遠只對 `art` 部門可見；而 `visible_to_departments` 讓操作者可以把*任何*命名空間（`hr/`、`finance/` 等）限制給指定部門。`wiki_namespace_status` 會列出目前生效的 `visible_to_departments` 宣告。
 
-**名稱怎麼比對（v1.84.0）。** 頁面路徑與 `.scope.toml` 的命名空間名稱在所有平台上都把 `/` 與 `\` 當成分隔符號、不分大小寫，並忽略結尾的句點與空白，所以 `departments\HR\pay.md` 和 `departments/hr/pay.md` 是同一頁。兩個 `[namespaces."…"]` 依這些規則指向同一個資料夾時（例如 `HR` 與 `hr`），AI 員工一律不能讀取這個資料夾，寫入則連操作者也被拒絕，直到管理員刪掉重複的那一筆；閘道對每個資料夾記錄一次警告。
+**名稱怎麼比對（v1.84.0）。** 頁面路徑中的 `/` 與 `\` 在所有平台上都是同一種分隔符號，所以 `departments\hr\pay.md` 和 `departments/hr/pay.md` 是同一頁。部門資料夾與 `.scope.toml` 命名空間只有在名稱完全相符時才會開放。只差大小寫、結尾多了句點或空白，或 Unicode 組字方式不同（NFC 與 NFD）的名稱，會被當成受保護名稱的別名而拒絕：`hr` 部門的員工讀不到 `departments/HR/pay.md`，AI 員工不能透過已宣告命名空間的別名讀取，透過別名寫入也一律被拒。部門代號和 v1.83.0 一樣區分大小寫。兩個 `[namespaces."…"]` 依這些規則指向同一個資料夾時（例如 `HR` 與 `hr`），AI 員工一律不能讀取這個資料夾，寫入則連操作者也被拒絕，直到管理員刪掉重複的那一筆；閘道對每個資料夾記錄一次警告。
 
 ### 部門知識與 Skill 分層
 
