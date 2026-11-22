@@ -508,6 +508,11 @@ impl MethodHandler {
         // Move the credential into a zeroizing owner before any early-return
         // gate. Secret-bearing requests never reach the extension clone.
         let mut params = params;
+        if matches!(method.split('.').next(), Some("wiki" | "shared_wiki"))
+            && duduclaw_memory::wiki_path::canonicalize_wiki_arguments(&mut params).is_err()
+        {
+            return WsFrame::error_response("", "Invalid wiki page id");
+        }
         let credential_request = if method.split('.').next() == Some("transcription_credentials") {
             Some(transcription_credentials_rpc::Request::take(method, params.take()))
         } else { None };

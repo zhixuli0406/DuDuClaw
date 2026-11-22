@@ -566,3 +566,35 @@ async fn wp7_lint_hides_other_departments() {
 // ─────────────────────────────────────────────────────────────────────
 // WP2.3 — namespace read-visibility via `visible_to_departments`
 // ─────────────────────────────────────────────────────────────────────
+
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn shared_wiki_sales_cannot_read_hr_separator_aliases() {
+    let tmp = TempDir::new();
+    let agents_dir = tmp.path().join("agents");
+    fs::create_dir_all(&agents_dir).unwrap();
+    write_agent_toml_dept(&agents_dir, "seller", "sales");
+    let store = duduclaw_memory::WikiStore::new_shared(tmp.path());
+    store.ensure_scaffold().unwrap();
+    store.write_page("departments/hr/salary.md", "---\ntitle: HR salary\n---\n\nprivate salaryneedle").unwrap();
+    store.write_page("departments/sales/own.md", "---\ntitle: Sales\n---\n\npublic salaryneedle").unwrap();
+    for path in [r"departments\hr\salary.md", r"departments/hr\salary.md", r".\departments\hr\salary.md"] {
+        let args = serde_json::json!({"page_path": path, "content": clean_karpathy_page("Replacement")});
+        let read = handle_shared_wiki_read(&args, tmp.path(), "seller").await;
+        assert_eq!(read["isError"], true, "{path}: {read}");
+        assert!(!read.to_string().contains("private salaryneedle"));
+        assert_eq!(handle_shared_wiki_write(&args, tmp.path(), "seller").await["isError"], true);
+        assert_eq!(handle_shared_wiki_delete(&args, tmp.path(), "seller").await["isError"], true);
+    }
+    let own = handle_shared_wiki_read(&serde_json::json!({"page_path": r".\departments\sales\own.md"}), tmp.path(), "seller").await;
+    assert_ne!(own["isError"], true, "{own}");
+    // These APIs have no page/path filter; test their actual list/search surfaces.
+    let list = handle_shared_wiki_ls(tmp.path(), "seller").await.to_string();
+    let search = handle_shared_wiki_search(&serde_json::json!({"query": "salaryneedle"}), tmp.path(), "seller").await.to_string();
+    for response in [list, search] {
+        assert!(!response.contains("departments/hr") && !response.contains("private salaryneedle"), "{response}");
+        assert!(response.contains("departments/sales/own.md"), "{response}");
+    }
+    assert!(store.read_raw("departments/hr/salary.md").unwrap().contains("private salaryneedle"));
+}

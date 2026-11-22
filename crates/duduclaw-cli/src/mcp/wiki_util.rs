@@ -406,8 +406,9 @@ pub(crate) fn update_wiki_index(
     page_path: &str,
     title: &str,
 ) -> std::result::Result<(), String> {
-    let canonical = duduclaw_memory::wiki_path::persisted_page_id(page_path);
-    let page_path = canonical.as_deref().unwrap_or(page_path);
+    let canonical = duduclaw_memory::wiki_path::persisted_page_id(page_path)
+        .ok_or_else(|| "Invalid wiki page id".to_string())?;
+    let page_path = canonical.as_str();
     let index_path = wiki_dir.join("_index.md");
     let existing = std::fs::read_to_string(&index_path).unwrap_or_default();
 
@@ -441,8 +442,9 @@ pub(crate) fn append_wiki_log(
     action: &str,
     page_path: &str,
 ) -> std::result::Result<(), String> {
-    let canonical = duduclaw_memory::wiki_path::persisted_page_id(page_path);
-    let page_path = canonical.as_deref().unwrap_or(page_path);
+    let canonical = duduclaw_memory::wiki_path::persisted_page_id(page_path)
+        .ok_or_else(|| "Invalid wiki page id".to_string())?;
+    let page_path = canonical.as_str();
     let log_path = wiki_dir.join("_log.md");
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
     let entry = format!("## [{}] {} | {}\n", now, action, page_path);
@@ -475,6 +477,8 @@ pub(crate) fn collect_md_files(base: &Path, dir: &Path) -> Vec<String> {
             continue;
         };
         let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else { continue; };
+        if duduclaw_memory::wiki_path::is_link_metadata(&meta) { continue; }
         if ftype.is_dir() {
             result.extend(collect_md_files(base, &path));
         } else if ftype.is_file()

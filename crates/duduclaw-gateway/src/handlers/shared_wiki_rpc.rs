@@ -82,8 +82,8 @@ impl SharedWikiReader {
         // Normalise by refusing alternate spellings before applying the
         // namespace rule. Global indexes/logs can name hidden department pages.
         if path.contains('\\')
-            || path.split('/').any(|part| part.is_empty() || part == "." || part == "..")
-            || path.split('/').any(|part| part.starts_with('_') || part.starts_with('.'))
+            || path.split(['/', '\\']).any(|part| part.is_empty() || part == "." || part == "..")
+            || path.split(['/', '\\']).any(|part| part.starts_with('_') || part.starts_with('.'))
         {
             return false;
         }
@@ -139,6 +139,11 @@ impl MethodHandler {
             .get("page_path")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        let canonical = match duduclaw_memory::wiki_path::canonical_page_argument(page_path) {
+            Ok(id) => id,
+            Err(_) => return WsFrame::error_response("", "Invalid page_path"),
+        };
+        let page_path = canonical.as_str();
         if page_path.is_empty() {
             return WsFrame::error_response("", "Missing 'page_path' parameter");
         }
@@ -146,6 +151,12 @@ impl MethodHandler {
         if !reader.page_visible(page_path) {
             return WsFrame::error_response("", "permission denied");
         }
+        let wiki_dir = self.home_dir.join("shared/wiki");
+        let target = match duduclaw_memory::wiki_path::resolve_wiki_page(&wiki_dir, page_path, false) {
+            Ok(target) if reader.page_visible(&target.id) => target,
+            _ => return WsFrame::error_response("", "permission denied"),
+        };
+        let page_path = target.id.as_str();
         let store = duduclaw_memory::WikiStore::new_shared(&self.home_dir);
         match store.read_raw(page_path) {
             Ok(content) => {
@@ -332,6 +343,14 @@ mod visibility_tests {
         assert_eq!(list["pages"].as_array().unwrap().len(), 2);
         for path in ["departments/hr/secret.md", "legal/secret.md", "_index.md", "./departments/hr/secret.md"] {
             denied(handler.handle("shared_wiki.read", json!({"page_path": path}), &ctx).await);
+        }
+        #[cfg(unix)]
+        for path in [r"departments\hr\secret.md", r"departments/hr\secret.md", r".\departments\hr\secret.md"] {
+            let response = handler.handle("shared_wiki.read", json!({"page_path": path}), &ctx).await;
+            assert!(!format!("{response:?}").contains("HR-only-snippet"));
+            denied(response);
+            // Direct handler calls are boundaries too, not just the dispatcher.
+            denied(handler.handle_shared_wiki_read(json!({"page_path": path}), &ctx).await);
         }
         let hits = payload(handler.handle("shared_wiki.search", json!({"query": "handbook"}), &ctx).await);
         assert_eq!(hits["hits"].as_array().unwrap().len(), 2);

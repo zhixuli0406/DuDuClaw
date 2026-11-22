@@ -148,6 +148,11 @@ pub(crate) async fn handle_shared_wiki_read(args: &Value, home_dir: &Path, calle
         Some(p) => p,
         None => return tool_error("Missing required parameter: page_path"),
     };
+    let canonical = match duduclaw_memory::wiki_path::canonical_page_argument(page_path) {
+        Ok(id) => id,
+        Err(_) => return tool_error("Invalid page_path"),
+    };
+    let page_path = canonical.as_str();
 
     // Shared validator (same as wiki_read), before any disk access.
     if let Err(e) = validate_wiki_read_path(page_path) {
@@ -166,9 +171,15 @@ pub(crate) async fn handle_shared_wiki_read(args: &Value, home_dir: &Path, calle
 
     let wiki_dir = resolve_shared_wiki_dir(home_dir);
 
+    let target = match duduclaw_memory::wiki_path::resolve_wiki_page(&wiki_dir, page_path, false) {
+        Ok(target) if DeptVisibility::for_agent(home_dir, caller_agent).allows(&target.id) => target,
+        _ => return tool_error("Shared wiki page not found"),
+    };
+    let page_path = target.id.as_str();
+
     // Fail-closed, no-follow read (a canonicalize failure used to skip the
     // escape check, and the read followed a link swapped in after it).
-    match duduclaw_memory::wiki_path::read_wiki_file_nofollow(&wiki_dir, page_path) {
+    match duduclaw_memory::wiki_path::read_resolved_wiki_file_nofollow(&target) {
         Ok(content) => tool_text(&content),
         Err(e) => tool_error(&wiki_read_error(page_path, &e)),
     }
@@ -179,6 +190,11 @@ pub(crate) async fn handle_shared_wiki_write(args: &Value, home_dir: &Path, call
         Some(p) => p,
         None => return tool_error("Missing required parameter: page_path"),
     };
+    let canonical = match duduclaw_memory::wiki_path::canonical_page_argument(page_path) {
+        Ok(id) => id,
+        Err(_) => return tool_error("Invalid page_path"),
+    };
+    let page_path = canonical.as_str();
     let content = match args.get("content").and_then(|v| v.as_str()) {
         Some(c) => c,
         None => return tool_error("Missing required parameter: content"),
@@ -255,6 +271,20 @@ pub(crate) async fn handle_shared_wiki_write(args: &Value, home_dir: &Path, call
     if let Err(e) = ensure_shared_wiki_dir(&wiki_dir) {
         return tool_error(&e);
     }
+
+    let target = match duduclaw_memory::wiki_path::prepare_wiki_write_with_policy(&wiki_dir, page_path, |id| {
+        verify_before_io().map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))?;
+        if !scope_policy.has_explicit_namespace(duduclaw_core::DEPARTMENTS_NAMESPACE) {
+            crate::wiki_scope::check_department_access(id, resolve_agent_department(home_dir, caller_agent).as_deref())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))?;
+        }
+        scope_policy.check_write(id, &caller_capability)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))
+    }) {
+        Ok(target) => target,
+        Err(_) => return tool_error("Shared wiki write denied"),
+    };
+    let page_path = target.id.as_str();
 
     // P2-B H-4: record where this write came from (host env only). The
     // previous version is read without following a symlink, so a link planted

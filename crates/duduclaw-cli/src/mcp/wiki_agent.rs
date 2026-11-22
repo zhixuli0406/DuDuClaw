@@ -12,33 +12,6 @@ fn wiki_read_scope(agent: &str) -> ReadScope {
     crate::mcp_memory_handlers::mcp_read_scope(agent)
 }
 
-/// Where a page path sits relative to the auto namespace (v1.84.0), judged
-/// on the components the file system will open: normal components only
-/// (`./auto/x.md` and `auto//x.md` are `auto/x.md`), the namespace segment
-/// as `auto_wiki_page::is_auto_namespace_segment` folds it (`AUTO/`,
-/// `auto./`, `auto /` all open `auto/` somewhere).
-enum AutoNamespace<'a> {
-    Outside,
-    /// Inside: every normal component, the namespace segment first (as given).
-    Inside(Vec<&'a str>),
-    /// A component that cannot be judged (not UTF-8, a root, a prefix, `..`):
-    /// treated as inside (fail closed).
-    Unusable,
-}
-
-/// Classify `page_path` (string only — never touches the file system).
-fn auto_namespace_of(page_path: &str) -> AutoNamespace<'_> {
-    let Some(parts) = duduclaw_core::wiki_auto_namespace::page_id_components(page_path) else {
-        return AutoNamespace::Unusable;
-    };
-    match parts.first() {
-        Some(first) if duduclaw_gateway::auto_wiki_page::is_auto_namespace_segment(first) => {
-            AutoNamespace::Inside(parts)
-        }
-        _ => AutoNamespace::Outside,
-    }
-}
-
 /// The auto-page registry a read in `scope` of `agent_id`'s wiki judges
 /// against, loaded ONCE per tool call (review H1 item 3). Employee-wide
 /// reads do not consult it (empty).
@@ -68,7 +41,7 @@ pub(crate) fn auto_page_hidden(
     scope: &ReadScope,
     registry: &duduclaw_gateway::auto_wiki_page::AutoPageRegistry,
 ) -> bool {
-    auto_page_hidden_with(page_path, scope, registry, |rel| {
+    auto_page_hidden_with(wiki_dir, page_path, scope, registry, |rel| {
         duduclaw_memory::wiki_path::read_wiki_file_nofollow(wiki_dir, rel).ok()
     })
 }
@@ -77,40 +50,33 @@ pub(crate) fn auto_page_hidden(
 /// (called with the path as it will be opened, only for a page under
 /// `auto/` on a channel turn) — e.g. the content a search already read.
 pub(crate) fn auto_page_hidden_with(
+    wiki_dir: &Path,
     page_path: &str,
     scope: &ReadScope,
     registry: &duduclaw_gateway::auto_wiki_page::AutoPageRegistry,
     read: impl FnOnce(&str) -> Option<String>,
 ) -> bool {
-    let ReadScope::Conversation(session) = scope else {
-        return false;
-    };
-    let parts = match auto_namespace_of(page_path) {
-        AutoNamespace::Outside => return false,
-        AutoNamespace::Unusable => return true,
-        AutoNamespace::Inside(parts) => parts,
-    };
-    let raw = read(&parts.join("/"));
-    let scoped_path = parts.join("/");
-    !duduclaw_gateway::auto_wiki_page::page_visible_in_conversation(
-        &scoped_path,
-        raw.as_deref(),
-        session.as_deref(),
-        registry,
+    let Ok(id) = duduclaw_memory::wiki_path::canonical_page_argument(page_path) else { return true; };
+    let Ok(target) = duduclaw_memory::wiki_path::resolve_wiki_page(wiki_dir, &id, false) else { return true; };
+    let ReadScope::Conversation(session) = scope else { return false; };
+    if !target.is_auto { return false; }
+    let raw = read(&target.id);
+    !duduclaw_gateway::auto_wiki_page::resolved_auto_page_visible(
+        &target.id, raw.as_deref(), session.as_deref(), registry,
     )
 }
 
 /// The one answer every MCP wiki mutation gives when its source or
 /// destination is inside `auto/` (v1.84.0, review H1), for every AI-callable
 /// scope — a channel conversation turn and an employee-wide call alike.
-/// Fixed text, decided from the path string before any file-system access,
-/// so it is the same whether or not the page exists.
+/// The lexical auto gate runs before file-system access. The resolved-parent
+/// gate uses the same refusal for aliases and unusable mutation targets.
 pub(crate) const WIKI_AUTO_NAMESPACE_REFUSED: &str =
     "Not available to AI tools: pages under auto/ are filed automatically from conversations and \
      are changed only from the curation station. Use a path outside auto/, or ask an administrator.";
 
-/// Whether an MCP wiki mutation of `page_path` (its source or destination)
-/// must be refused with [`WIKI_AUTO_NAMESPACE_REFUSED`]: any path inside
+/// Early lexical backstop for an MCP wiki mutation of `page_path` (its source
+/// or destination). Callers also resolve the parent chain before I/O and refuse with [`WIKI_AUTO_NAMESPACE_REFUSED`]: any path inside
 /// `auto/` of any agent's wiki (an unusable path counts as inside), whatever
 /// the read scope — the employee-wide scope included (review H1 round 2: an
 /// employee-wide `wiki_write` could otherwise overwrite a conversation's
@@ -118,7 +84,7 @@ pub(crate) const WIKI_AUTO_NAMESPACE_REFUSED: &str =
 /// and the dashboard's human actions (promote, archive, share-out) write
 /// there.
 pub(crate) fn auto_namespace_mutation_refused(page_path: &str) -> bool {
-    !matches!(auto_namespace_of(page_path), AutoNamespace::Outside)
+    duduclaw_core::wiki_auto_namespace::is_auto_page_path(page_path)
 }
 
 /// The fixed `wiki_export` answer on a channel conversation turn (v1.84.0).
@@ -131,7 +97,7 @@ pub(crate) const WIKI_EXPORT_CHANNEL_TURN_REFUSED: &str =
 /// conversations' pages). Fail closed: every such line is dropped, this
 /// conversation's own auto pages included (they stay reachable through
 /// `wiki_ls` / `wiki_search`).
-fn redact_reserved_listing(content: &str, scope: &ReadScope) -> String {
+fn redact_reserved_listing(wiki_dir: &Path, content: &str, scope: &ReadScope) -> String {
     if *scope == ReadScope::Employee {
         return content.to_string();
     }
@@ -139,7 +105,12 @@ fn redact_reserved_listing(content: &str, scope: &ReadScope) -> String {
         .lines()
         .filter(|line| !line.to_ascii_lowercase().contains("auto/") && !line.split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '`' | '|'))
             .filter(|token| token.contains(['/', '\\', ':', '~']))
-            .any(duduclaw_core::wiki_auto_namespace::is_auto_page_path))
+            .any(|token| {
+                if duduclaw_core::wiki_auto_namespace::is_auto_page_path(token) { return true; }
+                let Ok(id) = duduclaw_memory::wiki_path::canonical_page_argument(token) else { return true; };
+                duduclaw_memory::wiki_path::resolve_wiki_page(wiki_dir, &id, false)
+                    .map(|target| target.is_auto).unwrap_or(true)
+            }))
         .collect::<Vec<_>>()
         .join("\n");
     if content.ends_with('\n') {
@@ -158,7 +129,10 @@ fn visible_page_ids(
 ) -> Vec<String> {
     pages.into_iter()
         .filter(|path| !auto_page_hidden(wiki_dir, path, scope, registry))
-        .filter_map(|path| duduclaw_core::wiki_auto_namespace::canonical_page_id(&path))
+        .filter_map(|path| {
+            let id = duduclaw_memory::wiki_path::canonical_page_argument(&path).ok()?;
+            duduclaw_memory::wiki_path::resolve_wiki_page(wiki_dir, &id, false).ok().map(|target| target.id)
+        })
         .collect()
 }
 
@@ -222,8 +196,7 @@ pub(crate) async fn handle_wiki_ls_in(
     ));
 
     for rel_path in &pages {
-        let full_path = wiki_dir.join(rel_path);
-        let content = std::fs::read_to_string(&full_path).unwrap_or_default();
+        let content = duduclaw_memory::wiki_path::read_wiki_file_nofollow(&wiki_dir, rel_path).unwrap_or_default();
         let title = extract_frontmatter_title(&content)
             .unwrap_or_else(|| rel_path.to_string());
         let updated = extract_frontmatter_updated(&content).unwrap_or_else(|| "?".to_string());
@@ -259,9 +232,12 @@ pub(crate) async fn handle_wiki_read_in(
         Some(p) => p,
         None => return tool_error("Missing required parameter: page_path"),
     };
+    let canonical = match duduclaw_memory::wiki_path::canonical_page_argument(page_path) {
+        Ok(id) => id,
+        Err(_) => return tool_error("Invalid page_path"),
+    };
+    let page_path = canonical.as_str();
 
-    let canonical = duduclaw_core::wiki_auto_namespace::canonical_page_id(page_path);
-    let page_path = canonical.as_deref().unwrap_or(page_path);
 
     // Visibility check for cross-agent access
     if agent_id != default_agent {
@@ -288,6 +264,13 @@ pub(crate) async fn handle_wiki_read_in(
         Err(e) => return tool_error(&e),
     };
 
+    let registry = auto_registry_for(home_dir, agent_id, scope);
+    let target = match duduclaw_memory::wiki_path::resolve_wiki_page(&wiki_dir, page_path, false) {
+        Ok(target) => target,
+        Err(e) => return tool_error(&wiki_read_error(page_path, &e)),
+    };
+    let page_path = target.id.as_str();
+
     // Keep the raw read, parsed-page check, and live trust check in one
     // cooperative snapshot. A verified CCR route independently reacquires
     // its own delivery lease after the MCP response arrives. W2-B: the fence
@@ -301,7 +284,7 @@ pub(crate) async fn handle_wiki_read_in(
     // Fail-closed, no-follow read: the page must resolve inside the wiki
     // directory and be a regular file opened with O_NOFOLLOW (a canonicalize
     // failure used to skip the escape check).
-    let content = match duduclaw_memory::wiki_path::read_wiki_file_nofollow(&wiki_dir, page_path)
+    let content = match duduclaw_memory::wiki_path::read_resolved_wiki_file_nofollow(&target)
     {
         Ok(content) => content,
         Err(e) => return tool_error(&wiki_read_error(page_path, &e)),
@@ -312,13 +295,20 @@ pub(crate) async fn handle_wiki_read_in(
         .unwrap_or("");
     // v1.84.0: another conversation's auto page is "not found" — the same
     // text a missing page gets, before any other check can tell them apart.
-    let registry = auto_registry_for(home_dir, agent_id, scope);
-    if auto_page_hidden(&wiki_dir, page_path, scope, &registry) {
+    let hidden = match scope {
+        ReadScope::Conversation(session) if target.is_auto => {
+            !duduclaw_gateway::auto_wiki_page::resolved_auto_page_visible(
+                page_path, Some(&content), session.as_deref(), &registry,
+            )
+        }
+        _ => false,
+    };
+    if hidden {
         let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
         return tool_error(&wiki_read_error(page_path, &missing));
     }
     if WIKI_RESERVED.contains(&file_name) {
-        return tool_text(&redact_reserved_listing(&content, scope));
+        return tool_text(&redact_reserved_listing(&wiki_dir, &content, scope));
     }
     if let Some(reason) = wiki_page_withheld(home_dir, &wiki_dir, agent_id, page_path, &content) {
         return tool_error(reason);
@@ -449,6 +439,11 @@ pub(crate) async fn handle_wiki_write_in(
         Some(p) => p,
         None => return tool_error("Missing required parameter: page_path"),
     };
+    let canonical = match duduclaw_memory::wiki_path::canonical_page_argument(page_path) {
+        Ok(id) => id,
+        Err(_) => return tool_error(WIKI_AUTO_NAMESPACE_REFUSED),
+    };
+    let page_path = canonical.as_str();
     // v1.84.0 (review H1): before any file-system access, one fixed answer
     // whether or not the page exists (no existence oracle, no overwrite or
     // forgery of a conversation's auto page), for every scope.
@@ -520,15 +515,12 @@ pub(crate) async fn handle_wiki_write_in(
     if let Err(error) = duduclaw_mcp_boundary::io_authority::verify_before_io() {
         return tool_error(&error.to_string());
     }
-    let full_path = match duduclaw_memory::wiki_path::prepare_wiki_write_target(&wiki_dir, page_path)
-    {
-        Ok(p) => p,
-        Err(e) => {
-            return tool_error(&format!(
-                "Page path refused: {e}. It must resolve inside the wiki directory."
-            ));
-        }
+    let target = match duduclaw_memory::wiki_path::prepare_employee_wiki_write(&wiki_dir, page_path) {
+        Ok(target) => target,
+        Err(_) => return tool_error(WIKI_AUTO_NAMESPACE_REFUSED),
     };
+    let page_path = target.id.as_str();
+    let full_path = target.full_path.clone();
 
     let is_new = std::fs::symlink_metadata(&full_path).is_err();
 
@@ -642,7 +634,7 @@ pub(crate) async fn handle_wiki_search_in(
         return tool_text("No wiki found. Use wiki_write to create the first page.");
     }
 
-    let store = duduclaw_memory::WikiStore::new(wiki_dir);
+    let store = duduclaw_memory::WikiStore::new(wiki_dir.clone());
     let searched = match scope {
         ReadScope::Employee => store.search_filtered(query, limit, min_trust, layer_filter, expand),
         // Hidden pages are dropped inside the search, before its ranking
@@ -651,7 +643,7 @@ pub(crate) async fn handle_wiki_search_in(
         ReadScope::Conversation(_) => {
             let registry = auto_registry_for(home_dir, agent_id, scope);
             let visible = |rel: &str, raw: &str| {
-                !auto_page_hidden_with(rel, scope, &registry, |_| Some(raw.to_string()))
+                !auto_page_hidden_with(&wiki_dir, rel, scope, &registry, |_| Some(raw.to_string()))
             };
             store.search_filtered_visible(query, limit, min_trust, layer_filter, expand, &visible)
         }
@@ -714,7 +706,7 @@ pub(crate) async fn handle_wiki_lint(args: &Value, home_dir: &Path, default_agen
                 report.stale_pages.retain(|p| !hidden(p.as_str()));
                 report.broken_links.retain(|(from, to)| !hidden(from.as_str()) && !hidden(to.as_str()));
                 let index = std::fs::read_to_string(wiki_dir.join("_index.md")).unwrap_or_default();
-                report.index_entries = redact_reserved_listing(&index, &scope)
+                report.index_entries = redact_reserved_listing(&wiki_dir, &index, &scope)
                     .lines()
                     .filter(|l| l.starts_with("- ["))
                     .count();
@@ -791,6 +783,7 @@ pub(crate) async fn handle_wiki_stats(args: &Value, home_dir: &Path, default_age
     };
 
     let index_content = redact_reserved_listing(
+        &wiki_dir,
         &std::fs::read_to_string(wiki_dir.join("_index.md")).unwrap_or_default(),
         &scope,
     );
@@ -800,6 +793,7 @@ pub(crate) async fn handle_wiki_stats(args: &Value, home_dir: &Path, default_age
         .count();
 
     let log_content = redact_reserved_listing(
+        &wiki_dir,
         &std::fs::read_to_string(wiki_dir.join("_log.md")).unwrap_or_default(),
         &scope,
     );
@@ -957,6 +951,64 @@ mod conversation_scope_tests {
         .to_string()
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auto_directory_alias_is_scoped_for_read_write_share_search_and_listing() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let wiki = home.join("agents/alice/wiki");
+        std::fs::create_dir_all(&wiki).unwrap();
+        std::fs::write(home.join("agents/alice/agent.toml"), "[agent]\nname = \"alice\"\n").unwrap();
+        let path = file_page(home, "secret", "aliasneedle private salary", "conversation:telegram:A:m:1");
+        symlink("auto", wiki.join("public-alias")).unwrap();
+        let alias = path.replacen("auto/", "public-alias/", 1);
+        let in_a = ReadScope::Conversation(Some("telegram:A".into()));
+        let in_b = ReadScope::Conversation(Some("telegram:B".into()));
+        let args = serde_json::json!({"page_path": alias});
+        let refused = handle_wiki_read_in(&args, home, "alice", &in_b).await;
+        assert_eq!(refused["isError"], true);
+        assert!(!text(&refused).contains("private salary"));
+        assert!(text(&handle_wiki_read_in(&args, home, "alice", &in_a).await).contains("private salary"));
+        let before = std::fs::read(wiki.join(&path)).unwrap();
+        for scope in [&in_a, &in_b, &ReadScope::Employee] {
+            let write = handle_wiki_write_in(&serde_json::json!({"page_path": alias, "content": "replacement"}), home, "alice", scope).await;
+            assert_eq!(write["isError"], true, "{}", text(&write));
+            let share = handle_wiki_share_in(&args, home, "alice", scope).await;
+            assert_eq!(share["isError"], true, "{}", text(&share));
+        }
+        assert_eq!(std::fs::read(wiki.join(&path)).unwrap(), before);
+        let store = duduclaw_memory::WikiStore::new(wiki.clone());
+        store.write_page("concepts/public.md", &format!("---\ntitle: Public\nrelated: [{alias}]\n---\n\naliasneedle public")).unwrap();
+        let list = handle_wiki_ls_in(&serde_json::json!({}), home, "alice", &in_b).await;
+        assert!(!text(&list).contains("public-alias") && !text(&list).contains(&path), "{}", text(&list));
+        let search = handle_wiki_search_in(&serde_json::json!({"query": "aliasneedle", "expand": true}), home, "alice", &in_b).await;
+        assert!(text(&search).contains("concepts/public.md"));
+        assert!(!text(&search).contains("private salary") && !text(&search).contains("public-alias") && !text(&search).contains(&path), "{}", text(&search));
+        assert!(store.list_pages().unwrap().iter().all(|p| !p.path.starts_with("public-alias/")));
+        assert_eq!(store.build_backlink_index().unwrap()[&path], vec!["concepts/public.md".to_string()]);
+        // Registry compatibility must survive the stricter file reader.
+        let registry_path = duduclaw_memory::wiki_auto_registry::registry_path(home, "alice").unwrap();
+        let mut registry: duduclaw_gateway::auto_wiki_page::AutoPageRegistry = serde_json::from_slice(&std::fs::read(&registry_path).unwrap()).unwrap();
+        let record = registry.pages.remove(&path).unwrap();
+        registry.pages.insert(path.replace('/', "\\"), record);
+        std::fs::write(registry_path, serde_json::to_vec(&registry).unwrap()).unwrap();
+        assert!(text(&handle_wiki_read_in(&args, home, "alice", &in_a).await).contains("private salary"));
+        // Ordinary folder aliases still support reads, writes and sharing.
+        symlink("concepts", wiki.join("ordinary-alias")).unwrap();
+        let ordinary = serde_json::json!({"page_path": "ordinary-alias/plain.md", "content": "---\ntitle: Plain\ntrust: 0.8\n---\n\nordinary content"});
+        let write = handle_wiki_write_in(&ordinary, home, "alice", &ReadScope::Employee).await;
+        assert_ne!(write["isError"], true, "{}", text(&write));
+        assert!(text(&handle_wiki_read_in(&ordinary, home, "alice", &in_b).await).contains("ordinary content"));
+        let share = handle_wiki_share_in(&ordinary, home, "alice", &ReadScope::Employee).await;
+        assert_ne!(share["isError"], true, "{}", text(&share));
+        assert!(wiki.join("concepts/plain.md").is_file());
+        symlink("../concepts", wiki.join("auto/outward")).unwrap();
+        let outward = handle_wiki_read_in(&serde_json::json!({"page_path": "auto/outward/plain.md"}), home, "alice", &in_b).await;
+        assert_eq!(outward["isError"], true, "{}", text(&outward));
+        assert!(!redact_reserved_listing(&wiki, &format!("- [Private title]({alias})\n"), &in_b).contains("Private title"));
+    }
+
     #[test]
     fn legacy_windows_trust_keys_still_withhold_pages() {
         let tmp = tempfile::tempdir().unwrap();
@@ -990,13 +1042,13 @@ mod conversation_scope_tests {
             let mut page = duduclaw_memory::wiki::parse_wiki_page(&path, &raw).unwrap();
             page.path = alias.to_string();
             assert!(visible_page_ids(vec![page.path.clone()], &wiki, &in_b, &registry).is_empty(), "list {alias}");
-            assert!(auto_page_hidden_with(&page.path, &in_b, &registry, |_| Some(raw.clone())), "search predicate {alias}");
+            assert!(auto_page_hidden_with(&wiki, &page.path, &in_b, &registry, |_| Some(raw.clone())), "search predicate {alias}");
             assert!(auto_namespace_mutation_refused(alias), "write {alias}");
             let read = handle_wiki_read_in(&serde_json::json!({"page_path": alias}), home, "alice", &in_b).await;
             assert_eq!(read["isError"], true, "read {alias}: {}", text(&read));
             assert!(!text(&read).contains("private content"));
             let index = format!("- [secret]({alias})\n");
-            assert!(!redact_reserved_listing(&index, &in_b).contains("secret"), "index {alias}");
+            assert!(!redact_reserved_listing(&wiki, &index, &in_b).contains("secret"), "index {alias}");
         }
         let store = duduclaw_memory::WikiStore::new(wiki.clone());
         store.write_page("concepts/public.md", "---\ntitle: Public\nrelated: [auto\\sop\\x.md]\n---\n\nseparatorneedle public").unwrap();

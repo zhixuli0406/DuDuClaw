@@ -48,15 +48,22 @@ fn shared_policy_digest(home: &Path, page_path: &str) -> Option<String> {
     } else {
         content.parse().ok()?
     };
-    let namespace = page_path.split('/').next()?;
+    let canonical = crate::wiki_path::canonical_page_argument(page_path).ok()?;
+    let namespace = duduclaw_core::wiki_top_level_namespace(&canonical);
     let namespaces = match table.get("namespaces") {
         Some(value) => Some(value.as_table()?),
         None => None,
     };
-    let declared = match namespaces.and_then(|namespaces| namespaces.get(namespace)) {
-        Some(value) => Some(value.as_table()?),
-        None => None,
-    };
+    let declared = if let Some(namespaces) = namespaces {
+        let mut matches = namespaces.iter().filter(|(key, _)| {
+            duduclaw_core::wiki_auto_namespace::fold_segment(key)
+                == duduclaw_core::wiki_auto_namespace::fold_segment(namespace)
+        });
+        let first = matches.next();
+        // Ambiguous filesystem-equivalent declarations cannot attest a source.
+        if matches.next().is_some() { return None; }
+        match first { Some((_, value)) => Some(value.as_table()?), None => None }
+    } else { None };
     let mode = match declared.and_then(|entry| entry.get("mode")) {
         Some(value) => value.as_str()?,
         None => "agent_writable",
