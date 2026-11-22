@@ -268,6 +268,8 @@ This is orthogonal to the write `mode` — a namespace may declare either, both,
 
 This layers on top of the built-in `departments/<dept>/` isolation (see Department knowledge layering below): `departments/art/*` is always visible only to the `art` department regardless of `.scope.toml`, while `visible_to_departments` lets an operator restrict *any* namespace (`hr/`, `finance/`, …) to chosen departments. `wiki_namespace_status` surfaces the active `visible_to_departments` declarations.
 
+**How names are compared (v1.84.0).** Page paths and `.scope.toml` namespace names are compared with `/` and `\` both treated as separators, case-insensitively, and ignoring trailing dots and spaces, on every platform, so `departments\HR\pay.md` is the same page as `departments/hr/pay.md`. If two `[namespaces."…"]` entries name the same folder under these rules (for example `HR` and `hr`), no AI employee may read that folder and every writer is refused, operators included, until an administrator removes the duplicate entry; the gateway logs one warning per folder.
+
 ### Department knowledge & skill layering
 
 Knowledge and skills layer **company → department → personal**:
