@@ -9,6 +9,13 @@ pub fn canonicalize(path: &Path) -> io::Result<PathBuf> {
     dunce::canonicalize(path)
 }
 
+/// Child-facing spelling only; security snapshots retain their canonical path.
+/// Simplify Windows verbatim disk paths only when dunce proves equivalence.
+/// Paths requiring verbatim semantics and all non-Windows paths stay unchanged.
+pub fn spawn_path(path: &Path) -> &Path {
+    dunce::simplified(path)
+}
+
 /// Resolve an absent leaf through its closest existing ancestor. Only
 /// NotFound permits a fallback; permissions, malformed paths and I/O errors
 /// must reach the gate. This also resolves 8.3 names above an absent `run`.
@@ -334,6 +341,31 @@ pub fn file_identity(path: &Path) -> io::Result<FileIdentity> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spawn_path_preserves_native_paths() {
+        for path in [Path::new("/tmp/workspace"), Path::new("relative/workspace")] {
+            assert_eq!(spawn_path(path), path);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn spawn_path_simplifies_only_lossless_windows_disk_paths() {
+        assert_eq!(spawn_path(Path::new(r"\\?\C:\x\y")), Path::new(r"C:\x\y"));
+        for path in [r"\\?\C:\CON\x", r"\\?\C:\x.\y", r"\\?\C:\x \y", r"\\?\UNC\server\share\x"] {
+            assert_eq!(spawn_path(Path::new(path)), Path::new(path));
+        }
+        let long = format!(r"\\?\C:\{}\{}", "x".repeat(200), "y".repeat(100));
+        assert_eq!(spawn_path(Path::new(&long)), Path::new(&long));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_path_is_a_noop_on_unix() {
+        let path = Path::new("/tmp/工作目錄/🙂");
+        assert!(std::ptr::eq(spawn_path(path), path));
+    }
 
     #[test]
     fn windows_final_path_matches_normalized_local_paths() {

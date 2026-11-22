@@ -104,7 +104,8 @@ pub(crate) fn protected_roots(home_dir: &Path) -> Vec<PathBuf> {
     roots
 }
 
-/// A successful gate owns the one spelling used by argv, cwd and sandbox.
+/// A successful gate retains the canonical snapshot for security checks and
+/// supplies an equivalent child-facing spelling for argv, cwd and sandbox.
 /// The snapshot is rechecked immediately before handing the command to spawn.
 /// It is not an open directory handle: replacement after that check remains
 /// possible until the OS/CLI opens the directory.
@@ -115,10 +116,19 @@ pub(crate) struct CheckedWorkRoot {
 }
 
 impl CheckedWorkRoot {
-    pub(crate) fn path(&self) -> &Path { &self.path }
+    pub(crate) fn canonical_path(&self) -> &Path { &self.path }
+
+    pub(crate) fn spawn_path(&self) -> &Path {
+        self.path()
+    }
+
+    /// Child-facing path; use `canonical_path` to inspect the security snapshot.
+    pub(crate) fn path(&self) -> &Path {
+        duduclaw_core::path_compare::spawn_path(&self.path)
+    }
 
     pub(crate) fn apply_to_command(&self, cmd: &mut tokio::process::Command) {
-        cmd.current_dir(&self.path).arg("--cd").arg(&self.path);
+        cmd.current_dir(self.spawn_path()).arg("--cd").arg(self.spawn_path());
     }
 
     pub(crate) fn reverify(&self) -> Result<(), String> {
@@ -1097,10 +1107,17 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let checked = check_work_root(&home, &root).unwrap();
         let (final_path, identity) = duduclaw_core::path_compare::windows_directory_identity(&root).unwrap();
-        assert_eq!(checked.path(), final_path);
-        assert!(checked.path().to_str().unwrap().starts_with(r"\\?\"));
+        assert_eq!(checked.canonical_path(), final_path);
+        assert!(checked.canonical_path().to_str().unwrap().starts_with(r"\\?\"));
         assert_eq!(checked.identity, identity);
         assert!(identity.is_strong());
+        assert_eq!(checked.spawn_path(), duduclaw_core::path_compare::spawn_path(&final_path));
+        let mut command = tokio::process::Command::new("fixture-never-spawned");
+        checked.apply_to_command(&mut command);
+        assert_eq!(command.as_std().get_current_dir(), Some(checked.spawn_path()));
+        assert_eq!(command.as_std().get_args().collect::<Vec<_>>(),
+            vec![std::ffi::OsStr::new("--cd"), checked.spawn_path().as_os_str()]);
+        assert_eq!(checked.canonical_path(), final_path);
         checked.reverify().unwrap();
     }
 
@@ -1117,7 +1134,7 @@ mod tests {
             .expect("directory symlink test requires Windows Developer Mode or symlink privilege");
         let checked = check_work_root(&home, &link).unwrap();
         let (final_path, _) = duduclaw_core::path_compare::windows_directory_identity(&root).unwrap();
-        assert_eq!(checked.path(), final_path);
+        assert_eq!(checked.canonical_path(), final_path);
         checked.reverify().unwrap();
         std::fs::remove_dir(&link).unwrap();
         std::os::windows::fs::symlink_dir(base.path(), &link).unwrap();
