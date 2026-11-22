@@ -55,6 +55,7 @@ pub mod isolation_policy;
 pub mod pack;
 pub mod publishers;
 pub mod platform;
+pub mod path_compare;
 pub mod preset;
 pub mod profile_sections;
 pub mod protected_section;
