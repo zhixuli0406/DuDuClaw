@@ -465,25 +465,10 @@ impl WikiStore {
         let target = crate::wiki_path::resolve_wiki_page(&self.wiki_dir, path, false)
             .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
         let path = target.id.as_str();
-        let full = target.full_path.clone();
-        let metadata = std::fs::symlink_metadata(&full)
-            .map_err(|e| DuDuClawError::Memory(format!("export page metadata: {e}")))?;
-        if !metadata.is_file() || metadata.file_type().is_symlink() {
-            return Err(DuDuClawError::Memory("export page path refused".into()));
-        }
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)] {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-        }
-        let file = options.open(&full)
+        let file = crate::wiki_path::open_resolved_wiki_file_nofollow(&target)
             .map_err(|e| DuDuClawError::Memory(format!("export page open: {e}")))?;
         let metadata = file.metadata()
             .map_err(|e| DuDuClawError::Memory(format!("export page metadata: {e}")))?;
-        if !metadata.is_file() {
-            return Err(DuDuClawError::Memory("export page path refused".into()));
-        }
         if metadata.len() > max_bytes {
             return Err(DuDuClawError::Memory("EXPORT_TOO_LARGE".into()));
         }

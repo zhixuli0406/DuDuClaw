@@ -52,7 +52,9 @@ fn subdirs(root: &Path) -> Vec<String> {
     };
     entries
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter(|e| std::fs::symlink_metadata(e.path()).is_ok_and(|meta| {
+            meta.is_dir() && !duduclaw_memory::wiki_path::is_link_metadata(&meta)
+        }))
         .filter_map(|e| e.file_name().into_string().ok())
         .filter(|n| duduclaw_core::is_valid_department(n))
         .collect()
@@ -62,7 +64,9 @@ fn subdirs(root: &Path) -> Vec<String> {
 /// defensively — the wiki tree is operator-curated, not adversarial, but a
 /// symlink loop must not hang the RPC.
 fn count_files(dir: &Path, depth: usize) -> usize {
-    if depth > 6 {
+    if depth > 6 || !std::fs::symlink_metadata(dir).is_ok_and(|meta| {
+        meta.is_dir() && !duduclaw_memory::wiki_path::is_link_metadata(&meta)
+    }) {
         return 0;
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -70,7 +74,8 @@ fn count_files(dir: &Path, depth: usize) -> usize {
     };
     entries
         .filter_map(|e| e.ok())
-        .map(|e| match e.file_type() {
+        .map(|e| match std::fs::symlink_metadata(e.path()) {
+            Ok(t) if duduclaw_memory::wiki_path::is_link_metadata(&t) => 0,
             Ok(t) if t.is_dir() => count_files(&e.path(), depth + 1),
             Ok(t) if t.is_file() => 1,
             _ => 0,

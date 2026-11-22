@@ -105,6 +105,8 @@ impl WikiCacheIdentityProvider {
         let mut out = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else { continue; };
+            if duduclaw_core::fs_safety::is_link_metadata(&meta) || !meta.is_file() { continue; }
             if path.extension().and_then(|e| e.to_str()) != Some("md") {
                 continue;
             }
@@ -194,7 +196,11 @@ struct PersonFrontmatter {
 }
 
 fn parse_person_file(path: &Path) -> Result<ResolvedPerson, String> {
-    let raw = std::fs::read_to_string(path).map_err(|e| format!("read: {e}"))?;
+    use std::io::Read;
+    let mut file = duduclaw_core::fs_safety::open_regular_file_nofollow(path)
+        .map_err(|e| format!("read: {e}"))?;
+    let mut raw = String::new();
+    file.read_to_string(&mut raw).map_err(|e| format!("read: {e}"))?;
     let yaml = extract_frontmatter(&raw).ok_or_else(|| "missing YAML frontmatter".to_string())?;
     let fm: PersonFrontmatter =
         serde_yaml::from_str(yaml).map_err(|e| format!("malformed YAML frontmatter: {e}"))?;
@@ -206,7 +212,7 @@ fn parse_person_file(path: &Path) -> Result<ResolvedPerson, String> {
         return Err("missing required field: display_name".into());
     }
 
-    let fetched_at: DateTime<Utc> = std::fs::metadata(path)
+    let fetched_at: DateTime<Utc> = file.metadata()
         .and_then(|m| m.modified())
         .map(DateTime::<Utc>::from)
         .unwrap_or_else(|_| Utc::now());
@@ -252,6 +258,23 @@ fn extract_frontmatter(raw: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_wiki_cache_skips_linked_person_records() {
+        use std::os::unix::fs::symlink;
+        let wiki = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        write_person(wiki.path(), "ordinary.md", "person_id: ordinary\ndisplay_name: Ordinary\n");
+        write_person(outside.path(), "secret.md", "person_id: secret\ndisplay_name: Secret\n");
+        let source = outside.path().join("identity/people/secret.md");
+        symlink(&source, wiki.path().join("identity/people/alias.md")).unwrap();
+        let people = WikiCacheIdentityProvider::for_wiki_root(wiki.path()).list_people_sync();
+        assert_eq!(people.len(), 1);
+        assert_eq!(people[0].person_id, "ordinary");
+        assert!(parse_person_file(&wiki.path().join("identity/people/alias.md")).is_err());
+    }
+
     use std::fs;
     use tempfile::TempDir;
 

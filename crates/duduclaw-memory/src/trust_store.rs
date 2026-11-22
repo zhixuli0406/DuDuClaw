@@ -2100,7 +2100,9 @@ impl WikiTrustStore {
 
         for entry in entries.flatten() {
             let agent_dir = entry.path();
-            if !agent_dir.is_dir() {
+            if !std::fs::symlink_metadata(&agent_dir).is_ok_and(|meta| {
+                meta.is_dir() && !crate::wiki_path::is_link_metadata(&meta)
+            }) {
                 continue;
             }
             let agent_id = match agent_dir.file_name().and_then(|n| n.to_str()) {
@@ -2108,7 +2110,9 @@ impl WikiTrustStore {
                 None => continue,
             };
             let wiki_dir = agent_dir.join("wiki");
-            if !wiki_dir.exists() {
+            if !std::fs::symlink_metadata(&wiki_dir).is_ok_and(|meta| {
+                meta.is_dir() && !crate::wiki_path::is_link_metadata(&meta)
+            }) {
                 continue;
             }
             let store = crate::wiki::WikiStore::new(wiki_dir);

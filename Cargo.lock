@@ -2111,6 +2111,7 @@ version = "1.83.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "duduclaw-core",
  "reqwest",
  "serde",
  "serde_json",

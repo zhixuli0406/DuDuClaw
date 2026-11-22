@@ -32,6 +32,7 @@ pub mod department;
 pub mod dispatch_guard;
 pub mod docker_probe;
 pub mod error;
+pub mod fs_safety;
 pub mod fs_lock;
 #[doc(hidden)]
 pub mod owner_lock;

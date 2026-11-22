@@ -35,11 +35,9 @@ pub(super) fn collect(
     if !root.exists() {
         return Ok(());
     }
-    if std::fs::symlink_metadata(&root)
-        .map_err(|_| "EXPORT_SOURCE_UNAVAILABLE".to_string())?
-        .file_type()
-        .is_symlink()
-    {
+    let metadata = std::fs::symlink_metadata(&root)
+        .map_err(|_| "EXPORT_SOURCE_UNAVAILABLE".to_string())?;
+    if duduclaw_memory::wiki_path::is_link_metadata(&metadata) || !metadata.is_dir() {
         return Err("EXPORT_SOURCE_UNAVAILABLE".into());
     }
     let store = if shared {
@@ -122,11 +120,10 @@ fn visit(
             return Err("EXPORT_TOO_LARGE".into());
         }
         let entry = entry.map_err(|_| "EXPORT_SOURCE_UNAVAILABLE".to_string())?;
-        let kind = entry
-            .file_type()
-            .map_err(|_| "EXPORT_SOURCE_UNAVAILABLE".to_string())?;
         let path = entry.path();
-        if kind.is_symlink() {
+        let kind = std::fs::symlink_metadata(&path)
+            .map_err(|_| "EXPORT_SOURCE_UNAVAILABLE".to_string())?;
+        if duduclaw_memory::wiki_path::is_link_metadata(&kind) {
             continue;
         }
         if kind.is_dir() {
@@ -149,4 +146,23 @@ fn visit(
         }
     }
     Ok(())
+}
+
+
+#[cfg(all(test, unix))]
+#[test]
+fn export_walker_skips_directory_and_file_links() {
+    use std::os::unix::fs::symlink;
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("ordinary.md"), "ordinary").unwrap();
+    std::fs::write(outside.path().join("secret.md"), "secret").unwrap();
+    symlink(outside.path(), root.path().join("alias")).unwrap();
+    symlink(outside.path().join("secret.md"), root.path().join("alias.md")).unwrap();
+    let mut found = Vec::new();
+    visit(root.path(), root.path(), 0, &mut 0, &mut |id| {
+        found.push(id.to_string());
+        Ok(())
+    }, &mut || Ok(())).unwrap();
+    assert_eq!(found, vec!["ordinary.md".to_string()]);
 }

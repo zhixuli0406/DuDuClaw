@@ -76,7 +76,7 @@ pub(crate) async fn handle_shared_wiki_delete(args: &Value, home_dir: &Path, cal
     let scope_policy = crate::wiki_scope::WikiScopePolicy::load_for(home_dir);
 
     // WP7: an agent may only delete within its own department's sub-tree.
-    if !scope_policy.has_explicit_namespace(duduclaw_core::DEPARTMENTS_NAMESPACE) {
+    if !scope_policy.overrides_department_isolation() {
         let dept = resolve_agent_department(home_dir, caller_agent);
         if let Err(deny) = crate::wiki_scope::check_department_access(page_path, dept.as_deref()) {
             return tool_error(&format!("Shared wiki delete denied: {deny}"));
@@ -95,7 +95,7 @@ pub(crate) async fn handle_shared_wiki_delete(args: &Value, home_dir: &Path, cal
         Err(_) => return tool_error("Shared wiki page not found"),
     };
     let page_path = target.id.as_str();
-    if !scope_policy.has_explicit_namespace(duduclaw_core::DEPARTMENTS_NAMESPACE)
+    if !scope_policy.overrides_department_isolation()
         && crate::wiki_scope::check_department_access(page_path, resolve_agent_department(home_dir, caller_agent).as_deref()).is_err()
     {
         return tool_error("Shared wiki delete denied");
@@ -211,7 +211,7 @@ pub(crate) async fn handle_wiki_namespace_status(home_dir: &Path, caller_agent: 
     // WP7: surface the caller's department + the built-in department isolation
     // rule so the dashboard can render "which departments can I see".
     let caller_department = resolve_agent_department(home_dir, caller_agent);
-    let departments_explicit = policy.has_explicit_namespace(duduclaw_core::DEPARTMENTS_NAMESPACE);
+    let departments_explicit = policy.overrides_department_isolation();
 
     // WP2.3: namespaces declaring `visible_to_departments = [...]` (read-side
     // visibility, orthogonal to the write mode above). Surface them so the

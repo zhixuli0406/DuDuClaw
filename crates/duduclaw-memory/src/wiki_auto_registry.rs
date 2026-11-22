@@ -120,6 +120,28 @@ impl AutoPageRegistry {
     pub fn current(&self, path: &str, raw: &str) -> Option<&AutoPageRecord> {
         self.record(path).filter(|r| r.sha256 == page_digest(raw))
     }
+
+    /// Without a conversation identity, only a current host-promoted page
+    /// is readable. Require the exact frontmatter mark as conversation readers
+    /// do, even if a malformed registry claims otherwise.
+    pub fn current_promoted(&self, path: &str, raw: &str) -> bool {
+        self.current(path, raw).is_some_and(|record| record.host_promoted)
+            && page_host_promoted(raw)
+    }
+
+}
+
+/// Shared interpretation of the host-owned promotion mark.
+pub fn page_host_promoted(content: &str) -> bool {
+    let Some(rest) = content.strip_prefix("---\n").or_else(|| content.strip_prefix("---\r\n")) else {
+        return false;
+    };
+    let Some((fm, _)) = rest.split_once("\n---") else { return false; };
+    fm.lines()
+        .find(|line| line.strip_prefix("host_promoted")
+            .is_some_and(|rest| rest.trim_start().starts_with(':')))
+        .and_then(|line| line.split_once(':'))
+        .is_some_and(|(_, value)| value.trim() == "true")
 }
 
 fn registry_key(path: &str) -> io::Result<String> {

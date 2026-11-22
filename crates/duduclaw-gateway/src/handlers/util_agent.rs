@@ -25,12 +25,19 @@ pub(crate) async fn copy_template_extras(src: &Path, dst: &Path) -> Result<(), S
             .map_err(|e| format!("wiki read_dir: {e}"))?;
         while let Some(entry) = entries.next_entry().await.map_err(|e| e.to_string())? {
             let path = entry.path();
-            if path.is_file() {
+            let Ok(meta) = tokio::fs::symlink_metadata(&path).await else { continue; };
+            if duduclaw_memory::wiki_path::is_link_metadata(&meta) { continue; }
+            if meta.is_file() {
                 let Some(fname) = path.file_name() else {
                     continue;
                 };
-                tokio::fs::copy(&path, wiki_dst.join(fname))
-                    .await
+                use std::io::Read;
+                let mut file = duduclaw_core::fs_safety::open_regular_file_nofollow(&path)
+                    .map_err(|e| format!("wiki/{}: {e}", fname.to_string_lossy()))?;
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes)
+                    .map_err(|e| format!("wiki/{}: {e}", fname.to_string_lossy()))?;
+                tokio::fs::write(wiki_dst.join(fname), bytes).await
                     .map_err(|e| format!("wiki/{}: {e}", fname.to_string_lossy()))?;
             }
         }

@@ -7,6 +7,8 @@
 //! fold names identically; `duduclaw_gateway::auto_wiki_page` re-exports
 //! [`is_auto_namespace_segment`].
 
+use unicode_normalization::UnicodeNormalization;
+
 /// Top-level namespace of an employee wiki that only the gateway's auto
 /// writer and the dashboard's human actions write.
 pub const AUTO_NAMESPACE: &str = "auto";
@@ -22,22 +24,41 @@ fn is_ignorable_in_names(c: char) -> bool {
     matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}')
 }
 
-/// One path segment as a file system may compare it: Unicode case-folded
-/// (case-insensitive file systems), without characters a file system may
-/// ignore, and without the trailing dots / spaces Win32 normalisation strips.
+/// Filesystem-equivalent segment identity, without compatibility folding.
+/// Use NFD, Unicode lowercase (not full Unicode case folding), NFD again,
+/// then remove filesystem ignorables and Win32 trailing dots/spaces.
+/// Full-width and visually similar names deliberately remain distinct.
 pub fn fold_segment(segment: &str) -> String {
-    segment
-        .chars()
+    segment.nfd().collect::<String>().to_lowercase().nfd()
         .filter(|c| !is_ignorable_in_names(*c))
         .collect::<String>()
         .trim_end_matches(['.', ' '])
-        .to_lowercase()
+        .to_string()
 }
 
-/// Whether `segment` may open the directory entry `name` (lowercase ASCII)
-/// on some supported file system ([`fold_segment`]).
+/// Whether two segments can name the same filesystem entry.
 pub fn segment_opens_as(segment: &str, name: &str) -> bool {
-    fold_segment(segment) == name
+    fold_segment(segment) == fold_segment(name)
+}
+
+/// Detect ambiguous namespace declarations, including entries with no read
+/// filter or write mode. Log each ambiguous identity once per process, even
+/// when the policy is reloaded for every access. Callers must deny it.
+pub fn ambiguous_namespace_keys<'a>(keys: impl IntoIterator<Item = &'a str>) -> std::collections::BTreeSet<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut ambiguous = std::collections::BTreeSet::new();
+    for key in keys {
+        let folded = fold_segment(key);
+        if !seen.insert(folded.clone()) && ambiguous.insert(folded.clone()) {
+            static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<String>>> = std::sync::OnceLock::new();
+            if let Ok(mut warned) = WARNED.get_or_init(Default::default).lock() {
+                if warned.insert(folded.clone()) {
+                    tracing::warn!(namespace = %folded, "ambiguous filesystem-equivalent wiki namespaces; access denied");
+                }
+            }
+        }
+    }
+    ambiguous
 }
 
 /// v1.84.0 (review H2): whether one path segment names the auto namespace
@@ -106,6 +127,19 @@ pub fn is_auto_pages_sidecar(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filesystem_identity_normalizes_without_compatibility_folding() {
+        assert!(segment_opens_as("CAFÉ. ", "cafe\u{301}"));
+        assert!(segment_opens_as("ca\u{200d}fé", "cafe\u{301}"));
+        assert!(segment_opens_as("İ", "i\u{307}"));
+        assert!(!segment_opens_as("ｃａｆé", "café"));
+        assert!(!segment_opens_as("cаfé", "café")); // Cyrillic a
+        assert_eq!(fold_segment("HR. "), "hr");
+        assert!(is_auto_namespace_segment("AU\u{200d}TO. "));
+        assert!(!is_auto_namespace_segment("ａｕｔｏ"));
+    }
+
 
     #[test]
     fn portable_auto_ids_and_uncertain_paths_are_protected() {

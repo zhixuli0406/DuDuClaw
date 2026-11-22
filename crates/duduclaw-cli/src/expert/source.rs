@@ -85,7 +85,8 @@ pub(crate) async fn resolve_source_full(source: &str, staging: &Path) -> Result<
         return Err(import_err("import.source_missing", json!({}), format!("來源不存在: {source}")));
     }
     if path.is_dir() {
-        if std::fs::symlink_metadata(&path).map_err(|e| io_err(e.to_string()))?.file_type().is_symlink() {
+        let meta = std::fs::symlink_metadata(&path).map_err(|e| io_err(e.to_string()))?;
+        if duduclaw_memory::wiki_path::is_link_metadata(&meta) {
             return Err(super::cfg_err("pack source contains a symlink".into()));
         }
         let path = path.canonicalize().map_err(|e| io_err(e.to_string()))?;
@@ -184,7 +185,7 @@ fn snapshot_directory(source: &Path, destination: &Path) -> Result<()> {
     fn copy(source: &Path, dest: &Path, total: &mut u64, count: &mut usize, depth: usize) -> Result<()> {
         if depth > 64 { return Err(super::cfg_err("pack source nesting exceeds limit".into())); }
         let meta = std::fs::symlink_metadata(source).map_err(|e| io_err(e.to_string()))?;
-        if meta.file_type().is_symlink() || !meta.is_dir() { return Err(super::cfg_err("pack source contains a symlink or special directory".into())); }
+        if duduclaw_memory::wiki_path::is_link_metadata(&meta) || !meta.is_dir() { return Err(super::cfg_err("pack source contains a symlink or special directory".into())); }
         std::fs::create_dir_all(dest).map_err(|e| io_err(e.to_string()))?;
         for entry in std::fs::read_dir(source).map_err(|e| io_err(e.to_string()))? {
             let entry = entry.map_err(|e| io_err(e.to_string()))?;
@@ -192,20 +193,14 @@ fn snapshot_directory(source: &Path, destination: &Path) -> Result<()> {
             if *count > 10_000 { return Err(super::cfg_err("pack source exceeds file limit".into())); }
             let path = entry.path();
             let meta = std::fs::symlink_metadata(&path).map_err(|e| io_err(e.to_string()))?;
-            if meta.file_type().is_symlink() { return Err(super::cfg_err("pack source contains a symlink".into())); }
+            if duduclaw_memory::wiki_path::is_link_metadata(&meta) { return Err(super::cfg_err("pack source contains a symlink".into())); }
             let target = dest.join(entry.file_name());
             if meta.is_dir() { copy(&path, &target, total, count, depth + 1)?; continue; }
             if !meta.is_file() { return Err(super::cfg_err("pack source contains a special file".into())); }
             let remaining = safe_zip::MAX_UNPACK_BYTES.saturating_sub(*total);
             if meta.len() > remaining { return Err(super::cfg_err("pack source exceeds size limit".into())); }
-            let mut options = std::fs::OpenOptions::new();
-            options.read(true);
-            #[cfg(unix)] {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-            }
-            let file = options.open(&path).map_err(|e| io_err(e.to_string()))?;
-            if !file.metadata().map_err(|e| io_err(e.to_string()))?.is_file() { return Err(super::cfg_err("pack source changed file type".into())); }
+            let file = duduclaw_core::fs_safety::open_regular_file_nofollow(&path)
+                .map_err(|e| io_err(e.to_string()))?;
             let mut bytes = Vec::new();
             file.take(remaining + 1).read_to_end(&mut bytes).map_err(|e| io_err(e.to_string()))?;
             if bytes.len() as u64 > remaining { return Err(super::cfg_err("pack source exceeds size limit".into())); }

@@ -148,10 +148,14 @@ impl BlobStore {
         };
         let mut removed = 0;
         for dir in dirs.flatten() {
+            let Ok(meta) = std::fs::symlink_metadata(dir.path()) else { continue; };
+            if !meta.is_dir() || duduclaw_core::fs_safety::is_link_metadata(&meta) { continue; }
             let Ok(files) = std::fs::read_dir(dir.path()) else {
                 continue;
             };
             for f in files.flatten() {
+                let Ok(meta) = std::fs::symlink_metadata(f.path()) else { continue; };
+                if !meta.is_file() || duduclaw_core::fs_safety::is_link_metadata(&meta) { continue; }
                 let name = f.file_name().to_string_lossy().into_owned();
                 if is_sha256_hex(&name) && self.remove_if_unreferenced(conn, &name, grace)? {
                     removed += 1;
@@ -178,9 +182,9 @@ impl BlobStore {
         };
         let mut n = 0;
         for entry in rd.flatten() {
-            let old = entry
-                .metadata()
-                .and_then(|m| m.modified())
+            let Ok(meta) = std::fs::symlink_metadata(entry.path()) else { continue; };
+            if !meta.is_file() || duduclaw_core::fs_safety::is_link_metadata(&meta) { continue; }
+            let old = meta.modified()
                 .ok()
                 .and_then(|t| t.elapsed().ok())
                 .is_some_and(|age| age > max_age);
