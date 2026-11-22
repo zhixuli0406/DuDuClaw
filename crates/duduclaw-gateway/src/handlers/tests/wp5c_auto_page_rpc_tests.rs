@@ -18,6 +18,13 @@ fn frame_error_text(frame: &WsFrame) -> String {
     }
 }
 
+fn frame_error_str(frame: &WsFrame) -> &str {
+    match frame {
+        WsFrame::Response { error: Some(e), .. } => e.as_str(),
+        _ => "",
+    }
+}
+
 /// Seed an agent wiki with one auto-filed page and one hand-curated page.
 fn seed_wiki(home: &std::path::Path) -> duduclaw_memory::WikiStore {
     let wiki_dir = home.join("agents").join("agnes").join("wiki");
@@ -215,7 +222,7 @@ async fn archive_and_promote_share_the_same_gate() {
             "archive" => "Only auto-filed pages can be removed here",
             _ => "Promote failed: only auto-filed pages can be promoted",
         };
-        assert_eq!(frame_error_text(&frame), expected);
+        assert_eq!(frame_error_str(&frame), expected);
     }
 
     // The curated page is untouched.
@@ -247,7 +254,7 @@ async fn auto_page_actions_report_missing_pages_as_not_found() {
                 _ => handler.handle_wiki_share(params).await,
             };
             assert!(!frame_ok(&frame), "{method}: {page_path}");
-            assert_eq!(frame_error_text(&frame), "Auto page not found", "{method}: {page_path}");
+            assert_eq!(frame_error_str(&frame), "Auto page not found", "{method}: {page_path}");
         }
     }
 }
