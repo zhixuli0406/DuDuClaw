@@ -51,7 +51,13 @@ pub(crate) async fn handle_wiki_graph(args: &Value, home_dir: &Path, default_age
         return tool_text("No wiki found.");
     }
 
-    let center = args.get("center").and_then(|v| v.as_str());
+    let center = match args.get("center") {
+        Some(value) => match value.as_str().and_then(|s| duduclaw_memory::wiki_path::canonical_page_argument(s).ok()) {
+            Some(id) => Some(id),
+            None => return tool_error("Invalid center page id"),
+        },
+        None => None,
+    };
     // Clamped to `MAX_GRAPH_DEPTH` (10 hops): an uncapped caller value such
     // as 10^19 used to keep the BFS spinning and pinned the mcp-server CPU.
     let depth: usize = crate::mcp_args::arg_u64(args, "depth")
@@ -59,7 +65,7 @@ pub(crate) async fn handle_wiki_graph(args: &Value, home_dir: &Path, default_age
         .min(duduclaw_memory::wiki::MAX_GRAPH_DEPTH);
 
     let store = duduclaw_memory::WikiStore::new(wiki_dir);
-    match store.export_mermaid(center, depth) {
+    match store.export_mermaid(center.as_deref(), depth) {
         Ok(mermaid) => tool_text(&format!("```mermaid\n{mermaid}```")),
         Err(e) => tool_error(&format!("Graph export failed: {e}")),
     }
@@ -155,6 +161,11 @@ pub(crate) async fn handle_wiki_trust_history(args: &Value, home_dir: &Path, def
         .and_then(|v| v.as_str())
         .unwrap_or(default_agent);
     let page_path = args.get("page_path").and_then(|v| v.as_str()).unwrap_or("");
+    let canonical = match duduclaw_memory::wiki_path::canonical_page_argument(page_path) {
+        Ok(id) => id,
+        Err(_) => return tool_error("Invalid page_path"),
+    };
+    let page_path = canonical.as_str();
     let limit = (args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize).min(500);
 
     if !is_valid_agent_id(agent_id) {

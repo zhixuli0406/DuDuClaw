@@ -194,8 +194,22 @@ impl WikiScopePolicy {
     /// Resolve the namespace from a wiki-relative `page_path` and check
     /// whether `caller` may write to it.
     pub fn check_write(&self, page_path: &str, caller: &WriterCapability) -> Result<(), ScopeDeny> {
+        if duduclaw_core::wiki_auto_namespace::canonical_page_id(page_path).is_none() {
+            return Err(ScopeDeny { namespace: String::new(), mode: "invalid".into(), reason: "Invalid page id".into() });
+        }
         let namespace = top_level_namespace(page_path);
-        let mode = self.mode_for(&namespace);
+        for key in self.namespaces.keys().filter(|key| {
+            duduclaw_core::wiki_auto_namespace::fold_segment(key)
+                == duduclaw_core::wiki_auto_namespace::fold_segment(&namespace)
+        }) {
+            self.check_namespace_write(key, caller)?;
+        }
+        Ok(())
+    }
+
+    fn check_namespace_write(&self, namespace: &str, caller: &WriterCapability) -> Result<(), ScopeDeny> {
+        let mode = self.mode_for(namespace);
+        let namespace = namespace.to_string();
 
         match (&mode, caller) {
             // Default and explicit agent_writable: everyone may write
@@ -347,11 +361,7 @@ pub fn scope_file_path(home_dir: &Path) -> PathBuf {
 /// at the root (no slash) live in the synthetic `""` namespace, which is
 /// always `AgentWritable` unless an operator explicitly lists it.
 pub fn top_level_namespace(page_path: &str) -> String {
-    match page_path.split('/').next() {
-        Some(seg) if !seg.is_empty() && seg != page_path => seg.to_string(),
-        // Either no slash at all (root file) or empty leading segment.
-        _ => String::new(),
-    }
+    duduclaw_core::department::top_level_namespace(page_path).to_string()
 }
 
 // ── TOML parsing (private) ───────────────────────────────────────────────────
@@ -528,6 +538,17 @@ mod tests {
         // Policy still enforces operator_only for writes.
         let caller = WriterCapability::for_agent("agnes");
         assert!(p.check_write("departments/art/style.md", &caller).is_err());
+    }
+
+    #[test]
+    fn namespace_write_policy_checks_separator_and_case_aliases() {
+        let policy = WikiScopePolicy {
+            namespaces: BTreeMap::from([("policies".into(), NamespaceMode::OperatorOnly)]),
+            loaded_from: None,
+        };
+        for path in [r"policies\x.md", r".\policies\x.md", r"POLICIES\x.md", "policies./x.md", "../x.md"] {
+            assert!(policy.check_write(path, &WriterCapability::for_agent("alice")).is_err(), "{path}");
+        }
     }
 
     #[test]

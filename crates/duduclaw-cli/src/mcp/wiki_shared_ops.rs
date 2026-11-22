@@ -29,7 +29,7 @@ pub(crate) async fn handle_shared_wiki_search(args: &Value, home_dir: &Path, cal
     let visibility = DeptVisibility::for_agent(home_dir, caller_agent);
     let hits: Vec<_> = hits
         .into_iter()
-        .filter(|h| visibility.allows(&h.path.replace('\\', "/")))
+        .filter(|h| visibility.allows(&h.path))
         .collect();
 
     if hits.is_empty() {
@@ -60,6 +60,11 @@ pub(crate) async fn handle_shared_wiki_delete(args: &Value, home_dir: &Path, cal
         Some(p) => p,
         None => return tool_error("Missing required parameter: page_path"),
     };
+    let canonical = match duduclaw_memory::wiki_path::canonical_page_argument(page_path) {
+        Ok(id) => id,
+        Err(_) => return tool_error("Invalid page_path"),
+    };
+    let page_path = canonical.as_str();
 
     if let Err(e) = validate_wiki_page_path(page_path) {
         return tool_error(&e);
@@ -84,6 +89,20 @@ pub(crate) async fn handle_shared_wiki_delete(args: &Value, home_dir: &Path, cal
     }
 
     let wiki_dir = resolve_shared_wiki_dir(home_dir);
+
+    let target = match duduclaw_memory::wiki_path::resolve_wiki_page(&wiki_dir, page_path, false) {
+        Ok(target) => target,
+        Err(_) => return tool_error("Shared wiki page not found"),
+    };
+    let page_path = target.id.as_str();
+    if !scope_policy.has_explicit_namespace(duduclaw_core::DEPARTMENTS_NAMESPACE)
+        && crate::wiki_scope::check_department_access(page_path, resolve_agent_department(home_dir, caller_agent).as_deref()).is_err()
+    {
+        return tool_error("Shared wiki delete denied");
+    }
+    if let Err(deny) = scope_policy.check_write(page_path, &caller_capability) {
+        return tool_error(&format!("Shared wiki delete denied: {deny}"));
+    }
 
     // ACL: only author or main agent can delete. The page is read without
     // following a symlink and must resolve inside the shared wiki; any read
@@ -287,7 +306,7 @@ pub(crate) async fn handle_shared_wiki_lint(home_dir: &Path, caller_agent: &str)
     let store = duduclaw_memory::WikiStore::new_shared(home_dir);
     let graph = store.lint().ok().map(|mut r| {
         let vis = DeptVisibility::for_agent(home_dir, caller_agent);
-        let visible = |p: &str| vis.allows(&p.replace('\\', "/"));
+        let visible = |p: &str| vis.allows(p);
         r.orphan_pages.retain(|p| visible(p));
         r.stale_pages.retain(|p| visible(p));
         r.broken_links.retain(|(from, _to)| visible(from));
@@ -382,6 +401,11 @@ pub(crate) async fn handle_wiki_share_in(
         Some(p) => p,
         None => return tool_error("Missing required parameter: page_path"),
     };
+    let canonical = match duduclaw_memory::wiki_path::canonical_page_argument(page_path) {
+        Ok(id) => id,
+        Err(_) => return tool_error(WIKI_AUTO_NAMESPACE_REFUSED),
+    };
+    let page_path = canonical.as_str();
     // v1.84.0 (review H1): the source is inside `auto/` — one fixed answer,
     // before any file-system access, whether or not the page exists, in
     // every scope (employee-wide included). Auto pages reach the shared wiki
@@ -399,6 +423,12 @@ pub(crate) async fn handle_wiki_share_in(
         Err(e) => return tool_error(&e),
     };
 
+    let target = match duduclaw_memory::wiki_path::resolve_wiki_page(&wiki_dir, page_path, false) {
+        Ok(target) if !target.is_auto => target,
+        _ => return tool_error(WIKI_AUTO_NAMESPACE_REFUSED),
+    };
+    let page_path = target.id.as_str();
+
     // Shared validator, checked before the path touches the disk (no
     // existence probing outside the wiki): without it `../..` or an absolute
     // path published the first 500 characters of any file the process can
@@ -409,7 +439,7 @@ pub(crate) async fn handle_wiki_share_in(
     }
     // No-follow read; the page must resolve inside the caller's wiki.
     let source_content =
-        match duduclaw_memory::wiki_path::read_wiki_file_nofollow(&wiki_dir, page_path) {
+        match duduclaw_memory::wiki_path::read_resolved_wiki_file_nofollow(&target) {
             Ok(c) => c,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return tool_error(&format!("Page not found in your wiki: {}", page_path));

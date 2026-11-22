@@ -927,6 +927,20 @@ pub fn page_visible_in_conversation(
     })
 }
 
+/// Caller has already classified the lexical OR resolved path as auto.
+/// Always require the record at the resolved key, even if an `auto/` alias
+/// points outward to an ordinary directory inside this wiki.
+pub fn resolved_auto_page_visible(
+    path: &str, raw: Option<&str>, session: Option<&str>, registry: &AutoPageRegistry,
+) -> bool {
+    raw.is_some_and(|raw| {
+        registry.current(path, raw).is_some_and(|record| {
+            record.host_promoted == crate::wiki_host_sources::page_host_promoted(raw)
+                && (record.host_promoted || host_fields_visible("auto/page.md", raw, session))
+        })
+    })
+}
+
 /// The host-field half of [`page_visible_in_conversation`], on the page text
 /// alone (callers must also require the registry record). Pages outside
 /// `auto/` and pages carrying the promotion mark: visible. An auto page:
@@ -1067,10 +1081,12 @@ pub fn doc_type_of_path(path: &str) -> DocType {
 /// host fields change, with the fixed non-conversation legacy source marker.
 /// Runs under the per-agent auto-page lock, like the auto writer.
 pub fn promote_page(store: &WikiStore, path: &str) -> Result<(), String> {
+    let canonical = duduclaw_memory::wiki_path::canonical_page_argument(path).map_err(|e| e.to_string())?;
+    let target = duduclaw_memory::wiki_path::resolve_wiki_page(store.wiki_dir(), &canonical, false)
+        .map_err(|e| e.to_string())?;
+    if !target.is_auto { return Err("only auto-filed pages can be promoted".into()); }
+    let path = target.id.as_str();
     duduclaw_memory::wiki_path::validate_relative_wiki_path(path)?;
-    if !is_auto_path(path) {
-        return Err("only auto-filed pages can be promoted".into());
-    }
     let (home, agent) = duduclaw_memory::wiki_auto_registry::owner_of_wiki(store.wiki_dir())
         .ok_or_else(|| "only an AI staff member's own wiki pages can be promoted".to_string())?;
     let _lock = duduclaw_memory::wiki_auto_registry::lock_auto_pages(&home, &agent)

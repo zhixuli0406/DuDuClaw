@@ -44,17 +44,11 @@ pub fn is_valid_department(name: &str) -> bool {
 /// under `departments/`). Callers distinguish the two via
 /// [`department_page_visible`], which fails closed on the malformed case.
 pub fn department_of_page(page_path: &str) -> Option<&str> {
-    let mut segs = page_path.split('/');
-    if segs.next()? != DEPARTMENTS_NAMESPACE {
+    let parts = crate::wiki_auto_namespace::page_id_components(page_path)?;
+    if parts.len() < 3 || !crate::wiki_auto_namespace::segment_opens_as(parts[0], DEPARTMENTS_NAMESPACE) {
         return None;
     }
-    let dept = segs.next()?;
-    // Require a non-empty page component after the department segment.
-    let page = segs.next()?;
-    if dept.is_empty() || page.is_empty() {
-        return None;
-    }
-    Some(dept)
+    Some(parts[1])
 }
 
 /// Whether an agent whose department is `caller_department` may see/touch the
@@ -69,18 +63,13 @@ pub fn department_of_page(page_path: &str) -> Option<&str> {
 ///   `departments/<dept>/<page>` (e.g. a loose `departments/foo.md`) is denied
 ///   for every agent — fail-closed.
 pub fn department_page_visible(page_path: &str, caller_department: Option<&str>) -> bool {
-    let mut segs = page_path.split('/');
-    if segs.next() != Some(DEPARTMENTS_NAMESPACE) {
-        // Company / other namespace — visible to all.
+    let Some(parts) = crate::wiki_auto_namespace::page_id_components(page_path) else { return false; };
+    if !crate::wiki_auto_namespace::segment_opens_as(parts[0], DEPARTMENTS_NAMESPACE) {
         return true;
     }
-    match (segs.next(), segs.next()) {
-        (Some(dept), Some(page)) if !dept.is_empty() && !page.is_empty() => {
-            caller_department == Some(dept)
-        }
-        // departments/foo.md (no dept sub-dir) or departments/<dept>/ (no page).
-        _ => false,
-    }
+    parts.len() >= 3 && caller_department.is_some_and(|dept| {
+        crate::wiki_auto_namespace::fold_segment(dept) == crate::wiki_auto_namespace::fold_segment(parts[1])
+    })
 }
 
 /// Extract the top-level namespace (first path segment) from a wiki-relative
@@ -88,8 +77,8 @@ pub fn department_page_visible(page_path: &str, caller_department: Option<&str>)
 /// synthetic empty namespace `""`. Mirrors the CLI-side `top_level_namespace`
 /// so the department read-visibility filter agrees across the gateway and CLI.
 pub fn top_level_namespace(page_path: &str) -> &str {
-    match page_path.split('/').next() {
-        Some(seg) if !seg.is_empty() && seg != page_path => seg,
+    match crate::wiki_auto_namespace::page_id_components(page_path) {
+        Some(parts) if parts.len() > 1 => parts[0],
         _ => "",
     }
 }
@@ -214,7 +203,11 @@ impl DepartmentVisibilityPolicy {
     /// isolation — use [`Self::page_visible`] for the combined decision).
     pub fn namespace_allows(&self, page_path: &str, caller_department: Option<&str>) -> bool {
         let ns = top_level_namespace(page_path);
-        namespace_department_visible(self.allowed_for(ns), caller_department)
+        if crate::wiki_auto_namespace::canonical_page_id(page_path).is_none() { return false; }
+        // Every filesystem-equivalent policy key constrains the request.
+        self.map.iter().filter(|(key, _)| {
+            crate::wiki_auto_namespace::fold_segment(key) == crate::wiki_auto_namespace::fold_segment(ns)
+        }).all(|(_, allowed)| namespace_department_visible(Some(allowed), caller_department))
     }
 
     /// The full read-visibility decision for a wiki page: **both** the built-in
@@ -240,6 +233,22 @@ impl DepartmentVisibilityPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn department_predicates_fold_portable_path_components() {
+        for path in [r"departments\hr\salary.md", r"departments/hr\salary.md", r".\departments\hr\salary.md", r"DEPARTMENTS\HR\salary.md", "departments./hr /salary.md"] {
+            assert!(!department_page_visible(path, Some("sales")), "{path}");
+            assert!(department_page_visible(path, Some("hr")), "{path}");
+            assert!(department_of_page(path).is_some());
+        }
+        for path in ["../company.md", "departments/hr", r"a\..\departments\hr\salary.md"] {
+            assert!(!department_page_visible(path, Some("sales")), "{path}");
+        }
+        let policy = DepartmentVisibilityPolicy::parse("[namespaces.legal]\nvisible_to_departments = [\"hr\"]\n").unwrap();
+        for path in [r".\legal\x.md", r"LEGAL\x.md", "legal./x.md"] {
+            assert!(!policy.page_visible(path, Some("sales")), "{path}");
+        }
+    }
 
     #[test]
     fn valid_department_allowlist() {

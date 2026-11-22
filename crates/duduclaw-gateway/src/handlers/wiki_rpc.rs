@@ -85,12 +85,22 @@ impl MethodHandler {
             .get("page_path")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        let canonical = match duduclaw_memory::wiki_path::canonical_page_argument(page_path) {
+            Ok(id) => id,
+            Err(_) => return WsFrame::error_response("", "Invalid page_path"),
+        };
+        let page_path = canonical.as_str();
         let Some(wiki_dir) = self.agent_wiki_dir(agent_id) else {
             return WsFrame::error_response("", "Missing or invalid 'agent_id' parameter");
         };
         if page_path.is_empty() {
             return WsFrame::error_response("", "Missing 'page_path' parameter");
         }
+        let target = match duduclaw_memory::wiki_path::resolve_wiki_page(&wiki_dir, page_path, false) {
+            Ok(target) if target.is_auto => target,
+            _ => return WsFrame::error_response("", "Auto page not found"),
+        };
+        let page_path = target.id.as_str();
         let store = duduclaw_memory::WikiStore::new(wiki_dir);
         match crate::auto_wiki_page::promote_page(&store, page_path) {
             Ok(()) => WsFrame::ok_response("", json!({ "promoted": true, "path": page_path })),
@@ -115,12 +125,22 @@ impl MethodHandler {
             .get("page_path")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        let canonical = match duduclaw_memory::wiki_path::canonical_page_argument(page_path) {
+            Ok(id) => id,
+            Err(_) => return WsFrame::error_response("", "Invalid page_path"),
+        };
+        let page_path = canonical.as_str();
         let Some(wiki_dir) = self.agent_wiki_dir(agent_id) else {
             return WsFrame::error_response("", "Missing or invalid 'agent_id' parameter");
         };
         if page_path.is_empty() {
             return WsFrame::error_response("", "Missing 'page_path' parameter");
         }
+        let target = match duduclaw_memory::wiki_path::resolve_wiki_page(&wiki_dir, page_path, false) {
+            Ok(target) if target.is_auto => target,
+            _ => return WsFrame::error_response("", "Auto page not found"),
+        };
+        let page_path = target.id.as_str();
         if !crate::auto_wiki_page::is_auto_path(page_path) {
             return WsFrame::error_response("", "Only auto-filed pages can be removed here");
         }
@@ -169,12 +189,22 @@ impl MethodHandler {
             .get("page_path")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        let canonical = match duduclaw_memory::wiki_path::canonical_page_argument(page_path) {
+            Ok(id) => id,
+            Err(_) => return WsFrame::error_response("", "Invalid page_path"),
+        };
+        let page_path = canonical.as_str();
         let Some(wiki_dir) = self.agent_wiki_dir(agent_id) else {
             return WsFrame::error_response("", "Missing or invalid 'agent_id' parameter");
         };
         if page_path.is_empty() {
             return WsFrame::error_response("", "Missing 'page_path' parameter");
         }
+        let target = match duduclaw_memory::wiki_path::resolve_wiki_page(&wiki_dir, page_path, false) {
+            Ok(target) if target.is_auto => target,
+            _ => return WsFrame::error_response("", "Auto page not found"),
+        };
+        let page_path = target.id.as_str();
         // Same gate as promote/archive: this button lives on the auto-filing
         // audit tab and its whole contract is "an auto page, its provenance
         // intact". Without the check it would become a general
@@ -275,6 +305,11 @@ impl MethodHandler {
             .get("page_path")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        let canonical = match duduclaw_memory::wiki_path::canonical_page_argument(page_path) {
+            Ok(id) => id,
+            Err(_) => return WsFrame::error_response("", "Invalid page_path"),
+        };
+        let page_path = canonical.as_str();
         if agent_id.is_empty() || page_path.is_empty() {
             return WsFrame::error_response("", "Missing 'agent_id' or 'page_path' parameter");
         }
@@ -513,6 +548,11 @@ impl MethodHandler {
             .get("page_path")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        let canonical = match duduclaw_memory::wiki_path::canonical_page_argument(page_path) {
+            Ok(id) => id,
+            Err(_) => return WsFrame::error_response("", "Invalid page_path"),
+        };
+        let page_path = canonical.as_str();
         let trust = params
             .get("trust")
             .and_then(|v| v.as_f64())
@@ -587,6 +627,11 @@ impl MethodHandler {
             .get("page_path")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        let canonical = match duduclaw_memory::wiki_path::canonical_page_argument(page_path) {
+            Ok(id) => id,
+            Err(_) => return WsFrame::error_response("", "Invalid page_path"),
+        };
+        let page_path = canonical.as_str();
         let limit = (params.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize).min(500);
 
         if agent_id.is_empty() || page_path.is_empty() {

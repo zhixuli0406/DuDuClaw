@@ -223,10 +223,10 @@ pub fn forget_page(home: &Path, agent_id: &str, rel: &str) -> io::Result<()> {
         // Revocation is conservative even for case-insensitive filesystem
         // aliases. Never leave a lowercase grant behind after deleting via
         // an uppercase spelling; unlike lookup, removing extra grants is safe.
-        let folded: Vec<String> = rel.split('/')
+        let folded: Vec<String> = rel.split(['/', '\\'])
             .map(duduclaw_core::wiki_auto_namespace::fold_segment).collect();
         reg.pages.retain(|path, _| {
-            let key: Vec<String> = path.split('/')
+            let key: Vec<String> = path.split(['/', '\\'])
                 .map(duduclaw_core::wiki_auto_namespace::fold_segment).collect();
             key != folded
         });
