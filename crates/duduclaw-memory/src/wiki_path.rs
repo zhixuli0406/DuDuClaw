@@ -93,11 +93,14 @@ pub struct ResolvedWikiPage {
     pub id: String,
     pub full_path: PathBuf,
     pub is_auto: bool,
+    /// Whether the final component existed during resolution; opens recheck it.
+    pub exists: bool,
 }
 
 /// Resolve the parent chain (including Windows junctions) before classifying
-/// a page. Only a missing final component is accepted for a write. Opens use
-/// this resolved parent, retaining no-follow protection on the final name.
+/// a page. A missing final component is accepted for writes and auto policy
+/// checks; ordinary reads return NotFound. Missing parents return NotFound.
+/// Opens use this resolved parent, retaining no-follow protection on the final name.
 pub fn resolve_wiki_page(wiki_dir: &Path, id: &str, write: bool) -> io::Result<ResolvedWikiPage> {
     require_canonical_id(id)?;
     validate_relative_wiki_read_path(id).map_err(|e| invalid(&e))?;
@@ -106,22 +109,25 @@ pub fn resolve_wiki_page(wiki_dir: &Path, id: &str, write: bool) -> io::Result<R
     let parent = lexical.parent().ok_or_else(|| invalid("missing page parent"))?.canonicalize()?;
     if !parent.starts_with(&root) { return Err(denied("resolved parent escapes wiki directory")); }
     let full_path = parent.join(lexical.file_name().ok_or_else(|| invalid("missing page name"))?);
-    match std::fs::symlink_metadata(&full_path) {
-        Ok(meta) => {
-            if is_link_metadata(&meta) || !meta.is_file() {
-                return Err(denied("wiki page is not a regular file"));
-            }
-        }
-        Err(e) if write && e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
     let resolved = page_id_from_relative_path(full_path.strip_prefix(&root)
         .map_err(|_| denied("resolved path escapes wiki directory"))?)
         .ok_or_else(|| invalid("invalid resolved wiki page id"))?;
     require_canonical_id(&resolved)?;
     let is_auto = duduclaw_core::wiki_auto_namespace::is_auto_page_path(id)
         || duduclaw_core::wiki_auto_namespace::is_auto_page_path(&resolved);
-    Ok(ResolvedWikiPage { id: resolved, full_path, is_auto })
+    // Classify before checking existence so an auto alias cannot disclose
+    // whether a page exists by bypassing the auto policy on missing files.
+    let exists = match std::fs::symlink_metadata(&full_path) {
+        Ok(meta) => {
+            if is_link_metadata(&meta) || !meta.is_file() {
+                return Err(denied("wiki page is not a regular file"));
+            }
+            true
+        }
+        Err(e) if (write || is_auto) && e.kind() == io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e),
+    };
+    Ok(ResolvedWikiPage { id: resolved, full_path, is_auto, exists })
 }
 
 /// Reparse points include junctions, not just Rust's symlink file types.
@@ -499,6 +505,46 @@ mod tests {
             assert!(prepare_wiki_write_target(tmp.path(), id).is_err());
         }
         assert_eq!(read_wiki_file_nofollow(tmp.path(), "departments/hr/salary.md").unwrap(), "private salary");
+    }
+
+    #[test]
+    fn missing_page_under_ordinary_parent_is_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("notes")).unwrap();
+        let error = resolve_wiki_page(tmp.path(), "notes/none.md", false).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_page_under_auto_alias_is_auto() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("auto")).unwrap();
+        std::os::unix::fs::symlink("auto", tmp.path().join("public-alias")).unwrap();
+        let target = resolve_wiki_page(tmp.path(), "public-alias/none.md", false).unwrap();
+        assert!(target.is_auto);
+        assert!(!target.exists);
+        assert_eq!(target.id, "auto/none.md");
+        assert_eq!(read_resolved_wiki_file_nofollow(&target).unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert!(prepare_employee_wiki_write(tmp.path(), "public-alias/none.md").is_err());
+    }
+
+    #[test]
+    fn missing_page_parent_is_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let error = resolve_wiki_page(tmp.path(), "missing-parent/none.md", false).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn existing_ordinary_page_is_ordinary() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("notes")).unwrap();
+        std::fs::write(tmp.path().join("notes/page.md"), "ordinary").unwrap();
+        let target = resolve_wiki_page(tmp.path(), "notes/page.md", false).unwrap();
+        assert!(!target.is_auto);
+        assert!(target.exists);
+        assert_eq!(target.id, "notes/page.md");
     }
 
     #[cfg(unix)]

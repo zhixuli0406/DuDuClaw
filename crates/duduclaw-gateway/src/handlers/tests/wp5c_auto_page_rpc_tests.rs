@@ -211,6 +211,11 @@ async fn archive_and_promote_share_the_same_gate() {
             _ => handler.handle_wiki_promote(params).await,
         };
         assert!(!frame_ok(&frame), "{method} must refuse a curated page");
+        let expected = match method {
+            "archive" => "Only auto-filed pages can be removed here",
+            _ => "Promote failed: only auto-filed pages can be promoted",
+        };
+        assert_eq!(frame_error_text(&frame), expected);
     }
 
     // The curated page is untouched.
@@ -220,6 +225,31 @@ async fn archive_and_promote_share_the_same_gate() {
     let raw = std::fs::read_to_string(&wiki).unwrap();
     assert!(raw.contains("七天內未拆封可退"));
     assert!(raw.contains("author: \"operator\""));
+}
+
+#[tokio::test]
+async fn auto_page_actions_report_missing_pages_as_not_found() {
+    let home = tempfile::tempdir().unwrap();
+    seed_wiki(home.path());
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+    for page_path in [
+        "concepts/missing.md",
+        "missing-parent/missing.md",
+        "auto/charter/missing.md",
+        "auto/missing-parent/missing.md",
+    ] {
+        for method in ["promote", "archive", "share"] {
+            let params = json!({ "agent_id": "agnes", "page_path": page_path });
+            let frame = match method {
+                "promote" => handler.handle_wiki_promote(params).await,
+                "archive" => handler.handle_wiki_archive(params).await,
+                _ => handler.handle_wiki_share(params).await,
+            };
+            assert!(!frame_ok(&frame), "{method}: {page_path}");
+            assert_eq!(frame_error_text(&frame), "Auto page not found", "{method}: {page_path}");
+        }
+    }
 }
 
 /// The dashboard's existing promotion action can re-confirm v1.83 pages,
