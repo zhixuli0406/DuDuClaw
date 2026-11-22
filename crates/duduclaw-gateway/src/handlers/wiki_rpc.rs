@@ -98,6 +98,9 @@ impl MethodHandler {
         }
         let target = match duduclaw_memory::wiki_path::resolve_wiki_page(&wiki_dir, page_path, false) {
             Ok(target) if target.is_auto && target.exists => target,
+            Ok(target) if target.exists => return WsFrame::error_response(
+                "", "Promote failed: only auto-filed pages can be promoted",
+            ),
             _ => return WsFrame::error_response("", "Auto page not found"),
         };
         let page_path = target.id.as_str();
@@ -138,6 +141,9 @@ impl MethodHandler {
         }
         let target = match duduclaw_memory::wiki_path::resolve_wiki_page(&wiki_dir, page_path, false) {
             Ok(target) if target.is_auto && target.exists => target,
+            Ok(target) if target.exists => return WsFrame::error_response(
+                "", "Only auto-filed pages can be removed here",
+            ),
             _ => return WsFrame::error_response("", "Auto page not found"),
         };
         let page_path = target.id.as_str();
@@ -202,6 +208,9 @@ impl MethodHandler {
         }
         let target = match duduclaw_memory::wiki_path::resolve_wiki_page(&wiki_dir, page_path, false) {
             Ok(target) if target.is_auto && target.exists => target,
+            Ok(target) if target.exists => return WsFrame::error_response(
+                "", "Only auto-filed pages can be shared here",
+            ),
             _ => return WsFrame::error_response("", "Auto page not found"),
         };
         let page_path = target.id.as_str();
