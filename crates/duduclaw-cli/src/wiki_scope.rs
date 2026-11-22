@@ -202,7 +202,9 @@ impl WikiScopePolicy {
         });
         let first = matches.next();
         if matches.next().is_some() { return NamespaceMode::Ambiguous; }
-        first.map(|(_, mode)| mode.clone()).unwrap_or(NamespaceMode::AgentWritable)
+        first.map(|(key, mode)| {
+            if key == namespace { mode.clone() } else { NamespaceMode::Ambiguous }
+        }).unwrap_or(NamespaceMode::AgentWritable)
     }
 
     /// Resolve the namespace from a wiki-relative `page_path` and check
@@ -217,6 +219,11 @@ impl WikiScopePolicy {
 
     fn check_namespace_write(&self, namespace: &str, caller: &WriterCapability) -> Result<(), ScopeDeny> {
         let mode = self.mode_for(namespace);
+        if self.namespaces.keys().any(|key| key != namespace
+            && duduclaw_core::wiki_auto_namespace::segment_opens_as(key, namespace))
+        {
+            duduclaw_core::wiki_auto_namespace::warn_denied_alias(Some(&caller.label()), namespace);
+        }
         let namespace = namespace.to_string();
 
         match (&mode, caller) {
@@ -463,7 +470,7 @@ mod tests {
     }
 
     #[test]
-    fn namespace_write_mode_matches_nfc_and_nfd_in_both_directions() {
+    fn namespace_write_mode_denies_nfc_nfd_aliases_in_both_directions() {
         for (key, request) in [("café", "cafe\u{301}"), ("cafe\u{301}", "café")] {
             let tmp = TempDir::new().unwrap();
             write_policy(tmp.path(), &format!(
@@ -473,12 +480,35 @@ mod tests {
             let visibility = duduclaw_core::DepartmentVisibilityPolicy::load_for_home(tmp.path());
             let page = format!("{request}/salary.md");
             assert!(policy.has_explicit_namespace(request));
-            assert_eq!(policy.mode_for(key), policy.mode_for(request));
+            assert_eq!(policy.mode_for(request), NamespaceMode::Ambiguous);
             assert!(policy.check_write(&page, &WriterCapability::for_agent("sales-agent")).is_err());
             assert!(!visibility.page_visible(&page, Some("sales")));
-            assert!(policy.check_write(&page, &WriterCapability::for_agent("hr-agent")).is_ok());
-            assert!(visibility.page_visible(&page, Some("hr")));
+            assert!(policy.check_write(&page, &WriterCapability::for_agent("hr-agent")).is_err());
+            assert!(policy.check_write(&format!("{key}/x.md"), &WriterCapability::for_agent("hr-agent")).is_ok());
+            assert!(policy.check_write(&page, &WriterCapability::Operator).is_err());
+            assert!(!visibility.page_visible(&page, Some("hr")));
             assert!(policy.check_write("ｃａｆé/x.md", &WriterCapability::for_agent("sales-agent")).is_ok());
+        }
+    }
+
+    #[test]
+    fn namespace_aliases_deny_all_write_capabilities() {
+        for mode in [NamespaceMode::AgentWritable, NamespaceMode::OperatorOnly,
+            NamespaceMode::ReadOnly { synced_from: "sync".into() },
+            NamespaceMode::AgentAllowlist { agents: vec!["hr".into()] }]
+        {
+            let policy = WikiScopePolicy {
+                namespaces: BTreeMap::from([("departments".into(), mode)]),
+                loaded_from: None,
+            };
+            assert!(policy.overrides_department_isolation());
+            for alias in ["DEPARTMENTS", "departments.", "depar\u{200d}tments"] {
+                for caller in [WriterCapability::Operator, WriterCapability::for_agent("hr"),
+                    WriterCapability::Internal { capability: "sync".into() }]
+                {
+                    assert!(policy.check_write(&format!("{alias}/hr/x.md"), &caller).is_err());
+                }
+            }
         }
     }
 
