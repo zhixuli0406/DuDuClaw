@@ -108,7 +108,7 @@ fn clear_nonblocking(file: &fs::File) -> io::Result<()> {
 }
 
 /// Read externally managed licence data, following links (including backups).
-/// Only the opened descriptor decides file type; a linked FIFO cannot block.
+/// Only the opened descriptor can admit a file; a linked FIFO cannot block on Unix.
 pub fn read_store_file(path: &Path) -> std::result::Result<Option<Vec<u8>>, StoreError> {
     let mut options = fs::OpenOptions::new();
     options.read(true);
@@ -117,7 +117,39 @@ pub fn read_store_file(path: &Path) -> std::result::Result<Option<Vec<u8>>, Stor
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
-    read_opened_store_file(options.open(path).map_err(StoreError::Io))
+    let opened = options.open(path).map_err(|error| {
+        #[cfg(windows)]
+        {
+            // Without FILE_FLAG_BACKUP_SEMANTICS, Windows rejects directories
+            // before we can inspect a handle. Follow links for metadata only,
+            // matching licence reads through directory symlinks / junctions.
+            // This races with replacement, but can only classify a failed open:
+            // it never admits a file or reads any bytes from a special object.
+            classify_windows_open_error(error, || fs::metadata(path).is_ok_and(|meta| meta.is_dir()))
+        }
+        #[cfg(not(windows))]
+        StoreError::Io(error)
+    });
+    read_opened_store_file(opened)
+}
+
+/// Classify only failed Windows opens; successful opens always use handle metadata.
+#[cfg(any(windows, test))]
+fn classify_windows_open_error(error: io::Error, is_directory: impl FnOnce() -> bool) -> StoreError {
+    // ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION must remain retryable,
+    // even if the path changes to a directory before metadata is queried.
+    if matches!(error.raw_os_error(), Some(32 | 33)) {
+        return StoreError::Io(error);
+    }
+    // Do not turn NotFound into a refusal, or probe metadata for unrelated
+    // transient failures. A failed metadata query also preserves the I/O error.
+    if matches!(error.kind(), io::ErrorKind::PermissionDenied | io::ErrorKind::IsADirectory)
+        && is_directory()
+    {
+        StoreError::Refused("not a regular file")
+    } else {
+        StoreError::Io(error)
+    }
 }
 
 /// Internal files (locks and markers) are not operator-managed links, so
@@ -957,6 +989,61 @@ mod tests {
         assert!(read_store_file(&path).unwrap().is_none());
         assert!(matches!(load_from(&path), Err(LicenseError::FileNotFound(_))));
         assert!(LockedLicenseStore::acquire(&path).unwrap().read_contents().unwrap().license().unwrap().is_none());
+    }
+
+    #[test]
+    fn windows_failed_directory_open_is_refused() {
+        for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::IsADirectory] {
+            assert!(matches!(
+                classify_windows_open_error(io::Error::from(kind), || true),
+                StoreError::Refused("not a regular file")
+            ));
+        }
+    }
+
+    #[test]
+    fn windows_failed_open_without_directory_evidence_preserves_io_error() {
+        // A regular file denied by ACLs, or a failed metadata query, must be
+        // retried rather than memoised as a rejected licence.
+        for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::IsADirectory] {
+            let StoreError::Io(error) = classify_windows_open_error(io::Error::from(kind), || false) else {
+                panic!("missing directory evidence must preserve I/O errors");
+            };
+            assert_eq!(error.kind(), kind);
+        }
+    }
+
+    #[test]
+    fn windows_missing_and_transient_open_errors_skip_directory_probe() {
+        for kind in [io::ErrorKind::NotFound, io::ErrorKind::WouldBlock,
+            io::ErrorKind::Interrupted, io::ErrorKind::TimedOut, io::ErrorKind::Other]
+        {
+            let classified = classify_windows_open_error(io::Error::from(kind), || {
+                panic!("unrelated open errors must not query metadata");
+            });
+            if kind == io::ErrorKind::NotFound {
+                assert!(read_opened_store_file(Err(classified)).unwrap().is_none());
+            } else {
+                let StoreError::Io(error) = classified else {
+                    panic!("transient errors must remain retryable");
+                };
+                assert_eq!(error.kind(), kind);
+            }
+        }
+    }
+
+    #[test]
+    fn windows_sharing_and_lock_violations_preserve_os_error_without_probe() {
+        // Interpret these as Windows codes even when this test runs on Unix;
+        // the helper must not depend on the host's ErrorKind mapping.
+        for code in [32, 33] {
+            let StoreError::Io(error) = classify_windows_open_error(io::Error::from_raw_os_error(code), || {
+                panic!("sharing/lock violations must not query a possibly replaced path");
+            }) else {
+                panic!("sharing/lock violations must remain retryable");
+            };
+            assert_eq!(error.raw_os_error(), Some(code));
+        }
     }
 
     #[test]
