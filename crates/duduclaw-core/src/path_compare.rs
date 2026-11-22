@@ -209,16 +209,26 @@ fn windows_components(path: &str) -> Vec<String> {
     key
 }
 
-/// Classify a handle's final DOS path before comparing it with the validated
-/// canonical spelling. None means no local disk namespace can be proved.
-/// This is pure so Unix CI covers remote/device rejection as well.
+/// Bind a handle's final DOS path to the validated spelling using exact UTF-16.
+/// Only the verbatim disk prefix, one trailing separator and ASCII drive-letter
+/// case are ignored. Component case and Unicode normalization remain significant.
+/// None means no local disk namespace can be proved. Pure for Unix CI coverage.
 #[cfg(any(windows, test))]
-pub fn windows_final_path_matches(final_path: &str, canonical: &str) -> Option<bool> {
-    if classify_windows_path(final_path) != WindowsPathKind::Absolute
-        || classify_windows_path(canonical) != WindowsPathKind::Absolute {
-        return None;
+pub fn same_final_path_exact(final_path: &str, canonical: &str) -> Option<bool> {
+    fn disk_path(path: &str) -> Option<&str> {
+        if classify_windows_path(path) != WindowsPathKind::Absolute { return None; }
+        let disk = path.strip_prefix(r"\\?\").unwrap_or(path);
+        let bytes = disk.as_bytes();
+        if bytes.len() < 3 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' {
+            return None;
+        }
+        Some(disk.strip_suffix('\\').or_else(|| disk.strip_suffix('/')).unwrap_or(disk))
     }
-    Some(windows_components(final_path) == windows_components(canonical))
+    let final_path = disk_path(final_path)?;
+    let canonical = disk_path(canonical)?;
+    // Only the ASCII drive letter is folded; compare every remaining code unit.
+    Some(final_path.as_bytes()[0].eq_ignore_ascii_case(&canonical.as_bytes()[0])
+        && final_path.encode_utf16().skip(1).eq(canonical.encode_utf16().skip(1)))
 }
 
 /// Follow reparse points and obtain the final path and strong identity from
@@ -368,17 +378,38 @@ mod tests {
     }
 
     #[test]
-    fn windows_final_path_matches_normalized_local_paths() {
+    fn same_final_path_exact_normalizes_only_disk_prefix_trailing_separator_and_drive_case() {
         for (final_path, canonical) in [
-            (r"\\?\C:\x", r"C:\x"),
+            (r"\\?\C:\Work\Root", r"C:\Work\Root"),
+            (r"C:\Work\Root\", r"C:\Work\Root"),
+            (r"c:\Work\Root", r"C:\Work\Root"),
+        ] {
+            assert_eq!(same_final_path_exact(final_path, canonical), Some(true));
+            assert_eq!(same_final_path_exact(canonical, final_path), Some(true));
+        }
+    }
+
+    #[test]
+    fn same_final_path_exact_preserves_component_case_and_separators() {
+        // The former windows_final_path_matches_normalized_local_paths test
+        // accepted component case/slash changes; snapshot binding must be exact.
+        for (final_path, canonical) in [
+            (r"C:\Work\root", r"C:\Work\Root"),
             (r"C:\X\", r"c:\x"),
             (r"\\?\C:\ÉCOLE\測試\", "c:/école/測試"),
+            (r"C:\Work\Root", "C:/Work/Root"),
+            (r"C:\Work\Root\\", r"C:\Work\Root"),
+            (r"\\?\C:\other", r"C:\x"),
+            (r"\\?\D:\x", r"C:\x"),
+            (r"C:\xy", r"C:\x"),
         ] {
-            assert_eq!(windows_final_path_matches(final_path, canonical), Some(true));
+            assert_eq!(same_final_path_exact(final_path, canonical), Some(false));
         }
-        for final_path in [r"\\?\C:\other", r"\\?\D:\x", r"C:\xy"] {
-            assert_eq!(windows_final_path_matches(final_path, r"C:\x"), Some(false));
-        }
+    }
+
+    #[test]
+    fn same_final_path_exact_preserves_unicode_normalization() {
+        assert_eq!(same_final_path_exact(r"C:\Work\Röot", "C:\\Work\\Ro\u{308}ot"), Some(false));
     }
 
     #[test]
@@ -390,8 +421,8 @@ mod tests {
             r"\\?\UNC\localhost\C$\x", r"\\?\Volume{123}\x",
             r"\\.\C:\x", r"\Device\HarddiskVolume1\x", "C:", r"C:x", r"\x",
         ] {
-            assert_eq!(windows_final_path_matches(final_path, r"C:\x"), None, "{final_path}");
-            assert_eq!(windows_final_path_matches(r"C:\x", final_path), None, "{final_path}");
+            assert_eq!(same_final_path_exact(final_path, r"C:\x"), None, "{final_path}");
+            assert_eq!(same_final_path_exact(r"C:\x", final_path), None, "{final_path}");
         }
     }
 

@@ -107,8 +107,10 @@ pub(crate) fn protected_roots(home_dir: &Path) -> Vec<PathBuf> {
 /// A successful gate retains the canonical snapshot for security checks and
 /// supplies an equivalent child-facing spelling for argv, cwd and sandbox.
 /// The snapshot is rechecked immediately before handing the command to spawn.
-/// It is not an open directory handle: replacement after that check remains
-/// possible until the OS/CLI opens the directory.
+/// The remaining replacement window starts after the last handle snapshot /
+/// path resolution and lasts until the OS/CLI reopens the pathname. Windows
+/// handles allow FILE_SHARE_DELETE, so replacement can happen immediately after
+/// the final-path query, even while the snapshot handle is still open.
 #[derive(Debug)]
 pub(crate) struct CheckedWorkRoot {
     path: PathBuf,
@@ -187,9 +189,9 @@ fn directory_identity_refusal(error: std::io::Error) -> String {
 fn validate_directory_snapshot(path: &Path, snapshot: &DirectorySnapshot) -> Result<(), String> {
     #[cfg(windows)]
     {
-        use duduclaw_core::path_compare::windows_final_path_matches;
+        use duduclaw_core::path_compare::same_final_path_exact;
         let matches = snapshot.final_path.to_str().zip(path.to_str())
-            .and_then(|(final_path, canonical)| windows_final_path_matches(final_path, canonical));
+            .and_then(|(final_path, canonical)| same_final_path_exact(final_path, canonical));
         match matches {
             Some(true) => {},
             Some(false) => return Err(work_root_refusal()),
