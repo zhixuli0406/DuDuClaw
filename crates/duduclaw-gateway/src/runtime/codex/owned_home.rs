@@ -105,9 +105,9 @@ pub(crate) fn protected_roots(home_dir: &Path) -> Vec<PathBuf> {
 /// before the next call. Typed engine-local refusal, plain zh-TW, no path.
 ///
 /// An employee directory `<home>/agents/<id>` does not contain `<home>/run`
-/// and is accepted. A root that cannot be resolved is compared literally
-/// only; the callers run `check_project_layers` first, which already refuses
-/// an unresolvable root.
+/// and is accepted. Windows resolves missing leaves through existing parents
+/// and refuses any other resolution/identity error. Other platforms retain
+/// the literal fallback; callers check project layers before this gate.
 pub(crate) fn check_work_root(home_dir: &Path, work_root: &Path) -> Result<(), String> {
     if work_root_contains_run(home_dir, work_root) {
         return Err(duduclaw_agent::mcp_spawn_gate::engine_local_spawn_gate_error(WORK_ROOT_CONTAINS_HOME));
@@ -115,6 +115,7 @@ pub(crate) fn check_work_root(home_dir: &Path, work_root: &Path) -> Result<(), S
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn work_root_contains_run(home_dir: &Path, work_root: &Path) -> bool {
     let run = home_dir.join("run");
     let mut runs = vec![run.clone()];
@@ -142,6 +143,58 @@ fn work_root_contains_run(home_dir: &Path, work_root: &Path) -> bool {
         }
     }
     false
+}
+
+#[cfg(windows)]
+fn work_root_contains_run(home_dir: &Path, work_root: &Path) -> bool {
+    // A drive-less root (`/` or `\`) depends on process cwd, which can be
+    // on a different volume from the home. Never admit that ambiguous whole
+    // drive as an employee workspace, even when today's cwd is elsewhere.
+    let mut components = work_root.components();
+    if matches!(components.next(), Some(std::path::Component::RootDir))
+        && components.next().is_none() {
+        return true;
+    }
+    windows_work_root_contains_run(home_dir, work_root).unwrap_or(true)
+}
+
+#[cfg(windows)]
+fn windows_work_root_contains_run(home_dir: &Path, work_root: &Path) -> std::io::Result<bool> {
+    use duduclaw_core::path_compare::{canonicalize_allow_missing, file_identity, starts_with};
+
+    fn identify(path: &Path) -> std::io::Result<Option<(u32, u64)>> {
+        match file_identity(path) {
+            Ok(id) => Ok(Some(id)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    let home = canonicalize_allow_missing(home_dir)?;
+    let root = canonicalize_allow_missing(work_root)?;
+    // Check home explicitly, including before run exists. Do not turn an
+    // inaccessible home or root into a successful lexical-only decision.
+    identify(home_dir)?;
+    let root_id = identify(work_root)?;
+    let runs = [
+        std::path::absolute(home_dir)?.join("run"),
+        home.join("run"),
+        canonicalize_allow_missing(&home_dir.join("run"))?,
+    ];
+    let roots = [std::path::absolute(work_root)?, root];
+    for run in &runs {
+        for root in &roots {
+            if starts_with(run, root)? { return Ok(true); }
+        }
+        // Include both the link's lexical ancestors and its target's
+        // ancestors, matching the Unix protection against aliases.
+        for ancestor in run.ancestors() {
+            if let Some(id) = identify(ancestor)? {
+                if Some(id) == root_id { return Ok(true); }
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// Descriptor-relative directory access that never follows a symbolic link
@@ -872,5 +925,51 @@ mod tests {
         // The utility working directory lives inside `<home>/run/codex`: accepted.
         let utility = OwnedCallDir::create(&home, UTILITY_PREFIX).unwrap();
         check_work_root(&home, utility.path()).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_work_roots_match_case_verbatim_and_the_home_drive_root() {
+        let base = tempfile::tempdir().unwrap();
+        let home = base.path().join("MixedCaseHome");
+        let agent = home.join("agents/worker");
+        std::fs::create_dir_all(&agent).unwrap();
+        ensure_run_parent(&home).unwrap();
+        let canonical = std::fs::canonicalize(&home).unwrap();
+        let upper = PathBuf::from(canonical.to_str().unwrap().to_uppercase());
+        for root in [canonical.clone(), upper.clone(), upper.join("RUN"),
+            canonical.ancestors().last().unwrap().to_path_buf()] {
+            let error = check_work_root(&home, &root).unwrap_err();
+            assert_eq!(error, duduclaw_agent::mcp_spawn_gate::engine_local_spawn_gate_error(WORK_ROOT_CONTAINS_HOME));
+        }
+        check_work_root(&upper, &agent).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_missing_run_is_resolved_through_existing_home() {
+        let base = tempfile::tempdir().unwrap();
+        let home = base.path().join("MixedCaseHome");
+        let agent = home.join("agents/worker");
+        std::fs::create_dir_all(&agent).unwrap();
+        let canonical = std::fs::canonicalize(&home).unwrap();
+        let upper = PathBuf::from(canonical.to_str().unwrap().to_uppercase());
+        assert!(!home.join("run").exists());
+        for root in [upper.clone(), upper.join("RUN"), base.path().to_path_buf()] {
+            assert!(check_work_root(&home, &root).is_err());
+        }
+        check_work_root(&upper, &agent).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_unresolvable_home_or_work_root_fails_closed() {
+        let home = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let invalid = home.path().join("invalid\0path");
+        for (home, root) in [(invalid.as_path(), other.path()), (home.path(), invalid.as_path())] {
+            let error = check_work_root(home, root).unwrap_err();
+            assert_eq!(error, duduclaw_agent::mcp_spawn_gate::engine_local_spawn_gate_error(WORK_ROOT_CONTAINS_HOME));
+        }
     }
 }

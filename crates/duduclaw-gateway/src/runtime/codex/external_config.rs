@@ -170,18 +170,41 @@ fn project_layer_dirs(root: &Path) -> Result<Vec<PathBuf>, String> {
 }
 
 pub(super) fn check_project_layers(root: &Path, owned_config: Option<&Path>) -> Result<(), String> {
-    let root = std::fs::canonicalize(root).map_err(|_| refusal_at_layer(root, "無法檢查專案設定", "專案層"))?;
-    let owned_config = owned_config.map(|path| std::fs::canonicalize(path)
+    use duduclaw_core::path_compare;
+    let root = path_compare::canonicalize(root).map_err(|_| refusal_at_layer(root, "無法檢查專案設定", "專案層"))?;
+    let owned_config = owned_config.map(|path| path_compare::canonicalize(path)
         .map_err(|_| refusal_at_layer(path, "無法檢查代理設定檔", "員工資料夾"))).transpose()?;
     for parent in project_layer_dirs(&root)? {
         let file = parent.join(".codex/config.toml");
-        if Some(file.as_path()) != owned_config.as_deref() {
+        let owned = owned_config.as_deref().map(|owned| is_owned_project_config(&file, owned))
+            .transpose().map_err(|_| refusal_at_layer(&file, "無法檢查代理設定檔", "員工資料夾"))?
+            .unwrap_or(false);
+        if !owned {
             let employee_dir = owned_config.as_deref().and_then(Path::parent).and_then(Path::parent);
-            let layer = if employee_dir == Some(parent.as_path()) { "員工資料夾" } else { "專案層" };
+            let is_employee = employee_dir.map(|dir| path_compare::equal(dir, &parent))
+                .transpose().map_err(|_| refusal_at_layer(&file, "無法檢查專案設定", "專案層"))?
+                .unwrap_or(false);
+            let layer = if is_employee { "員工資料夾" } else { "專案層" };
             check_file_in_layer(&file, layer)?;
         }
     }
     Ok(())
+}
+
+fn is_owned_project_config(file: &Path, owned: &Path) -> std::io::Result<bool> {
+    use duduclaw_core::path_compare;
+    let candidate = match path_compare::canonicalize(file) {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if !path_compare::equal(&candidate, owned)? { return Ok(false); }
+    // Case-insensitive comparison is conservative for a denial, but cannot
+    // grant an exemption on a Windows directory with case sensitivity enabled.
+    #[cfg(windows)]
+    { Ok(path_compare::file_identity(&candidate)? == path_compare::file_identity(owned)?) }
+    #[cfg(not(windows))]
+    { Ok(true) }
 }
 
 fn check_cloud_cache(path: &Path) -> Result<(), String> {
@@ -235,6 +258,26 @@ pub(crate) fn require_mcp_isolation() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_owned_config_and_git_walk_accept_equivalent_path_spellings() {
+        let base = tempfile::tempdir().unwrap();
+        let repo = base.path().join("MixedCaseRepo");
+        let employee = repo.join("agents/worker");
+        std::fs::create_dir_all(employee.join(".codex")).unwrap();
+        std::fs::create_dir(repo.join(".git")).unwrap();
+        let owned = employee.join(".codex/config.toml");
+        std::fs::write(&owned, "[mcp_servers.duduclaw]\ncommand='owned'").unwrap();
+        let canonical = std::fs::canonicalize(&employee).unwrap();
+        let upper = PathBuf::from(canonical.to_str().unwrap().to_uppercase());
+        check_project_layers(&upper, Some(&owned)).unwrap();
+        check_project_layers(&employee, Some(&upper.join(".CODEX/CONFIG.TOML"))).unwrap();
+        std::fs::create_dir(repo.join(".codex")).unwrap();
+        std::fs::write(repo.join(".codex/config.toml"), "[mcp_servers.foreign]\ncommand='foreign'").unwrap();
+        assert!(check_project_layers(&upper, Some(&owned)).is_err());
+    }
+
     #[test]
     fn refusal_never_exposes_host_paths_even_with_spaces_unicode_or_tilde() {
         for path in ["/private/tmp/測試 空間/home/agents/worker/.codex/config.toml",

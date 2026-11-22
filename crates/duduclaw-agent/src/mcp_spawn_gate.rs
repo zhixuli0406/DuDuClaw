@@ -85,21 +85,29 @@ pub enum McpGateOutcome {
 
 /// The lock file path base for `config_path` (`<dir>/.mcp.json`); the lock
 /// itself is this path plus `.lock` (`with_file_lock` appends it).
-pub fn mcp_config_lock_base(config_path: &Path) -> PathBuf {
+pub fn mcp_config_lock_base(config_path: &Path) -> Result<PathBuf, String> {
     let Some(dir) = config_path.parent() else {
-        return config_path.to_path_buf();
+        return Ok(config_path.to_path_buf());
     };
     if !crate::mcp_template::is_repairable_agent_dir(dir) {
-        return config_path.to_path_buf();
+        return Ok(config_path.to_path_buf());
     }
     let home = crate::mcp_template::derive_home_from_agent_dir(dir);
-    let canon = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-    let digest = ring::digest::digest(&ring::digest::SHA256, canon.to_string_lossy().as_bytes());
+    #[cfg(windows)]
+    let key = {
+        use duduclaw_core::path_compare;
+        let canon = path_compare::canonicalize_allow_missing(dir)
+            .and_then(|path| path_compare::comparison_key(&path));
+        canon.map_err(|_| spawn_gate_error("無法確認員工設定鎖定資料夾；拒絕啟動。"))?
+    };
+    #[cfg(not(windows))]
+    let key = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf()).to_string_lossy().into_owned();
+    let digest = ring::digest::digest(&ring::digest::SHA256, key.as_bytes());
     let hex: String = digest.as_ref()[..16]
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    home.join("locks").join(format!("mcp-json-{hex}"))
+    Ok(home.join("locks").join(format!("mcp-json-{hex}")))
 }
 
 #[cfg(test)]
@@ -154,7 +162,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let agent = home.path().join("agents").join("agnes");
         std::fs::create_dir_all(&agent).unwrap();
-        let base = mcp_config_lock_base(&agent.join(".mcp.json"));
+        let base = mcp_config_lock_base(&agent.join(".mcp.json")).unwrap();
         assert!(
             base.starts_with(home.path().join("locks")),
             "{}",
@@ -163,12 +171,29 @@ mod tests {
         assert!(!base.starts_with(&agent));
         let eph = home.path().join("agents/.ephemeral/eph-1");
         std::fs::create_dir_all(&eph).unwrap();
-        let eph_base = mcp_config_lock_base(&eph.join(".mcp.json"));
+        let eph_base = mcp_config_lock_base(&eph.join(".mcp.json")).unwrap();
         assert!(eph_base.starts_with(home.path().join("locks")));
         assert_ne!(base, eph_base, "one lock per employee directory");
         // Not an employee directory: the old sidecar location.
         let other = tempfile::tempdir().unwrap();
         let p = other.path().join(".mcp.json");
-        assert_eq!(mcp_config_lock_base(&p), p);
+        assert_eq!(mcp_config_lock_base(&p).unwrap(), p);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_employee_lock_is_shared_across_path_spellings() {
+        let home = tempfile::tempdir().unwrap();
+        let agent = home.path().join("agents/.ephemeral/MixedCase");
+        std::fs::create_dir_all(&agent).unwrap();
+        let canonical = std::fs::canonicalize(&agent).unwrap();
+        let upper = PathBuf::from(canonical.to_str().unwrap().to_uppercase());
+        let expected = mcp_config_lock_base(&agent.join(".mcp.json")).unwrap();
+        for dir in [&canonical, &upper] {
+            let actual = mcp_config_lock_base(&dir.join(".mcp.json")).unwrap();
+            assert_eq!(actual.file_name(), expected.file_name());
+            assert_eq!(duduclaw_core::path_compare::file_identity(actual.parent().unwrap().parent().unwrap()).unwrap(),
+                duduclaw_core::path_compare::file_identity(home.path()).unwrap());
+        }
     }
 }
