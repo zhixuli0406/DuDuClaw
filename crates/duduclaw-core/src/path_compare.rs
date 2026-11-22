@@ -202,6 +202,93 @@ fn windows_components(path: &str) -> Vec<String> {
     key
 }
 
+/// Classify a handle's final DOS path before comparing it with the validated
+/// canonical spelling. None means no local disk namespace can be proved.
+/// This is pure so Unix CI covers remote/device rejection as well.
+#[cfg(any(windows, test))]
+pub fn windows_final_path_matches(final_path: &str, canonical: &str) -> Option<bool> {
+    if classify_windows_path(final_path) != WindowsPathKind::Absolute
+        || classify_windows_path(canonical) != WindowsPathKind::Absolute {
+        return None;
+    }
+    Some(windows_components(final_path) == windows_components(canonical))
+}
+
+/// Follow reparse points and obtain the final path and strong identity from
+/// ONE handle, refusing nonlocal final paths with ErrorKind::Unsupported.
+/// Callers must compare the final path with the canonical spelling before
+/// using this snapshot.
+/// Keep the verbatim final path for I/O; comparison keys are never I/O paths.
+#[cfg(windows)]
+pub fn windows_directory_identity(path: &Path) -> io::Result<(PathBuf, FileIdentity)> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, GetFinalPathNameByHandleW, GetFileInformationByHandleEx,
+        FileIdInfo, FileStandardInfo, FILE_ID_INFO, FILE_STANDARD_INFO,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, VOLUME_NAME_DOS,
+    };
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if wide.contains(&0) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "NUL in directory path"));
+    }
+    wide.push(0);
+    // SAFETY: the path is NUL-terminated; optional pointers are null. Omitting
+    // OPEN_REPARSE_POINT intentionally opens the final target, not the link.
+    let raw = unsafe { CreateFileW(wide.as_ptr(), FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, std::ptr::null(),
+        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, std::ptr::null_mut()) };
+    if raw == INVALID_HANDLE_VALUE { return Err(io::Error::last_os_error()); }
+    // SAFETY: CreateFileW returned a valid owned handle, closed on every exit.
+    let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+    let mut standard = std::mem::MaybeUninit::<FILE_STANDARD_INFO>::uninit();
+    // SAFETY: the live handle and output buffer match FileStandardInfo.
+    if unsafe { GetFileInformationByHandleEx(handle.as_raw_handle(), FileStandardInfo,
+        standard.as_mut_ptr().cast(), std::mem::size_of::<FILE_STANDARD_INFO>() as u32) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the successful call initialized the structure.
+    if unsafe { standard.assume_init() }.Directory == 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a directory"));
+    }
+    // A bounded buffer also fails closed if the name changes/grows during the
+    // query. No second open, truncated name, lossy UTF-16 or namespace fallback.
+    let mut buffer = vec![0u16; 32768];
+    // SAFETY: the live handle and writable buffer remain valid for the call.
+    let length = unsafe { GetFinalPathNameByHandleW(handle.as_raw_handle(),
+        buffer.as_mut_ptr(), buffer.len() as u32, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS) };
+    if length == 0 { return Err(io::Error::last_os_error()); }
+    if length as usize >= buffer.len() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "final directory path too long"));
+    }
+    buffer.truncate(length as usize);
+    let final_path = PathBuf::from(OsString::from_wide(&buffer));
+    // Derive locality from the FINAL path, never the input's drive prefix.
+    // UNC/device/GUID names are refused before GetDriveTypeW is called.
+    if !is_local_windows_path(&final_path)? {
+        return Err(io::Error::new(io::ErrorKind::Unsupported, "nonlocal final directory path"));
+    }
+    let mut info = std::mem::MaybeUninit::<FILE_ID_INFO>::uninit();
+    // SAFETY: this is the SAME handle used for the final path; the output
+    // buffer and size match FileIdInfo. There is no legacy identity fallback.
+    if unsafe { GetFileInformationByHandleEx(handle.as_raw_handle(), FileIdInfo,
+        info.as_mut_ptr().cast(), std::mem::size_of::<FILE_ID_INFO>() as u32) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the successful call initialized the structure.
+    let info = unsafe { info.assume_init() };
+    let identity = FileIdentity::Windows128 {
+        volume: info.VolumeSerialNumber, id: info.FileId.Identifier,
+    };
+    if !identity.is_strong() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "incomplete directory identity"));
+    }
+    Ok((final_path, identity))
+}
+
 /// Follow directory aliases/reparse points just as canonicalization does.
 /// Open with metadata access only, including directories, and close via RAII.
 #[cfg(windows)]
@@ -247,6 +334,34 @@ pub fn file_identity(path: &Path) -> io::Result<FileIdentity> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_final_path_matches_normalized_local_paths() {
+        for (final_path, canonical) in [
+            (r"\\?\C:\x", r"C:\x"),
+            (r"C:\X\", r"c:\x"),
+            (r"\\?\C:\ÉCOLE\測試\", "c:/école/測試"),
+        ] {
+            assert_eq!(windows_final_path_matches(final_path, canonical), Some(true));
+        }
+        for final_path in [r"\\?\C:\other", r"\\?\D:\x", r"C:\xy"] {
+            assert_eq!(windows_final_path_matches(final_path, r"C:\x"), Some(false));
+        }
+    }
+
+    #[test]
+    fn windows_final_path_rejects_remote_and_device_namespaces() {
+        // No SMB share is needed: exercise the exact classifier used by the
+        // gate for remote final names, including a loopback administrative share.
+        for final_path in [
+            r"\\srv\sh\x", r"\\?\UNC\srv\sh\x", r"\\localhost\C$\x",
+            r"\\?\UNC\localhost\C$\x", r"\\?\Volume{123}\x",
+            r"\\.\C:\x", r"\Device\HarddiskVolume1\x", "C:", r"C:x", r"\x",
+        ] {
+            assert_eq!(windows_final_path_matches(final_path, r"C:\x"), None, "{final_path}");
+            assert_eq!(windows_final_path_matches(r"C:\x", final_path), None, "{final_path}");
+        }
+    }
 
     #[test]
     fn windows_path_classification_is_host_independent() {
