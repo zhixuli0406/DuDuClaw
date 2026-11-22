@@ -70,7 +70,9 @@ async fn ingest(
         .map_err(|e| err(format!("無法讀取文件資料夾 {}：{e}", docs.display())))?
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.is_file())
+        .filter(|p| std::fs::symlink_metadata(p).is_ok_and(|meta| {
+            meta.is_file() && !duduclaw_core::fs_safety::is_link_metadata(&meta)
+        }))
         .collect();
     entries.sort();
     let started = Instant::now();
@@ -88,7 +90,11 @@ async fn ingest(
                 continue;
             }
         };
-        let bytes = std::fs::read(&path).map_err(|e| err(format!("無法讀取 {name}：{e}")))?;
+        use std::io::Read;
+        let mut file = duduclaw_core::fs_safety::open_regular_file_nofollow(&path)
+            .map_err(|e| err(format!("無法讀取 {name}：{e}")))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(|e| err(format!("無法讀取 {name}：{e}")))?;
         let sha = store.put(&bytes).map_err(|e| err(e.to_string()))?;
         let mut conn =
             duduclaw_knowledge::schema::open_home(home).map_err(|e| err(e.to_string()))?;

@@ -128,3 +128,24 @@ fn review_listing_finds_employee_pages_but_not_auto_or_other_sessions() {
         pages_needing_review(home.path(), "agnes", &sel("telegram:1", &["m:6"], None)).is_empty()
     );
 }
+
+
+#[cfg(unix)]
+#[test]
+fn review_walker_skips_links_to_auto_and_outside_sources() {
+    use std::os::unix::fs::symlink;
+    let home = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let wiki = home.path().join("agents/agnes/wiki");
+    std::fs::create_dir_all(wiki.join("auto")).unwrap();
+    let raw = stamp_host_sources("---\ntitle: x\n---\nb\n", None,
+        &["conversation:telegram:1:m:5".into()]);
+    std::fs::write(wiki.join("auto/secret.md"), &raw).unwrap();
+    std::fs::write(outside.path().join("secret.md"), &raw).unwrap();
+    std::fs::write(wiki.join("ordinary.md"), &raw).unwrap();
+    symlink(wiki.join("auto"), wiki.join("alias-auto")).unwrap();
+    symlink(outside.path(), wiki.join("alias-outside")).unwrap();
+    symlink(outside.path().join("secret.md"), wiki.join("alias.md")).unwrap();
+    assert_eq!(pages_needing_review(home.path(), "agnes", &sel("telegram:1", &["m:5"], None)),
+        vec!["wiki/ordinary.md".to_string()]);
+}

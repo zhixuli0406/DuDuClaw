@@ -214,7 +214,7 @@ pub(crate) async fn handle_shared_wiki_write(args: &Value, home_dir: &Path, call
     // department's `departments/<dept>/…` sub-tree; the company layer stays
     // governed by `.scope.toml` below. Deferred when the operator explicitly
     // declared the `departments` namespace (explicit policy wins).
-    if !scope_policy.has_explicit_namespace(duduclaw_core::DEPARTMENTS_NAMESPACE) {
+    if !scope_policy.overrides_department_isolation() {
         let dept = resolve_agent_department(home_dir, caller_agent);
         if let Err(deny) = crate::wiki_scope::check_department_access(page_path, dept.as_deref()) {
             return tool_error(&format!("Shared wiki write denied: {deny}"));
@@ -274,7 +274,7 @@ pub(crate) async fn handle_shared_wiki_write(args: &Value, home_dir: &Path, call
 
     let target = match duduclaw_memory::wiki_path::prepare_wiki_write_with_policy(&wiki_dir, page_path, |id| {
         verify_before_io().map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))?;
-        if !scope_policy.has_explicit_namespace(duduclaw_core::DEPARTMENTS_NAMESPACE) {
+        if !scope_policy.overrides_department_isolation() {
             crate::wiki_scope::check_department_access(id, resolve_agent_department(home_dir, caller_agent).as_deref())
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))?;
         }

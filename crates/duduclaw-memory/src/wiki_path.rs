@@ -130,14 +130,7 @@ pub fn resolve_wiki_page(wiki_dir: &Path, id: &str, write: bool) -> io::Result<R
     Ok(ResolvedWikiPage { id: resolved, full_path, is_auto, exists })
 }
 
-/// Reparse points include junctions, not just Rust's symlink file types.
-pub fn is_link_metadata(meta: &std::fs::Metadata) -> bool {
-    #[cfg(windows)] {
-        use std::os::windows::fs::MetadataExt;
-        if meta.file_attributes() & 0x400 != 0 { return true; }
-    }
-    meta.file_type().is_symlink()
-}
+pub use duduclaw_core::fs_safety::is_link_metadata;
 
 /// Employee writes may create ordinary directories, but must classify every
 /// existing ancestor before creating anything below it. A missing directory
@@ -355,27 +348,6 @@ pub fn ensure_within_wiki_dir(wiki_dir: &Path, full: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Open `full` for reading without following a symlink in its last
-/// component. On unix `O_NOFOLLOW` makes the open itself fail on a link; on
-/// Windows `FILE_FLAG_OPEN_REPARSE_POINT` opens the link instead of its
-/// target, which the `fstat` check below then refuses.
-fn open_nofollow(full: &Path) -> io::Result<std::fs::File> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    options.open(full)
-}
-
 /// Read one wiki file as UTF-8 without following symlinks.
 ///
 /// `rel` must pass [`validate_relative_wiki_read_path`] (checked here again). The
@@ -393,25 +365,16 @@ pub fn read_wiki_file_nofollow(wiki_dir: &Path, rel: &str) -> io::Result<String>
 /// the original directory alias a second time after authorization.
 pub fn read_resolved_wiki_file_nofollow(target: &ResolvedWikiPage) -> io::Result<String> {
     use std::io::Read;
-    let full = &target.full_path;
-    let meta = std::fs::symlink_metadata(&full)?;
-    if is_link_metadata(&meta) || !meta.is_file() {
-        return Err(denied("wiki page is not a regular file"));
-    }
-    let mut file = open_nofollow(&full).map_err(|e| {
-        if e.kind() == io::ErrorKind::NotFound {
-            e
-        } else {
-            denied("wiki page cannot be opened")
-        }
-    })?;
-    let opened = file.metadata()?;
-    if !opened.is_file() || is_link_metadata(&opened) {
-        return Err(denied("wiki page is not a regular file"));
-    }
+    let mut file = open_resolved_wiki_file_nofollow(target)?;
     let mut content = String::new();
     file.read_to_string(&mut content)?;
     Ok(content)
+}
+
+/// Open a validated target once; callers use this handle for both metadata
+/// and bounded reads, so the size check and bytes refer to the same file.
+pub fn open_resolved_wiki_file_nofollow(target: &ResolvedWikiPage) -> io::Result<std::fs::File> {
+    duduclaw_core::fs_safety::open_regular_file_nofollow(&target.full_path)
 }
 
 /// Validate `rel`, confirm the target stays inside `wiki_dir`, then create

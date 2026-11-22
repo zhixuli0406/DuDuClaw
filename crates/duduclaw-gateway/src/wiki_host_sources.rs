@@ -103,13 +103,7 @@ pub fn page_host_sources(content: &str) -> Vec<String> {
 /// v1.84.0: whether the page carries the host's promotion mark
 /// (`host_promoted: true` in its frontmatter, see [`HOST_PROMOTED_KEY`]).
 pub fn page_host_promoted(content: &str) -> bool {
-    let Some((fm, _)) = split_frontmatter(content) else {
-        return false;
-    };
-    fm.lines()
-        .find(|l| is_key_line(l, HOST_PROMOTED_KEY))
-        .and_then(|l| l.split_once(':'))
-        .is_some_and(|(_, v)| v.trim() == "true")
+    duduclaw_memory::wiki_auto_registry::page_host_promoted(content)
 }
 
 /// `content` with exactly the given host-owned frontmatter: `host_sources`
@@ -202,8 +196,8 @@ fn scan(root: &Path, label: &str, skip_auto: bool, sel: &SelectorView, out: &mut
                 return;
             }
             let path = entry.path();
-            let Ok(ft) = entry.file_type() else { continue };
-            if ft.is_symlink() {
+            let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+            if duduclaw_memory::wiki_path::is_link_metadata(&meta) {
                 continue;
             }
             let Ok(rel) = path.strip_prefix(root) else {
@@ -212,16 +206,20 @@ fn scan(root: &Path, label: &str, skip_auto: bool, sel: &SelectorView, out: &mut
             let Some(rel) = duduclaw_memory::wiki_path::page_id_from_relative_path(rel) else {
                 continue;
             };
-            if ft.is_dir() {
+            if meta.is_dir() {
                 if !(skip_auto && duduclaw_core::wiki_auto_namespace::is_auto_page_path(&rel)) {
                     stack.push(path);
                 }
                 continue;
             }
-            if !rel.ends_with(".md") || rel.starts_with('_') {
+            if !meta.is_file() || !rel.ends_with(".md") || rel.starts_with('_') {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(&path) else {
+            let Ok(target) = duduclaw_memory::wiki_path::resolve_wiki_page(root, &rel, false) else {
+                continue;
+            };
+            if skip_auto && target.is_auto { continue; }
+            let Ok(text) = duduclaw_memory::wiki_path::read_resolved_wiki_file_nofollow(&target) else {
                 continue;
             };
             if page_host_sources(&text)

@@ -686,16 +686,18 @@ fn copy_md_tree(src: &Path, dest: &Path) -> Result<()> {
     let rd =
         std::fs::read_dir(src).map_err(|e| io_err(format!("讀取 {} 失敗: {e}", src.display())))?;
     for entry in rd.flatten() {
-        let Ok(ft) = entry.file_type() else { continue };
-        if ft.is_symlink() {
+        let path = entry.path();
+        let Ok(ft) = std::fs::symlink_metadata(&path) else { continue };
+        if duduclaw_memory::wiki_path::is_link_metadata(&ft) {
             continue;
         }
-        let path = entry.path();
         let target = dest.join(entry.file_name());
         if ft.is_dir() {
             copy_md_tree(&path, &target)?;
         } else if ft.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md") {
-            let content = std::fs::read_to_string(&path)
+            let rel = duduclaw_memory::wiki_path::page_id_from_relative_path(Path::new(&entry.file_name()))
+                .ok_or_else(|| io_err("invalid wiki source filename".into()))?;
+            let content = duduclaw_memory::wiki_path::read_wiki_file_nofollow(src, &rel)
                 .map_err(|e| io_err(format!("讀取 {} 失敗: {e}", path.display())))?;
             write_file(&target, &sanitize_wiki_content(&content))?;
         }
@@ -736,6 +738,24 @@ fn sanitize_wiki_content(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_md_tree_skips_directory_and_file_links() {
+        use std::os::unix::fs::symlink;
+        let source = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("ordinary.md"), "ordinary").unwrap();
+        std::fs::write(outside.path().join("secret.md"), "secret").unwrap();
+        symlink(outside.path(), source.path().join("alias")).unwrap();
+        symlink(outside.path().join("secret.md"), source.path().join("alias.md")).unwrap();
+        copy_md_tree(source.path(), destination.path()).unwrap();
+        assert!(destination.path().join("ordinary.md").is_file());
+        assert!(!destination.path().join("alias").exists());
+        assert!(!destination.path().join("alias.md").exists());
+    }
+
 
     struct TempTree(PathBuf);
     impl TempTree {
