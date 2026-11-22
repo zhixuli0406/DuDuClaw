@@ -59,6 +59,12 @@ const MAX_REMOVE_DEPTH: usize = 32;
 /// folder (F4). No path is included.
 pub(crate) const WORK_ROOT_CONTAINS_HOME: &str = "Codex 不會啟動：這位員工的工作資料夾包含了 DuDuClaw 的系統資料夾。工作資料夾不可以是系統資料夾本身、它的上層資料夾，或任何包含系統資料夾的資料夾；請改用員工自己的資料夾或另一個專案資料夾。";
 
+/// Preserve the engine-local fallback class without disclosing a host path.
+#[cfg(windows)]
+pub(crate) const WORK_ROOT_MUST_BE_ABSOLUTE: &str = "為保護系統資料夾，這位員工的工作資料夾必須是完整路徑（例如 C:\\Work\\project），已停止啟動 Codex。";
+#[cfg(windows)]
+pub(crate) const WORK_ROOT_NETWORK_FOLDER: &str = "網路資料夾或無法確認為本機的磁碟不能用作 Codex 的工作資料夾，已停止啟動 Codex。";
+
 /// `<home>/run/codex`.
 pub(crate) fn run_parent(home_dir: &Path) -> PathBuf {
     home_dir.join("run").join("codex")
@@ -98,103 +104,111 @@ pub(crate) fn protected_roots(home_dir: &Path) -> Vec<PathBuf> {
     roots
 }
 
-/// F4 (a): refuse a Codex call whose working root — after resolving symbolic
-/// links — is `<home>`, one of its ancestors, or otherwise contains
-/// `<home>/run`. Inside such a root `:project_roots = write` covers
-/// `<home>/run`'s directory entry, so a tool could rename it and plant a link
-/// before the next call. Typed engine-local refusal, plain zh-TW, no path.
-///
-/// An employee directory `<home>/agents/<id>` does not contain `<home>/run`
-/// and is accepted. Windows resolves missing leaves through existing parents
-/// and refuses any other resolution/identity error. Other platforms retain
-/// the literal fallback; callers check project layers before this gate.
-pub(crate) fn check_work_root(home_dir: &Path, work_root: &Path) -> Result<(), String> {
-    if work_root_contains_run(home_dir, work_root) {
-        return Err(duduclaw_agent::mcp_spawn_gate::engine_local_spawn_gate_error(WORK_ROOT_CONTAINS_HOME));
+/// A successful gate owns the one spelling used by argv, cwd and sandbox.
+/// The snapshot is rechecked immediately before handing the command to spawn.
+/// It is not an open directory handle: replacement after that check remains
+/// possible until the OS/CLI opens the directory.
+#[derive(Debug)]
+pub(crate) struct CheckedWorkRoot {
+    path: PathBuf,
+    identity: duduclaw_core::path_compare::FileIdentity,
+}
+
+impl CheckedWorkRoot {
+    pub(crate) fn path(&self) -> &Path { &self.path }
+
+    pub(crate) fn apply_to_command(&self, cmd: &mut tokio::process::Command) {
+        cmd.current_dir(&self.path).arg("--cd").arg(&self.path);
     }
-    Ok(())
+
+    pub(crate) fn reverify(&self) -> Result<(), String> {
+        validate_windows_work_root(&self.path)?;
+        let identity = directory_identity(&self.path).map_err(|_| work_root_refusal())?;
+        if !identity.is_strong() || identity != self.identity {
+            return Err(work_root_refusal());
+        }
+        Ok(())
+    }
+}
+
+fn work_root_refusal() -> String {
+    duduclaw_agent::mcp_spawn_gate::engine_local_spawn_gate_error(WORK_ROOT_CONTAINS_HOME)
+}
+
+#[cfg(windows)]
+fn validate_windows_work_root(path: &Path) -> Result<(), String> {
+    use duduclaw_core::path_compare::{classify_windows_path, is_local_windows_path, WindowsPathKind};
+    let kind = path.to_str().map(classify_windows_path);
+    let text = if kind == Some(WindowsPathKind::Unc) {
+        Some(WORK_ROOT_NETWORK_FOLDER)
+    } else if kind != Some(WindowsPathKind::Absolute) || !path.is_absolute() {
+        Some(WORK_ROOT_MUST_BE_ABSOLUTE)
+    } else if !is_local_windows_path(path).unwrap_or(false) {
+        Some(WORK_ROOT_NETWORK_FOLDER)
+    } else {
+        None
+    };
+    match text {
+        Some(text) => Err(duduclaw_agent::mcp_spawn_gate::engine_local_spawn_gate_error(text)),
+        None => Ok(()),
+    }
 }
 
 #[cfg(not(windows))]
-fn work_root_contains_run(home_dir: &Path, work_root: &Path) -> bool {
-    let run = home_dir.join("run");
-    let mut runs = vec![run.clone()];
-    if let Ok(home) = std::fs::canonicalize(home_dir) { runs.push(home.join("run")); }
-    if let Ok(canonical) = std::fs::canonicalize(&run) { runs.push(canonical); }
-    let mut roots = vec![work_root.to_path_buf()];
-    if let Ok(canonical) = std::fs::canonicalize(work_root) { roots.push(canonical); }
-    if runs.iter().any(|run| roots.iter().any(|root| run.starts_with(root))) {
-        return true;
+fn validate_windows_work_root(_path: &Path) -> Result<(), String> { Ok(()) }
+
+fn directory_identity(path: &Path) -> std::io::Result<duduclaw_core::path_compare::FileIdentity> {
+    if !std::fs::metadata(path)?.is_dir() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a directory"));
     }
-    // The same directory under another spelling (a case-insensitive volume,
-    // a bind mount): compare the identity of every ancestor of `<home>/run`.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if let Ok(meta) = std::fs::metadata(work_root) {
-            let id = (meta.dev(), meta.ino());
-            for run in &runs {
-                for ancestor in run.ancestors() {
-                    if std::fs::metadata(ancestor).is_ok_and(|m| (m.dev(), m.ino()) == id) {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-    false
+    duduclaw_core::path_compare::file_identity(path)
 }
 
-#[cfg(windows)]
-fn work_root_contains_run(home_dir: &Path, work_root: &Path) -> bool {
-    // A drive-less root (`/` or `\`) depends on process cwd, which can be
-    // on a different volume from the home. Never admit that ambiguous whole
-    // drive as an employee workspace, even when today's cwd is elsewhere.
-    let mut components = work_root.components();
-    if matches!(components.next(), Some(std::path::Component::RootDir))
-        && components.next().is_none() {
-        return true;
-    }
-    windows_work_root_contains_run(home_dir, work_root).unwrap_or(true)
+/// Refuse roots containing `<home>/run`, ambiguous Windows paths, network
+/// namespaces and incomplete identity evidence. Only the protected run side
+/// may have missing components; the workspace must exist and have a strong
+/// identity. Keep both lexical and resolved run ancestors for alias denials.
+pub(crate) fn check_work_root(home_dir: &Path, work_root: &Path) -> Result<CheckedWorkRoot, String> {
+    check_work_root_with_identity(home_dir, work_root, directory_identity)
 }
 
-#[cfg(windows)]
-fn windows_work_root_contains_run(home_dir: &Path, work_root: &Path) -> std::io::Result<bool> {
-    use duduclaw_core::path_compare::{canonicalize_allow_missing, file_identity, starts_with};
-
-    fn identify(path: &Path) -> std::io::Result<Option<(u32, u64)>> {
-        match file_identity(path) {
-            Ok(id) => Ok(Some(id)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error),
-        }
-    }
-
-    let home = canonicalize_allow_missing(home_dir)?;
-    let root = canonicalize_allow_missing(work_root)?;
-    // Check home explicitly, including before run exists. Do not turn an
-    // inaccessible home or root into a successful lexical-only decision.
-    identify(home_dir)?;
-    let root_id = identify(work_root)?;
+fn check_work_root_with_identity(
+    home_dir: &Path,
+    work_root: &Path,
+    mut identify: impl FnMut(&Path) -> std::io::Result<duduclaw_core::path_compare::FileIdentity>,
+) -> Result<CheckedWorkRoot, String> {
+    use duduclaw_core::path_compare::{canonicalize, canonicalize_allow_missing, starts_with};
+    validate_windows_work_root(work_root)?;
+    let root = canonicalize(work_root).map_err(|_| work_root_refusal())?;
+    validate_windows_work_root(&root)?;
+    // Never permit NotFound here, including disappearance after canonicalize.
+    let root_id = identify(&root).map_err(|_| work_root_refusal())?;
+    if !root_id.is_strong() { return Err(work_root_refusal()); }
+    let home = canonicalize_allow_missing(home_dir).map_err(|_| work_root_refusal())?;
     let runs = [
-        std::path::absolute(home_dir)?.join("run"),
+        std::path::absolute(home_dir).map_err(|_| work_root_refusal())?.join("run"),
         home.join("run"),
-        canonicalize_allow_missing(&home_dir.join("run"))?,
+        canonicalize_allow_missing(&home_dir.join("run")).map_err(|_| work_root_refusal())?,
     ];
-    let roots = [std::path::absolute(work_root)?, root];
     for run in &runs {
-        for root in &roots {
-            if starts_with(run, root)? { return Ok(true); }
+        // Local and SMB identities must not be compared even when both APIs
+        // return 128-bit IDs. This also refuses a local home redirected to SMB.
+        validate_windows_work_root(run)?;
+        for candidate in [work_root, root.as_path()] {
+            if starts_with(run, candidate).map_err(|_| work_root_refusal())? {
+                return Err(work_root_refusal());
+            }
         }
-        // Include both the link's lexical ancestors and its target's
-        // ancestors, matching the Unix protection against aliases.
         for ancestor in run.ancestors() {
-            if let Some(id) = identify(ancestor)? {
-                if Some(id) == root_id { return Ok(true); }
+            match identify(ancestor) {
+                Ok(id) if !id.is_strong() || id == root_id => return Err(work_root_refusal()),
+                Ok(_) => {},
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                Err(_) => return Err(work_root_refusal()),
             }
         }
     }
-    Ok(false)
+    Ok(CheckedWorkRoot { path: root, identity: root_id })
 }
 
 /// Descriptor-relative directory access that never follows a symbolic link
@@ -970,6 +984,86 @@ mod tests {
         for (home, root) in [(invalid.as_path(), other.path()), (home.path(), invalid.as_path())] {
             let error = check_work_root(home, root).unwrap_err();
             assert_eq!(error, duduclaw_agent::mcp_spawn_gate::engine_local_spawn_gate_error(WORK_ROOT_CONTAINS_HOME));
+        }
+    }
+
+    #[test]
+    fn work_root_removed_between_resolution_and_identity_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let home = base.path().join("home");
+        let root = base.path().join("workspace");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        let canonical = duduclaw_core::path_compare::canonicalize(&root).unwrap();
+        let mut first = true;
+        let error = check_work_root_with_identity(&home, &root, |path| {
+            if first {
+                first = false;
+                assert_eq!(path, canonical);
+                std::fs::remove_dir(path).unwrap();
+            }
+            directory_identity(path)
+        }).unwrap_err();
+        assert!(!first, "identity lookup must follow canonicalization");
+        assert!(duduclaw_agent::mcp_spawn_gate::is_engine_local_spawn_gate_error(&error));
+    }
+
+    #[test]
+    fn checked_work_root_refuses_replacement_before_spawn() {
+        let base = tempfile::tempdir().unwrap();
+        let home = base.path().join("home");
+        let root = base.path().join("workspace");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        let checked = check_work_root(&home, &root).unwrap();
+        checked.reverify().unwrap();
+        // Keep the original inode/file ID live to prevent immediate ID reuse.
+        std::fs::rename(&root, base.path().join("original")).unwrap();
+        assert!(checked.reverify().is_err(), "missing root must refuse");
+        std::fs::create_dir(&root).unwrap();
+        let error = checked.reverify().unwrap_err();
+        assert!(duduclaw_agent::mcp_spawn_gate::is_engine_local_spawn_gate_error(&error));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_drive_relative_and_root_relative_work_roots_are_refused() {
+        let home = tempfile::tempdir().unwrap();
+        for root in ["C:", r"C:foo", r"\foo", "/foo", "foo", "/", r"\"] {
+            let error = check_work_root(home.path(), Path::new(root)).unwrap_err();
+            assert_eq!(error, duduclaw_agent::mcp_spawn_gate::engine_local_spawn_gate_error(
+                WORK_ROOT_MUST_BE_ABSOLUTE));
+            assert!(!error.contains(home.path().to_str().unwrap()));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_unc_work_roots_are_refused_before_filesystem_access() {
+        let home = tempfile::tempdir().unwrap();
+        for root in [r"\\server\share\x", r"\\?\UNC\s\sh\x", r"\\localhost\C$\home"] {
+            let error = check_work_root(home.path(), Path::new(root)).unwrap_err();
+            assert_eq!(error, duduclaw_agent::mcp_spawn_gate::engine_local_spawn_gate_error(
+                WORK_ROOT_NETWORK_FOLDER));
+            assert!(!error.contains(root));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_weak_identity_cannot_accept_a_work_root() {
+        use duduclaw_core::path_compare::FileIdentity;
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        for weak_at in [0, 1] {
+            let mut calls = 0;
+            let error = check_work_root_with_identity(home.path(), workspace.path(), |path| {
+                let weak = calls == weak_at;
+                calls += 1;
+                if weak { Ok(FileIdentity::WindowsLegacy { volume: 1, index: 2 }) }
+                else { directory_identity(path) }
+            }).unwrap_err();
+            assert!(duduclaw_agent::mcp_spawn_gate::is_engine_local_spawn_gate_error(&error));
         }
     }
 }
