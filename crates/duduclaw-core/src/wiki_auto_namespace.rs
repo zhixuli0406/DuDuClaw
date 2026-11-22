@@ -41,6 +41,17 @@ pub fn segment_opens_as(segment: &str, name: &str) -> bool {
     fold_segment(segment) == fold_segment(name)
 }
 
+/// Log a denied alias once per caller/folder pair, without page content.
+pub fn warn_denied_alias(caller: Option<&str>, folder: &str) {
+    type Pair = (Option<String>, String);
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<Pair>>> = std::sync::OnceLock::new();
+    if let Ok(mut warned) = WARNED.get_or_init(Default::default).lock() {
+        if warned.insert((caller.map(str::to_owned), folder.to_owned())) {
+            tracing::warn!(caller = ?caller, folder = %folder, "filesystem-equivalent alias is not an exact identity; access denied");
+        }
+    }
+}
+
 /// Detect ambiguous namespace declarations, including entries with no read
 /// filter or write mode. Log each ambiguous identity once per process, even
 /// when the policy is reloaded for every access. Callers must deny it.

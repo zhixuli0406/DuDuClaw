@@ -77,7 +77,14 @@ fn shared_policy_digest(home: &Path, page_path: &str) -> Option<String> {
         let first = matches.next();
         // Ambiguous filesystem-equivalent declarations cannot attest a source.
         if matches.next().is_some() { return None; }
-        match first { Some((_, value)) => Some(value.as_table()?), None => None }
+        match first {
+            Some((key, _)) if key != namespace => {
+                duduclaw_core::wiki_auto_namespace::warn_denied_alias(None, namespace);
+                return None;
+            }
+            Some((_, value)) => Some(value.as_table()?),
+            None => None,
+        }
     } else { None };
     let mode = match declared.and_then(|entry| entry.get("mode")) {
         Some(value) => value.as_str()?,
@@ -518,6 +525,20 @@ impl CausalStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_policy_digest_denies_namespace_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let wiki = dir.path().join("shared/wiki");
+        std::fs::create_dir_all(&wiki).unwrap();
+        for (key, alias) in [("café", "cafe\u{301}"), ("cafe\u{301}", "café")] {
+            std::fs::write(wiki.join(".scope.toml"), format!(
+                "[namespaces.\"{key}\"]\nmode = 'agent_writable'\n"
+            )).unwrap();
+            assert!(shared_policy_digest(dir.path(), &format!("{alias}/x.md")).is_none());
+            assert!(shared_policy_digest(dir.path(), &format!("{key}/x.md")).is_some());
+        }
+    }
 
     #[test]
     fn causal_ingest_canonical_separators_share_agent_and_shared_identity() {
