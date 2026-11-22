@@ -7339,6 +7339,18 @@
       "identity": "test",
       "migration": "test_only",
       "rationale": "Runs cmd.exe mklink /J to create a junction as a Windows test fixture for work-root verification."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/runtime/codex/owned_home.rs::tests::windows_local_work_root_stores_handle_final_path",
+      "apis": {
+        "command_constructor": 1
+      },
+      "identity": "test",
+      "migration": "test_only",
+      "effects": [
+        "process_spawn"
+      ],
+      "rationale": "Windows regression test inspects the constructed work-root Command cwd and argv without spawning a child."
     }
   ]
 }
