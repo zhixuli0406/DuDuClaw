@@ -425,6 +425,9 @@ pub(crate) async fn handle_wiki_share_in(
 
     let target = match duduclaw_memory::wiki_path::resolve_wiki_page(&wiki_dir, page_path, false) {
         Ok(target) if !target.is_auto => target,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return tool_error(&format!("Page not found in your wiki: {}", page_path));
+        }
         _ => return tool_error(WIKI_AUTO_NAMESPACE_REFUSED),
     };
     let page_path = target.id.as_str();

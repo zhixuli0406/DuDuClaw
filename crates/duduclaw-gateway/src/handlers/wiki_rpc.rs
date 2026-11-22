@@ -97,7 +97,7 @@ impl MethodHandler {
             return WsFrame::error_response("", "Missing 'page_path' parameter");
         }
         let target = match duduclaw_memory::wiki_path::resolve_wiki_page(&wiki_dir, page_path, false) {
-            Ok(target) if target.is_auto => target,
+            Ok(target) if target.is_auto && target.exists => target,
             _ => return WsFrame::error_response("", "Auto page not found"),
         };
         let page_path = target.id.as_str();
@@ -137,7 +137,7 @@ impl MethodHandler {
             return WsFrame::error_response("", "Missing 'page_path' parameter");
         }
         let target = match duduclaw_memory::wiki_path::resolve_wiki_page(&wiki_dir, page_path, false) {
-            Ok(target) if target.is_auto => target,
+            Ok(target) if target.is_auto && target.exists => target,
             _ => return WsFrame::error_response("", "Auto page not found"),
         };
         let page_path = target.id.as_str();
@@ -201,7 +201,7 @@ impl MethodHandler {
             return WsFrame::error_response("", "Missing 'page_path' parameter");
         }
         let target = match duduclaw_memory::wiki_path::resolve_wiki_page(&wiki_dir, page_path, false) {
-            Ok(target) if target.is_auto => target,
+            Ok(target) if target.is_auto && target.exists => target,
             _ => return WsFrame::error_response("", "Auto page not found"),
         };
         let page_path = target.id.as_str();
