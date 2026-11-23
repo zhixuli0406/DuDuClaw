@@ -254,7 +254,6 @@ pub async fn install_owned(home: &Path, call: &AuthorizedToolCall, agent: &str, 
     }).await.map_err(|_| "技能安裝工作失敗。".to_string())??;
     let scope = format!("agent:{agent}");
     let store = crate::custom_skills::CustomSkillStore::open(home)?;
-    store.curation_upsert_seen(name, &scope, &chrono::Utc::now().to_rfc3339()).await?;
     let digest = duduclaw_agent::skill_hub::sha256_hex(&gated.content);
     store.record_hub_signature(name, &scope, &signature, &digest).await?;
     Ok(HubInstallReport { hub: hub.into(), skill_name: name.into(), scope: agent.into(), risk_level, findings,

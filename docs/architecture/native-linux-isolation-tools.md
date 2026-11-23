@@ -145,8 +145,8 @@ record's own `Employee` grant (plus exactly one own `agent:` Confined wiki for
 `skill_extract`), take no subject selector (a legacy `agent_id` must equal the
 bound employee; `target_agent` refuses), parse skill bytes only in the E worker,
 and publish only into the caller's own wiki or own `SKILLS/`. Global graduation
-needs the dashboard admin card; the curator (D-H4) reports and runs only over the
-caller's own skills.
+needs the dashboard admin card; the deprecated curator status (D-H4) is read-only
+and reports only the caller's own archived skills. `run=true` is ignored.
 
 H13 (v1.81): `spawn_agent` and `spawn_ephemeral` require no workspace grant and no
 new capability grant. They are eligible with the record's own `Employee` grant
@@ -415,8 +415,8 @@ The matrix is checked for unique tool names, complete policy inventory, and exac
 | `skill_synthesis_status` | Resource → AuthorizedToolCall → original live employee handler |
 | `skill_synthesis_run` | Resource → original authenticated host orchestration; checked E parser required; EmployeeScope + own Employee, no Workspace; own events only, host provider call under the employee's own runtime/budget, E prepares and scans, published no-clobber into the caller's own SKILLS (H12c) |
 | `skill_hub_install` | Resource → original authenticated host orchestration; checked E parser required; EmployeeScope + own Employee + signed PublicOrigins; host-selected hub archive via the protected public fetch, expanded only by E, single SKILL.md scanned by E before approval and at install, published no-clobber into the caller's own SKILLS (H12b) |
-| `skill_curator_status` | Resource → original authenticated host orchestration; checked E parser required; EmployeeScope + own Employee; status and `run=true` limited to the caller's own skills (D-H4), run admin-approved, report returned and not published to the shared wiki (H12a) |
-| `skill_pin` | Resource → AuthorizedToolCall → original live employee handler |
+| `skill_curator_status` | Resource → original authenticated host orchestration; checked E parser required; EmployeeScope + own Employee; deprecated until v1.86.0; read-only archive status limited to the caller's own skills (D-H4), `run` ignored, no maintenance or wiki report |
+| `skill_pin` | Resource → AuthorizedToolCall → original live employee handler; deprecated until v1.86.0. Only `pinned=true` on an archived skill restores; pinning otherwise has no effect. Linux and macOS restoration in both modes uses directory descriptors, publishes the opened file bytes and refuses overwrites. Employees may restore only their own scope; global and other agent scopes require an Admin operator. Unknown callers are denied; other platforms retain archives for manual recovery |
 | `notion_status` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
 | `notion_search` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
 | `notion_page_read` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
@@ -504,3 +504,17 @@ The matrix is checked for unique tool names, complete policy inventory, and exac
 | `channel_config_list` | Resource → selected exact settings scope → CONFIG_KEYS ∪ MCP_ACCESS_KEYS projection |
 | `channel_status` | Resource → selected exact channel/scope → scoped status/session read; MCP_STATUS_KEYS guild projection |
 | `pairing_manage` | Resource → selected exact subject → checked pairing state; finite list |
+
+Automatic curator staleness, archive moves and wiki reports have been removed.
+`[skill_curator]` is ignored with one warning per process. Startup recovery is
+restricted to the single-gateway lock holder and never overwrites a destination.
+Linux and macOS recovery in both modes binds the archive path to its scope and
+walks directories without following symlinks. The opened regular file stays open
+while its bytes are copied to a hidden temporary file and synced. Publication
+uses `RENAME_NOREPLACE` on Linux or `RENAME_EXCL` on macOS. After syncing the
+destination directory, recovery keeps the archive copy; the database row becomes
+Active, so the copy is inert. Other platforms retain archives for manual recovery.
+Existing `skill-proposals/*.archive-intent` files
+are left untouched. Status never exposes filesystem paths; employees may list
+and restore only their own scope. Admin operators may access all scopes, and
+unknown identities are refused.

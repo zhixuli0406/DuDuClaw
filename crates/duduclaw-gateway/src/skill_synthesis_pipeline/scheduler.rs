@@ -144,11 +144,6 @@ async fn run_periodic(home_dir: PathBuf) {
             }
         }
 
-        // G5 curator: deterministic skill-maintenance pass. Independently
-        // gated by `[skill_curator] enabled` + its own 24h guard; errors are
-        // logged inside and never abort this loop.
-        crate::skill_lifecycle::curator::maybe_run(&home_dir).await;
-
         tokio::time::sleep(POLL).await;
     }
 }

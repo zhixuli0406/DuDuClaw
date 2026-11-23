@@ -1,5 +1,24 @@
 # Dashboard settings map (v1.80.0)
 
+## Skill archive recovery
+
+Automatic skill staleness and archiving have been removed. `[skill_curator]`
+is accepted but ignored, with one warning per process. Gateway startup restores
+recorded archived skills without overwriting existing destinations; conflicts
+remain in `skills-archive` for manual recovery. Linux and macOS restore flat global and agent skills in both modes through directory
+descriptors, without following symlinked components. Other platforms retain archives
+for manual recovery.
+
+| Deprecated tool (removal target v1.86.0) | Behaviour |
+|---|---|
+| `skill_curator_status` | Read-only archive recovery status. `run=true` is accepted but ignored with a notice. Only skill names and scopes are shown. Employees see only their own scope; Admin operators may see all |
+| `skill_pin` | `pinned=true` restores a recorded archived skill without overwriting; otherwise pinning has no effect. Restoration is supported on Linux and macOS. Employees may restore only their own scope; global and other agent scopes require an Admin operator |
+
+Use `skill_list` to inspect loaded skills. Resolve a destination conflict before
+retrying restoration; keep the archived file until recovery succeeds. Existing
+authorization and employee scope gates still apply to both compatibility tools.
+
+
 ## Automation → Run, schedule and file review limits (v1.82.0)
 
 These three cards are Admin-only and save through the locked configuration writer. Changes apply to subsequent runs, checks or approval requests without a restart.

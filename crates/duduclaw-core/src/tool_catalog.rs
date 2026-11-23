@@ -69,11 +69,8 @@ pub struct ToolCatalogEntry {
     pub effect: crate::tool_effect::ToolEffect,
 }
 
-/// MCP tool names that are deprecated aliases of a merged entry point: still
-/// listed and callable, flagged `deprecated: true` in the catalog. Empty since
-/// v1.69.0 removed the last window's aliases (see [`REMOVED_MCP_TOOLS`]); kept
-/// so the next deprecation is a one-line diff.
-pub const DEPRECATED_MCP_TOOLS: &[&str] = &[];
+/// Compatibility tools retained until v1.86.0; automatic curation was removed.
+pub const DEPRECATED_MCP_TOOLS: &[&str] = &["skill_curator_status", "skill_pin"];
 
 /// Is this MCP tool name a deprecated alias? Exact match, never a prefix or
 /// substring test (coding convention 2).
@@ -1507,7 +1504,7 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "skill_pin",
-        "Pin/unpin a skill for the curator",
+        "[deprecated → skill_list] Restore an archived skill; pinning has no effect",
         "admin",
         "skill",
     ),
@@ -1525,7 +1522,7 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "skill_curator_status",
-        "Skill curator lifecycle state",
+        "[deprecated → skill_list] Read-only archive recovery status",
         "admin",
         "skill",
     ),
@@ -2069,6 +2066,16 @@ mod tests {
         for kept in ["shared_wiki_delete", "wiki_share"] {
             assert!(catalog.iter().any(|e| e.name == kept), "{kept}");
             assert!(removed_mcp_tool(kept).is_none(), "{kept}");
+        }
+    }
+
+    #[test]
+    fn curator_compatibility_tools_remain_deprecated_and_listed() {
+        for name in ["skill_curator_status", "skill_pin"] {
+            assert!(is_deprecated_tool(name));
+            let entry = builtin_tool_catalog().into_iter().find(|tool| tool.name == name).unwrap();
+            assert!(entry.deprecated);
+            assert!(entry.description.starts_with("[deprecated → "));
         }
     }
 
