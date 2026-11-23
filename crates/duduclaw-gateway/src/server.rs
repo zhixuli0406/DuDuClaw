@@ -1321,6 +1321,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             Err(error) => warn!(%error, "first administrator two-factor setup state unreadable; setup refused"),
         }
     }
+    crate::skill_lifecycle::curator::restore_on_startup(&home_dir).await;
+
     // RM-136 (M5): deliver `users.mfa_reset` audit rows a previous process
     // committed but did not deliver (held rows included). Only the gateway
     // lock holder drains.

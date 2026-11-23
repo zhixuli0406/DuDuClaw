@@ -1,5 +1,24 @@
 # MCP tools: what an agent is shown, and why
 
+## Skill archive recovery
+
+Automatic skill staleness and archiving have been removed. `[skill_curator]`
+is accepted but ignored, with one warning per process. Gateway startup restores
+recorded archived skills without overwriting existing destinations; conflicts
+remain in `skills-archive` for manual recovery. Linux protected mode also restores flat
+global and agent skills without following symlinked components. Other targets
+refuse protected restoration.
+
+| Deprecated tool (removal target v1.86.0) | Behaviour |
+|---|---|
+| `skill_curator_status` | Read-only archive recovery status. `run=true` is accepted but ignored with a notice. Protected callers see only their own scope |
+| `skill_pin` | `pinned=true` restores a recorded archived skill without overwriting; otherwise pinning has no effect. Protected restoration is supported on Linux for global and agent skills |
+
+Use `skill_list` to inspect loaded skills. Resolve a destination conflict before
+retrying restoration; keep the archived file until recovery succeeds. Existing
+authorization and employee scope gates still apply to both compatibility tools.
+
+
 DuDuClaw's MCP server advertises its tools through the standard `tools/list`
 call. This page explains two things that are easy to get wrong:
 

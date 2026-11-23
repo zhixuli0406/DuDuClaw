@@ -447,14 +447,14 @@ async fn handle_skill_hub_install_owned(params: &Value, home_dir: &Path, caller_
     }
 }
 
-/// Report curator lifecycle state; optionally force a pass.
+/// Read-only archive recovery status; legacy run is ignored.
 pub(crate) async fn handle_skill_curator_status(params: &Value, home_dir: &Path) -> Value {
     curator_status(params, home_dir, None).await
 }
 
 /// H12a / D-H4: the protected (isolated) curator. `owner` is the
 /// capability-bound employee of the isolated call — never an argument — and
-/// both the report and a `run=true` pass are limited to its own skills.
+/// the read-only report is limited to its own skills; run is ignored.
 pub(crate) async fn handle_skill_curator_status_owned(params: &Value, home_dir: &Path, owner: &str) -> Value {
     curator_status(params, home_dir, Some(owner)).await
 }
@@ -476,28 +476,9 @@ async fn curator_status(params: &Value, home_dir: &Path, owner: Option<&str>) ->
         Err(e) => return mcp_error(&format!("curation store: {e}")),
     };
 
-    let force_run = params.get("run").and_then(|v| v.as_bool()).unwrap_or(false);
-    let cfg = curator::CuratorConfig::load_from_home(home_dir);
-    let mut pass_summary = String::new();
-    if force_run {
-        let pass = match owner {
-            Some(agent) => curator::run_owned_pass(home_dir, &store, &cfg, chrono::Utc::now(), agent).await,
-            None => curator::run_pass(home_dir, &store, &cfg, chrono::Utc::now()).await,
-        };
-        match pass {
-            Ok(report) => {
-                pass_summary = format!(
-                    "Pass executed: {} newly stale, {} archived, {} reactivated, {} error(s).\n\n",
-                    report.newly_stale.len(),
-                    report.newly_archived.len(),
-                    report.reactivated.len(),
-                    report.errors.len()
-                );
-            }
-            Err(e) => return mcp_error(&format!("curator pass failed: {e}")),
-        }
+    if let Ok(text) = std::fs::read_to_string(home_dir.join("config.toml")) {
+        curator::warn_ignored_config(&text);
     }
-
     let mut rows = match store.curation_list().await {
         Ok(r) => r,
         Err(e) => return mcp_error(&e),
@@ -507,58 +488,20 @@ async fn curator_status(params: &Value, home_dir: &Path, owner: Option<&str>) ->
         rows.retain(|row| row.scope == scope);
     }
 
-    let mut stale = Vec::new();
-    let mut archived = Vec::new();
-    let mut unmanaged = Vec::new();
-    let mut pinned = Vec::new();
-    for r in &rows {
-        let key = format!("{} [{}]", r.skill_name, r.scope);
-        if r.pinned {
-            pinned.push(key.clone());
-        }
-        match r.status {
-            CurationStatus::Stale => stale.push(key),
-            CurationStatus::Archived => archived.push(key),
-            // Nested layouts the curator can't manage — tracked, never
-            // archived (flagged once by the pass).
-            CurationStatus::Unmanaged => unmanaged.push(key),
-            CurationStatus::Active => {}
-        }
-    }
-
-    fn block(title: &str, items: &[String]) -> String {
-        if items.is_empty() {
-            format!("**{title}**: (none)\n")
-        } else {
-            format!(
-                "**{title}** ({}):\n{}\n",
-                items.len(),
-                items.iter().map(|i| format!("- {i}\n")).collect::<String>()
-            )
-        }
-    }
-
-    let text = format!(
-        "{}Curator status — {} tracked skill(s){} (enabled: {}, stale ≥ {}d, archive ≥ {}d)\n\n{}{}{}{}",
-        pass_summary,
-        rows.len(),
-        owned_scope.as_deref().map(|scope| format!(" in [{scope}]")).unwrap_or_default(),
-        cfg.enabled,
-        cfg.stale_days,
-        cfg.archive_days,
-        block("Stale", &stale),
-        block("Archived (recoverable via skill_pin)", &archived),
-        block(
-            "Unmanaged layout (tracked only, never auto-archived)",
-            &unmanaged
-        ),
-        block("Pinned", &pinned),
-    );
-    mcp_text(&text)
+    let archived = rows.iter().filter(|r| r.status == CurationStatus::Archived)
+        .map(|r| format!("- {} [{}]: {}", r.skill_name, r.scope,
+            r.archived_path.as_deref().unwrap_or("archive path missing")))
+        .collect::<Vec<_>>();
+    let notice = if params.get("run").and_then(Value::as_bool).unwrap_or(false) {
+        "run=true ignored: automatic skill archiving was removed.\n"
+    } else { "" };
+    mcp_text(&format!(
+        "{notice}skill_curator_status is deprecated (removal v1.86.0). Read-only archive status.\n{} archived skill(s){}\n{}\nRestore with skill_pin {{skill_name, scope, pinned:true}} (scope: global or agent id). If the destination exists, keep the archive and resolve the conflict manually; never overwrite it. Protected restore is supported on Linux for global and agent skills.",
+        archived.len(), owned_scope.as_deref().map(|s| format!(" in [{s}]")).unwrap_or_default(),
+        archived.join("\n")))
 }
 
-/// Pin / unpin a skill (pin exempts from stale+archive; pinning an archived
-/// skill restores it).
+/// Deprecated compatibility tool: pinned=true restores an archived skill.
 pub(crate) async fn handle_skill_pin(params: &Value, home_dir: &Path) -> Value {
     use duduclaw_gateway::custom_skills::CustomSkillStore;
     use duduclaw_gateway::skill_lifecycle::curator;

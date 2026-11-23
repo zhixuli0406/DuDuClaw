@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Removed
+
+- 技能不再因為一段時間沒使用而被標成過時或自動封存；`[skill_curator]` 設定已無作用。
+
+### Changed
+
+- 升級後，先前被自動封存的技能會自動搬回原位並恢復使用（同名技能已存在時保留封存檔，不覆蓋）。
+
+### Deprecated
+
+- `skill_curator_status` 與 `skill_pin` 預計於 v1.86.0 移除：前者改為唯讀封存清單，`run` 參數無作用；後者僅保留 `pinned=true` 還原封存技能，其餘釘選操作無作用。
+
 ### Fixed
 
 - 首次下載知識庫向量模型、去識別化 AI 偵測模型或 Kokoro 語音模型時，因 Hugging Face 改用新的下載主機而出現「download redirect refused」並下載失敗；現在接受 Hugging Face 的 hf.co 下載主機，檔案仍以固定雜湊驗證。

@@ -142,16 +142,16 @@ pub(super) const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "skill_curator_status",
-        description: "Report the G5 curator lifecycle state: stale (30d unused), archived (90d, recoverable), pinned, and approaching-stale skills. Optionally force a maintenance pass now.",
+        description: "[deprecated → skill_list] Read-only archive recovery status. Automatic staleness and archiving were removed; run is ignored. Removal target v1.86.0.",
         params: &[ParamDef {
             name: "run",
-            description: "true = run a curator pass immediately (default: false, report only)",
+            description: "Ignored compatibility parameter; automatic skill archiving was removed.",
             required: false,
         }],
     },
     ToolDef {
         name: "skill_pin",
-        description: "Pin or unpin a skill for the curator. Pinned skills are exempt from the 30-day stale flag and 90-day archive; pinning an archived skill restores its file from the archive.",
+        description: "[deprecated → skill_list] Pinning has no effect. pinned=true still restores an archived skill without overwriting an existing destination. Removal target v1.86.0.",
         params: &[
             ParamDef {
                 name: "skill_name",
@@ -165,7 +165,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
             },
             ParamDef {
                 name: "pinned",
-                description: "true (default) to pin, false to unpin",
+                description: "true (default) restores an archived skill; otherwise no effect",
                 required: false,
             },
         ],
