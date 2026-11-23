@@ -512,9 +512,9 @@ Linux and macOS recovery in both modes binds the archive path to its scope and
 walks directories without following symlinks. The opened regular file stays open
 while its bytes are copied to a hidden temporary file and synced. Publication
 uses `RENAME_NOREPLACE` on Linux or `RENAME_EXCL` on macOS. After syncing the
-destination directory, recovery removes the archive only if its device and inode
-still match; a replacement is retained with a warning. Other platforms retain
-archives for manual recovery. Existing `skill-proposals/*.archive-intent` files
+destination directory, recovery keeps the archive copy; the database row becomes
+Active, so the copy is inert. Other platforms retain archives for manual recovery.
+Existing `skill-proposals/*.archive-intent` files
 are left untouched. Status never exposes filesystem paths; employees may list
 and restore only their own scope. Admin operators may access all scopes, and
 unknown identities are refused.

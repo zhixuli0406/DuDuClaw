@@ -115,10 +115,15 @@ mod tests {
         restore_on_startup(home.path()).await;
         assert!(home.path().join("skills-archive/global/notes.md").exists());
         duduclaw_core::gateway_instance::acquire(home.path()).unwrap();
+        let archive_bytes = std::fs::read(home.path().join("skills-archive/global/notes.md")).unwrap();
         restore_on_startup(home.path()).await;
         restore_on_startup(home.path()).await;
         assert!(home.path().join("skills/notes.md").is_file());
-        assert!(!home.path().join("skills-archive/global/notes.md").exists());
+        assert_eq!(std::fs::read(home.path().join("skills-archive/global/notes.md")).unwrap(), archive_bytes);
+        assert_eq!(std::fs::read_dir(home.path().join("skills")).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(home.path().join("skills-archive/global")).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(home.path().join("skills")).unwrap().filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".restore-")).count(), 0);
         let rec = store.curation_get("notes", SCOPE_GLOBAL).await.unwrap().unwrap();
         assert_eq!(rec.status, CurationStatus::Active);
         assert!(rec.archived_path.is_none());
@@ -200,6 +205,7 @@ mod tests {
         assert!(set_pin(home.path(), &store, "notes", SCOPE_GLOBAL, false).await.unwrap().contains("no effect"));
         assert!(home.path().join("skills-archive/global/notes.md").exists());
         assert!(set_pin(home.path(), &store, "notes", SCOPE_GLOBAL, true).await.unwrap().contains("restored"));
+        assert!(home.path().join("skills-archive/global/notes.md").exists());
         assert!(!store.curation_get("notes", SCOPE_GLOBAL).await.unwrap().unwrap().pinned);
     }
 }

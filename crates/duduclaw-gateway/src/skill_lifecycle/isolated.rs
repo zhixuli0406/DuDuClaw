@@ -50,11 +50,6 @@ fn directory(home: &std::fs::File, parts: &[&str], create: bool) -> Result<std::
 /// Windows deliberately refuses restoration: path-based moves cannot enforce the
 /// descriptor-bound checks used on Unix. Keep the archive for manual recovery.
 pub(crate) fn restore_archived(home: &Path, scope: &str, archived: &Path) -> Result<PathBuf, String> {
-    restore_archived_with_hook(home, scope, archived, || {})
-}
-
-fn restore_archived_with_hook(home: &Path, scope: &str, archived: &Path,
-    before_cleanup: impl FnOnce()) -> Result<PathBuf, String> {
     let (archive_scope, parts) = if scope == "global" {
         ("global".to_owned(), vec!["skills"])
     } else {
@@ -70,11 +65,11 @@ fn restore_archived_with_hook(home: &Path, scope: &str, archived: &Path,
     }
     #[cfg(unix)]
     {
-        restore_unix(home, &archive_scope, &parts, filename, before_cleanup)
+        restore_unix(home, &archive_scope, &parts, filename)
     }
     #[cfg(not(unix))]
     {
-        let _ = (parts, before_cleanup);
+        let _ = parts;
         Err("safe skill restore requires Unix; archive retained for manual recovery".into())
     }
 }
@@ -107,10 +102,9 @@ fn publish_noreplace(dir: &std::fs::File, temp: &str, filename: &str) -> Result<
 }
 
 #[cfg(unix)]
-fn restore_unix(home: &Path, archive_scope: &str, parts: &[&str], filename: &str,
-    before_cleanup: impl FnOnce()) -> Result<PathBuf, String> {
+fn restore_unix(home: &Path, archive_scope: &str, parts: &[&str], filename: &str) -> Result<PathBuf, String> {
     use std::{io::{Read, Write}, os::{fd::{AsRawFd, FromRawFd}, unix::fs::OpenOptionsExt}};
-    use nix::{fcntl::{openat, AtFlags, OFlag}, sys::stat::{fstat, fstatat, Mode, SFlag},
+    use nix::{fcntl::{openat, OFlag}, sys::stat::{fstat, Mode, SFlag},
         unistd::{unlinkat, UnlinkatFlags}};
     let root = std::fs::OpenOptions::new().read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -119,10 +113,10 @@ fn restore_unix(home: &Path, archive_scope: &str, parts: &[&str], filename: &str
     let fd = openat(Some(source.as_raw_fd()), filename,
         OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK,
         Mode::empty()).map_err(|e| e.to_string())?;
-    // SAFETY: exactly one owned descriptor from openat, held through archive cleanup.
+    // SAFETY: exactly one owned descriptor from openat.
     let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-    let original = fstat(file.as_raw_fd()).map_err(|e| e.to_string())?;
-    if SFlag::from_bits_truncate(original.st_mode) & SFlag::S_IFMT != SFlag::S_IFREG {
+    let metadata = fstat(file.as_raw_fd()).map_err(|e| e.to_string())?;
+    if SFlag::from_bits_truncate(metadata.st_mode) & SFlag::S_IFMT != SFlag::S_IFREG {
         return Err("archive source is not a regular file".into());
     }
     let mut bytes = Vec::new();
@@ -149,17 +143,7 @@ fn restore_unix(home: &Path, archive_scope: &str, parts: &[&str], filename: &str
         }
         return Err(error);
     }
-    // Tests replace the archive dirent here, after publication but before the identity check.
-    before_cleanup();
-    match fstatat(Some(source.as_raw_fd()), filename, AtFlags::AT_SYMLINK_NOFOLLOW) {
-        Ok(current) if current.st_dev == original.st_dev && current.st_ino == original.st_ino => {
-            if let Err(error) = unlinkat(Some(source.as_raw_fd()), filename, UnlinkatFlags::NoRemoveDir)
-                .map_err(|e| e.to_string()).and_then(|()| source.sync_all().map_err(|e| e.to_string())) {
-                tracing::warn!(%error, "skill restored; archive cleanup unconfirmed");
-            }
-        }
-        _ => tracing::warn!("skill restored; archive dirent changed or unavailable, leaving it untouched"),
-    }
+    // Keep the archive copy intentionally; the DB row becomes Active, so this copy is inert.
     drop(file);
     let mut restored = home.to_path_buf();
     for part in parts { restored.push(part); }
@@ -230,7 +214,7 @@ mod tests {
         let restored = restore_archived(home.path(), "agent:writer", &archived).unwrap();
         assert_eq!(restored, home.path().join("agents/writer/SKILLS/notes.md"));
         assert_eq!(std::fs::read(restored).unwrap(), bytes);
-        assert!(!archived.exists());
+        assert_eq!(std::fs::read(&archived).unwrap(), bytes);
         assert_eq!(std::fs::read(intent).unwrap(), b"keep intent");
     }
 
@@ -301,18 +285,14 @@ mod tests {
     }
 
     #[test]
-    fn restore_publishes_opened_bytes_and_keeps_replaced_archive_dirent() {
+    fn restore_publishes_opened_bytes_and_keeps_archive_copy() {
         let home = tempfile::tempdir().unwrap();
         let archived = home.path().join("skills-archive/global/notes.md");
-        let replacement = home.path().join("replacement.md");
         std::fs::create_dir_all(archived.parent().unwrap()).unwrap();
         std::fs::write(&archived, b"verified original").unwrap();
-        std::fs::write(&replacement, b"unverified replacement").unwrap();
-        let restored = restore_archived_with_hook(home.path(), "global", &archived, || {
-            std::fs::rename(&replacement, &archived).unwrap();
-        }).unwrap();
+        let restored = restore_archived(home.path(), "global", &archived).unwrap();
         assert_eq!(std::fs::read(restored).unwrap(), b"verified original");
-        assert_eq!(std::fs::read(archived).unwrap(), b"unverified replacement");
+        assert_eq!(std::fs::read(archived).unwrap(), b"verified original");
         assert_eq!(std::fs::read_dir(home.path().join("skills")).unwrap().count(), 1);
     }
 
