@@ -13,6 +13,7 @@
 ### Deprecated
 
 - `skill_curator_status` 與 `skill_pin` 預計於 v1.86.0 移除：前者改為唯讀封存清單，`run` 參數無作用；後者僅保留 `pinned=true` 還原封存技能，其餘釘選操作無作用。
+## [1.84.1] - 2026-11-23 — 本機模型首次下載修正
 
 ### Fixed
 
