@@ -3542,6 +3542,7 @@ export interface AgentUpdateParams {
   max_active_skills?: number;
   max_silence_hours?: number;
   skill_token_budget?: number;
+  skill_budget_unlimited?: boolean;
 
   // Proactive ([proactive] section, nested object) + timezone / max_turns.
   proactive?: Partial<ProactiveSettings> & {
@@ -3773,6 +3774,7 @@ export interface AgentDetailV168 {
   evolution?: {
     max_active_skills?: number;
     skill_token_budget?: number;
+    skill_budget_unlimited?: boolean;
     skill_synthesis_enabled?: boolean;
     skill_synthesis_threshold?: number;
     skill_synthesis_cooldown_hours?: number;

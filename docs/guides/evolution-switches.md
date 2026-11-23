@@ -6,6 +6,10 @@ synthesising new skills, and exploring underused domains. Each of those paths
 has its own switch. This guide is the single map of which switch governs what, and how
 to freeze an agent completely.
 
+## Skill content budget
+
+`[evolution] skill_budget_unlimited` defaults to `false`, including when absent from an existing file. Administrators can enable **Unlimited skill content** in the employee's Skills settings. When enabled, every selected Layer 2 (full content) and Layer 1 (summary) skill is included regardless of `skill_token_budget`; layer selection stays unchanged. When disabled, `skill_token_budget` defaults to 2500 tokens and 0 excludes Layer 1/2 content; the Layer 0 names list remains uncapped. Selected skills that do not fit are listed in one “Skills omitted for length” footer (up to 10 names, then “and N more”). The legacy full-content path uses `max(10_000, skill_token_budget * 4)` bytes, preserving the previous 10 KB minimum, or no cap when unlimited is enabled; its truncation footer points to the employee settings. Unlimited content raises token cost and response time and can cause replies to fail when the model's context limit is exceeded.
+
 ## The master switch
 
 `agent.toml`:

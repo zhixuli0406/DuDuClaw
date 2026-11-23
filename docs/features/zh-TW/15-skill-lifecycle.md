@@ -10,6 +10,8 @@
 
 安裝檔案不等於占用啟用名額。同名技能合併後只保留一份（個人 > 部門 > 公司）。`[evolution] max_active_skills` 限制技能生命週期的啟用數（預設 5）；`skill_token_budget` 限制漸進載入的技能提示詞（預設 2500 tokens）。
 
+`[evolution] skill_budget_unlimited` 預設為 `false`，既有設定檔沒寫這個鍵時也一樣。管理員可在員工的「技能」設定開啟「技能內容不設上限」。開啟後，所有選中的 Layer 2（全文）及 Layer 1（摘要）都會帶入，不受 `skill_token_budget` 限制；分層選取規則不變。關閉時，`skill_token_budget` 預設 2500 tokens，0 代表不帶入 Layer 1／2 內容；Layer 0 技能名稱清單仍不設上限。選中卻因預算放不下的技能會集中列在一行「Skills omitted for length」提示中，最多列出 10 個名稱，其餘以「and N more」表示。舊的全文載入路徑上限改為 `max(10_000, skill_token_budget * 4)` bytes，至少保留原本的 10 KB；開啟不設上限則不裁減，裁減提示也會指向員工設定。每則回覆都會帶入所有選中的技能全文，token 費用與回應時間會增加，超過模型可接收的長度時回覆可能失敗。
+
 ---
 
 ## 比喻：學徒成為大師

@@ -105,6 +105,26 @@ pub fn read_max_input_tokens(agent_dir: &std::path::Path) -> Option<u64> {
 /// past the 200 K cliff alone.
 pub const DEFAULT_LEGACY_SKILL_BYTE_CAP: usize = 10_000;
 
+/// Preserve the historical minimum cap unless the administrator removes the cap.
+pub fn legacy_skill_byte_cap(evolution: &duduclaw_core::types::EvolutionConfig) -> usize {
+    if evolution.skill_budget_unlimited {
+        usize::MAX
+    } else {
+        DEFAULT_LEGACY_SKILL_BYTE_CAP.max((evolution.skill_token_budget as usize).saturating_mul(4))
+    }
+}
+
+/// One bounded preview shared by omission notices; Unicode names stay intact.
+pub fn skill_name_preview(names: &[&str]) -> String {
+    let mut preview = names.iter().take(10)
+        .map(|name| duduclaw_core::truncate_chars(name, 80))
+        .collect::<Vec<_>>().join(", ");
+    if names.len() > 10 {
+        preview.push_str(&format!(" (and {} more)", names.len() - 10));
+    }
+    preview
+}
+
 /// Render a sequence of (name, content) skills into a `Vec<String>` of
 /// `"## Skill: <name>\n<content>"` segments, capped at `max_bytes` total.
 ///
@@ -133,7 +153,7 @@ pub fn budgeted_legacy_skills(
     for (name, content) in ordered {
         let rendered = format!("## Skill: {name}\n{content}");
         let len = rendered.len();
-        if used + len <= max_bytes {
+        if len <= max_bytes.saturating_sub(used) {
             used += len;
             out.push(rendered);
         } else {
@@ -145,7 +165,7 @@ pub fn budgeted_legacy_skills(
     }
 
     let footer = if truncated_count > 0 {
-        let preview = truncated_names.join(", ");
+        let preview = skill_name_preview(&truncated_names);
         let suffix = if truncated_count > truncated_names.len() {
             format!(" (and {} more)", truncated_count - truncated_names.len())
         } else {
@@ -154,9 +174,8 @@ pub fn budgeted_legacy_skills(
         Some(format!(
             "## Skills truncated ({truncated_count})\n\
              [{preview}{suffix}] omitted to keep system prompt under \
-             {max_bytes} bytes — narrow the agent's skill set or migrate \
-             to progressive skill injection (channel_reply path) for \
-             relevance-ranked selection."
+             {max_bytes} bytes — an administrator can raise the skill budget \
+             or allow unlimited in the employee settings."
         ))
     } else {
         None
@@ -283,6 +302,35 @@ mod tests {
         std::fs::write(tmp.join("agent.toml"), "[agent]\nname = \"test\"\n").unwrap();
         assert_eq!(read_max_input_tokens(&tmp), None);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn legacy_cap_uses_employee_budget_with_historical_floor() {
+        let mut evo = duduclaw_core::types::EvolutionConfig::default();
+        for (budget, expected) in [(0, 10_000), (500, 10_000), (2500, 10_000), (5000, 20_000)] {
+            evo.skill_token_budget = budget;
+            assert_eq!(legacy_skill_byte_cap(&evo), expected);
+        }
+        evo.skill_token_budget = 0;
+        evo.skill_budget_unlimited = true;
+        assert_eq!(legacy_skill_byte_cap(&evo), usize::MAX);
+        let skills = vec![("large".into(), "文".repeat(20_000)), ("second".into(), "x".repeat(30_000))];
+        let (rendered, footer) = budgeted_legacy_skills(&skills, legacy_skill_byte_cap(&evo));
+        assert_eq!(rendered.len(), skills.len());
+        assert!(rendered[0].ends_with(&skills[0].1));
+        assert!(rendered[1].ends_with(&skills[1].1));
+        assert!(footer.is_none());
+    }
+
+    #[test]
+    fn omitted_name_preview_caps_count_and_preserves_unicode() {
+        let names: Vec<String> = (0..12).map(|i| format!("{i}{}", "技😀".repeat(100))).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let preview = skill_name_preview(&refs);
+        assert!(preview.ends_with("(and 2 more)"));
+        assert!(!preview.contains(&names[10]));
+        assert_eq!(preview.split(", ").count(), 10);
+        assert!(preview.starts_with(&duduclaw_core::truncate_chars(&names[0], 80)));
     }
 
     // ── #6.2b: budgeted skill renderer ──────────────────────────────────

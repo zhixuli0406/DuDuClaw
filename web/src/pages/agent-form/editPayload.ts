@@ -154,7 +154,7 @@ const FLAT_FORM_KEYS: ReadonlyArray<keyof AgentUpdateParams> = [
   'heartbeat_enabled', 'heartbeat_interval', 'heartbeat_cron',
   'can_create_agents', 'can_send_cross_agent', 'can_modify_own_skills', 'can_modify_own_soul', 'can_schedule_tasks',
   'timeout_ms', 'sandbox_enabled', 'network_access',
-  'gvu_enabled', 'max_active_skills', 'max_silence_hours', 'skill_token_budget',
+  'gvu_enabled', 'max_active_skills', 'max_silence_hours', 'skill_token_budget', 'skill_budget_unlimited',
 ];
 
 const CAP_LIST_KEYS: ReadonlyArray<keyof AgentCapabilities> = [

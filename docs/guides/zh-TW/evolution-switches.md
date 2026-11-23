@@ -2,6 +2,10 @@
 
 DuDuClaw 的 agent 能隨時間自我改進：反思預測誤差、累積 playbook 經驗法則（`SOUL.md` 對 agent 自己是唯讀的）、合成新技能，以及探索較少被使用的領域。這些路徑各有自己的開關。本指南是唯一一份地圖，說明哪個開關管哪件事，以及如何完全凍結一個 agent。
 
+## 技能內容預算
+
+`[evolution] skill_budget_unlimited` 預設為 `false`，既有設定檔沒寫這個鍵時也一樣。管理員可在員工的「技能」設定開啟「技能內容不設上限」。開啟後，所有選中的 Layer 2（全文）及 Layer 1（摘要）都會帶入，不受 `skill_token_budget` 限制；分層選取規則不變。關閉時，`skill_token_budget` 預設 2500 tokens，0 代表不帶入 Layer 1／2 內容；Layer 0 技能名稱清單仍不設上限。選中卻因預算放不下的技能會集中列在一行「Skills omitted for length」提示中，最多列出 10 個名稱，其餘以「and N more」表示。舊的全文載入路徑上限改為 `max(10_000, skill_token_budget * 4)` bytes，至少保留原本的 10 KB；開啟不設上限則不裁減，裁減提示也會指向員工設定。每則回覆都會帶入所有選中的技能全文，token 費用與回應時間會增加，超過模型可接收的長度時回覆可能失敗。
+
 ## 總開關
 
 `agent.toml`：

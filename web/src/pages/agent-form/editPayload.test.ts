@@ -71,6 +71,15 @@ describe('buildUpdatePayload — only dirty fields are sent', () => {
     expect(isAdminOnlyPath('caps.recipient_guard')).toBe(true);
   });
 
+  it('sends the unlimited skill flag only when edited and keeps the numeric budget', () => {
+    const edited = state({ form: { skill_budget_unlimited: true, skill_token_budget: 0 } });
+    expect(buildUpdatePayload(edited, new Set(), CTX).payload).toEqual({});
+    expect(buildUpdatePayload(edited, new Set(['form.skill_budget_unlimited', 'form.skill_token_budget']), CTX).payload)
+      .toEqual({ skill_budget_unlimited: true, skill_token_budget: 0 });
+    expect(buildUpdatePayload(state({ form: { skill_budget_unlimited: false } }), new Set(['form.skill_budget_unlimited']), CTX).payload)
+      .toEqual({ skill_budget_unlimited: false });
+  });
+
   it('sends nothing when nothing is dirty', () => {
     const r = buildUpdatePayload(state(), new Set(), CTX);
     expect(r.hasChanges).toBe(false);

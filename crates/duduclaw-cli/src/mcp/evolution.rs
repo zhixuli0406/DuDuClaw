@@ -29,9 +29,9 @@ pub(crate) async fn handle_evolution_toggle(
         });
     }
 
-    // Gate before reading the target file. Self-toggle is allowed: these four
-    // fields grant no tool, data, org or spend authority, and the evolution
-    // master switch still applies.
+    // Gate before reading the target file. Self-toggle covers the original
+    // four fields only; skill_budget_unlimited is administrator-only because
+    // it removes the cap on injected skill content.
     if let Some(caller) = actor.agent() {
         if let Err(reason) = check_org_subject_allowed(
             home_dir,
@@ -56,6 +56,12 @@ pub(crate) async fn handle_evolution_toggle(
             });
         }
     };
+    if field == "skill_budget_unlimited" && actor.agent().is_some() {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "技能內容不設上限只能由管理員在員工設定調整。"}],
+            "isError": true
+        });
+    }
     let value_str = match params.get("value").and_then(|v| v.as_str()) {
         Some(v) => v,
         None => match params.get("value") {
@@ -124,7 +130,7 @@ pub(crate) async fn handle_evolution_toggle(
     }
 
     // Validate field name and apply to the correct TOML section.
-    let boolean_fields = ["gvu_enabled"];
+    let boolean_fields = ["gvu_enabled", "skill_budget_unlimited"];
     let numeric_fields = [
         "max_silence_hours",
         "skill_token_budget",
@@ -205,6 +211,9 @@ pub(super) fn write_evolution_toggle(
     field: &str,
     value: toml::Value,
 ) -> std::result::Result<(), String> {
+    if field == "skill_budget_unlimited" && actor.agent().is_some() {
+        return Err("技能內容不設上限只能由管理員在員工設定調整。".to_string());
+    }
     // The background admission is taken in the writer's final guard and held
     // through commit, so a pause cannot land between the check and the write.
     let mut admission = None;
@@ -340,11 +349,13 @@ pub(crate) async fn handle_evolution_status_tool(
          Cognitive memory:  always on\n\
          \n\
          Skill token budget:   {}\n\
+         Unlimited skill content: {}\n\
          Max active skills:    {}\n\
          \n\
          Max silence hours:         {:.1}",
         evo.gvu_enabled,
         evo.skill_token_budget,
+        evo.skill_budget_unlimited,
         evo.max_active_skills,
         evo.max_silence_hours,
     );

@@ -59,6 +59,7 @@ max_silence_hours = 168.0
 skill_auto_activate = false
 skill_security_scan = true
 skill_token_budget = 500
+skill_budget_unlimited = false
 
 [heartbeat]
 cron = ""

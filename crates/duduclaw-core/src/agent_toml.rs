@@ -810,6 +810,7 @@ skill_security_scan = true
 gvu_enabled = false
 max_silence_hours = 168.0
 skill_token_budget = 500
+skill_budget_unlimited = false
 max_active_skills = 2
 "#;
 

@@ -3305,6 +3305,8 @@
   "agents.adv.status": "ステータスと進化",
   "agents.adv.statusField": "ステータス",
   "agents.adv.skillTokenBudget": "スキルのトークン予算",
+  "agents.adv.skillBudgetUnlimited": "スキル内容を無制限にする",
+  "agents.adv.skillBudgetUnlimitedWarning": "すべての返信に選択した全スキルの全文が含まれます。トークン費用と応答時間が増え、モデルのコンテキスト上限を超えると返信に失敗する場合があります。",
   "agents.adv.stagnation": "停滞検知",
   "agents.research.selfStudy": "自主研究",
   "agents.research.selfStudy.desc": "予測が外れた日は、夜間に研究目標を自動的にスケジュールし、根本原因を振り返って実行可能な修正案を作成します。",

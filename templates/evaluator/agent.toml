@@ -72,6 +72,7 @@ skill_security_scan = true
 gvu_enabled = false            # Evaluator doesn't self-evolve
 max_silence_hours = 168.0      # 7 days — evaluator is passive
 skill_token_budget = 500
+skill_budget_unlimited = false
 max_active_skills = 2
 
 [evolution.external_factors]

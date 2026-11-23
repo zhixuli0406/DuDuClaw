@@ -434,6 +434,29 @@ async fn partial_writes_keep_cron_and_new_keys_round_trip_through_inspect() {
 }
 
 #[tokio::test]
+async fn skill_budget_unlimited_validates_and_round_trips_through_inspect() {
+    let (home, handler) = handler_with_agent().await;
+    for unlimited in [true, false] {
+        ok(&handler.handle("agents.update", json!({
+            "agent_id": "a1", "skill_budget_unlimited": unlimited, "skill_token_budget": 7000,
+        }), &admin()).await);
+        let p = ok(&handler.handle("agents.inspect", json!({ "agent_id": "a1" }), &admin()).await);
+        assert_eq!(p["evolution"]["skill_budget_unlimited"], unlimited);
+        assert_eq!(p["evolution"]["skill_token_budget"], 7000);
+        let raw = std::fs::read_to_string(home.path().join("agents/a1/agent.toml")).unwrap();
+        let config: duduclaw_core::types::AgentConfig = toml::from_str(&raw).unwrap();
+        assert_eq!(config.evolution.skill_budget_unlimited, unlimited);
+        assert_eq!(config.evolution.skill_token_budget, 7000);
+    }
+    for invalid in [json!("true"), json!(1), Value::Null] {
+        let message = err(&handler.handle("agents.update", json!({
+            "agent_id": "a1", "skill_budget_unlimited": invalid,
+        }), &admin()).await);
+        assert!(message.contains("skill_budget_unlimited must be a boolean"), "{message}");
+    }
+}
+
+#[tokio::test]
 async fn prompt_reply_language_validates_round_trips_and_clears() {
     let (home, handler) = handler_with_agent().await;
     let toml_path = home.path().join("agents/a1/agent.toml");

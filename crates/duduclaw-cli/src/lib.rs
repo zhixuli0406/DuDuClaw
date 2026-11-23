@@ -9021,6 +9021,7 @@ gvu_enabled = {gvu_enabled}
 strategy = "balanced"
 max_silence_hours = 12.0
 skill_token_budget = 2500
+skill_budget_unlimited = false
 max_active_skills = 5
 "#,
         gvu_enabled = enable_gvu,

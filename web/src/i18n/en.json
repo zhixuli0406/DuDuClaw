@@ -3305,6 +3305,8 @@
   "agents.adv.status": "Status & Evolution",
   "agents.adv.statusField": "Status",
   "agents.adv.skillTokenBudget": "Skill Token Budget",
+  "agents.adv.skillBudgetUnlimited": "Unlimited skill content",
+  "agents.adv.skillBudgetUnlimitedWarning": "Every reply includes all selected skills in full. This increases token cost and response time, and replies may fail if the model’s context limit is exceeded.",
   "agents.adv.stagnation": "Stagnation Detection",
   "agents.research.selfStudy": "Self-Study",
   "agents.research.selfStudy.desc": "On a day with a missed prediction, automatically schedule an evening research goal to review the root cause and produce an actionable fix.",

@@ -630,18 +630,18 @@ Leave `source` alone unless you already know where the skill lives.
 
 ### `evolution_toggle` — fields and permissions
 
-`field` accepts `gvu_enabled` (bool), `max_silence_hours`,
+`field` accepts `gvu_enabled` and `skill_budget_unlimited` (bool; `skill_budget_unlimited` is administrator-only), `max_silence_hours`,
 `skill_token_budget` and `max_active_skills` (numbers). The old
 `stagnation_*` fields are no longer writable. See
 [evolution-switches.md](evolution-switches.md).
 
-An AI employee may change its own settings or those of its subordinates,
-using the same identity check and organization gate as `agent_update`. The
-`open` delegation policy permits cross-team changes; human operators remain
-unrestricted. Callers rejected by either check are refused before reading
-the target configuration. Self-edits remain allowed because these fields
-do not grant tool, data or organization permissions and do not bypass the
-evolution master switch.
+An AI employee may change its own settings or those of its subordinates for
+the original four fields, using the same identity check and organization gate
+as `agent_update`. The `open` delegation policy permits cross-team changes;
+human operators remain unrestricted. Callers rejected by either check are
+refused before reading the target configuration. Only an administrator may
+change `skill_budget_unlimited`, because it removes the cap on injected skill
+content.
 
 ### `execute_program` — where the script runs
 

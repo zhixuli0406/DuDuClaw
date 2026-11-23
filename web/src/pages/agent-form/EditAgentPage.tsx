@@ -604,6 +604,7 @@ function EditAgentPageContent() {
       gvu_enabled: ev?.gvu_enabled ?? true,
       max_active_skills: ev?.max_active_skills ?? 5,
       skill_token_budget: ev?.skill_token_budget ?? 0,
+      skill_budget_unlimited: ev?.skill_budget_unlimited ?? false,
       max_silence_hours: ev?.max_silence_hours ?? 12,
       sandbox_enabled: agent.sandbox_enabled ?? false,
       network_access: agent.network_access ?? false,
@@ -1376,7 +1377,8 @@ function EditAgentPageContent() {
             <SettingsCard>
               <RowNumber label={t('agents.edit.maxActiveSkills')} value={form.max_active_skills ?? 5} min={1} max={20} onChange={(v) => updateField('max_active_skills', v)} />
               <RowSwitch label={t('agents.edit.canModifySkills')} description={t('agents.v168.perm.canModifySkills.help')} checked={form.can_modify_own_skills ?? false} disabled={locked('form.can_modify_own_skills')} onChange={(v) => updateField('can_modify_own_skills', v)} />
-              <RowNumber label={t('agents.adv.skillTokenBudget')} value={form.skill_token_budget ?? 0} min={0} onChange={(v) => updateField('skill_token_budget', v)} />
+              <RowSwitch label={t('agents.adv.skillBudgetUnlimited')} description={form.skill_budget_unlimited ? t('agents.adv.skillBudgetUnlimitedWarning') : undefined} checked={form.skill_budget_unlimited ?? false} onChange={(v) => updateField('skill_budget_unlimited', v)} />
+              <RowNumber label={t('agents.adv.skillTokenBudget')} value={form.skill_token_budget ?? 0} disabled={form.skill_budget_unlimited ?? false} min={0} onChange={(v) => updateField('skill_token_budget', v)} />
             </SettingsCard>
           </SettingsSection>
 

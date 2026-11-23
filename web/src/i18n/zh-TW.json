@@ -3305,6 +3305,8 @@
   "agents.adv.status": "狀態與演化",
   "agents.adv.statusField": "狀態",
   "agents.adv.skillTokenBudget": "技能 token 預算",
+  "agents.adv.skillBudgetUnlimited": "技能內容不設上限",
+  "agents.adv.skillBudgetUnlimitedWarning": "每則回覆都會帶入所有選中的技能全文，token 費用與回應時間會增加，超過模型可接收的長度時回覆可能失敗。",
   "agents.adv.stagnation": "停滯偵測",
   "agents.research.selfStudy": "自主研究",
   "agents.research.selfStudy.desc": "有預測失準的日子，自動排一個晚間研究目標，回顧根因並產出可執行修正。",

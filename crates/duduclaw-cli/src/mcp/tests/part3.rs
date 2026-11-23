@@ -147,6 +147,40 @@ async fn evolution_toggle_allows_non_authority_self_settings() {
 }
 
 #[tokio::test]
+async fn skill_budget_unlimited_is_admin_only() {
+    let tmp = delegation_home();
+    let home = tmp.path();
+    let path = home.join("agents/sales-rep/agent.toml");
+    let before = fs::read(&path).unwrap();
+    let params = serde_json::json!({
+        "agent_id": "sales-rep",
+        "field": "skill_budget_unlimited",
+        "value": true
+    });
+
+    let out = handle_evolution_toggle(&params, home, RecordActor::Agent("sales-rep")).await;
+    assert_eq!(out["isError"], true, "{out}");
+    assert_eq!(out["content"][0]["text"], "技能內容不設上限只能由管理員在員工設定調整。");
+    assert_eq!(fs::read(&path).unwrap(), before);
+
+    let err = super::super::evolution::write_evolution_toggle(
+        home,
+        "sales-rep",
+        RecordActor::Agent("sales-rep"),
+        "skill_budget_unlimited",
+        toml::Value::Boolean(true),
+    )
+    .expect_err("employees must not reach the writer for this field");
+    assert_eq!(err, "技能內容不設上限只能由管理員在員工設定調整。");
+    assert_eq!(fs::read(&path).unwrap(), before);
+
+    let out = handle_evolution_toggle(&params, home, RecordActor::Operator("dashboard")).await;
+    assert_ne!(out["isError"], true, "{out}");
+    let cfg: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
+    assert_eq!(cfg["evolution"]["skill_budget_unlimited"].as_bool(), Some(true));
+}
+
+#[tokio::test]
 async fn evolution_toggle_rejects_invalid_agent_ids() {
     let tmp = delegation_home();
     let home = tmp.path();

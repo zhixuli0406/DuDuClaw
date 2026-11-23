@@ -65,6 +65,10 @@ impl MethodHandler {
             }
         }
 
+        if params.get("skill_budget_unlimited").is_some_and(|v| !v.is_boolean()) {
+            return WsFrame::error_response("", "skill_budget_unlimited must be a boolean");
+        }
+
         // ── OS-native quota gate (write side) ────────────────────────────
         // Setting this agent's os_native capability to true must not exceed
         // the edition quota (Personal = 1 OS-native seat). Fail-closed before
@@ -767,7 +771,7 @@ impl MethodHandler {
                 // v1.68: `skill_auto_activate` (the activation path never read
                 // it) and `skill_security_scan` (the scanner always runs) are
                 // no longer accepted.
-                for key in &["gvu_enabled"] {
+                for key in &["gvu_enabled", "skill_budget_unlimited"] {
                     if let Some(v) = params_clone.get(*key).and_then(|v| v.as_bool()) {
                         evo.insert((*key).into(), toml::Value::Boolean(v));
                         changes.push(format!("evolution.{key} = {v}"));

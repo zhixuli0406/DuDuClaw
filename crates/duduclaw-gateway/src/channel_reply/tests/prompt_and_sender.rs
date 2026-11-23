@@ -515,6 +515,35 @@ mod instructions_slot_tests {
         (tmp, agent)
     }
 
+    #[tokio::test]
+    async fn progressive_skill_budget_reports_omissions_and_unlimited_bypasses_budget() {
+        use crate::skill_lifecycle::compression::CompressedSkill;
+        let (_tmp, mut agent) = agent_with("").await;
+        // Two high-relevance skills fill Layer 2; the third enters Layer 1.
+        let skills: Vec<_> = ["alpha", "beta", "技能😀"].iter().map(|name| {
+            CompressedSkill::compress(name, "budget needle", Some("summary marker"))
+        }).collect();
+        let prompt = |agent: &duduclaw_agent::LoadedAgent, budget| {
+            build_system_prompt(Some(agent), Some("budget needle"), Some(&skills), None,
+                budget, None, "", None, "", false, None).unwrap()
+        };
+        let limited = prompt(&agent, 0);
+        assert!(limited.contains("Available skills: alpha, beta, 技能😀"));
+        assert!(!limited.contains("## Skill: alpha"));
+        assert!(!limited.contains("## 技能😀: summary marker"));
+        assert_eq!(limited.matches("## Skills omitted for length").count(), 1);
+        assert!(limited.contains("Skills omitted for length (3): alpha, beta, 技能😀"));
+        let partial = prompt(&agent, skills[0].tokens_layer2);
+        assert!(partial.contains("## Skill: alpha\nbudget needle"));
+        assert!(partial.contains("Skills omitted for length (2): beta, 技能😀"));
+        agent.config.evolution.skill_budget_unlimited = true;
+        let unlimited = prompt(&agent, 0);
+        assert!(unlimited.contains("## Skill: alpha\nbudget needle"));
+        assert!(unlimited.contains("## Skill: beta\nbudget needle"));
+        assert!(unlimited.contains("## 技能😀: summary marker"));
+        assert!(!unlimited.contains("Skills omitted for length"));
+    }
+
     fn prompt_for(agent: &duduclaw_agent::LoadedAgent) -> String {
         build_system_prompt(
             Some(agent), None, None, None, 0, None, "", None, "", false, None,
