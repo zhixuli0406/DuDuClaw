@@ -1688,7 +1688,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-agent"
-version = "1.84.0"
+version = "1.84.1"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -1715,7 +1715,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-api-worker"
-version = "1.84.0"
+version = "1.84.1"
 dependencies = [
  "libc",
  "reqwest",
@@ -1727,7 +1727,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-auth"
-version = "1.84.0"
+version = "1.84.1"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -1752,7 +1752,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-cli"
-version = "1.84.0"
+version = "1.84.1"
 dependencies = [
  "argon2",
  "async-trait",
@@ -1834,7 +1834,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-cli-runtime"
-version = "1.84.0"
+version = "1.84.1"
 dependencies = [
  "duduclaw-core",
  "parking_lot",
@@ -1846,7 +1846,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-container"
-version = "1.84.0"
+version = "1.84.1"
 dependencies = [
  "async-trait",
  "bollard",
@@ -1861,7 +1861,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-core"
-version = "1.84.0"
+version = "1.84.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1899,7 +1899,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-dashboard"
-version = "1.84.0"
+version = "1.84.1"
 dependencies = [
  "axum",
  "mime_guess",
@@ -1908,7 +1908,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-db"
-version = "1.84.0"
+version = "1.84.1"
 dependencies = [
  "base64 0.22.1",
  "duduclaw-core",
@@ -1927,7 +1927,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-desktop"
-version = "1.84.0"
+version = "1.84.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1939,7 +1939,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-egress"
-version = "1.84.0"
+version = "1.84.1"
 dependencies = [
  "duduclaw-isolation",
  "libc",
@@ -1951,7 +1951,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-execution"
-version = "1.84.0"
+version = "1.84.1"
 dependencies = [
  "duduclaw-isolation",
  "duduclaw-run",
@@ -1969,7 +1969,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-fork"
-version = "1.84.0"
+version = "1.84.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1990,7 +1990,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-gateway"
-version = "1.84.0"
+version = "1.84.1"
 dependencies = [
  "aes",
  "ammonia",
@@ -2099,7 +2099,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-identity"
-version = "1.84.0"
+version = "1.84.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2116,7 +2116,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-import"
-version = "1.84.0"
+version = "1.84.1"
 dependencies = [
  "duduclaw-core",
  "duduclaw-isolation",
@@ -2133,7 +2133,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-inference"
-version = "1.84.0"
+version = "1.84.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2172,7 +2172,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-isolation"
-version = "1.84.0"
+version = "1.84.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2181,7 +2181,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-isolation-storage"
-version = "1.84.0"
+version = "1.84.1"
 dependencies = [
  "duduclaw-isolation",
  "nix 0.29.0",
@@ -2193,7 +2193,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-knowledge"
-version = "1.84.0"
+version = "1.84.1"
 dependencies = [
  "calamine",
  "chrono",
@@ -2229,7 +2229,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-license"
-version = "1.84.0"
+version = "1.84.1"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -2254,7 +2254,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-llm"
-version = "1.84.0"
+version = "1.84.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2276,7 +2276,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-maint-tools"
-version = "1.84.0"
+version = "1.84.1"
 dependencies = [
  "chrono",
  "duduclaw-core",
@@ -2287,7 +2287,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-mcp-boundary"
-version = "1.84.0"
+version = "1.84.1"
 dependencies = [
  "duduclaw-execution",
  "duduclaw-isolation",
@@ -2308,7 +2308,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-memory"
-version = "1.84.0"
+version = "1.84.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2340,7 +2340,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-migration"
-version = "1.84.0"
+version = "1.84.1"
 dependencies = [
  "chacha20poly1305",
  "chrono",
@@ -2360,7 +2360,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-odoo"
-version = "1.84.0"
+version = "1.84.1"
 dependencies = [
  "chrono",
  "duduclaw-core",
@@ -2380,7 +2380,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-onnx"
-version = "1.84.0"
+version = "1.84.1"
 dependencies = [
  "duduclaw-core",
  "flate2",
@@ -2400,7 +2400,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-os"
-version = "1.84.0"
+version = "1.84.1"
 dependencies = [
  "duduclaw-core",
  "notify-debouncer-mini",
@@ -2414,7 +2414,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-parse-worker"
-version = "1.84.0"
+version = "1.84.1"
 dependencies = [
  "calamine",
  "chrono",
@@ -2442,7 +2442,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-pets"
-version = "1.84.0"
+version = "1.84.1"
 dependencies = [
  "chrono",
  "duduclaw-core",
@@ -2462,7 +2462,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-redaction"
-version = "1.84.0"
+version = "1.84.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2495,7 +2495,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-relay"
-version = "1.84.0"
+version = "1.84.1"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2518,7 +2518,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-run"
-version = "1.84.0"
+version = "1.84.1"
 dependencies = [
  "duduclaw-isolation",
  "landlock",
@@ -2531,7 +2531,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-sandbox"
-version = "1.84.0"
+version = "1.84.1"
 dependencies = [
  "duduclaw-core",
  "landlock",
@@ -2543,7 +2543,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-security"
-version = "1.84.0"
+version = "1.84.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2570,7 +2570,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-spawnd"
-version = "1.84.0"
+version = "1.84.1"
 dependencies = [
  "duduclaw-core",
  "duduclaw-execution",
@@ -2595,7 +2595,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-sysd"
-version = "1.84.0"
+version = "1.84.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2616,7 +2616,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-tui"
-version = "1.84.0"
+version = "1.84.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -2652,7 +2652,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-updated"
-version = "1.84.0"
+version = "1.84.1"
 dependencies = [
  "base64 0.22.1",
  "duduclaw-isolation",
