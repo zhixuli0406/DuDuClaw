@@ -117,6 +117,8 @@ fn redirect_allowed(initial: &reqwest::Url, next: &reqwest::Url, hops: usize) ->
         _ => return false,
     };
     allowed.contains(&host)
+        || (initial.host_str() == Some("huggingface.co")
+            && manifest::MODEL_REDIRECT_HOST_SUFFIXES.iter().any(|suffix| host.ends_with(suffix)))
 }
 
 /// HTTP client for pinned downloads, with a fail-closed redirect policy.

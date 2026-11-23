@@ -31,6 +31,9 @@ pub const MODEL_REDIRECT_HOSTS: &[&str] = &[
     "huggingface.co", "cdn-lfs.huggingface.co", "cdn-lfs-us-1.huggingface.co",
     "cdn-lfs-eu-1.huggingface.co", "cas-bridge.xethub.hf.co",
 ];
+// Hugging Face Xet/CDN regional hosts live under hf.co; content remains SHA-256
+// pinned, with HTTPS/443, no-userinfo and at-most-five-hop checks unchanged.
+pub const MODEL_REDIRECT_HOST_SUFFIXES: &[&str] = &[".hf.co"];
 
 /// Archive container format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,6 +288,7 @@ mod tests {
             ("GITHUB_REDIRECT_HOSTS", GITHUB_REDIRECT_HOSTS),
             ("NUGET_REDIRECT_HOSTS", NUGET_REDIRECT_HOSTS),
             ("MODEL_REDIRECT_HOSTS", MODEL_REDIRECT_HOSTS),
+            ("MODEL_REDIRECT_HOST_SUFFIXES", MODEL_REDIRECT_HOST_SUFFIXES),
         ] {
             let prefix = format!("{name}='");
             let value = script.lines().find_map(|line|

@@ -32,6 +32,7 @@ set -euo pipefail
 GITHUB_REDIRECT_HOSTS='github.com objects.githubusercontent.com release-assets.githubusercontent.com'
 NUGET_REDIRECT_HOSTS='api.nuget.org'
 MODEL_REDIRECT_HOSTS='huggingface.co cdn-lfs.huggingface.co cdn-lfs-us-1.huggingface.co cdn-lfs-eu-1.huggingface.co cas-bridge.xethub.hf.co'
+MODEL_REDIRECT_HOST_SUFFIXES='.hf.co'
 
 if [ $# -ne 3 ]; then
   sed -n '2,26p' "$0" >&2
@@ -115,12 +116,12 @@ recover_ort_archive() {
 }
 
 # Python is already required for the manifest. Use its URL parser so authority
-# boundaries, credentials and ports cannot bypass an exact host comparison.
+# boundaries, credentials and ports cannot bypass host or dot-boundary suffix checks.
 resolve_download_url() {
-  python3 -I - "$1" "$2" "$3" <<'PYURL'
+  python3 -I - "$1" "$2" "$3" "$4" <<'PYURL'
 import sys
 from urllib.parse import urlsplit, urljoin
-current, location, allowed = sys.argv[1:]
+current, location, allowed, suffixes = sys.argv[1:]
 try:
     if not location or any(ord(c) <= 32 or ord(c) == 127 for c in location) or "\\" in location:
         raise ValueError()
@@ -133,7 +134,9 @@ try:
         base = urlsplit(current)
         location = urljoin(f"{base.scheme}://{base.netloc}/", location)
         parsed = urlsplit(location)
-    if (parsed.scheme != "https" or parsed.hostname not in allowed.split()
+    host = parsed.hostname
+    if (parsed.scheme != "https" or host is None
+            or not (host in allowed.split() or any(host.endswith(suffix) for suffix in suffixes.split()))
             or parsed.username is not None or parsed.password is not None
             or parsed.port not in (None, 443)):
         raise ValueError()
@@ -144,14 +147,14 @@ PYURL
 }
 
 download_with_redirects() {
-  local current="$1" output="$2" size="$3" allowed headers status location hop
+  local current="$1" output="$2" size="$3" allowed suffixes='' headers status location hop
   case "$current" in
     https://github.com/*) allowed="$GITHUB_REDIRECT_HOSTS" ;;
     https://api.nuget.org/*) allowed="$NUGET_REDIRECT_HOSTS" ;;
-    https://huggingface.co/*) allowed="$MODEL_REDIRECT_HOSTS" ;;
+    https://huggingface.co/*) allowed="$MODEL_REDIRECT_HOSTS"; suffixes="$MODEL_REDIRECT_HOST_SUFFIXES" ;;
     *) echo "download refused: unknown source host" >&2; return 1 ;;
   esac
-  current="$(resolve_download_url "$current" "$current" "$allowed")" || return 1
+  current="$(resolve_download_url "$current" "$current" "$allowed" "$suffixes")" || return 1
   headers="$(mktemp "$STAGE/headers.XXXXXX")" || return 1
   for ((hop = 0; hop <= 5; hop++)); do
     # No automatic redirects: validate every next URL before requesting it.
@@ -180,7 +183,7 @@ if len(locations) != 1:
 print(locations[0])
 PYHEADER
 )" || return 1
-        current="$(resolve_download_url "$current" "$location" "$allowed")" || return 1
+        current="$(resolve_download_url "$current" "$location" "$allowed" "$suffixes")" || return 1
         ;;
       *) echo "download refused: unexpected HTTP status $status" >&2; return 1 ;;
     esac
