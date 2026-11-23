@@ -1,6 +1,25 @@
 use super::*;
 use std::io::Cursor;
 
+#[tokio::test]
+#[ignore = "network: hits huggingface.co; run with --ignored"]
+async fn live_huggingface_redirect_reaches_hf_cdn() {
+    let client = http_client("duduclaw-live-test").unwrap();
+    let response = client
+        .get("https://huggingface.co/intfloat/multilingual-e5-small/resolve/main/tokenizer.json")
+        .header(reqwest::header::RANGE, "bytes=0-15")
+        .send()
+        .await
+        .unwrap();
+    let host = response.url().host_str().expect("response URL must have a host");
+    println!("Final host: {host}");
+    assert!(
+        matches!(response.status().as_u16(), 200 | 206),
+        "unexpected response status: {}", response.status()
+    );
+    assert!(host.ends_with(".hf.co"), "expected hf.co CDN, got {host}");
+}
+
 fn zip_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
     let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
     for &(name, bytes) in entries {
