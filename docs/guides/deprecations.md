@@ -219,14 +219,16 @@ Automatic skill staleness, archiving and curator wiki reports have been removed.
 Skills remain loadable regardless of how long they have been unused. On gateway
 startup the single-gateway lock holder restores recorded archived skills to
 Active. A destination conflict or move failure preserves the archive and logs
-its skill name; existing skills are never overwritten. Linux protected mode restores flat global and agent skills through directory
+its skill name; existing skills are never overwritten. Linux and macOS restore flat global and agent skills in both modes through directory
 descriptors without following symlinked components or overwriting destinations.
-Other targets refuse protected restoration.
+Other platforms retain archives for manual recovery. Status lists only skill names
+and scopes; employees may list and restore only their own scope. Global and other
+agent scopes require an Admin operator. Unknown callers are denied.
 
 | Name | Compatibility behaviour | Removal target / action |
 |---|---|---|
 | MCP `skill_curator_status` | Listed and callable, deprecated description and catalog flag; read-only archive recovery status. `run` is accepted and ignored with a notice | v1.86.0; use `skill_list` for loaded skills. Resolve archive conflicts manually, or restore with `skill_pin` during the window |
-| MCP `skill_pin` | Listed and callable, deprecated description and catalog flag; `pinned=true` restores a recorded archived skill, otherwise no effect | v1.86.0; pinning is unnecessary. Protected restoration is supported on Linux for global and agent skills |
+| MCP `skill_pin` | Listed and callable, deprecated description and catalog flag; `pinned=true` restores a recorded archived skill, otherwise no effect | v1.86.0; pinning is unnecessary. Restoration is supported on Linux and macOS. Employees may restore only their own scope; global and other agent scopes require an Admin operator |
 | `config.toml [skill_curator]` | Still accepted, all values ignored; one warning per process on read explains removal | Remove the section; it cannot enable automatic archiving |
 
 

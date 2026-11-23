@@ -23,7 +23,7 @@ pub(crate) fn component(s: &str) -> bool {
 }
 
 /// Walk only validated components from the same pinned home descriptor.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn directory(home: &std::fs::File, parts: &[&str], create: bool) -> Result<std::fs::File, String> {
     use std::os::fd::{AsRawFd, FromRawFd};
     use nix::{fcntl::{openat, OFlag}, sys::stat::{mkdirat, Mode}};
@@ -46,63 +46,124 @@ fn directory(home: &std::fs::File, parts: &[&str], create: bool) -> Result<std::
     Ok(root)
 }
 
-#[cfg(target_os = "linux")]
-fn read_regular(dir: &std::fs::File, filename: &str) -> Result<Vec<u8>, String> {
-    use std::{io::Read, os::fd::{AsRawFd, FromRawFd}};
-    use nix::{fcntl::{openat, OFlag}, sys::stat::Mode};
-    if !component(filename) { return Err("invalid skill filename".into()); }
-    let fd = openat(Some(dir.as_raw_fd()), filename,
-        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK,
+/// Both protected and unprotected recovery bind the source to the recorded scope.
+/// Windows deliberately refuses restoration: path-based moves cannot enforce the
+/// descriptor-bound checks used on Unix. Keep the archive for manual recovery.
+pub(crate) fn restore_archived(home: &Path, scope: &str, archived: &Path) -> Result<PathBuf, String> {
+    restore_archived_with_hook(home, scope, archived, || {})
+}
+
+fn restore_archived_with_hook(home: &Path, scope: &str, archived: &Path,
+    before_cleanup: impl FnOnce()) -> Result<PathBuf, String> {
+    let (archive_scope, parts) = if scope == "global" {
+        ("global".to_owned(), vec!["skills"])
+    } else {
+        let id = scope.strip_prefix("agent:").ok_or("invalid restore scope")?;
+        super::curator::owned_scope(id)?;
+        (format!("agent-{id}"), vec!["agents", id, "SKILLS"])
+    };
+    let filename = archived.file_name().and_then(|name| name.to_str())
+        .filter(|name| component(name)).ok_or("invalid archive filename")?;
+    let expected = home.join("skills-archive").join(&archive_scope).join(filename);
+    if archived.as_os_str() != expected.as_os_str() {
+        return Err("archive path does not match scope".into());
+    }
+    #[cfg(unix)]
+    {
+        restore_unix(home, &archive_scope, &parts, filename, before_cleanup)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (parts, before_cleanup);
+        Err("safe skill restore requires Unix; archive retained for manual recovery".into())
+    }
+}
+
+#[cfg(unix)]
+fn publish_noreplace(dir: &std::fs::File, temp: &str, filename: &str) -> Result<(), String> {
+    use std::{ffi::CString, os::fd::AsRawFd};
+    let temp = CString::new(temp).map_err(|e| e.to_string())?;
+    let name = CString::new(filename).map_err(|e| e.to_string())?;
+    #[cfg(target_os = "linux")]
+    {
+        duduclaw_core::linux_syscalls::renameat2(dir.as_raw_fd(), &temp,
+            dir.as_raw_fd(), &name, libc::RENAME_NOREPLACE).map_err(|e| e.to_string())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: live directory descriptor and NUL-terminated names; no ownership transfer.
+        if unsafe { libc::renameatx_np(dir.as_raw_fd(), temp.as_ptr(),
+            dir.as_raw_fd(), name.as_ptr(), libc::RENAME_EXCL) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error().to_string())
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (dir, temp, name);
+        Err("no safe no-overwrite restore on this platform".into())
+    }
+}
+
+#[cfg(unix)]
+fn restore_unix(home: &Path, archive_scope: &str, parts: &[&str], filename: &str,
+    before_cleanup: impl FnOnce()) -> Result<PathBuf, String> {
+    use std::{io::{Read, Write}, os::{fd::{AsRawFd, FromRawFd}, unix::fs::OpenOptionsExt}};
+    use nix::{fcntl::{openat, AtFlags, OFlag}, sys::stat::{fstat, fstatat, Mode, SFlag},
+        unistd::{unlinkat, UnlinkatFlags}};
+    let root = std::fs::OpenOptions::new().read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(home).map_err(|e| e.to_string())?;
+    let source = directory(&root, &["skills-archive", archive_scope], false)?;
+    let fd = openat(Some(source.as_raw_fd()), filename,
+        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK,
         Mode::empty()).map_err(|e| e.to_string())?;
-    // SAFETY: exactly one owned descriptor from openat.
+    // SAFETY: exactly one owned descriptor from openat, held through archive cleanup.
     let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+    let original = fstat(file.as_raw_fd()).map_err(|e| e.to_string())?;
+    if SFlag::from_bits_truncate(original.st_mode) & SFlag::S_IFMT != SFlag::S_IFREG {
         return Err("archive source is not a regular file".into());
     }
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
-    Ok(bytes)
-}
-
-/// Reverse a flat protected archive without following symlinks or overwriting.
-/// Existing archive-intent files are deliberately left untouched.
-#[cfg(target_os = "linux")]
-pub(crate) fn restore_archived(home: &Path, scope: &str, archived: &Path) -> Result<PathBuf, String> {
-    use std::{ffi::CString, os::{fd::AsRawFd, unix::fs::OpenOptionsExt}};
-    let (archive_scope, parts) = if scope == "global" {
-        ("global".to_owned(), vec!["skills"])
-    } else {
-        let id = scope.strip_prefix("agent:").filter(|id| component(id)).ok_or("invalid restore scope")?;
-        (format!("agent-{id}"), vec!["agents", id, "SKILLS"])
-    };
-    if !component(&archive_scope) { return Err("invalid archive scope".into()); }
-    let filename = archived.file_name().and_then(|name| name.to_str())
-        .filter(|name| component(name)).ok_or("invalid archive filename")?;
-    if archived != home.join("skills-archive").join(&archive_scope).join(filename) {
-        return Err("archive path does not match scope".into());
+    let dest = directory(&root, parts, true)?;
+    // Registry::load_skills skips dot-files. Only verified bytes reach the final name.
+    let temp = format!(".{filename}.restore-{}", uuid::Uuid::new_v4());
+    let fd = openat(Some(dest.as_raw_fd()), temp.as_str(),
+        OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::from_bits_truncate(0o600)).map_err(|e| e.to_string())?;
+    // SAFETY: exactly one owned descriptor from openat.
+    let mut staged = unsafe { std::fs::File::from_raw_fd(fd) };
+    let publication = (|| {
+        staged.write_all(&bytes).map_err(|e| e.to_string())?;
+        staged.sync_all().map_err(|e| e.to_string())?;
+        publish_noreplace(&dest, &temp, filename)?;
+        dest.sync_all().map_err(|e| e.to_string())
+    })();
+    if let Err(error) = publication {
+        if let Err(cleanup) = unlinkat(Some(dest.as_raw_fd()), temp.as_str(), UnlinkatFlags::NoRemoveDir) {
+            if cleanup != nix::errno::Errno::ENOENT {
+                return Err(format!("{error}; restore temp cleanup failed: {cleanup}"));
+            }
+        }
+        return Err(error);
     }
-    let root = std::fs::OpenOptions::new().read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(home).map_err(|e| e.to_string())?;
-    let source = directory(&root, &["skills-archive", &archive_scope], false)?;
-    let bytes = read_regular(&source, filename)?;
-    let dest = directory(&root, &parts, true)?;
-    let name = CString::new(filename).map_err(|e| e.to_string())?;
-    duduclaw_core::linux_syscalls::renameat2(source.as_raw_fd(), &name,
-        dest.as_raw_fd(), &name, libc::RENAME_NOREPLACE).map_err(|e| e.to_string())?;
-    source.sync_all().map_err(|e| e.to_string())?;
-    dest.sync_all().map_err(|e| e.to_string())?;
-    if read_regular(&dest, filename)? != bytes {
-        return Err("restored skill bytes changed; recovery unconfirmed".into());
+    // Tests replace the archive dirent here, after publication but before the identity check.
+    before_cleanup();
+    match fstatat(Some(source.as_raw_fd()), filename, AtFlags::AT_SYMLINK_NOFOLLOW) {
+        Ok(current) if current.st_dev == original.st_dev && current.st_ino == original.st_ino => {
+            if let Err(error) = unlinkat(Some(source.as_raw_fd()), filename, UnlinkatFlags::NoRemoveDir)
+                .map_err(|e| e.to_string()).and_then(|()| source.sync_all().map_err(|e| e.to_string())) {
+                tracing::warn!(%error, "skill restored; archive cleanup unconfirmed");
+            }
+        }
+        _ => tracing::warn!("skill restored; archive dirent changed or unavailable, leaving it untouched"),
     }
+    drop(file);
     let mut restored = home.to_path_buf();
     for part in parts { restored.push(part); }
     Ok(restored.join(filename))
-}
-
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn restore_archived(_: &Path, _: &str, _: &Path) -> Result<PathBuf, String> {
-    Err("protected skill restore requires Linux".into())
 }
 
 pub(crate) async fn approve(home: &Path, agent: &str, action: &str, target: &str,
@@ -151,7 +212,7 @@ pub(crate) fn published(home: &Path, key: &str) -> Result<bool, String> {
         .map(|v| v.is_some()).map_err(|_| "publication receipt unavailable".into())
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     #[test]
@@ -185,6 +246,7 @@ mod tests {
         assert!(restore_archived(home.path(), "global", &archived).is_err());
         assert_eq!(std::fs::read(archived).unwrap(), b"archived");
         assert_eq!(std::fs::read(dest).unwrap(), b"existing");
+        assert_eq!(std::fs::read_dir(home.path().join("skills")).unwrap().count(), 1);
     }
 
     #[test]
@@ -202,6 +264,75 @@ mod tests {
         assert!(!home.path().join("skills/notes.md").exists());
     }
 
+    #[test]
+    fn restore_refuses_other_scope_and_invalid_agents() {
+        let home = tempfile::tempdir().unwrap();
+        let alice = home.path().join("skills-archive/agent-alice/notes.md");
+        let bob = home.path().join("skills-archive/agent-bob/notes.md");
+        for (path, bytes) in [(&alice, b"alice".as_slice()), (&bob, b"bob".as_slice())] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+        assert!(restore_archived(home.path(), "agent:bob", &alice).is_err());
+        for scope in ["department:sales", "agent:_hidden", "agent:dashboard", "agent:..", "agent:", "other"] {
+            assert!(restore_archived(home.path(), scope, &alice).is_err(), "{scope}");
+        }
+        assert_eq!(std::fs::read(alice).unwrap(), b"alice");
+        assert_eq!(std::fs::read(bob).unwrap(), b"bob");
+        assert!(!home.path().join("agents").exists());
+    }
+
+    #[test]
+    fn restore_refuses_symlinked_archive_root_or_destination_components() {
+        for linked in ["skills-archive", "agents", "agents/writer", "agents/writer/SKILLS"] {
+            let home = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let link = home.path().join(linked);
+            std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+            let archived = home.path().join("skills-archive/agent-writer/notes.md");
+            std::fs::create_dir_all(archived.parent().unwrap()).unwrap();
+            std::fs::write(&archived, b"untouched").unwrap();
+            assert!(restore_archived(home.path(), "agent:writer", &archived).is_err(), "{linked}");
+            assert_eq!(std::fs::read(archived).unwrap(), b"untouched");
+            assert!(!home.path().join("agents/writer/SKILLS/notes.md").exists());
+            assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        }
+    }
+
+    #[test]
+    fn restore_publishes_opened_bytes_and_keeps_replaced_archive_dirent() {
+        let home = tempfile::tempdir().unwrap();
+        let archived = home.path().join("skills-archive/global/notes.md");
+        let replacement = home.path().join("replacement.md");
+        std::fs::create_dir_all(archived.parent().unwrap()).unwrap();
+        std::fs::write(&archived, b"verified original").unwrap();
+        std::fs::write(&replacement, b"unverified replacement").unwrap();
+        let restored = restore_archived_with_hook(home.path(), "global", &archived, || {
+            std::fs::rename(&replacement, &archived).unwrap();
+        }).unwrap();
+        assert_eq!(std::fs::read(restored).unwrap(), b"verified original");
+        assert_eq!(std::fs::read(archived).unwrap(), b"unverified replacement");
+        assert_eq!(std::fs::read_dir(home.path().join("skills")).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn restore_refuses_symlink_and_nonregular_source() {
+        let home = tempfile::tempdir().unwrap();
+        let archived = home.path().join("skills-archive/global/notes.md");
+        std::fs::create_dir_all(archived.parent().unwrap()).unwrap();
+        let outside = home.path().join("outside.md");
+        std::fs::write(&outside, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&outside, &archived).unwrap();
+        assert!(restore_archived(home.path(), "global", &archived).is_err());
+        assert_eq!(std::fs::read(outside).unwrap(), b"untouched");
+        std::fs::remove_file(&archived).unwrap();
+        std::fs::create_dir(&archived).unwrap();
+        assert!(restore_archived(home.path(), "global", &archived).is_err());
+        assert!(!home.path().join("skills").exists());
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn i1c_synthesis_staging_retains_generation_time_and_refuses_overwrite() {
         let home = tempfile::tempdir().unwrap(); let key = digest(b"exact evidence");

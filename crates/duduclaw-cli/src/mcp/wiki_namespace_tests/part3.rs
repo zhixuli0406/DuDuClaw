@@ -73,7 +73,7 @@ async fn skill_pin_and_curator_status_roundtrip() {
         archived_path: None, updated_at: old,
     }).await.unwrap();
     std::fs::write(home.join("config.toml"), "[skill_curator]\nenabled=true\narchive_days=90\n").unwrap();
-    let res = super::handle_skill_curator_status(&json!({"run": true}), &home).await;
+    let res = super::handle_skill_curator_status(&json!({"run": true}), &home, RecordActor::Operator("operator"), true).await;
     assert!(res["isError"].as_bool() != Some(true), "{res}");
     let text = res["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("run=true ignored"), "{text}");
@@ -84,7 +84,7 @@ async fn skill_pin_and_curator_status_roundtrip() {
     assert!(!home.join("shared/wiki/reports").exists());
 
     for name in ["keeper", "ghost"] {
-        let res = super::handle_skill_pin(&json!({"skill_name": name}), &home).await;
+        let res = super::handle_skill_pin(&json!({"skill_name": name}), &home, RecordActor::Operator("operator"), true).await;
         assert!(res["isError"].as_bool() != Some(true), "{res}");
         assert!(res["content"][0]["text"].as_str().unwrap().contains("no effect"));
     }

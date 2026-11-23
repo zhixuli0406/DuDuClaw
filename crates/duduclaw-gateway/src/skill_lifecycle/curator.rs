@@ -23,29 +23,6 @@ pub fn owned_scope(agent: &str) -> Result<String, String> {
     Ok(format!("agent:{agent}"))
 }
 
-/// Skills dir for a scope string (`"global"`, `"department:<dept>"`, or
-/// `"agent:<id>"`). Returns None for malformed scopes (fail-safe: no file
-/// action).
-fn scope_dir(home_dir: &Path, scope: &str) -> Option<PathBuf> {
-    if scope == SCOPE_GLOBAL {
-        return Some(home_dir.join("skills"));
-    }
-    if let Some(dept) = scope.strip_prefix("department:") {
-        // WP7: department layer at shared/skills/departments/<dept>.
-        if !duduclaw_core::is_valid_department(dept) {
-            return None;
-        }
-        return Some(duduclaw_agent::skill_loader::department_skills_dir(
-            home_dir, dept,
-        ));
-    }
-    let id = scope.strip_prefix("agent:")?;
-    if id.is_empty() || !is_safe_component(id) {
-        return None;
-    }
-    Some(home_dir.join("agents").join(id).join("SKILLS"))
-}
-
 /// Directory-safe name check (mirrors the MCP-side validator: no traversal).
 fn is_safe_component(s: &str) -> bool {
     !s.is_empty()
@@ -57,64 +34,11 @@ fn is_safe_component(s: &str) -> bool {
         && s != ".."
 }
 
-/// Move without replacing even if a destination appears after the precheck.
-fn restore_move(source: &Path, dest: &Path) -> Result<(), String> {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
-        use std::{ffi::CString, os::unix::ffi::OsStrExt};
-        let source = CString::new(source.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
-        let dest = CString::new(dest.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
-        #[cfg(target_os = "linux")]
-        return duduclaw_core::linux_syscalls::renameat2(libc::AT_FDCWD, &source,
-            libc::AT_FDCWD, &dest, libc::RENAME_NOREPLACE).map_err(|e| e.to_string());
-        #[cfg(target_os = "macos")]
-        {
-            // SAFETY: both paths are live NUL-terminated C strings.
-            if unsafe { libc::renamex_np(source.as_ptr(), dest.as_ptr(), libc::RENAME_EXCL) } == 0 {
-                return Ok(());
-            }
-            return Err(std::io::Error::last_os_error().to_string());
-        }
-    }
-    // Windows rename refuses an existing destination.
-    #[cfg(target_os = "windows")]
-    { std::fs::rename(source, dest).map_err(|e| e.to_string()) }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    { let _ = (source, dest); Err("no safe no-overwrite restore on this platform".into()) }
-}
-
 async fn restore_record(home: &Path, store: &CustomSkillStore, rec: &SkillCurationRecord) -> Result<PathBuf, String> {
     let archived = PathBuf::from(rec.archived_path.as_deref().ok_or("archived skill has no archive path")?);
-    let dest = if duduclaw_parse_worker::client::required() {
-        super::isolated::restore_archived(home, &rec.scope, &archived)?
-    } else {
-        restore_unprotected(home, &rec.scope, &archived)?
-    };
+    let dest = super::isolated::restore_archived(home, &rec.scope, &archived)?;
     store.curation_set_status(&rec.skill_name, &rec.scope, CurationStatus::Active, None,
         &Utc::now().to_rfc3339()).await?;
-    Ok(dest)
-}
-
-fn restore_unprotected(home: &Path, scope: &str, archived: &Path) -> Result<PathBuf, String> {
-    let filename = archived.file_name().and_then(|name| name.to_str())
-        .filter(|name| super::isolated::component(name)).ok_or("invalid archive filename")?;
-    let archive_root = home.join("skills-archive").canonicalize().map_err(|e| format!("archive root: {e}"))?;
-    let parent = archived.parent().ok_or("archive path has no parent")?
-        .canonicalize().map_err(|e| format!("archive parent: {e}"))?;
-    if !parent.starts_with(&archive_root) {
-        return Err("archive path is outside skills-archive".into());
-    }
-    let source = parent.join(filename);
-    if !source.symlink_metadata().map_err(|e| format!("archive source: {e}"))?.is_file() {
-        return Err("archive source is not a regular file".into());
-    }
-    let dir = scope_dir(home, scope).ok_or("malformed scope")?;
-    let dest = dir.join(filename);
-    if dest.symlink_metadata().is_ok() {
-        return Err(format!("restore destination already exists: {}", dest.display()));
-    }
-    std::fs::create_dir_all(&dir).map_err(|e| format!("restore dir: {e}"))?;
-    restore_move(&source, &dest).map_err(|e| format!("restore move: {e}"))?;
     Ok(dest)
 }
 
@@ -183,6 +107,7 @@ mod tests {
         assert!(!home.path().join("shared/wiki/reports").exists());
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn startup_restore_requires_lock_and_is_idempotent() {
         let home = tempfile::tempdir().unwrap();
@@ -224,14 +149,50 @@ mod tests {
         let mut rec = store.curation_get("notes", SCOPE_GLOBAL).await.unwrap().unwrap();
         rec.archived_path = Some(outside.to_string_lossy().into_owned());
         store.curation_put(&rec).await.unwrap();
-        // Exercise the unprotected validation regardless of the process mode.
-        assert!(restore_unprotected(home.path(), SCOPE_GLOBAL, &outside).is_err());
+        // Both modes use the same exact-path validation.
+        assert!(super::super::isolated::restore_archived(home.path(), SCOPE_GLOBAL, &outside).is_err());
         assert!(restore_record(home.path(), &store, &rec).await.is_err());
         assert_eq!(std::fs::read(outside).unwrap(), b"outside archive");
         assert!(!home.path().join("skills/notes.md").exists());
         assert_eq!(store.curation_get("notes", SCOPE_GLOBAL).await.unwrap().unwrap().status, CurationStatus::Archived);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn scope_path_mismatch_preserves_files_and_record() {
+        let home = tempfile::tempdir().unwrap();
+        let store = seed(home.path(), true).await;
+        let mut rec = store.curation_get("notes", SCOPE_GLOBAL).await.unwrap().unwrap();
+        let alice = home.path().join("skills-archive/agent-alice/notes.md");
+        let bob = home.path().join("skills-archive/agent-bob/notes.md");
+        for path in [&alice, &bob] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, path.as_os_str().as_encoded_bytes()).unwrap();
+        }
+        rec.scope = "agent:bob".into();
+        rec.archived_path = Some(alice.to_string_lossy().into_owned());
+        store.curation_put(&rec).await.unwrap();
+        assert!(restore_record(home.path(), &store, &rec).await.is_err());
+        for path in [&alice, &bob] {
+            assert_eq!(std::fs::read(path).unwrap(), path.as_os_str().as_encoded_bytes());
+        }
+        assert_eq!(store.curation_get("notes", "agent:bob").await.unwrap().unwrap().status, CurationStatus::Archived);
+        assert!(!home.path().join("agents/bob/SKILLS/notes.md").exists());
+    }
+
+    #[cfg(not(unix))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn unsupported_restore_preserves_archive_and_record() {
+        let home = tempfile::tempdir().unwrap();
+        let store = seed(home.path(), true).await;
+        let archived = home.path().join("skills-archive/global/notes.md");
+        let bytes = std::fs::read(&archived).unwrap();
+        assert!(set_pin(home.path(), &store, "notes", SCOPE_GLOBAL, true).await.is_err());
+        assert_eq!(std::fs::read(archived).unwrap(), bytes);
+        assert!(!home.path().join("skills/notes.md").exists());
+        assert_eq!(store.curation_get("notes", SCOPE_GLOBAL).await.unwrap().unwrap().status, CurationStatus::Archived);
+    }
+
+    #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn pin_only_restores_archived_skills() {
         let home = tempfile::tempdir().unwrap();
