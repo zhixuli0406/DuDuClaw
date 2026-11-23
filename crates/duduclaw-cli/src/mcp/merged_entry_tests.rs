@@ -71,14 +71,15 @@ fn removed_aliases_are_not_declared_and_their_replacements_are() {
     tool("wiki_share");
 }
 
-/// No declared tool still advertises a deprecation window: a leftover
-/// `[deprecated → …]` marker would promise a name that no longer exists.
+/// A `[deprecated → …]` marker must correspond to a catalog-registered
+/// deprecated tool that is still listed and callable during its window.
 #[test]
-fn no_declared_tool_carries_a_deprecation_marker() {
+fn deprecation_marker_matches_catalog() {
     for t in tools() {
         assert!(
-            !t.description.starts_with("[deprecated"),
-            "{} still carries a deprecation marker",
+            t.description.starts_with("[deprecated")
+                == duduclaw_core::tool_catalog::is_deprecated_tool(t.name),
+            "{} deprecation marker must match the tool catalog",
             t.name
         );
     }

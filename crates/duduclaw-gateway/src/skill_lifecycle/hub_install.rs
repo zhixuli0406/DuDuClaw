@@ -202,7 +202,7 @@ pub async fn fetch_and_gate(
 }
 
 /// Phase 2: write an already-gated manifest into a skills directory and track
-/// it for the curator. Only ever called on a [`GatedManifest`] returned by
+/// its signature. Only ever called on a [`GatedManifest`] returned by
 /// [`fetch_and_gate`] (so the scan gate has provably already passed) — and,
 /// where required, only after a human approval decision.
 pub async fn install_gated(
@@ -313,7 +313,7 @@ async fn install_gated_locked(
     let _ = std::fs::remove_dir(&tmp_dir); // best-effort: unique dir, one file
     let parsed = install_result?;
 
-    // Track it for the curator from day one.
+    // Keep signature provenance without registering a curator lifecycle.
     let curation_scope = if scope == "global" {
         super::curator::SCOPE_GLOBAL.to_string()
     } else if scope.starts_with("department:") {
@@ -324,13 +324,6 @@ async fn install_gated_locked(
     };
     {
         let store = crate::custom_skills::CustomSkillStore::open(home_dir)?;
-        store
-            .curation_upsert_seen(
-                &parsed.meta.name,
-                &curation_scope,
-                &chrono::Utc::now().to_rfc3339(),
-            )
-            .await?;
         store.record_hub_signature(
             &parsed.meta.name, &curation_scope, &signature_status,
             &duduclaw_agent::skill_hub::sha256_hex(content),
@@ -848,7 +841,6 @@ async fn install_protected_locked(home: &Path, gated: &GatedManifest, scope: &st
     let curation_scope = if scope == "global" || scope.strip_prefix("department:").is_some() { scope.to_owned() }
         else { format!("agent:{scope}") };
     let store = crate::custom_skills::CustomSkillStore::open(home)?;
-    store.curation_upsert_seen(&gated.skill_name, &curation_scope, &chrono::Utc::now().to_rfc3339()).await?;
     store.record_hub_signature(&gated.skill_name, &curation_scope, &signature,
         &duduclaw_agent::skill_hub::sha256_hex(&gated.content)).await?;
     use sha2::{Digest, Sha256};
