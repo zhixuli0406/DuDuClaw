@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.84.1] - 2026-11-23 — 本機模型首次下載修正
+
 ### Fixed
 
 - 首次下載知識庫向量模型、去識別化 AI 偵測模型或 Kokoro 語音模型時，因 Hugging Face 改用新的下載主機而出現「download redirect refused」並下載失敗；現在接受 Hugging Face 的 hf.co 下載主機，檔案仍以固定雜湊驗證。
