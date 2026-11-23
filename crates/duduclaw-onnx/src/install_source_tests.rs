@@ -376,3 +376,30 @@ fn redirect_policy_allows_only_source_hosts_https_and_five_hops() {
     assert!(redirect_allowed(&models, &cdn, 1));
     assert!(!redirect_allowed(&nuget, &cdn, 1));
 }
+
+#[test]
+fn redirect_policy_allows_hf_subdomains_only_for_huggingface() {
+    let models = reqwest::Url::parse("https://huggingface.co/model").unwrap();
+    let github = reqwest::Url::parse(manifest::ORT_ARCHIVES[0].url).unwrap();
+    let nuget = reqwest::Url::parse(manifest::ORT_ARCHIVES[0].fallbacks[0].url).unwrap();
+    let unknown = reqwest::Url::parse("https://unknown.example/model").unwrap();
+    for host in ["us.aws.cdn.hf.co", "eu.aws.cdn.hf.co", "cas-bridge.xethub.hf.co"] {
+        let url = reqwest::Url::parse(&format!("https://{host}/asset")).unwrap();
+        assert!(redirect_allowed(&models, &url, 5), "{host}");
+        assert!(!redirect_allowed(&models, &url, 6), "{host}");
+        assert!(!redirect_allowed(&github, &url, 1), "{host}");
+        assert!(!redirect_allowed(&nuget, &url, 1), "{host}");
+        assert!(!redirect_allowed(&unknown, &url, 1), "{host}");
+    }
+}
+
+#[test]
+fn redirect_policy_refuses_hf_lookalikes_and_unsafe_urls() {
+    let models = reqwest::Url::parse("https://huggingface.co/model").unwrap();
+    for url in ["https://hf.co.evil.com/asset", "https://evilhf.co/asset",
+        "https://xhf.co/asset", "https://hf.co/asset", "http://us.aws.cdn.hf.co/asset",
+        "https://us.aws.cdn.hf.co:8443/asset", "https://user@us.aws.cdn.hf.co/asset",
+        "https://user:password@us.aws.cdn.hf.co/asset", "https://:password@us.aws.cdn.hf.co/asset"] {
+        assert!(!redirect_allowed(&models, &reqwest::Url::parse(url).unwrap(), 1), "{url}");
+    }
+}
