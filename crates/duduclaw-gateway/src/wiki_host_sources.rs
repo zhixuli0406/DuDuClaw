@@ -186,6 +186,7 @@ pub fn pages_needing_review(home: &Path, agent_id: &str, sel: &SelectorView) -> 
 fn scan(root: &Path, label: &str, skip_auto: bool, sel: &SelectorView, out: &mut Vec<String>) {
     let mut stack = vec![root.to_path_buf()];
     let mut seen = 0usize;
+    let mut resolver = duduclaw_memory::wiki_path::WikiPageResolver::new(root);
     while let Some(dir) = stack.pop() {
         let Ok(rd) = std::fs::read_dir(&dir) else {
             continue;
@@ -215,7 +216,7 @@ fn scan(root: &Path, label: &str, skip_auto: bool, sel: &SelectorView, out: &mut
             if !meta.is_file() || !rel.ends_with(".md") || rel.starts_with('_') {
                 continue;
             }
-            let Ok(target) = duduclaw_memory::wiki_path::resolve_wiki_page(root, &rel, false) else {
+            let Ok(target) = resolver.resolve(&rel) else {
                 continue;
             };
             if skip_auto && target.is_auto { continue; }

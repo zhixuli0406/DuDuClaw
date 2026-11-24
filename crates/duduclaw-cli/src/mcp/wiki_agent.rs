@@ -58,12 +58,36 @@ pub(crate) fn auto_page_hidden_with(
 ) -> bool {
     let Ok(id) = duduclaw_memory::wiki_path::canonical_page_argument(page_path) else { return true; };
     let Ok(target) = duduclaw_memory::wiki_path::resolve_wiki_page(wiki_dir, &id, false) else { return true; };
+    resolved_page_hidden(&target, scope, registry, read)
+}
+
+fn resolved_page_hidden(
+    target: &duduclaw_memory::wiki_path::ResolvedWikiPage,
+    scope: &ReadScope,
+    registry: &duduclaw_gateway::auto_wiki_page::AutoPageRegistry,
+    read: impl FnOnce(&str) -> Option<String>,
+) -> bool {
     let ReadScope::Conversation(session) = scope else { return false; };
     if !target.is_auto { return false; }
     let raw = read(&target.id);
     !duduclaw_gateway::auto_wiki_page::resolved_auto_page_visible(
         &target.id, raw.as_deref(), session.as_deref(), registry,
     )
+}
+
+fn cached_page_hidden(
+    resolver: &mut duduclaw_memory::wiki_path::WikiPageResolver,
+    page_path: &str,
+    scope: &ReadScope,
+    registry: &duduclaw_gateway::auto_wiki_page::AutoPageRegistry,
+    raw: Option<&str>,
+) -> bool {
+    let Ok(id) = duduclaw_memory::wiki_path::canonical_page_argument(page_path) else { return true; };
+    let Ok(target) = resolver.resolve(&id) else { return true; };
+    resolved_page_hidden(&target, scope, registry, |_| match raw {
+        Some(raw) => Some(raw.to_string()),
+        None => duduclaw_memory::wiki_path::read_resolved_wiki_file_nofollow(&target).ok(),
+    })
 }
 
 /// The one answer every MCP wiki mutation gives when its source or
@@ -101,6 +125,7 @@ fn redact_reserved_listing(wiki_dir: &Path, content: &str, scope: &ReadScope) ->
     if *scope == ReadScope::Employee {
         return content.to_string();
     }
+    let mut resolver = duduclaw_memory::wiki_path::WikiPageResolver::new(wiki_dir);
     let mut out: String = content
         .lines()
         .filter(|line| !line.to_ascii_lowercase().contains("auto/") && !line.split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '`' | '|'))
@@ -108,7 +133,7 @@ fn redact_reserved_listing(wiki_dir: &Path, content: &str, scope: &ReadScope) ->
             .any(|token| {
                 if duduclaw_core::wiki_auto_namespace::is_auto_page_path(token) { return true; }
                 let Ok(id) = duduclaw_memory::wiki_path::canonical_page_argument(token) else { return true; };
-                duduclaw_memory::wiki_path::resolve_wiki_page(wiki_dir, &id, false)
+                resolver.resolve(&id)
                     .map(|target| target.is_auto).unwrap_or(true)
             }))
         .collect::<Vec<_>>()
@@ -127,11 +152,15 @@ fn visible_page_ids(
     scope: &ReadScope,
     registry: &duduclaw_gateway::auto_wiki_page::AutoPageRegistry,
 ) -> Vec<String> {
+    let mut resolver = duduclaw_memory::wiki_path::WikiPageResolver::new(wiki_dir);
     pages.into_iter()
-        .filter(|path| !auto_page_hidden(wiki_dir, path, scope, registry))
         .filter_map(|path| {
             let id = duduclaw_memory::wiki_path::canonical_page_argument(&path).ok()?;
-            duduclaw_memory::wiki_path::resolve_wiki_page(wiki_dir, &id, false).ok().map(|target| target.id)
+            let target = resolver.resolve(&id).ok()?;
+            if resolved_page_hidden(&target, scope, registry, |_| {
+                duduclaw_memory::wiki_path::read_resolved_wiki_file_nofollow(&target).ok()
+            }) { return None; }
+            Some(target.id)
         })
         .collect()
 }
@@ -195,8 +224,10 @@ pub(crate) async fn handle_wiki_ls_in(
         pages.len()
     ));
 
+    let mut resolver = duduclaw_memory::wiki_path::WikiPageResolver::new(&wiki_dir);
     for rel_path in &pages {
-        let content = duduclaw_memory::wiki_path::read_wiki_file_nofollow(&wiki_dir, rel_path).unwrap_or_default();
+        let content = resolver.resolve(rel_path)
+            .and_then(|page| duduclaw_memory::wiki_path::read_resolved_wiki_file_nofollow(&page)).unwrap_or_default();
         let title = extract_frontmatter_title(&content)
             .unwrap_or_else(|| rel_path.to_string());
         let updated = extract_frontmatter_updated(&content).unwrap_or_else(|| "?".to_string());
@@ -647,8 +678,9 @@ pub(crate) async fn handle_wiki_search_in(
         // content the search itself read and the registry loaded once here.
         ReadScope::Conversation(_) => {
             let registry = auto_registry_for(home_dir, agent_id, scope);
+            let resolver = std::cell::RefCell::new(duduclaw_memory::wiki_path::WikiPageResolver::new(&wiki_dir));
             let visible = |rel: &str, raw: &str| {
-                !auto_page_hidden_with(&wiki_dir, rel, scope, &registry, |_| Some(raw.to_string()))
+                !cached_page_hidden(&mut resolver.borrow_mut(), rel, scope, &registry, Some(raw))
             };
             store.search_filtered_visible(query, limit, min_trust, layer_filter, expand, &visible)
         }
@@ -701,7 +733,8 @@ pub(crate) async fn handle_wiki_lint(args: &Value, home_dir: &Path, default_agen
         Ok(mut report) => {
             if scope != ReadScope::Employee {
                 let registry = auto_registry_for(home_dir, agent_id, &scope);
-                let hidden = |p: &str| auto_page_hidden(&wiki_dir, p, &scope, &registry);
+                let mut resolver = duduclaw_memory::wiki_path::WikiPageResolver::new(&wiki_dir);
+                let mut hidden = |p: &str| cached_page_hidden(&mut resolver, p, &scope, &registry, None);
                 let hidden_total = collect_md_files(&wiki_dir, &wiki_dir)
                     .iter()
                     .filter(|rel| hidden(rel))
@@ -779,10 +812,11 @@ pub(crate) async fn handle_wiki_stats(args: &Value, home_dir: &Path, default_age
     let scope = wiki_read_scope(default_agent);
     let registry = auto_registry_for(home_dir, agent_id, &scope);
     let store = duduclaw_memory::WikiStore::new(wiki_dir.clone());
+    let mut resolver = duduclaw_memory::wiki_path::WikiPageResolver::new(&wiki_dir);
     let pages = match store.list_pages() {
         Ok(p) => p
             .into_iter()
-            .filter(|p| !auto_page_hidden(&wiki_dir, &p.path, &scope, &registry))
+            .filter(|p| !cached_page_hidden(&mut resolver, &p.path, &scope, &registry, None))
             .collect::<Vec<_>>(),
         Err(e) => return tool_error(&format!("Failed to list pages: {e}")),
     };
@@ -1164,12 +1198,15 @@ mod conversation_scope_tests {
         let registry = auto_registry_for(home, "alice", &ReadScope::Conversation(None));
         let in_b = ReadScope::Conversation(Some("telegram:B".into()));
         let aliases = [r"auto\sop\x.md", r"auto/sop\x.md", r".\auto\sop\x.md", r"AUTO\x.md", r"auto\\x.md", r"a\..\auto\x.md"];
+        let mut resolver = duduclaw_memory::wiki_path::WikiPageResolver::new(&wiki);
         // Inject records directly: Unix read_dir cannot produce Windows ids.
         for alias in aliases {
             let mut page = duduclaw_memory::wiki::parse_wiki_page(&path, &raw).unwrap();
             page.path = alias.to_string();
             assert!(visible_page_ids(vec![page.path.clone()], &wiki, &in_b, &registry).is_empty(), "list {alias}");
             assert!(auto_page_hidden_with(&wiki, &page.path, &in_b, &registry, |_| Some(raw.clone())), "search predicate {alias}");
+            assert!(cached_page_hidden(&mut resolver, &page.path, &in_b, &registry, Some(&raw)), "cached search predicate {alias}");
+            assert!(cached_page_hidden(&mut resolver, &page.path, &in_b, &registry, None), "cached list predicate {alias}");
             assert!(auto_namespace_mutation_refused(alias), "write {alias}");
             let read = handle_wiki_read_in(&serde_json::json!({"page_path": alias}), home, "alice", &in_b).await;
             assert_eq!(read["isError"], true, "read {alias}: {}", text(&read));

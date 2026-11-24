@@ -497,6 +497,13 @@ impl WikiTrustStore {
     /// Persistent writes bind to a real, unambiguous page. In-memory stores
     /// have no filesystem and retain portable ids for isolated consumers.
     fn resolved_page_id(&self, page_path: &str, agent_id: &str) -> Result<String> {
+        self.resolved_page_id_with(page_path, agent_id, None)
+    }
+
+    fn resolved_page_id_with(
+        &self, page_path: &str, agent_id: &str,
+        resolver: Option<&mut crate::wiki_path::WikiPageResolver>,
+    ) -> Result<String> {
         let id = crate::wiki_path::persisted_page_id(page_path)
             .ok_or_else(|| DuDuClawError::Memory("invalid trust page id".into()))?;
         let Some(home) = self.trust_home() else { return Ok(id); };
@@ -504,10 +511,29 @@ impl WikiTrustStore {
             return Err(DuDuClawError::Memory("invalid trust agent id".into()));
         }
         let wiki = home.join("agents").join(agent_id).join("wiki");
-        let page = crate::wiki_path::resolve_wiki_page(&wiki, &id, false)
+        let page = match resolver {
+            Some(resolver) => resolver.resolve(&id),
+            None => crate::wiki_path::resolve_wiki_page(&wiki, &id, false),
+        }
             .map_err(|e| DuDuClawError::Memory(format!("trust page refused: {e}")))?;
         if !page.exists { return Err(DuDuClawError::Memory("trust page does not exist".into())); }
         Ok(page.id)
+    }
+
+    /// Trust batches may span agents. Keep one resolver per wiki only for the
+    /// duration of the batch; database updates do not mutate wiki directories.
+    fn resolved_page_id_in_batch(
+        &self, page_path: &str, agent_id: &str,
+        resolvers: &mut std::collections::HashMap<String, crate::wiki_path::WikiPageResolver>,
+    ) -> Result<String> {
+        let Some(home) = self.trust_home() else { return self.resolved_page_id(page_path, agent_id); };
+        if !duduclaw_core::is_valid_agent_id(agent_id) {
+            return Err(DuDuClawError::Memory("invalid trust agent id".into()));
+        }
+        let resolver = resolvers.entry(agent_id.to_string()).or_insert_with(|| {
+            crate::wiki_path::WikiPageResolver::new(&home.join("agents").join(agent_id).join("wiki"))
+        });
+        self.resolved_page_id_with(page_path, agent_id, Some(resolver))
     }
 
     /// Fence for the Wiki root that owns `agent_id`'s trust rows.
@@ -874,15 +900,26 @@ impl WikiTrustStore {
     ) -> Result<std::collections::HashMap<String, WikiTrustSnapshot>> {
         let mut wanted: std::collections::HashMap<String, Vec<String>> = Default::default();
         let mut out: std::collections::HashMap<String, WikiTrustSnapshot> = Default::default();
-        for path in page_paths {
+        let resolved: Vec<Option<String>> = match self.trust_home() {
+            Some(home) if duduclaw_core::is_valid_agent_id(agent_id) => {
+                let ids: Vec<_> = page_paths.iter().map(|path| {
+                    crate::wiki_path::persisted_page_id(path).unwrap_or_else(|| path.clone())
+                }).collect();
+                let wiki = home.join("agents").join(agent_id).join("wiki");
+                crate::wiki_path::WikiPageResolver::new(&wiki).resolve_many(&ids)
+                    .into_iter().map(|page| page.ok().filter(|page| page.exists).map(|page| page.id)).collect()
+            }
+            _ => page_paths.iter().map(|path| self.resolved_page_id(path, agent_id).ok()).collect(),
+        };
+        for (path, resolved) in page_paths.iter().zip(resolved) {
             let key = crate::wiki_path::persisted_page_id(path).unwrap_or_else(|| path.clone());
-            match self.resolved_page_id(path, agent_id) {
-                Ok(resolved) => {
+            match resolved {
+                Some(resolved) => {
                     let folded = crate::wiki_path::folded_page_id(&resolved)
                         .ok_or_else(|| DuDuClawError::Memory("invalid resolved trust id".into()))?;
                     wanted.entry(folded).or_default().push(key);
                 }
-                Err(_) => {
+                None => {
                     // Callers may fall back to frontmatter on database errors.
                     // Return an explicit quarantine for unresolved identities.
                     out.insert(key.clone(), WikiTrustSnapshot {
@@ -981,9 +1018,10 @@ impl WikiTrustStore {
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| DuDuClawError::Memory(format!("trust txn begin: {e}")))?;
+        let resolved = self.resolved_page_id(page_path, agent_id)?;
         let result = self.upsert_signal_in_tx(
             &tx,
-            page_path,
+            &resolved,
             agent_id,
             signal,
             conversation_id,
@@ -998,7 +1036,7 @@ impl WikiTrustStore {
     /// responsible for both. Used by `upsert_signal` (single-row commit)
     /// and `upsert_signal_batch` (one Tx for many rows → 1 fsync per
     /// batch instead of N). Caller must have filtered out
-    /// `TrustSignal::Neutral` before calling.
+    /// `TrustSignal::Neutral` and resolved the on-disk page id before calling.
     fn upsert_signal_in_tx(
         &self,
         tx: &rusqlite::Transaction<'_>,
@@ -1008,8 +1046,6 @@ impl WikiTrustStore {
         conversation_id: Option<&str>,
         composite_error: Option<f64>,
     ) -> Result<UpsertResult> {
-        let resolved = self.resolved_page_id(page_path, agent_id)?;
-        let page_path = resolved.as_str();
         debug_assert!(signal.is_actionable(), "caller must filter Neutral");
 
         let default_trust = self.config.default_trust;
@@ -1557,6 +1593,7 @@ impl WikiTrustStore {
             .map_err(|e| DuDuClawError::Memory(format!("trust batch txn begin: {e}")))?;
 
         let mut out = Vec::with_capacity(signals.len());
+        let mut resolvers = Default::default();
         for (page, agent, sig, conv, err) in signals {
             if !sig.is_actionable() {
                 out.push(UpsertResult::SkippedNeutral);
@@ -1564,7 +1601,8 @@ impl WikiTrustStore {
             }
             // Any error here drops the Tx via its Drop impl → automatic
             // rollback. Caller sees the error and an empty/short `out`.
-            let r = self.upsert_signal_in_tx(&tx, page, agent, *sig, conv.as_deref(), *err)?;
+            let resolved = self.resolved_page_id_in_batch(page, agent, &mut resolvers)?;
+            let r = self.upsert_signal_in_tx(&tx, &resolved, agent, *sig, conv.as_deref(), *err)?;
             out.push(r);
         }
 
@@ -1983,6 +2021,7 @@ impl WikiTrustStore {
             .map_err(|e| DuDuClawError::Memory(format!("import txn: {e}")))?;
 
         let mut applied = 0u64;
+        let mut resolvers = Default::default();
         for u in updates {
             // CRITICAL (review C3): a malicious peer could inject path-traversal
             // page_paths or oversized agent_ids. These end up in audit history
@@ -1997,7 +2036,7 @@ impl WikiTrustStore {
                 );
                 continue;
             }
-            let resolved = self.resolved_page_id(&u.page_path, &u.agent_id)?;
+            let resolved = self.resolved_page_id_in_batch(&u.page_path, &u.agent_id, &mut resolvers)?;
             // Trust must be in [0, 1] — a malicious peer could push 1e308.
             let incoming_trust = u.trust.clamp(0.0, 1.0);
 
@@ -2672,6 +2711,50 @@ mod tests {
         let s = WikiTrustStore::open(home.path().join("wiki_trust.db")).unwrap();
         assert!(s.manual_set("Bad.md", "agnes", 1.0, false, None, None).is_err());
         assert!(s.get("Bad.md", "agnes").unwrap().unwrap().do_not_inject);
+    }
+
+    #[test]
+    fn get_many_lists_directories_not_pages_and_preserves_folded_trust() {
+        for per_directory in [8, 64] {
+            let home = tempfile::tempdir().unwrap();
+            let wiki = home.path().join("agents/agnes/wiki");
+            let s = WikiTrustStore::open(home.path().join("wiki_trust.db")).unwrap();
+            let mut paths = Vec::new();
+            for directory in ["MiXeD", "Other", "Other/NeStEd"] {
+                std::fs::create_dir_all(wiki.join(directory)).unwrap();
+                for index in 0..per_directory {
+                    let id = format!("{directory}/PaGe{index}.md");
+                    std::fs::write(wiki.join(&id), "body").unwrap();
+                    s.with_conn_mut(|conn| {
+                        conn.execute("INSERT INTO wiki_trust_state(page_path,agent_id,trust,locked,do_not_inject) VALUES (?1,'agnes',0.9,0,0)", [&id]).unwrap();
+                        // Legacy aliases must still combine restrictively.
+                        conn.execute("INSERT INTO wiki_trust_state(page_path,agent_id,trust,locked,do_not_inject) VALUES (?1,'agnes',0.05,1,1)", [id.to_lowercase()]).unwrap();
+                        Ok(())
+                    }).unwrap();
+                    paths.push(id.to_lowercase());
+                    paths.push(format!("{}/PAGE{index}.md", directory.to_uppercase()));
+                }
+            }
+            let expected: std::collections::HashMap<_, _> = paths.iter().map(|path| {
+                let disk = crate::wiki_path::resolve_wiki_page(&wiki, path, false).unwrap();
+                assert_eq!(s.resolved_page_id(path, "agnes").unwrap(), disk.id);
+                (path.clone(), s.get(path, "agnes").unwrap().unwrap())
+            }).collect();
+            let before = crate::wiki_path::directory::LISTING_COUNT.with(|count| count.get());
+            let actual = s.get_many("agnes", &paths).unwrap();
+            let after = crate::wiki_path::directory::LISTING_COUNT.with(|count| count.get());
+            assert_eq!(after - before, 4);
+            assert_eq!(serde_json::to_value(&actual).unwrap(), serde_json::to_value(&expected).unwrap());
+            assert!(actual.values().all(|snapshot| snapshot.trust < 0.1 && snapshot.locked && snapshot.do_not_inject));
+
+            let missing: Vec<_> = (0..64).map(|i| format!("mixed/missing{i}.md")).collect();
+            let before = crate::wiki_path::directory::LISTING_COUNT.with(|count| count.get());
+            let denied = s.get_many("agnes", &missing).unwrap();
+            let after = crate::wiki_path::directory::LISTING_COUNT.with(|count| count.get());
+            assert_eq!(after - before, 2);
+            assert_eq!(denied.len(), missing.len());
+            assert!(denied.values().all(|snapshot| snapshot.trust == 0.0 && snapshot.locked && snapshot.do_not_inject));
+        }
     }
 
     #[test]

@@ -52,7 +52,8 @@ pub(super) fn collect(
         &root,
         0,
         &mut entries,
-        &mut |relative| {
+        &mut |resolved| {
+            let relative = resolved.id.as_str();
             (&mut *checkpoint.borrow_mut())()?;
             let live = authorize(home, ctx, request)?;
             if shared {
@@ -67,7 +68,7 @@ pub(super) fn collect(
                 return Err("EXPORT_TOO_LARGE".into());
             }
             let (page, raw) = store
-                .read_export_page(relative, MAX_BYTES.saturating_sub(*bytes as u64))
+                .read_resolved_export_page(&resolved, MAX_BYTES.saturating_sub(*bytes as u64))
                 .map_err(|error| match error {
                     duduclaw_core::error::DuDuClawError::Memory(code)
                         if code == "EXPORT_TOO_LARGE" =>
@@ -105,11 +106,11 @@ fn visit(
     directory: &Path,
     depth: usize,
     entries: &mut usize,
-    visitor: &mut impl FnMut(&str) -> ExportResult<()>,
+    visitor: &mut impl FnMut(duduclaw_memory::wiki_path::ResolvedWikiPage) -> ExportResult<()>,
     checkpoint: &mut impl FnMut() -> ExportResult<()>,
 ) -> ExportResult<duduclaw_memory::wiki_scan::ScanStats> {
     let _ = depth; // Depth is derived from the root by the shared walker.
-    let stats = duduclaw_memory::wiki_scan::visit(root, directory,
+    let stats = duduclaw_memory::wiki_scan::visit_resolved(root, directory,
         &mut |id| visitor(id).map_err(std::io::Error::other),
         &mut || {
             checkpoint().map_err(std::io::Error::other)?;
@@ -140,7 +141,7 @@ fn export_walker_skips_directory_and_file_links() {
     symlink(outside.path().join("secret.md"), root.path().join("alias.md")).unwrap();
     let mut found = Vec::new();
     visit(root.path(), root.path(), 0, &mut 0, &mut |id| {
-        found.push(id.to_string());
+        found.push(id.id);
         Ok(())
     }, &mut || Ok(())).unwrap();
     assert_eq!(found, vec!["ordinary.md".to_string()]);
@@ -159,7 +160,7 @@ fn rm209_export_scan_matches_store_and_counts_invalid_ids() {
     std::fs::write(root.path().join("bad\\name.md"), "body").unwrap();
     let mut exported = Vec::new();
     let stats = visit(root.path(), root.path(), 0, &mut 0, &mut |id| {
-        exported.push(id.to_string()); Ok(())
+        exported.push(id.id); Ok(())
     }, &mut || Ok(())).unwrap();
     exported.sort();
     let store = duduclaw_memory::WikiStore::new(root.path().to_path_buf());

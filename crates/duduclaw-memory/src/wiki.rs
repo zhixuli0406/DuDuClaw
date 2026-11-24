@@ -461,13 +461,28 @@ impl WikiStore {
         let canonical = crate::wiki_path::canonical_page_argument(path)
             .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
         let path = canonical.as_str();
-        use std::io::Read;
         self.validate_read_page_path(path)?;
         let _lease = self.delivery_fence().try_shared()?;
         let target = crate::wiki_path::resolve_wiki_page(&self.wiki_dir, path, false)
             .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        Self::read_export_target(&target, max_bytes)
+    }
+
+    /// Bounded export read using the scanner's classified page and held parent.
+    pub fn read_resolved_export_page(
+        &self, target: &crate::wiki_path::ResolvedWikiPage, max_bytes: u64,
+    ) -> Result<(WikiPage, String)> {
+        self.validate_read_page_path(&target.id)?;
+        let _lease = self.delivery_fence().try_shared()?;
+        Self::read_export_target(target, max_bytes)
+    }
+
+    fn read_export_target(
+        target: &crate::wiki_path::ResolvedWikiPage, max_bytes: u64,
+    ) -> Result<(WikiPage, String)> {
+        use std::io::Read;
         let path = target.id.as_str();
-        let file = crate::wiki_path::open_resolved_wiki_file_nofollow(&target)
+        let file = crate::wiki_path::open_resolved_wiki_file_nofollow(target)
             .map_err(|e| DuDuClawError::Memory(format!("export page open: {e}")))?;
         let metadata = file.metadata()
             .map_err(|e| DuDuClawError::Memory(format!("export page metadata: {e}")))?;
@@ -508,12 +523,12 @@ impl WikiStore {
 
     /// List metadata for all pages (excluding reserved files).
     pub fn list_pages(&self) -> Result<Vec<PageMeta>> {
-        let md_files = collect_md_files_recursive(&self.wiki_dir, &self.wiki_dir);
+        let md_files = crate::wiki_scan::collect_resolved(&self.wiki_dir, &self.wiki_dir);
         let mut pages = Vec::with_capacity(md_files.len());
 
-        for rel in md_files {
-            let rel_str = rel.to_string();
-            let content = match crate::wiki_path::read_wiki_file_nofollow(&self.wiki_dir, &rel) {
+        for page in md_files {
+            let rel_str = page.id.clone();
+            let content = match crate::wiki_path::read_resolved_wiki_file_nofollow(&page) {
                 Ok(c) => c,
                 Err(_) => continue,
             };
@@ -681,8 +696,9 @@ impl WikiStore {
 
         // Check for missing reciprocal backlinks in related pages
         let related = extract_string_list(content, "related");
+        let mut resolver = crate::wiki_path::WikiPageResolver::new(&self.wiki_dir);
         for rel_path in &related {
-            if let Some(rel_content) = self.read_linked_page(rel_path) {
+            if let Some(rel_content) = Self::read_linked_page(&mut resolver, rel_path) {
                 let rel_related = extract_string_list(&rel_content, "related");
                 if !rel_related.iter().any(|r| r == path) {
                     info!(
@@ -895,7 +911,7 @@ impl WikiStore {
             return Ok(Vec::new());
         }
 
-        let md_files = collect_md_files_recursive(&self.wiki_dir, &self.wiki_dir);
+        let md_files = crate::wiki_scan::collect_resolved(&self.wiki_dir, &self.wiki_dir);
         let mut hits: Vec<SearchHit> = Vec::new();
 
         // Live trust state from WikiTrustStore (when initialised). Bulk-loaded
@@ -907,7 +923,7 @@ impl WikiStore {
                 (Some(aid), Some(s)) => {
                     let all_paths: Vec<String> = md_files
                         .iter()
-                        .map(|p| p.to_string())
+                        .map(|p| p.id.clone())
                         .collect();
                     s.get_many(aid, &all_paths).ok()
                 }
@@ -916,8 +932,9 @@ impl WikiStore {
         };
 
         let mut judged = 0usize;
-        for rel in &md_files {
-            let content = match crate::wiki_path::read_wiki_file_nofollow(&self.wiki_dir, rel) {
+        for page in &md_files {
+            let rel = &page.id;
+            let content = match crate::wiki_path::read_resolved_wiki_file_nofollow(page) {
                 Ok(c) => c,
                 Err(_) => continue,
             };
@@ -1099,10 +1116,11 @@ impl WikiStore {
             let backlinks = self.build_backlink_index()?;
             let direct_paths: HashSet<String> = hits.iter().map(|h| h.path.clone()).collect();
             let mut expanded_paths: HashSet<String> = HashSet::new();
+            let mut resolver = crate::wiki_path::WikiPageResolver::new(&self.wiki_dir);
 
             for hit in &hits {
                 // Outbound: read the page's `related` field
-                if let Some(content) = self.read_linked_page(&hit.path) {
+                if let Some(content) = Self::read_linked_page(&mut resolver, &hit.path) {
                     for rel in extract_string_list(&content, "related") {
                         let Some(rel) = crate::wiki_path::canonical_page_id(&rel) else { continue; };
                         if !direct_paths.contains(&rel) {
@@ -1125,7 +1143,7 @@ impl WikiStore {
                 // `related` entries are page content, i.e. caller-supplied:
                 // `related: [../../secret.md]` must not pull an outside file
                 // into the search results.
-                let Ok(target) = crate::wiki_path::resolve_wiki_page(&self.wiki_dir, &exp_path, false) else { continue; };
+                let Ok(target) = resolver.resolve(&exp_path) else { continue; };
                 // A textual auto alias pointing outwards still requires the
                 // auto gate. No registry identity under auto/ exists for that
                 // target, so filtered expansion conservatively omits it.
@@ -1215,12 +1233,14 @@ impl WikiStore {
     pub fn export_obsidian(&self, output_dir: &Path) -> Result<usize> {
         let pages = self.list_pages()?;
         let mut exported = 0;
+        let mut resolver = crate::wiki_path::WikiPageResolver::new(&self.wiki_dir);
 
         // Copy reserved files
         // Read through the no-follow helper: a reserved file replaced by a
         // symlink must not copy an outside file into the export.
         for reserved in crate::wiki_scan::RESERVED_FILES {
-            match crate::wiki_path::read_wiki_file_nofollow(&self.wiki_dir, reserved) {
+            match resolver.resolve(reserved)
+                .and_then(|page| crate::wiki_path::read_resolved_wiki_file_nofollow(&page)) {
                 Ok(content) => crate::wiki_path::atomic_write_nofollow_checked(&output_dir.join(reserved), &content, || {
                     crate::isolation_io::verify().map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))
                 }).map_err(|e| DuDuClawError::Memory(format!("copy {reserved}: {e}")))?,
@@ -1239,7 +1259,8 @@ impl WikiStore {
                         .map_err(|e| DuDuClawError::Memory(format!("mkdir: {e}")))?;
                 }
 
-            let content = crate::wiki_path::read_wiki_file_nofollow(&self.wiki_dir, &page.path)
+            let content = resolver.resolve(&page.path)
+                .and_then(|page| crate::wiki_path::read_resolved_wiki_file_nofollow(&page))
                 .map_err(|e| DuDuClawError::Memory(format!("read {}: {e}", page.path)))?;
 
             // Append Obsidian wikilinks for related pages
@@ -1312,10 +1333,11 @@ impl WikiStore {
         let mut dirs: Vec<_> = by_dir.into_iter().collect();
         dirs.sort_by(|a, b| a.0.cmp(&b.0));
 
+        let mut resolver = crate::wiki_path::WikiPageResolver::new(&self.wiki_dir);
         for (dir, dir_pages) in &dirs {
             html.push_str(&format!("<h2>{}/</h2>\n", html_escape(dir)));
             for page in dir_pages {
-                let raw = self.read_raw(&page.path).unwrap_or_default();
+                let raw = Self::read_linked_page(&mut resolver, &page.path).unwrap_or_default();
                 let body = extract_body(&raw);
                 let tags_html: String = page.tags.iter()
                     .map(|t| format!("<span>{}</span>", html_escape(t)))
@@ -1463,9 +1485,11 @@ impl WikiStore {
         let pages = self.list_pages()?;
         let page_paths: HashSet<String> = pages.iter().map(|p| p.path.clone()).collect();
         let mut backlinks: HashMap<String, Vec<String>> = HashMap::new();
+        let mut resolver = crate::wiki_path::WikiPageResolver::new(&self.wiki_dir);
 
         for page in &pages {
-            let content = match crate::wiki_path::read_wiki_file_nofollow(&self.wiki_dir, &page.path) {
+            let content = match resolver.resolve(&page.path)
+                .and_then(|page| crate::wiki_path::read_resolved_wiki_file_nofollow(&page)) {
                 Ok(c) => c,
                 Err(_) => continue,
             };
@@ -1476,7 +1500,7 @@ impl WikiStore {
 
             for target in related.into_iter().chain(body_links) {
                 let Some(target) = crate::wiki_path::canonical_page_id(&target) else { continue; };
-                let Ok(resolved) = crate::wiki_path::resolve_wiki_page(&self.wiki_dir, &target, false) else { continue; };
+                let Ok(resolved) = resolver.resolve(&target) else { continue; };
                 let target = resolved.id;
                 if page_paths.contains(&target) && target != page.path {
                     backlinks
@@ -1613,7 +1637,7 @@ impl WikiStore {
         &self,
         layer: WikiLayer,
     ) -> Result<Vec<(String, String, f32)>> {
-        let md_files = collect_md_files_recursive(&self.wiki_dir, &self.wiki_dir);
+        let md_files = crate::wiki_scan::collect_resolved(&self.wiki_dir, &self.wiki_dir);
         let mut results = Vec::new();
 
         let live_state: Option<std::collections::HashMap<String, crate::trust_store::WikiTrustSnapshot>> = {
@@ -1623,7 +1647,7 @@ impl WikiStore {
                 (Some(aid), Some(s)) => {
                     let all_paths: Vec<String> = md_files
                         .iter()
-                        .map(|p| p.to_string())
+                        .map(|p| p.id.clone())
                         .collect();
                     s.get_many(aid, &all_paths).ok()
                 }
@@ -1631,8 +1655,9 @@ impl WikiStore {
             }
         };
 
-        for rel in &md_files {
-            let content = match crate::wiki_path::read_wiki_file_nofollow(&self.wiki_dir, rel) {
+        for page in &md_files {
+            let rel = &page.id;
+            let content = match crate::wiki_path::read_resolved_wiki_file_nofollow(page) {
                 Ok(c) => c,
                 Err(_) => continue,
             };
@@ -1744,13 +1769,14 @@ impl WikiStore {
     /// Read a page named by page content (a `related` entry, a backlink, a
     /// search hit). Same rules as a caller-supplied path: shared validator,
     /// `.md` only, inside the wiki, no symlink. `None` on any refusal.
-    fn read_linked_page(&self, rel: &str) -> Option<String> {
+    fn read_linked_page(resolver: &mut crate::wiki_path::WikiPageResolver, rel: &str) -> Option<String> {
         let canonical = crate::wiki_path::canonical_page_argument(rel).ok()?;
         let rel = canonical.as_str();
         if crate::wiki_path::validate_relative_wiki_read_path(rel).is_err() || !rel.ends_with(".md") {
             return None;
         }
-        crate::wiki_path::read_wiki_file_nofollow(&self.wiki_dir, rel).ok()
+        let page = resolver.resolve(rel).ok()?;
+        crate::wiki_path::read_resolved_wiki_file_nofollow(&page).ok()
     }
 
     pub(crate) fn validate_read_page_path(&self, path: &str) -> Result<()> {
@@ -2903,8 +2929,10 @@ impl WikiStore {
 
         // Build adjacency list
         let mut edges: Vec<(String, String)> = Vec::new();
+        let mut resolver = crate::wiki_path::WikiPageResolver::new(&self.wiki_dir);
         for page in &pages {
-            let content = match crate::wiki_path::read_wiki_file_nofollow(&self.wiki_dir, &page.path) {
+            let content = match resolver.resolve(&page.path)
+                .and_then(|page| crate::wiki_path::read_resolved_wiki_file_nofollow(&page)) {
                 Ok(c) => c,
                 Err(_) => continue,
             };
@@ -2912,7 +2940,7 @@ impl WikiStore {
             let body_links = extract_body_links(&content);
             for target in related.into_iter().chain(body_links) {
                 let Some(target) = crate::wiki_path::persisted_page_id(&target) else { continue; };
-                let Ok(resolved) = crate::wiki_path::resolve_wiki_page(&self.wiki_dir, &target, false) else { continue; };
+                let Ok(resolved) = resolver.resolve(&target) else { continue; };
                 let target = resolved.id;
                 if page_set.contains(&target) && target != page.path {
                     edges.push((page.path.clone(), target));
@@ -3016,6 +3044,124 @@ impl WikiStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn listing_fixture(per_directory: usize) -> (tempfile::TempDir, WikiStore, Vec<WikiPage>) {
+        let root = tempfile::tempdir().unwrap();
+        let store = WikiStore { wiki_dir: root.path().to_path_buf(), shared: true };
+        // Avoid process-global trust state: persistent get_many is covered in
+        // trust_store's fixture. This keeps listing counts deterministic.
+        assert!(store.derived_agent_id().is_none());
+        let mut expected = Vec::new();
+        for directory in ["MiXeD", "Other", "Other/NeStEd"] {
+            std::fs::create_dir_all(root.path().join(directory)).unwrap();
+            for index in 0..per_directory {
+                let id = format!("{directory}/PaGe{index}.md");
+                let layer = if index % 2 == 0 { "identity" } else { "core" };
+                let content = format!(
+                    "---\ntitle: Page {directory} {index}\nupdated: 2026-11-24T00:00:00Z\ncreated: 2026-11-24T00:00:00Z\ntags: [fixture]\nauthor: tester\nlayer: {layer}\ntrust: 0.8\nsource_type: user_statement\ndo_not_inject: {}\n---\nlistingneedle body {index}\n",
+                    index % 7 == 0,
+                );
+                std::fs::write(root.path().join(&id), content).unwrap();
+                // Reference uses the original single-page resolver with an
+                // alternate spelling, not the scanner or batch resolver.
+                expected.push(store.read_page(&id.to_lowercase()).unwrap());
+            }
+        }
+        expected.sort_by(|a, b| a.path.cmp(&b.path));
+        (root, store, expected)
+    }
+
+    fn listing_count() -> usize {
+        crate::wiki_path::directory::LISTING_COUNT.with(|count| count.get())
+    }
+
+    #[test]
+    fn export_scan_reuses_resolved_pages_and_preserves_byte_limit() {
+        let (_root, store, expected) = listing_fixture(32);
+        let mut actual = Vec::new();
+        let before = listing_count();
+        crate::wiki_scan::visit_resolved(store.wiki_dir(), store.wiki_dir(), &mut |target| {
+            let (page, raw) = store.read_resolved_export_page(&target, 4096).unwrap();
+            assert!(raw.contains("listingneedle"));
+            assert!(store.read_resolved_export_page(&target, 1).is_err());
+            actual.push(page);
+            Ok(())
+        }, &mut || Ok(())).unwrap();
+        assert_eq!(listing_count() - before, 4);
+        actual.sort_by(|a, b| a.path.cmp(&b.path));
+        assert_eq!(serde_json::to_value(actual).unwrap(), serde_json::to_value(expected).unwrap());
+    }
+
+    #[test]
+    fn list_pages_lists_directories_not_pages() {
+        for per_directory in [8, 64] {
+            let (_root, store, expected) = listing_fixture(per_directory);
+            let before = listing_count();
+            let mut actual = store.list_pages().unwrap();
+            assert_eq!(listing_count() - before, 4);
+            actual.sort_by(|a, b| a.path.cmp(&b.path));
+            assert_eq!(actual.len(), expected.len());
+            for (actual, expected) in actual.iter().zip(&expected) {
+                assert_eq!(actual.path, expected.path);
+                assert_eq!(actual.title, expected.title);
+                assert_eq!(actual.updated, expected.updated);
+                assert_eq!(actual.tags, expected.tags);
+                assert_eq!(actual.author, expected.author);
+                assert_eq!(actual.layer, expected.layer);
+                assert_eq!(actual.trust, expected.trust);
+                assert_eq!(actual.source_type, expected.source_type);
+                assert_eq!(actual.do_not_inject, expected.do_not_inject);
+            }
+        }
+    }
+
+    #[test]
+    fn search_lists_directories_not_pages() {
+        for per_directory in [8, 64] {
+            let (_root, store, expected) = listing_fixture(per_directory);
+            let before = listing_count();
+            let mut actual = store.search("listingneedle", usize::MAX).unwrap();
+            assert_eq!(listing_count() - before, 4);
+            actual.sort_by(|a, b| a.path.cmp(&b.path));
+            let expected: Vec<_> = expected.iter().filter(|page| !page.do_not_inject).collect();
+            assert_eq!(actual.len(), expected.len());
+            for (actual, expected) in actual.iter().zip(expected) {
+                assert_eq!(actual.path, expected.path);
+                assert_eq!(actual.title, expected.title);
+                assert_eq!(actual.layer, expected.layer);
+                assert_eq!(actual.trust, expected.trust);
+                assert_eq!(actual.source_type, expected.source_type);
+                assert_eq!(actual.score, 1);
+                assert_eq!(actual.weighted_score, (0.5 + expected.trust as f64) * expected.source_type.ranking_factor());
+                assert_eq!(actual.context_lines, vec![expected.body.trim().to_string()]);
+            }
+        }
+    }
+
+    #[test]
+    fn injection_selection_lists_directories_not_pages() {
+        for per_directory in [8, 64] {
+            let (_root, store, expected) = listing_fixture(per_directory);
+            let mut expected_context = String::new();
+            for layer in [WikiLayer::Identity, WikiLayer::Core] {
+                let selected: Vec<_> = expected.iter()
+                    .filter(|page| page.layer == layer && !page.do_not_inject)
+                    .map(|page| (page.path.clone(), format!("## {}\n\n{}", page.title, page.body), page.trust))
+                    .collect();
+                let before = listing_count();
+                assert_eq!(store.collect_by_layer_with_meta(layer).unwrap(), selected);
+                assert_eq!(listing_count() - before, 4);
+                expected_context.push_str(&format!("### Wiki — {layer}\n\n"));
+                for (_, body, _) in selected {
+                    expected_context.push_str(&body);
+                    expected_context.push_str("\n\n");
+                }
+            }
+            let before = listing_count();
+            assert_eq!(store.build_injection_context(1_000_000).unwrap(), expected_context);
+            assert_eq!(listing_count() - before, 8, "one scan per injected layer");
+        }
+    }
 
     #[test]
     fn fts_reads_and_removes_legacy_windows_ids() {

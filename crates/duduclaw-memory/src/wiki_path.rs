@@ -114,10 +114,17 @@ pub struct ResolvedWikiPage {
     /// Whether the final component existed during resolution; opens recheck it.
     pub exists: bool,
     root: Arc<Directory>,
-    parent: Directory,
+    parent: Arc<Directory>,
 }
 
 impl ResolvedWikiPage {
+    /// The scanner has already refused ambiguous names in every ancestor.
+    pub(crate) fn from_scan(root: Arc<Directory>, parent: Arc<Directory>, id: String) -> io::Result<Self> {
+        require_canonical_id(&id)?;
+        validate_relative_wiki_read_path(&id).map_err(|e| invalid(&e))?;
+        finish_resolution(root, parent, &id, &id, false)
+    }
+
     fn verify_parent(&self) -> io::Result<()> {
         let current_root = Directory::root(&self.root.path)?;
         let parent_id = Path::new(&self.id).parent().ok_or_else(|| invalid("missing parent"))?;
@@ -154,21 +161,77 @@ fn resolve_from_root(root: Arc<Directory>, id: &str, write: bool) -> io::Result<
         } else {
             let resolved = resolved_parts.join("/");
             require_canonical_id(&resolved)?;
-            let is_auto = duduclaw_core::wiki_auto_namespace::is_auto_page_path(id)
-                || duduclaw_core::wiki_auto_namespace::is_auto_page_path(&resolved);
-            let exists = match parent.kind(&name) {
-                Ok(Kind::File) => true,
-                Ok(_) => return Err(denied("wiki page is not a regular file")),
-                Err(e) if (write || is_auto) && e.kind() == io::ErrorKind::NotFound => false,
-                Err(e) => return Err(e),
-            };
-            let full_path = parent.path.join(&name);
-            let page = ResolvedWikiPage { id: resolved, full_path, is_auto, exists, root, parent };
-            page.verify_parent()?;
-            return Ok(page);
+            return finish_resolution(root, Arc::new(parent), id, &resolved, write);
         }
     }
     Err(invalid("empty page id"))
+}
+
+fn finish_resolution(
+    root: Arc<Directory>, parent: Arc<Directory>, requested: &str, resolved: &str, write: bool,
+) -> io::Result<ResolvedWikiPage> {
+    require_canonical_id(resolved)?;
+    let name = Path::new(resolved).file_name().ok_or_else(|| invalid("missing page name"))?;
+    let is_auto = duduclaw_core::wiki_auto_namespace::is_auto_page_path(requested)
+        || duduclaw_core::wiki_auto_namespace::is_auto_page_path(resolved);
+    let exists = match parent.kind(name) {
+        Ok(Kind::File) => true,
+        Ok(_) => return Err(denied("wiki page is not a regular file")),
+        Err(e) if (write || is_auto) && e.kind() == io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e),
+    };
+    let full_path = parent.path.join(name);
+    let page = ResolvedWikiPage { id: resolved.to_string(), full_path, is_auto, exists, root, parent };
+    page.verify_parent()?;
+    Ok(page)
+}
+
+/// A read operation's directory snapshots. Never retain this across operations
+/// or filesystem writes. Failed listings are cached too: a capped directory
+/// must not be listed again for every rejected page. Keys use on-disk names,
+/// so differently spelled requests share the same snapshot and held handle.
+pub struct WikiPageResolver {
+    root: io::Result<Arc<Directory>>,
+    directories: std::collections::HashMap<String, io::Result<(Arc<Directory>, FoldedNames)>>,
+}
+
+fn copied_error(error: &io::Error) -> io::Error {
+    io::Error::new(error.kind(), error.to_string())
+}
+
+impl WikiPageResolver {
+    pub fn new(wiki_dir: &Path) -> Self {
+        Self { root: Directory::root(wiki_dir).map(Arc::new), directories: Default::default() }
+    }
+
+    pub fn resolve(&mut self, id: &str) -> io::Result<ResolvedWikiPage> {
+        require_canonical_id(id)?;
+        validate_relative_wiki_read_path(id).map_err(|e| invalid(&e))?;
+        let root = self.root.as_ref().map_err(copied_error)?.clone();
+        let mut parent = root.clone();
+        let mut resolved_parts = Vec::new();
+        let parts: Vec<_> = id.split('/').collect();
+        for (index, part) in parts.iter().enumerate() {
+            let key = resolved_parts.join("/");
+            let snapshot = self.directories.entry(key).or_insert_with(|| {
+                let directory = if index == 0 { Ok(root.clone()) }
+                    else { parent.child(std::ffi::OsStr::new(&resolved_parts[index - 1]), false).map(Arc::new) }?;
+                let names = directory.names(MAX_DIRECTORY_ENTRIES, &mut || Ok(()))?;
+                Ok((directory, FoldedNames::new(&names)))
+            }).as_ref().map_err(copied_error)?;
+            parent = snapshot.0.clone();
+            let name = snapshot.1.resolve(part)?;
+            resolved_parts.push(name.to_str().ok_or_else(|| invalid("non-UTF8 wiki name"))?.to_owned());
+            if index + 1 == parts.len() {
+                return finish_resolution(root, parent, id, &resolved_parts.join("/"), false);
+            }
+        }
+        Err(invalid("empty page id"))
+    }
+
+    pub fn resolve_many(&mut self, ids: &[String]) -> Vec<io::Result<ResolvedWikiPage>> {
+        ids.iter().map(|id| self.resolve(id)).collect()
+    }
 }
 
 pub use duduclaw_core::fs_safety::is_link_metadata;
@@ -866,6 +929,41 @@ mod rm209_identity_tests {
     use super::*;
 
     #[test]
+    fn batch_resolution_matches_single_page_resolution_with_one_listing_per_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let mut ids = Vec::new();
+        for directory in ["MiXeD", "Other", "Other/NeStEd", "auto"] {
+            std::fs::create_dir_all(root.path().join(directory)).unwrap();
+            for index in 0..32 {
+                let id = format!("{directory}/PaGe{index}.md");
+                std::fs::write(root.path().join(&id), &id).unwrap();
+                ids.push(id.to_lowercase());
+                ids.push(format!("{}/PAGE{index}.md", directory.to_uppercase()));
+            }
+        }
+        ids.extend(["AUTO/not-yet.md", "mixed/missing.md", "../escape.md"].map(str::to_string));
+        let expected: Vec<_> = ids.iter().map(|id| resolve_wiki_page(root.path(), id, false)).collect();
+        let before = directory::LISTING_COUNT.with(|count| count.get());
+        let actual = WikiPageResolver::new(root.path()).resolve_many(&ids);
+        assert_eq!(directory::LISTING_COUNT.with(|count| count.get()) - before, 5);
+        for (actual, expected) in actual.into_iter().zip(expected) {
+            match (actual, expected) {
+                (Ok(actual), Ok(expected)) => {
+                    assert_eq!(actual.id, expected.id);
+                    assert_eq!(actual.full_path, expected.full_path);
+                    assert_eq!(actual.is_auto, expected.is_auto);
+                    assert_eq!(actual.exists, expected.exists);
+                    if actual.exists {
+                        assert_eq!(read_resolved_wiki_file_nofollow(&actual).unwrap(), read_resolved_wiki_file_nofollow(&expected).unwrap());
+                    }
+                }
+                (Err(actual), Err(expected)) => assert_eq!(actual.kind(), expected.kind()),
+                (actual, expected) => panic!("batch {actual:?} differs from single {expected:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn folded_filename_resolves_to_disk_identity_or_refuses() {
         let root = tempfile::tempdir().unwrap();
         for (disk, aliases) in [
@@ -903,6 +1001,10 @@ mod rm209_identity_tests {
             assert!(resolve_wiki_page(root.path(), name, false).is_err());
             assert!(resolve_wiki_page(root.path(), name, true).is_err());
         }
+        let before = directory::LISTING_COUNT.with(|count| count.get());
+        let ids = ["Bad.md", "bad.md", "BAD.md"].map(str::to_string);
+        assert!(WikiPageResolver::new(root.path()).resolve_many(&ids).iter().all(Result::is_err));
+        assert_eq!(directory::LISTING_COUNT.with(|count| count.get()) - before, 1);
     }
 
     #[cfg(unix)]
@@ -930,9 +1032,17 @@ mod parent_race_tests {
             std::fs::File::create(root.path().join(format!("{index}.md"))).unwrap();
         }
         assert!(resolve_wiki_page(root.path(), "0.md", false).is_ok());
+        let ids = ["0.md", "1.md", "2.md"].map(str::to_string);
+        let before = directory::LISTING_COUNT.with(|count| count.get());
+        assert!(WikiPageResolver::new(root.path()).resolve_many(&ids).iter().all(Result::is_ok));
+        assert_eq!(directory::LISTING_COUNT.with(|count| count.get()) - before, 1);
         std::fs::File::create(root.path().join("over-limit.md")).unwrap();
         let error = resolve_wiki_page(root.path(), "0.md", false).unwrap_err();
         assert!(error.to_string().contains("directory entry limit"));
+        let before = directory::LISTING_COUNT.with(|count| count.get());
+        let results = WikiPageResolver::new(root.path()).resolve_many(&ids);
+        assert!(results.iter().all(|result| result.as_ref().unwrap_err().to_string().contains("directory entry limit")));
+        assert_eq!(directory::LISTING_COUNT.with(|count| count.get()) - before, 1, "failed snapshots are shared too");
     }
 
     #[cfg(unix)]
@@ -944,9 +1054,14 @@ mod parent_race_tests {
         std::fs::write(root.path().join("notes/page.md"), "inside").unwrap();
         std::fs::write(outside.path().join("page.md"), "outside").unwrap();
         let page = resolve_wiki_page(root.path(), "notes/page.md", false).unwrap();
+        let mut resolver = WikiPageResolver::new(root.path());
+        let cached = resolver.resolve("NOTES/page.md").unwrap();
         std::fs::rename(root.path().join("notes"), root.path().join("held")).unwrap();
         std::os::unix::fs::symlink(outside.path(), root.path().join("notes")).unwrap();
         assert!(read_resolved_wiki_file_nofollow(&page).is_err());
+        assert!(read_resolved_wiki_file_nofollow(&cached).is_err());
+        assert!(resolver.resolve("notes/page.md").is_err());
+        assert!(WikiPageResolver::new(root.path()).resolve("notes/page.md").is_err());
         assert!(atomic_write_resolved_checked(&page, "attack", || Ok(())).is_err());
         assert!(atomic_write_nofollow(&page.full_path, "attack").is_err());
         assert!(prepare_wiki_write_page(root.path(), "notes/new/page.md").is_err());
