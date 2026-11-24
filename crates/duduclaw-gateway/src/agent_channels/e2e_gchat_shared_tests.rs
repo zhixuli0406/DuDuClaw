@@ -110,6 +110,28 @@ async fn rm148_unbound_and_impersonated_display_name_get_only_custom_text_withou
 }
 
 #[tokio::test]
+async fn rm148_unbound_mentions_and_lists_never_enter_model_or_expose_employees() {
+    for text in ["@dudu hello", "@sales hello", "@"] {
+        let f = shared_fixture().await;
+        enabled(&f, true).await;
+        // Even a public employee must remain behind shared-DM membership.
+        crate::trigger_route::tests::write_agent(
+            &f.home.path().join("agents"), "sales", "Sales", "@sales", "specialist",
+            "\n[channels]\npublic_trigger = true\n",
+        );
+        f.state.ctx.registry.write().await.scan().await.unwrap();
+        f.state.ctx.channel_settings.set("googlechat", "global", keys::UNBOUND_REPLY, "請聯絡管理員。").await.unwrap();
+        let mut waiting = super::super::e2e_seam::arm_waiting(f.home.path());
+        turn(&f, &dm("spaces/UNBOUNDMENTION", text, "users/123")).await;
+        assert!(waiting.entered.try_recv().is_err(), "no model entry for {text}");
+        assert!(observations(&f).is_empty());
+        assert_eq!(replies(&f), vec!["請聯絡管理員。"], "no employee names for {text}");
+        assert!(f.state.ctx.session_manager.list_sessions(None, 20).await.unwrap().is_empty());
+        assert!(!f.home.path().join("googlechat_inbox.db").exists());
+    }
+}
+
+#[tokio::test]
 async fn rm148_binding_lookup_error_and_unavailable_avatar_fail_closed() {
     for failure in ["binding", "archived", "missing", "no_primary", "suspended"] {
         let f = shared_fixture().await;
@@ -135,7 +157,12 @@ async fn rm148_binding_lookup_error_and_unavailable_avatar_fail_closed() {
             }
             _ => f.db.set_user_status(&f.member, duduclaw_auth::UserStatus::Suspended).unwrap(),
         }
-        turn(&f, &dm("spaces/FAILCLOSED", "hello", "users/42")).await;
+        for text in ["hello", "@sales hello", "@"] {
+            assert_eq!(googlechat_shared::route(
+                &f.state.ctx, false, true, "googlechat:spaces/FAILCLOSED", "users/42", text,
+            ).await, Route::Unbound(googlechat_shared::DEFAULT_UNBOUND_REPLY.into()), "{failure}: {text}");
+        }
+        turn(&f, &dm("spaces/FAILCLOSED", "@sales hello", "users/42")).await;
         assert!(observations(&f).is_empty(), "{failure}");
         assert!(f.state.ctx.session_manager.list_sessions(None, 20).await.unwrap().is_empty(), "{failure}");
         assert_eq!(replies(&f), vec![googlechat_shared::DEFAULT_UNBOUND_REPLY], "{failure}");
@@ -148,13 +175,49 @@ async fn rm148_automatic_account_matching_cannot_select_an_avatar() {
     enabled(&f, true).await;
     crate::googlechat_identity::test_support::set_derivation(f.home.path(), true);
     crate::googlechat_identity::test_support::link_google(f.home.path(), &[(&f.member, "123", "connected")]);
-    turn(&f, &dm("spaces/AUTOMATCH", "hello", "users/123")).await;
+    let mut waiting = super::super::e2e_seam::arm_waiting(f.home.path());
+    for text in ["hello", "@sales hello", "@dudu hello", "@"] {
+        assert_eq!(googlechat_shared::route(
+            &f.state.ctx, false, true, "googlechat:spaces/AUTOMATCH", "users/123", text,
+        ).await, Route::Unbound(googlechat_shared::DEFAULT_UNBOUND_REPLY.into()));
+        turn(&f, &dm("spaces/AUTOMATCH", text, "users/123")).await;
+    }
+    assert!(waiting.entered.try_recv().is_err(), "automatic identity must not enter the model");
     assert!(observations(&f).is_empty());
     assert_eq!(replies(&f), vec![googlechat_shared::DEFAULT_UNBOUND_REPLY]);
     for id in ["42", "users/staff@rm148.test", "Staff"] {
         assert!(matches!(crate::shared_app_route::manual_googlechat_sender(f.home.path(), id).sender,
             crate::trigger_route::Sender::Unmapped));
     }
+}
+
+#[tokio::test]
+async fn rm148_bound_mentions_and_pending_use_only_the_manual_access() {
+    let f = shared_fixture().await;
+    enabled(&f, true).await;
+    // Automatic resolution refuses this conflict. Shared routing must use
+    // the manually resolved member for both mentions and pending picks.
+    crate::googlechat_identity::test_support::set_derivation(f.home.path(), true);
+    crate::googlechat_identity::test_support::link_google(f.home.path(), &[(&f.admin, "42", "connected")]);
+    let conversation = "googlechat:spaces/MANUAL";
+    assert_eq!(googlechat_shared::route(
+        &f.state.ctx, false, true, conversation, "users/42", "@sales hello",
+    ).await, Route::Called { agent: "sales".into(), via_trigger: true });
+    assert!(matches!(googlechat_shared::route(
+        &f.state.ctx, false, true, conversation, "users/42", "@sales",
+    ).await, Route::Direct(_)));
+    assert_eq!(googlechat_shared::route(
+        &f.state.ctx, false, true, conversation, "users/42", "hello",
+    ).await, Route::Called { agent: "sales".into(), via_trigger: true });
+    // Revoking the manual identity must also block an already armed pick,
+    // even while automatic Google-account recognition remains enabled.
+    assert!(matches!(googlechat_shared::route(
+        &f.state.ctx, false, true, conversation, "users/42", "@sales",
+    ).await, Route::Direct(_)));
+    f.db.unbind_channel_identity("googlechat", "users/42").unwrap();
+    assert_eq!(googlechat_shared::route(
+        &f.state.ctx, false, true, conversation, "users/42", "hello",
+    ).await, Route::Unbound(googlechat_shared::DEFAULT_UNBOUND_REPLY.into()));
 }
 
 #[tokio::test]

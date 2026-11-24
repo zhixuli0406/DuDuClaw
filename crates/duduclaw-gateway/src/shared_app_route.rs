@@ -33,6 +33,15 @@ pub(crate) async fn member_agent_route_under(
     ctx: &Arc<ReplyContext>, channel: &'static str, user_id: &str,
     restriction: Option<&dyn duduclaw_auth::acl::PersonalRestriction>,
 ) -> Option<String> {
+    member_route_under(ctx, channel, user_id, restriction).await.map(|(_, agent)| agent)
+}
+
+/// Return the same resolved identity that passed the avatar checks, so shared
+/// DM mention/pending routing never resolves an automatic Google identity.
+pub(crate) async fn member_route_under(
+    ctx: &Arc<ReplyContext>, channel: &'static str, user_id: &str,
+    restriction: Option<&dyn duduclaw_auth::acl::PersonalRestriction>,
+) -> Option<(SenderAccess, String)> {
     if user_id.is_empty() {
         return None;
     }
@@ -65,12 +74,12 @@ pub(crate) async fn member_agent_route_under(
     // Never the raw platform id in logs: a mapped sender is labelled by
     // dashboard account (an unmapped one would be a per-home keyed digest).
     let who = sender.audit_label(&ctx.home_dir, channel, user_id);
-    let sender =
-        sender.for_webchat(crate::webchat::access::gateway_default_id(&ctx.home_dir).await);
+    let avatar_access =
+        sender.clone().for_webchat(crate::webchat::access::gateway_default_id(&ctx.home_dir).await);
     let usable = {
         let reg = ctx.registry.read().await;
         reg.get(&primary)
-            .is_some_and(|agent| crate::webchat::access::primary_candidate_under(&sender, agent, restriction))
+            .is_some_and(|agent| crate::webchat::access::primary_candidate_under(&avatar_access, agent, restriction))
     };
     if usable {
         tracing::debug!(
@@ -81,6 +90,6 @@ pub(crate) async fn member_agent_route_under(
             "Shared app routed to the sender's avatar or primary employee"
         );
     }
-    usable.then_some(primary)
+    usable.then_some((sender, primary))
 }
 

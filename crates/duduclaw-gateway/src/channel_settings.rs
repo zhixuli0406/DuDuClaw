@@ -509,6 +509,49 @@ impl ChannelSettingsManager {
         }))
     }
 
+    /// Apply all upserts/deletions atomically. Readers see the old snapshot
+    /// until commit; failed writes leave both SQLite and the cache unchanged.
+    pub async fn apply_batch(
+        &self,
+        channel_type: &str,
+        scope_id: &str,
+        changes: &[(&str, Option<String>)],
+    ) -> Result<(), String> {
+        let mut connection = self.conn.lock().await;
+        verify_live_io()?;
+        // Preserve the DB -> cache lock order used by snapshot publication.
+        let mut cache = self.cache.write().await;
+        verify_live_io()?;
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let now = chrono::Utc::now().to_rfc3339();
+        for (key, value) in changes {
+            verify_live_io()?;
+            match value {
+                Some(value) => {
+                    tx.execute(
+                        "INSERT INTO channel_settings (channel_type, scope_id, key, value, updated_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5)
+                         ON CONFLICT(channel_type, scope_id, key) DO UPDATE SET value = ?4, updated_at = ?5",
+                        params![channel_type, scope_id, key, value, now],
+                    ).map_err(|e| e.to_string())?;
+                }
+                None => {
+                    tx.execute(
+                        "DELETE FROM channel_settings WHERE channel_type = ?1 AND scope_id = ?2 AND key = ?3",
+                        params![channel_type, scope_id, key],
+                    ).map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        verify_live_io()?;
+        tx.commit().map_err(|e| e.to_string())?;
+        for (key, value) in changes {
+            cache.insert(Self::cache_key(channel_type, scope_id, key), value.clone());
+        }
+        Ok(())
+    }
+
     /// Set a setting value (upsert). Invalidates cache for this key.
     pub async fn set(
         &self,
@@ -698,6 +741,41 @@ async fn pause_after_settings_read() {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    #[tokio::test]
+    async fn rm148_batch_second_key_failure_rolls_back_database_and_cache() {
+        for first_value in [Some("true".to_string()), None] {
+            let (_db, mgr) = temp_db();
+            mgr.set("googlechat", "global", keys::SHARED_BOT_BINDING, "false").await.unwrap();
+            mgr.set("googlechat", "global", keys::UNBOUND_REPLY, "old reply").await.unwrap();
+            mgr.conn.lock().await.execute_batch(
+                "CREATE TRIGGER fail_unbound_reply BEFORE INSERT ON channel_settings
+                 WHEN NEW.key = 'unbound_reply'
+                 BEGIN SELECT RAISE(ABORT, 'second key failed'); END;",
+            ).unwrap();
+            let err = mgr.apply_batch("googlechat", "global", &[
+                (keys::SHARED_BOT_BINDING, first_value),
+                (keys::UNBOUND_REPLY, Some("new reply".into())),
+            ]).await.unwrap_err();
+            assert!(err.contains("second key failed"), "{err}");
+            // Check the warm cache before any fresh database read can replace it.
+            assert_eq!(mgr.get("googlechat", "global", keys::SHARED_BOT_BINDING).await.as_deref(), Some("false"));
+            assert_eq!(mgr.get("googlechat", "global", keys::UNBOUND_REPLY).await.as_deref(), Some("old reply"));
+            mgr.cache.write().await.clear();
+            assert_eq!(mgr.get("googlechat", "global", keys::SHARED_BOT_BINDING).await.as_deref(), Some("false"));
+            assert_eq!(mgr.get("googlechat", "global", keys::UNBOUND_REPLY).await.as_deref(), Some("old reply"));
+            mgr.conn.lock().await.execute_batch("DROP TRIGGER fail_unbound_reply").unwrap();
+            mgr.apply_batch("googlechat", "global", &[
+                (keys::SHARED_BOT_BINDING, Some("true".into())),
+                (keys::UNBOUND_REPLY, None),
+            ]).await.unwrap();
+            assert_eq!(mgr.get("googlechat", "global", keys::SHARED_BOT_BINDING).await.as_deref(), Some("true"));
+            assert_eq!(mgr.get("googlechat", "global", keys::UNBOUND_REPLY).await, None);
+            mgr.cache.write().await.clear();
+            assert_eq!(mgr.get("googlechat", "global", keys::SHARED_BOT_BINDING).await.as_deref(), Some("true"));
+            assert_eq!(mgr.get("googlechat", "global", keys::UNBOUND_REPLY).await, None);
+        }
+    }
 
     #[tokio::test]
     async fn stale_refresh_and_cache_miss_cannot_overwrite_completed_set_or_delete() {

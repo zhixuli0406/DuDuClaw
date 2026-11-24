@@ -29,7 +29,12 @@ pub(crate) fn render_unbound_reply(home: &Path, text: &str) -> String {
     let url = crate::deep_link::public_dashboard_base_url(home)
         .filter(|base| url::Url::parse(base).is_ok_and(|url| url.scheme() == "https"))
         .and_then(|base| crate::deep_link::channel_link_base(&base));
-    text.replace(ONBOARDING_URL, url.as_deref().unwrap_or(""))
+    let rendered = text.replace(ONBOARDING_URL, url.as_deref().unwrap_or(""));
+    if rendered.chars().count() > 1000 {
+        text.replace(ONBOARDING_URL, "")
+    } else {
+        rendered
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -65,21 +70,25 @@ pub(crate) async fn route(
     if validate_unbound_reply(template).is_err() {
         return Route::Unbound(DEFAULT_UNBOUND_REPLY.into());
     }
+    // Membership and a usable avatar are prerequisites for every shared DM,
+    // including employee lists, explicit mentions and already armed picks.
+    let Some((access, avatar)) = crate::shared_app_route::member_route_under(
+        ctx, "googlechat", sender, duduclaw_auth::acl::personal_restriction(),
+    ).await else {
+        return Route::Unbound(render_unbound_reply(&ctx.home_dir, template));
+    };
     // Check for a mention without consuming a one-shot pick, then apply the
     // same gate as the ordinary pipeline before making its live decision.
     // Never hand a peek back to the default pipeline: if a grant or pending
     // pick disappears in between, it must resolve to avatar/unbound instead
     // of silently reaching the company default.
     if !crate::chat_commands::is_command(text) {
-        let (peek, _) = peek_turn(ctx, conversation, sender, text).await;
+        let (peek, _) = decide_turn(ctx, conversation, sender, text, false, Some(&access)).await;
         if !matches!(peek, crate::trigger_route::turn::TurnDecision::Default) {
             if let Some(reply) = crate::channel_reply::gate_direct_reply(ctx, conversation, sender, text).await {
-                let access = crate::shared_app_route::manual_googlechat_sender(&ctx.home_dir, sender);
-                return Route::Direct(if matches!(access.sender, crate::trigger_route::Sender::Unmapped) {
-                    String::new()
-                } else { reply });
+                return Route::Direct(reply);
             }
-            let (decision, fallback) = decide_turn(ctx, conversation, sender, text, true).await;
+            let (decision, fallback) = decide_turn(ctx, conversation, sender, text, true, Some(&access)).await;
             use crate::trigger_route::turn::{ReplyKind, TurnDecision};
             match decision {
                 TurnDecision::Agent { id, via_trigger } => return Route::Called { agent: id, via_trigger },
@@ -93,7 +102,7 @@ pub(crate) async fn route(
                         home: &ctx.home_dir, channel: "googlechat", conversation, sender,
                         event: None, seq: crate::trigger_route::pending::next_seq(),
                         fallback: fallback.as_deref(),
-                        access: crate::trigger_route::access::for_channel_sender(&ctx.home_dir, "googlechat", sender),
+                        access: access.clone(),
                     };
                     return Route::Direct(Box::pin(crate::trigger_route::assign::run_pending(ctx, &id, text, &caller)).await.text);
                 }
@@ -101,10 +110,7 @@ pub(crate) async fn route(
             }
         }
     }
-    match crate::shared_app_route::member_agent_route(ctx, "googlechat", sender).await {
-        Some(agent) => Route::Avatar(agent),
-        None => Route::Unbound(render_unbound_reply(&ctx.home_dir, template)),
-    }
+    Route::Avatar(avatar)
 }
 
 /// Peek only for pre-model recovery registration; the guarded pipeline still
@@ -112,24 +118,29 @@ pub(crate) async fn route(
 async fn peek_turn(
     ctx: &ReplyContext, conversation: &str, sender: &str, text: &str,
 ) -> (crate::trigger_route::turn::TurnDecision, Option<String>) {
-    decide_turn(ctx, conversation, sender, text, false).await
+    decide_turn(ctx, conversation, sender, text, false, None).await
 }
 
 async fn decide_turn(
     ctx: &ReplyContext, conversation: &str, sender: &str, text: &str, live: bool,
+    access: Option<&crate::trigger_route::SenderAccess>,
 ) -> (crate::trigger_route::turn::TurnDecision, Option<String>) {
     let reg = ctx.registry.read().await;
     let fallback = crate::channel_reply::resolve_fallback_agent(ctx, &reg, conversation, sender).await
         .map(|agent| agent.config.agent.name.clone());
     let event = uuid::Uuid::new_v4().to_string();
-    let decision = crate::trigger_route::turn::decide_channel_turn(
-        &ctx.home_dir, &reg, crate::trigger_route::turn::ChannelTurn {
-            channel: "googlechat", conversation, sender, text, fallback: fallback.as_deref(),
-            event: &event, seq: crate::trigger_route::pending::next_seq(), quiet: !live,
-            pending: if live { crate::trigger_route::turn::PendingPolicy::Live }
-                else { crate::trigger_route::turn::PendingPolicy::Peek },
-        },
-    );
+    let turn = crate::trigger_route::turn::ChannelTurn {
+        channel: "googlechat", conversation, sender, text, fallback: fallback.as_deref(),
+        event: &event, seq: crate::trigger_route::pending::next_seq(), quiet: !live,
+        pending: if live { crate::trigger_route::turn::PendingPolicy::Live }
+            else { crate::trigger_route::turn::PendingPolicy::Peek },
+    };
+    let decision = match access {
+        Some(access) => crate::trigger_route::turn::decide_channel_turn_with_access(
+            &ctx.home_dir, &reg, turn, access,
+        ),
+        None => crate::trigger_route::turn::decide_channel_turn(&ctx.home_dir, &reg, turn),
+    };
     (decision, fallback)
 }
 
@@ -147,15 +158,20 @@ pub(crate) async fn recovery_identity(
     }
 }
 
-/// One window per sender, across spaces; use the existing keyed audit label
-/// as the throttle key so separate gateway homes do not share a quota.
+/// One window per canonical sender, across spaces and binding changes.
+/// Audit labels remain account-based; quotas never depend on those labels.
 pub(crate) fn allow_unbound_reply(home: &Path, sender: &str) -> bool {
-    let who = crate::shared_app_route::manual_googlechat_sender(home, sender)
-        .audit_label(home, "googlechat", sender);
+    if crate::googlechat_identity::normalize_user_id(sender).as_deref() != Some(sender) {
+        return false;
+    }
+    let key = crate::trigger_route::access::keyed_digest_full(home, "googlechat", sender);
+    if key == "unavailable" { return false; }
     let allowed = crate::trigger_route::allow_direct_reply(
-        "googlechat", "shared-app-unbound", &who, crate::trigger_route::turn::ReplyKind::Refusal,
+        "googlechat", "shared-app-unbound", &key, crate::trigger_route::turn::ReplyKind::Refusal,
     );
     if allowed {
+        let who = crate::shared_app_route::manual_googlechat_sender(home, sender)
+            .audit_label(home, "googlechat", sender);
         tracing::info!(sender = %who, route = "unbound_reply", "Google Chat shared app unbound reply");
     }
     allowed
@@ -188,6 +204,24 @@ mod tests {
     }
 
     #[test]
+    fn rm148_onboarding_expansion_respects_unicode_character_limit() {
+        let home = tempfile::tempdir().unwrap();
+        let url = "https://dashboard.example.com/team";
+        std::fs::write(home.path().join("config.toml"), format!("[dashboard]\npublic_url = {url:?}\n")).unwrap();
+        for placeholders in [1, 2] {
+            let literal = "🐾".repeat(1000 - placeholders * url.chars().count());
+            let template = format!("{literal}{}", ONBOARDING_URL.repeat(placeholders));
+            assert!(validate_unbound_reply(&template).is_ok());
+            let rendered = render_unbound_reply(home.path(), &template);
+            assert_eq!(rendered, format!("{literal}{}", url.repeat(placeholders)));
+            assert_eq!(rendered.chars().count(), 1000);
+            let overflowing = format!("界{template}");
+            assert!(validate_unbound_reply(&overflowing).is_ok());
+            assert_eq!(render_unbound_reply(home.path(), &overflowing), format!("界{literal}"));
+        }
+    }
+
+    #[test]
     fn rm148_unbound_throttle_is_per_sender_and_home() {
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
@@ -195,5 +229,31 @@ mod tests {
         assert!(!allow_unbound_reply(first.path(), "users/42"));
         assert!(allow_unbound_reply(first.path(), "users/43"));
         assert!(allow_unbound_reply(second.path(), "users/42"));
+    }
+
+    #[test]
+    fn rm148_unbound_throttle_survives_binding_changes_and_separates_mapped_homes() {
+        use duduclaw_auth::{UserDb, UserRole};
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let db = UserDb::new(&first.path().join("users.db")).unwrap();
+        let user = db.create_user("throttle@rm148.test", "Staff", "StaffPass-12345", UserRole::Employee).unwrap();
+        assert!(allow_unbound_reply(first.path(), "users/42"));
+        db.bind_channel_identity(&user.id, "googlechat", "users/42", true).unwrap();
+        assert!(!allow_unbound_reply(first.path(), "users/42"), "binding cannot reset the quota");
+        db.bind_channel_identity(&user.id, "googlechat", "users/43", true).unwrap();
+        assert!(allow_unbound_reply(first.path(), "users/43"), "distinct senders keep distinct quotas");
+        // Clone the dashboard DB, including its account id, into another home.
+        rusqlite::Connection::open(first.path().join("users.db")).unwrap()
+            .execute("VACUUM INTO ?1", [second.path().join("users.db").to_str().unwrap()]).unwrap();
+        let label = |home: &Path| crate::shared_app_route::manual_googlechat_sender(home, "users/42")
+            .audit_label(home, "googlechat", "users/42");
+        assert_eq!(label(first.path()), format!("user:{}", user.id));
+        assert_eq!(label(first.path()), label(second.path()));
+        assert!(allow_unbound_reply(second.path(), "users/42"), "account ids must not share quotas across homes");
+        assert!(allow_unbound_reply(second.path(), "users/43"));
+        db.unbind_channel_identity("googlechat", "users/42").unwrap();
+        assert!(!allow_unbound_reply(first.path(), "users/42"), "unbinding cannot reset the quota");
+        assert!(!allow_unbound_reply(first.path(), "42"), "only canonical sender names are admitted");
     }
 }
