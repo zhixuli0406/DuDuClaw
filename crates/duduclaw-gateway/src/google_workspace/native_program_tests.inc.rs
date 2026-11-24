@@ -532,7 +532,11 @@ async fn gmail_reply_draft_preserves_thread_and_message_headers_without_sending(
 
 #[tokio::test]
 async fn typed_gmail_drafts_refuse_header_injection_before_any_request() {
-    let template = NativeCallTemplate::for_api("gmail_create_draft");
+    let template = NativeCallTemplate::prepare(
+        "gmail_create_draft",
+        &json!({"to":"a@example.com","subject":"s","body":"b"}),
+    )
+    .unwrap();
     for bad in ["a@example.com\r\nBcc: x@example.com", "a@example.com\n", "a@example.com\0"] {
         for in_cc in [false, true] {
             let mut io = RecordingIo::default();
