@@ -288,12 +288,7 @@ pub(crate) async fn handle_tools_call(
 
     // RM-182: only this native dispatcher sees provider-owned create ids.
     // Third-party mcp-proxy results never enter this path.
-    let session = std::env::var(duduclaw_core::ENV_TRUST_SESSION_ID).ok();
-    let actual_agent = if isolated { default_agent.to_string() }
-        else { resolve_audit_agent(home_dir, Some(principal), default_agent) };
-    if let Err(error) = duduclaw_gateway::session_tool_refs::record_native_tool_result(
-        home_dir, session.as_deref(), &actual_agent, tool_name, &result,
-    ).await {
+    if let Err(error) = crate::identity_cmd::record_native_tool_result(home_dir, tool_name, &result).await {
         tracing::warn!(%error, "Could not retain conversation tool reference");
     }
 

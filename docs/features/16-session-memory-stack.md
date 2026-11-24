@@ -94,15 +94,15 @@ Migrate React app CRA → Vite; preserve tests; keep the auth flow unchanged
 </pinned_task_data>
 ```
 
-Angle brackets in the note are escaped. The system context and minimal prompt use the same framing. Building this reference costs no extra model call.
+All task-note and tool-reference fields use one serializer: C0/C1 and Unicode format controls (including bidi and zero-width characters), U+2028 and U+2029 are removed; CR/LF become visible ` ⏎ ` markers. Angle brackets and Markdown structure punctuation are escaped. System context, user-message recap, minimal prompts and Direct API fallback use the same framing. Building this reference costs no extra model call.
 
 ### Recently created items in this conversation
 
 Successful DuDuClaw-native create calls retain only structured identifiers and a short label: Gmail drafts, Calendar events, internal tasks, Google Tasks, Google Docs and Google Sheets. `docs_create` retains the returned `documentId` and title; `sheets_create` retains the returned `spreadsheetId` and title. Read, append and update calls, third-party MCP results and full tool responses are excluded.
 
-The MCP server writes references only when `DUDUCLAW_SESSION_ID` names this exact conversation and the stored owner matches the calling employee. The next turn receives an escaped, untrusted reference block. Each session keeps at most 20 entries for 24 hours, with capped fields. References from a previous incarnation after a session reset are not injected. These references are separate from the `pinned_task` setting.
+The MCP server sends its `DUDUCLAW_RUN_CREDENTIAL` and capped reference fields to the gateway’s dedicated loopback writer. The gateway alone selects the session and employee from its live run registry; `DUDUCLAW_SESSION_ID` is ignored. Missing or inactive credentials refuse the write, as does a session generation newer than the run’s precise issue time (including a reset within the same second). Identifiers must match `[A-Za-z0-9_\-.:/]+` and be at most 256 characters; invalid identifiers are dropped, never repaired. SQLite also enforces field length limits and allowed tool/kind pairs; migration preserves valid existing rows. The next turn receives an escaped, untrusted reference block. Each session keeps at most 20 entries for 24 hours, with capped fields. References from a previous incarnation after a session reset are not injected. These references are separate from the `pinned_task` setting.
 
-Codex and OpenAI-compatible tool-loop spawns explicitly forward the session identity. Grok forwards it to the CLI; delivery from that CLI to its MCP child still requires live verification.
+Reference writes require the MCP child to inherit a valid run credential. Native protected mode does not issue one, so this writer skips its references. Runtime-to-MCP credential propagation still needs live verification.
 
 ---
 

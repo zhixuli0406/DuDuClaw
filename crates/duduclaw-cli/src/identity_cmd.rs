@@ -48,6 +48,23 @@ pub(crate) async fn run(home: &Path, command: IdentityCommands) -> Result<()> {
     Ok(())
 }
 
+/// Only the gateway chooses the conversation and checks its generation.
+/// Missing/inactive run credentials never fall back to session environment claims.
+pub(crate) async fn record_native_tool_result(home: &Path, tool: &str, result: &serde_json::Value) -> Result<()> {
+    let Some(reference) = duduclaw_gateway::session_tool_refs::reference_from_result(tool, result) else { return Ok(()); };
+    let Some(credential) = std::env::var(ENV_RUN_CREDENTIAL).ok().and_then(RunCredential::parse) else { return Ok(()); };
+    let Some(mut url) = discover_url(home, std::env::var(ENV_IDENTITY_URL)) else { return Ok(()); };
+    url.set_path(duduclaw_gateway::run_identity::TOOL_REFS_ROUTE);
+    let unavailable = || DuDuClawError::Gateway("Conversation reference writer unavailable".into());
+    let client = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(5)).build().map_err(|_| unavailable())?;
+    let response = client.post(url).json(&serde_json::json!({
+        "credential": credential.expose(), "reference": reference,
+    })).send().await.map_err(|_| unavailable())?;
+    if !response.status().is_success() { return Err(unavailable()); }
+    Ok(())
+}
+
 fn require_run_identity_mode(protected: bool) -> Result<()> {
     if protected {
         return Err(DuDuClawError::Security(
@@ -76,6 +93,21 @@ fn discover_url(home: &Path, env: std::result::Result<String, std::env::VarError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reference_writer_never_uses_session_environment_claims() {
+        let source = include_str!("identity_cmd.rs");
+        let writer = source.split("pub(crate) async fn record_native_tool_result").nth(1).unwrap()
+            .split("fn require_run_identity_mode").next().unwrap();
+        assert!(!writer.contains("DUDUCLAW_SESSION_ID"));
+        assert!(!writer.contains("ENV_TRUST_SESSION_ID"));
+        assert!(writer.contains("ENV_RUN_CREDENTIAL"));
+        assert!(!writer.contains("SessionManager"));
+        let dispatch = include_str!("mcp/dispatch.rs");
+        let writer = dispatch.split("// RM-182:").nth(1).unwrap().split("// ── Tool call audit trail").next().unwrap();
+        assert!(!writer.contains("ENV_TRUST_SESSION_ID"));
+        assert!(writer.contains("crate::identity_cmd::record_native_tool_result"));
+    }
 
     #[test]
     fn protected_mode_reports_its_separate_capability_identity() {

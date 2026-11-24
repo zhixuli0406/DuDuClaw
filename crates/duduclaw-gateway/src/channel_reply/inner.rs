@@ -1820,11 +1820,7 @@ async fn build_reply_with_session_inner_impl(
         &group_user_part,
         turn_knowledge.block.as_deref(),
     );
-    let effective_message = if pinned.is_empty() || !has_history {
-        user_part
-    } else {
-        format!("{}\n\n{user_part}", crate::memory_reference::pinned_task_context(&pinned))
-    };
+    let effective_message = crate::memory_reference::with_pinned_recap(&pinned, has_history, &user_part);
     // End-of-turn language reminder, including user-language matching for auto:
     // long English tool/wiki output must not drag the reply out of the
     // chosen language. Same user-side tail as the recap; one short line.
@@ -4862,11 +4858,7 @@ fn direct_api_fallback_input(
     message: &str,
     history: &[crate::runtime::ConversationTurn],
 ) -> (String, Vec<(String, String)>) {
-    let message = if pinned.is_empty() || !has_history {
-        message.to_string()
-    } else {
-        format!("{}\n\n{message}", crate::memory_reference::pinned_task_context(pinned))
-    };
+    let message = crate::memory_reference::with_pinned_recap(pinned, has_history, message);
     let history = history.iter().map(|turn| (turn.role.clone(), turn.content.clone())).collect();
     (message, history)
 }
@@ -4900,6 +4892,29 @@ mod released_repro_source_tests {
     fn shipped_source() -> String {
         // Windows CRLF checkout: rustc normalizes literals, but include_str! does not.
         include_str!("inner.rs").replace("\r\n", "\n").split("\n#[cfg(test)]\nmod released_repro_source_tests {").next().unwrap().to_string()
+    }
+
+    #[test]
+    fn rm182_same_malicious_fields_are_safe_on_all_four_injection_paths() {
+        use crate::memory_reference::{assert_single_line_data, malicious_reference_samples, pinned_task_context, with_pinned_recap};
+        for malicious in malicious_reference_samples() {
+            let system = super::super::prompt_build::build_system_prompt(
+                None, None, None, None, 0, None, &malicious, None, "", true, None).unwrap();
+            let recap = with_pinned_recap(&malicious, true, "current message");
+            let minimal = crate::prompt_minimal::build_minimal_inner(crate::prompt_minimal::MinimalInput {
+                agent_name: "fixture", display_name: "Fixture", default_language: None,
+                soul: None, identity: None, user: None, instructions: None, contract: "",
+                sender_block: "", pinned_instructions: &malicious, minimal_core_kb: 1,
+            });
+            let (fallback, _) = super::direct_api_fallback_input(&malicious, true, "current message", &[]);
+            let expected = pinned_task_context(&malicious);
+            assert!(!expected.is_empty(), "{malicious:?}");
+            for (path, output) in [("system tail", system), ("user recap", recap), ("minimal", minimal), ("fallback", fallback)] {
+                assert!(output.contains(&expected), "{path}: {output}");
+                assert_single_line_data(&output, "pinned_task_data");
+                assert_eq!(output.matches("<pinned_task_data>").count(), 1, "{path}");
+            }
+        }
     }
 
     #[test]

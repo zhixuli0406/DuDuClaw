@@ -283,19 +283,6 @@ impl SessionManager {
             CREATE INDEX IF NOT EXISTS idx_webchat_cancellations_session_age
                 ON webchat_turn_cancellations(session_id, cancelled_at DESC, turn_id DESC);
 
-            CREATE TABLE IF NOT EXISTS session_tool_refs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                session_generation TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                tool_name TEXT NOT NULL,
-                ref_kind TEXT NOT NULL,
-                ref_id TEXT NOT NULL,
-                label TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_session_tool_refs_session
-                ON session_tool_refs(session_id, id);
-
             CREATE TABLE IF NOT EXISTS session_ccr_references (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
@@ -310,6 +297,9 @@ impl SessionManager {
                 ON session_ccr_references(session_id, id);",
         )
         .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+
+        crate::session_tool_refs::migrate(conn)
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
 
         // Phase 4: Add hidden column for hide/restore mechanism (Sculptor, arXiv 2508.04664)
         let _ = conn.execute(

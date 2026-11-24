@@ -21,6 +21,7 @@ use duduclaw_core::run_credential::discovery::DiscoveryDirectory;
 use duduclaw_core::run_credential::IDENTITY_URL_FILE;
 use duduclaw_knowledge::requester::RequesterIdentity;
 
+pub const TOOL_REFS_ROUTE: &str = "/api/internal/identity/tool-reference";
 pub const ROUTE: &str = "/api/internal/identity/introspect";
 const MAX_RUNS: usize = 8192;
 const MAX_TTL: u64 = 6 * 60 * 60;
@@ -46,6 +47,8 @@ pub struct RunRecord {
     pub task_id: Option<String>,
     pub runtime: String,
     pub issued_at: u64,
+    #[serde(skip_serializing)]
+    pub(crate) issued_at_exact: chrono::DateTime<chrono::Utc>,
     pub expires_at: u64,
 }
 
@@ -144,6 +147,7 @@ impl Registry {
         let now = unix_now()?;
         let ttl = timeout.saturating_add(60).min(MAX_TTL);
         record.issued_at = now;
+        record.issued_at_exact = chrono::Utc::now();
         record.expires_at = now.saturating_add(ttl);
         let mut bytes = zeroize::Zeroizing::new([0u8; 32]);
         rand::rngs::OsRng.try_fill_bytes(&mut *bytes)
@@ -245,7 +249,7 @@ pub fn issue(home: &Path, agent: &str, runtime: &str, timeout: u64) -> Result<Ru
             .or_else(|| dispatch.as_ref().map(|(session, _)| session.clone())),
         turn_id: turn.or_else(|| dispatch.map(|(_, run)| run)).unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
         task_id: crate::runtime::round_task_env().map(|(_, task)| task),
-        runtime: runtime.to_string(), issued_at: 0, expires_at: 0,
+        runtime: runtime.to_string(), issued_at: 0, issued_at_exact: chrono::Utc::now(), expires_at: 0,
     };
     registry().issue(record, timeout)
 }
@@ -276,6 +280,8 @@ async fn start_listener_with(home: &Path, registry: Arc<Registry>) -> Result<Ide
     if !duduclaw_core::gateway_instance::held(home) {
         return Err("Run identity listener requires the gateway lock".into());
     }
+    let sessions = Arc::new(crate::session::SessionManager::new(&home.join("sessions.db"))
+        .map_err(|_| "Cannot open conversation reference store")?);
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await
         .map_err(|_| "Cannot bind run identity listener")?;
     let address = listener.local_addr().map_err(|_| "Cannot inspect run identity listener")?;
@@ -286,7 +292,7 @@ async fn start_listener_with(home: &Path, registry: Arc<Registry>) -> Result<Ide
     discovery.write(&url).map_err(|_| "Cannot publish identity discovery file")?;
     *endpoint = Some(url);
     drop(endpoint);
-    let app = router_with(registry.clone());
+    let app = router_with(registry.clone()).merge(tool_refs_router(registry.clone(), sessions));
     let task = tokio::spawn(async move {
         if axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.is_err() {
             tracing::error!("Run identity listener stopped");
@@ -299,17 +305,50 @@ fn router_with(registry: Arc<Registry>) -> Router {
     Router::new().route(ROUTE, post(handle)).with_state(registry)
 }
 
+fn tool_refs_router(registry: Arc<Registry>, sessions: Arc<crate::session::SessionManager>) -> Router {
+    Router::new().route(TOOL_REFS_ROUTE, post(handle_tool_ref))
+        .layer(axum::Extension(sessions)).with_state(registry)
+}
+
+fn local_request(request: &Request) -> bool {
+    request.extensions().get::<ConnectInfo<std::net::SocketAddr>>()
+        .is_some_and(|peer| crate::computer_use_sessions::auth::check_peer(peer.0).is_ok())
+        && !request.headers().keys().any(|name| {
+            let name = name.as_str().to_ascii_lowercase();
+            name.starts_with("x-forwarded-") || matches!(name.as_str(), "forwarded" | "x-real-ip" | "via" | "origin")
+        })
+}
+
+async fn handle_tool_ref(
+    State(registry): State<Arc<Registry>>,
+    axum::Extension(sessions): axum::Extension<Arc<crate::session::SessionManager>>,
+    request: Request,
+) -> axum::http::StatusCode {
+    use axum::http::StatusCode;
+    if !local_request(&request) { return StatusCode::FORBIDDEN; }
+    let mut value = match tokio::time::timeout(Duration::from_secs(2), to_bytes(request.into_body(), 4096)).await {
+        Ok(Ok(body)) => serde_json::from_slice::<serde_json::Value>(&body).ok(),
+        _ => None,
+    };
+    let credential = value.as_mut().and_then(|v| v.get_mut("credential"))
+        .map(serde_json::Value::take).and_then(|v| match v {
+            serde_json::Value::String(raw) => RunCredential::parse(raw), _ => None,
+        });
+    let Some(run) = registry.query(credential.as_ref()) else { return StatusCode::FORBIDDEN; };
+    let reference = value.as_mut().and_then(|v| v.get_mut("reference"))
+        .map(serde_json::Value::take).and_then(|v| serde_json::from_value(v).ok());
+    let Some(reference) = reference else { return StatusCode::BAD_REQUEST; };
+    // Session/agent/issue-time claims in the request are never consulted.
+    match sessions.record_run_tool_reference(&run, reference).await {
+        Ok(true) => StatusCode::NO_CONTENT,
+        Ok(false) => StatusCode::FORBIDDEN,
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
 async fn handle(State(registry): State<Arc<Registry>>, request: Request) -> Json<serde_json::Value> {
     let inactive = || Json(serde_json::json!({"active": false}));
-    let Some(peer) = request.extensions().get::<ConnectInfo<std::net::SocketAddr>>() else { return inactive(); };
-    if crate::computer_use_sessions::auth::check_peer(peer.0).is_err()
-        || request.headers().keys().any(|name| {
-            let name = name.as_str().to_ascii_lowercase();
-            name.starts_with("x-forwarded-")
-                || matches!(name.as_str(), "forwarded" | "x-real-ip" | "via" | "origin")
-        }) {
-        return inactive();
-    }
+    if !local_request(&request) { return inactive(); }
     // No body/error logging. Every body/parse failure still hashes a dummy
     // proof and reaches the same registry lookup as an unknown credential.
     let credential = match tokio::time::timeout(Duration::from_secs(2), to_bytes(request.into_body(), 1024)).await {
@@ -344,7 +383,7 @@ mod tests {
     fn record() -> RunRecord {
         RunRecord { agent_id: "alice".into(), employee_id: None, incarnation: None,
             principal: Principal::Human { user_id: "user-1".into() }, session_id: Some("session-1".into()),
-            turn_id: "turn-1".into(), task_id: None, runtime: "claude".into(), issued_at: 0, expires_at: 0 }
+            turn_id: "turn-1".into(), task_id: None, runtime: "claude".into(), issued_at: 0, issued_at_exact: chrono::Utc::now(), expires_at: 0 }
     }
 
     async fn query(registry: &Arc<Registry>, peer: Option<&str>, body: String) -> (u16, Vec<u8>) {
@@ -359,6 +398,68 @@ mod tests {
 
     fn body(credential: &RunCredential) -> String {
         serde_json::json!({"credential": credential.expose()}).to_string()
+    }
+
+    async fn write_ref(registry: &Arc<Registry>, sessions: &Arc<crate::session::SessionManager>, credential: Option<&RunCredential>) -> axum::http::StatusCode {
+        let payload = serde_json::json!({
+            "credential": credential.map(RunCredential::expose),
+            "DUDUCLAW_SESSION_ID": "other-session", "session_id": "other-session",
+            "agent_id": "other-agent", "issued_at": u64::MAX,
+            "reference": { "tool_name": "docs_create", "ref_kind": "google_doc", "ref_id": "doc-1", "label": "Document" }
+        });
+        let mut request = axum::http::Request::post(TOOL_REFS_ROUTE).body(Body::from(payload.to_string())).unwrap();
+        request.extensions_mut().insert(ConnectInfo("127.0.0.1:1234".parse::<std::net::SocketAddr>().unwrap()));
+        tool_refs_router(registry.clone(), sessions.clone()).oneshot(request).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn tool_ref_route_uses_only_live_run_session_and_rejects_pre_reset_runs() {
+        use axum::http::StatusCode;
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let sessions = Arc::new(crate::session::SessionManager::new(file.path()).unwrap());
+        sessions.get_or_create("session-1", "alice").await.unwrap();
+        sessions.get_or_create("other-session", "alice").await.unwrap();
+        let registry = Arc::new(Registry::default());
+        let lease = registry.issue(record(), 60).unwrap();
+        assert_eq!(write_ref(&registry, &sessions, None).await, StatusCode::FORBIDDEN);
+        let unknown = RunCredential::from_bytes(&[42; 32]);
+        assert_eq!(write_ref(&registry, &sessions, Some(&unknown)).await, StatusCode::FORBIDDEN);
+        assert_eq!(write_ref(&registry, &sessions, Some(&lease.credential)).await, StatusCode::NO_CONTENT);
+        assert!(!sessions.tool_refs_context("session-1").await.unwrap().is_empty());
+        assert!(sessions.tool_refs_context("other-session").await.unwrap().is_empty());
+        sessions.clear_for_user("session-1").await.unwrap();
+        sessions.get_or_create("session-1", "alice").await.unwrap();
+        assert_eq!(write_ref(&registry, &sessions, Some(&lease.credential)).await, StatusCode::FORBIDDEN);
+        assert!(sessions.tool_refs_context("session-1").await.unwrap().is_empty());
+        // Deterministic sub-second reset: comparing integer seconds would allow it.
+        let issued = registry.lookup(&lease.credential).unwrap().issued_at_exact;
+        let generation = issued + chrono::Duration::nanoseconds(1);
+        sessions.acquire().await.execute("UPDATE sessions SET created_at = ?1 WHERE id = 'session-1'",
+            [generation.to_rfc3339()]).unwrap();
+        assert_eq!(write_ref(&registry, &sessions, Some(&lease.credential)).await, StatusCode::FORBIDDEN);
+        let fresh = registry.issue(record(), 60).unwrap();
+        assert_eq!(write_ref(&registry, &sessions, Some(&fresh.credential)).await, StatusCode::NO_CONTENT);
+        let proof = RunCredential::parse(fresh.credential.expose().into()).unwrap();
+        drop(fresh);
+        assert_eq!(write_ref(&registry, &sessions, Some(&proof)).await, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn tool_ref_route_rejects_nonlocal_and_forwarded_requests() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let sessions = Arc::new(crate::session::SessionManager::new(file.path()).unwrap());
+        let registry = Arc::new(Registry::default());
+        let lease = registry.issue(record(), 60).unwrap();
+        for (peer, header) in [("192.0.2.1:1234", None), ("127.0.0.1:1234", Some("origin")),
+            ("127.0.0.1:1234", Some("x-forwarded-for"))] {
+            let mut request = axum::http::Request::post(TOOL_REFS_ROUTE);
+            if let Some(header) = header { request = request.header(header, "untrusted"); }
+            let mut request = request.body(Body::from(body(&lease.credential))).unwrap();
+            request.extensions_mut().insert(ConnectInfo(peer.parse::<std::net::SocketAddr>().unwrap()));
+            let response = tool_refs_router(registry.clone(), sessions.clone()).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+        }
+        assert_eq!(registry.lookups.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

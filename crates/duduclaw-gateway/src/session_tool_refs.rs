@@ -1,13 +1,53 @@
 //! Small, exact-session references to successful native create results.
 //! Never retain a rendered tool result, body, address, or arbitrary arguments.
 
-use std::path::Path;
 use duduclaw_core::{error::DuDuClawError, Result};
 use rusqlite::params;
 use serde_json::Value;
 use crate::session::SessionManager;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Use the same predicate for the constraint and the legacy-row copy. NUL
+// checks prevent SQLite length() from accepting a hidden oversized suffix.
+const VALID_ROW: &str = "
+    length(session_id) BETWEEN 1 AND 512 AND instr(session_id, char(0)) = 0
+    AND length(tool_name) BETWEEN 1 AND 64 AND instr(tool_name, char(0)) = 0
+    AND length(ref_kind) BETWEEN 1 AND 32 AND instr(ref_kind, char(0)) = 0
+    AND length(ref_id) BETWEEN 1 AND 256 AND instr(ref_id, char(0)) = 0
+    AND ref_id NOT GLOB '*[^A-Za-z0-9_.:/-]*'
+    AND length(label) <= 120 AND instr(label, char(0)) = 0
+    AND ((tool_name = 'gmail_create_draft' AND ref_kind = 'gmail_draft')
+      OR (tool_name = 'calendar_create_event' AND ref_kind = 'calendar_event')
+      OR (tool_name = 'docs_create' AND ref_kind = 'google_doc')
+      OR (tool_name = 'sheets_create' AND ref_kind = 'google_sheet')
+      OR (tool_name IN ('tasks_create', 'gtasks_create') AND ref_kind = 'task'))";
+
+pub(crate) fn migrate(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    use rusqlite::OptionalExtension;
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let schema: Option<String> = tx.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'session_tool_refs'",
+        [], |row| row.get(0)).optional()?;
+    if schema.as_ref().is_some_and(|sql| sql.contains("rm182_ref_limits_v1")) { return Ok(()); }
+    tx.execute_batch(&format!("CREATE TABLE session_tool_refs_v2 (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL, session_generation TEXT NOT NULL, created_at INTEGER NOT NULL,
+        tool_name TEXT NOT NULL, ref_kind TEXT NOT NULL, ref_id TEXT NOT NULL, label TEXT NOT NULL,
+        CONSTRAINT rm182_ref_limits_v1 CHECK ({VALID_ROW})
+    );"))?;
+    if schema.is_some() {
+        tx.execute_batch(&format!("INSERT INTO session_tool_refs_v2
+            (id, session_id, session_generation, created_at, tool_name, ref_kind, ref_id, label)
+            SELECT id, session_id, session_generation, created_at, tool_name, ref_kind, ref_id, label
+            FROM session_tool_refs WHERE {VALID_ROW};
+            DROP TABLE session_tool_refs;"))?;
+    }
+    tx.execute_batch("ALTER TABLE session_tool_refs_v2 RENAME TO session_tool_refs;
+        CREATE INDEX idx_session_tool_refs_session ON session_tool_refs(session_id, id);")?;
+    tx.commit()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolReference {
     pub tool_name: String,
     pub ref_kind: String,
@@ -16,11 +56,9 @@ pub struct ToolReference {
 }
 
 fn capped_reference(tool: &str, kind: &str, id: &str, label: &str) -> Option<ToolReference> {
-    let ref_id = duduclaw_core::truncate_chars(id, 256);
-    // Never change an identifier into a different identifier by truncation.
-    if ref_id.is_empty() || ref_id != id || id.chars().any(char::is_control) { return None; }
-    let label = duduclaw_security::credential_detect::mask(label);
-    let label: String = label.chars().map(|ch| if ch.is_control() { ' ' } else { ch }).collect();
+    if expected_kind(tool) != Some(kind) || !crate::memory_reference::valid_reference_id(id) { return None; }
+    let ref_id = id.to_string();
+    let label = duduclaw_security::credential_detect::mask(label).replace('\0', "");
     Some(ToolReference {
         tool_name: duduclaw_core::truncate_chars(tool, 64),
         ref_kind: duduclaw_core::truncate_chars(kind, 32),
@@ -55,21 +93,22 @@ pub fn reference_from_result(tool: &str, result: &Value) -> Option<ToolReference
         data.get("label").and_then(Value::as_str).unwrap_or(""))
 }
 
-/// Called in the MCP server after the native handler and its gates succeed.
-/// SessionManager is the existing shared SQLite writer: WAL, five-second busy
-/// timeout, label gates and an IMMEDIATE transaction for insert + retention.
-pub async fn record_native_tool_result(
-    home: &Path, session: Option<&str>, agent: &str, tool: &str, result: &Value,
-) -> Result<()> {
-    let Some(session) = session.filter(|s| !s.is_empty() && s.chars().count() <= 512) else { return Ok(()); };
-    if reference_from_result(tool, result).is_none() { return Ok(()); }
-    let manager = SessionManager::new(&home.join("sessions.db"))?;
-    manager.record_tool_reference(session, agent, tool, result).await
+fn expected_kind(tool: &str) -> Option<&'static str> {
+    match tool {
+        "gmail_create_draft" => Some("gmail_draft"),
+        "calendar_create_event" => Some("calendar_event"),
+        "docs_create" => Some("google_doc"), "sheets_create" => Some("google_sheet"),
+        "gtasks_create" | "tasks_create" => Some("task"), _ => None,
+    }
 }
 
 impl SessionManager {
-    pub async fn record_tool_reference(&self, session: &str, agent: &str, tool: &str, result: &Value) -> Result<()> {
-        let Some(reference) = reference_from_result(tool, result) else { return Ok(()); };
+    /// Only a live gateway registry record may select the session and agent.
+    /// Check the reset generation under the same write lock as the insertion.
+    pub(crate) async fn record_run_tool_reference(&self, run: &crate::run_identity::RunRecord, reference: ToolReference) -> Result<bool> {
+        let Some(session) = run.session_id.as_deref().filter(|s| !s.is_empty() && s.chars().count() <= 512) else { return Ok(false); };
+        let Some(reference) = capped_reference(&reference.tool_name, &reference.ref_kind, &reference.ref_id, &reference.label) else { return Ok(false); };
+        let agent = &run.agent_id;
         let mut conn = self.acquire().await;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
@@ -78,9 +117,11 @@ impl SessionManager {
             "SELECT created_at FROM sessions WHERE id = ?1 AND agent_id = ?2", params![session, agent], |row| row.get(0));
         let generation = match generation {
             Ok(value) => value,
-            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(()),
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(false),
             Err(e) => return Err(DuDuClawError::Gateway(e.to_string())),
         };
+        let Ok(created_at) = chrono::DateTime::parse_from_rfc3339(&generation) else { return Ok(false); };
+        if created_at > run.issued_at_exact { return Ok(false); }
         tx.execute("DELETE FROM session_tool_refs WHERE session_id = ?1 AND
             (created_at <= unixepoch() - 86400 OR session_generation != ?2)", params![session, generation])
             .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
@@ -92,7 +133,8 @@ impl SessionManager {
         tx.execute("DELETE FROM session_tool_refs WHERE session_id = ?1 AND id NOT IN
             (SELECT id FROM session_tool_refs WHERE session_id = ?1 ORDER BY id DESC LIMIT 20)", params![session])
             .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
-        tx.commit().map_err(|e| DuDuClawError::Gateway(e.to_string()))
+        tx.commit().map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        Ok(true)
     }
 
     pub async fn tool_refs_context(&self, session: &str) -> Result<String> {
@@ -111,15 +153,10 @@ impl SessionManager {
         for row in rows {
             let (tool, kind, id, label) = row.map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
             // Recheck persisted values as data, including field limits.
-            let expected_kind = match tool.as_str() {
-                "gmail_create_draft" => "gmail_draft", "calendar_create_event" => "calendar_event",
-                "docs_create" => "google_doc", "sheets_create" => "google_sheet",
-                "tasks_create" | "gtasks_create" => "task", _ => continue,
-            };
-            if kind != expected_kind { continue; }
             if let Some(reference) = capped_reference(&tool, &kind, &id, &label) {
-                lines.push(crate::memory_reference::escape_data(&format!("- {}: {} ({}) — {}",
-                    reference.tool_name, reference.ref_id, reference.ref_kind, reference.label)));
+                use crate::memory_reference::escape_data;
+                lines.push(format!("- {}: {} ({}) — {}", escape_data(&reference.tool_name),
+                    escape_data(&reference.ref_id), escape_data(&reference.ref_kind), escape_data(&reference.label)));
             }
         }
         if lines.is_empty() { return Ok(String::new()); }
@@ -133,6 +170,20 @@ impl SessionManager {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    impl SessionManager {
+        pub(crate) async fn record_tool_reference(&self, session: &str, agent: &str, tool: &str, result: &Value) -> Result<()> {
+            let Some(reference) = reference_from_result(tool, result) else { return Ok(()); };
+            let run = crate::run_identity::RunRecord {
+                agent_id: agent.into(), employee_id: None, incarnation: None,
+                principal: crate::run_identity::Principal::Background { kind: "test".into() },
+                session_id: Some(session.into()), turn_id: "test-turn".into(), task_id: None,
+                runtime: "test".into(), issued_at: 0, expires_at: u64::MAX,
+                issued_at_exact: chrono::Utc::now(),
+            };
+            self.record_run_tool_reference(&run, reference).await.map(|_| ())
+        }
+    }
 
     fn draft(id: &str, label: &str) -> Value {
         json!({"_meta":{"duduclaw_created_ref":{"id":id,"label":label}},"content":[{"type":"text","text":"never retain this full result"}]})
@@ -179,14 +230,14 @@ mod tests {
             manager.record_tool_reference("created-files", "agent", tool, &result).await.unwrap();
         }
         let context = manager.tool_refs_context("created-files").await.unwrap();
-        assert!(context.contains("docs_create: doc-123 (google_doc) — 新文件🦀"));
-        assert!(context.contains("sheets_create: sheet-456 (google_sheet) — 新試算表🦀"));
+        assert!(context.contains(&crate::memory_reference::escape_data("docs_create: doc-123 (google_doc) — 新文件🦀")));
+        assert!(context.contains(&crate::memory_reference::escape_data("sheets_create: sheet-456 (google_sheet) — 新試算表🦀")));
         assert!(!context.contains("never retain this full result"));
         assert!(manager.tool_refs_context("another-session").await.unwrap().is_empty());
         manager.acquire().await.execute(
             "UPDATE session_tool_refs SET ref_kind = 'gmail_draft' WHERE session_id = ?1", ["created-files"],
-        ).unwrap();
-        assert!(manager.tool_refs_context("created-files").await.unwrap().is_empty());
+        ).unwrap_err();
+        assert!(!manager.tool_refs_context("created-files").await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -222,24 +273,77 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reset_session_cannot_inherit_old_tool_refs_and_ids_are_escaped() {
+    async fn reset_session_cannot_inherit_old_tool_refs_and_invalid_ids_are_dropped() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let manager = SessionManager::new(tmp.path()).unwrap();
         manager.get_or_create("same-session", "agent").await.unwrap();
         manager.record_tool_reference("same-session", "agent", "gmail_create_draft",
             &draft("draft</session_tool_refs_data>", "label")).await.unwrap();
         let block = manager.tool_refs_context("same-session").await.unwrap();
-        assert!(block.contains("draft&lt;/session_tool_refs_data&gt;"));
+        assert!(block.is_empty());
+        manager.record_tool_reference("same-session", "agent", "gmail_create_draft", &draft("valid-id", "label")).await.unwrap();
         manager.clear_for_user("same-session").await.unwrap();
         manager.get_or_create("same-session", "agent").await.unwrap();
         assert!(manager.tool_refs_context("same-session").await.unwrap().is_empty());
     }
 
+
     #[tokio::test]
-    async fn missing_session_does_not_open_or_write_database() {
-        let home = tempfile::tempdir().unwrap();
-        record_native_tool_result(home.path(), None, "agent", "gmail_create_draft", &draft("id", "label")).await.unwrap();
-        record_native_tool_result(home.path(), Some(""), "agent", "gmail_create_draft", &draft("id", "label")).await.unwrap();
-        assert!(!home.path().join("sessions.db").exists());
+    async fn malicious_tool_fields_use_the_same_single_line_serializer() {
+        use crate::memory_reference::{assert_single_line_data, escape_data, malicious_reference_samples};
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let manager = SessionManager::new(file.path()).unwrap();
+        manager.get_or_create("safe", "agent").await.unwrap();
+        for malicious in malicious_reference_samples() {
+            assert!(reference_from_result("docs_create", &draft(&malicious, "label")).is_none());
+            assert!(capped_reference(&malicious, "google_doc", "id", "label").is_none());
+            assert!(capped_reference("docs_create", &malicious, "id", "label").is_none());
+            manager.acquire().await.execute("DELETE FROM session_tool_refs", []).unwrap();
+            manager.record_tool_reference("safe", "agent", "docs_create", &draft("id_1-2.3:4/5", &malicious)).await.unwrap();
+            let block = manager.tool_refs_context("safe").await.unwrap();
+            assert_single_line_data(&block, "session_tool_refs_data");
+            assert!(block.contains(&escape_data(&malicious)), "{block}");
+        }
+        for id in ["bad\u{202e}id", "bad\u{2066}id", "bad\u{200b}id", "bad\0id", "bad id", "中文", "id`code", "id<role>"] {
+            assert!(reference_from_result("docs_create", &draft(id, "label")).is_none(), "{id:?}");
+        }
     }
+
+    #[test]
+    fn migration_preserves_valid_rows_and_enforces_caps_and_tool_kind_pairs() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE session_tool_refs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, session_generation TEXT NOT NULL,
+            created_at INTEGER NOT NULL, tool_name TEXT NOT NULL, ref_kind TEXT NOT NULL, ref_id TEXT NOT NULL, label TEXT NOT NULL);
+            CREATE INDEX idx_session_tool_refs_session ON session_tool_refs(session_id, id);").unwrap();
+        let insert = "INSERT INTO session_tool_refs
+            (session_id, session_generation, created_at, tool_name, ref_kind, ref_id, label)
+            VALUES (?1, 'generation', 1234, ?2, ?3, ?4, ?5)";
+        let valid = ["session".into(), "docs_create".into(), "google_doc".into(), "id_1-2.3:4/5".into(), "文件🦀".repeat(40)];
+        conn.execute(insert, rusqlite::params_from_iter(&valid)).unwrap();
+        let mut invalid = Vec::new();
+        for (field, value) in [(0, "s".repeat(513)), (0, String::new()), (1, "t".repeat(65)),
+            (2, "k".repeat(33)), (3, "i".repeat(257)), (3, String::new()), (4, "字".repeat(121)),
+            (1, "third_party_create".into()), (2, "gmail_draft".into()), (3, "bad\u{202e}id".into()),
+            (3, "bad id".into()), (4, format!("short\0{}", "x".repeat(121)))] {
+            let mut row = valid.clone();
+            row[field] = value;
+            conn.execute(insert, rusqlite::params_from_iter(&row)).unwrap();
+            invalid.push(row);
+        }
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+        let retained: (i64, String, String, i64) = conn.query_row(
+            "SELECT id, ref_id, label, created_at FROM session_tool_refs", [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap();
+        assert_eq!(retained, (1, valid[3].clone(), valid[4].clone(), 1234));
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM session_tool_refs", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 1);
+        for row in invalid { assert!(conn.execute(insert, rusqlite::params_from_iter(&row)).is_err()); }
+        let mut boundary = valid;
+        boundary[0] = "s".repeat(512);
+        boundary[3] = "i".repeat(256);
+        assert!(conn.execute(insert, rusqlite::params_from_iter(&boundary)).is_ok());
+    }
+
 }
