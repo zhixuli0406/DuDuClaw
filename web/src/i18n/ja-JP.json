@@ -1,4 +1,6 @@
 {
+  "myConnections.testNotice": "{time} に管理者が {agent} を通じて Google 接続と権限の確認を要求しました。この確認ではメール、ファイル、カレンダーは読み取りません。",
+  "myConnections.testNoticeData": "{time} に管理者が {agent} を通じて Google 委任のテストを要求しました。読み取り専用のデータ確認を含みます。",
   "agentConnections.identity.external": "外部ツールで提供",
   "agentConnections.externalServer": "外部サーバー名（任意、120 文字まで）",
   "agentConnections.choice.delegateOwner": "組織の承認：担当者に連動",

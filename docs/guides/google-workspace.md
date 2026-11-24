@@ -299,6 +299,8 @@ To follow an AI employee's responsible member:
 
 1. Bind the member as an Owner; if there are several Owners, select the primary owner in **Employee → Connections**.
 2. Select **Company authorization: follow responsible member** (`identity = "delegate:owner"`). Configure allowed subject domains and import the sealed delegation key as above.
+
+   After a permission change, the call already in progress may still complete as the previous responsible member; all subsequent calls are checked again.
 3. In **Integrations → Google → Company authorization**, review the employee, current owner, login email and attestation status. Confirm each listed member's address using the attest action. This works outside protected mode too; it requires an active Admin and the existing password + authenticator step-up with a session-bound CSRF token. If the member set the address themselves, explicitly acknowledge that you independently verified it.
 4. Test the connection. Every call derives the subject from the current primary-owner binding and login account, never a tool argument. Missing attestation, changed ownership (including changing back), changed email, inactive owner or an unreadable account record refuses the call and requires administrator attention. `requesters` defaults to `owner_only`, with the existing requester rules for scheduled work; `fallback = "home"` is forbidden for this selector. Protected mode retains its stricter tenant-route and requester rules.
 

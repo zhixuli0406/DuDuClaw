@@ -1,4 +1,6 @@
 {
+  "myConnections.testNotice": "管理員於 {time} 透過 {agent} 要求測試你的 Google 連線與授權狀態；這項測試不會讀取郵件、檔案或日曆。",
+  "myConnections.testNoticeData": "管理員於 {time} 透過 {agent} 要求測試你的 Google 公司授權代表連線，包含唯讀資料存取檢查。",
   "agentConnections.identity.external": "由外部工具提供",
   "agentConnections.externalServer": "外部伺服器名稱（選填，最多 120 字）",
   "agentConnections.choice.delegateOwner": "公司授權：跟隨負責人",

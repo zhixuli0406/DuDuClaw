@@ -2,26 +2,23 @@
 use std::path::Path;
 use duduclaw_auth::{UserDb, UserStatus};
 use duduclaw_core::google_identity::{self as gi, Effective};
-use sha2::{Digest, Sha256};
 use super::{Refusal, tenant_source};
 
 fn refused() -> Refusal {
     Refusal::hard("attestation_required", "無法確認目前負責人的 Google 信箱。請管理員到「整合 → Google → 公司授權代表」確認目前負責人與信箱後重新認證。")
 }
 
-/// Protected employees retain their immutable lifecycle identity. Ordinary
-/// installations bind the directory incarnation, not merely its reusable name.
+/// Protected employees also retain the native lifecycle check. Ordinary
+/// employees use the random nonce stored outside their directory in users.db.
 pub(crate) fn incarnation(home: &Path, agent: &str) -> Option<tenant_source::Incarnation> {
     if crate::runtime_readiness::is_protected_linux() {
         return tenant_source::current_incarnation(home, agent);
     }
-    let path = home.join("agents").join(agent);
-    let created = std::fs::metadata(&path).ok()?.created().ok()?
-        .duration_since(std::time::UNIX_EPOCH).ok()?;
-    let hash = Sha256::digest(format!("google-delegate-directory-v1:{agent}:{}", created.as_nanos()).as_bytes());
-    let mut id = [0u8; 16];
-    for (dst, src) in id.iter_mut().zip(hash.iter()) { *dst = *src; }
-    Some((duduclaw_isolation::ids::EmployeeId(id), 0))
+    let db = crate::decision_notify::open_user_db_read_only(home).ok()??;
+    let nonce = db.google_employee_nonce(agent).ok()??;
+    let id = uuid::Uuid::parse_str(&nonce).ok()?;
+    if id.get_version_num() != 4 { return None; }
+    Some((duduclaw_isolation::ids::EmployeeId(*id.as_bytes()), 0))
 }
 
 pub(crate) fn owner(db: &UserDb, agent: &str) -> Result<duduclaw_auth::User, Refusal> {
@@ -32,10 +29,16 @@ pub(crate) fn owner(db: &UserDb, agent: &str) -> Result<duduclaw_auth::User, Ref
 }
 
 pub(crate) fn subject(home: &Path, agent: &str, db: &UserDb) -> Result<String, Refusal> {
+    let path = home.join("agents").join(agent);
+    if !std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink()) {
+        return Err(refused());
+    }
+    let nonce = db.google_employee_nonce(agent).map_err(|_| refused())?.ok_or_else(refused)?;
     let generation = db.google_primary_owner_generation(agent).map_err(|_| refused())?;
     let owner = owner(db, agent)?;
     let email = gi::normalize_email(&owner.email).map_err(|_| refused())?;
     let attestation = db.google_delegate_attestation(agent).map_err(|_| refused())?.ok_or_else(refused)?;
+    if attestation.attestation.employee_nonce.as_deref() != Some(nonce.as_str()) { return Err(refused()); }
     if gi::normalize_email(&attestation.attestation.email_at_attestation).ok().as_deref() != Some(email.as_str()) {
         return Err(refused());
     }
@@ -113,6 +116,7 @@ mod tests {
         db.bind_agent(&alice.id, "bot", AccessLevel::Owner).unwrap();
         db.bind_agent(&bob.id, "bot", AccessLevel::Owner).unwrap();
         db.set_google_primary_owner("bot", &alice.id, &admin.id).unwrap();
+        db.ensure_google_employee_nonce("bot").unwrap();
         let attest = || {
             let employee = incarnation(home.path(), "bot").unwrap();
             db.attest_google_delegate_owner(&duduclaw_auth::google_delegate_attestation::AttestationRequest {
@@ -143,4 +147,46 @@ mod tests {
         // No operation accepts a subject parameter; only users.db supplies it.
         assert!(matches!(effective_for(home.path(), Some("bot")).effective, Effective::Invalid(_)));
     }
+    #[test]
+    fn nonce_refuses_missing_recreated_and_restored_directory() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("agents/bot");
+        std::fs::create_dir_all(&path).unwrap();
+        let db = UserDb::new(&home.path().join("users.db")).unwrap();
+        let owner = db.create_user("nonce@c.test", "Owner", "test-password", UserRole::Employee).unwrap();
+        db.bind_agent(&owner.id, "bot", AccessLevel::Owner).unwrap();
+        assert!(incarnation(home.path(), "bot").is_none());
+        assert!(subject(home.path(), "bot", &db).is_err(), "missing nonce refuses");
+        db.ensure_google_employee_nonce("bot").unwrap();
+        let attest = || {
+            let employee = incarnation(home.path(), "bot").unwrap();
+            db.attest_google_delegate_owner(&duduclaw_auth::google_delegate_attestation::AttestationRequest {
+                agent_id:"bot", employee_id:&hex::encode(employee.0.0), employee_incarnation:employee.1,
+                subject:"nonce@c.test", user_id:&owner.id, acknowledge_self_set:true,
+            }, &|email| email == "nonce@c.test", "admin").unwrap();
+        };
+        attest();
+        let nonce = db.google_employee_nonce("bot").unwrap().unwrap();
+        assert_eq!(uuid::Uuid::parse_str(&nonce).unwrap().get_version_num(), 4);
+        assert!(subject(home.path(), "bot", &db).is_ok());
+        // Moving the same directory away and back preserves its birth time.
+        let saved = home.path().join("saved-bot");
+        let birth = std::fs::metadata(&path).unwrap().created().ok();
+        std::fs::rename(&path, &saved).unwrap();
+        duduclaw_core::employee_incarnation::reconcile(home.path()).unwrap();
+        std::fs::rename(&saved, &path).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().created().ok(), birth);
+        assert!(db.google_employee_nonce("bot").unwrap().is_none());
+        assert!(subject(home.path(), "bot", &db).is_err(), "old birth time never restores authority");
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        duduclaw_core::employee_incarnation::created(home.path(), "bot").unwrap();
+        assert_ne!(db.google_employee_nonce("bot").unwrap().as_deref(), Some(nonce.as_str()));
+        assert!(subject(home.path(), "bot", &db).is_err(), "recreation rejects the retained attestation");
+        attest();
+        assert!(subject(home.path(), "bot", &db).is_ok());
+        duduclaw_core::employee_incarnation::deleted(home.path(), "bot").unwrap();
+        assert!(subject(home.path(), "bot", &db).is_err(), "soft deletion invalidates with directory intact");
+    }
+
 }

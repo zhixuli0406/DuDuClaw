@@ -19,6 +19,7 @@ pub mod compat_runners;
 pub mod concurrency_gate;
 pub mod gateway_instance;
 pub mod google_identity;
+pub mod employee_incarnation;
 pub mod human_principal;
 pub mod config;
 pub mod container_engine;

@@ -212,6 +212,10 @@ pub(crate) async fn serve(
         resolve_person_for_tool(&state.home, agent, requester, people.as_ref(), tool).await;
     audit_issue(&state.home, agent, tool, requester.kind(), &outcome);
     match outcome? {
+        // RM-147: once this bearer reaches the CLI, an in-flight call may
+        // finish as the former owner after an authority change. Subsequent
+        // calls recheck; delegate:owner never caches its bearer. See the
+        // delegate:owner limitation in docs/guides/google-workspace.md.
         Resolved::Delegated { email, token } => Ok(json!({
             "ok": true,
             "mode": "delegate",

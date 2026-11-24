@@ -187,6 +187,11 @@ impl MethodHandler {
                 };
                 // Shared employees of this installation only; the attestation
                 // binds this live employee id and incarnation (SR4 round 3, N2).
+                let directory = home.join("agents").join(&agent);
+                if !std::fs::symlink_metadata(&directory).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink()) {
+                    return Err(CONFIG_UNREADABLE.into());
+                }
+                db.ensure_google_employee_nonce(&agent)?;
                 let employee = if !crate::runtime_readiness::is_protected_linux() {
                     crate::google_identity::delegate_owner::incarnation(&home, &agent).ok_or(CONFIG_UNREADABLE)?
                 } else { match crate::isolation_lifecycle::read_lifecycle(&home, &agent) {

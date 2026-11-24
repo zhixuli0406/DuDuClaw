@@ -12,6 +12,16 @@ const status: PersonalGoogleStatus = { connection: { owner_id: 'alice', account_
 beforeEach(() => { vi.restoreAllMocks(); vi.spyOn(api.personalGoogle,'status').mockResolvedValue(status); });
 
 describe('MyConnectionsPage', () => {
+  it('shows persisted administrator test notices even without a connected account', async () => {
+    vi.mocked(api.personalGoogle.status).mockResolvedValue({ ...status, connection: null, notices: [
+      { id: 1, agent_id: 'helper', actor_id: 'admin', kind: 'google_identity_test', timestamp: '2026-11-25T00:00:00Z' },
+    ] });
+    renderWithProviders(<MyConnectionsPage />);
+    const notice = await screen.findByRole('status');
+    expect(notice).toHaveTextContent('administrator requested a Google connection and permission check through helper');
+    expect(notice).toHaveTextContent('does not read mail, files or calendars');
+  });
+
   it('asks a connected member missing Chat scopes to reconnect', async () => {
     vi.mocked(api.personalGoogle.status).mockResolvedValue({ ...status, chat_read: true });
     renderWithProviders(<MyConnectionsPage />);

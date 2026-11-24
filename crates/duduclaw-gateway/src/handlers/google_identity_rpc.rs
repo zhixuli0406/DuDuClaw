@@ -10,7 +10,7 @@
 //! | `google.delegation.attest_subject {agent_id, subject, user_id, acknowledge_self_set?, csrf_token}` / `google.delegation.revoke_attestation {agent_id, csrf_token}` | Admin + step-up | SR4: protected-mode attestation that a Shared employee's delegate subject is the listed person (`google_delegate_attestation_rpc.rs`) |
 //! | `agents.google_identity_get {agent_id}` | Viewer of the employee | the identity in effect and whether it can be used now |
 //! | `agents.google_identity_set {agent_id, identity, fallback?, requesters?}` | Admin | write `[google]` (B2a: `home`, `none`, `delegate:<email>`) |
-//! | `google.identity.test {agent_id}` | Admin | mint for the subject and read one profile; sends nothing |
+//! | `google.identity.test {agent_id}` | Admin (live re-check) | owner: mint + tokeninfo only; audited, with a durable member notice |
 //!
 //! No response ever carries key material or an access token.
 
@@ -35,6 +35,26 @@ fn sec_audit(home: &Path, event: &str, severity: Severity, ctx: &UserContext, de
         home,
         &AuditEvent::new(event, "dashboard", severity, d),
     );
+}
+
+/// Record every exit, including cancellation and refusals before selection.
+struct IdentityTestAudit<'a> {
+    home: &'a Path,
+    ctx: &'a UserContext,
+    agent: &'a str,
+    db: Option<Arc<UserDb>>,
+    outcome: &'static str,
+}
+
+impl Drop for IdentityTestAudit<'_> {
+    fn drop(&mut self) {
+        let detail = json!({"agent_id":self.agent,"outcome":self.outcome});
+        if let Some(db) = &self.db {
+            let _ = db.log_action(Some(&self.ctx.user_id), "google.identity_test_finished",
+                Some(self.agent), Some(&detail.to_string()), None);
+        }
+        sec_audit(self.home, "google_identity_test_finished", Severity::Warning, self.ctx, detail);
+    }
 }
 
 /// The identity of one employee as the dashboard shows it, plus whether it
@@ -581,33 +601,85 @@ impl MethodHandler {
     /// `google.identity.test {agent_id}`.
     pub(crate) async fn handle_google_identity_test(&self, params: Value, ctx: &UserContext) -> WsFrame {
         let agent_id = params.get("agent_id").and_then(Value::as_str).unwrap_or("");
-        if !is_valid_agent_id(agent_id) {
+        let mut audit = IdentityTestAudit { home: &self.home_dir, ctx, agent: agent_id,
+            db: None, outcome: "cancelled" };
+        audit.db = self.user_db.read().await.clone();
+        audit.outcome = "audit_unavailable";
+        let Some(db) = audit.db.clone() else { return WsFrame::error_response("", "人員資料尚未就緒。"); };
+        let detail = json!({"agent_id":agent_id});
+        if db.log_action(Some(&ctx.user_id), "google.identity_test_attempt", Some(agent_id), Some(&detail.to_string()), None).is_err() {
+            return WsFrame::error_response("", "無法寫入測試稽核，未執行測試。");
+        }
+        audit.outcome = "admin_refused";
+        if self.mfa_require_current_admin(ctx).await.is_err() {
+            return WsFrame::error_response("", "請以管理員帳號重新登入。");
+        }
+        audit.outcome = "invalid_agent";
+        if !is_valid_agent_id(agent_id) || !self.home_dir.join("agents").join(agent_id).is_dir() {
             return WsFrame::error_response("", "Missing or invalid 'agent_id' parameter");
         }
-        if !ctx.is_admin() { return WsFrame::error_response("", "需要管理員權限。"); }
+        audit.outcome = "selection_failed";
         let people = self.people().await;
-        if let Effective::Personal { selector } = gi::effective_for(&self.home_dir, Some(agent_id)).effective {
-            if self.mfa_require_current_admin(ctx).await.is_err() { return WsFrame::error_response("", "請以管理員帳號重新登入。"); }
-            let Some(db) = people.user_db() else { return WsFrame::error_response("", "人員資料尚未就緒。"); };
-            let user = match crate::google_personal::access::select_user(db, agent_id, &selector) {
-                Ok(user) => user, Err(r) => return WsFrame::error_response("", &r.message_zh),
-            };
+        let configured = gi::effective_for(&self.home_dir, Some(agent_id));
+        let effective = crate::google_identity::delegate_owner::effective_for(&self.home_dir, Some(agent_id));
+        let target = match &configured.effective {
+            Effective::Personal { selector } => match crate::google_personal::access::select_user(&db, agent_id, selector) {
+                Ok(user) => Some(user), Err(r) => return WsFrame::error_response("", &r.message_zh),
+            },
+            Effective::DelegateOwner => {
+                if let Err(r) = crate::google_identity::delegate_owner::subject(&self.home_dir, agent_id, &db) {
+                    return WsFrame::error_response("", &r.message_zh);
+                }
+                match crate::google_identity::delegate_owner::owner(&db, agent_id) {
+                    Ok(user) if matches!(&effective.effective, Effective::Delegate { email } if gi::normalize_email(&user.email).ok().as_ref() == Some(email)) => Some(user),
+                    _ => return WsFrame::error_response("", "負責人已變更，請重新測試。"),
+                }
+            }
+            Effective::Delegate { email } => match people.by_email(email) {
+                Ok(Some(person)) => match db.get_user(&person.user_id) {
+                    Ok(Some(user)) => Some(user), _ => return WsFrame::error_response("", "無法確認受測成員。"),
+                },
+                Ok(None) => None, Err(r) => return WsFrame::error_response("", &r.message_zh),
+            },
+            _ => None,
+        };
+        if let Some(user) = &target {
+            audit.outcome = "notice_failed";
             let detail = json!({"agent_id":agent_id,"tested_user_id":user.id,"tested_email":user.email});
-            if db.log_action(Some(&ctx.user_id), "google.personal_identity_test", Some(&user.id), Some(&detail.to_string()), None).is_err() {
+            let action = if matches!(&configured.effective, Effective::Personal { .. }) { "google.personal_identity_test" } else { "google.delegate_identity_test" };
+            if db.log_action(Some(&ctx.user_id), action, Some(&user.id), Some(&detail.to_string()), None).is_err() {
                 return WsFrame::error_response("", "無法寫入測試稽核，未執行測試。");
             }
-            sec_audit(&self.home_dir, "google_personal_identity_test", Severity::Warning, ctx, detail);
-            crate::notify_push::push_person_notice(&self.home_dir, &user.id, "管理員測試了你的 Google 連線；只檢查連線與授權狀態，不會讀取郵件、檔案或日曆。").await;
-            let steps = crate::google_identity::personal_check::run(&self.home_dir, agent_id, db, &user.id).await;
-            return WsFrame::ok_response("", json!({"agent_id":agent_id,"email":user.email,"ok":steps.iter().all(|s| s.ok),"steps":steps}));
+            sec_audit(&self.home_dir, &action.replace('.', "_"), Severity::Warning, ctx, detail);
+            let kind = if matches!(&configured.effective, Effective::Delegate { .. }) { "google_identity_data_test" } else { "google_identity_test" };
+            let notice = async {
+                crate::events_store::EventBusStore::open(&self.home_dir)?
+                    .person_notice(&user.id, agent_id, &ctx.user_id, kind).await
+            }.await;
+            if notice.is_err() { return WsFrame::error_response("", "無法保存站內通知，未執行測試。"); }
+            // External delivery is best effort, after the durable notice and
+            // attempt audit, and before any refresh or delegated token mint.
+            let message = if kind == "google_identity_test" {
+                "管理員準備測試你的 Google 連線；只檢查連線與授權狀態，不會讀取郵件、檔案或日曆。"
+            } else { "管理員準備測試你的 Google 公司授權代表連線，包含唯讀資料存取檢查。" };
+            crate::notify_push::push_person_notice(&self.home_dir, &user.id, message).await;
         }
-        let (email, steps) =
-            crate::google_identity::check::run(&self.home_dir, agent_id, people.as_ref()).await;
+        audit.outcome = "identity_changed";
+        if self.mfa_require_current_admin(ctx).await.is_err()
+            || gi::effective_for(&self.home_dir, Some(agent_id)) != configured
+            || crate::google_identity::delegate_owner::effective_for(&self.home_dir, Some(agent_id)) != effective {
+            return WsFrame::error_response("", "管理員權限或身分已變更，請重新測試。");
+        }
+        let (email, steps) = if matches!(&configured.effective, Effective::Personal { .. }) {
+            let Some(user) = target else { return WsFrame::error_response("", "無法確認受測成員。"); };
+            let steps = crate::google_identity::personal_check::run(&self.home_dir, agent_id, &db, &user.id).await;
+            (Some(user.email), steps)
+        } else {
+            crate::google_identity::check::run_selected(&self.home_dir, agent_id, people.as_ref(), &configured, &effective).await
+        };
         let ok = steps.iter().all(|s| s.ok);
-        WsFrame::ok_response(
-            "",
-            json!({ "agent_id": agent_id, "email": email, "ok": ok, "steps": steps }),
-        )
+        audit.outcome = if ok { "ok" } else { "check_failed" };
+        WsFrame::ok_response("", json!({"agent_id":agent_id,"email":email,"ok":ok,"steps":steps}))
     }
 }
 

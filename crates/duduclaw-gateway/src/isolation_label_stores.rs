@@ -549,6 +549,8 @@ pub(crate) fn rekey_all(home: &Path, old: &str, new: &str) -> Result<Vec<(&'stat
 
 /// Purge every registered store (F6i). Stops at the first failing store.
 pub(crate) fn purge_all(home: &Path, label: &str) -> Result<Vec<(&'static str, u64)>, (&'static str, StoreError)> {
+    duduclaw_core::employee_incarnation::deleted(home, label)
+        .map_err(|_| ("google_employee_incarnation", StoreError::Unavailable))?;
     LABEL_KEYED_STORES.iter().map(|store| store.purge(home, label).map(|n| (store.name, n)).map_err(|e| (store.name, e)))
         .collect()
 }

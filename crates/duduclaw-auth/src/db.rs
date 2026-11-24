@@ -2250,6 +2250,8 @@ pub fn remove_personal_agent_in_transaction(
     if !is_personal_agent_id(agent) { return Err(PersonalAgentError::InvalidAgent); }
     let Some(owner) = personal_agent_owner(tx, agent)? else { return Ok(false) };
     if owner != owner_user_id { return Err(PersonalAgentError::OwnerConflict); }
+    crate::google_delegate_attestation::revoke_in_transaction(tx, agent, "employee_retired")
+        .map_err(PersonalAgentError::Store)?;
     tx.execute(
         "INSERT INTO isolation_personal_agent_removals (agent_name, owner_user_id) VALUES (?1, ?2)",
         params![agent, owner_user_id],

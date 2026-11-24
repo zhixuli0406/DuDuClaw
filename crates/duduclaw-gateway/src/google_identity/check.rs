@@ -1,7 +1,8 @@
 //! `google.identity.test {agent_id}`: prove a delegate works without sending
 //! anything (design §7.3). Every step mints fresh (the cache is bypassed and
 //! never written), reads only GET endpoints, and reports one line per check.
-//! Document services use a Drive metadata lookup and then their own API.
+//! Explicit mailbox diagnostics use Drive metadata and service APIs.
+//! `delegate:owner` exits through OAuth tokeninfo only, without data reads.
 
 use std::path::Path;
 
@@ -94,12 +95,14 @@ struct DiagnosticIdentity<'a> {
     agent: &'a str,
     email: &'a str,
     expected: &'a gi::EffectiveIdentity,
+    configured: &'a gi::EffectiveIdentity,
     people: &'a dyn People,
 }
 
 impl DiagnosticIdentity<'_> {
     fn verify(&self) -> Result<(), super::Refusal> {
-        if super::delegate_owner::effective_for(self.home, Some(self.agent)) != *self.expected {
+        if gi::effective_for(self.home, Some(self.agent)) != *self.configured
+            || super::delegate_owner::effective_for(self.home, Some(self.agent)) != *self.expected {
             return Err(super::Refusal::hard("identity_changed", "身分、負責人或信箱認證已變更，請管理員重新確認。"));
         }
         precheck(self.home, self.email, self.people)?;
@@ -201,8 +204,14 @@ fn protected_subject_gate(home: &Path, agent: &str, people: &dyn People) -> Resu
 
 /// Run the checks for `agent`. Stops at the first check later ones depend on.
 pub async fn run(home: &Path, agent: &str, people: &dyn People) -> (Option<String>, Vec<Step>) {
+    let configured = gi::effective_for(home, Some(agent));
+    let effective = super::delegate_owner::effective_for(home, Some(agent));
+    run_selected(home, agent, people, &configured, &effective).await
+}
+
+pub(crate) async fn run_selected(home: &Path, agent: &str, people: &dyn People,
+    configured: &gi::EffectiveIdentity, eff: &gi::EffectiveIdentity) -> (Option<String>, Vec<Step>) {
     let mut out = Vec::new();
-    let eff = crate::google_identity::delegate_owner::effective_for(home, Some(agent));
     let email = match &eff.effective {
         Effective::Delegate { email } => email.clone(),
         Effective::Home => {
@@ -246,7 +255,36 @@ pub async fn run(home: &Path, agent: &str, people: &dyn People) -> (Option<Strin
         out.push(step("attestation", "管理員確認", true, "已符合受保護模式的代表規則"));
     }
 
-    let identity = DiagnosticIdentity { home, agent, email: &email, expected: &eff, people };
+    let identity = DiagnosticIdentity { home, agent, email: &email, expected: eff, configured, people };
+    if configured.effective == Effective::DelegateOwner {
+        // No Workspace data endpoint is reachable from this branch.
+        let client_id = match super::delegation_key::info(home) {
+            Ok(Some(info)) => info.client_id,
+            _ => None,
+        };
+        let Some(client_id) = client_id else {
+            out.push(step("tokeninfo", "Google 權限", false, "無法確認服務帳號用戶端。"));
+            return (Some(email), out);
+        };
+        for &(service, scopes) in super::delegated_scopes::SERVICES {
+            if service == "chat" && !gw::chat_read_enabled(home) { continue; }
+            for scope in scopes {
+                let result: Result<(), String> = async {
+                    let token = identity.mint(&[*scope]).await.map_err(|r| r.message_zh)?;
+                    identity.verify().map_err(|r| r.message_zh)?;
+                    let granted = crate::google_personal::oauth::tokeninfo(&token.access_token, &client_id).await
+                        .map_err(|_| "無法確認 tokeninfo 權限或用戶端。".to_string())?;
+                    identity.verify().map_err(|r| r.message_zh)?;
+                    if !granted.iter().any(|s| s.as_str() == *scope) { return Err("Google 未回報要求的權限。".into()); }
+                    Ok(())
+                }.await;
+                out.push(Step { id: format!("scope:{scope}"), label: "Google 權限", ok: result.is_ok(),
+                    detail: result.err().unwrap_or_else(|| format!("{service}: {scope} — tokeninfo 已確認；未讀取資料。")) });
+                if identity.verify().is_err() { return (Some(email), out); }
+            }
+        }
+        return (Some(email), out);
+    }
 
     // Each scope is independently requested so a missing Chat/Forms grant
     // cannot prevent diagnostics for already authorized services.

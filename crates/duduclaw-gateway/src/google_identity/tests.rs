@@ -173,6 +173,12 @@ async fn gmail_profile(headers: axum::http::HeaderMap) -> axum::Json<Value> {
     axum::Json(json!({"emailAddress": reported}))
 }
 
+async fn owner_tokeninfo(axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>) -> axum::Json<Value> {
+    let subject = query.get("access_token").and_then(|s| s.strip_prefix("tok:")).unwrap_or("");
+    let scope = seen_for(subject).last().map(|s| s.scope.clone()).unwrap_or_default();
+    axum::Json(json!({"aud":"1234567890","scope":scope}))
+}
+
 async fn ok_json() -> axum::Json<Value> {
     axum::Json(json!({"items": []}))
 }
@@ -268,6 +274,7 @@ fn mock() -> &'static str {
             rt.block_on(async move {
                 let app = axum::Router::new()
                     .route("/token", axum::routing::post(token_endpoint))
+                    .route("/owner-tokeninfo", axum::routing::get(owner_tokeninfo))
                     .route("/w3-refresh", axum::routing::post(closed_refresh_endpoint))
                     .route(
                         "/gmail.googleapis.com/gmail/v1/users/me/profile",
@@ -987,4 +994,81 @@ async fn delegate_status_and_unknown_tools_never_enter_token_work() {
     assert_eq!(route::serve(&state, "bot", "unknown_google_tool", &RequesterIdentity::Unknown)
         .await.unwrap_err().code, "scope_missing");
     assert_eq!(probe.counts(), [0, 0]);
+}
+
+
+#[tokio::test]
+async fn owner_diagnostic_records_audit_and_durable_notice_before_mint_without_data_reads() {
+    use duduclaw_auth::{AccessLevel, UserDb, UserRole};
+    use std::sync::Arc;
+    let home = Home::new();
+    let email = "owner-diagnostic@c.test";
+    home.ready("bot", email, "");
+    home.agent("bot", "[google]\nidentity='delegate:owner'\n");
+    let db = Arc::new(UserDb::new(&home.p().join("users.db")).unwrap());
+    let owner = db.create_user(email, "Owner", "test-password", UserRole::Employee).unwrap();
+    let admin = db.create_user("admin-diagnostic@c.test", "Admin", "test-password", UserRole::Admin).unwrap();
+    db.bind_agent(&owner.id, "bot", AccessLevel::Owner).unwrap();
+    db.ensure_google_employee_nonce("bot").unwrap();
+    let employee = delegate_owner::incarnation(home.p(), "bot").unwrap();
+    db.attest_google_delegate_owner(&duduclaw_auth::google_delegate_attestation::AttestationRequest {
+        agent_id:"bot", employee_id:&hex::encode(employee.0.0), employee_incarnation:employee.1,
+        subject:email, user_id:&owner.id, acknowledge_self_set:true,
+    }, &|value| value == email, &admin.id).unwrap();
+    let handler = Arc::new(crate::handlers::MethodHandler::new(home.p().to_path_buf()).await);
+    handler.set_user_db(db.clone(), Arc::new(duduclaw_auth::JwtConfig::new(b"diagnostic-fixture-signing-key-only"))).await;
+    let ctx = db.live_user_context(&admin.id).unwrap().unwrap();
+    let (entered, release) = pause_mint(email);
+    let task = {
+        let handler = handler.clone();
+        tokio::spawn(async move {
+            crate::google_personal::oauth::TEST_TOKENINFO_URL.scope(format!("{}/owner-tokeninfo", mock()), async {
+                handler.handle_google_identity_test(json!({"agent_id":"bot"}), &ctx).await
+            }).await
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), entered.notified()).await.unwrap();
+    let attempts = db.query_audit_log(Some(&admin.id), Some("google.delegate_identity_test"), 10).unwrap();
+    assert_eq!(attempts.len(), 1, "audit is durable before the first token response");
+    let store = crate::events_store::EventBusStore::open(home.p()).unwrap();
+    let notices = store.person_notices(&owner.id).await.unwrap();
+    assert_eq!(notices.len(), 1, "notice is durable before mint completes");
+    assert_eq!(notices[0]["kind"], "google_identity_test");
+    assert!(store.person_notices(&admin.id).await.unwrap().is_empty());
+    assert!(crate::notify_push::person_notice_test::take(home.p()).iter().any(|(id, _)| id == &owner.id));
+    release.notify_one();
+    let result = task.await.unwrap();
+    let crate::protocol::WsFrame::Response { ok:true, payload:Some(value), .. } = result else { panic!("{result:?}"); };
+    assert_eq!(value["ok"], true, "{value}");
+    assert_eq!(data_endpoint_reads_for(email), 0);
+    assert!(!seen_for(email).is_empty());
+    assert!(value["steps"].as_array().unwrap().iter().any(|step| step["detail"].as_str().is_some_and(|s| s.contains("tokeninfo"))));
+    assert_eq!(db.query_audit_log(Some(&admin.id), Some("google.identity_test_finished"), 10).unwrap().len(), 1);
+
+    // A durable-notice failure must stop before the HTTP mint boundary.
+    rusqlite::Connection::open(home.p().join("events.db")).unwrap().execute_batch(
+        "CREATE TRIGGER refuse_notice BEFORE INSERT ON person_notices BEGIN SELECT RAISE(ABORT,'fixture write failure'); END;"
+    ).unwrap();
+    let before_failure = seen_for(email).len();
+    let ctx = db.live_user_context(&admin.id).unwrap().unwrap();
+    let refused = handler.handle_google_identity_test(json!({"agent_id":"bot"}), &ctx).await;
+    assert!(matches!(refused, crate::protocol::WsFrame::Response { ok:false, .. }));
+    assert_eq!(seen_for(email).len(), before_failure);
+    assert_eq!(store.person_notices(&owner.id).await.unwrap().len(), 1);
+    assert!(crate::notify_push::person_notice_test::take(home.p()).is_empty());
+    assert!(db.query_audit_log(Some(&admin.id), Some("google.identity_test_finished"), 10).unwrap()[0]
+        .detail.as_deref().unwrap().contains("notice_failed"));
+
+    // A second ordinary owner call must mint afresh; revocation then refuses
+    // even though Google would still consider the previous bearer valid.
+    let people = super::requester_gate::people_for(home.p(), Some(&db));
+    let requester = RequesterIdentity::DashboardUser { user_id: owner.id.clone() };
+    let before = seen_for(email).len();
+    for _ in 0..2 {
+        resolve::resolve_person_for_tool(home.p(), "bot", &requester, people.as_ref(), "gmail_read").await.unwrap();
+    }
+    assert_eq!(seen_for(email).len(), before + 2);
+    db.revoke_google_delegate_attestation("bot", &admin.id).unwrap();
+    assert!(resolve::resolve_person_for_tool(home.p(), "bot", &requester, people.as_ref(), "gmail_read").await.is_err());
+    assert_eq!(seen_for(email).len(), before + 2);
 }

@@ -207,7 +207,7 @@ async fn resolve_person_scoped(
     };
     requester_gate::check(eff.requesters, requester, agent, &email, people)?;
     let attempt = match precheck(home, &email, people) {
-        Ok(()) => mint_delegate(home, &email, match endpoint_scopes { Some(scopes) => scopes, None => super::delegated_scopes::for_tool(home, tool)? }, CacheMode::Use).await,
+        Ok(()) => mint_delegate(home, &email, match endpoint_scopes { Some(scopes) => scopes, None => super::delegated_scopes::for_tool(home, tool)? }, if owner_selected { CacheMode::Bypass } else { CacheMode::Use }).await,
         Err(r) => Err(r),
     };
     if owner_selected {

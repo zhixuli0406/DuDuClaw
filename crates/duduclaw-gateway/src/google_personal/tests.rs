@@ -1287,6 +1287,6 @@ async fn administrator_personal_test_uses_only_oauth_metadata_and_notifies_the_m
         let audit = std::fs::read_to_string(f.home.join("security_audit.jsonl")).unwrap();
         assert!(audit.contains("google_personal_identity_test") && audit.contains(&admin.id) && audit.contains(&f.alice.id));
         let notices = crate::notify_push::person_notice_test::take(&f.home);
-        assert!(notices.iter().any(|(user, text)| user == &f.alice.id && text.contains("管理員測試")));
+        assert!(notices.iter().any(|(user, text)| user == &f.alice.id && text.contains("管理員準備測試")));
     }
 }

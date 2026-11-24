@@ -1123,6 +1123,7 @@ impl StagedAgentDir {
                 format!("agent '{}' already exists", self.agent_id),
             ));
         }
+        crate::employee_incarnation::deleted(org.home(), &self.agent_id)?;
         let prior = load(org.home()).get(&self.agent_id).cloned();
         upsert(org, &self.agent_id, entry)?;
         if let Err(e) = std::fs::rename(&self.staging, &self.target) {
@@ -1140,6 +1141,7 @@ impl StagedAgentDir {
             return Err(e);
         }
         self.published = true;
+        crate::employee_incarnation::created(org.home(), &self.agent_id)?;
         Ok(self.target.clone())
     }
 }

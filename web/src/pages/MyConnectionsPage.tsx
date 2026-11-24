@@ -53,6 +53,9 @@ export function MyConnectionsPage() {
   if (!status) return <Skeleton className="h-40 w-full" />;
   return <div className="mx-auto max-w-4xl space-y-6 p-6">
     <div><h1 className="text-2xl font-semibold">{t('myConnections.title')}</h1><p className="mt-2 text-sm text-muted-foreground">{t('myConnections.intro')}</p></div>
+    {(status.notices ?? []).map(notice => <p key={notice.id} role="status" className="rounded-lg border border-border p-3 text-sm">
+      {t(notice.kind === 'google_identity_data_test' ? 'myConnections.testNoticeData' : 'myConnections.testNotice', { agent: notice.agent_id, time: new Date(notice.timestamp).toLocaleString(intl.locale) })}
+    </p>)}
     <Card><CardHeader><CardTitle>Google</CardTitle></CardHeader><CardContent className="space-y-3">
       {status.connection && <><p className="font-medium">{status.connection.account_email}</p><p className="text-sm">{t(`myConnections.status.${status.connection.status}`)}</p>
         <Link to="/mail" className="text-sm underline">{t('nav.mail')}</Link>

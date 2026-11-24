@@ -6554,6 +6554,7 @@ export interface MyMemoryForgetResult {
 }
 
 export interface PersonalGoogleStatus {
+  notices?: { id: number; agent_id: string; actor_id: string; kind: string; timestamp: string }[];
   chat_read?: boolean;
   connection: { owner_id: string; account_email: string; granted_scopes: string[]; local_purposes?: string[]; status: 'connected' | 'needs_reconnect' | 'suspended'; connected_at: string } | null;
   login_email: string;

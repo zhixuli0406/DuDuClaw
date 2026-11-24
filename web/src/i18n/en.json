@@ -1,4 +1,6 @@
 {
+  "myConnections.testNotice": "At {time}, an administrator requested a Google connection and permission check through {agent}. The check does not read mail, files or calendars.",
+  "myConnections.testNoticeData": "At {time}, an administrator requested a Google delegation test through {agent}, including read-only data checks.",
   "agentConnections.identity.external": "Provided by an external tool",
   "agentConnections.externalServer": "External server name (optional, up to 120 characters)",
   "agentConnections.choice.delegateOwner": "Company authorization: follow responsible member",

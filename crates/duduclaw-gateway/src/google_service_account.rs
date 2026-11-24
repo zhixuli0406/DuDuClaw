@@ -323,6 +323,14 @@ pub async fn mint_for_subject(
     cache_mode: CacheMode,
 ) -> Result<MintedToken, ServiceAccountError> {
     let cache_key = cache_key(&key.client_email, subject, scopes);
+    if cache_mode == CacheMode::Bypass {
+        // Retire prior reusable bearers for this exact issuer/subject. Owner
+        // delegation uses Bypass on every call and never populates this cache.
+        cache().write().await.retain(|stored, _| {
+            let mut fields = stored.split('|');
+            !(fields.next() == Some(key.client_email.as_str()) && fields.next() == Some(subject))
+        });
+    }
     if cache_mode == CacheMode::Use
         && let Some(hit) = cache().read().await.get(&cache_key)
     {
