@@ -64,6 +64,33 @@ fn active() -> &'static Mutex<HashSet<(PathBuf, String)>> {
     ACTIVE.get_or_init(Default::default)
 }
 
+/// A lightweight reference; the registration remains responsible for liveness.
+#[derive(Clone)]
+pub(crate) struct ReplyBinding {
+    store: Arc<Inbox>,
+    name: String,
+}
+
+tokio::task_local! {
+    pub(crate) static REPLY_BINDING: Option<ReplyBinding>;
+}
+
+/// No-op for other adapters. Persist the employee/session that actually won
+/// routing before the model runs, including legacy default and @ turns.
+pub(crate) fn bind_reply_employee(employee: &str, session: &str) -> Result<(), String> {
+    REPLY_BINDING.try_with(|binding| {
+        let Some(binding) = binding else { return Ok(()); };
+        binding.store.placeholder_access(|conn| {
+            let changed = conn.execute(
+                "UPDATE pending_placeholders SET employee_id=?2,session_id=?3 WHERE message_name=?1",
+                params![binding.name, employee, session],
+            )?;
+            if changed != 1 { return Err(rusqlite::Error::QueryReturnedNoRows); }
+            Ok(())
+        })
+    }).unwrap_or(Ok(()))
+}
+
 /// Drop releases liveness, preserving evidence for same-process recovery.
 pub(crate) struct PlaceholderRegistration {
     store: Arc<Inbox>,
@@ -77,6 +104,10 @@ impl PlaceholderRegistration {
         store.insert_placeholder(row)?;
         active.insert((store.home.clone(), row.message_name.clone()));
         Ok(Self { store, name: row.message_name.clone(), retired: false.into() })
+    }
+
+    pub(crate) fn reply_binding(&self) -> ReplyBinding {
+        ReplyBinding { store: self.store.clone(), name: self.name.clone() }
     }
 
     pub(crate) fn home(&self) -> &Path { &self.store.home }

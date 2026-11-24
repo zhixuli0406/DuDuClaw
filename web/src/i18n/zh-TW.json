@@ -11647,5 +11647,9 @@
   "users.avatar.conflicts": "待處理的 AI 分身衝突",
   "users.avatar.conflictsHint": "以下成員共用同一位主要 AI，升級未自動指定分身。請編輯成員，分別指定不同的 AI 分身。",
   "users.avatar.inUse": "這位 AI 已是其他成員的分身，請選擇另一位 AI 員工。",
-  "users.avatar.loadError": "無法載入 AI 分身衝突，請重新整理後再試。"
+  "users.avatar.loadError": "無法載入 AI 分身衝突，請重新整理後再試。",
+  "channels.googlechat.sharedBinding": "依傳訊者分派（共用 Chat 應用程式）",
+  "channels.googlechat.sharedBinding.help": "私訊先依 @ 點名分派；沒有點名時，依管理員綁定的身分交給成員的 AI 分身或主要 AI。群組維持原有分派。儲存後下一則訊息生效。",
+  "channels.googlechat.unboundReply": "未開通者回覆",
+  "channels.googlechat.unboundReply.help": "純文字，最多 1,000 字。可加入 '{onboarding_url}'，有有效 HTTPS 公開儀表板網址時才顯示，否則會移除。這個網址會讓任何能私訊應用程式的人看見。"
 }

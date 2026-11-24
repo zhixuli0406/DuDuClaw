@@ -91,13 +91,20 @@ impl MethodHandler {
         };
         let all = mgr.get_all(&channel, &scope_id).await;
         let scopes = mgr.list_scopes(&channel).await;
+        let mut settings = config_settings_to_json(&all);
+        if channel != "googlechat" || scope_id != "global" {
+            if let Some(object) = settings.as_object_mut() {
+                object.remove("shared_bot_binding");
+                object.remove("unbound_reply");
+            }
+        }
         WsFrame::ok_response(
             "",
             json!({
                 "success": true,
                 "channel": channel,
                 "scope_id": scope_id,
-                "settings": config_settings_to_json(&all),
+                "settings": settings,
                 "scopes": scopes,
             }),
         )
@@ -127,7 +134,7 @@ impl MethodHandler {
         };
         for key in settings_obj.keys() {
             if !crate::channel_settings::CONFIG_KEYS.contains(&key.as_str())
-                && !(channel == "googlechat" && scope_id == "global" && key == crate::channel_settings::keys::DM_REPLY_PLACEMENT) {
+                && !(channel == "googlechat" && scope_id == "global" && [crate::channel_settings::keys::DM_REPLY_PLACEMENT, crate::channel_settings::keys::SHARED_BOT_BINDING, crate::channel_settings::keys::UNBOUND_REPLY].contains(&key.as_str())) {
                 return WsFrame::error_response("", &format!("Unknown setting key: {key}"));
             }
         }

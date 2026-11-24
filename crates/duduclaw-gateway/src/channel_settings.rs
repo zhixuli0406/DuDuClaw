@@ -24,6 +24,8 @@ fn verify_live_io() -> Result<(), String> {
 pub mod keys {
     /// Dashboard-only Google Chat DM presentation preference.
     pub const DM_REPLY_PLACEMENT: &str = "dm_reply_placement";
+    /// Admin-only shared Google Chat app onboarding text.
+    pub const UNBOUND_REPLY: &str = "unbound_reply";
     /// Admin-only per-group retention policy; not exposed through channel_config.
     pub const GROUP_CONTEXT: &str = "group_context";
     /// Admin-only per-guild choices for Discord /agent. No global inheritance.
@@ -54,8 +56,9 @@ pub mod keys {
     /// admin-gated chat commands (`!STOP` / `!STOP ALL` / `!RESUME`).
     /// Missing or empty = NO admins on that channel (fail-closed).
     pub const ADMIN_USERS: &str = "admin_users";
-    /// WP9: whether this is a company shared bot where employees bind to their
-    /// own agent via a `/start <token>` deep-link. Values: "true" / "false".
+    /// Company shared-app routing. Telegram uses bind links / member targets;
+    /// Google Chat uses manually bound members in proven one-to-one DMs.
+    /// Admin-only. Values: "true" / "false".
     /// Default false = the global bot keeps its existing default-agent routing.
     /// When true, an unbound user on the shared bot is shown a bind-first
     /// guidance message instead of being answered by the default agent.
@@ -157,6 +160,7 @@ pub fn validate_setting_value(key: &str, value: &str) -> Result<(), String> {
         keys::DM_REPLY_PLACEMENT => {
             if !["main", "thread"].contains(&value) { return Err("dm_reply_placement must be main or thread".into()); }
         }
+        keys::UNBOUND_REPLY => crate::googlechat_shared::validate_unbound_reply(value)?,
         keys::DISCORD_AGENT_CHOICES => {
             let ids: Vec<String> = serde_json::from_str(value)
                 .map_err(|_| "discord_agent_choices must be an array of agent ids".to_string())?;
@@ -164,7 +168,7 @@ pub fn validate_setting_value(key: &str, value: &str) -> Result<(), String> {
                 return Err("discord_agent_choices accepts at most 25 valid agent ids".into());
             }
         }
-        keys::MENTION_ONLY | keys::AUTO_THREAD | keys::REQUIRE_PAIRING => {
+        keys::SHARED_BOT_BINDING | keys::MENTION_ONLY | keys::AUTO_THREAD | keys::REQUIRE_PAIRING => {
             if value != "true" && value != "false" {
                 return Err(format!("{key} must be 'true' or 'false'"));
             }

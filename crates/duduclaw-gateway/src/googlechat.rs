@@ -843,6 +843,42 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
         .unwrap_or("unknown")
         .to_string();
 
+    let session_id = format!("googlechat:{space}");
+    let route = crate::googlechat_shared::route(
+        &state.ctx, state.agent.is_some(), is_dm, &session_id, &sender_id, &text,
+    ).await;
+    let (routed_agent, own_turn, called_turn) = match route {
+        crate::googlechat_shared::Route::Legacy => (state.agent.clone(), state.agent.is_some(), false),
+        crate::googlechat_shared::Route::Avatar(agent) => (Some(agent), true, false),
+        crate::googlechat_shared::Route::Called { agent, via_trigger } => (Some(agent), false, via_trigger),
+        crate::googlechat_shared::Route::Direct(reply) => {
+            if !reply.trim().is_empty() {
+                let reply = crate::markdown_render::to_googlechat_text(&reply);
+                if post_message(&state.creds, &space, thread.as_deref(), &reply).await.is_err() {
+                    warn!(failed = 1, "Google Chat direct reply delivery failed");
+                }
+            }
+            return;
+        }
+        crate::googlechat_shared::Route::Unbound(reply) => {
+            // Keep blocked/taken-over conversations silent. Never forward an
+            // access-gate diagnostic or command response to an unbound sender.
+            if crate::channel_reply::check_user_access_gate(
+                &state.ctx, &session_id,
+                crate::ccr_runtime::reply_principal_for_sender(&sender_id), &text,
+            ).await.is_none()
+                && !crate::takeover::is_target_paused(&state.ctx.home_dir, "googlechat", &space)
+                && !reply.trim().is_empty()
+                && crate::googlechat_shared::allow_unbound_reply(&state.ctx.home_dir, &sender_id)
+            {
+                if post_message(&state.creds, &space, thread.as_deref(), &reply).await.is_err() {
+                    warn!(failed = 1, "Google Chat unbound reply delivery failed");
+                }
+            }
+            return;
+        }
+    };
+
     let group_turn = crate::channel_reply::group_buffer::GroupTurn::capture(&state.ctx, message.pointer("/space/type").or_else(|| event.pointer("/space/type")).and_then(|v| v.as_str()).is_some_and(|kind| matches!(kind, "ROOM" | "SPACE" | "GROUP_CHAT")), "googlechat", "global", &space, thread.as_deref(), message.get("name").and_then(|v| v.as_str()).unwrap_or(""), &sender_id, &sender, if text.is_empty() { "[附件]" } else { &text }).await;
 
     let raw_text = message.get("argumentText").or_else(|| message.get("text"))
@@ -859,7 +895,7 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
     let mut attachment_lines: Vec<String> = Vec::new();
     if !attachments.is_empty() {
         let attach_base =
-            crate::channel_reply::resolve_attachment_base(state.ctx.as_ref(), state.agent.as_deref())
+            crate::channel_reply::resolve_attachment_base(state.ctx.as_ref(), routed_agent.as_deref())
                 .await;
         for att in &attachments {
             let filename = att.effective_filename();
@@ -912,15 +948,23 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
     }
 
     // Resolve the durable identity before creating any visible placeholder.
-    let session_id = format!("googlechat:{space}");
-    let reply_session = match &state.agent {
-        Some(agent) => crate::trigger_route::called_session(&session_id, agent),
-        None => session_id.clone(),
+    let reply_session = match &routed_agent {
+        Some(agent) if own_turn || called_turn => crate::trigger_route::called_session(&session_id, agent),
+        _ => session_id.clone(),
     };
-    let employee_id = match &state.agent {
+    let employee_id = match &routed_agent {
         Some(agent) => agent.clone(),
         None => state.ctx.registry.read().await.main_agent()
             .map(|a| a.config.agent.name.clone()).unwrap_or_default(),
+    };
+    let (recovery_employee, recovery_session) = if routed_agent.is_none()
+        && !crate::chat_commands::is_command(&text)
+    {
+        crate::googlechat_shared::recovery_identity(
+            &state.ctx, &session_id, &sender_id, &input_text,
+        ).await
+    } else {
+        (employee_id.clone(), reply_session.clone())
     };
     // Fail closed: never create a placeholder when recovery cannot be persisted.
     let store = match crate::googlechat_inbox::Inbox::shared(&state.ctx.home_dir) {
@@ -928,7 +972,7 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
         Err(_) => { warn!(failed = 1, "Google Chat placeholder store unavailable"); return; }
     };
     let (name, registration) = match create_placeholder(
-        &state.creds, store, &space, thread.as_deref(), state.agent.clone(), employee_id, reply_session.clone(),
+        &state.creds, store, &space, thread.as_deref(), state.agent.clone(), recovery_employee, recovery_session,
     ).await {
         Ok(created) => created,
         Err(_) => { warn!(failed = 1, "Google Chat placeholder persistence failed"); return; }
@@ -1012,15 +1056,7 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
             let reply = match crate::chat_commands::command_preflight(&cmd, &state.ctx, &origin).await {
                 Some(reply) => reply,
                 None => {
-                    let agent_id = match &state.agent {
-                        Some(agent) => agent.clone(),
-                        None => {
-                            let reg = state.ctx.registry.read().await;
-                            reg.main_agent()
-                                .map(|a| a.config.agent.name.clone())
-                                .unwrap_or_default()
-                        }
-                    };
+                    let agent_id = employee_id.clone();
                     crate::chat_commands::handle_command_for_sender(
                         &cmd,
                         &state.ctx,
@@ -1075,22 +1111,21 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
     } else {
         None
     };
-    let (guarded, deliberate_silence) = crate::channel_reply::track_silence(group_turn.scope(crate::ccr_runtime::ATTESTED_ONE_TO_ONE.scope(one_to_one, Box::pin(async { match &state.agent {
-        // Own app: deterministic routing to its employee, in the employee's
-        // bucket; the access gate and takeover still run on the space.
+    let recovery_binding = registration.as_ref().map(|r| r.reply_binding());
+    let (guarded, deliberate_silence) = crate::googlechat_inbox::REPLY_BINDING.scope(
+        recovery_binding, crate::channel_reply::track_silence(group_turn.scope(crate::ccr_runtime::ATTESTED_ONE_TO_ONE.scope(one_to_one, Box::pin(async { match &routed_agent {
+        // Avatars use the same own-bot bucket as employee apps; explicit @
+        // calls retain their existing label and called-session semantics.
         Some(agent) => {
-            thinking
-                .scope(crate::trigger_route::as_own_bot_turn(
-                    crate::channel_reply::build_guarded_reply_for_agent(
-                        &input_text,
-                        &state.ctx,
-                        agent,
-                        &session_id,
-                        crate::ccr_runtime::reply_principal_for_sender(&sender_id),
-                        Some(on_progress),
-                    ),
-                ))
-                .await
+            let reply = crate::channel_reply::build_guarded_reply_for_agent(
+                &input_text, &state.ctx, agent, &session_id,
+                crate::ccr_runtime::reply_principal_for_sender(&sender_id), Some(on_progress),
+            );
+            if own_turn {
+                thinking.scope(crate::trigger_route::as_own_bot_turn(reply)).await
+            } else {
+                thinking.scope(crate::trigger_route::as_called_turn(called_turn, reply)).await
+            }
         }
         None => {
             thinking
@@ -1103,7 +1138,7 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
                 ))
                 .await
         }
-    } })))).await;
+    } }))))).await;
     let thinking_footer = thinking.finish().await;
     if !guarded.still_valid().await {
         report_delivery(delivery_target, deliver_reply(
@@ -1151,6 +1186,12 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
         }
         return;
     }
+    let reply = match guarded.answered_by.as_ref() {
+        Some(who) if called_turn && who.via_trigger => {
+            crate::trigger_route::with_reply_prefix(reply, &who.display_name)
+        }
+        _ => reply,
+    };
     let reply = crate::thinking::channel_presenter::with_footer(reply, thinking_footer.as_ref());
 
     let answered = DeliveryTarget {

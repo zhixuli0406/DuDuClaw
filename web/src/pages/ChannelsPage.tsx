@@ -20,6 +20,7 @@ import { useAuthStore } from '@/stores/auth-store';
 import { isVisible, type Gated } from '@/lib/nav-visibility';
 import { ConfirmDialog } from '@/components/settings/controls';
 import { RestartRequiredBanner } from '@/components/settings/RestartRequiredBanner';
+import { GoogleChatSharedSettings } from '@/components/channels/GoogleChatSharedSettings';
 import { GroupContextSettings } from '@/components/channels/GroupContextSettings';
 import { WebChatWidgetCard } from '@/components/channels/WebChatWidgetCard';
 import { AddChannelDialog, CHANNEL_TYPES, DialogField } from '@/components/channels/AddChannelDialog';
@@ -970,6 +971,7 @@ function TagListEditor({
 
 /** 行為 tab (E1) — `channels.config_get`/`channels.config_set`. */
 function ChannelBehaviorTab({ platform, active }: { platform: string; active: boolean }) {
+  const role = useAuthStore((state) => state.user?.role);
   const intl = useIntl();
   const t = (id: string) => intl.formatMessage({ id });
   const [loading, setLoading] = useState(true);
@@ -1043,6 +1045,9 @@ function ChannelBehaviorTab({ platform, active }: { platform: string; active: bo
                 </SelectContent>
               </Select>
             </SettingsRow>
+          )}
+          {platform === 'googlechat' && (
+            <GoogleChatSharedSettings role={role} settings={settings} onChange={update} />
           )}
           {hasGroupContext && (
             <SettingsRow

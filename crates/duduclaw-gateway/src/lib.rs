@@ -228,6 +228,8 @@ pub mod google_identity;
 pub mod google_personal;
 pub mod google_service_account;
 pub mod google_workspace;
+mod shared_app_route;
+mod googlechat_shared;
 pub mod googlechat;
 pub mod googlechat_pubsub;
 mod googlechat_inbox;
