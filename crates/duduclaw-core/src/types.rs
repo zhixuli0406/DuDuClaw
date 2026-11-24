@@ -4688,6 +4688,9 @@ impl Default for PromptConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
 pub struct MemoryConfig {
+    /// Conversation task reference: off or first_message. An agent can only narrow.
+    #[serde(default, deserialize_with = "crate::lenient::opt", skip_serializing_if = "Option::is_none")]
+    pub pinned_task: Option<String>,
     /// Language for automatically generated memories; auto inherits the next level.
     #[serde(default, deserialize_with = "crate::lenient::opt", skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
@@ -4714,6 +4717,7 @@ impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
             language: None,
+            pinned_task: None,
             decision_continuity: None,
             decision_ttl_days: None,
         }

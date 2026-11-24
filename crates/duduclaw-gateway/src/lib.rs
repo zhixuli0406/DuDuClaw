@@ -532,7 +532,9 @@ mod mfa;
 mod mfa_email;
 /// Installation Ed25519 key and the shared descriptor-pinned `state/` store.
 pub mod installation_identity;
+pub mod memory_reference;
 pub mod session;
+pub mod session_tool_refs;
 pub mod session_origin;
 pub mod session_portability;
 pub mod session_retention;

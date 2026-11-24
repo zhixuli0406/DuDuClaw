@@ -2990,3 +2990,66 @@ mod idle_tests {
         }
     }
 }
+
+/// RM-182: missing keys preserve first-message extraction; unreadable files,
+/// malformed tables/types and unknown values fail closed. Employee settings
+/// are intersected with the installation setting and can never enable it.
+pub fn pinned_task_enabled(home: &Path, agent_dir: Option<&Path>) -> bool {
+    fn read(path: &Path) -> bool {
+        let Ok(text) = std::fs::read_to_string(path) else { return false; };
+        let Ok(doc) = text.parse::<toml::Value>() else { return false; };
+        let value = match doc.get("memory") {
+            None => return true,
+            Some(memory) => match memory.as_table() {
+                None => return false,
+                Some(memory) => memory.get("pinned_task"),
+            },
+        };
+        match value {
+            None => true,
+            Some(value) if value.as_str() == Some("first_message") => true,
+            Some(value) if value.as_str() == Some("off") => false,
+            Some(_) => {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| tracing::warn!("Unknown [memory] pinned_task value; treating it as off"));
+                false
+            }
+        }
+    }
+    let global = read(&home.join("config.toml"));
+    let employee = agent_dir.is_some_and(|dir| read(&dir.join("agent.toml")));
+    global && employee
+}
+
+#[cfg(test)]
+mod pinned_task_setting_tests {
+    use super::*;
+
+    #[test]
+    fn off_and_unknown_fail_closed_and_agent_only_narrows() {
+        let home = tempfile::tempdir().unwrap();
+        let agent = home.path().join("agent");
+        std::fs::create_dir(&agent).unwrap();
+        for (global, employee, enabled) in [
+            ("", "", true),
+            ("first_message", "first_message", true),
+            ("off", "first_message", false),
+            ("first_message", "off", false),
+            ("unknown", "first_message", false),
+            ("first_message", "unknown", false),
+        ] {
+            for (path, value) in [(home.path().join("config.toml"), global), (agent.join("agent.toml"), employee)] {
+                std::fs::write(path, if value.is_empty() { String::new() }
+                    else { format!("[memory]\npinned_task = {value:?}\n") }).unwrap();
+            }
+            assert_eq!(pinned_task_enabled(home.path(), Some(&agent)), enabled);
+        }
+        std::fs::write(agent.join("agent.toml"), "[memory]\npinned_task = true").unwrap();
+        assert!(!pinned_task_enabled(home.path(), Some(&agent)));
+        assert!(!pinned_task_enabled(home.path(), None));
+        std::fs::write(agent.join("agent.toml"), "invalid = [").unwrap();
+        assert!(!pinned_task_enabled(home.path(), Some(&agent)));
+        std::fs::remove_file(agent.join("agent.toml")).unwrap();
+        assert!(!pinned_task_enabled(home.path(), Some(&agent)));
+    }
+}

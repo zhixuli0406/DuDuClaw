@@ -1614,17 +1614,26 @@ pub(super) fn render<I: LocalRender>(value: Outcome, io: &mut I) -> Value {
                 r.draft_id, r.to, r.subject
             ));
             result["_meta"]["duduclaw_pending_draft_id"] = serde_json::json!(r.draft_id);
+            result["_meta"]["duduclaw_created_ref"] = json!({"id": r.draft_id, "label": r.subject});
             result
         },
-        Outcome::CalendarCreate(r) => tool_text(&calendar_created_text(&r)),
+        Outcome::CalendarCreate(r) => {
+            let mut result = tool_text(&calendar_created_text(&r));
+            result["_meta"]["duduclaw_created_ref"] = json!({"id": r.id, "label": r.summary});
+            result
+        },
         Outcome::SheetsAppend(r) => tool_text(&sheets_appended_text(&r)),
-        Outcome::TasksCreate(t) => tool_text(&format!(
-            "Task created in the user's Google Tasks.\nTask ID: {}\nTitle: {}\nStatus: {}\nDue: {}",
-            t.id,
-            t.title,
-            t.status,
-            if t.due.is_empty() { "(none)" } else { &t.due }
-        )),
+        Outcome::TasksCreate(t) => {
+            let mut result = tool_text(&format!(
+                "Task created in the user's Google Tasks.\nTask ID: {}\nTitle: {}\nStatus: {}\nDue: {}",
+                t.id,
+                t.title,
+                t.status,
+                if t.due.is_empty() { "(none)" } else { &t.due }
+            ));
+            result["_meta"]["duduclaw_created_ref"] = json!({"id": t.id, "label": t.title});
+            result
+        },
         Outcome::TasksComplete(t) => tool_text(&format!(
             "Task marked completed.\nTask ID: {}\nTitle: {}\nStatus: {}",
             t.id, t.title, t.status
