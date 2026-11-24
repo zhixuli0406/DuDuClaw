@@ -445,9 +445,12 @@ mod tests {
     #[test]
     fn trust_write_takes_the_fence_of_its_own_page_directory() {
         let temp = tempfile::tempdir().unwrap();
-        crate::wiki::WikiStore::new(temp.path().join("agents/a/wiki"))
-            .ensure_scaffold()
-            .unwrap();
+        // Persistent trust writes now require an actual resolved page.
+        for agent in ["a", "b"] {
+            let wiki = crate::wiki::WikiStore::new(temp.path().join("agents").join(agent).join("wiki"));
+            wiki.ensure_scaffold().unwrap();
+            wiki.write_page("concepts/a.md", "# A\n").unwrap();
+        }
         let trust =
             crate::trust_store::WikiTrustStore::open(temp.path().join("wiki_trust.db")).unwrap();
         let own = WikiDeliveryFence::for_agent_wiki(temp.path(), "a")

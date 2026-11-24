@@ -241,7 +241,7 @@ Three modes:
 
 Both `wiki_write` with `scope="shared"` and `shared_wiki_delete` honour the policy. Unlisted namespaces are `agent_writable` by default — the policy *only tightens*, never relaxes.
 
-**Fail-safe:** absent file ⇒ no policy ⇒ existing behaviour. Malformed TOML ⇒ logged warning + treated as no policy. The gateway is never blocked by a broken policy file.
+A missing `.scope.toml` keeps the existing default; a malformed or unreadable file denies access. See the RM-209 policy rules below.
 
 **Hot-reload:** the policy is re-read on every write/delete (the file is small; performance impact negligible). Operator edits take effect immediately.
 
@@ -264,7 +264,7 @@ This is orthogonal to the write `mode` — a namespace may declare either, both,
 
 **Fail-closed** for any declared namespace: an agent whose department is not on the list — including an agent with **no department** — is denied. Exact department match only (no prefix/substring). An empty list denies everyone.
 
-**Fail-safe** when undeclared: a namespace without `visible_to_departments` stays readable by all agents, exactly as before. Absent / malformed `.scope.toml` ⇒ no filter.
+An undeclared namespace has no department filter when the root policy is valid or missing. A malformed root policy hides every namespace from AI readers.
 
 This layers on top of the built-in `departments/<dept>/` isolation (see Department knowledge layering below): `departments/art/*` is always visible only to the `art` department regardless of `.scope.toml`, while `visible_to_departments` lets an operator restrict *any* namespace (`hr/`, `finance/`, …) to chosen departments. `wiki_namespace_status` surfaces the active `visible_to_departments` declarations.
 
@@ -340,7 +340,7 @@ is a no-op; changed content overwrites the body and appends a revision-log line.
 **Gates, all fail-closed, all degrading to the memory path:**
 
 1. `.scope.toml` — `[namespaces.auto]` may be `operator_only` / `read_only` for
-   another capability to disable auto-filing. Unlike the shared-wiki fail-safe,
+   another capability to disable auto-filing. As with shared-wiki access,
    a file that exists but does not parse **stops** the write.
 2. `scan_input` over the rendered page text — any rule match drops the page.
 3. Same-origin burst detection (`knowledge_guard`).
@@ -416,3 +416,13 @@ Before v1.8.9, the Wiki was write-only from the LLM's perspective: everyone coul
 ## The Takeaway
 
 Knowledge isn't a flat pile of documents — it's layered by how often you need to see it. DuDuClaw's Wiki makes that layering explicit, trust-weights every page, and auto-injects the must-always-remember tier directly into every system prompt. The deep archive stays quiet until summoned.
+
+### Page identity, policies and scanning (RM-209)
+
+Existing pages use the final filename found on disk as their identity, including trust quarantine and auto-page registry lookups. Equivalent case or Unicode spellings resolve to that identity; if multiple directory entries fold to the same name, access is refused. Reserved names use the same comparison: `_INDEX.md` receives index redaction and cannot be written as a page. Writes still reject trailing dots/spaces; a read alias either resolves to the same page or is refused under the platform's path rules.
+
+Only the wiki root's `.scope.toml` applies. A missing file keeps the existing default. Unreadable files, symlinks, files larger than 64 KB, malformed TOML and incorrect field types stop affected writes, AI visibility/injection, dashboard reads and exports. The dashboard policy editor supports `agent_allowlist` and its `agents` list. Run `duduclaw doctor` or the dashboard system check before upgrading: it reports policy errors and warns that nested `.scope.toml` files have no effect. Repair the root policy before retrying.
+
+Listing, search, injection and export share a scanner with a depth limit of 20. It skips the first-level `_archive` folder (including equivalent spellings), reserved files and internal links, and refuses a linked start directory. Invalid or ambiguous page ids are skipped and counted in scan/export logs. Both write paths refuse linked `_index.md`, `_log.md`, `_index.lock` and `.scope.toml`, including dangling links.
+
+Trust writes persist the resolved on-disk page id. Reads merge legacy separator, case, Unicode, invisible-character and trailing-dot/space aliases, taking the lowest trust and retaining any `do_not_inject` flag. Missing or ambiguous pages are withheld. Page and control-file I/O refuse every symlink/junction component, including links to another directory inside the wiki. Each directory is limited to 10,000 entries; exceeding the cap refuses resolution or scanning. The scanner lists each directory once. `knowledge_owner` accepts only `memory` or `wiki`; any other value invalidates the policy. ActionGuard grounding uses only `read_only` and `operator_only` namespaces: an `agent_allowlist` namespace remains employee-writable and cannot supply grounding.

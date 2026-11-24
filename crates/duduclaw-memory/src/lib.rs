@@ -96,3 +96,5 @@ pub use night::{
     consolidate_recurrent, detect_themes, induce_schema, recurrence_gate,
     verify_consolidation, ConsolidationResult, InducedSchema, Theme, VerificationReport,
 };
+
+pub mod wiki_scan;

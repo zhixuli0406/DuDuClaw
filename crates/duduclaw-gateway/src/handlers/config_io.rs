@@ -281,6 +281,14 @@ impl MethodHandler {
         }
 
         checks.extend(super::doctor_util::legacy_wiki_checks(&self.home_dir));
+        checks.extend(duduclaw_core::scope_policy_checks::checks(&self.home_dir).into_iter().map(|(name, status, message)| {
+            let status = match status {
+                duduclaw_core::types::CheckStatus::Pass => "pass",
+                duduclaw_core::types::CheckStatus::Warn => "warn",
+                _ => "fail",
+            };
+            json!({ "name": name, "status": status, "message": message, "can_repair": false })
+        }));
         checks
     }
 }
