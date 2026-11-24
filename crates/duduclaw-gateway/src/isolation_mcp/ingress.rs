@@ -2,11 +2,12 @@
 use std::{future::Future, path::{Path, PathBuf}, sync::Mutex};
 use duduclaw_auth::jwt::Claims;
 use duduclaw_knowledge::requester::RequesterIdentity;
+use crate::webchat::ChatCredential;
 use super::{RuntimeAuthorization, VerificationError};
 
 #[derive(Clone)]
 enum Source {
-    Web(Claims),
+    Web(ChatCredential),
     Channel { channel: String, sender: String },
 }
 struct HumanIngress {
@@ -16,15 +17,15 @@ struct HumanIngress {
     source: Source,
 }
 tokio::task_local! {
-    static WEB_CREDENTIAL: Option<Claims>;
+    static WEB_CREDENTIAL: Option<ChatCredential>;
     static INGRESS: Mutex<Option<HumanIngress>>;
 }
 
-/// Called only after the WebChat socket and this queued turn revalidate Claims.
-/// The Claims already crossed the socket-task boundary in TurnInput.
-pub(crate) async fn webchat_scope<F: Future>(claims: Option<Claims>, future: F) -> F::Output {
+/// Called only after the WebChat socket and this queued turn revalidate the credential.
+/// The credential already crossed the socket-task boundary in TurnInput.
+pub(crate) async fn webchat_scope<F: Future>(credential: Option<ChatCredential>, future: F) -> F::Output {
     if WEB_CREDENTIAL.try_with(|_| ()).is_ok() { return future.await; }
-    WEB_CREDENTIAL.scope(claims, future).await
+    WEB_CREDENTIAL.scope(credential, future).await
 }
 
 /// Capture the channel credential epoch before the reply pipeline does any
@@ -33,15 +34,19 @@ pub(crate) async fn webchat_scope<F: Future>(claims: Option<Claims>, future: F) 
 pub(crate) async fn reply_scope<F: Future>(home: &Path, requester: &RequesterIdentity, future: F) -> F::Output {
     if INGRESS.try_with(|_| ()).is_ok() { return future.await; }
     if !duduclaw_core::execution_gate::isolation_required() { return future.await; }
+    protected_reply_scope(home, requester, future).await
+}
+
+async fn protected_reply_scope<F: Future>(home: &Path, requester: &RequesterIdentity, future: F) -> F::Output {
     let web = WEB_CREDENTIAL.try_with(Clone::clone).ok().flatten();
     let (home, requester) = (home.to_owned(), requester.clone());
     let captured = duduclaw_mcp_boundary::authority::verify_blocking(move || {
         let (user, source, expected_epoch) = match requester {
             RequesterIdentity::DashboardUser { user_id } => {
-                let claims = web.ok_or(VerificationError::Invalid)?;
-                check_web_identity(&claims, &user_id, duduclaw_mcp_boundary::authority::now_seconds()?)?;
-                let epoch = claims.credential_epoch;
-                (user_id, Source::Web(claims), Some(epoch))
+                let credential = web.ok_or(VerificationError::Invalid)?;
+                let epoch = check_web_identity(&home, &credential, &user_id,
+                    duduclaw_mcp_boundary::authority::now_seconds()?)?;
+                (user_id, Source::Web(credential), Some(epoch))
             }
             RequesterIdentity::ChannelUser { channel, sender, user_id: Some(user), .. } => {
                 if web.is_some() { return Err(VerificationError::Revoked); }
@@ -102,11 +107,15 @@ pub(super) async fn authorize_current(agent_dir: &Path, principal_context: Optio
     duduclaw_mcp_boundary::authority::verify_blocking(move || {
         if !proof.valid_for(&agent, &turn) { return Err(VerificationError::Revoked); }
         match &human.source {
-            Source::Web(claims) => check_web_identity(claims, &human.user, duduclaw_mcp_boundary::authority::now_seconds()?)?,
+            Source::Web(credential) => {
+                let epoch = check_web_identity(&human.home, credential, &human.user,
+                    duduclaw_mcp_boundary::authority::now_seconds()?)?;
+                require_epoch(human.epoch, Some(epoch))?;
+            }
             Source::Channel { channel, sender } => check_channel_mapping(&human.user,
                 crate::trigger_route::access::verified_user_for_channel_sender(&human.home, channel, sender).as_deref())?,
         }
-        let expiry = match &human.source { Source::Web(claims) => Some(claims.exp), _ => None };
+        let expiry = match &human.source { Source::Web(ChatCredential::Jwt(claims)) => Some(claims.exp), _ => None };
         super::boot::record_authorization(human.home, agent, human.user, human.epoch, lane,
             super::HostTurn { identity: crate::isolation_egress::RunTurnIdentity {
                 turn, approval_session: Some(session) }, metadata: Some(metadata), principal_context,
@@ -119,7 +128,31 @@ fn take_human() -> Result<HumanIngress, VerificationError> {
         .ok().flatten().ok_or(VerificationError::Unavailable)
 }
 
-fn check_web_identity(claims: &Claims, user: &str, now: u64) -> Result<(), VerificationError> {
+/// Re-read authority at capture and again before issuance; a cached user alone
+/// must never turn a revoked member key into a human ingress credential.
+fn check_web_identity(home: &Path, credential: &ChatCredential, user: &str, now: u64)
+    -> Result<u64, VerificationError> {
+    if user.is_empty() { return Err(VerificationError::Revoked); }
+    let db = crate::decision_notify::open_user_db(home)
+        .map_err(|_| VerificationError::Unavailable)?.ok_or(VerificationError::Unavailable)?;
+    match credential {
+        ChatCredential::Jwt(claims) => {
+            check_jwt_identity(claims, user, now)?;
+            let live = db.live_user_context(user).map_err(|_| VerificationError::Unavailable)?
+                .ok_or(VerificationError::Revoked)?;
+            require_epoch(claims.credential_epoch, Some(live.credential_epoch))?;
+            Ok(live.credential_epoch)
+        }
+        ChatCredential::Member(ctx) => {
+            if ctx.user_id != user { return Err(VerificationError::Revoked); }
+            let live = crate::member_keys::refresh(home, &db, ctx)
+                .map_err(|_| VerificationError::Revoked)?;
+            Ok(live.credential_epoch)
+        }
+    }
+}
+
+fn check_jwt_identity(claims: &Claims, user: &str, now: u64) -> Result<(), VerificationError> {
     if claims.sub != user || user.is_empty() || claims.token_type != "access" || claims.exp <= now {
         return Err(VerificationError::Revoked);
     }
@@ -175,6 +208,86 @@ pub(super) fn own_agent_dir(home: &Path, agent: &str) -> Result<std::fs::File, V
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn web_fixture() -> (tempfile::TempDir, duduclaw_auth::UserDb, Claims) {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "[member_api_keys]\nenabled=true\n").unwrap();
+        let db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+        let user = db.create_user("ingress@example.invalid", "Ingress", "test-password",
+            duduclaw_auth::UserRole::Employee).unwrap();
+        let now = duduclaw_mcp_boundary::authority::now_seconds().unwrap();
+        let claims = serde_json::from_value(serde_json::json!({
+            "sub":user.id, "email":user.email, "role":"employee",
+            "bound_agents":[], "access_levels":{}, "exp":now + 3600, "iat":now,
+            "token_type":"access", "credential_epoch":user.credential_epoch
+        })).unwrap();
+        (home, db, claims)
+    }
+    // Exercise the production protected branch without setting the process-wide,
+    // irreversible isolation latch (which would affect unrelated gateway tests).
+    async fn capture_web(home: &Path, user: &str, credential: Option<ChatCredential>) -> Option<HumanIngress> {
+        webchat_scope(credential, async {
+            protected_reply_scope(home, &RequesterIdentity::DashboardUser { user_id: user.into() }, async {
+                let human = take_human().ok();
+                assert!(take_human().is_err());
+                human
+            }).await
+        }).await
+    }
+    #[tokio::test]
+    async fn ingress_jwt_scope_preserves_user_and_refuses_absent_revoked_or_retargeted_credentials() {
+        let (home, _db, claims) = web_fixture();
+        let credential = ChatCredential::Jwt(claims.clone());
+        let human = capture_web(home.path(), &claims.sub, Some(credential.clone())).await.unwrap();
+        assert_eq!(human.user, claims.sub);
+        assert_eq!(human.epoch, claims.credential_epoch);
+        assert!(matches!(human.source, Source::Web(ChatCredential::Jwt(_))));
+        assert!(capture_web(home.path(), &claims.sub, None).await.is_none());
+        assert!(capture_web(home.path(), "another-user", Some(credential.clone())).await.is_none());
+        let raw = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
+        raw.execute("UPDATE users SET credential_epoch=credential_epoch+1 WHERE id=?1", [&claims.sub]).unwrap();
+        assert!(check_web_identity(home.path(), &credential, &claims.sub,
+            duduclaw_mcp_boundary::authority::now_seconds().unwrap()).is_err());
+        assert!(capture_web(home.path(), &claims.sub, Some(credential)).await.is_none());
+        let mut current = claims;
+        current.credential_epoch += 1;
+        raw.execute("UPDATE users SET status='suspended' WHERE id=?1", [&current.sub]).unwrap();
+        assert!(capture_web(home.path(), &current.sub, Some(ChatCredential::Jwt(current.clone()))).await.is_none());
+        let absent_home = tempfile::tempdir().unwrap();
+        assert!(capture_web(absent_home.path(), &current.sub, Some(ChatCredential::Jwt(current.clone()))).await.is_none());
+    }
+    #[tokio::test]
+    async fn ingress_member_key_scope_rechecks_the_original_key_at_verification() {
+        for reason in ["revoke", "delete", "expiry", "epoch", "account", "admin", "switch"] {
+            let (home, db, claims) = web_fixture();
+            let key = db.member_key_create(&claims.sub, "ingress", 1, claims.credential_epoch).unwrap();
+            let ctx = crate::member_keys::authenticate(home.path(), &db, &key.secret).unwrap();
+            let credential = ChatCredential::Member(ctx.clone());
+            let human = capture_web(home.path(), &claims.sub, Some(credential.clone())).await.unwrap();
+            assert_eq!(human.user, claims.sub);
+            assert_eq!(human.epoch, claims.credential_epoch);
+            let Source::Web(original) = human.source else { panic!("expected web credential") };
+            assert!(matches!(&original, ChatCredential::Member(ctx) if ctx.member_key_id.as_deref() == Some(key.info.id.as_str())));
+            assert!(capture_web(home.path(), "another-user", Some(credential.clone())).await.is_none());
+            let mut missing_key = ctx;
+            missing_key.member_key_id = None;
+            assert!(capture_web(home.path(), &claims.sub, Some(ChatCredential::Member(missing_key))).await.is_none());
+            let raw = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
+            match reason {
+                "revoke" => db.member_key_revoke_own(&claims.sub, &key.info.id).unwrap(),
+                "delete" => { raw.execute("DELETE FROM member_api_keys WHERE id=?1", [&key.info.id]).unwrap(); }
+                "expiry" => { raw.execute("UPDATE member_api_keys SET expires_at='2000-01-01T00:00:00Z' WHERE id=?1", [&key.info.id]).unwrap(); }
+                "epoch" => { raw.execute("UPDATE users SET credential_epoch=credential_epoch+1 WHERE id=?1", [&claims.sub]).unwrap(); }
+                "account" => { raw.execute("UPDATE users SET status='suspended' WHERE id=?1", [&claims.sub]).unwrap(); }
+                "admin" => { raw.execute("UPDATE users SET role='admin' WHERE id=?1", [&claims.sub]).unwrap(); }
+                "switch" => std::fs::write(home.path().join("config.toml"), "broken [").unwrap(),
+                _ => unreachable!(),
+            }
+            // The same verifier is called by authorize_current after capture.
+            assert!(check_web_identity(home.path(), &original, &human.user,
+                duduclaw_mcp_boundary::authority::now_seconds().unwrap()).is_err(), "{reason}");
+            assert!(capture_web(home.path(), &claims.sub, Some(credential)).await.is_none(), "{reason}");
+        }
+    }
     fn human() -> HumanIngress {
         HumanIngress { home: "/trusted".into(), user: "original-user".into(), epoch: 7,
             source: Source::Channel { channel: "telegram".into(), sender: "verified-sender".into() } }
@@ -186,11 +299,11 @@ mod tests {
             "bound_agents":[], "access_levels":{}, "exp":100, "iat":1,
             "token_type":"access", "credential_epoch":7
         })).unwrap();
-        assert!(check_web_identity(&claims, "original-user", 99).is_ok());
-        assert!(check_web_identity(&claims, "other-user", 99).is_err());
-        assert!(check_web_identity(&claims, "original-user", 100).is_err());
+        assert!(check_jwt_identity(&claims, "original-user", 99).is_ok());
+        assert!(check_jwt_identity(&claims, "other-user", 99).is_err());
+        assert!(check_jwt_identity(&claims, "original-user", 100).is_err());
         claims.token_type = "refresh".into();
-        assert!(check_web_identity(&claims, "original-user", 99).is_err());
+        assert!(check_jwt_identity(&claims, "original-user", 99).is_err());
     }
     #[test]
     fn ingress_revoked_credential_and_rebound_channel_refuse() {
