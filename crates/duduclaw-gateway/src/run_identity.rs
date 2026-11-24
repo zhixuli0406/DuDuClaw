@@ -7,7 +7,7 @@
 //! it issues no run credential. Child environments only transport the proof.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -15,7 +15,10 @@ use axum::{Json, Router, body::to_bytes, extract::{ConnectInfo, Request, State},
 use rand::RngCore;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use duduclaw_core::run_credential::{ENV_IDENTITY_URL, IDENTITY_URL_FILE, ENV_RUN_CREDENTIAL, RunCredential};
+use duduclaw_core::run_credential::{ENV_IDENTITY_URL, ENV_RUN_CREDENTIAL, RunCredential};
+use duduclaw_core::run_credential::discovery::DiscoveryDirectory;
+#[cfg(test)]
+use duduclaw_core::run_credential::IDENTITY_URL_FILE;
 use duduclaw_knowledge::requester::RequesterIdentity;
 
 pub const ROUTE: &str = "/api/internal/identity/introspect";
@@ -251,7 +254,7 @@ pub fn issue(home: &Path, agent: &str, runtime: &str, timeout: u64) -> Result<Ru
 /// Dropping it stops the listener and removes the discovery file.
 pub struct IdentityListener {
     task: tokio::task::JoinHandle<()>,
-    path: PathBuf,
+    discovery: DiscoveryDirectory,
     registry: Arc<Registry>,
     #[cfg(test)]
     address: std::net::SocketAddr,
@@ -260,7 +263,7 @@ pub struct IdentityListener {
 impl Drop for IdentityListener {
     fn drop(&mut self) {
         self.task.abort();
-        let _ = std::fs::remove_file(&self.path);
+        let _ = self.discovery.remove();
         if let Ok(mut endpoint) = self.registry.endpoint.lock() { *endpoint = None; }
     }
 }
@@ -270,7 +273,6 @@ pub async fn start_listener(home: &Path) -> Result<IdentityListener, String> {
 }
 
 async fn start_listener_with(home: &Path, registry: Arc<Registry>) -> Result<IdentityListener, String> {
-    use std::io::Write;
     if !duduclaw_core::gateway_instance::held(home) {
         return Err("Run identity listener requires the gateway lock".into());
     }
@@ -280,15 +282,8 @@ async fn start_listener_with(home: &Path, registry: Arc<Registry>) -> Result<Ide
     let url = format!("http://{address}{ROUTE}");
     let mut endpoint = registry.endpoint.lock().map_err(|_| "Run identity listener unavailable")?;
     if endpoint.is_some() { return Err("Run identity listener already started".into()); }
-    let path = home.join(IDENTITY_URL_FILE);
-    let dir = path.parent().ok_or("Invalid identity discovery path")?;
-    std::fs::create_dir_all(dir).map_err(|_| "Cannot create identity run directory")?;
-    // Atomic replacement avoids following an existing file symlink and never
-    // publishes a discovery file with broader permissions, even briefly.
-    let mut file = tempfile::NamedTempFile::new_in(dir).map_err(|_| "Cannot create identity discovery file")?;
-    duduclaw_core::platform::set_owner_only(file.path()).map_err(|_| "Cannot restrict identity discovery file")?;
-    file.write_all(url.as_bytes()).map_err(|_| "Cannot write identity discovery file")?;
-    file.persist(&path).map_err(|_| "Cannot publish identity discovery file")?;
+    let discovery = DiscoveryDirectory::open(home, true).map_err(|_| "Unsafe identity run directory")?;
+    discovery.write(&url).map_err(|_| "Cannot publish identity discovery file")?;
     *endpoint = Some(url);
     drop(endpoint);
     let app = router_with(registry.clone());
@@ -297,7 +292,7 @@ async fn start_listener_with(home: &Path, registry: Arc<Registry>) -> Result<Ide
             tracing::error!("Run identity listener stopped");
         }
     });
-    Ok(IdentityListener { task, path, registry, #[cfg(test)] address })
+    Ok(IdentityListener { task, discovery, registry, #[cfg(test)] address })
 }
 
 fn router_with(registry: Arc<Registry>) -> Router {
@@ -308,8 +303,11 @@ async fn handle(State(registry): State<Arc<Registry>>, request: Request) -> Json
     let inactive = || Json(serde_json::json!({"active": false}));
     let Some(peer) = request.extensions().get::<ConnectInfo<std::net::SocketAddr>>() else { return inactive(); };
     if crate::computer_use_sessions::auth::check_peer(peer.0).is_err()
-        || ["forwarded", "x-forwarded-for", "x-forwarded-host", "x-real-ip", "via", "origin"]
-            .iter().any(|name| request.headers().contains_key(*name)) {
+        || request.headers().keys().any(|name| {
+            let name = name.as_str().to_ascii_lowercase();
+            name.starts_with("x-forwarded-")
+                || matches!(name.as_str(), "forwarded" | "x-real-ip" | "via" | "origin")
+        }) {
         return inactive();
     }
     // No body/error logging. Every body/parse failure still hashes a dummy
@@ -367,7 +365,9 @@ mod tests {
     async fn proxy_headers_are_uniformly_inactive() {
         let registry = Arc::new(Registry::default());
         let lease = registry.issue(record(), 100).unwrap();
-        for header in ["Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Real-IP", "Via", "Origin"] {
+        for header in ["Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Real-IP", "Via", "Origin",
+            "X-Forwarded-Proto", "X-Forwarded-Port", "X-Forwarded-Prefix", "x-FoRwArDeD-pRoTo",
+            "X-fOrWaRdEd-PoRt", "x-FORWARDED-pReFiX", "X-Forwarded-Unknown"] {
             let mut request = axum::http::Request::post(ROUTE)
                 .header(header, "untrusted").body(Body::from(body(&lease.credential))).unwrap();
             request.extensions_mut().insert(ConnectInfo("127.0.0.1:1234".parse::<std::net::SocketAddr>().unwrap()));
@@ -375,6 +375,14 @@ mod tests {
             assert_eq!(response.status(), axum::http::StatusCode::OK);
             assert_eq!(to_bytes(response.into_body(), 1024).await.unwrap().as_ref(), br#"{"active":false}"#);
         }
+        assert_eq!(registry.lookups.load(std::sync::atomic::Ordering::Relaxed), 0);
+        // Only the anchored prefix is forbidden; unrelated header names work.
+        let mut request = axum::http::Request::post(ROUTE)
+            .header("custom-x-forwarded-proto", "untrusted").body(Body::from(body(&lease.credential))).unwrap();
+        request.extensions_mut().insert(ConnectInfo("127.0.0.1:1234".parse::<std::net::SocketAddr>().unwrap()));
+        let response = router_with(registry.clone()).oneshot(request).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&to_bytes(response.into_body(), 16384).await.unwrap()).unwrap();
+        assert_eq!(value["active"], true);
     }
 
     #[tokio::test]
@@ -391,6 +399,7 @@ mod tests {
         assert_eq!(url, format!("http://{}{}", listener.address, ROUTE));
         #[cfg(unix)] {
             use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(home.path().join("run")).unwrap().permissions().mode() & 0o777, 0o700);
             assert_eq!(std::fs::metadata(home.path().join(IDENTITY_URL_FILE)).unwrap().permissions().mode() & 0o777, 0o600);
         }
         let lease = registry.issue(record(), 30).unwrap();
@@ -400,6 +409,27 @@ mod tests {
             && value.and_then(|v| v.to_str()) == Some(url.as_str())));
         assert!(start_listener_with(home.path(), registry.clone()).await.is_err());
         drop(listener);
+        assert!(!home.path().join(IDENTITY_URL_FILE).exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn listener_refuses_symlinked_or_group_writable_run_directory() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let home = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let registry = Arc::new(Registry::default());
+        duduclaw_core::gateway_instance::acquire(home.path()).unwrap();
+        let run = home.path().join("run");
+        symlink(outside.path(), &run).unwrap();
+        assert!(start_listener_with(home.path(), registry.clone()).await.is_err());
+        assert!(!outside.path().join("identity-url").exists());
+        std::fs::remove_file(&run).unwrap();
+        std::fs::create_dir(&run).unwrap();
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(start_listener_with(home.path(), registry.clone()).await.is_err());
+        assert!(registry.endpoint.lock().unwrap().is_none());
         assert!(!home.path().join(IDENTITY_URL_FILE).exists());
     }
 

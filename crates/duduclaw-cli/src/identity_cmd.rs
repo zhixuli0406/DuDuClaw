@@ -2,7 +2,8 @@
 
 use std::path::Path;
 use duduclaw_core::error::{DuDuClawError, Result};
-use duduclaw_core::run_credential::{ENV_IDENTITY_URL, IDENTITY_URL_FILE, ENV_RUN_CREDENTIAL, RunCredential};
+use duduclaw_core::run_credential::{ENV_IDENTITY_URL, ENV_RUN_CREDENTIAL, RunCredential};
+use duduclaw_core::run_credential::discovery::DiscoveryDirectory;
 
 #[derive(clap::Subcommand)]
 pub(crate) enum IdentityCommands {
@@ -60,7 +61,7 @@ fn require_run_identity_mode(protected: bool) -> Result<()> {
 fn discover_url(home: &Path, env: std::result::Result<String, std::env::VarError>) -> Option<reqwest::Url> {
     let raw = match env {
         Ok(value) => value,
-        Err(std::env::VarError::NotPresent) => std::fs::read_to_string(home.join(IDENTITY_URL_FILE)).ok()?,
+        Err(std::env::VarError::NotPresent) => DiscoveryDirectory::open(home, false).ok()?.read().ok()?,
         Err(_) => return None,
     };
     let url = reqwest::Url::parse(raw.trim()).ok()?;
@@ -90,8 +91,8 @@ mod tests {
         let url = format!("http://127.0.0.1:12345{}", duduclaw_gateway::run_identity::ROUTE);
         let other = format!("http://127.0.0.1:12346{}", duduclaw_gateway::run_identity::ROUTE);
         assert!(discover_url(home.path(), Err(std::env::VarError::NotPresent)).is_none());
-        std::fs::create_dir_all(home.path().join("run")).unwrap();
-        std::fs::write(home.path().join(IDENTITY_URL_FILE), &url).unwrap();
+        let discovery = DiscoveryDirectory::open(home.path(), true).unwrap();
+        discovery.write(&url).unwrap();
         assert_eq!(discover_url(home.path(), Err(std::env::VarError::NotPresent)).unwrap().as_str(), url);
         assert_eq!(discover_url(home.path(), Ok(other.clone())).unwrap().as_str(), other);
         for raw in [String::new(), url.replace("127.0.0.1", "example.com"),
@@ -100,6 +101,40 @@ mod tests {
             format!("{url}#x"), url.replace("12345", "0")] {
             assert!(discover_url(home.path(), Ok(raw)).is_none());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_ignores_unsafe_files_and_directories_but_keeps_env_override() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        use duduclaw_core::run_credential::IDENTITY_URL_FILE;
+
+        let url = format!("http://127.0.0.1:12345{}", duduclaw_gateway::run_identity::ROUTE);
+        let home = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let discovery = DiscoveryDirectory::open(home.path(), true).unwrap();
+        discovery.write(&url).unwrap();
+        let file = home.path().join(IDENTITY_URL_FILE);
+        let directory = home.path().join("run");
+        let assert_ignored = || {
+            assert!(discover_url(home.path(), Err(std::env::VarError::NotPresent)).is_none());
+            assert_eq!(discover_url(home.path(), Ok(url.clone())).unwrap().as_str(), url);
+        };
+
+        std::fs::rename(&file, outside.path().join("identity-url")).unwrap();
+        symlink(outside.path().join("identity-url"), &file).unwrap();
+        assert_ignored();
+        std::fs::remove_file(&file).unwrap();
+        discovery.write(&url).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o640)).unwrap();
+        assert_ignored();
+        discovery.write(&url).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o770)).unwrap();
+        assert_ignored();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::rename(&directory, home.path().join("original-run")).unwrap();
+        symlink(home.path().join("original-run"), &directory).unwrap();
+        assert_ignored();
     }
 }
 

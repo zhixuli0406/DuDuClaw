@@ -7,6 +7,8 @@
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use zeroize::Zeroizing;
 
+pub mod discovery;
+
 pub const ENV_RUN_CREDENTIAL: &str = "DUDUCLAW_RUN_CREDENTIAL";
 /// Routing hint only; never an identity claim. Always use a literal loopback IP.
 pub const ENV_IDENTITY_URL: &str = "DUDUCLAW_IDENTITY_URL";
