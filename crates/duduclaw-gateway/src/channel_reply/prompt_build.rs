@@ -437,11 +437,7 @@ pub(super) fn build_system_prompt(
     // "put instructions at the bottom for best attention"). This combats U-shaped
     // attention degradation by placing key task requirements in the high-attention tail.
     if !pinned_instructions.is_empty() {
-        let s = format!(
-            "## Pinned Task Instructions\n\
-             The user's core task requirements (ALWAYS follow these throughout the conversation):\n\
-             {pinned_instructions}"
-        );
+        let s = crate::memory_reference::pinned_task_context(pinned_instructions);
         audit.push(crate::prompt_audit::PromptSection::new("pinned", &s));
         parts.push(s);
     }

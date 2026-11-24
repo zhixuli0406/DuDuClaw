@@ -49,6 +49,8 @@ duduclaw gateway
 decision_continuity = true
 ```
 
+**對話任務備註**在設定檔調整：`config.toml [memory] pinned_task = "first_message"`（預設）或 `"off"`。員工 `agent.toml` 的同名設定只能進一步關閉，不能覆蓋全域的 `"off"`。關閉後，下一則訊息起不再萃取或注入。未知值視為關閉，每個程序只警告一次；設定讀不到或格式有誤也會停用。有效備註只在一對一對話作為不可信參考資料，距上次更新滿 24 小時後過期；無效舊備註只忽略，不改寫內容。詳見[對話記憶堆疊](../../features/zh-TW/16-session-memory-stack.md)。
+
 偵測為確定性、零 LLM 成本，且偏保守（寧漏勿錯）；背景擷取失敗不影響回覆送出。
 詳見 [RFC-24](../../rfc/RFC-24-decision-continuity.md)。
 

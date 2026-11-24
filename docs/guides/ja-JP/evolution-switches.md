@@ -187,6 +187,7 @@ duduclaw agent unfreeze <agent-id>
 
 | キー | デフォルト | ページ |
 |---|---|---|
+| `config.toml [memory] pinned_task` | `"first_message"` | [会話メモリ](../../features/ja-JP/16-session-memory-stack.md) — 1 対 1 の参照、`off` で停止、社員設定は制限のみ、24 時間で期限切れ |
 | `config.toml [memory] novelty_gate` | `true` | [memory-and-knowledge.md](./memory-and-knowledge.md) — ほぼ重複した意味記憶を拒否する |
 | `config.toml [memory] supersession_trust_guard` | `true`（v1.67.1） | [20-memory-intelligence.md](../../features/ja-JP/20-memory-intelligence.md#置き換え時の信頼度チェックv1671) — 信頼度の低い書き込みは、より信頼度の高い現在の事実を置き換えられない。抽出された主張はダッシュボードの審査へ |
 | `config.toml [dispatch] grounding_precheck_enabled` | `true` | [goal-loop.md](./goal-loop.md) — 承認判定の前にLLMコストゼロで証拠をチェックする |

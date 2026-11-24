@@ -264,14 +264,6 @@ impl SummaryFailure {
     }
 }
 
-// Anchored phrases only: a summary describing a refusal is still valid.
-const REFUSAL_PREFIXES: &[&str] = &[
-    "i can't ", "i cannot ", "i’m unable ", "i am unable ", "i'm unable ",
-    "sorry, i ", "i’m sorry", "i'm sorry", "as an ai,", "as an ai ", "i did not write", "the earlier refusal",
-    "我無法", "我不能", "抱歉，我", "作為人工智慧", "先前的拒絕", "之前的拒絕",
-    "申し訳ありません", "要約できません",
-];
-
 pub fn validate_summary_output(output: &str) -> Result<&str, SummaryFailure> {
     let text = output.trim();
     if text.is_empty() { return Err(SummaryFailure::EmptyOutput); }
@@ -279,8 +271,7 @@ pub fn validate_summary_output(output: &str) -> Result<&str, SummaryFailure> {
     if crate::prompt_compression::contains_never_trim_header_spelling(text) {
         return Err(SummaryFailure::ProtectedOutput);
     }
-    let lower = text.trim_start_matches(['-', '*', ' ']).to_lowercase();
-    if REFUSAL_PREFIXES.iter().any(|prefix| lower.starts_with(prefix)) {
+    if crate::memory_reference::is_refusal_or_meta(text) {
         return Err(SummaryFailure::RefusalOrMeta);
     }
     Ok(text)

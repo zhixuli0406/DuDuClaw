@@ -138,12 +138,7 @@ fn finish_minimal(
 
     // 6. Pinned task at the bottom (Anthropic best practice — high-attention tail)
     if !pinned_instructions.is_empty() {
-        let s = format!(
-            "## Pinned Task Instructions\n\
-             The user's core task requirements (ALWAYS follow these throughout the conversation):\n\
-             {pinned}",
-            pinned = pinned_instructions
-        );
+        let s = crate::memory_reference::pinned_task_context(pinned_instructions);
         audit.push(crate::prompt_audit::PromptSection::new("pinned", &s));
         parts.push(s);
     }
@@ -299,7 +294,7 @@ mod tests {
     fn minimal_prompt_includes_pinned_at_tail() {
         let prompt = build_minimal_inner(input(Some("soul"), None, "", "Use polite tone.", 5));
         let mcp_pos = prompt.find("Available MCP Tools").unwrap();
-        let pin_pos = prompt.find("Pinned Task Instructions").unwrap();
+        let pin_pos = prompt.find("Conversation task reference").unwrap();
         assert!(
             pin_pos > mcp_pos,
             "pinned instructions must appear after the MCP index (high-attention tail)"

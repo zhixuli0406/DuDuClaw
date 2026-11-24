@@ -187,6 +187,7 @@ duduclaw agent unfreeze <agent-id>
 
 | 鍵 | 預設值 | 頁面 |
 |---|---|---|
+| `config.toml [memory] pinned_task` | `"first_message"` | [對話記憶](../../features/zh-TW/16-session-memory-stack.md)；只限一對一，`off` 停用，員工只能進一步關閉；24 小時過期 |
 | `config.toml [memory] novelty_gate` | `true` | [memory-and-knowledge.md](./memory-and-knowledge.md) — 拒絕近乎重複的語意記憶 |
 | `config.toml [memory] supersession_trust_guard` | `true`（v1.67.1） | [20-memory-intelligence.md](../../features/zh-TW/20-memory-intelligence.md#取代時的可信度檢查v1671) — 可信度較低的寫入不能取代可信度較高的目前事實；萃取出的說法改送儀表板審核 |
 | `config.toml [dispatch] grounding_precheck_enabled` | `true` | [goal-loop.md](./goal-loop.md) — 在驗收判官之前做零 LLM 成本的證據檢查 |

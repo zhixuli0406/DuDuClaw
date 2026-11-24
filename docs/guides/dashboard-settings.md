@@ -261,6 +261,8 @@ Global background tasks without an assigned employee (such as employee selection
 
 ### Memory language and background work (v1.84.0)
 
+**Conversation task note** is configured in the files: `config.toml [memory] pinned_task = "first_message"` (default) or `"off"`. The same key in `agent.toml` may disable it but cannot override a global `"off"`. Off disables both extraction and injection on the next message. Unknown values act as off and warn once per process; unreadable or malformed settings also disable it. A valid note is used only in one-to-one conversations, as untrusted reference data, and expires 24 hours after its last update. Invalid old notes are ignored without rewriting their content. See [Session memory stack](../features/16-session-memory-stack.md).
+
 | Page → control | Key | Takes effect |
 |---|---|---|
 | Settings → General → Memory language (below the default reply language) | `config.toml [memory] language`: `auto` ("Follow reply language"), `zh-TW`, `zh-CN`, `en`, `ja-JP` | Immediately |

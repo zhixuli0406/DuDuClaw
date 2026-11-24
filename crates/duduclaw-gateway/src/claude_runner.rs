@@ -6015,11 +6015,15 @@ mod chain_tests {
         let envs = crate::memory_provenance::DISPATCH_RUN
             .scope(Some(("dispatch:agnes".into(), "k1".into())), async {
                 duduclaw_memory::feedback::CURRENT_TURN_ID
-                    .scope(Some("t-3".into()), async { mcp_client_envs("agnes") })
+                    .scope(Some("t-3".into()), async {
+                        duduclaw_memory::feedback::CURRENT_SESSION_ID
+                            .scope(Some("webchat:rm182".into()), async { mcp_client_envs("agnes") }).await
+                    })
                     .await
             })
             .await;
         let has = |k: &str, v: &str| envs.iter().any(|(a, b)| a == k && b == v);
+        assert!(has(duduclaw_core::ENV_TRUST_SESSION_ID, "webchat:rm182"));
         assert!(has(duduclaw_core::ENV_TRUST_TURN_ID, "t-3"), "{envs:?}");
         assert!(has(duduclaw_core::ENV_DISPATCH_RUN_ID, "k1"), "{envs:?}");
         assert!(has(duduclaw_core::ENV_DISPATCH_SESSION, "dispatch:agnes"));
