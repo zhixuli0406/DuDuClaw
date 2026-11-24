@@ -488,7 +488,10 @@ async fn malformed_identity_key_refuses_env_claim_and_mcp_startup() {
         let verdict = super::caller_identity_verdict(tmp.path());
         let resolved = get_default_agent(tmp.path()).await;
         let startup = super::run_mcp_server(tmp.path()).await;
-        let proxy = crate::mcp_proxy::run_mcp_proxy(tmp.path(), "test", "never-spawn-invalid-identity", &[]).await;
+        let proxy = crate::mcp_proxy::run_mcp_proxy_scoped_with_startup_input(
+            tmp.path(), "test", "never-spawn-invalid-identity", &[], false,
+            std::io::empty(), crate::mcp_proxy::STARTUP_REQUEST_TIMEOUT,
+        ).await;
         clear_claim();
         assert!(proxy.unwrap_err().to_string().contains("MCP caller identity rejected"));
         assert_eq!(verdict, duduclaw_core::IdentityVerdict::Rejected);
@@ -553,7 +556,10 @@ async fn signed_system_sender_identity_is_still_untrusted() {
         let result = get_default_agent(tmp.path()).await;
         let verified = crate::mcp_namespace::verified_employee_from_env(tmp.path());
         let startup = super::run_mcp_server(tmp.path()).await;
-        let proxy = crate::mcp_proxy::run_mcp_proxy(tmp.path(), "test", "never-spawn-invalid-identity", &[]).await;
+        let proxy = crate::mcp_proxy::run_mcp_proxy_scoped_with_startup_input(
+            tmp.path(), "test", "never-spawn-invalid-identity", &[], false,
+            std::io::empty(), crate::mcp_proxy::STARTUP_REQUEST_TIMEOUT,
+        ).await;
         clear_claim();
         assert!(proxy.unwrap_err().to_string().contains("MCP caller identity rejected"));
         assert_eq!(result, duduclaw_core::UNTRUSTED_AGENT_ID, "{sender}");
@@ -625,7 +631,10 @@ async fn invalid_identity_config_rejects_mcp_namespace_and_hook() {
         let verified = crate::mcp_namespace::verified_employee_from_env(tmp.path());
         let hook = crate::resolve_hook_caller(tmp.path(), Some("alice"));
         let startup = super::run_mcp_server(tmp.path()).await;
-        let proxy = crate::mcp_proxy::run_mcp_proxy(tmp.path(), "test", "never-spawn-invalid-identity", &[]).await;
+        let proxy = crate::mcp_proxy::run_mcp_proxy_scoped_with_startup_input(
+            tmp.path(), "test", "never-spawn-invalid-identity", &[], false,
+            std::io::empty(), crate::mcp_proxy::STARTUP_REQUEST_TIMEOUT,
+        ).await;
         clear_claim();
         assert!(proxy.unwrap_err().to_string().contains("MCP caller identity rejected"));
         assert_eq!(verdict, duduclaw_core::IdentityVerdict::Rejected);
@@ -637,7 +646,10 @@ async fn invalid_identity_config_rejects_mcp_namespace_and_hook() {
     fs::create_dir(tmp.path().join("config.toml")).unwrap();
     set_claim("alice", &token);
     let startup = super::run_mcp_server(tmp.path()).await;
-    let proxy = crate::mcp_proxy::run_mcp_proxy(tmp.path(), "test", "never-spawn-invalid-identity", &[]).await;
+    let proxy = crate::mcp_proxy::run_mcp_proxy_scoped_with_startup_input(
+        tmp.path(), "test", "never-spawn-invalid-identity", &[], false,
+        std::io::empty(), crate::mcp_proxy::STARTUP_REQUEST_TIMEOUT,
+    ).await;
     clear_claim();
     assert!(proxy.unwrap_err().to_string().contains("MCP caller identity rejected"));
     assert!(startup.unwrap_err().to_string().contains("MCP caller identity rejected"));
@@ -649,14 +661,20 @@ async fn default_strict_and_deleted_key_refuse_mcp_startup() {
     let tmp = TempDir::new();
     set_claim("ceo", "garbage");
     let startup = super::run_mcp_server(tmp.path()).await;
-    let proxy = crate::mcp_proxy::run_mcp_proxy(tmp.path(), "test", "never-spawn-invalid-identity", &[]).await;
+    let proxy = crate::mcp_proxy::run_mcp_proxy_scoped_with_startup_input(
+        tmp.path(), "test", "never-spawn-invalid-identity", &[], false,
+        std::io::empty(), crate::mcp_proxy::STARTUP_REQUEST_TIMEOUT,
+    ).await;
     clear_claim();
     assert!(proxy.unwrap_err().to_string().contains("MCP caller identity rejected"));
     assert!(startup.unwrap_err().to_string().contains("MCP caller identity rejected"));
     duduclaw_core::ensure_identity_key(tmp.path()).unwrap();
     set_claim("ceo", "garbage");
     let startup = super::run_mcp_server(tmp.path()).await;
-    let proxy = crate::mcp_proxy::run_mcp_proxy(tmp.path(), "test", "never-spawn-invalid-identity", &[]).await;
+    let proxy = crate::mcp_proxy::run_mcp_proxy_scoped_with_startup_input(
+        tmp.path(), "test", "never-spawn-invalid-identity", &[], false,
+        std::io::empty(), crate::mcp_proxy::STARTUP_REQUEST_TIMEOUT,
+    ).await;
     clear_claim();
     assert!(proxy.unwrap_err().to_string().contains("MCP caller identity rejected"));
     assert!(startup.unwrap_err().to_string().contains("MCP caller identity rejected"));
@@ -664,7 +682,10 @@ async fn default_strict_and_deleted_key_refuse_mcp_startup() {
     write_default_agent_config(tmp.path(), "alice");
     set_claim("ceo", "garbage");
     let startup = super::run_mcp_server(tmp.path()).await;
-    let proxy = crate::mcp_proxy::run_mcp_proxy(tmp.path(), "test", "never-spawn-invalid-identity", &[]).await;
+    let proxy = crate::mcp_proxy::run_mcp_proxy_scoped_with_startup_input(
+        tmp.path(), "test", "never-spawn-invalid-identity", &[], false,
+        std::io::empty(), crate::mcp_proxy::STARTUP_REQUEST_TIMEOUT,
+    ).await;
     clear_claim();
     assert!(proxy.unwrap_err().to_string().contains("MCP caller identity rejected"));
     assert!(startup.unwrap_err().to_string().contains("MCP caller identity rejected"));
@@ -694,10 +715,13 @@ async fn verified_identity_reaches_proxy_spawn() {
     let key = duduclaw_core::ensure_identity_key(tmp.path()).unwrap();
     set_claim("alice", &duduclaw_core::mint_identity_token(&key, "alice"));
     let nonexistent = tmp.path().join("nonexistent-upstream");
-    let result = crate::mcp_proxy::run_mcp_proxy(tmp.path(), "test", nonexistent.to_str().unwrap(), &[]).await;
+    let result = crate::mcp_proxy::run_mcp_proxy_scoped_with_startup_input(
+        tmp.path(), "test", nonexistent.to_str().unwrap(), &[], false,
+        std::io::empty(), crate::mcp_proxy::STARTUP_REQUEST_TIMEOUT,
+    ).await;
     clear_claim();
     // Reaching spawn proves the new identity gate accepted the verified caller.
-    // No actual upstream is launched, so the test does not depend on test stdin.
+    // The spawn refusal receives closed input, never the test process stdin.
     assert!(result.unwrap_err().to_string().contains("failed to spawn upstream"));
 }
 

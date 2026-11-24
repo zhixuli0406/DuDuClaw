@@ -21,12 +21,12 @@ async fn shared_fixture() -> SharedFixture {
     let agents = home.path().join("agents");
     use crate::trigger_route::tests::write_agent;
     write_agent(&agents, "dudu", "Company", "@dudu", "main", "");
-    write_agent(&agents, "finance", "Finance", "@finance", "specialist", &googlechat_section(home.path(), "987654321", &sa));
+    write_agent(&agents, "finance", "Finance", "@finance", "specialist", "");
     write_agent(&agents, "sales", "Sales", "@sales", "specialist", "");
     std::fs::write(home.path().join("config.toml"), "[general]\ndefault_agent = \"dudu\"\n").unwrap();
     let ctx = super::super::e2e_tests::reply_ctx(home.path()).await;
     super::super::e2e_seam::arm(home.path());
-    let creds = crate::googlechat_agents::agent_creds(home.path(), "finance").await.unwrap();
+    let creds = Arc::new(crate::googlechat::GoogleChatCreds::from_service_account_json(&sa, home.path()).unwrap());
     let state = Arc::new(crate::googlechat::GoogleChatState { ctx, creds, agent: None });
     let db = UserDb::new(&home.path().join("users.db")).unwrap();
     let member = db.create_user("staff@rm148.test", "Staff", "StaffPass-12345", UserRole::Employee).unwrap().id;
