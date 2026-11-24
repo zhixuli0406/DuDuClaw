@@ -211,7 +211,7 @@ pub fn project(source: &str) -> Result<String, String> {
         ("model", &["preferred", "fallback", "fallbacks", "standard", "utility", "api_mode", "delegation_routing"][..]),
         ("runtime", &["provider", "fallback", "timeout_secs", "minimal_context"][..]),
         ("heartbeat", &["interval_seconds", "max_concurrent_runs", "cron", "cron_timezone"][..]),
-        ("evolution", &["skill_security_scan", "skill_token_budget", "max_active_skills", "strategy", "max_silence_hours"][..]),
+        ("evolution", &["skill_security_scan", "skill_token_budget", "skill_budget_unlimited", "max_active_skills", "strategy", "max_silence_hours"][..]),
     ] {
         let mut table = toml::Table::new();
         if let Some(original) = source.get(section).and_then(toml::Value::as_table) {
@@ -662,6 +662,7 @@ skill_security_scan = true
 gvu_enabled = false
 max_silence_hours = 168.0
 skill_token_budget = 500
+skill_budget_unlimited = false
 max_active_skills = 2
 [permissions]
 can_create_agents = false

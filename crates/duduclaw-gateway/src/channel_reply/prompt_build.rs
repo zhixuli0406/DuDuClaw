@@ -254,36 +254,47 @@ pub(super) fn build_system_prompt(
                 );
 
                 let mut remaining_budget = skill_token_budget;
+                let unlimited = a.config.evolution.skill_budget_unlimited;
+                let mut omitted = Vec::new();
 
                 // Layer 2: active + highly relevant — full content
                 for &idx in &selection.layer2 {
                     let skill = &skills[idx];
-                    if remaining_budget >= skill.tokens_layer2 {
+                    if unlimited || remaining_budget >= skill.tokens_layer2 {
                         let s = format!("## Skill: {}\n{}", skill.name, skill.full_content);
                         skills_total_bytes += s.len();
                         parts.push(s);
                         remaining_budget = remaining_budget.saturating_sub(skill.tokens_layer2);
+                    } else {
+                        omitted.push(skill.name.as_str());
                     }
                 }
 
                 // Layer 1: relevant — summary only
                 for &idx in &selection.layer1 {
                     let skill = &skills[idx];
-                    if remaining_budget >= skill.tokens_layer1 {
+                    if unlimited || remaining_budget >= skill.tokens_layer1 {
                         let s = format!("## {}: {}", skill.name, skill.summary);
                         skills_total_bytes += s.len();
                         parts.push(s);
                         remaining_budget = remaining_budget.saturating_sub(skill.tokens_layer1);
+                    } else {
+                        omitted.push(skill.name.as_str());
                     }
+                }
+                if !omitted.is_empty() {
+                    let preview = crate::prompt_audit::skill_name_preview(&omitted);
+                    let note = format!(
+                        "## Skills omitted for length ({}): {preview} — an administrator can raise the skill budget or allow unlimited in the employee settings.",
+                        omitted.len(),
+                    );
+                    skills_total_bytes += note.len();
+                    parts.push(note);
                 }
             }
         } else {
-            // Legacy: inject all skills fully (backward compat when
-            // progressive not enabled). #6.2b: cap at
-            // DEFAULT_LEGACY_SKILL_BYTE_CAP so an unbounded SKILLS/ dir
-            // can't push the prompt past the 200K cliff. Truncation
-            // footer (when triggered) explains what was dropped and
-            // points operators at progressive injection.
+            // Legacy: use the employee's budget with the historical 10 KB floor,
+            // or include all skills when the administrator removes the cap.
             let pairs: Vec<(String, String)> = a
                 .skills
                 .iter()
@@ -291,7 +302,7 @@ pub(super) fn build_system_prompt(
                 .collect();
             let (rendered, footer) = crate::prompt_audit::budgeted_legacy_skills(
                 &pairs,
-                crate::prompt_audit::DEFAULT_LEGACY_SKILL_BYTE_CAP,
+                crate::prompt_audit::legacy_skill_byte_cap(&a.config.evolution),
             );
             for s in rendered {
                 skills_total_bytes += s.len();

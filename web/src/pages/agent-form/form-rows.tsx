@@ -90,6 +90,7 @@ export function RowNumber({
   max,
   step,
   tier = 'select',
+  disabled,
 }: {
   label: ReactNode;
   description?: ReactNode;
@@ -99,11 +100,13 @@ export function RowNumber({
   max?: number;
   step?: number;
   tier?: SettingsRowTier;
+  disabled?: boolean;
 }) {
   return (
     <SettingsRow label={label} description={description} tier={tier}>
       <Input
         type="number"
+        disabled={disabled}
         aria-label={typeof label === 'string' ? label : undefined}
         value={value}
         min={min}

@@ -69,6 +69,7 @@ gvu_enabled = true
 strategy = "balanced"
 max_silence_hours = 8.0
 skill_token_budget = 2500
+skill_budget_unlimited = false
 max_active_skills = 5
 
 [evolution.external_factors]

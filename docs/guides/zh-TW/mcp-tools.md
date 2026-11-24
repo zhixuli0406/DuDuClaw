@@ -331,9 +331,9 @@ Claude CLI 的 `minimal_context` 透過 `--tools` 控制內建 CLI 工具，不�
 
 ### `evolution_toggle` — 欄位與權限
 
-`field` 接受 `gvu_enabled`（布林值），以及 `max_silence_hours`、`skill_token_budget`、`max_active_skills`（數值）。舊的 `stagnation_*` 欄位已不能透過此工具修改。見 [evolution-switches.md](../evolution-switches.md)。
+`field` 接受 `gvu_enabled`、`skill_budget_unlimited`（布林值；`skill_budget_unlimited` 僅限管理員），以及 `max_silence_hours`、`skill_token_budget`、`max_active_skills`（數值）。舊的 `stagnation_*` 欄位已不能透過此工具修改。見 [evolution-switches.md](../evolution-switches.md)。
 
-AI 員工只能調整自己或下屬的設定，採用與 `agent_update` 相同的身分與組織授權檢查；委派政策設為 `open` 時允許跨團隊調整，操作者不受此限制。未通過身分或組織授權檢查時，會在讀取目標設定檔前拒絕。這些欄位不會授予工具、資料或組織權限，也不會繞過演化主開關，因此保留自身調整。
+AI 員工可調整原本四個欄位的自身或下屬設定，採用與 `agent_update` 相同的身分與組織授權檢查；委派政策設為 `open` 時允許跨團隊調整，操作者不受此限制。未通過身分或組織授權檢查時，會在讀取目標設定檔前拒絕。`skill_budget_unlimited` 會移除注入技能內容的上限，因此只能由管理員調整。
 
 ### `execute_program`：腳本在哪裡執行
 

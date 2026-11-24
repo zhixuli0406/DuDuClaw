@@ -321,6 +321,7 @@ pub(crate) fn agent_settings_json(raw: &toml::Table) -> Value {
             "gvu_enabled",
             "max_active_skills",
             "skill_token_budget",
+            "skill_budget_unlimited",
             "max_silence_hours",
             "skill_synthesis_enabled",
             "skill_synthesis_threshold",

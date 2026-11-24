@@ -40,12 +40,12 @@ pub(super) const TOOLS: &[ToolDef] = &[
             },
             ParamDef {
                 name: "field",
-                description: "gvu_enabled (bool); max_silence_hours / skill_token_budget / max_active_skills (number).",
+                description: "gvu_enabled / skill_budget_unlimited (bool; skill_budget_unlimited is administrator-only); max_silence_hours / skill_token_budget / max_active_skills (number).",
                 required: true,
             },
             ParamDef {
                 name: "value",
-                description: "New value: true/false (for gvu_enabled) or a number",
+                description: "New value: true/false (for gvu_enabled / skill_budget_unlimited; skill_budget_unlimited is administrator-only) or a number",
                 required: true,
             },
         ],

@@ -705,6 +705,7 @@ gvu_enabled = true            # 出廠即開 AEE（2026-09-29 K2）。演化目�
 strategy = "balanced"         # AEE 回合意圖配比：balanced / innovate / harden / repair_only
 max_silence_hours = 12.0
 skill_token_budget = 2500
+skill_budget_unlimited = false
 max_active_skills = 5
 
 [evolution.external_factors]

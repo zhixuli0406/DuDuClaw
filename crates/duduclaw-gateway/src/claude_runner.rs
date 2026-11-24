@@ -93,10 +93,8 @@ fn build_system_prompt(
     }
 
     // Sort skills by name for deterministic ordering (cache-friendly).
-    // #6.2b: cap the unbounded loop at DEFAULT_LEGACY_SKILL_BYTE_CAP so
-    // an over-stuffed `SKILLS/` directory can't single-handedly push the
-    // system prompt past the 200K cliff. Truncation footer surfaces the
-    // omitted skills so it's debuggable rather than mysterious.
+    // Apply the employee's budget (with a 10 KB floor) or explicit unlimited
+    // setting, and report any omitted skills in the truncation footer.
     let mut skills: Vec<_> = agent.skills.iter().collect();
     skills.sort_by(|a, b| a.name.cmp(&b.name));
     let pairs: Vec<(String, String)> = skills
@@ -105,7 +103,7 @@ fn build_system_prompt(
         .collect();
     let (rendered, footer) = crate::prompt_audit::budgeted_legacy_skills(
         &pairs,
-        crate::prompt_audit::DEFAULT_LEGACY_SKILL_BYTE_CAP,
+        crate::prompt_audit::legacy_skill_byte_cap(&agent.config.evolution),
     );
     let mut skills_total_bytes: usize = 0;
     for s in rendered {

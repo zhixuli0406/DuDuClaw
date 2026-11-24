@@ -240,6 +240,7 @@ max_silence_hours = 168.0
 max_gvu_generations = 0
 observation_period_hours = 24.0
 skill_token_budget = 500
+skill_budget_unlimited = false
 max_active_skills = 2
 "#
         );

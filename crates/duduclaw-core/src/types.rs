@@ -2987,9 +2987,15 @@ pub struct EvolutionConfig {
     pub max_silence_hours: f64,
 
     // ── Skill lifecycle ──
-    /// Token budget for skills in system prompt (default 2500).
+    /// Token budget for progressive skill content (default 2500; 0 excludes Layer 1/2).
+    /// Ignored when `skill_budget_unlimited` is true.
     #[serde(default = "default_skill_token_budget")]
     pub skill_token_budget: u32,
+
+    /// Include all selected skill content without a length cap (default false).
+    /// Raises token cost and latency and may exceed the model context limit.
+    #[serde(default)]
+    pub skill_budget_unlimited: bool,
 
     /// Maximum concurrently active skills per agent (default 5).
     #[serde(default = "default_max_active_skills")]
@@ -3138,6 +3144,7 @@ impl Default for EvolutionConfig {
             cognitive_memory: true,
             max_silence_hours: 12.0,
             skill_token_budget: 2500,
+            skill_budget_unlimited: false,
             max_active_skills: 5,
             // Skill lifecycle knobs with live readers (H3)
             skill_synthesis_enabled: false,
@@ -5319,6 +5326,18 @@ mod tests {
             toml::from_str("skill_auto_activate = false\nskill_security_scan = true\n").unwrap();
         assert!(cfg.cognitive_memory);
         assert!(cfg.cognitive_memory_enabled());
+    }
+
+    #[test]
+    fn skill_budget_unlimited_defaults_false_and_round_trips() {
+        let mut cfg: EvolutionConfig = toml::from_str("skill_token_budget = 0").unwrap();
+        assert!(!cfg.skill_budget_unlimited);
+        assert!(!EvolutionConfig::default().skill_budget_unlimited);
+        assert_eq!(cfg.skill_token_budget, 0);
+        cfg.skill_budget_unlimited = true;
+        let decoded: EvolutionConfig = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert!(decoded.skill_budget_unlimited);
+        assert_eq!(decoded.skill_token_budget, 0);
     }
 
     // ── R4: Grok runtime type ──────────────────────────────────────

@@ -212,6 +212,7 @@ impl MethodHandler {
                             "max_silence_hours": cfg.evolution.max_silence_hours,
                             "max_active_skills": cfg.evolution.max_active_skills,
                             "skill_token_budget": cfg.evolution.skill_token_budget,
+                            "skill_budget_unlimited": cfg.evolution.skill_budget_unlimited,
                             "skill_synthesis_enabled": cfg.evolution.skill_synthesis_enabled,
                             "skill_synthesis_threshold": cfg.evolution.skill_synthesis_threshold,
                             "skill_synthesis_cooldown_hours": cfg.evolution.skill_synthesis_cooldown_hours,
