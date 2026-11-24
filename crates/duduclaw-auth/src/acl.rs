@@ -45,6 +45,8 @@ pub fn personal_restriction() -> Option<&'static dyn PersonalRestriction> {
 /// Carried through the entire WebSocket session for ACL checks.
 #[derive(Debug, Clone)]
 pub struct UserContext {
+    /// Server-issued provenance; never accepted from client parameters.
+    pub member_key_id: Option<String>,
     pub credential_epoch: u64,
     pub user_id: String,
     pub email: String,
@@ -83,6 +85,7 @@ impl UserContext {
     /// Do NOT call this for JWT-authenticated users — use `from_claims` instead.
     pub fn admin_fallback() -> Self {
         Self {
+            member_key_id: None,
             credential_epoch: 0,
             user_id: "system".to_string(),
             email: "admin@local".to_string(),
@@ -99,6 +102,7 @@ impl UserContext {
     /// forced-password-change flag all come from here.
     pub fn from_live(user: &User, access: &EffectiveAccess) -> Self {
         Self {
+            member_key_id: None,
             credential_epoch: user.credential_epoch,
             user_id: user.id.clone(),
             email: user.email.clone(),
@@ -130,6 +134,7 @@ impl UserContext {
             agent_access.insert(agent.clone(), level);
         }
         Ok(Self {
+            member_key_id: None,
             credential_epoch: claims.credential_epoch,
             user_id: claims.sub.clone(),
             email: claims.email.clone(),
@@ -360,6 +365,7 @@ mod tests {
         let mut access = HashMap::new();
         access.insert("my-agent".to_string(), AccessLevel::Owner);
         UserContext {
+            member_key_id: None,
             credential_epoch: 0,
             user_id: "u1".to_string(),
             email: "emp@test.com".to_string(),

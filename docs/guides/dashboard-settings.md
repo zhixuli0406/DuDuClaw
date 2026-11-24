@@ -980,3 +980,28 @@ Claude chat and background runs, Codex JSONL runs, and OpenAI-compatible SSE res
 A step limit (`max_turns`), total timeout (`timeout_total`), or event-silence timeout (`timeout_no_progress`) ends the current turn without marking an account unhealthy, changing accounts, or retrying another model/runtime. A timeout reports that **no final answer was produced before the time limit**, even when tools ran. For signed-in channel users, captured assistant text is delivered before the notice and saved as an assistant turn; reply “continue” to resume with that context. Claude step-limit notices include the applied step count. Public visitors receive only the visitor-safe generic message and reference number, with no partial text, counts, reason code, or operator hints.
 
 Failure notices end with a stable lowercase reason code and the first eight characters of the turn reference. The audit record retains `reason_code` and the full `reference_id`; background results use the dispatch run reference. Goal-loop work limits pause with `max_turns`, `timeout_total`, or `timeout_no_progress`, without accumulating infrastructure dispatch failures.
+
+## Member personal API keys
+
+Administrators can enable or disable personal keys under **My account → External
+access**. Members create, list and revoke their own keys there; administrators
+list and revoke keys for all members. Admin accounts cannot create member keys.
+The switch defaults to off, including when configuration cannot be read or parsed.
+When off, both key use and management RPCs are refused; the normal configuration
+UI remains available to the administrator.
+
+```toml
+[member_api_keys]
+enabled = false
+rate_per_minute = 120
+```
+
+`enabled` is a boolean. `rate_per_minute` is an integer from 1 to 60000, default
+120, shared by all connections using a key. Invalid values disable key access.
+Changes take effect on the next call or connection check without a restart.
+
+Creation requires a browser login and, when MFA is enabled, a fresh TOTP or unused
+recovery code. Expiry is mandatory (1–365 days); the UI offers 30/90/365 and defaults
+to 90. Each member can have five active keys. The secret is shown once. Password
+changes and MFA resets invalidate existing keys. Do not put keys in browser
+front-end code; call from your server. See the [member API contract](../api/member-contract.md#personal-member-api-keys-rm-213-part-b-1850).

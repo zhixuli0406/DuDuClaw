@@ -28,6 +28,7 @@ fn admin() -> UserContext {
 /// A non-admin user who owns agent `a1`.
 fn owner_of_a1() -> UserContext {
     UserContext {
+        member_key_id: None,
         credential_epoch: 0,
         user_id: "owner-7".into(),
         email: "owner@example.com".into(),

@@ -112,6 +112,12 @@ pub(super) async fn refresh_allowed(state: &AppState, user: &str) -> bool {
 /// Personal keeps its legacy expiry behavior only when enforcement is off.
 pub(super) async fn socket_validity(state: &AppState, ctx: &UserContext, expires: Option<u64>, legacy: bool, heartbeat: bool) -> crate::handlers::live_context::SocketValidity {
     use crate::handlers::live_context::SocketValidity;
+    if ctx.member_key_id.is_some() {
+        return match state.handler.socket_context(ctx, true).await {
+            Ok(_) => SocketValidity::Valid,
+            Err(_) => SocketValidity::Revoked,
+        };
+    }
     if legacy {
         return if legacy_token_allowed(state).await { SocketValidity::Valid } else { SocketValidity::Revoked };
     }

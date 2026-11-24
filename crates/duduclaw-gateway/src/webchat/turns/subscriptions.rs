@@ -22,13 +22,13 @@ pub(in crate::webchat) struct Route {
     /// `None`: no target employee (the no-responder notice).
     pub(in crate::webchat) agent: Option<String>,
     epoch: u64,
-    pub(in crate::webchat) origin_credential: Option<duduclaw_auth::jwt::Claims>,
+    pub(in crate::webchat) origin_credential: Option<crate::webchat::ChatCredential>,
     pub(in crate::webchat) source: crate::channel_reply::ReplyDeliveryFence,
 }
 
 impl Route {
     pub(in crate::webchat) async fn authorized(&self, state: &WebChatState) -> bool {
-        if state.credential_validity(self.origin_credential.as_ref(), true).await
+        if state.chat_credential_validity(self.origin_credential.as_ref(), true).await
             != crate::handlers::live_context::SocketValidity::Valid {
             self.source.refuse();
         }
@@ -92,7 +92,7 @@ impl Subscriptions {
         subscription
     }
 
-    pub(super) fn sinks(&self, user: &str, sid: &str, msg_id: &str, agent: Option<&str>, credential: Option<&duduclaw_auth::jwt::Claims>,
+    pub(super) fn sinks(&self, user: &str, sid: &str, msg_id: &str, agent: Option<&str>, credential: Option<&crate::webchat::ChatCredential>,
         source: crate::channel_reply::ReplyDeliveryFence) -> Vec<TurnSink> {
         self.0.lock().unwrap().iter().filter_map(Weak::upgrade)
             .filter(|subscription| subscription.user == user)

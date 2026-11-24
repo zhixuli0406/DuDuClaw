@@ -12,9 +12,9 @@ and normal direct bindings, check successful read payload fields, and compare
 this table's method names with the constant. These tests are added with this
 draft; they have not been executed as part of its authoring.
 
-This contract describes existing JWT-authenticated dashboard RPCs. It does not
-introduce a member API key, grant permissions or define an API-key allowlist.
-Account credential operations below remain ordinary self-service RPCs.
+This contract describes member dashboard RPCs. Personal API keys use a restricted
+subset of this table, described in the authentication section below; existing
+ACL checks still apply. Account credential operations remain browser-only.
 
 ## Transport and authentication
 
@@ -248,3 +248,82 @@ They do not run AI work, external OAuth exchanges or a native browser journey.
 Transport/login details above were checked against `server.rs`, `protocol.rs`,
 `webchat.rs`, `server_mfa.rs` and `duduclaw-auth/src/jwt.rs`; socket authentication
 itself is outside these dispatch tests. Build and test execution remains pending.
+
+## Personal member API keys (RM-213 part B, 1.85.0)
+
+An administrator must first enable `[member_api_keys] enabled = true` in
+`config.toml`, or use the member-key section on **My account → External access**.
+The default is off. An unreadable or malformed configuration disables both
+key authentication and key management. The administrator can still change the
+switch through the normal authenticated configuration UI.
+
+A member signs in with a browser JWT session, then calls
+`me.member_keys.create {"name":"My server","expires_in_days":90}`. Accounts with
+MFA must also supply a fresh `code` (TOTP or unused recovery code), checked with
+the existing MFA step-up verifier. The response is `{"key":{...},"secret":"..."}`.
+Only this response contains the plaintext. Admin accounts cannot create keys;
+use a separate member account. Creation is never available to an existing key.
+Expiry is mandatory: 1–365 days; the UI defaults to 90 and offers 30/90/365.
+Each account can have at most five active keys.
+
+`me.member_keys.list` returns `{"keys":[...],"max_active":5}` and
+`me.member_keys.revoke {"id":"..."}` revokes an owned key. Administrators use
+`member_keys.admin_list` and `member_keys.admin_revoke {"id":"..."}`; the latter
+can revoke any member's key. Lists contain id, name, created/expires/last-used
+and revocation timestamps, and active status; the admin list adds the owner.
+Neither list includes hashes. Management requires a browser login and is
+refused while the master switch is off.
+
+**Do not put this key in browser front-end code; call from your server.** Keep it
+in a server-side secret manager. The format is `ddc_member_` followed by the
+unpadded base64url encoding of 32 OS-random bytes. The database stores only its
+SHA-256 digest. Never put the key in a URL, query string, log or source repository.
+
+Authenticate `/ws` using exactly one credential in the connect frame:
+
+```json
+{"type":"req","id":"connect-1","method":"connect","params":{"member_key":"<member-key>"}}
+```
+
+For `/ws/chat`, the first frame is:
+
+```json
+{"type":"auth","member_key":"<member-key>"}
+```
+
+For member HTTP operations, use `Authorization: Bearer <member-key>`: `/api/me`,
+`POST /api/tasks/rpc`, file list/download/preview, chat attachment downloads and
+knowledge-source upload/original downloads, STT/TTS and AG-UI runs. Task RPC still accepts only its documented
+two methods (`tasks.goal_create`, `tasks.skill_assign`) and runs normal dispatch.
+The attachment and original-file routes retain their existing ownership and
+AI-employee checks. Other HTTP surfaces retain their JWT-only authentication;
+this does not authorize arbitrary endpoints. Status credentials and MCP keys
+cannot authenticate these member-key paths. Conversely, member keys are refused
+by the status endpoint, MCP HTTP authentication, MCP key validation, legacy
+Dashboard-token authentication and JWT-only account/security endpoints.
+
+Key RPC access is the intersection of `MEMBER_CONTRACT_METHODS`, the member's
+**current** role/bindings, and all existing handler gates. Credential management,
+`users.change_password`, `users.change_email`, `mfa.*`, `sessions.*`, `config.*`,
+`me.google.connect_*`, `me.google.disconnect`, `me.google.consents.set` and
+step-up operations are excluded. Unknown methods are denied. The compatibility
+table includes browser-only methods; its presence alone is not a key grant.
+
+Every key call and socket heartbeat rechecks the key row, expiration, active
+account, role and credential epoch. A key can never gain Admin authority: a
+promotion to Admin refuses it. Revocation, offboarding, expiration, password
+change, MFA reset or disabling the feature stops further calls; already-open
+WebSocket connections close on their next call/heartbeat. Chat streaming also
+rechecks identity before delivery. Keys do not use the browser JWT's 30-minute
+access-token expiry.
+
+`[member_api_keys] rate_per_minute` defaults to 120 (valid range 1–60000), shared
+per key across connections and transports, with a bounded limiter. An exceeded
+limit returns code `member_key_rate_limited` (HTTP 429 on direct HTTP operations).
+The first use in each ten-minute window creates an `auth_audit_log` row; later
+uses increment an aggregate. Last-used time is updated once per window. Write
+attempts record the method and key id individually, without parameters, hashes
+or plaintext. Creation and revocation are also audited.
+
+The tests added for part B have not been executed in the implementation session;
+compilation, target tests and independent security review remain release gates.

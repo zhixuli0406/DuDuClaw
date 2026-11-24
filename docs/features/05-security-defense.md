@@ -903,3 +903,24 @@ Non-Admin add/update scans the complete resulting name + task model prompt with 
 Employee cron uses UTC (also accepts zero-offset UTC/GMT aliases) or an IANA timezone whose UTC offset stays the same over the next two years, such as `Asia/Taipei`; with a constant offset, clock-time gaps equal elapsed time, so the 15-minute proof holds. A timezone with daylight saving or another offset change is refused on create, edit, resume or manual run, and the scheduler skips it, because DST can compress clock-time gaps. Such records remain readable and authorized users can pause/remove them; Admin manages other timezone schedules and must change a skipped one to UTC or a timezone without daylight saving.
 
 Human-origin MCP creation defaults to UTC and accepts an explicit timezone without daylight saving; unmarked Admin/background schedules keep local-timezone detection.
+
+## Personal member API keys (1.85.0)
+
+External member applications can call from their own server using a personal
+`ddc_member_` key instead of renewing a browser access token every 30 minutes.
+Administrators enable the feature in **My account → External access**; it is off
+by default. Members create up to five keys with a required 1–365 day expiration
+(default 90 days). Accounts with MFA must complete fresh step-up verification.
+Admin accounts cannot create member keys.
+
+The plaintext is shown once, and only SHA-256 is stored. Keys inherit the
+member's live role and bindings, are restricted to the member contract, and
+cannot manage credentials, passwords, email, MFA, sessions or configuration.
+They never grant Admin access. Revocation, expiry, offboarding, password changes
+and MFA resets invalidate them, including existing connections on their next
+call or heartbeat. Each key is rate limited (120 calls/minute by default).
+Creation, revocation and write calls are audited; repeated use is aggregated.
+
+**Do not put this key in browser front-end code; call from your server.** See the
+[member API authentication reference](../api/member-contract.md#personal-member-api-keys-rm-213-part-b-1850)
+for transport examples and the precise method restrictions.

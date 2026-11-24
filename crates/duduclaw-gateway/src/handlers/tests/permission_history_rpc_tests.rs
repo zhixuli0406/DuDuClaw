@@ -25,6 +25,7 @@ fn admin() -> UserContext {
 
 fn employee() -> UserContext {
     UserContext {
+        member_key_id: None,
         credential_epoch: 0,
         user_id: "emp-1".into(),
         email: "emp@example.com".into(),

@@ -3,7 +3,7 @@ use super::*;
 pub(in crate::webchat) struct TurnInput {
     pub state: Arc<WebChatState>,
     pub auth_user: String,
-    pub credential: Option<duduclaw_auth::jwt::Claims>,
+    pub credential: Option<crate::webchat::ChatCredential>,
     pub user_id: String,
     pub agent_id: String,
     pub requested_agent: Option<String>,
@@ -64,7 +64,7 @@ pub(super) async fn run(input: TurnInput, mut sink: TurnSink, ticket: &Ticket) {
         arrival_seq,
     } = input;
     if !credential_allows_turn(
-        state.credential_validity(credential.as_ref(), true).await, &sink,
+        state.chat_credential_validity(credential.as_ref(), true).await, &sink,
     ).await {
         return;
     }
@@ -415,7 +415,7 @@ pub(super) async fn run(input: TurnInput, mut sink: TurnSink, ticket: &Ticket) {
         guarded.refuse_delivery();
         return;
     }
-    let validity = state.credential_validity(credential.as_ref(), true).await;
+    let validity = state.chat_credential_validity(credential.as_ref(), true).await;
     if validity != crate::handlers::live_context::SocketValidity::Valid {
         guarded.refuse_delivery();
         sink.identity_unavailable(validity, false).await;
@@ -658,7 +658,7 @@ enum Undelivered {
 /// conversations carry their own `session_id` and `msg_id`.
 pub(super) async fn notify_undelivered(
     state: &WebChatState, auth_user: &str, agent: Option<&str>, sid: &str,
-    credential: Option<&duduclaw_auth::jwt::Claims>, msg_id: &str, turn: &str,
+    credential: Option<&crate::webchat::ChatCredential>, msg_id: &str, turn: &str,
     cancel: &CancellationToken,
 ) {
     notify_destinations(state, agent, sid, msg_id, turn, cancel, || state.subscriptions.sinks(auth_user, sid, msg_id,
@@ -770,7 +770,7 @@ async fn send_terminal(
     answering_agent: Option<&str>,
     sid: &str,
     cancel: &CancellationToken,
-    credential: Option<&duduclaw_auth::jwt::Claims>,
+    credential: Option<&crate::webchat::ChatCredential>,
     sink: &mut TurnSink,
     guarded: &crate::channel_reply::GuardedReply,
     owned_archives: &[PathBuf],
@@ -782,7 +782,7 @@ async fn send_terminal(
         rollback_owned_webchat_archives(owned_archives).await;
         return Err(Undelivered::Silent);
     }
-    let validity = state.credential_validity(credential, true).await;
+    let validity = state.chat_credential_validity(credential, true).await;
     let mut recovery = crate::handlers::live_context::SocketRecovery::default();
     if cancel.is_cancelled() || state.authorize_turn(auth_user, answering_agent, true).await.is_err()
         || !rollback_before_final_reply(validity, &mut recovery, owned_archives).await {
@@ -844,7 +844,7 @@ async fn send_terminal(
     let users = state.user_db.clone();
     let generation = tokio::task::spawn_blocking(move || users.acl_generation()).await
         .ok().and_then(Result::ok);
-    let validity = state.credential_validity(credential, true).await;
+    let validity = state.chat_credential_validity(credential, true).await;
     if cancel.is_cancelled() || state.authorize_turn(auth_user, answering_agent, true).await.is_err()
         || !rollback_before_final_reply(validity, &mut recovery, owned_archives).await {
         guarded.refuse_delivery();

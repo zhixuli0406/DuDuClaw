@@ -5660,6 +5660,19 @@ export interface McpKeyCreateResult {
 // ── RM-064: read-only status credentials (external work-status query) ──
 
 /** One `ddc_status_…` credential as listed. Never carries the secret. */
+export interface MemberKeyInfo {
+  id: string;
+  name: string;
+  created_at: string;
+  expires_at: string;
+  last_used_at: string | null;
+  revoked_at: string | null;
+  active: boolean;
+  user_id?: string;
+  user_email?: string | null;
+}
+export interface MemberKeyCreated { key: MemberKeyInfo; secret: string }
+
 export interface StatusTokenInfo {
   id: string;
   name: string;
@@ -8299,6 +8312,7 @@ export const api = {
         // Structured [external_status] enabled (RM-064; absent ⇒ false).
         // Written back through `updateConfig({ external_status_enabled })`.
         external_status_enabled?: boolean;
+        member_api_keys_enabled?: boolean;
         // Structured [notify] daily_digest for the daily-digest toggle
         // (W2-8; absent ⇒ false/"09:00", matching `DigestConfig::default()`).
         daily_digest_enabled?: boolean;
@@ -9683,6 +9697,14 @@ export const api = {
       client.call('mcp_keys.dismiss_migration_hint') as Promise<{ success: boolean }>,
   },
   /** RM-064: the caller's own read-only status credentials. */
+  memberKeys: {
+    list: () => client.call('me.member_keys.list') as Promise<{ keys: MemberKeyInfo[]; max_active: number }>,
+    create: (name: string, expires_in_days: number, code?: string) =>
+      client.call('me.member_keys.create', { name, expires_in_days, ...(code ? { code } : {}) }) as Promise<MemberKeyCreated>,
+    revoke: (id: string) => client.call('me.member_keys.revoke', { id }) as Promise<{ revoked: boolean }>,
+    adminList: () => client.call('member_keys.admin_list') as Promise<{ keys: MemberKeyInfo[] }>,
+    adminRevoke: (id: string) => client.call('member_keys.admin_revoke', { id }) as Promise<{ revoked: boolean }>,
+  },
   statusTokens: {
     list: () => client.call('me.status_tokens.list') as Promise<StatusTokenListResult>,
     create: (name: string) =>

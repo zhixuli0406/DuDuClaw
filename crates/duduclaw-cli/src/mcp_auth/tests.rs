@@ -174,3 +174,12 @@ mod scope_table;
 /// unknown, unreadable store, the legacy read path and the throttled
 /// `last_used_at`.
 mod key_store;
+
+#[test]
+fn member_and_status_prefixes_are_never_mcp_keys() {
+    for prefix in ["ddc_member_", "ddc_status_"] {
+        for suffix in ["", "0123456789abcdef0123456789abcdef", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"] {
+            assert!(!super::is_valid_key_format(&format!("{prefix}{suffix}")));
+        }
+    }
+}

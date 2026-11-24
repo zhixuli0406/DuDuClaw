@@ -66,7 +66,7 @@ pub(super) enum CancelOutcome { Waiting, Running }
 pub(super) enum MergedOutcome { Done, Failed, Cancelled }
 
 struct PendingMessage {
-    credential: Option<(u64, Option<String>)>,
+    credential: Option<(u64, Option<String>, Option<String>)>,
     content: String,
     attachments: Vec<ChatAttachment>,
 }
@@ -308,7 +308,10 @@ impl Ticket {
         if is_widget_visitor(&input.auth_user) || input.sid.starts_with("odoolivechat:")
             || crate::chat_commands::is_command(&input.content) { return; }
         self.registry.entries.lock().unwrap().get_mut(&self.id).unwrap().pending = Some(PendingMessage {
-            credential: input.credential.as_ref().map(|c| (c.credential_epoch, c.jti.clone())),
+            credential: input.credential.as_ref().map(|c| match c {
+                crate::webchat::ChatCredential::Jwt(c) => (c.credential_epoch, c.jti.clone(), None),
+                crate::webchat::ChatCredential::Member(c) => (c.credential_epoch, None, c.member_key_id.clone()),
+            }),
             content: input.content.clone(), attachments: input.attachments.clone(),
         });
     }
@@ -532,13 +535,13 @@ impl Outbound {
     /// Prepare live authority, then let GuardedSocket enforce its generation
     /// below every buffered adapter. Backpressure never holds the ACL lease.
     pub(super) async fn deliver_live<S: futures_util::Sink<Message> + Unpin>(
-        self, state: &WebChatState, credential: Option<&duduclaw_auth::jwt::Claims>,
+        self, state: &WebChatState, credential: Option<&crate::webchat::ChatCredential>,
         recovery: &mut crate::handlers::live_context::SocketRecovery,
         sink: &mut BoundedSocketSink<S>, gate: &SocketGate,
     ) -> Result<(), ()> {
         use std::pin::Pin;
         let Some(route) = self.route.as_ref() else {
-            let validity = state.credential_validity(credential, true).await;
+            let validity = state.chat_credential_validity(credential, true).await;
             return self.deliver_authorized(validity, recovery, sink).await;
         };
         if !route.live() || !route.authorized(state).await {
@@ -562,7 +565,7 @@ impl Outbound {
             let db = state.user_db.clone();
             let generation = tokio::task::spawn_blocking(move || db.acl_generation())
                 .await.ok().and_then(Result::ok);
-            let validity = state.credential_validity(credential, true).await;
+            let validity = state.chat_credential_validity(credential, true).await;
             if generation.is_none() {
                 route.source.refuse();
                 return None;
@@ -797,7 +800,7 @@ async fn execute_inner(mut input: TurnInput, sink: TurnSink, ticket: &mut Ticket
         .unwrap_or(&input.agent_id)
         .to_owned();
     if !credential_allows_turn(
-        state.credential_validity(input.credential.as_ref(), true).await, &sink,
+        state.chat_credential_validity(input.credential.as_ref(), true).await, &sink,
     ).await {
         return;
     }
@@ -830,7 +833,7 @@ async fn execute_inner(mut input: TurnInput, sink: TurnSink, ticket: &mut Ticket
     let work = Box::pin(run::run(input, sink.clone(), &ticket));
     let watcher = async {
         if credential.is_some() {
-            watch_credential(&ticket, || state.credential_validity(credential.as_ref(), true)).await;
+            watch_credential(&ticket, || state.chat_credential_validity(credential.as_ref(), true)).await;
         } else {
             std::future::pending::<()>().await;
         }

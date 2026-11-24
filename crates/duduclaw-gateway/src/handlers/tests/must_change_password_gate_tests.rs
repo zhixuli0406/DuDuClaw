@@ -109,6 +109,7 @@ async fn handler_with_flagged_admin() -> (MethodHandler, UserContext, Arc<UserDb
     handler.set_user_db(db.clone(), jwt).await;
 
     let ctx = UserContext {
+        member_key_id: None,
         credential_epoch: 0,
         user_id: admin.id.clone(),
         email: admin.email.clone(),

@@ -128,7 +128,8 @@ mod tests {
     #[test]
     fn hx6fix_admin_recording_control_audits_both_outcomes() {
         let home = tempfile::tempdir().unwrap();
-        let ctx = duduclaw_auth::UserContext { credential_epoch: 0, user_id: "u-admin".into(), email: "a@example.com".into(),
+        let ctx = duduclaw_auth::UserContext {
+            member_key_id: None, credential_epoch: 0, user_id: "u-admin".into(), email: "a@example.com".into(),
             role: duduclaw_auth::UserRole::Admin, agent_access: Default::default(), must_change_password: false,
             team_access: Default::default(), acl_generation: 0 };
         let id = "ab".repeat(16);

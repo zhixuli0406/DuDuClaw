@@ -1293,7 +1293,7 @@ async fn webchat_writer_rechecks_acl_after_backpressure_before_start_send() {
         subscription.subscribe("owned", None);
         let cancel = CancellationToken::new();
         let source = crate::channel_reply::ReplyDeliveryFence::test_live().for_turn(&cancel);
-        let mut turn = subscriptions.sinks(&user, "owned", "m", Some("finance"), Some(&credential), source.clone())
+        let mut turn = subscriptions.sinks(&user, "owned", "m", Some("finance"), Some(&credential.clone().into()), source.clone())
             .pop().unwrap();
         let sending = tokio::spawn(async move {
             turn.send(Message::Text(r#"{"type":"assistant_done","content":"private"}"#.into())).await
@@ -1311,7 +1311,7 @@ async fn webchat_writer_rechecks_acl_after_backpressure_before_start_send() {
             let (writer, _reader) = GuardedSocket::new(
                 BackpressuredWriter { ready, waiting: Some(waiting), written: captured }, gate.clone(),
             ).split();
-            queued.deliver_live(&state, Some(&credential),
+            queued.deliver_live(&state, Some(&credential.clone().into()),
                 &mut crate::handlers::live_context::SocketRecovery::default(),
                 &mut BoundedSocketSink(writer), &gate).await
         });
@@ -1390,7 +1390,7 @@ async fn assert_final_policy_window(change: &str) {
         let subscription = subscriptions.register(&user, tx);
         subscription.subscribe("owned", None);
         let source = crate::channel_reply::ReplyDeliveryFence::test_live();
-        let mut turn = subscriptions.sinks(&user, "owned", "m", Some("finance"), Some(&credential), source.clone()).pop().unwrap();
+        let mut turn = subscriptions.sinks(&user, "owned", "m", Some("finance"), Some(&credential.clone().into()), source.clone()).pop().unwrap();
         let sending = tokio::spawn(async move {
             turn.send(Message::Text(r#"{"type":"assistant_done","content":"private"}"#.into())).await
         });
@@ -1405,7 +1405,7 @@ async fn assert_final_policy_window(change: &str) {
             let (writer, _reader) = GuardedSocket::new(
                 BackpressuredWriter { ready, waiting: Some(waiting), written: captured }, gate.clone(),
             ).split();
-            queued.deliver_live(&state, Some(&credential), &mut Default::default(),
+            queued.deliver_live(&state, Some(&credential.clone().into()), &mut Default::default(),
                 &mut BoundedSocketSink(writer), &gate).await
         });
         // SplitSink::poll_ready only reserves its slot. The underlying
@@ -1513,3 +1513,61 @@ async fn live_budget_and_provider_refusals_keep_pre_notice_assistant_done_bytes(
 
 #[path = "contention_socket_tests.rs"]
 mod contention;
+
+#[tokio::test]
+async fn member_key_chat_socket_closes_after_revoke_expiry_epoch_or_admin() {
+    let _serial = SOCKET_TEST_LOCK.lock().await;
+    for reason in ["revoke", "expiry", "epoch", "admin", "switch"] {
+        let mut fixture = Fixture::start(true).await.unwrap();
+        std::fs::write(fixture._home.path().join("config.toml"), "[member_api_keys]\nenabled=true").unwrap();
+        let (user, _) = fixture.employee("member-key", &["dudu"], Some("dudu")).await;
+        let epoch = fixture.state.user_db.get_user(&user).unwrap().unwrap().credential_epoch;
+        let key = fixture.state.user_db.member_key_create(&user, "test", 1, epoch).unwrap();
+        let ctx = crate::member_keys::authenticate(fixture._home.path(), &fixture.state.user_db, &key.secret).unwrap();
+        let mut socket = fixture.open().await.unwrap();
+        send(&mut socket, json!({"type":"auth","member_key":key.secret})).await;
+        assert_eq!(frame(&mut socket).await["type"], "session_info");
+        match reason {
+            "revoke" => fixture.state.user_db.member_key_revoke_own(&user, &key.info.id).unwrap(),
+            "epoch" => { fixture.state.user_db.mfa_operator_reset("member-key@socket.test").unwrap(); },
+            "switch" => std::fs::write(fixture._home.path().join("config.toml"), "broken [").unwrap(),
+            cause => {
+                let db = rusqlite::Connection::open(fixture._home.path().join("users.db")).unwrap();
+                if cause == "expiry" { db.execute("UPDATE member_api_keys SET expires_at='2000-01-01T00:00:00Z'", []).unwrap(); }
+                else { db.execute("UPDATE users SET role='admin' WHERE id=?1", [&user]).unwrap(); }
+            }
+        }
+        assert_eq!(fixture.state.chat_credential_validity(Some(&ChatCredential::Member(ctx)), true).await,
+            crate::handlers::live_context::SocketValidity::Revoked);
+        let _ = socket.send(WireMessage::Text(json!({"type":"user_message","content":"must not execute"}).to_string().into())).await;
+        tokio::time::timeout(DEADLINE, async {
+            loop {
+                match socket.next().await {
+                    None | Some(Err(_)) | Some(Ok(WireMessage::Close(_))) => break,
+                    Some(Ok(WireMessage::Ping(data))) => { let _ = socket.send(WireMessage::Pong(data)).await; }
+                    Some(Ok(WireMessage::Pong(_))) => {}
+                    other => panic!("retired member key received data: {other:?}"),
+                }
+            }
+        }).await.expect("retired key must close the chat socket");
+        assert!(fixture.gate.entered.try_recv().is_err());
+    }
+}
+
+#[tokio::test]
+async fn member_key_chat_prefixes_cannot_fall_back_to_jwt_or_widget() {
+    let _serial = SOCKET_TEST_LOCK.lock().await;
+    let fixture = Fixture::start(true).await.unwrap();
+    std::fs::write(fixture._home.path().join("config.toml"), "[member_api_keys]\nenabled=true").unwrap();
+    let (user, jwt) = fixture.employee("prefix", &["dudu"], Some("dudu")).await;
+    let key = fixture.state.user_db.member_key_create(&user, "x", 1, 0).unwrap();
+    let status = fixture.state.user_db.status_token_create(&user, "x").unwrap();
+    for raw in [status.secret.as_str(), jwt.as_str(), "ddc_prod_0123456789abcdef0123456789abcdef"] {
+        let mut socket = fixture.open().await.unwrap();
+        send(&mut socket, json!({"type":"auth", "member_key":raw})).await;
+        assert_eq!(frame(&mut socket).await["type"], "error");
+    }
+    for raw in [key.secret.as_str(), status.secret.as_str(), "ddc_prod_0123456789abcdef0123456789abcdef"] {
+        assert!(authenticate_with(&fixture.state.jwt_config, &fixture.state.user_db, raw).is_err());
+    }
+}

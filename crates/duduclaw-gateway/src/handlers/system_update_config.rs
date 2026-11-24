@@ -516,6 +516,17 @@ impl MethodHandler {
             }
         }
 
+        if let Some(value) = params.get("member_api_keys_enabled") {
+            if let Err(e) = self.mfa_require_current_admin(ctx).await { return WsFrame::error_response("", &e); }
+            let Some(enabled) = value.as_bool() else { return WsFrame::error_response("", "member_api_keys.enabled must be boolean"); };
+            let Some(section) = table.entry("member_api_keys")
+                .or_insert_with(|| toml::Value::Table(toml::Table::new())).as_table_mut() else {
+                return WsFrame::error_response("", "Invalid [member_api_keys] section");
+            };
+            section.insert("enabled".into(), toml::Value::Boolean(enabled));
+            changes.push(format!("member_api_keys.enabled = {enabled}"));
+        }
+
         // ── RM-064 [external_status] enabled (external work-status query) ──
         // Read by the credential RPCs per request; the HTTP endpoint's short
         // cache is dropped once the write below commits, so persisting takes

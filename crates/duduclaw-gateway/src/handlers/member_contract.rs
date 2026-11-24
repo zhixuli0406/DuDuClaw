@@ -1,6 +1,6 @@
 //! Draft member-facing dashboard RPC compatibility metadata (RM-213 part A).
 //! The distributor's actual method inventory is still pending. This is not
-//! an authorization table or a member API-key allowlist; dispatch owns access.
+//! a full authorization table; member_key_method narrows it for key authentication.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemberContractKind {
@@ -367,3 +367,32 @@ pub const MEMBER_CONTRACT_METHODS: &[MemberContractMethod] = &[
         key_fields: &[],
     },
 ];
+
+/// Contract membership is necessary, never sufficient: existing ACL and
+/// private-data gates still apply. Credential/step-up namespaces stay closed.
+pub(crate) fn member_key_method(method: &str) -> Option<MemberContractKind> {
+    let excluded = matches!(method, "users.change_password" | "users.change_email"
+        | "me.google.disconnect" | "me.google.consents.set")
+        || matches!(method.split('.').next(), Some("mfa" | "sessions" | "config" | "member_keys"))
+        || method.split('.').take(2).eq(["me", "status_tokens"])
+        || method.split('.').take(2).eq(["me", "member_keys"])
+        || method.strip_prefix("me.google.").is_some_and(|op| op.starts_with("connect_"));
+    if excluded { return None; }
+    MEMBER_CONTRACT_METHODS.iter().find(|entry| entry.name == method).map(|entry| entry.kind)
+}
+
+#[cfg(test)]
+mod member_key_tests {
+    use super::*;
+    #[test]
+    fn keys_use_contract_intersected_with_credential_exclusions() {
+        for method in ["users.change_password", "users.change_email", "me.status_tokens.list",
+            "me.member_keys.create", "me.google.connect_start", "me.google.disconnect",
+            "me.google.consents.set", "sessions.list", "mfa.status", "config.get",
+            "system.update_config", "agents.delete", "unknown.method"] {
+            assert_eq!(member_key_method(method), None, "{method}");
+        }
+        assert_eq!(member_key_method("tasks.create"), Some(MemberContractKind::Write));
+        assert_eq!(member_key_method("users.me"), Some(MemberContractKind::Read));
+    }
+}

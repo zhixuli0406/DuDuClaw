@@ -30,6 +30,7 @@ fn admin() -> UserContext {
 
 fn manager_ctx(id: &str) -> UserContext {
     UserContext {
+        member_key_id: None,
         credential_epoch: 0,
         user_id: id.into(),
         email: format!("{id}@example.com"),

@@ -39,7 +39,7 @@ pub enum ChatMessage {
     ComputerWatch { agent_id: String, href: String, conv: Option<String> },
     /// Client → Server: first frame, authenticates the connection (C5).
     #[serde(rename = "auth")]
-    Auth { token: String },
+    Auth { #[serde(default)] token: Option<String>, #[serde(default)] member_key: Option<String> },
     /// Client → Server: cancel one owned pending turn.
     #[serde(rename = "cancel")]
     Cancel {
@@ -515,6 +515,28 @@ pub struct WebChatState {
         tokio::sync::Mutex<std::collections::HashMap<String, (AclSnapshot, std::time::Instant)>>,
 }
 
+/// Transport-only provenance, never deserialized from a client or serialized.
+#[derive(Clone)]
+pub(crate) enum ChatCredential {
+    Jwt(duduclaw_auth::jwt::Claims),
+    Member(duduclaw_auth::UserContext),
+}
+impl ChatCredential {
+    fn user_id(&self) -> &str {
+        match self { Self::Jwt(claims) => &claims.sub, Self::Member(ctx) => &ctx.user_id }
+    }
+    fn valid_at_delivery(&self, home: &std::path::Path, db: &UserDb, now: u64) -> bool {
+        match self {
+            Self::Jwt(claims) => webchat_credential_expiry(home, claims)
+                .is_ok_and(|expiry| expiry.is_none_or(|expiry| now < expiry)),
+            Self::Member(ctx) => crate::member_keys::refresh(home, db, ctx).is_ok(),
+        }
+    }
+}
+impl From<duduclaw_auth::jwt::Claims> for ChatCredential {
+    fn from(claims: duduclaw_auth::jwt::Claims) -> Self { Self::Jwt(claims) }
+}
+
 impl WebChatState {
     pub fn new(ctx: Arc<ReplyContext>, jwt_config: Arc<JwtConfig>, user_db: Arc<UserDb>) -> Self {
         let approvals = crate::approval::ApprovalBroker::open(&ctx.home_dir).map_err(|error| {
@@ -551,6 +573,24 @@ impl WebChatState {
             return widget_authenticate(&self.ctx.home_dir, presented).map(|id| (id, false));
         }
         authenticate_with(&self.jwt_config, &self.user_db, token)
+    }
+
+    async fn chat_credential_validity(&self, credential: Option<&ChatCredential>, heartbeat: bool) -> crate::handlers::live_context::SocketValidity {
+        use crate::handlers::live_context::SocketValidity;
+        match credential {
+            Some(ChatCredential::Member(ctx)) => {
+                let home = self.ctx.home_dir.clone();
+                let db = self.user_db.clone();
+                let ctx = ctx.clone();
+                match tokio::task::spawn_blocking(move || crate::member_keys::refresh(&home, &db, &ctx)).await {
+                    Ok(Ok(_)) => SocketValidity::Valid,
+                    // A key connection closes on any unreadable authority.
+                    _ => SocketValidity::Revoked,
+                }
+            }
+            Some(ChatCredential::Jwt(claims)) => self.credential_validity(Some(claims), heartbeat).await,
+            None => self.credential_validity(None, heartbeat).await,
+        }
     }
 
     async fn credential_validity(&self, claims: Option<&duduclaw_auth::jwt::Claims>, heartbeat: bool) -> crate::handlers::live_context::SocketValidity {
@@ -721,6 +761,8 @@ fn authenticate_with(
     user_db: &UserDb,
     token: &str,
 ) -> Result<(String, bool), String> {
+    if duduclaw_auth::member_keys::is_member_key(token)
+        || duduclaw_auth::status_tokens::is_status_token(token) { return Err("invalid token type".into()); }
     let claims = jwt_config
         .verify_access_token(token)
         .map_err(|e| format!("invalid token: {e}"))?;
@@ -882,10 +924,17 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
         let auth_timeout = std::time::Duration::from_secs(10);
         let authed = match tokio::time::timeout(auth_timeout, stream.next()).await {
             Ok(Some(Ok(Message::Text(text)))) => match uploads::parse_message(&text) {
-                Ok(ChatMessage::Auth { token }) => {
+                Ok(ChatMessage::Auth { token: None, member_key: Some(raw) }) => {
+                    crate::member_keys::authenticate(&state.ctx.home_dir, &state.user_db, &raw).map(|ctx| {
+                        let identity = (ctx.user_id.clone(), false);
+                        credential = Some(ChatCredential::Member(ctx));
+                        identity
+                    })
+                },
+                Ok(ChatMessage::Auth { token: Some(token), member_key: None }) => {
                     state.authenticate(&token).and_then(|identity| {
                         if !token.starts_with("widget:") {
-                            credential = Some(state.jwt_config.verify_access_token(&token)?);
+                            credential = Some(ChatCredential::Jwt(state.jwt_config.verify_access_token(&token)?));
                         }
                         Ok(identity)
                     })
@@ -992,7 +1041,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
             },
             // Heartbeat tick
             _ = heartbeat_interval.tick() => {
-                let validity = state.credential_validity(credential.as_ref(), true).await;
+                let validity = state.chat_credential_validity(credential.as_ref(), true).await;
                 recovery.observe(validity, true);
                 if recovery.closed() {
                     let _ = sink.send(Message::Close(None)).await;
@@ -1014,7 +1063,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
             cfg_ev = cfg_rx.recv() => {
                 use tokio::sync::broadcast::error::RecvError;
                 if !matches!(cfg_ev, Err(RecvError::Closed)) {
-                    let validity = state.credential_validity(credential.as_ref(), false).await;
+                    let validity = state.chat_credential_validity(credential.as_ref(), false).await;
                     if !recovery.observe(validity, false) {
                         if recovery.closed() { let _ = sink.send(Message::Close(None)).await; break; }
                         continue;
@@ -1047,6 +1096,20 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                 #[allow(clippy::collapsible_match)]
                 match msg {
                     Message::Text(text) => {
+                        if let Some(ChatCredential::Member(ctx)) = credential.as_ref() {
+                            let validity = state.chat_credential_validity(credential.as_ref(), true).await;
+                            if validity != crate::handlers::live_context::SocketValidity::Valid {
+                                let _ = sink.send(Message::Close(None)).await;
+                                break;
+                            }
+                            if let Err(e) = crate::member_keys::record_call(&state.ctx.home_dir, &state.user_db,
+                                ctx, "webchat.command", true) {
+                                let error = serde_json::json!({"type": "error", "code": if e == "member_key_rate_limited" {
+                                    "member_key_rate_limited" } else { "member_key_refused" }, "message": "member key call refused"});
+                                let _ = sink.send(Message::Text(error.to_string().into())).await;
+                                continue;
+                            }
+                        }
                         // Explicit logout narrows only this authenticated socket's turns,
                         // even when the identity store is temporarily unavailable.
                         if matches!(serde_json::from_str::<ChatMessage>(&text), Ok(ChatMessage::Logout)) {
@@ -1081,7 +1144,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                             });
                             continue;
                         }
-                        let validity = state.credential_validity(credential.as_ref(), false).await;
+                        let validity = state.chat_credential_validity(credential.as_ref(), false).await;
                         if !recovery.observe(validity, false) {
                             if recovery.closed() {
                                 let _ = sink.send(Message::Close(None)).await;
@@ -1524,7 +1587,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 let cancel_principal = turns::cancel_principal(&auth_user, peer_ip);
                                 // Routing and ownership checks above may await. Recheck
                                 // the credential before reserving or starting any turn.
-                                let validity = state.credential_validity(credential.as_ref(), true).await;
+                                let validity = state.chat_credential_validity(credential.as_ref(), true).await;
                                 if !recovery.observe(validity, false) {
                                     if recovery.closed() { break; }
                                     turn_sink.identity_unavailable(validity, true).await;
@@ -1545,7 +1608,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 )).await {
                                     Ok(mut ticket) => {
                                         ticket.admission_generation = admission_generation;
-                                        let validity = state.credential_validity(credential.as_ref(), true).await;
+                                        let validity = state.chat_credential_validity(credential.as_ref(), true).await;
                                         recovery.observe(validity, false);
                                         if !turns::credential_allows_turn(validity, &turn_sink).await {
                                             if recovery.closed() { break; }
