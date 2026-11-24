@@ -1,6 +1,7 @@
 //! One incremental scanner for listing, search, injection, CLI and exports.
 use std::io;
 use std::path::Path;
+use crate::wiki_path::{directory::{Directory, Kind}, FoldedNames, MAX_DIRECTORY_ENTRIES};
 
 pub const RESERVED_FILES: &[&str] = &["_schema.md", "_index.md", "_log.md"];
 pub const MAX_DEPTH: usize = 20;
@@ -22,63 +23,50 @@ pub fn visit(
     visitor: &mut impl FnMut(&str) -> io::Result<()>,
     checkpoint: &mut impl FnMut() -> io::Result<()>,
 ) -> io::Result<ScanStats> {
-    for root in [base, directory] {
-        let meta = std::fs::symlink_metadata(root)?;
-        if crate::wiki_path::is_link_metadata(&meta) || !meta.is_dir() {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "wiki scan root is not a real directory"));
-        }
-    }
     let relative = directory.strip_prefix(base)
         .map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, "scan outside wiki"))?;
-    if relative.components().any(|part| !matches!(part, std::path::Component::Normal(_) | std::path::Component::CurDir)) {
-        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "invalid scan subtree"));
-    }
-    // Also refuse links in the chain to a requested subtree.
-    let mut ancestor = base.to_path_buf();
-    for part in relative.components() {
-        ancestor.push(part);
-        if crate::wiki_path::is_link_metadata(&std::fs::symlink_metadata(&ancestor)?) {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "linked scan ancestor"));
-        }
-    }
+    let root = Directory::root(base)?;
+    let directory = root.descend(relative, false)?;
     let mut stats = ScanStats::default();
     if relative.components().next().and_then(|c| c.as_os_str().to_str())
         .is_some_and(|name| duduclaw_core::wiki_auto_namespace::segment_opens_as(name, "_archive")) {
         return Ok(stats);
     }
-    walk(base, directory, relative.components().count(), &mut stats, visitor, checkpoint)?;
+    walk(&root.path, &directory, relative.components().count(), &mut stats, visitor, checkpoint)?;
     Ok(stats)
 }
 
 fn walk(
-    base: &Path, directory: &Path, depth: usize, stats: &mut ScanStats,
+    base: &Path, directory: &Directory, depth: usize, stats: &mut ScanStats,
     visitor: &mut impl FnMut(&str) -> io::Result<()>,
     checkpoint: &mut impl FnMut() -> io::Result<()>,
 ) -> io::Result<()> {
     if depth > MAX_DEPTH { return Ok(()); }
-    let metadata = std::fs::symlink_metadata(directory)?;
-    if crate::wiki_path::is_link_metadata(&metadata) || !metadata.is_dir() {
-        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "linked scan directory"));
-    }
-    for entry in std::fs::read_dir(directory)? {
+    let names = directory.names(MAX_DIRECTORY_ENTRIES, checkpoint)?;
+    let folded = FoldedNames::new(&names);
+    for name in names {
         checkpoint()?;
         stats.entries += 1;
-        let entry = entry?;
-        let path = entry.path();
-        let meta = std::fs::symlink_metadata(&path)?;
-        if crate::wiki_path::is_link_metadata(&meta) { continue; }
-        if meta.is_dir() {
-            if depth == 0 && entry.file_name().to_str().is_some_and(|name|
-                duduclaw_core::wiki_auto_namespace::segment_opens_as(name, "_archive")) { continue; }
-            walk(base, &path, depth + 1, stats, visitor, checkpoint)?;
-        } else if meta.is_file() && path.extension().is_some_and(|ext| ext == "md") {
-            if entry.file_name().to_str().is_some_and(is_reserved) { continue; }
-            let id = path.strip_prefix(base).ok().and_then(crate::wiki_path::page_id_from_relative_path);
-            let resolved = id.and_then(|id| crate::wiki_path::resolve_wiki_page(base, &id, false).ok());
-            match resolved {
-                Some(page) => visitor(&page.id)?,
-                None => stats.invalid_ids += 1,
+        let path = directory.path.join(&name);
+        // One snapshot/map per directory, including directory aliases. Never
+        // invoke the single-page resolver once per scanned file.
+        let unique = name.to_str().is_some_and(|text| folded.resolve(text).is_ok());
+        if !unique { stats.invalid_ids += 1; continue; }
+        match directory.kind(&name)? {
+            Kind::Directory => {
+                if depth == 0 && name.to_str().is_some_and(|name|
+                    duduclaw_core::wiki_auto_namespace::segment_opens_as(name, "_archive")) { continue; }
+                let child = directory.child(&name, false)?;
+                walk(base, &child, depth + 1, stats, visitor, checkpoint)?;
             }
+            Kind::File if path.extension().is_some_and(|ext| ext == "md") => {
+                if name.to_str().is_some_and(is_reserved) { continue; }
+                match path.strip_prefix(base).ok().and_then(crate::wiki_path::page_id_from_relative_path) {
+                    Some(id) => visitor(&id)?,
+                    None => stats.invalid_ids += 1,
+                }
+            }
+            _ => {},
         }
     }
     Ok(())
@@ -102,6 +90,25 @@ pub fn collect(base: &Path, directory: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scanner_lists_each_directory_once() {
+        let root = tempfile::tempdir().unwrap();
+        for directory in ["a", "b", "b/c"] {
+            std::fs::create_dir_all(root.path().join(directory)).unwrap();
+            for index in 0..32 {
+                std::fs::write(root.path().join(directory).join(format!("{index}.md")), "body").unwrap();
+            }
+        }
+        let mut pages = Vec::new();
+        let before = crate::wiki_path::directory::LISTING_COUNT.with(|count| count.get());
+        visit(root.path(), root.path(), &mut |id| {
+            pages.push(id.to_owned()); Ok(())
+        }, &mut || Ok(())).unwrap();
+        assert_eq!(pages.len(), 96);
+        let after = crate::wiki_path::directory::LISTING_COUNT.with(|count| count.get());
+        assert_eq!(after - before, 4, "one real directory listing per directory");
+    }
 
     #[test]
     fn rm209_scan_matches_store_and_caps_depth() {

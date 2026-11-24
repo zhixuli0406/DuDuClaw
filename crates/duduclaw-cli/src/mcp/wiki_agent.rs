@@ -345,7 +345,10 @@ pub(crate) fn wiki_page_withheld(
                 &db,
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
             )?;
-            let key = duduclaw_memory::wiki_path::persisted_page_id(&page.path)
+            let resolved = duduclaw_memory::wiki_path::resolve_wiki_page(wiki_dir, &page.path, false)
+                .map_err(|_| rusqlite::Error::InvalidQuery)?;
+            if !resolved.exists { return Err(rusqlite::Error::InvalidQuery); }
+            let key = duduclaw_memory::wiki_path::folded_page_id(&resolved.id)
                 .ok_or(rusqlite::Error::InvalidQuery)?;
             let mut stmt = conn.prepare(
                 "SELECT page_path,trust,do_not_inject FROM wiki_trust_state WHERE agent_id=?1",
@@ -356,7 +359,7 @@ pub(crate) fn wiki_page_withheld(
             let mut state: Option<(f64, i64)> = None;
             for row in rows {
                 let (stored, trust, deny) = row?;
-                if duduclaw_memory::wiki_path::persisted_page_id(&stored).as_ref() == Some(&key) {
+                if duduclaw_memory::wiki_path::folded_page_id(&stored).as_ref() == Some(&key) {
                     // Any quarantined alias wins; canonicalizing the read id
                     // must never lose an old Windows do_not_inject record.
                     let trust = if trust.is_finite() { trust } else { 0.0 };
@@ -537,7 +540,7 @@ pub(crate) async fn handle_wiki_write_in(
     if let Err(error) = duduclaw_mcp_boundary::io_authority::verify_before_io() {
         return tool_error(&error.to_string());
     }
-    if let Err(e) = duduclaw_memory::wiki_path::atomic_write_nofollow_checked(&full_path, content, || {
+    if let Err(e) = duduclaw_memory::wiki_path::atomic_write_resolved_checked(&target, content, || {
         duduclaw_memory::wiki_path::check_wiki_control_files(&wiki_dir)?;
         duduclaw_mcp_boundary::io_authority::verify_before_io()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))
@@ -960,6 +963,26 @@ mod conversation_scope_tests {
         assert!(!text(&result).contains("quarantined secret"));
     }
 
+    #[test]
+    fn legacy_folded_trust_rows_withhold_the_real_page() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki = regression_home(tmp.path());
+        let store = duduclaw_memory::WikiStore::new(wiki.clone());
+        let raw = "---\ntitle: Secret\ntrust: 0.9\n---\n\nprivate";
+        store.write_page("notes/Café.md", raw).unwrap();
+        let db = rusqlite::Connection::open(tmp.path().join("wiki_trust.db")).unwrap();
+        db.execute_batch("CREATE TABLE wiki_trust_state (agent_id TEXT, page_path TEXT, trust REAL, do_not_inject INTEGER);").unwrap();
+        for alias in ["notes/café.md", "NOTES/cafe\u{301}.md", "notes/Ca\u{200d}fé.md", "notes/Café.md. ", r"notes\Café.md"] {
+            db.execute("DELETE FROM wiki_trust_state", []).unwrap();
+            db.execute("INSERT INTO wiki_trust_state VALUES ('alice',?1,0.9,1)", [alias]).unwrap();
+            db.execute("INSERT INTO wiki_trust_state VALUES ('alice',?1,1.0,0)", ["notes/Café.md"]).unwrap();
+            assert!(wiki_page_withheld(tmp.path(), &wiki, "alice", "notes/Café.md", raw).is_some(), "{alias}");
+        }
+        db.execute("DELETE FROM wiki_trust_state", []).unwrap();
+        assert!(wiki_page_withheld(tmp.path(), &wiki, "alice", "notes/Café.md", raw).is_none());
+        assert!(wiki_page_withheld(tmp.path(), &wiki, "alice", "notes/missing.md", raw).is_some());
+    }
+
     #[tokio::test]
     async fn rm209_reserved_alias_read_is_redacted() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1071,7 +1094,7 @@ mod conversation_scope_tests {
         let refused = handle_wiki_read_in(&args, home, "alice", &in_b).await;
         assert_eq!(refused["isError"], true);
         assert!(!text(&refused).contains("private salary"));
-        assert!(text(&handle_wiki_read_in(&args, home, "alice", &in_a).await).contains("private salary"));
+        assert_eq!(handle_wiki_read_in(&args, home, "alice", &in_a).await["isError"], true);
         let before = std::fs::read(wiki.join(&path)).unwrap();
         for scope in [&in_a, &in_b, &ReadScope::Employee] {
             let write = handle_wiki_write_in(&serde_json::json!({"page_path": alias, "content": "replacement"}), home, "alice", scope).await;
@@ -1088,23 +1111,25 @@ mod conversation_scope_tests {
         assert!(text(&search).contains("concepts/public.md"));
         assert!(!text(&search).contains("private salary") && !text(&search).contains("public-alias") && !text(&search).contains(&path), "{}", text(&search));
         assert!(store.list_pages().unwrap().iter().all(|p| !p.path.starts_with("public-alias/")));
-        assert_eq!(store.build_backlink_index().unwrap()[&path], vec!["concepts/public.md".to_string()]);
+        assert!(!store.build_backlink_index().unwrap().contains_key(&path));
         // Registry compatibility must survive the stricter file reader.
         let registry_path = duduclaw_memory::wiki_auto_registry::registry_path(home, "alice").unwrap();
         let mut registry: duduclaw_gateway::auto_wiki_page::AutoPageRegistry = serde_json::from_slice(&std::fs::read(&registry_path).unwrap()).unwrap();
         let record = registry.pages.remove(&path).unwrap();
         registry.pages.insert(path.replace('/', "\\"), record);
         std::fs::write(registry_path, serde_json::to_vec(&registry).unwrap()).unwrap();
-        assert!(text(&handle_wiki_read_in(&args, home, "alice", &in_a).await).contains("private salary"));
-        // Ordinary folder aliases still support reads, writes and sharing.
+        assert_eq!(handle_wiki_read_in(&args, home, "alice", &in_a).await["isError"], true);
+        let direct = serde_json::json!({"page_path": path});
+        assert!(text(&handle_wiki_read_in(&direct, home, "alice", &in_a).await).contains("private salary"));
+        // Even ordinary internal directory links are refused.
         symlink("concepts", wiki.join("ordinary-alias")).unwrap();
         let ordinary = serde_json::json!({"page_path": "ordinary-alias/plain.md", "content": "---\ntitle: Plain\ntrust: 0.8\n---\n\nordinary content"});
         let write = handle_wiki_write_in(&ordinary, home, "alice", &ReadScope::Employee).await;
-        assert_ne!(write["isError"], true, "{}", text(&write));
-        assert!(text(&handle_wiki_read_in(&ordinary, home, "alice", &in_b).await).contains("ordinary content"));
+        assert_eq!(write["isError"], true, "{}", text(&write));
+        assert_eq!(handle_wiki_read_in(&ordinary, home, "alice", &in_b).await["isError"], true);
         let share = handle_wiki_share_in(&ordinary, home, "alice", &ReadScope::Employee).await;
-        assert_ne!(share["isError"], true, "{}", text(&share));
-        assert!(wiki.join("concepts/plain.md").is_file());
+        assert_eq!(share["isError"], true, "{}", text(&share));
+        assert!(!wiki.join("concepts/plain.md").exists());
         symlink("../concepts", wiki.join("auto/outward")).unwrap();
         let outward = handle_wiki_read_in(&serde_json::json!({"page_path": "auto/outward/plain.md"}), home, "alice", &in_b).await;
         assert_eq!(outward["isError"], true, "{}", text(&outward));

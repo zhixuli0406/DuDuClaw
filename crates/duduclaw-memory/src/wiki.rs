@@ -397,10 +397,9 @@ impl WikiStore {
         crate::wiki_path::check_wiki_control_files(&self.wiki_dir).map_err(|e| e.to_string())?;
         // create_dir_all is idempotent — safe for concurrent callers
         for sub in WIKI_SUBDIRS {
-            let p = self.wiki_dir.join(sub);
             verify()?;
-            std::fs::create_dir_all(&p)
-                .map_err(|e| format!("create dir {}: {e}", p.display()))?;
+            crate::wiki_path::create_wiki_directory(&self.wiki_dir, sub)
+                .map_err(|e| format!("create dir {sub}: {e}"))?;
         }
 
         // Use create_new to avoid TOCTOU — only the first caller writes, others get AlreadyExists (ignored)
@@ -410,10 +409,9 @@ impl WikiStore {
             ("_log.md", "# Wiki Log\n\n<!-- Append-only operation log. -->\n"),
         ];
         for (name, content) in scaffold_files {
-            let path = self.wiki_dir.join(name);
             verify()?;
             crate::wiki_path::check_wiki_control_files(&self.wiki_dir).map_err(|e| e.to_string())?;
-            match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            match crate::wiki_path::create_wiki_control_file(&self.wiki_dir, name) {
                 Ok(mut f) => {
                     use std::io::Write;
                     f.write_all(content.as_bytes())
@@ -663,7 +661,7 @@ impl WikiStore {
 
         let is_new = std::fs::symlink_metadata(&full).is_err();
 
-        crate::wiki_path::atomic_write_nofollow_checked(&full, content, || {
+        crate::wiki_path::atomic_write_resolved_checked(&target, content, || {
             crate::wiki_path::check_wiki_control_files(&self.wiki_dir)?;
             crate::isolation_io::verify().map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))
         })
@@ -721,39 +719,11 @@ impl WikiStore {
         let path = target.id.as_str();
         let _fence = self.delivery_fence().exclusive_for_write()?;
         crate::isolation_io::verify()?;
-        let src = target.full_path.clone();
-        if !src.exists() {
-            return Ok(false);
-        }
-        let archive_root = self.wiki_dir.join("_archive");
-        if let Ok(meta) = std::fs::symlink_metadata(&archive_root) {
-            if meta.file_type().is_symlink() {
-                return Err(DuDuClawError::Memory(
-                    "_archive/ is a symlink — refusing to archive (would escape wiki dir)".into(),
-                ));
-            }
-        }
-        let dest = archive_root.join(path);
-        // Confirm the destination stays under wiki_dir/_archive before and
-        // after creating its parents (defence in depth — `path` is
-        // validate_page_path'd, but a symlink planted deeper in `_archive/`
-        // must not redirect the move). Fail closed: an unresolvable path
-        // denies instead of skipping the check.
-        let confine = |p: &Path| {
-            crate::wiki_path::ensure_within_wiki_dir(&archive_root, p).map_err(|e| {
-                DuDuClawError::Memory(format!(
-                    "archive destination escapes _archive/ (symlink detected): {e}"
-                ))
-            })
-        };
-        confine(&dest)?;
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| DuDuClawError::Memory(format!("create archive dir: {e}")))?;
-            confine(parent)?;
-        }
+        if !target.exists { return Ok(false); }
+        let destination = crate::wiki_path::prepare_wiki_write_page(&self.wiki_dir, &format!("_archive/{path}"))
+            .map_err(|e| DuDuClawError::Memory(format!("archive destination: {e}")))?;
         crate::isolation_io::verify()?;
-        std::fs::rename(&src, &dest)
+        crate::wiki_path::rename_resolved_wiki_file(&target, &destination)
             .map_err(|e| DuDuClawError::Memory(format!("archive {path}: {e}")))?;
 
         if let Err(e) = self.remove_from_index(path) {
@@ -776,35 +746,18 @@ impl WikiStore {
         self.validate_page_path(path)?;
         let _fence = self.delivery_fence().exclusive_for_write()?;
         crate::isolation_io::verify()?;
-        let archive_root = self.wiki_dir.join("_archive");
-        let archived = archive_root.join(path);
-        match std::fs::symlink_metadata(&archived) {
-            Ok(m) if m.is_file() => {}
-            Ok(_) => {
-                return Err(DuDuClawError::Memory(
-                    "archived page is not a regular file".into(),
-                ));
-            }
+        let archived = match crate::wiki_path::resolve_wiki_page(&self.wiki_dir, &format!("_archive/{path}"), false) {
+            Ok(page) => page,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(e) => return Err(DuDuClawError::Memory(format!("archived page: {e}"))),
-        }
-        // A symlinked `_archive/` (or a link deeper in it) must not let a
-        // restore move an outside file into the live wiki.
-        if std::fs::symlink_metadata(&archive_root).is_ok_and(|m| m.file_type().is_symlink()) {
-            return Err(DuDuClawError::Memory("_archive/ is a symlink".into()));
-        }
-        crate::wiki_path::ensure_within_wiki_dir(&archive_root, &archived)
-            .map_err(|e| DuDuClawError::Memory(format!("archived page refused: {e}")))?;
-        let dest = self.wiki_dir.join(path);
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| DuDuClawError::Memory(format!("create restore dir: {e}")))?;
-        }
+        };
+        let destination = crate::wiki_path::prepare_wiki_write_page(&self.wiki_dir, path)
+            .map_err(|e| DuDuClawError::Memory(format!("restore destination: {e}")))?;
         crate::isolation_io::verify()?;
-        std::fs::rename(&archived, &dest)
+        crate::wiki_path::rename_resolved_wiki_file(&archived, &destination)
             .map_err(|e| DuDuClawError::Memory(format!("restore {path}: {e}")))?;
 
-        if let Ok(content) = std::fs::read_to_string(&dest) {
+        if let Ok(content) = crate::wiki_path::read_resolved_wiki_file_nofollow(&destination) {
             let title = extract_title(&content).unwrap_or_else(|| path.to_string());
             if let Err(e) = self.update_index(path, &title) {
                 warn!("Failed to update index for restored {path}: {e}");
@@ -857,7 +810,7 @@ impl WikiStore {
         let full = target.full_path.clone();
         if full.exists() {
             crate::isolation_io::verify()?;
-            std::fs::remove_file(&full)
+            crate::wiki_path::remove_resolved_wiki_file(&target)
                 .map_err(|e| DuDuClawError::Memory(format!("delete {path}: {e}")))?;
             if let Err(e) = self.remove_from_index(path) {
                 warn!("Failed to remove {path} from index: {e}");
@@ -888,7 +841,7 @@ impl WikiStore {
         let existed = full.exists();
         if existed {
             crate::isolation_io::verify()?;
-            std::fs::remove_file(&full)
+            crate::wiki_path::remove_resolved_wiki_file(&target)
                 .map_err(|e| DuDuClawError::Memory(format!("delete {path}: {e}")))?;
         }
         let indexed = match crate::wiki_path::read_wiki_file_nofollow(&self.wiki_dir, "_index.md") {
@@ -1246,8 +1199,7 @@ impl WikiStore {
         }
 
         let content = lines.join("\n") + "\n";
-        let index_path = self.wiki_dir.join("_index.md");
-        crate::wiki_path::atomic_write_nofollow(&index_path, &content)
+        crate::wiki_path::atomic_write_wiki_control_checked(&self.wiki_dir, "_index.md", &content, || Ok(()))
             .map_err(|e| DuDuClawError::Memory(format!("rebuild index: {e}")))?;
 
         info!(pages = pages.len(), "Wiki index rebuilt");
@@ -1851,13 +1803,11 @@ impl WikiStore {
         let canonical = crate::wiki_path::canonical_page_id(page_path)
             .ok_or_else(|| "Invalid wiki page id".to_string())?;
         let page_path = canonical.as_str();
-        let index_path = self.wiki_dir.join("_index.md");
 
         // Use flock for atomicity across concurrent callers
-        let lock_path = self.wiki_dir.join("_index.lock");
         verify()?;
         crate::wiki_path::check_wiki_control_files(&self.wiki_dir).map_err(|e| e.to_string())?;
-        let lock_file = crate::wiki_path::open_control_file_nofollow(&lock_path, false)
+        let lock_file = crate::wiki_path::open_control_file_nofollow(&self.wiki_dir, "_index.lock", false)
             .map_err(|e| format!("open lock: {e}"))?;
         // Advisory lock — blocks until acquired
         fs_lock(&lock_file).map_err(|e| format!("acquire lock: {e}"))?;
@@ -1884,7 +1834,7 @@ impl WikiStore {
 
         // Atomic write: temp + rename under lock
         let content = lines.join("\n") + "\n";
-        crate::wiki_path::atomic_write_nofollow_checked(&index_path, &content, || {
+        crate::wiki_path::atomic_write_wiki_control_checked(&self.wiki_dir, "_index.md", &content, || {
             crate::wiki_path::check_wiki_control_files(&self.wiki_dir)?;
             verify().map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))
         })
@@ -1898,12 +1848,10 @@ impl WikiStore {
         let canonical = crate::wiki_path::canonical_page_id(page_path)
             .ok_or_else(|| "Invalid wiki page id".to_string())?;
         let page_path = canonical.as_str();
-        let index_path = self.wiki_dir.join("_index.md");
 
-        let lock_path = self.wiki_dir.join("_index.lock");
         crate::isolation_io::verify().map_err(|e| e.to_string())?;
         crate::wiki_path::check_wiki_control_files(&self.wiki_dir).map_err(|e| e.to_string())?;
-        let lock_file = crate::wiki_path::open_control_file_nofollow(&lock_path, false)
+        let lock_file = crate::wiki_path::open_control_file_nofollow(&self.wiki_dir, "_index.lock", false)
             .map_err(|e| format!("open lock: {e}"))?;
         fs_lock(&lock_file).map_err(|e| format!("acquire lock: {e}"))?;
 
@@ -1916,7 +1864,7 @@ impl WikiStore {
             .collect();
 
         let content = lines.join("\n") + "\n";
-        crate::wiki_path::atomic_write_nofollow_checked(&index_path, &content, || {
+        crate::wiki_path::atomic_write_wiki_control_checked(&self.wiki_dir, "_index.md", &content, || {
             crate::wiki_path::check_wiki_control_files(&self.wiki_dir)?;
             crate::isolation_io::verify().map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))
         })
@@ -1949,7 +1897,6 @@ impl WikiStore {
         let canonical = crate::wiki_path::canonical_page_id(page_path)
             .ok_or_else(|| "Invalid wiki page id".to_string())?;
         let page_path = canonical.as_str();
-        let log_path = self.wiki_dir.join("_log.md");
         let now = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
         let entry = match author {
             Some(a) => format!("## [{}] {} | {} | by:{}\n", now, action, page_path, a),
@@ -1959,7 +1906,7 @@ impl WikiStore {
         use std::io::Write;
         verify()?;
         crate::wiki_path::check_wiki_control_files(&self.wiki_dir).map_err(|e| e.to_string())?;
-        let mut f = crate::wiki_path::open_control_file_nofollow(&log_path, true)
+        let mut f = crate::wiki_path::open_control_file_nofollow(&self.wiki_dir, "_log.md", true)
             .map_err(|e| format!("open log: {e}"))?;
         fs_lock(&f).map_err(|e| format!("lock log: {e}"))?;
         let masked = duduclaw_security::credential_detect::mask(&entry);
@@ -2011,7 +1958,7 @@ impl WikiStore {
 
         let is_new = std::fs::symlink_metadata(&full).is_err();
 
-        crate::wiki_path::atomic_write_nofollow_checked(&full, content, || {
+        crate::wiki_path::atomic_write_resolved_checked(&target, content, || {
             crate::wiki_path::check_wiki_control_files(&self.wiki_dir)?;
             verify().map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))
         })

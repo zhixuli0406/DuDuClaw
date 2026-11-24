@@ -169,7 +169,7 @@ const GROUNDING_SEARCH_OVERFETCH: usize = 5;
 ///    can always write there — it can never be trusted as independent
 ///    evidence about itself.
 /// 2. **The shared wiki is filtered to declared protected namespaces**:
-///    `read_only`, `operator_only`, or `agent_allowlist`. The shared core
+///    `read_only` or `operator_only`. The shared core
 ///    loader validates the root policy; this reader does not grant writes.
 ///
 /// Missing policy has no declared protected sources. Unreadable, linked or
@@ -214,7 +214,7 @@ pub fn simulation_grounding_snippets(
         .collect()
 }
 
-/// The set of top-level shared-wiki namespaces locked to `agent_allowlist`, `read_only` or
+/// The set of top-level shared-wiki namespaces locked to `read_only` or
 /// `operator_only`. Missing means no declared protection. A load error is
 /// indeterminate protection and denies all grounding retrieval.
 ///
@@ -236,7 +236,7 @@ pub(super) fn protected_wiki_namespaces(home_dir: &Path) -> Result<std::collecti
             entry
                 .get("mode")
                 .and_then(|m| m.as_str())
-                .is_some_and(|m| matches!(m, "read_only" | "operator_only" | "agent_allowlist"))
+                .is_some_and(|m| matches!(m, "read_only" | "operator_only"))
         })
         .map(|(name, _)| name.clone())
         .collect())

@@ -29,6 +29,11 @@ impl ScopePolicy {
                         return Err(ScopePolicyError(format!("{name}.{field}: expected string")));
                     }
                 }
+                if let Some(owner) = entry.get("knowledge_owner").and_then(|v| v.as_str()) {
+                    if !matches!(owner, "memory" | "wiki") {
+                        return Err(ScopePolicyError(format!("{name}: unknown knowledge_owner")));
+                    }
+                }
                 for field in ["agents", "visible_to_departments"] {
                     if let Some(value) = entry.get(field) {
                         if !value.as_array().is_some_and(|a| a.iter().all(|v| v.is_str())) {
@@ -82,6 +87,16 @@ pub fn load(path: &Path) -> Result<ScopePolicy, ScopePolicyError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_knowledge_owner_denies_the_whole_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".scope.toml");
+        for owner in ["memory", "wiki", "unknown", "Wiki", ""] {
+            std::fs::write(&path, format!("[namespaces.notes]\nknowledge_owner = '{owner}'")).unwrap();
+            assert_eq!(load(&path).is_ok(), matches!(owner, "memory" | "wiki"));
+        }
+    }
 
     #[test]
     fn rm209_size_types_and_namespace_aliases() {

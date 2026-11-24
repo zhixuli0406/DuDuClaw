@@ -10,9 +10,8 @@ pub(crate) fn resolve_shared_wiki_dir(home_dir: &Path) -> std::path::PathBuf {
 pub(crate) fn ensure_shared_wiki_dir(wiki_dir: &Path) -> std::result::Result<(), String> {
     let subdirs = ["entities", "concepts", "sources", "synthesis"];
     for sub in &subdirs {
-        let p = wiki_dir.join(sub);
         verify_before_io().map_err(|e| e.to_string())?;
-        std::fs::create_dir_all(&p).map_err(|e| format!("create dir {}: {e}", p.display()))?;
+        duduclaw_memory::wiki_path::create_wiki_directory(wiki_dir, sub).map_err(|e| format!("create dir {sub}: {e}"))?;
     }
     // Scaffold reserved files
     let scaffold: &[(&str, &str)] = &[
@@ -30,12 +29,8 @@ pub(crate) fn ensure_shared_wiki_dir(wiki_dir: &Path) -> std::result::Result<(),
         ),
     ];
     for (name, content) in scaffold {
-        let path = wiki_dir.join(name);
         verify_before_io().map_err(|e| e.to_string())?;
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
+        match duduclaw_memory::wiki_path::create_wiki_control_file(wiki_dir, name)
         {
             Ok(mut f) => {
                 use std::io::Write;

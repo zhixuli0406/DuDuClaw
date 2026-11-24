@@ -494,6 +494,22 @@ impl WikiTrustStore {
         self.db_path.as_deref().and_then(Path::parent)
     }
 
+    /// Persistent writes bind to a real, unambiguous page. In-memory stores
+    /// have no filesystem and retain portable ids for isolated consumers.
+    fn resolved_page_id(&self, page_path: &str, agent_id: &str) -> Result<String> {
+        let id = crate::wiki_path::persisted_page_id(page_path)
+            .ok_or_else(|| DuDuClawError::Memory("invalid trust page id".into()))?;
+        let Some(home) = self.trust_home() else { return Ok(id); };
+        if !duduclaw_core::is_valid_agent_id(agent_id) {
+            return Err(DuDuClawError::Memory("invalid trust agent id".into()));
+        }
+        let wiki = home.join("agents").join(agent_id).join("wiki");
+        let page = crate::wiki_path::resolve_wiki_page(&wiki, &id, false)
+            .map_err(|e| DuDuClawError::Memory(format!("trust page refused: {e}")))?;
+        if !page.exists { return Err(DuDuClawError::Memory("trust page does not exist".into())); }
+        Ok(page.id)
+    }
+
     /// Fence for the Wiki root that owns `agent_id`'s trust rows.
     ///
     /// An id that cannot name a directory falls back to the home fence: that
@@ -856,9 +872,28 @@ impl WikiTrustStore {
         agent_id: &str,
         page_paths: &[String],
     ) -> Result<std::collections::HashMap<String, WikiTrustSnapshot>> {
-        let wanted: std::collections::HashSet<String> = page_paths.iter()
-            .filter_map(|path| crate::wiki_path::persisted_page_id(path)).collect();
+        let mut wanted: std::collections::HashMap<String, Vec<String>> = Default::default();
         let mut out: std::collections::HashMap<String, WikiTrustSnapshot> = Default::default();
+        for path in page_paths {
+            let key = crate::wiki_path::persisted_page_id(path).unwrap_or_else(|| path.clone());
+            match self.resolved_page_id(path, agent_id) {
+                Ok(resolved) => {
+                    let folded = crate::wiki_path::folded_page_id(&resolved)
+                        .ok_or_else(|| DuDuClawError::Memory("invalid resolved trust id".into()))?;
+                    wanted.entry(folded).or_default().push(key);
+                }
+                Err(_) => {
+                    // Callers may fall back to frontmatter on database errors.
+                    // Return an explicit quarantine for unresolved identities.
+                    out.insert(key.clone(), WikiTrustSnapshot {
+                        page_path: key, agent_id: agent_id.to_string(), trust: 0.0,
+                        citation_count: 0, error_signal_count: 0, success_signal_count: 0,
+                        last_signal_at: None, last_verified: None, do_not_inject: true,
+                        locked: true, updated_at: Utc::now(),
+                    });
+                }
+            }
+        }
         if wanted.is_empty() { return Ok(out); }
         let conn = self.conn.lock()
             .map_err(|_| DuDuClawError::Memory("trust db poisoned".into()))?;
@@ -871,19 +906,22 @@ impl WikiTrustStore {
             .map_err(|e| DuDuClawError::Memory(format!("trust get_many: {e}")))?;
         for row in rows {
             let mut snapshot = row.map_err(|e| DuDuClawError::Memory(format!("trust row: {e}")))?;
-            let Some(key) = crate::wiki_path::persisted_page_id(&snapshot.page_path) else { continue; };
-            if !wanted.contains(&key) { continue; }
-            snapshot.page_path = key.clone();
+            let Some(folded) = crate::wiki_path::folded_page_id(&snapshot.page_path) else { continue; };
+            let Some(keys) = wanted.get(&folded) else { continue; };
             if !snapshot.trust.is_finite() {
                 snapshot.trust = 0.0;
                 snapshot.do_not_inject = true;
             }
-            if let Some(previous) = out.get_mut(&key) {
-                previous.trust = previous.trust.min(snapshot.trust);
-                previous.do_not_inject |= snapshot.do_not_inject;
-                previous.locked |= snapshot.locked;
-            } else {
-                out.insert(key, snapshot);
+            for key in keys {
+                if let Some(previous) = out.get_mut(key) {
+                    previous.trust = previous.trust.min(snapshot.trust);
+                    previous.do_not_inject |= snapshot.do_not_inject;
+                    previous.locked |= snapshot.locked;
+                } else {
+                    let mut snapshot = snapshot.clone();
+                    snapshot.page_path = key.clone();
+                    out.insert(key.clone(), snapshot);
+                }
             }
         }
         Ok(out)
@@ -895,6 +933,8 @@ impl WikiTrustStore {
     /// Used at retrieval time to track exposure independently of feedback.
     pub fn record_citation(&self, page_path: &str, agent_id: &str) -> Result<()> {
         let _fence = self.page_mutation_guard(agent_id)?;
+        let resolved = self.resolved_page_id(page_path, agent_id)?;
+        let page_path = resolved.as_str();
         let conn = self
             .conn
             .lock()
@@ -968,6 +1008,8 @@ impl WikiTrustStore {
         conversation_id: Option<&str>,
         composite_error: Option<f64>,
     ) -> Result<UpsertResult> {
+        let resolved = self.resolved_page_id(page_path, agent_id)?;
+        let page_path = resolved.as_str();
         debug_assert!(signal.is_actionable(), "caller must filter Neutral");
 
         let default_trust = self.config.default_trust;
@@ -1225,6 +1267,8 @@ impl WikiTrustStore {
         fence_wait: std::time::Duration,
     ) -> Result<TrustUpdateOutcome> {
         let _fence = self.page_mutation_guard_with_wait(agent_id, fence_wait)?;
+        let resolved = self.resolved_page_id(page_path, agent_id)?;
+        let page_path = resolved.as_str();
         let mut conn = self
             .conn
             .lock()
@@ -1342,6 +1386,8 @@ impl WikiTrustStore {
     /// Mark `last_verified = now` — called after a successful audit / GVU pass.
     pub fn mark_verified(&self, page_path: &str, agent_id: &str) -> Result<()> {
         let _fence = self.page_mutation_guard(agent_id)?;
+        let resolved = self.resolved_page_id(page_path, agent_id)?;
+        let page_path = resolved.as_str();
         let conn = self
             .conn
             .lock()
@@ -1596,6 +1642,8 @@ impl WikiTrustStore {
         recent_negative_count: u32,
     ) -> Result<()> {
         let _fence = self.page_mutation_guard(agent_id)?;
+        let resolved = self.resolved_page_id(page_path, agent_id)?;
+        let page_path = resolved.as_str();
         // (review HIGH R4 BUG-1) Wrap both writes in a single transaction so
         // a process crash between them can't leave `last_correction_at` set
         // (cooldown active) without a corresponding history row (audit
@@ -1949,6 +1997,7 @@ impl WikiTrustStore {
                 );
                 continue;
             }
+            let resolved = self.resolved_page_id(&u.page_path, &u.agent_id)?;
             // Trust must be in [0, 1] — a malicious peer could push 1e308.
             let incoming_trust = u.trust.clamp(0.0, 1.0);
 
@@ -1957,7 +2006,7 @@ impl WikiTrustStore {
                     "SELECT trust, do_not_inject, locked, updated_at
                      FROM wiki_trust_state
                      WHERE page_path = ?1 AND agent_id = ?2",
-                    params![u.page_path, u.agent_id],
+                    params![resolved, u.agent_id],
                     |r| {
                         Ok((
                             r.get::<_, f64>(0)? as f32,
@@ -2003,7 +2052,7 @@ impl WikiTrustStore {
                        trust = excluded.trust,
                        do_not_inject = excluded.do_not_inject,
                        updated_at = datetime('now')",
-                params![u.page_path, u.agent_id, new_trust as f64, new_dni as i64],
+                params![resolved, u.agent_id, new_trust as f64, new_dni as i64],
             )
             .map_err(|e| DuDuClawError::Memory(format!("import upsert: {e}")))?;
 
@@ -2013,7 +2062,7 @@ impl WikiTrustStore {
                     applied_delta, trigger, conversation_id, composite_error, signal_kind
                  ) VALUES (?1, ?2, ?3, ?4, ?5, 'federated_import', NULL, NULL, 'federated')",
                 params![
-                    u.page_path,
+                    resolved,
                     u.agent_id,
                     local_trust_before as f64, // local's value BEFORE blend
                     new_trust as f64,
@@ -2564,13 +2613,65 @@ mod tests {
     #[test]
     fn legacy_page_aliases_keep_the_most_restrictive_trust() {
         let s = store();
-        s.manual_set(r"auto\sop\x.md", "agnes", 0.05, true, Some(true), None).unwrap();
+        s.with_conn_mut(|conn| {
+            conn.execute("INSERT INTO wiki_trust_state(page_path,agent_id,trust,locked,do_not_inject) VALUES (?1,'agnes',0.05,1,1)", [r"auto\sop\x.md"]).unwrap();
+            Ok(())
+        }).unwrap();
         s.manual_set("auto/sop/x.md", "agnes", 0.9, false, Some(false), None).unwrap();
         let snapshot = s.get("auto/sop/x.md", "agnes").unwrap().unwrap();
         assert!(snapshot.do_not_inject && snapshot.locked);
         assert!(snapshot.trust < 0.1);
         let map = s.get_many("agnes", &[r"auto\sop\x.md".into()]).unwrap();
         assert!(map["auto/sop/x.md"].do_not_inject);
+    }
+
+    #[test]
+    fn persistent_trust_writes_disk_ids_and_merges_legacy_folded_rows() {
+        let home = tempfile::tempdir().unwrap();
+        let wiki = home.path().join("agents/agnes/wiki");
+        std::fs::create_dir_all(wiki.join("notes")).unwrap();
+        std::fs::write(wiki.join("notes/Café.md"), "body").unwrap();
+        let disk_id = crate::wiki_path::resolve_wiki_page(&wiki, "notes/Café.md", false).unwrap().id;
+        let s = WikiTrustStore::open(home.path().join("wiki_trust.db")).unwrap();
+        for alias in ["notes/café.md", "NOTES/cafe\u{301}.md", "notes/Ca\u{200d}fé.md", r"notes\Café.md"] {
+            s.manual_set(alias, "agnes", 0.9, false, Some(false), None).unwrap();
+            s.with_conn_mut(|conn| {
+                let rows: i64 = conn.query_row("SELECT COUNT(*) FROM wiki_trust_state", [], |r| r.get(0)).unwrap();
+                let stored: String = conn.query_row("SELECT page_path FROM wiki_trust_state", [], |r| r.get(0)).unwrap();
+                assert_eq!(rows, 1);
+                assert_eq!(stored, disk_id);
+                Ok(())
+            }).unwrap();
+        }
+        for alias in ["notes/café.md", "NOTES/cafe\u{301}.md", "notes/Ca\u{200d}fé.md", "notes/Café.md. ", r"notes\Café.md"] {
+            s.with_conn_mut(|conn| {
+                conn.execute("INSERT OR REPLACE INTO wiki_trust_state(page_path,agent_id,trust,do_not_inject) VALUES (?1,'agnes',0.05,1)", [alias]).unwrap();
+                Ok(())
+            }).unwrap();
+            let snapshot = s.get("notes/Café.md", "agnes").unwrap().unwrap();
+            assert!(snapshot.do_not_inject);
+            assert!(snapshot.trust < 0.1);
+        }
+        assert!(s.manual_set("notes/missing.md", "agnes", 1.0, false, None, None).is_err());
+        assert!(s.get("notes/missing.md", "agnes").unwrap().unwrap().do_not_inject);
+        std::fs::remove_file(wiki.join(&disk_id)).unwrap();
+        assert!(s.get("notes/Café.md", "agnes").unwrap().unwrap().do_not_inject);
+    }
+
+    #[test]
+    fn ambiguous_disk_names_withhold_trust_and_refuse_writes() {
+        let home = tempfile::tempdir().unwrap();
+        let wiki = home.path().join("agents/agnes/wiki");
+        std::fs::create_dir_all(&wiki).unwrap();
+        std::fs::write(wiki.join("Bad.md"), "first").unwrap();
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(wiki.join("bad.md")) {
+            Ok(_) => {},
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return,
+            Err(e) => panic!("fixture: {e}"),
+        }
+        let s = WikiTrustStore::open(home.path().join("wiki_trust.db")).unwrap();
+        assert!(s.manual_set("Bad.md", "agnes", 1.0, false, None, None).is_err());
+        assert!(s.get("Bad.md", "agnes").unwrap().unwrap().do_not_inject);
     }
 
     #[test]

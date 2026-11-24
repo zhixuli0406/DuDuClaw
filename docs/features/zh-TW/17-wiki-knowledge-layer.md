@@ -410,3 +410,5 @@ you need historical context or deep references.
 只有知識庫根目錄的 `.scope.toml` 會生效。檔案不存在時維持原本預設；無法讀取、檔案為連結、超過 64 KB、TOML 格式錯誤或欄位型別不正確時，會停止相關寫入、AI 讀取與注入，以及儀表板讀取與匯出。儀表板政策編輯器支援 `agent_allowlist` 與 `agents` 清單。升級前可執行 `duduclaw doctor` 或儀表板系統檢查，找出政策錯誤；檢查也會提醒子資料夾中的 `.scope.toml` 不會生效。請修好根目錄政策後再重試。
 
 列表、搜尋、注入與匯出共用深度上限為 20 的掃描器，略過第一層 `_archive`（含等價寫法）、保留檔與內部連結，並拒絕以連結作為起點。無效或有歧義的頁面 ID 會略過，數量記入掃描與匯出紀錄。兩條寫入路徑都拒絕連結形式的 `_index.md`、`_log.md`、`_index.lock` 與 `.scope.toml`，包括斷掉的連結。
+
+信任設定寫入時保存磁碟上的實際頁面 ID；讀取時合併舊有的分隔符號、大小寫、Unicode、不可見字元及結尾點號／空白別名，採最低信任值，並保留任何 `do_not_inject` 標記。無法解析或有歧義的頁面不會提供內容。頁面與控制檔讀寫拒絕路徑中的符號連結及 junction，包括指向知識庫內部的目錄連結。每個目錄最多 10,000 筆，超過即拒絕解析或掃描；掃描器對每個目錄只列舉一次。`knowledge_owner` 只接受 `memory` 或 `wiki`，其他值會使整份政策載入失敗。ActionGuard 核准模擬只採用 `read_only`、`operator_only` 命名空間；`agent_allowlist` 仍可由員工寫入，因此不作為判斷依據。
