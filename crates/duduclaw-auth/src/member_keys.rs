@@ -5,7 +5,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use password_hash::rand_core::{OsRng, RngCore};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
@@ -22,9 +22,11 @@ pub const MEMBER_KEY_NAME_MAX_CHARS: usize = 60;
 const SECRET_BYTES: usize = 32;
 /// `base64url(32 bytes)` without padding.
 const SECRET_CHARS: usize = 43;
-/// Revoked rows kept per account for the history list; older ones are pruned
-/// when a new credential is created, so the table cannot grow without bound.
-const REVOKED_KEPT_PER_USER: i64 = 20;
+/// Total retained rows, including revoked credentials.
+pub const MAX_MEMBER_KEY_ROWS: i64 = 50;
+pub const MEMBER_KEY_RETENTION_DAYS: i64 = 90;
+const CREATE_METHOD: &str = "me.member_keys.create";
+const REAUTH_TTL_SECS: i64 = 300;
 /// Width of one endpoint-audit aggregation window.
 pub const MEMBER_AUDIT_WINDOW_SECS: i64 = 600;
 /// Endpoint audit-log rows and aggregates older than this are pruned.
@@ -57,7 +59,17 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
     )
     .map_err(|e| format!("member_key_audit_agg migration failed: {e}"))?;
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS member_api_keys (
+        "CREATE TABLE IF NOT EXISTS member_key_create_proofs (
+            token_hash TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            session TEXT NOT NULL,
+            credential_epoch INTEGER NOT NULL,
+            password_hash TEXT NOT NULL,
+            method TEXT NOT NULL,
+            issued_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS member_api_keys (
             id TEXT PRIMARY KEY,
             user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             name TEXT NOT NULL,
@@ -176,6 +188,9 @@ pub enum MemberKeyError {
     InvalidExpiry,
     AdminForbidden,
     LimitReached,
+    HistoryLimitReached,
+    InvalidPage,
+    ReauthenticationRequired,
     AccountInactive,
     NotFound,
     Store,
@@ -189,6 +204,9 @@ impl MemberKeyError {
             Self::AdminForbidden => "member_key_admin_forbidden",
             Self::InvalidName => "member_key_invalid_name",
             Self::LimitReached => "member_key_limit_reached",
+            Self::HistoryLimitReached => "member_key_history_limit_reached",
+            Self::InvalidPage => "member_key_invalid_page",
+            Self::ReauthenticationRequired => "member_key_step_up_required",
             Self::AccountInactive => "member_key_account_inactive",
             Self::NotFound => "member_key_not_found",
             Self::Store => "member_key_unavailable",
@@ -279,7 +297,93 @@ fn prune_member_audit(conn: &Connection, now: DateTime<Utc>, batch: i64) -> rusq
     Ok(aggregates + rows)
 }
 
+/// Bounded keyset page. The cursor contains only public ordering metadata.
+#[derive(Debug, Serialize)]
+pub struct MemberKeyPage<T> {
+    pub keys: Vec<T>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct KeyCursor { created_at: String, id: String }
+fn page_cursor(limit: u32, cursor: Option<&str>) -> Result<Option<KeyCursor>, MemberKeyError> {
+    if !(1..=100).contains(&limit) { return Err(MemberKeyError::InvalidPage); }
+    cursor.map(|raw| {
+        if raw.len() > 512 { return Err(MemberKeyError::InvalidPage); }
+        let bytes = URL_SAFE_NO_PAD.decode(raw).map_err(|_| MemberKeyError::InvalidPage)?;
+        let value: KeyCursor = serde_json::from_slice(&bytes).map_err(|_| MemberKeyError::InvalidPage)?;
+        if DateTime::parse_from_rfc3339(&value.created_at).is_err() || Uuid::parse_str(&value.id).is_err() {
+            return Err(MemberKeyError::InvalidPage);
+        }
+        Ok(value)
+    }).transpose()
+}
+fn next_cursor(info: &MemberKeyInfo) -> Result<String, MemberKeyError> {
+    serde_json::to_vec(&KeyCursor { created_at: info.created_at.clone(), id: info.id.clone() })
+        .map(|bytes| URL_SAFE_NO_PAD.encode(bytes)).map_err(store_error)
+}
+
 impl UserDb {
+    /// Fresh proof for exactly one create. Never returned over the RPC wire.
+    /// The gateway must charge the transport peer's existing login rate limit first.
+    pub fn member_key_reauthenticate(
+        &self, user: &str, session: &str, epoch: u64, password: &str, code: &str,
+        cipher: &dyn crate::mfa::MfaCipher, now: i64,
+    ) -> Result<String, MemberKeyError> {
+        let denied = MemberKeyError::ReauthenticationRequired;
+        if Uuid::parse_str(session).is_err() { return Err(denied); }
+        let account = self.get_user(user).map_err(store_error)?.ok_or(denied)?;
+        if account.credential_epoch != epoch { return Err(denied); }
+        let snapshot: String = self.conn().query_row("SELECT password_hash FROM users WHERE id=?1", [user], |r| r.get(0))
+            .map_err(store_error)?;
+        let mfa = self.mfa_active(user).map_err(store_error)?;
+        if mfa {
+            self.mfa_step_up_verify(user, code, cipher, now).map_err(|_| denied)?;
+        } else {
+            let verified = self.verify_password(&account.email, password).map_err(|_| denied)?;
+            if password.is_empty() || verified.id != user || verified.credential_epoch != epoch { return Err(denied); }
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(store_error)?;
+        let current: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM users WHERE id=?1 AND credential_epoch=?2
+            AND password_hash=?3 AND status='active' AND must_change_password=0 AND role IN ('employee','manager'))",
+            params![user, epoch, snapshot], |r| r.get(0)).map_err(store_error)?;
+        if !current || crate::mfa::any_factor(&tx, user).map_err(store_error)? != mfa
+            || !crate::remembered_sessions::session_valid(&tx, Some(session), user, now).map_err(store_error)? {
+            return Err(denied);
+        }
+        // At most one pending proof per account, even if issuance is interrupted.
+        tx.execute("DELETE FROM member_key_create_proofs WHERE user_id=?1 OR expires_at<=?2", params![user, now]).map_err(store_error)?;
+        let proof = Uuid::new_v4().to_string();
+        tx.execute("INSERT INTO member_key_create_proofs VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![digest(&proof), user, session, epoch, snapshot, CREATE_METHOD, now, now + REAUTH_TTL_SECS]).map_err(store_error)?;
+        tx.commit().map_err(store_error)?;
+        Ok(proof)
+    }
+
+    /// Consume before creation (including failed creation); a proof cannot be replayed.
+    pub fn member_key_create_authenticated(
+        &self, user: &str, name: &str, days: u64, epoch: u64, session: &str, proof: &str,
+    ) -> Result<CreatedMemberKey, MemberKeyError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(store_error)?;
+        let now = Utc::now().timestamp();
+        let snapshot: Option<String> = tx.query_row("SELECT password_hash FROM member_key_create_proofs
+            WHERE token_hash=?1 AND user_id=?2 AND session=?3 AND credential_epoch=?4 AND method=?5
+            AND issued_at<=?6 AND expires_at>?6 AND expires_at-issued_at<=?7",
+            params![digest(proof), user, session, epoch, CREATE_METHOD, now, REAUTH_TTL_SECS], |r| r.get(0))
+            .optional().map_err(store_error)?;
+        if snapshot.is_some() {
+            tx.execute("DELETE FROM member_key_create_proofs WHERE token_hash=?1", [digest(proof)]).map_err(store_error)?;
+        }
+        let valid = crate::remembered_sessions::session_valid(&tx, Some(session), user, now).map_err(store_error)?;
+        tx.commit().map_err(store_error)?;
+        drop(conn);
+        // The password snapshot also closes the legacy epoch-zero first-key race.
+        let snapshot = snapshot.filter(|_| valid).ok_or(MemberKeyError::ReauthenticationRequired)?;
+        self.member_key_create_in_session(user, name, days, epoch, Some((session, &snapshot)))
+    }
+
     /// Issue a credential for `user_id` (who must be an active account not
     /// awaiting a password change). At most [`MAX_ACTIVE_MEMBER_KEYS`]
     /// unrevoked credentials per account. The secret is returned once and
@@ -290,6 +394,12 @@ impl UserDb {
         name: &str,
         expires_in_days: u64,
         verified_epoch: u64,
+    ) -> Result<CreatedMemberKey, MemberKeyError> {
+        self.member_key_create_in_session(user_id, name, expires_in_days, verified_epoch, None)
+    }
+
+    fn member_key_create_in_session(
+        &self, user_id: &str, name: &str, expires_in_days: u64, verified_epoch: u64, proof_binding: Option<(&str, &str)>,
     ) -> Result<CreatedMemberKey, MemberKeyError> {
         if !(1..=365).contains(&expires_in_days) { return Err(MemberKeyError::InvalidExpiry); }
         let name = clean_name(name)?;
@@ -314,33 +424,34 @@ impl UserDb {
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM users
                    WHERE id = ?1 AND status = 'active' AND must_change_password = 0
-                     AND role IN ('employee','manager') AND credential_epoch = ?2)",
-                params![user_id, verified_epoch],
+                     AND role IN ('employee','manager') AND credential_epoch = ?2
+                     AND (?3 IS NULL OR password_hash = ?3))",
+                params![user_id, verified_epoch, proof_binding.map(|(_, hash)| hash)],
                 |r| r.get(0),
             )
             .map_err(store_error)?;
-        if !active {
+        if !active || !crate::remembered_sessions::session_valid(&tx, proof_binding.map(|(session, _)| session), user_id, Utc::now().timestamp()).map_err(store_error)? {
             return Err(MemberKeyError::AccountInactive);
         }
-        let count: i64 = tx
-            .query_row(
-                "SELECT COUNT(*) FROM member_api_keys WHERE user_id = ?1 AND revoked_at IS NULL
-                   AND julianday(expires_at) > julianday('now') AND credential_epoch = ?2",
-                params![user_id, verified_epoch],
-                |r| r.get(0),
-            )
-            .map_err(store_error)?;
-        if count >= MAX_ACTIVE_MEMBER_KEYS {
-            return Err(MemberKeyError::LimitReached);
-        }
         tx.execute(
-            "DELETE FROM member_api_keys WHERE user_id = ?1 AND revoked_at IS NOT NULL
-               AND id NOT IN (SELECT id FROM member_api_keys
-                               WHERE user_id = ?1 AND revoked_at IS NOT NULL
-                               ORDER BY revoked_at DESC LIMIT ?2)",
-            params![user_id, REVOKED_KEPT_PER_USER],
-        )
-        .map_err(store_error)?;
+            "UPDATE member_api_keys SET revoked_at=?3 WHERE user_id=?1 AND revoked_at IS NULL
+             AND (credential_epoch!=?2 OR julianday(expires_at)<=julianday(?3) OR julianday(expires_at) IS NULL)",
+            params![user_id, verified_epoch, now],
+        ).map_err(store_error)?;
+        tx.execute(
+            "DELETE FROM member_api_keys WHERE user_id=?1 AND revoked_at IS NOT NULL
+             AND julianday(revoked_at)<julianday(?2)-?3",
+            params![user_id, now, MEMBER_KEY_RETENTION_DAYS],
+        ).map_err(store_error)?;
+        let (active_count, total): (i64, i64) = tx.query_row(
+            "SELECT COUNT(CASE WHEN revoked_at IS NULL THEN 1 END), COUNT(*) FROM member_api_keys WHERE user_id=?1",
+            [user_id], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).map_err(store_error)?;
+        if active_count >= MAX_ACTIVE_MEMBER_KEYS || total >= MAX_MEMBER_KEY_ROWS {
+            // Keep maintenance even when the creation cap refuses the new row.
+            tx.commit().map_err(store_error)?;
+            return Err(if total >= MAX_MEMBER_KEY_ROWS { MemberKeyError::HistoryLimitReached } else { MemberKeyError::LimitReached });
+        }
         tx.execute(
             "INSERT INTO member_api_keys(id, user_id, name, token_hash, created_at, expires_at, credential_epoch)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -370,45 +481,52 @@ impl UserDb {
         })
     }
 
-    /// The caller's own credentials, newest first.
-    pub fn member_api_keys_for_user(
-        &self,
-        user_id: &str,
-    ) -> Result<Vec<MemberKeyInfo>, MemberKeyError> {
-        let conn = self.conn();
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT {INFO_COLUMNS} FROM member_api_keys t
-                  WHERE t.user_id = ?1 ORDER BY t.created_at DESC, t.id"
-            ))
-            .map_err(store_error)?;
-        let rows = stmt.query_map([user_id], info_from_row).map_err(store_error)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(store_error)
+    /// Bounded compatibility helper for internal callers.
+    pub fn member_api_keys_for_user(&self, user_id: &str) -> Result<Vec<MemberKeyInfo>, MemberKeyError> {
+        Ok(self.member_api_keys_for_user_page(user_id, 50, None)?.keys)
     }
 
-    /// Every credential with its owner, for the Admin overview.
+    /// The caller's own credentials, newest first, with stable keyset pagination.
+    pub fn member_api_keys_for_user_page(&self, user_id: &str, limit: u32, cursor: Option<&str>) -> Result<MemberKeyPage<MemberKeyInfo>, MemberKeyError> {
+        let cursor = page_cursor(limit, cursor)?;
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {INFO_COLUMNS} FROM member_api_keys t WHERE t.user_id=?1
+             AND (?2 IS NULL OR t.created_at<?2 OR (t.created_at=?2 AND t.id>?3))
+             ORDER BY t.created_at DESC, t.id LIMIT ?4"
+        )).map_err(store_error)?;
+        let mut keys = stmt.query_map(params![user_id, cursor.as_ref().map(|c| &c.created_at), cursor.as_ref().map(|c| &c.id), limit + 1], info_from_row)
+            .map_err(store_error)?.collect::<Result<Vec<_>, _>>().map_err(store_error)?;
+        let more = keys.len() > limit as usize;
+        keys.truncate(limit as usize);
+        let next_cursor = if more { keys.last().map(next_cursor).transpose()? } else { None };
+        Ok(MemberKeyPage { keys, next_cursor })
+    }
+
+    /// Bounded compatibility helper for internal callers.
     pub fn member_api_keys_all(&self, admin_id: &str) -> Result<Vec<MemberKeyAdminEntry>, MemberKeyError> {
+        Ok(self.member_api_keys_all_page(admin_id, 50, None)?.keys)
+    }
+
+    pub fn member_api_keys_all_page(&self, admin_id: &str, limit: u32, cursor: Option<&str>) -> Result<MemberKeyPage<MemberKeyAdminEntry>, MemberKeyError> {
+        let cursor = page_cursor(limit, cursor)?;
         let mut conn = self.conn();
         let conn = conn.transaction().map_err(store_error)?;
         require_admin(&conn, admin_id)?;
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT {INFO_COLUMNS}, t.user_id, u.email, u.display_name
-                   FROM member_api_keys t LEFT JOIN users u ON u.id = t.user_id
-                  ORDER BY t.created_at DESC, t.id"
-            ))
-            .map_err(store_error)?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok(MemberKeyAdminEntry {
-                    token: info_from_row(row)?,
-                    user_id: row.get(7)?,
-                    user_email: row.get(8)?,
-                    user_display_name: row.get(9)?,
-                })
-            })
-            .map_err(store_error)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(store_error)
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {INFO_COLUMNS}, t.user_id, u.email, u.display_name
+             FROM member_api_keys t LEFT JOIN users u ON u.id=t.user_id
+             WHERE (?1 IS NULL OR t.created_at<?1 OR (t.created_at=?1 AND t.id>?2))
+             ORDER BY t.created_at DESC, t.id LIMIT ?3"
+        )).map_err(store_error)?;
+        let mut keys = stmt.query_map(params![cursor.as_ref().map(|c| &c.created_at), cursor.as_ref().map(|c| &c.id), limit + 1], |row| {
+            Ok(MemberKeyAdminEntry { token: info_from_row(row)?, user_id: row.get(7)?,
+                user_email: row.get(8)?, user_display_name: row.get(9)? })
+        }).map_err(store_error)?.collect::<Result<Vec<_>, _>>().map_err(store_error)?;
+        let more = keys.len() > limit as usize;
+        keys.truncate(limit as usize);
+        let next_cursor = if more { keys.last().map(|key| next_cursor(&key.token)).transpose()? } else { None };
+        Ok(MemberKeyPage { keys, next_cursor })
     }
 
     /// Revoke one of `user_id`'s own credentials. Another account's
@@ -738,4 +856,125 @@ mod tests {
         drop(conn);
         assert_eq!(db.member_api_keys_for_user(&user.id).unwrap()[0].last_used_at, Some(now.to_rfc3339()));
     }
+    struct Cipher;
+    impl crate::mfa::MfaCipher for Cipher {
+        fn encrypt(&self, value: &str) -> Result<String, String> { Ok(value.to_owned()) }
+        fn decrypt(&self, value: &str) -> Result<String, String> { Ok(value.to_owned()) }
+    }
+
+    #[test]
+    fn create_proof_requires_password_and_is_bound_single_use_and_short_lived() {
+        let (_home, db, user) = fixture();
+        let session = Uuid::new_v4().to_string();
+        let other_session = Uuid::new_v4().to_string();
+        let now = Utc::now().timestamp();
+        for password in ["", "wrong"] {
+            assert_eq!(db.member_key_reauthenticate(&user.id, &session, 0, password, "", &Cipher, now).unwrap_err(), MemberKeyError::ReauthenticationRequired);
+        }
+        let proof = db.member_key_reauthenticate(&user.id, &session, 0, "test-password", "", &Cipher, now).unwrap();
+        for (owner, jti, epoch) in [("someone-else", session.as_str(), 0), (user.id.as_str(), other_session.as_str(), 0), (user.id.as_str(), session.as_str(), 1)] {
+            assert!(db.member_key_create_authenticated(owner, "x", 1, epoch, jti, &proof).is_err());
+        }
+        db.conn().execute("UPDATE member_key_create_proofs SET method='users.change_password'", []).unwrap();
+        assert!(db.member_key_create_authenticated(&user.id, "x", 1, 0, &session, &proof).is_err());
+        db.conn().execute("UPDATE member_key_create_proofs SET method=?1", [CREATE_METHOD]).unwrap();
+        db.member_key_create_authenticated(&user.id, "x", 1, 0, &session, &proof).unwrap();
+        assert_eq!(db.member_key_create_authenticated(&user.id, "replay", 1, 0, &session, &proof).unwrap_err(), MemberKeyError::ReauthenticationRequired);
+        let expired = db.member_key_reauthenticate(&user.id, &session, 0, "test-password", "", &Cipher, now - 300).unwrap();
+        assert!(db.member_key_create_authenticated(&user.id, "expired", 1, 0, &session, &expired).is_err());
+        let future = db.member_key_reauthenticate(&user.id, &session, 0, "test-password", "", &Cipher, now + 300).unwrap();
+        assert!(db.member_key_create_authenticated(&user.id, "future", 1, 0, &session, &future).is_err());
+        let stale = db.member_key_reauthenticate(&user.id, &session, 0, "test-password", "", &Cipher, now).unwrap();
+        db.mfa_operator_reset(&user.email).unwrap();
+        assert!(db.member_key_create_authenticated(&user.id, "stale", 1, 0, &session, &stale).is_err());
+        assert_eq!(db.member_api_keys_for_user(&user.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cleanup_revokes_expired_and_old_epochs_and_preserves_retention_at_total_cap() {
+        let (_home, db, user) = fixture();
+        let expired = db.member_key_create(&user.id, "expired", 1, 0).unwrap();
+        let old_epoch = db.member_key_create(&user.id, "old epoch", 1, 0).unwrap();
+        let old_revoked = db.member_key_create(&user.id, "old revoked", 1, 0).unwrap();
+        db.conn().execute("UPDATE member_api_keys SET expires_at='2000-01-01T00:00:00Z' WHERE id=?1", [&expired.info.id]).unwrap();
+        db.conn().execute("UPDATE member_api_keys SET credential_epoch=99 WHERE id=?1", [&old_epoch.info.id]).unwrap();
+        db.conn().execute("UPDATE member_api_keys SET revoked_at='2000-01-01T00:00:00Z' WHERE id=?1", [&old_revoked.info.id]).unwrap();
+        let current = db.member_key_create(&user.id, "current", 1, 0).unwrap();
+        let listed = db.member_api_keys_for_user(&user.id).unwrap();
+        assert!(!listed.iter().any(|key| key.id == old_revoked.info.id));
+        for id in [&expired.info.id, &old_epoch.info.id] {
+            assert!(listed.iter().find(|key| &key.id == id).unwrap().revoked_at.is_some());
+        }
+        db.member_key_revoke_own(&user.id, &current.info.id).unwrap();
+        for _ in listed.len()..MAX_MEMBER_KEY_ROWS as usize {
+            let key = db.member_key_create(&user.id, "history", 1, 0).unwrap();
+            db.member_key_revoke_own(&user.id, &key.info.id).unwrap();
+        }
+        assert_eq!(db.member_key_create(&user.id, "over cap", 1, 0).unwrap_err(), MemberKeyError::HistoryLimitReached);
+        assert_eq!(db.member_api_keys_for_user(&user.id).unwrap().len(), 50);
+        db.conn().execute("UPDATE member_api_keys SET revoked_at='2000-01-01T00:00:00Z' WHERE id=?1", [&current.info.id]).unwrap();
+        db.member_key_create(&user.id, "after retention", 1, 0).unwrap();
+        assert_eq!(db.member_api_keys_for_user(&user.id).unwrap().len(), 50);
+    }
+
+    #[test]
+    fn keyset_pages_have_no_gaps_for_equal_timestamps_and_isolate_owners() {
+        let (_home, db, user) = fixture();
+        let other = db.create_user("other@test.invalid", "Other", "test-password", UserRole::Employee).unwrap();
+        let admin = db.create_user("admin@test.invalid", "Admin", "test-password", UserRole::Admin).unwrap();
+        for owner in [&user.id, &other.id] {
+            for _ in 0..3 { db.member_key_create(owner, "x", 1, 0).unwrap(); }
+        }
+        db.conn().execute("UPDATE member_api_keys SET created_at='2026-01-01T00:00:00Z'", []).unwrap();
+        let first = db.member_api_keys_for_user_page(&user.id, 2, None).unwrap();
+        let second = db.member_api_keys_for_user_page(&user.id, 2, first.next_cursor.as_deref()).unwrap();
+        assert_eq!((first.keys.len(), second.keys.len()), (2, 1));
+        assert!(second.next_cursor.is_none());
+        assert!(!first.keys.iter().any(|key| key.id == second.keys[0].id));
+        // A deleted cursor row does not make subsequent pages fail or repeat.
+        db.conn().execute("DELETE FROM member_api_keys WHERE id=?1", [&first.keys[1].id]).unwrap();
+        assert_eq!(db.member_api_keys_for_user_page(&user.id, 2, first.next_cursor.as_deref()).unwrap().keys, second.keys);
+        let mut cursor = None;
+        let mut ids = std::collections::HashSet::new();
+        loop {
+            let page = db.member_api_keys_all_page(&admin.id, 2, cursor.as_deref()).unwrap();
+            for key in page.keys { assert!(ids.insert(key.token.id)); }
+            cursor = page.next_cursor;
+            if cursor.is_none() { break; }
+        }
+        assert_eq!(ids.len(), 5);
+        assert!(db.member_api_keys_all_page(&user.id, 2, None).is_err());
+        for limit in [0, 101, u32::MAX] { assert!(db.member_api_keys_for_user_page(&user.id, limit, None).is_err()); }
+        assert!(db.member_api_keys_for_user_page(&user.id, 2, Some("invalid")).is_err());
+    }
+
+    #[test]
+    fn mfa_create_requires_fresh_factor_and_consumes_factor_and_create_proof() {
+        let (_home, db, user) = fixture();
+        let (enrollment, secret) = crate::mfa::test_totp_prepare(&db, &user.id, "test-password", &Cipher);
+        db.mfa_confirm(&user.id, Some(&enrollment), &crate::mfa::test_totp_code(&secret, 100), &Cipher, 3000).unwrap();
+        let epoch = db.get_user(&user.id).unwrap().unwrap().credential_epoch;
+        let now = Utc::now().timestamp();
+        let session = Uuid::new_v4().to_string();
+        assert_eq!(db.member_key_reauthenticate(&user.id, &session, epoch, "test-password", "", &Cipher, now).unwrap_err(), MemberKeyError::ReauthenticationRequired);
+        let code = crate::mfa::test_totp_code(&secret, now / 30);
+        let proof = db.member_key_reauthenticate(&user.id, &session, epoch, "", &code, &Cipher, now).unwrap();
+        db.member_key_create_authenticated(&user.id, "mfa", 1, epoch, &session, &proof).unwrap();
+        assert!(db.member_key_create_authenticated(&user.id, "replay", 1, epoch, &session, &proof).is_err());
+        assert!(db.member_key_reauthenticate(&user.id, &session, epoch, "", &code, &Cipher, now).is_err());
+    }
+
+    #[test]
+    fn first_key_proof_is_invalid_after_password_change_even_at_legacy_epoch_zero() {
+        let (_home, db, user) = fixture();
+        let session = Uuid::new_v4().to_string();
+        let proof = db.member_key_reauthenticate(&user.id, &session, 0, "test-password", "", &Cipher, Utc::now().timestamp()).unwrap();
+        // There are no key rows yet, so the legacy password trigger may leave epoch zero.
+        db.conn().execute("UPDATE users SET password_hash='changed-test-hash' WHERE id=?1", [&user.id]).unwrap();
+        assert!(db.member_key_create_authenticated(&user.id, "stale password", 1, 0, &session, &proof).is_err());
+        assert!(db.member_api_keys_for_user(&user.id).unwrap().is_empty());
+        let remaining: i64 = db.conn().query_row("SELECT COUNT(*) FROM member_key_create_proofs", [], |r| r.get(0)).unwrap();
+        assert_eq!(remaining, 0);
+    }
+
 }

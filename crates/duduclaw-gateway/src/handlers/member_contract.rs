@@ -368,6 +368,55 @@ pub const MEMBER_CONTRACT_METHODS: &[MemberContractMethod] = &[
     },
 ];
 
+/// Reviewed non-secret leaf paths accepted by key-authenticated agents.update.
+/// Enumerated from agents_update and agents_update_v168. New fields, dotted
+/// aliases, arbitrary prompt/advanced_kv entries, credential sections and
+/// account references are closed until explicitly reviewed here.
+pub(crate) const MEMBER_KEY_AGENT_UPDATE_FIELDS: &[&str] = &[
+    "agent_id", "display_name", "role", "status", "trigger", "icon", "reports_to", "department",
+    "preferred", "fallback", "api_mode", "local_model", "prefer_local", "use_router",
+    "when_unavailable", "monthly_limit_cents", "warn_threshold_percent", "hard_stop",
+    "heartbeat_enabled", "heartbeat_interval", "heartbeat_cron", "heartbeat_max_concurrent_runs",
+    "heartbeat_cron_timezone", "can_create_agents", "can_send_cross_agent", "can_modify_own_skills",
+    "can_modify_own_soul", "can_schedule_tasks", "timeout_ms", "sandbox_enabled", "network_access",
+    "gvu_enabled", "skill_budget_unlimited", "max_active_skills", "max_silence_hours", "utility",
+    "reply_language", "memory_language", "memory.language", "memory.decision_continuity",
+    "memory.decision_ttl_days", "budget.daily_cap_cents", "model.effort", "fork.enabled",
+    "night_engine.enabled", "team.enabled", "runtime.minimal_context",
+    "guardrails.enabled", "guardrails.block_injection_echo", "guardrails.redact_pii",
+    "proactive.enabled", "proactive.quiet_hours_start", "proactive.quiet_hours_end",
+    "proactive.max_messages_per_hour", "proactive.notify_channel", "proactive.notify_chat_id",
+    "proactive.notify_thread_id", "proactive.quiet_hours", "proactive.base_threshold",
+    "proactive.max_per_hour", "proactive.timezone", "proactive.max_turns",
+    "research.self_study", "research.self_study_hour", "prompt.reply_language",
+];
+
+pub(crate) fn member_key_agent_update_params(params: &serde_json::Value) -> Result<(), String> {
+    fn visit(value: &serde_json::Value, prefix: &str) -> Result<(), String> {
+        let object = value.as_object().ok_or("Member keys require an agents.update parameter object")?;
+        for (field, value) in object {
+            // Do not normalize aliases: only the reviewed spelling is accepted.
+            let path = if prefix.is_empty() { field.clone() } else { format!("{prefix}.{field}") };
+            let nested = match path.as_str() {
+                "memory" | "budget" | "model" | "fork" | "night_engine" | "team" | "runtime"
+                | "guardrails" | "proactive" | "research" | "prompt" => true,
+                _ => false,
+            };
+            if field.chars().all(|c| c.is_ascii_lowercase() || c == '_') && nested {
+                visit(value, &path)?;
+            } else if field.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+                && MEMBER_KEY_AGENT_UPDATE_FIELDS.contains(&path.as_str())
+                && !value.is_object() && !value.is_array() {
+                continue;
+            } else {
+                return Err(format!("Member keys cannot update agents.update field '{path}'; use a browser session. No settings were written."));
+            }
+        }
+        Ok(())
+    }
+    visit(params, "")
+}
+
 /// Contract membership is necessary, never sufficient: existing ACL and
 /// private-data gates still apply. Credential/step-up namespaces stay closed.
 pub(crate) fn member_key_method(method: &str) -> Option<MemberContractKind> {
@@ -395,4 +444,17 @@ mod member_key_tests {
         assert_eq!(member_key_method("tasks.create"), Some(MemberContractKind::Write));
         assert_eq!(member_key_method("users.me"), Some(MemberContractKind::Read));
     }
+    #[test]
+    fn key_agent_update_allows_only_reviewed_leaf_paths() {
+        assert!(member_key_agent_update_params(&serde_json::json!({
+            "agent_id":"a", "display_name":"Example", "heartbeat_enabled":false,
+            "memory":{"language":"zh-TW", "decision_ttl_days":7}, "model":{"effort":"high"}
+        })).is_ok());
+        for params in [serde_json::json!([]), serde_json::json!({"display_name":{"token":"x"}}),
+            serde_json::json!({"proactive":[{"secret":"x"}]}), serde_json::json!({"memory.language":"en"}),
+            serde_json::json!({"runtime":{"future_key":"x"}}), serde_json::json!({"odoo":{}})] {
+            assert!(member_key_agent_update_params(&params).is_err(), "{params}");
+        }
+    }
+
 }

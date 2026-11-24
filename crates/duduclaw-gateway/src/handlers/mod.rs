@@ -736,7 +736,7 @@ impl MethodHandler {
         // RM-064 status credentials are gateway-owned bearer secrets. Route
         // before extension dispatch so no plugin sees a freshly issued one.
         if member_keys_rpc::owns(method) {
-            return boxed_frame(|| self.handle_member_keys_rpc(method, params, ctx)).await;
+            return boxed_frame(|| self.handle_member_keys_rpc(method, params, ctx, conn)).await;
         }
         if let Some(role) = status_tokens_rpc::minimum_role(method) {
             if let Err(e) = acl::require_role(ctx, role) {

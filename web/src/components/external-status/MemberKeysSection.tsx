@@ -9,7 +9,7 @@ import {
 import { formatTokenDate, formatTokenLastUsed, RevokeConfirmDialog } from './shared';
 
 const ERROR_CODES = ['member_keys_disabled', 'member_keys_browser_required', 'member_key_invalid_name',
-  'member_key_invalid_expiry', 'member_key_admin_forbidden', 'member_key_limit_reached', 'member_key_step_up_required'] as const;
+  'member_key_history_limit_reached', 'member_key_reauth_rate_limited', 'member_key_invalid_expiry', 'member_key_admin_forbidden', 'member_key_limit_reached', 'member_key_step_up_required'] as const;
 function errorCode(error: unknown): string | undefined {
   return error && typeof error === 'object' && 'code' in error && typeof error.code === 'string' ? error.code : undefined;
 }
@@ -28,6 +28,9 @@ export function MemberKeysSection() {
   const [name, setName] = useState('');
   const [days, setDays] = useState(90);
   const [code, setCode] = useState('');
+  const [password, setPassword] = useState('');
+  const [reauthentication, setReauthentication] = useState<'password' | 'mfa' | null>(null);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [created, setCreated] = useState<MemberKeyCreated | null>(null);
   const [copied, setCopied] = useState(false);
   const [revoking, setRevoking] = useState<MemberKeyInfo | null>(null);
@@ -36,7 +39,7 @@ export function MemberKeysSection() {
     const code = errorCode(err);
     return t(code && ERROR_CODES.some(known => known === code) ? `error.${code}` : 'error.generic');
   };
-  const load = useCallback(async () => {
+  const load = useCallback(async (cursor?: string) => {
     const current = ++generation.current;
     try {
       if (admin) {
@@ -46,13 +49,15 @@ export function MemberKeysSection() {
           setEnabled(false); setKeys([]); setLoaded(true); return;
         }
       }
-      const result = await (admin ? api.memberKeys.adminList() : api.memberKeys.list());
+      const result = await (admin ? api.memberKeys.adminList(cursor) : api.memberKeys.list(cursor));
       if (current !== generation.current) return;
       if (!Array.isArray(result.keys)) throw new Error('Invalid key list');
+      setNextCursor(result.next_cursor ?? null);
+      setReauthentication('reauthentication' in result && (result.reauthentication === 'mfa' || result.reauthentication === 'password') ? result.reauthentication : null);
       setKeys(result.keys); setEnabled(true); setLoaded(true); setError(null);
     } catch (err) {
       if (current !== generation.current) return;
-      setLoaded(true); setKeys([]); setEnabled(false);
+      setLoaded(true); setKeys([]); setEnabled(false); setNextCursor(null); setReauthentication(null);
       setError(errorCode(err) === 'member_keys_disabled' ? null : intl.formatMessage({ id: 'memberKeys.error.generic' }));
     }
   }, [admin, intl]);
@@ -65,14 +70,14 @@ export function MemberKeysSection() {
   };
   const create = async (event: FormEvent) => {
     event.preventDefault();
-    if (busy) return;
+    if (busy || !reauthentication) return;
     setBusy(true); setError(null);
     try {
-      const result = await api.memberKeys.create(name.trim(), days, code.trim() || undefined);
+      const result = await api.memberKeys.create(name.trim(), days, reauthentication === 'mfa' ? { code: code.trim() } : { password });
       setCreated(result); setCopied(false); setCreating(false); setName('');
       await load();
     } catch (err) { setError(message(err)); }
-    finally { setCode(''); setBusy(false); }
+    finally { setCode(''); setPassword(''); setBusy(false); }
   };
   const revoke = async () => {
     if (!revoking) return;
@@ -92,7 +97,7 @@ export function MemberKeysSection() {
     <div className="flex flex-wrap items-center justify-between gap-3">
       <h2 className="text-base font-medium">{t(admin ? 'adminTitle' : 'title')}</h2>
       {admin && <Button variant="outline" disabled={busy || !loaded} onClick={() => void toggle()}>{t(enabled ? 'disable' : 'enable')}</Button>}
-      {!admin && enabled && <Button disabled={busy || keys.filter(key => key.active).length >= 5} onClick={() => { setError(null); setCreating(true); }}>{t('create')}</Button>}
+      {!admin && enabled && <Button disabled={busy || !reauthentication || keys.filter(key => key.active).length >= 5} onClick={() => { setError(null); setCreating(true); }}>{t('create')}</Button>}
     </div>
     <p role="note" className="text-sm text-muted-foreground">{t('warning')}</p>
     <p className="text-sm text-muted-foreground">{t('scope')}</p>
@@ -100,6 +105,7 @@ export function MemberKeysSection() {
     {admin && <p className="text-sm text-muted-foreground">{t('adminNote')}</p>}
     {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
     <Button variant="outline" size="sm" disabled={busy} onClick={() => void load()}>{t('refresh')}</Button>
+    {enabled && nextCursor && <Button variant="outline" size="sm" disabled={busy} onClick={() => void load(nextCursor)}>{t('nextPage')}</Button>}
     {enabled && <div className="overflow-x-auto"><Table>
       <TableHeader><TableRow>
         {admin && <TableHead>{t('owner')}</TableHead>}
@@ -115,16 +121,18 @@ export function MemberKeysSection() {
         <TableCell>{!key.revoked_at && <Button variant="destructive" size="sm" disabled={busy} onClick={() => { setError(null); setRevoking(key); }}>{t('revoke')}</Button>}</TableCell>
       </TableRow>)}</TableBody>
     </Table></div>}
-    {creating && <Dialog open onOpenChange={open => { if (!open && !busy) { setCreating(false); setCode(''); } }}>
+    {creating && <Dialog open onOpenChange={open => { if (!open && !busy) { setCreating(false); setCode(''); setPassword(''); } }}>
       <DialogContent><form className="grid gap-4" onSubmit={event => void create(event)}>
         <DialogHeader><DialogTitle>{t('create')}</DialogTitle><DialogDescription>{t('scope')}</DialogDescription></DialogHeader>
         <label className="grid gap-1 text-sm">{t('name')}<Input value={name} maxLength={60} autoComplete="off" onChange={e => setName(e.target.value)} required /></label>
         <label className="grid gap-1 text-sm">{t('expiry')}<select className="rounded-md border border-border bg-background p-2" value={days} onChange={e => setDays(Number(e.target.value))}>
           {[30, 90, 365].map(value => <option key={value} value={value}>{intl.formatMessage({ id: 'memberKeys.days' }, { days: value })}</option>)}
         </select></label>
-        <label className="grid gap-1 text-sm">{t('code')}<Input value={code} autoComplete="one-time-code" onChange={e => setCode(e.target.value)} /></label>
+        {reauthentication === 'mfa'
+          ? <label className="grid gap-1 text-sm">{t('code')}<Input value={code} autoComplete="one-time-code" onChange={e => setCode(e.target.value)} required /></label>
+          : <label className="grid gap-1 text-sm">{t('password')}<Input type="password" value={password} autoComplete="current-password" onChange={e => setPassword(e.target.value)} required /></label>}
         {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
-        <DialogFooter><Button type="submit" disabled={busy || !name.trim()}>{t('create')}</Button></DialogFooter>
+        <DialogFooter><Button type="submit" disabled={busy || !name.trim() || !reauthentication || !(reauthentication === 'mfa' ? code.trim() : password)}>{t('create')}</Button></DialogFooter>
       </form></DialogContent>
     </Dialog>}
     {created && <Dialog open onOpenChange={() => {}}><DialogContent showClose={false}>

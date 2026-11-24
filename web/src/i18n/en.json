@@ -11669,6 +11669,10 @@
   "memberKeys.inactive": "Inactive",
   "memberKeys.expiry": "Expiry",
   "memberKeys.days": "{days} days",
+  "memberKeys.password": "Current password",
+  "memberKeys.nextPage": "Next page",
+  "memberKeys.error.member_key_history_limit_reached": "Key history has reached 50 entries. Try again after revoked entries have been retained for 90 days.",
+  "memberKeys.error.member_key_reauth_rate_limited": "Too many authentication attempts. Try again in 15 minutes.",
   "memberKeys.code": "Fresh MFA or recovery code (required if MFA is enabled)",
   "memberKeys.secretTitle": "Save your key",
   "memberKeys.secretNote": "The plaintext is shown only once. After closing, it cannot be retrieved. Store it in your server’s secret manager.",
@@ -11684,5 +11688,5 @@
   "memberKeys.error.member_key_invalid_expiry": "Expiry must be 1–365 days.",
   "memberKeys.error.member_key_admin_forbidden": "Admin accounts cannot create personal keys. Use a member account.",
   "memberKeys.error.member_key_limit_reached": "You already have 5 active keys. Revoke an old key first.",
-  "memberKeys.error.member_key_step_up_required": "Enter a fresh MFA code or unused recovery code."
+  "memberKeys.error.member_key_step_up_required": "Enter your current password or a fresh MFA or recovery code."
 }

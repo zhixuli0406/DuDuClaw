@@ -1396,7 +1396,8 @@ async fn member_key_creation_consumes_a_fresh_recovery_factor() {
     let ctx = state.user_db.live_user_context(&member.id).unwrap().unwrap();
     let session = uuid::Uuid::new_v4().to_string();
     let call = |code: String| crate::google_personal::DASHBOARD_SESSION.scope(Some((member.id.clone(), session.clone())),
-        state.handler.handle("me.member_keys.create", json!({"name":"test","expires_in_days":90,"code":code}), &ctx));
+        state.handler.handle_conn("me.member_keys.create", json!({"name":"test","expires_in_days":90,"code":code}), &ctx,
+            crate::power_local::RpcConnInfo::from_ws("127.0.0.1:12345".parse().unwrap(), false)));
     assert!(matches!(call(String::new()).await, WsFrame::Response { ok: false, .. }));
     assert!(matches!(call(codes[0].clone()).await, WsFrame::Response { ok: true, .. }));
     assert!(matches!(call(codes[0].clone()).await, WsFrame::Response { ok: false, .. }));

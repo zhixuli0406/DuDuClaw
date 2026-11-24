@@ -11669,6 +11669,10 @@
   "memberKeys.inactive": "已失效",
   "memberKeys.expiry": "有效期限",
   "memberKeys.days": "{days} 天",
+  "memberKeys.password": "目前密碼",
+  "memberKeys.nextPage": "下一頁",
+  "memberKeys.error.member_key_history_limit_reached": "金鑰保留紀錄已達 50 筆，請等候撤銷紀錄超過 90 天後再建立。",
+  "memberKeys.error.member_key_reauth_rate_limited": "驗證嘗試次數過多，請於 15 分鐘後再試。",
   "memberKeys.code": "新的二次驗證碼或備援碼（已啟用 MFA 時必填）",
   "memberKeys.secretTitle": "請保存你的金鑰",
   "memberKeys.secretNote": "明文只顯示這一次。關閉後無法再查看，請存放在伺服器的秘密管理服務。",
@@ -11684,5 +11688,5 @@
   "memberKeys.error.member_key_invalid_expiry": "有效期限必須是 1～365 天。",
   "memberKeys.error.member_key_admin_forbidden": "管理員帳號不能建立本人金鑰，請使用成員帳號。",
   "memberKeys.error.member_key_limit_reached": "已有 5 把有效金鑰，請先撤銷舊金鑰。",
-  "memberKeys.error.member_key_step_up_required": "請輸入新的二次驗證碼或未使用的備援碼。"
+  "memberKeys.error.member_key_step_up_required": "請輸入目前密碼或新的二次驗證碼、備援碼。"
 }

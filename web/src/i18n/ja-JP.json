@@ -11669,6 +11669,10 @@
   "memberKeys.inactive": "無効",
   "memberKeys.expiry": "有効期間",
   "memberKeys.days": "{days} 日",
+  "memberKeys.password": "現在のパスワード",
+  "memberKeys.nextPage": "次のページ",
+  "memberKeys.error.member_key_history_limit_reached": "キー履歴が 50 件に達しました。失効済みの履歴が 90 日を超えてから再度お試しください。",
+  "memberKeys.error.member_key_reauth_rate_limited": "認証の試行回数が多すぎます。15 分後に再度お試しください。",
   "memberKeys.code": "新しい MFA コードまたはリカバリーコード（MFA 有効時は必須）",
   "memberKeys.secretTitle": "キーを保存してください",
   "memberKeys.secretNote": "平文は一度だけ表示されます。閉じた後は再表示できません。サーバーのシークレット管理サービスに保存してください。",
@@ -11684,5 +11688,5 @@
   "memberKeys.error.member_key_invalid_expiry": "有効期間は 1～365 日にしてください。",
   "memberKeys.error.member_key_admin_forbidden": "管理者は本人キーを作成できません。メンバーアカウントを使用してください。",
   "memberKeys.error.member_key_limit_reached": "有効なキーが 5 個あります。古いキーを失効してください。",
-  "memberKeys.error.member_key_step_up_required": "新しい MFA コードまたは未使用のリカバリーコードを入力してください。"
+  "memberKeys.error.member_key_step_up_required": "現在のパスワード、または新しい MFA コードかリカバリーコードを入力してください。"
 }

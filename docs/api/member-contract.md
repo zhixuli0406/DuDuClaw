@@ -96,7 +96,9 @@ Existing `/ws` connections are checked against live account state. Access-token
 expiry closes JWT sockets when MFA is enforced, or for MFA-enrolled Enterprise
 accounts; it does not universally close every socket at 30 minutes. Clients
 should renew tokens regardless. Role changes, suspension and binding changes
-remain effective through the existing live checks.
+remain effective through the existing live checks. A session `jti`, including
+one preserved by refresh, is not fresh authentication proof: creating a member
+key additionally requires the current password (without MFA) or a fresh MFA factor.
 
 The native same-site dashboard also supports remembered-session cookies via
 `/api/session/refresh`. This is distinct from the seven-day refresh-token API;
@@ -258,15 +260,40 @@ key authentication and key management. The administrator can still change the
 switch through the normal authenticated configuration UI.
 
 A member signs in with a browser JWT session, then calls
-`me.member_keys.create {"name":"My server","expires_in_days":90}`. Accounts with
-MFA must also supply a fresh `code` (TOTP or unused recovery code), checked with
-the existing MFA step-up verifier. The response is `{"key":{...},"secret":"..."}`.
+`me.member_keys.create {"name":"My server","expires_in_days":90,"password":"<current password>"}`.
+Every account must freshly re-authenticate. Accounts without MFA supply their
+current `password`, verified by the existing timing-safe password checker;
+MFA accounts supply a fresh `code` (TOTP or unused recovery code) instead, using
+the existing step-up verifier and its replay/lockout checks. Attempts share the
+login limiter for the actual socket peer IP and account email (five attempts
+per 15 minutes); request parameters cannot select that peer. Holding an access
+JWT or refresh token alone is insufficient.
+
+The gateway issues an internal, single-use proof bound to `(user, jti,
+credential_epoch, "me.member_keys.create")`, valid for at most five minutes.
+It consumes the proof before attempting creation, including attempts refused
+by a key cap. The proof is never returned to the client or accepted as an RPC
+parameter. Account epoch and remembered-session validity are rechecked at the
+write. The response is `{"key":{...},"secret":"..."}`.
 Only this response contains the plaintext. Admin accounts cannot create keys;
 use a separate member account. Creation is never available to an existing key.
 Expiry is mandatory: 1–365 days; the UI defaults to 90 and offers 30/90/365.
-Each account can have at most five active keys.
+Each account can have at most five active keys and 50 total retained rows.
+On creation, expired or old-epoch rows are marked revoked; revoked rows older
+than 90 days are purged. Recent history is retained even when the total cap
+refuses creation (`member_key_history_limit_reached`).
 
-`me.member_keys.list` returns `{"keys":[...],"max_active":5}` and
+`me.member_keys.list {"limit":25,"cursor":"<next_cursor>"}` returns
+`{"keys":[...],"next_cursor":null,"max_active":5,"max_total":50,"reauthentication":"password"}`
+(`reauthentication` is `mfa` when enrolled). Omit the cursor for the first page.
+Both this method and `member_keys.admin_list` accept `limit` (default 25,
+1–100) and an opaque cursor; `next_cursor: null` ends the list. Ordering is
+newest creation first, then id, so deleting a previous page's row does not shift
+later pages. Invalid limits/cursors return `member_key_invalid_page`. The
+Dashboard shows one page at a time; **Next page** advances and **Refresh**
+returns to the first page. The create dialog requires the corresponding password
+or MFA input and clears it after submission or cancellation.
+
 `me.member_keys.revoke {"id":"..."}` revokes an owned key. Administrators use
 `member_keys.admin_list` and `member_keys.admin_revoke {"id":"..."}`; the latter
 can revoke any member's key. Lists contain id, name, created/expires/last-used
@@ -308,6 +335,16 @@ Key RPC access is the intersection of `MEMBER_CONTRACT_METHODS`, the member's
 `me.google.connect_*`, `me.google.disconnect`, `me.google.consents.set` and
 step-up operations are excluded. Unknown methods are denied. The compatibility
 table includes browser-only methods; its presence alone is not a key grant.
+
+For `agents.update`, key sessions may send only the explicit non-secret leaf
+paths in `MEMBER_KEY_AGENT_UPDATE_FIELDS` beside the contract. The whitelist
+covers reviewed identity, model, budget, heartbeat, permission, language and
+selected nested settings; normal Owner/admin checks still apply. Unknown
+fields, dotted/legacy aliases, arbitrary `advanced_kv`, credential sections
+(including all `odoo` and channel objects), and token/secret/password/key/credential
+fields are refused with `member_key_forbidden_field` before any settings or
+channel side effects. Mixed safe/forbidden requests are rejected as a whole,
+including empty strings and null values used to clear credentials.
 
 Every key call and socket heartbeat rechecks the key row, expiration, active
 account, role and credential epoch. A key can never gain Admin authority: a
