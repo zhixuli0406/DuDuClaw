@@ -1,5 +1,13 @@
 # Security Defense
 
+
+## Per-run caller identity (RM-208)
+
+An AI cannot claim another identity by changing environment variables, parameters, or its working directory. On installs where all AI employees run as the same operating-system user, a process that can read other processes' environments could borrow another run's credential while that run is active; the credential stops working when the run ends. Native Linux protected mode isolates employees as separate users. In protected mode no run credential is issued: it keeps its own capability records, and `duduclaw identity whoami` reports that protected mode uses its own capability identity.
+
+Local tools can verify `DUDUCLAW_RUN_CREDENTIAL` through a dedicated ephemeral `127.0.0.1` listener (never the dashboard router), discovered with `DUDUCLAW_IDENTITY_URL` or the owner-only `<gateway home>/run/identity-url` file, or `duduclaw identity whoami --json`. The gateway stores only hashes; run completion, cancellation, expiry or restart invalidates the proof. This does not prevent a same-OS-user process from stealing another live credential. Protected mode issues no run credential and uses its own capability records; existing agent tokens and MCP identity verification are unchanged. See [Getting and verifying the caller identity](../guides/custom-mcp-tool.md#getting-and-verifying-the-caller-identity).
+
+
 ## Native Linux isolation integration (planned for a later release)
 
 > **Not available in the current release.** The code for the per-employee Linux isolation architecture has been included since v1.81.0, but it cannot be installed or enabled on a customer host. The protected service still installs, updates and runs employees as in v1.80 (`sudo duduclaw service install --protected-linux`, `sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux`). The paragraphs in this section, and the sections marked "planned for a later release" below, describe the development state of that planned release.

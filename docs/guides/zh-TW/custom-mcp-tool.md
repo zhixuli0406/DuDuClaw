@@ -5,6 +5,31 @@
 
 ---
 
+
+## 取得與查證呼叫者身分（Getting and verifying the caller identity）
+
+An AI cannot claim another identity by changing environment variables, parameters, or its working directory. On installs where all AI employees run as the same operating-system user, a process that can read other processes' environments could borrow another run's credential while that run is active; the credential stops working when the run ends. Native Linux protected mode isolates employees as separate users. In protected mode no run credential is issued: it keeps its own capability records, and `duduclaw identity whoami` reports that protected mode uses its own capability identity.
+
+本節適用 gateway 管理的執行。獨立的 `duduclaw agent` 終端互動模式尚未接入這份 gateway registry。安裝／版本／登入狀態探測，以及選用的 `/model` 選單探測，也不屬於帶身分的工作回合。
+
+AI 無法藉由修改環境變數、參數或工作目錄冒用其他身分。若所有 AI 員工都以同一個作業系統帳號執行，能讀取其他程序環境變數的程序，仍可在另一個執行回合有效期間借用其憑證；該回合結束後，憑證即失效。原生 Linux 受保護模式會以不同作業系統帳號隔離員工。受保護模式不簽發 run credential，使用自己的 capability records；`duduclaw identity whoami` 會明確提示此模式使用獨立的 capability 身分。
+
+DuDuClaw 啟動的本機工具可讀取 `DUDUCLAW_RUN_CREDENTIAL`，每次呼叫工具時向本機 gateway 查證，或執行下列指令。不要信任 cwd、顯示名稱、工具參數或 `DUDUCLAW_ON_BEHALF_OF`。**只在本機查詢，絕不轉送憑證**；不要把它放進網址、命令列參數、日誌、工具結果或對話紀錄。非機密的 `DUDUCLAW_IDENTITY_URL` 指向獨立於 dashboard 的 listener，僅綁定 `127.0.0.1` 的臨時連接埠，由持有 `gateway.lock` 的程序啟動。CLI 先讀此變數，未設定時讀取 `<gateway home>/run/identity-url`（僅擁有者可讀寫，Unix 權限為 0600），並拒絕非本機 URL。URL 只是尋址提示，不是身分證明。
+
+```sh
+duduclaw identity whoami --json
+
+```
+
+有效時回傳 `active: true`、`agent_id`、`principal`、`session_id`、`turn_id`、`task_id`、`runtime`、`issued_at` 與 `expires_at`（Unix 秒數）。人的身分為 `{"type":"human","user_id":"…"}`；排程、心跳與任務為 `{"type":"background","kind":"…"}`。未確認的交辦人歸為 background／unattributed，不會變成管理員。對話與任務代號可以是 null。這些值來自 gateway 的登記，不能由模型自填；工具仍須依查證後的身分檢查自己的權限規則。
+
+格式錯誤、不存在、過期或撤銷一律回 HTTP 200 與 `{"active":false}`；非 loopback、無法取得連線來源、超過限速也回相同拒絕。每個有效憑證各有每分鐘 600 次的限流桶，隨最多 8,192 筆 registry entry 保存；格式錯誤與未知請求另共用一桶。帶有 `Forwarded`、`X-Forwarded-For`、`X-Forwarded-Host`、`X-Real-IP`、`Via` 或 `Origin` 的請求也一律回傳 inactive。每個請求上限 1 KiB。憑證缺失、無效或 gateway 無法連線時，CLI 以非零狀態結束。查證失敗就拒絕，不跨次快取有效結果。
+
+每次 CLI 嘗試都使用新的 `ddc_run_` 憑證，由 32 個隨機位元組產生。gateway 只存 SHA-256 雜湊，最多保留 8,192 筆。執行結束、錯誤或取消時由 guard 撤銷；期限為執行逾時加 60 秒，最長六小時；gateway 重啟後全部失效。本機 API 工具迴圈的憑證由 tool registry 持有，隨它結束撤銷。`mcp-proxy` 會把新變數傳給本機第三方伺服器，舊身分變數仍會移除。Codex 需支援 MCP `env_vars`，憑證只走環境變數，不放進 argv；各安裝版本的 shell／MCP 繼承仍待實機驗證。
+
+這項保證涵蓋偽造聲明，無法阻止同一作業系統帳號的程序竊取另一張仍有效的 bearer 憑證。請只執行可信任的本機工具；不可信任的工作需要作業系統隔離。受保護模式不簽發 run credential，使用自己的 capability records；`duduclaw identity whoami` 會明確提示此模式使用獨立的 capability 身分。既有驗證不變；既有 `DUDUCLAW_AGENT_TOKEN` 與 DuDuClaw MCP server 的身分驗證維持原樣。
+
+
 ## Overview
 
 DuDuClaw 透過 stdin/stdout 上的 JSON-RPC 2.0，曝露 200+ 個 MCP 工具（截至 v1.56 為 206 個）。本指南說明如何新增與 Claude Code 整合的自訂工具。

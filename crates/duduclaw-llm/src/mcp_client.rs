@@ -407,6 +407,14 @@ fn concat_content_blocks(blocks: &[Value]) -> String {
 // Client — stdio child process OR remote Streamable HTTP
 // ---------------------------------------------------------------------------
 
+// Redact immediately after decoding, before id/method validation, error
+// construction, tool discovery, logging or returning any stdio frame.
+fn parse_stdio_response(line: &str) -> Option<Value> {
+    let mut value = serde_json::from_str(line).ok()?;
+    duduclaw_core::run_credential::redact_value(&mut value);
+    Some(value)
+}
+
 /// Build the original stdio command before handing ownership to the backend.
 fn stdio_command(
     command: &str, args: &[String], envs: &[(String, String)],
@@ -748,6 +756,7 @@ impl McpClient {
     }
 
     fn redact_scoped_response(&self, value: &mut Value) {
+        duduclaw_core::run_credential::redact_value(value);
         if let McpTransport::Http {
             scoped: Some(authority),
             ..
@@ -936,10 +945,10 @@ impl McpClient {
                 if trimmed.is_empty() {
                     continue;
                 }
-                let value: Value = match serde_json::from_str(trimmed) {
-                    Ok(v) => v,
+                let value = match parse_stdio_response(trimmed) {
+                    Some(v) => v,
                     // Not JSON (stray log line) — ignore and keep reading.
-                    Err(_) => continue,
+                    None => continue,
                 };
                 if value.get("id").is_some() && value.get("method").is_some() {
                     return Err(McpError::Parse("unsolicited MCP server request".into()));
@@ -1339,6 +1348,7 @@ pub trait ClientCallBoundary: Send + Sync {
 /// name, the earlier client owns it and a warning is logged; the later one's
 /// tool is dropped from both the routing table and `tool_defs()`.
 pub struct ToolRegistry {
+    run_identity: Option<Box<dyn duduclaw_core::run_credential::RunLease>>,
     clients: Vec<Mutex<RegistryClient>>,
     /// tool name → index into `clients`.
     routes: HashMap<String, usize>,
@@ -1427,6 +1437,11 @@ impl ToolFilter {
 }
 
 impl ToolRegistry {
+    /// Hold the host run lease until all tools for the API run are dropped.
+    pub fn hold_run_identity(&mut self, lease: Box<dyn duduclaw_core::run_credential::RunLease>) {
+        self.run_identity = Some(lease);
+    }
+
     /// Build a registry from already-connected clients, discovering each
     /// server's tools via `tools/list` and resolving name collisions.
     pub async fn from_clients(clients: Vec<McpClient>) -> Result<Self, McpError> {
@@ -1463,6 +1478,7 @@ impl ToolRegistry {
             client_notices: HashMap::new(),
             scoped_operation_timeouts: HashMap::new(),
             closed_client_indices: HashSet::new(),
+            run_identity: None,
         })
     }
 
@@ -1560,6 +1576,7 @@ impl ToolRegistry {
             client_notices: HashMap::new(),
             scoped_operation_timeouts,
             closed_client_indices,
+            run_identity: None,
         };
         // Cloning/filtering schemas and dropping discovery inputs are part
         // of discovery admission, before the final original-deadline check.
@@ -2260,6 +2277,7 @@ pathlib.Path(sys.argv[1]).write_text('guarded')
             client_notices: HashMap::new(),
             scoped_operation_timeouts: HashMap::new(),
             closed_client_indices: HashSet::new(),
+            run_identity: None,
         };
         let scope = CcrScope {
             tenant_id: "local".into(),
@@ -2306,6 +2324,7 @@ pathlib.Path(sys.argv[1]).write_text('guarded')
             client_notices: HashMap::new(),
             scoped_operation_timeouts: HashMap::new(),
             closed_client_indices: HashSet::new(),
+            run_identity: None,
         };
         let scope = CcrScope {
             tenant_id: "local".into(),
@@ -3052,6 +3071,23 @@ mod process_tree_cancellation_tests {
 #[cfg(test)]
 mod execution_backend_equivalence_tests {
     use super::*;
+
+    #[test]
+    fn every_stdio_frame_redacts_run_credentials_before_dispatch() {
+        let credential = duduclaw_core::run_credential::RunCredential::from_bytes(&[31; 32]);
+        for frame in [
+            serde_json::json!({"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"tool","description":credential.expose(),"inputSchema":{"type":"object"}}]}}),
+            serde_json::json!({"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":credential.expose()}]}}),
+            serde_json::json!({"jsonrpc":"2.0","id":3,"error":{"code":-32603,"message":credential.expose(),"data":credential.expose()}}),
+        ] {
+            let value = parse_stdio_response(&frame.to_string()).unwrap();
+            let output = value.to_string();
+            assert!(!output.contains(credential.expose()));
+            assert!(!output.contains(duduclaw_core::run_credential::PREFIX));
+            assert!(output.contains("[REDACTED]"));
+            assert_eq!(value["id"], frame["id"]);
+        }
+    }
 
     #[tokio::test]
     async fn tool_loop_mcp_backend_command_matches_legacy_argv_env_cwd() {

@@ -1,5 +1,14 @@
 # MCP tools: what an agent is shown, and why
 
+
+## Verify the local caller
+
+`duduclaw identity whoami --json` queries the current run's gateway-issued identity.
+It exits non-zero when the credential is missing, inactive or cannot be verified.
+Third-party local MCP servers receive `DUDUCLAW_RUN_CREDENTIAL` through the proxy;
+existing agent identity variables remain stripped. Check the identity for each
+call and authorize it separately. See [Getting and verifying the caller identity](custom-mcp-tool.md#getting-and-verifying-the-caller-identity).
+
 ## Skill archive recovery
 
 Automatic skill staleness and archiving have been removed. `[skill_curator]`

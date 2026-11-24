@@ -566,6 +566,12 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         duduclaw_core::root_key::recovery::initialize(&home_dir);
     }
 
+    let _identity_listener = if singleton_held {
+        Some(crate::run_identity::start_listener(&home_dir).await
+            .map_err(duduclaw_core::error::DuDuClawError::Security)?)
+    } else { None };
+
+
     // ── System-settings app: re-apply a persisted static wired-network
     // config, if any (see `network::wired::reapply_wired_config_on_boot`'s
     // own doc for WHY — the sysd verb's effect lives on tmpfs, so it does
@@ -1731,6 +1737,9 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     bg_handles.push(crate::odoo_livechat::spawn(&home_dir, reply_ctx.clone()));
     let webchat_ctx = reply_ctx.clone();
     info!("boot: channel startup done — starting schedulers");
+
+    crate::run_identity::install_background_issuer()
+        .map_err(duduclaw_core::error::DuDuClawError::Security)?;
 
     // Start unified heartbeat scheduler (per-agent: evolution + cron + monitoring)
     // Replaces the old start_evolution_timers — each agent's HeartbeatConfig

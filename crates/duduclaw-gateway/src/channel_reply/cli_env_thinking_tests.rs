@@ -106,6 +106,7 @@ fn child(home: std::path::PathBuf) {
             ))).await.unwrap_err();
             assert!(error.contains("captured"), "{error}");
             let cmd = capture.lock().unwrap().take().unwrap();
+            let _proof = crate::run_identity::assert_command_identity(&cmd, false);
             let args = duduclaw_core::execution_gate::command_snapshot(&cmd).argv;
             assert!(args.windows(2).any(|w| w[0] == "--max-turns" && w[1] == "73"));
             assert!(args.windows(2).any(|w| w[0] == "--disallowedTools" && w[1].to_string_lossy().split(',').any(|t| t == "AskUserQuestion")));
