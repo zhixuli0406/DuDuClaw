@@ -32,6 +32,18 @@ If the gateway restarts during a reply, it attempts to change the existing “�
 
 Rendering has not been verified on a real Google Chat client (尚未在真實 Google Chat 用戶端驗證). Check desktop and mobile table lists, Chinese bold boundaries, multiline bold and placeholder replacement.
 
+## Share one Chat app across AI employees (v1.85)
+
+In **Channels → Google Chat → Behavior**, an administrator can enable **Route by sender (shared Chat app)**. It is off by default and applies only to the company app, not an employee's own app. Saving takes effect on the next message without restarting the gateway.
+
+For a verified one-to-one DM, existing `@` mentions take priority. Otherwise, DuDuClaw uses the event's Google Chat user id and the administrator's manual identity binding under **Users** to find the member's AI avatar, or their primary AI when no avatar is configured. The Google-account automatic matching option does not supply this avatar route. Display names, email text and message text cannot establish identity. Each employee keeps a separate conversation; `/new` and other session commands operate on the routed employee's conversation.
+
+If the binding cannot be read, the member has no usable avatar or primary AI, or the employee is archived, unavailable or restricted by protected Personal mode, the app sends only the configured **Reply for people without access**. It does not call a model, create a conversation or fall back to the company default. Repeated notices are throttled per sender.
+
+The reply is plain text, up to 1,000 characters. The only supported placeholder is `{onboarding_url}`: it expands to the configured public dashboard URL only when that URL is valid HTTPS and has no credentials, query or fragment. Without a suitable URL, the placeholder is removed. **Anyone who can DM the app can see a dashboard URL included in this reply.** The default reply simply asks the sender to contact their administrator.
+
+**The Chat app's name and avatar are shared by the whole company.** Routing to a different AI employee does not change the app's appearance in Google Chat. Groups and spaces keep their existing behavior: a mentioned employee answers, otherwise the channel default answers. A group message never selects the sender's avatar; an unknown space type is treated as a shared space.
+
 ## Google Chat
 
 ### Before you start

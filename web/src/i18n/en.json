@@ -11647,5 +11647,9 @@
   "users.avatar.conflicts": "AI avatar conflicts to resolve",
   "users.avatar.conflictsHint": "These members share a primary AI. The upgrade left their avatars unassigned. Edit each member to assign a different AI avatar.",
   "users.avatar.inUse": "This AI is already another member’s avatar. Choose another AI employee.",
-  "users.avatar.loadError": "Unable to load AI avatar conflicts. Refresh to try again."
+  "users.avatar.loadError": "Unable to load AI avatar conflicts. Refresh to try again.",
+  "channels.googlechat.sharedBinding": "Route by sender (shared Chat app)",
+  "channels.googlechat.sharedBinding.help": "DMs follow @ mentions first; otherwise a manually bound member reaches their AI avatar or primary employee. Groups keep their existing routing. Changes apply to the next message.",
+  "channels.googlechat.unboundReply": "Reply for people without access",
+  "channels.googlechat.unboundReply.help": "Plain text, up to 1,000 characters. Use '{onboarding_url}' to include a valid HTTPS public dashboard URL; otherwise the placeholder is removed. Anyone who can DM the app can see this URL."
 }

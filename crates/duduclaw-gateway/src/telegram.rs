@@ -2712,47 +2712,7 @@ async fn resolve_shared_route(
 /// account (a main-role or gateway-default employee for a non-admin), or any
 /// lookup failure — never a refusal.
 async fn primary_agent_route(ctx: &Arc<ReplyContext>, user_id: &str) -> Option<String> {
-    if user_id.is_empty() {
-        return None;
-    }
-    let home = ctx.home_dir.clone();
-    let sender_id = user_id.to_string();
-    let (sender, primary) = tokio::task::spawn_blocking(move || {
-        // Verified identity → active account, the same resolution `@` routing
-        // and the "who is asking" checks use; unverified rows stay unmapped.
-        let sender =
-            crate::trigger_route::access::for_channel_sender(&home, "telegram", &sender_id);
-        let account = match &sender.sender {
-            crate::trigger_route::Sender::Admin { user_id: Some(id) }
-            | crate::trigger_route::Sender::Account { user_id: id, .. } => id.clone(),
-            _ => return None,
-        };
-        let db = crate::decision_notify::open_user_db(&home).ok().flatten()?;
-        let primary = db.member_avatar_or_primary(&account).ok().flatten()?;
-        Some((sender, primary))
-    })
-    .await
-    .ok()
-    .flatten()?;
-    // Never the raw Telegram id in logs: a mapped sender is labelled by
-    // dashboard account (an unmapped one would be a per-home keyed digest).
-    let who = sender.audit_label(&ctx.home_dir, "telegram", user_id);
-    let sender =
-        sender.for_webchat(crate::webchat::access::gateway_default_id(&ctx.home_dir).await);
-    let usable = {
-        let reg = ctx.registry.read().await;
-        reg.get(&primary)
-            .is_some_and(|agent| crate::webchat::access::primary_candidate(&sender, agent))
-    };
-    if usable {
-        tracing::debug!(
-            agent = primary.as_str(),
-            sender = %who,
-            route = "primary_agent",
-            "Telegram: shared bot routed to the sender's avatar or primary employee"
-        );
-    }
-    usable.then_some(primary)
+    crate::shared_app_route::member_agent_route(ctx, "telegram", user_id).await
 }
 
 /// The session the shared bot's reply for `route` is stored under: the

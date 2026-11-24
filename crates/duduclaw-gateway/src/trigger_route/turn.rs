@@ -116,6 +116,29 @@ pub fn decision_for_route(
     access: &SenderAccess,
     route: TriggerRoute,
 ) -> TurnDecision {
+    decision_for_route_inner(home, reg, turn, access, route, None)
+}
+
+/// Use an identity already resolved by a stricter channel boundary for both
+/// mentions and pending picks. Never fall back to automatic identity lookup.
+pub(crate) fn decide_channel_turn_with_access(
+    home: &Path,
+    reg: &AgentRegistry,
+    turn: ChannelTurn<'_>,
+    access: &SenderAccess,
+) -> TurnDecision {
+    let route = decide(reg, turn.text, access, turn.fallback);
+    decision_for_route_inner(home, reg, turn, access, route, Some(access))
+}
+
+fn decision_for_route_inner(
+    home: &Path,
+    reg: &AgentRegistry,
+    turn: ChannelTurn<'_>,
+    access: &SenderAccess,
+    route: TriggerRoute,
+    pending_access: Option<&SenderAccess>,
+) -> TurnDecision {
     let key = PendingKey::new(turn.channel, turn.conversation, turn.sender);
     let lang = texts::lang_for(home);
     match route {
@@ -123,7 +146,7 @@ pub fn decision_for_route(
             if let Some(id) = assign_addressee(&key, turn) {
                 return TurnDecision::Assign { id };
             }
-            match addressee(home, reg, &key, turn) {
+            match addressee(home, reg, &key, turn, pending_access) {
                 Some(id) => TurnDecision::Agent {
                     via_trigger: turn.fallback != Some(id.as_str()),
                     id,
@@ -200,6 +223,7 @@ fn addressee(
     reg: &AgentRegistry,
     key: &PendingKey,
     turn: ChannelTurn<'_>,
+    resolved_access: Option<&SenderAccess>,
 ) -> Option<String> {
     if turn.sender.is_empty() {
         return None;
@@ -215,7 +239,8 @@ fn addressee(
     let agent = reg
         .get(&id)
         .filter(|a| a.config.agent.status.is_operational())?;
-    let access = access::for_channel_sender(home, turn.channel, turn.sender);
+    let access = resolved_access.cloned()
+        .unwrap_or_else(|| access::for_channel_sender(home, turn.channel, turn.sender));
     if access.may_call(agent, turn.fallback) {
         Some(id)
     } else {

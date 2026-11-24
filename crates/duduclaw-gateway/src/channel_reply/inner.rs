@@ -423,6 +423,10 @@ async fn build_reply_with_session_inner_impl(
         );
     }
     if let Some(a) = agent {
+        if crate::googlechat_inbox::bind_reply_employee(&a.config.agent.name, session_id).is_err() {
+            tracing::warn!(failed = 1, "Google Chat reply identity persistence failed");
+            return "目前無法回覆，請稍後再試。".into();
+        }
         crate::trigger_route::record_answered_by(crate::trigger_route::AnsweredBy {
             id: a.config.agent.name.clone(),
             display_name: crate::trigger_route::display_name(&reg, &a.config.agent.name),

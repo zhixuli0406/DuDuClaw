@@ -29,6 +29,8 @@ pub(crate) fn config_settings_to_json(all: &[(String, String)]) -> Value {
     json!({
         "mention_only": get(crate::channel_settings::keys::MENTION_ONLY).as_deref() == Some("true"),
         "dm_reply_placement": if get(crate::channel_settings::keys::DM_REPLY_PLACEMENT).as_deref() == Some("thread") { "thread" } else { "main" },
+        "shared_bot_binding": get(crate::channel_settings::keys::SHARED_BOT_BINDING).as_deref() == Some("true"),
+        "unbound_reply": get(crate::channel_settings::keys::UNBOUND_REPLY).unwrap_or_else(|| crate::googlechat_shared::DEFAULT_UNBOUND_REPLY.to_string()),
         "auto_thread": get(crate::channel_settings::keys::AUTO_THREAD).as_deref() == Some("true"),
         "allowed_channels": json_array(crate::channel_settings::keys::ALLOWED_CHANNELS),
         "allowed_guilds": json_array(crate::channel_settings::keys::ALLOWED_GUILDS),
@@ -66,7 +68,7 @@ pub(crate) fn access_settings_to_json(all: &[(String, String)]) -> Value {
 pub(crate) fn json_value_to_setting_string(key: &str, value: &Value) -> std::result::Result<String, String> {
     use crate::channel_settings::keys;
     match key {
-        k if k == keys::MENTION_ONLY || k == keys::AUTO_THREAD || k == keys::REQUIRE_PAIRING => {
+        k if k == keys::SHARED_BOT_BINDING || k == keys::MENTION_ONLY || k == keys::AUTO_THREAD || k == keys::REQUIRE_PAIRING => {
             value
                 .as_bool()
                 .map(|b| b.to_string())

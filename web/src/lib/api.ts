@@ -283,6 +283,9 @@ export interface ChannelStatus {
 /** W2-2 (E1) — a channel's behavior settings (`channels.config_get/set`). */
 export interface ChannelConfigSettings {
   dm_reply_placement: 'main' | 'thread';
+  /** Admin-only, Google Chat global scope. */
+  shared_bot_binding?: boolean;
+  unbound_reply?: string;
   mention_only: boolean;
   auto_thread: boolean;
   allowed_channels: string[];
