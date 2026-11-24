@@ -10,6 +10,12 @@ Release maintainers, native Linux isolation (planned for a later release; not av
 
 Developer implementation notes: [Native Linux isolation](architecture/native-linux-isolation.md) (planned for a later release; not active product behavior in the current release).
 
+## Dashboard API
+
+- [Member-facing RPC compatibility contract (draft)](api/member-contract.md) — JWT transport and renewal, member methods, key fields and the two-minor-version compatibility promise; distributor inventory pending.
+- [API reference index](api/README.md) — scope of the partial historical OpenAPI reference.
+- [RPC deprecation policy](guides/deprecations.md#rpc-methods).
+
 ## Feature Highlights
 
 Release maintainers: [Release documentation and website synchronization](guides/release-delivery-sync.md)

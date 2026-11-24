@@ -113,6 +113,7 @@ mod skills_custom;
 mod cron_rpc;
 mod cron_scoped_rpc;
 mod dashboard_scope;
+pub mod member_contract;
 mod about_rpc;
 mod data_exports_rpc;
 mod compliance_rpc;

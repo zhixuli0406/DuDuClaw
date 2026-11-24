@@ -13,6 +13,7 @@ mod doctor_repair_hint_tests;
 mod edition_rpc_gate_table_tests;
 mod must_change_password_gate_tests;
 mod users_change_email_tests;
+mod member_contract_tests;
 mod live_acl_tests;
 mod team_callable_rpc_tests;
 mod team_history_rpc_tests;

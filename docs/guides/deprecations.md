@@ -303,3 +303,25 @@ both removed values.
 Older binaries may pass `secret://` references as literal credentials, so migrated employees cannot simply run on an older version. Copy the whole `<home>` before upgrading; to downgrade, stop the gateway and restore that copy. Without a copy, replace each reference in `.mcp.json` with the real key before starting the older version. No command decrypts `<home>/backups/mcp-migrate/*.enc`. Those files exist for manual recovery and are unreadable without the original `.keyfile`.
 
 If `.keyfile` is lost, the store cannot be read and a new key is refused while `.enc` files remain in `<home>/secrets/mcp` or `<home>/backups/mcp-migrate`. Move those files out of `<home>`, then enter the third-party keys again.
+
+
+## RPC methods
+
+The [draft member-facing RPC contract](../api/member-contract.md) publishes the
+member method names and key response fields covered from 1.85.0. The native UI
+candidate inventory is published now; the distributor's actual list is pending.
+The draft status does not waive compatibility for methods already listed.
+
+Announce any rename or removal of a listed method or key field in the release's
+`CHANGELOG.md` **Deprecated** section. Name the replacement, the deprecation
+version and the earliest removal version. Keep the old method callable and its
+old fields working alongside the replacement for two minor versions. A 1.85
+deprecation survives through 1.86; removal may start in 1.87. Announce the eventual
+removal under **Removed**. Additive fields are allowed and clients should ignore
+unknown fields. Updating the contract table or snapshots cannot replace this
+coexistence window.
+
+Existing live role, binding, record-ownership, privacy, edition and feature
+checks still apply. The contract does not grant access or introduce member API
+keys. When changing a listed name or field, update the contract metadata,
+compatibility tests, documentation and deprecation record in the same change.
