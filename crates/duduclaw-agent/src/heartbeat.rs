@@ -1368,8 +1368,10 @@ async fn execute_proactive_check(
                 }
             };
             cmd.env(duduclaw_core::run_credential::ENV_RUN_CREDENTIAL, _run_identity.credential().expose());
-            cmd.env(duduclaw_core::run_credential::ENV_RUN_GATEWAY_PORT,
-                duduclaw_core::gateway_port_for_home(home_dir).0.to_string());
+            cmd.env_remove(duduclaw_core::run_credential::ENV_IDENTITY_URL);
+            if let Some(url) = _run_identity.identity_url() {
+                cmd.env(duduclaw_core::run_credential::ENV_IDENTITY_URL, url);
+            }
             let child = duduclaw_core::execution_gate::with_runtime(
             duduclaw_core::execution_gate::RuntimeKind::Claude,
             duduclaw_core::execution_gate::spawn(&mut cmd,

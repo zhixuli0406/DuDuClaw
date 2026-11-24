@@ -566,6 +566,12 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         duduclaw_core::root_key::recovery::initialize(&home_dir);
     }
 
+    let _identity_listener = if singleton_held {
+        Some(crate::run_identity::start_listener(&home_dir).await
+            .map_err(duduclaw_core::error::DuDuClawError::Security)?)
+    } else { None };
+
+
     // ── System-settings app: re-apply a persisted static wired-network
     // config, if any (see `network::wired::reapply_wired_config_on_boot`'s
     // own doc for WHY — the sysd verb's effect lives on tmpfs, so it does
@@ -3539,7 +3545,6 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // Always mounted; every request must come from a loopback peer, carry
     // the gateway-internal MCP key and a verified employee identity token
     // (`computer_use_sessions::auth`). Own state + 64 KiB body cap.
-    app = app.merge(crate::run_identity::router());
     app = app.merge(crate::computer_use_sessions::http::router(
         computer_use_sessions.clone(),
     ));

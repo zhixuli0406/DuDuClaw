@@ -1,8 +1,13 @@
 //! RM-208: gateway-owned, memory-only run registry. No issuance HTTP API.
-//! Child environments are transport, never a source of identity claims.
+//! An AI cannot claim another identity by changing environment variables,
+//! parameters, or its working directory. Processes sharing an OS user may
+//! borrow another active run's credential by reading its environment; the
+//! credential stops working when that run ends. Native Linux protected mode
+//! isolates employees as separate users and uses its own capability identity;
+//! it issues no run credential. Child environments only transport the proof.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -10,7 +15,7 @@ use axum::{Json, Router, body::to_bytes, extract::{ConnectInfo, Request, State},
 use rand::RngCore;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use duduclaw_core::run_credential::{ENV_RUN_CREDENTIAL, RunCredential};
+use duduclaw_core::run_credential::{ENV_IDENTITY_URL, IDENTITY_URL_FILE, ENV_RUN_CREDENTIAL, RunCredential};
 use duduclaw_knowledge::requester::RequesterIdentity;
 
 pub const ROUTE: &str = "/api/internal/identity/introspect";
@@ -41,17 +46,24 @@ pub struct RunRecord {
     pub expires_at: u64,
 }
 
-struct Entry { record: RunRecord, deadline: Instant }
+struct Entry { record: RunRecord, deadline: Instant, rate: (Instant, usize) }
 
 pub struct Registry {
     // The only credential material retained here is its SHA-256 digest.
     runs: Mutex<HashMap<[u8; 32], Entry>>,
-    rate: Mutex<(Instant, usize)>,
+    invalid_rate: Mutex<(Instant, usize)>,
+    endpoint: Mutex<Option<String>>,
+    #[cfg(test)]
+    lookups: std::sync::atomic::AtomicUsize,
 }
 
 impl Default for Registry {
     fn default() -> Self {
-        Self { runs: Mutex::new(HashMap::new()), rate: Mutex::new((Instant::now(), 0)) }
+        Self { runs: Mutex::new(HashMap::new()), invalid_rate: Mutex::new((Instant::now(), 0)),
+            endpoint: Mutex::new(None),
+            #[cfg(test)]
+            lookups: std::sync::atomic::AtomicUsize::new(0),
+        }
     }
 }
 
@@ -75,7 +87,7 @@ pub struct RunGuard {
     registry: Arc<Registry>,
     hash: [u8; 32],
     credential: RunCredential,
-    port: Option<u16>,
+    identity_url: Option<String>,
 }
 
 impl std::fmt::Debug for RunGuard {
@@ -94,21 +106,20 @@ impl Drop for RunGuard {
 impl RunGuard {
     pub fn apply(&self, cmd: &mut tokio::process::Command) {
         cmd.env(ENV_RUN_CREDENTIAL, self.credential.expose());
-        if let Some(port) = self.port {
-            cmd.env(duduclaw_core::run_credential::ENV_RUN_GATEWAY_PORT, port.to_string());
-        }
+        cmd.env_remove(ENV_IDENTITY_URL);
+        if let Some(url) = &self.identity_url { cmd.env(ENV_IDENTITY_URL, url); }
     }
 
     pub fn apply_pty(&self, env: &mut HashMap<String, String>) {
         env.insert(ENV_RUN_CREDENTIAL.to_string(), self.credential.expose().to_string());
-        if let Some(port) = self.port {
-            env.insert(duduclaw_core::run_credential::ENV_RUN_GATEWAY_PORT.to_string(), port.to_string());
-        }
+        env.remove(ENV_IDENTITY_URL);
+        if let Some(url) = &self.identity_url { env.insert(ENV_IDENTITY_URL.into(), url.clone()); }
     }
 }
 
 impl duduclaw_core::run_credential::RunLease for RunGuard {
     fn credential(&self) -> &RunCredential { &self.credential }
+    fn identity_url(&self) -> Option<&str> { self.identity_url.as_deref() }
 }
 
 pub fn install_background_issuer() -> Result<(), String> {
@@ -141,32 +152,57 @@ impl Registry {
         if runs.len() >= MAX_RUNS || runs.contains_key(&hash) {
             return Err("Run identity registry full".into());
         }
-        runs.insert(hash, Entry { record, deadline: Instant::now() + Duration::from_secs(ttl) });
-        Ok(RunGuard { registry: self.clone(), hash, credential, port: None })
+        let identity_url = self.endpoint.lock().map_err(|_| "Run identity listener unavailable")?.clone();
+        runs.insert(hash, Entry { record, deadline: Instant::now() + Duration::from_secs(ttl), rate: (Instant::now(), 0) });
+        Ok(RunGuard { registry: self.clone(), hash, credential, identity_url })
     }
 
+    #[cfg(test)]
     fn lookup(&self, credential: &RunCredential) -> Option<RunRecord> {
-        let now = unix_now().ok()?;
-        let hash = digest(credential);
-        let mut runs = self.runs.lock().ok()?;
-        // Hash-map lookup compares fixed-size cryptographic digests, never
-        // plaintext prefixes. Confirm the selected key in constant time.
-        let (key, entry) = runs.get_key_value(&hash)?;
-        ring::constant_time::verify_slices_are_equal(key, &hash).ok()?;
+        self.lookup_hash(digest(credential), true, false).ok().flatten()
+    }
+
+    fn lookup_hash(&self, hash: [u8; 32], well_formed: bool, rate_limit: bool) -> Result<Option<RunRecord>, ()> {
+        #[cfg(test)]
+        self.lookups.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let now = unix_now().map_err(|_| ())?;
+        let mut runs = self.runs.lock().map_err(|_| ())?;
+        // Malformed and unknown requests both reach this fixed-size digest
+        // lookup. No plaintext prefix participates in credential comparison.
+        let Some((key, entry)) = runs.get_key_value(&hash) else { return Ok(None); };
+        ring::constant_time::verify_slices_are_equal(key, &hash).map_err(|_| ())?;
         if entry.record.expires_at <= now || entry.deadline <= Instant::now() {
             runs.remove(&hash);
-            return None;
+            return Ok(None);
         }
-        Some(entry.record.clone())
+        if !well_formed { return Ok(None); }
+        let entry = runs.get_mut(&hash).ok_or(())?;
+        if rate_limit && !allow_bucket(&mut entry.rate) { return Err(()); }
+        Ok(Some(entry.record.clone()))
     }
 
-    fn allow_query(&self) -> bool {
-        let Ok(mut rate) = self.rate.lock() else { return false; };
-        if rate.0.elapsed() >= Duration::from_secs(60) { *rate = (Instant::now(), 0); }
-        if rate.1 >= RATE_PER_MINUTE { return false; }
-        rate.1 += 1;
-        true
+    fn query(&self, credential: Option<&RunCredential>) -> Option<RunRecord> {
+        // Always hash and look up one credential, even if parsing failed.
+        let dummy = RunCredential::from_bytes(&[0; 32]);
+        let hash = digest(credential.unwrap_or(&dummy));
+        match self.lookup_hash(hash, credential.is_some(), true) {
+            Ok(Some(record)) => Some(record),
+            Ok(None) => {
+                let Ok(mut rate) = self.invalid_rate.lock() else { return None; };
+                if !allow_bucket(&mut rate) { return None; }
+                None
+            }
+            // An exhausted valid bucket never consumes the junk bucket.
+            Err(()) => None,
+        }
     }
+}
+
+fn allow_bucket(rate: &mut (Instant, usize)) -> bool {
+    if rate.0.elapsed() >= Duration::from_secs(60) { *rate = (Instant::now(), 0); }
+    if rate.1 >= RATE_PER_MINUTE { return false; }
+    rate.1 += 1;
+    true
 }
 
 fn principal(who: RequesterIdentity, fallback: &str) -> Principal {
@@ -208,12 +244,61 @@ pub fn issue(home: &Path, agent: &str, runtime: &str, timeout: u64) -> Result<Ru
         task_id: crate::runtime::round_task_env().map(|(_, task)| task),
         runtime: runtime.to_string(), issued_at: 0, expires_at: 0,
     };
-    let mut guard = registry().issue(record, timeout)?;
-    guard.port = Some(duduclaw_core::gateway_port_for_home(home).0);
-    Ok(guard)
+    registry().issue(record, timeout)
 }
 
-pub fn router() -> Router { router_with(registry().clone()) }
+/// Owned by gateway startup, after acquiring this home's gateway.lock.
+/// Dropping it stops the listener and removes the discovery file.
+pub struct IdentityListener {
+    task: tokio::task::JoinHandle<()>,
+    path: PathBuf,
+    registry: Arc<Registry>,
+    #[cfg(test)]
+    address: std::net::SocketAddr,
+}
+
+impl Drop for IdentityListener {
+    fn drop(&mut self) {
+        self.task.abort();
+        let _ = std::fs::remove_file(&self.path);
+        if let Ok(mut endpoint) = self.registry.endpoint.lock() { *endpoint = None; }
+    }
+}
+
+pub async fn start_listener(home: &Path) -> Result<IdentityListener, String> {
+    start_listener_with(home, registry().clone()).await
+}
+
+async fn start_listener_with(home: &Path, registry: Arc<Registry>) -> Result<IdentityListener, String> {
+    use std::io::Write;
+    if !duduclaw_core::gateway_instance::held(home) {
+        return Err("Run identity listener requires the gateway lock".into());
+    }
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await
+        .map_err(|_| "Cannot bind run identity listener")?;
+    let address = listener.local_addr().map_err(|_| "Cannot inspect run identity listener")?;
+    let url = format!("http://{address}{ROUTE}");
+    let mut endpoint = registry.endpoint.lock().map_err(|_| "Run identity listener unavailable")?;
+    if endpoint.is_some() { return Err("Run identity listener already started".into()); }
+    let path = home.join(IDENTITY_URL_FILE);
+    let dir = path.parent().ok_or("Invalid identity discovery path")?;
+    std::fs::create_dir_all(dir).map_err(|_| "Cannot create identity run directory")?;
+    // Atomic replacement avoids following an existing file symlink and never
+    // publishes a discovery file with broader permissions, even briefly.
+    let mut file = tempfile::NamedTempFile::new_in(dir).map_err(|_| "Cannot create identity discovery file")?;
+    duduclaw_core::platform::set_owner_only(file.path()).map_err(|_| "Cannot restrict identity discovery file")?;
+    file.write_all(url.as_bytes()).map_err(|_| "Cannot write identity discovery file")?;
+    file.persist(&path).map_err(|_| "Cannot publish identity discovery file")?;
+    *endpoint = Some(url);
+    drop(endpoint);
+    let app = router_with(registry.clone());
+    let task = tokio::spawn(async move {
+        if axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.is_err() {
+            tracing::error!("Run identity listener stopped");
+        }
+    });
+    Ok(IdentityListener { task, path, registry, #[cfg(test)] address })
+}
 
 fn router_with(registry: Arc<Registry>) -> Router {
     Router::new().route(ROUTE, post(handle)).with_state(registry)
@@ -222,17 +307,20 @@ fn router_with(registry: Arc<Registry>) -> Router {
 async fn handle(State(registry): State<Arc<Registry>>, request: Request) -> Json<serde_json::Value> {
     let inactive = || Json(serde_json::json!({"active": false}));
     let Some(peer) = request.extensions().get::<ConnectInfo<std::net::SocketAddr>>() else { return inactive(); };
-    if crate::computer_use_sessions::auth::check_peer(peer.0).is_err() || !registry.allow_query() {
+    if crate::computer_use_sessions::auth::check_peer(peer.0).is_err()
+        || ["forwarded", "x-forwarded-for", "x-forwarded-host", "x-real-ip", "via", "origin"]
+            .iter().any(|name| request.headers().contains_key(*name)) {
         return inactive();
     }
-    // Read only after checking the actual TCP peer. No body/error logging.
-    let Ok(Ok(body)) = tokio::time::timeout(Duration::from_secs(2), to_bytes(request.into_body(), 1024)).await
-        else { return inactive(); };
-    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&body) else { return inactive(); };
-    let Some(raw) = value.get_mut("credential").map(serde_json::Value::take) else { return inactive(); };
-    let serde_json::Value::String(raw) = raw else { return inactive(); };
-    let Some(credential) = RunCredential::parse(raw) else { return inactive(); };
-    let Some(record) = registry.lookup(&credential) else { return inactive(); };
+    // No body/error logging. Every body/parse failure still hashes a dummy
+    // proof and reaches the same registry lookup as an unknown credential.
+    let credential = match tokio::time::timeout(Duration::from_secs(2), to_bytes(request.into_body(), 1024)).await {
+        Ok(Ok(body)) => serde_json::from_slice::<serde_json::Value>(&body).ok()
+            .and_then(|mut value| value.get_mut("credential").map(serde_json::Value::take))
+            .and_then(|raw| match raw { serde_json::Value::String(raw) => RunCredential::parse(raw), _ => None }),
+        _ => None,
+    };
+    let Some(record) = registry.query(credential.as_ref()) else { return inactive(); };
     let Ok(mut response) = serde_json::to_value(record) else { return inactive(); };
     response["active"] = serde_json::json!(true);
     Json(response)
@@ -273,6 +361,124 @@ mod tests {
 
     fn body(credential: &RunCredential) -> String {
         serde_json::json!({"credential": credential.expose()}).to_string()
+    }
+
+    #[tokio::test]
+    async fn proxy_headers_are_uniformly_inactive() {
+        let registry = Arc::new(Registry::default());
+        let lease = registry.issue(record(), 100).unwrap();
+        for header in ["Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Real-IP", "Via", "Origin"] {
+            let mut request = axum::http::Request::post(ROUTE)
+                .header(header, "untrusted").body(Body::from(body(&lease.credential))).unwrap();
+            request.extensions_mut().insert(ConnectInfo("127.0.0.1:1234".parse::<std::net::SocketAddr>().unwrap()));
+            let response = router_with(registry.clone()).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            assert_eq!(to_bytes(response.into_body(), 1024).await.unwrap().as_ref(), br#"{"active":false}"#);
+        }
+    }
+
+    #[tokio::test]
+    async fn dedicated_listener_requires_lock_and_binds_only_ipv4_loopback() {
+        let home = tempfile::tempdir().unwrap();
+        let registry = Arc::new(Registry::default());
+        assert!(start_listener_with(home.path(), registry.clone()).await.is_err());
+        assert!(!home.path().join(IDENTITY_URL_FILE).exists());
+        duduclaw_core::gateway_instance::acquire(home.path()).unwrap();
+        let listener = start_listener_with(home.path(), registry.clone()).await.unwrap();
+        assert_eq!(listener.address.ip(), std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        assert_ne!(listener.address.port(), 0);
+        let url = std::fs::read_to_string(home.path().join(IDENTITY_URL_FILE)).unwrap();
+        assert_eq!(url, format!("http://{}{}", listener.address, ROUTE));
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(home.path().join(IDENTITY_URL_FILE)).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let lease = registry.issue(record(), 30).unwrap();
+        let mut command = tokio::process::Command::new("never-spawned");
+        lease.apply(&mut command);
+        assert!(command.as_std().get_envs().any(|(key, value)| key == ENV_IDENTITY_URL
+            && value.and_then(|v| v.to_str()) == Some(url.as_str())));
+        assert!(start_listener_with(home.path(), registry.clone()).await.is_err());
+        drop(listener);
+        assert!(!home.path().join(IDENTITY_URL_FILE).exists());
+    }
+
+    #[test]
+    fn protected_branches_do_not_issue_or_pass_run_credentials() {
+        // Source-contract guard: protected launch implementations must remain
+        // ahead of host command preparation and must not receive its env.
+        let channel = include_str!("channel_reply/cli_env.rs");
+        assert!(channel.contains("let _run_identity = if protected { None } else {"));
+        let protected = channel.split_once("let mut child = if protected {").unwrap().1
+            .split_once("} else {").unwrap().0;
+        assert!(!protected.contains("cmd"));
+        assert!(!protected.contains("run_identity"));
+        assert!(!protected.contains("env"));
+
+        let claude = include_str!("claude_runner.rs");
+        let branch = claude.split_once("if duduclaw_core::execution_gate::isolation_required() {").unwrap().1
+            .split_once("let claude = duduclaw_core::which_claude()").unwrap().0;
+        assert!(branch.contains("return call_claude_streaming"));
+        assert!(!branch.contains("prepare_claude_cmd"));
+        assert!(!branch.contains("run_identity::issue"));
+        assert!(!branch.contains(".env("));
+        for source in [include_str!("runtime/codex.rs"), include_str!("runtime/grok.rs"),
+            include_str!("runtime/generic_cli.rs")] {
+            let execute = source.split_once("async fn execute(").unwrap().1;
+            let branch = execute.split_once("if duduclaw_core::execution_gate::isolation_required() {").unwrap().1
+                .split_once("\n        }\n").unwrap().0;
+            assert!(branch.contains("return "));
+            assert!(!branch.contains("run_identity::issue"));
+            assert!(!branch.contains(".env("));
+            assert!(!branch.contains("prepare_run_command"));
+        }
+    }
+
+    #[test]
+    fn dashboard_does_not_mount_identity_introspection() {
+        // The identity router is private to this module; pin the dashboard
+        // assembly too, including accidental literal-path registration.
+        let server = include_str!("server.rs");
+        assert!(!server.contains("run_identity::router"));
+        assert!(!server.contains(ROUTE));
+    }
+
+    #[test]
+    fn junk_and_other_runs_cannot_exhaust_a_valid_runs_bucket() {
+        let registry = Arc::new(Registry::default());
+        let first = registry.issue(record(), 100).unwrap();
+        let second = registry.issue(record(), 100).unwrap();
+        let unknown = RunCredential::from_bytes(&[42; 32]);
+        for _ in 0..RATE_PER_MINUTE {
+            assert!(registry.query(Some(&first.credential)).is_some());
+            assert!(registry.query(Some(&unknown)).is_none());
+        }
+        assert!(registry.query(Some(&first.credential)).is_none());
+        assert!(registry.query(None).is_none());
+        assert!(registry.query(Some(&second.credential)).is_some());
+        assert_eq!(registry.invalid_rate.lock().unwrap().1, RATE_PER_MINUTE);
+        assert_eq!(registry.runs.lock().unwrap().get(&second.hash).unwrap().rate.1, 1);
+        registry.runs.lock().unwrap().get_mut(&first.hash).unwrap().rate.0 =
+            Instant::now() - Duration::from_secs(61);
+        assert!(registry.query(Some(&first.credential)).is_some());
+        // Valid buckets live inside the bounded registry, not an unbounded
+        // attacker-keyed map. Unknown requests share exactly one bucket.
+        assert_eq!(registry.runs.lock().unwrap().len(), 2);
+        drop(first);
+        assert_eq!(registry.runs.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn malformed_and_unknown_requests_do_the_same_digest_lookup_work() {
+        let registry = Arc::new(Registry::default());
+        for raw in ["not json".to_string(), "{}".into(), "{\"credential\":0}".into(),
+            "{\"credential\":\"bad\"}".into(), "x".repeat(2048),
+            body(&RunCredential::from_bytes(&[42; 32]))] {
+            let before = registry.lookups.load(std::sync::atomic::Ordering::Relaxed);
+            let response = query(&registry, Some("127.0.0.1:1234"), raw).await;
+            assert_eq!(response, (200, br#"{"active":false}"#.to_vec()));
+            assert_eq!(registry.lookups.load(std::sync::atomic::Ordering::Relaxed), before + 1);
+        }
     }
 
     #[test]
@@ -352,7 +558,7 @@ mod tests {
             assert!(value.get("credential").is_none());
             assert!(!String::from_utf8(bytes).unwrap().contains(active.credential.expose()));
         }
-        *registry.rate.lock().unwrap() = (Instant::now(), RATE_PER_MINUTE);
+        registry.runs.lock().unwrap().get_mut(&active.hash).unwrap().rate = (Instant::now(), RATE_PER_MINUTE);
         assert_eq!(query(&registry, Some("127.0.0.1:1234"), body(&active.credential)).await, baseline);
     }
 
@@ -385,7 +591,7 @@ mod tests {
                 let hash = Sha256::digest(n.to_be_bytes()).into();
                 let mut record = record();
                 record.expires_at = u64::MAX;
-                runs.insert(hash, Entry { record, deadline: Instant::now() + Duration::from_secs(60) });
+                runs.insert(hash, Entry { record, deadline: Instant::now() + Duration::from_secs(60), rate: (Instant::now(), 0) });
             }
         }
         assert!(registry.issue(record(), 10).is_err());

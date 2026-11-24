@@ -2,7 +2,7 @@
 
 use std::path::Path;
 use duduclaw_core::error::{DuDuClawError, Result};
-use duduclaw_core::run_credential::{ENV_RUN_CREDENTIAL, RunCredential};
+use duduclaw_core::run_credential::{ENV_IDENTITY_URL, IDENTITY_URL_FILE, ENV_RUN_CREDENTIAL, RunCredential};
 
 #[derive(clap::Subcommand)]
 pub(crate) enum IdentityCommands {
@@ -16,17 +16,14 @@ pub(crate) enum IdentityCommands {
 pub(crate) async fn run(home: &Path, command: IdentityCommands) -> Result<()> {
     let IdentityCommands::Whoami { json } = command;
     let inactive = || DuDuClawError::Security("Run identity is missing, inactive or unavailable".into());
+    require_run_identity_mode(duduclaw_core::execution_gate::isolation_required())?;
     let credential = std::env::var(ENV_RUN_CREDENTIAL).ok().and_then(RunCredential::parse)
         .ok_or_else(inactive)?;
-    let port = match std::env::var(duduclaw_core::run_credential::ENV_RUN_GATEWAY_PORT) {
-        Ok(port) => port.parse::<u16>().ok().filter(|port| *port != 0).ok_or_else(inactive)?,
-        Err(std::env::VarError::NotPresent) => duduclaw_core::gateway_port_for_home(home).0,
-        Err(_) => return Err(inactive()),
-    };
+    let url = discover_url(home, std::env::var(ENV_IDENTITY_URL)).ok_or_else(inactive)?;
     let client = reqwest::Client::builder().no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(5)).build().map_err(|_| inactive())?;
-    let mut response = client.post(format!("http://127.0.0.1:{port}{}", duduclaw_gateway::run_identity::ROUTE))
+    let mut response = client.post(url)
         .json(&serde_json::json!({"credential": credential.expose()}))
         .send().await.map_err(|_| inactive())?;
     if response.status() != reqwest::StatusCode::OK { return Err(inactive()); }
@@ -48,6 +45,62 @@ pub(crate) async fn run(home: &Path, command: IdentityCommands) -> Result<()> {
     };
     println!("{}", duduclaw_core::run_credential::redact(&output));
     Ok(())
+}
+
+fn require_run_identity_mode(protected: bool) -> Result<()> {
+    if protected {
+        return Err(DuDuClawError::Security(
+            "Protected mode uses its own capability identity; no run credential is issued (受保護模式使用獨立的 capability 身分，不簽發 run credential).".into()));
+    }
+    Ok(())
+}
+
+// Validate the final discovery target before sending a bearer proof. A present
+// but invalid environment override fails closed rather than using the file.
+fn discover_url(home: &Path, env: std::result::Result<String, std::env::VarError>) -> Option<reqwest::Url> {
+    let raw = match env {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => std::fs::read_to_string(home.join(IDENTITY_URL_FILE)).ok()?,
+        Err(_) => return None,
+    };
+    let url = reqwest::Url::parse(raw.trim()).ok()?;
+    if url.scheme() != "http" || url.host_str() != Some("127.0.0.1")
+        || url.port().is_none_or(|port| port == 0) || !url.username().is_empty() || url.password().is_some()
+        || url.path() != duduclaw_gateway::run_identity::ROUTE || url.query().is_some() || url.fragment().is_some() {
+        return None;
+    }
+    Some(url)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protected_mode_reports_its_separate_capability_identity() {
+        assert!(require_run_identity_mode(false).is_ok());
+        let error = require_run_identity_mode(true).unwrap_err().to_string();
+        assert!(error.contains("Protected mode uses its own capability identity"));
+        assert!(error.contains("no run credential is issued"));
+    }
+
+    #[test]
+    fn discovery_prefers_env_then_file_and_refuses_nonlocal_targets() {
+        let home = tempfile::tempdir().unwrap();
+        let url = format!("http://127.0.0.1:12345{}", duduclaw_gateway::run_identity::ROUTE);
+        let other = format!("http://127.0.0.1:12346{}", duduclaw_gateway::run_identity::ROUTE);
+        assert!(discover_url(home.path(), Err(std::env::VarError::NotPresent)).is_none());
+        std::fs::create_dir_all(home.path().join("run")).unwrap();
+        std::fs::write(home.path().join(IDENTITY_URL_FILE), &url).unwrap();
+        assert_eq!(discover_url(home.path(), Err(std::env::VarError::NotPresent)).unwrap().as_str(), url);
+        assert_eq!(discover_url(home.path(), Ok(other.clone())).unwrap().as_str(), other);
+        for raw in [String::new(), url.replace("127.0.0.1", "example.com"),
+            url.replace("127.0.0.1", "127.0.0.1.evil.example"), url.replace("http:", "https:"),
+            url.replace("127.0.0.1", "user@127.0.0.1"), format!("{url}?credential=x"),
+            format!("{url}#x"), url.replace("12345", "0")] {
+            assert!(discover_url(home.path(), Ok(raw)).is_none());
+        }
+    }
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]

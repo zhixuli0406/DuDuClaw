@@ -1209,8 +1209,9 @@ mod tests {
             }
             for (name, value) in command.as_std().get_envs() {
                 if name == duduclaw_core::run_credential::ENV_RUN_CREDENTIAL
-                    || name == duduclaw_core::run_credential::ENV_RUN_GATEWAY_PORT {
-                    expected.env(name, value.unwrap());
+                    || name == duduclaw_core::run_credential::ENV_IDENTITY_URL {
+                    if let Some(value) = value { expected.env(name, value); }
+                    else { expected.env_remove(name); }
                 }
             }
             assert_eq!(before, duduclaw_core::execution_gate::command_snapshot(&expected), "{id}");
