@@ -544,3 +544,14 @@ mode = "agent_writable"
         assert!(cached_selection("agent-x:sess-2").is_none());
     }
 }
+
+#[cfg(test)]
+#[test]
+fn rm209_malformed_policy_excludes_injection() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = WikiStore::new(tmp.path().to_path_buf());
+    store.write_page("notes/a.md", "---\ntitle: Note\nlayer: core\n---\ninjection secret").unwrap();
+    assert!(!select_pages(&store, "", 10000, None, true).is_empty());
+    std::fs::write(tmp.path().join(".scope.toml"), "not [ valid toml").unwrap();
+    assert!(select_pages(&store, "", 10000, None, true).is_empty());
+}

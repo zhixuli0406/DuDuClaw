@@ -458,3 +458,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+#[test]
+fn rm209_malformed_policy_denies_ai_visibility() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join(".scope.toml");
+    std::fs::write(&path, "not [ valid toml").unwrap();
+    assert!(!DepartmentVisibilityPolicy::load_from(&path).page_visible("notes/a.md", None));
+}

@@ -929,6 +929,89 @@ mod conversation_scope_tests {
         v["content"][0]["text"].as_str().unwrap_or("").to_string()
     }
 
+    fn case_insensitive(wiki: &Path) -> bool {
+        std::fs::write(wiki.join("CaseProbe"), "probe").unwrap();
+        let supported = wiki.join("caseprobe").exists();
+        std::fs::remove_file(wiki.join("CaseProbe")).unwrap();
+        if !supported { eprintln!("RM-209: skipping case-alias test on a case-sensitive filesystem"); }
+        supported
+    }
+
+    fn regression_home(home: &Path) -> std::path::PathBuf {
+        let wiki = home.join("agents/alice/wiki");
+        std::fs::create_dir_all(&wiki).unwrap();
+        std::fs::write(home.join("agents/alice/agent.toml"), "[agent]\nname = \"alice\"\n").unwrap();
+        wiki
+    }
+
+    #[tokio::test]
+    async fn rm209_case_alias_cannot_bypass_trust_quarantine() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki = regression_home(tmp.path());
+        if !case_insensitive(&wiki) { return; }
+        let store = duduclaw_memory::WikiStore::new(wiki);
+        store.write_page("notes/Bad.md", "---\ntitle: Bad\n---\nquarantined secret").unwrap();
+        let db = rusqlite::Connection::open(tmp.path().join("wiki_trust.db")).unwrap();
+        db.execute_batch("CREATE TABLE wiki_trust_state (agent_id TEXT, page_path TEXT, trust REAL, do_not_inject INTEGER); INSERT INTO wiki_trust_state VALUES ('alice','notes/Bad.md',1.0,1);").unwrap();
+        let result = handle_wiki_read_in(&serde_json::json!({"page_path":"notes/bad.md"}), tmp.path(), "alice", &ReadScope::Employee).await;
+        assert_eq!(result["isError"], true, "{}", text(&result));
+        assert!(!text(&result).contains("quarantined secret"));
+    }
+
+    #[tokio::test]
+    async fn rm209_reserved_alias_read_is_redacted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki = regression_home(tmp.path());
+        if !case_insensitive(&wiki) { return; }
+        let page = file_page(tmp.path(), "private", "private body", "conversation:telegram:A:m:1");
+        std::fs::write(wiki.join("_index.md"), format!("- [private title]({page})\n")).unwrap();
+        let result = handle_wiki_read_in(&serde_json::json!({"page_path":"_INDEX.md"}), tmp.path(), "alice", &ReadScope::Conversation(Some("telegram:B".into()))).await;
+        assert_ne!(result["isError"], true, "reserved reads should return a redacted listing");
+        assert!(!text(&result).contains("private title"));
+    }
+
+    #[tokio::test]
+    async fn rm209_reserved_alias_write_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki = regression_home(tmp.path());
+        if !case_insensitive(&wiki) { return; }
+        for (disk, alias) in [("_log.md", "_LOG.md"), ("_index.md", "_INDEX.md")] {
+            std::fs::write(wiki.join(disk), "original").unwrap();
+            let result = handle_wiki_write_in(&serde_json::json!({"page_path":alias,"content":"overwrite"}), tmp.path(), "alice", &ReadScope::Employee).await;
+            assert_eq!(result["isError"], true, "{}", text(&result));
+            assert_eq!(std::fs::read_to_string(wiki.join(disk)).unwrap(), "original");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rm209_cli_write_refuses_control_file_symlinks() {
+        for name in ["_index.md", "_log.md"] {
+            for dangling in [false, true] {
+                let tmp = tempfile::tempdir().unwrap();
+                let wiki = regression_home(tmp.path());
+                let victim = tmp.path().join("victim");
+                if !dangling { std::fs::write(&victim, "original").unwrap(); }
+                std::os::unix::fs::symlink(&victim, wiki.join(name)).unwrap();
+                let result = handle_wiki_write_in(&serde_json::json!({"page_path":"notes/new.md","content":"---\ntitle: New\n---\nbody"}), tmp.path(), "alice", &ReadScope::Employee).await;
+                assert_eq!(result["isError"], true, "{name}: {}", text(&result));
+                if dangling { assert!(!victim.exists()); }
+                else { assert_eq!(std::fs::read_to_string(victim).unwrap(), "original"); }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rm209_cli_listing_hides_archive_like_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki = regression_home(tmp.path());
+        let store = duduclaw_memory::WikiStore::new(wiki);
+        store.write_page("_archive/old.md", "---\ntitle: Archived secret\n---\nold").unwrap();
+        assert!(store.list_pages().unwrap().is_empty());
+        let result = handle_wiki_ls_in(&serde_json::json!({}), tmp.path(), "alice", &ReadScope::Employee).await;
+        assert!(!text(&result).contains("old.md"), "{}", text(&result));
+    }
+
     /// File an auto page the way the knowledge route does.
     fn file_page(home: &Path, slug: &str, original: &str, source_id: &str) -> String {
         let store = duduclaw_memory::WikiStore::new(home.join("agents").join("alice").join("wiki"));

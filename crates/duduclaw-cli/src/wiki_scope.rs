@@ -902,3 +902,13 @@ mod tests {
         assert!(p2.check_write("identity/x.md", &caller).is_ok());
     }
 }
+
+#[cfg(test)]
+#[test]
+fn rm209_malformed_policy_denies_shared_writes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join(".scope.toml");
+    std::fs::write(&path, "not [ valid toml").unwrap();
+    let policy = WikiScopePolicy::load_from(&path);
+    assert!(policy.check_write("notes/a.md", &WriterCapability::for_agent("alice")).is_err());
+}
