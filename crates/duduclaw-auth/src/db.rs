@@ -290,6 +290,14 @@ impl UserDb {
             );
             CREATE INDEX IF NOT EXISTS idx_chid_user ON channel_identities(user_id);
 
+            -- Only authenticated HTTP DM events may record these destinations.
+            CREATE TABLE IF NOT EXISTS verified_googlechat_dms (
+                account_id TEXT NOT NULL, space_id TEXT NOT NULL,
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                principal_id TEXT NOT NULL, verified_at TEXT NOT NULL,
+                PRIMARY KEY(account_id, space_id)
+            );
+
             CREATE TABLE IF NOT EXISTS otp_challenges (
                 id TEXT PRIMARY KEY,
                 user_id TEXT NOT NULL,

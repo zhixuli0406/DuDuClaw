@@ -322,3 +322,24 @@ it('keeps the existing MFA policy switch reachable on Personal for an Admin', as
     overview.mockRestore();
   }
 });
+
+describe('Knowledge owner self-add master setting', () => {
+  it('defaults off and saves an administrator opt-in', async () => {
+    useAuthStore.setState({ user: { id: 'admin', role: 'admin' } } as never);
+    mockWsClient.call.mockResolvedValue({ ...SECURITY_RESPONSE, config: '[knowledge]\n', success: true });
+    renderWithProviders(<SecurityPage />);
+    const toggle = await screen.findByRole('switch', { name: 'Allow owners to enable AI self-add' });
+    await waitFor(() => expect(toggle).toBeEnabled());
+    expect(toggle).not.toBeChecked();
+    fireEvent.click(toggle);
+    fireEvent.click(screen.getByRole('button', { name: 'Save outgoing data guard' }));
+    await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('system.update_config', { knowledge: { owner_self_add: true } }));
+  });
+
+  it('hides the master switch from non-administrators', () => {
+    useAuthStore.setState({ user: { id: 'member', role: 'employee' } } as never);
+    mockWsClient.call.mockResolvedValue(SECURITY_RESPONSE);
+    renderWithProviders(<SecurityPage />);
+    expect(screen.queryByRole('switch', { name: 'Allow owners to enable AI self-add' })).toBeNull();
+  });
+});

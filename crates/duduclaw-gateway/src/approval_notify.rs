@@ -387,7 +387,17 @@ fn dashboard_only_targets(
     reminder: bool,
 ) -> Vec<(String, String)> {
     let origin = origin_target();
-    let base = match (
+    let kb = rec.action_kind == crate::knowledge::add_source_approval::ACTION_KIND;
+    let owners = if kb { crate::knowledge::add_source_chat::owner_targets(home_dir, rec) } else { vec![] };
+    let base = if kb {
+        let mut targets: Vec<_> = crate::knowledge::add_source_chat::decider_targets(home_dir, rec)
+            .into_iter().map(|(_, ch, id)| (ch, id)).collect();
+        if let Some(target) = crate::goal_notify::agent_notify_target(home_dir, &rec.agent_id) { targets.push(target); }
+        targets.extend(approver_links(home_dir));
+        let mut seen = std::collections::HashSet::new();
+        targets.retain(|t| seen.insert(t.clone()));
+        targets
+    } else { match (
         reminder,
         rec.notify_channel.as_deref(),
         rec.notify_chat_id.as_deref(),
@@ -400,6 +410,7 @@ fn dashboard_only_targets(
             crate::goal_notify::agent_notify_target(home_dir, &rec.agent_id),
             approver_links(home_dir),
         ),
+    }
     };
     // R-L1: the origin recorded on the card at filing (captured before the
     // distillation was spawned) is the reliable one; the task-local is a
@@ -412,7 +423,8 @@ fn dashboard_only_targets(
         _ => None,
     };
     base.into_iter()
-        .filter(|t| origin.as_ref() != Some(t) && recorded.as_ref() != Some(t))
+        .filter(|t| (origin.as_ref() != Some(t) && recorded.as_ref() != Some(t))
+            || (kb && crate::knowledge::add_source_chat::origin_exception(rec, t, &owners)))
         .collect()
 }
 
@@ -474,22 +486,37 @@ async fn push_dashboard_only(
         text.push_str(&format!("\n\n👉 {url}"));
     }
     let http = reqwest::Client::new();
+    let kb = rec.action_kind == crate::knowledge::add_source_approval::ACTION_KIND;
+    let mut delivered = None;
+    let mut notified_users = std::collections::HashSet::new();
     for (channel, chat_id) in targets {
-        let Some(token) =
-            crate::goal_notify::channel_token(home_dir, &rec.agent_id, &channel).await
-        else {
-            continue;
+        // Re-read owner and destinations at delivery time. Never reuse a
+        // queued content preview after an ACL or identity change.
+        let uid = if kb {
+            crate::decision_notify::open_user_db(home_dir).ok().flatten().and_then(|db| {
+                db.list_users().ok()?.into_iter().find_map(|u| {
+                    db.verified_dm_destinations_for_user(&u.id).ok()?.iter()
+                        .any(|d| d.channel == channel && d.channel_user_id == chat_id).then_some(u.id)
+                })
+            })
+        } else { None };
+        if uid.as_ref().is_some_and(|u| notified_users.contains(u)) { continue; }
+        let Some(token) = crate::goal_notify::channel_token_for_target(home_dir, &rec.agent_id, &channel, &chat_id).await else { continue; };
+        if duduclaw_mcp_boundary::io_authority::verify_before_io().is_err() { return delivered; }
+        let is_owner = kb && crate::knowledge::add_source_chat::owner_targets(home_dir, rec)
+            .contains(&(channel.clone(), chat_id.clone()));
+        let sent = if is_owner {
+            crate::knowledge::add_source_chat::push_owner_card(home_dir, &http, rec, &channel, &token, &chat_id).await
+        } else {
+            crate::channel_sender::send_plain_text(home_dir, &http, &channel, &token, &chat_id, &text).await
         };
-        if duduclaw_mcp_boundary::io_authority::verify_before_io().is_err() { return None; }
-        if crate::channel_sender::send_plain_text(
-            home_dir, &http, &channel, &token, &chat_id, &text,
-        )
-        .await
-        {
-            return Some((channel, chat_id));
+        if sent {
+            if !kb { return Some((channel, chat_id)); }
+            if let Some(uid) = uid { notified_users.insert(uid); }
+            if delivered.is_none() { delivered = Some((channel, chat_id)); }
         }
     }
-    None
+    delivered
 }
 
 async fn push(home_dir: &Path, rec: &ApprovalRecord, reminder: bool) -> Option<(String, String)> {

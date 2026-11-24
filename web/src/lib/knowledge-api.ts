@@ -29,6 +29,8 @@ export interface KbCollection {
   department: string | null;
   sensitivity: KbSensitivity;
   embedding_policy: 'inherit' | 'local_only';
+  owner_self_add?: boolean;
+  owner_self_add_available?: boolean;
   acl_revision: number;
   created_by: string;
   created_at: string;
@@ -293,6 +295,7 @@ export interface KbCollectionPatch {
   department?: string;
   sensitivity?: KbSensitivity;
   embedding_policy?: 'inherit' | 'local_only';
+  owner_self_add?: boolean;
 }
 
 const call = <T>(method: string, params?: Record<string, unknown>) =>

@@ -117,6 +117,7 @@ pub(crate) const CONFIG_KEY_TYPES: &[(&str, &str, Ty)] = &[
     ("miniapp", "enabled", Bool),
     ("external_status", "enabled", Bool),
     ("knowledge", "enabled", Bool),
+    ("knowledge", "owner_self_add", Bool),
     ("knowledge", "max_source_bytes", UInt),
     ("knowledge", "max_source_chars", UInt),
     ("knowledge", "max_sources_per_collection", UInt),

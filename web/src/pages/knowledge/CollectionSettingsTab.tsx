@@ -11,7 +11,7 @@ import { KB_SENSITIVITIES, knowledgeApi, type KbCollection, type KbCollectionPat
 /** Only the fields that differ from the saved collection. */
 export function settingsPatch(
   saved: KbCollection,
-  form: { name: string; description: string; department: string; sensitivity: KbSensitivity; localOnly: boolean },
+  form: { name: string; description: string; department: string; sensitivity: KbSensitivity; localOnly: boolean; ownerSelfAdd?: boolean },
 ): KbCollectionPatch {
   const patch: KbCollectionPatch = {};
   if (form.name.trim() !== saved.name) patch.name = form.name.trim();
@@ -20,6 +20,7 @@ export function settingsPatch(
   if (form.sensitivity !== saved.sensitivity) patch.sensitivity = form.sensitivity;
   const policy = form.localOnly ? 'local_only' : 'inherit';
   if (policy !== saved.embedding_policy) patch.embedding_policy = policy;
+  if (saved.owner_self_add_available && form.ownerSelfAdd !== undefined && form.ownerSelfAdd !== (saved.owner_self_add ?? false)) patch.owner_self_add = form.ownerSelfAdd;
   return patch;
 }
 
@@ -45,6 +46,7 @@ export function CollectionSettingsTab({
   const [department, setDepartment] = useState(collection.department ?? '');
   const [sensitivity, setSensitivity] = useState<KbSensitivity>(collection.sensitivity);
   const [localOnly, setLocalOnly] = useState(collection.embedding_policy === 'local_only');
+  const [ownerSelfAdd, setOwnerSelfAdd] = useState(collection.owner_self_add ?? false);
   const [saving, setSaving] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -55,9 +57,10 @@ export function CollectionSettingsTab({
     setDepartment(collection.department ?? '');
     setSensitivity(collection.sensitivity);
     setLocalOnly(collection.embedding_policy === 'local_only');
+    setOwnerSelfAdd(collection.owner_self_add ?? false);
   }, [collection]);
 
-  const patch = settingsPatch(collection, { name, description, department, sensitivity, localOnly });
+  const patch = settingsPatch(collection, { name, description, department, sensitivity, localOnly, ownerSelfAdd });
   const dirty = Object.keys(patch).length > 0;
 
   const save = async () => {
@@ -137,6 +140,15 @@ export function CollectionSettingsTab({
           </div>
           <Switch aria-labelledby="kb-set-local-label" checked={localOnly} onCheckedChange={(v) => setLocalOnly(Boolean(v))} />
         </div>
+        {collection.owner_self_add_available === true && (
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <p id="kb-set-self-add-label" className="text-sm font-medium">{t('kb.selfAdd.label')}</p>
+              <p className="text-xs text-muted-foreground">{t('kb.selfAdd.description')}</p>
+            </div>
+            <Switch aria-labelledby="kb-set-self-add-label" checked={ownerSelfAdd} onCheckedChange={(v) => setOwnerSelfAdd(Boolean(v))} />
+          </div>
+        )}
         <div className="flex justify-end">
           <Button variant="brand" size="sm" onClick={() => void save()} disabled={!dirty || saving || name.trim() === ''}>
             {saving && <Loader2 aria-hidden className="motion-safe:animate-spin" />}

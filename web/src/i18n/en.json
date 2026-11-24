@@ -11647,5 +11647,9 @@
   "users.avatar.conflicts": "AI avatar conflicts to resolve",
   "users.avatar.conflictsHint": "These members share a primary AI. The upgrade left their avatars unassigned. Edit each member to assign a different AI avatar.",
   "users.avatar.inUse": "This AI is already another member’s avatar. Choose another AI employee.",
-  "users.avatar.loadError": "Unable to load AI avatar conflicts. Refresh to try again."
+  "users.avatar.loadError": "Unable to load AI avatar conflicts. Refresh to try again.",
+  "kb.selfAdd.label": "Let my AI add without approval",
+  "kb.selfAdd.description": "Only your verified requests to your avatar AI qualify, and the collection must grant access only to you and that AI. Limited to 10 imports per collection per hour; otherwise approval is required.",
+  "kb.selfAdd.adminLabel": "Allow owners to enable AI self-add",
+  "kb.selfAdd.adminDescription": "Off by default. Owners must also opt in in collection settings. Shared collections still require approval."
 }

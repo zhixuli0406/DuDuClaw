@@ -53,6 +53,26 @@ describe('CollectionSettingsTab', () => {
     expect(screen.queryByLabelText('Department (optional)')).toBeNull();
   });
 
+  it('shows and saves the self-add toggle only when the server permits the owner', async () => {
+    const user = userEvent.setup();
+    mockRpc({ 'knowledge.collections.update': (p) => ({ collection: collection({ owner_self_add: p.owner_self_add as boolean }) }) });
+    renderAt(<CollectionSettingsTab collection={collection({ owner_self_add: false, owner_self_add_available: true })} onSaved={vi.fn()} onDeleted={vi.fn()} />);
+    await user.click(screen.getByRole('switch', { name: 'Let my AI add without approval' }));
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(callsOf('knowledge.collections.update')).toEqual([
+      { id: 'col_1', expected_updated_at: '2026-10-20T08:00:00.000Z', owner_self_add: true },
+    ]));
+  });
+
+  it('hides self-add for a non-owner or a disabled master switch', () => {
+    mockRpc({});
+    renderAt(<CollectionSettingsTab collection={collection({ owner_self_add_available: false })} onSaved={vi.fn()} onDeleted={vi.fn()} />);
+    expect(screen.queryByRole('switch', { name: 'Let my AI add without approval' })).toBeNull();
+    const c = collection({ owner_self_add_available: false });
+    expect(settingsPatch(c, { name: c.name, description: c.description, department: c.department ?? '',
+      sensitivity: c.sensitivity, localOnly: false, ownerSelfAdd: true })).toEqual({});
+  });
+
   it('settingsPatch', () => {
     const c = collection({ department: 'hr' });
     const base = { name: c.name, description: c.description, department: 'hr', sensitivity: c.sensitivity, localOnly: false };

@@ -11647,5 +11647,9 @@
   "users.avatar.conflicts": "AI分身の競合",
   "users.avatar.conflictsHint": "以下のメンバーは同じメインAIを共有しているため、アップグレードでは分身を設定していません。各メンバーを編集して異なるAI分身を指定してください。",
   "users.avatar.inUse": "このAIは別のメンバーの分身です。別のAIスタッフを選択してください。",
-  "users.avatar.loadError": "AI分身の競合を読み込めません。再読み込みしてください。"
+  "users.avatar.loadError": "AI分身の競合を読み込めません。再読み込みしてください。",
+  "kb.selfAdd.label": "自分の AI による追加を承認不要にする",
+  "kb.selfAdd.description": "本人が自分の分身 AI に依頼し、コレクションの権限が本人とその AI だけの場合に限ります。1 コレクションにつき毎時 10 件まで。それ以外は承認が必要です。",
+  "kb.selfAdd.adminLabel": "所有者による AI の承認不要設定を許可",
+  "kb.selfAdd.adminDescription": "初期設定はオフです。所有者がコレクション設定でも有効にする必要があります。共有コレクションは引き続き承認が必要です。"
 }

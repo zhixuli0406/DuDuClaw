@@ -13,7 +13,7 @@
 
 /// Channels supported by the bound in-chat decision sender/parser.
 pub fn supports_text_decisions(channel: &str) -> bool {
-    matches!(channel, "telegram" | "discord" | "slack" | "line")
+    matches!(channel, "telegram" | "discord" | "slack" | "line" | "googlechat")
 }
 
 pub fn pending_confirmation_hint(in_chat: bool) -> &'static str {

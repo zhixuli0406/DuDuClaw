@@ -734,12 +734,14 @@ function SecurityCard({
 // Credential Proxy and Mount Guard cards — they had no other call site.
 
 function EgressGuardSection({ status, onSaved }: { status: SecurityStatus | null; onSaved: () => Promise<void> }) {
+  const isAdmin = useAuthStore((s) => s.user?.role) === 'admin';
   const intl = useIntl();
   const t = (id: string) => intl.formatMessage({ id });
   const form = useConfigForm((tables) => ({
     'security.egress_guard': tables.security?.egress_guard ?? 'shadow',
     'security.recipient_guard': tables.security?.recipient_guard ?? 'shadow',
     'security.mail_requester_approval': tables.security?.mail_requester_approval ?? true,
+    'knowledge.owner_self_add': tables.knowledge?.owner_self_add ?? false,
   }));
   const mode = vStr(form.values, 'security.egress_guard');
   const modes = ['off', 'shadow', 'ask', 'block'];
@@ -777,6 +779,13 @@ function EgressGuardSection({ status, onSaved }: { status: SecurityStatus | null
           />
         </div>
         <p className="text-xs text-muted-foreground">{t('security.mailRequester.description')}</p>
+        {isAdmin && <><div className="flex items-center justify-between gap-3">
+          <label htmlFor="knowledge-owner-self-add" className="text-sm">{t('kb.selfAdd.adminLabel')}</label>
+          <Switch id="knowledge-owner-self-add" checked={form.values['knowledge.owner_self_add'] === true}
+            onCheckedChange={(value) => form.set('knowledge.owner_self_add', value)}
+            disabled={!form.loaded || form.saving || form.loadError != null} />
+        </div>
+        <p className="text-xs text-muted-foreground">{t('kb.selfAdd.adminDescription')}</p></>}
         {status?.egress_bash_exposure && status.egress_bash_exposure.length > 0 && (
           <div role="alert" className="space-y-2 rounded-lg border border-warning/30 bg-warning/10 p-3 text-sm">
             <p>{t('security.egress.bashWarning')}</p>

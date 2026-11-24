@@ -11647,5 +11647,9 @@
   "users.avatar.conflicts": "待處理的 AI 分身衝突",
   "users.avatar.conflictsHint": "以下成員共用同一位主要 AI，升級未自動指定分身。請編輯成員，分別指定不同的 AI 分身。",
   "users.avatar.inUse": "這位 AI 已是其他成員的分身，請選擇另一位 AI 員工。",
-  "users.avatar.loadError": "無法載入 AI 分身衝突，請重新整理後再試。"
+  "users.avatar.loadError": "無法載入 AI 分身衝突，請重新整理後再試。",
+  "kb.selfAdd.label": "我的 AI 加入免核准",
+  "kb.selfAdd.description": "只有你交辦自己的 AI 分身，且集合只授權給你和該分身時，才會直接加入。每集合每小時最多 10 筆；其他情況仍需核准。",
+  "kb.selfAdd.adminLabel": "允許擁有者設定 AI 加入免核准",
+  "kb.selfAdd.adminDescription": "預設關閉。開啟後，集合擁有者可在集合設定中另行勾選；共用集合仍需核准。"
 }
