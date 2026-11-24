@@ -1732,6 +1732,9 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     let webchat_ctx = reply_ctx.clone();
     info!("boot: channel startup done — starting schedulers");
 
+    crate::run_identity::install_background_issuer()
+        .map_err(duduclaw_core::error::DuDuClawError::Security)?;
+
     // Start unified heartbeat scheduler (per-agent: evolution + cron + monitoring)
     // Replaces the old start_evolution_timers — each agent's HeartbeatConfig
     // now drives meso/macro reflections at its own interval or cron schedule.
@@ -3536,6 +3539,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // Always mounted; every request must come from a loopback peer, carry
     // the gateway-internal MCP key and a verified employee identity token
     // (`computer_use_sessions::auth`). Own state + 64 KiB body cap.
+    app = app.merge(crate::run_identity::router());
     app = app.merge(crate::computer_use_sessions::http::router(
         computer_use_sessions.clone(),
     ));

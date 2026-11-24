@@ -2065,8 +2065,10 @@ fn finish_mcp_tool_registry(
     agent_id: &str,
     home: &Path,
     registry: Option<duduclaw_llm::ToolRegistry>,
+    identity: crate::run_identity::RunGuard,
 ) -> Option<duduclaw_llm::ToolRegistry> {
     let mut registry = registry?;
+    registry.hold_run_identity(Box::new(identity));
     let observer = crate::credential_declaration::ToolObservation::new(home, agent_id);
     if registry.register_client_boundary(0, std::sync::Arc::new(observer)).is_err() {
         warn!("credential observation unavailable for internal MCP tools");
@@ -2156,13 +2158,21 @@ pub(crate) async fn build_mcp_tool_registry_checked_in(
     )
     .await?;
 
+    let run_identity = crate::run_identity::issue(&home_dir, agent_id, "api-tool-loop",
+        crate::runtime_config::call_timeout_secs(Some(&agent_dir)))?;
+    let with_identity = |env: &[(String, String)]| {
+        let mut env: std::collections::HashMap<String, String> = env.iter().cloned().collect();
+        run_identity.apply_pty(&mut env);
+        env.into_iter().collect::<Vec<_>>()
+    };
+
     // Connect the internal duduclaw MCP server (always client 0 → wins name
     // collisions against any external server).
     let connect_internal = || async {
         duduclaw_llm::McpClient::connect(
             &bin.to_string_lossy(),
             &["mcp-server".to_string()],
-            &mcp_client_envs_in(agent_id, &home_dir),
+            &with_identity(&mcp_client_envs_in(agent_id, &home_dir)),
             duduclaw_llm::DEFAULT_MCP_TIMEOUT,
         )
         .await.map(|mut client| {
@@ -2195,7 +2205,7 @@ pub(crate) async fn build_mcp_tool_registry_checked_in(
                 None
             }
         };
-        return Ok(finish_mcp_tool_registry(agent_id, &home_dir, registry));
+        return Ok(finish_mcp_tool_registry(agent_id, &home_dir, registry, run_identity));
     }
 
     let mut clients = vec![(
@@ -2229,7 +2239,7 @@ pub(crate) async fn build_mcp_tool_registry_checked_in(
                 duduclaw_llm::McpClient::connect_scrubbed(
                     &ext.command,
                     &ext.args,
-                    &ext.env,
+                    &with_identity(&ext.env),
                     duduclaw_llm::DEFAULT_MCP_TIMEOUT,
                 )
                 .await
@@ -2262,7 +2272,7 @@ pub(crate) async fn build_mcp_tool_registry_checked_in(
         match duduclaw_llm::McpClient::connect_scrubbed(
             &server.command,
             &server.args,
-            &server.env,
+            &with_identity(&server.env),
             duduclaw_llm::DEFAULT_MCP_TIMEOUT,
         )
         .await
@@ -2333,7 +2343,7 @@ pub(crate) async fn build_mcp_tool_registry_checked_in(
             .ok()
         }
     };
-    Ok(finish_mcp_tool_registry(agent_id, &home_dir, registry))
+    Ok(finish_mcp_tool_registry(agent_id, &home_dir, registry, run_identity))
 }
 
 /// Where a direct-API key came from — the pure output of [`choose_key_source`].
@@ -4075,6 +4085,7 @@ async fn call_claude_streaming(
                         return Err(format!("claude CLI read error: {e}"));
                     }
                     Ok(Some(line)) => {
+                        let line = duduclaw_core::run_credential::redact(&line).into_owned();
                         keepalive.reset();
                         if line.trim().is_empty() { continue; }
 
@@ -4496,6 +4507,7 @@ fn bind_delegation_mcp_config(
 /// child and drops it afterwards.
 #[allow(dead_code)]
 pub(crate) struct ClaudeCmdGuards {
+    identity: crate::run_identity::RunGuard,
     /// `--system-prompt-file` temp file (BE-C1).
     prompt: Option<tempfile::TempPath>,
     /// Frozen `--mcp-config` copy, held through child exit.
@@ -4870,9 +4882,13 @@ fn prepare_claude_cmd(
     // team role member gets its own scaffold's identity, never its parent's.
     crate::agent_hook_installer::apply_hook_identity_env(&mut cmd, config_dir);
 
+    let run_identity = crate::run_identity::issue(home_dir, spawned.unwrap_or("system"), "claude",
+        crate::runtime_config::claude_timeout_secs(home_dir, config_dir))?;
+    run_identity.apply(&mut cmd);
     Ok((
         cmd,
         ClaudeCmdGuards {
+            identity: run_identity,
             prompt: prompt_guard,
             mcp_proxy: mcp_proxy_guard,
             turn,
@@ -4924,6 +4940,13 @@ mod role_cache_ttl_tests {
             .env_remove(crate::on_behalf_of::context::ENV_CONTEXT)
             .env("CLAUDE_CONFIG_DIR", "fixture account")
             .env_remove("ANTHROPIC_API_KEY");
+        let _proof = crate::run_identity::assert_command_identity(&command, true);
+        for (name, value) in command.as_std().get_envs() {
+            if name == duduclaw_core::run_credential::ENV_RUN_CREDENTIAL
+                || name == duduclaw_core::run_credential::ENV_RUN_GATEWAY_PORT {
+                expected.env(name, value.unwrap());
+            }
+        }
         assert_eq!(before, duduclaw_core::execution_gate::command_snapshot(&expected));
         assert_eq!(duduclaw_core::execution_gate::local_command_roundtrip(command).await.unwrap(), before);
     }
@@ -5149,6 +5172,8 @@ async fn call_claude_with_env(
             cmd.env(key, value);
         }
     }
+
+    _cmd_guards.identity.apply(&mut cmd);
 
     // Native OS sandbox (opt-in via `[capabilities] native_sandbox`). Layered on
     // top of the `--allowedTools`/`--disallowedTools` restrictions; fail-closed

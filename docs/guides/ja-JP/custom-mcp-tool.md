@@ -5,6 +5,36 @@
 
 ---
 
+
+## 呼び出し元の身分を取得・検証する（Getting and verifying the caller identity）
+
+The AI cannot claim a different identity (another AI, another user, another conversation). It can still use its own identity — tools and the AI's shell run as the same OS user on non-isolated installs. The working directory is not an identity.
+
+この節は gateway が管理する実行を対象とします。単独の `duduclaw agent` ターミナルセッションはこの gateway registry に未接続です。インストール・バージョン・認証状態の確認と、任意の `/model` メニュー確認も身分付きの作業ターンではありません。
+
+AI は別の AI、別のユーザー、別の会話の身分を申告できません。ただし、自分の身分は利用できます。非隔離環境ではツールと AI のシェルは同じ OS ユーザーで動作します。**作業ディレクトリは身分ではありません**。
+
+DuDuClaw が起動したローカルツールは `DUDUCLAW_RUN_CREDENTIAL` を読み、ツールを呼び出すたびにローカル gateway で検証してください。下記の CLI も利用できます。cwd、表示名、ツール引数、`DUDUCLAW_ON_BEHALF_OF` は証明になりません。**照会はローカルのみ。資格情報を転送しないでください。** URL、argv、ログ、ツール結果、会話記録にも含めないでください。ポート変数は接続先のヒントであり、身分証明ではありません。未設定の場合、CLI は通常の gateway 検出を使います。
+
+```sh
+duduclaw identity whoami --json
+
+# Keep the credential out of argv and shell history; send it on stdin.
+python3 -c 'import json, os; print(json.dumps({"credential": os.environ["DUDUCLAW_RUN_CREDENTIAL"]}))' | \
+  curl --silent --show-error --noproxy '*' --max-time 5 \
+    -H 'Content-Type: application/json' --data-binary @- \
+    "http://127.0.0.1:${DUDUCLAW_RUN_GATEWAY_PORT:-18889}/api/internal/identity/introspect"
+```
+
+有効な応答には `active: true`、`agent_id`、`principal`、`session_id`、`turn_id`、`task_id`、`runtime`、`issued_at`、`expires_at`（Unix 秒）が含まれます。人間は `{"type":"human","user_id":"…"}`、cron・heartbeat・task は `{"type":"background","kind":"…"}` です。未確認の依頼者は background／unattributed で、管理者にはなりません。session と task は null の場合があります。モデルの申告ではなく gateway の登録情報です。検証結果をツール独自の権限規則に照合してください。身分確認だけでは権限は付与されません。
+
+形式不正、不明、期限切れ、失効済みはすべて HTTP 200 と `{"active":false}` を返します。非 loopback、接続元不明、レート制限超過も同じ拒否応答です。gateway 全体で毎分 600 回、リクエストは最大 1 KiB です。資格情報がない場合、無効な場合、gateway に接続できない場合は CLI が非ゼロで終了します。検証失敗時は拒否し、有効という結果を次の呼び出しに持ち越さないでください。
+
+CLI の各試行に、32 ランダムバイトから生成した新しい `ddc_run_` 資格情報を発行します。gateway は SHA-256 ハッシュのみを最大 8,192 件保持します。終了・エラー・キャンセルで guard が失効させ、有効期限は実行タイムアウト＋60 秒、最長 6 時間です。gateway 再起動ですべて無効になります。ローカル API ツールループの lease は tool registry の終了まで保持します。`mcp-proxy` は新しい変数をローカルのサードパーティーサーバーへ渡し、従来の身分変数は引き続き除去します。Codex は MCP `env_vars` 対応が必要で、資格情報を argv に含めません。各バージョンの shell／MCP 継承は実機検証が必要です。
+
+この保証は申告の偽造を防ぐもので、同じ OS ユーザーのプロセスによる有効な bearer 資格情報の窃取は防げません。ローカルツールは信頼できるものを使い、敵対的な処理には OS 隔離を使用してください。保護モードは独自の capability records を維持します。既存の `DUDUCLAW_AGENT_TOKEN` と DuDuClaw MCP server の身分検証は変更しません。
+
+
 ## Overview
 
 DuDuClawはstdin/stdout上のJSON-RPC 2.0経由で、200以上のMCPツールを公開しています（v1.56時点で206個）。本ガイドでは、Claude Codeと連携するカスタムツールを追加する方法を説明します。

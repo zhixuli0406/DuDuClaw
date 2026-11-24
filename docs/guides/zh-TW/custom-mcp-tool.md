@@ -5,6 +5,36 @@
 
 ---
 
+
+## 取得與查證呼叫者身分（Getting and verifying the caller identity）
+
+The AI cannot claim a different identity (another AI, another user, another conversation). It can still use its own identity — tools and the AI's shell run as the same OS user on non-isolated installs. The working directory is not an identity.
+
+本節適用 gateway 管理的執行。獨立的 `duduclaw agent` 終端互動模式尚未接入這份 gateway registry。安裝／版本／登入狀態探測，以及選用的 `/model` 選單探測，也不屬於帶身分的工作回合。
+
+AI 不能把憑證改成另一位 AI、另一位使用者或另一段對話；仍可使用自己的身分。未隔離安裝中，工具與 AI 的 shell 使用同一個作業系統帳號。**工作目錄不是身分**。
+
+DuDuClaw 啟動的本機工具可讀取 `DUDUCLAW_RUN_CREDENTIAL`，每次呼叫工具時向本機 gateway 查證，或執行下列指令。不要信任 cwd、顯示名稱、工具參數或 `DUDUCLAW_ON_BEHALF_OF`。**只在本機查詢，絕不轉送憑證**；不要把它放進網址、命令列參數、日誌、工具結果或對話紀錄。連接埠變數只是尋址提示，不是身分證明；未提供時，CLI 使用既有的 gateway 尋址方式。
+
+```sh
+duduclaw identity whoami --json
+
+# Keep the credential out of argv and shell history; send it on stdin.
+python3 -c 'import json, os; print(json.dumps({"credential": os.environ["DUDUCLAW_RUN_CREDENTIAL"]}))' | \
+  curl --silent --show-error --noproxy '*' --max-time 5 \
+    -H 'Content-Type: application/json' --data-binary @- \
+    "http://127.0.0.1:${DUDUCLAW_RUN_GATEWAY_PORT:-18889}/api/internal/identity/introspect"
+```
+
+有效時回傳 `active: true`、`agent_id`、`principal`、`session_id`、`turn_id`、`task_id`、`runtime`、`issued_at` 與 `expires_at`（Unix 秒數）。人的身分為 `{"type":"human","user_id":"…"}`；排程、心跳與任務為 `{"type":"background","kind":"…"}`。未確認的交辦人歸為 background／unattributed，不會變成管理員。對話與任務代號可以是 null。這些值來自 gateway 的登記，不能由模型自填；工具仍須依查證後的身分檢查自己的權限規則。
+
+格式錯誤、不存在、過期或撤銷一律回 HTTP 200 與 `{"active":false}`；非 loopback、無法取得連線來源、超過限速也回相同拒絕。整個 gateway 每分鐘最多查詢 600 次，每個請求上限 1 KiB。憑證缺失、無效或 gateway 無法連線時，CLI 以非零狀態結束。查證失敗就拒絕，不跨次快取有效結果。
+
+每次 CLI 嘗試都使用新的 `ddc_run_` 憑證，由 32 個隨機位元組產生。gateway 只存 SHA-256 雜湊，最多保留 8,192 筆。執行結束、錯誤或取消時由 guard 撤銷；期限為執行逾時加 60 秒，最長六小時；gateway 重啟後全部失效。本機 API 工具迴圈的憑證由 tool registry 持有，隨它結束撤銷。`mcp-proxy` 會把新變數傳給本機第三方伺服器，舊身分變數仍會移除。Codex 需支援 MCP `env_vars`，憑證只走環境變數，不放進 argv；各安裝版本的 shell／MCP 繼承仍待實機驗證。
+
+這項保證涵蓋偽造聲明，無法阻止同一作業系統帳號的程序竊取另一張仍有效的 bearer 憑證。請只執行可信任的本機工具；不可信任的工作需要作業系統隔離。受保護模式保留自己的 capability records；既有 `DUDUCLAW_AGENT_TOKEN` 與 DuDuClaw MCP server 的身分驗證維持原樣。
+
+
 ## Overview
 
 DuDuClaw 透過 stdin/stdout 上的 JSON-RPC 2.0，曝露 200+ 個 MCP 工具（截至 v1.56 為 206 個）。本指南說明如何新增與 Claude Code 整合的自訂工具。

@@ -148,7 +148,10 @@ pub(crate) fn override_args(
             &toml_string_literal("auto"),
         );
 
-        let mut forwarded: Vec<String> = Vec::new();
+        let mut forwarded = if supports_env_vars {
+            vec![duduclaw_core::run_credential::ENV_RUN_CREDENTIAL.to_string(),
+                duduclaw_core::run_credential::ENV_RUN_GATEWAY_PORT.to_string()]
+        } else { Vec::new() };
         for (k, v) in &s.env {
             if !is_safe_config_key_segment(k) {
                 warn!(runtime = "codex", server = %name, key = %k, "MCP env key is not a bare TOML key — dropped");

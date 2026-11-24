@@ -527,6 +527,7 @@ pub mod screenshot_audit;
 pub mod search_index;
 /// Credential redaction for operator-visible channel diagnostics (WP12).
 pub mod secret_redact;
+pub mod run_identity;
 pub mod server;
 mod mfa;
 mod mfa_email;

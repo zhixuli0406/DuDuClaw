@@ -1,5 +1,11 @@
 # セキュリティ防御
 
+
+## 実行ごとの呼び出し元の身分（RM-208）
+
+ローカルツールは `DUDUCLAW_RUN_CREDENTIAL` を loopback で照会するか、`duduclaw identity whoami --json` で AI・依頼者・会話を確認できます。gateway はハッシュのみを保持し、終了・キャンセル・期限切れ・再起動で無効になります。作業ディレクトリは身分ではありません。非隔離環境の AI は自分の資格情報を利用でき、同じ OS ユーザーのプロセスは他の有効な資格情報を窃取できる可能性があります。保護モードは独自の capability records を維持し、従来の agent token と MCP 身分検証は変更しません。[開発ガイド](../../guides/ja-JP/custom-mcp-tool.md)を参照してください。
+
+
 ## ネイティブ Linux 隔離統合（今後のバージョンで提供予定）
 
 > **現在のリリースでは利用できません。** 社員ごとに専用の Linux アカウントを使う隔離構成のコードは v1.81.0 から含まれていますが、お客様のホストにはまだインストールも有効化もできません。保護サービスは、引き続き v1.80 と同じ方法でインストール、更新し、社員を実行します（`sudo duduclaw service install --protected-linux`、`sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux`）。この節の各段落と、以下で「今後のバージョンで提供予定」と記した節は、その予定リリースの開発状況を説明しています。

@@ -23,6 +23,10 @@
 //! arbitrary operator-configured command, not `claude` — none of these names
 //! are Anthropic/Claude-specific.
 //!
+//! RM-208 explicitly permits `DUDUCLAW_RUN_CREDENTIAL` to survive a child
+//! forwarding hop; every gateway AI spawn must replace it with a fresh lease.
+//! All other credentials follow the rule below.
+//!
 //! **Never add a name here that is itself a secret** (`*_API_KEY`, `*_TOKEN`,
 //! `*_SECRET`, `*_PASSWORD`, ...). Every credential a spawned CLI needs is
 //! injected explicitly by the caller from a resolved config value (the
@@ -128,6 +132,10 @@ pub const AGENT_CLI_ENV_ALLOWLIST: &[&str] = &[
     // runs inside such a turn. Consumers re-verify it against the session
     // store and the acting employee before trusting it.
     "DUDUCLAW_ORIGIN_SESSION",
+    // RM-208 exception: a child may forward its own run proof. Gateway
+    // spawn sites always overwrite this with a freshly issued credential.
+    "DUDUCLAW_RUN_CREDENTIAL",
+    "DUDUCLAW_RUN_GATEWAY_PORT",
 ];
 
 /// macOS only: Cocoa `NSString`/Keychain Services initialization reads this

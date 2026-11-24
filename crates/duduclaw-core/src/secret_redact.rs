@@ -77,6 +77,7 @@ pub fn redaction_placeholder_ranges(input: &str) -> Vec<Range<usize>> {
 /// Codepoint-based (never slices by raw byte index) so CJK/emoji input cannot
 /// panic — see the project convention on string slicing.
 pub fn mask_secret(s: &str) -> String {
+    if s.contains(crate::run_credential::PREFIX) { return "[REDACTED]".to_string(); }
     let n = s.chars().count();
     if n <= 8 {
         return "***".to_string();
@@ -94,6 +95,11 @@ pub fn redact_secrets(input: &str) -> Cow<'_, str> {
 
 /// Return the redacted text and the number of credential values replaced.
 pub fn redact_secrets_with_count(input: &str) -> (Cow<'_, str>, usize) {
+    if input.contains(crate::run_credential::PREFIX) {
+        let masked = crate::run_credential::redact(input);
+        let (out, count) = redact_secrets_with_count(&masked);
+        return (Cow::Owned(out.into_owned()), count + input.matches(crate::run_credential::PREFIX).count());
+    }
     if input.is_empty() {
         return (Cow::Borrowed(input), 0);
     }

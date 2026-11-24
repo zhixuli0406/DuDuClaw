@@ -748,6 +748,7 @@ impl McpClient {
     }
 
     fn redact_scoped_response(&self, value: &mut Value) {
+        duduclaw_core::run_credential::redact_value(value);
         if let McpTransport::Http {
             scoped: Some(authority),
             ..
@@ -1339,6 +1340,7 @@ pub trait ClientCallBoundary: Send + Sync {
 /// name, the earlier client owns it and a warning is logged; the later one's
 /// tool is dropped from both the routing table and `tool_defs()`.
 pub struct ToolRegistry {
+    run_identity: Option<Box<dyn duduclaw_core::run_credential::RunLease>>,
     clients: Vec<Mutex<RegistryClient>>,
     /// tool name → index into `clients`.
     routes: HashMap<String, usize>,
@@ -1427,6 +1429,11 @@ impl ToolFilter {
 }
 
 impl ToolRegistry {
+    /// Hold the host run lease until all tools for the API run are dropped.
+    pub fn hold_run_identity(&mut self, lease: Box<dyn duduclaw_core::run_credential::RunLease>) {
+        self.run_identity = Some(lease);
+    }
+
     /// Build a registry from already-connected clients, discovering each
     /// server's tools via `tools/list` and resolving name collisions.
     pub async fn from_clients(clients: Vec<McpClient>) -> Result<Self, McpError> {
@@ -1463,6 +1470,7 @@ impl ToolRegistry {
             client_notices: HashMap::new(),
             scoped_operation_timeouts: HashMap::new(),
             closed_client_indices: HashSet::new(),
+            run_identity: None,
         })
     }
 
@@ -1560,6 +1568,7 @@ impl ToolRegistry {
             client_notices: HashMap::new(),
             scoped_operation_timeouts,
             closed_client_indices,
+            run_identity: None,
         };
         // Cloning/filtering schemas and dropping discovery inputs are part
         // of discovery admission, before the final original-deadline check.
@@ -2260,6 +2269,7 @@ pathlib.Path(sys.argv[1]).write_text('guarded')
             client_notices: HashMap::new(),
             scoped_operation_timeouts: HashMap::new(),
             closed_client_indices: HashSet::new(),
+            run_identity: None,
         };
         let scope = CcrScope {
             tenant_id: "local".into(),
@@ -2306,6 +2316,7 @@ pathlib.Path(sys.argv[1]).write_text('guarded')
             client_notices: HashMap::new(),
             scoped_operation_timeouts: HashMap::new(),
             closed_client_indices: HashSet::new(),
+            run_identity: None,
         };
         let scope = CcrScope {
             tenant_id: "local".into(),

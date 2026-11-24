@@ -159,6 +159,8 @@ pub fn is_proxy_private_env_key(name: &str) -> bool {
         || name.starts_with("DUDUCLAW_AGENT_")
         || name.starts_with("DUDUCLAW_DELEGATION_")
         || name == "DUDUCLAW_ON_BEHALF_OF"
+        || name == crate::run_credential::ENV_RUN_CREDENTIAL
+        || name == crate::run_credential::ENV_RUN_GATEWAY_PORT
 }
 
 fn has_private_env(def: &Value) -> bool {

@@ -142,7 +142,10 @@ pub async fn output_for_model(
     input: Option<&[u8]>,
     timeout: std::time::Duration,
 ) -> Result<std::process::Output, OutputError> {
-    collect_output(cmd, input, timeout, true).await
+    let mut output = collect_output(cmd, input, timeout, true).await?;
+    output.stdout = duduclaw_core::run_credential::redact(&String::from_utf8_lossy(&output.stdout)).into_owned().into_bytes();
+    output.stderr = duduclaw_core::run_credential::redact(&String::from_utf8_lossy(&output.stderr)).into_owned().into_bytes();
+    Ok(output)
 }
 
 async fn collect_output(

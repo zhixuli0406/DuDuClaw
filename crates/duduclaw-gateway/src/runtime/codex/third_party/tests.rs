@@ -325,7 +325,7 @@ fn overrides_keep_upstream_credentials_out_of_argv() {
     assert!(
         ov.args
             .iter()
-            .any(|a| a == r#"mcp_servers.masterlink.env_vars=["DUDUCLAW_MCP_API_KEY"]"#)
+            .any(|a| a == r#"mcp_servers.masterlink.env_vars=["DUDUCLAW_RUN_CREDENTIAL", "DUDUCLAW_RUN_GATEWAY_PORT", "DUDUCLAW_MCP_API_KEY"]"#)
     );
     // The API key was already set on the process for the duduclaw server.
     assert!(ov.process_env.is_empty());

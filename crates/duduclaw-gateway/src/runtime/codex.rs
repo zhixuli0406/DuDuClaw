@@ -496,6 +496,7 @@ fn is_secret_env_name(k: &str) -> bool {
     const SECRET_SUFFIXES: &[&str] = &["_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD"];
     let upper = k.to_ascii_uppercase();
     upper == duduclaw_core::identity_token::ENV_DELEGATION_CONTEXT
+        || upper == duduclaw_core::run_credential::ENV_RUN_CREDENTIAL
         || SECRET_SUFFIXES.iter().any(|s| upper.ends_with(s))
 }
 
@@ -566,7 +567,8 @@ fn split_env_overrides(
     env: &serde_json::Map<String, serde_json::Value>,
 ) -> (Vec<String>, Vec<(String, String)>) {
     let mut plain = serde_json::Map::new();
-    let mut secret_names: Vec<String> = Vec::new();
+    let mut secret_names = vec![duduclaw_core::run_credential::ENV_RUN_CREDENTIAL.to_string(),
+        duduclaw_core::run_credential::ENV_RUN_GATEWAY_PORT.to_string()];
     let mut process_env: Vec<(String, String)> = Vec::new();
     for (k, v) in env {
         if !is_secret_env_name(k) {
@@ -587,7 +589,7 @@ fn split_env_overrides(
         let Some(val) = env_value_as_string(v) else {
             continue;
         };
-        secret_names.push(k.clone());
+        if !secret_names.contains(k) { secret_names.push(k.clone()); }
         process_env.push((k.clone(), val));
     }
     let mut args = mcp_env_override_args(&plain);
@@ -1191,6 +1193,8 @@ impl CodexOutput {
     fn finish_line(&mut self) {
         if self.line.is_empty() { return; }
         let line_bytes = std::mem::take(&mut self.line);
+        let line_bytes = duduclaw_core::run_credential::redact(&String::from_utf8_lossy(&line_bytes))
+            .into_owned().into_bytes();
         if self.stdout.len() + line_bytes.len() <= MAX_STDOUT_BYTES {
             self.stdout.extend_from_slice(&line_bytes);
         } else {
@@ -1857,6 +1861,10 @@ impl AgentRuntime for CodexRuntime {
         // path per process; env passthrough alone falls back on probe failure.
         // The required employee permission profile was checked above.
         let supports_env_vars = codex_supports_env_vars(&self.codex_path).await;
+        if !supports_env_vars {
+            return Err(duduclaw_agent::mcp_spawn_gate::spawn_gate_error(
+                "Codex must support MCP env_vars for private run identity forwarding"));
+        }
         let delegation_env = crate::claude_runner::delegation_context_env(&context.home_dir, &context.agent_id,
             crate::runtime_config::call_timeout_secs(context.agent_dir.as_deref()));
         let mcp_overrides = mcp_override_args_with_extra_env(
@@ -1985,6 +1993,12 @@ async fn execute_codex_command_with_input(
     work_root: Option<&owned_home::CheckedWorkRoot>,
 ) -> Result<RuntimeResponse, String> {
     let timeout_secs = crate::runtime_config::call_timeout_secs(context.agent_dir.as_deref());
+    let agent = if context.agent_id.is_empty() && crate::runtime_dispatch::in_utility_call() { "system" } else { &context.agent_id };
+    let _run_identity = crate::run_identity::issue(&context.home_dir, agent, "codex", timeout_secs)?;
+    _run_identity.apply(cmd);
+    // Include lists are restrictive; inherit all keeps the existing shell
+    // environment and its default KEY/SECRET/TOKEN exclusions intact.
+    cmd.args(["-c", "shell_environment_policy.inherit=\"all\""]);
     let idle = crate::runtime_config::idle_timeout_secs(&context.home_dir, context.agent_dir.as_deref());
     let output = CODEX_IDLE_TIMEOUT.scope(idle, collect_codex_output_with_input(
         cmd, std::time::Duration::from_secs(timeout_secs), input, work_root,
@@ -1992,7 +2006,8 @@ async fn execute_codex_command_with_input(
 
     if let Some(status) = output.status {
         if output.terminal_at.is_none() && !status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr_raw = String::from_utf8_lossy(&output.stderr);
+            let stderr = duduclaw_core::run_credential::redact(&stderr_raw);
             return Err(format!(
                 "Codex CLI exited with {}: {}",
                 status,
@@ -2034,7 +2049,8 @@ async fn execute_codex_command_with_input(
     // Still empty ⇒ FAILURE, not success: Ok("") would be silently dropped
     // by every channel and poison the session with an empty assistant turn.
     if response.content.trim().is_empty() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr_raw = String::from_utf8_lossy(&output.stderr);
+        let stderr = duduclaw_core::run_credential::redact(&stderr_raw);
         return Err(format!(
             "Empty response from Codex CLI (exit 0); stderr tail: {}",
             duduclaw_core::truncate_bytes(stderr.trim(), 300)
@@ -2450,6 +2466,12 @@ pub(crate) mod tests {
             duduclaw_core::ns_guard::is_active()));
         // RM-204: the prompt is read from stdin (`-`), never argv.
         expected.args(["-", "--cd"]).arg(&canonical_agent).current_dir(&canonical_agent);
+        expected.args(["-c", "shell_environment_policy.inherit=\"all\""]);
+        let _proof = crate::run_identity::assert_command_identity(&command, false);
+        for name in [duduclaw_core::run_credential::ENV_RUN_CREDENTIAL,
+            duduclaw_core::run_credential::ENV_RUN_GATEWAY_PORT] {
+            expected.env(name, captured_env(name).expect("run environment missing"));
+        }
         assert_eq!(before.cwd.as_deref(), Some(canonical_agent.as_path()));
         // RM-204: the instructions live in the owned CODEX_HOME, owner-only,
         // and nothing is written into the employee directory.
@@ -4208,6 +4230,8 @@ pub(crate) mod tests {
     #[test]
     fn only_the_known_env_keys_may_reach_the_codex_argv_on_the_env_vars_branch() {
         const KNOWN: &[&str] = &[
+            "DUDUCLAW_RUN_CREDENTIAL",
+            "DUDUCLAW_RUN_GATEWAY_PORT",
             "DUDUCLAW_AGENT_ID",
             "DUDUCLAW_AGENT_TOKEN",
             "DUDUCLAW_HOME",

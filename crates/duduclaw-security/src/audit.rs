@@ -863,7 +863,8 @@ static SENSITIVE_TEXT_SLACK_WEBHOOK_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// guarantee — it shares the same key/prefix allowlists as
 /// [`mask_sensitive_json`] (now `-`/`_`-tolerant, see [`sensitive_keys_pattern`]).
 pub fn mask_sensitive_text(text: &str) -> String {
-    let credential_masked = crate::credential_detect::mask(text);
+    let run_masked = duduclaw_core::run_credential::redact(text);
+    let credential_masked = crate::credential_detect::mask(&run_masked);
     let text = credential_masked.as_str();
     let masked = SENSITIVE_TEXT_JSON_KV_RE.replace_all(text, |caps: &regex::Captures| {
         format!("\"{}\":\"***\"", &caps[1])
@@ -2480,5 +2481,20 @@ mod injection_context_tests {
             serde_json::json!({"risk_score": 40, "matched_rules": ["instruction_override"], "blocked": true})
         );
         std::fs::remove_dir_all(home).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod run_identity_audit_tests {
+    #[test]
+    fn run_credential_never_reaches_tool_call_jsonl() {
+        let home = tempfile::tempdir().unwrap();
+        let credential = duduclaw_core::run_credential::RunCredential::from_bytes(&[24; 32]);
+        super::append_tool_call_with_extras(home.path(), "alice", "custom_update", credential.expose(), true,
+            &[("input", serde_json::json!({"unusual_field": credential.expose()})),
+              ("result_text", serde_json::json!(credential.expose()))]);
+        let log = std::fs::read_to_string(home.path().join("tool_calls.jsonl")).unwrap();
+        assert!(!log.contains(credential.expose()));
+        assert!(!log.contains(duduclaw_core::run_credential::PREFIX));
     }
 }

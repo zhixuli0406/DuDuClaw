@@ -1359,22 +1359,40 @@ async fn execute_proactive_check(
                 return;
             };
             cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+            let _run_identity = match duduclaw_core::run_credential::background_lease(
+                home_dir, agent_id, "claude", "heartbeat", 300) {
+                Ok(guard) => guard,
+                Err(_) => {
+                    warn!(agent = agent_id, "Proactive check skipped: run identity unavailable");
+                    return;
+                }
+            };
+            cmd.env(duduclaw_core::run_credential::ENV_RUN_CREDENTIAL, _run_identity.credential().expose());
+            cmd.env(duduclaw_core::run_credential::ENV_RUN_GATEWAY_PORT,
+                duduclaw_core::gateway_port_for_home(home_dir).0.to_string());
             let child = duduclaw_core::execution_gate::with_runtime(
             duduclaw_core::execution_gate::RuntimeKind::Claude,
             duduclaw_core::execution_gate::spawn(&mut cmd,
                 duduclaw_core::execution_gate::ExecutionClass::Heartbeat)).await;
             drop(admission);
             let output = match child {
-                Ok(child) => child.wait_with_output().await,
+                Ok(child) => match tokio::time::timeout(
+                    std::time::Duration::from_secs(300), child.wait_with_output()).await {
+                    Ok(output) => output,
+                    Err(_) => {
+                        warn!(agent = agent_id, "Proactive check timed out");
+                        return;
+                    }
+                },
                 Err(error) => Err(error),
             };
             drop(prompt_file); // explicit: temp file survives until after spawn exits
             match output {
                 Ok(o) if o.status.success() => {
-                    String::from_utf8_lossy(&o.stdout).to_string()
+                    duduclaw_core::run_credential::redact(&String::from_utf8_lossy(&o.stdout)).into_owned()
                 }
                 Ok(o) => {
-                    let stderr_snippet: String = String::from_utf8_lossy(&o.stderr).chars().take(200).collect();
+                    let stderr_snippet: String = duduclaw_core::run_credential::redact(&String::from_utf8_lossy(&o.stderr)).chars().take(200).collect();
                     warn!(agent = agent_id, stderr = %stderr_snippet, "Proactive Claude failed");
                     return;
                 }

@@ -1,5 +1,11 @@
 # 安全防線
 
+
+## 每次執行的呼叫者身分（RM-208）
+
+本機工具可用 `DUDUCLAW_RUN_CREDENTIAL` 向 loopback 端點查證，或執行 `duduclaw identity whoami --json`，確認是哪位 AI、代誰工作、屬於哪段對話。gateway 只存雜湊，執行結束、取消、過期或重啟即失效。工作目錄不是身分；未隔離環境中，AI 仍可使用自己的憑證，同一 OS 帳號的程序也可能竊取別張有效憑證。受保護模式保留自己的 capability records，舊 agent token 與 MCP 身分驗證不變。詳見[取得與查證呼叫者身分](../../guides/zh-TW/custom-mcp-tool.md)。
+
+
 ## 原生 Linux 隔離整合（預計在之後的版本提供）
 
 > **目前版本無法使用。** 讓每位員工使用獨立 Linux 帳號的隔離架構，程式碼自 v1.81.0 起已包含在內，但客戶主機還無法安裝或啟用。受保護服務仍照 v1.80 的方式安裝、更新與執行員工（`sudo duduclaw service install --protected-linux`、`sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux`）。本節各段，以及下方標示「預計在之後的版本提供」的段落，說明的都是這個預計版本的開發狀態。

@@ -603,6 +603,17 @@ tokio::task_local! {
 
 /// Evolution keeps tools where authorized, but never inherits a raised work budget.
 /// Fail closed: without a positively identified work request type, the cap applies.
+pub(crate) fn identity_background_kind() -> &'static str {
+    use duduclaw_core::execution_gate::ExecutionClass;
+    match crate::process_group::execution_class(ExecutionClass::EmployeeMain) {
+        ExecutionClass::Heartbeat => "heartbeat",
+        ExecutionClass::Scheduled => "cron",
+        ExecutionClass::Judge => "judge",
+        _ if crate::runtime::round_task_env().is_some() => "task",
+        _ => RUNTIME_USAGE_REQUEST_TYPE.try_with(|kind| kind.as_str()).unwrap_or("unattributed"),
+    }
+}
+
 pub(crate) fn allows_employee_step_budget() -> bool {
     !in_utility_call() && RUNTIME_USAGE_REQUEST_TYPE.try_with(|kind| matches!(kind,
         RequestType::Chat | RequestType::Cron | RequestType::Dispatch)).unwrap_or(false)

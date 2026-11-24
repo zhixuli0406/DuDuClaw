@@ -640,9 +640,9 @@ impl AgentRuntime for GrokRuntime {
                 }
             }
         }
-        let mut cmd = self.prepare_command(
+        let (mut cmd, _run_identity) = self.prepare_run_command(
             &args, &home_env, &api_key, context, work_root.as_deref(), third_party_env.as_ref(),
-        );
+        )?;
 
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -666,6 +666,7 @@ impl AgentRuntime for GrokRuntime {
             crate::process_group::OutputError::Io(e) => crate::process_group::backend_error(e, "Failed to run grok"),
         })?;
 
+        drop(_run_identity);
         if !output.status.success() {
             let code = output.status.code().unwrap_or(-1);
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -815,6 +816,17 @@ impl AgentRuntime for GrokRuntime {
 }
 
 impl GrokRuntime {
+    fn prepare_run_command(&self, args: &[String], home_env: &[(String, String)], api_key: &str,
+        context: &RuntimeContext, work_root: Option<&std::path::Path>, third_party_env: Option<&(String, String)>)
+        -> Result<(tokio::process::Command, crate::run_identity::RunGuard), String>
+    {
+        let mut cmd = self.prepare_command(args, home_env, api_key, context, work_root, third_party_env);
+        let identity = crate::run_identity::issue(&context.home_dir, &context.agent_id, "grok",
+            crate::runtime_config::call_timeout_secs(context.agent_dir.as_deref()))?;
+        identity.apply(&mut cmd);
+        Ok((cmd, identity))
+    }
+
     /// The command handed to the backend is the same native builder used locally.
     fn prepare_command(
         &self,
@@ -951,7 +963,10 @@ impl GrokRuntime {
         if !PTY_TREE_CLEANUP_VERIFIED {
             return Err("Grok PTY retry refused: process-tree cleanup is not verified".into());
         }
+        let _run_identity = crate::run_identity::issue(&context.home_dir, &context.agent_id, "grok",
+            deadline.saturating_duration_since(tokio::time::Instant::now()).as_secs())?;
         let mut env: std::collections::HashMap<String, String> = home_env.iter().cloned().collect();
+        _run_identity.apply_pty(&mut env);
         if let Some((k, v)) = third_party_env {
             env.insert(k.clone(), v.clone());
         }
@@ -1310,8 +1325,9 @@ mod tests {
         let runtime = GrokRuntime { grok_path: "grok-fixture".into() };
         let args = vec!["--permission-mode".into(), "bypassPermissions".into(), "-p".into(), "繁體中文 $HOME;\nnext".into()];
         let env = vec![("HOME".into(), "fixture home".into()), ("GROK_HOME".into(), "fixture config".into())];
-        let command = runtime.prepare_command(&args, &env, "fixture-key", &context,
-            context.agent_dir.as_deref(), None);
+        let (command, _identity) = runtime.prepare_run_command(&args, &env, "fixture-key", &context,
+            context.agent_dir.as_deref(), None).unwrap();
+        let _proof = crate::run_identity::assert_command_identity(&command, true);
         let before = duduclaw_core::execution_gate::command_snapshot(&command);
         let mut expected = tokio::process::Command::new("grok-fixture");
         expected.args(["--permission-mode", "bypassPermissions", "-p", "繁體中文 $HOME;\nnext"])
@@ -1332,6 +1348,12 @@ mod tests {
             .env_remove(duduclaw_core::ENV_ORIGIN_SESSION)
             .env("DUDUCLAW_HOME", home.path())
             .env_remove(duduclaw_core::mcp_proxy_rewrite::PROXY_UPSTREAM_ENV_DIR_VAR);
+        for (name, value) in command.as_std().get_envs() {
+            if name == duduclaw_core::run_credential::ENV_RUN_CREDENTIAL
+                || name == duduclaw_core::run_credential::ENV_RUN_GATEWAY_PORT {
+                expected.env(name, value.unwrap());
+            }
+        }
         assert_eq!(before, duduclaw_core::execution_gate::command_snapshot(&expected));
         assert_eq!(duduclaw_core::execution_gate::local_command_roundtrip(command).await.unwrap(), before);
     }
