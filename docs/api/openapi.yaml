@@ -3,31 +3,33 @@ info:
   title: DuDuClaw WebSocket RPC API
   version: 1.56.0
   description: |
-    JSON-RPC 2.0 API over WebSocket for DuDuClaw multi-agent orchestration.
-
-    > **Coverage note (2026-08-13)**: this spec documents the stable core of
-    > the WebSocket RPC surface but lags the product — many RPC method
-    > families added after 0.12.0 (templates.*, experts.*, evolution.*,
-    > playbook.*, delegation.*, widgets.*, ticks.*, notify.*, …) are not yet
-    > described here. The authoritative method list is the dispatch table in
-    > `crates/duduclaw-gateway/src/handlers.rs`; treat this file as a guide,
-    > not an exhaustive contract. A full regeneration is tracked separately.
+    Partial historical discovery reference for the DuDuClaw dashboard RPC API.
+    The member-facing compatibility contract is docs/api/member-contract.md
+    (relative link: member-contract.md). Read that document for the current
+    JWT login/refresh flow, draft method inventory and compatibility policy.
+    Most method schemas below have not been regenerated for the current product.
+    /rpc/<method> paths are tooling pseudo-paths, not HTTP endpoints. Actual
+    dispatch and permissions live in crates/duduclaw-gateway/src/handlers/ and
+    gateway-owned namespace modules. This file is not an exhaustive contract.
 
     ## Connection
 
-    Connect to `ws://<host>:<port>/ws` and exchange JSON-RPC 2.0 frames:
-
-    ```json
-    { "jsonrpc": "2.0", "method": "<method>", "params": { ... }, "id": "1" }
-    ```
-
-    Responses follow the standard JSON-RPC 2.0 envelope with `result` or `error`.
+    Connect to ws://<host>:<port>/ws and send JSON WsFrame text envelopes:
+    {"type":"req","id":"1","method":"connect","params":{"jwt":"<access_token>"}}
+    Responses use {"type":"res","id":"1","ok":true,"payload":{...}},
+    or {"type":"res","id":"1","ok":false,"error":"message"}.
+    Some errors are objects with code/message fields. The wire protocol is
+    not JSON-RPC 2.0; there is no jsonrpc version field or result envelope.
 
     ## Authentication
 
-    1. Send `connect.challenge` to receive a challenge string.
-    2. Sign the challenge with your Ed25519 private key.
-    3. Send `connect` with the signed response and your client version.
+    POST /api/login with email and password; complete any MFA challenge or
+    enrollment before using the returned tokens. The default access lifetime
+    is 30 minutes and refresh lifetime is 7 days. POST /api/refresh with
+    {"refresh_token":"..."} returns only a new access_token; retain the
+    existing refresh token. Authenticate /ws with connect.params.jwt.
+    Member login does not use Ed25519 challenge signing. See member-contract.md
+    for the separate /ws/chat authentication frame and expiry details.
 
     ## Live events (2026-10-29)
 
@@ -531,9 +533,10 @@ paths:
         '200': {description: enrollment_code 與 expires_in（秒），或 RPC 拒絕}
   /ws:
     get:
-      summary: WebSocket JSON-RPC 2.0 endpoint
+      summary: Dashboard WebSocket WsFrame endpoint
       description: |
-        Upgrade to WebSocket for bidirectional JSON-RPC 2.0 communication.
+        Upgrade to WebSocket for JSON WsFrame request/response/event messages.
+        Authenticate the initial connect frame with params.jwt (access token).
         All methods listed below are invoked via this single endpoint.
       responses:
         "101":
@@ -583,16 +586,13 @@ paths:
   /rpc/connect.challenge:
     post:
       tags: [connection]
-      summary: Request authentication challenge
-      description: Returns a UUID challenge string for Ed25519 signing.
-      requestBody:
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/EmptyParams"
+      summary: Legacy compatibility challenge handler (not member login)
+      description: |
+        This handler still returns a UUID after dispatch authentication. It is
+        not the initial WebSocket authentication protocol. See member-contract.md.
       responses:
         "200":
-          description: Challenge issued
+          description: Legacy challenge payload
           content:
             application/json:
               schema:
@@ -605,39 +605,43 @@ paths:
   /rpc/connect:
     post:
       tags: [connection]
-      summary: Authenticate with signed challenge
+      summary: Initial WebSocket member JWT handshake (pseudo-path)
+      description: |
+        Send as the first /ws frame with type=req and a string id. This is not
+        an HTTP endpoint. The separate already-authenticated dispatch handler
+        accepts version metadata and returns connected, version, client_version
+        and boot_id; it does not authenticate a user. See member-contract.md.
       requestBody:
         content:
           application/json:
             schema:
               type: object
+              required: [jwt]
               properties:
-                signature:
+                jwt:
                   type: string
-                  format: base64
-                  description: Ed25519 signature of the challenge, base64-encoded
-                public_key:
-                  type: string
-                  format: hex
-                  description: Ed25519 public key, hex-encoded (64 chars)
-                version:
-                  type: string
-                  description: Client version string
+                  description: Access token from completed login or refresh
       responses:
         "200":
-          description: Connection established
+          description: Initial handshake payload, inside a WsFrame success response
           content:
             application/json:
               schema:
                 type: object
                 properties:
-                  version:
-                    type: string
-                  client_version:
-                    type: string
                   status:
                     type: string
-                    enum: [connected]
+                    enum: [authenticated]
+                  boot_id:
+                    type: string
+                  user:
+                    type: object
+                    properties:
+                      id: {type: string}
+                      email: {type: string}
+                      role: {type: string}
+                  must_change_password:
+                    type: boolean
 
   /rpc/tools.catalog:
     post:
