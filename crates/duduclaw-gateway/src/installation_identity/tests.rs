@@ -174,6 +174,25 @@ mod unix {
     }
 
     #[test]
+    fn concurrent_lock_open_or_create_succeeds() {
+        let home = tempfile::tempdir().unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let handles: Vec<_> = (0..16).map(|_| {
+            let home = home.path().to_path_buf();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || -> io::Result<()> {
+                barrier.wait();
+                for _ in 0..32 {
+                    let dir = StateDir::open(&home)?;
+                    drop(dir.lock(INSTALLATION_LOCK_FILE)?);
+                }
+                Ok(())
+            })
+        }).collect();
+        for handle in handles { handle.join().unwrap().unwrap(); }
+    }
+
+    #[test]
     fn create_new_never_replaces_and_cleans_up_failed_writes() {
         let home = tempfile::tempdir().unwrap();
         let dir = StateDir::open(home.path()).unwrap();

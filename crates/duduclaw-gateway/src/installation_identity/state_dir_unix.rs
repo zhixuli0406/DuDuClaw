@@ -35,9 +35,24 @@ impl StateDir {
 
     /// Open (creating if needed) a private, non-replaceable lock file.
     pub fn lock(&self, name: &str) -> io::Result<std::fs::File> {
-        let lock = open_at(&self.directory, name, libc::O_RDWR | libc::O_CREAT)?;
-        validate(&lock, false)?;
-        Ok(lock)
+        // APFS can return ENOENT for concurrent O_CREAT opens; bound retries
+        // so a persistent missing path still fails closed.
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let result = match open_at(&self.directory, name, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL) {
+                Err(e) if e.raw_os_error() == Some(libc::EEXIST) => open_at(&self.directory, name, libc::O_RDWR),
+                other => other,
+            };
+            match result {
+                Ok(lock) => {
+                    validate(&lock, false)?;
+                    return Ok(lock);
+                },
+                Err(e) if e.raw_os_error() == Some(libc::ENOENT) && attempts < 8 => std::thread::yield_now(),
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Bounded read. `Ok(None)` only for `NotFound`; any other error (symlink,
