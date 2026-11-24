@@ -18,12 +18,13 @@ impl SharedWikiReader {
         if live.requires_password_change() {
             return Err(());
         }
+        let loaded = load_shared_wiki_policy(home)?;
         if live.is_admin() {
             return Ok(Self {
                 admin: true,
                 department: None,
                 policy: duduclaw_core::DepartmentVisibilityPolicy::empty(),
-                policy_source: None,
+                policy_source: loaded.source,
             });
         }
         let db_path = home.join("users.db");
@@ -36,30 +37,8 @@ impl SharedWikiReader {
             [&live.user_id],
             |row| row.get(0),
         ).map_err(|_| ())?;
-        let path = home.join("shared/wiki/.scope.toml");
-        let (policy, policy_source) = match std::fs::read_to_string(&path) {
-            Ok(raw) => {
-                // The agent parser is deliberately lenient. Dashboard reads
-                // fail closed if a declared visibility rule has a bad shape.
-                let table: toml::Table = raw.parse().map_err(|_| ())?;
-                if let Some(namespaces) = table.get("namespaces") {
-                    for entry in namespaces.as_table().ok_or(())?.values() {
-                        let entry = entry.as_table().ok_or(())?;
-                        if let Some(departments) = entry.get("visible_to_departments") {
-                            if !departments.as_array().ok_or(())?.iter().all(|v| v.is_str()) {
-                                return Err(());
-                            }
-                        }
-                    }
-                }
-                let policy = duduclaw_core::DepartmentVisibilityPolicy::parse(&raw).map_err(|_| ())?;
-                (policy, Some(raw))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !path.is_symlink() => {
-                (duduclaw_core::DepartmentVisibilityPolicy::empty(), None)
-            }
-            Err(_) => return Err(()),
-        };
+        let policy = duduclaw_core::DepartmentVisibilityPolicy::parse(loaded.source.as_deref().unwrap_or("")).map_err(|_| ())?;
+        let policy_source = loaded.source;
         Ok(Self { admin: false, department, policy, policy_source })
     }
 
@@ -394,5 +373,42 @@ mod visibility_tests {
             denied(handler.handle("shared_wiki.pages", json!({}), &ctx).await);
             std::fs::write(home.path().join("shared/wiki/.scope.toml"), "").unwrap();
         }
+    }
+}
+
+fn load_shared_wiki_policy(home: &Path) -> Result<duduclaw_core::scope_policy::ScopePolicy, ()> {
+    duduclaw_core::scope_policy::load(&home.join("shared/wiki/.scope.toml")).map_err(|_| ())
+}
+
+#[cfg(test)]
+#[test]
+fn rm209_dashboard_reader_policy_matrix() {
+    let home = tempfile::tempdir().unwrap();
+    let wiki = home.path().join("shared/wiki");
+    std::fs::create_dir_all(&wiki).unwrap();
+    let path = wiki.join(".scope.toml");
+    let allowed = || { load_shared_wiki_policy(home.path()).is_ok() };
+    assert!(allowed(), "missing file retains no-policy behavior");
+    for raw in ["not [ valid toml", "namespaces = 42", "[namespaces.notes]\nvisible_to_departments = [7]", "[namespaces.notes]\nmode = false"] {
+        std::fs::write(&path, raw).unwrap();
+        assert!(!allowed(), "malformed policy must deny: {raw}");
+    }
+    std::fs::write(&path, "").unwrap();
+    assert!(allowed(), "empty valid policy");
+    std::fs::remove_file(&path).unwrap();
+    let target = home.path().join("target.toml");
+    std::fs::write(&target, "").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+    #[cfg(windows)]
+    if let Err(error) = std::os::windows::fs::symlink_file(&target, &path) {
+        eprintln!("RM-209: skipping link cases: Windows symlink permission unavailable: {error}");
+        return;
+    }
+    #[cfg(any(unix, windows))]
+    {
+        assert!(!allowed(), "valid symlink must deny");
+        std::fs::remove_file(&target).unwrap();
+        assert!(!allowed(), "dangling symlink must deny");
     }
 }

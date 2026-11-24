@@ -2,7 +2,7 @@ use super::*;
 use duduclaw_mcp_boundary::io_authority::verify_before_io;
 
 /// Reserved wiki filenames that cannot be overwritten by wiki_write.
-pub(crate) const WIKI_RESERVED: &[&str] = &["_schema.md", "_index.md", "_log.md"];
+pub(crate) use duduclaw_memory::wiki_scan::RESERVED_FILES as WIKI_RESERVED;
 
 /// Maximum wiki page size (512 KB).
 pub(crate) const WIKI_MAX_PAGE_SIZE: usize = 512 * 1024;
@@ -180,47 +180,9 @@ pub(crate) fn extract_toml_string_array(content: &str, field: &str) -> Option<Ve
 
 /// Ensure the wiki directory structure exists, creating scaffold if needed.
 pub(crate) fn ensure_wiki_dir(wiki_dir: &Path) -> std::result::Result<(), String> {
-    let subdirs = ["entities", "concepts", "sources", "synthesis"];
-    for sub in &subdirs {
-        let p = wiki_dir.join(sub);
-        if !p.exists() {
-            verify_before_io().map_err(|e| e.to_string())?;
-            std::fs::create_dir_all(&p)
-                .map_err(|e| format!("Failed to create {}: {e}", p.display()))?;
-        }
-    }
-
-    // Create _schema.md if missing
-    let schema_path = wiki_dir.join("_schema.md");
-    if !schema_path.exists() {
-        verify_before_io().map_err(|e| e.to_string())?;
-        std::fs::write(&schema_path, WIKI_DEFAULT_SCHEMA)
-            .map_err(|e| format!("Failed to write _schema.md: {e}"))?;
-    }
-
-    // Create _index.md if missing
-    let index_path = wiki_dir.join("_index.md");
-    if !index_path.exists() {
-        verify_before_io().map_err(|e| e.to_string())?;
-        std::fs::write(
-            &index_path,
-            "# Wiki Index\n\n<!-- Auto-maintained by wiki_write. One entry per page. -->\n",
-        )
-        .map_err(|e| format!("Failed to write _index.md: {e}"))?;
-    }
-
-    // Create _log.md if missing
-    let log_path = wiki_dir.join("_log.md");
-    if !log_path.exists() {
-        verify_before_io().map_err(|e| e.to_string())?;
-        std::fs::write(
-            &log_path,
-            "# Wiki Log\n\n<!-- Append-only operation log. -->\n",
-        )
-        .map_err(|e| format!("Failed to write _log.md: {e}"))?;
-    }
-
-    Ok(())
+    duduclaw_memory::WikiStore::new(wiki_dir.to_path_buf()).ensure_scaffold_checked(|| {
+        verify_before_io().map_err(|e| e.to_string())
+    })
 }
 
 /// Required frontmatter fields for Karpathy-style LLM wiki pages.
@@ -325,7 +287,7 @@ pub(crate) fn validate_wiki_page_path(page_path: &str) -> std::result::Result<()
         .file_name()
         .and_then(|f| f.to_str())
         .unwrap_or("");
-    if WIKI_RESERVED.contains(&filename) {
+    if duduclaw_memory::wiki_scan::is_reserved(filename) {
         return Err(format!(
             "'{}' is a reserved wiki file and cannot be overwritten",
             filename
@@ -406,34 +368,9 @@ pub(crate) fn update_wiki_index(
     page_path: &str,
     title: &str,
 ) -> std::result::Result<(), String> {
-    let canonical = duduclaw_memory::wiki_path::persisted_page_id(page_path)
-        .ok_or_else(|| "Invalid wiki page id".to_string())?;
-    let page_path = canonical.as_str();
-    let index_path = wiki_dir.join("_index.md");
-    let existing = std::fs::read_to_string(&index_path).unwrap_or_default();
-
-    // Build the new entry line
-    let now = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    let entry_line = format!("- [{}]({}) — updated {}", title, page_path, now);
-
-    // Check if this page already has an entry and replace it
-    let mut lines: Vec<String> = existing.lines().map(String::from).collect();
-    let mut found = false;
-    for line in &mut lines {
-        if duduclaw_memory::wiki_path::index_line_links_to(line, page_path) {
-            *line = entry_line.clone();
-            found = true;
-            break;
-        }
-    }
-
-    if !found {
-        lines.push(entry_line);
-    }
-
-    let new_content = lines.join("\n") + "\n";
-    verify_before_io().map_err(|e| e.to_string())?;
-    std::fs::write(&index_path, new_content).map_err(|e| format!("Failed to update _index.md: {e}"))
+    duduclaw_memory::WikiStore::new(wiki_dir.to_path_buf()).update_index_checked(page_path, title, || {
+        verify_before_io().map_err(|e| e.to_string())
+    })
 }
 
 /// Append a log entry to _log.md.
@@ -442,59 +379,14 @@ pub(crate) fn append_wiki_log(
     action: &str,
     page_path: &str,
 ) -> std::result::Result<(), String> {
-    let canonical = duduclaw_memory::wiki_path::persisted_page_id(page_path)
-        .ok_or_else(|| "Invalid wiki page id".to_string())?;
-    let page_path = canonical.as_str();
-    let log_path = wiki_dir.join("_log.md");
-    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-    let entry = format!("## [{}] {} | {}\n", now, action, page_path);
-
-    use std::io::Write;
-    verify_before_io().map_err(|e| e.to_string())?;
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .map_err(|e| format!("Failed to open _log.md: {e}"))?;
-    verify_before_io().map_err(|e| e.to_string())?;
-    f.write_all(entry.as_bytes())
-        .map_err(|e| format!("Failed to append to _log.md: {e}"))?;
-    Ok(())
+    duduclaw_memory::WikiStore::new(wiki_dir.to_path_buf()).append_log_with_author_checked(action, page_path, None, || {
+        verify_before_io().map_err(|e| e.to_string())
+    })
 }
 
 /// Collect all .md files under `dir` recursively (relative to `base`).
 pub(crate) fn collect_md_files(base: &Path, dir: &Path) -> Vec<String> {
-    let mut result = Vec::new();
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return result,
-    };
-    for entry in entries.flatten() {
-        // `DirEntry::file_type` does not follow symlinks: a link to a
-        // directory or file outside the wiki is skipped, never listed or read
-        // (same rule as `WikiStore`'s own scan).
-        let Ok(ftype) = entry.file_type() else {
-            continue;
-        };
-        let path = entry.path();
-        let Ok(meta) = std::fs::symlink_metadata(&path) else { continue; };
-        if duduclaw_memory::wiki_path::is_link_metadata(&meta) { continue; }
-        if ftype.is_dir() {
-            result.extend(collect_md_files(base, &path));
-        } else if ftype.is_file()
-            && path.extension().and_then(|e| e.to_str()) == Some("md")
-            && let Ok(rel) = path.strip_prefix(base)
-        {
-            // Skip reserved files
-            let fname = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
-            if !WIKI_RESERVED.contains(&fname) {
-                if let Some(id) = duduclaw_memory::wiki_path::page_id_from_relative_path(rel) {
-                    result.push(id);
-                }
-            }
-        }
-    }
-    result
+    duduclaw_memory::wiki_scan::collect(base, dir)
 }
 
 /// Extract a named field from frontmatter (helper for shared wiki).
@@ -532,4 +424,21 @@ pub(crate) fn extract_frontmatter_body(content: &str) -> String {
     } else {
         content.to_string()
     }
+}
+
+#[cfg(test)]
+#[test]
+fn rm209_cli_scan_matches_store_page_set() {
+    let root = tempfile::tempdir().unwrap();
+    for id in ["notes/a.md", "_archive/old.md", "notes/_INDEX.md", "notes/_archive/kept.md"] {
+        let path = root.path().join(id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "---\ntitle: Page\n---\nbody").unwrap();
+    }
+    let store = duduclaw_memory::WikiStore::new(root.path().to_path_buf());
+    let mut listed: Vec<_> = store.list_pages().unwrap().into_iter().map(|p| p.path).collect();
+    listed.sort();
+    let cli = collect_md_files(root.path(), root.path());
+    assert_eq!(cli, vec!["notes/_archive/kept.md", "notes/a.md"]);
+    assert_eq!(cli, listed);
 }

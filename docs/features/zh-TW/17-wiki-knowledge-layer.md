@@ -241,7 +241,7 @@ mode         = "operator_only"
 
 `wiki_write`（`scope="shared"`）與 `shared_wiki_delete` 都會遵守該政策。未列出的命名空間預設為 `agent_writable`；該政策*只會收緊*，絕不放寬。
 
-**Fail-safe（故障安全）：** 檔案不存在 ⇒ 無政策 ⇒ 維持既有行為。TOML 格式錯誤 ⇒ 記錄警告 + 視同無政策。gateway 絕不會被一個損壞的政策檔案卡住。
+`.scope.toml` 不存在時維持原本預設；格式錯誤或無法讀取時拒絕存取，詳見下方 RM-209 政策規則。
 
 **熱重載：** 政策會在每次 write／delete 時重新讀取（檔案很小；效能影響可忽略）。操作者的編輯立即生效。
 
@@ -264,7 +264,7 @@ visible_to_departments = ["hr", "legal"]   # 讀取：僅限 hr + legal 部門
 
 對任何有宣告的命名空間都是 **fail-closed**：部門不在清單上的 Agent（包括**沒有部門**的 Agent）一律拒絕。只做精確的部門比對（不做前綴/子字串比對）。清單為空則拒絕所有人。
 
-若未宣告則是 **fail-safe**：沒有 `visible_to_departments` 的命名空間維持對所有 Agent 可讀，行為與過去相同。`.scope.toml` 缺失或格式錯誤 ⇒ 不過濾。
+根目錄政策有效或不存在時，未宣告部門限制的命名空間仍可讀取；政策格式錯誤時，所有命名空間都不對 AI 開放。
 
 這一層疊在內建的 `departments/<dept>/` 隔離之上（見下方「部門知識分層」）：`departments/art/*` 無論 `.scope.toml` 怎麼設，永遠只對 `art` 部門可見；而 `visible_to_departments` 讓操作者可以把*任何*命名空間（`hr/`、`finance/` 等）限制給指定部門。`wiki_namespace_status` 會列出目前生效的 `visible_to_departments` 宣告。
 
@@ -331,7 +331,7 @@ Auto-ingested content defaults:
 
 **四道閘門，全部 fail-closed，全部退回記憶路徑**：
 
-1. `.scope.toml`：`[namespaces.auto]` 可設 `operator_only` 或指向其他 capability 的 `read_only` 來關閉自動建檔。與共享 wiki 的 fail-safe 不同，檔案存在但解析失敗會**停止**寫入。
+1. `.scope.toml`：`[namespaces.auto]` 可設 `operator_only` 或指向其他 capability 的 `read_only` 來關閉自動建檔。與共享 wiki 相同，檔案存在但解析失敗會**停止**寫入。
 2. 對整頁文字跑 `scan_input`，任一規則命中即丟棄。
 3. 同源爆量偵測（`knowledge_guard`）。
 4. 每日斷路器：每位 AI 員工每天 20 頁 + 20 次灰帶仲裁。
@@ -402,3 +402,11 @@ you need historical context or deep references.
 ## 總結
 
 知識不是一堆扁平的文件，它依你需要看到它的頻率分層。DuDuClaw 的 Wiki 將這種分層明確化、為每個頁面加上信任度權重，並將「必須永遠記住」那一層直接自動注入每一個 system prompt。深層典藏則保持安靜，直到被召喚。
+
+### 頁面名稱、政策與掃描範圍（RM-209）
+
+既有頁面以磁碟上的最終檔名作為身分，信任隔離與自動頁面登記也使用這個名稱。大小寫或 Unicode 組合寫法不同時，會解析成同一頁；若資料夾內有多個比對後相同的檔名，則拒絕存取。保留檔也採相同判斷：讀取 `_INDEX.md` 仍會移除不可見的索引內容，不能把它當一般頁面覆寫。寫入仍拒絕結尾的點號與空白；讀取別名則依平台規則解析成同一頁或拒絕。
+
+只有知識庫根目錄的 `.scope.toml` 會生效。檔案不存在時維持原本預設；無法讀取、檔案為連結、超過 64 KB、TOML 格式錯誤或欄位型別不正確時，會停止相關寫入、AI 讀取與注入，以及儀表板讀取與匯出。儀表板政策編輯器支援 `agent_allowlist` 與 `agents` 清單。升級前可執行 `duduclaw doctor` 或儀表板系統檢查，找出政策錯誤；檢查也會提醒子資料夾中的 `.scope.toml` 不會生效。請修好根目錄政策後再重試。
+
+列表、搜尋、注入與匯出共用深度上限為 20 的掃描器，略過第一層 `_archive`（含等價寫法）、保留檔與內部連結，並拒絕以連結作為起點。無效或有歧義的頁面 ID 會略過，數量記入掃描與匯出紀錄。兩條寫入路徑都拒絕連結形式的 `_index.md`、`_log.md`、`_index.lock` 與 `.scope.toml`，包括斷掉的連結。

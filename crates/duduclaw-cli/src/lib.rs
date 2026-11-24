@@ -10906,6 +10906,7 @@ async fn cmd_doctor(fix_residue: bool) -> duduclaw_core::error::Result<()> {
     // write (they run as the operator's OS user at every spawn).
     checks.push(doctor_mcp_servers::mcp_servers_check(&home));
     checks.push(doctor_egress_leases::check(&home));
+    checks.extend(duduclaw_core::scope_policy_checks::checks(&home));
     let office_conflicts = duduclaw_agent::builtin_skills::office_script_conflicts(&home.join("skills"));
     checks.push((
         "辦公文件腳本".into(),

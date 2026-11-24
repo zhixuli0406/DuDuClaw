@@ -18,7 +18,7 @@ use super::*;
 // Path: `<home>/shared/wiki/.scope.toml`.
 
 /// Valid namespace modes (mirror `wiki_scope::NamespaceMode`).
-pub(crate) const SCP_MODES: &[&str] = &["agent_writable", "read_only", "operator_only"];
+pub(crate) const SCP_MODES: &[&str] = duduclaw_core::scope_policy::MODES;
 
 /// Convert a parsed `.scope.toml` table into the `wiki_scope.get` response:
 /// `{ namespaces: [{ namespace, mode, synced_from }] }`.
@@ -39,6 +39,7 @@ pub(crate) fn scp_table_to_response(table: &toml::Table) -> Value {
                 "namespace": name,
                 "mode": mode,
                 "synced_from": synced_from,
+                "agents": t.get("agents").and_then(|v| v.as_array()),
             }));
         }
     }
@@ -84,7 +85,9 @@ pub(crate) fn scp_apply_namespace(
             SCP_MODES.join(", ")
         ));
     }
-    let mut entry = toml::map::Map::new();
+    let mut entry = ns_table.get(namespace).and_then(|v| v.as_table()).cloned().unwrap_or_default();
+    entry.remove("synced_from");
+    if mode != "agent_allowlist" { entry.remove("agents"); }
     entry.insert("mode".into(), toml::Value::String(mode.into()));
     if mode == "read_only" {
         let sf = synced_from.map(str::trim).unwrap_or("");
@@ -126,10 +129,55 @@ pub(crate) fn scp_namespace_mode(table: &toml::Table, namespace: &str) -> Option
 /// actually still held. Fail-closed here means refusing the write entirely
 /// and leaving the on-disk file untouched (CLAUDE.md convention 4).
 pub(crate) fn parse_scp_table_strict(content: &str) -> Result<toml::Table, String> {
-    if content.trim().is_empty() {
-        return Ok(toml::Table::new());
-    }
-    content
-        .parse::<toml::Table>()
+    duduclaw_core::scope_policy::ScopePolicy::parse(content)
+        .map(|policy| policy.table)
         .map_err(|e| format!(".scope.toml is malformed and was left untouched: {e}"))
+}
+
+pub(crate) fn load_scp_table(path: &Path) -> Result<toml::Table, String> {
+    duduclaw_core::scope_policy::load(path).map(|policy| policy.table).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+#[test]
+fn rm209_dashboard_editor_policy_matrix() {
+    let home = tempfile::tempdir().unwrap();
+    let wiki = home.path().join("shared/wiki");
+    std::fs::create_dir_all(&wiki).unwrap();
+    let path = wiki.join(".scope.toml");
+    let allowed = || { load_scp_table(&path).is_ok() };
+    assert!(allowed(), "missing file retains no-policy behavior");
+    for raw in ["not [ valid toml", "namespaces = 42", "[namespaces.notes]\nvisible_to_departments = [7]", "[namespaces.notes]\nmode = false"] {
+        std::fs::write(&path, raw).unwrap();
+        assert!(!allowed(), "malformed policy must deny: {raw}");
+    }
+    std::fs::write(&path, "").unwrap();
+    assert!(allowed(), "empty valid policy");
+    std::fs::remove_file(&path).unwrap();
+    let target = home.path().join("target.toml");
+    std::fs::write(&target, "").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+    #[cfg(windows)]
+    if let Err(error) = std::os::windows::fs::symlink_file(&target, &path) {
+        eprintln!("RM-209: skipping link cases: Windows symlink permission unavailable: {error}");
+        return;
+    }
+    #[cfg(any(unix, windows))]
+    {
+        assert!(!allowed(), "valid symlink must deny");
+        std::fs::remove_file(&target).unwrap();
+        assert!(!allowed(), "dangling symlink must deny");
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn rm209_editor_allowlist_and_visibility_round_trip() {
+    let mut table = parse_scp_table_strict("[namespaces.hr]\nvisible_to_departments = ['hr']\nagents = ['alice']\nmode = 'agent_allowlist'").unwrap();
+    assert!(SCP_MODES.contains(&"agent_allowlist"));
+    scp_apply_namespace(&mut table, "hr", "agent_allowlist", None, false).unwrap();
+    let response = scp_table_to_response(&table);
+    assert_eq!(response["namespaces"][0]["agents"][0], "alice");
+    assert_eq!(table["namespaces"]["hr"]["visible_to_departments"][0].as_str(), Some("hr"));
 }

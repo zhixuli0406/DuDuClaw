@@ -245,28 +245,9 @@ impl std::fmt::Display for AutoPageError {
 /// - anything else, **including a malformed file** → `Err` (§8.4)
 pub fn check_auto_scope(wiki_dir: &Path) -> Result<(), String> {
     let path = wiki_dir.join(".scope.toml");
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => {
-            // The file is there but unreadable — treat like malformed.
-            return Err(format!(
-                ".scope.toml unreadable ({e}) — auto-filing stopped"
-            ));
-        }
-    };
-
-    let table: toml::Table = raw
-        .parse()
-        .map_err(|e| format!(".scope.toml is malformed ({e}) — auto-filing stopped"))?;
-
-    let Some(entry) = table
-        .get("namespaces")
-        .and_then(|v| v.as_table())
-        .and_then(|t| t.get(AUTO_NAMESPACE))
-        .and_then(|v| v.as_table())
-    else {
-        return Ok(()); // namespace unlisted → default agent_writable
+    let policy = duduclaw_core::scope_policy::load(&path).map_err(|e| e.to_string())?;
+    let Some(entry) = policy.namespace(AUTO_NAMESPACE).map_err(|e| e.to_string())? else {
+        return Ok(());
     };
 
     let mode = entry
@@ -2047,5 +2028,38 @@ mod tests {
         for seg in ["automation", "autos", "auto.md", "_auto", "ａｕｔｏ", ""] {
             assert!(!is_auto_namespace_segment(seg), "{seg:?}");
         }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn rm209_auto_filing_policy_matrix() {
+    let home = tempfile::tempdir().unwrap();
+    let wiki = home.path().join("agents/alice/wiki");
+    std::fs::create_dir_all(&wiki).unwrap();
+    let path = wiki.join(".scope.toml");
+    let allowed = || { check_auto_scope(&wiki).is_ok() };
+    assert!(allowed(), "missing file retains no-policy behavior");
+    for raw in ["not [ valid toml", "namespaces = 42", "[namespaces.notes]\nvisible_to_departments = [7]", "[namespaces.notes]\nmode = false"] {
+        std::fs::write(&path, raw).unwrap();
+        assert!(!allowed(), "malformed policy must deny: {raw}");
+    }
+    std::fs::write(&path, "").unwrap();
+    assert!(allowed(), "empty valid policy");
+    std::fs::remove_file(&path).unwrap();
+    let target = home.path().join("target.toml");
+    std::fs::write(&target, "").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+    #[cfg(windows)]
+    if let Err(error) = std::os::windows::fs::symlink_file(&target, &path) {
+        eprintln!("RM-209: skipping link cases: Windows symlink permission unavailable: {error}");
+        return;
+    }
+    #[cfg(any(unix, windows))]
+    {
+        assert!(!allowed(), "valid symlink must deny");
+        std::fs::remove_file(&target).unwrap();
+        assert!(!allowed(), "dangling symlink must deny");
     }
 }

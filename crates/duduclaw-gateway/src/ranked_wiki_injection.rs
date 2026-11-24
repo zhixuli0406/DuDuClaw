@@ -97,6 +97,9 @@ pub fn ranked_wiki_injection(
     viewer_department: Option<&str>,
     allow_personal: bool,
 ) -> String {
+    if duduclaw_core::scope_policy::load(&store.wiki_dir().join(".scope.toml")).is_err() {
+        return String::new();
+    }
     if let Some(key) = cache_key {
         if let Some(pages) = cached_selection(key) {
             return render_and_cite(&pages, citation);
@@ -129,13 +132,16 @@ fn select_pages(
 ) -> Vec<RankedPage> {
     // Gather all candidate pages first. Identity and Core layers are
     // both eligible; L2/L3 stay search-only as the wiki contract states.
-    let memory_owned = load_memory_owned_namespaces(store.wiki_dir());
+    let Ok(memory_owned) = load_memory_owned_namespaces(store.wiki_dir()) else { return Vec::new(); };
     // P3-2: namespaces the operator marked Personal-or-higher. In a shared
     // session (`!allow_personal`) their pages are withheld from injection.
     let personal_ns = if allow_personal {
         HashSet::new()
     } else {
-        load_personal_namespaces(store.wiki_dir())
+        match load_personal_namespaces(store.wiki_dir()) {
+            Ok(namespaces) => namespaces,
+            Err(_) => return Vec::new(),
+        }
     };
     // WP2.3: namespaces declaring `visible_to_departments = [...]` in
     // `.scope.toml` are injected only for agents in one of those departments.
@@ -269,28 +275,18 @@ fn render_and_cite(pages: &[RankedPage], citation: Option<CitationContext<'_>>) 
 // ── Knowledge ownership (.scope.toml) ────────────────────────────────
 
 /// Read the set of top-level namespaces whose `knowledge_owner` is
-/// `"memory"` from `<wiki_root>/.scope.toml`. Absent or malformed file →
-/// empty set (fail-safe: wiki-owned, inject as before).
-fn load_memory_owned_namespaces(wiki_root: &Path) -> HashSet<String> {
-    let path = wiki_root.join(".scope.toml");
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return HashSet::new();
-    };
-    let table: toml::Table = match content.parse() {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::warn!(path = %path.display(), error = %e, ".scope.toml malformed — ignoring knowledge_owner");
-            return HashSet::new();
-        }
-    };
+/// `"memory"` from the root policy. Missing means empty; load errors deny injection.
+fn load_memory_owned_namespaces(wiki_root: &Path) -> Result<HashSet<String>, duduclaw_core::scope_policy::ScopePolicyError> {
+    let policy = duduclaw_core::scope_policy::load(&wiki_root.join(".scope.toml"))?;
+    let table = policy.table;
     let Some(namespaces) = table.get("namespaces").and_then(|v| v.as_table()) else {
-        return HashSet::new();
+        return Ok(HashSet::new());
     };
-    namespaces
+    Ok(namespaces
         .iter()
         .filter(|(_, v)| v.get("knowledge_owner").and_then(|o| o.as_str()) == Some("memory"))
         .map(|(ns, _)| ns.clone())
-        .collect()
+        .collect())
 }
 
 /// A page belongs to a memory-owned namespace when its first path
@@ -303,35 +299,22 @@ fn is_memory_owned(page_path: &str, memory_owned: &HashSet<String>) -> bool {
 /// (no `/`) are never filtered. Shared by the memory-owned and P3-2
 /// personal-namespace filters.
 fn namespace_in_set(page_path: &str, set: &HashSet<String>) -> bool {
-    if set.is_empty() {
-        return false;
-    }
-    match page_path.split('/').next() {
-        Some(ns) if ns != page_path => set.contains(ns),
-        _ => false,
-    }
+    let Some(parts) = duduclaw_core::wiki_auto_namespace::page_id_components(page_path) else { return true; };
+    if parts.len() < 2 { return false; }
+    set.iter().any(|name| duduclaw_core::wiki_auto_namespace::segment_opens_as(parts[0], name))
 }
 
 /// Read the set of top-level namespaces whose `.scope.toml` `sensitivity` is
-/// Personal-or-higher. Absent / malformed file, or a namespace with no/lower
-/// `sensitivity`, contributes nothing (fail-safe: inject as before). Same file
+/// Personal-or-higher. Missing/no declaration contributes nothing; load errors
+/// deny injection. Same file
 /// and table shape as `knowledge_owner`, so operators manage one file.
-fn load_personal_namespaces(wiki_root: &Path) -> HashSet<String> {
-    let path = wiki_root.join(".scope.toml");
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return HashSet::new();
-    };
-    let table: toml::Table = match content.parse() {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::warn!(path = %path.display(), error = %e, ".scope.toml malformed — ignoring sensitivity");
-            return HashSet::new();
-        }
-    };
+fn load_personal_namespaces(wiki_root: &Path) -> Result<HashSet<String>, duduclaw_core::scope_policy::ScopePolicyError> {
+    let policy = duduclaw_core::scope_policy::load(&wiki_root.join(".scope.toml"))?;
+    let table = policy.table;
     let Some(namespaces) = table.get("namespaces").and_then(|v| v.as_table()) else {
-        return HashSet::new();
+        return Ok(HashSet::new());
     };
-    namespaces
+    Ok(namespaces
         .iter()
         .filter(|(_, v)| {
             v.get("sensitivity")
@@ -341,7 +324,7 @@ fn load_personal_namespaces(wiki_root: &Path) -> HashSet<String> {
                 .unwrap_or(false)
         })
         .map(|(ns, _)| ns.clone())
-        .collect()
+        .collect())
 }
 
 // ── Session-stable selection cache ───────────────────────────────────
@@ -412,17 +395,17 @@ mode = "agent_writable"
 "#,
         )
         .unwrap();
-        let owned = load_memory_owned_namespaces(dir.path());
+        let owned = load_memory_owned_namespaces(dir.path()).unwrap();
         assert_eq!(owned.len(), 1);
         assert!(owned.contains("people"));
     }
 
     #[test]
-    fn scope_toml_absent_or_malformed_is_failsafe_empty() {
+    fn scope_toml_missing_is_empty_but_malformed_is_denied() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(load_memory_owned_namespaces(dir.path()).is_empty());
+        assert!(load_memory_owned_namespaces(dir.path()).unwrap().is_empty());
         std::fs::write(dir.path().join(".scope.toml"), "not [ valid toml").unwrap();
-        assert!(load_memory_owned_namespaces(dir.path()).is_empty());
+        assert!(load_memory_owned_namespaces(dir.path()).is_err());
     }
 
     #[test]
@@ -448,7 +431,7 @@ mode = "agent_writable"
 "#,
         )
         .unwrap();
-        let personal = load_personal_namespaces(dir.path());
+        let personal = load_personal_namespaces(dir.path()).unwrap();
         // Personal + Restricted are withheld; Internal / unset are not.
         assert_eq!(personal.len(), 2);
         assert!(personal.contains("calendar"));
@@ -469,20 +452,20 @@ mode = "agent_writable"
     }
 
     #[test]
-    fn scope_toml_sensitivity_absent_or_malformed_is_failsafe_empty() {
+    fn scope_toml_sensitivity_missing_is_empty_but_malformed_is_denied() {
         let dir = tempfile::tempdir().unwrap();
         // Absent → empty.
-        assert!(load_personal_namespaces(dir.path()).is_empty());
-        // Malformed → empty (fail-safe, never panics).
+        assert!(load_personal_namespaces(dir.path()).unwrap().is_empty());
+        // Malformed policies deny injection.
         std::fs::write(dir.path().join(".scope.toml"), "not [ valid toml").unwrap();
-        assert!(load_personal_namespaces(dir.path()).is_empty());
-        // Unknown sensitivity value → treated as no restriction.
+        assert!(load_personal_namespaces(dir.path()).is_err());
+        // Unknown sensitivity values also deny injection.
         std::fs::write(
             dir.path().join(".scope.toml"),
             "[namespaces.\"x\"]\nmode = \"agent_writable\"\nsensitivity = \"bogus\"\n",
         )
         .unwrap();
-        assert!(load_personal_namespaces(dir.path()).is_empty());
+        assert!(load_personal_namespaces(dir.path()).is_err());
     }
 
     #[test]
@@ -517,16 +500,16 @@ mode = "agent_writable"
     }
 
     #[test]
-    fn scope_toml_visibility_absent_or_malformed_is_failsafe() {
+    fn scope_toml_visibility_missing_is_open_but_malformed_is_denied() {
         let dir = tempfile::tempdir().unwrap();
         // Absent → empty policy, nothing restricted.
         let vis = duduclaw_core::DepartmentVisibilityPolicy::load_for_wiki_dir(dir.path());
         assert!(vis.is_empty());
         assert!(vis.page_visible("hr/x.md", None));
-        // Malformed → fail-safe empty (never blocks injection).
+        // Malformed policies deny every namespace.
         std::fs::write(dir.path().join(".scope.toml"), "not [ valid toml").unwrap();
         let vis = duduclaw_core::DepartmentVisibilityPolicy::load_for_wiki_dir(dir.path());
-        assert!(vis.is_empty());
+        assert!(!vis.page_visible("hr/x.md", None));
     }
 
     #[test]
@@ -554,4 +537,47 @@ fn rm209_malformed_policy_excludes_injection() {
     assert!(!select_pages(&store, "", 10000, None, true).is_empty());
     std::fs::write(tmp.path().join(".scope.toml"), "not [ valid toml").unwrap();
     assert!(select_pages(&store, "", 10000, None, true).is_empty());
+}
+
+#[cfg(test)]
+#[test]
+fn rm209_injection_filters_policy_matrix() {
+    let home = tempfile::tempdir().unwrap();
+    let wiki = home.path().join("shared/wiki");
+    std::fs::create_dir_all(&wiki).unwrap();
+    let path = wiki.join(".scope.toml");
+    let allowed = || { load_memory_owned_namespaces(&wiki).is_ok() && load_personal_namespaces(&wiki).is_ok() };
+    assert!(allowed(), "missing file retains no-policy behavior");
+    for raw in ["not [ valid toml", "namespaces = 42", "[namespaces.notes]\nvisible_to_departments = [7]", "[namespaces.notes]\nmode = false"] {
+        std::fs::write(&path, raw).unwrap();
+        assert!(!allowed(), "malformed policy must deny: {raw}");
+    }
+    std::fs::write(&path, "").unwrap();
+    assert!(allowed(), "empty valid policy");
+    std::fs::remove_file(&path).unwrap();
+    let target = home.path().join("target.toml");
+    std::fs::write(&target, "").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+    #[cfg(windows)]
+    if let Err(error) = std::os::windows::fs::symlink_file(&target, &path) {
+        eprintln!("RM-209: skipping link cases: Windows symlink permission unavailable: {error}");
+        return;
+    }
+    #[cfg(any(unix, windows))]
+    {
+        assert!(!allowed(), "valid symlink must deny");
+        std::fs::remove_file(&target).unwrap();
+        assert!(!allowed(), "dangling symlink must deny");
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn rm209_injection_namespace_folding_matches_visibility_policy() {
+    for (declared, alias) in [("personal", "Personal"), ("café", "cafe\u{301}"), ("personal", "personal.")] {
+        let namespaces = HashSet::from([declared.to_string()]);
+        assert!(namespace_in_set(&format!("{alias}/a.md"), &namespaces));
+        assert!(!namespace_in_set("personal-notes/a.md", &namespaces));
+    }
 }

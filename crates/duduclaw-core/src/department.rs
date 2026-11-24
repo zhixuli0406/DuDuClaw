@@ -130,8 +130,7 @@ pub fn namespace_department_visible(
 ///
 /// ## Fail-safe vs fail-closed
 ///
-/// - Absent / malformed / unreadable `.scope.toml` → **empty policy**: every
-///   namespace is visible (no extra restriction). Never blocks the gateway.
+/// - Absent file → empty policy; malformed/unreadable files deny all namespaces.
 /// - A namespace that *is* declared → **fail-closed** per
 ///   [`namespace_department_visible`]: a caller with no department, or a
 ///   department not on the list, is denied.
@@ -140,6 +139,7 @@ pub struct DepartmentVisibilityPolicy {
     /// namespace → allowed departments. Absent key = visible to all.
     map: std::collections::BTreeMap<String, Vec<String>>,
     ambiguous: std::collections::BTreeSet<String>,
+    denied: bool,
 }
 
 impl DepartmentVisibilityPolicy {
@@ -159,25 +159,17 @@ impl DepartmentVisibilityPolicy {
         Self::load_from(&wiki_dir.join(".scope.toml"))
     }
 
-    /// Load from an explicit `.scope.toml` path. Returns empty on any failure
-    /// (absent / malformed / read error) — fail-safe, logged at WARN.
+    /// Missing means no policy; all other load failures deny every namespace.
     pub fn load_from(path: &std::path::Path) -> Self {
-        let raw = match std::fs::read_to_string(path) {
-            Ok(r) => r,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::empty(),
+        match crate::scope_policy::load(path).and_then(|p| {
+            Self::parse(p.source.as_deref().unwrap_or("")).map_err(crate::scope_policy::ScopePolicyError)
+        }) {
+            Ok(policy) => policy,
             Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "reading .scope.toml for visible_to_departments");
-                return Self::empty();
+                tracing::warn!(path = %path.display(), error = %e, "wiki visibility denied");
+                Self { denied: true, ..Self::default() }
             }
-        };
-        Self::parse(&raw).unwrap_or_else(|e| {
-            tracing::warn!(
-                path = %path.display(),
-                error = %e,
-                ".scope.toml malformed — ignoring visible_to_departments (all namespaces visible)"
-            );
-            Self::empty()
-        })
+        }
     }
 
     /// Parse the `visible_to_departments` map out of a `.scope.toml` body.
@@ -185,7 +177,7 @@ impl DepartmentVisibilityPolicy {
     /// an entry; every other key in the table is ignored (write `mode`,
     /// `knowledge_owner`, `sensitivity`, …).
     pub fn parse(raw: &str) -> Result<Self, String> {
-        let table: toml::Table = raw.parse().map_err(|e: toml::de::Error| e.to_string())?;
+        let table = crate::scope_policy::ScopePolicy::parse(raw).map_err(|e| e.to_string())?.table;
         let mut map = std::collections::BTreeMap::new();
         let mut ambiguous = std::collections::BTreeSet::new();
         if let Some(namespaces) = table.get("namespaces").and_then(|v| v.as_table()) {
@@ -200,12 +192,13 @@ impl DepartmentVisibilityPolicy {
                 }
             }
         }
-        Ok(Self { map, ambiguous })
+        Ok(Self { map, ambiguous, denied: false })
     }
 
     /// Departments allowed to read `namespace`, or `None` when the namespace
     /// has no declaration (visible to all).
     pub fn allowed_for(&self, namespace: &str) -> Option<&[String]> {
+        if self.denied { return Some(&[]); }
         let folded = crate::wiki_auto_namespace::fold_segment(namespace);
         if self.ambiguous.contains(&folded) { return Some(&[]); }
         self.map.iter().find(|(key, _)| {
@@ -235,7 +228,7 @@ impl DepartmentVisibilityPolicy {
 
     /// Whether any namespace declares a `visible_to_departments` filter.
     pub fn is_empty(&self) -> bool {
-        self.map.is_empty() && self.ambiguous.is_empty()
+        !self.denied && self.map.is_empty() && self.ambiguous.is_empty()
     }
 
     /// namespace → allowed departments, for status surfaces
@@ -445,13 +438,13 @@ mod tests {
     }
 
     #[test]
-    fn malformed_scope_toml_yields_empty_policy() {
+    fn malformed_scope_toml_denies_every_page() {
         let dir = std::env::temp_dir().join(format!("dudu-vis-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(".scope.toml");
         std::fs::write(&path, "this = = not valid ===").unwrap();
         let p = DepartmentVisibilityPolicy::load_from(&path);
-        assert!(p.is_empty(), "malformed file must fail-safe to empty");
+        assert!(!p.page_visible("notes/a.md", None));
         // Absent file → empty too.
         let p2 = DepartmentVisibilityPolicy::load_from(&dir.join("nope.toml"));
         assert!(p2.is_empty());
@@ -466,4 +459,37 @@ fn rm209_malformed_policy_denies_ai_visibility() {
     let path = tmp.path().join(".scope.toml");
     std::fs::write(&path, "not [ valid toml").unwrap();
     assert!(!DepartmentVisibilityPolicy::load_from(&path).page_visible("notes/a.md", None));
+}
+
+#[cfg(test)]
+#[test]
+fn rm209_ai_visibility_policy_matrix() {
+    let home = tempfile::tempdir().unwrap();
+    let wiki = home.path().join("shared/wiki");
+    std::fs::create_dir_all(&wiki).unwrap();
+    let path = wiki.join(".scope.toml");
+    let allowed = || { DepartmentVisibilityPolicy::load_from(&path).page_visible("notes/a.md", None) };
+    assert!(allowed(), "missing file retains no-policy behavior");
+    for raw in ["not [ valid toml", "namespaces = 42", "[namespaces.notes]\nvisible_to_departments = [7]", "[namespaces.notes]\nmode = false"] {
+        std::fs::write(&path, raw).unwrap();
+        assert!(!allowed(), "malformed policy must deny: {raw}");
+    }
+    std::fs::write(&path, "").unwrap();
+    assert!(allowed(), "empty valid policy");
+    std::fs::remove_file(&path).unwrap();
+    let target = home.path().join("target.toml");
+    std::fs::write(&target, "").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+    #[cfg(windows)]
+    if let Err(error) = std::os::windows::fs::symlink_file(&target, &path) {
+        eprintln!("RM-209: skipping link cases: Windows symlink permission unavailable: {error}");
+        return;
+    }
+    #[cfg(any(unix, windows))]
+    {
+        assert!(!allowed(), "valid symlink must deny");
+        std::fs::remove_file(&target).unwrap();
+        assert!(!allowed(), "dangling symlink must deny");
+    }
 }

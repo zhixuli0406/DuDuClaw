@@ -1546,3 +1546,6 @@ pub mod mcp_key_store;
 pub mod private_sqlite;
 
 pub mod mcp_start_status;
+
+pub mod scope_policy;
+pub mod scope_policy_checks;

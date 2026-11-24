@@ -903,3 +903,9 @@ Non-Admin add/update scans the complete resulting name + task model prompt with 
 Employee cron uses UTC (also accepts zero-offset UTC/GMT aliases) or an IANA timezone whose UTC offset stays the same over the next two years, such as `Asia/Taipei`; with a constant offset, clock-time gaps equal elapsed time, so the 15-minute proof holds. A timezone with daylight saving or another offset change is refused on create, edit, resume or manual run, and the scheduler skips it, because DST can compress clock-time gaps. Such records remain readable and authorized users can pause/remove them; Admin manages other timezone schedules and must change a skipped one to UTC or a timezone without daylight saving.
 
 Human-origin MCP creation defaults to UTC and accepts an explicit timezone without daylight saving; unmarked Admin/background schedules keep local-timezone detection.
+
+### Wiki path and policy checks (RM-209)
+
+Page quarantine and auto-page visibility use the resolved on-disk filename. Equivalent spellings cannot bypass reserved-file redaction or write protection; ambiguous matches are refused. Page and policy reads use no-follow opens and validate the opened handle on Unix and Windows. Both writers refuse linked control files, including broken links, and scanning refuses linked roots and skips internal links.
+
+The shared root-policy loader caps `.scope.toml` at 64 KB and rejects malformed content and wrong field types. Load failures deny the affected access, including dashboard reads; a missing policy retains its previous meaning. Simulation grounding stops on a policy load error and recognizes `agent_allowlist` as protected. CLI doctor and the dashboard system check report policy errors and warn about ignored nested policies. See [Wiki knowledge layer](17-wiki-knowledge-layer.md) for scanning and recovery behavior.

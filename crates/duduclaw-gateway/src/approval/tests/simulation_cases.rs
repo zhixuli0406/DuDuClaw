@@ -53,7 +53,7 @@ fn grounding_snippets_caps_at_max_and_handles_missing_agent_dir() {
 }
 
 #[test]
-fn protected_wiki_namespaces_ignores_agent_writable_and_allowlist_modes() {
+fn protected_wiki_namespaces_includes_allowlist_modes() {
     let home = tmp_agent_dir();
     write_scope_policy(
         &home,
@@ -73,7 +73,7 @@ fn protected_wiki_namespaces_ignores_agent_writable_and_allowlist_modes() {
                 agents = ["agnes"]
             "#,
     );
-    let protected = protected_wiki_namespaces(&home);
+    let protected = protected_wiki_namespaces(&home).unwrap();
     assert!(protected.contains("identity"));
     assert!(protected.contains("policies"));
     assert!(
@@ -81,20 +81,20 @@ fn protected_wiki_namespaces_ignores_agent_writable_and_allowlist_modes() {
         "agent_writable must never be protected"
     );
     assert!(
-        !protected.contains("hr"),
-        "agent_allowlist still lets some agent write it — not protected for grounding purposes"
+        protected.contains("hr"),
+        "agent_allowlist is a protected namespace"
     );
     let _ = std::fs::remove_dir_all(&home);
 }
 
 #[test]
-fn protected_wiki_namespaces_empty_on_malformed_or_absent_file() {
+fn protected_wiki_namespaces_missing_is_empty_but_malformed_is_denied() {
     let home = tmp_agent_dir();
     // Absent file.
-    assert!(protected_wiki_namespaces(&home).is_empty());
+    assert!(protected_wiki_namespaces(&home).unwrap().is_empty());
     // Malformed TOML.
     write_scope_policy(&home, "this is :: not = valid = toml ===");
-    assert!(protected_wiki_namespaces(&home).is_empty());
+    assert!(protected_wiki_namespaces(&home).is_err());
     let _ = std::fs::remove_dir_all(&home);
 }
 

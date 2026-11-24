@@ -307,7 +307,7 @@ pub(crate) async fn handle_wiki_read_in(
         let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
         return tool_error(&wiki_read_error(page_path, &missing));
     }
-    if WIKI_RESERVED.contains(&file_name) {
+    if duduclaw_memory::wiki_scan::is_reserved(file_name) {
         return tool_text(&redact_reserved_listing(&wiki_dir, &content, scope));
     }
     if let Some(reason) = wiki_page_withheld(home_dir, &wiki_dir, agent_id, page_path, &content) {
@@ -345,7 +345,7 @@ pub(crate) fn wiki_page_withheld(
                 &db,
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
             )?;
-            let key = duduclaw_memory::wiki_path::persisted_page_id(page_path)
+            let key = duduclaw_memory::wiki_path::persisted_page_id(&page.path)
                 .ok_or(rusqlite::Error::InvalidQuery)?;
             let mut stmt = conn.prepare(
                 "SELECT page_path,trust,do_not_inject FROM wiki_trust_state WHERE agent_id=?1",
@@ -520,6 +520,7 @@ pub(crate) async fn handle_wiki_write_in(
         Err(_) => return tool_error(WIKI_AUTO_NAMESPACE_REFUSED),
     };
     let page_path = target.id.as_str();
+    if let Err(e) = validate_wiki_page_path(page_path) { return tool_error(&e); }
     let full_path = target.full_path.clone();
 
     let is_new = std::fs::symlink_metadata(&full_path).is_err();
@@ -537,6 +538,7 @@ pub(crate) async fn handle_wiki_write_in(
         return tool_error(&error.to_string());
     }
     if let Err(e) = duduclaw_memory::wiki_path::atomic_write_nofollow_checked(&full_path, content, || {
+        duduclaw_memory::wiki_path::check_wiki_control_files(&wiki_dir)?;
         duduclaw_mcp_boundary::io_authority::verify_before_io()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))
     }) {
@@ -549,14 +551,14 @@ pub(crate) async fn handle_wiki_write_in(
     if update_index {
         let title = extract_frontmatter_title(content).unwrap_or_else(|| page_path.to_string());
         if let Err(e) = update_wiki_index(&wiki_dir, page_path, &title) {
-            warn!("Failed to update wiki index: {e}");
+            return tool_error(&format!("Page saved but index update refused: {e}"));
         }
     }
 
     // Append to _log.md
     let action = if is_new { "create" } else { "update" };
     if let Err(e) = append_wiki_log(&wiki_dir, action, page_path) {
-        warn!("Failed to append wiki log: {e}");
+        return tool_error(&format!("Page saved but log update refused: {e}"));
     }
 
     drop(wiki_mutation);
@@ -971,6 +973,23 @@ mod conversation_scope_tests {
     }
 
     #[tokio::test]
+    async fn rm209_auto_registry_uses_resolved_filename() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki = regression_home(tmp.path());
+        if !case_insensitive(&wiki) { return; }
+        let page = file_page(tmp.path(), "private", "registry secret", "conversation:telegram:A:m:1");
+        let (parent, filename) = page.rsplit_once('/').unwrap();
+        let stem = filename.strip_suffix(".md").unwrap();
+        let alias = format!("{parent}/{}.md", stem.to_uppercase());
+        let args = serde_json::json!({"page_path": alias});
+        let own = handle_wiki_read_in(&args, tmp.path(), "alice", &ReadScope::Conversation(Some("telegram:A".into()))).await;
+        assert!(text(&own).contains("registry secret"));
+        let other = handle_wiki_read_in(&args, tmp.path(), "alice", &ReadScope::Conversation(Some("telegram:B".into()))).await;
+        assert_eq!(other["isError"], true);
+        assert!(!text(&other).contains("registry secret"));
+    }
+
+    #[tokio::test]
     async fn rm209_reserved_alias_write_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
         let wiki = regression_home(tmp.path());
@@ -986,7 +1005,7 @@ mod conversation_scope_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn rm209_cli_write_refuses_control_file_symlinks() {
-        for name in ["_index.md", "_log.md"] {
+        for name in ["_index.md", "_log.md", "_index.lock", ".scope.toml"] {
             for dangling in [false, true] {
                 let tmp = tempfile::tempdir().unwrap();
                 let wiki = regression_home(tmp.path());

@@ -32,11 +32,11 @@ pub(super) fn collect(
             )
             .join("wiki")
     };
-    if !root.exists() {
-        return Ok(());
-    }
-    let metadata = std::fs::symlink_metadata(&root)
-        .map_err(|_| "EXPORT_SOURCE_UNAVAILABLE".to_string())?;
+    let metadata = match std::fs::symlink_metadata(&root) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err("EXPORT_SOURCE_UNAVAILABLE".into()),
+    };
     if duduclaw_memory::wiki_path::is_link_metadata(&metadata) || !metadata.is_dir() {
         return Err("EXPORT_SOURCE_UNAVAILABLE".into());
     }
@@ -107,45 +107,24 @@ fn visit(
     entries: &mut usize,
     visitor: &mut impl FnMut(&str) -> ExportResult<()>,
     checkpoint: &mut impl FnMut() -> ExportResult<()>,
-) -> ExportResult<()> {
-    if depth > 20 {
-        return Err("EXPORT_TOO_LARGE".into());
+) -> ExportResult<duduclaw_memory::wiki_scan::ScanStats> {
+    let _ = depth; // Depth is derived from the root by the shared walker.
+    let stats = duduclaw_memory::wiki_scan::visit(root, directory,
+        &mut |id| visitor(id).map_err(std::io::Error::other),
+        &mut || {
+            checkpoint().map_err(std::io::Error::other)?;
+            *entries += 1;
+            if *entries > MAX_ROWS * 2 { return Err(std::io::Error::other("EXPORT_TOO_LARGE")); }
+            Ok(())
+        },
+    ).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::Other { error.to_string() }
+        else { "EXPORT_SOURCE_UNAVAILABLE".to_string() }
+    })?;
+    if stats.invalid_ids > 0 {
+        tracing::warn!(invalid_ids = stats.invalid_ids, "wiki export skipped invalid ids");
     }
-    for entry in
-        std::fs::read_dir(directory).map_err(|_| "EXPORT_SOURCE_UNAVAILABLE".to_string())?
-    {
-        checkpoint()?;
-        *entries += 1;
-        if *entries > MAX_ROWS * 2 {
-            return Err("EXPORT_TOO_LARGE".into());
-        }
-        let entry = entry.map_err(|_| "EXPORT_SOURCE_UNAVAILABLE".to_string())?;
-        let path = entry.path();
-        let kind = std::fs::symlink_metadata(&path)
-            .map_err(|_| "EXPORT_SOURCE_UNAVAILABLE".to_string())?;
-        if duduclaw_memory::wiki_path::is_link_metadata(&kind) {
-            continue;
-        }
-        if kind.is_dir() {
-            if depth == 0 && entry.file_name() == "_archive" {
-                continue;
-            }
-            visit(root, &path, depth + 1, entries, visitor, checkpoint)?;
-        } else if kind.is_file() && path.extension().is_some_and(|extension| extension == "md") {
-            if ["_schema.md", "_index.md", "_log.md"]
-                .iter()
-                .any(|reserved| entry.file_name() == *reserved)
-            {
-                continue;
-            }
-            let rel = path.strip_prefix(root)
-                .map_err(|_| "EXPORT_SOURCE_UNAVAILABLE".to_string())?;
-            let relative = duduclaw_memory::wiki_path::page_id_from_relative_path(rel)
-                .ok_or_else(|| "EXPORT_INVALID_PAGE_ID".to_string())?;
-            visitor(&relative)?;
-        }
-    }
-    Ok(())
+    Ok(stats)
 }
 
 
@@ -165,4 +144,38 @@ fn export_walker_skips_directory_and_file_links() {
         Ok(())
     }, &mut || Ok(())).unwrap();
     assert_eq!(found, vec!["ordinary.md".to_string()]);
+}
+
+#[cfg(test)]
+#[test]
+fn rm209_export_scan_matches_store_and_counts_invalid_ids() {
+    let root = tempfile::tempdir().unwrap();
+    for id in ["notes/a.md", "_archive/old.md", "notes/_INDEX.md", "notes/_archive/kept.md"] {
+        let path = root.path().join(id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "---\ntitle: Page\n---\nbody").unwrap();
+    }
+    #[cfg(unix)]
+    std::fs::write(root.path().join("bad\\name.md"), "body").unwrap();
+    let mut exported = Vec::new();
+    let stats = visit(root.path(), root.path(), 0, &mut 0, &mut |id| {
+        exported.push(id.to_string()); Ok(())
+    }, &mut || Ok(())).unwrap();
+    exported.sort();
+    let store = duduclaw_memory::WikiStore::new(root.path().to_path_buf());
+    let mut listed: Vec<_> = store.list_pages().unwrap().into_iter().map(|p| p.path).collect();
+    listed.sort();
+    assert_eq!(exported, vec!["notes/_archive/kept.md", "notes/a.md"]);
+    assert_eq!(exported, listed);
+    assert_eq!(stats.invalid_ids, if cfg!(unix) { 1 } else { 0 });
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn rm209_export_refuses_linked_start() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let alias = root.path().join("linked");
+    std::os::unix::fs::symlink(outside.path(), &alias).unwrap();
+    assert!(visit(&alias, &alias, 0, &mut 0, &mut |_| Ok(()), &mut || Ok(())).is_err());
 }

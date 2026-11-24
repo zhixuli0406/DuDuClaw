@@ -108,7 +108,18 @@ pub fn resolve_wiki_page(wiki_dir: &Path, id: &str, write: bool) -> io::Result<R
     let lexical = root.join(id);
     let parent = lexical.parent().ok_or_else(|| invalid("missing page parent"))?.canonicalize()?;
     if !parent.starts_with(&root) { return Err(denied("resolved parent escapes wiki directory")); }
-    let full_path = parent.join(lexical.file_name().ok_or_else(|| invalid("missing page name"))?);
+    let requested = lexical.file_name().and_then(|name| name.to_str())
+        .ok_or_else(|| invalid("missing page name"))?;
+    let mut matched = None;
+    for entry in std::fs::read_dir(&parent)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name.to_str().is_some_and(|name| duduclaw_core::wiki_auto_namespace::segment_opens_as(name, requested)) {
+            if matched.is_some() { return Err(denied("ambiguous wiki page spelling")); }
+            matched = Some(name);
+        }
+    }
+    let full_path = parent.join(matched.unwrap_or_else(|| requested.into()));
     let resolved = page_id_from_relative_path(full_path.strip_prefix(&root)
         .map_err(|_| denied("resolved path escapes wiki directory"))?)
         .ok_or_else(|| invalid("invalid resolved wiki page id"))?;
@@ -153,6 +164,7 @@ pub fn prepare_wiki_write_with_policy(
     require_canonical_id(id)?;
     validate_relative_wiki_path(id).map_err(|e| invalid(&e))?;
     authorize(id)?;
+    check_wiki_control_files(wiki_dir)?;
     std::fs::create_dir_all(wiki_dir)?;
     let root = wiki_dir.canonicalize()?;
     let mut parent = root.clone();
@@ -390,6 +402,7 @@ pub fn prepare_wiki_write_target(wiki_dir: &Path, rel: &str) -> io::Result<PathB
 pub fn prepare_wiki_write_page(wiki_dir: &Path, rel: &str) -> io::Result<ResolvedWikiPage> {
     require_canonical_id(rel)?;
     validate_relative_wiki_path(rel).map_err(|e| invalid(&e))?;
+    check_wiki_control_files(wiki_dir)?;
     std::fs::create_dir_all(wiki_dir)?;
     let full = wiki_dir.join(rel);
     ensure_within_wiki_dir(wiki_dir, &full)?;
@@ -426,6 +439,7 @@ pub fn atomic_write_nofollow_checked(
 ) -> io::Result<()> {
     use std::io::Write;
     verify()?;
+    reject_nonregular_target(full)?;
     let tmp = full.with_extension("md.tmp");
     match std::fs::remove_file(&tmp) {
         Ok(()) => {}
@@ -446,6 +460,10 @@ pub fn atomic_write_nofollow_checked(
     if let Err(e) = write {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
+    }
+    if let Err(error) = reject_nonregular_target(full) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
     }
     std::fs::rename(&tmp, full).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
@@ -755,5 +773,114 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("wiki")).unwrap();
         let e = read_wiki_file_nofollow(&tmp.path().join("wiki"), "nope.md").unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::NotFound);
+    }
+}
+
+/// Preflight every control file before either writer mutates the wiki.
+/// Folded aliases are resolved exactly as page identities are.
+pub fn check_wiki_control_files(wiki_dir: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(wiki_dir) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+        Ok(meta) if is_link_metadata(&meta) || !meta.is_dir() => return Err(denied("linked wiki root")),
+        Ok(_) => {}
+    }
+    for name in crate::wiki_scan::RESERVED_FILES.iter().copied().chain(["_index.lock", ".scope.toml"]) {
+        let target = resolve_wiki_page(wiki_dir, name, true)?;
+        if target.exists {
+            // A control file with a different spelling must not create a
+            // second control identity on a case-sensitive filesystem.
+            if target.id != name { return Err(denied("noncanonical control filename")); }
+            duduclaw_core::fs_safety::open_regular_file_nofollow(&target.full_path)?;
+        }
+    }
+    duduclaw_core::scope_policy::load(&wiki_dir.join(".scope.toml"))
+        .map_err(|e| denied(&e.to_string()))?;
+    Ok(())
+}
+
+/// Create/open an append or lock file without following links on any OS.
+pub fn open_control_file_nofollow(path: &Path, append: bool) -> io::Result<std::fs::File> {
+    reject_nonregular_target(path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).write(true).truncate(false).append(append);
+    #[cfg(unix)] {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)] {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let file = options.open(path)?;
+    let meta = file.metadata()?;
+    if is_link_metadata(&meta) || !meta.is_file() { return Err(denied("control file is not regular")); }
+    Ok(file)
+}
+
+fn reject_nonregular_target(path: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if is_link_metadata(&meta) || !meta.is_file() => Err(denied("target is not a regular file")),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod rm209_identity_tests {
+    use super::*;
+
+    #[test]
+    fn folded_filename_resolves_to_disk_identity_or_refuses() {
+        let root = tempfile::tempdir().unwrap();
+        for (disk, aliases) in [
+            ("Bad.md", vec!["Bad.md", "bad.md", "BAD.md"]),
+            ("café.md", vec!["café.md", "cafe\u{301}.md", "CAFÉ.md"]),
+            ("tail.md", vec!["tail.md", "tail.md.", "tail.md "]),
+        ] {
+            std::fs::write(root.path().join(disk), "body").unwrap();
+            let actual = resolve_wiki_page(root.path(), disk, false).unwrap().id;
+            for alias in aliases {
+                match resolve_wiki_page(root.path(), alias, false) {
+                    Ok(page) => {
+                        assert_eq!(page.id, actual);
+                        assert_eq!(read_resolved_wiki_file_nofollow(&page).unwrap(), "body");
+                    }
+                    Err(error) => assert!(matches!(error.kind(), io::ErrorKind::PermissionDenied | io::ErrorKind::InvalidInput)),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ambiguous_fold_matches_are_refused_even_for_exact_spelling() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Bad.md"), "first").unwrap();
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(root.path().join("bad.md")) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                eprintln!("RM-209: skipping ambiguous-name test: filesystem does not allow both spellings");
+                return;
+            }
+            Err(error) => panic!("fixture: {error}"),
+        }
+        for name in ["Bad.md", "bad.md", "BAD.md"] {
+            assert!(resolve_wiki_page(root.path(), name, false).is_err());
+            assert!(resolve_wiki_page(root.path(), name, true).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_open_refuses_link_swapped_after_resolution() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.md"), "safe").unwrap();
+        std::fs::write(outside.path().join("secret"), "private").unwrap();
+        let page = resolve_wiki_page(root.path(), "a.md", false).unwrap();
+        std::fs::remove_file(&page.full_path).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), &page.full_path).unwrap();
+        assert!(open_resolved_wiki_file_nofollow(&page).is_err());
     }
 }
