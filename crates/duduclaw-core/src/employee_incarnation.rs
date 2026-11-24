@@ -31,7 +31,7 @@ pub fn retire(conn: &Connection, agent: &str) -> rusqlite::Result<()> {
 /// publication must never restore an old grant.
 pub fn created(home: &Path, agent: &str) -> io::Result<()> {
     let mut conn = private_sqlite::open(home, "users.db", Access::Create)
-        .map_err(io::Error::other)?.ok_or_else(|| io::Error::other("users.db unavailable"))?;
+        .map_err(|e| io::Error::other(e.to_string()))?.ok_or_else(|| io::Error::other("users.db unavailable"))?;
     let tx = conn.transaction().map_err(io::Error::other)?;
     retire(&tx, agent).map_err(io::Error::other)?;
     ensure(&tx, agent).map_err(io::Error::other)?;
@@ -39,7 +39,7 @@ pub fn created(home: &Path, agent: &str) -> io::Result<()> {
 }
 
 pub fn deleted(home: &Path, agent: &str) -> io::Result<()> {
-    if let Some(conn) = private_sqlite::open(home, "users.db", Access::ReadWrite).map_err(io::Error::other)? {
+    if let Some(conn) = private_sqlite::open(home, "users.db", Access::ReadWrite).map_err(|e| io::Error::other(e.to_string()))? {
         retire(&conn, agent).map_err(io::Error::other)?;
     }
     Ok(())
@@ -48,7 +48,7 @@ pub fn deleted(home: &Path, agent: &str) -> io::Result<()> {
 /// Scan persisted labels, including ones missing before gateway restart.
 /// An unreadable directory fails the scan; it never creates a replacement nonce.
 pub fn reconcile(home: &Path) -> io::Result<()> {
-    let Some(mut conn) = private_sqlite::open(home, "users.db", Access::ReadWrite).map_err(io::Error::other)? else { return Ok(()); };
+    let Some(mut conn) = private_sqlite::open(home, "users.db", Access::ReadWrite).map_err(|e| io::Error::other(e.to_string()))? else { return Ok(()); };
     migrate(&conn).map_err(io::Error::other)?;
     let tx = conn.transaction().map_err(io::Error::other)?;
     let labels = {
