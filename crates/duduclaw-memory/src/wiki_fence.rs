@@ -492,7 +492,8 @@ mod tests {
         assert!(initialized_epoch > 0);
 
         let reopened = crate::trust_store::WikiTrustStore::open(&db).unwrap();
-        assert!(reopened.get("missing.md", "a").unwrap().is_none());
+        // RM-209 supplies a denial snapshot for a page with no disk identity.
+        assert!(reopened.get("missing.md", "a").unwrap().unwrap().do_not_inject);
         assert_eq!(fence.try_shared().unwrap().epoch(), initialized_epoch);
         drop(reopened);
         drop(lease);

@@ -313,6 +313,10 @@ mod tests {
     #[test]
     fn contended_delivery_fence_no_longer_drops_the_trust_signal() {
         let home = tempfile::tempdir().unwrap();
+        // RM-209 resolves trust keys against an existing, unambiguous disk page.
+        let wiki = home.path().join("agents/agnes/wiki/concepts");
+        std::fs::create_dir_all(&wiki).unwrap();
+        std::fs::write(wiki.join("a.md"), "# A").unwrap();
         let tracker = Arc::new(CitationTracker::new());
         let store =
             Arc::new(WikiTrustStore::open(home.path().join("wiki_trust.db")).unwrap());

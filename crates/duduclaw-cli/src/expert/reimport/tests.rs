@@ -57,6 +57,16 @@ fn trash_entries(home: &Path, id: &str) -> Vec<String> {
 }
 
 #[tokio::test]
+async fn importing_an_agent_does_not_create_users_database() {
+    let home = tempfile::tempdir().unwrap();
+    let src = tempfile::tempdir().unwrap();
+    let pack = source(src.path(), "fresh-advisor", "Read the source first.");
+    assert_eq!(run(home.path(), &pack, false, ReimportMode::Fresh).await.0, None);
+    assert!(home.path().join("agents/fresh-advisor/agent.toml").is_file());
+    assert!(!home.path().join("users.db").exists());
+}
+
+#[tokio::test]
 async fn a_second_import_without_a_choice_is_refused_with_its_options() {
     let home = tempfile::tempdir().unwrap();
     let src = tempfile::tempdir().unwrap();

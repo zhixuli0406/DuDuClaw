@@ -39,7 +39,7 @@ impl Fixture {
         let turn = Turn { agent: "kb-avatar".into(), turn_id: Some(uuid::Uuid::new_v4().to_string()), run_id: None };
         let guard = turn_requesters::register_inbound(&turn.agent, turn.turn_id.as_deref().unwrap(),
             RequesterIdentity::DashboardUser { user_id: owner.clone() },
-            Some(InboundContent { text: "data".into(), attachment_hashes: vec![] })).unwrap();
+            Some(InboundContent { text: "source data".into(), attachment_hashes: vec![] })).unwrap();
         Self { home, db, owner, editor, cid: c.id, turn, _guard: guard }
     }
     fn proposal(&self, text: &str) -> approval::Proposal {
@@ -91,12 +91,22 @@ async fn exact_owner_avatar_turn_imports_and_audits_without_content() {
 }
 
 #[tokio::test]
-async fn short_or_empty_verbatim_paste_requires_approval() {
-    for text in ["", "   \n\t", "的", "a", "1234567"] {
+async fn short_verbatim_paste_requires_approval() {
+    for text in ["的", "a", "1234567"] {
         let f = Fixture::new();
         assert!(matches!(f.submit(text).await, approval::Proposed::Filed { .. }), "{text:?}");
         assert_eq!(f.count(), 0, "{text:?}");
     }
+}
+
+#[tokio::test]
+async fn empty_verbatim_paste_is_rejected_without_import() {
+    let f = Fixture::new();
+    for text in ["", "   \n\t"] {
+        assert!(approval::propose_in_turn(f.home.path(), f.proposal(text),
+            f.turn.turn_id.clone(), None).await.is_err());
+    }
+    assert_eq!(f.count(), 0);
 }
 
 #[tokio::test]
@@ -166,7 +176,7 @@ fn sharing_after_initial_check_is_rechecked_inside_import_transaction() {
         collection_id: f.cid.clone(), kind: duduclaw_knowledge::sources::SourceKind::Paste,
         title: "metadata".into(), original_name: None, url: None,
         format: duduclaw_knowledge::extract::Format::Txt,
-        blob_sha256: duduclaw_knowledge::blob::BlobStore::for_home(f.home.path()).put(b"data").unwrap(), bytes: 4,
+        blob_sha256: duduclaw_knowledge::blob::BlobStore::for_home(f.home.path()).put(b"source data").unwrap(), bytes: 11,
         origin: serde_json::json!({}), created_by: "kb-avatar".into(),
     };
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
@@ -357,8 +367,8 @@ async fn current_attachment_hash_imports_but_prior_turn_or_modified_file_require
 async fn unavailable_inbound_record_requires_card_even_with_verified_owner() {
     let f = Fixture::new();
     // The newest record has identity but no readable ingress snapshot. It
-    // must not borrow the older registration's matching "data" snapshot.
-    assert!(matches!(f.submit_inbound(f.proposal("data"), None).await, approval::Proposed::Filed { .. }));
+    // must not borrow the older registration's matching "source data" snapshot.
+    assert!(matches!(f.submit_inbound(f.proposal("source data"), None).await, approval::Proposed::Filed { .. }));
     assert_eq!(f.count(), 0);
 }
 
@@ -370,8 +380,8 @@ fn lost_turn_record_is_rechecked_inside_source_transaction() {
     let source = NewSource {
         collection_id: f.cid.clone(), kind: SourceKind::Paste, title: "data".into(),
         original_name: None, url: None, format: duduclaw_knowledge::extract::Format::Txt,
-        blob_sha256: duduclaw_knowledge::blob::BlobStore::for_home(f.home.path()).put(b"data").unwrap(),
-        bytes: 4, origin: serde_json::json!({}), created_by: "kb-avatar".into(),
+        blob_sha256: duduclaw_knowledge::blob::BlobStore::for_home(f.home.path()).put(b"source data").unwrap(),
+        bytes: 11, origin: serde_json::json!({}), created_by: "kb-avatar".into(),
     };
     personally_provided(f.home.path(), &f.turn, &f.turn.requester(), &source).unwrap();
     let _unreadable = turn_requesters::register(&f.turn.agent, f.turn.turn_id.as_deref().unwrap(),

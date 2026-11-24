@@ -248,6 +248,21 @@ fn rm173_upgraded_session_stores_match_a_pinned_catalog() {
 }
 
 #[test]
+fn import_accepts_v185_sessions_without_importing_tool_references() {
+    for catalog in [SESSION_V185, SESSION_V185_UPGRADED, SESSION_V185_FROM_V181, SESSION_V185_FROM_V181_UPGRADED] {
+        assert_eq!(detected(catalog, Store::Sessions, None), Detected { version: SchemaVersion::V181, extension: false });
+        let file = store(catalog, "INSERT INTO sessions(id,agent_id,last_active,created_at) VALUES ('s','sales','now','now');
+            INSERT INTO session_messages(session_id,role,content,timestamp) VALUES ('s','user','legacy question','now');
+            INSERT INTO session_tool_refs(session_id,session_generation,created_at,tool_name,ref_kind,ref_id,label)
+            VALUES ('s','now',0,'docs_create','google_doc','SECRET-ID','SECRET-LABEL');");
+        let mut out = Vec::new();
+        assert_eq!(import(&request(SourceKind::SessionsSqlite, "sessions.db"), source(&file), None, &mut out), Ok(1));
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("legacy question") && !text.contains("SECRET"), "{text}");
+    }
+}
+
+#[test]
 fn import_accepts_v182_sessions_without_reading_origin_proofs() {
     // v1.82 = either v1.81 shape plus the gateway-owned proof table; both map
     // as V181 and the reader never emits a proof record.
@@ -287,7 +302,7 @@ fn rm173_import_refuses_v181_sessions_with_planted_objects() {
         assert_eq!((refusal.store, refusal.closest, refusal.closest_extension), (Store::Sessions, SchemaVersion::V181, false), "{sql}");
         assert_eq!(refusal.differences.len(), 1, "{sql}: {:?}", refusal.differences);
         let message = refusal.to_string();
-        assert!(message.contains("known catalogs (v1.79.3, v1.80.x, v1.81, v1.82)") && message.contains("closest (v1.81)"), "{message}");
+        assert!(message.contains("known catalogs (v1.79.3, v1.80.x, v1.81, v1.82, v1.85)") && message.contains("closest (v1.81)"), "{message}");
     }
     let file = store(SESSION_V181, "CREATE INDEX planted_idx ON sessions(user_cleared_at);");
     assert_eq!(import(&request(SourceKind::SessionsSqlite, "sessions.db"), source(&file), None, Vec::new()), Err(Error::Schema));

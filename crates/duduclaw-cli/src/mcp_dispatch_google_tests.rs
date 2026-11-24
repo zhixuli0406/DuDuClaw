@@ -614,7 +614,8 @@ async fn rm159_write_listing_and_dispatch_match_explicit_employee_scopes() {
                 let result = with_authenticated_call(call, dispatcher.dispatch_tool_call(
                     &principal, &namespace(), &json!({"name":tool,"arguments":{}}), &json!(159),
                 )).await;
-                assert_eq!(result["error"]["code"], -32003, "{tool}: {result}");
+                // RM-134 hides tools outside the authenticated employee scope.
+                assert_eq!(result["error"]["code"], -32601, "{tool}: {result}");
             }
         }
     }

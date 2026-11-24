@@ -249,8 +249,11 @@ The matrix is checked for unique tool names, complete policy inventory, and exac
 | `google_chat_messages` | Resource → Native account-bound executor (mailbox grant, admin Chat opt-in, Direct OAuth only); installed at production boot (F1); real provider acceptance needs a Linux host |
 | `calendar_list_events` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
 | `calendar_create_event` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `calendar_update_event` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
 | `sheets_read` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
 | `sheets_append` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `sheets_create` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `sheets_update` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
 | `forms_get` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
 | `forms_list_responses` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
 | `gtasks_lists` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
@@ -261,6 +264,8 @@ The matrix is checked for unique tool names, complete policy inventory, and exac
 | `drive_read` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
 | `docs_read` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
 | `docs_append` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `docs_create` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `docs_replace_text` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
 | `slides_read` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
 | `os_notify` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
 | `os_watch_status` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |

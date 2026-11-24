@@ -1276,15 +1276,14 @@ mod tests {
         assert!(check_auto_scope(store.wiki_dir()).is_ok());
     }
 
-    /// §8.4 approved deviation: existing-but-malformed policy stops the write,
-    /// whereas the shared-wiki path would treat it as "no policy".
+    /// RM-209: malformed policy refuses writes in both auto and shared wiki.
     #[test]
     fn scope_malformed_file_stops_auto_write() {
         let tmp = TempDir::new().unwrap();
         let store = store_in(&tmp);
         write_scope(&store, "this is :: not = valid = toml ===");
         let err = check_auto_scope(store.wiki_dir()).unwrap_err();
-        assert!(err.contains("malformed"), "got: {err}");
+        assert!(err.contains("wiki scope policy refused"), "got: {err}");
         let err = write_auto_page(&store, tmp.path(), "agnes", &req("t", "body")).unwrap_err();
         assert!(matches!(err, AutoPageError::ScopeDenied(_)));
     }

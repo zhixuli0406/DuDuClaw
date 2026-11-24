@@ -90,10 +90,12 @@ impl Transport<'_, '_> {
                         .starts_with("/calendar/v3/calendars/primary/events")
                         || url.path().starts_with("/drive/v3/files")
                 }
-                Some("sheets.googleapis.com") => url.path().starts_with("/v4/spreadsheets/"),
+                Some("sheets.googleapis.com") => url.path().starts_with("/v4/spreadsheets/")
+                    || (self.template.tool() == "sheets_create" && url.path() == "/v4/spreadsheets"),
                 Some("forms.googleapis.com") => url.path().starts_with("/v1/forms/"),
                 Some("tasks.googleapis.com") => url.path().starts_with("/tasks/v1/"),
-                Some("docs.googleapis.com") => url.path().starts_with("/v1/documents/"),
+                Some("docs.googleapis.com") => url.path().starts_with("/v1/documents/")
+                    || (self.template.tool() == "docs_create" && url.path() == "/v1/documents"),
                 Some("slides.googleapis.com") => url.path().starts_with("/v1/presentations/"),
                 _ => false,
             };

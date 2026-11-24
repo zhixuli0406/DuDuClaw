@@ -3244,7 +3244,6 @@ mod tests {
             "aux.md",
             "space /page.md",
             "auto./page.md",
-            "auto /page.md",
         ];
         let content = "---\ntitle: Legacy\nlayer: core\ntrust: 0.8\n---\n\ncompatibilityneedle\n";
         for path in paths {
@@ -3269,6 +3268,11 @@ mod tests {
         for path in paths {
             assert!(hits.iter().any(|p| p.path == path), "fts {path}");
         }
+        // RM-209: adding a colliding disk spelling makes both names ambiguous.
+        std::fs::create_dir_all(wiki.join("auto ")).unwrap();
+        std::fs::write(wiki.join("auto /page.md"), content).unwrap();
+        assert!(store.read_raw("auto /page.md").is_err());
+        assert!(store.read_raw("auto./page.md").is_err());
     }
 
     #[test]

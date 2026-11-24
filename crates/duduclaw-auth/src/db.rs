@@ -177,6 +177,23 @@ impl UserDb {
     /// Seed a newly created MFA policy table atomically with the verified
     /// installation default. Existing policy values are never overwritten.
     pub fn new_with_mfa_default(db_path: &Path, enforced: bool) -> Result<Self, String> {
+        // Create private databases before SQLite opens them so WAL/SHM inherit
+        // owner-only permissions. Never reopen an existing inode just to chmod:
+        // closing that descriptor would drop this process's SQLite locks.
+        if db_path != Path::new(":memory:") {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(db_path) {
+                Ok(_) => {},
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {},
+                Err(e) => return Err(format!("failed to create user db: {e}")),
+            }
+        }
         let mut pool = Vec::with_capacity(POOL_SIZE);
         for _ in 0..POOL_SIZE {
             let conn = Connection::open(db_path)

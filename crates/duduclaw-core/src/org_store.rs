@@ -1737,6 +1737,7 @@ mod tests {
         assert!(staged.path().file_name().unwrap().to_str().unwrap().starts_with(AGENT_STAGING_PREFIX));
         assert_eq!(staged.publish(&org, OrgEntry::new("ceo", "")).unwrap(), target);
         assert!(target.join("agent.toml").is_file());
+        assert!(!h.path().join("users.db").exists());
         assert_eq!(load(h.path()).get("newbie").unwrap().reports_to, "ceo");
         // A taken name is refused up front.
         assert_eq!(

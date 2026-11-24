@@ -552,15 +552,15 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn causal_ingest_resolved_alias_uses_target_identity_and_auto_rules() {
+    fn causal_ingest_refuses_symlink_aliases_and_auto_sources() {
         use std::os::unix::fs::symlink;
         let (dir, store, page) = fixture();
         let wiki = page.parent().unwrap().parent().unwrap();
         symlink(wiki.join("sources"), wiki.join("alias")).unwrap();
         let canonical = store.import_agent_wiki_source("agent-a", "sources/queue.md").unwrap();
-        let alias = store.import_agent_wiki_source("agent-a", "alias/queue.md").unwrap();
-        assert_eq!(canonical.id, alias.id);
-        assert_eq!(alias.external_id, "sources/queue.md");
+        // RM-209 refuses symlinks even when their target stays inside the wiki.
+        assert!(store.import_agent_wiki_source("agent-a", "alias/queue.md").is_err());
+        assert_eq!(canonical.external_id, "sources/queue.md");
         std::fs::create_dir_all(wiki.join("auto")).unwrap();
         symlink(wiki.join("auto"), wiki.join("auto-alias")).unwrap();
         let raw = std::fs::read_to_string(&page).unwrap();
@@ -576,9 +576,8 @@ mod tests {
         std::fs::write(wiki.join("auto/queue.md"), &promoted).unwrap();
         crate::wiki_auto_registry::record_page(dir.path(), "agent-a", "auto/queue.md", &promoted, &[], true).unwrap();
         let direct = store.import_agent_wiki_source("agent-a", "auto/queue.md").unwrap();
-        let alias = store.import_agent_wiki_source("agent-a", "auto-alias/queue.md").unwrap();
-        assert_eq!(direct.id, alias.id);
-        assert_eq!(alias.external_id, "auto/queue.md");
+        assert!(store.import_agent_wiki_source("agent-a", "auto-alias/queue.md").is_err());
+        assert_eq!(direct.external_id, "auto/queue.md");
         std::fs::write(wiki.join("auto/queue.md"), &raw).unwrap();
         assert!(store.import_agent_wiki_source("agent-a", "auto-alias/queue.md").is_err());
     }

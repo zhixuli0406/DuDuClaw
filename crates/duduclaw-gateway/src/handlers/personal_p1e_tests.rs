@@ -457,6 +457,7 @@ const EMPLOYEE_ARMS: &[(&str, &str)] = &[
     ("users.remove", "people; names no employee"),
     ("users.offboard", "people; P1g default deny on a named hand-over target"),
     ("users.set_primary_agent", "P1g default deny: another person's Personal employee is refused (owner only)"),
+    ("users.set_avatar", "v1.85 avatar assignment: live Admin check; P1g default deny on agent_id, protected-mode owner match, and existing binding required; grants no employee access"),
     ("users.change_password", "the caller's own password"),
     ("users.change_email", "the caller's own address"),
     ("users.audit_log", "auth audit rows; P1g hidden rows drop those naming another person's Personal employee"),
