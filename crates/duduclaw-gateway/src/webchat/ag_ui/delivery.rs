@@ -7,7 +7,7 @@ pub(super) struct Permit {
     generation: u64,
     policy: crate::webchat::access::TargetPolicy,
     home: PathBuf,
-    claims: duduclaw_auth::jwt::Claims,
+    claims: ChatCredential,
     source: ReplyDeliveryFence,
     deadline: tokio::time::Instant,
 }
@@ -19,7 +19,7 @@ impl Permit {
         // Capture before the account and target snapshots; any intervening
         // writer invalidates the permit instead of reviving a stale grant.
         let generation = tokio::task::spawn_blocking(move || db.acl_generation()).await.map_err(|_| ())?.map_err(|_| ())?;
-        if state.chat.credential_validity(Some(&connection.claims), true).await != crate::handlers::live_context::SocketValidity::Valid
+        if state.chat.chat_credential_validity(Some(&connection.claims), true).await != crate::handlers::live_context::SocketValidity::Valid
             || state.chat.authorize_target(user, agent, true).await.is_err()
             || !source.valid().await { return Err(()); }
         let policy = state.chat.target_policy(user, agent, true).await.map_err(|_| ())?;
@@ -28,11 +28,18 @@ impl Permit {
     }
 
     pub(super) fn with_current<T>(&self, emit: impl FnOnce() -> T) -> Result<T, ()> {
+        if !self.claims.valid_at_delivery(&self.home, &self.users, chrono::Utc::now().timestamp().max(0) as u64) {
+            self.source.refuse();
+            return Err(());
+        }
         let result = (|| self.users.with_acl_generation(self.generation, || {
             self.policy.with_current(|| {
                 let now = chrono::Utc::now().timestamp().max(0) as u64;
-                let valid = webchat_credential_expiry(&self.home, &self.claims)
-                    .is_ok_and(|expiry| expiry.is_none_or(|expiry| now < expiry));
+                let valid = match &self.claims {
+                    ChatCredential::Jwt(claims) => webchat_credential_expiry(&self.home, claims)
+                        .is_ok_and(|expiry| expiry.is_none_or(|expiry| now < expiry)),
+                    ChatCredential::Member(_) => crate::member_keys::config(&self.home).enabled,
+                };
                 if !valid || tokio::time::Instant::now() >= self.deadline || !self.source.latched_valid() { return Err(()); }
                 Ok(emit())
             }).map_err(|_| ())?

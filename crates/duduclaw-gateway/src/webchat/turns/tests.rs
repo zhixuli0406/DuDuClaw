@@ -863,7 +863,7 @@ async fn execute_revoked_running_credential_withdraws_and_refuses_card() {
     let turn_id = ticket.id.clone();
     let mut input = credential_input(state.clone());
     input.auth_user = user.id.clone();
-    input.credential = Some(claims);
+    input.credential = Some(claims.into());
     let (tx, mut rx) = outbound_channel();
     let mut task = tokio::spawn(execute(input, TurnSink::new(tx, "session", None, "m"), ticket));
     // The seam sender stays alive even if admission refuses the turn. Observe

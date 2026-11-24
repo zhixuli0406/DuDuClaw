@@ -33,7 +33,7 @@ impl Fixture {
     }
     fn connection(&self, input: RunInput) -> (Connection, mpsc::Receiver<Frame>) {
         let (output, rx) = mpsc::channel(8);
-        (Connection { input, claims: self.chat.jwt_config.verify_access_token(&self.token).unwrap(), output }, rx)
+        (Connection { input, claims: self.chat.jwt_config.verify_access_token(&self.token).unwrap().into(), output }, rx)
     }
 }
 async fn frame(rx: &mut mpsc::Receiver<Frame>) -> Value {
@@ -515,4 +515,21 @@ fn webchat_deadline_covers_resolved_employee_timeout_and_global_ceiling() {
         std::fs::write(home.path().join("config.toml"), format!("[runtime]\nmax_timeout_secs={max}\n")).unwrap();
         assert!(run_lifetime(home.path(), "anna").as_secs() <= max + 30);
     }
+}
+
+#[tokio::test]
+async fn member_key_bearer_has_live_provenance_and_is_revocable() {
+    let f = Fixture::new(UserRole::Employee).await;
+    std::fs::write(f.home.path().join("config.toml"), "[member_api_keys]\nenabled=true").unwrap();
+    let epoch = f.chat.user_db.get_user(&f.user).unwrap().unwrap().credential_epoch;
+    let key = f.chat.user_db.member_key_create(&f.user, "ag-ui", 1, epoch).unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert("authorization", format!("Bearer {}", key.secret).parse().unwrap());
+    let identity = authenticate(&f.chat, &headers).await.unwrap();
+    assert!(matches!(&identity, ChatCredential::Member(_)));
+    assert_eq!(identity.user_id(), f.user);
+    f.chat.user_db.member_key_revoke_own(&f.user, &key.info.id).unwrap();
+    assert!(authenticate(&f.chat, &headers).await.is_err());
+    assert_eq!(f.chat.chat_credential_validity(Some(&identity), true).await,
+        crate::handlers::live_context::SocketValidity::Revoked);
 }

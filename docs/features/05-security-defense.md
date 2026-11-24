@@ -917,3 +917,24 @@ Human-origin MCP creation defaults to UTC and accepts an explicit timezone witho
 Page quarantine and auto-page visibility use the resolved on-disk filename. Equivalent spellings cannot bypass reserved-file redaction or write protection; ambiguous matches are refused. Page and policy reads use no-follow opens and validate the opened handle on Unix and Windows. Both writers refuse linked control files, including broken links, and scanning refuses linked roots and skips internal links.
 
 The shared root-policy loader caps `.scope.toml` at 64 KB and rejects malformed content and wrong field types. Load failures deny the affected access, including dashboard reads; a missing policy retains its previous meaning. Simulation grounding stops on a policy load error and recognizes `agent_allowlist` as protected. CLI doctor and the dashboard system check report policy errors and warn about ignored nested policies. See [Wiki knowledge layer](17-wiki-knowledge-layer.md) for scanning and recovery behavior.
+
+## Personal member API keys (1.85.0)
+
+External member applications can call from their own server using a personal
+`ddc_member_` key instead of renewing a browser access token every 30 minutes.
+Administrators enable the feature in **My account → External access**; it is off
+by default. Members create up to five keys with a required 1–365 day expiration
+(default 90 days). Accounts with MFA must complete fresh step-up verification.
+Admin accounts cannot create member keys.
+
+The plaintext is shown once, and only SHA-256 is stored. Keys inherit the
+member's live role and bindings, are restricted to the member contract, and
+cannot manage credentials, passwords, email, MFA, sessions or configuration.
+They never grant Admin access. Revocation, expiry, offboarding, password changes
+and MFA resets invalidate them, including existing connections on their next
+call or heartbeat. Each key is rate limited (120 calls/minute by default).
+Creation, revocation and write calls are audited; repeated use is aggregated.
+
+**Do not put this key in browser front-end code; call from your server.** See the
+[member API authentication reference](../api/member-contract.md#personal-member-api-keys-rm-213-part-b-1850)
+for transport examples and the precise method restrictions.

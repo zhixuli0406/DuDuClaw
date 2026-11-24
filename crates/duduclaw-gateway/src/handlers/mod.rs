@@ -134,6 +134,7 @@ mod credential_audit_rpc;
 pub(crate) mod credential_protection_rpc;
 mod website_credentials_rpc;
 mod status_tokens_rpc;
+mod member_keys_rpc;
 mod transcription_credentials_rpc;
 mod analytics_rpc;
 mod evolution_rpc;
@@ -572,6 +573,8 @@ impl MethodHandler {
             }
         };
 
+        if let Err(frame) = self.member_key_gate(method, &params, ctx).await { return frame; }
+
         // ── Forced password-change gate ─────────────────────────────────
         // Runs FIRST — before the edition gate, before the plugin extension
         // dispatch, before the method match. Which features exist has no
@@ -732,6 +735,9 @@ impl MethodHandler {
 
         // RM-064 status credentials are gateway-owned bearer secrets. Route
         // before extension dispatch so no plugin sees a freshly issued one.
+        if member_keys_rpc::owns(method) {
+            return boxed_frame(|| self.handle_member_keys_rpc(method, params, ctx, conn)).await;
+        }
         if let Some(role) = status_tokens_rpc::minimum_role(method) {
             if let Err(e) = acl::require_role(ctx, role) {
                 return WsFrame::error_response("", &e);

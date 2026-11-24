@@ -996,3 +996,28 @@ Only files, URLs, or text personally provided by the Owner in the same message c
 Only a verified request from that Owner to their assigned avatar AI qualifies, with exactly those two principals in the collection ACL. The import transaction rechecks authorization and the limit of 10 automatic imports per collection per rolling hour. All other cases require approval. Turn identity is supplied by the gateway; callers cannot override it in tool arguments.
 
 Pending requests send a decision card with up to 300 escaped preview characters only to the Owner's verified DMs. Reply `確認 <full request UUID>` or `取消 <full request UUID>`. Editors use the dashboard. `[approval] forbid_self_approval` applies on both surfaces. Owner/Editor notifications are deduplicated and contain no preview outside the Owner card. Google Chat bound decisions require JWT-verified HTTP one-to-one DMs; Pub/Sub is not eligible. See [Document knowledge base](../features/63-knowledge-base.md).
+
+## Member personal API keys
+
+Administrators can enable or disable personal keys under **My account → External
+access**. Members create, list and revoke their own keys there; administrators
+list and revoke keys for all members. Admin accounts cannot create member keys.
+The switch defaults to off, including when configuration cannot be read or parsed.
+When off, both key use and management RPCs are refused; the normal configuration
+UI remains available to the administrator.
+
+```toml
+[member_api_keys]
+enabled = false
+rate_per_minute = 120
+```
+
+`enabled` is a boolean. `rate_per_minute` is an integer from 1 to 60000, default
+120, shared by all connections using a key. Invalid values disable key access.
+Changes take effect on the next call or connection check without a restart.
+
+Creation requires a browser login and, when MFA is enabled, a fresh TOTP or unused
+recovery code. Expiry is mandatory (1–365 days); the UI offers 30/90/365 and defaults
+to 90. Each member can have five active keys. The secret is shown once. Password
+changes and MFA resets invalidate existing keys. Do not put keys in browser
+front-end code; call from your server. See the [member API contract](../api/member-contract.md#personal-member-api-keys-rm-213-part-b-1850).

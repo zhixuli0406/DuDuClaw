@@ -4703,6 +4703,15 @@ async fn handle_me(
         }
     };
 
+    if duduclaw_auth::member_keys::is_member_key(token) {
+        let ctx = match member_http_caller(&state, &headers, None) { Ok(ctx) => ctx, Err(response) => return response };
+        return match state.handler.handle("users.me", serde_json::json!({}), &ctx).await {
+            WsFrame::Response { ok: true, payload: Some(payload), .. } => Json(payload).into_response(),
+            WsFrame::Response { error: Some(error), .. } if error.get("code").and_then(serde_json::Value::as_str) == Some("member_key_rate_limited") =>
+                (axum::http::StatusCode::TOO_MANY_REQUESTS, Json(error)).into_response(),
+            _ => axum::http::StatusCode::UNAUTHORIZED.into_response(),
+        };
+    }
     if authenticate_jwt(&state, token).is_err() {
         return (axum::http::StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"invalid or expired token"}))).into_response();
     }
@@ -5683,13 +5692,21 @@ fn authorize_file_access(
     // The token proves identity only. Like RPC live_context, rebuild all
     // authority from one current users.db snapshot, never JWT bindings.
     // This also refuses inactive users and database errors without a fallback.
-    let authenticated = authenticate_jwt(state, token).map_err(|_| unauthorized())?;
-    let ctx = crate::machine_employee::live_user_context(state.handler.home_dir(), &state.user_db, &authenticated.user_id)
+    let authenticated = if duduclaw_auth::member_keys::is_member_key(token) {
+        if extract_bearer_token(headers) != Some(token) { return Err(unauthorized()); }
+        let ctx = crate::member_keys::authenticate(&state.home_dir, &state.user_db, token).map_err(|_| unauthorized())?;
+        crate::member_keys::record_call(&state.home_dir, &state.user_db, &ctx, "http.attachments", true)
+            .map_err(member_http_error)?;
+        ctx
+    } else { authenticate_jwt(state, token).map_err(|_| unauthorized())? };
+    let mut ctx = crate::machine_employee::live_user_context(state.handler.home_dir(), &state.user_db, &authenticated.user_id)
         .map_err(|_| unauthorized())?
         .ok_or_else(unauthorized)?;
     if !duduclaw_auth::mfa::credential_epoch_matches(authenticated.credential_epoch, ctx.credential_epoch) {
         return Err(unauthorized());
     }
+    if authenticated.member_key_id.is_some() && ctx.is_admin() { return Err(unauthorized()); }
+    ctx.member_key_id = authenticated.member_key_id;
     require_password_changed(&ctx)?;
 
     let allowed = match agent {
@@ -15473,7 +15490,7 @@ async fn handle_chat_attachment(
     headers: axum::http::HeaderMap,
     axum::extract::Query(q): axum::extract::Query<ChatAttachmentQuery>,
 ) -> axum::response::Response {
-    let ctx = match knowledge_caller(&state, &headers) { Ok(c) => c, Err(r) => return r };
+    let ctx = match member_http_caller(&state, &headers, Some(("http.chat.attachment", false))) { Ok(c) => c, Err(r) => return r };
     let max = if q.preview { crate::chat_attachments::limits::MAX_PREVIEW } else { crate::chat_attachments::limits::MAX_DOWNLOAD };
     let (bytes, name, admission) = match state.handler.history_attachment_bytes(&ctx, &q.id, max).await {
         Ok(f) => f,
@@ -15586,6 +15603,27 @@ fn require_bearer(
     require_password_changed(&ctx)
 }
 
+fn member_http_error(error: String) -> axum::response::Response {
+    let status = if error == "member_key_rate_limited" { axum::http::StatusCode::TOO_MANY_REQUESTS }
+        else { axum::http::StatusCode::UNAUTHORIZED };
+    (status, Json(serde_json::json!({"error": "member key refused", "code": if status == axum::http::StatusCode::TOO_MANY_REQUESTS {
+        "member_key_rate_limited" } else { "member_key_refused" }}))).into_response()
+}
+
+/// Explicit member HTTP surfaces only; task RPC is charged by dispatch.
+fn member_http_caller(state: &AppState, headers: &axum::http::HeaderMap,
+    operation: Option<(&str, bool)>) -> Result<UserContext, axum::response::Response> {
+    if let Some(raw) = extract_bearer_token(headers)
+        && duduclaw_auth::member_keys::is_member_key(raw) {
+        let ctx = crate::member_keys::authenticate(&state.home_dir, &state.user_db, raw).map_err(member_http_error)?;
+        if let Some((method, write)) = operation {
+            crate::member_keys::record_call(&state.home_dir, &state.user_db, &ctx, method, write).map_err(member_http_error)?;
+        }
+        return Ok(ctx);
+    }
+    knowledge_caller(state, headers)
+}
+
 /// Bearer JWT → active, password-changed dashboard user (fail-closed).
 /// The error is the ready-to-send response, like `require_bearer`.
 #[allow(clippy::result_large_err)]
@@ -15631,7 +15669,7 @@ async fn handle_knowledge_upload(
     headers: axum::http::HeaderMap,
     multipart: Multipart,
 ) -> axum::response::Response {
-    match knowledge_caller(&state, &headers) {
+    match member_http_caller(&state, &headers, Some(("http.knowledge.upload", true))) {
         Ok(ctx) => {
             crate::knowledge::upload::handle_upload(
                 &state.home_dir,
@@ -15669,7 +15707,7 @@ async fn handle_task_rpc_with_files(
     // Authenticate and take a slot from the headers alone, before a byte of
     // the (up to ~67 MB) body is read: an unauthenticated or surplus request
     // is refused without the gateway buffering its upload.
-    let ctx = match knowledge_caller(&state, &headers) {
+    let ctx = match member_http_caller(&state, &headers, None) {
         Ok(ctx) => ctx,
         Err(resp) => return resp,
     };
@@ -15740,7 +15778,7 @@ async fn handle_knowledge_original(
     headers: axum::http::HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> axum::response::Response {
-    match knowledge_caller(&state, &headers) {
+    match member_http_caller(&state, &headers, Some(("http.knowledge.original", false))) {
         Ok(ctx) => {
             crate::knowledge::upload::handle_original(
                 &state.home_dir,
@@ -16129,7 +16167,7 @@ async fn handle_stt(
     headers: axum::http::HeaderMap,
     mut multipart: Multipart,
 ) -> axum::response::Response {
-    if let Err(resp) = require_bearer(&state, &headers) {
+    if let Err(resp) = member_http_caller(&state, &headers, Some(("http.voice.stt", true))) {
         return resp;
     }
 
@@ -16290,7 +16328,7 @@ async fn handle_tts(
 ) -> axum::response::Response {
     use crate::tts::{TtsProvider, TtsRouter};
 
-    let caller = match knowledge_caller(&state, &headers) {
+    let caller = match member_http_caller(&state, &headers, Some(("http.voice.tts", true))) {
         Ok(caller) => caller,
         Err(response) => return response,
     };
@@ -16683,6 +16721,7 @@ fn pre_auth_handshake_allowed(
 /// rows never claim a person did this.
 fn pre_auth_context() -> UserContext {
     UserContext {
+        member_key_id: None,
         credential_epoch: 0,
         user_id: "lockscreen".to_string(),
         email: "lockscreen@local".to_string(),
@@ -16760,14 +16799,38 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                                 .and_then(|v| v.as_str())
                                 .map(str::trim)
                                 .filter(|s| !s.is_empty());
+                            let member_param = params.get("member_key").and_then(|v| v.as_str());
                             let pre_auth_ok = pre_auth_handshake_allowed(
-                                jwt_param.is_some() || token_param.is_some(),
+                                jwt_param.is_some() || token_param.is_some() || params.get("member_key").is_some(),
                                 duduclaw_core::is_appliance(),
                                 crate::power_local::ip_is_loopback(peer.ip()),
                             );
 
                             // ── JWT authentication (new) ─────────────────────
-                            if let Some(jwt_str) = jwt_param {
+                            if params.get("member_key").is_some() {
+                                let result = if jwt_param.is_some() || token_param.is_some() {
+                                    Err("present exactly one credential".to_owned())
+                                } else {
+                                    member_param.ok_or_else(|| "member key invalid".to_owned())
+                                        .and_then(|raw| crate::member_keys::authenticate(&state.home_dir, &state.user_db, raw))
+                                };
+                                match result {
+                                    Ok(ctx) => {
+                                        let frame = WsFrame::ok_response(&id, serde_json::json!({
+                                            "status": "authenticated", "boot_id": crate::live_events::boot_id(),
+                                            "user": {"id": ctx.user_id, "email": ctx.email, "role": ctx.role.to_string()},
+                                            "must_change_password": false,
+                                        }));
+                                        let _ = socket.send(Message::Text(serde_json::to_string(&frame).unwrap_or_default().into())).await;
+                                        Ok(ctx)
+                                    }
+                                    Err(_) => {
+                                        let frame = WsFrame::error_response(&id, "member key authentication failed");
+                                        let _ = socket.send(Message::Text(serde_json::to_string(&frame).unwrap_or_default().into())).await;
+                                        Err(())
+                                    }
+                                }
+                            } else if let Some(jwt_str) = jwt_param {
                                 match authenticate_jwt(&state, jwt_str) {
                                     Ok(ctx) => {
                                         // Session provenance comes only from this
@@ -17558,7 +17621,8 @@ fn authenticate_jwt(state: &AppState, jwt_str: &str) -> Result<UserContext, Stri
     // RM-064: a status credential may only call `/api/v1/status/employees`.
     // Refuse it by type before any verification, so no dashboard surface
     // (WebSocket handshake, `/api/*` bearer routes) can ever accept one.
-    if duduclaw_auth::status_tokens::is_status_token(jwt_str) {
+    if duduclaw_auth::status_tokens::is_status_token(jwt_str)
+        || duduclaw_auth::member_keys::is_member_key(jwt_str) {
         return Err("authentication failed".to_string());
     }
     let claims = state.jwt_config.verify_access_token(jwt_str)?;
@@ -19254,6 +19318,10 @@ mod live_events_socket_tests {
         async fn connect(home: Arc<tempfile::TempDir>, state: Arc<AppState>, user: duduclaw_auth::User) -> Self {
             let token = state.jwt_config.issue_access_token(&user, &[]).unwrap();
             let ctx = authenticate_jwt(&state, &token).unwrap();
+            Self::connect_credential(home, state, user, json!({"jwt":token}), ctx).await
+        }
+        async fn connect_credential(home: Arc<tempfile::TempDir>, state: Arc<AppState>, user: duduclaw_auth::User,
+            params: Value, ctx: UserContext) -> Self {
             let (ready_tx, ready) = tokio::sync::oneshot::channel();
             let (checked_tx, checked) = tokio::sync::mpsc::unbounded_channel();
             let (done_tx, done) = tokio::sync::oneshot::channel();
@@ -19279,7 +19347,7 @@ mod live_events_socket_tests {
             let addr = listener.local_addr().unwrap();
             let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
             let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws")).await.unwrap();
-            client.send(ClientMessage::Text(json!({"type":"req","id":"connect","method":"connect","params":{"jwt":token}}).to_string().into())).await.unwrap();
+            client.send(ClientMessage::Text(json!({"type":"req","id":"connect","method":"connect","params":params}).to_string().into())).await.unwrap();
             assert_eq!(next_json(&mut client).await["ok"], true);
             let probe = tokio::time::timeout(std::time::Duration::from_secs(5), ready).await.unwrap().unwrap();
             probe.subscriptions.update(crate::live_events::RunSelector::Run("test-run".into()), true).unwrap();
@@ -19373,6 +19441,41 @@ mod live_events_socket_tests {
             self.client.close(None).await.unwrap();
             tokio::time::timeout(std::time::Duration::from_secs(5), &mut self.done).await
                 .expect("socket task termination").expect("task monitor alive").expect("socket task must not panic");
+        }
+    }
+
+    #[tokio::test]
+    async fn member_key_open_ws_rechecks_every_call_and_heartbeat() {
+        for reason in ["revoke", "expiry", "epoch", "admin", "switch"] {
+            let base = MfaSocket::new().await;
+            std::fs::write(base._home.path().join("config.toml"), "[member_api_keys]\nenabled=true\n").unwrap();
+            let user = base.state.user_db.create_user("member@socket.test", "Member", "password-test", duduclaw_auth::UserRole::Employee).unwrap();
+            let key = base.state.user_db.member_key_create(&user.id, "x", 1, user.credential_epoch).unwrap();
+            let ctx = crate::member_keys::authenticate(base._home.path(), &base.state.user_db, &key.secret).unwrap();
+            let mut socket = MfaSocket::connect_credential(base._home.clone(), base.state.clone(), user.clone(), json!({"member_key":key.secret}), ctx.clone()).await;
+            assert_eq!(socket.rpc("users.me", json!({})).await["ok"], true);
+            match reason {
+                "revoke" => base.state.user_db.member_key_revoke_own(&user.id, &key.info.id).unwrap(),
+                "epoch" => { base.state.user_db.mfa_operator_reset(&user.email).unwrap(); },
+                "switch" => std::fs::write(base._home.path().join("config.toml"), "[member_api_keys]\nenabled=false").unwrap(),
+                cause => {
+                    let db = rusqlite::Connection::open(base._home.path().join("users.db")).unwrap();
+                    if cause == "expiry" { db.execute("UPDATE member_api_keys SET expires_at='2000-01-01T00:00:00Z'", []).unwrap(); }
+                    else { db.execute("UPDATE users SET role='admin' WHERE id=?1", [&user.id]).unwrap(); }
+                }
+            }
+            assert_eq!(server_mfa::socket_validity(&base.state, &ctx, None, false, true).await,
+                crate::handlers::live_context::SocketValidity::Revoked);
+            let _ = socket.client.send(ClientMessage::Text(json!({"type":"req","id":"after","method":"users.me","params":{}}).to_string().into())).await;
+            tokio::time::timeout(SOCKET_FRAME_DEADLINE, async {
+                loop {
+                    match socket.client.next().await {
+                        None | Some(Err(_)) | Some(Ok(ClientMessage::Close(_))) => break,
+                        Some(Ok(ClientMessage::Ping(data))) => { let _ = socket.client.send(ClientMessage::Pong(data)).await; }
+                        other => panic!("invalid member socket delivered data: {other:?}"),
+                    }
+                }
+            }).await.unwrap();
         }
     }
 

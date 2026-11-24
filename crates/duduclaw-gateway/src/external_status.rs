@@ -174,7 +174,7 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(str::trim)
-        .filter(|t| is_status_token(t))
+        .filter(|t| !duduclaw_auth::member_keys::is_member_key(t) && is_status_token(t))
 }
 
 /// Limiter key for a peer: the IPv4 address, or the /64 of an IPv6 one (a
@@ -913,6 +913,8 @@ mod tests {
         assert_eq!(bearer(&headers), None, "a dashboard JWT is not this credential");
         headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer ddc_prod_0123456789abcdef0123456789abcdef"));
         assert_eq!(bearer(&headers), None, "an MCP key is not this credential");
+        headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer ddc_member_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
+        assert_eq!(bearer(&headers), None, "a member key is not this credential");
         headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer ddc_status_abc"));
         assert_eq!(bearer(&headers), Some("ddc_status_abc"));
     }

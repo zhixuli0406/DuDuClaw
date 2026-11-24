@@ -114,6 +114,7 @@ pub(crate) fn normalize_legacy_aliases(params: Value) -> Value {
         ("memory.novelty_gate", "novelty_gate_enabled"),
         ("miniapp.enabled", "miniapp_enabled"),
         ("external_status.enabled", "external_status_enabled"),
+        ("member_api_keys.enabled", "member_api_keys_enabled"),
         ("skills.gap_digest_enabled", "gap_digest_enabled"),
         ("logging.format", "log_format"),
     ];

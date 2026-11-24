@@ -46,7 +46,7 @@ pub(super) fn interrupt(record: &ApprovalRecord, admin: bool) -> Value {
 }
 
 async fn authorized(state: &AgUiState, user: &str, agent: &str, connection: &Connection) -> bool {
-    state.chat.credential_validity(Some(&connection.claims), true).await
+    state.chat.chat_credential_validity(Some(&connection.claims), true).await
         == crate::handlers::live_context::SocketValidity::Valid
         && state.chat.authorize_target(user, agent, false).await.is_ok()
         && state.chat.ctx.registry.read().await.get(agent).is_some_and(|a| a.config.agent.status.is_operational())

@@ -28,7 +28,8 @@ impl AuthManager {
     pub fn validate(&self, provided_token: &str) -> Result<()> {
         // RM-064: a read-only status credential is never an admin token, even
         // if an operator happened to configure one with the same prefix.
-        if duduclaw_auth::status_tokens::is_status_token(provided_token) {
+        if duduclaw_auth::status_tokens::is_status_token(provided_token)
+            || duduclaw_auth::member_keys::is_member_key(provided_token) {
             return Err(DuDuClawError::Security(
                 "invalid authentication token".to_owned(),
             ));

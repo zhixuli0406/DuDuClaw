@@ -39,7 +39,7 @@ struct Entry {
 }
 struct Connection {
     input: RunInput,
-    claims: duduclaw_auth::jwt::Claims,
+    claims: ChatCredential,
     output: mpsc::Sender<Frame>,
 }
 struct Frame { value: Value, ack: oneshot::Sender<()>, permit: Option<delivery::Permit> }
@@ -89,10 +89,17 @@ fn session_id(user: &str, agent: &str, thread: &str) -> String {
     format!("webchat:webchat:{}:ag-ui:{}", webchat_owner_tag(user), hex::encode(Sha256::digest(key)))
 }
 
-async fn authenticate(state: &WebChatState, headers: &HeaderMap) -> Result<duduclaw_auth::jwt::Claims, Response> {
+async fn authenticate(state: &WebChatState, headers: &HeaderMap) -> Result<ChatCredential, Response> {
     let token = headers.get(axum::http::header::AUTHORIZATION).and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer ")).filter(|v| !v.is_empty())
         .ok_or_else(|| error(StatusCode::UNAUTHORIZED, "authentication_required"))?;
+    if duduclaw_auth::member_keys::is_member_key(token) {
+        let ctx = crate::member_keys::authenticate(&state.ctx.home_dir, &state.user_db, token)
+            .map_err(|_| error(StatusCode::UNAUTHORIZED, "invalid_credential"))?;
+        crate::member_keys::record_call(&state.ctx.home_dir, &state.user_db, &ctx, "http.ag_ui", true)
+            .map_err(|e| error(if e == "member_key_rate_limited" { StatusCode::TOO_MANY_REQUESTS } else { StatusCode::UNAUTHORIZED }, "member_key_refused"))?;
+        return Ok(ChatCredential::Member(ctx));
+    }
     // Never accept widget credentials or the local-session implicit authority.
     let claims = state.jwt_config.verify_access_token(token)
         .map_err(|_| error(StatusCode::UNAUTHORIZED, "invalid_credential"))?;
@@ -102,7 +109,7 @@ async fn authenticate(state: &WebChatState, headers: &HeaderMap) -> Result<duduc
     if state.credential_validity(Some(&claims), true).await != crate::handlers::live_context::SocketValidity::Valid {
         return Err(error(StatusCode::UNAUTHORIZED, "invalid_credential"));
     }
-    Ok(claims)
+    Ok(ChatCredential::Jwt(claims))
 }
 
 async fn handle(State(state): State<Arc<AgUiState>>, Path(agent): Path<String>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
@@ -111,7 +118,7 @@ async fn handle(State(state): State<Arc<AgUiState>>, Path(agent): Path<String>, 
         .and_then(|v| v.split(';').next()).map(str::trim) != Some("application/json") {
         return error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "json_required");
     }
-    let user = claims.sub.clone();
+    let user = claims.user_id().to_owned();
     {
         let mut counts = match state.connections.lock() { Ok(c) => c, Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "run_store_unavailable") };
         if counts.values().sum::<usize>() >= MAX_RUNS || counts.get(&user).copied().unwrap_or(0) >= MAX_PER_USER {
