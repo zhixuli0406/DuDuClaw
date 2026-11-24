@@ -11,7 +11,7 @@ export const AGENT_TARGET_KEYS = new Set([
   'agent_id', 'agentId', 'agent', 'agent_name', 'target_agent', 'target_agent_id',
   'assigned_to', 'assignee', 'from_agent', 'to_agent', 'agent_ids', 'reports_to',
   'owner_agent_id', 'lead_agent_name', 'audit_agent', 'verifier_agent', 'agent_override',
-  'default_agent', 'primary_agent_id',
+  'default_agent', 'primary_agent_id', 'avatar_agent_id',
 ]);
 
 // Never gate discovery of identity/grants, authentication or bootstrap itself.

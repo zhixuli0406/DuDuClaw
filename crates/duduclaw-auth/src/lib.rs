@@ -1,3 +1,4 @@
+pub mod avatar;
 pub mod account_email_history;
 pub mod acl;
 pub mod admin_approval_rule;

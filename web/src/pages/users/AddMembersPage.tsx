@@ -31,6 +31,8 @@ const MEMBER_ERROR_MESSAGES = new Map<string, string>([
   ['member_invalid_department', 'members.error.department'],
   ['member_invalid_bindings', 'members.error.bindings'],
   ['member_invalid_primary', 'members.error.primary'],
+  ['member_invalid_avatar', 'members.error.primary'],
+  ['avatar_agent_in_use', 'users.avatar.inUse'],
   ['member_storage_unavailable', 'members.error.unavailable'],
   ['member_admin_required', 'members.error.admin'],
   ['member_email_exists', 'members.error.emailExists'],
@@ -109,7 +111,7 @@ export function AddMembersPage({ onBack, onCreated }: { onBack: () => void; onCr
         locale: intl.locale,
         members: pending.map(member => ({
           display_name: member.display_name.trim(), email: member.email.trim(), role: member.role,
-          department: member.department.trim() || undefined, primary_agent_id: member.bindings[0].agent_name,
+          department: member.department.trim() || undefined, primary_agent_id: member.bindings[0].agent_name, avatar_agent_id: member.bindings[0].agent_name,
           bindings: member.bindings, invite: member.invite,
         })),
       });

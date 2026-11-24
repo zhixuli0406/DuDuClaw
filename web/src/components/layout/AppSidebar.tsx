@@ -243,7 +243,8 @@ function StaffZone({
   const agents = useVisibleAgents();
   const selection = useSelectableCallableAgents();
   const bindings = useAuthStore((s) => s.bindings);
-  const primaryAgent = useAuthStore((s) => s.user?.primary_agent_id);
+  const avatarAgent = useAuthStore((s) => s.user?.avatar_agent_id);
+  const primaryAgent = useAuthStore((s) => s.user?.avatar_agent_id ?? s.user?.primary_agent_id);
   const [settingPrimary, setSettingPrimary] = useState(false);
   const setPrimary = async (agent: string) => {
     if (!canSelectAgent(agent)) return;
@@ -335,9 +336,9 @@ function StaffZone({
                     status={AGENT_STATUS_DOT[a.status] ?? 'offline'}
                   />
                   <span className="min-w-0 flex-1 truncate">{a.display_name}{a.readOnly && <span className="block text-[10px] text-muted-foreground">{intl.formatMessage({ id: 'agents.teamMember' }, { name: a.teamMember })}</span>}</span>
-                  {employee && a.name === primaryAgent && <span className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'sidebar.primaryAgent' })}</span>}
+                  {employee && a.name === primaryAgent && <span className="text-xs text-muted-foreground">{intl.formatMessage({ id: avatarAgent ? 'users.avatar.label' : 'sidebar.primaryAgent' })}</span>}
                 </NavLink>
-                {employee && bindings.some(binding => binding.agent_name === a.name && (binding.access_level === 'owner' || binding.access_level === 'operator')) && <DropdownMenu>
+                {employee && !avatarAgent && bindings.some(binding => binding.agent_name === a.name && (binding.access_level === 'owner' || binding.access_level === 'operator')) && <DropdownMenu>
                   <DropdownMenuTrigger render={<Button variant="ghost" size="icon" className="absolute right-1 top-1 size-6" aria-label={intl.formatMessage({ id: 'sidebar.setPrimaryAgent' })} />}>
                     <MoreHorizontal className="size-4" />
                   </DropdownMenuTrigger>

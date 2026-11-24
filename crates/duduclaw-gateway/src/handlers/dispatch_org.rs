@@ -240,6 +240,14 @@ impl MethodHandler {
                 require_admin!();
                 boxed_frame(|| self.handle_users_repair_primary_agents(params, ctx)).await
             }
+            "users.set_avatar" => {
+                require_admin!();
+                boxed_frame(|| self.handle_users_set_avatar(params, ctx)).await
+            }
+            "users.avatar_conflicts" => {
+                require_admin!();
+                boxed_frame(|| self.handle_users_avatar_conflicts(ctx)).await
+            }
             "users.set_primary_agent" => boxed_frame(|| self.handle_users_set_primary_agent(params, ctx)).await,
             "users.me" => boxed_frame(|| self.handle_users_me(ctx)).await,
             // Self-service: any logged-in user changes their OWN password. Not

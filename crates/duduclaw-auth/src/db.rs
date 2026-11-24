@@ -379,6 +379,7 @@ impl UserDb {
             conn.execute("ALTER TABLE users ADD COLUMN primary_agent_id TEXT", [])
                 .map_err(|e| format!("failed to migrate users.primary_agent_id: {e}"))?;
         }
+        crate::avatar::migrate(&conn)?;
         crate::onboarding::migrate(&conn)?;
         crate::invitation_content::migrate(&conn)?;
         // `auth_meta.acl_generation` invalidates every cached live ACL: each
@@ -416,9 +417,14 @@ impl UserDb {
     /// NULL clears the preference; only an Owner/Operator binding may be selected.
     pub fn set_primary_agent(&self, user_id: &str, agent_id: Option<&str>) -> Result<(), String> {
         let conn = self.conn();
+        let has_avatar: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1 AND avatar_agent_id IS NOT NULL)",
+            [user_id], |r| r.get(0),
+        ).map_err(|e| e.to_string())?;
+        if has_avatar { return Err("avatar_primary_locked".into()); }
         let changed = conn.execute(
             "UPDATE users SET primary_agent_id = ?1, updated_at = ?2
-             WHERE id = ?3 AND status = 'active' AND
+             WHERE id = ?3 AND status = 'active' AND avatar_agent_id IS NULL AND
              (?1 IS NULL OR EXISTS(SELECT 1 FROM user_agent_bindings
                  WHERE user_id = ?3 AND agent_name = ?1
                    AND access_level IN ('owner', 'operator')))",
@@ -436,6 +442,11 @@ impl UserDb {
              AND (id = ?2 OR role = 'admin'))", params![actor, user_id], |r| r.get(0),
         ).map_err(|e| e.to_string())?;
         if !permitted { return Err("permission denied".into()); }
+        let has_avatar: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1 AND avatar_agent_id IS NOT NULL)",
+            [user_id], |r| r.get(0),
+        ).map_err(|e| e.to_string())?;
+        if has_avatar { return Err("avatar_primary_locked".into()); }
         let now = Utc::now().to_rfc3339();
         let changed = tx.execute(
             "UPDATE users SET primary_agent_id = ?1, updated_at = ?2 WHERE id = ?3 AND status = 'active'
@@ -465,7 +476,7 @@ impl UserDb {
         let bindings = {
             let mut stmt = tx.prepare("SELECT u.id, u.display_name, b.agent_name
                 FROM users u JOIN user_agent_bindings b ON b.user_id = u.id
-                WHERE u.status = 'active' AND u.primary_agent_id IS NULL
+                WHERE u.status = 'active' AND u.primary_agent_id IS NULL AND u.avatar_agent_id IS NULL
                 AND b.access_level IN ('owner', 'operator') ORDER BY u.id, b.bound_at, b.rowid").map_err(|e| e.to_string())?;
             let rows = stmt.query_map([], |r| Ok(PrimaryAgentRepair {
                 user_id: r.get(0)?, display_name: r.get(1)?, agent_id: r.get(2)?,
@@ -574,6 +585,7 @@ impl UserDb {
         .map_err(|e| format!("failed to create user: {e}"))?;
 
         Ok(User {
+            avatar_agent_id: None,
             credential_epoch: 0,
             id,
             email: email.to_string(),
@@ -606,7 +618,7 @@ impl UserDb {
             conn.query_row(
                 &format!("SELECT {USER_COLUMNS}, password_hash FROM users WHERE email = ?1"),
                 params![email],
-                |row| Ok((user_from_row(row)?, row.get::<_, String>(12)?)),
+                |row| Ok((user_from_row(row)?, row.get::<_, String>(13)?)),
             )
         };
 
@@ -952,7 +964,7 @@ impl UserDb {
         bind_agent_in_transaction(&tx, user_id, agent_name, access_level, &now)?;
         if first_eligible && matches!(access_level, AccessLevel::Owner | AccessLevel::Operator) {
             let changed = tx.execute("UPDATE users SET primary_agent_id = ?1, updated_at = ?2
-                WHERE id = ?3 AND primary_agent_id IS NULL", params![agent_name, now, user_id]).map_err(|e| e.to_string())?;
+                WHERE id = ?3 AND primary_agent_id IS NULL AND avatar_agent_id IS NULL", params![agent_name, now, user_id]).map_err(|e| e.to_string())?;
             if changed > 0 {
                 tx.execute("INSERT INTO auth_audit_log(user_id, action, target, detail, timestamp)
                     VALUES(?1, 'user.primary_agent_auto', ?2, ?3, ?4)",

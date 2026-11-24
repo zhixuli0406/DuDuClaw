@@ -456,3 +456,42 @@ async fn unreadable_bindings_refuse_list_and_repair_without_exposing_sql_errors(
         other => panic!("expected structured refusal: {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn avatar_rpcs_require_admin_validate_agent_and_expose_both_preferences() {
+    let f = fixture(false).await;
+    f.handler.set_test_edition(Some(duduclaw_core::EditionProfile::Enterprise)).await;
+    let agents = f._home.path().join("agents");
+    crate::trigger_route::tests::write_agent(&agents, "avatar-ai", "Avatar", "@avatar-ai", "specialist", "");
+    f.handler.registry().write().await.scan().await.unwrap();
+    let member = f.db.create_user("avatar-member@example.test", "Member", "password123", UserRole::Employee).unwrap();
+    f.db.bind_agent(&member.id, "avatar-ai", duduclaw_auth::AccessLevel::Operator).unwrap();
+    let mut employee = f.owner.clone();
+    employee.user_id = member.id.clone();
+    employee.email = member.email.clone();
+    employee.role = UserRole::Employee;
+    for method in ["users.set_avatar", "users.avatar_conflicts"] {
+        let refused = f.handler.handle(method, json!({"user_id": member.id, "agent_id": "avatar-ai"}), &employee).await;
+        assert!(matches!(refused, WsFrame::Response { ok: false, .. }));
+    }
+    let missing = f.handler.handle("users.set_avatar", json!({"user_id": member.id, "agent_id": "missing"}), &f.owner).await;
+    assert!(error_text(&missing).contains("invalid_setting"));
+    let saved = f.handler.handle("users.set_avatar", json!({"user_id": member.id, "agent_id": "avatar-ai"}), &f.owner).await;
+    assert_eq!(ok_payload(&saved)["avatar_agent_id"], "avatar-ai");
+    let other = f.db.create_user("other-avatar@example.test", "Other", "password123", UserRole::Employee).unwrap();
+    f.db.bind_agent(&other.id, "avatar-ai", duduclaw_auth::AccessLevel::Operator).unwrap();
+    let duplicate = f.handler.handle("users.set_avatar", json!({"user_id": other.id, "agent_id": "avatar-ai"}), &f.owner).await;
+    assert!(error_text(&duplicate).contains("avatar_agent_in_use"));
+    let me = ok_payload(&f.handler.handle("users.me", json!({}), &employee).await);
+    assert_eq!(me["user"]["avatar_agent_id"], "avatar-ai");
+    assert_eq!(me["user"]["primary_agent_id"], "avatar-ai");
+    let list = ok_payload(&f.handler.handle("users.list", json!({}), &f.owner).await);
+    let listed = list["users"].as_array().unwrap().iter().find(|u| u["id"] == member.id).unwrap();
+    assert_eq!(listed["avatar_agent_id"], "avatar-ai");
+    let refused = f.handler.handle("users.set_primary_agent", json!({"agent_id": null}), &employee).await;
+    assert!(error_text(&refused).contains("avatar_primary_locked"));
+    let cleared = f.handler.handle("users.set_avatar", json!({"user_id": member.id, "agent_id": null}), &f.owner).await;
+    assert!(ok_payload(&cleared)["avatar_agent_id"].is_null());
+    assert_eq!(f.db.configured_primary_agent(&member.id).unwrap().as_deref(), Some("avatar-ai"));
+    assert!(ok_payload(&f.handler.handle("users.avatar_conflicts", json!({}), &f.owner).await)["conflicts"].as_array().unwrap().is_empty());
+}

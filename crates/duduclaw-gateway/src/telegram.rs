@@ -1541,7 +1541,7 @@ async fn process_telegram_message(
             (guard.text.clone(), Some(guard))
         } else {
             // Global/shared bot: route by the user→agent binding (WP9), or
-            // (RM-172) to the sender's primary employee in its own bucket.
+            // (RM-172) to the sender's avatar or primary employee in its own bucket.
             let route = shared_route.unwrap_or(SharedRoute::Unbound);
             reply_session = shared_route_session(&session_id, &route);
             let (text, guard, agent) = shared_route_reply(
@@ -2703,7 +2703,7 @@ async fn resolve_shared_route(
     }
 }
 
-/// RM-172: the dashboard 主要 AI 員工 (`users.primary_agent_id`) of the account
+/// RM-172/RM-212: the dashboard avatar (or bound legacy primary) of the account
 /// `user_id` is bound to through a **verified** Telegram `channel_identities`
 /// row, when that employee may still answer this account. `None` (route as
 /// before) for an unverified or missing identity, an inactive account, no or a
@@ -2728,7 +2728,7 @@ async fn primary_agent_route(ctx: &Arc<ReplyContext>, user_id: &str) -> Option<S
             _ => return None,
         };
         let db = crate::decision_notify::open_user_db(&home).ok().flatten()?;
-        let primary = db.bound_primary_agent(&account).ok().flatten()?;
+        let primary = db.member_avatar_or_primary(&account).ok().flatten()?;
         Some((sender, primary))
     })
     .await
@@ -2749,7 +2749,7 @@ async fn primary_agent_route(ctx: &Arc<ReplyContext>, user_id: &str) -> Option<S
             agent = primary.as_str(),
             sender = %who,
             route = "primary_agent",
-            "Telegram: shared bot routed to the sender's primary employee"
+            "Telegram: shared bot routed to the sender's avatar or primary employee"
         );
     }
     usable.then_some(primary)

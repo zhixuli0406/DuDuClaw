@@ -490,6 +490,17 @@ describe('WebChatPage primary preference', () => {
     ] as never });
     useChatStore.setState({ selectedAgentId: null, messages: [], resumedExplicitly: false });
   });
+  it('prefers the avatar over a legacy primary on a fresh admin conversation', async () => {
+    useAuthStore.setState({ user: { id: 'admin', role: 'admin', avatar_agent_id: 'nova', primary_agent_id: 'main' } as never });
+    renderWithProviders(<WebChatPage />);
+    await waitFor(() => expect(useChatStore.getState().selectedAgentId).toBe('nova'));
+  });
+  it('restores the avatar when starting another new conversation', () => {
+    useAuthStore.setState({ user: { id: 'admin', role: 'admin', avatar_agent_id: 'nova', primary_agent_id: 'main' } as never });
+    useChatStore.setState({ selectedAgentId: 'other', resumedExplicitly: true });
+    act(() => useConversationsStore.getState().startNew());
+    expect(useChatStore.getState().selectedAgentId).toBe('nova');
+  });
   it('uses the visible primary when opening a fresh admin conversation', async () => {
     renderWithProviders(<WebChatPage />);
     await waitFor(() => expect(useChatStore.getState().selectedAgentId).toBe('nova'));

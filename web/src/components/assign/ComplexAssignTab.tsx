@@ -103,7 +103,7 @@ export function ComplexAssignTab({
     if (!loaded) fetchAgents();
   }, [loaded, fetchAgents]);
 
-  const primaryAgent = useAuthStore((s) => s.user?.primary_agent_id);
+  const primaryAgent = useAuthStore((s) => s.user?.avatar_agent_id ?? s.user?.primary_agent_id);
   const defaultAgentId = useMemo(
     () => defaultAssignAgent(agents, primaryAgent),
     [agents, primaryAgent],

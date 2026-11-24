@@ -12,3 +12,15 @@ describe('users.bindAgent authorization intent', () => {
     });
   });
 });
+
+
+describe('users avatar API', () => {
+  it('sends the target member and nullable avatar without changing the primary API', async () => {
+    await api.users.setAvatar('member', 'avatar-ai');
+    expect(mockWsClient.call).toHaveBeenCalledWith('users.set_avatar', { user_id: 'member', agent_id: 'avatar-ai' });
+    await api.users.setAvatar('member', null);
+    expect(mockWsClient.call).toHaveBeenCalledWith('users.set_avatar', { user_id: 'member', agent_id: null });
+    await api.users.avatarConflicts();
+    expect(mockWsClient.call).toHaveBeenCalledWith('users.avatar_conflicts');
+  });
+});
