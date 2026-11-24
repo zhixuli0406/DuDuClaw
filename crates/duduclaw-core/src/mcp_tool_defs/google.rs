@@ -9,6 +9,58 @@ use super::{ParamDef, ToolDef};
 
 pub(super) const TOOLS: &[ToolDef] = &[
     ToolDef {
+        name: "docs_create",
+        description: "Create a Google Doc in My Drive root, optionally with initial text.",
+        params: &[
+            ParamDef { name: "title", description: "Document title", required: true },
+            ParamDef { name: "body", description: "Optional initial plain text (max 20000 characters)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "docs_replace_text",
+        description: "Replace all matching text in a Google Doc; returns occurrences changed.",
+        params: &[
+            ParamDef { name: "document_id", description: "Document ID or URL", required: true },
+            ParamDef { name: "find", description: "Text to find (nonempty, max 20000 characters)", required: true },
+            ParamDef { name: "replace", description: "Replacement text (max 20000 characters)", required: true },
+            ParamDef { name: "match_case", description: "Case-sensitive matching (default true)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "sheets_create",
+        description: "Create a Google spreadsheet in My Drive root.",
+        params: &[
+            ParamDef { name: "title", description: "Spreadsheet title", required: true },
+            ParamDef { name: "sheet_names", description: "Optional array of sheet names (max 100)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "sheets_update",
+        description: "Update a 2-D range of spreadsheet cells (max 10000 cells). RAW by default.",
+        params: &[
+            ParamDef { name: "spreadsheet_id", description: "Spreadsheet ID or URL", required: true },
+            ParamDef { name: "range", description: "A1 range, e.g. Sheet1!A1:B2", required: true },
+            ParamDef { name: "values", description: "2-D array of strings, numbers, booleans or null", required: true },
+            ParamDef { name: "value_input_option", description: "RAW (default) or USER_ENTERED", required: false },
+        ],
+    },
+    ToolDef {
+        name: "calendar_update_event",
+        description: "Edit a Google Calendar event. Attendees are NOT notified unless notify_attendees=true (send approval rules apply).",
+        params: &[
+            ParamDef { name: "event_id", description: "Existing calendar event ID", required: true },
+            ParamDef { name: "calendar_id", description: "Calendar ID (default primary)", required: false },
+            ParamDef { name: "summary", description: "New summary", required: false },
+            ParamDef { name: "description", description: "New description", required: false },
+            ParamDef { name: "location", description: "New location", required: false },
+            ParamDef { name: "start", description: "New start, RFC3339 timestamp", required: false },
+            ParamDef { name: "end", description: "New end, RFC3339 timestamp", required: false },
+            ParamDef { name: "attendees", description: "Replacement array of attendee email addresses (empty clears)", required: false },
+            ParamDef { name: "notify_attendees", description: "Notify attendees (default false)", required: false },
+        ],
+    },
+
+    ToolDef {
         name: "google_status",
         description: "Check the Google Workspace connection: connected or not, granted scopes, token validity and expiry. Reads local state only. Call this first if a Gmail/Calendar tool reports an auth error.",
         params: &[],
@@ -60,6 +112,9 @@ pub(super) const TOOLS: &[ToolDef] = &[
         name: "gmail_create_draft",
         description: "Create a Gmail DRAFT for human review. This only saves a draft and NEVER sends — sending stays a manual human action.",
         params: &[
+            ParamDef { name: "thread_id", description: "Existing Gmail thread ID; requires in_reply_to and matching subject", required: false },
+            ParamDef { name: "in_reply_to", description: "Original RFC Message-ID header, e.g. <id@example.com> (required for replies)", required: false },
+            ParamDef { name: "references", description: "Original References header; defaults to in_reply_to for replies", required: false },
             ParamDef {
                 name: "to",
                 description: "Recipient email address",
@@ -303,7 +358,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "docs_append",
-        description: "Append text to the END of a Google Doc (write). Append-only by design — no tool rewrites or deletes existing content. Newlines start new paragraphs.",
+        description: "Append text to the END of a Google Doc (write). Newlines start new paragraphs.",
         params: &[
             ParamDef {
                 name: "document_id",

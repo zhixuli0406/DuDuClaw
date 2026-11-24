@@ -32,15 +32,20 @@ fn valid_cases() -> Vec<(&'static str, Value)> {
         ("docs_read", json!({"document_id":"d"})),
         ("docs_append", json!({"document_id":"d","text":"x"})),
         ("slides_read", json!({"presentation_id":"p"})),
+        ("docs_create", json!({"title":"Doc"})),
+        ("docs_replace_text", json!({"document_id":"d","find":"old","replace":"new"})),
+        ("sheets_create", json!({"title":"Sheet"})),
+        ("sheets_update", json!({"spreadsheet_id":"s","range":"A1","values":[["x"]]})),
+        ("calendar_update_event", json!({"event_id":"e","summary":"Updated"})),
         ("google_chat_spaces", json!({})),
         ("google_chat_messages", json!({"space":"spaces/AAA"})),
     ]
 }
 
 #[test]
-fn all_twenty_native_inputs_are_frozen_without_status_or_remote_aliases() {
+fn all_twenty_five_native_inputs_are_frozen_without_status_or_remote_aliases() {
     let cases = valid_cases();
-    assert_eq!(cases.len(), 20);
+    assert_eq!(cases.len(), 25);
     for (tool, arguments) in cases {
         let call = NativeCallTemplate::prepare(tool, &arguments).unwrap();
         assert_eq!(call.tool(), tool);
@@ -170,4 +175,36 @@ fn calendar_create_timestamp_errors_keep_original_start_end_wording() {
             .unwrap(),
         "Invalid due: 'bad-due' is not a valid RFC-3339 timestamp (e.g. 2026-08-01T00:00:00Z)"
     );
+}
+
+#[test]
+fn google_write_inputs_validate_ids_types_limits_and_unicode() {
+    for (tool, args) in [
+        ("docs_create", json!({"title":" "})),
+        ("docs_create", json!({"title":"Doc","body":123})),
+        ("gmail_create_draft", json!({"to":"a@b.test","subject":"s","body":"b","thread_id":true})),
+        ("calendar_update_event", json!({"event_id":"e","calendar_id":"","summary":"s"})),
+        ("docs_replace_text", json!({"document_id":"../x","find":"old","replace":"new"})),
+        ("docs_replace_text", json!({"document_id":"d","find":"","replace":"new"})),
+        ("docs_replace_text", json!({"document_id":"d","find":"old","replace":"new","match_case":"false"})),
+        ("sheets_create", json!({"title":"s","sheet_names":[123]})),
+        ("sheets_update", json!({"spreadsheet_id":"s","range":"A1","values":[1]})),
+        ("sheets_update", json!({"spreadsheet_id":"s","range":"A1","values":[[{}]]})),
+        ("sheets_update", json!({"spreadsheet_id":"s","range":"A1","values":[[1]],"value_input_option":"INVALID"})),
+        ("sheets_update", json!({"spreadsheet_id":"s","range":"A1","values":[vec!["x";10001]]})),
+        ("sheets_update", json!({"spreadsheet_id":"s","range":"..","values":[[1]]})),
+        ("calendar_update_event", json!({"event_id":"e"})),
+        ("calendar_update_event", json!({"event_id":"x/y","summary":"s"})),
+        ("calendar_update_event", json!({"event_id":"e","summary":"s","notify_attendees":"true"})),
+        ("calendar_update_event", json!({"event_id":"e","start":"tomorrow"})),
+        ("gmail_create_draft", json!({"to":"a@b.test","subject":"s","body":"b","thread_id":"t"})),
+        ("gmail_create_draft", json!({"to":"a@b.test","subject":"s","body":"b","thread_id":"t","in_reply_to":"<id>\r\nBcc: other@example.test"})),
+    ] {
+        assert!(NativeCallTemplate::prepare(tool, &args).is_err(), "{tool}: {args}");
+    }
+    let template = NativeCallTemplate::prepare("docs_create", &json!({"title":"文件🦀".repeat(1000),"body":"漢🦀".repeat(11000)})).unwrap();
+    assert!(matches!(template.parsed(), ParsedNativeArguments::DocsCreate { title, body: Some(body) }
+        if title.chars().count() == 1000 && body.chars().count() == 20000));
+    let template = NativeCallTemplate::prepare("sheets_update", &json!({"spreadsheet_id":"s","range":"A1","values":[vec!["x";10000]]})).unwrap();
+    assert!(template.validate_closed().is_ok());
 }

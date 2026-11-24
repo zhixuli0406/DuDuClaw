@@ -214,3 +214,23 @@ pub async fn handle_slides_read(
 // `notion_workspace` module. Notion content is an external knowledge source —
 // surfaced for query/citation only, never auto-written into the shared wiki.
 // ─────────────────────────────────────────────────────────────────
+
+pub async fn handle_docs_create(args: &Value, home_dir: &Path, g: &dyn NativeGoogleAccess) -> Value {
+    crate::google_workspace::native_legacy::handle("docs_create", args, home_dir, g).await
+}
+
+pub async fn handle_docs_replace_text(args: &Value, home_dir: &Path, g: &dyn NativeGoogleAccess) -> Value {
+    crate::google_workspace::native_legacy::handle("docs_replace_text", args, home_dir, g).await
+}
+
+pub async fn handle_sheets_create(args: &Value, home_dir: &Path, g: &dyn NativeGoogleAccess) -> Value {
+    crate::google_workspace::native_legacy::handle("sheets_create", args, home_dir, g).await
+}
+
+pub async fn handle_sheets_update(args: &Value, home_dir: &Path, g: &dyn NativeGoogleAccess) -> Value {
+    crate::google_workspace::native_legacy::handle("sheets_update", args, home_dir, g).await
+}
+
+pub async fn handle_calendar_update_event(args: &Value, home_dir: &Path, g: &dyn NativeGoogleAccess) -> Value {
+    crate::google_workspace::native_legacy::handle("calendar_update_event", args, home_dir, g).await
+}

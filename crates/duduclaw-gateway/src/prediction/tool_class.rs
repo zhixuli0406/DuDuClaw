@@ -182,7 +182,7 @@ fn classify_mcp(name: &str) -> Option<ToolClass> {
         | "calendar_list_events"
         | "drive_read"
         | "drive_search"
-        | "docs_append"
+        | "docs_append" | "docs_create" | "docs_replace_text" | "sheets_create" | "sheets_update" | "calendar_update_event"
         | "docs_read"
         | "sheets_append"
         | "sheets_read"
@@ -359,6 +359,11 @@ mod tests {
         "desktop_record_stop",
         "diff_branches",
         "docs_append",
+        "docs_create",
+        "docs_replace_text",
+        "sheets_create",
+        "sheets_update",
+        "calendar_update_event",
         "docs_read",
         "drive_read",
         "drive_search",

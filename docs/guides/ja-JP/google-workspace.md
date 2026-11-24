@@ -1,10 +1,10 @@
 # Google Workspace ツールと安全モデル
 
-設定は [Google を接続する](google-setup.md)を参照してください。ネイティブ REST は九サービス・二十一ツール、Apps Script は三サービス・状態確認込み八アクションに対応します。連携がオフでもダッシュボードは表示され、ツールは `[integrations] google_workspace = true` で有効になります。共用 OAuth 認証情報は同梱しません。
+設定は [Google を接続する](google-setup.md)を参照してください。ネイティブ REST は九サービス・二十六ツール、Apps Script は三サービス・状態確認込み八アクションに対応します。連携がオフでもダッシュボードは表示され、ツールは `[integrations] google_workspace = true` で有効になります。共用 OAuth 認証情報は同梱しません。
 
 ## 何が使えるようになるか
 
-2つのスコープ(`google:read` / `google:write`)で管理される、21個のエージェント向け
+2つのスコープ(`google:read` / `google:write`)で管理される、26個のエージェント向け
 MCPツールです。
 
 | ツール | 分類 | 内容 |
@@ -28,7 +28,12 @@ MCPツールです。
 | `drive_search` | read | ファイル**名と全文**でDriveを検索する(ゴミ箱内のファイルは除外、新しい順)。オプションで厳密なMIMEフィルターを指定可能。 |
 | `drive_read` | read | Driveのファイルをテキストとして読み取る: Docs／Slidesはプレーンテキストとしてエクスポート、Sheetsは(**最初のシートのみ**)CSVとしてエクスポート、テキスト系のファイルはそのまま読み取る。バイナリ型はメタデータと注記のみを返し、バイナリ内容そのものは返さない。 |
 | `docs_read` | read | Google Documentの文書順にテキストを読み取る(表のセルのテキストを含む)。 |
-| `docs_append` | write | Docの**末尾**にテキストを追記する。追記のみで、既存の内容を書き換えたり削除したりするツールはない。 |
+| `docs_append` | write | Docの**末尾**にテキストを追記する。 |
+| `docs_create` | write | マイドライブのルートに文書を作成。本文は任意。 |
+| `docs_replace_text` | write | 文書内の一致する文字列を置換。既定は大文字・小文字を区別。 |
+| `sheets_create` | write | スプレッドシートを作成。シート名も指定可能。 |
+| `sheets_update` | write | 最大10,000セルを更新。既定はRAW。 |
+| `calendar_update_event` | write | 予定を編集。既定では参加者に通知しない。 |
 | `slides_read` | read | プレゼンテーションのテキストをスライドごとに読み取る(図形、グループ化された図形、表のセル)。 |
 
 書き込みツールの結果には Google が実際に返した内容だけを示します。`calendar_create_event` は追加した参加者の人数だけを示し（いない場合は「Attendees: none」）、誰かに通知したとは書きません。イベント ID が返らない場合はエラーです。`gmail_create_draft` で下書き ID が返らない場合もエラーです。`sheets_append` の行数・セル数は Google が返した場合だけ表示します。Apps Script 経由では行は常にスプレッドシートの**最初のシート**に追加され、結果にはそのことと、指定した範囲が使われなかったことを示します。Apps Script の応答は、その操作の成功時の形式を満たす場合だけ成功とみなし、空の応答・`ok: false`・あらゆる `error` 項目は理由付きのツールエラーになります。
@@ -56,11 +61,10 @@ MCPツールです。
   内容を一切変更できません。
 - **Forms、Drive、Slidesは読み取り専用です。** フォームの作成・編集、Driveへの
   書き込み、プレゼンテーションの変更を行うツールはありません。書き込み用ツールが
-  あるのはGmail(下書き)、Calendar、Sheets、Docs(追記)、Tasksだけです。
+  あるのはGmail(下書き)、Calendar、Sheets、Docs、Tasksだけです。
 - **最小権限。** Driveは`drive.readonly`のみを要求します(`drive`や
-  `drive.file`は要求しません。Driveファイルを作成するツールが存在しないため)。
-  Slidesは`presentations.readonly`を要求します。Docsが完全な`documents`
-  スコープを必要とするのは、`docs_append`が書き込みを行うためだけです。
+  `drive.file`は要求しません。DocsとSheetsの作成は各サービスのスコープを使います)。
+  Slidesは`presentations.readonly`を要求します。Docsの書き込みツールは既存の完全な`documents`スコープを使います。
 - **オプションの承認ゲート。** より慎重にしたい場合は、書き込み系ツールを
   エージェントの`agent.toml [capabilities] approval_required_tools`に
   リストアップすることで、下書き・イベント・スプレッドシートへの書き込みの
@@ -68,8 +72,35 @@ MCPツールです。
 
   ```toml
   [capabilities]
-  approval_required_tools = ["gmail_create_draft", "calendar_create_event", "sheets_append", "gtasks_create", "gtasks_complete", "docs_append"]
+  approval_required_tools = ["gmail_create_draft", "calendar_create_event", "sheets_append", "gtasks_create", "gtasks_complete", "docs_append", "docs_create", "docs_replace_text", "sheets_create", "sheets_update", "calendar_update_event"]
   ```
+
+## Google コンテンツの作成と編集
+
+以下のネイティブツールは既存の `documents`、`spreadsheets`、`calendar.events` OAuth スコープを使用します。`google:write` が必要で、`google:read` のみの社員には表示されず、呼び出しも拒否されます。個人接続には各サービスのスコープも必要です。ドメイン全体の委任でも同じ名前を使います。新ツールと返信下書きにはネイティブ REST 接続が必要です。Apps Script Bridge は対応しません。
+
+| ネイティブツール | 引数と動作 |
+|---|---|
+| `docs_create` | 必須の `title`、任意の `body`。マイドライブのルートに文書を作成します。 |
+| `docs_replace_text` | `document_id`、空でない `find`、`replace`。`match_case` は既定で `true`。一致する全文字列を置換し、`occurrencesChanged` を返します。 |
+| `sheets_create` | 必須の `title`、任意の `sheet_names` 配列（最大100件）。マイドライブのルートにスプレッドシートを作成します。 |
+| `sheets_update` | `spreadsheet_id`、A1形式の `range`、二次元 `values` 配列。1回最大10,000セル。`value_input_option` の既定は `RAW`。数式や日付を解釈する場合は `USER_ENTERED` を指定します。 |
+| `calendar_update_event` | `event_id`、任意の `calendar_id`（既定 `primary`）、変更するフィールドを1つ以上指定します：`summary`、`description`、`location`、RFC3339形式の `start`／`end`、メールアドレス配列の `attendees`（`[]` で参加者を削除）。既定は `sendUpdates=none` で参加者に通知しません。`notify_attendees=true` は `all` を送り、`calendar_create_event` と同じ `send` 動作ルールと承認経路を使います。 |
+
+テキストは最大20,000文字、タイトルは1,000文字、シート名は100文字、A1範囲は1,000文字です。結果の `structuredContent` は、後続の呼び出しに使える `documentId` または `spreadsheetId` と `url`、予定の場合は `id` と `htmlLink` を含みます。表示する Google の応答は注入検査を受けます。本文付き文書の作成は2回のリクエストを使うため、本文の挿入が失敗した場合は再試行する前にドライブで作成済み文書を確認してください。
+
+既存スレッドの返信下書きには、`gmail_create_draft` の引数に `thread_id` と `in_reply_to`（元メールの RFC `Message-ID`、例：`<original@example.com>`）を追加します。件名は元メールと合わせ、必要に応じて返信の接頭辞を付けます。任意の `references` は元メールの Message-ID を含む References チェーンで、既定は `in_reply_to` です。Gmail の `threadId`、`In-Reply-To`、`References` が設定されます。呼び出し側がヘッダーを渡すため、作成専用接続でも読み取りスコープを追加する必要はありません。下書きの保存のみで、送信しません。
+
+### 自社運用の Google MCP から移行する
+
+hcatwn-google などの自社運用サーバーを置き換える場合は、スキル内の名前を下表で対応させてください。別名の登録は行いません。移行前に各サーバーの引数スキーマも確認してください。
+
+| 自社運用ツール名 | DuDuClaw ネイティブ名 |
+|---|---|
+| `calendar_list` | `calendar_list_events` |
+| `gmail_draft` | `gmail_create_draft` |
+
+新しい Docs、Sheets、予定編集のフローには上のネイティブ名を使います。他の自社運用サーバーでは名前が異なる場合があるため、そのツール一覧を確認してください。Google 公式のリモート MCP は Google の名前を保持する別の連携です。
 
 ## 個人の Google Chat 会話を読む（オプトイン）
 
@@ -122,7 +153,7 @@ default_identity = "home"   # [google] のない社員が使うもの：home（�
 allowed_subject_domains = ["customer.com"]
 ```
 
-`[google]` のない社員は `default_identity` を使うので、既存のインストールの動作は変わりません。`none` は 21 個の Google ツールを隠して呼び出しも拒否します。不正な値は共用アカウントへ切り替えず拒否します。Enterprise では `owner` と `user:<id>` を使えますが、有効な直接 Owner と本人の明示的な同意が必要です。[個人 Google 接続（v1.76.0）](google-personal-connections.md)を参照してください。
+`[google]` のない社員は `default_identity` を使うので、既存のインストールの動作は変わりません。`none` は 26 個の Google ツールを隠して呼び出しも拒否します。不正な値は共用アカウントへ切り替えず拒否します。Enterprise では `owner` と `user:<id>` を使えますが、有効な直接 Owner と本人の明示的な同意が必要です。[個人 Google 接続（v1.76.0）](google-personal-connections.md)を参照してください。
 
 ### この社員を通じて誰がアカウントを使えるか
 
@@ -153,7 +184,7 @@ Web サイトの公開訪問者（WebChat ウィジェット、Odoo ライブチ
 
 ### 社員専用 API key と Google MCP マウント（v1.76.0）
 
-検証済みの社員専用 API key に `google:read` または `google:write` が明示されている場合、閉じた 21 個の Google ツールのうち対応するものを使えます。`admin` だけでは代用できず、実在する社員と読める設定が必要です。一般の外部キーに付与できる権限やほかの連携は変わりません。OAuth 認証からこの実行用の証明は作られません。社員に紐づかない正規の内部カスタム連携キーは、従来の Home 経路を保ちます。
+検証済みの社員専用 API key に `google:read` または `google:write` が明示されている場合、閉じた 26 個の Google ツールのうち対応するものを使えます。`admin` だけでは代用できず、実在する社員と読める設定が必要です。一般の外部キーに付与できる権限やほかの連携は変わりません。OAuth 認証からこの実行用の証明は作られません。社員に紐づかない正規の内部カスタム連携キーは、従来の Home 経路を保ちます。
 
 社員の許可／拒否ツール、動作ルール、PolicyKernel、期限付き権限、承認要求は引き続き適用されます。承認待ちの間も、受理した社員、ツール、最終引数は固定されます。キーの失効、社員の削除、権限変更は拒否となり、プロセスの別の身元や別アカウントには切り替わりません。gateway が Google 操作を実行し、外部 MCP クライアントにはサイズ制限付きの結果だけを返します。Google bearer は返しません。
 

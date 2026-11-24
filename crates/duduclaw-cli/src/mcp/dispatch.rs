@@ -191,6 +191,11 @@ pub(crate) async fn handle_tools_call(
             | "gtasks_create"
             | "gtasks_complete"
             | "docs_append"
+            | "docs_create"
+            | "docs_replace_text"
+            | "sheets_create"
+            | "sheets_update"
+            | "calendar_update_event"
             // Notion / GitHub write tools (page append, public issue comment).
             | "notion_page_append"
             | "github_issue_comment"
@@ -1070,6 +1075,12 @@ impl GatewayHandler<'_> {
         "drive_read" => handle_drive_read(&arguments, home_dir, google_caller).await,
         "docs_read" => handle_docs_read(&arguments, home_dir, google_caller).await,
         "docs_append" => handle_docs_append(&arguments, home_dir, google_caller).await,
+        "docs_create" => handle_docs_create(&arguments, home_dir, google_caller).await,
+        "docs_replace_text" => handle_docs_replace_text(&arguments, home_dir, google_caller).await,
+        "sheets_create" => handle_sheets_create(&arguments, home_dir, google_caller).await,
+        "sheets_update" => handle_sheets_update(&arguments, home_dir, google_caller).await,
+        "calendar_update_event" => handle_calendar_update_event(&arguments, home_dir, google_caller).await,
+
         "slides_read" => handle_slides_read(&arguments, home_dir, google_caller).await,
         "notion_status" => handle_notion_status(home_dir).await,
         "notion_search" => handle_notion_search(&arguments, home_dir).await,

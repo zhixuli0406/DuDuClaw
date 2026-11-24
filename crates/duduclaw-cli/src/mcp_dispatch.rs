@@ -5222,6 +5222,12 @@ effect = "forbid"
         "discovery_list",
         "discovery_tree",
         "docs_append",
+        "docs_create",
+        "docs_replace_text",
+        "sheets_create",
+        "sheets_update",
+        "calendar_update_event",
+
         "docs_read",
         "drive_read",
         "drive_search",

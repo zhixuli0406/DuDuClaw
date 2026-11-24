@@ -131,6 +131,8 @@ pub enum ClaimType {
     MailSent,
     /// Workspace family: claims a calendar event was created.
     CalendarEventCreated,
+    /// Workspace family: claims an existing calendar event was edited.
+    CalendarEventUpdated,
     /// Workspace family: claims a spreadsheet was written to.
     SheetWritten,
     /// Workspace family: claims a Google Doc was written to.
@@ -153,6 +155,7 @@ impl ClaimType {
             Self::AgentSpawned => "spawn_agent",
             Self::MailSent => "mail_send",
             Self::CalendarEventCreated => "calendar_create_event",
+            Self::CalendarEventUpdated => "calendar_update_event",
             Self::SheetWritten => "sheets_append",
             Self::DocWritten => "docs_append",
             Self::TaskCreated => "tasks_create",
@@ -166,6 +169,7 @@ impl ClaimType {
             self,
             Self::MailSent
                 | Self::CalendarEventCreated
+                | Self::CalendarEventUpdated
                 | Self::SheetWritten
                 | Self::DocWritten
                 | Self::TaskCreated
@@ -184,8 +188,9 @@ impl ClaimType {
             Self::AgentSpawned => &["spawn_agent"],
             Self::MailSent => &[],
             Self::CalendarEventCreated => &["calendar_create_event"],
-            Self::SheetWritten => &["sheets_append"],
-            Self::DocWritten => &["docs_append"],
+            Self::CalendarEventUpdated => &["calendar_update_event"],
+            Self::SheetWritten => &["sheets_append", "sheets_create", "sheets_update"],
+            Self::DocWritten => &["docs_append", "docs_create", "docs_replace_text"],
             Self::TaskCreated => &["tasks_create", "gtasks_create"],
         }
     }

@@ -36,6 +36,11 @@ pub const NATIVE_GOOGLE_TOOLS: &[&str] = &[
     "drive_read",
     "docs_read",
     "docs_append",
+    "docs_create",
+    "docs_replace_text",
+    "sheets_create",
+    "sheets_update",
+    "calendar_update_event",
     "slides_read",
 ];
 
@@ -61,7 +66,12 @@ pub fn native_google_scope(tool: &str) -> Option<NativeGoogleScope> {
         | "sheets_append"
         | "gtasks_create"
         | "gtasks_complete"
-        | "docs_append" => Some(NativeGoogleScope::Write),
+        | "docs_append"
+        | "docs_create"
+        | "docs_replace_text"
+        | "sheets_create"
+        | "sheets_update"
+        | "calendar_update_event" => Some(NativeGoogleScope::Write),
         _ => None,
     }
 }
@@ -77,7 +87,7 @@ mod tests {
             assert!(unique.insert(tool));
             assert!(native_google_scope(tool).is_some(), "{tool}");
         }
-        assert_eq!(unique.len(), 21);
+        assert_eq!(unique.len(), 26);
         assert_eq!(
             native_google_scope("gtasks_complete"),
             Some(NativeGoogleScope::Write)

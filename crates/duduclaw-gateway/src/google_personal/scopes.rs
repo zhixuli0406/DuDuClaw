@@ -7,7 +7,7 @@ pub const TOKEN_TOOLS: &[&str] = &[
     "calendar_list_events", "calendar_create_event", "sheets_read", "sheets_append",
     "forms_get", "forms_list_responses", "gtasks_lists", "gtasks_list",
     "gtasks_create", "gtasks_complete", "drive_search", "drive_read",
-    "docs_read", "docs_append", "slides_read", "google_remote_mcp",
+    "docs_read", "docs_append", "docs_create", "docs_replace_text", "sheets_create", "sheets_update", "calendar_update_event", "slides_read", "google_remote_mcp",
 ];
 
 pub fn token_tool(tool: &str) -> bool {
@@ -73,7 +73,7 @@ pub fn permitted(tool: &str, granted: &[String]) -> bool {
                 "https://www.googleapis.com/auth/calendar",
             ],
         ),
-        "calendar_create_event" => has(
+        "calendar_create_event" | "calendar_update_event" => has(
             granted,
             &[
                 "https://www.googleapis.com/auth/calendar.events",
@@ -87,7 +87,7 @@ pub fn permitted(tool: &str, granted: &[String]) -> bool {
                 "https://www.googleapis.com/auth/spreadsheets.readonly",
             ],
         ),
-        "sheets_append" => has(granted, &["https://www.googleapis.com/auth/spreadsheets"]),
+        "sheets_append" | "sheets_create" | "sheets_update" => has(granted, &["https://www.googleapis.com/auth/spreadsheets"]),
         "forms_get" => has(
             granted,
             &[
@@ -123,7 +123,7 @@ pub fn permitted(tool: &str, granted: &[String]) -> bool {
                 "https://www.googleapis.com/auth/documents.readonly",
             ],
         ),
-        "docs_append" => has(granted, &["https://www.googleapis.com/auth/documents"]),
+        "docs_append" | "docs_create" | "docs_replace_text" => has(granted, &["https://www.googleapis.com/auth/documents"]),
         "slides_read" => has(
             granted,
             &[
@@ -149,5 +149,31 @@ mod tests {
         assert!(!permitted("gmail_search", &scopes));
         assert!(!permitted("unknown_google_tool", &scopes));
         assert!(!permitted("google_remote_mcp", &scopes));
+    }
+}
+
+#[cfg(test)]
+mod native_write_scope_tests {
+    use super::*;
+    #[test]
+    fn every_new_write_requires_its_existing_service_scope() {
+        for (tool, service) in [
+            ("docs_create", "documents"), ("docs_replace_text", "documents"),
+            ("sheets_create", "spreadsheets"), ("sheets_update", "spreadsheets"),
+            ("calendar_update_event", "calendar.events"), ("gmail_create_draft", "gmail.compose"),
+        ] {
+            let scope = format!("https://www.googleapis.com/auth/{service}");
+            assert!(token_tool(tool), "{tool}");
+            assert!(permitted(tool, &[scope]), "{tool}");
+            assert!(!permitted(tool, &[]), "{tool}");
+            assert!(!permitted(tool, &[format!("https://www.googleapis.com/auth/{service}.readonly")]), "{tool}");
+        }
+        for tool in duduclaw_core::google_identity::NATIVE_GOOGLE_TOOLS {
+            if *tool != "google_status" {
+                assert!(token_tool(tool), "missing personal scope table entry: {tool}");
+                assert!(permitted(tool, &crate::google_workspace::REQUIRED_SCOPES.iter()
+                    .chain(crate::google_workspace::CHAT_READ_SCOPES.iter()).map(|s| s.to_string()).collect::<Vec<_>>()), "{tool}");
+            }
+        }
     }
 }

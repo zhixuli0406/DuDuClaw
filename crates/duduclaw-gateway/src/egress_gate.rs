@@ -196,8 +196,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(tmp.path().join("config.toml"), "[security]\negress_guard='off'").unwrap();
         std::fs::write(dir.join("agent.toml"), "[capabilities]\negress_guard='block'").unwrap();
-        assert!(check_external(tmp.path(), "bot", "docs_append", true).unwrap().is_none());
-        assert!(check_unattributed_employee(tmp.path(), "bot", "docs_append", true).is_err());
+        for tool in ["docs_append", "docs_create", "docs_replace_text", "sheets_create", "sheets_update", "calendar_update_event"] {
+            assert!(check_external(tmp.path(), "bot", tool, true).unwrap().is_none());
+            assert!(check_unattributed_employee(tmp.path(), "bot", tool, true).is_err());
+        }
     }
 
     #[tokio::test]

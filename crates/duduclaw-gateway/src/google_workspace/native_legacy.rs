@@ -335,7 +335,22 @@ pub(crate) async fn handle(
             return super::native_call::tool_error(&e);
         }
     };
+    if matches!(tool, "docs_create" | "docs_replace_text" | "sheets_create" | "sheets_update" | "calendar_update_event")
+        || matches!(template.parsed(), ParsedNativeArguments::GmailDraft { thread_id: Some(_), .. })
+    {
+        let backend = match g.backend(home, tool).await {
+            Ok(backend) => backend,
+            Err(error) => return super::native_call::tool_error(&error),
+        };
+        return match backend {
+            GoogleBackend::Direct(token) => program::run(&template, &mut LegacyIo { token: &token }).await,
+            GoogleBackend::AppsScript(_) => super::native_call::tool_error("這項 Google 工具需要原生 REST 連線；Apps Script Bridge 不支援這項操作。"),
+        };
+    }
     let result: Result<program::Outcome, GoogleApiError> = match template.parsed() {
+        ParsedNativeArguments::DocsCreate { .. } | ParsedNativeArguments::DocsReplace { .. }
+        | ParsedNativeArguments::SheetsCreate { .. } | ParsedNativeArguments::SheetsUpdate { .. }
+        | ParsedNativeArguments::CalendarUpdate { .. } => unreachable!("new native tools returned above"),
         ParsedNativeArguments::ChatSpaces(args) => {
             let backend = match g.backend(home, tool).await { Ok(b) => b, Err(e) => return super::native_call::tool_error(&e) };
             match backend {
@@ -372,7 +387,7 @@ pub(crate) async fn handle(
             to,
             subject,
             body,
-            cc,
+            cc, ..
         } => {
             let backend = match g.backend(home, tool).await {
                 Ok(b) => b,

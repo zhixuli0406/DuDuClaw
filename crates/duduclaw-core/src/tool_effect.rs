@@ -134,6 +134,8 @@ impl FromStr for ToolEffect {
 /// - `send_to_agent`, `spawn_agent`, `team_handoff` hand work to another
 ///   employee (`send`); `create_agent`, `spawn_ephemeral` create one (`admin`).
 /// - `calendar_create_event` notifies attendees (`send`).
+/// - `calendar_update_event` is `modify` by default; `effect_of_call` raises
+///   an explicit `notify_attendees=true` call to `send`.
 /// - `os_notify` shows a desktop notification to a person (`send`).
 /// - `odoo_connect` stays `read`: it re-reads the operator's `[odoo]` config,
 ///   replaces only the caller's own pooled connection and authenticates with
@@ -216,7 +218,7 @@ pub fn effect_of_builtin(tool_name: &str) -> Option<ToolEffect> {
         | "computer_navigate" | "computer_scroll" | "computer_session_start"
         | "computer_session_stop" | "computer_type" | "computer_login" | "credential_declare" | "computer_workspace_write"
         | "create_task" | "decision_resolve" | "desktop_record_start" | "desktop_record_stop"
-        | "docs_append" | "fork_run" | "goals_create" | "gtasks_complete" | "gtasks_create"
+        | "docs_append" | "docs_create" | "docs_replace_text" | "sheets_create" | "sheets_update" | "calendar_update_event" | "fork_run" | "goals_create" | "gtasks_complete" | "gtasks_create"
         | "memory_alias_add" | "memory_store" | "merge_or_select" | "notion_page_append"
         | "odoo_crm_create_lead" | "odoo_crm_update_stage" | "odoo_sale_create_quotation"
         | "odoo_create" | "odoo_write"
@@ -301,7 +303,7 @@ pub fn reads_private(tool_name: &str) -> Option<bool> {
         | "computer_scroll" | "computer_session_stop" | "computer_type" | "computer_login"
         | "credential_declare" | "computer_workspace_write" | "create_agent" | "create_reminder" | "create_task"
         | "delete_cron_task" | "desktop_record_start" | "desktop_record_stop"
-        | "discovery_cancel" | "docs_append" | "evolution_toggle" | "github_issue_comment"
+        | "discovery_cancel" | "docs_append" | "docs_create" | "docs_replace_text" | "sheets_create" | "sheets_update" | "calendar_update_event" | "evolution_toggle" | "github_issue_comment"
         | "gmail_create_draft" | "goals_create" | "gtasks_complete" | "gtasks_create"
         | "knowledge_add_source" | "llamafile_start" | "llamafile_stop" | "mail_send"
         | "memory_alias_add" | "memory_invalidate_by_origin" | "memory_store" | "model_download"
@@ -340,6 +342,11 @@ pub const EGRESS_CAPABLE_READS: &[&str] = &[
     "db_select",
     "db_tables",
     "docs_append",
+    "docs_create",
+    "docs_replace_text",
+    "sheets_create",
+    "sheets_update",
+    "calendar_update_event",
     "docs_read",
     "drive_read",
     "drive_search",
@@ -462,6 +469,9 @@ pub fn egress_capable(tool_name: &str) -> Option<bool> {
 /// Classify the final call arguments using the catalog's compatibility mapping.
 pub fn effect_of_call(tool_name: &str, args: &serde_json::Value) -> ToolEffect {
     let bare = tool_name.strip_prefix("mcp__duduclaw__").unwrap_or(tool_name);
+    if bare == "calendar_update_event" && args.get("notify_attendees").and_then(serde_json::Value::as_bool) == Some(true) {
+        return ToolEffect::Send;
+    }
     match crate::tool_catalog::removed_name_for_call(bare, args) {
         Some("shared_wiki_write") => ToolEffect::Publish,
         // Other mapped calls retain their conservative existing class:
@@ -1108,6 +1118,11 @@ mod tests {
             "google_chat_spaces",
             "google_chat_messages",
             "docs_append",
+            "docs_create",
+            "docs_replace_text",
+            "sheets_create",
+            "sheets_update",
+            "calendar_update_event",
         ] {
             assert_eq!(super::egress_capable(name), Some(true), "{name}");
         }
@@ -1407,5 +1422,23 @@ mod tests {
         assert_eq!(ProcessLane::Explore.delegation_stamp(), Some(LANE_EXPLORE));
         // An unrecognised value never turns into "normal" on the next hop.
         assert_eq!(ProcessLane::Invalid.delegation_stamp(), Some(LANE_EXPLORE));
+    }
+}
+
+#[cfg(test)]
+mod google_write_effect_tests {
+    use super::*;
+    #[test]
+    fn native_writes_are_modify_and_only_explicit_calendar_notification_is_send() {
+        for tool in ["docs_create", "docs_replace_text", "sheets_create", "sheets_update", "calendar_update_event"] {
+            assert_eq!(effect_of_builtin(tool), Some(ToolEffect::Modify), "{tool}");
+            assert_eq!(reads_private(tool), Some(false), "{tool}");
+            assert_eq!(egress_capable(tool), Some(true), "{tool}");
+        }
+        assert_eq!(effect_of_call("calendar_update_event", &serde_json::json!({})), ToolEffect::Modify);
+        assert_eq!(effect_of_call("calendar_update_event", &serde_json::json!({"notify_attendees":false})), ToolEffect::Modify);
+        assert_eq!(effect_of_call("calendar_update_event", &serde_json::json!({"notify_attendees":true})), effect_of("calendar_create_event"));
+        assert_eq!(effect_of_call("mcp__duduclaw__calendar_update_event", &serde_json::json!({"notify_attendees":true})), ToolEffect::Send);
+        assert_eq!(effect_of("gmail_create_draft"), ToolEffect::Draft);
     }
 }

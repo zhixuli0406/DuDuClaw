@@ -229,7 +229,7 @@ impl Transport<'_, '_> {
                     | "sheets_append"
                     | "gtasks_create"
                     | "gtasks_complete"
-                    | "docs_append"
+                    | "docs_append" | "docs_create" | "docs_replace_text" | "sheets_create" | "sheets_update" | "calendar_update_event"
             )
         {
             return self.fail();

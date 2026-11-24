@@ -982,3 +982,19 @@ Delivery to the creating conversation is re-checked at send time, before every n
 Google Chat notifications can use the employee's own Chat app, the app recorded for that space, or the shared app, following the existing app selection order. The selected app must still have access to the space. Recipient protection remains active: a stored, verified source conversation is allowed as a source; choosing another destination does not gain that exemption. An unlinked channel sender does not gain a verified-source exemption merely by creating a schedule.
 
 Cron lists and details report execution and notification separately: `last_status` describes the work; `last_delivery_status` is `delivered`, `delivery_failed`, `delivery_refused` (the send-time check above refused it), or empty when no delivery was attempted. `last_delivery_reason` contains the fixed code `notification_delivery_failed` on delivery failure, or on refusal one of `origin_unproven`, `origin_proof_invalid`, `origin_public_visitor`, `origin_state_unreadable`, `origin_account_inactive`, `origin_access_revoked`, `origin_identity_unbound` or `origin_conversation_changed`. These fields describe the latest run. Reminder lists retain `delivered` / `failed` status and include `error` when available (a refused reminder is `failed` with the same code). A failed send is never recorded as a delivered notification.
+
+## Native Google creation and editing tools
+
+These tools require `google:write` and the matching existing Google service scope. Read-only employees cannot list or call them. Both personal OAuth and domain-wide delegation use these names; no new OAuth scopes are requested.
+
+| Tool | Parameters | Result |
+|---|---|---|
+| `docs_create` | Required `title`, optional `body`; creates in My Drive root | `documentId`, `url` |
+| `docs_replace_text` | `document_id`, nonempty `find`, `replace`, optional boolean `match_case` (default true) | `documentId`, `url`, `occurrencesChanged` |
+| `sheets_create` | `title`, optional `sheet_names` array (max 100) | `spreadsheetId`, `url` |
+| `sheets_update` | `spreadsheet_id`, A1 `range`, 2-D `values` (max 10,000 cells); `value_input_option`: `RAW` (default) or `USER_ENTERED` | `spreadsheetId`, `url`, `updatedRange`, `updatedCells` when reported |
+| `calendar_update_event` | `event_id`, `calendar_id` (default primary), at least one of `summary`, `description`, `location`, RFC3339 `start` / `end`, `attendees` (email array) | `id`, `htmlLink`, `sendUpdates` |
+
+New write results expose these fields in `structuredContent` and screened JSON text. Text inputs are capped at 20,000 characters; titles at 1,000; sheet names at 100. `calendar_update_event` sends `sendUpdates=none` by default, even when attendees are supplied. `notify_attendees=true` changes it to `all` and uses the same `Send` effect / approval path as `calendar_create_event`. Other new writes use the existing `Modify` effect. An empty attendee array clears the attendee list.
+
+`gmail_create_draft` also accepts `thread_id` plus `in_reply_to` (the original RFC Message-ID, required for replies) and optional `references` (defaults to `in_reply_to`). Preserve the original subject for threading. This supplies the Gmail `threadId` and reply headers without adding a read scope; the operation remains draft-only and never sends. Its structured result contains `draft_id`, `message_id` and the Gmail drafts URL. New operations require native REST access; Apps Script Bridge does not support them. For setup and self-hosted MCP name mappings, see [Google Workspace](google-workspace.md#create-and-edit-google-content).
