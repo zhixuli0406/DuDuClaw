@@ -1397,6 +1397,9 @@ pub async fn gmail_create_draft_via(
                 subject,
                 body_text,
                 cc,
+                None,
+                None,
+                None,
             )
             .await
         }

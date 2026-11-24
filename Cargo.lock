@@ -2559,6 +2559,7 @@ dependencies = [
  "security-framework-sys",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "toml",
  "tracing",

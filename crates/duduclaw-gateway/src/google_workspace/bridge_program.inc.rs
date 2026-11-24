@@ -94,7 +94,16 @@ pub(super) async fn gmail_create_draft(
     subject: &str,
     body_text: &str,
     cc: Option<&str>,
+    thread_id: Option<&str>,
+    in_reply_to: Option<&str>,
+    references: Option<&str>,
 ) -> Result<GmailDraftResult, GoogleApiError> {
+    if thread_id.is_some() || in_reply_to.is_some() || references.is_some() {
+        return Err(GoogleApiError::Api {
+            status: 400,
+            message: "這項 Google 工具需要原生 REST 連線；Apps Script Bridge 不支援這項操作。".into(),
+        });
+    }
     // The shipped bridge script takes no cc field. Rather than silently
     // dropping a recipient the user asked for, refuse.
     if cc.is_some_and(|c| !c.trim().is_empty()) {
@@ -405,7 +414,7 @@ mod success_shape_tests {
     #[tokio::test]
     async fn empty_failed_or_error_replies_are_errors_with_a_reason() {
         for reply in not_success() {
-            let draft = gmail_create_draft(&mut Reply(reply.clone()), "a@b.test", "s", "b", None).await;
+            let draft = gmail_create_draft(&mut Reply(reply.clone()), "a@b.test", "s", "b", None, None, None, None).await;
             let event = calendar_create_event(&mut Reply(reply.clone()), "s", "2026-08-01T00:00:00Z", "2026-08-01T01:00:00Z", None, None, false).await;
             let append = sheets_append(&mut Reply(reply.clone()), "sheet", "A1", vec!["x".into()]).await;
             let search = gmail_search(&mut Reply(reply.clone()), "q", 5).await;
@@ -420,12 +429,12 @@ mod success_shape_tests {
                 assert!(message.len() > "did not succeed: ".len());
             }
         }
-        let error = gmail_create_draft(&mut Reply(json!({"error":{"message":"quota exceeded"}})), "a@b.test", "s", "b", None)
+        let error = gmail_create_draft(&mut Reply(json!({"error":{"message":"quota exceeded"}})), "a@b.test", "s", "b", None, None, None, None)
             .await
             .unwrap_err()
             .to_string();
         assert!(error.contains("quota exceeded"), "{error}");
-        let error = gmail_create_draft(&mut Reply(json!({"error":{"code":1}})), "a@b.test", "s", "b", None)
+        let error = gmail_create_draft(&mut Reply(json!({"error":{"code":1}})), "a@b.test", "s", "b", None, None, None, None)
             .await
             .unwrap_err()
             .to_string();
@@ -434,12 +443,12 @@ mod success_shape_tests {
 
     #[tokio::test]
     async fn blank_ids_are_not_success() {
-        assert!(gmail_create_draft(&mut Reply(json!({"draft_id": "", "message_id": "m"})), "a@b.test", "s", "b", None).await.is_err());
-        assert!(gmail_create_draft(&mut Reply(json!({"draft_id": "  "})), "a@b.test", "s", "b", None).await.is_err());
+        assert!(gmail_create_draft(&mut Reply(json!({"draft_id": "", "message_id": "m"})), "a@b.test", "s", "b", None, None, None, None).await.is_err());
+        assert!(gmail_create_draft(&mut Reply(json!({"draft_id": "  "})), "a@b.test", "s", "b", None, None, None, None).await.is_err());
         assert!(calendar_create_event(&mut Reply(json!({"id": "", "title": "s"})), "s", "a", "b", None, None, false).await.is_err());
         assert!(sheets_append(&mut Reply(json!({"appended": false, "row": 3})), "sheet", "A1", vec![]).await.is_err());
         assert!(sheets_append(&mut Reply(json!({"row": 3})), "sheet", "A1", vec![]).await.is_err());
-        let draft = gmail_create_draft(&mut Reply(json!({"draft_id": "d1", "message_id": "m1"})), "a@b.test", "s", "b", None).await.unwrap();
+        let draft = gmail_create_draft(&mut Reply(json!({"draft_id": "d1", "message_id": "m1"})), "a@b.test", "s", "b", None, None, None, None).await.unwrap();
         assert_eq!(draft.draft_id, "d1");
     }
 
@@ -518,7 +527,7 @@ mod credential_stripping_tests {
     #[tokio::test]
     async fn bridge_gmail_draft_strips_returned_subject() {
         let subject = format!("驗證碼 {CODE} {LOGIN_LINK} 中文 😀");
-        let result = gmail_create_draft(&mut FakeIo, "me@example.test", &subject, "body", None).await.unwrap();
+        let result = gmail_create_draft(&mut FakeIo, "me@example.test", &subject, "body", None, None, None, None).await.unwrap();
         assert_eq!(result.draft_id, "d123");
         assert_stripped(&result.subject);
     }
