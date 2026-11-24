@@ -55,6 +55,8 @@ impl PendingGoogleCall {
         {
             return Ok(tool_error(crate::google_workspace::chat_read::GUIDANCE));
         }
+        crate::google_workspace::validate_native_tool_inputs(native_tool, &arguments)
+            .map_err(|message| Refusal::hard("native_arguments_invalid", message))?;
         if gi::google_arguments_digest(&arguments) != *final_arguments_digest {
             return Err(changed());
         }

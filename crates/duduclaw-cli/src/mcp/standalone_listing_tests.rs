@@ -189,6 +189,55 @@ async fn google_chat_listing_tracks_admin_switch_for_employee_and_external_clien
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn google_backend_changes_hide_native_tools_reply_fields_and_notify_once() {
+    let home = scaffold_home();
+    let caller = principal("scaffold", "", false);
+    let mut previous = None;
+    for native in [true, false, true] {
+        let config = if native {
+            "[integrations]\ngoogle_workspace = true\ngoogle_credential_path = 'oauth'\n"
+        } else {
+            "[integrations]\ngoogle_workspace = true\ngoogle_credential_path = 'apps_script'\n[integrations.google_apps_script]\nurl = 'https://script.google.com/macros/s/fixture/exec'\n"
+        };
+        std::fs::write(home.path().join("config.toml"), config).unwrap();
+        let response = handle_tools_list_for_agent(&serde_json::json!(1), &caller, home.path(), "scaffold").await;
+        let schemas = response["result"]["tools"].as_array().unwrap();
+        for name in ["docs_create", "docs_replace_text", "sheets_create", "sheets_update", "calendar_update_event"] {
+            assert_eq!(schemas.iter().any(|tool| tool["name"] == name), native, "{name}");
+        }
+        let draft = schemas.iter().find(|tool| tool["name"] == "gmail_create_draft").expect("plain drafts remain available");
+        for field in ["thread_id", "in_reply_to", "references"] {
+            assert_eq!(draft["inputSchema"]["properties"].get(field).is_some(), native, "{field}");
+        }
+        let snapshot = advertised_tool_snapshot(&response);
+        assert_eq!(visible_tool_snapshot(&caller, home.path(), "scaffold").await, snapshot);
+        if previous.is_some() {
+            let notifications = super::server::tools_list_change_notifications(&mut previous, snapshot.clone(), true, false, &[]);
+            assert_eq!(notifications.len(), 1);
+            assert_eq!(notifications[0]["method"], "notifications/tools/list_changed");
+            assert!(super::server::tools_list_change_notifications(&mut previous, snapshot, true, false, &[]).is_empty());
+        } else { previous = Some(snapshot); }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn reply_schema_change_notifies_even_when_native_tools_are_hidden_by_rules() {
+    let home = scaffold_home();
+    std::fs::write(home.path().join("agents/scaffold/agent.toml"),
+        "[agent]\nid = 'scaffold'\nname = 'Scaffold'\nstatus = 'active'\n[capabilities]\ndenied_tools = ['docs_create', 'docs_replace_text', 'sheets_create', 'sheets_update', 'calendar_update_event']\n").unwrap();
+    let caller = principal("scaffold", "", false);
+    std::fs::write(home.path().join("config.toml"), "[integrations]\ngoogle_workspace = true\ngoogle_credential_path = 'oauth'\n").unwrap();
+    let before = handle_tools_list_for_agent(&serde_json::json!(1), &caller, home.path(), "scaffold").await;
+    std::fs::write(home.path().join("config.toml"), "[integrations]\ngoogle_workspace = true\ngoogle_credential_path = 'apps_script'\n[integrations.google_apps_script]\n").unwrap();
+    let after = handle_tools_list_for_agent(&serde_json::json!(2), &caller, home.path(), "scaffold").await;
+    assert_eq!(advertised_tool_names(&before), advertised_tool_names(&after));
+    let mut previous = Some(advertised_tool_snapshot(&before));
+    let notifications = super::server::tools_list_change_notifications(&mut previous, advertised_tool_snapshot(&after), true, false, &[]);
+    assert_eq!(notifications.len(), 1);
+    assert_eq!(notifications[0]["method"], "notifications/tools/list_changed");
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn employee_listing_is_unchanged_and_unverified_internal_background_is_hidden() {
     let home = scaffold_home();
     // Per-agent key whose client id is the employee (the O7 budget fixture):

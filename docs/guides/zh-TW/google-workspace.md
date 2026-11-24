@@ -32,8 +32,10 @@
 | `docs_replace_text` | write | 取代文件中相符的文字，預設區分大小寫。 |
 | `sheets_create` | write | 建立試算表，可指定工作表名稱。 |
 | `sheets_update` | write | 更新最多 10,000 格，預設使用 RAW。 |
-| `calendar_update_event` | write | 編輯行事曆活動，預設不通知與會者。 |
+| `calendar_update_event` | write | 編輯行事曆活動，可能變更與會者的行事曆，一律走 send 核准規則。 |
 | `slides_read` | read | 逐頁讀取簡報的文字內容（圖形、群組圖形、表格儲存格）。 |
+
+這五項寫入工具及 Gmail 回覆欄位（`thread_id`、`in_reply_to`、`references`）需要原生 REST。Apps Script Bridge 會隱藏不支援的工具及回覆欄位；切換後端會透過 `notifications/tools/list_changed` 通知客戶端更新清單。Gmail 的 `to` 與 `cc` 可用逗號分隔電子郵件地址，每欄最多 1,000 字元；每個地址都會驗證，並拒絕控制字元。
 
 寫入類工具的結果只寫 Google 實際回報的內容。`calendar_create_event` 只寫加入了幾位參與者（沒有時寫「Attendees: none」），不宣稱已通知任何人；沒有回傳活動代號時回報錯誤。`gmail_create_draft` 沒有回傳草稿代號時回報錯誤。`sheets_append` 只在 Google 回報時才顯示列數與儲存格數。透過 Apps Script 連線時，新增的列一律加在試算表的**第一個工作表**，結果會說明這點以及指定的範圍沒有被使用。Apps Script 的回覆必須符合該動作成功時的格式才算成功；空的回覆、`ok: false` 或任何錯誤欄位都會回報為工具錯誤並附上原因。
 
@@ -81,9 +83,9 @@
 | `docs_replace_text` | `document_id`、非空白的 `find`、`replace`；`match_case` 預設為 `true`。取代所有相符文字，回傳 `occurrencesChanged`。 |
 | `sheets_create` | 必填 `title`，可選 `sheet_names` 陣列（最多 100 個名稱），在「我的雲端硬碟」根目錄建立試算表。 |
 | `sheets_update` | `spreadsheet_id`、A1 格式的 `range`、二維 `values` 陣列，每次最多 10,000 格。`value_input_option` 預設 `RAW`；要解析公式、日期或數字時可選 `USER_ENTERED`。 |
-| `calendar_update_event` | `event_id`、可選 `calendar_id`（預設 `primary`），以及至少一個更新欄位：`summary`、`description`、`location`、RFC3339 格式的 `start`／`end`、`attendees` 電子郵件陣列（`[]` 清空與會者）。預設送出 `sendUpdates=none`，不通知與會者；`notify_attendees=true` 才送出 `all`，並套用與 `calendar_create_event` 相同的 `send` 動作規則及核准路徑。 |
+| `calendar_update_event` | `event_id`、可選 `calendar_id`（預設 `primary`），以及至少一個更新欄位：`summary`、`description`、`location`、RFC3339 格式的 `start`／`end`、`attendees` 電子郵件陣列（`[]` 清空與會者）。每次呼叫都套用與 `calendar_create_event` 相同的 `send` 動作規則及核准路徑，因為 `sendUpdates=none` 仍可能變更與會者的行事曆。通知參數預設維持 `none`，`notify_attendees=true` 改為 `all`。 |
 
-文字最多 20,000 字元；標題最多 1,000 字元，工作表名稱最多 100 字元，A1 範圍最多 1,000 字元。結果的 `structuredContent` 會包含可供後續呼叫使用的 `documentId` 或 `spreadsheetId` 與 `url`，行事曆則回傳 `id` 與 `htmlLink`。Google 回傳並顯示的內容會先經過注入檢查。建立含內文的文件需要兩次請求；若插入內文失敗，重試前先到雲端硬碟確認文件是否已建立。
+文字最多 20,000 字元；標題最多 1,000 字元，工作表名稱最多 100 字元，A1 範圍最多 1,000 字元。超限輸入會在動作規則、核准或摘要綁定之前拒絕，不會截斷輸入。結果的 `structuredContent` 會包含可供後續呼叫使用的 `documentId` 或 `spreadsheetId` 與 `url`，行事曆則回傳 `id` 與 `htmlLink`。Google 回傳並顯示的內容會先經過注入檢查。建立含內文的文件需要兩次請求；若插入內文失敗，重試前先到雲端硬碟確認文件是否已建立。
 
 要在既有郵件討論串建立回覆草稿，請在 `gmail_create_draft` 原有參數之外提供 `thread_id` 與 `in_reply_to`（原信的 RFC `Message-ID`，例如 `<original@example.com>`），主旨維持原信主旨，可加回覆前綴。可選的 `references` 是包含原信 Message-ID 的 References 鏈，預設使用 `in_reply_to`。工具會設定 Gmail `threadId`、`In-Reply-To` 與 `References`；由呼叫端提供標頭，只有撰寫權限的連線也不必多申請讀取範圍。這項操作仍只存草稿，永遠不寄出。
 

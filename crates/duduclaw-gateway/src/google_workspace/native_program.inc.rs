@@ -300,6 +300,8 @@ async fn gmail_draft_with_reply<I: LocalIo>(
     io: &mut I, template: &NativeCallTemplate, to: &str, subject: &str, body_text: &str,
     cc: Option<&str>, thread_id: Option<&str>, in_reply_to: Option<&str>, references: Option<&str>,
 ) -> Result<GmailDraftResult, GoogleApiError> {
+    crate::google_workspace::native_call::validate_draft_recipients(to, cc)
+        .map_err(|message| GoogleApiError::Api { status: 400, message })?;
     let mut raw = build_rfc2822(to, subject, body_text, cc);
     if let (Some(reply), Some(refs)) = (in_reply_to, references) {
         raw = format!("In-Reply-To: {reply}\r\nReferences: {refs}\r\n{raw}");
@@ -989,6 +991,8 @@ async fn native_write<I: LocalIo>(io: &mut I, template: &NativeCallTemplate) -> 
                 "updatedCells":response.get("updatedCells").and_then(Value::as_u64)}))
         }
         CalendarUpdate { calendar, event, patch, notify } => {
+            // Always a Send effect: sendUpdates controls notifications, not
+            // whether an attendee's calendar can change.
             let response = google_request(io, template, reqwest::Method::PATCH,
                 &format!("{CALENDAR_BASE}/calendars/{}/events/{}", encode_path_component(calendar), encode_path_component(event)),
                 &[("sendUpdates", if *notify { "all" } else { "none" }.into())], Some(patch)).await?;

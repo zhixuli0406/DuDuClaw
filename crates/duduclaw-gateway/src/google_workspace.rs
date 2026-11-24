@@ -586,6 +586,28 @@ pub enum GoogleBackend {
     AppsScript(google_apps_script::BridgeConfig),
 }
 
+/// Shared by discovery and dispatch; this checks backend features, not scopes.
+pub fn backend_supports_tool(native_rest: bool, tool: &str, reply_draft: bool) -> bool {
+    native_rest || !(matches!(tool, "docs_create" | "docs_replace_text" | "sheets_create" | "sheets_update" | "calendar_update_event")
+        || (tool == "gmail_create_draft" && reply_draft))
+}
+
+/// Discovery cannot open credentials. Dedicated personal/delegate calls use
+/// REST; home calls follow the same saved backend selection as dispatch.
+pub fn native_rest_available(home: &Path, agent: Option<&str>) -> bool {
+    use duduclaw_core::google_identity::{Effective, effective_for};
+    match effective_for(home, agent).effective {
+        Effective::Personal { .. } | Effective::Delegate { .. } => true,
+        Effective::Home => selected_path(home).is_ok_and(|path| matches!(path.as_str(), "oauth" | "service_account")),
+        _ => false,
+    }
+}
+
+/// Must run before action rules, approval requests or argument digest binding.
+pub fn validate_native_tool_inputs(tool: &str, args: &Value) -> Result<(), String> {
+    native_call::validate_inputs(tool, args)
+}
+
 /// Resolve the credential path for this home.
 ///
 /// Saved selection wins over retained OAuth tokens. Invalid configuration
@@ -1364,6 +1386,8 @@ pub async fn gmail_create_draft_via(
     body_text: &str,
     cc: Option<&str>,
 ) -> Result<GmailDraftResult, GoogleApiError> {
+    native_call::validate_draft_recipients(to, cc)
+        .map_err(|message| GoogleApiError::Api { status: 400, message })?;
     match backend {
         GoogleBackend::Direct(token) => gmail_create_draft(token, to, subject, body_text, cc).await,
         GoogleBackend::AppsScript(cfg) => {
@@ -1522,6 +1546,26 @@ mod tests {
         assert!(super::chat_read_tool_available(home.path(), "google_chat_spaces"));
         assert!(super::chat_read_tool_available(home.path(), "google_chat_messages"));
         assert!(!super::chat_read_tool_available(home.path(), "gmail_read"));
+    }
+
+    #[test]
+    fn native_write_backend_capabilities_match_saved_backend_selection() {
+        let home = tempfile::tempdir().unwrap();
+        for (config, native) in [
+            ("[integrations]\ngoogle_credential_path = 'oauth'\n", true),
+            ("[integrations]\ngoogle_credential_path = 'service_account'\n[ integrations.google_service_account ]\n", true),
+            ("[integrations]\ngoogle_credential_path = 'apps_script'\n[ integrations.google_apps_script ]\n", false),
+            ("[integrations]\ngoogle_credential_path = 'none'\n", false),
+            ("invalid = [", false),
+        ] {
+            std::fs::write(home.path().join("config.toml"), config).unwrap();
+            assert_eq!(native_rest_available(home.path(), None), native, "{config}");
+            for tool in ["docs_create", "docs_replace_text", "sheets_create", "sheets_update", "calendar_update_event"] {
+                assert_eq!(backend_supports_tool(native, tool, false), native, "{tool}");
+            }
+            assert!(backend_supports_tool(native, "gmail_create_draft", false));
+            assert_eq!(backend_supports_tool(native, "gmail_create_draft", true), native);
+        }
     }
 
     use super::*;

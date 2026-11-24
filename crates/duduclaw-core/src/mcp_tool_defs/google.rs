@@ -46,7 +46,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "calendar_update_event",
-        description: "Edit a Google Calendar event. Attendees are NOT notified unless notify_attendees=true (send approval rules apply).",
+        description: "Edit a Google Calendar event. Always uses send approval rules; attendee calendars may change. sendUpdates defaults to none.",
         params: &[
             ParamDef { name: "event_id", description: "Existing calendar event ID", required: true },
             ParamDef { name: "calendar_id", description: "Calendar ID (default primary)", required: false },
@@ -56,7 +56,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
             ParamDef { name: "start", description: "New start, RFC3339 timestamp", required: false },
             ParamDef { name: "end", description: "New end, RFC3339 timestamp", required: false },
             ParamDef { name: "attendees", description: "Replacement array of attendee email addresses (empty clears)", required: false },
-            ParamDef { name: "notify_attendees", description: "Notify attendees (default false)", required: false },
+            ParamDef { name: "notify_attendees", description: "Request attendee notifications (default false); send approval always applies", required: false },
         ],
     },
 

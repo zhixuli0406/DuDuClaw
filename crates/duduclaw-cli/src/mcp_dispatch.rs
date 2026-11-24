@@ -782,6 +782,11 @@ impl McpDispatcher {
         }
         let params = &clean_params;
         let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        if let Err(message) = duduclaw_gateway::google_workspace::validate_native_tool_inputs(
+            tool_name, params.get("arguments").unwrap_or(&Value::Null),
+        ) {
+            return jsonrpc_error(id, -32602, &message);
+        }
         let isolation_denied = crate::mcp_isolation::current().is_some()
             && (!crate::mcp_isolation::tool_allowed(tool_name, principal)
                 || crate::mcp_isolation::check_tool_arguments(tool_name,
@@ -3348,6 +3353,22 @@ effect = "forbid"
     }
 
     // ── 2026-10: action rules ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn google_over_limit_inputs_are_refused_before_action_rules_or_approval() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        write_scoped_toml(&tmp, "[capabilities]\naction_rules = [{ effect = 'modify', verdict = 'block' }]\napproval_required_tools = ['docs_create']\n");
+        let principal = make_principal(vec![Scope::Admin], false);
+        let params = make_params("docs_create", serde_json::json!({"title":"Doc","body":"x".repeat(20_001)}));
+        let result = dispatcher.dispatch_tool_call(&principal, &make_ns_ctx(false), &params, &serde_json::json!(90)).await;
+        assert_eq!(result["error"]["code"], -32602, "{result}");
+        let message = result["error"]["message"].as_str().unwrap();
+        assert!(message.contains("body") && message.contains("20000"), "{message}");
+        assert!(!message.contains("action_rules"));
+        let audit = std::fs::read_to_string(tmp.path().join("tool_calls.jsonl")).unwrap_or_default();
+        assert!(!audit.contains("\"action_rule\""));
+    }
 
     #[tokio::test]
     async fn action_rule_block_refuses_with_its_own_error_class() {

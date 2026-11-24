@@ -142,7 +142,85 @@ fn timestamp(label: &str, value: &str, example: &str) -> Result<(), String> {
 }
 
 fn capped(args: &Value, key: &str, nonempty: bool, max: usize) -> Result<String, String> {
-    Ok(duduclaw_core::truncate_chars(&required(args, key, false, nonempty)?, max))
+    let value = required(args, key, false, nonempty)?;
+    check_text_limit(key, &value, max)?;
+    Ok(value)
+}
+
+fn check_text_limit(key: &str, value: &str, max: usize) -> Result<(), String> {
+    if value.chars().count() > max {
+        return Err(format!("Parameter '{key}' exceeds the limit of {max} characters"));
+    }
+    Ok(())
+}
+
+/// Validate raw input before policy, approval and argument-digest binding.
+/// Never shorten an approved payload, including optional or nested strings.
+pub(crate) fn validate_inputs(tool: &str, args: &Value) -> Result<(), String> {
+    let limits: &[(&str, usize)] = match tool {
+        "docs_create" => &[("title", 1000), ("body", 20_000)],
+        "docs_replace_text" => &[("find", 20_000), ("replace", 20_000)],
+        "sheets_create" => &[("title", 1000)],
+        "sheets_update" => &[("range", 1000)],
+        "calendar_update_event" => &[("summary", 20_000), ("description", 20_000), ("location", 20_000)],
+        "gmail_create_draft" => &[("to", 1000), ("cc", 1000), ("subject", 1000), ("body", 20_000)],
+        _ => &[],
+    };
+    for (key, max) in limits {
+        if let Some(value) = args.get(*key).and_then(Value::as_str) {
+            check_text_limit(key, value, *max)?;
+        }
+    }
+    let array_limit = match tool {
+        "sheets_create" => Some(("sheet_names", 100, 100)),
+        "calendar_update_event" => Some(("attendees", 1000, 320)),
+        _ => None,
+    };
+    if let Some((key, count, max)) = array_limit {
+        if let Some(values) = args.get(key).and_then(Value::as_array) {
+            if values.len() > count {
+                return Err(format!("Invalid array parameter: {key} (max {count})"));
+            }
+            for value in values.iter().filter_map(Value::as_str) {
+                check_text_limit(key, value, max)?;
+            }
+        }
+    }
+    if tool == "sheets_update" {
+        if let Some(rows) = args.get("values").and_then(Value::as_array) {
+            let mut cells = 0usize;
+            for row in rows.iter().filter_map(Value::as_array) {
+                cells = cells.checked_add(row.len()).filter(|n| *n <= 10_000)
+                    .ok_or("values exceeds 10000 cells")?;
+                for value in row.iter().filter_map(Value::as_str) {
+                    check_text_limit("values cell", value, 20_000)?;
+                }
+            }
+        }
+    }
+    if tool == "gmail_create_draft" {
+        reply_headers(args)?;
+        if let Some(to) = args.get("to").and_then(Value::as_str) {
+            validate_draft_recipients(to, args.get("cc").and_then(Value::as_str))?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_draft_recipients(to: &str, cc: Option<&str>) -> Result<(), String> {
+    for (key, value) in [("to", Some(to)), ("cc", cc)] {
+        let Some(value) = value else { continue; };
+        // Check before trimming: even a trailing CR/LF must be refused.
+        if value.chars().any(char::is_control) {
+            return Err(format!("Invalid {key}: control characters are not allowed in email addresses"));
+        }
+        if key == "cc" && value.trim().is_empty() { continue; }
+        for address in value.split(',') {
+            duduclaw_auth::db::validate_account_email(address)
+                .map_err(|_| format!("Invalid email address in {key}"))?;
+        }
+    }
+    Ok(())
 }
 fn checked_optional(args: &Value, key: &str, trim: bool, nonempty: bool) -> Result<Option<String>, String> {
     if args.get(key).is_none() { return Ok(None); }
@@ -159,9 +237,12 @@ fn string_array(args: &Value, key: &str, limit: usize, max_chars: usize) -> Resu
     let Some(value) = args.get(key) else { return Ok(None); };
     let rows = value.as_array().filter(|v| v.len() <= limit)
         .ok_or_else(|| format!("Invalid array parameter: {key} (max {limit})"))?;
-    rows.iter().map(|value| value.as_str().filter(|s| !s.trim().is_empty())
-        .map(|s| duduclaw_core::truncate_chars(s, max_chars))
-        .ok_or_else(|| format!("Invalid string in {key}"))).collect::<Result<Vec<_>, _>>().map(Some)
+    rows.iter().map(|value| {
+        let s = value.as_str().filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| format!("Invalid string in {key}"))?;
+        check_text_limit(key, s, max_chars)?;
+        Ok(s.to_owned())
+    }).collect::<Result<Vec<_>, String>>().map(Some)
 }
 fn reply_headers(args: &Value) -> Result<(Option<String>, Option<String>, Option<String>), String> {
     let thread = checked_optional(args, "thread_id", true, true)?;
@@ -183,10 +264,11 @@ fn reply_headers(args: &Value) -> Result<(Option<String>, Option<String>, Option
 
 impl NativeCallTemplate {
     pub(crate) fn prepare(tool: &str, args: &Value) -> Result<Self, String> {
+        validate_inputs(tool, args)?;
         let parsed = match tool {
             "docs_create" => ParsedNativeArguments::DocsCreate {
                 title: capped(args, "title", true, 1000)?,
-                body: checked_optional(args, "body", false, false)?.map(|s| duduclaw_core::truncate_chars(&s, 20_000)),
+                body: checked_optional(args, "body", false, false)?,
             },
             "docs_replace_text" => ParsedNativeArguments::DocsReplace {
                 document: required(args, "document_id", true, true)?,
@@ -209,7 +291,7 @@ impl NativeCallTemplate {
                     let mut parsed_row = Vec::new();
                     for cell in row {
                         parsed_row.push(match cell {
-                            Value::String(s) => json!(duduclaw_core::truncate_chars(s, 20_000)),
+                            Value::String(_) => cell.clone(),
                             Value::Null | Value::Bool(_) | Value::Number(_) => cell.clone(),
                             _ => return Err("Cells must be strings, numbers, booleans or null".into()),
                         });
@@ -260,10 +342,10 @@ impl NativeCallTemplate {
             "gmail_create_draft" => {
                 let (thread_id, in_reply_to, references) = reply_headers(args)?;
                 ParsedNativeArguments::GmailDraft {
-                    to: capped(args, "to", true, 1000)?.trim().to_owned(),
+                    to: capped(args, "to", true, 1000)?,
                     subject: capped(args, "subject", false, 1000)?,
                     body: capped(args, "body", false, 20_000)?,
-                    cc: optional(args, "cc", true).map(|s| duduclaw_core::truncate_chars(&s, 1000)),
+                    cc: checked_optional(args, "cc", false, false)?,
                     thread_id, in_reply_to, references,
                 }
             },

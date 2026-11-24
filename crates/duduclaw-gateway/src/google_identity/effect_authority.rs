@@ -581,6 +581,8 @@ pub(in crate::google_identity) async fn execute_immediate_native_pinned(
     args: serde_json::Value,
     tenant: Option<TenantPin>,
 ) -> Result<serde_json::Value, Refusal> {
+    crate::google_workspace::validate_native_tool_inputs(tool, &args)
+        .map_err(|message| Refusal::hard("native_arguments_invalid", message))?;
     // Initial admission keeps the public credential-refusal taxonomy. Once
     // captured, every later wait still rechecks the original source context.
     host_claim::live_key(home, agent, reference, tool)?;

@@ -184,11 +184,11 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
     // minted mid-session (PORTICO `capability_request`, a goal-loop kickoff),
     // an operator editing `agent.toml`, or a dashboard `agent_update` changes
     // what this caller may see. `last_advertised` holds the set we actually
-    // sent; `None` means no `tools/list` has been answered yet and there is
-    // therefore nothing to invalidate. The watcher compares SETS rather than
+    // sent, including backend-dependent schemas. `None` means no list has
+    // been answered yet, so there is nothing to invalidate. The watcher compares SETS rather than
     // file mtimes, so a touched-but-unchanged config emits nothing and a WAL
     // write we cannot stat still gets noticed. Live autonomy state is also
-    // re-read by visible_tool_names on every tick; pause/resume needs no mtime watch.
+    // re-read by visible_tool_snapshot on every tick; backend changes need no mtime watch.
     let mut last_advertised: Option<Vec<String>> = None;
     // Protocol era bookkeeping (MCP 2026-07-28, see `crate::mcp_protocol`).
     // A legacy client (`initialize`) gets the unsolicited `list_changed`; a
@@ -224,11 +224,8 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
                 {
                     let current: Vec<String> =
                         crate::mcp_auth::with_authenticated_call(p.clone(),
-                            visible_tool_names(p.principal(), home_dir, &default_agent))
-                            .await
-                            .into_iter()
-                            .map(str::to_string)
-                            .collect();
+                            visible_tool_snapshot(p.principal(), home_dir, &default_agent))
+                            .await;
                     for notification in tools_list_change_notifications(
                         &mut last_advertised,
                         current,
@@ -358,12 +355,9 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
                         Ok(p) => Some(
                             crate::mcp_auth::with_authenticated_call(
                                 p.clone(),
-                                visible_tool_names(p.principal(), home_dir, &default_agent),
+                                visible_tool_snapshot(p.principal(), home_dir, &default_agent),
                             )
-                            .await
-                            .into_iter()
-                            .map(str::to_string)
-                            .collect::<Vec<_>>(),
+                            .await,
                         ),
                         Err(e) => {
                             let err = crate::mcp_protocol::modernize_response(jsonrpc_error(
@@ -427,7 +421,7 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
                         // second evaluation, so the watcher above compares
                         // against the real wire content and the hot path pays
                         // for one pass, not two.
-                        last_advertised = Some(advertised_tool_names(&resp));
+                        last_advertised = Some(advertised_tool_snapshot(&resp));
                         if modern {
                             crate::mcp_protocol::with_cache_hints(
                                 resp,

@@ -33,8 +33,10 @@ MCPツールです。
 | `docs_replace_text` | write | 文書内の一致する文字列を置換。既定は大文字・小文字を区別。 |
 | `sheets_create` | write | スプレッドシートを作成。シート名も指定可能。 |
 | `sheets_update` | write | 最大10,000セルを更新。既定はRAW。 |
-| `calendar_update_event` | write | 予定を編集。既定では参加者に通知しない。 |
+| `calendar_update_event` | write | 予定を編集。参加者のカレンダーに影響するため、常に send 承認ルールを適用。 |
 | `slides_read` | read | プレゼンテーションのテキストをスライドごとに読み取る(図形、グループ化された図形、表のセル)。 |
+
+この5つの書き込みツールと Gmail の返信フィールド（`thread_id`、`in_reply_to`、`references`）にはネイティブ REST 接続が必要です。Apps Script Bridge では非対応のツールと返信フィールドを非表示にし、バックエンドの変更時に `notifications/tools/list_changed` を送信します。Gmail の `to` と `cc` はカンマ区切りのメールアドレスを指定でき、各フィールドの上限は1,000文字です。各アドレスを検証し、制御文字は拒否します。
 
 書き込みツールの結果には Google が実際に返した内容だけを示します。`calendar_create_event` は追加した参加者の人数だけを示し（いない場合は「Attendees: none」）、誰かに通知したとは書きません。イベント ID が返らない場合はエラーです。`gmail_create_draft` で下書き ID が返らない場合もエラーです。`sheets_append` の行数・セル数は Google が返した場合だけ表示します。Apps Script 経由では行は常にスプレッドシートの**最初のシート**に追加され、結果にはそのことと、指定した範囲が使われなかったことを示します。Apps Script の応答は、その操作の成功時の形式を満たす場合だけ成功とみなし、空の応答・`ok: false`・あらゆる `error` 項目は理由付きのツールエラーになります。
 
@@ -85,9 +87,9 @@ MCPツールです。
 | `docs_replace_text` | `document_id`、空でない `find`、`replace`。`match_case` は既定で `true`。一致する全文字列を置換し、`occurrencesChanged` を返します。 |
 | `sheets_create` | 必須の `title`、任意の `sheet_names` 配列（最大100件）。マイドライブのルートにスプレッドシートを作成します。 |
 | `sheets_update` | `spreadsheet_id`、A1形式の `range`、二次元 `values` 配列。1回最大10,000セル。`value_input_option` の既定は `RAW`。数式や日付を解釈する場合は `USER_ENTERED` を指定します。 |
-| `calendar_update_event` | `event_id`、任意の `calendar_id`（既定 `primary`）、変更するフィールドを1つ以上指定します：`summary`、`description`、`location`、RFC3339形式の `start`／`end`、メールアドレス配列の `attendees`（`[]` で参加者を削除）。既定は `sendUpdates=none` で参加者に通知しません。`notify_attendees=true` は `all` を送り、`calendar_create_event` と同じ `send` 動作ルールと承認経路を使います。 |
+| `calendar_update_event` | `event_id`、任意の `calendar_id`（既定 `primary`）、変更するフィールドを1つ以上指定します：`summary`、`description`、`location`、RFC3339形式の `start`／`end`、メールアドレス配列の `attendees`（`[]` で参加者を削除）。すべての呼び出しに `calendar_create_event` と同じ `send` 動作ルールと承認経路を適用します。`sendUpdates=none` でも参加者のカレンダーが変わる可能性があります。通知パラメーターの既定値は引き続き `none` で、`notify_attendees=true` の場合は `all` です。 |
 
-テキストは最大20,000文字、タイトルは1,000文字、シート名は100文字、A1範囲は1,000文字です。結果の `structuredContent` は、後続の呼び出しに使える `documentId` または `spreadsheetId` と `url`、予定の場合は `id` と `htmlLink` を含みます。表示する Google の応答は注入検査を受けます。本文付き文書の作成は2回のリクエストを使うため、本文の挿入が失敗した場合は再試行する前にドライブで作成済み文書を確認してください。
+テキストは最大20,000文字、タイトルは1,000文字、シート名は100文字、A1範囲は1,000文字です。上限を超える入力は動作ルール・承認・ダイジェストの生成前に拒否され、切り詰められません。結果の `structuredContent` は、後続の呼び出しに使える `documentId` または `spreadsheetId` と `url`、予定の場合は `id` と `htmlLink` を含みます。表示する Google の応答は注入検査を受けます。本文付き文書の作成は2回のリクエストを使うため、本文の挿入が失敗した場合は再試行する前にドライブで作成済み文書を確認してください。
 
 既存スレッドの返信下書きには、`gmail_create_draft` の引数に `thread_id` と `in_reply_to`（元メールの RFC `Message-ID`、例：`<original@example.com>`）を追加します。件名は元メールと合わせ、必要に応じて返信の接頭辞を付けます。任意の `references` は元メールの Message-ID を含む References チェーンで、既定は `in_reply_to` です。Gmail の `threadId`、`In-Reply-To`、`References` が設定されます。呼び出し側がヘッダーを渡すため、作成専用接続でも読み取りスコープを追加する必要はありません。下書きの保存のみで、送信しません。
 

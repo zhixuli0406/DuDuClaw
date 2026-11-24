@@ -33,6 +33,11 @@ impl Clock {
 fn refused() -> Refusal {
     changed()
 }
+fn validate_native_inputs(tool: &str, args: &Value) -> Result<(), Refusal> {
+    crate::google_workspace::validate_native_tool_inputs(tool, args)
+        .map_err(|message| Refusal::hard("native_arguments_invalid", message))
+}
+
 fn capacity() -> Refusal {
     Refusal::hard(
         "selection_capacity",
@@ -335,6 +340,7 @@ impl SelectionStore {
         args: &Value,
         clock: Clock,
     ) -> Result<Option<GoogleSelectionStamp>, Refusal> {
+        validate_native_inputs(tool, args)?;
         live_key(home, agent, reference, tool)?;
         match gi::effective_for(home, Some(agent)).effective {
             gi::Effective::Home | gi::Effective::Delegate { .. } => return Ok(None),
@@ -394,6 +400,7 @@ impl SelectionStore {
         clock: Clock,
     ) -> Result<Option<GoogleSelectionStamp>, Refusal> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(18);
+        validate_native_inputs(tool, args)?;
         live_key(home, agent, reference, tool)?;
         match gi::effective_for(home, Some(agent)).effective {
             gi::Effective::Home | gi::Effective::Delegate { .. } => return Ok(None),
@@ -528,6 +535,7 @@ impl SelectionStore {
         deadline: Option<tokio::time::Instant>,
         mut reservation: Option<&mut PreparationReservation<'_>>,
     ) -> Result<Option<GoogleSelectionStamp>, Refusal> {
+        validate_native_inputs(tool, args)?;
         live_key(home, agent, reference, tool)?;
         let id = uuid::Uuid::new_v4().to_string();
         let bound = DedicatedBinding {
@@ -638,6 +646,7 @@ impl SelectionStore {
         {
             return Err(refused());
         }
+        validate_native_inputs(tool, args)?;
         let digest = gi::google_arguments_digest(args);
         let mut inner = self.inner.lock().map_err(|_| refused())?;
         Self::prune(&mut inner, clock);
@@ -684,6 +693,7 @@ impl SelectionStore {
         args: &Value,
         clock: Clock,
     ) -> Result<PendingGoogleCall, Refusal> {
+        validate_native_inputs(tool, args)?;
         let digest = gi::google_arguments_digest(args);
         let mut inner = self.inner.lock().map_err(|_| refused())?;
         Self::prune(&mut inner, clock);
