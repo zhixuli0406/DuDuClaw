@@ -997,6 +997,73 @@ async fn delegate_status_and_unknown_tools_never_enter_token_work() {
 }
 
 
+async fn owner_incarnation_during_mint(rotate: bool, email: &str) {
+    use duduclaw_auth::{AccessLevel, UserDb, UserRole};
+    use std::sync::Arc;
+    let home = Home::new();
+    home.ready("bot", email, "");
+    home.agent("bot", "[google]\nidentity='delegate:owner'\n");
+    let db = Arc::new(UserDb::new(&home.p().join("users.db")).unwrap());
+    let owner = db.create_user(email, "Owner", "test-password", UserRole::Employee).unwrap();
+    let admin = db.create_user("admin-incarnation@c.test", "Admin", "test-password", UserRole::Admin).unwrap();
+    db.bind_agent(&owner.id, "bot", AccessLevel::Owner).unwrap();
+    db.ensure_google_employee_nonce("bot").unwrap();
+    let attest = || {
+        let employee = delegate_owner::incarnation(home.p(), "bot").unwrap();
+        db.attest_google_delegate_owner(&duduclaw_auth::google_delegate_attestation::AttestationRequest {
+            agent_id:"bot", employee_id:&hex::encode(employee.0.0), employee_incarnation:employee.1,
+            subject:email, user_id:&owner.id, acknowledge_self_set:true,
+        }, &|value| value == email, &admin.id).unwrap();
+    };
+    attest();
+    let original_incarnation = delegate_owner::incarnation(home.p(), "bot").unwrap();
+    let original_identity = delegate_owner::effective_for(home.p(), Some("bot"));
+    assert_eq!(original_identity.effective, Effective::Delegate { email: email.into() });
+    let people = requester_gate::people_for(home.p(), Some(&db));
+    let requester = RequesterIdentity::DashboardUser { user_id: owner.id.clone() };
+    let (entered, release) = pause_mint(email);
+    let (result, ()) = tokio::join!(
+        resolve(&home, "bot", &requester, people.as_ref()),
+        async {
+            tokio::time::timeout(std::time::Duration::from_secs(10), entered.notified()).await.unwrap();
+            if rotate {
+                // Simulate deletion and recreation under the same employee label.
+                duduclaw_core::employee_incarnation::deleted(home.p(), "bot").unwrap();
+                duduclaw_core::employee_incarnation::created(home.p(), "bot").unwrap();
+                attest();
+                assert_ne!(delegate_owner::incarnation(home.p(), "bot"), Some(original_incarnation));
+            } else {
+                assert_eq!(delegate_owner::incarnation(home.p(), "bot"), Some(original_incarnation));
+            }
+            // The final effective identity alone cannot distinguish these cases.
+            assert_eq!(delegate_owner::effective_for(home.p(), Some("bot")), original_identity);
+            release.notify_one();
+        }
+    );
+    assert_eq!(seen_for(email).len(), 1, "the paused exchange must complete");
+    if rotate {
+        let refusal = result.expect_err("an old incarnation must never receive the minted bearer");
+        assert_eq!(refusal.code, "identity_changed");
+        assert!(!refusal.fallback_eligible);
+    } else {
+        let Resolved::Delegated { email: resolved_email, token } = result.unwrap() else {
+            panic!("unchanged incarnation must receive its delegated token");
+        };
+        assert_eq!(resolved_email, email);
+        assert_eq!(token.access_token, format!("tok:{email}"));
+    }
+}
+
+#[tokio::test]
+async fn owner_nonce_rotation_and_same_email_reattest_during_mint_refuses_bearer() {
+    owner_incarnation_during_mint(true, "owner-rotated-during-mint@c.test").await;
+}
+
+#[tokio::test]
+async fn owner_unchanged_nonce_during_mint_returns_bearer() {
+    owner_incarnation_during_mint(false, "owner-unchanged-during-mint@c.test").await;
+}
+
 #[tokio::test]
 async fn owner_diagnostic_records_audit_and_durable_notice_before_mint_without_data_reads() {
     use duduclaw_auth::{AccessLevel, UserDb, UserRole};

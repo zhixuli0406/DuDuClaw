@@ -170,6 +170,15 @@ async fn resolve_person_scoped(
         return Err(Refusal::hard("scope_missing", "這項操作不能取得 Google 權杖。"));
     }
     let owner_selected = gi::effective_for(home, Some(agent)).effective == Effective::DelegateOwner;
+    // Bind this request to the employee before resolving its attested owner.
+    // Re-attesting the same email must not authorize an older incarnation.
+    let owner_incarnation = if owner_selected {
+        Some(super::delegate_owner::incarnation(home, agent).ok_or_else(|| {
+            Refusal::hard("identity_changed", "負責人或信箱認證已變更，請管理員重新確認。")
+        })?)
+    } else {
+        None
+    };
     let eff = crate::google_identity::delegate_owner::effective_for(home, Some(agent));
     if matches!(eff.effective, Effective::Personal { .. }) {
         let outcome =
@@ -212,7 +221,12 @@ async fn resolve_person_scoped(
     };
     if owner_selected {
         let current = super::delegate_owner::effective_for(home, Some(agent));
-        if current != eff || gi::effective_for(home, Some(agent)).effective != Effective::DelegateOwner { return Err(Refusal::hard("identity_changed", "負責人或信箱認證已變更，請管理員重新確認。")); }
+        if current != eff
+            || gi::effective_for(home, Some(agent)).effective != Effective::DelegateOwner
+            || super::delegate_owner::incarnation(home, agent) != owner_incarnation
+        {
+            return Err(Refusal::hard("identity_changed", "負責人或信箱認證已變更，請管理員重新確認。"));
+        }
         requester_gate::check(current.requesters, requester, agent, &email, people)?;
     }
     match attempt {
