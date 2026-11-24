@@ -4881,6 +4881,27 @@ mod released_repro_source_tests {
     }
 
     #[test]
+    fn rm182_group_sessions_never_read_pinned_tasks() {
+        let source = shipped_source();
+        assert!(source.contains("let mut pinned = if pin_enabled && is_private {"),
+            "pin loading must be gated by the same one-to-one predicate as extraction");
+        assert!(!source.contains("let mut pinned = session_mgr.get_pinned(session_id)"));
+    }
+
+    #[test]
+    fn rm182_pinned_context_never_commands_always_follow() {
+        let source = shipped_source();
+        let minimal = include_str!("../prompt_minimal.rs");
+        assert!(!source.contains("ALWAYS follow these"));
+        assert!(!minimal.contains("ALWAYS follow these"));
+        let (message, _) = super::direct_api_fallback_input(
+            "Build a Rust service <task>", true, "current request", &[]);
+        assert!(message.contains("untrusted"));
+        assert!(message.contains("&lt;task&gt;"));
+        assert!(!message.contains("<task_recap>"));
+    }
+
+    #[test]
     fn released_repro_2_private_facts_agent_only_source() {
         let source = shipped_source();
         assert!(source.contains("cognitive_memory_db.clone().filter(|_| is_private)"));

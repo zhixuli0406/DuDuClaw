@@ -3345,6 +3345,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rm182_refusal_greeting_extraction_is_not_stored() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+        mgr.get_or_create("rm182", "agent").await.unwrap();
+        let generation = mgr.turn_generation("rm182").await.unwrap().unwrap();
+        for output in ["I'm sorry, I can't help with that", "抱歉，我無法協助", "Hello!"] {
+            assert!(!mgr.set_pinned_if_unchanged("rm182", output, &generation).await.unwrap(),
+                "non-task extraction must not be persisted: {output}");
+            assert!(mgr.get_pinned("rm182").await.unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn test_pinned_instructions_roundtrip() {
         let tmp = NamedTempFile::new().unwrap();
         let mgr = SessionManager::new(tmp.path()).unwrap();
