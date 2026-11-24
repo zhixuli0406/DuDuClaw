@@ -2,6 +2,19 @@
 //! (in-memory protected-key store; no keychain, no network).
 use super::*;
 
+#[test]
+fn owner_delegation_defaults_to_owner_only_and_external_name_is_bounded() {
+    let parse = super::super::google_identity_rpc::parse_identity_params;
+    let owner = parse(&json!({"identity":"delegate:owner"})).unwrap();
+    assert_eq!(owner["requesters"].as_str(), Some("owner_only"));
+    assert!(parse(&json!({"identity":"delegate:owner","fallback":"home"})).is_err());
+    assert!(parse(&json!({"identity":"delegate:owner","requesters":"anyone"})).is_err());
+    let external = parse(&json!({"identity":"external","external_server":"自訂 MCP"})).unwrap();
+    assert_eq!(external["external_server"].as_str(), Some("自訂 MCP"));
+    assert!(parse(&json!({"identity":"external","external_server":"字".repeat(121)})).is_err());
+    assert_eq!(crate::google_identity::resolve::refusal_for(&duduclaw_core::google_identity::Effective::External).unwrap().code, "external");
+}
+
 fn ok(frame: &WsFrame) -> Value {
     match frame {
         WsFrame::Response {

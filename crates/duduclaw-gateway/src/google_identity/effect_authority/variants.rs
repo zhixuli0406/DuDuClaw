@@ -150,7 +150,7 @@ fn check(deadline: tokio::time::Instant) -> Result<(), Refusal> {
 impl Prepared {
     pub(super) fn metadata(context: &GoogleCallContext, fallback: bool) -> Result<Self, Refusal> {
         let source = SourceSnapshot::capture(&context.home, &context.agent)?;
-        let effective = gi::effective_for(&context.home, Some(&context.agent));
+        let effective = crate::google_identity::delegate_owner::effective_for(&context.home, Some(&context.agent));
         let mut delegate_original = None;
         let mut fallback = fallback;
         if let gi::Effective::Delegate { email } = &effective.effective {
@@ -410,7 +410,7 @@ impl Prepared {
     ) -> Result<Self, Refusal> {
         check(deadline)?;
         context.validate()?;
-        let effective = gi::effective_for(&context.home, Some(&context.agent));
+        let effective = crate::google_identity::delegate_owner::effective_for(&context.home, Some(&context.agent));
         match &effective.effective {
             gi::Effective::Home => {
                 Self::home(context, deadline, false, PreflightOriginal::Home).await
@@ -520,7 +520,7 @@ impl Prepared {
             dep.validate()?;
         }
         if let Some((email, precheck_error)) = &self.delegate_original {
-            let policy = gi::effective_for(&context.home, Some(&context.agent));
+            let policy = crate::google_identity::delegate_owner::effective_for(&context.home, Some(&context.agent));
             if !matches!(&policy.effective,gi::Effective::Delegate{email:actual} if actual==email) {
                 return Err(changed());
             }

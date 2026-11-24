@@ -203,6 +203,8 @@ pub(crate) async fn push_guarded(
 /// approval buttons. Destinations come from this active user's verified
 /// links; token lookup and plain sending reuse the established DM path.
 pub(crate) async fn push_person_notice(home: &Path, user_id: &str, text: &str) {
+    #[cfg(test)]
+    person_notice_test::record(home, user_id, text);
     let Ok(Some(db)) = crate::decision_notify::open_user_db(home) else { return; };
     let Ok(Some(user)) = db.get_user(user_id) else { return; };
     if user.status != duduclaw_auth::UserStatus::Active { return; }
@@ -226,6 +228,22 @@ pub(crate) async fn push_person_notice(home: &Path, user_id: &str, text: &str) {
         } else {
             crate::install_notify::send_plain_text(home, &http, &link.channel, &link.channel_user_id, text).await;
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod person_notice_test {
+    use std::{path::{Path, PathBuf}, collections::HashMap, sync::{Mutex, OnceLock}};
+    type Notices = HashMap<PathBuf, Vec<(String, String)>>;
+    fn notices() -> &'static Mutex<Notices> {
+        static NOTICES: OnceLock<Mutex<Notices>> = OnceLock::new();
+        NOTICES.get_or_init(Default::default)
+    }
+    pub(crate) fn record(home: &Path, user: &str, text: &str) {
+        notices().lock().unwrap().entry(home.to_path_buf()).or_default().push((user.into(), text.into()));
+    }
+    pub(crate) fn take(home: &Path) -> Vec<(String, String)> {
+        notices().lock().unwrap().remove(home).unwrap_or_default()
     }
 }
 

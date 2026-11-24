@@ -37,8 +37,8 @@ fn sr4_host_lane_refuses_a_tenant_source_other_than_the_pinned_one() {
     let pinned = context(home.path()).pin_tenant(Some(pin.clone())).unwrap();
     assert!(pinned.check_tenant().is_ok());
     assert_eq!(pinned.assertion_scope().unwrap(), GMAIL_READ, "exactly the configured tenant scopes");
-    // Unpinned (non-isolated) lanes keep the full minted set.
-    assert_eq!(context(home.path()).assertion_scope().unwrap(), crate::google_workspace::REQUIRED_SCOPES.join(" "));
+    // Unpinned lanes request only this tool's service.
+    assert_eq!(context(home.path()).assertion_scope().unwrap(), crate::google_identity::delegated_scopes::for_tool(home.path(), "gmail_read").unwrap().join(" "));
 
     // `tenant_scopes` widened after the bridge decided: the host lane refuses
     // instead of deciding on its own re-read.

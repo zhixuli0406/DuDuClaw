@@ -64,6 +64,7 @@ export function MyConnectionsPage() {
       {!status.integration_enabled && <p className="text-sm text-warning">{t('myConnections.integrationOff')}</p>}
       {status.requires_login && <p className="text-sm text-warning">{t('myConnections.loginAgain')}</p>}
       <p className="text-xs text-muted-foreground">{t('myConnections.testing')}</p>
+      {status.chat_read && status.connection?.status === 'connected' && (!status.connection.local_purposes?.includes('chat_read') || !['chat.spaces.readonly', 'chat.messages.readonly'].every(scope => status.connection!.granted_scopes.includes(`https://www.googleapis.com/auth/${scope}`))) && <p role="status" className="text-sm text-warning">{t('myConnections.reconnectChat')}</p>}
       {status.chat_read && <p className="text-sm text-muted-foreground">{t('google.chatRead.hint')}</p>}
       <GoogleDataDisclosure confirmed={googleDataConfirmed} onConfirmedChange={setGoogleDataConfirmed}/>
       <Button disabled={busy||!status.client_configured||status.requires_login||!googleDataConfirmed} onClick={()=>void connect()}>{status.connection ? t('myConnections.reconnect') : t('myConnections.connect')}</Button>

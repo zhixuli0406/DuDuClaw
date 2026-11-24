@@ -12,6 +12,24 @@ const status: PersonalGoogleStatus = { connection: { owner_id: 'alice', account_
 beforeEach(() => { vi.restoreAllMocks(); vi.spyOn(api.personalGoogle,'status').mockResolvedValue(status); });
 
 describe('MyConnectionsPage', () => {
+  it('asks a connected member missing Chat scopes to reconnect', async () => {
+    vi.mocked(api.personalGoogle.status).mockResolvedValue({ ...status, chat_read: true });
+    renderWithProviders(<MyConnectionsPage />);
+    expect(await screen.findByText('Reconnect to add Google Chat.')).toBeInTheDocument();
+  });
+
+  it('does not ask for Chat again when both scopes and the purpose are present', async () => {
+    vi.mocked(api.personalGoogle.status).mockResolvedValue({ ...status, chat_read: true, connection: {
+      ...status.connection!, local_purposes: ['base', 'chat_read'], granted_scopes: [
+        'https://www.googleapis.com/auth/chat.spaces.readonly',
+        'https://www.googleapis.com/auth/chat.messages.readonly',
+      ],
+    } });
+    renderWithProviders(<MyConnectionsPage />);
+    await screen.findByText('other@gmail.com');
+    expect(screen.queryByText('Reconnect to add Google Chat.')).not.toBeInTheDocument();
+  });
+
   it('does not advertise employee Drive access from extra provider scopes alone', async () => {
     vi.mocked(api.personalGoogle.status).mockResolvedValue({...status, connection: {...status.connection!,
       local_purposes: ['base', 'meeting_recordings'],

@@ -72,7 +72,7 @@ async fn reused_google_mount_checks_each_real_requester_and_preserves_task_local
     home.ready("mount-bot", "mount-default@c.test", "");
     let (_, guard) = CURRENT_REQUESTER
         .scope(system(), async {
-            mcp_mount::GoogleMountGuard::prepare(home.p(), &home.p().join("agents/mount-bot")).await
+            mcp_mount::GoogleMountGuard::prepare(home.p(), &home.p().join("agents/mount-bot"), "https://gmailmcp.googleapis.com/mcp/v1").await
         })
         .await
         .unwrap();
@@ -131,7 +131,7 @@ async fn google_mount_refuses_changed_domain_sealed_key_and_selector_without_usi
     let home = Home::new();
     home.ready("mount-bot", "mount-live@c.test", "requesters='anyone'\n");
     let (token, guard) =
-        mcp_mount::GoogleMountGuard::prepare(home.p(), &home.p().join("agents/mount-bot"))
+        mcp_mount::GoogleMountGuard::prepare(home.p(), &home.p().join("agents/mount-bot"), "https://gmailmcp.googleapis.com/mcp/v1")
             .await
             .unwrap();
     assert_eq!(token, "tok:mount-live@c.test");
@@ -192,7 +192,7 @@ async fn actual_delegate_failure_uses_home_and_keeps_a_per_call_fallback_notice(
         home.p(), "home-mount-test-token", None,
     ).await;
     let (token, guard) =
-        mcp_mount::GoogleMountGuard::prepare(home.p(), &home.p().join("agents/mount-bot"))
+        mcp_mount::GoogleMountGuard::prepare(home.p(), &home.p().join("agents/mount-bot"), "https://gmailmcp.googleapis.com/mcp/v1")
             .await
             .unwrap();
     assert_eq!(token, "home-mount-test-token");
@@ -328,7 +328,7 @@ async fn personal_selectors_refuse_external_mount_even_with_anyone_and_available
         crate::mcp_oauth::google_home_test_fixture::connect(
             home.p(), "home-personal-boundary-token", None,
         ).await;
-        let result = CURRENT_REQUESTER.scope(system(), mcp_mount::GoogleMountGuard::prepare(home.p(), &home.p().join("agents/mount-bot"))).await;
+        let result = CURRENT_REQUESTER.scope(system(), mcp_mount::GoogleMountGuard::prepare(home.p(), &home.p().join("agents/mount-bot"), "https://gmailmcp.googleapis.com/mcp/v1")).await;
         let error = match result { Err(error) => error, Ok(_) => panic!("Personal identity yielded an external mount bearer") };
         assert_eq!(error.code, "no_verified_caller");
         assert!(!error.fallback_eligible);

@@ -268,6 +268,20 @@ pub async fn refresh(
     parse_tokens(response_json(response).await?)
 }
 
+/// Connection diagnostics use only OAuth metadata, never a Workspace API.
+pub(crate) async fn tokeninfo(access_token: &str, client_id: &str) -> Result<Vec<String>, Error> {
+    let response = client()?
+        .get(endpoint("https://oauth2.googleapis.com/tokeninfo"))
+        .query(&[("access_token", access_token)])
+        .send().await.map_err(|_| Error::Unavailable)?;
+    let value = response_json(response).await?;
+    if value.get("aud").and_then(serde_json::Value::as_str) != Some(client_id) {
+        return Err(Error::Unavailable);
+    }
+    let scopes = value.get("scope").and_then(serde_json::Value::as_str).ok_or(Error::Unavailable)?;
+    Ok(scopes.split_whitespace().map(str::to_owned).collect())
+}
+
 pub(crate) async fn refresh_scoped(
     client_id: &str,
     client_secret: &str,

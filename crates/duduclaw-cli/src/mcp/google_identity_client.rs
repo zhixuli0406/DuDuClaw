@@ -203,6 +203,12 @@ impl GoogleCaller {
         eff.tools_listed()
     }
 
+    pub(crate) fn disabled_message(&self, home: &Path) -> &'static str {
+        if effective_for(home, self.agent.as_deref()).effective == Effective::External {
+            "這位 AI 員工的 Google 由外部工具提供。"
+        } else { "這位 AI 員工設定為不使用 Google。" }
+    }
+
     fn record(&self, r: CallRecord) {
         *self.last.lock().unwrap_or_else(|p| p.into_inner()) = Some(r);
     }
@@ -221,7 +227,7 @@ impl GoogleCaller {
                     fallback: false,
                     notice: None,
                 });
-                gw::resolve_backend(home).await.map_err(local_google_auth_error)
+                gw::resolve_backend_for_tool(home, tool).await.map_err(local_google_auth_error)
             }
             Plan::Refuse(m) => {
                 duduclaw_gateway::egress_client::builtin_not_dispatched();
@@ -258,7 +264,7 @@ impl GoogleCaller {
                         fallback,
                         notice,
                     });
-                    gw::resolve_backend(home).await.map_err(local_google_auth_error)
+                    gw::resolve_backend_for_tool(home, tool).await.map_err(local_google_auth_error)
                 }
                 Err(m) => {
                     self.record(CallRecord {
@@ -288,13 +294,13 @@ impl GoogleCaller {
                     fallback: false,
                     notice: None,
                 });
-                gw::get_valid_google_token(home)
+                gw::get_valid_google_token_for_tool(home, tool)
                     .await
                     .map_err(local_google_auth_error)
             }
             _ => match self.backend(home, tool).await? {
                 GoogleBackend::Direct(t) => Ok(t),
-                GoogleBackend::AppsScript(_) => gw::get_valid_google_token(home)
+                GoogleBackend::AppsScript(_) => gw::get_valid_google_token_for_tool(home, tool)
                     .await
                     .map_err(local_google_auth_error),
             },
@@ -365,7 +371,7 @@ impl GoogleCaller {
 fn plan_of(eff: &Effective, agent: &str) -> Plan {
     match eff {
         Effective::Home => Plan::Home,
-        Effective::Delegate { .. } | Effective::Personal { .. } if !agent.is_empty() => {
+        Effective::Delegate { .. } | Effective::DelegateOwner | Effective::Personal { .. } if !agent.is_empty() => {
             Plan::Gateway {
                 agent: agent.to_string(),
             }
@@ -518,6 +524,7 @@ pub(crate) async fn status_header(home: &Path, caller: &GoogleCaller) -> (String
         Plan::Refuse(m) => (format!("目前代表：無法使用 — {m}\n"), false),
         Plan::Gateway { agent } => {
             let configured = match effective_for(home, Some(&agent)).effective {
+                Effective::DelegateOwner => "公司授權代表目前主要負責人（需要管理員認證）".into(),
                 Effective::Delegate { email } => format!("公司授權代表 {email}（網域委派）"),
                 Effective::Personal { selector } => match selector {
                     duduclaw_core::google_identity::Selector::Owner => {
@@ -548,6 +555,15 @@ pub(crate) async fn status_header(home: &Path, caller: &GoogleCaller) -> (String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_identity_hides_native_tools_and_refuses_dispatch() {
+        let home = home_with("bot", "[google]\nidentity='external'\nexternal_server='Partner MCP'\n");
+        let caller = GoogleCaller { agent: Some("bot".into()), ..Default::default() };
+        assert!(!caller.tools_listed(home.path()));
+        assert!(caller.disabled_message(home.path()).contains("由外部工具提供"));
+        assert!(matches!(plan_of(&Effective::External, "bot"), Plan::Refuse(message) if message.contains("由外部工具提供")));
+    }
 
     #[tokio::test]
     async fn dedicated_receipt_keeps_its_lane_when_employee_config_becomes_invalid() {

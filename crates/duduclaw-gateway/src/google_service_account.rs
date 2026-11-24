@@ -273,6 +273,9 @@ fn cache() -> &'static RwLock<HashMap<String, CachedToken>> {
 }
 
 fn cache_key(client_email: &str, subject: &str, scopes: &[&str]) -> String {
+    let mut scopes = scopes.to_vec();
+    scopes.sort_unstable();
+    scopes.dedup();
     format!("{client_email}|{subject}|{}", scopes.join(" "))
 }
 
@@ -679,6 +682,7 @@ subject = "boss@customer.com"
 
     #[test]
     fn cache_key_separates_scopes_and_subjects() {
+        assert_eq!(cache_key("sa", "a@c.com", &["y", "x", "x"]), cache_key("sa", "a@c.com", &["x", "y"]));
         assert_ne!(cache_key("sa", "a@c.com", &["x"]), cache_key("sa", "a@c.com", &["x", "y"]));
         assert_ne!(cache_key("sa", "a@c.com", &["x"]), cache_key("sa", "b@c.com", &["x"]));
     }

@@ -336,7 +336,7 @@ impl SelectionStore {
         clock: Clock,
     ) -> Result<Option<GoogleSelectionStamp>, Refusal> {
         live_key(home, agent, reference, tool)?;
-        match gi::effective_for(home, Some(agent)).effective {
+        match crate::google_identity::delegate_owner::effective_for(home, Some(agent)).effective {
             gi::Effective::Home | gi::Effective::Delegate { .. } => return Ok(None),
             gi::Effective::Personal { .. } => {}
             other => {
@@ -395,7 +395,7 @@ impl SelectionStore {
     ) -> Result<Option<GoogleSelectionStamp>, Refusal> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(18);
         live_key(home, agent, reference, tool)?;
-        match gi::effective_for(home, Some(agent)).effective {
+        match crate::google_identity::delegate_owner::effective_for(home, Some(agent)).effective {
             gi::Effective::Home | gi::Effective::Delegate { .. } => return Ok(None),
             gi::Effective::Personal { .. } => {}
             other => {

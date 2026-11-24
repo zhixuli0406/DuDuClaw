@@ -211,7 +211,7 @@ impl GoogleIsolationBridge {
         super::credential_registry::authorize(&self.home, &self.reference, &self.agent, tool)
             .map_err(|_| VerificationError::BindingMismatch)?;
         if !crate::google_workspace::integration_enabled(&self.home) { return Err(VerificationError::Unavailable); }
-        let effective = gi::effective_for(&self.home, Some(&self.agent));
+        let effective = crate::google_identity::delegate_owner::effective_for(&self.home, Some(&self.agent));
         let people = super::requester_gate::people_for(&self.home, self.users.as_ref());
         let route = match &effective.effective {
             Effective::Personal { .. } => {

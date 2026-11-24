@@ -249,7 +249,7 @@ fn status_metadata(
     if !crate::google_workspace::integration_enabled(&state.home) {
         return Err(Refusal::hard("disabled", "管理員尚未開啟 Google 整合。"));
     }
-    let effective = gi::effective_for(&state.home, Some(agent));
+    let effective = crate::google_identity::delegate_owner::effective_for(&state.home, Some(agent));
     let people = people_for(&state.home, state.users.as_ref());
     match &effective.effective {
         Effective::Personal { .. } => {

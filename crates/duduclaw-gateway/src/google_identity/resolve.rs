@@ -9,7 +9,7 @@
 //!            → colleague with that email still active    F
 //!            → protection gate (B2c)            hard
 //!            → sealed key                        missing F / unreadable hard
-//!            → mint (sub = email, all scopes)    rejected / unreachable F
+//!            → mint (sub = email, service scopes)    rejected / unreachable F
 //! F + `fallback = "home"` ⇒ UseHome with a notice; otherwise the refusal.
 //! ```
 
@@ -21,7 +21,7 @@ use duduclaw_knowledge::requester::RequesterIdentity;
 use super::requester_gate::{self, People};
 use super::{Fallback, Refusal, delegation_key};
 use crate::google_service_account::{self as sa, CacheMode, MintedToken, ServiceAccountError};
-use crate::google_workspace::REQUIRED_SCOPES;
+
 
 /// What the caller should use.
 #[derive(Debug)]
@@ -48,6 +48,8 @@ pub enum Resolved {
 pub fn refusal_for(effective: &Effective) -> Option<Refusal> {
     match effective {
         Effective::Home | Effective::Delegate { .. } | Effective::Personal { .. } => None,
+        Effective::DelegateOwner => Some(Refusal::hard("attestation_required", "請管理員確認目前負責人的信箱並重新認證。")),
+        Effective::External => Some(Refusal::hard("external", "這位 AI 員工的 Google 由外部工具提供。")),
         Effective::Disabled => Some(Refusal::hard(
             "disabled",
             "這位 AI 員工設定為不使用 Google。",
@@ -144,8 +146,10 @@ pub async fn resolve_person(
     agent: &str,
     requester: &RequesterIdentity,
     people: &dyn People,
+    endpoint: &str,
 ) -> Result<Resolved, Refusal> {
-    resolve_person_for_tool(home, agent, requester, people, "google_remote_mcp").await
+    let scopes = super::delegated_scopes::for_endpoint(home, endpoint)?;
+    resolve_person_scoped(home, agent, requester, people, "google_remote_mcp", Some(scopes)).await
 }
 
 pub async fn resolve_person_for_tool(
@@ -155,10 +159,18 @@ pub async fn resolve_person_for_tool(
     people: &dyn People,
     tool: &str,
 ) -> Result<Resolved, Refusal> {
+    resolve_person_scoped(home, agent, requester, people, tool, None).await
+}
+
+async fn resolve_person_scoped(
+    home: &Path, agent: &str, requester: &RequesterIdentity, people: &dyn People,
+    tool: &str, endpoint_scopes: Option<&[&str]>,
+) -> Result<Resolved, Refusal> {
     if !crate::google_personal::scopes::token_tool(tool) {
         return Err(Refusal::hard("scope_missing", "這項操作不能取得 Google 權杖。"));
     }
-    let eff = gi::effective_for(home, Some(agent));
+    let owner_selected = gi::effective_for(home, Some(agent)).effective == Effective::DelegateOwner;
+    let eff = crate::google_identity::delegate_owner::effective_for(home, Some(agent));
     if matches!(eff.effective, Effective::Personal { .. }) {
         let outcome =
             crate::google_personal::access::resolve(home, agent, requester, people, &eff, tool)
@@ -195,9 +207,14 @@ pub async fn resolve_person_for_tool(
     };
     requester_gate::check(eff.requesters, requester, agent, &email, people)?;
     let attempt = match precheck(home, &email, people) {
-        Ok(()) => mint_delegate(home, &email, REQUIRED_SCOPES, CacheMode::Use).await,
+        Ok(()) => mint_delegate(home, &email, match endpoint_scopes { Some(scopes) => scopes, None => super::delegated_scopes::for_tool(home, tool)? }, CacheMode::Use).await,
         Err(r) => Err(r),
     };
+    if owner_selected {
+        let current = super::delegate_owner::effective_for(home, Some(agent));
+        if current != eff || gi::effective_for(home, Some(agent)).effective != Effective::DelegateOwner { return Err(Refusal::hard("identity_changed", "負責人或信箱認證已變更，請管理員重新確認。")); }
+        requester_gate::check(current.requesters, requester, agent, &email, people)?;
+    }
     match attempt {
         Ok(token) => Ok(Resolved::Delegated { email, token }),
         Err(r) if r.fallback_eligible && eff.fallback == Fallback::Home => Ok(Resolved::UseHome {

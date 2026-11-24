@@ -1,4 +1,11 @@
 {
+  "agentConnections.identity.external": "外部ツールで提供",
+  "agentConnections.externalServer": "外部サーバー名（任意、120 文字まで）",
+  "agentConnections.choice.delegateOwner": "組織の承認：担当者に連動",
+  "agentConnections.identity.delegateOwner": "現在の担当者を代理する組織の承認：{email}",
+  "agentConnections.delegateOwnerHint": "管理者が Google 連携ページで現在の担当者とログインメールを確認してください。担当者やメールの変更後は再確認が必要です。",
+  "myConnections.reconnectChat": "Google Chat を追加するには再接続してください。",
+  "google.wizard.saveChat": "Chat 読み取り設定を保存",
   "agents.runtime.idleTimeout": "進展なしの制限時間（秒）",
   "agents.runtime.idleTimeout.hint": "空欄は全体設定を継承。0 は無効、それ以外は 60 秒から全体上限まで。延長や無効化には管理者権限が必要です。Claude と Codex はイベントで進展を判定します。",
   "settings.limits.default_idle_timeout_secs": "進展なしの既定制限時間（秒）",

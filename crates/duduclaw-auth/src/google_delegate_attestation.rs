@@ -178,6 +178,20 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
                 .map_err(failed)?;
         }
     }
+    conn.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS google_attestation_owner_insert AFTER INSERT ON user_agent_bindings
+         WHEN NEW.access_level = 'owner' BEGIN
+           DELETE FROM google_delegate_attestations WHERE agent_id = NEW.agent_name;
+         END;
+         CREATE TRIGGER IF NOT EXISTS google_attestation_owner_update AFTER UPDATE OF access_level, is_primary, user_id, agent_name ON user_agent_bindings
+         WHEN OLD.access_level = 'owner' OR NEW.access_level = 'owner' BEGIN
+           DELETE FROM google_delegate_attestations WHERE agent_id IN (OLD.agent_name, NEW.agent_name);
+         END;
+         CREATE TRIGGER IF NOT EXISTS google_attestation_owner_delete AFTER DELETE ON user_agent_bindings
+         WHEN OLD.access_level = 'owner' BEGIN
+           DELETE FROM google_delegate_attestations WHERE agent_id = OLD.agent_name;
+         END;"
+    ).map_err(failed)?;
     Ok(())
 }
 
@@ -248,6 +262,16 @@ impl UserDb {
     /// has checked role, MFA and step-up).
     pub fn attest_google_delegate(&self, request: &AttestationRequest<'_>, email_matches: &dyn Fn(&str) -> bool,
         attested_by: &str) -> Result<Attested, String> {
+        self.attest_google_delegate_inner(request, email_matches, attested_by, false)
+    }
+
+    pub fn attest_google_delegate_owner(&self, request: &AttestationRequest<'_>, email_matches: &dyn Fn(&str) -> bool,
+        attested_by: &str) -> Result<Attested, String> {
+        self.attest_google_delegate_inner(request, email_matches, attested_by, true)
+    }
+
+    fn attest_google_delegate_inner(&self, request: &AttestationRequest<'_>, email_matches: &dyn Fn(&str) -> bool,
+        attested_by: &str, require_owner: bool) -> Result<Attested, String> {
         let AttestationRequest { agent_id, employee_id, employee_incarnation, subject, user_id: shown,
             acknowledge_self_set } = *request;
         if agent_id.is_empty() || subject.is_empty() || attested_by.is_empty() || shown.is_empty()
@@ -259,6 +283,15 @@ impl UserDb {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| format!("attestation: {e}"))?;
+        if require_owner {
+            let selected: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM user_agent_bindings b WHERE b.agent_name = ?1
+                 AND b.user_id = ?2 AND b.access_level = 'owner' AND (b.is_primary = 1 OR
+                 (SELECT COUNT(*) FROM user_agent_bindings WHERE agent_name = ?1 AND access_level = 'owner') = 1))",
+                params![agent_id, shown], |row| row.get(0),
+            ).map_err(|e| format!("attestation owner: {e}"))?;
+            if !selected { return Err(HOLDER_MISMATCH.into()); }
+        }
         let holders: Vec<(String, String, String, String)> = {
             let mut statement = tx
                 .prepare("SELECT id, email, status, display_name FROM users")
@@ -606,7 +639,8 @@ mod tests {
     fn sr4r3_migration_keeps_rows_without_employee() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "CREATE TABLE google_delegate_attestations (agent_id TEXT PRIMARY KEY, subject TEXT NOT NULL,
+            "CREATE TABLE user_agent_bindings (agent_name TEXT, user_id TEXT, access_level TEXT, is_primary INTEGER);
+             CREATE TABLE google_delegate_attestations (agent_id TEXT PRIMARY KEY, subject TEXT NOT NULL,
                 user_id TEXT NOT NULL, email_at_attestation TEXT NOT NULL, credential_seq INTEGER NOT NULL,
                 attested_by TEXT NOT NULL, attested_at TEXT NOT NULL);
              INSERT INTO google_delegate_attestations VALUES ('bot','a@customer.com','u','a@customer.com',0,'admin','t');",

@@ -300,7 +300,7 @@ pub async fn load_external_mcp_servers_resolved(
 ) -> Vec<ExternalMcpServer> {
     let agent = agent_dir.file_name().and_then(|s| s.to_str()).unwrap_or("");
     let personal = matches!(
-        duduclaw_core::google_identity::effective_for(home_dir, Some(agent)).effective,
+        crate::google_identity::delegate_owner::effective_for(home_dir, Some(agent)).effective,
         duduclaw_core::google_identity::Effective::Personal { .. }
             | duduclaw_core::google_identity::Effective::Home
             | duduclaw_core::google_identity::Effective::Delegate { .. }
@@ -359,74 +359,33 @@ pub async fn load_external_mcp_servers_resolved(
             })
             .collect();
     }
-    let has_google = servers
-        .iter()
-        .any(|s| s.bearer_token.as_deref() == Some(OAUTH_GOOGLE_REF));
-    let prepared = if has_google {
-        Some(
-            crate::google_identity::mcp_mount::GoogleMountGuard::prepare(home_dir, agent_dir).await,
-        )
-    } else {
-        None
-    };
-    let mut token = None;
-    if let Some(prepared) = prepared {
-        match prepared {
-            Ok((bearer, guard)) => {
-                token = Some(bearer);
-                // Only HTTP uses bearer_token. A stdio child's independent
-                // credentials must never be described as this person's.
-                servers.retain(|server| {
-                    let unusable = guard.is_person_identity()
-                        && server.url.is_none()
-                        && server.bearer_token.as_deref() == Some(OAUTH_GOOGLE_REF);
-                    if unusable {
-                        tracing::warn!(
-                            "person Google MCP needs HTTP bearer transport — skipping stdio mount"
-                        );
-                    }
-                    !unusable
-                });
-                for server in &mut servers {
-                    if server.bearer_token.as_deref() == Some(OAUTH_GOOGLE_REF) {
-                        server.bearer_token = None;
-                        server.google_guard = Some(guard.clone());
-                    }
+    let mut resolved = Vec::new();
+    for mut server in servers {
+        let prepared = if server.bearer_token.as_deref() == Some(OAUTH_GOOGLE_REF) {
+            let Some(endpoint) = server.url.as_deref() else { continue; };
+            match crate::google_identity::mcp_mount::GoogleMountGuard::prepare(home_dir, agent_dir, endpoint).await {
+                Ok((token, guard)) => {
+                    server.bearer_token = None;
+                    server.google_guard = Some(guard);
+                    Some(token)
+                }
+                Err(error) => {
+                    tracing::warn!(code = error.code, "employee Google MCP identity unavailable — skipping mount");
+                    duduclaw_security::audit::append_tool_call_with_extras(home_dir, agent, "google_mcp_mount",
+                        "Google mount refused", false, &[("reason", serde_json::json!(error.code))]);
+                    continue;
                 }
             }
-            Err(error) => {
-                tracing::warn!(
-                    code = error.code,
-                    "employee Google MCP identity unavailable — skipping mounts"
-                );
-                let agent = agent_dir
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .filter(|id| duduclaw_core::is_valid_agent_id(id))
-                    .unwrap_or("unknown");
-                duduclaw_security::audit::append_tool_call_with_extras(
-                    home_dir,
-                    agent,
-                    "google_mcp_mount",
-                    "Google mount refused",
-                    false,
-                    &[("reason", serde_json::json!(error.code))],
-                );
-                servers.retain(|s| s.bearer_token.as_deref() != Some(OAUTH_GOOGLE_REF));
-            }
+        } else { None };
+        // Resolve configuration references before inserting provider material.
+        // Each mount gets only its own service's token, never a sibling's.
+        let mut entries = resolve_secret_refs_for(vec![server], home_dir, false).await;
+        if let Some(token) = prepared {
+            for entry in &mut entries { entry.bearer_token = Some(token.clone()); }
         }
+        resolved.extend(entries);
     }
-    // Resolve other secret refs first. A provider's opaque access token must
-    // never be reinterpreted as a `secret://` configuration instruction.
-    let mut servers = resolve_secret_refs_for(servers, home_dir, false).await;
-    if let Some(token) = token {
-        for server in &mut servers {
-            if server.google_guard.is_some() {
-                server.bearer_token = Some(token.clone());
-            }
-        }
-    }
-    servers
+    resolved
 }
 
 /// Resolve a security-relevant tool-filter list (`allowed_tools`/`denied_tools`).
@@ -1190,7 +1149,7 @@ impl ExternalGoogleMountEntry {
         {
             return None;
         }
-        let effective = duduclaw_core::google_identity::effective_for(&home, Some(&agent));
+        let effective = crate::google_identity::delegate_owner::effective_for(&home, Some(&agent));
         if !matches!(
             &effective.effective,
             duduclaw_core::google_identity::Effective::Personal { .. }
@@ -1225,7 +1184,7 @@ impl ExternalGoogleMountEntry {
             && self.dir.canonicalize().ok().as_ref() == Some(&self.dir)
             && self.home.join("agents").canonicalize().ok().as_deref() == self.dir.parent()
             && mount_stamp(&self.dir.join("agent.toml")).as_ref() == Some(&self.stamp)
-            && duduclaw_core::google_identity::effective_for(&self.home, Some(&self.agent))
+            && crate::google_identity::delegate_owner::effective_for(&self.home, Some(&self.agent))
                 == self.effective
     }
     pub(crate) fn home(&self) -> &Path {

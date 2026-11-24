@@ -11,7 +11,7 @@ use duduclaw_knowledge::requester::RequesterIdentity;
 use serde_json::{Value, json};
 
 use super::requester_gate::{NoPeople, People, Person};
-use super::resolve::{Resolved, resolve_person};
+use super::resolve::Resolved;
 use super::*;
 
 #[path = "execute_tests.rs"]
@@ -158,6 +158,7 @@ async fn closed_refresh_endpoint(
     token_endpoint(headers, axum::Form(form)).await
 }
 async fn gmail_profile(headers: axum::http::HeaderMap) -> axum::Json<Value> {
+    service_reads().lock().unwrap().push((fixture_account(&headers), "gmail/profile".into()));
     let bearer = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -179,6 +180,14 @@ async fn ok_json() -> axum::Json<Value> {
 fn service_reads() -> &'static Mutex<Vec<(String, String)>> {
     static READS: OnceLock<Mutex<Vec<(String, String)>>> = OnceLock::new();
     READS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+pub(crate) fn start_data_endpoint_probe() {
+    mock();
+}
+
+pub(crate) fn data_endpoint_reads_for(token: &str) -> usize {
+    service_reads().lock().unwrap().iter().filter(|(account, _)| account == token).count()
 }
 
 async fn service_endpoint(
@@ -430,7 +439,7 @@ async fn resolve(
     req: &RequesterIdentity,
     people: &dyn People,
 ) -> Result<Resolved, Refusal> {
-    resolve_person(home.p(), agent, req, people).await
+    super::resolve::resolve_person_for_tool(home.p(), agent, req, people, "gmail_read").await
 }
 
 fn code(r: Result<Resolved, Refusal>) -> &'static str {
@@ -466,7 +475,7 @@ async fn home_and_absent_sections_stay_on_the_home_path() {
 }
 
 #[tokio::test]
-async fn delegate_mints_with_the_configured_subject_and_all_scopes() {
+async fn delegate_mints_with_the_configured_subject_and_service_scopes() {
     let home = Home::new();
     home.ready("bot", "alice.l2@c.test", "requesters='anyone'\n");
     let r = resolve(&home, "bot", &RequesterIdentity::Unknown, &NoPeople)
@@ -486,8 +495,27 @@ async fn delegate_mints_with_the_configured_subject_and_all_scopes() {
     assert_eq!(seen[0].iss, "duduclaw@proj.iam.gserviceaccount.test");
     assert_eq!(
         seen[0].scope,
-        crate::google_workspace::REQUIRED_SCOPES.join(" ")
+        super::delegated_scopes::for_tool(home.p(), "gmail_read").unwrap().join(" ")
     );
+}
+
+#[tokio::test]
+async fn delegate_cache_separates_services_and_chat_requires_the_switch() {
+    let home = Home::new();
+    home.ready("scope-bot", "scoped-cache@c.test", "requesters='anyone'\n");
+    for tool in ["gmail_read", "gmail_search", "sheets_read"] {
+        super::resolve::resolve_person_for_tool(home.p(), "scope-bot", &RequesterIdentity::Unknown, &NoPeople, tool).await.unwrap();
+    }
+    let requests = seen_for("scoped-cache@c.test");
+    assert_eq!(requests.len(), 2, "Gmail reuses its token; Sheets gets another scope set");
+    assert_eq!(requests[0].scope, super::delegated_scopes::for_tool(home.p(), "gmail_read").unwrap().join(" "));
+    assert_eq!(requests[1].scope, super::delegated_scopes::for_tool(home.p(), "sheets_read").unwrap().join(" "));
+    assert!(super::resolve::resolve_person_for_tool(home.p(), "scope-bot", &RequesterIdentity::Unknown, &NoPeople, "google_chat_messages").await.is_err());
+    assert_eq!(seen_for("scoped-cache@c.test").len(), 2);
+    let config = std::fs::read_to_string(home.p().join("config.toml")).unwrap();
+    std::fs::write(home.p().join("config.toml"), format!("{config}\n[google]\nchat_read=true\n")).unwrap();
+    super::resolve::resolve_person_for_tool(home.p(), "scope-bot", &RequesterIdentity::Unknown, &NoPeople, "google_chat_messages").await.unwrap();
+    assert_eq!(seen_for("scoped-cache@c.test").last().unwrap().scope, crate::google_workspace::CHAT_READ_SCOPES.join(" "));
 }
 
 #[tokio::test]
@@ -865,10 +893,11 @@ async fn identity_test_reports_each_check_and_sends_nothing() {
     let (email, steps) = check::run(home.p(), "bot", &NoPeople).await;
     assert_eq!(email.as_deref(), Some("check@c.test"));
     assert!(steps.iter().all(|s| s.ok), "{steps:?}");
-    let ids: Vec<&str> = steps.iter().map(|s| s.id).collect();
+    let ids: Vec<&str> = steps.iter().map(|s| s.id.as_str()).collect();
     assert!(ids.contains(&"identity_match") && ids.contains(&"gmail") && ids.contains(&"tasks"));
-    // Full list once, then one mint per service (8) — all fresh (cache bypassed).
-    assert_eq!(seen_for("check@c.test").len(), 9);
+    // Each scope is checked independently; no request contains unrelated services.
+    assert!(steps.iter().any(|s| s.id == "scope:https://www.googleapis.com/auth/gmail.compose"));
+    assert!(seen_for("check@c.test").iter().all(|request| !request.scope.contains("chat.")));
     let urls: Vec<String> = service_reads()
         .lock()
         .unwrap()
@@ -896,7 +925,7 @@ async fn identity_test_reports_each_check_and_sends_nothing() {
 
     home.agent("ua", "[google]\nidentity='delegate:unauth-check@c.test'\n");
     let (_, steps) = check::run(home.p(), "ua", &NoPeople).await;
-    assert_eq!(steps.last().unwrap().id, "authorize");
+    assert!(steps.iter().any(|s| s.id.starts_with("scope:") && !s.ok));
     assert!(!steps.last().unwrap().ok);
 }
 

@@ -69,6 +69,7 @@ fn provider() {
             runtime.block_on(async move {
                 let router = Router::new()
                     .route("/oauth2.googleapis.com/token", post(token))
+                    .route("/oauth2.googleapis.com/tokeninfo", get(diagnostic_tokeninfo))
                     .route("/h1-owned-google-home-token", post(bound_home_token))
                     .route("/openidconnect.googleapis.com/v1/userinfo", get(info))
                     .route("/oauth2.googleapis.com/revoke", post(revoke));
@@ -88,6 +89,10 @@ async fn token(
             StatusCode::BAD_REQUEST,
             Json(json!({"error":"invalid_grant"})),
         );
+    }
+    if let Some(client) = form.get("client_id").filter(|client| client.starts_with("diagnostic-")) {
+        diagnostic_requests().lock().unwrap().entry(client.clone()).or_default().push("refresh".into());
+        return (StatusCode::OK, Json(json!({"access_token":client,"expires_in":3600,"token_type":"Bearer"})));
     }
     let who = form.get("code").map(String::as_str).unwrap_or("alice");
     if let Some(delay) = delay_for(who) {
@@ -1236,5 +1241,52 @@ async fn google_chat_opt_in_scopes_require_requested_and_actual_consent() {
         for tool in ["google_chat_spaces", "google_chat_messages"] {
             assert_eq!(scopes::permitted_for(tool, &record.metadata), permitted);
         }
+    }
+}
+
+// This mock accepts only the two OAuth metadata operations used by Admin tests.
+fn diagnostic_requests() -> &'static std::sync::Mutex<std::collections::HashMap<String, Vec<String>>> {
+    static REQUESTS: OnceLock<std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>> = OnceLock::new();
+    REQUESTS.get_or_init(Default::default)
+}
+async fn diagnostic_tokeninfo(axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>) -> Json<Value> {
+    let token = query.get("access_token").unwrap();
+    diagnostic_requests().lock().unwrap().entry(token.clone()).or_default().push("tokeninfo".into());
+    Json(json!({"aud":token,"scope":"openid email https://www.googleapis.com/auth/gmail.readonly"}))
+}
+
+#[tokio::test]
+async fn administrator_personal_test_uses_only_oauth_metadata_and_notifies_the_member() {
+    crate::google_identity::start_data_endpoint_probe();
+    for selector in ["owner", "user"] {
+        let f = Fixture::new();
+        f.connect().await;
+        f.db.set_google_consent(&f.alice.id, "bot", true, &f.alice.id).unwrap();
+        let identity = if selector == "user" { format!("user:{}", f.alice.id) } else { "owner".into() };
+        std::fs::write(f.home.join("agents/bot/agent.toml"), format!("[agent]\nname='bot'\n[google]\nidentity='{identity}'\n")).unwrap();
+        let client_id = format!("diagnostic-{}", uuid::Uuid::new_v4());
+        let mut client = crate::mcp_oauth::get_client_config(&f.home, "google").unwrap();
+        client.client_id = client_id.clone();
+        crate::mcp_oauth::upsert_client_config(&f.home, client).unwrap();
+        let key = crate::google_identity::protection_gate(&f.home).unwrap();
+        let record = vault::get(&f.home, &f.alice.id).unwrap().unwrap();
+        let secret = vault::unseal(&key, &record).unwrap();
+        let mut metadata = record.metadata;
+        metadata.oauth_client_id = client_id.clone();
+        let epoch = vault::begin_connection(&f.home, &f.alice.id).unwrap();
+        vault::connect(&f.home, &key, metadata, &secret, epoch).unwrap();
+        let admin = f.db.create_user("admin@c.test", "Admin", "fixture-password", UserRole::Admin).unwrap();
+        let handler = crate::handlers::MethodHandler::new(f.home.clone()).await;
+        handler.set_user_db(f.db.clone(), Arc::new(duduclaw_auth::JwtConfig::new(b"diagnostic-fixture-signing-key-only"))).await;
+        let ctx = f.db.live_user_context(&admin.id).unwrap().unwrap();
+        let result = handler.handle("google.identity.test", json!({"agent_id":"bot", "subject":"attacker@c.test"}), &ctx).await;
+        let crate::protocol::WsFrame::Response { ok: true, payload: Some(result), .. } = result else { panic!("expected diagnostic response"); };
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(diagnostic_requests().lock().unwrap().remove(&client_id).unwrap(), ["refresh", "tokeninfo"]);
+        assert_eq!(crate::google_identity::data_endpoint_reads_for(&client_id), 0, "personal diagnostics must never read a Workspace data endpoint");
+        let audit = std::fs::read_to_string(f.home.join("security_audit.jsonl")).unwrap();
+        assert!(audit.contains("google_personal_identity_test") && audit.contains(&admin.id) && audit.contains(&f.alice.id));
+        let notices = crate::notify_push::person_notice_test::take(&f.home);
+        assert!(notices.iter().any(|(user, text)| user == &f.alice.id && text.contains("管理員測試")));
     }
 }

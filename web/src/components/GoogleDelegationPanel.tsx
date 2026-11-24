@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { AlertTriangle, Check, Copy, Loader2, Upload, Users } from 'lucide-react';
 import { useNavigate } from 'react-router';
+import { DelegateAttestationCard } from '@/pages/protected/DelegateAttestationCard';
+import { StepUpProvider } from '@/pages/protected/step-up';
 import { api, type GoogleDelegationStatus } from '@/lib/api';
 import { toast } from '@/lib/toast';
 import { Badge, Button, Card, CardContent, CardHeader, CardTitle, Input, Separator } from '@/components/mds';
@@ -70,7 +72,7 @@ export function GoogleDelegationPanel() {
 
   if (!status) return null;
   const protectionOk = status.protection.person_identity_allowed;
-  const delegates = status.agents.filter((a) => a.kind === 'delegate');
+  const delegates = status.agents.filter((a) => a.kind === 'delegate' || a.kind === 'delegate_owner');
 
   return (
     <Card data-testid="google-delegation">
@@ -215,6 +217,7 @@ export function GoogleDelegationPanel() {
                   >
                     {a.agent_id}
                   </button>
+                  {a.kind === 'delegate_owner' && a.selected_person && <span>{a.selected_person.name}</span>}
                   <span className="font-mono text-xs text-muted-foreground">{a.email}</span>
                   {a.state === 'ready' ? (
                     <Badge className="bg-success/15 text-success">{t('agentConnections.state.ready')}</Badge>
@@ -227,6 +230,7 @@ export function GoogleDelegationPanel() {
             </ul>
           )}
         </div>
+        <StepUpProvider google><DelegateAttestationCard agents={status.agents.filter(a => a.kind === 'delegate_owner')} onChanged={load} /></StepUpProvider>
       </CardContent>
     </Card>
   );

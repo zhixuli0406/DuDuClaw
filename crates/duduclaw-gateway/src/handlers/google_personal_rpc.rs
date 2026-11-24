@@ -181,7 +181,7 @@ impl MethodHandler {
         let mut delegated = Vec::new();
         for agent in registry.list() {
             let name = &agent.config.agent.name;
-            let effective = gi::effective_for(&self.home_dir, Some(name));
+            let effective = crate::google_identity::delegate_owner::effective_for(&self.home_dir, Some(name));
             match &effective.effective {
                 Effective::Personal { selector } => {
                     let selected = access::select_user(db, name, selector);

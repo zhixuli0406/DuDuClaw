@@ -26,7 +26,7 @@
 //!   label; a recreated or restored employee needs a fresh one.
 //!
 //! Authority exactly like `google.delegation.tenant_settings_set`:
-//! dashboard-only, Enterprise-only, protected mode only, Admin re-read from
+//! dashboard-only, Admin re-read from
 //! users.db (`mfa_require_current_admin`), `system` refused, and the migration
 //! step-up proof (password + TOTP, five minutes, bound to this session and
 //! credential epoch) with its CSRF token, re-checked on the blocking pool just
@@ -42,7 +42,6 @@ use crate::google_identity::tenant_source;
 
 const NOT_ALLOWED: &str = "不允許此操作。";
 const ADMIN_REQUIRED: &str = "請以管理員帳號重新登入後再操作。";
-const NOT_PROTECTED: &str = "這個環境未啟用受保護模式；代表同仁的確認只在受保護模式使用。";
 const USERS_UNAVAILABLE: &str = "無法讀取帳號資料，或有無法辨識的登入 email，已拒絕確認。";
 const REQUEST_INVALID: &str = "請提供員工、要確認的信箱與驗證權杖。";
 const NOT_SHARED: &str = "只有受保護模式的共用員工可以設定代表同仁；個人專屬員工不使用公司授權代表。";
@@ -55,7 +54,7 @@ const MAX_USER_ID: usize = 128;
 
 /// What the Admin confirms (reply + docs), naming the listed person.
 pub(crate) fn attestation_copy(subject: &str, name: &str) -> String {
-    format!("管理員確認：{subject} 是「{name}」本人的信箱。AI 員工只會在「{name}」本人提出請求時，代表本人使用 Google；\
+    format!("管理員確認：{subject} 是「{name}」本人的信箱。AI 員工會依發問者限制，代表「{name}」使用 Google；\
         「{name}」變更登入 email 後，這份確認會自動失效，需要重新確認。")
 }
 
@@ -105,7 +104,14 @@ pub(crate) fn attest_subject(home: &Path, db: &UserDb, request: &Attest<'_>, emp
     let gi::SectionRead::Present(section) = gi::read_agent_section(home, agent) else {
         return Err(NOT_DELEGATE.into());
     };
-    if !matches!(&section.identity, Some(gi::Selector::Delegate(configured)) if *configured == subject) {
+    let follows_owner = section.identity == Some(gi::Selector::DelegateOwner);
+    if follows_owner {
+        let owner = crate::google_identity::delegate_owner::owner(db, agent).map_err(|r| r.message_zh)?;
+        if owner.id != request.user_id || gi::normalize_email(&owner.email).ok().as_deref() != Some(subject.as_str()) {
+            return Err(duduclaw_auth::google_delegate_attestation::HOLDER_MISMATCH.into());
+        }
+    }
+    if !follows_owner && !matches!(&section.identity, Some(gi::Selector::Delegate(configured)) if *configured == subject) {
         return Err(NOT_DELEGATE.into());
     }
     let config = gi::read_home_config(home).map_err(|_| CONFIG_UNREADABLE.to_owned())?;
@@ -114,10 +120,15 @@ pub(crate) fn attest_subject(home: &Path, db: &UserDb, request: &Attest<'_>, emp
     tenant_source::subject_accounts(db, agent, Some(employee), &subject).map_err(|_| USERS_UNAVAILABLE.to_owned())?;
     let matches = |email: &str| tenant_source::stored_email(email).ok().flatten().as_deref() == Some(subject.as_str());
     let employee_id = hex::encode(employee.0.0);
-    let attested = db.attest_google_delegate(&AttestationRequest {
+    let attestation_request = AttestationRequest {
         agent_id: agent, employee_id: &employee_id, employee_incarnation: employee.1, subject: &subject,
         user_id: request.user_id, acknowledge_self_set: request.acknowledge_self_set,
-    }, &matches, actor)?;
+    };
+    let attested = if follows_owner {
+        db.attest_google_delegate_owner(&attestation_request, &matches, actor)?
+    } else {
+        db.attest_google_delegate(&attestation_request, &matches, actor)?
+    };
     Ok(json!({
         "agent_id": agent,
         "subject": subject,
@@ -156,7 +167,6 @@ impl MethodHandler {
             return Err(ADMIN_REQUIRED.into());
         }
         let session = crate::google_personal::session_for(&ctx.user_id).map_err(|_| ADMIN_REQUIRED)?;
-        if !crate::runtime_readiness::is_protected_linux() { return Err(NOT_PROTECTED.into()); }
         let db = self.user_db.read().await.clone().ok_or(USERS_UNAVAILABLE)?;
         let (agent, subject, csrf) = if attest {
             let input: AttestRequest = serde_json::from_value(params).map_err(|_| REQUEST_INVALID)?;
@@ -177,12 +187,14 @@ impl MethodHandler {
                 };
                 // Shared employees of this installation only; the attestation
                 // binds this live employee id and incarnation (SR4 round 3, N2).
-                let employee = match crate::isolation_lifecycle::read_lifecycle(&home, &agent) {
+                let employee = if !crate::runtime_readiness::is_protected_linux() {
+                    crate::google_identity::delegate_owner::incarnation(&home, &agent).ok_or(CONFIG_UNREADABLE)?
+                } else { match crate::isolation_lifecycle::read_lifecycle(&home, &agent) {
                     Ok(lifecycle) if matches!(lifecycle.binding,
                         duduclaw_isolation::capability::EmployeeBinding::Shared(_)) =>
                         (lifecycle.employee, lifecycle.incarnation),
                     _ => return Err(NOT_SHARED.into()),
-                };
+                } };
                 attest_subject(&home, &db, &Attest { agent: &agent, subject: &subject, user_id: &user_id,
                     acknowledge_self_set }, employee, &user)
             }).await.map_err(|_| FAILED.to_owned())??
