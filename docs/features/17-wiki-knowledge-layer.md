@@ -241,7 +241,7 @@ Three modes:
 
 Both `wiki_write` with `scope="shared"` and `shared_wiki_delete` honour the policy. Unlisted namespaces are `agent_writable` by default — the policy *only tightens*, never relaxes.
 
-A missing `.scope.toml` keeps the existing default; a malformed or unreadable file denies access. See the RM-209 policy rules below.
+A missing `.scope.toml` keeps the existing default; a malformed or unreadable file denies access. See the policy rules below.
 
 **Hot-reload:** the policy is re-read on every write/delete (the file is small; performance impact negligible). Operator edits take effect immediately.
 
@@ -417,7 +417,7 @@ Before v1.8.9, the Wiki was write-only from the LLM's perspective: everyone coul
 
 Knowledge isn't a flat pile of documents — it's layered by how often you need to see it. DuDuClaw's Wiki makes that layering explicit, trust-weights every page, and auto-injects the must-always-remember tier directly into every system prompt. The deep archive stays quiet until summoned.
 
-### Page identity, policies and scanning (RM-209)
+### Page identity, policies and scanning
 
 Existing pages use the final filename found on disk as their identity, including trust quarantine and auto-page registry lookups. Equivalent case or Unicode spellings resolve to that identity; if multiple directory entries fold to the same name, access is refused. Reserved names use the same comparison: `_INDEX.md` receives index redaction and cannot be written as a page. Writes still reject trailing dots/spaces; a read alias either resolves to the same page or is refused under the platform's path rules.
 

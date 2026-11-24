@@ -1,7 +1,7 @@
 # Security Defense
 
 
-## Per-run caller identity (RM-208)
+## Per-run caller identity
 
 An AI cannot claim another identity by changing environment variables, parameters, or its working directory. On installs where all AI employees run as the same operating-system user, a process that can read other processes' environments could borrow another run's credential while that run is active; the credential stops working when the run ends. Native Linux protected mode isolates employees as separate users. In protected mode no run credential is issued: it keeps its own capability records, and `duduclaw identity whoami` reports that protected mode uses its own capability identity.
 
@@ -912,7 +912,7 @@ Employee cron uses UTC (also accepts zero-offset UTC/GMT aliases) or an IANA tim
 
 Human-origin MCP creation defaults to UTC and accepts an explicit timezone without daylight saving; unmarked Admin/background schedules keep local-timezone detection.
 
-### Wiki path and policy checks (RM-209)
+### Wiki path and policy checks
 
 Page quarantine and auto-page visibility use the resolved on-disk filename. Equivalent spellings cannot bypass reserved-file redaction or write protection; ambiguous matches are refused. Page and policy reads use no-follow opens and validate the opened handle on Unix and Windows. Both writers refuse linked control files, including broken links, and scanning refuses linked roots and skips internal links.
 

@@ -124,7 +124,7 @@ listed; its unscoped aggregate shape has `global_skills`, `agents`, `scanned`,
 `usage_error` and `usage_truncated`. `about.get` uses its default full response,
 not the `brand_revision_only` projection.
 
-`users.me` additionally preserves `user.avatar_agent_id` (nullable, RM-212).
+`users.me` additionally preserves `user.avatar_agent_id` (nullable).
 Setting an avatar remains an Admin operation. A member with an assigned avatar
 cannot use `users.set_primary_agent` to replace it.
 
@@ -214,9 +214,9 @@ change them.
 | `budget.incidents` | Manager minimum in `dispatch_org.rs` |
 | `tasks.goal_schedule` | No such dispatched method; use `schedule` on `tasks.create` or `tasks.goal_create` |
 | `connect`, `/ws/chat` | Transport entry points documented above, outside the dispatched compatibility inventory |
-| `users.set_avatar`, `users.avatar_conflicts` | RM-212 Admin-only management methods, outside the member inventory |
+| `users.set_avatar`, `users.avatar_conflicts` | Admin-only management methods, outside the member inventory |
 
-`users.list` is also Admin-only; its RM-212 avatar field is not a member-facing
+`users.list` is also Admin-only; its avatar field is not a member-facing
 read contract. The presence of a method call in shared React code does not
 establish Employee permission.
 
@@ -251,7 +251,7 @@ Transport/login details above were checked against `server.rs`, `protocol.rs`,
 `webchat.rs`, `server_mfa.rs` and `duduclaw-auth/src/jwt.rs`; socket authentication
 itself is outside these dispatch tests. Build and test execution remains pending.
 
-## Personal member API keys (RM-213 part B, 1.85.0)
+## Personal member API keys (1.85.0)
 
 An administrator must first enable `[member_api_keys] enabled = true` in
 `config.toml`, or use the member-key section on **My account → External access**.
