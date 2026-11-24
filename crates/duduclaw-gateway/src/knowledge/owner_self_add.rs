@@ -4,6 +4,8 @@ use std::path::Path;
 use duduclaw_knowledge::{KbError, KbResult};
 use duduclaw_knowledge::requester::RequesterIdentity;
 use rusqlite::{Connection, Transaction, params};
+use duduclaw_knowledge::sources::{NewSource, SourceKind};
+use unicode_normalization::UnicodeNormalization;
 
 pub const HOURLY_CAP: i64 = 10;
 
@@ -57,15 +59,62 @@ fn exact_shape(conn: &Connection, cid: &str, uid: &str, agent: &str) -> KbResult
         FROM collection_acl WHERE collection_id=?1", params![cid, uid, agent], |r| r.get(0))?)
 }
 
+fn normalized_text(text: &str) -> String {
+    text.trim().nfc().collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Compare the effective source to the gateway's live inbound record, never
+/// the title, preview, tool arguments, or a model-supplied provenance claim.
+fn personally_provided(home: &Path, turn: &Turn, who: &RequesterIdentity, source: &NewSource) -> KbResult<()> {
+    let turn_id = turn.turn_id.as_deref().ok_or(KbError::PermissionDenied)?;
+    let (record_who, inbound) = super::turn_requesters::inbound(&turn.agent, turn_id)
+        .ok_or(KbError::PermissionDenied)?;
+    if &record_who != who { return Err(KbError::PermissionDenied); }
+    let matches = match source.kind {
+        SourceKind::Url => {
+            let url = source.url.as_deref().ok_or(KbError::PermissionDenied)?;
+            let expected = super::url_ingest::validate(url).map_err(|_| KbError::PermissionDenied)?;
+            source.blob_sha256 == duduclaw_knowledge::blob::url_identity(&expected)
+                && inbound.text.split(|c: char| c.is_whitespace()
+                    || matches!(c, '<' | '>' | '"' | '\'' | '(' | ')' | '[' | ']' | '「' | '」' | '，' | '。'))
+                    .filter(|token| !token.is_empty())
+                    .any(|token| super::url_ingest::validate(token).is_ok_and(|url| url == expected))
+        }
+        SourceKind::File | SourceKind::Attachment => {
+            let bytes = std::fs::read(duduclaw_knowledge::blob::BlobStore::for_home(home)
+                .path_for(&source.blob_sha256)?)?;
+            duduclaw_knowledge::sha256_hex(&bytes) == source.blob_sha256
+                && inbound.attachment_hashes.iter().any(|hash| hash == &source.blob_sha256)
+        }
+        SourceKind::Paste => {
+            let bytes = std::fs::read(duduclaw_knowledge::blob::BlobStore::for_home(home)
+                .path_for(&source.blob_sha256)?)?;
+            if duduclaw_knowledge::sha256_hex(&bytes) != source.blob_sha256 {
+                return Err(KbError::PermissionDenied);
+            }
+            let text = std::str::from_utf8(&bytes).map_err(|_| KbError::PermissionDenied)?;
+            let text = normalized_text(text);
+            // Substring containment is intentional here: the owner may wrap
+            // their literal source text in an instruction to add it.
+            !text.is_empty() && normalized_text(&inbound.text).contains(&text)
+        }
+    };
+    if !matches { return Err(KbError::PermissionDenied); }
+    Ok(())
+}
+
 /// Reserve the rate slot and audit in the source transaction. Any read error
 /// propagates to the caller, which files an ordinary approval instead.
 pub(crate) fn authorize(
-    tx: &Transaction<'_>, home: &Path, turn: &Turn, cid: &str, summary: &str,
+    tx: &Transaction<'_>, home: &Path, turn: &Turn, source: &NewSource,
 ) -> KbResult<()> {
+    let cid = &source.collection_id;
+    let summary = &source.title;
     let cfg = duduclaw_knowledge::limits::KnowledgeConfig::from_home(home);
     if !cfg.enabled || !cfg.owner_self_add { return Err(KbError::PermissionDenied); }
     let who = turn.requester();
     let uid = human_id(&who).ok_or(KbError::PermissionDenied)?;
+    personally_provided(home, turn, &who, source)?;
     let opted: bool = tx.query_row("SELECT owner_self_add=1 FROM collections WHERE id=?1", [cid], |r| r.get(0))?;
     if !opted || !exact_shape(tx, cid, uid, &turn.agent)? { return Err(KbError::PermissionDenied); }
     let avatar: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM self_add_users.users u

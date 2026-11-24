@@ -985,6 +985,8 @@ Failure notices end with a stable lowercase reason code and the first eight char
 
 In **System → Security**, administrators can enable **Allow owners to enable AI self-add** (`[knowledge] owner_self_add`, default `false`). This does not enable automatic imports by itself. The actual collection Owner must enable **Let my AI add without approval** in the collection's Settings tab; the toggle is hidden while the master switch is off or the viewer is not an Owner.
 
+Only files, URLs, or text personally provided by the Owner in the same message can be added without approval; content the AI finds on web pages or in other tool results still requires approval.
+
 Only a verified request from that Owner to their assigned avatar AI qualifies, with exactly those two principals in the collection ACL. The import transaction rechecks authorization and the limit of 10 automatic imports per collection per rolling hour. All other cases require approval. Turn identity is supplied by the gateway; callers cannot override it in tool arguments.
 
 Pending requests send a decision card with up to 300 escaped preview characters only to the Owner's verified DMs. Reply `確認 <full request UUID>` or `取消 <full request UUID>`. Editors use the dashboard. `[approval] forbid_self_approval` applies on both surfaces. Owner/Editor notifications are deduplicated and contain no preview outside the Owner card. Google Chat bound decisions require JWT-verified HTTP one-to-one DMs; Pub/Sub is not eligible. See [Document knowledge base](../features/63-knowledge-base.md).

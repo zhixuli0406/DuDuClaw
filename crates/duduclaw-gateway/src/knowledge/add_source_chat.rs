@@ -108,11 +108,11 @@ pub(crate) async fn decide(home: &Path, rec: &ApprovalRecord, context: &Decision
     Ok(if approve { "已核准並加入知識庫。" } else { "已拒絕加入知識庫。" }.into())
 }
 
-/// Content is quoted and bounded before escaping; notices never call this.
-pub(crate) fn card_body(rec: &ApprovalRecord) -> String {
-    let field = |key: &str, max: usize| crate::goal_state::xml_escape(&duduclaw_core::truncate_chars(
-        rec.payload[key].as_str().unwrap_or(""), max));
-    format!("加入知識庫的請求\n標題：{}\n檔案／網址：{}\n<preview>\n{}\n</preview>\n僅限集合目前的擁有者在此私訊決定。\n確認 {}\n取消 {}",
+/// Each untrusted field is a bounded, inert single line; notices never call this.
+pub(crate) fn card_body(rec: &ApprovalRecord, channel: &str) -> String {
+    let field = |key: &str, max: usize| crate::markdown_render::untrusted_preview(
+        channel, rec.payload[key].as_str().unwrap_or(""), max);
+    format!("加入知識庫的請求\n標題：{}\n檔案／網址：{}\n預覽：{}\n僅限集合目前的擁有者在此私訊決定。\n確認 {}\n取消 {}",
         field("title", 120), if rec.payload["url"].is_string() { field("url", 2048) } else { field("original_name", 200) },
         field("preview", 300), rec.id.as_str(), rec.id.as_str())
 }
@@ -148,7 +148,7 @@ pub(crate) fn origin_exception(rec: &ApprovalRecord, target: &(String, String), 
 /// Only an owner destination receives content, even when a fallback channel
 /// happens to be the source group. Other deciders receive metadata-free notices.
 pub(crate) fn body_for_target(home: &Path, rec: &ApprovalRecord, target: &(String, String), notice: &str) -> String {
-    if owner_targets(home, rec).contains(target) { card_body(rec) } else { notice.to_owned() }
+    if owner_targets(home, rec).contains(target) { card_body(rec, &target.0) } else { notice.to_owned() }
 }
 
 /// The provider resolves Slack/Discord user IDs into DM conversation IDs. Keep
@@ -159,12 +159,10 @@ pub(crate) async fn push_owner_card(
     channel: &str, token: &str, destination: &str,
 ) -> bool {
     if !owner_targets(home, rec).contains(&(channel.to_owned(), destination.to_owned())) { return false; }
-    let body = card_body(rec);
-    let Some(markup) = crate::channel_format::decision_markup(channel,
-        crate::decision_action::DecisionSource::Approval, rec.id.as_str()) else {
-        return crate::channel_sender::send_plain_text(home, http, channel, token, destination, &body).await;
-    };
-    match crate::channel_sender::send_with_markup(http, channel, token, destination, &body, markup).await {
+    let body = card_body(rec, channel);
+    let markup = crate::channel_format::decision_markup(channel,
+        crate::decision_action::DecisionSource::Approval, rec.id.as_str());
+    match crate::channel_sender::send_untrusted_card(home, http, channel, token, destination, &body, markup).await {
         Ok(receipt) => {
             if let Some(receipt) = receipt {
                 let Some((uid, _, _)) = owner_entries(home, rec).into_iter()

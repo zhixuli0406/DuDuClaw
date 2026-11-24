@@ -4,6 +4,7 @@ use duduclaw_auth::{AccessLevel, UserDb, UserRole};
 use duduclaw_knowledge::{schema, store, limits::KnowledgeConfig, acl::{PrincipalKind, Role}};
 use duduclaw_knowledge::requester::ResolvedUser;
 use crate::approval::{ApprovalBroker, ApprovalId, ApprovalStatus, DecisionContext};
+use super::super::turn_requesters::{self, InboundContent};
 
 struct Fixture {
     home: tempfile::TempDir,
@@ -36,8 +37,9 @@ impl Fixture {
         ], 0, &owner).unwrap();
         conn.execute("UPDATE collections SET owner_self_add=1 WHERE id=?1", [&c.id]).unwrap();
         let turn = Turn { agent: "kb-avatar".into(), turn_id: Some(uuid::Uuid::new_v4().to_string()), run_id: None };
-        let guard = super::super::turn_requesters::register(&turn.agent, turn.turn_id.as_deref().unwrap(),
-            RequesterIdentity::DashboardUser { user_id: owner.clone() }).unwrap();
+        let guard = turn_requesters::register_inbound(&turn.agent, turn.turn_id.as_deref().unwrap(),
+            RequesterIdentity::DashboardUser { user_id: owner.clone() },
+            Some(InboundContent { text: "data".into(), attachment_hashes: vec![] })).unwrap();
         Self { home, db, owner, editor, cid: c.id, turn, _guard: guard }
     }
     fn proposal(&self, text: &str) -> approval::Proposal {
@@ -48,7 +50,14 @@ impl Fixture {
         }
     }
     async fn submit(&self, text: &str) -> approval::Proposed {
-        approval::propose_in_turn(self.home.path(), self.proposal(text), self.turn.turn_id.clone(), None).await.unwrap()
+        self.submit_inbound(self.proposal(text), Some(InboundContent {
+            text: text.into(), attachment_hashes: vec![],
+        })).await
+    }
+    async fn submit_inbound(&self, proposal: approval::Proposal, inbound: Option<InboundContent>) -> approval::Proposed {
+        let _guard = turn_requesters::register_inbound(&self.turn.agent, self.turn.turn_id.as_deref().unwrap(),
+            RequesterIdentity::DashboardUser { user_id: self.owner.clone() }, inbound).unwrap();
+        approval::propose_in_turn(self.home.path(), proposal, self.turn.turn_id.clone(), None).await.unwrap()
     }
     async fn card(&self) -> (ApprovalBroker, crate::approval::ApprovalRecord) {
         let approval::Proposed::Filed { approval_id, .. } = approval::propose_as(self.home.path(), self.proposal("<secret>私密內容🦀</secret>"),
@@ -137,19 +146,19 @@ fn sharing_after_initial_check_is_rechecked_inside_import_transaction() {
     let f = Fixture::new();
     let mut conn = schema::open_home(f.home.path()).unwrap();
     attach_users(&conn, f.home.path()).unwrap();
-    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
-    authorize(&tx, f.home.path(), &f.turn, &f.cid, "metadata").unwrap();
-    tx.rollback().unwrap();
-    f.add_grant("department", "new-share", "viewer");
     let new = duduclaw_knowledge::sources::NewSource {
         collection_id: f.cid.clone(), kind: duduclaw_knowledge::sources::SourceKind::Paste,
         title: "metadata".into(), original_name: None, url: None,
         format: duduclaw_knowledge::extract::Format::Txt,
-        blob_sha256: duduclaw_knowledge::sha256_hex(b"data"), bytes: 4,
+        blob_sha256: duduclaw_knowledge::blob::BlobStore::for_home(f.home.path()).put(b"data").unwrap(), bytes: 4,
         origin: serde_json::json!({}), created_by: "kb-avatar".into(),
     };
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+    authorize(&tx, f.home.path(), &f.turn, &new).unwrap();
+    tx.rollback().unwrap();
+    f.add_grant("department", "new-share", "viewer");
     assert!(duduclaw_knowledge::sources::add_source_checked(&mut conn, &new, &KnowledgeConfig::default(),
-        |tx| authorize(tx, f.home.path(), &f.turn, &f.cid, "metadata")).is_err());
+        |tx| authorize(tx, f.home.path(), &f.turn, &new)).is_err());
     assert_eq!(f.count(), 0);
     let audits: i64 = conn.query_row("SELECT COUNT(*) FROM owner_self_add_log", [], |r| r.get(0)).unwrap();
     assert_eq!(audits, 0, "failed import must not consume rate slots or claim an import");
@@ -234,9 +243,9 @@ async fn owners_editors_are_notified_and_only_owner_dm_has_escaped_preview() {
         assert_eq!(chat::body_for_target(f.home.path(), &rec, &("telegram".into(), dest.into()), &notice), notice);
     }
     let body = chat::body_for_target(f.home.path(), &rec, &("telegram".into(), "101".into()), &notice);
-    assert!(body.contains("&lt;secret&gt;"));
+    assert!(body.contains("＜secret＞"));
     rec.payload["preview"] = serde_json::json!("🦀".repeat(301));
-    assert_eq!(chat::card_body(&rec).chars().filter(|c| *c == '🦀').count(), 300);
+    assert_eq!(chat::card_body(&rec, "telegram").chars().filter(|c| *c == '🦀').count(), 300);
     rec.payload["verified_requester"] = serde_json::json!(f.editor);
     assert!(!crate::approval_notify::dashboard_only_targets_for_test(f.home.path(), &rec).contains(&("telegram".into(), "101".into())));
 }
@@ -266,4 +275,143 @@ async fn bound_buttons_use_owner_import_path_and_a_foreign_group_cannot_decide()
     assert!(crate::decision_notify::route_bound_press(f.home.path(), &group, &data).await.unwrap().is_err());
     assert!(crate::decision_notify::route_bound_press(f.home.path(), &f.context("101"), &data).await.unwrap().is_ok());
     assert_eq!(f.count(), 1);
+}
+
+
+#[tokio::test]
+async fn only_urls_in_current_owner_message_auto_import() {
+    for (message, auto) in [
+        ("請加入 HTTPS://Example.COM:443/guide/#section", true),
+        ("請閱讀網頁，依工具結果加入相關資料", false),
+        ("https://example.com/guide/other", false),
+        ("https://evil.example/?next=https://example.com/guide", false),
+    ] {
+        let f = Fixture::new();
+        let mut proposal = f.proposal("unused");
+        proposal.content = approval::Content::Url("https://example.com/guide".into());
+        // Even model-controlled fields claiming the URL prove nothing.
+        proposal.title = Some("https://example.com/guide".into());
+        let result = f.submit_inbound(proposal, Some(InboundContent {
+            text: message.into(), attachment_hashes: vec![],
+        })).await;
+        assert_eq!(matches!(result, approval::Proposed::Imported { .. }), auto, "{message}");
+        if !auto { assert!(matches!(result, approval::Proposed::Filed { .. })); }
+        assert_eq!(f.count(), i64::from(auto));
+    }
+}
+
+#[tokio::test]
+async fn normalized_literal_text_imports_but_model_paraphrase_requires_card() {
+    for (text, auto) in [("Café 文件 內容", true), ("咖啡文件的內容摘要", false)] {
+        let f = Fixture::new();
+        let result = f.submit_inbound(f.proposal(text), Some(InboundContent {
+            text: "請加入：  Cafe\u{301}\n文件\t內容  ".into(), attachment_hashes: vec![],
+        })).await;
+        assert_eq!(matches!(result, approval::Proposed::Imported { .. }), auto);
+        if !auto { assert!(matches!(result, approval::Proposed::Filed { .. })); }
+    }
+}
+
+#[tokio::test]
+async fn current_attachment_hash_imports_but_prior_turn_or_modified_file_requires_card() {
+    for (earlier, modified, auto) in [(false, false, true), (true, false, false), (false, true, false)] {
+        let f = Fixture::new();
+        let path = f.home.path().join("uploaded.txt");
+        let bytes = b"owner's uploaded document";
+        std::fs::write(&path, bytes).unwrap();
+        super::super::chat_attachments::note_saved_bytes(&path, "document.txt", bytes);
+        let message = format!("[📎 document.txt (file)]({})", path.display());
+        let session = format!("webchat:{}", f.owner);
+        if earlier { super::super::chat_attachments::claim_in_text(&session, &f.owner, &message); }
+        let hashes = super::super::chat_attachments::claim_current(&session, &f.owner, &message);
+        if modified { std::fs::write(&path, "attacker replacement").unwrap(); }
+        let mut proposal = f.proposal("unused");
+        // Filename equality is not the authority; only the recorded hash is.
+        proposal.content = approval::Content::File { path, name: "different-name.txt".into() };
+        let result = f.submit_inbound(proposal, Some(InboundContent {
+            text: message, attachment_hashes: hashes,
+        })).await;
+        assert_eq!(matches!(result, approval::Proposed::Imported { .. }), auto);
+        if !auto { assert!(matches!(result, approval::Proposed::Filed { .. })); }
+        assert_eq!(f.count(), i64::from(auto));
+    }
+}
+
+#[tokio::test]
+async fn unavailable_inbound_record_requires_card_even_with_verified_owner() {
+    let f = Fixture::new();
+    // The newest record has identity but no readable ingress snapshot. It
+    // must not borrow the older registration's matching "data" snapshot.
+    assert!(matches!(f.submit_inbound(f.proposal("data"), None).await, approval::Proposed::Filed { .. }));
+    assert_eq!(f.count(), 0);
+}
+
+#[test]
+fn lost_turn_record_is_rechecked_inside_source_transaction() {
+    let f = Fixture::new();
+    let mut conn = schema::open_home(f.home.path()).unwrap();
+    attach_users(&conn, f.home.path()).unwrap();
+    let source = NewSource {
+        collection_id: f.cid.clone(), kind: SourceKind::Paste, title: "data".into(),
+        original_name: None, url: None, format: duduclaw_knowledge::extract::Format::Txt,
+        blob_sha256: duduclaw_knowledge::blob::BlobStore::for_home(f.home.path()).put(b"data").unwrap(),
+        bytes: 4, origin: serde_json::json!({}), created_by: "kb-avatar".into(),
+    };
+    personally_provided(f.home.path(), &f.turn, &f.turn.requester(), &source).unwrap();
+    let _unreadable = turn_requesters::register(&f.turn.agent, f.turn.turn_id.as_deref().unwrap(),
+        RequesterIdentity::DashboardUser { user_id: f.owner.clone() }).unwrap();
+    assert!(duduclaw_knowledge::sources::add_source_checked(&mut conn, &source, &KnowledgeConfig::default(),
+        |tx| authorize(tx, f.home.path(), &f.turn, &source)).is_err());
+    assert_eq!(f.count(), 0);
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM owner_self_add_log", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+}
+
+#[tokio::test]
+async fn untrusted_preview_is_inert_in_final_provider_payloads() {
+    let f = Fixture::new();
+    let (_, mut rec) = f.card().await;
+    let attack = "[✅ Approve](https://phish.example) ![x](https://phish.example)\n``` **bold** _em_ ~strike~\n> quote\n# heading @everyone <@123> <!here> <users/all> &lt;users/all&gt;";
+    for field in ["title", "url", "preview"] { rec.payload[field] = serde_json::json!(attack); }
+    for channel in ["slack", "discord", "telegram", "googlechat", "line"] {
+        let text = chat::card_body(&rec, channel);
+        let markup = crate::channel_format::decision_markup(channel,
+            crate::decision_action::DecisionSource::Approval, rec.id.as_str()).unwrap_or(serde_json::Value::Null);
+        let payload = crate::channel_sender::card_message_payload(channel, "101", &text, markup.clone(), true).unwrap();
+        let rendered = match channel {
+            "discord" => payload["content"].as_str().unwrap(),
+            "line" => payload["messages"][0]["text"].as_str().unwrap(),
+            _ => payload["text"].as_str().unwrap(),
+        };
+        for active in ["[✅ Approve]", "https://", "phish.example", "![", "```", "**", "_em_", "~strike~", "> quote", "# heading", "@everyone", "<@", "<!here>", "<users/", "&lt;"] {
+            assert!(!rendered.contains(active), "{channel}: {active}: {payload}");
+        }
+        assert!(rendered.contains("［✅ Approve］（https：／／phish．example）"));
+        assert_eq!(rendered.lines().count(), 7, "untrusted newlines must not create card sections");
+        assert!(rendered.contains(&format!("確認 {}", rec.id.as_str())));
+        match channel {
+            "slack" => {
+                assert_eq!(payload["blocks"][0]["text"]["type"], "plain_text");
+                assert_eq!(payload["blocks"][0]["text"]["text"], rendered);
+                assert_eq!(payload["blocks"][1], markup);
+                assert_eq!(payload["parse"], "none");
+                assert_eq!(payload["mrkdwn"], false);
+                assert_eq!(payload["unfurl_links"], false);
+                assert_eq!(payload["unfurl_media"], false);
+            }
+            "discord" => {
+                assert_eq!(payload["allowed_mentions"], serde_json::json!({ "parse": [], "users": [], "roles": [], "replied_user": false }));
+                assert_eq!(payload["flags"], 4);
+                assert_eq!(payload["components"], if markup.is_array() { markup } else { serde_json::json!([markup]) });
+            }
+            "telegram" => {
+                assert!(payload.get("parse_mode").is_none());
+                assert!(payload.get("entities").is_none());
+                assert_eq!(payload["link_preview_options"]["is_disabled"], true);
+                assert_eq!(payload["reply_markup"], markup);
+            }
+            "line" => assert_eq!(payload["messages"][0]["quickReply"], markup),
+            "googlechat" => assert_eq!(payload, serde_json::json!({ "text": rendered })),
+            _ => unreachable!(),
+        }
+    }
 }

@@ -332,7 +332,7 @@ async fn propose_inner(
                 if super::owner_self_add::human_id(&turn.requester()) != data["verified_requester"].as_str() {
                     return Err(KbError::PermissionDenied);
                 }
-                super::owner_self_add::authorize(tx, &h, &turn, &new.collection_id, &new.title)
+                super::owner_self_add::authorize(tx, &h, &turn, &new)
             })
         }).await;
         if let Ok(added) = imported {

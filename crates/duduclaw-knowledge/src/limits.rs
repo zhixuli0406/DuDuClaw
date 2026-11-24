@@ -54,7 +54,6 @@ pub const EXTRACT_WHEN_UNAVAILABLE_VALUES: &[&str] = &["refuse", "run_unsandboxe
 impl Default for KnowledgeConfig {
     fn default() -> Self {
         Self {
-            owner_self_add: t.get("owner_self_add").and_then(toml::Value::as_bool).unwrap_or(false),
             enabled: true,
             owner_self_add: false,
             max_source_bytes: DEFAULT_MAX_SOURCE_BYTES,
@@ -193,6 +192,7 @@ mod tests {
 
     #[test]
     fn owner_self_add_is_explicit_and_fail_closed() {
+        assert!(!KnowledgeConfig::default().owner_self_add);
         for text in ["", "[knowledge]", "[knowledge]\nowner_self_add='true'", "[knowledge]\nowner_self_add=true\nbroken=["] {
             assert!(!KnowledgeConfig::from_toml_str(text).owner_self_add);
         }

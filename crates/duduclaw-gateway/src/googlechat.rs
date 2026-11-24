@@ -1570,6 +1570,23 @@ pub async fn send_text_to_space_as(
     Ok(())
 }
 
+/// A knowledge approval card is already rendered as inert plain fields.
+/// Send its final payload directly; do not reinterpret previews as Markdown.
+pub(crate) async fn send_untrusted_card(
+    home_dir: &Path, space: &str, body: serde_json::Value,
+) -> Result<(), String> {
+    if !crate::google_workspace::chat_read::valid_space(space) {
+        return Err(GoogleChatSendError::InvalidTarget.user_message(home_dir));
+    }
+    let (creds, _) = sending_creds(home_dir, None, space).await?;
+    post_message_json(&creds, space, None, body, None).await
+        .map(|_| ())
+        .map_err(|status| match status {
+            Some(status) => GoogleChatSendError::Http { status },
+            None => GoogleChatSendError::Transport,
+        }.user_message(home_dir))
+}
+
 /// RM-192: whether the app a send to `space` as `agent` would use (the same
 /// selection as [`sending_creds`]) receives Chat interaction events over the
 /// HTTP transport — the only transport whose `CARD_CLICKED` events are

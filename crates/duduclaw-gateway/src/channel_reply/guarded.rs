@@ -85,7 +85,10 @@ pub(super) async fn build_reply_with_session_inner_capturing_operator_result(
     // message belong to this conversation and sender (first claim wins);
     // the person this turn is for (resolved once, before any runtime call)
     // and the sources the reply cites.
-    crate::knowledge::chat_attachments::claim_in_text(session_id, user_id, text);
+    let inbound = crate::knowledge::turn_requesters::InboundContent {
+        text: text.to_owned(),
+        attachment_hashes: crate::knowledge::chat_attachments::claim_current(session_id, user_id, text),
+    };
     let requester =
         crate::knowledge::requester_map::requester_for_reply(&ctx.home_dir, session_id, user_id)
             .await;
@@ -119,6 +122,7 @@ pub(super) async fn build_reply_with_session_inner_capturing_operator_result(
         on_progress,
     ));
     let outcome = Arc::new(std::sync::Mutex::new(None));
+    let pipeline = Box::pin(crate::knowledge::turn_requesters::CURRENT_INBOUND.scope(Some(inbound), pipeline));
     let pipeline = super::health::OUTCOME.scope(outcome.clone(), pipeline);
     let pipeline = Box::pin(crate::autonomous_runtime::human_interactive(&ctx.home_dir, pipeline));
     let turn = Box::pin(reply_identity_scope(
