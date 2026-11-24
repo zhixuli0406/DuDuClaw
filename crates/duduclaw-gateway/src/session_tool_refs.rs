@@ -36,6 +36,8 @@ pub fn reference_from_result(tool: &str, result: &Value) -> Option<ToolReference
     let kind = match tool {
         "gmail_create_draft" => "gmail_draft",
         "calendar_create_event" => "calendar_event",
+        "docs_create" => "google_doc",
+        "sheets_create" => "google_sheet",
         "gtasks_create" | "tasks_create" => "task",
         _ => return None,
     };
@@ -111,6 +113,7 @@ impl SessionManager {
             // Recheck persisted values as data, including field limits.
             let expected_kind = match tool.as_str() {
                 "gmail_create_draft" => "gmail_draft", "calendar_create_event" => "calendar_event",
+                "docs_create" => "google_doc", "sheets_create" => "google_sheet",
                 "tasks_create" | "gtasks_create" => "task", _ => continue,
             };
             if kind != expected_kind { continue; }
@@ -137,10 +140,10 @@ mod tests {
 
     #[test]
     fn only_successful_whitelisted_structured_creates() {
-        for tool in ["gmail_create_draft", "calendar_create_event", "gtasks_create"] {
+        for tool in ["gmail_create_draft", "calendar_create_event", "gtasks_create", "docs_create", "sheets_create"] {
             assert!(reference_from_result(tool, &draft("id-123", "label")).is_some());
         }
-        for tool in ["gmail_read", "calendar_list_events", "third_party_create", "docs_append", "drive_read"] {
+        for tool in ["gmail_read", "calendar_list_events", "third_party_create", "docs_append", "drive_read", "docs_replace_text", "sheets_update"] {
             assert!(reference_from_result(tool, &draft("id-123", "label")).is_none());
         }
         assert!(reference_from_result("gmail_create_draft", &json!({"isError":true,"_meta":{"duduclaw_created_ref":{"id":"id"}}})).is_none());
@@ -149,6 +152,41 @@ mod tests {
         assert!(reference_from_result("gmail_create_draft", &draft(&"字".repeat(257), "label")).is_none());
         let task = json!({"content":[{"text":json!({"task":{"id":"task-1","title":"small task"}}).to_string()}]});
         assert_eq!(reference_from_result("tasks_create", &task).unwrap().ref_id, "task-1");
+    }
+
+    #[tokio::test]
+    async fn docs_and_sheets_creates_are_retained_and_rechecked_in_exact_session() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let manager = SessionManager::new(tmp.path()).unwrap();
+        manager.get_or_create("created-files", "agent").await.unwrap();
+        for (tool, kind, id, title) in [
+            ("docs_create", "google_doc", "doc-123", "新文件🦀"),
+            ("sheets_create", "google_sheet", "sheet-456", "新試算表🦀"),
+        ] {
+            let result = draft(id, title);
+            let reference = reference_from_result(tool, &result).unwrap();
+            assert_eq!(reference.ref_kind, kind);
+            assert_eq!(reference.ref_id, id);
+            assert_eq!(reference.label, title);
+            for invalid in [
+                json!({"isError":true,"_meta":{"duduclaw_created_ref":{"id":id,"label":title}}}),
+                json!({"structuredContent":{"documentId":id,"spreadsheetId":id,"title":title}}),
+                json!({"content":[{"text":format!("Created ID: {id}")}]}),
+                draft("", title), draft(&"字".repeat(257), title),
+            ] {
+                assert!(reference_from_result(tool, &invalid).is_none(), "{tool}: {invalid}");
+            }
+            manager.record_tool_reference("created-files", "agent", tool, &result).await.unwrap();
+        }
+        let context = manager.tool_refs_context("created-files").await.unwrap();
+        assert!(context.contains("docs_create: doc-123 (google_doc) — 新文件🦀"));
+        assert!(context.contains("sheets_create: sheet-456 (google_sheet) — 新試算表🦀"));
+        assert!(!context.contains("never retain this full result"));
+        assert!(manager.tool_refs_context("another-session").await.unwrap().is_empty());
+        manager.acquire().await.execute(
+            "UPDATE session_tool_refs SET ref_kind = 'gmail_draft' WHERE session_id = ?1", ["created-files"],
+        ).unwrap();
+        assert!(manager.tool_refs_context("created-files").await.unwrap().is_empty());
     }
 
     #[tokio::test]

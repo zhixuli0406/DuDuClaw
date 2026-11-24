@@ -76,6 +76,8 @@ pub(crate) async fn serve_add_source(
     // propose.
     let who = super::turn_requesters::resolve_with_run(agent, request.turn_id(), request.run_id());
     super::add_source_guard::requester_may_propose(&who).map_err(from_kb)?;
+    let turn_id = request.turn_id().map(str::to_owned);
+    let run_id = request.run_id().map(str::to_owned);
     let Request::AddSource {
         collection,
         path,
@@ -149,7 +151,10 @@ pub(crate) async fn serve_add_source(
             _ => None,
         },
     };
-    match approval::propose(home, proposal).await.map_err(from_kb)? {
+    match approval::propose_in_turn(home, proposal, turn_id, run_id).await.map_err(from_kb)? {
+        Proposed::Imported { title, source_id } => Ok(json!({
+            "ok": true, "status": "imported", "title": title, "source_id": source_id,
+        })),
         Proposed::Filed { approval_id, title } => Ok(json!({
             "ok": true,
             "status": "awaiting_approval",

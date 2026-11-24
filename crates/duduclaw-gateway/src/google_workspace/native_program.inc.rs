@@ -959,7 +959,7 @@ async fn native_write<I: LocalIo>(io: &mut I, template: &NativeCallTemplate) -> 
                     ) });
                 }
             }
-            Ok(json!({"documentId":id,"url":format!("https://docs.google.com/document/d/{id}/edit")}))
+            Ok(json!({"documentId":id,"title":title,"url":format!("https://docs.google.com/document/d/{id}/edit")}))
         }
         DocsReplace { document, find, replace, match_case } => {
             let id = extract_drive_file_id(document);
@@ -979,7 +979,7 @@ async fn native_write<I: LocalIo>(io: &mut I, template: &NativeCallTemplate) -> 
             }
             let response = google_request(io, template, reqwest::Method::POST, SHEETS_BASE, &[], Some(&body)).await?;
             let id = response_id(io, &response, "spreadsheetId")?;
-            Ok(json!({"spreadsheetId":id,"url":format!("https://docs.google.com/spreadsheets/d/{id}/edit")}))
+            Ok(json!({"spreadsheetId":id,"title":title,"url":format!("https://docs.google.com/spreadsheets/d/{id}/edit")}))
         }
         SheetsUpdate { spreadsheet, range, values, input_option } => {
             let id = extract_spreadsheet_id(spreadsheet);
@@ -1594,7 +1594,7 @@ pub(super) fn scope_guidance(api_error_body: &str) -> String {
 
 pub(super) enum Outcome {
     Chat(Value),
-    Write(Value),
+    Write { data: Value, created_id_field: Option<&'static str> },
     GmailSearch(GmailSearchResult),
     GmailRead(GmailReadResult),
     GmailDraft(GmailDraftResult),
@@ -1688,10 +1688,13 @@ fn write_response_safe(value: &Value) -> bool {
 pub(super) fn render<I: LocalRender>(value: Outcome, io: &mut I) -> Value {
     match value {
         Outcome::Chat(r) => render_chat(&r, io),
-        Outcome::Write(r) => {
+        Outcome::Write { data: r, created_id_field } => {
             if !write_response_safe(&r) { return tool_error("Google response failed content screening; check the resource before retrying."); }
             let mut result = render_json(&r, io);
             if result.get("isError").and_then(Value::as_bool) != Some(true) {
+                if let Some(field) = created_id_field {
+                    result["_meta"]["duduclaw_created_ref"] = json!({"id":r[field],"label":r["title"]});
+                }
                 result["structuredContent"] = r;
             }
             result
@@ -1762,7 +1765,14 @@ pub(super) async fn run<I: LocalIo>(template: &NativeCallTemplate, io: &mut I) -
     let result: Result<Outcome, GoogleApiError> = match template.parsed() {
         ParsedNativeArguments::DocsCreate { .. } | ParsedNativeArguments::DocsReplace { .. }
         | ParsedNativeArguments::SheetsCreate { .. } | ParsedNativeArguments::SheetsUpdate { .. }
-        | ParsedNativeArguments::CalendarUpdate { .. } => native_write(io, template).await.map(Outcome::Write),
+        | ParsedNativeArguments::CalendarUpdate { .. } => native_write(io, template).await.map(|data| Outcome::Write {
+            data,
+            created_id_field: match template.parsed() {
+                ParsedNativeArguments::DocsCreate { .. } => Some("documentId"),
+                ParsedNativeArguments::SheetsCreate { .. } => Some("spreadsheetId"),
+                _ => None,
+            },
+        }),
         ParsedNativeArguments::ChatSpaces(args) => chat_spaces(io, template, args).await.map(Outcome::Chat),
         ParsedNativeArguments::ChatMessages(args) => chat_messages(io, template, args).await.map(Outcome::Chat),
         ParsedNativeArguments::GmailSearch { query, max } => {

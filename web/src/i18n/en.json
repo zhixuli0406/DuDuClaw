@@ -11660,5 +11660,9 @@
   "channels.googlechat.sharedBinding": "Route by sender (shared Chat app)",
   "channels.googlechat.sharedBinding.help": "DMs follow @ mentions first; otherwise a manually bound member reaches their AI avatar or primary employee. Groups keep their existing routing. Changes apply to the next message.",
   "channels.googlechat.unboundReply": "Reply for people without access",
-  "channels.googlechat.unboundReply.help": "Plain text, up to 1,000 characters. Use '{onboarding_url}' to include a valid HTTPS public dashboard URL; otherwise the placeholder is removed. Anyone who can DM the app can see this URL."
+  "channels.googlechat.unboundReply.help": "Plain text, up to 1,000 characters. Use '{onboarding_url}' to include a valid HTTPS public dashboard URL; otherwise the placeholder is removed. Anyone who can DM the app can see this URL.",
+  "kb.selfAdd.label": "Let my AI add without approval",
+  "kb.selfAdd.description": "Only your verified requests to your avatar AI qualify, and the collection must grant access only to you and that AI. Limited to 10 imports per collection per hour; otherwise approval is required.",
+  "kb.selfAdd.adminLabel": "Allow owners to enable AI self-add",
+  "kb.selfAdd.adminDescription": "Off by default. Owners must also opt in in collection settings. Shared collections still require approval."
 }

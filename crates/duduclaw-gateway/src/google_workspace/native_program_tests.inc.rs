@@ -461,6 +461,15 @@ async fn google_write_request_shapes_and_structured_identifiers() {
         assert_eq!(io.wire[0].1, url, "{tool}");
         assert_eq!(io.wire[0].3.as_ref(), Some(&body), "{tool}");
         assert_eq!(result["structuredContent"][id_field], id, "{tool}");
+        if matches!(tool, "docs_create" | "sheets_create") {
+            assert_eq!(result["structuredContent"]["title"], args["title"], "{tool}");
+            assert_eq!(result["_meta"]["duduclaw_created_ref"], json!({"id":id,"label":args["title"]}), "{tool}");
+            let reference = crate::session_tool_refs::reference_from_result(tool, &result).unwrap();
+            assert_eq!(reference.ref_id, id);
+            assert_eq!(reference.label, args["title"].as_str().unwrap());
+        } else {
+            assert!(result.pointer("/_meta/duduclaw_created_ref").is_none(), "{tool}");
+        }
         if tool == "docs_create" {
             assert_eq!(io.wire.len(), 2);
             assert!(io.wire[1].1.ends_with("/doc123:batchUpdate"));
@@ -498,7 +507,9 @@ async fn google_write_optional_modes_and_missing_creation_proof() {
     ] {
         let template = NativeCallTemplate::prepare(tool, &args).unwrap();
         let mut io = RecordingIo { json: VecDeque::from([json!({})]), ..Default::default() };
-        assert_eq!(run(&template, &mut io).await["isError"],true, "{tool}");
+        let result = run(&template, &mut io).await;
+        assert_eq!(result["isError"],true, "{tool}");
+        assert!(result.pointer("/_meta/duduclaw_created_ref").is_none(), "{tool}");
         assert_eq!(io.wire.len(),1, "No follow-up request without a resource id");
     }
     let template = NativeCallTemplate::prepare("docs_replace_text", &json!({"document_id":"d","find":"x","replace":"","match_case":false})).unwrap();

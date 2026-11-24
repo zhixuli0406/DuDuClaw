@@ -1,6 +1,6 @@
 //! Proposals to add a source to a collection from outside the dashboard
 //! (the `knowledge_add_source` MCP tool, the 「加入知識庫」 chat command).
-//! Every proposal waits for a human; there is no setting that skips it.
+//! Owner/avatar-only turns can opt into transactional, rate-limited self-add.
 //!
 //! - **Filing** ([`propose`]): the content is copied into a sidecar file
 //!   under `<home>/knowledge/proposals/` (directory 0700, files 0600); the
@@ -10,7 +10,7 @@
 //!   Visitors, unbound senders and unregistered turns may not propose, and
 //!   each employee / proposer may have only a few cards waiting
 //!   ([`super::add_source_guard`]).
-//! - **Deciding** ([`decide`]): only in the dashboard
+//! - **Deciding** ([`decide`]): dashboard, or the domain-bound Owner DM route
 //!   (`approval_notify::is_dashboard_only_kind`), only by an Admin or a
 //!   person who is editor or owner of the collection **at decision time**.
 //!   Approving re-hashes the sidecar; a mismatch refuses and closes the card
@@ -78,6 +78,7 @@ pub struct Proposal {
 /// Result of [`propose`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Proposed {
+    Imported { title: String, source_id: String },
     Filed {
         approval_id: String,
         title: String,
@@ -232,6 +233,30 @@ fn stage(home: &Path, cfg: &KnowledgeConfig, p: &Proposal) -> KbResult<Staged> {
 
 /// File a proposal. Blocking file and database work runs off the reactor.
 pub async fn propose(home: &Path, p: Proposal) -> KbResult<Proposed> {
+    propose_inner(home, p, None, None).await
+}
+
+pub(crate) async fn propose_in_turn(
+    home: &Path, p: Proposal, turn_id: Option<String>, run_id: Option<String>,
+) -> KbResult<Proposed> {
+    let turn = super::owner_self_add::Turn { agent: p.agent_id.clone(), turn_id, run_id };
+    let who = turn.requester();
+    propose_inner(home, p, Some(who), Some(turn)).await
+}
+
+pub(crate) async fn propose_as(
+    home: &Path, p: Proposal, who: duduclaw_knowledge::requester::RequesterIdentity,
+) -> KbResult<Proposed> {
+    propose_inner(home, p, Some(who), None).await
+}
+
+async fn propose_inner(
+    home: &Path, p: Proposal,
+    who: Option<duduclaw_knowledge::requester::RequesterIdentity>,
+    turn: Option<super::owner_self_add::Turn>,
+) -> KbResult<Proposed> {
+    let requester = who.as_ref().and_then(super::owner_self_add::human_id).map(str::to_owned);
+    let requester_for_payload = requester.clone();
     super::add_source_guard::sweep_unreferenced(home).await;
     super::add_source_guard::check_caps(home, &p.agent_id, &p.proposed_by).await?;
     let cfg = KnowledgeConfig::from_home(home);
@@ -255,7 +280,7 @@ pub async fn propose(home: &Path, p: Proposal) -> KbResult<Proposed> {
             }
             return Ok((Value::Null, t, String::new(), true));
         }
-        let payload = json!({
+        let mut payload = json!({
             "collection_id": coll.id,
             "collection_slug": coll.slug,
             "collection_name": coll.name,
@@ -276,7 +301,9 @@ pub async fn propose(home: &Path, p: Proposal) -> KbResult<Proposed> {
             "origin_channel": p.origin.as_ref().map(|o| o.0.clone()),
             "origin_chat_id": p.origin.as_ref().map(|o| o.1.clone()),
             "note": CARD_NOTE,
+            "verified_requester": requester_for_payload,
         });
+        super::add_source_chat::bind_owner(&h, &conn, &mut payload);
         let summary = format!(
             "加入知識庫：「{}」→ 集合「{}」（{}）",
             duduclaw_core::truncate_chars(&title, 60),
@@ -294,9 +321,40 @@ pub async fn propose(home: &Path, p: Proposal) -> KbResult<Proposed> {
         return Ok(Proposed::Duplicate { title });
     }
     let agent = payload["agent_id"].as_str().unwrap_or("").to_string();
+    if let Some(turn) = turn {
+        let (h, data) = (home.to_path_buf(), payload.clone());
+        let imported = super::blocking(move || {
+            let mut conn = schema::open_home(&h)?;
+            super::owner_self_add::attach_users(&conn, &h)?;
+            let new = source_input(&h, &data, json!({"auto_import": true}))?;
+            let cfg = KnowledgeConfig::from_home(&h);
+            duduclaw_knowledge::sources::add_source_checked(&mut conn, &new, &cfg, |tx| {
+                if super::owner_self_add::human_id(&turn.requester()) != data["verified_requester"].as_str() {
+                    return Err(KbError::PermissionDenied);
+                }
+                super::owner_self_add::authorize(tx, &h, &turn, &new)
+            })
+        }).await;
+        if let Ok(added) = imported {
+            remove_sidecar(home, &payload);
+            super::worker::notify();
+            return Ok(match added {
+                Added::New(source) => {
+                    super::audit_admin(home, "knowledge_owner_self_add", &agent, json!({
+                        "actor_ai": agent, "owner": requester, "collection_id": payload["collection_id"],
+                        "source_id": source.id, "source_summary": title,
+                    }));
+                    Proposed::Imported { title, source_id: source.id }
+                },
+                Added::Duplicate(_) => Proposed::Duplicate { title },
+            });
+        }
+        // No authorization/read failure may turn into an implicit allow.
+    }
     let broker = ApprovalBroker::open(home).map_err(|e| KbError::Io(std::io::Error::other(e)))?;
-    match broker
-        .request(&agent, ACTION_KIND, &summary, payload.clone(), TTL_SECS)
+    let principal = requester.as_deref().and_then(duduclaw_core::HumanPrincipal::user).map(|p| p.to_string());
+    match crate::on_behalf_of::ON_BEHALF_OF.scope(principal,
+        broker.request(&agent, ACTION_KIND, &summary, payload.clone(), TTL_SECS))
         .await
     {
         Ok(id) => {
@@ -382,6 +440,20 @@ pub async fn decide(
     approve: bool,
     user: &ResolvedUser,
 ) -> Result<Value, String> {
+    decide_inner(home, broker, id, approve, user, None).await
+}
+
+pub(crate) async fn decide_owner(
+    home: &Path, broker: &ApprovalBroker, id: &ApprovalId, approve: bool,
+    user: &ResolvedUser, context: &crate::approval::DecisionContext,
+) -> Result<Value, String> {
+    decide_inner(home, broker, id, approve, user, Some(context)).await
+}
+
+async fn decide_inner(
+    home: &Path, broker: &ApprovalBroker, id: &ApprovalId, approve: bool,
+    user: &ResolvedUser, owner_context: Option<&crate::approval::DecisionContext>,
+) -> Result<Value, String> {
     let lock = lock_for(id.as_str());
     let _g = lock.lock().await;
     let rec = match broker.get(id).await {
@@ -389,6 +461,11 @@ pub async fn decide(
         Ok(_) => return Err("找不到這筆審核".into()),
         Err(e) => return Err(format!("讀取審核失敗：{e}")),
     };
+    if let Some(context) = owner_context {
+        if super::add_source_chat::owner_user(home, &rec, context).as_ref().map(|u| &u.user_id) != Some(&user.user_id) {
+            return Err(crate::channel_decision_route::DECISION_REFUSED.into());
+        }
+    }
     let (h, r, u) = (home.to_path_buf(), rec.clone(), user.clone());
     let allowed = super::blocking(move || may_decide(&h, &r, &u)).await;
     if allowed.is_err() {
@@ -406,8 +483,15 @@ pub async fn decide(
         remove_sidecar(home, &rec.payload);
         return Err(EXPIRED_TEXT.into());
     }
+    let decider = duduclaw_core::HumanPrincipal::user(&user.user_id).map(|p| p.to_string());
+    if crate::on_behalf_of::self_approval::refuses(home, rec.on_behalf_of.as_deref(), decider.as_deref(), approve) {
+        return Err(crate::on_behalf_of::self_approval::REFUSAL.into());
+    }
     crate::approval::check_expected_digest(&rec)?;
-    let decided_by = format!("dashboard:{}", user.user_id);
+    let decided_by = match owner_context {
+        Some(ctx) => format!("channel:{}:{}", ctx.channel, ctx.principal_id),
+        None => format!("dashboard:{}", user.user_id),
+    };
     if !approve {
         broker.decide(id, false, &decided_by).await?;
         remove_sidecar(home, &rec.payload);
@@ -415,7 +499,8 @@ pub async fn decide(
         return Ok(json!({"id": id.to_string(), "decided": "denied"}));
     }
     let (h, r, u) = (home.to_path_buf(), rec.clone(), user.clone());
-    match super::blocking(move || ingest(&h, &r, &u)).await {
+    let owner_context = owner_context.cloned();
+    match super::blocking(move || ingest(&h, &r, &u, owner_context.as_ref())).await {
         Ok(v) => {
             broker.decide(id, true, &decided_by).await?;
             remove_sidecar(home, &rec.payload);
@@ -454,8 +539,7 @@ fn audit(home: &Path, rec: &ApprovalRecord, user: &ResolvedUser, outcome: &str) 
     );
 }
 
-fn ingest(home: &Path, rec: &ApprovalRecord, user: &ResolvedUser) -> KbResult<Value> {
-    let p = &rec.payload;
+fn source_input(home: &Path, p: &Value, origin: Value) -> KbResult<NewSource> {
     let s = |k: &str| p[k].as_str().map(str::to_string);
     let cid = s("collection_id").ok_or(KbError::PermissionDenied)?;
     let expected = s("content_sha256").ok_or(KbError::PermissionDenied)?;
@@ -470,9 +554,9 @@ fn ingest(home: &Path, rec: &ApprovalRecord, user: &ResolvedUser) -> KbResult<Va
         .as_str()
         .and_then(Format::parse)
         .ok_or_else(|| KbError::Invalid("審核內容格式不正確。".into()))?;
-    let cfg = KnowledgeConfig::from_home(home);
     let (sha, bytes) = if kind == SourceKind::Url {
         let url = s("url").ok_or(KbError::PermissionDenied)?;
+        super::url_ingest::validate(&url).map_err(|e| KbError::Rejected { code: "url_blocked", message: e.message })?;
         if url_identity(&url) != expected {
             return Err(mismatch());
         }
@@ -488,8 +572,7 @@ fn ingest(home: &Path, rec: &ApprovalRecord, user: &ResolvedUser) -> KbResult<Va
         let sha = BlobStore::for_home(home).put(&data)?;
         (sha, data.len() as u64)
     };
-    let mut conn = schema::open_home(home)?;
-    let new = NewSource {
+    Ok(NewSource {
         collection_id: cid.clone(),
         kind,
         title: s("title").unwrap_or_default(),
@@ -498,15 +581,36 @@ fn ingest(home: &Path, rec: &ApprovalRecord, user: &ResolvedUser) -> KbResult<Va
         format,
         blob_sha256: sha,
         bytes,
-        origin: json!({
-            "proposed_by": p["proposed_by"],
-            "via": p["via"],
-            "approval_id": rec.id.to_string(),
-            "approved_by": user.user_id,
-        }),
+        origin,
         created_by: p["proposed_by"].as_str().unwrap_or("").to_string(),
-    };
-    let (source, duplicate) = match duduclaw_knowledge::sources::add_source(&mut conn, &new, &cfg)?
+    })
+}
+
+fn ingest(home: &Path, rec: &ApprovalRecord, user: &ResolvedUser, owner_context: Option<&crate::approval::DecisionContext>) -> KbResult<Value> {
+    let p = &rec.payload;
+    let new = source_input(home, p, json!({
+        "proposed_by": p["proposed_by"], "via": p["via"],
+        "approval_id": rec.id.to_string(), "approved_by": user.user_id,
+    }))?;
+    let cid = new.collection_id.clone();
+    let cfg = KnowledgeConfig::from_home(home);
+    let mut conn = schema::open_home(home)?;
+    if owner_context.is_some() { super::owner_self_add::attach_users(&conn, home)?; }
+    let (source, duplicate) = match duduclaw_knowledge::sources::add_source_checked(&mut conn, &new, &cfg, |tx| {
+        if let Some(context) = owner_context {
+            let db = crate::decision_notify::open_user_db_read_only(home).ok().flatten()
+                .ok_or(KbError::PermissionDenied)?;
+            let uid = crate::googlechat_identity::verified_user_id(home, &db, &context.channel, &context.principal_id)
+                .ok().flatten();
+            if uid.as_deref() != Some(user.user_id.as_str()) { return Err(KbError::PermissionDenied); }
+            let active: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM self_add_users.users WHERE id=?1 AND status='active')",
+                [&user.user_id], |r| r.get(0))?;
+            if !active || !super::owner_self_add::is_direct_owner(tx, &cid, &user.user_id)? {
+                return Err(KbError::PermissionDenied);
+            }
+        }
+        Ok(())
+    })?
     {
         Added::New(s) => (s, false),
         Added::Duplicate(s) => (s, true),
@@ -550,7 +654,7 @@ pub(crate) fn notice_body(rec: &ApprovalRecord, reminder: bool, deadline: &str) 
     format!(
         "{head}\n\
          AI 員工：{agent}\n\
-         這類請求只能由管理員或該集合的編輯者在儀表板的待辦清單決定。\n\
+         請管理員或集合編輯者至儀表板的待辦清單處理；擁有者也可使用另外收到的私訊核准卡。\n\
          期限：{deadline}未審核將自動拒絕\n\
          編號：{id}",
         agent = crate::goal_state::xml_escape(&duduclaw_core::truncate_chars(&rec.agent_id, 64)),

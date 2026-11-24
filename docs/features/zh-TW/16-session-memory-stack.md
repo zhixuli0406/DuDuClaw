@@ -98,7 +98,7 @@ Do not mention, quote, or comment on this note or its source.
 
 ### 同一段對話最近建立的項目
 
-DuDuClaw 原生工具成功建立 Gmail 草稿、Calendar 事件、內建任務或 Google Tasks 後，只保留結構化識別碼與簡短標籤。現有 Docs、Sheets、Drive 原生工具只有讀取或附加內容，沒有建立檔案工具，因此不會留下檔案參照。第三方 MCP 結果與工具回傳全文不保留。
+DuDuClaw 原生工具成功建立 Gmail 草稿、Calendar 事件、內建任務、Google Tasks、Google Docs 或 Google Sheets 後，只保留結構化識別碼與簡短標籤。`docs_create` 保留回傳的 `documentId` 與標題；`sheets_create` 保留回傳的 `spreadsheetId` 與標題。讀取、附加、更新工具、第三方 MCP 結果與工具回傳全文不保留。
 
 只有 `DUDUCLAW_SESSION_ID` 指向這段對話，且儲存的所屬員工與呼叫者一致時，MCP 伺服器才會寫入。下一輪以逸出後的不可信資料框提供參照，每段對話最多 20 筆，保留 24 小時，各欄位都有長度上限。重設對話後，不會注入上一代對話的參照。工具參照獨立於 `pinned_task` 設定。
 

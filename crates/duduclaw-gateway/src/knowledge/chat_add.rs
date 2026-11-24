@@ -202,7 +202,8 @@ pub async fn handle(cmd: Command<'_>) -> String {
             requester_channel: cmd.requester.channel().map(str::to_string),
             origin: origin(&cmd.requester),
         };
-        lines.push(match approval::propose(cmd.home, proposal).await {
+        lines.push(match approval::propose_as(cmd.home, proposal, cmd.requester.clone()).await {
+            Ok(Proposed::Imported { title, .. }) => format!("「{title}」已加入「{collection_name}」。"),
             Ok(Proposed::Filed { approval_id, title }) => format!(
                 "「{title}」已送出審核（編號 {}），管理員或集合編輯者在儀表板核准後，會自動加入「{collection_name}」。",
                 duduclaw_core::truncate_chars(&approval_id, 8)

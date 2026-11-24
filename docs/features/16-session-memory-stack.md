@@ -98,7 +98,7 @@ Angle brackets in the note are escaped. The system context and minimal prompt us
 
 ### Recently created items in this conversation
 
-Successful DuDuClaw-native create calls retain only structured identifiers and a short label: Gmail drafts, Calendar events, internal tasks and Google Tasks. The native Docs, Sheets and Drive tools currently read or append; they do not create files, so they add no file references. Third-party MCP results and full tool responses are excluded.
+Successful DuDuClaw-native create calls retain only structured identifiers and a short label: Gmail drafts, Calendar events, internal tasks, Google Tasks, Google Docs and Google Sheets. `docs_create` retains the returned `documentId` and title; `sheets_create` retains the returned `spreadsheetId` and title. Read, append and update calls, third-party MCP results and full tool responses are excluded.
 
 The MCP server writes references only when `DUDUCLAW_SESSION_ID` names this exact conversation and the stored owner matches the calling employee. The next turn receives an escaped, untrusted reference block. Each session keeps at most 20 entries for 24 hours, with capped fields. References from a previous incarnation after a session reset are not injected. These references are separate from the `pinned_task` setting.
 

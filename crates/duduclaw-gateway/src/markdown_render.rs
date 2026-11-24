@@ -708,6 +708,27 @@ pub fn to_whatsapp_text(text: &str) -> String {
     parts.join("\n\n")
 }
 
+/// One untrusted field in a decision card. Fullwidth punctuation is literal
+/// on every supported provider and survives subsequent rendering without
+/// becoming Markdown, HTML, mentions, or auto-linked URLs. Never escape with
+/// backslashes/entities: later renderers may decode those into active syntax.
+pub(crate) fn untrusted_preview(channel: &str, text: &str, max: usize) -> String {
+    if !matches!(channel, "slack" | "discord" | "telegram" | "googlechat" | "line") {
+        return String::new();
+    }
+    let bounded = duduclaw_core::truncate_chars(text, max);
+    bounded.split_whitespace().collect::<Vec<_>>().join(" ").chars()
+        .filter(|c| !c.is_control() && !matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}'))
+        .map(|c| match c {
+            '[' => '［', ']' => '］', '(' => '（', ')' => '）',
+            '<' => '＜', '>' => '＞', '@' => '＠', '!' => '！',
+            '`' => '｀', '*' => '＊', '_' => '＿', '~' => '～',
+            '#' => '＃', '|' => '｜', '\\' => '＼', '&' => '＆',
+            ':' => '：', '/' => '／', '.' => '．', '-' => '－',
+            _ => c,
+        }).collect()
+}
+
 /// Render markdown to Google Chat text markup.
 pub fn to_googlechat_text(text: &str) -> String {
     googlechat_text(text, 0)

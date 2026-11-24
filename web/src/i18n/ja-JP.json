@@ -11660,5 +11660,9 @@
   "channels.googlechat.sharedBinding": "送信者ごとに振り分け（共有 Chat アプリ）",
   "channels.googlechat.sharedBinding.help": "DM は @ メンションを優先し、指定がなければ管理者が手動で紐付けたメンバーの AI アバターまたはメイン AI に渡します。グループの振り分けは変わりません。保存後、次のメッセージから適用されます。",
   "channels.googlechat.unboundReply": "未開通のユーザーへの返信",
-  "channels.googlechat.unboundReply.help": "プレーンテキスト、1,000 文字以内。'{onboarding_url}' は有効な HTTPS 公開ダッシュボード URL に置き換わり、設定がなければ削除されます。アプリに DM を送れる人は誰でもこの URL を見ることができます。"
+  "channels.googlechat.unboundReply.help": "プレーンテキスト、1,000 文字以内。'{onboarding_url}' は有効な HTTPS 公開ダッシュボード URL に置き換わり、設定がなければ削除されます。アプリに DM を送れる人は誰でもこの URL を見ることができます。",
+  "kb.selfAdd.label": "自分の AI による追加を承認不要にする",
+  "kb.selfAdd.description": "本人が自分の分身 AI に依頼し、コレクションの権限が本人とその AI だけの場合に限ります。1 コレクションにつき毎時 10 件まで。それ以外は承認が必要です。",
+  "kb.selfAdd.adminLabel": "所有者による AI の承認不要設定を許可",
+  "kb.selfAdd.adminDescription": "初期設定はオフです。所有者がコレクション設定でも有効にする必要があります。共有コレクションは引き続き承認が必要です。"
 }

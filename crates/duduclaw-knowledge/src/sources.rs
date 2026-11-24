@@ -194,6 +194,17 @@ pub fn add_source(
     new: &NewSource,
     cfg: &KnowledgeConfig,
 ) -> KbResult<Added> {
+    add_source_checked(conn, new, cfg, |_| Ok(()))
+}
+
+/// The authorization callback and insertion share the same IMMEDIATE transaction.
+/// Any callback error rolls back every write (including rate/audit reservations).
+pub fn add_source_checked(
+    conn: &mut Connection,
+    new: &NewSource,
+    cfg: &KnowledgeConfig,
+    authorize: impl FnOnce(&rusqlite::Transaction<'_>) -> KbResult<()>,
+) -> KbResult<Added> {
     if new.bytes > cfg.max_source_bytes {
         return Err(KbError::Rejected {
             code: "too_large",
@@ -204,6 +215,7 @@ pub fn add_source(
         });
     }
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    authorize(&tx)?;
     let existing: Option<String> = tx
         .query_row(
             "SELECT id FROM sources WHERE collection_id = ?1 AND blob_sha256 = ?2",
@@ -212,10 +224,10 @@ pub fn add_source(
         )
         .optional()?;
     if let Some(id) = existing {
+        let source = get_source(&tx, &id)?.ok_or(KbError::PermissionDenied)?;
+        // Roll back callback reservations: duplicates are not new imports.
         drop(tx);
-        return Ok(Added::Duplicate(
-            get_source(conn, &id)?.ok_or(KbError::PermissionDenied)?,
-        ));
+        return Ok(Added::Duplicate(source));
     }
     let count: i64 = tx.query_row(
         "SELECT COUNT(*) FROM sources WHERE collection_id = ?1",
@@ -277,10 +289,12 @@ pub fn add_source(
         ],
     )?;
     crate::jobs::enqueue_tx(&tx, &id, crate::jobs::JobKind::Ingest)?;
+    // Complete every fallible read before committing. In particular, an
+    // auto-import must never file an approval after a committed insert merely
+    // because loading the response failed.
+    let source = get_source(&tx, &id)?.ok_or(KbError::PermissionDenied)?;
     tx.commit()?;
-    Ok(Added::New(
-        get_source(conn, &id)?.ok_or(KbError::PermissionDenied)?,
-    ))
+    Ok(Added::New(source))
 }
 
 /// Move a source to `status` (no-op on a deleting / deleted source).

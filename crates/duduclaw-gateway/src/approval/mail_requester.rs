@@ -9,7 +9,8 @@ pub(crate) fn adapter_audience(channel: &str, chat_type: Option<&str>) -> super:
     use super::ConversationAudience::{Private, MultiParty};
     match (channel, chat_type) {
         ("line", Some("user")) | ("telegram", Some("private"))
-        | ("slack", Some("im")) | ("discord", Some("1")) => Private,
+        | ("slack", Some("im")) | ("discord", Some("1"))
+        | ("googlechat", Some("jwt_http_dm")) => Private,
         _ => MultiParty,
     }
 }
@@ -178,6 +179,7 @@ mod tests {
             ("telegram", "private", vec!["group", "supergroup", "channel"]),
             ("slack", "im", vec!["mpim", "group", "channel"]),
             ("discord", "1", vec!["0", "3", "11"]),
+            ("googlechat", "jwt_http_dm", vec!["pubsub_dm", "DIRECT_MESSAGE", "DM", "SPACE"]),
         ] {
             assert_eq!(adapter_audience(channel, Some(private)), Private);
             for kind in groups.into_iter().map(Some).chain([None, Some("unknown"), Some("")]) {

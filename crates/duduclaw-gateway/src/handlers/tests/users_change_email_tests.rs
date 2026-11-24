@@ -495,3 +495,31 @@ async fn avatar_rpcs_require_admin_validate_agent_and_expose_both_preferences() 
     assert_eq!(f.db.configured_primary_agent(&member.id).unwrap().as_deref(), Some("avatar-ai"));
     assert!(ok_payload(&f.handler.handle("users.avatar_conflicts", json!({}), &f.owner).await)["conflicts"].as_array().unwrap().is_empty());
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn protected_avatar_assignment_checks_target_members_personal_owner() {
+    let f = fixture(false).await;
+    let member = f.db.create_user("personal-avatar@example.test", "Member", "password123", UserRole::Employee).unwrap();
+    let other = f.db.create_user("other-personal-avatar@example.test", "Other", "password123", UserRole::Employee).unwrap();
+    for (agent, owner) in [("member-personal", &member.id), ("other-personal", &other.id)] {
+        seed_agent(f._home.path(), agent);
+        crate::personal_visibility::tests::record_personal(f._home.path(), agent, owner);
+    }
+    crate::personal_visibility::tests::private_store(f._home.path());
+    f.handler.registry.write().await.scan().await.unwrap();
+
+    // Pass isolation explicitly instead of changing process-wide flags.
+    let saved = f.handler.handle_users_set_avatar_in_mode(
+        json!({"user_id": member.id, "agent_id": "member-personal"}), &f.owner, true,
+    ).await;
+    assert_eq!(ok_payload(&saved)["avatar_agent_id"], "member-personal");
+    assert_eq!(f.db.get_user(&member.id).unwrap().unwrap().avatar_agent_id.as_deref(), Some("member-personal"));
+
+    let refused = f.handler.handle_users_set_avatar_in_mode(
+        json!({"user_id": member.id, "agent_id": "other-personal"}), &f.owner, true,
+    ).await;
+    assert!(error_text(&refused).contains("avatar_binding_required"));
+    assert_eq!(f.db.get_user(&member.id).unwrap().unwrap().avatar_agent_id.as_deref(), Some("member-personal"));
+    assert!(f.db.get_user(&other.id).unwrap().unwrap().avatar_agent_id.is_none());
+}

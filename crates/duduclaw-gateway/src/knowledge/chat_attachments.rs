@@ -3,10 +3,10 @@
 //! itself saved for that sender (never a path someone typed into a message).
 //!
 //! - Every inbound save (`media::save_attachment_in_base`) is noted with its
-//!   real file name ([`note_saved`]).
+//!   real file name ([`note_saved_bytes`]).
 //! - The first reply turn whose message carries the reference the adapter
 //!   wrote claims the file for that conversation and sender
-//!   ([`claim_in_text`], called once per turn before anything else). The
+//!   ([`claim_current`], called once per turn before anything else). The
 //!   adapter's own message reaches the pipeline right after the save, so a
 //!   reference typed later by anyone else finds the file already claimed.
 //! - The chat command accepts a file only when it is claimed by the same
@@ -30,15 +30,16 @@ const MAX_ENTRIES: usize = 4_096;
 #[derive(Debug, Clone)]
 struct Entry {
     display_name: String,
+    sha256: String,
     saved_at: Instant,
     owner: Option<(String, String)>,
 }
 
-fn map() -> std::sync::MutexGuard<'static, HashMap<PathBuf, Entry>> {
+fn map() -> Option<std::sync::MutexGuard<'static, HashMap<PathBuf, Entry>>> {
     static M: OnceLock<Mutex<HashMap<PathBuf, Entry>>> = OnceLock::new();
     M.get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
+        .ok()
 }
 
 /// The conversation a session belongs to: a called employee's bucket
@@ -51,12 +52,17 @@ pub fn base_session(session_id: &str) -> &str {
 }
 
 /// Record a file an inbound adapter saved, under its real name.
+#[cfg(test)]
 pub fn note_saved(path: &Path, display_name: &str) {
+    if let Ok(bytes) = std::fs::read(path) { note_saved_bytes(path, display_name, &bytes); }
+}
+
+pub(crate) fn note_saved_bytes(path: &Path, display_name: &str, bytes: &[u8]) {
     let Ok(real) = std::fs::canonicalize(path) else {
         return;
     };
     let now = Instant::now();
-    let mut m = map();
+    let Some(mut m) = map() else { return; };
     if m.len() >= MAX_ENTRIES {
         m.retain(|_, e| now.saturating_duration_since(e.saved_at) < OWNED_FOR);
         if m.len() >= MAX_ENTRIES {
@@ -67,6 +73,7 @@ pub fn note_saved(path: &Path, display_name: &str) {
         real,
         Entry {
             display_name: duduclaw_core::truncate_chars(display_name.trim(), 200),
+            sha256: duduclaw_knowledge::sha256_hex(bytes),
             saved_at: now,
             owner: None,
         },
@@ -76,16 +83,23 @@ pub fn note_saved(path: &Path, display_name: &str) {
 /// Claim, for `(session, sender)`, every recently saved and still
 /// unclaimed file whose reference appears in `text`.
 pub fn claim_in_text(session_id: &str, sender: &str, text: &str) {
+    let _ = claim_current(session_id, sender, text);
+}
+
+/// Only newly claimed gateway attachment records belong to THIS message.
+/// Repeating an old filename/path never grants a new automatic-import right.
+pub(crate) fn claim_current(session_id: &str, sender: &str, text: &str) -> Vec<String> {
+    let mut hashes = Vec::new();
     if sender.is_empty() || !text.contains("](") {
-        return;
+        return hashes;
     }
     let refs = super::chat_add::attachment_refs(text);
     if refs.is_empty() {
-        return;
+        return hashes;
     }
     let owner = (base_session(session_id).to_string(), sender.to_string());
     let now = Instant::now();
-    let mut m = map();
+    let Some(mut m) = map() else { return hashes; };
     for r in refs {
         let Ok(real) = std::fs::canonicalize(&r.path) else {
             continue;
@@ -93,9 +107,11 @@ pub fn claim_in_text(session_id: &str, sender: &str, text: &str) {
         if let Some(e) = m.get_mut(&real) {
             if e.owner.is_none() && now.saturating_duration_since(e.saved_at) < CLAIM_WINDOW {
                 e.owner = Some(owner.clone());
+                hashes.push(e.sha256.clone());
             }
         }
     }
+    hashes
 }
 
 /// The real path and stored name of `path` when it belongs to
@@ -105,7 +121,7 @@ pub fn owned(session_id: &str, sender: &str, path: &Path) -> Option<(PathBuf, St
     if !real.is_file() {
         return None;
     }
-    let m = map();
+    let m = map()?;
     let e = m.get(&real)?;
     let mine = e
         .owner

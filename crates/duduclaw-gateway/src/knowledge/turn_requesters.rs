@@ -28,8 +28,18 @@ use duduclaw_knowledge::requester::RequesterIdentity;
 
 type Key = (String, String);
 
-fn registry() -> &'static Mutex<HashMap<Key, Vec<(u64, RequesterIdentity)>>> {
-    static R: OnceLock<Mutex<HashMap<Key, Vec<(u64, RequesterIdentity)>>>> = OnceLock::new();
+/// Gateway ingress data, captured before any model/tool execution. Never
+/// deserialized from a tool request. Absence means approval is required.
+#[derive(Debug, Clone)]
+pub(crate) struct InboundContent {
+    pub text: String,
+    pub attachment_hashes: Vec<String>,
+}
+
+type Registration = (u64, RequesterIdentity, Option<InboundContent>);
+
+fn registry() -> &'static Mutex<HashMap<Key, Vec<Registration>>> {
+    static R: OnceLock<Mutex<HashMap<Key, Vec<Registration>>>> = OnceLock::new();
     R.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -44,7 +54,7 @@ impl Drop for RequesterGuard {
     fn drop(&mut self) {
         let mut map = registry().lock().unwrap_or_else(|p| p.into_inner());
         if let Some(list) = map.get_mut(&self.key) {
-            list.retain(|(id, _)| *id != self.id);
+            list.retain(|(id, _, _)| *id != self.id);
             if list.is_empty() {
                 map.remove(&self.key);
             }
@@ -54,6 +64,12 @@ impl Drop for RequesterGuard {
 
 /// Record that `agent_id`'s turn `turn_id` serves `who`.
 pub fn register(agent_id: &str, turn_id: &str, who: RequesterIdentity) -> Option<RequesterGuard> {
+    register_inbound(agent_id, turn_id, who, None)
+}
+
+pub(crate) fn register_inbound(
+    agent_id: &str, turn_id: &str, who: RequesterIdentity, inbound: Option<InboundContent>,
+) -> Option<RequesterGuard> {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     if !duduclaw_core::is_valid_agent_id(agent_id)
         || !crate::computer_use_sessions::turns::valid_turn_id(turn_id)
@@ -68,7 +84,7 @@ pub fn register(agent_id: &str, turn_id: &str, who: RequesterIdentity) -> Option
         .unwrap_or_else(|p| p.into_inner())
         .entry(key.clone())
         .or_default()
-        .push((id, who));
+        .push((id, who, inbound));
     Some(RequesterGuard { key, id })
 }
 
@@ -79,13 +95,28 @@ pub fn lookup(agent_id: &str, turn_id: &str) -> Option<RequesterIdentity> {
         .unwrap_or_else(|p| p.into_inner())
         .get(&(agent_id.to_string(), turn_id.to_string()))
         .and_then(|l| l.last())
-        .map(|(_, who)| who.clone())
+        .map(|(_, who, _)| who.clone())
 }
 
 tokio::task_local! {
     /// The person the current channel reply turn is for, resolved once by
     /// the reply pipeline before any runtime call.
     pub static CURRENT_REQUESTER: RequesterIdentity;
+    pub(crate) static CURRENT_INBOUND: Option<InboundContent>;
+}
+
+/// Read identity and content from the SAME live registration. Poisoned or
+/// absent records fail closed; older registrations cannot supply content.
+pub(crate) fn inbound(agent_id: &str, turn_id: &str) -> Option<(RequesterIdentity, InboundContent)> {
+    read_inbound(registry(), agent_id, turn_id)
+}
+
+fn read_inbound(
+    records: &Mutex<HashMap<Key, Vec<Registration>>>, agent_id: &str, turn_id: &str,
+) -> Option<(RequesterIdentity, InboundContent)> {
+    let map = records.lock().ok()?;
+    let (_, who, content) = map.get(&(agent_id.to_owned(), turn_id.to_owned()))?.last()?;
+    Some((who.clone(), content.clone()?))
 }
 
 /// The person of the current channel reply turn; `Unknown` outside one.
@@ -105,7 +136,8 @@ pub fn register_current_turn(agent_id: &str) -> Option<RequesterGuard> {
         .try_with(|t| t.clone())
         .ok()
         .flatten()?;
-    register(agent_id, &turn_id, who)
+    let inbound = CURRENT_INBOUND.try_with(Clone::clone).ok().flatten();
+    register_inbound(agent_id, &turn_id, who, inbound)
 }
 
 /// Register a cron or dispatched run of `agent_id` (key = its
@@ -264,6 +296,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unreadable_registry_does_not_recover_inbound_authority() {
+        let records = Mutex::new(HashMap::from([(("bot".into(), "turn".into()), vec![(
+            1, RequesterIdentity::DashboardUser { user_id: "owner".into() },
+            Some(InboundContent { text: "data".into(), attachment_hashes: vec![] }),
+        )])]));
+        assert!(read_inbound(&records, "bot", "turn").is_some());
+        let _ = std::panic::catch_unwind(|| {
+            let _held = records.lock().unwrap();
+            panic!("simulate unreadable turn registry");
+        });
+        assert!(read_inbound(&records, "bot", "turn").is_none());
+    }
+
+    #[test]
     fn register_lookup_and_drop() {
         let who = RequesterIdentity::DashboardUser {
             user_id: "u1".into(),
@@ -315,7 +361,9 @@ mod tests {
         let who = RequesterIdentity::DashboardUser {
             user_id: "u-7".into(),
         };
-        let fut = async { register_current_turn("kb-agent-d") };
+        let fut = CURRENT_INBOUND.scope(Some(InboundContent {
+            text: "owner message".into(), attachment_hashes: vec!["saved hash".into()],
+        }), async { register_current_turn("kb-agent-d") });
         let guard = CURRENT_REQUESTER
             .scope(
                 who.clone(),
@@ -324,7 +372,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resolve("kb-agent-d", Some("turn-42")), who);
+        let (record_who, content) = inbound("kb-agent-d", "turn-42").unwrap();
+        assert_eq!(record_who, who);
+        assert_eq!(content.text, "owner message");
+        assert_eq!(content.attachment_hashes, vec!["saved hash"]);
+        assert!(inbound("other-agent", "turn-42").is_none());
+        assert!(inbound("kb-agent-d", "earlier-turn").is_none());
         drop(guard);
+        assert!(inbound("kb-agent-d", "turn-42").is_none());
         assert_eq!(
             resolve("kb-agent-d", Some("turn-42")),
             RequesterIdentity::Unknown

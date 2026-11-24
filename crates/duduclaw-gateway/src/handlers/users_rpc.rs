@@ -583,6 +583,10 @@ impl MethodHandler {
     }
 
     pub(crate) async fn handle_users_set_avatar(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        self.handle_users_set_avatar_in_mode(params, ctx, crate::runtime_readiness::isolation_active()).await
+    }
+
+    pub(super) async fn handle_users_set_avatar_in_mode(&self, params: Value, ctx: &UserContext, protected: bool) -> WsFrame {
         if let Err(frame) = validate_settings(&params, &["user_id", "agent_id"]) { return frame; }
         let Some(target) = params.get("user_id").and_then(Value::as_str) else {
             return setting_error("user_id", "required");
@@ -597,9 +601,9 @@ impl MethodHandler {
         let registry = self.registry.read().await;
         if let Some(id) = agent {
             if registry.get(id).is_none() { return setting_error("agent_id", "AI employee does not exist"); }
-            if crate::runtime_readiness::isolation_active() {
+            if protected {
                 match crate::personal_visibility::personal_owner(&self.home_dir, id) {
-                    Ok(Some(owner)) if owner != ctx.user_id => return avatar_error("avatar_binding_required"),
+                    Ok(Some(owner)) if owner != target => return avatar_error("avatar_binding_required"),
                     Err(_) => return avatar_error("avatar_unavailable"),
                     _ => {}
                 }

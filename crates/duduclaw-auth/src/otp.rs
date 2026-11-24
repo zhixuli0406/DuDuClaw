@@ -349,11 +349,41 @@ impl UserDb {
     /// "who is this person on which channel" answer (identity display,
     /// memory subjects, sender labels).
     pub fn verified_dm_destinations_for_user(&self, user_id: &str) -> Result<Vec<ChannelIdentity>, String> {
-        Ok(self
-            .verified_channels_for_user(user_id)?
-            .into_iter()
-            .filter(|c| is_dm_destination_channel(&c.channel))
-            .collect())
+        let mut destinations: Vec<_> = self.verified_channels_for_user(user_id)?
+            .into_iter().filter(|c| is_dm_destination_channel(&c.channel)).collect();
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT DISTINCT d.space_id, d.verified_at
+            FROM verified_googlechat_dms d JOIN channel_identities i
+              ON i.user_id=d.user_id AND i.channel='googlechat' AND i.channel_user_id=d.principal_id AND i.verified=1
+            JOIN users u ON u.id=d.user_id AND u.status='active' WHERE d.user_id=?1")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt.query_map([user_id], |r| Ok(ChannelIdentity {
+            user_id: user_id.to_owned(), channel: "googlechat".into(), channel_user_id: r.get(0)?,
+            verified: true, created_at: r.get(1)?,
+        })).map_err(|e| e.to_string())?;
+        for row in rows { destinations.push(row.map_err(|e| e.to_string())?); }
+        Ok(destinations)
+    }
+
+    /// Call only after JWT verification and positive one-to-one classification.
+    /// A typed identity/space supplied by a user or model is never evidence.
+    pub fn record_googlechat_dm(&self, account: &str, space: &str, principal: &str) -> Result<(), String> {
+        let conn = self.conn();
+        conn.execute("INSERT INTO verified_googlechat_dms(account_id, space_id, user_id, principal_id, verified_at)
+            SELECT ?1, ?2, i.user_id, ?3, ?4 FROM channel_identities i JOIN users u ON u.id=i.user_id
+            WHERE i.channel='googlechat' AND i.channel_user_id=?3 AND i.verified=1 AND u.status='active'
+            ON CONFLICT(account_id, space_id) DO UPDATE SET user_id=excluded.user_id,
+                principal_id=excluded.principal_id, verified_at=excluded.verified_at",
+            params![account, space, principal, chrono::Utc::now().to_rfc3339()]).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn matches_googlechat_dm(&self, uid: &str, account: &str, space: &str, principal: &str) -> Result<bool, String> {
+        self.conn().query_row("SELECT EXISTS(SELECT 1 FROM verified_googlechat_dms d
+            JOIN channel_identities i ON i.user_id=d.user_id AND i.channel='googlechat'
+                AND i.channel_user_id=d.principal_id AND i.verified=1
+            WHERE d.user_id=?1 AND d.account_id=?2 AND d.space_id=?3 AND d.principal_id=?4)",
+            params![uid, account, space, principal], |r| r.get(0)).map_err(|e| e.to_string())
     }
 
     fn find_user_id_by_email(&self, email: &str) -> Result<Option<String>, String> {
@@ -1145,4 +1175,28 @@ mod tests {
         assert!(db.claim_first_admin_setup_token(&recovery, "second@example.com", "Second", "new-password-123").is_err());
     }
 
+}
+
+#[cfg(test)]
+mod verified_googlechat_dm_tests {
+    use super::*;
+
+    #[test]
+    fn dm_destination_requires_verified_identity_and_is_revoked_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::UserDb::new(&dir.path().join("users.db")).unwrap();
+        let user = db.create_user("owner@example.com", "Owner", "test-password", crate::UserRole::Employee).unwrap();
+        db.bind_channel_identity(&user.id, "googlechat", "users/123", false).unwrap();
+        db.record_googlechat_dm("app@example.com", "spaces/DM1", "users/123").unwrap();
+        assert!(db.verified_dm_destinations_for_user(&user.id).unwrap().is_empty());
+        db.bind_channel_identity(&user.id, "googlechat", "users/123", true).unwrap();
+        db.record_googlechat_dm("app@example.com", "spaces/DM1", "users/123").unwrap();
+        let targets = db.verified_dm_destinations_for_user(&user.id).unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].channel_user_id, "spaces/DM1");
+        assert!(db.matches_googlechat_dm(&user.id, "app@example.com", "spaces/DM1", "users/123").unwrap());
+        assert!(!db.matches_googlechat_dm(&user.id, "other@example.com", "spaces/DM1", "users/123").unwrap());
+        db.bind_channel_identity(&user.id, "googlechat", "users/123", false).unwrap();
+        assert!(db.verified_dm_destinations_for_user(&user.id).unwrap().is_empty());
+    }
 }

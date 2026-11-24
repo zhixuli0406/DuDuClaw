@@ -685,6 +685,7 @@ fn validate_raw_with_stored(file: &RawFile, text: &str, stored: Option<&toml::Ta
 /// executables are refused here outright (terminal only).
 const RAW_REFUSED_KEYS: &[&str] = &["dispatch.judge_command", "evolution.eval_binary"];
 const RAW_CONFIG_SENSITIVE_KEYS: &[&str] = &[
+    "knowledge.owner_self_add",
     "people.manager_team_history",
     "people.bound_history_privacy",
     // RM-173: conversation retention (purge deletes content irreversibly).

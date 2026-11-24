@@ -526,6 +526,54 @@ pub fn create_sender_for_home(home_dir: &Path, target: &ChannelTarget, http: req
 /// extra, not required for delivery). Callers persist it via
 /// `decision_message_store::record_card_message` so a later decide can edit
 /// this exact card in place.
+/// The exact JSON passed to providers for button cards. Untrusted cards use
+/// plain text where supported, disable mentions, and suppress URL previews.
+pub(crate) fn card_message_payload(
+    channel: &str, chat_id: &str, text: &str, markup: serde_json::Value, untrusted: bool,
+) -> Result<serde_json::Value, String> {
+    let mut body = match channel {
+        "telegram" => json!({ "chat_id": chat_id, "text": text, "reply_markup": markup }),
+        "slack" => json!({ "channel": chat_id, "text": text, "blocks": [
+            { "type": "section", "text": { "type": "mrkdwn", "text": text } }, markup,
+        ] }),
+        "discord" => json!({ "content": text, "components": if markup.is_array() { markup } else { json!([markup]) } }),
+        "line" => json!({ "to": chat_id, "messages": [{ "type": "text", "text": text, "quickReply": markup }] }),
+        "googlechat" if untrusted => json!({ "text": text }),
+        _ => return Err("unsupported card channel".into()),
+    };
+    if untrusted {
+        match channel {
+            "telegram" => body["link_preview_options"] = json!({ "is_disabled": true }),
+            "slack" => {
+                body["blocks"][0]["text"] = json!({ "type": "plain_text", "text": text, "emoji": false });
+                body["mrkdwn"] = json!(false);
+                body["parse"] = json!("none");
+                body["unfurl_links"] = json!(false);
+                body["unfurl_media"] = json!(false);
+            }
+            "discord" => {
+                body["allowed_mentions"] = json!({ "parse": [], "users": [], "roles": [], "replied_user": false });
+                body["flags"] = json!(4); // SUPPRESS_EMBEDS
+            }
+            _ => {}
+        }
+    }
+    Ok(body)
+}
+
+pub(crate) async fn send_untrusted_card(
+    home: &Path, http: &reqwest::Client, channel: &str, token: &str, chat_id: &str,
+    text: &str, markup: Option<serde_json::Value>,
+) -> Result<Option<crate::decision_card::PushedMessage>, String> {
+    if channel == "googlechat" {
+        let body = card_message_payload(channel, chat_id, text, serde_json::Value::Null, true)?;
+        crate::googlechat::send_untrusted_card(home, chat_id, body).await?;
+        return Ok(None);
+    }
+    let markup = markup.ok_or_else(|| "unsupported card channel".to_string())?;
+    send_with_markup_inner(http, channel, token, chat_id, text, markup, true).await
+}
+
 pub(crate) async fn send_with_markup(
     http: &reqwest::Client,
     channel: &str,
@@ -534,10 +582,17 @@ pub(crate) async fn send_with_markup(
     text: &str,
     markup: serde_json::Value,
 ) -> Result<Option<crate::decision_card::PushedMessage>, String> {
+    send_with_markup_inner(http, channel, token, chat_id, text, markup, false).await
+}
+
+async fn send_with_markup_inner(
+    http: &reqwest::Client, channel: &str, token: &str, chat_id: &str, text: &str,
+    markup: serde_json::Value, untrusted: bool,
+) -> Result<Option<crate::decision_card::PushedMessage>, String> {
+    let body = card_message_payload(channel, chat_id, text, markup, untrusted)?;
     match channel {
         "telegram" => {
             let url = format!("{}/sendMessage", crate::telegram::telegram_poll_api_base(token));
-            let body = json!({ "chat_id": chat_id, "text": text, "reply_markup": markup });
             let resp = http
                 .post(&url)
                 .json(&body)
@@ -559,14 +614,6 @@ pub(crate) async fn send_with_markup(
             }))
         }
         "slack" => {
-            let body = json!({
-                "channel": chat_id,
-                "text": text,
-                "blocks": [
-                    { "type": "section", "text": { "type": "mrkdwn", "text": text } },
-                    markup,
-                ],
-            });
             let resp = http
                 .post("https://slack.com/api/chat.postMessage")
                 .bearer_auth(token)
@@ -608,17 +655,6 @@ pub(crate) async fn send_with_markup(
                 _ => chat_id.to_string(),
             };
             let url = format!("https://discord.com/api/v10/channels/{dm_channel}/messages");
-            // W1-5: `decision_markup` returns EITHER one action-row object
-            // (every source but goal) or an array of them (goal's
-            // primary+secondary two-row layout, `discord_goal_buttons`) — an
-            // array is already shaped as Discord's `components` list, an
-            // object needs wrapping in one.
-            let components = if markup.is_array() {
-                markup
-            } else {
-                json!([markup])
-            };
-            let body = json!({ "content": text, "components": components });
             let resp = http
                 .post(&url)
                 .header("Authorization", format!("Bot {token}"))
@@ -637,10 +673,6 @@ pub(crate) async fn send_with_markup(
             }))
         }
         "line" => {
-            let body = json!({
-                "to": chat_id,
-                "messages": [{ "type": "text", "text": text, "quickReply": markup }],
-            });
             let resp = http
                 .post(crate::line::line_api_url("/message/push"))
                 .bearer_auth(token)

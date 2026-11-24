@@ -197,7 +197,10 @@ fn dispatch(call: Call, embedder: Option<Arc<dyn duduclaw_knowledge::embed::Embe
             let mut list = store::list_by_ids(&conn, &[id.to_string()])?;
             let mut c = list.pop().ok_or(KbError::PermissionDenied)?;
             c.my_role = Some(role);
-            Ok(json!({ "collection": c }))
+            let mut value = serde_json::to_value(c).map_err(|_| KbError::PermissionDenied)?;
+            value["owner_self_add_available"] = json!(call.cfg.owner_self_add
+                && super::owner_self_add::is_direct_owner(&conn, id, &u.user_id)?);
+            Ok(json!({ "collection": value }))
         }
         "knowledge.collections.create" => {
             if !call.can_create {
@@ -220,8 +223,13 @@ fn dispatch(call: Call, embedder: Option<Arc<dyn duduclaw_knowledge::embed::Embe
             role_on(&call.home, &conn, id, u, Role::Owner)?;
             let patch: CollectionPatch = serde_json::from_value(p.clone())
                 .map_err(|_| KbError::Invalid("集合資料格式不正確。".to_string()))?;
-            let c =
-                store::update_collection(&mut conn, id, &patch, req(p, "expected_updated_at")?)?;
+            if patch.owner_self_add.is_some() { super::owner_self_add::attach_users(&conn, &call.home)?; }
+            let c = store::update_collection_checked(&mut conn, id, &patch, req(p, "expected_updated_at")?, |tx| {
+                if patch.owner_self_add.is_some() {
+                    super::owner_self_add::may_set_opt_in(tx, &call.home, id, &u.user_id)?;
+                }
+                Ok(())
+            })?;
             log_access(&conn, &access("collection_change", u, Some(id)))?;
             audit_admin(
                 &call.home,
