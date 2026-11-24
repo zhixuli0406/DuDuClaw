@@ -420,11 +420,36 @@ paths:
       summary: 目前有效 Admin 查看每位使用者的 user_id、email、enabled；無秘密鍵
       responses:
         '200': {description: RPC 結果（成功或拒絕）；確認／重產的備援碼僅顯示一次}
+  /rpc/users.set_avatar:
+    post:
+      tags: [auth]
+      summary: Assign or clear a member's AI avatar (Admin only)
+      description: Dashboard WebSocket RPC. Requires a current active Admin. The employee must exist and the active target must have an Owner or Operator binding. One IMMEDIATE transaction enforces uniqueness, synchronizes primary_agent_id when assigning, writes an audit entry and bumps acl_generation. Clearing preserves primary_agent_id. Another member's avatar is refused with avatar_agent_in_use. No conversation or memory ACL is changed.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [user_id, agent_id]
+              properties:
+                user_id: {type: string, minLength: 1, maxLength: 256}
+                agent_id: {type: string, nullable: true, minLength: 1, maxLength: 256}
+      responses:
+        '200': {description: RPC result or refusal; success contains nullable avatar_agent_id}
+  /rpc/users.avatar_conflicts:
+    post:
+      tags: [auth]
+      summary: List unresolved shared-primary avatar conflicts (Admin only)
+      description: Dashboard WebSocket RPC. Returns conflicts with agent_id and the active user_ids sharing that primary while at least one of them has no avatar. The upgrade only carries over single-owner primaries with valid Owner or Operator bindings. It never assigns shared primaries or reruns a cleared assignment.
+      responses:
+        '200': {description: RPC result or refusal; success contains conflicts}
   /rpc/users.set_primary_agent:
     post:
       tags: [auth]
       summary: Set or clear a member's primary AI
-      description: Dashboard WebSocket RPC. Defaults to the caller; targeting another user requires a current active Admin. The selected employee must have a live Owner or Operator binding for the target. The change and user.set_primary_agent audit record commit together. Unknown keys and invalid types are refused.
+      description: Dashboard WebSocket RPC. Defaults to the caller; targeting another user requires a current active Admin. The selected employee must have a live Owner or Operator binding for the target. Accounts with an AI avatar are refused with avatar_primary_locked and zh-TW/en messages; use the Admin-only users.set_avatar instead. The change and user.set_primary_agent audit record commit together. Unknown keys and invalid types are refused.
       requestBody:
         required: true
         content:

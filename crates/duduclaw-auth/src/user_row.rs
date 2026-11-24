@@ -13,7 +13,7 @@ use crate::models::{User, UserRole, UserStatus};
 
 /// Column list matching [`user_from_row`]; keep the two in sync.
 pub(crate) const USER_COLUMNS: &str = "id, email, display_name, role, status, created_at, \
-     updated_at, last_login, must_change_password, department, manager_user_id, credential_epoch";
+     updated_at, last_login, must_change_password, department, manager_user_id, credential_epoch, avatar_agent_id";
 
 /// `auth_meta` key of the counter that invalidates every cached live ACL.
 pub(crate) const ACL_GENERATION_KEY: &str = "acl_generation";
@@ -35,6 +35,7 @@ pub(crate) fn user_from_row(row: &Row<'_>) -> rusqlite::Result<User> {
         .parse()
         .map_err(|e: String| corrupt(4, format!("corrupt status in DB: {e}")))?;
     Ok(User {
+        avatar_agent_id: row.get(12)?,
         credential_epoch: row.get(11)?,
         id: row.get(0)?,
         email: row.get(1)?,

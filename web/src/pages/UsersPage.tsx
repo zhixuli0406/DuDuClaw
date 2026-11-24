@@ -1,7 +1,7 @@
 import { AdminMfa } from '@/components/mfa/AdminMfa';
 import { useCallback, useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
-import { api, type UserDetail, type UserInviteState, type PrimaryAgentRepairPreview } from '@/lib/api';
+import { api, type UserDetail, type UserInviteState, type PrimaryAgentRepairPreview, type AvatarConflict } from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
 import { dashboardBaseUrl } from '@/lib/dashboard-base';
 import { InviteEmailPreview, InviteLinkDialog, InviteStatusChip } from './users/InviteControls';
@@ -52,6 +52,7 @@ export function UsersPage() {
   const [inviting, setInviting] = useState(false);
   const [repairPreview, setRepairPreview] = useState<PrimaryAgentRepairPreview | null>(null);
   const [repairCandidates, setRepairCandidates] = useState<PrimaryAgentRepairPreview | null>(null);
+  const [avatarConflicts, setAvatarConflicts] = useState<AvatarConflict[] | null>([]);
   const [repairing, setRepairing] = useState(false);
   const [users, setUsers] = useState<UserDetail[]>([]);
   const [loading, setLoading] = useState(true);
@@ -82,6 +83,8 @@ export function UsersPage() {
       const { users: data } = await api.users.list();
       setUsers(data);
       if (isAdmin) {
+        try { const result = await api.users.avatarConflicts(); setAvatarConflicts(result.conflicts ?? []); }
+        catch { setAvatarConflicts(null); }
         try {
           const preview = await api.users.repairPrimaryAgents();
           setRepairCandidates(Array.isArray(preview.members) && typeof preview.preview_digest === 'string' ? preview : null);
@@ -202,6 +205,15 @@ export function UsersPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>}
+      {isAdmin && (avatarConflicts === null ? <p role="alert">{intl.formatMessage({ id: 'users.avatar.loadError' })}</p> : avatarConflicts.length > 0 && (
+        <div className="space-y-2 rounded-lg border border-surface-border p-4">
+          <p className="font-medium">{intl.formatMessage({ id: 'users.avatar.conflicts' })}</p>
+          <p className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'users.avatar.conflictsHint' })}</p>
+          <ul className="space-y-1 text-sm">{avatarConflicts.map(conflict => <li key={conflict.agent_id}>
+            {agentName(conflict.agent_id)}: {conflict.user_ids.map(id => nameOf(id) || id).join(', ')}
+          </li>)}</ul>
+        </div>
+      ))}
       <OrgHistorySettings />
       <AdminMfa />
 
@@ -254,6 +266,7 @@ export function UsersPage() {
                 </div>
                 <div className="flex flex-col gap-0.5">
                   <RoleDetails user={user} managerName={nameOf(user.manager_user_id)} />
+                  <span className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'users.avatar.label' })}: {user.avatar_agent_id ? agentName(user.avatar_agent_id) : intl.formatMessage({ id: 'users.manager.none' })}</span>
                 </div>
                 <div className="space-y-1">
                   <p className="text-xs font-medium text-muted-foreground">
@@ -306,6 +319,7 @@ export function UsersPage() {
                 <ListGridCell className="flex-col items-start gap-0.5">
                   <RoleBadge role={user.role} />
                   <RoleDetails user={user} managerName={nameOf(user.manager_user_id)} />
+                  <span className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'users.avatar.label' })}: {user.avatar_agent_id ? agentName(user.avatar_agent_id) : intl.formatMessage({ id: 'users.manager.none' })}</span>
                 </ListGridCell>
                 <ListGridCell className="flex-wrap gap-1 py-1.5">
                   <BindingChips user={user} agentName={agentName} onUnbind={(a) => handleUnbind(user.id, a)} />

@@ -229,7 +229,7 @@ export const useConversationsStore = create<ConversationsState>((set, get) => {
       if (requiresAssignedChatAgent()) useChatStore.getState().selectAgent(null);
       if (!requiresAssignedChatAgent()) {
         const primary = useAgentsStore.getState().agents.find(agent =>
-          agent.name === useAuthStore.getState().user?.primary_agent_id);
+          agent.name === (useAuthStore.getState().user?.avatar_agent_id ?? useAuthStore.getState().user?.primary_agent_id));
         if (primary) useChatStore.getState().selectAgent(primary.role === 'main' ? null : primary.name);
       }
       const chat = useChatStore.getState();

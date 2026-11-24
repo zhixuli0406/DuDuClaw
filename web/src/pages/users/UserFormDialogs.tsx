@@ -170,12 +170,12 @@ export function EditUserDialog({
   const agentName = useAgentDisplayName();
   const assignablePrimaryAgents = user.assignable_primary_agents ?? [];
   const primaryPersonalExcluded = user.primary_personal_excluded ?? false;
-  const [primary, setPrimary] = useState(user.primary_agent_id ?? '');
+  const [primary, setPrimary] = useState(user.avatar_agent_id ?? '');
   const savePrimary = async () => {
     setSubmitting(true);
     setError('');
     try {
-      await api.users.setPrimaryAgent(primary || null, user.id);
+      await api.users.setAvatar(user.id, primary || null);
       onUpdated();
     } catch (e) { setError(userWriteError(e, intl)); }
     finally { setSubmitting(false); }
@@ -265,9 +265,9 @@ export function EditUserDialog({
               onChange={(e) => setNewPassword(e.target.value)}
             />
           </DialogField>
-          <DialogField label={intl.formatMessage({ id: 'users.primary.label' })}>
+          <DialogField label={intl.formatMessage({ id: 'users.avatar.label' })}>
             <Select value={primary || '__none__'} onValueChange={v => setPrimary(v === '__none__' ? '' : String(v))}>
-              <SelectTrigger className="w-full" aria-label={intl.formatMessage({ id: 'users.primary.label' })}><SelectValue>{primary ? agentName(primary) : intl.formatMessage({ id: 'users.manager.none' })}</SelectValue></SelectTrigger>
+              <SelectTrigger className="w-full" aria-label={intl.formatMessage({ id: 'users.avatar.label' })}><SelectValue>{primary ? agentName(primary) : intl.formatMessage({ id: 'users.manager.none' })}</SelectValue></SelectTrigger>
               <SelectContent>
                 <SelectItem value="__none__">{intl.formatMessage({ id: 'users.manager.none' })}</SelectItem>
                 {assignablePrimaryAgents.map(agentId => (
@@ -277,8 +277,8 @@ export function EditUserDialog({
             </Select>
             {assignablePrimaryAgents.length === 0 && <p className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'users.primary.empty' })}</p>}
             {primaryPersonalExcluded && <p className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'users.primary.personalSelf' })}</p>}
-            <Button variant="outline" disabled={submitting || primary === (user.primary_agent_id ?? '')} onClick={() => void savePrimary()}>
-              {intl.formatMessage({ id: 'users.primary.save' })}
+            <Button variant="outline" disabled={submitting || primary === (user.avatar_agent_id ?? '')} onClick={() => void savePrimary()}>
+              {intl.formatMessage({ id: 'users.avatar.save' })}
             </Button>
           </DialogField>
           <RevokeUserSessions userId={user.id} name={user.display_name || user.email} />

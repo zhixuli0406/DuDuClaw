@@ -740,3 +740,20 @@ async fn session_info_uses_the_engine_default_for_a_live_edited_claude_alias() {
     let json = serde_json::to_value(frame).unwrap();
     assert_eq!(json["model"], "gpt-5.6-sol");
 }
+
+#[tokio::test]
+async fn rm212_new_webchat_uses_avatar_and_keeps_legacy_primary_fallback() {
+    let f = fixture().await;
+    let db = &f.state.user_db;
+    let admin = db.create_user("admin@avatar-webchat.test", "Admin", "password123", UserRole::Admin).unwrap();
+    db.bind_agent(&f.emp, "sales-rep", AccessLevel::Operator).unwrap();
+    db.set_primary_agent(&f.emp, Some("finance")).unwrap();
+    assert_eq!(route(&f, "hello", None).await.unwrap().agent.as_deref(), Some("finance"));
+    db.set_avatar_as(&admin.id, &f.emp, Some("sales-rep")).unwrap();
+    assert_eq!(route(&f, "hello", None).await.unwrap().agent.as_deref(), Some("sales-rep"));
+    db.unbind_agent(&f.emp, "sales-rep").unwrap();
+    assert_eq!(route(&f, "hello", None).await.unwrap().agent.as_deref(), Some("finance"));
+    db.set_avatar_as(&admin.id, &f.emp, None).unwrap();
+    db.set_primary_agent(&f.emp, Some("finance")).unwrap();
+    assert_eq!(route(&f, "hello", None).await.unwrap().agent.as_deref(), Some("finance"));
+}

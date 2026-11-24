@@ -2617,6 +2617,7 @@ export interface NewMemberInput {
   role: 'employee' | 'manager' | 'admin';
   department?: string;
   primary_agent_id: string;
+  avatar_agent_id?: string | null;
   bindings: Array<{ agent_name: string; access_level: 'operator' | 'viewer' }>;
   invite: boolean;
 }
@@ -2627,7 +2628,10 @@ export interface CreateMemberResult {
   error?: string;
 }
 
+export interface AvatarConflict { agent_id: string; user_ids: string[] }
+
 export interface UserInfo {
+  avatar_agent_id?: string | null;
   primary_agent_id?: string | null;
   id: string;
   email: string;
@@ -9876,6 +9880,10 @@ export const api = {
       }>,
     repairPrimaryAgents: (previewDigest?: string) =>
       client.call('users.repair_primary_agents', previewDigest !== undefined ? { preview_digest: previewDigest } : {}) as Promise<PrimaryAgentRepairPreview>,
+    avatarConflicts: () =>
+      client.call('users.avatar_conflicts') as Promise<{ conflicts: AvatarConflict[] }>,
+    setAvatar: (userId: string, agentId: string | null) =>
+      client.call('users.set_avatar', { user_id: userId, agent_id: agentId }) as Promise<{ avatar_agent_id: string | null }>,
     setPrimaryAgent: (agentId: string | null, userId?: string) =>
       client.call('users.set_primary_agent', { agent_id: agentId, ...(userId ? { user_id: userId } : {}) }) as Promise<{ primary_agent_id: string | null }>,
     me: () =>

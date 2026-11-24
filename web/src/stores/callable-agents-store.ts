@@ -71,7 +71,7 @@ export const useCallableAgentsStore = create<CallableStore>((set, get) => ({
 
 export function callableSubject() {
   const { user, bindings, jwt } = useAuthStore.getState();
-  return JSON.stringify([user?.id, user?.role, user?.status, user?.primary_agent_id,
+  return JSON.stringify([user?.id, user?.role, user?.status, user?.primary_agent_id, user?.avatar_agent_id,
     bindings.map(b => [b.agent_name, b.access_level]).sort(), jwt,
     useSystemStore.getState().status?.edition_profile]);
 }

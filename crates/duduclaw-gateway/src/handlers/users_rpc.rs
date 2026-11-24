@@ -38,6 +38,18 @@ pub(super) fn validate_settings(params: &Value, allowed: &[&str]) -> Result<(), 
     Ok(())
 }
 
+fn avatar_error(code: &str) -> WsFrame {
+    let (code, zh, en) = match code {
+        "avatar_primary_locked" => ("avatar_primary_locked", "已有 AI 分身，請聯絡管理員變更。", "An AI avatar is assigned. Contact an administrator to change it."),
+        "avatar_agent_in_use" => ("avatar_agent_in_use", "這位 AI 已是其他成員的分身。", "This AI is already another member's avatar."),
+        "avatar_admin_required" => ("avatar_admin_required", "只有管理員可以設定 AI 分身。", "Only administrators can assign AI avatars."),
+        "avatar_binding_required" => ("avatar_binding_required", "請選擇此成員可操作的 AI 員工。", "Choose an AI employee with an Owner or Operator binding for this active member."),
+        _ => ("avatar_unavailable", "無法讀取或設定 AI 分身，請稍後再試。", "Unable to read or assign the AI avatar. Try again later."),
+    };
+    WsFrame::Response { id: String::new(), ok: false, payload: None,
+        error: Some(json!({"code": code, "message": format!("{zh} {en}"), "message_zh_TW": zh, "message_en": en})) }
+}
+
 impl MethodHandler {
     // ── User management handlers (admin only) ────────────────
 
@@ -89,6 +101,7 @@ impl MethodHandler {
                         "invite_eligible": invite_eligible,
                         "bindings": bindings,
                         "primary_agent_id": primary,
+                        "avatar_agent_id": u.avatar_agent_id,
                         "assignable_primary_agents": assignable_primary_agents,
                         "primary_personal_excluded": primary_personal_excluded,
                     }));
@@ -569,6 +582,44 @@ impl MethodHandler {
         )
     }
 
+    pub(crate) async fn handle_users_set_avatar(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        if let Err(frame) = validate_settings(&params, &["user_id", "agent_id"]) { return frame; }
+        let Some(target) = params.get("user_id").and_then(Value::as_str) else {
+            return setting_error("user_id", "required");
+        };
+        let agent = match params.get("agent_id") {
+            Some(Value::Null) => None,
+            Some(Value::String(id)) if duduclaw_core::is_valid_agent_id(id) => Some(id.as_str()),
+            _ => return setting_error("agent_id", "must be an agent id or null"),
+        };
+        let Some(db) = self.user_db.read().await.clone() else { return avatar_error("avatar_unavailable"); };
+        if !super::user_invites_rpc::live_admin(&db, ctx) { return avatar_error("avatar_admin_required"); }
+        let registry = self.registry.read().await;
+        if let Some(id) = agent {
+            if registry.get(id).is_none() { return setting_error("agent_id", "AI employee does not exist"); }
+            if crate::runtime_readiness::isolation_active() {
+                match crate::personal_visibility::personal_owner(&self.home_dir, id) {
+                    Ok(Some(owner)) if owner != ctx.user_id => return avatar_error("avatar_binding_required"),
+                    Err(_) => return avatar_error("avatar_unavailable"),
+                    _ => {}
+                }
+            }
+        }
+        match db.set_avatar_as(&ctx.user_id, target, agent) {
+            Ok(()) => WsFrame::ok_response("", json!({"avatar_agent_id": agent})),
+            Err(error) => avatar_error(&error),
+        }
+    }
+
+    pub(crate) async fn handle_users_avatar_conflicts(&self, ctx: &UserContext) -> WsFrame {
+        let Some(db) = self.user_db.read().await.clone() else { return avatar_error("avatar_unavailable"); };
+        if !super::user_invites_rpc::live_admin(&db, ctx) { return avatar_error("avatar_admin_required"); }
+        match db.avatar_conflicts() {
+            Ok(conflicts) => WsFrame::ok_response("", json!({"conflicts": conflicts})),
+            Err(_) => avatar_error("avatar_unavailable"),
+        }
+    }
+
     pub(crate) async fn handle_users_set_primary_agent(&self, params: Value, ctx: &UserContext) -> WsFrame {
         if let Err(frame) = validate_settings(&params, &["user_id", "agent_id"]) { return frame; }
         let agent = match params.get("agent_id") {
@@ -586,6 +637,7 @@ impl MethodHandler {
         }
         match db.set_primary_agent_as(&ctx.user_id, target, agent) {
             Ok(()) => WsFrame::ok_response("", json!({ "primary_agent_id": agent })),
+            Err(error) if error == "avatar_primary_locked" => avatar_error(&error),
             Err(error) if error == "agent requires an Owner or Operator binding" => setting_error("agent_id", "requires an active user and an Owner or Operator binding"),
             Err(_) => WsFrame::error_response("", "unable to save primary AI; no change was written"),
         }
@@ -635,6 +687,7 @@ impl MethodHandler {
                         "user": {
                             "id": ctx.user_id,
                             "primary_agent_id": null,
+                            "avatar_agent_id": null,
                             "email": ctx.email,
                             "role": ctx.role.to_string(),
                         },
@@ -672,6 +725,7 @@ impl MethodHandler {
                     "user": {
                         "id": ctx.user_id,
                             "primary_agent_id": null,
+                            "avatar_agent_id": null,
                         "email": ctx.email,
                         "role": ctx.role.to_string(),
                     },

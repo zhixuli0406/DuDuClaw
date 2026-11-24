@@ -20,7 +20,7 @@ async function fillMember(number: number, email: string) {
   const region = within(screen.getByRole('region', { name: `Member ${number}` }));
   await user.type(region.getByLabelText('Display name'), `Member ${number}`);
   await user.type(region.getByLabelText('Email address'), email);
-  await user.click(region.getByRole('combobox', { name: 'Primary AI staff' }));
+  await user.click(region.getByRole('combobox', { name: 'AI avatar' }));
   await user.click(await screen.findByRole('option', { name: 'Nova' }));
   return { user, region };
 }
@@ -39,7 +39,7 @@ describe('AddMembersPage', () => {
     expect(mockWsClient.call).toHaveBeenCalledWith('users.create_members', {
       public_url: window.location.origin, locale: 'en', members: [{
         display_name: 'Member 1', email: 'first@example.test', role: 'employee', department: undefined,
-        primary_agent_id: 'nova', bindings: [{ agent_name: 'nova', access_level: 'operator' }, { agent_name: 'reader', access_level: 'viewer' }], invite: true,
+        primary_agent_id: 'nova', avatar_agent_id: 'nova', bindings: [{ agent_name: 'nova', access_level: 'operator' }, { agent_name: 'reader', access_level: 'viewer' }], invite: true,
       }],
     }, false, 330000);
     expect(await screen.findByText('Account and AI staff access created. Invitation sent.')).toBeInTheDocument();
