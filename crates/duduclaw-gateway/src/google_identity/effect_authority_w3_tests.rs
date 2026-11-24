@@ -144,10 +144,9 @@ async fn w3_home_sa_and_delegate_execute_all_eighteen_actual_native_recipes() {
                 .unwrap();
             let claims: Value = serde_json::from_slice(&payload).unwrap();
             assert_eq!(claims["sub"], "declared@unit.test");
-            assert_eq!(
-                claims["scope"],
-                crate::google_workspace::REQUIRED_SCOPES.join(" ")
-            );
+            assert!(crate::google_identity::delegated_scopes::SERVICES.iter()
+                .any(|(_, scopes)| claims["scope"] == scopes.join(" ")),
+                "each token is limited to one service: {claims}");
         }
     }
 }

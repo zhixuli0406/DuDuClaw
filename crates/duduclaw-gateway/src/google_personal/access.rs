@@ -191,7 +191,7 @@ pub(super) fn check_metadata_authority(
     Ok(())
 }
 
-fn refresh_lock(home: &Path, user: &str) -> Result<Arc<tokio::sync::Mutex<()>>, Refusal> {
+pub(crate) fn refresh_lock(home: &Path, user: &str) -> Result<Arc<tokio::sync::Mutex<()>>, Refusal> {
     let home = std::fs::canonicalize(home).map_err(store_error)?;
     type Key = (PathBuf, String);
     static LOCKS: OnceLock<Mutex<HashMap<Key, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
@@ -371,7 +371,7 @@ pub async fn resolve(
     }
     check_person(home, db, agent, &user)?;
     let current_user = select_user(db, agent, selector)?;
-    if current_user.id != user.id || gi::effective_for(home, Some(agent)) != *effective {
+    if current_user.id != user.id || crate::google_identity::delegate_owner::effective_for(home, Some(agent)) != *effective {
         return Err(Refusal::hard(
             "config_invalid",
             "員工的 Google 身分已變更，請重試。",

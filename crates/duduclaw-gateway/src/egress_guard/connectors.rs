@@ -21,7 +21,7 @@ pub(super) fn declared_allowed(home: &Path, agent: &str, reference: &str) -> boo
                 .and_then(toml::Value::as_array)
                 .is_some_and(|values| values.iter().any(|v| v.as_str() == Some(source)));
     }
-    let effective = duduclaw_core::google_identity::effective_for(home, Some(agent));
+    let effective = crate::google_identity::delegate_owner::effective_for(home, Some(agent));
     if !crate::google_workspace::integration_enabled(home) { return false; }
     if reference == "google:home" {
         let granted = matches!(&effective.effective, Effective::Home)

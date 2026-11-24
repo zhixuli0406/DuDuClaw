@@ -185,7 +185,7 @@ impl PersonalSelection {
         let agent_file = file_stamp(&agent_path)?.ok_or_else(changed)?;
         let home_file = file_stamp(&home.join("config.toml"))?.ok_or_else(changed)?;
         let client_file = file_stamp(&home.join("mcp-oauth-configs.json"))?;
-        let effective = gi::effective_for(&home, Some(agent));
+        let effective = crate::google_identity::delegate_owner::effective_for(&home, Some(agent));
         let Effective::Personal { selector } = &effective.effective else {
             return Err(changed());
         };
@@ -266,7 +266,7 @@ impl PersonalSelection {
                                 != db
                                     .google_primary_owner_generation(agent)
                                     .map_err(|_| changed().message_zh)?
-                            || effective != gi::effective_for(&home, Some(agent))
+                            || effective != crate::google_identity::delegate_owner::effective_for(&home, Some(agent))
                         {
                             return Err(changed().message_zh);
                         }
@@ -310,7 +310,7 @@ impl PersonalSelection {
         if agent_file != file_stamp(&agent_path)?.ok_or_else(changed)?
             || home_file != file_stamp(&home.join("config.toml"))?.ok_or_else(changed)?
             || client_file != file_stamp(&home.join("mcp-oauth-configs.json"))?
-            || effective != gi::effective_for(&home, Some(agent))
+            || effective != crate::google_identity::delegate_owner::effective_for(&home, Some(agent))
             || acl_generation != db.acl_generation().map_err(store_error)?
             || primary_generation
                 != db

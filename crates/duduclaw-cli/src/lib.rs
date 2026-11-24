@@ -11313,6 +11313,8 @@ pub(crate) async fn scaffold_planned_agent_dir(
         .map_err(|e| DuDuClawError::Agent(e.to_string()))?;
     // Exclusive directory creation refuses a destination created after planning.
     std::fs::create_dir(&agent_dir).map_err(|e| DuDuClawError::Agent(e.to_string()))?;
+    duduclaw_core::employee_incarnation::created(home, &s.name)
+        .map_err(|e| DuDuClawError::Agent(e.to_string()))?;
     for dir in ["SKILLS", "memory", ".claude"] {
         std::fs::create_dir_all(agent_dir.join(dir))
             .map_err(|e| DuDuClawError::Agent(e.to_string()))?;

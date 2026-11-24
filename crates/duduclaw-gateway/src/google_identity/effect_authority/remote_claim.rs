@@ -76,7 +76,7 @@ impl GoogleClosedMount {
                 tenant: None,
             };
             context.validate()?;
-            let selected = match gi::effective_for(&context.home, Some(&context.agent)).effective {
+            let selected = match crate::google_identity::delegate_owner::effective_for(&context.home, Some(&context.agent)).effective {
                 gi::Effective::Personal { .. } => Some(PersonalSelection::prepare_dedicated(
                     &context.home,
                     &context.agent,
@@ -293,6 +293,13 @@ impl RemoteRequestBound {
     }
     pub(crate) fn deadline(&self) -> tokio::time::Instant {
         self.deadline
+    }
+    pub(super) fn delegation_scopes(&self, home: &Path) -> Result<&'static [&'static str], Refusal> {
+        #[cfg(test)]
+        if testing::required(home, self.entry.url()) {
+            return crate::google_identity::delegated_scopes::for_service(home, "gmail");
+        }
+        crate::google_identity::delegated_scopes::for_endpoint(home, self.entry.url())
     }
     pub(crate) fn endpoint(&self) -> &str {
         self.entry.url()

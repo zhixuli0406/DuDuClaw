@@ -53,6 +53,9 @@ export function MyConnectionsPage() {
   if (!status) return <Skeleton className="h-40 w-full" />;
   return <div className="mx-auto max-w-4xl space-y-6 p-6">
     <div><h1 className="text-2xl font-semibold">{t('myConnections.title')}</h1><p className="mt-2 text-sm text-muted-foreground">{t('myConnections.intro')}</p></div>
+    {(status.notices ?? []).map(notice => <p key={notice.id} role="status" className="rounded-lg border border-border p-3 text-sm">
+      {t(notice.kind === 'google_identity_data_test' ? 'myConnections.testNoticeData' : 'myConnections.testNotice', { agent: notice.agent_id, time: new Date(notice.timestamp).toLocaleString(intl.locale) })}
+    </p>)}
     <Card><CardHeader><CardTitle>Google</CardTitle></CardHeader><CardContent className="space-y-3">
       {status.connection && <><p className="font-medium">{status.connection.account_email}</p><p className="text-sm">{t(`myConnections.status.${status.connection.status}`)}</p>
         <Link to="/mail" className="text-sm underline">{t('nav.mail')}</Link>
@@ -64,6 +67,7 @@ export function MyConnectionsPage() {
       {!status.integration_enabled && <p className="text-sm text-warning">{t('myConnections.integrationOff')}</p>}
       {status.requires_login && <p className="text-sm text-warning">{t('myConnections.loginAgain')}</p>}
       <p className="text-xs text-muted-foreground">{t('myConnections.testing')}</p>
+      {status.chat_read && status.connection?.status === 'connected' && (!status.connection.local_purposes?.includes('chat_read') || !['chat.spaces.readonly', 'chat.messages.readonly'].every(scope => status.connection!.granted_scopes.includes(`https://www.googleapis.com/auth/${scope}`))) && <p role="status" className="text-sm text-warning">{t('myConnections.reconnectChat')}</p>}
       {status.chat_read && <p className="text-sm text-muted-foreground">{t('google.chatRead.hint')}</p>}
       <GoogleDataDisclosure confirmed={googleDataConfirmed} onConfirmedChange={setGoogleDataConfirmed}/>
       <Button disabled={busy||!status.client_configured||status.requires_login||!googleDataConfirmed} onClick={()=>void connect()}>{status.connection ? t('myConnections.reconnect') : t('myConnections.connect')}</Button>

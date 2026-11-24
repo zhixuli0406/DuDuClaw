@@ -1040,6 +1040,11 @@ impl GatewayHandler<'_> {
         // the identity route selects the authorized credential source.
         // Whole group sits behind the integration gate (hidden from tools/list
         // too); saving the user's chosen credentials enables it.
+        // Per-employee Google identity: `none` / `external` hide and refuses the whole
+        // group (same predicate as `tools/list`).
+        name if GOOGLE_WORKSPACE_TOOLS.contains(&name) && !google_caller.tools_listed(home_dir) => {
+            tool_error(google_caller.disabled_message(home_dir))
+        }
         name if GOOGLE_WORKSPACE_TOOLS.contains(&name)
             && !duduclaw_gateway::google_workspace::integration_enabled(home_dir) =>
         {
@@ -1047,11 +1052,6 @@ impl GatewayHandler<'_> {
                 "content": [{"type": "text", "text": "Google Workspace 整合尚未啟用。請操作者在 dashboard 的 整合 → Google 頁面完成連線或儲存憑證（會自動啟用），或手動在 config.toml 加上 [integrations] google_workspace = true。"}],
                 "isError": true
             })
-        }
-        // Per-employee Google identity: `none` hides and refuses the whole
-        // group (same predicate as `tools/list`).
-        name if GOOGLE_WORKSPACE_TOOLS.contains(&name) && !google_caller.tools_listed(home_dir) => {
-            tool_error("這位 AI 員工設定為不使用 Google。")
         }
         name if GOOGLE_WORKSPACE_TOOLS.contains(&name) && google_caller.is_dedicated() => {
             google_caller

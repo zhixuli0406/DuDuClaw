@@ -383,7 +383,7 @@ impl MethodHandler {
             // employee's own identity needs Viewer access to that employee.
             "google.delegation.get" => {
                 require_admin!();
-                boxed_frame(|| self.handle_google_delegation_get()).await
+                boxed_frame(|| self.handle_google_delegation_get(ctx)).await
             }
             "google.delegation.import_key" => {
                 require_admin!();
@@ -419,7 +419,7 @@ impl MethodHandler {
             }
             "google.identity.test" => {
                 require_admin!();
-                boxed_frame(|| self.handle_google_identity_test(params)).await
+                boxed_frame(|| self.handle_google_identity_test(params, ctx)).await
             }
             "agents.google_identity_get" => {
                 let agent_id = params

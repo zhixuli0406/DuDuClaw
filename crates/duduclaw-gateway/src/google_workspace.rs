@@ -623,6 +623,12 @@ pub async fn resolve_backend(home_dir: &Path) -> Result<GoogleBackend, GoogleAut
     }
 }
 
+/// Native calls select only the service their operation needs when minting delegation.
+pub async fn resolve_backend_for_tool(home_dir: &Path, tool: &str) -> Result<GoogleBackend, GoogleAuthError> {
+    if selected_path(home_dir)? == "apps_script" { return resolve_backend(home_dir).await; }
+    get_valid_google_token_for_tool(home_dir, tool).await.map(GoogleBackend::Direct)
+}
+
 /// Metadata only: resolving the effective path must not mint a token.
 pub(crate) fn selected_path(home: &Path) -> Result<String, GoogleAuthError> {
     let raw = match std::fs::read_to_string(home.join("config.toml")) {
@@ -757,7 +763,7 @@ fn scope_probes(scopes: &[String]) -> Vec<ServiceProbe> {
 // ── Token acquisition ───────────────────────────────────────────────────────
 
 /// Original public adapter; the sealed Home owner now resolves OAuth.
-pub use crate::google_identity::home_source::get_valid_google_token;
+pub use crate::google_identity::home_source::{get_valid_google_token, get_valid_google_token_for_tool, get_valid_google_token_for_endpoint};
 
 // ── HTTP plumbing ───────────────────────────────────────────────────────────
 

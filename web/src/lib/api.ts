@@ -6290,8 +6290,9 @@ export interface GoogleCredentialsStatus {
 // ── Per-employee Google identity (B2a) ──
 // Which Google account each AI employee acts as. Never carries a key or a
 // token: the delegation key is sealed in the gateway.
-export type GoogleIdentityKind = 'home' | 'none' | 'delegate' | 'owner' | 'user' | 'invalid';
+export type GoogleIdentityKind = 'home' | 'none' | 'external' | 'delegate_owner' | 'delegate' | 'owner' | 'user' | 'invalid';
 export interface AgentGoogleIdentity {
+  external_server?: string | null;
   agent_id: string;
   kind: GoogleIdentityKind;
   identity?: string | null;
@@ -6306,7 +6307,7 @@ export interface AgentGoogleIdentity {
   fallback: 'none' | 'home';
   requesters: 'bound_people' | 'owner_only' | 'anyone';
   /** `ready` means locally configured, not a successful unseal or Google probe. */
-  state: 'home' | 'none' | 'ready' | 'blocked' | 'configured' | 'needs_reconnect' | 'not_connected' | 'awaiting_consent' | 'consent_declined' | 'person_inactive' | 'no_owner' | 'ambiguous_owner';
+  state: 'home' | 'none' | 'external' | 'ready' | 'blocked' | 'configured' | 'needs_reconnect' | 'not_connected' | 'awaiting_consent' | 'consent_declined' | 'person_inactive' | 'no_owner' | 'ambiguous_owner';
   /** zh-TW reason when blocked. */
   message: string;
   /** Protected mode only: the D-5 standing of a tenant-source subject (`null` elsewhere). */
@@ -6356,6 +6357,7 @@ export interface GoogleDelegationKeyInfo {
   key_id: string;
 }
 export interface GoogleDelegationStatus {
+  step_up?: ProtectedStepUpState;
   protection: CredentialProtectionStatus;
   key: GoogleDelegationKeyInfo | null;
   key_error: string | null;
@@ -6493,6 +6495,7 @@ export interface ProtectedWebsiteCredential {
 }
 // ── end v1.81 F5 part A types ────────────────────────────────────────────────
 export interface GoogleIdentitySetInput {
+  external_server?: string;
   agent_id: string;
   /** `home`, `none` or `delegate:<email>`. */
   identity: string;
@@ -6558,6 +6561,7 @@ export interface MyMemoryForgetResult {
 }
 
 export interface PersonalGoogleStatus {
+  notices?: { id: number; agent_id: string; actor_id: string; kind: string; timestamp: string }[];
   chat_read?: boolean;
   connection: { owner_id: string; account_email: string; granted_scopes: string[]; local_purposes?: string[]; status: 'connected' | 'needs_reconnect' | 'suspended'; connected_at: string } | null;
   login_email: string;

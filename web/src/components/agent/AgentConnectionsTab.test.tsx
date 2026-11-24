@@ -30,6 +30,25 @@ beforeEach(() => {
 });
 
 describe('AgentConnectionsTab', () => {
+  it('labels external Google and renders the optional server name as text', async () => {
+    setRole('admin');
+    vi.spyOn(api.googleIdentity, 'get').mockResolvedValue({ ...HOME, kind: 'external', state: 'external', external_server: '<img src=x onerror=alert(1)>' });
+    renderWithProviders(<AgentConnectionsTab agentId="bot" />);
+    expect(await screen.findByText('Provided by an external tool')).toBeInTheDocument();
+    expect(screen.getByText('<img src=x onerror=alert(1)>')).toBeInTheDocument();
+    expect(screen.queryByRole('img')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Test connection' })).not.toBeInTheDocument();
+  });
+
+  it.each(['owner', 'user', 'delegate_owner'] as const)('allows an administrator to test %s', async kind => {
+    setRole('admin');
+    vi.spyOn(api.googleIdentity, 'get').mockResolvedValue({ ...HOME, kind, email: 'alice@c.test' });
+    const test = vi.spyOn(api.googleIdentity, 'test').mockResolvedValue({ agent_id: 'bot', email: 'alice@c.test', ok: true, steps: [] });
+    renderWithProviders(<AgentConnectionsTab agentId="bot" />);
+    await userEvent.click(await screen.findByRole('button', { name: 'Test connection' }));
+    expect(test).toHaveBeenCalledWith('bot');
+  });
+
   const owners = [
     { user_id: 'alice', name: 'Alice', email: 'alice@test.invalid', is_primary: true },
     { user_id: 'bob', name: 'Bob', email: 'bob@test.invalid', is_primary: false },

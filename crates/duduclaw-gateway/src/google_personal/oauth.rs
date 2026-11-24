@@ -268,6 +268,26 @@ pub async fn refresh(
     parse_tokens(response_json(response).await?)
 }
 
+#[cfg(test)]
+tokio::task_local! { pub(crate) static TEST_TOKENINFO_URL: String; }
+
+/// Connection diagnostics use only OAuth metadata, never a Workspace API.
+pub(crate) async fn tokeninfo(access_token: &str, client_id: &str) -> Result<Vec<String>, Error> {
+    let tokeninfo_url = endpoint("https://oauth2.googleapis.com/tokeninfo");
+    #[cfg(test)]
+    let tokeninfo_url = TEST_TOKENINFO_URL.try_with(Clone::clone).unwrap_or(tokeninfo_url);
+    let response = client()?
+        .get(tokeninfo_url)
+        .query(&[("access_token", access_token)])
+        .send().await.map_err(|_| Error::Unavailable)?;
+    let value = response_json(response).await?;
+    if value.get("aud").and_then(serde_json::Value::as_str) != Some(client_id) {
+        return Err(Error::Unavailable);
+    }
+    let scopes = value.get("scope").and_then(serde_json::Value::as_str).ok_or(Error::Unavailable)?;
+    Ok(scopes.split_whitespace().map(str::to_owned).collect())
+}
+
 pub(crate) async fn refresh_scoped(
     client_id: &str,
     client_secret: &str,

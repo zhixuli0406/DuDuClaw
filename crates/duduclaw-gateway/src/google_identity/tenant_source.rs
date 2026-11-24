@@ -441,12 +441,12 @@ pub(crate) fn audit_email_conflict(home: &Path, user_id: &str, email: &str) {
 /// OAuth, Personal, none).
 pub(crate) fn read(home: &Path, agent: &str) -> Result<Option<TenantSource>, TenantSourceError> {
     let home_config = gi::read_home_config(home);
-    let effective = gi::combine(&gi::read_agent_section(home, agent), &home_config);
+    let effective = super::delegate_owner::effective_for(home, Some(agent));
     let config = home_config.map_err(|_| TenantSourceError::Unavailable)?;
     let configured_scopes = || -> Result<Vec<String>, TenantSourceError> {
         // Only scopes the tenant mint actually requests; anything else is a
         // configuration error, never silently widened or dropped.
-        if config.tenant_scopes.iter().any(|scope| !crate::google_workspace::REQUIRED_SCOPES.contains(&scope.as_str())) {
+        if config.tenant_scopes.iter().any(|scope| !crate::google_workspace::REQUIRED_SCOPES.contains(&scope.as_str()) && !crate::google_workspace::CHAT_READ_SCOPES.contains(&scope.as_str())) {
             return Err(TenantSourceError::Unavailable);
         }
         Ok(config.tenant_scopes.clone())
@@ -500,7 +500,8 @@ pub(crate) fn read(home: &Path, agent: &str) -> Result<Option<TenantSource>, Ten
                 service_mailboxes: config.service_mailboxes.clone(), scopes: configured_scopes()?,
                 material: material_digest("service_account", &key) }))
         }
-        Effective::Personal { .. } | Effective::Disabled => Ok(None),
+        Effective::Personal { .. } | Effective::Disabled | Effective::External => Ok(None),
+        Effective::DelegateOwner => Err(TenantSourceError::Refused),
     }
 }
 

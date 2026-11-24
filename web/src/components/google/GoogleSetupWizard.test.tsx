@@ -17,6 +17,16 @@ beforeEach(() => {
 const renderWizard = () => renderWithProviders(<GoogleSetupWizard open onOpenChange={vi.fn()} />);
 
 describe('Google setup wizard', () => {
+  it('preselects Chat reading without saving until Save is pressed', async () => {
+    sessionStorage.setItem(GOOGLE_SETUP_STORAGE, JSON.stringify({ path: 'external', step: 2, testing: false }));
+    const save = vi.spyOn(api.googleCredentials, 'setChatRead').mockResolvedValue({ chat_read: true, changed: true });
+    renderWizard();
+    expect(await screen.findByRole('checkbox', { name: 'Read Google Chat' })).toBeChecked();
+    expect(save).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole('button', { name: 'Save Chat reading option' }));
+    expect(save).toHaveBeenCalledWith(true);
+  });
+
   it.each([
     ['Company Workspace with a super administrator', /Create a service account and a JSON key/],
     ['Company Workspace with my own OAuth client', /Internal allows only organization members/],
