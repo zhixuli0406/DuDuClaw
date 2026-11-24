@@ -554,15 +554,64 @@ pub(crate) async fn handle_tools_list_for_transport(
         }
         _ => visible_tools(principal, home_dir, default_agent).await,
     };
-    let tools: Vec<Value> = tools.into_iter().map(build_tool_schema).collect();
+    let native_rest = google_native_rest_available(home_dir, principal);
+    let tools: Vec<Value> = tools.into_iter().map(|t| backend_tool_schema(t, native_rest)).collect();
     jsonrpc_response(id, serde_json::json!({ "tools": tools }))
+}
+
+fn google_native_rest_available(
+    home: &Path, principal: &crate::mcp_auth::Principal,
+) -> bool {
+    if crate::mcp_auth::dedicated_google_call(home, principal).is_some() {
+        duduclaw_gateway::google_workspace::native_rest_available(home, Some(&principal.client_id))
+    } else {
+        super::google_identity_client::GoogleCaller::for_process(home, &principal.client_id)
+            .native_rest_available(home)
+    }
+}
+
+fn backend_tool_schema(tool: &ToolDef, native_rest: bool) -> Value {
+    let mut schema = build_tool_schema(tool);
+    if !duduclaw_gateway::google_workspace::backend_supports_tool(native_rest, tool.name, true)
+        && tool.name == "gmail_create_draft"
+    {
+        if let Some(properties) = schema["inputSchema"]["properties"].as_object_mut() {
+            for key in ["thread_id", "in_reply_to", "references"] { properties.remove(key); }
+        }
+    }
+    schema
+}
+
+/// Names plus the backend-dependent draft schema, compared by the existing
+/// listChanged watcher even when only reply fields enter or leave the list.
+pub(crate) async fn visible_tool_snapshot(
+    principal: &crate::mcp_auth::Principal, home: &Path, default_agent: &str,
+) -> Vec<String> {
+    let native_rest = google_native_rest_available(home, principal);
+    visible_tools(principal, home, default_agent).await.into_iter().map(|tool| {
+        if tool.name == "gmail_create_draft" {
+            tool_schema_snapshot(&backend_tool_schema(tool, native_rest)).unwrap()
+        } else { tool.name.to_owned() }
+    }).collect()
+}
+
+fn tool_schema_snapshot(tool: &Value) -> Option<String> {
+    let name = tool["name"].as_str()?;
+    Some(if name == "gmail_create_draft" {
+        format!("{name}:{}", tool["inputSchema"])
+    } else { name.to_owned() })
+}
+
+pub(crate) fn advertised_tool_snapshot(response: &Value) -> Vec<String> {
+    response["result"]["tools"].as_array()
+        .map(|tools| tools.iter().filter_map(tool_schema_snapshot).collect())
+        .unwrap_or_default()
 }
 
 /// The exact set of tool names this caller would be shown right now.
 ///
-/// Extracted from [`handle_tools_list_for_agent`] so the stdio server can poll
-/// it and tell — by comparing sets, not by guessing at file mtimes — whether a
-/// `notifications/tools/list_changed` is owed.
+/// Name-only view for callers that do not need schema changes. The stdio
+/// watcher uses [`visible_tool_snapshot`] to include backend-dependent fields.
 pub(crate) async fn visible_tool_names(
     principal: &crate::mcp_auth::Principal,
     home_dir: &Path,
@@ -638,6 +687,7 @@ pub(crate) async fn visible_tools_in_lane(
     };
     let google_enabled =
         duduclaw_gateway::google_workspace::integration_enabled(home_dir) && google_listed;
+    let google_native_rest = google_native_rest_available(home_dir, principal);
     // H8: same deny-by-default gate for GitHub — discoverable ⇔ callable.
     let github_enabled = duduclaw_gateway::github_workspace::integration_enabled(home_dir);
 
@@ -904,6 +954,7 @@ pub(crate) async fn visible_tools_in_lane(
                 || crate::mcp_auth::dedicated_google_tool_allowed(home_dir, principal, t.name)
         })
         .filter(|t| google_enabled || !GOOGLE_WORKSPACE_TOOLS.contains(&t.name))
+        .filter(|t| duduclaw_gateway::google_workspace::backend_supports_tool(google_native_rest, t.name, false))
         .filter(|t| {
             !matches!(t.name, "google_chat_spaces" | "google_chat_messages")
                 || duduclaw_gateway::google_workspace::chat_read_tool_available(home_dir, t.name)

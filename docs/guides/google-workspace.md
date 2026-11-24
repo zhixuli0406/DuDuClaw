@@ -1,10 +1,10 @@
 # Google Workspace tools and security
 
-For setup, use [Connect Google](google-setup.md). Native REST tools cover nine services and twenty-one tools. The Apps Script path covers three services and eight actions including status. The dashboard remains visible with the integration disabled; tools are hidden until `[integrations] google_workspace = true`. DuDuClaw does not ship shared OAuth credentials.
+For setup, use [Connect Google](google-setup.md). Native REST tools cover nine services and twenty-six tools. The Apps Script path covers three services and eight actions including status. The dashboard remains visible with the integration disabled; tools are hidden until `[integrations] google_workspace = true`. DuDuClaw does not ship shared OAuth credentials.
 
 ## What you get
 
-Twenty-one agent-facing MCP tools, gated by two scopes (`google:read` /
+Twenty-six agent-facing MCP tools, gated by two scopes (`google:read` /
 `google:write`):
 
 | Tool | Class | What it does |
@@ -28,8 +28,15 @@ Twenty-one agent-facing MCP tools, gated by two scopes (`google:read` /
 | `drive_search` | read | Search Drive by file **name and full text** (trashed files excluded, newest first). Optional exact MIME filter. |
 | `drive_read` | read | Read a Drive file as text: Docs/Slides export as plain text, Sheets as CSV (**first sheet only**), text-like blobs verbatim. Binary types return metadata + a note, never binary content. |
 | `docs_read` | read | Read a Google Doc's text in document order, including table cell text. |
-| `docs_append` | write | Append text to the **end** of a Doc. Append-only — no tool rewrites or deletes existing content. |
+| `docs_append` | write | Append text to the **end** of a Doc. |
+| `docs_create` | write | Create a Doc in My Drive root; optional initial text. |
+| `docs_replace_text` | write | Replace matching text in a Doc; case-sensitive by default. |
+| `sheets_create` | write | Create a spreadsheet, optionally with named sheets. |
+| `sheets_update` | write | Update up to 10,000 cells; RAW by default. |
+| `calendar_update_event` | write | Edit an event; always uses send approval rules because attendee calendars may change. |
 | `slides_read` | read | Read a presentation's text slide by slide (shapes, grouped shapes, table cells). |
+
+These five write tools and Gmail reply fields (`thread_id`, `in_reply_to`, `references`) require native REST. Apps Script Bridge hides unsupported tools and reply fields. Changing the backend triggers `notifications/tools/list_changed`. Gmail `to` and `cc` accept comma-separated email addresses (up to 1,000 characters per field); each mailbox is validated and control characters are refused.
 
 Write results report only what Google returned. `calendar_create_event` lists how many attendees were added (or "Attendees: none") and never claims anyone was notified; a missing event ID is an error. `gmail_create_draft` with no draft ID back is an error. `sheets_append` shows row and cell counts only when Google reports them. On the Apps Script path, a row is always appended to the **first sheet** of the spreadsheet: the result says so and that the requested range was ignored. An Apps Script reply counts as success only in that action's success shape; an empty reply, `ok: false` or any `error` field is a tool error with the reason.
 
@@ -54,19 +61,45 @@ which is why they are served natively here.
   Calendar.
 - **Forms, Drive and Slides are read-only.** No tool creates or edits a form,
   writes to Drive, or modifies a presentation. Only Gmail (draft), Calendar,
-  Sheets, Docs (append) and Tasks have write tools.
+  Sheets, Docs and Tasks have write tools.
 - **Least privilege.** Drive is requested `drive.readonly` (never `drive` or
-  `drive.file` — nothing creates Drive files) and Slides
-  `presentations.readonly`. Docs needs full `documents` only because
-  `docs_append` writes.
+  `drive.file` — Docs and Sheets creation uses their own service scopes) and Slides
+  `presentations.readonly`. Docs uses the existing full `documents` scope for its write tools.
 - **Optional approval gate.** For extra caution, list the write tools under an
   agent's `agent.toml [capabilities] approval_required_tools` so each draft,
   event, or spreadsheet write waits for HITL approval:
 
   ```toml
   [capabilities]
-  approval_required_tools = ["gmail_create_draft", "calendar_create_event", "sheets_append", "gtasks_create", "gtasks_complete", "docs_append"]
+  approval_required_tools = ["gmail_create_draft", "calendar_create_event", "sheets_append", "gtasks_create", "gtasks_complete", "docs_append", "docs_create", "docs_replace_text", "sheets_create", "sheets_update", "calendar_update_event"]
   ```
+
+## Create and edit Google content
+
+These native tools reuse the existing `documents`, `spreadsheets` and `calendar.events` OAuth scopes. They require `google:write`; a `google:read` employee cannot list or call them. Personal connections must also have the corresponding service scope. Domain-wide delegation uses the same native tool names. New tools and reply drafts require native REST access; Apps Script Bridge does not implement these operations.
+
+| Native tool | Arguments and behavior |
+|---|---|
+| `docs_create` | Required `title`, optional `body`. Creates a Doc in My Drive root. |
+| `docs_replace_text` | `document_id`, nonempty `find`, `replace`, optional `match_case` (default `true`). Replaces every match and returns `occurrencesChanged`. |
+| `sheets_create` | Required `title`, optional `sheet_names` array (up to 100 names). Creates a spreadsheet in My Drive root. |
+| `sheets_update` | `spreadsheet_id`, A1 `range`, 2-D `values` array (up to 10,000 cells). `value_input_option` is `RAW` by default; opt into `USER_ENTERED` for formulas, dates and typed values. |
+| `calendar_update_event` | `event_id`, optional `calendar_id` (default `primary`), and at least one of `summary`, `description`, `location`, RFC3339 `start` / `end`, or `attendees` (email array; `[]` clears attendees). Every call applies the same `send` action rules and approval path as `calendar_create_event`: attendee calendars may change even with `sendUpdates=none`. This remains the default notification parameter; `notify_attendees=true` changes it to `all`. |
+
+Text has a 20,000-character limit (titles: 1,000; sheet names: 100; A1 ranges: 1,000). Over-limit input is refused before action rules, approval or digest binding, and is never truncated. Results contain machine-readable `structuredContent`: `documentId` or `spreadsheetId` plus `url`, or the event `id` and `htmlLink`. IDs can be reused in later tool calls. Google content echoed in results is screened before return. Creating a Doc with initial text takes two requests; if insertion fails, check My Drive for the created document before retrying.
+
+For a reply draft, call `gmail_create_draft` with its existing parameters plus `thread_id` and `in_reply_to` (the original email's RFC `Message-ID`, for example `<original@example.com>`). Keep the original subject, with a reply prefix if needed. Optional `references` holds the existing References chain including the original Message-ID; it defaults to `in_reply_to`. These inputs set Gmail `threadId`, `In-Reply-To` and `References`. The caller supplies the headers so a compose-only connection needs no additional read scope. This still saves a draft and never sends mail.
+
+### Migrating a self-hosted Google MCP server
+
+Use native names in skills when replacing a customer-managed server such as hcatwn-google. These are name mappings, not registered aliases; compare each server's argument schema before migrating.
+
+| Self-hosted tool name | DuDuClaw native name |
+|---|---|
+| `calendar_list` | `calendar_list_events` |
+| `gmail_draft` | `gmail_create_draft` |
+
+Use the native names in the table above for new Docs, Sheets and calendar editing workflows. Other self-hosted servers may use different names; check their tool list. Google official remote MCP tools retain Google's names and are a separate integration.
 
 ## Read personal Google Chat conversations (opt-in)
 
@@ -155,7 +188,7 @@ allowed_subject_domains = ["customer.com"]
 ```
 
 An employee without `[google]` uses `default_identity`, so an existing
-installation behaves exactly as before. `none` hides the 21 Google tools
+installation behaves exactly as before. `none` hides the 26 Google tools
 from that employee and refuses calls to them. A value that cannot be read
 (a typo, an unknown key) refuses Google for that employee; it never turns
 into the shared account. Enterprise employees may use `owner` or `user:<id>`

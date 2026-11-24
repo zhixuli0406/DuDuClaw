@@ -296,7 +296,7 @@ impl NativeConnectorExecutor {
             // Direct-OAuth-only backend rule and its content-free audit.
             "google_chat_spaces" | "google_chat_messages" |
             "sheets_read" | "sheets_append" | "forms_get" | "forms_list_responses" | "gtasks_lists" | "gtasks_list" |
-            "gtasks_create" | "gtasks_complete" | "drive_search" | "drive_read" | "docs_read" | "docs_append" | "slides_read" => {
+            "gtasks_create" | "gtasks_complete" | "drive_search" | "drive_read" | "docs_read" | "docs_append" | "docs_create" | "docs_replace_text" | "sheets_create" | "sheets_update" | "calendar_update_event" | "slides_read" => {
                 let access = FixedGoogleAccess { selected, credential: &token, tool };
                 let result = crate::google_workspace::native_legacy::handle(tool, args, &self.policy.home, &access).await;
                 if result.get("isError").and_then(Value::as_bool) == Some(true) { remote_error() } else { result }

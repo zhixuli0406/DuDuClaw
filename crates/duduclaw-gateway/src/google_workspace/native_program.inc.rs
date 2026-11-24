@@ -293,9 +293,22 @@ pub(super) async fn gmail_create_draft<I: LocalIo>(
     body_text: &str,
     cc: Option<&str>,
 ) -> Result<GmailDraftResult, GoogleApiError> {
-    let raw = build_rfc2822(to, subject, body_text, cc);
+    gmail_draft_with_reply(io, template, to, subject, body_text, cc, None, None, None).await
+}
+
+async fn gmail_draft_with_reply<I: LocalIo>(
+    io: &mut I, template: &NativeCallTemplate, to: &str, subject: &str, body_text: &str,
+    cc: Option<&str>, thread_id: Option<&str>, in_reply_to: Option<&str>, references: Option<&str>,
+) -> Result<GmailDraftResult, GoogleApiError> {
+    crate::google_workspace::native_call::validate_draft_recipients(to, cc)
+        .map_err(|message| GoogleApiError::Api { status: 400, message })?;
+    let mut raw = build_rfc2822(to, subject, body_text, cc);
+    if let (Some(reply), Some(refs)) = (in_reply_to, references) {
+        raw = format!("In-Reply-To: {reply}\r\nReferences: {refs}\r\n{raw}");
+    }
     let encoded = encode_raw_message(&raw);
-    let payload = json!({ "message": { "raw": encoded } });
+    let mut payload = json!({ "message": { "raw": encoded } });
+    if let Some(thread) = thread_id { payload["message"]["threadId"] = json!(thread); }
 
     let resp = google_request(
         io,
@@ -926,6 +939,71 @@ pub(super) async fn docs_append<I: LocalIo>(
     })
 }
 
+fn response_id<I: LocalIo>(io: &mut I, response: &Value, field: &str) -> Result<String, GoogleApiError> {
+    let id = response.get(field).and_then(Value::as_str).filter(|id| crate::google_workspace::native_call::safe_gmail_component(id))
+        .ok_or_else(|| GoogleApiError::Api { status: 502, message: format!("Google returned no valid {field}; check the resource before retrying.") })?;
+    io.reject_derived(id)?;
+    Ok(id.to_owned())
+}
+
+async fn native_write<I: LocalIo>(io: &mut I, template: &NativeCallTemplate) -> Result<Value, GoogleApiError> {
+    use ParsedNativeArguments::*;
+    match template.parsed() {
+        DocsCreate { title, body } => {
+            let response = google_request(io, template, reqwest::Method::POST, DOCS_BASE, &[], Some(&json!({"title":title}))).await?;
+            let id = response_id(io, &response, "documentId")?;
+            if let Some(text) = body {
+                if docs_append(io, template, &id, text).await.is_err() {
+                    return Err(GoogleApiError::Api { status: 502, message: format!(
+                        "Google Doc {id} was created, but initial text insertion was not confirmed. Check https://docs.google.com/document/d/{id}/edit before retrying."
+                    ) });
+                }
+            }
+            Ok(json!({"documentId":id,"url":format!("https://docs.google.com/document/d/{id}/edit")}))
+        }
+        DocsReplace { document, find, replace, match_case } => {
+            let id = extract_drive_file_id(document);
+            let response = google_request(io, template, reqwest::Method::POST,
+                &format!("{DOCS_BASE}/{}:batchUpdate", encode_path_component(&id)), &[],
+                Some(&json!({"requests":[{"replaceAllText":{"containsText":{"text":find,"matchCase":match_case},"replaceText":replace}}]}))).await?;
+            // Missing replies are not evidence that zero occurrences changed.
+            let changed = response.pointer("/replies/0/replaceAllText/occurrencesChanged").and_then(Value::as_u64)
+                .or_else(|| response.pointer("/replies/0/replaceAllText").filter(|v| v.is_object()).map(|_| 0))
+                .ok_or_else(|| GoogleApiError::Api { status: 502, message: "Google returned no replaceAllText result; check the document before retrying.".into() })?;
+            Ok(json!({"documentId":id,"url":format!("https://docs.google.com/document/d/{id}/edit"),"occurrencesChanged":changed}))
+        }
+        SheetsCreate { title, sheet_names } => {
+            let mut body = json!({"properties":{"title":title}});
+            if let Some(names) = sheet_names {
+                if !names.is_empty() { body["sheets"] = json!(names.iter().map(|name| json!({"properties":{"title":name}})).collect::<Vec<_>>()); }
+            }
+            let response = google_request(io, template, reqwest::Method::POST, SHEETS_BASE, &[], Some(&body)).await?;
+            let id = response_id(io, &response, "spreadsheetId")?;
+            Ok(json!({"spreadsheetId":id,"url":format!("https://docs.google.com/spreadsheets/d/{id}/edit")}))
+        }
+        SheetsUpdate { spreadsheet, range, values, input_option } => {
+            let id = extract_spreadsheet_id(spreadsheet);
+            let response = google_request(io, template, reqwest::Method::PUT,
+                &format!("{SHEETS_BASE}/{}/values/{}", encode_path_component(&id), encode_path_component(range)),
+                &[("valueInputOption", input_option.clone())], Some(&json!({"range":range,"majorDimension":"ROWS","values":values}))).await?;
+            Ok(json!({"spreadsheetId":id,"url":format!("https://docs.google.com/spreadsheets/d/{id}/edit"),
+                "updatedRange":io.sanitize(&duduclaw_core::truncate_chars(response.get("updatedRange").and_then(Value::as_str).unwrap_or(range),1000)),
+                "updatedCells":response.get("updatedCells").and_then(Value::as_u64)}))
+        }
+        CalendarUpdate { calendar, event, patch, notify } => {
+            // Always a Send effect: sendUpdates controls notifications, not
+            // whether an attendee's calendar can change.
+            let response = google_request(io, template, reqwest::Method::PATCH,
+                &format!("{CALENDAR_BASE}/calendars/{}/events/{}", encode_path_component(calendar), encode_path_component(event)),
+                &[("sendUpdates", if *notify { "all" } else { "none" }.into())], Some(patch)).await?;
+            let id = response_id(io, &response, "id")?;
+            Ok(json!({"id":id,"htmlLink":io.sanitize(&duduclaw_core::truncate_chars(response.get("htmlLink").and_then(Value::as_str).unwrap_or(""),2000)),
+                "sendUpdates":if *notify { "all" } else { "none" }}))
+        }
+        _ => Err(io.refuse()),
+    }
+}
+
 pub(super) async fn slides_read<I: LocalIo>(
     io: &mut I,
     template: &NativeCallTemplate,
@@ -1516,6 +1594,7 @@ pub(super) fn scope_guidance(api_error_body: &str) -> String {
 
 pub(super) enum Outcome {
     Chat(Value),
+    Write(Value),
     GmailSearch(GmailSearchResult),
     GmailRead(GmailReadResult),
     GmailDraft(GmailDraftResult),
@@ -1586,9 +1665,37 @@ pub(super) fn sheets_appended_text(r: &SheetsAppendResult) -> String {
     text
 }
 
+// Use the shared input guard on every echoed field and on the assembled output,
+// just as untrusted Google read content is screened before returning to the model.
+fn write_response_safe(value: &Value) -> bool {
+    fn fields<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
+        match value {
+            Value::String(s) => out.push(s),
+            Value::Array(a) => a.iter().for_each(|v| fields(v, out)),
+            Value::Object(o) => o.values().for_each(|v| fields(v, out)),
+            _ => {},
+        }
+    }
+    let mut strings = Vec::new();
+    fields(value, &mut strings);
+    let safe = |text: &str| {
+        let scan = duduclaw_security::input_guard::scan_input(text, duduclaw_security::input_guard::DEFAULT_BLOCK_THRESHOLD);
+        !scan.blocked && scan.matched_rules.is_empty()
+    };
+    strings.iter().all(|s| safe(s)) && safe(&strings.join(" ")) && safe(&strings.join("")) && safe(&value.to_string())
+}
+
 pub(super) fn render<I: LocalRender>(value: Outcome, io: &mut I) -> Value {
     match value {
         Outcome::Chat(r) => render_chat(&r, io),
+        Outcome::Write(r) => {
+            if !write_response_safe(&r) { return tool_error("Google response failed content screening; check the resource before retrying."); }
+            let mut result = render_json(&r, io);
+            if result.get("isError").and_then(Value::as_bool) != Some(true) {
+                result["structuredContent"] = r;
+            }
+            result
+        },
         Outcome::GmailSearch(r) => render_json(&r, io),
         Outcome::GmailRead(r) => render_json(&r, io),
         Outcome::CalendarList(r) => render_json(&r, io),
@@ -1609,12 +1716,16 @@ pub(super) fn render<I: LocalRender>(value: Outcome, io: &mut I) -> Value {
             "Google Calendar returned no event id; the event may not have been created. Check the calendar before retrying.",
         ),
         Outcome::GmailDraft(r) => {
+            let projected = json!({"draft_id":r.draft_id,"message_id":r.message_id,"to":r.to,"subject":r.subject});
+            if !write_response_safe(&projected) { return tool_error("Google response failed content screening; check Gmail drafts before retrying."); }
+            if let Err(error) = io.inspect_curated(&projected) { return tool_error(&error.to_string()); }
             let mut result = tool_text(&format!(
                 "Draft created — NOT sent. Review and send it manually in Gmail.\nDraft ID: {}\nTo: {}\nSubject: {}",
                 r.draft_id, r.to, r.subject
             ));
             result["_meta"]["duduclaw_pending_draft_id"] = serde_json::json!(r.draft_id);
             result["_meta"]["duduclaw_created_ref"] = json!({"id": r.draft_id, "label": r.subject});
+            result["structuredContent"] = json!({"draft_id":r.draft_id,"message_id":r.message_id,"url":"https://mail.google.com/mail/u/0/#drafts"});
             result
         },
         Outcome::CalendarCreate(r) => {
@@ -1649,6 +1760,9 @@ pub(super) async fn run<I: LocalIo>(template: &NativeCallTemplate, io: &mut I) -
         return tool_error(&e.to_string());
     }
     let result: Result<Outcome, GoogleApiError> = match template.parsed() {
+        ParsedNativeArguments::DocsCreate { .. } | ParsedNativeArguments::DocsReplace { .. }
+        | ParsedNativeArguments::SheetsCreate { .. } | ParsedNativeArguments::SheetsUpdate { .. }
+        | ParsedNativeArguments::CalendarUpdate { .. } => native_write(io, template).await.map(Outcome::Write),
         ParsedNativeArguments::ChatSpaces(args) => chat_spaces(io, template, args).await.map(Outcome::Chat),
         ParsedNativeArguments::ChatMessages(args) => chat_messages(io, template, args).await.map(Outcome::Chat),
         ParsedNativeArguments::GmailSearch { query, max } => {
@@ -1663,8 +1777,8 @@ pub(super) async fn run<I: LocalIo>(template: &NativeCallTemplate, io: &mut I) -
             to,
             subject,
             body,
-            cc,
-        } => gmail_create_draft(io, template, to, subject, body, cc.as_deref())
+            cc, thread_id, in_reply_to, references,
+        } => gmail_draft_with_reply(io, template, to, subject, body, cc.as_deref(), thread_id.as_deref(), in_reply_to.as_deref(), references.as_deref())
             .await
             .map(Outcome::GmailDraft),
         ParsedNativeArguments::CalendarList { min, max_time, max } => {

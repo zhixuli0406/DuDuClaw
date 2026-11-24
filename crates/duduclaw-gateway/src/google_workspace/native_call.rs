@@ -2,6 +2,11 @@
 use serde_json::{Value, json};
 
 pub(crate) enum ParsedNativeArguments {
+    DocsCreate { title: String, body: Option<String> },
+    DocsReplace { document: String, find: String, replace: String, match_case: bool },
+    SheetsCreate { title: String, sheet_names: Option<Vec<String>> },
+    SheetsUpdate { spreadsheet: String, range: String, values: Vec<Vec<Value>>, input_option: String },
+    CalendarUpdate { calendar: String, event: String, patch: Value, notify: bool },
     ChatSpaces(super::chat_read::SpacesArgs),
     ChatMessages(super::chat_read::MessagesArgs),
     GmailSearch {
@@ -16,6 +21,9 @@ pub(crate) enum ParsedNativeArguments {
         subject: String,
         body: String,
         cc: Option<String>,
+        thread_id: Option<String>,
+        in_reply_to: Option<String>,
+        references: Option<String>,
     },
     CalendarList {
         min: Option<String>,
@@ -133,9 +141,195 @@ fn timestamp(label: &str, value: &str, example: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn capped(args: &Value, key: &str, nonempty: bool, max: usize) -> Result<String, String> {
+    let value = required(args, key, false, nonempty)?;
+    check_text_limit(key, &value, max)?;
+    Ok(value)
+}
+
+fn check_text_limit(key: &str, value: &str, max: usize) -> Result<(), String> {
+    if value.chars().count() > max {
+        return Err(format!("Parameter '{key}' exceeds the limit of {max} characters"));
+    }
+    Ok(())
+}
+
+/// Validate raw input before policy, approval and argument-digest binding.
+/// Never shorten an approved payload, including optional or nested strings.
+pub(crate) fn validate_inputs(tool: &str, args: &Value) -> Result<(), String> {
+    let limits: &[(&str, usize)] = match tool {
+        "docs_create" => &[("title", 1000), ("body", 20_000)],
+        "docs_replace_text" => &[("find", 20_000), ("replace", 20_000)],
+        "sheets_create" => &[("title", 1000)],
+        "sheets_update" => &[("range", 1000)],
+        "calendar_update_event" => &[("summary", 20_000), ("description", 20_000), ("location", 20_000)],
+        "gmail_create_draft" => &[("to", 1000), ("cc", 1000), ("subject", 1000), ("body", 20_000)],
+        _ => &[],
+    };
+    for (key, max) in limits {
+        if let Some(value) = args.get(*key).and_then(Value::as_str) {
+            check_text_limit(key, value, *max)?;
+        }
+    }
+    let array_limit = match tool {
+        "sheets_create" => Some(("sheet_names", 100, 100)),
+        "calendar_update_event" => Some(("attendees", 1000, 320)),
+        _ => None,
+    };
+    if let Some((key, count, max)) = array_limit {
+        if let Some(values) = args.get(key).and_then(Value::as_array) {
+            if values.len() > count {
+                return Err(format!("Invalid array parameter: {key} (max {count})"));
+            }
+            for value in values.iter().filter_map(Value::as_str) {
+                check_text_limit(key, value, max)?;
+            }
+        }
+    }
+    if tool == "sheets_update" {
+        if let Some(rows) = args.get("values").and_then(Value::as_array) {
+            let mut cells = 0usize;
+            for row in rows.iter().filter_map(Value::as_array) {
+                cells = cells.checked_add(row.len()).filter(|n| *n <= 10_000)
+                    .ok_or("values exceeds 10000 cells")?;
+                for value in row.iter().filter_map(Value::as_str) {
+                    check_text_limit("values cell", value, 20_000)?;
+                }
+            }
+        }
+    }
+    if tool == "gmail_create_draft" {
+        reply_headers(args)?;
+        if let Some(to) = args.get("to").and_then(Value::as_str) {
+            validate_draft_recipients(to, args.get("cc").and_then(Value::as_str))?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_draft_recipients(to: &str, cc: Option<&str>) -> Result<(), String> {
+    for (key, value) in [("to", Some(to)), ("cc", cc)] {
+        let Some(value) = value else { continue; };
+        // Check before trimming: even a trailing CR/LF must be refused.
+        if value.chars().any(char::is_control) {
+            return Err(format!("Invalid {key}: control characters are not allowed in email addresses"));
+        }
+        if key == "cc" && value.trim().is_empty() { continue; }
+        for address in value.split(',') {
+            duduclaw_auth::db::validate_account_email(address)
+                .map_err(|_| format!("Invalid email address in {key}"))?;
+        }
+    }
+    Ok(())
+}
+fn checked_optional(args: &Value, key: &str, trim: bool, nonempty: bool) -> Result<Option<String>, String> {
+    if args.get(key).is_none() { return Ok(None); }
+    required(args, key, trim, nonempty).map(Some)
+}
+fn boolean(args: &Value, key: &str, default: bool) -> Result<bool, String> {
+    match args.get(key) {
+        None => Ok(default),
+        Some(Value::Bool(value)) => Ok(*value),
+        _ => Err(format!("Invalid boolean parameter: {key}")),
+    }
+}
+fn string_array(args: &Value, key: &str, limit: usize, max_chars: usize) -> Result<Option<Vec<String>>, String> {
+    let Some(value) = args.get(key) else { return Ok(None); };
+    let rows = value.as_array().filter(|v| v.len() <= limit)
+        .ok_or_else(|| format!("Invalid array parameter: {key} (max {limit})"))?;
+    rows.iter().map(|value| {
+        let s = value.as_str().filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| format!("Invalid string in {key}"))?;
+        check_text_limit(key, s, max_chars)?;
+        Ok(s.to_owned())
+    }).collect::<Result<Vec<_>, String>>().map(Some)
+}
+fn reply_headers(args: &Value) -> Result<(Option<String>, Option<String>, Option<String>), String> {
+    let thread = checked_optional(args, "thread_id", true, true)?;
+    let reply = checked_optional(args, "in_reply_to", true, true)?;
+    let references = checked_optional(args, "references", true, true)?.or_else(|| reply.clone());
+    if thread.is_some() != reply.is_some() || (thread.is_none() && references.is_some()) {
+        return Err("Reply drafts require thread_id and in_reply_to (original Message-ID).".into());
+    }
+    let message_id = |s: &str| s.len() <= 998 && s.starts_with('<') && s.ends_with('>')
+        && s.chars().all(|c| c.is_ascii_graphic() && c != '"');
+    if thread.as_deref().is_some_and(|s| !safe_gmail_component(s))
+        || reply.as_deref().is_some_and(|s| !message_id(s))
+        || references.as_deref().is_some_and(|s| s.len() > 8000 || s.contains(['\r', '\n'])
+            || !s.split_whitespace().all(message_id)) {
+        return Err("Invalid Gmail reply identifiers or headers.".into());
+    }
+    Ok((thread, reply, references))
+}
+
 impl NativeCallTemplate {
     pub(crate) fn prepare(tool: &str, args: &Value) -> Result<Self, String> {
+        validate_inputs(tool, args)?;
         let parsed = match tool {
+            "docs_create" => ParsedNativeArguments::DocsCreate {
+                title: capped(args, "title", true, 1000)?,
+                body: checked_optional(args, "body", false, false)?,
+            },
+            "docs_replace_text" => ParsedNativeArguments::DocsReplace {
+                document: required(args, "document_id", true, true)?,
+                find: capped(args, "find", true, 20_000)?,
+                replace: capped(args, "replace", false, 20_000)?,
+                match_case: boolean(args, "match_case", true)?,
+            },
+            "sheets_create" => ParsedNativeArguments::SheetsCreate {
+                title: capped(args, "title", true, 1000)?,
+                sheet_names: string_array(args, "sheet_names", 100, 100)?,
+            },
+            "sheets_update" => {
+                let rows = args.get("values").and_then(Value::as_array).filter(|r| !r.is_empty() && r.len() <= 10_000)
+                    .ok_or("values must be a nonempty 2-D array (max 10000 cells)")?;
+                let mut values = Vec::new();
+                let mut cells = 0usize;
+                for row in rows {
+                    let row = row.as_array().filter(|r| !r.is_empty()).ok_or("Each values row must be a nonempty array")?;
+                    cells = cells.checked_add(row.len()).filter(|n| *n <= 10_000).ok_or("values exceeds 10000 cells")?;
+                    let mut parsed_row = Vec::new();
+                    for cell in row {
+                        parsed_row.push(match cell {
+                            Value::String(_) => cell.clone(),
+                            Value::Null | Value::Bool(_) | Value::Number(_) => cell.clone(),
+                            _ => return Err("Cells must be strings, numbers, booleans or null".into()),
+                        });
+                    }
+                    values.push(parsed_row);
+                }
+                let input_option = checked_optional(args, "value_input_option", true, true)?.unwrap_or_else(|| "RAW".into());
+                if !matches!(input_option.as_str(), "RAW" | "USER_ENTERED") { return Err("value_input_option must be RAW or USER_ENTERED".into()); }
+                ParsedNativeArguments::SheetsUpdate {
+                    spreadsheet: required(args, "spreadsheet_id", true, true)?,
+                    range: capped(args, "range", true, 1000)?, values, input_option,
+                }
+            },
+            "calendar_update_event" => {
+                let mut patch = json!({});
+                for field in ["summary", "description", "location"] {
+                    if args.get(field).is_some() { patch[field] = json!(capped(args, field, false, 20_000)?); }
+                }
+                for field in ["start", "end"] {
+                    if args.get(field).is_some() {
+                        let value = required(args, field, true, true)?;
+                        timestamp(field, &value, "2026-11-24T10:00:00Z")?;
+                        patch[field] = json!({"dateTime":value});
+                    }
+                }
+                if let Some(attendees) = string_array(args, "attendees", 1000, 320)? {
+                    if attendees.iter().any(|email| !email.contains('@') || email.chars().any(char::is_whitespace)) {
+                        return Err("Invalid attendee email address".into());
+                    }
+                    patch["attendees"] = json!(attendees.iter().map(|email| json!({"email":email})).collect::<Vec<_>>());
+                }
+                if patch.as_object().is_none_or(|p| p.is_empty()) { return Err("Provide at least one event field to update".into()); }
+                ParsedNativeArguments::CalendarUpdate {
+                    calendar: checked_optional(args, "calendar_id", true, true)?.unwrap_or_else(|| "primary".into()),
+                    event: required(args, "event_id", true, true)?, patch,
+                    notify: boolean(args, "notify_attendees", false)?,
+                }
+            },
             "google_chat_spaces" => ParsedNativeArguments::ChatSpaces(super::chat_read::spaces_args(args)?),
             "google_chat_messages" => ParsedNativeArguments::ChatMessages(super::chat_read::messages_args(args)?),
             "gmail_search" => ParsedNativeArguments::GmailSearch {
@@ -145,11 +339,15 @@ impl NativeCallTemplate {
             "gmail_read" => ParsedNativeArguments::GmailRead {
                 message_id: required(args, "message_id", false, true)?,
             },
-            "gmail_create_draft" => ParsedNativeArguments::GmailDraft {
-                to: required(args, "to", true, true)?,
-                subject: required(args, "subject", false, false)?,
-                body: required(args, "body", false, false)?,
-                cc: optional(args, "cc", true),
+            "gmail_create_draft" => {
+                let (thread_id, in_reply_to, references) = reply_headers(args)?;
+                ParsedNativeArguments::GmailDraft {
+                    to: capped(args, "to", true, 1000)?,
+                    subject: capped(args, "subject", false, 1000)?,
+                    body: capped(args, "body", false, 20_000)?,
+                    cc: checked_optional(args, "cc", false, false)?,
+                    thread_id, in_reply_to, references,
+                }
             },
             "calendar_list_events" => {
                 let min = optional(args, "time_min", true);
@@ -276,6 +474,9 @@ impl NativeCallTemplate {
         let mut call = Self::for_api(tool);
         call.digest = duduclaw_core::google_identity::google_arguments_digest(args);
         call.parsed = Some(parsed);
+        if matches!(tool, "docs_create" | "docs_replace_text" | "sheets_create" | "sheets_update" | "calendar_update_event") {
+            call.validate_closed()?;
+        }
         Ok(call)
     }
     // Legacy public API wrappers have typed arguments rather than an MCP DTO.
@@ -310,8 +511,11 @@ impl NativeCallTemplate {
     pub(crate) fn validate_closed(&self) -> Result<(), String> {
         use ParsedNativeArguments::*;
         let safe = match self.parsed() {
+            GmailDraft { thread_id, .. } => thread_id.as_deref().is_none_or(safe_gmail_component),
+            CalendarUpdate { calendar, event, .. } => safe_gmail_component(calendar) && safe_gmail_component(event),
             GmailRead { message_id } => safe_gmail_component(message_id),
             SheetsRead { spreadsheet, range }
+            | SheetsUpdate { spreadsheet, range, .. }
             | SheetsAppend {
                 spreadsheet, range, ..
             } => {
@@ -329,7 +533,7 @@ impl NativeCallTemplate {
                 safe_gmail_component(list_id) && safe_gmail_component(task_id)
             }
             DriveRead { file } => safe_gmail_component(&super::extract_drive_file_id(file)),
-            DocsRead { document } | DocsAppend { document, .. } => {
+            DocsRead { document } | DocsAppend { document, .. } | DocsReplace { document, .. } => {
                 safe_gmail_component(&super::extract_drive_file_id(document))
             }
             SlidesRead { presentation } => {

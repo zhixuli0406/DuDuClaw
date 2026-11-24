@@ -365,7 +365,7 @@ fn test_google_tools_scope_split() {
         );
     }
     // Write class — a read-only key must NOT satisfy it.
-    for tool in ["gmail_create_draft", "calendar_create_event"] {
+    for tool in ["gmail_create_draft", "calendar_create_event", "docs_create", "docs_replace_text", "sheets_create", "sheets_update", "calendar_update_event"] {
         assert_eq!(
             tool_requires_scope(tool),
             Some(Scope::GoogleWrite),

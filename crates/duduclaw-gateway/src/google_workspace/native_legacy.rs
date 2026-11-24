@@ -335,7 +335,25 @@ pub(crate) async fn handle(
             return super::native_call::tool_error(&e);
         }
     };
+    let reply_draft = matches!(template.parsed(), ParsedNativeArguments::GmailDraft { thread_id: Some(_), .. });
+    if !super::backend_supports_tool(false, tool, reply_draft) {
+        let backend = match g.backend(home, tool).await {
+            Ok(backend) => backend,
+            Err(error) => return super::native_call::tool_error(&error),
+        };
+        if !super::backend_supports_tool(matches!(&backend, GoogleBackend::Direct(_)), tool, reply_draft) {
+            crate::egress_client::builtin_not_dispatched();
+            return super::native_call::tool_error("這項 Google 工具需要原生 REST 連線；Apps Script Bridge 不支援這項操作。");
+        }
+        return match backend {
+            GoogleBackend::Direct(token) => program::run(&template, &mut LegacyIo { token: &token }).await,
+            GoogleBackend::AppsScript(_) => super::native_call::tool_error("這項 Google 工具需要原生 REST 連線；Apps Script Bridge 不支援這項操作。"),
+        };
+    }
     let result: Result<program::Outcome, GoogleApiError> = match template.parsed() {
+        ParsedNativeArguments::DocsCreate { .. } | ParsedNativeArguments::DocsReplace { .. }
+        | ParsedNativeArguments::SheetsCreate { .. } | ParsedNativeArguments::SheetsUpdate { .. }
+        | ParsedNativeArguments::CalendarUpdate { .. } => unreachable!("new native tools returned above"),
         ParsedNativeArguments::ChatSpaces(args) => {
             let backend = match g.backend(home, tool).await { Ok(b) => b, Err(e) => return super::native_call::tool_error(&e) };
             match backend {
@@ -372,7 +390,7 @@ pub(crate) async fn handle(
             to,
             subject,
             body,
-            cc,
+            cc, ..
         } => {
             let backend = match g.backend(home, tool).await {
                 Ok(b) => b,
@@ -650,4 +668,41 @@ pub(crate) async fn first_recipe_fits(template: &NativeCallTemplate) -> bool {
     };
     let _ = program::run(template, &mut io).await;
     io.seen && io.valid
+}
+
+#[cfg(test)]
+mod backend_capability_tests {
+    use super::*;
+
+    struct BridgeOnly;
+    #[async_trait::async_trait]
+    impl crate::google_identity::native_tools::NativeGoogleAccess for BridgeOnly {
+        async fn backend(&self, _: &Path, _: &str) -> Result<GoogleBackend, String> {
+            Ok(GoogleBackend::AppsScript(crate::google_apps_script::BridgeConfig {
+                url: "https://script.google.com/macros/s/fixture/exec".into(),
+                secret: duduclaw_security::secret_ref::Secret::new("fixture-secret").unwrap(),
+            }))
+        }
+        async fn token(&self, _: &Path, _: &str) -> Result<String, String> {
+            panic!("a Bridge call must not acquire a REST token")
+        }
+    }
+
+    #[tokio::test]
+    async fn bridge_dispatch_refuses_the_same_native_capabilities_discovery_hides() {
+        let home = tempfile::tempdir().unwrap();
+        for (tool, args) in [
+            ("docs_create", json!({"title":"d"})),
+            ("docs_replace_text", json!({"document_id":"d","find":"x","replace":"y"})),
+            ("sheets_create", json!({"title":"s"})),
+            ("sheets_update", json!({"spreadsheet_id":"s","range":"A1","values":[[1]]})),
+            ("calendar_update_event", json!({"event_id":"e","summary":"s"})),
+            ("gmail_create_draft", json!({"to":"a@example.test","subject":"s","body":"b","thread_id":"t","in_reply_to":"<m@example.test>"})),
+        ] {
+            assert!(!backend_supports_tool(false, tool, tool == "gmail_create_draft"));
+            let result = handle(tool, &args, home.path(), &BridgeOnly).await;
+            assert_eq!(result["isError"], true, "{tool}: {result}");
+            assert!(result["content"][0]["text"].as_str().unwrap().contains("Apps Script Bridge"));
+        }
+    }
 }

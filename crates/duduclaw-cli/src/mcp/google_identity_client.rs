@@ -203,6 +203,15 @@ impl GoogleCaller {
         eff.tools_listed()
     }
 
+    /// Backend discovery follows the same verified caller plan as dispatch.
+    pub(crate) fn native_rest_available(&self, home: &Path) -> bool {
+        match self.plan(home) {
+            Plan::Home => gw::native_rest_available(home, None),
+            Plan::Gateway { agent } => gw::native_rest_available(home, Some(&agent)),
+            Plan::Refuse(_) => false,
+        }
+    }
+
     fn record(&self, r: CallRecord) {
         *self.last.lock().unwrap_or_else(|p| p.into_inner()) = Some(r);
     }

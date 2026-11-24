@@ -100,9 +100,10 @@ const ZH_BA: &str = r"(?:把[^，,。．.!！?？;；\s]{1,12}?)?";
 const EN_NEG: &str = r"(?P<neg>\b(?:not|never|once|if|after|when|whether|until|unless|be|will|would)\s+)?";
 
 /// The workspace families, in a stable order (notices list kinds in it).
-pub const WORKSPACE_FAMILIES: [ClaimType; 5] = [
+pub const WORKSPACE_FAMILIES: [ClaimType; 6] = [
     ClaimType::MailSent,
     ClaimType::CalendarEventCreated,
+    ClaimType::CalendarEventUpdated,
     ClaimType::SheetWritten,
     ClaimType::DocWritten,
     ClaimType::TaskCreated,
@@ -144,6 +145,10 @@ fn workspace_specs() -> Vec<(String, ClaimType)> {
         (format!(r"{n}已經?\s*{f}\s*(?:成功)?\s*(?:發送|送出)\s*(?:了\s*)?(?:這封|那封|該封)?\s*(?:信件?|郵件|電子郵件|[Ee]-?mail){p}"), ClaimType::MailSent),
         (format!(r"(?i){en}\bI(?:['’]ve|\s+have)\s+(?:just\s+|already\s+|now\s+|successfully\s+)?sent\s+(?:the|your|an|that|this|my)\s+(?:e-?mail|mail)\b"), ClaimType::MailSent),
         (format!(r"(?i){en}\b(?:the\s+|your\s+|an?\s+)?e-?mail\s+(?:has\s+been\s+|was\s+|is\s+now\s+)?sent\b"), ClaimType::MailSent),
+
+        // ── Calendar event updated ───────────────────────────
+        (format!(r"{n}已經?\s*{f}\s*(?:更新|修改|編輯)\s*(?:了\s*)?(?:行事曆活動|日曆活動|行程|活動|會議){p}"), ClaimType::CalendarEventUpdated),
+        (format!(r"(?i){en}\b(?:calendar\s+)?event\s+(?:has\s+been\s+|was\s+)?(?:updated|edited|modified)\b"), ClaimType::CalendarEventUpdated),
 
         // ── Calendar event created ───────────────────────────
         (format!(r"{n}已經?\s*{f}\s*(?:建立|新增|安排)\s*(?:了\s*)?(?:一個|一筆|這個|新的?)?\s*(?:行事曆活動|日曆活動|行程|活動|會議){p}"), ClaimType::CalendarEventCreated),

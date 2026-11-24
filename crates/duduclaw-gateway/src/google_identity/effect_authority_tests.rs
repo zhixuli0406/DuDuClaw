@@ -3672,3 +3672,65 @@ async fn google_chat_native_missing_scope_refuses_before_wire() {
         }
     }
 }
+
+#[tokio::test]
+async fn rm159_personal_missing_write_scope_is_refused_before_any_request() {
+    use serde_json::json;
+    for (tool, args, missing) in [
+        ("docs_create", json!({"title":"d"}), "documents"),
+        ("docs_replace_text", json!({"document_id":"d","find":"a","replace":"b"}), "documents"),
+        ("sheets_create", json!({"title":"s"}), "spreadsheets"),
+        ("sheets_update", json!({"spreadsheet_id":"s","range":"A1","values":[[1]]}), "spreadsheets"),
+        ("calendar_update_event", json!({"event_id":"e","summary":"s"}), "calendar.events"),
+    ] {
+        let f = d1_fixture(false);
+        let missing = format!("https://www.googleapis.com/auth/{missing}");
+        let old = vault::get(f.home.path(), &f.user).unwrap().unwrap();
+        let key = crate::google_identity::protection_gate(f.home.path()).unwrap();
+        let scopes: Vec<String> = old.metadata.granted_scopes.iter().filter(|scope| scope.as_str() != missing.as_str()).cloned().collect();
+        assert!(vault::finish_refresh_with_scopes(
+            f.home.path(), &key, &old.metadata,
+            &Secret { access_token: D1_SECRET.into(), refresh_token: None, expires_at: Some(4_000_000_000) }, Some(&scopes),
+        ).unwrap());
+        let wire = d1_wire(|_, _| panic!("missing write scope must never send a request")).await;
+        let _fixture = crate::google_workspace::native_call::testing::install(f.home.path(), &wire.endpoint);
+        let reference = duduclaw_core::google_identity::CredentialRef {
+            kind: duduclaw_core::google_identity::CredentialKind::Legacy,
+            sha256: client_digest("ddc_prod_0123456789abcdef0123456789abcdef"),
+        };
+        let result = SelectionStore::default().select_dedicated(
+            f.home.path(), Some(&f.db), "bot", &reference, tool, &args, Clock::now(),
+        );
+        match result {
+            Err(error) => assert_eq!(error.code, "scope_missing", "{tool}"),
+            Ok(_) => panic!("{tool}: missing OAuth scope must refuse"),
+        }
+        assert_eq!(wire.hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn rm159_both_credential_owners_execute_new_native_write_recipes() {
+    use serde_json::json;
+    for home in [false, true] {
+        let f = d1_fixture(home);
+        let wire = d1_wire(|_, _| D1Reply::json(json!({
+            "id":"e","documentId":"d","spreadsheetId":"s","htmlLink":"https://calendar.google.com/event?eid=e",
+            "replies":[{"replaceAllText":{"occurrencesChanged":1}}],"updatedCells":1,
+        }))).await;
+        let _fixture = crate::google_workspace::native_call::testing::install(f.home.path(), &wire.endpoint);
+        for (tool, args, field) in [
+            ("docs_create", json!({"title":"d","body":"initial"}), "documentId"),
+            ("docs_replace_text", json!({"document_id":"d","find":"a","replace":"b"}), "documentId"),
+            ("sheets_create", json!({"title":"s"}), "spreadsheetId"),
+            ("sheets_update", json!({"spreadsheet_id":"s","range":"A1","values":[[1]]}), "spreadsheetId"),
+            ("calendar_update_event", json!({"event_id":"e","summary":"s"}), "id"),
+        ] {
+            let value = d1_pending(&f, tool, &args).execute_native(args).await.unwrap();
+            assert_ne!(value["isError"],true,"{home}: {tool}: {value}");
+            assert!(value["structuredContent"][field].as_str().is_some(),"{value}");
+            assert!(!value.to_string().contains(D1_SECRET));
+        }
+        assert_eq!(wire.hits.load(std::sync::atomic::Ordering::SeqCst),6);
+    }
+}
