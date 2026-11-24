@@ -91,6 +91,22 @@ async fn exact_owner_avatar_turn_imports_and_audits_without_content() {
 }
 
 #[tokio::test]
+async fn short_or_empty_verbatim_paste_requires_approval() {
+    for text in ["", "   \n\t", "的", "a", "1234567"] {
+        let f = Fixture::new();
+        assert!(matches!(f.submit(text).await, approval::Proposed::Filed { .. }), "{text:?}");
+        assert_eq!(f.count(), 0, "{text:?}");
+    }
+}
+
+#[tokio::test]
+async fn eight_character_verbatim_paste_auto_imports() {
+    let f = Fixture::new();
+    assert!(matches!(f.submit("abcdefgh").await, approval::Proposed::Imported { .. }));
+    assert_eq!(f.count(), 1);
+}
+
+#[tokio::test]
 async fn extra_acl_principal_always_requires_approval() {
     for (kind, id, role) in [("department", "hr", "viewer"), ("channel", "telegram", "viewer"),
         ("user", "other", "viewer"), ("user", "co-owner", "owner"), ("agent", "other-bot", "viewer")] {

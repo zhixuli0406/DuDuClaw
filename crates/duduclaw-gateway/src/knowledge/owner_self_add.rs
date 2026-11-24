@@ -8,6 +8,7 @@ use duduclaw_knowledge::sources::{NewSource, SourceKind};
 use unicode_normalization::UnicodeNormalization;
 
 pub const HOURLY_CAP: i64 = 10;
+const MIN_VERBATIM_TEXT_CHARS: usize = 8;
 
 #[derive(Clone)]
 pub(crate) struct Turn {
@@ -96,7 +97,8 @@ fn personally_provided(home: &Path, turn: &Turn, who: &RequesterIdentity, source
             let text = normalized_text(text);
             // Substring containment is intentional here: the owner may wrap
             // their literal source text in an instruction to add it.
-            !text.is_empty() && normalized_text(&inbound.text).contains(&text)
+            text.chars().count() >= MIN_VERBATIM_TEXT_CHARS
+                && normalized_text(&inbound.text).contains(&text)
         }
     };
     if !matches { return Err(KbError::PermissionDenied); }
