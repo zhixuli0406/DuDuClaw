@@ -270,6 +270,9 @@ pub(crate) async fn run_approval_bound(
         }
         summary
     };
+    let summary = if let Some(card) = payload.get("google_owner_account").and_then(Value::as_str) {
+        format!("{summary}\n\n{}", duduclaw_core::truncate_chars(card, 400))
+    } else { summary };
     let summary = summary.as_str();
     let kind = subject.action_kind();
     // F5-D: a card raised inside a goal round names that round's task (set

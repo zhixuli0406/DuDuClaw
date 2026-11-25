@@ -618,6 +618,8 @@ fn member_binding_count(home: &Path, label: &str) -> Result<u64, StoreError> {
 /// removed here (only the lifecycle's own paths may, `db.rs` contract):
 /// `Err`, so the label stays held until the tombstone's step 5 retry.
 fn member_binding_purge(home: &Path, label: &str) -> Result<Vec<String>, StoreError> {
+    let _authority = duduclaw_core::authority_coordinator::AuthorityCoordinator::new(home)
+        .write().map_err(|_| StoreError::Unavailable)?;
     if member_binding_count(home, label)? == 0 { return Ok(Vec::new()); }
     let Some(mut db) = sqlite::open(home, "users.db", Access::ReadWrite)? else { return Ok(Vec::new()) };
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| StoreError::Unavailable)?;

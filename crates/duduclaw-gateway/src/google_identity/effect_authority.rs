@@ -13,6 +13,7 @@ use crate::google_personal::{
     grants,
 };
 
+pub(crate) mod employee;
 mod host_claim;
 mod mcp_operation;
 mod native_operation;
@@ -50,6 +51,7 @@ fn binding(value: &str) -> bool {
 
 // Purpose is deliberately not a wire type, and carries no secret.
 enum GooglePurpose {
+    Employee { native_tool: String, final_arguments_digest: String, turn_id: Option<String>, run_id: Option<String> },
     Dedicated {
         native_tool: String,
         final_arguments_digest: String,
@@ -65,7 +67,7 @@ enum GooglePurpose {
 impl GooglePurpose {
     fn scope_key(&self) -> &str {
         match self {
-            Self::Dedicated { native_tool, .. } => native_tool,
+            Self::Dedicated { native_tool, .. } | Self::Employee { native_tool, .. } => native_tool,
             Self::ClosedRemote(_) => "google_remote_mcp",
             #[cfg(test)]
             Self::RemoteMcp { .. } => "google_remote_mcp",
@@ -93,6 +95,7 @@ impl TenantPin {
 /// Only live host code supplies requester and directory. No environment,
 /// serialized input, or model-selected account can construct this context.
 pub(crate) struct GoogleCallContext {
+    owner_snapshot: Option<super::owner_snapshot::OwnerSnapshot>,
     home: PathBuf,
     agent_dir: PathBuf,
     agent: String,
@@ -143,6 +146,7 @@ impl GoogleCallContext {
         }
         // This lane's authenticated caller is Unknown, never an inferred owner.
         Ok(Self {
+            owner_snapshot: super::owner_snapshot::OwnerSnapshot::optional(&home, &agent)?,
             home,
             agent_dir,
             agent: canonical_agent,
@@ -181,7 +185,7 @@ impl GoogleCallContext {
     /// when pinned. Empty or insufficient scope sets refuse.
     pub(crate) fn assertion_scope(&self) -> Result<String, Refusal> {
         let scopes = match &self.purpose {
-            GooglePurpose::Dedicated { native_tool, .. } => super::delegated_scopes::for_tool(&self.home, native_tool)?,
+            GooglePurpose::Dedicated { native_tool, .. } | GooglePurpose::Employee { native_tool, .. } => super::delegated_scopes::for_tool(&self.home, native_tool)?,
             GooglePurpose::ClosedRemote(bound) => bound.delegation_scopes(&self.home)?,
             #[cfg(test)]
             GooglePurpose::RemoteMcp { .. } => super::delegated_scopes::for_service(&self.home, "gmail")?,
@@ -189,7 +193,7 @@ impl GoogleCallContext {
         let scopes: Vec<&str> = scopes.iter().copied().filter(|scope| self.tenant.as_ref()
             .is_none_or(|pin| pin.scopes.iter().any(|allowed| allowed == scope))).collect();
         if scopes.is_empty() { return Err(changed()); }
-        if let GooglePurpose::Dedicated { native_tool, .. } = &self.purpose {
+        if let GooglePurpose::Dedicated { native_tool, .. } | GooglePurpose::Employee { native_tool, .. } = &self.purpose {
             let granted: Vec<String> = scopes.iter().map(|scope| (*scope).to_owned()).collect();
             if !crate::google_personal::scopes::permitted(native_tool, &granted) { return Err(changed()); }
         }
@@ -212,6 +216,7 @@ impl GoogleCallContext {
         }
         let (home, agent_dir, agent) = Self::canonical(home, agent_dir)?;
         Ok(Self {
+            owner_snapshot: super::owner_snapshot::OwnerSnapshot::optional(&home, &agent)?,
             home,
             agent_dir,
             agent,
@@ -226,6 +231,9 @@ impl GoogleCallContext {
     }
 
     fn validate(&self) -> Result<(), Refusal> {
+        if let Some(snapshot) = &self.owner_snapshot { snapshot.validate(&self.home, &self.agent)?; }
+        if !matches!(self.purpose, GooglePurpose::Employee { .. }) && self.owner_snapshot.is_none()
+            && gi::effective_for(&self.home, Some(&self.agent)).effective == gi::Effective::DelegateOwner { return Err(changed()); }
         duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|_| changed())?;
         let (home, dir, agent) = Self::canonical(&self.home, &self.agent_dir)?;
         if home != self.home || dir != self.agent_dir || agent != self.agent {
@@ -470,6 +478,15 @@ pub(crate) struct AssertionEffectPermit<'a> {
     authority: &'a GoogleEffectAuthority,
 }
 impl AssertionEffectPermit<'_> {
+    pub(crate) async fn acquire_native_lease(&self) -> Result<Option<duduclaw_core::authority_coordinator::SharedLease>, Refusal> {
+        let context = &self.authority.material.context;
+        match &context.owner_snapshot {
+            Some(snapshot) => snapshot.lease(&context.home, &context.agent).await.map(Some),
+            None => Ok(None),
+        }
+    }
+    pub(crate) fn native_sent(&self) { super::dedicated_owner::record_sent(); }
+
     pub(crate) fn validate_home_sa(
         &self,
         actual: &crate::google_identity::home_source::sa_material::Resolved,
@@ -567,95 +584,7 @@ impl BridgeEffectPermit<'_> {
         )
     }
 }
-pub(in crate::google_identity) async fn execute_immediate_native(
-    home: &Path,
-    users: Option<&std::sync::Arc<duduclaw_auth::UserDb>>,
-    agent: &str,
-    reference: &CredentialRef,
-    tool: &str,
-    args: serde_json::Value,
-) -> Result<serde_json::Value, Refusal> {
-    execute_immediate_native_pinned(home, users, agent, reference, tool, args, None).await
-}
-
-/// [`execute_immediate_native`] bound to the tenant source the isolation
-/// bridge pinned (SR4 item 4): the host lane never decides on a config it
-/// re-read after the bridge decided; a different source digest refuses.
-pub(in crate::google_identity) async fn execute_immediate_native_pinned(
-    home: &Path,
-    users: Option<&std::sync::Arc<duduclaw_auth::UserDb>>,
-    agent: &str,
-    reference: &CredentialRef,
-    tool: &str,
-    args: serde_json::Value,
-    tenant: Option<TenantPin>,
-) -> Result<serde_json::Value, Refusal> {
-    crate::google_workspace::validate_native_tool_inputs(tool, &args)
-        .map_err(|message| Refusal::hard("native_arguments_invalid", message))?;
-    // Initial admission keeps the public credential-refusal taxonomy. Once
-    // captured, every later wait still rechecks the original source context.
-    host_claim::live_key(home, agent, reference, tool)?;
-    let context = GoogleCallContext::dedicated(
-        home,
-        agent,
-        crate::google_identity::requester_gate::people_for(home, users),
-        tool,
-        gi::google_arguments_digest(&args),
-        reference.clone(),
-    )?
-    .pin_tenant(tenant)?;
-    context.validate()?;
-    if tool != "google_status" {
-        let template =
-            match crate::google_workspace::native_call::NativeCallTemplate::prepare(tool, &args)
-                .and_then(|t| {
-                    t.validate_closed()?;
-                    Ok(t)
-                }) {
-                Ok(template) => template,
-                Err(message) => {
-                    crate::google_identity::execute::audit(
-                        home,
-                        agent,
-                        tool,
-                        "",
-                        false,
-                        false,
-                        "native_arguments_invalid",
-                    );
-                    return Ok(crate::google_workspace::native_call::tool_error(&message));
-                }
-            };
-        if !crate::google_workspace::native_legacy::first_recipe_fits(&template).await {
-            context.validate()?;
-            crate::google_identity::execute::audit(
-                home,
-                agent,
-                tool,
-                "",
-                false,
-                false,
-                "native_recipe_too_large",
-            );
-            return Ok(crate::google_workspace::native_call::tool_error(
-                "Google 請求的網址與本文超過 1 MiB 上限。",
-            ));
-        }
-    }
-    #[cfg(test)]
-    if tool != "google_status" && !crate::google_workspace::native_call::testing::required(home) {
-        return Err(Refusal::hard(
-            "personal_external_unsupported",
-            "此 Google 操作缺少受控測試端點，未執行資料操作。",
-        ));
-    }
-    let pending = host_claim::prepare_immediate(context).await?;
-    if pending.is_metadata_status() {
-        pending.metadata_status()
-    } else {
-        pending.execute_native(args).await
-    }
-}
+include!("effect_authority/immediate.inc.rs");
 
 // New credential resolution borrows the original host proof, never a raw-key
 // callback or an ambient requester. This permit is not an effect lease.

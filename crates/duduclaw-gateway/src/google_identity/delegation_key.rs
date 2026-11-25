@@ -86,6 +86,8 @@ pub fn info(home: &Path) -> Result<Option<KeyInfo>, String> {
 /// Validate a service-account key JSON, seal it and store it. Replaces any
 /// previous record (an explicit admin act).
 pub fn import(home: &Path, key: &ProtectedKey, raw_json: &str) -> Result<KeyInfo, String> {
+    let _authority = duduclaw_core::authority_coordinator::AuthorityCoordinator::new(home)
+        .write().map_err(|e| e.to_string())?;
     if raw_json.len() > MAX_KEY_JSON_BYTES {
         return Err("金鑰檔太大，這不是服務帳號金鑰。".into());
     }
@@ -125,6 +127,8 @@ fn token_uri_ok(uri: &str) -> bool {
 
 /// Remove the sealed record. Missing is success.
 pub fn remove(home: &Path) -> Result<(), String> {
+    let _authority = duduclaw_core::authority_coordinator::AuthorityCoordinator::new(home)
+        .write().map_err(|e| e.to_string())?;
     match std::fs::remove_file(path(home)) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),

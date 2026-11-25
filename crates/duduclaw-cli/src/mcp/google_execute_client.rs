@@ -23,12 +23,6 @@ pub(crate) async fn execute(
     selection: Option<&duduclaw_core::google_identity::GoogleSelectionStamp>,
 ) -> Result<Value, String> {
     let scope = native_google_scope(tool).ok_or("Google 工具不存在。")?;
-    let uncertain = match scope {
-        NativeGoogleScope::Write => {
-            "Google 操作結果無法確認。請先到 Google 檢查是否已完成，勿直接重試，以免重複寫入。"
-        }
-        NativeGoogleScope::Read => "Google 暫時無法使用：DuDuClaw 主程式沒有傳回完整結果。",
-    };
     if !duduclaw_core::is_valid_agent_id(agent)
         || !reference.is_well_formed()
         || !arguments.is_object()
@@ -37,6 +31,29 @@ pub(crate) async fn execute(
     }
     let now = duduclaw_gateway::google_personal::authority::now();
     let body = encode_execute_body(tool, arguments, reference, selection, now)?;
+    let mut body: Value = serde_json::from_slice(&body).map_err(|_| "Google 請求無法編碼。")?;
+    let owner = crate::mcp_auth::current_accepted_google_call().and_then(|c| c.owner_binding().map(str::to_owned));
+    if let Some(binding) = &owner { body["owner_binding_digest"] = json!(binding); }
+    let body = serde_json::to_vec(&body).map_err(|_| "Google 請求無法編碼。")?;
+    post_body(home, agent, body, scope, selection.is_some() || owner.is_some()).await
+}
+
+pub(crate) async fn prepare_owner(home: &Path, agent: &str, reference: &CredentialRef,
+    tool: &str, arguments: &Value) -> Result<Value, String> {
+    let body = serde_json::to_vec(&json!({"tool":tool, "arguments":arguments,
+        "credential_ref":reference, "owner_prepare":true})).map_err(|_| "Google 請求無法編碼。")?;
+    post_body(home, agent, body, NativeGoogleScope::Read, true).await
+}
+
+async fn post_body(home: &Path, agent: &str, body: Vec<u8>, scope: NativeGoogleScope, no_retry: bool) -> Result<Value, String> {
+    let now = duduclaw_gateway::google_personal::authority::now();
+    let uncertain = match scope {
+        NativeGoogleScope::Write => {
+            "Google 操作結果無法確認。請先到 Google 檢查是否已完成，勿直接重試，以免重複寫入。"
+        }
+        NativeGoogleScope::Read => "Google 暫時無法使用：DuDuClaw 主程式沒有傳回完整結果。",
+    };
+
     if body.len() > MAX_BODY {
         return Err("Google 請求過大，尚未送出。".into());
     }
@@ -54,7 +71,7 @@ pub(crate) async fn execute(
         super::computer_use_client::signed_headers(&key, agent, &token, timestamp, &nonce, &body);
     #[cfg(test)]
     {
-        let _ = (headers, uncertain);
+        let _ = (headers, uncertain, no_retry);
         test_transport::invoke(
             home,
             &serde_json::from_slice(&body).map_err(|_| "Google 請求無法編碼。")?,
@@ -67,7 +84,7 @@ pub(crate) async fn execute(
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(125));
-        let client = if selection.is_some() {
+        let client = if no_retry {
             client.retry(reqwest::retry::never())
         } else {
             client

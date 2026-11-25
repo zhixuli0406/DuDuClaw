@@ -178,6 +178,10 @@ fn commit_locked_inner(
     lock_wait: Option<std::time::Duration>,
 ) -> Result<Outcome, CommitError> {
     let path = super::file_path(c.home, c.agent_id, &c.key).map_err(CommitError::Refused)?;
+    let _authority = if path.file_name().and_then(|n| n.to_str()) == Some("agent.toml") {
+        Some(duduclaw_core::authority_coordinator::AuthorityCoordinator::new(c.home)
+            .write().map_err(|e| CommitError::Failed(e.to_string()))?)
+    } else { None };
     let keep = AgentFilesConfig::load(c.home).history_keep;
     let anchor = lock_anchor(c, &path);
     let locked_section = || -> std::io::Result<Locked> {

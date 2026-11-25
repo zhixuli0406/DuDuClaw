@@ -162,6 +162,12 @@ pub async fn resolve_person_for_tool(
     resolve_person_scoped(home, agent, requester, people, tool, None).await
 }
 
+/// Scopes originate only in the gateway's pinned employee context.
+pub(crate) async fn resolve_employee_scoped(home: &Path, agent: &str, requester: &RequesterIdentity,
+    people: &dyn People, tool: &str, scopes: &[&str]) -> Result<Resolved, Refusal> {
+    resolve_person_scoped(home, agent, requester, people, tool, Some(scopes)).await
+}
+
 async fn resolve_person_scoped(
     home: &Path, agent: &str, requester: &RequesterIdentity, people: &dyn People,
     tool: &str, endpoint_scopes: Option<&[&str]>,

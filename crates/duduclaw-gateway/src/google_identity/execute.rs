@@ -1,6 +1,6 @@
-//! Dedicated MCP keys get tool results, never Google bearers. A credential
-//! digest is metadata only; the signed local host attests actual possession
-//! after the MCP dispatcher has applied its normal employee policy gates.
+//! Signed employee calls and dedicated MCP keys get tool results, never
+//! owner Google bearers. Employee calls use live requester IDs and a one-shot
+//! approval binding; dedicated calls retain their actual credential reference.
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -28,15 +28,17 @@ pub const MAX_BODY: usize = 256 * 1024;
 pub const MAX_RESPONSE: usize = 512 * 1024;
 
 pub struct ExecuteState {
-    home: PathBuf,
-    users: Option<Arc<UserDb>>,
+    pub(super) home: PathBuf,
+    pub(super) users: Option<Arc<UserDb>>,
     replay: ReplayGuard,
     rate: RateLimiter,
     selections: selection::SelectionStore,
+    pub(super) employees: super::employee_execute::Store,
 }
 impl ExecuteState {
     pub fn new(home: PathBuf, users: Option<Arc<UserDb>>) -> Self {
         Self {
+            employees: super::employee_execute::Store::default(),
             home,
             users,
             replay: ReplayGuard::default(),
@@ -54,6 +56,10 @@ struct ExecuteRequest {
     credential_ref: CredentialRef,
     #[serde(default)]
     selection_stamp: Option<String>,
+    #[serde(default)]
+    owner_prepare: bool,
+    #[serde(default)]
+    owner_binding_digest: Option<String>,
 }
 
 pub fn router(state: Arc<ExecuteState>) -> Router {
@@ -117,6 +123,22 @@ async fn handle(
     }
     if !state.replay.record(&caller.nonce, now) {
         return unauthorized();
+    }
+    if serde_json::from_slice::<Value>(&body).ok().is_some_and(|v| v.get("kind").is_some()) {
+        let request = match serde_json::from_slice::<super::employee_execute::Request>(&body) {
+            Ok(request) => request,
+            Err(_) => return refuse(StatusCode::BAD_REQUEST, "bad_request", "Google 員工請求格式不正確。"),
+        };
+        return match super::employee_execute::serve(&state, &caller.agent_id, request).await {
+            Ok(result) => {
+                let response = json!({"ok":true,"result":result});
+                if serde_json::to_vec(&response).map_or(true, |v| v.len() > MAX_RESPONSE) {
+                    refuse(StatusCode::BAD_GATEWAY, "result_unconfirmed", UNCERTAIN)
+                } else { Json(response).into_response() }
+            }
+            Err(error) => refuse(if error.code == "result_unconfirmed" { StatusCode::BAD_GATEWAY } else { StatusCode::FORBIDDEN },
+                error.code, &error.message_zh),
+        };
     }
     let request = match serde_json::from_slice::<ExecuteRequest>(&body) {
         Ok(request)
@@ -184,6 +206,13 @@ async fn serve(
     agent: &str,
     request: &ExecuteRequest,
 ) -> Result<Value, Refusal> {
+    if request.owner_prepare || request.owner_binding_digest.is_some()
+        || duduclaw_core::google_identity::effective_for(&state.home, Some(agent)).effective
+            == duduclaw_core::google_identity::Effective::DelegateOwner {
+        return super::dedicated_owner::serve(&state.home, state.users.as_ref(), agent,
+            &request.credential_ref, &request.tool, &request.arguments, request.owner_prepare,
+            request.owner_binding_digest.as_deref()).await;
+    }
     if let Some(id) = request.selection_stamp.as_deref() {
         // Synchronous one-shot consumption precedes every credential/resolve
         // await. Even a later failure never puts the private entry back.

@@ -67,6 +67,7 @@ impl GoogleClosedMount {
         let pending = tokio::task::spawn_blocking(move || {
             let (home, agent_dir, agent) = GoogleCallContext::canonical(entry.home(), entry.dir())?;
             let context = GoogleCallContext {
+                owner_snapshot: crate::google_identity::owner_snapshot::OwnerSnapshot::optional(&home, &agent)?,
                 people: crate::google_identity::requester_gate::people_for(&home, None),
                 home,
                 agent_dir,

@@ -245,6 +245,13 @@ impl AgentRegistry {
                             Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
                             Err(error) => return Err(DuDuClawError::Agent(format!("resolved policy unreadable: {error}"))),
                         };
+                        let _authority = if changed {
+                            let home = home.clone();
+                            Some(tokio::task::spawn_blocking(move ||
+                                duduclaw_core::authority_coordinator::AuthorityCoordinator::new(&home).write())
+                                .await.map_err(|e| DuDuClawError::Agent(e.to_string()))?
+                                .map_err(|e| DuDuClawError::Agent(e.to_string()))?)
+                        } else { None };
                         if changed {
                             duduclaw_core::isolation_policy::fence_change(&home)
                                 .map_err(|error| DuDuClawError::Agent(format!("policy revocation unavailable: {error}")))?;
@@ -267,6 +274,11 @@ impl AgentRegistry {
                 // last good resolution).
                 match fs::symlink_metadata(&resolved_path).await {
                     Ok(_) => {
+                        let authority_home = home.clone();
+                        let _authority = tokio::task::spawn_blocking(move ||
+                            duduclaw_core::authority_coordinator::AuthorityCoordinator::new(&authority_home).write())
+                            .await.map_err(|e| DuDuClawError::Agent(e.to_string()))?
+                            .map_err(|e| DuDuClawError::Agent(e.to_string()))?;
                         duduclaw_core::isolation_policy::fence_change(&home)
                             .map_err(|error| DuDuClawError::Agent(format!("policy revocation unavailable: {error}")))?;
                         fs::remove_file(&resolved_path).await.map_err(|error|

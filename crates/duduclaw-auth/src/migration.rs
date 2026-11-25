@@ -63,6 +63,7 @@ impl UserDb {
     /// Never deletes the account. Suspension and credential-epoch fencing revoke
     /// even a partially activated account; its operation remains tombstoned.
     pub fn migration_user_disable(&self, operation: &str, digest: &[u8; 32]) -> Result<(), String> {
+        let _authority = self.google_authority_write()?;
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(error)?;
         let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='migration_user_receipts')",
@@ -135,6 +136,7 @@ impl UserDb {
     /// Normal binding writer and durable receipt share one immediate transaction.
     pub fn migration_bind_shared(&self, operation:&str, digest:&[u8;32], user_id:&str,
         agent:&str, access:crate::AccessLevel) -> Result<(),String> {
+        let _authority = self.google_authority_write()?;
         validate_binding(operation,agent)?;
         let mut conn=self.conn();let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(error)?;
         binding_schema(&tx)?;
@@ -168,6 +170,7 @@ impl UserDb {
         Ok(crate::UserAgentBinding{user_id:user,agent_name:agent,access_level:level.parse().map_err(error)?,bound_at:bound,is_primary:primary})
     }
     pub fn migration_binding_disable(&self,operation:&str,digest:&[u8;32])->Result<(),String>{
+        let _authority = self.google_authority_write()?;
         let mut conn=self.conn();let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(error)?;
         binding_schema(&tx)?;
         let receipt:Option<(Vec<u8>,String,String,String,String)>=tx.query_row(

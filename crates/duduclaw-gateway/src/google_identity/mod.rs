@@ -277,3 +277,14 @@ pub fn delegate_email_of(home: &Path, agent: Option<&str>) -> Option<String> {
         _ => None,
     }
 }
+
+pub(crate) mod owner_snapshot;
+
+pub(crate) mod employee_execute;
+
+#[cfg(test)]
+pub(crate) mod owner_test_support;
+#[cfg(test)]
+mod owner_tests;
+
+pub(crate) mod dedicated_owner;

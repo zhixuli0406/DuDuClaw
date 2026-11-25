@@ -194,6 +194,7 @@ impl UserDb {
         transfer_to: Option<&str>,
         actor: Option<&str>,
     ) -> Result<OffboardOutcome, OrgError> {
+        let _authority = self.google_authority_write().map_err(OrgError::Db)?;
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)

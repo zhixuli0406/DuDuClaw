@@ -17,6 +17,7 @@ use crate::user_row::{
 
 /// SQLite-backed user database with connection pool.
 pub struct UserDb {
+    pub(crate) authority_home: Option<std::path::PathBuf>,
     pool: Vec<Mutex<Connection>>,
     pub(crate) remember_key: ring::hmac::Key,
 }
@@ -203,7 +204,7 @@ impl UserDb {
             pool.push(Mutex::new(conn));
         }
         let remember_key = crate::remembered_sessions::load_key(db_path, &pool[0].lock().unwrap())?;
-        let db = Self { pool, remember_key };
+        let db = Self { pool, remember_key, authority_home: (db_path != Path::new(":memory:")).then(|| db_path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")).to_owned()) };
         db.init_tables(enforced)?;
         Ok(db)
     }
@@ -240,7 +241,7 @@ impl UserDb {
         let mut key = [0u8; 32];
         ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut key)
             .map_err(|_| "failed to create an ephemeral key".to_string())?;
-        Ok(Self { pool: vec![Mutex::new(conn)], remember_key: ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key) })
+        Ok(Self { authority_home: (db_path != Path::new(":memory:")).then(|| db_path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")).to_owned()), pool: vec![Mutex::new(conn)], remember_key: ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key) })
     }
 
     pub(crate) fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -751,6 +752,7 @@ impl UserDb {
     }
 
     fn change_email_stamped(&self, actor: &str, user_id: &str, email: &str, by_owner: bool) -> Result<(), String> {
+        let _authority = self.google_authority_write()?;
         if actor.trim().is_empty() {
             return Err("update error: email change requires an actor".to_string());
         }
@@ -815,6 +817,7 @@ impl UserDb {
     /// [`Self::set_user_status`] attributed to the acting Admin in the
     /// admin eligibility log (same transaction, F6 S1/S2).
     pub fn set_user_status_as(&self, actor: Option<&str>, user_id: &str, status: UserStatus) -> Result<(), String> {
+        let _authority = self.google_authority_write()?;
         let now = Utc::now().to_rfc3339();
         let mut conn = self.conn();
         let tx = conn
@@ -968,6 +971,7 @@ impl UserDb {
         agent_name: &str,
         access_level: AccessLevel,
     ) -> Result<(), String> {
+        let _authority = self.google_authority_write()?;
         let now = Utc::now().to_rfc3339();
         let mut conn = self.conn();
         let tx = conn
@@ -980,6 +984,7 @@ impl UserDb {
     /// Interactive binding only; migration, restore and Personal provisioning
     /// use the preference-free shared writer instead.
     pub fn bind_agent_as(&self, actor: &str, user_id: &str, agent_name: &str, access_level: AccessLevel) -> Result<(), String> {
+        let _authority = self.google_authority_write()?;
         let now = Utc::now().to_rfc3339();
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
@@ -1002,6 +1007,7 @@ impl UserDb {
 
     /// Unbind a user from an agent.
     pub fn unbind_agent(&self, user_id: &str, agent_name: &str) -> Result<(), String> {
+        let _authority = self.google_authority_write()?;
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)

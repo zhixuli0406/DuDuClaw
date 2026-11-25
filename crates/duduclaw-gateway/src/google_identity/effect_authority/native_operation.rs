@@ -24,7 +24,7 @@ impl ClosedNativeFailure {
             may_have_sent,
         )
     }
-    fn into_refusal(self) -> Refusal {
+    pub(super) fn into_refusal(self) -> Refusal {
         match self {
             Self::Denied(error) => error,
             Self::Unconfirmed => Refusal::hard(

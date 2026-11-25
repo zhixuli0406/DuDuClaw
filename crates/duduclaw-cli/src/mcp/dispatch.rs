@@ -1048,6 +1048,9 @@ impl GatewayHandler<'_> {
                 "isError": true
             })
         }
+        name if GOOGLE_WORKSPACE_TOOLS.contains(&name) && google_caller.owner_execution(home_dir) => {
+            google_caller.execute_owner(home_dir, name, &arguments).await
+        }
         name if GOOGLE_WORKSPACE_TOOLS.contains(&name) && google_caller.is_dedicated() => {
             google_caller
                 .execute_dedicated(home_dir, name, &arguments)

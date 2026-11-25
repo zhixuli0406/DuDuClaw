@@ -354,7 +354,9 @@ pub async fn mint_for_subject(
         .token_uri
         .clone()
         .unwrap_or_else(|| DEFAULT_TOKEN_URI.to_string());
-    let client = reqwest::Client::builder()
+    let client = reqwest::Client::builder();
+    let client = if cache_mode == CacheMode::Bypass { client.no_proxy().retry(reqwest::retry::never()) } else { client };
+    let client = client
         .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
         .redirect(reqwest::redirect::Policy::none())
         .build()
