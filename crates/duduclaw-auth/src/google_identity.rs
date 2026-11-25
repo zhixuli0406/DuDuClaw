@@ -142,7 +142,9 @@ impl UserDb {
         user_id: &str,
         actor: &str,
     ) -> Result<(), String> {
-        let seats = crate::avatar_seats::SeatChange::begin(self, None)?;
+        // Seat-neutral: avatar_exemptions_in reads binding membership/access,
+        // user status/avatar and incarnation grants, never is_primary. Keep
+        // this async-handler write free of the blocking seat admission wait.
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -172,7 +174,6 @@ impl UserDb {
         bump_acl_generation(&tx).map_err(|e| e.to_string())?;
         tx.execute("INSERT INTO auth_audit_log(user_id, action, target, detail, timestamp) VALUES (?1, 'agent.primary_owner_set', ?2, ?3, ?4)",
             params![actor, agent, serde_json::json!({"primary_user_id": user_id}).to_string(), chrono::Utc::now().to_rfc3339()]).map_err(|e| e.to_string())?;
-        seats.check(&tx)?;
         tx.commit().map_err(|e| e.to_string())
     }
 
