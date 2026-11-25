@@ -114,6 +114,13 @@ async fn dedicated_listener_requires_lock_and_publishes_only_local_ipc() {
     lease.apply(&mut command);
     assert!(command.as_std().get_envs().any(|(key, value)| key == ENV_IDENTITY_ENDPOINT
         && value.and_then(|v| v.to_str()) == Some(url.as_str())));
+    let server = ipc::encode_server_identity(duduclaw_core::run_credential::ProcessIdentity::read(std::process::id()).unwrap());
+    assert!(command.as_std().get_envs().any(|(key, value)| key == ENV_IDENTITY_SERVER
+        && value.and_then(|v| v.to_str()) == Some(server.as_str())));
+    let mut pty_env = HashMap::from([("duduclaw_identity_server".into(), "forged".into())]);
+    lease.apply_pty(&mut pty_env);
+    assert!(!pty_env.contains_key("duduclaw_identity_server"));
+    assert_eq!(pty_env.get(ENV_IDENTITY_SERVER), Some(&server));
     assert!(start_listener_with(home.path(), registry.clone()).await.is_err());
     drop(listener);
     assert!(!home.path().join(IDENTITY_ENDPOINT_FILE).exists());

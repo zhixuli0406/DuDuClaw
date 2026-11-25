@@ -10,7 +10,7 @@ use duduclaw_core::run_credential::{RootProcess, ipc};
 use rand::RngCore;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use duduclaw_core::run_credential::{ENV_IDENTITY_URL, ENV_IDENTITY_ENDPOINT, ENV_RUN_CREDENTIAL, RunCredential, SpawnBinding};
+use duduclaw_core::run_credential::{ENV_IDENTITY_URL, ENV_IDENTITY_ENDPOINT, ENV_IDENTITY_SERVER, ENV_RUN_CREDENTIAL, RunCredential, SpawnBinding};
 use duduclaw_core::run_credential::discovery::DiscoveryDirectory;
 #[cfg(test)]
 use duduclaw_core::run_credential::IDENTITY_ENDPOINT_FILE;
@@ -89,6 +89,7 @@ pub struct RunGuard {
     hash: [u8; 32],
     credential: RunCredential,
     identity_endpoint: Option<String>,
+    identity_server: String,
     binding: SpawnBinding,
 }
 
@@ -120,12 +121,14 @@ impl RunGuard {
         cmd.env(ENV_RUN_CREDENTIAL, self.credential.expose());
         cmd.env_remove(ENV_IDENTITY_URL);
         cmd.env_remove(ENV_IDENTITY_ENDPOINT);
+        cmd.env(ENV_IDENTITY_SERVER, &self.identity_server);
         if let Some(url) = &self.identity_endpoint { cmd.env(ENV_IDENTITY_ENDPOINT, url); }
     }
 
     pub fn apply_pty(&self, env: &mut HashMap<String, String>) {
         env.retain(|key, _| !key.eq_ignore_ascii_case(ENV_RUN_CREDENTIAL)
-            && !key.eq_ignore_ascii_case(ENV_IDENTITY_URL) && !key.eq_ignore_ascii_case(ENV_IDENTITY_ENDPOINT));
+            && !key.eq_ignore_ascii_case(ENV_IDENTITY_URL) && !key.eq_ignore_ascii_case(ENV_IDENTITY_ENDPOINT) && !key.eq_ignore_ascii_case(ENV_IDENTITY_SERVER));
+        env.insert(ENV_IDENTITY_SERVER.into(), self.identity_server.clone());
         env.insert(ENV_RUN_CREDENTIAL.to_string(), self.credential.expose().to_string());
         if let Some(url) = &self.identity_endpoint { env.insert(ENV_IDENTITY_ENDPOINT.into(), url.clone()); }
     }
@@ -135,6 +138,7 @@ impl duduclaw_core::run_credential::RunLease for RunGuard {
     fn credential(&self) -> &RunCredential { &self.credential }
     fn spawn_binding(&self) -> SpawnBinding { self.binding.clone() }
     fn identity_endpoint(&self) -> Option<&str> { self.identity_endpoint.as_deref() }
+    fn identity_server(&self) -> Option<&str> { Some(&self.identity_server) }
 }
 
 pub fn install_background_issuer() -> Result<(), String> {
@@ -172,12 +176,15 @@ impl Registry {
         if runs.len() >= MAX_RUNS || runs.contains_key(&hash) {
             return Err("Run identity registry full".into());
         }
+        let identity_server = ipc::encode_server_identity(
+            duduclaw_core::run_credential::ProcessIdentity::read(std::process::id())
+                .map_err(|_| "Run identity server process unavailable")?);
         let identity_endpoint = self.endpoint.lock().map_err(|_| "Run identity listener unavailable")?.clone();
         let deadline = Instant::now() + Duration::from_secs(ttl);
         let deadline = limit.map_or(deadline, |limit| limit.min(deadline));
         let binding = SpawnBinding::pending(deadline);
         runs.insert(hash, Entry { binding: binding.clone(), record, deadline, rate: (Instant::now(), 0) });
-        Ok(RunGuard { registry: self.clone(), hash, credential, identity_endpoint, binding })
+        Ok(RunGuard { registry: self.clone(), hash, credential, identity_endpoint, identity_server, binding })
     }
 
     #[cfg(test)]

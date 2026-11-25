@@ -2,8 +2,7 @@
 
 use std::path::Path;
 use duduclaw_core::error::{DuDuClawError, Result};
-use duduclaw_core::run_credential::{ipc, ENV_IDENTITY_URL, ENV_IDENTITY_ENDPOINT, ENV_RUN_CREDENTIAL, RunCredential};
-use duduclaw_core::run_credential::discovery::DiscoveryDirectory;
+use duduclaw_core::run_credential::{ipc, ENV_IDENTITY_URL, ENV_IDENTITY_ENDPOINT, ENV_IDENTITY_SERVER, ENV_RUN_CREDENTIAL, RunCredential};
 
 #[derive(clap::Subcommand)]
 pub(crate) enum IdentityCommands {
@@ -14,15 +13,16 @@ pub(crate) enum IdentityCommands {
     },
 }
 
-pub(crate) async fn run(home: &Path, command: IdentityCommands) -> Result<()> {
+pub(crate) async fn run(_home: &Path, command: IdentityCommands) -> Result<()> {
     let IdentityCommands::Whoami { json } = command;
     let inactive = || DuDuClawError::Security("Run identity is missing, inactive or unavailable".into());
     require_run_identity_mode(duduclaw_core::execution_gate::isolation_required())?;
     let credential = std::env::var(ENV_RUN_CREDENTIAL).ok().and_then(RunCredential::parse)
         .ok_or_else(inactive)?;
     if std::env::var_os(ENV_IDENTITY_URL).is_some() { return Err(inactive()); }
-    let endpoint = discover_endpoint(home, std::env::var(ENV_IDENTITY_ENDPOINT)).ok_or_else(inactive)?;
-    let value = ipc::request(&endpoint, &serde_json::json!({
+    let (endpoint, server) = trusted_target(std::env::var(ENV_IDENTITY_ENDPOINT),
+        std::env::var(ENV_IDENTITY_SERVER)).ok_or_else(inactive)?;
+    let value = ipc::request(&endpoint, &server, &serde_json::json!({
         "version": 1, "operation": "introspect", "credential": credential.expose(),
     })).await.map_err(|_| inactive())?;
     if value.get("active").and_then(serde_json::Value::as_bool) != Some(true) {
@@ -41,13 +41,14 @@ pub(crate) async fn run(home: &Path, command: IdentityCommands) -> Result<()> {
 
 /// Only the gateway chooses the conversation and checks its generation.
 /// Missing/inactive run credentials never fall back to session environment claims.
-pub(crate) async fn record_native_tool_result(home: &Path, tool: &str, result: &serde_json::Value) -> Result<()> {
+pub(crate) async fn record_native_tool_result(_home: &Path, tool: &str, result: &serde_json::Value) -> Result<()> {
     let Some(reference) = duduclaw_gateway::session_tool_refs::reference_from_result(tool, result) else { return Ok(()); };
     let Some(credential) = std::env::var(ENV_RUN_CREDENTIAL).ok().and_then(RunCredential::parse) else { return Ok(()); };
     if std::env::var_os(ENV_IDENTITY_URL).is_some() { return Ok(()); }
-    let Some(endpoint) = discover_endpoint(home, std::env::var(ENV_IDENTITY_ENDPOINT)) else { return Ok(()); };
+    let Some((endpoint, server)) = trusted_target(std::env::var(ENV_IDENTITY_ENDPOINT),
+        std::env::var(ENV_IDENTITY_SERVER)) else { return Ok(()); };
     let unavailable = || DuDuClawError::Gateway("Conversation reference writer unavailable".into());
-    let response = ipc::request(&endpoint, &serde_json::json!({
+    let response = ipc::request(&endpoint, &server, &serde_json::json!({
         "version": 1, "operation": "tool-reference", "credential": credential.expose(), "reference": reference,
     })).await.map_err(|_| unavailable())?;
     if response["active"] != true { return Err(unavailable()); }
@@ -62,16 +63,16 @@ fn require_run_identity_mode(protected: bool) -> Result<()> {
     Ok(())
 }
 
-// Validate the final discovery target before sending a bearer proof. A present
-// but invalid environment override fails closed rather than using the file.
-fn discover_endpoint(home: &Path, env: std::result::Result<String, std::env::VarError>) -> Option<String> {
-    let raw = match env {
-        Ok(value) => value,
-        Err(std::env::VarError::NotPresent) => DiscoveryDirectory::open(home, false).ok()?.read().ok()?,
-        Err(_) => return None,
-    };
-    ipc::endpoint_path(&raw)?;
-    Some(raw)
+// Discovery is operator diagnostics only. Both routing and the server generation
+// must come from the gateway's spawn environment, even if a discovery file exists.
+fn trusted_target(endpoint: std::result::Result<String, std::env::VarError>,
+    server: std::result::Result<String, std::env::VarError>) -> Option<(String, String)>
+{
+    let endpoint = endpoint.ok()?;
+    let server = server.ok()?;
+    ipc::endpoint_path(&endpoint)?;
+    ipc::server_identity(&server)?;
+    Some((endpoint, server))
 }
 
 #[cfg(test)]
@@ -109,54 +110,33 @@ mod tests {
     }
 
     #[test]
-    fn discovery_prefers_env_then_file_and_refuses_nonlocal_targets() {
+    fn missing_trusted_env_never_uses_discovery_even_after_redirection() {
+        use duduclaw_core::run_credential::discovery::DiscoveryDirectory;
         let home = tempfile::tempdir().unwrap();
-        let url = test_endpoint("abc");
-        let other = test_endpoint("def");
-        assert!(discover_endpoint(home.path(), Err(std::env::VarError::NotPresent)).is_none());
         let discovery = DiscoveryDirectory::open(home.path(), true).unwrap();
-        discovery.write(&url).unwrap();
-        assert_eq!(discover_endpoint(home.path(), Err(std::env::VarError::NotPresent)).unwrap().as_str(), url);
-        assert_eq!(discover_endpoint(home.path(), Ok(other.clone())).unwrap().as_str(), other);
-        for raw in [String::new(), "http://127.0.0.1:12345/api/internal/identity/introspect".into(),
-            "https://example.com".into(), "unix:v2:/tmp/s".into(), "unix:v1:relative".into(),
-            format!(" {url}"), format!("{url}\0")] {
-            assert!(discover_endpoint(home.path(), Ok(raw)).is_none());
+        let endpoint = test_endpoint("abc");
+        let server = "v1:123:456".to_owned();
+        // Runs on Windows too: a valid local pipe in discovery is never a destination.
+        for destination in [&endpoint, &test_endpoint("def")] {
+            discovery.write(destination).unwrap();
+            assert!(trusted_target(Err(std::env::VarError::NotPresent), Ok(server.clone())).is_none());
+            assert!(trusted_target(Ok(endpoint.clone()), Err(std::env::VarError::NotPresent)).is_none());
+            assert_eq!(trusted_target(Ok(endpoint.clone()), Ok(server.clone())),
+                Some((endpoint.clone(), server.clone())));
         }
     }
 
-    #[cfg(unix)]
     #[test]
-    fn discovery_ignores_unsafe_files_and_directories_but_keeps_env_override() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
-        use duduclaw_core::run_credential::IDENTITY_ENDPOINT_FILE;
-
-        let url = test_endpoint("abc");
-        let home = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let discovery = DiscoveryDirectory::open(home.path(), true).unwrap();
-        discovery.write(&url).unwrap();
-        let file = home.path().join(IDENTITY_ENDPOINT_FILE);
-        let directory = home.path().join("run");
-        let assert_ignored = || {
-            assert!(discover_endpoint(home.path(), Err(std::env::VarError::NotPresent)).is_none());
-            assert_eq!(discover_endpoint(home.path(), Ok(url.clone())).unwrap().as_str(), url);
-        };
-
-        std::fs::rename(&file, outside.path().join("identity-endpoint")).unwrap();
-        symlink(outside.path().join("identity-endpoint"), &file).unwrap();
-        assert_ignored();
-        std::fs::remove_file(&file).unwrap();
-        discovery.write(&url).unwrap();
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o640)).unwrap();
-        assert_ignored();
-        discovery.write(&url).unwrap();
-        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o770)).unwrap();
-        assert_ignored();
-        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
-        std::fs::rename(&directory, home.path().join("original-run")).unwrap();
-        symlink(home.path().join("original-run"), &directory).unwrap();
-        assert_ignored();
+    fn invalid_endpoint_or_server_identity_fails_closed() {
+        let endpoint = test_endpoint("abc");
+        for raw in [String::new(), "http://127.0.0.1:12345/api/internal/identity/introspect".into(),
+            "https://example.com".into(), "unix:v2:/tmp/s".into(), "unix:v1:relative".into(),
+            format!(" {endpoint}"), format!("{endpoint}\0")] {
+            assert!(trusted_target(Ok(raw), Ok("v1:123:456".into())).is_none());
+        }
+        for raw in ["", "v2:123:456", "v1:0:456", "v1:123:0", "v1:123:456:7", "v1:+123:456"] {
+            assert!(trusted_target(Ok(endpoint.clone()), Ok(raw.into())).is_none());
+        }
     }
 }
 

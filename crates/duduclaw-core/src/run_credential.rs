@@ -1,5 +1,6 @@
 //! Run proof bound to a gateway-recorded OS process tree.
-//! Environment variables transport the token and local endpoint, never identity.
+//! Environment variables transport the token, local endpoint and expected server identity.
+//! Employee identity still comes exclusively from the gateway registry.
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use zeroize::Zeroizing;
@@ -14,6 +15,8 @@ pub const ENV_RUN_CREDENTIAL: &str = "DUDUCLAW_RUN_CREDENTIAL";
 pub const ENV_IDENTITY_URL: &str = "DUDUCLAW_IDENTITY_URL";
 /// Versioned local routing hint; never an identity claim.
 pub const ENV_IDENTITY_ENDPOINT: &str = "DUDUCLAW_IDENTITY_ENDPOINT";
+/// Gateway process generation, checked against the kernel peer before sending a proof.
+pub const ENV_IDENTITY_SERVER: &str = "DUDUCLAW_IDENTITY_SERVER";
 pub const IDENTITY_ENDPOINT_FILE: &str = "run/identity-endpoint";
 pub const PREFIX: &str = "ddc_run_";
 
@@ -60,6 +63,7 @@ pub trait RunLease: Send + Sync {
         self.spawn_binding().bind_spawn(root)
     }
     fn identity_endpoint(&self) -> Option<&str> { None }
+    fn identity_server(&self) -> Option<&str> { None }
 }
 
 pub type BackgroundIssuer = dyn Fn(&std::path::Path, &str, &str, &str, u64)
@@ -129,6 +133,8 @@ mod tests {
         }
         assert!(crate::spawn_env::AGENT_CLI_ENV_ALLOWLIST.contains(&ENV_RUN_CREDENTIAL));
         assert!(crate::spawn_env::AGENT_CLI_ENV_ALLOWLIST.contains(&ENV_IDENTITY_ENDPOINT));
+        assert!(crate::spawn_env::AGENT_CLI_ENV_ALLOWLIST.contains(&ENV_IDENTITY_SERVER));
+        assert!(crate::mcp_proxy_rewrite::is_proxy_private_env_key("duduclaw_identity_server"));
         assert!(crate::mcp_proxy_rewrite::is_proxy_private_env_key("duduclaw_run_credential"));
     }
 }

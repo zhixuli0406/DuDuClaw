@@ -1370,6 +1370,7 @@ async fn execute_proactive_check(
             cmd.env(duduclaw_core::run_credential::ENV_RUN_CREDENTIAL, _run_identity.credential().expose());
             cmd.env_remove(duduclaw_core::run_credential::ENV_IDENTITY_URL);
             cmd.env_remove(duduclaw_core::run_credential::ENV_IDENTITY_ENDPOINT);
+            cmd.env(duduclaw_core::run_credential::ENV_IDENTITY_SERVER, _run_identity.identity_server().unwrap_or(""));
             if let Some(url) = _run_identity.identity_endpoint() {
                 cmd.env(duduclaw_core::run_credential::ENV_IDENTITY_ENDPOINT, url);
             }
