@@ -4,6 +4,26 @@
 use std::io;
 use std::path::Path;
 
+/// Generated DOS 8.3 spellings cannot safely be mapped without the volume.
+/// Archive extractors on Windows refuse these aliases before writing.
+pub fn is_dos_short_name(name: &str) -> bool {
+    let name = name.split(':').next().unwrap_or(name).trim_end_matches(['.', ' ']);
+    let (stem, extension) = name.rsplit_once('.').unwrap_or((name, ""));
+    stem.chars().count() <= 8 && !stem.contains('.') && extension.chars().count() <= 3
+        && stem.rsplit_once('~').is_some_and(|(prefix, digits)|
+            !prefix.is_empty() && !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+#[test]
+fn dos_short_name_archive_aliases() {
+    for name in ["GOOGLE~1", "GOOGL~12.AUT", "GO1234~1", "google~1. ", "GOOGLE~1::$INDEX_ALLOCATION", "CONFIG~1.TOM"] {
+        assert!(is_dos_short_name(name), "{name}");
+    }
+    for name in [".google-authority", "notes~draft", "GOOGLE~", "~1", "toolong~1", "GOOGLE~1.long"] {
+        assert!(!is_dos_short_name(name), "{name}");
+    }
+}
+
 /// Reparse points include junctions, not just Rust's symlink file types.
 pub fn is_link_metadata(meta: &std::fs::Metadata) -> bool {
     #[cfg(windows)] {

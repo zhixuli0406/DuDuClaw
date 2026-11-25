@@ -352,6 +352,14 @@ fn extract_inner(
             });
         }
 
+        // Match the CLI: volume-dependent DOS aliases must never reach disk.
+        if cfg!(windows) && raw_path.components().any(|part|
+            duduclaw_core::fs_safety::is_dos_short_name(&part.as_os_str().to_string_lossy())) {
+            return Err(RestoreViolation::UnsafeEntry {
+                path: path_str,
+                reason: "dos_short_name_alias",
+            });
+        }
         // Backups may be home-rooted or partition-rooted. Never materialize
         // an archived authority namespace at either depth, even in staging.
         if raw_path.components().any(|part|
@@ -773,6 +781,8 @@ pub enum RestoreSwapError {
 // Portable tar globs: case-insensitive names and Win32 trailing-dot/space/ADS
 // aliases. Shared by manual and scheduled backups; no GNU-only tar flags.
 pub(crate) const AUTHORITY_BACKUP_EXCLUDES: &[&str] = &[
+    ".[gG][oO][oO][gG][lL][eE]-[aA][uU][tT][hH][oO][rR][iI][tT][yY]",
+    ".[gG][oO][oO][gG][lL][eE]-[aA][uU][tT][hH][oO][rR][iI][tT][yY][. :]*",
     "*/.[gG][oO][oO][gG][lL][eE]-[aA][uU][tT][hH][oO][rR][iI][tT][yY]",
     "*/.[gG][oO][oO][gG][lL][eE]-[aA][uU][tT][hH][oO][rR][iI][tT][yY][. :]*",
 ];
@@ -853,12 +863,11 @@ fn perform_pending_restore_swap_with_protection(
 
     // Keep local lock identity; retire the epoch before replacing any data.
     // Hold admission -> authority writer -> restore/config locks through swap.
-    let authority_exists = path_occupied(&home_dir.join(".google-authority"))
+    // Unconditional fencing also covers a concurrent initializer on a fresh home.
+    let _admission = duduclaw_core::agent_seats::SeatAdmission::acquire(home_dir)
         .map_err(|e| RestoreSwapError::Io(e.to_string()))?;
-    let _admission = authority_exists.then(|| duduclaw_core::agent_seats::SeatAdmission::acquire(home_dir))
-        .transpose().map_err(|e| RestoreSwapError::Io(e.to_string()))?;
-    let _authority = authority_exists.then(|| duduclaw_core::authority_coordinator::AuthorityCoordinator::new(home_dir).write())
-        .transpose().map_err(|e| RestoreSwapError::Io(e.to_string()))?;
+    let _authority = duduclaw_core::authority_coordinator::AuthorityCoordinator::new(home_dir).write()
+        .map_err(|e| RestoreSwapError::Io(e.to_string()))?;
     with_restore_lock(home_dir, || perform_pending_restore_swap_locked(home_dir, now_tag))
         .map_err(|e| RestoreSwapError::Io(e.to_string()))?
 }
@@ -1672,17 +1681,63 @@ mod tests {
             let report = perform_pending_restore_swap(home.path(), "authority").unwrap().unwrap();
             assert_eq!(report.entries_swapped, 1);
             assert_eq!(std::fs::read_dir(home.path()).unwrap().filter(|entry|
-                is_authority_namespace(&entry.as_ref().unwrap().file_name().to_string_lossy())).count(), usize::from(existing));
+                is_authority_namespace(&entry.as_ref().unwrap().file_name().to_string_lossy())).count(), 1);
             assert!(!report.preserved_dir.join(".google-authority").exists());
+            assert!(home.path().join(".google-authority").is_dir());
+            let epoch = std::fs::read(home.path().join(".google-authority/epoch")).unwrap();
+            assert_ne!(epoch, b"archived state");
+            assert_ne!(epoch, b"old epoch");
             if let Some(before) = before {
                 assert_ne!(authority.epoch().unwrap(), before);
-            } else {
-                assert!(!home.path().join(".google-authority").exists());
             }
             // Check original anchors and fresh Unix mode/uid/nlink or DACLs.
             if existing { drop(authority.write().unwrap()); }
             drop(AuthorityCoordinator::new(home.path()).write().unwrap());
             assert!(is_gateway_lock_directory(std::ffi::OsStr::new(".GOOGLE-AUTHORITY. ")));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn extract_rejects_dos_short_name_aliases_at_any_depth() {
+        for path in ["GOOGLE~1/epoch", "home/GO1234~1/epoch", "home/google~1. /intent", "GOOGL~12.AUT/resource"] {
+            let root = tempfile::tempdir().unwrap();
+            let archive = root.path().join("input.tar.gz");
+            std::fs::write(&archive, build_tar_gz(&[("ordinary", b"ok"), (path, b"old epoch")])).unwrap();
+            let dest = root.path().join("extracted");
+            let error = extract_tar_gz_with_isolation(&archive, &dest, &RestoreLimits::default(), false).unwrap_err();
+            assert!(matches!(error, RestoreViolation::UnsafeEntry { reason: "dos_short_name_alias", .. }));
+            assert!(!dest.exists(), "rejection must remove the partial extraction");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authority_backup_excludes_cover_home_and_parent_roots() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("source");
+        let home = parent.join("home");
+        for name in [".google-authority", ".GOOGLE-AUTHORITY. ", ".google-authority:stream"] {
+            std::fs::create_dir_all(home.join(name)).unwrap();
+            std::fs::write(home.join(name).join("epoch"), b"old epoch").unwrap();
+        }
+        std::fs::write(home.join("ordinary"), b"keep").unwrap();
+        for source in [&home, &parent] {
+            let archive = root.path().join("backup.tar.gz");
+            let mut command = std::process::Command::new("tar");
+            command.arg("-czf").arg(&archive);
+            for pattern in AUTHORITY_BACKUP_EXCLUDES { command.arg("--exclude").arg(pattern); }
+            let output = command.arg("-C").arg(source).arg(".").output().unwrap();
+            assert!(output.status.success(), "tar failed: {output:?}");
+            let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(std::fs::File::open(&archive).unwrap()));
+            let mut ordinary = false;
+            for entry in archive.entries().unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path().unwrap();
+                assert!(!path.components().any(|part| is_authority_namespace(&part.as_os_str().to_string_lossy())));
+                ordinary |= path.file_name().is_some_and(|name| name == "ordinary");
+            }
+            assert!(ordinary, "the backup must retain ordinary data");
         }
     }
 
