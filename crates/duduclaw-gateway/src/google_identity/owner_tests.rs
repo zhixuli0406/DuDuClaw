@@ -3,6 +3,60 @@ use serde_json::json;
 use duduclaw_core::authority_coordinator::AuthorityCoordinator;
 
 #[tokio::test]
+async fn no_google_connection_refuses_before_owner_binding() {
+    let f = Fixture::new();
+    let config = f.home.path().join("config.toml");
+    std::fs::write(&config, std::fs::read_to_string(&config).unwrap()
+        .replace("google_workspace=true", "google_workspace=false")).unwrap();
+    std::fs::remove_file(delegation_key::path(f.home.path())).unwrap();
+    let turn = uuid::Uuid::new_v4().to_string();
+    let _guard = crate::knowledge::turn_requesters::register(AGENT, &turn,
+        duduclaw_knowledge::requester::RequesterIdentity::DashboardUser { user_id:f.alice.clone() }).unwrap();
+    let probe = route_test_probe::Guard::install(f.home.path());
+    for turn in [None, Some(turn)] {
+        for (tool, arguments) in [
+            ("google_chat_send", json!({"space":"spaces/local", "text":"never sent"})),
+            ("gmail_send_draft", json!({"draft_id":"local-draft"})),
+            ("calendar_delete_event", json!({"event_id":"local-event"})),
+        ] {
+            let body = serde_json::to_vec(&json!({"kind":"employee_prepare", "tool":tool,
+                "arguments":arguments, "turn_id":turn, "call_id":"no-connection"})).unwrap();
+            let (status, result) = f.post(execute::ROUTE, body.clone(), f.signed(&body)).await;
+            assert_eq!(status, 403, "{tool}: {result}");
+            assert_eq!(result["code"], "disabled", "{tool}: {result}");
+            assert_eq!(result["message"], "管理員尚未開啟 Google 整合。");
+        }
+    }
+    assert_eq!(probe.counts(), [0, 0]);
+    assert!(!f.home.path().join("approvals.db").exists());
+}
+
+#[tokio::test]
+async fn no_google_connection_member_chat_reports_not_connected() {
+    let f = Fixture::new();
+    let config = f.home.path().join("config.toml");
+    let mut raw = std::fs::read_to_string(&config).unwrap();
+    raw.push_str("\n[google]\nchat_send=true\n");
+    std::fs::write(config, raw).unwrap();
+    std::fs::write(f.home.path().join("agents").join(AGENT).join("agent.toml"),
+        format!("[agent]\nname='{AGENT}'\n[google]\nidentity='owner'\n")).unwrap();
+    f.db.set_google_consent(&f.alice, AGENT, true, &f.alice).unwrap();
+    let turn = uuid::Uuid::new_v4().to_string();
+    let _guard = crate::knowledge::turn_requesters::register(AGENT, &turn,
+        duduclaw_knowledge::requester::RequesterIdentity::DashboardUser { user_id:f.alice.clone() }).unwrap();
+    let probe = route_test_probe::Guard::install(f.home.path());
+    let body = serde_json::to_vec(&json!({"kind":"employee_prepare", "tool":"google_chat_send",
+        "arguments":{"space":"spaces/local", "text":"never sent"},
+        "turn_id":turn, "call_id":"member-no-connection"})).unwrap();
+    let (status, result) = f.post(execute::ROUTE, body.clone(), f.signed(&body)).await;
+    assert_eq!(status, 403, "{result}");
+    assert_eq!(result["code"], "not_connected", "{result}");
+    assert_eq!(result["message"], "負責人還沒連結 Google，請本人到「我的連線」按「連結我的 Google」。");
+    assert_eq!(probe.counts(), [0, 0]);
+    assert!(!f.home.path().join("approvals.db").exists());
+}
+
+#[tokio::test]
 async fn notification_db_opens_preserve_pending_and_approval_waiting_owner_calls() {
     for require_approval in [false, true] {
         let f = Fixture::new();

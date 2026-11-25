@@ -82,6 +82,9 @@ async fn serve_inner(state: &ExecuteState, agent: &str, request: Request,
     }
     crate::google_workspace::validate_native_tool_inputs(&tool, &args)
         .map_err(|m| Refusal::hard("native_arguments_invalid", m))?;
+    if !crate::google_workspace::integration_enabled(&state.home) {
+        return Err(Refusal::hard("disabled", "管理員尚未開啟 Google 整合。"));
+    }
     let who = requester(agent, turn.as_deref(), run.as_deref())?;
     if tool == super::chat_send::TOOL {
         return super::chat_send::serve(state, agent, &args, who, turn, call, approved).await;

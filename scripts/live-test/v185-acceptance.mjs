@@ -10,7 +10,7 @@ import net from 'node:net';
 import { tmpdir, homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const file = fileURLToPath(import.meta.url);
 const scriptDir = dirname(file);
@@ -123,6 +123,13 @@ function system(command, args, input) {
 }
 function sql(query, readonly = true) {
   return JSON.parse(system('/usr/bin/sqlite3', [...(readonly ? ['-readonly'] : []), '-json', join(context.home, 'users.db'), query]) || '[]');
+}
+function walReadArgs(path, query) {
+  // A read-only opener can fail with SQLITE_CANTOPEN while the last WAL
+  // writer retires its sidecars. Allow WAL recovery, but no SQL writes or
+  // creation of a missing database; wait for concurrent checkpoint locks.
+  return ['-cmd', '.timeout 2000', '-json', `${pathToFileURL(path).href}?mode=rw`,
+    `PRAGMA query_only=ON; ${query}`];
 }
 async function until(action, label, ms = 15000) {
   const end = Date.now() + ms;
@@ -811,9 +818,9 @@ async function selfAddScenario() {
     await fixtureTurn(chat, 'claude', { action: 'knowledge', collection: 'local-private', text: other, title: 'Tool-discovered source' }, 'Add the same tool result again.', 'knowledge-fixture');
     // This isolated fixture has no external DM token. Check the durable Owner
     // notification handoff; real provider delivery is a separate live check.
-    const noticeRows = () => JSON.parse(system('/usr/bin/sqlite3', ['-readonly', '-json',
+    const noticeRows = () => JSON.parse(system('/usr/bin/sqlite3', walReadArgs(
       join(context.home, 'knowledge', 'knowledge.db'),
-      'SELECT source_id,owner_id,title,delivered FROM owner_self_add_notices']) || '[]');
+      'SELECT source_id,owner_id,title,delivered FROM owner_self_add_notices')) || '[]');
     await until(() => noticeRows().filter(row => finalSources.sources.some(source => source.id === row.source_id)).length === 2,
       'durable Owner auto-import notifications');
     const notices = noticeRows().filter(row => finalSources.sources.some(source => source.id === row.source_id));
@@ -1098,6 +1105,9 @@ async function main() {
 }
 
 async function testHelpers() {
+  const walArgs = walReadArgs('/tmp/knowledge fixture/knowledge.db', 'SELECT 1');
+  assert.deepEqual(walArgs, ['-cmd', '.timeout 2000', '-json',
+    'file:///tmp/knowledge%20fixture/knowledge.db?mode=rw', 'PRAGMA query_only=ON; SELECT 1']);
   assert.equal(parseOptions([]).port, 18985);
   assert.deepEqual(parseOptions(['--port', '18986', '--only', 'memory,wiki']), { port: 18986, only: ['memory', 'wiki'] });
   for (const args of [['--port', '18889'], ['--port', '0'], ['--port', 'bad'], ['--port'], ['--wat']]) assert.throws(() => parseOptions(args));

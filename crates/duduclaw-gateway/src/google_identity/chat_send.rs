@@ -46,7 +46,8 @@ impl Snapshot {
             gi::Effective::Personal { selector } => {
                 let owner = crate::google_personal::access::select_user(&db, agent, selector)?;
                 if owner.id != uid || db.google_consent(uid, agent).map_err(store_error)? != Some(true) { return Err(refused()); }
-                let record = crate::person_credentials::get(home, uid).map_err(store_error)?.ok_or_else(refused)?;
+                let record = crate::person_credentials::get(home, uid).map_err(store_error)?.ok_or_else(||
+                    Refusal::hard("not_connected", "負責人還沒連結 Google，請本人到「我的連線」按「連結我的 Google」。"))?;
                 if record.metadata.status != crate::person_credentials::Status::Connected
                     || !crate::google_personal::scopes::permitted_for(TOOL, &record.metadata)
                     || !crate::google_personal::access::domain_allowed(home, &record.metadata).map_err(store_error)? {
