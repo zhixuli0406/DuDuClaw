@@ -182,8 +182,9 @@ impl MethodHandler {
                         if item.category == duduclaw_migration::contract::ConfirmationCategory::Employee {
                             // Reconcile any interrupted compensation, but never
                             // revive a permanently tombstoned UID on Retry.
-                            approval.authorize(&input.csrf_token, now as u64).map_err(|_| error)?;
-                            duduclaw_migration::confirmation::ProposalApplier::disable_and_read_back(&mut applier, &item).map_err(|_| error)?;
+                            applier.with_confirmation_admission(&mut store, &item.binding, |store, applier| {
+                                store.compensate_failed_employee(&item.binding, &approval, input.csrf_token, now as u64, applier)
+                            }).map_err(|_| error)?;
                             return Err("此員工配置已撤銷，舊身分不會重用。請重新建立員工配置提案，再逐筆確認。");
                         }
                         applier.with_confirmation_admission(&mut store, &item.binding, |store, applier| {

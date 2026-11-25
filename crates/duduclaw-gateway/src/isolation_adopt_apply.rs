@@ -845,7 +845,14 @@ pub(crate) fn apply_item(home: &Path, env: &AdoptEnv<'_>, item: &ConfirmationIte
     if settings_from_toml(&inputs.agent_toml).map_err(fail)? != settings { return Err(fail(AdoptError::SettingsChanged)); }
     // 2. The allowlist transform.
     let dirs = fsops::open_dirs(home, &q).map_err(fail)?;
-    env.with_seat_write(home, |_| fsops::transform(&dirs, &target, &inputs, &verified)).map_err(fail)?;
+    env.with_seat_write(home, |admission| {
+        match admission.decide(env.agent_cap, 1, None) {
+            duduclaw_core::agent_seats::SeatDecision::Admitted => {}
+            duduclaw_core::agent_seats::SeatDecision::Full { .. } => return Err(Refusal::QuotaExceeded.into()),
+            duduclaw_core::agent_seats::SeatDecision::Unverifiable(_) => return Err(AdoptError::Unavailable),
+        }
+        fsops::transform(&dirs, &target, &inputs, &verified)
+    }).map_err(fail)?;
     if crash_at(AdoptHook::AfterMove) { return Err(AdoptError::Unavailable); }
     let agents = home.join("agents");
     (env.hooks)(&agents.join(&target)).map_err(|()| fail(AdoptError::Unavailable))?;

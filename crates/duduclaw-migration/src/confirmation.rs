@@ -400,6 +400,36 @@ impl ConfirmationStore {
         Ok(item)
     }
 
+    /// Finish compensation for a failed Employee without reviving its UID.
+    /// Keep Failed even after success: allocation requires a new proposal.
+    pub fn compensate_failed_employee(&mut self, binding: &ProposalBinding, session: &ApprovalSession,
+        csrf: [u8; 32], now: u64, adapter: &mut dyn ProposalApplier) -> Result<()> {
+        session.check(&csrf, now)?;
+        let proposal = ProposalLock::new(&self.conn, binding);
+        let _operation = proposal.operation()?;
+        let guard = proposal.acquire()?;
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let item = required(&tx, binding)?;
+        if item.status != ConfirmationStatus::Failed || item.category != ConfirmationCategory::Employee {
+            return Err(ConfirmationError::Denied);
+        }
+        let intent = effects::intent(&tx, &item, 3)?;
+        tx.commit()?;
+        drop(guard);
+        let disabled = adapter.apply_effect(&item, ProposalEffect::Disable, &proposal).is_ok();
+        let _guard = proposal.acquire()?;
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        effects::consume(&tx, &item, 3, &intent)?;
+        if disabled {
+            receipt(&tx, &item, 3)?;
+            audit(&tx, &item, "failed_disabled", Some(session.actor))?;
+        } else {
+            audit(&tx, &item, "compensation_failed", Some(session.actor))?;
+        }
+        tx.commit()?;
+        if disabled { Ok(()) } else { Err(ConfirmationError::Compensation) }
+    }
+
     pub fn retry(&mut self, binding: &ProposalBinding, session: &ApprovalSession,
         csrf: [u8; 32], now: u64, adapter: &mut dyn ProposalApplier,
         validator: &dyn ProposalValidator) -> Result<()> {
