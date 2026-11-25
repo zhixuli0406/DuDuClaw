@@ -529,6 +529,7 @@ async fn protected_avatar_assignment_checks_target_members_personal_owner() {
 #[tokio::test]
 async fn avatar_seats_create_when_full_recount_and_refuse_exemption_loss() {
     let f = fixture(false).await;
+    f.handler.set_test_edition(Some(duduclaw_core::EditionProfile::Enterprise)).await;
     let member = f.db.create_user("seat-avatar@test.example", "Member", "password123", UserRole::Employee).unwrap();
     let before = duduclaw_core::agent_seats::seat_holders(f._home.path()).unwrap().len();
     f.handler.set_agent_cap_fixture(Some(before + 1)).await;
@@ -559,6 +560,13 @@ async fn avatar_seats_create_when_full_recount_and_refuse_exemption_loss() {
     }
     assert_eq!(f.db.get_user(&member.id).unwrap().unwrap().status, duduclaw_auth::UserStatus::Active);
     assert_eq!(duduclaw_core::agent_seats::seat_holders(f._home.path()).unwrap().len(), before + 1);
+    for invalid in [json!("true"), json!(1), Value::Null] {
+        let refused = f.handler.handle_users_set_avatar(json!({
+            "user_id":member.id,"agent_id":null,"delete_avatar":invalid,
+        }), &f.owner).await;
+        assert!(error_text(&refused).contains("invalid_setting"));
+        assert_eq!(f.db.avatar_agent(&member.id).unwrap().as_deref(), Some("personal-avatar"));
+    }
     ok_payload(&f.handler.handle_users_set_avatar(json!({
         "user_id":member.id,"agent_id":null,"delete_avatar":true,
     }), &f.owner).await);

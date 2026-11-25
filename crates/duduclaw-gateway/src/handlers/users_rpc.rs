@@ -16,7 +16,7 @@ pub(super) fn validate_settings(params: &Value, allowed: &[&str]) -> Result<(), 
     for (key, value) in object {
         if !allowed.contains(&key.as_str()) { return Err(setting_error(key, "unsupported key")); }
         let valid = match key.as_str() {
-            "invite" | "confirm" => value.is_boolean(),
+            "invite" | "confirm" | "delete_avatar" => value.is_boolean(),
             "department" | "manager_user_id" | "agent_id" => value.is_string() || value.is_null(),
             _ => value.is_string(),
         };

@@ -354,6 +354,11 @@ const EMPLOYEE_KEYS: &[&str] = &["agent_id", "agent", "agent_name", "from_agent"
 /// an employee, method by method, each with its reason. Required for every
 /// such arm in a namespace that also has a gated method.
 const EMPLOYEE_ARMS: &[(&str, &str)] = &[
+    // The shared broadcast_event helper reads assigned_to only for task events;
+    // these system-status events neither select nor expose employee content.
+    ("license.activate", "Admin-only signed license installation; request contains a license key, no employee; broadcasts system status"),
+    ("maintenance.enable", "Admin-only appliance maintenance with confirmation and password re-auth; names no employee; broadcasts maintenance status"),
+    ("maintenance.disable", "Admin-only appliance maintenance shutdown; names no employee; broadcasts maintenance status"),
     // (a) = the P1g explicit Admin management / metadata allowlist
     // (`personal_p1g_gate::metadata_allowlisted`): exempt from the default
     // deny and the hidden-row filter, each audited or metadata by design.
@@ -458,6 +463,7 @@ const EMPLOYEE_ARMS: &[(&str, &str)] = &[
     ("users.offboard", "people; P1g default deny on a named hand-over target"),
     ("users.set_primary_agent", "P1g default deny: another person's Personal employee is refused (owner only)"),
     ("users.set_avatar", "v1.85 avatar assignment: live Admin check; P1g default deny on agent_id, protected-mode owner match, and existing binding required; grants no employee access"),
+    ("users.avatar_conflicts", "v1.85 live Admin-only avatar assignment conflict metadata (employee/member ids); takes no request parameters and returns no employee content"),
     ("users.change_password", "the caller's own password"),
     ("users.change_email", "the caller's own address"),
     ("users.audit_log", "auth audit rows; P1g hidden rows drop those naming another person's Personal employee"),

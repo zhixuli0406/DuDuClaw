@@ -1800,7 +1800,10 @@ pub(super) async fn run<I: LocalIo>(template: &NativeCallTemplate, io: &mut I) -
                 name.strip_prefix(&format!("{}/messages/", args.space)).is_some_and(|id|
                     !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b))))
                 .ok_or_else(|| GoogleApiError::Api { status:502, message:"result_unconfirmed".into() })?;
-            Ok(Outcome::Chat(json!({"status":"sent", "name":name, "request_id":template.meet_request_id()})))
+            Ok(Outcome::Write {
+                data: json!({"status":"sent", "name":name, "request_id":template.meet_request_id()}),
+                created_id_field: None,
+            })
         }.await,
         ParsedNativeArguments::ChatSpaces(args) => chat_spaces(io, template, args).await.map(Outcome::Chat),
         ParsedNativeArguments::ChatMessages(args) => chat_messages(io, template, args).await.map(Outcome::Chat),

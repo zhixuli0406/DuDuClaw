@@ -359,7 +359,15 @@ impl CredentialProtection {
     }
 
     pub fn with_store(home: &Path, store: Box<dyn KeyStore>) -> Self {
-        Self { home: home.to_path_buf(), store }
+        // Pin the same physical home used by the key-store account and the
+        // gateway lock. The authority coordinator still validates ownership,
+        // permissions and lock identities; it never follows a symlink leaf.
+        #[cfg(unix)]
+        let home = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
+        // Windows must retain the original spelling for its reparse-point checks.
+        #[cfg(not(unix))]
+        let home = home.to_path_buf();
+        Self { home, store }
     }
 
     fn account(&self) -> String {

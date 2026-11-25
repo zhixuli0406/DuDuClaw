@@ -2,6 +2,11 @@
 
 use serde_json::Value;
 
+pub(crate) enum TurnLease {
+    Dedicated { _guard: tokio::sync::OwnedRwLockReadGuard<()> },
+    Shared { _guard: tokio::sync::OwnedRwLockWriteGuard<()> },
+}
+
 /// Built once from an authenticated HTTP event or authoritative Pub/Sub read.
 /// Fields stay private so delivery and history cannot select different threads.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,9 +61,38 @@ impl GoogleChatConversation {
     }
 
     pub(crate) fn queue_keys(&self, app_agent: Option<&str>) -> (String, String) {
-        // Resolve employees inside the queue. Serializing the base thread also
-        // covers shared/dedicated apps that eventually select the same bucket.
-        (serde_json::json!([app_agent, self.space]).to_string(), self.session_key.clone())
+        // Keep each app independent while serializing all senders in one
+        // thread of that app. Shared-app routing is resolved inside its queue.
+        (serde_json::json!([app_agent, self.space]).to_string(),
+            serde_json::json!([app_agent, self.session_key]).to_string())
+    }
+
+    /// Dedicated apps have disjoint employee buckets and may run together.
+    /// A shared app can route to any of them, so hold the whole thread until
+    /// routing, commands, model work and delivery finish. Entry queues still
+    /// serialize senders of each app and enforce their original admission caps.
+    pub(crate) async fn turn_lease(&self, home: &std::path::Path, own_app: bool) -> std::io::Result<TurnLease> {
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex, OnceLock, Weak};
+        type Locks = HashMap<(std::path::PathBuf, String), Weak<tokio::sync::RwLock<()>>>;
+        static LOCKS: OnceLock<Mutex<Locks>> = OnceLock::new();
+        let key = (home.canonicalize()?, self.session_key.clone());
+        let lock = {
+            let mut locks = LOCKS.get_or_init(Default::default).lock()
+                .map_err(|_| std::io::Error::other("Google Chat thread lock unavailable"))?;
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            let slot = locks.entry(key).or_default();
+            match slot.upgrade() {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(tokio::sync::RwLock::new(()));
+                    *slot = Arc::downgrade(&lock);
+                    lock
+                }
+            }
+        };
+        Ok(if own_app { TurnLease::Dedicated { _guard: lock.read_owned().await } }
+            else { TurnLease::Shared { _guard: lock.write_owned().await } })
     }
 }
 
@@ -113,9 +147,9 @@ mod tests {
         other_sender["message"]["sender"] = json!({"name":"users/222"});
         let same = GoogleChatConversation::from_event(&other_sender, false, false).unwrap();
         assert_eq!(a.session_key(), same.session_key());
-        // Shared and dedicated apps that reach the same employee bucket must
-        // serialize too. Routing happens inside this conservative thread queue.
-        assert_eq!(a.queue_keys(None).1, same.queue_keys(Some("sales")).1);
+        assert_eq!(a.queue_keys(Some("sales")).1, same.queue_keys(Some("sales")).1);
+        assert_ne!(a.queue_keys(Some("sales")).1, same.queue_keys(Some("hr")).1);
+        assert_ne!(a.queue_keys(None).1, same.queue_keys(Some("sales")).1);
     }
 
     #[test]
@@ -165,6 +199,7 @@ mod tests {
 
     #[tokio::test]
     async fn rm182_queue_serializes_different_senders_and_apps_in_one_thread() {
+        let home = tempfile::tempdir().unwrap();
         let c = GoogleChatConversation::from_event(&event("spaces/A", "spaces/A/threads/t", true), false, false).unwrap();
         let queue = crate::conversation_queue::ConversationQueue::default();
         let (entered, started) = tokio::sync::oneshot::channel();
@@ -172,10 +207,19 @@ mod tests {
         let (done, finished) = tokio::sync::oneshot::channel();
         let (g1, k1) = c.queue_keys(None);
         let (g2, k2) = c.queue_keys(Some("sales"));
-        queue.submit_in(&g1, &k1, async move { entered.send(()).unwrap(); wait.await.unwrap(); }).unwrap();
+        let shared = c.clone();
+        let shared_home = home.path().to_owned();
+        queue.submit_in(&g1, &k1, async move {
+            let _lease = shared.turn_lease(&shared_home, false).await.unwrap();
+            entered.send(()).unwrap(); wait.await.unwrap();
+        }).unwrap();
         started.await.unwrap();
         let (second, mut second_started) = tokio::sync::oneshot::channel();
-        queue.submit_in(&g2, &k2, async move { second.send(()).unwrap(); done.send(()).unwrap(); }).unwrap();
+        let dedicated_home = home.path().to_owned();
+        queue.submit_in(&g2, &k2, async move {
+            let _lease = c.turn_lease(&dedicated_home, true).await.unwrap();
+            second.send(()).unwrap(); done.send(()).unwrap();
+        }).unwrap();
         tokio::task::yield_now().await;
         assert!(matches!(second_started.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
         release.send(()).unwrap();

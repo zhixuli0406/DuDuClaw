@@ -90,9 +90,15 @@ pub(crate) async fn execute(
         return Ok(serde_json::json!({"content":[{"type":"text", "text":
             format!("目前負責人 Google 帳號：{}；僅檢查本機授權，未取得權杖。", snapshot.email)}]}));
     }
-    let template = crate::google_workspace::native_call::NativeCallTemplate::prepare(context.purpose.scope_key(), args)
+    let mut template = crate::google_workspace::native_call::NativeCallTemplate::prepare(context.purpose.scope_key(), args)
         .map_err(|m| Refusal::hard("native_arguments_invalid", m))?;
     template.validate_closed().map_err(|m| Refusal::hard("native_arguments_invalid", m))?;
+    if matches!(template.tool(), "gmail_send_draft" | "calendar_delete_event") {
+        template.bind_confirmation(crate::google_workspace::native_confirmation::HostContext::new(
+            &context.home, &context.agent, snapshot.email.clone(),
+        ).map_err(|m| Refusal::hard("native_confirmation_unavailable", m))?);
+        snapshot.validate(&context.home, &context.agent)?;
+    }
     // The owner selector forces CacheMode::Bypass in the existing resolver.
     #[cfg(test)]
     if crate::google_identity::route_test_probe::refuse_work(&context.home, crate::google_identity::route_test_probe::Work::Token) {

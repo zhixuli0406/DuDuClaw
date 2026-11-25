@@ -325,8 +325,9 @@ fn overrides_keep_upstream_credentials_out_of_argv() {
     assert!(
         ov.args
             .iter()
-            .any(|a| a == r#"mcp_servers.masterlink.env_vars=["DUDUCLAW_RUN_CREDENTIAL", "DUDUCLAW_IDENTITY_URL", "DUDUCLAW_IDENTITY_SERVER", "DUDUCLAW_MCP_API_KEY"]"#)
+            .any(|a| a == r#"mcp_servers.masterlink.env_vars=["DUDUCLAW_RUN_CREDENTIAL", "DUDUCLAW_IDENTITY_ENDPOINT", "DUDUCLAW_IDENTITY_SERVER", "DUDUCLAW_MCP_API_KEY"]"#)
     );
+    assert!(!argv.contains("DUDUCLAW_IDENTITY_URL"), "legacy HTTP transport must not be forwarded");
     // The API key was already set on the process for the duduclaw server.
     assert!(ov.process_env.is_empty());
 

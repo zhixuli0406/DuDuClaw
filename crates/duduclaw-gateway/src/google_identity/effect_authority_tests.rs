@@ -3746,7 +3746,14 @@ async fn rm159_closed_owners_require_a_fresh_snapshot_card_before_any_send_or_de
             ("calendar_delete_event", json!({"event_id":"e1"}))] {
             for approve in [false, true] {
                 let f = d1_fixture(home);
+                // Fresh confirmation requires a live employee policy and an
+                // authenticated Admin, even for dedicated credentials.
+                let path = f.home.path().join("agents/bot/agent.toml");
+                let config = std::fs::read_to_string(&path).unwrap().replace("name='bot'", "name='bot'\nstatus='active'");
+                std::fs::write(path, config).unwrap();
                 f.db.ensure_google_employee_nonce("bot").unwrap();
+                let admin = f.db.create_user("admin@unit.test", "Admin", "fixture-password", UserRole::Admin).unwrap();
+                let actor = f.db.live_user_context(&admin.id).unwrap().unwrap();
                 let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
                     "To: recipient@example.com\r\nSubject: Real Google subject\r\n\r\nApproved body");
                 let wire = d1_wire(move |_, target| {
@@ -3774,7 +3781,7 @@ async fn rm159_closed_owners_require_a_fresh_snapshot_card_before_any_send_or_de
                             assert_eq!(rec.payload["native_google_confirmation"], true);
                             assert_eq!(rec.payload["arguments"]["account"], "alice@unit.test");
                             assert!(rec.payload["arguments"]["content_hash"].is_string());
-                            broker.decide(&rec.id, approve, "dashboard:admin").await.unwrap();
+                            broker.decide_egress_dashboard(&rec.id, &actor, approve).await.unwrap();
                             break;
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(10)).await;

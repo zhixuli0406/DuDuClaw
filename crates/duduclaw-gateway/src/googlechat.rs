@@ -858,6 +858,11 @@ async fn handle_message(
         return;
     }
 
+    let _turn = match conversation.turn_lease(&state.ctx.home_dir, state.agent.is_some()).await {
+        Ok(lease) => lease,
+        Err(_) => { warn!("Google Chat thread lock unavailable; turn refused"); return; }
+    };
+
     let space = conversation.space().to_owned();
     let is_dm = conversation.is_dm();
     let thread = conversation.delivery_thread().map(str::to_owned);
@@ -2400,8 +2405,8 @@ mod access_notice_tests {
         let c = conversation("spaces/A", "spaces/A/threads/t");
         let (group, key) = c.queue_keys(Some("sales"));
         assert_eq!(group, json!(["sales", "spaces/A"]).to_string());
-        assert_eq!(key, c.session_key());
-        assert_eq!(c.queue_keys(None).1, key);
+        assert_eq!(key, json!(["sales", c.session_key()]).to_string());
+        assert_ne!(c.queue_keys(None).1, key);
     }
 
     #[tokio::test]

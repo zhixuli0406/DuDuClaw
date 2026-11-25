@@ -777,7 +777,9 @@ async fn chat_send_uses_fixed_request_id_exact_text_and_reply_or_fail() {
         &json!({"space":"spaces/A","text":"完整 👋\n文字", "thread":"spaces/A/threads/T"})).unwrap();
     template.set_chat_request_id("f3059222-a4ae-40f6-a173-f320cfdc8acd");
     let result = run(&template, &mut io).await;
-    assert_ne!(result["isError"], true);
+    assert_ne!(result["isError"], true, "{result}");
+    assert_eq!(result["structuredContent"], json!({"status":"sent", "name":"spaces/A/messages/m1",
+        "request_id":"f3059222-a4ae-40f6-a173-f320cfdc8acd"}));
     assert_eq!(io.wire.len(), 1);
     assert_eq!(io.wire[0].0, "POST");
     assert_eq!(io.wire[0].1, "https://chat.googleapis.com/v1/spaces/A/messages");

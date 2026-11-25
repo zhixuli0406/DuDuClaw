@@ -334,6 +334,66 @@ async fn bot_sender_on_the_http_path_never_starts_a_turn() {
 }
 
 #[tokio::test]
+async fn queue_keys_preserve_thread_order_and_app_independence() {
+    use crate::googlechat_conversation::GoogleChatConversation;
+    let home = tempfile::tempdir().unwrap();
+    let event = message_event("spaces/QUEUED", "first");
+    let conversation = GoogleChatConversation::from_event(&event, false, false).unwrap();
+    let queue = crate::conversation_queue::ConversationQueue::default();
+    let (group, key) = conversation.queue_keys(Some("sales"));
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let (release, wait) = tokio::sync::oneshot::channel();
+    let first = conversation.clone();
+    let first_home = home.path().to_owned();
+    queue.submit_in(&group, &key, async move {
+        let _lease = first.turn_lease(&first_home, true).await.unwrap();
+        entered.send(()).unwrap(); wait.await.unwrap();
+    }).unwrap();
+    started.await.unwrap();
+    let (second, mut second_started) = tokio::sync::oneshot::channel();
+    let second_home = home.path().to_owned();
+    queue.submit_in(&group, &key, async move {
+        let _lease = conversation.turn_lease(&second_home, true).await.unwrap();
+        second.send(()).unwrap();
+    }).unwrap();
+    for (app, thread) in [("hr", "T"), ("sales", "OTHER")] {
+        let mut independent = event.clone();
+        independent["message"]["thread"]["name"] = json!(format!("spaces/QUEUED/threads/{thread}"));
+        let conversation = GoogleChatConversation::from_event(&independent, false, false).unwrap();
+        let (group, key) = conversation.queue_keys(Some(app));
+        let (done, finished) = tokio::sync::oneshot::channel();
+        let independent_home = home.path().to_owned();
+        queue.submit_in(&group, &key, async move {
+            let _lease = conversation.turn_lease(&independent_home, true).await.unwrap();
+            done.send(()).unwrap();
+        }).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), finished).await.unwrap().unwrap();
+    }
+    assert!(matches!(second_started.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), second_started).await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn thread_lease_preserves_shared_app_order() {
+    use crate::googlechat_conversation::GoogleChatConversation;
+    let home = tempfile::tempdir().unwrap();
+    let event = message_event("spaces/ORDER", "first");
+    let thread = GoogleChatConversation::from_event(&event, false, false).unwrap();
+    let mut other = event.clone();
+    other["message"]["thread"]["name"] = json!("spaces/ORDER/threads/OTHER");
+    let other_thread = GoogleChatConversation::from_event(&other, false, false).unwrap();
+    for own_app in [false, true] {
+        let first = thread.turn_lease(home.path(), own_app).await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(20), thread.turn_lease(home.path(), !own_app)).await.is_err());
+        let independent = tokio::time::timeout(Duration::from_secs(2), other_thread.turn_lease(home.path(), false)).await.unwrap().unwrap();
+        drop(independent);
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(2), thread.turn_lease(home.path(), !own_app)).await.unwrap().unwrap();
+    }
+}
+
+#[tokio::test]
 async fn own_app_requests_queue_in_order_while_other_apps_keep_running() {
     let home = tempfile::tempdir().unwrap();
     let agents = home.path().join("agents");

@@ -76,6 +76,7 @@ pub(crate) struct HostContext {
     policy: String,
     incarnation: String,
     recipient_policy: String,
+    owner_snapshot: Option<crate::google_identity::owner_snapshot::OwnerSnapshot>,
 }
 impl HostContext {
     pub(crate) fn new(home: &Path, agent: &str, account: String) -> Result<Self, String> {
@@ -83,7 +84,12 @@ impl HostContext {
         let policy = crate::approval::strict_policy_revision(home, agent)?;
         let incarnation = Self::incarnation(home, agent)?;
         let recipient_policy = Self::recipient_policy(home, agent)?;
-        Ok(Self { home: home.to_owned(), agent: agent.into(), account, policy, incarnation, recipient_policy })
+        let owner_snapshot = crate::google_identity::owner_snapshot::OwnerSnapshot::optional(home, agent)
+            .map_err(|_| "Google 負責人授權無法確認，已拒絕。".to_owned())?;
+        if owner_snapshot.as_ref().is_some_and(|owner| owner.email != account) {
+            return Err("Google 負責人帳號已變更，請重新確認。".into());
+        }
+        Ok(Self { home: home.to_owned(), agent: agent.into(), account, policy, incarnation, recipient_policy, owner_snapshot })
     }
     fn incarnation(home: &Path, agent: &str) -> Result<String, String> {
         crate::decision_notify::open_user_db_read_only(home)?
@@ -96,6 +102,13 @@ impl HostContext {
         Ok(duduclaw_core::google_identity::google_arguments_digest(&json!([policy.mode, policy.recipients])))
     }
     pub(crate) fn current(&self) -> Result<(), String> {
+        if let Some(owner) = &self.owner_snapshot {
+            owner.validate(&self.home, &self.agent)
+                .map_err(|_| "Google 負責人授權已變更，請重新確認。".to_owned())?;
+        } else if duduclaw_core::google_identity::effective_for(&self.home, Some(&self.agent)).effective
+            == duduclaw_core::google_identity::Effective::DelegateOwner {
+            return Err("Google 負責人授權已變更，請重新確認。".into());
+        }
         if Self::recipient_policy(&self.home, &self.agent)? != self.recipient_policy
             || Self::incarnation(&self.home, &self.agent)? != self.incarnation
             || crate::approval::strict_policy_revision(&self.home, &self.agent)? != self.policy {
@@ -127,6 +140,12 @@ impl HostContext {
         }
         payload["arguments"]["employee_incarnation"] = json!(self.incarnation);
         payload["arguments"]["policy_revision"] = json!(self.policy);
+        if let Some(owner) = &self.owner_snapshot {
+            // The single-use grant includes the exact owner/epoch that the
+            // gateway selected; an approval cannot migrate to a new owner.
+            payload["arguments"]["owner_snapshot"] = json!(owner);
+            payload["google_owner_binding"] = json!(owner.digest());
+        }
         let grant = ActionGrant::build(&self.agent, tool, &payload);
         payload[action_grant::ACTION_GRANT_KEY] = grant.to_json();
         let summary = card(tool, snapshot)?;
@@ -310,6 +329,9 @@ mod tests {
     #[tokio::test]
     async fn allow_and_admin_do_not_remove_new_single_use_card() {
         let home = fixture();
+        let users = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+        let admin = users.create_user("admin@example.com", "Admin", "fixture-password", duduclaw_auth::UserRole::Admin).unwrap();
+        let actor = users.live_user_context(&admin.id).unwrap().unwrap();
         let path = home.path().join("agents/alice/agent.toml");
         let mut config = std::fs::read_to_string(&path).unwrap();
         config.push_str("[[capabilities.action_rules]]\neffect='send'\nverdict='allow'\n");
@@ -324,7 +346,8 @@ mod tests {
                     assert_eq!(rec.payload["native_google_confirmation"], true);
                     assert!(rec.payload["arguments"]["employee_incarnation"].is_string());
                     assert!(rec.payload["egress_guard"]["recipient_guard"].is_object());
-                    broker.decide(&rec.id, true, "dashboard:admin").await.unwrap();
+                    assert!(broker.decide(&rec.id, true, "dashboard:admin").await.is_err());
+                    broker.decide_egress_dashboard(&rec.id, &actor, true).await.unwrap();
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -345,6 +368,42 @@ mod tests {
         let context = HostContext::new(home.path(), "alice", "sender@example.com".into()).unwrap();
         assert!(context.confirm("calendar_delete_event", &json!({}), &[]).await.is_err());
         assert!(!home.path().join("approvals.db").exists());
+    }
+    #[tokio::test]
+    async fn owner_snapshot_card_is_bound_and_revocation_invalidates_approval() {
+        use crate::google_identity::owner_test_support::{Fixture, AGENT};
+        for tool in ["gmail_send_draft", "calendar_delete_event"] {
+            for revoke in [false, true] {
+                let f = Fixture::new();
+                let path = f.home.path().join("agents").join(AGENT).join("agent.toml");
+                let config = std::fs::read_to_string(&path).unwrap().replace("[agent]", "[agent]\nstatus='active'");
+                std::fs::write(path, config).unwrap();
+                let owner = f.snapshot();
+                assert!(HostContext::new(f.home.path(), AGENT, "other@c.test".into()).is_err());
+                let context = HostContext::new(f.home.path(), AGENT, owner.email.clone()).unwrap();
+                let broker = ApprovalBroker::open(f.home.path()).unwrap();
+                let actor = f.db.live_user_context(&f.admin).unwrap().unwrap();
+                let snapshot = json!({"account":owner.email,"content_hash":"a".repeat(64),"operation":tool});
+                let decide = async {
+                    loop {
+                        if let Some(rec) = broker.list_pending(None).await.unwrap().first() {
+                            assert_eq!(rec.payload["arguments"]["owner_snapshot"], json!(owner));
+                            assert_eq!(rec.payload["google_owner_binding"], owner.digest());
+                            broker.decide_egress_dashboard(&rec.id, &actor, true).await.unwrap();
+                            if revoke {
+                                f.db.revoke_google_delegate_attestation(AGENT, &f.admin).unwrap();
+                            }
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                };
+                let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    tokio::join!(context.confirm(tool, &snapshot, &[]), decide)
+                }).await.expect("owner confirmation must not hold an authority lease while awaiting approval");
+                assert_eq!(result.is_err(), revoke, "{tool}/{revoke}: {result:?}");
+            }
+        }
     }
     #[test]
     fn endpoint_allowlist_is_exact_for_both_tools() {
