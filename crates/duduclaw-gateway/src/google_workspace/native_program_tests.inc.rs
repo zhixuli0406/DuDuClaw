@@ -571,3 +571,30 @@ async fn write_response_injection_is_refused_before_structured_output() {
     assert!(result.get("structuredContent").is_none());
     assert!(!result.to_string().contains("ignore all previous"));
 }
+
+#[tokio::test]
+async fn chat_send_uses_fixed_request_id_exact_text_and_reply_or_fail() {
+    let mut io = RecordingIo::default();
+    io.json.push_back(json!({"name":"spaces/A/messages/m1"}));
+    let mut template = NativeCallTemplate::prepare("google_chat_send",
+        &json!({"space":"spaces/A","text":"完整 👋\n文字", "thread":"spaces/A/threads/T"})).unwrap();
+    template.set_chat_request_id("f3059222-a4ae-40f6-a173-f320cfdc8acd");
+    let result = run(&template, &mut io).await;
+    assert_ne!(result["isError"], true);
+    assert_eq!(io.wire.len(), 1);
+    assert_eq!(io.wire[0].0, "POST");
+    assert_eq!(io.wire[0].1, "https://chat.googleapis.com/v1/spaces/A/messages");
+    assert_eq!(io.wire[0].2, vec![("requestId".into(), "f3059222-a4ae-40f6-a173-f320cfdc8acd".into()),
+        ("messageReplyOption".into(), "REPLY_MESSAGE_OR_FAIL".into())]);
+    assert_eq!(io.wire[0].3, Some(json!({"text":"完整 👋\n文字","thread":{"name":"spaces/A/threads/T"}})));
+}
+
+#[tokio::test]
+async fn chat_send_unknown_result_never_retries() {
+    let mut io = RecordingIo::default();
+    io.json.push_back(json!({"unexpected":"body"}));
+    let template = NativeCallTemplate::prepare("google_chat_send", &json!({"space":"spaces/A","text":"hello"})).unwrap();
+    let result = run(&template, &mut io).await;
+    assert_eq!(result["isError"], true);
+    assert_eq!(io.wire.len(), 1, "uncertain response must not produce a second POST");
+}

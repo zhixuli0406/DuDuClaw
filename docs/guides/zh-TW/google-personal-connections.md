@@ -130,7 +130,7 @@ requesters = "bound_people" # or "owner_only"; "anyone" needs confirmation
 
 網域委派每次只要求工具所屬服務的權限：Gmail、日曆、文件、試算表、雲端硬碟、簡報、表單或工作清單。權杖依服務帳號、代表信箱及排序去重後的權限集合分開快取；其他服務缺少授權，不會阻止原本已授權的服務。測試連線會逐項列出 scope 已授權或尚未確認，再另外檢查各服務。取得權杖不代表資料 API 或範例檔案一定可讀。
 
-開啟 `[google] chat_read = true` 後，公司授權也支援 `chat.spaces.readonly` 與 `chat.messages.readonly`（完整前綴都是 `https://www.googleapis.com/auth/`）。請在 Google 管理控制台加入這兩項範圍，並啟用 Google Chat API。設定預設仍為關閉；整合精靈預先勾選 Chat 讀取，管理員按儲存後才寫入。已連結但缺少任一 Chat 權限或本地用途的成員，會在「我的連線」看到「重新連結以加入 Google Chat」。目前不支援以本人名義傳送 Chat 訊息。
+開啟 `[google] chat_read = true` 後，公司授權也支援 `chat.spaces.readonly` 與 `chat.messages.readonly`（完整前綴都是 `https://www.googleapis.com/auth/`）。請在 Google 管理控制台加入這兩項範圍，並啟用 Google Chat API。設定預設仍為關閉；整合精靈預先勾選 Chat 讀取，管理員按儲存後才寫入。已連結但缺少任一 Chat 權限或本地用途的成員，會在「我的連線」看到「重新連結以加入 Google Chat」。傳送另須開放 `chat_send`，並由本人逐次確認，詳見下方說明。
 
 讓公司授權跟隨 AI 員工的負責人：
 
@@ -154,3 +154,13 @@ external_server = "合作夥伴 Google MCP" # 選填，最多 120 字
 ```
 
 連線分頁會顯示「由外部工具提供」。原生 Google 工具和 `none` 一樣不列出、不能呼叫；這個選項不會自動設定或授權外部伺服器。名稱只作文字顯示，不接受控制字元。舊版解析器遇到未知身分或欄位會拒絕原生 Google 存取，不會退回公司共用帳號。
+
+## 以本人身分傳送 Google Chat
+
+`google_chat_send {space, text, thread?}` 使用提出要求的已驗證成員本人的 Google 帳號，傳送文字到既有空間。需要 `google:write`；管理員須先啟用 `[google] chat_send = true`，預設關閉。不接受指定寄件者，也不會改用公司共用帳號、其他成員、Apps Script 或 Chat app 的 `chat.bot` 權杖。
+
+個人 OAuth 請先連結帳號，再到「我的連線 → Google Chat 傳送」開放獨立的 `chat_send` 用途。增量授權要求最小範圍 `https://www.googleapis.com/auth/chat.messages.create`，必須維持相同 Google `sub` 且實際取得權限。公司全網域委派也使用獨立的傳送範圍，仍須 Workspace 管理員授權；不會把傳送範圍加入每項 Google 工具。
+
+每次都由本人確認，五分鐘內有效、只能使用一次。確認卡顯示帳號、空間資源名稱、討論串、完整最終文字及私人資料外傳提醒。短文可在已驗證私訊確認；群組要求與長文改到本人限定的「我的連線」頁面確認。管理員核准、`allow` 規則、Admin MCP scope、收件人白名單都不能代替本人確認；組織要求的外傳核准仍另外執行。文字、目的地、帳號、憑證或政策變更後，須重新確認。
+
+Gateway 保存單次操作的固定 request ID。結果不明會回報 `result_unconfirmed`，不會自動重送；請先檢查 Google Chat，再決定是否提出新的傳送要求。第一版不支援附件或建立空間；指定的討論串必須屬於同一空間。Google 顯示本人為寄件者，同時附上應用程式名稱。[Google Chat API 說明](https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages/create)。

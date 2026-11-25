@@ -169,6 +169,7 @@ impl ApprovalVisibility {
     /// Bound cards may be listed with their binding redacted; permission to
     /// decide is a separate gate and does not hide their metadata here.
     pub(crate) fn may_read(&self, record: &ApprovalRecord, fresh: &UserContext, department: Option<&str>) -> bool {
+        if crate::google_identity::chat_send::is_member_card(record) { return false; }
         if !fresh.has_role(UserRole::Manager) || fresh.requires_password_change() { return false; }
         if !fresh.is_admin() && self.employee_requires_admin != Some(false) { return false; }
         let allowed = match dashboard_only_reader(record) {

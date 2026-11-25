@@ -134,6 +134,7 @@ fn all_25_effect_tools_have_a_closed_native_template() {
             "docs_append" => json!({"document_id":"doc", "text":"test"}),
             "docs_replace_text" => json!({"document_id":"doc", "find":"old", "replace":"new"}),
             "slides_read" => json!({"presentation_id":"slides"}),
+            "google_chat_send" => json!({"space":"spaces/AAAA","text":"text"}),
             "google_chat_messages" => json!({"space":"spaces/AAAA"}),
             "google_chat_spaces" | "calendar_list_events" | "gtasks_lists" | "gtasks_list" => json!({}),
             other => panic!("missing owner coverage fixture: {other}"),
@@ -142,7 +143,7 @@ fn all_25_effect_tools_have_a_closed_native_template() {
         template.validate_closed().unwrap_or_else(|e| panic!("{tool}: {e}"));
         count += 1;
     }
-    assert_eq!(count, 25);
+    assert_eq!(count, 26);
 }
 
 #[test]

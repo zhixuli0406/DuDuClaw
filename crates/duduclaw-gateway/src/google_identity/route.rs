@@ -190,7 +190,7 @@ pub(crate) async fn serve(
     let _authority = duduclaw_core::authority_coordinator::AuthorityCoordinator::new(&state.home)
         .shared().await.map_err(|_| super::owner_snapshot::changed())?;
     refuse_owner_token(&state.home, agent)?;
-    if !crate::google_personal::scopes::token_tool(tool) {
+    if tool == "google_chat_send" || !crate::google_personal::scopes::token_tool(tool) {
         let outcome = Err(Refusal::hard("scope_missing", "這項操作不能取得 Google 權杖。"));
         audit_issue(&state.home, agent, tool, requester.kind(), &outcome);
         return outcome.map(|_| Value::Null);

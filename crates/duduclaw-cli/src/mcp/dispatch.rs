@@ -1057,6 +1057,7 @@ impl GatewayHandler<'_> {
                 .await
         }
         "google_status" => handle_google_status(home_dir, google_caller).await,
+        "google_chat_send" => crate::mcp::google_owner_client::execute(home_dir, tool_name, &arguments).await,
         "google_chat_spaces" => handle_google_chat_spaces(&arguments, home_dir, google_caller).await,
         "google_chat_messages" => handle_google_chat_messages(&arguments, home_dir, google_caller).await,
         "gmail_search" => handle_gmail_search(&arguments, home_dir, google_caller).await,

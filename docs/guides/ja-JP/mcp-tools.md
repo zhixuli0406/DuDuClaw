@@ -538,3 +538,13 @@ Google Chat の社員専用アプリのセクションは共通アプリより�
 Google Chat は既存の選択順序に従い、社員専用の Chat アプリ、スペースに記録されたアプリ、または共通アプリを使用します。選ばれたアプリには、そのスペースへの送信権限が必要です。受信者保護は継続され、保存済みの検証された会話は作成元として扱います。別の通知先を指定しても、この扱いは適用されません。ユーザーに紐付けられていない送信者は、スケジュールを作成しただけでは検証済みの作成元として扱われません。
 
 定期実行の一覧と詳細は、実行結果 `last_status` と通知結果 `last_delivery_status` を別々に返します。通知結果は `delivered`、`delivery_failed`、`delivery_refused`（上記の送信時確認で拒否）、または未送信の空値です。失敗時の `last_delivery_reason` は固定コード `notification_delivery_failed`、拒否時は `origin_unproven`、`origin_proof_invalid`、`origin_public_visitor`、`origin_state_unreadable`、`origin_account_inactive`、`origin_access_revoked`、`origin_identity_unbound`、`origin_conversation_changed` のいずれかです。これらは直近の実行についての情報です。リマインダーは従来の `delivered` / `failed` を使い、一覧に `error` も表示します（拒否されたリマインダーは `failed` で、`error` に同じコードが入ります）。送信失敗を配信済みとして記録することはありません。
+
+## 本人として Google Chat を送信する
+
+`google_chat_send {space, text, thread?}` は、依頼した認証済みメンバー自身の Google アカウントで既存スペースにテキストを送信します。`google:write` が必要で、管理者が `[google] chat_send = true` を有効にするまでは使用できません。共有アカウント、他のメンバー、Apps Script、Chat アプリの `chat.bot` トークンへの切り替えは行いません。
+
+個人 OAuth では、先にアカウントを接続し、「自分の接続 → Google Chat の送信」で独立した `chat_send` 用途を許可します。追加同意の最小スコープは `https://www.googleapis.com/auth/chat.messages.create` です。Google の `sub` が以前と同じで、実際にスコープが付与されている必要があります。ドメイン全体の委任でも送信用スコープを別に要求し、Workspace 管理者の許可が必要です。他の Google ツールの要求には追加しません。
+
+毎回本人の確認が必要です。確認は５分間有効で１回限りです。カードにはアカウント、スペースのリソース名、スレッド、送信する全文と個人情報の送信に関する注意が表示されます。短文は認証済みの個別チャットで確認でき、グループからの依頼や長文は本人だけが開ける「自分の接続」ページで確認します。管理者の承認、`allow` ルール、Admin MCP scope、宛先許可リストでは代替できません。組織の外部送信承認も別途適用されます。本文、宛先、アカウント、認証情報、ポリシーが変わると再確認が必要です。
+
+Gateway は操作ごとに固定の request ID を保存します。結果が不明な場合は `result_unconfirmed` を返し、自動再送しません。新たに送信を依頼する前に Google Chat を確認してください。添付ファイルやスペースの作成には対応していません。指定スレッドは同じスペース内のものに限ります。Google では本人が送信者として表示され、アプリ名も付きます。[Google Chat API](https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages/create)。

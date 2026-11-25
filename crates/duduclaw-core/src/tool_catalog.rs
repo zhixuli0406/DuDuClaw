@@ -644,6 +644,7 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
     ("gmail_search", "Search Gmail", "google:read", "google"),
     ("google_chat_spaces", "List Google Chat spaces", "google:read", "google"),
     ("google_chat_messages", "Read Google Chat messages", "google:read", "google"),
+    ("google_chat_send", "Send Google Chat as the confirming member", "google:write", "google"), // RM-062 +1
     (
         "gmail_read",
         "Read a Gmail message",

@@ -11705,5 +11705,16 @@
   "memberKeys.error.member_key_invalid_expiry": "有効期間は 1～365 日にしてください。",
   "memberKeys.error.member_key_admin_forbidden": "管理者は本人キーを作成できません。メンバーアカウントを使用してください。",
   "memberKeys.error.member_key_limit_reached": "有効なキーが 5 個あります。古いキーを失効してください。",
-  "memberKeys.error.member_key_step_up_required": "現在のパスワード、または新しい MFA コードかリカバリーコードを入力してください。"
+  "memberKeys.error.member_key_step_up_required": "現在のパスワード、または新しい MFA コードかリカバリーコードを入力してください。",
+  "google.chatSend.title": "Google Chat の送信",
+  "google.chatSend.hint": "初期設定はオフです。メンバーが送信権限を別途許可し、毎回本人が確認します。既存スペースへのテキスト送信のみ対応します。Google には本人が送信者として表示され、アプリ名も付きます。",
+  "myConnections.chatSend.enabled": "Chat 送信を許可済みです。送信ごとに確認が必要です。",
+  "myConnections.chatSend.missing": "Chat 送信は未許可です。",
+  "myConnections.chatSend.consent": "自分の Google Chat アカウントの送信権限を許可します。個別のメッセージ送信を承認するものではありません。",
+  "myConnections.chatSend.authorize": "Chat 送信を許可",
+  "myConnections.chatSend.confirmTitle": "あなたの Google アカウントで送信",
+  "myConnections.chatSend.egress": "全文を確認してください。確認すると、個人情報を含む可能性がある内容が上記スペースへ送信されます。Google にアプリ名も表示されます。",
+  "myConnections.chatSend.expires": "確認期限：{time}",
+  "myConnections.chatSend.confirm": "確認して送信",
+  "myConnections.chatSend.cancel": "キャンセル"
 }

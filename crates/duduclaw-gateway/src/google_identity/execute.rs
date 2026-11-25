@@ -33,11 +33,13 @@ pub struct ExecuteState {
     replay: ReplayGuard,
     rate: RateLimiter,
     selections: selection::SelectionStore,
+    pub(super) chats: super::chat_send::Store,
     pub(super) employees: super::employee_execute::Store,
 }
 impl ExecuteState {
     pub fn new(home: PathBuf, users: Option<Arc<UserDb>>) -> Self {
         Self {
+            chats: super::chat_send::Store::default(),
             employees: super::employee_execute::Store::default(),
             home,
             users,
@@ -206,6 +208,7 @@ async fn serve(
     agent: &str,
     request: &ExecuteRequest,
 ) -> Result<Value, Refusal> {
+    if request.tool == "google_chat_send" { return Err(Refusal::hard("requester_refused", "Chat 傳送需要即時、已驗證的本人要求。")); }
     if request.owner_prepare || request.owner_binding_digest.is_some()
         || duduclaw_core::google_identity::effective_for(&state.home, Some(agent)).effective
             == duduclaw_core::google_identity::Effective::DelegateOwner {

@@ -294,6 +294,20 @@ impl GoogleIsolationBridge {
         // selection, and the host lane is bound to that pinned tenant source
         // (it refuses a config it re-reads that differs from this decision).
         self.pin_source(tool, route.clone(), digest)?;
+        if tool == super::chat_send::TOOL {
+            selected.recheck()?;
+            let authenticated = self.requester(call.context())?;
+            let resolved = self.turns.resolve_run(call.context())?;
+            let who = crate::knowledge::turn_requesters::lookup(&self.agent, &resolved.identity.turn)
+                .ok_or(VerificationError::BindingMismatch)?;
+            if who.audit_id() != authenticated.identity().audit_id() { return Err(VerificationError::BindingMismatch); }
+            let snapshot = super::chat_send::Snapshot::capture(&self.home, &self.agent, &who)
+                .map_err(|_| VerificationError::BindingMismatch)?;
+            let result = super::chat_send::execute(&self.home, &self.agent, args, who, &resolved.identity.turn,
+                snapshot, uuid::Uuid::new_v4().to_string()).await;
+            selected.recheck()?;
+            return result.map_err(|_| VerificationError::Unavailable);
+        }
         let tenant = tenant.as_ref().map(TenantPin::of);
         if let Some(snapshot) = owner.as_ref() {
             selected.recheck()?;
@@ -386,12 +400,12 @@ impl BoundConnectorExecutor for GoogleIsolationBridge {
             let selected = Arc::new(selected);
             let context = selected.binding_io_context();
             let result = duduclaw_mcp_boundary::io_authority::scope(context,
-                tokio::time::timeout(std::time::Duration::from_secs(120), self.owned(&selected, &call))).await;
+                tokio::time::timeout(std::time::Duration::from_secs(if call.name() == super::chat_send::TOOL { 420 } else { 120 }), self.owned(&selected, &call))).await;
             // A late failure is never described as proof that a write did not run.
             match result {
                 Ok(Ok(value)) if selected.recheck().is_ok() => Ok(value),
                 _ => Ok(json!({"isError":true,"content":[{"type":"text","text":
-                    "Google 操作結果無法確認。若有寫入，請先到 Google 檢查，勿直接重試。"}]})),
+                    "Google 操作結果無法確認（result_unconfirmed）。若有寫入，請先到 Google 檢查，勿直接重試。"}]})),
             }
         })
     }

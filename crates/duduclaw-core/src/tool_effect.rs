@@ -196,7 +196,7 @@ pub fn effect_of_builtin(tool_name: &str) -> Option<ToolEffect> {
         // ── send ────────────────────────────────────────────────────────
         "send_message" | "send_photo" | "send_sticker" | "mail_send" | "send_to_agent"
         | "spawn_agent" | "team_handoff" | "create_reminder" | "responsibility_ask"
-        | "calendar_create_event" | "calendar_update_event" | "os_notify" => Send,
+        | "calendar_create_event" | "calendar_update_event" | "google_chat_send" | "os_notify" => Send,
 
         // ── publish ─────────────────────────────────────────────────────
         // `knowledge_add_source` only files a proposal; a person decides in
@@ -298,7 +298,7 @@ pub fn reads_private(tool_name: &str) -> Option<bool> {
         | "xlsx_read" => Some(true),
         "activity_post" | "agent_remove" | "agent_update" | "agent_update_soul"
         | "belief_submit" | "browser_record_start" | "browser_record_stop"
-        | "calendar_create_event" | "cancel_reminder" | "canvas_clear" | "canvas_push"
+        | "google_chat_send" | "calendar_create_event" | "cancel_reminder" | "canvas_clear" | "canvas_push"
         | "capability_request" | "computer_click" | "computer_key" | "computer_navigate"
         | "computer_scroll" | "computer_session_stop" | "computer_type" | "computer_login"
         | "credential_declare" | "computer_workspace_write" | "create_agent" | "create_reminder" | "create_task"
@@ -357,6 +357,7 @@ pub const EGRESS_CAPABLE_READS: &[&str] = &[
     "github_pr_read",
     "github_search_issues",
     "gmail_create_draft",
+    "google_chat_send",
     "gmail_read",
     "google_chat_spaces",
     "google_chat_messages",

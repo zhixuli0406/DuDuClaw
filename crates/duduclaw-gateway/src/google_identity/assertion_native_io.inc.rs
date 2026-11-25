@@ -85,7 +85,12 @@ impl Transport<'_, '_> {
             && url.fragment().is_none()
             && url.port().is_none_or(|p| p == 443)
             && match url.host_str() {
-                Some("chat.googleapis.com") => url.path() == "/v1/spaces" || url.path().starts_with("/v1/spaces/"),
+                Some("chat.googleapis.com") => match self.template.parsed() {
+                    crate::google_workspace::native_call::ParsedNativeArguments::ChatSend(args) =>
+                        crate::google_identity::chat_send::has_permit(self.template)
+                        && crate::google_workspace::chat_send::endpoint_allowed(original, &args.space),
+                    _ => url.path() == "/v1/spaces" || url.path().starts_with("/v1/spaces/"),
+                },
                 Some("gmail.googleapis.com") => url.path().starts_with("/gmail/v1/users/me/"),
                 Some("www.googleapis.com") => {
                     url.path()

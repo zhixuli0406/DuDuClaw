@@ -40,7 +40,7 @@ pub async fn start_with_meetings(
     acknowledge_google_data: bool,
     meeting_recordings: bool,
 ) -> Result<Value, String> {
-    start_consent(home, db, user, session, origin, allowed, acknowledge_google_data, meeting_recordings, false).await
+    start_consent(home, db, user, session, origin, allowed, acknowledge_google_data, meeting_recordings, false, false).await
 }
 
 pub async fn start_drive_tools(
@@ -52,7 +52,11 @@ pub async fn start_drive_tools(
     allowed: &[String],
     acknowledge_google_data: bool,
 ) -> Result<Value, String> {
-    start_consent(home, db, user, session, origin, allowed, acknowledge_google_data, false, true).await
+    start_consent(home, db, user, session, origin, allowed, acknowledge_google_data, false, true, false).await
+}
+
+pub async fn start_chat_send(home: &Path, db: &UserDb, user: &str, session: &str, origin: &str, allowed: &[String], acknowledge: bool) -> Result<Value, String> {
+    start_consent(home, db, user, session, origin, allowed, acknowledge, false, false, true).await
 }
 
 async fn start_consent(
@@ -65,8 +69,10 @@ async fn start_consent(
     acknowledge_google_data: bool,
     meeting_recordings: bool,
     drive_tools: bool,
+    chat_send: bool,
 ) -> Result<Value, String> {
-    if meeting_recordings && drive_tools {
+    if chat_send && !crate::google_workspace::chat_send_enabled(home) { return Err(crate::google_workspace::chat_send::GUIDANCE.into()); }
+    if [meeting_recordings, drive_tools, chat_send].iter().filter(|v| **v).count() > 1 {
         return Err("請每次選擇一項 Google 額外服務。".into());
     }
     if !acknowledge_google_data {
@@ -91,14 +97,16 @@ async fn start_consent(
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
     // Incremental consent extends this person's existing Google account;
     // choosing another account cannot silently replace it.
-    let expected_connection = if drive_tools {
+    let expected_connection = if chat_send {
+        Some(vault::get(home, user)?.ok_or("請先連結自己的 Google 帳號，再開放 Chat 傳送。")?.metadata)
+    } else if drive_tools {
         Some(vault::get(home, user)?.ok_or("請先連結自己的 Google 帳號，再開放雲端硬碟工具。")?.metadata)
     } else if meeting_recordings {
         Some(vault::get(home, user)?.ok_or("請先連結自己的 Google 帳號，再開放會議錄影。")?.metadata)
     } else {
         None
     };
-    let chat_read = !meeting_recordings && !drive_tools && crate::google_workspace::chat_read_enabled(home);
+    let chat_read = !chat_send && !meeting_recordings && !drive_tools && crate::google_workspace::chat_read_enabled(home);
     let epoch = vault::begin_connection(home, user)?;
     let google_data_consent = crate::google_data_consent::Evidence::issue(user)?;
     pending::cancel_user(home, user);
@@ -116,6 +124,7 @@ async fn start_consent(
         meeting_recordings,
         drive_tools,
         chat_read,
+        chat_send,
         expected_connection,
         google_data_consent,
         created: Instant::now(),
@@ -123,7 +132,7 @@ async fn start_consent(
     });
     let authorization_url = oauth::authorization_url_for(
         &client.client_id, &redirect_uri, &state, &challenge,
-        meeting_recordings, drive_tools, chat_read,
+        meeting_recordings, drive_tools, chat_read, chat_send,
     )?;
     Ok(
         json!({ "authorization_url": authorization_url, "state": state, "completion": if paste { "paste" } else { "redirect" }, "redirect_uri": redirect_uri, "expires_in": 600 }),
@@ -159,6 +168,10 @@ pub async fn finish(
     if pending.expected_connection.as_ref().is_some_and(|old| old.google_sub != info.sub) {
         return Err("請使用原本連結的 Google 帳號開放額外服務。這次沒有取代既有連線。".into());
     }
+    if pending.chat_send && (!crate::google_workspace::chat_send_enabled(home)
+        || !super::scopes::permitted("google_chat_send", &scopes)) {
+        return Err("Chat 傳送未啟用或 Google 未授予傳送權限，沒有變更連線。".into());
+    }
     if pending.meeting_recordings && !super::meeting_access::has_scopes(&scopes) {
         return Err("尚未開放所選雲端硬碟檔案及 Meet 錄影的讀取權限，這次沒有變更連線。".into());
     }
@@ -170,7 +183,7 @@ pub async fn finish(
     }) {
         return Err("Google 未保留原有授權範圍，這次沒有取代既有憑證。請重新開始。".into());
     }
-    let purpose = if pending.drive_tools { "drive_tools" }
+    let purpose = if pending.chat_send { "chat_send" } else if pending.drive_tools { "drive_tools" }
         else if pending.meeting_recordings { "meeting_recordings" } else { "base" };
     let mut local_purposes = pending.expected_connection.as_ref()
         .map(|old| old.local_purposes.clone()).unwrap_or_default();
@@ -194,6 +207,9 @@ pub async fn finish(
     }
     if local_purposes.iter().any(|purpose| purpose == "chat_read") {
         expected_scopes.extend(crate::google_workspace::CHAT_READ_SCOPES.iter().map(|s| s.to_string()));
+    }
+    if local_purposes.iter().any(|purpose| purpose == "chat_send") {
+        expected_scopes.extend(crate::google_workspace::CHAT_SEND_SCOPES.iter().map(|s| s.to_string()));
     }
     let mut unexpected_scopes: Vec<_> = scopes.iter()
         .filter(|scope| !expected_scopes.contains(scope)).cloned().collect();

@@ -308,7 +308,8 @@ impl ResourceResolver for GatewayResourceResolver {
             }) { format!("account:{connector}") } else { format!("agent:{}", self.agent) };
             resources.push(ResourceGrant::Mailbox { id: text(mailbox)? });
         }
-        for key in ["to", "cc", "bcc", "attendees", "chat_id", "notify_chat_id", "target_agent", "recipient"] {
+        for key in ["to", "cc", "bcc", "attendees", "chat_id", "notify_chat_id", "target_agent", "recipient", "space"] {
+            if key == "space" && policy.name != "google_chat_send" { continue; }
             if let Some(value) = args.get(key).filter(|v| !v.is_null()) {
                 let values = if let Some(values) = value.as_array() { values.clone() } else { vec![value.clone()] };
                 for value in values {

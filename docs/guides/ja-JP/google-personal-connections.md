@@ -130,7 +130,7 @@ requesters = "bound_people" # or "owner_only"; "anyone" needs confirmation
 
 ドメイン全体の委任では、ツールが属するサービス（Gmail、カレンダー、Docs、Sheets、Drive、Slides、Forms、Tasks）のスコープだけを要求します。トークンはサービスアカウント、代理対象、並べ替え・重複除去したスコープ集合ごとにキャッシュします。別サービスの未承認スコープが既存サービスを停止させることはありません。接続テストは各スコープの承認結果とサービスへのアクセス結果を分けて表示します。発行成功だけでは API やサンプルファイルへのアクセスを証明しません。
 
-`[google] chat_read = true` の場合、委任でも `chat.spaces.readonly` と `chat.messages.readonly`（接頭辞は `https://www.googleapis.com/auth/`）を使用できます。Google 管理コンソールで両方を承認し、Google Chat API を有効にしてください。設定の既定値はオフのままです。設定ウィザードでは Chat 読み取りを選択済みで表示しますが、管理者が保存するまで書き込みません。接続済みでも Chat のスコープまたはローカル用途が不足するメンバーには「Google Chat を追加するには再接続してください」と表示します。本人名義での Chat 送信は対象外です。
+`[google] chat_read = true` の場合、委任でも `chat.spaces.readonly` と `chat.messages.readonly`（接頭辞は `https://www.googleapis.com/auth/`）を使用できます。Google 管理コンソールで両方を承認し、Google Chat API を有効にしてください。設定の既定値はオフのままです。設定ウィザードでは Chat 読み取りを選択済みで表示しますが、管理者が保存するまで書き込みません。接続済みでも Chat のスコープまたはローカル用途が不足するメンバーには「Google Chat を追加するには再接続してください」と表示します。本人名義での Chat 送信には、下記の追加許可と毎回の本人確認が必要です。
 
 AI 社員の担当者に組織の承認を連動させる手順：
 
@@ -154,3 +154,13 @@ external_server = "Partner Google MCP" # 任意、120 文字まで
 ```
 
 接続タブには「外部ツールで提供」と表示します。ネイティブ Google ツールは `none` と同様に非表示・呼び出し拒否となります。この設定は外部サーバーを構成・認可しません。名前は表示用テキストで、制御文字は拒否します。旧版は未知の ID またはキーを拒否するため、共用アカウントへフォールバックしません。
+
+## 本人として Google Chat を送信する
+
+`google_chat_send {space, text, thread?}` は、依頼した認証済みメンバー自身の Google アカウントで既存スペースにテキストを送信します。`google:write` が必要で、管理者が `[google] chat_send = true` を有効にするまでは使用できません。共有アカウント、他のメンバー、Apps Script、Chat アプリの `chat.bot` トークンへの切り替えは行いません。
+
+個人 OAuth では、先にアカウントを接続し、「自分の接続 → Google Chat の送信」で独立した `chat_send` 用途を許可します。追加同意の最小スコープは `https://www.googleapis.com/auth/chat.messages.create` です。Google の `sub` が以前と同じで、実際にスコープが付与されている必要があります。ドメイン全体の委任でも送信用スコープを別に要求し、Workspace 管理者の許可が必要です。他の Google ツールの要求には追加しません。
+
+毎回本人の確認が必要です。確認は５分間有効で１回限りです。カードにはアカウント、スペースのリソース名、スレッド、送信する全文と個人情報の送信に関する注意が表示されます。短文は認証済みの個別チャットで確認でき、グループからの依頼や長文は本人だけが開ける「自分の接続」ページで確認します。管理者の承認、`allow` ルール、Admin MCP scope、宛先許可リストでは代替できません。組織の外部送信承認も別途適用されます。本文、宛先、アカウント、認証情報、ポリシーが変わると再確認が必要です。
+
+Gateway は操作ごとに固定の request ID を保存します。結果が不明な場合は `result_unconfirmed` を返し、自動再送しません。新たに送信を依頼する前に Google Chat を確認してください。添付ファイルやスペースの作成には対応していません。指定スレッドは同じスペース内のものに限ります。Google では本人が送信者として表示され、アプリ名も付きます。[Google Chat API](https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages/create)。

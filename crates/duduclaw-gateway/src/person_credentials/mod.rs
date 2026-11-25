@@ -191,7 +191,7 @@ fn valid_metadata(m: &Metadata) -> bool {
         && m.oauth_client_id.len() <= 1024
         && !m.oauth_client_id.chars().any(char::is_control)
         && m.local_purposes.len() <= 4
-        && m.local_purposes.iter().all(|purpose| matches!(purpose.as_str(), "base" | "meeting_recordings" | "drive_tools" | "chat_read"))
+        && m.local_purposes.iter().all(|purpose| matches!(purpose.as_str(), "base" | "meeting_recordings" | "drive_tools" | "chat_read" | "chat_send"))
         && m.granted_scopes.len() <= 128
         && m.granted_scopes.iter().all(|scope| {
             !scope.is_empty() && scope.len() <= 2048 && !scope.chars().any(char::is_whitespace)

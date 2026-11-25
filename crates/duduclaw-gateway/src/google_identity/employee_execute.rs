@@ -51,12 +51,15 @@ impl Binding {
 
 pub(super) async fn serve(state: &ExecuteState, agent: &str, request: Request) -> Result<Value, Refusal> {
     let execute = matches!(&request, Request::Execute { .. });
+    let chat = match &request {
+        Request::Prepare { tool, .. } | Request::Execute { tool, .. } => tool == super::chat_send::TOOL,
+    };
     let progress = AtomicUsize::new(0);
     let mut binding = None;
-    let result = match tokio::time::timeout(Duration::from_secs(120),
+    let result = match tokio::time::timeout(Duration::from_secs(if chat { 420 } else { 120 }),
         serve_inner(state, agent, request, &progress, &mut binding)).await {
         Ok(result) => result,
-        Err(_) => Err(Refusal::hard(if progress.load(Ordering::SeqCst) == 0 { "not_sent" } else { "result_unconfirmed" },
+        Err(_) => Err(Refusal::hard(if !chat && progress.load(Ordering::SeqCst) == 0 { "not_sent" } else { "result_unconfirmed" },
             "Google 操作逾時；若已送出，結果無法確認，請先檢查 Google。")),
     };
     if execute {
@@ -80,6 +83,9 @@ async fn serve_inner(state: &ExecuteState, agent: &str, request: Request,
     crate::google_workspace::validate_native_tool_inputs(&tool, &args)
         .map_err(|m| Refusal::hard("native_arguments_invalid", m))?;
     let who = requester(agent, turn.as_deref(), run.as_deref())?;
+    if tool == super::chat_send::TOOL {
+        return super::chat_send::serve(state, agent, &args, who, turn, call, approved).await;
+    }
     let context = super::effect_authority::GoogleCallContext::employee(&state.home, agent, who,
         super::requester_gate::people_for(&state.home, state.users.as_ref()), &tool, &args, turn.clone(), run.clone())?;
     let coordinator = AuthorityCoordinator::new(&state.home);
@@ -128,17 +134,21 @@ fn audit(home: &std::path::Path, binding: &Binding, steps: usize, success: bool,
 }
 
 async fn verify_approval(home: &std::path::Path, binding: &Binding, args: &Value) -> Result<(), Refusal> {
+    verify_policy_approval(home, &binding.agent, &binding.tool, &binding.digest(), args).await
+}
+
+pub(super) async fn verify_policy_approval(home: &std::path::Path, agent: &str, tool: &str, digest: &str, args: &Value) -> Result<(), Refusal> {
     use crate::approval::{ApprovalBroker, ApprovalStatus};
-    let dir = home.join("agents").join(&binding.agent);
+    let dir = home.join("agents").join(agent);
     #[derive(Deserialize)]
     struct Config { #[serde(default)] capabilities: duduclaw_core::types::CapabilitiesConfig }
     let raw = duduclaw_core::agent_toml::read_effective_text(&dir).map_err(|_| changed())?;
     let config: Config = toml::from_str(&raw).map_err(|_| changed())?;
-    if duduclaw_core::tool_catalog::tool_list_verdict(&binding.tool,
+    if duduclaw_core::tool_catalog::tool_list_verdict(tool,
         &config.capabilities.denied_tools, &config.capabilities.allowed_tools)
         != duduclaw_core::tool_catalog::ToolListVerdict::Allowed { return Err(changed()); }
     let event = duduclaw_security::policy_kernel::ToolCallEvent {
-        tool_name: &binding.tool, arguments: args, agent_id: &binding.agent,
+        tool_name: tool, arguments: args, agent_id: agent,
     };
     let policy_ask = match duduclaw_security::policy_kernel::evaluate(&event, &config.capabilities.policy) {
         duduclaw_security::policy_kernel::Decision::Allow => false,
@@ -147,19 +157,19 @@ async fn verify_approval(home: &std::path::Path, binding: &Binding, args: &Value
         _ => return Err(changed()),
     };
     let rules = duduclaw_core::agent_toml::load_action_rules(&dir);
-    let verdict = rules.resolve_for_call(&binding.tool, duduclaw_core::effect_of(&binding.tool), args);
+    let verdict = rules.resolve_for_call(tool, duduclaw_core::effect_of(tool), args);
     if verdict == Some(duduclaw_core::ActionVerdict::Block) { return Err(changed()); }
-    let required = policy_ask || crate::approval::tool_requires_approval(&dir, &binding.tool)
-        || crate::approval::tool_is_irreversible(&dir, &binding.tool)
+    let required = policy_ask || crate::approval::tool_requires_approval(&dir, tool)
+        || crate::approval::tool_is_irreversible(&dir, tool)
         || verdict == Some(duduclaw_core::ActionVerdict::Ask);
     if !required { return Ok(()); }
     let broker = ApprovalBroker::open(home).map_err(|_| changed())?;
     let records = broker.list_by_kind("mcp_call").await.map_err(|_| changed())?;
-    let digest = binding.digest();
+
     let found = records.iter().any(|r| chrono::DateTime::parse_from_rfc3339(&r.created_at).ok()
         .and_then(|at| at.checked_add_signed(chrono::Duration::seconds(r.ttl_seconds)))
-        .is_some_and(|until| until > chrono::Utc::now()) && r.agent_id == binding.agent
-        && r.payload.get("google_owner_binding").and_then(Value::as_str) == Some(digest.as_str())
+        .is_some_and(|until| until > chrono::Utc::now()) && r.agent_id == agent
+        && r.payload.get("google_owner_binding").and_then(Value::as_str) == Some(digest)
         && r.payload.get("arguments") == Some(args)
         && (r.status == ApprovalStatus::Approved
             || (r.status == ApprovalStatus::Invalidated && r.invalidated_reason.as_deref()

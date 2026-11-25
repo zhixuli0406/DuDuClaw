@@ -517,3 +517,13 @@ Google Chat 員工專用應用程式區段優先於共用應用程式。若該�
 Google Chat 依既有順序選用員工自己的 App、該空間記錄的 App 或共用 App，選中的 App 仍須有權在該空間發訊。收件人防護持續生效：已保存且驗證過的來源對話視為來源；另外指定的對象不會取得這項豁免。尚未綁定使用者的通道，不會只因建立排程就取得已驗證來源的豁免。
 
 例行工作清單與明細會分別回報工作與通知結果：`last_status` 是工作執行狀態；`last_delivery_status` 為 `delivered`（已送達）、`delivery_failed`（傳送失敗）、`delivery_refused`（傳送前的確認未通過），未嘗試傳送時為空。失敗時 `last_delivery_reason` 為固定代碼 `notification_delivery_failed`；未通過確認時為 `origin_unproven`、`origin_proof_invalid`、`origin_public_visitor`、`origin_state_unreadable`、`origin_account_inactive`、`origin_access_revoked`、`origin_identity_unbound`、`origin_conversation_changed` 其中之一。這些欄位記錄最近一次執行。提醒清單沿用 `delivered`／`failed` 狀態，並在有錯誤時列出 `error`（未通過確認的提醒為 `failed`，`error` 帶相同代碼）；傳送失敗不會記成已送達。
+
+## 以本人身分傳送 Google Chat
+
+`google_chat_send {space, text, thread?}` 使用提出要求的已驗證成員本人的 Google 帳號，傳送文字到既有空間。需要 `google:write`；管理員須先啟用 `[google] chat_send = true`，預設關閉。不接受指定寄件者，也不會改用公司共用帳號、其他成員、Apps Script 或 Chat app 的 `chat.bot` 權杖。
+
+個人 OAuth 請先連結帳號，再到「我的連線 → Google Chat 傳送」開放獨立的 `chat_send` 用途。增量授權要求最小範圍 `https://www.googleapis.com/auth/chat.messages.create`，必須維持相同 Google `sub` 且實際取得權限。公司全網域委派也使用獨立的傳送範圍，仍須 Workspace 管理員授權；不會把傳送範圍加入每項 Google 工具。
+
+每次都由本人確認，五分鐘內有效、只能使用一次。確認卡顯示帳號、空間資源名稱、討論串、完整最終文字及私人資料外傳提醒。短文可在已驗證私訊確認；群組要求與長文改到本人限定的「我的連線」頁面確認。管理員核准、`allow` 規則、Admin MCP scope、收件人白名單都不能代替本人確認；組織要求的外傳核准仍另外執行。文字、目的地、帳號、憑證或政策變更後，須重新確認。
+
+Gateway 保存單次操作的固定 request ID。結果不明會回報 `result_unconfirmed`，不會自動重送；請先檢查 Google Chat，再決定是否提出新的傳送要求。第一版不支援附件或建立空間；指定的討論串必須屬於同一空間。Google 顯示本人為寄件者，同時附上應用程式名稱。[Google Chat API 說明](https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages/create)。

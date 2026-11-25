@@ -143,3 +143,13 @@ approval_required_tools = ["create_event", "update_doc", "create_file"]
 [Developer Preview Program](https://developers.google.com/workspace/preview)。
 
 `google:chat` プリセットは Chat スコープを追加しません。ネイティブ Workspace のスコープ一覧には Chat がないため、別途適切な認可が必要です。Google Chat チャネルは `chat.bot` を使う別接続です。
+
+## 本人として Google Chat を送信する
+
+`google_chat_send {space, text, thread?}` は、依頼した認証済みメンバー自身の Google アカウントで既存スペースにテキストを送信します。`google:write` が必要で、管理者が `[google] chat_send = true` を有効にするまでは使用できません。共有アカウント、他のメンバー、Apps Script、Chat アプリの `chat.bot` トークンへの切り替えは行いません。
+
+個人 OAuth では、先にアカウントを接続し、「自分の接続 → Google Chat の送信」で独立した `chat_send` 用途を許可します。追加同意の最小スコープは `https://www.googleapis.com/auth/chat.messages.create` です。Google の `sub` が以前と同じで、実際にスコープが付与されている必要があります。ドメイン全体の委任でも送信用スコープを別に要求し、Workspace 管理者の許可が必要です。他の Google ツールの要求には追加しません。
+
+毎回本人の確認が必要です。確認は５分間有効で１回限りです。カードにはアカウント、スペースのリソース名、スレッド、送信する全文と個人情報の送信に関する注意が表示されます。短文は認証済みの個別チャットで確認でき、グループからの依頼や長文は本人だけが開ける「自分の接続」ページで確認します。管理者の承認、`allow` ルール、Admin MCP scope、宛先許可リストでは代替できません。組織の外部送信承認も別途適用されます。本文、宛先、アカウント、認証情報、ポリシーが変わると再確認が必要です。
+
+Gateway は操作ごとに固定の request ID を保存します。結果が不明な場合は `result_unconfirmed` を返し、自動再送しません。新たに送信を依頼する前に Google Chat を確認してください。添付ファイルやスペースの作成には対応していません。指定スレッドは同じスペース内のものに限ります。Google では本人が送信者として表示され、アプリ名も付きます。[Google Chat API](https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages/create)。

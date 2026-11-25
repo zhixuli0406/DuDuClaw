@@ -2,7 +2,7 @@
 
 /// The bearer broker accepts only these operations; status is metadata-only.
 pub const TOKEN_TOOLS: &[&str] = &[
-    "google_chat_spaces", "google_chat_messages",
+    "google_chat_spaces", "google_chat_messages", "google_chat_send",
     "gmail_search", "gmail_read", "mail_poll", "gmail_create_draft",
     "calendar_list_events", "calendar_create_event", "sheets_read", "sheets_append",
     "forms_get", "forms_list_responses", "gtasks_lists", "gtasks_list",
@@ -32,6 +32,7 @@ pub fn permitted_for(tool: &str, metadata: &crate::person_credentials::Metadata)
     let consent = |purpose: &str| metadata.local_purposes.iter().any(|p| p == purpose);
     let local = match tool {
         "google_chat_spaces" | "google_chat_messages" => consent("chat_read"),
+        "google_chat_send" => consent("chat_send"),
         "drive_search" | "drive_read" => consent("drive_tools"),
         "google_remote_mcp" => consent("base") && consent("drive_tools"),
         _ => consent("base"),
@@ -47,6 +48,7 @@ fn has(granted: &[String], candidates: &[&str]) -> bool {
 
 pub fn permitted(tool: &str, granted: &[String]) -> bool {
     match tool {
+        "google_chat_send" => has(granted, &["https://www.googleapis.com/auth/chat.messages.create", "https://www.googleapis.com/auth/chat.messages"]),
         "google_chat_spaces" => has(granted, &["https://www.googleapis.com/auth/chat.spaces.readonly"]),
         "google_chat_messages" => has(granted, &["https://www.googleapis.com/auth/chat.messages.readonly"]),
         "gmail_search" | "gmail_read" | "mail_poll" => has(
@@ -172,7 +174,7 @@ mod native_write_scope_tests {
             if *tool != "google_status" {
                 assert!(token_tool(tool), "missing personal scope table entry: {tool}");
                 assert!(permitted(tool, &crate::google_workspace::REQUIRED_SCOPES.iter()
-                    .chain(crate::google_workspace::CHAT_READ_SCOPES.iter()).map(|s| s.to_string()).collect::<Vec<_>>()), "{tool}");
+                    .chain(crate::google_workspace::CHAT_READ_SCOPES.iter()).chain(crate::google_workspace::CHAT_SEND_SCOPES.iter()).map(|s| s.to_string()).collect::<Vec<_>>()), "{tool}");
             }
         }
     }

@@ -23,11 +23,20 @@ export function MyConnectionsPage() {
   const [googleDataConfirmed,setGoogleDataConfirmed] = useState(false);
   const [meetingConfirmed,setMeetingConfirmed] = useState(false);
   const [driveToolsConfirmed,setDriveToolsConfirmed] = useState(false);
+  const [chatSendConfirmed,setChatSendConfirmed] = useState(false);
+  const [chatRequests,setChatRequests] = useState<Awaited<ReturnType<typeof api.personalGoogle.chatConfirmations>>['requests']>([]);
   const [disconnectNote,setDisconnectNote] = useState('');
   const load = useCallback(async () => {
     try { setStatus(await api.personalGoogle.status()); setError(null); } catch(e) { setError(e); }
   },[]);
   useEffect(() => { void load(); const focus = () => void load(); window.addEventListener('focus',focus); return () => window.removeEventListener('focus',focus); },[load]);
+  useEffect(() => {
+    let active = true;
+    const refresh = () => void api.personalGoogle.chatConfirmations().then(result => { if (active) setChatRequests(result.requests); }).catch(() => { if (active) setChatRequests([]); });
+    refresh();
+    const timer = window.setInterval(refresh, 3000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, []);
   const run = useCallback(async (action:()=>Promise<unknown>) => {
     setBusy(true);
     try { await action(); await load(); } catch(e) { toast.error(e instanceof Error ? e.message : String(e)); } finally { setBusy(false); }
@@ -41,11 +50,11 @@ export function MyConnectionsPage() {
     setQuery({}, {replace:true});
     void run(()=>api.personalGoogle.finish(state));
   },[query,setQuery,run]);
-  const connect = async (purpose?: 'meeting' | 'drive_tools') => {
+  const connect = async (purpose?: 'meeting' | 'drive_tools' | 'chat_send') => {
     const popup = window.open('about:blank','_blank');
     if (popup) popup.opener = null;
     setBusy(true);
-    try { const started = await api.personalGoogle.start(googleDataConfirmed, purpose === 'meeting', purpose === 'drive_tools'); setGoogleDataConfirmed(false); setMeetingConfirmed(false); setDriveToolsConfirmed(false); setRedirectUri(started.redirect_uri); setPaste(started.completion === 'paste'); if (popup) popup.location.replace(started.authorization_url); else window.location.assign(started.authorization_url); }
+    try { const started = await api.personalGoogle.start(googleDataConfirmed, purpose === 'meeting', purpose === 'drive_tools', purpose === 'chat_send'); setChatSendConfirmed(false); setGoogleDataConfirmed(false); setMeetingConfirmed(false); setDriveToolsConfirmed(false); setRedirectUri(started.redirect_uri); setPaste(started.completion === 'paste'); if (popup) popup.location.replace(started.authorization_url); else window.location.assign(started.authorization_url); }
     catch(e) { popup?.close(); toast.error(e instanceof Error ? e.message : String(e)); }
     finally { setBusy(false); }
   };
@@ -69,6 +78,13 @@ export function MyConnectionsPage() {
       <p className="text-xs text-muted-foreground">{t('myConnections.testing')}</p>
       {status.chat_read && status.connection?.status === 'connected' && (!status.connection.local_purposes?.includes('chat_read') || !['chat.spaces.readonly', 'chat.messages.readonly'].every(scope => status.connection!.granted_scopes.includes(`https://www.googleapis.com/auth/${scope}`))) && <p role="status" className="text-sm text-warning">{t('myConnections.reconnectChat')}</p>}
       {status.chat_read && <p className="text-sm text-muted-foreground">{t('google.chatRead.hint')}</p>}
+      {status.connection && <section className="space-y-3 rounded-lg border border-border p-4">
+        <h2 className="font-medium">{t('google.chatSend.title')}</h2>
+        <p className="text-sm">{t('google.chatSend.hint')}</p>
+        <p role="status" className="text-sm">{t(status.chat_send && status.integration_enabled && status.connection.status === 'connected' && status.connection.local_purposes?.includes('chat_send') && status.connection.granted_scopes.some(scope => ['https://www.googleapis.com/auth/chat.messages.create', 'https://www.googleapis.com/auth/chat.messages'].includes(scope)) ? 'myConnections.chatSend.enabled' : 'myConnections.chatSend.missing')}</p>
+        <label className="flex items-start gap-2 text-sm"><input type="checkbox" checked={chatSendConfirmed} onChange={e=>setChatSendConfirmed(e.target.checked)}/>{t('myConnections.chatSend.consent')}</label>
+        <Button variant="outline" disabled={busy||!status.chat_send||!status.client_configured||status.requires_login||!googleDataConfirmed||!chatSendConfirmed} onClick={()=>void connect('chat_send')}>{t('myConnections.chatSend.authorize')}</Button>
+      </section>}
       <GoogleDataDisclosure confirmed={googleDataConfirmed} onConfirmedChange={setGoogleDataConfirmed}/>
       <Button disabled={busy||!status.client_configured||status.requires_login||!googleDataConfirmed} onClick={()=>void connect()}>{status.connection ? t('myConnections.reconnect') : t('myConnections.connect')}</Button>
       {status.connection && <section className="space-y-3 rounded-lg border border-border p-4" aria-labelledby="meeting-google-consent">
@@ -92,6 +108,13 @@ export function MyConnectionsPage() {
       {status.connection && <div className="space-y-2"><label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={disconnectConfirmed} onChange={e=>setDisconnectConfirmed(e.target.checked)}/>{t('myConnections.disconnectConfirm')}</label><Button variant="outline" disabled={busy||!disconnectConfirmed} onClick={()=>void run(async()=>{const result=await api.personalGoogle.disconnect();setDisconnectNote(result.provider_note??'');})}>{t('myConnections.disconnect')}</Button></div>}
       {paste && <div className="space-y-2"><p className="text-sm">{t('myConnections.pasteHint')}</p><label htmlFor="google-return-url">{t('myConnections.returnUrl')}</label><Input id="google-return-url" type="url" value={url} onChange={e=>setUrl(e.target.value)} autoComplete="off"/><Button disabled={busy||!url} onClick={()=>void run(async()=>{await api.personalGoogle.paste(url);setUrl('');setPaste(false);})}>{t('myConnections.finish')}</Button></div>}
     </CardContent></Card>
+    {chatRequests.map(request => <Card key={request.id}><CardHeader><CardTitle>{t('myConnections.chatSend.confirmTitle')}</CardTitle></CardHeader><CardContent className="space-y-3">
+      <p>{request.employee} · {request.account}</p><p className="break-all">{request.space} {request.thread ?? ''}</p>
+      <pre className="whitespace-pre-wrap break-words rounded-lg border border-border p-4 font-sans text-sm">{request.text}</pre>
+      <p className="text-sm">{t('myConnections.chatSend.egress')}</p><p>{t('myConnections.chatSend.expires', {time:new Date(request.expires_at).toLocaleString(intl.locale)})}</p>
+      <div className="flex gap-2"><Button disabled={busy||Date.parse(request.expires_at)<=Date.now()} onClick={()=>void run(async()=>{await api.personalGoogle.confirmChat(request.id,true);setChatRequests(rows=>rows.filter(r=>r.id!==request.id));})}>{t('myConnections.chatSend.confirm')}</Button>
+      <Button variant="outline" disabled={busy} onClick={()=>void run(async()=>{await api.personalGoogle.confirmChat(request.id,false);setChatRequests(rows=>rows.filter(r=>r.id!==request.id));})}>{t('myConnections.chatSend.cancel')}</Button></div>
+    </CardContent></Card>)}
     <Card><CardHeader><CardTitle>{t('myConnections.employees')}</CardTitle></CardHeader><CardContent className="space-y-4">
       {status.requests.length===0 && <p className="text-sm text-muted-foreground">{t('myConnections.noEmployees')}</p>}
       {status.requests.map(request=><div key={request.agent_id} className="space-y-2 rounded border border-border p-3">

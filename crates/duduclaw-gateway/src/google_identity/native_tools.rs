@@ -30,6 +30,10 @@ pub fn arg_u32(args: &Value, key: &str, default: u32) -> u32 {
         .unwrap_or(default)
 }
 
+pub async fn handle_google_chat_send(args: &Value, home: &Path, g: &dyn NativeGoogleAccess) -> Value {
+    crate::google_workspace::native_legacy::handle("google_chat_send", args, home, g).await
+}
+
 pub async fn handle_google_chat_spaces(args: &Value, home: &Path, g: &dyn NativeGoogleAccess) -> Value {
     crate::google_workspace::native_legacy::handle("google_chat_spaces", args, home, g).await
 }

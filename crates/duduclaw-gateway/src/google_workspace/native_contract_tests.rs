@@ -38,6 +38,7 @@ fn valid_cases() -> Vec<(&'static str, Value)> {
         ("sheets_update", json!({"spreadsheet_id":"s","range":"A1","values":[["x"]]})),
         ("calendar_update_event", json!({"event_id":"e","summary":"Updated"})),
         ("google_chat_spaces", json!({})),
+        ("google_chat_send", json!({"space":"spaces/A","text":"final text"})),
         ("google_chat_messages", json!({"space":"spaces/AAA"})),
     ]
 }
@@ -45,7 +46,7 @@ fn valid_cases() -> Vec<(&'static str, Value)> {
 #[test]
 fn all_twenty_five_native_inputs_are_frozen_without_status_or_remote_aliases() {
     let cases = valid_cases();
-    assert_eq!(cases.len(), 25);
+    assert_eq!(cases.len(), 26);
     for (tool, arguments) in cases {
         let call = NativeCallTemplate::prepare(tool, &arguments).unwrap();
         assert_eq!(call.tool(), tool);
