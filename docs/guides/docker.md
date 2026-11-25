@@ -371,6 +371,12 @@ docker run --rm \
   alpine tar xzf /backup/duduclaw-data-2026-04-22.tar.gz -C /target
 ```
 
+If a restored named volume is root-owned, change its ownership before starting the gateway:
+
+```bash
+docker run --rm -v duduclaw_duduclaw-data:/target alpine chown -R 1000:1000 /target
+```
+
 ### 7.3 Replacing volumes with host directories (advanced)
 
 If you'd rather browse the data directly, you can swap named volumes for bind mounts:
@@ -389,11 +395,12 @@ If you'd rather browse the data directly, you can swap named volumes for bind mo
       - ./data/opencode:/home/duduclaw/.local/share/opencode
 ```
 
-Note that the host directories **must be owned by UID 1000** (the `duduclaw` user inside the container):
+The mounted application data directory must be owned by UID 1000 inside the container and must not be writable by group or other users; the gateway refuses it otherwise. A root-owned named volume must be changed to UID 1000 as well. Host umask settings can create directories with mode 0775, so set the data directory to 0700 explicitly:
 
 ```bash
 mkdir -p data/{duduclaw,claude,codex,gemini,grok,kimi,copilot,kiro,cursor,opencode}
 sudo chown -R 1000:1000 data/
+sudo chmod 700 data/duduclaw
 ```
 
 ---

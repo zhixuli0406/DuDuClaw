@@ -389,6 +389,12 @@ docker run --rm \
   alpine tar xzf /backup/duduclaw-data-2026-04-22.tar.gz -C /target
 ```
 
+還原後若 named volume 由 root 擁有，請在啟動 gateway 前改為 UID 1000：
+
+```bash
+docker run --rm -v duduclaw_duduclaw-data:/target alpine chown -R 1000:1000 /target
+```
+
 ### 7.3 用宿主機目錄取代（進階）
 
 若想方便直接瀏覽資料，可把 named volume 換成 bind mount：
@@ -407,11 +413,12 @@ docker run --rm \
       - ./data/opencode:/home/duduclaw/.local/share/opencode
 ```
 
-注意宿主機目錄的 **owner 必須是 UID 1000**（容器內 `duduclaw` 使用者）：
+掛載的主程式資料目錄在容器內必須由 UID 1000 擁有，且群組與其他人不可寫入，否則 gateway 會拒絕使用。若 named volume 由 root 擁有，也必須改由 UID 1000 擁有。宿主機 umask 可能讓目錄變成 0775，請明確設為 0700：
 
 ```bash
 mkdir -p data/{duduclaw,claude,codex,gemini,grok,kimi,copilot,kiro,cursor,opencode}
 sudo chown -R 1000:1000 data/
+sudo chmod 700 data/duduclaw
 ```
 
 ---

@@ -385,6 +385,12 @@ docker run --rm \
   alpine tar xzf /backup/duduclaw-data-2026-04-22.tar.gz -C /target
 ```
 
+復元後の named volume が root 所有の場合は、gateway の起動前に UID 1000 に変更してください：
+
+```bash
+docker run --rm -v duduclaw_duduclaw-data:/target alpine chown -R 1000:1000 /target
+```
+
 ### 7.3 ホストディレクトリで置き換える（上級者向け）
 
 データを直接ブラウズしたい場合は、named volumeをbind mountに置き換えられます。
@@ -403,11 +409,12 @@ docker run --rm \
       - ./data/opencode:/home/duduclaw/.local/share/opencode
 ```
 
-ホスト側ディレクトリの**ownerはUID 1000でなければならない**点に注意してください（コンテナ内の `duduclaw` ユーザー）。
+マウントするアプリケーションデータディレクトリは、コンテナ内の UID 1000 が所有し、グループやその他のユーザーが書き込めない必要があります。条件を満たさない場合、gateway は使用を拒否します。root 所有の named volume も UID 1000 に変更してください。ホストの umask によってディレクトリが 0775 になることがあるため、明示的に 0700 に設定します：
 
 ```bash
 mkdir -p data/{duduclaw,claude,codex,gemini,grok,kimi,copilot,kiro,cursor,opencode}
 sudo chown -R 1000:1000 data/
+sudo chmod 700 data/duduclaw
 ```
 
 ---

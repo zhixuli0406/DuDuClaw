@@ -287,10 +287,19 @@ enabled = true
 
 > **→ 詳細版：** [docs/guides/docker.md](../docker.md) — 3 大 CLI 認証設定、ポートの詳細、ボリュームのバックアップ、watchtower、トラブルシューティングを含みます。
 
+マウントする `~/.duduclaw` はコンテナ内の UID 1000 が所有し、グループやその他のユーザーが書き込めない必要があります。満たさない場合、gateway は使用を拒否します。Compose の起動前に設定してください：
+
+```bash
+mkdir -p ~/.duduclaw
+sudo chown 1000:1000 ~/.duduclaw
+sudo chmod 700 ~/.duduclaw
+```
+
 ```bash
 cd /path/to/DuDuClaw
 docker compose up -d
 ```
+
 
 ```yaml
 # docker-compose.yml

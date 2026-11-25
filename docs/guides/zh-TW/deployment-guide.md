@@ -264,10 +264,19 @@ enabled = true
 
 > **→ 詳細版：** [docs/guides/docker.md](../docker.md)，包含三大 CLI 認證設定、port 詳解、volume 備份、watchtower、疑難排解。
 
+掛載的 `~/.duduclaw` 在容器內必須由 UID 1000 擁有，且群組與其他人不可寫入，否則 gateway 會拒絕使用。啟動 Compose 前先設定：
+
+```bash
+mkdir -p ~/.duduclaw
+sudo chown 1000:1000 ~/.duduclaw
+sudo chmod 700 ~/.duduclaw
+```
+
 ```bash
 cd /path/to/DuDuClaw
 docker compose up -d
 ```
+
 
 ```yaml
 # docker-compose.yml
