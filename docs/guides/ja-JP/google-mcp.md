@@ -143,3 +143,7 @@ approval_required_tools = ["create_event", "update_doc", "create_file"]
 [Developer Preview Program](https://developers.google.com/workspace/preview)。
 
 `google:chat` プリセットは Chat スコープを追加しません。ネイティブ Workspace のスコープ一覧には Chat がないため、別途適切な認可が必要です。Google Chat チャネルは `chat.bot` を使う別接続です。
+
+## チャットの認可リンク
+
+本人の接続や用途の許可が不足する場合、ゲートウェイが確認リンクを案内できます。同じメンバーによる通常の Dashboard ログインとデータ説明への明示的な同意が必要で、ログイン資格情報や SSO ではありません。MCP ツールは ticket を受け取ったり、メンバー、アカウント、スコープ、戻り先 URL を指定したりできません。認可は外部送信の承認とは別です。アカウントの確認、公開 URL、続行については[個人 Google 接続ガイド](google-personal-connections.md)を参照してください。公式 remote MCP の利用資格と既存の権限チェックも引き続き必要です。

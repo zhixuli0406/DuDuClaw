@@ -86,6 +86,7 @@ const UsersPage = lazyPage(() => import('./pages/UsersPage'), 'UsersPage');
 const TeamPage = lazyPage(() => import('./pages/TeamPage'), 'TeamPage');
 const AccountPage = lazyPage(() => import('./pages/AccountPage'), 'AccountPage');
 const ExternalAccessPage = lazyPage(() => import('./pages/ExternalAccessPage'), 'ExternalAccessPage');
+const GoogleAuthorizationPage = lazyPage(() => import('./pages/GoogleAuthorizationPage'), 'GoogleAuthorizationPage');
 const MyConnectionsPage = lazyPage(() => import('./pages/MyConnectionsPage'), 'MyConnectionsPage');
 const MyMemoryPage = lazyPage(() => import('./pages/MyMemoryPage'), 'MyMemoryPage');
 const MyHistoryViewsPage = lazyPage(() => import('./pages/MyHistoryViewsPage'), 'MyHistoryViewsPage');
@@ -365,7 +366,7 @@ export function App() {
               <Route path="me/external-access" element={<ExternalAccessPage />} />
               {/* RM-039: self-service view of what AI employees remember about the caller (every role and edition). */}
               <Route path="me/memory" element={<MyMemoryPage />} />
-              <Route element={<EditionGuard enterprise />}><Route path="me/connections" element={<MyConnectionsPage />} /></Route>
+              <Route element={<EditionGuard enterprise />}><Route path="me/connections" element={<MyConnectionsPage />} /><Route path="me/google/authorize" element={<GoogleAuthorizationPage />} /></Route>
               {/* Self-only receipts are available to every Enterprise account. */}
               <Route element={<EditionGuard enterprise />}>
                 <Route path="my/history-views" element={<MyHistoryViewsPage />} />

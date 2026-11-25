@@ -1,3 +1,4 @@
+import { dashboardEndpoint } from '@/lib/dashboard-base';
 import { create } from 'zustand';
 import { client, type ConnectionState } from '@/lib/ws-client';
 import { useAuthStore } from '@/stores/auth-store';
@@ -49,7 +50,7 @@ export const useConnectionStore = create<ConnectionStore>((set) => {
     connectWithAuth: async (getToken: TokenGetter) => {
       try {
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const url = `${protocol}//${window.location.host}/ws`;
+        const url = `${protocol}//${window.location.host}${dashboardEndpoint('/ws')}`;
         // authRefreshHook: when WS handshake fails with an auth-shaped error,
         // ws-client triggers this before reconnecting so getToken() returns
         // a fresh JWT. Defends against the JWT-expiry death loop.

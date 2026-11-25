@@ -733,6 +733,7 @@ impl MethodHandler {
     /// Inject the reply context for hot-starting channels. Called once after
     /// ReplyContext is constructed in server.rs.
     pub async fn set_reply_ctx(&self, ctx: Arc<crate::channel_reply::ReplyContext>) {
+        crate::google_authorization_requests::resume::start(ctx.clone());
         *self.reply_ctx.write().await = Some(ctx);
     }
 

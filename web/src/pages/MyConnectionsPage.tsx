@@ -56,6 +56,11 @@ export function MyConnectionsPage() {
     {(status.notices ?? []).map(notice => <p key={notice.id} role="status" className="rounded-lg border border-border p-3 text-sm">
       {t(notice.kind === 'google_identity_data_test' ? 'myConnections.testNoticeData' : 'myConnections.testNotice', { agent: notice.agent_id, time: new Date(notice.timestamp).toLocaleString(intl.locale) })}
     </p>)}
+    {!!status.authorization_requests?.length && <Card><CardHeader><CardTitle>{t('googleAuthorization.requests')}</CardTitle></CardHeader><CardContent>
+      <ul className="space-y-3 text-sm">{status.authorization_requests.map(request => <li key={request.id}>
+        {request.agent} · {t(`googleAuthorization.purpose.${request.purpose}`)} · {t(`googleAuthorization.status.${request.status}`)}
+      </li>)}</ul>
+    </CardContent></Card>}
     <Card><CardHeader><CardTitle>Google</CardTitle></CardHeader><CardContent className="space-y-3">
       {status.connection && <><p className="font-medium">{status.connection.account_email}</p><p className="text-sm">{t(`myConnections.status.${status.connection.status}`)}</p>
         <Link to="/mail" className="text-sm underline">{t('nav.mail')}</Link>

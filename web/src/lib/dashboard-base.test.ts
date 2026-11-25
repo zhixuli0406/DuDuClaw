@@ -67,3 +67,18 @@ describe('dashboardBaseUrl', () => {
     expect(dashboardBaseUrl(fakeDoc('https://example.com/agents/', true), '')).toBe('');
   });
 });
+
+describe('gateway-provided deployment prefix', () => {
+  it('uses the administrator prefix without accepting a URL as a path', () => {
+    const doc = (prefix: string) => ({
+      baseURI: 'https://example.com/team/me/google/authorize',
+      querySelector: ((selector: string) => selector === 'meta[name="duduclaw-base"]'
+        ? { getAttribute: () => prefix } as unknown as Element : null) as Document['querySelector'],
+    });
+    expect(dashboardBasePath(doc('/team'), 'https://example.com')).toBe('/team/');
+    expect(dashboardBaseUrl(doc('/team'), 'https://example.com')).toBe('https://example.com/team/');
+    for (const bad of ['//evil.test', '/x/../y', '/x%2fy', '/x?redirect=evil', 'https://evil.test']) {
+      expect(dashboardBasePath(doc(bad), 'https://example.com')).toBe('/');
+    }
+  });
+});

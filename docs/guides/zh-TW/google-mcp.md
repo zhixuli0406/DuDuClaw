@@ -127,3 +127,7 @@ approval_required_tools = ["create_event", "update_doc", "create_file"]
 [Developer Preview Program](https://developers.google.com/workspace/preview)。
 
 `google:chat` 預設集不會增加 Chat 授權。原生 Workspace 權限清單沒有 Chat，掛載前要另行配置適當授權。Google Chat 頻道使用 `chat.bot`，是另一條連線。
+
+## 聊天授權連結
+
+缺少本人連線或用途時，可由閘道提供確認連結。連結要求同一位成員正常登入 Dashboard，並明確確認資料說明；它不是登入憑證或 SSO。MCP 工具不能接收 ticket，也不能指定成員、帳號、授權範圍或返回網址。Google 授權不代表核准對外傳送。帳號檢查、公開網址與續行規則見[Google 個人連線指南](google-personal-connections.md#從聊天確認-google-授權)。官方 remote MCP 的使用資格與既有能力閘仍須符合。

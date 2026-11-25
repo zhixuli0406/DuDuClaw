@@ -1,3 +1,4 @@
+import { dashboardEndpoint } from '@/lib/dashboard-base';
 import { create } from 'zustand';
 import { client } from '@/lib/ws-client';
 import { refreshBrandRevision } from '@/stores/brand-store';
@@ -224,7 +225,7 @@ const RETRY_MAX_ATTEMPTS = 4;
 const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 export async function apiPost<T>(path: string, body: Record<string, unknown>): Promise<T> {
-  const res = await fetch(path, {
+  const res = await fetch(dashboardEndpoint(path), {
     method: 'POST',
     credentials: 'same-origin',
     cache: 'no-store',
@@ -239,7 +240,7 @@ export async function apiPost<T>(path: string, body: Record<string, unknown>): P
 }
 
 async function apiGet<T>(path: string, jwt: string): Promise<T> {
-  const res = await fetch(path, {
+  const res = await fetch(dashboardEndpoint(path), {
     headers: { Authorization: `Bearer ${jwt}` },
   });
   const data = await res.json().catch(() => ({}));
@@ -372,7 +373,7 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
     const attempt = get().authAttempt + 1;
     set({ authAttempt: attempt });
     try {
-      const res = await fetch('/api/session/local', {
+      const res = await fetch(dashboardEndpoint('/api/session/local'), {
         method: 'POST',
         headers: { [LOCAL_SESSION_HEADER]: '1' },
       });
@@ -391,7 +392,7 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
 
   firstRunStatus: async () => {
     try {
-      const res = await fetch('/api/first-run/status');
+      const res = await fetch(dashboardEndpoint('/api/first-run/status'));
       if (!res.ok) return false;
       const data = (await res.json()) as { claimable?: boolean };
       return data.claimable === true;

@@ -16,6 +16,7 @@ import { applyTheme, useThemeStore } from './stores/theme-store';
 import { setTimeAgoNowLabel } from './lib/format';
 import { installExternalLinkInterceptor } from './lib/external-link';
 import './index.css';
+import { dashboardBase } from './lib/dashboard-base';
 
 // Apply the persisted theme before first render. The embedded production
 // server sends a strict `script-src 'self'` CSP that blocks inline scripts,
@@ -46,7 +47,7 @@ function Root() {
           message instead of a blank tab (RouteErrorBoundary covers pages). */}
       <AppErrorBoundary>
         <ToastProvider>
-          <BrowserRouter>
+          <BrowserRouter basename={dashboardBase() || '/'}>
             <App />
           </BrowserRouter>
         </ToastProvider>

@@ -802,3 +802,5 @@ pub mod meeting_uploads;
 pub mod meeting_links;
 
 mod mcp_start;
+
+mod google_authorization_requests;

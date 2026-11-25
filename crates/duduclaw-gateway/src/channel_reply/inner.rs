@@ -144,9 +144,26 @@ pub(super) async fn build_reply_with_session_inner(
 ) -> String {
     // Keep the instrumented future small even for callers that bypass the
     // guarded entry points: debug task-local poll frames copy their futures.
-    Box::pin(build_reply_with_session_inner_impl(
-        text, ctx, agent_override, session_id, user_id, on_progress,
-    )).await
+    let notice = std::sync::Arc::new(std::sync::Mutex::new(crate::google_authorization_requests::turn::Notice::default()));
+    let reply = crate::google_authorization_requests::turn::NOTICE.scope(notice.clone(),
+        Box::pin(build_reply_with_session_inner_impl(
+            text, ctx, agent_override, session_id, user_id, on_progress,
+        ))).await;
+    crate::google_authorization_requests::turn::flush(&notice).await;
+    let hint = notice.lock().ok().and_then(|mut value| value.text.take());
+    match hint {
+        Some(hint) if reply.is_empty() => {
+            if crate::notify_push::push_google_authorization_notice(ctx.http.clone(),&hint).await {
+                super::mark_deliberate_silence();
+                String::new()
+            } else { live_only_notice(hint) }
+        }
+        Some(hint) => {
+            if crate::notify_push::push_google_authorization_notice(ctx.http.clone(),&hint).await { reply }
+            else { format!("{reply}\n\n{hint}") }
+        }
+        None => reply,
+    }
 }
 
 async fn build_reply_with_session_inner_impl(
@@ -433,6 +450,21 @@ async fn build_reply_with_session_inner_impl(
             via_trigger,
             session_id: session_id.to_string(),
         });
+    }
+
+    let authorization_generation = ctx.session_manager.turn_generation(session_id).await;
+    let _authorization_turn = agent.and_then(|a| authorization_generation.ok().and_then(|generation|
+        crate::google_authorization_requests::turn::register(&ctx.home_dir, &a.config.agent.name,
+            &turn_id, text, session_id, ctx.session_manager.clone(),generation)));
+    if let Some(a) = agent {
+        if let Some(tool) = crate::google_authorization_requests::hinted_tool(text) {
+            crate::google_authorization_requests::turn::missing(
+                &ctx.home_dir, &a.config.agent.name, Some(&turn_id), tool, "not_connected").await;
+            if crate::google_authorization_requests::turn::NOTICE.try_with(|n| n.lock().is_ok_and(|v|v.text.is_some())).unwrap_or(false) {
+                // The host pauses before the model can substitute another account.
+                return live_only_notice(String::new());
+            }
+        }
     }
 
     if let Some(a) = agent {
@@ -1103,6 +1135,8 @@ async fn build_reply_with_session_inner_impl(
     // The WebChat staged-reply fallback (`GuardedReply::persist_webchat`)
     // binds its write to the same generation.
     super::record_turn_generation(turn_generation.as_deref());
+    crate::google_authorization_requests::turn::bind_generation(
+        &ctx.home_dir,&agent_id,&turn_id,turn_generation.clone());
 
     // ── Phase 3: Check if previous trajectory should get feedback ──
     // The current user message may contain feedback (positive/negative) for

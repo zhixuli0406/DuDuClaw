@@ -40,7 +40,7 @@ pub async fn start_with_meetings(
     acknowledge_google_data: bool,
     meeting_recordings: bool,
 ) -> Result<Value, String> {
-    start_consent(home, db, user, session, origin, allowed, acknowledge_google_data, meeting_recordings, false).await
+    start_consent(home, db, user, session, origin, allowed, acknowledge_google_data, meeting_recordings, false, None).await
 }
 
 pub async fn start_drive_tools(
@@ -52,7 +52,15 @@ pub async fn start_drive_tools(
     allowed: &[String],
     acknowledge_google_data: bool,
 ) -> Result<Value, String> {
-    start_consent(home, db, user, session, origin, allowed, acknowledge_google_data, false, true).await
+    start_consent(home, db, user, session, origin, allowed, acknowledge_google_data, false, true, None).await
+}
+
+pub(crate) async fn start_authorization_request(
+    home: &Path, db: &UserDb, user: &str, session: &str, origin: &str,
+    allowed: &[String], request: &crate::google_authorization_requests::store::Request,
+) -> Result<Value,String> {
+    start_consent(home,db,user,session,origin,allowed,true,false,
+        matches!(request.purpose.as_str(), "drive_tools" | "workspace"),Some(request)).await
 }
 
 async fn start_consent(
@@ -65,6 +73,7 @@ async fn start_consent(
     acknowledge_google_data: bool,
     meeting_recordings: bool,
     drive_tools: bool,
+    authorization_request: Option<&crate::google_authorization_requests::store::Request>,
 ) -> Result<Value, String> {
     if meeting_recordings && drive_tools {
         return Err("請每次選擇一項 Google 額外服務。".into());
@@ -91,7 +100,9 @@ async fn start_consent(
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
     // Incremental consent extends this person's existing Google account;
     // choosing another account cannot silently replace it.
-    let expected_connection = if drive_tools {
+    let expected_connection = if authorization_request.is_some() {
+        vault::get(home,user)?.map(|r|r.metadata)
+    } else if drive_tools {
         Some(vault::get(home, user)?.ok_or("請先連結自己的 Google 帳號，再開放雲端硬碟工具。")?.metadata)
     } else if meeting_recordings {
         Some(vault::get(home, user)?.ok_or("請先連結自己的 Google 帳號，再開放會議錄影。")?.metadata)
@@ -121,10 +132,23 @@ async fn start_consent(
         created: Instant::now(),
         code: None,
     });
-    let authorization_url = oauth::authorization_url_for(
+    let mut authorization_url = oauth::authorization_url_for(
         &client.client_id, &redirect_uri, &state, &challenge,
         meeting_recordings, drive_tools, chat_read,
     )?;
+    if let Some(request) = authorization_request {
+        let mut url = url::Url::parse(&authorization_url).map_err(|_| "Google 授權網址無效。")?;
+        if request.purpose == "workspace" {
+            let mut scopes=oauth::requested_scopes(false,false);
+            scopes.extend(oauth::requested_scopes(false,true));
+            scopes.sort_unstable(); scopes.dedup();
+            let pairs=url.query_pairs().filter(|(key,_)|key!="scope").map(|(k,v)|(k.into_owned(),v.into_owned())).collect::<Vec<_>>();
+            url.set_query(None);
+            url.query_pairs_mut().extend_pairs(pairs).append_pair("scope",&scopes.join(" "));
+        }
+        url.query_pairs_mut().append_pair("login_hint", &request.email);
+        authorization_url = url.to_string();
+    }
     Ok(
         json!({ "authorization_url": authorization_url, "state": state, "completion": if paste { "paste" } else { "redirect" }, "redirect_uri": redirect_uri, "expires_in": 600 }),
     )
@@ -138,6 +162,11 @@ pub async fn finish(
     state: &str,
 ) -> Result<Value, String> {
     active_user(db, user)?;
+    let authorization_request = crate::google_authorization_requests::store::Store::open(home)?
+        .oauth(state, user, session)?;
+    if let Some(request) = &authorization_request {
+        crate::google_authorization_requests::validate(home, db, request)?;
+    }
     let pending = pending::take(home, state, user, session)?;
     crate::google_data_consent::require_current(Some(&pending.google_data_consent))?;
     let grant_lease = super::grants::acquire(home).await?;
@@ -153,6 +182,12 @@ pub async fn finish(
     let info = oauth::userinfo(&tokens.secret.access_token)
         .await
         .map_err(|_| "無法確認 Google 帳號或信箱尚未驗證，沒有保存連線。")?;
+    if let Some(request) = &authorization_request {
+        crate::google_authorization_requests::validate(home, db, request)?;
+        if !crate::google_authorization_requests::account_matches(request, &info.sub, &info.email) {
+            return Err("Google 帳號與授權請求指定的本人身分不符，沒有保存這次連線。".into());
+        }
+    }
     let scopes = tokens
         .granted_scopes
         .ok_or("Google 沒有回傳實際授權範圍，請重新連結。")?;
@@ -176,6 +211,10 @@ pub async fn finish(
         .map(|old| old.local_purposes.clone()).unwrap_or_default();
     if !local_purposes.iter().any(|p| p == purpose) {
         local_purposes.push(purpose.into());
+    }
+    if authorization_request.as_ref().is_some_and(|request| request.purpose == "workspace") {
+        local_purposes.push("base".into());
+        local_purposes.push("drive_tools".into());
     }
     if pending.chat_read && crate::google_workspace::CHAT_READ_SCOPES.iter()
         .all(|scope| scopes.iter().any(|granted| granted == scope)) {
@@ -243,11 +282,20 @@ pub async fn finish(
     if !access::domain_allowed(home, &metadata)? {
         return Err("管理員已變更允許的 Google 網域，請重新開始。".into());
     }
+    if let Some(request) = &authorization_request {
+        crate::google_authorization_requests::validate(home, db, request)?;
+        if !super::scopes::permitted_for(&request.tool, &metadata) {
+            return Err("Google 尚未授予原任務所需的用途與範圍，沒有保存這次連線。".into());
+        }
+    }
     // v1.81 C4: the isolated connector catalog is fenced around publication
     // (same account: new generation / relink; another account: revoke).
     super::lifecycle::publish_connection(home, user, &metadata, || {
         vault::connect_with_previous(home, &key, metadata.clone(), &tokens.secret, pending.epoch, pending.expected_connection.as_ref())
     })?;
+    if let Some(request) = authorization_request {
+        crate::google_authorization_requests::routes::complete(home, db, request, Some(&metadata))?;
+    }
     let detail = json!({
         "google_email": metadata.account_email,
         "scope_count": metadata.granted_scopes.len(),
