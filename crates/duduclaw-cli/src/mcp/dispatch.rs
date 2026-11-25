@@ -365,7 +365,7 @@ pub(crate) async fn handle_tools_call(
                 else { resolve_audit_agent(home_dir, Some(principal), default_agent) };
             duduclaw_security::audit::append_tool_call_with_extras(
                 home_dir, &actual_agent, tool_name, "Gmail send confirmed", true,
-                &[("sent", json!(true)), ("message_id", json!(message_id))],
+                &[("sent", serde_json::json!(true)), ("message_id", serde_json::json!(message_id))],
             );
         }
     }

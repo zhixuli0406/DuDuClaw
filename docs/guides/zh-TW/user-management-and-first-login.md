@@ -33,3 +33,11 @@
 此變更包含資料庫與遠端呼叫測試。真實 SMTP 寄送、執行中閘道的首次登入與瀏覽器操作仍須另行驗收，不能以單元測試結果替代。
 
 AI 分身必須有「可操作」權限（既有 Owner 綁定也符合）；「僅檢視」只適用於其他員工，不能設為分身，也不能在控制台開始或續接對話。既有主要選擇與分身會重新檢查即時權限，降為僅檢視後便不再列入聊天候選。邀請與課程網址一律要求 HTTPS 且不得內含帳密，localhost 也不例外。
+
+## AI 分身與授權名額
+
+**AI 分身不佔名額**：須為一位啟用成員本人的 Personal AI，且成員擁有 Owner 權限，一人一分身、一分身一人。把一般共用員工指定為分身、僅有 Operator 操作權限、修改設定旗標，或無法讀取身分資料，都不符合免計條件。封存的 AI 仍佔名額，刪除才釋出。使用者、AI 員工與授權頁會分開顯示普通名額與免計名額的分身數。
+
+換綁或解除分身、解除 Owner 綁定、停用或離職成員、封存 AI，若變更後超過名額上限就拒絕儲存。請先刪除不用的 AI 或增加授權名額。管理員也可呼叫 `users.set_avatar`，同時帶入 `agent_id: null` 與 `delete_avatar: true`，在同一個請求刪除分身 AI 並解除指派；會執行正常刪除的憑證清理與 Personal 寫入權限檢查（原生隔離需要二次驗證時須帶入 `step_up_csrf`）。若清理失敗，回應會明示 AI 已刪除、仍須重試清理。
+
+普通名額已滿時，管理員仍可用 `agents.create` 的 `{ "name": "member-avatar", "avatar_for_user": "成員ID" }` 建立新 Personal 分身。成員必須啟用且尚未有分身；此操作一起建立 Personal 身分、Owner 綁定與分身指派，不能用來轉換既有普通員工。原生 Linux 隔離環境請用管理員 `isolation.employee_propose`，指定 `binding_kind: "personal"`、`owner_id` 與 `as_avatar: true`。仍須通過二次驗證及既有 root 配置核准，核准前 AI 不會執行。既有 RM-212 分身只在即時 Owner 與 Personal 紀錄核對符合後免計，升級不會把共用員工轉成 Personal AI。`license.status` 分別回傳 `seats_used` 與 `avatars_exempt`；無法確認的數值為 `null`。

@@ -1,3 +1,4 @@
+pub mod avatar_seats;
 pub mod avatar;
 pub mod account_email_history;
 pub mod acl;

@@ -137,15 +137,19 @@ impl MethodHandler {
     async fn add_seat_fields(&self, payload: &mut Value) {
         let cap = self.effective_agent_cap().await;
         let home = self.home_dir.clone();
-        let used = tokio::task::spawn_blocking(move || duduclaw_core::agent_seats::seat_holders(&home))
-            .await
-            .ok()
-            .and_then(|scan| scan.ok())
-            .map(|holders| holders.len());
+        let counts = match duduclaw_core::agent_seats::SeatAdmission::acquire_async(&home).await {
+            Ok(admission) => tokio::task::spawn_blocking(move || -> std::io::Result<(usize, usize)> {
+                let seats = duduclaw_core::agent_seats::scan_agent_seats(admission.home())?;
+                Ok((seats.iter().filter(|s| s.holds_seat()).count(),
+                    seats.iter().filter(|s| s.is_avatar_exempt()).count()))
+            }).await.ok().and_then(|scan| scan.ok()),
+            Err(_) => None,
+        };
         if let Some(object) = payload.as_object_mut() {
             object.insert("seat_limit".into(), if cap == 0 { Value::Null } else { json!(cap) });
             object.insert("seat_unlimited".into(), json!(cap == 0));
-            object.insert("seats_used".into(), used.map_or(Value::Null, |n| json!(n)));
+            object.insert("seats_used".into(), counts.map_or(Value::Null, |(used, _)| json!(used)));
+            object.insert("avatars_exempt".into(), counts.map_or(Value::Null, |(_, avatars)| json!(avatars)));
         }
     }
 

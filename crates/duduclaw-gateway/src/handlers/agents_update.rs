@@ -57,6 +57,14 @@ impl MethodHandler {
             Some(id) if !id.is_empty() => id.to_string(),
             _ => return WsFrame::error_response("", "Missing 'agent_id' parameter"),
         };
+        // Status writes serialize with avatar eligibility and lifecycle
+        // changes before taking the registry, org or profile locks.
+        let seat_admission = if params.get("status").is_some() {
+            match self.acquire_seat_admission().await {
+                Ok(lock) => Some(lock),
+                Err(error) => return WsFrame::error_response("", &error.to_string()),
+            }
+        } else { None };
 
         // Every update can change proactive behavior; check main-agent access
         // before parsing fields or performing any side effect.
@@ -503,6 +511,10 @@ impl MethodHandler {
                     }
                 }
                 if let Some(v) = params_clone.get("status").and_then(|v| v.as_str()) {
+                    let current = agent_section.get("status").and_then(toml::Value::as_str).unwrap_or("active");
+                    if !matches!(current, "active" | "paused" | "terminated") {
+                        return Err("已封存、已刪除或狀態不明的 AI 員工，請使用還原流程。".into());
+                    }
                     match v {
                         "active" | "paused" | "terminated" => {
                             agent_section.insert("status".into(), toml::Value::String(v.into()));
@@ -1251,6 +1263,11 @@ impl MethodHandler {
 
         match result {
             Ok(hot_reloaded) => {
+                if let Some(admission) = &seat_admission {
+                    if let Err(error) = admission.recount(0) {
+                        return WsFrame::error_response("", &error);
+                    }
+                }
                 if let Some(status) = params.get("status").and_then(Value::as_str) {
                     self.broadcast_event("agent.status_changed",
                         json!({ "agent_id": agent_id, "status": status })).await;

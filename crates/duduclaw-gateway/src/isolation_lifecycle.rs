@@ -282,6 +282,13 @@ pub(crate) type UsersGate<'a> = dyn Fn(&Connection) -> Result<(), ()> + 'a;
 /// the mirror).
 pub(crate) fn record_personal_mirror_gated(home: &Path, label: &str, owner: &str, gate: Option<&UsersGate<'_>>)
     -> Result<bool, LifecycleError> {
+    let admission = duduclaw_core::agent_seats::SeatAdmission::acquire(home).map_err(|_| LifecycleError::Unavailable)?;
+    record_personal_mirror_under(home, label, owner, gate, &admission)
+}
+
+pub(crate) fn record_personal_mirror_under(home: &Path, label: &str, owner: &str, gate: Option<&UsersGate<'_>>,
+    admission: &duduclaw_core::agent_seats::SeatAdmission) -> Result<bool, LifecycleError> {
+    // Lock order: caller-held seat admission -> authority writer lease -> users.db transaction.
     let _authority = duduclaw_core::authority_coordinator::AuthorityCoordinator::new(home)
         .write().map_err(|_| LifecycleError::Unavailable)?;
     let mut users = open_store(home, USERS_DB, Access::ReadWrite)?;
@@ -293,6 +300,9 @@ pub(crate) fn record_personal_mirror_gated(home: &Path, label: &str, owner: &str
     if !owner_eligible(&tx, owner)? { return Err(LifecycleError::Denied); }
     let inserted = duduclaw_auth::db::insert_personal_agent_in_transaction(&tx, label, owner).map_err(mirror_error)?;
     duduclaw_auth::db::bind_personal_owner_in_transaction(&tx, label, owner).map_err(mirror_error)?;
+    // Native allocation/adoption establishes Personal ownership, not avatar
+    // provenance. Only dedicated creation or the validated migration grants it.
+    duduclaw_core::agent_seats::seat_holders_in(admission.home(), &tx).map_err(|_| LifecycleError::Unavailable)?;
     tx.commit().map_err(|_| LifecycleError::Unavailable)?;
     // P1h (N2): the ACL generation bump already makes cached owner maps miss;
     // drop them explicitly too (and this request's snapshot, if any).
@@ -316,11 +326,23 @@ pub(crate) fn run_users_gate(home: &Path, gate: &UsersGate<'_>) -> Result<(), Li
 /// (and, per A3, every binding of the agent). `Ok(false)` when absent;
 /// `Stale` when another owner is recorded (left untouched).
 pub(crate) fn remove_personal_mirror(home: &Path, label: &str, owner: &str) -> Result<bool, LifecycleError> {
+    let admission = duduclaw_core::agent_seats::SeatAdmission::acquire(home).map_err(|_| LifecycleError::Unavailable)?;
+    remove_personal_mirror_under(home, label, owner, &admission)
+}
+
+pub(crate) fn remove_personal_mirror_under(home: &Path, label: &str, owner: &str,
+    admission: &duduclaw_core::agent_seats::SeatAdmission) -> Result<bool, LifecycleError> {
+    let before = duduclaw_core::agent_seats::seat_holders(admission.home()).map_err(|_| LifecycleError::Unavailable)?.len();
+    // Lock order: caller-held seat admission -> authority writer lease -> users.db transaction.
     let _authority = duduclaw_core::authority_coordinator::AuthorityCoordinator::new(home)
         .write().map_err(|_| LifecycleError::Unavailable)?;
     let mut users = open_store(home, USERS_DB, Access::ReadWrite)?;
     let tx = users.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| LifecycleError::Unavailable)?;
     let removed = duduclaw_auth::db::remove_personal_agent_in_transaction(&tx, label, owner).map_err(mirror_error)?;
+    let after = duduclaw_core::agent_seats::seat_holders_in(admission.home(), &tx).map_err(|_| LifecycleError::Unavailable)?.len();
+    // Lifecycle removal follows moving the AI out of agents/. A live profile
+    // may not lose its exemption through an unmetered lifecycle operation.
+    if after > before { return Err(LifecycleError::Denied); }
     tx.commit().map_err(|_| LifecycleError::Unavailable)?;
     crate::personal_visibility::invalidate_owner_cache(home);
     Ok(removed)
@@ -420,6 +442,7 @@ pub(crate) struct TombstoneEnv<'a> {
 /// rescan (F6c); root retire (F6l).
 pub(crate) fn tombstone_employee(home: &Path, label: &str, employee: EmployeeId, env: &TombstoneEnv<'_>)
     -> Result<TombstoneOutcome, LifecycleError> {
+    let admission = duduclaw_core::agent_seats::SeatAdmission::acquire(home).map_err(|_| LifecycleError::Unavailable)?;
     use crate::isolation_quarantine as quarantine;
     use LifecycleError::*;
     if !valid_label(label) { return Err(Denied); }
@@ -547,7 +570,7 @@ pub(crate) fn tombstone_employee(home: &Path, label: &str, employee: EmployeeId,
 
     // 4. users.db.
     let users = match &owner {
-        Some(owner) => remove_personal_mirror(home, label, owner).map(|_| ()),
+        Some(owner) => remove_personal_mirror_under(home, label, owner, &admission).map(|_| ()),
         None => remove_shared_bindings(home, label).map(|_| ()),
     };
 
@@ -573,6 +596,7 @@ pub(crate) fn tombstone_employee(home: &Path, label: &str, employee: EmployeeId,
     crate::security_autopilot::audit_and_emit(home, &duduclaw_security::audit::AuditEvent::new(
         "isolation.employee_tombstoned", label, severity, details));
     users?;
+    admission.recount(0).map_err(|_| Unavailable)?;
     Ok(outcome)
 }
 
@@ -658,6 +682,13 @@ pub(crate) fn principal_snapshot_in(tx: &Connection, home: &Path, label: &str, b
             let baseline = duduclaw_auth::mfa::owner_factor::FactorBaseline::read(tx, owner, &crate::mfa::Cipher(home))
                 .map_err(|_| Unavailable)?;
             let seq = duduclaw_auth::credential_changes::high_water(tx).map_err(|_| Unavailable)?;
+            // Preserve protected provenance in the immutable quarantine
+            // snapshot, never infer it merely from a Personal binding.
+            let grant_nonce: Option<String> = tx.query_row(
+                "SELECT nonce FROM avatar_seat_grants WHERE agent_name=?1 AND owner_user_id=?2",
+                params![label, owner], |r| r.get(0)).optional().unwrap_or(None);
+            let avatar_seat_grant = grant_nonce.as_ref().is_some_and(|nonce|
+                duduclaw_core::employee_incarnation::read(tx, label).ok().flatten().as_ref() == Some(nonce));
             serde_json::json!({
                 "kind": "personal", "owner_user_id": owner,
                 "credential_epoch": account.as_ref().map(|(epoch, _)| *epoch),
@@ -667,6 +698,7 @@ pub(crate) fn principal_snapshot_in(tx: &Connection, home: &Path, label: &str, b
                 "notice_address": account.as_ref().map(|(_, email)| email.clone()),
                 "owner_factors": baseline.to_value(),
                 "credential_seq": seq,
+                "avatar_seat_grant": avatar_seat_grant,
             })
         }
         EmployeeBinding::Shared(_) => {

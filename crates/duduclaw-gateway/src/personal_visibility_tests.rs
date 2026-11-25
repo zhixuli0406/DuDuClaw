@@ -338,3 +338,54 @@ fn p1b_self_target_decided_before_users_db() {
     assert_eq!(management_refusal(empty.path(), true, EPH, PERSONAL), None);
     assert_eq!(management_refusal(empty.path(), true, SHARED, PERSONAL), Some(OWNERSHIP_UNAVAILABLE));
 }
+
+pub(crate) fn assign_avatar(h: &Home) {
+    h.db.set_avatar_as(&h.admin, &h.alice, Some(PERSONAL)).unwrap();
+    private_store(h.path());
+}
+
+#[tokio::test]
+async fn d4_avatar_grant_is_audited_live_and_never_delegation() {
+    use duduclaw_auth::acl::PersonalRestriction;
+    let h = home();
+    assign_avatar(&h);
+    let restriction = AclRestriction::with_flag(h.path(), true);
+    assert!(restriction.denies(&h.admin, PERSONAL), "assignment alone is not a global ACL grant");
+    with_break_glass_scope(async {
+        let member = audit_avatar_read(h.path(), &h.admin, PERSONAL, "memory.browse").unwrap().unwrap();
+        record_avatar_read(&h.admin, PERSONAL, &member);
+        assert!(!restriction.denies(&h.admin, PERSONAL));
+        assert!(restriction.denies_delegation(&h.admin, PERSONAL));
+        assert!(restriction.denies(&h.bob, PERSONAL));
+        assert_eq!(hidden_from(h.path(), true, &h.admin).unwrap(), [PERSONAL.to_string()].into(),
+            "generic lists retain the old policy");
+        h.db.set_avatar_as(&h.admin, &h.alice, None).unwrap();
+        assert!(restriction.denies(&h.admin, PERSONAL), "unset revokes even within the request");
+    }).await;
+    assign_avatar(&h);
+    with_break_glass_scope(async {
+        assert!(restriction.denies(&h.admin, PERSONAL), "next request needs a new audit");
+        let member = audit_avatar_read(h.path(), &h.admin, PERSONAL, "chat.sessions.history").unwrap().unwrap();
+        record_avatar_read(&h.admin, PERSONAL, &member);
+        rusqlite::Connection::open(h.path().join(USERS_DB)).unwrap()
+            .execute("ALTER TABLE users RENAME COLUMN avatar_agent_id TO unreadable_avatar", []).unwrap();
+        assert!(restriction.denies(&h.admin, PERSONAL), "unreadable avatar state revokes the grant");
+        assert!(audit_avatar_read(h.path(), &h.admin, PERSONAL, "memory.search").unwrap().is_none());
+    }).await;
+}
+
+#[test]
+fn d4_current_avatar_requires_active_member_binding_and_live_admin() {
+    let h = home();
+    assign_avatar(&h);
+    assert_eq!(current_admin_avatar_member(h.path(), &h.admin, PERSONAL), Some(h.alice.clone()));
+    for user in [h.bob.as_str(), h.alice.as_str(), "system"] {
+        assert!(current_admin_avatar_member(h.path(), user, PERSONAL).is_none());
+    }
+    let conn = rusqlite::Connection::open(h.path().join(USERS_DB)).unwrap();
+    conn.execute("UPDATE users SET status='inactive' WHERE id=?1", [&h.alice]).unwrap();
+    assert!(current_admin_avatar_member(h.path(), &h.admin, PERSONAL).is_none());
+    conn.execute("UPDATE users SET status='active' WHERE id=?1", [&h.alice]).unwrap();
+    conn.execute("DELETE FROM user_agent_bindings WHERE agent_name=?1", [PERSONAL]).unwrap();
+    assert!(current_admin_avatar_member(h.path(), &h.admin, PERSONAL).is_none());
+}

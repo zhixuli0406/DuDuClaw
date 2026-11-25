@@ -201,7 +201,7 @@ mod dispatch;
 mod evolution;
 mod exec;
 mod google;
-mod google_execute_client;
+pub(crate) mod google_execute_client;
 #[cfg(test)]
 pub(crate) use google_execute_client::test_transport as google_execute_test_transport;
 mod google_identity_client;

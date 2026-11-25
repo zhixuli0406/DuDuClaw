@@ -431,7 +431,8 @@ fn check_outside(home: &Path, env: &AdoptEnv<'_>, q: &Quarantined, target: &str)
         Refusal::LabelTaken => AdoptError::LabelNotFree,
         other => other.into(),
     })?;
-    restore::check_quota(home, env.agent_cap)?;
+    // Adoption creates a new employee without carrying avatar provenance.
+    restore::check_quota(home, env.agent_cap, false)?;
     crate::isolation_label_stores::check_label_not_quarantined(home, target, Some((q.employee, q.incarnation)))
         .map_err(|refusal| match refusal {
             crate::isolation_label_stores::GateRefusal::Unavailable => AdoptError::Unavailable,
@@ -812,7 +813,7 @@ pub(crate) fn validate_item(home: &Path, env: &AdoptEnv<'_>, item: &Confirmation
     }
     if request.state == "requested" {
         // F6fb item 8: the new id is one more live employee (licence cap).
-        restore::check_quota(home, env.agent_cap)?;
+        restore::check_quota(home, env.agent_cap, false)?;
         require_root_gone(home, env, &q)?;
         let inputs = sealed_inputs(home, &q, &target)?;
         if apply::settings_from_toml(&inputs.agent_toml)? != settings { return Err(AdoptError::SettingsChanged); }

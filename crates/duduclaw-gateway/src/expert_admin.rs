@@ -369,13 +369,17 @@ pub struct RemoveItem {
 ///
 /// The exact semantics of `duduclaw expert remove <slug>`.
 pub async fn remove_pack(home: &Path, slug: &str) -> Result<Vec<RemoveItem>, String> {
+    let admission = duduclaw_core::agent_seats::SeatAdmission::acquire_async(home).await
+        .map_err(|error| error.to_string())?;
     let home = home.to_path_buf();
     let slug = slug.to_string();
     // The blocking worker owns the lease even if the request is cancelled.
     tokio::task::spawn_blocking(move || {
         let _barrier = duduclaw_core::autonomy_gate::exclusive_barrier(&home)
             .map_err(|error| error.to_string())?;
-        remove_pack_locked(&home, &slug)
+        let result = remove_pack_locked(&home, &slug);
+        admission.recount(0)?;
+        result
     })
     .await
     .map_err(|error| format!("移除專家包工作失敗：{error}"))?

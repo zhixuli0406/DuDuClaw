@@ -180,6 +180,9 @@ struct NoParams {}
 #[serde(deny_unknown_fields)]
 struct ProposeRequest {
     label: String,
+    /// Create a new Personal AI and assign it as the owner's avatar together.
+    #[serde(default)]
+    as_avatar: bool,
     #[serde(default)]
     display_name: Option<String>,
     /// `personal` (with `owner_id`, or the owner of `request_id`) or `shared`.
@@ -341,6 +344,7 @@ impl MethodHandler {
 
     async fn employee_propose(&self, input: ProposeRequest, ctx: &UserContext, db: Arc<UserDb>, session: String)
         -> Result<Value, &'static str> {
+        let as_avatar = input.as_avatar;
         let (home, user, epoch) = (self.home_dir.clone(), ctx.user_id.clone(), ctx.credential_epoch);
         // F6fb item 8: an adoption adds a live employee, so the licence cap
         // (read as `agents.create` and the restore RPCs read it) applies.
@@ -378,6 +382,14 @@ impl MethodHandler {
         let exists = self.registry.read().await.get(&prepared.label).is_some();
         let present = exists || !matches!(std::fs::symlink_metadata(agents_dir.join(&prepared.label)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound);
+        if as_avatar && present {
+            let Some(owner) = &owner else { return Err(BINDING_INVALID) };
+            if db.avatar_agent(owner).map_err(|_| STORE_UNAVAILABLE)?.as_deref() != Some(prepared.label.as_str())
+                || !duduclaw_core::agent_seats::resolve_agent_seat(&home, &prepared.label)
+                    .map_err(|_| STORE_UNAVAILABLE)?.is_some_and(|seat| seat.is_avatar_exempt()) {
+                return Err(LABEL_TAKEN);
+            }
+        }
         let created = match (&owner, present) {
             (Some(owner), true) => {
                 let (home, agents_dir, label, owner) = (home.clone(), agents_dir.clone(), prepared.label.clone(), owner.clone());
@@ -388,8 +400,9 @@ impl MethodHandler {
             (None, true) => return Err(LABEL_TAKEN),
             (_, false) => {
                 if self.employee_label_taken(&prepared.label).await { return Err(LABEL_TAKEN); }
-                let frame = self.create_agent_files(
-                    json!({ "name": prepared.label, "display_name": prepared.display_name }), Some(ctx)).await;
+                let mut create = json!({ "name": prepared.label, "display_name": prepared.display_name });
+                if as_avatar { create["avatar_for_user"] = json!(owner.as_deref().ok_or(BINDING_INVALID)?); }
+                let frame = self.create_agent_files(create, Some(ctx)).await;
                 if !matches!(frame, WsFrame::Response { ok: true, .. }) {
                     warn!(agent = %prepared.label, "employee proposal: product create refused");
                     return Err(CREATE_FAILED);
@@ -400,7 +413,14 @@ impl MethodHandler {
                         // Without a marker the directory could never be
                         // proposed; remove what this call just created.
                         warn!(agent = %prepared.label, "employee proposal: creation marker not recorded");
-                        let _ = tokio::fs::remove_dir_all(agents_dir.join(&prepared.label)).await;
+                        let admission = self.acquire_seat_admission().await.map_err(|_| STORE_UNAVAILABLE)?;
+                        tokio::fs::remove_dir_all(agents_dir.join(&prepared.label)).await.map_err(|_| STORE_UNAVAILABLE)?;
+                        if as_avatar {
+                            let EmployeeBinding::Personal(member) = &prepared.binding else { return Err(BINDING_INVALID) };
+                            db.discard_absent_avatar_under(member.as_str(), &prepared.label, &admission)
+                                .map_err(|_| STORE_UNAVAILABLE)?;
+                        }
+                        drop(admission);
                         let _ = self.registry.write().await.scan().await;
                         return Err(error);
                     }
@@ -794,6 +814,9 @@ fn prepare_propose(home: &Path, db: &UserDb, proof: Option<&MigrationConfirmatio
 fn prepare_propose_capped(home: &Path, db: &UserDb, proof: Option<&MigrationConfirmationSession>, user: &str,
     input: ProposeRequest, now: i64, agent_cap: usize) -> Result<Prepared, &'static str> {
     authorize_step_up(proof, user, &input.csrf_token, now)?;
+    if input.as_avatar && (input.binding_kind != "personal" || input.adoption_request_id.is_some()) {
+        return Err(BINDING_INVALID);
+    }
     if !valid_label(&input.label) { return Err(LABEL_INVALID); }
     if input.adoption_request_id.is_some() { return prepare_adoption(home, user, input, now, agent_cap); }
     // SR2 finding 6: the request path's apply.db writer lock, held across

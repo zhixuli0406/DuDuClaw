@@ -3781,7 +3781,7 @@ async fn rm159_closed_owners_require_a_fresh_snapshot_card_before_any_send_or_de
                     }
                 };
                 let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                    tokio::join!(pending.execute_native(args), decide)
+                    tokio::join!(pending.execute_native(args.clone()), decide)
                 }).await.expect("native confirmation must complete within fixture deadline");
                 let result = result.unwrap();
                 assert_eq!(result["isError"] == true, !approve, "{home}/{tool}/{approve}: {result}");

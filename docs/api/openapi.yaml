@@ -724,7 +724,10 @@ paths:
         rejected; they are listed in `ignored_fields` in the response.
         A seat-limit refusal is a structured error (`SeatLimitError`) that
         lists the employees currently counted against the licence
-        (every employee whose status is not `deleted`; archived ones count).
+        (non-deleted employees except verified Personal avatars of active member Owners; archived ones count).
+        An Admin may supply `avatar_for_user` to create a new Personal AI,
+        Owner binding and unique avatar assignment together, even when ordinary
+        seats are full. Existing employees cannot be converted through this field.
         The seat check and the creation are one step: the check runs under a
         cross-process seat admission lock shared with template creation,
         `agents.unarchive`, MCP `create_agent` and the pack importer, held
@@ -741,6 +744,9 @@ paths:
                 name:
                   type: string
                   description: Agent name (lowercase alphanumeric + hyphens)
+                avatar_for_user:
+                  type: string
+                  description: Active member ID for a new Personal avatar (Admin-only; the member must have no avatar)
                 display_name:
                   type: string
                 role:
@@ -3343,7 +3349,8 @@ components:
         (`agents.create`, `templates.create_agent`, `agents.unarchive`;
         `templates.apply` returns it under `seat_limit` with
         `warning: seat_limit`). Seat holders are every employee whose
-        `[agent] status` is not `deleted`; archived employees and employees
+        `[agent] status` is not `deleted`, excluding verified Personal avatars
+        of active member Owners. Archived employees and employees
         whose `agent.toml` cannot be read (`status: unreadable`) count.
         These RPCs are Admin-only; the holder list is not given to AI
         callers (MCP `create_agent` reports only the cap and the number of

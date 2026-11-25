@@ -37,7 +37,7 @@ Creating an AI employee directly is not possible in protected mode; every employ
 
 ### Who sees a Personal employee's data
 
-Conversations, execution records, memory, configuration files, the employee's Wiki, task content, files and approval content belong to the owner. Managers do not gain access through the people they manage. An Admin who is not the owner can read this data only after re-verifying with password and two-factor code (valid for 5 minutes), and every read is recorded with the Admin, the employee, the owner and the data category. Cross-employee lists and searches leave these employees out, and other AI employees cannot change, remove or read a Personal employee's settings, skills, Wiki or mailbox.
+Admins can read a member's currently assigned AI avatar conversations and memory directly, without an extra password or TOTP check. This includes conversation lists, conversation/memory search and their live updates. Every such Admin read records who read it, the avatar, its member and the operation; if the audit cannot be written, access is refused. Other members gain no access. A Personal employee that is not currently an avatar still requires the five-minute password + TOTP proof and `step_up_csrf`. Removing the avatar assignment, losing its active owner binding, or being unable to read avatar state restores those stricter rules immediately. Writes, conversation restore, delegation, settings, files and Wiki access keep their existing rules. Managers and other AI employees retain their existing Personal-employee restrictions.
 
 ## Retire, restore, adopt, purge and release
 
@@ -73,7 +73,7 @@ Recording is gated until the host proves that Chromium starts inside the helper 
 
 - On Personal employees, old schedules and reminders without a recorded creator stop when they fire. The owner can create them again.
 - Background work approved before this version needs a new Admin approval; one request is filed automatically.
-- Admins lose implicit access to other people's Personal employees.
+- Admin access to other people's Personal employees remains restricted, except for the audited avatar conversation/memory reads above.
 - Live log tail is unavailable while hidden Personal employees exist.
 - Discovery requests filed before the upgrade are not visible to the employee (Admins still see them).
 - Recording is off by default.

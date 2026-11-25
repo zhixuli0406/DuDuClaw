@@ -20,6 +20,15 @@ beforeEach(() => {
 });
 
 describe('UsersPage', () => {
+  it('shows authoritative seats separately from exempt avatars', async () => {
+    mockWsClient.call.mockImplementation((method: string) => Promise.resolve(method === 'license.status'
+      ? { seats_used: 5, seat_limit: 5, avatars_exempt: 2 }
+      : { users: [], departments: [], agents: [] }));
+    renderWithProviders(<UsersPage />);
+    expect(await screen.findByText('AI employee seats: 5 / 5 · AI avatars: 2')).toBeInTheDocument();
+    expect(screen.getByText('AI avatars do not use employee seats')).toBeInTheDocument();
+  });
+
   it('renders the users heading', () => {
     renderWithProviders(<UsersPage />);
 

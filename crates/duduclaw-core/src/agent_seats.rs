@@ -7,14 +7,16 @@
 //!
 //! The rule: an employee directory under `<home>/agents/` with an
 //! `agent.toml` holds a seat unless its `[agent] status` is exactly
-//! `"deleted"`. Archived employees still hold one (they can be restored at
+//! `"deleted"` or it is a verified Personal avatar of an active Owner.
+//! A protected grant is bound to the employee incarnation, never a profile flag.
+//! Archived employees still hold one (they can be restored at
 //! any time). The dashboard soft-delete keeps the directory on disk, so
 //! deleted employees are still found here, reported, and skipped.
 //!
 //! Fail closed: an `agent.toml` that cannot be read or parsed, or whose
 //! status is not a string, counts as a seat holder with status
 //! [`UNREADABLE_STATUS`]. Only a status this module can read as `"deleted"`
-//! frees a seat.
+//! frees a seat without validated avatar authority.
 //!
 //! The scan reads the files on disk, not the gateway's in-memory registry:
 //! the registry leaves out deleted employees and anything that fails to load,
@@ -101,6 +103,9 @@ pub struct AgentSeat {
     holds_seat: bool,
     /// Decided from the full, raw status.
     archived: bool,
+    avatar_exempt: bool,
+    deleted: bool,
+    avatar_eligible: bool,
 }
 
 impl AgentSeat {
@@ -112,6 +117,9 @@ impl AgentSeat {
             name: None,
             holds_seat: true,
             archived: false,
+            avatar_exempt: false,
+            deleted: false,
+            avatar_eligible: false,
         }
     }
 
@@ -120,6 +128,8 @@ impl AgentSeat {
         self.holds_seat
     }
 
+    pub fn is_avatar_exempt(&self) -> bool { self.avatar_exempt }
+
     /// Whether the raw status is exactly `"archived"`.
     pub fn is_archived(&self) -> bool {
         self.archived
@@ -127,7 +137,7 @@ impl AgentSeat {
 
     /// Whether the raw status is exactly `"deleted"`.
     pub fn is_deleted(&self) -> bool {
-        !self.holds_seat
+        self.deleted
     }
 }
 
@@ -166,6 +176,9 @@ pub fn parse_seat(id: &str, agent_toml: &str) -> AgentSeat {
         name,
         holds_seat,
         archived,
+        avatar_exempt: false,
+        deleted: !holds_seat,
+        avatar_eligible: matches!(text("status").as_deref(), Some("active" | "paused" | "terminated")),
     }
 }
 
@@ -177,7 +190,7 @@ pub fn parse_seat(id: &str, agent_toml: &str) -> AgentSeat {
 /// directories without an `agent.toml`. A missing `agents/` directory is an
 /// empty list. A listing error is `Err` so callers can fail closed; an entry
 /// that cannot be inspected is reported as an unreadable seat holder.
-pub fn scan_agent_seats(home: &Path) -> io::Result<Vec<AgentSeat>> {
+fn scan_profiles(home: &Path) -> io::Result<Vec<AgentSeat>> {
     let entries = match std::fs::read_dir(home.join("agents")) {
         Ok(entries) => entries,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -210,8 +223,78 @@ pub fn scan_agent_seats(home: &Path) -> io::Result<Vec<AgentSeat>> {
     Ok(out)
 }
 
+/// Authoritative exemption predicate. No profile flag participates. One active
+/// member must own this Personal AI, be its only bound member, and be the only
+/// account naming it as avatar (including inactive accounts). SQL errors grant
+/// no exemptions; collect the entire result before applying any of it.
+pub fn avatar_exemptions_in(conn: &rusqlite::Connection) -> rusqlite::Result<std::collections::BTreeSet<String>> {
+    let mut stmt = conn.prepare("SELECT p.agent_name, g.nonce FROM isolation_personal_agents p
+        JOIN avatar_seat_grants g ON g.agent_name = p.agent_name AND g.owner_user_id = p.owner_user_id
+        JOIN google_employee_incarnations i ON i.agent_id = p.agent_name AND i.nonce = g.nonce
+        JOIN users u ON u.id = p.owner_user_id AND u.status = 'active'
+            AND u.avatar_agent_id = p.agent_name
+        WHERE (SELECT COUNT(*) FROM users a WHERE a.avatar_agent_id = p.agent_name) = 1
+        AND (SELECT COUNT(*) FROM user_agent_bindings b WHERE b.agent_name = p.agent_name) = 1
+        AND EXISTS(SELECT 1 FROM user_agent_bindings b WHERE b.agent_name = p.agent_name
+            AND b.user_id = u.id AND b.access_level = 'owner')")?;
+    let candidates = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut exempt = std::collections::BTreeSet::new();
+    for (agent, nonce) in candidates {
+        // A durable retirement marker also revokes a nonce whose SQLite
+        // rotation failed. Never grant from the stale database row alone.
+        if crate::employee_incarnation::read(conn, &agent)?.as_deref() == Some(nonce.as_str()) { exempt.insert(agent); }
+    }
+    Ok(exempt)
+}
+
+/// Restore preflight only, after resolving one unambiguous archived profile
+/// under admission. The published active profile must still be recounted.
+pub fn archived_avatar_will_exempt(home: &Path, seat: &AgentSeat) -> bool {
+    if !seat.is_archived() { return false; }
+    let Some(name) = &seat.name else { return false; };
+    crate::private_sqlite::open(home, "users.db", crate::private_sqlite::Access::ReadOnly)
+        .ok().flatten().and_then(|conn| avatar_exemptions_in(&conn).ok())
+        .is_some_and(|names| names.contains(name))
+}
+
+fn apply_avatar_exemptions(seats: &mut [AgentSeat], exempt: &std::collections::BTreeSet<String>) {
+    let mut names = std::collections::BTreeMap::new();
+    for seat in seats.iter() {
+        if let Some(name) = &seat.name { *names.entry(name.clone()).or_insert(0usize) += 1; }
+    }
+    for seat in seats {
+        // Unknown/unreadable/deleted/archived profiles never qualify. Duplicate
+        // registry names cannot use the same authority to free two seats.
+        seat.avatar_exempt = seat.avatar_eligible && seat.name.as_ref().is_some_and(|name|
+            names.get(name) == Some(&1) && exempt.contains(name));
+        if seat.avatar_exempt { seat.holds_seat = false; }
+    }
+}
+
+/// A single database snapshot supplies all exemptions. Missing, insecure or
+/// unreadable identity state means every non-deleted profile is counted.
+pub fn scan_agent_seats(home: &Path) -> io::Result<Vec<AgentSeat>> {
+    let mut seats = scan_profiles(home)?;
+    if let Ok(Some(conn)) = crate::private_sqlite::open(home, "users.db", crate::private_sqlite::Access::ReadOnly) {
+        if let Ok(exempt) = avatar_exemptions_in(&conn) { apply_avatar_exemptions(&mut seats, &exempt); }
+    }
+    Ok(seats)
+}
+
+/// Recount using the caller's pending users.db transaction, not a second
+/// connection that would still see the old committed avatar assignment.
+pub fn seat_holders_in(home: &Path, conn: &rusqlite::Connection) -> io::Result<Vec<AgentSeat>> {
+    let mut seats = scan_profiles(home)?;
+    if let Ok(exempt) = avatar_exemptions_in(conn) { apply_avatar_exemptions(&mut seats, &exempt); }
+    Ok(seats.into_iter().filter(AgentSeat::holds_seat).collect())
+}
+
+pub const AVATAR_SEAT_REFUSAL: &str = "此變更會超過 AI 員工名額上限，未儲存。請先刪除不再使用的 AI 員工或增加授權名額；封存仍佔名額。";
+
 /// The employees that count against the licence: every employee whose status
-/// is not `"deleted"` (archived and unreadable ones included).
+/// is not `"deleted"`, excluding verified Personal avatars (archived and
+/// unreadable profiles still count).
 pub fn seat_holders(home: &Path) -> io::Result<Vec<AgentSeat>> {
     Ok(scan_agent_seats(home)?
         .into_iter()
@@ -345,6 +428,20 @@ pub struct SeatAdmission {
 }
 
 impl SeatAdmission {
+    /// Recount the published filesystem artifact while admission is still held.
+    pub fn recount(&self, max: usize) -> Result<(), String> {
+        let used = seat_holders(&self.home).map_err(|e| e.to_string())?.len();
+        if max != 0 && used > max { return Err(AVATAR_SEAT_REFUSAL.into()); }
+        Ok(())
+    }
+
+    /// Validate the actual pending state before committing an identity change.
+    pub fn recount_in(&self, conn: &rusqlite::Connection, max: usize) -> Result<(), String> {
+        let used = seat_holders_in(&self.home, conn).map_err(|e| e.to_string())?.len();
+        if max != 0 && used > max { return Err(AVATAR_SEAT_REFUSAL.into()); }
+        Ok(())
+    }
+
     /// Take the lock, waiting at most [`SEAT_ADMISSION_WAIT`]. Blocking, for
     /// synchronous callers; async callers use [`Self::acquire_async`].
     pub fn acquire(home: &Path) -> io::Result<Self> {
@@ -765,3 +862,7 @@ mod tests {
         assert_eq!(v[2]["id"], "cx");
     }
 }
+
+#[cfg(test)]
+#[path = "agent_seats_avatar_tests.rs"]
+mod avatar_tests;

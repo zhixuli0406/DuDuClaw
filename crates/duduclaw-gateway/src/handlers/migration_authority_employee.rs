@@ -103,6 +103,7 @@ pub(crate) fn save_confirmed_receipt(home:&Path,item:&ConfirmationItem,receipt:&
 /// nor the confirmed row.
 pub(crate) fn save_confirmed_receipt_gated(home:&Path,item:&ConfirmationItem,receipt:&Receipt,
     gate:Option<&lifecycle::UsersGate<'_>>)->Result<()> {
+        let admission = duduclaw_core::agent_seats::SeatAdmission::acquire(home).map_err(|_|Error::Storage)?;
         let spec=allocation::specification(item).map_err(|_|Error::Invalid)?;
         // The root copies the principal from this confirmed proposal only.
         if receipt.binding!=item.binding || receipt.label!=spec.label || receipt.principal_binding!=spec.binding {return Err(Error::Stale);}
@@ -124,7 +125,7 @@ pub(crate) fn save_confirmed_receipt_gated(home:&Path,item:&ConfirmationItem,rec
             _ => None,
         };
         if let (Some(owner),false)=(personal_owner,receipt.disabled) {
-            lifecycle::record_personal_mirror_gated(home,&receipt.label,owner,gate).map_err(lifecycle_error)?;
+            lifecycle::record_personal_mirror_under(home,&receipt.label,owner,gate,&admission).map_err(lifecycle_error)?;
         } else if let Some(gate)=gate {
             lifecycle::run_users_gate(home,gate).map_err(lifecycle_error)?;
         }
@@ -142,11 +143,12 @@ pub(crate) fn save_confirmed_receipt_gated(home:&Path,item:&ConfirmationItem,rec
         tx.commit().map_err(|_|Error::Storage)?;
         if let (Some(owner),true)=(personal_owner,receipt.disabled) {
             // Another owner's mirror (Stale) is not this allocation's to remove.
-            match lifecycle::remove_personal_mirror(home,&receipt.label,owner) {
+            match lifecycle::remove_personal_mirror_under(home,&receipt.label,owner,&admission) {
                 Ok(_)|Err(LifecycleError::Stale)=>{}
                 Err(e)=>return Err(lifecycle_error(e)),
             }
         }
+        admission.recount(0).map_err(|_| Error::Storage)?;
         Ok(())
 }
 fn label_hold_error(e:crate::isolation_label_stores::GateRefusal)->Error {

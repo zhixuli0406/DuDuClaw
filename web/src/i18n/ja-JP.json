@@ -1144,7 +1144,7 @@
   "agents.create.personaPlaceholder": "例：あなたは当社のサポート担当です。製品の質問に、簡潔で丁寧に答えてください。",
   "agents.seatLimit.title": "AI スタッフの枠がいっぱいです",
   "agents.seatLimit.summary": "ライセンスの上限は {max} 人で、現在 {current} 人が枠を使っています。",
-  "agents.seatLimit.hint": "アーカイブしたスタッフも枠を使います。削除すると枠が空きます。",
+  "agents.seatLimit.hint": "条件を満たす AI 分身は枠を使いません。アーカイブしたスタッフも枠を使います。削除すると枠が空きます。",
   "agents.seatLimit.listLabel": "現在枠を使っている AI スタッフ",
   "agents.seatLimit.status.active": "稼働中",
   "agents.seatLimit.status.paused": "一時停止",
@@ -11729,5 +11729,8 @@
   "googleAuthorization.status.done": "続行済み",
   "googleAuthorization.status.stopped": "停止しました。元の会話で再試行してください",
   "googleAuthorization.status.expired": "期限切れ",
-  "googleAuthorization.purpose.workspace": "用途：Google Workspace サービスとドライブの読み取り。"
+  "googleAuthorization.purpose.workspace": "用途：Google Workspace サービスとドライブの読み取り。",
+  "agents.seats.summary": "AI 従業員枠：{used}／{limit}・AI 分身：{avatars}",
+  "agents.seats.avatarExempt": "AI 分身は従業員枠を消費しません",
+  "agents.seats.avatarConditions": "有効なメンバー本人が所有する Personal AI が１人につき１体だけ対象です。共有 AI、操作権限のみの割り当て、アーカイブ済み AI は枠を消費します。"
 }

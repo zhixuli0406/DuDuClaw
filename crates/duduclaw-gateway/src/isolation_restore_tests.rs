@@ -343,6 +343,42 @@ fn restore_refuses_after_90_days() {
     assert!(in_quarantine(home));
 }
 
+/// D5: only the protected kind saved before tombstoning survives restore.
+#[test]
+fn avatar_restore_when_full_preserves_verified_provenance() {
+    let f = fixture();
+    let home = f.home();
+    let item = applied(home, 1, LABEL, &personal(&f.alice));
+    let root = receipt(&item, 1, false);
+    save(home, &item, &root).unwrap();
+    write_tree(home, LABEL);
+    std::fs::write(home.join("agents").join(LABEL).join("agent.toml"),
+        format!("[agent]\nname='{LABEL}'\nstatus='active'\n")).unwrap();
+    // A normal Personal allocation cannot itself mint the avatar kind.
+    {
+        let mut conn = Connection::open(home.join(USERS_DB)).unwrap();
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM avatar_seat_grants", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0);
+        let tx = conn.transaction().unwrap();
+        duduclaw_auth::avatar_seats::grant_personal_incarnation(&tx, LABEL, &f.alice).unwrap();
+        tx.commit().unwrap();
+    }
+    f.users.set_avatar_as(&f.bob, &f.alice, Some(LABEL)).unwrap();
+    assert!(duduclaw_core::agent_seats::seat_holders(home).unwrap().is_empty());
+    tombstone_employee(home, LABEL, root.employee,
+        &TombstoneEnv { actor: &f.bob, runs: &NoLiveRuns, now: now() }).unwrap();
+    assert_eq!(row(home, 0).principal_snapshot["avatar_seat_grant"], true);
+    sql(home, APPLY_DB, "UPDATE employee_quarantine SET store_marks=?1", &[&marks().to_string()]);
+    write_tree(home, "ordinary");
+    let mut fx = fakes(&root);
+    fx.cap = 1;
+    let request = file(&f, &fx).unwrap();
+    approve(home, &fx.env(), &request.request_id, &f.bob).unwrap();
+    let seats = duduclaw_core::agent_seats::scan_agent_seats(home).unwrap();
+    assert_eq!(seats.iter().filter(|s| s.holds_seat()).count(), 1);
+    assert_eq!(seats.iter().filter(|s| s.is_avatar_exempt()).count(), 1);
+}
+
 /// Q6: only a `sealed` row is restorable.
 #[test]
 fn restore_refuses_unsealed_or_oversize() {
@@ -366,6 +402,7 @@ fn restore_rechecks_quota() {
     let (_, root) = tombstoned(&f);
     let team = applied(home, 2, "team", &[("binding_kind", "shared"), ("tenant_id", f.tenant.as_str())]);
     save(home, &team, &receipt(&team, 2, false)).unwrap();
+    write_tree(home, "team");
     let mut fx = fakes(&root);
     let request = file(&f, &fx).unwrap();
     fx.cap = 1;
@@ -707,6 +744,7 @@ fn f6fa_quota_recounted_in_apply_tx() {
         if point == HookPoint::BeforeTx1 {
             let team = applied(&path, 2, "team", &[("binding_kind", "shared"), ("tenant_id", tenant.as_str())]);
             save(&path, &team, &receipt(&team, 2, false)).unwrap();
+            write_tree(&path, "team");
         }
         false
     });

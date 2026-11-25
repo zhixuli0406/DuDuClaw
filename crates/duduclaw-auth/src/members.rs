@@ -76,8 +76,15 @@ impl NewMember {
 
 impl UserDb {
     pub fn create_member_at_epoch(&self, member: &NewMember, actor: &str, epoch: u64) -> Result<CreatedMember, &'static str> {
-        let _authority = self.google_authority_write().map_err(|_| "Google authority unavailable")?;
+        self.create_member_at_epoch_under(member, actor, epoch, None)
+    }
+
+    pub fn create_member_at_epoch_under(&self, member: &NewMember, actor: &str, epoch: u64,
+        limit: crate::avatar_seats::SeatLimit<'_>) -> Result<CreatedMember, &'static str> {
         member.validate()?;
+        let seats = crate::avatar_seats::SeatChange::begin(self, limit).map_err(|_| "member_storage_unavailable")?;
+        // Lock order: seat admission -> authority writer lease -> users.db transaction.
+        let _authority = self.google_authority_write().map_err(|_| "Google authority unavailable")?;
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| "member_storage_unavailable")?;
@@ -142,6 +149,7 @@ impl UserDb {
         bump_acl_generation(&tx).map_err(|_| "member_storage_unavailable")?;
         let user = load_user(&tx, &id).map_err(|_| "member_storage_unavailable")?
             .ok_or("member_storage_unavailable")?;
+        seats.check(&tx).map_err(|_| "member_storage_unavailable")?;
         tx.commit().map_err(|_| "member_storage_unavailable")?;
         Ok(CreatedMember { user, invitation })
     }

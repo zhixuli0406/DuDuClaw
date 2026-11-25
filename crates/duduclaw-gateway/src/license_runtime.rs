@@ -1501,7 +1501,7 @@ pub fn agent_cap_text(max: usize, tier: Option<&str>) -> String {
 /// The note appended to an agent-cap refusal: deleted employees no longer
 /// count, archived ones still do (RM-149).
 pub const AGENT_SEAT_NOTE: &str =
-    "已刪除的 AI 員工不佔名額；已封存的 AI 員工仍佔名額，刪除後即釋出。";
+    "AI 分身不佔名額（須為啟用成員本人擁有的 Personal AI）；已刪除的 AI 員工不佔名額，已封存的 AI 員工仍佔名額，刪除後即釋出。";
 
 /// Keep URLs separate from the seat explanation at every refusal call site.
 pub fn with_agent_seat_note(message: &str, separator: &str) -> String {

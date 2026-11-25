@@ -816,8 +816,8 @@ refusal names the reason (HTML comment, invisible characters, hidden content,
 prompt-injection phrasing) without quoting the text. Arguments the tool does
 not read are not rejected; the reply lists them under "Ignored arguments (no
 effect)" (at most 20 names, each cut to 64 characters, then "… and N more").
-The licence seat check counts every employee whose status is not `deleted`
-(archived employees still count); when it refuses, the reply gives only the
+The licence seat check excludes deleted employees and verified Personal avatars of active member Owners
+(one per member; archived employees still count); when it refuses, the reply gives only the
 limit and the number of seats in use — it does not list who holds them (an
 administrator sees that list in the dashboard). The check and the creation are
 one step under a lock shared with the dashboard and the pack importer, so

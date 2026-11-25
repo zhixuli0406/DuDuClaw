@@ -1,3 +1,4 @@
+import { AgentSeatSummary } from '@/components/shared/AgentSeatSummary';
 import { AdminMfa } from '@/components/mfa/AdminMfa';
 import { useCallback, useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
@@ -189,6 +190,8 @@ export function UsersPage() {
           </Button>
         </div>
       </div>
+
+      {isAdmin && <AgentSeatSummary refreshKey={users} />}
 
       {isAdmin && (missingPrimaryCount > 0 || (repairCandidates?.excluded_personal_count ?? 0) > 0) && <div className="flex flex-wrap items-center gap-3 rounded-lg border border-surface-border bg-card px-4 py-3 text-sm">
         <span>{intl.formatMessage({ id: 'users.primary.missing' }, { count: missingPrimaryCount })}</span>

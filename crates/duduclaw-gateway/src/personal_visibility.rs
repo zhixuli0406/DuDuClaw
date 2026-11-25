@@ -17,7 +17,10 @@
 //!   step-up (the migration/isolation dashboard proof) and writes an audit
 //!   row before anything is read; everybody else is refused. Cross-agent
 //!   listings hide the Personal employees the caller does not own
-//!   ([`hidden_from`]), so listing and access agree.
+//!   ([`hidden_from`]), so listing and access agree. D4 installs separate,
+//!   audited request grants for current-avatar conversation/memory reads;
+//!   every use rechecks live avatar authority. Generic hidden sets and
+//!   delegation remain owner-only.
 //! - **Cross-agent management MCP tools** call [`management_refusal`]: an AI
 //!   caller never manages another person's Personal employee; human owner
 //!   actions go through the dashboard.
@@ -84,6 +87,10 @@ use crate::fs_safe::sqlite::{Access, open_existing};
 
 const USERS_DB: &str = "users.db";
 
+#[path = "personal_avatar_reads.rs"]
+mod avatar_reads;
+pub(crate) use avatar_reads::{avatar_read_category, audit_avatar_read, current_admin_avatar_member};
+
 /// P1g: the ACL decision installed into `duduclaw_auth::acl` at gateway boot.
 /// `true` = `user_id` must not reach `agent` through any ACL predicate: a
 /// Personal employee recorded for another owner, or a users.db that cannot
@@ -104,6 +111,8 @@ struct RequestScope {
     /// P1g: `(user, employee)` pairs an audited Admin step-up admitted during
     /// THIS request (`personal_data_gate` records each successful break-glass).
     break_glass: std::cell::RefCell<BTreeSet<(String, String)>>,
+    /// D4 grants are separate: re-read avatar authority on every use.
+    avatar_reads: std::cell::RefCell<std::collections::BTreeMap<(String, String), String>>,
     /// P1h (N2): the owner map read once for this request, per home. A
     /// request answers from one ownership snapshot; [`invalidate_owner_cache`]
     /// drops it (a lifecycle write inside the request).
@@ -137,6 +146,20 @@ pub fn break_glass_granted(user: &str, agent: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Only an audited, allowlisted read may install this request-local grant.
+pub(crate) fn record_avatar_read(user: &str, agent: &str, member: &str) {
+    let _ = REQUEST.try_with(|scope| scope.avatar_reads.borrow_mut()
+        .insert((user.to_owned(), agent.to_owned()), member.to_owned()));
+}
+
+/// Reassignment, unset, inactive membership or unreadable authority revokes
+/// an avatar grant even inside an in-flight request. Never cached.
+pub(crate) fn avatar_read_granted(home: &Path, user: &str, agent: &str) -> bool {
+    let member = REQUEST.try_with(|scope| scope.avatar_reads.borrow()
+        .get(&(user.to_owned(), agent.to_owned())).cloned()).ok().flatten();
+    member.is_some_and(|member| current_admin_avatar_member(home, user, agent).as_deref() == Some(member.as_str()))
+}
+
 /// P1g: the restriction object (`home` fixed at boot; protected mode read
 /// on every call so an unprotected process never touches users.db).
 pub struct AclRestriction {
@@ -159,7 +182,9 @@ impl AclRestriction {
 
 impl duduclaw_auth::acl::PersonalRestriction for AclRestriction {
     fn denies(&self, user_id: &str, agent: &str) -> bool {
-        acl_denies(&self.home, self.protected(), user_id, agent) && !break_glass_granted(user_id, agent)
+        acl_denies(&self.home, self.protected(), user_id, agent)
+            && !break_glass_granted(user_id, agent)
+            && !avatar_read_granted(&self.home, user_id, agent)
     }
 
     /// Delegation never uses a break-glass grant (owner only).

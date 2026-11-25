@@ -392,26 +392,38 @@ impl crate::expert::install::InstallCtx {
     /// run re-checks under the admission it already holds. A dry run only
     /// checks.
     pub async fn ensure_quota(&self, adding: usize) -> Result<()> {
-        let freed = self
-            .freed()
-            .map(|f| {
-                f.iter()
-                    .filter(|id| self.home.join("agents").join(id.as_str()).join("agent.toml").is_file())
-                    .count()
-            })
-            .unwrap_or(0);
+        let freed = || -> Result<usize> {
+            let holders = super::quota::seat_holders(&self.home).map_err(|e|
+                super::import_error::import_err("import.quota_unverifiable", serde_json::json!({}), e.to_string()))?;
+            Ok(holders.iter().filter(|seat| self.freed().is_some_and(|ids| ids.contains(&seat.id))).count())
+        };
         if self.dry_run {
-            return super::quota::ensure(&self.home, self.agent_cap, adding, freed).await;
+            return super::quota::ensure(&self.home, self.agent_cap, adding, freed()?).await;
         }
         let held = self.seat_admission.lock().unwrap_or_else(|p| p.into_inner()).take();
         let admission = match held {
-            Some(admission) => {
-                super::quota::check_under(&admission, self.agent_cap, adding, freed).await?;
-                admission
-            }
-            None => super::quota::admit(&self.home, self.agent_cap, adding, freed).await?,
+            Some(admission) => admission,
+            None => duduclaw_core::agent_seats::SeatAdmission::acquire_async(&self.home).await
+                .map_err(|e| super::import_error::import_err("import.quota_unverifiable", serde_json::json!({}), e.to_string()))?,
+        };
+        // Only actual seat holders can be subtracted, and only after locking.
+        // An exempt avatar being replaced never frees an ordinary seat.
+        let result = match freed() {
+            Ok(freed) => super::quota::check_under(&admission, self.agent_cap, adding, freed).await,
+            Err(error) => Err(error),
         };
         *self.seat_admission.lock().unwrap_or_else(|p| p.into_inner()) = Some(admission);
+        result
+    }
+
+    pub async fn recount_seats(&self) -> Result<()> {
+        if self.dry_run { return Ok(()); }
+        let max = super::quota::import_cap(&self.home, self.agent_cap).await;
+        let held = self.seat_admission.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(admission) = held.as_ref() {
+            admission.recount(max).map_err(|e|
+                super::import_error::import_err("import.quota_exceeded", serde_json::json!({"max":max}), e))?;
+        }
         Ok(())
     }
 

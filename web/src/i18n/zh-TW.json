@@ -1144,7 +1144,7 @@
   "agents.create.personaPlaceholder": "例如：你是公司的客服，負責回答產品問題，語氣親切、回答簡短。",
   "agents.seatLimit.title": "AI 員工名額已滿",
   "agents.seatLimit.summary": "授權最多 {max} 位，目前有 {current} 位佔用名額。",
-  "agents.seatLimit.hint": "已封存的員工仍佔名額；刪除之後就會釋出名額。",
+  "agents.seatLimit.hint": "符合條件的 AI 分身不佔名額。已封存的員工仍佔名額；刪除之後就會釋出名額。",
   "agents.seatLimit.listLabel": "目前佔用名額的 AI 員工",
   "agents.seatLimit.status.active": "啟用中",
   "agents.seatLimit.status.paused": "暫停",
@@ -11729,5 +11729,8 @@
   "googleAuthorization.status.done": "已續行",
   "googleAuthorization.status.stopped": "已停止，請回原對話重試",
   "googleAuthorization.status.expired": "已過期",
-  "googleAuthorization.purpose.workspace": "用途：Google Workspace 服務與雲端硬碟讀取。"
+  "googleAuthorization.purpose.workspace": "用途：Google Workspace 服務與雲端硬碟讀取。",
+  "agents.seats.summary": "AI 員工名額：{used}／{limit}・AI 分身：{avatars}",
+  "agents.seats.avatarExempt": "AI 分身不佔名額",
+  "agents.seats.avatarConditions": "須為啟用成員本人擁有的個人 AI，且一人一分身；一般員工或僅有操作權限的 AI 仍佔名額，封存也佔名額。"
 }

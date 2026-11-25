@@ -483,12 +483,15 @@ impl MethodHandler {
             }
             created.push(names[index].clone());
             for user in &users {
-                let response = self.handle_users_bind_agent(json!({"user_id":user,"agent_name":names[index],"access_level":"operator"}),caller).await;
+                let response = self.bind_user_agent_under(json!({"user_id":user,"agent_name":names[index],"access_level":"operator"}),caller,&batch_admission).await;
                 if !matches!(response,WsFrame::Response{ok:true,..}) {
                     return Ok(json!({"success":false,"agents":created,"warning":"binding_failed"}));
                 }
             }
             after_member(index).await;
+        }
+        if let Err(error) = batch_admission.recount(self.effective_agent_cap().await) {
+            return Ok(json!({"success":false,"agents":created,"warning":"seat_limit","error":error}));
         }
         drop(batch_admission);
         Ok(json!({"success":true,"agents":created}))

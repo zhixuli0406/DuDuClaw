@@ -1145,7 +1145,7 @@
   "agents.create.personaPlaceholder": "For example: You are our customer support agent. Answer product questions briefly and kindly.",
   "agents.seatLimit.title": "No AI staff seats left",
   "agents.seatLimit.summary": "Your license allows {max}; {current} seats are in use.",
-  "agents.seatLimit.hint": "Archived employees still hold a seat. Deleting an employee frees its seat.",
+  "agents.seatLimit.hint": "Eligible AI avatars do not use seats. Archived employees still hold a seat. Deleting an employee frees its seat.",
   "agents.seatLimit.listLabel": "AI staff currently holding a seat",
   "agents.seatLimit.status.active": "Active",
   "agents.seatLimit.status.paused": "Paused",
@@ -11729,5 +11729,8 @@
   "googleAuthorization.status.done": "Continued",
   "googleAuthorization.status.stopped": "Stopped; retry in the original conversation",
   "googleAuthorization.status.expired": "Expired",
-  "googleAuthorization.purpose.workspace": "Purpose: Google Workspace services and Google Drive reading."
+  "googleAuthorization.purpose.workspace": "Purpose: Google Workspace services and Google Drive reading.",
+  "agents.seats.summary": "AI employee seats: {used} / {limit} · AI avatars: {avatars}",
+  "agents.seats.avatarExempt": "AI avatars do not use employee seats",
+  "agents.seats.avatarConditions": "Only one Personal AI owned by each active member qualifies. Shared or operator-only assignments and archived AI still use seats."
 }

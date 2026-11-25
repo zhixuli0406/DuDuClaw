@@ -80,7 +80,9 @@ impl MethodHandler {
             }
         }
 
-        if wants("artifacts") {
+        let avatar_scope = agent_id.is_some_and(|agent|
+            crate::personal_visibility::avatar_read_granted(&self.home_dir, &live.user_id, agent));
+        if wants("artifacts") && !avatar_scope {
             let found = crate::search_index::search_artifacts(
                 &self.home_dir,
                 agent_id,
@@ -154,7 +156,7 @@ impl MethodHandler {
         }
 
         if wants("wiki") {
-            if let Some(a) = agent_id {
+            if let Some(a) = agent_id.filter(|_| !avatar_scope) {
                 let wiki_dir = self.home_dir.join("agents").join(a).join("wiki");
                 if wiki_dir.exists() {
                     let store = duduclaw_memory::WikiStore::new(wiki_dir);
@@ -189,6 +191,16 @@ impl MethodHandler {
         // v1.81 P1: an unscoped (Admin) search hides Personal employees the
         // caller does not own; a scoped one was gated at dispatch.
         if agent_id.is_none() {
+            // D4 only reveals conversation/memory hits. Never let the same
+            // request grant reveal files or employee-local wiki hits.
+            if crate::runtime_readiness::isolation_active() {
+                let hidden = match crate::personal_visibility::hidden_from(&self.home_dir, true, &live.user_id) {
+                    Ok(hidden) => hidden,
+                    Err(_) => return WsFrame::error_response("", crate::personal_visibility::OWNERSHIP_UNAVAILABLE),
+                };
+                hits.retain(|hit| hit.agent_id.as_ref().is_none_or(|agent|
+                    !hidden.contains(agent) || matches!(hit.source, crate::search_index::SOURCE_CONVERSATION | crate::search_index::SOURCE_MEMORY)));
+            }
             match self.personal_hidden_agents(&live).await {
                 Ok(hidden) if !hidden.is_empty() => hits
                     .retain(|hit| hit.agent_id.as_ref().is_none_or(|agent| !hidden.contains(agent))),
