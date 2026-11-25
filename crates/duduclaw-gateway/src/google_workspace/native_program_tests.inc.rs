@@ -695,6 +695,69 @@ fn snapshot_recipient_adapter_includes_all_headers_and_refuses_ambiguous_address
     assert!(mail_targets(&json!([{"name":"To","value":"a@example.com\r\nBcc: evil@example.com"}])).is_err());
 }
 
+#[test]
+fn confirmation_recipient_limit_counts_all_to_cc_bcc_entries() {
+    let addresses = vec!["alice@example.com"; confirmation_limits::MAX_CONFIRMATION_RECIPIENTS].join(",");
+    let mut headers = json!([{"name":"To","value":addresses}]);
+    assert_eq!(mail_targets(&headers).unwrap().len(), confirmation_limits::MAX_CONFIRMATION_RECIPIENTS);
+    for name in ["To", "Cc", "Bcc"] {
+        headers.as_array_mut().unwrap().push(json!({"name":name,"value":"last@example.com"}));
+        assert!(mail_targets(&headers).unwrap_err().to_string().contains("收件人"));
+        headers.as_array_mut().unwrap().pop();
+    }
+}
+
+#[tokio::test]
+async fn confirmation_limits_refuse_provider_data_before_card_or_mutation() {
+    let gmail = NativeCallTemplate::prepare("gmail_send_draft", &json!({"draft_id":"r1"})).unwrap();
+    for case in ["recipients", "attachments", "attachment_bytes", "subject_bytes"] {
+        let mut io = gmail_io(true);
+        match case {
+            "recipients" => io.json[1]["message"]["payload"]["headers"].as_array_mut().unwrap().push(
+                json!({"name":"To","value":vec!["last@example.com"; confirmation_limits::MAX_CONFIRMATION_RECIPIENTS].join(",")})),
+            "attachments" => io.json[1]["message"]["payload"]["parts"] = json!([{"parts":vec![json!({"filename":"a.txt","body":{"size":1}}); confirmation_limits::MAX_CONFIRMATION_ATTACHMENTS + 1]}]),
+            "attachment_bytes" => io.json[1]["message"]["payload"]["parts"][0]["filename"] = json!("x".repeat(confirmation_limits::MAX_CONFIRMATION_BYTES)),
+            _ => io.json[1]["message"]["payload"]["headers"].as_array_mut().unwrap().push(
+                json!({"name":"Subject","value":"x".repeat(confirmation_limits::MAX_CONFIRMATION_BYTES)})),
+        }
+        let result = run(&gmail, &mut io).await;
+        assert_eq!(result["isError"], true, "{case}");
+        assert!(io.snapshots.is_empty(), "{case} must fail before confirmation");
+        assert!(io.wire.iter().all(|s| s.0 == "GET"), "{case}");
+    }
+    let calendar = NativeCallTemplate::prepare("calendar_delete_event", &json!({"event_id":"e1"})).unwrap();
+    for case in ["attendees", "attendee_bytes", "title_bytes", "calendar_bytes"] {
+        let mut io = calendar_io(true);
+        match case {
+            "attendees" => io.json[0]["attendees"] = json!(vec![json!({"email":"a@example.com"}); confirmation_limits::MAX_CONFIRMATION_RECIPIENTS + 1]),
+            "attendee_bytes" => io.json[0]["attendees"][0]["displayName"] = json!("x".repeat(confirmation_limits::MAX_CONFIRMATION_BYTES)),
+            "title_bytes" => io.json[0]["summary"] = json!("x".repeat(confirmation_limits::MAX_CONFIRMATION_BYTES)),
+            _ => io.json[2]["summary"] = json!("x".repeat(confirmation_limits::MAX_CONFIRMATION_BYTES)),
+        }
+        assert_eq!(run(&calendar, &mut io).await["isError"], true, "{case}");
+        assert!(io.snapshots.is_empty(), "{case} must fail before confirmation");
+        assert!(io.wire.iter().all(|s| s.0 == "GET"), "{case}");
+    }
+}
+
+#[tokio::test]
+async fn confirmation_boundary_counts_preserve_every_fact_and_preview_marks_truncation() {
+    let gmail = NativeCallTemplate::prepare("gmail_send_draft", &json!({"draft_id":"r1"})).unwrap();
+    let mut io = gmail_io(false);
+    io.json[1]["message"]["payload"]["parts"] = json!(vec![json!({"filename":"a.txt","body":{"size":1}}); confirmation_limits::MAX_CONFIRMATION_ATTACHMENTS]);
+    io.json[1]["message"]["payload"]["body"]["data"] = json!(encode_raw_message(&"長內文🙂".repeat(2000)));
+    run(&gmail, &mut io).await;
+    assert_eq!(io.snapshots[0]["attachments"].as_array().unwrap().len(), confirmation_limits::MAX_CONFIRMATION_ATTACHMENTS);
+    assert!(io.snapshots[0]["body_preview"].as_str().unwrap().ends_with("（內文預覽已截短）"));
+    let calendar = NativeCallTemplate::prepare("calendar_delete_event", &json!({"event_id":"e1"})).unwrap();
+    let mut io = calendar_io(false);
+    io.json[0]["attendees"] = json!(vec![json!({"email":"a@example.com","displayName":"保留名稱"}); confirmation_limits::MAX_CONFIRMATION_RECIPIENTS]);
+    let attendees = io.json[0]["attendees"].clone();
+    run(&calendar, &mut io).await;
+    assert_eq!(io.snapshots[0]["attendees"], attendees);
+    assert_eq!(io.snapshots[0]["attendees"].as_array().unwrap().len(), confirmation_limits::MAX_CONFIRMATION_RECIPIENTS);
+}
+
 #[tokio::test]
 async fn calendar_conditional_delete_412_requires_a_fresh_confirmation() {
     let template = NativeCallTemplate::prepare("calendar_delete_event", &json!({"event_id":"e1"})).unwrap();

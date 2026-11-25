@@ -1570,7 +1570,7 @@ mod tests {
         ] {
             std::fs::write(home.path().join("config.toml"), config).unwrap();
             assert_eq!(native_rest_available(home.path(), None), native, "{config}");
-            for tool in ["docs_create", "docs_replace_text", "sheets_create", "sheets_update", "gmail_send_draft" | "calendar_delete_event" | "calendar_update_event"] {
+            for tool in ["docs_create", "docs_replace_text", "sheets_create", "sheets_update", "gmail_send_draft", "calendar_delete_event", "calendar_update_event"] {
                 assert_eq!(backend_supports_tool(native, tool, false), native, "{tool}");
             }
             assert!(backend_supports_tool(native, "gmail_create_draft", false));

@@ -1,4 +1,6 @@
 // Included in the private native program of each credential owner.
+use crate::google_workspace::native_confirmation as confirmation_limits;
+
 fn confirmation_error(message: String) -> GoogleApiError {
     GoogleApiError::Api { status: 403, message }
 }
@@ -22,6 +24,7 @@ fn inspect_snapshot<I: LocalIo>(io: &mut I, snapshot: &Value) -> Result<(), Goog
     io.inspect_curated(snapshot)
 }
 fn mail_targets(headers: &Value) -> Result<Vec<String>, GoogleApiError> {
+    confirmation_limits::ensure_json_size(headers).map_err(confirmation_error)?;
     let mut targets = Vec::new();
     // Refuse ambiguous/group/obsolete recipient syntax rather than omit a recipient.
     // Standard simple addresses and display-name <address> are supported.
@@ -31,6 +34,7 @@ fn mail_targets(headers: &Value) -> Result<Vec<String>, GoogleApiError> {
             let line = row["value"].as_str().ok_or_else(changed_snapshot)?;
             if line.chars().any(char::is_control) { return Err(changed_snapshot()); }
             for entry in line.split(',').filter(|s| !s.trim().is_empty()) {
+                confirmation_limits::check_recipient_count(targets.len() + 1).map_err(confirmation_error)?;
                 let entry = entry.trim();
                 let email = if let Some((_, tail)) = entry.rsplit_once('<') {
                     tail.strip_suffix('>').filter(|s| !s.contains(['<', '>'])).ok_or_else(changed_snapshot)?
@@ -42,6 +46,23 @@ fn mail_targets(headers: &Value) -> Result<Vec<String>, GoogleApiError> {
     }
     if targets.is_empty() { return Err(confirmation_error("草稿沒有有效收件人。".into())); }
     Ok(targets)
+}
+fn confirmation_attachments(payload: &Value) -> Result<Vec<GmailAttachment>, GoogleApiError> {
+    // Count and bound borrowed filenames before the existing collector copies
+    // metadata. Nested MIME parts share the same budget.
+    fn visit<'a>(node: &'a Value, names: &mut Vec<&'a str>) -> Result<(), GoogleApiError> {
+        if let Some(name) = node["filename"].as_str().filter(|s| !s.is_empty()) {
+            confirmation_limits::check_attachment_count(names.len() + 1).map_err(confirmation_error)?;
+            names.push(name);
+            confirmation_limits::ensure_json_size(names).map_err(confirmation_error)?;
+        }
+        if let Some(parts) = node["parts"].as_array() {
+            for part in parts { visit(part, names)?; }
+        }
+        Ok(())
+    }
+    visit(payload, &mut Vec::new())?;
+    Ok(collect_attachments(payload))
 }
 async fn mailbox_account<I: LocalIo>(io: &mut I, template: &NativeCallTemplate) -> Result<String, GoogleApiError> {
     let profile = google_request(io, template, reqwest::Method::GET, &format!("{GMAIL_BASE}/profile"), &[], None).await?;
@@ -82,8 +103,9 @@ async fn confirmed_effect<I: LocalIo>(io: &mut I, template: &NativeCallTemplate)
                 "content_hash":hash, "from":header_value(headers,"From").unwrap_or_default(), "to":header_value(headers,"To").unwrap_or_default(),
                 "cc":header_value(headers,"Cc").unwrap_or_default(), "bcc":header_value(headers,"Bcc").unwrap_or_default(),
                 "subject":header_value(headers,"Subject").unwrap_or_default(),
-                "body_preview":duduclaw_core::truncate_chars(&extract_message_body(&full["message"]["payload"]),2000),
-                "attachments":collect_attachments(&full["message"]["payload"]), "recipients":recipients});
+                "body_preview":confirmation_limits::body_preview(&extract_message_body(&full["message"]["payload"])),
+                "attachments":confirmation_attachments(&full["message"]["payload"])?, "recipients":recipients});
+            confirmation_limits::validate_snapshot(&snapshot, &recipients).map_err(confirmation_error)?;
             inspect_snapshot(io, &snapshot)?;
             io.confirm(template, &snapshot, &recipients).await?;
             io.checkpoint()?;
@@ -100,6 +122,8 @@ async fn confirmed_effect<I: LocalIo>(io: &mut I, template: &NativeCallTemplate)
         CalendarDelete { calendar, event, notify } => {
             let endpoint = format!("{CALENDAR_BASE}/calendars/{}/events/{}", encode_path_component(calendar), encode_path_component(event));
             let before = google_request(io, template, reqwest::Method::GET, &endpoint, &[], None).await?;
+            confirmation_limits::check_recipient_count(before["attendees"].as_array().map_or(0, Vec::len)).map_err(confirmation_error)?;
+            confirmation_limits::ensure_json_size(&[&before["summary"], &before["start"], &before["end"], &before["attendees"]]).map_err(confirmation_error)?;
             let etag = provider_string(&before, "etag")?;
             if before["status"] == "cancelled" || event_time(&before, "start").is_empty() || event_time(&before, "end").is_empty() {
                 return Err(changed_snapshot());
@@ -108,6 +132,7 @@ async fn confirmed_effect<I: LocalIo>(io: &mut I, template: &NativeCallTemplate)
                 return Err(changed_snapshot());
             }
             let (account, metadata) = calendar_details(io, template, calendar).await?;
+            confirmation_limits::ensure_json_size(&[&metadata["id"], &metadata["summary"], &metadata["timeZone"]]).map_err(confirmation_error)?;
             if let Ok(context) = template.confirmation() {
                 if !context.account.is_empty() && !context.account.eq_ignore_ascii_case(&account) { return Err(changed_snapshot()); }
             }
@@ -119,6 +144,7 @@ async fn confirmed_effect<I: LocalIo>(io: &mut I, template: &NativeCallTemplate)
                 "attendees":before.get("attendees").cloned().unwrap_or_else(|| json!([])),"whole_recurring_series":before["recurrence"].as_array().is_some_and(|a| !a.is_empty()),
                 "notify_attendees":notify,"sendUpdates":if *notify {"all"} else {"none"},
                 "content_hash":duduclaw_core::google_identity::google_arguments_digest(&before)});
+            confirmation_limits::validate_snapshot(&snapshot, &recipients).map_err(confirmation_error)?;
             inspect_snapshot(io, &snapshot)?;
             io.confirm(template, &snapshot, &recipients).await?;
             io.checkpoint()?;
