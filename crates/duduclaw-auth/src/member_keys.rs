@@ -34,6 +34,13 @@ pub const MEMBER_AUDIT_RETENTION_DAYS: i64 = 90;
 /// Rows deleted per table by one prune pass.
 pub const MEMBER_AUDIT_PRUNE_BATCH: i64 = 500;
 
+/// Key identity, ACL generation and expiry from one validated read snapshot.
+pub struct MemberKeyAuthority {
+    pub context: crate::UserContext,
+    /// Unix seconds, rounded down so a grant never outlives the key.
+    pub expires_at: u64,
+}
+
 /// Idempotent `member_api_keys` migration, invoked by `UserDb::init_tables`.
 ///
 /// Offboarding an account revokes its credentials permanently (the trigger);
@@ -637,6 +644,11 @@ impl UserDb {
 
     /// Revalidate an already-open connection; never use an ACL cache for keys.
     pub fn member_key_context(&self, id: &str, user_id: &str) -> Result<crate::UserContext, String> {
+        self.member_key_authority(id, user_id).map(|live| live.context)
+    }
+
+    /// Include expiry in the same transaction as key validity and live ACLs.
+    pub fn member_key_authority(&self, id: &str, user_id: &str) -> Result<MemberKeyAuthority, String> {
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(|_| "authentication service unavailable")?;
         let valid: bool = tx.query_row(
@@ -651,7 +663,14 @@ impl UserDb {
         let mut ctx = crate::UserContext::from_live(&user, &access);
         if ctx.is_admin() || ctx.must_change_password { return Err("member key invalid".into()); }
         ctx.member_key_id = Some(id.to_owned());
-        Ok(ctx)
+        // The schema requires expiry; missing, malformed or negative timestamps
+        // remain refusals, never an unbounded credential.
+        let expiry: String = tx.query_row("SELECT expires_at FROM member_api_keys WHERE id=?1",
+            [id], |r| r.get(0)).map_err(|_| "authentication service unavailable")?;
+        let expires_at = DateTime::parse_from_rfc3339(&expiry)
+            .map_err(|_| "member key invalid")?.timestamp();
+        let expires_at = u64::try_from(expires_at).map_err(|_| "member key invalid")?;
+        Ok(MemberKeyAuthority { context: ctx, expires_at })
     }
 
     /// Write attempts carry only the key id and method, never params or secrets.

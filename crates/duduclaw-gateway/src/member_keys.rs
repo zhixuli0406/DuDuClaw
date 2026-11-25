@@ -45,9 +45,15 @@ fn refresh_id(home: &Path, db: &UserDb, id: &str, user: &str) -> Result<UserCont
         .map(|ctx| crate::machine_employee::without_restricted_access(home, ctx))
 }
 pub(crate) fn refresh(home: &Path, db: &UserDb, ctx: &UserContext) -> Result<UserContext, String> {
+    refresh_authority(home, db, ctx).map(|live| live.context)
+}
+pub(crate) fn refresh_authority(home: &Path, db: &UserDb, ctx: &UserContext)
+    -> Result<duduclaw_auth::member_keys::MemberKeyAuthority, String> {
     let id = ctx.member_key_id.as_deref().ok_or("member key invalid")?;
-    let live = refresh_id(home, db, id, &ctx.user_id)?;
-    if live.credential_epoch != ctx.credential_epoch { return Err("member key invalid".into()); }
+    if !config(home).enabled { return Err("member keys disabled".into()); }
+    let mut live = db.member_key_authority(id, &ctx.user_id)?;
+    live.context = crate::machine_employee::without_restricted_access(home, live.context);
+    if live.context.credential_epoch != ctx.credential_epoch { return Err("member key invalid".into()); }
     Ok(live)
 }
 

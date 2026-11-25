@@ -412,12 +412,19 @@ impl crate::isolation_readiness::IntegrationProbe for BoundaryReadiness {
 pub(crate) fn record_authorization(home: PathBuf, agent: String, user: String, epoch: u64,
     lane: duduclaw_isolation::capability::Lane, turn: super::HostTurn, credential_expiry: Option<u64>,
     task: Option<String>) -> Result<super::RuntimeAuthorization, VerificationError> {
+    record_authorization_at_generation(home, agent, user, epoch, lane, turn, credential_expiry, task, None)
+}
+
+/// Member ingress pins the generation observed while refreshing the key.
+pub(super) fn record_authorization_at_generation(home: PathBuf, agent: String, user: String, epoch: u64,
+    lane: duduclaw_isolation::capability::Lane, turn: super::HostTurn, credential_expiry: Option<u64>,
+    task: Option<String>, credential_generation: Option<u64>) -> Result<super::RuntimeAuthorization, VerificationError> {
     let owner = OWNER.get().ok_or(VerificationError::Unavailable)?;
     if owner.home != home || !owner.boundary.healthy() { return Err(VerificationError::Unavailable); }
     let authority = owner.product_authority.as_ref().ok_or(VerificationError::Unavailable)?;
     let lifecycle = lifecycle::read_lifecycle(&home, &agent).map_err(lifecycle_refusal)?;
     let current = authority.ingress_snapshot(&user, &agent)?;
-    super::ingress::require_epoch(epoch, current.human.as_ref().map(|human| human.credential_epoch))?;
+    check_issuance_credential(epoch, credential_generation, &current)?;
     let principal = issuance_principal(&user, &current)?;
     issuance_facts(&agent, &lifecycle, &principal, &current, turn.background.as_ref())?;
     let policy = crate::approval::strict_policy_revision(&home, &agent)
@@ -436,6 +443,17 @@ pub(crate) fn record_authorization(home: PathBuf, agent: String, user: String, e
     recheck_issuance_facts(&agent, &lifecycle, &principal, epoch, &current, &after,
         authorization.turn.as_ref().and_then(|turn| turn.background.as_ref()))?;
     Ok(authorization)
+}
+
+pub(super) fn check_issuance_credential(epoch: u64, generation: Option<u64>,
+    current: &duduclaw_auth::IsolationAuthoritySnapshot) -> Result<(), VerificationError> {
+    super::ingress::require_epoch(epoch, current.human.as_ref().map(|human| human.credential_epoch))?;
+    // Never adopt a post-revocation generation after a successful key refresh.
+    // Later issuance rechecks already pin this snapshot's generation.
+    if generation.is_some_and(|generation| generation != current.acl_generation) {
+        return Err(VerificationError::Revoked);
+    }
+    Ok(())
 }
 
 fn issuance_principal(user: &str, current: &duduclaw_auth::IsolationAuthoritySnapshot)

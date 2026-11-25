@@ -45,7 +45,7 @@ async fn protected_reply_scope<F: Future>(home: &Path, requester: &RequesterIden
             RequesterIdentity::DashboardUser { user_id } => {
                 let credential = web.ok_or(VerificationError::Invalid)?;
                 let epoch = check_web_identity(&home, &credential, &user_id,
-                    duduclaw_mcp_boundary::authority::now_seconds()?)?;
+                    duduclaw_mcp_boundary::authority::now_seconds()?)?.epoch;
                 (user_id, Source::Web(credential), Some(epoch))
             }
             RequesterIdentity::ChannelUser { channel, sender, user_id: Some(user), .. } => {
@@ -106,20 +106,23 @@ pub(super) async fn authorize_current(agent_dir: &Path, principal_context: Optio
     let egress_turn = crate::runtime_turn::current();
     duduclaw_mcp_boundary::authority::verify_blocking(move || {
         if !proof.valid_for(&agent, &turn) { return Err(VerificationError::Revoked); }
-        match &human.source {
+        let (expiry, generation) = match &human.source {
             Source::Web(credential) => {
-                let epoch = check_web_identity(&human.home, credential, &human.user,
+                let live = check_web_identity(&human.home, credential, &human.user,
                     duduclaw_mcp_boundary::authority::now_seconds()?)?;
-                require_epoch(human.epoch, Some(epoch))?;
+                require_epoch(human.epoch, Some(live.epoch))?;
+                (live.expiry, live.generation)
             }
-            Source::Channel { channel, sender } => check_channel_mapping(&human.user,
-                crate::trigger_route::access::verified_user_for_channel_sender(&human.home, channel, sender).as_deref())?,
-        }
-        let expiry = match &human.source { Source::Web(ChatCredential::Jwt(claims)) => Some(claims.exp), _ => None };
-        super::boot::record_authorization(human.home, agent, human.user, human.epoch, lane,
+            Source::Channel { channel, sender } => {
+                check_channel_mapping(&human.user,
+                    crate::trigger_route::access::verified_user_for_channel_sender(&human.home, channel, sender).as_deref())?;
+                (None, None)
+            }
+        };
+        super::boot::record_authorization_at_generation(human.home, agent, human.user, human.epoch, lane,
             super::HostTurn { identity: crate::isolation_egress::RunTurnIdentity {
                 turn, approval_session: Some(session) }, metadata: Some(metadata), principal_context,
-                egress_turn, background: None }, expiry, None)
+                egress_turn, background: None }, expiry, None, generation)
     }).await
 }
 
@@ -130,8 +133,13 @@ fn take_human() -> Result<HumanIngress, VerificationError> {
 
 /// Re-read authority at capture and again before issuance; a cached user alone
 /// must never turn a revoked member key into a human ingress credential.
+struct WebIdentity {
+    epoch: u64,
+    expiry: Option<u64>,
+    generation: Option<u64>,
+}
 fn check_web_identity(home: &Path, credential: &ChatCredential, user: &str, now: u64)
-    -> Result<u64, VerificationError> {
+    -> Result<WebIdentity, VerificationError> {
     if user.is_empty() { return Err(VerificationError::Revoked); }
     let db = crate::decision_notify::open_user_db(home)
         .map_err(|_| VerificationError::Unavailable)?.ok_or(VerificationError::Unavailable)?;
@@ -141,13 +149,14 @@ fn check_web_identity(home: &Path, credential: &ChatCredential, user: &str, now:
             let live = db.live_user_context(user).map_err(|_| VerificationError::Unavailable)?
                 .ok_or(VerificationError::Revoked)?;
             require_epoch(claims.credential_epoch, Some(live.credential_epoch))?;
-            Ok(live.credential_epoch)
+            Ok(WebIdentity { epoch: live.credential_epoch, expiry: Some(claims.exp), generation: None })
         }
         ChatCredential::Member(ctx) => {
             if ctx.user_id != user { return Err(VerificationError::Revoked); }
-            let live = crate::member_keys::refresh(home, &db, ctx)
+            let live = crate::member_keys::refresh_authority(home, &db, ctx)
                 .map_err(|_| VerificationError::Revoked)?;
-            Ok(live.credential_epoch)
+            Ok(WebIdentity { epoch: live.context.credential_epoch, expiry: Some(live.expires_at),
+                generation: Some(live.context.acl_generation) })
         }
     }
 }
@@ -257,7 +266,7 @@ mod tests {
     }
     #[tokio::test]
     async fn ingress_member_key_scope_rechecks_the_original_key_at_verification() {
-        for reason in ["revoke", "delete", "expiry", "epoch", "account", "admin", "switch"] {
+        for reason in ["revoke", "delete", "expiry", "malformed_expiry", "epoch", "account", "admin", "switch"] {
             let (home, db, claims) = web_fixture();
             let key = db.member_key_create(&claims.sub, "ingress", 1, claims.credential_epoch).unwrap();
             let ctx = crate::member_keys::authenticate(home.path(), &db, &key.secret).unwrap();
@@ -276,6 +285,7 @@ mod tests {
                 "revoke" => db.member_key_revoke_own(&claims.sub, &key.info.id).unwrap(),
                 "delete" => { raw.execute("DELETE FROM member_api_keys WHERE id=?1", [&key.info.id]).unwrap(); }
                 "expiry" => { raw.execute("UPDATE member_api_keys SET expires_at='2000-01-01T00:00:00Z' WHERE id=?1", [&key.info.id]).unwrap(); }
+                "malformed_expiry" => { raw.execute("UPDATE member_api_keys SET expires_at='2999-01-01' WHERE id=?1", [&key.info.id]).unwrap(); }
                 "epoch" => { raw.execute("UPDATE users SET credential_epoch=credential_epoch+1 WHERE id=?1", [&claims.sub]).unwrap(); }
                 "account" => { raw.execute("UPDATE users SET status='suspended' WHERE id=?1", [&claims.sub]).unwrap(); }
                 "admin" => { raw.execute("UPDATE users SET role='admin' WHERE id=?1", [&claims.sub]).unwrap(); }
@@ -286,6 +296,85 @@ mod tests {
             assert!(check_web_identity(home.path(), &original, &human.user,
                 duduclaw_mcp_boundary::authority::now_seconds().unwrap()).is_err(), "{reason}");
             assert!(capture_web(home.path(), &claims.sub, Some(credential)).await.is_none(), "{reason}");
+        }
+    }
+    fn issuer_fixture() -> (tempfile::TempDir, duduclaw_auth::UserDb, super::super::boot::test_support::SharedEmployee) {
+        let home = crate::fs_safe::private_test_home().unwrap();
+        std::fs::write(home.path().join("config.toml"), "[member_api_keys]\nenabled=true\n").unwrap();
+        let agent = home.path().join("agents/ingress");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(agent.join("agent.toml"),
+            super::super::boot::test_support::agent_toml("ingress", false, "")).unwrap();
+        let employee = super::super::boot::test_support::SharedEmployee::new_personal(
+            home.path(), "ingress", duduclaw_isolation::ids::EmployeeId([23; 16]));
+        let db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+        (home, db, employee)
+    }
+    fn issue_web(employee: &super::super::boot::test_support::SharedEmployee, live: &WebIdentity)
+        -> Result<RuntimeAuthorization, VerificationError> {
+        // Same first-snapshot gate as record_authorization_at_generation; only
+        // the root allocator is doubled by the existing issuer fixture.
+        let current = employee.snapshot();
+        super::super::boot::check_issuance_credential(live.epoch, live.generation, &current)?;
+        employee.authorize(&current, duduclaw_isolation::capability::Lane::Standard,
+            duduclaw_isolation::bounded::List::new(vec![
+                duduclaw_isolation::bounded::Text::new("tasks_update".to_owned()).unwrap()]).unwrap(),
+            super::super::HostTurn { identity: crate::isolation_egress::RunTurnIdentity {
+                turn: "ingress-expiry".into(), approval_session: None }, metadata: None,
+                principal_context: None, egress_turn: None, background: None }, live.expiry)
+    }
+    #[test]
+    fn ingress_member_key_grant_is_capped_by_key_expiry() {
+        let (home, db, employee) = issuer_fixture();
+        let key = db.member_key_create(employee.user(), "ingress", 1, employee.epoch()).unwrap();
+        let credential = ChatCredential::Member(crate::member_keys::authenticate(home.path(), &db, &key.secret).unwrap());
+        let now = duduclaw_mcp_boundary::authority::now_seconds().unwrap();
+        // Set the expiry explicitly; no sleeps or dependence on creation TTL.
+        let expiry = now + 300;
+        let stamp = chrono::DateTime::<chrono::Utc>::from_timestamp(i64::try_from(expiry).unwrap(), 0)
+            .unwrap().to_rfc3339();
+        rusqlite::Connection::open(home.path().join("users.db")).unwrap().execute(
+            "UPDATE member_api_keys SET expires_at=?1 WHERE id=?2", rusqlite::params![stamp, key.info.id]).unwrap();
+        let live = check_web_identity(home.path(), &credential, employee.user(), now).unwrap();
+        assert_eq!(live.expiry, Some(expiry));
+        assert_eq!(live.generation, Some(db.acl_generation().unwrap()));
+        let authorization = issue_web(&employee, &live).unwrap();
+        assert_eq!(authorization.grant.expires_at, expiry);
+        assert!(authorization.grant.expires_at - authorization.grant.not_before < 30 * 60);
+    }
+    #[test]
+    fn ingress_member_key_revoke_between_refresh_and_issuer_snapshot_is_refused() {
+        let (home, db, employee) = issuer_fixture();
+        let key = db.member_key_create(employee.user(), "ingress", 1, employee.epoch()).unwrap();
+        let credential = ChatCredential::Member(crate::member_keys::authenticate(home.path(), &db, &key.secret).unwrap());
+        let live = check_web_identity(home.path(), &credential, employee.user(),
+            duduclaw_mcp_boundary::authority::now_seconds().unwrap()).unwrap();
+        // Deterministically inject the revoke after refresh and before the
+        // issuer's first snapshot, when the old epoch-only gate would pass.
+        db.member_key_revoke_own(employee.user(), &key.info.id).unwrap();
+        let after = employee.snapshot();
+        assert_eq!(after.human.as_ref().unwrap().credential_epoch, live.epoch);
+        assert_ne!(Some(after.acl_generation), live.generation);
+        assert!(matches!(issue_web(&employee, &live), Err(VerificationError::Revoked)));
+    }
+    #[test]
+    fn ingress_jwt_grant_keeps_expiry_cap_and_does_not_pin_refresh_generation() {
+        let (home, db, employee) = issuer_fixture();
+        let now = duduclaw_mcp_boundary::authority::now_seconds().unwrap();
+        for lifetime in [300, 3600] {
+            let claims: Claims = serde_json::from_value(serde_json::json!({
+                "sub":employee.user(), "email":"ingress@example.invalid", "role":"employee",
+                "bound_agents":[], "access_levels":{}, "exp":now + lifetime, "iat":now,
+                "token_type":"access", "credential_epoch":employee.epoch()
+            })).unwrap();
+            let live = check_web_identity(home.path(), &ChatCredential::Jwt(claims.clone()), employee.user(), now).unwrap();
+            assert_eq!(live.expiry, Some(claims.exp));
+            assert_eq!(live.generation, None);
+            // Unrelated member-key revocation must not change JWT semantics.
+            let key = db.member_key_create(employee.user(), "unrelated", 1, employee.epoch()).unwrap();
+            db.member_key_revoke_own(employee.user(), &key.info.id).unwrap();
+            let authorization = issue_web(&employee, &live).unwrap();
+            assert_eq!(authorization.grant.expires_at, claims.exp.min(authorization.grant.not_before + 30 * 60));
         }
     }
     fn human() -> HumanIngress {
