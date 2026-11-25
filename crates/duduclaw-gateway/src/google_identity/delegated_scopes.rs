@@ -24,8 +24,8 @@ pub(crate) fn for_service(home: &Path, service: &str) -> Result<&'static [&'stat
 
 pub(crate) fn for_tool(home: &Path, tool: &str) -> Result<&'static [&'static str], super::Refusal> {
     let service = match tool {
-        "gmail_search" | "gmail_read" | "gmail_create_draft" | "mail_poll" => "gmail",
-        "calendar_list_events" | "calendar_create_event" | "calendar_update_event" => "calendar",
+        "gmail_search" | "gmail_read" | "gmail_send_draft" | "gmail_create_draft" | "mail_poll" => "gmail",
+        "calendar_list_events" | "calendar_create_event" | "calendar_delete_event" | "calendar_update_event" => "calendar",
         "docs_read" | "docs_append" | "docs_create" | "docs_replace_text" => "docs",
         "sheets_read" | "sheets_append" | "sheets_create" | "sheets_update" => "sheets",
         "drive_search" | "drive_read" => "drive",

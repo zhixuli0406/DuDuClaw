@@ -1,10 +1,10 @@
 # Google Workspace tools and security
 
-For setup, use [Connect Google](google-setup.md). Native REST tools cover nine services and twenty-six tools. The Apps Script path covers three services and eight actions including status. The dashboard remains visible with the integration disabled; tools are hidden until `[integrations] google_workspace = true`. DuDuClaw does not ship shared OAuth credentials.
+For setup, use [Connect Google](google-setup.md). Native REST tools cover nine services and twenty-eight tools. The Apps Script path covers three services and eight actions including status. The dashboard remains visible with the integration disabled; tools are hidden until `[integrations] google_workspace = true`. DuDuClaw does not ship shared OAuth credentials.
 
 ## What you get
 
-Twenty-six agent-facing MCP tools, gated by two scopes (`google:read` /
+Twenty-eight agent-facing MCP tools, gated by two scopes (`google:read` /
 `google:write`):
 
 | Tool | Class | What it does |
@@ -14,7 +14,9 @@ Twenty-six agent-facing MCP tools, gated by two scopes (`google:read` /
 | `gmail_read` | read | Read one message in full: headers, plain-text body (truncated if long), attachment manifest (filename + size only — never downloaded). |
 | `google_chat_spaces` | read | List the connected user's spaces, group chats and DMs; requires Chat read opt-in. |
 | `google_chat_messages` | read | Read recent Chat messages; scanned reference data, attachment names only. |
-| `gmail_create_draft` | write | Create a Gmail **draft**. Never sends — sending stays a manual human action. |
+| `gmail_send_draft` | send | Send an approved draft snapshot; a new confirmation is required every time. |
+| `calendar_delete_event` | delete | Delete an approved event version; notifications default to none. |
+| `gmail_create_draft` | write | Create a Gmail **draft**. Saves without sending; use `gmail_send_draft` with a separate confirmation to send. |
 | `calendar_list_events` | read | List primary-calendar events (defaults to the next 7 days). |
 | `calendar_create_event` | write | Create a real, externally-visible event; optional Google Meet link. |
 | `sheets_read` | read | Read a cell range from a spreadsheet (accepts a spreadsheet ID or a full sheet URL). Returns up to 200 rows of formatted values. |
@@ -55,12 +57,11 @@ which is why they are served natively here.
 
 ### Safety design
 
-- **Drafts never send.** `gmail_create_draft` only saves a draft; there is no
-  "send" tool. Delivery is always a human decision.
+- **Sending requires confirmation.** `gmail_create_draft` saves without sending. `gmail_send_draft` sends only after a new card is confirmed for that call.
 - **Read stays read.** The read-class tools cannot modify anything in Gmail or
   Calendar.
 - **Forms, Drive and Slides are read-only.** No tool creates or edits a form,
-  writes to Drive, or modifies a presentation. Only Gmail (draft), Calendar,
+  writes to Drive, or modifies a presentation. Only Gmail (draft and confirmed send), Calendar,
   Sheets, Docs and Tasks have write tools.
 - **Least privilege.** Drive is requested `drive.readonly` (never `drive` or
   `drive.file` — Docs and Sheets creation uses their own service scopes) and Slides
@@ -188,7 +189,7 @@ allowed_subject_domains = ["customer.com"]
 ```
 
 An employee without `[google]` uses `default_identity`, so an existing
-installation behaves exactly as before. `none` hides the 26 Google tools
+installation behaves exactly as before. `none` hides the 28 Google tools
 from that employee and refuses calls to them. A value that cannot be read
 (a typo, an unknown key) refuses Google for that employee; it never turns
 into the shared account. Enterprise employees may use `owner` or `user:<id>`
@@ -299,8 +300,7 @@ Dedicated gateway execution makes one attempt for non-GET/HEAD REST requests: tr
 
 ### Limits
 
-- `gmail.compose` lets whoever holds the access token send mail. The tools
-  only create drafts, but an employee with an unrestricted shell can call
+- `gmail.compose` lets whoever holds the access token send mail. The draft-creation tool saves drafts and `gmail_send_draft` requires per-call confirmation, but an employee with an unrestricted shell can call
   Google directly with a token it was issued for its own colleague.
 - An employee with a shell runs as the same OS user as the gateway; see the
   keychain limits in [Security defense](../features/05-security-defense.md#person-credentials-in-the-os-keychain-v1760).
@@ -350,3 +350,15 @@ external_server = "Partner Google MCP" # optional, at most 120 characters
 ```
 
 The connection tab displays **Provided by an external tool**. Native Google tools are hidden and refused, just as with `none`; this selector does not configure or authorize the external server. The name is display text only, with control characters rejected. Older parsers reject the unknown selector (and optional key), so they refuse native Google access rather than using the company account.
+
+### Confirmed Gmail send and Calendar delete
+
+`gmail_send_draft {"draft_id":"r…"}` and `calendar_delete_event {"event_id":"…","calendar_id":"primary","notify_attendees":false}` require `google:write` and gateway native REST execution. Apps Script hides and refuses both. Legacy bearer-only Home execution hides and refuses them; use a dedicated employee Google connection or an account-bound gateway connector.
+
+Every call creates a new confirmation card. `allow`, Admin scope and persistent workflow grants cannot waive it; `block` still refuses. The Gmail card comes from Google: sending account, To/Cc/Bcc, subject, body preview and attachment names/sizes. Approval binds that account, employee incarnation, draft ID, operation and MIME hash. The gateway rechecks the draft and sends the approved MIME snapshot; changed content or account requires a fresh confirmation. Recipient policy includes all To/Cc/Bcc addresses, including display-name addresses; ambiguous recipient syntax is refused.
+
+The Calendar card shows the title, start/end with timezone, attendees, calendar, whole-series deletion flag and notification choice. It binds the event version and uses `If-Match`; a changed event requires a new confirmation. `calendar_id` defaults to `primary`; `sendUpdates=none` is explicit unless `notify_attendees=true` requests `all`. Empty HTTP 204 is success. Calendar deletion also reads the primary calendar account and selected calendar name/timezone using the existing `calendar.calendarlist.readonly` scope (or a broader calendar scope).
+
+The MIME remains in gateway memory; the approval stores the curated preview and content hash. A denied, expired, consumed or mismatched approval cannot mutate Google. A timeout or uncertain write reports `result_unconfirmed`: inspect Google before retrying; the operation never automatically resends. Confirmation expires after 90 seconds.
+
+The transport contract follows [Gmail drafts](https://developers.google.com/workspace/gmail/api/guides/drafts) and [Calendar conditional modifications](https://developers.google.com/workspace/calendar/api/guides/version-resources).

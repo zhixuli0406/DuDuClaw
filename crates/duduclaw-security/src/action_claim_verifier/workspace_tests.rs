@@ -459,3 +459,14 @@ fn calendar_update_evidence_cannot_prove_event_creation() {
     assert!(verify_workspace_claims(&[claim(ClaimType::CalendarEventUpdated)], &rows).is_empty());
     assert_eq!(verify_workspace_claims(&[claim(ClaimType::CalendarEventCreated)], &rows).len(),1);
 }
+
+#[test]
+fn gmail_confirmed_send_needs_a_successful_sent_receipt() {
+    let now = chrono::Utc::now();
+    let mut sent = row(now, "gmail_send_draft", 1);
+    assert!(!verify_workspace_claims(&[claim(ClaimType::MailSent)], &[sent.clone()]).is_empty());
+    sent["sent"] = json!(true);
+    assert!(verify_workspace_claims(&[claim(ClaimType::MailSent)], &[sent.clone()]).is_empty());
+    sent["success"] = json!(false);
+    assert!(!verify_workspace_claims(&[claim(ClaimType::MailSent)], &[sent]).is_empty());
+}

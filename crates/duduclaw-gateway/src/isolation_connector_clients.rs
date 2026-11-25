@@ -289,6 +289,9 @@ impl NativeConnectorExecutor {
         let tool = call.name();
         let args = call.arguments();
         let result = match tool {
+            "gmail_send_draft" | "calendar_delete_event" => {
+                crate::google_workspace::native_legacy::handle_confirmed_connector(tool, args, &self.policy.home, &self.policy.agent, &token.token).await
+            }
             "google_status" | "notion_status" | "github_status" => tool_text(json!({"account":selected.account(),
                 "provider":selected.provider(),"configured":true,"provider_verified":false})),
             "gmail_search" | "gmail_read" | "gmail_create_draft" | "calendar_list_events" | "calendar_create_event" |

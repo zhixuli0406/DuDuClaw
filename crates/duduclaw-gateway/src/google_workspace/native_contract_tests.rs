@@ -8,6 +8,8 @@ fn valid_cases() -> Vec<(&'static str, Value)> {
             "gmail_create_draft",
             json!({"to":" a@b.test ","subject":"主旨","body":"body"}),
         ),
+        ("gmail_send_draft", json!({"draft_id":"r-123"})),
+        ("calendar_delete_event", json!({"event_id":"e","calendar_id":"team@example.com"})),
         ("calendar_list_events", json!({})),
         (
             "calendar_create_event",
@@ -43,9 +45,9 @@ fn valid_cases() -> Vec<(&'static str, Value)> {
 }
 
 #[test]
-fn all_twenty_five_native_inputs_are_frozen_without_status_or_remote_aliases() {
+fn all_twenty_seven_native_inputs_are_frozen_without_status_or_remote_aliases() {
     let cases = valid_cases();
-    assert_eq!(cases.len(), 25);
+    assert_eq!(cases.len(), 27);
     for (tool, arguments) in cases {
         let call = NativeCallTemplate::prepare(tool, &arguments).unwrap();
         assert_eq!(call.tool(), tool);
@@ -284,4 +286,19 @@ fn gmail_recipient_headers_refuse_controls_and_validate_each_mailbox() {
     let template = NativeCallTemplate::prepare("gmail_create_draft", &args).unwrap();
     assert!(matches!(template.parsed(), ParsedNativeArguments::GmailDraft { to, cc: Some(cc), .. }
         if to == "Alice@example.com, bob@example.com" && cc == "Carol@example.com"));
+}
+
+#[test]
+fn confirmed_tools_validate_ids_booleans_and_native_only_backend() {
+    for (tool, args) in [
+        ("gmail_send_draft", json!({"draft_id":"../send"})),
+        ("gmail_send_draft", json!({"draft_id":"a%2Fb"})),
+        ("calendar_delete_event", json!({"event_id":"e","calendar_id":"x/y"})),
+        ("calendar_delete_event", json!({"event_id":"e","notify_attendees":"false"})),
+        ("calendar_delete_event", json!({"event_id":"e","notify_attendees":null})),
+    ] { assert!(NativeCallTemplate::prepare(tool, &args).is_err(), "{tool}: {args}"); }
+    for tool in ["gmail_send_draft", "calendar_delete_event"] {
+        assert!(!super::super::backend_supports_tool(false, tool, false));
+        assert!(super::super::backend_supports_tool(true, tool, false));
+    }
 }

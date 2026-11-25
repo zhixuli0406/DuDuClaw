@@ -6,16 +6,29 @@ struct RecordingIo {
     json: VecDeque<Value>,
     text: VecDeque<String>,
     wire: Vec<(String, String, Vec<(String, String)>, Option<Value>)>,
+    approve: bool,
+    snapshots: Vec<Value>,
+    etags: Vec<String>,
+    fail_write: bool,
+    precondition_failed: bool,
 }
 #[async_trait::async_trait]
 impl LocalIo for RecordingIo {
     async fn json(&mut self, step: NativeStep<'_>) -> Result<Value, GoogleApiError> {
+        if let Some(etag) = step.if_match() { self.etags.push(etag.to_owned()); }
+        if self.fail_write && step.method() != reqwest::Method::GET {
+            self.wire.push((step.method().to_string(), step.url().into(), step.query().to_vec(), step.body().cloned()));
+            return Err(GoogleApiError::Http("timeout".into()));
+        }
         self.wire.push((
             step.method().to_string(),
             step.url().into(),
             step.query().to_vec(),
             step.body().cloned(),
         ));
+        if self.precondition_failed && step.method() == reqwest::Method::DELETE {
+            return Err(GoogleApiError::Api { status:412, message:"Changed".into() });
+        }
         // Default: a generic success carrying an id (a write with no id back
         // is reported as an error, not as created).
         Ok(self.json.pop_front().unwrap_or(json!({"id":"fixture-id"})))
@@ -28,6 +41,10 @@ impl LocalIo for RecordingIo {
             None,
         ));
         Ok(self.text.pop_front().unwrap_or_default())
+    }
+    async fn confirm(&mut self, _: &NativeCallTemplate, snapshot: &Value, _: &[String]) -> Result<(), GoogleApiError> {
+        self.snapshots.push(snapshot.clone());
+        if self.approve { Ok(()) } else { Err(confirmation_error("Denied".into())) }
     }
     fn checkpoint(&mut self) -> Result<(), GoogleApiError> {
         Ok(())
@@ -570,4 +587,121 @@ async fn write_response_injection_is_refused_before_structured_output() {
     assert_eq!(result["isError"],true);
     assert!(result.get("structuredContent").is_none());
     assert!(!result.to_string().contains("ignore all previous"));
+}
+
+fn draft_fixture() -> (Value, Value) {
+    let mime = format!("Bcc: hidden@example.com\r\n{}", build_rfc2822("alice@example.com", "Snapshot subject", "Approved body", Some("copy@example.com")));
+    (json!({"id":"r1","message":{"id":"m1","payload":{"mimeType":"text/plain",
+        "headers":[{"name":"To","value":"alice@example.com"},{"name":"Cc","value":"copy@example.com"},
+            {"name":"Bcc","value":"hidden@example.com"},{"name":"Subject","value":"Snapshot subject"}],
+        "body":{"data":encode_raw_message("Approved body")},
+        "parts":[{"filename":"report.txt","body":{"size":42}}]}}}),
+     json!({"id":"r1","message":{"id":"m1","raw":encode_raw_message(&mime)}}))
+}
+fn gmail_io(approve: bool) -> RecordingIo {
+    let (full, raw) = draft_fixture();
+    RecordingIo { approve, json:VecDeque::from(vec![json!({"emailAddress":"sender@example.com"}), full.clone(), raw.clone(),
+        json!({"emailAddress":"sender@example.com"}), full, raw, json!({"id":"sent1"})]), ..Default::default() }
+}
+fn event_fixture() -> Value {
+    json!({"id":"e1","etag":"\"v1\"","summary":"Planning <script>",
+        "start":{"dateTime":"2026-11-25T10:00:00+08:00","timeZone":"Asia/Taipei"},
+        "end":{"dateTime":"2026-11-25T11:00:00+08:00","timeZone":"Asia/Taipei"},
+        "attendees":[{"email":"alice@example.com"}],"recurrence":["RRULE:FREQ=WEEKLY"]})
+}
+fn calendar_io(approve: bool) -> RecordingIo {
+    let event = event_fixture();
+    let metadata = json!({"id":"sender@example.com","summary":"Work","timeZone":"Asia/Taipei"});
+    RecordingIo { approve, json:VecDeque::from(vec![event.clone(), metadata.clone(), metadata.clone(), event, metadata.clone(), metadata, Value::Null]), ..Default::default() }
+}
+#[tokio::test]
+async fn gmail_send_without_approval_has_zero_mutations() {
+    let template = NativeCallTemplate::prepare("gmail_send_draft", &json!({"draft_id":"r1"})).unwrap();
+    let mut io = gmail_io(false);
+    assert_eq!(run(&template, &mut io).await["isError"], true);
+    assert!(io.wire.iter().all(|step| step.0 == "GET"));
+    let card = &io.snapshots[0];
+    assert_eq!(card["account"], "sender@example.com");
+    for key in ["to", "cc", "bcc", "subject", "body_preview", "attachments", "content_hash"] { assert!(!card[key].is_null(), "{key}"); }
+    assert!(card.to_string().contains("hidden@example.com"));
+    assert!(!card.to_string().contains("\"raw\""));
+}
+#[tokio::test]
+async fn gmail_sends_approved_mime_once_and_rejects_changed_content_or_account() {
+    let template = NativeCallTemplate::prepare("gmail_send_draft", &json!({"draft_id":"r1"})).unwrap();
+    let mut io = gmail_io(true);
+    assert_ne!(run(&template, &mut io).await["isError"], true);
+    let writes:Vec<_> = io.wire.iter().filter(|s| s.0 == "POST").collect();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].3.as_ref().unwrap()["message"]["raw"], draft_fixture().1["message"]["raw"]);
+    for index in [3, 5] {
+        let mut io = gmail_io(true);
+        if index == 3 { io.json[index] = json!({"emailAddress":"other@example.com"}); }
+        else { io.json[index]["message"]["raw"] = json!(encode_raw_message("Changed MIME")); }
+        assert_eq!(run(&template, &mut io).await["isError"], true);
+        assert!(io.wire.iter().all(|s| s.0 == "GET"));
+    }
+}
+#[tokio::test]
+async fn calendar_delete_is_version_bound_handles_204_and_defaults_to_no_notifications() {
+    for notify in [false, true] {
+        let args = if notify { json!({"event_id":"e1","calendar_id":"team@example.com","notify_attendees":true}) }
+            else { json!({"event_id":"e1","calendar_id":"team@example.com"}) };
+        let template = NativeCallTemplate::prepare("calendar_delete_event", &args).unwrap();
+        let mut io = calendar_io(true);
+        io.json[2]["id"] = json!("team@example.com");
+        io.json[5]["id"] = json!("team@example.com");
+        assert_ne!(run(&template, &mut io).await["isError"], true);
+        let step = io.wire.last().unwrap();
+        assert_eq!(step.0, "DELETE");
+        assert!(step.1.ends_with("/calendars/team%40example.com/events/e1"));
+        assert_eq!(step.2, vec![("sendUpdates".into(), if notify {"all"} else {"none"}.into())]);
+        assert_eq!(io.etags, vec!["\"v1\""]);
+        let card = &io.snapshots[0];
+        assert_eq!(card["whole_recurring_series"], true);
+        assert_eq!(card["start"]["timeZone"], "Asia/Taipei");
+    }
+}
+#[tokio::test]
+async fn calendar_denial_and_changed_event_never_delete() {
+    let template = NativeCallTemplate::prepare("calendar_delete_event", &json!({"event_id":"e1"})).unwrap();
+    for approve in [false, true] {
+        let mut io = calendar_io(approve);
+        io.json[3]["etag"] = json!("\"v2\"");
+        assert_eq!(run(&template, &mut io).await["isError"], true);
+        assert!(io.wire.iter().all(|s| s.0 == "GET"));
+    }
+}
+#[tokio::test]
+async fn confirmed_mutation_timeout_reports_unconfirmed_without_retry() {
+    for (tool, args, mut io) in [
+        ("gmail_send_draft", json!({"draft_id":"r1"}), gmail_io(true)),
+        ("calendar_delete_event", json!({"event_id":"e1"}), calendar_io(true)),
+    ] {
+        io.fail_write = true;
+        let template = NativeCallTemplate::prepare(tool, &args).unwrap();
+        let result = run(&template, &mut io).await;
+        assert_eq!(result["isError"], true);
+        assert!(result.to_string().contains("result_unconfirmed"));
+        assert_eq!(io.wire.iter().filter(|s| s.0 != "GET").count(), 1);
+    }
+}
+#[test]
+fn snapshot_recipient_adapter_includes_all_headers_and_refuses_ambiguous_addresses() {
+    let full = draft_fixture().0;
+    let targets = mail_targets(&full["message"]["payload"]["headers"]).unwrap();
+    assert_eq!(targets.len(), 3);
+    assert!(targets.contains(&"mail:hidden@example.com".into()));
+    assert!(mail_targets(&json!([{"name":"To","value":"a@example.com\r\nBcc: evil@example.com"}])).is_err());
+}
+
+#[tokio::test]
+async fn calendar_conditional_delete_412_requires_a_fresh_confirmation() {
+    let template = NativeCallTemplate::prepare("calendar_delete_event", &json!({"event_id":"e1"})).unwrap();
+    let mut io = calendar_io(true);
+    io.precondition_failed = true;
+    let result = run(&template, &mut io).await;
+    assert_eq!(result["isError"], true);
+    assert!(result.to_string().contains("重新呼叫並確認新卡片"));
+    assert_eq!(io.wire.iter().filter(|s| s.0 == "DELETE").count(), 1);
 }

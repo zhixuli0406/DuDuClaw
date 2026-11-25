@@ -3682,6 +3682,8 @@ async fn rm159_personal_missing_write_scope_is_refused_before_any_request() {
         ("sheets_create", json!({"title":"s"}), "spreadsheets"),
         ("sheets_update", json!({"spreadsheet_id":"s","range":"A1","values":[[1]]}), "spreadsheets"),
         ("calendar_update_event", json!({"event_id":"e","summary":"s"}), "calendar.events"),
+        ("calendar_delete_event", json!({"event_id":"e"}), "calendar.events"),
+        ("gmail_send_draft", json!({"draft_id":"r1"}), "gmail.compose"),
     ] {
         let f = d1_fixture(false);
         let missing = format!("https://www.googleapis.com/auth/{missing}");
@@ -3732,5 +3734,63 @@ async fn rm159_both_credential_owners_execute_new_native_write_recipes() {
             assert!(!value.to_string().contains(D1_SECRET));
         }
         assert_eq!(wire.hits.load(std::sync::atomic::Ordering::SeqCst),6);
+    }
+}
+
+#[tokio::test]
+async fn rm159_closed_owners_require_a_fresh_snapshot_card_before_any_send_or_delete() {
+    use serde_json::json;
+    use base64::Engine;
+    for home in [false, true] {
+        for (tool, args) in [("gmail_send_draft", json!({"draft_id":"r1"})),
+            ("calendar_delete_event", json!({"event_id":"e1"}))] {
+            for approve in [false, true] {
+                let f = d1_fixture(home);
+                f.db.ensure_google_employee_nonce("bot").unwrap();
+                let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                    "To: recipient@example.com\r\nSubject: Real Google subject\r\n\r\nApproved body");
+                let wire = d1_wire(move |_, target| {
+                    if target.contains("sendUpdates=") {
+                        return D1Reply { status:204, body:String::new(), location:None, delay_ms:0, disconnect:false };
+                    }
+                    if target.ends_with("/drafts/send") { return D1Reply::json(json!({"id":"sent1"})); }
+                    if target.contains("/profile") { return D1Reply::json(json!({"emailAddress":"alice@unit.test"})); }
+                    if target.contains("calendarList") { return D1Reply::json(json!({"id":"alice@unit.test","summary":"Work","timeZone":"Asia/Taipei"})); }
+                    if target.contains("format=raw") { return D1Reply::json(json!({"id":"r1","message":{"id":"m1","raw":raw}})); }
+                    if tool == "gmail_send_draft" {
+                        return D1Reply::json(json!({"id":"r1","message":{"id":"m1","payload":{
+                            "headers":[{"name":"To","value":"recipient@example.com"},{"name":"Subject","value":"Real Google subject"}],
+                            "mimeType":"text/plain","body":{"data":"QXBwcm92ZWQgYm9keQ"}}}}));
+                    }
+                    D1Reply::json(json!({"id":"e1","etag":"\"v1\"","summary":"Real Google event",
+                        "start":{"dateTime":"2026-11-25T10:00:00+08:00"},"end":{"dateTime":"2026-11-25T11:00:00+08:00"},"attendees":[]}))
+                }).await;
+                let _fixture = crate::google_workspace::native_call::testing::install(f.home.path(), &wire.endpoint);
+                let pending = d1_pending(&f, tool, &args);
+                let broker = crate::approval::ApprovalBroker::open(f.home.path()).unwrap();
+                let decide = async {
+                    loop {
+                        if let Some(rec) = broker.list_pending(None).await.unwrap().first() {
+                            assert_eq!(rec.payload["native_google_confirmation"], true);
+                            assert_eq!(rec.payload["arguments"]["account"], "alice@unit.test");
+                            assert!(rec.payload["arguments"]["content_hash"].is_string());
+                            broker.decide(&rec.id, approve, "dashboard:admin").await.unwrap();
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                };
+                let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    tokio::join!(pending.execute_native(args), decide)
+                }).await.expect("native confirmation must complete within fixture deadline");
+                let result = result.unwrap();
+                assert_eq!(result["isError"] == true, !approve, "{home}/{tool}/{approve}: {result}");
+                let requests = wire.requests.lock().unwrap();
+                assert_eq!(requests.iter().filter(|(method, _, _)| method != "GET").count(), usize::from(approve));
+                if approve && tool == "calendar_delete_event" {
+                    assert!(wire.headers.lock().unwrap().iter().any(|header| header.to_ascii_lowercase().contains("if-match: \"v1\"")));
+                }
+            }
+        }
     }
 }

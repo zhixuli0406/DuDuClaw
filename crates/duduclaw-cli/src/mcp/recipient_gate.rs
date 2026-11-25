@@ -22,6 +22,10 @@ pub(crate) fn targets(tool: &str, args: &Value) -> Option<Vec<String>> {
         "send_message" | "send_photo" | "send_sticker" | "create_reminder" => {
             Some(vec![channel_target(args, "channel", "chat_id")])
         }
+        // RM-159: recipients are read from Google by the gateway, never
+        // accepted from these arguments. native_confirmation evaluates the
+        // same recipient_policy and binds any Ask to the mandatory card.
+        "gmail_send_draft" | "calendar_delete_event" => None,
         "mail_send" => Some(vec![recipient_policy::channel_recipient("mail", args["to"].as_str().unwrap_or_default()).unwrap_or_default()]),
         "tasks_create" | "update_cron_task" => {
             if !["notify_channel", "notify_chat_id", "notify_thread_id"].iter()

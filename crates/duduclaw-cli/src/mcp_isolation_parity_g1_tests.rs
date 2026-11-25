@@ -33,7 +33,7 @@ use duduclaw_mcp_boundary::tool_policy::{self as policy_table, ResourceKind};
 
 /// The reviewed catalog size (same pin as `isolated_round4_*`). A new tool
 /// must be given a policy, a boundary route and a G1 review before this moves.
-const CATALOG_TOOLS: usize = 268;
+const CATALOG_TOOLS: usize = 270;
 const SHARED_LABEL: &str = "team";
 const PERSONAL_LABEL: &str = "alice-personal";
 const SHARED_EMPLOYEE: EmployeeId = EmployeeId([0x21; 16]);
@@ -315,6 +315,18 @@ github = true
     let pending = pending_production_selectors();
     let manifests: Vec<BTreeMap<&'static str, ServiceState>> =
         employees.iter().map(|employee| employee.dispatcher.service_manifest().into_iter().collect()).collect();
+    for (name, effect, required) in [
+        ("gmail_send_draft", duduclaw_core::ToolEffect::Send, &[ResourceKind::Employee, ResourceKind::Connector, ResourceKind::Mailbox][..]),
+        ("calendar_delete_event", duduclaw_core::ToolEffect::Delete, &[ResourceKind::Employee, ResourceKind::Connector][..]),
+    ] {
+        let policy = policy_table::policy(name).unwrap();
+        assert_eq!(policy.route, Route::Connector);
+        assert_eq!(policy.required, required);
+        assert_eq!(provider_for_tool(name), Some("google"));
+        assert_eq!(duduclaw_core::effect_of(name), effect);
+        assert_eq!(crate::mcp_auth::tool_requires_scope(name), Some(crate::mcp_auth::Scope::GoogleWrite));
+        assert!(!pending.contains(name));
+    }
     // v1.85 Google writes use the existing account-bound connector route.
     // EmployeeScope permits discovery, not account access: this fixture has no
     // Google route, so both employees' installed providers must refuse selection.

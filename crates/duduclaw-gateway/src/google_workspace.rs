@@ -26,6 +26,7 @@ use std::time::Duration;
 use crate::google_apps_script;
 pub mod chat_read;
 pub(crate) mod native_call;
+pub(crate) mod native_confirmation;
 pub(crate) mod native_legacy;
 
 /// Provider id in the `mcp_oauth` vault.
@@ -588,7 +589,7 @@ pub enum GoogleBackend {
 
 /// Shared by discovery and dispatch; this checks backend features, not scopes.
 pub fn backend_supports_tool(native_rest: bool, tool: &str, reply_draft: bool) -> bool {
-    native_rest || !(matches!(tool, "docs_create" | "docs_replace_text" | "sheets_create" | "sheets_update" | "calendar_update_event")
+    native_rest || !(matches!(tool, "docs_create" | "docs_replace_text" | "sheets_create" | "sheets_update" | "gmail_send_draft" | "calendar_delete_event" | "calendar_update_event")
         || (tool == "gmail_create_draft" && reply_draft))
 }
 
@@ -1569,7 +1570,7 @@ mod tests {
         ] {
             std::fs::write(home.path().join("config.toml"), config).unwrap();
             assert_eq!(native_rest_available(home.path(), None), native, "{config}");
-            for tool in ["docs_create", "docs_replace_text", "sheets_create", "sheets_update", "calendar_update_event"] {
+            for tool in ["docs_create", "docs_replace_text", "sheets_create", "sheets_update", "gmail_send_draft" | "calendar_delete_event" | "calendar_update_event"] {
                 assert_eq!(backend_supports_tool(native, tool, false), native, "{tool}");
             }
             assert!(backend_supports_tool(native, "gmail_create_draft", false));

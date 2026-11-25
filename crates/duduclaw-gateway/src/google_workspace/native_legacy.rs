@@ -13,6 +13,9 @@ struct LegacyIo<'a> {
 #[async_trait::async_trait]
 impl program::LocalIo for LegacyIo<'_> {
     async fn json(&mut self, s: program::NativeStep<'_>) -> Result<Value, GoogleApiError> {
+        if matches!(s.template().tool(), "gmail_send_draft" | "calendar_delete_event") {
+            return confirmed_request(self.token, s).await;
+        }
         let q: Vec<_> = s
             .query()
             .iter()
@@ -31,8 +34,10 @@ impl program::LocalIo for LegacyIo<'_> {
     fn checkpoint(&mut self) -> Result<(), GoogleApiError> {
         Ok(())
     }
-    fn reject_derived(&mut self, _: &str) -> Result<(), GoogleApiError> {
-        Ok(())
+    fn reject_derived(&mut self, candidate: &str) -> Result<(), GoogleApiError> {
+        if program::contains_representation(candidate, self.token) {
+            Err(GoogleApiError::Forbidden("Google reply contains credential material".into()))
+        } else { Ok(()) }
     }
     fn sanitize(&self, s: &str) -> String {
         s.to_owned()
@@ -328,6 +333,10 @@ pub(crate) async fn handle(
         crate::egress_client::builtin_not_dispatched();
         return super::native_call::tool_error(super::chat_read::GUIDANCE);
     }
+    if matches!(tool, "gmail_send_draft" | "calendar_delete_event") {
+        crate::egress_client::builtin_not_dispatched();
+        return super::native_call::tool_error("這項操作需要 gateway 原生執行與逐次確認，請使用 Google 專用連線；Apps Script Bridge 不支援。");
+    }
     let template = match NativeCallTemplate::prepare(tool, args) {
         Ok(t) => t,
         Err(e) => {
@@ -353,6 +362,7 @@ pub(crate) async fn handle(
     let result: Result<program::Outcome, GoogleApiError> = match template.parsed() {
         ParsedNativeArguments::DocsCreate { .. } | ParsedNativeArguments::DocsReplace { .. }
         | ParsedNativeArguments::SheetsCreate { .. } | ParsedNativeArguments::SheetsUpdate { .. }
+        | ParsedNativeArguments::GmailSend { .. } | ParsedNativeArguments::CalendarDelete { .. }
         | ParsedNativeArguments::CalendarUpdate { .. } => unreachable!("new native tools returned above"),
         ParsedNativeArguments::ChatSpaces(args) => {
             let backend = match g.backend(home, tool).await { Ok(b) => b, Err(e) => return super::native_call::tool_error(&e) };
@@ -640,9 +650,7 @@ impl program::LocalIo for FirstRecipePreflight {
     fn checkpoint(&mut self) -> Result<(), GoogleApiError> {
         Ok(())
     }
-    fn reject_derived(&mut self, _: &str) -> Result<(), GoogleApiError> {
-        Ok(())
-    }
+    fn reject_derived(&mut self, _: &str) -> Result<(), GoogleApiError> { Ok(()) }
     fn sanitize(&self, value: &str) -> String {
         value.into()
     }
@@ -692,6 +700,8 @@ mod backend_capability_tests {
     async fn bridge_dispatch_refuses_the_same_native_capabilities_discovery_hides() {
         let home = tempfile::tempdir().unwrap();
         for (tool, args) in [
+            ("gmail_send_draft", json!({"draft_id":"r"})),
+            ("calendar_delete_event", json!({"event_id":"e"})),
             ("docs_create", json!({"title":"d"})),
             ("docs_replace_text", json!({"document_id":"d","find":"x","replace":"y"})),
             ("sheets_create", json!({"title":"s"})),
@@ -705,4 +715,44 @@ mod backend_capability_tests {
             assert!(result["content"][0]["text"].as_str().unwrap().contains("Apps Script Bridge"));
         }
     }
+}
+
+/// Account-bound legacy connector execution, callable only inside this gateway.
+pub(crate) async fn handle_confirmed_connector(tool: &str, args: &Value, home: &Path, agent: &str, token: &str) -> Value {
+    let result = (|| -> Result<_, String> {
+        if !crate::isolation_connector_clients::active() { return Err("Missing connector authority".into()); }
+        let mut template = NativeCallTemplate::prepare(tool, args)?;
+        template.bind_confirmation(super::native_confirmation::HostContext::new(home, agent, String::new())?);
+        Ok(template)
+    })();
+    match result {
+        Ok(template) => program::run(&template, &mut LegacyIo { token }).await,
+        Err(error) => super::native_call::tool_error(&error),
+    }
+}
+async fn confirmed_request(token: &str, step: program::NativeStep<'_>) -> Result<Value, GoogleApiError> {
+    let endpoint = reqwest::Url::parse(step.url()).map_err(|_| GoogleApiError::Forbidden("Invalid endpoint".into()))?;
+    if !crate::isolation_connector_clients::active()
+        || !super::native_confirmation::endpoint_allowed(step.template(), &endpoint) {
+        return Err(GoogleApiError::Forbidden("Missing connector authority".into()));
+    }
+    crate::isolation_connector_clients::before_request("google", step.url()).map_err(|s| GoogleApiError::Forbidden(s.into()))?;
+    let client = crate::isolation_connector_clients::client_builder().timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none()).retry(reqwest::retry::never()).build()
+        .map_err(|_| GoogleApiError::Http("result_unconfirmed".into()))?;
+    let mut request = client.request(step.method().clone(), super::effective_url(step.url()).as_ref())
+        .bearer_auth(token).query(step.query());
+    if let Some(etag) = step.if_match() { request = request.header(reqwest::header::IF_MATCH, etag); }
+    if let Some(body) = step.body() { request = request.json(body); }
+    let mut response = request.send().await.map_err(|_| GoogleApiError::Http("result_unconfirmed".into()))?;
+    let status = response.status().as_u16();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| GoogleApiError::Http("result_unconfirmed".into()))? {
+        if bytes.len().saturating_add(chunk.len()) > 4 * 1024 * 1024 { return Err(GoogleApiError::Http("result_unconfirmed".into())); }
+        bytes.extend_from_slice(&chunk);
+    }
+    crate::isolation_connector_clients::before_request("google", step.url()).map_err(|_| GoogleApiError::Http("result_unconfirmed".into()))?;
+    if !(200..300).contains(&status) { return Err(GoogleApiError::Api { status, message:"Google request refused".into() }); }
+    if bytes.iter().all(u8::is_ascii_whitespace) { return Ok(Value::Null); }
+    serde_json::from_slice(&bytes).map_err(|_| GoogleApiError::Http("result_unconfirmed".into()))
 }

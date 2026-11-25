@@ -53,9 +53,9 @@ pub const MAX_SCAN_CHARS: usize = 16_000;
 /// The mail tools whose successful row backs a "sent" claim — and only
 /// when the row also carries `sent == true`. These are the mail tools in
 /// `duduclaw_core::mcp_tool_defs` that can produce a sent mail; today only
-/// `mail_send` writes a `sent` field to its audit row. No other tool's row
+/// `mail_send` and confirmed `gmail_send_draft` write `sent` audit fields. No other tool's row
 /// backs a mail claim, whatever fields it carries.
-const MAIL_SENT_EVIDENCE_TOOLS: &[&str] = &["mail_send", "gmail_create_draft"];
+const MAIL_SENT_EVIDENCE_TOOLS: &[&str] = &["mail_send", "gmail_create_draft", "gmail_send_draft"];
 
 /// A successful row of one of these without `sent == true` means the mail
 /// is only a draft or waits for confirmation.

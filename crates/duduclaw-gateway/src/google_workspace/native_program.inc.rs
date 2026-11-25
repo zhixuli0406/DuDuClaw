@@ -24,6 +24,7 @@ pub(super) struct NativeStep<'a> {
     url: String,
     query: Vec<(String, String)>,
     body: Option<Value>,
+    if_match: Option<String>,
 }
 impl NativeStep<'_> {
     pub(super) fn template(&self) -> &NativeCallTemplate {
@@ -38,6 +39,7 @@ impl NativeStep<'_> {
     pub(super) fn query(&self) -> &[(String, String)] {
         &self.query
     }
+    pub(super) fn if_match(&self) -> Option<&str> { self.if_match.as_deref() }
     pub(super) fn body(&self) -> Option<&Value> {
         self.body.as_ref()
     }
@@ -46,6 +48,9 @@ impl NativeStep<'_> {
 pub(super) trait LocalIo: LocalRender + Send {
     async fn json(&mut self, step: NativeStep<'_>) -> Result<Value, GoogleApiError>;
     async fn text(&mut self, step: NativeStep<'_>) -> Result<String, GoogleApiError>;
+    async fn confirm(&mut self, template: &NativeCallTemplate, snapshot: &Value, recipients: &[String]) -> Result<(), GoogleApiError> {
+        template.confirmation().map_err(confirmation_error)?.confirm(template.tool(), snapshot, recipients).await.map_err(confirmation_error)
+    }
     fn checkpoint(&mut self) -> Result<(), GoogleApiError>;
     fn reject_derived(&mut self, candidate: &str) -> Result<(), GoogleApiError>;
     fn sanitize(&self, value: &str) -> String;
@@ -64,6 +69,7 @@ async fn google_request<I: LocalIo>(
     body: Option<&Value>,
 ) -> Result<Value, GoogleApiError> {
     io.checkpoint()?;
+    if let Ok(context) = template.confirmation() { context.current().map_err(confirmation_error)?; }
     let step = NativeStep {
         template,
         method,
@@ -73,6 +79,7 @@ async fn google_request<I: LocalIo>(
             .map(|(k, v)| (k.to_string(), v.clone()))
             .collect(),
         body: body.cloned(),
+        if_match: None,
     };
     let result = io.json(step).await;
     io.checkpoint()?;
@@ -86,6 +93,7 @@ async fn google_request_text<I: LocalIo>(
     query: &[(&str, String)],
 ) -> Result<String, GoogleApiError> {
     io.checkpoint()?;
+    if let Ok(context) = template.confirmation() { context.current().map_err(confirmation_error)?; }
     let step = NativeStep {
         template,
         method,
@@ -95,6 +103,7 @@ async fn google_request_text<I: LocalIo>(
             .map(|(k, v)| (k.to_string(), v.clone()))
             .collect(),
         body: None,
+        if_match: None,
     };
     let result = io.text(step).await;
     io.checkpoint()?;
@@ -946,6 +955,8 @@ fn response_id<I: LocalIo>(io: &mut I, response: &Value, field: &str) -> Result<
     Ok(id.to_owned())
 }
 
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/google_workspace/native_confirmed_program.inc.rs"));
+
 async fn native_write<I: LocalIo>(io: &mut I, template: &NativeCallTemplate) -> Result<Value, GoogleApiError> {
     use ParsedNativeArguments::*;
     match template.parsed() {
@@ -1695,6 +1706,9 @@ pub(super) fn render<I: LocalRender>(value: Outcome, io: &mut I) -> Value {
                 if let Some(field) = created_id_field {
                     result["_meta"]["duduclaw_created_ref"] = json!({"id":r[field],"label":r["title"]});
                 }
+                if r["status"] == "sent" && r["id"].is_string() {
+                    result["_meta"]["duduclaw_sent_message_id"] = r["id"].clone();
+                }
                 result["structuredContent"] = r;
             }
             result
@@ -1763,6 +1777,9 @@ pub(super) async fn run<I: LocalIo>(template: &NativeCallTemplate, io: &mut I) -
         return tool_error(&e.to_string());
     }
     let result: Result<Outcome, GoogleApiError> = match template.parsed() {
+        ParsedNativeArguments::GmailSend { .. } | ParsedNativeArguments::CalendarDelete { .. } => {
+            confirmed_effect(io, template).await.map(|data| Outcome::Write { data, created_id_field: None })
+        }
         ParsedNativeArguments::DocsCreate { .. } | ParsedNativeArguments::DocsReplace { .. }
         | ParsedNativeArguments::SheetsCreate { .. } | ParsedNativeArguments::SheetsUpdate { .. }
         | ParsedNativeArguments::CalendarUpdate { .. } => native_write(io, template).await.map(|data| Outcome::Write {

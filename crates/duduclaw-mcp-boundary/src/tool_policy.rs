@@ -117,6 +117,8 @@ pub const POLICIES: &[ToolPolicy] = &[
     ToolPolicy { name: "docs_replace_text", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
     ToolPolicy { name: "sheets_create", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
     ToolPolicy { name: "sheets_update", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "gmail_send_draft", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector, ResourceKind::Mailbox] },
+    ToolPolicy { name: "calendar_delete_event", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
     ToolPolicy { name: "calendar_update_event", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
     ToolPolicy { name: "slides_read", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
     // os
