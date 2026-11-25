@@ -1,10 +1,10 @@
 # Google Workspace ツールと安全モデル
 
-設定は [Google を接続する](google-setup.md)を参照してください。ネイティブ REST は九サービス・二十六ツール、Apps Script は三サービス・状態確認込み八アクションに対応します。連携がオフでもダッシュボードは表示され、ツールは `[integrations] google_workspace = true` で有効になります。共用 OAuth 認証情報は同梱しません。
+設定は [Google を接続する](google-setup.md)を参照してください。ネイティブ REST は九サービス・二十八ツール、Apps Script は三サービス・状態確認込み八アクションに対応します。連携がオフでもダッシュボードは表示され、ツールは `[integrations] google_workspace = true` で有効になります。共用 OAuth 認証情報は同梱しません。
 
 ## 何が使えるようになるか
 
-2つのスコープ(`google:read` / `google:write`)で管理される、26個のエージェント向け
+2つのスコープ(`google:read` / `google:write`)で管理される、28個のエージェント向け
 MCPツールです。
 
 | ツール | 分類 | 内容 |
@@ -14,7 +14,9 @@ MCPツールです。
 | `gmail_read` | read | 1件のメッセージを全文読み取る: ヘッダー、プレーンテキスト本文(長い場合は切り詰め)、添付ファイル一覧(ファイル名とサイズのみ、ダウンロードは行わない)。 |
 | `google_chat_spaces` | read | 接続したユーザーのスペース、グループチャット、DM を一覧表示。Chat 読み取りの有効化が必要。 |
 | `google_chat_messages` | read | 最近の Chat メッセージを検査済みの参照データとして読み取り。添付は名前のみ。 |
-| `gmail_create_draft` | write | Gmailの**下書き**を作成する。送信は行わない。送信は常に人間が手動で行う。 |
+| `gmail_send_draft` | send | 毎回確認して承認済みの下書きを送信。 |
+| `calendar_delete_event` | delete | 毎回確認して指定バージョンの予定を削除。通知の既定はなし。 |
+| `gmail_create_draft` | write | Gmailの**下書き**を作成する。送信は行わない。送信には `gmail_send_draft` の個別確認が必要。 |
 | `calendar_list_events` | read | プライマリカレンダーのイベントを一覧表示する(デフォルトは今後7日間)。 |
 | `calendar_create_event` | write | 実際に外部から見えるイベントを作成する。Google Meetリンクをオプションで付与可能。 |
 | `sheets_read` | read | スプレッドシートのセル範囲を読み取る(スプレッドシートIDまたはシートのURL全体を受け付ける)。最大200行の整形済みの値を返す。 |
@@ -57,13 +59,12 @@ MCPツールです。
 
 ### 安全設計
 
-- **下書きは決して送信されません。** `gmail_create_draft`は下書きを保存する
-  だけで、「送信」ツールは存在しません。送信は常に人間の判断です。
+- **送信は毎回確認が必要です。** `gmail_create_draft` は下書きを保存し、`gmail_send_draft` は新しいカードを人が確認したときだけ送信します。
 - **読み取りは読み取りのままです。** read分類のツールはGmailやCalendarの
   内容を一切変更できません。
 - **Forms、Drive、Slidesは読み取り専用です。** フォームの作成・編集、Driveへの
   書き込み、プレゼンテーションの変更を行うツールはありません。書き込み用ツールが
-  あるのはGmail(下書き)、Calendar、Sheets、Docs、Tasksだけです。
+  あるのはGmail(下書き・承認済み送信)、Calendar、Sheets、Docs、Tasksだけです。
 - **最小権限。** Driveは`drive.readonly`のみを要求します(`drive`や
   `drive.file`は要求しません。DocsとSheetsの作成は各サービスのスコープを使います)。
   Slidesは`presentations.readonly`を要求します。Docsの書き込みツールは既存の完全な`documents`スコープを使います。
@@ -155,7 +156,7 @@ default_identity = "home"   # [google] のない社員が使うもの：home（�
 allowed_subject_domains = ["customer.com"]
 ```
 
-`[google]` のない社員は `default_identity` を使うので、既存のインストールの動作は変わりません。`none` は 26 個の Google ツールを隠して呼び出しも拒否します。不正な値は共用アカウントへ切り替えず拒否します。Enterprise では `owner` と `user:<id>` を使えますが、有効な直接 Owner と本人の明示的な同意が必要です。[個人 Google 接続（v1.76.0）](google-personal-connections.md)を参照してください。
+`[google]` のない社員は `default_identity` を使うので、既存のインストールの動作は変わりません。`none` は 28 個の Google ツールを隠して呼び出しも拒否します。不正な値は共用アカウントへ切り替えず拒否します。Enterprise では `owner` と `user:<id>` を使えますが、有効な直接 Owner と本人の明示的な同意が必要です。[個人 Google 接続（v1.76.0）](google-personal-connections.md)を参照してください。
 
 ### この社員を通じて誰がアカウントを使えるか
 
@@ -186,7 +187,7 @@ Web サイトの公開訪問者（WebChat ウィジェット、Odoo ライブチ
 
 ### 社員専用 API key と Google MCP マウント（v1.76.0）
 
-検証済みの社員専用 API key に `google:read` または `google:write` が明示されている場合、閉じた 26 個の Google ツールのうち対応するものを使えます。`admin` だけでは代用できず、実在する社員と読める設定が必要です。一般の外部キーに付与できる権限やほかの連携は変わりません。OAuth 認証からこの実行用の証明は作られません。社員に紐づかない正規の内部カスタム連携キーは、従来の Home 経路を保ちます。
+検証済みの社員専用 API key に `google:read` または `google:write` が明示されている場合、閉じた 28 個の Google ツールのうち対応するものを使えます。`admin` だけでは代用できず、実在する社員と読める設定が必要です。一般の外部キーに付与できる権限やほかの連携は変わりません。OAuth 認証からこの実行用の証明は作られません。社員に紐づかない正規の内部カスタム連携キーは、従来の Home 経路を保ちます。
 
 社員の許可／拒否ツール、動作ルール、PolicyKernel、期限付き権限、承認要求は引き続き適用されます。承認待ちの間も、受理した社員、ツール、最終引数は固定されます。キーの失効、社員の削除、権限変更は拒否となり、プロセスの別の身元や別アカウントには切り替わりません。gateway が Google 操作を実行し、外部 MCP クライアントにはサイズ制限付きの結果だけを返します。Google bearer は返しません。
 
@@ -200,7 +201,7 @@ Agent Mail は最後に完了したポーリング時刻、アカウント利用
 
 ### 制限
 
-- `gmail.compose` があれば、アクセストークンを持つ人はメールを送れます。ツールは下書きを作るだけですが、制限のないシェルを持つ社員は、自分の同僚向けに発行されたトークンで Google を直接呼べます。
+- `gmail.compose` があれば、アクセストークンを持つ人はメールを送れます。下書き作成は保存のみで、送信ツールには毎回確認が必要ですが、制限のないシェルを持つ社員は、自分の同僚向けに発行されたトークンで Google を直接呼べます。
 - シェルを持つ社員は gateway と同じ OS ユーザーで動きます。[セキュリティ防御](../../features/ja-JP/05-security-defense.md#特定の人の認証情報をシステムのキーチェーンに置くv1760)のキーチェーンの制限を参照してください。
 - 実際の Workspace ではまだ検証していません：管理コンソールの実際の流れ、Google の実際のエラー文字列、Gmail を無効にした組織部門、Google 自身のリモート MCP エンドポイントが委任トークンを受け付けるかどうか。
 
@@ -240,3 +241,15 @@ external_server = "Partner Google MCP" # 任意、120 文字まで
 ```
 
 接続タブには「外部ツールで提供」と表示します。ネイティブ Google ツールは `none` と同様に非表示・呼び出し拒否となります。この設定は外部サーバーを構成・認可しません。名前は表示用テキストで、制御文字は拒否します。旧版は未知の ID またはキーを拒否するため、共用アカウントへフォールバックしません。
+
+### 毎回確認する Gmail 送信と Calendar 削除
+
+`gmail_send_draft {"draft_id":"r…"}` と `calendar_delete_event {"event_id":"…","calendar_id":"primary","notify_attendees":false}` は `google:write` と gateway のネイティブ REST 実行が必要です。Apps Script は両ツールを非表示にし、直接呼び出しも拒否します。bearer だけを渡す従来の Home 経路も非表示・拒否となります。社員専用 Google 接続か、gateway のアカウントに紐づくコネクターを使用してください。
+
+呼び出すたびに新しい確認カードが必要です。`allow`、Admin 権限、永続ワークフロー権限でも省略できず、`block` は引き続き拒否します。送信カードは Google から取得した送信元、To／Cc／Bcc、件名、本文プレビュー、添付ファイル名とサイズを表示します。承認はアカウント、社員の世代、下書き ID、操作、MIME ハッシュに紐づきます。gateway は再確認して承認済み MIME を送信し、内容やアカウントの変更時は再承認が必要です。宛先ポリシーは全 To／Cc／Bcc を確認し、曖昧なアドレス構文を拒否します。
+
+削除カードは予定名、タイムゾーン付き開始・終了、参加者、カレンダー、繰り返し全体の削除、通知設定を表示します。承認したバージョンを `If-Match` で確認し、変更時は再承認を要求します。`calendar_id` の既定は `primary`、通知は明示的に `sendUpdates=none` です。`notify_attendees=true` のときだけ `all` を使用します。空の HTTP 204 は成功です。削除時は既存の `calendar.calendarlist.readonly`（または上位の Calendar スコープ）で、プライマリカレンダーのアカウントと選択したカレンダーの名前・タイムゾーンも取得します。
+
+MIME 全体は gateway のメモリに保持し、承認には必要なプレビューとハッシュを保存します。拒否・期限切れ・使用済み・不一致の承認では変更しません。書き込みのタイムアウトや結果不明時は `result_unconfirmed` を返します。自動再送は行わず、再試行の前に Google で結果を確認してください。確認期限は 90 秒です。
+
+通信契約は [Gmail 下書き](https://developers.google.com/workspace/gmail/api/guides/drafts)と [Calendar の条件付き変更](https://developers.google.com/workspace/calendar/api/guides/version-resources)に従います。

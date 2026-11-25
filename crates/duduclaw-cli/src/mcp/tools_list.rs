@@ -954,6 +954,10 @@ pub(crate) async fn visible_tools_in_lane(
                 || crate::mcp_auth::dedicated_google_tool_allowed(home_dir, principal, t.name)
         })
         .filter(|t| google_enabled || !GOOGLE_WORKSPACE_TOOLS.contains(&t.name))
+        // These effects require a gateway-owned approval context. Bearer-only
+        // legacy Home callers cannot supply one and must not discover them.
+        .filter(|t| !matches!(t.name, "gmail_send_draft" | "calendar_delete_event")
+            || dedicated_google || crate::mcp_isolation::current().is_some())
         .filter(|t| duduclaw_gateway::google_workspace::backend_supports_tool(google_native_rest, t.name, false))
         .filter(|t| {
             !matches!(t.name, "google_chat_spaces" | "google_chat_messages")

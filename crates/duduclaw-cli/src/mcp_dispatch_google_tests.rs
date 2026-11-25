@@ -586,7 +586,7 @@ async fn google_chat_tools_list_uses_same_scope_and_identity_receipt_as_gmail() 
 
 #[tokio::test]
 async fn rm159_write_listing_and_dispatch_match_explicit_employee_scopes() {
-    let tools = ["docs_create", "docs_replace_text", "sheets_create", "sheets_update", "calendar_update_event"];
+    let tools = ["docs_create", "docs_replace_text", "sheets_create", "sheets_update", "calendar_update_event", "gmail_send_draft", "calendar_delete_event"];
     for write in [false, true] {
         let home = fixture("[capabilities]\nallowed_tools=['mcp__duduclaw__*']");
         let path = home.path().join("config.toml");
@@ -606,7 +606,11 @@ async fn rm159_write_listing_and_dispatch_match_explicit_employee_scopes() {
         for tool in tools {
             assert_eq!(names.contains(&tool), write, "{tool}: {names:?}");
             assert_eq!(crate::mcp_auth::tool_requires_scope(tool), Some(crate::mcp_auth::Scope::GoogleWrite));
-            let effect = if tool == "calendar_update_event" { duduclaw_core::ToolEffect::Send } else { duduclaw_core::ToolEffect::Modify };
+            let effect = match tool {
+                "calendar_update_event" | "gmail_send_draft" => duduclaw_core::ToolEffect::Send,
+                "calendar_delete_event" => duduclaw_core::ToolEffect::Delete,
+                _ => duduclaw_core::ToolEffect::Modify,
+            };
             assert_eq!(duduclaw_core::effect_of(tool), effect);
             if !write {
                 let dispatcher = dispatcher(home.path()).await;

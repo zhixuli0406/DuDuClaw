@@ -2,6 +2,8 @@
 use serde_json::{Value, json};
 
 pub(crate) enum ParsedNativeArguments {
+    GmailSend { draft: String },
+    CalendarDelete { calendar: String, event: String, notify: bool },
     DocsCreate { title: String, body: Option<String> },
     DocsReplace { document: String, find: String, replace: String, match_case: bool },
     SheetsCreate { title: String, sheet_names: Option<Vec<String>> },
@@ -90,6 +92,7 @@ pub(crate) enum ParsedNativeArguments {
 }
 
 pub(crate) struct NativeCallTemplate {
+    confirmation: Option<super::native_confirmation::HostContext>,
     tool: String,
     digest: String,
     parsed: Option<ParsedNativeArguments>,
@@ -157,6 +160,18 @@ fn check_text_limit(key: &str, value: &str, max: usize) -> Result<(), String> {
 /// Validate raw input before policy, approval and argument-digest binding.
 /// Never shorten an approved payload, including optional or nested strings.
 pub(crate) fn validate_inputs(tool: &str, args: &Value) -> Result<(), String> {
+    if matches!(tool, "gmail_send_draft" | "calendar_delete_event") {
+        for key in if tool == "gmail_send_draft" { &["draft_id"][..] } else { &["event_id"][..] } {
+            let id = required(args, key, true, true)?;
+            if id.len() > 1024 || !safe_gmail_component(&id) { return Err("Invalid Google resource ID".into()); }
+        }
+        if tool == "calendar_delete_event" {
+            boolean(args, "notify_attendees", false)?;
+            if let Some(calendar) = checked_optional(args, "calendar_id", true, true)? {
+                if calendar.len() > 1024 || !safe_gmail_component(&calendar) { return Err("Invalid calendar ID".into()); }
+            }
+        }
+    }
     let limits: &[(&str, usize)] = match tool {
         "docs_create" => &[("title", 1000), ("body", 20_000)],
         "docs_replace_text" => &[("find", 20_000), ("replace", 20_000)],
@@ -266,6 +281,14 @@ impl NativeCallTemplate {
     pub(crate) fn prepare(tool: &str, args: &Value) -> Result<Self, String> {
         validate_inputs(tool, args)?;
         let parsed = match tool {
+            "gmail_send_draft" => ParsedNativeArguments::GmailSend {
+                draft: required(args, "draft_id", true, true)?,
+            },
+            "calendar_delete_event" => ParsedNativeArguments::CalendarDelete {
+                calendar: checked_optional(args, "calendar_id", true, true)?.unwrap_or_else(|| "primary".into()),
+                event: required(args, "event_id", true, true)?,
+                notify: boolean(args, "notify_attendees", false)?,
+            },
             "docs_create" => ParsedNativeArguments::DocsCreate {
                 title: capped(args, "title", true, 1000)?,
                 body: checked_optional(args, "body", false, false)?,
@@ -474,7 +497,7 @@ impl NativeCallTemplate {
         let mut call = Self::for_api(tool);
         call.digest = duduclaw_core::google_identity::google_arguments_digest(args);
         call.parsed = Some(parsed);
-        if matches!(tool, "docs_create" | "docs_replace_text" | "sheets_create" | "sheets_update" | "calendar_update_event") {
+        if matches!(tool, "gmail_send_draft" | "calendar_delete_event" | "docs_create" | "docs_replace_text" | "sheets_create" | "sheets_update" | "calendar_update_event") {
             call.validate_closed()?;
         }
         Ok(call)
@@ -483,6 +506,7 @@ impl NativeCallTemplate {
     pub(super) fn for_api(tool: &str) -> Self {
         let now = chrono::Utc::now();
         Self {
+            confirmation: None,
             tool: tool.into(),
             digest: String::new(),
             parsed: None,
@@ -490,6 +514,12 @@ impl NativeCallTemplate {
             calendar_max: (now + chrono::Duration::days(7)).to_rfc3339(),
             meet_request_id: uuid::Uuid::new_v4().to_string(),
         }
+    }
+    pub(crate) fn bind_confirmation(&mut self, context: super::native_confirmation::HostContext) {
+        self.confirmation = Some(context);
+    }
+    pub(crate) fn confirmation(&self) -> Result<&super::native_confirmation::HostContext, String> {
+        self.confirmation.as_ref().ok_or_else(|| "這項操作需要 gateway 逐次確認，未送出任何變更。".into())
     }
     pub(crate) fn tool(&self) -> &str {
         &self.tool
@@ -513,6 +543,8 @@ impl NativeCallTemplate {
         let safe = match self.parsed() {
             GmailDraft { thread_id, .. } => thread_id.as_deref().is_none_or(safe_gmail_component),
             CalendarUpdate { calendar, event, .. } => safe_gmail_component(calendar) && safe_gmail_component(event),
+            GmailSend { draft } => safe_gmail_component(draft),
+            CalendarDelete { calendar, event, .. } => safe_gmail_component(calendar) && safe_gmail_component(event),
             GmailRead { message_id } => safe_gmail_component(message_id),
             SheetsRead { spreadsheet, range }
             | SheetsUpdate { spreadsheet, range, .. }

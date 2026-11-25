@@ -3,7 +3,7 @@
 /// The bearer broker accepts only these operations; status is metadata-only.
 pub const TOKEN_TOOLS: &[&str] = &[
     "google_chat_spaces", "google_chat_messages",
-    "gmail_search", "gmail_read", "mail_poll", "gmail_create_draft",
+    "gmail_search", "gmail_read", "mail_poll", "gmail_create_draft", "gmail_send_draft", "calendar_delete_event",
     "calendar_list_events", "calendar_create_event", "sheets_read", "sheets_append",
     "forms_get", "forms_list_responses", "gtasks_lists", "gtasks_list",
     "gtasks_create", "gtasks_complete", "drive_search", "drive_read",
@@ -57,7 +57,7 @@ pub fn permitted(tool: &str, granted: &[String]) -> bool {
                 "https://mail.google.com/",
             ],
         ),
-        "gmail_create_draft" => has(
+        "gmail_create_draft" | "gmail_send_draft" => has(
             granted,
             &[
                 "https://www.googleapis.com/auth/gmail.compose",
@@ -65,6 +65,12 @@ pub fn permitted(tool: &str, granted: &[String]) -> bool {
                 "https://mail.google.com/",
             ],
         ),
+        "calendar_delete_event" => has(granted, &[
+            "https://www.googleapis.com/auth/calendar.events", "https://www.googleapis.com/auth/calendar",
+        ]) && has(granted, &[
+            "https://www.googleapis.com/auth/calendar.calendarlist.readonly", "https://www.googleapis.com/auth/calendar.calendarlist",
+            "https://www.googleapis.com/auth/calendar.readonly", "https://www.googleapis.com/auth/calendar",
+        ]),
         "calendar_list_events" => has(
             granted,
             &[

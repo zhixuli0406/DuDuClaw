@@ -751,6 +751,8 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
     ("docs_replace_text", "Replace text in a Google Doc", "google:write", "google"),
     ("sheets_create", "Create a spreadsheet", "google:write", "google"),
     ("sheets_update", "Update spreadsheet cells", "google:write", "google"),
+    ("gmail_send_draft", "Send a confirmed Gmail draft", "google:write", "google"),
+    ("calendar_delete_event", "Delete a confirmed calendar event", "google:write", "google"),
     ("calendar_update_event", "Update a calendar event", "google:write", "google"),
     (
         "docs_append",

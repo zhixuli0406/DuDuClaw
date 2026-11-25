@@ -126,6 +126,7 @@ pub const EXTERNAL_TOOLS_WHITELIST: &[&str] = &[
 pub const PARAM_TYPES: &[(&str, &str, &str)] = &[
     ("docs_replace_text", "match_case", "boolean"),
     ("calendar_update_event", "notify_attendees", "boolean"),
+    ("calendar_delete_event", "notify_attendees", "boolean"),
     ("calendar_update_event", "attendees", "array"),
     ("sheets_create", "sheet_names", "array"),
     ("sheets_update", "values", "array"),

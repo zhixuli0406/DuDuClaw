@@ -5263,6 +5263,8 @@ effect = "forbid"
         "sheets_create",
         "sheets_update",
         "calendar_update_event",
+        "gmail_send_draft",
+        "calendar_delete_event",
 
         "docs_read",
         "drive_read",
@@ -5481,7 +5483,7 @@ effect = "forbid"
             .collect();
         assert_eq!(
             names.len(),
-            268,
+            270,
             "tool count changed — classify the new tool here"
         );
         let all: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
