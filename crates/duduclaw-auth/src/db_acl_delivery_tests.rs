@@ -1,7 +1,7 @@
 //! Bounded waiting of the ACL delivery fence: contention is not a refusal.
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tempfile::NamedTempFile;
 
 const THREADS: usize = 8;
@@ -24,9 +24,10 @@ fn run_concurrently(db: &UserDb, other: &UserDb, generation: u64, delivered: &At
             scope.spawn(move || {
                 start.wait();
                 target.with_acl_generation(generation, || {
-                    // A synchronous delivery decision that takes a moment,
-                    // such as a socket write, while holding the reservation.
-                    std::thread::sleep(Duration::from_millis(5));
+                    // Model the documented nonblocking delivery callback.
+                    // Sleeping under eight serialized reservations measures CI
+                    // scheduling delays, not just contention. The held-slot and
+                    // held-writer tests below cover waiting and budget expiry.
                     delivered.fetch_add(1, Ordering::SeqCst);
                 })
             })
